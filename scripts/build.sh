@@ -47,6 +47,22 @@ cp target/x86_64-saltyos-uefi/release/saltyos-bootloader-uefi \
 cp target/x86_64-saltyos-kernel/release/saltyos-kernel \
    "$ROOT_DIR/build/kernel.elf"
 
+# Build userspace demo ELF
+echo "Building userspace..."
+if command -v nasm >/dev/null 2>&1 && command -v ld >/dev/null 2>&1; then
+    nasm -f elf64 \
+        "$ROOT_DIR/userspace/hello.asm" \
+        -o "$ROOT_DIR/build/userspace.o"
+    ld -m elf_x86_64 \
+        -nostdlib \
+        -T "$ROOT_DIR/userspace/link.ld" \
+        -o "$ROOT_DIR/build/userspace.elf" \
+        "$ROOT_DIR/build/userspace.o"
+else
+    echo "Error: nasm or ld not found, cannot build userspace"
+    exit 1
+fi
+
 # BIOS stage1 and stage2 (pure assembly)
 if command -v nasm &> /dev/null; then
     nasm -f bin \

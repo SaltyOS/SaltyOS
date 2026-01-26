@@ -39,11 +39,16 @@ ORG 0x7E00
 %define VGA_SEG                 0xB800
 %define VGA_LINEAR              0xB8000
 
+%define DAP_PHYS                0x0400          ; DAP in low memory (safe, below TMP)
+%define DAP_SEG                 0x0000
+%define DAP_OFF                 0x0700          ; avoid BIOS data area (0x0400-0x04FF) and TMP buffer
+
 %define TMP_SECTOR_BUF          0x0500          ; 512B read buffer in low memory (avoid stage2 overlap)
 %define TMP_SECTOR_BUF_SEG      0x0000
 %define TMP_SECTOR_BUF_OFF      0x0500
 
-%define KERNEL_LBA_START        10              ; must match mkdisk-bios.sh seek
+%define KERNEL_LBA_START        33              ; must match mkdisk-bios.sh seek
+%define USER_LBA_START          2048
 ; KERNEL_PHYS_BASE, KERNEL_VIRT_BASE, USER_* constants come from layout.inc
 
 %define BOOTINFO_PHYS_ADDR      0x00006000      ; low memory BootInfo for now
@@ -68,7 +73,7 @@ ORG 0x7E00
 %define COM1_PORT               0x3F8
 
 ; ELF constants
-%define ELF_MAGIC               0x464C457F      ; 0x7F 'E' 'L' 'F' little-endian dword
+%define ELF_MAGIC               0x464C457F      ; bytes: 7F 45 4C 46, reversed for 16-bit dword comparison
 %define EI_CLASS_64             2
 %define EI_DATA_LE              1
 %define ET_EXEC                 2               ; Static executable
@@ -110,6 +115,7 @@ start:
     mov gs, ax
 
     mov [boot_drive], dl
+    mov dword [rf_base_lba], KERNEL_LBA_START
 
     ; Enable A20 (fast A20 gate)
     in  al, 0x92
@@ -118,17 +124,39 @@ start:
 
     ; Enter Unreal Mode so we can write to KERNEL_PHYS_BASE easily
     call enter_unreal_mode
+    call detect_int13_extensions
+    call detect_chs_geometry
+
+    ; Initialize serial for debug output
+    call serial_init
+    ; Debug: Boot started
+    mov al, 'B'
+    call serial_putc
 
     ; Load and validate ELF header + compute vaddr_base
     call elf_read_and_analyze
     jc  fatal_elf
 
+    ; Debug: kernel ELF analyzed OK
+    mov al, 'K'
+    call serial_putc
+
     ; Load PT_LOAD segments into KERNEL_PHYS_BASE + (p_vaddr - vaddr_base)
     call elf_load_segments_unreal
     jc  fatal_disk
 
-    ; Prepare user code + stack pages in physical memory
-    call prepare_user_pages
+    ; Debug: kernel segments loaded OK
+    mov al, 'S'
+    call serial_putc
+
+    ; Load userspace ELF into physical memory
+    call user_elf_read_and_analyze
+    jc  fatal_elf
+    call user_elf_load_segments_unreal
+    jc  fatal_disk
+    ; Debug: userspace loaded OK
+    mov al, 'U'
+    call serial_putc
 
     ; Query BIOS memory map (E820) BEFORE building BootInfo
     call e820_get_map
@@ -370,8 +398,9 @@ enter_unreal_mode:
     mov eax, cr0
     or  eax, 1                     ; PE=1 (enter protected mode)
     mov cr0, eax
-    jmp $+2
+    jmp 0x08:unreal_pm_entry       ; load protected-mode CS
 
+unreal_pm_entry:
     ; Load a flat 4GiB data selector into FS (for high memory access)
     mov ax, 0x10                   ; unreal data selector (base=0, limit=4GiB)
     mov fs, ax
@@ -379,8 +408,9 @@ enter_unreal_mode:
     mov eax, cr0
     and eax, 0xFFFFFFFE            ; PE=0 (back to real mode)
     mov cr0, eax
-    jmp $+2
+    jmp 0x0000:unreal_rm_entry     ; reload real-mode CS
 
+unreal_rm_entry:
     sti
 
     ; IMPORTANT: Do NOT reload FS here - keep 4GiB cached limit
@@ -399,26 +429,51 @@ enter_unreal_mode:
 ; -----------------------------------------------------------------------------
 bios_read_sector_lba_to_tmp:
     pusha
-    ; Prepare DAP
-    mov dword [dap_lba], eax
-    mov dword [dap_lba+4], 0
-    mov word  [dap_count], 1
-    mov word  [dap_off], TMP_SECTOR_BUF_OFF
-    mov word  [dap_seg], TMP_SECTOR_BUF_SEG
+    mov [bios_lba_arg], eax
+    push ds
+    push es
 
-    ; Try LBA (INT13 extensions) first
+    xor ax, ax
+    mov ds, ax              ; DS = 0
+    mov es, ax              ; ES = 0
+
+    ; ------------------------------------------------------------
+    ; Build DAP at 0000:0400 (physical 0x0400)
+    ; DAP format (size=16):
+    ;   +0  u8  size (0x10)
+    ;   +1  u8  reserved (0)
+    ;   +2  u16 sector count
+    ;   +4  u16 buffer offset
+    ;   +6  u16 buffer segment
+    ;   +8  u64 LBA
+    ; ------------------------------------------------------------
+    mov byte [DAP_OFF + 0], 0x10
+    mov byte [DAP_OFF + 1], 0x00
+    mov word [DAP_OFF + 2], 1
+    mov word [DAP_OFF + 4], TMP_SECTOR_BUF_OFF
+    mov word [DAP_OFF + 6], TMP_SECTOR_BUF_SEG
+
+    ; LBA (EAX input)
+    mov eax, [bios_lba_arg]
+    mov dword [DAP_OFF + 8], eax
+    mov dword [DAP_OFF + 12], 0
+
+    ; Try LBA (INT13 extensions) first unless forced to CHS
+    cmp byte [force_chs], 0
+    jne .chs_fallback
+
     mov dl, [boot_drive]
-    mov si, dap
+    mov si, DAP_OFF
     mov ah, 0x42
     int 0x13
     mov [last_int13_status], ah
-    jnc .done
+    jnc .lba_ok
 
-    ; Fallback: CHS read via AH=02h
+.chs_fallback:
     ; LBA -> CHS with H=16, S=63
-    mov eax, [dap_lba]           ; low 32 LBA
+    mov eax, [DAP_OFF + 8]     ; low 32 LBA
     xor edx, edx
-    mov ebx, CHS_SECTORS         ; 63
+    movzx ebx, word [chs_spt]    ; sectors per track
     div ebx                      ; eax=q1 (LBA/63), edx=r1 (sector-1)
     mov esi, eax                 ; q1
     mov bh, dl                   ; sector-1
@@ -426,7 +481,7 @@ bios_read_sector_lba_to_tmp:
 
     mov eax, esi
     xor edx, edx
-    mov ebx, CHS_HEADS           ; 16
+    movzx ebx, word [chs_heads]  ; heads
     div ebx                      ; eax=cylinder, edx=head
     mov dh, dl                   ; head
     mov ch, al                   ; cylinder low 8
@@ -439,9 +494,83 @@ bios_read_sector_lba_to_tmp:
     mov ax, TMP_SECTOR_BUF_SEG
     mov es, ax
     mov bx, TMP_SECTOR_BUF_OFF
+    mov dl, [boot_drive]
     mov ax, 0x0201               ; AH=02 read, AL=1 sector
     int 0x13
     mov [last_int13_status], ah
+    ; Log: C=CHS fallback ok, F=CHS failed (LBA failed)
+    pushf
+    jnc .chs_ok
+    mov al, 'F'
+    call serial_putc
+    popf
+    jmp .done
+.chs_ok:
+    mov al, 'C'
+    call serial_putc
+    popf
+    jmp .done
+
+.lba_ok:
+    ; Log: L=LBA ok (no fallback)
+    pushf
+    mov al, 'L'
+    call serial_putc
+    popf
+
+.done:
+    pop es
+    pop ds
+    popa
+    ret
+
+; -----------------------------------------------------------------------------
+; detect_int13_extensions
+;   - Sets force_chs=1 if INT13h extensions are not available
+; -----------------------------------------------------------------------------
+detect_int13_extensions:
+    pusha
+    mov ax, 0x4100
+    mov bx, 0x55AA
+    mov dl, [boot_drive]
+    int 0x13
+    jc .no_ext
+    cmp bx, 0xAA55
+    jne .no_ext
+    jmp .done
+.no_ext:
+    mov byte [force_chs], 1
+.done:
+    popa
+    ret
+
+; -----------------------------------------------------------------------------
+; detect_chs_geometry
+;   - Reads BIOS drive geometry for CHS fallback
+; -----------------------------------------------------------------------------
+detect_chs_geometry:
+    pusha
+    mov ah, 0x08
+    mov dl, [boot_drive]
+    int 0x13
+    jc .use_default
+
+    ; CL bits 0-5: sectors per track (1-63)
+    mov al, cl
+    and ax, 0x003F
+    test ax, ax
+    jz .use_default
+    mov [chs_spt], ax
+
+    ; DH: max head number (0-based)
+    movzx ax, dh
+    inc ax
+    mov [chs_heads], ax
+    jmp .done
+
+.use_default:
+    mov word [chs_spt], CHS_SECTORS
+    mov word [chs_heads], CHS_HEADS
 .done:
     popa
     ret
@@ -471,9 +600,10 @@ read_file_bytes_to_phys:
     mov edx, eax
     and edx, 511                 ; intra
     shr eax, 9                   ; sector_index
+    mov [tmp_sector_index32], eax
 
-    ; lba = KERNEL_LBA_START + sector_index
-    add eax, KERNEL_LBA_START
+    ; lba = base_lba + sector_index
+    add eax, [rf_base_lba]
     call bios_read_sector_lba_to_tmp
     jc .fail
 
@@ -485,7 +615,9 @@ read_file_bytes_to_phys:
     jbe .use_eax
     mov eax, ebx
 .use_eax:
-    mov [rf_bytes_this], eax
+    mov [rf_bytes_this], ax
+    xor ebx, ebx
+    mov bx, ax
 
     ; Copy bytes_this from TMP_SECTOR_BUF+intra -> dst_phys
     ; Use DS=0, read from [TMP+intra], write to [dst_phys] using addr-size override.
@@ -507,17 +639,17 @@ read_file_bytes_to_phys:
 
     ; Advance file_off += bytes_this
     mov eax, [rf_file_off_lo]
-    add eax, [rf_bytes_this]
+    add eax, ebx
     mov [rf_file_off_lo], eax
 
     ; Advance dst_phys += bytes_this
     mov eax, [rf_dst_phys]
-    add eax, [rf_bytes_this]
+    add eax, ebx
     mov [rf_dst_phys], eax
 
     ; len -= bytes_this
     mov eax, [rf_len_lo]
-    sub eax, [rf_bytes_this]
+    sub eax, ebx
     mov [rf_len_lo], eax
 
     jmp .next_chunk
@@ -545,9 +677,12 @@ read_file_bytes_to_phys:
 elf_read_and_analyze:
     pusha
 
-    ; Read sector 0 of kernel file (LBA=KERNEL_LBA_START)
-    mov eax, KERNEL_LBA_START
-    call bios_read_sector_lba_to_tmp
+    ; Read sector 0 of kernel file via common reader
+    mov dword [rf_base_lba], KERNEL_LBA_START
+    mov dword [rf_file_off_lo], 0
+    mov dword [rf_len_lo], 512
+    mov dword [rf_dst_phys], TMP_SECTOR_BUF
+    call read_file_bytes_to_phys
     jc .bad
 
     ; Validate ELF magic
@@ -794,61 +929,277 @@ elf_load_segments_unreal:
     ret
 
 ; -----------------------------------------------------------------------------
-; prepare_user_pages
-;   - Picks user code/stack physical pages after the kernel image
-;   - Writes a tiny syscall loop into user code page
-;   - Zeros user stack pages
+; user_elf_read_and_analyze
+;   - Reads userspace ELF header + PHDRs from USER_LBA_START
+;   - Computes vaddr_base/vaddr_end among PT_LOAD
+;   - Computes user_image_size/pages and validates stack offset
 ; -----------------------------------------------------------------------------
-prepare_user_pages:
+user_elf_read_and_analyze:
     pusha
+
+    mov dword [rf_base_lba], USER_LBA_START
+
+    mov dword [rf_file_off_lo], 0
+    mov dword [rf_len_lo], 512
+    mov dword [rf_dst_phys], TMP_SECTOR_BUF
+    call read_file_bytes_to_phys
+    jc .bad
+
+    cmp dword [TMP_SECTOR_BUF + 0x00], ELF_MAGIC
+    jne .bad
+
+    cmp byte  [TMP_SECTOR_BUF + 0x04], EI_CLASS_64
+    jne .bad
+    cmp byte  [TMP_SECTOR_BUF + 0x05], EI_DATA_LE
+    jne .bad
+
+    mov ax, word [TMP_SECTOR_BUF + 0x10]
+    cmp ax, ET_EXEC
+    je .type_ok
+    cmp ax, ET_DYN
+    jne .bad
+.type_ok:
+
+    cmp word  [TMP_SECTOR_BUF + 0x12], EM_X86_64
+    jne .bad
+
+    mov eax, dword [TMP_SECTOR_BUF + 0x18]
+    mov dword [user_e_entry], eax
+    mov eax, dword [TMP_SECTOR_BUF + 0x1C]
+    mov dword [user_e_entry+4], eax
+
+    mov eax, dword [TMP_SECTOR_BUF + 0x20]
+    mov [user_phoff_lo], eax
+
+    mov ax, word [TMP_SECTOR_BUF + 0x36]
+    mov [user_phentsize], ax
+    mov ax, word [TMP_SECTOR_BUF + 0x38]
+    mov [user_phnum], ax
+
+    mov dword [user_vaddr_base], 0xFFFFFFFF
+    mov dword [user_vaddr_base+4], 0xFFFFFFFF
+    mov dword [user_vaddr_end], 0
+    mov dword [user_vaddr_end+4], 0
+
+    xor cx, cx
+.ph_loop:
+    cmp cx, [user_phnum]
+    jae .done
+
+    movzx eax, cx
+    movzx ebx, word [user_phentsize]
+    imul eax, ebx
+    add eax, [user_phoff_lo]
+
+    mov dword [rf_file_off_lo], eax
+    mov dword [rf_len_lo], 56
+    mov dword [rf_dst_phys], TMP_SECTOR_BUF
+    call read_file_bytes_to_phys
+    jc .bad
+
+    cmp dword [TMP_SECTOR_BUF + 0x00], PT_LOAD
+    jne .next
+
+    mov eax, dword [TMP_SECTOR_BUF + 0x10]
+    mov edx, dword [TMP_SECTOR_BUF + 0x14]
+
+    mov ebx, dword [user_vaddr_base+4]
+    cmp edx, ebx
+    jb  .update
+    ja  .maybe_end
+    mov ebx, dword [user_vaddr_base]
+    cmp eax, ebx
+    jae .maybe_end
+.update:
+    mov dword [user_vaddr_base], eax
+    mov dword [user_vaddr_base+4], edx
+    ; Debug: found PT_LOAD, updated vaddr_base
+    pusha
+    mov al, 'P'
+    call serial_putc
+    popa
+
+.maybe_end:
+    mov eax, dword [TMP_SECTOR_BUF + 0x10]
+    mov edx, dword [TMP_SECTOR_BUF + 0x14]
+    mov ebx, dword [TMP_SECTOR_BUF + 0x28]
+    add eax, ebx
+    adc edx, 0
+    mov ebx, dword [user_vaddr_end+4]
+    cmp edx, ebx
+    jb .next
+    ja .update_end
+    mov ebx, dword [user_vaddr_end]
+    cmp eax, ebx
+    jbe .next
+.update_end:
+    mov dword [user_vaddr_end], eax
+    mov dword [user_vaddr_end+4], edx
+
+.next:
+    inc cx
+    jmp .ph_loop
+
+.done:
+    ; Debug: about to do final validation
+    pusha
+    mov al, 'V'
+    call serial_putc
+    popa
+
+    cmp dword [user_vaddr_base+4], 0xFFFFFFFF
+    je .bad
+
+    mov eax, [user_vaddr_end]
+    mov edx, [user_vaddr_end+4]
+    sub eax, dword [user_vaddr_base]
+    sbb edx, dword [user_vaddr_base+4]
+    test edx, edx
+    jne .bad
+
+    mov [user_image_size], eax
+    add eax, 0x0FFF
+    shr eax, 12
+    mov [user_image_pages], eax
+
+    cmp eax, USER_STACK_PT_INDEX
+    jae .bad
+
+    ; Debug: all validation passed, returning success
+    pusha
+    mov al, 'S'
+    call serial_putc
+    popa
+
+    clc
+    popa
+    ret
+
+.bad:
+    stc
+    popa
+    ret
+
+; -----------------------------------------------------------------------------
+; user_elf_load_segments_unreal
+;   - Loads user PT_LOAD segments into user_image_phys
+;   - Zeros BSS
+;   - Allocates and zeros user stack pages
+; -----------------------------------------------------------------------------
+user_elf_load_segments_unreal:
+    pusha
+
+    mov dword [rf_base_lba], USER_LBA_START
 
     mov eax, [max_phys_end]
     add eax, 0x0FFF
     and eax, 0xFFFFF000
-    mov [user_code_phys], eax
+    mov [user_image_phys], eax
 
-    mov ebx, eax
-    add ebx, 0x1000
-    mov [user_stack_phys], ebx
+    xor cx, cx
+.seg_loop:
+    cmp cx, [user_phnum]
+    jae .done
 
-    ; Zero user code page
-    mov edi, eax
-    mov ecx, 0x1000
+    movzx eax, cx
+    movzx ebx, word [user_phentsize]
+    imul eax, ebx
+    add eax, [user_phoff_lo]
+
+    mov dword [rf_file_off_lo], eax
+    mov dword [rf_len_lo], 56
+    mov dword [rf_dst_phys], TMP_SECTOR_BUF
+    call read_file_bytes_to_phys
+    jc .fail
+
+    cmp dword [TMP_SECTOR_BUF + 0x00], PT_LOAD
+    jne .next_seg
+
+    mov eax, dword [TMP_SECTOR_BUF + 0x08]
+    mov [user_seg_file_off], eax
+
+    mov eax, dword [TMP_SECTOR_BUF + 0x10]
+    mov edx, dword [TMP_SECTOR_BUF + 0x14]
+    mov [user_seg_vaddr_lo], eax
+    mov [user_seg_vaddr_hi], edx
+
+    mov eax, dword [TMP_SECTOR_BUF + 0x20]
+    mov [user_seg_filesz], eax
+
+    mov eax, dword [TMP_SECTOR_BUF + 0x28]
+    mov [user_seg_memsz], eax
+
+    mov eax, [user_seg_vaddr_lo]
+    mov edx, [user_seg_vaddr_hi]
+    sub eax, dword [user_vaddr_base]
+    sbb edx, dword [user_vaddr_base+4]
+    test edx, edx
+    jne .fail
+    mov [user_seg_off_from_base], eax
+
+    mov eax, [user_image_phys]
+    add eax, [user_seg_off_from_base]
+    mov [user_seg_phys_dst], eax
+
+    mov eax, [user_seg_file_off]
+    mov [rf_file_off_lo], eax
+    mov eax, [user_seg_filesz]
+    mov [rf_len_lo], eax
+    mov eax, [user_seg_phys_dst]
+    mov [rf_dst_phys], eax
+    call read_file_bytes_to_phys
+    jc .fail
+
+    mov eax, [user_seg_memsz]
+    cmp eax, [user_seg_filesz]
+    jbe .next_seg
+
+    mov ebx, [user_seg_memsz]
+    sub ebx, [user_seg_filesz]
+    mov edi, [user_seg_phys_dst]
+    add edi, [user_seg_filesz]
     xor al, al
-.zero_code:
-    db 0x64                      ; FS segment override
-    db 0x67                      ; 32-bit address override
-    mov [edi], al
-    inc edi
-    dec ecx
-    jnz .zero_code
-
-    ; Copy user stub into code page
-    mov si, user_stub
-    mov edi, [user_code_phys]
-    mov cx, USER_STUB_LEN
-.copy_stub:
-    mov al, [si]
+.zero_user_bss:
+    test ebx, ebx
+    jz .next_seg
     db 0x64
     db 0x67
     mov [edi], al
-    inc si
     inc edi
-    dec cx
-    jnz .copy_stub
+    dec ebx
+    jmp .zero_user_bss
 
-    ; Zero user stack pages
+.next_seg:
+    inc cx
+    jmp .seg_loop
+
+.done:
+    mov eax, [user_image_pages]
+    shl eax, 12
+    add eax, [user_image_phys]
+    mov [user_stack_phys], eax
+
     mov edi, [user_stack_phys]
     mov ecx, (USER_STACK_PAGES * 4096)
     xor al, al
-.zero_stack:
+.zero_user_stack:
     db 0x64
     db 0x67
     mov [edi], al
     inc edi
     dec ecx
-    jnz .zero_stack
+    jnz .zero_user_stack
 
+    mov eax, [user_stack_phys]
+    add eax, (USER_STACK_PAGES * 4096)
+    mov [max_phys_end], eax
+
+    clc
+    popa
+    ret
+
+.fail:
+    stc
     popa
     ret
 
@@ -1112,11 +1463,21 @@ setup_page_tables:
     mov dword [PD_USER_ADDR + 0x000], (PT_USER_ADDR | 0x007)
     mov dword [PD_USER_ADDR + 0x004], 0
 
-    ; PT_USER[0] -> user code page (RX)
-    mov eax, [user_code_phys]
-    or eax, 0x005                         ; Present | User
-    mov dword [PT_USER_ADDR + (USER_PT_INDEX * 8)], eax
-    mov dword [PT_USER_ADDR + (USER_PT_INDEX * 8) + 4], 0
+    ; PT_USER[0..user_image_pages) -> user image (RW)
+    mov eax, [user_image_phys]
+    or eax, 0x007                         ; Present | Write | User
+    mov edi, PT_USER_ADDR
+    mov ecx, [user_image_pages]
+.user_image_loop:
+    test ecx, ecx
+    jz .user_image_done
+    mov dword [edi + 0], eax
+    mov dword [edi + 4], 0
+    add eax, 0x1000
+    add edi, 8
+    dec ecx
+    jmp .user_image_loop
+.user_image_done:
 
     ; PT_USER[USER_STACK_PT_INDEX..+3] -> user stack pages (RW)
     mov eax, [user_stack_phys]
@@ -1290,9 +1651,9 @@ BITS 16
 align 8
 gdt_unreal:
     dq 0
-    ; 0x08: 32-bit code (not used much here)
+    ; 0x08: 16-bit code (for protected-mode transition)
     dw 0xFFFF, 0x0000
-    db 0x00, 0x9A, 0xCF, 0x00
+    db 0x00, 0x9A, 0x00, 0x00
     ; 0x10: data, base=0, limit=4GiB (for unreal mode cache)
     dw 0xFFFF, 0x0000
     db 0x00, 0x92, 0xCF, 0x00
@@ -1331,27 +1692,14 @@ gdt64_desc:
     dd gdt64
 
 ; =============================================================================
-; BIOS Disk Address Packet (DAP)
-; =============================================================================
-align 4
-dap:
-    db 0x10
-    db 0
-dap_count:
-    dw 0
-dap_off:
-    dw 0
-dap_seg:
-    dw 0
-dap_lba:
-    dq 0
-
-; =============================================================================
 ; Data / state
 ; =============================================================================
 boot_drive:          db 0
 last_int13_status:   db 0
 e820_count:          db 0
+force_chs:           db 0
+chs_spt:             dw CHS_SECTORS
+chs_heads:           dw CHS_HEADS
 
 ; ELF info extracted from header
 elf_e_entry:         dq 0
@@ -1364,16 +1712,38 @@ elf_vaddr_base:      dq 0
 ; We'll set this while loading segments (need to capture PT_DYNAMIC PHDR).
 elf_dyn_vaddr:       dq 0
 max_phys_end:        dd 0
-user_code_phys:      dd 0
+user_image_phys:     dd 0
 user_stack_phys:     dd 0
+user_image_size:     dd 0
+user_image_pages:    dd 0
+
+; Userspace ELF info
+user_e_entry:        dq 0
+user_phoff_lo:       dd 0
+user_phentsize:      dw 0
+user_phnum:          dw 0
+user_vaddr_base:     dq 0
+user_vaddr_end:      dq 0
+
+; Userspace segment temp
+user_seg_file_off:      dd 0
+user_seg_vaddr_lo:      dd 0
+user_seg_vaddr_hi:      dd 0
+user_seg_filesz:        dd 0
+user_seg_memsz:         dd 0
+user_seg_off_from_base: dd 0
+user_seg_phys_dst:      dd 0
 
 ; temp fields for file reads
 rf_file_off_lo:      dd 0
 rf_len_lo:           dd 0
 rf_dst_phys:         dd 0
 rf_bytes_this:       dw 0
+rf_base_lba:         dd 0
 
 tmp_ph_file_off:     dd 0
+tmp_sector_index32:  dd 0
+bios_lba_arg:        dd 0
 
 ; segment temp
 seg_file_off:        dd 0
@@ -1384,11 +1754,6 @@ seg_memsz:           dd 0
 seg_off_from_base:   dd 0
 seg_off_from_base_hi: dd 0
 seg_phys_dst:        dd 0
-
-user_stub:
-    db 0x48, 0xB8, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-    db 0x48, 0xBF, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-    db 0x0F, 0x05, 0xEB, 0xFE
 
 ; Convenience constant so we can refer as memory in 16-bit
 %define TMP_SECTOR_BUF TMP_SECTOR_BUF_OFF

@@ -18,7 +18,7 @@ use saltyos_ska::{BootInfo, BootFlags, PhysAddr, MemoryEntry, MemoryType as SkaM
 use saltyos_bootloader_common::{
     PT_LOAD, parse_elf_header, get_program_headers, init_bootinfo,
     find_load_vaddr_range, find_dynamic_segment,
-    layout::{KERNEL_PHYS_BASE, KERNEL_VIRT_BASE, USER_STACK_PAGES},
+    layout::{KERNEL_PHYS_BASE, KERNEL_VIRT_BASE, USER_CODE_BASE, USER_STACK_BASE, USER_STACK_PAGES},
 };
 
 mod paging;
@@ -99,6 +99,7 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
     // Open kernel.elf
     let kernel_filename = cstr16!("kernel.elf");
+    let userspace_filename = cstr16!("userspace.elf");
     let mut kernel_file = root
         .open(kernel_filename, FileMode::Read, FileAttribute::empty())
         .expect("Failed to open kernel.elf")
@@ -111,8 +112,21 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     let kernel_size = info.file_size();
     let _ = info;
 
-    // Drop kernel_file and print status
+    // Get userspace file size
+    let mut userspace_file = root
+        .open(userspace_filename, FileMode::Read, FileAttribute::empty())
+        .expect("Failed to open userspace.elf")
+        .into_regular_file()
+        .expect("Not a regular file");
+    let info: &mut FileInfo = userspace_file
+        .get_info(&mut info_buf)
+        .expect("Failed to get userspace file info");
+    let userspace_size = info.file_size();
+    let _ = info;
+
+    // Drop file handles and print status
     drop(kernel_file);
+    drop(userspace_file);
     drop(root);
     drop(fs);
 
@@ -133,7 +147,16 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         core::slice::from_raw_parts_mut(kernel_data_ptr as *mut u8, kernel_size as usize)
     };
 
-    // Reopen file and read kernel
+    // Allocate memory for userspace ELF data
+    let userspace_pages = (userspace_size as usize + 4095) / 4096;
+    let userspace_data_ptr = boot_services
+        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, userspace_pages)
+        .expect("Failed to allocate memory for userspace");
+    let userspace_data = unsafe {
+        core::slice::from_raw_parts_mut(userspace_data_ptr as *mut u8, userspace_size as usize)
+    };
+
+    // Reopen file and read kernel/userspace
     let loaded_image = boot_services
         .open_protocol_exclusive::<LoadedImage>(_image_handle)
         .expect("Failed to open LoadedImage protocol");
@@ -154,10 +177,20 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         .read(kernel_data)
         .expect("Failed to read kernel file");
     drop(kernel_file);
+
+    let mut userspace_file = root
+        .open(userspace_filename, FileMode::Read, FileAttribute::empty())
+        .expect("Failed to open userspace.elf")
+        .into_regular_file()
+        .expect("Not a regular file");
+    userspace_file
+        .read(userspace_data)
+        .expect("Failed to read userspace file");
+    drop(userspace_file);
     drop(root);
     drop(fs);
 
-    // Parse ELF
+    // Parse kernel ELF
     let elf_header = parse_elf_header(kernel_data)
         .expect("Invalid ELF header");
     let phdrs = get_program_headers(kernel_data, elf_header);
@@ -214,6 +247,53 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             }
         }
 
+    }
+
+    // Parse userspace ELF
+    let user_elf = parse_elf_header(userspace_data)
+        .expect("Invalid userspace ELF header");
+    let user_phdrs = get_program_headers(userspace_data, user_elf);
+    let (user_vaddr_base, user_vaddr_end) = find_load_vaddr_range(user_phdrs)
+        .expect("No PT_LOAD segments in userspace");
+
+    let user_image_size = (user_vaddr_end - user_vaddr_base) as usize;
+    let user_image_pages = (user_image_size + 4095) / 4096;
+    let stack_offset_pages = ((USER_STACK_BASE - USER_CODE_BASE) / 4096) as usize;
+    if user_image_pages >= stack_offset_pages {
+        panic!("Userspace image overlaps user stack region");
+    }
+
+    let user_image_phys = boot_services
+        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, user_image_pages)
+        .expect("Failed to allocate userspace image");
+
+    for phdr in user_phdrs {
+        if phdr.p_type != PT_LOAD {
+            continue;
+        }
+        let dest_addr = user_image_phys + (phdr.p_vaddr - user_vaddr_base);
+        let src_data = unsafe {
+            core::slice::from_raw_parts(
+                (userspace_data_ptr as usize + phdr.p_offset as usize) as *const u8,
+                phdr.p_filesz as usize,
+            )
+        };
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src_data.as_ptr(),
+                dest_addr as *mut u8,
+                phdr.p_filesz as usize,
+            );
+
+            if phdr.p_memsz > phdr.p_filesz {
+                core::ptr::write_bytes(
+                    (dest_addr + phdr.p_filesz) as *mut u8,
+                    0,
+                    (phdr.p_memsz - phdr.p_filesz) as usize,
+                );
+            }
+        }
     }
 
     // Drop boot_services and print status
@@ -343,10 +423,7 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     }
     let boot_services = system_table.boot_services();
 
-    // Allocate user code + stack pages
-    let user_code_phys = boot_services
-        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
-        .expect("Failed to allocate user code page");
+    // Allocate user stack pages
     let user_stack_pages = USER_STACK_PAGES;
     let user_stack_phys = boot_services
         .allocate_pages(
@@ -356,19 +433,7 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         )
         .expect("Failed to allocate user stack pages");
 
-    // Fill user code page with a tiny syscall loop
-    let user_stub: [u8; 24] = [
-        0x48, 0xb8, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x48, 0xbf, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x0f, 0x05, 0xeb, 0xfe,
-    ];
     unsafe {
-        core::ptr::write_bytes(user_code_phys as *mut u8, 0, 4096);
-        core::ptr::copy_nonoverlapping(
-            user_stub.as_ptr(),
-            user_code_phys as *mut u8,
-            user_stub.len(),
-        );
         core::ptr::write_bytes(
             user_stack_phys as *mut u8,
             0,
@@ -381,7 +446,8 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         paging::create_page_tables(
             kernel_phys_base,
             identity_map_gib,
-            user_code_phys,
+            user_image_phys,
+            user_image_pages,
             user_stack_phys,
             user_stack_pages,
         )

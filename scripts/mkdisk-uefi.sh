@@ -16,6 +16,11 @@ if [ ! -f "build/kernel.elf" ]; then
     echo "Run ./scripts/build.sh first."
     exit 1
 fi
+if [ ! -f "build/userspace.elf" ]; then
+    echo "Error: build/userspace.elf not found!"
+    echo "Run ./scripts/build.sh first."
+    exit 1
+fi
 
 # Create EFI directory structure
 mkdir -p build/uefi-disk/EFI/BOOT
@@ -25,6 +30,7 @@ cp build/BOOTX64.EFI build/uefi-disk/EFI/BOOT/
 
 # Copy kernel
 cp build/kernel.elf build/uefi-disk/
+cp build/userspace.elf build/uefi-disk/
 
 # Create disk image
 dd if=/dev/zero of=build/saltyos-uefi.img bs=1M count=64 2>/dev/null
@@ -48,6 +54,7 @@ if command -v mcopy &> /dev/null; then
     # Copy files
     mcopy -i build/saltyos-uefi.img build/uefi-disk/EFI/BOOT/BOOTX64.EFI ::/EFI/BOOT/
     mcopy -i build/saltyos-uefi.img build/uefi-disk/kernel.elf ::/
+    mcopy -i build/saltyos-uefi.img build/uefi-disk/userspace.elf ::/
 
     echo "Files copied successfully."
 else

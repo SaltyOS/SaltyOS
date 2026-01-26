@@ -29,18 +29,31 @@ else
     echo "Warning: build/stage2.bin not found, BIOS bootloader incomplete"
 fi
 
-# Write kernel starting at sector 10 (5KB offset)
-# This matches 'mov dword [current_sector], 10' in stage2.asm
+# Write kernel starting at sector 33
+# This matches 'mov dword [current_sector], 33' in stage2.asm
 if [ -f "build/kernel.elf" ]; then
     dd if=build/kernel.elf \
        of=build/saltyos-bios.img \
        bs=512 \
-       seek=10 \
+       seek=33 \
        conv=notrunc \
        2>/dev/null
-    echo "Kernel written to disk (at sector 10)"
+    echo "Kernel written to disk (at sector 33)"
 else
     echo "Warning: build/kernel.elf not found"
+fi
+
+# Write userspace ELF starting at sector 2048
+if [ -f "build/userspace.elf" ]; then
+    dd if=build/userspace.elf \
+       of=build/saltyos-bios.img \
+       bs=512 \
+       seek=2048 \
+       conv=notrunc \
+       2>/dev/null
+    echo "Userspace written to disk (at sector 2048)"
+else
+    echo "Warning: build/userspace.elf not found"
 fi
 
 echo "BIOS disk image created: build/saltyos-bios.img"

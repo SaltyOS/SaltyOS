@@ -24,7 +24,8 @@ pub const KERNEL_HIGHER_HALF_BASE: u64 = KERNEL_VIRT_BASE;
 pub unsafe fn create_page_tables(
     kernel_phys_base: u64,
     identity_map_gib: usize,
-    user_code_phys: u64,
+    user_image_phys: u64,
+    user_image_pages: usize,
     user_stack_phys: u64,
     user_stack_pages: usize,
 ) -> u64 {
@@ -81,7 +82,6 @@ pub unsafe fn create_page_tables(
     let user_pml4_idx = ((USER_CODE_BASE >> 39) & 0x1ff) as usize;
     let user_pdpt_idx = ((USER_CODE_BASE >> 30) & 0x1ff) as usize;
     let user_pd_idx = ((USER_CODE_BASE >> 21) & 0x1ff) as usize;
-    let user_pt_idx = ((USER_CODE_BASE >> 12) & 0x1ff) as usize;
     let user_stack_pt_idx = ((USER_STACK_BASE >> 12) & 0x1ff) as usize;
 
     let pdpt_user_addr = allocate_page_table();
@@ -98,10 +98,19 @@ pub unsafe fn create_page_tables(
     pdpt_user[user_pdpt_idx].set_addr(PhysAddr::new(pd_user_addr), user_flags);
     pd_user[user_pd_idx].set_addr(PhysAddr::new(pt_user_addr), user_flags);
 
-    let code_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-    pt_user[user_pt_idx].set_addr(PhysAddr::new(user_code_phys), code_flags);
+    let image_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE;
+    for i in 0..user_image_pages {
+        pt_user[i].set_addr(
+            PhysAddr::new(user_image_phys + (i as u64 * 4096)),
+            image_flags,
+        );
+    }
 
-    let stack_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    let stack_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE;
     for i in 0..user_stack_pages {
         let idx = user_stack_pt_idx + i;
         pt_user[idx].set_addr(

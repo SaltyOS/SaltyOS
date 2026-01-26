@@ -34,6 +34,8 @@ start:
     mov dl, [boot_drive]
     int 0x13
     jc disk_error
+    cmp al, 32
+    jne disk_error
 
     ; --------------------------------------------------------------------------
     ; Verify & Jump
