@@ -1,0 +1,8 @@
+[package]
+name = "saltyos-ssabi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+
+[dependencies]
+bitflags = "2.4"

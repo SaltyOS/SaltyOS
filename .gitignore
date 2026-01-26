@@ -1,0 +1,47 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Build artifacts
+/build/
+*.bin
+*.iso
+*.img
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# QEMU
+*.log
+qemu.log
+qemu.pid
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Debug
+*.debug
+
+# CLion / IntelliJ
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+.clangd/
+.cache/
+
+# Custom build outputs
+disk.img
+os-image.bin
+bootloader.bin
+kernel.bin

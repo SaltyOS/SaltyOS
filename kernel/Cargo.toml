@@ -1,0 +1,20 @@
+[package]
+name = "saltyos-kernel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+build = "build.rs"
+links = "saltyos-kernel"
+
+[dependencies]
+saltyos-ska = { path = "../abi/ska" }
+saltyos-ssabi = { path = "../abi/ssabi" }
+
+[package.metadata.cargo-udeps]
+# Ignore that we only use specific features
+ignore = ["x86_64"]
+
+# Linker script
+[[bin]]
+name = "saltyos-kernel"
+path = "src/main.rs"

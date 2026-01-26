@@ -1,0 +1,6 @@
+[target.x86_64-saltyos-kernel]
+rustflags = [
+    "-C", "link-arg=-Tkernel/linker.ld",
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-pie",
+]
