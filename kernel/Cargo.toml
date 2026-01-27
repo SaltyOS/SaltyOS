@@ -9,6 +9,7 @@ links = "saltyos-kernel"
 [dependencies]
 saltyos-ska = { path = "../abi/ska" }
 saltyos-ssabi = { path = "../abi/ssabi" }
+spin = "0.9"
 
 [package.metadata.cargo-udeps]
 # Ignore that we only use specific features

@@ -13,6 +13,9 @@ pub struct BootInfo {
     /// Boot flags
     pub flags: BootFlags,
 
+    /// Size of this BootInfo struct in bytes (for forward compatibility)
+    pub size: u32,
+
     /// Memory map pointer (physical address)
     pub memory_map: PhysAddr,
 
@@ -33,7 +36,27 @@ pub struct BootInfo {
 
     /// ACPI RSDP pointer (optional)
     pub rsdp: Option<PhysAddr>,
+
+    /// Optional extra data (TLV) physical pointer
+    pub extra: PhysAddr,
+
+    /// Optional extra data length
+    pub extra_len: u32,
 }
+
+// ============================================================================
+// BootInfo Extras (TLV)
+// ============================================================================
+/// Extra entry header
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ExtraHeader {
+    pub kind: u32,
+    pub len: u32,
+}
+
+/// Extra entry kinds
+pub const EXTRA_KIND_MEM_RESERVED: u32 = 1;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -176,9 +199,49 @@ impl PhysAddr {
     }
 }
 
+// ============================================================================
+// Memory Layout Constants
+// ============================================================================
 /// Page size constant
 pub const PAGE_SIZE: u64 = 4096;
 
+/// Kernel physical base address (where bootloader loads kernel)
+pub const KERNEL_PHYS_BASE: u64 = 0x0020_0000;
+
+/// Kernel virtual base address (higher-half kernel)
+pub const KERNEL_VIRT_BASE: u64 = 0xffff_ffff_8000_0000;
+
+/// Direct map offset for physical memory access
+pub const DIRECT_MAP_OFFSET: u64 = 0xffff_8800_0000_0000;
+
+/// Kernel heap base virtual address
+pub const KERNEL_HEAP_BASE: u64 = 0xffff_8900_0000_0000;
+
+/// Initial kernel heap size (256 MB)
+pub const KERNEL_HEAP_SIZE: usize = 256 * 1024 * 1024;
+
+/// Maximum managed physical memory (8 GiB)
+pub const MAX_MANAGED_MEMORY: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Size of kernel image (2 MB)
+pub const KERNEL_SIZE: u64 = 0x0020_0000;
+
+// User space memory layout
+/// User code base address
+pub const USER_CODE_BASE: u64 = 0x0000_0000_4000_0000;
+
+/// User stack base address
+pub const USER_STACK_BASE: u64 = USER_CODE_BASE + 0x0000_0000_0010_0000;
+
+/// User stack size (4 pages = 16 KiB)
+pub const USER_STACK_SIZE: u64 = 4096 * 4;
+
+/// User stack pages count
+pub const USER_STACK_PAGES: u64 = 4;
+
+// ============================================================================
+// BootInfo Constants
+// ============================================================================
 /// Magic number for BootInfo
 pub const BOOTINFO_MAGIC: &[u8; 4] = b"SKA\0";
 

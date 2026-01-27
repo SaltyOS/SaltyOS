@@ -1,0 +1,12 @@
+[package]
+name = "saltyos-bootloader-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+
+[dependencies]
+saltyos-ska = { path = "../../abi/ska" }
+
+[[bin]]
+name = "bootcore"
+path = "src/main.rs"

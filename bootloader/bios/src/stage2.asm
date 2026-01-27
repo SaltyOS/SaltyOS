@@ -1,6 +1,6 @@
 ; =============================================================================
 ; SaltyOS BIOS Stage 2
-; PIE (ET_DYN) ELF64 Loader + Higher-Half Paging + RELA (R_X86_64_RELATIVE)
+; Kernel/bootcore ELF64 loader + minimal paging for bootcore handoff
 ; =============================================================================
 ;
 ; What this stage does:
@@ -13,19 +13,12 @@
 ;      and then load segments to:
 ;        phys_dst = KERNEL_PHYS_BASE + (p_vaddr - vaddr_base)
 ;   5) Zero BSS for each PT_LOAD when p_memsz > p_filesz.
-;   6) Build page tables:
-;        - Identity map 0..1GiB (2MiB pages) for VGA/boot data
-;        - Higher-half map 0xffffffff80000000..+1GiB to phys KERNEL_PHYS_BASE..+1GiB
-;   7) Enter Long Mode.
-;   8) Apply RELA relocations of type R_X86_64_RELATIVE using PT_DYNAMIC tables.
-;   9) Jump to runtime entry:
-;        runtime_entry = KERNEL_VIRT_BASE + (e_entry - vaddr_base)
-;      with RDI = BootInfo pointer.
+;   6) Load bootcore ELF and initrd into memory.
+;   7) Build BootInfo + BootHandoff and enter Long Mode with a minimal identity map.
+;   8) Jump to bootcore entry with RDI = BootHandoff pointer.
 ;
 ; Notes:
-;   - This loader assumes the kernel is PIE (ET_DYN) and uses DT_RELA.
-;   - Only R_X86_64_RELATIVE is handled. If your kernel produces other types,
-;     you must extend relocation handling.
+;   - Kernel must be PIE (ET_DYN); relocations are applied by bootcore.
 ;   - All addresses here are "physical" until paging is enabled.
 ; =============================================================================
 
@@ -36,6 +29,8 @@ ORG 0x7E00
 ; Tunables / constants
 ; -----------------------------------------------------------------------------
 %include "layout.inc"
+%include "ska.inc"
+%include "bootcore.inc"
 %define VGA_SEG                 0xB800
 %define VGA_LINEAR              0xB8000
 
@@ -48,26 +43,34 @@ ORG 0x7E00
 %define TMP_SECTOR_BUF_OFF      0x0500
 
 %define KERNEL_LBA_START        33              ; must match mkdisk-bios.sh seek
-%define USER_LBA_START          2048
-; KERNEL_PHYS_BASE, KERNEL_VIRT_BASE, USER_* constants come from layout.inc
+%define BOOTCORE_LBA_START      4096
+%define INITRD_LBA_START        2048
+; KERNEL_PHYS_BASE/KERNEL_VIRT_BASE constants come from layout.inc
 
 %define BOOTINFO_PHYS_ADDR      0x00006000      ; low memory BootInfo for now
+%define BOOTCORE_HANDOFF_PHYS   0x00006800      ; low memory handoff buffer
+%define BOOTCORE_PT_ARENA_BASE  0x00018000
+%define BOOTCORE_PT_ARENA_SIZE  0x00010000
+%define BOOTEXTRA_PHYS          0x0000A000
 
 %define PML4_ADDR               0x00001000
 %define PDPT_LOW_ADDR           0x00002000
 %define PD_LOW_ADDR             0x00003000
-%define PDPT_HIGH_ADDR          0x00004000
-%define PD_HIGH_ADDR            0x00005000
-%define PDPT_USER_ADDR          0x00012000
-%define PD_USER_ADDR            0x00013000
-%define PT_USER_ADDR            0x00014000
+; Only identity paging tables are needed to reach bootcore.
+%define PD_LOW1_ADDR            0x00015000
+%define PD_LOW2_ADDR            0x00016000
+%define PD_LOW3_ADDR            0x00017000
 
 %define CHS_HEADS               16
 %define CHS_SECTORS             63
 
 %define CR0_PE                  0x00000001
+%define CR0_MP                  0x00000002
+%define CR0_EM                  0x00000004
 %define CR0_PG                  0x80000000
 %define CR4_PAE                 0x00000020
+%define CR4_OSFXSR              0x00000200
+%define CR4_OSXMMEXCPT          0x00000400
 
 ; Serial I/O (COM1)
 %define COM1_PORT               0x3F8
@@ -82,15 +85,6 @@ ORG 0x7E00
 
 %define PT_LOAD                 1
 %define PT_DYNAMIC              2
-
-; Dynamic tags
-%define DT_NULL                 0
-%define DT_RELA                 7
-%define DT_RELASZ               8
-%define DT_RELAENT              9
-
-; x86_64 relocation
-%define R_X86_64_RELATIVE       8
 
 ; E820 memory map (BIOS INT 15h, EAX=E820h)
 %define E820_BUF_PHYS            0x00007000      ; safe low memory buffer (< 0x7C00)
@@ -149,13 +143,20 @@ start:
     mov al, 'S'
     call serial_putc
 
-    ; Load userspace ELF into physical memory
-    call user_elf_read_and_analyze
+    ; Load bootcore ELF (common bootloader core)
+    call bootcore_elf_read_and_analyze
     jc  fatal_elf
-    call user_elf_load_segments_unreal
+    call bootcore_elf_load_segments_unreal
     jc  fatal_disk
-    ; Debug: userspace loaded OK
-    mov al, 'U'
+    ; Debug: bootcore loaded OK
+    mov al, 'C'
+    call serial_putc
+
+    ; Load initrd into physical memory
+    call initrd_load
+    jc  fatal_disk
+    ; Debug: initrd loaded OK
+    mov al, 'I'
     call serial_putc
 
     ; Query BIOS memory map (E820) BEFORE building BootInfo
@@ -174,6 +175,8 @@ start:
 
     ; Build BootInfo AFTER we have the memory map
     call build_bootinfo
+    ; Initialize bootcore handoff structure
+    call init_bootcore_handoff
 
     ; Setup paging and enter long mode
     cli
@@ -197,12 +200,12 @@ pm32_entry:
 
     mov esp, 0x90000
 
-    ; Build page tables (identity low + higher-half kernel mapping)
+    ; Build page tables (identity mapping only)
     call setup_page_tables
 
-    ; Enable PAE
+    ; Enable PAE and SSE support
     mov eax, cr4
-    or eax, CR4_PAE
+    or eax, (CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT)
     mov cr4, eax
 
     ; Load CR3 (PML4 base)
@@ -215,9 +218,10 @@ pm32_entry:
     or eax, (1 << 8)
     wrmsr
 
-    ; Enable paging (CR0.PG)
+    ; Enable paging (CR0.PG) and clear EM/set MP for SSE
     mov eax, cr0
-    or eax, CR0_PG
+    and eax, ~CR0_EM
+    or eax, (CR0_PG | CR0_MP)
     mov cr0, eax
 
     ; Load 64-bit GDT and far jump to long mode
@@ -225,7 +229,7 @@ pm32_entry:
     jmp 0x08:lm64_entry
 
 ; =============================================================================
-; 64-bit long mode: apply RELA relocations and jump to kernel entry
+; 64-bit long mode: jump to bootcore entry
 ; =============================================================================
 BITS 64
 lm64_entry:
@@ -236,21 +240,44 @@ lm64_entry:
     mov fs, ax
     mov gs, ax
 
-    mov rsp, 0x90000
+    ; Ensure SysV ABI stack alignment (RSP % 16 == 8 at function entry)
+    mov rsp, 0x8fff8
 
-    ; Apply relocations (R_X86_64_RELATIVE) if present
-    call apply_relocations_rela_relative
+    ; Fill BootHandoff kernel fields for bootcore
+    mov rbx, BOOTCORE_HANDOFF_PHYS
 
-    ; Compute runtime entry:
-    ; runtime_entry = KERNEL_VIRT_BASE + (e_entry - vaddr_base)
-    mov rax, [elf_e_entry]           ; original link-time virtual e_entry
-    mov rbx, [elf_vaddr_base]        ; min PT_LOAD vaddr
-    sub rax, rbx                     ; entry offset from base
-    mov rcx, KERNEL_VIRT_BASE
-    add rax, rcx                     ; runtime entry VA in higher half
+    mov rax, KERNEL_PHYS_BASE
+    mov [rbx + BOOTHANDOFF_OFF_KERNEL_PHYS_BASE], rax
 
-    ; Pass BootInfo pointer in RDI (System V AMD64 ABI)
-    mov rdi, BOOTINFO_PHYS_ADDR      ; identity mapped low mem is still valid
+    mov rax, [elf_vaddr_base]
+    mov [rbx + BOOTHANDOFF_OFF_KERNEL_VADDR], rax
+
+    mov rax, [elf_e_entry]
+    mov [rbx + BOOTHANDOFF_OFF_KERNEL_ENTRY], rax
+
+    mov rax, [elf_dyn_vaddr]
+    test rax, rax
+    jz .no_dyn
+    mov rcx, [elf_vaddr_base]
+    sub rax, rcx
+    add rax, KERNEL_PHYS_BASE
+    mov [rbx + BOOTHANDOFF_OFF_KERNEL_DYN_PHYS], rax
+    mov rax, [elf_dyn_size]
+    mov [rbx + BOOTHANDOFF_OFF_KERNEL_DYN_SIZE], rax
+    jmp .dyn_done
+.no_dyn:
+    mov qword [rbx + BOOTHANDOFF_OFF_KERNEL_DYN_PHYS], 0
+    mov qword [rbx + BOOTHANDOFF_OFF_KERNEL_DYN_SIZE], 0
+.dyn_done:
+
+    ; Jump to bootcore entry (identity mapped)
+    mov rax, [bootcore_e_entry]
+    mov rcx, [bootcore_vaddr_base]
+    sub rax, rcx
+    mov rdx, BOOTCORE_PHYS_BASE
+    add rax, rdx
+
+    mov rdi, BOOTCORE_HANDOFF_PHYS
     jmp rax
 
 .hang:
@@ -805,6 +832,8 @@ elf_load_segments_unreal:
     ; Initialize elf_dyn_vaddr to 0 (no PT_DYNAMIC found yet)
     mov dword [elf_dyn_vaddr], 0
     mov dword [elf_dyn_vaddr+4], 0
+    mov dword [elf_dyn_size], 0
+    mov dword [elf_dyn_size+4], 0
     mov dword [max_phys_end], KERNEL_PHYS_BASE
 
     xor cx, cx
@@ -833,6 +862,10 @@ elf_load_segments_unreal:
     mov dword [elf_dyn_vaddr], eax
     mov eax, dword [TMP_SECTOR_BUF + 0x14]
     mov dword [elf_dyn_vaddr+4], eax
+    ; Save PT_DYNAMIC p_memsz (u64 @ offset 0x28, low32 only)
+    mov eax, dword [TMP_SECTOR_BUF + 0x28]
+    mov dword [elf_dyn_size], eax
+    mov dword [elf_dyn_size+4], 0
     jmp .next_seg
 
 .not_dynamic:
@@ -929,16 +962,14 @@ elf_load_segments_unreal:
     ret
 
 ; -----------------------------------------------------------------------------
-; user_elf_read_and_analyze
-;   - Reads userspace ELF header + PHDRs from USER_LBA_START
-;   - Computes vaddr_base/vaddr_end among PT_LOAD
-;   - Computes user_image_size/pages and validates stack offset
+; bootcore_elf_read_and_analyze
+;   - Reads bootcore ELF header (BOOTCORE_LBA_START)
+;   - Computes vaddr_base among PT_LOAD
 ; -----------------------------------------------------------------------------
-user_elf_read_and_analyze:
+bootcore_elf_read_and_analyze:
     pusha
 
-    mov dword [rf_base_lba], USER_LBA_START
-
+    mov dword [rf_base_lba], BOOTCORE_LBA_START
     mov dword [rf_file_off_lo], 0
     mov dword [rf_len_lo], 512
     mov dword [rf_dst_phys], TMP_SECTOR_BUF
@@ -964,32 +995,30 @@ user_elf_read_and_analyze:
     jne .bad
 
     mov eax, dword [TMP_SECTOR_BUF + 0x18]
-    mov dword [user_e_entry], eax
+    mov dword [bootcore_e_entry], eax
     mov eax, dword [TMP_SECTOR_BUF + 0x1C]
-    mov dword [user_e_entry+4], eax
+    mov dword [bootcore_e_entry+4], eax
 
     mov eax, dword [TMP_SECTOR_BUF + 0x20]
-    mov [user_phoff_lo], eax
+    mov [bootcore_phoff_lo], eax
 
     mov ax, word [TMP_SECTOR_BUF + 0x36]
-    mov [user_phentsize], ax
+    mov [bootcore_phentsize], ax
     mov ax, word [TMP_SECTOR_BUF + 0x38]
-    mov [user_phnum], ax
+    mov [bootcore_phnum], ax
 
-    mov dword [user_vaddr_base], 0xFFFFFFFF
-    mov dword [user_vaddr_base+4], 0xFFFFFFFF
-    mov dword [user_vaddr_end], 0
-    mov dword [user_vaddr_end+4], 0
+    mov dword [bootcore_vaddr_base], 0xFFFFFFFF
+    mov dword [bootcore_vaddr_base+4], 0xFFFFFFFF
 
     xor cx, cx
 .ph_loop:
-    cmp cx, [user_phnum]
+    cmp cx, [bootcore_phnum]
     jae .done
 
     movzx eax, cx
-    movzx ebx, word [user_phentsize]
+    movzx ebx, word [bootcore_phentsize]
     imul eax, ebx
-    add eax, [user_phoff_lo]
+    add eax, [bootcore_phoff_lo]
 
     mov dword [rf_file_off_lo], eax
     mov dword [rf_len_lo], 56
@@ -1003,74 +1032,24 @@ user_elf_read_and_analyze:
     mov eax, dword [TMP_SECTOR_BUF + 0x10]
     mov edx, dword [TMP_SECTOR_BUF + 0x14]
 
-    mov ebx, dword [user_vaddr_base+4]
+    mov ebx, dword [bootcore_vaddr_base+4]
     cmp edx, ebx
     jb  .update
-    ja  .maybe_end
-    mov ebx, dword [user_vaddr_base]
+    ja  .next
+    mov ebx, dword [bootcore_vaddr_base]
     cmp eax, ebx
-    jae .maybe_end
+    jae .next
 .update:
-    mov dword [user_vaddr_base], eax
-    mov dword [user_vaddr_base+4], edx
-    ; Debug: found PT_LOAD, updated vaddr_base
-    pusha
-    mov al, 'P'
-    call serial_putc
-    popa
-
-.maybe_end:
-    mov eax, dword [TMP_SECTOR_BUF + 0x10]
-    mov edx, dword [TMP_SECTOR_BUF + 0x14]
-    mov ebx, dword [TMP_SECTOR_BUF + 0x28]
-    add eax, ebx
-    adc edx, 0
-    mov ebx, dword [user_vaddr_end+4]
-    cmp edx, ebx
-    jb .next
-    ja .update_end
-    mov ebx, dword [user_vaddr_end]
-    cmp eax, ebx
-    jbe .next
-.update_end:
-    mov dword [user_vaddr_end], eax
-    mov dword [user_vaddr_end+4], edx
+    mov dword [bootcore_vaddr_base], eax
+    mov dword [bootcore_vaddr_base+4], edx
 
 .next:
     inc cx
     jmp .ph_loop
 
 .done:
-    ; Debug: about to do final validation
-    pusha
-    mov al, 'V'
-    call serial_putc
-    popa
-
-    cmp dword [user_vaddr_base+4], 0xFFFFFFFF
+    cmp dword [bootcore_vaddr_base+4], 0xFFFFFFFF
     je .bad
-
-    mov eax, [user_vaddr_end]
-    mov edx, [user_vaddr_end+4]
-    sub eax, dword [user_vaddr_base]
-    sbb edx, dword [user_vaddr_base+4]
-    test edx, edx
-    jne .bad
-
-    mov [user_image_size], eax
-    add eax, 0x0FFF
-    shr eax, 12
-    mov [user_image_pages], eax
-
-    cmp eax, USER_STACK_PT_INDEX
-    jae .bad
-
-    ; Debug: all validation passed, returning success
-    pusha
-    mov al, 'S'
-    call serial_putc
-    popa
-
     clc
     popa
     ret
@@ -1081,30 +1060,23 @@ user_elf_read_and_analyze:
     ret
 
 ; -----------------------------------------------------------------------------
-; user_elf_load_segments_unreal
-;   - Loads user PT_LOAD segments into user_image_phys
-;   - Zeros BSS
-;   - Allocates and zeros user stack pages
+; bootcore_elf_load_segments_unreal
+;   - Loads bootcore PT_LOAD segments into BOOTCORE_PHYS_BASE
 ; -----------------------------------------------------------------------------
-user_elf_load_segments_unreal:
+bootcore_elf_load_segments_unreal:
     pusha
 
-    mov dword [rf_base_lba], USER_LBA_START
-
-    mov eax, [max_phys_end]
-    add eax, 0x0FFF
-    and eax, 0xFFFFF000
-    mov [user_image_phys], eax
+    mov dword [rf_base_lba], BOOTCORE_LBA_START
 
     xor cx, cx
 .seg_loop:
-    cmp cx, [user_phnum]
+    cmp cx, [bootcore_phnum]
     jae .done
 
     movzx eax, cx
-    movzx ebx, word [user_phentsize]
+    movzx ebx, word [bootcore_phentsize]
     imul eax, ebx
-    add eax, [user_phoff_lo]
+    add eax, [bootcore_phoff_lo]
 
     mov dword [rf_file_off_lo], eax
     mov dword [rf_len_lo], 56
@@ -1116,50 +1088,52 @@ user_elf_load_segments_unreal:
     jne .next_seg
 
     mov eax, dword [TMP_SECTOR_BUF + 0x08]
-    mov [user_seg_file_off], eax
+    mov [seg_file_off], eax
 
     mov eax, dword [TMP_SECTOR_BUF + 0x10]
     mov edx, dword [TMP_SECTOR_BUF + 0x14]
-    mov [user_seg_vaddr_lo], eax
-    mov [user_seg_vaddr_hi], edx
+    mov [seg_vaddr_lo], eax
+    mov [seg_vaddr_hi], edx
 
     mov eax, dword [TMP_SECTOR_BUF + 0x20]
-    mov [user_seg_filesz], eax
+    mov [seg_filesz], eax
 
     mov eax, dword [TMP_SECTOR_BUF + 0x28]
-    mov [user_seg_memsz], eax
+    mov [seg_memsz], eax
 
-    mov eax, [user_seg_vaddr_lo]
-    mov edx, [user_seg_vaddr_hi]
-    sub eax, dword [user_vaddr_base]
-    sbb edx, dword [user_vaddr_base+4]
+    mov eax, [seg_vaddr_lo]
+    mov edx, [seg_vaddr_hi]
+    sub eax, dword [bootcore_vaddr_base]
+    sbb edx, dword [bootcore_vaddr_base+4]
+    mov [seg_off_from_base], eax
+    mov [seg_off_from_base_hi], edx
     test edx, edx
     jne .fail
-    mov [user_seg_off_from_base], eax
 
-    mov eax, [user_image_phys]
-    add eax, [user_seg_off_from_base]
-    mov [user_seg_phys_dst], eax
+    mov eax, BOOTCORE_PHYS_BASE
+    add eax, [seg_off_from_base]
+    mov [seg_phys_dst], eax
 
-    mov eax, [user_seg_file_off]
+    mov eax, [seg_file_off]
     mov [rf_file_off_lo], eax
-    mov eax, [user_seg_filesz]
+    mov eax, [seg_filesz]
     mov [rf_len_lo], eax
-    mov eax, [user_seg_phys_dst]
+    mov eax, [seg_phys_dst]
     mov [rf_dst_phys], eax
     call read_file_bytes_to_phys
     jc .fail
 
-    mov eax, [user_seg_memsz]
-    cmp eax, [user_seg_filesz]
+    mov eax, [seg_memsz]
+    cmp eax, [seg_filesz]
     jbe .next_seg
 
-    mov ebx, [user_seg_memsz]
-    sub ebx, [user_seg_filesz]
-    mov edi, [user_seg_phys_dst]
-    add edi, [user_seg_filesz]
+    mov ebx, [seg_memsz]
+    sub ebx, [seg_filesz]
+    mov edi, [seg_phys_dst]
+    add edi, [seg_filesz]
     xor al, al
-.zero_user_bss:
+
+.zero_loop:
     test ebx, ebx
     jz .next_seg
     db 0x64
@@ -1167,38 +1141,76 @@ user_elf_load_segments_unreal:
     mov [edi], al
     inc edi
     dec ebx
-    jmp .zero_user_bss
+    jmp .zero_loop
 
 .next_seg:
     inc cx
     jmp .seg_loop
 
 .done:
-    mov eax, [user_image_pages]
-    shl eax, 12
-    add eax, [user_image_phys]
-    mov [user_stack_phys], eax
+    clc
+    popa
+    ret
 
-    mov edi, [user_stack_phys]
-    mov ecx, (USER_STACK_PAGES * 4096)
-    xor al, al
-.zero_user_stack:
-    db 0x64
-    db 0x67
-    mov [edi], al
-    inc edi
-    dec ecx
-    jnz .zero_user_stack
+.fail:
+    stc
+    popa
+    ret
 
-    mov eax, [user_stack_phys]
-    add eax, (USER_STACK_PAGES * 4096)
+; -----------------------------------------------------------------------------
+; initrd_load
+;   - Reads initrd size header at INITRD_LBA_START (first 8 bytes)
+;   - Loads initrd data from INITRD_LBA_START+1 into memory
+; -----------------------------------------------------------------------------
+initrd_load:
+    pusha
+
+    mov dword [rf_base_lba], INITRD_LBA_START
+    mov dword [rf_file_off_lo], 0
+    mov dword [rf_len_lo], 512
+    mov dword [rf_dst_phys], TMP_SECTOR_BUF
+    call read_file_bytes_to_phys
+    jc .bad
+
+    mov eax, [TMP_SECTOR_BUF + 0x00]
+    mov dword [initrd_size], eax
+    mov eax, [TMP_SECTOR_BUF + 0x04]
+    mov dword [initrd_size+4], eax
+
+    mov eax, [initrd_size]
+    mov edx, [initrd_size+4]
+    test eax, eax
+    jnz .load
+    test edx, edx
+    jnz .load
+    clc
+    popa
+    ret
+
+.load:
+    mov eax, [max_phys_end]
+    add eax, 0x0FFF
+    and eax, 0xFFFFF000
+    mov [initrd_phys], eax
+
+    mov dword [rf_base_lba], INITRD_LBA_START + 1
+    mov dword [rf_file_off_lo], 0
+    mov eax, [initrd_size]
+    mov [rf_len_lo], eax
+    mov eax, [initrd_phys]
+    mov [rf_dst_phys], eax
+    call read_file_bytes_to_phys
+    jc .bad
+
+    mov eax, [initrd_phys]
+    add eax, [initrd_size]
     mov [max_phys_end], eax
 
     clc
     popa
     ret
 
-.fail:
+.bad:
     stc
     popa
     ret
@@ -1230,26 +1242,149 @@ build_bootinfo:
     jnz .clear_loop
     pop di
 
-    ; magic "SKA\0" = 0x00414B53 (little-endian: 'S', 'K', 'A', 0)
-    mov dword [di + 0], 0x00414B53
+    ; magic "SKA\0"
+    mov dword [di + BOOTINFO_OFF_MAGIC], BOOTINFO_MAGIC_DWORD
 
-    ; version = 0x0001 (u32 at offset +4)
-    mov dword [di + 4], 0x0001
+    ; version
+    mov dword [di + BOOTINFO_OFF_VERSION], BOOTINFO_VERSION
 
-    ; flags = BIOS = 0x02 (BootFlags::BIOS, u32 at offset +8)
-    mov dword [di + 8], 0x02
+    ; flags = BIOS
+    mov dword [di + BOOTINFO_OFF_FLAGS], BOOTFLAG_BIOS
 
-    ; memory_map (u64 physical address at offset +16)
-    mov dword [di + 16], E820_BUF_PHYS   ; low 32 bits
-    mov dword [di + 20], 0               ; high 32 bits
+    ; size = 0 (bootcore will write correct size)
+    mov dword [di + BOOTINFO_OFF_SIZE], 0
 
-    ; memory_map_entries (u32 at offset +24)
+    ; memory_map (u64 physical address)
+    mov dword [di + BOOTINFO_OFF_MEMORY_MAP], E820_BUF_PHYS   ; low 32 bits
+    mov dword [di + BOOTINFO_OFF_MEMORY_MAP + 4], 0           ; high 32 bits
+
+    ; memory_map_entries
     xor eax, eax
     mov al, [e820_count]
-    mov dword [di + 24], eax
+    mov dword [di + BOOTINFO_OFF_MEMORY_MAP_ENT], eax
 
     ; All other fields (framebuffer, initrd, cmdline, rsdp) are already 0
     ; which is safe - kernel will check flags before using them
+
+    popa
+    ret
+
+; -----------------------------------------------------------------------------
+; init_bootcore_handoff
+;   Initialize BootHandoff structure for bootcore (BootContext + pointers).
+; -----------------------------------------------------------------------------
+init_bootcore_handoff:
+    pusha
+    mov di, BOOTCORE_HANDOFF_PHYS
+
+    ; Zero the whole handoff area
+    mov cx, BOOTHANDOFF_SIZE
+    xor al, al
+.handoff_clear:
+    mov [di], al
+    inc di
+    dec cx
+    jnz .handoff_clear
+
+    mov di, BOOTCORE_HANDOFF_PHYS
+
+    ; Build extra TLV: reserved ranges
+    ; [kind=u32][len=u32][count=u32][(base:u64,size:u64)*count]
+    push di
+    mov di, BOOTEXTRA_PHYS
+    mov dword [di + 0], 1            ; EXTRA_KIND_MEM_RESERVED
+    mov dword [di + 4], 52           ; len = 4 + 3*16
+    mov dword [di + 8], 3            ; count
+    ; entry 0: bootcore (1 MiB, 1 MiB)
+    mov dword [di + 12], BOOTCORE_PHYS_BASE
+    mov dword [di + 16], 0
+    mov dword [di + 20], 0x00100000
+    mov dword [di + 24], 0
+    ; entry 1: bootinfo+handoff+extra (0x6000..0xC000)
+    mov dword [di + 28], 0x00006000
+    mov dword [di + 32], 0
+    mov dword [di + 36], 0x00006000
+    mov dword [di + 40], 0
+    ; entry 2: page table arena (0x18000..0x28000)
+    mov dword [di + 44], BOOTCORE_PT_ARENA_BASE
+    mov dword [di + 48], 0
+    mov dword [di + 52], BOOTCORE_PT_ARENA_SIZE
+    mov dword [di + 56], 0
+    pop di
+
+    ; BootContext.flags = BIOS (+ INITRD if available)
+    mov eax, BOOTFLAG_BIOS
+    mov ebx, [initrd_size]
+    mov ecx, [initrd_size+4]
+    test ebx, ebx
+    jnz .set_initrd_flag
+    test ecx, ecx
+    jz .flags_done
+.set_initrd_flag:
+    or eax, BOOTFLAG_INITRD
+.flags_done:
+    mov dword [di + BOOTCTX_OFF_FLAGS], eax
+
+    ; BootContext.memory_map = E820 buffer (phys)
+    mov dword [di + BOOTCTX_OFF_MEMORY_MAP], E820_BUF_PHYS
+    mov dword [di + BOOTCTX_OFF_MEMORY_MAP + 4], 0
+
+    ; BootContext.memory_map_entries = e820_count
+    xor eax, eax
+    mov al, [e820_count]
+    mov dword [di + BOOTCTX_OFF_MEMORY_MAP_ENT], eax
+
+    ; BootHandoff.bootinfo_ptr = BOOTINFO_PHYS_ADDR
+    mov dword [di + BOOTHANDOFF_OFF_BOOTINFO_PTR], BOOTINFO_PHYS_ADDR
+    mov dword [di + BOOTHANDOFF_OFF_BOOTINFO_PTR + 4], 0
+
+    ; BootContext.initrd (ModuleInfo) if available
+    mov eax, [initrd_size]
+    mov ecx, [initrd_size+4]
+    test eax, eax
+    jnz .set_initrd
+    test ecx, ecx
+    jz .skip_initrd
+.set_initrd:
+    mov eax, [initrd_phys]
+    mov dword [di + BOOTCTX_OFF_INITRD], eax
+    mov dword [di + BOOTCTX_OFF_INITRD + 4], 0
+    mov eax, [initrd_size]
+    mov dword [di + BOOTCTX_OFF_INITRD + 8], eax
+    mov dword [di + BOOTCTX_OFF_INITRD + 12], 0
+.skip_initrd:
+
+    ; BootHandoff.user_image_phys/pages (disabled)
+    xor eax, eax
+    mov dword [di + BOOTHANDOFF_OFF_USER_IMAGE_PHYS], eax
+    mov dword [di + BOOTHANDOFF_OFF_USER_IMAGE_PHYS + 4], 0
+    xor eax, eax
+    mov dword [di + BOOTHANDOFF_OFF_USER_IMAGE_PAGES], eax
+    mov dword [di + BOOTHANDOFF_OFF_USER_IMAGE_PAGES + 4], 0
+
+    ; BootHandoff.user_stack_phys/pages
+    xor eax, eax
+    mov dword [di + BOOTHANDOFF_OFF_USER_STACK_PHYS], eax
+    mov dword [di + BOOTHANDOFF_OFF_USER_STACK_PHYS + 4], 0
+    xor eax, eax
+    mov dword [di + BOOTHANDOFF_OFF_USER_STACK_PAGES], eax
+    mov dword [di + BOOTHANDOFF_OFF_USER_STACK_PAGES + 4], 0
+
+    ; BootHandoff page table arena
+    mov dword [di + BOOTHANDOFF_OFF_PT_ALLOC_BASE], BOOTCORE_PT_ARENA_BASE
+    mov dword [di + BOOTHANDOFF_OFF_PT_ALLOC_BASE + 4], 0
+    mov dword [di + BOOTHANDOFF_OFF_PT_ALLOC_SIZE], BOOTCORE_PT_ARENA_SIZE
+    mov dword [di + BOOTHANDOFF_OFF_PT_ALLOC_SIZE + 4], 0
+
+    ; BootHandoff identity map size (GiB)
+    mov dword [di + BOOTHANDOFF_OFF_IDENTITY_GIB], 4
+    mov dword [di + BOOTHANDOFF_OFF_IDENTITY_GIB + 4], 0
+
+    ; BootHandoff extra pointer/len
+    mov dword [di + BOOTHANDOFF_OFF_EXTRA_PTR], BOOTEXTRA_PHYS
+    mov dword [di + BOOTHANDOFF_OFF_EXTRA_PTR + 4], 0
+    mov dword [di + BOOTHANDOFF_OFF_EXTRA_LEN], 60
+    mov dword [di + BOOTHANDOFF_OFF_EXTRA_LEN + 4], 0
 
     popa
     ret
@@ -1361,20 +1496,20 @@ e820_to_memory_map:
     je .type_acpi_nvs
     cmp eax, 5
     je .type_unusable
-    mov eax, 2
+    mov eax, SKA_MEM_RESERVED
     jmp .store
 
 .type_usable:
-    mov eax, 1
+    mov eax, SKA_MEM_USABLE
     jmp .store
 .type_acpi_reclaim:
-    mov eax, 3
+    mov eax, SKA_MEM_ACPI_RECLAIM
     jmp .store
 .type_acpi_nvs:
-    mov eax, 4
+    mov eax, SKA_MEM_ACPI_NVS
     jmp .store
 .type_unusable:
-    mov eax, 5
+    mov eax, SKA_MEM_UNUSABLE
 
 .store:
     mov [si + 16], eax
@@ -1391,19 +1526,24 @@ e820_to_memory_map:
 ; =============================================================================
 BITS 32
 setup_page_tables:
-    ; Clear PML4 + PDPTs + PDs (5 pages)
+    ; Clear PML4 + PDPT + PDs (identity map only)
     mov edi, PML4_ADDR
     xor eax, eax
-    mov ecx, (4096 * 5) / 4
-    rep stosd
-    ; Clear user paging tables
-    mov edi, PDPT_USER_ADDR
     mov ecx, 4096 / 4
     rep stosd
-    mov edi, PD_USER_ADDR
+    mov edi, PDPT_LOW_ADDR
     mov ecx, 4096 / 4
     rep stosd
-    mov edi, PT_USER_ADDR
+    mov edi, PD_LOW_ADDR
+    mov ecx, 4096 / 4
+    rep stosd
+    mov edi, PD_LOW1_ADDR
+    mov ecx, 4096 / 4
+    rep stosd
+    mov edi, PD_LOW2_ADDR
+    mov ecx, 4096 / 4
+    rep stosd
+    mov edi, PD_LOW3_ADDR
     mov ecx, 4096 / 4
     rep stosd
 
@@ -1411,20 +1551,15 @@ setup_page_tables:
     mov dword [PML4_ADDR + 0x000], (PDPT_LOW_ADDR | 0x003)
     mov dword [PML4_ADDR + 0x004], 0
 
-    ; PML4[511] -> PDPT_HIGH (higher-half mapping)
-    mov dword [PML4_ADDR + 0xFF8], (PDPT_HIGH_ADDR | 0x003)
-    mov dword [PML4_ADDR + 0xFFC], 0
-
-    ; PDPT_LOW[0] -> PD_LOW (maps 0..1GiB identity, supervisor-only)
+    ; PDPT_LOW[0..3] -> PD_LOW0..3 (maps 0..4GiB identity, supervisor-only)
     mov dword [PDPT_LOW_ADDR + 0x000], (PD_LOW_ADDR | 0x003)
     mov dword [PDPT_LOW_ADDR + 0x004], 0
-
-    ; PDPT_HIGH[510] -> PD_HIGH
-    ; For KERNEL_VIRT_BASE = 0xffffffff80000000:
-    ;   PML4 index = 511, PDPT index = 510
-    ;   PDPT slot offset = 510*8 = 0xFF0
-    mov dword [PDPT_HIGH_ADDR + 0xFF0], (PD_HIGH_ADDR | 0x003)
-    mov dword [PDPT_HIGH_ADDR + 0xFF4], 0
+    mov dword [PDPT_LOW_ADDR + 0x008], (PD_LOW1_ADDR | 0x003)
+    mov dword [PDPT_LOW_ADDR + 0x00C], 0
+    mov dword [PDPT_LOW_ADDR + 0x010], (PD_LOW2_ADDR | 0x003)
+    mov dword [PDPT_LOW_ADDR + 0x014], 0
+    mov dword [PDPT_LOW_ADDR + 0x018], (PD_LOW3_ADDR | 0x003)
+    mov dword [PDPT_LOW_ADDR + 0x01C], 0
 
     ; Fill PD_LOW with 2MiB identity pages (0..1GiB, supervisor-only)
     mov edi, PD_LOW_ADDR
@@ -1436,212 +1571,37 @@ setup_page_tables:
     add eax, 0x200000
     add edi, 8
     loop .pd_low_loop
-
-    ; Fill PD_HIGH with 2MiB pages mapping:
-    ;   VA = KERNEL_VIRT_BASE + i*2MiB
-    ;   PA = KERNEL_PHYS_BASE + i*2MiB
-    mov edi, PD_HIGH_ADDR
-    mov eax, (KERNEL_PHYS_BASE | 0x83)
+    ; Fill PD_LOW1 with 2MiB identity pages (1..2GiB, supervisor-only)
+    mov edi, PD_LOW1_ADDR
+    mov eax, 0x40000083                  ; 1GiB | Present | Write | PS(2MiB)
     mov ecx, 512
-.pd_high_loop:
+.pd_low1_loop:
     mov dword [edi + 0], eax
     mov dword [edi + 4], 0
     add eax, 0x200000
     add edi, 8
-    loop .pd_high_loop
-
-    ; User mapping at USER_CODE_BASE
-    ; PML4[USER_PML4_INDEX] -> PDPT_USER
-    mov dword [PML4_ADDR + (USER_PML4_INDEX * 8)], (PDPT_USER_ADDR | 0x007)
-    mov dword [PML4_ADDR + (USER_PML4_INDEX * 8) + 4], 0
-
-    ; PDPT_USER[0] -> PD_USER
-    mov dword [PDPT_USER_ADDR + 0x000], (PD_USER_ADDR | 0x007)
-    mov dword [PDPT_USER_ADDR + 0x004], 0
-
-    ; PD_USER[0] -> PT_USER
-    mov dword [PD_USER_ADDR + 0x000], (PT_USER_ADDR | 0x007)
-    mov dword [PD_USER_ADDR + 0x004], 0
-
-    ; PT_USER[0..user_image_pages) -> user image (RW)
-    mov eax, [user_image_phys]
-    or eax, 0x007                         ; Present | Write | User
-    mov edi, PT_USER_ADDR
-    mov ecx, [user_image_pages]
-.user_image_loop:
-    test ecx, ecx
-    jz .user_image_done
+    loop .pd_low1_loop
+    ; Fill PD_LOW2 with 2MiB identity pages (2..3GiB, supervisor-only)
+    mov edi, PD_LOW2_ADDR
+    mov eax, 0x80000083                  ; 2GiB | Present | Write | PS(2MiB)
+    mov ecx, 512
+.pd_low2_loop:
     mov dword [edi + 0], eax
     mov dword [edi + 4], 0
-    add eax, 0x1000
+    add eax, 0x200000
     add edi, 8
-    dec ecx
-    jmp .user_image_loop
-.user_image_done:
-
-    ; PT_USER[USER_STACK_PT_INDEX..+3] -> user stack pages (RW)
-    mov eax, [user_stack_phys]
-    or eax, 0x007                         ; Present | Write | User
-    mov edi, PT_USER_ADDR
-    add edi, (USER_STACK_PT_INDEX * 8)
-    mov ecx, USER_STACK_PAGES
-.user_stack_loop:
+    loop .pd_low2_loop
+    ; Fill PD_LOW3 with 2MiB identity pages (3..4GiB, supervisor-only)
+    mov edi, PD_LOW3_ADDR
+    mov eax, 0xC0000083                  ; 3GiB | Present | Write | PS(2MiB)
+    mov ecx, 512
+.pd_low3_loop:
     mov dword [edi + 0], eax
     mov dword [edi + 4], 0
-    add eax, 0x1000
+    add eax, 0x200000
     add edi, 8
-    dec ecx
-    jnz .user_stack_loop
+    loop .pd_low3_loop
 
-    ret
-
-; =============================================================================
-; 64-bit relocations: apply DT_RELA of type R_X86_64_RELATIVE
-; =============================================================================
-BITS 64
-apply_relocations_rela_relative:
-    ; We need to locate PT_DYNAMIC in the loaded image.
-    ; We'll iterate PHDRs again, but now in-memory.
-    ;
-    ; The in-memory layout for PIE:
-    ;   runtime_virt = KERNEL_VIRT_BASE + (link_vaddr - vaddr_base)
-    ; slide = KERNEL_VIRT_BASE - vaddr_base
-    ;
-    ; PT_DYNAMIC p_vaddr is link-time VA. Runtime dynamic table address:
-    ;   dyn_rt = slide + p_vaddr
-    ;
-    ; Then parse Elf64_Dyn entries and find:
-    ;   DT_RELA (addr), DT_RELASZ, DT_RELAENT
-    ; Runtime reloc table address:
-    ;   rela_rt = slide + DT_RELA
-    ;
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
-
-    ; slide = KERNEL_VIRT_BASE - vaddr_base
-    mov rbx, KERNEL_VIRT_BASE
-    mov rax, [elf_vaddr_base]
-    sub rbx, rax                  ; rbx = slide (64-bit)
-
-    ; Walk program headers to find PT_DYNAMIC.
-    ; We stored e_phoff (low32), e_phentsize, e_phnum from disk header.
-    movzx r12, word [elf_phentsize]
-    movzx r13, word [elf_phnum]
-    mov eax, [elf_phoff_lo]
-    mov r14, rax                  ; r14 = phoff (bytes)
-
-    ; phdr base in file vaddr space is not relevant; we must reference loaded image.
-    ; Our kernel image is mapped at runtime base KERNEL_VIRT_BASE corresponding to link vaddr_base.
-    ; The ELF header itself is typically in a PT_LOAD segment, but not guaranteed at offset 0.
-    ; For simplicity: assume headers are within a loaded PT_LOAD and accessible at:
-    ;   hdr_rt = KERNEL_VIRT_BASE + (0 - vaddr_base) ??? Not safe.
-    ;
-    ; Instead: use the *file copy*? We didn't keep full file in memory.
-    ; So we must locate PT_DYNAMIC without relying on headers in memory.
-    ;
-    ; Practical approach for early boot:
-    ;   - We already loaded segments. One of them includes PT_DYNAMIC data.
-    ;   - We can locate dynamic table by scanning memory for Elf64_Dyn DT_NULL terminator
-    ;     is too heuristic.
-    ;
-    ; Better: store PT_DYNAMIC p_vaddr while parsing PHDRs in real mode.
-    ; We will do that: elf_dyn_vaddr holds p_vaddr if PT_DYNAMIC exists.
-    ;
-    mov rax, [elf_dyn_vaddr]
-    test rax, rax
-    jz .no_dynamic
-
-    lea r15, [rbx + rax]          ; r15 = dyn_rt
-
-    ; Parse Elf64_Dyn entries (16 bytes each): d_tag (i64), d_val/d_ptr (u64)
-    xor r12, r12                  ; rela_ptr (link-time VA)
-    xor r13, r13                  ; relasz
-    xor r14, r14                  ; relaent
-
-.dyn_loop:
-    mov rax, [r15 + 0]            ; d_tag
-    cmp rax, DT_NULL
-    je  .dyn_done
-
-    cmp rax, DT_RELA
-    jne .chk_relasz
-    mov r12, [r15 + 8]
-.chk_relasz:
-    mov rax, [r15 + 0]
-    cmp rax, DT_RELASZ
-    jne .chk_relaent
-    mov r13, [r15 + 8]
-.chk_relaent:
-    mov rax, [r15 + 0]
-    cmp rax, DT_RELAENT
-    jne .next_dyn
-    mov r14, [r15 + 8]
-.next_dyn:
-    add r15, 16
-    jmp .dyn_loop
-
-.dyn_done:
-    ; If no RELA, nothing to do
-    test r12, r12
-    jz .no_dynamic
-    test r13, r13
-    jz .no_dynamic
-
-    ; Default relaent for x86_64 is 24 bytes (Elf64_Rela)
-    test r14, r14
-    jnz .have_ent
-    mov r14, 24
-.have_ent:
-
-    ; rela_rt = slide + rela_ptr
-    lea r15, [rbx + r12]
-
-    ; Count = relasz / relaent
-    mov rax, r13
-    xor rdx, rdx
-    div r14
-    mov rcx, rax                  ; rcx = number of entries
-    test rcx, rcx
-    jz .no_dynamic
-
-.rela_loop:
-    ; Elf64_Rela:
-    ;   r_offset (u64) @ +0
-    ;   r_info   (u64) @ +8  (type = low 32 bits)
-    ;   r_addend (i64) @ +16
-    mov rax, [r15 + 0]            ; r_offset (link-time VA)
-    mov r8,  [r15 + 8]            ; r_info
-    mov r9,  [r15 + 16]           ; r_addend
-
-    ; type = (u32)r_info
-    mov edx, r8d
-    cmp edx, R_X86_64_RELATIVE
-    jne .next_rela
-
-    ; Where to write:
-    ;   reloc_addr = slide + r_offset
-    lea r10, [rbx + rax]
-
-    ; What to write:
-    ;   value = slide + addend
-    lea r11, [rbx + r9]
-
-    mov [r10], r11
-
-.next_rela:
-    add r15, r14
-    dec rcx
-    jnz .rela_loop
-
-.no_dynamic:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
     ret
 
 ; =============================================================================
@@ -1708,31 +1668,20 @@ elf_phentsize:       dw 0
 elf_phnum:           dw 0
 elf_vaddr_base:      dq 0
 
+; Bootcore ELF info
+bootcore_e_entry:    dq 0
+bootcore_phoff_lo:   dd 0
+bootcore_phentsize:  dw 0
+bootcore_phnum:      dw 0
+bootcore_vaddr_base: dq 0
+
 ; PT_DYNAMIC vaddr (link-time) captured during segment parse (IMPORTANT)
 ; We'll set this while loading segments (need to capture PT_DYNAMIC PHDR).
 elf_dyn_vaddr:       dq 0
+elf_dyn_size:        dq 0
 max_phys_end:        dd 0
-user_image_phys:     dd 0
-user_stack_phys:     dd 0
-user_image_size:     dd 0
-user_image_pages:    dd 0
-
-; Userspace ELF info
-user_e_entry:        dq 0
-user_phoff_lo:       dd 0
-user_phentsize:      dw 0
-user_phnum:          dw 0
-user_vaddr_base:     dq 0
-user_vaddr_end:      dq 0
-
-; Userspace segment temp
-user_seg_file_off:      dd 0
-user_seg_vaddr_lo:      dd 0
-user_seg_vaddr_hi:      dd 0
-user_seg_filesz:        dd 0
-user_seg_memsz:         dd 0
-user_seg_off_from_base: dd 0
-user_seg_phys_dst:      dd 0
+initrd_phys:         dd 0
+initrd_size:         dq 0
 
 ; temp fields for file reads
 rf_file_off_lo:      dd 0

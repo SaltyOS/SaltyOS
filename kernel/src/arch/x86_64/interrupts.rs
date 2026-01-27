@@ -226,15 +226,28 @@ pub extern "C" fn handle_general_protection_fault(frame: &InterruptFrame) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn handle_page_fault(frame: &InterruptFrame) {
-    serial_print_str("\r\n*** PAGE FAULT ***\r\n");
-    serial_print_str("Error code: ");
-    serial_print_number(frame.error_code);
-    serial_print_str("\r\n");
     let cr2 = read_cr2();
-    serial_print_str("CR2: ");
-    serial_print_hex(cr2);
-    serial_print_str("\r\n");
-    loop { unsafe { core::arch::asm!("hlt"); } }
+    let fault_addr = crate::mm::VirtAddr::new(cr2);
+
+    unsafe {
+        match crate::mm::handle_page_fault(fault_addr, frame.error_code) {
+            Ok(_) => {
+                // Page fault resolved successfully
+                return;
+            }
+            Err(_) => {
+                // Page fault failed - halt
+                serial_print_str("\r\n*** PAGE FAULT (FAILED) ***\r\n");
+                serial_print_str("Error code: ");
+                serial_print_number(frame.error_code);
+                serial_print_str("\r\n");
+                serial_print_str("CR2: ");
+                serial_print_hex(cr2);
+                serial_print_str("\r\n");
+                loop { core::arch::asm!("hlt"); }
+            }
+        }
+    }
 }
 
 #[unsafe(no_mangle)]

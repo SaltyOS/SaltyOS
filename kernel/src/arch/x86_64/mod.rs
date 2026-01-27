@@ -11,12 +11,8 @@ pub mod tss;
 use gdt::Gdt;
 use idt::Idt;
 use tss::Tss;
-
-const KERNEL_VIRT_BASE: u64 = 0xffff_ffff_8000_0000;
-const KERNEL_PHYS_BASE: u64 = 0x0020_0000;
-const USER_CODE_BASE: u64 = 0x0000_4000_0000_0000;
-const USER_STACK_BASE: u64 = USER_CODE_BASE + 0x0000_0000_0010_0000;
-const USER_STACK_SIZE: u64 = 4096 * 4;
+use saltyos_ska::{KERNEL_VIRT_BASE, KERNEL_PHYS_BASE, USER_CODE_BASE,
+                    USER_STACK_BASE, USER_STACK_SIZE};
 
 /// Initialize x86_64 architecture
 pub fn init() {
@@ -60,11 +56,38 @@ pub fn init() {
     syscall::init();
     crate::print_string("syscall init done\r\n");
 
+    // Allow SSE instructions (memset/memcpy may use XMM regs).
+    unsafe {
+        enable_sse();
+    }
+
     // TODO: Initialize APIC for IRQ handling
 
+    // Interrupts are enabled later after MM init.
+}
+
+pub fn enable_interrupts() {
     unsafe {
         core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
     }
+}
+
+/// Enable SSE/SSE2 instruction usage in kernel code.
+unsafe fn enable_sse() {
+    let mut cr0: u64;
+    let mut cr4: u64;
+    core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nostack, preserves_flags));
+    // Clear EM/TS, set MP.
+    cr0 &= !(1 << 2);
+    cr0 &= !(1 << 3);
+    cr0 |= 1 << 1;
+    core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nostack, preserves_flags));
+
+    core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nostack, preserves_flags));
+    // OSFXSR | OSXMMEXCPT
+    cr4 |= 1 << 9;
+    cr4 |= 1 << 10;
+    core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
 }
 
 /// Enter user mode at the given entry point with the given user stack

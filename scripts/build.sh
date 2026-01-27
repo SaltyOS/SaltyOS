@@ -34,6 +34,16 @@ RUSTC_BOOTSTRAP=1 cargo build \
     --package saltyos-kernel \
     --release
 
+# Build bootcore (BIOS helper binary)
+echo "Building bootcore..."
+RUSTC_BOOTSTRAP=1 cargo rustc \
+    -Z build-std=core,compiler_builtins \
+    --target "$ROOT_DIR/target-specs/x86_64-saltyos-bios.json" \
+    --package saltyos-bootloader-core \
+    --bin bootcore \
+    --release \
+    -- -C relocation-model=static -C link-arg=-T"$ROOT_DIR/bootloader/core/linker.ld"
+
 # Copy artifacts to build directory
 echo "Copying artifacts..."
 
@@ -46,6 +56,10 @@ cp target/x86_64-saltyos-uefi/release/saltyos-bootloader-uefi \
 # Kernel
 cp target/x86_64-saltyos-kernel/release/saltyos-kernel \
    "$ROOT_DIR/build/kernel.elf"
+
+# Bootcore
+cp target/x86_64-saltyos-bios/release/bootcore \
+   "$ROOT_DIR/build/bootcore.elf"
 
 # Build userspace demo ELF
 echo "Building userspace..."
@@ -62,6 +76,10 @@ else
     echo "Error: nasm or ld not found, cannot build userspace"
     exit 1
 fi
+
+# Build initrd (cpio) with userspace init
+echo "Building initrd..."
+"$ROOT_DIR/scripts/mkinitrd.sh"
 
 # BIOS stage1 and stage2 (pure assembly)
 if command -v nasm &> /dev/null; then

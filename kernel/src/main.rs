@@ -15,6 +15,8 @@ use saltyos_ska::{BootInfo, BootFlags, FramebufferInfo, PixelFormat, BOOTINFO_MA
 // Architecture and syscall modules
 mod arch;
 mod ssabi;
+mod mm;
+mod boot;
 
 /// VGA buffer address
 const VGA_BUFFER: usize = 0xb8000;
@@ -63,11 +65,20 @@ pub unsafe extern "sysv64" fn kernel_main(bootinfo: &BootInfo) -> ! {
         print_string("Error: Unsupported BootInfo version!\r\n");
         halt();
     }
+    if bootinfo.size != 0 && (bootinfo.size as usize) < core::mem::size_of::<BootInfo>() {
+        print_string("Error: BootInfo size too small!\r\n");
+        halt();
+    }
 
     print_string("arch::init() start\r\n");
     // NEW: Initialize architecture (GDT, IDT, interrupts, syscall)
     arch::init();
     print_string("arch::init() done\r\n");
+
+    print_string("mm::init() start\r\n");
+    unsafe { mm::init(bootinfo); }
+    print_string("mm::init() done\r\n");
+    arch::enable_interrupts();
 
     // Print banner
     print_string("SaltyOS vNext\r\n");
@@ -95,6 +106,51 @@ pub unsafe extern "sysv64" fn kernel_main(bootinfo: &BootInfo) -> ! {
     print_string("\r\n");
     print_string("Hello, SaltyOS!\r\n");
     print_string("\r\n");
+    if bootinfo.flags.contains(BootFlags::INITRD) {
+        if let Some(initrd) = bootinfo.initrd {
+            print_string("Initrd addr: ");
+            print_hex(initrd.address.as_u64());
+            print_string(" size: ");
+            print_hex(initrd.size);
+            print_string("\r\n");
+            match boot::initrd::find_init(initrd.address, initrd.size) {
+                Ok(Some(init_data)) => {
+                    match boot::user::load_and_enter(init_data) {
+                        Ok((entry, stack_top)) => unsafe {
+                            print_string("Entering user mode...\r\n");
+                            print_string("user entry: ");
+                            print_hex(entry);
+                            print_string("\r\n");
+                            print_string("user stack: ");
+                            print_hex(stack_top);
+                            print_string("\r\n");
+                            arch::enter_user_mode(entry, stack_top);
+                        },
+                        Err(err) => {
+                            print_string("Error: Failed to load /init from initrd: ");
+                            print_string(err);
+                            print_string("\r\n");
+                            halt();
+                        }
+                    }
+                }
+                Ok(None) => {
+                    print_string("Error: /init not found in initrd.\r\n");
+                    halt();
+                }
+                Err(err) => {
+                    print_string("Error: initrd parse failed: ");
+                    print_string(err);
+                    print_string("\r\n");
+                    halt();
+                }
+            }
+        } else {
+            print_string("Error: INITRD flag set but no module.\r\n");
+            halt();
+        }
+    }
+
     print_string("Entering user mode...\r\n");
 
     unsafe {
@@ -241,6 +297,74 @@ unsafe fn inb(port: u16) -> u8 {
     let mut val: u8;
     core::arch::asm!("in al, dx", in("dx") port, out("al") val, options(nomem, nostack));
     val
+}
+
+// Minimal C runtime shims to avoid compiler-emitted SSE mem* in early boot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    core::arch::asm!(
+        "rep movsb",
+        inout("rdi") dst => _,
+        inout("rsi") src => _,
+        inout("rcx") n => _,
+        options(nostack, preserves_flags)
+    );
+    dst
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    if (dst as usize) < (src as usize) {
+        core::arch::asm!(
+            "rep movsb",
+            inout("rdi") dst => _,
+            inout("rsi") src => _,
+            inout("rcx") n => _,
+            options(nostack, preserves_flags)
+        );
+    } else if n != 0 {
+        let dst_end = dst.add(n - 1);
+        let src_end = src.add(n - 1);
+        core::arch::asm!(
+            "std",
+            "rep movsb",
+            "cld",
+            inout("rdi") dst_end => _,
+            inout("rsi") src_end => _,
+            inout("rcx") n => _,
+            options(nostack, preserves_flags)
+        );
+    }
+    dst
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memset(dst: *mut u8, value: i32, n: usize) -> *mut u8 {
+    let addr = dst as u64;
+    let sign = (addr >> 47) & 1;
+    let upper = addr >> 48;
+    let canonical = (sign == 0 && upper == 0) || (sign == 1 && upper == 0xffff);
+    if !canonical {
+        let mut ret: u64 = 0;
+        core::arch::asm!("mov {}, [rsp]", out(reg) ret, options(nostack, preserves_flags));
+        print_string("memset non-canonical dst: ");
+        print_hex(addr);
+        print_string(" len: ");
+        print_hex(n as u64);
+        print_string(" ret: ");
+        print_hex(ret);
+        print_string("\r\n");
+        halt();
+    }
+    core::arch::asm!(
+        "cld",
+        "rep stosb",
+        inout("rdi") dst => _,
+        in("al") value as u8,
+        inout("rcx") n => _,
+        options(nostack, preserves_flags)
+    );
+    dst
 }
 
 fn fb_print_char(c: u8) {
@@ -513,6 +637,14 @@ fn panic(info: &PanicInfo) -> ! {
     halt()
 }
 
+/// Exception handling personality for no_std
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_eh_personality() -> ! {
+    loop {
+        unsafe { core::arch::asm!("hlt") };
+    }
+}
+
 /// Print panic info
 fn print_panic_info(info: &PanicInfo) -> Result<(), core::fmt::Error> {
     use core::fmt::Write;
@@ -529,15 +661,6 @@ fn print_panic_info(info: &PanicInfo) -> Result<(), core::fmt::Error> {
     write!(&mut writer, "{}", info)
 }
 
-/// Memory set (for compiler builtins)
-#[unsafe(no_mangle)]
-unsafe extern "C" fn memset(dst: *mut u8, c: i32, n: usize) -> *mut u8 {
-    for i in 0..n {
-        unsafe { core::ptr::write(dst.add(i), c as u8) };
-    }
-    dst
-}
-
 /// Memory compare (for compiler builtins)
 #[unsafe(no_mangle)]
 unsafe extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
@@ -551,23 +674,4 @@ unsafe extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
         }
     }
     0
-}
-
-/// Memory copy (for compiler builtins)
-#[unsafe(no_mangle)]
-unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    unsafe {
-        if src < dst && (src as usize + n) > (dst as usize) {
-            let mut i = n;
-            while i > 0 {
-                i -= 1;
-                core::ptr::write(dst.add(i), core::ptr::read(src.add(i)));
-            }
-        } else {
-            for i in 0..n {
-                core::ptr::write(dst.add(i), core::ptr::read(src.add(i)));
-            }
-        }
-        dst
-    }
 }

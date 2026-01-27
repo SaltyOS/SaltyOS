@@ -1,7 +1,6 @@
 //! UEFI Bootloader for SaltyOS
 //!
-//! Loads the kernel ELF file with PIE support and sets up page tables
-//! for higher-half kernel execution.
+//! Loads kernel/initrd/bootcore and hands off to bootcore for paging setup.
 
 #![no_std]
 #![no_main]
@@ -15,13 +14,13 @@ use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::media::file::FileInfo;
 use uefi::proto::console::gop::{GraphicsOutput, PixelFormat as GopPixelFormat};
 use saltyos_ska::{BootInfo, BootFlags, PhysAddr, MemoryEntry, MemoryType as SkaMemoryType};
+use saltyos_bootloader_core::{BootContext, BootHandoff};
+use saltyos_ska::{ExtraHeader, EXTRA_KIND_MEM_RESERVED};
 use saltyos_bootloader_common::{
-    PT_LOAD, parse_elf_header, get_program_headers, init_bootinfo,
+    PT_LOAD, parse_elf_header, get_program_headers,
     find_load_vaddr_range, find_dynamic_segment,
-    layout::{KERNEL_PHYS_BASE, KERNEL_VIRT_BASE, USER_CODE_BASE, USER_STACK_BASE, USER_STACK_PAGES},
+    layout::{KERNEL_PHYS_BASE, BOOTCORE_PHYS_BASE},
 };
-
-mod paging;
 
 use core::mem::size_of;
 
@@ -34,27 +33,6 @@ const MAX_MEMORY_MAP_ENTRIES: usize = 128;
 /// Identity map size for bootloader + kernel staging
 const IDENTITY_MAP_GIB: usize = 4;
 
-/// ELF dynamic constants
-const DT_NULL: i64 = 0;
-const DT_RELA: i64 = 7;
-const DT_RELASZ: i64 = 8;
-const DT_RELAENT: i64 = 9;
-
-/// x86_64 relocation type
-const R_X86_64_RELATIVE: u32 = 8;
-
-#[repr(C)]
-struct Elf64Dyn {
-    d_tag: i64,
-    d_val: u64,
-}
-
-#[repr(C)]
-struct Elf64Rela {
-    r_offset: u64,
-    r_info: u64,
-    r_addend: i64,
-}
 
 /// Static memory map storage
 #[repr(C, align(16))]
@@ -99,7 +77,8 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
     // Open kernel.elf
     let kernel_filename = cstr16!("kernel.elf");
-    let userspace_filename = cstr16!("userspace.elf");
+    let bootcore_filename = cstr16!("bootcore.elf");
+    let initrd_filename = cstr16!("initrd.img");
     let mut kernel_file = root
         .open(kernel_filename, FileMode::Read, FileAttribute::empty())
         .expect("Failed to open kernel.elf")
@@ -112,21 +91,34 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     let kernel_size = info.file_size();
     let _ = info;
 
-    // Get userspace file size
-    let mut userspace_file = root
-        .open(userspace_filename, FileMode::Read, FileAttribute::empty())
-        .expect("Failed to open userspace.elf")
+    // Get bootcore file size
+    let mut bootcore_file = root
+        .open(bootcore_filename, FileMode::Read, FileAttribute::empty())
+        .expect("Failed to open bootcore.elf")
         .into_regular_file()
         .expect("Not a regular file");
-    let info: &mut FileInfo = userspace_file
+    let info: &mut FileInfo = bootcore_file
         .get_info(&mut info_buf)
-        .expect("Failed to get userspace file info");
-    let userspace_size = info.file_size();
+        .expect("Failed to get bootcore file info");
+    let bootcore_size = info.file_size();
+    let _ = info;
+
+    // Get initrd file size
+    let mut initrd_file = root
+        .open(initrd_filename, FileMode::Read, FileAttribute::empty())
+        .expect("Failed to open initrd.img")
+        .into_regular_file()
+        .expect("Not a regular file");
+    let info: &mut FileInfo = initrd_file
+        .get_info(&mut info_buf)
+        .expect("Failed to get initrd file info");
+    let initrd_size = info.file_size();
     let _ = info;
 
     // Drop file handles and print status
     drop(kernel_file);
-    drop(userspace_file);
+    drop(bootcore_file);
+    drop(initrd_file);
     drop(root);
     drop(fs);
 
@@ -147,16 +139,26 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         core::slice::from_raw_parts_mut(kernel_data_ptr as *mut u8, kernel_size as usize)
     };
 
-    // Allocate memory for userspace ELF data
-    let userspace_pages = (userspace_size as usize + 4095) / 4096;
-    let userspace_data_ptr = boot_services
-        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, userspace_pages)
-        .expect("Failed to allocate memory for userspace");
-    let userspace_data = unsafe {
-        core::slice::from_raw_parts_mut(userspace_data_ptr as *mut u8, userspace_size as usize)
+    // Allocate memory for bootcore ELF data
+    let bootcore_pages = (bootcore_size as usize + 4095) / 4096;
+    let bootcore_data_ptr = boot_services
+        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, bootcore_pages)
+        .expect("Failed to allocate memory for bootcore");
+
+    let bootcore_data = unsafe {
+        core::slice::from_raw_parts_mut(bootcore_data_ptr as *mut u8, bootcore_size as usize)
     };
 
-    // Reopen file and read kernel/userspace
+    // Allocate memory for initrd data
+    let initrd_pages = (initrd_size as usize + 4095) / 4096;
+    let initrd_data_ptr = boot_services
+        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, initrd_pages)
+        .expect("Failed to allocate memory for initrd");
+    let initrd_data = unsafe {
+        core::slice::from_raw_parts_mut(initrd_data_ptr as *mut u8, initrd_size as usize)
+    };
+
+    // Reopen file and read kernel/initrd
     let loaded_image = boot_services
         .open_protocol_exclusive::<LoadedImage>(_image_handle)
         .expect("Failed to open LoadedImage protocol");
@@ -178,15 +180,25 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         .expect("Failed to read kernel file");
     drop(kernel_file);
 
-    let mut userspace_file = root
-        .open(userspace_filename, FileMode::Read, FileAttribute::empty())
-        .expect("Failed to open userspace.elf")
+    let mut bootcore_file = root
+        .open(bootcore_filename, FileMode::Read, FileAttribute::empty())
+        .expect("Failed to open bootcore.elf")
         .into_regular_file()
         .expect("Not a regular file");
-    userspace_file
-        .read(userspace_data)
-        .expect("Failed to read userspace file");
-    drop(userspace_file);
+    bootcore_file
+        .read(bootcore_data)
+        .expect("Failed to read bootcore file");
+    drop(bootcore_file);
+
+    let mut initrd_file = root
+        .open(initrd_filename, FileMode::Read, FileAttribute::empty())
+        .expect("Failed to open initrd.img")
+        .into_regular_file()
+        .expect("Not a regular file");
+    initrd_file
+        .read(initrd_data)
+        .expect("Failed to read initrd file");
+    drop(initrd_file);
     drop(root);
     drop(fs);
 
@@ -194,6 +206,13 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     let elf_header = parse_elf_header(kernel_data)
         .expect("Invalid ELF header");
     let phdrs = get_program_headers(kernel_data, elf_header);
+
+    // Parse bootcore ELF
+    let bootcore_elf_header = parse_elf_header(bootcore_data)
+        .expect("Invalid bootcore ELF header");
+    let bootcore_phdrs = get_program_headers(bootcore_data, bootcore_elf_header);
+    let (bootcore_vaddr_base, bootcore_vaddr_end) = find_load_vaddr_range(bootcore_phdrs)
+        .expect("No PT_LOAD segments found in bootcore");
 
     // Compute kernel image bounds (link-time VAs)
     let (vaddr_base, vaddr_end) = find_load_vaddr_range(phdrs)
@@ -249,52 +268,55 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
     }
 
-    // Parse userspace ELF
-    let user_elf = parse_elf_header(userspace_data)
-        .expect("Invalid userspace ELF header");
-    let user_phdrs = get_program_headers(userspace_data, user_elf);
-    let (user_vaddr_base, user_vaddr_end) = find_load_vaddr_range(user_phdrs)
-        .expect("No PT_LOAD segments in userspace");
+    // Allocate bootcore image at a fixed physical base
+    let bootcore_image_size = (bootcore_vaddr_end - bootcore_vaddr_base) as usize;
+    let bootcore_image_pages = (bootcore_image_size + 4095) / 4096;
+    let bootcore_phys_base = BOOTCORE_PHYS_BASE;
 
-    let user_image_size = (user_vaddr_end - user_vaddr_base) as usize;
-    let user_image_pages = (user_image_size + 4095) / 4096;
-    let stack_offset_pages = ((USER_STACK_BASE - USER_CODE_BASE) / 4096) as usize;
-    if user_image_pages >= stack_offset_pages {
-        panic!("Userspace image overlaps user stack region");
-    }
+    boot_services
+        .allocate_pages(
+            AllocateType::Address(bootcore_phys_base),
+            MemoryType::LOADER_DATA,
+            bootcore_image_pages,
+        )
+        .expect("Failed to allocate bootcore image");
 
-    let user_image_phys = boot_services
-        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, user_image_pages)
-        .expect("Failed to allocate userspace image");
+    for phdr in bootcore_phdrs {
+        if phdr.p_type == PT_LOAD {
+            let dest_addr = bootcore_phys_base + (phdr.p_vaddr - bootcore_vaddr_base);
+            let src_data = unsafe {
+                core::slice::from_raw_parts(
+                    (bootcore_data_ptr as usize + phdr.p_offset as usize) as *const u8,
+                    phdr.p_filesz as usize,
+                )
+            };
 
-    for phdr in user_phdrs {
-        if phdr.p_type != PT_LOAD {
-            continue;
-        }
-        let dest_addr = user_image_phys + (phdr.p_vaddr - user_vaddr_base);
-        let src_data = unsafe {
-            core::slice::from_raw_parts(
-                (userspace_data_ptr as usize + phdr.p_offset as usize) as *const u8,
-                phdr.p_filesz as usize,
-            )
-        };
-
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                src_data.as_ptr(),
-                dest_addr as *mut u8,
-                phdr.p_filesz as usize,
-            );
-
-            if phdr.p_memsz > phdr.p_filesz {
-                core::ptr::write_bytes(
-                    (dest_addr + phdr.p_filesz) as *mut u8,
-                    0,
-                    (phdr.p_memsz - phdr.p_filesz) as usize,
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src_data.as_ptr(),
+                    dest_addr as *mut u8,
+                    phdr.p_filesz as usize,
                 );
+
+                // Zero BSS
+                if phdr.p_memsz > phdr.p_filesz {
+                    core::ptr::write_bytes(
+                        (dest_addr + phdr.p_filesz) as *mut u8,
+                        0,
+                        (phdr.p_memsz - phdr.p_filesz) as usize,
+                    );
+                }
             }
         }
     }
+
+    let bootcore_entry = bootcore_phys_base + (bootcore_elf_header.e_entry - bootcore_vaddr_base);
+    let bootcore_end = bootcore_phys_base + (bootcore_image_pages as u64 * 4096);
+
+    let user_image_phys: u64 = 0;
+    let user_image_pages: usize = 0;
+    let user_stack_phys: u64 = 0;
+    let user_stack_pages: usize = 0;
 
     // Drop boot_services and print status
     drop(boot_services);
@@ -318,7 +340,11 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     let mut entry_count = 0usize;
     for entry in memory_map.entries().take(MAX_MEMORY_MAP_ENTRIES) {
         let ska_type = match entry.ty {
-            MemoryType::CONVENTIONAL => SkaMemoryType::Usable,
+            MemoryType::CONVENTIONAL
+            | MemoryType::LOADER_CODE
+            | MemoryType::LOADER_DATA
+            | MemoryType::BOOT_SERVICES_CODE
+            | MemoryType::BOOT_SERVICES_DATA => SkaMemoryType::Usable,
             MemoryType::RESERVED => SkaMemoryType::Reserved,
             MemoryType::ACPI_RECLAIM => SkaMemoryType::AcpiReclaimable,
             MemoryType::ACPI_NON_VOLATILE => SkaMemoryType::AcpiNvs,
@@ -358,12 +384,34 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     }
 
     let mut identity_map_gib = IDENTITY_MAP_GIB;
+    let mem_map_end = memory_map_phys + (entries_pages as u64 * 4096);
+    let needed_gib = ((mem_map_end + (1 << 30) - 1) >> 30) as usize;
+    if needed_gib > identity_map_gib {
+        identity_map_gib = needed_gib;
+    }
+    let needed_gib = ((bootcore_end + (1 << 30) - 1) >> 30) as usize;
+    if needed_gib > identity_map_gib {
+        identity_map_gib = needed_gib;
+    }
 
     // Build BootInfo in low memory
-    let mut bootinfo = init_bootinfo();
-    bootinfo.flags |= BootFlags::UEFI;
-    bootinfo.memory_map = PhysAddr::new(memory_map_phys);
-    bootinfo.memory_map_entries = entry_count as u32;
+    let mut ctx = BootContext::empty();
+    ctx.flags |= BootFlags::UEFI;
+    ctx.memory_map = PhysAddr::new(memory_map_phys);
+    ctx.memory_map_entries = entry_count as u32;
+
+    // Initrd (raw cpio)
+    let initrd_end = initrd_data_ptr + initrd_size;
+    let needed_gib = ((initrd_end + (1 << 30) - 1) >> 30) as usize;
+    if needed_gib > identity_map_gib {
+        identity_map_gib = needed_gib;
+    }
+    ctx.flags |= BootFlags::INITRD;
+    ctx.initrd = saltyos_ska::ModuleInfo {
+        address: PhysAddr::new(initrd_data_ptr),
+        size: initrd_size,
+        name: [0; 64],
+    };
 
     // Populate framebuffer info if GOP is available
     if let Ok(handles) = boot_services.locate_handle_buffer(
@@ -389,15 +437,15 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                     identity_map_gib = needed_gib;
                 }
 
-                bootinfo.flags |= BootFlags::FRAMEBUFFER;
-                bootinfo.framebuffer = Some(saltyos_ska::FramebufferInfo {
+                ctx.flags |= BootFlags::FRAMEBUFFER;
+                ctx.framebuffer = saltyos_ska::FramebufferInfo {
                     address: PhysAddr::new(fb_addr),
                     width: mode.resolution().0 as u32,
                     height: mode.resolution().1 as u32,
                     pitch: (mode.stride() * 4) as u32,
                     format,
                     bpp: 32,
-                });
+                };
             }
         }
     }
@@ -411,117 +459,122 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         .expect("Failed to allocate BootInfo buffer");
 
     let bootinfo_ptr = bootinfo_phys as *mut BootInfo;
-    unsafe {
-        core::ptr::write(bootinfo_ptr, bootinfo);
-    }
 
     // Print status
     drop(boot_services);
     {
         let stdout = system_table.stdout();
-        let _ = stdout.output_string(cstr16!("Setting up page tables...\r\n"));
+        let _ = stdout.output_string(cstr16!("Preparing bootcore handoff...\r\n"));
     }
     let boot_services = system_table.boot_services();
 
-    // Allocate user stack pages
-    let user_stack_pages = USER_STACK_PAGES;
-    let user_stack_phys = boot_services
+    // Allocate page table arena for bootcore (keep below 4 GiB for identity map)
+    let pt_pages: usize = 32;
+    let pt_alloc_base = boot_services
         .allocate_pages(
-            AllocateType::AnyPages,
+            AllocateType::MaxAddress(0x0000_0000_FFFF_F000),
             MemoryType::LOADER_DATA,
-            user_stack_pages,
+            pt_pages,
         )
-        .expect("Failed to allocate user stack pages");
+        .expect("Failed to allocate bootcore page table arena");
+    let pt_alloc_size = (pt_pages * 4096) as u64;
 
-    unsafe {
-        core::ptr::write_bytes(
-            user_stack_phys as *mut u8,
-            0,
-            user_stack_pages * 4096,
-        );
+    // Allocate handoff buffer (low memory for identity map)
+    let handoff_pages: usize = 1;
+    let handoff_phys = boot_services
+        .allocate_pages(
+            AllocateType::MaxAddress(0x0000_0000_FFFF_F000),
+            MemoryType::LOADER_DATA,
+            handoff_pages,
+        )
+        .expect("Failed to allocate bootcore handoff buffer");
+    let handoff_size = (handoff_pages * 4096) as u64;
+
+    let handoff_end = handoff_phys + handoff_size;
+    let needed_gib = ((handoff_end + (1 << 30) - 1) >> 30) as usize;
+    if needed_gib > identity_map_gib {
+        identity_map_gib = needed_gib;
     }
 
-    // Create page tables for higher-half kernel + user mappings
-    let pml4_addr = unsafe {
-        paging::create_page_tables(
-            kernel_phys_base,
-            identity_map_gib,
-            user_image_phys,
-            user_image_pages,
-            user_stack_phys,
-            user_stack_pages,
+    // Build extra TLV (reserved ranges)
+    let extra_count: u32 = 8;
+    let extra_len = (4 + (extra_count as u64) * 16) as u32;
+    let extra_total = (core::mem::size_of::<ExtraHeader>() as u32) + extra_len;
+    let extra_pages = ((extra_total as usize) + 4095) / 4096;
+    let extra_ptr = boot_services
+        .allocate_pages(
+            AllocateType::MaxAddress(0x0000_0000_FFFF_F000),
+            MemoryType::LOADER_DATA,
+            extra_pages,
         )
+        .expect("Failed to allocate boot extra buffer");
+    let extra_size = (extra_pages * 4096) as u64;
+
+    let extra_end = extra_ptr + extra_size;
+    let needed_gib = ((extra_end + (1 << 30) - 1) >> 30) as usize;
+    if needed_gib > identity_map_gib {
+        identity_map_gib = needed_gib;
+    }
+
+    unsafe {
+        let hdr = extra_ptr as *mut ExtraHeader;
+        core::ptr::write(hdr, ExtraHeader { kind: EXTRA_KIND_MEM_RESERVED, len: extra_len });
+        let count_ptr = (extra_ptr + core::mem::size_of::<ExtraHeader>() as u64) as *mut u32;
+        core::ptr::write(count_ptr, extra_count);
+        let mut cur = (count_ptr as u64) + 4;
+
+        let mut write_range = |base: u64, size: u64| {
+            let base_ptr = cur as *mut u64;
+            core::ptr::write(base_ptr, base);
+            core::ptr::write(base_ptr.add(1), size);
+            cur += 16;
+        };
+
+        write_range(bootinfo_phys, 4096);
+        write_range(memory_map_phys, (entries_pages * 4096) as u64);
+        write_range(initrd_data_ptr, initrd_size);
+        write_range(kernel_phys_base, image_pages as u64 * 4096);
+        write_range(bootcore_phys_base, bootcore_image_pages as u64 * 4096);
+        write_range(pt_alloc_base, pt_alloc_size);
+        write_range(extra_ptr, extra_size);
+        write_range(handoff_phys, handoff_size);
+    }
+
+    let extra_ptr = extra_ptr as u64;
+    let extra_len = extra_total as u64;
+
+    let handoff_ptr = handoff_phys as *mut BootHandoff;
+    let handoff = BootHandoff {
+        boot_context: ctx,
+        bootinfo_ptr,
+        kernel_phys_base,
+        kernel_vaddr_base: vaddr_base,
+        kernel_entry: elf_header.e_entry,
+        kernel_dyn_phys: dyn_phys,
+        kernel_dyn_size: dyn_size,
+        user_image_phys,
+        user_image_pages: user_image_pages as u64,
+        user_stack_phys,
+        user_stack_pages: user_stack_pages as u64,
+        pt_alloc_base,
+        pt_alloc_size,
+        identity_map_gib: identity_map_gib as u64,
+        extra_ptr,
+        extra_len,
     };
 
+    unsafe {
+        core::ptr::write(handoff_ptr, handoff);
+    }
+
     // Exit boot services
+    drop(boot_services);
     let (_image, _memory_map) = system_table.exit_boot_services(MemoryType::LOADER_DATA);
 
-    // Enable paging
+    let bootcore_fn: extern "sysv64" fn(*const BootHandoff) -> ! =
+        unsafe { core::mem::transmute(bootcore_entry as usize) };
     unsafe {
-        paging::enable_paging(pml4_addr);
-    }
-
-    // Apply RELA relocations (R_X86_64_RELATIVE) if present
-    if dyn_phys != 0 && dyn_size != 0 {
-        apply_relocations(dyn_phys, dyn_size, vaddr_base, kernel_phys_base);
-    }
-
-    // Jump to runtime kernel entry point
-    // runtime_entry = KERNEL_VIRT_BASE + (e_entry - vaddr_base)
-    let kernel_entry = KERNEL_VIRT_BASE + (elf_header.e_entry - vaddr_base);
-
-    unsafe {
-        let kernel_fn: extern "sysv64" fn(&BootInfo) -> ! =
-            core::mem::transmute(kernel_entry as usize);
-
-        kernel_fn(&*bootinfo_ptr);
-    }
-}
-
-fn apply_relocations(dyn_phys: u64, dyn_size: u64, vaddr_base: u64, phys_base: u64) {
-    let mut rela_ptr = 0u64;
-    let mut rela_sz = 0u64;
-    let mut rela_ent = 0u64;
-
-    let mut offset = 0u64;
-    while offset + size_of::<Elf64Dyn>() as u64 <= dyn_size {
-        let dyn_entry = unsafe { &*(dyn_phys.wrapping_add(offset) as *const Elf64Dyn) };
-        if dyn_entry.d_tag == DT_NULL {
-            break;
-        }
-        match dyn_entry.d_tag {
-            DT_RELA => rela_ptr = dyn_entry.d_val,
-            DT_RELASZ => rela_sz = dyn_entry.d_val,
-            DT_RELAENT => rela_ent = dyn_entry.d_val,
-            _ => {}
-        }
-        offset += size_of::<Elf64Dyn>() as u64;
-    }
-
-    if rela_ptr == 0 || rela_sz == 0 {
-        return;
-    }
-
-    if rela_ent == 0 {
-        rela_ent = size_of::<Elf64Rela>() as u64;
-    }
-
-    let slide = KERNEL_VIRT_BASE.wrapping_sub(vaddr_base);
-    let rela_phys = phys_base + (rela_ptr - vaddr_base);
-    let count = rela_sz / rela_ent;
-
-    for i in 0..count {
-        let rela = unsafe {
-            &*(rela_phys.wrapping_add(i * rela_ent) as *const Elf64Rela)
-        };
-        let r_type = (rela.r_info & 0xffff_ffff) as u32;
-        if r_type == R_X86_64_RELATIVE {
-            let reloc_phys = phys_base + (rela.r_offset - vaddr_base);
-            let value = slide.wrapping_add(rela.r_addend as u64);
-            unsafe {
-                core::ptr::write_unaligned(reloc_phys as *mut u64, value);
-            }
-        }
+        bootcore_fn(handoff_ptr as *const BootHandoff);
     }
 }
 

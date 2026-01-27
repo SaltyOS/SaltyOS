@@ -8,6 +8,7 @@ rust-version = "1.91"
 uefi = "0.26"
 uefi-services = "0.23"
 saltyos-ska = { path = "../../abi/ska" }
+saltyos-bootloader-core = { path = "../core" }
 saltyos-bootloader-common = { path = "../common" }
 x86_64 = "0.15"
 

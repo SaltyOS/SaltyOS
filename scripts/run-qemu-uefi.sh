@@ -50,7 +50,7 @@ qemu-system-x86_64 \
     -boot order=c \
     -serial mon:stdio \
     ${DISPLAY_OPTS} \
-    -m 512M \
+    -m 4096M \
     -smp 1 \
     -no-reboot \
     -no-shutdown -d int -no-reboot -D qemu.log

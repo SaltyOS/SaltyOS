@@ -128,6 +128,7 @@ pub fn init_bootinfo() -> BootInfo {
         magic: *BOOTINFO_MAGIC,
         version: BOOTINFO_VERSION,
         flags: BootFlags::empty(),
+        size: core::mem::size_of::<BootInfo>() as u32,
         memory_map: PhysAddr::new(0),
         memory_map_entries: 0,
         framebuffer: None,
@@ -135,5 +136,7 @@ pub fn init_bootinfo() -> BootInfo {
         cmdline: PhysAddr::new(0),
         cmdline_len: 0,
         rsdp: None,
+        extra: PhysAddr::new(0),
+        extra_len: 0,
     }
 }

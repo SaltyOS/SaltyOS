@@ -5,6 +5,7 @@ members = [
     "abi/ssabi",
     "abi/ssip",
     "kernel",
+    "bootloader/core",
     "bootloader/uefi",
     "bootloader/common",
 ]
