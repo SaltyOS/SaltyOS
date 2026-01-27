@@ -2,13 +2,19 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+mod apic;
 mod boot;
+mod context;
 mod cpu;
 mod gdt;
 mod idt;
+mod pit;
 pub mod paging;
 
 pub use cpu::{current_cpu, MAX_CPUS};
+
+// Re-export architecture-specific implementations for generic arch interface
+pub use context::{context_switch, init_thread_context};
 
 /// Initialize x86_64 architecture
 pub fn init() {
@@ -18,7 +24,13 @@ pub fn init() {
     // Initialize GDT
     gdt::init();
 
-    // Initialize IDT
+    // Initialize APIC and timer
+    apic::init();
+
+    // Initialize PIT (for calibration and fallback)
+    pit::init();
+
+    // Initialize IDT (now includes APIC timer handler)
     idt::init();
 
     // Initialize paging (kernel page tables already set up by bootloader)

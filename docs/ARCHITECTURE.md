@@ -10,7 +10,7 @@ This document provides a technical overview of the SaltyOS system architecture.
 │                         (shell, utilities, etc.)                            │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                           System Libraries                                   │
-│                    (libsalty, libc, protocol libs)                          │
+│              (libsalty, POSIX libc, protocol libs)                          │
 ├─────────────┬─────────────┬─────────────┬─────────────┬─────────────────────┤
 │    init     │   procmgr   │     vfs     │  nameserv   │      drivers        │
 │             │             │   saltyfs   │             │  (pci,nvme,usb)     │
@@ -438,7 +438,7 @@ SaltyOS/
 │
 ├── lib/
 │   ├── libsalty/                 # Syscall wrappers
-│   └── libc/                     # Minimal C library
+│   └── libc/                     # POSIX C library
 │
 ├── tools/
 │   ├── mkimage.py                # Disk image creator

@@ -26,9 +26,12 @@ This document describes the high-level design philosophy, goals, and architectur
    - x86_64 as primary target
    - aarch64 as secondary target
 
-### Non-Goals
+5. **Full POSIX compatibility**: SaltyOS provides a POSIX subset sufficient for
+  modern applications (including GUI stacks like Wayland) while excluding legacy
+  features that conflict with capability-based security. See
+  [POSIX Compatibility](posix.md) for details.
 
-- POSIX compatibility (Unix-like, not Unix-compatible)
+### Non-Goals
 - Maximum performance at cost of complexity
 - Legacy hardware support
 

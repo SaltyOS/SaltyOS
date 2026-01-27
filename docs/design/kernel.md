@@ -13,6 +13,7 @@ The SaltyOS kernel is a capability-based microkernel written in Rust. It provide
 - Interrupt routing
 
 All other services (filesystems, drivers, networking) run in userspace.
+For POSIX compatibility, see [POSIX Compatibility Layer](posix.md).
 
 ## Design Principles
 

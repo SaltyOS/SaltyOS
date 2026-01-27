@@ -55,7 +55,10 @@ impl FrameAllocator {
             if frame < MAX_FRAMES {
                 let idx = frame / 64;
                 let bit = frame % 64;
-                self.bitmap[idx] |= 1u64 << bit;
+                // SAFETY: idx < MAX_FRAMES / 64 since frame < MAX_FRAMES
+                unsafe {
+                    *self.bitmap.get_unchecked_mut(idx) |= 1u64 << bit;
+                }
                 self.free += 1;
                 self.total = self.total.max(frame + 1);
             }
@@ -67,9 +70,15 @@ impl FrameAllocator {
         for i in self.next_free..self.total {
             let idx = i / 64;
             let bit = i % 64;
-            if self.bitmap[idx] & (1u64 << bit) != 0 {
+            // SAFETY: idx is calculated from i which is bounded by self.total
+            // and bitmap has MAX_FRAMES / 64 elements which is always >= total / 64
+            let word = unsafe { *self.bitmap.get_unchecked(idx) };
+            if word & (1u64 << bit) != 0 {
                 // Found free frame, mark as used
-                self.bitmap[idx] &= !(1u64 << bit);
+                // SAFETY: Same bounds as above
+                unsafe {
+                    *self.bitmap.get_unchecked_mut(idx) &= !(1u64 << bit);
+                }
                 self.free -= 1;
                 self.next_free = i + 1;
                 return Some((i * PAGE_SIZE) as PhysAddr);
@@ -83,7 +92,10 @@ impl FrameAllocator {
         if frame < MAX_FRAMES {
             let idx = frame / 64;
             let bit = frame % 64;
-            self.bitmap[idx] |= 1u64 << bit;
+            // SAFETY: idx < MAX_FRAMES / 64 since frame < MAX_FRAMES
+            unsafe {
+                *self.bitmap.get_unchecked_mut(idx) |= 1u64 << bit;
+            }
             self.free += 1;
             if frame < self.next_free {
                 self.next_free = frame;

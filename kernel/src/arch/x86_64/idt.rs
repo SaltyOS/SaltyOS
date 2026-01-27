@@ -66,13 +66,29 @@ struct IdtPtr {
     base: u64,
 }
 
+/// Interrupt stack frame pushed by x86_64 on interrupt/exception
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct InterruptStackFrame {
+    /// This value is always pushed by the CPU
+    pub rip: u64,
+    /// Code segment selector
+    pub cs: u64,
+    /// CPU flags (RFLAGS register)
+    pub rflags: u64,
+    /// Stack pointer before interrupt
+    pub rsp: u64,
+    /// Stack segment selector
+    pub ss: u64,
+}
+
 static mut IDT: Idt = Idt::new();
 
 /// Initialize IDT
 pub fn init() {
     // SAFETY: Single-threaded initialization, IDT is properly structured
     unsafe {
-        // Set up exception handlers
+        // Set up exception handlers (vectors 0-31)
         (*(&raw mut IDT)).entries[0].set_handler(exception_divide_error as u64);
         (*(&raw mut IDT)).entries[1].set_handler(exception_debug as u64);
         (*(&raw mut IDT)).entries[2].set_handler(exception_nmi as u64);
@@ -82,6 +98,10 @@ pub fn init() {
         (*(&raw mut IDT)).entries[8].set_handler(exception_double_fault as u64);
         (*(&raw mut IDT)).entries[13].set_handler(exception_gpf as u64);
         (*(&raw mut IDT)).entries[14].set_handler(exception_page_fault as u64);
+
+        // Set up IRQ handlers (vectors 32+)
+        // Vector 32: APIC Timer
+        (*(&raw mut IDT)).entries[32].set_handler(irq_timer as u64);
 
         let idt_ptr = IdtPtr {
             limit: (size_of::<Idt>() - 1) as u16,
@@ -147,4 +167,14 @@ extern "C" fn exception_page_fault() {
     loop {
         super::halt();
     }
+}
+
+/// APIC Timer interrupt handler
+///
+/// Vector 32 - called every 1ms by the APIC timer.
+/// This is the primary scheduler tick interrupt.
+extern "C" fn irq_timer() {
+    // Delegate to the APIC timer handler
+    // SAFETY: Interrupt context, timer handler is designed for this
+    super::apic::timer_handler();
 }
