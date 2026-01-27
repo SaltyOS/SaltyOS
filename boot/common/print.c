@@ -68,3 +68,5 @@ void println(const char *s) {
     serial_puts(s);
     serial_puts("\n");
 }
+
+/* String functions were moved to common/memory.c to avoid duplicates */

@@ -17,6 +17,10 @@ use crate::BootInfo;
 pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_SHIFT: usize = 12;
 
+/// Direct physical mapping offset
+/// Physical memory is mapped at this virtual address
+pub const PHYS_MAP_OFFSET: u64 = 0xFFFF_8000_0000_0000;
+
 /// Physical address type
 pub type PhysAddr = u64;
 
@@ -48,4 +52,34 @@ pub fn free_frame(addr: PhysAddr) {
             allocator.free(addr);
         }
     }
+}
+
+/// Align value up to alignment boundary
+#[inline]
+pub const fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
+}
+
+/// Align value down to alignment boundary
+#[inline]
+pub const fn align_down(value: usize, align: usize) -> usize {
+    value & !(align - 1)
+}
+
+/// Check if value is aligned to alignment boundary
+#[inline]
+pub const fn is_aligned(value: usize, align: usize) -> bool {
+    value & (align - 1) == 0
+}
+
+/// Convert physical address to virtual address (direct mapping)
+#[inline]
+pub const fn phys_to_virt(phys: PhysAddr) -> VirtAddr {
+    phys + PHYS_MAP_OFFSET
+}
+
+/// Convert virtual address to physical address (direct mapping)
+#[inline]
+pub const fn virt_to_phys(virt: VirtAddr) -> PhysAddr {
+    virt - PHYS_MAP_OFFSET
 }

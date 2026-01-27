@@ -7,64 +7,32 @@
 
 #include "../common/types.h"
 #include "elf.h"
+#include "../common/print.h"
 
-/* Addresses */
-#define KERNEL_TEMP_ADDR    0x20000ULL          /* Kernel ELF loaded here by Stage 2 (temp) */
-#define KERNEL_PHYS_ADDR    0x100000ULL         /* Kernel loaded here (1MB) after parsing */
-#define KERNEL_VIRT_ADDR    0xFFFFFFFF80000000ULL
+/* Addresses (defaults if BootInfo not set) */
+#define KERNEL_PHYS_ADDR    0x100000ULL           /* Default kernel physical base */
+#define KERNEL_VIRT_ADDR    0xFFFFFFFF80000000ULL /* Default kernel virtual base */
+#define LEGACY_KERNEL_ADDR  0x20000ULL            /* BIOS temp load location */
 
-/* Serial port for debug output */
-#define SERIAL_PORT 0x3F8
-
-/* I/O functions */
-static inline void outb(uint16_t port, uint8_t value) {
-    __asm__ volatile("outb %0, %1" : : "a"(value), "Nd"(port));
-}
-
-static inline uint8_t inb(uint16_t port) {
-    uint8_t value;
-    __asm__ volatile("inb %1, %0" : "=a"(value) : "Nd"(port));
-    return value;
-}
-
-static void serial_init(void) {
-    /* Disable interrupts */
-    outb(SERIAL_PORT + 1, 0x00);
-    /* Set baud rate divisor (115200) */
-    outb(SERIAL_PORT + 3, 0x80);    /* Enable DLAB */
-    outb(SERIAL_PORT + 0, 0x01);    /* Divisor low */
-    outb(SERIAL_PORT + 1, 0x00);    /* Divisor high */
-    /* 8 bits, no parity, one stop bit */
-    outb(SERIAL_PORT + 3, 0x03);
-    /* Enable FIFO */
-    outb(SERIAL_PORT + 2, 0xC7);
-    /* Enable IRQs, RTS/DSR set */
-    outb(SERIAL_PORT + 4, 0x0B);
-}
-
-static void serial_putc(char c) {
-    /* Wait for transmit buffer empty */
-    while ((inb(SERIAL_PORT + 5) & 0x20) == 0);
-    outb(SERIAL_PORT, c);
-}
-
-static void serial_puts(const char *s) {
-    while (*s) {
-        if (*s == '\n') serial_putc('\r');
-        serial_putc(*s++);
-    }
-}
-
-static void serial_puthex(uint64_t value) {
-    const char *hex = "0123456789ABCDEF";
-    serial_puts("0x");
-    for (int i = 60; i >= 0; i -= 4) {
-        serial_putc(hex[(value >> i) & 0xF]);
-    }
-}
+/* Serial helpers come from common/print */
 
 /* Boot info - using struct from types.h */
 static struct boot_info g_boot_info;
+
+/* Get kernel base addresses from BootInfo or use defaults */
+static inline uint64_t get_kernel_phys_base(const struct boot_info *bi) {
+    if (bi && bi->kernel_phys_base != 0) {
+        return bi->kernel_phys_base;
+    }
+    return KERNEL_PHYS_ADDR;
+}
+
+static inline uint64_t get_kernel_virt_base(const struct boot_info *bi) {
+    if (bi && bi->kernel_virt_base != 0) {
+        return bi->kernel_virt_base;
+    }
+    return KERNEL_VIRT_ADDR;
+}
 
 /* Simple memset */
 static void *memset_local(void *s, int c, uint64_t n) {
@@ -81,8 +49,20 @@ static void *memcpy_local(void *dest, const void *src, uint64_t n) {
     return dest;
 }
 
+/* Initialize BootInfo defaults for BIOS fallback */
+static void bootinfo_set_defaults(struct boot_info *bi) {
+    memset_local(bi, 0, sizeof(*bi));
+    bi->magic = BOOT_INFO_MAGIC;
+    bi->kernel_phys_base = KERNEL_PHYS_ADDR;
+    bi->kernel_virt_base = KERNEL_VIRT_ADDR;
+    bi->initrd_addr = LEGACY_KERNEL_ADDR;
+    bi->initrd_size = 0;
+}
+
 /* Parse ELF and get entry point */
-static uint64_t parse_elf(void *elf_data) {
+static uint64_t parse_elf(void *elf_data, const struct boot_info *bi) {
+    uint64_t kernel_phys_base = get_kernel_phys_base(bi);
+    uint64_t kernel_virt_base = get_kernel_virt_base(bi);
     Elf64_Ehdr *ehdr = (Elf64_Ehdr *)elf_data;
     
     /* Verify ELF magic */
@@ -111,8 +91,8 @@ static uint64_t parse_elf(void *elf_data) {
             
             /* Calculate physical address from virtual */
             uint64_t paddr;
-            if (phdr[i].p_vaddr >= KERNEL_VIRT_ADDR) {
-                paddr = phdr[i].p_vaddr - KERNEL_VIRT_ADDR + KERNEL_PHYS_ADDR;
+            if (phdr[i].p_vaddr >= kernel_virt_base) {
+                paddr = phdr[i].p_vaddr - kernel_virt_base + kernel_phys_base;
             } else {
                 paddr = phdr[i].p_vaddr;
             }
@@ -138,26 +118,40 @@ static uint64_t parse_elf(void *elf_data) {
 }
 
 /* Entry point - called from Stage 2 assembly */
-void stage3_main(void) {
+void stage3_main(struct boot_info *bi) {
     serial_init();
     serial_puts("\nStage 3 loaded\n");
-    
-    /* Kernel ELF was loaded to KERNEL_TEMP_ADDR by Stage 2 */
+
+    /* Store BootInfo for kernel access, with BIOS fallback */
+    if (bi && bi->magic == BOOT_INFO_MAGIC) {
+        g_boot_info = *bi;
+    } else {
+        bootinfo_set_defaults(&g_boot_info);
+    }
+
+    /* If kernel buffer missing, fallback to legacy BIOS load address */
+    if (g_boot_info.initrd_addr == 0) {
+        g_boot_info.initrd_addr = LEGACY_KERNEL_ADDR;
+    }
+
+    /* Kernel ELF buffer passed via initrd fields */
     serial_puts("Parsing kernel ELF at ");
-    serial_puthex(KERNEL_TEMP_ADDR);
+    serial_puthex(g_boot_info.initrd_addr);
+    serial_puts(" size ");
+    serial_puthex(g_boot_info.initrd_size);
     serial_puts("\n");
-    
-    uint64_t entry = parse_elf((void *)KERNEL_TEMP_ADDR);
+    serial_puts("Kernel phys base: ");
+    serial_puthex(g_boot_info.kernel_phys_base);
+    serial_puts("\n");
+
+    uint64_t entry = parse_elf((void *)g_boot_info.initrd_addr, &g_boot_info);
     if (entry == 0) {
         serial_puts("Failed to parse kernel!\n");
         goto halt;
     }
-    
-    /* Set up boot info */
-    memset_local(&g_boot_info, 0, sizeof(g_boot_info));
+
+    /* Boot info already set up above, ensure magic is set */
     g_boot_info.magic = BOOT_INFO_MAGIC;
-    g_boot_info.memory_map = NULL;
-    g_boot_info.memory_map_len = 0;
     
     serial_puts("Jumping to kernel at ");
     serial_puthex(entry);

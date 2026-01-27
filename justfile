@@ -109,16 +109,30 @@ gdb:
         -ex "symbol-file {{builddir}}/kernel/kernel.elf"
 
 # Run with UEFI firmware
-run-uefi: build
+run-uefi: image-uefi
     qemu-system-x86_64 \
         -machine q35 \
         -cpu qemu64 \
         -m 512M \
         -serial stdio \
-        -bios /usr/share/OVMF/OVMF_CODE.fd \
-        -drive file={{builddir}}/saltyos.img,format=raw \
+        -bios /usr/share/edk2-ovmf/OVMF_CODE.fd \
+        -drive file={{builddir}}/saltyos-uefi.img,format=raw \
         -no-reboot \
         -no-shutdown
+
+# Run UEFI with debug output
+run-uefi-debug: image-uefi
+    qemu-system-x86_64 \
+        -machine q35 \
+        -cpu qemu64 \
+        -m 512M \
+        -serial stdio \
+        -bios /usr/share/edk2-ovmf/OVMF_CODE.fd \
+        -drive file={{builddir}}/saltyos-uefi.img,format=raw \
+        -no-reboot \
+        -no-shutdown \
+        -d int,cpu_reset \
+        -D qemu.log
 
 # =============================================================================
 # Testing
@@ -136,9 +150,13 @@ test-integration: build
 # Utilities
 # =============================================================================
 
-# Create disk image
+# Create disk image (BIOS)
 image: build
     meson compile -C {{builddir}} disk_image
+
+# Create disk image (UEFI)
+image-uefi: build
+    meson compile -C {{builddir}} uefi_image
 
 # Show build configuration
 info:

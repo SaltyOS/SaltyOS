@@ -14,7 +14,7 @@ project('saltyos', ['c'],
   ])
 
 # =============================================================================
-# Build Configuration
+# Build Options
 # =============================================================================
 
 arch = get_option('arch')
@@ -22,29 +22,36 @@ build_boot = get_option('build_boot')
 build_kernel = get_option('build_kernel')
 build_userland = get_option('build_userland')
 
-message('Target architecture: ' + arch)
-message('Build bootloader: ' + build_boot.to_string())
-message('Build kernel: ' + build_kernel.to_string())
-message('Build userland: ' + build_userland.to_string())
-
 # =============================================================================
-# Toolchain Detection
+# Toolchain (clang/lld required)
 # =============================================================================
 
-# Find required tools
-rustc = find_program('rustc', required: build_kernel)
+# C Compiler: must be clang
+cc = meson.get_compiler('c', native: false)
+if cc.get_id() != 'clang'
+  error('SaltyOS requires clang. Got: ' + cc.get_id())
+endif
+cc_cmd = cc.cmd_array()
+
+# Assembler
 nasm = find_program('nasm', required: build_boot)
-ld = find_program('ld', required: true)
 
-# Architecture-specific settings
+# Binary tools
+objcopy = find_program('llvm-objcopy', required: build_boot)
+
+# Rust
+rustc = find_program('rustc', required: build_kernel)
+
+# =============================================================================
+# Architecture Configuration
+# =============================================================================
+
 if arch == 'x86_64'
   rust_target = 'x86_64-unknown-none'
-  asm_format = 'elf64'
-  kernel_base = '0xFFFFFFFF80000000'  # Higher half
+  efi_target = 'x86_64-unknown-uefi'
 elif arch == 'aarch64'
   rust_target = 'aarch64-unknown-none'
-  asm_format = 'elf64'
-  kernel_base = '0xFFFF000000000000'
+  efi_target = 'aarch64-unknown-uefi'
 else
   error('Unsupported architecture: ' + arch)
 endif
@@ -53,20 +60,34 @@ endif
 # Compiler Flags
 # =============================================================================
 
-# Freestanding C flags (no libc, no standard library)
+# Base freestanding flags (shared across boot components)
 c_freestanding_args = [
   '-ffreestanding',
+  '-fno-builtin',
+  '-fcf-protection=none',
   '-fno-stack-protector',
   '-fno-pic',
   '-fno-pie',
   '-mno-red-zone',
   '-nostdlib',
-  '-nostdinc',
 ]
 
-# Architecture-specific C flags
+# EFI-specific flags (PE/COFF via clang UEFI target)
+c_efi_args = c_freestanding_args + [
+  '-target', efi_target,
+  '-fshort-wchar',
+  '-DEFI_BUILD',
+]
+
+# Stage3 flags (loaded at 0x10000, small code model sufficient)
+c_stage3_args = c_freestanding_args + [
+  '-m64',
+  '-mcmodel=small',
+]
+
+# Kernel flags (higher half)
 if arch == 'x86_64'
-  c_freestanding_args += [
+  c_kernel_args = c_freestanding_args + [
     '-mcmodel=kernel',
     '-mno-sse',
     '-mno-mmx',
@@ -74,9 +95,11 @@ if arch == 'x86_64'
     '-mno-3dnow',
     '-mno-avx',
   ]
+else
+  c_kernel_args = c_freestanding_args
 endif
 
-# Rust flags for kernel
+# Rust flags
 rust_kernel_args = [
   '--edition=2024',
   '--target=' + rust_target,
@@ -104,26 +127,40 @@ if build_userland
 endif
 
 # =============================================================================
-# Image Generation
+# Disk Image Generation
 # =============================================================================
 
 mkimage = find_program('tools/mkimage.py', required: false)
 
 if mkimage.found() and build_boot and build_kernel
+
+  # BIOS disk image
   disk_image = custom_target('disk_image',
     input: [mbr, stage2, stage3, kernel],
     output: 'saltyos.img',
     command: [mkimage,
-      '--arch', arch,
-      '--mbr', '@INPUT0@',
-      '--stage2', '@INPUT1@',
-      '--stage3', '@INPUT2@',
-      '--kernel', '@INPUT3@',
+      '--build-dir', meson.project_build_root(),
       '--output', '@OUTPUT@',
       '--size', '8',
     ],
     build_by_default: true,
   )
+
+  # UEFI disk image
+  if arch == 'x86_64'
+    uefi_image = custom_target('uefi_image',
+      input: [efi, stage2_efi, stage3, kernel],
+      output: 'saltyos-uefi.img',
+      command: [mkimage,
+        '--efi',
+        '--build-dir', meson.project_build_root(),
+        '--output', '@OUTPUT@',
+        '--size', '64',
+      ],
+      build_by_default: false,
+    )
+  endif
+
 endif
 
 # =============================================================================
@@ -132,13 +169,18 @@ endif
 
 summary({
   'Architecture': arch,
-  'Build Bootloader': build_boot,
-  'Build Kernel': build_kernel,
-  'Build Userland': build_userland,
-  'Rust Target': rust_target,
-}, section: 'Configuration')
+  'Bootloader': build_boot,
+  'Kernel': build_kernel,
+  'Userland': build_userland,
+}, section: 'Build')
 
 summary({
-  'rustc': rustc.found() ? rustc.full_path() : 'not found',
-  'nasm': nasm.found() ? nasm.full_path() : 'not found',
-}, section: 'Tools')
+  'C Compiler': cc.get_id() + ' ' + cc.version(),
+  'Rust': rustc.found() ? rustc.full_path() : 'not found',
+  'NASM': nasm.found() ? nasm.full_path() : 'not found',
+}, section: 'Toolchain')
+
+summary({
+  'Rust Target': rust_target,
+  'EFI Target': efi_target,
+}, section: 'Targets')

@@ -3,12 +3,18 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 mod boot;
+mod cpu;
 mod gdt;
 mod idt;
 pub mod paging;
 
+pub use cpu::{current_cpu, MAX_CPUS};
+
 /// Initialize x86_64 architecture
 pub fn init() {
+    // Initialize per-CPU data for BSP
+    cpu::init_bsp();
+
     // Initialize GDT
     gdt::init();
 

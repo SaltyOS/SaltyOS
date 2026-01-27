@@ -71,6 +71,8 @@ struct boot_info {
     uint64_t magic;
     struct memory_map_entry *memory_map;
     size_t   memory_map_len;
+    uint64_t kernel_phys_base;     /* Kernel physical base address */
+    uint64_t kernel_virt_base;     /* Kernel virtual base address */
     uint64_t initrd_addr;
     uint64_t initrd_size;
     char    *cmdline;

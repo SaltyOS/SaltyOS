@@ -2,7 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Loaded at 0x10000 (64KB) by Stage 2 */
 
-OUTPUT_FORMAT(binary)
+OUTPUT_FORMAT(elf64-x86-64)
 OUTPUT_ARCH(i386:x86-64)
 
 ENTRY(_start)
