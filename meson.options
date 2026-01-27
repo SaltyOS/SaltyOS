@@ -1,0 +1,57 @@
+# SaltyOS Build Options
+# SPDX-License-Identifier: GPL-2.0-only
+
+# Target architecture
+option('arch',
+  type: 'combo',
+  choices: ['x86_64', 'aarch64'],
+  value: 'x86_64',
+  description: 'Target CPU architecture')
+
+# Component selection
+option('build_boot',
+  type: 'boolean',
+  value: true,
+  description: 'Build the bootloader')
+
+option('build_kernel',
+  type: 'boolean',
+  value: true,
+  description: 'Build the microkernel')
+
+option('build_userland',
+  type: 'boolean',
+  value: false,
+  description: 'Build userland components')
+
+# Debug options
+option('debug_serial',
+  type: 'boolean',
+  value: true,
+  description: 'Enable serial port debugging output')
+
+option('debug_symbols',
+  type: 'boolean',
+  value: true,
+  description: 'Include debug symbols in binaries')
+
+# Kernel options
+option('kernel_log_level',
+  type: 'combo',
+  choices: ['error', 'warn', 'info', 'debug', 'trace'],
+  value: 'info',
+  description: 'Kernel log verbosity level')
+
+option('max_cpus',
+  type: 'integer',
+  min: 1,
+  max: 256,
+  value: 16,
+  description: 'Maximum number of supported CPUs')
+
+option('kernel_stack_size',
+  type: 'integer',
+  min: 4096,
+  max: 65536,
+  value: 16384,
+  description: 'Kernel stack size per thread (bytes)')

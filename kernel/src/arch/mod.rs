@@ -1,0 +1,46 @@
+//! Architecture-specific code
+//!
+//! SPDX-License-Identifier: GPL-2.0-only
+
+#[cfg(target_arch = "x86_64")]
+pub mod x86_64;
+
+/// Initialize architecture-specific subsystems
+pub fn init() {
+    #[cfg(target_arch = "x86_64")]
+    x86_64::init();
+}
+
+/// Halt the CPU until next interrupt
+pub fn halt() {
+    #[cfg(target_arch = "x86_64")]
+    x86_64::halt();
+}
+
+/// Output byte to I/O port
+///
+/// # Safety
+/// Caller must ensure the port access is valid.
+#[inline(always)]
+pub unsafe fn outb(port: u16, value: u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: Caller ensures port access is valid
+    unsafe {
+        x86_64::outb(port, value);
+    }
+}
+
+/// Input byte from I/O port
+///
+/// # Safety
+/// Caller must ensure the port access is valid.
+#[inline(always)]
+pub unsafe fn inb(port: u16) -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: Caller ensures port access is valid
+    unsafe {
+        return x86_64::inb(port);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    0
+}

@@ -1,0 +1,39 @@
+# SaltyOS x86_64 Cross-Compilation Configuration
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Usage: meson setup build --cross-file tools/cross/x86_64.txt
+
+[binaries]
+c = 'x86_64-elf-gcc'
+cpp = 'x86_64-elf-g++'
+ar = 'x86_64-elf-ar'
+strip = 'x86_64-elf-strip'
+ld = 'x86_64-elf-ld'
+objcopy = 'x86_64-elf-objcopy'
+objdump = 'x86_64-elf-objdump'
+nm = 'x86_64-elf-nm'
+readelf = 'x86_64-elf-readelf'
+
+# Assembly tools
+nasm = 'nasm'
+
+# Rust compiler (invoked directly, not through Meson's Rust support)
+rustc = 'rustc'
+
+[built-in options]
+c_args = ['-ffreestanding', '-fno-stack-protector', '-fno-pic', '-mno-red-zone', '-mcmodel=kernel']
+c_link_args = ['-nostdlib', '-static']
+
+[properties]
+# Indicate this is a freestanding environment
+needs_exe_wrapper = true
+
+# Kernel-specific properties
+kernel_base = '0xFFFFFFFF80000000'
+kernel_stack_size = 16384
+
+[host_machine]
+system = 'saltyos'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'

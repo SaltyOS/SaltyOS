@@ -1,0 +1,48 @@
+# Build outputs
+/build/
+/build-*/
+
+# Meson
+/.meson/
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS generated
+.DS_Store
+Thumbs.db
+
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Object files
+*.o
+*.a
+*.so
+*.elf
+*.bin
+
+# Disk images
+*.img
+*.iso
+*.vhd
+*.vmdk
+
+# Debug
+*.log
+core
+*.core
+
+# Generated
+*.generated.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
