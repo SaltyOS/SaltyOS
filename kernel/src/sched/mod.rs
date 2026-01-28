@@ -4,7 +4,7 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-mod scheduler;
+pub mod scheduler;
 pub mod thread;
 
 // Re-exports for public API

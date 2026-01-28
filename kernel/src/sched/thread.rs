@@ -15,6 +15,22 @@ pub enum ThreadState {
     Waiting,
 }
 
+/// Reason why a thread is blocked
+#[derive(Clone, Copy)]
+pub enum BlockedReason {
+    /// Blocked on send - waiting for receiver
+    SendBlocked {
+        /// Message to send
+        msg: super::super::ipc::Message,
+        /// Badge (sender identity)
+        badge: u64,
+    },
+    /// Blocked on receive - waiting for sender
+    RecvBlocked,
+    /// Blocked on notification wait
+    NotificationWait,
+}
+
 /// Thread Control Block
 #[repr(C)]
 pub struct Tcb {
@@ -34,6 +50,14 @@ pub struct Tcb {
     pub sched_context: *mut SchedContext,
     /// Next thread in queue
     pub next: *mut Tcb,
+    /// Why this thread is blocked (valid when state == Blocked/Waiting)
+    pub blocked_reason: Option<BlockedReason>,
+    /// Saved caller badge (for reply_recv)
+    pub saved_caller_badge: u64,
+    /// Saved caller message (for reply_recv)
+    pub saved_caller_msg: super::super::ipc::Message,
+    /// Notification pointer if blocked on notification
+    pub blocked_notification: *mut u8,
 }
 
 /// Saved thread context
@@ -118,6 +142,10 @@ impl Tcb {
             ipc_buffer: 0,
             sched_context: core::ptr::null_mut(),
             next: core::ptr::null_mut(),
+            blocked_reason: None,
+            saved_caller_badge: 0,
+            saved_caller_msg: super::super::ipc::Message::empty(),
+            blocked_notification: core::ptr::null_mut(),
         }
     }
 }
