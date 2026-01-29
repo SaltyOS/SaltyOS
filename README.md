@@ -19,13 +19,28 @@ SaltyOS is a capability-based microkernel designed with security and modularity 
 
 ## Project Status
 
-🚧 **Early Development** - Not yet bootable
+🚧 **Active Development** - Kernel initializes with timer ticks, userspace not yet reachable
 
-Current focus:
-- [ ] Stage 1/2 bootloader (BIOS + UEFI)
-- [ ] Basic kernel entry and serial output
-- [ ] Memory management (physical + virtual)
-- [ ] Capability system foundation
+### Completed Components
+
+- [x] **3-stage bootloader** (BIOS + UEFI support)
+- [x] **Kernel entry** with serial debug output
+- [x] **Memory management** (frame allocator, page tables, VSpace)
+- [x] **Capability system** (fat caps, CDT, CNode operations)
+- [x] **Synchronous IPC** (endpoints with send/recv/call)
+- [x] **Async notifications** (IRQ signaling)
+- [x] **EDF scheduler** (budget enforcement, deadline-based)
+- [x] **Context switching** (full save/restore)
+- [x] **SMP infrastructure** (per-CPU data, IPI, APIC timer)
+- [x] **Interrupt handling** (IDT, IRQ routing)
+
+### Current Focus
+
+- [ ] System call dispatch and handlers
+- [ ] ELF loader for userspace processes
+- [ ] First init process spawn
+- [ ] Capability derivation and revocation testing
+- [ ] IPC message transfer implementation
 
 ## Architecture
 
@@ -102,6 +117,7 @@ just reconfigure -Dkernel_log_level=debug
   - [Scheduling](docs/design/scheduling.md)
   - [Memory Management](docs/design/memory.md)
   - [SaltyFS](docs/design/saltyfs.md)
+  - [POSIX Compatibility](docs/design/posix.md)
 - [Specifications](docs/spec/)
   - [System Calls](docs/spec/syscalls.md)
   - [Boot Protocol](docs/spec/boot_protocol.md)
@@ -139,17 +155,17 @@ SaltyOS/
 
 ## Design Philosophy
 
-### What the Kernel Does
+### What the Kernel Does (Implemented)
 
-- Thread management and scheduling (EDF)
+- Thread management and EDF scheduling with budget enforcement
 - Synchronous IPC (endpoints) and async notifications
-- Virtual address space management (VSpace)
-- Physical memory allocation and mapping
-- Capability-based access control
-- IRQ routing to userspace
-- Kernel object lifecycle management
+- Virtual address space management (VSpace) with page tables
+- Physical memory allocation (frame allocator, slab allocator)
+- Capability-based access control (fat capabilities, CDT)
+- Context switching and interrupt handling
+- SMP support (per-CPU data, IPI, APIC timer)
 
-### What the Kernel Does NOT Do
+### What the Kernel Does NOT Do (Userspace)
 
 - Filesystem (VFS is a userspace server)
 - Network stack
