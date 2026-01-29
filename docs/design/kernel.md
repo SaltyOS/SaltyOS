@@ -124,7 +124,7 @@ mod syscall;
 use core::panic::PanicInfo;
 
 /// Kernel entry point (called from bootloader)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Initialize serial for early debug output
     arch::serial::init();
@@ -595,7 +595,7 @@ pub enum Syscall {
 }
 
 /// System call handler entry point
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn syscall_handler(
     syscall: u64,
     arg1: u64,
@@ -629,7 +629,7 @@ pub extern "C" fn syscall_handler(
 
 /// x86_64 syscall entry (from SYSCALL instruction)
 #[naked]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn syscall_entry() {
     core::arch::asm!(
         // Swap to kernel stack

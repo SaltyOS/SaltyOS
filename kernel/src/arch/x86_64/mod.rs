@@ -69,6 +69,9 @@ pub fn init(boot_info: Option<&crate::BootInfo>) {
         crate::mm::init(info);
     }
 
+    // Initialize syscalls (needs frame allocator for kernel stack)
+    init_syscalls();
+
     // Initialize paging (kernel page tables already set up by bootloader)
     paging::init();
 
@@ -143,4 +146,221 @@ pub unsafe fn inb(port: u16) -> u8 {
         );
     }
     value
+}
+
+/// Print a hexadecimal number to serial port
+unsafe fn print_hex(mut val: u64) {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    unsafe {
+        for byte in b"0x" {
+            while (inb(0x3F8 + 5) & 0x20) == 0 {}
+            outb(0x3F8, *byte);
+        }
+    }
+    if val == 0 {
+        unsafe {
+            while (inb(0x3F8 + 5) & 0x20) == 0 {}
+            outb(0x3F8, b'0');
+        }
+        return;
+    }
+    let mut buf = [0u8; 16];
+    let mut pos = 15;
+    while val > 0 {
+        buf[pos] = HEX_CHARS[(val & 0xF) as usize];
+        val >>= 4;
+        pos -= 1;
+    }
+    unsafe {
+        for &c in &buf[(pos + 1)..] {
+            while (inb(0x3F8 + 5) & 0x20) == 0 {}
+            outb(0x3F8, c);
+        }
+    }
+}
+
+// External assembly entry point
+unsafe extern "C" {
+    fn syscall_entry();
+}
+
+/// Initialize x86_64 SYSCALL/SYSRET MSRs
+///
+/// Sets up:
+/// - IA32_STAR (0xC0000081): Ring 0/3 CS/SS selectors
+/// - IA32_LSTAR (0xC0000082): Kernel entry point RIP
+/// - IA32_FMASK (0xC0000084): RFLAGS mask to clear on syscall
+/// - IA32_EFER.SCE: Enable syscall
+///
+/// Also allocates and sets up kernel stacks for syscall handling.
+pub fn init_syscalls() {
+    unsafe {
+        // Debug output
+        for byte in b"\n[SYSCALL] Initializing syscall MSRs\n" {
+            while (inb(0x3F8 + 5) & 0x20) == 0 {}
+            outb(0x3F8, *byte);
+        }
+
+        // Allocate kernel stack for syscall (16KB = 4 contiguous pages of 4KB each)
+        // We need to allocate frames and verify they are contiguous
+        const STACK_PAGES: usize = 4;
+        const STACK_SIZE: u64 = STACK_PAGES as u64 * 4096;
+
+        let mut stack_frames = [0u64; STACK_PAGES];
+        let mut stack_allocated = false;
+
+        // Try to allocate contiguous frames (retry a few times if needed)
+        for _attempt in 0..10 {
+            let mut first_frame: Option<u64> = None;
+            let mut all_contiguous = true;
+
+            for i in 0..STACK_PAGES {
+                if let Some(frame) = crate::mm::alloc_frame() {
+                    stack_frames[i] = frame;
+
+                    if let Some(first) = first_frame {
+                        // Check if this frame is contiguous with the previous one
+                        let expected = first + (i as u64 * 4096);
+                        if frame != expected {
+                            all_contiguous = false;
+                            break;
+                        }
+                    } else {
+                        first_frame = Some(frame);
+                    }
+                } else {
+                    // Allocation failed, free any allocated frames and retry
+                    for j in 0..i {
+                        if stack_frames[j] != 0 {
+                            crate::mm::free_frame(stack_frames[j]);
+                            stack_frames[j] = 0;
+                        }
+                    }
+                    all_contiguous = false;
+                    break;
+                }
+            }
+
+            if all_contiguous {
+                stack_allocated = true;
+                break;
+            }
+
+            // Free all allocated frames and retry
+            for i in 0..STACK_PAGES {
+                if stack_frames[i] != 0 {
+                    crate::mm::free_frame(stack_frames[i]);
+                    stack_frames[i] = 0;
+                }
+            }
+        }
+
+        if !stack_allocated {
+            for byte in b"[SYSCALL] Failed to allocate contiguous kernel stack!\n" {
+                while (inb(0x3F8 + 5) & 0x20) == 0 {}
+                outb(0x3F8, *byte);
+            }
+            loop {
+                core::arch::asm!("hlt");
+            }
+        }
+
+        let stack_bottom = stack_frames[0];
+        let stack_top = stack_bottom + STACK_SIZE;
+
+        // Set kernel stack for current CPU
+        cpu::set_kernel_stack(stack_top);
+
+        // Print stack info
+        for byte in b"[SYSCALL] Kernel stack: " {
+            while (inb(0x3F8 + 5) & 0x20) == 0 {}
+            outb(0x3F8, *byte);
+        }
+        print_hex(stack_top);
+        for byte in b"\n" {
+            while (inb(0x3F8 + 5) & 0x20) == 0 {}
+            outb(0x3F8, *byte);
+        }
+
+        // Segment selectors
+        // STAR format: [63:48] = user CS (star - 16), [47:32] = user SS,
+        //              [31:16] = kernel CS, [15:0] = kernel SS
+        // Kernel CS = 0x08 (from GDT), User CS = 0x18 | 3 = 0x1B
+        // User SS = 0x20 | 3 = 0x23
+        let star = (0x1Bu64 << 48) | (0x23u64 << 32) | (0x08u64 << 16);
+        let star_low = star as u32;
+        let star_high = (star >> 32) as u32;
+
+        // Write IA32_STAR
+        core::arch::asm!(
+            "wrmsr",
+            in("rcx") 0xC0000081u32,  // IA32_STAR
+            in("rax") star_low,
+            in("rdx") star_high,
+            options(nostack)
+        );
+
+        // Write IA32_LSTAR (syscall_entry address)
+        let lstar = syscall_entry as *const () as u64;
+        let lstar_low = lstar as u32;
+        let lstar_high = (lstar >> 32) as u32;
+
+        core::arch::asm!(
+            "wrmsr",
+            in("rcx") 0xC0000082u32,  // IA32_LSTAR
+            in("rax") lstar_low,
+            in("rdx") lstar_high,
+            options(nostack)
+        );
+
+        // Write IA32_FMASK (clear IF on syscall, disable interrupts)
+        core::arch::asm!(
+            "wrmsr",
+            in("rcx") 0xC0000084u32,  // IA32_FMASK
+            in("rax") 0x200u32,       // Clear IF flag
+            in("rdx") 0u32,
+            options(nostack)
+        );
+
+        // Enable syscall in IA32_EFER
+        let mut efer: u64;
+        core::arch::asm!(
+            "rdmsr",
+            in("rcx") 0xC0000080u32,  // IA32_EFER
+            lateout("rax") efer,
+            out("rdx") _,
+            options(nostack)
+        );
+        efer |= 1;  // Set SCE (SysCall Enable) bit
+        
+        let efer_low = efer as u32;
+        let efer_high = (efer >> 32) as u32;
+
+        core::arch::asm!(
+            "wrmsr",
+            in("rcx") 0xC0000080u32,
+            in("rax") efer_low,
+            in("rdx") efer_high,
+            options(nostack)
+        );
+
+        for byte in b"[SYSCALL] MSRs configured successfully\n" {
+            while (inb(0x3F8 + 5) & 0x20) == 0 {}
+            outb(0x3F8, *byte);
+        }
+        for byte in b"[SYSCALL]   STAR=" {
+            while (inb(0x3F8 + 5) & 0x20) == 0 {}
+            outb(0x3F8, *byte);
+        }
+        print_hex(star);
+        for byte in b"\n[SYSCALL]   LSTAR=" {
+            while (inb(0x3F8 + 5) & 0x20) == 0 {}
+            outb(0x3F8, *byte);
+        }
+        print_hex(lstar);
+        for byte in b"\n" {
+            while (inb(0x3F8 + 5) & 0x20) == 0 {}
+            outb(0x3F8, *byte);
+        }
+    }
 }

@@ -4,32 +4,27 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-// Will be used when syscalls are implemented
 #[allow(unused_imports)]
 use crate::cap::{CapRights, Capability, ObjectType};
 
 /// System call numbers
 #[repr(u64)]
 pub enum Syscall {
-    /// Send message to endpoint
     Send = 0,
-    /// Receive message from endpoint
     Recv = 1,
-    /// Call (send + recv)
     Call = 2,
-    /// Reply and receive
     ReplyRecv = 3,
-    /// Signal notification
     Signal = 4,
-    /// Wait on notification
     Wait = 5,
-    /// Yield to scheduler
     Yield = 6,
-    /// Invoke capability
     Invoke = 7,
 }
 
-/// System call result
+/// System call result (FFI-safe)
+///
+/// Under System V AMD64 ABI:
+/// - `error` is returned in %rax
+/// - `value` is returned in %rdx
 #[repr(C)]
 pub struct SyscallResult {
     pub error: u64,
@@ -60,7 +55,7 @@ pub enum SyscallError {
     OutOfMemory = 5,
 }
 
-/// Handle system call
+/// Handle system call logic
 pub fn handle(
     syscall: u64,
     _cap_ptr: u64,
@@ -69,6 +64,7 @@ pub fn handle(
     _arg2: u64,
     _arg3: u64,
 ) -> SyscallResult {
+    // Convert raw u64 to Enum safely
     let syscall_num = match syscall {
         0 => Syscall::Send,
         1 => Syscall::Recv,
@@ -91,4 +87,24 @@ pub fn handle(
             SyscallResult::err(SyscallError::InvalidOperation)
         }
     }
+}
+
+/// Syscall handler wrapper called from assembly
+///
+/// # ABI Note
+/// Returns struct { u64, u64 }.
+/// - Rust/C ABI places the first u64 in **RAX**.
+/// - Rust/C ABI places the second u64 in **RDX**.
+///
+/// The assembly entry point MUST read the value from RDX, not RBX.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn syscall_handle_rust(
+    syscall: u64, // RDI
+    cap_ptr: u64, // RSI
+    arg0: u64,    // RDX
+    arg1: u64,    // RCX
+    arg2: u64,    // R8
+    arg3: u64,    // R9
+) -> SyscallResult {
+    handle(syscall, cap_ptr, arg0, arg1, arg2, arg3)
 }

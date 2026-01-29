@@ -16,6 +16,13 @@ all_rs_files = run_command(
   check: true
 ).stdout().strip()
 
+# Find all assembly source files
+all_asm_files = run_command(
+  'find', 'src', '-name', '*.S',
+  capture: true,
+  check: true
+).stdout().strip()
+
 # Split into crate root and module dependencies
 kernel_crate_root = files('src/lib.rs')
 module_deps = files(all_rs_files.split('\n'))
@@ -23,6 +30,22 @@ kernel_ld = meson.current_source_dir() / 'kernel.ld'
 
 # Paths to core and compiler_builtins metadata (built in rust/)
 rust_build_dir = meson.project_build_root() / 'rust'
+
+# Compile assembly files to object files
+asm_objs = []
+if all_asm_files != ''
+  asm_files = all_asm_files.split('\n')
+  foreach asm_file : asm_files
+    asm_obj = custom_target(
+      'asm_' + asm_file.underscorify(),
+      input: files(asm_file),
+      output: asm_file.underscorify() + '.o',
+      command: [cc_cmd, '-c', '@INPUT@', '-o', '@OUTPUT@'],
+      build_by_default: true,
+    )
+    asm_objs += asm_obj
+  endforeach
+endif
 
 # Step 1: Compile Rust kernel to object file
 # Uses custom-built core library instead of sysroot
@@ -52,9 +75,9 @@ kernel_obj = custom_target('kernel_obj',
   build_by_default: true,
 )
 
-# Step 2: Link kernel object with core and compiler_builtins into ELF executable
+# Step 2: Link kernel object with core, compiler_builtins, and assembly objects into ELF executable
 kernel = custom_target('kernel',
-  input: [kernel_obj, core_obj, compiler_builtins_obj],
+  input: [kernel_obj, core_obj, compiler_builtins_obj] + asm_objs,
   output: 'kernel.elf',
   command: [
     cc_cmd,

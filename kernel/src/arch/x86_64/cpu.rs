@@ -9,20 +9,32 @@ const IA32_GS_BASE_MSR: u32 = 0xC000_0101;
 pub const MAX_CPUS: usize = 16;
 
 /// Per-CPU data structure
+///
+/// Layout is fixed with #[repr(C)] to ensure assembly compatibility.
+/// Offset 0: cpu_id (u32)
+/// Offset 4: padding (u32)
+/// Offset 8: kernel_stack (u64)
+/// Offset 16: saved_rsp (u64)
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PerCpuData {
     /// CPU ID (0 for BSP, 1+ for APs)
     pub cpu_id: u32,
+    /// Kernel stack pointer for syscall entry
+    pub kernel_stack: u64,
+    /// Saved user RSP during syscall
+    pub saved_rsp: u64,
     /// Reserved for future use
-    _reserved: [u64; 15],
+    _reserved: [u64; 13],
 }
 
 /// Per-CPU data for each CPU
 static mut PER_CPU_DATA: [PerCpuData; MAX_CPUS] = {
     const INIT: PerCpuData = PerCpuData {
         cpu_id: 0,
-        _reserved: [0; 15],
+        kernel_stack: 0,
+        saved_rsp: 0,
+        _reserved: [0; 13],
     };
     [INIT; MAX_CPUS]
 };
@@ -32,7 +44,6 @@ const SERIAL_PORT: u16 = 0x3F8;
 
 /// Write a byte to serial port
 unsafe fn serial_putc(c: u8) {
-    // SAFETY: COM1 is a standard x86 serial port
     unsafe {
         while (super::inb(SERIAL_PORT + 5) & 0x20) == 0 {}
         super::outb(SERIAL_PORT, c);
@@ -42,25 +53,16 @@ unsafe fn serial_putc(c: u8) {
 /// Write a string to serial port
 unsafe fn serial_puts(s: &str) {
     for byte in s.bytes() {
-        // SAFETY: COM1 is a standard x86 serial port
-        unsafe {
-            serial_putc(byte);
-        }
+        unsafe { serial_putc(byte); }
     }
 }
 
 /// Write a hexadecimal number to serial port
 unsafe fn serial_hex(mut val: u64) {
     const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-    // SAFETY: COM1 is a standard x86 serial port
-    unsafe {
-        serial_puts("0x");
-    }
+    unsafe { serial_puts("0x"); }
     if val == 0 {
-        // SAFETY: COM1 is a standard x86 serial port
-        unsafe {
-            serial_putc(b'0');
-        }
+        unsafe { serial_putc(b'0'); }
         return;
     }
     let mut buf = [0u8; 16];
@@ -71,16 +73,12 @@ unsafe fn serial_hex(mut val: u64) {
         pos -= 1;
     }
     for &c in &buf[(pos + 1)..] {
-        // SAFETY: COM1 is a standard x86 serial port
-        unsafe {
-            serial_putc(c);
-        }
+        unsafe { serial_putc(c); }
     }
 }
 
 /// Initialize per-CPU data for the BSP (Boot Processor)
 pub fn init_bsp() {
-    // SAFETY: Single-threaded initialization, PER_CPU_DATA is valid
     unsafe {
         serial_puts("\n[CPU] init_bsp() called\n");
 
@@ -98,28 +96,22 @@ pub fn init_bsp() {
 }
 
 /// Get the current CPU ID
-///
-/// Uses the GS base register to access per-CPU data.
-/// The GS base is set by init_bsp() (for BSP) or during AP startup.
 #[inline(always)]
 pub fn current_cpu() -> u32 {
+    let cpu_id: u32;
     unsafe {
-        let ptr: *const PerCpuData;
+        // Read value directly from GS:[0], not as a pointer
         core::arch::asm!(
-            "mov {}, gs:[0]",
-            out(reg) ptr,
+            "mov {0:e}, gs:[0]", 
+            out(reg) cpu_id,
             options(nostack, pure, readonly)
         );
-        (*ptr).cpu_id
     }
+    cpu_id
 }
 
-/// Write to GS base using MSR (more compatible than wrgsbase)
-///
-/// # Safety
-/// The address must be valid.
+/// Write to GS base using MSR
 fn write_gs_base_msr(base: u64) {
-    // SAFETY: MSR address is valid, caller ensures base is valid
     unsafe {
         let low = base as u32;
         let high = (base >> 32) as u32;
@@ -135,10 +127,36 @@ fn write_gs_base_msr(base: u64) {
 }
 
 /// Get per-CPU data pointer for a specific CPU
+pub unsafe fn per_cpu_mut(cpu_id: u32) -> &'static mut PerCpuData {
+    unsafe { &mut PER_CPU_DATA[cpu_id as usize] }
+}
+
+/// Set kernel stack for the current CPU
 ///
 /// # Safety
-/// The CPU ID must be valid and less than MAX_CPUS.
-pub unsafe fn per_cpu_mut(cpu_id: u32) -> &'static mut PerCpuData {
-    // SAFETY: Caller ensures CPU ID is valid
-    unsafe { &mut PER_CPU_DATA[cpu_id as usize] }
+/// Must be called with a valid kernel stack pointer.
+pub unsafe fn set_kernel_stack(stack_top: u64) {
+    // SAFETY: We access GS:[8] which corresponds to `kernel_stack` field.
+    // Offset calculation: cpu_id(4) + padding(4) = 8
+    unsafe {
+        core::arch::asm!(
+            "mov gs:[8], {}",
+            in(reg) stack_top,
+            options(nostack)
+        );
+    }
+}
+
+/// Get kernel stack pointer for the current CPU
+pub fn get_kernel_stack() -> u64 {
+    let stack_top: u64;
+    unsafe {
+        // Read value directly from GS:[8]
+        core::arch::asm!(
+            "mov {}, gs:[8]",
+            out(reg) stack_top,
+            options(nostack, pure, readonly)
+        );
+    }
+    stack_top
 }
