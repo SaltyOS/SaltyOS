@@ -8,6 +8,8 @@ mod endpoint;
 mod notification;
 mod queue;
 
+pub use endpoint::Endpoint;
+pub use notification::Notification;
 pub use queue::WaitQueue;
 
 /// IPC message (register-based for fastpath)
@@ -48,8 +50,10 @@ use crate::sched::scheduler::scheduler as get_scheduler;
 /// # Safety
 /// Must be called from current thread context with interrupts disabled
 pub unsafe fn block_current_thread(tcb: *mut Tcb, reason: BlockedReason) {
-    (*tcb).blocked_reason = Some(reason);
-    (*tcb).state = ThreadState::Blocked;
+    unsafe {
+        (*tcb).blocked_reason = Some(reason);
+        (*tcb).state = ThreadState::Blocked;
+    }
 
     // Do NOT enqueue - thread is in endpoint/notification queue, not ready queue
     get_scheduler().reschedule();
@@ -65,7 +69,9 @@ pub unsafe fn block_current_thread(tcb: *mut Tcb, reason: BlockedReason) {
 /// # Safety
 /// Must be called with interrupts disabled
 pub unsafe fn wake_thread(tcb: *mut Tcb) {
-    (*tcb).blocked_reason = None;
-    (*tcb).blocked_notification = core::ptr::null_mut();
+    unsafe {
+        (*tcb).blocked_reason = None;
+        (*tcb).blocked_notification = core::ptr::null_mut();
+    }
     get_scheduler().enqueue(tcb);
 }

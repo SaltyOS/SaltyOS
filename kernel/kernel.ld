@@ -6,7 +6,7 @@ OUTPUT_ARCH(i386:x86-64)
 ENTRY(_start)
 
 /* Higher-half kernel base address */
-KERNEL_VMA = 0xFFFFFFFF80000000;
+KERNEL_VMA = 0xFFFFFFFF80100000;
 KERNEL_LMA = 0x100000;  /* 1MB physical */
 
 PHDRS

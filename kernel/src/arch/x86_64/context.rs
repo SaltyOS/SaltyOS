@@ -34,10 +34,11 @@ pub unsafe extern "sysv64" fn switch_context(
     // - Other registers restored from new context
     // - Function returns to new thread's RIP
 
-    core::arch::asm!(
-        // Save callee-saved registers to old context
-        // RSP is saved first (current stack pointer before we switch)
-        "
+    unsafe {
+        core::arch::asm!(
+            // Save callee-saved registers to old context
+            // RSP is saved first (current stack pointer before we switch)
+            "
         mov [rdi + 0x40], rbp    // Save RBP (offset 0x40 = 8*8)
         mov [rdi + 0x50], r12    // Save R12 (offset 0x50 = 10*8)
         mov [rdi + 0x58], r13    // Save R13 (offset 0x58 = 11*8)
@@ -47,12 +48,12 @@ pub unsafe extern "sysv64" fn switch_context(
         mov [rdi + 0x38], rsp    // Save RSP (offset 0x38 = 7*8) - save last
         ",
 
-        // Load new stack pointer first
-        // This is critical - we must switch stacks before restoring other registers
-        "mov rsp, [rsi + 0x38]",  // Load new RSP
+            // Load new stack pointer first
+            // This is critical - we must switch stacks before restoring other registers
+            "mov rsp, [rsi + 0x38]",  // Load new RSP
 
-        // Restore callee-saved registers from new context
-        "
+            // Restore callee-saved registers from new context
+            "
         mov rbx, [rsi + 0x28]    // Restore RBX
         mov rbp, [rsi + 0x40]    // Restore RBP
         mov r12, [rsi + 0x50]    // Restore R12
@@ -61,24 +62,25 @@ pub unsafe extern "sysv64" fn switch_context(
         mov r15, [rsi + 0x68]    // Restore R15
         ",
 
-        // Restore RSP was already done above
-        // The ret instruction will use the new RSP to pop return address
-        // but we need to return to the new context's RIP, not here
+            // Restore RSP was already done above
+            // The ret instruction will use the new RSP to pop return address
+            // but we need to return to the new context's RIP, not here
 
-        // Save current RIP (return address) to old context
-        // This was pushed by the call instruction
-        "mov [rdi + 0x70], rax", // Placeholder - we'll fix this below
+            // Save current RIP (return address) to old context
+            // This was pushed by the call instruction
+            "mov [rdi + 0x70], rax", // Placeholder - we'll fix this below
 
-        // Load new RIP and return there
-        // We need to pop the return address and push the new one
-        // Actually, let's use a different approach
+            // Load new RIP and return there
+            // We need to pop the return address and push the new one
+            // Actually, let's use a different approach
 
-        in("rdi") old_context,  // First argument: old context
-        in("rsi") new_context,  // Second argument: new context
+            in("rdi") old_context,  // First argument: old context
+            in("rsi") new_context,  // Second argument: new context
 
-        // Clobber all caller-saved and some callee-saved registers
-        clobber_abi("sysv64"),
-    );
+            // Clobber all caller-saved and some callee-saved registers
+            clobber_abi("sysv64"),
+        );
+    }
 }
 
 /// Context switch implementation with proper return handling
@@ -96,50 +98,52 @@ pub unsafe extern "sysv64" fn context_switch(
     // 3. Restore all registers from new context
     // 4. Return will use the new RIP from stack
 
-    core::arch::asm!(
-        // === Save old context ===
-        // First, save the return address (pushed by call) to old context
-        "mov rax, [rsp]",           // Get return address from stack
-        "mov [rdi + 0x70], rax",    // Save RIP to old_context.rip (offset 0x70 = 14*8)
+    unsafe {
+        core::arch::asm!(
+            // === Save old context ===
+            // First, save the return address (pushed by call) to old context
+            "mov rax, [rsp]",           // Get return address from stack
+            "mov [rdi + 0x70], rax",    // Save RIP to old_context.rip (offset 0x70 = 14*8)
 
-        // Save RBP (stack frame pointer)
-        "mov [rdi + 0x40], rbp",    // Save RBP
+            // Save RBP (stack frame pointer)
+            "mov [rdi + 0x40], rbp",    // Save RBP
 
-        // Save callee-saved registers: RBX, R12-R15
-        "mov [rdi + 0x28], rbx",    // Save RBX
-        "mov [rdi + 0x50], r12",    // Save R12
-        "mov [rdi + 0x58], r13",    // Save R13
-        "mov [rdi + 0x60], r14",    // Save R14
-        "mov [rdi + 0x68], r15",    // Save R15
+            // Save callee-saved registers: RBX, R12-R15
+            "mov [rdi + 0x28], rbx",    // Save RBX
+            "mov [rdi + 0x50], r12",    // Save R12
+            "mov [rdi + 0x58], r13",    // Save R13
+            "mov [rdi + 0x60], r14",    // Save R14
+            "mov [rdi + 0x68], r15",    // Save R15
 
-        // Save RSP (must be done after saving return address)
-        "lea rax, [rsp + 8]",       // RSP after popping return address
-        "mov [rdi + 0x38], rax",    // Save RSP
+            // Save RSP (must be done after saving return address)
+            "lea rax, [rsp + 8]",       // RSP after popping return address
+            "mov [rdi + 0x38], rax",    // Save RSP
 
-        // === Switch to new context ===
-        // Load new RSP first (critical!)
-        "mov rsp, [rsi + 0x38]",    // Load new RSP
+            // === Switch to new context ===
+            // Load new RSP first (critical!)
+            "mov rsp, [rsi + 0x38]",    // Load new RSP
 
-        // Push new return address
-        "mov rax, [rsi + 0x70]",    // Load new RIP
-        "push rax",                 // Push it as return address
+            // Push new return address
+            "mov rax, [rsi + 0x70]",    // Load new RIP
+            "push rax",                 // Push it as return address
 
-        // Restore callee-saved registers from new context
-        "mov rbx, [rsi + 0x28]",    // Restore RBX
-        "mov rbp, [rsi + 0x40]",    // Restore RBP
-        "mov r12, [rsi + 0x50]",    // Restore R12
-        "mov r13, [rsi + 0x58]",    // Restore R13
-        "mov r14, [rsi + 0x60]",    // Restore R14
-        "mov r15, [rsi + 0x68]",    // Restore R15
+            // Restore callee-saved registers from new context
+            "mov rbx, [rsi + 0x28]",    // Restore RBX
+            "mov rbp, [rsi + 0x40]",    // Restore RBP
+            "mov r12, [rsi + 0x50]",    // Restore R12
+            "mov r13, [rsi + 0x58]",    // Restore R13
+            "mov r14, [rsi + 0x60]",    // Restore R14
+            "mov r15, [rsi + 0x68]",    // Restore R15
 
-        // Return to new RIP (pop return address from stack and jump)
-        "ret",
+            // Return to new RIP (pop return address from stack and jump)
+            "ret",
 
-        in("rdi") old_context,
-        in("rsi") new_context,
+            in("rdi") old_context,
+            in("rsi") new_context,
 
-        clobber_abi("sysv64"),
-    );
+            clobber_abi("sysv64"),
+        );
+    }
 }
 
 /// Initialize a thread context for first execution
@@ -156,28 +160,30 @@ pub unsafe fn init_thread_context(
     entry_point: extern "C" fn() -> !,
     stack_top: u64,
 ) {
-    (*context).rip = entry_point as u64;
-    (*context).rsp = stack_top;
-    (*context).rflags = 0x202; // Interrupts enabled
-    (*context).cs = 0x08; // Kernel code segment
-    (*context).ss = 0x10; // Kernel data segment
+    unsafe {
+        (*context).rip = entry_point as u64;
+        (*context).rsp = stack_top;
+        (*context).rflags = 0x202; // Interrupts enabled
+        (*context).cs = 0x08; // Kernel code segment
+        (*context).ss = 0x10; // Kernel data segment
 
-    // All other registers are zero-initialized
-    (*context).rax = 0;
-    (*context).rbx = 0;
-    (*context).rcx = 0;
-    (*context).rdx = 0;
-    (*context).rsi = 0;
-    (*context).rdi = 0;
-    (*context).rbp = 0;
-    (*context).r8 = 0;
-    (*context).r9 = 0;
-    (*context).r10 = 0;
-    (*context).r11 = 0;
-    (*context).r12 = 0;
-    (*context).r13 = 0;
-    (*context).r14 = 0;
-    (*context).r15 = 0;
+        // All other registers are zero-initialized
+        (*context).rax = 0;
+        (*context).rbx = 0;
+        (*context).rcx = 0;
+        (*context).rdx = 0;
+        (*context).rsi = 0;
+        (*context).rdi = 0;
+        (*context).rbp = 0;
+        (*context).r8 = 0;
+        (*context).r9 = 0;
+        (*context).r10 = 0;
+        (*context).r11 = 0;
+        (*context).r12 = 0;
+        (*context).r13 = 0;
+        (*context).r14 = 0;
+        (*context).r15 = 0;
+    }
 }
 
 #[cfg(test)]

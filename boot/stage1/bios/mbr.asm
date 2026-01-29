@@ -18,7 +18,7 @@ start:
     mov ds, ax
     mov es, ax
     mov ss, ax
-    mov sp, 0x7C00              ; Stack below MBR
+    mov sp, 0x5000              ; Stack at safe location (20KB)
 
     ; Save boot drive
     mov [boot_drive], dl
@@ -69,9 +69,9 @@ print_string:
 
 ; Data
 boot_drive:     db 0
-msg_boot:       db "SaltyOS MBR", 13, 10, 0
-msg_loaded:     db "Stage 2 loaded", 13, 10, 0
-msg_disk_error: db "Disk error!", 13, 10, 0
+msg_boot:       db "S1: SaltyOS MBR", 13, 10, 0
+msg_loaded:     db "S1: Starting stage2", 13, 10, 0
+msg_disk_error: db "S1: Disk error!", 13, 10, 0
 
 ; Disk Address Packet for LBA read
 align 4

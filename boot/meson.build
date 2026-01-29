@@ -93,11 +93,59 @@ endif
 # Stage 2: Loader (BIOS + EFI)
 # =============================================================================
 
-# --- BIOS: stage2.bin ---
-stage2 = custom_target('stage2_bios',
-  input: 'stage2/bios/entry.asm',
+# --- BIOS: stage2.bin (mixed asm + C) ---
+
+# Assembly sources (compiled with NASM to ELF64)
+s2_bios_asm_src = [
+  'stage2/bios/entry.asm',
+  'stage2/bios/helpers.asm',
+]
+s2_bios_asm_objs = []
+foreach src : s2_bios_asm_src
+  s2_bios_asm_objs += custom_target('s2_bios_asm_' + src.underscorify(),
+    input: src,
+    output: '@BASENAME@.o',
+    command: [nasm, '-f', 'elf64', '-w-label-redef-late', '-o', '@OUTPUT@', '@INPUT@'],
+  )
+endforeach
+
+# C sources (compiled with Clang)
+s2_bios_c_src = [
+  'stage2/bios/entry.c',
+  'stage2/bios/disk.c',
+  'stage2/bios/memory.c',
+  'stage2/bios/acpi.c',
+  'stage2/bios/fb.c',
+  'stage2/common/main.c',
+  'stage2/common/bootinfo.c',
+  'common/print.c',
+  'common/memory.c',
+]
+s2_bios_c_objs = []
+foreach src : s2_bios_c_src
+  s2_bios_c_objs += custom_target('s2_bios_c_' + src.underscorify(),
+    input: src,
+    output: 's2_bios_c_' + src.underscorify() + '.o',
+    command: [cc_cmd, c_stage3_args, inc_common, inc_stage2, '-c', '@INPUT@', '-o', '@OUTPUT@'],
+  )
+endforeach
+
+# Link all objects to ELF, then convert to flat binary
+stage2_bios_elf = custom_target('stage2_bios_elf',
+  input: s2_bios_asm_objs + s2_bios_c_objs,
+  output: 'stage2_bios.elf',
+  command: [
+    cc_cmd, '-nostdlib', '-static', '-fuse-ld=lld',
+    '-Wl,--no-pie', '-Wl,-T,' + dir_stage2 / 'stage2.ld',
+    '-o', '@OUTPUT@', '@INPUT@',
+  ],
+  build_by_default: false,
+)
+
+stage2 = custom_target('stage2_bios_bin',
+  input: stage2_bios_elf,
   output: 'stage2.bin',
-  command: [nasm, '-f', 'bin', '-o', '@OUTPUT@', '@INPUT@'],
+  command: [objcopy, '-O', 'binary', '@INPUT@', '@OUTPUT@'],
   build_by_default: true,
 )
 

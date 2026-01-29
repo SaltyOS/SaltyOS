@@ -6,10 +6,14 @@
 
 mod frame;
 mod slab;
-mod vspace;
+pub mod vspace;
 
 pub use frame::FrameAllocator;
-pub use vspace::VSpace;
+pub use vspace::{
+    advance_quiescent_gen, current_vspace_tracking, kernel_vspace_root, kernel_vspace_tracking,
+    process_deferred_free, restore_irq, save_irq_disable, set_current_vspace_tracking,
+    set_pending_deactivate, take_pending_deactivate, DeactivateResult, VSpace, VSpaceTracking,
+};
 
 use crate::BootInfo;
 
@@ -51,6 +55,14 @@ pub fn free_frame(addr: PhysAddr) {
         if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
             allocator.free(addr);
         }
+    }
+}
+
+/// Free multiple contiguous frames
+pub fn free_frames(addr: PhysAddr, size_bytes: usize) {
+    let num_frames = (size_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    for i in 0..num_frames {
+        free_frame(addr + (i * PAGE_SIZE) as u64);
     }
 }
 

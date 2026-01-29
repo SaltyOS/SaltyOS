@@ -11,12 +11,16 @@ pub use x86_64::{current_cpu, MAX_CPUS};
 
 // Re-export context switch interface
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::{context_switch, init_thread_context};
+pub use x86_64::context_switch;
+
+// Re-export IPI types and functions
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::{send_ipi, IpiKind};
 
 /// Initialize architecture-specific subsystems
-pub fn init() {
+pub fn init(boot_info: Option<&crate::BootInfo>) {
     #[cfg(target_arch = "x86_64")]
-    x86_64::init();
+    x86_64::init(boot_info);
 }
 
 /// Halt the CPU until next interrupt
@@ -35,6 +39,16 @@ pub fn sti() {
 pub fn cli() {
     #[cfg(target_arch = "x86_64")]
     x86_64::cli();
+}
+
+/// Start timer interrupts
+///
+/// Called after scheduler is initialized to begin timer ticks.
+/// This is separate from init() because the timer must not start
+/// until the idle thread is ready to handle interrupts.
+pub fn start_timer() {
+    #[cfg(target_arch = "x86_64")]
+    x86_64::start_timer();
 }
 
 /// Output byte to I/O port

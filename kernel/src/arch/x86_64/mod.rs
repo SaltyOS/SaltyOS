@@ -8,33 +8,84 @@ mod context;
 mod cpu;
 mod gdt;
 mod idt;
-mod pit;
 pub mod paging;
+mod pit;
 
+pub use apic::{send_ipi, IpiKind};
 pub use cpu::{current_cpu, MAX_CPUS};
 
 // Re-export architecture-specific implementations for generic arch interface
-pub use context::{context_switch, init_thread_context};
+pub use context::context_switch;
 
 /// Initialize x86_64 architecture
-pub fn init() {
+///
+/// Critical initialization order:
+/// 1. CPU data (BSP)
+/// 2. GDT (required for IDT)
+/// 3. IDT (must be ready BEFORE any interrupts fire)
+/// 4. Memory management (frame allocator, needed by paging)
+/// 5. APIC (timer is masked, won't fire yet)
+/// 6. PIT (used for APIC timer calibration)
+/// 7. Paging (kernel page tables + direct mapping)
+///
+/// Timer is started later via start_timer() after scheduler is ready.
+pub fn init(boot_info: Option<&crate::BootInfo>) {
+    // Debug: Print init entry
+    unsafe {
+        for byte in b"\n[ARCH] init() called\n" {
+            while (inb(0x3F8 + 5) & 0x20) == 0 {}
+            outb(0x3F8, *byte);
+        }
+    }
+
     // Initialize per-CPU data for BSP
     cpu::init_bsp();
 
-    // Initialize GDT
+    // Initialize GDT (required before IDT)
     gdt::init();
 
-    // Initialize APIC and timer
-    apic::init();
+    // Debug: Before IDT init
+    unsafe {
+        for byte in b"[ARCH] About to call idt::init()\n" {
+            while (inb(0x3F8 + 5) & 0x20) == 0 {}
+            outb(0x3F8, *byte);
+        }
+    }
+
+    // Initialize IDT BEFORE APIC timer starts
+    // This prevents triple fault when timer fires
+    idt::init();
+
+    // Debug: After IDT init
+    unsafe {
+        for byte in b"[ARCH] idt::init() returned successfully\n" {
+            while (inb(0x3F8 + 5) & 0x20) == 0 {}
+            outb(0x3F8, *byte);
+        }
+    }
+
+    // Initialize memory management (frame allocator needed by paging::init())
+    if let Some(info) = boot_info {
+        crate::mm::init(info);
+    }
+
+    // Initialize paging (kernel page tables already set up by bootloader)
+    paging::init();
 
     // Initialize PIT (for calibration and fallback)
     pit::init();
 
-    // Initialize IDT (now includes APIC timer handler)
-    idt::init();
+    // Initialize APIC (timer is masked, won't fire yet)
+    apic::init();
+}
 
-    // Initialize paging (kernel page tables already set up by bootloader)
-    paging::init();
+/// Start the APIC timer
+///
+/// Called after scheduler is initialized to begin timer ticks.
+/// The timer is configured but masked during init() to prevent
+/// interrupts before the scheduler is ready.
+pub fn start_timer() {
+    apic::start_timer();
 }
 
 /// Halt CPU until next interrupt

@@ -84,35 +84,147 @@ pub struct InterruptStackFrame {
 
 static mut IDT: Idt = Idt::new();
 
+/// Serial port (COM1) for debug output
+const SERIAL_PORT: u16 = 0x3F8;
+
+/// Write a byte to serial port
+unsafe fn serial_putc(c: u8) {
+    // SAFETY: COM1 is a standard x86 serial port
+    unsafe {
+        while (super::inb(SERIAL_PORT + 5) & 0x20) == 0 {}
+        super::outb(SERIAL_PORT, c);
+    }
+}
+
+/// Write a string to serial port
+unsafe fn serial_puts(s: &str) {
+    for byte in s.bytes() {
+        // SAFETY: COM1 is a standard x86 serial port
+        unsafe {
+            serial_putc(byte);
+        }
+    }
+}
+
+/// Write a hexadecimal number to serial port
+unsafe fn serial_hex(mut val: u64) {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    // SAFETY: COM1 is a standard x86 serial port
+    unsafe {
+        serial_puts("0x");
+    }
+    if val == 0 {
+        // SAFETY: COM1 is a standard x86 serial port
+        unsafe {
+            serial_putc(b'0');
+        }
+        return;
+    }
+    let mut buf = [0u8; 16];
+    let mut pos = 15;
+    while val > 0 {
+        buf[pos] = HEX_CHARS[(val & 0xF) as usize];
+        val >>= 4;
+        pos -= 1;
+    }
+    for &c in &buf[(pos + 1)..] {
+        // SAFETY: COM1 is a standard x86 serial port
+        unsafe {
+            serial_putc(c);
+        }
+    }
+}
+
 /// Initialize IDT
 pub fn init() {
     // SAFETY: Single-threaded initialization, IDT is properly structured
     unsafe {
+        serial_puts("\n[IDT] Starting init\n");
+
+        // Print IDT address
+        serial_puts("[IDT] IDT addr: ");
+        serial_hex((&raw const IDT) as u64);
+        serial_putc(b'\n');
+
         // Set up exception handlers (vectors 0-31)
-        (*(&raw mut IDT)).entries[0].set_handler(exception_divide_error as u64);
-        (*(&raw mut IDT)).entries[1].set_handler(exception_debug as u64);
-        (*(&raw mut IDT)).entries[2].set_handler(exception_nmi as u64);
-        (*(&raw mut IDT)).entries[3].set_trap(exception_breakpoint as u64);
-        (*(&raw mut IDT)).entries[4].set_handler(exception_overflow as u64);
-        (*(&raw mut IDT)).entries[6].set_handler(exception_invalid_opcode as u64);
-        (*(&raw mut IDT)).entries[8].set_handler(exception_double_fault as u64);
-        (*(&raw mut IDT)).entries[13].set_handler(exception_gpf as u64);
-        (*(&raw mut IDT)).entries[14].set_handler(exception_page_fault as u64);
+        serial_puts("[IDT] Setting exception handlers\n");
+
+        (*(&raw mut IDT)).entries[0].set_handler(exception_divide_error as *const () as u64);
+        serial_puts("[IDT]   divide_error handler: ");
+        serial_hex(exception_divide_error as *const () as u64);
+        serial_putc(b'\n');
+
+        (*(&raw mut IDT)).entries[1].set_handler(exception_debug as *const () as u64);
+        (*(&raw mut IDT)).entries[2].set_handler(exception_nmi as *const () as u64);
+        (*(&raw mut IDT)).entries[3].set_trap(exception_breakpoint as *const () as u64);
+        (*(&raw mut IDT)).entries[4].set_handler(exception_overflow as *const () as u64);
+        (*(&raw mut IDT)).entries[6].set_handler(exception_invalid_opcode as *const () as u64);
+        (*(&raw mut IDT)).entries[8].set_handler(exception_double_fault as *const () as u64);
+        (*(&raw mut IDT)).entries[13].set_handler(exception_gpf as *const () as u64);
+        (*(&raw mut IDT)).entries[14].set_handler(exception_page_fault as *const () as u64);
+
+        serial_puts("[IDT] Exception handlers set\n");
 
         // Set up IRQ handlers (vectors 32+)
         // Vector 32: APIC Timer
-        (*(&raw mut IDT)).entries[32].set_handler(irq_timer as u64);
+        serial_puts("[IDT] Setting IRQ handlers\n");
+        (*(&raw mut IDT)).entries[32].set_handler(irq_timer as *const () as u64);
+        serial_puts("[IDT]   timer handler: ");
+        serial_hex(irq_timer as *const () as u64);
+        serial_putc(b'\n');
 
+        // Prepare IDT pointer
+        serial_puts("[IDT] Preparing IDT pointer\n");
         let idt_ptr = IdtPtr {
             limit: (size_of::<Idt>() - 1) as u16,
             base: (&raw const IDT) as u64,
         };
 
+        serial_puts("[IDT]   limit: ");
+        serial_hex(idt_ptr.limit as u64);
+        serial_puts("\n[IDT]   base: ");
+        serial_hex(idt_ptr.base);
+        serial_putc(b'\n');
+
+        // Load IDT
+        serial_puts("[IDT] Calling lidt\n");
         core::arch::asm!(
             "lidt [{}]",
             in(reg) &idt_ptr,
             options(nostack)
         );
+
+        // Verify with sidt - CRITICAL: must use same packed struct
+        serial_puts("[IDT] Verifying with sidt...\n");
+        let mut idt_read_back: IdtPtr = IdtPtr { limit: 0, base: 0 };
+        core::arch::asm!(
+            "sidt [{}]",
+            in(reg) &mut idt_read_back,
+            options(nostack)
+        );
+        serial_puts("[IDT] sidt result: limit=");
+        serial_hex(idt_read_back.limit as u64);
+        serial_puts(" base=");
+        serial_hex(idt_read_back.base);
+        serial_putc(b'\n');
+
+        // CRITICAL: Verify struct sizes
+        serial_puts("[IDT] Struct sizes:\n");
+        serial_puts("  size_of::<IdtEntry>() = ");
+        serial_hex(size_of::<IdtEntry>() as u64);
+        serial_putc(b'\n');
+        serial_puts("  size_of::<IdtPtr>() = ");
+        serial_hex(size_of::<IdtPtr>() as u64);
+        serial_putc(b'\n');
+        serial_puts("  size_of::<Idt>() = ");
+        serial_hex(size_of::<Idt>() as u64);
+        serial_putc(b'\n');
+
+        // Panic if sizes are wrong
+        assert!(size_of::<IdtEntry>() == 16, "IdtEntry must be 16 bytes!");
+        assert!(size_of::<IdtPtr>() == 10, "IdtPtr must be 10 bytes (packed)!");
+
+        serial_puts("[IDT] IDT loaded and verified successfully\n");
     }
 }
 

@@ -1,66 +1,308 @@
 //! Capability System
 //!
-//! Fat capabilities (32 bytes) with rights management.
+//! Fat capabilities (32 bytes) with rights management and seL4-style CDT.
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+mod cdt;
 mod cnode;
 mod object;
+mod refcount;
+mod slot;
+mod untyped;
 
-pub use cnode::CNode;
+pub use cdt::CDT;
+pub use cnode::{CNode, CapError};
 pub use object::{KernelObject, ObjectType};
+pub use refcount::{increment_refcount, release_object};
+pub use slot::{
+    alloc_slot, free_slot, get_cap, get_cap_mut, get_meta, get_meta_mut, nullify_capability,
+    CapSlot, INVALID_SLOT,
+};
 
-/// Capability rights
-#[repr(u16)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Rights {
-    Read = 1 << 0,
-    Write = 1 << 1,
-    Execute = 1 << 2,
-    Grant = 1 << 3,
-    Revoke = 1 << 4,
+/// Capability rights bitmap
+///
+/// Represents the access rights associated with a capability.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CapRights(u32);
+
+impl CapRights {
+    /// Read permission
+    pub const READ: CapRights = CapRights(1 << 0);
+    /// Write permission
+    pub const WRITE: CapRights = CapRights(1 << 1);
+    /// Execute permission (for code mappings)
+    pub const EXECUTE: CapRights = CapRights(1 << 2);
+    /// Grant right (can copy to others)
+    pub const GRANT: CapRights = CapRights(1 << 3);
+    /// Revoke right (can revoke derived caps)
+    pub const REVOKE: CapRights = CapRights(1 << 4);
+
+    // IPC rights
+    /// Send to endpoint
+    pub const SEND: CapRights = CapRights(1 << 5);
+    /// Receive from endpoint
+    pub const RECV: CapRights = CapRights(1 << 6);
+    /// Send + receive atomically
+    pub const CALL: CapRights = CapRights(1 << 7);
+    /// Reply capability
+    pub const REPLY: CapRights = CapRights(1 << 8);
+
+    // Thread management
+    /// Configure thread
+    pub const CONFIGURE: CapRights = CapRights(1 << 9);
+    /// Suspend thread
+    pub const SUSPEND: CapRights = CapRights(1 << 10);
+    /// Resume thread
+    pub const RESUME: CapRights = CapRights(1 << 11);
+
+    // Memory management
+    /// Map pages
+    pub const MAP: CapRights = CapRights(1 << 12);
+    /// Unmap pages
+    pub const UNMAP: CapRights = CapRights(1 << 13);
+    /// Retype untyped
+    pub const RETYPE: CapRights = CapRights(1 << 14);
+
+    /// All rights
+    pub const ALL: CapRights = CapRights(0xFFFFFFFF);
+
+    /// Create an empty CapRights (no rights)
+    #[inline]
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// Check if this CapRights contains the specified right
+    #[inline]
+    pub fn contains(&self, other: CapRights) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    /// Bitwise OR of two CapRights
+    #[inline]
+    pub fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
 }
 
-/// Fat capability (32 bytes)
+impl core::ops::BitOr for CapRights {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl core::ops::BitOrAssign for CapRights {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+/// Fat capability (exactly 32 bytes)
+///
+/// Memory layout:
+/// Offset  Field          Size
+/// ------  -----          ----
+/// 0x00    object         8
+/// 0x08    badge          8
+/// 0x10    rights         4
+/// 0x14    obj_type       1
+/// 0x15    depth          1
+/// 0x16    _reserved      2
+/// 0x18    _pad           8
+/// ------                ---
+/// Total                  32
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Capability {
-    /// Pointer to kernel object
+    /// Pointer to kernel object (8 bytes)
     pub object: *mut KernelObject,
-    /// Object type
-    pub obj_type: ObjectType,
-    /// Access rights
-    pub rights: u16,
-    /// Badge value (for IPC identification)
+
+    /// Badge value for IPC identification (8 bytes)
     pub badge: u64,
-    /// Generation counter (for revocation)
-    pub generation: u32,
-    /// Reserved for future use
-    pub reserved: u32,
+
+    /// Access rights (4 bytes)
+    pub rights: CapRights,
+
+    /// Object type (1 byte)
+    pub obj_type: ObjectType,
+
+    /// Derivation depth (1 byte) - prevents infinite loops
+    pub depth: u8,
+
+    /// Reserved for future use (2 bytes)
+    pub _reserved: u16,
+
+    /// Padding to 32 bytes (8 bytes)
+    pub _pad: u64,
 }
 
+// Compile-time assertion: Capability must be exactly 32 bytes
+const _: () = assert!(core::mem::size_of::<Capability>() == 32);
+
 impl Capability {
+    /// Create a null capability
     pub const fn null() -> Self {
         Self {
             object: core::ptr::null_mut(),
-            obj_type: ObjectType::Null,
-            rights: 0,
             badge: 0,
-            generation: 0,
-            reserved: 0,
+            rights: CapRights::empty(),
+            obj_type: ObjectType::Null,
+            depth: 0,
+            _reserved: 0,
+            _pad: 0,
         }
     }
 
+    /// Check if capability is null
     pub fn is_null(&self) -> bool {
         self.object.is_null()
     }
 
-    pub fn has_right(&self, right: Rights) -> bool {
-        (self.rights & right as u16) != 0
+    /// Check if capability has a specific right
+    pub fn has_right(&self, right: CapRights) -> bool {
+        self.rights.contains(right)
+    }
+
+    /// Copy capability with reduced rights
+    ///
+    /// Creates a new capability in dest_slot that references the same object
+    /// but with potentially reduced rights. The new capability becomes a
+    /// child of the source in the CDT.
+    ///
+    /// # Errors
+    /// - InsufficientRights: Source cap must have Grant right
+    /// - RightsNotSubset: New rights must be subset of source rights
+    /// - DepthExceeded: Maximum derivation depth reached
+    pub fn copy(
+        &self,
+        source_slot: CapSlot,
+        new_rights: CapRights,
+        dest_slot: CapSlot,
+    ) -> Result<(), CapError> {
+        // Check source has Grant right
+        if !self.has_right(CapRights::GRANT) {
+            return Err(CapError::InsufficientRights);
+        }
+
+        // New rights must be subset of current rights
+        if !self.rights.contains(new_rights) {
+            return Err(CapError::RightsNotSubset);
+        }
+
+        // Check derivation depth
+        if self.depth >= slot::MAX_DERIVATION_DEPTH {
+            return Err(CapError::DepthExceeded);
+        }
+
+        // Copy to destination slot
+        let dest_cap = get_cap_mut(dest_slot);
+        *dest_cap = *self;
+        dest_cap.rights = new_rights;
+        dest_cap.depth = self.depth + 1;
+
+        // Insert into CDT as child of source
+        CDT::insert_child(source_slot, dest_slot);
+
+        // Increment object refcount
+        unsafe {
+            if !self.object.is_null() {
+                increment_refcount(self.object);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Mint badged capability
+    ///
+    /// Creates a new capability with a badge value. Only endpoints can be minted.
+    /// Minted capabilities cannot have Grant right (cannot be further delegated).
+    ///
+    /// # Errors
+    /// - InvalidOperation: Object type is not Endpoint
+    /// - InsufficientRights: Source must have Grant right
+    /// - InvalidBadge: Attempting to grant with badge (badged caps can't grant)
+    pub fn mint(
+        &self,
+        source_slot: CapSlot,
+        badge: u64,
+        new_rights: CapRights,
+        dest_slot: CapSlot,
+    ) -> Result<(), CapError> {
+        // Only endpoints can be badged
+        if self.obj_type != ObjectType::Endpoint {
+            return Err(CapError::InvalidOperation);
+        }
+
+        // Source must have Grant right
+        if !self.has_right(CapRights::GRANT) {
+            return Err(CapError::InsufficientRights);
+        }
+
+        // Badged capabilities cannot have Grant right
+        if new_rights.contains(CapRights::GRANT) {
+            return Err(CapError::InvalidBadge);
+        }
+
+        // Check derivation depth
+        if self.depth >= slot::MAX_DERIVATION_DEPTH {
+            return Err(CapError::DepthExceeded);
+        }
+
+        // Create minted capability
+        let dest_cap = get_cap_mut(dest_slot);
+        *dest_cap = *self;
+        dest_cap.rights = new_rights;
+        dest_cap.badge = badge;
+        dest_cap.depth = self.depth + 1;
+
+        // Insert into CDT
+        CDT::insert_child(source_slot, dest_slot);
+
+        // Increment object refcount
+        unsafe {
+            if !self.object.is_null() {
+                increment_refcount(self.object);
+            }
+        }
+
+        Ok(())
     }
 }
 
 /// Initialize capability system
 pub fn init() {
-    // Initialize global capability tables
+    // Static arrays are initialized at compile time
+    // No runtime initialization needed currently
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_capability_size() {
+        assert_eq!(core::mem::size_of::<Capability>(), 32);
+    }
+
+    #[test]
+    fn test_null_capability() {
+        let cap = Capability::null();
+        assert!(cap.is_null());
+        assert_eq!(cap.obj_type, ObjectType::Null);
+    }
+
+    #[test]
+    fn test_rights_check() {
+        let mut cap = Capability::null();
+        cap.rights = CapRights::READ | CapRights::WRITE;
+
+        assert!(cap.has_right(CapRights::READ));
+        assert!(cap.has_right(CapRights::WRITE));
+        assert!(!cap.has_right(CapRights::GRANT));
+    }
 }

@@ -6,7 +6,7 @@
 
 // Will be used when syscalls are implemented
 #[allow(unused_imports)]
-use crate::cap::{Capability, ObjectType, Rights};
+use crate::cap::{CapRights, Capability, ObjectType};
 
 /// System call numbers
 #[repr(u64)]

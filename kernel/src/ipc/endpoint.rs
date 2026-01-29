@@ -2,8 +2,8 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use super::{Message, WaitQueue, block_current_thread};
-use crate::sched::thread::{Tcb, ThreadState, BlockedReason};
+use super::{block_current_thread, Message, WaitQueue};
+use crate::sched::thread::{BlockedReason, Tcb, ThreadState};
 
 use crate::sched::scheduler::scheduler as get_scheduler;
 
@@ -46,6 +46,12 @@ impl Endpoint {
                 EndpointState::RecvBlocked => {
                     // FASTPATH: Receiver waiting - transfer immediately
                     let receiver = self.recv_queue.pop().unwrap();
+
+                    // Set up reply capability in receiver's TCB
+                    // The receiver (server) can now reply to the sender (client)
+                    (*receiver).reply_tcb = current;
+                    (*receiver).reply_can_grant = false; // TODO: check sender's grant right
+
                     self.transfer_message(current, receiver, msg, badge);
 
                     // Wake receiver
@@ -62,10 +68,7 @@ impl Endpoint {
                     self.send_queue.push(current);
                     self.state = EndpointState::SendBlocked;
 
-                    let reason = BlockedReason::SendBlocked {
-                        msg: *msg,
-                        badge,
-                    };
+                    let reason = BlockedReason::SendBlocked { msg: *msg, badge };
                     block_current_thread(current, reason);
                 }
             }
@@ -88,10 +91,16 @@ impl Endpoint {
                         _ => (Message::empty(), 0),
                     };
 
+                    // Set up reply capability in receiver's (current thread's) TCB
+                    // The receiver can now reply to the sender
+                    (*current).reply_tcb = sender;
+                    (*current).reply_can_grant = false; // TODO: check sender's grant right
+
                     self.transfer_message(sender, current, &msg, badge);
 
-                    // Wake sender
+                    // Wake sender (for regular send, not call - call sender stays blocked)
                     (*sender).state = ThreadState::Ready;
+                    (*sender).blocked_reason = None;
                     get_scheduler().enqueue(sender);
 
                     // Update state
@@ -120,20 +129,48 @@ impl Endpoint {
     /// Call (send + recv atomically)
     pub fn call(&mut self, msg: &Message, badge: u64) -> Message {
         self.send(msg, badge);
-        self.recv().0
-    }
 
-    /// Reply to saved caller and receive next message
-    pub fn reply_recv(&mut self, _reply: &Message) -> (Message, u64) {
+        // After send, we need to receive a reply
+        // The reply will come via the server's reply_tcb capability
         unsafe {
             let current = get_scheduler().current();
 
-            // Note: In full implementation, we would reply to saved caller
-            // via a reply cap. For now, we skip the reply part as
-            // saved_caller is not persisted across calls.
+            // Wait for reply
+            // The reply will be delivered to saved_caller_msg by the server
+            (*current).state = ThreadState::Blocked;
+            (*current).blocked_reason = Some(BlockedReason::ReplyWait { msg: *msg, badge });
+            get_scheduler().reschedule();
 
-            // Clear saved caller info
-            (*current).saved_caller_badge = 0;
+            // When we wake up, the reply is in saved_caller_msg
+            (*current).saved_caller_msg
+        }
+    }
+
+    /// Reply to saved caller and receive next message
+    pub fn reply_recv(&mut self, reply: &Message) -> (Message, u64) {
+        unsafe {
+            let current = get_scheduler().current();
+
+            // Reply to saved caller via reply capability
+            let caller = (*current).reply_tcb;
+
+            if !caller.is_null() {
+                // Transfer reply message to caller's TCB
+                (*caller).saved_caller_msg = *reply;
+                (*caller).saved_caller_badge = 0;
+
+                // Clear caller's blocked reason
+                (*caller).blocked_reason = None;
+
+                // Wake the caller
+                (*caller).state = ThreadState::Ready;
+                get_scheduler().enqueue(caller);
+
+                // Clear reply capability (one-shot)
+                (*current).reply_tcb = core::ptr::null_mut();
+                (*current).reply_can_grant = false;
+            }
+            // If caller is null, there's no one to reply to - just proceed to recv
         }
 
         // Now receive next request
@@ -148,8 +185,33 @@ impl Endpoint {
         msg: &Message,
         badge: u64,
     ) {
-        // Copy message and badge to receiver's TCB
-        (*receiver).saved_caller_msg = *msg;
-        (*receiver).saved_caller_badge = badge;
+        unsafe {
+            // Copy message and badge to receiver's TCB
+            (*receiver).saved_caller_msg = *msg;
+            (*receiver).saved_caller_badge = badge;
+        }
+    }
+
+    /// Cleanup when endpoint is destroyed
+    ///
+    /// Wake all blocked threads with error.
+    pub fn cleanup(&mut self) {
+        unsafe {
+            // Wake all blocked senders
+            while let Some(sender) = self.send_queue.pop() {
+                (*sender).state = ThreadState::Ready;
+                (*sender).blocked_reason = None;
+                get_scheduler().enqueue(sender);
+            }
+
+            // Wake all blocked receivers
+            while let Some(receiver) = self.recv_queue.pop() {
+                (*receiver).state = ThreadState::Ready;
+                (*receiver).blocked_reason = None;
+                get_scheduler().enqueue(receiver);
+            }
+
+            self.state = EndpointState::Idle;
+        }
     }
 }

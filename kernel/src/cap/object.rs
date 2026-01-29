@@ -2,9 +2,11 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+use core::sync::atomic::AtomicU32;
+
 /// Kernel object types
 #[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ObjectType {
     Null = 0,
     Untyped = 1,
@@ -19,12 +21,23 @@ pub enum ObjectType {
     SchedContext = 10,
 }
 
-/// Base kernel object header
+/// Base kernel object header with inline reference count
+///
+/// All kernel objects start with this header.
+/// The ref_count field is used for tracking capability references.
 #[repr(C)]
 pub struct KernelObject {
+    /// Object type
     pub obj_type: ObjectType,
+
+    /// Size in bits (for memory objects)
     pub size_bits: u8,
-    pub generation: u32,
+
+    /// Reference count (number of capabilities referencing this object)
+    pub ref_count: AtomicU32,
+
+    /// Padding/reserved
+    pub _reserved: u32,
 }
 
 impl KernelObject {
@@ -32,7 +45,8 @@ impl KernelObject {
         Self {
             obj_type,
             size_bits,
-            generation: 0,
+            ref_count: AtomicU32::new(1),
+            _reserved: 0,
         }
     }
 }

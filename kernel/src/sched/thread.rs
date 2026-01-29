@@ -29,6 +29,15 @@ pub enum BlockedReason {
     RecvBlocked,
     /// Blocked on notification wait
     NotificationWait,
+    /// Blocked on VSpace teardown - waiting for VSpace to become inactive
+    VSpaceWait,
+    /// Blocked waiting for reply from server (after call())
+    ReplyWait {
+        /// Message to send
+        msg: super::super::ipc::Message,
+        /// Badge (sender identity)
+        badge: u64,
+    },
 }
 
 /// Thread Control Block
@@ -58,6 +67,14 @@ pub struct Tcb {
     pub saved_caller_msg: super::super::ipc::Message,
     /// Notification pointer if blocked on notification
     pub blocked_notification: *mut u8,
+    /// VSpace tracking pointer (for VSpaceWait)
+    pub blocked_vspace_tracking: *mut crate::mm::VSpaceTracking,
+    /// Next pointer for VSpace wait queue (intrusive)
+    pub vspace_wait_next: *mut Tcb,
+    /// Reply capability: pointer to caller's TCB (for reply_recv)
+    pub reply_tcb: *mut Tcb,
+    /// Can the caller grant capabilities in the reply?
+    pub reply_can_grant: bool,
 }
 
 /// Saved thread context
@@ -146,6 +163,54 @@ impl Tcb {
             saved_caller_badge: 0,
             saved_caller_msg: super::super::ipc::Message::empty(),
             blocked_notification: core::ptr::null_mut(),
+            blocked_vspace_tracking: core::ptr::null_mut(),
+            vspace_wait_next: core::ptr::null_mut(),
+            reply_tcb: core::ptr::null_mut(),
+            reply_can_grant: false,
         }
+    }
+
+    /// Cleanup when TCB is destroyed
+    ///
+    /// Note: This does not wake the thread if blocked or remove it from scheduler queues.
+    /// Those operations should be handled by the caller before calling cleanup.
+    ///
+    /// However, this DOES wake any caller waiting for a reply via reply_tcb.
+    pub fn cleanup(&mut self) {
+        self.state = ThreadState::Inactive;
+        self.blocked_reason = None;
+        self.blocked_vspace_tracking = core::ptr::null_mut();
+        self.vspace_wait_next = core::ptr::null_mut();
+
+        // If we have a reply capability, wake the blocked caller
+        // This handles the case where a server dies before replying
+        if !self.reply_tcb.is_null() {
+            unsafe {
+                let caller = self.reply_tcb;
+                // Wake the caller - it will receive an error or empty reply
+                (*caller).state = ThreadState::Ready;
+                (*caller).blocked_reason = None;
+                crate::sched::scheduler::scheduler().enqueue(caller);
+            }
+        }
+        self.reply_tcb = core::ptr::null_mut();
+        self.reply_can_grant = false;
+    }
+}
+
+impl SchedContext {
+    pub const fn new() -> Self {
+        Self {
+            budget: 0,
+            remaining: 0,
+            period: 0,
+            deadline: 0,
+            bound_tcb: core::ptr::null_mut(),
+        }
+    }
+
+    /// Cleanup when scheduling context is destroyed
+    pub fn cleanup(&mut self) {
+        self.bound_tcb = core::ptr::null_mut();
     }
 }

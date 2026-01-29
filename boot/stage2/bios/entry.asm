@@ -1,106 +1,193 @@
-; SaltyOS Stage 2 - Entry Point
 ; SPDX-License-Identifier: GPL-2.0-only
-;
-; Called from MBR at 0x7E00 in real mode
-; Sets up protected mode, long mode, loads Stage 3, jumps to it
+; -----------------------------------------------------------------------------
+;  SaltyOS Stage 2 - BIOS Entry Point
+;  File: boot/stage2/bios/entry.asm
+; -----------------------------------------------------------------------------
 
 [bits 16]
-[org 0x7E00]
 
-; Constants
-STAGE3_LOAD_ADDR    equ 0x10000     ; 64KB - Stage 3 load address
-STAGE3_LBA          equ 129         ; Stage 3 starts after Stage 2 (1 + 128 sectors)
-STAGE3_SECTORS      equ 64          ; 32KB for Stage 3
-KERNEL_LBA          equ 193         ; Kernel LBA (after Stage 3)
+STAGE3_LBA      equ 129
+KERNEL_LBA      equ 193
+PT_BASE         equ 0x70000
+STACK_ADDR_16   equ 0x5000
+STACK_ADDR_32   equ 0x6000
+STACK_ADDR_64   equ 0x90000
 
+extern stage2_bios_main
+extern boot_drive
+extern stage3_lba
+extern kernel_lba
+
+global _start
 _start:
     cli
-    
-    ; Save boot drive from MBR (passed in DL)
-    mov [boot_drive], dl
+    mov al, 0xFF
+    out 0x21, al
+    out 0xA1, al
 
-    ; Set up segments
+    mov [boot_drive], dl
+    
+    mov dword [stage3_lba], STAGE3_LBA
+    mov dword [kernel_lba], KERNEL_LBA
+    mov dword [stage3_lba + 4], 0
+    mov dword [kernel_lba + 4], 0
+
     xor ax, ax
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
     mov ss, ax
-    mov sp, 0x7C00              ; Stack below MBR
+    mov sp, STACK_ADDR_16
 
-    ; Print message
+    mov eax, gdt_start
+    mov [gdt_ptr + 2], eax
+
     mov si, msg_stage2
     call print16
 
-    ; Enable A20 line
     call enable_a20
+    jc .a20_failed
 
-    ; Load Stage 3 to 0x10000 while still in real mode
-    mov si, msg_loading_s3
-    call print16
-    
-    ; Set up DAP for Stage 3
-    mov word [dap_sectors], STAGE3_SECTORS
-    mov word [dap_offset], 0x0000
-    mov word [dap_segment], 0x1000      ; Segment 0x1000 = address 0x10000
-    mov dword [dap_lba_low], STAGE3_LBA
-    mov dword [dap_lba_high], 0
-    
-    mov ah, 0x42
-    mov dl, [boot_drive]
-    mov si, dap
-    int 0x13
-    jc .disk_error
+    ; Unreal Mode
+    push ds
+    push es
+    lgdt [gdt_ptr]
+    mov eax, cr0
+    or al, 1
+    mov cr0, eax
+    mov bx, 0x10
+    mov fs, bx
+    and al, 0xFE
+    mov cr0, eax
+    pop es
+    pop ds
+    sti
 
-    ; Load Kernel to 0x20000 temporarily (BIOS can't access >1MB directly)
-    mov si, msg_loading_kernel
+    mov si, msg_checking_cpu
     call print16
-    
-    ; Load kernel to 0x20000 (we'll copy to 1MB in protected mode)
-    mov word [dap_sectors], 64          ; Load 32KB of kernel for now
-    mov word [dap_offset], 0x0000
-    mov word [dap_segment], 0x2000      ; 0x20000
-    mov dword [dap_lba_low], KERNEL_LBA
-    mov dword [dap_lba_high], 0
-    
-    mov ah, 0x42
-    mov dl, [boot_drive]
-    mov si, dap
-    int 0x13
-    jc .disk_error
+
+    call check_cpu_features
+    jc .cpu_unsupported
 
     mov si, msg_entering_pm
     call print16
 
-    ; Load GDT
+    cli
+    lidt [idt_ptr]
     lgdt [gdt_ptr]
 
-    ; Enter protected mode
     mov eax, cr0
     or eax, 1
     mov cr0, eax
 
-    ; Far jump to 32-bit code
     jmp 0x08:protected_mode
 
-.disk_error:
-    mov si, msg_disk_err
+.cpu_unsupported:
+    mov si, msg_cpu_err
     call print16
-    jmp .halt
+    jmp halt_cpu
 
-.halt:
+.a20_failed:
+    mov si, msg_a20_err
+    call print16
+    jmp halt_cpu
+
+; Real Mode Helpers
+halt_cpu:
     cli
     hlt
-    jmp .halt
+    jmp halt_cpu
 
-; Enable A20 via fast A20 gate
 enable_a20:
-    in al, 0x92
-    or al, 2
-    out 0x92, al
+    call a20_try_kbc
+    jc a20_try_bios
+    call a20_test
+    jc a20_try_bios
     ret
 
-; Print string in real mode (SI = string)
+a20_try_kbc:
+    cli
+    call a20_wait_cmd
+    mov al, 0xAD
+    out 0x64, al
+    call a20_wait_cmd
+    mov al, 0xD0
+    out 0x64, al
+    call a20_wait_data
+    in al, 0x60
+    push ax
+    call a20_wait_cmd
+    mov al, 0xD1
+    out 0x64, al
+    call a20_wait_cmd
+    mov al, 0xDF
+    out 0x60, al
+    pop ax
+    or al, 2
+    push ax
+    out 0x60, al
+    call a20_wait_cmd
+    mov al, 0xAE
+    out 0x64, al
+    pop ax
+    sti
+    ret
+
+a20_wait_cmd:
+    in al, 0x64
+    test al, 2
+    jnz a20_wait_cmd
+    ret
+
+a20_wait_data:
+    in al, 0x64
+    test al, 1
+    jz a20_wait_data
+    ret
+
+a20_try_bios:
+    in al, 0x92
+    or al, 2
+    and al, 0xFE
+    out 0x92, al
+    call a20_test
+    ret
+
+a20_test:
+    pushf
+    cli
+    push ds
+    push es
+    xor ax, ax
+    mov es, ax
+    mov ax, 0xFFFF
+    mov ds, ax
+    mov di, 0x7DFE
+    mov si, 0x7E0E
+    mov ax, [es:di]
+    push ax
+    mov bx, [si]
+    push bx
+    mov word [es:di], 0xAA55
+    mov word [si], 0x55AA
+    mov ax, [es:di]
+    mov bx, [si]
+    pop bx
+    mov [si], bx
+    pop ax
+    mov [es:di], ax
+    pop es
+    pop ds
+    popf
+    cmp ax, bx
+    je .a20_disabled
+    clc
+    ret
+.a20_disabled:
+    stc
+    ret
+
 print16:
     pusha
 .loop:
@@ -115,214 +202,221 @@ print16:
     popa
     ret
 
-; Messages
-msg_stage2:         db "S2: start", 13, 10, 0
-msg_loading_s3:     db "S2: load S3", 13, 10, 0
-msg_loading_kernel: db "S2: load K", 13, 10, 0
-msg_entering_pm:    db "S2: PM", 13, 10, 0
-msg_disk_err:       db "S2: disk err", 13, 10, 0
+check_cpu_features:
+    pushfd
+    pop eax
+    mov ecx, eax
+    xor eax, 1 << 21
+    push eax
+    popfd
+    pushfd
+    pop eax
+    push ecx
+    popfd
+    cmp eax, ecx
+    je .no_long_mode
+    mov eax, 0x80000000
+    cpuid
+    cmp eax, 0x80000001
+    jb .no_long_mode
+    mov eax, 0x80000001
+    cpuid
+    test edx, 1 << 29
+    jz .no_long_mode
+    clc
+    ret
+.no_long_mode:
+    stc
+    ret
 
-; Boot drive number
-boot_drive: db 0
+; Data
+msg_stage2:       db "S2: Start", 13, 10, 0
+msg_entering_pm:  db "S2: Enter PM", 13, 10, 0
+msg_checking_cpu: db "S2: Check CPU", 13, 10, 0
+msg_cpu_err:      db "S2: CPU No LM", 13, 10, 0
+msg_a20_err:      db "S2: A20 Fail", 13, 10, 0
 
-; Disk Address Packet
-align 4
-dap:
-    db 0x10                 ; Size
-    db 0                    ; Reserved
-dap_sectors:    dw 0        ; Sectors to read
-dap_offset:     dw 0        ; Offset
-dap_segment:    dw 0        ; Segment
-dap_lba_low:    dd 0        ; LBA low
-dap_lba_high:   dd 0        ; LBA high
-
-; 32-bit protected mode code
+; 32-bit Protected Mode
 [bits 32]
 protected_mode:
-    ; Set up segment registers
     mov ax, 0x10
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
     mov ss, ax
-    mov esp, 0x7C00
+    mov esp, STACK_ADDR_32
 
-    ; Print character via serial (0x3F8) to show we're in PM
     mov dx, 0x3F8
     mov al, 'P'
     out dx, al
 
-    ; NOTE: Kernel stays at 0x20000. Stage 3 will parse the ELF and
-    ; load segments to their correct physical addresses (0x100000+)
-
-    ; Set up paging for long mode
     call setup_paging
 
-    ; Enable long mode in EFER
-    mov ecx, 0xC0000080     ; EFER MSR
+    mov ecx, 0xC0000080
     rdmsr
-    or eax, (1 << 8)        ; Set LME bit
+    or eax, (1 << 8)
     wrmsr
 
-    ; Enable paging (enters long mode)
     mov eax, cr0
     or eax, (1 << 31)
     mov cr0, eax
 
-    ; Jump to 64-bit code (use 64-bit code segment 0x18)
     jmp 0x18:long_mode
 
-; Set up identity paging for first 1GB + higher-half kernel mapping
 setup_paging:
-    ; Page table layout at 0x70000:
-    ;   0x70000: PML4
-    ;   0x71000: PDPT
-    ;   0x72000: PD for identity mapping (0x0 - 1GB, 2MB pages)
-    ;   0x73000: PD for higher-half (PDPT[510]: 0xFFFFFFFF80000000+)
-    ;   0x74000: PT[0] for higher-half kernel code/data (4KB pages)
-    ;   0x75000: PD for higher-half stack area (PDPT[509]: 0xFFFFFFFF7FC00000+)
-    ;   0x76000: PT for stack area (4KB pages)
-    
-    ; Clear page table area (28KB = 7 pages)
-    mov edi, 0x70000
-    mov cr3, edi
+    mov edi, PT_BASE
     xor eax, eax
-    mov ecx, 7168           ; 28KB in dwords
+    mov ecx, 3072
     rep stosd
-    mov edi, cr3
 
-    ; === PML4 setup ===
-    ; PML4[0] -> PDPT at 0x71000 (identity mapping)
+    mov edi, PT_BASE
     lea eax, [edi + 0x1000]
-    or eax, 3               ; Present + Writable
+    or eax, 3
     mov dword [edi], eax
-    
-    ; PML4[511] -> same PDPT (for higher-half 0xFFFFFFFF........)
     mov dword [edi + 511*8], eax
-    
-    add edi, 0x1000         ; EDI = PDPT at 0x71000
 
-    ; === PDPT setup ===
-    ; PDPT[0] -> PD at 0x72000 (for identity 0x0 - 1GB)
+    add edi, 0x1000
     lea eax, [edi + 0x1000]
     or eax, 3
     mov dword [edi], eax
-    
-    ; PDPT[509] -> PD at 0x75000 (for stack area 0xFFFFFFFF7FC00000+)
-    lea eax, [edi + 0x4000]
-    or eax, 3
-    mov dword [edi + 509*8], eax
-    
-    ; PDPT[510] -> PD at 0x73000 (for kernel 0xFFFFFFFF80000000+)
-    lea eax, [edi + 0x2000]
-    or eax, 3
     mov dword [edi + 510*8], eax
-    
-    add edi, 0x1000         ; EDI = PD at 0x72000 (identity PD)
 
-    ; === Identity PD (0x72000): 2MB huge pages for first 1GB ===
-    mov ebx, 0x00000083     ; Present + Writable + Huge (PS bit)
+    add edi, 0x1000
     mov ecx, 512
-.pd_identity_loop:
-    mov dword [edi], ebx
-    add ebx, 0x200000       ; 2MB per entry
-    add edi, 8
-    loop .pd_identity_loop
-    
-    ; EDI now at 0x73000 (higher-half kernel PD)
-    
-    ; === Higher-half kernel PD (0x73000) ===
-    ; PD[0] -> PT at 0x74000 (for 4KB pages at 0xFFFFFFFF80000000+)
-    lea eax, [edi + 0x1000]
-    or eax, 3               ; Present + Writable
-    mov dword [edi], eax
-    
-    add edi, 0x1000         ; EDI = PT at 0x74000
-    
-    ; === Kernel PT (0x74000): map 0xFFFFFFFF80000000+ -> physical 0x100000+ ===
-    ; Map 2MB (512 * 4KB pages)
-    mov ebx, 0x00100003     ; Physical 0x100000 + Present + Writable
-    mov ecx, 512
-.pt_kernel_loop:
-    mov dword [edi], ebx
-    add ebx, 0x1000         ; 4KB per entry
-    add edi, 8
-    loop .pt_kernel_loop
-    
-    ; EDI now at 0x75000 (stack area PD)
-    
-    ; === Stack area PD (0x75000) for PDPT[509] ===
-    ; Maps 0xFFFFFFFF7FC00000 - 0xFFFFFFFF7FFFFFFF
-    ; PD[511] -> PT at 0x76000 (last 2MB of this 1GB region, where stack probing goes)
-    lea eax, [edi + 0x1000]
-    or eax, 3
-    mov dword [edi + 511*8], eax    ; PD[511] for the last 2MB
-    
-    add edi, 0x1000         ; EDI = PT at 0x76000
-    
-    ; === Stack PT (0x76000): map physical 0x0 - 0x1FFFFF for stack probing ===
-    ; This maps virtual 0xFFFFFFFF7FE00000 - 0xFFFFFFFF7FFFFFFF -> physical 0x0 - 0x1FFFFF
-    ; Stack probing will touch these pages
-    mov ebx, 0x00000003     ; Physical 0x0 + Present + Writable
-    mov ecx, 512
-.pt_stack_loop:
-    mov dword [edi], ebx
-    add ebx, 0x1000         ; 4KB per entry
-    add edi, 8
-    loop .pt_stack_loop
 
-    ; Enable PAE
+    ; Entry 0: identity-map 0x0-0x1FFFFF -> 0x0-0x1FFFFF (for stage2 at 0x7E00)
+    mov dword [edi], 0x83      ; 0x80 (PS) | 0x02 (RW) | 0x01 (Present), base = 0
+    mov dword [edi + 4], 0
+    add edi, 8
+
+    ; Entry 1: identity-map 0x200000-0x3FFFFF -> 0x200000-0x3FFFFF
+    mov dword [edi], (1 << 21) | 0x83  ; Base = 2MB
+    mov dword [edi + 4], 0
+    add edi, 8
+
+    ; Entry 2: identity-map 0x400000-0x5FFFFF -> 0x400000-0x5FFFFF
+    mov dword [edi], (2 << 21) | 0x83  ; Base = 4MB
+    mov dword [edi + 4], 0
+    add edi, 8
+
+    ; Entry 3: identity-map 0x600000-0x7FFFFF -> 0x600000-0x7FFFFF
+    mov dword [edi], (3 << 21) | 0x83  ; Base = 6MB
+    mov dword [edi + 4], 0
+    add edi, 8
+
+    ; Remaining entries: start from 0x800000 (8MB)
+    mov ebx, (4 << 21) | 0x83  ; Start at 8MB
+    mov ecx, 508               ; 512 - 4 entries already set
+
+.loop_pd:
+    mov dword [edi], ebx
+    mov dword [edi + 4], 0
+    add ebx, 1 << 21           ; Add 2MB
+    add edi, 8
+    loop .loop_pd
+
+    mov eax, PT_BASE
+    mov cr3, eax
+
     mov eax, cr4
     or eax, (1 << 5)
     mov cr4, eax
-
     ret
 
-; 64-bit long mode code
+; 64-bit Long Mode
 [bits 64]
+default rel
+
 long_mode:
-    ; Set up 64-bit data segments (use 64-bit data segment 0x20)
     mov ax, 0x20
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
     mov ss, ax
-    
-    ; Set up stack
-    mov rsp, 0x80000        ; Stack at 512KB
+    mov rsp, STACK_ADDR_64
 
-    ; Print 'L' to serial to show long mode
+    call setup_idt64
+    lidt [idt64_ptr]
+
     mov dx, 0x3F8
     mov al, 'L'
     out dx, al
 
-    ; Jump to Stage 3 at 0x10000
-    mov rax, STAGE3_LOAD_ADDR
-    call rax
+    xor rdi, rdi
+    mov dil, [boot_drive]
+    call stage2_bios_main
 
-    ; Should not return, halt if it does
 .halt64:
     cli
     hlt
     jmp .halt64
 
-; GDT for protected mode and long mode
+setup_idt64:
+    mov rdi, idt64
+    lea rsi, [isr_stub_table]
+    mov ecx, 256
+.loop_idt:
+    lodsq
+    mov word [rdi], ax
+    mov word [rdi + 2], 0x18
+    mov byte [rdi + 4], 0
+    mov byte [rdi + 5], 0x8E
+    shr rax, 16
+    mov word [rdi + 6], ax
+    shr rax, 16
+    mov dword [rdi + 8], eax
+    mov dword [rdi + 12], 0
+    add rdi, 16
+    dec ecx
+    jnz .loop_idt
+    ret
+
+isr_common_halt:
+    cli
+.halt_loop:
+    hlt
+    jmp .halt_loop
+
+%assign i 0
+%rep 256
+isr%+i:
+    jmp isr_common_halt
+%assign i i+1
+%endrep
+
+align 8
+isr_stub_table:
+%assign i 0
+%rep 256
+    dq isr%+i
+%assign i i+1
+%endrep
+
 align 16
 gdt_start:
-    ; Null descriptor (0x00)
     dq 0
-    ; 32-bit code segment (0x08) - for protected mode
     dq 0x00CF9A000000FFFF
-    ; 32-bit data segment (0x10)
     dq 0x00CF92000000FFFF
-    ; 64-bit code segment (0x18) - for long mode
     dq 0x00AF9A000000FFFF
-    ; 64-bit data segment (0x20)
     dq 0x00AF92000000FFFF
 gdt_end:
-
 gdt_ptr:
     dw gdt_end - gdt_start - 1
     dd gdt_start
+
+idt_ptr:
+    dw 2047
+    dd 0
+
+; IDT 64-bit Storage
+align 16
+idt64:
+    times 256 * 16 db 0
+
+idt64_end:
+global idt64_ptr
+idt64_ptr:
+    dw idt64_end - idt64 - 1
+    dq idt64

@@ -31,7 +31,7 @@ const PIT_CHANNEL0: u16 = 0x40;
 
 /// PIT base frequency (Hz)
 /// The classic PC PIT runs at 1.193182 MHz
-const PIT_FREQUENCY: u32 = 1193182;
+pub const PIT_FREQUENCY: u32 = 1193182;
 
 /// Target tick frequency (1000 Hz = 1ms per tick)
 const TARGET_FREQUENCY: u32 = 1000;

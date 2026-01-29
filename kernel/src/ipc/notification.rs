@@ -4,7 +4,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::sched::thread::{Tcb, ThreadState, BlockedReason};
+use crate::sched::thread::{BlockedReason, Tcb, ThreadState};
 
 use crate::sched::scheduler::scheduler as get_scheduler;
 
@@ -75,6 +75,23 @@ impl Notification {
             Some(bits)
         } else {
             None
+        }
+    }
+
+    /// Cleanup when notification is destroyed
+    ///
+    /// Wake any waiting thread.
+    pub fn cleanup(&mut self) {
+        unsafe {
+            if !self.waiting.is_null() {
+                let waiter = self.waiting;
+                self.waiting = core::ptr::null_mut();
+
+                (*waiter).blocked_reason = None;
+                (*waiter).blocked_notification = core::ptr::null_mut();
+                (*waiter).state = ThreadState::Ready;
+                get_scheduler().enqueue(waiter);
+            }
         }
     }
 }

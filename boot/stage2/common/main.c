@@ -61,7 +61,6 @@ void stage2_main(struct stage2_context *ctx) {
     /* 3. Build BootInfo */
     struct boot_info *bi = stage2_build_bootinfo(ctx);
 
-    /* 4. Jump to Stage3 with BootInfo in RDI */
     stage3_entry_fn stage3 = (stage3_entry_fn)stage3_addr;
 
     print("S2: jumping to stage3 @");

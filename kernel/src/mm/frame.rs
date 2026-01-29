@@ -8,10 +8,14 @@ use crate::{BootInfo, MemoryKind};
 /// Maximum supported physical memory (4GB for now)
 const MAX_FRAMES: usize = 1024 * 1024; // 4GB / 4KB
 
+/// Static bitmap storage to avoid stack overflow
+/// Size: 128KB (placed in .bss section, not stack)
+static mut BITMAP_STORAGE: [u64; MAX_FRAMES / 64] = [0; MAX_FRAMES / 64];
+
 /// Frame allocator using bitmap
 pub struct FrameAllocator {
     /// Bitmap of free frames (1 = free, 0 = used)
-    bitmap: [u64; MAX_FRAMES / 64],
+    bitmap: &'static mut [u64],
     /// First potentially free frame
     next_free: usize,
     /// Total frames
@@ -22,8 +26,13 @@ pub struct FrameAllocator {
 
 impl FrameAllocator {
     pub fn new(boot_info: &BootInfo) -> Self {
+        let bitmap = unsafe { &mut *(&raw mut BITMAP_STORAGE) };
+        
+        // Ensure bitmap is clear (optional if .bss is zeroed, but safe)
+        // for val in bitmap.iter_mut() { *val = 0; }
+
         let mut allocator = Self {
-            bitmap: [0; MAX_FRAMES / 64],
+            bitmap,
             next_free: 0,
             total: 0,
             free: 0,
@@ -56,9 +65,8 @@ impl FrameAllocator {
                 let idx = frame / 64;
                 let bit = frame % 64;
                 // SAFETY: idx < MAX_FRAMES / 64 since frame < MAX_FRAMES
-                unsafe {
-                    *self.bitmap.get_unchecked_mut(idx) |= 1u64 << bit;
-                }
+                self.bitmap[idx] |= 1u64 << bit;
+                
                 self.free += 1;
                 self.total = self.total.max(frame + 1);
             }
@@ -70,15 +78,12 @@ impl FrameAllocator {
         for i in self.next_free..self.total {
             let idx = i / 64;
             let bit = i % 64;
-            // SAFETY: idx is calculated from i which is bounded by self.total
-            // and bitmap has MAX_FRAMES / 64 elements which is always >= total / 64
-            let word = unsafe { *self.bitmap.get_unchecked(idx) };
+            
+            let word = self.bitmap[idx];
             if word & (1u64 << bit) != 0 {
                 // Found free frame, mark as used
-                // SAFETY: Same bounds as above
-                unsafe {
-                    *self.bitmap.get_unchecked_mut(idx) &= !(1u64 << bit);
-                }
+                self.bitmap[idx] &= !(1u64 << bit);
+                
                 self.free -= 1;
                 self.next_free = i + 1;
                 return Some((i * PAGE_SIZE) as PhysAddr);
@@ -92,10 +97,9 @@ impl FrameAllocator {
         if frame < MAX_FRAMES {
             let idx = frame / 64;
             let bit = frame % 64;
-            // SAFETY: idx < MAX_FRAMES / 64 since frame < MAX_FRAMES
-            unsafe {
-                *self.bitmap.get_unchecked_mut(idx) |= 1u64 << bit;
-            }
+            
+            self.bitmap[idx] |= 1u64 << bit;
+            
             self.free += 1;
             if frame < self.next_free {
                 self.next_free = frame;

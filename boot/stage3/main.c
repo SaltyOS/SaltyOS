@@ -21,7 +21,7 @@ static struct boot_info g_boot_info;
 
 /* Get kernel base addresses from BootInfo or use defaults */
 static inline uint64_t get_kernel_phys_base(const struct boot_info *bi) {
-    if (bi && bi->kernel_phys_base != 0) {
+    if (bi) {
         return bi->kernel_phys_base;
     }
     return KERNEL_PHYS_ADDR;
@@ -122,17 +122,14 @@ void stage3_main(struct boot_info *bi) {
     serial_init();
     serial_puts("\nStage 3 loaded\n");
 
-    /* Store BootInfo for kernel access, with BIOS fallback */
-    if (bi && bi->magic == BOOT_INFO_MAGIC) {
-        g_boot_info = *bi;
-    } else {
-        bootinfo_set_defaults(&g_boot_info);
+    /* Validate BootInfo - MUST be provided by bootloader */
+    if (!bi || bi->magic != BOOT_INFO_MAGIC) {
+        serial_puts("ERROR: Invalid or missing BootInfo!\n");
+        goto halt;
     }
 
-    /* If kernel buffer missing, fallback to legacy BIOS load address */
-    if (g_boot_info.initrd_addr == 0) {
-        g_boot_info.initrd_addr = LEGACY_KERNEL_ADDR;
-    }
+    /* Store BootInfo for kernel access */
+    g_boot_info = *bi;
 
     /* Kernel ELF buffer passed via initrd fields */
     serial_puts("Parsing kernel ELF at ");
@@ -152,12 +149,30 @@ void stage3_main(struct boot_info *bi) {
 
     /* Boot info already set up above, ensure magic is set */
     g_boot_info.magic = BOOT_INFO_MAGIC;
-    
-    serial_puts("Jumping to kernel at ");
+
+    /* Convert virtual entry point to physical address */
+    uint64_t phys_entry;
+    if (entry >= g_boot_info.kernel_virt_base) {
+        phys_entry = entry - g_boot_info.kernel_virt_base + g_boot_info.kernel_phys_base;
+    } else {
+        phys_entry = entry;
+    }
+
+    /* Debug: Verify addresses before jump */
+    serial_puts("Jump info:\n");
+    serial_puts("  boot_info: ");
+    serial_puthex((uint64_t)&g_boot_info);
+    serial_puts("\n  kernel_phys_base: ");
+    serial_puthex(g_boot_info.kernel_phys_base);
+    serial_puts("\n  kernel_virt_base: ");
+    serial_puthex(g_boot_info.kernel_virt_base);
+    serial_puts("\n  virt_entry: ");
     serial_puthex(entry);
-    serial_puts("\n");
-    
-    /* Jump to kernel entry point */
+    serial_puts("\n  phys_entry: ");
+    serial_puthex(phys_entry);
+    serial_puts("\nJumping to kernel...\n");
+
+/* Jump to kernel entry point with VIRTUAL address */
     /* Kernel expects boot_info pointer in RDI */
     /* Flush TLB by reloading CR3, then use jmp */
     __asm__ volatile(

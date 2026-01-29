@@ -2,7 +2,7 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use super::thread::{Tcb, ThreadState};
+use super::thread::{BlockedReason, Tcb, ThreadState};
 
 /// EDF Scheduler
 pub struct Scheduler {
@@ -12,6 +12,8 @@ pub struct Scheduler {
     current: *mut Tcb,
     /// Idle thread
     idle: *mut Tcb,
+    /// Lock state (simple test-and-set spinlock)
+    lock_state: core::sync::atomic::AtomicU8,
 }
 
 impl Scheduler {
@@ -20,7 +22,26 @@ impl Scheduler {
             ready_head: core::ptr::null_mut(),
             current: core::ptr::null_mut(),
             idle: core::ptr::null_mut(),
+            lock_state: core::sync::atomic::AtomicU8::new(0),
         }
+    }
+
+    /// Take scheduler lock
+    fn lock(&self) {
+        use core::sync::atomic::Ordering;
+        while self
+            .lock_state
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Release scheduler lock
+    fn unlock(&self) {
+        self.lock_state
+            .store(0, core::sync::atomic::Ordering::Release);
     }
 
     /// Add thread to ready queue (sorted by deadline)
@@ -196,6 +217,213 @@ impl Scheduler {
             let new_ctx = &(*new_tcb).context as *const _;
             crate::arch::context_switch(old_ctx, new_ctx);
         }
+    }
+
+    /// Enqueue thread in VSpace's intrusive wait queue
+    ///
+    /// Must be called with scheduler lock held and IRQs disabled.
+    unsafe fn enqueue_vspace_waiter_locked(
+        &mut self,
+        tracking: &crate::mm::VSpaceTracking,
+        tcb: *mut Tcb,
+    ) {
+        unsafe {
+            (*tcb).vspace_wait_next = core::ptr::null_mut();
+
+            // Get and update waiter head (UnsafeCell, scheduler lock sync)
+            let head = tracking.waiter_head_get_locked();
+            (*tcb).vspace_wait_next = head;
+            tracking.waiter_head_set_locked(tcb);
+        }
+    }
+
+    /// Wake all threads waiting on a VSpace
+    ///
+    /// Called when last core exits the VSpace.
+    /// CRITICAL: Must be called with scheduler lock held and IRQs disabled!
+    fn wakeup_vspace_waiters_locked(&mut self, tracking: &crate::mm::VSpaceTracking) {
+        unsafe {
+            // Clear waiter head and get all waiters
+            let mut current = tracking.waiter_head_get_locked();
+            tracking.waiter_head_set_locked(core::ptr::null_mut());
+
+            // Wake all waiters
+            while !current.is_null() {
+                let next = (*current).vspace_wait_next;
+
+                (*current).state = ThreadState::Ready;
+                (*current).blocked_reason = None;
+                (*current).blocked_vspace_tracking = core::ptr::null_mut();
+                (*current).vspace_wait_next = core::ptr::null_mut();
+
+                self.enqueue(current);
+                current = next;
+            }
+        }
+    }
+
+    /// Finish deactivate operation - wake waiters if VSpace became inactive
+    ///
+    /// CRITICAL: Must be called with scheduler lock held and IRQs disabled!
+    ///
+    /// This is the centralized handler for all "last core exited" cases.
+    /// All callers of `deactivate_nosched()` that get `BecameInactive` MUST
+    /// call this function (with scheduler lock held).
+    ///
+    /// This centralization ensures:
+    /// - Single point for wakeup logic (easier debugging/tracing)
+    /// - Structurally enforced lock requirement
+    /// - Consistent handling across all code paths
+    pub fn finish_deactivate(&mut self, tracking: &crate::mm::VSpaceTracking) {
+        self.wakeup_vspace_waiters_locked(tracking);
+    }
+
+    /// Block current thread on VSpace teardown (MAY switch, manages IRQ state internally)
+    ///
+    /// CRITICAL: This function may call reschedule() which performs context switch.
+    /// The function manages IRQ state internally - do NOT wrap with with_lock().
+    ///
+    /// Use this instead of with_lock() for blocking operations:
+    /// ```rust
+    /// scheduler.block_current_on_vspace(tracking);
+    /// ```
+    ///
+    /// This forms one half of the "structurally-enforced shared lock" pattern.
+    /// The other half is `finish_deactivate()`, which handles wakeup when
+    /// deactivate_nosched() returns `BecameInactive`.
+    pub fn block_current_on_vspace(&mut self, tracking: &crate::mm::VSpaceTracking) {
+        // Take scheduler lock and disable IRQs
+        let irq_flag = unsafe { crate::mm::save_irq_disable() };
+        self.lock();
+
+        unsafe {
+            let current = self.current;
+
+            // Fast path: check if already inactive
+            if !tracking.is_active() {
+                self.unlock();
+                crate::mm::restore_irq(irq_flag);
+                return;
+            }
+
+            // Mark as blocked
+            (*current).state = ThreadState::Blocked;
+            (*current).blocked_reason = Some(BlockedReason::VSpaceWait);
+            (*current).blocked_vspace_tracking = tracking as *const _ as *mut _;
+
+            // Add to VSpace's intrusive wait queue
+            self.enqueue_vspace_waiter_locked(tracking, current);
+
+            // Context switch - reschedule() handles lock release and IRQ restore
+            // NOTE: reschedule() will NOT return here until this thread is scheduled again
+            self.reschedule_with_irq_restore(irq_flag);
+        }
+
+        // When we return here, IRQ state has been restored by reschedule_with_irq_restore
+    }
+
+    /// Reschedule with IRQ state management (internal, for blocking operations)
+    ///
+    /// This is called by blocking functions like `block_current_on_vspace()`.
+    /// It handles context switch and ensures IRQ state is properly restored
+    /// when the thread resumes.
+    ///
+    /// # Safety
+    /// Must be called with scheduler lock held and IRQs disabled.
+    /// irq_flag is the saved interrupt flag to restore when thread resumes.
+    unsafe fn reschedule_with_irq_restore(&mut self, irq_flag: u64) {
+        unsafe {
+            // Release scheduler lock
+            self.unlock();
+
+            // Perform context switch
+            // When we return here (thread resumed), restore IRQ state
+            self.reschedule();
+
+            // Thread resumed - restore IRQ state
+            crate::mm::restore_irq(irq_flag);
+        }
+    }
+
+    /// Kernel exit epilogue - MUST be called from ALL kernel exit points
+    ///
+    /// **STRUCTURALLY ENFORCED**: This function MUST be called from:
+    /// 1. Context switch paths (before/after thread switch)
+    /// 2. Scheduler lock acquisition points (when taking lock for non-blocking operations)
+    /// 3. Timer tick handler (which already holds scheduler lock)
+    ///
+    /// IMPORTANT: Do NOT call from arbitrary interrupt return paths!
+    /// Only call from contexts that already safely interact with scheduler.
+    ///
+    /// This is automatically called by `with_lock()` - no manual call needed for most cases.
+    ///
+    /// # Safety
+    /// Must be called with scheduler lock held and IRQs disabled.
+    fn kernel_exit_epilogue(&mut self) {
+        // Process pending VSpace deactivates
+        self.process_pending_deactivates();
+
+        // Future: add other "must-run" epilogue tasks here
+        // e.g., deferred work, signal handling, etc.
+    }
+
+    /// Process pending deactivates (internal, called by kernel_exit_epilogue)
+    ///
+    /// CRITICAL: Must be called with scheduler lock held and IRQs disabled!
+    fn process_pending_deactivates(&mut self) {
+        let cpu_id = crate::arch::current_cpu() as usize;
+
+        unsafe {
+            // Take pending if any (null check is implicit)
+            let old_tracking = crate::mm::take_pending_deactivate(cpu_id);
+
+            if !old_tracking.is_null() {
+                // Perform deactivate_nosched and check result
+                match (*old_tracking).deactivate_nosched(cpu_id) {
+                    crate::mm::DeactivateResult::BecameInactive => {
+                        // We hold scheduler lock, call finish_deactivate
+                        self.finish_deactivate(&*old_tracking);
+                    }
+                    _ => {
+                        // Not active or still active, no wakeup needed
+                    }
+                }
+            }
+        }
+
+        // Always advance quiescent generation - we passed a safe point
+        // This signals to deferred free that this CPU processed pending
+        crate::mm::advance_quiescent_gen(cpu_id);
+    }
+
+    /// Execute closure with scheduler lock held and IRQs disabled
+    ///
+    /// **IMPORTANT**: Use this ONLY for operations that do NOT block/switch!
+    /// For blocking operations like VSpace wait, use `block_current_on_vspace()` instead.
+    ///
+    /// Automatically calls `kernel_exit_epilogue()` to process pending deactivates.
+    pub fn with_lock<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&mut Scheduler) -> R,
+    {
+        // Save interrupt flag and disable IRQs
+        let irq_flag = unsafe { crate::mm::save_irq_disable() };
+
+        // Take scheduler lock
+        self.lock();
+
+        // Process pending deactivates (we hold lock + IRQs disabled)
+        self.kernel_exit_epilogue();
+
+        let result = f(self);
+
+        // Release scheduler lock
+        self.unlock();
+
+        // Restore interrupt flag
+        unsafe { crate::mm::restore_irq(irq_flag) };
+
+        result
     }
 }
 

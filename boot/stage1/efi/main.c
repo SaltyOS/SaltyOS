@@ -129,7 +129,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
 
     /* Initialize serial for early diagnostics */
     serial_init();
-    println("S1: start");
+    println("S1: SaltyOS UEFI");
 
     /* Load stage2.efi into memory buffer */
     status = load_stage2_image(image, &stage2_addr, &stage2_size);

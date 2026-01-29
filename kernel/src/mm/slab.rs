@@ -119,8 +119,8 @@ impl SlabAllocator {
     pub const fn new(obj_size: usize) -> Self {
         Self {
             obj_size,
-            obj_per_slab: 0,  // Calculated during first grow
-            obj_offset: 0,    // Calculated during first grow
+            obj_per_slab: 0, // Calculated during first grow
+            obj_offset: 0,   // Calculated during first grow
             per_cpu: [PerCpuCache::new(); MAX_CPUS],
             slab_list: core::ptr::null_mut(),
         }
@@ -315,7 +315,7 @@ impl SlabAllocator {
             let count = available / obj_size;
 
             if count == 0 {
-                return None;  // Object too large
+                return None; // Object too large
             }
 
             // These are const now, but we need mutable self to write them

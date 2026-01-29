@@ -23,7 +23,7 @@ build_kernel = get_option('build_kernel')
 build_userland = get_option('build_userland')
 
 # =============================================================================
-# Toolchain (clang/lld required)
+# Toolchain (clang/lld required, nightly rustc required)
 # =============================================================================
 
 # C Compiler: must be clang
@@ -39,8 +39,31 @@ nasm = find_program('nasm', required: build_boot)
 # Binary tools
 objcopy = find_program('llvm-objcopy', required: build_boot)
 
-# Rust
+# Rust: must be nightly (required for building core library)
 rustc = find_program('rustc', required: build_kernel)
+
+fs = import('fs')
+
+if build_kernel
+  # Verify nightly toolchain
+  rustc_version = run_command(rustc, '--version', capture: true, check: true).stdout().strip()
+  if not rustc_version.contains('nightly')
+    error('SaltyOS requires nightly rustc for building core library.\n' +
+          'Got: ' + rustc_version + '\n' +
+          'Fix: rustup default nightly, or add nightly bin to PATH')
+  endif
+
+  # Get rust-src path from sysroot
+  rustc_sysroot = run_command(rustc, '--print', 'sysroot', capture: true, check: true).stdout().strip()
+  rust_lib_src = rustc_sysroot / 'lib/rustlib/src/rust/library'
+
+  # Verify rust-src component is installed
+  if not fs.is_file(rust_lib_src / 'core/src/lib.rs')
+    error('rust-src component not found.\n' +
+          'Expected: ' + rust_lib_src + '\n' +
+          'Fix: rustup component add rust-src')
+  endif
+endif
 
 # =============================================================================
 # Architecture Configuration
@@ -119,6 +142,8 @@ if build_boot
 endif
 
 if build_kernel
+  # Build core library and compiler_builtins first
+  subdir('rust')
   subdir('kernel')
 endif
 
@@ -176,11 +201,12 @@ summary({
 
 summary({
   'C Compiler': cc.get_id() + ' ' + cc.version(),
-  'Rust': rustc.found() ? rustc.full_path() : 'not found',
+  'Rust': rustc.found() ? rustc_version : 'not found',
   'NASM': nasm.found() ? nasm.full_path() : 'not found',
 }, section: 'Toolchain')
 
 summary({
   'Rust Target': rust_target,
+  'Rust Lib Src': build_kernel ? rust_lib_src : 'N/A',
   'EFI Target': efi_target,
 }, section: 'Targets')
