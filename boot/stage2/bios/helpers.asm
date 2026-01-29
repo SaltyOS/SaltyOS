@@ -368,7 +368,7 @@ bios_get_e820_map:
     bits 16
 
     mov edi, [param_buf]
-    mov cx, [param_buf + 16] 
+    mov cx, [param_buf + 8] 
     
     xor ebx, ebx
     xor bp, bp               

@@ -78,6 +78,22 @@ int bios_load_kernel(void **addr, size_t *size) {
     uint16_t phnum = *(uint16_t *)(temp_buf + ELF64_E_PHNUM);
     uint16_t phentsize = *(uint16_t *)(temp_buf + ELF64_E_PHENTSIZE);
 
+    /* Validate PHDR table is within first sector */
+    uint32_t phdr_end = phoff + (uint32_t)phnum * phentsize;
+    if (phdr_end > 512) {
+        /* Need to read more sectors to get full PHDR table */
+        uint32_t need_sectors = (phdr_end + 511) / 512;
+        if (need_sectors > 8) {  /* Sanity check: don't read more than 4KB */
+            println("S2: PHDR table too large");
+            return -1;
+        }
+        read = bios_read_disk_lba(temp_buf, kernel_lba, need_sectors);
+        if ((int64_t)read < 0) {
+            println("S2: Kernel extended header read failed");
+            return -1;
+        }
+    }
+
     uint32_t max_offset = 0;
 
     for (uint16_t i = 0; i < phnum; i++) {

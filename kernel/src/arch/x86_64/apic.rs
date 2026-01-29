@@ -396,7 +396,8 @@ unsafe fn calibrate_timer() -> u32 {
         lapic_write(LAPIC_LVT_TIMER, timer_config);
 
         // Set initial count to our calibration value
-        lapic_write(LAPIC_TIMER_INITIAL, APIC_COUNT);
+        let start_count = APIC_COUNT;
+        lapic_write(LAPIC_TIMER_INITIAL, start_count);
 
         // Step 3: Wait for APIC timer to expire, measuring with PIT
         let pit_start = super::pit::read_counter();
@@ -406,8 +407,8 @@ unsafe fn calibrate_timer() -> u32 {
         loop {
             timer_current = lapic_read(LAPIC_TIMER_CURRENT);
 
-            // Check if timer has expired (reached zero)
-            if timer_current == 0 || timer_current >= APIC_COUNT {
+            // Check if timer has expired (reached zero or wrapped)
+            if timer_current == 0 || timer_current >= start_count {
                 break;
             }
 
@@ -430,8 +431,9 @@ unsafe fn calibrate_timer() -> u32 {
             }
         }
 
-        // Read final PIT counter value
+        // Read final PIT counter value and APIC timer end value
         let pit_end = super::pit::read_counter();
+        let end_count = lapic_read(LAPIC_TIMER_CURRENT);
 
         // Calculate PIT ticks elapsed
         let pit_elapsed = if pit_end <= pit_start {
@@ -441,9 +443,11 @@ unsafe fn calibrate_timer() -> u32 {
             pit_start + (0xFFFF as u16 - pit_end) + 1
         };
 
+        // Calculate actual APIC ticks elapsed (down-counter: start > end)
+        let apic_ticks = (start_count - end_count) as u64;
+
         // Step 4: Calculate APIC ticks per millisecond
         // Formula: (APIC_count * PIT_FREQUENCY) / (PIT_ticks_elapsed * TIMER_DIVIDE * 1000)
-        let apic_ticks = (0xFFFF_FFFF - APIC_COUNT) as u64;
         let pit_freq = super::pit::PIT_FREQUENCY as u64;
         let pit_elapsed_u64 = pit_elapsed as u64;
         let timer_divide = 16u64;

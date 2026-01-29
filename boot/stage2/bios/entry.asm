@@ -344,8 +344,6 @@ long_mode:
     mov al, 'L'
     out dx, al
 
-    xor rdi, rdi
-    mov dil, [boot_drive]
     call stage2_bios_main
 
 .halt64:
