@@ -268,8 +268,11 @@ pub fn init_syscalls() {
         let stack_bottom = stack_frames[0];
         let stack_top = stack_bottom + STACK_SIZE;
 
-        // Set kernel stack for current CPU
+        // Set kernel stack for current CPU (for syscall entry)
         cpu::set_kernel_stack(stack_top);
+
+        // Set TSS rsp0 (for interrupt entry from user mode)
+        gdt::set_tss_rsp0(stack_top);
 
         // Print stack info
         for byte in b"[SYSCALL] Kernel stack: " {

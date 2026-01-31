@@ -37,6 +37,11 @@ impl Endpoint {
         }
     }
 
+    /// Get the current endpoint state
+    pub fn state(&self) -> EndpointState {
+        self.state
+    }
+
     /// Send message (blocks until receiver ready)
     pub fn send(&mut self, msg: &Message, badge: u64) {
         unsafe {

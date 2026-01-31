@@ -28,6 +28,14 @@ pub use slot::{
 pub struct CapRights(u32);
 
 impl CapRights {
+    /// Create CapRights from raw bits
+    ///
+    /// # Safety
+    /// Callers should ensure only valid rights bits are set.
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
     /// Read permission
     pub const READ: CapRights = CapRights(1 << 0);
     /// Write permission

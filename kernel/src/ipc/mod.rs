@@ -8,7 +8,7 @@ mod endpoint;
 mod notification;
 mod queue;
 
-pub use endpoint::Endpoint;
+pub use endpoint::{Endpoint, EndpointState};
 pub use notification::Notification;
 pub use queue::WaitQueue;
 

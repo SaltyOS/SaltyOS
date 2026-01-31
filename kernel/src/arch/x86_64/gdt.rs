@@ -174,6 +174,24 @@ static mut GDT: Gdt = Gdt {
 /// The kernel TSS
 static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
+/// Set the kernel stack pointer in TSS (rsp0)
+///
+/// This is the stack that will be used when interrupts occur from user mode.
+/// The CPU switches to this stack automatically based on CPL.
+///
+/// # Safety
+/// Must be called with a valid kernel stack pointer.
+pub unsafe fn set_tss_rsp0(stack_top: u64) {
+    unsafe {
+        TSS.rsp0 = stack_top;
+    }
+}
+
+/// Get the current TSS stack pointer
+pub fn get_tss_rsp0() -> u64 {
+    unsafe { TSS.rsp0 }
+}
+
 /// Serial port (COM1) for debug output
 const SERIAL_PORT: u16 = 0x3F8;
 
