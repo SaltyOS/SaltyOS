@@ -122,7 +122,7 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
         (*tcb).priority = 100; // deadline for EDF
         (*tcb).cpu_affinity = 0;
         (*tcb).sched_context = sc;
-        (*tcb).vspace = (&raw mut INIT_VSPACE).cast::<VSpace>();
+        (*tcb).vspace_root = (&raw mut INIT_VSPACE).cast::<VSpace>();
 
         // Enqueue the init task
         crate::sched::scheduler::scheduler().enqueue(tcb);

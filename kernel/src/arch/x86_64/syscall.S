@@ -89,18 +89,18 @@ syscall_entry:
     # Return Value Handling
     # --------------------------------------------------------------------------
     # Rust returns struct { u64 error; u64 value; } in RAX:RDX (System V ABI).
-    # Overwrite saved RAX/RBX on stack so pops restore the result to user.
-    # Stack: [saved_rax] [saved_rbx] [saved_rcx=user_rip] ...
-    mov %rax, 0(%rsp)  # error  → will be popped into %rax
-    mov %rdx, 8(%rsp)  # value  → will be popped into %rbx
+    # Overwrite saved RAX and saved RDX on stack so pops restore results.
+    # Stack layout: [0]=rax [8]=rbx [16]=rcx(rip) [24]=rdx ...
+    mov %rax, 0(%rsp)   # error  → will be popped into %rax
+    mov %rdx, 24(%rsp)  # value  → will be popped into %rdx
 
     # --------------------------------------------------------------------------
     # Context Restoration
     # --------------------------------------------------------------------------
     pop %rax   # Error code (from handler)
-    pop %rbx   # Return value (from handler)
+    pop %rbx   # Restored (original value)
     pop %rcx   # Restores RIP (needed for sysretq)
-    pop %rdx
+    pop %rdx   # Return value (from handler)
     pop %rsi
     pop %rdi
     pop %rbp

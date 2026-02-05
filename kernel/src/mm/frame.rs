@@ -35,15 +35,41 @@ impl FrameAllocator {
             free: 0,
         };
 
-        // Mark usable memory regions as free (all others stay as used/0)
         let entries = &boot_info.memory_map[..boot_info.memory_map_len];
+
+        // First pass: mark usable memory regions as free
         for entry in entries {
             if entry.kind == MemoryKind::Usable {
                 allocator.mark_region_free(entry.base, entry.length);
             }
         }
 
+        // Second pass: carve out reserved/kernel/bootinfo/initrd regions
+        // that overlap with usable regions
+        for entry in entries {
+            if entry.kind != MemoryKind::Usable {
+                allocator.mark_region_used(entry.base, entry.length);
+            }
+        }
+
         allocator
+    }
+
+    fn mark_region_used(&mut self, base: u64, length: u64) {
+        let start_frame = (base as usize) / PAGE_SIZE;
+        let end_frame = ((base + length) as usize + PAGE_SIZE - 1) / PAGE_SIZE;
+
+        for frame in start_frame..end_frame {
+            if frame < MAX_FRAMES {
+                let idx = frame / 64;
+                let bit = frame % 64;
+                if self.bitmap[idx] & (1u64 << bit) != 0 {
+                    // Frame was free, mark as used
+                    self.bitmap[idx] &= !(1u64 << bit);
+                    self.free = self.free.saturating_sub(1);
+                }
+            }
+        }
     }
 
     fn mark_region_free(&mut self, base: u64, length: u64) {

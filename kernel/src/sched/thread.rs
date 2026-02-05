@@ -2,6 +2,7 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+use crate::cap::{KernelObject, ObjectType};
 use crate::cap::CNode;
 use crate::mm::VSpace;
 
@@ -43,16 +44,18 @@ pub enum BlockedReason {
 /// Thread Control Block
 #[repr(C)]
 pub struct Tcb {
+    /// Kernel object header (must be first for refcount access)
+    pub header: KernelObject,
     /// Thread state
     pub state: ThreadState,
     /// Priority (for EDF: deadline)
     pub priority: u64,
     /// Saved registers
     pub context: ThreadContext,
-    /// Virtual address space
-    pub vspace: *mut VSpace,
+    /// Virtual address space root
+    pub vspace_root: *mut VSpace,
     /// Capability space root
-    pub cspace: *mut CNode,
+    pub cspace_root: *mut CNode,
     /// IPC buffer address
     pub ipc_buffer: u64,
     /// Scheduling context
@@ -67,6 +70,8 @@ pub struct Tcb {
     pub saved_caller_badge: u64,
     /// Saved caller message (for reply_recv)
     pub saved_caller_msg: super::super::ipc::Message,
+    /// Endpoint pointer if blocked on endpoint send/recv queue
+    pub blocked_endpoint: *mut u8,
     /// Notification pointer if blocked on notification
     pub blocked_notification: *mut u8,
     /// VSpace tracking pointer (for VSpaceWait)
@@ -77,6 +82,10 @@ pub struct Tcb {
     pub reply_tcb: *mut Tcb,
     /// Can the caller grant capabilities in the reply?
     pub reply_can_grant: bool,
+    /// Fault handler endpoint (for delivering faults to userspace handler)
+    pub fault_handler: *mut u8,
+    /// Bound notification for combined IPC wait
+    pub bound_notification: *mut u8,
 }
 
 /// Saved thread context
@@ -138,6 +147,8 @@ impl ThreadContext {
 /// Scheduling context (EDF parameters)
 #[repr(C)]
 pub struct SchedContext {
+    /// Kernel object header (must be first for refcount access)
+    pub header: KernelObject,
     /// Budget per period (time units)
     pub budget: u64,
     /// Remaining budget
@@ -148,16 +159,19 @@ pub struct SchedContext {
     pub deadline: u64,
     /// Bound TCB
     pub bound_tcb: *mut Tcb,
+    /// Cumulative consumed time (ticks)
+    pub consumed: u64,
 }
 
 impl Tcb {
     pub const fn new() -> Self {
         Self {
+            header: KernelObject::new(ObjectType::Tcb, 0),
             state: ThreadState::Inactive,
             priority: 0,
             context: ThreadContext::empty(),
-            vspace: core::ptr::null_mut(),
-            cspace: core::ptr::null_mut(),
+            vspace_root: core::ptr::null_mut(),
+            cspace_root: core::ptr::null_mut(),
             ipc_buffer: 0,
             sched_context: core::ptr::null_mut(),
             cpu_affinity: 0xFFFF_FFFF,
@@ -165,11 +179,14 @@ impl Tcb {
             blocked_reason: None,
             saved_caller_badge: 0,
             saved_caller_msg: super::super::ipc::Message::empty(),
+            blocked_endpoint: core::ptr::null_mut(),
             blocked_notification: core::ptr::null_mut(),
             blocked_vspace_tracking: core::ptr::null_mut(),
             vspace_wait_next: core::ptr::null_mut(),
             reply_tcb: core::ptr::null_mut(),
             reply_can_grant: false,
+            fault_handler: core::ptr::null_mut(),
+            bound_notification: core::ptr::null_mut(),
         }
     }
 
@@ -182,6 +199,8 @@ impl Tcb {
     pub fn cleanup(&mut self) {
         self.state = ThreadState::Inactive;
         self.blocked_reason = None;
+        self.blocked_endpoint = core::ptr::null_mut();
+        self.blocked_notification = core::ptr::null_mut();
         self.blocked_vspace_tracking = core::ptr::null_mut();
         self.vspace_wait_next = core::ptr::null_mut();
 
@@ -198,17 +217,21 @@ impl Tcb {
         }
         self.reply_tcb = core::ptr::null_mut();
         self.reply_can_grant = false;
+        self.fault_handler = core::ptr::null_mut();
+        self.bound_notification = core::ptr::null_mut();
     }
 }
 
 impl SchedContext {
     pub const fn new() -> Self {
         Self {
+            header: KernelObject::new(ObjectType::SchedContext, 0),
             budget: 0,
             remaining: 0,
             period: 0,
             deadline: 0,
             bound_tcb: core::ptr::null_mut(),
+            consumed: 0,
         }
     }
 

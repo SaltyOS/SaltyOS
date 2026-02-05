@@ -3,6 +3,7 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use super::{block_current_thread, Message, WaitQueue};
+use crate::cap::{KernelObject, ObjectType};
 use crate::sched::thread::{BlockedReason, Tcb, ThreadState};
 
 use crate::sched::scheduler::scheduler as get_scheduler;
@@ -21,6 +22,8 @@ pub enum EndpointState {
 /// IPC Endpoint
 #[repr(C)]
 pub struct Endpoint {
+    /// Kernel object header (must be first for refcount access)
+    pub header: KernelObject,
     state: EndpointState,
     /// Queue of waiting senders
     send_queue: WaitQueue,
@@ -31,6 +34,7 @@ pub struct Endpoint {
 impl Endpoint {
     pub const fn new() -> Self {
         Self {
+            header: KernelObject::new(ObjectType::Endpoint, 0),
             state: EndpointState::Idle,
             send_queue: WaitQueue::new(),
             recv_queue: WaitQueue::new(),
@@ -61,6 +65,7 @@ impl Endpoint {
 
                     // Wake receiver
                     (*receiver).state = ThreadState::Ready;
+                    (*receiver).blocked_endpoint = core::ptr::null_mut();
                     get_scheduler().enqueue(receiver);
 
                     // Update state
@@ -72,6 +77,7 @@ impl Endpoint {
                     // SLOWPATH: No receiver - block sender
                     self.send_queue.push(current);
                     self.state = EndpointState::SendBlocked;
+                    (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
 
                     let reason = BlockedReason::SendBlocked { msg: *msg, badge };
                     block_current_thread(current, reason);
@@ -106,6 +112,7 @@ impl Endpoint {
                     // Wake sender (for regular send, not call - call sender stays blocked)
                     (*sender).state = ThreadState::Ready;
                     (*sender).blocked_reason = None;
+                    (*sender).blocked_endpoint = core::ptr::null_mut();
                     get_scheduler().enqueue(sender);
 
                     // Update state
@@ -119,6 +126,7 @@ impl Endpoint {
                     // SLOWPATH: No sender - block receiver
                     self.recv_queue.push(current);
                     self.state = EndpointState::RecvBlocked;
+                    (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
 
                     block_current_thread(current, BlockedReason::RecvBlocked);
 
@@ -197,6 +205,26 @@ impl Endpoint {
         }
     }
 
+    /// Remove a specific TCB from send or recv queue
+    ///
+    /// Used when suspending a thread that is blocked on this endpoint.
+    /// Returns true if the thread was found and removed.
+    pub fn remove_from_queue(&mut self, tcb: *mut Tcb) -> bool {
+        if self.send_queue.remove(tcb) {
+            if self.send_queue.is_empty() && self.state == EndpointState::SendBlocked {
+                self.state = EndpointState::Idle;
+            }
+            return true;
+        }
+        if self.recv_queue.remove(tcb) {
+            if self.recv_queue.is_empty() && self.state == EndpointState::RecvBlocked {
+                self.state = EndpointState::Idle;
+            }
+            return true;
+        }
+        false
+    }
+
     /// Cleanup when endpoint is destroyed
     ///
     /// Wake all blocked threads with error.
@@ -206,6 +234,7 @@ impl Endpoint {
             while let Some(sender) = self.send_queue.pop() {
                 (*sender).state = ThreadState::Ready;
                 (*sender).blocked_reason = None;
+                (*sender).blocked_endpoint = core::ptr::null_mut();
                 get_scheduler().enqueue(sender);
             }
 
@@ -213,6 +242,7 @@ impl Endpoint {
             while let Some(receiver) = self.recv_queue.pop() {
                 (*receiver).state = ThreadState::Ready;
                 (*receiver).blocked_reason = None;
+                (*receiver).blocked_endpoint = core::ptr::null_mut();
                 get_scheduler().enqueue(receiver);
             }
 

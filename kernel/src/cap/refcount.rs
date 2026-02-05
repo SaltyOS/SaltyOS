@@ -102,7 +102,8 @@ unsafe fn destroy_object(obj: *mut KernelObject, obj_type: ObjectType) {
             }
 
             ObjectType::IrqHandler => {
-                // IRQ handler cleanup - restore default handler
+                let irq = &mut *(obj as *mut crate::ipc::IrqHandler);
+                irq.cleanup();
             }
 
             ObjectType::IoPort => {

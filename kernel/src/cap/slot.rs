@@ -38,7 +38,7 @@ pub struct CapSlotMeta {
     /// CDT: parent slot
     pub cdt_parent: CapSlot,
 
-    /// CDT: first child slot
+    /// CDT: first child slot (derivation tree children)
     pub cdt_first_child: CapSlot,
 
     /// CDT: next sibling
@@ -46,6 +46,9 @@ pub struct CapSlotMeta {
 
     /// CDT: previous sibling
     pub cdt_prev: CapSlot,
+
+    /// Untyped: first child in untyped's child list (separate from CDT)
+    pub ut_first_child: CapSlot,
 
     /// Untyped: next child in untyped's child list
     pub ut_next: CapSlot,
@@ -65,6 +68,7 @@ impl CapSlotMeta {
             cdt_first_child: INVALID_SLOT,
             cdt_next: INVALID_SLOT,
             cdt_prev: INVALID_SLOT,
+            ut_first_child: INVALID_SLOT,
             ut_next: INVALID_SLOT,
             ut_parent: INVALID_SLOT,
             state: SlotState::Free,
@@ -78,6 +82,7 @@ impl CapSlotMeta {
             cdt_first_child: INVALID_SLOT,
             cdt_next: INVALID_SLOT,
             cdt_prev: INVALID_SLOT,
+            ut_first_child: INVALID_SLOT,
             ut_next: INVALID_SLOT,
             ut_parent: INVALID_SLOT,
             state: SlotState::Occupied,

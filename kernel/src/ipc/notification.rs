@@ -4,6 +4,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::cap::{KernelObject, ObjectType};
 use crate::sched::thread::{BlockedReason, Tcb, ThreadState};
 
 use crate::sched::scheduler::scheduler as get_scheduler;
@@ -11,6 +12,8 @@ use crate::sched::scheduler::scheduler as get_scheduler;
 /// Notification object for async signaling
 #[repr(C)]
 pub struct Notification {
+    /// Kernel object header (must be first for refcount access)
+    pub header: KernelObject,
     /// Pending notification bits (atomic for concurrent access)
     bits: AtomicU64,
     /// Waiting thread (if any)
@@ -20,6 +23,7 @@ pub struct Notification {
 impl Notification {
     pub const fn new() -> Self {
         Self {
+            header: KernelObject::new(ObjectType::Notification, 0),
             bits: AtomicU64::new(0),
             waiting: core::ptr::null_mut(),
         }
@@ -38,6 +42,7 @@ impl Notification {
 
                 // Clear blocked reason and make runnable
                 (*waiter).blocked_reason = None;
+                (*waiter).blocked_notification = core::ptr::null_mut();
                 (*waiter).state = ThreadState::Ready;
                 get_scheduler().enqueue(waiter);
             }
@@ -58,6 +63,7 @@ impl Notification {
             // No bits - block current thread
             let current = get_scheduler().current();
             self.waiting = current;
+            (*current).blocked_notification = self as *mut Notification as *mut u8;
 
             // Block and wait for signal
             super::block_current_thread(current, BlockedReason::NotificationWait);
@@ -76,6 +82,18 @@ impl Notification {
         } else {
             None
         }
+    }
+
+    /// Remove a specific TCB from the waiting slot
+    ///
+    /// Used when suspending a thread that is blocked on this notification.
+    /// Returns true if the thread was the waiter and was removed.
+    pub fn remove_waiter(&mut self, tcb: *mut Tcb) -> bool {
+        if self.waiting == tcb {
+            self.waiting = core::ptr::null_mut();
+            return true;
+        }
+        false
     }
 
     /// Cleanup when notification is destroyed

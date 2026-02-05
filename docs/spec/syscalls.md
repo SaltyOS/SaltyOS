@@ -9,18 +9,20 @@ SaltyOS uses a capability-invocation model for system calls. Most operations are
 ### Calling Convention (x86_64)
 
 ```
-Registers:
+User Registers (before SYSCALL instruction):
   RAX  - System call number
-  RDI  - Argument 1 (capability pointer or syscall-specific)
-  RSI  - Argument 2
-  RDX  - Argument 3
-  R10  - Argument 4 (RCX is clobbered by SYSCALL)
-  R8   - Argument 5
-  R9   - Argument 6
+  RDI  - Argument 0 (capability pointer)
+  RSI  - Argument 1 (msg_info / label)
+  RDX  - Argument 2
+  R10  - Argument 3 (RCX is clobbered by SYSCALL instruction)
+  R8   - Argument 4
+  R9   - Argument 5 (reserved)
 
 Return:
-  RAX  - Return value (0 = success, negative = error)
-  RDI  - Additional return value (syscall-specific)
+  RAX  - Error code (0 = success)
+  RDX  - Return value (syscall-specific)
+
+Note: RCX and R11 are clobbered by the SYSCALL instruction (RCX=RIP, R11=RFLAGS).
 ```
 
 ### System Call Entry
@@ -303,30 +305,87 @@ The `label` determines the operation. The message buffer contains operation-spec
 
 | Label | Operation | Description |
 |-------|-----------|-------------|
-| 0x01 | `TCB_ReadRegisters` | Read thread registers |
-| 0x02 | `TCB_WriteRegisters` | Write thread registers |
-| 0x03 | `TCB_Configure` | Configure thread |
-| 0x04 | `TCB_SetPriority` | Set thread priority |
-| 0x05 | `TCB_SetIPCBuffer` | Set IPC buffer address |
-| 0x06 | `TCB_SetSpace` | Set CSpace/VSpace |
-| 0x07 | `TCB_Suspend` | Suspend thread |
-| 0x08 | `TCB_Resume` | Resume thread |
-| 0x09 | `TCB_BindNotification` | Bind notification to thread |
-| 0x0A | `TCB_UnbindNotification` | Unbind notification |
+| 0x40 | `TCB_Configure` | Configure thread (entry, stack, IPC buffer) |
+| 0x41 | `TCB_Resume` | Resume thread |
+| 0x42 | `TCB_Suspend` | Suspend thread |
+| 0x43 | `TCB_SetSpace` | Set CSpace/VSpace roots |
+| 0x44 | `TCB_SetAffinity` | Set CPU affinity (0xFFFFFFFF = any CPU) |
+| 0x45 | `TCB_ReadRegisters` | Read saved registers |
+| 0x46 | `TCB_WriteRegisters` | Write saved registers |
+| 0x47 | `TCB_SetPriority` | Set scheduling priority |
+| 0x48 | `TCB_SetIPCBuffer` | Set IPC buffer address |
+| 0x49 | `TCB_BindNotification` | Bind notification for combined wait |
+| 0x4A | `TCB_UnbindNotification` | Unbind notification |
 
-#### TCB_Configure
+#### TCB_Configure (0x40)
 
-```c
-struct tcb_configure_args {
-    cap_t fault_handler;     // Fault handler endpoint
-    cap_t cspace_root;       // CSpace root
-    uint64_t cspace_data;    // CSpace guard/depth
-    cap_t vspace_root;       // VSpace root
-    uint64_t vspace_data;    // VSpace data
-    uint64_t ipc_buffer;     // IPC buffer address
-    cap_t ipc_buffer_frame;  // IPC buffer frame
-};
+Configure a thread's entry point, stack, and IPC buffer. The fault handler endpoint is set separately via `TCB_BindNotification`.
+
 ```
+arg0 = entry_rip     (instruction pointer)
+arg1 = entry_rsp     (stack pointer)
+arg2 = ipc_buffer    (IPC buffer virtual address)
+```
+
+#### TCB_SetAffinity (0x44)
+
+```
+arg0 = cpu_id        (target CPU, 0xFFFFFFFF = any CPU)
+```
+
+#### TCB_ReadRegisters (0x45)
+
+Read a thread's saved registers. Thread must not be Running.
+
+```
+arg0 = flags         (reserved, must be 0)
+```
+
+**Returns:** RIP in value field. Requires READ right. Returns `EBUSY` if thread is Running.
+
+#### TCB_WriteRegisters (0x46)
+
+Write a thread's saved registers. Thread must not be Running.
+
+```
+arg0 = flags         (bit 0: resume thread after write)
+arg1 = rip           (new instruction pointer)
+arg2 = rsp           (new stack pointer)
+```
+
+Requires WRITE right. Returns `EBUSY` if thread is Running.
+
+#### TCB_SetPriority (0x47)
+
+Set thread scheduling priority (EDF deadline value).
+
+```
+arg0 = priority      (deadline value for EDF scheduling)
+```
+
+If thread is in Ready state, it is re-enqueued with the updated priority.
+
+#### TCB_SetIPCBuffer (0x48)
+
+```
+arg0 = addr          (new IPC buffer virtual address)
+```
+
+#### TCB_BindNotification (0x49)
+
+Bind a notification object to this thread for combined IPC wait.
+
+```
+arg0 = ntfn_cap_ptr  (capability pointer to Notification)
+```
+
+Returns `EBUSY` if a notification is already bound.
+
+#### TCB_UnbindNotification (0x4A)
+
+Unbind the current notification from this thread.
+
+Returns `InvalidOperation` if no notification is bound.
 
 ---
 
@@ -344,16 +403,16 @@ struct tcb_configure_args {
 
 #### CNode_Copy
 
-```c
-struct cnode_copy_args {
-    cap_t dest_cnode;        // Destination CNode
-    uint64_t dest_index;     // Destination slot
-    uint64_t dest_depth;     // Destination depth
-    cap_t src_cnode;         // Source CNode
-    uint64_t src_index;      // Source slot
-    uint64_t src_depth;      // Source depth
-    uint64_t rights;         // Rights to grant
-};
+Invoked on the **source** CNode capability.
+
+```
+Register mapping (via Invoke syscall):
+  cap_ptr (RDI) - Source CNode capability (invoked)
+  label   (RSI) - 0x10 (CNode_Copy)
+  arg0    (RDX) - Source slot index within source CNode
+  arg1    (R10) - Destination CNode capability pointer (looked up from CSpace)
+  arg2    (R8)  - Destination slot index
+  arg3    (R9)  - Rights mask
 ```
 
 ---
@@ -362,25 +421,38 @@ struct cnode_copy_args {
 
 | Label | Operation | Description |
 |-------|-----------|-------------|
-| 0x20 | `VSpace_Map` | Map frame into VSpace |
-| 0x21 | `VSpace_Unmap` | Unmap page |
-| 0x22 | `VSpace_MapPT` | Map page table |
+| 0x50 | `VSpace_Map` | Map frame into VSpace |
+| 0x51 | `VSpace_Unmap` | Unmap page |
+| 0x52 | `VSpace_MapPT` | Install page table at specific level |
 
-#### VSpace_Map
+#### VSpace_Map (0x50)
 
-```c
-struct vspace_map_args {
-    cap_t frame;             // Frame capability
-    uint64_t vaddr;          // Virtual address
-    uint64_t rights;         // MapRights (R/W/X)
-    uint64_t attr;           // Cache attributes
-};
+```
+arg0 = frame_cap_ptr  (capability pointer to frame)
+arg1 = virt_addr       (virtual address to map at)
+arg2 = flags_bits      (see flags below)
 ```
 
-**Rights:**
-- `0x01`: Read
-- `0x02`: Write
-- `0x04`: Execute
+**Flags bits:**
+| Bit | Name | Description |
+|-----|------|-------------|
+| 0 | writable | Page is writable |
+| 1 | user | Page is accessible from user mode |
+| 2 | executable | Page is executable (NX cleared) |
+| 3 | cache_disable | PCD: disable caching (for MMIO) |
+| 4 | write_through | PWT: write-through caching |
+
+#### VSpace_MapPT (0x52)
+
+Install a pre-allocated page table frame into the page table hierarchy.
+
+```
+arg0 = frame_cap_ptr  (capability pointer to frame for page table)
+arg1 = virt_addr       (virtual address to install table for)
+arg2 = level           (1=PT, 2=PD, 3=PDPT)
+```
+
+The frame is zeroed and installed as a page table at the specified level. Returns `AlreadyExists` if an entry already exists at that level.
 
 ---
 
@@ -388,46 +460,29 @@ struct vspace_map_args {
 
 | Label | Operation | Description |
 |-------|-----------|-------------|
-| 0x30 | `Untyped_Retype` | Create typed objects |
+| 0x20 | `Untyped_Retype` | Create typed objects |
 
-#### Untyped_Retype
+#### Untyped_Retype (0x20)
 
-```c
-struct untyped_retype_args {
-    uint64_t object_type;    // CapType enum
-    uint64_t size_bits;      // For variable-size objects
-    cap_t dest_cnode;        // Destination CNode
-    uint64_t dest_index;     // First destination slot
-    uint64_t dest_depth;     // Destination depth
-    uint64_t num_objects;    // Number of objects to create
-};
+```
+arg0 = object_type   (ObjectType enum, 1..=10)
+arg1 = size_bits     (for variable-size objects)
+arg2 = dest_offset   (destination slot index in current CSpace)
 ```
 
 **Object Types:**
 | Value | Type |
 |-------|------|
-| 1 | Endpoint |
-| 2 | Notification |
-| 3 | TCB |
-| 4 | CNode |
-| 5 | VSpace |
-| 6 | Frame (4KB) |
-| 7 | LargePage (2MB) |
-| 8 | HugePage (1GB) |
-| 9 | PageTable |
-| 10 | IRQHandler |
-| 11 | SchedContext |
-
----
-
-### IRQ Invocations
-
-| Label | Operation | Description |
-|-------|-----------|-------------|
-| 0x40 | `IRQControl_Get` | Get IRQ handler |
-| 0x41 | `IRQHandler_Ack` | Acknowledge IRQ |
-| 0x42 | `IRQHandler_SetNotification` | Set notification |
-| 0x43 | `IRQHandler_Clear` | Clear handler |
+| 1 | Untyped |
+| 2 | Endpoint |
+| 3 | Notification |
+| 4 | TCB |
+| 5 | CNode |
+| 6 | VSpace |
+| 7 | Frame |
+| 8 | IrqHandler |
+| 9 | IoPort |
+| 10 | SchedContext |
 
 ---
 
@@ -435,29 +490,89 @@ struct untyped_retype_args {
 
 | Label | Operation | Description |
 |-------|-----------|-------------|
-| 0x50 | `SC_Configure` | Configure parameters |
-| 0x51 | `SC_Bind` | Bind to TCB |
-| 0x52 | `SC_Unbind` | Unbind from TCB |
-| 0x53 | `SC_Consumed` | Get consumed time |
-| 0x54 | `SC_YieldTo` | Yield to another SC |
+| 0x30 | `SC_Configure` | Configure parameters (budget, period) |
+| 0x31 | `SC_Bind` | Bind to TCB |
+| 0x32 | `SC_Unbind` | Unbind from TCB |
+| 0x33 | `SC_YieldTo` | Yield to another SC |
+| 0x34 | `SC_Consumed` | Query consumed time |
+
+#### SC_Configure (0x30)
+
+```
+arg0 = budget_us     (budget per period, in microseconds, must be > 0)
+arg1 = period_us     (period in microseconds, 0 = sporadic, else >= budget)
+```
+
+Converted internally: 1 tick = 1ms = 1000us. Budget must be at least 1000us (1 tick).
+
+#### SC_Consumed (0x34)
+
+Query cumulative consumed time (in ticks) for this scheduling context.
+
+**Returns:** Consumed ticks in value field. Requires READ right.
+
+---
+
+### IRQ Invocations
+
+| Label | Operation | Description |
+|-------|-----------|-------------|
+| 0x60 | `IRQControl_Get` | Acquire IRQ handler for a specific IRQ |
+| 0x61 | `IRQHandler_Ack` | Acknowledge IRQ (re-enable delivery) |
+| 0x62 | `IRQHandler_SetNotification` | Bind notification to IRQ |
+| 0x63 | `IRQHandler_Clear` | Unbind notification from IRQ |
+
+#### IRQControl_Get (0x60)
+
+Register a hardware IRQ handler. The invoked capability is the IRQ handler object.
+
+```
+arg0 = irq_num       (hardware IRQ number, 0-255)
+arg1 = dest_cnode    (reserved)
+arg2 = dest_slot     (reserved)
+```
+
+Returns `AlreadyExists` if the IRQ already has a handler. Returns `OutOfRange` if irq_num >= 256.
+
+#### IRQHandler_Ack (0x61)
+
+Acknowledge an IRQ after handling it. Until acknowledged, the IRQ will not be delivered again (edge-triggered model).
+
+#### IRQHandler_SetNotification (0x62)
+
+Bind a notification to the IRQ handler. When the IRQ fires, the notification is signaled with `1 << (irq_num % 64)`.
+
+```
+arg0 = ntfn_cap_ptr  (capability pointer to Notification)
+```
+
+#### IRQHandler_Clear (0x63)
+
+Unbind the notification from the IRQ handler.
+
+---
 
 ## Error Codes
 
+SaltyOS uses positive error codes (returned in RAX).
+
 | Code | Name | Description |
 |------|------|-------------|
-| 0 | `OK` | Success |
-| -1 | `EINVAL` | Invalid argument |
-| -2 | `EPERM` | Permission denied |
-| -3 | `ENOENT` | Object not found |
-| -4 | `ENOMEM` | Out of memory |
-| -5 | `EBUSY` | Resource busy |
-| -6 | `EEXIST` | Already exists |
-| -7 | `EFAULT` | Bad address |
-| -8 | `ERANGE` | Value out of range |
-| -9 | `EWOULDBLOCK` | Operation would block |
-| -10 | `ECANCELED` | Operation cancelled |
-| -11 | `ERESTART` | Restart syscall |
-| -12 | `EDEADLK` | Deadlock detected |
+| 0 | `None` | Success |
+| 1 | `InvalidCapability` | Capability is null or invalid |
+| 2 | `InvalidOperation` | Wrong object type or unsupported operation |
+| 3 | `InsufficientRights` | Capability lacks required rights |
+| 4 | `InvalidArgument` | Bad argument value |
+| 5 | `OutOfMemory` | No memory available |
+| 6 | `NotFound` | Object not found (empty slot, unmapped page) |
+| 7 | `Busy` | Resource is busy (e.g., thread is Running) |
+| 8 | `AlreadyExists` | Resource already exists (mapped page, occupied slot) |
+| 9 | `WouldBlock` | Non-blocking operation has no work |
+| 10 | `BadAddress` | Invalid memory address |
+| 11 | `OutOfRange` | Value exceeds valid range |
+| 12 | `Cancelled` | Operation was cancelled |
+| 13 | `Restart` | Syscall should be restarted |
+| 14 | `Deadlock` | Deadlock detected |
 
 ## IPC Buffer Layout
 
@@ -497,13 +612,13 @@ uint64_t result = sys_call(
 for (;;) {
     uint64_t badge;
     uint64_t msg_info = sys_recv(endpoint, &badge, ...);
-    
+
     uint64_t op = mr0;
     uint64_t arg = mr1;
-    
+
     uint64_t result = handle_request(op, arg);
-    
-    sys_reply_recv(endpoint, 
+
+    sys_reply_recv(endpoint,
         MAKE_MSG_INFO(1, 0, 0),
         result, 0, 0, 0
     );

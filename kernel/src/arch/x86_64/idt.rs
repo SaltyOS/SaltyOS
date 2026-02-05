@@ -271,6 +271,21 @@ unsafe extern "C" {
     fn irq_stub_timer();
     fn irq_stub_ipi_vspace_teardown();
     fn irq_stub_ipi_reschedule();
+
+    // Generic IRQ stubs for external hardware interrupts
+    fn irq_stub_generic_33();
+    fn irq_stub_generic_34();
+    fn irq_stub_generic_35();
+    fn irq_stub_generic_36();
+    fn irq_stub_generic_37();
+    fn irq_stub_generic_38();
+    fn irq_stub_generic_39();
+    fn irq_stub_generic_42();
+    fn irq_stub_generic_43();
+    fn irq_stub_generic_44();
+    fn irq_stub_generic_45();
+    fn irq_stub_generic_46();
+    fn irq_stub_generic_47();
 }
 
 /// Set IST for double fault handler (vector 8).
@@ -483,6 +498,22 @@ pub fn init() {
         idt.entries[41].set_handler(irq_stub_ipi_reschedule as *const () as u64);
         serial_puts("[IDT] IPI handlers set (vectors 40-41)\n");
 
+        // Generic external IRQ handlers (vectors 33-39, 42-47)
+        idt.entries[33].set_handler(irq_stub_generic_33 as *const () as u64);
+        idt.entries[34].set_handler(irq_stub_generic_34 as *const () as u64);
+        idt.entries[35].set_handler(irq_stub_generic_35 as *const () as u64);
+        idt.entries[36].set_handler(irq_stub_generic_36 as *const () as u64);
+        idt.entries[37].set_handler(irq_stub_generic_37 as *const () as u64);
+        idt.entries[38].set_handler(irq_stub_generic_38 as *const () as u64);
+        idt.entries[39].set_handler(irq_stub_generic_39 as *const () as u64);
+        idt.entries[42].set_handler(irq_stub_generic_42 as *const () as u64);
+        idt.entries[43].set_handler(irq_stub_generic_43 as *const () as u64);
+        idt.entries[44].set_handler(irq_stub_generic_44 as *const () as u64);
+        idt.entries[45].set_handler(irq_stub_generic_45 as *const () as u64);
+        idt.entries[46].set_handler(irq_stub_generic_46 as *const () as u64);
+        idt.entries[47].set_handler(irq_stub_generic_47 as *const () as u64);
+        serial_puts("[IDT] External IRQ handlers set (vectors 33-47)\n");
+
         // Prepare IDT pointer
         serial_puts("[IDT] Preparing IDT pointer\n");
         let idt_ptr = IdtPtr {
@@ -563,5 +594,17 @@ extern "C" fn irq_handler_ipi_vspace_teardown() {
 #[unsafe(no_mangle)]
 extern "C" fn irq_handler_ipi_reschedule() {
     super::apic::handle_ipi(super::apic::IpiKind::Reschedule);
+    super::apic::eoi();
+}
+
+/// Generic IRQ handler for external hardware interrupts
+///
+/// Called from assembly stubs for vectors 33-47 (except 40-41 which are IPIs).
+/// Dispatches to the IRQ handler system and sends EOI.
+#[unsafe(no_mangle)]
+extern "C" fn irq_handler_generic(vector: u32) {
+    // Convert vector to IRQ number (vector = IRQ + 32)
+    let irq_num = vector.saturating_sub(32) as usize;
+    crate::ipc::irq::dispatch_irq(irq_num);
     super::apic::eoi();
 }

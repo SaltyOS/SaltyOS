@@ -11,6 +11,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 const ENTRY_PRESENT: u64 = 1 << 0;
 const ENTRY_WRITABLE: u64 = 1 << 1;
 const ENTRY_USER: u64 = 1 << 2;
+const ENTRY_WRITE_THROUGH: u64 = 1 << 3;
+const ENTRY_CACHE_DISABLE: u64 = 1 << 4;
 const ENTRY_NO_EXECUTE: u64 = 1 << 63;
 
 /// Physical address mask in page table entry
@@ -690,6 +692,8 @@ fn irqs_disabled() -> bool {
 /// Virtual address space (wraps page table root)
 #[repr(C)]
 pub struct VSpace {
+    /// Kernel object header (must be first for refcount access)
+    pub header: crate::cap::KernelObject,
     /// Physical address of PML4
     root: PhysAddr,
     /// VSpaceTracking is allocated from static pool for deferred free support
@@ -703,6 +707,10 @@ impl VSpace {
         let tracking = alloc_tracking(pml4_addr).expect("VSpace tracking pool exhausted");
 
         Self {
+            header: crate::cap::KernelObject::new(
+                crate::cap::ObjectType::VSpace,
+                0,
+            ),
             root: pml4_addr,
             tracking,
         }
@@ -927,6 +935,14 @@ impl VSpace {
             entry |= ENTRY_NO_EXECUTE;
         }
 
+        if flags.cache_disable {
+            entry |= ENTRY_CACHE_DISABLE;
+        }
+
+        if flags.write_through {
+            entry |= ENTRY_WRITE_THROUGH;
+        }
+
         entry
     }
 
@@ -963,6 +979,76 @@ impl VSpace {
         // Flush TLB for this page
         crate::arch::x86_64::paging::invlpg(virt);
 
+        Ok(())
+    }
+
+    /// Install a page table at a specific level
+    ///
+    /// Installs a pre-allocated page table frame into the page table hierarchy.
+    /// level: 1=PT, 2=PD, 3=PDPT
+    pub fn install_page_table(
+        &mut self,
+        vaddr: VirtAddr,
+        pt_phys: PhysAddr,
+        level: usize,
+    ) -> Result<(), VSpaceError> {
+        if level < 1 || level > 3 {
+            return Err(VSpaceError::Alignment);
+        }
+
+        // Check alignment of the page table frame
+        if pt_phys & (PAGE_SIZE as u64 - 1) != 0 {
+            return Err(VSpaceError::Alignment);
+        }
+
+        // Zero the new page table
+        unsafe {
+            let pt_virt = phys_to_virt(pt_phys) as *mut u8;
+            core::ptr::write_bytes(pt_virt, 0, PAGE_SIZE);
+        }
+
+        // Walk from PML4 down to the parent level
+        // We need to ensure tables exist down to level+1, then install at level
+        let parent_level = level + 1;
+
+        let user_flag = ENTRY_USER; // Page tables for user mappings
+        let table_flags = ENTRY_PRESENT | ENTRY_WRITABLE | user_flag;
+
+        let mut current_table: PhysAddr = self.root;
+        let mut cur = 4;
+
+        while cur > parent_level {
+            let table = unsafe { &mut *(phys_to_virt(current_table) as *mut PageTable) };
+            let idx = match cur {
+                4 => Self::pml4_index(vaddr),
+                3 => Self::pdpt_index(vaddr),
+                2 => Self::pd_index(vaddr),
+                _ => unreachable!(),
+            };
+
+            let entry = table.entry(idx);
+            if entry & ENTRY_PRESENT == 0 {
+                return Err(VSpaceError::NotMapped);
+            }
+            current_table = entry & ENTRY_ADDR_MASK;
+            cur -= 1;
+        }
+
+        // Now install at the parent level
+        let parent_table = unsafe { &mut *(phys_to_virt(current_table) as *mut PageTable) };
+        let idx = match parent_level {
+            4 => Self::pml4_index(vaddr),
+            3 => Self::pdpt_index(vaddr),
+            2 => Self::pd_index(vaddr),
+            _ => unreachable!(),
+        };
+
+        let existing = parent_table.entry(idx);
+        if existing & ENTRY_PRESENT != 0 {
+            return Err(VSpaceError::AlreadyMapped);
+        }
+
+        parent_table.set_entry(idx, pt_phys | table_flags);
         Ok(())
     }
 
@@ -1215,6 +1301,8 @@ pub struct PageFlags {
     pub writable: bool,
     pub user: bool,
     pub executable: bool,
+    pub cache_disable: bool,
+    pub write_through: bool,
 }
 
 impl PageFlags {
@@ -1222,36 +1310,48 @@ impl PageFlags {
         writable: false,
         user: false,
         executable: false,
+        cache_disable: false,
+        write_through: false,
     };
 
     pub const KERNEL_RW: Self = Self {
         writable: true,
         user: false,
         executable: false,
+        cache_disable: false,
+        write_through: false,
     };
 
     pub const KERNEL_RX: Self = Self {
         writable: false,
         user: false,
         executable: true,
+        cache_disable: false,
+        write_through: false,
     };
 
     pub const USER_RO: Self = Self {
         writable: false,
         user: true,
         executable: false,
+        cache_disable: false,
+        write_through: false,
     };
 
     pub const USER_RW: Self = Self {
         writable: true,
         user: true,
         executable: false,
+        cache_disable: false,
+        write_through: false,
     };
 
     pub const USER_RX: Self = Self {
         writable: false,
         user: true,
         executable: true,
+        cache_disable: false,
+        write_through: false,
     };
 }
 

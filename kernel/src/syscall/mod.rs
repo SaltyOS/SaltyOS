@@ -109,7 +109,15 @@ pub enum SyscallError {
     InsufficientRights = 3,
     InvalidArgument = 4,
     OutOfMemory = 5,
+    NotFound = 6,
+    Busy = 7,
+    AlreadyExists = 8,
     WouldBlock = 9,
+    BadAddress = 10,
+    OutOfRange = 11,
+    Cancelled = 12,
+    Restart = 13,
+    Deadlock = 14,
 }
 
 /// Look up capability from current thread's CSpace
@@ -134,7 +142,7 @@ fn lookup_capability(cap_ptr: u64) -> Result<&'static Capability, SyscallError> 
         }
 
         // Get thread's CSpace (CNode)
-        let cspace = &*(*current_tcb).cspace;
+        let cspace = &*(*current_tcb).cspace_root;
 
         // Look up capability in CSpace
         // CNode::get() returns Option<&Capability>
@@ -442,7 +450,7 @@ fn syscall_invoke(
     arg0: u64,
     arg1: u64,
     arg2: u64,
-    _arg3: u64, // Reserved for future use
+    arg3: u64,
 ) -> SyscallResult {
     let cap = match lookup_capability(cap_ptr) {
         Ok(c) => c,
@@ -451,21 +459,24 @@ fn syscall_invoke(
 
     match (cap.obj_type, label) {
         (ObjectType::CNode, 0x10) => {
-            // CNode_Copy
-            let dest_cnode = match lookup_capability(arg0) {
+            // CNode_Copy: cap_ptr = src CNode (invoked)
+            //   arg0 = src slot index
+            //   arg1 = dest CNode cap_ptr
+            //   arg2 = dest slot index
+            //   arg3 = rights mask
+            let dest_cnode_cap = match lookup_capability(arg1) {
                 Ok(c) => c,
                 Err(e) => return SyscallResult::err(e),
             };
-            let src_cnode = match lookup_capability(arg2) {
-                Ok(c) => c,
-                Err(e) => return SyscallResult::err(e),
-            };
-            let rights = CapRights::from_bits(arg1 as u32);
+            if let Err(e) = validate_capability(dest_cnode_cap, ObjectType::CNode, CapRights::WRITE) {
+                return SyscallResult::err(e);
+            }
+            let rights = CapRights::from_bits(arg3 as u32);
 
             unsafe {
-                let dest = &mut *(dest_cnode.object as *mut CNode);
-                let src = &*(src_cnode.object as *const CNode);
-                match dest.copy_slot(arg0 as usize, src, arg2 as usize, rights) {
+                let dest = &mut *(dest_cnode_cap.object as *mut CNode);
+                let src = &*(cap.object as *const CNode);
+                match dest.copy_slot(arg2 as usize, src, arg0 as usize, rights) {
                     Ok(()) => {}
                     Err(e) => return SyscallResult::err(syscall_error_from_cap_error(e)),
                 }
@@ -521,6 +532,30 @@ fn syscall_invoke(
             // TCB_SET_AFFINITY: arg0 = cpu_id
             syscall_tcb_set_affinity(cap, arg0)
         }
+        (ObjectType::Tcb, 0x45) => {
+            // TCB_READ_REGISTERS: arg0 = flags
+            syscall_tcb_read_registers(cap, arg0)
+        }
+        (ObjectType::Tcb, 0x46) => {
+            // TCB_WRITE_REGISTERS: arg0 = flags, arg1 = rip, arg2 = rsp
+            syscall_tcb_write_registers(cap, arg0, arg1, arg2)
+        }
+        (ObjectType::Tcb, 0x47) => {
+            // TCB_SET_PRIORITY: arg0 = priority
+            syscall_tcb_set_priority(cap, arg0)
+        }
+        (ObjectType::Tcb, 0x48) => {
+            // TCB_SET_IPC_BUFFER: arg0 = addr
+            syscall_tcb_set_ipc_buffer(cap, arg0)
+        }
+        (ObjectType::Tcb, 0x49) => {
+            // TCB_BIND_NOTIFICATION: arg0 = ntfn_cap_ptr
+            syscall_tcb_bind_notification(cap, arg0)
+        }
+        (ObjectType::Tcb, 0x4A) => {
+            // TCB_UNBIND_NOTIFICATION
+            syscall_tcb_unbind_notification(cap)
+        }
 
         // VSpace operations
         (ObjectType::VSpace, 0x50) => {
@@ -530,6 +565,10 @@ fn syscall_invoke(
         (ObjectType::VSpace, 0x51) => {
             // VSPACE_UNMAP: arg0 = virt_addr
             syscall_vspace_unmap(cap, arg0)
+        }
+        (ObjectType::VSpace, 0x52) => {
+            // VSPACE_MAP_PT: arg0 = frame_cap_ptr, arg1 = virt_addr, arg2 = level
+            syscall_vspace_map_pt(cap, arg0, arg1, arg2)
         }
 
         // SchedContext operations
@@ -548,6 +587,28 @@ fn syscall_invoke(
         (ObjectType::SchedContext, 0x33) => {
             // SC_YIELD_TO: arg0 = target_sc_cap_ptr
             syscall_sc_yield_to(cap, arg0)
+        }
+        (ObjectType::SchedContext, 0x34) => {
+            // SC_CONSUMED: Query consumed time
+            syscall_sc_consumed(cap)
+        }
+
+        // IRQ operations
+        (ObjectType::IrqHandler, 0x60) => {
+            // IRQ_CONTROL_GET: arg0 = irq_num, arg1 = dest_cnode_cap, arg2 = dest_slot
+            syscall_irq_control_get(cap, arg0, arg1, arg2)
+        }
+        (ObjectType::IrqHandler, 0x61) => {
+            // IRQ_HANDLER_ACK
+            syscall_irq_handler_ack(cap)
+        }
+        (ObjectType::IrqHandler, 0x62) => {
+            // IRQ_HANDLER_SET_NOTIFICATION: arg0 = ntfn_cap_ptr
+            syscall_irq_handler_set_notification(cap, arg0)
+        }
+        (ObjectType::IrqHandler, 0x63) => {
+            // IRQ_HANDLER_CLEAR
+            syscall_irq_handler_clear(cap)
         }
 
         _ => SyscallResult::err(SyscallError::InvalidOperation),
@@ -637,10 +698,11 @@ fn syscall_sc_bind(cap: &Capability, tcb_cap_ptr: u64) -> SyscallResult {
         tcb.sched_context = sc as *mut SchedContext;
         tcb.priority = sc.deadline;
 
-        // If TCB is Ready, re-enqueue with updated priority
+        // If TCB is Ready, remove and re-enqueue with updated priority
         if tcb.state == ThreadState::Ready {
-            // Remove and re-insert to maintain deadline ordering
-            crate::sched::scheduler::scheduler().enqueue(tcb as *mut Tcb);
+            let scheduler = crate::sched::scheduler::scheduler();
+            scheduler.remove_from_ready_queue(tcb as *mut Tcb);
+            scheduler.enqueue(tcb as *mut Tcb);
         }
     }
 
@@ -755,11 +817,33 @@ fn syscall_tcb_resume(cap: &Capability) -> SyscallResult {
             ThreadState::Running | ThreadState::Ready => {
                 // Already runnable, no-op
             }
-            ThreadState::Inactive | ThreadState::Blocked => {
+            ThreadState::Inactive => {
+                let scheduler = crate::sched::scheduler::scheduler();
+                scheduler.enqueue(tcb as *mut Tcb);
+            }
+            ThreadState::Blocked => {
+                // Remove from IPC wait queue before making runnable
+                if !tcb.blocked_endpoint.is_null() {
+                    let ep = &mut *(tcb.blocked_endpoint as *mut crate::ipc::Endpoint);
+                    ep.remove_from_queue(tcb as *mut Tcb);
+                    tcb.blocked_endpoint = core::ptr::null_mut();
+                }
+                if !tcb.blocked_notification.is_null() {
+                    let ntfn = &mut *(tcb.blocked_notification as *mut crate::ipc::Notification);
+                    ntfn.remove_waiter(tcb as *mut Tcb);
+                    tcb.blocked_notification = core::ptr::null_mut();
+                }
+                tcb.blocked_reason = None;
                 let scheduler = crate::sched::scheduler::scheduler();
                 scheduler.enqueue(tcb as *mut Tcb);
             }
             ThreadState::Waiting => {
+                // Remove from notification wait queue before making runnable
+                if !tcb.blocked_notification.is_null() {
+                    let ntfn = &mut *(tcb.blocked_notification as *mut crate::ipc::Notification);
+                    ntfn.remove_waiter(tcb as *mut Tcb);
+                    tcb.blocked_notification = core::ptr::null_mut();
+                }
                 let scheduler = crate::sched::scheduler::scheduler();
                 scheduler.enqueue(tcb as *mut Tcb);
             }
@@ -789,10 +873,27 @@ fn syscall_tcb_suspend(cap: &Capability) -> SyscallResult {
                 tcb.state = ThreadState::Inactive;
             }
             ThreadState::Blocked => {
+                // Remove from IPC wait queue before marking inactive
+                if !tcb.blocked_endpoint.is_null() {
+                    let ep = &mut *(tcb.blocked_endpoint as *mut crate::ipc::Endpoint);
+                    ep.remove_from_queue(tcb as *mut Tcb);
+                    tcb.blocked_endpoint = core::ptr::null_mut();
+                }
+                if !tcb.blocked_notification.is_null() {
+                    let ntfn = &mut *(tcb.blocked_notification as *mut crate::ipc::Notification);
+                    ntfn.remove_waiter(tcb as *mut Tcb);
+                    tcb.blocked_notification = core::ptr::null_mut();
+                }
                 tcb.state = ThreadState::Inactive;
                 tcb.blocked_reason = None;
             }
             ThreadState::Waiting => {
+                // Remove from notification wait queue before marking inactive
+                if !tcb.blocked_notification.is_null() {
+                    let ntfn = &mut *(tcb.blocked_notification as *mut crate::ipc::Notification);
+                    ntfn.remove_waiter(tcb as *mut Tcb);
+                    tcb.blocked_notification = core::ptr::null_mut();
+                }
                 tcb.state = ThreadState::Inactive;
             }
             ThreadState::Inactive => {
@@ -838,8 +939,8 @@ fn syscall_tcb_set_space(
 
     unsafe {
         let tcb = &mut *(cap.object as *mut Tcb);
-        tcb.cspace = cspace_cap.object as *mut CNode;
-        tcb.vspace = vspace_cap.object as *mut VSpace;
+        tcb.cspace_root = cspace_cap.object as *mut CNode;
+        tcb.vspace_root = vspace_cap.object as *mut VSpace;
     }
 
     SyscallResult::ok(0)
@@ -865,6 +966,159 @@ fn syscall_tcb_set_affinity(cap: &Capability, cpu_id: u64) -> SyscallResult {
     }
 
     SyscallResult::ok(0)
+}
+
+/// TCB_READ_REGISTERS: Read a thread's saved registers
+///
+/// Args:
+/// - flags: Reserved for future use (must be 0)
+///
+/// Returns: RIP of the target thread in value
+fn syscall_tcb_read_registers(cap: &Capability, _flags: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let tcb = &*(cap.object as *const Tcb);
+        if tcb.state == ThreadState::Running {
+            return SyscallResult::err(SyscallError::Busy);
+        }
+        SyscallResult::ok(tcb.context.rip)
+    }
+}
+
+/// TCB_WRITE_REGISTERS: Write a thread's saved registers
+///
+/// Args:
+/// - flags: bit 0 = resume after write
+/// - rip: New instruction pointer
+/// - rsp: New stack pointer
+fn syscall_tcb_write_registers(
+    cap: &Capability,
+    flags: u64,
+    rip: u64,
+    rsp: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let tcb = &mut *(cap.object as *mut Tcb);
+        if tcb.state == ThreadState::Running {
+            return SyscallResult::err(SyscallError::Busy);
+        }
+
+        tcb.context.rip = rip;
+        tcb.context.rsp = rsp;
+
+        // bit 0 = resume
+        if flags & 1 != 0 && tcb.state == ThreadState::Inactive {
+            let scheduler = crate::sched::scheduler::scheduler();
+            scheduler.enqueue(tcb as *mut Tcb);
+        }
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// TCB_SET_PRIORITY: Set thread priority (EDF deadline)
+///
+/// Args:
+/// - priority: New priority value (deadline for EDF)
+fn syscall_tcb_set_priority(cap: &Capability, priority: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::CONFIGURE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let tcb = &mut *(cap.object as *mut Tcb);
+        tcb.priority = priority;
+
+        // If thread is Ready, remove and re-enqueue with new priority
+        if tcb.state == ThreadState::Ready {
+            let scheduler = crate::sched::scheduler::scheduler();
+            scheduler.remove_from_ready_queue(tcb as *mut Tcb);
+            scheduler.enqueue(tcb as *mut Tcb);
+        }
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// TCB_SET_IPC_BUFFER: Change IPC buffer address
+///
+/// Args:
+/// - addr: New IPC buffer virtual address
+fn syscall_tcb_set_ipc_buffer(cap: &Capability, addr: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::CONFIGURE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let tcb = &mut *(cap.object as *mut Tcb);
+        tcb.ipc_buffer = addr;
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// TCB_BIND_NOTIFICATION: Bind a notification to this thread
+///
+/// Args:
+/// - ntfn_cap_ptr: Capability pointer to a Notification
+fn syscall_tcb_bind_notification(cap: &Capability, ntfn_cap_ptr: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::CONFIGURE) {
+        return SyscallResult::err(e);
+    }
+
+    let ntfn_cap = match lookup_capability(ntfn_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(ntfn_cap, ObjectType::Notification, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let tcb = &mut *(cap.object as *mut Tcb);
+        if !tcb.bound_notification.is_null() {
+            return SyscallResult::err(SyscallError::Busy);
+        }
+        tcb.bound_notification = ntfn_cap.object as *mut u8;
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// TCB_UNBIND_NOTIFICATION: Unbind notification from this thread
+fn syscall_tcb_unbind_notification(cap: &Capability) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::CONFIGURE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let tcb = &mut *(cap.object as *mut Tcb);
+        if tcb.bound_notification.is_null() {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+        tcb.bound_notification = core::ptr::null_mut();
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// SC_CONSUMED: Query consumed time from scheduling context
+fn syscall_sc_consumed(cap: &Capability) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::SchedContext, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let sc = &*(cap.object as *const SchedContext);
+        SyscallResult::ok(sc.consumed)
+    }
 }
 
 /// UNTYPED_RETYPE: Create typed kernel objects from untyped memory
@@ -905,7 +1159,7 @@ fn syscall_untyped_retype(
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
 
-        let cspace = &mut *(*current_tcb).cspace;
+        let cspace = &mut *(*current_tcb).cspace_root;
 
         // Get the untyped's CapSlot for CDT tracking
         let cap_ref = match cspace.get_ref(cap_ptr as usize) {
@@ -962,6 +1216,8 @@ fn syscall_vspace_map(
             writable: flags_bits & 1 != 0,
             user: flags_bits & 2 != 0,
             executable: flags_bits & 4 != 0,
+            cache_disable: flags_bits & 8 != 0,
+            write_through: flags_bits & 16 != 0,
         };
 
         match vspace.map(virt_addr, frame.phys_addr, flags) {
@@ -989,12 +1245,140 @@ fn syscall_vspace_unmap(cap: &Capability, virt_addr: u64) -> SyscallResult {
     }
 }
 
+/// IRQ_CONTROL_GET: Acquire an IRQ handler capability
+///
+/// Args:
+/// - irq_num: Hardware IRQ number
+/// - dest_cnode_cap: Capability pointer to destination CNode
+/// - dest_slot: Slot index in destination CNode
+fn syscall_irq_control_get(
+    cap: &Capability,
+    irq_num: u64,
+    _dest_cnode_cap: u64,
+    _dest_slot: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::IrqHandler, CapRights::CONFIGURE) {
+        return SyscallResult::err(e);
+    }
+
+    if irq_num as usize >= crate::ipc::irq::MAX_IRQS {
+        return SyscallResult::err(SyscallError::OutOfRange);
+    }
+
+    unsafe {
+        let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
+        irq_handler.irq_num = irq_num as u32;
+
+        if !crate::ipc::irq::register_handler(irq_num as usize, irq_handler as *mut _) {
+            return SyscallResult::err(SyscallError::AlreadyExists);
+        }
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// IRQ_HANDLER_ACK: Acknowledge an IRQ (re-enable delivery)
+fn syscall_irq_handler_ack(cap: &Capability) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::IrqHandler, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
+        irq_handler.acknowledged = true;
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// IRQ_HANDLER_SET_NOTIFICATION: Bind a notification to an IRQ handler
+///
+/// Args:
+/// - ntfn_cap_ptr: Capability pointer to a Notification
+fn syscall_irq_handler_set_notification(
+    cap: &Capability,
+    ntfn_cap_ptr: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::IrqHandler, CapRights::CONFIGURE) {
+        return SyscallResult::err(e);
+    }
+
+    let ntfn_cap = match lookup_capability(ntfn_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(ntfn_cap, ObjectType::Notification, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
+        irq_handler.notification = ntfn_cap.object as *mut Notification;
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// IRQ_HANDLER_CLEAR: Unbind notification from IRQ handler
+fn syscall_irq_handler_clear(cap: &Capability) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::IrqHandler, CapRights::CONFIGURE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
+        irq_handler.notification = core::ptr::null_mut();
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// VSPACE_MAP_PT: Install a page table at a specific level
+///
+/// Args:
+/// - frame_cap_ptr: Capability pointer to the page table frame
+/// - virt_addr: Virtual address whose table hierarchy to install into
+/// - level: Page table level (1=PT, 2=PD, 3=PDPT)
+fn syscall_vspace_map_pt(
+    cap: &Capability,
+    frame_cap_ptr: u64,
+    virt_addr: u64,
+    level: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::MAP) {
+        return SyscallResult::err(e);
+    }
+
+    if level < 1 || level > 3 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    // Look up and validate frame capability
+    let frame_cap = match lookup_capability(frame_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(frame_cap, ObjectType::Frame, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let frame = &*(frame_cap.object as *const FrameObject);
+        let vspace = &mut *(cap.object as *mut VSpace);
+
+        match vspace.install_page_table(virt_addr, frame.phys_addr, level as usize) {
+            Ok(()) => SyscallResult::ok(0),
+            Err(e) => SyscallResult::err(syscall_error_from_vspace_error(e)),
+        }
+    }
+}
+
 /// Convert VSpaceError to syscall error
 fn syscall_error_from_vspace_error(err: VSpaceError) -> SyscallError {
     match err {
         VSpaceError::Alignment => SyscallError::InvalidArgument,
-        VSpaceError::AlreadyMapped => SyscallError::InvalidArgument,
-        VSpaceError::NotMapped => SyscallError::InvalidArgument,
+        VSpaceError::AlreadyMapped => SyscallError::AlreadyExists,
+        VSpaceError::NotMapped => SyscallError::NotFound,
         VSpaceError::OutOfMemory => SyscallError::OutOfMemory,
     }
 }
@@ -1002,16 +1386,26 @@ fn syscall_error_from_vspace_error(err: VSpaceError) -> SyscallError {
 /// Convert CNode error to syscall error
 fn syscall_error_from_cap_error(err: CapError) -> SyscallError {
     match err {
-        CapError::InvalidSlot | CapError::SlotEmpty => SyscallError::InvalidArgument,
+        CapError::InvalidSlot => SyscallError::InvalidArgument,
+        CapError::SlotEmpty => SyscallError::NotFound,
         CapError::InsufficientRights => SyscallError::InsufficientRights,
         CapError::InsufficientMemory | CapError::OutOfSlots => SyscallError::OutOfMemory,
-        CapError::SlotOccupied => SyscallError::InvalidArgument,
+        CapError::SlotOccupied => SyscallError::AlreadyExists,
         CapError::HasChildren => SyscallError::InvalidOperation,
         _ => SyscallError::InvalidOperation,
     }
 }
 
 /// Handle system call logic
+///
+/// Register mapping from assembly (after ABI translation):
+///   syscall = RAX (syscall number)
+///   cap_ptr = RDI (arg0 / capability pointer)
+///   msg_info = RSI (arg1 / message info or label)
+///   mr0 = RDX (arg2)
+///   mr1 = RCX (arg3, from user R10)
+///   mr2 = R8 (arg4, from user R8)
+///   mr3 = R9 (arg5, from user R9 — currently unused by userspace)
 pub fn handle(
     syscall: u64,
     cap_ptr: u64,
@@ -1019,6 +1413,7 @@ pub fn handle(
     mr0: u64,
     mr1: u64,
     mr2: u64,
+    mr3: u64,
 ) -> SyscallResult {
     let syscall_num = match Syscall::try_from(syscall) {
         Ok(s) => s,
@@ -1026,10 +1421,10 @@ pub fn handle(
     };
 
     match syscall_num {
-        Syscall::Send => syscall_send(cap_ptr, msg_info, mr0, mr1, mr2, 0),
+        Syscall::Send => syscall_send(cap_ptr, msg_info, mr0, mr1, mr2, mr3),
         Syscall::Recv => syscall_recv(cap_ptr),
-        Syscall::Call => syscall_call(cap_ptr, msg_info, mr0, mr1, mr2, 0),
-        Syscall::ReplyRecv => syscall_reply_recv(cap_ptr, msg_info, mr0, mr1, mr2, 0),
+        Syscall::Call => syscall_call(cap_ptr, msg_info, mr0, mr1, mr2, mr3),
+        Syscall::ReplyRecv => syscall_reply_recv(cap_ptr, msg_info, mr0, mr1, mr2, mr3),
         Syscall::NBSend => syscall_nbsend(cap_ptr, msg_info, mr0, mr1, mr2),
         Syscall::Signal => syscall_signal(cap_ptr, mr0),
         Syscall::Wait => syscall_wait(cap_ptr),
@@ -1039,26 +1434,32 @@ pub fn handle(
             crate::sched::yield_now();
             SyscallResult::ok(0)
         }
-        Syscall::Invoke => syscall_invoke(cap_ptr, msg_info, mr0, mr1, mr2, 0),
+        Syscall::Invoke => syscall_invoke(cap_ptr, msg_info, mr0, mr1, mr2, mr3),
     }
 }
 
 /// Syscall handler wrapper called from assembly
 ///
 /// # ABI Note
-/// Returns struct { u64, u64 }.
-/// - Rust/C ABI places the first u64 in **RAX**.
-/// - Rust/C ABI places the second u64 in **RDX**.
+/// System V AMD64 calling convention:
+/// - Arguments: RDI, RSI, RDX, RCX, R8, R9
+/// - Returns struct { u64, u64 } in RAX:RDX
 ///
-/// The assembly entry point MUST read the value from RDX, not RBX.
+/// Assembly maps user registers → System V before calling:
+///   RDI = syscall number (user RAX)
+///   RSI = cap_ptr (user RDI)
+///   RDX = arg0 (user RSI)
+///   RCX = arg1 (user RDX / arg2 in user convention)
+///   R8  = arg2 (user R10 / arg3 in user convention)
+///   R9  = arg3 (user R8 / arg4 in user convention)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn syscall_handle_rust(
-    syscall: u64, // RDI
-    cap_ptr: u64, // RSI
-    arg0: u64,    // RDX
-    arg1: u64,    // RCX
-    arg2: u64,    // R8
-    arg3: u64,    // R9
+    syscall: u64, // RDI (user RAX)
+    cap_ptr: u64, // RSI (user RDI)
+    arg0: u64,    // RDX (user RSI)
+    arg1: u64,    // RCX (user RDX)
+    arg2: u64,    // R8  (user R10)
+    arg3: u64,    // R9  (user R8)
 ) -> SyscallResult {
-    handle(syscall, cap_ptr, arg0, arg1, arg2, arg3)
+    handle(syscall, cap_ptr, arg0, arg1, arg2, arg3, 0)
 }

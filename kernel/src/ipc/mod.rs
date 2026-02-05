@@ -5,10 +5,12 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 mod endpoint;
+pub mod irq;
 mod notification;
 mod queue;
 
 pub use endpoint::{Endpoint, EndpointState};
+pub use irq::IrqHandler;
 pub use notification::Notification;
 pub use queue::WaitQueue;
 

@@ -226,6 +226,9 @@ impl Scheduler {
                 return;
             }
 
+            // Track consumed time
+            (*sched_ctx).consumed += 1;
+
             // Decrement remaining budget
             (*sched_ctx).remaining = (*sched_ctx).remaining.saturating_sub(1);
 
@@ -245,11 +248,9 @@ impl Scheduler {
     /// Handle budget exhaustion for a thread
     ///
     /// When a thread's budget is exhausted:
-    /// 1. Mark it as blocked
-    /// 2. Calculate next deadline (current + period)
-    /// 3. Replenish budget
-    /// 4. Re-enqueue the thread
-    /// 5. Trigger reschedule
+    /// - Periodic (period > 0): advance deadline by period, replenish, re-enqueue
+    /// - Sporadic (period == 0): set deadline to u64::MAX (lowest EDF priority),
+    ///   replenish, re-enqueue
     fn handle_budget_exhausted(&mut self, tcb: *mut Tcb) {
         unsafe {
             let sched_ctx = (*tcb).sched_context;
@@ -257,11 +258,13 @@ impl Scheduler {
                 return;
             }
 
-            // Block the thread
-            (*tcb).state = ThreadState::Blocked;
-
-            // Calculate next deadline (current + period)
-            (*sched_ctx).deadline += (*sched_ctx).period;
+            if (*sched_ctx).period > 0 {
+                // Periodic: advance deadline by period
+                (*sched_ctx).deadline += (*sched_ctx).period;
+            } else {
+                // Sporadic: move to lowest EDF priority
+                (*sched_ctx).deadline = u64::MAX;
+            }
 
             // Update priority (deadline) in TCB
             (*tcb).priority = (*sched_ctx).deadline;
@@ -269,7 +272,7 @@ impl Scheduler {
             // Replenish budget
             (*sched_ctx).remaining = (*sched_ctx).budget;
 
-            // Re-enqueue thread
+            // Re-enqueue thread (enqueue sets state = Ready)
             self.enqueue(tcb);
 
             // Trigger reschedule

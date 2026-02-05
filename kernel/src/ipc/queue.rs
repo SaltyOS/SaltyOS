@@ -66,4 +66,43 @@ impl WaitQueue {
             Some(self.head)
         }
     }
+
+    /// Remove a specific thread from anywhere in the queue
+    ///
+    /// Returns true if the thread was found and removed.
+    pub fn remove(&mut self, tcb: *mut Tcb) -> bool {
+        if self.head.is_null() {
+            return false;
+        }
+
+        unsafe {
+            // Check if head
+            if self.head == tcb {
+                self.head = (*tcb).next;
+                if self.head.is_null() {
+                    self.tail = core::ptr::null_mut();
+                }
+                (*tcb).next = core::ptr::null_mut();
+                return true;
+            }
+
+            // Walk the queue
+            let mut prev = self.head;
+            let mut current = (*prev).next;
+            while !current.is_null() {
+                if current == tcb {
+                    (*prev).next = (*current).next;
+                    if self.tail == tcb {
+                        self.tail = prev;
+                    }
+                    (*tcb).next = core::ptr::null_mut();
+                    return true;
+                }
+                prev = current;
+                current = (*current).next;
+            }
+        }
+
+        false
+    }
 }

@@ -208,3 +208,67 @@ irq_stub_\name:
 irq_stub timer
 irq_stub ipi_vspace_teardown
 irq_stub ipi_reschedule
+
+// ---------------------------------------------------------------------------
+// Generic IRQ stubs for external hardware interrupts (vectors 33-47)
+// Each calls irq_handler_generic with the vector number in RDI
+// ---------------------------------------------------------------------------
+
+.macro irq_stub_generic vector
+.global irq_stub_generic_\vector
+.type irq_stub_generic_\vector, @function
+irq_stub_generic_\vector:
+    // Check if from user mode
+    testb $3, 8(%rsp)
+    jz 1f
+    swapgs
+1:
+    // Save caller-saved registers
+    push %rax
+    push %rcx
+    push %rdx
+    push %rsi
+    push %rdi
+    push %r8
+    push %r9
+    push %r10
+    push %r11
+
+    // Pass vector number as argument
+    mov $\vector, %edi
+    call irq_handler_generic
+
+    // Restore caller-saved registers
+    pop %r11
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rdi
+    pop %rsi
+    pop %rdx
+    pop %rcx
+    pop %rax
+
+    // Check if returning to user mode
+    testb $3, 8(%rsp)
+    jz 2f
+    swapgs
+2:
+    iretq
+.size irq_stub_generic_\vector, . - irq_stub_generic_\vector
+.endm
+
+// Generate stubs for vectors 33-39, 42-47 (skip 40-41 = IPI handlers)
+irq_stub_generic 33
+irq_stub_generic 34
+irq_stub_generic 35
+irq_stub_generic 36
+irq_stub_generic 37
+irq_stub_generic 38
+irq_stub_generic 39
+irq_stub_generic 42
+irq_stub_generic 43
+irq_stub_generic 44
+irq_stub_generic 45
+irq_stub_generic 46
+irq_stub_generic 47

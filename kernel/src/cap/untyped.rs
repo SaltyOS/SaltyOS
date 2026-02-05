@@ -16,6 +16,9 @@ use crate::mm::{self, PhysAddr, PAGE_SIZE};
 /// retyped into kernel objects.
 #[repr(C)]
 pub struct UntypedMemory {
+    /// Kernel object header (must be first for refcount access)
+    pub header: super::object::KernelObject,
+
     /// Physical address of the region
     pub phys_addr: PhysAddr,
 
@@ -27,19 +30,16 @@ pub struct UntypedMemory {
 
     /// Whether this is device memory (non-cacheable)
     pub is_device: bool,
-
-    /// Reference count (inherited from KernelObject, but we track here too)
-    pub ref_count: core::sync::atomic::AtomicU32,
 }
 
 impl UntypedMemory {
     pub const fn new(phys_addr: PhysAddr, size_bits: u8, is_device: bool) -> Self {
         Self {
+            header: super::object::KernelObject::new(ObjectType::Untyped, size_bits),
             phys_addr,
             size_bits,
             watermark: 0,
             is_device,
-            ref_count: core::sync::atomic::AtomicU32::new(1),
         }
     }
 
@@ -63,17 +63,18 @@ impl UntypedMemory {
 /// Single frame object (for Frame capabilities)
 #[repr(C)]
 pub struct FrameObject {
+    /// Kernel object header (must be first for refcount access)
+    pub header: super::object::KernelObject,
     pub phys_addr: PhysAddr,
     pub size_bits: u8,
-    pub ref_count: core::sync::atomic::AtomicU32,
 }
 
 impl FrameObject {
     pub const fn new(phys_addr: PhysAddr, size_bits: u8) -> Self {
         Self {
+            header: super::object::KernelObject::new(ObjectType::Frame, size_bits),
             phys_addr,
             size_bits,
-            ref_count: core::sync::atomic::AtomicU32::new(1),
         }
     }
 
@@ -92,25 +93,24 @@ impl UntypedTracker {
     /// Add child to untyped's child list
     ///
     /// Called when an object is created via retype().
-    /// Uses ut_next links in slot metadata to build a linked list.
+    /// Uses ut_first_child/ut_next links in slot metadata to build a linked list.
+    /// This is separate from the CDT child list (cdt_first_child).
     pub fn add_child(untyped_slot: CapSlot, child_slot: CapSlot) {
         unsafe {
             let slots_ptr = core::ptr::addr_of_mut!(crate::cap::slot::SLOTS[0]);
 
-            // Get untyped metadata
             let untyped_storage = &mut *slots_ptr.add(untyped_slot as usize);
             let child_storage = &mut *slots_ptr.add(child_slot as usize);
 
-            // Store child list head in cdt_first_child temporarily
-            // (this is the untyped's child list, not CDT children)
-            let old_first = untyped_storage.meta.cdt_first_child;
+            // Read current head of untyped's child list
+            let old_first = untyped_storage.meta.ut_first_child;
 
             // Insert child at head of list
             child_storage.meta.ut_next = old_first;
             child_storage.meta.ut_parent = untyped_slot;
 
             // Update untyped's first child pointer
-            untyped_storage.meta.cdt_first_child = child_slot;
+            untyped_storage.meta.ut_first_child = child_slot;
         }
     }
 
@@ -124,7 +124,7 @@ impl UntypedTracker {
             let untyped_storage = &mut *slots_ptr.add(untyped_slot as usize);
 
             let mut prev = INVALID_SLOT;
-            let mut current = untyped_storage.meta.cdt_first_child;
+            let mut current = untyped_storage.meta.ut_first_child;
 
             while current != INVALID_SLOT {
                 let curr_storage = &*slots_ptr.add(current as usize);
@@ -135,7 +135,7 @@ impl UntypedTracker {
 
                     if prev == INVALID_SLOT {
                         // Was first child
-                        untyped_storage.meta.cdt_first_child = next;
+                        untyped_storage.meta.ut_first_child = next;
                     } else {
                         // Update prev's ut_next
                         let prev_storage = &mut *slots_ptr.add(prev as usize);
@@ -162,7 +162,7 @@ impl UntypedTracker {
         unsafe {
             let slots_ptr = core::ptr::addr_of!(crate::cap::slot::SLOTS[0]);
             let storage = &*slots_ptr.add(untyped_slot as usize);
-            storage.meta.cdt_first_child != INVALID_SLOT
+            storage.meta.ut_first_child != INVALID_SLOT
         }
     }
 
@@ -196,7 +196,7 @@ fn object_size(obj_type: ObjectType, size_bits: u8) -> usize {
         ObjectType::VSpace => PAGE_SIZE, // Page table
         ObjectType::Frame => 1usize << size_bits,
         ObjectType::Untyped => 1usize << size_bits,
-        ObjectType::IrqHandler => core::mem::size_of::<()>(), // Placeholder
+        ObjectType::IrqHandler => core::mem::size_of::<crate::ipc::IrqHandler>(),
         ObjectType::IoPort => core::mem::size_of::<()>(),     // Placeholder
         ObjectType::SchedContext => core::mem::size_of::<crate::sched::thread::SchedContext>(),
         ObjectType::Null => 0,
@@ -252,8 +252,21 @@ unsafe fn init_object(
             }
 
             ObjectType::VSpace => {
-                // VSpace initialization is complex, handled separately
-                Ok(virt_addr as *mut KernelObject)
+                let vs = virt_addr as *mut crate::mm::VSpace;
+                vs.write(crate::mm::VSpace::new(phys_addr));
+                Ok(vs as *mut KernelObject)
+            }
+
+            ObjectType::SchedContext => {
+                let sc = virt_addr as *mut crate::sched::thread::SchedContext;
+                sc.write(crate::sched::thread::SchedContext::new());
+                Ok(sc as *mut KernelObject)
+            }
+
+            ObjectType::IrqHandler => {
+                let irq = virt_addr as *mut crate::ipc::IrqHandler;
+                irq.write(crate::ipc::IrqHandler::new(0));
+                Ok(irq as *mut KernelObject)
             }
 
             _ => Err(CapError::InvalidOperation),

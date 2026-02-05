@@ -67,8 +67,8 @@ pub fn init() {
         BOOTSTRAP_TCB.state = crate::sched::thread::ThreadState::Running;
         BOOTSTRAP_TCB.priority = 0; // Higher priority than idle
         BOOTSTRAP_TCB.sched_context = core::ptr::null_mut();
-        BOOTSTRAP_TCB.vspace = core::ptr::null_mut();
-        BOOTSTRAP_TCB.cspace = core::ptr::null_mut();
+        BOOTSTRAP_TCB.vspace_root = core::ptr::null_mut();
+        BOOTSTRAP_TCB.cspace_root = core::ptr::null_mut();
         BOOTSTRAP_TCB.ipc_buffer = 0;
         BOOTSTRAP_TCB.next = core::ptr::null_mut();
         BOOTSTRAP_TCB.cpu_affinity = 0; // Pin bootstrap thread to BSP
@@ -86,8 +86,8 @@ pub fn init() {
         (*idle_tcb).state = crate::sched::thread::ThreadState::Ready;
         (*idle_tcb).priority = u64::MAX; // Lowest priority (infinite deadline)
         (*idle_tcb).sched_context = core::ptr::null_mut(); // No scheduling context
-        (*idle_tcb).vspace = core::ptr::null_mut();
-        (*idle_tcb).cspace = core::ptr::null_mut();
+        (*idle_tcb).vspace_root = core::ptr::null_mut();
+        (*idle_tcb).cspace_root = core::ptr::null_mut();
         (*idle_tcb).ipc_buffer = 0;
         (*idle_tcb).next = core::ptr::null_mut();
         (*idle_tcb).cpu_affinity = 0; // Pin idle thread to BSP
@@ -123,8 +123,8 @@ pub fn init_cpu(cpu_id: usize) {
         (*idle_tcb).state = crate::sched::thread::ThreadState::Ready;
         (*idle_tcb).priority = u64::MAX;
         (*idle_tcb).sched_context = core::ptr::null_mut();
-        (*idle_tcb).vspace = core::ptr::null_mut();
-        (*idle_tcb).cspace = core::ptr::null_mut();
+        (*idle_tcb).vspace_root = core::ptr::null_mut();
+        (*idle_tcb).cspace_root = core::ptr::null_mut();
         (*idle_tcb).ipc_buffer = 0;
         (*idle_tcb).next = core::ptr::null_mut();
         (*idle_tcb).cpu_affinity = cpu_id as u32;
