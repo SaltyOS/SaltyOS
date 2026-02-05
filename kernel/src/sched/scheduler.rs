@@ -127,6 +127,31 @@ impl Scheduler {
         }
     }
 
+    /// Remove a specific thread from the ready queue
+    ///
+    /// Walks the queue and removes the TCB if found.
+    /// Returns true if the thread was found and removed.
+    pub fn remove_from_ready_queue(&mut self, tcb: *mut Tcb) -> bool {
+        unsafe {
+            let mut prev: *mut Tcb = core::ptr::null_mut();
+            let mut current = self.ready_head;
+            while !current.is_null() {
+                if current == tcb {
+                    if prev.is_null() {
+                        self.ready_head = (*current).next;
+                    } else {
+                        (*prev).next = (*current).next;
+                    }
+                    (*current).next = core::ptr::null_mut();
+                    return true;
+                }
+                prev = current;
+                current = (*current).next;
+            }
+            false
+        }
+    }
+
     /// Pick next thread to run on the current CPU
     pub fn schedule(&mut self) -> *mut Tcb {
         let cpu_id = crate::arch::current_cpu() as usize;
