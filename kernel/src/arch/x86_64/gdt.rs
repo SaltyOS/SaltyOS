@@ -192,6 +192,28 @@ pub fn get_tss_rsp0() -> u64 {
     unsafe { TSS.rsp0 }
 }
 
+/// Set an IST (Interrupt Stack Table) entry in the TSS
+///
+/// IST entries provide dedicated stacks for critical exceptions (e.g., double fault)
+/// so they can be handled even if the current kernel stack is corrupted.
+///
+/// # Safety
+/// `stack_top` must be a valid virtual address pointing to the top of an allocated stack.
+pub unsafe fn set_tss_ist(ist_index: u8, stack_top: u64) {
+    unsafe {
+        match ist_index {
+            1 => TSS.ist1 = stack_top,
+            2 => TSS.ist2 = stack_top,
+            3 => TSS.ist3 = stack_top,
+            4 => TSS.ist4 = stack_top,
+            5 => TSS.ist5 = stack_top,
+            6 => TSS.ist6 = stack_top,
+            7 => TSS.ist7 = stack_top,
+            _ => {}
+        }
+    }
+}
+
 /// Serial port (COM1) for debug output
 const SERIAL_PORT: u16 = 0x3F8;
 

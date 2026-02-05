@@ -74,6 +74,9 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
         crate::mm::init(info);
     }
 
+    // Allocate IST stacks now that frame allocator is ready
+    init_exception_stacks();
+
     // Initialize syscalls (needs frame allocator for kernel stack)
     init_syscalls();
 
@@ -180,6 +183,33 @@ unsafe fn print_hex(mut val: u64) {
         for &c in &buf[(pos + 1)..] {
             while (inb(0x3F8 + 5) & 0x20) == 0 {}
             outb(0x3F8, c);
+        }
+    }
+}
+
+/// Allocate IST stacks for critical exceptions (called after mm::init)
+///
+/// The double fault handler (vector 8) gets its own stack via IST1 so it can
+/// run even if the kernel stack is corrupted or overflowed.
+fn init_exception_stacks() {
+    let stack_phys = crate::mm::alloc_frame().expect("IST stack allocation failed");
+    let stack_virt = crate::mm::phys_to_virt(stack_phys);
+    let stack_top = stack_virt + 4096;
+
+    unsafe {
+        gdt::set_tss_ist(1, stack_top);
+    }
+    idt::set_double_fault_ist(1);
+
+    unsafe {
+        for byte in b"[ARCH] Double fault IST1 stack: " {
+            while (inb(0x3F8 + 5) & 0x20) == 0 {}
+            outb(0x3F8, *byte);
+        }
+        print_hex(stack_top);
+        for byte in b"\n" {
+            while (inb(0x3F8 + 5) & 0x20) == 0 {}
+            outb(0x3F8, *byte);
         }
     }
 }
