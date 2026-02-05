@@ -15,7 +15,7 @@ pub use apic::{get_ticks, send_ipi, IpiKind};
 pub use cpu::{current_cpu, MAX_CPUS};
 
 // Re-export architecture-specific implementations for generic arch interface
-pub use context::context_switch;
+pub use context::{context_switch, usermode_trampoline};
 
 /// Initialize x86_64 architecture
 ///
@@ -240,7 +240,7 @@ pub fn init_syscalls() {
         const STACK_PAGES: usize = 4;
         const STACK_SIZE: u64 = STACK_PAGES as u64 * 4096;
 
-        let stack_bottom = match crate::mm::alloc_contiguous_frames(STACK_PAGES) {
+        let stack_bottom_phys = match crate::mm::alloc_contiguous_frames(STACK_PAGES) {
             Some(addr) => addr,
             None => {
                 for byte in b"[SYSCALL] Failed to allocate contiguous kernel stack!\n" {
@@ -252,7 +252,7 @@ pub fn init_syscalls() {
                 }
             }
         };
-        let stack_top = stack_bottom + STACK_SIZE;
+        let stack_top = crate::mm::phys_to_virt(stack_bottom_phys) + STACK_SIZE;
 
         // Set kernel stack for current CPU (for syscall entry)
         cpu::set_kernel_stack(stack_top);
@@ -271,12 +271,14 @@ pub fn init_syscalls() {
             outb(0x3F8, *byte);
         }
 
-        // Segment selectors
-        // STAR format: [63:48] = user CS (star - 16), [47:32] = user SS,
-        //              [31:16] = kernel CS, [15:0] = kernel SS
-        // Kernel CS = 0x08 (from GDT), User CS = 0x18 | 3 = 0x1B
-        // User SS = 0x20 | 3 = 0x23
-        let star = (0x1Bu64 << 48) | (0x23u64 << 32) | (0x08u64 << 16);
+        // STAR MSR format:
+        // [63:48] = sysret base selector
+        //   sysretq: CS = base+16 | RPL3, SS = base+8 | RPL3
+        //   With base=0x10: CS = 0x20|3 = 0x23, SS = 0x18|3 = 0x1B
+        // [47:32] = syscall selector
+        //   syscall: CS = selector, SS = selector+8
+        //   With selector=0x08: CS = 0x08, SS = 0x10
+        let star = (0x10u64 << 48) | (0x08u64 << 32);
         let star_low = star as u32;
         let star_high = (star >> 32) as u32;
 

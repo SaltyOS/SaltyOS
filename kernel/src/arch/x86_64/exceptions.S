@@ -1,18 +1,17 @@
-//! Exception entry stubs for x86_64
+//! Exception and IRQ entry stubs for x86_64
 //!
-//! Provides assembly entry points for all 32 CPU exception vectors (0-31).
-//! Each stub pushes a uniform frame (error code + vector number + CR2 + GPRs)
+//! Provides assembly entry points for all 32 CPU exception vectors (0-31)
+//! and IRQ handlers that need swapgs for ring-3 transitions.
+//!
+//! Each exception stub pushes a uniform frame (error code + vector number + CR2 + GPRs)
 //! then calls exception_handler_rust in idt.rs.
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-// TODO: When userspace is supported, check CS on stack for CPL and swapgs
-// if the exception came from ring 3.
-
 .section .text
 
 // ---------------------------------------------------------------------------
-// Macros
+// Exception Macros
 // ---------------------------------------------------------------------------
 
 // Stub for exceptions that do NOT push an error code.
@@ -83,13 +82,18 @@ exception_stub_no_error    31   // (reserved)
 // ---------------------------------------------------------------------------
 
 // Stack on entry here (from stub):
-//   [RSP+16] ... CPU-pushed frame (RIP, CS, RFLAGS, RSP, SS)
+//   [RSP+24] CS    (CPU-pushed interrupt frame)
+//   [RSP+16] RIP   (CPU-pushed)
 //   [RSP+8]  error_code (real or dummy 0)
 //   [RSP+0]  vector number
-//
-// We build an ExceptionFrame for the Rust handler.
 
 exception_common:
+    // Check if exception came from user mode (CS RPL != 0)
+    testb $3, 24(%rsp)
+    jz 1f
+    swapgs
+1:
+
     // Read CR2 before it gets clobbered (only meaningful for #PF but harmless)
     mov %cr2, %rax
     push %rax                   // cr2
@@ -141,4 +145,66 @@ exception_common:
     // Skip cr2, vector, error_code (3 * 8 = 24 bytes)
     add $24, %rsp
 
+    // Check if returning to user mode (CS RPL != 0)
+    // After skipping cr2+vector+error_code, stack is: RIP, CS, RFLAGS, RSP, SS
+    // CS is at RSP+8
+    testb $3, 8(%rsp)
+    jz 2f
+    swapgs
+2:
     iretq
+
+// ---------------------------------------------------------------------------
+// IRQ stubs: save caller-saved registers, call handler, swapgs as needed
+// ---------------------------------------------------------------------------
+// On IRQ entry, the CPU pushes: SS, RSP, RFLAGS, CS, RIP
+// No error code, no vector. CS is at RSP+8.
+
+.macro irq_stub name
+.global irq_stub_\name
+.type irq_stub_\name, @function
+irq_stub_\name:
+    // Check if from user mode
+    testb $3, 8(%rsp)
+    jz 1f
+    swapgs
+1:
+    // Save caller-saved registers
+    push %rax
+    push %rcx
+    push %rdx
+    push %rsi
+    push %rdi
+    push %r8
+    push %r9
+    push %r10
+    push %r11
+
+    // Align stack: 9 pushes = 72 bytes + 5 CPU pushes = 40 bytes = 112 bytes
+    // 112 mod 16 = 0, already aligned
+
+    call irq_handler_\name
+
+    // Restore caller-saved registers
+    pop %r11
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rdi
+    pop %rsi
+    pop %rdx
+    pop %rcx
+    pop %rax
+
+    // Check if returning to user mode
+    testb $3, 8(%rsp)
+    jz 2f
+    swapgs
+2:
+    iretq
+.size irq_stub_\name, . - irq_stub_\name
+.endm
+
+irq_stub timer
+irq_stub ipi_vspace_teardown
+irq_stub ipi_reschedule

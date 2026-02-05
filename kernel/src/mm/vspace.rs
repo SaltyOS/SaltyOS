@@ -155,42 +155,34 @@ static mut GLOBAL_RETIRE_GEN: AtomicU64 = AtomicU64::new(0);
 ///
 /// This is a minimal spinlock implementation for protecting the deferred free list.
 /// In a full implementation, this would use proper ticket or queue-based locking.
-struct SpinLock;
+struct SpinLock {
+    locked: AtomicU8,
+}
 
 impl SpinLock {
     pub const fn new() -> Self {
-        Self
+        Self {
+            locked: AtomicU8::new(0),
+        }
     }
 
     #[inline]
     pub fn lock(&self) {
-        // Simple test-and-set spinlock
-        // In production, use a proper ticket or queue lock
-        while self.is_locked() {
-            core::hint::spin_loop();
+        // Test-and-set spinlock
+        while self
+            .locked
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            while self.locked.load(Ordering::Relaxed) != 0 {
+                core::hint::spin_loop();
+            }
         }
-        self.set_locked(true);
     }
 
     #[inline]
     pub fn unlock(&self) {
-        self.set_locked(false);
-    }
-
-    #[inline]
-    fn is_locked(&self) -> bool {
-        unsafe {
-            let lock_ptr = &self as *const _ as *const AtomicU8;
-            (*lock_ptr).load(Ordering::Acquire) != 0
-        }
-    }
-
-    #[inline]
-    fn set_locked(&self, value: bool) {
-        unsafe {
-            let lock_ptr = &self as *const _ as *mut AtomicU8;
-            (*lock_ptr).store(value as u8, Ordering::Release);
-        }
+        self.locked.store(0, Ordering::Release);
     }
 }
 

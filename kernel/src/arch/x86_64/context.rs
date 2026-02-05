@@ -34,50 +34,34 @@ pub unsafe extern "sysv64" fn switch_context(
     // - Other registers restored from new context
     // - Function returns to new thread's RIP
 
+    // ThreadContext field offsets (repr(C), all u64):
+    //   rax=0x00 rbx=0x08 rcx=0x10 rdx=0x18 rsi=0x20 rdi=0x28
+    //   rbp=0x30 rsp=0x38 r8=0x40  r9=0x48  r10=0x50 r11=0x58
+    //   r12=0x60 r13=0x68 r14=0x70 r15=0x78 rip=0x80
     unsafe {
         core::arch::asm!(
-            // Save callee-saved registers to old context
-            // RSP is saved first (current stack pointer before we switch)
-            "
-        mov [rdi + 0x40], rbp    // Save RBP (offset 0x40 = 8*8)
-        mov [rdi + 0x50], r12    // Save R12 (offset 0x50 = 10*8)
-        mov [rdi + 0x58], r13    // Save R13 (offset 0x58 = 11*8)
-        mov [rdi + 0x60], r14    // Save R14 (offset 0x60 = 12*8)
-        mov [rdi + 0x68], r15    // Save R15 (offset 0x68 = 13*8)
-        mov [rdi + 0x28], rbx    // Save RBX (offset 0x28 = 5*8)
-        mov [rdi + 0x38], rsp    // Save RSP (offset 0x38 = 7*8) - save last
-        ",
+            "mov [rdi + 0x30], rbp",
+            "mov [rdi + 0x60], r12",
+            "mov [rdi + 0x68], r13",
+            "mov [rdi + 0x70], r14",
+            "mov [rdi + 0x78], r15",
+            "mov [rdi + 0x08], rbx",
+            "mov [rdi + 0x38], rsp",
 
-            // Load new stack pointer first
-            // This is critical - we must switch stacks before restoring other registers
-            "mov rsp, [rsi + 0x38]",  // Load new RSP
+            "mov rsp, [rsi + 0x38]",
 
-            // Restore callee-saved registers from new context
-            "
-        mov rbx, [rsi + 0x28]    // Restore RBX
-        mov rbp, [rsi + 0x40]    // Restore RBP
-        mov r12, [rsi + 0x50]    // Restore R12
-        mov r13, [rsi + 0x58]    // Restore R13
-        mov r14, [rsi + 0x60]    // Restore R14
-        mov r15, [rsi + 0x68]    // Restore R15
-        ",
+            "mov rbx, [rsi + 0x08]",
+            "mov rbp, [rsi + 0x30]",
+            "mov r12, [rsi + 0x60]",
+            "mov r13, [rsi + 0x68]",
+            "mov r14, [rsi + 0x70]",
+            "mov r15, [rsi + 0x78]",
 
-            // Restore RSP was already done above
-            // The ret instruction will use the new RSP to pop return address
-            // but we need to return to the new context's RIP, not here
+            "mov [rdi + 0x80], rax",
 
-            // Save current RIP (return address) to old context
-            // This was pushed by the call instruction
-            "mov [rdi + 0x70], rax", // Placeholder - we'll fix this below
+            in("rdi") old_context,
+            in("rsi") new_context,
 
-            // Load new RIP and return there
-            // We need to pop the return address and push the new one
-            // Actually, let's use a different approach
-
-            in("rdi") old_context,  // First argument: old context
-            in("rsi") new_context,  // Second argument: new context
-
-            // Clobber all caller-saved and some callee-saved registers
             clobber_abi("sysv64"),
         );
     }
@@ -98,44 +82,39 @@ pub unsafe extern "sysv64" fn context_switch(
     // 3. Restore all registers from new context
     // 4. Return will use the new RIP from stack
 
+    // ThreadContext field offsets (repr(C), all u64):
+    //   rax=0x00 rbx=0x08 rcx=0x10 rdx=0x18 rsi=0x20 rdi=0x28
+    //   rbp=0x30 rsp=0x38 r8=0x40  r9=0x48  r10=0x50 r11=0x58
+    //   r12=0x60 r13=0x68 r14=0x70 r15=0x78 rip=0x80
     unsafe {
         core::arch::asm!(
             // === Save old context ===
-            // First, save the return address (pushed by call) to old context
             "mov rax, [rsp]",           // Get return address from stack
-            "mov [rdi + 0x70], rax",    // Save RIP to old_context.rip (offset 0x70 = 14*8)
+            "mov [rdi + 0x80], rax",    // Save RIP (offset 16*8)
 
-            // Save RBP (stack frame pointer)
-            "mov [rdi + 0x40], rbp",    // Save RBP
+            "mov [rdi + 0x30], rbp",    // Save RBP (offset 6*8)
+            "mov [rdi + 0x08], rbx",    // Save RBX (offset 1*8)
+            "mov [rdi + 0x60], r12",    // Save R12 (offset 12*8)
+            "mov [rdi + 0x68], r13",    // Save R13 (offset 13*8)
+            "mov [rdi + 0x70], r14",    // Save R14 (offset 14*8)
+            "mov [rdi + 0x78], r15",    // Save R15 (offset 15*8)
 
-            // Save callee-saved registers: RBX, R12-R15
-            "mov [rdi + 0x28], rbx",    // Save RBX
-            "mov [rdi + 0x50], r12",    // Save R12
-            "mov [rdi + 0x58], r13",    // Save R13
-            "mov [rdi + 0x60], r14",    // Save R14
-            "mov [rdi + 0x68], r15",    // Save R15
-
-            // Save RSP (must be done after saving return address)
             "lea rax, [rsp + 8]",       // RSP after popping return address
-            "mov [rdi + 0x38], rax",    // Save RSP
+            "mov [rdi + 0x38], rax",    // Save RSP (offset 7*8)
 
             // === Switch to new context ===
-            // Load new RSP first (critical!)
             "mov rsp, [rsi + 0x38]",    // Load new RSP
 
-            // Push new return address
-            "mov rax, [rsi + 0x70]",    // Load new RIP
-            "push rax",                 // Push it as return address
+            "mov rax, [rsi + 0x80]",    // Load new RIP
+            "push rax",                 // Push as return address
 
-            // Restore callee-saved registers from new context
-            "mov rbx, [rsi + 0x28]",    // Restore RBX
-            "mov rbp, [rsi + 0x40]",    // Restore RBP
-            "mov r12, [rsi + 0x50]",    // Restore R12
-            "mov r13, [rsi + 0x58]",    // Restore R13
-            "mov r14, [rsi + 0x60]",    // Restore R14
-            "mov r15, [rsi + 0x68]",    // Restore R15
+            "mov rbx, [rsi + 0x08]",    // Restore RBX
+            "mov rbp, [rsi + 0x30]",    // Restore RBP
+            "mov r12, [rsi + 0x60]",    // Restore R12
+            "mov r13, [rsi + 0x68]",    // Restore R13
+            "mov r14, [rsi + 0x70]",    // Restore R14
+            "mov r15, [rsi + 0x78]",    // Restore R15
 
-            // Return to new RIP (pop return address from stack and jump)
             "ret",
 
             in("rdi") old_context,
@@ -186,6 +165,37 @@ pub unsafe fn init_thread_context(
     }
 }
 
+/// Trampoline for first dispatch to user mode
+///
+/// context_switch restores callee-saved registers and `ret`s here.
+/// Expected register state on entry:
+///   r12 = user RIP
+///   r13 = user RSP
+///   r14 = user PML4 physical address (CR3)
+///
+/// User segment selectors (post GDT reorder):
+///   SS = 0x1B (user_data at GDT slot 3 | RPL 3)
+///   CS = 0x23 (user_code at GDT slot 4 | RPL 3)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn usermode_trampoline() -> ! {
+    unsafe {
+        core::arch::asm!(
+            // Switch to user page tables
+            "mov cr3, r14",
+            // Build iretq frame on kernel stack
+            "push 0x1B",       // SS (user data)
+            "push r13",        // User RSP
+            "push 0x202",      // RFLAGS (IF=1)
+            "push 0x23",       // CS (user code)
+            "push r12",        // User RIP
+            // Switch GS to user GS base before entering user mode
+            "swapgs",
+            "iretq",
+            options(noreturn)
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,13 +204,13 @@ mod tests {
     fn test_context_offsets() {
         // Verify that our offset calculations are correct
         assert_eq!(core::mem::offset_of!(ThreadContext, rax), 0x00);
-        assert_eq!(core::mem::offset_of!(ThreadContext, rbx), 0x28);
+        assert_eq!(core::mem::offset_of!(ThreadContext, rbx), 0x08);
+        assert_eq!(core::mem::offset_of!(ThreadContext, rbp), 0x30);
         assert_eq!(core::mem::offset_of!(ThreadContext, rsp), 0x38);
-        assert_eq!(core::mem::offset_of!(ThreadContext, rbp), 0x40);
-        assert_eq!(core::mem::offset_of!(ThreadContext, r12), 0x50);
-        assert_eq!(core::mem::offset_of!(ThreadContext, r13), 0x58);
-        assert_eq!(core::mem::offset_of!(ThreadContext, r14), 0x60);
-        assert_eq!(core::mem::offset_of!(ThreadContext, r15), 0x68);
-        assert_eq!(core::mem::offset_of!(ThreadContext, rip), 0x70);
+        assert_eq!(core::mem::offset_of!(ThreadContext, r12), 0x60);
+        assert_eq!(core::mem::offset_of!(ThreadContext, r13), 0x68);
+        assert_eq!(core::mem::offset_of!(ThreadContext, r14), 0x70);
+        assert_eq!(core::mem::offset_of!(ThreadContext, r15), 0x78);
+        assert_eq!(core::mem::offset_of!(ThreadContext, rip), 0x80);
     }
 }

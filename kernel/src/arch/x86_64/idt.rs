@@ -231,8 +231,9 @@ unsafe fn serial_dec(mut val: u64) {
     }
 }
 
-// Assembly exception stubs (defined in exceptions.S)
+// Assembly stubs (defined in exceptions.S)
 unsafe extern "C" {
+    // Exception stubs
     fn exception_stub_0();
     fn exception_stub_1();
     fn exception_stub_2();
@@ -265,6 +266,11 @@ unsafe extern "C" {
     fn exception_stub_29();
     fn exception_stub_30();
     fn exception_stub_31();
+
+    // IRQ stubs (with swapgs guards)
+    fn irq_stub_timer();
+    fn irq_stub_ipi_vspace_teardown();
+    fn irq_stub_ipi_reschedule();
 }
 
 /// Set IST for double fault handler (vector 8).
@@ -464,18 +470,17 @@ pub fn init() {
 
         serial_puts("[IDT] Exception handlers set\n");
 
-        // Set up IRQ handlers (vectors 32+)
-        // Vector 32: APIC Timer
+        // Set up IRQ handlers (vectors 32+) using assembly stubs with swapgs
         serial_puts("[IDT] Setting IRQ handlers\n");
-        idt.entries[32].set_handler(irq_timer as *const () as u64);
+        idt.entries[32].set_handler(irq_stub_timer as *const () as u64);
         serial_puts("[IDT]   timer handler: ");
-        serial_hex(irq_timer as *const () as u64);
+        serial_hex(irq_stub_timer as *const () as u64);
         serial_putc(b'\n');
 
         // Vector 40: IPI VSpace Teardown
-        idt.entries[40].set_handler(ipi_vspace_teardown as *const () as u64);
+        idt.entries[40].set_handler(irq_stub_ipi_vspace_teardown as *const () as u64);
         // Vector 41: IPI Reschedule
-        idt.entries[41].set_handler(ipi_reschedule as *const () as u64);
+        idt.entries[41].set_handler(irq_stub_ipi_reschedule as *const () as u64);
         serial_puts("[IDT] IPI handlers set (vectors 40-41)\n");
 
         // Prepare IDT pointer
@@ -532,29 +537,31 @@ pub fn init() {
     }
 }
 
-/// APIC Timer interrupt handler
+/// APIC Timer interrupt handler (called from assembly stub irq_stub_timer)
 ///
 /// Vector 32 - called every 1ms by the APIC timer.
 /// This is the primary scheduler tick interrupt.
-extern "C" fn irq_timer() {
-    // Delegate to the APIC timer handler
+#[unsafe(no_mangle)]
+extern "C" fn irq_handler_timer() {
     super::apic::timer_handler();
 }
 
-/// IPI VSpace Teardown handler
+/// IPI VSpace Teardown handler (called from assembly stub irq_stub_ipi_vspace_teardown)
 ///
 /// Vector 40 - sent when a VSpace is being torn down and this CPU
 /// needs to switch away from it.
-extern "C" fn ipi_vspace_teardown() {
+#[unsafe(no_mangle)]
+extern "C" fn irq_handler_ipi_vspace_teardown() {
     super::apic::handle_ipi(super::apic::IpiKind::VSpaceTeardown);
     super::apic::eoi();
 }
 
-/// IPI Reschedule handler
+/// IPI Reschedule handler (called from assembly stub irq_stub_ipi_reschedule)
 ///
 /// Vector 41 - sent when a thread with specific CPU affinity is
 /// enqueued and the target CPU should check for work.
-extern "C" fn ipi_reschedule() {
+#[unsafe(no_mangle)]
+extern "C" fn irq_handler_ipi_reschedule() {
     super::apic::handle_ipi(super::apic::IpiKind::Reschedule);
     super::apic::eoi();
 }

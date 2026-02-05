@@ -141,8 +141,8 @@ pub struct Gdt {
     null: GdtEntry,
     kernel_code: GdtEntry,
     kernel_data: GdtEntry,
-    user_code: GdtEntry,
-    user_data: GdtEntry,
+    user_data: GdtEntry,        // 0x18: must be before user_code for sysretq
+    user_code: GdtEntry,        // 0x20: sysretq computes CS = STAR[63:48]+16
     tss: TssEntry,
 }
 
@@ -157,8 +157,8 @@ static mut GDT: Gdt = Gdt {
     null: GdtEntry::null(),
     kernel_code: GdtEntry::kernel_code(),
     kernel_data: GdtEntry::kernel_data(),
-    user_code: GdtEntry::user_code(),
-    user_data: GdtEntry::user_data(),
+    user_data: GdtEntry::user_data(),       // 0x18
+    user_code: GdtEntry::user_code(),       // 0x20
     tss: TssEntry {
         limit_low: 0,
         base_low: 0,

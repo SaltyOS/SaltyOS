@@ -735,8 +735,8 @@ fn syscall_tcb_configure(
         tcb.context.rip = entry_rip;
         tcb.context.rsp = entry_rsp;
         tcb.context.rflags = 0x202; // IF=1
-        tcb.context.cs = 0x1B; // User code segment (selector 0x18 | RPL 3)
-        tcb.context.ss = 0x23; // User data segment (selector 0x20 | RPL 3)
+        tcb.context.cs = 0x23; // User code segment (selector 0x20 | RPL 3)
+        tcb.context.ss = 0x1B; // User data segment (selector 0x18 | RPL 3)
         tcb.ipc_buffer = ipc_buffer;
     }
 
@@ -1035,6 +1035,7 @@ pub fn handle(
         Syscall::Wait => syscall_wait(cap_ptr),
         Syscall::Poll => syscall_poll(cap_ptr),
         Syscall::Yield => {
+            crate::serial_puts("[INIT] yield\n");
             crate::sched::yield_now();
             SyscallResult::ok(0)
         }

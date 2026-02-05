@@ -194,4 +194,7 @@ pub fn init() {
     unsafe {
         init_direct_map();
     }
+
+    // Initialize kernel VSpace tracking (needed before any VSpace::new() calls)
+    crate::mm::vspace::init_kernel_vspace(read_cr3());
 }

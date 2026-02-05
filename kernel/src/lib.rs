@@ -12,6 +12,7 @@ mod arch;
 mod bootinfo;
 mod builtins;
 mod cap;
+mod init;
 mod ipc;
 mod mm;
 mod sched;
@@ -155,7 +156,13 @@ pub extern "C" fn kmain(raw_boot_info: *const u8) -> ! {
     // Start timer interrupts (scheduler must be ready first)
     arch::start_timer();
 
-    // For now, halt
+    // Bootstrap the first user-mode init task
+    init::bootstrap();
+
+    // Dispatch the init task (context_switch to it)
+    sched::scheduler::scheduler().reschedule();
+
+    // Fallback (should never reach here once init task is dispatched)
     loop {
         arch::halt();
     }

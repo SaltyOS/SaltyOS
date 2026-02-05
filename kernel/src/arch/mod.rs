@@ -11,7 +11,7 @@ pub use x86_64::{current_cpu, MAX_CPUS};
 
 // Re-export context switch interface
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::context_switch;
+pub use x86_64::{context_switch, usermode_trampoline};
 
 // Re-export IPI types and functions
 #[cfg(target_arch = "x86_64")]

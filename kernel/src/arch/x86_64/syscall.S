@@ -82,28 +82,23 @@ syscall_entry:
 
     call syscall_handle_rust
 
-    # Rust returns: RAX (error), RDX (value)
-    # We need to put these into the stack slots for RAX and RBX
-    mov %rax, 0(%rsp)   # Save Error to stack (for pop %rax)
-    mov %rdx, 8(%rsp)   # Save Value to stack (for pop %rbx)
+    # Remove alignment padding
+    add $8, %rsp
 
     # --------------------------------------------------------------------------
     # Return Value Handling
     # --------------------------------------------------------------------------
-    # The handler returns a struct { u64 error; u64 value; } in RAX and RBX.
-    # We must overwrite the saved values on the stack so `pop` restores the
-    # *result*, not the original values.
-    #
-    # Stack Top -> [Saved RAX] [Saved RBX] ...
-    
-    mov %rax, 0(%rsp)  # Update RAX on stack
-    mov %rbx, 8(%rsp)  # Update RBX on stack
+    # Rust returns struct { u64 error; u64 value; } in RAX:RDX (System V ABI).
+    # Overwrite saved RAX/RBX on stack so pops restore the result to user.
+    # Stack: [saved_rax] [saved_rbx] [saved_rcx=user_rip] ...
+    mov %rax, 0(%rsp)  # error  → will be popped into %rax
+    mov %rdx, 8(%rsp)  # value  → will be popped into %rbx
 
     # --------------------------------------------------------------------------
     # Context Restoration
     # --------------------------------------------------------------------------
-    pop %rax   # Loads the NEW return value (error code)
-    pop %rbx   # Loads the NEW return value (result)
+    pop %rax   # Error code (from handler)
+    pop %rbx   # Return value (from handler)
     pop %rcx   # Restores RIP (needed for sysretq)
     pop %rdx
     pop %rsi
