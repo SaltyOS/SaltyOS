@@ -111,7 +111,7 @@ static mut LAPIC_VIRTUAL_BASE: u64 = 0;
 #[derive(Clone, Copy, Debug)]
 pub enum IpiKind {
     VSpaceTeardown = 0,
-    // ... other IPI kinds can be added here
+    Reschedule = 1,
 }
 
 impl IpiKind {
@@ -591,6 +591,10 @@ pub fn handle_ipi(kind: IpiKind) {
             unsafe {
                 crate::mm::set_pending_deactivate(cpu_id, current_tracking);
             }
-        } // ... other IPI handlers can be added here
+        }
+        IpiKind::Reschedule => {
+            // Trigger a reschedule check on this CPU via the timer_tick path
+            crate::sched::timer_tick();
+        }
     }
 }

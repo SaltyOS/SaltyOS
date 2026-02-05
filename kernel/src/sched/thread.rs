@@ -57,6 +57,8 @@ pub struct Tcb {
     pub ipc_buffer: u64,
     /// Scheduling context
     pub sched_context: *mut SchedContext,
+    /// CPU affinity (0xFFFF_FFFF = any CPU, otherwise specific CPU ID)
+    pub cpu_affinity: u32,
     /// Next thread in queue
     pub next: *mut Tcb,
     /// Why this thread is blocked (valid when state == Blocked/Waiting)
@@ -158,6 +160,7 @@ impl Tcb {
             cspace: core::ptr::null_mut(),
             ipc_buffer: 0,
             sched_context: core::ptr::null_mut(),
+            cpu_affinity: 0xFFFF_FFFF,
             next: core::ptr::null_mut(),
             blocked_reason: None,
             saved_caller_badge: 0,

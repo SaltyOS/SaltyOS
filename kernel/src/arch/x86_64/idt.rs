@@ -173,6 +173,12 @@ pub fn init() {
         serial_hex(irq_timer as *const () as u64);
         serial_putc(b'\n');
 
+        // Vector 40: IPI VSpace Teardown
+        (*(&raw mut IDT)).entries[40].set_handler(ipi_vspace_teardown as *const () as u64);
+        // Vector 41: IPI Reschedule
+        (*(&raw mut IDT)).entries[41].set_handler(ipi_reschedule as *const () as u64);
+        serial_puts("[IDT] IPI handlers set (vectors 40-41)\n");
+
         // Prepare IDT pointer
         serial_puts("[IDT] Preparing IDT pointer\n");
         let idt_ptr = IdtPtr {
@@ -289,4 +295,22 @@ extern "C" fn irq_timer() {
     // Delegate to the APIC timer handler
     // SAFETY: Interrupt context, timer handler is designed for this
     super::apic::timer_handler();
+}
+
+/// IPI VSpace Teardown handler
+///
+/// Vector 40 - sent when a VSpace is being torn down and this CPU
+/// needs to switch away from it.
+extern "C" fn ipi_vspace_teardown() {
+    super::apic::handle_ipi(super::apic::IpiKind::VSpaceTeardown);
+    super::apic::eoi();
+}
+
+/// IPI Reschedule handler
+///
+/// Vector 41 - sent when a thread with specific CPU affinity is
+/// enqueued and the target CPU should check for work.
+extern "C" fn ipi_reschedule() {
+    super::apic::handle_ipi(super::apic::IpiKind::Reschedule);
+    super::apic::eoi();
 }

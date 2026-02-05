@@ -15,7 +15,7 @@ pub use x86_64::context_switch;
 
 // Re-export IPI types and functions
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::{send_ipi, IpiKind};
+pub use x86_64::{get_ticks, send_ipi, IpiKind};
 
 /// Initialize architecture-specific subsystems
 pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {

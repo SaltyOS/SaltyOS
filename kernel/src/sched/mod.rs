@@ -11,6 +11,7 @@ pub mod thread;
 pub use thread::Tcb;
 
 use crate::arch;
+use crate::arch::MAX_CPUS;
 use crate::mm::{alloc_frame, phys_to_virt, PAGE_SIZE};
 
 /// Idle thread stack size
@@ -70,14 +71,15 @@ pub fn init() {
         BOOTSTRAP_TCB.cspace = core::ptr::null_mut();
         BOOTSTRAP_TCB.ipc_buffer = 0;
         BOOTSTRAP_TCB.next = core::ptr::null_mut();
+        BOOTSTRAP_TCB.cpu_affinity = 0; // Pin bootstrap thread to BSP
 
         // The bootstrap thread's context will be saved on first context switch
         // We don't need to initialize it here - the context_switch function
         // will save the current register state to BOOTSTRAP_TCB.context
     }
 
-    // Allocate idle TCB
-    let idle_tcb = unsafe { allocate_idle_tcb() };
+    // Allocate BSP idle TCB
+    let idle_tcb = unsafe { allocate_idle_tcb(0) };
 
     // Initialize idle thread context
     unsafe {
@@ -88,6 +90,7 @@ pub fn init() {
         (*idle_tcb).cspace = core::ptr::null_mut();
         (*idle_tcb).ipc_buffer = 0;
         (*idle_tcb).next = core::ptr::null_mut();
+        (*idle_tcb).cpu_affinity = 0; // Pin idle thread to BSP
     }
 
     // Allocate and set up stack
@@ -105,17 +108,52 @@ pub fn init() {
 
     // Set bootstrap as current thread (not idle!)
     // The first context switch will save the bootstrap context and switch to idle
-    scheduler().set_idle(idle_tcb);
+    scheduler().set_idle(0, idle_tcb);
     scheduler().set_current(&raw mut BOOTSTRAP_TCB);
 }
 
-/// Allocate TCB for idle thread
+/// Initialize scheduler for an Application Processor
+///
+/// Creates a per-CPU idle thread for the given CPU.
+/// Called during AP startup after the CPU is online.
+pub fn init_cpu(cpu_id: usize) {
+    let idle_tcb = unsafe { allocate_idle_tcb(cpu_id) };
+
+    unsafe {
+        (*idle_tcb).state = crate::sched::thread::ThreadState::Ready;
+        (*idle_tcb).priority = u64::MAX;
+        (*idle_tcb).sched_context = core::ptr::null_mut();
+        (*idle_tcb).vspace = core::ptr::null_mut();
+        (*idle_tcb).cspace = core::ptr::null_mut();
+        (*idle_tcb).ipc_buffer = 0;
+        (*idle_tcb).next = core::ptr::null_mut();
+        (*idle_tcb).cpu_affinity = cpu_id as u32;
+    }
+
+    let idle_stack = unsafe { allocate_idle_stack() };
+    let stack_top = idle_stack + IDLE_STACK_SIZE as u64;
+
+    unsafe {
+        (*idle_tcb).context.rip = idle_thread as *const () as u64;
+        (*idle_tcb).context.rsp = stack_top;
+        (*idle_tcb).context.rflags = 0x202; // Interrupts enabled
+        (*idle_tcb).context.cs = 0x08; // Kernel code segment
+        (*idle_tcb).context.ss = 0x10; // Kernel data segment
+    }
+
+    scheduler().set_idle(cpu_id, idle_tcb);
+    scheduler().set_current(idle_tcb);
+}
+
+/// Per-CPU idle TCBs (static, never freed)
+static mut IDLE_TCBS: [Tcb; MAX_CPUS] = [const { Tcb::new() }; MAX_CPUS];
+
+/// Allocate TCB for idle thread on a specific CPU
 ///
 /// The idle thread is a special thread that exists for the entire kernel lifetime
 /// and is never destroyed, so we use static allocation rather than the slab allocator.
-unsafe fn allocate_idle_tcb() -> *mut Tcb {
-    static mut IDLE_TCB: Tcb = Tcb::new();
-    &raw mut IDLE_TCB
+unsafe fn allocate_idle_tcb(cpu_id: usize) -> *mut Tcb {
+    unsafe { &raw mut IDLE_TCBS[cpu_id] }
 }
 
 /// Allocate stack for idle thread

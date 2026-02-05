@@ -3,15 +3,16 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use super::thread::{BlockedReason, Tcb, ThreadState};
+use crate::arch::MAX_CPUS;
 
 /// EDF Scheduler
 pub struct Scheduler {
     /// Ready queue head (sorted by deadline)
     ready_head: *mut Tcb,
-    /// Currently running thread
-    current: *mut Tcb,
-    /// Idle thread
-    idle: *mut Tcb,
+    /// Per-CPU currently running thread
+    current: [*mut Tcb; MAX_CPUS],
+    /// Per-CPU idle thread
+    idle: [*mut Tcb; MAX_CPUS],
     /// Lock state (simple test-and-set spinlock)
     lock_state: core::sync::atomic::AtomicU8,
 }
@@ -20,8 +21,8 @@ impl Scheduler {
     pub const fn new() -> Self {
         Self {
             ready_head: core::ptr::null_mut(),
-            current: core::ptr::null_mut(),
-            idle: core::ptr::null_mut(),
+            current: [core::ptr::null_mut(); MAX_CPUS],
+            idle: [core::ptr::null_mut(); MAX_CPUS],
             lock_state: core::sync::atomic::AtomicU8::new(0),
         }
     }
@@ -45,6 +46,9 @@ impl Scheduler {
     }
 
     /// Add thread to ready queue (sorted by deadline)
+    ///
+    /// If the thread has a specific CPU affinity and the target CPU is idle,
+    /// sends a Reschedule IPI to wake that CPU.
     pub fn enqueue(&mut self, tcb: *mut Tcb) {
         unsafe {
             (*tcb).state = ThreadState::Ready;
@@ -60,6 +64,23 @@ impl Scheduler {
                 }
                 (*tcb).next = (*current).next;
                 (*current).next = tcb;
+            }
+
+            // If thread has specific CPU affinity, check if target CPU needs waking
+            let affinity = (*tcb).cpu_affinity;
+            if affinity != 0xFFFF_FFFF {
+                let target = affinity as usize;
+                let this_cpu = crate::arch::current_cpu() as usize;
+                if target != this_cpu
+                    && target < MAX_CPUS
+                    && !self.idle[target].is_null()
+                    && self.current[target] == self.idle[target]
+                {
+                    crate::arch::send_ipi(
+                        target,
+                        crate::arch::IpiKind::Reschedule,
+                    );
+                }
             }
         }
     }
@@ -78,50 +99,88 @@ impl Scheduler {
         }
     }
 
-    /// Pick next thread to run
+    /// Remove highest priority thread that can run on the given CPU
+    ///
+    /// Walks the ready queue and finds the first thread whose affinity
+    /// matches the target CPU (affinity == 0xFFFF_FFFF means any CPU).
+    pub fn dequeue_for_cpu(&mut self, cpu_id: usize) -> Option<*mut Tcb> {
+        unsafe {
+            let mut prev: *mut Tcb = core::ptr::null_mut();
+            let mut current = self.ready_head;
+
+            while !current.is_null() {
+                let affinity = (*current).cpu_affinity;
+                if affinity == 0xFFFF_FFFF || affinity as usize == cpu_id {
+                    // Remove from queue
+                    if prev.is_null() {
+                        self.ready_head = (*current).next;
+                    } else {
+                        (*prev).next = (*current).next;
+                    }
+                    (*current).next = core::ptr::null_mut();
+                    return Some(current);
+                }
+                prev = current;
+                current = (*current).next;
+            }
+            None
+        }
+    }
+
+    /// Pick next thread to run on the current CPU
     pub fn schedule(&mut self) -> *mut Tcb {
-        if let Some(tcb) = self.dequeue() {
+        let cpu_id = crate::arch::current_cpu() as usize;
+        if let Some(tcb) = self.dequeue_for_cpu(cpu_id) {
             unsafe {
                 (*tcb).state = ThreadState::Running;
             }
-            self.current = tcb;
+            self.current[cpu_id] = tcb;
             tcb
         } else {
-            // Return idle thread
-            self.idle
+            // Return idle thread for this CPU
+            self.idle[cpu_id]
         }
     }
 
-    /// Current running thread
+    /// Current running thread (on calling CPU)
     pub fn current(&self) -> *mut Tcb {
-        self.current
+        let cpu_id = crate::arch::current_cpu() as usize;
+        self.current[cpu_id]
     }
 
-    /// Set current running thread
-    ///
-    /// Used when switching to a new thread.
+    /// Set current running thread (on calling CPU)
     pub fn set_current(&mut self, tcb: *mut Tcb) {
-        self.current = tcb;
+        let cpu_id = crate::arch::current_cpu() as usize;
+        self.current[cpu_id] = tcb;
     }
 
-    /// Get idle thread
+    /// Get idle thread for calling CPU
     pub fn get_idle(&self) -> *mut Tcb {
-        self.idle
+        let cpu_id = crate::arch::current_cpu() as usize;
+        self.idle[cpu_id]
     }
 
-    /// Set idle thread
-    ///
-    /// Called during scheduler initialization.
-    pub fn set_idle(&mut self, tcb: *mut Tcb) {
-        self.idle = tcb;
+    /// Set idle thread for a specific CPU
+    pub fn set_idle(&mut self, cpu_id: usize, tcb: *mut Tcb) {
+        self.idle[cpu_id] = tcb;
     }
 
-    /// Check if reschedule needed (preemption)
+    /// Check if reschedule needed (preemption) on the calling CPU
     pub fn needs_reschedule(&self) -> bool {
-        if self.ready_head.is_null() || self.current.is_null() {
+        let cpu_id = crate::arch::current_cpu() as usize;
+        let current = self.current[cpu_id];
+        if self.ready_head.is_null() || current.is_null() {
             return false;
         }
-        unsafe { (*self.ready_head).priority < (*self.current).priority }
+        unsafe {
+            // Check that the head of the ready queue can actually run on this CPU
+            let head = self.ready_head;
+            let affinity = (*head).cpu_affinity;
+            if affinity != 0xFFFF_FFFF && affinity as usize != cpu_id {
+                return false;
+            }
+            (*head).priority < (*current).priority
+        }
     }
 
     /// Handle timer tick - called from interrupt context
@@ -130,7 +189,8 @@ impl Scheduler {
     /// Also checks for preemption if a higher priority thread is ready.
     pub fn timer_tick(&mut self) {
         unsafe {
-            let current = self.current;
+            let cpu_id = crate::arch::current_cpu() as usize;
+            let current = self.current[cpu_id];
 
             if current.is_null() {
                 return;
@@ -200,7 +260,8 @@ impl Scheduler {
     /// - The current thread yields
     pub fn reschedule(&mut self) {
         unsafe {
-            let old_tcb = self.current;
+            let cpu_id = crate::arch::current_cpu() as usize;
+            let old_tcb = self.current[cpu_id];
             let new_tcb = self.schedule();
 
             if old_tcb == new_tcb {
@@ -297,7 +358,8 @@ impl Scheduler {
         self.lock();
 
         unsafe {
-            let current = self.current;
+            let cpu_id = crate::arch::current_cpu() as usize;
+            let current = self.current[cpu_id];
 
             // Fast path: check if already inactive
             if !tracking.is_active() {

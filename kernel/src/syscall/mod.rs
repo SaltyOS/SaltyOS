@@ -6,6 +6,7 @@
 
 use crate::cap::{CapError, CapRights, Capability, CNode, ObjectType};
 use crate::ipc::{Endpoint, EndpointState, Message, Notification};
+use crate::sched::thread::{SchedContext, Tcb, ThreadState};
 
 /// System call numbers
 #[repr(u64)]
@@ -492,8 +493,186 @@ fn syscall_invoke(
             }
             SyscallResult::ok(0)
         }
+        // SchedContext operations
+        (ObjectType::SchedContext, 0x30) => {
+            // SC_CONFIGURE: arg0 = budget (microseconds), arg1 = period (microseconds)
+            syscall_sc_configure(cap, arg0, arg1)
+        }
+        (ObjectType::SchedContext, 0x31) => {
+            // SC_BIND: arg0 = tcb_cap_ptr
+            syscall_sc_bind(cap, arg0)
+        }
+        (ObjectType::SchedContext, 0x32) => {
+            // SC_UNBIND
+            syscall_sc_unbind(cap)
+        }
+        (ObjectType::SchedContext, 0x33) => {
+            // SC_YIELD_TO: arg0 = target_sc_cap_ptr
+            syscall_sc_yield_to(cap, arg0)
+        }
+
         _ => SyscallResult::err(SyscallError::InvalidOperation),
     }
+}
+
+/// SC_CONFIGURE: Configure scheduling context parameters
+///
+/// Args:
+/// - budget_us: Budget per period in microseconds (must be > 0)
+/// - period_us: Period in microseconds (0 = sporadic, otherwise >= budget)
+fn syscall_sc_configure(cap: &Capability, budget_us: u64, period_us: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::SchedContext, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    if budget_us == 0 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    // For periodic tasks, period must be >= budget
+    if period_us != 0 && period_us < budget_us {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    // Convert microseconds to ticks (1 tick = 1ms = 1000us)
+    let budget_ticks = budget_us / 1000;
+    let period_ticks = period_us / 1000;
+
+    if budget_ticks == 0 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    unsafe {
+        let sc = &mut *(cap.object as *mut SchedContext);
+        sc.budget = budget_ticks;
+        sc.period = period_ticks;
+        sc.remaining = budget_ticks;
+
+        if period_ticks > 0 {
+            // Periodic: deadline = now + period
+            let now = crate::arch::get_ticks() as u64;
+            sc.deadline = now + period_ticks;
+        } else {
+            // Sporadic: infinite deadline (lowest priority in EDF)
+            sc.deadline = u64::MAX;
+        }
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// SC_BIND: Bind a scheduling context to a TCB
+///
+/// Args:
+/// - tcb_cap_ptr: Capability pointer to the target TCB
+fn syscall_sc_bind(cap: &Capability, tcb_cap_ptr: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::SchedContext, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    // Look up and validate the TCB capability
+    let tcb_cap = match lookup_capability(tcb_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(tcb_cap, ObjectType::Tcb, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let sc = &mut *(cap.object as *mut SchedContext);
+        let tcb = &mut *(tcb_cap.object as *mut Tcb);
+
+        // Check SC is not already bound
+        if !sc.bound_tcb.is_null() {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+
+        // Check TCB does not already have a scheduling context
+        if !tcb.sched_context.is_null() {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+
+        // Bind SC to TCB
+        sc.bound_tcb = tcb as *mut Tcb;
+        tcb.sched_context = sc as *mut SchedContext;
+        tcb.priority = sc.deadline;
+
+        // If TCB is Ready, re-enqueue with updated priority
+        if tcb.state == ThreadState::Ready {
+            // Remove and re-insert to maintain deadline ordering
+            crate::sched::scheduler::scheduler().enqueue(tcb as *mut Tcb);
+        }
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// SC_UNBIND: Unbind a scheduling context from its TCB
+fn syscall_sc_unbind(cap: &Capability) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::SchedContext, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let sc = &mut *(cap.object as *mut SchedContext);
+
+        // Check SC is bound
+        if sc.bound_tcb.is_null() {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+
+        let tcb = &mut *sc.bound_tcb;
+
+        // Cannot unbind from a Running or Ready thread
+        if tcb.state == ThreadState::Running || tcb.state == ThreadState::Ready {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+
+        // Clear the binding
+        tcb.sched_context = core::ptr::null_mut();
+        sc.bound_tcb = core::ptr::null_mut();
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// SC_YIELD_TO: Transfer remaining budget to target scheduling context
+///
+/// Args:
+/// - target_sc_cap_ptr: Capability pointer to the target SchedContext
+fn syscall_sc_yield_to(cap: &Capability, target_sc_cap_ptr: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::SchedContext, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    // Look up and validate the target SC capability
+    let target_cap = match lookup_capability(target_sc_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(target_cap, ObjectType::SchedContext, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let current_sc = &mut *(cap.object as *mut SchedContext);
+        let target_sc = &mut *(target_cap.object as *mut SchedContext);
+
+        // Transfer remaining budget to target
+        target_sc.remaining += current_sc.remaining;
+        current_sc.remaining = 0;
+
+        // Block the current thread and reschedule
+        let scheduler = crate::sched::scheduler::scheduler();
+        let current_tcb = scheduler.current();
+        if !current_tcb.is_null() {
+            (*current_tcb).state = ThreadState::Blocked;
+            scheduler.reschedule();
+        }
+    }
+
+    SyscallResult::ok(0)
 }
 
 /// Convert CNode error to syscall error

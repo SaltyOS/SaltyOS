@@ -11,7 +11,7 @@ mod idt;
 pub mod paging;
 mod pit;
 
-pub use apic::{send_ipi, IpiKind};
+pub use apic::{get_ticks, send_ipi, IpiKind};
 pub use cpu::{current_cpu, MAX_CPUS};
 
 // Re-export architecture-specific implementations for generic arch interface
@@ -38,11 +38,12 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
         }
     }
 
-    // Initialize per-CPU data for BSP
-    cpu::init_bsp();
-
     // Initialize GDT (required before IDT)
     gdt::init();
+
+    // Initialize per-CPU data for BSP
+    // MUST be after gdt::init() because reload_segments() clobbers GS base
+    cpu::init_bsp();
 
     // Debug: Before IDT init
     unsafe {
