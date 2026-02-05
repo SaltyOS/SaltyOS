@@ -34,6 +34,9 @@ static EFI_GUID s_FileInfoGuid = { 0x09576E92, 0x6D3F, 0x11D2,
 static CHAR16 s_KernelPath[] = { '\\','E','F','I','\\','S','A','L','T','Y',
     'O','S','\\','k','e','r','n','e','l','.','e','l','f', 0 };
 
+static CHAR16 s_InitrdPath[] = { '\\','E','F','I','\\','S','A','L','T','Y',
+    'O','S','\\','i','n','i','t','r','d','.','i','m','g', 0 };
+
 /*
  * Load a file from ESP using UEFI Boot Services
  *
@@ -142,6 +145,20 @@ void stage3_entry_64(struct Stage2Info *info)
     print_str(" size=");
     print_hex(kernel_file_size, 8);
     print_char('\n');
+
+    /* Load initrd from ESP (optional) */
+    void *initrd_buffer = NULL;
+    uint64_t initrd_file_size = 0;
+    if (uefi_load_file(bs, image_handle, s_InitrdPath,
+                        &initrd_buffer, &initrd_file_size) == 0) {
+        print_str("Initrd loaded: addr=0x");
+        print_hex((uint64_t)(uintptr_t)initrd_buffer, 16);
+        print_str(" size=");
+        print_hex(initrd_file_size, 8);
+        print_char('\n');
+    } else {
+        print_str("No initrd found on ESP (optional)\n");
+    }
 
     /* Validate ELF header */
     int err = elf_validate((struct Elf64_Ehdr *)kernel_buffer);
@@ -282,7 +299,7 @@ void stage3_entry_64(struct Stage2Info *info)
     struct BootInfoHeader *bootinfo = handoff_build_bootinfo(
         bootinfo_buffer_64, sizeof(bootinfo_buffer_64),
         info, &load_result,
-        0, 0);
+        (uint64_t)(uintptr_t)initrd_buffer, initrd_file_size);
 
     if (!bootinfo) {
         stage3_panic("Failed to build BootInfo");

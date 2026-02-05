@@ -409,6 +409,7 @@ def create_efi_image(
     stage1_efi_path: Path,
     stage3_path: Path,
     kernel_path: Path,
+    initrd_path: Path = None,
     size_mb: int = 64
 ) -> None:
     """Create a UEFI bootable disk image with GPT and ESP."""
@@ -437,6 +438,8 @@ def create_efi_image(
     print(f"    EFI/SALTYOS/stage2.efi")
     print(f"    EFI/SALTYOS/stage3.bin")
     print(f"    EFI/SALTYOS/kernel.elf")
+    if initrd_path and initrd_path.exists():
+        print(f"    EFI/SALTYOS/initrd.img")
     print()
 
     # Validate EFI files exist
@@ -555,6 +558,14 @@ def create_efi_image(
             str(kernel_path), '::/EFI/SALTYOS/kernel.elf'
         ], check=True)
 
+        # Copy initrd if provided
+        if initrd_path and initrd_path.exists():
+            print(f"  Copying initrd to ESP...")
+            subprocess.run([
+                'mcopy', '-i', str(esp_img),
+                str(initrd_path), '::/EFI/SALTYOS/initrd.img'
+            ], check=True)
+
         # Read ESP and write to disk image at ESP_START_LBA
         print(f"  Writing ESP to disk image at LBA {ESP_START_LBA}...")
         with open(esp_img, 'rb') as f:
@@ -584,6 +595,7 @@ def create_disk_image(
     stage2_path: Path,
     stage3_path: Path,
     kernel_path: Path,
+    initrd_path: Path = None,
     size_mb: int = 8
 ) -> None:
     """Create a bootable disk image with Boot Manifest."""
@@ -625,13 +637,29 @@ def create_disk_image(
     kernel_sectors = len(kernel_data) // SECTOR_SIZE
     print(f"    Size: {kernel_actual_size} bytes ({kernel_sectors} sectors)")
 
+    # Read Initrd (optional)
+    initrd_lba = 0
+    initrd_actual_size = 0
+    initrd_data = b''
+    if initrd_path and initrd_path.exists():
+        print(f"  Initrd: {initrd_path}")
+        initrd_data = read_file(initrd_path)
+        initrd_actual_size = len(initrd_data)
+        initrd_data = pad_to_sector_boundary(initrd_data)
+        initrd_lba = KERNEL_LBA + kernel_sectors
+        initrd_sectors = len(initrd_data) // SECTOR_SIZE
+        print(f"    Size: {initrd_actual_size} bytes ({initrd_sectors} sectors)")
+        print(f"    LBA:  {initrd_lba}")
+
     # Create Boot Manifest
     print(f"  Creating Boot Manifest...")
     manifest_data = create_boot_manifest(
         stage3_lba=STAGE3_LBA,
         stage3_size=stage3_actual_size,
         kernel_lba=KERNEL_LBA,
-        kernel_size=kernel_actual_size
+        kernel_size=kernel_actual_size,
+        initrd_lba=initrd_lba,
+        initrd_size=initrd_actual_size,
     )
     manifest_data = pad_to_sectors(manifest_data, MANIFEST_SECTORS)
     print(f"    Manifest size: {len(manifest_data)} bytes")
@@ -641,10 +669,12 @@ def create_disk_image(
 
     # Validate that all components fit within the disk image
     last_used_sector = KERNEL_LBA + kernel_sectors
+    if initrd_data:
+        last_used_sector = initrd_lba + len(initrd_data) // SECTOR_SIZE
     if last_used_sector > total_sectors:
         raise ValueError(
-            f"Disk image too small: need {last_used_sector} sectors "
-            f"for kernel, but image has {total_sectors} sectors "
+            f"Disk image too small: need {last_used_sector} sectors, "
+            f"but image has {total_sectors} sectors "
             f"({size_mb}MB). Increase --size.")
 
     # Create image
@@ -656,6 +686,10 @@ def create_disk_image(
     image[STAGE2_LBA * SECTOR_SIZE : STAGE2_LBA * SECTOR_SIZE + len(stage2_data)] = stage2_data
     image[STAGE3_LBA * SECTOR_SIZE : STAGE3_LBA * SECTOR_SIZE + len(stage3_data)] = stage3_data
     image[KERNEL_LBA * SECTOR_SIZE : KERNEL_LBA * SECTOR_SIZE + len(kernel_data)] = kernel_data
+
+    # Write initrd after kernel
+    if initrd_data:
+        image[initrd_lba * SECTOR_SIZE : initrd_lba * SECTOR_SIZE + len(initrd_data)] = initrd_data
 
     # Write image to file
     write_file(output, bytes(image))
@@ -697,6 +731,12 @@ def main():
         action='store_true',
         help='Create UEFI image (with ESP) instead of BIOS image'
     )
+    parser.add_argument(
+        '--initrd',
+        type=Path,
+        default=None,
+        help='Path to initrd CPIO archive (optional)'
+    )
 
     args = parser.parse_args()
 
@@ -721,6 +761,7 @@ def main():
             stage2_efi_path=stage2_efi,
             stage3_path=stage3,
             kernel_path=kernel,
+            initrd_path=args.initrd,
             size_mb=args.size
         )
     else:
@@ -743,6 +784,7 @@ def main():
             stage2_path=stage2,
             stage3_path=stage3,
             kernel_path=kernel,
+            initrd_path=args.initrd,
             size_mb=args.size
         )
 

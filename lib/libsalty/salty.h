@@ -9,15 +9,17 @@
 
 #include <stdint.h>
 
-/* System call numbers */
+/* System call numbers (must match kernel/src/syscall/mod.rs Syscall enum) */
 #define SYS_SEND        0
 #define SYS_RECV        1
 #define SYS_CALL        2
 #define SYS_REPLY_RECV  3
-#define SYS_SIGNAL      4
-#define SYS_WAIT        5
-#define SYS_YIELD       6
-#define SYS_INVOKE      7
+#define SYS_NBSEND      4
+#define SYS_SIGNAL      5
+#define SYS_WAIT        6
+#define SYS_POLL        7
+#define SYS_YIELD       8
+#define SYS_INVOKE      9
 
 /* Capability handle (index into CSpace) */
 typedef uint64_t cap_t;

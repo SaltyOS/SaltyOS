@@ -12,6 +12,8 @@ mod arch;
 mod bootinfo;
 mod builtins;
 mod cap;
+mod cpio;
+mod elf;
 mod init;
 mod ipc;
 mod mm;
@@ -157,7 +159,7 @@ pub extern "C" fn kmain(raw_boot_info: *const u8) -> ! {
     arch::start_timer();
 
     // Bootstrap the first user-mode init task
-    init::bootstrap();
+    init::bootstrap(boot_info);
 
     // Dispatch the init task (context_switch to it)
     sched::scheduler::scheduler().reschedule();

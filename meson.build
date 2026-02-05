@@ -153,6 +153,30 @@ if build_userland
 endif
 
 # =============================================================================
+# Initrd Generation (CPIO archive with init.elf)
+# =============================================================================
+
+mkcpio = find_program('tools/mkcpio.py', required: false)
+initrd_args = []
+initrd_inputs = []
+initrd_target = []
+
+if build_userland and mkcpio.found()
+  initrd = custom_target('initrd',
+    input: [init_elf],
+    output: 'initrd.cpio',
+    command: [mkcpio,
+      '--output', '@OUTPUT@',
+      'init.elf=@INPUT0@',
+    ],
+    build_by_default: true,
+  )
+  initrd_args = ['--initrd', initrd.full_path()]
+  initrd_inputs = [initrd]
+  initrd_target = [initrd]
+endif
+
+# =============================================================================
 # Disk Image Generation
 # =============================================================================
 
@@ -162,27 +186,27 @@ if mkimage.found() and build_boot and build_kernel
 
   # BIOS disk image
   disk_image = custom_target('disk_image',
-    input: [mbr, stage2, stage3, kernel],
+    input: [mbr, stage2, stage3, kernel] + initrd_inputs,
     output: 'saltyos.img',
     command: [mkimage,
       '--build-dir', meson.project_build_root(),
       '--output', '@OUTPUT@',
       '--size', '8',
-    ],
+    ] + initrd_args,
     build_by_default: true,
   )
 
   # UEFI disk image
   if arch == 'x86_64'
     uefi_image = custom_target('uefi_image',
-      input: [efi, stage2_efi, stage3_uefi, kernel],
+      input: [efi, stage2_efi, stage3_uefi, kernel] + initrd_inputs,
       output: 'saltyos-uefi.img',
       command: [mkimage,
         '--efi',
         '--build-dir', meson.project_build_root(),
         '--output', '@OUTPUT@',
         '--size', '64',
-      ],
+      ] + initrd_args,
       build_by_default: false,
     )
   endif

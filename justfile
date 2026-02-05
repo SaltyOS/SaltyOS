@@ -17,21 +17,23 @@ setup:
         -Darch={{arch}} \
         -Dbuild_boot=true \
         -Dbuild_kernel=true \
-        -Dbuild_userland=false
+        -Dbuild_userland=true
 
 # Configure for x86_64
 setup-x86_64:
     meson setup {{builddir}}-x86_64 \
         -Darch=x86_64 \
         -Dbuild_boot=true \
-        -Dbuild_kernel=true
+        -Dbuild_kernel=true \
+        -Dbuild_userland=true
 
 # Configure for aarch64
 setup-aarch64:
     meson setup {{builddir}}-aarch64 \
         -Darch=aarch64 \
         -Dbuild_boot=true \
-        -Dbuild_kernel=true
+        -Dbuild_kernel=true \
+        -Dbuild_userland=true
 
 # Reconfigure with new options
 reconfigure *ARGS:

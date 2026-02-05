@@ -322,7 +322,8 @@ pub fn init_syscalls() {
             out("rdx") _,
             options(nostack)
         );
-        efer |= 1;  // Set SCE (SysCall Enable) bit
+        efer |= 1;        // Set SCE (SysCall Enable) bit
+        efer |= 1 << 11;  // Set NXE (No-Execute Enable) bit
         
         let efer_low = efer as u32;
         let efer_high = (efer >> 32) as u32;

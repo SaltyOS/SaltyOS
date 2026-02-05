@@ -5,7 +5,7 @@
  * and bootstraps the system.
  */
 
-#include "../../lib/libsalty/salty.h"
+#include "salty.h"
 
 /* Well-known capability slots in init's CSpace */
 #define CAP_SELF_TCB        0
