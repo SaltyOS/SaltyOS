@@ -3,7 +3,7 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use super::{PhysAddr, PAGE_SIZE};
-use crate::{BootInfo, MemoryKind};
+use crate::bootinfo::{MemoryKind, ParsedBootInfo};
 
 /// Maximum supported physical memory (4GB for now)
 const MAX_FRAMES: usize = 1024 * 1024; // 4GB / 4KB
@@ -25,11 +25,8 @@ pub struct FrameAllocator {
 }
 
 impl FrameAllocator {
-    pub fn new(boot_info: &BootInfo) -> Self {
+    pub fn new(boot_info: &ParsedBootInfo) -> Self {
         let bitmap = unsafe { &mut *(&raw mut BITMAP_STORAGE) };
-        
-        // Ensure bitmap is clear (optional if .bss is zeroed, but safe)
-        // for val in bitmap.iter_mut() { *val = 0; }
 
         let mut allocator = Self {
             bitmap,
@@ -38,18 +35,11 @@ impl FrameAllocator {
             free: 0,
         };
 
-        // Mark all frames as used initially
-        // Then mark usable memory as free
-
-        if !boot_info.memory_map.is_null() && boot_info.memory_map_len > 0 {
-            let entries = unsafe {
-                core::slice::from_raw_parts(boot_info.memory_map, boot_info.memory_map_len)
-            };
-
-            for entry in entries {
-                if entry.kind == MemoryKind::Usable {
-                    allocator.mark_region_free(entry.base, entry.length);
-                }
+        // Mark usable memory regions as free (all others stay as used/0)
+        let entries = &boot_info.memory_map[..boot_info.memory_map_len];
+        for entry in entries {
+            if entry.kind == MemoryKind::Usable {
+                allocator.mark_region_free(entry.base, entry.length);
             }
         }
 
@@ -105,6 +95,50 @@ impl FrameAllocator {
                 self.next_free = frame;
             }
         }
+    }
+
+    /// Allocate `count` contiguous physical frames.
+    /// Returns the physical address of the first frame, or None if unavailable.
+    pub fn alloc_contiguous(&mut self, count: usize) -> Option<PhysAddr> {
+        if count == 0 {
+            return None;
+        }
+        if count == 1 {
+            return self.alloc();
+        }
+
+        let mut run_start = self.next_free;
+        let mut run_len = 0usize;
+
+        let mut i = self.next_free;
+        while i < self.total {
+            let idx = i / 64;
+            let bit = i % 64;
+
+            if self.bitmap[idx] & (1u64 << bit) != 0 {
+                // Frame is free
+                if run_len == 0 {
+                    run_start = i;
+                }
+                run_len += 1;
+                if run_len == count {
+                    // Found a contiguous run, mark all as used
+                    for j in run_start..(run_start + count) {
+                        let jidx = j / 64;
+                        let jbit = j % 64;
+                        self.bitmap[jidx] &= !(1u64 << jbit);
+                    }
+                    self.free -= count;
+                    return Some((run_start * PAGE_SIZE) as PhysAddr);
+                }
+            } else {
+                // Frame is used, reset run
+                run_len = 0;
+            }
+            i += 1;
+        }
+
+        None
     }
 
     pub fn free_count(&self) -> usize {

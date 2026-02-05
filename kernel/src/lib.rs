@@ -9,12 +9,15 @@
 #![allow(dead_code)]
 
 mod arch;
+mod bootinfo;
 mod builtins;
 mod cap;
 mod ipc;
 mod mm;
 mod sched;
 mod syscall;
+
+pub use bootinfo::{FramebufferInfo, MemoryKind, MemoryMapEntry, ParsedBootInfo};
 
 use core::panic::PanicInfo;
 
@@ -90,12 +93,13 @@ fn serial_dec(mut val: u64) {
 
 /// Kernel entry point (called from bootloader)
 ///
+/// The bootloader passes a pointer to a TLV-encoded BootInfo structure via RDI.
+///
 /// # Safety
 /// This function is called directly from assembly with a specific ABI.
 #[unsafe(no_mangle)]
-pub extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
+pub extern "C" fn kmain(raw_boot_info: *const u8) -> ! {
     // Immediate confirmation we're in kernel (before anything else)
-    // SAFETY: Serial port 0x3F8 is standard COM1
     unsafe {
         for byte in b"[ENTRY] " {
             while (arch::inb(0x3F8 + 5) & 0x20) == 0 {}
@@ -103,41 +107,41 @@ pub extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
         }
     }
 
-    // Output to serial to confirm kernel is running
-    // SAFETY: Serial port 0x3F8 is standard COM1
     unsafe {
         for byte in b"\nSaltyOS Kernel loaded\n" {
-            // Wait for transmit buffer empty
             while (arch::inb(0x3F8 + 5) & 0x20) == 0 {}
             arch::outb(0x3F8, *byte);
         }
 
-        // Debug: Print kernel entry address and kmain address
         for byte in b"[KMAIN] Entry addr: " {
             while (arch::inb(0x3F8 + 5) & 0x20) == 0 {}
             arch::outb(0x3F8, *byte);
         }
         serial_hex(kmain as *const () as u64);
-        for byte in b"\n[KMAIN] Boot info: " {
+        for byte in b"\n[KMAIN] Boot info ptr: " {
             while (arch::inb(0x3F8 + 5) & 0x20) == 0 {}
             arch::outb(0x3F8, *byte);
         }
-        serial_hex(boot_info as u64);
+        serial_hex(raw_boot_info as u64);
         for byte in b"\n" {
             while (arch::inb(0x3F8 + 5) & 0x20) == 0 {}
             arch::outb(0x3F8, *byte);
         }
     }
 
-    // Initialize architecture-specific subsystems
-    // (includes memory management, which is needed before paging setup)
-    let boot_info_ref = if !boot_info.is_null() {
-        // SAFETY: Caller guarantees boot_info is valid when non-null
-        Some(unsafe { &*boot_info })
+    // Parse TLV-encoded BootInfo from bootloader
+    let boot_info = unsafe { bootinfo::parse(raw_boot_info) };
+
+    if let Some(info) = boot_info {
+        serial_puts("[KMAIN] BootInfo parsed: ");
+        serial_dec(info.memory_map_len as u64);
+        serial_puts(" memory map entries\n");
     } else {
-        None
-    };
-    arch::init(boot_info_ref);
+        serial_puts("[KMAIN] WARNING: Failed to parse BootInfo!\n");
+    }
+
+    // Initialize architecture-specific subsystems
+    arch::init(boot_info);
 
     // Initialize capability system
     cap::init();
@@ -151,71 +155,10 @@ pub extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
     // Start timer interrupts (scheduler must be ready first)
     arch::start_timer();
 
-    // TODO: Load init process from initrd
-    // TODO: Switch to userspace
-
     // For now, halt
     loop {
         arch::halt();
     }
-}
-
-/// Boot information passed from bootloader
-#[repr(C)]
-pub struct BootInfo {
-    /// Magic number for validation
-    pub magic: u64,
-    /// Memory map entries
-    pub memory_map: *const MemoryMapEntry,
-    /// Number of memory map entries
-    pub memory_map_len: usize,
-    /// Kernel physical base address
-    pub kernel_phys_base: u64,
-    /// Kernel virtual base address
-    pub kernel_virt_base: u64,
-    /// Initrd physical address
-    pub initrd_addr: u64,
-    /// Initrd size in bytes
-    pub initrd_size: u64,
-    /// Kernel command line
-    pub cmdline: *const u8,
-    /// ACPI RSDP address
-    pub rsdp_addr: u64,
-    /// Framebuffer info (if available)
-    pub framebuffer: FramebufferInfo,
-}
-
-/// Memory map entry from bootloader
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct MemoryMapEntry {
-    pub base: u64,
-    pub length: u64,
-    pub kind: MemoryKind,
-}
-
-/// Memory region type
-#[repr(u32)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum MemoryKind {
-    Usable = 1,
-    Reserved = 2,
-    AcpiReclaimable = 3,
-    AcpiNvs = 4,
-    BadMemory = 5,
-    Bootloader = 6,
-    Kernel = 7,
-}
-
-/// Framebuffer information
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct FramebufferInfo {
-    pub addr: u64,
-    pub width: u32,
-    pub height: u32,
-    pub pitch: u32,
-    pub bpp: u8,
 }
 
 /// Panic handler

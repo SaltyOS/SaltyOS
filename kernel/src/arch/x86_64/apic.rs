@@ -212,7 +212,8 @@ unsafe fn lapic_write(offset: u32, value: u32) {
 ///
 /// The 8259 PIC must be disabled when using APIC to avoid interrupt conflicts.
 /// We mask all IRQs on both PICs.
-fn disable_8259_pic() {
+/// Can be called early (before APIC init) to prevent spurious IRQ0 from PIT.
+pub fn disable_8259_pic() {
     unsafe {
         // ICW1: Initialize, ICW4 needed
         outb(0x20, 0x11);
@@ -330,6 +331,10 @@ pub fn start_timer() {
 /// interrupt processing and allow further interrupts.
 #[inline]
 pub fn eoi() {
+    // Guard: LAPIC must be mapped before we can write EOI
+    if unsafe { LAPIC_VIRTUAL_BASE } == 0 {
+        return;
+    }
     unsafe {
         lapic_write(LAPIC_EOI, 0);
     }
@@ -484,6 +489,11 @@ pub fn get_timer_ticks_per_ms() -> u32 {
 /// Called by the IDT handler when the timer interrupt fires.
 /// Increments the tick counter and notifies the scheduler.
 pub fn timer_handler() {
+    // Guard: LAPIC must be mapped before we can handle timer or send EOI
+    if unsafe { LAPIC_VIRTUAL_BASE } == 0 {
+        return;
+    }
+
     // Increment tick counter
     TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
 

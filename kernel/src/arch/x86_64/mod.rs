@@ -29,7 +29,7 @@ pub use context::context_switch;
 /// 7. Paging (kernel page tables + direct mapping)
 ///
 /// Timer is started later via start_timer() after scheduler is ready.
-pub fn init(boot_info: Option<&crate::BootInfo>) {
+pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // Debug: Print init entry
     unsafe {
         for byte in b"\n[ARCH] init() called\n" {
@@ -55,6 +55,10 @@ pub fn init(boot_info: Option<&crate::BootInfo>) {
     // Initialize IDT BEFORE APIC timer starts
     // This prevents triple fault when timer fires
     idt::init();
+
+    // Disable legacy PIC immediately after IDT is ready
+    // Prevents spurious IRQ0 (PIT timer) before APIC is initialized
+    apic::disable_8259_pic();
 
     // Debug: After IDT init
     unsafe {
@@ -202,70 +206,21 @@ pub fn init_syscalls() {
         }
 
         // Allocate kernel stack for syscall (16KB = 4 contiguous pages of 4KB each)
-        // We need to allocate frames and verify they are contiguous
         const STACK_PAGES: usize = 4;
         const STACK_SIZE: u64 = STACK_PAGES as u64 * 4096;
 
-        let mut stack_frames = [0u64; STACK_PAGES];
-        let mut stack_allocated = false;
-
-        // Try to allocate contiguous frames (retry a few times if needed)
-        for _attempt in 0..10 {
-            let mut first_frame: Option<u64> = None;
-            let mut all_contiguous = true;
-
-            for i in 0..STACK_PAGES {
-                if let Some(frame) = crate::mm::alloc_frame() {
-                    stack_frames[i] = frame;
-
-                    if let Some(first) = first_frame {
-                        // Check if this frame is contiguous with the previous one
-                        let expected = first + (i as u64 * 4096);
-                        if frame != expected {
-                            all_contiguous = false;
-                            break;
-                        }
-                    } else {
-                        first_frame = Some(frame);
-                    }
-                } else {
-                    // Allocation failed, free any allocated frames and retry
-                    for j in 0..i {
-                        if stack_frames[j] != 0 {
-                            crate::mm::free_frame(stack_frames[j]);
-                            stack_frames[j] = 0;
-                        }
-                    }
-                    all_contiguous = false;
-                    break;
+        let stack_bottom = match crate::mm::alloc_contiguous_frames(STACK_PAGES) {
+            Some(addr) => addr,
+            None => {
+                for byte in b"[SYSCALL] Failed to allocate contiguous kernel stack!\n" {
+                    while (inb(0x3F8 + 5) & 0x20) == 0 {}
+                    outb(0x3F8, *byte);
+                }
+                loop {
+                    core::arch::asm!("hlt");
                 }
             }
-
-            if all_contiguous {
-                stack_allocated = true;
-                break;
-            }
-
-            // Free all allocated frames and retry
-            for i in 0..STACK_PAGES {
-                if stack_frames[i] != 0 {
-                    crate::mm::free_frame(stack_frames[i]);
-                    stack_frames[i] = 0;
-                }
-            }
-        }
-
-        if !stack_allocated {
-            for byte in b"[SYSCALL] Failed to allocate contiguous kernel stack!\n" {
-                while (inb(0x3F8 + 5) & 0x20) == 0 {}
-                outb(0x3F8, *byte);
-            }
-            loop {
-                core::arch::asm!("hlt");
-            }
-        }
-
-        let stack_bottom = stack_frames[0];
+        };
         let stack_top = stack_bottom + STACK_SIZE;
 
         // Set kernel stack for current CPU (for syscall entry)

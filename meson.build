@@ -38,6 +38,7 @@ nasm = find_program('nasm', required: build_boot)
 
 # Binary tools
 objcopy = find_program('llvm-objcopy', required: build_boot)
+lld_link = find_program('lld-link', required: build_boot)
 
 # Rust: must be nightly (required for building core library)
 rustc = find_program('rustc', required: build_kernel)
@@ -174,7 +175,7 @@ if mkimage.found() and build_boot and build_kernel
   # UEFI disk image
   if arch == 'x86_64'
     uefi_image = custom_target('uefi_image',
-      input: [efi, stage2_efi, stage3, kernel],
+      input: [efi, stage2_efi, stage3_uefi, kernel],
       output: 'saltyos-uefi.img',
       command: [mkimage,
         '--efi',

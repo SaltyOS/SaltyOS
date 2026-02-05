@@ -21,13 +21,33 @@ from pathlib import Path
 # Constants
 SECTOR_SIZE = 512
 
-# Disk layout (BIOS)
+# Boot Manifest constants
+BOOT_MANIFEST_MAGIC = 0x53414C54594D414E  # "SALTYMAN" in little-endian
+BOOT_MANIFEST_VERSION = 1
+
+# Manifest entry types
+MANIFEST_ENTRY_KERNEL = 1
+MANIFEST_ENTRY_INITRD = 2
+MANIFEST_ENTRY_STAGE3 = 3
+MANIFEST_ENTRY_CONFIG = 4
+
+# Disk layout (BIOS) - Boot Reserved Area (BRA)
 MBR_LBA = 0
-STAGE2_LBA = 1
-STAGE2_SECTORS = 128        # 64KB reserved for Stage 2
-STAGE3_LBA = STAGE2_LBA + STAGE2_SECTORS  # 129
-STAGE3_SECTORS = 64         # 32KB reserved for Stage 3
-KERNEL_LBA = STAGE3_LBA + STAGE3_SECTORS  # 193
+BRA_START_LBA = 2048                        # 1 MiB offset
+MANIFEST_LBA = BRA_START_LBA                # Manifest at BRA start
+MANIFEST_SECTORS = 64                       # 32 KB for manifest
+STAGE2_LBA = BRA_START_LBA + MANIFEST_SECTORS  # 2112
+STAGE2_SECTORS = 128                        # 64 KB for Stage 2
+STAGE3_LBA = STAGE2_LBA + STAGE2_SECTORS    # 2240
+STAGE3_SECTORS = 512                        # 256 KB for Stage 3
+KERNEL_LBA = STAGE3_LBA + STAGE3_SECTORS    # 2752
+
+# Legacy layout (for backwards compatibility)
+LEGACY_STAGE2_LBA = 1
+LEGACY_STAGE2_SECTORS = 128
+LEGACY_STAGE3_LBA = LEGACY_STAGE2_LBA + LEGACY_STAGE2_SECTORS
+LEGACY_STAGE3_SECTORS = 64
+LEGACY_KERNEL_LBA = LEGACY_STAGE3_LBA + LEGACY_STAGE3_SECTORS
 
 # GPT configuration
 GPT_HEADER_LBA = 1
@@ -53,6 +73,34 @@ def guid_to_bytes(guid: uuid.UUID) -> bytes:
 def crc32_bytes(data: bytes) -> int:
     """Calculate CRC32 for GPT (uses standard zlib CRC32)."""
     return zlib.crc32(data) & 0xFFFFFFFF
+
+
+# CRC64-ECMA-182 lookup table (polynomial 0x42F0E1EBA9EA3693)
+_CRC64_TABLE = None
+
+def _init_crc64_table():
+    global _CRC64_TABLE
+    poly = 0x42F0E1EBA9EA3693
+    table = []
+    for i in range(256):
+        crc = i
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ poly
+            else:
+                crc >>= 1
+        table.append(crc)
+    _CRC64_TABLE = table
+
+def crc64_ecma(data: bytes) -> int:
+    """Calculate CRC64-ECMA-182 matching manifest_crc64() in manifest.h."""
+    global _CRC64_TABLE
+    if _CRC64_TABLE is None:
+        _init_crc64_table()
+    crc = 0xFFFFFFFFFFFFFFFF
+    for b in data:
+        crc = _CRC64_TABLE[(crc ^ b) & 0xFF] ^ (crc >> 8)
+    return crc ^ 0xFFFFFFFFFFFFFFFF
 
 
 def read_file(path: Path) -> bytes:
@@ -81,6 +129,129 @@ def pad_to_sector_boundary(data: bytes) -> bytes:
     if remainder != 0:
         data += b'\x00' * (SECTOR_SIZE - remainder)
     return data
+
+
+def create_manifest_extent(lba: int, sector_count: int) -> bytes:
+    """Create a ManifestExtent structure (16 bytes)."""
+    return struct.pack('<QII', lba, sector_count, 0)
+
+
+def create_manifest_entry(
+    entry_type: int,
+    entry_id: int,
+    size_bytes: int,
+    load_align: int,
+    extents: list
+) -> bytes:
+    """Create a BootManifestEntry structure (160 bytes)."""
+    entry = bytearray(160)
+
+    # type (2 bytes)
+    struct.pack_into('<H', entry, 0, entry_type)
+    # flags (2 bytes)
+    struct.pack_into('<H', entry, 2, 0)
+    # id (4 bytes)
+    struct.pack_into('<I', entry, 4, entry_id)
+    # size_bytes (8 bytes)
+    struct.pack_into('<Q', entry, 8, size_bytes)
+    # load_align (8 bytes)
+    struct.pack_into('<Q', entry, 16, load_align)
+    # extent_count (4 bytes)
+    struct.pack_into('<I', entry, 24, len(extents))
+    # reserved (4 bytes)
+    struct.pack_into('<I', entry, 28, 0)
+
+    # extents (8 * 16 bytes = 128 bytes)
+    for i, (lba, sectors) in enumerate(extents[:8]):
+        extent_offset = 32 + i * 16
+        entry[extent_offset:extent_offset + 16] = create_manifest_extent(lba, sectors)
+
+    return bytes(entry)
+
+
+def create_boot_manifest(
+    stage3_lba: int,
+    stage3_size: int,
+    kernel_lba: int,
+    kernel_size: int,
+    initrd_lba: int = 0,
+    initrd_size: int = 0
+) -> bytes:
+    """Create a Boot Manifest with header and entries."""
+
+    # Calculate entry table offset (after header)
+    header_size = 40  # BootManifestHeader size
+    entry_table_offset = header_size
+
+    # Create entries
+    entries = []
+
+    # Stage 3 entry
+    stage3_sectors = (stage3_size + SECTOR_SIZE - 1) // SECTOR_SIZE
+    entries.append(create_manifest_entry(
+        entry_type=MANIFEST_ENTRY_STAGE3,
+        entry_id=0,
+        size_bytes=stage3_size,
+        load_align=4096,
+        extents=[(stage3_lba, stage3_sectors)]
+    ))
+
+    # Kernel entry
+    kernel_sectors = (kernel_size + SECTOR_SIZE - 1) // SECTOR_SIZE
+    entries.append(create_manifest_entry(
+        entry_type=MANIFEST_ENTRY_KERNEL,
+        entry_id=1,
+        size_bytes=kernel_size,
+        load_align=2 * 1024 * 1024,  # 2MB alignment
+        extents=[(kernel_lba, kernel_sectors)]
+    ))
+
+    # Initrd entry (optional)
+    if initrd_lba and initrd_size:
+        initrd_sectors = (initrd_size + SECTOR_SIZE - 1) // SECTOR_SIZE
+        entries.append(create_manifest_entry(
+            entry_type=MANIFEST_ENTRY_INITRD,
+            entry_id=2,
+            size_bytes=initrd_size,
+            load_align=4096,
+            extents=[(initrd_lba, initrd_sectors)]
+        ))
+
+    # Create header
+    entry_count = len(entries)
+    entries_data = b''.join(entries)
+    manifest_size = header_size + len(entries_data)
+
+    header = bytearray(header_size)
+
+    # magic (8 bytes)
+    struct.pack_into('<Q', header, 0, BOOT_MANIFEST_MAGIC)
+    # version (2 bytes)
+    struct.pack_into('<H', header, 8, BOOT_MANIFEST_VERSION)
+    # header_size (2 bytes)
+    struct.pack_into('<H', header, 10, header_size)
+    # manifest_size (4 bytes)
+    struct.pack_into('<I', header, 12, manifest_size)
+    # flags (4 bytes) - HAS_CHECKSUM = (1 << 0)
+    MANIFEST_HDR_FLAG_HAS_CHECKSUM = 1 << 0
+    struct.pack_into('<I', header, 16, MANIFEST_HDR_FLAG_HAS_CHECKSUM)
+    # arch (2 bytes) - 1 = x86_64
+    struct.pack_into('<H', header, 20, 1)
+    # entry_count (2 bytes)
+    struct.pack_into('<H', header, 22, entry_count)
+    # entry_table_off (8 bytes)
+    struct.pack_into('<Q', header, 24, entry_table_offset)
+    # checksum (8 bytes) - set to 0 for CRC computation
+    struct.pack_into('<Q', header, 32, 0)
+
+    # Compute CRC64 over the full manifest (header + entries) with checksum=0
+    full_manifest = bytes(header) + entries_data
+    checksum = crc64_ecma(full_manifest)
+
+    # Write the computed checksum back into the header
+    struct.pack_into('<Q', header, 32, checksum)
+
+    return bytes(header) + entries_data
 
 
 def create_protective_mbr(total_sectors: int) -> bytes:
@@ -415,53 +586,77 @@ def create_disk_image(
     kernel_path: Path,
     size_mb: int = 8
 ) -> None:
-    """Create a bootable disk image."""
-    
+    """Create a bootable disk image with Boot Manifest."""
+
     print(f"Creating disk image: {output}")
-    print(f"  Layout:")
-    print(f"    MBR:     sector 0")
-    print(f"    Stage 2: sectors {STAGE2_LBA}-{STAGE2_LBA + STAGE2_SECTORS - 1}")
-    print(f"    Stage 3: sectors {STAGE3_LBA}-{STAGE3_LBA + STAGE3_SECTORS - 1}")
-    print(f"    Kernel:  sectors {KERNEL_LBA}+")
+    print(f"  Layout (Boot Reserved Area at LBA {BRA_START_LBA}):")
+    print(f"    MBR:      sector 0")
+    print(f"    Manifest: sectors {MANIFEST_LBA}-{MANIFEST_LBA + MANIFEST_SECTORS - 1}")
+    print(f"    Stage 2:  sectors {STAGE2_LBA}-{STAGE2_LBA + STAGE2_SECTORS - 1}")
+    print(f"    Stage 3:  sectors {STAGE3_LBA}-{STAGE3_LBA + STAGE3_SECTORS - 1}")
+    print(f"    Kernel:   sectors {KERNEL_LBA}+")
     print()
-    
+
     # Read MBR
     print(f"  MBR: {mbr_path}")
     mbr_data = read_file(mbr_path)
     if len(mbr_data) != SECTOR_SIZE:
         raise ValueError(f"MBR must be exactly {SECTOR_SIZE} bytes, got {len(mbr_data)}")
-    
+
     # Read Stage 2
     print(f"  Stage 2: {stage2_path}")
     stage2_data = read_file(stage2_path)
-    print(f"    Size: {len(stage2_data)} bytes ({(len(stage2_data) + SECTOR_SIZE - 1) // SECTOR_SIZE} sectors)")
+    stage2_actual_size = len(stage2_data)
+    print(f"    Size: {stage2_actual_size} bytes ({(stage2_actual_size + SECTOR_SIZE - 1) // SECTOR_SIZE} sectors)")
     stage2_data = pad_to_sectors(stage2_data, STAGE2_SECTORS)
-    
+
     # Read Stage 3
     print(f"  Stage 3: {stage3_path}")
     stage3_data = read_file(stage3_path)
-    print(f"    Size: {len(stage3_data)} bytes ({(len(stage3_data) + SECTOR_SIZE - 1) // SECTOR_SIZE} sectors)")
+    stage3_actual_size = len(stage3_data)
+    print(f"    Size: {stage3_actual_size} bytes ({(stage3_actual_size + SECTOR_SIZE - 1) // SECTOR_SIZE} sectors)")
     stage3_data = pad_to_sectors(stage3_data, STAGE3_SECTORS)
-    
+
     # Read Kernel
     print(f"  Kernel: {kernel_path}")
     kernel_data = read_file(kernel_path)
+    kernel_actual_size = len(kernel_data)
     kernel_data = pad_to_sector_boundary(kernel_data)
     kernel_sectors = len(kernel_data) // SECTOR_SIZE
-    print(f"    Size: {len(kernel_data)} bytes ({kernel_sectors} sectors)")
-    
+    print(f"    Size: {kernel_actual_size} bytes ({kernel_sectors} sectors)")
+
+    # Create Boot Manifest
+    print(f"  Creating Boot Manifest...")
+    manifest_data = create_boot_manifest(
+        stage3_lba=STAGE3_LBA,
+        stage3_size=stage3_actual_size,
+        kernel_lba=KERNEL_LBA,
+        kernel_size=kernel_actual_size
+    )
+    manifest_data = pad_to_sectors(manifest_data, MANIFEST_SECTORS)
+    print(f"    Manifest size: {len(manifest_data)} bytes")
+
     # Calculate total image size
     total_sectors = size_mb * 1024 * 1024 // SECTOR_SIZE
-    
+
+    # Validate that all components fit within the disk image
+    last_used_sector = KERNEL_LBA + kernel_sectors
+    if last_used_sector > total_sectors:
+        raise ValueError(
+            f"Disk image too small: need {last_used_sector} sectors "
+            f"for kernel, but image has {total_sectors} sectors "
+            f"({size_mb}MB). Increase --size.")
+
     # Create image
     image = bytearray(total_sectors * SECTOR_SIZE)
-    
+
     # Write components
     image[MBR_LBA * SECTOR_SIZE : MBR_LBA * SECTOR_SIZE + len(mbr_data)] = mbr_data
+    image[MANIFEST_LBA * SECTOR_SIZE : MANIFEST_LBA * SECTOR_SIZE + len(manifest_data)] = manifest_data
     image[STAGE2_LBA * SECTOR_SIZE : STAGE2_LBA * SECTOR_SIZE + len(stage2_data)] = stage2_data
     image[STAGE3_LBA * SECTOR_SIZE : STAGE3_LBA * SECTOR_SIZE + len(stage3_data)] = stage3_data
     image[KERNEL_LBA * SECTOR_SIZE : KERNEL_LBA * SECTOR_SIZE + len(kernel_data)] = kernel_data
-    
+
     # Write image to file
     write_file(output, bytes(image))
     print(f"\n  Created {output} ({size_mb}MB)")
@@ -509,7 +704,7 @@ def main():
         # UEFI mode
         stage1_efi = args.build_dir / 'boot' / 'BOOTX64.EFI'
         stage2_efi = args.build_dir / 'boot' / 'stage2.efi'
-        stage3 = args.build_dir / 'boot' / 'stage3.bin'
+        stage3 = args.build_dir / 'boot' / 'stage3_uefi.bin'
         kernel = args.build_dir / 'kernel' / 'kernel.elf'
 
         # Validate paths

@@ -15,7 +15,7 @@ pub use vspace::{
     set_pending_deactivate, take_pending_deactivate, DeactivateResult, VSpace, VSpaceTracking,
 };
 
-use crate::BootInfo;
+use crate::ParsedBootInfo;
 
 /// Page size (4KB)
 pub const PAGE_SIZE: usize = 4096;
@@ -35,7 +35,7 @@ pub type VirtAddr = u64;
 static mut FRAME_ALLOCATOR: Option<FrameAllocator> = None;
 
 /// Initialize memory management from boot info
-pub fn init(boot_info: &BootInfo) {
+pub fn init(boot_info: &ParsedBootInfo) {
     // SAFETY: Single-threaded initialization
     unsafe {
         (*(&raw mut FRAME_ALLOCATOR)) = Some(FrameAllocator::new(boot_info));
@@ -46,6 +46,11 @@ pub fn init(boot_info: &BootInfo) {
 pub fn alloc_frame() -> Option<PhysAddr> {
     // SAFETY: Single-threaded access, interrupts disabled during allocation
     unsafe { (*(&raw mut FRAME_ALLOCATOR)).as_mut()?.alloc() }
+}
+
+/// Allocate contiguous physical frames
+pub fn alloc_contiguous_frames(count: usize) -> Option<PhysAddr> {
+    unsafe { (*(&raw mut FRAME_ALLOCATOR)).as_mut()?.alloc_contiguous(count) }
 }
 
 /// Free a physical frame

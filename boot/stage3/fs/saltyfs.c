@@ -1,116 +1,98 @@
-/* SaltyOS SaltyFS Read-Only Driver
- * SPDX-License-Identifier: GPL-2.0-only
+/* SPDX-License-Identifier: GPL-2.0-only */
+/*
+ * SaltyOS Bootloader - SaltyFS Filesystem Driver
  *
- * Minimal read-only driver for booting
+ * Optional SaltyFS support for loading files from native filesystem.
+ * This is NOT required for the mandatory boot path (raw extents).
+ *
+ * Status: Stub implementation - filesystem design pending.
  */
 
-#include "../../common/types.h"
+#include "fs.h"
+#include "../config.h"
 
-/* SaltyFS magic number */
-#define SALTYFS_MAGIC 0x53414C545946530ULL  /* "SALTYFS\0" */
+#if CONFIG_FS_SALTYFS
 
-/* Block size */
-#define SALTYFS_BLOCK_SIZE 4096
+/* SaltyFS magic: "SALTYFS\0" */
+#define SALTYFS_MAGIC 0x5346595453414C53ULL
 
-/* Superblock (stored at block 0) */
-struct saltyfs_super {
+/* SaltyFS superblock */
+struct SaltyFS_Superblock {
     uint64_t magic;
-    uint64_t version;
-    uint64_t block_count;
+    uint32_t version;
+    uint32_t flags;
+    uint64_t block_size;
+    uint64_t total_blocks;
     uint64_t free_blocks;
     uint64_t root_inode;
-    uint64_t inode_count;
-    uint64_t snapshot_root;
-    uint8_t  uuid[16];
-    char     label[64];
-    uint8_t  reserved[384];
-};
+    uint64_t inode_table_block;
+    uint64_t block_bitmap_block;
+    uint64_t checksum;
+} PACKED;
 
-/* Inode structure */
-struct saltyfs_inode {
-    uint64_t mode;
-    uint64_t uid;
-    uint64_t gid;
+/* SaltyFS inode */
+struct SaltyFS_Inode {
+    uint32_t mode;
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t nlinks;
     uint64_t size;
     uint64_t atime;
     uint64_t mtime;
     uint64_t ctime;
-    uint64_t block_count;
-    uint64_t direct[12];
-    uint64_t indirect;
-    uint64_t double_indirect;
-    uint64_t triple_indirect;
-    uint8_t  reserved[40];
+    uint64_t blocks[12];        /* Direct blocks */
+    uint64_t indirect_block;    /* Single indirect */
+    uint64_t double_indirect;   /* Double indirect */
+    uint64_t triple_indirect;   /* Triple indirect */
+} PACKED;
+
+/* SaltyFS context */
+struct SaltyFS_Context {
+    struct DiskDevice *disk;
+    struct SaltyFS_Superblock sb;
 };
 
-/* Directory entry */
-struct saltyfs_dirent {
-    uint64_t inode;
-    uint16_t rec_len;
-    uint8_t  name_len;
-    uint8_t  file_type;
-    char     name[244];
-};
-
-/* File types */
-#define SALTYFS_FT_UNKNOWN  0
-#define SALTYFS_FT_REG      1
-#define SALTYFS_FT_DIR      2
-#define SALTYFS_FT_SYMLINK  7
-
-/* Mount state */
-static struct {
-    bool mounted;
-    struct saltyfs_super super;
-    uint64_t device_start_lba;
-} saltyfs_state = { .mounted = false };
-
-/* Block read function (provided by driver layer) */
-extern int disk_read_blocks(uint64_t lba, uint32_t count, void *buffer);
-
-/* Mount filesystem */
-int saltyfs_mount(uint64_t partition_lba) {
-    if (saltyfs_state.mounted) {
-        return -1;  /* Already mounted */
-    }
-
-    saltyfs_state.device_start_lba = partition_lba;
-
-    /* Read superblock */
-    if (disk_read_blocks(partition_lba, 1, &saltyfs_state.super) != 0) {
-        return -2;
-    }
-
-    /* Verify magic */
-    if (saltyfs_state.super.magic != SALTYFS_MAGIC) {
-        return -3;
-    }
-
-    saltyfs_state.mounted = true;
-    return 0;
+/*
+ * Initialize SaltyFS filesystem
+ *
+ * Returns: 0 on success, error code otherwise
+ */
+int saltyfs_init(struct DiskDevice *disk, struct SaltyFS_Context *ctx)
+{
+    (void)disk;
+    (void)ctx;
+    /* TODO: Implement SaltyFS initialization */
+    return FS_ERR_NOT_IMPL;
 }
 
-/* Read file by path */
-int saltyfs_read_file(const char *path, void *buffer, size_t max_size, size_t *out_size) {
-    if (!saltyfs_state.mounted) {
-        return -1;
-    }
-
-    /* TODO: Implement path traversal */
-    /* 1. Start at root inode */
-    /* 2. Parse path components */
-    /* 3. Look up each component in directory */
-    /* 4. Read final file data */
-
+/*
+ * Open a file by path
+ *
+ * Returns: 0 on success, error code otherwise
+ */
+int saltyfs_open(struct SaltyFS_Context *ctx, const char *path, struct FSFile *file)
+{
+    (void)ctx;
     (void)path;
+    (void)file;
+    /* TODO: Implement file open */
+    return FS_ERR_NOT_IMPL;
+}
+
+/*
+ * Read from file
+ *
+ * Returns: Number of bytes read, or negative error code
+ */
+ssize_t saltyfs_read(struct SaltyFS_Context *ctx, struct FSFile *file,
+                     void *buffer, size_t size)
+{
+    (void)ctx;
+    (void)file;
     (void)buffer;
-    (void)max_size;
-    (void)out_size;
-
-    return -1;  /* Not implemented */
+    (void)size;
+    /* TODO: Implement file read */
+    return -FS_ERR_NOT_IMPL;
 }
 
-/* Unmount filesystem */
-void saltyfs_unmount(void) {
-    saltyfs_state.mounted = false;
-}
+#endif /* CONFIG_FS_SALTYFS */

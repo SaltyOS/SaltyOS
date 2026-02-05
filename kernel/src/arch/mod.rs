@@ -18,7 +18,7 @@ pub use x86_64::context_switch;
 pub use x86_64::{send_ipi, IpiKind};
 
 /// Initialize architecture-specific subsystems
-pub fn init(boot_info: Option<&crate::BootInfo>) {
+pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     #[cfg(target_arch = "x86_64")]
     x86_64::init(boot_info);
 }

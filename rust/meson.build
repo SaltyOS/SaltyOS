@@ -24,8 +24,8 @@ rust_core_args = [
   '--target=' + rust_target,
   '-C', 'panic=abort',
   '-C', 'opt-level=2',
-  '-C', 'code-model=kernel',
-  '-C', 'relocation-model=static',
+  '-C', 'code-model=small',
+  '-C', 'relocation-model=pic',
 ]
 
 # Step 1: Build core library from rust-src
