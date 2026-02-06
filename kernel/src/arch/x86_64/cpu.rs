@@ -110,6 +110,14 @@ pub fn current_cpu() -> u32 {
     cpu_id
 }
 
+/// Set GS base for a specific CPU by index
+///
+/// Used during AP init before GS is functional.
+pub fn write_gs_base_for_cpu(cpu_id: usize) {
+    let base = unsafe { &PER_CPU_DATA[cpu_id] as *const _ as u64 };
+    write_gs_base_msr(base);
+}
+
 /// Write to GS base using MSR
 fn write_gs_base_msr(base: u64) {
     unsafe {

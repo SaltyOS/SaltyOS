@@ -8,7 +8,6 @@ subdir('init')
 subdir('rtld')
 subdir('console')
 
-# TODO: Build each userland component
-# subdir('procmgr')
-# subdir('vfs')
-# subdir('nameserv')
+subdir('nameserv')
+subdir('procmgr')
+subdir('vfs')

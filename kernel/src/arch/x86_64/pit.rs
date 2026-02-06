@@ -139,8 +139,6 @@ pub fn delay_us(microseconds: u32) {
 
     // For very short delays (< 10us), just use a few cycles
     if microseconds < 10 {
-        // Approximately 3-4 cycles per loop iteration on modern CPUs
-        // At 3 GHz, that's about 0.1 ns per iteration
         let iterations = microseconds * 30;
         for _ in 0..iterations {
             unsafe { core::arch::asm!("nop") };
@@ -148,8 +146,19 @@ pub fn delay_us(microseconds: u32) {
         return;
     }
 
-    // For longer delays, use PIT calibration
-    calibrate_sleep_us(microseconds);
+    // The PIT counter wraps every ~1ms (DIVISOR ticks).
+    // For delays > ~500us, break into smaller chunks to avoid
+    // wrap-around issues in the counter tracking.
+    // Each chunk is at most 500us (about half a PIT cycle).
+    let chunk_us = 500u32;
+    let mut remaining = microseconds;
+    while remaining > chunk_us {
+        calibrate_sleep_us(chunk_us);
+        remaining -= chunk_us;
+    }
+    if remaining > 0 {
+        calibrate_sleep_us(remaining);
+    }
 }
 
 /// Get approximate time since boot in milliseconds

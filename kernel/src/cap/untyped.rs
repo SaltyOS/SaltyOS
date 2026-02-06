@@ -8,6 +8,7 @@
 
 use super::slot::{free_slot, get_cap, get_meta, CapSlot, INVALID_SLOT, MAX_SLOTS};
 use super::{CapError, ObjectType, CDT};
+use crate::cap::cnode::CNODE_SIZE;
 use crate::mm::{self, PhysAddr, PAGE_SIZE};
 use core::mem::MaybeUninit;
 
@@ -347,6 +348,16 @@ impl UntypedMemory {
     ) -> Result<(), CapError> {
         let obj_size = object_size(new_type, size_bits);
         let total_size = obj_size * num_objects;
+
+        // Validate destination range before probing slot occupancy.
+        // Without this, out-of-range indices look "not empty" and are
+        // misreported as SlotOccupied.
+        let end = dest_offset
+            .checked_add(num_objects)
+            .ok_or(CapError::InvalidSlot)?;
+        if end > CNODE_SIZE {
+            return Err(CapError::InvalidSlot);
+        }
 
         // Check sufficient memory
         if self.available() < total_size {

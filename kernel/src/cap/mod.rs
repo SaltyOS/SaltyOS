@@ -316,4 +316,163 @@ mod tests {
         assert!(cap.has_right(CapRights::WRITE));
         assert!(!cap.has_right(CapRights::GRANT));
     }
+
+    #[test]
+    fn test_mint_badge() {
+        use core::sync::atomic::Ordering;
+
+        // Create a fake Endpoint object on the stack
+        let obj = KernelObject::new(ObjectType::Endpoint, 0);
+        let obj_ptr = &obj as *const KernelObject as *mut KernelObject;
+
+        // Set up source capability in a slot
+        let src_slot = alloc_slot().unwrap();
+        let dest_slot = alloc_slot().unwrap();
+
+        let src_cap = get_cap_mut(src_slot);
+        src_cap.object = obj_ptr;
+        src_cap.obj_type = ObjectType::Endpoint;
+        src_cap.rights = CapRights::SEND | CapRights::RECV | CapRights::GRANT;
+        src_cap.badge = 0;
+        src_cap.depth = 0;
+
+        CDT::insert_root(src_slot);
+
+        // Mint with badge=42, rights=SEND only (no GRANT, required for badged caps)
+        let badge: u64 = 42;
+        let new_rights = CapRights::SEND;
+        let result = get_cap(src_slot).mint(src_slot, badge, new_rights, dest_slot);
+        assert!(result.is_ok());
+
+        // Verify minted capability
+        let minted = get_cap(dest_slot);
+        assert_eq!(minted.badge, 42);
+        assert_eq!(minted.obj_type, ObjectType::Endpoint);
+        assert!(minted.has_right(CapRights::SEND));
+        assert!(!minted.has_right(CapRights::RECV));
+        assert!(!minted.has_right(CapRights::GRANT));
+        assert_eq!(minted.depth, 1);
+        assert_eq!(minted.object, obj_ptr);
+
+        // Verify refcount was incremented (1 original + 1 mint = 2)
+        assert_eq!(obj.ref_count.load(Ordering::Acquire), 2);
+
+        // Verify CDT relationship
+        assert_eq!(CDT::parent(dest_slot), src_slot);
+        assert!(CDT::has_children(src_slot));
+
+        // Clean up: remove CDT links and free slots
+        CDT::remove(dest_slot);
+        CDT::remove(src_slot);
+        nullify_capability(src_slot);
+        nullify_capability(dest_slot);
+        free_slot(src_slot);
+        free_slot(dest_slot);
+    }
+
+    #[test]
+    fn test_mint_rejects_non_endpoint() {
+        // Mint should fail for non-Endpoint types
+        let src_slot = alloc_slot().unwrap();
+        let dest_slot = alloc_slot().unwrap();
+
+        let src_cap = get_cap_mut(src_slot);
+        src_cap.obj_type = ObjectType::Frame; // Not an endpoint
+        src_cap.rights = CapRights::GRANT;
+
+        CDT::insert_root(src_slot);
+
+        let result = get_cap(src_slot).mint(src_slot, 1, CapRights::READ, dest_slot);
+        assert!(matches!(result, Err(CapError::InvalidOperation)));
+
+        CDT::remove(src_slot);
+        nullify_capability(src_slot);
+        free_slot(src_slot);
+        free_slot(dest_slot);
+    }
+
+    #[test]
+    fn test_mint_rejects_grant_in_badge() {
+        // Badged caps must not have Grant right
+        let obj = KernelObject::new(ObjectType::Endpoint, 0);
+        let obj_ptr = &obj as *const KernelObject as *mut KernelObject;
+
+        let src_slot = alloc_slot().unwrap();
+        let dest_slot = alloc_slot().unwrap();
+
+        let src_cap = get_cap_mut(src_slot);
+        src_cap.object = obj_ptr;
+        src_cap.obj_type = ObjectType::Endpoint;
+        src_cap.rights = CapRights::SEND | CapRights::GRANT;
+
+        CDT::insert_root(src_slot);
+
+        let result = get_cap(src_slot).mint(
+            src_slot,
+            99,
+            CapRights::SEND | CapRights::GRANT, // Grant not allowed in minted cap
+            dest_slot,
+        );
+        assert!(matches!(result, Err(CapError::InvalidBadge)));
+
+        CDT::remove(src_slot);
+        nullify_capability(src_slot);
+        free_slot(src_slot);
+        free_slot(dest_slot);
+    }
+
+    #[test]
+    fn test_copy_reduced_rights() {
+        let obj = KernelObject::new(ObjectType::Endpoint, 0);
+        let obj_ptr = &obj as *const KernelObject as *mut KernelObject;
+
+        let src_slot = alloc_slot().unwrap();
+        let dest_slot = alloc_slot().unwrap();
+
+        let src_cap = get_cap_mut(src_slot);
+        src_cap.object = obj_ptr;
+        src_cap.obj_type = ObjectType::Endpoint;
+        src_cap.rights = CapRights::SEND | CapRights::RECV | CapRights::GRANT;
+        src_cap.depth = 0;
+
+        CDT::insert_root(src_slot);
+
+        // Copy with reduced rights (SEND only)
+        let result = get_cap(src_slot).copy(src_slot, CapRights::SEND, dest_slot);
+        assert!(result.is_ok());
+
+        let copied = get_cap(dest_slot);
+        assert!(copied.has_right(CapRights::SEND));
+        assert!(!copied.has_right(CapRights::RECV));
+        assert!(!copied.has_right(CapRights::GRANT));
+        assert_eq!(copied.depth, 1);
+        assert_eq!(CDT::parent(dest_slot), src_slot);
+
+        CDT::remove(dest_slot);
+        CDT::remove(src_slot);
+        nullify_capability(src_slot);
+        nullify_capability(dest_slot);
+        free_slot(src_slot);
+        free_slot(dest_slot);
+    }
+
+    #[test]
+    fn test_copy_rejects_without_grant() {
+        let src_slot = alloc_slot().unwrap();
+        let dest_slot = alloc_slot().unwrap();
+
+        let src_cap = get_cap_mut(src_slot);
+        src_cap.obj_type = ObjectType::Endpoint;
+        src_cap.rights = CapRights::SEND | CapRights::RECV; // No GRANT
+
+        CDT::insert_root(src_slot);
+
+        let result = get_cap(src_slot).copy(src_slot, CapRights::SEND, dest_slot);
+        assert!(matches!(result, Err(CapError::InsufficientRights)));
+
+        CDT::remove(src_slot);
+        nullify_capability(src_slot);
+        free_slot(src_slot);
+        free_slot(dest_slot);
+    }
 }

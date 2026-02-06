@@ -18,9 +18,11 @@ pub use queue::WaitQueue;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Message {
-    /// Message label/tag
+    /// Message label (extracted from msg_info bits 51:12)
     pub label: u64,
-    /// Message registers
+    /// Number of valid message registers (extracted from msg_info bits 6:0)
+    pub length: usize,
+    /// Message registers (inline fastpath: 4 in registers, overflow via IPC buffer)
     pub regs: [u64; 4],
 }
 
@@ -28,10 +30,35 @@ impl Message {
     pub const fn empty() -> Self {
         Self {
             label: 0,
+            length: 0,
             regs: [0; 4],
         }
     }
 }
+
+/// IPC Buffer layout (mapped into user VSpace, shared between kernel and user)
+///
+/// Total size: 4096 bytes (one page)
+#[repr(C)]
+pub struct IpcBuffer {
+    /// Message registers MR0..MR19 (overflow beyond the 4 inline regs)
+    pub msg: [u64; 20],         // 0x000: 160 bytes
+    /// Badge received from sender
+    pub badge: u64,             // 0x0A0: 8 bytes
+    /// Capability slots to transfer (sender-side: indices into sender's CNode)
+    pub caps: [u64; 4],         // 0x0A8: 32 bytes
+    /// CNode for receiving transferred capabilities
+    pub receive_cnode: u64,     // 0x0C8: 8 bytes
+    /// Starting slot index in receive CNode
+    pub receive_index: u64,     // 0x0D0: 8 bytes
+    /// CNode depth for receive
+    pub receive_depth: u64,     // 0x0D8: 8 bytes
+    /// Reserved for future use
+    pub reserved: [u64; 480],   // 0x0E0: 3840 bytes
+}
+
+// Compile-time assertion: IpcBuffer fits in one page
+const _: () = assert!(core::mem::size_of::<IpcBuffer>() <= 4096);
 
 /// Fault types for user-mode exception delivery
 #[repr(u64)]
@@ -55,6 +82,7 @@ pub enum FaultType {
 pub fn vm_fault_message(address: u64, error_code: u64, rip: u64, is_instr: bool) -> Message {
     Message {
         label: FaultType::VMFault as u64,
+        length: 4,
         regs: [address, error_code, rip, is_instr as u64],
     }
 }
@@ -70,6 +98,7 @@ pub fn vm_fault_message(address: u64, error_code: u64, rip: u64, is_instr: bool)
 pub fn user_exception_message(vector: u64, error_code: u64, rip: u64, rsp: u64) -> Message {
     Message {
         label: FaultType::UserException as u64,
+        length: 4,
         regs: [vector, error_code, rip, rsp],
     }
 }

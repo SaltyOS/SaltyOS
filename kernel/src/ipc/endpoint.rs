@@ -59,7 +59,7 @@ impl Endpoint {
                     // Set up reply capability in receiver's TCB
                     // The receiver (server) can now reply to the sender (client)
                     (*receiver).reply_tcb = current;
-                    (*receiver).reply_can_grant = false; // TODO: check sender's grant right
+                    (*receiver).reply_can_grant = true;
 
                     self.transfer_message(current, receiver, msg, badge);
 
@@ -106,7 +106,7 @@ impl Endpoint {
                     // Set up reply capability in receiver's (current thread's) TCB
                     // The receiver can now reply to the sender
                     (*current).reply_tcb = sender;
-                    (*current).reply_can_grant = false;
+                    (*current).reply_can_grant = true;
 
                     self.transfer_message(sender, current, &msg, badge);
 
@@ -198,9 +198,14 @@ impl Endpoint {
     }
 
     /// Transfer message from sender to receiver
+    ///
+    /// Copies the message and badge to the receiver's TCB.
+    /// If the message has extra caps (capability transfer), those are
+    /// transferred from sender's CSpace to receiver's CSpace via their
+    /// IPC buffers.
     unsafe fn transfer_message(
         &self,
-        _sender: *mut Tcb,
+        sender: *mut Tcb,
         receiver: *mut Tcb,
         msg: &Message,
         badge: u64,
@@ -209,6 +214,64 @@ impl Endpoint {
             // Copy message and badge to receiver's TCB
             (*receiver).saved_caller_msg = *msg;
             (*receiver).saved_caller_badge = badge;
+
+            // Check for capability transfer via IPC buffer
+            // The sender's IPC buffer caps[] array holds slot indices into
+            // sender's CNode. The receiver's IPC buffer receive_cnode/index/depth
+            // specify where to place received caps.
+            let sender_buf = (*sender).ipc_buffer;
+            let receiver_buf = (*receiver).ipc_buffer;
+            if sender_buf != 0 && receiver_buf != 0 {
+                let sender_ipc = sender_buf as *const super::IpcBuffer;
+                let receiver_ipc = receiver_buf as *const super::IpcBuffer;
+
+                // Read extra_caps count from receiver's IPC buffer
+                // (sender signals how many caps via msg_info extra_caps field)
+                let recv_cnode_ptr = (*receiver_ipc).receive_cnode;
+                let recv_index = (*receiver_ipc).receive_index;
+
+                if recv_cnode_ptr != 0 {
+                    // Transfer up to 4 caps
+                    for i in 0..4u64 {
+                        let src_slot_idx = (*sender_ipc).caps[i as usize];
+                        if src_slot_idx == 0 { break; }
+
+                        // Look up cap in sender's CSpace
+                        let sender_cspace = &*(*sender).cspace_root;
+                        let src_cap = match sender_cspace.get(src_slot_idx as usize) {
+                            Some(c) => c,
+                            None => continue,
+                        };
+
+                        // Check Grant right
+                        if !src_cap.has_right(crate::cap::CapRights::GRANT) {
+                            continue;
+                        }
+
+                        // Look up receiver's CNode
+                        let recv_cspace = &*(*receiver).cspace_root;
+                        let recv_cnode_cap = match recv_cspace.get(recv_cnode_ptr as usize) {
+                            Some(c) => c,
+                            None => continue,
+                        };
+
+                        if recv_cnode_cap.obj_type != crate::cap::ObjectType::CNode {
+                            continue;
+                        }
+
+                        let recv_cnode = &mut *(recv_cnode_cap.object as *mut crate::cap::CNode);
+                        let dest_slot = (recv_index + i) as usize;
+
+                        // Copy capability into receiver's CNode
+                        let _ = recv_cnode.copy_slot(
+                            dest_slot,
+                            sender_cspace,
+                            src_slot_idx as usize,
+                            src_cap.rights,
+                        );
+                    }
+                }
+            }
         }
     }
 

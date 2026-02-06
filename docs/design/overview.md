@@ -137,13 +137,15 @@ Three-level memory abstraction:
 
 ### Userspace Components
 
-| Component | Responsibility |
-|-----------|---------------|
-| `init` | System initialization, server spawning |
-| `procmgr` | Process lifecycle, capability distribution |
-| `vfs` | Virtual filesystem, SaltyFS driver |
-| `nameserv` | Service discovery (endpoint lookup) |
-| `drivers/` | Device drivers (PCI, NVMe, USB, etc.) |
+| Component | Responsibility | Status |
+|-----------|---------------|--------|
+| `init` | System initialization, server spawning | Implemented |
+| `console` | Serial console server (COM1 via IoPort caps) | Implemented |
+| `rtld` | Runtime dynamic linker (shared library loading) | Implemented |
+| `procmgr` | Process lifecycle, capability distribution | Planned |
+| `vfs` | Virtual filesystem, SaltyFS driver | Planned |
+| `nameserv` | Service discovery (endpoint lookup) | Planned |
+| `drivers/` | Device drivers (PCI, NVMe, USB, etc.) | Planned |
 
 ## Boot Sequence
 
@@ -197,10 +199,32 @@ Standard L4/seL4 uses inline capabilities (single word). We chose fat capabiliti
 - **No runtime**: `#![no_std]` freestanding support
 - **Trade-off**: Steeper learning curve, some FFI complexity
 
+## Current Status
+
+### Implemented
+- Capability system with fat capabilities (32 bytes), CDT, copy/mint/move/mutate/revoke/delete
+- Synchronous IPC (endpoints) with send/recv/call/reply_recv/NBSend
+- Asynchronous notifications (signal/wait/poll) with combined endpoint wait
+- IPC buffer with message overflow (MR4-MR19) and capability transfer
+- Fault handling via fault endpoints with reply-to-resume
+- EDF scheduler with budget enforcement
+- Virtual memory management (VSpace map/unmap/MapPT)
+- IRQ handling via notifications with IRQHandler capabilities
+- I/O port capabilities (IoPort_In8/Out8/In16/Out16)
+- Debug syscalls (DebugPutChar, DebugDumpState)
+- 3-stage bootloader (BIOS and UEFI)
+- Init process with multi-phase bootstrap
+- Console server (serial I/O via IoPort caps)
+- Runtime dynamic linker (rtld)
+
+### In Progress
+- SMP support (ACPI MADT parser, AP trampoline, per-CPU queues)
+- Userspace servers (procmgr, vfs, nameserv)
+
 ## Future Directions
 
 1. **Formal Verification**: seL4-style proofs for critical paths
-2. **SMP Support**: Per-CPU run queues, IPI-based migration
+2. **IPC Assembly Fastpath**: Register-to-register transfer in assembly for < 500 cycle IPC
 3. **Nested Virtualization**: Hypervisor mode for VMs
 4. **Network Stack**: Userspace TCP/IP implementation
 5. **GUI Compositor**: Wayland-like display server

@@ -1,0 +1,482 @@
+//! ACPI MADT Parser for SMP CPU Discovery
+//!
+//! Parses the RSDP → XSDT/RSDT → MADT chain to discover Application Processors.
+//!
+//! SPDX-License-Identifier: GPL-2.0-only
+
+use super::cpu::MAX_CPUS;
+use crate::mm::PHYS_MAP_OFFSET;
+
+/// CPU descriptor discovered from ACPI MADT
+#[derive(Clone, Copy)]
+pub struct CpuDescriptor {
+    /// Local APIC ID
+    pub apic_id: u8,
+    /// True if this is the Bootstrap Processor
+    pub is_bsp: bool,
+    /// True if this CPU is enabled (or online-capable)
+    pub enabled: bool,
+}
+
+impl CpuDescriptor {
+    const fn empty() -> Self {
+        Self {
+            apic_id: 0,
+            is_bsp: false,
+            enabled: false,
+        }
+    }
+}
+
+/// I/O APIC descriptor discovered from ACPI MADT
+#[derive(Clone, Copy)]
+pub struct IoApicDescriptor {
+    pub id: u8,
+    pub base_addr: u32,
+    pub gsi_base: u32,
+}
+
+/// Result of MADT parsing
+pub struct MadtInfo {
+    pub cpus: [CpuDescriptor; MAX_CPUS],
+    pub cpu_count: usize,
+    pub io_apic_addr: u32,
+    pub io_apic_gsi_base: u32,
+}
+
+/// RSDP (Root System Description Pointer) v1
+#[repr(C, packed)]
+struct Rsdp {
+    signature: [u8; 8],  // "RSD PTR "
+    checksum: u8,
+    oem_id: [u8; 6],
+    revision: u8,
+    rsdt_address: u32,
+}
+
+/// RSDP v2 (XSDP) extends RSDP with 64-bit XSDT pointer
+#[repr(C, packed)]
+struct Rsdp2 {
+    rsdp: Rsdp,
+    length: u32,
+    xsdt_address: u64,
+    extended_checksum: u8,
+    reserved: [u8; 3],
+}
+
+/// ACPI SDT header (common to all tables)
+#[repr(C, packed)]
+struct SdtHeader {
+    signature: [u8; 4],
+    length: u32,
+    revision: u8,
+    checksum: u8,
+    oem_id: [u8; 6],
+    oem_table_id: [u8; 8],
+    oem_revision: u32,
+    creator_id: u32,
+    creator_revision: u32,
+}
+
+/// MADT (Multiple APIC Description Table) header
+#[repr(C, packed)]
+struct MadtHeader {
+    header: SdtHeader,
+    local_apic_addr: u32,
+    flags: u32,
+}
+
+/// MADT entry header
+#[repr(C, packed)]
+struct MadtEntryHeader {
+    entry_type: u8,
+    length: u8,
+}
+
+/// MADT Type 0: Processor Local APIC
+#[repr(C, packed)]
+struct MadtLocalApic {
+    header: MadtEntryHeader,
+    processor_id: u8,
+    apic_id: u8,
+    flags: u32,
+}
+
+/// MADT Type 1: I/O APIC
+#[repr(C, packed)]
+struct MadtIoApic {
+    header: MadtEntryHeader,
+    id: u8,
+    reserved: u8,
+    address: u32,
+    gsi_base: u32,
+}
+
+// MADT entry type constants
+const MADT_TYPE_LOCAL_APIC: u8 = 0;
+const MADT_TYPE_IO_APIC: u8 = 1;
+
+// Local APIC flags
+const LAPIC_FLAG_ENABLED: u32 = 1 << 0;
+const LAPIC_FLAG_ONLINE_CAPABLE: u32 = 1 << 1;
+
+/// Serial port helpers
+const SERIAL_PORT: u16 = 0x3F8;
+
+unsafe fn serial_putc(c: u8) {
+    unsafe {
+        while (super::inb(SERIAL_PORT + 5) & 0x20) == 0 {}
+        super::outb(SERIAL_PORT, c);
+    }
+}
+
+unsafe fn serial_puts(s: &str) {
+    for byte in s.bytes() {
+        unsafe { serial_putc(byte); }
+    }
+}
+
+unsafe fn serial_hex(mut val: u64) {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    unsafe { serial_puts("0x"); }
+    if val == 0 {
+        unsafe { serial_putc(b'0'); }
+        return;
+    }
+    let mut buf = [0u8; 16];
+    let mut pos = 15;
+    while val > 0 {
+        buf[pos] = HEX_CHARS[(val & 0xF) as usize];
+        val >>= 4;
+        pos -= 1;
+    }
+    for &c in &buf[(pos + 1)..] {
+        unsafe { serial_putc(c); }
+    }
+}
+
+unsafe fn serial_dec(mut val: u64) {
+    if val == 0 {
+        unsafe { serial_putc(b'0'); }
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut pos = 19;
+    while val > 0 {
+        buf[pos] = b'0' + ((val % 10) as u8);
+        val /= 10;
+        pos -= 1;
+    }
+    for &c in &buf[(pos + 1)..] {
+        unsafe { serial_putc(c); }
+    }
+}
+
+/// Validate an ACPI table checksum
+///
+/// All bytes in the structure must sum to zero (mod 256).
+unsafe fn validate_checksum(ptr: *const u8, len: usize) -> bool {
+    let mut sum: u8 = 0;
+    for i in 0..len {
+        sum = sum.wrapping_add(unsafe { *ptr.add(i) });
+    }
+    sum == 0
+}
+
+/// Convert a physical address to a virtual pointer using the direct mapping
+fn phys_to_ptr<T>(phys: u64) -> *const T {
+    (phys + PHYS_MAP_OFFSET) as *const T
+}
+
+/// Scan for RSDP in standard BIOS locations
+///
+/// Searches:
+/// 1. EBDA (Extended BIOS Data Area) - first 1KB starting at address in BDA[0x40E]
+/// 2. Main BIOS area: 0xE0000 - 0xFFFFF
+///
+/// Returns the physical address of the RSDP, or 0 if not found.
+pub unsafe fn scan_for_rsdp() -> u64 {
+    unsafe {
+        serial_puts("[ACPI] Scanning for RSDP...\n");
+
+        // Search EBDA (address stored at BDA 0x040E, segment value)
+        let ebda_segment_ptr = phys_to_ptr::<u16>(0x040E);
+        let ebda_segment = core::ptr::read_unaligned(ebda_segment_ptr);
+        let ebda_base = (ebda_segment as u64) << 4;
+
+        if ebda_base >= 0x80000 && ebda_base < 0xA0000 {
+            if let Some(addr) = scan_region_for_rsdp(ebda_base, 1024) {
+                serial_puts("[ACPI] Found RSDP in EBDA at ");
+                serial_hex(addr);
+                serial_putc(b'\n');
+                return addr;
+            }
+        }
+
+        // Search main BIOS area: 0xE0000 - 0xFFFFF
+        if let Some(addr) = scan_region_for_rsdp(0xE0000, 0x20000) {
+            serial_puts("[ACPI] Found RSDP in BIOS area at ");
+            serial_hex(addr);
+            serial_putc(b'\n');
+            return addr;
+        }
+
+        serial_puts("[ACPI] RSDP not found\n");
+        0
+    }
+}
+
+/// Scan a physical memory region for the RSDP signature "RSD PTR "
+///
+/// Scans on 16-byte boundaries as required by the ACPI spec.
+unsafe fn scan_region_for_rsdp(base_phys: u64, length: usize) -> Option<u64> {
+    let base_ptr: *const u8 = phys_to_ptr(base_phys);
+
+    let mut offset = 0;
+    while offset + 20 <= length {
+        let ptr = unsafe { base_ptr.add(offset) };
+        let sig = unsafe { core::slice::from_raw_parts(ptr, 8) };
+
+        if sig == b"RSD PTR " {
+            // Validate checksum (first 20 bytes for RSDP v1)
+            if unsafe { validate_checksum(ptr, 20) } {
+                return Some(base_phys + offset as u64);
+            }
+        }
+
+        offset += 16; // RSDP must be on 16-byte boundary
+    }
+
+    None
+}
+
+/// Parse the ACPI MADT to discover CPUs
+///
+/// # Safety
+/// `rsdp_phys` must be a valid physical address of the ACPI RSDP structure.
+pub unsafe fn parse_madt(rsdp_phys: u64) -> Option<MadtInfo> {
+    if rsdp_phys == 0 {
+        unsafe { serial_puts("[ACPI] No RSDP address provided\n"); }
+        return None;
+    }
+
+    unsafe {
+        serial_puts("[ACPI] RSDP at phys ");
+        serial_hex(rsdp_phys);
+        serial_putc(b'\n');
+    }
+
+    // Read RSDP
+    let rsdp_ptr: *const Rsdp = phys_to_ptr(rsdp_phys);
+    let rsdp = unsafe { &*rsdp_ptr };
+
+    // Validate RSDP signature
+    if &rsdp.signature != b"RSD PTR " {
+        unsafe { serial_puts("[ACPI] Invalid RSDP signature\n"); }
+        return None;
+    }
+
+    // Validate RSDP v1 checksum (first 20 bytes)
+    if !unsafe { validate_checksum(rsdp_ptr as *const u8, 20) } {
+        unsafe { serial_puts("[ACPI] RSDP checksum failed\n"); }
+        return None;
+    }
+
+    unsafe {
+        serial_puts("[ACPI] RSDP valid, revision=");
+        serial_dec(rsdp.revision as u64);
+        serial_putc(b'\n');
+    }
+
+    // Find MADT via XSDT (revision >= 2) or RSDT (revision 0)
+    let madt_phys = if rsdp.revision >= 2 {
+        let rsdp2 = unsafe { &*(rsdp_ptr as *const Rsdp2) };
+        unsafe { find_madt_in_xsdt(rsdp2.xsdt_address) }
+    } else {
+        unsafe { find_madt_in_rsdt(rsdp.rsdt_address as u64) }
+    };
+
+    let madt_phys = match madt_phys {
+        Some(addr) => addr,
+        None => {
+            unsafe { serial_puts("[ACPI] MADT not found\n"); }
+            return None;
+        }
+    };
+
+    unsafe {
+        serial_puts("[ACPI] MADT at phys ");
+        serial_hex(madt_phys);
+        serial_putc(b'\n');
+    }
+
+    // Parse MADT entries
+    unsafe { parse_madt_entries(madt_phys) }
+}
+
+/// Search XSDT (64-bit pointers) for the MADT table
+unsafe fn find_madt_in_xsdt(xsdt_phys: u64) -> Option<u64> {
+    let xsdt_ptr: *const SdtHeader = phys_to_ptr(xsdt_phys);
+    let xsdt = unsafe { &*xsdt_ptr };
+
+    let header_size = core::mem::size_of::<SdtHeader>();
+    let entry_count = (xsdt.length as usize - header_size) / 8;
+
+    unsafe {
+        serial_puts("[ACPI] XSDT has ");
+        serial_dec(entry_count as u64);
+        serial_puts(" entries\n");
+    }
+
+    let entries_ptr = unsafe { (xsdt_ptr as *const u8).add(header_size) as *const u64 };
+
+    for i in 0..entry_count {
+        let table_phys = unsafe { core::ptr::read_unaligned(entries_ptr.add(i)) };
+        let table_hdr: *const SdtHeader = phys_to_ptr(table_phys);
+        let sig = unsafe { (*table_hdr).signature };
+
+        if &sig == b"APIC" {
+            return Some(table_phys);
+        }
+    }
+
+    None
+}
+
+/// Search RSDT (32-bit pointers) for the MADT table
+unsafe fn find_madt_in_rsdt(rsdt_phys: u64) -> Option<u64> {
+    let rsdt_ptr: *const SdtHeader = phys_to_ptr(rsdt_phys);
+    let rsdt = unsafe { &*rsdt_ptr };
+
+    let header_size = core::mem::size_of::<SdtHeader>();
+    let entry_count = (rsdt.length as usize - header_size) / 4;
+
+    unsafe {
+        serial_puts("[ACPI] RSDT has ");
+        serial_dec(entry_count as u64);
+        serial_puts(" entries\n");
+    }
+
+    let entries_ptr = unsafe { (rsdt_ptr as *const u8).add(header_size) as *const u32 };
+
+    for i in 0..entry_count {
+        let table_phys = unsafe { core::ptr::read_unaligned(entries_ptr.add(i)) } as u64;
+        let table_hdr: *const SdtHeader = phys_to_ptr(table_phys);
+        let sig = unsafe { (*table_hdr).signature };
+
+        if &sig == b"APIC" {
+            return Some(table_phys);
+        }
+    }
+
+    None
+}
+
+/// Parse MADT entries to extract CPU and I/O APIC information
+unsafe fn parse_madt_entries(madt_phys: u64) -> Option<MadtInfo> {
+    let madt_ptr: *const MadtHeader = phys_to_ptr(madt_phys);
+    let madt = unsafe { &*madt_ptr };
+
+    let total_length = madt.header.length as usize;
+    let entries_start = core::mem::size_of::<MadtHeader>();
+
+    let base_ptr = madt_ptr as *const u8;
+
+    let mut info = MadtInfo {
+        cpus: [CpuDescriptor::empty(); MAX_CPUS],
+        cpu_count: 0,
+        io_apic_addr: 0,
+        io_apic_gsi_base: 0,
+    };
+
+    // Read BSP's APIC ID from the LAPIC ID register to identify which CPU is BSP
+    let bsp_apic_id = unsafe { read_bsp_apic_id() };
+
+    unsafe {
+        serial_puts("[ACPI] BSP APIC ID: ");
+        serial_dec(bsp_apic_id as u64);
+        serial_putc(b'\n');
+    }
+
+    let mut offset = entries_start;
+    while offset + 2 <= total_length {
+        let entry_hdr = unsafe { &*(base_ptr.add(offset) as *const MadtEntryHeader) };
+        let entry_len = entry_hdr.length as usize;
+
+        if entry_len < 2 || offset + entry_len > total_length {
+            break;
+        }
+
+        match entry_hdr.entry_type {
+            MADT_TYPE_LOCAL_APIC => {
+                if entry_len >= core::mem::size_of::<MadtLocalApic>() {
+                    let lapic = unsafe { &*(base_ptr.add(offset) as *const MadtLocalApic) };
+                    let flags = lapic.flags;
+                    let enabled = (flags & LAPIC_FLAG_ENABLED) != 0
+                        || (flags & LAPIC_FLAG_ONLINE_CAPABLE) != 0;
+
+                    if enabled && info.cpu_count < MAX_CPUS {
+                        let is_bsp = lapic.apic_id == bsp_apic_id;
+                        info.cpus[info.cpu_count] = CpuDescriptor {
+                            apic_id: lapic.apic_id,
+                            is_bsp,
+                            enabled: true,
+                        };
+                        info.cpu_count += 1;
+
+                        unsafe {
+                            serial_puts("[ACPI]   CPU ");
+                            serial_dec(lapic.processor_id as u64);
+                            serial_puts(" APIC_ID=");
+                            serial_dec(lapic.apic_id as u64);
+                            if is_bsp { serial_puts(" (BSP)"); }
+                            serial_putc(b'\n');
+                        }
+                    }
+                }
+            }
+            MADT_TYPE_IO_APIC => {
+                if entry_len >= core::mem::size_of::<MadtIoApic>() {
+                    let io_apic = unsafe { &*(base_ptr.add(offset) as *const MadtIoApic) };
+                    info.io_apic_addr = io_apic.address;
+                    info.io_apic_gsi_base = io_apic.gsi_base;
+
+                    unsafe {
+                        serial_puts("[ACPI]   I/O APIC id=");
+                        serial_dec(io_apic.id as u64);
+                        serial_puts(" addr=");
+                        serial_hex(io_apic.address as u64);
+                        serial_puts(" gsi_base=");
+                        serial_dec(io_apic.gsi_base as u64);
+                        serial_putc(b'\n');
+                    }
+                }
+            }
+            _ => {
+                // Skip unknown entry types
+            }
+        }
+
+        offset += entry_len;
+    }
+
+    unsafe {
+        serial_puts("[ACPI] Found ");
+        serial_dec(info.cpu_count as u64);
+        serial_puts(" CPU(s)\n");
+    }
+
+    if info.cpu_count > 0 {
+        Some(info)
+    } else {
+        None
+    }
+}
+
+/// Read the BSP's Local APIC ID from the APIC ID register
+unsafe fn read_bsp_apic_id() -> u8 {
+    let apic_base = super::apic::LAPIC_BASE + PHYS_MAP_OFFSET;
+    let id_reg = unsafe { ((apic_base + super::apic::LAPIC_ID as u64) as *const u32).read_volatile() };
+    // APIC ID is in bits 24-31
+    ((id_reg >> 24) & 0xFF) as u8
+}

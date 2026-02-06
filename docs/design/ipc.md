@@ -11,6 +11,20 @@ SaltyOS implements two IPC primitives:
 
 This dual-primitive design follows the L4/seL4 tradition, providing both reliable message passing and efficient event notification.
 
+## Implementation Status
+
+| Feature | Status |
+|---------|--------|
+| Endpoint send/recv | Implemented |
+| Endpoint call/reply_recv | Implemented |
+| NBSend (non-blocking) | Implemented |
+| Notifications (signal/wait/poll) | Implemented |
+| Combined notification + endpoint wait | Implemented |
+| IPC buffer overflow (MR4-MR19) | Implemented |
+| Capability transfer via IPC | Implemented |
+| Fault delivery via endpoint | Implemented |
+| IPC assembly fastpath | Not yet implemented |
+
 ## Synchronous IPC (Endpoints)
 
 ### Concept
@@ -18,8 +32,8 @@ This dual-primitive design follows the L4/seL4 tradition, providing both reliabl
 An Endpoint is a kernel object that facilitates synchronous message passing between threads:
 
 - **Rendezvous**: Sender blocks until receiver is ready (and vice versa)
-- **Zero-copy potential**: Large transfers via page donation
-- **Badge**: Identifies sender to receiver
+- **Badge**: Identifies sender to receiver (set via `CNode_Mint`)
+- **Reply capability**: One-shot reply path for Call/ReplyRecv RPC pattern
 
 ```mermaid
 sequenceDiagram
@@ -30,16 +44,16 @@ sequenceDiagram
     Note over Client: Wants to send message
     Client->>Endpoint: send(msg)
     Note over Client: BLOCKED (waiting for receiver)
-    
+
     Note over Server: Ready to receive
     Server->>Endpoint: recv()
     Note over Endpoint: Rendezvous!
-    
+
     Endpoint-->>Server: msg + sender_badge
     Endpoint-->>Client: UNBLOCKED
-    
+
     Note over Server: Process request...
-    
+
     Server->>Client: reply(response)
     Note over Client: Receives response
 ```
@@ -47,320 +61,145 @@ sequenceDiagram
 ### Endpoint Structure
 
 ```rust
-/// Synchronous IPC Endpoint
 pub struct Endpoint {
-    /// Queue of waiting senders
-    send_queue: ThreadQueue,
-    
-    /// Queue of waiting receivers  
-    recv_queue: ThreadQueue,
-    
-    /// Current state
+    pub header: KernelObject,
     state: EndpointState,
+    send_queue: WaitQueue,
+    recv_queue: WaitQueue,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum EndpointState {
-    /// No threads waiting
     Idle,
-    /// One or more senders waiting
     SendBlocked,
-    /// One or more receivers waiting
     RecvBlocked,
-}
-
-impl Endpoint {
-    pub fn new() -> Self {
-        Self {
-            send_queue: ThreadQueue::new(),
-            recv_queue: ThreadQueue::new(),
-            state: EndpointState::Idle,
-        }
-    }
 }
 ```
 
-### IPC Message Format
+### Message Format
 
 ```rust
-/// IPC Message stored in thread's IPC buffer
-#[repr(C)]
-pub struct IpcMessage {
-    /// Message label (operation identifier)
-    pub label: u64,
-    
-    /// Number of capability slots transferred
-    pub caps_transferred: u8,
-    
-    /// Number of extra capability slots (for receiving)
-    pub caps_unwrapped: u8,
-    
-    /// Reserved
-    _reserved: [u8; 6],
-    
-    /// Message registers (MR0-MR3)
-    pub mrs: [u64; 4],
-    
-    /// Extra words (for longer messages)
-    pub extra: [u64; IPC_EXTRA_WORDS],
+/// IPC Message (kernel-internal)
+pub struct Message {
+    pub label: u64,      // Extracted from msg_info bits 51:12
+    pub length: usize,   // Extracted from msg_info bits 6:0
+    pub regs: [u64; 4],  // Inline register MRs (MR0-MR3)
 }
+```
 
-/// Maximum message size in words
-pub const IPC_MAX_WORDS: usize = 4 + IPC_EXTRA_WORDS;
-pub const IPC_EXTRA_WORDS: usize = 16;
+Messages carry up to 4 inline register words. For longer messages (length > 4), additional words overflow to the IPC buffer.
+
+### Message Info Word
+
+The msg_info word packs label, length, and extra caps count:
+
+```
+Bits  6:0  = Length (0-127)
+Bits 11:7  = ExtraCaps (0-31)
+Bits 51:12 = Label (40 bits)
+Bits 63:52 = Reserved
 ```
 
 ### IPC Buffer
 
-Each thread has an IPC buffer page mapped at a known virtual address:
+Each thread has an IPC buffer (4KB page) mapped at a configurable virtual address:
 
+```rust
+#[repr(C)]
+pub struct IpcBuffer {
+    pub msg: [u64; 20],         // 0x000: MR0..MR19
+    pub badge: u64,             // 0x0A0: Received badge
+    pub caps: [u64; 4],         // 0x0A8: Cap slots to transfer (sender-side)
+    pub receive_cnode: u64,     // 0x0C8: CNode for receiving caps
+    pub receive_index: u64,     // 0x0D0: Starting slot index
+    pub receive_depth: u64,     // 0x0D8: CNode depth
+    pub reserved: [u64; 480],   // 0x0E0: Future use
+}
 ```
-┌─────────────────────────────────────────────┐
-│              IPC Buffer (4KB)                │
-├─────────────────────────────────────────────┤
-│  Offset 0x000: IpcMessage structure          │
-├─────────────────────────────────────────────┤
-│  Offset 0x100: Capability receive slots      │
-│               (up to 16 caps)                │
-├─────────────────────────────────────────────┤
-│  Offset 0x200: Extended message data         │
-│               (for large messages)           │
-├─────────────────────────────────────────────┤
-│  Offset 0x800: Reserved                      │
-└─────────────────────────────────────────────┘
-```
+
+**Message overflow:** MR0-MR3 are passed in CPU registers for low latency. When length > 4, the kernel reads MR4-MR19 from the sender's IPC buffer and writes them to the receiver's IPC buffer.
+
+**Capability transfer:** The sender sets `caps[0..3]` to slot indices in its CNode. The receiver configures `receive_cnode`, `receive_index`, and `receive_depth` to specify where received capabilities should be placed. The `ExtraCaps` field in msg_info indicates how many caps to transfer.
 
 ### Operations
 
 #### Send
 
-```rust
-/// Send a message through an endpoint
-pub fn sys_send(
-    tcb: &mut Tcb,
-    endpoint_cap: CapPtr,
-    msg_info: u64,
-) -> SyscallResult {
-    // Look up endpoint capability
-    let cap = tcb.cspace.lookup(endpoint_cap)?;
-    
-    if cap.cap_type != CapType::Endpoint {
-        return Err(SyscallError::InvalidCapability);
-    }
-    
-    if !cap.rights.contains(CapRights::SEND) {
-        return Err(SyscallError::InsufficientRights);
-    }
-    
-    let endpoint = unsafe { &mut *(cap.object as *mut Endpoint) };
-    let badge = cap.badge;
-    
-    do_send(tcb, endpoint, badge, msg_info)
-}
+```
+Fastpath (receiver waiting):
+  1. Pop receiver from recv_queue
+  2. Set reply_tcb in receiver's TCB (for Call pattern)
+  3. Transfer message: copy MRs + badge to receiver's saved state
+  4. Transfer capabilities if ExtraCaps > 0
+  5. Wake receiver (enqueue to scheduler)
 
-fn do_send(
-    sender: &mut Tcb,
-    endpoint: &mut Endpoint,
-    badge: u64,
-    msg_info: u64,
-) -> SyscallResult {
-    match endpoint.state {
-        EndpointState::Idle | EndpointState::SendBlocked => {
-            // No receiver ready - block sender
-            sender.state = ThreadState::BlockedOnSend { 
-                endpoint: endpoint.as_ref() 
-            };
-            endpoint.send_queue.push(sender);
-            endpoint.state = EndpointState::SendBlocked;
-            
-            // Yield to scheduler
-            schedule();
-            
-            // When we return, message has been delivered
-            Ok(0)
-        }
-        
-        EndpointState::RecvBlocked => {
-            // Receiver is waiting - immediate transfer
-            let receiver = endpoint.recv_queue.pop().unwrap();
-            
-            // Transfer message
-            transfer_ipc_message(sender, receiver, badge, msg_info);
-            
-            // Wake receiver
-            receiver.state = ThreadState::Ready;
-            scheduler::make_runnable(receiver);
-            
-            // Update endpoint state
-            if endpoint.recv_queue.is_empty() {
-                endpoint.state = EndpointState::Idle;
-            }
-            
-            Ok(0)
-        }
-    }
-}
+Slowpath (no receiver):
+  1. Push sender onto send_queue
+  2. Set state to SendBlocked
+  3. Block current thread (context switch)
 ```
 
 #### Receive
 
-```rust
-/// Receive a message from an endpoint
-pub fn sys_recv(
-    tcb: &mut Tcb,
-    endpoint_cap: CapPtr,
-) -> SyscallResult {
-    let cap = tcb.cspace.lookup(endpoint_cap)?;
-    
-    if cap.cap_type != CapType::Endpoint {
-        return Err(SyscallError::InvalidCapability);
-    }
-    
-    if !cap.rights.contains(CapRights::RECV) {
-        return Err(SyscallError::InsufficientRights);
-    }
-    
-    let endpoint = unsafe { &mut *(cap.object as *mut Endpoint) };
-    
-    do_recv(tcb, endpoint)
-}
+```
+Fastpath (sender waiting):
+  1. Pop sender from send_queue
+  2. Extract message from sender's BlockedReason
+  3. Set reply_tcb in current thread's TCB
+  4. Transfer message to current thread
+  5. Wake sender (unless fault-blocked)
 
-fn do_recv(
-    receiver: &mut Tcb,
-    endpoint: &mut Endpoint,
-) -> SyscallResult {
-    match endpoint.state {
-        EndpointState::Idle | EndpointState::RecvBlocked => {
-            // No sender ready - block receiver
-            receiver.state = ThreadState::BlockedOnReceive { 
-                endpoint: endpoint.as_ref() 
-            };
-            endpoint.recv_queue.push(receiver);
-            endpoint.state = EndpointState::RecvBlocked;
-            
-            // Yield to scheduler
-            schedule();
-            
-            // When we return, message is in IPC buffer
-            // Return badge from sender
-            Ok(receiver.ipc_badge)
-        }
-        
-        EndpointState::SendBlocked => {
-            // Sender is waiting - immediate transfer
-            let sender = endpoint.send_queue.pop().unwrap();
-            let badge = sender.ipc_badge;
-            
-            // Transfer message
-            transfer_ipc_message(sender, receiver, badge, sender.ipc_msg_info);
-            
-            // Wake sender
-            sender.state = ThreadState::Ready;
-            scheduler::make_runnable(sender);
-            
-            // Update endpoint state
-            if endpoint.send_queue.is_empty() {
-                endpoint.state = EndpointState::Idle;
-            }
-            
-            Ok(badge)
-        }
-    }
-}
+Slowpath (no sender):
+  1. Push receiver onto recv_queue
+  2. Set state to RecvBlocked
+  3. Block current thread
+  4. On wake: read message from saved_caller_msg
 ```
 
 #### Call (Send + Receive)
 
-```rust
-/// Send and wait for reply (RPC pattern)
-pub fn sys_call(
-    tcb: &mut Tcb,
-    endpoint_cap: CapPtr,
-    msg_info: u64,
-) -> SyscallResult {
-    let cap = tcb.cspace.lookup(endpoint_cap)?;
-    
-    if !cap.rights.contains(CapRights::CALL) {
-        return Err(SyscallError::InsufficientRights);
-    }
-    
-    let endpoint = unsafe { &mut *(cap.object as *mut Endpoint) };
-    
-    // Set up reply capability
-    let reply_cap = create_reply_cap(tcb);
-    
-    // Include reply cap in message
-    tcb.ipc_buffer.set_reply_cap(reply_cap);
-    
-    // Send the message
-    do_send(tcb, endpoint, cap.badge, msg_info)?;
-    
-    // Wait for reply (blocked on one-shot reply endpoint)
-    wait_for_reply(tcb)
-}
+Atomic send-then-block-for-reply:
+1. Perform send (which may fastpath or slowpath)
+2. Set current thread to ReplyWait blocked state
+3. Context switch
+4. On wake: reply message is in `saved_caller_msg`
+
+#### ReplyRecv
+
+Atomic reply-then-receive:
+1. Reply to `reply_tcb` (if non-null): copy reply message, wake caller
+2. Clear reply capability (one-shot)
+3. Perform receive on the endpoint
+
+### Capability Transfer
+
+When `ExtraCaps > 0` in the msg_info word, the kernel transfers capabilities from sender to receiver during message transfer:
+
+1. **Sender setup:** Write CNode slot indices into `ipc_buffer.caps[0..3]`
+2. **Receiver setup:** Configure `receive_cnode`, `receive_index`, `receive_depth`
+3. **Transfer:** For each cap (up to ExtraCaps count):
+   - Read sender's `caps[i]` (slot index in sender's CNode)
+   - Look up capability in sender's CSpace
+   - Check Grant right on the capability
+   - Copy into receiver's CNode at `receive_index + i`
+
+### Fault Delivery
+
+When a thread faults (page fault, invalid cap, etc.), the kernel delivers a fault message to the thread's fault handler endpoint:
+
+```
+Fault message format:
+  label  = fault type (e.g., VM_FAULT, CAP_FAULT)
+  length = 4
+  regs[0] = fault address
+  regs[1] = fault status / error code
+  regs[2] = faulting instruction pointer
+  regs[3] = reserved
 ```
 
-#### Reply + Receive
-
-```rust
-/// Reply to caller and wait for next request
-pub fn sys_reply_recv(
-    tcb: &mut Tcb,
-    endpoint_cap: CapPtr,
-    msg_info: u64,
-) -> SyscallResult {
-    // Reply to saved caller
-    if let Some(caller) = tcb.saved_caller.take() {
-        transfer_ipc_message(tcb, caller, 0, msg_info);
-        caller.state = ThreadState::Ready;
-        scheduler::make_runnable(caller);
-    }
-    
-    // Now receive next request
-    sys_recv(tcb, endpoint_cap)
-}
-```
-
-### Message Transfer
-
-```rust
-fn transfer_ipc_message(
-    sender: &Tcb,
-    receiver: &mut Tcb,
-    badge: u64,
-    msg_info: u64,
-) {
-    let msg_length = (msg_info & 0x7F) as usize;
-    let caps_count = ((msg_info >> 7) & 0x7) as usize;
-    
-    // Copy message registers
-    let src = &sender.ipc_buffer.mrs;
-    let dst = &mut receiver.ipc_buffer.mrs;
-    
-    for i in 0..msg_length.min(4) {
-        dst[i] = src[i];
-    }
-    
-    // Copy extra words if needed
-    if msg_length > 4 {
-        let src_extra = &sender.ipc_buffer.extra;
-        let dst_extra = &mut receiver.ipc_buffer.extra;
-        
-        for i in 0..(msg_length - 4).min(IPC_EXTRA_WORDS) {
-            dst_extra[i] = src_extra[i];
-        }
-    }
-    
-    // Transfer capabilities
-    for i in 0..caps_count {
-        transfer_cap(sender, receiver, i);
-    }
-    
-    // Set badge for receiver
-    receiver.ipc_badge = badge;
-    receiver.ipc_msg_info = msg_info;
-}
-```
+The faulting thread is always blocked (even on fastpath). The fault handler receives a reply capability and can:
+- Map the missing page and reply to resume the thread
+- Kill the thread by not replying
 
 ## Notifications
 
@@ -368,35 +207,23 @@ fn transfer_ipc_message(
 
 Notifications provide lightweight, asynchronous signaling:
 
-- **Word-sized bitmap or counter**: Very small kernel object
+- **Word-sized bitmap**: Very small kernel object
 - **Non-blocking signal**: Sender never blocks
-- **Coalescing**: Multiple signals merge into one
+- **Coalescing**: Multiple signals merge (OR semantics)
 
 Use cases:
 - IRQ delivery
 - Event flags
-- Semaphores
 - Waking async waiters
 
 ### Notification Structure
 
 ```rust
-/// Asynchronous notification object
 pub struct Notification {
-    /// Notification word (bitmap or counter)
-    word: AtomicU64,
-    
-    /// Thread waiting on this notification (if any)
-    waiting: Option<TcbRef>,
-}
-
-impl Notification {
-    pub fn new() -> Self {
-        Self {
-            word: AtomicU64::new(0),
-            waiting: None,
-        }
-    }
+    pub header: KernelObject,
+    word: u64,
+    waiting_tcb: *mut Tcb,
+    bound_tcb: *mut Tcb,
 }
 ```
 
@@ -404,284 +231,29 @@ impl Notification {
 
 #### Signal
 
-```rust
-/// Signal a notification (set bits)
-pub fn sys_signal(
-    tcb: &mut Tcb,
-    notif_cap: CapPtr,
-    bits: u64,
-) -> SyscallResult {
-    let cap = tcb.cspace.lookup(notif_cap)?;
-    
-    if cap.cap_type != CapType::Notification {
-        return Err(SyscallError::InvalidCapability);
-    }
-    
-    if !cap.rights.contains(CapRights::WRITE) {
-        return Err(SyscallError::InsufficientRights);
-    }
-    
-    let notif = unsafe { &*(cap.object as *const Notification) };
-    
-    // Atomically OR bits into notification word
-    notif.word.fetch_or(bits, Ordering::SeqCst);
-    
-    // Wake waiting thread if any
-    if let Some(waiter) = notif.waiting.take() {
-        waiter.state = ThreadState::Ready;
-        scheduler::make_runnable(waiter);
-    }
-    
-    Ok(0)
-}
-```
+Atomically ORs bits into the notification word. If a thread is waiting, it is woken with the accumulated word value.
 
 #### Wait
 
-```rust
-/// Wait on a notification
-pub fn sys_wait(
-    tcb: &mut Tcb,
-    notif_cap: CapPtr,
-) -> SyscallResult {
-    let cap = tcb.cspace.lookup(notif_cap)?;
-    
-    if cap.cap_type != CapType::Notification {
-        return Err(SyscallError::InvalidCapability);
-    }
-    
-    if !cap.rights.contains(CapRights::READ) {
-        return Err(SyscallError::InsufficientRights);
-    }
-    
-    let notif = unsafe { &mut *(cap.object as *mut Notification) };
-    
-    // Try to consume notification
-    let word = notif.word.swap(0, Ordering::SeqCst);
-    
-    if word != 0 {
-        // Notification was pending - return immediately
-        return Ok(word);
-    }
-    
-    // No notification - block
-    tcb.state = ThreadState::BlockedOnNotification { 
-        notification: notif.as_ref() 
-    };
-    notif.waiting = Some(tcb.as_ref());
-    
-    schedule();
-    
-    // When we wake, return the notification word
-    Ok(notif.word.swap(0, Ordering::SeqCst))
-}
-```
+If notification word is non-zero: returns immediately with value (word is cleared). Otherwise, blocks until signaled.
+
+#### Poll
+
+Non-blocking check. Returns current word value or WouldBlock.
 
 ### Combined Notification + Endpoint Wait
 
-A thread can bind a notification to itself, allowing simultaneous wait on both:
-
-```rust
-/// Wait on endpoint OR bound notification
-pub fn sys_recv_with_notification(
-    tcb: &mut Tcb,
-    endpoint_cap: CapPtr,
-) -> SyscallResult {
-    // Check bound notification first
-    if let Some(notif) = &tcb.bound_notification {
-        let word = notif.word.swap(0, Ordering::SeqCst);
-        if word != 0 {
-            // Notification ready - return it
-            return Ok(word | NOTIFICATION_FLAG);
-        }
-    }
-    
-    // Fall through to normal receive
-    sys_recv(tcb, endpoint_cap)
-}
-```
-
-## IPC Fastpath
-
-For performance, common IPC cases use an optimized fastpath:
-
-### Fastpath Conditions
-
-1. Send to endpoint with receiver waiting
-2. No capability transfer
-3. Message fits in registers (≤ 4 words)
-4. No other threads at higher priority
-5. Receiver not in same security domain (would be direct call)
-
-### Fastpath Implementation
-
-```rust
-#[inline(always)]
-fn ipc_fastpath(
-    sender: &mut Tcb,
-    endpoint: &mut Endpoint,
-    badge: u64,
-) -> bool {
-    // Check fastpath conditions
-    if endpoint.state != EndpointState::RecvBlocked {
-        return false;
-    }
-    
-    let receiver = endpoint.recv_queue.peek().unwrap();
-    
-    // Check no caps transferred
-    if sender.ipc_buffer.caps_transferred != 0 {
-        return false;
-    }
-    
-    // Check message fits in registers
-    if sender.ipc_msg_info & 0x7F > 4 {
-        return false;
-    }
-    
-    // Fastpath!
-    endpoint.recv_queue.pop();
-    
-    // Direct register transfer
-    receiver.context.regs[0] = sender.context.regs[0];  // MR0
-    receiver.context.regs[1] = sender.context.regs[1];  // MR1
-    receiver.context.regs[2] = sender.context.regs[2];  // MR2
-    receiver.context.regs[3] = sender.context.regs[3];  // MR3
-    receiver.context.regs[4] = badge;
-    receiver.context.regs[5] = sender.ipc_msg_info;
-    
-    // Direct context switch (skip scheduler)
-    receiver.state = ThreadState::Running;
-    sender.state = ThreadState::Ready;
-    
-    switch_to(receiver);
-    
-    true
-}
-```
+A thread can bind a notification to itself. When calling `recv()`, the kernel checks the bound notification first. If pending, the notification is returned instead of blocking on the endpoint.
 
 ## IRQ Handling
 
 IRQs are delivered via notifications:
 
-```mermaid
-graph LR
-    A[Hardware IRQ] --> B[Kernel IRQ Handler]
-    B --> C[Signal Notification]
-    C --> D[Wake Driver Thread]
-    D --> E[Handle IRQ in Userspace]
-    E --> F[Ack via IRQHandler cap]
+```
+Hardware IRQ → Kernel IRQ Handler → Signal Notification → Wake Driver Thread → Handle IRQ in Userspace → Ack via IRQHandler cap
 ```
 
-### IRQ Handler Object
-
-```rust
-pub struct IrqHandler {
-    /// IRQ number
-    irq: u32,
-    
-    /// Notification to signal on IRQ
-    notification: Option<NotificationRef>,
-    
-    /// Is IRQ acknowledged?
-    acked: bool,
-}
-
-impl IrqHandler {
-    /// Set notification for IRQ delivery
-    pub fn set_notification(&mut self, notif: NotificationRef) {
-        self.notification = Some(notif);
-    }
-    
-    /// Acknowledge IRQ (re-enable)
-    pub fn ack(&mut self) {
-        self.acked = true;
-        arch::unmask_irq(self.irq);
-    }
-}
-```
-
-### IRQ Delivery
-
-```rust
-/// Called from interrupt handler
-pub fn deliver_irq(irq: u32) {
-    let handler = IRQ_HANDLERS[irq as usize];
-    
-    if let Some(notif) = &handler.notification {
-        // Signal with IRQ bit
-        notif.word.fetch_or(1 << (irq % 64), Ordering::SeqCst);
-        
-        // Wake waiter if any
-        if let Some(waiter) = notif.waiting.take() {
-            waiter.state = ThreadState::Ready;
-            scheduler::make_runnable(waiter);
-        }
-    }
-    
-    // Mask IRQ until acked
-    handler.acked = false;
-    arch::mask_irq(irq);
-}
-```
-
-## Userspace Async Patterns
-
-Using sync IPC + notifications, userspace can build async patterns:
-
-### Ring Buffer + Notification
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                    Shared Memory                          │
-│  ┌────────────────────────────────────────────────────┐  │
-│  │              Ring Buffer                            │  │
-│  │  head ──► [msg0][msg1][msg2][msg3]... ◄── tail     │  │
-│  └────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────┘
-           │                              ▲
-           │ push                         │ pop
-           ▼                              │
-     ┌──────────┐                   ┌──────────┐
-     │  Sender  │                   │ Receiver │
-     └────┬─────┘                   └────┬─────┘
-          │                              │
-          │ signal(notification)         │ wait(notification)
-          └──────────────────────────────┘
-```
-
-```rust
-// Userspace async queue implementation
-
-struct AsyncQueue {
-    buffer: SharedMemory,
-    notification: Notification,
-}
-
-impl AsyncQueue {
-    fn send(&self, msg: &[u8]) -> Result<(), Error> {
-        // Push to ring buffer
-        self.buffer.push(msg)?;
-        
-        // Signal receiver
-        syscall::signal(self.notification, 1);
-        
-        Ok(())
-    }
-    
-    fn recv(&self) -> Result<Vec<u8>, Error> {
-        loop {
-            // Try to pop from buffer
-            if let Some(msg) = self.buffer.pop() {
-                return Ok(msg);
-            }
-            
-            // Buffer empty - wait for signal
-            syscall::wait(self.notification);
-        }
-    }
-}
-```
+Each IRQ handler object binds to a notification. When the IRQ fires, the kernel signals `1 << (irq_num % 64)` into the notification word.
 
 ## Performance Considerations
 
@@ -696,8 +268,8 @@ impl AsyncQueue {
 
 ### Optimization Techniques
 
-1. **Fastpath**: Inline assembly for hot path
-2. **Register passing**: Message in registers, not memory
-3. **Direct switch**: Skip scheduler for IPC
-4. **Lazy FPU**: Don't save FPU unless used
-5. **No allocation**: All structures pre-allocated
+1. **Register passing**: MR0-MR3 in CPU registers, not memory
+2. **Direct switch**: Skip scheduler for IPC rendezvous
+3. **Lazy FPU**: Don't save FPU unless used
+4. **No allocation**: All structures pre-allocated
+5. **Future: Assembly fastpath**: Inline assembly for hot path (not yet implemented)

@@ -545,6 +545,339 @@ pub unsafe fn send_ipi(cpu_id: usize, kind: IpiKind) {
     }
 }
 
+/// Number of APs that have successfully booted
+static AP_BOOT_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Flag set by each AP when it finishes initialization
+static AP_READY: [core::sync::atomic::AtomicBool; super::cpu::MAX_CPUS] = {
+    const INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    [INIT; super::cpu::MAX_CPUS]
+};
+
+/// Get AP boot count
+pub fn ap_boot_count() -> usize {
+    AP_BOOT_COUNT.load(core::sync::atomic::Ordering::SeqCst)
+}
+
+/// Signal that an AP has finished initialization
+pub fn signal_ap_ready(cpu_id: usize) {
+    AP_READY[cpu_id].store(true, core::sync::atomic::Ordering::SeqCst);
+    AP_BOOT_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Trampoline communication area addresses (physical)
+const TRAMPOLINE_BASE: u64 = 0x8000;
+const TRAMPOLINE_PML4: u64 = 0x8FF0;
+const TRAMPOLINE_STACK: u64 = 0x8FF8;
+const TRAMPOLINE_CPU_ID: u64 = 0x8FE8;
+const TRAMPOLINE_ENTRY: u64 = 0x8FE0;
+
+/// SIPI vector (physical page number: 0x8000 / 0x1000 = 0x08)
+const SIPI_VECTOR: u32 = 0x08;
+
+/// ICR delivery mode bits
+const ICR_INIT: u32 = 0x500;
+const ICR_STARTUP: u32 = 0x600;
+const ICR_LEVEL_ASSERT: u32 = 0x4000;
+const ICR_LEVEL_DEASSERT: u32 = 0x0000;
+
+// Assembly symbols for trampoline code bounds
+unsafe extern "C" {
+    static ap_trampoline_start: u8;
+    static ap_trampoline_end: u8;
+}
+
+/// Start Application Processors
+///
+/// Copies the AP trampoline to physical 0x8000, then sends INIT+SIPI
+/// to each non-BSP CPU discovered by the ACPI parser.
+///
+/// # Safety
+/// Must be called from the BSP after ACPI parsing and memory init.
+pub unsafe fn start_aps(cpu_descriptors: &[super::acpi::CpuDescriptor], cpu_count: usize) {
+    use crate::mm::PHYS_MAP_OFFSET;
+
+    unsafe {
+        // Serial debug
+        let serial = |s: &str| {
+            for byte in s.bytes() {
+                while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
+                super::outb(0x3F8, byte);
+            }
+        };
+
+        serial("\n[SMP] Starting Application Processors\n");
+
+        // Copy trampoline code to physical 0x8000
+        let tramp_src = &raw const ap_trampoline_start as *const u8;
+        let tramp_end = &raw const ap_trampoline_end as *const u8;
+        let tramp_size = tramp_end as usize - tramp_src as usize;
+        let tramp_dst = (TRAMPOLINE_BASE + PHYS_MAP_OFFSET) as *mut u8;
+
+        core::ptr::copy_nonoverlapping(tramp_src, tramp_dst, tramp_size);
+
+        serial("[SMP] Trampoline copied to 0x8000 (");
+        // Print size
+        let mut buf = [0u8; 8];
+        let mut n = tramp_size;
+        let mut pos = 7;
+        if n == 0 {
+            buf[pos] = b'0';
+        } else {
+            while n > 0 {
+                buf[pos] = b'0' + (n % 10) as u8;
+                n /= 10;
+                if pos == 0 { break; }
+                pos -= 1;
+            }
+        }
+        for &c in &buf[(pos)..] {
+            if c != 0 {
+                while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
+                super::outb(0x3F8, c);
+            }
+        }
+        serial(" bytes)\n");
+
+        // Store PML4 physical address (current CR3)
+        let pml4_phys = super::paging::read_cr3();
+        let pml4_ptr = (TRAMPOLINE_PML4 + PHYS_MAP_OFFSET) as *mut u64;
+        pml4_ptr.write_volatile(pml4_phys);
+
+        // Store ap_entry function pointer
+        let entry_fn = super::ap_boot::ap_entry as *const () as u64;
+        let entry_ptr = (TRAMPOLINE_ENTRY + PHYS_MAP_OFFSET) as *mut u64;
+        entry_ptr.write_volatile(entry_fn);
+
+        // Send INIT+SIPI to each AP
+        for i in 0..cpu_count {
+            let desc = &cpu_descriptors[i];
+            if desc.is_bsp || !desc.enabled {
+                continue;
+            }
+
+            let apic_id = desc.apic_id;
+
+            serial("[SMP] Starting AP APIC_ID=");
+            let digit = b'0' + apic_id;
+            while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
+            super::outb(0x3F8, digit);
+            serial("\n");
+
+            // Allocate per-CPU kernel stack (16KB = 4 pages)
+            const STACK_PAGES: usize = 4;
+            const STACK_SIZE: u64 = STACK_PAGES as u64 * 4096;
+
+            let stack_phys = crate::mm::alloc_contiguous_frames(STACK_PAGES)
+                .expect("[SMP] Failed to allocate AP kernel stack");
+            let stack_top = crate::mm::phys_to_virt(stack_phys) + STACK_SIZE;
+
+            // Write per-CPU communication data
+            let stack_ptr = (TRAMPOLINE_STACK + PHYS_MAP_OFFSET) as *mut u64;
+            stack_ptr.write_volatile(stack_top);
+
+            // CPU ID = array index (we need a logical cpu_id, not APIC ID)
+            let cpu_id = i as u32;
+            let cpuid_ptr = (TRAMPOLINE_CPU_ID + PHYS_MAP_OFFSET) as *mut u32;
+            cpuid_ptr.write_volatile(cpu_id);
+
+            // Set up per-CPU GS data before the AP boots
+            let per_cpu = super::cpu::per_cpu_mut(cpu_id);
+            per_cpu.cpu_id = cpu_id;
+            per_cpu.kernel_stack = stack_top;
+
+            // Clear magic check area (trampoline writes 0xCAFE here)
+            let magic_ptr = (0x8F00u64 + PHYS_MAP_OFFSET) as *mut u16;
+            magic_ptr.write_volatile(0);
+
+            // Verify trampoline code was copied by reading first bytes
+            let verify_ptr = (TRAMPOLINE_BASE + PHYS_MAP_OFFSET) as *const u8;
+            let byte0 = verify_ptr.read_volatile();
+            let byte1 = verify_ptr.add(1).read_volatile();
+            serial("[SMP]   Trampoline verify: first bytes = ");
+            let hex = b"0123456789abcdef";
+            while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
+            super::outb(0x3F8, hex[((byte0 >> 4) & 0xF) as usize]);
+            while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
+            super::outb(0x3F8, hex[(byte0 & 0xF) as usize]);
+            while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
+            super::outb(0x3F8, b' ');
+            while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
+            super::outb(0x3F8, hex[((byte1 >> 4) & 0xF) as usize]);
+            while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
+            super::outb(0x3F8, hex[(byte1 & 0xF) as usize]);
+            serial(" (expect: fa fc)\n");
+
+            // Verify PML4 was stored
+            let pml4_verify = (TRAMPOLINE_PML4 + PHYS_MAP_OFFSET) as *const u64;
+            serial("[SMP]   PML4 at 0x8FF0 = ");
+            super::print_hex(pml4_verify.read_volatile());
+            serial("\n");
+
+            // Set warm-reset vector (BIOS data area at 0x467)
+            // This tells the BIOS where to jump after INIT reset.
+            // Write the trampoline address as segment:offset (real mode far pointer).
+            let warm_reset_ptr = (0x467u64 + PHYS_MAP_OFFSET) as *mut u32;
+            warm_reset_ptr.write_volatile(0x0800_0000); // segment 0x0800, offset 0x0000
+
+            // Set CMOS shutdown status to 0x0A (jump via warm-reset vector)
+            super::outb(0x70, 0x0F); // select CMOS register 0x0F
+            super::outb(0x71, 0x0A); // shutdown status = warm reset
+
+            // Memory fence to ensure all writes are ordered
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
+            // Send INIT IPI (level assert)
+            send_init_ipi(apic_id);
+
+            // Wait 10ms for INIT to be received and processed
+            super::pit::delay_us(10_000);
+
+            // Send SIPI (twice per Intel spec)
+            // SIPI vector = physical page number of trampoline code
+            send_sipi(apic_id, SIPI_VECTOR);
+            super::pit::delay_us(200);
+            send_sipi(apic_id, SIPI_VECTOR);
+
+            // Wait for AP to signal ready (timeout after 500ms)
+            let mut timeout = 500;
+            while !AP_READY[cpu_id as usize].load(core::sync::atomic::Ordering::SeqCst) {
+                super::pit::delay_us(1_000);
+                timeout -= 1;
+                if timeout == 0 {
+                    serial("[SMP] WARNING: AP did not respond\n");
+                    // Check if trampoline was even reached
+                    let magic = magic_ptr.read_volatile();
+                    if magic == 0xCAFE {
+                        serial("[SMP]   Trampoline WAS reached (magic=0xCAFE)\n");
+                    } else {
+                        serial("[SMP]   Trampoline NOT reached (magic=0x");
+                        let digits = [
+                            b"0123456789abcdef"[((magic >> 12) & 0xF) as usize],
+                            b"0123456789abcdef"[((magic >> 8) & 0xF) as usize],
+                            b"0123456789abcdef"[((magic >> 4) & 0xF) as usize],
+                            b"0123456789abcdef"[(magic & 0xF) as usize],
+                        ];
+                        for &d in &digits {
+                            while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
+                            super::outb(0x3F8, d);
+                        }
+                        serial(")\n");
+                    }
+                    break;
+                }
+            }
+
+            if AP_READY[cpu_id as usize].load(core::sync::atomic::Ordering::SeqCst) {
+                serial("[SMP] AP is online\n");
+            }
+        }
+
+        serial("[SMP] AP startup complete. Online CPUs: ");
+        let total = ap_boot_count() + 1; // +1 for BSP
+        let digit = b'0' + (total as u8);
+        while (super::inb(0x3F8 + 5) & 0x20) == 0 {}
+        super::outb(0x3F8, digit);
+        serial("\n");
+    }
+}
+
+/// Send INIT IPI to a specific APIC ID
+unsafe fn send_init_ipi(apic_id: u8) {
+    unsafe {
+        // Wait for ICR to be idle
+        while lapic_read(LAPIC_ICR0) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+
+        // Set destination APIC ID
+        lapic_write(LAPIC_ICR1, (apic_id as u32) << 24);
+
+        // Send INIT IPI: delivery mode = INIT, level = assert, trigger = level
+        lapic_write(LAPIC_ICR0, ICR_INIT | ICR_LEVEL_ASSERT | (1 << 15));
+
+        // Wait for delivery
+        while lapic_read(LAPIC_ICR0) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Send INIT IPI (level de-assert) broadcast
+///
+/// This is required by the Intel MP specification after the INIT assert.
+/// It is a broadcast de-assert (all CPUs), not targeted.
+unsafe fn send_init_deassert() {
+    unsafe {
+        // Wait for ICR to be idle
+        while lapic_read(LAPIC_ICR0) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+
+        // Broadcast INIT de-assert (all including self)
+        // Delivery mode = INIT, Level = de-assert, Trigger = level
+        // Destination shorthand = All Including Self (bits 19:18 = 10)
+        lapic_write(LAPIC_ICR0, ICR_INIT | (1 << 15) | (0b10 << 18));
+
+        // Wait for delivery
+        while lapic_read(LAPIC_ICR0) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Send Startup IPI (SIPI) to a specific APIC ID
+unsafe fn send_sipi(apic_id: u8, vector: u32) {
+    unsafe {
+        // Wait for ICR to be idle
+        while lapic_read(LAPIC_ICR0) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+
+        // Set destination APIC ID
+        lapic_write(LAPIC_ICR1, (apic_id as u32) << 24);
+
+        // Send SIPI with startup vector
+        lapic_write(LAPIC_ICR0, ICR_STARTUP | vector);
+
+        // Wait for delivery
+        while lapic_read(LAPIC_ICR0) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Initialize Local APIC for an Application Processor
+///
+/// This is a minimal APIC init for APs - the APIC is already enabled
+/// in hardware, we just need to configure the SVR and timer.
+pub fn init_ap() {
+    unsafe {
+        // Map LAPIC (reuse same virtual base as BSP)
+        map_lapic();
+
+        // Set Spurious Interrupt Vector register (enable APIC)
+        lapic_write(LAPIC_SVR, SVR_ENABLE | SVR_VECTOR);
+
+        // Configure timer for this AP (same settings as BSP)
+        lapic_write(LAPIC_TIMER_DIVIDE, TIMER_DIVIDE_16);
+
+        // Set initial count for 1ms ticks
+        lapic_write(LAPIC_TIMER_INITIAL, TIMER_TICKS_PER_MS);
+
+        // Unmask timer - periodic mode
+        let timer_config = (LAPIC_TIMER_VECTOR as u32) | TIMER_MODE_PERIODIC;
+        lapic_write(LAPIC_LVT_TIMER, timer_config);
+
+        // Mask other LVT entries
+        lapic_write(LAPIC_LVT_THERMAL, TIMER_MASK);
+        lapic_write(LAPIC_LVT_PERF, TIMER_MASK);
+        lapic_write(LAPIC_LVT_LINT0, TIMER_MASK);
+        lapic_write(LAPIC_LVT_LINT1, TIMER_MASK);
+        lapic_write(LAPIC_LVT_ERROR, TIMER_MASK);
+    }
+}
+
 /// Handle IPI on current CPU (interrupt context)
 ///
 /// CRITICAL: We're in interrupt context, cannot call scheduler or deactivate!

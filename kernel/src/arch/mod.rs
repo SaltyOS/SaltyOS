@@ -23,6 +23,12 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     x86_64::init(boot_info);
 }
 
+/// Initialize SMP (start Application Processors)
+pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
+    #[cfg(target_arch = "x86_64")]
+    x86_64::init_smp(boot_info);
+}
+
 /// Halt the CPU until next interrupt
 pub fn halt() {
     #[cfg(target_arch = "x86_64")]

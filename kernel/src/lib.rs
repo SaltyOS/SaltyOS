@@ -158,6 +158,9 @@ pub extern "C" fn kmain(raw_boot_info: *const u8) -> ! {
     // Start timer interrupts (scheduler must be ready first)
     arch::start_timer();
 
+    // Initialize SMP (start Application Processors)
+    arch::init_smp(boot_info);
+
     // Bootstrap the first user-mode init task
     init::bootstrap(boot_info);
 

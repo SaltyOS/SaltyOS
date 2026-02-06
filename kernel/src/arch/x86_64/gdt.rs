@@ -3,6 +3,7 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use core::mem::size_of;
+use super::cpu::MAX_CPUS;
 
 /// GDT entry
 #[repr(C, packed)]
@@ -171,10 +172,34 @@ static mut GDT: Gdt = Gdt {
     },
 };
 
-/// The kernel TSS
+/// The BSP TSS (CPU 0)
 static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
-/// Set the kernel stack pointer in TSS (rsp0)
+/// Per-CPU TSS array (for APs; index 0 is unused since BSP uses the original TSS)
+static mut PER_CPU_TSS: [TaskStateSegment; MAX_CPUS] = [const { TaskStateSegment::new() }; MAX_CPUS];
+
+/// Per-CPU GDT array (for APs; index 0 is unused since BSP uses the original GDT)
+static mut PER_CPU_GDT: [Gdt; MAX_CPUS] = [const {
+    Gdt {
+        null: GdtEntry::null(),
+        kernel_code: GdtEntry::kernel_code(),
+        kernel_data: GdtEntry::kernel_data(),
+        user_data: GdtEntry::user_data(),
+        user_code: GdtEntry::user_code(),
+        tss: TssEntry {
+            limit_low: 0,
+            base_low: 0,
+            base_mid: 0,
+            access: 0,
+            granularity: 0,
+            base_high: 0,
+            base_upper: 0,
+            reserved: 0,
+        },
+    }
+}; MAX_CPUS];
+
+/// Set the kernel stack pointer in TSS (rsp0) for the current CPU
 ///
 /// This is the stack that will be used when interrupts occur from user mode.
 /// The CPU switches to this stack automatically based on CPL.
@@ -182,14 +207,36 @@ static mut TSS: TaskStateSegment = TaskStateSegment::new();
 /// # Safety
 /// Must be called with a valid kernel stack pointer.
 pub unsafe fn set_tss_rsp0(stack_top: u64) {
+    let cpu_id = super::cpu::current_cpu() as usize;
+    unsafe { set_tss_rsp0_cpu(cpu_id, stack_top); }
+}
+
+/// Set the kernel stack pointer in TSS (rsp0) for a specific CPU.
+///
+/// Useful during AP initialization before GS-based current_cpu() is trusted.
+///
+/// # Safety
+/// `cpu_id` must be a valid CPU index and `stack_top` must be a valid stack pointer.
+pub unsafe fn set_tss_rsp0_cpu(cpu_id: usize, stack_top: u64) {
     unsafe {
-        TSS.rsp0 = stack_top;
+        if cpu_id == 0 {
+            TSS.rsp0 = stack_top;
+        } else {
+            PER_CPU_TSS[cpu_id].rsp0 = stack_top;
+        }
     }
 }
 
 /// Get the current TSS stack pointer
 pub fn get_tss_rsp0() -> u64 {
-    unsafe { TSS.rsp0 }
+    let cpu_id = super::cpu::current_cpu() as usize;
+    unsafe {
+        if cpu_id == 0 {
+            TSS.rsp0
+        } else {
+            PER_CPU_TSS[cpu_id].rsp0
+        }
+    }
 }
 
 /// Set an IST (Interrupt Stack Table) entry in the TSS
@@ -200,17 +247,84 @@ pub fn get_tss_rsp0() -> u64 {
 /// # Safety
 /// `stack_top` must be a valid virtual address pointing to the top of an allocated stack.
 pub unsafe fn set_tss_ist(ist_index: u8, stack_top: u64) {
+    let cpu_id = super::cpu::current_cpu() as usize;
     unsafe {
+        let tss = if cpu_id == 0 {
+            &raw mut TSS
+        } else {
+            &raw mut PER_CPU_TSS[cpu_id]
+        };
         match ist_index {
-            1 => TSS.ist1 = stack_top,
-            2 => TSS.ist2 = stack_top,
-            3 => TSS.ist3 = stack_top,
-            4 => TSS.ist4 = stack_top,
-            5 => TSS.ist5 = stack_top,
-            6 => TSS.ist6 = stack_top,
-            7 => TSS.ist7 = stack_top,
+            1 => (*tss).ist1 = stack_top,
+            2 => (*tss).ist2 = stack_top,
+            3 => (*tss).ist3 = stack_top,
+            4 => (*tss).ist4 = stack_top,
+            5 => (*tss).ist5 = stack_top,
+            6 => (*tss).ist6 = stack_top,
+            7 => (*tss).ist7 = stack_top,
             _ => {}
         }
+    }
+}
+
+/// Set an IST entry for a specific CPU's TSS (used during AP init before GS is set)
+///
+/// # Safety
+/// `cpu_id` must be valid. `stack_top` must be a valid stack address.
+pub unsafe fn set_tss_ist_cpu(cpu_id: usize, ist_index: u8, stack_top: u64) {
+    unsafe {
+        let tss = if cpu_id == 0 {
+            &raw mut TSS
+        } else {
+            &raw mut PER_CPU_TSS[cpu_id]
+        };
+        match ist_index {
+            1 => (*tss).ist1 = stack_top,
+            2 => (*tss).ist2 = stack_top,
+            3 => (*tss).ist3 = stack_top,
+            4 => (*tss).ist4 = stack_top,
+            5 => (*tss).ist5 = stack_top,
+            6 => (*tss).ist6 = stack_top,
+            7 => (*tss).ist7 = stack_top,
+            _ => {}
+        }
+    }
+}
+
+/// Load per-CPU GDT and TSS for an Application Processor
+///
+/// Each AP gets its own GDT with its own TSS entry pointing to its own TSS.
+/// This must be called early during AP initialization.
+///
+/// # Safety
+/// Must be called from the AP during its init sequence.
+pub unsafe fn load_per_cpu(cpu_id: usize) {
+    unsafe {
+        // Set up per-CPU TSS entry in per-CPU GDT
+        let tss_ptr = &raw const PER_CPU_TSS[cpu_id];
+        PER_CPU_GDT[cpu_id].tss = TssEntry::from_tss(tss_ptr);
+
+        let gdt_ptr = GdtPtr {
+            limit: (size_of::<Gdt>() - 1) as u16,
+            base: (&raw const PER_CPU_GDT[cpu_id]) as u64,
+        };
+
+        // Load GDTR
+        core::arch::asm!(
+            "lgdt [{}]",
+            in(reg) &gdt_ptr,
+            options(nostack)
+        );
+
+        // Reload segment registers
+        reload_segments();
+
+        // Load TSS (selector 0x28 = 5th entry)
+        core::arch::asm!(
+            "ltr {0:x}",
+            in(reg) 0x28u16,
+            options(nostack)
+        );
     }
 }
 

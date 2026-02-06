@@ -6,12 +6,15 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use super::{
-    alloc_slot, free_slot, get_cap, get_meta, get_meta_mut, CapRights, Capability, CDT,
+    alloc_slot, free_slot, get_cap, get_cap_mut, get_meta, get_meta_mut, CapRights, Capability, CDT,
     KernelObject, ObjectType, INVALID_SLOT,
 };
 
 /// CNode size (number of slots as power of 2)
-pub const CNODE_SIZE_BITS: usize = 8;
+///
+/// 1024 slots is required for init's multi-server bootstrap layout
+/// (console + nameserv + procmgr + vfs capability blocks).
+pub const CNODE_SIZE_BITS: usize = 10;
 pub const CNODE_SIZE: usize = 1 << CNODE_SIZE_BITS;
 
 /// Capability reference - points to global slot
@@ -198,6 +201,80 @@ impl CNode {
         // Transfer reference (no global slot changes)
         self.slots[dest] = src_ref;
         src_cnode.slots[src] = CapRef::null();
+
+        Ok(())
+    }
+
+    /// Mutate capability (move + change badge)
+    ///
+    /// Moves a capability from source to destination and sets a new badge.
+    /// The source slot becomes empty. Only works on endpoint capabilities.
+    pub fn mutate_slot(
+        &mut self,
+        dest: usize,
+        src_cnode: &mut CNode,
+        src: usize,
+        new_badge: u64,
+    ) -> Result<(), CapError> {
+        // First do the move
+        self.move_slot(dest, src_cnode, src)?;
+
+        // Then modify the badge on the moved capability
+        let cap_ref = self.get_ref(dest).ok_or(CapError::SlotEmpty)?;
+        let cap = get_cap_mut(cap_ref.slot);
+
+        // Only endpoints can be badged
+        if cap.obj_type != super::ObjectType::Endpoint {
+            return Err(CapError::InvalidOperation);
+        }
+
+        cap.badge = new_badge;
+        Ok(())
+    }
+
+    /// Save the caller's reply capability into a CNode slot
+    ///
+    /// Takes the reply_tcb from the current thread and creates a one-shot
+    /// reply capability in the specified slot. The reply_tcb is cleared
+    /// from the current thread.
+    pub fn save_caller(
+        &mut self,
+        index: usize,
+        current_tcb: *mut super::super::sched::thread::Tcb,
+    ) -> Result<(), CapError> {
+        if index >= CNODE_SIZE {
+            return Err(CapError::InvalidSlot);
+        }
+        if !self.is_slot_empty(index) {
+            return Err(CapError::SlotOccupied);
+        }
+
+        unsafe {
+            let tcb = &mut *current_tcb;
+            if tcb.reply_tcb.is_null() {
+                return Err(CapError::SlotEmpty);
+            }
+
+            // Allocate a new global slot for the reply capability
+            let slot = alloc_slot().ok_or(CapError::OutOfSlots)?;
+            let cap = super::get_cap_mut(slot);
+
+            // Create a reply capability pointing to the caller's TCB
+            cap.object = tcb.reply_tcb as *mut super::KernelObject;
+            cap.obj_type = super::ObjectType::Tcb;
+            cap.rights = super::CapRights::REPLY;
+            cap.badge = 0;
+            cap.depth = 0;
+            cap._reserved = 0;
+            cap._pad = 0;
+
+            // Insert reference into CNode
+            self.slots[index] = CapRef { slot };
+
+            // Clear the reply capability from the current thread (one-shot)
+            tcb.reply_tcb = core::ptr::null_mut();
+            tcb.reply_can_grant = false;
+        }
 
         Ok(())
     }

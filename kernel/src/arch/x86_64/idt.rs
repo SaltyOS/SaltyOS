@@ -288,6 +288,23 @@ unsafe extern "C" {
     fn irq_stub_generic_47();
 }
 
+/// Load the IDT on the current CPU
+///
+/// Used by APs to load the shared (global) IDT.
+pub fn load() {
+    unsafe {
+        let idt_ptr = IdtPtr {
+            limit: (size_of::<Idt>() - 1) as u16,
+            base: (&raw const IDT) as u64,
+        };
+        core::arch::asm!(
+            "lidt [{}]",
+            in(reg) &idt_ptr,
+            options(nostack)
+        );
+    }
+}
+
 /// Set IST for double fault handler (vector 8).
 /// Called after frame allocator is available.
 pub fn set_double_fault_ist(ist: u8) {

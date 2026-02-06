@@ -2,7 +2,9 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+pub mod acpi;
 mod apic;
+pub mod ap_boot;
 mod boot;
 mod context;
 mod cpu;
@@ -98,6 +100,60 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
 /// interrupts before the scheduler is ready.
 pub fn start_timer() {
     apic::start_timer();
+}
+
+/// Initialize SMP (Symmetric Multi-Processing)
+///
+/// Parses ACPI MADT to discover APs, then sends INIT+SIPI to start them.
+/// Must be called after scheduler is initialized and timer is running.
+pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
+    // Try bootloader-provided RSDP first, then fall back to BIOS scan
+    let rsdp_addr = match boot_info {
+        Some(info) if info.rsdp_addr != 0 => info.rsdp_addr,
+        _ => {
+            // Fall back to scanning standard BIOS locations for RSDP
+            let scanned = unsafe { acpi::scan_for_rsdp() };
+            if scanned == 0 {
+                unsafe {
+                    for byte in b"[SMP] No RSDP found, skipping SMP init\n" {
+                        while (inb(0x3F8 + 5) & 0x20) == 0 {}
+                        outb(0x3F8, *byte);
+                    }
+                }
+                return;
+            }
+            scanned
+        }
+    };
+
+    // Parse ACPI MADT
+    let madt_info = match unsafe { acpi::parse_madt(rsdp_addr) } {
+        Some(info) => info,
+        None => {
+            unsafe {
+                for byte in b"[SMP] MADT parsing failed, running single-CPU\n" {
+                    while (inb(0x3F8 + 5) & 0x20) == 0 {}
+                    outb(0x3F8, *byte);
+                }
+            }
+            return;
+        }
+    };
+
+    if madt_info.cpu_count <= 1 {
+        unsafe {
+            for byte in b"[SMP] Only 1 CPU found, no APs to start\n" {
+                while (inb(0x3F8 + 5) & 0x20) == 0 {}
+                outb(0x3F8, *byte);
+            }
+        }
+        return;
+    }
+
+    // Start APs
+    unsafe {
+        apic::start_aps(&madt_info.cpus, madt_info.cpu_count);
+    }
 }
 
 /// Halt CPU until next interrupt

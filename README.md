@@ -19,47 +19,51 @@ SaltyOS is a capability-based microkernel designed with security and modularity 
 
 ## Project Status
 
-🚧 **Active Development** - Kernel initializes with timer ticks, userspace not yet reachable
-
 ### Completed Components
 
 - [x] **3-stage bootloader** (BIOS + UEFI support)
 - [x] **Kernel entry** with serial debug output
 - [x] **Memory management** (frame allocator, page tables, VSpace)
-- [x] **Capability system** (fat caps, CDT, CNode operations)
-- [x] **Synchronous IPC** (endpoints with send/recv/call)
-- [x] **Async notifications** (IRQ signaling)
+- [x] **Capability system** (fat caps, CDT, CNode operations: copy/mint/move/mutate/revoke/delete/save_caller)
+- [x] **Synchronous IPC** (endpoints with send/recv/call/reply_recv/nbsend)
+- [x] **Async notifications** (signal/wait/poll, combined endpoint wait)
 - [x] **EDF scheduler** (budget enforcement, deadline-based)
-- [x] **Context switching** (full save/restore)
-- [x] **SMP infrastructure** (per-CPU data, IPI, APIC timer)
-- [x] **Interrupt handling** (IDT, IRQ routing)
+- [x] **Context switching** (full save/restore, per-thread user RSP)
+- [x] **Interrupt handling** (IDT, IRQ routing via notifications)
+- [x] **System call dispatch** (12 syscalls, capability invocations)
+- [x] **ELF loader** (loads userspace from CPIO initrd)
+- [x] **Init process** (multi-phase bootstrap: IPC test, fault handling, console spawn)
+- [x] **Console server** (serial I/O via IoPort capabilities)
+- [x] **Runtime dynamic linker** (shared library loading)
+- [x] **Fault handling** (page fault delivery via fault endpoints, reply-to-resume)
+- [x] **IPC buffer** (message overflow MR4-MR19, capability transfer)
+- [x] **I/O port capabilities** (IoPort_In8/Out8/In16/Out16)
+- [x] **Debug syscalls** (DebugPutChar, DebugDumpState)
 
-### Current Focus
+### In Progress
 
-- [ ] System call dispatch and handlers
-- [ ] ELF loader for userspace processes
-- [ ] First init process spawn
-- [ ] Capability derivation and revocation testing
-- [ ] IPC message transfer implementation
+- [ ] SMP support (ACPI MADT parser, AP trampoline, per-CPU run queues)
+- [ ] Userspace servers (procmgr, vfs, nameserv)
+- [ ] IPC assembly fastpath
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                         Userspace                               │
-├─────────────┬─────────────┬─────────────┬─────────────┬────────┤
-│    init     │   procmgr   │     vfs     │   drivers   │  apps  │
-│             │             │   saltyfs   │  (pci,nvme) │        │
-└──────┬──────┴──────┬──────┴──────┬──────┴──────┬──────┴────────┘
-       │             │             │             │
-       │         IPC (Endpoints + Notifications) │
-       │             │             │             │
-┌──────┴─────────────┴─────────────┴─────────────┴───────────────┐
-│                     SaltyOS Microkernel                        │
-├────────────┬────────────┬────────────┬────────────┬────────────┤
-│ Capability │    IPC     │  Scheduler │   Memory   │    Arch    │
-│   System   │ Endpoints  │    (EDF)   │ Management │  (x86_64)  │
-└────────────┴────────────┴────────────┴────────────┴────────────┘
+├──────────┬──────────┬──────────┬──────────┬──────────┬──────────┤
+│   init   │ console  │  procmgr │   vfs    │ nameserv │   apps   │
+│          │ (serial) │ (planned)│(planned) │(planned) │          │
+└────┬─────┴────┬─────┴────┬─────┴────┬─────┴────┬─────┴──────────┘
+     │          │          │          │          │
+     │      IPC (Endpoints + Notifications)     │
+     │          │          │          │          │
+┌────┴──────────┴──────────┴──────────┴──────────┴─────────────────┐
+│                     SaltyOS Microkernel                          │
+├────────────┬────────────┬────────────┬────────────┬──────────────┤
+│ Capability │    IPC     │  Scheduler │   Memory   │    Arch      │
+│   System   │ Endpoints  │    (EDF)   │ Management │  (x86_64)    │
+└────────────┴────────────┴────────────┴────────────┴──────────────┘
 ```
 
 ## Building
@@ -70,7 +74,7 @@ SaltyOS is a capability-based microkernel designed with security and modularity 
 - Meson build system (>= 1.1)
 - Ninja
 - NASM assembler
-- GCC or Clang (cross-compiler for target arch)
+- Clang (required; gcc is not supported)
 - QEMU (for testing)
 
 ### Quick Start
@@ -81,27 +85,36 @@ rustup install nightly
 rustup default nightly
 rustup component add rust-src
 
-# Configure build
+# Configure build (requires CC=clang)
 just setup
 
 # Build
 just build
 
-# Run in QEMU
+# Run in QEMU (BIOS)
 just run
+
+# Run in QEMU (UEFI)
+just run-uefi
 ```
 
 ### Build Options
 
 ```bash
-# Configure for different architecture
-just setup-aarch64
-
 # Enable debug symbols
 just reconfigure -Ddebug_symbols=true
 
 # Change log level
 just reconfigure -Dkernel_log_level=debug
+
+# Quick rebuild and run
+just rr
+
+# Run with GDB server
+just run-gdb
+
+# Headless debug (serial only, no GUI)
+just run-debug-headless
 ```
 
 ## Documentation
@@ -120,8 +133,8 @@ just reconfigure -Dkernel_log_level=debug
   - [POSIX Compatibility](docs/design/posix.md)
 - [Specifications](docs/spec/)
   - [System Calls](docs/spec/syscalls.md)
-  - [Boot Protocol](docs/spec/boot_protocol.md)
   - [ABI](docs/spec/abi.md)
+  - [Boot Protocol](docs/spec/boot_protocol.md)
 
 ## Project Structure
 
@@ -140,16 +153,15 @@ SaltyOS/
 │       ├── mm/             # Memory management
 │       ├── sched/          # Scheduler
 │       └── syscall/        # System call handlers
-├── userland/               # Userspace servers
-│   ├── init/               # First process
-│   ├── procmgr/            # Process manager
-│   ├── vfs/                # VFS server
-│   └── drivers/            # Userspace drivers
+├── userland/               # Userspace programs
+│   ├── init/               # First process (multi-phase bootstrap)
+│   ├── console/            # Serial console server
+│   └── rtld/               # Runtime dynamic linker
 ├── lib/                    # Shared libraries
-│   ├── libsalty/           # System call wrappers
-│   └── libc/               # Minimal C library
-├── tools/                  # Build utilities
-│   └── cross/              # Cross-compilation configs
+│   └── libsalty/           # System call wrappers (salty.h + salty_impl.c)
+├── tools/                  # Build utilities and test scripts
+│   ├── test_boot.sh        # QEMU boot smoke test
+│   └── test_smp.sh         # SMP boot smoke test
 └── docs/                   # Documentation
 ```
 
@@ -163,7 +175,9 @@ SaltyOS/
 - Physical memory allocation (frame allocator, slab allocator)
 - Capability-based access control (fat capabilities, CDT)
 - Context switching and interrupt handling
-- SMP support (per-CPU data, IPI, APIC timer)
+- IRQ routing to userspace via notification capabilities
+- I/O port access control via IoPort capabilities
+- Fault delivery to userspace fault handlers
 
 ### What the Kernel Does NOT Do (Userspace)
 
@@ -172,6 +186,19 @@ SaltyOS/
 - Device drivers (userspace, with mapped MMIO)
 - Process management policy (userspace procmgr)
 - Access control policy (enforced via capabilities)
+
+## Testing
+
+```bash
+# Run QEMU boot smoke test
+just test-integration
+
+# Run SMP smoke test (boots with -smp 2)
+just test-smp
+
+# Run all tests
+just test-all
+```
 
 ## Contributing
 

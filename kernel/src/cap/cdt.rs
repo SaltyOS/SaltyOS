@@ -202,8 +202,9 @@ impl CDT {
     /// - Sibling lists are correctly linked
     /// - No cycles exist
     #[cfg(debug_assertions)]
-    pub fn verify_integrity() -> Result<(), CapError> {
+    pub fn verify_integrity() -> Result<(), super::cnode::CapError> {
         use crate::cap::slot::{get_meta, MAX_SLOTS};
+        use super::cnode::CapError;
 
         for slot in 0..MAX_SLOTS {
             let slot = slot as CapSlot;
@@ -308,5 +309,107 @@ mod tests {
         free_slot(child1);
         free_slot(child2);
         free_slot(child3);
+    }
+
+    #[test]
+    fn test_revoke_single_level() {
+        // Build: root -> {child1, child2, child3}
+        let root = alloc_slot().unwrap();
+        let child1 = alloc_slot().unwrap();
+        let child2 = alloc_slot().unwrap();
+        let child3 = alloc_slot().unwrap();
+
+        CDT::insert_root(root);
+        CDT::insert_child(root, child1);
+        CDT::insert_child(root, child2);
+        CDT::insert_child(root, child3);
+
+        assert_eq!(CDT::child_count(root), 3);
+
+        // Revoke all children of root by revoking each subtree.
+        // CDT::revoke deletes the target AND its descendants,
+        // so we revoke children one at a time via first_child.
+        while CDT::has_children(root) {
+            let child = CDT::first_child(root);
+            CDT::revoke(child);
+        }
+
+        // Root should have no children; children's slots were freed
+        assert!(!CDT::has_children(root));
+        assert_eq!(CDT::child_count(root), 0);
+
+        free_slot(root);
+    }
+
+    #[test]
+    fn test_revoke_deep_tree() {
+        // Build a 3-level tree:
+        //   root -> A -> A1
+        //               A2
+        //        -> B -> B1
+        let root = alloc_slot().unwrap();
+        let a = alloc_slot().unwrap();
+        let a1 = alloc_slot().unwrap();
+        let a2 = alloc_slot().unwrap();
+        let b = alloc_slot().unwrap();
+        let b1 = alloc_slot().unwrap();
+
+        CDT::insert_root(root);
+        CDT::insert_child(root, a);
+        CDT::insert_child(a, a1);
+        CDT::insert_child(a, a2);
+        CDT::insert_child(root, b);
+        CDT::insert_child(b, b1);
+
+        // Verify tree structure
+        assert_eq!(CDT::child_count(root), 2);
+        assert_eq!(CDT::child_count(a), 2);
+        assert_eq!(CDT::child_count(b), 1);
+        assert_eq!(CDT::descendant_count(root), 5);
+
+        // Revoke subtree rooted at A (should delete A, A1, A2)
+        CDT::revoke(a);
+
+        // Root should only have B left
+        assert_eq!(CDT::child_count(root), 1);
+        assert_eq!(CDT::first_child(root), b);
+        assert_eq!(CDT::descendant_count(root), 2); // B + B1
+
+        // Revoke subtree rooted at B (should delete B, B1)
+        CDT::revoke(b);
+
+        assert!(!CDT::has_children(root));
+        assert_eq!(CDT::descendant_count(root), 0);
+
+        free_slot(root);
+    }
+
+    #[test]
+    fn test_descendant_count() {
+        // Build: root -> A -> A1
+        //             -> B
+        let root = alloc_slot().unwrap();
+        let a = alloc_slot().unwrap();
+        let a1 = alloc_slot().unwrap();
+        let b = alloc_slot().unwrap();
+
+        CDT::insert_root(root);
+        CDT::insert_child(root, a);
+        CDT::insert_child(a, a1);
+        CDT::insert_child(root, b);
+
+        assert_eq!(CDT::descendant_count(root), 3); // A + A1 + B
+        assert_eq!(CDT::descendant_count(a), 1);    // A1
+        assert_eq!(CDT::descendant_count(b), 0);
+        assert_eq!(CDT::descendant_count(a1), 0);
+
+        // Clean up
+        CDT::remove(a1);
+        CDT::remove(a);
+        CDT::remove(b);
+        free_slot(root);
+        free_slot(a);
+        free_slot(a1);
+        free_slot(b);
     }
 }

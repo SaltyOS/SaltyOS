@@ -31,7 +31,7 @@ typedef uint64_t cap_t;
 #define CAP_NULL ((cap_t)0)
 
 // Message info word
-typedef uint64_t seL4_MessageInfo_t;
+typedef uint64_t salty_msginfo_t;
 
 // Badge from received IPC
 typedef uint64_t badge_t;
@@ -66,18 +66,19 @@ typedef uint64_t badge_t;
 **Entry:**
 ```
 RAX = System call number
-RDI = Argument 1
-RSI = Argument 2
-RDX = Argument 3
-R10 = Argument 4 (RCX clobbered by SYSCALL)
-R8  = Argument 5
-R9  = Argument 6
+RDI = Argument 1 (capability pointer / first arg)
+RSI = Argument 2 (msg_info / label)
+RDX = Argument 3 (mr0 / arg0)
+R10 = Argument 4 (mr1 / arg1) — RCX is clobbered by SYSCALL
+R8  = Argument 5 (mr2 / arg2)
+R9  = Argument 6 (mr3 / arg3)
+[stack] = Argument 7 (used by some IPC syscalls, e.g., ReplyRecv)
 ```
 
 **Return:**
 ```
-RAX = Return value / Error code
-RDI = Additional return value (syscall-specific)
+RAX = Error code (0 = success)
+RDX = Return value (syscall-specific)
 ```
 
 **Clobbered:**
@@ -86,17 +87,18 @@ RDI = Additional return value (syscall-specific)
 
 ### IPC Register Convention
 
-For fast IPC, message registers map directly to CPU registers:
+For IPC syscalls, message registers map to CPU registers:
 
-| MR | Register | Purpose |
-|----|----------|---------|
-| Label | RDI | Operation/type identifier |
-| MR0 | RSI | First message word |
-| MR1 | RDX | Second message word |
-| MR2 | R10 | Third message word |
-| MR3 | R8 | Fourth message word |
+| Field | Register | Purpose |
+|-------|----------|---------|
+| cap_ptr | RDI | Endpoint capability slot |
+| msg_info | RSI | Packed message info word |
+| MR0 | RDX | First message register |
+| MR1 | R10 | Second message register |
+| MR2 | R8 | Third message register |
+| MR3 | R9 | Fourth message register |
 
-Badge is returned in R9.
+Badge is returned in RDX on Recv/ReplyRecv.
 
 ## IPC Message Format
 
@@ -104,73 +106,52 @@ Badge is returned in R9.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  63:58  │  57:52  │  51:12  │  11:7   │  6:0   │
-│  Caps   │ ExCaps  │  Label  │ Reserved│ Length │
+│  63:52   │  51:12   │  11:7     │  6:0    │
+│ Reserved │  Label   │ ExtraCaps │ Length  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 | Field | Bits | Description |
 |-------|------|-------------|
-| Length | 6:0 | Number of message words (0-127) |
-| Caps | 63:58 | Number of capabilities transferred |
-| ExCaps | 57:52 | Extra capability slots |
-| Label | 51:12 | Message label (40 bits) |
+| Length | 6:0 | Number of message registers used (0-127) |
+| ExtraCaps | 11:7 | Number of capabilities to transfer (0-31) |
+| Label | 51:12 | Application-defined message label (40 bits) |
+| Reserved | 63:52 | Must be zero |
 
 ### Macros
 
 ```c
-#define MSGINFO_LENGTH(info)    ((info) & 0x7F)
-#define MSGINFO_CAPS(info)      (((info) >> 58) & 0x3F)
-#define MSGINFO_LABEL(info)     (((info) >> 12) & 0xFFFFFFFFFF)
+#define SALTY_MSGINFO(label, length, extra_caps) \
+    (((uint64_t)(label) << 12) | \
+     ((uint64_t)(extra_caps) << 7) | \
+     ((uint64_t)(length) & 0x7F))
 
-#define MAKE_MSGINFO(label, caps, length) \
-    ((((uint64_t)(label) & 0xFFFFFFFFFF) << 12) | \
-     (((uint64_t)(caps) & 0x3F) << 58) | \
-     ((length) & 0x7F))
+#define SALTY_MSGINFO_LABEL(info)      (((info) >> 12) & 0xFFFFFFFFFFULL)
+#define SALTY_MSGINFO_LENGTH(info)     ((info) & 0x7F)
+#define SALTY_MSGINFO_EXTRACAPS(info)  (((info) >> 7) & 0x1F)
 ```
 
 ## Error Codes
 
-### Kernel Error Codes
+SaltyOS uses sequential positive error codes (returned in RAX).
 
 ```c
 typedef enum {
-    SALTY_OK = 0,
-    
-    // Generic errors (1-99)
-    SALTY_EINVAL = 1,           // Invalid argument
-    SALTY_EPERM = 2,            // Permission denied
-    SALTY_ENOENT = 3,           // Not found
-    SALTY_ENOMEM = 4,           // Out of memory
-    SALTY_EBUSY = 5,            // Resource busy
-    SALTY_EEXIST = 6,           // Already exists
-    SALTY_EFAULT = 7,           // Bad address
-    SALTY_ERANGE = 8,           // Out of range
-    
-    // IPC errors (100-199)
-    SALTY_ESEND = 100,          // Send failed
-    SALTY_ERECV = 101,          // Receive failed
-    SALTY_ECALL = 102,          // Call failed
-    SALTY_ETIMEOUT = 103,       // Operation timed out
-    SALTY_ETRUNCATED = 104,     // Message truncated
-    
-    // Capability errors (200-299)
-    SALTY_ECAP_INVALID = 200,   // Invalid capability
-    SALTY_ECAP_REVOKED = 201,   // Capability revoked
-    SALTY_ECAP_RIGHTS = 202,    // Insufficient rights
-    SALTY_ECAP_TYPE = 203,      // Wrong capability type
-    SALTY_ECAP_RANGE = 204,     // Invalid CNode range
-    
-    // Memory errors (300-399)
-    SALTY_EMAP_ALIGN = 300,     // Alignment error
-    SALTY_EMAP_PERM = 301,      // Mapping permission error
-    SALTY_EMAP_OVERLAP = 302,   // Mapping overlap
-    SALTY_EMAP_NOFRAME = 303,   // No frame mapped
-    
-    // Scheduling errors (400-499)
-    SALTY_ESCHED_BUDGET = 400,  // Budget exceeded
-    SALTY_ESCHED_BOUND = 401,   // Already bound
-    
+    SALTY_OK                = 0,   // Success
+    SALTY_INVALID_CAP       = 1,   // Invalid or null capability
+    SALTY_INVALID_OPERATION = 2,   // Wrong object type or unsupported op
+    SALTY_INSUFFICIENT_RIGHTS = 3, // Capability lacks required rights
+    SALTY_INVALID_ARGUMENT  = 4,   // Bad argument value
+    SALTY_OUT_OF_MEMORY     = 5,   // No memory available
+    SALTY_NOT_FOUND         = 6,   // Empty slot, unmapped page
+    SALTY_BUSY              = 7,   // Resource is busy
+    SALTY_ALREADY_EXISTS    = 8,   // Occupied slot, mapped page
+    SALTY_WOULD_BLOCK       = 9,   // Non-blocking op has no work
+    SALTY_BAD_ADDRESS       = 10,  // Invalid memory address
+    SALTY_OUT_OF_RANGE      = 11,  // Value exceeds valid range
+    SALTY_CANCELLED         = 12,  // Operation was cancelled
+    SALTY_RESTART           = 13,  // Syscall should be restarted
+    SALTY_DEADLOCK          = 14,  // Deadlock detected
 } salty_error_t;
 ```
 
@@ -195,30 +176,25 @@ struct tcb_config {
 ### IPC Buffer
 
 ```c
-// IPC Buffer layout (4KB page)
-struct ipc_buffer {
-    // Message data (offset 0x000)
-    uint64_t msg[64];       // Up to 64 message words
-    
-    // Receive info (offset 0x200)
-    uint64_t badge;
-    cap_t    receive_slot[16];
-    uint64_t receive_cnode;
-    uint64_t receive_index;
-    uint64_t receive_depth;
-    
-    // Send info (offset 0x2A0)
-    cap_t    send_caps[8];
-    
-    // Reserved (offset 0x2E0)
-    uint64_t reserved[36];
-    
-    // User data (offset 0x400)
-    uint8_t  user_data[3072];
+// IPC Buffer layout (4KB page, 512 x uint64_t)
+struct salty_ipc_buffer {
+    uint64_t msg[20];           // 0x000: MR0..MR19 (160 bytes)
+    uint64_t badge;             // 0x0A0: Received badge
+    uint64_t caps[4];           // 0x0A8: Cap slots to transfer (sender-side)
+    uint64_t receive_cnode;     // 0x0C8: CNode for receiving caps
+    uint64_t receive_index;     // 0x0D0: Starting slot index
+    uint64_t receive_depth;     // 0x0D8: CNode depth
+    uint64_t reserved[480];     // 0x0E0: Reserved / future use
 };
 
-_Static_assert(sizeof(struct ipc_buffer) == 4096, "IPC buffer size");
+_Static_assert(sizeof(struct salty_ipc_buffer) == 4096, "IPC buffer size");
 ```
+
+**Register vs. IPC buffer message passing:**
+
+- MR0-MR3 are passed in CPU registers (RDX, R10, R8, R9) for low latency.
+- If `length > 4`, MR4-MR19 overflow to the thread's IPC buffer (`msg[4]` through `msg[19]`).
+- The kernel reads/writes the IPC buffer at the virtual address set via `TCB_SetIPCBuffer`.
 
 ## Virtual Address Space Layout
 
@@ -400,18 +376,29 @@ System library functions use the `salty_` prefix:
 
 ```c
 // IPC
-salty_error_t salty_send(cap_t ep, salty_msginfo_t info);
-salty_error_t salty_recv(cap_t ep, badge_t *badge);
-salty_error_t salty_call(cap_t ep, salty_msginfo_t info);
+int salty_send(cap_t ep, struct salty_msg *msg);
+int salty_recv(cap_t ep, struct salty_msg *msg, uint64_t *badge);
+int salty_call(cap_t ep, struct salty_msg *msg);
+int salty_reply_recv(cap_t ep, struct salty_msg *reply,
+                     struct salty_msg *msg, uint64_t *badge);
 
 // Capability operations
-salty_error_t salty_cap_copy(cap_t dest, cap_t src);
-salty_error_t salty_cap_delete(cap_t cap);
-salty_error_t salty_cap_revoke(cap_t cap);
+int salty_cnode_copy(cap_t src_cnode, uint64_t src_slot,
+                     cap_t dest_cnode, uint64_t dest_slot, uint64_t rights);
+int salty_cnode_mint(cap_t src_cnode, uint64_t src_slot,
+                     cap_t dest_cnode, uint64_t dest_slot, uint64_t badge);
+int salty_cnode_move(cap_t dest_cnode, uint64_t dest_slot,
+                     cap_t src_cnode, uint64_t src_slot);
+int salty_cnode_delete(cap_t cnode, uint64_t slot);
+int salty_cnode_revoke(cap_t cnode, uint64_t slot);
 
 // Memory
-salty_error_t salty_map(cap_t vspace, cap_t frame, void *addr, int prot);
-salty_error_t salty_unmap(cap_t vspace, void *addr);
+int salty_vspace_map(cap_t vspace, cap_t frame, uint64_t vaddr, uint64_t flags);
+int salty_vspace_unmap(cap_t vspace, uint64_t vaddr);
+
+// Debug
+void salty_debug_putchar(char c);
+void salty_debug_dump_state(void);
 ```
 
 ### Reserved Prefixes

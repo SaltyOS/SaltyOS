@@ -76,6 +76,51 @@ run: build
         -no-reboot \
         -no-shutdown
 
+# Run in QEMU with SMP (2 CPUs)
+run-smp: build
+    qemu-system-x86_64 \
+        -machine q35 \
+        -cpu qemu64 \
+        -smp 2 \
+        -m 512M \
+        -serial stdio \
+        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
+        -device ahci,id=ahci \
+        -device ide-hd,drive=disk,bus=ahci.0 \
+        -no-reboot \
+        -no-shutdown
+
+# Run SMP headless with debug output
+run-smp-debug: build
+    qemu-system-x86_64 \
+        -machine q35 \
+        -cpu qemu64 \
+        -smp 2 \
+        -m 512M \
+        -serial stdio \
+        -display none \
+        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
+        -device ahci,id=ahci \
+        -device ide-hd,drive=disk,bus=ahci.0 \
+        -no-reboot \
+        -no-shutdown \
+        -d int,cpu_reset \
+        -D qemu.log
+
+# Run SMP with 4 CPUs
+run-smp4: build
+    qemu-system-x86_64 \
+        -machine q35 \
+        -cpu qemu64 \
+        -smp 4 \
+        -m 512M \
+        -serial stdio \
+        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
+        -device ahci,id=ahci \
+        -device ide-hd,drive=disk,bus=ahci.0 \
+        -no-reboot \
+        -no-shutdown
+
 # Run with debug output
 run-debug: build
     qemu-system-x86_64 \
@@ -171,13 +216,18 @@ run-uefi-debug-headless: image-uefi
 # Testing
 # =============================================================================
 
-# Run unit tests (host)
-test:
-    meson test -C {{builddir}}
-
-# Run integration tests in QEMU
+# Run boot integration tests in QEMU
 test-integration: build
-    @echo "Integration tests not yet implemented"
+    @bash tools/test_boot.sh
+
+# Run SMP integration tests in QEMU
+test-smp: build
+    @bash tools/test_smp.sh
+
+# Run all tests (integration + SMP)
+test-all: build
+    @bash tools/test_boot.sh
+    @bash tools/test_smp.sh
 
 # =============================================================================
 # Utilities

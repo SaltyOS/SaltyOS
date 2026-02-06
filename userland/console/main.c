@@ -132,6 +132,7 @@ void _start(void) {
     for (;;) {
         struct salty_msg reply;
         reply.label = 0;
+        reply.length = 0;
         reply.regs[0] = 0;
         reply.regs[1] = 0;
         reply.regs[2] = 0;
@@ -145,6 +146,7 @@ void _start(void) {
         case CONSOLE_READ:
             reply.regs[0] = handle_read();
             reply.label = SALTY_OK;
+            reply.length = 1;
             break;
         default:
             reply.label = SALTY_INVALID_OPERATION;

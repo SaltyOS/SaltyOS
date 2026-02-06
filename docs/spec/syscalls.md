@@ -13,10 +13,10 @@ User Registers (before SYSCALL instruction):
   RAX  - System call number
   RDI  - Argument 0 (capability pointer)
   RSI  - Argument 1 (msg_info / label)
-  RDX  - Argument 2
-  R10  - Argument 3 (RCX is clobbered by SYSCALL instruction)
-  R8   - Argument 4
-  R9   - Argument 5 (reserved)
+  RDX  - Argument 2 (mr0 / arg0)
+  R10  - Argument 3 (mr1 / arg1) — RCX is clobbered by SYSCALL
+  R8   - Argument 4 (mr2 / arg2)
+  R9   - Argument 5 (mr3 / arg3)
 
 Return:
   RAX  - Error code (0 = success)
@@ -52,6 +52,31 @@ syscall_invoke:
 | 10 | `DebugPutChar` | Debug output (development only) |
 | 11 | `DebugDumpState` | Dump thread state (development only) |
 
+## Message Info Word Format
+
+All IPC syscalls (Send, Recv, Call, ReplyRecv, NBSend) use a packed `msg_info` word in RSI:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  63:52   │  51:12   │  11:7     │  6:0    │
+│ Reserved │  Label   │ ExtraCaps │ Length  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+| Field | Bits | Description |
+|-------|------|-------------|
+| Length | 6:0 | Number of message registers used (0-127) |
+| ExtraCaps | 11:7 | Number of capabilities to transfer via IPC buffer (0-31) |
+| Label | 51:12 | Application-defined message label (40 bits) |
+| Reserved | 63:52 | Must be zero |
+
+```c
+#define SALTY_MSGINFO(label, length, extra_caps) \
+    (((uint64_t)(label) << 12) | \
+     ((uint64_t)(extra_caps) << 7) | \
+     ((uint64_t)(length) & 0x7F))
+```
+
 ## IPC System Calls
 
 ### Send (0)
@@ -60,36 +85,24 @@ Send a message through an endpoint capability.
 
 ```c
 long sys_send(
-    cap_t endpoint,     // Endpoint capability
-    uint64_t msg_info,  // Message info word
-    uint64_t mr0,       // Message register 0
-    uint64_t mr1,       // Message register 1
-    uint64_t mr2,       // Message register 2
-    uint64_t mr3        // Message register 3
+    cap_t endpoint,     // RDI: Endpoint capability
+    uint64_t msg_info,  // RSI: Message info word
+    uint64_t mr0,       // RDX: Message register 0
+    uint64_t mr1,       // R10: Message register 1
+    uint64_t mr2,       // R8:  Message register 2
+    uint64_t mr3        // R9:  Message register 3
 );
 ```
 
 **Arguments:**
 - `endpoint`: Capability to endpoint (must have SEND right)
-- `msg_info`: Encoded message info (see below)
-- `mr0-mr3`: Message registers (inline data)
-
-**Message Info Format:**
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  63:12  │  11:8   │   7:4    │   3:0   │
-│ Reserved│ExtraCaps│ CapsUnwr │ Length  │
-└─────────────────────────────────────────────────────────────────┘
-```
-- `Length`: Number of message words (0-15)
-- `CapsUnwr`: Number of capabilities to unwrap
-- `ExtraCaps`: Number of extra capabilities to transfer
+- `msg_info`: Packed message info (label, length, extra_caps)
+- `mr0-mr3`: Inline message registers
 
 **Returns:**
 - `0`: Success
-- `-EINVAL`: Invalid capability
-- `-EPERM`: Insufficient rights
-- `-ENOENT`: Endpoint deleted
+- `1` (InvalidCapability): Invalid capability
+- `3` (InsufficientRights): Missing SEND right
 
 **Behavior:**
 - If receiver is waiting: immediate transfer, both threads resume
@@ -103,13 +116,9 @@ Receive a message from an endpoint.
 
 ```c
 long sys_recv(
-    cap_t endpoint,         // Endpoint capability
-    uint64_t *sender_badge, // Output: sender's badge
-    uint64_t *msg_info,     // Output: message info
-    uint64_t *mr0,          // Output: message register 0
-    uint64_t *mr1,          // Output: message register 1
-    uint64_t *mr2,          // Output: message register 2
-    uint64_t *mr3           // Output: message register 3
+    cap_t endpoint,     // RDI: Endpoint capability
+    uint64_t msg_info,  // RSI: (unused on input)
+    // Returns: msg_info in RSI, mr0-mr3 in RDX/R10/R8/R9, badge in RDX
 );
 ```
 
@@ -117,14 +126,13 @@ long sys_recv(
 - `endpoint`: Capability to endpoint (must have RECV right)
 
 **Returns:**
-- `>= 0`: Sender's badge
-- `-EINVAL`: Invalid capability
-- `-EPERM`: Insufficient rights
+- RAX = `0`: Success, badge in RDX
+- RAX = `1`: Invalid capability
 
 **Behavior:**
 - If sender is waiting: immediate transfer
 - If no sender: receiver blocks until sender arrives
-- If thread has bound notification and it's pending: returns notification instead
+- Message registers and badge are written to the caller's saved registers
 
 ---
 
@@ -134,12 +142,12 @@ Send a message and wait for reply (RPC pattern).
 
 ```c
 long sys_call(
-    cap_t endpoint,     // Endpoint capability
-    uint64_t msg_info,  // Message info word
-    uint64_t mr0,       // Message register 0
-    uint64_t mr1,       // Message register 1
-    uint64_t mr2,       // Message register 2
-    uint64_t mr3        // Message register 3
+    cap_t endpoint,     // RDI: Endpoint capability
+    uint64_t msg_info,  // RSI: Message info word
+    uint64_t mr0,       // RDX: Message register 0
+    uint64_t mr1,       // R10: Message register 1
+    uint64_t mr2,       // R8:  Message register 2
+    uint64_t mr3        // R9:  Message register 3
 );
 ```
 
@@ -149,14 +157,13 @@ long sys_call(
 - `mr0-mr3`: Message registers
 
 **Returns:**
-- `>= 0`: Reply message info
-- Negative: Error code
+- RAX = `0`: Success, reply message in MR registers
+- RAX = error code on failure
 
 **Behavior:**
-1. Generates one-shot reply capability
-2. Sends message with reply cap
-3. Blocks waiting for reply
-4. Returns reply message
+1. Sends message (with implicit reply capability)
+2. Blocks waiting for reply
+3. Returns reply message in MR registers
 
 ---
 
@@ -166,12 +173,12 @@ Reply to current caller and wait for next request.
 
 ```c
 long sys_reply_recv(
-    cap_t endpoint,     // Endpoint to receive on
-    uint64_t msg_info,  // Reply message info
-    uint64_t mr0,       // Reply message register 0
-    uint64_t mr1,
-    uint64_t mr2,
-    uint64_t mr3
+    cap_t endpoint,     // RDI: Endpoint to receive on
+    uint64_t msg_info,  // RSI: Reply message info
+    uint64_t mr0,       // RDX: Reply message register 0
+    uint64_t mr1,       // R10: Reply MR1
+    uint64_t mr2,       // R8:  Reply MR2
+    uint64_t mr3        // R9:  Reply MR3
 );
 ```
 
@@ -188,18 +195,18 @@ Non-blocking send.
 
 ```c
 long sys_nbsend(
-    cap_t endpoint,
-    uint64_t msg_info,
-    uint64_t mr0,
-    uint64_t mr1,
-    uint64_t mr2,
-    uint64_t mr3
+    cap_t endpoint,     // RDI
+    uint64_t msg_info,  // RSI
+    uint64_t mr0,       // RDX
+    uint64_t mr1,       // R10
+    uint64_t mr2,       // R8
+    uint64_t mr3        // R9
 );
 ```
 
 **Returns:**
 - `0`: Message sent
-- `-EWOULDBLOCK`: No receiver waiting
+- `9` (WouldBlock): No receiver waiting
 
 ---
 
@@ -209,14 +216,14 @@ Signal a notification.
 
 ```c
 long sys_signal(
-    cap_t notification,  // Notification capability
-    uint64_t bits        // Bits to set
+    cap_t notification,  // RDI: Notification capability
+    uint64_t bits        // RSI: Bits to set (passed in msg_info position)
 );
 ```
 
 **Arguments:**
 - `notification`: Notification capability (must have WRITE right)
-- `bits`: Bits to OR into notification word
+- `bits`: Bits to OR into notification word (passed in RSI)
 
 **Returns:**
 - `0`: Success
@@ -233,7 +240,7 @@ Wait on a notification.
 
 ```c
 long sys_wait(
-    cap_t notification   // Notification capability
+    cap_t notification   // RDI: Notification capability
 );
 ```
 
@@ -241,8 +248,8 @@ long sys_wait(
 - `notification`: Notification capability (must have READ right)
 
 **Returns:**
-- `>= 0`: Notification word value (word is cleared)
-- Negative: Error code
+- RAX = `0`, RDX = notification word value (word is cleared)
+- RAX = error code on failure
 
 **Behavior:**
 - If notification word is non-zero: returns immediately with value
@@ -256,13 +263,13 @@ Non-blocking notification check.
 
 ```c
 long sys_poll(
-    cap_t notification
+    cap_t notification   // RDI
 );
 ```
 
 **Returns:**
-- `>= 0`: Notification word value
-- `-EWOULDBLOCK`: No notification pending
+- RAX = `0`, RDX = notification word value
+- RAX = `9` (WouldBlock): No notification pending
 
 ---
 
@@ -289,15 +296,34 @@ Generic capability invocation.
 
 ```c
 long sys_invoke(
-    cap_t capability,    // Capability to invoke
-    uint64_t label,      // Operation label
-    uint64_t *msg        // Message buffer
+    cap_t capability,    // RDI: Capability to invoke
+    uint64_t label,      // RSI: Operation label (msg_info format)
+    uint64_t arg0,       // RDX: Operation argument 0
+    uint64_t arg1,       // R10: Operation argument 1
+    uint64_t arg2,       // R8:  Operation argument 2
+    uint64_t arg3        // R9:  Operation argument 3
 );
 ```
 
-This is the generic syscall for all capability operations not covered by IPC.
+The `label` field (extracted from msg_info bits 51:12) determines the operation. Arguments are operation-specific.
 
-The `label` determines the operation. The message buffer contains operation-specific arguments.
+### DebugPutChar (10)
+
+Write a character to the kernel debug serial port. Development use only.
+
+```c
+long sys_debug_putchar(
+    char c               // RDI: Character to output (cast to u64)
+);
+```
+
+### DebugDumpState (11)
+
+Dump the current thread's register state to the kernel debug serial port.
+
+```c
+long sys_debug_dump_state(void);
+```
 
 ## Capability Operations
 
@@ -316,10 +342,11 @@ The `label` determines the operation. The message buffer contains operation-spec
 | 0x48 | `TCB_SetIPCBuffer` | Set IPC buffer address |
 | 0x49 | `TCB_BindNotification` | Bind notification for combined wait |
 | 0x4A | `TCB_UnbindNotification` | Unbind notification |
+| 0x4B | `TCB_SetFaultHandler` | Set fault handler endpoint |
 
 #### TCB_Configure (0x40)
 
-Configure a thread's entry point, stack, and IPC buffer. The fault handler endpoint is set separately via `TCB_BindNotification`.
+Configure a thread's entry point, stack, and IPC buffer.
 
 ```
 arg0 = entry_rip     (instruction pointer)
@@ -341,7 +368,7 @@ Read a thread's saved registers. Thread must not be Running.
 arg0 = flags         (reserved, must be 0)
 ```
 
-**Returns:** RIP in value field. Requires READ right. Returns `EBUSY` if thread is Running.
+**Returns:** RIP in value field. Requires READ right. Returns `Busy` if thread is Running.
 
 #### TCB_WriteRegisters (0x46)
 
@@ -353,7 +380,7 @@ arg1 = rip           (new instruction pointer)
 arg2 = rsp           (new stack pointer)
 ```
 
-Requires WRITE right. Returns `EBUSY` if thread is Running.
+Requires WRITE right. Returns `Busy` if thread is Running.
 
 #### TCB_SetPriority (0x47)
 
@@ -379,7 +406,7 @@ Bind a notification object to this thread for combined IPC wait.
 arg0 = ntfn_cap_ptr  (capability pointer to Notification)
 ```
 
-Returns `EBUSY` if a notification is already bound.
+Returns `Busy` if a notification is already bound.
 
 #### TCB_UnbindNotification (0x4A)
 
@@ -387,21 +414,31 @@ Unbind the current notification from this thread.
 
 Returns `InvalidOperation` if no notification is bound.
 
+#### TCB_SetFaultHandler (0x4B)
+
+Set the fault handler endpoint for a thread. When the thread faults (e.g., page fault), a fault message is delivered to this endpoint.
+
+```
+arg0 = fault_ep_cap_ptr  (capability pointer to Endpoint)
+```
+
+The fault endpoint must be an Endpoint capability. Set to 0 to clear the fault handler.
+
 ---
 
 ### CNode Invocations
 
 | Label | Operation | Description |
 |-------|-----------|-------------|
-| 0x10 | `CNode_Copy` | Copy capability |
-| 0x11 | `CNode_Mint` | Copy with badge |
-| 0x12 | `CNode_Move` | Move capability |
-| 0x13 | `CNode_Mutate` | Move with badge |
-| 0x14 | `CNode_Delete` | Delete capability |
-| 0x15 | `CNode_Revoke` | Revoke derived capabilities |
-| 0x16 | `CNode_SaveCaller` | Save reply capability |
+| 0x10 | `CNode_Copy` | Copy capability with rights mask |
+| 0x11 | `CNode_Mint` | Copy with badge (for endpoint badging) |
+| 0x12 | `CNode_Move` | Move capability between CNodes |
+| 0x13 | `CNode_Mutate` | Move with badge change |
+| 0x14 | `CNode_Delete` | Delete single capability |
+| 0x15 | `CNode_Revoke` | Revoke capability and all descendants |
+| 0x16 | `CNode_SaveCaller` | Save reply capability to slot |
 
-#### CNode_Copy
+#### CNode_Copy (0x10)
 
 Invoked on the **source** CNode capability.
 
@@ -414,6 +451,82 @@ Register mapping (via Invoke syscall):
   arg2    (R8)  - Destination slot index
   arg3    (R9)  - Rights mask
 ```
+
+#### CNode_Mint (0x11)
+
+Create a badged copy of a capability. Invoked on the **source** CNode.
+
+```
+  cap_ptr (RDI) - Source CNode capability (invoked)
+  label   (RSI) - 0x11 (CNode_Mint)
+  arg0    (RDX) - Source slot index
+  arg1    (R10) - Destination CNode capability pointer
+  arg2    (R8)  - Destination slot index
+  arg3    (R9)  - Badge value
+```
+
+The new capability has the badge set and Grant right removed. Badged capabilities identify the sender to the receiver.
+
+#### CNode_Move (0x12)
+
+Move a capability from one CNode to another. Invoked on the **destination** CNode.
+
+```
+  cap_ptr (RDI) - Destination CNode capability (invoked)
+  label   (RSI) - 0x12 (CNode_Move)
+  arg0    (RDX) - Destination slot index
+  arg1    (R10) - Source CNode capability pointer
+  arg2    (R8)  - Source slot index
+```
+
+The source slot becomes empty after the move.
+
+#### CNode_Mutate (0x13)
+
+Move a capability and change its badge. Invoked on the **destination** CNode. Only works on endpoint capabilities.
+
+```
+  cap_ptr (RDI) - Destination CNode capability (invoked)
+  label   (RSI) - 0x13 (CNode_Mutate)
+  arg0    (RDX) - Destination slot index
+  arg1    (R10) - Source CNode capability pointer
+  arg2    (R8)  - Source slot index
+  arg3    (R9)  - New badge value
+```
+
+#### CNode_Delete (0x14)
+
+Delete a single capability from a CNode. Invoked on the CNode containing the capability.
+
+```
+  cap_ptr (RDI) - CNode capability (invoked)
+  label   (RSI) - 0x14 (CNode_Delete)
+  arg0    (RDX) - Slot index to delete
+```
+
+Fails with `HasChildren` error if the capability has derived children (use Revoke instead).
+
+#### CNode_Revoke (0x15)
+
+Revoke a capability and all its descendants in the CDT.
+
+```
+  cap_ptr (RDI) - CNode capability (invoked)
+  label   (RSI) - 0x15 (CNode_Revoke)
+  arg0    (RDX) - Slot index to revoke
+```
+
+#### CNode_SaveCaller (0x16)
+
+Save the current thread's reply capability into a CNode slot. This enables deferred reply patterns where a server can reply to a client later rather than immediately in ReplyRecv.
+
+```
+  cap_ptr (RDI) - CNode capability (invoked)
+  label   (RSI) - 0x16 (CNode_SaveCaller)
+  arg0    (RDX) - Destination slot index
+```
+
+The reply capability is one-shot and is cleared from the current thread's TCB.
 
 ---
 
@@ -471,18 +584,18 @@ arg2 = dest_offset   (destination slot index in current CSpace)
 ```
 
 **Object Types:**
-| Value | Type |
-|-------|------|
-| 1 | Untyped |
-| 2 | Endpoint |
-| 3 | Notification |
-| 4 | TCB |
-| 5 | CNode |
-| 6 | VSpace |
-| 7 | Frame |
-| 8 | IrqHandler |
-| 9 | IoPort |
-| 10 | SchedContext |
+| Value | Type | Description |
+|-------|------|-------------|
+| 1 | Untyped | Raw physical memory |
+| 2 | Endpoint | Synchronous IPC channel |
+| 3 | Notification | Async signaling primitive |
+| 4 | TCB | Thread control block |
+| 5 | CNode | Capability storage node |
+| 6 | VSpace | Virtual address space (PML4) |
+| 7 | Frame | Physical memory page (min size_bits=12 for 4KB) |
+| 8 | IrqHandler | Interrupt handler object |
+| 9 | IoPort | I/O port range |
+| 10 | SchedContext | Scheduling parameters |
 
 ---
 
@@ -552,6 +665,61 @@ Unbind the notification from the IRQ handler.
 
 ---
 
+### IoPort Invocations
+
+I/O port capabilities provide controlled access to x86 I/O ports. Each IoPort capability covers a range of ports (base address + size).
+
+| Label | Operation | Description |
+|-------|-----------|-------------|
+| 0x70 | `IoPort_In8` | Read 8-bit value from port |
+| 0x71 | `IoPort_Out8` | Write 8-bit value to port |
+| 0x72 | `IoPort_In16` | Read 16-bit value from port |
+| 0x73 | `IoPort_Out16` | Write 16-bit value to port |
+
+#### IoPort_In8 (0x70)
+
+Read an 8-bit value from an I/O port.
+
+```
+arg0 = offset        (port offset within the IoPort range)
+```
+
+**Returns:** Value in RDX. Requires READ right.
+
+#### IoPort_Out8 (0x71)
+
+Write an 8-bit value to an I/O port.
+
+```
+arg0 = offset        (port offset within the IoPort range)
+arg1 = value         (8-bit value to write)
+```
+
+Requires WRITE right.
+
+#### IoPort_In16 (0x72)
+
+Read a 16-bit value from an I/O port.
+
+```
+arg0 = offset        (port offset within the IoPort range)
+```
+
+**Returns:** Value in RDX. Requires READ right.
+
+#### IoPort_Out16 (0x73)
+
+Write a 16-bit value to an I/O port.
+
+```
+arg0 = offset        (port offset within the IoPort range)
+arg1 = value         (16-bit value to write)
+```
+
+Requires WRITE right.
+
+---
+
 ## Error Codes
 
 SaltyOS uses positive error codes (returned in RAX).
@@ -579,19 +747,18 @@ SaltyOS uses positive error codes (returned in RAX).
 ```
 Offset  Size   Field
 ──────  ─────  ─────────────────
-0x000   8      Message Info
-0x008   8      MR0
-0x010   8      MR1
-0x018   8      MR2
-0x020   8      MR3
-0x028   128    Extra MRs (MR4-MR19)
-0x0A8   8      Badge (receive only)
-0x0B0   8      Receive CNode
-0x0B8   8      Receive Index
-0x0C0   8      Receive Depth
-0x0C8   128    Capability receive slots
-0x148   ...    Reserved
+0x000   160    msg[20] — Message registers MR0-MR19
+0x0A0   8      badge — Received sender badge
+0x0A8   32     caps[4] — Capability slots to transfer (sender-side)
+0x0C8   8      receive_cnode — CNode cap for receiving caps
+0x0D0   8      receive_index — Starting slot index in receive CNode
+0x0D8   8      receive_depth — CNode depth for cap lookup
+0x0E0   3840   reserved[480] — Reserved for future use
+──────  ─────  ─────────────────
+Total:  4096   (one 4KB page)
 ```
+
+MR0-MR3 are passed in CPU registers for the fastpath. MR4-MR19 overflow to the IPC buffer when length > 4.
 
 ## Example Usage
 
@@ -599,28 +766,26 @@ Offset  Size   Field
 
 ```c
 // Client side
-uint64_t result = sys_call(
-    server_endpoint,
-    MAKE_MSG_INFO(2, 0, 0),  // 2 words, 0 caps
-    REQUEST_ADD,             // mr0: operation
-    42,                      // mr1: argument
-    0, 0
-);
-// Result in mr0
+struct salty_msg msg = {
+    .label = REQUEST_ADD,
+    .length = 2,
+    .regs = { 42, 0, 0, 0 },
+};
+salty_call(server_ep, &msg);
+uint64_t result = msg.regs[0];
 
 // Server side
+struct salty_msg msg, reply;
+uint64_t badge;
+salty_recv(endpoint, &msg, &badge);
+
 for (;;) {
-    uint64_t badge;
-    uint64_t msg_info = sys_recv(endpoint, &badge, ...);
+    uint64_t result = handle_request(msg.label, msg.regs[0]);
 
-    uint64_t op = mr0;
-    uint64_t arg = mr1;
+    reply.label = SALTY_OK;
+    reply.length = 1;
+    reply.regs[0] = result;
 
-    uint64_t result = handle_request(op, arg);
-
-    sys_reply_recv(endpoint,
-        MAKE_MSG_INFO(1, 0, 0),
-        result, 0, 0, 0
-    );
+    salty_reply_recv(endpoint, &reply, &msg, &badge);
 }
 ```

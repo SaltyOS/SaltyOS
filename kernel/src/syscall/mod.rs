@@ -22,6 +22,8 @@ pub enum Syscall {
     Poll = 7,
     Yield = 8,
     Invoke = 9,
+    DebugPutChar = 10,
+    DebugDumpState = 11,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -39,6 +41,8 @@ impl TryFrom<u64> for Syscall {
             7 => Ok(Syscall::Poll),
             8 => Ok(Syscall::Yield),
             9 => Ok(Syscall::Invoke),
+            10 => Ok(Syscall::DebugPutChar),
+            11 => Ok(Syscall::DebugDumpState),
             _ => Err(SyscallError::InvalidOperation),
         }
     }
@@ -46,33 +50,40 @@ impl TryFrom<u64> for Syscall {
 
 /// Message info word helpers
 ///
-/// Format: [63:12 Reserved | 11:8 ExtraCaps | 7:4 CapsUnwr | 3:0 Length]
-mod msg_info {
-    const LENGTH_MASK: u64 = 0xF;
-    const CAPS_UNWR_SHIFT: u64 = 4;
-    const CAPS_UNWR_MASK: u64 = 0xF << CAPS_UNWR_SHIFT;
-    const EXTRACAPS_SHIFT: u64 = 8;
-    const EXTRACAPS_MASK: u64 = 0xF << EXTRACAPS_SHIFT;
+/// Format (seL4-aligned):
+///   Bits  6:0  = Length (0-127, number of message registers used)
+///   Bits 11:7  = ExtraCaps (0-31, number of capabilities to transfer)
+///   Bits 51:12 = Label (40 bits, application-defined message label)
+///   Bits 63:52 = Reserved
+pub mod msg_info {
+    const LENGTH_BITS: u64 = 7;
+    const LENGTH_MASK: u64 = (1 << LENGTH_BITS) - 1; // 0x7F
+    const EXTRACAPS_SHIFT: u64 = 7;
+    const EXTRACAPS_BITS: u64 = 5;
+    const EXTRACAPS_MASK: u64 = ((1 << EXTRACAPS_BITS) - 1) << EXTRACAPS_SHIFT; // 0xF80
+    const LABEL_SHIFT: u64 = 12;
+    const LABEL_MASK: u64 = 0xFF_FFFF_FFFF; // 40 bits
 
-    /// Extract message length (number of words)
+    /// Extract message label (bits 51:12)
+    pub fn get_label(msg_info: u64) -> u64 {
+        (msg_info >> LABEL_SHIFT) & LABEL_MASK
+    }
+
+    /// Extract message length (bits 6:0, max 127)
     pub fn get_length(msg_info: u64) -> usize {
-        ((msg_info & LENGTH_MASK) as usize).min(4) // Max 4 for now
+        (msg_info & LENGTH_MASK) as usize
     }
 
-    /// Extract number of capabilities to unwrap
-    pub fn get_caps_unwr(msg_info: u64) -> usize {
-        ((msg_info & CAPS_UNWR_MASK) >> CAPS_UNWR_SHIFT) as usize
-    }
-
-    /// Extract number of extra capabilities
+    /// Extract number of extra capabilities (bits 11:7, max 31)
     pub fn get_extra_caps(msg_info: u64) -> usize {
         ((msg_info & EXTRACAPS_MASK) >> EXTRACAPS_SHIFT) as usize
     }
 
-    /// Create message info word
-    #[allow(dead_code)]
-    pub fn make(length: u64, caps_unwr: u64, extra_caps: u64) -> u64 {
-        length | (caps_unwr << 4) | (extra_caps << 8)
+    /// Create a message info word
+    pub fn make(label: u64, length: usize, extra_caps: usize) -> u64 {
+        ((label & LABEL_MASK) << LABEL_SHIFT)
+            | ((extra_caps as u64 & 0x1F) << EXTRACAPS_SHIFT)
+            | (length as u64 & LENGTH_MASK)
     }
 }
 
@@ -233,8 +244,8 @@ fn validate_notification_cap(
 /// Construct Message from syscall arguments
 ///
 /// Arguments:
-/// - msg_info: Message info word (length, caps counts)
-/// - mr0-mr3: Message registers
+/// - msg_info: Message info word (label + length + extra_caps, packed)
+/// - mr0-mr3: Message registers (inline fastpath)
 fn construct_message(
     msg_info: u64,
     mr0: u64,
@@ -242,31 +253,49 @@ fn construct_message(
     mr2: u64,
     mr3: u64,
 ) -> Message {
+    let label = msg_info::get_label(msg_info);
     let length = msg_info::get_length(msg_info);
     let mut regs = [0u64; 4];
 
-    // Copy registers based on length
-    regs[0] = mr0;
+    // Copy inline registers based on length (max 4 in registers)
+    if length > 0 { regs[0] = mr0; }
     if length > 1 { regs[1] = mr1; }
     if length > 2 { regs[2] = mr2; }
     if length > 3 { regs[3] = mr3; }
 
-    Message { label: msg_info, regs }
+    Message { label, length, regs }
 }
 
 /// Write received IPC message to current thread's IPC buffer
 ///
-/// The IPC buffer is a user-mapped page whose virtual address is stored
-/// in the TCB. The kernel writes the Message struct directly to this page.
-unsafe fn write_msg_to_ipc_buffer(msg: &Message) {
+/// Writes message registers and badge into the IpcBuffer layout.
+/// MR0-MR3 go into ipc_buffer.msg[0..4], badge into ipc_buffer.badge.
+unsafe fn write_msg_to_ipc_buffer(msg: &Message, badge: u64) {
     unsafe {
         let scheduler = crate::sched::scheduler::scheduler();
         let current = scheduler.current();
         if current.is_null() { return; }
         let buf = (*current).ipc_buffer;
         if buf == 0 { return; }
-        let ptr = buf as *mut Message;
-        core::ptr::write(ptr, *msg);
+        let ipc_buf = buf as *mut crate::ipc::IpcBuffer;
+
+        // Write inline message registers to IPC buffer msg array
+        let len = msg.length.min(4);
+        for i in 0..len {
+            (*ipc_buf).msg[i] = msg.regs[i];
+        }
+        // Clear remaining slots up to length
+        for i in len..msg.length.min(20) {
+            (*ipc_buf).msg[i] = 0;
+        }
+
+        // Write badge
+        (*ipc_buf).badge = badge;
+
+        // Also write the Message struct at the beginning for backward compat
+        // with userspace that reads struct salty_msg from ipc_buffer
+        let legacy_ptr = buf as *mut Message;
+        core::ptr::write(legacy_ptr, *msg);
     }
 }
 
@@ -312,7 +341,7 @@ fn syscall_recv(cap_ptr: u64) -> SyscallResult {
     unsafe {
         let endpoint = &mut *(cap.object as *mut Endpoint);
         let (msg, badge) = endpoint.recv();
-        write_msg_to_ipc_buffer(&msg);
+        write_msg_to_ipc_buffer(&msg, badge);
         SyscallResult::ok(badge)
     }
 }
@@ -340,7 +369,7 @@ fn syscall_call(
     unsafe {
         let endpoint = &mut *(cap.object as *mut Endpoint);
         let reply_msg = endpoint.call(&msg, cap.badge);
-        write_msg_to_ipc_buffer(&reply_msg);
+        write_msg_to_ipc_buffer(&reply_msg, 0);
     }
 
     SyscallResult::ok(0)
@@ -369,7 +398,7 @@ fn syscall_reply_recv(
     unsafe {
         let endpoint = &mut *(cap.object as *mut Endpoint);
         let (msg, badge) = endpoint.reply_recv(&reply);
-        write_msg_to_ipc_buffer(&msg);
+        write_msg_to_ipc_buffer(&msg, badge);
         SyscallResult::ok(badge)
     }
 }
@@ -381,6 +410,7 @@ fn syscall_nbsend(
     mr0: u64,
     mr1: u64,
     mr2: u64,
+    mr3: u64,
 ) -> SyscallResult {
     let cap = match lookup_capability(cap_ptr) {
         Ok(c) => c,
@@ -391,7 +421,7 @@ fn syscall_nbsend(
         Err(e) => return SyscallResult::err(e),
     }
 
-    let msg = construct_message(msg_info, mr0, mr1, mr2, 0);
+    let msg = construct_message(msg_info, mr0, mr1, mr2, mr3);
 
     unsafe {
         let endpoint = &mut *(cap.object as *mut Endpoint);
@@ -502,6 +532,80 @@ fn syscall_invoke(
             }
             SyscallResult::ok(0)
         }
+        (ObjectType::CNode, 0x11) => {
+            // CNode_Mint: cap_ptr = src CNode (invoked)
+            //   arg0 = src slot index
+            //   arg1 = dest CNode cap_ptr
+            //   arg2 = dest slot index
+            //   arg3 = badge value
+            let dest_cnode_cap = match lookup_capability(arg1) {
+                Ok(c) => c,
+                Err(e) => return SyscallResult::err(e),
+            };
+            if let Err(e) = validate_capability(dest_cnode_cap, ObjectType::CNode, CapRights::WRITE) {
+                return SyscallResult::err(e);
+            }
+
+            // Badged caps get all rights except GRANT
+            let rights = CapRights::from_bits(0xFFFFFFFF & !(1 << 3));
+
+            unsafe {
+                let dest = &mut *(dest_cnode_cap.object as *mut CNode);
+                let src = &*(cap.object as *const CNode);
+                match dest.mint_slot(arg2 as usize, src, arg0 as usize, arg3, rights) {
+                    Ok(()) => {}
+                    Err(e) => return SyscallResult::err(syscall_error_from_cap_error(e)),
+                }
+            }
+            SyscallResult::ok(0)
+        }
+        (ObjectType::CNode, 0x12) => {
+            // CNode_Move: cap_ptr = dest CNode (invoked)
+            //   arg0 = dest slot index
+            //   arg1 = src CNode cap_ptr
+            //   arg2 = src slot index
+            let src_cnode_cap = match lookup_capability(arg1) {
+                Ok(c) => c,
+                Err(e) => return SyscallResult::err(e),
+            };
+            if let Err(e) = validate_capability(src_cnode_cap, ObjectType::CNode, CapRights::WRITE) {
+                return SyscallResult::err(e);
+            }
+
+            unsafe {
+                let dest = &mut *(cap.object as *mut CNode);
+                let src = &mut *(src_cnode_cap.object as *mut CNode);
+                match dest.move_slot(arg0 as usize, src, arg2 as usize) {
+                    Ok(()) => {}
+                    Err(e) => return SyscallResult::err(syscall_error_from_cap_error(e)),
+                }
+            }
+            SyscallResult::ok(0)
+        }
+        (ObjectType::CNode, 0x13) => {
+            // CNode_Mutate: cap_ptr = dest CNode (invoked)
+            //   arg0 = dest slot index
+            //   arg1 = src CNode cap_ptr
+            //   arg2 = src slot index
+            //   arg3 = new badge value
+            let src_cnode_cap = match lookup_capability(arg1) {
+                Ok(c) => c,
+                Err(e) => return SyscallResult::err(e),
+            };
+            if let Err(e) = validate_capability(src_cnode_cap, ObjectType::CNode, CapRights::WRITE) {
+                return SyscallResult::err(e);
+            }
+
+            unsafe {
+                let dest = &mut *(cap.object as *mut CNode);
+                let src = &mut *(src_cnode_cap.object as *mut CNode);
+                match dest.mutate_slot(arg0 as usize, src, arg2 as usize, arg3) {
+                    Ok(()) => {}
+                    Err(e) => return SyscallResult::err(syscall_error_from_cap_error(e)),
+                }
+            }
+            SyscallResult::ok(0)
+        }
         (ObjectType::CNode, 0x14) => {
             // CNode_Delete — require WRITE right
             if !cap.has_right(CapRights::WRITE) {
@@ -524,6 +628,25 @@ fn syscall_invoke(
             unsafe {
                 let cnode = &mut *(cap.object as *mut CNode);
                 match cnode.revoke(arg0 as usize) {
+                    Ok(()) => {}
+                    Err(e) => return SyscallResult::err(syscall_error_from_cap_error(e)),
+                }
+            }
+            SyscallResult::ok(0)
+        }
+        (ObjectType::CNode, 0x16) => {
+            // CNode_SaveCaller: cap_ptr = CNode (invoked)
+            //   arg0 = slot index to save the reply cap into
+            if !cap.has_right(CapRights::WRITE) {
+                return SyscallResult::err(SyscallError::InsufficientRights);
+            }
+            unsafe {
+                let cnode = &mut *(cap.object as *mut CNode);
+                let current_tcb = crate::sched::scheduler::scheduler().current();
+                if current_tcb.is_null() {
+                    return SyscallResult::err(SyscallError::InvalidOperation);
+                }
+                match cnode.save_caller(arg0 as usize, current_tcb) {
                     Ok(()) => {}
                     Err(e) => return SyscallResult::err(syscall_error_from_cap_error(e)),
                 }
@@ -1624,8 +1747,8 @@ pub fn handle(
         Syscall::Recv => syscall_recv(cap_ptr),
         Syscall::Call => syscall_call(cap_ptr, msg_info, mr0, mr1, mr2, mr3),
         Syscall::ReplyRecv => syscall_reply_recv(cap_ptr, msg_info, mr0, mr1, mr2, mr3),
-        Syscall::NBSend => syscall_nbsend(cap_ptr, msg_info, mr0, mr1, mr2),
-        Syscall::Signal => syscall_signal(cap_ptr, mr0),
+        Syscall::NBSend => syscall_nbsend(cap_ptr, msg_info, mr0, mr1, mr2, mr3),
+        Syscall::Signal => syscall_signal(cap_ptr, msg_info),
         Syscall::Wait => syscall_wait(cap_ptr),
         Syscall::Poll => syscall_poll(cap_ptr),
         Syscall::Yield => {
@@ -1633,6 +1756,38 @@ pub fn handle(
             SyscallResult::ok(0)
         }
         Syscall::Invoke => syscall_invoke(cap_ptr, msg_info, mr0, mr1, mr2, mr3),
+        Syscall::DebugPutChar => {
+            unsafe { debug_serial_putc(cap_ptr as u8); }
+            SyscallResult::ok(0)
+        }
+        Syscall::DebugDumpState => {
+            unsafe {
+                let scheduler = crate::sched::scheduler::scheduler();
+                let current = scheduler.current();
+                if !current.is_null() {
+                    let tcb = &*current;
+                    debug_serial_puts("[DEBUG] TCB state dump:\n");
+                    debug_serial_puts("  RIP=");
+                    debug_serial_hex(tcb.context.rip);
+                    debug_serial_puts(" RSP=");
+                    debug_serial_hex(tcb.context.rsp);
+                    debug_serial_puts("\n  RAX=");
+                    debug_serial_hex(tcb.context.rax);
+                    debug_serial_puts(" RBX=");
+                    debug_serial_hex(tcb.context.rbx);
+                    debug_serial_puts("\n  RCX=");
+                    debug_serial_hex(tcb.context.rcx);
+                    debug_serial_puts(" RDX=");
+                    debug_serial_hex(tcb.context.rdx);
+                    debug_serial_puts("\n  RSI=");
+                    debug_serial_hex(tcb.context.rsi);
+                    debug_serial_puts(" RDI=");
+                    debug_serial_hex(tcb.context.rdi);
+                    debug_serial_puts("\n");
+                }
+            }
+            SyscallResult::ok(0)
+        }
     }
 }
 
@@ -1662,4 +1817,42 @@ pub unsafe extern "C" fn syscall_handle_rust(
     arg4: u64,    // stack (user R9)
 ) -> SyscallResult {
     handle(syscall, cap_ptr, arg0, arg1, arg2, arg3, arg4)
+}
+
+// Debug serial helpers for DebugPutChar / DebugDumpState syscalls
+const DEBUG_SERIAL_PORT: u16 = 0x3F8;
+
+unsafe fn debug_serial_putc(c: u8) {
+    unsafe {
+        while (crate::arch::inb(DEBUG_SERIAL_PORT + 5) & 0x20) == 0 {}
+        crate::arch::outb(DEBUG_SERIAL_PORT, c);
+    }
+}
+
+unsafe fn debug_serial_puts(s: &str) {
+    for byte in s.bytes() {
+        unsafe { debug_serial_putc(byte); }
+    }
+}
+
+unsafe fn debug_serial_hex(mut val: u64) {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    unsafe {
+        debug_serial_putc(b'0');
+        debug_serial_putc(b'x');
+    }
+    if val == 0 {
+        unsafe { debug_serial_putc(b'0'); }
+        return;
+    }
+    let mut buf = [0u8; 16];
+    let mut pos = 15i32;
+    while val > 0 && pos >= 0 {
+        buf[pos as usize] = HEX_CHARS[(val & 0xF) as usize];
+        val >>= 4;
+        pos -= 1;
+    }
+    for i in (pos + 1) as usize..16 {
+        unsafe { debug_serial_putc(buf[i]); }
+    }
 }

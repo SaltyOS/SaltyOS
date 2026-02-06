@@ -22,7 +22,7 @@ pub type CapSlot = u32;
 
 /// Slot state
 #[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SlotState {
     Free = 0,
     Occupied = 1,
@@ -254,7 +254,11 @@ mod tests {
         let slot2 = alloc_slot().unwrap();
 
         assert_ne!(slot1, slot2);
-        assert!(!is_slot_null(slot1));
+        // alloc_slot marks the slot as Occupied but does not populate the
+        // capability payload, so is_slot_null() is still true.  Verify
+        // occupation via metadata instead.
+        assert_eq!(get_meta(slot1).state, SlotState::Occupied);
+        assert_eq!(get_meta(slot2).state, SlotState::Occupied);
 
         free_slot(slot1);
         free_slot(slot2);

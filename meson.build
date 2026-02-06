@@ -164,7 +164,8 @@ initrd_target = []
 
 if build_userland and mkcpio.found()
   initrd = custom_target('initrd',
-    input: [init_elf, console_elf, ld_salty_so, libsalty_so, libc_so],
+    input: [init_elf, console_elf, ld_salty_so, libsalty_so, libc_so,
+            nameserv_elf, procmgr_elf, vfs_elf],
     output: 'initrd.cpio',
     command: [mkcpio,
       '--output', '@OUTPUT@',
@@ -173,6 +174,9 @@ if build_userland and mkcpio.found()
       'ld-salty.so=@INPUT2@',
       'libsalty.so=@INPUT3@',
       'libc.so=@INPUT4@',
+      'nameserv.elf=@INPUT5@',
+      'procmgr.elf=@INPUT6@',
+      'vfs.elf=@INPUT7@',
     ],
     build_by_default: true,
   )
