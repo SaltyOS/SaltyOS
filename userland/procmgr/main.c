@@ -416,8 +416,6 @@ static void handle_exit(const struct salty_msg *msg, struct salty_msg *reply, ui
 
     /* Suspend the thread (it called exit, so we don't reply) */
     salty_invoke(proc->tcb_cap, TCB_SUSPEND, 0, 0, 0, 0);
-
-    reply->label = SALTY_OK;
 }
 
 static void handle_wait(const struct salty_msg *msg, struct salty_msg *reply, uint64_t badge) {
@@ -518,6 +516,7 @@ void _start(void) {
         reply.label = 0;
         reply.length = 0;
         for (int i = 0; i < 4; i++) reply.regs[i] = 0;
+        int skip_reply = 0;
 
         switch (msg.label) {
         case PM_SPAWN:
@@ -525,6 +524,7 @@ void _start(void) {
             break;
         case PM_EXIT:
             handle_exit(&msg, &reply, badge);
+            skip_reply = 1;
             break;
         case PM_WAIT:
             handle_wait(&msg, &reply, badge);
@@ -540,7 +540,11 @@ void _start(void) {
             break;
         }
 
-        err = salty_reply_recv(CAP_SERVER_EP, &reply, &msg, &badge);
+        if (skip_reply) {
+            err = salty_recv(CAP_SERVER_EP, &msg, &badge);
+        } else {
+            err = salty_reply_recv(CAP_SERVER_EP, &reply, &msg, &badge);
+        }
         if (err != 0) {
             salty_serial_puts("[PROCMGR] reply_recv failed err=");
             salty_serial_hex((uint64_t)err);

@@ -215,7 +215,9 @@ impl Endpoint {
             (*receiver).saved_caller_msg = *msg;
             (*receiver).saved_caller_badge = badge;
 
-            // Copy overflow registers MR4..MR(length-1) via IPC buffers
+            // Copy overflow registers MR4..MR(length-1) via IPC buffers.
+            // The IPC buffer msg[] has a 2-slot header (label, length)
+            // so MR4 maps to msg[6], MR5 to msg[7], etc.
             let sender_buf = (*sender).ipc_buffer;
             let receiver_buf = (*receiver).ipc_buffer;
             if msg.length > 4 && sender_buf != 0 && receiver_buf != 0 {
@@ -223,7 +225,7 @@ impl Endpoint {
                 let receiver_ipc = receiver_buf as *mut super::IpcBuffer;
                 let overflow_count = (msg.length - 4).min(16); // MR4..MR19
                 for i in 0..overflow_count {
-                    (*receiver_ipc).msg[4 + i] = (*sender_ipc).msg[4 + i];
+                    (*receiver_ipc).msg[6 + i] = (*sender_ipc).msg[6 + i];
                 }
             }
 

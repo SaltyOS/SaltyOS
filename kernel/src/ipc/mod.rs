@@ -41,23 +41,27 @@ impl Message {
 
 /// IPC Buffer layout (mapped into user VSpace, shared between kernel and user)
 ///
+/// The msg[] array is overlaid by userland as `struct salty_msg`:
+///   msg[0] = label, msg[1] = length, msg[2..21] = regs[0..19]
+/// So 22 slots = 2 header + 20 message registers.
+///
 /// Total size: 4096 bytes (one page)
 #[repr(C)]
 pub struct IpcBuffer {
-    /// Message registers MR0..MR19 (overflow beyond the 4 inline regs)
-    pub msg: [u64; 20],         // 0x000: 160 bytes
+    /// salty_msg overlay: [label, length, regs[0..19]]
+    pub msg: [u64; 22],         // 0x000: 176 bytes
     /// Badge received from sender
-    pub badge: u64,             // 0x0A0: 8 bytes
+    pub badge: u64,             // 0x0B0: 8 bytes
     /// Capability slots to transfer (sender-side: indices into sender's CNode)
-    pub caps: [u64; 4],         // 0x0A8: 32 bytes
+    pub caps: [u64; 4],         // 0x0B8: 32 bytes
     /// CNode for receiving transferred capabilities
-    pub receive_cnode: u64,     // 0x0C8: 8 bytes
+    pub receive_cnode: u64,     // 0x0D8: 8 bytes
     /// Starting slot index in receive CNode
-    pub receive_index: u64,     // 0x0D0: 8 bytes
+    pub receive_index: u64,     // 0x0E0: 8 bytes
     /// CNode depth for receive
-    pub receive_depth: u64,     // 0x0D8: 8 bytes
+    pub receive_depth: u64,     // 0x0E8: 8 bytes
     /// Reserved for future use
-    pub reserved: [u64; 480],   // 0x0E0: 3840 bytes
+    pub reserved: [u64; 478],   // 0x0F0: 3824 bytes
 }
 
 // Compile-time assertion: IpcBuffer fits in one page

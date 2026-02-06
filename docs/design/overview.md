@@ -143,7 +143,7 @@ Three-level memory abstraction:
 | `console` | Serial console server (COM1 via IoPort caps) | Implemented |
 | `rtld` | Runtime dynamic linker (shared library loading) | Implemented |
 | `procmgr` | Process lifecycle, capability distribution | Implemented |
-| `vfs` | Virtual filesystem, SaltyFS driver | Implemented |
+| `vfs` | Virtual filesystem, SaltyFS driver | **Partial** (devfs-only) |
 | `nameserv` | Service discovery (endpoint lookup) | Implemented |
 | `drivers/` | Device drivers (PCI, NVMe, USB, etc.) | Planned |
 
@@ -163,7 +163,7 @@ graph TD
 
 1. **Stage 1**: Load Stage 2 from fixed location
 2. **Stage 2**: Enter long mode, load Stage 3 from partition
-3. **Stage 3**: Read SaltyFS, load kernel + initrd
+3. **Stage 3**: Load kernel + initrd via raw disk extents (no filesystem)
 4. **Kernel**: Initialize memory, create root task
 5. **Init**: Spawn system servers, mount filesystems
 

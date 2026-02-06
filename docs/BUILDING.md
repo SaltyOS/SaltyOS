@@ -15,6 +15,9 @@ This document provides detailed instructions for building SaltyOS from source.
 | Clang | >= 11 | C compiler (required; GCC is not supported) |
 | GNU ld / LLD | latest | Linker |
 
+> **Note:** If `clang` is not your default C compiler, set `CC=clang` before
+> running `just setup` or `meson setup`, e.g. `CC=clang just setup`.
+
 ### Optional Tools
 
 | Tool | Purpose |
@@ -32,7 +35,7 @@ This document provides detailed instructions for building SaltyOS from source.
 
 ```bash
 # Core tools
-sudo pacman -S meson ninja nasm gcc lld
+sudo pacman -S meson ninja nasm clang lld
 
 # Rust (use rustup for nightly)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -51,7 +54,7 @@ sudo pacman -S just xorriso mtools
 ```bash
 # Core tools
 sudo apt update
-sudo apt install meson ninja-build nasm gcc lld
+sudo apt install meson ninja-build nasm clang lld
 
 # Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -70,7 +73,7 @@ sudo apt install xorriso mtools
 
 ```bash
 # Core tools
-sudo dnf install meson ninja-build nasm gcc lld
+sudo dnf install meson ninja-build nasm clang lld
 
 # Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -89,10 +92,11 @@ sudo dnf install xorriso mtools
 
 ```bash
 # Homebrew
-brew install meson ninja nasm
+brew install meson ninja nasm llvm
 
-# Cross-compiler (x86_64-elf target)
-brew install x86_64-elf-gcc x86_64-elf-binutils
+# Clang from Homebrew includes cross-compilation support.
+# Add LLVM to PATH (Homebrew's clang):
+export PATH="$(brew --prefix llvm)/bin:$PATH"
 
 # Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -416,7 +420,7 @@ For CI environments:
 ```bash
 # Install dependencies (example for Ubuntu)
 sudo apt-get update
-sudo apt-get install -y meson ninja-build nasm gcc lld
+sudo apt-get install -y meson ninja-build nasm clang lld
 
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y

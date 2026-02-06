@@ -30,6 +30,7 @@ struct salty_result salty_invoke(
 int salty_send(cap_t ep, const struct salty_msg *msg) {
     int caps = __salty_send_cap_count;
     uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
+    __salty_write_overflow(msg);
     struct salty_result r = salty_syscall(
         SYS_SEND, ep,
         info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
@@ -53,6 +54,7 @@ int salty_recv(cap_t ep, struct salty_msg *msg, uint64_t *badge) {
 int salty_call(cap_t ep, const struct salty_msg *msg, struct salty_msg *reply) {
     int caps = __salty_send_cap_count;
     uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
+    __salty_write_overflow(msg);
     struct salty_result r = salty_syscall(
         SYS_CALL, ep,
         info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
@@ -69,6 +71,7 @@ int salty_reply_recv(cap_t ep, const struct salty_msg *reply,
                      struct salty_msg *out_msg, uint64_t *badge) {
     int caps = __salty_send_cap_count;
     uint64_t info = SALTY_MSGINFO(reply->label, reply->length, caps);
+    __salty_write_overflow(reply);
     struct salty_result r = salty_syscall(
         SYS_REPLY_RECV, ep,
         info, reply->regs[0], reply->regs[1], reply->regs[2], reply->regs[3]
@@ -236,6 +239,7 @@ int salty_cnode_revoke(cap_t cnode, uint64_t slot) {
 int salty_nbsend(cap_t ep, const struct salty_msg *msg) {
     int caps = __salty_send_cap_count;
     uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
+    __salty_write_overflow(msg);
     struct salty_result r = salty_syscall(
         SYS_NBSEND, ep,
         info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]

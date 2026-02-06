@@ -269,8 +269,13 @@ fn construct_message(
 
 /// Write received IPC message to current thread's IPC buffer
 ///
-/// Writes message registers and badge into the IpcBuffer layout.
-/// MR0-MR3 go into ipc_buffer.msg[0..4], badge into ipc_buffer.badge.
+/// Writes in `struct salty_msg` layout (matching userland overlay):
+///   msg[0] = label
+///   msg[1] = length
+///   msg[2..5] = regs[0..3]  (inline MRs)
+///   msg[6..21] = regs[4..19] (overflow, already placed by transfer_message)
+///
+/// Badge is written to ipc_buffer.badge.
 unsafe fn write_msg_to_ipc_buffer(msg: &Message, badge: u64) {
     unsafe {
         let scheduler = crate::sched::scheduler::scheduler();
@@ -280,24 +285,25 @@ unsafe fn write_msg_to_ipc_buffer(msg: &Message, badge: u64) {
         if buf == 0 { return; }
         let ipc_buf = buf as *mut crate::ipc::IpcBuffer;
 
-        // Write inline message registers (MR0-MR3) to IPC buffer
-        let len = msg.length.min(4);
-        for i in 0..len {
-            (*ipc_buf).msg[i] = msg.regs[i];
+        // Write header: label and length
+        (*ipc_buf).msg[0] = msg.label;
+        (*ipc_buf).msg[1] = msg.length as u64;
+
+        // Write inline message registers (MR0-MR3) → msg[2..5]
+        let inline_count = msg.length.min(4);
+        for i in 0..inline_count {
+            (*ipc_buf).msg[2 + i] = msg.regs[i];
         }
-        // MR4+ overflow data is already in the IPC buffer (copied by
-        // transfer_message), so only clear slots beyond msg.length
-        for i in msg.length.min(20)..20 {
+
+        // Clear unused slots from end of message to end of regs area
+        // Overflow MR4+ (msg[6..]) is already written by transfer_message
+        let first_clear = if msg.length <= 4 { 2 + msg.length } else { 6 + (msg.length - 4) };
+        for i in first_clear.min(22)..22 {
             (*ipc_buf).msg[i] = 0;
         }
 
         // Write badge
         (*ipc_buf).badge = badge;
-
-        // Also write the Message struct at the beginning for backward compat
-        // with userspace that reads struct salty_msg from ipc_buffer
-        let legacy_ptr = buf as *mut Message;
-        core::ptr::write(legacy_ptr, *msg);
     }
 }
 

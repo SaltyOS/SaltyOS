@@ -166,15 +166,19 @@ struct salty_msg {
 
 /* IPC buffer layout (must match kernel IpcBuffer struct)
  * Mapped at the thread's ipc_buffer address (one 4KB page).
+ *
+ * msg[] is overlaid by struct salty_msg:
+ *   msg[0] = label, msg[1] = length, msg[2..21] = regs[0..19]
+ * So 22 slots = 2 header + 20 message registers.
  */
 struct salty_ipc_buffer {
-    uint64_t msg[20];           /* 0x000: MR0..MR19 */
-    uint64_t badge;             /* 0x0A0: received badge */
-    uint64_t caps[4];           /* 0x0A8: cap slots to transfer (sender) */
-    uint64_t receive_cnode;     /* 0x0C8: CNode for receiving caps */
-    uint64_t receive_index;     /* 0x0D0: starting slot index */
-    uint64_t receive_depth;     /* 0x0D8: CNode depth */
-    uint64_t reserved[480];     /* 0x0E0: future use */
+    uint64_t msg[22];           /* 0x000: salty_msg overlay */
+    uint64_t badge;             /* 0x0B0: received badge */
+    uint64_t caps[4];           /* 0x0B8: cap slots to transfer (sender) */
+    uint64_t receive_cnode;     /* 0x0D8: CNode for receiving caps */
+    uint64_t receive_index;     /* 0x0E0: starting slot index */
+    uint64_t receive_depth;     /* 0x0E8: CNode depth */
+    uint64_t reserved[478];     /* 0x0F0: future use */
 };
 
 /* Pack label, length, and extra_caps into a msg_info word.
@@ -321,6 +325,21 @@ static inline void salty_set_send_cap(int slot_index, uint64_t cap_slot) {
     }
 }
 
+/* Write overflow MRs (regs[4..19]) to the IPC buffer before a send syscall.
+ * The kernel reads MR4+ from the sender's IPC buffer via transfer_message.
+ * The IPC buffer msg[] has a 2-slot header (label, length), so
+ * regs[4] maps to msg[6], regs[5] to msg[7], etc.
+ */
+static inline void __salty_write_overflow(const struct salty_msg *msg) {
+    if (msg->length > 4 && __salty_ipc_buffer) {
+        struct salty_ipc_buffer *buf = (struct salty_ipc_buffer *)__salty_ipc_buffer;
+        int n = (int)msg->length - 4;
+        if (n > 16) n = 16;
+        for (int i = 0; i < n; i++)
+            buf->msg[6 + i] = msg->regs[4 + i];
+    }
+}
+
 /* ====================================================================
  * Higher-level wrappers: static inline when SALTY_STATIC, extern otherwise
  * ==================================================================== */
@@ -343,6 +362,7 @@ static inline struct salty_result salty_invoke(
 static inline int salty_send(cap_t ep, const struct salty_msg *msg) {
     int caps = __salty_send_cap_count;
     uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
+    __salty_write_overflow(msg);
     struct salty_result r = salty_syscall(
         SYS_SEND, ep,
         info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
@@ -367,6 +387,7 @@ static inline int salty_recv(cap_t ep, struct salty_msg *msg, uint64_t *badge) {
 static inline int salty_call(cap_t ep, const struct salty_msg *msg, struct salty_msg *reply) {
     int caps = __salty_send_cap_count;
     uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
+    __salty_write_overflow(msg);
     struct salty_result r = salty_syscall(
         SYS_CALL, ep,
         info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
@@ -383,6 +404,7 @@ static inline int salty_reply_recv(cap_t ep, const struct salty_msg *reply,
                                     struct salty_msg *out_msg, uint64_t *badge) {
     int caps = __salty_send_cap_count;
     uint64_t info = SALTY_MSGINFO(reply->label, reply->length, caps);
+    __salty_write_overflow(reply);
     struct salty_result r = salty_syscall(
         SYS_REPLY_RECV, ep,
         info, reply->regs[0], reply->regs[1], reply->regs[2], reply->regs[3]
@@ -552,6 +574,7 @@ static inline int salty_cnode_revoke(cap_t cnode, uint64_t slot) {
 static inline int salty_nbsend(cap_t ep, const struct salty_msg *msg) {
     int caps = __salty_send_cap_count;
     uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
+    __salty_write_overflow(msg);
     struct salty_result r = salty_syscall(
         SYS_NBSEND, ep,
         info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
