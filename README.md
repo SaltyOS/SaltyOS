@@ -12,6 +12,7 @@ SaltyOS is a capability-based microkernel designed with security and modularity 
 - **Capability-Based Security**: All resource access is mediated through unforgeable capability tokens
 - **Fat Capabilities**: Extended capability format with rich metadata for fine-grained access control
 - **Synchronous IPC + Notifications**: Fast rendezvous-style IPC with lightweight async signaling
+- **SMP Support**: Multi-core boot via ACPI MADT, per-CPU scheduling with IPI-driven reschedule (up to 16 CPUs)
 - **EDF Scheduler**: Earliest Deadline First scheduling for real-time workload support
 - **Multi-Architecture**: Designed for x86_64 with aarch64 support planned
 - **Custom Bootloader**: 3-stage bootloader supporting both BIOS and UEFI
@@ -40,10 +41,10 @@ SaltyOS is a capability-based microkernel designed with security and modularity 
 - [x] **I/O port capabilities** (IoPort_In8/Out8/In16/Out16)
 - [x] **Debug syscalls** (DebugPutChar, DebugDumpState)
 - [x] **Userspace servers** (procmgr, vfs, nameserv)
+- [x] **SMP** (ACPI MADT discovery, AP trampoline, per-CPU GDT/TSS, APIC timer, IPI reschedule/VSpace teardown, CPU affinity)
 
 ### In Progress
 
-- [ ] SMP support (ACPI MADT parser, AP trampoline, per-CPU run queues)
 - [ ] IPC assembly fastpath
 
 ## Architecture
@@ -60,10 +61,11 @@ SaltyOS is a capability-based microkernel designed with security and modularity 
      │          │          │          │          │
 ┌────┴──────────┴──────────┴──────────┴──────────┴─────────────────┐
 │                     SaltyOS Microkernel                          │
-├────────────┬────────────┬────────────┬────────────┬──────────────┤
-│ Capability │    IPC     │  Scheduler │   Memory   │    Arch      │
-│   System   │ Endpoints  │    (EDF)   │ Management │  (x86_64)    │
-└────────────┴────────────┴────────────┴────────────┴──────────────┘
+├──────────┬──────────┬──────────┬──────────┬──────────┬───────────┤
+│Capability│   IPC    │Scheduler │  Memory  │   SMP    │   Arch    │
+│  System  │Endpoints │  (EDF)   │Management│ (APIC/   │ (x86_64)  │
+│          │          │          │          │  IPI)    │           │
+└──────────┴──────────┴──────────┴──────────┴──────────┴───────────┘
 ```
 
 ## Building
@@ -169,7 +171,8 @@ SaltyOS/
 
 ### What the Kernel Does (Implemented)
 
-- Thread management and EDF scheduling with budget enforcement
+- SMP multi-core support (ACPI discovery, AP bootstrap, per-CPU state, IPI)
+- Thread management and EDF scheduling with budget enforcement and CPU affinity
 - Synchronous IPC (endpoints) and async notifications
 - Virtual address space management (VSpace) with page tables
 - Physical memory allocation (frame allocator, slab allocator)
