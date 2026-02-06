@@ -5,9 +5,9 @@
 # Each component is a separate executable
 
 subdir('init')
+subdir('console')
 
 # TODO: Build each userland component
 # subdir('procmgr')
 # subdir('vfs')
-# subdir('console')
 # subdir('nameserv')

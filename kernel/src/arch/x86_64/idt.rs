@@ -301,6 +301,70 @@ pub fn set_double_fault_ist(ist: u8) {
 pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
     let f = unsafe { &*frame };
 
+    // Breakpoint: resume execution immediately
+    if f.vector == 3 {
+        return;
+    }
+
+    // User-mode exception: try fault delivery via IPC
+    if (f.cs & 3) != 0 {
+        unsafe {
+            let scheduler = crate::sched::scheduler::scheduler();
+            let current = scheduler.current();
+
+            if !current.is_null() && !(*current).fault_handler.is_null() {
+                let fault_ep = &mut *((*current).fault_handler
+                    as *mut crate::ipc::Endpoint);
+
+                // Build fault message
+                let msg = if f.vector == 14 {
+                    crate::ipc::vm_fault_message(
+                        f.cr2,
+                        f.error_code,
+                        f.rip,
+                        f.error_code & 16 != 0,
+                    )
+                } else {
+                    crate::ipc::user_exception_message(
+                        f.vector,
+                        f.error_code,
+                        f.rip,
+                        f.rsp,
+                    )
+                };
+
+                serial_puts("[FAULT] user exception vec=");
+                serial_dec(f.vector);
+                serial_puts(" addr=");
+                serial_hex(f.cr2);
+                serial_puts(" rip=");
+                serial_hex(f.rip);
+                serial_puts(" -> delivering via IPC\n");
+
+                // Block faulting thread
+                (*current).state = crate::sched::thread::ThreadState::Blocked;
+                (*current).blocked_reason = Some(
+                    crate::sched::thread::BlockedReason::FaultBlocked {
+                        msg,
+                        badge: 0,
+                    },
+                );
+
+                // Deliver to handler endpoint
+                fault_ep.deliver_fault(current, &msg);
+
+                // Switch to handler (or whoever is next)
+                scheduler.reschedule();
+
+                // Handler replied — we're back. Return to assembly which
+                // restores GPRs from the exception frame and iretq retries
+                // the faulting instruction.
+                return;
+            }
+        }
+    }
+
+    // No fault handler or kernel-mode exception: diagnostic dump + halt
     unsafe {
         serial_puts("\n*** EXCEPTION: ");
         serial_puts(f.exception_name());
@@ -310,37 +374,19 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
         serial_hex(f.error_code);
         serial_puts(")\n");
 
-        // Page fault: decode CR2 and error bits
         if f.vector == 14 {
             serial_puts("  CR2 (fault addr): ");
             serial_hex(f.cr2);
             serial_putc(b'\n');
             serial_puts("  Flags: ");
-            if f.error_code & 1 != 0 {
-                serial_puts("P ");
-            } else {
-                serial_puts("NP ");
-            }
-            if f.error_code & 2 != 0 {
-                serial_puts("W ");
-            } else {
-                serial_puts("R ");
-            }
-            if f.error_code & 4 != 0 {
-                serial_puts("U ");
-            } else {
-                serial_puts("S ");
-            }
-            if f.error_code & 8 != 0 {
-                serial_puts("RSVD ");
-            }
-            if f.error_code & 16 != 0 {
-                serial_puts("I/D ");
-            }
+            if f.error_code & 1 != 0 { serial_puts("P "); } else { serial_puts("NP "); }
+            if f.error_code & 2 != 0 { serial_puts("W "); } else { serial_puts("R "); }
+            if f.error_code & 4 != 0 { serial_puts("U "); } else { serial_puts("S "); }
+            if f.error_code & 8 != 0 { serial_puts("RSVD "); }
+            if f.error_code & 16 != 0 { serial_puts("I/D "); }
             serial_putc(b'\n');
         }
 
-        // GPF: decode selector error code
         if f.vector == 13 && f.error_code != 0 {
             serial_puts("  Selector: ");
             serial_hex(f.error_code & 0xFFF8);
@@ -352,70 +398,32 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
                 3 => serial_puts("IDT"),
                 _ => {}
             }
-            if f.error_code & 1 != 0 {
-                serial_puts(" (External)");
-            }
+            if f.error_code & 1 != 0 { serial_puts(" (External)"); }
             serial_putc(b'\n');
         }
 
-        // Register dump
-        serial_puts("  RIP:    ");
-        serial_hex(f.rip);
-        serial_puts("  CS:     ");
-        serial_hex(f.cs);
-        serial_putc(b'\n');
-        serial_puts("  RSP:    ");
-        serial_hex(f.rsp);
-        serial_puts("  SS:     ");
-        serial_hex(f.ss);
-        serial_putc(b'\n');
-        serial_puts("  RFLAGS: ");
-        serial_hex(f.rflags);
-        serial_putc(b'\n');
-
-        serial_puts("  RAX: ");
-        serial_hex(f.rax);
-        serial_puts("  RBX: ");
-        serial_hex(f.rbx);
-        serial_puts("  RCX: ");
-        serial_hex(f.rcx);
-        serial_putc(b'\n');
-        serial_puts("  RDX: ");
-        serial_hex(f.rdx);
-        serial_puts("  RSI: ");
-        serial_hex(f.rsi);
-        serial_puts("  RDI: ");
-        serial_hex(f.rdi);
-        serial_putc(b'\n');
-        serial_puts("  RBP: ");
-        serial_hex(f.rbp);
-        serial_puts("  R8:  ");
-        serial_hex(f.r8);
-        serial_puts("  R9:  ");
-        serial_hex(f.r9);
-        serial_putc(b'\n');
-        serial_puts("  R10: ");
-        serial_hex(f.r10);
-        serial_puts("  R11: ");
-        serial_hex(f.r11);
-        serial_puts("  R12: ");
-        serial_hex(f.r12);
-        serial_putc(b'\n');
-        serial_puts("  R13: ");
-        serial_hex(f.r13);
-        serial_puts("  R14: ");
-        serial_hex(f.r14);
-        serial_puts("  R15: ");
-        serial_hex(f.r15);
-        serial_putc(b'\n');
+        serial_puts("  RIP:    "); serial_hex(f.rip);
+        serial_puts("  CS:     "); serial_hex(f.cs); serial_putc(b'\n');
+        serial_puts("  RSP:    "); serial_hex(f.rsp);
+        serial_puts("  SS:     "); serial_hex(f.ss); serial_putc(b'\n');
+        serial_puts("  RFLAGS: "); serial_hex(f.rflags); serial_putc(b'\n');
+        serial_puts("  RAX: "); serial_hex(f.rax);
+        serial_puts("  RBX: "); serial_hex(f.rbx);
+        serial_puts("  RCX: "); serial_hex(f.rcx); serial_putc(b'\n');
+        serial_puts("  RDX: "); serial_hex(f.rdx);
+        serial_puts("  RSI: "); serial_hex(f.rsi);
+        serial_puts("  RDI: "); serial_hex(f.rdi); serial_putc(b'\n');
+        serial_puts("  RBP: "); serial_hex(f.rbp);
+        serial_puts("  R8:  "); serial_hex(f.r8);
+        serial_puts("  R9:  "); serial_hex(f.r9); serial_putc(b'\n');
+        serial_puts("  R10: "); serial_hex(f.r10);
+        serial_puts("  R11: "); serial_hex(f.r11);
+        serial_puts("  R12: "); serial_hex(f.r12); serial_putc(b'\n');
+        serial_puts("  R13: "); serial_hex(f.r13);
+        serial_puts("  R14: "); serial_hex(f.r14);
+        serial_puts("  R15: "); serial_hex(f.r15); serial_putc(b'\n');
     }
 
-    // Breakpoint: resume execution
-    if f.vector == 3 {
-        return;
-    }
-
-    // All other exceptions: halt
     loop {
         super::halt();
     }

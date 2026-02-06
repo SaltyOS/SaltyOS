@@ -33,6 +33,47 @@ impl Message {
     }
 }
 
+/// Fault types for user-mode exception delivery
+#[repr(u64)]
+#[derive(Clone, Copy)]
+pub enum FaultType {
+    NullFault = 0,
+    CapFault = 1,
+    VMFault = 2,
+    UnknownSyscall = 3,
+    UserException = 4,
+}
+
+/// Build a VMFault message
+///
+/// Layout:
+///   label = FaultType::VMFault (2)
+///   regs[0] = fault address (CR2)
+///   regs[1] = error code (PF error bits)
+///   regs[2] = faulting RIP
+///   regs[3] = is_instruction_fault (1 if I/D bit set)
+pub fn vm_fault_message(address: u64, error_code: u64, rip: u64, is_instr: bool) -> Message {
+    Message {
+        label: FaultType::VMFault as u64,
+        regs: [address, error_code, rip, is_instr as u64],
+    }
+}
+
+/// Build a UserException message
+///
+/// Layout:
+///   label = FaultType::UserException (4)
+///   regs[0] = exception vector
+///   regs[1] = error code
+///   regs[2] = faulting RIP
+///   regs[3] = faulting RSP
+pub fn user_exception_message(vector: u64, error_code: u64, rip: u64, rsp: u64) -> Message {
+    Message {
+        label: FaultType::UserException as u64,
+        regs: [vector, error_code, rip, rsp],
+    }
+}
+
 /// Initialize IPC subsystem
 pub fn init() {
     // Initialize IPC structures

@@ -300,6 +300,24 @@ impl Scheduler {
             // Update current pointer
             self.set_current(new_tcb);
 
+            // Switch to the target thread's user VSpace before restoring
+            // its CPU context. Without this, context switches between user
+            // threads can continue running on the previous thread's CR3.
+            if !(*new_tcb).vspace_root.is_null() {
+                let vspace = &*(*new_tcb).vspace_root;
+                if !vspace.switch_to() {
+                    crate::serial_puts("[SCHED] WARN: VSpace switch failed\n");
+                }
+            }
+
+            // Switch per-CPU kernel stack to new thread's kernel stack
+            // Both GS:[8] (syscall entry) and TSS RSP0 (interrupt entry from ring 3)
+            // must point to the new thread's kernel stack
+            if (*new_tcb).kernel_stack_top != 0 {
+                crate::arch::set_kernel_stack((*new_tcb).kernel_stack_top);
+                crate::arch::set_tss_rsp0((*new_tcb).kernel_stack_top);
+            }
+
             // Perform context switch
             // SAFETY: Both TCBs are valid, interrupts are disabled
             let old_ctx = &mut (*old_tcb).context as *mut _;

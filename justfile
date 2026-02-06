@@ -136,6 +136,37 @@ run-uefi-debug: image-uefi
         -d int,cpu_reset \
         -D qemu.log
 
+# Run with debug output (headless, no GUI window)
+run-debug-headless: build
+    qemu-system-x86_64 \
+        -machine q35 \
+        -cpu qemu64 \
+        -m 512M \
+        -serial stdio \
+        -display none \
+        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
+        -device ahci,id=ahci \
+        -device ide-hd,drive=disk,bus=ahci.0 \
+        -no-reboot \
+        -no-shutdown \
+        -d int,cpu_reset \
+        -D qemu.log
+
+# Run UEFI with debug output (headless, no GUI window)
+run-uefi-debug-headless: image-uefi
+    qemu-system-x86_64 \
+        -machine q35 \
+        -cpu qemu64 \
+        -m 512M \
+        -serial stdio \
+        -display none \
+        -bios /usr/share/edk2-ovmf/OVMF_CODE.fd \
+        -drive file={{builddir}}/saltyos-uefi.img,format=raw \
+        -no-reboot \
+        -no-shutdown \
+        -d int,cpu_reset \
+        -D qemu.log
+
 # =============================================================================
 # Testing
 # =============================================================================

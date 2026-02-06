@@ -97,23 +97,30 @@ impl Endpoint {
                     let sender = self.send_queue.pop().unwrap();
 
                     // Extract message from sender's blocked reason
-                    let (msg, badge) = match (*sender).blocked_reason {
-                        Some(BlockedReason::SendBlocked { msg, badge }) => (msg, badge),
-                        _ => (Message::empty(), 0),
+                    let (msg, badge, is_fault) = match (*sender).blocked_reason {
+                        Some(BlockedReason::SendBlocked { msg, badge }) => (msg, badge, false),
+                        Some(BlockedReason::FaultBlocked { msg, badge }) => (msg, badge, true),
+                        _ => (Message::empty(), 0, false),
                     };
 
                     // Set up reply capability in receiver's (current thread's) TCB
                     // The receiver can now reply to the sender
                     (*current).reply_tcb = sender;
-                    (*current).reply_can_grant = false; // TODO: check sender's grant right
+                    (*current).reply_can_grant = false;
 
                     self.transfer_message(sender, current, &msg, badge);
 
-                    // Wake sender (for regular send, not call - call sender stays blocked)
-                    (*sender).state = ThreadState::Ready;
-                    (*sender).blocked_reason = None;
-                    (*sender).blocked_endpoint = core::ptr::null_mut();
-                    get_scheduler().enqueue(sender);
+                    if is_fault {
+                        // Fault sender: keep blocked until reply (via reply_recv)
+                        // Just clear endpoint ref since it's no longer in the queue
+                        (*sender).blocked_endpoint = core::ptr::null_mut();
+                    } else {
+                        // Regular sender: wake immediately
+                        (*sender).state = ThreadState::Ready;
+                        (*sender).blocked_reason = None;
+                        (*sender).blocked_endpoint = core::ptr::null_mut();
+                        get_scheduler().enqueue(sender);
+                    }
 
                     // Update state
                     if self.send_queue.is_empty() {
@@ -202,6 +209,46 @@ impl Endpoint {
             // Copy message and badge to receiver's TCB
             (*receiver).saved_caller_msg = *msg;
             (*receiver).saved_caller_badge = badge;
+        }
+    }
+
+    /// Deliver a fault message to this endpoint
+    ///
+    /// Like send(), but the faulting thread is ALWAYS blocked (even on fastpath).
+    /// The receiver gets a reply capability to resume the faulting thread.
+    ///
+    /// Fastpath: handler waiting on recv → transfer message, set reply_tcb, wake handler
+    /// Slowpath: no handler → queue faulting thread as sender
+    pub fn deliver_fault(&mut self, faulting_tcb: *mut Tcb, msg: &Message) {
+        unsafe {
+            match self.state {
+                EndpointState::RecvBlocked => {
+                    // Fastpath: handler already waiting
+                    let receiver = self.recv_queue.pop().unwrap();
+
+                    // Set reply cap so handler can reply to resume faulting thread
+                    (*receiver).reply_tcb = faulting_tcb;
+                    (*receiver).reply_can_grant = false;
+
+                    // Transfer fault message to handler
+                    self.transfer_message(faulting_tcb, receiver, msg, 0);
+
+                    // Wake handler
+                    (*receiver).state = ThreadState::Ready;
+                    (*receiver).blocked_endpoint = core::ptr::null_mut();
+                    get_scheduler().enqueue(receiver);
+
+                    if self.recv_queue.is_empty() {
+                        self.state = EndpointState::Idle;
+                    }
+                }
+                _ => {
+                    // Slowpath: no handler waiting — queue faulting thread as sender
+                    self.send_queue.push(faulting_tcb);
+                    self.state = EndpointState::SendBlocked;
+                    (*faulting_tcb).blocked_endpoint = self as *mut Endpoint as *mut u8;
+                }
+            }
         }
     }
 

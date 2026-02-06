@@ -10,7 +10,11 @@
 //! - Offset 0: cpu_id (u32)
 //! - Offset 4: padding
 //! - Offset 8: kernel_stack (u64)
-//! - Offset 16: saved_rsp (u64)
+//! - Offset 16: saved_rsp (u64) — scratch only, NOT used for return
+//!
+//! CRITICAL: The user RSP is saved on the per-thread kernel stack, NOT in
+//! per-CPU data. This ensures it survives context switches when another
+//! thread's syscall overwrites %gs:16.
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
@@ -22,7 +26,7 @@ syscall_entry:
     # Swap GS to access per-CPU data (GS points to PerCpuData)
     swapgs
 
-    # Save user stack pointer to per-CPU data (offset 16)
+    # Save user stack pointer to per-CPU scratch area (offset 16)
     mov %rsp, %gs:16
 
     # Load kernel stack from per-CPU data (offset 8)
@@ -31,9 +35,12 @@ syscall_entry:
     # --------------------------------------------------------------------------
     # Context Preservation
     # --------------------------------------------------------------------------
-    # Push all general-purpose registers to create a PtRegs-like structure.
-    # Order matters for the final pop sequence.
-    
+    # Push user RSP first (from per-CPU scratch) — popped LAST on return.
+    # This ensures each thread's user RSP is saved per-thread on its own
+    # kernel stack, surviving context switches.
+    pushq %gs:16
+
+    # Push all general-purpose registers
     push %r15
     push %r14
     push %r13
@@ -50,13 +57,11 @@ syscall_entry:
     push %rbx
     push %rax  # Original Syscall Number
 
+    # 16 pushes (user_rsp + 15 GPRs) = 128 bytes = 16-byte aligned!
+
     # --------------------------------------------------------------------------
     # ABI Translation (User Syscall ABI -> System V ABI)
     # --------------------------------------------------------------------------
-    # We must move registers because the Syscall ABI differs from the C/Rust ABI.
-    # Specifically, User passes Arg3 in R10, but Rust expects Arg3 in RCX.
-    # Rust also expects the First Arg in RDI, but current RDI holds User Arg0.
-    
     # Mapping:
     # r9  (Rust Arg5) <--- r8  (User Arg4)
     # r8  (Rust Arg4) <--- r10 (User Arg3)
@@ -75,15 +80,9 @@ syscall_entry:
     # --------------------------------------------------------------------------
     # Handler Call
     # --------------------------------------------------------------------------
-    # Align stack to 16 bytes.
-    # Currently pushed 15 registers (15 * 8 = 120 bytes).
-    # 120 is not 16-byte aligned. Subtract 8 bytes to align.
-    sub $8, %rsp
+    # Stack is already 16-byte aligned (128 bytes pushed), no padding needed.
 
     call syscall_handle_rust
-
-    # Remove alignment padding
-    add $8, %rsp
 
     # --------------------------------------------------------------------------
     # Return Value Handling
@@ -113,8 +112,8 @@ syscall_entry:
     pop %r14
     pop %r15
 
-    # Restore user stack pointer from per-CPU data
-    mov %gs:16, %rsp
+    # Restore user RSP from kernel stack (per-thread, NOT from %gs:16!)
+    pop %rsp
 
     # Return to userspace
     # sysretq loads RIP from RCX and RFLAGS from R11

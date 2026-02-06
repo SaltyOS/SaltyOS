@@ -170,4 +170,5 @@ impl FrameAllocator {
     pub fn free_count(&self) -> usize {
         self.free
     }
+
 }

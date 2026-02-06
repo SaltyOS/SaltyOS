@@ -39,6 +39,13 @@ pub enum BlockedReason {
         /// Badge (sender identity)
         badge: u64,
     },
+    /// Blocked on fault delivery (waiting for fault handler to reply)
+    FaultBlocked {
+        /// Fault message (label = FaultType, regs = fault details)
+        msg: super::super::ipc::Message,
+        /// Badge
+        badge: u64,
+    },
 }
 
 /// Thread Control Block
@@ -86,6 +93,8 @@ pub struct Tcb {
     pub fault_handler: *mut u8,
     /// Bound notification for combined IPC wait
     pub bound_notification: *mut u8,
+    /// Kernel stack top for syscall entry (per-thread kernel stack)
+    pub kernel_stack_top: u64,
 }
 
 /// Saved thread context
@@ -187,6 +196,7 @@ impl Tcb {
             reply_can_grant: false,
             fault_handler: core::ptr::null_mut(),
             bound_notification: core::ptr::null_mut(),
+            kernel_stack_top: 0,
         }
     }
 

@@ -4,7 +4,7 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use crate::cap::{CapError, CapRights, Capability, CNode, FrameObject, ObjectType, UntypedMemory};
+use crate::cap::{CapError, CapRights, Capability, CNode, FrameObject, IoPortRange, ObjectType, UntypedMemory};
 use crate::ipc::{Endpoint, EndpointState, Message, Notification};
 use crate::mm::vspace::{PageFlags, VSpace, VSpaceError};
 use crate::sched::thread::{SchedContext, Tcb, ThreadState};
@@ -556,6 +556,10 @@ fn syscall_invoke(
             // TCB_UNBIND_NOTIFICATION
             syscall_tcb_unbind_notification(cap)
         }
+        (ObjectType::Tcb, 0x4B) => {
+            // TCB_SET_FAULT_HANDLER: arg0 = fault_ep_cap_ptr
+            syscall_tcb_set_fault_handler(cap, arg0)
+        }
 
         // VSpace operations
         (ObjectType::VSpace, 0x50) => {
@@ -609,6 +613,24 @@ fn syscall_invoke(
         (ObjectType::IrqHandler, 0x63) => {
             // IRQ_HANDLER_CLEAR
             syscall_irq_handler_clear(cap)
+        }
+
+        // IoPort operations
+        (ObjectType::IoPort, 0x70) => {
+            // IOPORT_IN8: arg0 = port offset
+            syscall_ioport_in8(cap, arg0)
+        }
+        (ObjectType::IoPort, 0x71) => {
+            // IOPORT_OUT8: arg0 = port offset, arg1 = value
+            syscall_ioport_out8(cap, arg0, arg1)
+        }
+        (ObjectType::IoPort, 0x72) => {
+            // IOPORT_IN16: arg0 = port offset
+            syscall_ioport_in16(cap, arg0)
+        }
+        (ObjectType::IoPort, 0x73) => {
+            // IOPORT_OUT16: arg0 = port offset, arg1 = value
+            syscall_ioport_out16(cap, arg0, arg1)
         }
 
         _ => SyscallResult::err(SyscallError::InvalidOperation),
@@ -782,6 +804,10 @@ fn syscall_sc_yield_to(cap: &Capability, target_sc_cap_ptr: u64) -> SyscallResul
 /// - entry_rip: Entry instruction pointer
 /// - entry_rsp: Entry stack pointer
 /// - ipc_buffer: IPC buffer virtual address
+///
+/// If the TCB has a VSpace set (via TCB_SET_SPACE), configures
+/// the thread to enter usermode via the trampoline (iretq).
+/// Otherwise treats it as a kernel thread (ring 0).
 fn syscall_tcb_configure(
     cap: &Capability,
     entry_rip: u64,
@@ -794,11 +820,40 @@ fn syscall_tcb_configure(
 
     unsafe {
         let tcb = &mut *(cap.object as *mut Tcb);
-        tcb.context.rip = entry_rip;
-        tcb.context.rsp = entry_rsp;
-        tcb.context.rflags = 0x202; // IF=1
-        tcb.context.cs = 0x23; // User code segment (selector 0x20 | RPL 3)
-        tcb.context.ss = 0x1B; // User data segment (selector 0x18 | RPL 3)
+
+        // Allocate per-thread kernel stack for syscall entry
+        let kstack_phys = crate::mm::alloc_frame()
+            .expect("tcb_configure: kernel stack alloc");
+        let kstack_virt = crate::mm::phys_to_virt(kstack_phys);
+        let kstack_top = kstack_virt + crate::mm::PAGE_SIZE as u64;
+        core::ptr::write_bytes(kstack_virt as *mut u8, 0, crate::mm::PAGE_SIZE);
+        tcb.kernel_stack_top = kstack_top;
+
+        if !tcb.vspace_root.is_null() {
+            // VSpace is set: use usermode trampoline for ring 3 entry
+            let vspace = &*tcb.vspace_root;
+            let tramp_stack_phys = crate::mm::alloc_frame()
+                .expect("tcb_configure: trampoline stack alloc");
+            let tramp_stack_virt = crate::mm::phys_to_virt(tramp_stack_phys);
+            let tramp_stack_top = tramp_stack_virt + crate::mm::PAGE_SIZE as u64;
+            core::ptr::write_bytes(tramp_stack_virt as *mut u8, 0, crate::mm::PAGE_SIZE);
+
+            tcb.context.rip = crate::arch::usermode_trampoline as *const () as u64;
+            tcb.context.rsp = tramp_stack_top;
+            tcb.context.r12 = entry_rip;      // User RIP
+            tcb.context.r13 = entry_rsp;      // User RSP
+            tcb.context.r14 = vspace.root();  // User CR3
+            tcb.context.r15 = 0x3202;         // User RFLAGS: IF=1, IOPL=3
+            tcb.context.rflags = 0x202;       // Kernel RFLAGS for context_switch
+        } else {
+            // No VSpace: kernel thread (ring 0)
+            tcb.context.rip = entry_rip;
+            tcb.context.rsp = entry_rsp;
+            tcb.context.rflags = 0x202;
+            tcb.context.cs = 0x23;
+            tcb.context.ss = 0x1B;
+        }
+
         tcb.ipc_buffer = ipc_buffer;
     }
 
@@ -1109,6 +1164,39 @@ fn syscall_tcb_unbind_notification(cap: &Capability) -> SyscallResult {
     SyscallResult::ok(0)
 }
 
+/// TCB_SET_FAULT_HANDLER: Set the fault handler endpoint for a thread
+///
+/// When a user-mode exception occurs in this thread, the kernel delivers
+/// a fault message to the specified endpoint. A fault handler thread
+/// waiting on the endpoint receives the message and can reply to resume
+/// the faulting thread.
+///
+/// Args:
+/// - fault_ep_cap_ptr: Capability pointer to an Endpoint (SEND right required)
+fn syscall_tcb_set_fault_handler(
+    cap: &Capability,
+    fault_ep_cap_ptr: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::CONFIGURE) {
+        return SyscallResult::err(e);
+    }
+
+    let ep_cap = match lookup_capability(fault_ep_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(ep_cap, ObjectType::Endpoint, CapRights::SEND) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let tcb = &mut *(cap.object as *mut Tcb);
+        tcb.fault_handler = ep_cap.object as *mut u8;
+    }
+
+    SyscallResult::ok(0)
+}
+
 /// SC_CONSUMED: Query consumed time from scheduling context
 fn syscall_sc_consumed(cap: &Capability) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::SchedContext, CapRights::READ) {
@@ -1333,6 +1421,92 @@ fn syscall_irq_handler_clear(cap: &Capability) -> SyscallResult {
     SyscallResult::ok(0)
 }
 
+/// IOPORT_IN8: Read a byte from an I/O port
+///
+/// Args:
+/// - offset: Port offset within the IoPort range
+fn syscall_ioport_in8(cap: &Capability, offset: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let ioport = &*(cap.object as *const IoPortRange);
+        if offset as u16 >= ioport.num_ports {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+        let port = ioport.base_port + offset as u16;
+        let val: u8;
+        core::arch::asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack));
+        SyscallResult::ok(val as u64)
+    }
+}
+
+/// IOPORT_OUT8: Write a byte to an I/O port
+///
+/// Args:
+/// - offset: Port offset within the IoPort range
+/// - value: Byte value to write
+fn syscall_ioport_out8(cap: &Capability, offset: u64, value: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let ioport = &*(cap.object as *const IoPortRange);
+        if offset as u16 >= ioport.num_ports {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+        let port = ioport.base_port + offset as u16;
+        core::arch::asm!("out dx, al", in("al") value as u8, in("dx") port, options(nomem, nostack));
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// IOPORT_IN16: Read a 16-bit word from an I/O port
+///
+/// Args:
+/// - offset: Port offset within the IoPort range
+fn syscall_ioport_in16(cap: &Capability, offset: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let ioport = &*(cap.object as *const IoPortRange);
+        if offset as u16 + 1 >= ioport.num_ports {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+        let port = ioport.base_port + offset as u16;
+        let val: u16;
+        core::arch::asm!("in ax, dx", out("ax") val, in("dx") port, options(nomem, nostack));
+        SyscallResult::ok(val as u64)
+    }
+}
+
+/// IOPORT_OUT16: Write a 16-bit word to an I/O port
+///
+/// Args:
+/// - offset: Port offset within the IoPort range
+/// - value: 16-bit value to write
+fn syscall_ioport_out16(cap: &Capability, offset: u64, value: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let ioport = &*(cap.object as *const IoPortRange);
+        if offset as u16 + 1 >= ioport.num_ports {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+        let port = ioport.base_port + offset as u16;
+        core::arch::asm!("out dx, ax", in("ax") value as u16, in("dx") port, options(nomem, nostack));
+    }
+
+    SyscallResult::ok(0)
+}
+
 /// VSPACE_MAP_PT: Install a page table at a specific level
 ///
 /// Args:
@@ -1430,7 +1604,6 @@ pub fn handle(
         Syscall::Wait => syscall_wait(cap_ptr),
         Syscall::Poll => syscall_poll(cap_ptr),
         Syscall::Yield => {
-            crate::serial_puts("[INIT] yield\n");
             crate::sched::yield_now();
             SyscallResult::ok(0)
         }

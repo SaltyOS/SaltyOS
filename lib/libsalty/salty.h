@@ -54,6 +54,7 @@
 #define TCB_SET_IPC_BUFFER     0x48
 #define TCB_BIND_NOTIFICATION  0x49
 #define TCB_UNBIND_NOTIFICATION 0x4A
+#define TCB_SET_FAULT_HANDLER  0x4B
 
 /* VSpace operations (0x50-0x52) */
 #define VSPACE_MAP          0x50
@@ -65,6 +66,28 @@
 #define IRQ_HANDLER_ACK           0x61
 #define IRQ_HANDLER_SET_NOTIFICATION 0x62
 #define IRQ_HANDLER_CLEAR         0x63
+
+/* IoPort operations (0x70-0x73) */
+#define IOPORT_IN8                0x70
+#define IOPORT_OUT8               0x71
+#define IOPORT_IN16               0x72
+#define IOPORT_OUT16              0x73
+
+/* Console IPC message labels */
+#define CONSOLE_WRITE             1
+#define CONSOLE_READ              2
+
+/* Well-known cap slots for init/procmgr */
+#define CAP_COM1_IOPORT           8
+#define CAP_COM1_IRQ              9
+#define CAP_COM1_NTFN             10
+#define CAP_CONSOLE_EP            11
+
+/* Initrd mapping address (16 MB) */
+#define INITRD_VADDR              0x0000000001000000ULL
+
+/* Scratch address for temporary frame mappings (32 MB) */
+#define SCRATCH_VADDR             0x0000000002000000ULL
 
 /* Error codes (positive, returned in RAX) */
 #define SALTY_OK                  0
@@ -182,6 +205,20 @@ static inline int salty_call(cap_t ep, const struct salty_msg *msg, struct salty
     return (int)r.error;
 }
 
+/* Reply to caller and receive next message (server loop pattern) */
+static inline int salty_reply_recv(cap_t ep, const struct salty_msg *reply,
+                                    struct salty_msg *out_msg, uint64_t *badge) {
+    struct salty_result r = salty_syscall(
+        SYS_REPLY_RECV, ep,
+        reply->label, reply->regs[0], reply->regs[1], reply->regs[2]
+    );
+    if (r.error == 0 && badge) {
+        *badge = r.value;
+    }
+    (void)out_msg;
+    return (int)r.error;
+}
+
 /* Notification operations */
 static inline int salty_signal(cap_t ntfn, uint64_t bits) {
     struct salty_result r = salty_syscall(SYS_SIGNAL, ntfn, bits, 0, 0, 0);
@@ -207,6 +244,159 @@ static inline struct salty_result salty_invoke(
     uint64_t arg2
 ) {
     return salty_syscall(SYS_INVOKE, cap, label, arg0, arg1, arg2);
+}
+
+/* ---- Convenience wrappers ---- */
+
+/* Retype untyped memory into a new object at dest_slot in caller's CSpace */
+static inline int salty_untyped_retype(cap_t untyped, uint64_t new_type,
+                                       uint64_t size_bits, uint64_t dest_slot) {
+    struct salty_result r = salty_invoke(untyped, UNTYPED_RETYPE,
+                                        new_type, size_bits, dest_slot);
+    return (int)r.error;
+}
+
+/* Configure a TCB's entry point, stack, and IPC buffer */
+static inline int salty_tcb_configure(cap_t tcb, uint64_t rip,
+                                      uint64_t rsp, uint64_t ipc_buf) {
+    struct salty_result r = salty_invoke(tcb, TCB_CONFIGURE, rip, rsp, ipc_buf);
+    return (int)r.error;
+}
+
+/* Resume (make runnable) a TCB */
+static inline int salty_tcb_resume(cap_t tcb) {
+    struct salty_result r = salty_invoke(tcb, TCB_RESUME, 0, 0, 0);
+    return (int)r.error;
+}
+
+/* Set a TCB's CSpace and VSpace */
+static inline int salty_tcb_set_space(cap_t tcb, cap_t cspace, cap_t vspace) {
+    struct salty_result r = salty_invoke(tcb, TCB_SET_SPACE, cspace, vspace, 0);
+    return (int)r.error;
+}
+
+/* Set a TCB's fault handler endpoint */
+static inline int salty_tcb_set_fault_handler(cap_t tcb, cap_t fault_ep) {
+    struct salty_result r = salty_invoke(tcb, TCB_SET_FAULT_HANDLER, fault_ep, 0, 0);
+    return (int)r.error;
+}
+
+/* Configure scheduling context parameters */
+static inline int salty_sc_configure(cap_t sc, uint64_t budget_us,
+                                     uint64_t period_us) {
+    struct salty_result r = salty_invoke(sc, SC_CONFIGURE, budget_us, period_us, 0);
+    return (int)r.error;
+}
+
+/* Bind scheduling context to a TCB */
+static inline int salty_sc_bind(cap_t sc, cap_t tcb) {
+    struct salty_result r = salty_invoke(sc, SC_BIND, tcb, 0, 0);
+    return (int)r.error;
+}
+
+/* Map a frame into a VSpace */
+static inline int salty_vspace_map(cap_t vspace, cap_t frame,
+                                   uint64_t vaddr, uint64_t flags) {
+    struct salty_result r = salty_invoke(vspace, VSPACE_MAP, frame, vaddr, flags);
+    return (int)r.error;
+}
+
+/* Unmap a page from a VSpace */
+static inline int salty_vspace_unmap(cap_t vspace, uint64_t vaddr) {
+    struct salty_result r = salty_invoke(vspace, VSPACE_UNMAP, vaddr, 0, 0);
+    return (int)r.error;
+}
+
+/* IoPort operations */
+static inline uint8_t salty_ioport_in8(cap_t ioport, uint64_t offset) {
+    struct salty_result r = salty_invoke(ioport, IOPORT_IN8, offset, 0, 0);
+    return (uint8_t)r.value;
+}
+
+static inline void salty_ioport_out8(cap_t ioport, uint64_t offset,
+                                     uint8_t value) {
+    salty_invoke(ioport, IOPORT_OUT8, offset, (uint64_t)value, 0);
+}
+
+static inline uint16_t salty_ioport_in16(cap_t ioport, uint64_t offset) {
+    struct salty_result r = salty_invoke(ioport, IOPORT_IN16, offset, 0, 0);
+    return (uint16_t)r.value;
+}
+
+static inline void salty_ioport_out16(cap_t ioport, uint64_t offset,
+                                      uint16_t value) {
+    salty_invoke(ioport, IOPORT_OUT16, offset, (uint64_t)value, 0);
+}
+
+/* IRQ handler operations */
+static inline int salty_irq_handler_ack(cap_t irq_handler) {
+    struct salty_result r = salty_invoke(irq_handler, IRQ_HANDLER_ACK, 0, 0, 0);
+    return (int)r.error;
+}
+
+static inline int salty_irq_handler_set_notification(cap_t irq_handler,
+                                                      cap_t ntfn) {
+    struct salty_result r = salty_invoke(irq_handler,
+                                         IRQ_HANDLER_SET_NOTIFICATION,
+                                         ntfn, 0, 0);
+    return (int)r.error;
+}
+
+/* Install a page table at a specific level in a VSpace */
+static inline int salty_vspace_map_pt(cap_t vspace, cap_t frame,
+                                       uint64_t vaddr, uint64_t level) {
+    struct salty_result r = salty_invoke(vspace, VSPACE_MAP_PT,
+                                         frame, vaddr, level);
+    return (int)r.error;
+}
+
+/* Copy a capability from src CNode slot to dest CNode slot */
+static inline int salty_cnode_copy(cap_t src_cnode, uint64_t src_slot,
+                                   cap_t dest_cnode, uint64_t dest_slot,
+                                   uint64_t rights) {
+    /* CNode_Copy: invoked on src_cnode
+     * arg0 = src_slot, arg1 = dest_cnode_cap, arg2 = dest_slot
+     * arg3 = rights (not supported with 5-arg invoke, use max rights)
+     */
+    struct salty_result r = salty_invoke(src_cnode, CNODE_COPY,
+                                        src_slot, dest_cnode, dest_slot);
+    (void)rights;
+    return (int)r.error;
+}
+
+/* Serial output via direct port I/O (for early debugging before console) */
+static inline void salty_serial_putc(char c) {
+    /* Wait for THR empty (LSR bit 5) then write to THR */
+    uint8_t status;
+    do {
+        __asm__ volatile("inb %1, %0" : "=a"(status) : "Nd"((uint16_t)0x3FD));
+    } while ((status & 0x20) == 0);
+    __asm__ volatile("outb %0, %1" :: "a"((uint8_t)c), "Nd"((uint16_t)0x3F8));
+}
+
+static inline void salty_serial_puts(const char *s) {
+    while (*s) {
+        salty_serial_putc(*s++);
+    }
+}
+
+static inline void salty_serial_hex(uint64_t val) {
+    static const char hex[] = "0123456789abcdef";
+    salty_serial_putc('0');
+    salty_serial_putc('x');
+    if (val == 0) {
+        salty_serial_putc('0');
+        return;
+    }
+    char buf[16];
+    int pos = 15;
+    while (val > 0 && pos >= 0) {
+        buf[pos--] = hex[val & 0xF];
+        val >>= 4;
+    }
+    for (int i = pos + 1; i < 16; i++) {
+        salty_serial_putc(buf[i]);
+    }
 }
 
 #endif /* LIBSALTY_H */

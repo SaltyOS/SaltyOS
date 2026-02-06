@@ -12,7 +12,8 @@ pub mod paging;
 mod pit;
 
 pub use apic::{get_ticks, send_ipi, IpiKind};
-pub use cpu::{current_cpu, MAX_CPUS};
+pub use cpu::{current_cpu, set_kernel_stack, MAX_CPUS};
+pub use gdt::set_tss_rsp0;
 
 // Re-export architecture-specific implementations for generic arch interface
 pub use context::{context_switch, usermode_trampoline};

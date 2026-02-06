@@ -497,11 +497,13 @@ pub fn timer_handler() {
     // Increment tick counter
     TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
 
-    // Notify scheduler
-    crate::sched::timer_tick();
-
-    // Send EOI
+    // Send EOI BEFORE timer_tick: if budget exhaustion triggers a context switch,
+    // timer_tick() never returns (context_switch jumps to another thread).
+    // Without early EOI, the APIC blocks all further timer interrupts.
     eoi();
+
+    // Notify scheduler (may context-switch and never return)
+    crate::sched::timer_tick();
 }
 
 /// Send Inter-Processor Interrupt (IPI)

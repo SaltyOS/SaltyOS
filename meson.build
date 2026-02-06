@@ -163,11 +163,12 @@ initrd_target = []
 
 if build_userland and mkcpio.found()
   initrd = custom_target('initrd',
-    input: [init_elf],
+    input: [init_elf, console_elf],
     output: 'initrd.cpio',
     command: [mkcpio,
       '--output', '@OUTPUT@',
       'init.elf=@INPUT0@',
+      'console.elf=@INPUT1@',
     ],
     build_by_default: true,
   )

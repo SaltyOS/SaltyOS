@@ -51,6 +51,10 @@ just gdb
 
 # Run with debug logging (creates qemu.log)
 just run-debug
+
+# Run headless with debug logging (no GUI, for SSH/CI)
+just run-debug-headless
+just run-uefi-debug-headless
 ```
 
 ### Configuration
@@ -213,8 +217,10 @@ docs/                   # Comprehensive documentation
 
 The project does not yet have formal test infrastructure. Testing is done via QEMU:
 ```bash
-just run          # Run and observe serial output
-just run-gdb      # Debug with GDB
+just run                    # Run and observe serial output
+just run-gdb                # Debug with GDB
+just run-debug-headless     # Headless debug (no GUI, serial only)
+just run-uefi-debug-headless  # UEFI headless debug
 ```
 
 ## Documentation

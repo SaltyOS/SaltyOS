@@ -6,9 +6,10 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use super::slot::{get_cap, get_meta, CapSlot, INVALID_SLOT};
+use super::slot::{free_slot, get_cap, get_meta, CapSlot, INVALID_SLOT, MAX_SLOTS};
 use super::{CapError, ObjectType, CDT};
 use crate::mm::{self, PhysAddr, PAGE_SIZE};
+use core::mem::MaybeUninit;
 
 /// Untyped memory region
 ///
@@ -82,6 +83,17 @@ impl FrameObject {
         1usize << self.size_bits
     }
 }
+
+// Frame metadata is stored out-of-line from frame payload memory.
+// This prevents user mappings/writes to frame pages from corrupting
+// kernel metadata (e.g., phys_addr used by VSpace_Map).
+static mut FRAME_METADATA: [MaybeUninit<FrameObject>; MAX_SLOTS] =
+    [const { MaybeUninit::uninit() }; MAX_SLOTS];
+
+// VSpace metadata is also stored out-of-line. The untyped-allocated page is
+// used exclusively as the PML4 root page table.
+static mut VSPACE_METADATA: [MaybeUninit<crate::mm::VSpace>; MAX_SLOTS] =
+    [const { MaybeUninit::uninit() }; MAX_SLOTS];
 
 /// Untyped child tracker
 ///
@@ -191,13 +203,19 @@ fn object_size(obj_type: ObjectType, size_bits: u8) -> usize {
     match obj_type {
         ObjectType::Endpoint => core::mem::size_of::<crate::ipc::Endpoint>(),
         ObjectType::Notification => core::mem::size_of::<crate::ipc::Notification>(),
-        ObjectType::CNode => 1usize << size_bits, // CNode size is variable
+        // CNode implementation is fixed-size (CNODE_SIZE slots, 4KiB aligned).
+        // Ignore requested size_bits to avoid undersized allocations.
+        ObjectType::CNode => core::mem::size_of::<crate::cap::CNode>(),
         ObjectType::Tcb => core::mem::size_of::<crate::sched::thread::Tcb>(),
-        ObjectType::VSpace => PAGE_SIZE, // Page table
-        ObjectType::Frame => 1usize << size_bits,
+        ObjectType::VSpace => PAGE_SIZE, // Page table (always 4KB-aligned PML4)
+        ObjectType::Frame => {
+            // Minimum 4KB page; size_bits=0 defaults to PAGE_SIZE
+            let bits = if size_bits < 12 { 12 } else { size_bits };
+            1usize << bits
+        }
         ObjectType::Untyped => 1usize << size_bits,
         ObjectType::IrqHandler => core::mem::size_of::<crate::ipc::IrqHandler>(),
-        ObjectType::IoPort => core::mem::size_of::<()>(),     // Placeholder
+        ObjectType::IoPort => core::mem::size_of::<crate::cap::IoPortRange>(),
         ObjectType::SchedContext => core::mem::size_of::<crate::sched::thread::SchedContext>(),
         ObjectType::Null => 0,
     }
@@ -228,16 +246,12 @@ unsafe fn init_object(
             }
 
             ObjectType::CNode => {
-                let obj = virt_addr as *mut KernelObject;
-                obj.write(KernelObject::new(obj_type, size_bits));
-                Ok(obj)
+                let cnode = virt_addr as *mut crate::cap::CNode;
+                cnode.write(crate::cap::CNode::new());
+                Ok(cnode as *mut KernelObject)
             }
 
-            ObjectType::Frame => {
-                let frame = virt_addr as *mut FrameObject;
-                frame.write(FrameObject::new(phys_addr, size_bits));
-                Ok(frame as *mut KernelObject)
-            }
+            ObjectType::Frame => Err(CapError::InvalidOperation),
 
             ObjectType::Untyped => {
                 let untyped = virt_addr as *mut UntypedMemory;
@@ -252,9 +266,7 @@ unsafe fn init_object(
             }
 
             ObjectType::VSpace => {
-                let vs = virt_addr as *mut crate::mm::VSpace;
-                vs.write(crate::mm::VSpace::new(phys_addr));
-                Ok(vs as *mut KernelObject)
+                Err(CapError::InvalidOperation)
             }
 
             ObjectType::SchedContext => {
@@ -269,9 +281,54 @@ unsafe fn init_object(
                 Ok(irq as *mut KernelObject)
             }
 
+            ObjectType::IoPort => {
+                let ioport = virt_addr as *mut crate::cap::IoPortRange;
+                ioport.write(crate::cap::IoPortRange::new(0, 0));
+                Ok(ioport as *mut KernelObject)
+            }
+
             _ => Err(CapError::InvalidOperation),
         }
     }
+}
+
+/// Initialize frame metadata in slot-indexed static storage.
+unsafe fn init_frame_metadata(
+    cap_slot: CapSlot,
+    phys_addr: PhysAddr,
+    size_bits: u8,
+) -> *mut crate::cap::object::KernelObject {
+    let actual_bits = if size_bits < 12 { 12 } else { size_bits };
+    let frame_ptr = unsafe { FRAME_METADATA[cap_slot as usize].as_mut_ptr() };
+    unsafe {
+        frame_ptr.write(FrameObject::new(phys_addr, actual_bits));
+    }
+    frame_ptr as *mut crate::cap::object::KernelObject
+}
+
+/// Initialize VSpace metadata in slot-indexed static storage and initialize
+/// the provided physical page as a PML4 root.
+unsafe fn init_vspace_metadata(
+    cap_slot: CapSlot,
+    pml4_phys: PhysAddr,
+) -> *mut crate::cap::object::KernelObject {
+    let pml4_virt = mm::phys_to_virt(pml4_phys) as *mut u64;
+    unsafe {
+        core::ptr::write_bytes(pml4_virt, 0, PAGE_SIZE / 8);
+
+        // Copy kernel higher-half entries so kernel remains mapped.
+        let kernel_cr3 = crate::arch::x86_64::paging::read_cr3();
+        let kernel_pml4 = mm::phys_to_virt(kernel_cr3) as *const u64;
+        for i in 256..512 {
+            pml4_virt.add(i).write(kernel_pml4.add(i).read());
+        }
+    }
+
+    let vspace_ptr = unsafe { VSPACE_METADATA[cap_slot as usize].as_mut_ptr() };
+    unsafe {
+        vspace_ptr.write(crate::mm::VSpace::new(pml4_phys));
+    }
+    vspace_ptr as *mut crate::cap::object::KernelObject
 }
 
 impl UntypedMemory {
@@ -303,16 +360,39 @@ impl UntypedMemory {
             }
         }
 
+        // Align watermark to object size (critical for Frame/VSpace page alignment)
+        if obj_size > 0 {
+            let aligned = (self.watermark as usize + obj_size - 1) & !(obj_size - 1);
+            self.watermark = aligned as u32;
+
+            // Re-check after alignment
+            if self.available() < total_size {
+                return Err(CapError::InsufficientMemory);
+            }
+        }
+
         // Allocate objects
         for i in 0..num_objects {
             let obj_offset = self.watermark as usize + (i * obj_size);
             let obj_addr = self.phys_addr + obj_offset as u64;
 
-            // Initialize object
-            let object = unsafe { init_object(new_type, obj_addr, size_bits)? };
-
             // Allocate capability slot
             let cap_slot = crate::cap::slot::alloc_slot().ok_or(CapError::OutOfSlots)?;
+
+            // Initialize object
+            let object = unsafe {
+                match new_type {
+                    ObjectType::Frame => init_frame_metadata(cap_slot, obj_addr, size_bits),
+                    ObjectType::VSpace => init_vspace_metadata(cap_slot, obj_addr),
+                    _ => match init_object(new_type, obj_addr, size_bits) {
+                        Ok(obj) => obj,
+                        Err(e) => {
+                            free_slot(cap_slot);
+                            return Err(e);
+                        }
+                    },
+                }
+            };
 
             // Initialize capability
             let cap = crate::cap::slot::get_cap_mut(cap_slot);

@@ -6,19 +6,21 @@
 
 mod cdt;
 mod cnode;
+pub mod ioport;
 mod object;
 mod refcount;
 mod slot;
 mod untyped;
 
 pub use cdt::CDT;
-pub use cnode::{CNode, CapError};
+pub use cnode::{CNode, CapError, CapRef};
 pub use object::{KernelObject, ObjectType};
 pub use refcount::{increment_refcount, release_object};
 pub use slot::{
     alloc_slot, free_slot, get_cap, get_cap_mut, get_meta, get_meta_mut, nullify_capability,
     CapSlot, INVALID_SLOT,
 };
+pub use ioport::IoPortRange;
 pub use untyped::{FrameObject, UntypedMemory};
 
 /// Capability rights bitmap

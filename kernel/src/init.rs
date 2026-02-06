@@ -6,10 +6,17 @@
 //! using the kernel ELF loader. Otherwise falls back to a hardcoded bytecode
 //! yield loop.
 //!
+//! Sets up the init task's CSpace with well-known capability slots for
+//! TCB, VSpace, CSpace, and Untyped memory regions.
+//!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use crate::mm::{alloc_frame, phys_to_virt, VSpace, PAGE_SIZE};
+use crate::cap::{
+    alloc_slot, get_cap_mut, CNode, CapRef, CapRights, IoPortRange, ObjectType, UntypedMemory,
+};
+use crate::ipc::{IrqHandler, Notification};
 use crate::mm::vspace::PageFlags;
+use crate::mm::{alloc_contiguous_frames, alloc_frame, phys_to_virt, VSpace, PAGE_SIZE};
 use crate::sched::thread::{SchedContext, Tcb};
 use crate::ParsedBootInfo;
 use core::mem::MaybeUninit;
@@ -20,6 +27,26 @@ const INIT_CODE_VADDR: u64 = 0x0000_0040_0000;
 const INIT_STACK_VADDR: u64 = 0x0000_0080_0000;
 /// Top of user stack (stack grows down)
 const INIT_STACK_TOP: u64 = INIT_STACK_VADDR + PAGE_SIZE as u64;
+
+/// Well-known CSpace slot indices (must match userland/init/main.c)
+const CAP_SELF_TCB: usize = 0;
+const CAP_SELF_VSPACE: usize = 1;
+const CAP_SELF_CSPACE: usize = 2;
+/// COM1 serial port capabilities
+const CAP_COM1_IOPORT: usize = 8;
+const CAP_COM1_IRQ: usize = 9;
+const CAP_COM1_NOTIFICATION: usize = 10;
+/// Initrd info slots (vaddr and size passed as badge values)
+const CAP_INITRD_VSPACE: usize = 11;
+const CAP_UNTYPED_START: usize = 16;
+
+/// Initrd mapping virtual address (16 MB)
+const INITRD_VADDR: u64 = 0x0000_0100_0000;
+/// Boot info page virtual address (12 MB) -- read-only page with initrd info
+const BOOTINFO_VADDR: u64 = 0x0000_00C0_0000;
+
+/// Maximum number of untyped regions to hand to init
+const MAX_INIT_UNTYPEDS: usize = 64;
 
 /// Minimal user program: yield loop (fallback when no initrd)
 ///
@@ -40,6 +67,16 @@ static INIT_USER_CODE: [u8; 12] = [
 static mut INIT_TCB: Tcb = Tcb::new();
 static mut INIT_SCHED_CTX: SchedContext = SchedContext::new();
 static mut INIT_VSPACE: MaybeUninit<VSpace> = MaybeUninit::uninit();
+static mut INIT_CNODE: CNode = CNode::new();
+static mut INIT_UNTYPEDS: [UntypedMemory; MAX_INIT_UNTYPEDS] = {
+    const EMPTY: UntypedMemory = UntypedMemory::new(0, 0, false);
+    [EMPTY; MAX_INIT_UNTYPEDS]
+};
+
+/// COM1 serial port objects (static, never freed)
+static mut INIT_COM1_IOPORT: IoPortRange = IoPortRange::new(0x3F8, 8);
+static mut INIT_COM1_IRQ: IrqHandler = IrqHandler::new(4);
+static mut INIT_COM1_NOTIFICATION: Notification = Notification::new();
 
 /// Bootstrap the first user-mode init task
 pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
@@ -80,12 +117,28 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
         load_hardcoded_fallback(&mut vspace)
     };
 
-    // Allocate a kernel stack for the trampoline
+    // Map initrd into user VSpace (for procmgr to parse CPIO)
+    if let Some(info) = boot_info {
+        if info.initrd_addr != 0 && info.initrd_size != 0 {
+            map_initrd(info, &mut vspace);
+            map_bootinfo(&mut vspace);
+        }
+    }
+
+    // Allocate a kernel stack for the trampoline (used by context_switch → iretq)
     let tramp_stack_phys = alloc_frame().expect("init: trampoline stack alloc failed");
     let tramp_stack_virt = phys_to_virt(tramp_stack_phys);
     let tramp_stack_top = tramp_stack_virt + PAGE_SIZE as u64;
     unsafe {
         core::ptr::write_bytes(tramp_stack_virt as *mut u8, 0, PAGE_SIZE);
+    }
+
+    // Allocate per-thread kernel stack for syscall entry
+    let kstack_phys = alloc_frame().expect("init: kernel stack alloc failed");
+    let kstack_virt = phys_to_virt(kstack_phys);
+    let kstack_top = kstack_virt + PAGE_SIZE as u64;
+    unsafe {
+        core::ptr::write_bytes(kstack_virt as *mut u8, 0, PAGE_SIZE);
     }
 
     let vspace_root = vspace.root();
@@ -97,6 +150,9 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
         let vspace_ptr = (&raw mut INIT_VSPACE).cast::<MaybeUninit<VSpace>>();
         (*vspace_ptr).write(vspace);
     }
+
+    // Set up CSpace for init task
+    setup_init_cspace(boot_info);
 
     // Configure init TCB
     unsafe {
@@ -110,7 +166,8 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
         (*tcb).context.r12 = user_rip;            // User RIP
         (*tcb).context.r13 = user_stack_top;       // User RSP
         (*tcb).context.r14 = vspace_root;          // User CR3
-        (*tcb).context.rflags = 0x202;             // IF=1
+        (*tcb).context.r15 = 0x3202;               // User RFLAGS: IF=1, IOPL=3
+        (*tcb).context.rflags = 0x202;             // Kernel RFLAGS for context_switch
 
         // SchedContext: 10ms budget, 100ms period
         (*sc).budget = 10;
@@ -123,6 +180,12 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
         (*tcb).cpu_affinity = 0;
         (*tcb).sched_context = sc;
         (*tcb).vspace_root = (&raw mut INIT_VSPACE).cast::<VSpace>();
+        (*tcb).cspace_root = &raw mut INIT_CNODE;
+        (*tcb).kernel_stack_top = kstack_top;
+
+        // Set per-CPU kernel stack to init's stack before first scheduling
+        crate::arch::set_kernel_stack(kstack_top);
+        crate::arch::set_tss_rsp0(kstack_top);
 
         // Enqueue the init task
         crate::sched::scheduler::scheduler().enqueue(tcb);
@@ -131,6 +194,156 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
     crate::serial_puts("[INIT] Init task enqueued, entering user mode at ");
     crate::serial_hex(user_rip);
     crate::serial_puts("\n");
+}
+
+/// Set up init task's CSpace with well-known capabilities
+fn setup_init_cspace(boot_info: Option<&ParsedBootInfo>) {
+    crate::serial_puts("[INIT] Setting up CSpace\n");
+
+    unsafe {
+        let cnode = &mut *(&raw mut INIT_CNODE);
+
+        // Slot 0: CAP_SELF_TCB - capability to init's own TCB
+        insert_static_cap(
+            cnode,
+            CAP_SELF_TCB,
+            &raw mut INIT_TCB as *mut crate::cap::KernelObject,
+            ObjectType::Tcb,
+        );
+
+        // Slot 1: CAP_SELF_VSPACE - capability to init's VSpace
+        insert_static_cap(
+            cnode,
+            CAP_SELF_VSPACE,
+            (&raw mut INIT_VSPACE).cast::<crate::cap::KernelObject>(),
+            ObjectType::VSpace,
+        );
+
+        // Slot 2: CAP_SELF_CSPACE - capability to init's own CNode
+        insert_static_cap(
+            cnode,
+            CAP_SELF_CSPACE,
+            &raw mut INIT_CNODE as *mut crate::cap::KernelObject,
+            ObjectType::CNode,
+        );
+
+        // Slot 8: COM1 IoPort capability (ports 0x3F8..0x3FF)
+        insert_static_cap(
+            cnode,
+            CAP_COM1_IOPORT,
+            &raw mut INIT_COM1_IOPORT as *mut crate::cap::KernelObject,
+            ObjectType::IoPort,
+        );
+
+        // Slot 9: COM1 IRQ handler capability (IRQ 4)
+        {
+            let irq_ptr = &raw mut INIT_COM1_IRQ;
+            insert_static_cap(
+                cnode,
+                CAP_COM1_IRQ,
+                irq_ptr as *mut crate::cap::KernelObject,
+                ObjectType::IrqHandler,
+            );
+            // Register in global IRQ table so hardware IRQ4 dispatches to it
+            crate::ipc::irq::register_handler(4, irq_ptr);
+        }
+
+        // Slot 10: COM1 notification (for IRQ delivery)
+        insert_static_cap(
+            cnode,
+            CAP_COM1_NOTIFICATION,
+            &raw mut INIT_COM1_NOTIFICATION as *mut crate::cap::KernelObject,
+            ObjectType::Notification,
+        );
+
+        // Slots 16+: Untyped memory capabilities from usable memory regions
+        if let Some(info) = boot_info {
+            create_untyped_caps(cnode, info);
+        }
+    }
+
+    crate::serial_puts("[INIT] CSpace setup complete\n");
+}
+
+/// Insert a capability for a statically-allocated kernel object into a CNode
+unsafe fn insert_static_cap(
+    cnode: &mut CNode,
+    cnode_index: usize,
+    object: *mut crate::cap::KernelObject,
+    obj_type: ObjectType,
+) {
+    let slot = alloc_slot().expect("init: cap slot alloc failed");
+    let cap = get_cap_mut(slot);
+    cap.object = object;
+    cap.obj_type = obj_type;
+    cap.rights = CapRights::ALL;
+    cap.depth = 0;
+    cap.badge = 0;
+    cnode
+        .insert_ref(cnode_index, CapRef { slot })
+        .expect("init: CNode insert failed");
+}
+
+/// Create untyped memory capabilities from boot info memory map
+unsafe fn create_untyped_caps(cnode: &mut CNode, _info: &ParsedBootInfo) {
+    // Allocate backing memory from the frame allocator so untyped regions
+    // do not overlap frames already in use by the kernel.
+    const MAX_SIZE_BITS: u8 = 28; // 256 MiB
+    const MIN_SIZE_BITS: u8 = 12; // 4 KiB
+
+    let mut ut_index = 0;
+
+    for size_bits in (MIN_SIZE_BITS..=MAX_SIZE_BITS).rev() {
+        if ut_index >= MAX_INIT_UNTYPEDS {
+            break;
+        }
+
+        let size_bytes = 1usize << size_bits;
+        let frame_count = size_bytes / PAGE_SIZE;
+
+        let Some(base) = alloc_contiguous_frames(frame_count) else {
+            continue;
+        };
+
+        // Initialize the UntypedMemory object in static storage
+        let ut = &raw mut INIT_UNTYPEDS[ut_index];
+        (*ut) = UntypedMemory::new(base, size_bits, false);
+
+        // Allocate a global cap slot and populate it
+        let slot = alloc_slot().expect("init: untyped cap slot alloc failed");
+        let cap = get_cap_mut(slot);
+        cap.object = ut as *mut crate::cap::KernelObject;
+        cap.obj_type = ObjectType::Untyped;
+        cap.rights = CapRights::ALL;
+        cap.depth = 0;
+        cap.badge = 0;
+
+        let cnode_slot = CAP_UNTYPED_START + ut_index;
+        cnode
+            .insert_ref(cnode_slot, CapRef { slot })
+            .expect("init: untyped CNode insert failed");
+
+        crate::serial_puts("[INIT]   Untyped ");
+        crate::serial_dec(ut_index as u64);
+        crate::serial_puts(": phys=");
+        crate::serial_hex(base);
+        crate::serial_puts(" size=");
+        crate::serial_hex(1u64 << size_bits);
+        crate::serial_puts(" (2^");
+        crate::serial_dec(size_bits as u64);
+        crate::serial_puts(")\n");
+
+        ut_index += 1;
+        break;
+    }
+
+    if ut_index == 0 {
+        crate::serial_puts("[INIT] WARNING: no contiguous untyped region available\n");
+    }
+
+    crate::serial_puts("[INIT] Created ");
+    crate::serial_dec(ut_index as u64);
+    crate::serial_puts(" untyped capabilities\n");
 }
 
 /// Load init.elf from CPIO initrd using the kernel ELF loader
@@ -199,6 +412,89 @@ fn load_from_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) -> (u64, u64) {
         .expect("init: stack map failed");
 
     (result.entry, INIT_STACK_TOP)
+}
+
+/// Map initrd into user VSpace as read-only pages
+///
+/// Maps the physical initrd pages at INITRD_VADDR so userspace can parse
+/// the CPIO archive to find and load additional binaries (console, procmgr).
+fn map_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) {
+    let initrd_phys = info.initrd_addr;
+    let initrd_size = info.initrd_size as usize;
+    let num_pages = (initrd_size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    crate::serial_puts("[INIT] Mapping initrd: phys=");
+    crate::serial_hex(initrd_phys);
+    crate::serial_puts(" size=");
+    crate::serial_dec(initrd_size as u64);
+    crate::serial_puts(" pages=");
+    crate::serial_dec(num_pages as u64);
+    crate::serial_puts(" -> vaddr=");
+    crate::serial_hex(INITRD_VADDR);
+    crate::serial_puts("\n");
+
+    for i in 0..num_pages {
+        let phys = initrd_phys + (i * PAGE_SIZE) as u64;
+        let virt = INITRD_VADDR + (i * PAGE_SIZE) as u64;
+
+        // Allocate a new frame and copy the initrd data into it, since the
+        // original physical pages may not be frame-aligned or may overlap
+        // with kernel-managed memory.
+        let frame_phys = alloc_frame().expect("init: initrd frame alloc failed");
+        let frame_virt = phys_to_virt(frame_phys) as *mut u8;
+        let src = phys_to_virt(phys) as *const u8;
+        let copy_len = if (i + 1) * PAGE_SIZE > initrd_size {
+            initrd_size - i * PAGE_SIZE
+        } else {
+            PAGE_SIZE
+        };
+        unsafe {
+            core::ptr::write_bytes(frame_virt, 0, PAGE_SIZE);
+            core::ptr::copy_nonoverlapping(src, frame_virt, copy_len);
+        }
+
+        vspace
+            .map(virt, frame_phys, PageFlags::USER_RO)
+            .expect("init: initrd page map failed");
+    }
+
+    // Store initrd info in statics so we can pass to userspace via IPC buffer
+    // or well-known memory location
+    unsafe {
+        INITRD_USER_VADDR = INITRD_VADDR;
+        INITRD_USER_SIZE = initrd_size as u64;
+    }
+
+    crate::serial_puts("[INIT] Initrd mapped OK\n");
+}
+
+/// Initrd location in user VSpace (set by map_initrd, read by userspace)
+static mut INITRD_USER_VADDR: u64 = 0;
+static mut INITRD_USER_SIZE: u64 = 0;
+
+/// Map a boot info page at BOOTINFO_VADDR containing initrd location
+///
+/// Layout (all u64, little-endian):
+///   offset 0: magic (0x534C5459_424F4F54 = "SLTYBOOT")
+///   offset 8: initrd virtual address
+///   offset 16: initrd size in bytes
+fn map_bootinfo(vspace: &mut VSpace) {
+    let frame_phys = alloc_frame().expect("init: bootinfo frame alloc failed");
+    let frame_virt = phys_to_virt(frame_phys) as *mut u8;
+    unsafe {
+        core::ptr::write_bytes(frame_virt, 0, PAGE_SIZE);
+        let data = frame_virt as *mut u64;
+        data.write(0x534C5459_424F4F54); // magic "SLTYBOOT"
+        data.add(1).write(INITRD_USER_VADDR);
+        data.add(2).write(INITRD_USER_SIZE);
+    }
+    vspace
+        .map(BOOTINFO_VADDR, frame_phys, PageFlags::USER_RO)
+        .expect("init: bootinfo map failed");
+
+    crate::serial_puts("[INIT] Boot info page mapped at ");
+    crate::serial_hex(BOOTINFO_VADDR);
+    crate::serial_puts("\n");
 }
 
 /// Load the hardcoded yield-loop bytecode (fallback when no initrd)
