@@ -25,24 +25,15 @@
  *   8 = nameserv endpoint
  */
 
-#define SALTY_STATIC
 #include "salty.h"
-
-/* IPC buffer pointer */
-__attribute__((visibility("hidden")))
-void *__salty_ipc_buffer = (void *)0;
-
-/* Send cap counter */
-__attribute__((visibility("hidden")))
-int __salty_send_cap_count = 0;
 
 /* Cap layout */
 #define CAP_SELF_TCB     0
 #define CAP_SELF_VSPACE  1
 #define CAP_SELF_CSPACE  2
 #define CAP_SERVER_EP    3
-#define CAP_CONSOLE_EP   4
-#define CAP_NAMESERV_EP  8
+#define VFS_CAP_CONSOLE_EP  4
+#define VFS_CAP_NAMESERV_EP 8
 
 /* IPC buffer setup (pre-mapped by init) */
 #define IPC_BUF_VADDR       0x0000000000200000ULL
@@ -190,7 +181,7 @@ static void handle_read(const struct salty_msg *msg, struct salty_msg *reply, ui
         creq.length = 0;
         for (int i = 0; i < 4; i++) creq.regs[i] = 0;
 
-        int err = salty_call(CAP_CONSOLE_EP, &creq, &creply);
+        int err = salty_call(VFS_CAP_CONSOLE_EP, &creq, &creply);
         if (err != 0 || creply.label != SALTY_OK) {
             reply->label = SALTY_INVALID_OPERATION;
             return;
@@ -259,7 +250,7 @@ static void handle_write(const struct salty_msg *msg, struct salty_msg *reply, u
             if (chunk > 24) chunk = 24;
 
             creq.label = CONSOLE_WRITE;
-            creq.length = 2;
+            creq.length = 1 + (uint64_t)((chunk + 7) / 8);
             creq.regs[0] = chunk;
             creq.regs[1] = 0;
             creq.regs[2] = 0;
@@ -269,8 +260,8 @@ static void handle_write(const struct salty_msg *msg, struct salty_msg *reply, u
             for (uint64_t i = 0; i < chunk; i++)
                 dst[i] = src[sent + i];
 
-            int err = salty_call(CAP_CONSOLE_EP, &creq, &creply);
-            if (err != 0) break;
+            int err = salty_call(VFS_CAP_CONSOLE_EP, &creq, &creply);
+            if (err != 0 || creply.label != SALTY_OK) break;
             sent += chunk;
         }
         reply->label = sent > 0 ? SALTY_OK : SALTY_INVALID_OPERATION;
@@ -330,10 +321,33 @@ void _start(void) {
         salty_serial_puts("\n");
         goto idle;
     }
-    __salty_ipc_buffer = (void *)IPC_BUF_VADDR;
+    salty_ipc_context_init(&__salty_ipc_ctx, (void *)IPC_BUF_VADDR);
 
     salty_serial_puts("[VFS] IPC buffer ready\n");
     salty_serial_puts("[VFS] Devices: /dev/console, /dev/null, /dev/zero\n");
+
+    /* Register with name server */
+    if (VFS_CAP_NAMESERV_EP != 0) {
+        struct salty_msg reg_msg, reg_reply;
+        reg_msg.label = 1; /* NS_REGISTER */
+        reg_msg.regs[0] = 3; /* length of "vfs" */
+        reg_msg.length = 1 + (uint64_t)((reg_msg.regs[0] + 7) / 8);
+        const char *svc_name = "vfs";
+        uint8_t *ns_dst = (uint8_t *)&reg_msg.regs[1];
+        for (int i = 0; i < 3; i++) ns_dst[i] = (uint8_t)svc_name[i];
+        reg_msg.regs[2] = 0;
+        reg_msg.regs[3] = 0;
+
+        /* Set up cap transfer: send our server EP */
+        salty_set_send_cap(0, CAP_SERVER_EP);
+
+        err = salty_call(VFS_CAP_NAMESERV_EP, &reg_msg, &reg_reply);
+        if (err == 0 && reg_reply.label == SALTY_OK) {
+            salty_serial_puts("[VFS] registered with nameserv\n");
+        } else {
+            salty_serial_puts("[VFS] WARN: nameserv registration failed\n");
+        }
+    }
 
     /* Initial recv */
     struct salty_msg msg;

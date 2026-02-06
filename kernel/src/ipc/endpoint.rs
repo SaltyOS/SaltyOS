@@ -46,6 +46,28 @@ impl Endpoint {
         self.state
     }
 
+    /// Cache the current thread's receive-slot configuration from its IPC buffer.
+    /// This must be called while the thread is current (its VSpace is active).
+    unsafe fn cache_receive_slot(tcb: *mut Tcb) {
+        unsafe {
+            if tcb.is_null() {
+                return;
+            }
+            let buf = (*tcb).ipc_buffer;
+            if buf == 0 {
+                (*tcb).ipc_receive_cnode = 0;
+                (*tcb).ipc_receive_index = 0;
+                (*tcb).ipc_receive_depth = 0;
+                return;
+            }
+
+            let ipc_buf = buf as *const super::IpcBuffer;
+            (*tcb).ipc_receive_cnode = (*ipc_buf).receive_cnode;
+            (*tcb).ipc_receive_index = (*ipc_buf).receive_index;
+            (*tcb).ipc_receive_depth = (*ipc_buf).receive_depth;
+        }
+    }
+
     /// Send message (blocks until receiver ready)
     pub fn send(&mut self, msg: &Message, badge: u64) {
         unsafe {
@@ -90,6 +112,7 @@ impl Endpoint {
     pub fn recv(&mut self) -> (Message, u64) {
         unsafe {
             let current = get_scheduler().current();
+            Self::cache_receive_slot(current);
 
             match self.state {
                 EndpointState::SendBlocked => {
@@ -154,6 +177,7 @@ impl Endpoint {
         // The reply will come via the server's reply_tcb capability
         unsafe {
             let current = get_scheduler().current();
+            Self::cache_receive_slot(current);
 
             // Wait for reply
             // The reply will be delivered to saved_caller_msg by the server
@@ -175,9 +199,16 @@ impl Endpoint {
             let caller = (*current).reply_tcb;
 
             if !caller.is_null() {
-                // Transfer reply message to caller's TCB
-                (*caller).saved_caller_msg = *reply;
-                (*caller).saved_caller_badge = 0;
+                // Transfer reply message to caller's TCB.
+                // Fault replies cannot grant capabilities.
+                if (*current).reply_can_grant {
+                    self.transfer_message(current, caller, reply, 0);
+                } else {
+                    let mut no_grant_reply = *reply;
+                    no_grant_reply.extra_caps = 0;
+                    no_grant_reply.caps = [0; 4];
+                    self.transfer_message(current, caller, &no_grant_reply, 0);
+                }
 
                 // Clear caller's blocked reason
                 (*caller).blocked_reason = None;
@@ -200,9 +231,8 @@ impl Endpoint {
     /// Transfer message from sender to receiver
     ///
     /// Copies the message and badge to the receiver's TCB.
-    /// If the message has extra caps (capability transfer), those are
-    /// transferred from sender's CSpace to receiver's CSpace via their
-    /// IPC buffers.
+    /// If the message has extra caps, those are copied from sender CSpace to
+    /// receiver CSpace using receiver's cached receive slot configuration.
     unsafe fn transfer_message(
         &self,
         sender: *mut Tcb,
@@ -215,75 +245,56 @@ impl Endpoint {
             (*receiver).saved_caller_msg = *msg;
             (*receiver).saved_caller_badge = badge;
 
-            // Copy overflow registers MR4..MR(length-1) via IPC buffers.
-            // The IPC buffer msg[] has a 2-slot header (label, length)
-            // so MR4 maps to msg[6], MR5 to msg[7], etc.
-            let sender_buf = (*sender).ipc_buffer;
-            let receiver_buf = (*receiver).ipc_buffer;
-            if msg.length > 4 && sender_buf != 0 && receiver_buf != 0 {
-                let sender_ipc = sender_buf as *const super::IpcBuffer;
-                let receiver_ipc = receiver_buf as *mut super::IpcBuffer;
-                let overflow_count = (msg.length - 4).min(16); // MR4..MR19
-                for i in 0..overflow_count {
-                    (*receiver_ipc).msg[6 + i] = (*sender_ipc).msg[6 + i];
-                }
-            }
-
             // Check for capability transfer via IPC buffer.
-            // Use msg.extra_caps (from sender's msg_info) to bound the loop,
-            // preventing stale values in caps[] from leaking capabilities.
+            // Use msg.extra_caps (from sender's msg_info) to bound the loop.
             let cap_count = msg.extra_caps.min(4);
-            if cap_count > 0 && sender_buf != 0 && receiver_buf != 0 {
-                let sender_ipc = sender_buf as *mut super::IpcBuffer;
-                let receiver_ipc = receiver_buf as *const super::IpcBuffer;
+            if cap_count > 0 {
+                let recv_cnode_ptr = (*receiver).ipc_receive_cnode;
+                let recv_index = (*receiver).ipc_receive_index;
 
-                let recv_cnode_ptr = (*receiver_ipc).receive_cnode;
-                let recv_index = (*receiver_ipc).receive_index;
-
-                if recv_cnode_ptr != 0 {
-                    for i in 0..cap_count as u64 {
-                        let src_slot_idx = (*sender_ipc).caps[i as usize];
-                        if src_slot_idx == 0 { continue; }
-
-                        // Look up cap in sender's CSpace
-                        let sender_cspace = &*(*sender).cspace_root;
-                        let src_cap = match sender_cspace.get(src_slot_idx as usize) {
-                            Some(c) => c,
-                            None => continue,
-                        };
-
-                        // Check Grant right
-                        if !src_cap.has_right(crate::cap::CapRights::GRANT) {
-                            continue;
-                        }
-
-                        // Look up receiver's CNode
-                        let recv_cspace = &*(*receiver).cspace_root;
-                        let recv_cnode_cap = match recv_cspace.get(recv_cnode_ptr as usize) {
-                            Some(c) => c,
-                            None => continue,
-                        };
-
-                        if recv_cnode_cap.obj_type != crate::cap::ObjectType::CNode {
-                            continue;
-                        }
-
-                        let recv_cnode = &mut *(recv_cnode_cap.object as *mut crate::cap::CNode);
-                        let dest_slot = (recv_index + i) as usize;
-
-                        // Copy capability into receiver's CNode
-                        let _ = recv_cnode.copy_slot(
-                            dest_slot,
-                            sender_cspace,
-                            src_slot_idx as usize,
-                            src_cap.rights,
-                        );
-                    }
+                if recv_cnode_ptr == 0 {
+                    return;
                 }
 
-                // Clear sender's caps to prevent stale leaks on next IPC
-                for i in 0..4 {
-                    (*sender_ipc).caps[i] = 0;
+                for i in 0..cap_count as u64 {
+                    let src_slot_idx = msg.caps[i as usize];
+                    if src_slot_idx == 0 {
+                        continue;
+                    }
+
+                    // Look up cap in sender's CSpace
+                    let sender_cspace = &*(*sender).cspace_root;
+                    let src_cap = match sender_cspace.get(src_slot_idx as usize) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+
+                    // Check Grant right
+                    if !src_cap.has_right(crate::cap::CapRights::GRANT) {
+                        continue;
+                    }
+
+                    // Look up receiver's CNode
+                    let recv_cspace = &*(*receiver).cspace_root;
+                    let recv_cnode_cap = match recv_cspace.get(recv_cnode_ptr as usize) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+
+                    if recv_cnode_cap.obj_type != crate::cap::ObjectType::CNode {
+                        continue;
+                    }
+
+                    let recv_cnode = &mut *(recv_cnode_cap.object as *mut crate::cap::CNode);
+                    let dest_slot = (recv_index + i) as usize;
+
+                    // Copy capability into receiver's CNode
+                    let _ = recv_cnode.copy_slot(
+                        dest_slot,
+                        sender_cspace,
+                        src_slot_idx as usize,
+                        src_cap.rights,
+                    );
                 }
             }
         }

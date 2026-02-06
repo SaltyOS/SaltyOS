@@ -91,18 +91,6 @@
 #define CAP_COM1_NTFN             10
 #define CAP_CONSOLE_EP            11
 
-/* IPC buffer pointer - set by init to point at mapped IPC buffer page.
- * When SALTY_STATIC: weak hidden definition (each static binary defines its own).
- * When !SALTY_STATIC: extern (defined in libsalty.so).
- */
-#ifdef SALTY_STATIC
-extern void *__salty_ipc_buffer __attribute__((visibility("hidden")));
-extern int __salty_send_cap_count __attribute__((visibility("hidden")));
-#else
-extern void *__salty_ipc_buffer;
-extern int __salty_send_cap_count;
-#endif
-
 /* Initrd mapping address (16 MB) */
 #define INITRD_VADDR              0x0000000001000000ULL
 
@@ -180,6 +168,24 @@ struct salty_ipc_buffer {
     uint64_t receive_depth;     /* 0x0E8: CNode depth */
     uint64_t reserved[478];     /* 0x0F0: future use */
 };
+
+/* Per-thread IPC context.
+ * Keep one instance per userspace thread and pass it to *_ctx IPC helpers.
+ */
+struct salty_ipc_context {
+    struct salty_ipc_buffer *ipc_buffer;
+    int send_cap_count;
+};
+
+/* Default IPC context for the current user thread.
+ * - SALTY_STATIC: each static binary defines this hidden symbol.
+ * - !SALTY_STATIC: defined by libsalty.so.
+ */
+#ifdef SALTY_STATIC
+extern struct salty_ipc_context __salty_ipc_ctx __attribute__((visibility("hidden")));
+#else
+extern struct salty_ipc_context __salty_ipc_ctx;
+#endif
 
 /* Pack label, length, and extra_caps into a msg_info word.
  *   Bits  6:0  = length (0-127)
@@ -301,43 +307,154 @@ static inline void salty_ioport_out16(cap_t ioport, uint64_t offset,
                   (uint64_t)value, 0, 0);
 }
 
-/* Clear all pending send caps and reset counter */
-static inline void salty_clear_send_caps(void) {
-    if (__salty_ipc_buffer) {
-        struct salty_ipc_buffer *buf = (struct salty_ipc_buffer *)__salty_ipc_buffer;
-        for (int i = 0; i < 4; i++) buf->caps[i] = 0;
-    }
-    __salty_send_cap_count = 0;
+/* Initialize a per-thread IPC context for a mapped IPC buffer page. */
+static inline void salty_ipc_context_init(struct salty_ipc_context *ctx,
+                                          void *ipc_buffer_vaddr) {
+    if (!ctx) return;
+    ctx->ipc_buffer = (struct salty_ipc_buffer *)ipc_buffer_vaddr;
+    ctx->send_cap_count = 0;
 }
 
-/* Set a capability slot for transfer in the next IPC send.
- * slot_index: which of the 4 cap transfer slots (0-3) to set
- * cap_slot: the CNode slot index of the capability to transfer
- *
- * Increments __salty_send_cap_count so salty_send/call/etc. include
- * the correct extra_caps count in msg_info.
+/* Clear all pending send caps in a context. */
+static inline void salty_clear_send_caps_ctx(struct salty_ipc_context *ctx) {
+    if (!ctx) return;
+    if (ctx->ipc_buffer) {
+        for (int i = 0; i < 4; i++) ctx->ipc_buffer->caps[i] = 0;
+    }
+    ctx->send_cap_count = 0;
+}
+
+/* Queue one cap for transfer in the next IPC send on this context.
+ * extra_caps is derived from the highest slot used.
  */
-static inline void salty_set_send_cap(int slot_index, uint64_t cap_slot) {
-    if (__salty_ipc_buffer && slot_index >= 0 && slot_index < 4) {
-        struct salty_ipc_buffer *buf = (struct salty_ipc_buffer *)__salty_ipc_buffer;
-        buf->caps[slot_index] = cap_slot;
-        __salty_send_cap_count++;
-    }
+static inline void salty_set_send_cap_ctx(struct salty_ipc_context *ctx,
+                                          int slot_index, uint64_t cap_slot) {
+    if (!ctx || !ctx->ipc_buffer || slot_index < 0 || slot_index >= 4) return;
+    ctx->ipc_buffer->caps[slot_index] = cap_slot;
+    if (ctx->send_cap_count < slot_index + 1)
+        ctx->send_cap_count = slot_index + 1;
 }
 
-/* Write overflow MRs (regs[4..19]) to the IPC buffer before a send syscall.
- * The kernel reads MR4+ from the sender's IPC buffer via transfer_message.
+/* Configure receive slot for incoming cap transfers on this context. */
+static inline void salty_set_receive_slot_ctx(struct salty_ipc_context *ctx,
+                                              cap_t cnode, uint64_t index,
+                                              uint64_t depth) {
+    if (!ctx || !ctx->ipc_buffer) return;
+    ctx->ipc_buffer->receive_cnode = cnode;
+    ctx->ipc_buffer->receive_index = index;
+    ctx->ipc_buffer->receive_depth = depth;
+}
+
+/* Write overflow MRs (regs[4..19]) to the given context's IPC buffer.
  * The IPC buffer msg[] has a 2-slot header (label, length), so
  * regs[4] maps to msg[6], regs[5] to msg[7], etc.
  */
+static inline void __salty_write_overflow_ctx(struct salty_ipc_context *ctx,
+                                              const struct salty_msg *msg) {
+    if (!ctx || !ctx->ipc_buffer || msg->length <= 4) return;
+    int n = (int)msg->length - 4;
+    if (n > 16) n = 16;
+    for (int i = 0; i < n; i++)
+        ctx->ipc_buffer->msg[6 + i] = msg->regs[4 + i];
+}
+
+/* Backward-compatible default-context helpers. */
+static inline void salty_clear_send_caps(void) {
+    salty_clear_send_caps_ctx(&__salty_ipc_ctx);
+}
+
+static inline void salty_set_send_cap(int slot_index, uint64_t cap_slot) {
+    salty_set_send_cap_ctx(&__salty_ipc_ctx, slot_index, cap_slot);
+}
+
+/* Configure default-context receive slot for incoming cap transfers. */
+static inline void salty_set_receive_slot(cap_t cnode, uint64_t index, uint64_t depth) {
+    salty_set_receive_slot_ctx(&__salty_ipc_ctx, cnode, index, depth);
+}
+
+/* Kept for compatibility with existing salty_impl.c call sites. */
 static inline void __salty_write_overflow(const struct salty_msg *msg) {
-    if (msg->length > 4 && __salty_ipc_buffer) {
-        struct salty_ipc_buffer *buf = (struct salty_ipc_buffer *)__salty_ipc_buffer;
-        int n = (int)msg->length - 4;
-        if (n > 16) n = 16;
-        for (int i = 0; i < n; i++)
-            buf->msg[6 + i] = msg->regs[4 + i];
+    __salty_write_overflow_ctx(&__salty_ipc_ctx, msg);
+}
+
+/* Per-context IPC operations */
+static inline int salty_send_ctx(struct salty_ipc_context *ctx, cap_t ep,
+                                 const struct salty_msg *msg) {
+    int caps = ctx ? ctx->send_cap_count : 0;
+    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
+    __salty_write_overflow_ctx(ctx, msg);
+    struct salty_result r = salty_syscall(
+        SYS_SEND, ep,
+        info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
+    );
+    if (caps > 0 && ctx) salty_clear_send_caps_ctx(ctx);
+    return (int)r.error;
+}
+
+static inline int salty_recv_ctx(struct salty_ipc_context *ctx, cap_t ep,
+                                 struct salty_msg *msg, uint64_t *badge) {
+    struct salty_result r = salty_syscall(SYS_RECV, ep, 0, 0, 0, 0, 0);
+    if (r.error == 0) {
+        if (badge) *badge = r.value;
+        if (msg && ctx && ctx->ipc_buffer) {
+            const struct salty_msg *buf = (const struct salty_msg *)ctx->ipc_buffer;
+            *msg = *buf;
+        }
     }
+    return (int)r.error;
+}
+
+static inline int salty_call_ctx(struct salty_ipc_context *ctx, cap_t ep,
+                                 const struct salty_msg *msg,
+                                 struct salty_msg *reply) {
+    int caps = ctx ? ctx->send_cap_count : 0;
+    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
+    __salty_write_overflow_ctx(ctx, msg);
+    struct salty_result r = salty_syscall(
+        SYS_CALL, ep,
+        info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
+    );
+    if (caps > 0 && ctx) salty_clear_send_caps_ctx(ctx);
+    if (r.error == 0 && reply && ctx && ctx->ipc_buffer) {
+        const struct salty_msg *buf = (const struct salty_msg *)ctx->ipc_buffer;
+        *reply = *buf;
+    }
+    return (int)r.error;
+}
+
+static inline int salty_reply_recv_ctx(struct salty_ipc_context *ctx, cap_t ep,
+                                       const struct salty_msg *reply,
+                                       struct salty_msg *out_msg,
+                                       uint64_t *badge) {
+    int caps = ctx ? ctx->send_cap_count : 0;
+    uint64_t info = SALTY_MSGINFO(reply->label, reply->length, caps);
+    __salty_write_overflow_ctx(ctx, reply);
+    struct salty_result r = salty_syscall(
+        SYS_REPLY_RECV, ep,
+        info, reply->regs[0], reply->regs[1], reply->regs[2], reply->regs[3]
+    );
+    if (caps > 0 && ctx) salty_clear_send_caps_ctx(ctx);
+    if (r.error == 0) {
+        if (badge) *badge = r.value;
+        if (out_msg && ctx && ctx->ipc_buffer) {
+            const struct salty_msg *buf = (const struct salty_msg *)ctx->ipc_buffer;
+            *out_msg = *buf;
+        }
+    }
+    return (int)r.error;
+}
+
+static inline int salty_nbsend_ctx(struct salty_ipc_context *ctx, cap_t ep,
+                                   const struct salty_msg *msg) {
+    int caps = ctx ? ctx->send_cap_count : 0;
+    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
+    __salty_write_overflow_ctx(ctx, msg);
+    struct salty_result r = salty_syscall(
+        SYS_NBSEND, ep,
+        info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
+    );
+    if (caps > 0 && ctx) salty_clear_send_caps_ctx(ctx);
+    return (int)r.error;
 }
 
 /* ====================================================================
@@ -360,64 +477,20 @@ static inline struct salty_result salty_invoke(
 
 /* IPC operations */
 static inline int salty_send(cap_t ep, const struct salty_msg *msg) {
-    int caps = __salty_send_cap_count;
-    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
-    __salty_write_overflow(msg);
-    struct salty_result r = salty_syscall(
-        SYS_SEND, ep,
-        info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
-    );
-    if (caps > 0) salty_clear_send_caps();
-    return (int)r.error;
+    return salty_send_ctx(&__salty_ipc_ctx, ep, msg);
 }
 
 static inline int salty_recv(cap_t ep, struct salty_msg *msg, uint64_t *badge) {
-    struct salty_result r = salty_syscall(SYS_RECV, ep, 0, 0, 0, 0, 0);
-    if (r.error == 0) {
-        *badge = r.value;
-        if (msg && __salty_ipc_buffer) {
-            /* Read from IPC buffer (kernel writes Message struct at base) */
-            const struct salty_msg *buf = (const struct salty_msg *)__salty_ipc_buffer;
-            *msg = *buf;
-        }
-    }
-    return (int)r.error;
+    return salty_recv_ctx(&__salty_ipc_ctx, ep, msg, badge);
 }
 
 static inline int salty_call(cap_t ep, const struct salty_msg *msg, struct salty_msg *reply) {
-    int caps = __salty_send_cap_count;
-    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
-    __salty_write_overflow(msg);
-    struct salty_result r = salty_syscall(
-        SYS_CALL, ep,
-        info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
-    );
-    if (caps > 0) salty_clear_send_caps();
-    if (r.error == 0 && reply && __salty_ipc_buffer) {
-        const struct salty_msg *buf = (const struct salty_msg *)__salty_ipc_buffer;
-        *reply = *buf;
-    }
-    return (int)r.error;
+    return salty_call_ctx(&__salty_ipc_ctx, ep, msg, reply);
 }
 
 static inline int salty_reply_recv(cap_t ep, const struct salty_msg *reply,
                                     struct salty_msg *out_msg, uint64_t *badge) {
-    int caps = __salty_send_cap_count;
-    uint64_t info = SALTY_MSGINFO(reply->label, reply->length, caps);
-    __salty_write_overflow(reply);
-    struct salty_result r = salty_syscall(
-        SYS_REPLY_RECV, ep,
-        info, reply->regs[0], reply->regs[1], reply->regs[2], reply->regs[3]
-    );
-    if (caps > 0) salty_clear_send_caps();
-    if (r.error == 0) {
-        if (badge) *badge = r.value;
-        if (out_msg && __salty_ipc_buffer) {
-            const struct salty_msg *buf = (const struct salty_msg *)__salty_ipc_buffer;
-            *out_msg = *buf;
-        }
-    }
-    return (int)r.error;
+    return salty_reply_recv_ctx(&__salty_ipc_ctx, ep, reply, out_msg, badge);
 }
 
 /* Notification operations */
@@ -572,15 +645,7 @@ static inline int salty_cnode_revoke(cap_t cnode, uint64_t slot) {
 
 /* Non-blocking send to endpoint */
 static inline int salty_nbsend(cap_t ep, const struct salty_msg *msg) {
-    int caps = __salty_send_cap_count;
-    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
-    __salty_write_overflow(msg);
-    struct salty_result r = salty_syscall(
-        SYS_NBSEND, ep,
-        info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
-    );
-    if (caps > 0) salty_clear_send_caps();
-    return (int)r.error;
+    return salty_nbsend_ctx(&__salty_ipc_ctx, ep, msg);
 }
 
 /* Poll notification without blocking */
@@ -599,19 +664,6 @@ static inline void salty_debug_putchar(char c) {
 /* Dump current thread state to kernel debug serial */
 static inline void salty_debug_dump_state(void) {
     salty_syscall(SYS_DEBUG_DUMP_STATE, 0, 0, 0, 0, 0, 0);
-}
-
-/* Configure the IPC buffer receive slot for capability transfer.
- * When receiving IPC with extra_caps > 0, transferred capabilities
- * will be placed into the specified CNode starting at index.
- */
-static inline void salty_set_receive_slot(cap_t cnode, uint64_t index, uint64_t depth) {
-    if (__salty_ipc_buffer) {
-        struct salty_ipc_buffer *buf = (struct salty_ipc_buffer *)__salty_ipc_buffer;
-        buf->receive_cnode = cnode;
-        buf->receive_index = index;
-        buf->receive_depth = depth;
-    }
 }
 
 /* Set IPC buffer address for a TCB */

@@ -54,6 +54,7 @@
 #define CAP_CHILD_SC        (CAP_CHILD_BASE + 3)
 #define CAP_CHILD_STACK_FR  (CAP_CHILD_BASE + 4)
 #define CAP_CHILD_EP        (CAP_CHILD_BASE + 5)  /* Endpoint for console */
+#define CAP_CHILD_IPC_FR    (CAP_CHILD_BASE + 6)  /* IPC buffer frame */
 /* ELF loader will use cap slots starting at CAP_CHILD_BASE + 16 for frames */
 #define CAP_CHILD_FRAME_START (CAP_CHILD_BASE + 16)
 
@@ -76,13 +77,9 @@
 #define IPC_BUF_VADDR       0x0000000000200000ULL  /* 2 MB - init's IPC buffer */
 #define IPC_BUF2_VADDR      0x0000000000201000ULL  /* 2 MB + 4K - thread2's IPC buffer */
 
-/* IPC buffer pointer (referenced by salty.h) */
+/* Default IPC context for init's main thread (used by legacy wrappers). */
 __attribute__((visibility("hidden")))
-void *__salty_ipc_buffer = (void *)0;
-
-/* Send cap counter */
-__attribute__((visibility("hidden")))
-int __salty_send_cap_count = 0;
+struct salty_ipc_context __salty_ipc_ctx = { 0 };
 
 /* Unmapped user address for fault test (1GB, page-aligned) */
 #define FAULT_TEST_ADDR     0x40000000ULL
@@ -101,8 +98,20 @@ int __salty_send_cap_count = 0;
 #define CHILD_SCRATCH_VADDR 0x0000000004000000ULL  /* scratch area for rtld */
 #define CHILD_IPC_BUF_VADDR 0x0000000000200000ULL  /* IPC buffer for child */
 
+/* init still uses legacy (default-context) libsalty wrappers.
+ * Keep that default IPC context pinned to init's own IPC buffer.
+ */
+static void restore_init_ipc_context(void) {
+    salty_invoke(CAP_SELF_TCB, TCB_SET_IPC_BUFFER, IPC_BUF_VADDR, 0, 0, 0);
+    salty_ipc_context_init(&__salty_ipc_ctx, (void *)IPC_BUF_VADDR);
+}
+
 /* Cap slot for untyped cap copied into child CNode (for rtld frame alloc) */
 #define CAP_CHILD_UNTYPED_OFFSET  7
+/* First child CNode slot reserved for rtld frame allocations.
+ * Keep this above low well-known/service slots to avoid collisions.
+ */
+#define CHILD_RTLD_FRAME_SLOT_START 64
 
 /* Auxiliary vector types (standard) */
 #define AT_NULL    0
@@ -127,15 +136,19 @@ static uint8_t thread2_stack[4096] __attribute__((aligned(4096)));
 /* Fault handler stack */
 static uint8_t fault_handler_stack[4096] __attribute__((aligned(4096)));
 
+/* Per-thread IPC contexts used by init's helper threads. */
+static struct salty_ipc_context thread2_ipc_ctx;
+static struct salty_ipc_context fault_ipc_ctx;
+
 /* Thread 2 entry point: receives a message from the endpoint */
 static void thread2_entry(void) {
-    __salty_ipc_buffer = (void *)IPC_BUF2_VADDR;
+    salty_ipc_context_init(&thread2_ipc_ctx, (void *)IPC_BUF2_VADDR);
     salty_serial_puts("[THREAD2] started, waiting on endpoint\n");
 
     struct salty_msg msg;
     uint64_t badge = 0;
 
-    int err = salty_recv(CAP_TEST_EP, &msg, &badge);
+    int err = salty_recv_ctx(&thread2_ipc_ctx, CAP_TEST_EP, &msg, &badge);
     if (err == 0) {
         salty_serial_puts("[THREAD2] received message! label=");
         salty_serial_hex(msg.label);
@@ -156,12 +169,13 @@ static void thread2_entry(void) {
 
 /* Fault handler thread: receives fault, maps page, replies */
 static void fault_handler_entry(void) {
+    salty_ipc_context_init(&fault_ipc_ctx, (void *)IPC_BUF_VADDR);
     salty_serial_puts("[FAULT_HANDLER] started, waiting for fault\n");
 
     struct salty_msg msg;
     uint64_t badge = 0;
 
-    int err = salty_recv(CAP_FAULT_EP, &msg, &badge);
+    int err = salty_recv_ctx(&fault_ipc_ctx, CAP_FAULT_EP, &msg, &badge);
     if (err != 0) {
         salty_serial_puts("[FAULT_HANDLER] recv failed err=");
         salty_serial_hex((uint64_t)err);
@@ -190,7 +204,7 @@ static void fault_handler_entry(void) {
     reply.regs[1] = 0;
     reply.regs[2] = 0;
     reply.regs[3] = 0;
-    salty_reply_recv(CAP_FAULT_EP, &reply, &msg, &badge);
+    salty_reply_recv_ctx(&fault_ipc_ctx, CAP_FAULT_EP, &reply, &msg, &badge);
 
 done:
     for (;;) { salty_yield(); }
@@ -521,6 +535,14 @@ static int phase3_spawn_console(cap_t ut) {
         return -1;
     }
 
+    err = salty_untyped_retype(ut, OBJ_FRAME, 0, CAP_CHILD_IPC_FR);
+    if (err != 0) {
+        salty_serial_puts("[INIT] FAIL: child IPC Frame retype err=");
+        salty_serial_hex((uint64_t)err);
+        salty_serial_puts("\n");
+        return -1;
+    }
+
     err = salty_untyped_retype(ut, OBJ_ENDPOINT, 0, CAP_CHILD_EP);
     if (err != 0) {
         salty_serial_puts("[INIT] FAIL: child EP retype err=");
@@ -529,7 +551,7 @@ static int phase3_spawn_console(cap_t ut) {
         return -1;
     }
 
-    salty_serial_puts("[INIT] Child objects created (TCB/VS/CN/SC/FR/EP)\n");
+    salty_serial_puts("[INIT] Child objects created (TCB/VS/CN/SC/STK_FR/IPC_FR/EP)\n");
 
     /* 2. Load console.elf into child VSpace */
     struct elf_loader_ctx loader_ctx;
@@ -671,6 +693,17 @@ static int phase3_spawn_console(cap_t ut) {
             salty_serial_puts("\n");
             return -1;
         }
+    }
+
+    /* 5b. Map IPC buffer frame in child VSpace */
+    err = salty_vspace_map(CAP_CHILD_VSPACE, CAP_CHILD_IPC_FR,
+                           CHILD_IPC_BUF_VADDR,
+                           VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER);
+    if (err != 0) {
+        salty_serial_puts("[INIT] FAIL: child IPC map err=");
+        salty_serial_hex((uint64_t)err);
+        salty_serial_puts("\n");
+        return -1;
     }
 
     /* 6. Copy caps into child's CNode.
@@ -838,7 +871,7 @@ static int phase3_spawn_console(cap_t ut) {
         stack_base[idx++] = elf_result.entry;
 
         stack_base[idx++] = AT_BASE;
-        stack_base[idx++] = CHILD_RTLD_VADDR;
+        stack_base[idx++] = rtld_result.base;
 
         stack_base[idx++] = AT_PAGESZ;
         stack_base[idx++] = 4096;
@@ -859,7 +892,7 @@ static int phase3_spawn_console(cap_t ut) {
         stack_base[idx++] = (uint64_t)initrd_size;
 
         stack_base[idx++] = AT_SALTY_FRAME_SLOT;
-        stack_base[idx++] = (uint64_t)(CAP_CHILD_UNTYPED_OFFSET + 1);  /* First free slot in child CNode */
+        stack_base[idx++] = (uint64_t)CHILD_RTLD_FRAME_SLOT_START;
 
         /* AT_NULL terminator */
         stack_base[idx++] = AT_NULL;
@@ -887,6 +920,15 @@ static int phase3_spawn_console(cap_t ut) {
     err = salty_tcb_configure(CAP_CHILD_TCB, child_entry, child_rsp, 0);
     if (err != 0) {
         salty_serial_puts("[INIT] FAIL: child TCB configure err=");
+        salty_serial_hex((uint64_t)err);
+        salty_serial_puts("\n");
+        return -1;
+    }
+
+    /* Set console thread IPC buffer address */
+    err = salty_tcb_set_ipc_buffer(CAP_CHILD_TCB, CHILD_IPC_BUF_VADDR);
+    if (err != 0) {
+        salty_serial_puts("[INIT] FAIL: child TCB set_ipc_buffer err=");
         salty_serial_hex((uint64_t)err);
         salty_serial_puts("\n");
         return -1;
@@ -924,21 +966,15 @@ static int phase3_spawn_console(cap_t ut) {
 }
 
 /* ================================================================
- * Generic static server spawn helper
+ * Generic server spawn helper (static + dynamic)
  * ================================================================
- * Spawns a statically-linked server from the initrd:
+ * Spawns a server from initrd and supports both static and dynamic ELF:
  *   1. Retype: TCB, VSpace, CNode, SC, stack Frame, IPC buf Frame, EP
- *   2. Load ELF into child VSpace
- *   3. Map stack + IPC buffer
- *   4. Copy standard caps (TCB, VSpace, CNode, EP) into child CNode
- *   5. Copy extra caps from extra_caps array into child CNode
- *   6. Configure + start
- *
- * cap_base: starting cap slot for this child's object block
- * elf_name: CPIO filename (e.g. "nameserv.elf")
- * extra_caps / extra_dst / extra_count: additional caps to copy into child CNode
- *   extra_caps[i] = source cap in init's CSpace
- *   extra_dst[i]  = destination slot in child's CNode
+ *   2. Load executable ELF into child VSpace
+ *   3. If PT_INTERP exists: load rtld and prepare auxv bootstrap stack
+ *   4. Map stack + IPC buffer (+ initrd when needed)
+ *   5. Copy standard caps and requested extra caps into child CNode
+ *   6. Configure TCB, bind SC, and start
  */
 struct extra_cap_copy {
     cap_t    src;   /* Source slot in init's CSpace */
@@ -950,13 +986,14 @@ struct extra_cap_copy {
 #define SRV_STACK_SIZE    (SRV_STACK_PAGES * 4096ULL)
 #define SRV_STACK_TOP     (CHILD_STACK_VADDR + SRV_STACK_SIZE)
 
-static int spawn_static_server(
+static int spawn_server(
     cap_t ut,
     cap_t cap_base,
     const char *elf_name,
     const char *label,
     const struct extra_cap_copy *extras,
-    int extra_count
+    int extra_count,
+    int map_initrd
 ) {
     int err;
 
@@ -975,6 +1012,13 @@ static int spawn_static_server(
         salty_serial_puts(elf_name);
         salty_serial_puts(" not found in initrd\n");
         return -1;
+    }
+
+    int is_dynamic = elf_has_interp(entry.data, entry.data_len);
+    if (is_dynamic) {
+        salty_serial_puts("[INIT] ");
+        salty_serial_puts(label);
+        salty_serial_puts(" is dynamically linked\n");
     }
 
     cap_t child_tcb    = cap_base + COFF_TCB;
@@ -1029,6 +1073,51 @@ static int spawn_static_server(
     salty_serial_hex(elf_result.entry);
     salty_serial_puts("\n");
 
+    /* 2b. If dynamic, load rtld into child VSpace */
+    struct elf_load_result rtld_result;
+    rtld_result.entry = 0;
+    rtld_result.base = 0;
+    rtld_result.brk = 0;
+
+    if (is_dynamic) {
+        const char *rtld_name = "ld-salty.so";
+        const char *interp = elf_get_interp(entry.data, entry.data_len);
+        if (interp && interp[0]) {
+            const char *last = interp;
+            const char *p = interp;
+            while (*p) {
+                if (*p == '/')
+                    last = p + 1;
+                p++;
+            }
+            if (*last)
+                rtld_name = last;
+        }
+
+        struct cpio_entry rtld_entry;
+        if (!cpio_find_file(initrd, initrd_size, rtld_name, &rtld_entry)) {
+            salty_serial_puts("[INIT] rtld not found in initrd: ");
+            salty_serial_puts(rtld_name);
+            salty_serial_puts("\n");
+            return -1;
+        }
+
+        err = elf_load(rtld_entry.data, rtld_entry.data_len,
+                       CHILD_RTLD_VADDR, &loader_ctx, &rtld_result);
+        if (err != 0) {
+            salty_serial_puts("[INIT] rtld ELF load failed err=");
+            salty_serial_hex((uint64_t)err);
+            salty_serial_puts("\n");
+            return -1;
+        }
+
+        salty_serial_puts("[INIT] rtld loaded: entry=");
+        salty_serial_hex(rtld_result.entry);
+        salty_serial_puts(" base=");
+        salty_serial_hex(rtld_result.base);
+        salty_serial_puts("\n");
+    }
+
     /* 3. Map stack pages */
     for (int pg = 0; pg < SRV_STACK_PAGES; pg++) {
         uint64_t page_vaddr = CHILD_STACK_VADDR + (uint64_t)pg * 4096ULL;
@@ -1061,6 +1150,56 @@ static int spawn_static_server(
         return -1;
     }
 
+    /* Map initrd into child VSpace when requested, or always for dynamic ELFs
+     * (rtld needs it to locate shared libraries).
+     */
+    if (map_initrd || is_dynamic) {
+        size_t initrd_pages = (initrd_size + 4095) / 4096;
+        salty_serial_puts("[INIT] Mapping initrd into child (");
+        salty_serial_hex(initrd_pages);
+        salty_serial_puts(" pages)\n");
+
+        for (size_t pg = 0; pg < initrd_pages; pg++) {
+            cap_t fr_slot = loader_ctx.next_frame_slot++;
+            err = salty_untyped_retype(ut, OBJ_FRAME, 0, fr_slot);
+            if (err != 0) {
+                salty_serial_puts("[INIT] initrd frame retype failed\n");
+                return -1;
+            }
+
+            /* Scratch-map in our VSpace, copy initrd data */
+            err = salty_vspace_map(CAP_SELF_VSPACE, fr_slot,
+                                   SCRATCH_VADDR,
+                                   VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER);
+            if (err != 0) {
+                salty_serial_puts("[INIT] initrd scratch map failed\n");
+                return -1;
+            }
+
+            volatile uint8_t *scratch = (volatile uint8_t *)SCRATCH_VADDR;
+            const uint8_t *isrc = initrd + pg * 4096;
+            size_t copy_len = 4096;
+            if (pg * 4096 + copy_len > initrd_size)
+                copy_len = initrd_size - pg * 4096;
+            for (size_t i = 0; i < copy_len; i++)
+                scratch[i] = isrc[i];
+            for (size_t i = copy_len; i < 4096; i++)
+                scratch[i] = 0;
+
+            salty_vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
+
+            /* Map into child VSpace at CHILD_INITRD_VADDR (read-only + user) */
+            err = salty_vspace_map(child_vs, fr_slot,
+                                   CHILD_INITRD_VADDR + pg * 4096,
+                                   VSPACE_FLAG_USER);
+            if (err != 0) {
+                salty_serial_puts("[INIT] initrd child map failed\n");
+                return -1;
+            }
+        }
+        salty_serial_puts("[INIT] Initrd mapped in child VSpace\n");
+    }
+
     /* 4. Copy standard caps into child CNode:
      *   0 = TCB, 1 = VSpace, 2 = CNode, 3 = server EP, 7 = untyped
      */
@@ -1084,6 +1223,10 @@ static int spawn_static_server(
     err = salty_cnode_copy(CAP_SELF_CSPACE, ut,
                            child_cn, 7, CAP_RIGHTS_ALL);
     if (err != 0) {
+        if (is_dynamic) {
+            salty_serial_puts("[INIT] copy Untyped to child failed\n");
+            return -1;
+        }
         salty_serial_puts("[INIT] WARN: copy Untyped to child failed\n");
     }
 
@@ -1102,11 +1245,81 @@ static int spawn_static_server(
     err = salty_tcb_set_space(child_tcb, child_cn, child_vs);
     if (err != 0) { salty_serial_puts("[INIT] TCB set_space failed\n"); return -1; }
 
-    err = salty_tcb_configure(child_tcb, elf_result.entry, SRV_STACK_TOP, 0);
+    uint64_t child_entry = elf_result.entry;
+    uint64_t child_rsp = SRV_STACK_TOP;
+
+    if (is_dynamic) {
+        err = salty_vspace_map(CAP_SELF_VSPACE, child_stk_fr,
+                               SCRATCH_VADDR,
+                               VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER);
+        if (err != 0) {
+            salty_serial_puts("[INIT] dynamic stack scratch map failed\n");
+            return -1;
+        }
+
+        uint64_t phdr_vaddr = 0;
+        uint64_t phent = 0;
+        uint64_t phnum = 0;
+        if (elf_get_phdr_info(entry.data, entry.data_len, CHILD_CODE_VADDR,
+                              &phdr_vaddr, &phent, &phnum) != 0) {
+            salty_serial_puts("[INIT] dynamic phdr info extraction failed\n");
+            salty_vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
+            return -1;
+        }
+
+        const uint64_t srv_auxv_entries = 13;
+        const uint64_t srv_stack_frame_size =
+            3 * 8 + srv_auxv_entries * 2 * 8 + 8; /* 240 bytes, 16-byte aligned */
+
+        volatile uint64_t *stack_base =
+            (volatile uint64_t *)((uint8_t *)SCRATCH_VADDR + 4096 - srv_stack_frame_size);
+
+        size_t idx = 0;
+        stack_base[idx++] = 0; /* argc */
+        stack_base[idx++] = 0; /* argv terminator */
+        stack_base[idx++] = 0; /* envp terminator */
+
+        stack_base[idx++] = AT_PHDR;
+        stack_base[idx++] = phdr_vaddr;
+        stack_base[idx++] = AT_PHENT;
+        stack_base[idx++] = phent;
+        stack_base[idx++] = AT_PHNUM;
+        stack_base[idx++] = phnum;
+        stack_base[idx++] = AT_ENTRY;
+        stack_base[idx++] = elf_result.entry;
+        stack_base[idx++] = AT_BASE;
+        stack_base[idx++] = rtld_result.base;
+        stack_base[idx++] = AT_PAGESZ;
+        stack_base[idx++] = 4096;
+
+        stack_base[idx++] = AT_SALTY_UNTYPED;
+        stack_base[idx++] = CAP_CHILD_UNTYPED_OFFSET;
+        stack_base[idx++] = AT_SALTY_VSPACE;
+        stack_base[idx++] = 1;
+        stack_base[idx++] = AT_SALTY_SCRATCH;
+        stack_base[idx++] = CHILD_SCRATCH_VADDR;
+        stack_base[idx++] = AT_SALTY_INITRD;
+        stack_base[idx++] = CHILD_INITRD_VADDR;
+        stack_base[idx++] = AT_SALTY_INITRD_SZ;
+        stack_base[idx++] = (uint64_t)initrd_size;
+        stack_base[idx++] = AT_SALTY_FRAME_SLOT;
+        stack_base[idx++] = (uint64_t)CHILD_RTLD_FRAME_SLOT_START;
+        stack_base[idx++] = AT_NULL;
+        stack_base[idx++] = 0;
+        stack_base[idx++] = 0; /* padding */
+
+        salty_vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
+
+        child_rsp = SRV_STACK_TOP - srv_stack_frame_size;
+        child_entry = rtld_result.entry;
+    }
+
+    err = salty_tcb_configure(child_tcb, child_entry, child_rsp, 0);
     if (err != 0) { salty_serial_puts("[INIT] TCB configure failed\n"); return -1; }
 
     /* Set child IPC buffer */
-    salty_invoke(child_tcb, TCB_SET_IPC_BUFFER, CHILD_IPC_BUF_VADDR, 0, 0, 0);
+    err = salty_tcb_set_ipc_buffer(child_tcb, CHILD_IPC_BUF_VADDR);
+    if (err != 0) { salty_serial_puts("[INIT] TCB set_ipc_buffer failed\n"); return -1; }
 
     /* Configure scheduling context */
     err = salty_sc_configure(child_sc, 10000, 100000);
@@ -1147,8 +1360,8 @@ static void phase4_spawn_servers(cap_t ut) {
     cap_t console_ep = CAP_CHILD_BASE + 5; /* Console's EP from phase 3 */
 
     /* 1. Spawn nameserv (no extra caps needed beyond standard set) */
-    if (spawn_static_server(ut, CAP_NS_BASE, "nameserv.elf", "nameserv",
-                             (const struct extra_cap_copy *)0, 0) != 0) {
+    if (spawn_server(ut, CAP_NS_BASE, "nameserv.elf", "nameserv",
+                     (const struct extra_cap_copy *)0, 0, 0) != 0) {
         salty_serial_puts("[INIT] FAIL: nameserv spawn failed\n");
         goto idle;
     }
@@ -1156,13 +1369,32 @@ static void phase4_spawn_servers(cap_t ut) {
     /* Let nameserv start up and enter its recv loop */
     salty_yield();
 
-    /* 2. Spawn procmgr (needs nameserv EP at child slot 8) */
+    /* 2. Spawn VFS first (needs console EP + nameserv EP).
+     * VFS must be spawned before procmgr so we can pass the VFS EP
+     * to procmgr directly — avoids nested IPC lookups. */
+    {
+        struct extra_cap_copy vfs_extras[] = {
+            { console_ep, 4 },  /* console EP -> child slot 4 */
+            { ns_ep, 8 },       /* nameserv EP -> child slot 8 */
+        };
+        if (spawn_server(ut, CAP_VFS_BASE, "vfs.elf", "vfs",
+                         vfs_extras, 2, 0) != 0) {
+            salty_serial_puts("[INIT] FAIL: vfs spawn failed\n");
+            goto idle;
+        }
+    }
+
+    /* Let VFS start up and register with nameserv */
+    salty_yield();
+
+    /* 3. Spawn procmgr (needs nameserv EP + VFS EP + initrd mapping) */
     {
         struct extra_cap_copy pm_extras[] = {
-            { ns_ep, 8 },   /* nameserv EP -> child slot 8 */
+            { ns_ep, 8 },       /* nameserv EP -> child slot 8 */
+            { vfs_ep, 9 },      /* VFS EP -> child slot 9 (CAP_VFS_EP) */
         };
-        if (spawn_static_server(ut, CAP_PM_BASE, "procmgr.elf", "procmgr",
-                                 pm_extras, 1) != 0) {
+        if (spawn_server(ut, CAP_PM_BASE, "procmgr.elf", "procmgr",
+                         pm_extras, 2, 1) != 0) {
             salty_serial_puts("[INIT] FAIL: procmgr spawn failed\n");
             goto idle;
         }
@@ -1171,24 +1403,75 @@ static void phase4_spawn_servers(cap_t ut) {
     /* Let procmgr start up */
     salty_yield();
 
-    /* 3. Spawn vfs (needs console EP at child slot 4, nameserv EP at child slot 8) */
-    {
-        struct extra_cap_copy vfs_extras[] = {
-            { console_ep, 4 },  /* console EP -> child slot 4 */
-            { ns_ep, 8 },       /* nameserv EP -> child slot 8 */
-        };
-        if (spawn_static_server(ut, CAP_VFS_BASE, "vfs.elf", "vfs",
-                                 vfs_extras, 2) != 0) {
-            salty_serial_puts("[INIT] FAIL: vfs spawn failed\n");
-            goto idle;
-        }
-    }
-
     salty_serial_puts("[INIT] Phase 4: All servers spawned!\n");
 
-    /* Store server EP caps in init's well-known slots for future use */
+    /* Let all servers finish initialization (register with nameserv, etc.) */
+    for (int i = 0; i < 5; i++) salty_yield();
+
+    /* ================================================================
+     * Phase 5: Test POSIX calls via hello program
+     * ================================================================
+     * Sends PM_SPAWN for "hello" to procmgr, then PM_WAIT to collect
+     * the exit code.
+     */
+    salty_serial_puts("\n[INIT] Phase 5: Spawning hello test program\n");
+
+    {
+        /* PM_SPAWN: "hello" */
+        struct salty_msg spawn_msg, spawn_reply;
+        spawn_msg.label = 1; /* PM_SPAWN */
+        spawn_msg.regs[0] = 5; /* len("hello") */
+        spawn_msg.length = 1 + (uint64_t)((spawn_msg.regs[0] + 7) / 8);
+        const char *hello_name = "hello";
+        uint8_t *hdst = (uint8_t *)&spawn_msg.regs[1];
+        for (int i = 0; i < 5; i++) hdst[i] = (uint8_t)hello_name[i];
+        spawn_msg.regs[2] = 0;
+        spawn_msg.regs[3] = 0;
+
+        int serr = salty_call(pm_ep, &spawn_msg, &spawn_reply);
+        if (serr != 0 || spawn_reply.label != SALTY_OK) {
+            salty_serial_puts("[INIT] FAIL: hello spawn failed err=");
+            salty_serial_hex((uint64_t)serr);
+            salty_serial_puts(" label=");
+            salty_serial_hex(spawn_reply.label);
+            salty_serial_puts("\n");
+            goto idle;
+        }
+
+        uint32_t hello_pid = (uint32_t)spawn_reply.regs[0];
+        salty_serial_puts("[INIT] hello spawned PID=");
+        salty_serial_hex((uint64_t)hello_pid);
+        salty_serial_puts("\n");
+
+        /* PM_WAIT: poll for exit */
+        int exit_code = -1;
+        for (int attempt = 0; attempt < 200; attempt++) {
+            struct salty_msg wait_msg, wait_reply;
+            wait_msg.label = 3; /* PM_WAIT */
+            wait_msg.length = 1;
+            wait_msg.regs[0] = (uint64_t)hello_pid;
+            wait_msg.regs[1] = 0;
+            wait_msg.regs[2] = 0;
+            wait_msg.regs[3] = 0;
+
+            serr = salty_call(pm_ep, &wait_msg, &wait_reply);
+            if (serr != 0) break;
+
+            if (wait_reply.label == SALTY_OK) {
+                exit_code = (int)wait_reply.regs[0];
+                break;
+            }
+            /* SALTY_BUSY = not exited yet, retry */
+            salty_yield();
+        }
+
+        salty_serial_puts("[INIT] hello exited with code ");
+        salty_serial_hex((uint64_t)exit_code);
+        salty_serial_puts("\n");
+        salty_serial_puts("[INIT] Phase 5 PASSED\n");
+    }
+
     (void)ns_ep;
-    (void)pm_ep;
     (void)vfs_ep;
 
 idle:
@@ -1220,7 +1503,7 @@ void _start(void) {
         goto fail;
     }
     salty_invoke(CAP_SELF_TCB, TCB_SET_IPC_BUFFER, IPC_BUF_VADDR, 0, 0, 0);
-    __salty_ipc_buffer = (void *)IPC_BUF_VADDR;
+    salty_ipc_context_init(&__salty_ipc_ctx, (void *)IPC_BUF_VADDR);
     salty_serial_puts("[INIT] IPC buffer mapped at ");
     salty_serial_hex(IPC_BUF_VADDR);
     salty_serial_puts("\n");
@@ -1228,10 +1511,14 @@ void _start(void) {
     /* Phase 1: IPC test */
     if (phase1_ipc_test(ut) != 0)
         goto fail;
+    /* Phase 1 helper thread is no longer needed. */
+    salty_invoke(CAP_TEST_TCB, TCB_SUSPEND, 0, 0, 0, 0);
+    restore_init_ipc_context();
 
     /* Phase 2: Fault handling test */
     if (phase2_fault_test(ut) != 0)
         goto fail;
+    restore_init_ipc_context();
 
     /* Phase 3: Spawn console server (may fail if kernel support not ready) */
     phase3_spawn_console(ut);

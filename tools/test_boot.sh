@@ -113,10 +113,37 @@ check_string() {
     fi
 }
 
+check_regex() {
+    local label="$1"
+    local pattern="$2"
+    if grep -Eq "$pattern" "$LOG_FILE"; then
+        pass "$label"
+    else
+        fail "$label (expected regex: $pattern)"
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
+check_absent() {
+    local label="$1"
+    local pattern="$2"
+    if grep -qF "$pattern" "$LOG_FILE"; then
+        fail "$label (unexpected: \"$pattern\")"
+        FAILURES=$((FAILURES + 1))
+    else
+        pass "$label"
+    fi
+}
+
 check_string "Phase 1: IPC test"       "[INIT] Phase 1 IPC test PASSED"
 check_string "Phase 2: Fault handling"  "[INIT] Phase 2 Fault test PASSED"
 check_string "Phase 3: Console server"  "[INIT] Phase 3 PASSED"
 check_string "Console server started"   "[CONSOLE] SaltyOS console server ready"
+check_string "Phase 5: POSIX hello"     "[INIT] Phase 5 PASSED"
+check_regex  "POSIX hello output"       "\\[HELLO\\] Hello from POSIX! pid=[0-9]+"
+check_absent "Kernel exceptions"        "*** EXCEPTION:"
+check_absent "Page faults"              "#PF Page Fault"
+check_absent "Init failure marker"      "[INIT] FAIL:"
 
 echo ""
 if [[ $FAILURES -eq 0 ]]; then

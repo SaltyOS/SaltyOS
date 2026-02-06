@@ -203,6 +203,46 @@ static inline int elf_write_to_page(
     return 0;
 }
 
+/* Translate an in-image virtual address to a file offset using PT_LOAD
+ * segments. Dynamic entries such as DT_RELA store virtual addresses,
+ * not file offsets.
+ */
+static inline int elf_vaddr_to_file_offset(
+    const uint8_t *data, size_t data_len,
+    const struct elf64_ehdr *ehdr,
+    uint64_t vaddr, size_t *out_off
+) {
+    size_t phdr_base = (size_t)ehdr->e_phoff;
+    size_t phdr_count = ehdr->e_phnum;
+    size_t phdr_size = ehdr->e_phentsize;
+
+    for (size_t i = 0; i < phdr_count; i++) {
+        size_t off = phdr_base + i * phdr_size;
+        if (off + sizeof(struct elf64_phdr) > data_len)
+            break;
+
+        const struct elf64_phdr *phdr =
+            (const struct elf64_phdr *)(data + off);
+        if (phdr->p_type != PT_LOAD)
+            continue;
+        if (vaddr < phdr->p_vaddr)
+            continue;
+
+        uint64_t seg_off = vaddr - phdr->p_vaddr;
+        if (seg_off >= phdr->p_filesz)
+            continue;
+
+        uint64_t file_off = phdr->p_offset + seg_off;
+        if (file_off >= data_len)
+            return -1;
+
+        *out_off = (size_t)file_off;
+        return 0;
+    }
+
+    return -1;
+}
+
 /* Apply RELA relocations for PIE binaries */
 static inline int elf_apply_relocations(
     const uint8_t *data, size_t data_len,
@@ -234,7 +274,7 @@ static inline int elf_apply_relocations(
     if (dyn_offset == 0) return 0; /* No dynamic section */
 
     /* Parse .dynamic entries */
-    uint64_t rela_offset = 0;
+    uint64_t rela_vaddr = 0;
     uint64_t rela_size = 0;
     uint64_t rela_ent = 0;
 
@@ -245,20 +285,27 @@ static inline int elf_apply_relocations(
            pos + sizeof(struct elf64_dyn) <= data_len) {
         const struct elf64_dyn *d = (const struct elf64_dyn *)(data + pos);
         if (d->d_tag == DT_NULL) break;
-        if (d->d_tag == DT_RELA)    rela_offset = d->d_val;
+        if (d->d_tag == DT_RELA)    rela_vaddr = d->d_val;
         if (d->d_tag == DT_RELASZ)  rela_size = d->d_val;
         if (d->d_tag == DT_RELAENT) rela_ent = d->d_val;
         pos += sizeof(struct elf64_dyn);
     }
 
-    if (rela_offset == 0 || rela_size == 0 || rela_ent == 0)
+    if (rela_vaddr == 0 || rela_size == 0 || rela_ent == 0)
         return 0;
 
-    size_t rela_file_offset = (size_t)rela_offset;
+    if (rela_ent < sizeof(struct elf64_rela))
+        return ELF_RELOC_FAILED;
+
+    size_t rela_file_offset = 0;
+    if (elf_vaddr_to_file_offset(data, data_len, ehdr,
+                                 rela_vaddr, &rela_file_offset) != 0)
+        return ELF_RELOC_FAILED;
+
     uint64_t rela_count = rela_size / rela_ent;
 
     for (uint64_t i = 0; i < rela_count; i++) {
-        size_t entry_off = rela_file_offset + (size_t)i * sizeof(struct elf64_rela);
+        size_t entry_off = rela_file_offset + (size_t)i * (size_t)rela_ent;
         if (entry_off + sizeof(struct elf64_rela) > data_len)
             return ELF_RELOC_FAILED;
 

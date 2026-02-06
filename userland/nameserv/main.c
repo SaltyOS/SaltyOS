@@ -15,16 +15,7 @@
  *   3 = server endpoint (clients reach us here)
  */
 
-#define SALTY_STATIC
 #include "salty.h"
-
-/* IPC buffer pointer */
-__attribute__((visibility("hidden")))
-void *__salty_ipc_buffer = (void *)0;
-
-/* Send cap counter */
-__attribute__((visibility("hidden")))
-int __salty_send_cap_count = 0;
 
 /* Cap layout */
 #define CAP_SELF_TCB     0
@@ -165,7 +156,7 @@ void _start(void) {
         salty_serial_puts("\n");
         goto idle;
     }
-    __salty_ipc_buffer = (void *)IPC_BUF_VADDR;
+    salty_ipc_context_init(&__salty_ipc_ctx, (void *)IPC_BUF_VADDR);
 
     salty_serial_puts("[NAMESERV] IPC buffer ready\n");
 

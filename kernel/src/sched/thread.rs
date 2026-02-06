@@ -65,6 +65,12 @@ pub struct Tcb {
     pub cspace_root: *mut CNode,
     /// IPC buffer address
     pub ipc_buffer: u64,
+    /// Cached receive CNode slot for incoming cap transfers
+    pub ipc_receive_cnode: u64,
+    /// Cached receive index for incoming cap transfers
+    pub ipc_receive_index: u64,
+    /// Cached receive depth for incoming cap transfers
+    pub ipc_receive_depth: u64,
     /// Scheduling context
     pub sched_context: *mut SchedContext,
     /// CPU affinity (0xFFFF_FFFF = any CPU, otherwise specific CPU ID)
@@ -182,6 +188,9 @@ impl Tcb {
             vspace_root: core::ptr::null_mut(),
             cspace_root: core::ptr::null_mut(),
             ipc_buffer: 0,
+            ipc_receive_cnode: 0,
+            ipc_receive_index: 0,
+            ipc_receive_depth: 0,
             sched_context: core::ptr::null_mut(),
             cpu_affinity: 0xFFFF_FFFF,
             next: core::ptr::null_mut(),

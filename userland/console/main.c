@@ -8,8 +8,8 @@
 
 #include "salty.h"
 
-/* IPC buffer pointer: defined in libsalty.so, declared extern in salty.h */
-extern void *__salty_ipc_buffer;
+/* IPC buffer setup (pre-mapped by init). */
+#define IPC_BUF_VADDR 0x0000000000200000ULL
 
 /* COM1 register offsets (relative to base 0x3F8) */
 #define COM1_THR  0   /* Transmit Holding Register (write) */
@@ -115,6 +115,10 @@ void _start(void) {
     /* Initialize COM1 via IoPort invocations */
     com1_init();
     com1_puts("[CONSOLE] SaltyOS console server ready\n");
+
+    /* Bind libsalty default context to this thread's IPC buffer. */
+    salty_tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
+    salty_ipc_context_init(&__salty_ipc_ctx, (void *)IPC_BUF_VADDR);
 
     /* Set up IRQ notification: bind notification to IRQ handler */
     salty_irq_handler_set_notification(CAP_IRQ, CAP_NTFN);

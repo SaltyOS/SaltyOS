@@ -1,12 +1,12 @@
-# SaltyOS Name Server Build
+# SaltyOS Hello Test Program Build
 # SPDX-License-Identifier: GPL-2.0-only
 
-nameserv_src = files('main.c')
-nameserv_link = meson.current_source_dir() / 'link.ld'
+hello_src = files('main.c')
+hello_link = meson.current_source_dir() / 'link.ld'
 
-nameserv_elf = custom_target('nameserv_elf',
-    input: [nameserv_src],
-    output: 'nameserv.elf',
+hello_elf = custom_target('hello_elf',
+    input: [hello_src],
+    output: 'hello.elf',
     depends: [libsalty_so, libc_so],
     command: [cc_cmd,
         '-nostdlib', '-nostartfiles', '-ffreestanding',
@@ -15,7 +15,7 @@ nameserv_elf = custom_target('nameserv_elf',
         '-mno-red-zone',
         '-I', meson.project_source_root() / 'lib/libsalty',
         '-I', meson.project_source_root() / 'lib/libc',
-        '-T', nameserv_link,
+        '-T', hello_link,
         '-Wl,--dynamic-linker,/lib/ld-salty.so',
         '-L', meson.project_build_root() / 'lib/libsalty',
         '-L', meson.project_build_root() / 'lib/libc',

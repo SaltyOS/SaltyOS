@@ -8,11 +8,11 @@
 
 #include "salty.h"
 
-/* IPC buffer - exported from libsalty.so, shared by all dynamically linked code */
-void *__salty_ipc_buffer = (void *)0;
-
-/* Send cap counter - tracks how many caps are queued for the next IPC send */
-int __salty_send_cap_count = 0;
+/* Default IPC context for dynamically linked binaries.
+ * Single-threaded services can use this directly; multi-threaded code should
+ * use explicit *_ctx helpers with per-thread contexts.
+ */
+struct salty_ipc_context __salty_ipc_ctx = { 0 };
 
 /* Generic capability invocation */
 struct salty_result salty_invoke(
@@ -28,63 +28,20 @@ struct salty_result salty_invoke(
 
 /* IPC operations */
 int salty_send(cap_t ep, const struct salty_msg *msg) {
-    int caps = __salty_send_cap_count;
-    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
-    __salty_write_overflow(msg);
-    struct salty_result r = salty_syscall(
-        SYS_SEND, ep,
-        info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
-    );
-    if (caps > 0) salty_clear_send_caps();
-    return (int)r.error;
+    return salty_send_ctx(&__salty_ipc_ctx, ep, msg);
 }
 
 int salty_recv(cap_t ep, struct salty_msg *msg, uint64_t *badge) {
-    struct salty_result r = salty_syscall(SYS_RECV, ep, 0, 0, 0, 0, 0);
-    if (r.error == 0) {
-        *badge = r.value;
-        if (msg && __salty_ipc_buffer) {
-            const struct salty_msg *buf = (const struct salty_msg *)__salty_ipc_buffer;
-            *msg = *buf;
-        }
-    }
-    return (int)r.error;
+    return salty_recv_ctx(&__salty_ipc_ctx, ep, msg, badge);
 }
 
 int salty_call(cap_t ep, const struct salty_msg *msg, struct salty_msg *reply) {
-    int caps = __salty_send_cap_count;
-    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
-    __salty_write_overflow(msg);
-    struct salty_result r = salty_syscall(
-        SYS_CALL, ep,
-        info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
-    );
-    if (caps > 0) salty_clear_send_caps();
-    if (r.error == 0 && reply && __salty_ipc_buffer) {
-        const struct salty_msg *buf = (const struct salty_msg *)__salty_ipc_buffer;
-        *reply = *buf;
-    }
-    return (int)r.error;
+    return salty_call_ctx(&__salty_ipc_ctx, ep, msg, reply);
 }
 
 int salty_reply_recv(cap_t ep, const struct salty_msg *reply,
                      struct salty_msg *out_msg, uint64_t *badge) {
-    int caps = __salty_send_cap_count;
-    uint64_t info = SALTY_MSGINFO(reply->label, reply->length, caps);
-    __salty_write_overflow(reply);
-    struct salty_result r = salty_syscall(
-        SYS_REPLY_RECV, ep,
-        info, reply->regs[0], reply->regs[1], reply->regs[2], reply->regs[3]
-    );
-    if (caps > 0) salty_clear_send_caps();
-    if (r.error == 0) {
-        if (badge) *badge = r.value;
-        if (out_msg && __salty_ipc_buffer) {
-            const struct salty_msg *buf = (const struct salty_msg *)__salty_ipc_buffer;
-            *out_msg = *buf;
-        }
-    }
-    return (int)r.error;
+    return salty_reply_recv_ctx(&__salty_ipc_ctx, ep, reply, out_msg, badge);
 }
 
 /* Notification operations */
@@ -237,15 +194,7 @@ int salty_cnode_revoke(cap_t cnode, uint64_t slot) {
 
 /* Non-blocking send */
 int salty_nbsend(cap_t ep, const struct salty_msg *msg) {
-    int caps = __salty_send_cap_count;
-    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
-    __salty_write_overflow(msg);
-    struct salty_result r = salty_syscall(
-        SYS_NBSEND, ep,
-        info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
-    );
-    if (caps > 0) salty_clear_send_caps();
-    return (int)r.error;
+    return salty_nbsend_ctx(&__salty_ipc_ctx, ep, msg);
 }
 
 /* Poll notification without blocking */

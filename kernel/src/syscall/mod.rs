@@ -254,9 +254,10 @@ fn construct_message(
     mr3: u64,
 ) -> Message {
     let label = msg_info::get_label(msg_info);
-    let length = msg_info::get_length(msg_info);
-    let extra_caps = msg_info::get_extra_caps(msg_info);
-    let mut regs = [0u64; 4];
+    let length = msg_info::get_length(msg_info).min(20);
+    let extra_caps = msg_info::get_extra_caps(msg_info).min(4);
+    let mut regs = [0u64; 20];
+    let mut caps = [0u64; 4];
 
     // Copy inline registers based on length (max 4 in registers)
     if length > 0 { regs[0] = mr0; }
@@ -264,7 +265,33 @@ fn construct_message(
     if length > 2 { regs[2] = mr2; }
     if length > 3 { regs[3] = mr3; }
 
-    Message { label, length, extra_caps, regs }
+    // Pull overflow MRs and cap transfer slots from the sender's IPC buffer
+    // while the sender is current (its VSpace is active in CR3).
+    if length > 4 || extra_caps > 0 {
+        unsafe {
+            let scheduler = crate::sched::scheduler::scheduler();
+            let current = scheduler.current();
+            if !current.is_null() {
+                let buf = (*current).ipc_buffer;
+                if buf != 0 {
+                    let ipc_buf = buf as *const crate::ipc::IpcBuffer;
+
+                    if length > 4 {
+                        let overflow = (length - 4).min(16);
+                        for i in 0..overflow {
+                            regs[4 + i] = (*ipc_buf).msg[6 + i];
+                        }
+                    }
+
+                    for i in 0..extra_caps {
+                        caps[i] = (*ipc_buf).caps[i];
+                    }
+                }
+            }
+        }
+    }
+
+    Message { label, length, extra_caps, regs, caps }
 }
 
 /// Write received IPC message to current thread's IPC buffer
@@ -273,7 +300,7 @@ fn construct_message(
 ///   msg[0] = label
 ///   msg[1] = length
 ///   msg[2..5] = regs[0..3]  (inline MRs)
-///   msg[6..21] = regs[4..19] (overflow, already placed by transfer_message)
+///   msg[6..21] = regs[4..19] (overflow)
 ///
 /// Badge is written to ipc_buffer.badge.
 unsafe fn write_msg_to_ipc_buffer(msg: &Message, badge: u64) {
@@ -289,15 +316,24 @@ unsafe fn write_msg_to_ipc_buffer(msg: &Message, badge: u64) {
         (*ipc_buf).msg[0] = msg.label;
         (*ipc_buf).msg[1] = msg.length as u64;
 
+        let reg_count = msg.length.min(20);
+
         // Write inline message registers (MR0-MR3) → msg[2..5]
-        let inline_count = msg.length.min(4);
+        let inline_count = reg_count.min(4);
         for i in 0..inline_count {
             (*ipc_buf).msg[2 + i] = msg.regs[i];
         }
 
+        // Write overflow message registers (MR4-MR19) → msg[6..21]
+        if reg_count > 4 {
+            let overflow_count = (reg_count - 4).min(16);
+            for i in 0..overflow_count {
+                (*ipc_buf).msg[6 + i] = msg.regs[4 + i];
+            }
+        }
+
         // Clear unused slots from end of message to end of regs area
-        // Overflow MR4+ (msg[6..]) is already written by transfer_message
-        let first_clear = if msg.length <= 4 { 2 + msg.length } else { 6 + (msg.length - 4) };
+        let first_clear = if reg_count <= 4 { 2 + reg_count } else { 6 + (reg_count - 4) };
         for i in first_clear.min(22)..22 {
             (*ipc_buf).msg[i] = 0;
         }

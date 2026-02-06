@@ -1,4 +1,4 @@
-/* SaltyOS VFS server - dynamically linked PIE linker script
+/* SaltyOS hello test - dynamically linked PIE linker script
  * SPDX-License-Identifier: GPL-2.0-only
  *
  * Produces ET_DYN (PIE) ELF with base address 0.

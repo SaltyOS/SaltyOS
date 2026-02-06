@@ -24,8 +24,10 @@ pub struct Message {
     pub length: usize,
     /// Number of capabilities to transfer (extracted from msg_info bits 11:7)
     pub extra_caps: usize,
-    /// Message registers (inline fastpath: 4 in registers, overflow via IPC buffer)
-    pub regs: [u64; 4],
+    /// Message registers (MR0..MR19)
+    pub regs: [u64; 20],
+    /// Sender CSpace slot indices for capability transfer (up to 4)
+    pub caps: [u64; 4],
 }
 
 impl Message {
@@ -34,7 +36,8 @@ impl Message {
             label: 0,
             length: 0,
             extra_caps: 0,
-            regs: [0; 4],
+            regs: [0; 20],
+            caps: [0; 4],
         }
     }
 }
@@ -87,12 +90,14 @@ pub enum FaultType {
 ///   regs[2] = faulting RIP
 ///   regs[3] = is_instruction_fault (1 if I/D bit set)
 pub fn vm_fault_message(address: u64, error_code: u64, rip: u64, is_instr: bool) -> Message {
-    Message {
-        label: FaultType::VMFault as u64,
-        length: 4,
-        extra_caps: 0,
-        regs: [address, error_code, rip, is_instr as u64],
-    }
+    let mut msg = Message::empty();
+    msg.label = FaultType::VMFault as u64;
+    msg.length = 4;
+    msg.regs[0] = address;
+    msg.regs[1] = error_code;
+    msg.regs[2] = rip;
+    msg.regs[3] = is_instr as u64;
+    msg
 }
 
 /// Build a UserException message
@@ -104,12 +109,14 @@ pub fn vm_fault_message(address: u64, error_code: u64, rip: u64, is_instr: bool)
 ///   regs[2] = faulting RIP
 ///   regs[3] = faulting RSP
 pub fn user_exception_message(vector: u64, error_code: u64, rip: u64, rsp: u64) -> Message {
-    Message {
-        label: FaultType::UserException as u64,
-        length: 4,
-        extra_caps: 0,
-        regs: [vector, error_code, rip, rsp],
-    }
+    let mut msg = Message::empty();
+    msg.label = FaultType::UserException as u64;
+    msg.length = 4;
+    msg.regs[0] = vector;
+    msg.regs[1] = error_code;
+    msg.regs[2] = rip;
+    msg.regs[3] = rsp;
+    msg
 }
 
 /// Initialize IPC subsystem

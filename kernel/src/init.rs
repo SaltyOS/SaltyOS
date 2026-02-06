@@ -25,8 +25,12 @@ use core::mem::MaybeUninit;
 const INIT_CODE_VADDR: u64 = 0x0000_0040_0000;
 /// User stack virtual address (8 MB)
 const INIT_STACK_VADDR: u64 = 0x0000_0080_0000;
+/// Init user stack size (pages)
+const INIT_STACK_PAGES: usize = 8;
+/// Init user stack size in bytes
+const INIT_STACK_SIZE: u64 = INIT_STACK_PAGES as u64 * PAGE_SIZE as u64;
 /// Top of user stack (stack grows down)
-const INIT_STACK_TOP: u64 = INIT_STACK_VADDR + PAGE_SIZE as u64;
+const INIT_STACK_TOP: u64 = INIT_STACK_VADDR + INIT_STACK_SIZE;
 
 /// Well-known CSpace slot indices (must match userland/init/main.c)
 const CAP_SELF_TCB: usize = 0;
@@ -401,14 +405,17 @@ fn load_from_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) -> (u64, u64) {
     crate::serial_hex(result.brk);
     crate::serial_puts("\n");
 
-    // Allocate user stack
-    let stack_phys = alloc_frame().expect("init: stack alloc failed");
-    unsafe {
-        core::ptr::write_bytes(phys_to_virt(stack_phys) as *mut u8, 0, PAGE_SIZE);
+    // Allocate and map a multi-page user stack
+    for pg in 0..INIT_STACK_PAGES {
+        let stack_phys = alloc_frame().expect("init: stack alloc failed");
+        unsafe {
+            core::ptr::write_bytes(phys_to_virt(stack_phys) as *mut u8, 0, PAGE_SIZE);
+        }
+        let stack_vaddr = INIT_STACK_VADDR + (pg as u64) * PAGE_SIZE as u64;
+        vspace
+            .map(stack_vaddr, stack_phys, PageFlags::USER_RW)
+            .expect("init: stack map failed");
     }
-    vspace
-        .map(INIT_STACK_VADDR, stack_phys, PageFlags::USER_RW)
-        .expect("init: stack map failed");
 
     (result.entry, INIT_STACK_TOP)
 }
@@ -515,15 +522,18 @@ fn load_hardcoded_fallback(vspace: &mut VSpace) -> (u64, u64) {
         .map(INIT_CODE_VADDR, code_phys, PageFlags::USER_RX)
         .expect("init: code map failed");
 
-    // Allocate and map user stack page
-    let stack_phys = alloc_frame().expect("init: stack frame alloc failed");
-    let stack_virt = phys_to_virt(stack_phys) as *mut u8;
-    unsafe {
-        core::ptr::write_bytes(stack_virt, 0, PAGE_SIZE);
+    // Allocate and map a multi-page user stack
+    for pg in 0..INIT_STACK_PAGES {
+        let stack_phys = alloc_frame().expect("init: stack frame alloc failed");
+        let stack_virt = phys_to_virt(stack_phys) as *mut u8;
+        unsafe {
+            core::ptr::write_bytes(stack_virt, 0, PAGE_SIZE);
+        }
+        let stack_vaddr = INIT_STACK_VADDR + (pg as u64) * PAGE_SIZE as u64;
+        vspace
+            .map(stack_vaddr, stack_phys, PageFlags::USER_RW)
+            .expect("init: stack map failed");
     }
-    vspace
-        .map(INIT_STACK_VADDR, stack_phys, PageFlags::USER_RW)
-        .expect("init: stack map failed");
 
     (INIT_CODE_VADDR, INIT_STACK_TOP)
 }
