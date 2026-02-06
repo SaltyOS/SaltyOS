@@ -254,6 +254,22 @@ fn construct_message(
     Message { label: msg_info, regs }
 }
 
+/// Write received IPC message to current thread's IPC buffer
+///
+/// The IPC buffer is a user-mapped page whose virtual address is stored
+/// in the TCB. The kernel writes the Message struct directly to this page.
+unsafe fn write_msg_to_ipc_buffer(msg: &Message) {
+    unsafe {
+        let scheduler = crate::sched::scheduler::scheduler();
+        let current = scheduler.current();
+        if current.is_null() { return; }
+        let buf = (*current).ipc_buffer;
+        if buf == 0 { return; }
+        let ptr = buf as *mut Message;
+        core::ptr::write(ptr, *msg);
+    }
+}
+
 /// Send message to endpoint (blocks until receiver ready)
 fn syscall_send(
     cap_ptr: u64,
@@ -295,7 +311,8 @@ fn syscall_recv(cap_ptr: u64) -> SyscallResult {
 
     unsafe {
         let endpoint = &mut *(cap.object as *mut Endpoint);
-        let (_msg, badge) = endpoint.recv();
+        let (msg, badge) = endpoint.recv();
+        write_msg_to_ipc_buffer(&msg);
         SyscallResult::ok(badge)
     }
 }
@@ -322,7 +339,8 @@ fn syscall_call(
 
     unsafe {
         let endpoint = &mut *(cap.object as *mut Endpoint);
-        endpoint.call(&msg, cap.badge);
+        let reply_msg = endpoint.call(&msg, cap.badge);
+        write_msg_to_ipc_buffer(&reply_msg);
     }
 
     SyscallResult::ok(0)
@@ -350,7 +368,8 @@ fn syscall_reply_recv(
 
     unsafe {
         let endpoint = &mut *(cap.object as *mut Endpoint);
-        let (_msg, badge) = endpoint.reply_recv(&reply);
+        let (msg, badge) = endpoint.reply_recv(&reply);
+        write_msg_to_ipc_buffer(&msg);
         SyscallResult::ok(badge)
     }
 }
@@ -484,7 +503,10 @@ fn syscall_invoke(
             SyscallResult::ok(0)
         }
         (ObjectType::CNode, 0x14) => {
-            // CNode_Delete
+            // CNode_Delete — require WRITE right
+            if !cap.has_right(CapRights::WRITE) {
+                return SyscallResult::err(SyscallError::InsufficientRights);
+            }
             unsafe {
                 let cnode = &mut *(cap.object as *mut CNode);
                 match cnode.delete(arg0 as usize) {
@@ -495,7 +517,10 @@ fn syscall_invoke(
             SyscallResult::ok(0)
         }
         (ObjectType::CNode, 0x15) => {
-            // CNode_Revoke
+            // CNode_Revoke — require WRITE right
+            if !cap.has_right(CapRights::WRITE) {
+                return SyscallResult::err(SyscallError::InsufficientRights);
+            }
             unsafe {
                 let cnode = &mut *(cap.object as *mut CNode);
                 match cnode.revoke(arg0 as usize) {
@@ -786,11 +811,11 @@ fn syscall_sc_yield_to(cap: &Capability, target_sc_cap_ptr: u64) -> SyscallResul
         target_sc.remaining += current_sc.remaining;
         current_sc.remaining = 0;
 
-        // Block the current thread and reschedule
+        // Re-enqueue current thread and reschedule
         let scheduler = crate::sched::scheduler::scheduler();
         let current_tcb = scheduler.current();
         if !current_tcb.is_null() {
-            (*current_tcb).state = ThreadState::Blocked;
+            scheduler.enqueue(current_tcb);
             scheduler.reschedule();
         }
     }
@@ -1615,7 +1640,7 @@ pub fn handle(
 ///
 /// # ABI Note
 /// System V AMD64 calling convention:
-/// - Arguments: RDI, RSI, RDX, RCX, R8, R9
+/// - Arguments: RDI, RSI, RDX, RCX, R8, R9, then stack
 /// - Returns struct { u64, u64 } in RAX:RDX
 ///
 /// Assembly maps user registers → System V before calling:
@@ -1625,6 +1650,7 @@ pub fn handle(
 ///   RCX = arg1 (user RDX / arg2 in user convention)
 ///   R8  = arg2 (user R10 / arg3 in user convention)
 ///   R9  = arg3 (user R8 / arg4 in user convention)
+///   stack = arg4 (user R9 / arg5 in user convention)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn syscall_handle_rust(
     syscall: u64, // RDI (user RAX)
@@ -1633,6 +1659,7 @@ pub unsafe extern "C" fn syscall_handle_rust(
     arg1: u64,    // RCX (user RDX)
     arg2: u64,    // R8  (user R10)
     arg3: u64,    // R9  (user R8)
+    arg4: u64,    // stack (user R9)
 ) -> SyscallResult {
-    handle(syscall, cap_ptr, arg0, arg1, arg2, arg3, 0)
+    handle(syscall, cap_ptr, arg0, arg1, arg2, arg3, arg4)
 }

@@ -334,7 +334,6 @@ unsafe fn create_untyped_caps(cnode: &mut CNode, _info: &ParsedBootInfo) {
         crate::serial_puts(")\n");
 
         ut_index += 1;
-        break;
     }
 
     if ut_index == 0 {

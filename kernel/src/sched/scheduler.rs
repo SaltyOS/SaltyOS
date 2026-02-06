@@ -45,11 +45,14 @@ impl Scheduler {
             .store(0, core::sync::atomic::Ordering::Release);
     }
 
-    /// Add thread to ready queue (sorted by deadline)
+    // ---------------------------------------------------------------
+    // Unlocked queue operations (caller must hold lock + IRQs disabled)
+    // ---------------------------------------------------------------
+
+    /// Add thread to ready queue (sorted by deadline) — unlocked variant.
     ///
-    /// If the thread has a specific CPU affinity and the target CPU is idle,
-    /// sends a Reschedule IPI to wake that CPU.
-    pub fn enqueue(&mut self, tcb: *mut Tcb) {
+    /// Caller MUST hold the scheduler lock.
+    pub fn enqueue_unlocked(&mut self, tcb: *mut Tcb) {
         unsafe {
             (*tcb).state = ThreadState::Ready;
 
@@ -85,8 +88,10 @@ impl Scheduler {
         }
     }
 
-    /// Remove highest priority (earliest deadline) thread
-    pub fn dequeue(&mut self) -> Option<*mut Tcb> {
+    /// Remove highest priority (earliest deadline) thread — unlocked variant.
+    ///
+    /// Caller MUST hold the scheduler lock.
+    pub fn dequeue_unlocked(&mut self) -> Option<*mut Tcb> {
         if self.ready_head.is_null() {
             None
         } else {
@@ -99,11 +104,10 @@ impl Scheduler {
         }
     }
 
-    /// Remove highest priority thread that can run on the given CPU
+    /// Remove highest priority thread for a CPU — unlocked variant.
     ///
-    /// Walks the ready queue and finds the first thread whose affinity
-    /// matches the target CPU (affinity == 0xFFFF_FFFF means any CPU).
-    pub fn dequeue_for_cpu(&mut self, cpu_id: usize) -> Option<*mut Tcb> {
+    /// Caller MUST hold the scheduler lock.
+    pub fn dequeue_for_cpu_unlocked(&mut self, cpu_id: usize) -> Option<*mut Tcb> {
         unsafe {
             let mut prev: *mut Tcb = core::ptr::null_mut();
             let mut current = self.ready_head;
@@ -127,11 +131,10 @@ impl Scheduler {
         }
     }
 
-    /// Remove a specific thread from the ready queue
+    /// Remove a specific thread from the ready queue — unlocked variant.
     ///
-    /// Walks the queue and removes the TCB if found.
-    /// Returns true if the thread was found and removed.
-    pub fn remove_from_ready_queue(&mut self, tcb: *mut Tcb) -> bool {
+    /// Caller MUST hold the scheduler lock.
+    pub fn remove_from_ready_queue_unlocked(&mut self, tcb: *mut Tcb) -> bool {
         unsafe {
             let mut prev: *mut Tcb = core::ptr::null_mut();
             let mut current = self.ready_head;
@@ -152,10 +155,62 @@ impl Scheduler {
         }
     }
 
-    /// Pick next thread to run on the current CPU
-    pub fn schedule(&mut self) -> *mut Tcb {
+    // ---------------------------------------------------------------
+    // Locking wrapper methods (for external callers without lock held)
+    // ---------------------------------------------------------------
+
+    /// Add thread to ready queue with IRQ-safe locking.
+    ///
+    /// Acquires the scheduler spinlock with IRQs disabled.
+    /// External callers (syscall, IPC, init) should use this.
+    pub fn enqueue(&mut self, tcb: *mut Tcb) {
+        let irq_flag = unsafe { crate::mm::save_irq_disable() };
+        self.lock();
+        self.enqueue_unlocked(tcb);
+        self.unlock();
+        unsafe { crate::mm::restore_irq(irq_flag) };
+    }
+
+    /// Remove highest priority thread with IRQ-safe locking.
+    pub fn dequeue(&mut self) -> Option<*mut Tcb> {
+        let irq_flag = unsafe { crate::mm::save_irq_disable() };
+        self.lock();
+        let result = self.dequeue_unlocked();
+        self.unlock();
+        unsafe { crate::mm::restore_irq(irq_flag) };
+        result
+    }
+
+    /// Remove highest priority thread for a CPU with IRQ-safe locking.
+    pub fn dequeue_for_cpu(&mut self, cpu_id: usize) -> Option<*mut Tcb> {
+        let irq_flag = unsafe { crate::mm::save_irq_disable() };
+        self.lock();
+        let result = self.dequeue_for_cpu_unlocked(cpu_id);
+        self.unlock();
+        unsafe { crate::mm::restore_irq(irq_flag) };
+        result
+    }
+
+    /// Remove a specific thread from the ready queue with IRQ-safe locking.
+    pub fn remove_from_ready_queue(&mut self, tcb: *mut Tcb) -> bool {
+        let irq_flag = unsafe { crate::mm::save_irq_disable() };
+        self.lock();
+        let result = self.remove_from_ready_queue_unlocked(tcb);
+        self.unlock();
+        unsafe { crate::mm::restore_irq(irq_flag) };
+        result
+    }
+
+    // ---------------------------------------------------------------
+    // Schedule decision (unlocked — caller must hold lock)
+    // ---------------------------------------------------------------
+
+    /// Pick next thread to run on the current CPU — unlocked variant.
+    ///
+    /// Caller MUST hold the scheduler lock.
+    fn schedule_unlocked(&mut self) -> *mut Tcb {
         let cpu_id = crate::arch::current_cpu() as usize;
-        if let Some(tcb) = self.dequeue_for_cpu(cpu_id) {
+        if let Some(tcb) = self.dequeue_for_cpu_unlocked(cpu_id) {
             unsafe {
                 (*tcb).state = ThreadState::Running;
             }
@@ -208,21 +263,63 @@ impl Scheduler {
         }
     }
 
-    /// Handle timer tick - called from interrupt context
+    // ---------------------------------------------------------------
+    // Context switch helpers
+    // ---------------------------------------------------------------
+
+    /// Perform the actual context switch (VSpace, kernel stack, registers).
     ///
-    /// Decrements the current thread's budget and handles budget exhaustion.
-    /// Also checks for preemption if a higher priority thread is ready.
+    /// MUST be called WITHOUT the scheduler lock held — context_switch does
+    /// not return until the old thread is re-scheduled.
+    unsafe fn do_context_switch(&mut self, old_tcb: *mut Tcb, new_tcb: *mut Tcb) {
+        unsafe {
+            // Switch to the target thread's user VSpace
+            if !(*new_tcb).vspace_root.is_null() {
+                let vspace = &*(*new_tcb).vspace_root;
+                if !vspace.switch_to() {
+                    crate::serial_puts("[SCHED] WARN: VSpace switch failed\n");
+                }
+            }
+
+            // Switch per-CPU kernel stack
+            if (*new_tcb).kernel_stack_top != 0 {
+                crate::arch::set_kernel_stack((*new_tcb).kernel_stack_top);
+                crate::arch::set_tss_rsp0((*new_tcb).kernel_stack_top);
+            }
+
+            // Perform context switch
+            let old_ctx = &mut (*old_tcb).context as *mut _;
+            let new_ctx = &(*new_tcb).context as *const _;
+            crate::arch::context_switch(old_ctx, new_ctx);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Timer tick (acquires lock internally)
+    // ---------------------------------------------------------------
+
+    /// Handle timer tick — called from interrupt context.
+    ///
+    /// Acquires the scheduler lock, performs budget accounting, and if a
+    /// context switch is needed, releases the lock before switching.
     pub fn timer_tick(&mut self) {
+        let irq_flag = unsafe { crate::mm::save_irq_disable() };
+        self.lock();
+
         unsafe {
             let cpu_id = crate::arch::current_cpu() as usize;
             let current = self.current[cpu_id];
 
             if current.is_null() {
+                self.unlock();
+                crate::mm::restore_irq(irq_flag);
                 return;
             }
 
             let sched_ctx = (*current).sched_context;
             if sched_ctx.is_null() {
+                self.unlock();
+                crate::mm::restore_irq(irq_flag);
                 return;
             }
 
@@ -234,24 +331,43 @@ impl Scheduler {
 
             // Check if budget exhausted
             if (*sched_ctx).remaining == 0 {
-                self.handle_budget_exhausted(current);
+                self.handle_budget_exhausted_unlocked(current);
+                // handle_budget_exhausted_unlocked enqueued + made schedule decision
+                // Check if switch is needed
+                let new_tcb = self.schedule_unlocked();
+                let old_tcb = current;
+                if old_tcb != new_tcb {
+                    self.set_current(new_tcb);
+                    self.unlock();
+                    crate::mm::restore_irq(irq_flag);
+                    self.do_context_switch(old_tcb, new_tcb);
+                    return;
+                }
             }
             // Check for preemption (earlier deadline ready)
             else if self.needs_reschedule() {
                 // Put current back in ready queue
-                self.enqueue(current);
-                self.reschedule();
+                self.enqueue_unlocked(current);
+                let new_tcb = self.schedule_unlocked();
+                let old_tcb = current;
+                if old_tcb != new_tcb {
+                    self.set_current(new_tcb);
+                    self.unlock();
+                    crate::mm::restore_irq(irq_flag);
+                    self.do_context_switch(old_tcb, new_tcb);
+                    return;
+                }
             }
         }
+
+        self.unlock();
+        unsafe { crate::mm::restore_irq(irq_flag) };
     }
 
-    /// Handle budget exhaustion for a thread
+    /// Handle budget exhaustion for a thread — unlocked variant.
     ///
-    /// When a thread's budget is exhausted:
-    /// - Periodic (period > 0): advance deadline by period, replenish, re-enqueue
-    /// - Sporadic (period == 0): set deadline to u64::MAX (lowest EDF priority),
-    ///   replenish, re-enqueue
-    fn handle_budget_exhausted(&mut self, tcb: *mut Tcb) {
+    /// Caller MUST hold the scheduler lock.
+    fn handle_budget_exhausted_unlocked(&mut self, tcb: *mut Tcb) {
         unsafe {
             let sched_ctx = (*tcb).sched_context;
             if sched_ctx.is_null() {
@@ -273,58 +389,48 @@ impl Scheduler {
             (*sched_ctx).remaining = (*sched_ctx).budget;
 
             // Re-enqueue thread (enqueue sets state = Ready)
-            self.enqueue(tcb);
-
-            // Trigger reschedule
-            self.reschedule();
+            self.enqueue_unlocked(tcb);
         }
     }
 
-    /// Perform a context switch to the next thread
+    // ---------------------------------------------------------------
+    // Reschedule (acquires lock, then drops before context switch)
+    // ---------------------------------------------------------------
+
+    /// Perform a context switch to the next thread.
     ///
-    /// This function is called when:
-    /// - The current thread's budget is exhausted
-    /// - A higher priority thread becomes ready
-    /// - The current thread yields
+    /// Acquires the scheduler lock for the scheduling decision, then
+    /// releases it before performing the actual context switch.
     pub fn reschedule(&mut self) {
+        let irq_flag = unsafe { crate::mm::save_irq_disable() };
+        self.lock();
+
         unsafe {
             let cpu_id = crate::arch::current_cpu() as usize;
             let old_tcb = self.current[cpu_id];
-            let new_tcb = self.schedule();
+            let new_tcb = self.schedule_unlocked();
 
             if old_tcb == new_tcb {
                 // No switch needed
+                self.unlock();
+                crate::mm::restore_irq(irq_flag);
                 return;
             }
 
             // Update current pointer
             self.set_current(new_tcb);
 
-            // Switch to the target thread's user VSpace before restoring
-            // its CPU context. Without this, context switches between user
-            // threads can continue running on the previous thread's CR3.
-            if !(*new_tcb).vspace_root.is_null() {
-                let vspace = &*(*new_tcb).vspace_root;
-                if !vspace.switch_to() {
-                    crate::serial_puts("[SCHED] WARN: VSpace switch failed\n");
-                }
-            }
+            // Release lock before context switch
+            self.unlock();
+            crate::mm::restore_irq(irq_flag);
 
-            // Switch per-CPU kernel stack to new thread's kernel stack
-            // Both GS:[8] (syscall entry) and TSS RSP0 (interrupt entry from ring 3)
-            // must point to the new thread's kernel stack
-            if (*new_tcb).kernel_stack_top != 0 {
-                crate::arch::set_kernel_stack((*new_tcb).kernel_stack_top);
-                crate::arch::set_tss_rsp0((*new_tcb).kernel_stack_top);
-            }
-
-            // Perform context switch
-            // SAFETY: Both TCBs are valid, interrupts are disabled
-            let old_ctx = &mut (*old_tcb).context as *mut _;
-            let new_ctx = &(*new_tcb).context as *const _;
-            crate::arch::context_switch(old_ctx, new_ctx);
+            self.do_context_switch(old_tcb, new_tcb);
         }
     }
+
+    // ---------------------------------------------------------------
+    // VSpace blocking / wakeup (manages lock internally)
+    // ---------------------------------------------------------------
 
     /// Enqueue thread in VSpace's intrusive wait queue
     ///
@@ -363,7 +469,7 @@ impl Scheduler {
                 (*current).blocked_vspace_tracking = core::ptr::null_mut();
                 (*current).vspace_wait_next = core::ptr::null_mut();
 
-                self.enqueue(current);
+                self.enqueue_unlocked(current);
                 current = next;
             }
         }
@@ -372,15 +478,6 @@ impl Scheduler {
     /// Finish deactivate operation - wake waiters if VSpace became inactive
     ///
     /// CRITICAL: Must be called with scheduler lock held and IRQs disabled!
-    ///
-    /// This is the centralized handler for all "last core exited" cases.
-    /// All callers of `deactivate_nosched()` that get `BecameInactive` MUST
-    /// call this function (with scheduler lock held).
-    ///
-    /// This centralization ensures:
-    /// - Single point for wakeup logic (easier debugging/tracing)
-    /// - Structurally enforced lock requirement
-    /// - Consistent handling across all code paths
     pub fn finish_deactivate(&mut self, tracking: &crate::mm::VSpaceTracking) {
         self.wakeup_vspace_waiters_locked(tracking);
     }
@@ -389,15 +486,6 @@ impl Scheduler {
     ///
     /// CRITICAL: This function may call reschedule() which performs context switch.
     /// The function manages IRQ state internally - do NOT wrap with with_lock().
-    ///
-    /// Use this instead of with_lock() for blocking operations:
-    /// ```rust
-    /// scheduler.block_current_on_vspace(tracking);
-    /// ```
-    ///
-    /// This forms one half of the "structurally-enforced shared lock" pattern.
-    /// The other half is `finish_deactivate()`, which handles wakeup when
-    /// deactivate_nosched() returns `BecameInactive`.
     pub fn block_current_on_vspace(&mut self, tracking: &crate::mm::VSpaceTracking) {
         // Take scheduler lock and disable IRQs
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
@@ -422,57 +510,34 @@ impl Scheduler {
             // Add to VSpace's intrusive wait queue
             self.enqueue_vspace_waiter_locked(tracking, current);
 
-            // Context switch - reschedule() handles lock release and IRQ restore
-            // NOTE: reschedule() will NOT return here until this thread is scheduled again
-            self.reschedule_with_irq_restore(irq_flag);
-        }
+            // Make schedule decision while still holding lock
+            let new_tcb = self.schedule_unlocked();
+            let old_tcb = current;
 
-        // When we return here, IRQ state has been restored by reschedule_with_irq_restore
-    }
-
-    /// Reschedule with IRQ state management (internal, for blocking operations)
-    ///
-    /// This is called by blocking functions like `block_current_on_vspace()`.
-    /// It handles context switch and ensures IRQ state is properly restored
-    /// when the thread resumes.
-    ///
-    /// # Safety
-    /// Must be called with scheduler lock held and IRQs disabled.
-    /// irq_flag is the saved interrupt flag to restore when thread resumes.
-    unsafe fn reschedule_with_irq_restore(&mut self, irq_flag: u64) {
-        unsafe {
-            // Release scheduler lock
+            // Release lock before context switch
             self.unlock();
 
-            // Perform context switch
-            // When we return here (thread resumed), restore IRQ state
-            self.reschedule();
+            if old_tcb != new_tcb {
+                self.set_current(new_tcb);
+                self.do_context_switch(old_tcb, new_tcb);
+            }
 
             // Thread resumed - restore IRQ state
             crate::mm::restore_irq(irq_flag);
         }
     }
 
+    // ---------------------------------------------------------------
+    // Kernel exit epilogue
+    // ---------------------------------------------------------------
+
     /// Kernel exit epilogue - MUST be called from ALL kernel exit points
-    ///
-    /// **STRUCTURALLY ENFORCED**: This function MUST be called from:
-    /// 1. Context switch paths (before/after thread switch)
-    /// 2. Scheduler lock acquisition points (when taking lock for non-blocking operations)
-    /// 3. Timer tick handler (which already holds scheduler lock)
-    ///
-    /// IMPORTANT: Do NOT call from arbitrary interrupt return paths!
-    /// Only call from contexts that already safely interact with scheduler.
-    ///
-    /// This is automatically called by `with_lock()` - no manual call needed for most cases.
     ///
     /// # Safety
     /// Must be called with scheduler lock held and IRQs disabled.
     fn kernel_exit_epilogue(&mut self) {
         // Process pending VSpace deactivates
         self.process_pending_deactivates();
-
-        // Future: add other "must-run" epilogue tasks here
-        // e.g., deferred work, signal handling, etc.
     }
 
     /// Process pending deactivates (internal, called by kernel_exit_epilogue)
@@ -500,7 +565,6 @@ impl Scheduler {
         }
 
         // Always advance quiescent generation - we passed a safe point
-        // This signals to deferred free that this CPU processed pending
         crate::mm::advance_quiescent_gen(cpu_id);
     }
 

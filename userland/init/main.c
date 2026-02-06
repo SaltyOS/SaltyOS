@@ -28,11 +28,15 @@
 #define CAP_TEST_TCB        129
 #define CAP_TEST_SC         130
 
+/* IPC buffer caps */
+#define CAP_IPC_BUF_FRAME   131
+#define CAP_IPC_BUF2_FRAME  132
+
 /* Phase 2: Fault handling caps */
-#define CAP_FAULT_EP        131
-#define CAP_FAULT_TCB       132
-#define CAP_FAULT_SC        133
-#define CAP_FAULT_FRAME     134
+#define CAP_FAULT_EP        133
+#define CAP_FAULT_TCB       134
+#define CAP_FAULT_SC        135
+#define CAP_FAULT_FRAME     136
 
 /* Phase 3+4: Process manager dynamic caps
  * We allocate from slot 200+ for child process objects */
@@ -45,6 +49,14 @@
 #define CAP_CHILD_EP        (CAP_CHILD_BASE + 5)  /* Endpoint for console */
 /* ELF loader will use cap slots starting at CAP_CHILD_BASE + 16 for frames */
 #define CAP_CHILD_FRAME_START (CAP_CHILD_BASE + 16)
+
+/* IPC buffer addresses */
+#define IPC_BUF_VADDR       0x0000000000200000ULL  /* 2 MB - init's IPC buffer */
+#define IPC_BUF2_VADDR      0x0000000000201000ULL  /* 2 MB + 4K - thread2's IPC buffer */
+
+/* IPC buffer pointer (referenced by salty.h) */
+__attribute__((visibility("hidden")))
+void *__salty_ipc_buffer = (void *)0;
 
 /* Unmapped user address for fault test (1GB, page-aligned) */
 #define FAULT_TEST_ADDR     0x40000000ULL
@@ -63,6 +75,7 @@ static uint8_t fault_handler_stack[4096] __attribute__((aligned(4096)));
 
 /* Thread 2 entry point: receives a message from the endpoint */
 static void thread2_entry(void) {
+    __salty_ipc_buffer = (void *)IPC_BUF2_VADDR;
     salty_serial_puts("[THREAD2] started, waiting on endpoint\n");
 
     struct salty_msg msg;
@@ -191,6 +204,19 @@ static int phase1_ipc_test(cap_t ut) {
     salty_serial_puts(" rsp=");
     salty_serial_hex(t2_rsp);
     salty_serial_puts("\n");
+
+    /* 5b. Set up IPC buffer for thread2 */
+    err = salty_untyped_retype(ut, OBJ_FRAME, 0, CAP_IPC_BUF2_FRAME);
+    if (err != 0) {
+        salty_serial_puts("[INIT] WARN: thread2 IPC buf frame retype err\n");
+    } else {
+        err = salty_vspace_map(CAP_SELF_VSPACE, CAP_IPC_BUF2_FRAME,
+                               IPC_BUF2_VADDR,
+                               VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER);
+        if (err == 0) {
+            salty_invoke(CAP_TEST_TCB, TCB_SET_IPC_BUFFER, IPC_BUF2_VADDR, 0, 0, 0);
+        }
+    }
 
     /* 6. Configure and bind scheduling context */
     err = salty_sc_configure(CAP_TEST_SC, 10000, 100000);
@@ -634,6 +660,26 @@ void _start(void) {
 
     /* Find a usable untyped memory region */
     cap_t ut = CAP_UNTYPED_START;
+    int err;
+
+    /* Set up IPC buffer for init */
+    err = salty_untyped_retype(ut, OBJ_FRAME, 0, CAP_IPC_BUF_FRAME);
+    if (err != 0) {
+        salty_serial_puts("[INIT] FAIL: IPC buf frame retype\n");
+        goto fail;
+    }
+    err = salty_vspace_map(CAP_SELF_VSPACE, CAP_IPC_BUF_FRAME,
+                           IPC_BUF_VADDR,
+                           VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER);
+    if (err != 0) {
+        salty_serial_puts("[INIT] FAIL: IPC buf map\n");
+        goto fail;
+    }
+    salty_invoke(CAP_SELF_TCB, TCB_SET_IPC_BUFFER, IPC_BUF_VADDR, 0, 0, 0);
+    __salty_ipc_buffer = (void *)IPC_BUF_VADDR;
+    salty_serial_puts("[INIT] IPC buffer mapped at ");
+    salty_serial_hex(IPC_BUF_VADDR);
+    salty_serial_puts("\n");
 
     /* Phase 1: IPC test */
     if (phase1_ipc_test(ut) != 0)

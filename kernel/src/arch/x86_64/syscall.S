@@ -80,9 +80,16 @@ syscall_entry:
     # --------------------------------------------------------------------------
     # Handler Call
     # --------------------------------------------------------------------------
-    # Stack is already 16-byte aligned (128 bytes pushed), no padding needed.
+    # 7th argument (User R9) on stack for syscall_handle_rust.
+    # User R9 was saved at RSP+64 (9th push from top). After sub $16,
+    # it shifts to RSP+80. We use r10 as scratch (already remapped to r8).
+    sub  $16, %rsp
+    mov  80(%rsp), %r10
+    mov  %r10, (%rsp)
 
     call syscall_handle_rust
+
+    add  $16, %rsp
 
     # --------------------------------------------------------------------------
     # Return Value Handling

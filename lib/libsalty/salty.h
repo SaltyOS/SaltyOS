@@ -83,6 +83,9 @@
 #define CAP_COM1_NTFN             10
 #define CAP_CONSOLE_EP            11
 
+/* IPC buffer pointer - set by init to point at mapped IPC buffer page */
+extern void *__salty_ipc_buffer __attribute__((visibility("hidden")));
+
 /* Initrd mapping address (16 MB) */
 #define INITRD_VADDR              0x0000000001000000ULL
 
@@ -162,18 +165,20 @@ static inline struct salty_result salty_syscall(
     uint64_t arg1,
     uint64_t arg2,
     uint64_t arg3,
-    uint64_t arg4
+    uint64_t arg4,
+    uint64_t arg5
 ) {
     struct salty_result result;
     register uint64_t r10 __asm__("r10") = arg3;
     register uint64_t r8  __asm__("r8")  = arg4;
+    register uint64_t r9  __asm__("r9")  = arg5;
 
     __asm__ volatile(
         "syscall"
         : "=a"(result.error), "=d"(result.value)
         : "a"(syscall), "D"(arg0), "S"(arg1), "d"(arg2),
-          "r"(r10), "r"(r8)
-        : "rcx", "r11", "r9", "memory"
+          "r"(r10), "r"(r8), "r"(r9)
+        : "rcx", "r11", "memory"
     );
 
     return result;
@@ -183,15 +188,17 @@ static inline struct salty_result salty_syscall(
 static inline int salty_send(cap_t ep, const struct salty_msg *msg) {
     struct salty_result r = salty_syscall(
         SYS_SEND, ep,
-        msg->label, msg->regs[0], msg->regs[1], msg->regs[2]
+        msg->label, msg->regs[0], msg->regs[1], msg->regs[2], 0
     );
     return (int)r.error;
 }
 
 static inline int salty_recv(cap_t ep, struct salty_msg *msg, uint64_t *badge) {
-    struct salty_result r = salty_syscall(SYS_RECV, ep, 0, 0, 0, 0);
+    struct salty_result r = salty_syscall(SYS_RECV, ep, 0, 0, 0, 0, 0);
     if (r.error == 0) {
         *badge = r.value;
+        if (msg && __salty_ipc_buffer)
+            *msg = *(struct salty_msg *)__salty_ipc_buffer;
     }
     return (int)r.error;
 }
@@ -199,9 +206,10 @@ static inline int salty_recv(cap_t ep, struct salty_msg *msg, uint64_t *badge) {
 static inline int salty_call(cap_t ep, const struct salty_msg *msg, struct salty_msg *reply) {
     struct salty_result r = salty_syscall(
         SYS_CALL, ep,
-        msg->label, msg->regs[0], msg->regs[1], msg->regs[2]
+        msg->label, msg->regs[0], msg->regs[1], msg->regs[2], 0
     );
-    (void)reply;
+    if (r.error == 0 && reply && __salty_ipc_buffer)
+        *reply = *(struct salty_msg *)__salty_ipc_buffer;
     return (int)r.error;
 }
 
@@ -210,29 +218,30 @@ static inline int salty_reply_recv(cap_t ep, const struct salty_msg *reply,
                                     struct salty_msg *out_msg, uint64_t *badge) {
     struct salty_result r = salty_syscall(
         SYS_REPLY_RECV, ep,
-        reply->label, reply->regs[0], reply->regs[1], reply->regs[2]
+        reply->label, reply->regs[0], reply->regs[1], reply->regs[2], 0
     );
-    if (r.error == 0 && badge) {
-        *badge = r.value;
+    if (r.error == 0) {
+        if (badge) *badge = r.value;
+        if (out_msg && __salty_ipc_buffer)
+            *out_msg = *(struct salty_msg *)__salty_ipc_buffer;
     }
-    (void)out_msg;
     return (int)r.error;
 }
 
 /* Notification operations */
 static inline int salty_signal(cap_t ntfn, uint64_t bits) {
-    struct salty_result r = salty_syscall(SYS_SIGNAL, ntfn, bits, 0, 0, 0);
+    struct salty_result r = salty_syscall(SYS_SIGNAL, ntfn, bits, 0, 0, 0, 0);
     return (int)r.error;
 }
 
 static inline uint64_t salty_wait(cap_t ntfn) {
-    struct salty_result r = salty_syscall(SYS_WAIT, ntfn, 0, 0, 0, 0);
+    struct salty_result r = salty_syscall(SYS_WAIT, ntfn, 0, 0, 0, 0, 0);
     return r.value;
 }
 
 /* Yield CPU */
 static inline void salty_yield(void) {
-    salty_syscall(SYS_YIELD, 0, 0, 0, 0, 0);
+    salty_syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
 }
 
 /* Generic capability invocation helper */
@@ -241,9 +250,10 @@ static inline struct salty_result salty_invoke(
     uint64_t label,
     uint64_t arg0,
     uint64_t arg1,
-    uint64_t arg2
+    uint64_t arg2,
+    uint64_t arg3
 ) {
-    return salty_syscall(SYS_INVOKE, cap, label, arg0, arg1, arg2);
+    return salty_syscall(SYS_INVOKE, cap, label, arg0, arg1, arg2, arg3);
 }
 
 /* ---- Convenience wrappers ---- */
@@ -252,85 +262,85 @@ static inline struct salty_result salty_invoke(
 static inline int salty_untyped_retype(cap_t untyped, uint64_t new_type,
                                        uint64_t size_bits, uint64_t dest_slot) {
     struct salty_result r = salty_invoke(untyped, UNTYPED_RETYPE,
-                                        new_type, size_bits, dest_slot);
+                                        new_type, size_bits, dest_slot, 0);
     return (int)r.error;
 }
 
 /* Configure a TCB's entry point, stack, and IPC buffer */
 static inline int salty_tcb_configure(cap_t tcb, uint64_t rip,
                                       uint64_t rsp, uint64_t ipc_buf) {
-    struct salty_result r = salty_invoke(tcb, TCB_CONFIGURE, rip, rsp, ipc_buf);
+    struct salty_result r = salty_invoke(tcb, TCB_CONFIGURE, rip, rsp, ipc_buf, 0);
     return (int)r.error;
 }
 
 /* Resume (make runnable) a TCB */
 static inline int salty_tcb_resume(cap_t tcb) {
-    struct salty_result r = salty_invoke(tcb, TCB_RESUME, 0, 0, 0);
+    struct salty_result r = salty_invoke(tcb, TCB_RESUME, 0, 0, 0, 0);
     return (int)r.error;
 }
 
 /* Set a TCB's CSpace and VSpace */
 static inline int salty_tcb_set_space(cap_t tcb, cap_t cspace, cap_t vspace) {
-    struct salty_result r = salty_invoke(tcb, TCB_SET_SPACE, cspace, vspace, 0);
+    struct salty_result r = salty_invoke(tcb, TCB_SET_SPACE, cspace, vspace, 0, 0);
     return (int)r.error;
 }
 
 /* Set a TCB's fault handler endpoint */
 static inline int salty_tcb_set_fault_handler(cap_t tcb, cap_t fault_ep) {
-    struct salty_result r = salty_invoke(tcb, TCB_SET_FAULT_HANDLER, fault_ep, 0, 0);
+    struct salty_result r = salty_invoke(tcb, TCB_SET_FAULT_HANDLER, fault_ep, 0, 0, 0);
     return (int)r.error;
 }
 
 /* Configure scheduling context parameters */
 static inline int salty_sc_configure(cap_t sc, uint64_t budget_us,
                                      uint64_t period_us) {
-    struct salty_result r = salty_invoke(sc, SC_CONFIGURE, budget_us, period_us, 0);
+    struct salty_result r = salty_invoke(sc, SC_CONFIGURE, budget_us, period_us, 0, 0);
     return (int)r.error;
 }
 
 /* Bind scheduling context to a TCB */
 static inline int salty_sc_bind(cap_t sc, cap_t tcb) {
-    struct salty_result r = salty_invoke(sc, SC_BIND, tcb, 0, 0);
+    struct salty_result r = salty_invoke(sc, SC_BIND, tcb, 0, 0, 0);
     return (int)r.error;
 }
 
 /* Map a frame into a VSpace */
 static inline int salty_vspace_map(cap_t vspace, cap_t frame,
                                    uint64_t vaddr, uint64_t flags) {
-    struct salty_result r = salty_invoke(vspace, VSPACE_MAP, frame, vaddr, flags);
+    struct salty_result r = salty_invoke(vspace, VSPACE_MAP, frame, vaddr, flags, 0);
     return (int)r.error;
 }
 
 /* Unmap a page from a VSpace */
 static inline int salty_vspace_unmap(cap_t vspace, uint64_t vaddr) {
-    struct salty_result r = salty_invoke(vspace, VSPACE_UNMAP, vaddr, 0, 0);
+    struct salty_result r = salty_invoke(vspace, VSPACE_UNMAP, vaddr, 0, 0, 0);
     return (int)r.error;
 }
 
 /* IoPort operations */
 static inline uint8_t salty_ioport_in8(cap_t ioport, uint64_t offset) {
-    struct salty_result r = salty_invoke(ioport, IOPORT_IN8, offset, 0, 0);
+    struct salty_result r = salty_invoke(ioport, IOPORT_IN8, offset, 0, 0, 0);
     return (uint8_t)r.value;
 }
 
 static inline void salty_ioport_out8(cap_t ioport, uint64_t offset,
                                      uint8_t value) {
-    salty_invoke(ioport, IOPORT_OUT8, offset, (uint64_t)value, 0);
+    salty_invoke(ioport, IOPORT_OUT8, offset, (uint64_t)value, 0, 0);
 }
 
 static inline uint16_t salty_ioport_in16(cap_t ioport, uint64_t offset) {
-    struct salty_result r = salty_invoke(ioport, IOPORT_IN16, offset, 0, 0);
+    struct salty_result r = salty_invoke(ioport, IOPORT_IN16, offset, 0, 0, 0);
     return (uint16_t)r.value;
 }
 
 static inline void salty_ioport_out16(cap_t ioport, uint64_t offset,
                                       uint16_t value) {
-    salty_invoke(ioport, IOPORT_OUT16, offset, (uint64_t)value, 0);
+    salty_invoke(ioport, IOPORT_OUT16, offset, (uint64_t)value, 0, 0);
 }
 
 /* IRQ handler operations */
 static inline int salty_irq_handler_ack(cap_t irq_handler) {
-    struct salty_result r = salty_invoke(irq_handler, IRQ_HANDLER_ACK, 0, 0, 0);
+    struct salty_result r = salty_invoke(irq_handler, IRQ_HANDLER_ACK, 0, 0, 0, 0);
     return (int)r.error;
 }
 
@@ -338,7 +348,7 @@ static inline int salty_irq_handler_set_notification(cap_t irq_handler,
                                                       cap_t ntfn) {
     struct salty_result r = salty_invoke(irq_handler,
                                          IRQ_HANDLER_SET_NOTIFICATION,
-                                         ntfn, 0, 0);
+                                         ntfn, 0, 0, 0);
     return (int)r.error;
 }
 
@@ -346,7 +356,7 @@ static inline int salty_irq_handler_set_notification(cap_t irq_handler,
 static inline int salty_vspace_map_pt(cap_t vspace, cap_t frame,
                                        uint64_t vaddr, uint64_t level) {
     struct salty_result r = salty_invoke(vspace, VSPACE_MAP_PT,
-                                         frame, vaddr, level);
+                                         frame, vaddr, level, 0);
     return (int)r.error;
 }
 
@@ -354,13 +364,8 @@ static inline int salty_vspace_map_pt(cap_t vspace, cap_t frame,
 static inline int salty_cnode_copy(cap_t src_cnode, uint64_t src_slot,
                                    cap_t dest_cnode, uint64_t dest_slot,
                                    uint64_t rights) {
-    /* CNode_Copy: invoked on src_cnode
-     * arg0 = src_slot, arg1 = dest_cnode_cap, arg2 = dest_slot
-     * arg3 = rights (not supported with 5-arg invoke, use max rights)
-     */
     struct salty_result r = salty_invoke(src_cnode, CNODE_COPY,
-                                        src_slot, dest_cnode, dest_slot);
-    (void)rights;
+                                        src_slot, dest_cnode, dest_slot, rights);
     return (int)r.error;
 }
 

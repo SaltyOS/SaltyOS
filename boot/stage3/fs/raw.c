@@ -8,6 +8,7 @@
 
 #include "fs.h"
 #include "../../common/print.h"
+#include "../../common/string.h"
 #include "../config.h"
 
 ssize_t fs_load_extents(struct DiskDevice *disk,
@@ -28,11 +29,28 @@ ssize_t fs_load_extents(struct DiskDevice *disk,
 
         /* Check buffer space */
         if (total_read + bytes > buffer_size) {
-            bytes = buffer_size - total_read;
-            sectors = bytes / disk->sector_size;
-            if (sectors == 0)
-                break;
-            bytes = (size_t)sectors * disk->sector_size;
+            size_t remaining = buffer_size - total_read;
+            uint32_t full_sectors = remaining / disk->sector_size;
+            size_t tail = remaining % disk->sector_size;
+
+            /* Read full sectors directly into buffer */
+            if (full_sectors > 0) {
+                int err = disk_read(disk, lba, full_sectors, dest);
+                if (err != DISK_OK) return -FS_ERR_IO;
+                dest += (size_t)full_sectors * disk->sector_size;
+                total_read += (size_t)full_sectors * disk->sector_size;
+                lba += full_sectors;
+            }
+
+            /* Read partial trailing sector via temp buffer */
+            if (tail > 0) {
+                uint8_t sector_buf[512];
+                int err = disk_read(disk, lba, 1, sector_buf);
+                if (err != DISK_OK) return -FS_ERR_IO;
+                memcpy(dest, sector_buf, tail);
+                total_read += tail;
+            }
+            break;
         }
 
 #if CONFIG_DEBUG
