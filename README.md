@@ -39,11 +39,11 @@ SaltyOS is a capability-based microkernel designed with security and modularity 
 - [x] **IPC buffer** (message overflow MR4-MR19, capability transfer)
 - [x] **I/O port capabilities** (IoPort_In8/Out8/In16/Out16)
 - [x] **Debug syscalls** (DebugPutChar, DebugDumpState)
+- [x] **Userspace servers** (procmgr, vfs, nameserv)
 
 ### In Progress
 
 - [ ] SMP support (ACPI MADT parser, AP trampoline, per-CPU run queues)
-- [ ] Userspace servers (procmgr, vfs, nameserv)
 - [ ] IPC assembly fastpath
 
 ## Architecture
@@ -53,7 +53,7 @@ SaltyOS is a capability-based microkernel designed with security and modularity 
 │                         Userspace                               │
 ├──────────┬──────────┬──────────┬──────────┬──────────┬──────────┤
 │   init   │ console  │  procmgr │   vfs    │ nameserv │   apps   │
-│          │ (serial) │ (planned)│(planned) │(planned) │          │
+│          │ (serial) │          │          │          │          │
 └────┬─────┴────┬─────┴────┬─────┴────┬─────┴────┬─────┴──────────┘
      │          │          │          │          │
      │      IPC (Endpoints + Notifications)     │

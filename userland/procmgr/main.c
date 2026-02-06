@@ -28,6 +28,10 @@
 __attribute__((visibility("hidden")))
 void *__salty_ipc_buffer = (void *)0;
 
+/* Send cap counter */
+__attribute__((visibility("hidden")))
+int __salty_send_cap_count = 0;
+
 /* Cap layout */
 #define CAP_SELF_TCB     0
 #define CAP_SELF_VSPACE  1

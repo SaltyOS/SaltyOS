@@ -11,6 +11,9 @@
 /* IPC buffer - exported from libsalty.so, shared by all dynamically linked code */
 void *__salty_ipc_buffer = (void *)0;
 
+/* Send cap counter - tracks how many caps are queued for the next IPC send */
+int __salty_send_cap_count = 0;
+
 /* Generic capability invocation */
 struct salty_result salty_invoke(
     cap_t cap,
@@ -25,11 +28,13 @@ struct salty_result salty_invoke(
 
 /* IPC operations */
 int salty_send(cap_t ep, const struct salty_msg *msg) {
-    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, 0);
+    int caps = __salty_send_cap_count;
+    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
     struct salty_result r = salty_syscall(
         SYS_SEND, ep,
         info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
     );
+    if (caps > 0) salty_clear_send_caps();
     return (int)r.error;
 }
 
@@ -46,11 +51,13 @@ int salty_recv(cap_t ep, struct salty_msg *msg, uint64_t *badge) {
 }
 
 int salty_call(cap_t ep, const struct salty_msg *msg, struct salty_msg *reply) {
-    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, 0);
+    int caps = __salty_send_cap_count;
+    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
     struct salty_result r = salty_syscall(
         SYS_CALL, ep,
         info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
     );
+    if (caps > 0) salty_clear_send_caps();
     if (r.error == 0 && reply && __salty_ipc_buffer) {
         const struct salty_msg *buf = (const struct salty_msg *)__salty_ipc_buffer;
         *reply = *buf;
@@ -60,11 +67,13 @@ int salty_call(cap_t ep, const struct salty_msg *msg, struct salty_msg *reply) {
 
 int salty_reply_recv(cap_t ep, const struct salty_msg *reply,
                      struct salty_msg *out_msg, uint64_t *badge) {
-    uint64_t info = SALTY_MSGINFO(reply->label, reply->length, 0);
+    int caps = __salty_send_cap_count;
+    uint64_t info = SALTY_MSGINFO(reply->label, reply->length, caps);
     struct salty_result r = salty_syscall(
         SYS_REPLY_RECV, ep,
         info, reply->regs[0], reply->regs[1], reply->regs[2], reply->regs[3]
     );
+    if (caps > 0) salty_clear_send_caps();
     if (r.error == 0) {
         if (badge) *badge = r.value;
         if (out_msg && __salty_ipc_buffer) {
@@ -225,11 +234,13 @@ int salty_cnode_revoke(cap_t cnode, uint64_t slot) {
 
 /* Non-blocking send */
 int salty_nbsend(cap_t ep, const struct salty_msg *msg) {
-    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, 0);
+    int caps = __salty_send_cap_count;
+    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
     struct salty_result r = salty_syscall(
         SYS_NBSEND, ep,
         info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
     );
+    if (caps > 0) salty_clear_send_caps();
     return (int)r.error;
 }
 

@@ -262,9 +262,9 @@ pub fn init() {
         // Map LAPIC MMIO region
         map_lapic();
 
-        // Read APIC ID to verify it's working
-        let apic_id = lapic_read(LAPIC_ID);
-        let _ = apic_id; // Suppress unused warning for now
+        // Read APIC ID to verify it's working and store BSP mapping
+        let apic_id = lapic_read(LAPIC_ID) >> 24;
+        super::cpu::set_cpu_apic_id(0, apic_id);
 
         // Set Spurious Interrupt Vector register
         // Enable APIC and set spurious vector
@@ -535,9 +535,15 @@ pub unsafe fn send_ipi(cpu_id: usize, kind: IpiKind) {
             core::hint::spin_loop();
         }
 
+        // Look up the real hardware APIC ID for this logical CPU index.
+        // On hardware where APIC IDs differ from sequential indices
+        // (multi-socket, non-sequential), using cpu_id directly would
+        // send the IPI to the wrong processor.
+        let apic_id = super::cpu::get_apic_id_for_cpu(cpu_id);
+
         // Set destination (single CPU, not shorthand)
         // ICR1: high 32 bits of destination APIC ID
-        lapic_write(LAPIC_ICR1, (cpu_id as u32) << 24);
+        lapic_write(LAPIC_ICR1, apic_id << 24);
 
         // Send IPI (ICR0: vector + trigger mode + destination shorthand)
         let icr0 = kind.vector() as u32 | ICR_MODE_ASSERT | ICR_LEVEL;
@@ -680,6 +686,9 @@ pub unsafe fn start_aps(cpu_descriptors: &[super::acpi::CpuDescriptor], cpu_coun
             let cpu_id = i as u32;
             let cpuid_ptr = (TRAMPOLINE_CPU_ID + PHYS_MAP_OFFSET) as *mut u32;
             cpuid_ptr.write_volatile(cpu_id);
+
+            // Store the mapping from logical CPU ID to hardware APIC ID
+            super::cpu::set_cpu_apic_id(cpu_id as usize, apic_id as u32);
 
             // Set up per-CPU GS data before the AP boots
             let per_cpu = super::cpu::per_cpu_mut(cpu_id);

@@ -12,7 +12,7 @@ This document provides detailed instructions for building SaltyOS from source.
 | Ninja | >= 1.10 | Build backend |
 | Rust | nightly | Kernel development |
 | NASM | >= 2.15 | x86 assembly |
-| GCC/Clang | >= 11 | C compiler (freestanding) |
+| Clang | >= 11 | C compiler (required; GCC is not supported) |
 | GNU ld / LLD | latest | Linker |
 
 ### Optional Tools

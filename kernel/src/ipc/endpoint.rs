@@ -215,26 +215,33 @@ impl Endpoint {
             (*receiver).saved_caller_msg = *msg;
             (*receiver).saved_caller_badge = badge;
 
-            // Check for capability transfer via IPC buffer
-            // The sender's IPC buffer caps[] array holds slot indices into
-            // sender's CNode. The receiver's IPC buffer receive_cnode/index/depth
-            // specify where to place received caps.
+            // Copy overflow registers MR4..MR(length-1) via IPC buffers
             let sender_buf = (*sender).ipc_buffer;
             let receiver_buf = (*receiver).ipc_buffer;
-            if sender_buf != 0 && receiver_buf != 0 {
+            if msg.length > 4 && sender_buf != 0 && receiver_buf != 0 {
                 let sender_ipc = sender_buf as *const super::IpcBuffer;
+                let receiver_ipc = receiver_buf as *mut super::IpcBuffer;
+                let overflow_count = (msg.length - 4).min(16); // MR4..MR19
+                for i in 0..overflow_count {
+                    (*receiver_ipc).msg[4 + i] = (*sender_ipc).msg[4 + i];
+                }
+            }
+
+            // Check for capability transfer via IPC buffer.
+            // Use msg.extra_caps (from sender's msg_info) to bound the loop,
+            // preventing stale values in caps[] from leaking capabilities.
+            let cap_count = msg.extra_caps.min(4);
+            if cap_count > 0 && sender_buf != 0 && receiver_buf != 0 {
+                let sender_ipc = sender_buf as *mut super::IpcBuffer;
                 let receiver_ipc = receiver_buf as *const super::IpcBuffer;
 
-                // Read extra_caps count from receiver's IPC buffer
-                // (sender signals how many caps via msg_info extra_caps field)
                 let recv_cnode_ptr = (*receiver_ipc).receive_cnode;
                 let recv_index = (*receiver_ipc).receive_index;
 
                 if recv_cnode_ptr != 0 {
-                    // Transfer up to 4 caps
-                    for i in 0..4u64 {
+                    for i in 0..cap_count as u64 {
                         let src_slot_idx = (*sender_ipc).caps[i as usize];
-                        if src_slot_idx == 0 { break; }
+                        if src_slot_idx == 0 { continue; }
 
                         // Look up cap in sender's CSpace
                         let sender_cspace = &*(*sender).cspace_root;
@@ -270,6 +277,11 @@ impl Endpoint {
                             src_cap.rights,
                         );
                     }
+                }
+
+                // Clear sender's caps to prevent stale leaks on next IPC
+                for i in 0..4 {
+                    (*sender_ipc).caps[i] = 0;
                 }
             }
         }

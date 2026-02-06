@@ -80,6 +80,10 @@
 __attribute__((visibility("hidden")))
 void *__salty_ipc_buffer = (void *)0;
 
+/* Send cap counter */
+__attribute__((visibility("hidden")))
+int __salty_send_cap_count = 0;
+
 /* Unmapped user address for fault test (1GB, page-aligned) */
 #define FAULT_TEST_ADDR     0x40000000ULL
 

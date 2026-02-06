@@ -22,6 +22,8 @@ pub struct Message {
     pub label: u64,
     /// Number of valid message registers (extracted from msg_info bits 6:0)
     pub length: usize,
+    /// Number of capabilities to transfer (extracted from msg_info bits 11:7)
+    pub extra_caps: usize,
     /// Message registers (inline fastpath: 4 in registers, overflow via IPC buffer)
     pub regs: [u64; 4],
 }
@@ -31,6 +33,7 @@ impl Message {
         Self {
             label: 0,
             length: 0,
+            extra_caps: 0,
             regs: [0; 4],
         }
     }
@@ -83,6 +86,7 @@ pub fn vm_fault_message(address: u64, error_code: u64, rip: u64, is_instr: bool)
     Message {
         label: FaultType::VMFault as u64,
         length: 4,
+        extra_caps: 0,
         regs: [address, error_code, rip, is_instr as u64],
     }
 }
@@ -99,6 +103,7 @@ pub fn user_exception_message(vector: u64, error_code: u64, rip: u64, rsp: u64) 
     Message {
         label: FaultType::UserException as u64,
         length: 4,
+        extra_caps: 0,
         regs: [vector, error_code, rip, rsp],
     }
 }

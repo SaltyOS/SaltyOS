@@ -142,9 +142,9 @@ Three-level memory abstraction:
 | `init` | System initialization, server spawning | Implemented |
 | `console` | Serial console server (COM1 via IoPort caps) | Implemented |
 | `rtld` | Runtime dynamic linker (shared library loading) | Implemented |
-| `procmgr` | Process lifecycle, capability distribution | Planned |
-| `vfs` | Virtual filesystem, SaltyFS driver | Planned |
-| `nameserv` | Service discovery (endpoint lookup) | Planned |
+| `procmgr` | Process lifecycle, capability distribution | Implemented |
+| `vfs` | Virtual filesystem, SaltyFS driver | Implemented |
+| `nameserv` | Service discovery (endpoint lookup) | Implemented |
 | `drivers/` | Device drivers (PCI, NVMe, USB, etc.) | Planned |
 
 ## Boot Sequence
@@ -219,7 +219,6 @@ Standard L4/seL4 uses inline capabilities (single word). We chose fat capabiliti
 
 ### In Progress
 - SMP support (ACPI MADT parser, AP trampoline, per-CPU queues)
-- Userspace servers (procmgr, vfs, nameserv)
 
 ## Future Directions
 

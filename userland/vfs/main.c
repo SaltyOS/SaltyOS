@@ -32,6 +32,10 @@
 __attribute__((visibility("hidden")))
 void *__salty_ipc_buffer = (void *)0;
 
+/* Send cap counter */
+__attribute__((visibility("hidden")))
+int __salty_send_cap_count = 0;
+
 /* Cap layout */
 #define CAP_SELF_TCB     0
 #define CAP_SELF_VSPACE  1
@@ -243,27 +247,35 @@ static void handle_write(const struct salty_msg *msg, struct salty_msg *reply, u
 
     switch (cli->fds[fd].dev_type) {
     case DEV_CONSOLE: {
-        /* Forward WRITE to console server */
-        struct salty_msg creq, creply;
-        creq.label = CONSOLE_WRITE;
-        creq.length = 2;
-        creq.regs[0] = count;
-        /* Copy data from our regs[2..] into console msg regs[1..] */
+        /* Forward WRITE to console server in 24-byte chunks.
+         * Each chunk fits in creq.regs[1..3] (3 regs = 24 bytes).
+         * Returns actual bytes written, not the requested count.
+         */
         const uint8_t *src = (const uint8_t *)&msg->regs[2];
-        uint8_t *dst = (uint8_t *)&creq.regs[1];
-        for (uint64_t i = 0; i < count && i < 24; i++)
-            dst[i] = src[i];
-        creq.regs[2] = 0;
-        creq.regs[3] = 0;
+        uint64_t sent = 0;
+        while (sent < count) {
+            struct salty_msg creq, creply;
+            uint64_t chunk = count - sent;
+            if (chunk > 24) chunk = 24;
 
-        int err = salty_call(CAP_CONSOLE_EP, &creq, &creply);
-        if (err != 0) {
-            reply->label = SALTY_INVALID_OPERATION;
-            return;
+            creq.label = CONSOLE_WRITE;
+            creq.length = 2;
+            creq.regs[0] = chunk;
+            creq.regs[1] = 0;
+            creq.regs[2] = 0;
+            creq.regs[3] = 0;
+
+            uint8_t *dst = (uint8_t *)&creq.regs[1];
+            for (uint64_t i = 0; i < chunk; i++)
+                dst[i] = src[sent + i];
+
+            int err = salty_call(CAP_CONSOLE_EP, &creq, &creply);
+            if (err != 0) break;
+            sent += chunk;
         }
-        reply->label = SALTY_OK;
+        reply->label = sent > 0 ? SALTY_OK : SALTY_INVALID_OPERATION;
         reply->length = 1;
-        reply->regs[0] = count;
+        reply->regs[0] = sent;
         break;
     }
     case DEV_NULL:

@@ -39,6 +39,12 @@ static mut PER_CPU_DATA: [PerCpuData; MAX_CPUS] = {
     [INIT; MAX_CPUS]
 };
 
+/// APIC ID mapping table: logical CPU index → hardware APIC ID
+///
+/// Separate from PerCpuData to avoid disturbing the assembly-accessed
+/// layout (GS:[0], GS:[8], GS:[16]).
+static mut CPU_APIC_IDS: [u32; MAX_CPUS] = [0; MAX_CPUS];
+
 /// Serial port (COM1) for debug output
 const SERIAL_PORT: u16 = 0x3F8;
 
@@ -137,6 +143,19 @@ fn write_gs_base_msr(base: u64) {
 /// Get per-CPU data pointer for a specific CPU
 pub unsafe fn per_cpu_mut(cpu_id: u32) -> &'static mut PerCpuData {
     unsafe { &mut PER_CPU_DATA[cpu_id as usize] }
+}
+
+/// Store the hardware APIC ID for a logical CPU index
+///
+/// # Safety
+/// Must be called during boot before IPIs are sent.
+pub unsafe fn set_cpu_apic_id(cpu_id: usize, apic_id: u32) {
+    unsafe { CPU_APIC_IDS[cpu_id] = apic_id; }
+}
+
+/// Get the hardware APIC ID for a logical CPU index
+pub fn get_apic_id_for_cpu(cpu_id: usize) -> u32 {
+    unsafe { CPU_APIC_IDS[cpu_id] }
 }
 
 /// Set kernel stack for the current CPU

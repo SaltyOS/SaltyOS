@@ -255,6 +255,7 @@ fn construct_message(
 ) -> Message {
     let label = msg_info::get_label(msg_info);
     let length = msg_info::get_length(msg_info);
+    let extra_caps = msg_info::get_extra_caps(msg_info);
     let mut regs = [0u64; 4];
 
     // Copy inline registers based on length (max 4 in registers)
@@ -263,7 +264,7 @@ fn construct_message(
     if length > 2 { regs[2] = mr2; }
     if length > 3 { regs[3] = mr3; }
 
-    Message { label, length, regs }
+    Message { label, length, extra_caps, regs }
 }
 
 /// Write received IPC message to current thread's IPC buffer
@@ -279,13 +280,14 @@ unsafe fn write_msg_to_ipc_buffer(msg: &Message, badge: u64) {
         if buf == 0 { return; }
         let ipc_buf = buf as *mut crate::ipc::IpcBuffer;
 
-        // Write inline message registers to IPC buffer msg array
+        // Write inline message registers (MR0-MR3) to IPC buffer
         let len = msg.length.min(4);
         for i in 0..len {
             (*ipc_buf).msg[i] = msg.regs[i];
         }
-        // Clear remaining slots up to length
-        for i in len..msg.length.min(20) {
+        // MR4+ overflow data is already in the IPC buffer (copied by
+        // transfer_message), so only clear slots beyond msg.length
+        for i in msg.length.min(20)..20 {
             (*ipc_buf).msg[i] = 0;
         }
 

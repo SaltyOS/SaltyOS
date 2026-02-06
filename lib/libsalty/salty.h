@@ -97,8 +97,10 @@
  */
 #ifdef SALTY_STATIC
 extern void *__salty_ipc_buffer __attribute__((visibility("hidden")));
+extern int __salty_send_cap_count __attribute__((visibility("hidden")));
 #else
 extern void *__salty_ipc_buffer;
+extern int __salty_send_cap_count;
 #endif
 
 /* Initrd mapping address (16 MB) */
@@ -295,6 +297,30 @@ static inline void salty_ioport_out16(cap_t ioport, uint64_t offset,
                   (uint64_t)value, 0, 0);
 }
 
+/* Clear all pending send caps and reset counter */
+static inline void salty_clear_send_caps(void) {
+    if (__salty_ipc_buffer) {
+        struct salty_ipc_buffer *buf = (struct salty_ipc_buffer *)__salty_ipc_buffer;
+        for (int i = 0; i < 4; i++) buf->caps[i] = 0;
+    }
+    __salty_send_cap_count = 0;
+}
+
+/* Set a capability slot for transfer in the next IPC send.
+ * slot_index: which of the 4 cap transfer slots (0-3) to set
+ * cap_slot: the CNode slot index of the capability to transfer
+ *
+ * Increments __salty_send_cap_count so salty_send/call/etc. include
+ * the correct extra_caps count in msg_info.
+ */
+static inline void salty_set_send_cap(int slot_index, uint64_t cap_slot) {
+    if (__salty_ipc_buffer && slot_index >= 0 && slot_index < 4) {
+        struct salty_ipc_buffer *buf = (struct salty_ipc_buffer *)__salty_ipc_buffer;
+        buf->caps[slot_index] = cap_slot;
+        __salty_send_cap_count++;
+    }
+}
+
 /* ====================================================================
  * Higher-level wrappers: static inline when SALTY_STATIC, extern otherwise
  * ==================================================================== */
@@ -315,11 +341,13 @@ static inline struct salty_result salty_invoke(
 
 /* IPC operations */
 static inline int salty_send(cap_t ep, const struct salty_msg *msg) {
-    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, 0);
+    int caps = __salty_send_cap_count;
+    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
     struct salty_result r = salty_syscall(
         SYS_SEND, ep,
         info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
     );
+    if (caps > 0) salty_clear_send_caps();
     return (int)r.error;
 }
 
@@ -337,11 +365,13 @@ static inline int salty_recv(cap_t ep, struct salty_msg *msg, uint64_t *badge) {
 }
 
 static inline int salty_call(cap_t ep, const struct salty_msg *msg, struct salty_msg *reply) {
-    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, 0);
+    int caps = __salty_send_cap_count;
+    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
     struct salty_result r = salty_syscall(
         SYS_CALL, ep,
         info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
     );
+    if (caps > 0) salty_clear_send_caps();
     if (r.error == 0 && reply && __salty_ipc_buffer) {
         const struct salty_msg *buf = (const struct salty_msg *)__salty_ipc_buffer;
         *reply = *buf;
@@ -351,11 +381,13 @@ static inline int salty_call(cap_t ep, const struct salty_msg *msg, struct salty
 
 static inline int salty_reply_recv(cap_t ep, const struct salty_msg *reply,
                                     struct salty_msg *out_msg, uint64_t *badge) {
-    uint64_t info = SALTY_MSGINFO(reply->label, reply->length, 0);
+    int caps = __salty_send_cap_count;
+    uint64_t info = SALTY_MSGINFO(reply->label, reply->length, caps);
     struct salty_result r = salty_syscall(
         SYS_REPLY_RECV, ep,
         info, reply->regs[0], reply->regs[1], reply->regs[2], reply->regs[3]
     );
+    if (caps > 0) salty_clear_send_caps();
     if (r.error == 0) {
         if (badge) *badge = r.value;
         if (out_msg && __salty_ipc_buffer) {
@@ -518,11 +550,13 @@ static inline int salty_cnode_revoke(cap_t cnode, uint64_t slot) {
 
 /* Non-blocking send to endpoint */
 static inline int salty_nbsend(cap_t ep, const struct salty_msg *msg) {
-    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, 0);
+    int caps = __salty_send_cap_count;
+    uint64_t info = SALTY_MSGINFO(msg->label, msg->length, caps);
     struct salty_result r = salty_syscall(
         SYS_NBSEND, ep,
         info, msg->regs[0], msg->regs[1], msg->regs[2], msg->regs[3]
     );
+    if (caps > 0) salty_clear_send_caps();
     return (int)r.error;
 }
 
@@ -554,17 +588,6 @@ static inline void salty_set_receive_slot(cap_t cnode, uint64_t index, uint64_t 
         buf->receive_cnode = cnode;
         buf->receive_index = index;
         buf->receive_depth = depth;
-    }
-}
-
-/* Set a capability slot for transfer in the next IPC send.
- * slot_index: which of the 4 cap transfer slots (0-3) to set
- * cap_slot: the CNode slot index of the capability to transfer
- */
-static inline void salty_set_send_cap(int slot_index, uint64_t cap_slot) {
-    if (__salty_ipc_buffer && slot_index >= 0 && slot_index < 4) {
-        struct salty_ipc_buffer *buf = (struct salty_ipc_buffer *)__salty_ipc_buffer;
-        buf->caps[slot_index] = cap_slot;
     }
 }
 
