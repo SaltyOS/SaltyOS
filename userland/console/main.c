@@ -8,9 +8,8 @@
 
 #include "salty.h"
 
-/* IPC buffer pointer (referenced by salty.h) */
-__attribute__((visibility("hidden")))
-void *__salty_ipc_buffer = (void *)0;
+/* IPC buffer pointer: defined in libsalty.so, declared extern in salty.h */
+extern void *__salty_ipc_buffer;
 
 /* COM1 register offsets (relative to base 0x3F8) */
 #define COM1_THR  0   /* Transmit Holding Register (write) */

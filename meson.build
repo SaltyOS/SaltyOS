@@ -149,6 +149,7 @@ if build_kernel
 endif
 
 if build_userland
+  subdir('lib')
   subdir('userland')
 endif
 
@@ -163,12 +164,15 @@ initrd_target = []
 
 if build_userland and mkcpio.found()
   initrd = custom_target('initrd',
-    input: [init_elf, console_elf],
+    input: [init_elf, console_elf, ld_salty_so, libsalty_so, libc_so],
     output: 'initrd.cpio',
     command: [mkcpio,
       '--output', '@OUTPUT@',
       'init.elf=@INPUT0@',
       'console.elf=@INPUT1@',
+      'ld-salty.so=@INPUT2@',
+      'libsalty.so=@INPUT3@',
+      'libc.so=@INPUT4@',
     ],
     build_by_default: true,
   )

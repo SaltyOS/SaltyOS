@@ -1,8 +1,8 @@
-/* SaltyOS console server PIE linker script
+/* SaltyOS console server - dynamically linked PIE linker script
  * SPDX-License-Identifier: GPL-2.0-only
  *
  * Produces ET_DYN (PIE) ELF with base address 0.
- * Relocated by procmgr ELF loader at load time.
+ * Includes PLT/GOT sections for dynamic linking via ld-salty.so.
  */
 
 OUTPUT_FORMAT(elf64-x86-64)
@@ -12,6 +12,15 @@ ENTRY(_start)
 SECTIONS
 {
     . = 0;
+
+    .interp       : { *(.interp) }
+    .gnu.hash     : { *(.gnu.hash) }
+    .dynsym       : { *(.dynsym) }
+    .dynstr       : { *(.dynstr) }
+    .rela.dyn     : { *(.rela.dyn) }
+    .rela.plt     : { *(.rela.plt) }
+
+    .plt ALIGN(16) : { *(.plt .plt.*) }
 
     .text ALIGN(4K) : {
         *(.text .text.*)
@@ -23,12 +32,11 @@ SECTIONS
 
     .data ALIGN(4K) : {
         *(.data .data.*)
-        *(.got)
-        *(.got.plt)
     }
 
-    .dynamic : { *(.dynamic) }
-    .rela.dyn : { *(.rela.dyn) *(.rela.plt) }
+    .got      : { *(.got) }
+    .got.plt  : { *(.got.plt) }
+    .dynamic  : { *(.dynamic) }
 
     .bss ALIGN(4K) : {
         *(.bss .bss.*)

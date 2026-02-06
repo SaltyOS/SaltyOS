@@ -12,6 +12,7 @@
 #include "salty.h"
 #include "cpio.h"
 #include "elf_loader.h"
+#include "elf_dynamic.h"
 
 /* Well-known capability slots in init's CSpace (set by kernel) */
 #define CAP_SELF_TCB        0
@@ -66,6 +67,32 @@ void *__salty_ipc_buffer = (void *)0;
 /* Child stack (8 MB in child VSpace) */
 #define CHILD_STACK_VADDR   0x0000000000800000ULL
 #define CHILD_STACK_TOP     (CHILD_STACK_VADDR + 4096)
+
+/* Dynamic linking addresses in child VSpace */
+#define CHILD_RTLD_VADDR    0x0000000002000000ULL  /* ld-salty.so load address */
+#define CHILD_INITRD_VADDR  0x0000000001000000ULL  /* initrd mapped in child */
+#define CHILD_SCRATCH_VADDR 0x0000000004000000ULL  /* scratch area for rtld */
+#define CHILD_IPC_BUF_VADDR 0x0000000000200000ULL  /* IPC buffer for child */
+
+/* Cap slot for untyped cap copied into child CNode (for rtld frame alloc) */
+#define CAP_CHILD_UNTYPED_OFFSET  7
+
+/* Auxiliary vector types (standard) */
+#define AT_NULL    0
+#define AT_PHDR    3
+#define AT_PHENT   4
+#define AT_PHNUM   5
+#define AT_PAGESZ  6
+#define AT_BASE    7
+#define AT_ENTRY   9
+
+/* SaltyOS custom auxv types (pass cap info to rtld) */
+#define AT_SALTY_UNTYPED     0x1000
+#define AT_SALTY_VSPACE      0x1001
+#define AT_SALTY_SCRATCH     0x1002
+#define AT_SALTY_INITRD      0x1003
+#define AT_SALTY_INITRD_SZ   0x1004
+#define AT_SALTY_FRAME_SLOT  0x1005
 
 /* Thread 2 stack (4KB in BSS, page-aligned) */
 static uint8_t thread2_stack[4096] __attribute__((aligned(4096)));
@@ -387,30 +414,25 @@ static int phase2_fault_test(cap_t ut) {
 }
 
 /* ================================================================
- * Phase 3: Spawn Console Server
+ * Phase 3: Spawn Console Server (with dynamic linking support)
  * ================================================================
  * Creates a child process from console.elf in the initrd:
  *   1. Retype: TCB, VSpace, CNode, SchedContext, stack Frame
  *   2. Load ELF segments into child VSpace
- *   3. Copy required caps (IoPort, IRQ, Notification, Endpoint) into child CNode
- *   4. Configure TCB and start the process
- *
- * Requires kernel to have placed IoPort/IRQ/Notification caps at
- * well-known slots (CAP_COM1_IOPORT, CAP_COM1_IRQ, CAP_COM1_NTFN)
- * and mapped the initrd at INITRD_VADDR.
+ *   3. Detect PT_INTERP: if present, load ld-salty.so into child VSpace
+ *   4. Map initrd into child VSpace (for rtld to find .so files)
+ *   5. Copy required caps into child CNode (including Untyped for rtld)
+ *   6. Set up auxiliary vector on child stack
+ *   7. Configure TCB (entry = rtld if dynamic, exe if static)
+ *   8. Start the process
  */
 static int phase3_spawn_console(cap_t ut) {
     int err;
 
     salty_serial_puts("\n[INIT] Phase 3: Spawning console server\n");
 
-    /* Check if initrd is accessible. The kernel should have mapped it.
-     * If the first 6 bytes are not CPIO magic, skip Phase 3. */
     const uint8_t *initrd = (const uint8_t *)INITRD_VADDR;
-
-    /* We need the initrd size. The kernel places it in a well-known location.
-     * For now, scan up to 1MB for the TRAILER!!! entry. */
-    size_t initrd_size = 1024 * 1024; /* Conservative upper bound */
+    size_t initrd_size = cpio_archive_size(initrd, 1024 * 1024);
 
     /* Find console.elf in the CPIO archive */
     struct cpio_entry console_entry;
@@ -422,6 +444,12 @@ static int phase3_spawn_console(cap_t ut) {
     salty_serial_puts("[INIT] Found console.elf (");
     salty_serial_hex(console_entry.data_len);
     salty_serial_puts(" bytes)\n");
+
+    /* Check if console.elf needs a dynamic linker */
+    int is_dynamic = elf_has_interp(console_entry.data, console_entry.data_len);
+    if (is_dynamic) {
+        salty_serial_puts("[INIT] console.elf is dynamically linked\n");
+    }
 
     /* 1. Retype child process objects */
     err = salty_untyped_retype(ut, OBJ_TCB, 0, CAP_CHILD_TCB);
@@ -464,7 +492,6 @@ static int phase3_spawn_console(cap_t ut) {
         return -1;
     }
 
-    /* Retype an endpoint for console server IPC */
     err = salty_untyped_retype(ut, OBJ_ENDPOINT, 0, CAP_CHILD_EP);
     if (err != 0) {
         salty_serial_puts("[INIT] FAIL: child EP retype err=");
@@ -475,7 +502,7 @@ static int phase3_spawn_console(cap_t ut) {
 
     salty_serial_puts("[INIT] Child objects created (TCB/VS/CN/SC/FR/EP)\n");
 
-    /* 2. Load ELF into child VSpace */
+    /* 2. Load console.elf into child VSpace */
     struct elf_loader_ctx loader_ctx;
     loader_ctx.untyped = ut;
     loader_ctx.self_vspace = CAP_SELF_VSPACE;
@@ -499,7 +526,95 @@ static int phase3_spawn_console(cap_t ut) {
     salty_serial_hex(elf_result.brk);
     salty_serial_puts("\n");
 
-    /* 3. Map child stack */
+    /* 3. If dynamically linked, load ld-salty.so into child VSpace */
+    struct elf_load_result rtld_result;
+    rtld_result.entry = 0;
+    rtld_result.base = 0;
+    rtld_result.brk = 0;
+
+    if (is_dynamic) {
+        struct cpio_entry rtld_entry;
+        if (!cpio_find_file(initrd, initrd_size, "ld-salty.so", &rtld_entry)) {
+            salty_serial_puts("[INIT] FAIL: ld-salty.so not found in initrd\n");
+            return -1;
+        }
+        salty_serial_puts("[INIT] Found ld-salty.so (");
+        salty_serial_hex(rtld_entry.data_len);
+        salty_serial_puts(" bytes)\n");
+
+        err = elf_load(rtld_entry.data, rtld_entry.data_len,
+                       CHILD_RTLD_VADDR, &loader_ctx, &rtld_result);
+        if (err != 0) {
+            salty_serial_puts("[INIT] FAIL: rtld ELF load err=");
+            salty_serial_hex((uint64_t)err);
+            salty_serial_puts("\n");
+            return -1;
+        }
+        salty_serial_puts("[INIT] rtld loaded: entry=");
+        salty_serial_hex(rtld_result.entry);
+        salty_serial_puts(" base=");
+        salty_serial_hex(rtld_result.base);
+        salty_serial_puts("\n");
+    }
+
+    /* 4. If dynamic, map initrd into child VSpace (read-only).
+     * The rtld will search this for .so files.
+     */
+    if (is_dynamic) {
+        size_t initrd_pages = (initrd_size + 4095) / 4096;
+        salty_serial_puts("[INIT] Mapping initrd into child (");
+        salty_serial_hex(initrd_pages);
+        salty_serial_puts(" pages)\n");
+
+        for (size_t pg = 0; pg < initrd_pages; pg++) {
+            /* Retype a frame */
+            cap_t fr_slot = loader_ctx.next_frame_slot++;
+            err = salty_untyped_retype(ut, OBJ_FRAME, 0, fr_slot);
+            if (err != 0) {
+                salty_serial_puts("[INIT] FAIL: initrd frame retype err=");
+                salty_serial_hex((uint64_t)err);
+                salty_serial_puts("\n");
+                return -1;
+            }
+
+            /* Map at scratch in our VSpace, copy initrd data */
+            err = salty_vspace_map(CAP_SELF_VSPACE, fr_slot,
+                                   SCRATCH_VADDR,
+                                   VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER);
+            if (err != 0) {
+                salty_serial_puts("[INIT] FAIL: initrd scratch map err=");
+                salty_serial_hex((uint64_t)err);
+                salty_serial_puts("\n");
+                return -1;
+            }
+
+            volatile uint8_t *scratch = (volatile uint8_t *)SCRATCH_VADDR;
+            const uint8_t *src = initrd + pg * 4096;
+            size_t copy_len = 4096;
+            if (pg * 4096 + copy_len > initrd_size)
+                copy_len = initrd_size - pg * 4096;
+            for (size_t i = 0; i < copy_len; i++)
+                scratch[i] = src[i];
+            for (size_t i = copy_len; i < 4096; i++)
+                scratch[i] = 0;
+
+            salty_vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
+
+            /* Map into child VSpace (read-only + user) */
+            err = salty_vspace_map(CAP_CHILD_VSPACE, fr_slot,
+                                   CHILD_INITRD_VADDR + pg * 4096,
+                                   VSPACE_FLAG_USER);
+            if (err != 0) {
+                salty_serial_puts("[INIT] FAIL: initrd child map err=");
+                salty_serial_hex((uint64_t)err);
+                salty_serial_puts("\n");
+                return -1;
+            }
+        }
+        salty_serial_puts("[INIT] Initrd mapped in child VSpace\n");
+    }
+
+    /* 5. Map child stack */
     err = salty_vspace_map(CAP_CHILD_VSPACE, CAP_CHILD_STACK_FR,
                            CHILD_STACK_VADDR,
                            VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER);
@@ -510,7 +625,7 @@ static int phase3_spawn_console(cap_t ut) {
         return -1;
     }
 
-    /* 4. Copy caps into child's CNode.
+    /* 6. Copy caps into child's CNode.
      * Child CNode layout (must match console/main.c):
      *   0 = TCB (self)
      *   1 = VSpace (self)
@@ -519,6 +634,7 @@ static int phase3_spawn_console(cap_t ut) {
      *   4 = IoPort (COM1)
      *   5 = IRQ handler (COM1)
      *   6 = Notification (COM1)
+     *   7 = Untyped (for rtld, if dynamic)
      */
 
     /* Copy child TCB cap -> child CNode slot 0 */
@@ -568,7 +684,6 @@ static int phase3_spawn_console(cap_t ut) {
         salty_serial_puts("[INIT] WARN: copy IoPort cap err=");
         salty_serial_hex((uint64_t)err);
         salty_serial_puts(" (kernel may not have IoPort support yet)\n");
-        /* Not fatal: continue without IoPort */
     }
 
     /* Copy IRQ handler -> child CNode slot 5 */
@@ -589,7 +704,19 @@ static int phase3_spawn_console(cap_t ut) {
         salty_serial_puts(" (may not be provisioned yet)\n");
     }
 
-    /* 5. Configure child TCB */
+    /* Copy Untyped cap -> child CNode slot 7 (for rtld frame allocation) */
+    if (is_dynamic) {
+        err = salty_cnode_copy(CAP_SELF_CSPACE, ut,
+                               CAP_CHILD_CNODE, CAP_CHILD_UNTYPED_OFFSET, 0);
+        if (err != 0) {
+            salty_serial_puts("[INIT] FAIL: copy Untyped cap err=");
+            salty_serial_hex((uint64_t)err);
+            salty_serial_puts("\n");
+            return -1;
+        }
+    }
+
+    /* 7. Configure child TCB */
     err = salty_tcb_set_space(CAP_CHILD_TCB, CAP_CHILD_CNODE, CAP_CHILD_VSPACE);
     if (err != 0) {
         salty_serial_puts("[INIT] FAIL: child TCB set_space err=");
@@ -598,8 +725,117 @@ static int phase3_spawn_console(cap_t ut) {
         return -1;
     }
 
-    err = salty_tcb_configure(CAP_CHILD_TCB, elf_result.entry,
-                               CHILD_STACK_TOP, 0);
+    /* Entry point and stack pointer depend on whether dynamic or static */
+    uint64_t child_entry;
+    uint64_t child_rsp = CHILD_STACK_TOP;
+
+    if (is_dynamic) {
+        /* Set up auxiliary vector on the child stack page.
+         * We scratch-map the stack frame, write auxv at the top, then unmap.
+         */
+        err = salty_vspace_map(CAP_SELF_VSPACE, CAP_CHILD_STACK_FR,
+                               SCRATCH_VADDR,
+                               VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER);
+        if (err != 0) {
+            salty_serial_puts("[INIT] FAIL: scratch map stack err=");
+            salty_serial_hex((uint64_t)err);
+            salty_serial_puts("\n");
+            return -1;
+        }
+
+        /* Get phdr info from the executable ELF */
+        uint64_t phdr_vaddr, phent, phnum;
+        elf_get_phdr_info(console_entry.data, console_entry.data_len,
+                          CHILD_CODE_VADDR, &phdr_vaddr, &phent, &phnum);
+
+        /* Build the initial stack layout at the TOP of the page.
+         * Stack grows downward, so we place data near the end.
+         *
+         * Layout (14 auxv entries * 16 bytes = 224, + argc/argv/envp = 24):
+         *   total = 248 bytes
+         *
+         * [page_top - 248] = argc (0)
+         * [page_top - 240] = NULL (argv terminator)
+         * [page_top - 232] = NULL (envp terminator)
+         * [page_top - 224] = AT_PHDR, phdr_vaddr
+         * ...
+         * [page_top - 8]   = 0 (AT_NULL value)
+         */
+        #define AUXV_ENTRIES 13  /* 12 entries + AT_NULL terminator */
+        #define STACK_FRAME_SIZE  (3 * 8 + AUXV_ENTRIES * 2 * 8 + 8)  /* 240 bytes (16-byte aligned) */
+
+        volatile uint64_t *stack_base =
+            (volatile uint64_t *)((uint8_t *)SCRATCH_VADDR + 4096 - STACK_FRAME_SIZE);
+
+        size_t idx = 0;
+        /* argc = 0 */
+        stack_base[idx++] = 0;
+        /* argv terminator (NULL) */
+        stack_base[idx++] = 0;
+        /* envp terminator (NULL) */
+        stack_base[idx++] = 0;
+
+        /* Auxiliary vector entries (key, value pairs) */
+        stack_base[idx++] = AT_PHDR;
+        stack_base[idx++] = phdr_vaddr;
+
+        stack_base[idx++] = AT_PHENT;
+        stack_base[idx++] = phent;
+
+        stack_base[idx++] = AT_PHNUM;
+        stack_base[idx++] = phnum;
+
+        stack_base[idx++] = AT_ENTRY;
+        stack_base[idx++] = elf_result.entry;
+
+        stack_base[idx++] = AT_BASE;
+        stack_base[idx++] = CHILD_RTLD_VADDR;
+
+        stack_base[idx++] = AT_PAGESZ;
+        stack_base[idx++] = 4096;
+
+        stack_base[idx++] = AT_SALTY_UNTYPED;
+        stack_base[idx++] = CAP_CHILD_UNTYPED_OFFSET;  /* slot 7 in child */
+
+        stack_base[idx++] = AT_SALTY_VSPACE;
+        stack_base[idx++] = 1;  /* VSpace is always slot 1 */
+
+        stack_base[idx++] = AT_SALTY_SCRATCH;
+        stack_base[idx++] = CHILD_SCRATCH_VADDR;
+
+        stack_base[idx++] = AT_SALTY_INITRD;
+        stack_base[idx++] = CHILD_INITRD_VADDR;
+
+        stack_base[idx++] = AT_SALTY_INITRD_SZ;
+        stack_base[idx++] = (uint64_t)initrd_size;
+
+        stack_base[idx++] = AT_SALTY_FRAME_SLOT;
+        stack_base[idx++] = (uint64_t)loader_ctx.next_frame_slot;
+
+        /* AT_NULL terminator */
+        stack_base[idx++] = AT_NULL;
+        stack_base[idx++] = 0;
+
+        /* 8-byte padding for 16-byte stack alignment */
+        stack_base[idx++] = 0;
+
+        salty_vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
+
+        /* Set child RSP to point at the auxv data on the stack page */
+        child_rsp = CHILD_STACK_VADDR + 4096 - STACK_FRAME_SIZE;
+        /* Entry point is the rtld, not the executable */
+        child_entry = rtld_result.entry;
+
+        salty_serial_puts("[INIT] Dynamic: entry=rtld at ");
+        salty_serial_hex(child_entry);
+        salty_serial_puts(" rsp=");
+        salty_serial_hex(child_rsp);
+        salty_serial_puts("\n");
+    } else {
+        child_entry = elf_result.entry;
+    }
+
+    err = salty_tcb_configure(CAP_CHILD_TCB, child_entry, child_rsp, 0);
     if (err != 0) {
         salty_serial_puts("[INIT] FAIL: child TCB configure err=");
         salty_serial_hex((uint64_t)err);
@@ -607,7 +843,7 @@ static int phase3_spawn_console(cap_t ut) {
         return -1;
     }
 
-    /* 6. Configure and bind scheduling context */
+    /* 8. Configure and bind scheduling context */
     err = salty_sc_configure(CAP_CHILD_SC, 10000, 100000);
     if (err != 0) {
         salty_serial_puts("[INIT] FAIL: child SC configure err=");
@@ -624,7 +860,7 @@ static int phase3_spawn_console(cap_t ut) {
         return -1;
     }
 
-    /* 7. Start the console server */
+    /* 9. Start the console server */
     err = salty_tcb_resume(CAP_CHILD_TCB);
     if (err != 0) {
         salty_serial_puts("[INIT] FAIL: child TCB resume err=");

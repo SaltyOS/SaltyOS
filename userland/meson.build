@@ -5,6 +5,7 @@
 # Each component is a separate executable
 
 subdir('init')
+subdir('rtld')
 subdir('console')
 
 # TODO: Build each userland component

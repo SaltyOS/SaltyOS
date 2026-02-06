@@ -169,4 +169,53 @@ static inline int cpio_next(const uint8_t *archive, size_t archive_len,
     return 1;
 }
 
+/* Compute the total size of a CPIO archive (up to and including TRAILER!!!).
+ * max_len is the maximum number of bytes to scan.
+ * Returns the archive size in bytes, or max_len if no trailer is found.
+ */
+static inline size_t cpio_archive_size(const uint8_t *archive, size_t max_len) {
+    size_t offset = 0;
+
+    for (;;) {
+        if (offset + CPIO_HEADER_SIZE > max_len)
+            return max_len;
+
+        const uint8_t *header = archive + offset;
+
+        if (header[0] != '0' || header[1] != '7' || header[2] != '0' ||
+            header[3] != '7' || header[4] != '0' || header[5] != '1')
+            return offset;  /* not a valid header, archive ends here */
+
+        size_t namesize = cpio_parse_hex8(header + 94);
+        size_t filesize = cpio_parse_hex8(header + 54);
+
+        size_t name_start = offset + CPIO_HEADER_SIZE;
+        if (name_start + namesize > max_len)
+            return max_len;
+
+        const uint8_t *entry_name = archive + name_start;
+        size_t entry_name_len = namesize;
+        if (entry_name_len > 0 && entry_name[entry_name_len - 1] == 0)
+            entry_name_len--;
+
+        size_t data_start = cpio_align4(offset + CPIO_HEADER_SIZE + namesize);
+        size_t data_end = data_start + filesize;
+        size_t next_offset = cpio_align4(data_end);
+
+        /* Check for TRAILER!!! — include it in the size */
+        if (entry_name_len == 10 &&
+            entry_name[0] == 'T' && entry_name[1] == 'R' &&
+            entry_name[2] == 'A' && entry_name[3] == 'I' &&
+            entry_name[4] == 'L' && entry_name[5] == 'E' &&
+            entry_name[6] == 'R' && entry_name[7] == '!' &&
+            entry_name[8] == '!' && entry_name[9] == '!')
+            return next_offset;
+
+        if (data_end > max_len)
+            return max_len;
+
+        offset = next_offset;
+    }
+}
+
 #endif /* LIBSALTY_CPIO_H */

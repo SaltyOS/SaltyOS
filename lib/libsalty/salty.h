@@ -1,7 +1,13 @@
 /* libsalty - SaltyOS System Library
  * SPDX-License-Identifier: GPL-2.0-only
  *
- * Provides system call wrappers and IPC helpers for userland
+ * Provides system call wrappers and IPC helpers for userland.
+ *
+ * When SALTY_STATIC is defined, all functions are static inline (header-only).
+ * When SALTY_STATIC is NOT defined, higher-level wrappers are extern
+ * declarations (implemented in salty_impl.c / libsalty.so).
+ * Performance-critical primitives (raw syscall, serial, ioport) are always
+ * static inline.
  */
 
 #ifndef LIBSALTY_H
@@ -83,8 +89,15 @@
 #define CAP_COM1_NTFN             10
 #define CAP_CONSOLE_EP            11
 
-/* IPC buffer pointer - set by init to point at mapped IPC buffer page */
+/* IPC buffer pointer - set by init to point at mapped IPC buffer page.
+ * When SALTY_STATIC: weak hidden definition (each static binary defines its own).
+ * When !SALTY_STATIC: extern (defined in libsalty.so).
+ */
+#ifdef SALTY_STATIC
 extern void *__salty_ipc_buffer __attribute__((visibility("hidden")));
+#else
+extern void *__salty_ipc_buffer;
+#endif
 
 /* Initrd mapping address (16 MB) */
 #define INITRD_VADDR              0x0000000001000000ULL
@@ -146,6 +159,10 @@ struct salty_result {
     uint64_t value;
 };
 
+/* ====================================================================
+ * Always-inline primitives (performance-critical, single instruction)
+ * ==================================================================== */
+
 /* Raw system call
  *
  * Register convention (matches kernel syscall.S):
@@ -184,6 +201,83 @@ static inline struct salty_result salty_syscall(
     return result;
 }
 
+/* Serial output via direct port I/O (always inline for early debugging) */
+static inline void salty_serial_putc(char c) {
+    uint8_t status;
+    do {
+        __asm__ volatile("inb %1, %0" : "=a"(status) : "Nd"((uint16_t)0x3FD));
+    } while ((status & 0x20) == 0);
+    __asm__ volatile("outb %0, %1" :: "a"((uint8_t)c), "Nd"((uint16_t)0x3F8));
+}
+
+static inline void salty_serial_puts(const char *s) {
+    while (*s) {
+        salty_serial_putc(*s++);
+    }
+}
+
+static inline void salty_serial_hex(uint64_t val) {
+    static const char hex[] = "0123456789abcdef";
+    salty_serial_putc('0');
+    salty_serial_putc('x');
+    if (val == 0) {
+        salty_serial_putc('0');
+        return;
+    }
+    char buf[16];
+    int pos = 15;
+    while (val > 0 && pos >= 0) {
+        buf[pos--] = hex[val & 0xF];
+        val >>= 4;
+    }
+    for (int i = pos + 1; i < 16; i++) {
+        salty_serial_putc(buf[i]);
+    }
+}
+
+/* IoPort operations (always inline - direct syscall for zero overhead) */
+static inline uint8_t salty_ioport_in8(cap_t ioport, uint64_t offset) {
+    struct salty_result r = salty_syscall(SYS_INVOKE, ioport, IOPORT_IN8,
+                                          offset, 0, 0, 0);
+    return (uint8_t)r.value;
+}
+
+static inline void salty_ioport_out8(cap_t ioport, uint64_t offset,
+                                     uint8_t value) {
+    salty_syscall(SYS_INVOKE, ioport, IOPORT_OUT8, offset,
+                  (uint64_t)value, 0, 0);
+}
+
+static inline uint16_t salty_ioport_in16(cap_t ioport, uint64_t offset) {
+    struct salty_result r = salty_syscall(SYS_INVOKE, ioport, IOPORT_IN16,
+                                          offset, 0, 0, 0);
+    return (uint16_t)r.value;
+}
+
+static inline void salty_ioport_out16(cap_t ioport, uint64_t offset,
+                                      uint16_t value) {
+    salty_syscall(SYS_INVOKE, ioport, IOPORT_OUT16, offset,
+                  (uint64_t)value, 0, 0);
+}
+
+/* ====================================================================
+ * Higher-level wrappers: static inline when SALTY_STATIC, extern otherwise
+ * ==================================================================== */
+
+#ifdef SALTY_STATIC
+
+/* Generic capability invocation helper */
+static inline struct salty_result salty_invoke(
+    cap_t cap,
+    uint64_t label,
+    uint64_t arg0,
+    uint64_t arg1,
+    uint64_t arg2,
+    uint64_t arg3
+) {
+    return salty_syscall(SYS_INVOKE, cap, label, arg0, arg1, arg2, arg3);
+}
+
 /* IPC operations */
 static inline int salty_send(cap_t ep, const struct salty_msg *msg) {
     struct salty_result r = salty_syscall(
@@ -213,7 +307,6 @@ static inline int salty_call(cap_t ep, const struct salty_msg *msg, struct salty
     return (int)r.error;
 }
 
-/* Reply to caller and receive next message (server loop pattern) */
 static inline int salty_reply_recv(cap_t ep, const struct salty_msg *reply,
                                     struct salty_msg *out_msg, uint64_t *badge) {
     struct salty_result r = salty_syscall(
@@ -243,20 +336,6 @@ static inline uint64_t salty_wait(cap_t ntfn) {
 static inline void salty_yield(void) {
     salty_syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
 }
-
-/* Generic capability invocation helper */
-static inline struct salty_result salty_invoke(
-    cap_t cap,
-    uint64_t label,
-    uint64_t arg0,
-    uint64_t arg1,
-    uint64_t arg2,
-    uint64_t arg3
-) {
-    return salty_syscall(SYS_INVOKE, cap, label, arg0, arg1, arg2, arg3);
-}
-
-/* ---- Convenience wrappers ---- */
 
 /* Retype untyped memory into a new object at dest_slot in caller's CSpace */
 static inline int salty_untyped_retype(cap_t untyped, uint64_t new_type,
@@ -317,41 +396,6 @@ static inline int salty_vspace_unmap(cap_t vspace, uint64_t vaddr) {
     return (int)r.error;
 }
 
-/* IoPort operations */
-static inline uint8_t salty_ioport_in8(cap_t ioport, uint64_t offset) {
-    struct salty_result r = salty_invoke(ioport, IOPORT_IN8, offset, 0, 0, 0);
-    return (uint8_t)r.value;
-}
-
-static inline void salty_ioport_out8(cap_t ioport, uint64_t offset,
-                                     uint8_t value) {
-    salty_invoke(ioport, IOPORT_OUT8, offset, (uint64_t)value, 0, 0);
-}
-
-static inline uint16_t salty_ioport_in16(cap_t ioport, uint64_t offset) {
-    struct salty_result r = salty_invoke(ioport, IOPORT_IN16, offset, 0, 0, 0);
-    return (uint16_t)r.value;
-}
-
-static inline void salty_ioport_out16(cap_t ioport, uint64_t offset,
-                                      uint16_t value) {
-    salty_invoke(ioport, IOPORT_OUT16, offset, (uint64_t)value, 0, 0);
-}
-
-/* IRQ handler operations */
-static inline int salty_irq_handler_ack(cap_t irq_handler) {
-    struct salty_result r = salty_invoke(irq_handler, IRQ_HANDLER_ACK, 0, 0, 0, 0);
-    return (int)r.error;
-}
-
-static inline int salty_irq_handler_set_notification(cap_t irq_handler,
-                                                      cap_t ntfn) {
-    struct salty_result r = salty_invoke(irq_handler,
-                                         IRQ_HANDLER_SET_NOTIFICATION,
-                                         ntfn, 0, 0, 0);
-    return (int)r.error;
-}
-
 /* Install a page table at a specific level in a VSpace */
 static inline int salty_vspace_map_pt(cap_t vspace, cap_t frame,
                                        uint64_t vaddr, uint64_t level) {
@@ -369,39 +413,55 @@ static inline int salty_cnode_copy(cap_t src_cnode, uint64_t src_slot,
     return (int)r.error;
 }
 
-/* Serial output via direct port I/O (for early debugging before console) */
-static inline void salty_serial_putc(char c) {
-    /* Wait for THR empty (LSR bit 5) then write to THR */
-    uint8_t status;
-    do {
-        __asm__ volatile("inb %1, %0" : "=a"(status) : "Nd"((uint16_t)0x3FD));
-    } while ((status & 0x20) == 0);
-    __asm__ volatile("outb %0, %1" :: "a"((uint8_t)c), "Nd"((uint16_t)0x3F8));
+/* IRQ handler operations */
+static inline int salty_irq_handler_ack(cap_t irq_handler) {
+    struct salty_result r = salty_invoke(irq_handler, IRQ_HANDLER_ACK, 0, 0, 0, 0);
+    return (int)r.error;
 }
 
-static inline void salty_serial_puts(const char *s) {
-    while (*s) {
-        salty_serial_putc(*s++);
-    }
+static inline int salty_irq_handler_set_notification(cap_t irq_handler,
+                                                      cap_t ntfn) {
+    struct salty_result r = salty_invoke(irq_handler,
+                                         IRQ_HANDLER_SET_NOTIFICATION,
+                                         ntfn, 0, 0, 0);
+    return (int)r.error;
 }
 
-static inline void salty_serial_hex(uint64_t val) {
-    static const char hex[] = "0123456789abcdef";
-    salty_serial_putc('0');
-    salty_serial_putc('x');
-    if (val == 0) {
-        salty_serial_putc('0');
-        return;
-    }
-    char buf[16];
-    int pos = 15;
-    while (val > 0 && pos >= 0) {
-        buf[pos--] = hex[val & 0xF];
-        val >>= 4;
-    }
-    for (int i = pos + 1; i < 16; i++) {
-        salty_serial_putc(buf[i]);
-    }
-}
+#else /* !SALTY_STATIC — extern declarations for libsalty.so */
+
+extern struct salty_result salty_invoke(cap_t cap, uint64_t label,
+                                        uint64_t arg0, uint64_t arg1,
+                                        uint64_t arg2, uint64_t arg3);
+extern int salty_send(cap_t ep, const struct salty_msg *msg);
+extern int salty_recv(cap_t ep, struct salty_msg *msg, uint64_t *badge);
+extern int salty_call(cap_t ep, const struct salty_msg *msg, struct salty_msg *reply);
+extern int salty_reply_recv(cap_t ep, const struct salty_msg *reply,
+                             struct salty_msg *out_msg, uint64_t *badge);
+extern int salty_signal(cap_t ntfn, uint64_t bits);
+extern uint64_t salty_wait(cap_t ntfn);
+extern void salty_yield(void);
+extern int salty_untyped_retype(cap_t untyped, uint64_t new_type,
+                                 uint64_t size_bits, uint64_t dest_slot);
+extern int salty_tcb_configure(cap_t tcb, uint64_t rip,
+                                uint64_t rsp, uint64_t ipc_buf);
+extern int salty_tcb_resume(cap_t tcb);
+extern int salty_tcb_set_space(cap_t tcb, cap_t cspace, cap_t vspace);
+extern int salty_tcb_set_fault_handler(cap_t tcb, cap_t fault_ep);
+extern int salty_sc_configure(cap_t sc, uint64_t budget_us,
+                               uint64_t period_us);
+extern int salty_sc_bind(cap_t sc, cap_t tcb);
+extern int salty_vspace_map(cap_t vspace, cap_t frame,
+                             uint64_t vaddr, uint64_t flags);
+extern int salty_vspace_unmap(cap_t vspace, uint64_t vaddr);
+extern int salty_vspace_map_pt(cap_t vspace, cap_t frame,
+                                uint64_t vaddr, uint64_t level);
+extern int salty_cnode_copy(cap_t src_cnode, uint64_t src_slot,
+                             cap_t dest_cnode, uint64_t dest_slot,
+                             uint64_t rights);
+extern int salty_irq_handler_ack(cap_t irq_handler);
+extern int salty_irq_handler_set_notification(cap_t irq_handler,
+                                               cap_t ntfn);
+
+#endif /* SALTY_STATIC */
 
 #endif /* LIBSALTY_H */
