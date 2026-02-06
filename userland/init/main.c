@@ -64,9 +64,11 @@ void *__salty_ipc_buffer = (void *)0;
 
 /* Child process code base address (4 MB in child VSpace) */
 #define CHILD_CODE_VADDR    0x0000000000400000ULL
-/* Child stack (8 MB in child VSpace) */
+/* Child stack region in child VSpace */
 #define CHILD_STACK_VADDR   0x0000000000800000ULL
-#define CHILD_STACK_TOP     (CHILD_STACK_VADDR + 4096)
+#define CHILD_STACK_PAGES   8
+#define CHILD_STACK_SIZE    (CHILD_STACK_PAGES * 4096ULL)
+#define CHILD_STACK_TOP     (CHILD_STACK_VADDR + CHILD_STACK_SIZE)
 
 /* Dynamic linking addresses in child VSpace */
 #define CHILD_RTLD_VADDR    0x0000000002000000ULL  /* ld-salty.so load address */
@@ -614,15 +616,34 @@ static int phase3_spawn_console(cap_t ut) {
         salty_serial_puts("[INIT] Initrd mapped in child VSpace\n");
     }
 
-    /* 5. Map child stack */
-    err = salty_vspace_map(CAP_CHILD_VSPACE, CAP_CHILD_STACK_FR,
-                           CHILD_STACK_VADDR,
-                           VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER);
-    if (err != 0) {
-        salty_serial_puts("[INIT] FAIL: child stack map err=");
-        salty_serial_hex((uint64_t)err);
-        salty_serial_puts("\n");
-        return -1;
+    /* 5. Map child stack pages.
+     * Reserve CAP_CHILD_STACK_FR for the top page because we scratch-map it
+     * later to write the initial argc/argv/envp/auxv frame.
+     */
+    for (size_t pg = 0; pg < CHILD_STACK_PAGES; pg++) {
+        uint64_t page_vaddr = CHILD_STACK_VADDR + pg * 4096ULL;
+        cap_t frame_slot = CAP_CHILD_STACK_FR;
+
+        if (pg != CHILD_STACK_PAGES - 1) {
+            frame_slot = loader_ctx.next_frame_slot++;
+            err = salty_untyped_retype(ut, OBJ_FRAME, 0, frame_slot);
+            if (err != 0) {
+                salty_serial_puts("[INIT] FAIL: child stack frame retype err=");
+                salty_serial_hex((uint64_t)err);
+                salty_serial_puts("\n");
+                return -1;
+            }
+        }
+
+        err = salty_vspace_map(CAP_CHILD_VSPACE, frame_slot,
+                               page_vaddr,
+                               VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER);
+        if (err != 0) {
+            salty_serial_puts("[INIT] FAIL: child stack map err=");
+            salty_serial_hex((uint64_t)err);
+            salty_serial_puts("\n");
+            return -1;
+        }
     }
 
     /* 6. Copy caps into child's CNode.
@@ -639,7 +660,7 @@ static int phase3_spawn_console(cap_t ut) {
 
     /* Copy child TCB cap -> child CNode slot 0 */
     err = salty_cnode_copy(CAP_SELF_CSPACE, CAP_CHILD_TCB,
-                           CAP_CHILD_CNODE, 0, 0);
+                           CAP_CHILD_CNODE, 0, CAP_RIGHTS_ALL);
     if (err != 0) {
         salty_serial_puts("[INIT] FAIL: copy child TCB cap err=");
         salty_serial_hex((uint64_t)err);
@@ -649,7 +670,7 @@ static int phase3_spawn_console(cap_t ut) {
 
     /* Copy child VSpace cap -> child CNode slot 1 */
     err = salty_cnode_copy(CAP_SELF_CSPACE, CAP_CHILD_VSPACE,
-                           CAP_CHILD_CNODE, 1, 0);
+                           CAP_CHILD_CNODE, 1, CAP_RIGHTS_ALL);
     if (err != 0) {
         salty_serial_puts("[INIT] FAIL: copy child VSpace cap err=");
         salty_serial_hex((uint64_t)err);
@@ -659,7 +680,7 @@ static int phase3_spawn_console(cap_t ut) {
 
     /* Copy child CNode cap -> child CNode slot 2 */
     err = salty_cnode_copy(CAP_SELF_CSPACE, CAP_CHILD_CNODE,
-                           CAP_CHILD_CNODE, 2, 0);
+                           CAP_CHILD_CNODE, 2, CAP_RIGHTS_ALL);
     if (err != 0) {
         salty_serial_puts("[INIT] FAIL: copy child CNode cap err=");
         salty_serial_hex((uint64_t)err);
@@ -669,7 +690,7 @@ static int phase3_spawn_console(cap_t ut) {
 
     /* Copy console endpoint -> child CNode slot 3 */
     err = salty_cnode_copy(CAP_SELF_CSPACE, CAP_CHILD_EP,
-                           CAP_CHILD_CNODE, 3, 0);
+                           CAP_CHILD_CNODE, 3, CAP_RIGHTS_ALL);
     if (err != 0) {
         salty_serial_puts("[INIT] FAIL: copy child EP cap err=");
         salty_serial_hex((uint64_t)err);
@@ -679,7 +700,7 @@ static int phase3_spawn_console(cap_t ut) {
 
     /* Copy IoPort cap -> child CNode slot 4 */
     err = salty_cnode_copy(CAP_SELF_CSPACE, CAP_COM1_IOPORT,
-                           CAP_CHILD_CNODE, 4, 0);
+                           CAP_CHILD_CNODE, 4, CAP_RIGHTS_ALL);
     if (err != 0) {
         salty_serial_puts("[INIT] WARN: copy IoPort cap err=");
         salty_serial_hex((uint64_t)err);
@@ -688,7 +709,7 @@ static int phase3_spawn_console(cap_t ut) {
 
     /* Copy IRQ handler -> child CNode slot 5 */
     err = salty_cnode_copy(CAP_SELF_CSPACE, CAP_COM1_IRQ,
-                           CAP_CHILD_CNODE, 5, 0);
+                           CAP_CHILD_CNODE, 5, CAP_RIGHTS_ALL);
     if (err != 0) {
         salty_serial_puts("[INIT] WARN: copy IRQ cap err=");
         salty_serial_hex((uint64_t)err);
@@ -697,7 +718,7 @@ static int phase3_spawn_console(cap_t ut) {
 
     /* Copy notification -> child CNode slot 6 */
     err = salty_cnode_copy(CAP_SELF_CSPACE, CAP_COM1_NTFN,
-                           CAP_CHILD_CNODE, 6, 0);
+                           CAP_CHILD_CNODE, 6, CAP_RIGHTS_ALL);
     if (err != 0) {
         salty_serial_puts("[INIT] WARN: copy NTFN cap err=");
         salty_serial_hex((uint64_t)err);
@@ -707,7 +728,8 @@ static int phase3_spawn_console(cap_t ut) {
     /* Copy Untyped cap -> child CNode slot 7 (for rtld frame allocation) */
     if (is_dynamic) {
         err = salty_cnode_copy(CAP_SELF_CSPACE, ut,
-                               CAP_CHILD_CNODE, CAP_CHILD_UNTYPED_OFFSET, 0);
+                               CAP_CHILD_CNODE, CAP_CHILD_UNTYPED_OFFSET,
+                               CAP_RIGHTS_ALL);
         if (err != 0) {
             salty_serial_puts("[INIT] FAIL: copy Untyped cap err=");
             salty_serial_hex((uint64_t)err);
@@ -810,7 +832,7 @@ static int phase3_spawn_console(cap_t ut) {
         stack_base[idx++] = (uint64_t)initrd_size;
 
         stack_base[idx++] = AT_SALTY_FRAME_SLOT;
-        stack_base[idx++] = (uint64_t)loader_ctx.next_frame_slot;
+        stack_base[idx++] = (uint64_t)(CAP_CHILD_UNTYPED_OFFSET + 1);  /* First free slot in child CNode */
 
         /* AT_NULL terminator */
         stack_base[idx++] = AT_NULL;
@@ -821,8 +843,8 @@ static int phase3_spawn_console(cap_t ut) {
 
         salty_vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
 
-        /* Set child RSP to point at the auxv data on the stack page */
-        child_rsp = CHILD_STACK_VADDR + 4096 - STACK_FRAME_SIZE;
+        /* Set child RSP to point at the auxv data on the top stack page */
+        child_rsp = CHILD_STACK_TOP - STACK_FRAME_SIZE;
         /* Entry point is the rtld, not the executable */
         child_entry = rtld_result.entry;
 

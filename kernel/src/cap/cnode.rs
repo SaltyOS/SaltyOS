@@ -7,7 +7,7 @@
 
 use super::{
     alloc_slot, free_slot, get_cap, get_meta, get_meta_mut, CapRights, Capability, CDT,
-    INVALID_SLOT,
+    KernelObject, ObjectType, INVALID_SLOT,
 };
 
 /// CNode size (number of slots as power of 2)
@@ -48,12 +48,15 @@ impl CapRef {
 /// Each entry is either INVALID_SLOT (empty) or a valid slot index.
 #[repr(C, align(4096))]
 pub struct CNode {
+    /// Kernel object header (must be first for refcount access)
+    pub header: KernelObject,
     slots: [CapRef; CNODE_SIZE],
 }
 
 impl CNode {
     pub const fn new() -> Self {
         Self {
+            header: KernelObject::new(ObjectType::CNode, CNODE_SIZE_BITS as u8),
             slots: [CapRef::null(); CNODE_SIZE],
         }
     }

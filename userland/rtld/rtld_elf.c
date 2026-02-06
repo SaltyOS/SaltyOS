@@ -106,6 +106,39 @@ static int alloc_map_page(struct rtld_state *st, uint64_t vaddr, uint64_t flags,
     return 0;
 }
 
+#define RTLD_MAX_LIB_PAGES  256
+
+struct rtld_lib_page {
+    uint64_t vaddr;
+    cap_t frame_slot;
+    uint64_t flags;
+};
+
+/* Update bytes in an already-mapped target page by scratch-mapping its frame. */
+static int patch_mapped_page(struct rtld_state *st, cap_t frame_slot,
+                              const uint8_t *data, size_t data_offset,
+                              size_t page_offset, size_t copy_len) {
+    if (!data || copy_len == 0)
+        return 0;
+
+    uint64_t err = rtld_vspace_map(st->vspace, frame_slot, st->scratch_vaddr,
+                                    VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER);
+    if (err != 0) {
+        rtld_puts("[RTLD] patch map scratch failed err=");
+        rtld_hex(err);
+        rtld_putc('\n');
+        return -1;
+    }
+
+    volatile uint8_t *dst = (volatile uint8_t *)(st->scratch_vaddr + page_offset);
+    const uint8_t *src = data + data_offset;
+    for (size_t i = 0; i < copy_len; i++)
+        dst[i] = src[i];
+
+    rtld_vspace_unmap(st->vspace, st->scratch_vaddr);
+    return 0;
+}
+
 int load_shared_library(struct rtld_state *st, const char *name,
                          uint64_t load_addr) {
     rtld_puts("[RTLD] Loading ");
@@ -157,6 +190,8 @@ int load_shared_library(struct rtld_state *st, const char *name,
 
     uint64_t base = load_addr;
     uint64_t delta = base - min_vaddr;
+    struct rtld_lib_page pages[RTLD_MAX_LIB_PAGES];
+    size_t page_count = 0;
 
     /* Load each PT_LOAD segment */
     for (int i = 0; i < ehdr->e_phnum; i++) {
@@ -200,6 +235,48 @@ int load_shared_library(struct rtld_state *st, const char *name,
                     copy_len = 0;
             }
 
+            size_t existing = SIZE_MAX;
+            for (size_t j = 0; j < page_count; j++) {
+                if (pages[j].vaddr == page) {
+                    existing = j;
+                    break;
+                }
+            }
+
+            if (existing != SIZE_MAX) {
+                int err = patch_mapped_page(st, pages[existing].frame_slot,
+                                             cpio.data, data_offset,
+                                             page_offset, copy_len);
+                if (err != 0) {
+                    rtld_puts("[RTLD] patch_mapped_page failed\n");
+                    return -6;
+                }
+
+                uint64_t merged_flags = pages[existing].flags | flags;
+                if (merged_flags != pages[existing].flags) {
+                    rtld_vspace_unmap(st->vspace, page);
+                    uint64_t remap_err = rtld_vspace_map(st->vspace,
+                                                          pages[existing].frame_slot,
+                                                          page, merged_flags);
+                    if (remap_err != 0) {
+                        rtld_puts("[RTLD] remap merged flags failed vaddr=");
+                        rtld_hex(page);
+                        rtld_puts(" err=");
+                        rtld_hex(remap_err);
+                        rtld_putc('\n');
+                        return -6;
+                    }
+                    pages[existing].flags = merged_flags;
+                }
+                continue;
+            }
+
+            if (page_count >= RTLD_MAX_LIB_PAGES) {
+                rtld_puts("[RTLD] too many pages in library\n");
+                return -6;
+            }
+
+            cap_t frame_slot = st->next_frame_slot;
             int err = alloc_map_page(st, page, flags,
                                       cpio.data, data_offset,
                                       page_offset, copy_len);
@@ -207,6 +284,11 @@ int load_shared_library(struct rtld_state *st, const char *name,
                 rtld_puts("[RTLD] alloc_map_page failed\n");
                 return -6;
             }
+
+            pages[page_count].vaddr = page;
+            pages[page_count].frame_slot = frame_slot;
+            pages[page_count].flags = flags;
+            page_count++;
         }
     }
 

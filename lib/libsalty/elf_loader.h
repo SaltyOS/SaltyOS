@@ -107,6 +107,7 @@ struct elf_load_result {
 struct elf_page_entry {
     uint64_t vaddr;      /* Virtual address in child VSpace */
     cap_t    frame_cap;  /* Cap slot of the Frame */
+    uint64_t flags;      /* Current mapping flags in child VSpace */
 };
 
 /* Loader context: caller must provide cap slots and VSpace caps */
@@ -374,10 +375,10 @@ static inline int elf_load(
         uint64_t page_vaddr = seg_start;
         while (page_vaddr < seg_end) {
             /* Check if page already mapped by previous segment */
-            cap_t existing = 0;
+            size_t existing_idx = page_count;
             for (size_t j = 0; j < page_count; j++) {
                 if (pages[j].vaddr == page_vaddr) {
-                    existing = pages[j].frame_cap;
+                    existing_idx = j;
                     break;
                 }
             }
@@ -399,7 +400,8 @@ static inline int elf_load(
                 copy_len = (size_t)(copy_end - copy_start);
             }
 
-            if (existing) {
+            if (existing_idx < page_count) {
+                cap_t existing = pages[existing_idx].frame_cap;
                 /* Page exists; need to map at scratch, copy more data, unmap */
                 if (copy_len > 0 && src_offset + copy_len <= data_len) {
                     int err = salty_vspace_map(ctx->self_vspace, existing,
@@ -412,6 +414,27 @@ static inline int elf_load(
                             scratch[k] = data[src_offset + k];
                         salty_vspace_unmap(ctx->self_vspace, ctx->scratch_vaddr);
                     }
+                }
+
+                /* Merge permissions for overlapping PT_LOAD pages. */
+                uint64_t merged_flags = pages[existing_idx].flags | flags;
+                if (merged_flags != pages[existing_idx].flags) {
+                    salty_vspace_unmap(ctx->child_vspace, page_vaddr);
+                    int remap_err = salty_vspace_map(ctx->child_vspace, existing,
+                                                     page_vaddr, merged_flags);
+                    if (remap_err != 0) {
+                        salty_serial_puts("[ELF] remap child failed err=");
+                        salty_serial_hex((uint64_t)remap_err);
+                        salty_serial_puts(" vaddr=");
+                        salty_serial_hex(page_vaddr);
+                        salty_serial_puts(" frame=");
+                        salty_serial_hex((uint64_t)existing);
+                        salty_serial_puts(" flags=");
+                        salty_serial_hex(merged_flags);
+                        salty_serial_puts("\n");
+                        return ELF_MAP_FAILED;
+                    }
+                    pages[existing_idx].flags = merged_flags;
                 }
             } else {
                 /* New page */
@@ -485,6 +508,7 @@ static inline int elf_load(
 
                 pages[page_count].vaddr = page_vaddr;
                 pages[page_count].frame_cap = frame_slot;
+                pages[page_count].flags = flags;
                 page_count++;
             }
 

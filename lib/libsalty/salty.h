@@ -105,6 +105,9 @@ extern void *__salty_ipc_buffer;
 /* Scratch address for temporary frame mappings (32 MB) */
 #define SCRATCH_VADDR             0x0000000002000000ULL
 
+/* Capability rights bitmask (matches kernel CapRights) */
+#define CAP_RIGHTS_ALL            0xFFFFFFFFU
+
 /* Error codes (positive, returned in RAX) */
 #define SALTY_OK                  0
 #define SALTY_INVALID_CAPABILITY  1

@@ -3,6 +3,10 @@
  *
  * Produces ET_DYN (PIE) ELF with base address 0.
  * Includes PLT/GOT sections for dynamic linking via ld-salty.so.
+ *
+ * SIZEOF_HEADERS ensures the ELF header and program headers are placed
+ * inside the first PT_LOAD segment, making them accessible at runtime
+ * for the dynamic linker (ld-salty.so) to parse PT_DYNAMIC, PT_PHDR, etc.
  */
 
 OUTPUT_FORMAT(elf64-x86-64)
@@ -11,7 +15,7 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0;
+    . = SIZEOF_HEADERS;
 
     .interp       : { *(.interp) }
     .gnu.hash     : { *(.gnu.hash) }

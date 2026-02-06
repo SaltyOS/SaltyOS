@@ -149,8 +149,22 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
      * The difference is the slide applied by the loader.
      */
     uint64_t exe_load_delta = 0;
-    if (have_phdr)
+    if (have_phdr) {
         exe_load_delta = at_phdr - exe_phdr_vaddr;
+    } else if (at_phdr >= sizeof(Elf64_Ehdr)) {
+        /* Fallback: if no PT_PHDR, try reading the ELF header which is
+         * expected immediately before the phdrs (e_phoff == sizeof(Elf64_Ehdr)
+         * for all standard ELF64 binaries). Verify via magic bytes.
+         */
+        Elf64_Ehdr *exe_ehdr = (Elf64_Ehdr *)(at_phdr - sizeof(Elf64_Ehdr));
+        if (exe_ehdr->e_ident[0] == 0x7F && exe_ehdr->e_ident[1] == 'E' &&
+            exe_ehdr->e_ident[2] == 'L'  && exe_ehdr->e_ident[3] == 'F') {
+            exe_load_delta = at_phdr - exe_ehdr->e_phoff;
+            rtld_puts("[RTLD] PT_PHDR missing, computed delta from ELF header\n");
+        } else {
+            rtld_puts("[RTLD] WARN: no PT_PHDR and ELF header not found\n");
+        }
+    }
 
     /* Apply delta to exe_dyn (which was set from the file-level vaddr) */
     if (exe_dyn)

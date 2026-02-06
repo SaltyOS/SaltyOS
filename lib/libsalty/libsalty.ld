@@ -4,7 +4,7 @@
 
 OUTPUT_FORMAT("elf64-x86-64")
 SECTIONS {
-    . = 0;
+    . = SIZEOF_HEADERS;
     .gnu.hash : { *(.gnu.hash) }
     .dynsym   : { *(.dynsym) }
     .dynstr   : { *(.dynstr) }
