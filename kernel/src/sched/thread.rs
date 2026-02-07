@@ -46,6 +46,14 @@ pub enum BlockedReason {
         /// Badge
         badge: u64,
     },
+    /// Blocked on call() send phase - waiting for receiver to pick up
+    /// When recv() pops this, the sender stays blocked (transitions to ReplyWait)
+    CallSendBlocked {
+        /// Message to send
+        msg: super::super::ipc::Message,
+        /// Badge (sender identity)
+        badge: u64,
+    },
 }
 
 /// Thread Control Block

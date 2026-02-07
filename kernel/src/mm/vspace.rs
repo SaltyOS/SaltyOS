@@ -2,7 +2,7 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use super::{alloc_frame, free_frame, phys_to_virt, PhysAddr, VirtAddr, PAGE_SIZE};
+use super::{alloc_frame, free_frame, phys_to_virt, PhysAddr, SpinLock, VirtAddr, PAGE_SIZE};
 use crate::arch::x86_64::paging::PageTable;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -153,40 +153,7 @@ static mut PENDING_GENERATION: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0
 /// Global retire generation counter - increments for each retired tracking
 static mut GLOBAL_RETIRE_GEN: AtomicU64 = AtomicU64::new(0);
 
-/// Simple spinlock for deferred free list protection
-///
-/// This is a minimal spinlock implementation for protecting the deferred free list.
-/// In a full implementation, this would use proper ticket or queue-based locking.
-struct SpinLock {
-    locked: AtomicU8,
-}
-
-impl SpinLock {
-    pub const fn new() -> Self {
-        Self {
-            locked: AtomicU8::new(0),
-        }
-    }
-
-    #[inline]
-    pub fn lock(&self) {
-        // Test-and-set spinlock
-        while self
-            .locked
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            while self.locked.load(Ordering::Relaxed) != 0 {
-                core::hint::spin_loop();
-            }
-        }
-    }
-
-    #[inline]
-    pub fn unlock(&self) {
-        self.locked.store(0, Ordering::Release);
-    }
-}
+// SpinLock is imported from super (mm/mod.rs)
 
 /// Deferred free list for VSpaceTracking
 ///
@@ -804,6 +771,16 @@ impl VSpace {
         }
     }
 
+    /// Resolve a user virtual address to its physical address.
+    /// Returns None if the page is not mapped.
+    pub fn resolve_page(&self, vaddr: VirtAddr) -> Option<PhysAddr> {
+        let pte = self.read_entry(vaddr, 1)?;
+        if pte & ENTRY_PRESENT == 0 {
+            return None;
+        }
+        Some(pte & ENTRY_ADDR_MASK)
+    }
+
     /// Ensure page table exists at specified level, creating if needed
     /// level: 1=PT, 2=PD, 3=PDPT
     /// Returns physical address of the page table
@@ -826,7 +803,7 @@ impl VSpace {
                 4 => Self::pml4_index(vaddr),
                 3 => Self::pdpt_index(vaddr),
                 2 => Self::pd_index(vaddr),
-                _ => unreachable!(),
+                _ => return Err(VSpaceError::NotMapped),
             };
 
             let entry = table.entry(idx);
@@ -1023,7 +1000,7 @@ impl VSpace {
                 4 => Self::pml4_index(vaddr),
                 3 => Self::pdpt_index(vaddr),
                 2 => Self::pd_index(vaddr),
-                _ => unreachable!(),
+                _ => return Err(VSpaceError::NotMapped),
             };
 
             let entry = table.entry(idx);
@@ -1040,7 +1017,7 @@ impl VSpace {
             4 => Self::pml4_index(vaddr),
             3 => Self::pdpt_index(vaddr),
             2 => Self::pd_index(vaddr),
-            _ => unreachable!(),
+            _ => return Err(VSpaceError::NotMapped),
         };
 
         let existing = parent_table.entry(idx);
@@ -1284,6 +1261,102 @@ impl VSpace {
 
             free_frame(pd_addr);
         }
+    }
+
+    /// Walk user-half page tables starting from `start_vaddr`.
+    /// Returns up to `max_entries` mapped pages as (vaddr, phys, flags) tuples.
+    /// `next_vaddr` is set to the next address to continue scanning (0 if done).
+    pub fn walk_pages(
+        &self,
+        start_vaddr: VirtAddr,
+        max_entries: usize,
+    ) -> (usize, VirtAddr, [(VirtAddr, PhysAddr, u64); 6]) {
+        let mut results = [(0u64, 0u64, 0u64); 6];
+        let max = if max_entries > 6 { 6 } else { max_entries };
+        let mut count = 0usize;
+        let mut vaddr = start_vaddr & !0xFFF; // Align to page
+
+        let pml4 = unsafe { &*self.pml4() };
+
+        // Only walk user half (PML4 entries 0..255)
+        let start_pml4 = Self::pml4_index(vaddr);
+
+        'outer: for pml4_idx in start_pml4..USER_PML4_MAX {
+            let pml4e = pml4.entry(pml4_idx);
+            if pml4e & ENTRY_PRESENT == 0 {
+                // Skip to next PML4 region
+                vaddr = ((pml4_idx + 1) as u64) << 39;
+                continue;
+            }
+            let pdpt = unsafe { &*(phys_to_virt(pml4e & ENTRY_ADDR_MASK) as *const PageTable) };
+
+            let start_pdpt = if pml4_idx == start_pml4 { Self::pdpt_index(vaddr) } else { 0 };
+
+            for pdpt_idx in start_pdpt..512 {
+                let pdpte = pdpt.entry(pdpt_idx);
+                if pdpte & ENTRY_PRESENT == 0 {
+                    vaddr = ((pml4_idx as u64) << 39) | ((pdpt_idx + 1) as u64) << 30;
+                    continue;
+                }
+                // Skip 1GB huge pages
+                if pdpte & (1 << 7) != 0 {
+                    vaddr = ((pml4_idx as u64) << 39) | ((pdpt_idx + 1) as u64) << 30;
+                    continue;
+                }
+                let pd = unsafe { &*(phys_to_virt(pdpte & ENTRY_ADDR_MASK) as *const PageTable) };
+
+                let start_pd = if pml4_idx == start_pml4 && pdpt_idx == start_pdpt {
+                    Self::pd_index(vaddr)
+                } else { 0 };
+
+                for pd_idx in start_pd..512 {
+                    let pde = pd.entry(pd_idx);
+                    if pde & ENTRY_PRESENT == 0 {
+                        vaddr = ((pml4_idx as u64) << 39) | ((pdpt_idx as u64) << 30) |
+                                ((pd_idx + 1) as u64) << 21;
+                        continue;
+                    }
+                    // Skip 2MB huge pages
+                    if pde & (1 << 7) != 0 {
+                        vaddr = ((pml4_idx as u64) << 39) | ((pdpt_idx as u64) << 30) |
+                                ((pd_idx + 1) as u64) << 21;
+                        continue;
+                    }
+                    let pt = unsafe { &*(phys_to_virt(pde & ENTRY_ADDR_MASK) as *const PageTable) };
+
+                    let start_pt = if pml4_idx == start_pml4 && pdpt_idx == start_pdpt &&
+                                      pd_idx == start_pd {
+                        Self::pt_index(vaddr)
+                    } else { 0 };
+
+                    for pt_idx in start_pt..512 {
+                        let pte = pt.entry(pt_idx);
+                        if pte & ENTRY_PRESENT == 0 {
+                            continue;
+                        }
+
+                        let page_vaddr = ((pml4_idx as u64) << 39) |
+                                          ((pdpt_idx as u64) << 30) |
+                                          ((pd_idx as u64) << 21) |
+                                          ((pt_idx as u64) << 12);
+                        let page_phys = pte & ENTRY_ADDR_MASK;
+                        let page_flags = pte & !ENTRY_ADDR_MASK;
+
+                        results[count] = (page_vaddr, page_phys, page_flags);
+                        count += 1;
+
+                        if count >= max {
+                            // Set next_vaddr to the page after this one
+                            let next = page_vaddr + PAGE_SIZE as u64;
+                            return (count, next, results);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Done scanning
+        (count, 0, results)
     }
 }
 

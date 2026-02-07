@@ -16,6 +16,7 @@ pub use vspace::{
 };
 
 use crate::ParsedBootInfo;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 /// Page size (4KB)
 pub const PAGE_SIZE: usize = 4096;
@@ -31,8 +32,52 @@ pub type PhysAddr = u64;
 /// Virtual address type
 pub type VirtAddr = u64;
 
+/// Simple spinlock for SMP-safe access to shared kernel structures.
+///
+/// Uses test-and-set with TTAS (test-and-test-and-set) optimization.
+/// Debug builds include deadlock detection via spin count limit.
+pub(crate) struct SpinLock {
+    locked: AtomicU8,
+}
+
+impl SpinLock {
+    pub const fn new() -> Self {
+        Self {
+            locked: AtomicU8::new(0),
+        }
+    }
+
+    #[inline]
+    pub fn lock(&self) {
+        let mut _spins: u32 = 0;
+        while self
+            .locked
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            while self.locked.load(Ordering::Relaxed) != 0 {
+                core::hint::spin_loop();
+                _spins += 1;
+                #[cfg(debug_assertions)]
+                if _spins > 10_000_000 {
+                    crate::serial_puts("[SPINLOCK] possible deadlock detected\n");
+                    _spins = 0;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn unlock(&self) {
+        self.locked.store(0, Ordering::Release);
+    }
+}
+
 /// Global frame allocator
 static mut FRAME_ALLOCATOR: Option<FrameAllocator> = None;
+
+/// Spinlock protecting FRAME_ALLOCATOR for SMP safety
+static FRAME_LOCK: SpinLock = SpinLock::new();
 
 /// Initialize memory management from boot info
 pub fn init(boot_info: &ParsedBootInfo) {
@@ -42,25 +87,37 @@ pub fn init(boot_info: &ParsedBootInfo) {
     }
 }
 
-/// Allocate a physical frame
+/// Allocate a physical frame (SMP-safe)
 pub fn alloc_frame() -> Option<PhysAddr> {
-    // SAFETY: Single-threaded access, interrupts disabled during allocation
-    unsafe { (*(&raw mut FRAME_ALLOCATOR)).as_mut()?.alloc() }
+    let irq_flag = unsafe { save_irq_disable() };
+    FRAME_LOCK.lock();
+    let result = unsafe { (*(&raw mut FRAME_ALLOCATOR)).as_mut()?.alloc() };
+    FRAME_LOCK.unlock();
+    unsafe { restore_irq(irq_flag) };
+    result
 }
 
-/// Allocate contiguous physical frames
+/// Allocate contiguous physical frames (SMP-safe)
 pub fn alloc_contiguous_frames(count: usize) -> Option<PhysAddr> {
-    unsafe { (*(&raw mut FRAME_ALLOCATOR)).as_mut()?.alloc_contiguous(count) }
+    let irq_flag = unsafe { save_irq_disable() };
+    FRAME_LOCK.lock();
+    let result = unsafe { (*(&raw mut FRAME_ALLOCATOR)).as_mut()?.alloc_contiguous(count) };
+    FRAME_LOCK.unlock();
+    unsafe { restore_irq(irq_flag) };
+    result
 }
 
-/// Free a physical frame
+/// Free a physical frame (SMP-safe)
 pub fn free_frame(addr: PhysAddr) {
-    // SAFETY: Single-threaded access, interrupts disabled during deallocation
+    let irq_flag = unsafe { save_irq_disable() };
+    FRAME_LOCK.lock();
     unsafe {
         if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
             allocator.free(addr);
         }
     }
+    FRAME_LOCK.unlock();
+    unsafe { restore_irq(irq_flag) };
 }
 
 /// Free multiple contiguous frames

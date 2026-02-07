@@ -8,7 +8,7 @@
 
 use super::slot::{free_slot, get_cap, get_meta, CapSlot, INVALID_SLOT, MAX_SLOTS};
 use super::{CapError, ObjectType, CDT};
-use crate::cap::cnode::CNODE_SIZE;
+use crate::cap::cnode::{effective_cnode_bits, CapRef};
 use crate::mm::{self, PhysAddr, PAGE_SIZE};
 use core::mem::MaybeUninit;
 
@@ -199,26 +199,31 @@ impl UntypedTracker {
     }
 }
 
-/// Get object size in bytes for a given type
-fn object_size(obj_type: ObjectType, size_bits: u8) -> usize {
+/// Get object size in bytes for a given type.
+///
+/// For CNode, uses `effective_cnode_bits()` to determine slot count,
+/// returning header + trailing slots.
+fn object_size(obj_type: ObjectType, size_bits: u8) -> Result<usize, CapError> {
     match obj_type {
-        ObjectType::Endpoint => core::mem::size_of::<crate::ipc::Endpoint>(),
-        ObjectType::Notification => core::mem::size_of::<crate::ipc::Notification>(),
-        // CNode implementation is fixed-size (CNODE_SIZE slots, 4KiB aligned).
-        // Ignore requested size_bits to avoid undersized allocations.
-        ObjectType::CNode => core::mem::size_of::<crate::cap::CNode>(),
-        ObjectType::Tcb => core::mem::size_of::<crate::sched::thread::Tcb>(),
-        ObjectType::VSpace => PAGE_SIZE, // Page table (always 4KB-aligned PML4)
+        ObjectType::Endpoint => Ok(core::mem::size_of::<crate::ipc::Endpoint>()),
+        ObjectType::Notification => Ok(core::mem::size_of::<crate::ipc::Notification>()),
+        ObjectType::CNode => {
+            let bits = effective_cnode_bits(size_bits)?;
+            Ok(core::mem::size_of::<crate::cap::CNode>()
+                + ((1usize << bits) * core::mem::size_of::<CapRef>()))
+        }
+        ObjectType::Tcb => Ok(core::mem::size_of::<crate::sched::thread::Tcb>()),
+        ObjectType::VSpace => Ok(PAGE_SIZE), // Page table (always 4KB-aligned PML4)
         ObjectType::Frame => {
             // Minimum 4KB page; size_bits=0 defaults to PAGE_SIZE
             let bits = if size_bits < 12 { 12 } else { size_bits };
-            1usize << bits
+            Ok(1usize << bits)
         }
-        ObjectType::Untyped => 1usize << size_bits,
-        ObjectType::IrqHandler => core::mem::size_of::<crate::ipc::IrqHandler>(),
-        ObjectType::IoPort => core::mem::size_of::<crate::cap::IoPortRange>(),
-        ObjectType::SchedContext => core::mem::size_of::<crate::sched::thread::SchedContext>(),
-        ObjectType::Null => 0,
+        ObjectType::Untyped => Ok(1usize << size_bits),
+        ObjectType::IrqHandler => Ok(core::mem::size_of::<crate::ipc::IrqHandler>()),
+        ObjectType::IoPort => Ok(core::mem::size_of::<crate::cap::IoPortRange>()),
+        ObjectType::SchedContext => Ok(core::mem::size_of::<crate::sched::thread::SchedContext>()),
+        ObjectType::Null => Ok(0),
     }
 }
 
@@ -247,9 +252,9 @@ unsafe fn init_object(
             }
 
             ObjectType::CNode => {
-                let cnode = virt_addr as *mut crate::cap::CNode;
-                cnode.write(crate::cap::CNode::new());
-                Ok(cnode as *mut KernelObject)
+                let bits = effective_cnode_bits(size_bits)?;
+                crate::cap::CNode::init_at(virt_addr, bits);
+                Ok(virt_addr as *mut KernelObject)
             }
 
             ObjectType::Frame => Err(CapError::InvalidOperation),
@@ -346,7 +351,7 @@ impl UntypedMemory {
         dest_cnode: &mut crate::cap::cnode::CNode,
         dest_offset: usize,
     ) -> Result<(), CapError> {
-        let obj_size = object_size(new_type, size_bits);
+        let obj_size = object_size(new_type, size_bits)?;
         let total_size = obj_size * num_objects;
 
         // Validate destination range before probing slot occupancy.
@@ -355,7 +360,7 @@ impl UntypedMemory {
         let end = dest_offset
             .checked_add(num_objects)
             .ok_or(CapError::InvalidSlot)?;
-        if end > CNODE_SIZE {
+        if end > dest_cnode.num_slots() {
             return Err(CapError::InvalidSlot);
         }
 
@@ -371,9 +376,16 @@ impl UntypedMemory {
             }
         }
 
-        // Align watermark to object size (critical for Frame/VSpace page alignment)
+        // Align watermark to object size (critical for Frame/VSpace page alignment).
+        // CNode only needs CapRef alignment (4 bytes), not full slot-array size,
+        // since CNodes are never user-mapped.
         if obj_size > 0 {
-            let aligned = (self.watermark as usize + obj_size - 1) & !(obj_size - 1);
+            let align = if new_type == ObjectType::CNode {
+                core::mem::align_of::<CapRef>()
+            } else {
+                obj_size
+            };
+            let aligned = (self.watermark as usize + align - 1) & !(align - 1);
             self.watermark = aligned as u32;
 
             // Re-check after alignment

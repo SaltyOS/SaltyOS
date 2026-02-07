@@ -14,6 +14,12 @@
  */
 struct salty_ipc_context __salty_ipc_ctx = { 0 };
 
+/* Next available frame slot in the caller's CNode.
+ * The rtld (ld-salty.so) sets the authoritative value after loading .so files.
+ * This weak definition provides a link-time fallback; rtld overrides at runtime.
+ */
+__attribute__((weak)) uint64_t __salty_next_frame_slot = 64;
+
 /* Generic capability invocation */
 struct salty_result salty_invoke(
     cap_t cap,
@@ -219,4 +225,71 @@ void salty_debug_dump_state(void) {
 int salty_tcb_set_ipc_buffer(cap_t tcb, uint64_t addr) {
     struct salty_result r = salty_invoke(tcb, TCB_SET_IPC_BUFFER, addr, 0, 0, 0);
     return (int)r.error;
+}
+
+/* Walk user-half page tables */
+int salty_vspace_walk(cap_t vspace, uint64_t start_vaddr,
+                       uint64_t max_entries) {
+    struct salty_result r = salty_invoke(vspace, VSPACE_WALK,
+                                         start_vaddr, max_entries, 0, 0);
+    return (int)r.error;
+}
+
+/* Copy a page from source VSpace into destination frame */
+int salty_vspace_copy_page(cap_t src_vspace, uint64_t src_vaddr,
+                            cap_t dst_frame) {
+    struct salty_result r = salty_invoke(src_vspace, VSPACE_COPY_PAGE,
+                                         src_vaddr, dst_frame, 0, 0);
+    return (int)r.error;
+}
+
+/* Write registers to a TCB */
+int salty_tcb_write_registers(cap_t tcb, uint64_t flags,
+                               uint64_t rip, uint64_t rsp) {
+    struct salty_result r = salty_invoke(tcb, TCB_WRITE_REGISTERS,
+                                         flags, rip, rsp, 0);
+    return (int)r.error;
+}
+
+/* Suspend a TCB */
+int salty_tcb_suspend(cap_t tcb) {
+    struct salty_result r = salty_invoke(tcb, TCB_SUSPEND, 0, 0, 0, 0);
+    return (int)r.error;
+}
+
+/* Fork implementation: called from fork.S trampoline.
+ * Sends PM_FORK to procmgr with saved RSP and child entry point.
+ * Returns child PID to parent (or -1 on error).
+ */
+#define _POSIX_CAP_PROCMGR_EP 3
+#define _POSIX_PM_FORK         5
+
+int _posix_fork_impl(uint64_t saved_rsp, uint64_t child_entry) {
+    if (saved_rsp == 0 || child_entry == 0)
+        return -1;
+
+    /* Stack layout produced by libsalty/fork.S after pushes:
+     *   [0]=r15 [1]=r14 [2]=r13 [3]=r12 [4]=rbx [5]=rbp [6]=return RIP
+     */
+    const uint64_t *saved = (const uint64_t *)saved_rsp;
+
+    struct salty_msg msg, reply;
+    msg.label = _POSIX_PM_FORK;
+    msg.length = 9;
+    msg.regs[0] = saved_rsp;
+    msg.regs[1] = child_entry;
+    msg.regs[2] = saved[5]; /* rbp */
+    msg.regs[3] = saved[4]; /* rbx */
+    msg.regs[4] = saved[3]; /* r12 */
+    msg.regs[5] = saved[2]; /* r13 */
+    msg.regs[6] = saved[1]; /* r14 */
+    msg.regs[7] = saved[0]; /* r15 */
+    msg.regs[8] = saved[6]; /* return RIP */
+    for (int i = 9; i < 20; i++) msg.regs[i] = 0;
+
+    int err = salty_call(_POSIX_CAP_PROCMGR_EP, &msg, &reply);
+    if (err != 0 || reply.label != 0) /* SALTY_OK = 0 */
+        return -1;
+
+    return (int)reply.regs[0];
 }

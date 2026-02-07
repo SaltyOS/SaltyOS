@@ -358,16 +358,7 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
                 serial_hex(f.rip);
                 serial_puts(" -> delivering via IPC\n");
 
-                // Block faulting thread
-                (*current).state = crate::sched::thread::ThreadState::Blocked;
-                (*current).blocked_reason = Some(
-                    crate::sched::thread::BlockedReason::FaultBlocked {
-                        msg,
-                        badge: 0,
-                    },
-                );
-
-                // Deliver to handler endpoint
+                // Deliver to handler endpoint (sets state/blocked_reason internally)
                 fault_ep.deliver_fault(current, &msg);
 
                 // Switch to handler (or whoever is next)

@@ -76,7 +76,19 @@ impl Endpoint {
             match self.state {
                 EndpointState::RecvBlocked => {
                     // FASTPATH: Receiver waiting - transfer immediately
-                    let receiver = self.recv_queue.pop().unwrap();
+                    let receiver = match self.recv_queue.pop() {
+                        Some(r) => r,
+                        None => {
+                            // State inconsistency — recover by falling through to block
+                            self.state = EndpointState::Idle;
+                            self.send_queue.push(current);
+                            self.state = EndpointState::SendBlocked;
+                            (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
+                            let reason = BlockedReason::SendBlocked { msg: *msg, badge };
+                            block_current_thread(current, reason);
+                            return;
+                        }
+                    };
 
                     // Set up reply capability in receiver's TCB
                     // The receiver (server) can now reply to the sender (client)
@@ -117,26 +129,56 @@ impl Endpoint {
             match self.state {
                 EndpointState::SendBlocked => {
                     // FASTPATH: Sender waiting - transfer immediately
-                    let sender = self.send_queue.pop().unwrap();
+                    let sender = match self.send_queue.pop() {
+                        Some(s) => s,
+                        None => {
+                            // State inconsistency — recover by blocking receiver
+                            self.state = EndpointState::Idle;
+                            self.recv_queue.push(current);
+                            self.state = EndpointState::RecvBlocked;
+                            (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
+                            block_current_thread(current, BlockedReason::RecvBlocked);
+                            let msg = (*current).saved_caller_msg;
+                            let badge = (*current).saved_caller_badge;
+                            return (msg, badge);
+                        }
+                    };
 
-                    // Extract message from sender's blocked reason
-                    let (msg, badge, is_fault) = match (*sender).blocked_reason {
+                    // Extract message from sender's blocked reason and determine
+                    // whether sender should be kept blocked (fault/call) or woken
+                    let (msg, badge, keep_blocked) = match (*sender).blocked_reason {
                         Some(BlockedReason::SendBlocked { msg, badge }) => (msg, badge, false),
                         Some(BlockedReason::FaultBlocked { msg, badge }) => (msg, badge, true),
+                        Some(BlockedReason::CallSendBlocked { msg, badge }) => (msg, badge, true),
                         _ => (Message::empty(), 0, false),
                     };
 
                     // Set up reply capability in receiver's (current thread's) TCB
                     // The receiver can now reply to the sender
                     (*current).reply_tcb = sender;
-                    (*current).reply_can_grant = true;
+                    (*current).reply_can_grant = !matches!(
+                        (*sender).blocked_reason,
+                        Some(BlockedReason::FaultBlocked { .. })
+                    );
 
                     self.transfer_message(sender, current, &msg, badge);
 
-                    if is_fault {
-                        // Fault sender: keep blocked until reply (via reply_recv)
-                        // Just clear endpoint ref since it's no longer in the queue
+                    if keep_blocked {
+                        // Fault/Call sender: keep blocked until reply (via reply_recv)
+                        // Clear endpoint ref since it's no longer in the queue
                         (*sender).blocked_endpoint = core::ptr::null_mut();
+
+                        // For call senders, transition to ReplyWait so reply_recv
+                        // can match it (same as fastpath call)
+                        if matches!(
+                            (*sender).blocked_reason,
+                            Some(BlockedReason::CallSendBlocked { .. })
+                        ) {
+                            (*sender).blocked_reason = Some(BlockedReason::ReplyWait {
+                                msg,
+                                badge,
+                            });
+                        }
                     } else {
                         // Regular sender: wake immediately
                         (*sender).state = ThreadState::Ready;
@@ -170,23 +212,76 @@ impl Endpoint {
     }
 
     /// Call (send + recv atomically)
+    ///
+    /// Unlike send() followed by recv(), this is atomic: the caller is blocked
+    /// BEFORE the receiver is woken, preventing a race where the receiver
+    /// replies before the caller enters the Blocked state.
     pub fn call(&mut self, msg: &Message, badge: u64) -> Message {
-        self.send(msg, badge);
-
-        // After send, we need to receive a reply
-        // The reply will come via the server's reply_tcb capability
         unsafe {
             let current = get_scheduler().current();
             Self::cache_receive_slot(current);
 
-            // Wait for reply
-            // The reply will be delivered to saved_caller_msg by the server
-            (*current).state = ThreadState::Blocked;
-            (*current).blocked_reason = Some(BlockedReason::ReplyWait { msg: *msg, badge });
-            get_scheduler().reschedule();
+            match self.state {
+                EndpointState::RecvBlocked => {
+                    // FASTPATH: Receiver waiting - transfer immediately
+                    let receiver = match self.recv_queue.pop() {
+                        Some(r) => r,
+                        None => {
+                            // State inconsistency — fall through to slowpath
+                            self.state = EndpointState::Idle;
+                            self.send_queue.push(current);
+                            self.state = EndpointState::SendBlocked;
+                            (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
+                            let reason = BlockedReason::CallSendBlocked { msg: *msg, badge };
+                            block_current_thread(current, reason);
+                            return (*current).saved_caller_msg;
+                        }
+                    };
 
-            // When we wake up, the reply is in saved_caller_msg
-            (*current).saved_caller_msg
+                    // Block caller BEFORE waking receiver to prevent race:
+                    // Without this, receiver could reply_recv() before caller
+                    // sets Blocked, overwriting Ready with Blocked forever.
+                    (*current).state = ThreadState::Blocked;
+                    (*current).blocked_reason = Some(BlockedReason::ReplyWait {
+                        msg: *msg,
+                        badge,
+                    });
+
+                    // Set up reply capability so receiver can reply to us
+                    (*receiver).reply_tcb = current;
+                    (*receiver).reply_can_grant = true;
+
+                    self.transfer_message(current, receiver, msg, badge);
+
+                    // Wake receiver
+                    (*receiver).state = ThreadState::Ready;
+                    (*receiver).blocked_endpoint = core::ptr::null_mut();
+                    get_scheduler().enqueue(receiver);
+
+                    // Update endpoint state
+                    if self.recv_queue.is_empty() {
+                        self.state = EndpointState::Idle;
+                    }
+
+                    // Caller sleeps until reply_recv() wakes it
+                    get_scheduler().reschedule();
+
+                    // Woken by reply - message is in saved_caller_msg
+                    (*current).saved_caller_msg
+                }
+                EndpointState::Idle | EndpointState::SendBlocked => {
+                    // SLOWPATH: No receiver - queue caller as CallSendBlocked
+                    self.send_queue.push(current);
+                    self.state = EndpointState::SendBlocked;
+                    (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
+
+                    let reason = BlockedReason::CallSendBlocked { msg: *msg, badge };
+                    block_current_thread(current, reason);
+
+                    // Woken by reply_recv() - message is in saved_caller_msg
+                    (*current).saved_caller_msg
+                }
+            }
         }
     }
 
@@ -309,10 +404,30 @@ impl Endpoint {
     /// Slowpath: no handler → queue faulting thread as sender
     pub fn deliver_fault(&mut self, faulting_tcb: *mut Tcb, msg: &Message) {
         unsafe {
+            // Set faulting thread state BEFORE fastpath/slowpath branch.
+            // This ensures both paths have correct state — previously the
+            // slowpath left blocked_reason as None, causing recv() to
+            // deliver an empty message and immediately wake the faulter.
+            (*faulting_tcb).state = ThreadState::Blocked;
+            (*faulting_tcb).blocked_reason = Some(BlockedReason::FaultBlocked {
+                msg: *msg,
+                badge: 0,
+            });
+
             match self.state {
                 EndpointState::RecvBlocked => {
                     // Fastpath: handler already waiting
-                    let receiver = self.recv_queue.pop().unwrap();
+                    let receiver = match self.recv_queue.pop() {
+                        Some(r) => r,
+                        None => {
+                            // State inconsistency — fall through to slowpath
+                            self.state = EndpointState::Idle;
+                            self.send_queue.push(faulting_tcb);
+                            self.state = EndpointState::SendBlocked;
+                            (*faulting_tcb).blocked_endpoint = self as *mut Endpoint as *mut u8;
+                            return;
+                        }
+                    };
 
                     // Set reply cap so handler can reply to resume faulting thread
                     (*receiver).reply_tcb = faulting_tcb;

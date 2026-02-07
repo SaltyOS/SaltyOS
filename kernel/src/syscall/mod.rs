@@ -7,7 +7,7 @@
 use crate::cap::{CapError, CapRights, Capability, CNode, FrameObject, IoPortRange, ObjectType, UntypedMemory};
 use crate::ipc::{Endpoint, EndpointState, Message, Notification};
 use crate::mm::vspace::{PageFlags, VSpace, VSpaceError};
-use crate::sched::thread::{SchedContext, Tcb, ThreadState};
+use crate::sched::thread::{BlockedReason, SchedContext, Tcb, ThreadState};
 
 /// System call numbers
 #[repr(u64)]
@@ -356,19 +356,62 @@ fn syscall_send(
         Ok(c) => c,
         Err(e) => return SyscallResult::err(e),
     };
-    match validate_endpoint_cap(cap, CapRights::SEND) {
-        Ok(()) => {}
-        Err(e) => return SyscallResult::err(e),
-    }
 
     let msg = construct_message(msg_info, mr0, mr1, mr2, mr3);
 
-    unsafe {
-        let endpoint = &mut *(cap.object as *mut Endpoint);
-        endpoint.send(&msg, cap.badge);
+    if cap.obj_type == ObjectType::Endpoint {
+        match validate_endpoint_cap(cap, CapRights::SEND) {
+            Ok(()) => {}
+            Err(e) => return SyscallResult::err(e),
+        }
+
+        unsafe {
+            let endpoint = &mut *(cap.object as *mut Endpoint);
+            endpoint.send(&msg, cap.badge);
+        }
+        return SyscallResult::ok(0);
     }
 
-    SyscallResult::ok(0)
+    // Reply capability path (saved via CNODE_SAVE_CALLER):
+    // cap points to caller TCB and has REPLY right.
+    if cap.obj_type == ObjectType::Tcb && cap.has_right(CapRights::REPLY) {
+        unsafe {
+            let caller = cap.object as *mut Tcb;
+            if caller.is_null() {
+                return SyscallResult::err(SyscallError::InvalidCapability);
+            }
+
+            // Saved reply caps cannot transfer capabilities.
+            let mut reply_msg = msg;
+            reply_msg.extra_caps = 0;
+            reply_msg.caps = [0; 4];
+
+            let blocked_for_reply = matches!(
+                (*caller).blocked_reason,
+                Some(BlockedReason::ReplyWait { .. }) | Some(BlockedReason::FaultBlocked { .. })
+            );
+            if !blocked_for_reply || (*caller).state != ThreadState::Blocked {
+                return SyscallResult::err(SyscallError::InvalidOperation);
+            }
+
+            (*caller).saved_caller_msg = reply_msg;
+            (*caller).saved_caller_badge = 0;
+            (*caller).blocked_reason = None;
+            (*caller).blocked_endpoint = core::ptr::null_mut();
+
+            crate::sched::scheduler::scheduler().enqueue(caller);
+
+            // One-shot: auto-delete reply cap from sender's CNode after use
+            let current_tcb = crate::sched::scheduler::scheduler().current();
+            if !current_tcb.is_null() && !(*current_tcb).cspace_root.is_null() {
+                let cspace = &mut *(*current_tcb).cspace_root;
+                let _ = cspace.delete(cap_ptr as usize);
+            }
+        }
+        return SyscallResult::ok(0);
+    }
+
+    SyscallResult::err(SyscallError::InvalidOperation)
 }
 
 /// Receive message from endpoint (blocks until sender ready)
@@ -766,6 +809,17 @@ fn syscall_invoke(
             // VSPACE_MAP_PT: arg0 = frame_cap_ptr, arg1 = virt_addr, arg2 = level
             syscall_vspace_map_pt(cap, arg0, arg1, arg2)
         }
+        (ObjectType::VSpace, 0x53) => {
+            // VSPACE_WALK: arg0 = start_vaddr, arg1 = max_entries
+            // Returns mapped pages via IPC buffer:
+            //   msg[0] = count, msg[1] = next_vaddr
+            //   msg[2..19] = (vaddr, phys, flags) tuples (3 u64s each, max 6)
+            syscall_vspace_walk(cap, arg0, arg1)
+        }
+        (ObjectType::VSpace, 0x54) => {
+            // VSPACE_COPY_PAGE: arg0 = src_vaddr, arg1 = dst_frame_cap_ptr
+            syscall_vspace_copy_page(cap, arg0, arg1)
+        }
 
         // SchedContext operations
         (ObjectType::SchedContext, 0x30) => {
@@ -1014,8 +1068,10 @@ fn syscall_tcb_configure(
         let tcb = &mut *(cap.object as *mut Tcb);
 
         // Allocate per-thread kernel stack for syscall entry
-        let kstack_phys = crate::mm::alloc_frame()
-            .expect("tcb_configure: kernel stack alloc");
+        let kstack_phys = match crate::mm::alloc_frame() {
+            Some(f) => f,
+            None => return SyscallResult::err(SyscallError::OutOfMemory),
+        };
         let kstack_virt = crate::mm::phys_to_virt(kstack_phys);
         let kstack_top = kstack_virt + crate::mm::PAGE_SIZE as u64;
         core::ptr::write_bytes(kstack_virt as *mut u8, 0, crate::mm::PAGE_SIZE);
@@ -1024,8 +1080,10 @@ fn syscall_tcb_configure(
         if !tcb.vspace_root.is_null() {
             // VSpace is set: use usermode trampoline for ring 3 entry
             let vspace = &*tcb.vspace_root;
-            let tramp_stack_phys = crate::mm::alloc_frame()
-                .expect("tcb_configure: trampoline stack alloc");
+            let tramp_stack_phys = match crate::mm::alloc_frame() {
+                Some(f) => f,
+                None => return SyscallResult::err(SyscallError::OutOfMemory),
+            };
             let tramp_stack_virt = crate::mm::phys_to_virt(tramp_stack_phys);
             let tramp_stack_top = tramp_stack_virt + crate::mm::PAGE_SIZE as u64;
             core::ptr::write_bytes(tramp_stack_virt as *mut u8, 0, crate::mm::PAGE_SIZE);
@@ -1739,6 +1797,95 @@ fn syscall_vspace_map_pt(
     }
 }
 
+/// VSPACE_WALK: Walk user-half page tables, returning mapped pages
+///
+/// Args:
+/// - start_vaddr: Virtual address to start scanning from
+/// - max_entries: Maximum number of entries to return (capped at 6)
+///
+/// Returns via IPC buffer:
+///   msg[0] = count (number of entries)
+///   msg[1] = next_vaddr (0 if done)
+///   msg[2..] = (vaddr, phys, flags) tuples, 3 u64s each
+fn syscall_vspace_walk(
+    cap: &Capability,
+    start_vaddr: u64,
+    max_entries: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let vspace = &*(cap.object as *const VSpace);
+        let max = if max_entries > 6 { 6 } else { max_entries as usize };
+        let (count, next_vaddr, entries) = vspace.walk_pages(start_vaddr, max);
+
+        // Write results to caller's IPC buffer
+        let scheduler = crate::sched::scheduler::scheduler();
+        let current = scheduler.current();
+        if current.is_null() {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+        let buf = (*current).ipc_buffer;
+        if buf == 0 {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+        let ipc_buf = buf as *mut crate::ipc::IpcBuffer;
+
+        (*ipc_buf).msg[0] = count as u64;
+        (*ipc_buf).msg[1] = next_vaddr;
+        for i in 0..count {
+            (*ipc_buf).msg[2 + i * 3] = entries[i].0;     // vaddr
+            (*ipc_buf).msg[2 + i * 3 + 1] = entries[i].1; // phys
+            (*ipc_buf).msg[2 + i * 3 + 2] = entries[i].2; // flags
+        }
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// VSPACE_COPY_PAGE: Copy 4K page from source VSpace into destination Frame.
+///
+/// Walks source VSpace page tables to find the physical page at src_vaddr,
+/// then copies 4096 bytes into the destination Frame via kernel direct mapping.
+fn syscall_vspace_copy_page(
+    cap: &Capability,
+    src_vaddr: u64,
+    dst_frame_cap_ptr: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+    if src_vaddr & 0xFFF != 0 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    let frame_cap = match lookup_capability(dst_frame_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(frame_cap, ObjectType::Frame, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let vspace = &*(cap.object as *const VSpace);
+        let frame = &*(frame_cap.object as *const FrameObject);
+
+        let src_phys = match vspace.resolve_page(src_vaddr) {
+            Some(p) => p,
+            None => return SyscallResult::err(SyscallError::NotFound),
+        };
+
+        let src_ptr = crate::mm::phys_to_virt(src_phys) as *const u8;
+        let dst_ptr = crate::mm::phys_to_virt(frame.phys_addr) as *mut u8;
+        core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, crate::mm::PAGE_SIZE);
+    }
+
+    SyscallResult::ok(0)
+}
+
 /// Convert VSpaceError to syscall error
 fn syscall_error_from_vspace_error(err: VSpaceError) -> SyscallError {
     match err {
@@ -1752,7 +1899,7 @@ fn syscall_error_from_vspace_error(err: VSpaceError) -> SyscallError {
 /// Convert CNode error to syscall error
 fn syscall_error_from_cap_error(err: CapError) -> SyscallError {
     match err {
-        CapError::InvalidSlot => SyscallError::InvalidArgument,
+        CapError::InvalidSlot | CapError::InvalidArgument => SyscallError::InvalidArgument,
         CapError::SlotEmpty => SyscallError::NotFound,
         CapError::InsufficientRights => SyscallError::InsufficientRights,
         CapError::InsufficientMemory | CapError::OutOfSlots => SyscallError::OutOfMemory,

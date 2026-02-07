@@ -12,7 +12,8 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use crate::cap::{
-    alloc_slot, get_cap_mut, CNode, CapRef, CapRights, IoPortRange, ObjectType, UntypedMemory,
+    alloc_slot, get_cap_mut, CNode, CapRef, CapRights, IoPortRange, KernelObject, ObjectType,
+    UntypedMemory,
 };
 use crate::ipc::{IrqHandler, Notification};
 use crate::mm::vspace::PageFlags;
@@ -20,6 +21,39 @@ use crate::mm::{alloc_contiguous_frames, alloc_frame, phys_to_virt, VSpace, PAGE
 use crate::sched::thread::{SchedContext, Tcb};
 use crate::ParsedBootInfo;
 use core::mem::MaybeUninit;
+
+/// Fatal boot error — prints message and halts.
+/// Used instead of .expect() to avoid unwinding/panic infrastructure.
+macro_rules! boot_fatal {
+    ($msg:expr) => {{
+        crate::serial_puts("[INIT] FATAL: ");
+        crate::serial_puts($msg);
+        crate::serial_puts("\n");
+        loop {
+            unsafe { core::arch::asm!("hlt") }
+        }
+    }};
+}
+
+/// Unwrap an Option during boot, halting with message on None.
+macro_rules! boot_unwrap {
+    ($opt:expr, $msg:expr) => {
+        match $opt {
+            Some(v) => v,
+            None => boot_fatal!($msg),
+        }
+    };
+}
+
+/// Unwrap a Result during boot, halting with message on Err.
+macro_rules! boot_unwrap_result {
+    ($result:expr, $msg:expr) => {
+        match $result {
+            Ok(v) => v,
+            Err(_) => boot_fatal!($msg),
+        }
+    };
+}
 
 /// User code virtual address (4 MB)
 const INIT_CODE_VADDR: u64 = 0x0000_0040_0000;
@@ -67,11 +101,26 @@ static INIT_USER_CODE: [u8; 12] = [
     0x00,                                       // padding
 ];
 
+/// Init's CNode size: 4096 slots (2^12) to accommodate initrd mapping
+const INIT_CNODE_SIZE_BITS: u8 = 12;
+const INIT_CNODE_SLOTS: usize = 1 << (INIT_CNODE_SIZE_BITS as usize);
+
+/// Static backing for init's CNode: header + 4096 CapRef slots.
+/// Memory layout matches CNode header followed by trailing slots.
+#[repr(C, align(16))]
+struct InitCNodeStorage {
+    header: KernelObject,
+    slots: [CapRef; INIT_CNODE_SLOTS],
+}
+
 /// Static storage for init task (never freed)
 static mut INIT_TCB: Tcb = Tcb::new();
 static mut INIT_SCHED_CTX: SchedContext = SchedContext::new();
 static mut INIT_VSPACE: MaybeUninit<VSpace> = MaybeUninit::uninit();
-static mut INIT_CNODE: CNode = CNode::new();
+static mut INIT_CNODE_STORAGE: InitCNodeStorage = InitCNodeStorage {
+    header: KernelObject::new(ObjectType::CNode, INIT_CNODE_SIZE_BITS),
+    slots: [CapRef::null(); INIT_CNODE_SLOTS],
+};
 static mut INIT_UNTYPEDS: [UntypedMemory; MAX_INIT_UNTYPEDS] = {
     const EMPTY: UntypedMemory = UntypedMemory::new(0, 0, false);
     [EMPTY; MAX_INIT_UNTYPEDS]
@@ -90,7 +139,7 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
     let kernel_cr3 = crate::arch::x86_64::paging::read_cr3();
 
     // Allocate PML4 for user VSpace
-    let pml4_phys = alloc_frame().expect("init: PML4 alloc failed");
+    let pml4_phys = boot_unwrap!(alloc_frame(), "PML4 alloc failed");
     let pml4_virt = phys_to_virt(pml4_phys) as *mut u64;
 
     // Zero the PML4
@@ -130,7 +179,7 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
     }
 
     // Allocate a kernel stack for the trampoline (used by context_switch → iretq)
-    let tramp_stack_phys = alloc_frame().expect("init: trampoline stack alloc failed");
+    let tramp_stack_phys = boot_unwrap!(alloc_frame(), "trampoline stack alloc failed");
     let tramp_stack_virt = phys_to_virt(tramp_stack_phys);
     let tramp_stack_top = tramp_stack_virt + PAGE_SIZE as u64;
     unsafe {
@@ -138,7 +187,7 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
     }
 
     // Allocate per-thread kernel stack for syscall entry
-    let kstack_phys = alloc_frame().expect("init: kernel stack alloc failed");
+    let kstack_phys = boot_unwrap!(alloc_frame(), "kernel stack alloc failed");
     let kstack_virt = phys_to_virt(kstack_phys);
     let kstack_top = kstack_virt + PAGE_SIZE as u64;
     unsafe {
@@ -184,7 +233,7 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
         (*tcb).cpu_affinity = 0;
         (*tcb).sched_context = sc;
         (*tcb).vspace_root = (&raw mut INIT_VSPACE).cast::<VSpace>();
-        (*tcb).cspace_root = &raw mut INIT_CNODE;
+        (*tcb).cspace_root = &raw mut INIT_CNODE_STORAGE as *mut CNode;
         (*tcb).kernel_stack_top = kstack_top;
 
         // Set per-CPU kernel stack to init's stack before first scheduling
@@ -205,7 +254,7 @@ fn setup_init_cspace(boot_info: Option<&ParsedBootInfo>) {
     crate::serial_puts("[INIT] Setting up CSpace\n");
 
     unsafe {
-        let cnode = &mut *(&raw mut INIT_CNODE);
+        let cnode = &mut *(&raw mut INIT_CNODE_STORAGE as *mut CNode);
 
         // Slot 0: CAP_SELF_TCB - capability to init's own TCB
         insert_static_cap(
@@ -227,7 +276,7 @@ fn setup_init_cspace(boot_info: Option<&ParsedBootInfo>) {
         insert_static_cap(
             cnode,
             CAP_SELF_CSPACE,
-            &raw mut INIT_CNODE as *mut crate::cap::KernelObject,
+            &raw mut INIT_CNODE_STORAGE as *mut crate::cap::KernelObject,
             ObjectType::CNode,
         );
 
@@ -276,7 +325,7 @@ unsafe fn insert_static_cap(
     object: *mut crate::cap::KernelObject,
     obj_type: ObjectType,
 ) {
-    let slot = alloc_slot().expect("init: cap slot alloc failed");
+    let slot = boot_unwrap!(alloc_slot(), "cap slot alloc failed");
     let cap = get_cap_mut(slot);
     cap.object = object;
     cap.obj_type = obj_type;
@@ -285,7 +334,7 @@ unsafe fn insert_static_cap(
     cap.badge = 0;
     cnode
         .insert_ref(cnode_index, CapRef { slot })
-        .expect("init: CNode insert failed");
+        .unwrap_or_else(|_| boot_fatal!("CNode insert failed"));
 }
 
 /// Create untyped memory capabilities from boot info memory map
@@ -314,7 +363,7 @@ unsafe fn create_untyped_caps(cnode: &mut CNode, _info: &ParsedBootInfo) {
         (*ut) = UntypedMemory::new(base, size_bits, false);
 
         // Allocate a global cap slot and populate it
-        let slot = alloc_slot().expect("init: untyped cap slot alloc failed");
+        let slot = boot_unwrap!(alloc_slot(), "untyped cap slot alloc failed");
         let cap = get_cap_mut(slot);
         cap.object = ut as *mut crate::cap::KernelObject;
         cap.obj_type = ObjectType::Untyped;
@@ -325,7 +374,7 @@ unsafe fn create_untyped_caps(cnode: &mut CNode, _info: &ParsedBootInfo) {
         let cnode_slot = CAP_UNTYPED_START + ut_index;
         cnode
             .insert_ref(cnode_slot, CapRef { slot })
-            .expect("init: untyped CNode insert failed");
+            .unwrap_or_else(|_| boot_fatal!("untyped CNode insert failed"));
 
         crate::serial_puts("[INIT]   Untyped ");
         crate::serial_dec(ut_index as u64);
@@ -407,14 +456,14 @@ fn load_from_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) -> (u64, u64) {
 
     // Allocate and map a multi-page user stack
     for pg in 0..INIT_STACK_PAGES {
-        let stack_phys = alloc_frame().expect("init: stack alloc failed");
+        let stack_phys = boot_unwrap!(alloc_frame(), "stack alloc failed");
         unsafe {
             core::ptr::write_bytes(phys_to_virt(stack_phys) as *mut u8, 0, PAGE_SIZE);
         }
         let stack_vaddr = INIT_STACK_VADDR + (pg as u64) * PAGE_SIZE as u64;
         vspace
             .map(stack_vaddr, stack_phys, PageFlags::USER_RW)
-            .expect("init: stack map failed");
+            .unwrap_or_else(|_| boot_fatal!("stack map failed"));
     }
 
     (result.entry, INIT_STACK_TOP)
@@ -446,7 +495,7 @@ fn map_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) {
         // Allocate a new frame and copy the initrd data into it, since the
         // original physical pages may not be frame-aligned or may overlap
         // with kernel-managed memory.
-        let frame_phys = alloc_frame().expect("init: initrd frame alloc failed");
+        let frame_phys = boot_unwrap!(alloc_frame(), "initrd frame alloc failed");
         let frame_virt = phys_to_virt(frame_phys) as *mut u8;
         let src = phys_to_virt(phys) as *const u8;
         let copy_len = if (i + 1) * PAGE_SIZE > initrd_size {
@@ -461,7 +510,7 @@ fn map_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) {
 
         vspace
             .map(virt, frame_phys, PageFlags::USER_RO)
-            .expect("init: initrd page map failed");
+            .unwrap_or_else(|_| boot_fatal!("initrd page map failed"));
     }
 
     // Store initrd info in statics so we can pass to userspace via IPC buffer
@@ -485,7 +534,7 @@ static mut INITRD_USER_SIZE: u64 = 0;
 ///   offset 8: initrd virtual address
 ///   offset 16: initrd size in bytes
 fn map_bootinfo(vspace: &mut VSpace) {
-    let frame_phys = alloc_frame().expect("init: bootinfo frame alloc failed");
+    let frame_phys = boot_unwrap!(alloc_frame(), "bootinfo frame alloc failed");
     let frame_virt = phys_to_virt(frame_phys) as *mut u8;
     unsafe {
         core::ptr::write_bytes(frame_virt, 0, PAGE_SIZE);
@@ -496,7 +545,7 @@ fn map_bootinfo(vspace: &mut VSpace) {
     }
     vspace
         .map(BOOTINFO_VADDR, frame_phys, PageFlags::USER_RO)
-        .expect("init: bootinfo map failed");
+        .unwrap_or_else(|_| boot_fatal!("bootinfo map failed"));
 
     crate::serial_puts("[INIT] Boot info page mapped at ");
     crate::serial_hex(BOOTINFO_VADDR);
@@ -508,7 +557,7 @@ fn load_hardcoded_fallback(vspace: &mut VSpace) -> (u64, u64) {
     crate::serial_puts("[INIT] Using hardcoded bytecode fallback\n");
 
     // Allocate and map user code page
-    let code_phys = alloc_frame().expect("init: code frame alloc failed");
+    let code_phys = boot_unwrap!(alloc_frame(), "code frame alloc failed");
     let code_virt = phys_to_virt(code_phys) as *mut u8;
     unsafe {
         core::ptr::write_bytes(code_virt, 0, PAGE_SIZE);
@@ -520,11 +569,11 @@ fn load_hardcoded_fallback(vspace: &mut VSpace) -> (u64, u64) {
     }
     vspace
         .map(INIT_CODE_VADDR, code_phys, PageFlags::USER_RX)
-        .expect("init: code map failed");
+        .unwrap_or_else(|_| boot_fatal!("code map failed"));
 
     // Allocate and map a multi-page user stack
     for pg in 0..INIT_STACK_PAGES {
-        let stack_phys = alloc_frame().expect("init: stack frame alloc failed");
+        let stack_phys = boot_unwrap!(alloc_frame(), "stack frame alloc failed");
         let stack_virt = phys_to_virt(stack_phys) as *mut u8;
         unsafe {
             core::ptr::write_bytes(stack_virt, 0, PAGE_SIZE);
@@ -532,7 +581,7 @@ fn load_hardcoded_fallback(vspace: &mut VSpace) -> (u64, u64) {
         let stack_vaddr = INIT_STACK_VADDR + (pg as u64) * PAGE_SIZE as u64;
         vspace
             .map(stack_vaddr, stack_phys, PageFlags::USER_RW)
-            .expect("init: stack map failed");
+            .unwrap_or_else(|_| boot_fatal!("stack map failed"));
     }
 
     (INIT_CODE_VADDR, INIT_STACK_TOP)

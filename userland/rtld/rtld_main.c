@@ -10,6 +10,9 @@
 
 struct rtld_state g_rtld;
 
+/* Exported so applications can continue allocating frame slots after rtld */
+uint64_t __salty_next_frame_slot = 0;
+
 void __attribute__((naked, noreturn)) _start(void) {
     __asm__ volatile(
         "mov %%rsp, %%rdi\n"
@@ -244,7 +247,17 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         }
     }
 
-    /* 7. Jump to executable entry point */
+    /* 7. Export frame slot so user code can allocate after rtld.
+     * __salty_next_frame_slot references in user code resolve to libsalty,
+     * so update that symbol explicitly if present. */
+    __salty_next_frame_slot = g_rtld.next_frame_slot;
+    {
+        uint64_t slot_addr = resolve_symbol_addr(&g_rtld, "__salty_next_frame_slot");
+        if (slot_addr != 0)
+            *(volatile uint64_t *)slot_addr = g_rtld.next_frame_slot;
+    }
+
+    /* 8. Jump to executable entry point */
     rtld_puts("[RTLD] Jumping to executable entry at ");
     rtld_hex(g_rtld.exe_entry);
     rtld_putc('\n');

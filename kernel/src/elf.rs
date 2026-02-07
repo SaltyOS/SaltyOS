@@ -313,7 +313,7 @@ pub fn load_elf(
 
     // Apply RELA relocations for PIE binaries
     if is_pie {
-        apply_relocations(data, delta, load_base, &page_map[..page_count])?;
+        apply_relocations(data, delta, &page_map[..page_count])?;
     }
 
     let entry = ehdr.e_entry.wrapping_add(delta);
@@ -325,11 +325,34 @@ pub fn load_elf(
     })
 }
 
+/// Convert a virtual address (from DT_RELA etc.) to a file offset by scanning PT_LOAD segments.
+fn vaddr_to_file_offset(
+    data: &[u8],
+    phdr_base: usize,
+    phdr_count: usize,
+    phdr_size: usize,
+    vaddr: u64,
+) -> Result<usize, ElfError> {
+    for i in 0..phdr_count {
+        let off = phdr_base + i * phdr_size;
+        if off + core::mem::size_of::<Elf64Phdr>() > data.len() {
+            break;
+        }
+        let phdr = unsafe { &*(data.as_ptr().add(off) as *const Elf64Phdr) };
+        if phdr.p_type != PT_LOAD {
+            continue;
+        }
+        if vaddr >= phdr.p_vaddr && vaddr - phdr.p_vaddr < phdr.p_filesz {
+            return Ok((phdr.p_offset + (vaddr - phdr.p_vaddr)) as usize);
+        }
+    }
+    Err(ElfError::RelocFailed)
+}
+
 /// Apply RELA relocations by finding PT_DYNAMIC → DT_RELA/DT_RELASZ/DT_RELAENT
 fn apply_relocations(
     data: &[u8],
     delta: u64,
-    load_base: u64,
     page_map: &[(u64, u64)],
 ) -> Result<(), ElfError> {
     let ehdr = unsafe { &*(data.as_ptr() as *const Elf64Ehdr) };
@@ -360,7 +383,7 @@ fn apply_relocations(
     }
 
     // Parse .dynamic entries to find RELA table
-    let mut rela_offset: u64 = 0;
+    let mut rela_vaddr: u64 = 0;
     let mut rela_size: u64 = 0;
     let mut rela_ent: u64 = 0;
 
@@ -376,7 +399,7 @@ fn apply_relocations(
         }
 
         match dyn_entry.d_tag {
-            DT_RELA => rela_offset = dyn_entry.d_val,
+            DT_RELA => rela_vaddr = dyn_entry.d_val,
             DT_RELASZ => rela_size = dyn_entry.d_val,
             DT_RELAENT => rela_ent = dyn_entry.d_val,
             _ => {}
@@ -385,14 +408,13 @@ fn apply_relocations(
         pos += dyn_entry_size;
     }
 
-    if rela_offset == 0 || rela_size == 0 || rela_ent == 0 {
+    if rela_vaddr == 0 || rela_size == 0 || rela_ent == 0 {
         return Ok(());
     }
 
-    // DT_RELA value is a virtual address (relative to file's min_vaddr).
-    // For PIE with base 0, it's also the file offset.
-    // We need to convert to file offset to read the RELA entries.
-    let rela_file_offset = rela_offset as usize;
+    // DT_RELA value is a virtual address, not a file offset.
+    // Convert to file offset by scanning PT_LOAD segments.
+    let rela_file_offset = vaddr_to_file_offset(data, phdr_base, phdr_count, phdr_size, rela_vaddr)?;
     let rela_count = rela_size / rela_ent;
 
     let rela_entry_size = core::mem::size_of::<Elf64Rela>();
@@ -411,9 +433,9 @@ fn apply_relocations(
         let reloc_type = (rela.r_info & 0xFFFF_FFFF) as u32;
 
         if reloc_type == R_X86_64_RELATIVE {
-            // R_X86_64_RELATIVE: *target = load_base + r_addend
+            // R_X86_64_RELATIVE: *target = B + A, where B = delta (slide)
             let target_vaddr = rela.r_offset.wrapping_add(delta);
-            let value = load_base.wrapping_add(rela.r_addend as u64);
+            let value = delta.wrapping_add(rela.r_addend as u64);
 
             // Find the physical page containing this virtual address
             let target_page = page_align_down(target_vaddr);

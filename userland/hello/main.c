@@ -47,7 +47,7 @@ void _start(void) {
     salty_serial_puts("\n");
 
     /* 2. open /dev/console */
-    int fd = posix_open("/dev/console", 0);
+    int fd = posix_open("/dev/console", O_WRONLY);
     salty_serial_puts("[HELLO] open /dev/console fd=");
     salty_serial_hex((uint64_t)fd);
     salty_serial_puts("\n");
@@ -60,7 +60,7 @@ void _start(void) {
     }
 
     /* 4. open /dev/null and write to it */
-    int fd_null = posix_open("/dev/null", 0);
+    int fd_null = posix_open("/dev/null", O_WRONLY);
     salty_serial_puts("[HELLO] open /dev/null fd=");
     salty_serial_hex((uint64_t)fd_null);
     salty_serial_puts("\n");

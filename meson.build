@@ -165,7 +165,8 @@ initrd_target = []
 if build_userland and mkcpio.found()
   initrd = custom_target('initrd',
     input: [init_elf, console_elf, ld_salty_so, libsalty_so, libc_so,
-            nameserv_elf, procmgr_elf, vfs_elf, hello_elf],
+            nameserv_elf, procmgr_elf, vfs_elf, hello_elf,
+            fstest_elf, mmap_test_elf, test_fork_elf],
     output: 'initrd.cpio',
     command: [mkcpio,
       '--output', '@OUTPUT@',
@@ -178,6 +179,9 @@ if build_userland and mkcpio.found()
       'procmgr.elf=@INPUT6@',
       'vfs.elf=@INPUT7@',
       'hello.elf=@INPUT8@',
+      'fstest.elf=@INPUT9@',
+      'mmap_test.elf=@INPUT10@',
+      'test_fork.elf=@INPUT11@',
     ],
     build_by_default: true,
   )

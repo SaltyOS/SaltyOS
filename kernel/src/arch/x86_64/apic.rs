@@ -17,7 +17,7 @@
 
 use super::outb;
 use crate::mm::PHYS_MAP_OFFSET;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Local APIC base address (physical)
 pub const LAPIC_BASE: u64 = 0xFEE0_0000;
@@ -93,7 +93,7 @@ const TIMER_DIVIDE_16: u32 = 0x3;
 /// Timer ticks per millisecond (calibrated at boot)
 /// Default fallback value assumes ~100 MHz APIC bus frequency
 /// This is calibrated during initialization using the PIT
-static mut TIMER_TICKS_PER_MS: u32 = 10000;
+static TIMER_TICKS_PER_MS: AtomicU32 = AtomicU32::new(10000);
 
 /// ICR (Interrupt Command Register) bits
 const ICR_DS: u32 = 1 << 12; // Destination shorthand
@@ -104,7 +104,7 @@ const ICR_MODE_ASSERT: u32 = 1 << 15; // Assert interrupt
 static TICK_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Local APIC base address (virtual)
-static mut LAPIC_VIRTUAL_BASE: u64 = 0;
+static LAPIC_VIRTUAL_BASE: AtomicU64 = AtomicU64::new(0);
 
 /// IPI kinds
 #[repr(u8)]
@@ -177,9 +177,7 @@ unsafe fn enable_apic() {
 /// Must be called after paging is initialized.
 /// Assumes direct physical mapping is available.
 unsafe fn map_lapic() {
-    unsafe {
-        LAPIC_VIRTUAL_BASE = LAPIC_BASE + PHYS_MAP_OFFSET;
-    }
+    LAPIC_VIRTUAL_BASE.store(LAPIC_BASE + PHYS_MAP_OFFSET, Ordering::Release);
 }
 
 /// Read from LAPIC register
@@ -189,7 +187,7 @@ unsafe fn map_lapic() {
 #[inline(always)]
 unsafe fn lapic_read(offset: u32) -> u32 {
     unsafe {
-        let addr = LAPIC_VIRTUAL_BASE + offset as u64;
+        let addr = LAPIC_VIRTUAL_BASE.load(Ordering::Acquire) + offset as u64;
         let ptr = addr as *const u32;
         ptr.read_volatile()
     }
@@ -202,7 +200,7 @@ unsafe fn lapic_read(offset: u32) -> u32 {
 #[inline(always)]
 unsafe fn lapic_write(offset: u32, value: u32) {
     unsafe {
-        let addr = LAPIC_VIRTUAL_BASE + offset as u64;
+        let addr = LAPIC_VIRTUAL_BASE.load(Ordering::Acquire) + offset as u64;
         let ptr = addr as *mut u32;
         ptr.write_volatile(value);
     }
@@ -294,7 +292,7 @@ unsafe fn init_timer() {
     unsafe {
         // Calibrate timer using PIT
         let calibrated_ticks = calibrate_timer();
-        TIMER_TICKS_PER_MS = calibrated_ticks;
+        TIMER_TICKS_PER_MS.store(calibrated_ticks, Ordering::Release);
 
         // Set timer divide configuration (divide by 16)
         lapic_write(LAPIC_TIMER_DIVIDE, TIMER_DIVIDE_16);
@@ -317,7 +315,7 @@ unsafe fn init_timer() {
 pub fn start_timer() {
     unsafe {
         // Set initial count for 1ms ticks using calibrated value
-        lapic_write(LAPIC_TIMER_INITIAL, TIMER_TICKS_PER_MS);
+        lapic_write(LAPIC_TIMER_INITIAL, TIMER_TICKS_PER_MS.load(Ordering::Acquire));
 
         // Unmask the timer - interrupts will now fire
         let timer_config = (LAPIC_TIMER_VECTOR as u32) | TIMER_MODE_PERIODIC;
@@ -332,7 +330,7 @@ pub fn start_timer() {
 #[inline]
 pub fn eoi() {
     // Guard: LAPIC must be mapped before we can write EOI
-    if unsafe { LAPIC_VIRTUAL_BASE } == 0 {
+    if LAPIC_VIRTUAL_BASE.load(Ordering::Relaxed) == 0 {
         return;
     }
     unsafe {
@@ -481,7 +479,7 @@ unsafe fn calibrate_timer() -> u32 {
 /// Returns the number of APIC timer ticks that correspond to 1 millisecond.
 /// This value is calibrated during boot using the PIT for accuracy.
 pub fn get_timer_ticks_per_ms() -> u32 {
-    unsafe { TIMER_TICKS_PER_MS }
+    TIMER_TICKS_PER_MS.load(Ordering::Relaxed)
 }
 
 /// APIC Timer interrupt handler
@@ -490,7 +488,7 @@ pub fn get_timer_ticks_per_ms() -> u32 {
 /// Increments the tick counter and notifies the scheduler.
 pub fn timer_handler() {
     // Guard: LAPIC must be mapped before we can handle timer or send EOI
-    if unsafe { LAPIC_VIRTUAL_BASE } == 0 {
+    if LAPIC_VIRTUAL_BASE.load(Ordering::Relaxed) == 0 {
         return;
     }
 
@@ -872,7 +870,7 @@ pub fn init_ap() {
         lapic_write(LAPIC_TIMER_DIVIDE, TIMER_DIVIDE_16);
 
         // Set initial count for 1ms ticks
-        lapic_write(LAPIC_TIMER_INITIAL, TIMER_TICKS_PER_MS);
+        lapic_write(LAPIC_TIMER_INITIAL, TIMER_TICKS_PER_MS.load(Ordering::Acquire));
 
         // Unmask timer - periodic mode
         let timer_config = (LAPIC_TIMER_VECTOR as u32) | TIMER_MODE_PERIODIC;

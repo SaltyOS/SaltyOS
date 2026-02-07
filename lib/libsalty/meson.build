@@ -4,7 +4,7 @@
 libsalty_link = meson.current_source_dir() / 'libsalty.ld'
 
 libsalty_so = custom_target('libsalty_so',
-    input: files('salty_impl.c'),
+    input: files('salty_impl.c', 'fork.S'),
     output: 'libsalty.so',
     command: [cc_cmd,
         '-fPIC', '-shared',

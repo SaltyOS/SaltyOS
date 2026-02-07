@@ -30,12 +30,21 @@ impl Scheduler {
     /// Take scheduler lock
     fn lock(&self) {
         use core::sync::atomic::Ordering;
+        let mut _spins: u32 = 0;
         while self
             .lock_state
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            core::hint::spin_loop();
+            while self.lock_state.load(Ordering::Relaxed) != 0 {
+                core::hint::spin_loop();
+                _spins += 1;
+                #[cfg(debug_assertions)]
+                if _spins > 10_000_000 {
+                    crate::serial_puts("[SCHED SPINLOCK] possible deadlock detected\n");
+                    _spins = 0;
+                }
+            }
         }
     }
 

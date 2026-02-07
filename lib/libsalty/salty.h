@@ -64,10 +64,12 @@
 #define TCB_UNBIND_NOTIFICATION 0x4A
 #define TCB_SET_FAULT_HANDLER  0x4B
 
-/* VSpace operations (0x50-0x52) */
+/* VSpace operations (0x50-0x54) */
 #define VSPACE_MAP          0x50
 #define VSPACE_UNMAP        0x51
 #define VSPACE_MAP_PT       0x52
+#define VSPACE_WALK         0x53
+#define VSPACE_COPY_PAGE    0x54
 
 /* IRQ operations (0x60-0x63) */
 #define IRQ_CONTROL_GET           0x60
@@ -351,8 +353,10 @@ static inline void salty_set_receive_slot_ctx(struct salty_ipc_context *ctx,
  */
 static inline void __salty_write_overflow_ctx(struct salty_ipc_context *ctx,
                                               const struct salty_msg *msg) {
-    if (!ctx || !ctx->ipc_buffer || msg->length <= 4) return;
-    int n = (int)msg->length - 4;
+    uint32_t len = (uint32_t)msg->length;
+    if (len > 20) len = 20;
+    if (!ctx || !ctx->ipc_buffer || len <= 4) return;
+    int n = (int)len - 4;
     if (n > 16) n = 16;
     for (int i = 0; i < n; i++)
         ctx->ipc_buffer->msg[6 + i] = msg->regs[4 + i];
@@ -576,6 +580,41 @@ static inline int salty_vspace_map_pt(cap_t vspace, cap_t frame,
     return (int)r.error;
 }
 
+/* Walk user-half page tables starting from start_vaddr.
+ * Results are written to the IPC buffer:
+ *   msg[0] = count, msg[1] = next_vaddr (0 if done)
+ *   msg[2..] = (vaddr, phys, flags) tuples, 3 u64s each, up to 6 entries.
+ * Returns 0 on success. */
+static inline int salty_vspace_walk(cap_t vspace, uint64_t start_vaddr,
+                                     uint64_t max_entries) {
+    struct salty_result r = salty_invoke(vspace, VSPACE_WALK,
+                                         start_vaddr, max_entries, 0, 0);
+    return (int)r.error;
+}
+
+/* Copy a page from src VSpace at src_vaddr into dst_frame.
+ * Kernel walks src page tables and copies 4096 bytes via direct mapping. */
+static inline int salty_vspace_copy_page(cap_t src_vspace, uint64_t src_vaddr,
+                                          cap_t dst_frame) {
+    struct salty_result r = salty_invoke(src_vspace, VSPACE_COPY_PAGE,
+                                         src_vaddr, dst_frame, 0, 0);
+    return (int)r.error;
+}
+
+/* Write registers to a TCB: arg0=flags(bit0=resume), arg1=rip, arg2=rsp */
+static inline int salty_tcb_write_registers(cap_t tcb, uint64_t flags,
+                                             uint64_t rip, uint64_t rsp) {
+    struct salty_result r = salty_invoke(tcb, TCB_WRITE_REGISTERS,
+                                         flags, rip, rsp, 0);
+    return (int)r.error;
+}
+
+/* Suspend a TCB */
+static inline int salty_tcb_suspend(cap_t tcb) {
+    struct salty_result r = salty_invoke(tcb, TCB_SUSPEND, 0, 0, 0, 0);
+    return (int)r.error;
+}
+
 /* Copy a capability from src CNode slot to dest CNode slot */
 static inline int salty_cnode_copy(cap_t src_cnode, uint64_t src_slot,
                                    cap_t dest_cnode, uint64_t dest_slot,
@@ -722,6 +761,13 @@ extern int salty_poll(cap_t ntfn, uint64_t *bits);
 extern void salty_debug_putchar(char c);
 extern void salty_debug_dump_state(void);
 extern int salty_tcb_set_ipc_buffer(cap_t tcb, uint64_t addr);
+extern int salty_vspace_walk(cap_t vspace, uint64_t start_vaddr,
+                              uint64_t max_entries);
+extern int salty_vspace_copy_page(cap_t src_vspace, uint64_t src_vaddr,
+                                   cap_t dst_frame);
+extern int salty_tcb_write_registers(cap_t tcb, uint64_t flags,
+                                      uint64_t rip, uint64_t rsp);
+extern int salty_tcb_suspend(cap_t tcb);
 
 #endif /* SALTY_STATIC */
 

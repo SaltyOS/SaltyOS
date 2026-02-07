@@ -80,7 +80,6 @@ struct elf64_rela {
 #define R_X86_64_RELATIVE 8
 
 #define ELF_PAGE_SIZE    4096
-#define ELF_MAX_PAGES    64
 
 /* ELF load errors */
 #define ELF_OK             0
@@ -117,6 +116,12 @@ struct elf_loader_ctx {
     cap_t    child_vspace;     /* Child's VSpace (final mapping target) */
     uint64_t scratch_vaddr;    /* Temp VA in loader's VSpace for copying */
     cap_t    next_frame_slot;  /* Next free cap slot for new frames */
+    /* Optional slot allocator. If set, this is used instead of next_frame_slot++. */
+    cap_t    (*alloc_frame_slot)(void *opaque);
+    void     *alloc_opaque;
+    /* Optional callback to track page mappings in the caller. */
+    int      (*record_page)(void *opaque, uint64_t vaddr, cap_t frame_cap, uint64_t flags);
+    void     *record_opaque;
 };
 
 static inline uint64_t elf_page_align_down(uint64_t v) {
@@ -125,6 +130,19 @@ static inline uint64_t elf_page_align_down(uint64_t v) {
 
 static inline uint64_t elf_page_align_up(uint64_t v) {
     return (v + ELF_PAGE_SIZE - 1) & ~(uint64_t)(ELF_PAGE_SIZE - 1);
+}
+
+static inline cap_t elf_next_frame_slot(struct elf_loader_ctx *ctx) {
+    if (ctx->alloc_frame_slot)
+        return ctx->alloc_frame_slot(ctx->alloc_opaque);
+    return ctx->next_frame_slot++;
+}
+
+static inline int elf_record_page_map(struct elf_loader_ctx *ctx, uint64_t vaddr,
+                                      cap_t frame_cap, uint64_t flags) {
+    if (!ctx->record_page)
+        return 0;
+    return ctx->record_page(ctx->record_opaque, vaddr, frame_cap, flags);
 }
 
 /* Convert ELF p_flags to VSpace mapping flags */
@@ -146,7 +164,8 @@ static inline cap_t elf_alloc_and_map_page(
     size_t src_offset,
     size_t copy_len
 ) {
-    cap_t frame_slot = ctx->next_frame_slot++;
+    cap_t frame_slot = elf_next_frame_slot(ctx);
+    if (frame_slot == (cap_t)-1) return 0;
     int err;
 
     /* Retype a Frame from untyped */
@@ -176,6 +195,9 @@ static inline cap_t elf_alloc_and_map_page(
     /* Map into child's VSpace */
     err = salty_vspace_map(ctx->child_vspace, frame_slot, child_vaddr, flags);
     if (err != 0) return 0;
+
+    if (elf_record_page_map(ctx, child_vaddr, frame_slot, flags) != 0)
+        return 0;
 
     return frame_slot;
 }
@@ -399,8 +421,27 @@ static inline int elf_load(
     /* Delta for PIE relocation */
     uint64_t delta = is_pie ? (load_base - min_vaddr) : 0;
 
-    /* Track mapped pages */
-    struct elf_page_entry pages[ELF_MAX_PAGES];
+    /* Compute a dynamic upper bound for mapped pages across PT_LOAD segments. */
+    size_t page_capacity = 0;
+    for (size_t i = 0; i < phdr_count; i++) {
+        size_t off = phdr_base + i * phdr_size;
+        if (off + sizeof(struct elf64_phdr) > data_len) break;
+        const struct elf64_phdr *phdr =
+            (const struct elf64_phdr *)(data + off);
+        if (phdr->p_type != PT_LOAD) continue;
+
+        uint64_t seg_vaddr = phdr->p_vaddr + delta;
+        uint64_t seg_start = elf_page_align_down(seg_vaddr);
+        uint64_t seg_end = elf_page_align_up(seg_vaddr + phdr->p_memsz);
+        if (seg_end > seg_start)
+            page_capacity += (size_t)((seg_end - seg_start) / ELF_PAGE_SIZE);
+    }
+
+    if (page_capacity == 0)
+        return ELF_NO_LOAD;
+
+    /* Track mapped pages (dynamic stack allocation, no fixed global cap). */
+    struct elf_page_entry pages[page_capacity];
     size_t page_count = 0;
     uint64_t brk = 0;
 
@@ -482,10 +523,12 @@ static inline int elf_load(
                         return ELF_MAP_FAILED;
                     }
                     pages[existing_idx].flags = merged_flags;
+                    if (elf_record_page_map(ctx, page_vaddr, existing, merged_flags) != 0)
+                        return ELF_OUT_OF_MEMORY;
                 }
             } else {
                 /* New page */
-                if (page_count >= ELF_MAX_PAGES) return ELF_TOO_MANY_PAGES;
+                if (page_count >= page_capacity) return ELF_OUT_OF_MEMORY;
 
                 const uint8_t *src_ptr = NULL;
                 size_t actual_offset = 0;
@@ -504,7 +547,8 @@ static inline int elf_load(
                 /* The alloc function zeros the page and copies data at offset 0.
                  * We need a version that copies at dst_offset. Let's do it inline.
                  */
-                cap_t frame_slot = ctx->next_frame_slot++;
+                cap_t frame_slot = elf_next_frame_slot(ctx);
+                if (frame_slot == (cap_t)-1) return ELF_OUT_OF_MEMORY;
                 int err;
 
                 err = salty_untyped_retype(ctx->untyped, OBJ_FRAME, 0, frame_slot);
@@ -557,6 +601,8 @@ static inline int elf_load(
                 pages[page_count].frame_cap = frame_slot;
                 pages[page_count].flags = flags;
                 page_count++;
+                if (elf_record_page_map(ctx, page_vaddr, frame_slot, flags) != 0)
+                    return ELF_OUT_OF_MEMORY;
             }
 
             page_vaddr += ELF_PAGE_SIZE;

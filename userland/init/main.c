@@ -73,6 +73,11 @@
 #define COFF_IPC_FR         6
 #define COFF_FRAME_START    16
 
+/* Dynamic frame-cap pool for phase4 server loading.
+ * Keep this above fixed phase3/4 object slots.
+ */
+#define INIT_DYN_FRAME_MIN  720
+
 /* IPC buffer addresses */
 #define IPC_BUF_VADDR       0x0000000000200000ULL  /* 2 MB - init's IPC buffer */
 #define IPC_BUF2_VADDR      0x0000000000201000ULL  /* 2 MB + 4K - thread2's IPC buffer */
@@ -139,6 +144,13 @@ static uint8_t fault_handler_stack[4096] __attribute__((aligned(4096)));
 /* Per-thread IPC contexts used by init's helper threads. */
 static struct salty_ipc_context thread2_ipc_ctx;
 static struct salty_ipc_context fault_ipc_ctx;
+
+static cap_t init_dyn_frame_next = INIT_DYN_FRAME_MIN;
+
+static cap_t init_alloc_frame_slot(void *opaque) {
+    (void)opaque;
+    return init_dyn_frame_next++;
+}
 
 /* Thread 2 entry point: receives a message from the endpoint */
 static void thread2_entry(void) {
@@ -560,6 +572,10 @@ static int phase3_spawn_console(cap_t ut) {
     loader_ctx.child_vspace = CAP_CHILD_VSPACE;
     loader_ctx.scratch_vaddr = SCRATCH_VADDR;
     loader_ctx.next_frame_slot = CAP_CHILD_FRAME_START;
+    loader_ctx.alloc_frame_slot = 0;
+    loader_ctx.alloc_opaque = 0;
+    loader_ctx.record_page = 0;
+    loader_ctx.record_opaque = 0;
 
     struct elf_load_result elf_result;
     err = elf_load(console_entry.data, console_entry.data_len,
@@ -985,6 +1001,10 @@ struct extra_cap_copy {
 #define SRV_STACK_PAGES   4
 #define SRV_STACK_SIZE    (SRV_STACK_PAGES * 4096ULL)
 #define SRV_STACK_TOP     (CHILD_STACK_VADDR + SRV_STACK_SIZE)
+/* procmgr uses high cap slots (CAP_REPLY_BASE=4096 and per-process blocks),
+ * so it needs a larger CNode than the default 1024 slots.
+ */
+#define PROCMGR_CNODE_SIZE_BITS 13 /* 8192 slots */
 
 static int spawn_server(
     cap_t ut,
@@ -993,7 +1013,8 @@ static int spawn_server(
     const char *label,
     const struct extra_cap_copy *extras,
     int extra_count,
-    int map_initrd
+    int map_initrd,
+    uint64_t cnode_size_bits
 ) {
     int err;
 
@@ -1036,7 +1057,7 @@ static int spawn_server(
     err = salty_untyped_retype(ut, OBJ_VSPACE, 0, child_vs);
     if (err != 0) { salty_serial_puts("[INIT] retype VSpace failed\n"); return -1; }
 
-    err = salty_untyped_retype(ut, OBJ_CNODE, 0, child_cn);
+    err = salty_untyped_retype(ut, OBJ_CNODE, cnode_size_bits, child_cn);
     if (err != 0) { salty_serial_puts("[INIT] retype CNode failed\n"); return -1; }
 
     err = salty_untyped_retype(ut, OBJ_SCHED_CONTEXT, 0, child_sc);
@@ -1058,6 +1079,10 @@ static int spawn_server(
     loader_ctx.child_vspace = child_vs;
     loader_ctx.scratch_vaddr = SCRATCH_VADDR;
     loader_ctx.next_frame_slot = cap_base + COFF_FRAME_START;
+    loader_ctx.alloc_frame_slot = init_alloc_frame_slot;
+    loader_ctx.alloc_opaque = 0;
+    loader_ctx.record_page = 0;
+    loader_ctx.record_opaque = 0;
 
     struct elf_load_result elf_result;
     err = elf_load(entry.data, entry.data_len,
@@ -1126,7 +1151,11 @@ static int spawn_server(
         if (pg == SRV_STACK_PAGES - 1) {
             frame_slot = child_stk_fr;
         } else {
-            frame_slot = loader_ctx.next_frame_slot++;
+            frame_slot = init_alloc_frame_slot(0);
+            if (frame_slot == (cap_t)-1) {
+                salty_serial_puts("[INIT] stack frame slot alloc failed\n");
+                return -1;
+            }
             err = salty_untyped_retype(ut, OBJ_FRAME, 0, frame_slot);
             if (err != 0) {
                 salty_serial_puts("[INIT] stack frame retype failed\n");
@@ -1160,7 +1189,11 @@ static int spawn_server(
         salty_serial_puts(" pages)\n");
 
         for (size_t pg = 0; pg < initrd_pages; pg++) {
-            cap_t fr_slot = loader_ctx.next_frame_slot++;
+            cap_t fr_slot = init_alloc_frame_slot(0);
+            if (fr_slot == (cap_t)-1) {
+                salty_serial_puts("[INIT] initrd frame slot alloc failed\n");
+                return -1;
+            }
             err = salty_untyped_retype(ut, OBJ_FRAME, 0, fr_slot);
             if (err != 0) {
                 salty_serial_puts("[INIT] initrd frame retype failed\n");
@@ -1338,6 +1371,40 @@ static int spawn_server(
     return 0;
 }
 
+static int pm_spawn_and_wait(cap_t pm_ep, const char *prog, int *out_status) {
+    struct salty_msg spawn_msg, spawn_reply;
+    uint8_t len = 0;
+    while (prog[len] && len < 31) len++;
+
+    spawn_msg.label = 1; /* PM_SPAWN */
+    spawn_msg.length = 1 + (uint64_t)((len + 7) / 8);
+    for (int i = 0; i < 20; i++) spawn_msg.regs[i] = 0;
+    spawn_msg.regs[0] = len;
+    {
+        uint8_t *dst = (uint8_t *)&spawn_msg.regs[1];
+        for (uint8_t i = 0; i < len; i++) dst[i] = (uint8_t)prog[i];
+    }
+
+    int err = salty_call(pm_ep, &spawn_msg, &spawn_reply);
+    if (err != 0 || spawn_reply.label != SALTY_OK)
+        return -1;
+
+    uint32_t pid = (uint32_t)spawn_reply.regs[0];
+
+    struct salty_msg wait_msg, wait_reply;
+    wait_msg.label = 3; /* PM_WAIT */
+    wait_msg.length = 1;
+    for (int i = 0; i < 20; i++) wait_msg.regs[i] = 0;
+    wait_msg.regs[0] = (uint64_t)pid;
+
+    err = salty_call(pm_ep, &wait_msg, &wait_reply);
+    if (err != 0 || wait_reply.label != SALTY_OK)
+        return -1;
+
+    if (out_status) *out_status = (int)wait_reply.regs[0];
+    return 0;
+}
+
 /* ================================================================
  * Phase 4: Spawn system servers (nameserv, procmgr, vfs)
  * ================================================================
@@ -1361,7 +1428,7 @@ static void phase4_spawn_servers(cap_t ut) {
 
     /* 1. Spawn nameserv (no extra caps needed beyond standard set) */
     if (spawn_server(ut, CAP_NS_BASE, "nameserv.elf", "nameserv",
-                     (const struct extra_cap_copy *)0, 0, 0) != 0) {
+                     (const struct extra_cap_copy *)0, 0, 0, 0) != 0) {
         salty_serial_puts("[INIT] FAIL: nameserv spawn failed\n");
         goto idle;
     }
@@ -1378,7 +1445,7 @@ static void phase4_spawn_servers(cap_t ut) {
             { ns_ep, 8 },       /* nameserv EP -> child slot 8 */
         };
         if (spawn_server(ut, CAP_VFS_BASE, "vfs.elf", "vfs",
-                         vfs_extras, 2, 0) != 0) {
+                         vfs_extras, 2, 0, 0) != 0) {
             salty_serial_puts("[INIT] FAIL: vfs spawn failed\n");
             goto idle;
         }
@@ -1394,7 +1461,7 @@ static void phase4_spawn_servers(cap_t ut) {
             { vfs_ep, 9 },      /* VFS EP -> child slot 9 (CAP_VFS_EP) */
         };
         if (spawn_server(ut, CAP_PM_BASE, "procmgr.elf", "procmgr",
-                         pm_extras, 2, 1) != 0) {
+                         pm_extras, 2, 1, PROCMGR_CNODE_SIZE_BITS) != 0) {
             salty_serial_puts("[INIT] FAIL: procmgr spawn failed\n");
             goto idle;
         }
@@ -1409,65 +1476,40 @@ static void phase4_spawn_servers(cap_t ut) {
     for (int i = 0; i < 5; i++) salty_yield();
 
     /* ================================================================
-     * Phase 5: Test POSIX calls via hello program
-     * ================================================================
-     * Sends PM_SPAWN for "hello" to procmgr, then PM_WAIT to collect
-     * the exit code.
-     */
-    salty_serial_puts("\n[INIT] Phase 5: Spawning hello test program\n");
-
+     * Phase 5: Runtime userland tests through procmgr
+     * ================================================================ */
+    salty_serial_puts("\n[INIT] Phase 5: Running userland runtime tests\n");
     {
-        /* PM_SPAWN: "hello" */
-        struct salty_msg spawn_msg, spawn_reply;
-        spawn_msg.label = 1; /* PM_SPAWN */
-        spawn_msg.regs[0] = 5; /* len("hello") */
-        spawn_msg.length = 1 + (uint64_t)((spawn_msg.regs[0] + 7) / 8);
-        const char *hello_name = "hello";
-        uint8_t *hdst = (uint8_t *)&spawn_msg.regs[1];
-        for (int i = 0; i < 5; i++) hdst[i] = (uint8_t)hello_name[i];
-        spawn_msg.regs[2] = 0;
-        spawn_msg.regs[3] = 0;
+        const char *tests[] = { "hello", "fstest", "mmap_test", "test_fork" };
+        const int test_count = (int)(sizeof(tests) / sizeof(tests[0]));
 
-        int serr = salty_call(pm_ep, &spawn_msg, &spawn_reply);
-        if (serr != 0 || spawn_reply.label != SALTY_OK) {
-            salty_serial_puts("[INIT] FAIL: hello spawn failed err=");
-            salty_serial_hex((uint64_t)serr);
-            salty_serial_puts(" label=");
-            salty_serial_hex(spawn_reply.label);
+        for (int i = 0; i < test_count; i++) {
+            int status = -1;
+            salty_serial_puts("[INIT] Phase 5: spawn ");
+            salty_serial_puts(tests[i]);
             salty_serial_puts("\n");
-            goto idle;
-        }
 
-        uint32_t hello_pid = (uint32_t)spawn_reply.regs[0];
-        salty_serial_puts("[INIT] hello spawned PID=");
-        salty_serial_hex((uint64_t)hello_pid);
-        salty_serial_puts("\n");
-
-        /* PM_WAIT: poll for exit */
-        int exit_code = -1;
-        for (int attempt = 0; attempt < 200; attempt++) {
-            struct salty_msg wait_msg, wait_reply;
-            wait_msg.label = 3; /* PM_WAIT */
-            wait_msg.length = 1;
-            wait_msg.regs[0] = (uint64_t)hello_pid;
-            wait_msg.regs[1] = 0;
-            wait_msg.regs[2] = 0;
-            wait_msg.regs[3] = 0;
-
-            serr = salty_call(pm_ep, &wait_msg, &wait_reply);
-            if (serr != 0) break;
-
-            if (wait_reply.label == SALTY_OK) {
-                exit_code = (int)wait_reply.regs[0];
-                break;
+            if (pm_spawn_and_wait(pm_ep, tests[i], &status) != 0) {
+                salty_serial_puts("[INIT] FAIL: spawn/wait failed for ");
+                salty_serial_puts(tests[i]);
+                salty_serial_puts("\n");
+                goto idle;
             }
-            /* SALTY_BUSY = not exited yet, retry */
-            salty_yield();
+
+            salty_serial_puts("[INIT] ");
+            salty_serial_puts(tests[i]);
+            salty_serial_puts(" exited with code ");
+            salty_serial_hex((uint64_t)status);
+            salty_serial_puts("\n");
+
+            if (status != 42) {
+                salty_serial_puts("[INIT] FAIL: unexpected exit code from ");
+                salty_serial_puts(tests[i]);
+                salty_serial_puts("\n");
+                goto idle;
+            }
         }
 
-        salty_serial_puts("[INIT] hello exited with code ");
-        salty_serial_hex((uint64_t)exit_code);
-        salty_serial_puts("\n");
         salty_serial_puts("[INIT] Phase 5 PASSED\n");
     }
 

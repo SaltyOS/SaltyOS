@@ -10,11 +10,15 @@ use super::{
     KernelObject, ObjectType, INVALID_SLOT,
 };
 
-/// CNode size (number of slots as power of 2)
-///
-/// 1024 slots is required for init's multi-server bootstrap layout
-/// (console + nameserv + procmgr + vfs capability blocks).
-pub const CNODE_SIZE_BITS: usize = 10;
+/// Default CNode size_bits when caller passes 0 (ABI backward compat)
+pub const CNODE_DEFAULT_SIZE_BITS: u8 = 10; // 1024 slots
+/// Minimum allowed CNode size_bits
+pub const CNODE_MIN_SIZE_BITS: u8 = 4; // 16 slots
+/// Maximum allowed CNode size_bits
+pub const CNODE_MAX_SIZE_BITS: u8 = 16; // 65536 slots
+
+/// Legacy aliases (kept for any external references)
+pub const CNODE_SIZE_BITS: usize = CNODE_DEFAULT_SIZE_BITS as usize;
 pub const CNODE_SIZE: usize = 1 << CNODE_SIZE_BITS;
 
 /// Capability reference - points to global slot
@@ -47,44 +51,109 @@ impl CapRef {
 
 /// Capability Node - stores capability references
 ///
-/// CNodes are kernel objects that hold an array of CapRef entries.
-/// Each entry is either INVALID_SLOT (empty) or a valid slot index.
-#[repr(C, align(4096))]
+/// CNodes are kernel objects that hold a header followed by a contiguous
+/// array of CapRef entries in memory. The number of slots is determined
+/// by `header.size_bits` (capacity = 1 << size_bits).
+///
+/// Memory layout:
+///   +0:  KernelObject header (12 bytes, header.size_bits = log2(num_slots))
+///   +12: CapRef[0] .. CapRef[2^size_bits - 1]
+#[repr(C)]
 pub struct CNode {
     /// Kernel object header (must be first for refcount access)
     pub header: KernelObject,
-    slots: [CapRef; CNODE_SIZE],
+    // Slots [CapRef; 1 << header.size_bits] follow contiguously in memory.
+    // Accessed via pointer arithmetic (slot_ptr / slot_ptr_mut).
+}
+
+/// Validate size_bits for CNode, returning effective bits or error.
+///
+/// - 0 → default (CNODE_DEFAULT_SIZE_BITS = 10, i.e. 1024 slots)
+/// - 1..3 → InvalidArgument (too small)
+/// - 4..16 → use as-is
+/// - 17+ → InvalidArgument (too large)
+pub fn effective_cnode_bits(size_bits: u8) -> Result<u8, CapError> {
+    if size_bits == 0 {
+        Ok(CNODE_DEFAULT_SIZE_BITS)
+    } else if size_bits < CNODE_MIN_SIZE_BITS {
+        Err(CapError::InvalidArgument)
+    } else if size_bits > CNODE_MAX_SIZE_BITS {
+        Err(CapError::InvalidArgument)
+    } else {
+        Ok(size_bits)
+    }
 }
 
 impl CNode {
-    pub const fn new() -> Self {
-        Self {
-            header: KernelObject::new(ObjectType::CNode, CNODE_SIZE_BITS as u8),
-            slots: [CapRef::null(); CNODE_SIZE],
+    /// Number of slots this CNode holds (1 << header.size_bits)
+    pub fn num_slots(&self) -> usize {
+        1usize << (self.header.size_bits as usize)
+    }
+
+    /// Get pointer to slot at `index` (no bounds check)
+    unsafe fn slot_ptr(&self, index: usize) -> *const CapRef {
+        unsafe {
+            let base = (self as *const CNode).add(1) as *const CapRef;
+            base.add(index)
+        }
+    }
+
+    /// Get mutable pointer to slot at `index` (no bounds check)
+    unsafe fn slot_ptr_mut(&mut self, index: usize) -> *mut CapRef {
+        unsafe {
+            let base = (self as *mut CNode).add(1) as *mut CapRef;
+            base.add(index)
+        }
+    }
+
+    /// Initialize a CNode in-place at the given memory address.
+    ///
+    /// Writes the header and zero-fills all slot entries with CapRef::null().
+    /// The caller must ensure `ptr` points to at least
+    /// `size_of::<CNode>() + (1 << size_bits) * size_of::<CapRef>()` bytes.
+    pub unsafe fn init_at(ptr: *mut u8, size_bits: u8) {
+        unsafe {
+            let cnode = ptr as *mut CNode;
+            // Write header
+            core::ptr::write(
+                &raw mut (*cnode).header,
+                KernelObject::new(ObjectType::CNode, size_bits),
+            );
+            // Zero-fill all slots with CapRef::null() (INVALID_SLOT = 0xFFFFFFFF)
+            let num_slots = 1usize << (size_bits as usize);
+            let slots_base = cnode.add(1) as *mut CapRef;
+            for i in 0..num_slots {
+                core::ptr::write(slots_base.add(i), CapRef::null());
+            }
         }
     }
 
     /// Check if slot is empty (holds null reference)
     pub fn is_slot_empty(&self, index: usize) -> bool {
-        index < CNODE_SIZE && self.slots[index].is_null()
+        if index >= self.num_slots() {
+            return false;
+        }
+        unsafe { (*self.slot_ptr(index)).is_null() }
     }
 
     /// Insert a capability reference into a slot
     pub fn insert_ref(&mut self, index: usize, cap_ref: CapRef) -> Result<(), CapError> {
-        if index >= CNODE_SIZE {
+        if index >= self.num_slots() {
             return Err(CapError::InvalidSlot);
         }
         if !self.is_slot_empty(index) {
             return Err(CapError::SlotOccupied);
         }
-        self.slots[index] = cap_ref;
+        unsafe {
+            core::ptr::write(self.slot_ptr_mut(index), cap_ref);
+        }
         Ok(())
     }
 
     /// Get capability reference at index
     pub fn get_ref(&self, index: usize) -> Option<CapRef> {
-        if index < CNODE_SIZE && !self.is_slot_empty(index) {
-            Some(self.slots[index])
+        if index < self.num_slots() && !self.is_slot_empty(index) {
+            Some(unsafe { *self.slot_ptr(index) })
         } else {
             None
         }
@@ -107,7 +176,7 @@ impl CNode {
         new_rights: CapRights,
     ) -> Result<(), CapError> {
         // Validate indices
-        if dest >= CNODE_SIZE || src >= CNODE_SIZE {
+        if dest >= self.num_slots() || src >= src_cnode.num_slots() {
             return Err(CapError::InvalidSlot);
         }
 
@@ -132,7 +201,9 @@ impl CNode {
         src_cap.copy(src_ref.slot, new_rights, dest_slot)?;
 
         // Insert reference into destination CNode
-        self.slots[dest] = CapRef { slot: dest_slot };
+        unsafe {
+            core::ptr::write(self.slot_ptr_mut(dest), CapRef { slot: dest_slot });
+        }
 
         Ok(())
     }
@@ -150,7 +221,7 @@ impl CNode {
         new_rights: CapRights,
     ) -> Result<(), CapError> {
         // Validate indices
-        if dest >= CNODE_SIZE || src >= CNODE_SIZE {
+        if dest >= self.num_slots() || src >= src_cnode.num_slots() {
             return Err(CapError::InvalidSlot);
         }
 
@@ -170,7 +241,9 @@ impl CNode {
         src_cap.mint(src_ref.slot, badge, new_rights, dest_slot)?;
 
         // Insert reference into destination CNode
-        self.slots[dest] = CapRef { slot: dest_slot };
+        unsafe {
+            core::ptr::write(self.slot_ptr_mut(dest), CapRef { slot: dest_slot });
+        }
 
         Ok(())
     }
@@ -186,7 +259,7 @@ impl CNode {
         src: usize,
     ) -> Result<(), CapError> {
         // Validate indices
-        if dest >= CNODE_SIZE || src >= CNODE_SIZE {
+        if dest >= self.num_slots() || src >= src_cnode.num_slots() {
             return Err(CapError::InvalidSlot);
         }
 
@@ -199,8 +272,10 @@ impl CNode {
         let src_ref = src_cnode.get_ref(src).ok_or(CapError::SlotEmpty)?;
 
         // Transfer reference (no global slot changes)
-        self.slots[dest] = src_ref;
-        src_cnode.slots[src] = CapRef::null();
+        unsafe {
+            core::ptr::write(self.slot_ptr_mut(dest), src_ref);
+            core::ptr::write(src_cnode.slot_ptr_mut(src), CapRef::null());
+        }
 
         Ok(())
     }
@@ -242,7 +317,7 @@ impl CNode {
         index: usize,
         current_tcb: *mut super::super::sched::thread::Tcb,
     ) -> Result<(), CapError> {
-        if index >= CNODE_SIZE {
+        if index >= self.num_slots() {
             return Err(CapError::InvalidSlot);
         }
         if !self.is_slot_empty(index) {
@@ -261,6 +336,8 @@ impl CNode {
 
             // Create a reply capability pointing to the caller's TCB
             cap.object = tcb.reply_tcb as *mut super::KernelObject;
+            // Increment refcount to balance release_object() in delete()
+            super::increment_refcount(cap.object);
             cap.obj_type = super::ObjectType::Tcb;
             cap.rights = super::CapRights::REPLY;
             cap.badge = 0;
@@ -269,7 +346,7 @@ impl CNode {
             cap._pad = 0;
 
             // Insert reference into CNode
-            self.slots[index] = CapRef { slot };
+            core::ptr::write(self.slot_ptr_mut(index), CapRef { slot });
 
             // Clear the reply capability from the current thread (one-shot)
             tcb.reply_tcb = core::ptr::null_mut();
@@ -284,7 +361,7 @@ impl CNode {
     /// Deletes the capability at the given index and recursively
     /// revokes all its descendants in the CDT.
     pub fn revoke(&mut self, index: usize) -> Result<(), CapError> {
-        if index >= CNODE_SIZE {
+        if index >= self.num_slots() {
             return Err(CapError::InvalidSlot);
         }
 
@@ -294,7 +371,9 @@ impl CNode {
         CDT::revoke(cap_ref.slot);
 
         // Clear CNode slot
-        self.slots[index] = CapRef::null();
+        unsafe {
+            core::ptr::write(self.slot_ptr_mut(index), CapRef::null());
+        }
 
         Ok(())
     }
@@ -304,7 +383,7 @@ impl CNode {
     /// Deletes the capability at the given index.
     /// Fails if the capability has children (use revoke instead).
     pub fn delete(&mut self, index: usize) -> Result<(), CapError> {
-        if index >= CNODE_SIZE {
+        if index >= self.num_slots() {
             return Err(CapError::InvalidSlot);
         }
 
@@ -342,14 +421,16 @@ impl CNode {
         free_slot(cap_ref.slot);
 
         // Clear CNode slot
-        self.slots[index] = CapRef::null();
+        unsafe {
+            core::ptr::write(self.slot_ptr_mut(index), CapRef::null());
+        }
 
         Ok(())
     }
 
     /// Get information about a capability
     pub fn cap_info(&self, index: usize) -> Result<CapInfo, CapError> {
-        if index >= CNODE_SIZE {
+        if index >= self.num_slots() {
             return Err(CapError::InvalidSlot);
         }
 
@@ -399,22 +480,38 @@ pub enum CapError {
     HasDerivedCaps,
     ObjectInUse,
     InvalidState,
+    InvalidArgument,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Size of a test CNode buffer (header + 16 slots, size_bits=4)
+    const TEST_SIZE_BITS: u8 = CNODE_MIN_SIZE_BITS; // 16 slots
+    const TEST_BUF_SIZE: usize =
+        core::mem::size_of::<CNode>() + ((1 << TEST_SIZE_BITS) * core::mem::size_of::<CapRef>());
+
+    fn make_test_cnode(buf: &mut [u8; TEST_BUF_SIZE]) -> &mut CNode {
+        unsafe {
+            CNode::init_at(buf.as_mut_ptr(), TEST_SIZE_BITS);
+            &mut *(buf.as_mut_ptr() as *mut CNode)
+        }
+    }
+
     #[test]
     fn test_cnode_new() {
-        let cnode = CNode::new();
+        let mut buf = [0u8; TEST_BUF_SIZE];
+        let cnode = make_test_cnode(&mut buf);
+        assert_eq!(cnode.num_slots(), 1 << TEST_SIZE_BITS);
         assert!(cnode.is_slot_empty(0));
         assert!(cnode.get(0).is_none());
     }
 
     #[test]
     fn test_insert_ref() {
-        let mut cnode = CNode::new();
+        let mut buf = [0u8; TEST_BUF_SIZE];
+        let cnode = make_test_cnode(&mut buf);
         let cap_ref = CapRef { slot: 100 };
 
         assert!(cnode.insert_ref(0, cap_ref).is_ok());
@@ -424,7 +521,8 @@ mod tests {
 
     #[test]
     fn test_insert_occupied() {
-        let mut cnode = CNode::new();
+        let mut buf = [0u8; TEST_BUF_SIZE];
+        let cnode = make_test_cnode(&mut buf);
         let cap_ref = CapRef { slot: 100 };
 
         assert!(cnode.insert_ref(0, cap_ref).is_ok());
@@ -433,17 +531,39 @@ mod tests {
 
     #[test]
     fn test_move_slot() {
-        let mut cnode1 = CNode::new();
-        let mut cnode2 = CNode::new();
+        let mut buf1 = [0u8; TEST_BUF_SIZE];
+        let mut buf2 = [0u8; TEST_BUF_SIZE];
+        unsafe {
+            CNode::init_at(buf1.as_mut_ptr(), TEST_SIZE_BITS);
+            CNode::init_at(buf2.as_mut_ptr(), TEST_SIZE_BITS);
+        }
+        let cnode1 = unsafe { &mut *(buf1.as_mut_ptr() as *mut CNode) };
+        let cnode2 = unsafe { &mut *(buf2.as_mut_ptr() as *mut CNode) };
         let cap_ref = CapRef { slot: 100 };
 
         // Insert into first CNode
         cnode1.insert_ref(0, cap_ref).unwrap();
 
         // Move to second CNode
-        cnode2.move_slot(5, &mut cnode1, 0).unwrap();
+        cnode2.move_slot(5, cnode1, 0).unwrap();
 
         assert!(cnode1.is_slot_empty(0));
         assert!(!cnode2.is_slot_empty(5));
+    }
+
+    #[test]
+    fn test_effective_cnode_bits() {
+        // 0 → default
+        assert_eq!(effective_cnode_bits(0).unwrap(), CNODE_DEFAULT_SIZE_BITS);
+        // 1..3 → error
+        assert!(effective_cnode_bits(1).is_err());
+        assert!(effective_cnode_bits(3).is_err());
+        // 4..16 → as-is
+        assert_eq!(effective_cnode_bits(4).unwrap(), 4);
+        assert_eq!(effective_cnode_bits(10).unwrap(), 10);
+        assert_eq!(effective_cnode_bits(16).unwrap(), 16);
+        // 17+ → error
+        assert!(effective_cnode_bits(17).is_err());
+        assert!(effective_cnode_bits(255).is_err());
     }
 }
