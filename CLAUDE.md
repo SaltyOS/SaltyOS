@@ -83,7 +83,7 @@ Syscall instruction: `syscall` (not `int 0x80`). Number in `rax`, args in `rdi, 
 
 **Message info encoding** (seL4-style): bits 6:0 = length (0-127 MRs), bits 11:7 = extra caps, bits 51:12 = label. MR0-MR3 in registers, MR4-MR19 via IPC buffer.
 
-**Invoke labels** (defined in `lib/libsalty/salty.h`): CNode ops `0x10-0x16`, Untyped `0x20`, SchedContext `0x30-0x34`, TCB `0x40-0x4B`, VSpace `0x50-0x53`, IRQ `0x60-0x63`, IoPort `0x70-0x73`.
+**Invoke labels** (defined in `lib/libsalty/src/consts.rs`): CNode ops `0x10-0x16`, Untyped `0x20`, SchedContext `0x30-0x34`, TCB `0x40-0x4B`, VSpace `0x50-0x53`, IRQ `0x60-0x63`, IoPort `0x70-0x73`.
 
 ### Well-Known Capability Slots
 
@@ -110,32 +110,30 @@ Set by kernel for init; inherited by child processes:
 
 Include paths are relative to `boot/` root (Meson `-I` flag). Files in `stage3/arch/x86/bios/` use `../../../../common/` to reach `boot/common/`.
 
-### Userland (C, `userland/`)
+### Userland (Rust, `userland/`)
 
 | Program | Role |
 |---------|------|
-| `init` | First process — multi-phase bootstrap: IPC test, fault handling, spawn servers |
+| `init` | First process — service-based multi-phase bootstrap |
 | `rtld` | Runtime dynamic linker (loads libsalty.so) |
 | `console` | Serial console server (IoPort cap for COM1) |
-| `procmgr` | Process manager (spawn/exit) |
-| `vfs` | Virtual filesystem server |
-| `nameserv` | Name service |
-| `hello` | Test program |
+| `procmgr` | Process manager (spawn/exit/waitpid) |
+| `vfs` | Virtual filesystem server (ramfs + devfs + Unix sockets + shm + poll) |
+| `nameserv` | Name service (endpoint lookup) |
+| `test_runner` | Automated test suite (hello, fs, mmap, fork, signal, socket) |
 
 All userland ELFs are packed into a CPIO initrd (`tools/mkcpio.py`) which is embedded in the disk image.
 
-### libsalty (`lib/libsalty/`)
+### libsalty (`lib/libsalty/`, Rust)
 
-Userspace system library providing syscall wrappers and IPC helpers.
+Userspace system library providing syscall wrappers, IPC helpers, and POSIX compatibility.
 
-- `salty.h` — Syscall numbers, invoke labels, error codes, object types, well-known cap slots, message struct
-- `salty_impl.c` — Higher-level wrappers (e.g., retype, map, TCB configure)
-- `posix.h` / `posix_mm.h` — POSIX compatibility layer (fork, exec, mmap)
-- `elf_loader.h` / `elf_dynamic.h` — ELF loading and dynamic linking
-- `cpio.h` — CPIO archive parsing
-- `fork.S` — Fork assembly stub
-
-**Static vs dynamic**: When `SALTY_STATIC` is defined, all functions are `static inline` (header-only). Otherwise they're extern declarations linked against `libsalty.so`.
+- `src/consts.rs` — Syscall numbers, invoke labels, error codes, object types, well-known cap slots, POSIX constants (socket, poll, shm)
+- `src/types.rs` — Message struct, PollFd, SockAddrUn, EpollEvent, signal types
+- `src/ipc.rs` — Low-level IPC wrappers (call, send, recv, reply_recv)
+- `src/posix.rs` — POSIX compatibility layer (file I/O, fork, exec, mmap, sockets, poll, shm)
+- `src/lib.rs` — C ABI exports for all operations
+- `src/fork.S` — Fork assembly stub
 
 ## Rust 2024 Edition
 

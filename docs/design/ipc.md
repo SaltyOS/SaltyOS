@@ -221,17 +221,21 @@ Use cases:
 ```rust
 pub struct Notification {
     pub header: KernelObject,
-    word: u64,
-    waiting_tcb: *mut Tcb,
-    bound_tcb: *mut Tcb,
+    pub bits: AtomicU64,        // Pending notification bits
+    waiting: *mut Tcb,          // Thread directly Wait()-ing
+    pub bound_tcb: *mut Tcb,    // Thread with this notification bound
 }
 ```
+
+The `bound_tcb` field maintains a bidirectional link with the TCB's `bound_notification` pointer. Bind/unbind operations update both sides, and cleanup on either object destruction clears the back-pointer to prevent use-after-free.
 
 ### Operations
 
 #### Signal
 
-Atomically ORs bits into the notification word. If a thread is waiting, it is woken with the accumulated word value.
+Atomically ORs bits into the notification word. Wake behavior:
+1. If a thread is directly waiting (via `Wait` syscall), wake it with accumulated bits.
+2. Otherwise, if `bound_tcb` is non-null and the bound thread is `RecvBlocked` on an endpoint, remove it from the endpoint's recv queue and deliver the notification bits as the badge.
 
 #### Wait
 
@@ -243,7 +247,13 @@ Non-blocking check. Returns current word value or WouldBlock.
 
 ### Combined Notification + Endpoint Wait
 
-A thread can bind a notification to itself. When calling `recv()`, the kernel checks the bound notification first. If pending, the notification is returned instead of blocking on the endpoint.
+A thread can bind a notification to itself via `TCB_BindNotification`. The kernel maintains a bidirectional link: `tcb.bound_notification` ↔ `notification.bound_tcb`.
+
+When calling `recv()` on an endpoint with no sender waiting, the kernel checks the bound notification for pending bits before blocking. If bits are pending, they are atomically swapped out and returned immediately as the badge (with an empty message), avoiding the block entirely.
+
+Additionally, if a signal arrives on the bound notification while the thread is `RecvBlocked` on an endpoint, the signal handler wakes the thread by removing it from the endpoint's recv queue and delivering the notification bits. This enables servers to wait on both client IPC and async events (e.g., IRQs) simultaneously.
+
+The IPC fastpath (ReplyRecv) bails to the slowpath when no sender is waiting, ensuring the bound notification check occurs correctly.
 
 ## IRQ Handling
 

@@ -205,26 +205,35 @@ Standard L4/seL4 uses inline capabilities (single word). We chose fat capabiliti
 - Capability system with fat capabilities (32 bytes), CDT, copy/mint/move/mutate/revoke/delete
 - Synchronous IPC (endpoints) with send/recv/call/reply_recv/NBSend
 - Asynchronous notifications (signal/wait/poll) with combined endpoint wait
+- Bound notification wake: signal wakes RecvBlocked thread on endpoint (bidirectional tcb↔notification link)
 - IPC buffer with message overflow (MR4-MR19) and capability transfer
+- IPC assembly fastpath for Call + ReplyRecv (short messages, no cap transfer)
 - Fault handling via fault endpoints with reply-to-resume
 - EDF scheduler with budget enforcement
 - Virtual memory management (VSpace map/unmap/MapPT)
 - IRQ handling via notifications with IRQHandler capabilities
 - I/O port capabilities (IoPort_In8/Out8/In16/Out16)
+- POSIX signals via notification-based delivery
 - Debug syscalls (DebugPutChar, DebugDumpState)
 - 3-stage bootloader (BIOS and UEFI)
-- Init process with multi-phase bootstrap
+- Init process with multi-phase bootstrap (service-based)
 - Console server (serial I/O via IoPort caps)
 - Runtime dynamic linker (rtld)
+- Process manager (spawn, exit, waitpid)
+- VFS server (ramfs + devfs + initrd + Unix domain sockets + shared memory + poll)
+- Name service (endpoint lookup)
 - SMP support (ACPI MADT parser, AP trampoline, per-CPU queues, IPI reschedule)
+- Userland and libsalty migrated from C to Rust
+- POSIX Phase 2 (GUI-ready): Unix domain sockets, poll/select, POSIX shared memory, fd passing
 
 ## Future Directions
 
 1. **Formal Verification**: seL4-style proofs for critical paths
-2. **IPC Assembly Fastpath**: Implemented — hybrid asm/Rust fastpath for Call + ReplyRecv
-3. **Nested Virtualization**: Hypervisor mode for VMs
-4. **Network Stack**: Userspace TCP/IP implementation
-5. **GUI Compositor**: Wayland-like display server
+2. **Nested Virtualization**: Hypervisor mode for VMs
+3. **Network Stack**: Userspace TCP/IP implementation
+4. **GUI Compositor**: Wayland-like display server (POSIX socket/shm prerequisites done)
+5. **Pipes and FIFOs**: pipe, pipe2, dup, mkfifo
+6. **Terminal Handling**: isatty, tcgetattr/tcsetattr, ioctl
 
 ## References
 

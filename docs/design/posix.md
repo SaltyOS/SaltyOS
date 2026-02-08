@@ -129,25 +129,28 @@ Required for running graphical applications (Wayland, X11 via XWayland).
 **Unix Domain Sockets**:
 | Function | Status | Notes |
 |----------|--------|-------|
-| `socket(AF_UNIX, ...)` | Planned | Implemented via SaltyOS endpoints |
-| `bind`, `listen`, `accept` | Planned | |
-| `connect` | Planned | |
-| `sendmsg`, `recvmsg` | Planned | Critical for fd passing |
-| `SCM_RIGHTS` | Planned | Maps to capability transfer |
+| `socket(AF_UNIX, ...)` | Implemented | VFS server + libsalty posix.rs |
+| `bind`, `listen`, `accept` | Implemented | VFS server + libsalty posix.rs |
+| `connect` | Implemented | VFS server + libsalty posix.rs |
+| `sendmsg`, `recvmsg` | Implemented | With fd passing support |
+| `socketpair` | Implemented | VFS server + libsalty posix.rs |
+| `shutdown` | Implemented | SHUT_RD/SHUT_WR/SHUT_RDWR |
+| `SCM_RIGHTS` | Implemented | fd passing via sendmsg/recvmsg |
 
 **Event Multiplexing**:
 | Function | Status | Notes |
 |----------|--------|-------|
-| `poll` | Planned | Wait on multiple endpoints/notifications |
-| `select` | Planned | Wrapper around poll |
-| `epoll_*` | Planned | Linux extension, needed for many apps |
+| `poll` | Implemented | VFS server + libsalty posix.rs |
+| `select` | Implemented | Wrapper around poll in libsalty |
+| `epoll_*` | Partial | Constants defined, epoll_create via /dev/epoll |
 
 **POSIX Shared Memory**:
 | Function | Status | Notes |
 |----------|--------|-------|
-| `shm_open` | Planned | Creates shared memory object |
-| `shm_unlink` | Planned | |
-| `mmap` (shared) | Planned | Map shm into address space |
+| `shm_open` | Implemented | VFS server + libsalty posix.rs |
+| `shm_unlink` | Implemented | VFS server + libsalty posix.rs |
+| `mmap` (shared) | Implemented | MAP_SHARED flag support |
+| `ftruncate` | Implemented | VFS server + libsalty posix.rs |
 
 **Signals** (limited):
 | Function | Status | Notes |
@@ -330,11 +333,12 @@ Phase 1: Core POSIX
 ├── ProcMgr (fork, exec, wait)
 └── Basic signal delivery
 
-Phase 2: GUI-Ready
-├── Unix domain socket emulation
-├── SCM_RIGHTS (capability transfer)
-├── POSIX shared memory
-├── poll/epoll
+Phase 2: GUI-Ready                     ✓ DONE
+├── Unix domain socket emulation        ✓
+├── SCM_RIGHTS (capability transfer)    ✓
+├── POSIX shared memory                 ✓
+├── poll/select                         ✓
+├── epoll (partial)
 └── Wayland compositor support
 
 Phase 3: Extended Compatibility
