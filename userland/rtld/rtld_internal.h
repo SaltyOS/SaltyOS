@@ -13,22 +13,20 @@
 #include <stddef.h>
 
 /* ============================================================
- * Debug output (direct port I/O to COM1 0x3F8)
+ * Debug output (via DebugPutChar syscall)
  * ============================================================ */
 
-static inline void rtld_outb(uint16_t port, uint8_t val) {
-    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
-}
-
-static inline uint8_t rtld_inb(uint16_t port) {
-    uint8_t val;
-    __asm__ volatile("inb %1, %0" : "=a"(val) : "Nd"(port));
-    return val;
-}
+#define SYS_DEBUG_PUTCHAR  10
 
 static inline void rtld_putc(char c) {
-    while (!(rtld_inb(0x3FD) & 0x20)) {}
-    rtld_outb(0x3F8, c);
+    register uint64_t r10 __asm__("r10") = 0;
+    register uint64_t r8  __asm__("r8")  = 0;
+    register uint64_t r9  __asm__("r9")  = 0;
+    __asm__ volatile("syscall"
+        : : "a"((uint64_t)SYS_DEBUG_PUTCHAR), "D"((uint64_t)(unsigned char)c),
+            "S"((uint64_t)0), "d"((uint64_t)0),
+            "r"(r10), "r"(r8), "r"(r9)
+        : "rcx", "r11", "memory");
 }
 
 static inline void rtld_puts(const char *s) {

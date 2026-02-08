@@ -1,0 +1,9 @@
+[Service]
+Name=vfs
+Binary=vfs.elf
+Type=simple
+Restart=always
+
+[Dependencies]
+After=console nameserv
+Before=procmgr

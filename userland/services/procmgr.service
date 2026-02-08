@@ -1,0 +1,9 @@
+[Service]
+Name=procmgr
+Binary=procmgr.elf
+Type=simple
+Restart=always
+
+[Dependencies]
+After=console nameserv vfs
+Before=test_runner

@@ -1,0 +1,9 @@
+[Service]
+Name=test_runner
+Binary=test_runner.elf
+Type=simple
+Restart=no
+
+[Dependencies]
+After=procmgr
+Before=

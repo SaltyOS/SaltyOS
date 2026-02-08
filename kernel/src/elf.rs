@@ -75,10 +75,6 @@ const DT_RELASZ: i64 = 8;
 const DT_RELAENT: i64 = 9;
 const R_X86_64_RELATIVE: u32 = 8;
 
-/// Maximum number of pages we track for relocation fixups.
-/// A small init binary should be well under this.
-const MAX_MAPPED_PAGES: usize = 64;
-
 /// ELF load errors
 #[derive(Debug)]
 pub enum ElfError {
@@ -91,7 +87,6 @@ pub enum ElfError {
     RelocFailed,
     OutOfMemory,
     TooSmall,
-    TooManyPages,
     MapFailed,
 }
 
@@ -210,9 +205,6 @@ pub fn load_elf(
         0
     };
 
-    // Track mapped pages for relocation fixups: (page_vaddr, frame_phys)
-    let mut page_map: [(u64, u64); MAX_MAPPED_PAGES] = [(0, 0); MAX_MAPPED_PAGES];
-    let mut page_count: usize = 0;
     let mut brk: u64 = 0;
 
     // Load each PT_LOAD segment
@@ -238,15 +230,7 @@ pub fn load_elf(
         let mut page_vaddr = seg_start;
         while page_vaddr < seg_end {
             // Check if this page was already mapped by a previous segment
-            let mut existing_phys: Option<u64> = None;
-            for j in 0..page_count {
-                if page_map[j].0 == page_vaddr {
-                    existing_phys = Some(page_map[j].1);
-                    break;
-                }
-            }
-
-            let frame_phys = if let Some(phys) = existing_phys {
+            let frame_phys = if let Some(phys) = vspace.resolve_page(page_vaddr) {
                 // Page already mapped — reuse existing frame (don't re-zero)
                 phys
             } else {
@@ -261,13 +245,6 @@ pub fn load_elf(
                 vspace
                     .map(page_vaddr, phys, flags)
                     .map_err(|_| ElfError::MapFailed)?;
-
-                // Track for relocation
-                if page_count >= MAX_MAPPED_PAGES {
-                    return Err(ElfError::TooManyPages);
-                }
-                page_map[page_count] = (page_vaddr, phys);
-                page_count += 1;
 
                 phys
             };
@@ -313,7 +290,7 @@ pub fn load_elf(
 
     // Apply RELA relocations for PIE binaries
     if is_pie {
-        apply_relocations(data, delta, &page_map[..page_count])?;
+        apply_relocations(data, delta, vspace)?;
     }
 
     let entry = ehdr.e_entry.wrapping_add(delta);
@@ -353,7 +330,7 @@ fn vaddr_to_file_offset(
 fn apply_relocations(
     data: &[u8],
     delta: u64,
-    page_map: &[(u64, u64)],
+    vspace: &VSpace,
 ) -> Result<(), ElfError> {
     let ehdr = unsafe { &*(data.as_ptr() as *const Elf64Ehdr) };
     let phdr_base = ehdr.e_phoff as usize;
@@ -441,23 +418,13 @@ fn apply_relocations(
             let target_page = page_align_down(target_vaddr);
             let page_offset = (target_vaddr - target_page) as usize;
 
-            let mut found = false;
-            for &(vaddr, phys) in page_map.iter() {
-                if vaddr == target_page {
-                    let ptr = phys_to_virt(phys) as *mut u8;
-                    if page_offset + 8 <= PAGE_SIZE {
-                        unsafe {
-                            let target = ptr.add(page_offset) as *mut u64;
-                            target.write(value);
-                        }
-                    }
-                    found = true;
-                    break;
+            let phys = vspace.resolve_page(target_page).ok_or(ElfError::RelocFailed)?;
+            let ptr = phys_to_virt(phys) as *mut u8;
+            if page_offset + 8 <= PAGE_SIZE {
+                unsafe {
+                    let target = ptr.add(page_offset) as *mut u64;
+                    target.write(value);
                 }
-            }
-
-            if !found {
-                return Err(ElfError::RelocFailed);
             }
         }
         // Ignore other relocation types (R_X86_64_NONE, etc.)

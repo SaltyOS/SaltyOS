@@ -1099,15 +1099,11 @@ fn syscall_tcb_configure(
             tcb.context.r12 = entry_rip;      // User RIP
             tcb.context.r13 = entry_rsp;      // User RSP
             tcb.context.r14 = vspace.root();  // User CR3
-            tcb.context.r15 = 0x3202;         // User RFLAGS: IF=1, IOPL=3
+            tcb.context.r15 = 0x0202;         // User RFLAGS: IF=1, IOPL=0
             tcb.context.rflags = 0x202;       // Kernel RFLAGS for context_switch
         } else {
-            // No VSpace: kernel thread (ring 0)
-            tcb.context.rip = entry_rip;
-            tcb.context.rsp = entry_rsp;
-            tcb.context.rflags = 0x202;
-            tcb.context.cs = 0x23;
-            tcb.context.ss = 0x1B;
+            // No VSpace: reject — kernel threads must be created internally
+            return SyscallResult::err(SyscallError::InvalidOperation);
         }
 
         tcb.ipc_buffer = ipc_buffer;

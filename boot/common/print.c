@@ -190,6 +190,19 @@ void print_hex(uint64_t value, int width)
     print_str(&buf[start]);
 }
 
+void print_hex64(uint64_t value)
+{
+    static const char hex_chars[] = "0123456789ABCDEF";
+    char buf[17];
+    buf[16] = '\0';
+    for (int i = 15; i >= 0; i--) {
+        buf[i] = hex_chars[value & 0xF];
+        value >>= 4;
+    }
+    print_str("0x");
+    print_str(buf);
+}
+
 void print_dec(uint64_t value)
 {
     char buf[21];

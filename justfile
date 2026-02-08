@@ -213,23 +213,6 @@ run-uefi-debug-headless: image-uefi
         -D qemu.log
 
 # =============================================================================
-# Testing
-# =============================================================================
-
-# Run boot integration tests in QEMU
-test-integration: build
-    @bash tools/test_boot.sh
-
-# Run SMP integration tests in QEMU
-test-smp: build
-    @bash tools/test_smp.sh
-
-# Run all tests (integration + SMP)
-test-all: build
-    @bash tools/test_boot.sh
-    @bash tools/test_smp.sh
-
-# =============================================================================
 # Utilities
 # =============================================================================
 

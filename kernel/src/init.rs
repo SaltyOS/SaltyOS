@@ -209,7 +209,7 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
         (*tcb).context.r12 = user_rip;            // User RIP
         (*tcb).context.r13 = user_stack_top;       // User RSP
         (*tcb).context.r14 = vspace_root;          // User CR3
-        (*tcb).context.r15 = 0x3202;               // User RFLAGS: IF=1, IOPL=3
+        (*tcb).context.r15 = 0x0202;               // User RFLAGS: IF=1, IOPL=0
         (*tcb).context.rflags = 0x202;             // Kernel RFLAGS for context_switch
 
         // SchedContext: 10ms budget, 100ms period
@@ -428,7 +428,6 @@ fn load_from_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) -> (u64, u64) {
                 crate::elf::ElfError::RelocFailed => crate::serial_puts("reloc failed"),
                 crate::elf::ElfError::OutOfMemory => crate::serial_puts("OOM"),
                 crate::elf::ElfError::TooSmall => crate::serial_puts("too small"),
-                crate::elf::ElfError::TooManyPages => crate::serial_puts("too many pages"),
                 crate::elf::ElfError::MapFailed => crate::serial_puts("map failed"),
             }
             crate::serial_puts("\n");

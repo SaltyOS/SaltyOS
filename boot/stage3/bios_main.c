@@ -232,15 +232,12 @@ void stage3_entry(struct Stage2Info *info)
 
 #if CONFIG_DEBUG
     print_str("ELF: vaddr range ");
-    print_hex((uint32_t)(min_vaddr >> 32), 8);
-    print_hex((uint32_t)min_vaddr, 8);
+    print_hex64(min_vaddr);
     print_str(" - ");
-    print_hex((uint32_t)(max_vaddr >> 32), 8);
-    print_hex((uint32_t)max_vaddr, 8);
+    print_hex64(max_vaddr);
     print_char('\n');
     print_str("Loading to ");
-    print_hex((uint32_t)(final_load_addr >> 32), 8);
-    print_hex((uint32_t)final_load_addr, 8);
+    print_hex64(final_load_addr);
     print_char('\n');
 #endif
 
@@ -263,8 +260,7 @@ void stage3_entry(struct Stage2Info *info)
     g_ctx.kernel_entry = load_result.entry;
 
     print_str("Kernel loaded: entry=");
-    print_hex((uint32_t)(load_result.entry >> 32), 8);
-    print_hex((uint32_t)load_result.entry, 8);
+    print_hex64(load_result.entry);
     print_char('\n');
 
     /* Find and load initrd if present */

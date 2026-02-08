@@ -20,14 +20,20 @@ SaltyOS is split by execution layer:
 - `just reconfigure -Dkernel_log_level=debug`: adjust Meson options without rebuilding config.
 - `just fmt` and `just fmt-check`: format/check Rust and C sources.
 
+## Rust 2024 Edition
+The kernel is compiled with **Rust 2024 edition** (`--edition=2024`, nightly toolchain). Key rules to follow:
+- **`unsafe_op_in_unsafe_fn`**: Unsafe operations inside `unsafe fn` must be wrapped in explicit `unsafe {}` blocks.
+- **No `static mut` references**: Use `addr_of!`/`addr_of_mut!` or `SyncUnsafeCell` instead of `&`/`&mut` on `static mut`.
+- **`unsafe extern` blocks**: Items in `extern` blocks require explicit `unsafe` or `safe` annotations (e.g., `unsafe extern "C" { safe fn foo(); }`).
+- **RPIT lifetime capture**: `impl Trait` in return position captures all in-scope lifetimes by default. Use `+ use<'a>` to restrict.
+- **`gen` is reserved**: Do not use `gen` as an identifier.
+- **No Cargo**: The build uses Meson with direct `rustc` invocation, not Cargo. There are no `Cargo.toml` files.
+
 ## Coding Style & Naming Conventions
 Use 4-space indentation and keep code freestanding-safe (no host libc assumptions). Follow existing naming:
 - Rust: `snake_case` functions/modules, `CamelCase` types, `UPPER_SNAKE_CASE` constants.
 - C: `snake_case` functions/variables, `UPPER_SNAKE_CASE` macros/capability slot constants.
 Preserve SPDX license headers in new files and keep module names aligned with subsystem paths (example: `kernel/src/ipc/...`).
-
-## Testing Guidelines
-This repository uses QEMU-based integration testing, not a unit-test framework. Add or update assertions in `tools/test_boot.sh` / `tools/test_smp.sh` by checking serial log markers and absence of fault signatures. Run `just test-all` before opening a PR. Use `BOOT_TIMEOUT=30 just test-integration` for slower hosts.
 
 ## Commit & Pull Request Guidelines
 Commit history follows Conventional Commits (`feat:`, `fix:`, `docs:`). Keep commits focused and descriptive. PRs should include:

@@ -8,7 +8,7 @@ SaltyOS is a capability-based microkernel OS inspired by seL4, written in Rust (
 
 ## Prerequisites
 
-- **Rust nightly** with `rust-src` component (for `core` library cross-compilation)
+- **Rust nightly** with `rust-src` component (for `core` library cross-compilation) — edition 2024
 - **Clang** (enforced — gcc will not work; Meson checks `cc.get_id() == 'clang'`)
 - **NASM**, **Meson >= 1.1**, **Ninja**
 - **QEMU** (qemu-system-x86_64) for testing
@@ -31,11 +31,6 @@ just run-gdb                # QEMU with GDB server (-s -S)
 just gdb                    # Connect GDB to running QEMU
 just run-debug              # Run with interrupt/reset logging (qemu.log)
 just run-debug-headless     # Headless debug (no GUI)
-
-# Testing
-just test-integration       # Boot smoke test (single CPU, timeout-based)
-just test-smp               # SMP boot test (2 CPUs)
-just test-all               # Both tests
 
 # Code quality
 just fmt                    # Format Rust (rustfmt) and C (clang-format)
@@ -141,6 +136,25 @@ Userspace system library providing syscall wrappers and IPC helpers.
 - `fork.S` — Fork assembly stub
 
 **Static vs dynamic**: When `SALTY_STATIC` is defined, all functions are `static inline` (header-only). Otherwise they're extern declarations linked against `libsalty.so`.
+
+## Rust 2024 Edition
+
+The kernel uses **Rust 2024 edition** (`--edition=2024`) with nightly rustc. There are no `Cargo.toml` files — all Rust code is compiled via Meson with direct `rustc` invocation (`rust/meson.build`, `kernel/meson.build`).
+
+**Edition-specific rules that apply to kernel code:**
+- **`unsafe_op_in_unsafe_fn`** (warn by default): Every unsafe operation inside an `unsafe fn` must be wrapped in an explicit `unsafe {}` block. Do not rely on the function signature alone.
+- **No `static mut` references**: Taking `&` or `&mut` of a `static mut` is disallowed. Use `core::ptr::addr_of!` / `addr_of_mut!` for raw pointers, or `SyncUnsafeCell` for safe interior mutability.
+- **`unsafe extern` blocks**: Items declared in `extern` blocks require explicit `unsafe` or `safe` annotation (e.g., `unsafe extern "C" { safe fn memset(...); }`).
+- **RPIT lifetime capture**: `-> impl Trait` return types capture all in-scope lifetimes by default. Narrow with `+ use<'a>` if needed.
+- **`gen` keyword reserved**: Do not use `gen` as an identifier.
+- **`never` type fallback**: The `!` type falls back to `!` (not `()`).
+
+**Rustc flags** (set in `meson.build`):
+```
+--edition=2024  --target=x86_64-unknown-none
+-C panic=abort  -C opt-level=2  -C code-model=kernel
+-C relocation-model=static  -C soft-float
+```
 
 ## Key Design Details
 

@@ -152,8 +152,9 @@ Required for running graphical applications (Wayland, X11 via XWayland).
 **Signals** (limited):
 | Function | Status | Notes |
 |----------|--------|-------|
-| `kill` | Planned | Via ProcMgr |
-| `signal`, `sigaction` | Planned | Notification-based delivery |
+| `kill` | Implemented | Via ProcMgr IPC |
+| `signal` | Implemented | Notification-based delivery |
+| `sigaction` | Planned | Full POSIX sigaction struct |
 | `sigprocmask` | Planned | |
 
 ### Phase 3: Extended

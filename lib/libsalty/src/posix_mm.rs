@@ -1,0 +1,311 @@
+//! POSIX memory management (brk, sbrk, mmap, munmap, mprotect)
+//! SPDX-License-Identifier: GPL-2.0-only
+
+use crate::consts::*;
+use crate::invoke;
+use crate::types::*;
+
+static mut MM: PosixMmState = PosixMmState {
+    untyped: 0,
+    vspace: 0,
+    cspace: 0,
+    next_frame_slot: 0,
+    max_frame_slot: 0,
+    heap_base: 0,
+    heap_current: 0,
+    mmap_base: 0,
+    mmap_next: 0,
+    regions: {
+        const ZERO: PosixMmRegion = PosixMmRegion::zeroed();
+        [ZERO; MM_MAX_REGIONS]
+    },
+    heap_frame_slots: [0; MM_MAX_PAGES_PER_REGION],
+    initialized: 0,
+};
+
+pub unsafe fn posix_mm_init(
+    untyped: Cap,
+    vspace: Cap,
+    cspace: Cap,
+    first_frame_slot: Cap,
+    heap_base: u64,
+    mmap_base: u64,
+) {
+    unsafe {
+        MM.untyped = untyped;
+        MM.vspace = vspace;
+        MM.cspace = cspace;
+        MM.next_frame_slot = first_frame_slot;
+        MM.max_frame_slot = first_frame_slot + MM_MAX_FRAME_SLOTS;
+        MM.heap_base = heap_base;
+        MM.heap_current = heap_base;
+        MM.mmap_base = mmap_base;
+        MM.mmap_next = mmap_base;
+        for i in 0..MM_MAX_REGIONS {
+            MM.regions[i].region_type = MM_REGION_FREE;
+        }
+        MM.initialized = 1;
+    }
+}
+
+unsafe fn alloc_frame() -> Cap {
+    unsafe {
+        if MM.next_frame_slot >= MM.max_frame_slot {
+            return u64::MAX;
+        }
+        let slot = MM.next_frame_slot;
+        MM.next_frame_slot += 1;
+        let err = invoke::untyped_retype(MM.untyped, OBJ_FRAME, 0, slot);
+        if err != 0 {
+            return u64::MAX;
+        }
+        slot
+    }
+}
+
+unsafe fn prot_to_flags(prot: i32) -> u64 {
+    let mut flags = VSPACE_FLAG_USER;
+    if prot & PROT_WRITE != 0 {
+        flags |= VSPACE_FLAG_WRITABLE;
+    }
+    if prot & PROT_EXEC != 0 {
+        flags |= VSPACE_FLAG_EXECUTABLE;
+    }
+    flags
+}
+
+unsafe fn map_page(frame: Cap, vaddr: u64, prot: i32) -> i32 {
+    unsafe { invoke::vspace_map(MM.vspace, frame, vaddr, prot_to_flags(prot)) }
+}
+
+unsafe fn alloc_region() -> *mut PosixMmRegion {
+    unsafe {
+        for i in 0..MM_MAX_REGIONS {
+            if MM.regions[i].region_type == MM_REGION_FREE {
+                return &raw mut MM.regions[i];
+            }
+        }
+        core::ptr::null_mut()
+    }
+}
+
+unsafe fn find_region(addr: u64) -> *mut PosixMmRegion {
+    unsafe {
+        for i in 0..MM_MAX_REGIONS {
+            let r = &mut MM.regions[i];
+            if r.region_type != MM_REGION_FREE && addr >= r.base && addr < r.base + r.length {
+                return r as *mut PosixMmRegion;
+            }
+        }
+        core::ptr::null_mut()
+    }
+}
+
+pub unsafe fn posix_brk(addr: u64) -> i32 {
+    unsafe {
+        if MM.initialized == 0 {
+            return -1;
+        }
+        if addr < MM.heap_base {
+            return -1;
+        }
+
+        let old_page = (MM.heap_current + 4095) & !4095u64;
+        let new_page = (addr + 4095) & !4095u64;
+
+        if new_page > old_page {
+            let mut va = old_page;
+            while va < new_page {
+                let frame = alloc_frame();
+                if frame == u64::MAX {
+                    return -1;
+                }
+                let err = map_page(frame, va, PROT_READ | PROT_WRITE);
+                if err != 0 {
+                    return -1;
+                }
+                let idx = ((va - MM.heap_base) / 4096) as usize;
+                if idx < MM_MAX_PAGES_PER_REGION {
+                    MM.heap_frame_slots[idx] = frame;
+                }
+                // Zero the page
+                let p = va as *mut u8;
+                for i in 0..4096usize {
+                    core::ptr::write_volatile(p.add(i), 0);
+                }
+                va += 4096;
+            }
+        } else if new_page < old_page {
+            let mut va = new_page;
+            while va < old_page {
+                invoke::vspace_unmap(MM.vspace, va);
+                let idx = ((va - MM.heap_base) / 4096) as usize;
+                if idx < MM_MAX_PAGES_PER_REGION && MM.heap_frame_slots[idx] != 0 {
+                    invoke::cnode_delete(MM.cspace, MM.heap_frame_slots[idx]);
+                    MM.heap_frame_slots[idx] = 0;
+                }
+                va += 4096;
+            }
+        }
+
+        MM.heap_current = addr;
+        0
+    }
+}
+
+pub unsafe fn posix_sbrk(increment: i64) -> u64 {
+    unsafe {
+        if MM.initialized == 0 {
+            return u64::MAX;
+        }
+
+        let old_break = MM.heap_current;
+        if increment == 0 {
+            return old_break;
+        }
+
+        let new_break = if increment > 0 {
+            old_break + increment as u64
+        } else {
+            let dec = (-increment) as u64;
+            if dec > old_break - MM.heap_base {
+                return u64::MAX;
+            }
+            old_break - dec
+        };
+
+        if posix_brk(new_break) != 0 {
+            return u64::MAX;
+        }
+        old_break
+    }
+}
+
+pub unsafe fn posix_mmap(
+    addr: *mut u8,
+    length: u64,
+    prot: i32,
+    flags: i32,
+    _fd: i32,
+    _offset: i64,
+) -> *mut u8 {
+    unsafe {
+        if MM.initialized == 0 || flags & MAP_ANONYMOUS == 0 || length == 0 {
+            return usize::MAX as *mut u8; // MAP_FAILED
+        }
+
+        let len = (length + 4095) & !4095u64;
+        let num_pages = (len / 4096) as usize;
+
+        if num_pages > MM_MAX_PAGES_PER_REGION {
+            return usize::MAX as *mut u8;
+        }
+
+        let region = alloc_region();
+        if region.is_null() {
+            return usize::MAX as *mut u8;
+        }
+
+        let base = if (flags & MAP_FIXED) != 0 && !addr.is_null() {
+            let fixed_base = (addr as u64) & !4095u64;
+            let existing = find_region(fixed_base);
+            if !existing.is_null() && (*existing).region_type == MM_REGION_MMAP {
+                posix_munmap((*existing).base as *mut u8, (*existing).length);
+            }
+            fixed_base
+        } else {
+            let b = MM.mmap_next;
+            MM.mmap_next = b + len;
+            b
+        };
+
+        (*region).base = base;
+        (*region).length = len;
+        (*region).region_type = MM_REGION_MMAP;
+        (*region).prot = prot as u8;
+        (*region).num_pages = num_pages as u16;
+
+        for i in 0..num_pages {
+            let frame = alloc_frame();
+            if frame == u64::MAX {
+                for j in 0..i {
+                    invoke::vspace_unmap(MM.vspace, base + j as u64 * 4096);
+                }
+                (*region).region_type = MM_REGION_FREE;
+                return usize::MAX as *mut u8;
+            }
+            (*region).frame_slots[i] = frame;
+
+            let err = map_page(frame, base + i as u64 * 4096, prot);
+            if err != 0 {
+                for j in 0..i {
+                    invoke::vspace_unmap(MM.vspace, base + j as u64 * 4096);
+                }
+                (*region).region_type = MM_REGION_FREE;
+                return usize::MAX as *mut u8;
+            }
+
+            // Zero the page
+            let p = (base + i as u64 * 4096) as *mut u8;
+            for k in 0..4096usize {
+                core::ptr::write_volatile(p.add(k), 0);
+            }
+        }
+
+        base as *mut u8
+    }
+}
+
+pub unsafe fn posix_munmap(addr: *mut u8, _length: u64) -> i32 {
+    unsafe {
+        if MM.initialized == 0 {
+            return -1;
+        }
+
+        let base = addr as u64;
+        let region = find_region(base);
+        if region.is_null() || (*region).region_type != MM_REGION_MMAP {
+            return -1;
+        }
+        if base != (*region).base {
+            return -1;
+        }
+
+        for i in 0..(*region).num_pages as usize {
+            invoke::vspace_unmap(MM.vspace, (*region).base + i as u64 * 4096);
+            if (*region).frame_slots[i] != 0 {
+                invoke::cnode_delete(MM.cspace, (*region).frame_slots[i]);
+                (*region).frame_slots[i] = 0;
+            }
+        }
+
+        (*region).region_type = MM_REGION_FREE;
+        0
+    }
+}
+
+pub unsafe fn posix_mprotect(addr: *mut u8, _length: u64, prot: i32) -> i32 {
+    unsafe {
+        if MM.initialized == 0 {
+            return -1;
+        }
+
+        let base = addr as u64;
+        let region = find_region(base);
+        if region.is_null() || (*region).region_type != MM_REGION_MMAP {
+            return -1;
+        }
+
+        for i in 0..(*region).num_pages as usize {
+            let va = (*region).base + i as u64 * 4096;
+            invoke::vspace_unmap(MM.vspace, va);
+            let err = map_page((*region).frame_slots[i], va, prot);
+            if err != 0 {
+                return -1;
+            }
+        }
+
+        (*region).prot = prot as u8;
+        0
+    }
+}

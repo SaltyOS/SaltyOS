@@ -41,11 +41,11 @@ objcopy = find_program('llvm-objcopy', required: build_boot)
 lld_link = find_program('lld-link', required: build_boot)
 
 # Rust: must be nightly (required for building core library)
-rustc = find_program('rustc', required: build_kernel)
+rustc = find_program('rustc', required: build_kernel or build_userland)
 
 fs = import('fs')
 
-if build_kernel
+if build_kernel or build_userland
   # Verify nightly toolchain
   rustc_version = run_command(rustc, '--version', capture: true, check: true).stdout().strip()
   if not rustc_version.contains('nightly')
@@ -142,9 +142,12 @@ if build_boot
   subdir('boot')
 endif
 
-if build_kernel
-  # Build core library and compiler_builtins first
+if build_kernel or build_userland
+  # Build core library and compiler_builtins (shared by kernel and userland)
   subdir('rust')
+endif
+
+if build_kernel
   subdir('kernel')
 endif
 
@@ -163,10 +166,17 @@ initrd_inputs = []
 initrd_target = []
 
 if build_userland and mkcpio.found()
+  # Service definition files
+  svc_console = files('userland/services/console.service')
+  svc_nameserv = files('userland/services/nameserv.service')
+  svc_vfs = files('userland/services/vfs.service')
+  svc_procmgr = files('userland/services/procmgr.service')
+  svc_test_runner = files('userland/services/test_runner.service')
+
   initrd = custom_target('initrd',
     input: [init_elf, console_elf, ld_salty_so, libsalty_so, libc_so,
-            nameserv_elf, procmgr_elf, vfs_elf, hello_elf,
-            fstest_elf, mmap_test_elf, test_fork_elf, test_signal_elf],
+            nameserv_elf, procmgr_elf, vfs_elf, test_runner_elf,
+            svc_console, svc_nameserv, svc_vfs, svc_procmgr, svc_test_runner],
     output: 'initrd.cpio',
     command: [mkcpio,
       '--output', '@OUTPUT@',
@@ -178,11 +188,12 @@ if build_userland and mkcpio.found()
       'nameserv.elf=@INPUT5@',
       'procmgr.elf=@INPUT6@',
       'vfs.elf=@INPUT7@',
-      'hello.elf=@INPUT8@',
-      'fstest.elf=@INPUT9@',
-      'mmap_test.elf=@INPUT10@',
-      'test_fork.elf=@INPUT11@',
-      'test_signal.elf=@INPUT12@',
+      'test_runner.elf=@INPUT8@',
+      'services/console.service=@INPUT9@',
+      'services/nameserv.service=@INPUT10@',
+      'services/vfs.service=@INPUT11@',
+      'services/procmgr.service=@INPUT12@',
+      'services/test_runner.service=@INPUT13@',
     ],
     build_by_default: true,
   )

@@ -28,6 +28,9 @@ void print_str(const char *s);
 /* Output a hexadecimal number */
 void print_hex(uint64_t value, int width);
 
+/* Output a full 64-bit hex value with 0x prefix and all 16 digits */
+void print_hex64(uint64_t value);
+
 /* Output a decimal number */
 void print_dec(uint64_t value);
 

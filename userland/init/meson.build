@@ -1,27 +1,41 @@
-# SaltyOS Init Process Build
+# SaltyOS Init Process Build (Rust, statically linked)
 # SPDX-License-Identifier: GPL-2.0-only
-#
-# Builds init.elf as a PIE (ET_DYN) ELF64 binary.
-# Uses libsalty (header-only syscall wrappers) and libc (string functions).
 
-init_src = files('main.c')
 init_link = meson.current_source_dir() / 'link.ld'
+libsalty_build_dir = meson.project_build_root() / 'lib/libsalty'
 
+# Step 1: Rust -> .o
+init_obj = custom_target('init_obj',
+  input: files('src/main.rs'),
+  output: 'init.o',
+  command: [rustc,
+    rust_userland_args,
+    '--emit=obj',
+    '--crate-name=init',
+    '--crate-type=lib',
+    '--extern', 'salty=' + libsalty_build_dir / 'libsalty.rmeta',
+    '-o', '@OUTPUT@',
+    '@INPUT@',
+  ],
+  depends: [core, compiler_builtins, libsalty_rust],
+  build_by_default: true,
+)
+
+# Step 2: .o + libsalty.o + fork.o + core.o + compiler_builtins.o + string.c -> init.elf (static)
 init_elf = custom_target('init_elf',
-    input: [init_src, '../../lib/libc/string.c'],
-    output: 'init.elf',
-    command: [cc_cmd,
-        '-nostdlib', '-nostartfiles', '-ffreestanding',
-        '-fPIE', '-pie', '-shared',
-        '-fno-plt', '-Wl,-Bsymbolic',
-        '-fno-stack-protector',
-        '-mno-red-zone',
-        '-DSALTY_STATIC',
-        '-I', meson.project_source_root() / 'lib/libsalty',
-        '-I', meson.project_source_root() / 'lib/libc',
-        '-T', init_link,
-        '-o', '@OUTPUT@',
-        '@INPUT@',
-    ],
-    build_by_default: true,
+  input: [init_obj, libsalty_obj, fork_obj, core_obj, compiler_builtins_obj,
+          '../../lib/libc/string.c'],
+  output: 'init.elf',
+  command: [cc_cmd,
+    '-nostdlib', '-nostartfiles', '-ffreestanding',
+    '-fPIC', '-shared',
+    '-fno-plt', '-Wl,-Bsymbolic',
+    '-fno-stack-protector',
+    '-mno-red-zone',
+    '-fuse-ld=lld',
+    '-T', init_link,
+    '-o', '@OUTPUT@',
+    '@INPUT@',
+  ],
+  build_by_default: true,
 )

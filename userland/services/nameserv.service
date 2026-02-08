@@ -1,0 +1,9 @@
+[Service]
+Name=nameserv
+Binary=nameserv.elf
+Type=simple
+Restart=always
+
+[Dependencies]
+After=console
+Before=vfs procmgr

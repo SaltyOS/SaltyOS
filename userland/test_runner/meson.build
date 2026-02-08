@@ -1,17 +1,17 @@
-# SaltyOS VFS Server Build (Rust)
+# SaltyOS Test Runner Build (Rust, dynamically linked)
 # SPDX-License-Identifier: GPL-2.0-only
 
-vfs_link = meson.current_source_dir() / 'link.ld'
+test_runner_link = meson.current_source_dir() / 'link.ld'
 libsalty_build_dir = meson.project_build_root() / 'lib/libsalty'
 
 # Step 1: Rust -> .o
-vfs_obj = custom_target('vfs_obj',
+test_runner_obj = custom_target('test_runner_obj',
   input: files('src/main.rs'),
-  output: 'vfs.o',
+  output: 'test_runner.o',
   command: [rustc,
     rust_userland_args,
     '--emit=obj',
-    '--crate-name=vfs',
+    '--crate-name=test_runner',
     '--crate-type=lib',
     '--extern', 'salty=' + libsalty_build_dir / 'libsalty.rmeta',
     '-o', '@OUTPUT@',
@@ -22,9 +22,9 @@ vfs_obj = custom_target('vfs_obj',
 )
 
 # Step 2: .o -> .elf (dynamic linking)
-vfs_elf = custom_target('vfs_elf',
-  input: [vfs_obj],
-  output: 'vfs.elf',
+test_runner_elf = custom_target('test_runner_elf',
+  input: [test_runner_obj],
+  output: 'test_runner.elf',
   depends: [libsalty_so, libc_so],
   command: [cc_cmd,
     '-nostdlib', '-nostartfiles', '-ffreestanding',
@@ -32,7 +32,7 @@ vfs_elf = custom_target('vfs_elf',
     '-fno-stack-protector',
     '-mno-red-zone',
     '-fuse-ld=lld',
-    '-T', vfs_link,
+    '-T', test_runner_link,
     '-Wl,--dynamic-linker,/lib/ld-salty.so',
     '-L', libsalty_build_dir,
     '-L', meson.project_build_root() / 'lib/libc',
