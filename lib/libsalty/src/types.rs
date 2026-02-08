@@ -304,3 +304,59 @@ pub type SigHandlerT = Option<unsafe extern "C" fn(i32)>;
 // Special handler values encoded as usize
 pub const SIG_DFL: usize = 0;
 pub const SIG_IGN: usize = 1;
+
+// SHM memory region type
+pub const MM_REGION_SHM: u8 = 3;
+
+// Socket address (Unix domain)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SockAddrUn {
+    pub sun_family: u16,
+    pub sun_path: [u8; 64],
+}
+
+impl SockAddrUn {
+    pub const fn zeroed() -> Self {
+        SockAddrUn {
+            sun_family: 0,
+            sun_path: [0; 64],
+        }
+    }
+}
+
+// Poll file descriptor
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+
+impl PollFd {
+    pub const fn zeroed() -> Self {
+        PollFd {
+            fd: -1,
+            events: 0,
+            revents: 0,
+        }
+    }
+}
+
+// Epoll event
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EpollEvent {
+    pub events: u32,
+    pub data: u64,
+}
+
+impl EpollEvent {
+    pub const fn zeroed() -> Self {
+        EpollEvent {
+            events: 0,
+            data: 0,
+        }
+    }
+}

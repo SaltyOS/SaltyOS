@@ -133,6 +133,19 @@ pub const POSIX_VFS_RMDIR: u64 = 12;
 pub const POSIX_VFS_OPENDIR: u64 = 13;
 pub const POSIX_VFS_READDIR: u64 = 14;
 pub const POSIX_VFS_LSTAT: u64 = 15;
+pub const POSIX_VFS_POLL: u64 = 16;
+pub const POSIX_VFS_SHM_OPEN: u64 = 17;
+pub const POSIX_VFS_SHM_UNLINK: u64 = 18;
+pub const POSIX_VFS_FTRUNCATE: u64 = 19;
+pub const POSIX_VFS_SOCKET: u64 = 20;
+pub const POSIX_VFS_BIND: u64 = 21;
+pub const POSIX_VFS_LISTEN: u64 = 22;
+pub const POSIX_VFS_ACCEPT: u64 = 23;
+pub const POSIX_VFS_CONNECT: u64 = 24;
+pub const POSIX_VFS_SENDMSG: u64 = 25;
+pub const POSIX_VFS_RECVMSG: u64 = 26;
+pub const POSIX_VFS_SOCKPAIR: u64 = 27;
+pub const POSIX_VFS_SHUTDOWN: u64 = 28;
 
 // Procmgr protocol labels
 pub const POSIX_PM_SPAWN: u64 = 1;
@@ -150,6 +163,7 @@ pub const O_RDONLY: u64 = 0x0000;
 pub const O_WRONLY: u64 = 0x0001;
 pub const O_RDWR: u64 = 0x0002;
 pub const O_CREAT: u64 = 0x0040;
+pub const O_EXCL: u64 = 0x0080;
 pub const O_TRUNC: u64 = 0x0200;
 pub const O_APPEND: u64 = 0x0400;
 
@@ -163,6 +177,7 @@ pub const S_IFMT: u64 = 0o170000;
 pub const S_IFDIR: u64 = 0o040000;
 pub const S_IFCHR: u64 = 0o020000;
 pub const S_IFREG: u64 = 0o100000;
+pub const S_IFSOCK: u64 = 0o140000;
 
 // Access mode flags
 pub const F_OK: u64 = 0;
@@ -173,6 +188,7 @@ pub const DT_UNKNOWN: u8 = 0;
 pub const DT_REG: u8 = 8;
 pub const DT_DIR: u8 = 4;
 pub const DT_CHR: u8 = 2;
+pub const DT_SOCK: u8 = 12;
 
 // waitpid options
 pub const WNOHANG: u64 = 1;
@@ -205,9 +221,10 @@ pub const PROT_WRITE: i32 = 0x2;
 pub const PROT_EXEC: i32 = 0x4;
 
 // MAP_* flags
+pub const MAP_SHARED: i32 = 0x01;
 pub const MAP_PRIVATE: i32 = 0x02;
-pub const MAP_ANONYMOUS: i32 = 0x20;
 pub const MAP_FIXED: i32 = 0x10;
+pub const MAP_ANONYMOUS: i32 = 0x20;
 
 // Memory management limits
 pub const MM_MAX_REGIONS: usize = 128;
@@ -246,6 +263,31 @@ pub const ELF_RELOC_FAILED: i32 = 7;
 pub const ELF_OUT_OF_MEMORY: i32 = 8;
 pub const ELF_TOO_SMALL: i32 = 9;
 pub const ELF_MAP_FAILED: i32 = 11;
+
+// Socket constants
+pub const AF_UNIX: i32 = 1;
+pub const SOCK_STREAM: i32 = 1;
+pub const SCM_RIGHTS: i32 = 1;
+pub const SOL_SOCKET: i32 = 1;
+pub const SHUT_RD: i32 = 0;
+pub const SHUT_WR: i32 = 1;
+pub const SHUT_RDWR: i32 = 2;
+
+// Poll event flags
+pub const POLLIN: i16 = 0x001;
+pub const POLLOUT: i16 = 0x004;
+pub const POLLERR: i16 = 0x008;
+pub const POLLHUP: i16 = 0x010;
+pub const POLLNVAL: i16 = 0x020;
+
+// Epoll constants
+pub const EPOLL_CTL_ADD: i32 = 1;
+pub const EPOLL_CTL_DEL: i32 = 2;
+pub const EPOLL_CTL_MOD: i32 = 3;
+pub const EPOLLIN: u32 = 0x001;
+pub const EPOLLOUT: u32 = 0x004;
+pub const EPOLLERR: u32 = 0x008;
+pub const EPOLLHUP: u32 = 0x010;
 
 // CPIO header size
 pub const CPIO_HEADER_SIZE: usize = 110;

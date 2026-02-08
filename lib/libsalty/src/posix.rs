@@ -589,3 +589,447 @@ pub unsafe fn posix_kill(pid: i32, sig: i32) -> i32 {
 unsafe extern "C" {
     pub safe fn posix_fork() -> i32;
 }
+
+// ======================================================================
+// Socket operations
+// ======================================================================
+
+pub unsafe fn posix_socket(domain: i32, sock_type: i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_SOCKET;
+        msg.length = 2;
+        msg.regs[0] = domain as u64;
+        msg.regs[1] = sock_type as u64;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        reply.regs[0] as i32
+    }
+}
+
+pub unsafe fn posix_bind(fd: i32, path: *const u8) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_BIND;
+        msg.regs[0] = fd as u64;
+        let path_len = pack_path(&raw mut msg, 1, path);
+        msg.length = 2 + ((path_len as u64 + 7) / 8);
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        0
+    }
+}
+
+pub unsafe fn posix_listen(fd: i32, backlog: i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_LISTEN;
+        msg.length = 2;
+        msg.regs[0] = fd as u64;
+        msg.regs[1] = backlog as u64;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        0
+    }
+}
+
+pub unsafe fn posix_accept(fd: i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_ACCEPT;
+        msg.length = 1;
+        msg.regs[0] = fd as u64;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        reply.regs[0] as i32
+    }
+}
+
+pub unsafe fn posix_connect(fd: i32, path: *const u8) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_CONNECT;
+        msg.regs[0] = fd as u64;
+        let path_len = pack_path(&raw mut msg, 1, path);
+        msg.length = 2 + ((path_len as u64 + 7) / 8);
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        0
+    }
+}
+
+pub unsafe fn posix_shutdown(fd: i32, how: i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_SHUTDOWN;
+        msg.length = 2;
+        msg.regs[0] = fd as u64;
+        msg.regs[1] = how as u64;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        0
+    }
+}
+
+pub unsafe fn posix_socketpair(fds: *mut i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_SOCKPAIR;
+        msg.length = 0;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        if !fds.is_null() {
+            *fds = reply.regs[0] as i32;
+            *fds.add(1) = reply.regs[1] as i32;
+        }
+        0
+    }
+}
+
+pub unsafe fn posix_sendmsg(fd: i32, data: *const u8, data_len: u64, fds_to_send: *const i32, fd_count: u32) -> i64 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_SENDMSG;
+        msg.regs[0] = fd as u64;
+        msg.regs[1] = data_len;
+        msg.regs[2] = fd_count as u64;
+
+        // Pack data starting at regs[3]
+        let mut actual_data = data_len;
+        if actual_data > 120 {
+            actual_data = 120;
+        }
+        let dst = &mut msg.regs[3] as *mut u64 as *mut u8;
+        for i in 0..actual_data as usize {
+            *dst.add(i) = *data.add(i);
+        }
+
+        let data_regs = (actual_data + 7) / 8;
+        // Pack fd numbers after data
+        let fd_dst = &mut msg.regs[3 + data_regs as usize] as *mut u64 as *mut i32;
+        let actual_fds = if fd_count > 4 { 4 } else { fd_count };
+        for i in 0..actual_fds as usize {
+            *fd_dst.add(i) = *fds_to_send.add(i);
+        }
+
+        msg.length = 3 + data_regs + ((actual_fds as u64 * 4 + 7) / 8);
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        reply.regs[0] as i64
+    }
+}
+
+pub unsafe fn posix_recvmsg(fd: i32, data: *mut u8, data_len: u64, fds_out: *mut i32, fd_count: *mut u32) -> i64 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_RECVMSG;
+        msg.length = 2;
+        msg.regs[0] = fd as u64;
+        msg.regs[1] = data_len;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+
+        let actual_data = reply.regs[0];
+        let actual_fds = reply.regs[1] as u32;
+
+        // Unpack data from regs[2..]
+        let src = &reply.regs[2] as *const u64 as *const u8;
+        for i in 0..actual_data as usize {
+            if i < data_len as usize {
+                *data.add(i) = *src.add(i);
+            }
+        }
+
+        // Unpack fd numbers
+        let data_regs = (actual_data + 7) / 8;
+        let fd_src = &reply.regs[2 + data_regs as usize] as *const u64 as *const i32;
+        if !fds_out.is_null() && !fd_count.is_null() {
+            let max_fds = *fd_count;
+            let copy_fds = if actual_fds < max_fds { actual_fds } else { max_fds };
+            for i in 0..copy_fds as usize {
+                *fds_out.add(i) = *fd_src.add(i);
+            }
+            *fd_count = actual_fds;
+        }
+
+        actual_data as i64
+    }
+}
+
+// ======================================================================
+// Poll / Select / Epoll
+// ======================================================================
+
+pub unsafe fn posix_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_POLL;
+
+        let actual_nfds = if nfds > 8 { 8 } else { nfds };
+        msg.regs[0] = actual_nfds as u64;
+        msg.regs[1] = timeout as u64;
+
+        // Pack (fd, events) pairs into regs[2..]
+        for i in 0..actual_nfds as usize {
+            msg.regs[2 + i * 2] = (*fds.add(i)).fd as u64;
+            msg.regs[2 + i * 2 + 1] = (*fds.add(i)).events as u64;
+        }
+        msg.length = 2 + actual_nfds as u64 * 2;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+
+        let ready_count = reply.regs[0] as i32;
+        // Unpack revents from regs[1..]
+        for i in 0..actual_nfds as usize {
+            (*fds.add(i)).revents = reply.regs[1 + i] as i16;
+        }
+
+        ready_count
+    }
+}
+
+pub unsafe fn posix_select(nfds: i32, readfds: *mut u64, writefds: *mut u64, timeout: i32) -> i32 {
+    unsafe {
+        // Simple implementation: convert fd_sets to poll array
+        let mut poll_fds: [PollFd; 8] = [PollFd::zeroed(); 8];
+        let mut count: u32 = 0;
+
+        let max_fd = if nfds > 64 { 64 } else { nfds };
+        for fd in 0..max_fd {
+            let mut events: i16 = 0;
+            if !readfds.is_null() && (*readfds & (1u64 << fd)) != 0 {
+                events |= crate::consts::POLLIN;
+            }
+            if !writefds.is_null() && (*writefds & (1u64 << fd)) != 0 {
+                events |= crate::consts::POLLOUT;
+            }
+            if events != 0 && count < 8 {
+                poll_fds[count as usize].fd = fd;
+                poll_fds[count as usize].events = events;
+                count += 1;
+            }
+        }
+
+        if count == 0 {
+            return 0;
+        }
+
+        let ret = posix_poll(poll_fds.as_mut_ptr(), count, timeout);
+        if ret < 0 {
+            return ret;
+        }
+
+        // Clear and rebuild fd_sets from revents
+        if !readfds.is_null() { *readfds = 0; }
+        if !writefds.is_null() { *writefds = 0; }
+
+        let mut ready = 0;
+        for i in 0..count as usize {
+            if poll_fds[i].revents != 0 {
+                let fd = poll_fds[i].fd;
+                let mut counted = false;
+                if !readfds.is_null()
+                    && (poll_fds[i].revents & (crate::consts::POLLIN | crate::consts::POLLHUP | crate::consts::POLLERR)) != 0
+                {
+                    *readfds |= 1u64 << fd;
+                    if !counted { ready += 1; counted = true; }
+                }
+                if !writefds.is_null() && (poll_fds[i].revents & crate::consts::POLLOUT) != 0 {
+                    *writefds |= 1u64 << fd;
+                    if !counted { ready += 1; }
+                }
+            }
+        }
+        ready
+    }
+}
+
+pub unsafe fn posix_epoll_create() -> i32 {
+    // epoll_create just creates a special fd in VFS
+    // We reuse the poll mechanism; epoll_wait sends VFS_POLL
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_OPEN;
+        msg.regs[0] = 0;
+        msg.regs[1] = 0; // flags
+        // Special path: /dev/epoll creates an epoll fd
+        let path = b"/dev/epoll\0";
+        let path_len = pack_path(&raw mut msg, 2, path.as_ptr());
+        msg.length = 3 + ((path_len as u64 + 7) / 8);
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        reply.regs[0] as i32
+    }
+}
+
+// ======================================================================
+// POSIX shared memory
+// ======================================================================
+
+pub unsafe fn posix_shm_open(name: *const u8, flags: i32) -> i32 {
+    unsafe {
+        // POSIX: shm names are "/name"; strip leading '/' before sending bare name to VFS
+        let bare = if !name.is_null() && *name == b'/' { name.add(1) } else { name };
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_SHM_OPEN;
+        msg.regs[0] = flags as u64;
+        let name_len = pack_path(&raw mut msg, 1, bare);
+        msg.length = 2 + ((name_len as u64 + 7) / 8);
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        reply.regs[0] as i32
+    }
+}
+
+pub unsafe fn posix_shm_unlink(name: *const u8) -> i32 {
+    unsafe {
+        // POSIX: shm names are "/name"; strip leading '/' before sending bare name to VFS
+        let bare = if !name.is_null() && *name == b'/' { name.add(1) } else { name };
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_SHM_UNLINK;
+        let name_len = pack_path(&raw mut msg, 0, bare);
+        msg.length = 1 + ((name_len as u64 + 7) / 8);
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        0
+    }
+}
+
+pub unsafe fn posix_ftruncate(fd: i32, length: u64) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_FTRUNCATE;
+        msg.length = 2;
+        msg.regs[0] = fd as u64;
+        msg.regs[1] = length;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        0
+    }
+}

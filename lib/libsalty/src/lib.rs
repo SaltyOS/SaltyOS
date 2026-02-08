@@ -365,3 +365,62 @@ pub extern "C" fn salty_serial_puts(s: *const u8) {
 pub extern "C" fn salty_serial_hex(val: u64) {
     serial::serial_hex(val);
 }
+
+// ---------------------------------------------------------------------------
+// C ABI exports: Socket operations
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_socket(domain: i32, sock_type: i32) -> i32 {
+    unsafe { posix::posix_socket(domain, sock_type) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_bind(fd: i32, path: *const u8) -> i32 {
+    unsafe { posix::posix_bind(fd, path) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_listen(fd: i32, backlog: i32) -> i32 {
+    unsafe { posix::posix_listen(fd, backlog) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_accept(fd: i32) -> i32 {
+    unsafe { posix::posix_accept(fd) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_connect(fd: i32, path: *const u8) -> i32 {
+    unsafe { posix::posix_connect(fd, path) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_shutdown(fd: i32, how: i32) -> i32 {
+    unsafe { posix::posix_shutdown(fd, how) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_socketpair(fds: *mut i32) -> i32 {
+    unsafe { posix::posix_socketpair(fds) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_posix_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32 {
+    unsafe { posix::posix_poll(fds, nfds, timeout) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_shm_open(name: *const u8, flags: i32) -> i32 {
+    unsafe { posix::posix_shm_open(name, flags) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_shm_unlink(name: *const u8) -> i32 {
+    unsafe { posix::posix_shm_unlink(name) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_ftruncate(fd: i32, length: u64) -> i32 {
+    unsafe { posix::posix_ftruncate(fd, length) }
+}
