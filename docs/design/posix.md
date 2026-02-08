@@ -94,33 +94,33 @@ Essential for basic program execution.
 **File I/O**:
 | Function | Status | Notes |
 |----------|--------|-------|
-| `open` | Planned | Via VFS server |
-| `close` | Planned | |
-| `read` | Planned | |
-| `write` | Planned | |
-| `lseek` | Planned | |
-| `stat`, `fstat`, `lstat` | Planned | |
-| `access` | Planned | |
-| `unlink`, `rename` | Planned | |
-| `mkdir`, `rmdir` | Planned | |
-| `opendir`, `readdir`, `closedir` | Planned | |
+| `open` | Implemented | VFS server + posix.h |
+| `close` | Implemented | VFS server + posix.h |
+| `read` | Implemented | VFS server + posix.h |
+| `write` | Implemented | VFS server + posix.h |
+| `lseek` | Implemented | VFS server + posix.h |
+| `stat`, `fstat`, `lstat` | Implemented | VFS server + posix.h |
+| `access` | Implemented | VFS server + posix.h |
+| `unlink`, `rename` | Implemented | VFS server + posix.h |
+| `mkdir`, `rmdir` | Implemented | VFS server + posix.h |
+| `opendir`, `readdir`, `closedir` | Implemented | VFS server + posix.h |
 
 **Process**:
 | Function | Status | Notes |
 |----------|--------|-------|
-| `exit`, `_exit` | Planned | |
-| `getpid`, `getppid` | Planned | |
-| `fork` | Planned | See capability inheritance below |
-| `exec*` family | Planned | `execve`, `execvp`, etc. |
-| `wait`, `waitpid` | Planned | |
+| `exit`, `_exit` | Implemented | procmgr + posix.h |
+| `getpid`, `getppid` | Implemented | procmgr + posix.h |
+| `fork` | Implemented | procmgr + posix.h + fork.S |
+| `exec*` family | Implemented | procmgr + posix.h |
+| `wait`, `waitpid` | Implemented | procmgr + posix.h (WNOHANG, pid=-1) |
 
 **Memory**:
 | Function | Status | Notes |
 |----------|--------|-------|
-| `mmap` (anonymous) | Planned | Via MemMgr |
-| `munmap` | Planned | |
-| `mprotect` | Planned | |
-| `brk`, `sbrk` | Planned | For malloc compatibility |
+| `mmap` (anonymous) | Implemented | posix_mm.h |
+| `munmap` | Implemented | posix_mm.h |
+| `mprotect` | Implemented | posix_mm.h |
+| `brk`, `sbrk` | Implemented | posix_mm.h |
 
 ### Phase 2: GUI-Ready
 

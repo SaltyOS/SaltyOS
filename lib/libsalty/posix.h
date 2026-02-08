@@ -187,16 +187,20 @@ static inline int posix_getpid(void) {
     return (int)reply.regs[0];
 }
 
+/* waitpid options */
+#define WNOHANG 1
+
 /* Wait for a child process to exit. Returns exit code via *status.
- * This is a blocking call — procmgr saves the reply cap and wakes us
- * when the child exits.
- * Returns child PID on success, -1 on error. */
-static inline int posix_waitpid(int pid, int *status) {
+ * pid > 0: wait for specific child
+ * pid == -1: wait for any child
+ * options: 0 for blocking, WNOHANG for non-blocking
+ * Returns child PID on success, 0 if WNOHANG and no child exited, -1 on error. */
+static inline int posix_waitpid3(int pid, int *status, int options) {
     struct salty_msg msg, reply;
     msg.label = POSIX_PM_WAIT;
-    msg.length = 1;
-    msg.regs[0] = (uint64_t)pid;
-    msg.regs[1] = 0;
+    msg.length = 2;
+    msg.regs[0] = (uint64_t)(uint32_t)pid;
+    msg.regs[1] = (uint64_t)options;
     msg.regs[2] = 0;
     msg.regs[3] = 0;
 
@@ -204,9 +208,17 @@ static inline int posix_waitpid(int pid, int *status) {
     if (err != 0 || reply.label != SALTY_OK)
         return -1;
 
+    /* regs[0] = exit code, regs[1] = actual child PID (for pid=-1) */
     if (status)
         *status = (int)reply.regs[0];
-    return pid;
+    int ret_pid = (int)reply.regs[1];
+    /* If WNOHANG and no child exited yet, ret_pid == 0 */
+    return ret_pid;
+}
+
+/* Backwards-compatible wrapper: blocking wait for specific child */
+static inline int posix_waitpid(int pid, int *status) {
+    return posix_waitpid3(pid, status, 0);
 }
 
 /* O_* flags for open() */
@@ -404,9 +416,9 @@ static inline int posix_rename(const char *old_path, const char *new_path) {
     msg.label = POSIX_VFS_RENAME;
 
     uint8_t old_len = 0;
-    while (old_path[old_len] && old_len < 30) old_len++;
+    while (old_path[old_len] && old_len < 64) old_len++;
     uint8_t new_len = 0;
-    while (new_path[new_len] && new_len < 30) new_len++;
+    while (new_path[new_len] && new_len < 64) new_len++;
 
     msg.regs[0] = (uint64_t)old_len;
     msg.regs[1] = (uint64_t)new_len;

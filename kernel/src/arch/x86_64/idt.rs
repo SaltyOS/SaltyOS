@@ -584,33 +584,40 @@ pub fn init() {
     }
 }
 
-/// APIC Timer interrupt handler (called from assembly stub irq_stub_timer)
+/// Timer interrupt handler (called from assembly stub irq_stub_timer)
 ///
-/// Vector 32 - called every 1ms by the APIC timer.
-/// This is the primary scheduler tick interrupt.
+/// Vector 32 - dispatches to APIC or PIT handler based on active timer backend.
 #[unsafe(no_mangle)]
 extern "C" fn irq_handler_timer() {
-    super::apic::timer_handler();
+    if super::has_apic() {
+        super::apic::timer_handler();
+    } else {
+        super::pit::timer_handler();
+    }
 }
 
 /// IPI VSpace Teardown handler (called from assembly stub irq_stub_ipi_vspace_teardown)
 ///
 /// Vector 40 - sent when a VSpace is being torn down and this CPU
-/// needs to switch away from it.
+/// needs to switch away from it. Only fires in APIC mode (SMP).
 #[unsafe(no_mangle)]
 extern "C" fn irq_handler_ipi_vspace_teardown() {
-    super::apic::handle_ipi(super::apic::IpiKind::VSpaceTeardown);
-    super::apic::eoi();
+    if super::has_apic() {
+        super::apic::handle_ipi(super::apic::IpiKind::VSpaceTeardown);
+        super::apic::eoi();
+    }
 }
 
 /// IPI Reschedule handler (called from assembly stub irq_stub_ipi_reschedule)
 ///
 /// Vector 41 - sent when a thread with specific CPU affinity is
-/// enqueued and the target CPU should check for work.
+/// enqueued and the target CPU should check for work. Only fires in APIC mode.
 #[unsafe(no_mangle)]
 extern "C" fn irq_handler_ipi_reschedule() {
-    super::apic::handle_ipi(super::apic::IpiKind::Reschedule);
-    super::apic::eoi();
+    if super::has_apic() {
+        super::apic::handle_ipi(super::apic::IpiKind::Reschedule);
+        super::apic::eoi();
+    }
 }
 
 /// Generic IRQ handler for external hardware interrupts
@@ -622,5 +629,13 @@ extern "C" fn irq_handler_generic(vector: u32) {
     // Convert vector to IRQ number (vector = IRQ + 32)
     let irq_num = vector.saturating_sub(32) as usize;
     crate::ipc::irq::dispatch_irq(irq_num);
-    super::apic::eoi();
+    if super::has_apic() {
+        super::apic::eoi();
+    } else {
+        // PIC EOI: if IRQ >= 8, also send EOI to slave PIC
+        if irq_num >= 8 {
+            unsafe { super::outb(0xA0, 0x20); }
+        }
+        unsafe { super::outb(0x20, 0x20); }
+    }
 }

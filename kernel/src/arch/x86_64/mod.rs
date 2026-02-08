@@ -13,9 +13,28 @@ mod idt;
 pub mod paging;
 mod pit;
 
-pub use apic::{get_ticks, send_ipi, IpiKind};
+pub use apic::{send_ipi, IpiKind};
 pub use cpu::{current_cpu, set_kernel_stack, MAX_CPUS};
 pub use gdt::set_tss_rsp0;
+
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// True = APIC mode, False = PIC+PIT fallback
+static APIC_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Check if APIC mode is active
+pub fn has_apic() -> bool {
+    APIC_MODE.load(Ordering::Relaxed)
+}
+
+/// Get tick count from the active timer backend
+pub fn get_ticks() -> u64 {
+    if has_apic() {
+        apic::get_ticks() as u64
+    } else {
+        pit::get_ticks()
+    }
+}
 
 // Re-export architecture-specific implementations for generic arch interface
 pub use context::{context_switch, usermode_trampoline};
@@ -60,9 +79,23 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // This prevents triple fault when timer fires
     idt::init();
 
-    // Disable legacy PIC immediately after IDT is ready
-    // Prevents spurious IRQ0 (PIT timer) before APIC is initialized
-    apic::disable_8259_pic();
+    if apic::is_available() {
+        APIC_MODE.store(true, Ordering::Release);
+        // Disable legacy PIC immediately after IDT is ready
+        // Prevents spurious IRQ0 (PIT timer) before APIC is initialized
+        apic::disable_8259_pic();
+    } else {
+        APIC_MODE.store(false, Ordering::Release);
+        // Initialize PIC with remapped vectors (IRQ0→vector 32)
+        // All IRQs masked; start_timer() will unmask IRQ0
+        pit::init_pic_mode();
+        unsafe {
+            for byte in b"[ARCH] No APIC, using PIC+PIT fallback\n" {
+                while (inb(0x3F8 + 5) & 0x20) == 0 {}
+                outb(0x3F8, *byte);
+            }
+        }
+    }
 
     // Debug: After IDT init
     unsafe {
@@ -89,17 +122,23 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // Initialize PIT (for calibration and fallback)
     pit::init();
 
-    // Initialize APIC (timer is masked, won't fire yet)
-    apic::init();
+    // Initialize APIC only if available (timer is masked, won't fire yet)
+    if has_apic() {
+        apic::init();
+    }
 }
 
-/// Start the APIC timer
+/// Start the timer (APIC or PIC+PIT depending on hardware)
 ///
 /// Called after scheduler is initialized to begin timer ticks.
 /// The timer is configured but masked during init() to prevent
 /// interrupts before the scheduler is ready.
 pub fn start_timer() {
-    apic::start_timer();
+    if has_apic() {
+        apic::start_timer();
+    } else {
+        pit::start_timer();
+    }
 }
 
 /// Initialize SMP (Symmetric Multi-Processing)
@@ -107,6 +146,16 @@ pub fn start_timer() {
 /// Parses ACPI MADT to discover APs, then sends INIT+SIPI to start them.
 /// Must be called after scheduler is initialized and timer is running.
 pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
+    if !has_apic() {
+        unsafe {
+            for byte in b"[SMP] No APIC available, running single-CPU\n" {
+                while (inb(0x3F8 + 5) & 0x20) == 0 {}
+                outb(0x3F8, *byte);
+            }
+        }
+        return;
+    }
+
     // Try bootloader-provided RSDP first, then fall back to BIOS scan
     let rsdp_addr = match boot_info {
         Some(info) if info.rsdp_addr != 0 => info.rsdp_addr,

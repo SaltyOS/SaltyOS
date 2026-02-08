@@ -246,11 +246,7 @@ pub fn disable_8259_pic() {
 /// 6. Disables legacy 8259 PIC
 pub fn init() {
     if !is_available() {
-        // APIC not available - this is a critical error
-        // TODO: Fall back to PIT-only mode
-        loop {
-            unsafe { core::arch::asm!("hlt") };
-        }
+        panic!("apic::init() called but APIC not available");
     }
 
     unsafe {

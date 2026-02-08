@@ -143,7 +143,7 @@ Three-level memory abstraction:
 | `console` | Serial console server (COM1 via IoPort caps) | Implemented |
 | `rtld` | Runtime dynamic linker (shared library loading) | Implemented |
 | `procmgr` | Process lifecycle, capability distribution | Implemented |
-| `vfs` | Virtual filesystem, SaltyFS driver | **Partial** (devfs-only) |
+| `vfs` | Virtual filesystem (ramfs + devfs + initrd) | Implemented |
 | `nameserv` | Service discovery (endpoint lookup) | Implemented |
 | `drivers/` | Device drivers (PCI, NVMe, USB, etc.) | Planned |
 

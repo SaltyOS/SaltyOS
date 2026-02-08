@@ -57,6 +57,7 @@ struct posix_mm_state {
     uint64_t mmap_base;
     uint64_t mmap_next;
     struct posix_mm_region regions[MM_MAX_REGIONS];
+    cap_t    heap_frame_slots[MM_MAX_PAGES_PER_REGION];
     int      initialized;
 };
 
@@ -147,15 +148,24 @@ static inline int posix_brk(uint64_t addr) {
             int err = __mm_map_page(frame, va, PROT_READ | PROT_WRITE);
             if (err != 0)
                 return -1;
+            /* Record frame slot for later reclamation */
+            uint64_t idx = (va - __posix_mm.heap_base) / 4096;
+            if (idx < MM_MAX_PAGES_PER_REGION)
+                __posix_mm.heap_frame_slots[idx] = frame;
             /* Zero the page by scratch-writing through it */
             volatile uint8_t *p = (volatile uint8_t *)va;
             for (int i = 0; i < 4096; i++)
                 p[i] = 0;
         }
     } else if (new_page < old_page) {
-        /* Shrink: unmap pages (frame slots leaked in Phase 1) */
+        /* Shrink: unmap pages and reclaim frame caps */
         for (uint64_t va = new_page; va < old_page; va += 4096) {
             salty_vspace_unmap(__posix_mm.vspace, va);
+            uint64_t idx = (va - __posix_mm.heap_base) / 4096;
+            if (idx < MM_MAX_PAGES_PER_REGION && __posix_mm.heap_frame_slots[idx] != 0) {
+                salty_cnode_delete(__posix_mm.cspace, __posix_mm.heap_frame_slots[idx]);
+                __posix_mm.heap_frame_slots[idx] = 0;
+            }
         }
     }
 
@@ -280,13 +290,18 @@ static inline int posix_munmap(void *addr, unsigned long length) {
     if (!region || region->type != MM_REGION_MMAP)
         return -1;
 
-    /* Reject partial unmaps: only allow unmapping the full region */
+    /* Intentional limitation: partial munmap not supported.
+     * Only full-region unmap is allowed (base must match region start). */
     if (base != region->base)
         return -1;
 
-    /* Unmap all pages (frame slots leaked in Phase 1) */
+    /* Unmap all pages and reclaim frame caps */
     for (uint16_t i = 0; i < region->num_pages; i++) {
         salty_vspace_unmap(__posix_mm.vspace, region->base + (uint64_t)i * 4096);
+        if (region->frame_slots[i] != 0) {
+            salty_cnode_delete(__posix_mm.cspace, region->frame_slots[i]);
+            region->frame_slots[i] = 0;
+        }
     }
 
     region->type = MM_REGION_FREE;

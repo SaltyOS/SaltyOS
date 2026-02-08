@@ -93,12 +93,50 @@ pub fn now_us() -> u64 {
     get_ticks() * 1000
 }
 
-/// PIT interrupt handler
+/// 8259 PIC initialization: remap IRQ0-7→vector 32-39, IRQ8-15→vector 40-47.
+/// All IRQs masked. Call start_timer() to unmask IRQ0.
+pub fn init_pic_mode() {
+    unsafe {
+        // ICW1: initialize
+        outb(0x20, 0x11);
+        outb(0xA0, 0x11);
+        // ICW2: remap (Master→0x20=32, Slave→0x28=40)
+        outb(0x21, 0x20);
+        outb(0xA1, 0x28);
+        // ICW3: cascade wiring
+        outb(0x21, 0x04);
+        outb(0xA1, 0x02);
+        // ICW4: 8086 mode
+        outb(0x21, 0x01);
+        outb(0xA1, 0x01);
+        // OCW1: mask all IRQs
+        outb(0x21, 0xFF);
+        outb(0xA1, 0xFF);
+    }
+}
+
+/// Unmask PIC IRQ0 to start PIT timer interrupts
+pub fn start_timer() {
+    unsafe {
+        // Unmask IRQ0 only (0xFE = 11111110)
+        outb(0x21, 0xFE);
+    }
+}
+
+/// Send End-Of-Interrupt to the master PIC
+fn pic_eoi() {
+    unsafe { outb(0x20, 0x20); }
+}
+
+/// PIT interrupt handler (PIC+PIT fallback mode)
 ///
 /// Called by the IRQ0 handler when using the PIT as the primary timer.
-/// Note: We primarily use the APIC timer, so this may not be used.
+/// Sends PIC EOI before scheduler notification to prevent lost interrupts
+/// if timer_tick() triggers a context switch that never returns.
 pub fn timer_handler() {
     TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    pic_eoi();
+    crate::sched::timer_tick();
 }
 
 /// Calibrate using PIT

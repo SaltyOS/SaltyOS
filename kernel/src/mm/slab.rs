@@ -280,8 +280,27 @@ impl SlabAllocator {
             }
         }
 
-        // Object not found in any slab (shouldn't happen)
-        // TODO: handle this error case
+        unsafe {
+            let msg = b"[SLAB] BUG: return_to_slab: object not found at ";
+            for &byte in msg {
+                while (crate::arch::inb(0x3F8 + 5) & 0x20) == 0 {}
+                crate::arch::outb(0x3F8, byte);
+            }
+            // Print address as hex
+            let hex = b"0123456789abcdef";
+            let addr = obj as usize as u64;
+            for &byte in b"0x" {
+                while (crate::arch::inb(0x3F8 + 5) & 0x20) == 0 {}
+                crate::arch::outb(0x3F8, byte);
+            }
+            for shift in (0..16).rev() {
+                let nibble = ((addr >> (shift * 4)) & 0xF) as usize;
+                while (crate::arch::inb(0x3F8 + 5) & 0x20) == 0 {}
+                crate::arch::outb(0x3F8, hex[nibble]);
+            }
+            while (crate::arch::inb(0x3F8 + 5) & 0x20) == 0 {}
+            crate::arch::outb(0x3F8, b'\n');
+        }
     }
 
     /// Find a slab with free objects

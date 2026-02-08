@@ -86,10 +86,10 @@
 /* Limits */
 #define MAX_INODES      128
 #define MAX_DIRENTS      32
-#define MAX_WRITABLE     16
-#define WRITABLE_SIZE  4096
+#define MAX_WRITABLE     32
+#define WRITABLE_SIZE  8192
 #define MAX_CLIENTS      16
-#define MAX_FDS          16
+#define MAX_FDS          32
 #define MAX_PATH_LEN     64
 #define MAX_NAME_LEN     32
 
@@ -989,8 +989,8 @@ static void handle_rename(const struct salty_msg *msg, struct salty_msg *reply) 
     /* regs[0] = old_len, regs[1] = new_len, regs[2..] = old_path, then new_path */
     uint8_t old_len = (uint8_t)msg->regs[0];
     uint8_t new_len = (uint8_t)msg->regs[1];
-    if (old_len > 30) old_len = 30;
-    if (new_len > 30) new_len = 30;
+    if (old_len > MAX_PATH_LEN) old_len = MAX_PATH_LEN;
+    if (new_len > MAX_PATH_LEN) new_len = MAX_PATH_LEN;
 
     char old_path[MAX_PATH_LEN];
     char new_path[MAX_PATH_LEN];

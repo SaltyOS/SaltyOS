@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="${PROJECT_DIR}/build"
-TIMEOUT="${SMP_TIMEOUT:-15}"
+TIMEOUT="${SMP_TIMEOUT:-25}"
 SMP_CPUS="${SMP_CPUS:-2}"
 IMAGE="${BUILD_DIR}/saltyos.img"
 LOG_FILE="$(mktemp /tmp/saltyos-smp-XXXXXX.log)"
@@ -126,6 +126,17 @@ check_regex() {
     fi
 }
 
+check_absent() {
+    local label="$1"
+    local pattern="$2"
+    if grep -qF "$pattern" "$LOG_FILE"; then
+        fail "$label (unexpected: \"$pattern\")"
+        FAILURES=$((FAILURES + 1))
+    else
+        pass "$label"
+    fi
+}
+
 # Check that SMP initialization started
 check_string "SMP AP startup"           "[SMP] Starting Application Processors"
 check_string "SMP AP online"            "[SMP] AP is online"
@@ -140,6 +151,11 @@ done
 # Also verify boot tests still pass under SMP
 check_string "Phase 1: IPC test (SMP)"       "[INIT] Phase 1 IPC test PASSED"
 check_string "Phase 2: Fault handling (SMP)"  "[INIT] Phase 2 Fault test PASSED"
+check_string "Phase 3: Console (SMP)"         "[INIT] Phase 3 PASSED"
+check_string "Phase 4: Servers (SMP)"         "[INIT] Phase 4: All servers spawned!"
+check_string "Phase 5: Tests (SMP)"           "[INIT] Phase 5 PASSED"
+check_absent "Kernel exceptions (SMP)"        "*** EXCEPTION:"
+check_absent "Init failure (SMP)"             "[INIT] FAIL:"
 
 echo ""
 if [[ $FAILURES -eq 0 ]]; then

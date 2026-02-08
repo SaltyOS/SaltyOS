@@ -155,9 +155,12 @@ struct process {
     cap_t    vspace_cap;
     cap_t    cnode_cap;
     cap_t    sc_cap;
-    /* Blocking waitpid support */
+    /* Blocking waitpid support (specific child) */
     cap_t    waiter_reply;  /* CNode slot holding saved reply cap (0 = no waiter) */
     uint32_t waiter_pid;    /* PID of process blocked waiting on this child */
+    /* Blocking waitpid(-1) support (any child) */
+    cap_t    any_waiter_reply;  /* Reply cap for parent blocked on any child */
+    uint8_t  waiting_for_any;   /* 1 if parent is blocked in waitpid(-1) */
 };
 
 static struct process proctab[MAX_PROCESSES];
@@ -702,7 +705,7 @@ static void handle_exit(const struct salty_msg *msg, struct salty_msg *reply, ui
     /* Suspend the thread (it called exit, so we don't reply) */
     salty_invoke(proc->tcb_cap, TCB_SUSPEND, 0, 0, 0, 0);
 
-    /* If a parent is blocked in waitpid for this child, wake them */
+    /* If a parent is blocked in waitpid for this specific child, wake them */
     if (proc->waiter_reply != 0) {
         salty_serial_puts("[PROCMGR] Waking waiter for PID=");
         salty_serial_hex((uint64_t)proc->pid);
@@ -711,9 +714,10 @@ static void handle_exit(const struct salty_msg *msg, struct salty_msg *reply, ui
         /* Build reply message for the waiting parent */
         struct salty_msg wake_reply;
         wake_reply.label = SALTY_OK;
-        wake_reply.length = 1;
+        wake_reply.length = 2;
         wake_reply.regs[0] = (uint64_t)exit_code;
-        for (int i = 1; i < 20; i++) wake_reply.regs[i] = 0;
+        wake_reply.regs[1] = (uint64_t)proc->pid;
+        for (int i = 2; i < 20; i++) wake_reply.regs[i] = 0;
 
         /* Send reply via the saved reply cap */
         int wake_err = salty_send(proc->waiter_reply, &wake_reply);
@@ -732,15 +736,115 @@ static void handle_exit(const struct salty_msg *msg, struct salty_msg *reply, ui
 
         /* Parent consumed status; reclaim process resources now. */
         cleanup_proc_resources(proc);
+        return;
+    }
+
+    /* Check if the parent is blocked in waitpid(-1) */
+    struct process *parent = find_proc_by_pid(proc->ppid);
+    if (parent && parent->waiting_for_any) {
+        salty_serial_puts("[PROCMGR] Waking any-waiter parent PID=");
+        salty_serial_hex((uint64_t)parent->pid);
+        salty_serial_puts(" for child PID=");
+        salty_serial_hex((uint64_t)proc->pid);
+        salty_serial_puts("\n");
+
+        struct salty_msg wake_reply;
+        wake_reply.label = SALTY_OK;
+        wake_reply.length = 2;
+        wake_reply.regs[0] = (uint64_t)exit_code;
+        wake_reply.regs[1] = (uint64_t)proc->pid;
+        for (int i = 2; i < 20; i++) wake_reply.regs[i] = 0;
+
+        int wake_err = salty_send(parent->any_waiter_reply, &wake_reply);
+        if (wake_err != 0) {
+            salty_serial_puts("[PROCMGR] any-wait wake send failed err=");
+            salty_serial_hex((uint64_t)wake_err);
+            salty_serial_puts("\n");
+        }
+
+        salty_cnode_delete(CAP_SELF_CSPACE, parent->any_waiter_reply);
+        parent->any_waiter_reply = 0;
+        parent->waiting_for_any = 0;
+
+        cleanup_proc_resources(proc);
     }
 }
 
-/* handle_wait: blocking waitpid.
+/* WNOHANG flag for waitpid */
+#define WNOHANG 1
+
+/* handle_wait: blocking or non-blocking waitpid.
+ * Supports specific child (pid > 0) and any child (pid == -1).
  * Returns 1 if the caller should NOT send a reply (blocked), 0 otherwise. */
 static int handle_wait(const struct salty_msg *msg, struct salty_msg *reply, uint64_t badge) {
     uint32_t child_pid = (uint32_t)msg->regs[0];
+    uint32_t options = (uint32_t)msg->regs[1];
 
     struct process *caller = find_proc_by_badge(badge);
+    if (!caller) {
+        reply->label = SALTY_NOT_FOUND;
+        return 0;
+    }
+
+    /* waitpid(-1): wait for any child */
+    if (child_pid == (uint32_t)-1) {
+        /* Search for a ZOMBIE child of the caller */
+        struct process *zombie = (struct process *)0;
+        int has_running_child = 0;
+        for (int i = 0; i < MAX_PROCESSES; i++) {
+            if (proctab[i].state != PROC_FREE && proctab[i].ppid == caller->pid) {
+                if (proctab[i].state == PROC_ZOMBIE && !zombie) {
+                    zombie = &proctab[i];
+                } else if (proctab[i].state == PROC_RUNNING) {
+                    has_running_child = 1;
+                }
+            }
+        }
+
+        if (zombie) {
+            /* Return immediately with zombie's info */
+            reply->label = SALTY_OK;
+            reply->length = 2;
+            reply->regs[0] = (uint64_t)zombie->exit_code;
+            reply->regs[1] = (uint64_t)zombie->pid;
+            cleanup_proc_resources(zombie);
+            return 0;
+        }
+
+        if (!has_running_child) {
+            /* No children at all -> ECHILD equivalent */
+            reply->label = SALTY_NOT_FOUND;
+            return 0;
+        }
+
+        if (options & WNOHANG) {
+            /* Non-blocking: no zombie yet, return 0 */
+            reply->label = SALTY_OK;
+            reply->length = 2;
+            reply->regs[0] = 0;
+            reply->regs[1] = 0; /* pid=0 means no child exited yet */
+            return 0;
+        }
+
+        /* Block: save reply cap on the caller (parent) */
+        cap_t reply_slot = CAP_REPLY_BASE + MAX_PROCESSES + (cap_t)(caller - proctab);
+        int err = salty_cnode_save_caller(CAP_SELF_CSPACE, reply_slot);
+        if (err != 0) {
+            reply->label = SALTY_OUT_OF_MEMORY;
+            return 0;
+        }
+
+        caller->any_waiter_reply = reply_slot;
+        caller->waiting_for_any = 1;
+
+        salty_serial_puts("[PROCMGR] WAIT(-1) blocking parent PID=");
+        salty_serial_hex((uint64_t)caller->pid);
+        salty_serial_puts("\n");
+
+        return 1;
+    }
+
+    /* waitpid(specific child) */
     struct process *child = find_proc_by_pid(child_pid);
     if (!child) {
         reply->label = SALTY_NOT_FOUND;
@@ -748,7 +852,7 @@ static int handle_wait(const struct salty_msg *msg, struct salty_msg *reply, uin
     }
 
     /* Only the parent may wait on a child */
-    if (caller && child->ppid != caller->pid) {
+    if (child->ppid != caller->pid) {
         reply->label = SALTY_NOT_FOUND;
         return 0;
     }
@@ -756,11 +860,21 @@ static int handle_wait(const struct salty_msg *msg, struct salty_msg *reply, uin
     if (child->state == PROC_ZOMBIE) {
         /* Already exited, return immediately */
         reply->label = SALTY_OK;
-        reply->length = 1;
+        reply->length = 2;
         reply->regs[0] = (uint64_t)child->exit_code;
+        reply->regs[1] = (uint64_t)child->pid;
 
         /* Reclaim resources now that status is consumed. */
         cleanup_proc_resources(child);
+        return 0;
+    }
+
+    if (options & WNOHANG) {
+        /* Non-blocking: child still running, return 0 */
+        reply->label = SALTY_OK;
+        reply->length = 2;
+        reply->regs[0] = 0;
+        reply->regs[1] = 0;
         return 0;
     }
 
@@ -777,7 +891,7 @@ static int handle_wait(const struct salty_msg *msg, struct salty_msg *reply, uin
     }
 
     child->waiter_reply = reply_slot;
-    child->waiter_pid = caller ? caller->pid : 0;
+    child->waiter_pid = caller->pid;
 
     salty_serial_puts("[PROCMGR] WAIT blocking for PID=");
     salty_serial_hex((uint64_t)child_pid);
