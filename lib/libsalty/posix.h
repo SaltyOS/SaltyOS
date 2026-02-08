@@ -188,7 +188,16 @@ static inline int posix_getpid(void) {
 }
 
 /* waitpid options */
-#define WNOHANG 1
+#define WNOHANG    1
+#define WUNTRACED  2
+
+/* Wait status encoding (POSIX) */
+#define WIFEXITED(s)    (((s) & 0x7f) == 0)
+#define WEXITSTATUS(s)  (((s) >> 8) & 0xff)
+#define WIFSIGNALED(s)  (((s) & 0x7f) != 0 && ((s) & 0x7f) != 0x7f)
+#define WTERMSIG(s)     ((s) & 0x7f)
+#define WIFSTOPPED(s)   (((s) & 0xff) == 0x7f)
+#define WSTOPSIG(s)     (((s) >> 8) & 0xff)
 
 /* Wait for a child process to exit. Returns exit code via *status.
  * pid > 0: wait for specific child
@@ -294,6 +303,163 @@ struct salty_dirent {
 #define POSIX_PM_FORK    5
 #define POSIX_PM_EXEC    6
 #define POSIX_PM_GETPPID 7
+#define POSIX_PM_KILL      8
+#define POSIX_PM_SIGACTION 9
+
+/* Signal notification cap slot in child CNode (set by procmgr) */
+#define POSIX_CAP_SIGNAL_NTFN 6
+
+/* ================================================================
+ * POSIX Signals
+ * ================================================================
+ * Synchronous, notification-based signal delivery.
+ * Signal number N maps to notification bit (1 << N).
+ * Procmgr tracks disposition (DFL/IGN/CATCH); handler function
+ * pointers are stored process-locally in __sig_handlers[].
+ */
+
+/* Signal numbers (Linux x86_64 values) */
+#define SIGHUP    1
+#define SIGINT    2
+#define SIGQUIT   3
+#define SIGABRT   6
+#define SIGKILL   9
+#define SIGUSR1  10
+#define SIGUSR2  12
+#define SIGPIPE  13
+#define SIGALRM  14
+#define SIGTERM  15
+#define SIGCHLD  17
+#define SIGCONT  18
+#define SIGSTOP  19
+
+#define _NSIG    32
+
+/* Signal handler type */
+typedef void (*sighandler_t)(int);
+
+/* Special handler values */
+#define SIG_DFL  ((sighandler_t)0)
+#define SIG_IGN  ((sighandler_t)1)
+#define SIG_ERR  ((sighandler_t)-1)
+
+/* Disposition categories sent to procmgr */
+#define _SIG_DISP_DFL   0
+#define _SIG_DISP_IGN   1
+#define _SIG_DISP_CATCH 2
+
+/* Process-local signal handler table */
+#ifdef SALTY_STATIC
+static sighandler_t __sig_handlers[_NSIG];
+static int __sig_initialized;
+#else
+extern sighandler_t __sig_handlers[_NSIG];
+extern int __sig_initialized;
+#endif
+
+/* Returns 1 if default action for sig is terminate, 0 if ignore/stop */
+static inline int __sig_default_action(int sig) {
+    switch (sig) {
+    case SIGCHLD: case SIGCONT: case SIGSTOP:
+        return 0; /* default = ignore (SIGCHLD/SIGCONT) or stop (SIGSTOP) */
+    default:
+        return 1; /* default = terminate */
+    }
+}
+
+/* Lazy-init signal handler table */
+static inline void __sig_init(void) {
+    if (__sig_initialized) return;
+    for (int i = 0; i < _NSIG; i++)
+        __sig_handlers[i] = SIG_DFL;
+    __sig_initialized = 1;
+}
+
+/* posix_signal: install a signal handler.
+ * Updates local table AND informs procmgr of disposition category.
+ * Returns previous handler, or SIG_ERR on failure. */
+static inline sighandler_t posix_signal(int sig, sighandler_t handler) {
+    __sig_init();
+    if (sig <= 0 || sig >= _NSIG || sig == SIGKILL || sig == SIGSTOP || handler == SIG_ERR)
+        return SIG_ERR;
+
+    sighandler_t old = __sig_handlers[sig];
+    __sig_handlers[sig] = handler;
+
+    /* Notify procmgr of disposition category */
+    uint8_t disp;
+    if (handler == SIG_DFL)
+        disp = _SIG_DISP_DFL;
+    else if (handler == SIG_IGN)
+        disp = _SIG_DISP_IGN;
+    else
+        disp = _SIG_DISP_CATCH;
+
+    struct salty_msg msg, reply;
+    msg.label = POSIX_PM_SIGACTION;
+    msg.length = 2;
+    msg.regs[0] = (uint64_t)sig;
+    msg.regs[1] = (uint64_t)disp;
+    msg.regs[2] = 0;
+    msg.regs[3] = 0;
+
+    int err = salty_call(POSIX_CAP_PROCMGR_EP, &msg, &reply);
+    if (err != 0 || reply.label != SALTY_OK) {
+        /* Revert local change on failure */
+        __sig_handlers[sig] = old;
+        return SIG_ERR;
+    }
+
+    return old;
+}
+
+/* posix_kill: send a signal to a process.
+ * Returns 0 on success, -1 on error. */
+static inline int posix_kill(int pid, int sig) {
+    struct salty_msg msg, reply;
+    msg.label = POSIX_PM_KILL;
+    msg.length = 2;
+    msg.regs[0] = (uint64_t)(uint32_t)pid;
+    msg.regs[1] = (uint64_t)sig;
+    msg.regs[2] = 0;
+    msg.regs[3] = 0;
+
+    int err = salty_call(POSIX_CAP_PROCMGR_EP, &msg, &reply);
+    if (err != 0 || reply.label != SALTY_OK)
+        return -1;
+    return 0;
+}
+
+/* posix_sigcheck: poll signal notification and dispatch handlers.
+ * Call this at safe points (e.g. after IPC, in idle loops).
+ * Returns number of signals dispatched. */
+static inline int posix_sigcheck(void) {
+    __sig_init();
+
+    uint64_t bits = 0;
+    int err = salty_poll(POSIX_CAP_SIGNAL_NTFN, &bits);
+    if (err != 0 || bits == 0)
+        return 0;
+
+    int dispatched = 0;
+    for (int sig = 1; sig < _NSIG; sig++) {
+        if (!(bits & (1ULL << sig)))
+            continue;
+
+        sighandler_t handler = __sig_handlers[sig];
+        if (handler == SIG_IGN) {
+            /* Ignore */
+        } else if (handler == SIG_DFL) {
+            if (__sig_default_action(sig))
+                posix_exit(128 + sig);
+            /* else ignore (SIGCHLD, SIGCONT with DFL) */
+        } else {
+            handler(sig);
+        }
+        dispatched++;
+    }
+    return dispatched;
+}
 
 /* lseek: reposition file offset */
 static inline long posix_lseek(int fd, long offset, int whence) {

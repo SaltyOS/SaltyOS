@@ -45,18 +45,37 @@
 #define IPC_BUF_VADDR       0x0000000000200000ULL
 
 /* Protocol labels */
-#define PM_SPAWN   1
-#define PM_EXIT    2
-#define PM_WAIT    3
-#define PM_GETPID  4
-#define PM_FORK    5
-#define PM_EXEC    6
-#define PM_GETPPID 7
+#define PM_SPAWN     1
+#define PM_EXIT      2
+#define PM_WAIT      3
+#define PM_GETPID    4
+#define PM_FORK      5
+#define PM_EXEC      6
+#define PM_GETPPID   7
+#define PM_KILL      8
+#define PM_SIGACTION 9
+
+/* Signal disposition categories */
+#define SIG_DISP_DFL   0
+#define SIG_DISP_IGN   1
+#define SIG_DISP_CATCH 2
+#define _PM_NSIG       32
+
+/* Signal number aliases used internally */
+#define _PM_SIGKILL  9
+#define _PM_SIGTERM 15
+#define _PM_SIGCHLD 17
+#define _PM_SIGCONT 18
+#define _PM_SIGSTOP 19
+
+/* Cap offset for signal notification within per-process cap block */
+#define CAP_OFF_SIGNAL_NTFN  6
 
 /* Process states */
 #define PROC_FREE     0
 #define PROC_RUNNING  1
 #define PROC_ZOMBIE   2  /* Exited but not yet waited on */
+#define PROC_STOPPED  3  /* Stopped by signal (SIGSTOP/SIGTSTP/etc.) */
 
 /* Process table limits */
 #define MAX_PROCESSES  32
@@ -124,6 +143,7 @@
 #define CHILD_CAP_EP        3
 #define CHILD_CAP_VFS       4
 #define CHILD_CAP_NAMESERV  5
+#define CHILD_CAP_SIGNAL_NTFN 6
 #define CHILD_CAP_UNTYPED   7
 /* Child CNode is created with size_bits=0 (kernel default = 2^10 slots). */
 #define CHILD_CNODE_SLOTS   1024
@@ -161,6 +181,10 @@ struct process {
     /* Blocking waitpid(-1) support (any child) */
     cap_t    any_waiter_reply;  /* Reply cap for parent blocked on any child */
     uint8_t  waiting_for_any;   /* 1 if parent is blocked in waitpid(-1) */
+    /* Signal support */
+    cap_t    signal_ntfn;               /* Notification cap in procmgr CSpace */
+    uint8_t  sig_disposition[_PM_NSIG]; /* DFL=0, IGN=1, CATCH=2 */
+    int      stop_status;               /* POSIX wstatus for PROC_STOPPED */
 };
 
 static struct process proctab[MAX_PROCESSES];
@@ -223,6 +247,10 @@ static void cleanup_proc_resources(struct process *proc) {
     proc->sc_cap = 0;
     proc->waiter_reply = 0;
     proc->waiter_pid = 0;
+    proc->signal_ntfn = 0;
+    proc->stop_status = 0;
+    for (int i = 0; i < _PM_NSIG; i++)
+        proc->sig_disposition[i] = SIG_DISP_DFL;
     proc->state = PROC_FREE;
 }
 
@@ -305,6 +333,7 @@ static void handle_spawn(const struct salty_msg *msg, struct salty_msg *reply, u
     cap_t child_sc     = base + CAP_OFF_SC;
     cap_t child_stk_fr = base + CAP_OFF_STACK_FR;
     cap_t child_ipc_fr = base + CAP_OFF_IPC_FR;
+    cap_t child_sig_ntfn = base + CAP_OFF_SIGNAL_NTFN;
 
     int err;
 
@@ -325,6 +354,9 @@ static void handle_spawn(const struct salty_msg *msg, struct salty_msg *reply, u
     if (err != 0) { reply->label = SALTY_OUT_OF_MEMORY; return; }
 
     err = salty_untyped_retype(CAP_UNTYPED, OBJ_FRAME, 0, child_ipc_fr);
+    if (err != 0) { reply->label = SALTY_OUT_OF_MEMORY; return; }
+
+    err = salty_untyped_retype(CAP_UNTYPED, OBJ_NOTIFICATION, 0, child_sig_ntfn);
     if (err != 0) { reply->label = SALTY_OUT_OF_MEMORY; return; }
 
     salty_serial_puts("[PROCMGR] Objects retyped for PID ");
@@ -555,6 +587,13 @@ static void handle_spawn(const struct salty_msg *msg, struct salty_msg *reply, u
         salty_serial_puts("[PROCMGR] WARN: copy Nameserv EP cap failed\n");
     }
 
+    /* Child slot 6 = Signal notification (for POSIX signal delivery) */
+    err = salty_cnode_copy(CAP_SELF_CSPACE, child_sig_ntfn,
+                           child_cn, CHILD_CAP_SIGNAL_NTFN, CAP_RIGHTS_ALL);
+    if (err != 0) {
+        salty_serial_puts("[PROCMGR] WARN: copy signal ntfn cap failed\n");
+    }
+
     /* 6. Configure child TCB */
     err = salty_tcb_set_space(child_tcb, child_cn, child_vs);
     if (err != 0) {
@@ -683,6 +722,9 @@ static void handle_spawn(const struct salty_msg *msg, struct salty_msg *reply, u
     proc->sc_cap = child_sc;
     proc->waiter_reply = 0;
     proc->waiter_pid = 0;
+    proc->signal_ntfn = child_sig_ntfn;
+    for (int i = 0; i < _PM_NSIG; i++)
+        proc->sig_disposition[i] = SIG_DISP_DFL;
 
     salty_serial_puts("[PROCMGR] Process started PID=");
     salty_serial_hex((uint64_t)pid);
@@ -694,7 +736,8 @@ static void handle_spawn(const struct salty_msg *msg, struct salty_msg *reply, u
 }
 
 static void handle_exit(const struct salty_msg *msg, struct salty_msg *reply, uint64_t badge) {
-    int exit_code = (int)msg->regs[0];
+    int raw_code = (int)msg->regs[0];
+    int exit_code = (raw_code << 8);  /* POSIX __W_EXITCODE(raw_code, 0) */
 
     struct process *proc = find_proc_by_badge(badge);
     if (!proc) {
@@ -716,6 +759,17 @@ static void handle_exit(const struct salty_msg *msg, struct salty_msg *reply, ui
 
     /* Suspend the thread (it called exit, so we don't reply) */
     salty_invoke(proc->tcb_cap, TCB_SUSPEND, 0, 0, 0, 0);
+
+    /* Deliver SIGCHLD to parent before waking waiters, so the notification
+     * is set regardless of which waitpid path processes the exit. */
+    {
+        struct process *sig_parent = find_proc_by_pid(proc->ppid);
+        if (sig_parent && sig_parent->state == PROC_RUNNING &&
+            sig_parent->signal_ntfn != 0 &&
+            sig_parent->sig_disposition[_PM_SIGCHLD] == SIG_DISP_CATCH) {
+            salty_signal(sig_parent->signal_ntfn, 1ULL << _PM_SIGCHLD);
+        }
+    }
 
     /* If a parent is blocked in waitpid for this specific child, wake them */
     if (proc->waiter_reply != 0) {
@@ -782,8 +836,9 @@ static void handle_exit(const struct salty_msg *msg, struct salty_msg *reply, ui
     }
 }
 
-/* WNOHANG flag for waitpid */
-#define WNOHANG 1
+/* waitpid option flags */
+#define WNOHANG    1
+#define WUNTRACED  2
 
 /* handle_wait: blocking or non-blocking waitpid.
  * Supports specific child (pid > 0) and any child (pid == -1).
@@ -800,21 +855,25 @@ static int handle_wait(const struct salty_msg *msg, struct salty_msg *reply, uin
 
     /* waitpid(-1): wait for any child */
     if (child_pid == (uint32_t)-1) {
-        /* Search for a ZOMBIE child of the caller */
+        /* Search for a ZOMBIE or STOPPED child of the caller */
         struct process *zombie = (struct process *)0;
-        int has_running_child = 0;
+        struct process *stopped = (struct process *)0;
+        int has_living_child = 0;
         for (int i = 0; i < MAX_PROCESSES; i++) {
             if (proctab[i].state != PROC_FREE && proctab[i].ppid == caller->pid) {
                 if (proctab[i].state == PROC_ZOMBIE && !zombie) {
                     zombie = &proctab[i];
-                } else if (proctab[i].state == PROC_RUNNING) {
-                    has_running_child = 1;
+                } else if (proctab[i].state == PROC_STOPPED && !stopped) {
+                    stopped = &proctab[i];
+                }
+                if (proctab[i].state == PROC_RUNNING ||
+                    proctab[i].state == PROC_STOPPED) {
+                    has_living_child = 1;
                 }
             }
         }
 
         if (zombie) {
-            /* Return immediately with zombie's info */
             reply->label = SALTY_OK;
             reply->length = 2;
             reply->regs[0] = (uint64_t)zombie->exit_code;
@@ -823,8 +882,15 @@ static int handle_wait(const struct salty_msg *msg, struct salty_msg *reply, uin
             return 0;
         }
 
-        if (!has_running_child) {
-            /* No children at all -> ECHILD equivalent */
+        if ((options & WUNTRACED) && stopped) {
+            reply->label = SALTY_OK;
+            reply->length = 2;
+            reply->regs[0] = (uint64_t)stopped->stop_status;
+            reply->regs[1] = (uint64_t)stopped->pid;
+            return 0;
+        }
+
+        if (!has_living_child) {
             reply->label = SALTY_NOT_FOUND;
             return 0;
         }
@@ -878,6 +944,14 @@ static int handle_wait(const struct salty_msg *msg, struct salty_msg *reply, uin
 
         /* Reclaim resources now that status is consumed. */
         cleanup_proc_resources(child);
+        return 0;
+    }
+
+    if ((options & WUNTRACED) && child->state == PROC_STOPPED) {
+        reply->label = SALTY_OK;
+        reply->length = 2;
+        reply->regs[0] = (uint64_t)child->stop_status;
+        reply->regs[1] = (uint64_t)child->pid;
         return 0;
     }
 
@@ -935,6 +1009,212 @@ static void handle_getppid(struct salty_msg *reply, uint64_t badge) {
     reply->label = SALTY_OK;
     reply->length = 1;
     reply->regs[0] = (uint64_t)proc->ppid;
+}
+
+/* Returns 1 if default action for sig is terminate, 0 if ignore/stop */
+static int sig_default_is_terminate(int sig) {
+    switch (sig) {
+    case _PM_SIGCHLD: case _PM_SIGCONT: case _PM_SIGSTOP:
+        return 0; /* default = ignore (SIGCHLD/SIGCONT) or stop (SIGSTOP) */
+    default:
+        return 1; /* default = terminate */
+    }
+}
+
+/* Terminate a process by signal: suspend TCB, mark zombie, wake waiters.
+ * Mirrors the handle_exit() termination path. */
+static void sig_terminate_proc(struct process *proc, int sig) {
+    int exit_code = sig & 0x7f;  /* POSIX: low 7 bits = signal number */
+
+    salty_serial_puts("[PROCMGR] SIGKILL/terminate PID=");
+    salty_serial_hex((uint64_t)proc->pid);
+    salty_serial_puts(" sig=");
+    salty_serial_hex((uint64_t)sig);
+    salty_serial_puts("\n");
+
+    /* Suspend the thread */
+    salty_invoke(proc->tcb_cap, TCB_SUSPEND, 0, 0, 0, 0);
+
+    proc->state = PROC_ZOMBIE;
+    proc->exit_code = exit_code;
+
+    /* Deliver SIGCHLD to parent before waking waiters, so the notification
+     * is set regardless of which waitpid path processes the exit. */
+    struct process *parent = find_proc_by_pid(proc->ppid);
+    if (parent && (parent->state == PROC_RUNNING || parent->state == PROC_STOPPED) &&
+        parent->signal_ntfn != 0 &&
+        parent->sig_disposition[_PM_SIGCHLD] == SIG_DISP_CATCH) {
+        salty_signal(parent->signal_ntfn, 1ULL << _PM_SIGCHLD);
+    }
+
+    /* Wake specific-child waiter */
+    if (proc->waiter_reply != 0) {
+        struct salty_msg wake_reply;
+        wake_reply.label = SALTY_OK;
+        wake_reply.length = 2;
+        wake_reply.regs[0] = (uint64_t)exit_code;
+        wake_reply.regs[1] = (uint64_t)proc->pid;
+        for (int i = 2; i < 20; i++) wake_reply.regs[i] = 0;
+
+        salty_send(proc->waiter_reply, &wake_reply);
+        salty_cnode_delete(CAP_SELF_CSPACE, proc->waiter_reply);
+        proc->waiter_reply = 0;
+        proc->waiter_pid = 0;
+        cleanup_proc_resources(proc);
+        return;
+    }
+
+    /* Wake any-child waiter on parent */
+    if (parent && parent->waiting_for_any) {
+        struct salty_msg wake_reply;
+        wake_reply.label = SALTY_OK;
+        wake_reply.length = 2;
+        wake_reply.regs[0] = (uint64_t)exit_code;
+        wake_reply.regs[1] = (uint64_t)proc->pid;
+        for (int i = 2; i < 20; i++) wake_reply.regs[i] = 0;
+
+        salty_send(parent->any_waiter_reply, &wake_reply);
+        salty_cnode_delete(CAP_SELF_CSPACE, parent->any_waiter_reply);
+        parent->any_waiter_reply = 0;
+        parent->waiting_for_any = 0;
+        cleanup_proc_resources(proc);
+        return;
+    }
+}
+
+/* handle_kill: send a signal to a process.
+ *   regs[0] = target PID
+ *   regs[1] = signal number
+ */
+static void handle_kill(const struct salty_msg *msg, struct salty_msg *reply, uint64_t badge) {
+    (void)badge;
+    uint32_t target_pid = (uint32_t)msg->regs[0];
+    int sig = (int)msg->regs[1];
+
+    if (sig <= 0 || sig >= _PM_NSIG) {
+        reply->label = SALTY_INVALID_ARGUMENT;
+        return;
+    }
+
+    struct process *target = find_proc_by_pid(target_pid);
+    if (!target || (target->state != PROC_RUNNING && target->state != PROC_STOPPED)) {
+        reply->label = SALTY_NOT_FOUND;
+        return;
+    }
+
+    /* SIGKILL: always terminate, cannot be caught or ignored */
+    if (sig == _PM_SIGKILL) {
+        sig_terminate_proc(target, sig);
+        reply->label = SALTY_OK;
+        reply->length = 0;
+        return;
+    }
+
+    /* SIGSTOP: cannot be caught or ignored, always stops the process */
+    if (sig == _PM_SIGSTOP) {
+        if (target->state == PROC_RUNNING) {
+            salty_invoke(target->tcb_cap, TCB_SUSPEND, 0, 0, 0, 0);
+            target->state = PROC_STOPPED;
+            target->stop_status = (sig << 8) | 0x7f;  /* __W_STOPCODE(sig) */
+
+            /* Deliver SIGCHLD to parent */
+            struct process *parent = find_proc_by_pid(target->ppid);
+            if (parent && (parent->state == PROC_RUNNING || parent->state == PROC_STOPPED) &&
+                parent->signal_ntfn != 0 &&
+                parent->sig_disposition[_PM_SIGCHLD] == SIG_DISP_CATCH) {
+                salty_signal(parent->signal_ntfn, 1ULL << _PM_SIGCHLD);
+            }
+        }
+        reply->label = SALTY_OK;
+        reply->length = 0;
+        return;
+    }
+
+    /* SIGCONT: resume stopped processes */
+    if (sig == _PM_SIGCONT) {
+        if (target->state == PROC_STOPPED) {
+            salty_invoke(target->tcb_cap, TCB_RESUME, 0, 0, 0, 0);
+            target->state = PROC_RUNNING;
+            target->stop_status = 0;
+
+            /* Deliver SIGCHLD to parent */
+            struct process *parent = find_proc_by_pid(target->ppid);
+            if (parent && (parent->state == PROC_RUNNING || parent->state == PROC_STOPPED) &&
+                parent->signal_ntfn != 0 &&
+                parent->sig_disposition[_PM_SIGCHLD] == SIG_DISP_CATCH) {
+                salty_signal(parent->signal_ntfn, 1ULL << _PM_SIGCHLD);
+            }
+        }
+        /* If target has CATCH disposition for SIGCONT, also deliver notification */
+        if (target->sig_disposition[sig] == SIG_DISP_CATCH &&
+            target->signal_ntfn != 0) {
+            salty_signal(target->signal_ntfn, 1ULL << sig);
+        }
+        reply->label = SALTY_OK;
+        reply->length = 0;
+        return;
+    }
+
+    /* Cannot deliver most signals to stopped processes */
+    if (target->state != PROC_RUNNING) {
+        reply->label = SALTY_OK;
+        reply->length = 0;
+        return;
+    }
+
+    uint8_t disp = target->sig_disposition[sig];
+
+    if (disp == SIG_DISP_IGN) {
+        reply->label = SALTY_OK;
+        reply->length = 0;
+        return;
+    }
+
+    if (disp == SIG_DISP_DFL) {
+        if (sig_default_is_terminate(sig)) {
+            sig_terminate_proc(target, sig);
+        }
+        reply->label = SALTY_OK;
+        reply->length = 0;
+        return;
+    }
+
+    /* SIG_DISP_CATCH: deliver via notification */
+    if (target->signal_ntfn != 0) {
+        salty_signal(target->signal_ntfn, 1ULL << sig);
+    }
+
+    reply->label = SALTY_OK;
+    reply->length = 0;
+}
+
+/* handle_sigaction: set signal disposition for calling process.
+ *   regs[0] = signal number
+ *   regs[1] = disposition (0=DFL, 1=IGN, 2=CATCH)
+ */
+static void handle_sigaction(const struct salty_msg *msg, struct salty_msg *reply, uint64_t badge) {
+    int sig = (int)msg->regs[0];
+    uint8_t disp = (uint8_t)msg->regs[1];
+
+    if (sig <= 0 || sig >= _PM_NSIG || sig == _PM_SIGKILL || sig == _PM_SIGSTOP) {
+        reply->label = SALTY_INVALID_ARGUMENT;
+        return;
+    }
+
+    if (disp > SIG_DISP_CATCH) {
+        reply->label = SALTY_INVALID_ARGUMENT;
+        return;
+    }
+
+    struct process *proc = find_proc_by_badge(badge);
+    if (!proc) {
+        reply->label = SALTY_NOT_FOUND;
+        return;
+    }
+
+    proc->sig_disposition[sig] = disp;
+    reply->label = SALTY_OK;
+    reply->length = 0;
 }
 
 /* handle_fork: Create a child process that is a copy of the caller.
@@ -1005,6 +1285,7 @@ static void handle_fork(const struct salty_msg *msg, struct salty_msg *reply,
     cap_t child_cn     = base + CAP_OFF_CNODE;
     cap_t child_sc     = base + CAP_OFF_SC;
     cap_t child_ipc_fr = base + CAP_OFF_IPC_FR;
+    cap_t child_sig_ntfn = base + CAP_OFF_SIGNAL_NTFN;
 
     int err;
 
@@ -1018,6 +1299,8 @@ static void handle_fork(const struct salty_msg *msg, struct salty_msg *reply,
     err = salty_untyped_retype(CAP_UNTYPED, OBJ_SCHED_CONTEXT, 0, child_sc);
     if (err) { reply->label = SALTY_OUT_OF_MEMORY; return; }
     err = salty_untyped_retype(CAP_UNTYPED, OBJ_FRAME, 0, child_ipc_fr);
+    if (err) { reply->label = SALTY_OUT_OF_MEMORY; return; }
+    err = salty_untyped_retype(CAP_UNTYPED, OBJ_NOTIFICATION, 0, child_sig_ntfn);
     if (err) { reply->label = SALTY_OUT_OF_MEMORY; return; }
 
     /* 2. Walk parent VSpace and copy all user pages into child VSpace */
@@ -1193,6 +1476,11 @@ static void handle_fork(const struct salty_msg *msg, struct salty_msg *reply,
                            child_cn, CHILD_CAP_UNTYPED, CAP_RIGHTS_ALL);
     if (err) { salty_serial_puts("[PROCMGR] FORK: copy Untyped failed\n"); }
 
+    /* Signal notification */
+    err = salty_cnode_copy(CAP_SELF_CSPACE, child_sig_ntfn,
+                           child_cn, CHILD_CAP_SIGNAL_NTFN, CAP_RIGHTS_ALL);
+    if (err) { salty_serial_puts("[PROCMGR] FORK: copy signal ntfn failed\n"); }
+
     /* 5. Configure child TCB */
     err = salty_tcb_set_space(child_tcb, child_cn, child_vs);
     if (err) {
@@ -1236,6 +1524,10 @@ static void handle_fork(const struct salty_msg *msg, struct salty_msg *reply,
     child->sc_cap = child_sc;
     child->waiter_reply = 0;
     child->waiter_pid = 0;
+    child->signal_ntfn = child_sig_ntfn;
+    /* Fork inherits parent's signal dispositions (POSIX) */
+    for (int i = 0; i < _PM_NSIG; i++)
+        child->sig_disposition[i] = parent->sig_disposition[i];
 
     salty_serial_puts("[PROCMGR] FORK: child PID=");
     salty_serial_hex((uint64_t)child_pid);
@@ -1522,6 +1814,13 @@ static void handle_exec(const struct salty_msg *msg, struct salty_msg *reply,
      * Use TCB_CONFIGURE so the kernel rebuilds the usermode trampoline
      * context (r12/r13/r14/r15 + ring3 iret path). */
     salty_tcb_suspend(proc->tcb_cap);
+
+    /* POSIX: exec resets caught signals to SIG_DFL; SIG_IGN persists */
+    for (int i = 0; i < _PM_NSIG; i++) {
+        if (proc->sig_disposition[i] == SIG_DISP_CATCH)
+            proc->sig_disposition[i] = SIG_DISP_DFL;
+    }
+
     err = salty_tcb_configure(proc->tcb_cap, new_entry, new_rsp, 0);
     if (err) {
         salty_serial_puts("[PROCMGR] EXEC: tcb_configure failed\n");
@@ -1637,6 +1936,12 @@ void _start(void) {
             break;
         case PM_GETPPID:
             handle_getppid(&reply, badge);
+            break;
+        case PM_KILL:
+            handle_kill(&msg, &reply, badge);
+            break;
+        case PM_SIGACTION:
+            handle_sigaction(&msg, &reply, badge);
             break;
         default:
             salty_serial_puts("[PROCMGR] unknown label=");

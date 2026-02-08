@@ -127,7 +127,7 @@ void _start(void) {
     serial_num(status);
     serial_puts("\n");
 
-    if (ret != pid || status != 7) {
+    if (ret != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 7) {
         serial_puts("[TEST_FORK] FAIL: waitpid\n");
         posix_exit(1);
     }
@@ -161,8 +161,8 @@ void _start(void) {
         serial_puts("[TEST_FORK] FAIL: waitpid for exec'd child\n");
         posix_exit(1);
     }
-    /* hello.elf exits with code 42, so status2 should be 42 */
-    if (status2 == 42) {
+    /* hello.elf exits with code 42; wstatus = (42 << 8) | 0 */
+    if (WIFEXITED(status2) && WEXITSTATUS(status2) == 42) {
         serial_puts("[TEST_FORK] Test 4: PASS (hello exited 42)\n");
     } else {
         serial_puts("[TEST_FORK] Test 4: PASS (exec child exited)\n");

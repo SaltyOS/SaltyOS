@@ -1493,7 +1493,7 @@ static void phase4_spawn_servers(cap_t ut) {
      * ================================================================ */
     salty_serial_puts("\n[INIT] Phase 5: Running userland runtime tests\n");
     {
-        const char *tests[] = { "hello", "fstest", "mmap_test", "test_fork" };
+        const char *tests[] = { "hello", "fstest", "mmap_test", "test_fork", "test_signal" };
         const int test_count = (int)(sizeof(tests) / sizeof(tests[0]));
 
         for (int i = 0; i < test_count; i++) {
@@ -1515,7 +1515,8 @@ static void phase4_spawn_servers(cap_t ut) {
             salty_serial_hex((uint64_t)status);
             salty_serial_puts("\n");
 
-            if (status != 42) {
+            /* status is POSIX wstatus: normal exit = (code << 8) | 0 */
+            if (!(((status & 0x7f) == 0) && (((status >> 8) & 0xff) == 42))) {
                 salty_serial_puts("[INIT] FAIL: unexpected exit code from ");
                 salty_serial_puts(tests[i]);
                 salty_serial_puts("\n");

@@ -8,6 +8,13 @@
 
 #include "salty.h"
 
+/* Signal handler table (shared across all TUs in dynamically-linked binaries).
+ * Types and _NSIG must match posix.h declarations. */
+typedef void (*sighandler_t)(int);
+#define _NSIG 32
+sighandler_t __sig_handlers[_NSIG];
+int __sig_initialized;
+
 /* Default IPC context for dynamically linked binaries.
  * Single-threaded services can use this directly; multi-threaded code should
  * use explicit *_ctx helpers with per-thread contexts.
