@@ -216,6 +216,15 @@ pub fn timer_tick() {
     scheduler().timer_tick();
 }
 
+/// Handle reschedule IPI
+///
+/// Called by the IPI handler when a reschedule IPI is received.
+/// Checks the ready queue for work on this CPU without requiring
+/// a sched_context (works correctly for idle threads).
+pub fn handle_reschedule_ipi() {
+    scheduler().handle_reschedule_ipi();
+}
+
 /// Get global scheduler instance
 fn scheduler() -> &'static mut scheduler::Scheduler {
     scheduler::scheduler()

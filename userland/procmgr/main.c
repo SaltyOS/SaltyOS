@@ -164,7 +164,7 @@ struct process {
 };
 
 static struct process proctab[MAX_PROCESSES];
-static uint32_t next_pid = 1;
+static uint32_t next_pid = 2;
 
 static struct process *find_proc_by_badge(uint64_t badge) {
     for (int i = 0; i < MAX_PROCESSES; i++) {
@@ -226,7 +226,7 @@ static void cleanup_proc_resources(struct process *proc) {
     proc->state = PROC_FREE;
 }
 
-static void handle_spawn(const struct salty_msg *msg, struct salty_msg *reply) {
+static void handle_spawn(const struct salty_msg *msg, struct salty_msg *reply, uint64_t badge) {
     /* Extract ELF name: regs[0] = length, regs[1..] = packed name bytes */
     uint8_t name_len = (uint8_t)msg->regs[0];
     if (name_len > MAX_NAME_LEN) name_len = MAX_NAME_LEN;
@@ -274,6 +274,18 @@ static void handle_spawn(const struct salty_msg *msg, struct salty_msg *reply) {
     salty_serial_puts("[PROCMGR] Found ELF (");
     salty_serial_hex(elf_entry.data_len);
     salty_serial_puts(" bytes)\n");
+
+    /* Identify the caller by badge; auto-register if unknown (e.g. init) */
+    struct process *caller = find_proc_by_badge(badge);
+    if (!caller && badge != 0) {
+        caller = alloc_proc();
+        if (caller) {
+            caller->pid = (uint32_t)badge;
+            caller->ppid = 0;
+            caller->state = PROC_RUNNING;
+            caller->badge = badge;
+        }
+    }
 
     /* Allocate process slot */
     struct process *proc = alloc_proc();
@@ -506,9 +518,9 @@ static void handle_spawn(const struct salty_msg *msg, struct salty_msg *reply) {
     }
 
     /* Child slot 3 = Procmgr EP (badged with PID for identity) */
-    uint64_t badge = (uint64_t)pid;
+    uint64_t child_badge = (uint64_t)pid;
     err = salty_cnode_mint(CAP_SELF_CSPACE, CAP_SERVER_EP,
-                           child_cn, CHILD_CAP_EP, badge);
+                           child_cn, CHILD_CAP_EP, child_badge);
     if (err != 0) {
         salty_serial_puts("[PROCMGR] mint EP cap failed err=");
         salty_serial_hex((uint64_t)err);
@@ -661,10 +673,10 @@ static void handle_spawn(const struct salty_msg *msg, struct salty_msg *reply) {
 
     /* Record in process table */
     proc->pid = pid;
-    proc->ppid = 0; /* Spawned by procmgr, no parent process */
+    proc->ppid = caller ? caller->pid : 0;
     proc->state = PROC_RUNNING;
     proc->exit_code = 0;
-    proc->badge = badge;
+    proc->badge = child_badge;
     proc->tcb_cap = child_tcb;
     proc->vspace_cap = child_vs;
     proc->cnode_cap = child_cn;
@@ -1602,7 +1614,7 @@ void _start(void) {
 
         switch (msg.label) {
         case PM_SPAWN:
-            handle_spawn(&msg, &reply);
+            handle_spawn(&msg, &reply, badge);
             break;
         case PM_EXIT:
             handle_exit(&msg, &reply, badge);

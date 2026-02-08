@@ -1064,6 +1064,10 @@ fn syscall_tcb_configure(
         return SyscallResult::err(e);
     }
 
+    if let Err(e) = validate_ipc_buffer_addr(ipc_buffer) {
+        return SyscallResult::err(e);
+    }
+
     unsafe {
         let tcb = &mut *(cap.object as *mut Tcb);
 
@@ -1352,12 +1356,32 @@ fn syscall_tcb_set_priority(cap: &Capability, priority: u64) -> SyscallResult {
     SyscallResult::ok(0)
 }
 
+/// Validate IPC buffer address
+///
+/// Must be 0 (no buffer), or page-aligned and in user-space address range.
+fn validate_ipc_buffer_addr(addr: u64) -> Result<(), SyscallError> {
+    if addr == 0 {
+        return Ok(());
+    }
+    if addr & 0xFFF != 0 {
+        return Err(SyscallError::InvalidArgument);
+    }
+    if addr >= 0x0000_8000_0000_0000 {
+        return Err(SyscallError::InvalidArgument);
+    }
+    Ok(())
+}
+
 /// TCB_SET_IPC_BUFFER: Change IPC buffer address
 ///
 /// Args:
 /// - addr: New IPC buffer virtual address
 fn syscall_tcb_set_ipc_buffer(cap: &Capability, addr: u64) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::CONFIGURE) {
+        return SyscallResult::err(e);
+    }
+
+    if let Err(e) = validate_ipc_buffer_addr(addr) {
         return SyscallResult::err(e);
     }
 
@@ -1682,10 +1706,13 @@ fn syscall_ioport_in8(cap: &Capability, offset: u64) -> SyscallResult {
 
     unsafe {
         let ioport = &*(cap.object as *const IoPortRange);
-        if offset as u16 >= ioport.num_ports {
+        if offset >= ioport.num_ports as u64 {
             return SyscallResult::err(SyscallError::OutOfRange);
         }
-        let port = ioport.base_port + offset as u16;
+        let port = match ioport.base_port.checked_add(offset as u16) {
+            Some(p) => p,
+            None => return SyscallResult::err(SyscallError::OutOfRange),
+        };
         let val: u8;
         core::arch::asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack));
         SyscallResult::ok(val as u64)
@@ -1704,10 +1731,13 @@ fn syscall_ioport_out8(cap: &Capability, offset: u64, value: u64) -> SyscallResu
 
     unsafe {
         let ioport = &*(cap.object as *const IoPortRange);
-        if offset as u16 >= ioport.num_ports {
+        if offset >= ioport.num_ports as u64 {
             return SyscallResult::err(SyscallError::OutOfRange);
         }
-        let port = ioport.base_port + offset as u16;
+        let port = match ioport.base_port.checked_add(offset as u16) {
+            Some(p) => p,
+            None => return SyscallResult::err(SyscallError::OutOfRange),
+        };
         core::arch::asm!("out dx, al", in("al") value as u8, in("dx") port, options(nomem, nostack));
     }
 
@@ -1725,10 +1755,13 @@ fn syscall_ioport_in16(cap: &Capability, offset: u64) -> SyscallResult {
 
     unsafe {
         let ioport = &*(cap.object as *const IoPortRange);
-        if offset as u16 + 1 >= ioport.num_ports {
+        if offset + 1 >= ioport.num_ports as u64 {
             return SyscallResult::err(SyscallError::OutOfRange);
         }
-        let port = ioport.base_port + offset as u16;
+        let port = match ioport.base_port.checked_add(offset as u16) {
+            Some(p) => p,
+            None => return SyscallResult::err(SyscallError::OutOfRange),
+        };
         let val: u16;
         core::arch::asm!("in ax, dx", out("ax") val, in("dx") port, options(nomem, nostack));
         SyscallResult::ok(val as u64)
@@ -1747,10 +1780,13 @@ fn syscall_ioport_out16(cap: &Capability, offset: u64, value: u64) -> SyscallRes
 
     unsafe {
         let ioport = &*(cap.object as *const IoPortRange);
-        if offset as u16 + 1 >= ioport.num_ports {
+        if offset + 1 >= ioport.num_ports as u64 {
             return SyscallResult::err(SyscallError::OutOfRange);
         }
-        let port = ioport.base_port + offset as u16;
+        let port = match ioport.base_port.checked_add(offset as u16) {
+            Some(p) => p,
+            None => return SyscallResult::err(SyscallError::OutOfRange),
+        };
         core::arch::asm!("out dx, ax", in("ax") value as u16, in("dx") port, options(nomem, nostack));
     }
 

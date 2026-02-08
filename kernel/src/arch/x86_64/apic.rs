@@ -931,8 +931,7 @@ pub fn handle_ipi(kind: IpiKind) {
             }
         }
         IpiKind::Reschedule => {
-            // Trigger a reschedule check on this CPU via the timer_tick path
-            crate::sched::timer_tick();
+            crate::sched::handle_reschedule_ipi();
         }
     }
 }

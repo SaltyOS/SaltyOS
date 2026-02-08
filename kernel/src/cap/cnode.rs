@@ -198,7 +198,10 @@ impl CNode {
         let dest_slot = alloc_slot().ok_or(CapError::OutOfSlots)?;
 
         // Perform copy (this updates CDT and refcount)
-        src_cap.copy(src_ref.slot, new_rights, dest_slot)?;
+        if let Err(e) = src_cap.copy(src_ref.slot, new_rights, dest_slot) {
+            free_slot(dest_slot);
+            return Err(e);
+        }
 
         // Insert reference into destination CNode
         unsafe {
@@ -238,7 +241,10 @@ impl CNode {
         let dest_slot = alloc_slot().ok_or(CapError::OutOfSlots)?;
 
         // Perform mint (this updates CDT and refcount)
-        src_cap.mint(src_ref.slot, badge, new_rights, dest_slot)?;
+        if let Err(e) = src_cap.mint(src_ref.slot, badge, new_rights, dest_slot) {
+            free_slot(dest_slot);
+            return Err(e);
+        }
 
         // Insert reference into destination CNode
         unsafe {
@@ -291,18 +297,19 @@ impl CNode {
         src: usize,
         new_badge: u64,
     ) -> Result<(), CapError> {
-        // First do the move
-        self.move_slot(dest, src_cnode, src)?;
-
-        // Then modify the badge on the moved capability
-        let cap_ref = self.get_ref(dest).ok_or(CapError::SlotEmpty)?;
-        let cap = get_cap_mut(cap_ref.slot);
-
-        // Only endpoints can be badged
-        if cap.obj_type != super::ObjectType::Endpoint {
+        // Validate source is an endpoint BEFORE moving (atomicity)
+        let src_ref = src_cnode.get_ref(src).ok_or(CapError::SlotEmpty)?;
+        let src_cap = src_ref.get();
+        if src_cap.obj_type != super::ObjectType::Endpoint {
             return Err(CapError::InvalidOperation);
         }
 
+        // Now safe to move — type is validated
+        self.move_slot(dest, src_cnode, src)?;
+
+        // Set badge on the moved capability
+        let cap_ref = self.get_ref(dest).ok_or(CapError::SlotEmpty)?;
+        let cap = get_cap_mut(cap_ref.slot);
         cap.badge = new_badge;
         Ok(())
     }

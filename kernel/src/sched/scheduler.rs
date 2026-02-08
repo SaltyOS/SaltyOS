@@ -262,13 +262,16 @@ impl Scheduler {
             return false;
         }
         unsafe {
-            // Check that the head of the ready queue can actually run on this CPU
-            let head = self.ready_head;
-            let affinity = (*head).cpu_affinity;
-            if affinity != 0xFFFF_FFFF && affinity as usize != cpu_id {
-                return false;
+            // Walk the ready queue to find the first thread compatible with this CPU
+            let mut node = self.ready_head;
+            while !node.is_null() {
+                let affinity = (*node).cpu_affinity;
+                if affinity == 0xFFFF_FFFF || affinity as usize == cpu_id {
+                    return (*node).priority < (*current).priority;
+                }
+                node = (*node).next;
             }
-            (*head).priority < (*current).priority
+            false
         }
     }
 
@@ -366,6 +369,42 @@ impl Scheduler {
                     self.do_context_switch(old_tcb, new_tcb);
                     return;
                 }
+            }
+        }
+
+        self.unlock();
+        unsafe { crate::mm::restore_irq(irq_flag) };
+    }
+
+    /// Handle reschedule IPI — checks ready queue for work on this CPU.
+    ///
+    /// Unlike timer_tick(), this does not require a sched_context, so it
+    /// works correctly when the current thread is the idle thread.
+    pub fn handle_reschedule_ipi(&mut self) {
+        let irq_flag = unsafe { crate::mm::save_irq_disable() };
+        self.lock();
+
+        unsafe {
+            let cpu_id = crate::arch::current_cpu() as usize;
+            let current = self.current[cpu_id];
+            if current.is_null() {
+                self.unlock();
+                crate::mm::restore_irq(irq_flag);
+                return;
+            }
+
+            // Re-enqueue current if it's a real thread (not idle)
+            if current != self.idle[cpu_id] {
+                self.enqueue_unlocked(current);
+            }
+
+            let new_tcb = self.schedule_unlocked();
+            if current != new_tcb {
+                self.set_current(new_tcb);
+                self.unlock();
+                crate::mm::restore_irq(irq_flag);
+                self.do_context_switch(current, new_tcb);
+                return;
             }
         }
 

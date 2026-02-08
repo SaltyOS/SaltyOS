@@ -1467,6 +1467,19 @@ static void phase4_spawn_servers(cap_t ut) {
         }
     }
 
+    /* Mint a badged EP so procmgr can identify init (badge=1 → PID 1) */
+    {
+        cap_t pm_badged_slot = init_dyn_frame_next++;
+        int merr = salty_cnode_mint(CAP_SELF_CSPACE, pm_ep,
+                                     CAP_SELF_CSPACE, pm_badged_slot, 1);
+        if (merr == 0) {
+            pm_ep = pm_badged_slot;
+            salty_serial_puts("[INIT] Minted badged PM EP (badge=1)\n");
+        } else {
+            salty_serial_puts("[INIT] WARN: mint badged PM EP failed\n");
+        }
+    }
+
     /* Let procmgr start up */
     salty_yield();
 
