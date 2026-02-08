@@ -48,7 +48,7 @@ impl Endpoint {
 
     /// Cache the current thread's receive-slot configuration from its IPC buffer.
     /// This must be called while the thread is current (its VSpace is active).
-    unsafe fn cache_receive_slot(tcb: *mut Tcb) {
+    pub(crate) unsafe fn cache_receive_slot(tcb: *mut Tcb) {
         unsafe {
             if tcb.is_null() {
                 return;
@@ -473,6 +473,47 @@ impl Endpoint {
             return true;
         }
         false
+    }
+
+    // ---------------------------------------------------------------
+    // Fastpath helpers — direct queue access without blocking/rescheduling
+    // ---------------------------------------------------------------
+
+    /// Pop a receiver from the recv queue (fastpath).
+    /// Returns None if queue is empty.
+    pub(crate) fn fastpath_pop_recv(&mut self) -> Option<*mut Tcb> {
+        self.recv_queue.pop()
+    }
+
+    /// Push a receiver back to front of recv queue (fastpath rollback).
+    pub(crate) fn fastpath_push_recv(&mut self, tcb: *mut Tcb) {
+        self.recv_queue.push_front(tcb);
+    }
+
+    /// Pop a sender from the send queue (fastpath).
+    /// Returns None if queue is empty.
+    pub(crate) fn fastpath_pop_send(&mut self) -> Option<*mut Tcb> {
+        self.send_queue.pop()
+    }
+
+    /// Push a sender back to front of send queue (fastpath rollback).
+    pub(crate) fn fastpath_push_send(&mut self, tcb: *mut Tcb) {
+        self.send_queue.push_front(tcb);
+    }
+
+    /// Check if recv queue is empty (fastpath).
+    pub(crate) fn fastpath_recv_queue_empty(&self) -> bool {
+        self.recv_queue.is_empty()
+    }
+
+    /// Check if send queue is empty (fastpath).
+    pub(crate) fn fastpath_send_queue_empty(&self) -> bool {
+        self.send_queue.is_empty()
+    }
+
+    /// Set endpoint state (fastpath).
+    pub(crate) fn fastpath_set_state(&mut self, state: EndpointState) {
+        self.state = state;
     }
 
     /// Cleanup when endpoint is destroyed

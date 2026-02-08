@@ -41,6 +41,17 @@ impl WaitQueue {
         }
     }
 
+    /// Push thread to front of queue (used for fastpath bail rollback)
+    pub fn push_front(&mut self, tcb: *mut Tcb) {
+        unsafe {
+            (*tcb).next = self.head;
+            self.head = tcb;
+            if self.tail.is_null() {
+                self.tail = tcb;
+            }
+        }
+    }
+
     /// Pop thread from front of queue
     pub fn pop(&mut self) -> Option<*mut Tcb> {
         if self.head.is_null() {

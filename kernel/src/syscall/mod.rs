@@ -4,6 +4,8 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+pub mod fastpath;
+
 use crate::cap::{CapError, CapRights, Capability, CNode, FrameObject, IoPortRange, ObjectType, UntypedMemory};
 use crate::ipc::{Endpoint, EndpointState, Message, Notification};
 use crate::mm::vspace::{PageFlags, VSpace, VSpaceError};
@@ -142,7 +144,7 @@ pub enum SyscallError {
 /// # Returns
 /// * `Ok(&Capability)` - Reference to the capability
 /// * `Err(SyscallError::InvalidCapability)` - Slot is empty or CSpace is null
-fn lookup_capability(cap_ptr: u64) -> Result<&'static Capability, SyscallError> {
+pub(crate) fn lookup_capability(cap_ptr: u64) -> Result<&'static Capability, SyscallError> {
     unsafe {
         // Get current thread's TCB
         let scheduler = crate::sched::scheduler::scheduler();
@@ -213,7 +215,7 @@ fn validate_capability(
 /// * `Err(SyscallError::InvalidCapability)` - Null capability
 /// * `Err(SyscallError::InvalidOperation)` - Not an endpoint
 /// * `Err(SyscallError::InsufficientRights)` - Missing required rights
-fn validate_endpoint_cap(
+pub(crate) fn validate_endpoint_cap(
     cap: &Capability,
     required_rights: CapRights,
 ) -> Result<(), SyscallError> {
@@ -303,7 +305,7 @@ fn construct_message(
 ///   msg[6..21] = regs[4..19] (overflow)
 ///
 /// Badge is written to ipc_buffer.badge.
-unsafe fn write_msg_to_ipc_buffer(msg: &Message, badge: u64) {
+pub(crate) unsafe fn write_msg_to_ipc_buffer(msg: &Message, badge: u64) {
     unsafe {
         let scheduler = crate::sched::scheduler::scheduler();
         let current = scheduler.current();

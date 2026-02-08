@@ -23,7 +23,7 @@ This dual-primitive design follows the L4/seL4 tradition, providing both reliabl
 | IPC buffer overflow (MR4-MR19) | Implemented |
 | Capability transfer via IPC | Implemented |
 | Fault delivery via endpoint | Implemented |
-| IPC assembly fastpath | Not yet implemented |
+| IPC assembly fastpath | Implemented |
 
 ## Synchronous IPC (Endpoints)
 
@@ -272,4 +272,4 @@ Each IRQ handler object binds to a notification. When the IRQ fires, the kernel 
 2. **Direct switch**: Skip scheduler for IPC rendezvous
 3. **Lazy FPU**: Don't save FPU unless used
 4. **No allocation**: All structures pre-allocated
-5. **Future: Assembly fastpath**: Inline assembly for hot path (not yet implemented)
+5. **Assembly fastpath**: Hybrid asm/Rust fastpath for Call + ReplyRecv (short messages, no cap transfer)

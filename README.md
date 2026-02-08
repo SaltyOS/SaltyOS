@@ -43,9 +43,9 @@ SaltyOS is a capability-based microkernel designed with security and modularity 
 - [x] **Userspace servers** (procmgr, vfs, nameserv)
 - [x] **SMP** (ACPI MADT discovery, AP trampoline, per-CPU GDT/TSS, APIC timer, IPI reschedule/VSpace teardown, CPU affinity)
 
-### In Progress
+### Recently Completed
 
-- [ ] IPC assembly fastpath
+- [x] **IPC assembly fastpath** (hybrid asm/Rust for Call + ReplyRecv, short messages, no cap transfer)
 
 ## Architecture
 

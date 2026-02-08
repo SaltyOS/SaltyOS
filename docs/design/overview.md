@@ -216,14 +216,12 @@ Standard L4/seL4 uses inline capabilities (single word). We chose fat capabiliti
 - Init process with multi-phase bootstrap
 - Console server (serial I/O via IoPort caps)
 - Runtime dynamic linker (rtld)
-
-### In Progress
-- SMP support (ACPI MADT parser, AP trampoline, per-CPU queues)
+- SMP support (ACPI MADT parser, AP trampoline, per-CPU queues, IPI reschedule)
 
 ## Future Directions
 
 1. **Formal Verification**: seL4-style proofs for critical paths
-2. **IPC Assembly Fastpath**: Register-to-register transfer in assembly for < 500 cycle IPC
+2. **IPC Assembly Fastpath**: Implemented — hybrid asm/Rust fastpath for Call + ReplyRecv
 3. **Nested Virtualization**: Hypervisor mode for VMs
 4. **Network Stack**: Userspace TCP/IP implementation
 5. **GUI Compositor**: Wayland-like display server

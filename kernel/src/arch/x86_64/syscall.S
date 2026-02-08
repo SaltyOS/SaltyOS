@@ -60,6 +60,22 @@ syscall_entry:
     # 16 pushes (user_rsp + 15 GPRs) = 128 bytes = 16-byte aligned!
 
     # --------------------------------------------------------------------------
+    # IPC Fastpath Dispatch
+    # --------------------------------------------------------------------------
+    # At this point, all GPRs still hold their original user-space values
+    # (push copies to stack but does not modify the register).
+    #
+    # Check for Call (2) or ReplyRecv (3) — the client-server hot path.
+    # Fastpath functions use System V ABI:
+    #   RDI=cap_ptr  RSI=msg_info  RDX=mr0  RCX=mr1  R8=mr2  R9=mr3
+    # Only R10→RCX needs remapping.
+    cmp $2, %rax
+    je .Lfastpath_call
+    cmp $3, %rax
+    je .Lfastpath_reply_recv
+
+.Lslowpath:
+    # --------------------------------------------------------------------------
     # ABI Translation (User Syscall ABI -> System V ABI)
     # --------------------------------------------------------------------------
     # Mapping:
@@ -100,6 +116,7 @@ syscall_entry:
     mov %rax, 0(%rsp)   # error  → will be popped into %rax
     mov %rdx, 24(%rsp)  # value  → will be popped into %rdx
 
+.Lreturn:
     # --------------------------------------------------------------------------
     # Context Restoration
     # --------------------------------------------------------------------------
@@ -126,5 +143,62 @@ syscall_entry:
     # sysretq loads RIP from RCX and RFLAGS from R11
     swapgs
     sysretq
+
+    # --------------------------------------------------------------------------
+    # Fastpath: Call (syscall 2)
+    # --------------------------------------------------------------------------
+    # Register state: RDI=cap_ptr RSI=msg_info RDX=mr0 R10=mr1 R8=mr2 R9=mr3
+    # Remap R10 → RCX for System V, then call fastpath_call_rust.
+    # Returns FastpathResult { status: u64, value: u64 } in RAX:RDX.
+    # If status == 0, fall through to slowpath (all regs still on stack).
+.Lfastpath_call:
+    mov %r10, %rcx
+    call fastpath_call_rust
+    test %rax, %rax
+    jz .Lfastpath_call_bail
+    # Fastpath succeeded: write return values to stack slots
+    movq $0, 0(%rsp)           # saved RAX = 0 (no error)
+    mov %rdx, 24(%rsp)         # saved RDX = return value
+    jmp .Lreturn
+
+.Lfastpath_call_bail:
+    # Restore original register values from stack for slowpath.
+    # The fastpath Rust function follows C ABI and preserves callee-saved
+    # regs (rbx, rbp, r12-r15), but may have clobbered caller-saved regs
+    # (rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11).
+    # Reload from stack: [0]=rax [8]=rbx [16]=rcx [24]=rdx [32]=rsi
+    # [40]=rdi [48]=rbp [56]=r8 [64]=r9 [72]=r10 [80]=r11
+    mov 0(%rsp), %rax
+    mov 24(%rsp), %rdx
+    mov 32(%rsp), %rsi
+    mov 40(%rsp), %rdi
+    mov 56(%rsp), %r8
+    mov 64(%rsp), %r9
+    mov 72(%rsp), %r10
+    jmp .Lslowpath
+
+    # --------------------------------------------------------------------------
+    # Fastpath: ReplyRecv (syscall 3)
+    # --------------------------------------------------------------------------
+.Lfastpath_reply_recv:
+    mov %r10, %rcx
+    call fastpath_reply_recv_rust
+    test %rax, %rax
+    jz .Lfastpath_reply_recv_bail
+    # Fastpath succeeded
+    movq $0, 0(%rsp)           # saved RAX = 0 (no error)
+    mov %rdx, 24(%rsp)         # saved RDX = badge
+    jmp .Lreturn
+
+.Lfastpath_reply_recv_bail:
+    # Restore clobbered registers for slowpath
+    mov 0(%rsp), %rax
+    mov 24(%rsp), %rdx
+    mov 32(%rsp), %rsi
+    mov 40(%rsp), %rdi
+    mov 56(%rsp), %r8
+    mov 64(%rsp), %r9
+    mov 72(%rsp), %r10
+    jmp .Lslowpath
 
 .size syscall_entry, . - syscall_entry

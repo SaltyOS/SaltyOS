@@ -45,16 +45,6 @@ macro_rules! boot_unwrap {
     };
 }
 
-/// Unwrap a Result during boot, halting with message on Err.
-macro_rules! boot_unwrap_result {
-    ($result:expr, $msg:expr) => {
-        match $result {
-            Ok(v) => v,
-            Err(_) => boot_fatal!($msg),
-        }
-    };
-}
-
 /// User code virtual address (4 MB)
 const INIT_CODE_VADDR: u64 = 0x0000_0040_0000;
 /// User stack virtual address (8 MB)
@@ -359,8 +349,8 @@ unsafe fn create_untyped_caps(cnode: &mut CNode, _info: &ParsedBootInfo) {
         };
 
         // Initialize the UntypedMemory object in static storage
-        let ut = &raw mut INIT_UNTYPEDS[ut_index];
-        (*ut) = UntypedMemory::new(base, size_bits, false);
+        let ut = unsafe { &raw mut INIT_UNTYPEDS[ut_index] };
+        unsafe { (*ut) = UntypedMemory::new(base, size_bits, false); }
 
         // Allocate a global cap slot and populate it
         let slot = boot_unwrap!(alloc_slot(), "untyped cap slot alloc failed");

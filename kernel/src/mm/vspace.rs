@@ -1281,7 +1281,7 @@ impl VSpace {
         // Only walk user half (PML4 entries 0..255)
         let start_pml4 = Self::pml4_index(vaddr);
 
-        'outer: for pml4_idx in start_pml4..USER_PML4_MAX {
+        for pml4_idx in start_pml4..USER_PML4_MAX {
             let pml4e = pml4.entry(pml4_idx);
             if pml4e & ENTRY_PRESENT == 0 {
                 // Skip to next PML4 region
