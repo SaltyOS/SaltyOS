@@ -7,7 +7,6 @@
 subdir('init')
 subdir('rtld')
 subdir('console')
-
 subdir('nameserv')
 subdir('procmgr')
 subdir('vfs')
