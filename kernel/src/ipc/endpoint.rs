@@ -195,7 +195,19 @@ impl Endpoint {
                     (msg, badge)
                 }
                 EndpointState::Idle | EndpointState::RecvBlocked => {
-                    // SLOWPATH: No sender - block receiver
+                    // SLOWPATH: No sender - check bound notification before blocking
+                    // If thread has a bound notification with pending bits, return
+                    // those immediately instead of blocking on the endpoint.
+                    if !(*current).bound_notification.is_null() {
+                        let ntfn = &mut *((*current).bound_notification
+                            as *mut super::Notification);
+                        let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
+                        if bits != 0 {
+                            // Return notification bits as badge, empty message
+                            return (Message::empty(), bits);
+                        }
+                    }
+
                     self.recv_queue.push(current);
                     self.state = EndpointState::RecvBlocked;
                     (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;

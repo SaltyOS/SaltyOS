@@ -245,6 +245,14 @@ impl Tcb {
         self.reply_tcb = core::ptr::null_mut();
         self.reply_can_grant = false;
         self.fault_handler = core::ptr::null_mut();
+
+        // Clear bound notification's back-pointer to prevent use-after-free
+        if !self.bound_notification.is_null() {
+            unsafe {
+                let ntfn = &mut *(self.bound_notification as *mut crate::ipc::Notification);
+                ntfn.bound_tcb = core::ptr::null_mut();
+            }
+        }
         self.bound_notification = core::ptr::null_mut();
     }
 }

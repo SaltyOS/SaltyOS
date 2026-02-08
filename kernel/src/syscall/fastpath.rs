@@ -269,7 +269,9 @@ pub unsafe extern "C" fn fastpath_reply_recv_rust(
         // If caller is null, no one to reply to — proceed to recv phase
 
         // ---- RECV PHASE ----
-        // Must have a sender waiting (SendBlocked)
+        // Must have a sender waiting (SendBlocked).
+        // If no senders, bail to slowpath which checks bound notification
+        // bits before blocking (combined IPC wait).
         if endpoint.state() != EndpointState::SendBlocked {
             return FastpathResult::slowpath();
         }

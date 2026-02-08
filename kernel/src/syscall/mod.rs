@@ -1413,7 +1413,15 @@ fn syscall_tcb_bind_notification(cap: &Capability, ntfn_cap_ptr: u64) -> Syscall
         if !tcb.bound_notification.is_null() {
             return SyscallResult::err(SyscallError::Busy);
         }
+
+        // Check if the notification already has a bound TCB
+        let ntfn = &mut *(ntfn_cap.object as *mut crate::ipc::Notification);
+        if !ntfn.bound_tcb.is_null() {
+            return SyscallResult::err(SyscallError::Busy);
+        }
+
         tcb.bound_notification = ntfn_cap.object as *mut u8;
+        ntfn.bound_tcb = tcb as *mut Tcb;
     }
 
     SyscallResult::ok(0)
@@ -1430,6 +1438,11 @@ fn syscall_tcb_unbind_notification(cap: &Capability) -> SyscallResult {
         if tcb.bound_notification.is_null() {
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
+
+        // Clear back-pointer in notification
+        let ntfn = &mut *(tcb.bound_notification as *mut crate::ipc::Notification);
+        ntfn.bound_tcb = core::ptr::null_mut();
+
         tcb.bound_notification = core::ptr::null_mut();
     }
 
