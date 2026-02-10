@@ -70,6 +70,11 @@ const VFS_SENDMSG: u64 = 25;
 const VFS_RECVMSG: u64 = 26;
 const VFS_SOCKPAIR: u64 = 27;
 const VFS_SHUTDOWN: u64 = 28;
+const VFS_IOCTL: u64 = 33;
+const VFS_ISATTY: u64 = 34;
+const VFS_FCNTL: u64 = 35;
+const VFS_CHDIR: u64 = 36;
+const VFS_GETCWD: u64 = 37;
 
 // File type constants
 const FTYPE_NONE: u8 = 0;
@@ -140,6 +145,17 @@ const CAP_REPLY_BASE: u64 = 32;
 const ROOT_INO: u32 = 1;
 
 const INITRD_VADDR: u64 = 0x0000_0000_0100_0000;
+
+fn read_boot_info_initrd_size() -> usize {
+    unsafe {
+        let page = BOOTINFO_VADDR as *const u64;
+        let magic = core::ptr::read_volatile(page);
+        if magic != BOOTINFO_MAGIC {
+            return 0;
+        }
+        core::ptr::read_volatile(page.add(2)) as usize
+    }
+}
 
 // ======================================================================
 // Data structures
@@ -242,6 +258,8 @@ struct ClientState {
     badge: u64,
     active: u8,
     fds: [FdEntry; MAX_FDS],
+    cwd: [u8; 128],
+    fd_flags: [u8; MAX_FDS],
 }
 
 impl ClientState {
@@ -250,6 +268,8 @@ impl ClientState {
             badge: 0,
             active: 0,
             fds: [FdEntry::zeroed(); MAX_FDS],
+            cwd: [0; 128],
+            fd_flags: [0; MAX_FDS],
         }
     }
 }
@@ -482,6 +502,10 @@ static mut NEXT_PIPE_ID: u32 = 1;
 
 // Reply slot counter for deferred replies
 static mut NEXT_REPLY_SLOT: u64 = CAP_REPLY_BASE;
+
+// Dynamic SHM frame cap base — set at startup from __salty_next_frame_slot
+// to avoid collision with rtld-loaded library frame caps
+static mut VFS_SHM_CAP_BASE: u64 = 512;
 
 // ======================================================================
 // Helper functions
@@ -789,7 +813,7 @@ unsafe fn init_ramfs() {
 
         // Mount initrd CPIO
         let initrd = INITRD_VADDR as *const u8;
-        let initrd_size = cpio::cpio_archive_size(initrd, 1024 * 1024);
+        let initrd_size = read_boot_info_initrd_size();
 
         { let mut lb = LineBuf::new(); lb.str(b"[VFS] Initrd size: "); lb.hex(initrd_size as u64); lb.str(b" bytes\n"); lb.flush(); }
 
@@ -868,6 +892,14 @@ unsafe fn get_client(badge: u64) -> *mut ClientState {
                 CLIENTS[i].active = 1;
                 for j in 0..MAX_FDS {
                     CLIENTS[i].fds[j].active = 0;
+                    CLIENTS[i].fd_flags[j] = 0;
+                }
+                // Initialize cwd to "/"
+                CLIENTS[i].cwd[0] = b'/';
+                let mut k = 1;
+                while k < 128 {
+                    CLIENTS[i].cwd[k] = 0;
+                    k += 1;
                 }
                 return &raw mut CLIENTS[i];
             }
@@ -2324,6 +2356,7 @@ unsafe fn handle_clone_fds(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
         // Copy all FDs from parent to child
         for i in 0..MAX_FDS {
             (*child).fds[i] = (*parent).fds[i];
+            (*child).fd_flags[i] = (*parent).fd_flags[i];
             if (*child).fds[i].active == 0 { continue; }
             // Increment pipe refcounts
             if (*child).fds[i].fd_type == FD_TYPE_PIPE {
@@ -2346,7 +2379,250 @@ unsafe fn handle_clone_fds(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
             }
         }
 
+        // Copy cwd
+        let mut i = 0;
+        while i < 128 {
+            (*child).cwd[i] = (*parent).cwd[i];
+            i += 1;
+        }
+
         (*reply).label = SALTY_OK;
+    }
+}
+
+// ======================================================================
+// isatty / ioctl / fcntl / chdir / getcwd handlers
+// ======================================================================
+
+unsafe fn handle_isatty(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+    unsafe {
+        let fd = (*msg).regs[0] as i32;
+        let cli = get_client(badge);
+        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32
+            || (*cli).fds[fd as usize].active == 0
+        {
+            (*reply).label = SALTY_OK;
+            (*reply).length = 1;
+            (*reply).regs[0] = 0;
+            return;
+        }
+
+        let is_tty = if (*cli).fds[fd as usize].fd_type == FD_TYPE_DEVICE
+            && (*cli).fds[fd as usize].dev_type == DEV_CONSOLE
+        {
+            1u64
+        } else {
+            0u64
+        };
+
+        (*reply).label = SALTY_OK;
+        (*reply).length = 1;
+        (*reply).regs[0] = is_tty;
+    }
+}
+
+unsafe fn handle_ioctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+    unsafe {
+        let fd = (*msg).regs[0] as i32;
+        let request = (*msg).regs[1];
+        let _arg = (*msg).regs[2];
+
+        let cli = get_client(badge);
+        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32
+            || (*cli).fds[fd as usize].active == 0
+        {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        match request {
+            // TIOCGPGRP: get foreground process group
+            0x540F => {
+                (*reply).label = SALTY_OK;
+                (*reply).length = 1;
+                (*reply).regs[0] = 0; // pgid 0 (single process group)
+            }
+            // TIOCSPGRP: set foreground process group (accept and ignore)
+            0x5410 => {
+                (*reply).label = SALTY_OK;
+                (*reply).length = 1;
+                (*reply).regs[0] = 0;
+            }
+            // TIOCGWINSZ: get terminal window size
+            0x5413 => {
+                (*reply).label = SALTY_OK;
+                (*reply).length = 2;
+                // Pack rows(16) | cols(16) into regs[0], xpixel(16) | ypixel(16) into regs[1]
+                (*reply).regs[0] = (24u64 << 16) | 80u64; // rows=24, cols=80
+                (*reply).regs[1] = 0; // xpixel=0, ypixel=0
+            }
+            _ => {
+                (*reply).label = SALTY_INVALID_ARGUMENT;
+            }
+        }
+    }
+}
+
+unsafe fn handle_fcntl(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+    unsafe {
+        let fd = (*msg).regs[0] as i32;
+        let cmd = (*msg).regs[1] as i32;
+        let arg = (*msg).regs[2] as i64;
+
+        let cli = get_client(badge);
+        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32
+            || (*cli).fds[fd as usize].active == 0
+        {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        match cmd {
+            // F_DUPFD: duplicate fd, new fd >= arg
+            0 | 1030 => {
+                // F_DUPFD (0) and F_DUPFD_CLOEXEC (1030)
+                let min_fd = if arg < 0 { 0 } else { arg as usize };
+                let mut newfd: i32 = -1;
+                let mut i = min_fd;
+                while i < MAX_FDS {
+                    if (*cli).fds[i].active == 0 {
+                        newfd = i as i32;
+                        break;
+                    }
+                    i += 1;
+                }
+                if newfd < 0 {
+                    (*reply).label = SALTY_OUT_OF_MEMORY;
+                    return;
+                }
+
+                dup_fd_entry(cli, fd, newfd);
+                // F_DUPFD_CLOEXEC sets FD_CLOEXEC on new fd
+                if cmd == 1030 {
+                    (*cli).fd_flags[newfd as usize] = 1; // FD_CLOEXEC
+                } else {
+                    (*cli).fd_flags[newfd as usize] = 0;
+                }
+
+                (*reply).label = SALTY_OK;
+                (*reply).length = 1;
+                (*reply).regs[0] = newfd as u64;
+            }
+            // F_GETFD: get fd flags
+            1 => {
+                (*reply).label = SALTY_OK;
+                (*reply).length = 1;
+                (*reply).regs[0] = (*cli).fd_flags[fd as usize] as u64;
+            }
+            // F_SETFD: set fd flags
+            2 => {
+                (*cli).fd_flags[fd as usize] = arg as u8;
+                (*reply).label = SALTY_OK;
+                (*reply).length = 1;
+                (*reply).regs[0] = 0;
+            }
+            // F_GETFL: get file status flags
+            3 => {
+                (*reply).label = SALTY_OK;
+                (*reply).length = 1;
+                (*reply).regs[0] = (*cli).fds[fd as usize].flags as u64;
+            }
+            // F_SETFL: set file status flags (only O_APPEND, O_NONBLOCK are changeable)
+            4 => {
+                let changeable = O_APPEND | 0x0800; // O_APPEND | O_NONBLOCK
+                let preserved = (*cli).fds[fd as usize].flags & !changeable;
+                (*cli).fds[fd as usize].flags = preserved | (arg as u32 & changeable);
+                (*reply).label = SALTY_OK;
+                (*reply).length = 1;
+                (*reply).regs[0] = 0;
+            }
+            _ => {
+                (*reply).label = SALTY_INVALID_ARGUMENT;
+            }
+        }
+    }
+}
+
+unsafe fn handle_chdir(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+    unsafe {
+        let mut path = [0u8; MAX_PATH_LEN];
+        let path_len = extract_path(msg, 0, path.as_mut_ptr());
+        if path_len == 0 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        // Validate that path exists and is a directory
+        let inode = resolve_path(path.as_ptr(), path_len);
+        if inode.is_null() {
+            (*reply).label = SALTY_NOT_FOUND;
+            return;
+        }
+        if (*inode).ftype != FTYPE_DIRECTORY {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        let cli = get_client(badge);
+        if cli.is_null() {
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
+
+        // Store the new cwd
+        let copy_len = if (path_len as usize) < 127 { path_len as usize } else { 127 };
+        let mut i = 0;
+        while i < copy_len {
+            (*cli).cwd[i] = path[i];
+            i += 1;
+        }
+        // Ensure null-terminated
+        (*cli).cwd[copy_len] = 0;
+        // Zero rest
+        i = copy_len + 1;
+        while i < 128 {
+            (*cli).cwd[i] = 0;
+            i += 1;
+        }
+
+        (*reply).label = SALTY_OK;
+    }
+}
+
+unsafe fn handle_getcwd(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+    unsafe {
+        let max_size = (*msg).regs[0] as usize;
+
+        let cli = get_client(badge);
+        if cli.is_null() {
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
+
+        // Measure cwd length
+        let mut cwd_len: usize = 0;
+        while cwd_len < 128 && (*cli).cwd[cwd_len] != 0 {
+            cwd_len += 1;
+        }
+        if cwd_len == 0 {
+            // Default to "/"
+            cwd_len = 1;
+            (*cli).cwd[0] = b'/';
+            (*cli).cwd[1] = 0;
+        }
+
+        // Pack cwd bytes into reply regs[1..] (up to 152 bytes)
+        let copy_len = if cwd_len < 152 { cwd_len } else { 152 };
+        let _ = max_size; // acknowledged but we always send the actual cwd
+        (*reply).label = SALTY_OK;
+        (*reply).regs[0] = copy_len as u64;
+        let dst = &mut (*reply).regs[1] as *mut u64 as *mut u8;
+        let mut i = 0;
+        while i < copy_len {
+            *dst.add(i) = (*cli).cwd[i];
+            i += 1;
+        }
+        (*reply).length = 1 + ((copy_len as u64 + 7) / 8);
     }
 }
 
@@ -3488,7 +3764,7 @@ unsafe fn handle_ftruncate(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
             let cap_untyped: u64 = 7; // CAP_UNTYPED for VFS
 
             // Use high cap slots for SHM frames: 192+
-            let frame_base: u64 = 192 + shm_idx as u64 * MAX_SHM_PAGES as u64;
+            let frame_base: u64 = VFS_SHM_CAP_BASE + shm_idx as u64 * MAX_SHM_PAGES as u64;
 
             for i in (*shm).num_pages..num_pages {
                 let slot = frame_base + i as u64;
@@ -3536,6 +3812,10 @@ pub extern "C" fn _start() -> ! {
     }
 
     puts(b"[VFS] IPC buffer ready\n");
+
+    unsafe {
+        VFS_SHM_CAP_BASE = salty::__salty_next_frame_slot;
+    }
 
     unsafe {
         init_ramfs();
@@ -3713,6 +3993,21 @@ pub extern "C" fn _start() -> ! {
                 }
                 VFS_CLONE_FDS => {
                     handle_clone_fds(&raw const msg, &raw mut reply);
+                }
+                VFS_ISATTY => {
+                    handle_isatty(&raw const msg, &raw mut reply, badge);
+                }
+                VFS_IOCTL => {
+                    handle_ioctl(&raw const msg, &raw mut reply, badge);
+                }
+                VFS_FCNTL => {
+                    handle_fcntl(&raw const msg, &raw mut reply, badge);
+                }
+                VFS_CHDIR => {
+                    handle_chdir(&raw const msg, &raw mut reply, badge);
+                }
+                VFS_GETCWD => {
+                    handle_getcwd(&raw const msg, &raw mut reply, badge);
                 }
                 _ => {
                     { let mut lb = LineBuf::new(); lb.str(b"[VFS] unknown label="); lb.hex(msg.label); lb.str(b"\n"); lb.flush(); }

@@ -450,6 +450,50 @@ pub extern "C" fn salty_dup2(oldfd: i32, newfd: i32) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// C ABI exports: Process groups and UID/GID
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_setpgid(pid: i32, pgid: i32) -> i32 {
+    unsafe { posix::posix_setpgid(pid, pgid) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_getpgid(pid: i32) -> i32 {
+    unsafe { posix::posix_getpgid(pid) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_setsid() -> i32 {
+    unsafe { posix::posix_setsid() }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_getuid() -> i32 {
+    unsafe { posix::posix_getuid() }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_geteuid() -> i32 {
+    unsafe { posix::posix_geteuid() }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_getgid() -> i32 {
+    unsafe { posix::posix_getgid() }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_getegid() -> i32 {
+    unsafe { posix::posix_getegid() }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_getgroups(size: i32, list: *mut i32) -> i32 {
+    unsafe { posix::posix_getgroups(size, list) }
+}
+
+// ---------------------------------------------------------------------------
 // C ABI exports: Time API
 // ---------------------------------------------------------------------------
 
@@ -476,4 +520,33 @@ pub extern "C" fn salty_usleep(usec: u64) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn salty_sleep(seconds: u64) -> u64 {
     unsafe { posix::posix_sleep(seconds) }
+}
+
+// ---------------------------------------------------------------------------
+// C ABI exports: fcntl / isatty / chdir / getcwd / ioctl
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_fcntl(fd: i32, cmd: i32, arg: i64) -> i32 {
+    unsafe { posix::posix_fcntl(fd, cmd, arg) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_isatty(fd: i32) -> i32 {
+    unsafe { posix::posix_isatty(fd) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_ioctl(fd: i32, request: u64, arg: u64) -> i32 {
+    unsafe { posix::posix_ioctl(fd, request, arg) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_chdir(path: *const u8) -> i32 {
+    unsafe { posix::posix_chdir(path) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_getcwd(buf: *mut u8, size: u64) -> i32 {
+    unsafe { posix::posix_getcwd(buf, size) }
 }

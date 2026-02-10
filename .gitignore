@@ -27,6 +27,8 @@ Cargo.lock
 *.so
 *.elf
 *.bin
+*.rlib
+*.rmeta
 
 # Disk images
 *.img

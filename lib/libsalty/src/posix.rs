@@ -1150,6 +1150,170 @@ pub unsafe fn posix_sleep(seconds: u64) -> u64 {
     if res.error != 0 { seconds } else { 0 }
 }
 
+pub unsafe fn posix_setpgid(pid: i32, pgid: i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_PM_SETPGID;
+        msg.length = 2;
+        msg.regs[0] = pid as u32 as u64;
+        msg.regs[1] = pgid as u32 as u64;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_PROCMGR_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        0
+    }
+}
+
+pub unsafe fn posix_getpgid(pid: i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_PM_GETPGID;
+        msg.length = 1;
+        msg.regs[0] = pid as u32 as u64;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_PROCMGR_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        reply.regs[0] as i32
+    }
+}
+
+pub unsafe fn posix_setsid() -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_PM_SETSID;
+        msg.length = 0;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_PROCMGR_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        reply.regs[0] as i32
+    }
+}
+
+pub unsafe fn posix_getuid() -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_PM_GETUID;
+        msg.length = 0;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_PROCMGR_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        reply.regs[0] as i32
+    }
+}
+
+pub unsafe fn posix_geteuid() -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_PM_GETEUID;
+        msg.length = 0;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_PROCMGR_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        reply.regs[0] as i32
+    }
+}
+
+pub unsafe fn posix_getgid() -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_PM_GETGID;
+        msg.length = 0;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_PROCMGR_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        reply.regs[0] as i32
+    }
+}
+
+pub unsafe fn posix_getegid() -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_PM_GETEGID;
+        msg.length = 0;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_PROCMGR_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        reply.regs[0] as i32
+    }
+}
+
+pub unsafe fn posix_getgroups(size: i32, _list: *mut i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_PM_GETGROUPS;
+        msg.length = 1;
+        msg.regs[0] = size as u64;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_PROCMGR_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        reply.regs[0] as i32
+    }
+}
+
 pub unsafe fn posix_ftruncate(fd: i32, length: u64) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1168,6 +1332,127 @@ pub unsafe fn posix_ftruncate(fd: i32, length: u64) -> i32 {
         if err != 0 || reply.label != SALTY_OK {
             return -1;
         }
+        0
+    }
+}
+
+// ======================================================================
+// fcntl / isatty / chdir / getcwd / ioctl
+// ======================================================================
+
+pub unsafe fn posix_fcntl(fd: i32, cmd: i32, arg: i64) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_FCNTL;
+        msg.length = 3;
+        msg.regs[0] = fd as u64;
+        msg.regs[1] = cmd as u64;
+        msg.regs[2] = arg as u64;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        reply.regs[0] as i32
+    }
+}
+
+pub unsafe fn posix_isatty(fd: i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_ISATTY;
+        msg.length = 1;
+        msg.regs[0] = fd as u64;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return 0;
+        }
+        reply.regs[0] as i32
+    }
+}
+
+pub unsafe fn posix_ioctl(fd: i32, request: u64, arg: u64) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_IOCTL;
+        msg.length = 3;
+        msg.regs[0] = fd as u64;
+        msg.regs[1] = request;
+        msg.regs[2] = arg;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        reply.regs[0] as i32
+    }
+}
+
+pub unsafe fn posix_chdir(path: *const u8) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_CHDIR;
+        let path_len = pack_path(&raw mut msg, 0, path);
+        msg.length = 1 + ((path_len as u64 + 7) / 8);
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        0
+    }
+}
+
+pub unsafe fn posix_getcwd(buf: *mut u8, size: u64) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_GETCWD;
+        msg.length = 1;
+        msg.regs[0] = size;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+
+        let path_len = reply.regs[0] as usize;
+        let src = &reply.regs[1] as *const u64 as *const u8;
+        let copy_len = if path_len < size as usize { path_len } else { size as usize - 1 };
+        for i in 0..copy_len {
+            *buf.add(i) = *src.add(i);
+        }
+        *buf.add(copy_len) = 0;
         0
     }
 }

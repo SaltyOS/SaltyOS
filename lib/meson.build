@@ -2,4 +2,4 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 subdir('libsalty')
-subdir('libc')
+subdir('saltyc')

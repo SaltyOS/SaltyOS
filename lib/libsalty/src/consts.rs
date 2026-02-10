@@ -92,6 +92,8 @@ pub const CAP_UNTYPED_START: u64 = 16;
 // Addresses
 pub const INITRD_VADDR: u64 = 0x0000_0000_0100_0000;
 pub const SCRATCH_VADDR: u64 = 0x0000_0000_0200_0000;
+pub const BOOTINFO_VADDR: u64 = 0x0000_0000_00C0_0000;
+pub const BOOTINFO_MAGIC: u64 = 0x534C5459_424F4F54; // "SLTYBOOT"
 
 // Capability rights
 pub const CAP_RIGHTS_ALL: u64 = 0xFFFF_FFFF;
@@ -160,6 +162,23 @@ pub const POSIX_VFS_DUP2: u64 = 31;
 pub const POSIX_VFS_CLONE_FDS: u64 = 32;
 pub const POSIX_VFS_IOCTL: u64 = 33;
 pub const POSIX_VFS_ISATTY: u64 = 34;
+pub const POSIX_VFS_FCNTL: u64 = 35;
+pub const POSIX_VFS_CHDIR: u64 = 36;
+pub const POSIX_VFS_GETCWD: u64 = 37;
+
+// fcntl commands
+pub const F_DUPFD: i32 = 0;
+pub const F_GETFD: i32 = 1;
+pub const F_SETFD: i32 = 2;
+pub const F_GETFL: i32 = 3;
+pub const F_SETFL: i32 = 4;
+pub const F_DUPFD_CLOEXEC: i32 = 1030;
+pub const FD_CLOEXEC: i32 = 1;
+
+// ioctl requests
+pub const TIOCGPGRP: u64 = 0x540F;
+pub const TIOCSPGRP: u64 = 0x5410;
+pub const TIOCGWINSZ: u64 = 0x5413;
 
 // Procmgr protocol labels
 pub const POSIX_PM_SPAWN: u64 = 1;
@@ -171,6 +190,14 @@ pub const POSIX_PM_EXEC: u64 = 6;
 pub const POSIX_PM_GETPPID: u64 = 7;
 pub const POSIX_PM_KILL: u64 = 8;
 pub const POSIX_PM_SIGACTION: u64 = 9;
+pub const POSIX_PM_GETUID: u64 = 10;
+pub const POSIX_PM_GETGID: u64 = 11;
+pub const POSIX_PM_SETPGID: u64 = 12;
+pub const POSIX_PM_GETPGID: u64 = 13;
+pub const POSIX_PM_SETSID: u64 = 14;
+pub const POSIX_PM_GETEUID: u64 = 15;
+pub const POSIX_PM_GETEGID: u64 = 16;
+pub const POSIX_PM_GETGROUPS: u64 = 17;
 
 // Nameserv protocol labels
 pub const POSIX_NS_REGISTER: u64 = 1;

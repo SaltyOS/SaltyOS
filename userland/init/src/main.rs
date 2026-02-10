@@ -93,6 +93,7 @@ pub const AT_SALTY_FRAME_SLOT: u64 = 0x1005;
 // ======================================================================
 
 static mut INIT_DYN_FRAME_NEXT: u64 = INIT_DYN_FRAME_MIN;
+static mut INITRD_SIZE: usize = 0;
 
 // ======================================================================
 // Helpers
@@ -127,6 +128,22 @@ fn idle() -> ! {
     }
 }
 
+/// Read the kernel boot info page at BOOTINFO_VADDR.
+/// Returns (initrd_vaddr, initrd_size).
+unsafe fn read_boot_info() -> (u64, usize) {
+    unsafe {
+        let page = BOOTINFO_VADDR as *const u64;
+        let magic = core::ptr::read_volatile(page);
+        if magic != BOOTINFO_MAGIC {
+            puts(b"[INIT] WARN: boot info magic mismatch\n");
+            return (INITRD_VADDR, 0);
+        }
+        let vaddr = core::ptr::read_volatile(page.add(1));
+        let size = core::ptr::read_volatile(page.add(2)) as usize;
+        (vaddr, size)
+    }
+}
+
 fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -148,7 +165,7 @@ unsafe fn load_service_defs(mgr: &mut svc_mgr::ServiceManager) {
 
     unsafe {
         let initrd = INITRD_VADDR as *const u8;
-        let initrd_size = cpio::cpio_archive_size(initrd, 1024 * 1024);
+        let initrd_size = INITRD_SIZE;
 
         let mut offset: usize = 0;
         let mut entry = CpioEntry::zeroed();
@@ -553,11 +570,15 @@ pub extern "C" fn _start() -> ! {
     }
     { let mut lb = LineBuf::new(); lb.str(b"[INIT] IPC buffer mapped at "); lb.hex(IPC_BUF_VADDR); lb.str(b"\n"); lb.flush(); }
 
+    // Read initrd size from kernel boot info page (once, at startup)
+    let (_, initrd_size) = unsafe { read_boot_info() };
+    unsafe { INITRD_SIZE = initrd_size; }
+    { let mut lb = LineBuf::new(); lb.str(b"[INIT] Initrd size from boot info: "); lb.hex(initrd_size as u64); lb.str(b" bytes\n"); lb.flush(); }
+
     // Optional self-tests (IPC + fault handling)
     // Check if selftest is enabled by looking for "selftest.enable" in CPIO
     let run_selftest = unsafe {
         let initrd = INITRD_VADDR as *const u8;
-        let initrd_size = cpio::cpio_archive_size(initrd, 1024 * 1024);
         let mut entry = CpioEntry::zeroed();
         let name = b"selftest.enable";
         cpio::cpio_find_file(initrd, initrd_size, name.as_ptr(), name.len(), &raw mut entry) != 0

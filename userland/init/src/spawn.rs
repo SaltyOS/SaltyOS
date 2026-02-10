@@ -35,7 +35,7 @@ pub unsafe fn spawn_server(
 
     unsafe {
         let initrd = super::INITRD_VADDR as *const u8;
-        let initrd_size = cpio::cpio_archive_size(initrd, 1024 * 1024);
+        let initrd_size = super::INITRD_SIZE;
 
         let mut entry = CpioEntry::zeroed();
         if cpio::cpio_find_file(initrd, initrd_size, elf_name.as_ptr(), elf_name.len(), &raw mut entry) == 0 {
@@ -223,6 +223,44 @@ pub unsafe fn spawn_server(
                 }
             }
             puts(b"[INIT] Initrd mapped in child VSpace\n");
+
+            // Map boot info page into child VSpace so it can read initrd size
+            let bi_fr = super::init_alloc_frame_slot(core::ptr::null_mut());
+            let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, bi_fr);
+            if err != 0 {
+                puts(b"[INIT] bootinfo frame retype failed\n");
+                return -1;
+            }
+
+            let err = invoke::vspace_map(
+                CAP_SELF_VSPACE,
+                bi_fr,
+                SCRATCH_VADDR,
+                VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+            );
+            if err != 0 {
+                puts(b"[INIT] bootinfo scratch map failed\n");
+                return -1;
+            }
+
+            let bi_src = BOOTINFO_VADDR as *const u8;
+            let scratch = SCRATCH_VADDR as *mut u8;
+            for i in 0..4096usize {
+                core::ptr::write_volatile(scratch.add(i), core::ptr::read_volatile(bi_src.add(i)));
+            }
+
+            invoke::vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
+
+            let err = invoke::vspace_map(
+                child_vs,
+                bi_fr,
+                BOOTINFO_VADDR,
+                VSPACE_FLAG_USER,
+            );
+            if err != 0 {
+                puts(b"[INIT] bootinfo child map failed\n");
+                return -1;
+            }
         }
 
         // Copy standard caps

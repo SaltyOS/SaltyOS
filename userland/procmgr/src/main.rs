@@ -31,6 +31,14 @@ const PM_EXEC: u64 = 6;
 const PM_GETPPID: u64 = 7;
 const PM_KILL: u64 = 8;
 const PM_SIGACTION: u64 = 9;
+const PM_GETUID: u64 = 10;
+const PM_GETGID: u64 = 11;
+const PM_SETPGID: u64 = 12;
+const PM_GETPGID: u64 = 13;
+const PM_SETSID: u64 = 14;
+const PM_GETEUID: u64 = 15;
+const PM_GETEGID: u64 = 16;
+const PM_GETGROUPS: u64 = 17;
 
 // ---- Signal constants ----
 const SIG_DISP_DFL: u8 = 0;
@@ -49,7 +57,7 @@ const PROC_ZOMBIE: u8 = 2;
 const PROC_STOPPED: u8 = 3;
 
 // ---- Process table limits ----
-const MAX_PROCESSES: usize = 32;
+const MAX_PROCESSES: usize = 31;
 const MAX_NAME_LEN: usize = 32;
 
 // ---- Child VSpace layout ----
@@ -67,7 +75,7 @@ const PROCMGR_SCRATCH_VADDR: u64 = 0x0000_0000_0500_0000;
 
 // ---- Cap slots for child objects ----
 const CAP_PROC_BASE: Cap = 256;
-const CAP_PROC_STRIDE: Cap = 512;
+const CAP_PROC_STRIDE: Cap = 1024;
 const CAP_OFF_TCB: Cap = 0;
 const CAP_OFF_VSPACE: Cap = 1;
 const CAP_OFF_CNODE: Cap = 2;
@@ -129,6 +137,19 @@ const VSPACE_FLAG_USER: u64 = salty::VSPACE_FLAG_USER;
 const VSPACE_FLAG_EXECUTABLE: u64 = salty::VSPACE_FLAG_EXECUTABLE;
 const CAP_RIGHTS_ALL: u64 = salty::CAP_RIGHTS_ALL;
 const INITRD_VADDR: u64 = salty::INITRD_VADDR;
+const BOOTINFO_VADDR: u64 = salty::BOOTINFO_VADDR;
+const BOOTINFO_MAGIC: u64 = salty::BOOTINFO_MAGIC;
+
+fn read_boot_info_initrd_size() -> usize {
+    unsafe {
+        let page = BOOTINFO_VADDR as *const u64;
+        let magic = core::ptr::read_volatile(page);
+        if magic != BOOTINFO_MAGIC {
+            return 0;
+        }
+        core::ptr::read_volatile(page.add(2)) as usize
+    }
+}
 
 // ===========================================================================
 // Process struct
@@ -151,6 +172,7 @@ struct Process {
     signal_ntfn: Cap,
     sig_disposition: [u8; NSIG],
     stop_status: i32,
+    pgid: u32,
 }
 
 impl Process {
@@ -160,7 +182,7 @@ impl Process {
             tcb_cap: 0, vspace_cap: 0, cnode_cap: 0, sc_cap: 0,
             waiter_reply: 0, waiter_pid: 0,
             any_waiter_reply: 0, waiting_for_any: 0,
-            signal_ntfn: 0, sig_disposition: [SIG_DISP_DFL; NSIG], stop_status: 0,
+            signal_ntfn: 0, sig_disposition: [SIG_DISP_DFL; NSIG], stop_status: 0, pgid: 0,
         }
     }
 }
@@ -246,7 +268,7 @@ unsafe fn cleanup_proc_resources(idx: usize) {
         let p = &mut PROCTAB[idx];
         p.pid = 0; p.ppid = 0; p.exit_code = 0; p.badge = 0;
         p.tcb_cap = 0; p.vspace_cap = 0; p.cnode_cap = 0; p.sc_cap = 0;
-        p.waiter_reply = 0; p.waiter_pid = 0; p.signal_ntfn = 0; p.stop_status = 0;
+        p.waiter_reply = 0; p.waiter_pid = 0; p.signal_ntfn = 0; p.stop_status = 0; p.pgid = 0;
         for i in 0..NSIG { p.sig_disposition[i] = SIG_DISP_DFL; }
         p.state = PROC_FREE;
     }
@@ -503,6 +525,58 @@ unsafe fn map_initrd_to_child(
     }
 }
 
+/// Map boot info page into child VSpace so it can read initrd size.
+/// Copies procmgr's own boot info page into a fresh frame, then maps read-only.
+unsafe fn map_boot_info_to_child(
+    child_vs: Cap,
+    loader_ctx: &mut ElfLoaderCtx,
+    base: Cap,
+) -> i32 {
+    unsafe {
+        let frame_limit = base + CAP_PROC_STRIDE;
+        if loader_ctx.next_frame_slot >= frame_limit {
+            puts(b"[PROCMGR] bootinfo frame slot overflow\n");
+            return -1;
+        }
+        let bi_fr = loader_ctx.next_frame_slot;
+        loader_ctx.next_frame_slot += 1;
+
+        let err = salty::invoke::untyped_retype(CAP_UNTYPED, OBJ_FRAME, 0, bi_fr);
+        if err != 0 {
+            puts(b"[PROCMGR] bootinfo frame retype failed\n");
+            return -1;
+        }
+
+        let err = salty::invoke::vspace_map(
+            CAP_SELF_VSPACE, bi_fr, PROCMGR_SCRATCH_VADDR,
+            VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+        );
+        if err != 0 {
+            puts(b"[PROCMGR] bootinfo scratch map failed\n");
+            return -1;
+        }
+
+        let bi_src = BOOTINFO_VADDR as *const u8;
+        let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
+        for i in 0..4096usize {
+            core::ptr::write_volatile(scratch.add(i), core::ptr::read_volatile(bi_src.add(i)));
+        }
+
+        salty::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
+
+        let err = salty::invoke::vspace_map(
+            child_vs, bi_fr, BOOTINFO_VADDR,
+            VSPACE_FLAG_USER,
+        );
+        if err != 0 {
+            puts(b"[PROCMGR] bootinfo child map failed\n");
+            return -1;
+        }
+
+        0
+    }
+}
+
 // ===========================================================================
 // handle_spawn
 // ===========================================================================
@@ -518,7 +592,7 @@ unsafe fn handle_spawn(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         lb.flush();
 
         let initrd = INITRD_VADDR as *const u8;
-        let initrd_size = salty::cpio::cpio_archive_size(initrd, 1024 * 1024);
+        let initrd_size = read_boot_info_initrd_size();
 
         let mut elf_entry = CpioEntry::zeroed();
         if salty::cpio::cpio_find_file(initrd, initrd_size, name.as_ptr(), name_len, &raw mut elf_entry) == 0 {
@@ -657,9 +731,13 @@ unsafe fn handle_spawn(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             return;
         }
 
-        // 4b. Map initrd for dynamic executables
+        // 4b. Map initrd and boot info for dynamic executables
         if is_dynamic {
             if map_initrd_to_child(child_vs, initrd, initrd_size, &mut loader_ctx, base) != 0 {
+                reply.label = SALTY_OUT_OF_MEMORY;
+                return;
+            }
+            if map_boot_info_to_child(child_vs, &mut loader_ctx, base) != 0 {
                 reply.label = SALTY_OUT_OF_MEMORY;
                 return;
             }
@@ -737,6 +815,7 @@ unsafe fn handle_spawn(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         p.waiter_reply = 0;
         p.waiter_pid = 0;
         p.signal_ntfn = child_sig_ntfn;
+        p.pgid = pid;
         for i in 0..NSIG { p.sig_disposition[i] = SIG_DISP_DFL; }
 
         { let mut lb = LineBuf::new();
@@ -1440,6 +1519,7 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         p.waiter_reply = 0;
         p.waiter_pid = 0;
         p.signal_ntfn = child_sig_ntfn;
+        p.pgid = PROCTAB[parent_idx].pgid;
         // Fork inherits parent's signal dispositions
         for i in 0..NSIG {
             p.sig_disposition[i] = PROCTAB[parent_idx].sig_disposition[i];
@@ -1474,7 +1554,7 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         lb.flush(); }
 
         let initrd = INITRD_VADDR as *const u8;
-        let initrd_size = salty::cpio::cpio_archive_size(initrd, 1024 * 1024);
+        let initrd_size = read_boot_info_initrd_size();
 
         let mut elf_entry = CpioEntry::zeroed();
         if salty::cpio::cpio_find_file(initrd, initrd_size, name.as_ptr(), name_len, &raw mut elf_entry) == 0 {
@@ -1580,10 +1660,14 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             if err != 0 { reply.label = SALTY_OUT_OF_MEMORY; return; }
         }
 
-        // 5. Map initrd for dynamic executables
+        // 5. Map initrd and boot info for dynamic executables
         if is_dynamic {
             let base_cap = CAP_PROC_BASE + slot_i as u64 * CAP_PROC_STRIDE;
             if map_initrd_to_child(proc_vs, initrd, initrd_size, &mut loader_ctx, base_cap) != 0 {
+                reply.label = SALTY_OUT_OF_MEMORY;
+                return;
+            }
+            if map_boot_info_to_child(proc_vs, &mut loader_ctx, base_cap) != 0 {
                 reply.label = SALTY_OUT_OF_MEMORY;
                 return;
             }
@@ -1640,6 +1724,108 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
 
         // Don't reply — process image replaced and resumed.
     }
+}
+
+// ===========================================================================
+// Process group and UID/GID handlers
+// ===========================================================================
+
+unsafe fn handle_setpgid(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
+    unsafe {
+        let mut target_pid = msg.regs[0] as u32;
+        let mut pgid = msg.regs[1] as u32;
+
+        let Some(caller_idx) = find_by_badge(badge) else {
+            reply.label = SALTY_NOT_FOUND;
+            return;
+        };
+        let caller_pid = PROCTAB[caller_idx].pid;
+
+        // pid=0 means self
+        if target_pid == 0 {
+            target_pid = caller_pid;
+        }
+        // pgid=0 means pgid=pid
+        if pgid == 0 {
+            pgid = target_pid;
+        }
+
+        let Some(ti) = find_by_pid(target_pid) else {
+            reply.label = SALTY_NOT_FOUND;
+            return;
+        };
+
+        PROCTAB[ti].pgid = pgid;
+        reply.label = SALTY_OK;
+        reply.length = 0;
+    }
+}
+
+unsafe fn handle_getpgid(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
+    unsafe {
+        let mut target_pid = msg.regs[0] as u32;
+
+        if target_pid == 0 {
+            let Some(caller_idx) = find_by_badge(badge) else {
+                reply.label = SALTY_NOT_FOUND;
+                return;
+            };
+            target_pid = PROCTAB[caller_idx].pid;
+        }
+
+        let Some(ti) = find_by_pid(target_pid) else {
+            reply.label = SALTY_NOT_FOUND;
+            return;
+        };
+
+        reply.label = SALTY_OK;
+        reply.length = 1;
+        reply.regs[0] = PROCTAB[ti].pgid as u64;
+    }
+}
+
+unsafe fn handle_setsid(reply: &mut SaltyMsg, badge: u64) {
+    unsafe {
+        let Some(idx) = find_by_badge(badge) else {
+            reply.label = SALTY_NOT_FOUND;
+            return;
+        };
+        let pid = PROCTAB[idx].pid;
+        PROCTAB[idx].pgid = pid;
+        reply.label = SALTY_OK;
+        reply.length = 1;
+        reply.regs[0] = pid as u64;
+    }
+}
+
+unsafe fn handle_getuid(reply: &mut SaltyMsg, _badge: u64) {
+    reply.label = SALTY_OK;
+    reply.length = 1;
+    reply.regs[0] = 0;
+}
+
+unsafe fn handle_geteuid(reply: &mut SaltyMsg, _badge: u64) {
+    reply.label = SALTY_OK;
+    reply.length = 1;
+    reply.regs[0] = 0;
+}
+
+unsafe fn handle_getgid(reply: &mut SaltyMsg, _badge: u64) {
+    reply.label = SALTY_OK;
+    reply.length = 1;
+    reply.regs[0] = 0;
+}
+
+unsafe fn handle_getegid(reply: &mut SaltyMsg, _badge: u64) {
+    reply.label = SALTY_OK;
+    reply.length = 1;
+    reply.regs[0] = 0;
+}
+
+unsafe fn handle_getgroups(reply: &mut SaltyMsg) {
+    reply.label = SALTY_OK;
+    reply.length = 1;
+    reply.regs[0] = 0;
 }
 
 // ===========================================================================
@@ -1723,6 +1909,14 @@ pub extern "C" fn _start() -> ! {
                 PM_GETPPID => handle_getppid(&mut reply, badge),
                 PM_KILL => handle_kill(&msg, &mut reply, badge),
                 PM_SIGACTION => handle_sigaction(&msg, &mut reply, badge),
+                PM_GETUID => handle_getuid(&mut reply, badge),
+                PM_GETGID => handle_getgid(&mut reply, badge),
+                PM_SETPGID => handle_setpgid(&msg, &mut reply, badge),
+                PM_GETPGID => handle_getpgid(&msg, &mut reply, badge),
+                PM_SETSID => handle_setsid(&mut reply, badge),
+                PM_GETEUID => handle_geteuid(&mut reply, badge),
+                PM_GETEGID => handle_getegid(&mut reply, badge),
+                PM_GETGROUPS => handle_getgroups(&mut reply),
                 _ => {
                     let mut lb = LineBuf::new();
                     lb.str(b"[PROCMGR] unknown label="); lb.hex(msg.label); lb.str(b"\n"); lb.flush();
