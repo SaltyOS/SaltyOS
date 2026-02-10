@@ -36,7 +36,7 @@ pub type VirtAddr = u64;
 ///
 /// Uses test-and-set with TTAS (test-and-test-and-set) optimization.
 /// Debug builds include deadlock detection via spin count limit.
-pub(crate) struct SpinLock {
+pub struct SpinLock {
     locked: AtomicU8,
 }
 
@@ -60,7 +60,7 @@ impl SpinLock {
                 _spins += 1;
                 #[cfg(debug_assertions)]
                 if _spins > 10_000_000 {
-                    crate::serial_puts("[SPINLOCK] possible deadlock detected\n");
+                    crate::serial_puts_raw("[SPINLOCK] possible deadlock detected\n");
                     _spins = 0;
                 }
             }
@@ -73,10 +73,30 @@ impl SpinLock {
     }
 }
 
+/// Subsystem lock: protects scheduler queues, endpoint/notification state,
+/// TCB state transitions, sleep queue, VSpace waiter queues.
+///
+/// Lock ordering (outermost → innermost):
+///   CAP_LOCK → SCHED_IPC_LOCK → scheduler.lock_state → VSpace.lock → MM_LOCK (FRAME_LOCK) → SERIAL_LOCK
+///
+/// Nesting patterns:
+///   - Slowpath syscalls: CAP_LOCK (cap lookup) → release → SCHED_IPC_LOCK (IPC)
+///   - IPC cap transfer (transfer_message): SCHED_IPC_LOCK → CAP_LOCK (slot copy)
+///   - Fastpath: CAP_LOCK (cap copy-to-stack) → release → SCHED_IPC_LOCK → scheduler.lock_state
+///   - Timer/IPI: SCHED_IPC_LOCK (assembly stub) → scheduler.lock_state
+///   - do_context_switch: releases SCHED_IPC_LOCK before switch, reacquires on resume
+pub static SCHED_IPC_LOCK: SpinLock = SpinLock::new();
+
+/// Subsystem lock: protects capability slot array, CDT operations, CNode ops,
+/// untyped child tracking, and capability lookup.
+///
+/// Lock ordering: CAP_LOCK → SCHED_IPC_LOCK → scheduler.lock_state → VSpace.lock → MM_LOCK → SERIAL_LOCK
+pub static CAP_LOCK: SpinLock = SpinLock::new();
+
 /// Global frame allocator
 static mut FRAME_ALLOCATOR: Option<FrameAllocator> = None;
 
-/// Spinlock protecting FRAME_ALLOCATOR for SMP safety
+/// Spinlock protecting FRAME_ALLOCATOR for SMP safety (MM_LOCK)
 static FRAME_LOCK: SpinLock = SpinLock::new();
 
 /// Initialize memory management from boot info

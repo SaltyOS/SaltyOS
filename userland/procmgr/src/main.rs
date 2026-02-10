@@ -6,6 +6,8 @@
 #![no_std]
 #![no_main]
 
+use salty::ipc;
+use salty::serial::LineBuf;
 use salty::types::*;
 
 // ---- Cap layout (set by init for this process) ----
@@ -178,7 +180,6 @@ static mut NEXT_PID: u32 = 2;
 // ===========================================================================
 
 fn puts(s: &[u8]) { salty::serial::serial_puts(s); }
-fn hex(v: u64) { salty::serial::serial_hex(v); }
 fn ipc_ctx() -> *mut IpcContext { &raw mut salty::__salty_ipc_ctx }
 
 unsafe fn strlen(s: *const u8) -> usize {
@@ -384,7 +385,8 @@ unsafe fn load_rtld(
             CHILD_RTLD_VADDR, loader_ctx, &raw mut rtld_result,
         );
         if err != 0 {
-            puts(b"[PROCMGR] rtld load failed err="); hex(err as u64); puts(b"\n");
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] rtld load failed err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
             return None;
         }
         Some(rtld_result)
@@ -408,7 +410,8 @@ fn copy_child_caps(
 
     err = salty::invoke::cnode_mint(CAP_SELF_CSPACE, CAP_SERVER_EP, child_cn, CHILD_CAP_EP, pid as u64);
     if err != 0 {
-        puts(b"[PROCMGR] mint EP cap failed err="); hex(err as u64); puts(b"\n");
+        let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] mint EP cap failed err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
         return err;
     }
 
@@ -421,8 +424,14 @@ fn copy_child_caps(
         puts(b"[PROCMGR] WARN: copy Untyped cap failed\n");
     }
 
-    err = salty::invoke::cnode_copy(CAP_SELF_CSPACE, CAP_VFS_EP, child_cn, CHILD_CAP_VFS, CAP_RIGHTS_ALL);
-    if err != 0 { puts(b"[PROCMGR] WARN: copy VFS EP cap failed\n"); }
+    // Give each process a uniquely badged VFS endpoint so VFS can maintain
+    // per-process client state keyed by PID badge.
+    err = salty::invoke::cnode_mint(CAP_SELF_CSPACE, CAP_VFS_EP, child_cn, CHILD_CAP_VFS, pid as u64);
+    if err != 0 {
+        puts(b"[PROCMGR] WARN: mint VFS EP cap failed, trying unbadged copy\n");
+        err = salty::invoke::cnode_copy(CAP_SELF_CSPACE, CAP_VFS_EP, child_cn, CHILD_CAP_VFS, CAP_RIGHTS_ALL);
+        if err != 0 { puts(b"[PROCMGR] WARN: copy VFS EP cap failed\n"); }
+    }
 
     err = salty::invoke::cnode_copy(CAP_SELF_CSPACE, CAP_NAMESERV_EP, child_cn, CHILD_CAP_NAMESERV, CAP_RIGHTS_ALL);
     if err != 0 { puts(b"[PROCMGR] WARN: copy Nameserv EP cap failed\n"); }
@@ -502,9 +511,11 @@ unsafe fn handle_spawn(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
     unsafe {
         let (name, name_len) = extract_name(msg);
 
-        puts(b"[PROCMGR] SPAWN: '");
-        for i in 0..name_len { salty::serial::serial_putc(name[i]); }
-        puts(b"'\n");
+        let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] SPAWN: '");
+        lb.bytes(&name[..name_len]);
+        lb.str(b"'\n");
+        lb.flush();
 
         let initrd = INITRD_VADDR as *const u8;
         let initrd_size = salty::cpio::cpio_archive_size(initrd, 1024 * 1024);
@@ -518,7 +529,8 @@ unsafe fn handle_spawn(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
 
         let is_dynamic = salty::elf_dynamic::elf_has_interp(elf_entry.data, elf_entry.data_len);
         if is_dynamic { puts(b"[PROCMGR] ELF is dynamically linked\n"); }
-        puts(b"[PROCMGR] Found ELF ("); hex(elf_entry.data_len as u64); puts(b" bytes)\n");
+        { let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] Found ELF ("); lb.hex(elf_entry.data_len as u64); lb.str(b" bytes)\n"); lb.flush(); }
 
         // Auto-register caller if unknown
         let caller_idx = find_by_badge(badge);
@@ -565,7 +577,8 @@ unsafe fn handle_spawn(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         retype!(OBJ_FRAME, child_ipc_fr);
         retype!(OBJ_NOTIFICATION, child_sig_ntfn);
 
-        puts(b"[PROCMGR] Objects retyped for PID "); hex(pid as u64); puts(b"\n");
+        { let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] Objects retyped for PID "); lb.hex(pid as u64); lb.str(b"\n"); lb.flush(); }
 
         // 2. Load ELF
         let mut loader_ctx = ElfLoaderCtx {
@@ -582,11 +595,13 @@ unsafe fn handle_spawn(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             CHILD_CODE_VADDR, &mut loader_ctx, &raw mut elf_result,
         );
         if err != 0 {
-            puts(b"[PROCMGR] ELF load failed err="); hex(err as u64); puts(b"\n");
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] ELF load failed err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
             reply.label = SALTY_INVALID_ARGUMENT;
             return;
         }
-        puts(b"[PROCMGR] ELF loaded: entry="); hex(elf_result.entry); puts(b"\n");
+        { let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] ELF loaded: entry="); lb.hex(elf_result.entry); lb.str(b"\n"); lb.flush(); }
 
         // 2b. Load rtld if dynamic
         let mut rtld_result = ElfLoadResult { entry: 0, base: 0, brk: 0 };
@@ -624,7 +639,8 @@ unsafe fn handle_spawn(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                 VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
             );
             if err != 0 {
-                puts(b"[PROCMGR] stack map failed err="); hex(err as u64); puts(b"\n");
+                let mut lb = LineBuf::new();
+                lb.str(b"[PROCMGR] stack map failed err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
                 reply.label = SALTY_OUT_OF_MEMORY;
                 return;
             }
@@ -723,7 +739,8 @@ unsafe fn handle_spawn(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         p.signal_ntfn = child_sig_ntfn;
         for i in 0..NSIG { p.sig_disposition[i] = SIG_DISP_DFL; }
 
-        puts(b"[PROCMGR] Process started PID="); hex(pid as u64); puts(b"\n");
+        { let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] Process started PID="); lb.hex(pid as u64); lb.str(b"\n"); lb.flush(); }
         reply.label = SALTY_OK;
         reply.length = 1;
         reply.regs[0] = pid as u64;
@@ -740,13 +757,15 @@ unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         let exit_code = raw_code << 8;
 
         let Some(idx) = find_by_badge(badge) else {
-            puts(b"[PROCMGR] EXIT from unknown badge="); hex(badge); puts(b"\n");
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] EXIT from unknown badge="); lb.hex(badge); lb.str(b"\n"); lb.flush();
             reply.label = SALTY_NOT_FOUND;
             return;
         };
 
-        puts(b"[PROCMGR] EXIT PID="); hex(PROCTAB[idx].pid as u64);
-        puts(b" code="); hex(exit_code as u64); puts(b"\n");
+        { let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] EXIT PID="); lb.hex(PROCTAB[idx].pid as u64);
+        lb.str(b" code="); lb.hex(exit_code as u64); lb.str(b"\n"); lb.flush(); }
 
         PROCTAB[idx].state = PROC_ZOMBIE;
         PROCTAB[idx].exit_code = exit_code;
@@ -766,7 +785,8 @@ unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
 
         // Wake specific-child waiter
         if PROCTAB[idx].waiter_reply != 0 {
-            puts(b"[PROCMGR] Waking waiter for PID="); hex(PROCTAB[idx].pid as u64); puts(b"\n");
+            { let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] Waking waiter for PID="); lb.hex(PROCTAB[idx].pid as u64); lb.str(b"\n"); lb.flush(); }
 
             let mut wake = SaltyMsg::zeroed();
             wake.label = SALTY_OK;
@@ -786,8 +806,9 @@ unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         // Wake any-child waiter on parent
         if let Some(pi) = find_by_pid(ppid) {
             if PROCTAB[pi].waiting_for_any != 0 {
-                puts(b"[PROCMGR] Waking any-waiter parent PID="); hex(PROCTAB[pi].pid as u64);
-                puts(b" for child PID="); hex(PROCTAB[idx].pid as u64); puts(b"\n");
+                { let mut lb = LineBuf::new();
+                lb.str(b"[PROCMGR] Waking any-waiter parent PID="); lb.hex(PROCTAB[pi].pid as u64);
+                lb.str(b" for child PID="); lb.hex(PROCTAB[idx].pid as u64); lb.str(b"\n"); lb.flush(); }
 
                 let mut wake = SaltyMsg::zeroed();
                 wake.label = SALTY_OK;
@@ -882,7 +903,8 @@ unsafe fn handle_wait(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) -> bool 
             }
             PROCTAB[caller_idx].any_waiter_reply = reply_slot;
             PROCTAB[caller_idx].waiting_for_any = 1;
-            puts(b"[PROCMGR] WAIT(-1) blocking parent PID="); hex(caller_pid as u64); puts(b"\n");
+            { let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] WAIT(-1) blocking parent PID="); lb.hex(caller_pid as u64); lb.str(b"\n"); lb.flush(); }
             return true;
         }
 
@@ -925,13 +947,15 @@ unsafe fn handle_wait(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) -> bool 
         let reply_slot = CAP_REPLY_BASE + ci as u64;
         let err = salty::invoke::cnode_save_caller(CAP_SELF_CSPACE, reply_slot);
         if err != 0 {
-            puts(b"[PROCMGR] save_caller failed for WAIT, err="); hex(err as u64); puts(b"\n");
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] save_caller failed for WAIT, err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
             reply.label = SALTY_OUT_OF_MEMORY;
             return false;
         }
         PROCTAB[ci].waiter_reply = reply_slot;
         PROCTAB[ci].waiter_pid = caller_pid;
-        puts(b"[PROCMGR] WAIT blocking for PID="); hex(child_pid as u64); puts(b"\n");
+        { let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] WAIT blocking for PID="); lb.hex(child_pid as u64); lb.str(b"\n"); lb.flush(); }
         true
     }
 }
@@ -972,8 +996,9 @@ unsafe fn sig_terminate_proc(idx: usize, sig: usize) {
     unsafe {
         let exit_code = (sig & 0x7f) as i32;
 
-        puts(b"[PROCMGR] SIGKILL/terminate PID="); hex(PROCTAB[idx].pid as u64);
-        puts(b" sig="); hex(sig as u64); puts(b"\n");
+        { let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] SIGKILL/terminate PID="); lb.hex(PROCTAB[idx].pid as u64);
+        lb.str(b" sig="); lb.hex(sig as u64); lb.str(b"\n"); lb.flush(); }
 
         salty::invoke::invoke(PROCTAB[idx].tcb_cap, salty::TCB_SUSPEND, 0, 0, 0, 0);
         PROCTAB[idx].state = PROC_ZOMBIE;
@@ -1190,7 +1215,8 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         let parent_pid = PROCTAB[parent_idx].pid;
         let parent_vs = PROCTAB[parent_idx].vspace_cap;
 
-        puts(b"[PROCMGR] FORK from PID="); hex(parent_pid as u64); puts(b"\n");
+        { let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] FORK from PID="); lb.hex(parent_pid as u64); lb.str(b"\n"); lb.flush(); }
 
         let Some(slot_idx) = alloc_proc() else {
             puts(b"[PROCMGR] FORK: process table full\n");
@@ -1260,8 +1286,9 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
 
                 let err = salty::invoke::vspace_copy_page(parent_vs, page_vaddr, next_frame);
                 if err != 0 {
-                    puts(b"[PROCMGR] FORK: copy_page failed at "); hex(page_vaddr);
-                    puts(b" err="); hex(err as u64); puts(b"\n");
+                    let mut lb = LineBuf::new();
+                    lb.str(b"[PROCMGR] FORK: copy_page failed at "); lb.hex(page_vaddr);
+                    lb.str(b" err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
                     reply.label = SALTY_INVALID_OPERATION;
                     return;
                 }
@@ -1272,8 +1299,9 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
 
                 let err = salty::invoke::vspace_map(child_vs, next_frame, page_vaddr, map_flags);
                 if err != 0 {
-                    puts(b"[PROCMGR] FORK: child map failed at "); hex(page_vaddr);
-                    puts(b" err="); hex(err as u64); puts(b"\n");
+                    let mut lb = LineBuf::new();
+                    lb.str(b"[PROCMGR] FORK: child map failed at "); lb.hex(page_vaddr);
+                    lb.str(b" err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
                     reply.label = SALTY_OUT_OF_MEMORY;
                     return;
                 }
@@ -1294,7 +1322,8 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             walk_start = next_addr;
         }
 
-        puts(b"[PROCMGR] FORK: copied "); hex(total_pages); puts(b" pages\n");
+        { let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] FORK: copied "); lb.hex(total_pages); lb.str(b" pages\n"); lb.flush(); }
 
         if rsp_frame == 0 {
             puts(b"[PROCMGR] FORK: parent RSP page not mapped in child\n");
@@ -1341,7 +1370,14 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         salty::invoke::cnode_copy(CAP_SELF_CSPACE, child_vs, child_cn, CHILD_CAP_VSPACE, CAP_RIGHTS_ALL);
         salty::invoke::cnode_copy(CAP_SELF_CSPACE, child_cn, child_cn, CHILD_CAP_CSPACE, CAP_RIGHTS_ALL);
         salty::invoke::cnode_mint(CAP_SELF_CSPACE, CAP_SERVER_EP, child_cn, CHILD_CAP_EP, child_pid as u64);
-        salty::invoke::cnode_copy(CAP_SELF_CSPACE, CAP_VFS_EP, child_cn, CHILD_CAP_VFS, CAP_RIGHTS_ALL);
+        let err = salty::invoke::cnode_mint(
+            CAP_SELF_CSPACE, CAP_VFS_EP, child_cn, CHILD_CAP_VFS, child_pid as u64,
+        );
+        if err != 0 {
+            puts(b"[PROCMGR] FORK: mint child VFS EP failed\n");
+            reply.label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
         salty::invoke::cnode_copy(CAP_SELF_CSPACE, CAP_NAMESERV_EP, child_cn, CHILD_CAP_NAMESERV, CAP_RIGHTS_ALL);
         salty::invoke::cnode_copy(CAP_SELF_CSPACE, CAP_UNTYPED, child_cn, CHILD_CAP_UNTYPED, CAP_RIGHTS_ALL);
         salty::invoke::cnode_copy(CAP_SELF_CSPACE, child_sig_ntfn, child_cn, CHILD_CAP_SIGNAL_NTFN, CAP_RIGHTS_ALL);
@@ -1366,7 +1402,23 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             return;
         }
 
-        // 6. Schedule the child
+        // 6. Clone FD table BEFORE resuming child (Bug 5: race condition)
+        {
+            let mut clone_msg = SaltyMsg::zeroed();
+            let mut clone_reply = SaltyMsg::zeroed();
+            clone_msg.label = salty::consts::POSIX_VFS_CLONE_FDS;
+            clone_msg.length = 2;
+            clone_msg.regs[0] = badge; // parent badge
+            clone_msg.regs[1] = child_pid as u64; // child badge
+            let err = ipc::call_ctx(ipc_ctx(), CAP_VFS_EP, &raw const clone_msg, &raw mut clone_reply);
+            if err != 0 || clone_reply.label != SALTY_OK {
+                puts(b"[PROCMGR] FORK: VFS clone_fds failed, aborting fork\n");
+                reply.label = SALTY_INVALID_OPERATION;
+                return;
+            }
+        }
+
+        // 7. Schedule the child
         let err = salty::invoke::sc_configure(child_sc, 10000, 100000);
         if err != 0 { reply.label = SALTY_OUT_OF_MEMORY; return; }
         let err = salty::invoke::sc_bind(child_sc, child_tcb);
@@ -1393,7 +1445,8 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             p.sig_disposition[i] = PROCTAB[parent_idx].sig_disposition[i];
         }
 
-        puts(b"[PROCMGR] FORK: child PID="); hex(child_pid as u64); puts(b" started\n");
+        { let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] FORK: child PID="); lb.hex(child_pid as u64); lb.str(b" started\n"); lb.flush(); }
         reply.label = SALTY_OK;
         reply.length = 1;
         reply.regs[0] = child_pid as u64;
@@ -1413,10 +1466,12 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
 
         let (name, name_len) = extract_name(msg);
 
-        puts(b"[PROCMGR] EXEC PID="); hex(PROCTAB[idx].pid as u64);
-        puts(b" -> '");
-        for i in 0..name_len { salty::serial::serial_putc(name[i]); }
-        puts(b"'\n");
+        { let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] EXEC PID="); lb.hex(PROCTAB[idx].pid as u64);
+        lb.str(b" -> '");
+        lb.bytes(&name[..name_len]);
+        lb.str(b"'\n");
+        lb.flush(); }
 
         let initrd = INITRD_VADDR as *const u8;
         let initrd_size = salty::cpio::cpio_archive_size(initrd, 1024 * 1024);
@@ -1477,8 +1532,9 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             CHILD_CODE_VADDR, &mut loader_ctx, &raw mut elf_result,
         );
         if err != 0 {
-            puts(b"[PROCMGR] EXEC: ELF load failed\n");
-            puts(b"[PROCMGR] EXEC: ELF load err="); hex(err as u64); puts(b"\n");
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] EXEC: ELF load failed\n");
+            lb.str(b"[PROCMGR] EXEC: ELF load err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
             reply.label = SALTY_INVALID_ARGUMENT;
             return;
         }
@@ -1578,8 +1634,9 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             return;
         }
 
-        puts(b"[PROCMGR] EXEC: PID="); hex(PROCTAB[idx].pid as u64);
-        puts(b" -> entry="); hex(new_entry); puts(b"\n");
+        { let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] EXEC: PID="); lb.hex(PROCTAB[idx].pid as u64);
+        lb.str(b" -> entry="); lb.hex(new_entry); lb.str(b"\n"); lb.flush(); }
 
         // Don't reply — process image replaced and resumed.
     }
@@ -1597,7 +1654,8 @@ pub extern "C" fn _start() -> ! {
         // Set IPC buffer
         let err = salty::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
         if err != 0 {
-            puts(b"[PROCMGR] FAIL: set IPC buffer err="); hex(err as u64); puts(b"\n");
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] FAIL: set IPC buffer err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
             idle();
         }
         salty::ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
@@ -1612,12 +1670,12 @@ pub extern "C" fn _start() -> ! {
         if CAP_NAMESERV_EP != 0 {
             let mut reg_msg = SaltyMsg::zeroed();
             let mut reg_reply = SaltyMsg::zeroed();
-            reg_msg.label = 1; // NS_REGISTER
-            reg_msg.regs[0] = 7; // length of "procmgr"
-            reg_msg.length = 1 + (7 + 7) / 8;
             let svc_name = b"procmgr";
+            reg_msg.label = salty::consts::POSIX_NS_REGISTER;
+            reg_msg.regs[0] = svc_name.len() as u64;
+            reg_msg.length = 1 + (svc_name.len() as u64 + 7) / 8;
             let dst = &raw mut reg_msg.regs[1] as *mut u8;
-            for i in 0..7 { *dst.add(i) = svc_name[i]; }
+            for i in 0..svc_name.len() { *dst.add(i) = svc_name[i]; }
             reg_msg.regs[2] = 0;
             reg_msg.regs[3] = 0;
 
@@ -1666,7 +1724,8 @@ pub extern "C" fn _start() -> ! {
                 PM_KILL => handle_kill(&msg, &mut reply, badge),
                 PM_SIGACTION => handle_sigaction(&msg, &mut reply, badge),
                 _ => {
-                    puts(b"[PROCMGR] unknown label="); hex(msg.label); puts(b"\n");
+                    let mut lb = LineBuf::new();
+                    lb.str(b"[PROCMGR] unknown label="); lb.hex(msg.label); lb.str(b"\n"); lb.flush();
                     reply.label = SALTY_INVALID_OPERATION;
                 }
             }
@@ -1677,7 +1736,8 @@ pub extern "C" fn _start() -> ! {
                 salty::ipc::reply_recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw const reply, &raw mut msg, &raw mut badge)
             };
             if err != 0 {
-                puts(b"[PROCMGR] reply_recv failed err="); hex(err as u64); puts(b"\n");
+                let mut lb = LineBuf::new();
+                lb.str(b"[PROCMGR] reply_recv failed err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
                 break;
             }
         }

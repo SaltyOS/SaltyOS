@@ -2,8 +2,9 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
 //! Provides serial console access over IPC.
-//! Receives CONSOLE_WRITE / CONSOLE_READ requests on its endpoint
-//! and translates them to COM1 I/O via IoPort capability invocations.
+//! Receives CONSOLE_WRITE / CONSOLE_READ requests on its endpoint.
+//! Output goes through the DebugPutStr syscall so all COM1 writes are
+//! serialized under the kernel's SERIAL_LOCK.
 
 #![no_std]
 #![no_main]
@@ -13,6 +14,7 @@ extern crate salty;
 use salty::consts::*;
 use salty::invoke;
 use salty::ipc;
+use salty::serial;
 use salty::types::*;
 
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
@@ -23,8 +25,7 @@ const CAP_IOPORT: u64 = 4;
 const CAP_IRQ: u64 = 5;
 const CAP_NTFN: u64 = 6;
 
-// COM1 register offsets
-const COM1_THR: u64 = 0;
+// COM1 register offsets (still needed for init and input)
 const COM1_RBR: u64 = 0;
 const COM1_IER: u64 = 1;
 const COM1_FCR: u64 = 2;
@@ -36,12 +37,12 @@ const COM1_DLH: u64 = 1;
 
 // LSR bits
 const LSR_DR: u8 = 1 << 0;
-const LSR_THRE: u8 = 1 << 5;
 
 fn ipc_ctx() -> *mut IpcContext {
     &raw mut salty::__salty_ipc_ctx
 }
 
+/// Initialize COM1 hardware registers via IoPort cap
 fn com1_init() {
     invoke::ioport_out8(CAP_IOPORT, COM1_IER, 0x00);
     invoke::ioport_out8(CAP_IOPORT, COM1_LCR, 0x80);
@@ -53,20 +54,38 @@ fn com1_init() {
     invoke::ioport_out8(CAP_IOPORT, COM1_IER, 0x01);
 }
 
-fn com1_putc(c: u8) {
-    while (invoke::ioport_in8(CAP_IOPORT, COM1_LSR) & LSR_THRE) == 0 {}
-    invoke::ioport_out8(CAP_IOPORT, COM1_THR, c);
-}
-
-fn com1_puts(s: &[u8]) {
+/// Write a byte slice with CR/LF translation via DebugPutStr syscall.
+///
+/// All output goes through the kernel's SERIAL_LOCK, preventing
+/// interleaving with other CPUs/threads.
+fn console_puts(s: &[u8]) {
+    // Pre-process CR/LF: expand \n → \r\n into a stack buffer
+    // Max expansion: each byte could become 2 bytes
+    // Process in chunks to avoid large stack allocations
+    let mut buf = [0u8; 80];
+    let mut buf_len = 0;
     for &c in s {
         if c == b'\n' {
-            com1_putc(b'\r');
+            buf[buf_len] = b'\r';
+            buf_len += 1;
+            if buf_len >= buf.len() {
+                serial::serial_puts(&buf[..buf_len]);
+                buf_len = 0;
+            }
         }
-        com1_putc(c);
+        buf[buf_len] = c;
+        buf_len += 1;
+        if buf_len >= buf.len() {
+            serial::serial_puts(&buf[..buf_len]);
+            buf_len = 0;
+        }
+    }
+    if buf_len > 0 {
+        serial::serial_puts(&buf[..buf_len]);
     }
 }
 
+/// Read a character from COM1 via IoPort cap (input path, no lock needed)
 fn com1_getc() -> i32 {
     if (invoke::ioport_in8(CAP_IOPORT, COM1_LSR) & LSR_DR) != 0 {
         invoke::ioport_in8(CAP_IOPORT, COM1_RBR) as i32
@@ -81,14 +100,11 @@ unsafe fn handle_write(msg: *const SaltyMsg) {
         if len > 24 {
             len = 24;
         }
-        let data = &(*msg).regs[1] as *const u64 as *const u8;
-        for i in 0..len as usize {
-            let c = *data.add(i);
-            if c == b'\n' {
-                com1_putc(b'\r');
-            }
-            com1_putc(c);
-        }
+        let data = core::slice::from_raw_parts(
+            &(*msg).regs[1] as *const u64 as *const u8,
+            len as usize,
+        );
+        console_puts(data);
     }
 }
 
@@ -104,7 +120,7 @@ fn handle_read() -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     com1_init();
-    com1_puts(b"[CONSOLE] SaltyOS console server ready\n");
+    serial::serial_puts(b"[CONSOLE] SaltyOS console server ready\n");
 
     unsafe {
         invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
@@ -117,7 +133,7 @@ pub extern "C" fn _start() -> ! {
 
     let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
     if err != 0 {
-        com1_puts(b"[CONSOLE] initial recv failed\n");
+        serial::serial_puts(b"[CONSOLE] initial recv failed\n");
         idle();
     }
 
@@ -149,7 +165,7 @@ pub extern "C" fn _start() -> ! {
             )
         };
         if err != 0 {
-            com1_puts(b"[CONSOLE] reply_recv failed\n");
+            serial::serial_puts(b"[CONSOLE] reply_recv failed\n");
             break;
         }
     }

@@ -36,16 +36,6 @@ ap_trampoline_start:
     mov  $0xCAFE, %ax
     mov  %ax, 0x8F00
 
-    // Debug: write 'A' to serial port to confirm trampoline reached
-    mov  $0x3F8, %dx
-    add  $5, %dx
-1:  in   %dx, %al
-    test $0x20, %al
-    jz   1b
-    mov  $0x3F8, %dx
-    mov  $0x41, %al        // 'A'
-    out  %al, %dx
-
     // Load temporary GDT for 32-bit transition
     // DS=0, so effective address = 0 + operand = physical address
     lgdt (_ap_gdt32_ptr - ap_trampoline_start + 0x8000)
@@ -67,15 +57,6 @@ _ap_pm32:
     mov  %ax, %ds
     mov  %ax, %es
     mov  %ax, %ss
-
-    // Debug: write 'B' to serial port
-    mov  $0x3FD, %dx
-1:  in   %dx, %al
-    test $0x20, %al
-    jz   1b
-    mov  $0x3F8, %dx
-    mov  $0x42, %al        // 'B'
-    out  %al, %dx
 
     // Enable PAE (CR4.PAE bit 5)
     mov  %cr4, %eax
@@ -117,15 +98,6 @@ _ap_lm64:
     xor  %ax, %ax
     mov  %ax, %fs
     mov  %ax, %gs
-
-    // Debug: write 'C' to serial port
-    mov  $0x3FD, %dx
-1:  in   %dx, %al
-    test $0x20, %al
-    jz   1b
-    mov  $0x3F8, %dx
-    mov  $0x43, %al        // 'C'
-    out  %al, %dx
 
     // Load per-CPU kernel stack (set by BSP at 0x8FF8)
     mov  0x8FF8, %rsp

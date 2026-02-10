@@ -396,9 +396,12 @@ fn apply_relocations(
 
     let rela_entry_size = core::mem::size_of::<Elf64Rela>();
 
-    crate::serial_puts("[INIT] ELF: ");
-    crate::serial_dec(rela_count);
-    crate::serial_puts(" relocations\n");
+    {
+        let s = crate::SerialGuard::acquire();
+        s.puts("[INIT] ELF: ");
+        s.dec(rela_count);
+        s.puts(" relocations\n");
+    }
 
     for i in 0..rela_count {
         let entry_off = rela_file_offset + (i as usize) * rela_entry_size;

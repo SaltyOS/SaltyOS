@@ -165,12 +165,18 @@ pub unsafe fn posix_exit(status: i32) -> ! {
         msg.length = 1;
         msg.regs[0] = status as u64;
 
-        crate::ipc::send_ctx(
+        // Call blocks waiting for reply; procmgr never replies for PM_EXIT,
+        // so the child stays in ReplyWait until TCB_SUSPEND moves it to Inactive.
+        // This avoids the yield-loop that starves SCHED_IPC_LOCK on SMP.
+        let mut reply = SaltyMsg::zeroed();
+        crate::ipc::call_ctx(
             &raw mut crate::__salty_ipc_ctx,
             CAP_PROCMGR_EP,
             &raw const msg,
+            &raw mut reply,
         );
     }
+    // Unreachable: call never returns since procmgr never replies
     loop {
         crate::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
@@ -1010,6 +1016,138 @@ pub unsafe fn posix_shm_unlink(name: *const u8) -> i32 {
         }
         0
     }
+}
+
+// ======================================================================
+// Pipe / dup
+// ======================================================================
+
+pub unsafe fn posix_pipe(fds: *mut i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_PIPE;
+        msg.length = 0;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        *fds = reply.regs[0] as i32;       // read fd
+        *fds.add(1) = reply.regs[1] as i32; // write fd
+        0
+    }
+}
+
+pub unsafe fn posix_pipe2(fds: *mut i32, _flags: i32) -> i32 {
+    // For now, ignore flags (O_NONBLOCK, O_CLOEXEC) and just call pipe
+    unsafe { posix_pipe(fds) }
+}
+
+pub unsafe fn posix_dup(oldfd: i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_DUP;
+        msg.length = 1;
+        msg.regs[0] = oldfd as u64;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        reply.regs[0] as i32
+    }
+}
+
+pub unsafe fn posix_dup2(oldfd: i32, newfd: i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_DUP2;
+        msg.length = 2;
+        msg.regs[0] = oldfd as u64;
+        msg.regs[1] = newfd as u64;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        reply.regs[0] as i32
+    }
+}
+
+// ======================================================================
+// Time API
+// ======================================================================
+
+pub unsafe fn posix_clock_gettime(clock_id: i32, ts: *mut crate::types::Timespec) -> i32 {
+    unsafe {
+        let res = crate::syscall::syscall(SYS_CLOCK_GETTIME, clock_id as u64, 0, 0, 0, 0, 0);
+        if res.error != 0 {
+            return -1;
+        }
+        let ns = res.value;
+        (*ts).tv_sec = ns / 1_000_000_000;
+        (*ts).tv_nsec = ns % 1_000_000_000;
+        0
+    }
+}
+
+pub unsafe fn posix_gettimeofday(tv: *mut crate::types::Timeval) -> i32 {
+    unsafe {
+        let res = crate::syscall::syscall(SYS_CLOCK_GETTIME, 0, 0, 0, 0, 0, 0);
+        if res.error != 0 {
+            return -1;
+        }
+        let ns = res.value;
+        (*tv).tv_sec = ns / 1_000_000_000;
+        (*tv).tv_usec = (ns % 1_000_000_000) / 1_000;
+        0
+    }
+}
+
+pub unsafe fn posix_nanosleep(req: *const crate::types::Timespec, rem: *mut crate::types::Timespec) -> i32 {
+    unsafe {
+        let seconds = (*req).tv_sec;
+        let nanos = (*req).tv_nsec;
+        let res = crate::syscall::syscall(SYS_NANOSLEEP, seconds, nanos, 0, 0, 0, 0);
+        if !rem.is_null() {
+            (*rem).tv_sec = 0;
+            (*rem).tv_nsec = 0;
+        }
+        if res.error != 0 {
+            return -1;
+        }
+        0
+    }
+}
+
+pub unsafe fn posix_usleep(usec: u64) -> i32 {
+    let seconds = usec / 1_000_000;
+    let nanos = (usec % 1_000_000) * 1_000;
+    let res = crate::syscall::syscall(SYS_NANOSLEEP, seconds, nanos, 0, 0, 0, 0);
+    if res.error != 0 { -1 } else { 0 }
+}
+
+pub unsafe fn posix_sleep(seconds: u64) -> u64 {
+    let res = crate::syscall::syscall(SYS_NANOSLEEP, seconds, 0, 0, 0, 0, 0);
+    if res.error != 0 { seconds } else { 0 }
 }
 
 pub unsafe fn posix_ftruncate(fd: i32, length: u64) -> i32 {

@@ -29,6 +29,7 @@ use salty::consts::*;
 use salty::cpio;
 use salty::ipc;
 use salty::serial;
+use salty::serial::LineBuf;
 use salty::types::*;
 
 // ======================================================================
@@ -116,7 +117,6 @@ const FD_TYPE_FILE: u8 = 2;
 const FD_TYPE_DIR: u8 = 3;
 const FD_TYPE_SOCKET: u8 = 4;
 const FD_TYPE_SHM: u8 = 5;
-const FD_TYPE_EPOLL: u8 = 6;
 
 // Socket states
 const SOCK_UNBOUND: u8 = 0;
@@ -230,6 +230,11 @@ impl FdEntry {
             sock_id: 0,
         }
     }
+
+    /// Get pipe_id (aliases sock_id for pipe FDs)
+    fn pipe_id(&self) -> u32 {
+        self.sock_id
+    }
 }
 
 #[repr(C)]
@@ -310,6 +315,7 @@ struct SocketState {
     shut_rd: u8,
     shut_wr: u8,
     peer_closed: u8,
+    refcount: u16,
 }
 
 impl SocketState {
@@ -325,6 +331,7 @@ impl SocketState {
             recv_reply_slot: 0, recv_badge: 0,
             pending_caps: [0; 4], pending_cap_count: 0,
             shut_rd: 0, shut_wr: 0, peer_closed: 0,
+            refcount: 0,
         }
     }
 }
@@ -389,6 +396,90 @@ static mut SHM_DATA: [ShmData; MAX_SHM_OBJECTS] = {
     [ZERO; MAX_SHM_OBJECTS]
 };
 
+// ======================================================================
+// Pipe data structures
+// ======================================================================
+
+const PIPE_BUF_SIZE: usize = 4096;
+const MAX_PIPES: usize = 16;
+const FD_TYPE_PIPE: u8 = 7;
+const MAX_PIPE_WAITERS: usize = 4;
+
+const VFS_PIPE: u64 = 29;
+const VFS_DUP: u64 = 30;
+const VFS_DUP2: u64 = 31;
+const VFS_CLONE_FDS: u64 = 32;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PipeReadWaiter {
+    reply_slot: u64,
+    badge: u64,
+    requested_len: u16,
+}
+
+impl PipeReadWaiter {
+    const fn zeroed() -> Self {
+        PipeReadWaiter { reply_slot: 0, badge: 0, requested_len: 0 }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PipeWriteWaiter {
+    reply_slot: u64,
+    badge: u64,
+    data: [u8; 144],
+    data_len: u16,
+}
+
+impl PipeWriteWaiter {
+    const fn zeroed() -> Self {
+        PipeWriteWaiter { reply_slot: 0, badge: 0, data: [0; 144], data_len: 0 }
+    }
+}
+
+#[repr(C)]
+struct PipeState {
+    active: u8,
+    pipe_id: u32,
+    read_refcount: u16,
+    write_refcount: u16,
+    data_buf: [u8; PIPE_BUF_SIZE],
+    data_head: u16,
+    data_tail: u16,
+    recv_waiters: [PipeReadWaiter; MAX_PIPE_WAITERS],
+    recv_waiter_count: u8,
+    write_waiters: [PipeWriteWaiter; MAX_PIPE_WAITERS],
+    write_waiter_count: u8,
+}
+
+impl PipeState {
+    const fn zeroed() -> Self {
+        PipeState {
+            active: 0,
+            pipe_id: 0,
+            read_refcount: 0,
+            write_refcount: 0,
+            data_buf: [0; PIPE_BUF_SIZE],
+            data_head: 0,
+            data_tail: 0,
+            recv_waiters: [PipeReadWaiter::zeroed(); MAX_PIPE_WAITERS],
+            recv_waiter_count: 0,
+            write_waiters: [PipeWriteWaiter::zeroed(); MAX_PIPE_WAITERS],
+            write_waiter_count: 0,
+        }
+    }
+}
+
+unsafe impl Sync for PipeState {}
+
+static mut PIPES: [PipeState; MAX_PIPES] = {
+    const ZERO: PipeState = PipeState::zeroed();
+    [ZERO; MAX_PIPES]
+};
+static mut NEXT_PIPE_ID: u32 = 1;
+
 // Reply slot counter for deferred replies
 static mut NEXT_REPLY_SLOT: u64 = CAP_REPLY_BASE;
 
@@ -398,14 +489,6 @@ static mut NEXT_REPLY_SLOT: u64 = CAP_REPLY_BASE;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
-}
-
-fn hex(v: u64) {
-    serial::serial_hex(v);
-}
-
-fn putc(c: u8) {
-    serial::serial_putc(c);
 }
 
 fn ipc_ctx() -> *mut IpcContext {
@@ -708,9 +791,7 @@ unsafe fn init_ramfs() {
         let initrd = INITRD_VADDR as *const u8;
         let initrd_size = cpio::cpio_archive_size(initrd, 1024 * 1024);
 
-        puts(b"[VFS] Initrd size: ");
-        hex(initrd_size as u64);
-        puts(b" bytes\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[VFS] Initrd size: "); lb.hex(initrd_size as u64); lb.str(b" bytes\n"); lb.flush(); }
 
         let mut offset: usize = 0;
         let mut entry = CpioEntryExt::zeroed();
@@ -763,18 +844,10 @@ unsafe fn init_ramfs() {
             );
             file_count += 1;
 
-            puts(b"[VFS] initrd: ");
-            for i in 0..entry.name_len {
-                putc(*entry.name.add(i));
-            }
-            puts(b" (");
-            hex(entry.data_len as u64);
-            puts(b")\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[VFS] initrd: "); lb.bytes(core::slice::from_raw_parts(entry.name, entry.name_len)); lb.str(b" ("); lb.hex(entry.data_len as u64); lb.str(b")\n"); lb.flush(); }
         }
 
-        puts(b"[VFS] Mounted ");
-        hex(file_count as u64);
-        puts(b" initrd files\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[VFS] Mounted "); lb.hex(file_count as u64); lb.str(b" initrd files\n"); lb.flush(); }
     }
 }
 
@@ -868,11 +941,7 @@ unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
             }
 
             if inode.is_null() {
-                puts(b"[VFS] OPEN: not found '");
-                for i in 0..path_len as usize {
-                    putc(path[i]);
-                }
-                puts(b"'\n");
+                { let mut lb = LineBuf::new(); lb.str(b"[VFS] OPEN: not found '"); lb.bytes(&path[..path_len as usize]); lb.str(b"'\n"); lb.flush(); }
                 (*reply).label = SALTY_NOT_FOUND;
                 return;
             }
@@ -1577,6 +1646,7 @@ unsafe fn alloc_socket() -> *mut SocketState {
                 (*s).shut_rd = 0;
                 (*s).shut_wr = 0;
                 (*s).peer_closed = 0;
+                (*s).refcount = 1;
                 return s;
             }
         }
@@ -1686,6 +1756,597 @@ unsafe fn wake_poll_waiters(badge: u64, fd: i32, revents: u16) {
                 }
             }
         }
+    }
+}
+
+// ======================================================================
+// Pipe helpers
+// ======================================================================
+
+unsafe fn find_pipe(pipe_id: u32) -> *mut PipeState {
+    unsafe {
+        for i in 0..MAX_PIPES {
+            if PIPES[i].active != 0 && PIPES[i].pipe_id == pipe_id {
+                return &raw mut PIPES[i];
+            }
+        }
+        core::ptr::null_mut()
+    }
+}
+
+unsafe fn alloc_pipe() -> *mut PipeState {
+    unsafe {
+        for i in 0..MAX_PIPES {
+            if PIPES[i].active == 0 {
+                let p = &raw mut PIPES[i];
+                (*p).active = 1;
+                (*p).pipe_id = NEXT_PIPE_ID;
+                NEXT_PIPE_ID += 1;
+                (*p).read_refcount = 1;
+                (*p).write_refcount = 1;
+                (*p).data_head = 0;
+                (*p).data_tail = 0;
+                (*p).recv_waiter_count = 0;
+                (*p).write_waiter_count = 0;
+                return p;
+            }
+        }
+        core::ptr::null_mut()
+    }
+}
+
+unsafe fn pipe_buf_len(p: *const PipeState) -> u16 {
+    unsafe {
+        let h = (*p).data_head;
+        let t = (*p).data_tail;
+        if h >= t { h - t } else { PIPE_BUF_SIZE as u16 - t + h }
+    }
+}
+
+unsafe fn pipe_buf_free(p: *const PipeState) -> u16 {
+    (PIPE_BUF_SIZE as u16 - 1) - unsafe { pipe_buf_len(p) }
+}
+
+unsafe fn pipe_buf_write(p: *mut PipeState, data: *const u8, len: u16) -> u16 {
+    unsafe {
+        let free = pipe_buf_free(p);
+        let actual = if len < free { len } else { free };
+        for i in 0..actual as usize {
+            (*p).data_buf[(*p).data_head as usize] = *data.add(i);
+            (*p).data_head = ((*p).data_head + 1) % PIPE_BUF_SIZE as u16;
+        }
+        actual
+    }
+}
+
+unsafe fn pipe_buf_read(p: *mut PipeState, data: *mut u8, len: u16) -> u16 {
+    unsafe {
+        let avail = pipe_buf_len(p);
+        let actual = if len < avail { len } else { avail };
+        for i in 0..actual as usize {
+            *data.add(i) = (*p).data_buf[(*p).data_tail as usize];
+            (*p).data_tail = ((*p).data_tail + 1) % PIPE_BUF_SIZE as u16;
+        }
+        actual
+    }
+}
+
+/// Push a read waiter onto the pipe's FIFO queue. Returns false if full.
+unsafe fn pipe_push_recv_waiter(pipe: *mut PipeState, slot: u64, badge: u64, req_len: u16) -> bool {
+    unsafe {
+        let count = (*pipe).recv_waiter_count as usize;
+        if count >= MAX_PIPE_WAITERS { return false; }
+        (*pipe).recv_waiters[count].reply_slot = slot;
+        (*pipe).recv_waiters[count].badge = badge;
+        (*pipe).recv_waiters[count].requested_len = req_len;
+        (*pipe).recv_waiter_count = (count + 1) as u8;
+        true
+    }
+}
+
+/// Pop the first read waiter from the pipe's FIFO queue.
+unsafe fn pipe_pop_recv_waiter(pipe: *mut PipeState) -> Option<PipeReadWaiter> {
+    unsafe {
+        let count = (*pipe).recv_waiter_count as usize;
+        if count == 0 { return None; }
+        let waiter = (*pipe).recv_waiters[0];
+        // Shift remaining waiters down
+        for i in 1..count {
+            (*pipe).recv_waiters[i - 1] = (*pipe).recv_waiters[i];
+        }
+        (*pipe).recv_waiters[count - 1] = PipeReadWaiter::zeroed();
+        (*pipe).recv_waiter_count = (count - 1) as u8;
+        Some(waiter)
+    }
+}
+
+/// Push a write waiter onto the pipe's FIFO queue with saved data. Returns false if full.
+unsafe fn pipe_push_write_waiter(pipe: *mut PipeState, slot: u64, badge: u64, src: *const u8, len: u16) -> bool {
+    unsafe {
+        let count = (*pipe).write_waiter_count as usize;
+        if count >= MAX_PIPE_WAITERS { return false; }
+        (*pipe).write_waiters[count].reply_slot = slot;
+        (*pipe).write_waiters[count].badge = badge;
+        (*pipe).write_waiters[count].data_len = len;
+        let actual = if len > 144 { 144 } else { len };
+        for i in 0..actual as usize {
+            (*pipe).write_waiters[count].data[i] = *src.add(i);
+        }
+        (*pipe).write_waiter_count = (count + 1) as u8;
+        true
+    }
+}
+
+/// Pop the first write waiter from the pipe's FIFO queue.
+unsafe fn pipe_pop_write_waiter(pipe: *mut PipeState) -> Option<PipeWriteWaiter> {
+    unsafe {
+        let count = (*pipe).write_waiter_count as usize;
+        if count == 0 { return None; }
+        let waiter = (*pipe).write_waiters[0];
+        // Shift remaining waiters down
+        for i in 1..count {
+            (*pipe).write_waiters[i - 1] = (*pipe).write_waiters[i];
+        }
+        (*pipe).write_waiters[count - 1] = PipeWriteWaiter::zeroed();
+        (*pipe).write_waiter_count = (count - 1) as u8;
+        Some(waiter)
+    }
+}
+
+/// Close a pipe FD — decrement refcount, wake blocked peers, free if both zero.
+unsafe fn close_pipe(fde: *mut FdEntry) {
+    unsafe {
+        let pipe = find_pipe((*fde).pipe_id());
+        if pipe.is_null() { return; }
+
+        let is_read_end = ((*fde).flags & O_ACCMODE) == 0; // O_RDONLY = 0
+        if is_read_end {
+            (*pipe).read_refcount = (*pipe).read_refcount.saturating_sub(1);
+            // No readers left — wake ALL blocked writers with EPIPE
+            if (*pipe).read_refcount == 0 {
+                while let Some(w) = pipe_pop_write_waiter(pipe) {
+                    let mut wake = SaltyMsg::zeroed();
+                    wake.label = SALTY_INVALID_OPERATION; // EPIPE
+                    ipc::send_ctx(ipc_ctx(), w.reply_slot, &raw const wake);
+                }
+                wake_poll_waiters_pipe(pipe, false, 0x008); // POLLERR on write end
+            }
+        } else {
+            (*pipe).write_refcount = (*pipe).write_refcount.saturating_sub(1);
+            // No writers left — wake ALL blocked readers with EOF
+            if (*pipe).write_refcount == 0 {
+                while let Some(w) = pipe_pop_recv_waiter(pipe) {
+                    let mut wake = SaltyMsg::zeroed();
+                    wake.label = SALTY_OK;
+                    wake.length = 1;
+                    wake.regs[0] = 0; // EOF
+                    ipc::send_ctx(ipc_ctx(), w.reply_slot, &raw const wake);
+                }
+                wake_poll_waiters_pipe(pipe, true, 0x010); // POLLHUP on read end
+            }
+        }
+
+        // Free pipe if both ends closed
+        if (*pipe).read_refcount == 0 && (*pipe).write_refcount == 0 {
+            (*pipe).active = 0;
+        }
+    }
+}
+
+/// Wake poll waiters for any fd that is a pipe end matching the given pipe.
+/// `is_read_end`: true = wake waiters on read-end fds, false = wake waiters on write-end fds.
+unsafe fn wake_poll_waiters_pipe(pipe: *const PipeState, is_read_end: bool, revents: u16) {
+    unsafe {
+        let pipe_id = (*pipe).pipe_id;
+        for i in 0..MAX_POLL_WAITERS {
+            if POLL_WAITERS[i].active == 0 { continue; }
+            let badge = POLL_WAITERS[i].badge;
+            let cli = get_client_noalloc(badge);
+            if cli.is_null() { continue; }
+
+            let mut ready_count: u64 = 0;
+            let mut wake_reply = SaltyMsg::zeroed();
+            wake_reply.label = SALTY_OK;
+
+            for j in 0..POLL_WAITERS[i].nfds as usize {
+                let pfd = POLL_WAITERS[i].fds[j].0;
+                if pfd < 0 || pfd >= MAX_FDS as i32 { continue; }
+                let fde = &(*cli).fds[pfd as usize];
+                if fde.active == 0 || fde.fd_type != FD_TYPE_PIPE { continue; }
+                if fde.pipe_id() != pipe_id { continue; }
+                let fd_is_read = (fde.flags & O_ACCMODE) == 0;
+                if fd_is_read != is_read_end { continue; }
+
+                let requested = POLL_WAITERS[i].fds[j].1;
+                let matched = revents & (requested | 0x010 | 0x008);
+                if matched != 0 {
+                    wake_reply.regs[1 + j] = matched as u64;
+                    ready_count += 1;
+                }
+            }
+
+            if ready_count > 0 {
+                wake_reply.regs[0] = ready_count;
+                wake_reply.length = 1 + POLL_WAITERS[i].nfds as u64;
+                ipc::send_ctx(ipc_ctx(), POLL_WAITERS[i].reply_slot, &raw const wake_reply);
+                POLL_WAITERS[i].active = 0;
+            }
+        }
+    }
+}
+
+/// Look up client without allocating a new one if not found.
+unsafe fn get_client_noalloc(badge: u64) -> *mut ClientState {
+    unsafe {
+        for i in 0..MAX_CLIENTS {
+            if CLIENTS[i].active != 0 && CLIENTS[i].badge == badge {
+                return &raw mut CLIENTS[i];
+            }
+        }
+        core::ptr::null_mut()
+    }
+}
+
+// ======================================================================
+// Pipe request handlers
+// ======================================================================
+
+/// handle_pipe: create a pipe pair, return read_fd and write_fd
+unsafe fn handle_pipe(reply: *mut SaltyMsg, badge: u64) {
+    unsafe {
+        let pipe = alloc_pipe();
+        if pipe.is_null() {
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
+
+        let cli = get_client(badge);
+        if cli.is_null() {
+            (*pipe).active = 0;
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
+
+        // Allocate read-end fd
+        let mut read_fd: i32 = -1;
+        for i in 0..MAX_FDS {
+            if (*cli).fds[i].active == 0 {
+                read_fd = i as i32;
+                break;
+            }
+        }
+        if read_fd < 0 {
+            (*pipe).active = 0;
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
+
+        // Allocate write-end fd
+        let mut write_fd: i32 = -1;
+        for i in 0..MAX_FDS {
+            if (*cli).fds[i].active == 0 && i as i32 != read_fd {
+                write_fd = i as i32;
+                break;
+            }
+        }
+        if write_fd < 0 {
+            (*pipe).active = 0;
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
+
+        // Set up read-end fd
+        (*cli).fds[read_fd as usize].active = 1;
+        (*cli).fds[read_fd as usize].fd_type = FD_TYPE_PIPE;
+        (*cli).fds[read_fd as usize].sock_id = (*pipe).pipe_id; // reuse sock_id for pipe_id
+        (*cli).fds[read_fd as usize].flags = 0; // O_RDONLY = 0
+        (*cli).fds[read_fd as usize].offset = 0;
+
+        // Set up write-end fd
+        (*cli).fds[write_fd as usize].active = 1;
+        (*cli).fds[write_fd as usize].fd_type = FD_TYPE_PIPE;
+        (*cli).fds[write_fd as usize].sock_id = (*pipe).pipe_id;
+        (*cli).fds[write_fd as usize].flags = O_WRONLY; // O_WRONLY = 1
+        (*cli).fds[write_fd as usize].offset = 0;
+
+        (*reply).label = SALTY_OK;
+        (*reply).length = 2;
+        (*reply).regs[0] = read_fd as u64;
+        (*reply).regs[1] = write_fd as u64;
+    }
+}
+
+/// Handle read on a pipe fd
+unsafe fn handle_pipe_read(msg: *const SaltyMsg, fde: *mut FdEntry, reply: *mut SaltyMsg, badge: u64) -> bool {
+    unsafe {
+        // Bug 6: Verify read-end access mode
+        if ((*fde).flags & O_ACCMODE) != 0 {
+            // Not O_RDONLY — reject read on write-end
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return false;
+        }
+
+        let pipe = find_pipe((*fde).pipe_id());
+        if pipe.is_null() {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return false;
+        }
+
+        // Bug 1: Respect requested length from msg
+        let requested = (*msg).regs[1] as u16;
+        let avail = pipe_buf_len(pipe);
+        if avail > 0 {
+            let mut count = avail;
+            if requested > 0 && requested < count { count = requested; }
+            if count > 152 { count = 152; }
+            let dst = &raw mut (*reply).regs[1] as *mut u8;
+            let actual = pipe_buf_read(pipe, dst, count);
+            (*reply).label = SALTY_OK;
+            (*reply).length = 1 + ((actual as u64 + 7) / 8);
+            (*reply).regs[0] = actual as u64;
+
+            // Bug 2+7: Wake blocked writer — write their saved data into buffer
+            if let Some(w) = pipe_pop_write_waiter(pipe) {
+                let written = pipe_buf_write(pipe, w.data.as_ptr(), w.data_len);
+                let mut wake = SaltyMsg::zeroed();
+                wake.label = SALTY_OK;
+                wake.length = 1;
+                wake.regs[0] = written as u64;
+                ipc::send_ctx(ipc_ctx(), w.reply_slot, &raw const wake);
+            }
+
+            // Wake poll waiters on write-end (POLLOUT — space available)
+            wake_poll_waiters_pipe(pipe, false, 0x004);
+            return false;
+        }
+
+        // Buffer empty
+        if (*pipe).write_refcount == 0 {
+            // No writers — return EOF
+            (*reply).label = SALTY_OK;
+            (*reply).length = 1;
+            (*reply).regs[0] = 0;
+            return false;
+        }
+
+        // Block reader — save caller (Bug 7: multi-waiter)
+        let slot = alloc_reply_slot();
+        let err = salty::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
+        if err != 0 {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return false;
+        }
+        let req_len = if requested > 0 && requested < 152 { requested } else { 152 };
+        if !pipe_push_recv_waiter(pipe, slot, badge, req_len) {
+            // Waiter queue full — return EAGAIN
+            (*reply).label = SALTY_WOULD_BLOCK;
+            return false;
+        }
+        true // deferred
+    }
+}
+
+/// Handle write on a pipe fd
+unsafe fn handle_pipe_write(msg: *const SaltyMsg, fde: *mut FdEntry, reply: *mut SaltyMsg, badge: u64) -> bool {
+    unsafe {
+        // Bug 6: Verify write-end access mode
+        if ((*fde).flags & O_ACCMODE) != O_WRONLY {
+            // Not O_WRONLY — reject write on read-end
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return false;
+        }
+
+        let pipe = find_pipe((*fde).pipe_id());
+        if pipe.is_null() {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return false;
+        }
+
+        // No readers — EPIPE
+        if (*pipe).read_refcount == 0 {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return false;
+        }
+
+        let count = (*msg).regs[1];
+        let src = &(*msg).regs[2] as *const u64 as *const u8;
+        let mut actual_count = count;
+        if actual_count > 144 { actual_count = 144; }
+
+        let free = pipe_buf_free(pipe);
+        if free == 0 {
+            // Buffer full — block writer with saved data (Bug 2+7: multi-waiter)
+            let slot = alloc_reply_slot();
+            let err = salty::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
+            if err != 0 {
+                (*reply).label = SALTY_INVALID_OPERATION;
+                return false;
+            }
+            if !pipe_push_write_waiter(pipe, slot, badge, src, actual_count as u16) {
+                // Waiter queue full — return EAGAIN
+                (*reply).label = SALTY_WOULD_BLOCK;
+                return false;
+            }
+            return true; // deferred
+        }
+
+        let written = pipe_buf_write(pipe, src, actual_count as u16);
+
+        // Bug 7: Wake blocked reader — pop from multi-waiter queue
+        if written > 0 {
+            if let Some(w) = pipe_pop_recv_waiter(pipe) {
+                let mut wake = SaltyMsg::zeroed();
+                let avail = pipe_buf_len(pipe);
+                let mut rcount = avail;
+                if w.requested_len > 0 && w.requested_len < rcount { rcount = w.requested_len; }
+                if rcount > 152 { rcount = 152; }
+                let dst = &raw mut wake.regs[1] as *mut u8;
+                let actual = pipe_buf_read(pipe, dst, rcount);
+                wake.label = SALTY_OK;
+                wake.length = 1 + ((actual as u64 + 7) / 8);
+                wake.regs[0] = actual as u64;
+                ipc::send_ctx(ipc_ctx(), w.reply_slot, &raw const wake);
+            }
+        }
+
+        // Wake poll waiters on read-end (POLLIN — data available)
+        if written > 0 {
+            wake_poll_waiters_pipe(pipe, true, 0x001);
+        }
+
+        (*reply).label = SALTY_OK;
+        (*reply).length = 1;
+        (*reply).regs[0] = written as u64;
+        false
+    }
+}
+
+// ======================================================================
+// Dup/dup2 handlers
+// ======================================================================
+
+unsafe fn handle_dup(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+    unsafe {
+        let oldfd = (*msg).regs[0] as i32;
+        let cli = get_client(badge);
+        if cli.is_null() || oldfd < 0 || oldfd >= MAX_FDS as i32
+            || (*cli).fds[oldfd as usize].active == 0
+        {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        // Find lowest free fd
+        let mut newfd: i32 = -1;
+        for i in 0..MAX_FDS {
+            if (*cli).fds[i].active == 0 {
+                newfd = i as i32;
+                break;
+            }
+        }
+        if newfd < 0 {
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
+
+        dup_fd_entry(cli, oldfd, newfd);
+
+        (*reply).label = SALTY_OK;
+        (*reply).length = 1;
+        (*reply).regs[0] = newfd as u64;
+    }
+}
+
+unsafe fn handle_dup2(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+    unsafe {
+        let oldfd = (*msg).regs[0] as i32;
+        let newfd = (*msg).regs[1] as i32;
+        let cli = get_client(badge);
+        if cli.is_null() || oldfd < 0 || oldfd >= MAX_FDS as i32
+            || newfd < 0 || newfd >= MAX_FDS as i32
+            || (*cli).fds[oldfd as usize].active == 0
+        {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        if oldfd == newfd {
+            (*reply).label = SALTY_OK;
+            (*reply).length = 1;
+            (*reply).regs[0] = newfd as u64;
+            return;
+        }
+
+        // Close newfd if open
+        if (*cli).fds[newfd as usize].active != 0 {
+            let fde = &raw mut (*cli).fds[newfd as usize];
+            if (*fde).fd_type == FD_TYPE_SOCKET {
+                close_socket(fde);
+            } else if (*fde).fd_type == FD_TYPE_PIPE {
+                close_pipe(fde);
+            }
+            (*cli).fds[newfd as usize].active = 0;
+        }
+
+        dup_fd_entry(cli, oldfd, newfd);
+
+        (*reply).label = SALTY_OK;
+        (*reply).length = 1;
+        (*reply).regs[0] = newfd as u64;
+    }
+}
+
+/// Copy fd entry and increment refcounts as needed.
+unsafe fn dup_fd_entry(cli: *mut ClientState, oldfd: i32, newfd: i32) {
+    unsafe {
+        (*cli).fds[newfd as usize] = (*cli).fds[oldfd as usize];
+        let fde = &(*cli).fds[newfd as usize];
+        if fde.fd_type == FD_TYPE_PIPE {
+            let pipe = find_pipe(fde.pipe_id());
+            if !pipe.is_null() {
+                let is_read = (fde.flags & O_ACCMODE) == 0;
+                if is_read {
+                    (*pipe).read_refcount += 1;
+                } else {
+                    (*pipe).write_refcount += 1;
+                }
+            }
+        } else if fde.fd_type == FD_TYPE_SOCKET {
+            let sock = find_socket(fde.sock_id);
+            if !sock.is_null() {
+                (*sock).refcount += 1;
+            }
+        }
+    }
+}
+
+// ======================================================================
+// Fork FD inheritance (VFS_CLONE_FDS)
+// ======================================================================
+
+unsafe fn handle_clone_fds(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
+    unsafe {
+        let parent_badge = (*msg).regs[0];
+        let child_badge = (*msg).regs[1];
+
+        let parent = get_client_noalloc(parent_badge);
+        if parent.is_null() {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        let child = get_client(child_badge);
+        if child.is_null() {
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
+
+        // Copy all FDs from parent to child
+        for i in 0..MAX_FDS {
+            (*child).fds[i] = (*parent).fds[i];
+            if (*child).fds[i].active == 0 { continue; }
+            // Increment pipe refcounts
+            if (*child).fds[i].fd_type == FD_TYPE_PIPE {
+                let pipe = find_pipe((*child).fds[i].pipe_id());
+                if !pipe.is_null() {
+                    let is_read = ((*child).fds[i].flags & O_ACCMODE) == 0;
+                    if is_read {
+                        (*pipe).read_refcount += 1;
+                    } else {
+                        (*pipe).write_refcount += 1;
+                    }
+                }
+            }
+            // Increment socket refcounts
+            if (*child).fds[i].fd_type == FD_TYPE_SOCKET {
+                let sock = find_socket((*child).fds[i].sock_id);
+                if !sock.is_null() {
+                    (*sock).refcount += 1;
+                }
+            }
+        }
+
+        (*reply).label = SALTY_OK;
     }
 }
 
@@ -2249,11 +2910,15 @@ unsafe fn handle_socket_write(msg: *const SaltyMsg, fde: *mut FdEntry, reply: *m
     }
 }
 
-/// Close a socket fd — signal peer, cleanup
+/// Close a socket fd — decrement refcount, only destroy when last reference closed
 unsafe fn close_socket(fde: *mut FdEntry) {
     unsafe {
         let sock = find_socket((*fde).sock_id);
         if sock.is_null() { return; }
+
+        // Decrement refcount — only destroy socket when last fd is closed
+        (*sock).refcount = (*sock).refcount.saturating_sub(1);
+        if (*sock).refcount > 0 { return; }
 
         // Signal peer
         if (*sock).peer_sock_id != 0 {
@@ -2299,6 +2964,7 @@ unsafe fn close_socket(fde: *mut FdEntry) {
             }
         }
 
+        (*sock).state = SOCK_CLOSED;
         (*sock).active = 0;
     }
 }
@@ -2529,6 +3195,29 @@ unsafe fn handle_poll(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) ->
                     } else if !sock.is_null() && (*sock).state == SOCK_LISTENING {
                         if events & 0x001 != 0 && (*sock).pending_count > 0 {
                             rev |= 0x001;
+                        }
+                    }
+                }
+                FD_TYPE_PIPE => {
+                    let pipe = find_pipe(fde.pipe_id());
+                    if !pipe.is_null() {
+                        let is_read = (fde.flags & O_ACCMODE) == 0;
+                        if is_read {
+                            // Read end
+                            if events & 0x001 != 0 && pipe_buf_len(pipe) > 0 {
+                                rev |= 0x001; // POLLIN
+                            }
+                            if (*pipe).write_refcount == 0 {
+                                rev |= 0x010; // POLLHUP — no writers
+                            }
+                        } else {
+                            // Write end
+                            if events & 0x004 != 0 && pipe_buf_free(pipe) > 0 {
+                                rev |= 0x004; // POLLOUT
+                            }
+                            if (*pipe).read_refcount == 0 {
+                                rev |= 0x008; // POLLERR — no readers
+                            }
                         }
                     }
                 }
@@ -2797,7 +3486,6 @@ unsafe fn handle_ftruncate(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
             // Allocate frames
             let shm = &raw mut SHM_DATA[shm_idx];
             let cap_untyped: u64 = 7; // CAP_UNTYPED for VFS
-            let cap_self_cspace: u64 = 2;
 
             // Use high cap slots for SHM frames: 192+
             let frame_base: u64 = 192 + shm_idx as u64 * MAX_SHM_PAGES as u64;
@@ -2840,9 +3528,7 @@ pub extern "C" fn _start() -> ! {
 
     let err = salty::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
     if err != 0 {
-        puts(b"[VFS] FAIL: set IPC buffer err=");
-        hex(err as u64);
-        puts(b"\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[VFS] FAIL: set IPC buffer err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
         idle();
     }
     unsafe {
@@ -2861,14 +3547,15 @@ pub extern "C" fn _start() -> ! {
     if VFS_CAP_NAMESERV_EP != 0 {
         let mut reg_msg = SaltyMsg::zeroed();
         let mut reg_reply = SaltyMsg::zeroed();
-        reg_msg.label = 1; // NS_REGISTER
-        reg_msg.regs[0] = 3; // length of "vfs"
-        reg_msg.length = 1 + (3 + 7) / 8;
+        let svc_name = b"vfs";
+        reg_msg.label = POSIX_NS_REGISTER;
+        reg_msg.regs[0] = svc_name.len() as u64;
+        reg_msg.length = 1 + (svc_name.len() as u64 + 7) / 8;
         let ns_dst = &raw mut reg_msg.regs[1] as *mut u8;
         unsafe {
-            *ns_dst = b'v';
-            *ns_dst.add(1) = b'f';
-            *ns_dst.add(2) = b's';
+            for i in 0..svc_name.len() {
+                *ns_dst.add(i) = svc_name[i];
+            }
         }
 
         unsafe {
@@ -2902,15 +3589,24 @@ pub extern "C" fn _start() -> ! {
             match msg.label {
                 VFS_OPEN => { handle_open(&raw const msg, &raw mut reply, badge); }
                 VFS_READ => {
-                    // Check if this is a socket fd — route to socket read
                     let fd = msg.regs[0] as i32;
                     let cli = get_client(badge);
                     if !cli.is_null() && fd >= 0 && fd < MAX_FDS as i32
                         && (*cli).fds[fd as usize].active != 0
-                        && (*cli).fds[fd as usize].fd_type == FD_TYPE_SOCKET
                     {
-                        skip_reply = handle_socket_read(
-                            &raw mut (*cli).fds[fd as usize], &raw mut reply, badge);
+                        match (*cli).fds[fd as usize].fd_type {
+                            FD_TYPE_SOCKET => {
+                                skip_reply = handle_socket_read(
+                                    &raw mut (*cli).fds[fd as usize], &raw mut reply, badge);
+                            }
+                            FD_TYPE_PIPE => {
+                                skip_reply = handle_pipe_read(
+                                    &raw const msg, &raw mut (*cli).fds[fd as usize], &raw mut reply, badge);
+                            }
+                            _ => {
+                                handle_read(&raw const msg, &raw mut reply, badge);
+                            }
+                        }
                     } else {
                         handle_read(&raw const msg, &raw mut reply, badge);
                     }
@@ -2920,10 +3616,20 @@ pub extern "C" fn _start() -> ! {
                     let cli = get_client(badge);
                     if !cli.is_null() && fd >= 0 && fd < MAX_FDS as i32
                         && (*cli).fds[fd as usize].active != 0
-                        && (*cli).fds[fd as usize].fd_type == FD_TYPE_SOCKET
                     {
-                        skip_reply = handle_socket_write(
-                            &raw const msg, &raw mut (*cli).fds[fd as usize], &raw mut reply);
+                        match (*cli).fds[fd as usize].fd_type {
+                            FD_TYPE_SOCKET => {
+                                skip_reply = handle_socket_write(
+                                    &raw const msg, &raw mut (*cli).fds[fd as usize], &raw mut reply);
+                            }
+                            FD_TYPE_PIPE => {
+                                skip_reply = handle_pipe_write(
+                                    &raw const msg, &raw mut (*cli).fds[fd as usize], &raw mut reply, badge);
+                            }
+                            _ => {
+                                handle_write(&raw const msg, &raw mut reply, badge);
+                            }
+                        }
                     } else {
                         handle_write(&raw const msg, &raw mut reply, badge);
                     }
@@ -2933,9 +3639,16 @@ pub extern "C" fn _start() -> ! {
                     let cli = get_client(badge);
                     if !cli.is_null() && fd >= 0 && fd < MAX_FDS as i32
                         && (*cli).fds[fd as usize].active != 0
-                        && (*cli).fds[fd as usize].fd_type == FD_TYPE_SOCKET
                     {
-                        close_socket(&raw mut (*cli).fds[fd as usize]);
+                        match (*cli).fds[fd as usize].fd_type {
+                            FD_TYPE_SOCKET => {
+                                close_socket(&raw mut (*cli).fds[fd as usize]);
+                            }
+                            FD_TYPE_PIPE => {
+                                close_pipe(&raw mut (*cli).fds[fd as usize]);
+                            }
+                            _ => {}
+                        }
                     }
                     handle_close(&raw const msg, &raw mut reply, badge);
                 }
@@ -2989,10 +3702,20 @@ pub extern "C" fn _start() -> ! {
                 VFS_SHUTDOWN => {
                     skip_reply = handle_shutdown(&raw const msg, &raw mut reply, badge);
                 }
+                VFS_PIPE => {
+                    handle_pipe(&raw mut reply, badge);
+                }
+                VFS_DUP => {
+                    handle_dup(&raw const msg, &raw mut reply, badge);
+                }
+                VFS_DUP2 => {
+                    handle_dup2(&raw const msg, &raw mut reply, badge);
+                }
+                VFS_CLONE_FDS => {
+                    handle_clone_fds(&raw const msg, &raw mut reply);
+                }
                 _ => {
-                    puts(b"[VFS] unknown label=");
-                    hex(msg.label);
-                    puts(b"\n");
+                    { let mut lb = LineBuf::new(); lb.str(b"[VFS] unknown label="); lb.hex(msg.label); lb.str(b"\n"); lb.flush(); }
                     reply.label = SALTY_INVALID_OPERATION;
                 }
             }
@@ -3004,9 +3727,7 @@ pub extern "C" fn _start() -> ! {
             unsafe { ipc::reply_recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw const reply, &raw mut msg, &raw mut badge) }
         };
         if err != 0 {
-            puts(b"[VFS] reply_recv failed err=");
-            hex(err as u64);
-            puts(b"\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[VFS] reply_recv failed err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
             break;
         }
     }

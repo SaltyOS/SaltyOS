@@ -5,6 +5,7 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 pub mod scheduler;
+pub mod sleep_queue;
 pub mod thread;
 
 // Re-exports for public API
@@ -30,22 +31,23 @@ const IDLE_STACK_SIZE: usize = PAGE_SIZE;
 /// that have reached quiescent state.
 extern "C" fn idle_thread() -> ! {
     loop {
+        // sched_ipc_lock does cli + acquire SCHED_IPC_LOCK
+        crate::sched_ipc_lock();
+
         // CRITICAL: Periodically process pending deactivates
-        // This structurally guarantees that CPUs receiving IPI will process pending
-        scheduler().with_lock(|_| {
-            // Empty closure - we just want the side effect of kernel_exit_epilogue()
-        });
+        // with_lock acquires scheduler lock internally and calls kernel_exit_epilogue
+        scheduler().with_lock(|_| {});
 
         // BSP also processes deferred free (only BSP to avoid concurrent manipulation)
         if arch::current_cpu() == 0 {
             crate::mm::process_deferred_free();
         }
 
-        // Enable interrupts and halt
-        // The CPU will wake up on the next interrupt (timer, etc.)
+        crate::sched_ipc_unlock();
+
+        // IF was cleared by sched_ipc_lock's cli; re-enable before halt
         arch::sti();
         arch::halt();
-        // After interrupt, check for work and loop
     }
 }
 
@@ -184,13 +186,19 @@ unsafe fn allocate_idle_stack() -> u64 {
 ///
 /// Called by a thread to voluntarily give up the CPU.
 /// The thread is placed back in the ready queue and a reschedule is triggered.
+/// SCHED_IPC_LOCK is held across reschedule (do_context_switch releases/reacquires it).
 pub fn yield_now() {
-    let current = scheduler().current();
-    if !current.is_null() && current != scheduler().get_idle() {
-        // Put current back in ready queue
-        scheduler().enqueue(current);
-        // Trigger reschedule
-        scheduler().reschedule();
+    unsafe {
+        let irq = crate::mm::save_irq_disable();
+        crate::mm::SCHED_IPC_LOCK.lock();
+        let sched = scheduler();
+        let current = sched.current();
+        if !current.is_null() && current != sched.get_idle() {
+            sched.enqueue(current);
+            sched.reschedule();
+        }
+        crate::mm::SCHED_IPC_LOCK.unlock();
+        crate::mm::restore_irq(irq);
     }
 }
 

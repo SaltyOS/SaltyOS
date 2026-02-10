@@ -27,6 +27,7 @@ use salty::cpio;
 use salty::invoke;
 use salty::ipc;
 use salty::serial;
+use salty::serial::LineBuf;
 use salty::syscall::syscall;
 use salty::types::*;
 
@@ -66,7 +67,10 @@ pub const SRV_STACK_PAGES: usize = 4;
 pub const SRV_STACK_SIZE: u64 = SRV_STACK_PAGES as u64 * 4096;
 pub const SRV_STACK_TOP: u64 = CHILD_STACK_VADDR + SRV_STACK_SIZE;
 
-const PROCMGR_CNODE_SIZE_BITS: u64 = 14;
+const PROCMGR_CNODE_SIZE_BITS: u64 = 15;
+const CHILD_UT_BITS_DEFAULT: u8 = 20;  // 1MB per child
+const CHILD_UT_BITS_PROCMGR: u8 = 25;  // 32MB for procmgr (spawns children)
+const PM_WAIT_ANY_CHILD: u64 = u32::MAX as u64;
 
 const INIT_DYN_FRAME_MIN: u64 = 720;
 
@@ -96,10 +100,6 @@ static mut INIT_DYN_FRAME_NEXT: u64 = INIT_DYN_FRAME_MIN;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
-}
-
-fn hex(v: u64) {
-    serial::serial_hex(v);
 }
 
 pub fn ipc_ctx() -> *mut IpcContext {
@@ -161,27 +161,19 @@ unsafe fn load_service_defs(mgr: &mut svc_mgr::ServiceManager) {
                 continue;
             }
 
-            puts(b"[INIT] Found service file: ");
-            serial::serial_puts(name);
-            puts(b"\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] Found service file: "); lb.bytes(name); lb.str(b"\n"); lb.flush(); }
 
             let data = core::slice::from_raw_parts(entry.data, entry.data_len);
             let mut def = ini::ServiceDef::zeroed();
             if ini::parse_service(data, &mut def) {
-                puts(b"[INIT] Parsed service: ");
-                serial::serial_puts(def.name_bytes());
-                puts(b" binary=");
-                serial::serial_puts(def.binary_bytes());
-                puts(b"\n");
+                { let mut lb = LineBuf::new(); lb.str(b"[INIT] Parsed service: "); lb.bytes(def.name_bytes()); lb.str(b" binary="); lb.bytes(def.binary_bytes()); lb.str(b"\n"); lb.flush(); }
                 mgr.add_service(&def);
             } else {
                 puts(b"[INIT] WARN: failed to parse service file\n");
             }
         }
 
-        puts(b"[INIT] Found ");
-        hex(mgr.count as u64);
-        puts(b" services\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[INIT] Found "); lb.hex(mgr.count as u64); lb.str(b" services\n"); lb.flush(); }
     }
 }
 
@@ -233,17 +225,13 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap) -> Cap {
         let svc_idx = mgr.boot_order[order_idx] as usize;
 
         if mgr.services[svc_idx].state == svc_mgr::ServiceState::Failed {
-            puts(b"[INIT] Skipping failed service: ");
-            puts(mgr.services[svc_idx].def.name_bytes());
-            puts(b"\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] Skipping failed service: "); lb.bytes(mgr.services[svc_idx].def.name_bytes()); lb.str(b"\n"); lb.flush(); }
             continue;
         }
 
         // Check deps satisfied
         if !mgr.deps_satisfied(svc_idx) {
-            puts(b"[INIT] Dependencies not met for ");
-            puts(mgr.services[svc_idx].def.name_bytes());
-            puts(b", marking Failed\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] Dependencies not met for "); lb.bytes(mgr.services[svc_idx].def.name_bytes()); lb.str(b", marking Failed\n"); lb.flush(); }
             mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
             continue;
         }
@@ -266,8 +254,10 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap) -> Cap {
             let cap_base = get_cap_base(pre_spawn_idx);
 
             let extras = build_extras(name, console_ep, nameserv_ep, vfs_ep);
-            let cnode_bits = if bytes_eq(name, b"procmgr") { PROCMGR_CNODE_SIZE_BITS } else { 0 };
-            let map_initrd = bytes_eq(name, b"procmgr");
+            let is_procmgr = bytes_eq(name, b"procmgr");
+            let cnode_bits = if is_procmgr { PROCMGR_CNODE_SIZE_BITS } else { 0 };
+            let map_initrd = is_procmgr;
+            let ut_bits = if is_procmgr { CHILD_UT_BITS_PROCMGR } else { CHILD_UT_BITS_DEFAULT };
 
             let err = unsafe {
                 spawn::spawn_server(
@@ -278,6 +268,7 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap) -> Cap {
                     &extras,
                     map_initrd,
                     cnode_bits,
+                    ut_bits,
                 )
             };
 
@@ -321,9 +312,7 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap) -> Cap {
         } else {
             // Post-procmgr: spawn via procmgr IPC
             if procmgr_ep == 0 {
-                puts(b"[INIT] Cannot spawn ");
-                puts(name);
-                puts(b" - procmgr not available\n");
+                { let mut lb = LineBuf::new(); lb.str(b"[INIT] Cannot spawn "); lb.bytes(name); lb.str(b" - procmgr not available\n"); lb.flush(); }
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
                 continue;
             }
@@ -342,9 +331,7 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap) -> Cap {
 
             let pid = unsafe { spawn::pm_spawn(procmgr_ep, spawn_name) };
             if pid < 0 {
-                puts(b"[INIT] Failed to spawn ");
-                puts(name);
-                puts(b" via procmgr\n");
+                { let mut lb = LineBuf::new(); lb.str(b"[INIT] Failed to spawn "); lb.bytes(name); lb.str(b" via procmgr\n"); lb.flush(); }
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
                 continue;
             }
@@ -411,16 +398,87 @@ fn find_service_by_pid(mgr: &svc_mgr::ServiceManager, pid: u32) -> i32 {
     -1
 }
 
-/// Poll procmgr for exited children (WNOHANG).
-unsafe fn poll_exited_children(mgr: &mut svc_mgr::ServiceManager, pm_ep: Cap) {
+/// Send a blocking PM_WAIT(-1, 0) to procmgr. Init sleeps until a child exits.
+/// Returns (exit_status, child_pid), or (0, 0) on error / no children.
+unsafe fn blocking_wait_child(pm_ep: Cap) -> (i32, u32) {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        msg.label = POSIX_PM_WAIT;
+        msg.length = 2;
+        msg.regs[0] = PM_WAIT_ANY_CHILD;
+        msg.regs[1] = 0; // blocking (no WNOHANG)
+
+        let mut reply = SaltyMsg::zeroed();
+        let err = ipc::call_ctx(ipc_ctx(), pm_ep, &raw const msg, &raw mut reply);
+        if err != 0 || reply.label != SALTY_OK {
+            return (0, 0);
+        }
+
+        let exit_status = reply.regs[0] as i32;
+        let child_pid = reply.regs[1] as u32;
+        (exit_status, child_pid)
+    }
+}
+
+/// Process a single child exit: log, record in service manager, restart if needed.
+unsafe fn handle_child_exit(
+    mgr: &mut svc_mgr::ServiceManager,
+    pm_ep: Cap,
+    child_pid: u32,
+    exit_status: i32,
+) {
+    { let mut lb = LineBuf::new(); lb.str(b"[INIT] Child exited: pid="); lb.hex(child_pid as u64); lb.str(b" status="); lb.hex(exit_status as u64); lb.str(b"\n"); lb.flush(); }
+
+    let idx = find_service_by_pid(mgr, child_pid);
+    if idx < 0 {
+        puts(b"[INIT] Unknown child pid, ignoring\n");
+        return;
+    }
+
+    let svc_idx = idx as usize;
+
+    let exit_code = if (exit_status & 0x7f) == 0 {
+        (exit_status >> 8) & 0xff
+    } else {
+        exit_status
+    };
+
+    mgr.record_exit(svc_idx, exit_code);
+
+    if mgr.should_restart(svc_idx) {
+        unsafe {
+            let mut bin_buf = [0u8; 48];
+            let bin_len = mgr.services[svc_idx].def.binary_len as usize;
+            bin_buf[..bin_len].copy_from_slice(&mgr.services[svc_idx].def.binary[..bin_len]);
+            let elf_name = &bin_buf[..bin_len];
+
+            let spawn_name = if ends_with(elf_name, b".elf") {
+                &elf_name[..elf_name.len() - 4]
+            } else {
+                elf_name
+            };
+
+            let new_pid = spawn::pm_spawn(pm_ep, spawn_name);
+            if new_pid < 0 {
+                puts(b"[INIT] Failed to restart service\n");
+                mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
+            } else {
+                mgr.services[svc_idx].pid = new_pid as u32;
+                mgr.set_state(svc_idx, svc_mgr::ServiceState::Running);
+            }
+        }
+    }
+}
+
+/// Drain remaining zombie children using WNOHANG (non-blocking).
+unsafe fn drain_zombies(mgr: &mut svc_mgr::ServiceManager, pm_ep: Cap) {
     unsafe {
         loop {
-            // PM_WAIT(-1, WNOHANG)
             let mut msg = SaltyMsg::zeroed();
-            msg.label = 3; // PM_WAIT
+            msg.label = POSIX_PM_WAIT;
             msg.length = 2;
-            msg.regs[0] = 0xFFFF_FFFF; // pid = -1 (any child)
-            msg.regs[1] = 1; // WNOHANG
+            msg.regs[0] = PM_WAIT_ANY_CHILD;
+            msg.regs[1] = WNOHANG;
 
             let mut reply = SaltyMsg::zeroed();
             let err = ipc::call_ctx(ipc_ctx(), pm_ep, &raw const msg, &raw mut reply);
@@ -428,74 +486,38 @@ unsafe fn poll_exited_children(mgr: &mut svc_mgr::ServiceManager, pm_ep: Cap) {
                 break;
             }
 
-            let exit_status = reply.regs[0] as i32;
             let child_pid = reply.regs[1] as u32;
-
-            // WNOHANG: pid=0 means no zombie found
             if child_pid == 0 {
                 break;
             }
 
-            puts(b"[INIT] Child exited: pid=");
-            hex(child_pid as u64);
-            puts(b" status=");
-            hex(exit_status as u64);
-            puts(b"\n");
-
-            let idx = find_service_by_pid(mgr, child_pid);
-            if idx < 0 {
-                puts(b"[INIT] Unknown child pid, ignoring\n");
-                continue;
-            }
-
-            let svc_idx = idx as usize;
-
-            // Extract exit code from wait status
-            let exit_code = if (exit_status & 0x7f) == 0 {
-                (exit_status >> 8) & 0xff
-            } else {
-                exit_status
-            };
-
-            mgr.record_exit(svc_idx, exit_code);
-
-            if mgr.should_restart(svc_idx) {
-                // Re-spawn via procmgr
-                let mut bin_buf = [0u8; 48];
-                let bin_len = mgr.services[svc_idx].def.binary_len as usize;
-                bin_buf[..bin_len].copy_from_slice(&mgr.services[svc_idx].def.binary[..bin_len]);
-                let elf_name = &bin_buf[..bin_len];
-
-                let spawn_name = if ends_with(elf_name, b".elf") {
-                    &elf_name[..elf_name.len() - 4]
-                } else {
-                    elf_name
-                };
-
-                let new_pid = spawn::pm_spawn(pm_ep, spawn_name);
-                if new_pid < 0 {
-                    puts(b"[INIT] Failed to restart service\n");
-                    mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
-                } else {
-                    mgr.services[svc_idx].pid = new_pid as u32;
-                    mgr.set_state(svc_idx, svc_mgr::ServiceState::Running);
-                }
-            }
+            let exit_status = reply.regs[0] as i32;
+            handle_child_exit(mgr, pm_ep, child_pid, exit_status);
         }
     }
 }
 
-/// Main service monitor loop. Polls procmgr for child exits and handles restarts.
+/// Main service monitor loop. Blocks in procmgr until a child exits, then
+/// handles restart and drains additional zombies before blocking again.
+/// This avoids WNOHANG polling that starves other procmgr clients on SMP.
 unsafe fn service_monitor(mgr: &mut svc_mgr::ServiceManager, pm_ep: Cap) -> ! {
+    if pm_ep == 0 {
+        idle();
+    }
+
     loop {
-        // Yield several times to avoid busy polling
-        for _ in 0..10 {
-            syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        let (exit_status, child_pid) = unsafe { blocking_wait_child(pm_ep) };
+
+        if child_pid == 0 {
+            // No children in procmgr yet — yield and retry
+            for _ in 0..50 {
+                syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+            }
+            continue;
         }
 
-        if pm_ep != 0 {
-            unsafe { poll_exited_children(mgr, pm_ep) };
-        }
+        unsafe { handle_child_exit(mgr, pm_ep, child_pid, exit_status) };
+        unsafe { drain_zombies(mgr, pm_ep) };
     }
 }
 
@@ -529,9 +551,7 @@ pub extern "C" fn _start() -> ! {
     unsafe {
         ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
     }
-    puts(b"[INIT] IPC buffer mapped at ");
-    hex(IPC_BUF_VADDR);
-    puts(b"\n");
+    { let mut lb = LineBuf::new(); lb.str(b"[INIT] IPC buffer mapped at "); lb.hex(IPC_BUF_VADDR); lb.str(b"\n"); lb.flush(); }
 
     // Optional self-tests (IPC + fault handling)
     // Check if selftest is enabled by looking for "selftest.enable" in CPIO
@@ -602,7 +622,7 @@ unsafe fn legacy_boot(ut: Cap) {
                 ExtraCapCopy { src: CAP_COM1_IOPORT, dst: 4 },
                 ExtraCapCopy { src: CAP_COM1_IRQ, dst: 5 },
                 ExtraCapCopy { src: CAP_COM1_NTFN, dst: 6 },
-            ], false, 0) != 0 {
+            ], false, 0, CHILD_UT_BITS_DEFAULT) != 0 {
             puts(b"[INIT] FAIL: console spawn failed\n");
             return;
         }
@@ -614,7 +634,7 @@ unsafe fn legacy_boot(ut: Cap) {
         let mut pm_ep = LEGACY_CAP_PM_BASE + COFF_EP;
 
         // Spawn nameserv
-        if spawn::spawn_server(ut, LEGACY_CAP_NS_BASE, b"nameserv.elf", b"nameserv", &[], false, 0) != 0 {
+        if spawn::spawn_server(ut, LEGACY_CAP_NS_BASE, b"nameserv.elf", b"nameserv", &[], false, 0, CHILD_UT_BITS_DEFAULT) != 0 {
             puts(b"[INIT] FAIL: nameserv spawn failed\n");
             return;
         }
@@ -625,7 +645,7 @@ unsafe fn legacy_boot(ut: Cap) {
             ExtraCapCopy { src: console_ep, dst: 4 },
             ExtraCapCopy { src: ns_ep, dst: 8 },
         ];
-        if spawn::spawn_server(ut, LEGACY_CAP_VFS_BASE, b"vfs.elf", b"vfs", &vfs_extras, false, 0) != 0 {
+        if spawn::spawn_server(ut, LEGACY_CAP_VFS_BASE, b"vfs.elf", b"vfs", &vfs_extras, false, 0, CHILD_UT_BITS_DEFAULT) != 0 {
             puts(b"[INIT] FAIL: vfs spawn failed\n");
             return;
         }
@@ -636,7 +656,7 @@ unsafe fn legacy_boot(ut: Cap) {
             ExtraCapCopy { src: ns_ep, dst: 8 },
             ExtraCapCopy { src: vfs_ep, dst: 9 },
         ];
-        if spawn::spawn_server(ut, LEGACY_CAP_PM_BASE, b"procmgr.elf", b"procmgr", &pm_extras, true, PROCMGR_CNODE_SIZE_BITS) != 0 {
+        if spawn::spawn_server(ut, LEGACY_CAP_PM_BASE, b"procmgr.elf", b"procmgr", &pm_extras, true, PROCMGR_CNODE_SIZE_BITS, CHILD_UT_BITS_PROCMGR) != 0 {
             puts(b"[INIT] FAIL: procmgr spawn failed\n");
             return;
         }
@@ -668,7 +688,7 @@ unsafe fn legacy_boot(ut: Cap) {
 
         // Wait for test_runner to complete
         let mut wait_msg = SaltyMsg::zeroed();
-        wait_msg.label = 3; // PM_WAIT
+        wait_msg.label = POSIX_PM_WAIT;
         wait_msg.length = 1;
         wait_msg.regs[0] = pid as u64;
 
@@ -680,9 +700,7 @@ unsafe fn legacy_boot(ut: Cap) {
         }
         let status = wait_reply.regs[0] as i32;
 
-        puts(b"[INIT] test_runner exited with code ");
-        hex(status as u64);
-        puts(b"\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[INIT] test_runner exited with code "); lb.hex(status as u64); lb.str(b"\n"); lb.flush(); }
 
         if (status & 0x7f) == 0 && ((status >> 8) & 0xff) == 42 {
             puts(b"[INIT] All tests PASSED\n");

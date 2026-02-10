@@ -16,11 +16,14 @@ mod test_mmap;
 mod test_fork;
 mod test_signal;
 mod test_socket;
+mod test_pipe;
+mod test_time;
 
 use salty::consts::*;
 use salty::ipc;
 use salty::posix;
 use salty::serial;
+use salty::serial::LineBuf;
 use salty::types::*;
 
 fn puts(s: &[u8]) {
@@ -37,42 +40,34 @@ pub extern "C" fn _start() -> ! {
 
     puts(b"[TEST_RUNNER] SaltyOS Test Runner starting\n");
 
-    let tests: [(&[u8], fn() -> bool); 6] = [
+    let tests: [(&[u8], fn() -> bool); 8] = [
         (b"test_hello", test_hello::run),
         (b"test_fs", test_fs::run),
         (b"test_mmap", test_mmap::run),
         (b"test_fork", test_fork::run),
         (b"test_signal", test_signal::run),
         (b"test_socket", test_socket::run),
+        (b"test_pipe", test_pipe::run),
+        (b"test_time", test_time::run),
     ];
 
     let mut passed = 0u32;
     let mut failed = 0u32;
 
     for (name, test_fn) in &tests {
-        puts(b"[TEST_RUNNER] Running ");
-        puts(name);
-        puts(b"...\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[TEST_RUNNER] Running "); lb.str(name); lb.str(b"...\n"); lb.flush(); }
 
         let result = test_fn();
         if result {
-            puts(b"[TEST_RUNNER] ");
-            puts(name);
-            puts(b" ... PASS\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[TEST_RUNNER] "); lb.str(name); lb.str(b" ... PASS\n"); lb.flush(); }
             passed += 1;
         } else {
-            puts(b"[TEST_RUNNER] ");
-            puts(name);
-            puts(b" ... FAIL\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[TEST_RUNNER] "); lb.str(name); lb.str(b" ... FAIL\n"); lb.flush(); }
             failed += 1;
         }
     }
 
-    puts(b"[TEST_RUNNER] Results: ");
-    serial::serial_dec(passed as u64);
-    puts(b" passed, ");
-    serial::serial_dec(failed as u64);
-    puts(b" failed\n");
+    { let mut lb = LineBuf::new(); lb.str(b"[TEST_RUNNER] Results: "); lb.dec(passed as u64); lb.str(b" passed, "); lb.dec(failed as u64); lb.str(b" failed\n"); lb.flush(); }
 
     if failed == 0 {
         puts(b"[TEST_RUNNER] ALL TESTS PASSED\n");

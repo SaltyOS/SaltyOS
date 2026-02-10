@@ -54,6 +54,8 @@ pub enum BlockedReason {
         /// Badge (sender identity)
         badge: u64,
     },
+    /// Blocked on nanosleep timer
+    TimerBlocked,
 }
 
 /// Thread Control Block
@@ -109,6 +111,10 @@ pub struct Tcb {
     pub bound_notification: *mut u8,
     /// Kernel stack top for syscall entry (per-thread kernel stack)
     pub kernel_stack_top: u64,
+    /// Wakeup time in nanoseconds (for nanosleep)
+    pub timer_wakeup_ns: u64,
+    /// Next pointer for sleep queue (intrusive singly-linked list)
+    pub sleep_next: *mut Tcb,
 }
 
 /// Saved thread context
@@ -214,6 +220,8 @@ impl Tcb {
             fault_handler: core::ptr::null_mut(),
             bound_notification: core::ptr::null_mut(),
             kernel_stack_top: 0,
+            timer_wakeup_ns: 0,
+            sleep_next: core::ptr::null_mut(),
         }
     }
 
@@ -245,6 +253,8 @@ impl Tcb {
         self.reply_tcb = core::ptr::null_mut();
         self.reply_can_grant = false;
         self.fault_handler = core::ptr::null_mut();
+        self.timer_wakeup_ns = 0;
+        self.sleep_next = core::ptr::null_mut();
 
         // Clear bound notification's back-pointer to prevent use-after-free
         if !self.bound_notification.is_null() {

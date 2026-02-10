@@ -424,3 +424,56 @@ pub extern "C" fn salty_shm_unlink(name: *const u8) -> i32 {
 pub extern "C" fn salty_ftruncate(fd: i32, length: u64) -> i32 {
     unsafe { posix::posix_ftruncate(fd, length) }
 }
+
+// ---------------------------------------------------------------------------
+// C ABI exports: Pipe / dup
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_pipe(fds: *mut i32) -> i32 {
+    unsafe { posix::posix_pipe(fds) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_pipe2(fds: *mut i32, flags: i32) -> i32 {
+    unsafe { posix::posix_pipe2(fds, flags) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_dup(oldfd: i32) -> i32 {
+    unsafe { posix::posix_dup(oldfd) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_dup2(oldfd: i32, newfd: i32) -> i32 {
+    unsafe { posix::posix_dup2(oldfd, newfd) }
+}
+
+// ---------------------------------------------------------------------------
+// C ABI exports: Time API
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_clock_gettime(clock_id: i32, ts: *mut types::Timespec) -> i32 {
+    unsafe { posix::posix_clock_gettime(clock_id, ts) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_gettimeofday(tv: *mut types::Timeval) -> i32 {
+    unsafe { posix::posix_gettimeofday(tv) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_nanosleep(req: *const types::Timespec, rem: *mut types::Timespec) -> i32 {
+    unsafe { posix::posix_nanosleep(req, rem) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_usleep(usec: u64) -> i32 {
+    unsafe { posix::posix_usleep(usec) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_sleep(seconds: u64) -> u64 {
+    unsafe { posix::posix_sleep(seconds) }
+}

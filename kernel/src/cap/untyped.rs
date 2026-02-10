@@ -96,6 +96,12 @@ static mut FRAME_METADATA: [MaybeUninit<FrameObject>; MAX_SLOTS] =
 static mut VSPACE_METADATA: [MaybeUninit<crate::mm::VSpace>; MAX_SLOTS] =
     [const { MaybeUninit::uninit() }; MAX_SLOTS];
 
+// Sub-untyped metadata is stored out-of-line to prevent child frame retypes
+// from overwriting the UntypedMemory struct (which would be at offset 0 of
+// the sub-untyped's physical region if stored in-band).
+static mut UNTYPED_METADATA: [MaybeUninit<UntypedMemory>; MAX_SLOTS] =
+    [const { MaybeUninit::uninit() }; MAX_SLOTS];
+
 /// Untyped child tracker
 ///
 /// Tracks objects allocated from untyped memory using ut_next links
@@ -259,11 +265,7 @@ unsafe fn init_object(
 
             ObjectType::Frame => Err(CapError::InvalidOperation),
 
-            ObjectType::Untyped => {
-                let untyped = virt_addr as *mut UntypedMemory;
-                untyped.write(UntypedMemory::new(phys_addr, size_bits, false));
-                Ok(untyped as *mut KernelObject)
-            }
+            ObjectType::Untyped => Err(CapError::InvalidOperation),
 
             ObjectType::Tcb => {
                 let tcb = virt_addr as *mut crate::sched::thread::Tcb;
@@ -337,6 +339,22 @@ unsafe fn init_vspace_metadata(
     vspace_ptr as *mut crate::cap::object::KernelObject
 }
 
+/// Initialize sub-untyped metadata in slot-indexed static storage.
+///
+/// # Safety
+/// Caller must ensure `cap_slot` is a valid, exclusively-owned slot index.
+unsafe fn init_untyped_metadata(
+    cap_slot: CapSlot,
+    phys_addr: PhysAddr,
+    size_bits: u8,
+) -> *mut crate::cap::object::KernelObject {
+    let untyped_ptr = unsafe { UNTYPED_METADATA[cap_slot as usize].as_mut_ptr() };
+    unsafe {
+        untyped_ptr.write(UntypedMemory::new(phys_addr, size_bits, false));
+    }
+    untyped_ptr as *mut crate::cap::object::KernelObject
+}
+
 impl UntypedMemory {
     /// Retype untyped memory into typed objects
     ///
@@ -407,6 +425,7 @@ impl UntypedMemory {
                 match new_type {
                     ObjectType::Frame => init_frame_metadata(cap_slot, obj_addr, size_bits),
                     ObjectType::VSpace => init_vspace_metadata(cap_slot, obj_addr),
+                    ObjectType::Untyped => init_untyped_metadata(cap_slot, obj_addr, size_bits),
                     _ => match init_object(new_type, obj_addr, size_bits) {
                         Ok(obj) => obj,
                         Err(e) => {

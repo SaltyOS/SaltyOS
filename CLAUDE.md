@@ -4,7 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-SaltyOS is a capability-based microkernel OS inspired by seL4, written in Rust (kernel) and C (bootloader, userland). All resource access is mediated through unforgeable capability tokens. The kernel provides only scheduling, IPC, memory management, and capabilities — everything else (filesystem, drivers, process management) runs in userspace.
+SaltyOS is a capability-based microkernel OS inspired by seL4, written in Rust (kernel) and C (bootloader). All resource access is mediated through unforgeable capability tokens. The kernel provides only scheduling, IPC, memory management, and capabilities — everything else (filesystem, drivers, process management) runs in userspace.
+
+**Design philosophy:**
+- **Minimal trusted computing base** — the kernel is the only trusted code. Keep it small.
+- **Correctness over performance** — get it right first. The IPC fastpath is the exception: IPC is on every critical path, so it gets assembly-level optimization.
+- **Capability-mediated access** — no ambient authority. Every resource access requires an explicit capability token.
 
 ## Prerequisites
 
@@ -43,6 +48,96 @@ just reconfigure -Ddebug_symbols=true
 
 Build options: `arch` (x86_64), `build_boot`/`build_kernel`/`build_userland` (bool), `kernel_log_level` (error/warn/info/debug/trace), `max_cpus` (16), `kernel_stack_size` (16384).
 
+## Build System Details
+
+No `Cargo.toml` files — all Rust code is compiled via Meson with direct `rustc` invocation. The build chain:
+
+1. `rust/meson.build` — Builds `core` and `compiler_builtins` from `rust-src`
+2. `kernel/meson.build` — Compiles kernel Rust → `.o`, assembles `.S` files, links to `kernel.elf`
+3. `lib/libsalty/meson.build` — Builds libsalty (Rust → `.o` + `.rmeta`, plus `fork.S` → `.o`, links to `libsalty.so`)
+4. `userland/*/meson.build` — Each program compiled against libsalty `.rmeta`, linked with libsalty `.o` + `core.o`
+5. `tools/mkcpio.py` — Packs all userland ELFs + `.service` files into `initrd.cpio`
+6. `tools/mkimage.py` — Creates bootable disk image with bootloader + kernel + initrd
+
+**Kernel rustc flags** (actual, from `kernel/meson.build`):
+```
+--edition=2024  --target=x86_64-unknown-none
+-C panic=abort  -C opt-level=2  -C debuginfo=2
+-C code-model=small  -C relocation-model=pic
+```
+
+**Userland rustc flags** (from `lib/libsalty/meson.build`):
+```
+--edition=2024  --target=x86_64-unknown-none
+-C panic=abort  -C opt-level=2
+-C code-model=small  -C relocation-model=pic
+```
+
+**Init is statically linked** (embeds libsalty.o directly). Other userland programs use shared `libsalty.so` loaded by `rtld` (the runtime dynamic linker).
+
+### Build Gotchas
+
+- **`just distclean` is required** after adding/removing source files or editing any `meson.build`. The kernel `meson.build` auto-discovers `.rs` files via `find`, but the file list is only refreshed on `meson setup`.
+- **Clang is enforced.** The build fails with gcc. Do not suggest `cargo build`, `cargo test`, or create `Cargo.toml` files — this project does not use Cargo.
+- **Rust flags live in `meson.build`**, not `.cargo/config.toml`.
+- **Linker scripts:** `kernel/kernel.ld` (kernel), `lib/libsalty/libsalty.ld` (shared lib).
+
+## Code Patterns and Safety Rules
+
+### Lock Ordering
+
+Lock ordering (outermost → innermost), from `kernel/src/mm/mod.rs`:
+
+```
+CAP_LOCK → SCHED_IPC_LOCK → scheduler.lock_state → VSpace.lock → MM_LOCK (FRAME_LOCK)
+```
+
+Nesting patterns:
+- **Slowpath syscalls:** CAP_LOCK (cap lookup) → release → SCHED_IPC_LOCK (IPC)
+- **IPC cap transfer:** SCHED_IPC_LOCK → CAP_LOCK (slot copy)
+- **Fastpath:** CAP_LOCK (cap copy-to-stack) → release → SCHED_IPC_LOCK → scheduler.lock_state
+- **Timer/IPI:** SCHED_IPC_LOCK (assembly stub) → scheduler.lock_state
+- **do_context_switch:** releases SCHED_IPC_LOCK before switch, reacquires on resume
+
+**IRQ save/restore pattern** (used everywhere):
+```rust
+let irq = save_irq_disable();
+LOCK.lock();
+// critical section
+LOCK.unlock();
+restore_irq(irq);
+```
+
+### Kernel Safety Constraints
+
+- **`#![no_std]` with only `core`** — no `alloc` crate, no heap allocation
+- **No floating point in kernel** — target `x86_64-unknown-none` with `-mno-sse -mno-mmx -mno-avx`
+- **Slab allocator for fixed kernel objects only** — objects are never freed (owned by untyped memory parent). Pointers to kernel objects remain valid for the lifetime of the system.
+- **Never `.unwrap()` or `.expect()`** in kernel hot paths — use `match` or `if let`
+- **EOI before schedulable code** — context switch can happen inside `timer_tick()`. Always send `eoi()` before calling any function that might trigger a context switch, or the APIC blocks all further timer interrupts.
+- **Per-thread state on kernel stack, not per-CPU globals** — per-CPU `%gs:16` (saved_rsp) is shared state that gets overwritten by other threads' syscalls. Save user RSP on the per-thread kernel stack instead.
+
+### Unsafe Code Conventions
+
+- Every `unsafe {}` block must have a `// SAFETY:` comment explaining the invariant that makes it safe
+- Every `unsafe fn` must have a `# Safety` doc section listing caller obligations
+- Use `#[unsafe(no_mangle)]` (not `#[no_mangle]`) — Rust 2024 edition requirement
+- Use `#[repr(C)]` for all structures shared across FFI boundaries or passed to/from assembly
+- `KernelObject` header must be the **first field** of any kernel object struct (for refcount access via pointer cast)
+
+### Error Handling
+
+- **Kernel error types:** `SyscallError`, `CapError`, `VSpaceError` — all enums with specific variants, not strings
+- **Map between error types explicitly** with dedicated functions (e.g., `syscall_error_from_cap_error()` in `syscall/mod.rs`). Do not add `impl From<X> for Y` — explicit mapping prevents accidental information loss.
+- **Userland error codes** in `lib/libsalty/src/consts.rs` (`SALTY_OK`, `SALTY_INVALID_CAPABILITY`, etc.) must match kernel `SyscallError` variants
+
+### FFI Conventions
+
+- Kernel functions called from assembly: `#[unsafe(no_mangle)] pub extern "C" fn`
+- libsalty public exports: `#[unsafe(no_mangle)] pub extern "C" fn` with `salty_` prefix
+- Shared structures: `#[repr(C)]` always
+- Constants shared between kernel and userland (syscall numbers, invoke labels, error codes) must be kept in sync manually — `consts.rs` is the userland source of truth
+
 ## Architecture
 
 ### Kernel (Rust, `kernel/src/`)
@@ -54,11 +149,11 @@ Build options: `arch` (x86_64), `build_boot`/`build_kernel`/`build_userland` (bo
 | `cap/` | CNode (4-16 bit slots), Untyped retype, CDT, IoPort caps |
 | `ipc/` | Endpoints (sync rendezvous), Notifications (async bitmap), IRQ routing |
 | `mm/` | VSpace (page tables), Frame allocator, Slab allocator |
-| `sched/` | EDF scheduler (per-CPU ready queues), TCB, context switch |
-| `syscall/` | 12 syscalls, capability invocation dispatch |
+| `sched/` | EDF scheduler (per-CPU ready queues), TCB, context switch, sleep queue |
+| `syscall/` | 14 syscalls, capability invocation dispatch, IPC fastpath |
 
 **Key assembly files** in `kernel/src/arch/x86_64/`:
-- `syscall.S` — Syscall entry/exit via `syscall`/`sysretq`. User RSP is saved on the **per-thread kernel stack** (not per-CPU `%gs:16`) to prevent RSP corruption during context switches.
+- `syscall.S` — Syscall entry/exit via `syscall`/`sysretq`. User RSP is saved on the **per-thread kernel stack** (not per-CPU `%gs:16`) to prevent RSP corruption during context switches. IPC fastpath dispatch happens here (checks RAX==2 for Call, RAX==3 for ReplyRecv before slowpath).
 - `exceptions.S` — IDT exception handlers
 - `ap_tramp.S` — SMP application processor trampoline (real→long mode)
 
@@ -80,6 +175,8 @@ Syscall instruction: `syscall` (not `int 0x80`). Number in `rax`, args in `rdi, 
 | 9 | Invoke | Capability invocation (CNode/Untyped/TCB/VSpace/IRQ/IoPort ops) |
 | 10 | DebugPutChar | Write char to serial |
 | 11 | DebugDumpState | Dump CPU state |
+| 12 | ClockGetTime | Read monotonic clock |
+| 13 | NanoSleep | Sleep for duration |
 
 **Message info encoding** (seL4-style): bits 6:0 = length (0-127 MRs), bits 11:7 = extra caps, bits 51:12 = label. MR0-MR3 in registers, MR4-MR19 via IPC buffer.
 
@@ -120,39 +217,36 @@ Include paths are relative to `boot/` root (Meson `-I` flag). Files in `stage3/a
 | `procmgr` | Process manager (spawn/exit/waitpid) |
 | `vfs` | Virtual filesystem server (ramfs + devfs + Unix sockets + shm + poll) |
 | `nameserv` | Name service (endpoint lookup) |
-| `test_runner` | Automated test suite (hello, fs, mmap, fork, signal, socket) |
+| `test_runner` | Automated test suite (hello, fs, mmap, fork, signal, socket, pipe, time) |
 
-All userland ELFs are packed into a CPIO initrd (`tools/mkcpio.py`) which is embedded in the disk image.
+**Service-based bootstrap**: Init reads `.service` files from `userland/services/` in the initrd to determine boot order and dependencies. Each `.service` file declares `[Service]` (name, binary, type, restart policy) and `[Dependencies]` (After/Before ordering).
+
+All userland ELFs + service files are packed into a CPIO initrd (`tools/mkcpio.py`) embedded in the disk image.
 
 ### libsalty (`lib/libsalty/`, Rust)
 
-Userspace system library providing syscall wrappers, IPC helpers, and POSIX compatibility.
+Userspace system library providing syscall wrappers, IPC helpers, capability invocations, and POSIX compatibility.
 
-- `src/consts.rs` — Syscall numbers, invoke labels, error codes, object types, well-known cap slots, POSIX constants (socket, poll, shm)
-- `src/types.rs` — Message struct, PollFd, SockAddrUn, EpollEvent, signal types
-- `src/ipc.rs` — Low-level IPC wrappers (call, send, recv, reply_recv)
-- `src/posix.rs` — POSIX compatibility layer (file I/O, fork, exec, mmap, sockets, poll, shm)
-- `src/lib.rs` — C ABI exports for all operations
-- `src/fork.S` — Fork assembly stub
+Key modules:
+- `consts.rs` — Syscall numbers, invoke labels, error codes, object types, well-known cap slots, POSIX constants
+- `types.rs` — Message struct, PollFd, SockAddrUn, signal types
+- `syscall.rs` — Raw syscall wrappers (inline asm)
+- `ipc.rs` — IPC wrappers (call, send, recv, reply_recv)
+- `invoke.rs` — Capability invocation helpers (CNode/Untyped/TCB/VSpace/IRQ/IoPort ops)
+- `posix.rs` / `posix_mm.rs` — POSIX compatibility (file I/O, fork, exec, sockets, poll, shm, mmap)
+- `signals.rs` — POSIX signal delivery via notifications
+- `cpio.rs` / `elf_loader.rs` / `elf_dynamic.rs` — CPIO parsing, ELF loading, dynamic linking support
+- `fork.S` — Fork assembly stub
 
 ## Rust 2024 Edition
 
-The kernel uses **Rust 2024 edition** (`--edition=2024`) with nightly rustc. There are no `Cargo.toml` files — all Rust code is compiled via Meson with direct `rustc` invocation (`rust/meson.build`, `kernel/meson.build`).
-
-**Edition-specific rules that apply to kernel code:**
+**Edition-specific rules that apply to all Rust code:**
 - **`unsafe_op_in_unsafe_fn`** (warn by default): Every unsafe operation inside an `unsafe fn` must be wrapped in an explicit `unsafe {}` block. Do not rely on the function signature alone.
 - **No `static mut` references**: Taking `&` or `&mut` of a `static mut` is disallowed. Use `core::ptr::addr_of!` / `addr_of_mut!` for raw pointers, or `SyncUnsafeCell` for safe interior mutability.
 - **`unsafe extern` blocks**: Items declared in `extern` blocks require explicit `unsafe` or `safe` annotation (e.g., `unsafe extern "C" { safe fn memset(...); }`).
 - **RPIT lifetime capture**: `-> impl Trait` return types capture all in-scope lifetimes by default. Narrow with `+ use<'a>` if needed.
 - **`gen` keyword reserved**: Do not use `gen` as an identifier.
 - **`never` type fallback**: The `!` type falls back to `!` (not `()`).
-
-**Rustc flags** (set in `meson.build`):
-```
---edition=2024  --target=x86_64-unknown-none
--C panic=abort  -C opt-level=2  -C code-model=kernel
--C relocation-model=static  -C soft-float
-```
 
 ## Key Design Details
 
@@ -161,21 +255,87 @@ The kernel uses **Rust 2024 edition** (`--edition=2024`) with nightly rustc. The
 - **EDF scheduler**: Per-CPU ready queues, IPI-driven reschedule for affinity changes
 - **SMP**: ACPI MADT discovery, AP trampoline, per-CPU GDT/TSS/APIC, IPI messaging
 - **Frame minimum**: size_bits=12 enforced (4K pages) to prevent misaligned objects
+- **IPC fastpath**: Assembly-dispatched fast path for Call (syscall 2) and ReplyRecv (syscall 3) — bails to slowpath for extra_caps>0, length>4, no waiting partner, cross-CPU, or fault-blocked
+- **Bound notifications**: Bidirectional TCB↔Notification link; signals wake RecvBlocked threads
 
-## Testing
+## Adding New Components
 
-No formal unit test framework. Testing is done via QEMU boot and serial output observation:
+### New Kernel Source File
+
+1. Create the `.rs` file in the appropriate `kernel/src/` subdirectory
+2. Add `mod my_module;` to the parent module's `mod.rs` or `lib.rs`
+3. Run `just distclean && just setup && just build` (the `find` in `kernel/meson.build` auto-discovers `.rs` files, but only on `meson setup`)
+
+### New Userland Program
+
+1. Create `userland/<name>/src/main.rs` with `#![no_std]` and `#![no_main]`
+2. Create `userland/<name>/meson.build` (copy pattern from an existing program like `userland/test_runner/meson.build`)
+3. Create `userland/services/<name>.service` with `[Service]` and `[Dependencies]` sections
+4. Add `subdir('<name>')` to `userland/meson.build`
+5. Add the ELF and service file entries to the manifest in `tools/mkcpio.py`
+6. Run `just distclean && just setup && just build`
+
+### New Syscall
+
+1. Add variant to the `Syscall` enum and its `TryFrom<u64>` impl in `kernel/src/syscall/mod.rs`
+2. Add matching constant to `lib/libsalty/src/consts.rs`
+3. Add dispatch arm in `syscall_handle_rust()` in `kernel/src/syscall/mod.rs`
+4. Add raw syscall wrapper in `lib/libsalty/src/syscall.rs`
+5. Update `docs/spec/syscalls.md`
+
+### New Capability Invocation
+
+1. Add invoke label constant to `lib/libsalty/src/consts.rs`
+2. Add dispatch arm in `handle_invoke()` in `kernel/src/syscall/mod.rs`
+3. Add wrapper function in `lib/libsalty/src/invoke.rs`
+4. Update `docs/spec/syscalls.md`
+
+## Testing and Verification
+
+No formal unit test framework. Testing is done via QEMU boot and serial output observation.
+
 ```bash
-just run                        # Manual observation
-just test-integration           # Automated boot smoke test
-just test-smp                   # Automated SMP test
-just run-debug-headless         # Headless debug (serial only)
+just build                      # Must succeed before any commit
+just run                        # Quick smoke test — watch serial for KERNEL PANIC
+just run-smp                    # SMP test — race conditions only show with >1 CPU
+just run-smp4                   # Stress test with 4 CPUs
+just run-debug-headless         # CI-like testing (serial only, logs to qemu.log)
+just fmt-check                  # Check kernel Rust formatting
 ```
+
+The `test_runner` userland program runs automated tests and prints `PASS`/`FAIL` for each test case via serial output. Watch for these lines to verify correctness.
+
+**Do not use `cargo test`** — this project does not use Cargo.
+
+## Commit Conventions
+
+Format: `<type>(<scope>): <subject>` (scope is optional for cross-cutting changes)
+
+**Types:** `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `perf`
+
+**Scopes:** `kernel`, `boot`, `ipc`, `sched`, `cap`, `mm`, `vspace`, `syscall`, `libsalty`, `init`, `procmgr`, `vfs`, `console`, `nameserv`, `test_runner`
+
+Examples:
+```
+feat(ipc): add notification polling with timeout
+fix(sched): send EOI before timer_tick to prevent APIC lockup
+feat: implement POSIX Phase 2 — sockets, poll, shm, fd passing
+docs: update design docs for bound notification
+```
+
+## Definition of Done
+
+- [ ] `just build` succeeds with no new warnings
+- [ ] `just run` boots to test_runner output without panics
+- [ ] `just run-smp` does not deadlock or corrupt state
+- [ ] `just fmt-check` passes
+- [ ] Constants in sync: any new syscall/invoke label/error code in both kernel and `consts.rs`
+- [ ] Design docs updated if architectural changes were made
 
 ## Documentation
 
-Design documents in `docs/design/` — read before making architectural changes:
-- `capability.md`, `ipc.md`, `scheduling.md`, `memory.md`, `bootloader.md`, `saltyfs.md`, `posix.md`
+Design documents in `docs/design/` — **read before making architectural changes**:
+- `overview.md`, `kernel.md`, `capability.md`, `ipc.md`, `scheduling.md`, `memory.md`, `bootloader.md`, `saltyfs.md`, `posix.md`
 
-Specifications in `docs/spec/`:
+Specifications in `docs/spec/` — **read before changing ABI or syscall interfaces**:
 - `syscalls.md`, `abi.md`, `boot_protocol.md`

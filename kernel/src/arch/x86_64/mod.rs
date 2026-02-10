@@ -13,7 +13,7 @@ mod idt;
 pub mod paging;
 mod pit;
 
-pub use apic::{send_ipi, IpiKind};
+pub use apic::{send_ipi, set_tlb_shootdown_addr, IpiKind};
 pub use cpu::{current_cpu, set_kernel_stack, MAX_CPUS};
 pub use gdt::set_tss_rsp0;
 
@@ -30,9 +30,18 @@ pub fn has_apic() -> bool {
 /// Get tick count from the active timer backend
 pub fn get_ticks() -> u64 {
     if has_apic() {
-        apic::get_ticks() as u64
+        apic::get_ticks()
     } else {
         pit::get_ticks()
+    }
+}
+
+/// Get elapsed time in nanoseconds from the active timer backend
+pub fn now_ns() -> u64 {
+    if has_apic() {
+        apic::now_ns()
+    } else {
+        pit::get_ticks() * 1_000_000
     }
 }
 
@@ -52,13 +61,7 @@ pub use context::{context_switch, usermode_trampoline};
 ///
 /// Timer is started later via start_timer() after scheduler is ready.
 pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
-    // Debug: Print init entry
-    unsafe {
-        for byte in b"\n[ARCH] init() called\n" {
-            while (inb(0x3F8 + 5) & 0x20) == 0 {}
-            outb(0x3F8, *byte);
-        }
-    }
+    crate::serial_puts("\n[ARCH] init() called\n");
 
     // Initialize GDT (required before IDT)
     gdt::init();
@@ -67,13 +70,7 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // MUST be after gdt::init() because reload_segments() clobbers GS base
     cpu::init_bsp();
 
-    // Debug: Before IDT init
-    unsafe {
-        for byte in b"[ARCH] About to call idt::init()\n" {
-            while (inb(0x3F8 + 5) & 0x20) == 0 {}
-            outb(0x3F8, *byte);
-        }
-    }
+    crate::serial_puts("[ARCH] About to call idt::init()\n");
 
     // Initialize IDT BEFORE APIC timer starts
     // This prevents triple fault when timer fires
@@ -89,21 +86,10 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
         // Initialize PIC with remapped vectors (IRQ0→vector 32)
         // All IRQs masked; start_timer() will unmask IRQ0
         pit::init_pic_mode();
-        unsafe {
-            for byte in b"[ARCH] No APIC, using PIC+PIT fallback\n" {
-                while (inb(0x3F8 + 5) & 0x20) == 0 {}
-                outb(0x3F8, *byte);
-            }
-        }
+        crate::serial_puts("[ARCH] No APIC, using PIC+PIT fallback\n");
     }
 
-    // Debug: After IDT init
-    unsafe {
-        for byte in b"[ARCH] idt::init() returned successfully\n" {
-            while (inb(0x3F8 + 5) & 0x20) == 0 {}
-            outb(0x3F8, *byte);
-        }
-    }
+    crate::serial_puts("[ARCH] idt::init() returned successfully\n");
 
     // Initialize memory management (frame allocator needed by paging::init())
     if let Some(info) = boot_info {
@@ -147,12 +133,7 @@ pub fn start_timer() {
 /// Must be called after scheduler is initialized and timer is running.
 pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
     if !has_apic() {
-        unsafe {
-            for byte in b"[SMP] No APIC available, running single-CPU\n" {
-                while (inb(0x3F8 + 5) & 0x20) == 0 {}
-                outb(0x3F8, *byte);
-            }
-        }
+        crate::serial_puts("[SMP] No APIC available, running single-CPU\n");
         return;
     }
 
@@ -163,12 +144,7 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
             // Fall back to scanning standard BIOS locations for RSDP
             let scanned = unsafe { acpi::scan_for_rsdp() };
             if scanned == 0 {
-                unsafe {
-                    for byte in b"[SMP] No RSDP found, skipping SMP init\n" {
-                        while (inb(0x3F8 + 5) & 0x20) == 0 {}
-                        outb(0x3F8, *byte);
-                    }
-                }
+                crate::serial_puts("[SMP] No RSDP found, skipping SMP init\n");
                 return;
             }
             scanned
@@ -179,23 +155,13 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
     let madt_info = match unsafe { acpi::parse_madt(rsdp_addr) } {
         Some(info) => info,
         None => {
-            unsafe {
-                for byte in b"[SMP] MADT parsing failed, running single-CPU\n" {
-                    while (inb(0x3F8 + 5) & 0x20) == 0 {}
-                    outb(0x3F8, *byte);
-                }
-            }
+            crate::serial_puts("[SMP] MADT parsing failed, running single-CPU\n");
             return;
         }
     };
 
     if madt_info.cpu_count <= 1 {
-        unsafe {
-            for byte in b"[SMP] Only 1 CPU found, no APs to start\n" {
-                while (inb(0x3F8 + 5) & 0x20) == 0 {}
-                outb(0x3F8, *byte);
-            }
-        }
+        crate::serial_puts("[SMP] Only 1 CPU found, no APs to start\n");
         return;
     }
 
@@ -262,37 +228,6 @@ pub unsafe fn inb(port: u16) -> u8 {
     value
 }
 
-/// Print a hexadecimal number to serial port
-unsafe fn print_hex(mut val: u64) {
-    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-    unsafe {
-        for byte in b"0x" {
-            while (inb(0x3F8 + 5) & 0x20) == 0 {}
-            outb(0x3F8, *byte);
-        }
-    }
-    if val == 0 {
-        unsafe {
-            while (inb(0x3F8 + 5) & 0x20) == 0 {}
-            outb(0x3F8, b'0');
-        }
-        return;
-    }
-    let mut buf = [0u8; 16];
-    let mut pos = 15;
-    while val > 0 {
-        buf[pos] = HEX_CHARS[(val & 0xF) as usize];
-        val >>= 4;
-        pos -= 1;
-    }
-    unsafe {
-        for &c in &buf[(pos + 1)..] {
-            while (inb(0x3F8 + 5) & 0x20) == 0 {}
-            outb(0x3F8, c);
-        }
-    }
-}
-
 /// Allocate IST stacks for critical exceptions (called after mm::init)
 ///
 /// The double fault handler (vector 8) gets its own stack via IST1 so it can
@@ -307,16 +242,11 @@ fn init_exception_stacks() {
     }
     idt::set_double_fault_ist(1);
 
-    unsafe {
-        for byte in b"[ARCH] Double fault IST1 stack: " {
-            while (inb(0x3F8 + 5) & 0x20) == 0 {}
-            outb(0x3F8, *byte);
-        }
-        print_hex(stack_top);
-        for byte in b"\n" {
-            while (inb(0x3F8 + 5) & 0x20) == 0 {}
-            outb(0x3F8, *byte);
-        }
+    {
+        let s = crate::SerialGuard::acquire();
+        s.puts("[ARCH] Double fault IST1 stack: ");
+        s.hex(stack_top);
+        s.putc(b'\n');
     }
 }
 
@@ -336,11 +266,7 @@ unsafe extern "C" {
 /// Also allocates and sets up kernel stacks for syscall handling.
 pub fn init_syscalls() {
     unsafe {
-        // Debug output
-        for byte in b"\n[SYSCALL] Initializing syscall MSRs\n" {
-            while (inb(0x3F8 + 5) & 0x20) == 0 {}
-            outb(0x3F8, *byte);
-        }
+        crate::serial_puts("\n[SYSCALL] Initializing syscall MSRs\n");
 
         // Allocate kernel stack for syscall (16KB = 4 contiguous pages of 4KB each)
         const STACK_PAGES: usize = 4;
@@ -349,10 +275,7 @@ pub fn init_syscalls() {
         let stack_bottom_phys = match crate::mm::alloc_contiguous_frames(STACK_PAGES) {
             Some(addr) => addr,
             None => {
-                for byte in b"[SYSCALL] Failed to allocate contiguous kernel stack!\n" {
-                    while (inb(0x3F8 + 5) & 0x20) == 0 {}
-                    outb(0x3F8, *byte);
-                }
+                crate::serial_puts("[SYSCALL] Failed to allocate contiguous kernel stack!\n");
                 loop {
                     core::arch::asm!("hlt");
                 }
@@ -366,15 +289,11 @@ pub fn init_syscalls() {
         // Set TSS rsp0 (for interrupt entry from user mode)
         gdt::set_tss_rsp0(stack_top);
 
-        // Print stack info
-        for byte in b"[SYSCALL] Kernel stack: " {
-            while (inb(0x3F8 + 5) & 0x20) == 0 {}
-            outb(0x3F8, *byte);
-        }
-        print_hex(stack_top);
-        for byte in b"\n" {
-            while (inb(0x3F8 + 5) & 0x20) == 0 {}
-            outb(0x3F8, *byte);
+        {
+            let s = crate::SerialGuard::acquire();
+            s.puts("[SYSCALL] Kernel stack: ");
+            s.hex(stack_top);
+            s.putc(b'\n');
         }
 
         // STAR MSR format:
@@ -442,23 +361,14 @@ pub fn init_syscalls() {
             options(nostack)
         );
 
-        for byte in b"[SYSCALL] MSRs configured successfully\n" {
-            while (inb(0x3F8 + 5) & 0x20) == 0 {}
-            outb(0x3F8, *byte);
-        }
-        for byte in b"[SYSCALL]   STAR=" {
-            while (inb(0x3F8 + 5) & 0x20) == 0 {}
-            outb(0x3F8, *byte);
-        }
-        print_hex(star);
-        for byte in b"\n[SYSCALL]   LSTAR=" {
-            while (inb(0x3F8 + 5) & 0x20) == 0 {}
-            outb(0x3F8, *byte);
-        }
-        print_hex(lstar);
-        for byte in b"\n" {
-            while (inb(0x3F8 + 5) & 0x20) == 0 {}
-            outb(0x3F8, *byte);
+        {
+            let s = crate::SerialGuard::acquire();
+            s.puts("[SYSCALL] MSRs configured successfully\n");
+            s.puts("[SYSCALL]   STAR=");
+            s.hex(star);
+            s.puts("\n[SYSCALL]   LSTAR=");
+            s.hex(lstar);
+            s.putc(b'\n');
         }
     }
 }

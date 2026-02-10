@@ -22,13 +22,11 @@ extern crate salty;
 use salty::consts::*;
 use salty::ipc;
 use salty::serial;
+use salty::serial::LineBuf;
 use salty::types::*;
 
 const CAP_SERVER_EP: u64 = 3;
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
-
-const NS_REGISTER: u64 = 1;
-const NS_LOOKUP: u64 = 2;
 
 const CAP_SERVICE_BASE: u64 = 32;
 const MAX_SERVICES: usize = 32;
@@ -58,14 +56,6 @@ static mut SERVICE_COUNT: usize = 0;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
-}
-
-fn hex(v: u64) {
-    serial::serial_hex(v);
-}
-
-fn putc(c: u8) {
-    serial::serial_putc(c);
 }
 
 fn ipc_ctx() -> *mut IpcContext {
@@ -114,11 +104,11 @@ unsafe fn handle_register(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
             if SERVICES[i].active != 0
                 && name_equal(&SERVICES[i].name, SERVICES[i].name_len, &name, name_len)
             {
-                puts(b"[NAMESERV] REGISTER: duplicate name '");
-                for j in 0..name_len as usize {
-                    putc(name[j]);
-                }
-                puts(b"'\n");
+                let mut lb = LineBuf::new();
+                lb.str(b"[NAMESERV] REGISTER: duplicate name '");
+                lb.bytes(&name[..name_len as usize]);
+                lb.str(b"'\n");
+                lb.flush();
                 (*reply).label = SALTY_ALREADY_EXISTS;
                 return;
             }
@@ -141,13 +131,13 @@ unsafe fn handle_register(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
         entry.active = 1;
         SERVICE_COUNT += 1;
 
-        puts(b"[NAMESERV] registered '");
-        for i in 0..name_len as usize {
-            putc(name[i]);
-        }
-        puts(b"' at slot ");
-        hex(ep_slot);
-        puts(b"\n");
+        let mut lb = LineBuf::new();
+        lb.str(b"[NAMESERV] registered '");
+        lb.bytes(&name[..name_len as usize]);
+        lb.str(b"' at slot ");
+        lb.hex(ep_slot);
+        lb.str(b"\n");
+        lb.flush();
 
         (*reply).label = SALTY_OK;
     }
@@ -174,11 +164,11 @@ unsafe fn handle_lookup(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
             }
         }
 
-        puts(b"[NAMESERV] LOOKUP: not found '");
-        for i in 0..name_len as usize {
-            putc(name[i]);
-        }
-        puts(b"'\n");
+        let mut lb = LineBuf::new();
+        lb.str(b"[NAMESERV] LOOKUP: not found '");
+        lb.bytes(&name[..name_len as usize]);
+        lb.str(b"'\n");
+        lb.flush();
         (*reply).label = SALTY_NOT_FOUND;
     }
 }
@@ -189,9 +179,11 @@ pub extern "C" fn _start() -> ! {
 
     let err = salty::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
     if err != 0 {
-        puts(b"[NAMESERV] FAIL: set IPC buffer err=");
-        hex(err as u64);
-        puts(b"\n");
+        let mut lb = LineBuf::new();
+        lb.str(b"[NAMESERV] FAIL: set IPC buffer err=");
+        lb.hex(err as u64);
+        lb.str(b"\n");
+        lb.flush();
         idle();
     }
     unsafe {
@@ -221,12 +213,14 @@ pub extern "C" fn _start() -> ! {
 
         unsafe {
             match msg.label {
-                NS_REGISTER => handle_register(&raw const msg, &raw mut reply),
-                NS_LOOKUP => handle_lookup(&raw const msg, &raw mut reply),
+                POSIX_NS_REGISTER => handle_register(&raw const msg, &raw mut reply),
+                POSIX_NS_LOOKUP => handle_lookup(&raw const msg, &raw mut reply),
                 _ => {
-                    puts(b"[NAMESERV] unknown label=");
-                    hex(msg.label);
-                    puts(b"\n");
+                    let mut lb = LineBuf::new();
+                    lb.str(b"[NAMESERV] unknown label=");
+                    lb.hex(msg.label);
+                    lb.str(b"\n");
+                    lb.flush();
                     reply.label = SALTY_INVALID_OPERATION;
                 }
             }
@@ -252,9 +246,11 @@ pub extern "C" fn _start() -> ! {
             )
         };
         if err != 0 {
-            puts(b"[NAMESERV] reply_recv failed err=");
-            hex(err as u64);
-            puts(b"\n");
+            let mut lb = LineBuf::new();
+            lb.str(b"[NAMESERV] reply_recv failed err=");
+            lb.hex(err as u64);
+            lb.str(b"\n");
+            lb.flush();
             break;
         }
     }

@@ -130,7 +130,12 @@ impl SlabAllocator {
     ///
     /// Fast path: allocate from per-CPU cache (lock-free)
     /// Slow path: refill cache from shared slab
+    ///
+    /// IRQs are disabled to prevent preemption during per-CPU cache manipulation.
+    /// Without this, a timer interrupt could re-enter the slab allocator and
+    /// corrupt the per-CPU free list.
     pub fn alloc(&mut self) -> Option<*mut u8> {
+        let irq = unsafe { crate::mm::save_irq_disable() };
         let cpu_id = crate::arch::current_cpu() as usize;
 
         // Fast path: allocate from per-CPU cache
@@ -140,12 +145,16 @@ impl SlabAllocator {
                 let obj = cache.free_list;
                 cache.free_list = (*obj).next;
                 cache.free_count -= 1;
+                crate::mm::restore_irq(irq);
                 return Some(obj as *mut u8);
             }
         }
 
         // Slow path: refill from shared slab
-        self.refill_cache(cpu_id)?;
+        if self.refill_cache(cpu_id).is_none() {
+            unsafe { crate::mm::restore_irq(irq) };
+            return None;
+        }
 
         // Try again from cache
         let cache = &mut self.per_cpu[cpu_id];
@@ -153,6 +162,7 @@ impl SlabAllocator {
             let obj = cache.free_list;
             cache.free_list = (*obj).next;
             cache.free_count -= 1;
+            crate::mm::restore_irq(irq);
             Some(obj as *mut u8)
         }
     }
@@ -161,7 +171,10 @@ impl SlabAllocator {
     ///
     /// Fast path: return to per-CPU cache (lock-free)
     /// Slow path: flush cache to shared slab if full
+    ///
+    /// IRQs are disabled to prevent preemption during per-CPU cache manipulation.
     pub fn free(&mut self, ptr: *mut u8) {
+        let irq = unsafe { crate::mm::save_irq_disable() };
         let cpu_id = crate::arch::current_cpu() as usize;
         let cache = &mut self.per_cpu[cpu_id];
 
@@ -177,6 +190,8 @@ impl SlabAllocator {
             if cache.free_count > PER_CPU_LIMIT {
                 self.flush_cache(cpu_id);
             }
+
+            crate::mm::restore_irq(irq);
         }
     }
 

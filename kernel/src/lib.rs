@@ -24,38 +24,59 @@ pub use bootinfo::{FramebufferInfo, MemoryKind, MemoryMapEntry, ParsedBootInfo};
 
 use core::panic::PanicInfo;
 
+/// Acquire SCHED_IPC_LOCK. Does `cli` first to prevent same-CPU deadlock.
+/// Called from assembly (timer/reschedule/exception stubs).
+#[unsafe(no_mangle)]
+pub extern "C" fn sched_ipc_lock() {
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+    mm::SCHED_IPC_LOCK.lock();
+}
+
+/// Release SCHED_IPC_LOCK. Does NOT re-enable interrupts.
+/// Called from assembly (timer/reschedule/exception stubs).
+#[unsafe(no_mangle)]
+pub extern "C" fn sched_ipc_unlock() {
+    mm::SCHED_IPC_LOCK.unlock();
+}
+
 /// Serial port (COM1) for debug output
 const SERIAL_PORT: u16 = 0x3F8;
 
-/// Write a byte to serial port
+/// Leaf-level spinlock protecting all COM1 serial output.
 ///
-/// # Safety
-/// Serial port I/O is safe as long as the port exists.
+/// Lock ordering (outermost → innermost):
+///   CAP_LOCK → SCHED_IPC_LOCK → scheduler.lock_state → VSpace.lock → MM_LOCK → SERIAL_LOCK
+pub(crate) static SERIAL_LOCK: mm::SpinLock = mm::SpinLock::new();
+
+// ---------------------------------------------------------------------------
+// Raw serial output (no lock) — for panic/deadlock/crash paths only
+// ---------------------------------------------------------------------------
+
+/// Write a single byte to COM1 hardware. No locking.
 #[inline]
-fn serial_putc(c: u8) {
+pub(crate) fn serial_putc_hw(c: u8) {
     // SAFETY: COM1 is a standard x86 serial port
     unsafe {
-        // Wait for transmit buffer empty
         while (arch::inb(SERIAL_PORT + 5) & 0x20) == 0 {}
         arch::outb(SERIAL_PORT, c);
     }
 }
 
-/// Write a string to serial port
-fn serial_puts(s: &str) {
+/// Write a string to COM1 without any locking. Panic/crash path only.
+pub(crate) fn serial_puts_raw(s: &str) {
     for byte in s.bytes() {
-        serial_putc(byte);
+        serial_putc_hw(byte);
     }
 }
 
-/// Write a hexadecimal number to serial port
-fn serial_hex(mut val: u64) {
+/// Write a hexadecimal number to COM1 without any locking. Panic/crash path only.
+pub(crate) fn serial_hex_raw(mut val: u64) {
     const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
 
-    serial_puts("0x");
+    serial_puts_raw("0x");
 
     if val == 0 {
-        serial_putc(b'0');
+        serial_putc_hw(b'0');
         return;
     }
 
@@ -69,14 +90,14 @@ fn serial_hex(mut val: u64) {
     }
 
     for &c in &buf[(pos + 1)..] {
-        serial_putc(c);
+        serial_putc_hw(c);
     }
 }
 
-/// Write a decimal number to serial port
-fn serial_dec(mut val: u64) {
+/// Write a decimal number to COM1 without any locking. Panic/crash path only.
+pub(crate) fn serial_dec_raw(mut val: u64) {
     if val == 0 {
-        serial_putc(b'0');
+        serial_putc_hw(b'0');
         return;
     }
 
@@ -90,7 +111,155 @@ fn serial_dec(mut val: u64) {
     }
 
     for &c in &buf[(pos + 1)..] {
-        serial_putc(c);
+        serial_putc_hw(c);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Locked serial output — IRQ-safe, SMP-safe
+// ---------------------------------------------------------------------------
+
+/// Write a single byte to COM1 under SERIAL_LOCK.
+pub(crate) fn serial_putc(c: u8) {
+    // SAFETY: save/restore IRQ flags around spinlock to prevent deadlock
+    let irq = unsafe { mm::save_irq_disable() };
+    SERIAL_LOCK.lock();
+    serial_putc_hw(c);
+    SERIAL_LOCK.unlock();
+    unsafe { mm::restore_irq(irq) };
+}
+
+/// Write a string to COM1 under SERIAL_LOCK.
+pub(crate) fn serial_puts(s: &str) {
+    // SAFETY: save/restore IRQ flags around spinlock to prevent deadlock
+    let irq = unsafe { mm::save_irq_disable() };
+    SERIAL_LOCK.lock();
+    for byte in s.bytes() {
+        serial_putc_hw(byte);
+    }
+    SERIAL_LOCK.unlock();
+    unsafe { mm::restore_irq(irq) };
+}
+
+/// Write a hexadecimal number to COM1 under SERIAL_LOCK.
+pub(crate) fn serial_hex(val: u64) {
+    // SAFETY: save/restore IRQ flags around spinlock to prevent deadlock
+    let irq = unsafe { mm::save_irq_disable() };
+    SERIAL_LOCK.lock();
+    serial_hex_impl(val);
+    SERIAL_LOCK.unlock();
+    unsafe { mm::restore_irq(irq) };
+}
+
+/// Write a decimal number to COM1 under SERIAL_LOCK.
+pub(crate) fn serial_dec(val: u64) {
+    // SAFETY: save/restore IRQ flags around spinlock to prevent deadlock
+    let irq = unsafe { mm::save_irq_disable() };
+    SERIAL_LOCK.lock();
+    serial_dec_impl(val);
+    SERIAL_LOCK.unlock();
+    unsafe { mm::restore_irq(irq) };
+}
+
+/// Hex formatting without lock (used by SerialGuard and locked wrappers)
+fn serial_hex_impl(mut val: u64) {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    serial_putc_hw(b'0');
+    serial_putc_hw(b'x');
+
+    if val == 0 {
+        serial_putc_hw(b'0');
+        return;
+    }
+
+    let mut buf = [0u8; 16];
+    let mut pos = 15;
+
+    while val > 0 {
+        buf[pos] = HEX_CHARS[(val & 0xF) as usize];
+        val >>= 4;
+        pos -= 1;
+    }
+
+    for &c in &buf[(pos + 1)..] {
+        serial_putc_hw(c);
+    }
+}
+
+/// Decimal formatting without lock (used by SerialGuard and locked wrappers)
+fn serial_dec_impl(mut val: u64) {
+    if val == 0 {
+        serial_putc_hw(b'0');
+        return;
+    }
+
+    let mut buf = [0u8; 20];
+    let mut pos = 19;
+
+    while val > 0 {
+        buf[pos] = b'0' + ((val % 10) as u8);
+        val /= 10;
+        pos -= 1;
+    }
+
+    for &c in &buf[(pos + 1)..] {
+        serial_putc_hw(c);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SerialGuard — RAII guard for compound serial output atomicity
+// ---------------------------------------------------------------------------
+
+/// RAII guard that holds SERIAL_LOCK for the duration of a compound output.
+///
+/// Use when multiple serial_puts/hex/dec calls form a single logical message
+/// that must not be interleaved with output from other CPUs/threads.
+///
+/// ```rust
+/// {
+///     let s = SerialGuard::acquire();
+///     s.puts("[AP] CPU ");
+///     s.dec(cpu_id as u64);
+///     s.puts(" online\n");
+/// } // Drop → unlock + restore_irq
+/// ```
+pub(crate) struct SerialGuard {
+    irq: u64,
+}
+
+impl SerialGuard {
+    pub fn acquire() -> Self {
+        // SAFETY: save IRQ flags and disable interrupts to prevent deadlock
+        let irq = unsafe { mm::save_irq_disable() };
+        SERIAL_LOCK.lock();
+        Self { irq }
+    }
+
+    pub fn puts(&self, s: &str) {
+        for byte in s.bytes() {
+            serial_putc_hw(byte);
+        }
+    }
+
+    pub fn hex(&self, val: u64) {
+        serial_hex_impl(val);
+    }
+
+    pub fn dec(&self, val: u64) {
+        serial_dec_impl(val);
+    }
+
+    pub fn putc(&self, c: u8) {
+        serial_putc_hw(c);
+    }
+}
+
+impl Drop for SerialGuard {
+    fn drop(&mut self) {
+        SERIAL_LOCK.unlock();
+        // SAFETY: restoring previously saved IRQ flags
+        unsafe { mm::restore_irq(self.irq) };
     }
 }
 
@@ -103,42 +272,26 @@ fn serial_dec(mut val: u64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain(raw_boot_info: *const u8) -> ! {
     // Immediate confirmation we're in kernel (before anything else)
-    unsafe {
-        for byte in b"[ENTRY] " {
-            while (arch::inb(0x3F8 + 5) & 0x20) == 0 {}
-            arch::outb(0x3F8, *byte);
-        }
-    }
-
-    unsafe {
-        for byte in b"\nSaltyOS Kernel loaded\n" {
-            while (arch::inb(0x3F8 + 5) & 0x20) == 0 {}
-            arch::outb(0x3F8, *byte);
-        }
-
-        for byte in b"[KMAIN] Entry addr: " {
-            while (arch::inb(0x3F8 + 5) & 0x20) == 0 {}
-            arch::outb(0x3F8, *byte);
-        }
-        serial_hex(kmain as *const () as u64);
-        for byte in b"\n[KMAIN] Boot info ptr: " {
-            while (arch::inb(0x3F8 + 5) & 0x20) == 0 {}
-            arch::outb(0x3F8, *byte);
-        }
-        serial_hex(raw_boot_info as u64);
-        for byte in b"\n" {
-            while (arch::inb(0x3F8 + 5) & 0x20) == 0 {}
-            arch::outb(0x3F8, *byte);
-        }
+    // Note: raw output OK here — single CPU, before SMP init
+    serial_puts_raw("[ENTRY] ");
+    serial_puts_raw("\nSaltyOS Kernel loaded\n");
+    {
+        let s = SerialGuard::acquire();
+        s.puts("[KMAIN] Entry addr: ");
+        s.hex(kmain as *const () as u64);
+        s.puts("\n[KMAIN] Boot info ptr: ");
+        s.hex(raw_boot_info as u64);
+        s.puts("\n");
     }
 
     // Parse TLV-encoded BootInfo from bootloader
     let boot_info = unsafe { bootinfo::parse(raw_boot_info) };
 
     if let Some(info) = boot_info {
-        serial_puts("[KMAIN] BootInfo parsed: ");
-        serial_dec(info.memory_map_len as u64);
-        serial_puts(" memory map entries\n");
+        let s = SerialGuard::acquire();
+        s.puts("[KMAIN] BootInfo parsed: ");
+        s.dec(info.memory_map_len as u64);
+        s.puts(" memory map entries\n");
     } else {
         serial_puts("[KMAIN] WARNING: Failed to parse BootInfo!\n");
     }
@@ -161,11 +314,18 @@ pub extern "C" fn kmain(raw_boot_info: *const u8) -> ! {
     // Initialize SMP (start Application Processors)
     arch::init_smp(boot_info);
 
+    // Remove bootloader identity mapping (PML4[0]) now that all APs
+    // have booted and are running in higher-half kernel code.
+    arch::clear_boot_identity_map();
+
     // Bootstrap the first user-mode init task
     init::bootstrap(boot_info);
 
-    // Dispatch the init task (context_switch to it)
+    // Dispatch the init task (context_switch to it).
+    // SCHED_IPC_LOCK must be held: do_context_switch releases/reacquires it.
+    mm::SCHED_IPC_LOCK.lock();
     sched::scheduler::scheduler().reschedule();
+    mm::SCHED_IPC_LOCK.unlock();
 
     // Fallback (should never reach here once init task is dispatched)
     loop {
@@ -176,21 +336,21 @@ pub extern "C" fn kmain(raw_boot_info: *const u8) -> ! {
 /// Panic handler
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    serial_puts("\n!!! KERNEL PANIC !!!\n");
+    // Use raw output — another CPU might hold SERIAL_LOCK
+    serial_puts_raw("\n!!! KERNEL PANIC !!!\n");
 
     if let Some(location) = info.location() {
-        serial_puts("  Location: ");
-        serial_puts(location.file());
-        serial_putc(b':');
-        serial_dec(location.line() as u64);
-        serial_putc(b'\n');
+        serial_puts_raw("  Location: ");
+        serial_puts_raw(location.file());
+        serial_putc_hw(b':');
+        serial_dec_raw(location.line() as u64);
+        serial_putc_hw(b'\n');
     }
 
-    // message() returns PanicMessage which can be converted to Option<&str>
     if let Some(msg) = info.message().as_str() {
-        serial_puts("  Message: ");
-        serial_puts(msg);
-        serial_putc(b'\n');
+        serial_puts_raw("  Message: ");
+        serial_puts_raw(msg);
+        serial_putc_hw(b'\n');
     }
 
     loop {

@@ -9,6 +9,7 @@ use salty::elf_loader;
 use salty::invoke;
 use salty::ipc;
 use salty::serial;
+use salty::serial::LineBuf;
 use salty::types::*;
 
 pub struct ExtraCapCopy {
@@ -20,10 +21,6 @@ fn puts(s: &[u8]) {
     serial::serial_puts(s);
 }
 
-fn hex(v: u64) {
-    serial::serial_hex(v);
-}
-
 pub unsafe fn spawn_server(
     ut: Cap,
     cap_base: Cap,
@@ -32,12 +29,9 @@ pub unsafe fn spawn_server(
     extras: &[ExtraCapCopy],
     map_initrd: bool,
     cnode_size_bits: u64,
+    child_ut_bits: u8,
 ) -> i32 {
-    puts(b"[INIT] Spawning ");
-    puts(label);
-    puts(b" (");
-    puts(elf_name);
-    puts(b")\n");
+    { let mut lb = LineBuf::new(); lb.str(b"[INIT] Spawning "); lb.bytes(label); lb.str(b" ("); lb.bytes(elf_name); lb.str(b")\n"); lb.flush(); }
 
     unsafe {
         let initrd = super::INITRD_VADDR as *const u8;
@@ -45,17 +39,13 @@ pub unsafe fn spawn_server(
 
         let mut entry = CpioEntry::zeroed();
         if cpio::cpio_find_file(initrd, initrd_size, elf_name.as_ptr(), elf_name.len(), &raw mut entry) == 0 {
-            puts(b"[INIT] ");
-            puts(elf_name);
-            puts(b" not found in initrd\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] "); lb.bytes(elf_name); lb.str(b" not found in initrd\n"); lb.flush(); }
             return -1;
         }
 
         let is_dynamic = elf_dynamic::elf_has_interp(entry.data, entry.data_len);
         if is_dynamic {
-            puts(b"[INIT] ");
-            puts(label);
-            puts(b" is dynamically linked\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] "); lb.bytes(label); lb.str(b" is dynamically linked\n"); lb.flush(); }
         }
 
         let child_tcb = cap_base + super::COFF_TCB;
@@ -69,7 +59,7 @@ pub unsafe fn spawn_server(
         macro_rules! retype {
             ($obj:expr, $slot:expr, $name:expr) => {
                 let err = invoke::untyped_retype(ut, $obj, 0, $slot);
-                if err != 0 { puts(b"[INIT] retype "); puts($name); puts(b" failed\n"); return -1; }
+                if err != 0 { let mut lb = LineBuf::new(); lb.str(b"[INIT] retype "); lb.bytes($name); lb.str(b" failed\n"); lb.flush(); return -1; }
             };
         }
 
@@ -111,15 +101,11 @@ pub unsafe fn spawn_server(
             &raw mut elf_result,
         );
         if err != 0 {
-            puts(b"[INIT] ELF load failed err=");
-            hex(err as u64);
-            puts(b"\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] ELF load failed err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
             return -1;
         }
 
-        puts(b"[INIT] ELF loaded: entry=");
-        hex(elf_result.entry);
-        puts(b"\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[INIT] ELF loaded: entry="); lb.hex(elf_result.entry); lb.str(b"\n"); lb.flush(); }
 
         let mut rtld_result = ElfLoadResult { entry: 0, base: 0, brk: 0 };
 
@@ -143,11 +129,7 @@ pub unsafe fn spawn_server(
                 return -1;
             }
 
-            puts(b"[INIT] rtld loaded: entry=");
-            hex(rtld_result.entry);
-            puts(b" base=");
-            hex(rtld_result.base);
-            puts(b"\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] rtld loaded: entry="); lb.hex(rtld_result.entry); lb.str(b" base="); lb.hex(rtld_result.base); lb.str(b"\n"); lb.flush(); }
         }
 
         // Map stack pages
@@ -193,9 +175,7 @@ pub unsafe fn spawn_server(
         // Map initrd if needed
         if map_initrd || is_dynamic {
             let initrd_pages = (initrd_size + 4095) / 4096;
-            puts(b"[INIT] Mapping initrd into child (");
-            hex(initrd_pages as u64);
-            puts(b" pages)\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] Mapping initrd into child ("); lb.hex(initrd_pages as u64); lb.str(b" pages)\n"); lb.flush(); }
 
             for pg in 0..initrd_pages {
                 let fr_slot = super::init_alloc_frame_slot(core::ptr::null_mut());
@@ -257,13 +237,23 @@ pub unsafe fn spawn_server(
         if copy_cap!(child_cn, 2) != 0 { puts(b"[INIT] copy CNode failed\n"); return -1; }
         if copy_cap!(child_ep, 3) != 0 { puts(b"[INIT] copy EP failed\n"); return -1; }
 
-        let err = copy_cap!(ut, 7);
+        // Retype a dedicated sub-untyped for this child so each child has
+        // exclusive memory — prevents SMP races on the shared untyped.
+        let sub_ut_slot = super::init_alloc_frame_slot(core::ptr::null_mut());
+        let err = invoke::untyped_retype(ut, OBJ_UNTYPED, child_ut_bits as u64, sub_ut_slot);
         if err != 0 {
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] sub-untyped retype failed err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
             if is_dynamic {
-                puts(b"[INIT] copy Untyped to child failed\n");
                 return -1;
             }
-            puts(b"[INIT] WARN: copy Untyped to child failed\n");
+        }
+        let err = copy_cap!(sub_ut_slot, 7);
+        if err != 0 {
+            if is_dynamic {
+                puts(b"[INIT] copy sub-Untyped to child failed\n");
+                return -1;
+            }
+            puts(b"[INIT] WARN: copy sub-Untyped to child failed\n");
         }
 
         for extra in extras {
@@ -272,9 +262,7 @@ pub unsafe fn spawn_server(
             }
             let err = copy_cap!(extra.src, extra.dst);
             if err != 0 {
-                puts(b"[INIT] WARN: extra cap copy failed slot=");
-                hex(extra.dst);
-                puts(b"\n");
+                { let mut lb = LineBuf::new(); lb.str(b"[INIT] WARN: extra cap copy failed slot="); lb.hex(extra.dst); lb.str(b"\n"); lb.flush(); }
             }
         }
 
@@ -369,9 +357,7 @@ pub unsafe fn spawn_server(
         let err = invoke::tcb_resume(child_tcb);
         if err != 0 { puts(b"[INIT] TCB resume failed\n"); return -1; }
 
-        puts(b"[INIT] ");
-        puts(label);
-        puts(b" started!\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[INIT] "); lb.bytes(label); lb.str(b" started!\n"); lb.flush(); }
         0
     }
 }
@@ -381,7 +367,7 @@ pub unsafe fn pm_spawn(pm_ep: Cap, prog: &[u8]) -> i32 {
     unsafe {
         let len = prog.len();
         let mut spawn_msg = SaltyMsg::zeroed();
-        spawn_msg.label = 1; // PM_SPAWN
+        spawn_msg.label = POSIX_PM_SPAWN;
         spawn_msg.length = 1 + ((len as u64 + 7) / 8);
         spawn_msg.regs[0] = len as u64;
         let dst = &raw mut spawn_msg.regs[1] as *mut u8;

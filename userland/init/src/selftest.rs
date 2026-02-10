@@ -6,6 +6,7 @@ use salty::consts::*;
 use salty::invoke;
 use salty::ipc;
 use salty::serial;
+use salty::serial::LineBuf;
 use salty::syscall::syscall;
 use salty::types::*;
 
@@ -21,6 +22,7 @@ const CAP_FAULT_FRAME: u64 = 136;
 
 const IPC_BUF2_VADDR: u64 = 0x0000_0000_0020_1000;
 const FAULT_TEST_ADDR: u64 = 0x4000_0000;
+const TEST_IPC_LABEL: u64 = 0x42;
 
 #[repr(C, align(4096))]
 struct AlignedPage([u8; 4096]);
@@ -35,9 +37,6 @@ fn puts(s: &[u8]) {
     serial::serial_puts(s);
 }
 
-fn hex(v: u64) {
-    serial::serial_hex(v);
-}
 
 unsafe extern "C" fn thread2_entry() {
     unsafe {
@@ -49,15 +48,9 @@ unsafe extern "C" fn thread2_entry() {
 
         let err = ipc::recv_ctx(&raw mut THREAD2_IPC_CTX, CAP_TEST_EP, &raw mut msg, &raw mut badge);
         if err == 0 {
-            puts(b"[THREAD2] received message! label=");
-            hex(msg.label);
-            puts(b" reg0=");
-            hex(msg.regs[0]);
-            puts(b"\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[THREAD2] received message! label="); lb.hex(msg.label); lb.str(b" reg0="); lb.hex(msg.regs[0]); lb.str(b"\n"); lb.flush(); }
         } else {
-            puts(b"[THREAD2] recv failed, error=");
-            hex(err as u64);
-            puts(b"\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[THREAD2] recv failed, error="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
         }
 
         loop {
@@ -76,9 +69,7 @@ unsafe extern "C" fn fault_handler_entry() {
 
         let err = ipc::recv_ctx(&raw mut FAULT_IPC_CTX, CAP_FAULT_EP, &raw mut msg, &raw mut badge);
         if err != 0 {
-            puts(b"[FAULT_HANDLER] recv failed err=");
-            hex(err as u64);
-            puts(b"\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[FAULT_HANDLER] recv failed err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
         } else {
             puts(b"[FAULT_HANDLER] received fault! mapping page...\n");
 
@@ -89,9 +80,7 @@ unsafe extern "C" fn fault_handler_entry() {
                 VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
             );
             if merr != 0 {
-                puts(b"[FAULT_HANDLER] vspace_map failed err=");
-                hex(merr as u64);
-                puts(b"\n");
+                { let mut lb = LineBuf::new(); lb.str(b"[FAULT_HANDLER] vspace_map failed err="); lb.hex(merr as u64); lb.str(b"\n"); lb.flush(); }
             } else {
                 puts(b"[FAULT_HANDLER] page mapped OK\n");
             }
@@ -119,11 +108,7 @@ pub unsafe fn phase1_ipc_test(ut: Cap) -> i32 {
         ($obj:expr, $slot:expr, $name:expr) => {
             let err = invoke::untyped_retype(ut, $obj, 0, $slot);
             if err != 0 {
-                puts(b"[INIT] FAIL: ");
-                puts($name);
-                puts(b" retype error=");
-                hex(err as u64);
-                puts(b"\n");
+                { let mut lb = LineBuf::new(); lb.str(b"[INIT] FAIL: "); lb.str($name); lb.str(b" retype error="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
                 return -1;
             }
         };
@@ -138,9 +123,7 @@ pub unsafe fn phase1_ipc_test(ut: Cap) -> i32 {
 
         let err = invoke::tcb_set_space(CAP_TEST_TCB, CAP_SELF_CSPACE, CAP_SELF_VSPACE);
         if err != 0 {
-            puts(b"[INIT] FAIL: TCB_SET_SPACE error=");
-            hex(err as u64);
-            puts(b"\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] FAIL: TCB_SET_SPACE error="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
             return -1;
         }
 
@@ -148,9 +131,7 @@ pub unsafe fn phase1_ipc_test(ut: Cap) -> i32 {
         let t2_rsp = (&raw const THREAD2_STACK) as *const u8 as u64 + 4096;
         let err = invoke::tcb_configure(CAP_TEST_TCB, t2_rip, t2_rsp, 0);
         if err != 0 {
-            puts(b"[INIT] FAIL: TCB_CONFIGURE error=");
-            hex(err as u64);
-            puts(b"\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] FAIL: TCB_CONFIGURE error="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
             return -1;
         }
 
@@ -172,25 +153,19 @@ pub unsafe fn phase1_ipc_test(ut: Cap) -> i32 {
 
         let err = invoke::sc_configure(CAP_TEST_SC, 10000, 100000);
         if err != 0 {
-            puts(b"[INIT] FAIL: SC_CONFIGURE error=");
-            hex(err as u64);
-            puts(b"\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] FAIL: SC_CONFIGURE error="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
             return -1;
         }
 
         let err = invoke::sc_bind(CAP_TEST_SC, CAP_TEST_TCB);
         if err != 0 {
-            puts(b"[INIT] FAIL: SC_BIND error=");
-            hex(err as u64);
-            puts(b"\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] FAIL: SC_BIND error="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
             return -1;
         }
 
         let err = invoke::tcb_resume(CAP_TEST_TCB);
         if err != 0 {
-            puts(b"[INIT] FAIL: TCB_RESUME error=");
-            hex(err as u64);
-            puts(b"\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] FAIL: TCB_RESUME error="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
             return -1;
         }
 
@@ -198,15 +173,13 @@ pub unsafe fn phase1_ipc_test(ut: Cap) -> i32 {
 
         puts(b"[INIT] Sending test message to endpoint\n");
         let mut msg = SaltyMsg::zeroed();
-        msg.label = 0x42;
+        msg.label = TEST_IPC_LABEL;
         msg.length = 1;
         msg.regs[0] = 0xDEAD_BEEF;
 
         let err = ipc::send_ctx(super::ipc_ctx(), CAP_TEST_EP, &raw const msg);
         if err != 0 {
-            puts(b"[INIT] FAIL: send error=");
-            hex(err as u64);
-            puts(b"\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] FAIL: send error="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
             return -1;
         }
         puts(b"[INIT] Message sent successfully!\n");
@@ -226,11 +199,7 @@ pub unsafe fn phase2_fault_test(ut: Cap) -> i32 {
         ($obj:expr, $slot:expr, $name:expr) => {
             let err = invoke::untyped_retype(ut, $obj, 0, $slot);
             if err != 0 {
-                puts(b"[INIT] FAIL: ");
-                puts($name);
-                puts(b" retype err=");
-                hex(err as u64);
-                puts(b"\n");
+                { let mut lb = LineBuf::new(); lb.str(b"[INIT] FAIL: "); lb.str($name); lb.str(b" retype err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
                 return -1;
             }
         };
@@ -244,9 +213,7 @@ pub unsafe fn phase2_fault_test(ut: Cap) -> i32 {
 
         let err = invoke::tcb_set_space(CAP_FAULT_TCB, CAP_SELF_CSPACE, CAP_SELF_VSPACE);
         if err != 0 {
-            puts(b"[INIT] FAIL: fault TCB set_space err=");
-            hex(err as u64);
-            puts(b"\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] FAIL: fault TCB set_space err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
             return -1;
         }
 
@@ -254,9 +221,7 @@ pub unsafe fn phase2_fault_test(ut: Cap) -> i32 {
         let fh_rsp = (&raw const FAULT_HANDLER_STACK) as *const u8 as u64 + 4096;
         let err = invoke::tcb_configure(CAP_FAULT_TCB, fh_rip, fh_rsp, 0);
         if err != 0 {
-            puts(b"[INIT] FAIL: fault TCB configure err=");
-            hex(err as u64);
-            puts(b"\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] FAIL: fault TCB configure err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
             return -1;
         }
 
@@ -274,16 +239,12 @@ pub unsafe fn phase2_fault_test(ut: Cap) -> i32 {
 
         syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
 
-        puts(b"[INIT] Triggering page fault at ");
-        hex(FAULT_TEST_ADDR);
-        puts(b"\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[INIT] Triggering page fault at "); lb.hex(FAULT_TEST_ADDR); lb.str(b"\n"); lb.flush(); }
 
         let fault_ptr = FAULT_TEST_ADDR as *const u64;
         let val = core::ptr::read_volatile(fault_ptr);
 
-        puts(b"[INIT] Resumed after fault! val=");
-        hex(val);
-        puts(b"\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[INIT] Resumed after fault! val="); lb.hex(val); lb.str(b"\n"); lb.flush(); }
         puts(b"[INIT] Phase 2 Fault test PASSED\n");
         0
     }

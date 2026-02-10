@@ -107,13 +107,18 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
 
     /* Now global data is safe to use */
     rtld_puts("[RTLD] SaltyOS dynamic linker starting\n");
-    rtld_puts("[RTLD] AT_BASE=");
-    rtld_hex(at_base);
-    rtld_puts(" AT_ENTRY=");
-    rtld_hex(at_entry);
-    rtld_puts(" AT_PHDR=");
-    rtld_hex(at_phdr);
-    rtld_putc('\n');
+    {
+        struct rtld_linebuf lb;
+        rtld_lb_init(&lb);
+        rtld_lb_str(&lb, "[RTLD] AT_BASE=");
+        rtld_lb_hex(&lb, at_base);
+        rtld_lb_str(&lb, " AT_ENTRY=");
+        rtld_lb_hex(&lb, at_entry);
+        rtld_lb_str(&lb, " AT_PHDR=");
+        rtld_lb_hex(&lb, at_phdr);
+        rtld_lb_str(&lb, "\n");
+        rtld_lb_flush(&lb);
+    }
 
     g_rtld.exe_entry = at_entry;
     g_rtld.exe_phdr = at_phdr;
@@ -175,11 +180,16 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
     exe_base = exe_min_vaddr + exe_load_delta;
     g_rtld.exe_phdr = at_phdr;
 
-    rtld_puts("[RTLD] exe_base=");
-    rtld_hex(exe_base);
-    rtld_puts(" exe_dyn=");
-    rtld_hex((uint64_t)exe_dyn);
-    rtld_putc('\n');
+    {
+        struct rtld_linebuf lb;
+        rtld_lb_init(&lb);
+        rtld_lb_str(&lb, "[RTLD] exe_base=");
+        rtld_lb_hex(&lb, exe_base);
+        rtld_lb_str(&lb, " exe_dyn=");
+        rtld_lb_hex(&lb, (uint64_t)exe_dyn);
+        rtld_lb_str(&lb, "\n");
+        rtld_lb_flush(&lb);
+    }
 
     /* Create link_map for executable */
     struct link_map *exe_map = &g_rtld.objects[0];
@@ -198,17 +208,25 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         for (int i = 0; exe_dyn[i].d_tag != DT_NULL; i++) {
             if (exe_dyn[i].d_tag == DT_NEEDED) {
                 const char *lib_name = exe_map->strtab + exe_dyn[i].d_val;
-                rtld_puts("[RTLD] DT_NEEDED: ");
-                rtld_puts(lib_name);
-                rtld_putc('\n');
+                {
+                    struct rtld_linebuf lb;
+                    rtld_lb_init(&lb);
+                    rtld_lb_str(&lb, "[RTLD] DT_NEEDED: ");
+                    rtld_lb_str(&lb, lib_name);
+                    rtld_lb_str(&lb, "\n");
+                    rtld_lb_flush(&lb);
+                }
 
                 int err = load_shared_library(&g_rtld, lib_name, lib_load_addr);
                 if (err != 0) {
-                    rtld_puts("[RTLD] FATAL: failed to load ");
-                    rtld_puts(lib_name);
-                    rtld_puts(" err=");
-                    rtld_hex((uint64_t)err);
-                    rtld_putc('\n');
+                    struct rtld_linebuf lb;
+                    rtld_lb_init(&lb);
+                    rtld_lb_str(&lb, "[RTLD] FATAL: failed to load ");
+                    rtld_lb_str(&lb, lib_name);
+                    rtld_lb_str(&lb, " err=");
+                    rtld_lb_hex(&lb, (uint64_t)err);
+                    rtld_lb_str(&lb, "\n");
+                    rtld_lb_flush(&lb);
                     for (;;) rtld_yield();
                 }
 
@@ -221,9 +239,14 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
     /* 5. Process relocations for all loaded objects (libs first, then exe) */
     for (int i = g_rtld.nobjects - 1; i >= 0; i--) {
         struct link_map *map = &g_rtld.objects[i];
-        rtld_puts("[RTLD] Relocating: ");
-        rtld_puts(map->name);
-        rtld_putc('\n');
+        {
+            struct rtld_linebuf lb;
+            rtld_lb_init(&lb);
+            rtld_lb_str(&lb, "[RTLD] Relocating: ");
+            rtld_lb_str(&lb, map->name);
+            rtld_lb_str(&lb, "\n");
+            rtld_lb_flush(&lb);
+        }
         process_relocations(&g_rtld, map);
     }
 
@@ -258,9 +281,14 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
     }
 
     /* 8. Jump to executable entry point */
-    rtld_puts("[RTLD] Jumping to executable entry at ");
-    rtld_hex(g_rtld.exe_entry);
-    rtld_putc('\n');
+    {
+        struct rtld_linebuf lb;
+        rtld_lb_init(&lb);
+        rtld_lb_str(&lb, "[RTLD] Jumping to executable entry at ");
+        rtld_lb_hex(&lb, g_rtld.exe_entry);
+        rtld_lb_str(&lb, "\n");
+        rtld_lb_flush(&lb);
+    }
 
     ((void (*)(void))g_rtld.exe_entry)();
     __builtin_unreachable();

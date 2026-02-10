@@ -363,6 +363,8 @@ impl Endpoint {
                     return;
                 }
 
+                // Acquire CAP_LOCK for slot array access (nesting: SCHED_IPC_LOCK → CAP_LOCK)
+                crate::mm::CAP_LOCK.lock();
                 for i in 0..cap_count as u64 {
                     let src_slot_idx = msg.caps[i as usize];
                     if src_slot_idx == 0 {
@@ -403,6 +405,7 @@ impl Endpoint {
                         src_cap.rights,
                     );
                 }
+                crate::mm::CAP_LOCK.unlock();
             }
         }
     }

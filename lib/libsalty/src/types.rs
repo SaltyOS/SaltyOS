@@ -344,6 +344,33 @@ impl PollFd {
     }
 }
 
+// Time types
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Timespec {
+    pub tv_sec: u64,
+    pub tv_nsec: u64,
+}
+
+impl Timespec {
+    pub const fn zeroed() -> Self {
+        Timespec { tv_sec: 0, tv_nsec: 0 }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Timeval {
+    pub tv_sec: u64,
+    pub tv_usec: u64,
+}
+
+impl Timeval {
+    pub const fn zeroed() -> Self {
+        Timeval { tv_sec: 0, tv_usec: 0 }
+    }
+}
+
 // Epoll event
 #[repr(C)]
 #[derive(Clone, Copy)]

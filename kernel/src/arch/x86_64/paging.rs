@@ -198,3 +198,24 @@ pub fn init() {
     // Initialize kernel VSpace tracking (needed before any VSpace::new() calls)
     crate::mm::vspace::init_kernel_vspace(read_cr3());
 }
+
+/// Remove bootloader identity mapping (PML4[0]).
+///
+/// Must be called AFTER all APs have booted. The AP trampoline executes
+/// in low physical memory and needs the identity mapping during its
+/// real-mode → long-mode transition. Once all APs are in higher-half
+/// kernel code, PML4[0] can be safely cleared.
+///
+/// This prevents stale bootloader page table frames (with supervisor-only
+/// 2MB entries) from being visible through the old PML4[0] reference
+/// after their physical memory is reclaimed by the frame allocator.
+pub fn clear_boot_identity_map() {
+    let cr3 = read_cr3();
+    let pml4 = unsafe { &mut *(crate::mm::phys_to_virt(cr3) as *mut PageTable) };
+    pml4.set_entry(0, 0);
+
+    // Flush local TLB
+    unsafe {
+        write_cr3(cr3);
+    }
+}

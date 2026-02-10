@@ -15,7 +15,7 @@ pub use x86_64::{context_switch, usermode_trampoline};
 
 // Re-export IPI types and functions
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::{get_ticks, send_ipi, IpiKind};
+pub use x86_64::{get_ticks, now_ns, send_ipi, set_tlb_shootdown_addr, IpiKind};
 
 /// Initialize architecture-specific subsystems
 pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
@@ -27,6 +27,12 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
 pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
     #[cfg(target_arch = "x86_64")]
     x86_64::init_smp(boot_info);
+}
+
+/// Remove bootloader identity mapping after all APs have booted.
+pub fn clear_boot_identity_map() {
+    #[cfg(target_arch = "x86_64")]
+    x86_64::paging::clear_boot_identity_map();
 }
 
 /// Halt the CPU until next interrupt

@@ -60,9 +60,9 @@ static int alloc_map_page(struct rtld_state *st, uint64_t vaddr, uint64_t flags,
     /* Retype a frame from untyped */
     err = rtld_retype_frame(st->untyped, frame_slot);
     if (err != 0) {
-        rtld_puts("[RTLD] retype frame failed err=");
-        rtld_hex(err);
-        rtld_putc('\n');
+        { struct rtld_linebuf lb; rtld_lb_init(&lb);
+          rtld_lb_str(&lb, "[RTLD] retype frame failed err=");
+          rtld_lb_hex(&lb, err); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
         return -1;
     }
 
@@ -70,9 +70,9 @@ static int alloc_map_page(struct rtld_state *st, uint64_t vaddr, uint64_t flags,
     err = rtld_vspace_map(st->vspace, frame_slot, st->scratch_vaddr,
                            VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER);
     if (err != 0) {
-        rtld_puts("[RTLD] map scratch failed err=");
-        rtld_hex(err);
-        rtld_putc('\n');
+        { struct rtld_linebuf lb; rtld_lb_init(&lb);
+          rtld_lb_str(&lb, "[RTLD] map scratch failed err=");
+          rtld_lb_hex(&lb, err); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
         return -2;
     }
 
@@ -95,11 +95,10 @@ static int alloc_map_page(struct rtld_state *st, uint64_t vaddr, uint64_t flags,
     /* Map at target vaddr in our own VSpace */
     err = rtld_vspace_map(st->vspace, frame_slot, vaddr, flags);
     if (err != 0) {
-        rtld_puts("[RTLD] map target failed vaddr=");
-        rtld_hex(vaddr);
-        rtld_puts(" err=");
-        rtld_hex(err);
-        rtld_putc('\n');
+        { struct rtld_linebuf lb; rtld_lb_init(&lb);
+          rtld_lb_str(&lb, "[RTLD] map target failed vaddr=");
+          rtld_lb_hex(&lb, vaddr); rtld_lb_str(&lb, " err=");
+          rtld_lb_hex(&lb, err); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
         return -3;
     }
 
@@ -124,9 +123,9 @@ static int patch_mapped_page(struct rtld_state *st, cap_t frame_slot,
     uint64_t err = rtld_vspace_map(st->vspace, frame_slot, st->scratch_vaddr,
                                     VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER);
     if (err != 0) {
-        rtld_puts("[RTLD] patch map scratch failed err=");
-        rtld_hex(err);
-        rtld_putc('\n');
+        { struct rtld_linebuf lb; rtld_lb_init(&lb);
+          rtld_lb_str(&lb, "[RTLD] patch map scratch failed err=");
+          rtld_lb_hex(&lb, err); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
         return -1;
     }
 
@@ -141,11 +140,10 @@ static int patch_mapped_page(struct rtld_state *st, cap_t frame_slot,
 
 int load_shared_library(struct rtld_state *st, const char *name,
                          uint64_t load_addr) {
-    rtld_puts("[RTLD] Loading ");
-    rtld_puts(name);
-    rtld_puts(" at ");
-    rtld_hex(load_addr);
-    rtld_putc('\n');
+    { struct rtld_linebuf lb; rtld_lb_init(&lb);
+      rtld_lb_str(&lb, "[RTLD] Loading ");
+      rtld_lb_str(&lb, name); rtld_lb_str(&lb, " at ");
+      rtld_lb_hex(&lb, load_addr); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
 
     if (st->nobjects >= RTLD_MAX_OBJECTS) {
         rtld_puts("[RTLD] too many loaded objects\n");
@@ -156,15 +154,15 @@ int load_shared_library(struct rtld_state *st, const char *name,
     struct rtld_cpio_entry cpio;
     if (!rtld_cpio_find((const uint8_t *)st->initrd_base, st->initrd_size,
                          name, &cpio)) {
-        rtld_puts("[RTLD] not found in initrd: ");
-        rtld_puts(name);
-        rtld_putc('\n');
+        { struct rtld_linebuf lb; rtld_lb_init(&lb);
+          rtld_lb_str(&lb, "[RTLD] not found in initrd: ");
+          rtld_lb_str(&lb, name); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
         return -2;
     }
 
-    rtld_puts("[RTLD] Found in initrd, size=");
-    rtld_hex(cpio.data_len);
-    rtld_putc('\n');
+    { struct rtld_linebuf lb; rtld_lb_init(&lb);
+      rtld_lb_str(&lb, "[RTLD] Found in initrd, size=");
+      rtld_lb_hex(&lb, cpio.data_len); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
 
     /* Validate ELF header */
     if (cpio.data_len < sizeof(Elf64_Ehdr))
@@ -204,11 +202,10 @@ int load_shared_library(struct rtld_state *st, const char *name,
         uint64_t seg_end = rtld_page_align_up(seg_vaddr + ph->p_memsz);
         uint64_t flags = rtld_elf_to_vspace_flags(ph->p_flags);
 
-        rtld_puts("[RTLD]   LOAD ");
-        rtld_hex(seg_start);
-        rtld_puts("-");
-        rtld_hex(seg_end);
-        rtld_putc('\n');
+        { struct rtld_linebuf lb; rtld_lb_init(&lb);
+          rtld_lb_str(&lb, "[RTLD]   LOAD ");
+          rtld_lb_hex(&lb, seg_start); rtld_lb_str(&lb, "-");
+          rtld_lb_hex(&lb, seg_end); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
 
         /* Map pages for this segment */
         for (uint64_t page = seg_start; page < seg_end; page += PAGE_SIZE) {
@@ -259,11 +256,10 @@ int load_shared_library(struct rtld_state *st, const char *name,
                                                           pages[existing].frame_slot,
                                                           page, merged_flags);
                     if (remap_err != 0) {
-                        rtld_puts("[RTLD] remap merged flags failed vaddr=");
-                        rtld_hex(page);
-                        rtld_puts(" err=");
-                        rtld_hex(remap_err);
-                        rtld_putc('\n');
+                        { struct rtld_linebuf lb; rtld_lb_init(&lb);
+                          rtld_lb_str(&lb, "[RTLD] remap merged flags failed vaddr=");
+                          rtld_lb_hex(&lb, page); rtld_lb_str(&lb, " err=");
+                          rtld_lb_hex(&lb, remap_err); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
                         return -6;
                     }
                     pages[existing].flags = merged_flags;
@@ -318,11 +314,10 @@ int load_shared_library(struct rtld_state *st, const char *name,
 
     st->nobjects++;
 
-    rtld_puts("[RTLD] Loaded ");
-    rtld_puts(name);
-    rtld_puts(" base=");
-    rtld_hex(base);
-    rtld_putc('\n');
+    { struct rtld_linebuf lb; rtld_lb_init(&lb);
+      rtld_lb_str(&lb, "[RTLD] Loaded ");
+      rtld_lb_str(&lb, name); rtld_lb_str(&lb, " base=");
+      rtld_lb_hex(&lb, base); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
 
     return 0;
 }

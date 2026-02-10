@@ -5,6 +5,7 @@
 use salty::consts::*;
 use salty::posix_mm;
 use salty::serial;
+use salty::serial::LineBuf;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -33,9 +34,7 @@ pub fn run() -> bool {
         puts(b"[TEST_MMAP] FAIL: sbrk returned -1\n");
         return false;
     }
-    puts(b"[TEST_MMAP] sbrk returned: ");
-    serial::serial_hex(old_brk);
-    puts(b"\n");
+    { let mut lb = LineBuf::new(); lb.str(b"[TEST_MMAP] sbrk returned: "); lb.hex(old_brk); lb.str(b"\n"); lb.flush(); }
 
     // Write and read back
     unsafe {
@@ -73,9 +72,7 @@ pub fn run() -> bool {
         puts(b"[TEST_MMAP] FAIL: mmap returned MAP_FAILED\n");
         return false;
     }
-    puts(b"[TEST_MMAP] mmap returned: ");
-    serial::serial_hex(page as u64);
-    puts(b"\n");
+    { let mut lb = LineBuf::new(); lb.str(b"[TEST_MMAP] mmap returned: "); lb.hex(page as u64); lb.str(b"\n"); lb.flush(); }
 
     // Verify zero-initialized
     unsafe {

@@ -200,23 +200,12 @@ static mut PER_CPU_GDT: [Gdt; MAX_CPUS] = [const {
 }; MAX_CPUS];
 
 /// Set the kernel stack pointer in TSS (rsp0) for the current CPU
-///
-/// This is the stack that will be used when interrupts occur from user mode.
-/// The CPU switches to this stack automatically based on CPL.
-///
-/// # Safety
-/// Must be called with a valid kernel stack pointer.
 pub unsafe fn set_tss_rsp0(stack_top: u64) {
     let cpu_id = super::cpu::current_cpu() as usize;
     unsafe { set_tss_rsp0_cpu(cpu_id, stack_top); }
 }
 
 /// Set the kernel stack pointer in TSS (rsp0) for a specific CPU.
-///
-/// Useful during AP initialization before GS-based current_cpu() is trusted.
-///
-/// # Safety
-/// `cpu_id` must be a valid CPU index and `stack_top` must be a valid stack pointer.
 pub unsafe fn set_tss_rsp0_cpu(cpu_id: usize, stack_top: u64) {
     unsafe {
         if cpu_id == 0 {
@@ -240,12 +229,6 @@ pub fn get_tss_rsp0() -> u64 {
 }
 
 /// Set an IST (Interrupt Stack Table) entry in the TSS
-///
-/// IST entries provide dedicated stacks for critical exceptions (e.g., double fault)
-/// so they can be handled even if the current kernel stack is corrupted.
-///
-/// # Safety
-/// `stack_top` must be a valid virtual address pointing to the top of an allocated stack.
 pub unsafe fn set_tss_ist(ist_index: u8, stack_top: u64) {
     let cpu_id = super::cpu::current_cpu() as usize;
     unsafe {
@@ -268,9 +251,6 @@ pub unsafe fn set_tss_ist(ist_index: u8, stack_top: u64) {
 }
 
 /// Set an IST entry for a specific CPU's TSS (used during AP init before GS is set)
-///
-/// # Safety
-/// `cpu_id` must be valid. `stack_top` must be a valid stack address.
 pub unsafe fn set_tss_ist_cpu(cpu_id: usize, ist_index: u8, stack_top: u64) {
     unsafe {
         let tss = if cpu_id == 0 {
@@ -292,12 +272,6 @@ pub unsafe fn set_tss_ist_cpu(cpu_id: usize, ist_index: u8, stack_top: u64) {
 }
 
 /// Load per-CPU GDT and TSS for an Application Processor
-///
-/// Each AP gets its own GDT with its own TSS entry pointing to its own TSS.
-/// This must be called early during AP initialization.
-///
-/// # Safety
-/// Must be called from the AP during its init sequence.
 pub unsafe fn load_per_cpu(cpu_id: usize) {
     unsafe {
         // Set up per-CPU TSS entry in per-CPU GDT
@@ -324,100 +298,6 @@ pub unsafe fn load_per_cpu(cpu_id: usize) {
             "ltr {0:x}",
             in(reg) 0x28u16,
             options(nostack)
-        );
-    }
-}
-
-/// Serial port (COM1) for debug output
-const SERIAL_PORT: u16 = 0x3F8;
-
-/// Write a byte to serial port (inline for debugging)
-///
-/// # Safety
-/// Serial port I/O is safe as long as the port exists.
-unsafe fn serial_putc(c: u8) {
-    // Wait for transmit buffer empty
-    loop {
-        // SAFETY: Reading serial port status is safe for standard COM1 port
-        let status = unsafe { inb(SERIAL_PORT + 5) };
-        if status & 0x20 != 0 {
-            break;
-        }
-    }
-    // SAFETY: Serial port I/O is safe for standard COM1 port
-    unsafe {
-        outb(SERIAL_PORT, c);
-    }
-}
-
-/// Write a string to serial port
-unsafe fn serial_puts(s: &str) {
-    for byte in s.bytes() {
-        // SAFETY: Serial port I/O is safe for standard COM1 port
-        unsafe {
-            serial_putc(byte);
-        }
-    }
-}
-
-/// Write a hexadecimal number to serial port
-unsafe fn serial_hex(mut val: u64) {
-    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-
-    // SAFETY: Serial port I/O is safe
-    unsafe {
-        serial_puts("0x");
-    }
-
-    if val == 0 {
-        // SAFETY: Serial port I/O is safe
-        unsafe {
-            serial_putc(b'0');
-        }
-        return;
-    }
-
-    let mut buf = [0u8; 16];
-    let mut pos = 15;
-
-    while val > 0 {
-        buf[pos] = HEX_CHARS[(val & 0xF) as usize];
-        val >>= 4;
-        pos -= 1;
-    }
-
-    for &c in &buf[(pos + 1)..] {
-        // SAFETY: Serial port I/O is safe
-        unsafe {
-            serial_putc(c);
-        }
-    }
-}
-
-/// Read byte from I/O port
-unsafe fn inb(port: u16) -> u8 {
-    let result: u8;
-    // SAFETY: I/O port read is safe for standard ports
-    unsafe {
-        core::arch::asm!(
-            "in al, dx",
-            out("al") result,
-            in("dx") port,
-            options(nomem, nostack)
-        );
-    }
-    result
-}
-
-/// Write byte to I/O port
-unsafe fn outb(port: u16, value: u8) {
-    // SAFETY: I/O port write is safe for standard ports
-    unsafe {
-        core::arch::asm!(
-            "out dx, al",
-            in("dx") port,
-            in("al") value,
-            options(nomem, nostack)
         );
     }
 }
@@ -454,16 +334,19 @@ pub fn init() {
         };
 
         // DEBUG: Print what we're about to load
-        serial_puts("\n[GDT] Before lgdt:\n");
-        serial_puts("  base: ");
-        serial_hex(gdt_ptr.base);
-        serial_puts("\n  limit: ");
-        serial_hex(gdt_ptr.limit as u64);
-        serial_puts("\n  GDT addr: ");
-        serial_hex((&raw const GDT) as u64);
-        serial_puts("\n  TSS addr: ");
-        serial_hex((&raw const TSS) as u64);
-        serial_putc(b'\n');
+        {
+            let s = crate::SerialGuard::acquire();
+            s.puts("\n[GDT] Before lgdt:\n");
+            s.puts("  base: ");
+            s.hex(gdt_ptr.base);
+            s.puts("\n  limit: ");
+            s.hex(gdt_ptr.limit as u64);
+            s.puts("\n  GDT addr: ");
+            s.hex((&raw const GDT) as u64);
+            s.puts("\n  TSS addr: ");
+            s.hex((&raw const TSS) as u64);
+            s.putc(b'\n');
+        }
 
         core::arch::asm!(
             "lgdt [{}]",
@@ -482,16 +365,19 @@ pub fn init() {
         read_back_base = gdt_ptr.base;
         read_back_limit = gdt_ptr.limit;
 
-        serial_puts("[GDT] After lgdt (read back):\n");
-        serial_puts("  base: ");
-        serial_hex(read_back_base);
-        serial_puts("\n  limit: ");
-        serial_hex(read_back_limit as u64);
-        serial_putc(b'\n');
+        {
+            let s = crate::SerialGuard::acquire();
+            s.puts("[GDT] After lgdt (read back):\n");
+            s.puts("  base: ");
+            s.hex(read_back_base);
+            s.puts("\n  limit: ");
+            s.hex(read_back_limit as u64);
+            s.putc(b'\n');
+        }
 
         // Reload segment registers (including CS via far return)
         reload_segments();
-        serial_puts("[GDT] Segments reloaded successfully\n");
+        crate::serial_puts("[GDT] Segments reloaded successfully\n");
 
         // Load TSS (must be AFTER GDT is loaded and segments are reloaded)
         // TSS selector is 0x28 (5th GDT entry, first is null)
@@ -500,7 +386,7 @@ pub fn init() {
             in(reg) 0x28u16,
             options(nostack)
         );
-        serial_puts("[GDT] TSS loaded successfully\n");
+        crate::serial_puts("[GDT] TSS loaded successfully\n");
     }
 }
 

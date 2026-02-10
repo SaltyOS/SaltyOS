@@ -4,14 +4,11 @@
 
 use salty::posix;
 use salty::serial;
+use salty::serial::LineBuf;
 use salty::types::*;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
-}
-
-fn putnum(n: i32) {
-    serial::serial_dec(if n < 0 { 0 } else { n as u64 });
 }
 
 pub fn run() -> bool {
@@ -19,9 +16,7 @@ pub fn run() -> bool {
 
     // Test 1: getpid
     let my_pid = unsafe { posix::posix_getpid() };
-    puts(b"[TEST_FORK] Test 1: getpid = ");
-    putnum(my_pid);
-    puts(b"\n");
+    { let mut lb = LineBuf::new(); lb.str(b"[TEST_FORK] Test 1: getpid = "); lb.dec(my_pid as u64); lb.str(b"\n"); lb.flush(); }
     if my_pid <= 0 {
         puts(b"[TEST_FORK] FAIL: getpid\n");
         return false;
@@ -30,9 +25,7 @@ pub fn run() -> bool {
 
     // Test 2: getppid
     let my_ppid = unsafe { posix::posix_getppid() };
-    puts(b"[TEST_FORK] Test 2: getppid = ");
-    putnum(my_ppid);
-    puts(b"\n");
+    { let mut lb = LineBuf::new(); lb.str(b"[TEST_FORK] Test 2: getppid = "); lb.dec(my_ppid as u64); lb.str(b"\n"); lb.flush(); }
     puts(b"[TEST_FORK] Test 2: PASS\n");
 
     // Test 3: fork + waitpid
@@ -48,17 +41,11 @@ pub fn run() -> bool {
         unsafe { posix::posix_exit(7) };
     }
 
-    puts(b"[TEST_FORK] Parent: child PID = ");
-    putnum(pid);
-    puts(b"\n");
+    { let mut lb = LineBuf::new(); lb.str(b"[TEST_FORK] Parent: child PID = "); lb.dec(pid as u64); lb.str(b"\n"); lb.flush(); }
 
     let mut status: i32 = 0;
     let ret = unsafe { posix::posix_waitpid(pid, &raw mut status) };
-    puts(b"[TEST_FORK] Parent: waitpid returned ");
-    putnum(ret);
-    puts(b", status = ");
-    putnum(status);
-    puts(b"\n");
+    { let mut lb = LineBuf::new(); lb.str(b"[TEST_FORK] Parent: waitpid returned "); lb.dec(ret as u64); lb.str(b", status = "); lb.dec(status as u64); lb.str(b"\n"); lb.flush(); }
 
     if ret != pid || !wifexited(status) || wexitstatus(status) != 7 {
         puts(b"[TEST_FORK] FAIL: waitpid\n");

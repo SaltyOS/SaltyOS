@@ -17,6 +17,14 @@ pub const SYS_YIELD: u64 = 8;
 pub const SYS_INVOKE: u64 = 9;
 pub const SYS_DEBUG_PUTCHAR: u64 = 10;
 pub const SYS_DEBUG_DUMP_STATE: u64 = 11;
+pub const SYS_CLOCK_GETTIME: u64 = 12;
+pub const SYS_NANOSLEEP: u64 = 13;
+pub const SYS_DEBUG_PUTSTR: u64 = 14;
+pub const SYS_DEBUG_PUTBUF: u64 = 15;
+
+// Clock IDs
+pub const CLOCK_MONOTONIC: i32 = 0;
+pub const CLOCK_REALTIME: i32 = 1;
 
 // CNode operations (0x10-0x16)
 pub const CNODE_COPY: u64 = 0x10;
@@ -146,6 +154,12 @@ pub const POSIX_VFS_SENDMSG: u64 = 25;
 pub const POSIX_VFS_RECVMSG: u64 = 26;
 pub const POSIX_VFS_SOCKPAIR: u64 = 27;
 pub const POSIX_VFS_SHUTDOWN: u64 = 28;
+pub const POSIX_VFS_PIPE: u64 = 29;
+pub const POSIX_VFS_DUP: u64 = 30;
+pub const POSIX_VFS_DUP2: u64 = 31;
+pub const POSIX_VFS_CLONE_FDS: u64 = 32;
+pub const POSIX_VFS_IOCTL: u64 = 33;
+pub const POSIX_VFS_ISATTY: u64 = 34;
 
 // Procmgr protocol labels
 pub const POSIX_PM_SPAWN: u64 = 1;
@@ -158,6 +172,10 @@ pub const POSIX_PM_GETPPID: u64 = 7;
 pub const POSIX_PM_KILL: u64 = 8;
 pub const POSIX_PM_SIGACTION: u64 = 9;
 
+// Nameserv protocol labels
+pub const POSIX_NS_REGISTER: u64 = 1;
+pub const POSIX_NS_LOOKUP: u64 = 2;
+
 // O_* flags
 pub const O_RDONLY: u64 = 0x0000;
 pub const O_WRONLY: u64 = 0x0001;
@@ -166,6 +184,7 @@ pub const O_CREAT: u64 = 0x0040;
 pub const O_EXCL: u64 = 0x0080;
 pub const O_TRUNC: u64 = 0x0200;
 pub const O_APPEND: u64 = 0x0400;
+pub const O_NONBLOCK: u64 = 0x0800;
 
 // SEEK_* constants
 pub const SEEK_SET: u64 = 0;
@@ -178,6 +197,7 @@ pub const S_IFDIR: u64 = 0o040000;
 pub const S_IFCHR: u64 = 0o020000;
 pub const S_IFREG: u64 = 0o100000;
 pub const S_IFSOCK: u64 = 0o140000;
+pub const S_IFIFO: u64 = 0o010000;
 
 // Access mode flags
 pub const F_OK: u64 = 0;
@@ -189,6 +209,7 @@ pub const DT_REG: u8 = 8;
 pub const DT_DIR: u8 = 4;
 pub const DT_CHR: u8 = 2;
 pub const DT_SOCK: u8 = 12;
+pub const DT_FIFO: u8 = 1;
 
 // waitpid options
 pub const WNOHANG: u64 = 1;
@@ -207,6 +228,9 @@ pub const SIGTERM: i32 = 15;
 pub const SIGCHLD: i32 = 17;
 pub const SIGCONT: i32 = 18;
 pub const SIGSTOP: i32 = 19;
+pub const SIGTSTP: i32 = 20;
+pub const SIGTTIN: i32 = 21;
+pub const SIGTTOU: i32 = 22;
 pub const NSIG: usize = 32;
 
 // Signal disposition categories

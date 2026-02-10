@@ -29,9 +29,9 @@ static uint64_t resolve_by_index(struct rtld_state *st, struct link_map *map,
     if (ELF64_ST_BIND(sym->st_info) == STB_WEAK)
         return 0;
 
-    rtld_puts("[RTLD] WARN: unresolved symbol: ");
-    rtld_puts(name);
-    rtld_putc('\n');
+    { struct rtld_linebuf lb; rtld_lb_init(&lb);
+      rtld_lb_str(&lb, "[RTLD] WARN: unresolved symbol: ");
+      rtld_lb_str(&lb, name); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
     return 0;
 }
 
@@ -73,9 +73,9 @@ static void apply_rela(struct rtld_state *st, struct link_map *map,
     }
 
     default:
-        rtld_puts("[RTLD] WARN: unknown reloc type ");
-        rtld_hex(type);
-        rtld_putc('\n');
+        { struct rtld_linebuf lb; rtld_lb_init(&lb);
+          rtld_lb_str(&lb, "[RTLD] WARN: unknown reloc type ");
+          rtld_lb_hex(&lb, type); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
         break;
     }
 }
@@ -103,9 +103,9 @@ int process_relocations(struct rtld_state *st, struct link_map *map) {
  */
 uint64_t _dl_fixup(struct link_map *map, uint64_t reloc_index) {
     if (!map->jmprel || reloc_index >= map->jmprel_count) {
-        rtld_puts("[RTLD] _dl_fixup: invalid reloc_index ");
-        rtld_hex(reloc_index);
-        rtld_putc('\n');
+        { struct rtld_linebuf lb; rtld_lb_init(&lb);
+          rtld_lb_str(&lb, "[RTLD] _dl_fixup: invalid reloc_index ");
+          rtld_lb_hex(&lb, reloc_index); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
         return 0;
     }
 
@@ -114,16 +114,16 @@ uint64_t _dl_fixup(struct link_map *map, uint64_t reloc_index) {
     Elf64_Sym *sym = &map->symtab[sym_idx];
     const char *name = map->strtab + sym->st_name;
 
-    rtld_puts("[RTLD] Lazy resolve: ");
-    rtld_puts(name);
-    rtld_putc('\n');
+    { struct rtld_linebuf lb; rtld_lb_init(&lb);
+      rtld_lb_str(&lb, "[RTLD] Lazy resolve: ");
+      rtld_lb_str(&lb, name); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
 
     uint64_t addr = resolve_symbol_addr(&g_rtld, name);
 
     if (addr == 0) {
-        rtld_puts("[RTLD] FATAL: lazy resolve failed for: ");
-        rtld_puts(name);
-        rtld_putc('\n');
+        { struct rtld_linebuf lb; rtld_lb_init(&lb);
+          rtld_lb_str(&lb, "[RTLD] FATAL: lazy resolve failed for: ");
+          rtld_lb_str(&lb, name); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
         for (;;) rtld_yield();
     }
 

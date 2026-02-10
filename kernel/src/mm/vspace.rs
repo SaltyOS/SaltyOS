@@ -666,6 +666,8 @@ pub struct VSpace {
     /// VSpaceTracking is allocated from static pool for deferred free support
     /// Pool allocation allows tracking to outlive VSpace
     tracking: *mut VSpaceTracking,
+    /// Per-VSpace lock for page table modifications (map/unmap/install_page_table)
+    lock: SpinLock,
 }
 
 impl VSpace {
@@ -680,6 +682,7 @@ impl VSpace {
             ),
             root: pml4_addr,
             tracking,
+            lock: SpinLock::new(),
         }
     }
 
@@ -764,6 +767,10 @@ impl VSpace {
                 if pde & ENTRY_PRESENT == 0 {
                     return None;
                 }
+                // 2MB huge page — there is no level-1 page table
+                if pde & (1 << 7) != 0 {
+                    return None;
+                }
                 let pt = unsafe { &*(phys_to_virt(pde & ENTRY_ADDR_MASK) as *const PageTable) };
                 Some(pt.entry(Self::pt_index(vaddr)))
             }
@@ -823,6 +830,11 @@ impl VSpace {
 
                 current_table = new_frame;
             } else {
+                // Huge page (PS bit set) at this level means we cannot
+                // descend further — the entry covers a large page, not a table pointer.
+                if current_level <= 3 && entry & (1 << 7) != 0 {
+                    return Err(VSpaceError::AlreadyMapped);
+                }
                 current_table = entry & ENTRY_ADDR_MASK;
             }
 
@@ -923,6 +935,33 @@ impl VSpace {
         entry
     }
 
+    /// Send TLB shootdown IPI to all remote CPUs that have this VSpace loaded
+    fn tlb_shootdown(&self, vaddr: VirtAddr) {
+        if self.tracking.is_null() {
+            return;
+        }
+        let cpu_id = crate::arch::current_cpu() as usize;
+        let tracking = unsafe { &*self.tracking };
+
+        for word_idx in 0..tracking.active_mask.len() {
+            let mask = tracking.active_mask[word_idx].load(Ordering::Acquire);
+            if mask == 0 {
+                continue;
+            }
+            for bit in 0..32 {
+                if mask & (1 << bit) != 0 {
+                    let target = word_idx * 32 + bit;
+                    if target < MAX_CPUS && target != cpu_id {
+                        crate::arch::set_tlb_shootdown_addr(target, vaddr);
+                        unsafe {
+                            crate::arch::send_ipi(target, crate::arch::IpiKind::TlbShootdown);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Map a page
     pub fn map(
         &mut self,
@@ -930,7 +969,7 @@ impl VSpace {
         phys: PhysAddr,
         flags: PageFlags,
     ) -> Result<(), VSpaceError> {
-        // Check alignment
+        // Check alignment (no lock needed)
         if virt & (PAGE_SIZE as u64 - 1) != 0 {
             return Err(VSpaceError::Alignment);
         }
@@ -939,24 +978,38 @@ impl VSpace {
             return Err(VSpaceError::Alignment);
         }
 
-        // Ensure all intermediate page tables exist
-        self.ensure_table(virt, 1, flags.user)?;
+        // Acquire per-VSpace lock
+        let irq = unsafe { save_irq_disable() };
+        self.lock.lock();
 
-        // Check if already mapped
-        if let Some(entry) = self.read_entry(virt, 1) {
-            if entry & ENTRY_PRESENT != 0 {
-                return Err(VSpaceError::AlreadyMapped);
+        // Ensure all intermediate page tables exist (may alloc frames — MM_LOCK is inner)
+        let result = (|| {
+            self.ensure_table(virt, 1, flags.user)?;
+
+            // Check if already mapped
+            if let Some(entry) = self.read_entry(virt, 1) {
+                if entry & ENTRY_PRESENT != 0 {
+                    return Err(VSpaceError::AlreadyMapped);
+                }
             }
-        }
 
-        // Create the mapping
-        let entry_flags = Self::flags_to_entry_flags(flags);
-        self.write_entry(virt, 1, phys | entry_flags)?;
+            // Create the mapping
+            let entry_flags = Self::flags_to_entry_flags(flags);
+            self.write_entry(virt, 1, phys | entry_flags)?;
 
-        // Flush TLB for this page
-        crate::arch::x86_64::paging::invlpg(virt);
+            // Local TLB flush
+            crate::arch::x86_64::paging::invlpg(virt);
 
-        Ok(())
+            // Remote TLB shootdown
+            self.tlb_shootdown(virt);
+
+            Ok(())
+        })();
+
+        self.lock.unlock();
+        unsafe { restore_irq(irq) };
+
+        result
     }
 
     /// Install a page table at a specific level
@@ -984,71 +1037,96 @@ impl VSpace {
             core::ptr::write_bytes(pt_virt, 0, PAGE_SIZE);
         }
 
-        // Walk from PML4 down to the parent level
-        // We need to ensure tables exist down to level+1, then install at level
-        let parent_level = level + 1;
+        // Acquire per-VSpace lock
+        let irq = unsafe { save_irq_disable() };
+        self.lock.lock();
 
-        let user_flag = ENTRY_USER; // Page tables for user mappings
-        let table_flags = ENTRY_PRESENT | ENTRY_WRITABLE | user_flag;
+        let result = (|| {
+            // Walk from PML4 down to the parent level
+            let parent_level = level + 1;
 
-        let mut current_table: PhysAddr = self.root;
-        let mut cur = 4;
+            let user_flag = ENTRY_USER; // Page tables for user mappings
+            let table_flags = ENTRY_PRESENT | ENTRY_WRITABLE | user_flag;
 
-        while cur > parent_level {
-            let table = unsafe { &mut *(phys_to_virt(current_table) as *mut PageTable) };
-            let idx = match cur {
+            let mut current_table: PhysAddr = self.root;
+            let mut cur = 4;
+
+            while cur > parent_level {
+                let table = unsafe { &mut *(phys_to_virt(current_table) as *mut PageTable) };
+                let idx = match cur {
+                    4 => Self::pml4_index(vaddr),
+                    3 => Self::pdpt_index(vaddr),
+                    2 => Self::pd_index(vaddr),
+                    _ => return Err(VSpaceError::NotMapped),
+                };
+
+                let entry = table.entry(idx);
+                if entry & ENTRY_PRESENT == 0 {
+                    return Err(VSpaceError::NotMapped);
+                }
+                current_table = entry & ENTRY_ADDR_MASK;
+                cur -= 1;
+            }
+
+            // Now install at the parent level
+            let parent_table = unsafe { &mut *(phys_to_virt(current_table) as *mut PageTable) };
+            let idx = match parent_level {
                 4 => Self::pml4_index(vaddr),
                 3 => Self::pdpt_index(vaddr),
                 2 => Self::pd_index(vaddr),
                 _ => return Err(VSpaceError::NotMapped),
             };
 
-            let entry = table.entry(idx);
-            if entry & ENTRY_PRESENT == 0 {
-                return Err(VSpaceError::NotMapped);
+            let existing = parent_table.entry(idx);
+            if existing & ENTRY_PRESENT != 0 {
+                return Err(VSpaceError::AlreadyMapped);
             }
-            current_table = entry & ENTRY_ADDR_MASK;
-            cur -= 1;
-        }
 
-        // Now install at the parent level
-        let parent_table = unsafe { &mut *(phys_to_virt(current_table) as *mut PageTable) };
-        let idx = match parent_level {
-            4 => Self::pml4_index(vaddr),
-            3 => Self::pdpt_index(vaddr),
-            2 => Self::pd_index(vaddr),
-            _ => return Err(VSpaceError::NotMapped),
-        };
+            parent_table.set_entry(idx, pt_phys | table_flags);
+            // No TLB shootdown needed — new empty table has no cached entries
+            Ok(())
+        })();
 
-        let existing = parent_table.entry(idx);
-        if existing & ENTRY_PRESENT != 0 {
-            return Err(VSpaceError::AlreadyMapped);
-        }
+        self.lock.unlock();
+        unsafe { restore_irq(irq) };
 
-        parent_table.set_entry(idx, pt_phys | table_flags);
-        Ok(())
+        result
     }
 
     /// Unmap a page
     pub fn unmap(&mut self, virt: VirtAddr) -> Result<(), VSpaceError> {
-        // Check alignment
+        // Check alignment (no lock needed)
         if virt & (PAGE_SIZE as u64 - 1) != 0 {
             return Err(VSpaceError::Alignment);
         }
 
-        // Check if mapped
-        let entry = self.read_entry(virt, 1).ok_or(VSpaceError::NotMapped)?;
-        if entry & ENTRY_PRESENT == 0 {
-            return Err(VSpaceError::NotMapped);
-        }
+        // Acquire per-VSpace lock
+        let irq = unsafe { save_irq_disable() };
+        self.lock.lock();
 
-        // Clear the entry
-        self.write_entry(virt, 1, 0)?;
+        let result = (|| {
+            // Check if mapped
+            let entry = self.read_entry(virt, 1).ok_or(VSpaceError::NotMapped)?;
+            if entry & ENTRY_PRESENT == 0 {
+                return Err(VSpaceError::NotMapped);
+            }
 
-        // Flush TLB for this page
-        crate::arch::x86_64::paging::invlpg(virt);
+            // Clear the entry
+            self.write_entry(virt, 1, 0)?;
 
-        Ok(())
+            // Local TLB flush
+            crate::arch::x86_64::paging::invlpg(virt);
+
+            // Remote TLB shootdown
+            self.tlb_shootdown(virt);
+
+            Ok(())
+        })();
+
+        self.lock.unlock();
+        unsafe { restore_irq(irq) };
+
+        result
     }
 
     /// Atomically switch to this VSpace (non-blocking)

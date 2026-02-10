@@ -163,74 +163,6 @@ impl ExceptionFrame {
 
 static mut IDT: Idt = Idt::new();
 
-/// Serial port (COM1) for debug output
-const SERIAL_PORT: u16 = 0x3F8;
-
-/// Write a byte to serial port
-unsafe fn serial_putc(c: u8) {
-    unsafe {
-        while (super::inb(SERIAL_PORT + 5) & 0x20) == 0 {}
-        super::outb(SERIAL_PORT, c);
-    }
-}
-
-/// Write a string to serial port
-unsafe fn serial_puts(s: &str) {
-    for byte in s.bytes() {
-        unsafe {
-            serial_putc(byte);
-        }
-    }
-}
-
-/// Write a hexadecimal number to serial port
-unsafe fn serial_hex(mut val: u64) {
-    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-    unsafe {
-        serial_puts("0x");
-    }
-    if val == 0 {
-        unsafe {
-            serial_putc(b'0');
-        }
-        return;
-    }
-    let mut buf = [0u8; 16];
-    let mut pos = 15;
-    while val > 0 {
-        buf[pos] = HEX_CHARS[(val & 0xF) as usize];
-        val >>= 4;
-        pos -= 1;
-    }
-    for &c in &buf[(pos + 1)..] {
-        unsafe {
-            serial_putc(c);
-        }
-    }
-}
-
-/// Write a decimal number to serial port
-unsafe fn serial_dec(mut val: u64) {
-    if val == 0 {
-        unsafe {
-            serial_putc(b'0');
-        }
-        return;
-    }
-    let mut buf = [0u8; 20];
-    let mut pos = 19;
-    while val > 0 {
-        buf[pos] = b'0' + ((val % 10) as u8);
-        val /= 10;
-        pos -= 1;
-    }
-    for &c in &buf[(pos + 1)..] {
-        unsafe {
-            serial_putc(c);
-        }
-    }
-}
-
 // Assembly stubs (defined in exceptions.S)
 unsafe extern "C" {
     // Exception stubs
@@ -271,6 +203,7 @@ unsafe extern "C" {
     fn irq_stub_timer();
     fn irq_stub_ipi_vspace_teardown();
     fn irq_stub_ipi_reschedule();
+    fn irq_stub_ipi_tlb_shootdown();
 
     // Generic IRQ stubs for external hardware interrupts
     fn irq_stub_generic_33();
@@ -350,13 +283,16 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
                     )
                 };
 
-                serial_puts("[FAULT] user exception vec=");
-                serial_dec(f.vector);
-                serial_puts(" addr=");
-                serial_hex(f.cr2);
-                serial_puts(" rip=");
-                serial_hex(f.rip);
-                serial_puts(" -> delivering via IPC\n");
+                {
+                    let s = crate::SerialGuard::acquire();
+                    s.puts("[FAULT] user exception vec=");
+                    s.dec(f.vector);
+                    s.puts(" addr=");
+                    s.hex(f.cr2);
+                    s.puts(" rip=");
+                    s.hex(f.rip);
+                    s.puts(" -> delivering via IPC\n");
+                }
 
                 // Deliver to handler endpoint (sets state/blocked_reason internally)
                 fault_ep.deliver_fault(current, &msg);
@@ -372,66 +308,149 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
         }
     }
 
-    // No fault handler or kernel-mode exception: diagnostic dump + halt
+    // No fault handler — diagnostic dump
+    // For user-mode: SCHED_IPC_LOCK is held (assembly acquired it)
+    // For kernel-mode: SCHED_IPC_LOCK is NOT held (assembly skipped it)
+    // Use raw serial — this is a crash path, another CPU may hold SERIAL_LOCK
     unsafe {
-        serial_puts("\n*** EXCEPTION: ");
-        serial_puts(f.exception_name());
-        serial_puts(" (vector ");
-        serial_dec(f.vector);
-        serial_puts(", error_code ");
-        serial_hex(f.error_code);
-        serial_puts(")\n");
+        crate::serial_puts_raw("\n*** EXCEPTION: ");
+        crate::serial_puts_raw(f.exception_name());
+        crate::serial_puts_raw(" (vector ");
+        crate::serial_dec_raw(f.vector);
+        crate::serial_puts_raw(", error_code ");
+        crate::serial_hex_raw(f.error_code);
+        crate::serial_puts_raw(")\n");
 
         if f.vector == 14 {
-            serial_puts("  CR2 (fault addr): ");
-            serial_hex(f.cr2);
-            serial_putc(b'\n');
-            serial_puts("  Flags: ");
-            if f.error_code & 1 != 0 { serial_puts("P "); } else { serial_puts("NP "); }
-            if f.error_code & 2 != 0 { serial_puts("W "); } else { serial_puts("R "); }
-            if f.error_code & 4 != 0 { serial_puts("U "); } else { serial_puts("S "); }
-            if f.error_code & 8 != 0 { serial_puts("RSVD "); }
-            if f.error_code & 16 != 0 { serial_puts("I/D "); }
-            serial_putc(b'\n');
+            crate::serial_puts_raw("  CR2 (fault addr): ");
+            crate::serial_hex_raw(f.cr2);
+            crate::serial_putc_hw(b'\n');
+            crate::serial_puts_raw("  Flags: ");
+            if f.error_code & 1 != 0 { crate::serial_puts_raw("P "); } else { crate::serial_puts_raw("NP "); }
+            if f.error_code & 2 != 0 { crate::serial_puts_raw("W "); } else { crate::serial_puts_raw("R "); }
+            if f.error_code & 4 != 0 { crate::serial_puts_raw("U "); } else { crate::serial_puts_raw("S "); }
+            if f.error_code & 8 != 0 { crate::serial_puts_raw("RSVD "); }
+            if f.error_code & 16 != 0 { crate::serial_puts_raw("I/D "); }
+            crate::serial_putc_hw(b'\n');
+
+            // Dump PTE chain for the faulting address to diagnose NX at any level
+            if f.error_code & 16 != 0 {
+                let cr3: u64;
+                core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
+                let addr_mask: u64 = 0x000F_FFFF_FFFF_F000;
+                let nx_bit: u64 = 1u64 << 63;
+
+                let pml4 = crate::mm::phys_to_virt(cr3 & addr_mask) as *const u64;
+                let pml4_idx = ((f.cr2 >> 39) & 0x1FF) as usize;
+                let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
+                crate::serial_puts_raw("  PML4E["); crate::serial_dec_raw(pml4_idx as u64);
+                crate::serial_puts_raw("]="); crate::serial_hex_raw(pml4e);
+                if pml4e & nx_bit != 0 { crate::serial_puts_raw(" NX!"); }
+                crate::serial_putc_hw(b'\n');
+
+                if pml4e & 1 != 0 {
+                    let pdpt = crate::mm::phys_to_virt(pml4e & addr_mask) as *const u64;
+                    let pdpt_idx = ((f.cr2 >> 30) & 0x1FF) as usize;
+                    let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
+                    crate::serial_puts_raw("  PDPTE["); crate::serial_dec_raw(pdpt_idx as u64);
+                    crate::serial_puts_raw("]="); crate::serial_hex_raw(pdpte);
+                    if pdpte & nx_bit != 0 { crate::serial_puts_raw(" NX!"); }
+                    crate::serial_putc_hw(b'\n');
+
+                    if pdpte & 1 != 0 {
+                        if pdpte & (1 << 7) != 0 {
+                            crate::serial_puts_raw("  PDPTE is 1GB page (PS=1), no PD\n");
+                        } else {
+                            let pd = crate::mm::phys_to_virt(pdpte & addr_mask) as *const u64;
+                            let pd_idx = ((f.cr2 >> 21) & 0x1FF) as usize;
+                            let pde = core::ptr::read_volatile(pd.add(pd_idx));
+                            crate::serial_puts_raw("  PDE["); crate::serial_dec_raw(pd_idx as u64);
+                            crate::serial_puts_raw("]="); crate::serial_hex_raw(pde);
+                            if pde & nx_bit != 0 { crate::serial_puts_raw(" NX!"); }
+                            crate::serial_putc_hw(b'\n');
+
+                            if pde & 1 != 0 {
+                                if pde & (1 << 7) != 0 {
+                                    crate::serial_puts_raw("  PDE is 2MB page (PS=1), no PT\n");
+                                } else {
+                                    let pt = crate::mm::phys_to_virt(pde & addr_mask) as *const u64;
+                                    let pt_idx = ((f.cr2 >> 12) & 0x1FF) as usize;
+                                    let pte = core::ptr::read_volatile(pt.add(pt_idx));
+                                    crate::serial_puts_raw("  PTE["); crate::serial_dec_raw(pt_idx as u64);
+                                    crate::serial_puts_raw("]="); crate::serial_hex_raw(pte);
+                                    if pte & nx_bit != 0 { crate::serial_puts_raw(" NX!"); }
+                                    crate::serial_putc_hw(b'\n');
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if f.vector == 13 && f.error_code != 0 {
-            serial_puts("  Selector: ");
-            serial_hex(f.error_code & 0xFFF8);
-            serial_puts("  Table: ");
+            crate::serial_puts_raw("  Selector: ");
+            crate::serial_hex_raw(f.error_code & 0xFFF8);
+            crate::serial_puts_raw("  Table: ");
             match (f.error_code >> 1) & 3 {
-                0 => serial_puts("GDT"),
-                1 => serial_puts("IDT"),
-                2 => serial_puts("LDT"),
-                3 => serial_puts("IDT"),
+                0 => crate::serial_puts_raw("GDT"),
+                1 => crate::serial_puts_raw("IDT"),
+                2 => crate::serial_puts_raw("LDT"),
+                3 => crate::serial_puts_raw("IDT"),
                 _ => {}
             }
-            if f.error_code & 1 != 0 { serial_puts(" (External)"); }
-            serial_putc(b'\n');
+            if f.error_code & 1 != 0 { crate::serial_puts_raw(" (External)"); }
+            crate::serial_putc_hw(b'\n');
         }
 
-        serial_puts("  RIP:    "); serial_hex(f.rip);
-        serial_puts("  CS:     "); serial_hex(f.cs); serial_putc(b'\n');
-        serial_puts("  RSP:    "); serial_hex(f.rsp);
-        serial_puts("  SS:     "); serial_hex(f.ss); serial_putc(b'\n');
-        serial_puts("  RFLAGS: "); serial_hex(f.rflags); serial_putc(b'\n');
-        serial_puts("  RAX: "); serial_hex(f.rax);
-        serial_puts("  RBX: "); serial_hex(f.rbx);
-        serial_puts("  RCX: "); serial_hex(f.rcx); serial_putc(b'\n');
-        serial_puts("  RDX: "); serial_hex(f.rdx);
-        serial_puts("  RSI: "); serial_hex(f.rsi);
-        serial_puts("  RDI: "); serial_hex(f.rdi); serial_putc(b'\n');
-        serial_puts("  RBP: "); serial_hex(f.rbp);
-        serial_puts("  R8:  "); serial_hex(f.r8);
-        serial_puts("  R9:  "); serial_hex(f.r9); serial_putc(b'\n');
-        serial_puts("  R10: "); serial_hex(f.r10);
-        serial_puts("  R11: "); serial_hex(f.r11);
-        serial_puts("  R12: "); serial_hex(f.r12); serial_putc(b'\n');
-        serial_puts("  R13: "); serial_hex(f.r13);
-        serial_puts("  R14: "); serial_hex(f.r14);
-        serial_puts("  R15: "); serial_hex(f.r15); serial_putc(b'\n');
+        crate::serial_puts_raw("  RIP:    "); crate::serial_hex_raw(f.rip);
+        crate::serial_puts_raw("  CS:     "); crate::serial_hex_raw(f.cs); crate::serial_putc_hw(b'\n');
+        crate::serial_puts_raw("  RSP:    "); crate::serial_hex_raw(f.rsp);
+        crate::serial_puts_raw("  SS:     "); crate::serial_hex_raw(f.ss); crate::serial_putc_hw(b'\n');
+        crate::serial_puts_raw("  RFLAGS: "); crate::serial_hex_raw(f.rflags); crate::serial_putc_hw(b'\n');
+        crate::serial_puts_raw("  RAX: "); crate::serial_hex_raw(f.rax);
+        crate::serial_puts_raw("  RBX: "); crate::serial_hex_raw(f.rbx);
+        crate::serial_puts_raw("  RCX: "); crate::serial_hex_raw(f.rcx); crate::serial_putc_hw(b'\n');
+        crate::serial_puts_raw("  RDX: "); crate::serial_hex_raw(f.rdx);
+        crate::serial_puts_raw("  RSI: "); crate::serial_hex_raw(f.rsi);
+        crate::serial_puts_raw("  RDI: "); crate::serial_hex_raw(f.rdi); crate::serial_putc_hw(b'\n');
+        crate::serial_puts_raw("  RBP: "); crate::serial_hex_raw(f.rbp);
+        crate::serial_puts_raw("  R8:  "); crate::serial_hex_raw(f.r8);
+        crate::serial_puts_raw("  R9:  "); crate::serial_hex_raw(f.r9); crate::serial_putc_hw(b'\n');
+        crate::serial_puts_raw("  R10: "); crate::serial_hex_raw(f.r10);
+        crate::serial_puts_raw("  R11: "); crate::serial_hex_raw(f.r11);
+        crate::serial_puts_raw("  R12: "); crate::serial_hex_raw(f.r12); crate::serial_putc_hw(b'\n');
+        crate::serial_puts_raw("  R13: "); crate::serial_hex_raw(f.r13);
+        crate::serial_puts_raw("  R14: "); crate::serial_hex_raw(f.r14);
+        crate::serial_puts_raw("  R15: "); crate::serial_hex_raw(f.r15); crate::serial_putc_hw(b'\n');
     }
 
+    // User-mode fault without handler: terminate thread and reschedule
+    // instead of halting the CPU permanently.
+    if (f.cs & 3) != 0 {
+        unsafe {
+            // SCHED_IPC_LOCK is held (assembly acquired it for user-mode exceptions).
+            // reschedule() expects it held; do_context_switch releases before switch
+            // and reacquires on resume in the new thread.
+            let scheduler = crate::sched::scheduler::scheduler();
+            let current = scheduler.current();
+            if !current.is_null() {
+                (*current).state = crate::sched::thread::ThreadState::Inactive;
+                crate::serial_puts_raw("[FAULT] Thread terminated, rescheduling\n");
+                // reschedule picks next runnable thread and context-switches.
+                // The dead thread never resumes, so the assembly epilogue
+                // (sched_ipc_unlock + iretq) for THIS frame is never reached.
+                // That is correct: do_context_switch releases SCHED_IPC_LOCK
+                // before switching, and the new thread resumes normally.
+                scheduler.reschedule();
+                // Not reached — this thread is Inactive and won't be scheduled
+            }
+            // Fallback: no current thread (shouldn't happen), release lock and halt
+            crate::sched_ipc_unlock();
+        }
+    }
+
+    // Kernel-mode fault: no recovery possible
     loop {
         super::halt();
     }
@@ -441,15 +460,18 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
 pub fn init() {
     // SAFETY: Single-threaded initialization, IDT is properly structured
     unsafe {
-        serial_puts("\n[IDT] Starting init\n");
+        crate::serial_puts("\n[IDT] Starting init\n");
 
         // Print IDT address
-        serial_puts("[IDT] IDT addr: ");
-        serial_hex((&raw const IDT) as u64);
-        serial_putc(b'\n');
+        {
+            let s = crate::SerialGuard::acquire();
+            s.puts("[IDT] IDT addr: ");
+            s.hex((&raw const IDT) as u64);
+            s.putc(b'\n');
+        }
 
         // Set up exception handlers (vectors 0-31) using assembly stubs
-        serial_puts("[IDT] Setting exception handlers (0-31)\n");
+        crate::serial_puts("[IDT] Setting exception handlers (0-31)\n");
 
         let stubs: [u64; 32] = [
             exception_stub_0 as *const () as u64,
@@ -499,20 +521,25 @@ pub fn init() {
             }
         }
 
-        serial_puts("[IDT] Exception handlers set\n");
+        crate::serial_puts("[IDT] Exception handlers set\n");
 
         // Set up IRQ handlers (vectors 32+) using assembly stubs with swapgs
-        serial_puts("[IDT] Setting IRQ handlers\n");
+        crate::serial_puts("[IDT] Setting IRQ handlers\n");
         idt.entries[32].set_handler(irq_stub_timer as *const () as u64);
-        serial_puts("[IDT]   timer handler: ");
-        serial_hex(irq_stub_timer as *const () as u64);
-        serial_putc(b'\n');
+        {
+            let s = crate::SerialGuard::acquire();
+            s.puts("[IDT]   timer handler: ");
+            s.hex(irq_stub_timer as *const () as u64);
+            s.putc(b'\n');
+        }
 
         // Vector 40: IPI VSpace Teardown
         idt.entries[40].set_handler(irq_stub_ipi_vspace_teardown as *const () as u64);
         // Vector 41: IPI Reschedule
         idt.entries[41].set_handler(irq_stub_ipi_reschedule as *const () as u64);
-        serial_puts("[IDT] IPI handlers set (vectors 40-41)\n");
+        // Vector 48: IPI TLB Shootdown
+        idt.entries[48].set_handler(irq_stub_ipi_tlb_shootdown as *const () as u64);
+        crate::serial_puts("[IDT] IPI handlers set (vectors 40-41, 48)\n");
 
         // Generic external IRQ handlers (vectors 33-39, 42-47)
         idt.entries[33].set_handler(irq_stub_generic_33 as *const () as u64);
@@ -528,23 +555,26 @@ pub fn init() {
         idt.entries[45].set_handler(irq_stub_generic_45 as *const () as u64);
         idt.entries[46].set_handler(irq_stub_generic_46 as *const () as u64);
         idt.entries[47].set_handler(irq_stub_generic_47 as *const () as u64);
-        serial_puts("[IDT] External IRQ handlers set (vectors 33-47)\n");
+        crate::serial_puts("[IDT] External IRQ handlers set (vectors 33-47)\n");
 
         // Prepare IDT pointer
-        serial_puts("[IDT] Preparing IDT pointer\n");
+        crate::serial_puts("[IDT] Preparing IDT pointer\n");
         let idt_ptr = IdtPtr {
             limit: (size_of::<Idt>() - 1) as u16,
             base: (&raw const IDT) as u64,
         };
 
-        serial_puts("[IDT]   limit: ");
-        serial_hex(idt_ptr.limit as u64);
-        serial_puts("\n[IDT]   base: ");
-        serial_hex(idt_ptr.base);
-        serial_putc(b'\n');
+        {
+            let s = crate::SerialGuard::acquire();
+            s.puts("[IDT]   limit: ");
+            s.hex(idt_ptr.limit as u64);
+            s.puts("\n[IDT]   base: ");
+            s.hex(idt_ptr.base);
+            s.putc(b'\n');
+        }
 
         // Load IDT
-        serial_puts("[IDT] Calling lidt\n");
+        crate::serial_puts("[IDT] Calling lidt\n");
         core::arch::asm!(
             "lidt [{}]",
             in(reg) &idt_ptr,
@@ -552,35 +582,39 @@ pub fn init() {
         );
 
         // Verify with sidt
-        serial_puts("[IDT] Verifying with sidt...\n");
+        crate::serial_puts("[IDT] Verifying with sidt...\n");
         let mut idt_read_back: IdtPtr = IdtPtr { limit: 0, base: 0 };
         core::arch::asm!(
             "sidt [{}]",
             in(reg) &mut idt_read_back,
             options(nostack)
         );
-        serial_puts("[IDT] sidt result: limit=");
-        serial_hex(idt_read_back.limit as u64);
-        serial_puts(" base=");
-        serial_hex(idt_read_back.base);
-        serial_putc(b'\n');
+        {
+            let s = crate::SerialGuard::acquire();
+            s.puts("[IDT] sidt result: limit=");
+            s.hex(idt_read_back.limit as u64);
+            s.puts(" base=");
+            s.hex(idt_read_back.base);
+            s.putc(b'\n');
+        }
 
         // Verify struct sizes
-        serial_puts("[IDT] Struct sizes:\n");
-        serial_puts("  size_of::<IdtEntry>() = ");
-        serial_hex(size_of::<IdtEntry>() as u64);
-        serial_putc(b'\n');
-        serial_puts("  size_of::<IdtPtr>() = ");
-        serial_hex(size_of::<IdtPtr>() as u64);
-        serial_putc(b'\n');
-        serial_puts("  size_of::<Idt>() = ");
-        serial_hex(size_of::<Idt>() as u64);
-        serial_putc(b'\n');
+        {
+            let s = crate::SerialGuard::acquire();
+            s.puts("[IDT] Struct sizes:\n");
+            s.puts("  size_of::<IdtEntry>() = ");
+            s.hex(size_of::<IdtEntry>() as u64);
+            s.puts("\n  size_of::<IdtPtr>() = ");
+            s.hex(size_of::<IdtPtr>() as u64);
+            s.puts("\n  size_of::<Idt>() = ");
+            s.hex(size_of::<Idt>() as u64);
+            s.putc(b'\n');
+        }
 
         assert!(size_of::<IdtEntry>() == 16, "IdtEntry must be 16 bytes!");
         assert!(size_of::<IdtPtr>() == 10, "IdtPtr must be 10 bytes (packed)!");
 
-        serial_puts("[IDT] IDT loaded and verified successfully\n");
+        crate::serial_puts("[IDT] IDT loaded and verified successfully\n");
     }
 }
 
@@ -616,6 +650,24 @@ extern "C" fn irq_handler_ipi_vspace_teardown() {
 extern "C" fn irq_handler_ipi_reschedule() {
     if super::has_apic() {
         super::apic::handle_ipi(super::apic::IpiKind::Reschedule);
+        super::apic::eoi();
+    }
+}
+
+/// IPI TLB Shootdown handler (called from assembly stub irq_stub_ipi_tlb_shootdown)
+///
+/// Vector 48 — sent when a page table entry is modified and remote CPUs
+/// must invalidate the corresponding TLB entry via `invlpg`.
+#[unsafe(no_mangle)]
+extern "C" fn irq_handler_ipi_tlb_shootdown() {
+    if super::has_apic() {
+        let cpu_id = crate::arch::current_cpu() as usize;
+        let addr = super::apic::tlb_shootdown_addr(cpu_id);
+        if addr != 0 {
+            unsafe {
+                core::arch::asm!("invlpg [{}]", in(reg) addr, options(nostack, preserves_flags));
+            }
+        }
         super::apic::eoi();
     }
 }

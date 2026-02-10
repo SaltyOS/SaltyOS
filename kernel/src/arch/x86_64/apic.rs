@@ -100,11 +100,56 @@ const ICR_DS: u32 = 1 << 12; // Destination shorthand
 const ICR_LEVEL: u32 = 1 << 14; // Level trigger
 const ICR_MODE_ASSERT: u32 = 1 << 15; // Assert interrupt
 
-/// Tick counter for timekeeping
-static TICK_COUNTER: AtomicU32 = AtomicU32::new(0);
+/// Tick counter for timekeeping (incremented by BSP only)
+static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// TSC value at boot (set after calibration)
+static TSC_BOOT: AtomicU64 = AtomicU64::new(0);
+
+/// TSC ticks per microsecond (calibrated via PIT)
+static TSC_PER_US: AtomicU32 = AtomicU32::new(0);
+
+/// Per-CPU TSC boot value (calibrated during init for each CPU)
+static PER_CPU_TSC_BOOT: [AtomicU64; super::cpu::MAX_CPUS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; super::cpu::MAX_CPUS]
+};
+
+/// Last returned timestamp for global monotonicity (all CPUs)
+static LAST_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Read the x86 Time Stamp Counter
+#[inline]
+fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
+    }
+    (hi as u64) << 32 | lo as u64
+}
 
 /// Local APIC base address (virtual)
 static LAPIC_VIRTUAL_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// Per-CPU TLB shootdown target address
+///
+/// When a VSpace modifies a page table entry, it stores the target virtual address
+/// here and sends a TlbShootdown IPI. The handler reads the address and does `invlpg`.
+static TLB_SHOOTDOWN_ADDR: [AtomicU64; super::cpu::MAX_CPUS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; super::cpu::MAX_CPUS]
+};
+
+/// Set TLB shootdown target address for a CPU (called by sender before IPI)
+pub fn set_tlb_shootdown_addr(cpu_id: usize, addr: u64) {
+    TLB_SHOOTDOWN_ADDR[cpu_id].store(addr, Ordering::Release);
+}
+
+/// Read TLB shootdown target address for a CPU (called by handler on target)
+pub fn tlb_shootdown_addr(cpu_id: usize) -> u64 {
+    TLB_SHOOTDOWN_ADDR[cpu_id].load(Ordering::Acquire)
+}
 
 /// IPI kinds
 #[repr(u8)]
@@ -112,6 +157,7 @@ static LAPIC_VIRTUAL_BASE: AtomicU64 = AtomicU64::new(0);
 pub enum IpiKind {
     VSpaceTeardown = 0,
     Reschedule = 1,
+    TlbShootdown = 8,  // vector 48 (avoids conflict with generic IRQ vectors 42-47)
 }
 
 impl IpiKind {
@@ -286,9 +332,15 @@ pub fn init() {
 /// Call start_timer() after the scheduler is initialized to begin ticks.
 unsafe fn init_timer() {
     unsafe {
-        // Calibrate timer using PIT
+        // Calibrate timer using PIT (also calibrates TSC_PER_US)
         let calibrated_ticks = calibrate_timer();
         TIMER_TICKS_PER_MS.store(calibrated_ticks, Ordering::Release);
+
+        // Record boot TSC after calibration completes
+        TSC_BOOT.store(rdtsc(), Ordering::Release);
+
+        // Also set BSP's per-CPU TSC boot value
+        PER_CPU_TSC_BOOT[0].store(TSC_BOOT.load(Ordering::Relaxed), Ordering::Release);
 
         // Set timer divide configuration (divide by 16)
         lapic_write(LAPIC_TIMER_DIVIDE, TIMER_DIVIDE_16);
@@ -338,16 +390,71 @@ pub fn eoi() {
 ///
 /// Returns the number of timer ticks since boot.
 /// This increments by 1000 per second (1ms tick period).
-pub fn get_ticks() -> u32 {
+pub fn get_ticks() -> u64 {
     TICK_COUNTER.load(Ordering::Relaxed)
 }
 
 /// Get elapsed time in microseconds
 ///
 /// Returns the number of microseconds since boot.
-/// This is an approximation based on tick count.
+/// Uses TSC for nanosecond precision when calibrated.
 pub fn now_us() -> u64 {
-    get_ticks() as u64 * 1000
+    now_ns() / 1000
+}
+
+/// Get elapsed time in nanoseconds
+///
+/// Uses per-CPU TSC for sub-microsecond precision when calibrated.
+/// Falls back to tick-based timing before calibration completes.
+/// A global monotonicity guard ensures time never goes backwards,
+/// even when threads migrate between CPUs with different TSC origins.
+pub fn now_ns() -> u64 {
+    let tsc_per_us = TSC_PER_US.load(Ordering::Acquire);
+    let tick_ns = TICK_COUNTER.load(Ordering::Relaxed) * 1_000_000;
+
+    let raw_ns = if tsc_per_us == 0 {
+        tick_ns
+    } else {
+        let cpu = crate::arch::current_cpu() as usize;
+        let boot = PER_CPU_TSC_BOOT[cpu].load(Ordering::Relaxed);
+        if boot == 0 {
+            tick_ns
+        } else {
+            let delta = rdtsc().wrapping_sub(boot);
+            let tsc_ns = (delta * 1000) / tsc_per_us as u64;
+            // Floor at TICK_COUNTER time to prevent large drift
+            tsc_ns.max(tick_ns)
+        }
+    };
+
+    // Global monotonicity guard: never return less than previous value
+    loop {
+        let last = LAST_NS.load(Ordering::Acquire);
+        if raw_ns > last {
+            match LAST_NS.compare_exchange_weak(
+                last,
+                raw_ns,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return raw_ns,
+                Err(_) => continue,
+            }
+        } else {
+            // Time would go backwards — return last seen value + 1ns
+            // to maintain strict monotonicity
+            let bumped = last + 1;
+            match LAST_NS.compare_exchange_weak(
+                last,
+                bumped,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return bumped,
+                Err(_) => continue,
+            }
+        }
+    }
 }
 
 /// Calibrate APIC timer using PIT
@@ -398,7 +505,8 @@ unsafe fn calibrate_timer() -> u32 {
         let start_count = APIC_COUNT;
         lapic_write(LAPIC_TIMER_INITIAL, start_count);
 
-        // Step 3: Wait for APIC timer to expire, measuring with PIT
+        // Step 3: Wait for APIC timer to expire, measuring with PIT and TSC
+        let tsc_start = rdtsc();
         let pit_start = super::pit::read_counter();
         let mut timer_current: u32;
 
@@ -442,8 +550,14 @@ unsafe fn calibrate_timer() -> u32 {
             pit_start + (0xFFFF as u16 - pit_end) + 1
         };
 
+        // Read TSC at end of calibration
+        let tsc_end = rdtsc();
+
         // Calculate actual APIC ticks elapsed (down-counter: start > end)
         let apic_ticks = (start_count - end_count) as u64;
+
+        // Calibrate TSC frequency from the same PIT-measured interval
+        let tsc_elapsed = tsc_end.wrapping_sub(tsc_start);
 
         // Step 4: Calculate APIC ticks per millisecond
         // Formula: (APIC_count * PIT_FREQUENCY) / (PIT_ticks_elapsed * TIMER_DIVIDE * 1000)
@@ -452,6 +566,15 @@ unsafe fn calibrate_timer() -> u32 {
         let timer_divide = 16u64;
 
         let ticks_per_ms = (apic_ticks * pit_freq) / (pit_elapsed_u64 * timer_divide * 1000);
+
+        // Compute TSC ticks per microsecond:
+        // time_us = (pit_elapsed * 1_000_000) / pit_freq
+        // tsc_per_us = tsc_elapsed / time_us
+        //            = (tsc_elapsed * pit_freq) / (pit_elapsed * 1_000_000)
+        let tsc_per_us_val = (tsc_elapsed * pit_freq) / (pit_elapsed_u64 * 1_000_000);
+        if tsc_per_us_val > 0 && tsc_per_us_val <= u32::MAX as u64 {
+            TSC_PER_US.store(tsc_per_us_val as u32, Ordering::Release);
+        }
 
         // Sanity check: reject values outside reasonable bounds
         let calibrated =
@@ -488,8 +611,10 @@ pub fn timer_handler() {
         return;
     }
 
-    // Increment tick counter
-    TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Only BSP increments tick counter so ticks represent wall-clock time
+    if crate::arch::current_cpu() == 0 {
+        TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    }
 
     // Send EOI BEFORE timer_tick: if budget exhaustion triggers a context switch,
     // timer_tick() never returns (context_switch jumps to another thread).
@@ -714,7 +839,7 @@ pub unsafe fn start_aps(cpu_descriptors: &[super::acpi::CpuDescriptor], cpu_coun
             // Verify PML4 was stored
             let pml4_verify = (TRAMPOLINE_PML4 + PHYS_MAP_OFFSET) as *const u64;
             serial("[SMP]   PML4 at 0x8FF0 = ");
-            super::print_hex(pml4_verify.read_volatile());
+            crate::serial_hex_raw(pml4_verify.read_volatile());
             serial("\n");
 
             // Set warm-reset vector (BIOS data area at 0x467)
@@ -878,6 +1003,22 @@ pub fn init_ap() {
         lapic_write(LAPIC_LVT_LINT0, TIMER_MASK);
         lapic_write(LAPIC_LVT_LINT1, TIMER_MASK);
         lapic_write(LAPIC_LVT_ERROR, TIMER_MASK);
+
+        // Calibrate per-CPU TSC boot value using TICK_COUNTER as reference.
+        // TICK_COUNTER (BSP-only, 1ms resolution) gives approximate elapsed time.
+        // We compute what this CPU's rdtsc() "would have been" at time=0.
+        let cpu_id = crate::arch::current_cpu() as usize;
+        let tsc_per_us = TSC_PER_US.load(Ordering::Acquire);
+        if tsc_per_us > 0 {
+            let ticks = TICK_COUNTER.load(Ordering::Acquire);
+            let my_tsc = rdtsc();
+            // elapsed_tsc = ticks_ms * 1000_us/ms * tsc_per_us
+            let elapsed_tsc = ticks * 1000 * tsc_per_us as u64;
+            PER_CPU_TSC_BOOT[cpu_id].store(
+                my_tsc.wrapping_sub(elapsed_tsc),
+                Ordering::Release,
+            );
+        }
     }
 }
 
@@ -909,6 +1050,17 @@ pub fn handle_ipi(kind: IpiKind) {
                 return;
             }
 
+            // Only switch CR3 if our current VSpace is actually dying.
+            // switch_to() activates the new VSpace before deactivating the old one,
+            // so an IPI for the OLD VSpace can arrive while this CPU already runs
+            // a different (Active) VSpace. Switching CR3 in that case would corrupt
+            // the active thread's address space.
+            unsafe {
+                if (*current_tracking).state() == crate::mm::vspace::VSpaceState::Active {
+                    return;
+                }
+            }
+
             // CRITICAL ORDERING:
             // 1. Switch CR3 to kernel FIRST (still using old mappings, but safe)
             let kernel_root = crate::mm::kernel_vspace_root();
@@ -932,6 +1084,10 @@ pub fn handle_ipi(kind: IpiKind) {
         }
         IpiKind::Reschedule => {
             crate::sched::handle_reschedule_ipi();
+        }
+        IpiKind::TlbShootdown => {
+            // Handled by irq_handler_ipi_tlb_shootdown (own assembly stub),
+            // not through handle_ipi. This arm should never be reached.
         }
     }
 }

@@ -59,6 +59,8 @@ syscall_entry:
 
     # 16 pushes (user_rsp + 15 GPRs) = 128 bytes = 16-byte aligned!
 
+    # No lock acquired here — each Rust handler acquires the lock(s) it needs.
+
     # --------------------------------------------------------------------------
     # IPC Fastpath Dispatch
     # --------------------------------------------------------------------------
@@ -117,6 +119,8 @@ syscall_entry:
     mov %rdx, 24(%rsp)  # value  → will be popped into %rdx
 
 .Lreturn:
+    # No lock to release — Rust handlers release their own locks.
+
     # --------------------------------------------------------------------------
     # Context Restoration
     # --------------------------------------------------------------------------

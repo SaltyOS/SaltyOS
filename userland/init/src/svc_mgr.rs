@@ -3,6 +3,7 @@
 
 use crate::ini::{ServiceDef, RestartPolicy};
 use salty::serial;
+use salty::serial::LineBuf;
 
 pub const MAX_SERVICES: usize = 16;
 const MAX_RESTARTS: u16 = 5;
@@ -11,9 +12,6 @@ fn puts(s: &[u8]) {
     serial::serial_puts(s);
 }
 
-fn hex(v: u64) {
-    serial::serial_hex(v);
-}
 
 fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -207,11 +205,7 @@ impl ServiceManager {
 
         if self.boot_order_len != n {
             // Cycle detected — mark unprocessed services as Failed
-            puts(b"[INIT] svc_mgr: cycle detected! Only ");
-            hex(self.boot_order_len as u64);
-            puts(b" of ");
-            hex(n as u64);
-            puts(b" services sorted\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] svc_mgr: cycle detected! Only "); lb.hex(self.boot_order_len as u64); lb.str(b" of "); lb.hex(n as u64); lb.str(b" services sorted\n"); lb.flush(); }
 
             for i in 0..n {
                 let mut in_order = false;
@@ -223,9 +217,7 @@ impl ServiceManager {
                 }
                 if !in_order {
                     self.services[i].state = ServiceState::Failed;
-                    puts(b"[INIT] svc=");
-                    puts(self.services[i].def.name_bytes());
-                    puts(b" state=Failed (cycle)\n");
+                    { let mut lb = LineBuf::new(); lb.str(b"[INIT] svc="); lb.bytes(self.services[i].def.name_bytes()); lb.str(b" state=Failed (cycle)\n"); lb.flush(); }
                 }
             }
             return false;
@@ -250,17 +242,21 @@ impl ServiceManager {
             return;
         }
         self.services[idx].state = state;
-        puts(b"[INIT] svc=");
-        puts(self.services[idx].def.name_bytes());
-        puts(b" state=");
-        match state {
-            ServiceState::Stopped => puts(b"Stopped"),
-            ServiceState::Starting => puts(b"Starting"),
-            ServiceState::Running => puts(b"Running"),
-            ServiceState::Failed => puts(b"Failed"),
-            ServiceState::Stopping => puts(b"Stopping"),
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[INIT] svc=");
+            lb.bytes(self.services[idx].def.name_bytes());
+            lb.str(b" state=");
+            match state {
+                ServiceState::Stopped => lb.str(b"Stopped"),
+                ServiceState::Starting => lb.str(b"Starting"),
+                ServiceState::Running => lb.str(b"Running"),
+                ServiceState::Failed => lb.str(b"Failed"),
+                ServiceState::Stopping => lb.str(b"Stopping"),
+            }
+            lb.str(b"\n");
+            lb.flush();
         }
-        puts(b"\n");
     }
 
     /// Check if all dependencies for service at `idx` are Running.
@@ -301,20 +297,12 @@ impl ServiceManager {
             return;
         }
         self.services[idx].exit_code = exit_code;
-        puts(b"[INIT] svc=");
-        puts(self.services[idx].def.name_bytes());
-        puts(b" exited code=");
-        hex(exit_code as u64);
-        puts(b"\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[INIT] svc="); lb.bytes(self.services[idx].def.name_bytes()); lb.str(b" exited code="); lb.hex(exit_code as u64); lb.str(b"\n"); lb.flush(); }
 
         if self.should_restart(idx) {
             self.services[idx].restart_count += 1;
             self.services[idx].state = ServiceState::Stopped;
-            puts(b"[INIT] svc=");
-            puts(self.services[idx].def.name_bytes());
-            puts(b" will restart (attempt ");
-            hex(self.services[idx].restart_count as u64);
-            puts(b")\n");
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] svc="); lb.bytes(self.services[idx].def.name_bytes()); lb.str(b" will restart (attempt "); lb.hex(self.services[idx].restart_count as u64); lb.str(b")\n"); lb.flush(); }
         } else {
             self.services[idx].state = ServiceState::Failed;
         }
@@ -335,14 +323,16 @@ impl ServiceManager {
 
     /// Log the boot order
     pub fn log_boot_order(&self) {
-        puts(b"[INIT] Boot order: ");
+        let mut lb = LineBuf::new();
+        lb.str(b"[INIT] Boot order: ");
         for i in 0..self.boot_order_len {
             if i > 0 {
-                puts(b" -> ");
+                lb.str(b" -> ");
             }
             let idx = self.boot_order[i] as usize;
-            puts(self.services[idx].def.name_bytes());
+            lb.bytes(self.services[idx].def.name_bytes());
         }
-        puts(b"\n");
+        lb.str(b"\n");
+        lb.flush();
     }
 }

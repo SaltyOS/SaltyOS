@@ -11,9 +11,7 @@ pub fn run() -> bool {
 
     // 1. getpid
     let pid = unsafe { posix::posix_getpid() };
-    serial::serial_puts(b"[TEST_HELLO] PID=");
-    serial::serial_hex(pid as u64);
-    serial::serial_puts(b"\n");
+    { let mut lb = serial::LineBuf::new(); lb.str(b"[TEST_HELLO] PID="); lb.hex(pid as u64); lb.str(b"\n"); lb.flush(); }
     if pid <= 0 {
         serial::serial_puts(b"[TEST_HELLO] FAIL: getpid <= 0\n");
         return false;
@@ -21,9 +19,7 @@ pub fn run() -> bool {
 
     // 2. open /dev/console
     let fd = unsafe { posix::posix_open(b"/dev/console\0".as_ptr(), O_WRONLY as i32) };
-    serial::serial_puts(b"[TEST_HELLO] open /dev/console fd=");
-    serial::serial_hex(fd as u64);
-    serial::serial_puts(b"\n");
+    { let mut lb = serial::LineBuf::new(); lb.str(b"[TEST_HELLO] open /dev/console fd="); lb.hex(fd as u64); lb.str(b"\n"); lb.flush(); }
 
     if fd >= 0 {
         // 3. write greeting via VFS -> console
@@ -33,9 +29,7 @@ pub fn run() -> bool {
 
     // 4. open /dev/null and write to it
     let fd_null = unsafe { posix::posix_open(b"/dev/null\0".as_ptr(), O_WRONLY as i32) };
-    serial::serial_puts(b"[TEST_HELLO] open /dev/null fd=");
-    serial::serial_hex(fd_null as u64);
-    serial::serial_puts(b"\n");
+    { let mut lb = serial::LineBuf::new(); lb.str(b"[TEST_HELLO] open /dev/null fd="); lb.hex(fd_null as u64); lb.str(b"\n"); lb.flush(); }
 
     if fd_null >= 0 {
         unsafe {

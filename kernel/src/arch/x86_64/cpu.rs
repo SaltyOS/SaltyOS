@@ -4,6 +4,8 @@
 
 /// IA32_GS_BASE MSR address
 const IA32_GS_BASE_MSR: u32 = 0xC000_0101;
+/// IA32_KERNEL_GS_BASE MSR address
+const IA32_KERNEL_GS_BASE_MSR: u32 = 0xC000_0102;
 
 /// Maximum number of CPUs supported
 pub const MAX_CPUS: usize = 16;
@@ -45,59 +47,27 @@ static mut PER_CPU_DATA: [PerCpuData; MAX_CPUS] = {
 /// layout (GS:[0], GS:[8], GS:[16]).
 static mut CPU_APIC_IDS: [u32; MAX_CPUS] = [0; MAX_CPUS];
 
-/// Serial port (COM1) for debug output
-const SERIAL_PORT: u16 = 0x3F8;
-
-/// Write a byte to serial port
-unsafe fn serial_putc(c: u8) {
-    unsafe {
-        while (super::inb(SERIAL_PORT + 5) & 0x20) == 0 {}
-        super::outb(SERIAL_PORT, c);
-    }
-}
-
-/// Write a string to serial port
-unsafe fn serial_puts(s: &str) {
-    for byte in s.bytes() {
-        unsafe { serial_putc(byte); }
-    }
-}
-
-/// Write a hexadecimal number to serial port
-unsafe fn serial_hex(mut val: u64) {
-    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-    unsafe { serial_puts("0x"); }
-    if val == 0 {
-        unsafe { serial_putc(b'0'); }
-        return;
-    }
-    let mut buf = [0u8; 16];
-    let mut pos = 15;
-    while val > 0 {
-        buf[pos] = HEX_CHARS[(val & 0xF) as usize];
-        val >>= 4;
-        pos -= 1;
-    }
-    for &c in &buf[(pos + 1)..] {
-        unsafe { serial_putc(c); }
-    }
-}
-
 /// Initialize per-CPU data for the BSP (Boot Processor)
 pub fn init_bsp() {
     unsafe {
-        serial_puts("\n[CPU] init_bsp() called\n");
+        crate::serial_puts("\n[CPU] init_bsp() called\n");
 
         PER_CPU_DATA[0].cpu_id = 0;
 
-        serial_puts("[CPU] PER_CPU_DATA addr: ");
-        serial_hex((&raw const PER_CPU_DATA) as u64);
-        serial_puts("\n[CPU] Setting GS base\n");
+        {
+            let s = crate::SerialGuard::acquire();
+            s.puts("[CPU] PER_CPU_DATA addr: ");
+            s.hex((&raw const PER_CPU_DATA) as u64);
+            s.puts("\n[CPU] Setting GS base\n");
+        }
 
-        // Set GS base to point to this CPU's data
-        write_gs_base_msr(&PER_CPU_DATA[0] as *const _ as u64);
+        // Keep kernel GS pointing at PerCpuData. User GS starts at 0 and is
+        // swapped in/out by swapgs on user<->kernel transitions.
+        let per_cpu_base = &PER_CPU_DATA[0] as *const _ as u64;
+        write_gs_base_msr(per_cpu_base);
+        write_kernel_gs_base_msr(0);
 
-        serial_puts("[CPU] GS base set successfully\n");
+        crate::serial_puts("[CPU] GS base set successfully\n");
     }
 }
 
@@ -108,7 +78,7 @@ pub fn current_cpu() -> u32 {
     unsafe {
         // Read value directly from GS:[0], not as a pointer
         core::arch::asm!(
-            "mov {0:e}, gs:[0]", 
+            "mov {0:e}, gs:[0]",
             out(reg) cpu_id,
             options(nostack, pure, readonly)
         );
@@ -122,6 +92,7 @@ pub fn current_cpu() -> u32 {
 pub fn write_gs_base_for_cpu(cpu_id: usize) {
     let base = unsafe { &PER_CPU_DATA[cpu_id] as *const _ as u64 };
     write_gs_base_msr(base);
+    write_kernel_gs_base_msr(0);
 }
 
 /// Write to GS base using MSR
@@ -133,6 +104,22 @@ fn write_gs_base_msr(base: u64) {
         core::arch::asm!(
             "wrmsr",
             in("ecx") IA32_GS_BASE_MSR,
+            in("eax") low,
+            in("edx") high,
+            options(nostack, nomem)
+        );
+    }
+}
+
+/// Write to KERNEL_GS_BASE using MSR
+fn write_kernel_gs_base_msr(base: u64) {
+    unsafe {
+        let low = base as u32;
+        let high = (base >> 32) as u32;
+
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") IA32_KERNEL_GS_BASE_MSR,
             in("eax") low,
             in("edx") high,
             options(nostack, nomem)

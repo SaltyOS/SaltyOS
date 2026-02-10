@@ -5,6 +5,7 @@
 use salty::consts::*;
 use salty::posix;
 use salty::serial;
+use salty::serial::LineBuf;
 use salty::types::*;
 
 fn puts(s: &[u8]) {
@@ -41,11 +42,7 @@ fn test_socketpair() -> bool {
         puts(b"[TEST_SOCKET] FAIL: socketpair returned error\n");
         return false;
     }
-    puts(b"[TEST_SOCKET] socketpair fds: ");
-    serial::serial_dec(fds[0] as u64);
-    puts(b", ");
-    serial::serial_dec(fds[1] as u64);
-    puts(b"\n");
+    { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] socketpair fds: "); lb.dec(fds[0] as u64); lb.str(b", "); lb.dec(fds[1] as u64); lb.str(b"\n"); lb.flush(); }
 
     if fds[0] < 0 || fds[1] < 0 {
         puts(b"[TEST_SOCKET] FAIL: invalid fds\n");
@@ -56,18 +53,14 @@ fn test_socketpair() -> bool {
     let data = b"hello";
     let written = unsafe { posix::posix_write(fds[0], data.as_ptr(), data.len() as u64) };
     if written != data.len() as i64 {
-        puts(b"[TEST_SOCKET] FAIL: write returned ");
-        serial::serial_hex(written as u64);
-        puts(b"\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] FAIL: write returned "); lb.hex(written as u64); lb.str(b"\n"); lb.flush(); }
         return false;
     }
 
     let mut buf = [0u8; 32];
     let nread = unsafe { posix::posix_read(fds[1], buf.as_mut_ptr(), buf.len() as u64) };
     if nread != data.len() as i64 {
-        puts(b"[TEST_SOCKET] FAIL: read returned ");
-        serial::serial_hex(nread as u64);
-        puts(b"\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] FAIL: read returned "); lb.hex(nread as u64); lb.str(b"\n"); lb.flush(); }
         return false;
     }
 
@@ -209,9 +202,7 @@ fn test_scm_rights() -> bool {
         )
     };
     if sent < 0 {
-        puts(b"[TEST_SOCKET] FAIL: sendmsg returned ");
-        serial::serial_hex(sent as u64);
-        puts(b"\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] FAIL: sendmsg returned "); lb.hex(sent as u64); lb.str(b"\n"); lb.flush(); }
         unsafe {
             posix::posix_close(file_fd);
             posix::posix_close(fds[0]);
@@ -219,9 +210,7 @@ fn test_scm_rights() -> bool {
         }
         return false;
     }
-    puts(b"[TEST_SOCKET] sendmsg sent ");
-    serial::serial_dec(sent as u64);
-    puts(b" bytes + 1 fd\n");
+    { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] sendmsg sent "); lb.dec(sent as u64); lb.str(b" bytes + 1 fd\n"); lb.flush(); }
 
     // recvmsg: receive data + fd on fds[1]
     let mut recv_buf = [0u8; 32];
@@ -237,9 +226,7 @@ fn test_scm_rights() -> bool {
         )
     };
     if rcvd < 0 {
-        puts(b"[TEST_SOCKET] FAIL: recvmsg returned ");
-        serial::serial_hex(rcvd as u64);
-        puts(b"\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] FAIL: recvmsg returned "); lb.hex(rcvd as u64); lb.str(b"\n"); lb.flush(); }
         unsafe {
             posix::posix_close(file_fd);
             posix::posix_close(fds[0]);
@@ -259,9 +246,7 @@ fn test_scm_rights() -> bool {
     }
 
     if recv_fd_count != 1 || recv_fds[0] < 0 {
-        puts(b"[TEST_SOCKET] FAIL: expected 1 fd, got ");
-        serial::serial_dec(recv_fd_count as u64);
-        puts(b"\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] FAIL: expected 1 fd, got "); lb.dec(recv_fd_count as u64); lb.str(b"\n"); lb.flush(); }
         unsafe {
             posix::posix_close(file_fd);
             posix::posix_close(fds[0]);
@@ -270,9 +255,7 @@ fn test_scm_rights() -> bool {
         return false;
     }
 
-    puts(b"[TEST_SOCKET] received fd=");
-    serial::serial_dec(recv_fds[0] as u64);
-    puts(b"\n");
+    { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] received fd="); lb.dec(recv_fds[0] as u64); lb.str(b"\n"); lb.flush(); }
 
     // Verify the received fd works (write to /dev/null should succeed)
     let wr = unsafe { posix::posix_write(recv_fds[0], b"x".as_ptr(), 1) };
@@ -305,21 +288,15 @@ fn test_shm() -> bool {
     // shm_open
     let fd = unsafe { posix::posix_shm_open(b"/test_shm\0".as_ptr(), (O_CREAT | O_RDWR) as i32) };
     if fd < 0 {
-        puts(b"[TEST_SOCKET] FAIL: shm_open returned ");
-        serial::serial_hex(fd as u64);
-        puts(b"\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] FAIL: shm_open returned "); lb.hex(fd as u64); lb.str(b"\n"); lb.flush(); }
         return false;
     }
-    puts(b"[TEST_SOCKET] shm_open fd=");
-    serial::serial_dec(fd as u64);
-    puts(b"\n");
+    { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] shm_open fd="); lb.dec(fd as u64); lb.str(b"\n"); lb.flush(); }
 
     // ftruncate to 4096
     let ret = unsafe { posix::posix_ftruncate(fd, 4096) };
     if ret != 0 {
-        puts(b"[TEST_SOCKET] FAIL: ftruncate returned ");
-        serial::serial_hex(ret as u64);
-        puts(b"\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] FAIL: ftruncate returned "); lb.hex(ret as u64); lb.str(b"\n"); lb.flush(); }
         unsafe { posix::posix_close(fd) };
         return false;
     }
@@ -331,9 +308,7 @@ fn test_shm() -> bool {
     // Unlink
     let ret = unsafe { posix::posix_shm_unlink(b"/test_shm\0".as_ptr()) };
     if ret != 0 {
-        puts(b"[TEST_SOCKET] FAIL: shm_unlink returned ");
-        serial::serial_hex(ret as u64);
-        puts(b"\n");
+        { let mut lb = LineBuf::new(); lb.str(b"[TEST_SOCKET] FAIL: shm_unlink returned "); lb.hex(ret as u64); lb.str(b"\n"); lb.flush(); }
         return false;
     }
     puts(b"[TEST_SOCKET] PASS: shm_open/ftruncate/unlink OK\n");

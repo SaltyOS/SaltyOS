@@ -17,10 +17,11 @@
 /// Called from assembly trampoline with a specific ABI.
 #[unsafe(no_mangle)]
 pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
-    unsafe {
-        serial_puts("[AP] Entry cpu_id=");
-        serial_dec(cpu_id as u64);
-        serial_putc(b'\n');
+    {
+        let s = crate::SerialGuard::acquire();
+        s.puts("[AP] Entry cpu_id=");
+        s.dec(cpu_id as u64);
+        s.putc(b'\n');
     }
 
     // 1. Seed per-CPU metadata for this AP
@@ -32,37 +33,38 @@ pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
     // 2. Load per-CPU GDT and TSS
     unsafe {
         super::gdt::load_per_cpu(cpu_id);
-        serial_puts("[AP] GDT/TSS loaded\n");
     }
+    crate::serial_puts("[AP] GDT/TSS loaded\n");
 
     // 3. Re-install GS base after segment reload in load_per_cpu()
     super::cpu::write_gs_base_for_cpu(cpu_id);
 
     // 4. Load IDT (shared with BSP - IDT is global)
     super::idt::load();
-    unsafe { serial_puts("[AP] IDT loaded\n"); }
+    crate::serial_puts("[AP] IDT loaded\n");
 
     // 5. Initialize SYSCALL MSRs for this CPU
     init_ap_syscalls(cpu_id);
-    unsafe { serial_puts("[AP] SYSCALL MSRs configured\n"); }
+    crate::serial_puts("[AP] SYSCALL MSRs configured\n");
 
     // 6. Initialize Local APIC for this AP (timer + SVR)
     super::apic::init_ap();
-    unsafe { serial_puts("[AP] Local APIC initialized\n"); }
+    crate::serial_puts("[AP] Local APIC initialized\n");
 
     // 7. Allocate IST stack for double fault on this CPU
     init_ap_exception_stacks(cpu_id);
-    unsafe { serial_puts("[AP] IST stacks allocated\n"); }
+    crate::serial_puts("[AP] IST stacks allocated\n");
 
     // 8. Initialize scheduler for this CPU (creates idle thread)
     crate::sched::init_cpu(cpu_id);
-    unsafe { serial_puts("[AP] Scheduler initialized\n"); }
+    crate::serial_puts("[AP] Scheduler initialized\n");
 
     // 9. Emit AP online log before signaling ready to reduce serial interleaving
-    unsafe {
-        serial_puts("[AP] CPU ");
-        serial_dec(cpu_id as u64);
-        serial_puts(" online\n");
+    {
+        let s = crate::SerialGuard::acquire();
+        s.puts("[AP] CPU ");
+        s.dec(cpu_id as u64);
+        s.puts(" online\n");
     }
 
     // 10. Signal that this AP is ready
@@ -72,10 +74,11 @@ pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
     super::sti();
 
     loop {
-        // Process pending deactivates (same as BSP idle loop)
+        // sched_ipc_lock does cli + acquire SCHED_IPC_LOCK
+        crate::sched_ipc_lock();
         crate::sched::scheduler::scheduler().with_lock(|_| {});
+        crate::sched_ipc_unlock();
 
-        // Halt until next interrupt
         super::sti();
         super::halt();
     }
@@ -167,38 +170,5 @@ fn init_ap_exception_stacks(cpu_id: usize) {
 
     unsafe {
         super::gdt::set_tss_ist_cpu(cpu_id, 1, stack_top);
-    }
-}
-
-/// Serial port helpers
-const SERIAL_PORT: u16 = 0x3F8;
-
-unsafe fn serial_putc(c: u8) {
-    unsafe {
-        while (super::inb(SERIAL_PORT + 5) & 0x20) == 0 {}
-        super::outb(SERIAL_PORT, c);
-    }
-}
-
-unsafe fn serial_puts(s: &str) {
-    for byte in s.bytes() {
-        unsafe { serial_putc(byte); }
-    }
-}
-
-unsafe fn serial_dec(mut val: u64) {
-    if val == 0 {
-        unsafe { serial_putc(b'0'); }
-        return;
-    }
-    let mut buf = [0u8; 20];
-    let mut pos = 19;
-    while val > 0 {
-        buf[pos] = b'0' + ((val % 10) as u8);
-        val /= 10;
-        pos -= 1;
-    }
-    for &c in &buf[(pos + 1)..] {
-        unsafe { serial_putc(c); }
     }
 }

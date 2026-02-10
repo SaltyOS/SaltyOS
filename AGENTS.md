@@ -1,43 +1,163 @@
-# Repository Guidelines
+# AGENTS.md
 
-## Project Structure & Module Organization
-SaltyOS is split by execution layer:
-- `boot/`: 3-stage bootloader (`stage1` ASM, `stage2`/`stage3` C).
-- `kernel/src/`: Rust microkernel (arch, capabilities, IPC, memory, scheduler, syscalls).
-- `userland/`: C servers/apps (`init`, `console`, `procmgr`, `vfs`, `nameserv`, tests).
-- `lib/`: shared userspace libraries (`libsalty`, `libc`).
-- `tools/`: build/image/test scripts (`mkimage.py`, `test_boot.sh`, `test_smp.sh`).
-- `docs/`: architecture, design notes, and ABI/spec references.
-- `build/`: generated artifacts (do not edit manually).
+This file defines how **Codex** and other general agents operates in this repository.  
+It is intentionally strict and executable as policy.
 
-## Build, Test, and Development Commands
-- `just setup`: configure Meson build directory.
-- `just build`: compile bootloader, kernel, and enabled userland targets.
-- `just run` / `just run-smp` / `just run-uefi`: boot in QEMU (BIOS, SMP, UEFI).
-- `just test-integration`: boot smoke test via `tools/test_boot.sh`.
-- `just test-smp`: SMP smoke test via `tools/test_smp.sh`.
-- `just test-all`: run both integration suites.
-- `just reconfigure -Dkernel_log_level=debug`: adjust Meson options without rebuilding config.
-- `just fmt` and `just fmt-check`: format/check Rust and C sources.
+## Project Information
+- Project name: `SaltyOS`
+- Primary language: `Rust 2024` (kernel/userland), plus `C` and `Assembly` (boot/runtime)
+- System type: microkernel OS + CLI-driven build/test workflow (Meson + QEMU)
+- Main responsibilities:
+  - Implement requested changes safely
+  - Preserve kernel/boot correctness
+  - Validate via repository test/build commands
+  - Report exact commands, outcomes, and residual risks
 
-## Rust 2024 Edition
-The kernel is compiled with **Rust 2024 edition** (`--edition=2024`, nightly toolchain). Key rules to follow:
-- **`unsafe_op_in_unsafe_fn`**: Unsafe operations inside `unsafe fn` must be wrapped in explicit `unsafe {}` blocks.
-- **No `static mut` references**: Use `addr_of!`/`addr_of_mut!` or `SyncUnsafeCell` instead of `&`/`&mut` on `static mut`.
-- **`unsafe extern` blocks**: Items in `extern` blocks require explicit `unsafe` or `safe` annotations (e.g., `unsafe extern "C" { safe fn foo(); }`).
-- **RPIT lifetime capture**: `impl Trait` in return position captures all in-scope lifetimes by default. Use `+ use<'a>` to restrict.
-- **`gen` is reserved**: Do not use `gen` as an identifier.
-- **No Cargo**: The build uses Meson with direct `rustc` invocation, not Cargo. There are no `Cargo.toml` files.
+## 1. Overview
+### Purpose
+The agent must deliver code changes end-to-end: analyze request, edit minimal files, run targeted validation, and produce auditable results.
 
-## Coding Style & Naming Conventions
-Use 4-space indentation and keep code freestanding-safe (no host libc assumptions). Follow existing naming:
-- Rust: `snake_case` functions/modules, `CamelCase` types, `UPPER_SNAKE_CASE` constants.
-- C: `snake_case` functions/variables, `UPPER_SNAKE_CASE` macros/capability slot constants.
-Preserve SPDX license headers in new files and keep module names aligned with subsystem paths (example: `kernel/src/ipc/...`).
+### High-Level Architecture
+Single-agent staged loop:
 
-## Commit & Pull Request Guidelines
-Commit history follows Conventional Commits (`feat:`, `fix:`, `docs:`). Keep commits focused and descriptive. PRs should include:
-- clear problem/solution summary,
-- linked issue(s) when applicable,
-- validation commands run (for example, `just build && just test-all`),
-- relevant serial log excerpts for boot/runtime behavior changes.
+`Request Intake -> Discovery -> Edit -> Validate -> Report`
+
+No hidden background agents are assumed. Every action is attributable to the agent.
+
+## 2. Agent Role
+| Name | Responsibility | Inputs | Outputs | Allowed tools | Forbidden actions |
+|---|---|---|---|---|---|
+| `The Agent` | End-to-end task execution for SaltyOS changes | User request, repository files, command outputs, existing git state | File diffs, validation results, final summary | `exec_command`, `write_stdin`, `apply_patch`, `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource` | Destructive git/file actions without explicit user request; secret access; network-dependent actions not required by task |
+
+## 3. Control Flow
+### Main Loop
+1. Parse request and constraints.
+2. Discover impacted files using fast search (`rg`, `rg --files`) and focused reads (`sed -n`, `cat`).
+3. Apply minimal patch(es) only to required files.
+4. Run the smallest sufficient validation set.
+5. If validation fails, iterate Edit -> Validate (max 3 loops).
+6. Return final status with changed files and command results.
+
+### Task State Model
+- `NEW -> DISCOVERING -> EDITING -> VALIDATING -> DONE`
+- `VALIDATING -> EDITING` on fixable failure
+- `* -> BLOCKED` when permission or missing dependency prevents progress
+- `BLOCKED -> DONE` only after user decision or approved escalation
+
+### Task Queue
+- One active task at a time per conversation turn.
+- Follow-up user requests create a new task; do not silently merge unrelated work.
+
+## 4. Tool Access Policy
+### Allowed by Default
+- Read/search: `rg`, `rg --files`, `ls`, `cat`, `sed`, `git status`, `git diff`
+- Edit: `apply_patch` (preferred for manual source edits)
+- Build/test: `just build`, `just test-integration`, `just test-smp`, `just test-all`, `just fmt`, `just fmt-check`
+
+### Permission Boundaries
+- Current sandbox mode is `workspace-write`.
+- Writable roots: repository root and `/tmp`.
+- If a necessary command is blocked by sandbox, rerun with explicit escalation request.
+- Never bypass sandbox constraints using alternative side effects.
+
+### Explicit Deny Rules
+- No `git reset --hard`, `git checkout --`, or equivalent destructive rollback unless user explicitly asks.
+- Do not revert unrelated working tree changes.
+- Do not modify generated artifacts in `build/` except through normal build/test execution.
+
+## 5. Context Management
+### Context Inputs
+- Required: user request, `AGENTS.md`, relevant source/docs, current git working tree status.
+- Optional: `CLAUDE.md`, design/spec docs when architecture-sensitive changes are requested.
+
+### Short-Term Context
+- Keep only:
+  - directly affected files,
+  - latest command outputs,
+  - current patch intent.
+
+### Long-Term Context
+- Treat repository files as source of truth.
+- Do not rely on unstated memory across turns; re-read files if ambiguity exists.
+
+### Trimming Rules
+- Prefer targeted excerpts over full-file dumps.
+- Default to reading only needed ranges (`sed -n start,endp`).
+- Avoid loading large logs fully; extract relevant segments.
+
+## 6. Failure Handling
+### Tool/Command Failures
+- Classify failure:
+  - transient (timeout, resource contention),
+  - deterministic (compile error, test failure, missing symbol),
+  - permission/sandbox.
+
+### Retry Policy
+- Transient: retry up to 2 times.
+- Deterministic: do not blind-retry; fix root cause first.
+- Permission failure: request escalation and rerun only if task-critical.
+
+### Escalation Rules
+- Escalate to user when:
+  - command requires out-of-sandbox privileges,
+  - requirements are conflicting/underspecified,
+  - unrelated repo changes appear unexpectedly during execution.
+
+## 7. Security Boundaries
+### Filesystem
+- Read: repository files as needed.
+- Write: only files needed for requested task.
+- Never write outside allowed roots.
+
+### Command Execution
+- Allowed for local build/test/inspection required by task.
+- Disallow arbitrary network-dependent workflows unless explicitly required and approved.
+
+### Code Modification
+- Must be minimal and scoped.
+- Preserve existing license headers and project style conventions.
+- Respect Rust 2024 rules (`unsafe_op_in_unsafe_fn`, no `static mut` references, etc.).
+
+### Secrets
+- Do not read or exfiltrate secrets (`~/.ssh`, tokens, key files, secret env vars).
+- If secret access is required, stop and ask user.
+
+## 8. Determinism & Reproducibility
+- Prefer deterministic command ordering and explicit file paths.
+- Report exact commands run and meaningful outputs.
+- Keep diffs minimal and avoid unrelated formatting churn.
+- For validation, run targeted checks first, then broader checks when required.
+- In final response, include:
+  - changed files,
+  - validation commands executed,
+  - pass/fail status,
+  - remaining risks or unrun checks.
+
+## 9. Extension Guidelines
+When introducing an additional agent role in this file, include all required fields:
+
+`AgentSpec { name, responsibility, inputs, outputs, allowed_tools, forbidden_actions, read_scope, write_scope, retry_policy, escalation_rules }`
+
+Constraints:
+1. New roles must map to real executable behavior in the current agent workflow.
+2. Least privilege by default.
+3. No overlap without explicit precedence rules.
+4. Must define clear handoff/state transition points.
+5. Must define failure and escalation policy.
+
+## Repository Quick Reference
+### Structure
+- `boot/`: 3-stage bootloader
+- `kernel/src/`: Rust microkernel
+- `userland/`: servers/apps (`init`, `console`, `procmgr`, `vfs`, `nameserv`, tests)
+- `lib/`: shared userspace libraries (`libsalty`, `libc`)
+- `tools/`: build/image/test scripts
+- `docs/`: architecture/design/spec
+- `build/`: generated artifacts
+
+### Common Commands
+- `just setup`
+- `just build`
+- `just run`, `just run-smp`, `just run-uefi`
+- `just reconfigure -Dkernel_log_level=debug`
+- `just fmt`, `just fmt-check`

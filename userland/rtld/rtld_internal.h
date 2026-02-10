@@ -13,10 +13,11 @@
 #include <stddef.h>
 
 /* ============================================================
- * Debug output (via DebugPutChar syscall)
+ * Debug output (via DebugPutStr batch syscall)
  * ============================================================ */
 
 #define SYS_DEBUG_PUTCHAR  10
+#define SYS_DEBUG_PUTBUF   15
 
 static inline void rtld_putc(char c) {
     register uint64_t r10 __asm__("r10") = 0;
@@ -29,27 +30,92 @@ static inline void rtld_putc(char c) {
         : "rcx", "r11", "memory");
 }
 
+/* Write a string atomically via DebugPutBuf (pointer + length, up to 256 bytes).
+ * The kernel copies from user memory and outputs under SERIAL_LOCK. */
 static inline void rtld_puts(const char *s) {
-    while (*s) rtld_putc(*s++);
+    size_t len = 0;
+    const char *p = s;
+    while (*p++) len++;
+
+    size_t off = 0;
+    while (off < len) {
+        size_t chunk = len - off;
+        if (chunk > 256) chunk = 256;
+
+        register uint64_t r10 __asm__("r10") = 0;
+        register uint64_t r8  __asm__("r8")  = 0;
+        register uint64_t r9  __asm__("r9")  = 0;
+        __asm__ volatile("syscall"
+            : : "a"((uint64_t)SYS_DEBUG_PUTBUF),
+                "D"((uint64_t)(uintptr_t)(s + off)),
+                "S"((uint64_t)chunk), "d"((uint64_t)0),
+                "r"(r10), "r"(r8), "r"(r9)
+            : "rcx", "r11", "memory");
+        off += chunk;
+    }
 }
 
+/* Write hex number atomically via a single rtld_puts call */
 static inline void rtld_hex(uint64_t val) {
-    static const char hex[] = "0123456789abcdef";
-    rtld_putc('0');
-    rtld_putc('x');
+    static const char hextab[] = "0123456789abcdef";
+    char buf[18]; /* "0x" + up to 16 digits */
+    buf[0] = '0';
+    buf[1] = 'x';
     if (val == 0) {
-        rtld_putc('0');
+        buf[2] = '0';
+        buf[3] = '\0';
+        rtld_puts(buf);
         return;
     }
-    char buf[16];
+    char tmp[16];
     int pos = 15;
     while (val > 0 && pos >= 0) {
-        buf[pos--] = hex[val & 0xF];
+        tmp[pos--] = hextab[val & 0xF];
         val >>= 4;
     }
-    for (int i = pos + 1; i < 16; i++) {
-        rtld_putc(buf[i]);
+    int idx = 2;
+    for (int i = pos + 1; i < 16; i++)
+        buf[idx++] = tmp[i];
+    buf[idx] = '\0';
+    rtld_puts(buf);
+}
+
+/* Line buffer for compound output (build a full line, flush atomically) */
+struct rtld_linebuf {
+    char buf[128];
+    int pos;
+};
+
+static inline void rtld_lb_init(struct rtld_linebuf *lb) {
+    lb->pos = 0;
+}
+
+static inline void rtld_lb_str(struct rtld_linebuf *lb, const char *s) {
+    while (*s && lb->pos < (int)sizeof(lb->buf) - 1)
+        lb->buf[lb->pos++] = *s++;
+}
+
+static inline void rtld_lb_hex(struct rtld_linebuf *lb, uint64_t val) {
+    static const char ht[] = "0123456789abcdef";
+    rtld_lb_str(lb, "0x");
+    if (val == 0) {
+        if (lb->pos < (int)sizeof(lb->buf) - 1) lb->buf[lb->pos++] = '0';
+        return;
     }
+    char tmp[16];
+    int p = 15;
+    while (val > 0 && p >= 0) {
+        tmp[p--] = ht[val & 0xF];
+        val >>= 4;
+    }
+    for (int i = p + 1; i < 16 && lb->pos < (int)sizeof(lb->buf) - 1; i++)
+        lb->buf[lb->pos++] = tmp[i];
+}
+
+static inline void rtld_lb_flush(struct rtld_linebuf *lb) {
+    lb->buf[lb->pos] = '\0';
+    rtld_puts(lb->buf);
+    lb->pos = 0;
 }
 
 /* ============================================================

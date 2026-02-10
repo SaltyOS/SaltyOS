@@ -4,6 +4,7 @@
 
 use super::thread::{BlockedReason, Tcb, ThreadState};
 use crate::arch::MAX_CPUS;
+use core::sync::atomic::AtomicUsize;
 
 /// EDF Scheduler
 pub struct Scheduler {
@@ -28,7 +29,7 @@ impl Scheduler {
     }
 
     /// Take scheduler lock
-    fn lock(&self) {
+    pub(crate) fn lock(&self) {
         use core::sync::atomic::Ordering;
         let mut _spins: u32 = 0;
         while self
@@ -49,7 +50,7 @@ impl Scheduler {
     }
 
     /// Release scheduler lock
-    fn unlock(&self) {
+    pub(crate) fn unlock(&self) {
         self.lock_state
             .store(0, core::sync::atomic::Ordering::Release);
     }
@@ -224,6 +225,7 @@ impl Scheduler {
                 (*tcb).state = ThreadState::Running;
             }
             self.current[cpu_id] = tcb;
+            CURRENT_ON_CPU[cpu_id].store(tcb as usize, core::sync::atomic::Ordering::Release);
             tcb
         } else {
             // Return idle thread for this CPU
@@ -241,6 +243,7 @@ impl Scheduler {
     pub fn set_current(&mut self, tcb: *mut Tcb) {
         let cpu_id = crate::arch::current_cpu() as usize;
         self.current[cpu_id] = tcb;
+        CURRENT_ON_CPU[cpu_id].store(tcb as usize, core::sync::atomic::Ordering::Release);
     }
 
     /// Get idle thread for calling CPU
@@ -252,6 +255,19 @@ impl Scheduler {
     /// Set idle thread for a specific CPU
     pub fn set_idle(&mut self, cpu_id: usize, tcb: *mut Tcb) {
         self.idle[cpu_id] = tcb;
+    }
+
+    /// Find which CPU a thread is running on by scanning current[].
+    ///
+    /// Returns `None` if the thread is not the current thread on any CPU.
+    /// Caller MUST hold the scheduler lock.
+    pub fn find_running_cpu(&self, tcb: *mut Tcb) -> Option<usize> {
+        for cpu in 0..MAX_CPUS {
+            if self.current[cpu] == tcb {
+                return Some(cpu);
+            }
+        }
+        None
     }
 
     /// Check if reschedule needed (preemption) on the calling CPU
@@ -281,8 +297,10 @@ impl Scheduler {
 
     /// Perform the actual context switch (VSpace, kernel stack, registers).
     ///
-    /// MUST be called WITHOUT the scheduler lock held — context_switch does
-    /// not return until the old thread is re-scheduled.
+    /// # Preconditions
+    /// - SCHED_IPC_LOCK MUST be held: this function releases it before switching
+    ///   and reacquires it on resume. Callers without it cause a lock leak.
+    /// - Scheduler lock (`lock_state`) MUST NOT be held.
     unsafe fn do_context_switch(&mut self, old_tcb: *mut Tcb, new_tcb: *mut Tcb) {
         unsafe {
             // Switch to the target thread's user VSpace
@@ -299,10 +317,16 @@ impl Scheduler {
                 crate::arch::set_tss_rsp0((*new_tcb).kernel_stack_top);
             }
 
-            // Perform context switch
+            // Release SCHED_IPC_LOCK before context switch (IF=0, no interrupts possible)
+            crate::mm::SCHED_IPC_LOCK.unlock();
+
+            // Pure register save/restore — no shared state accessed
             let old_ctx = &mut (*old_tcb).context as *mut _;
             let new_ctx = &(*new_tcb).context as *const _;
             crate::arch::context_switch(old_ctx, new_ctx);
+
+            // Reacquire SCHED_IPC_LOCK after resume
+            crate::mm::SCHED_IPC_LOCK.lock();
         }
     }
 
@@ -318,6 +342,10 @@ impl Scheduler {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
         self.lock();
 
+        // Wake expired sleepers
+        let now_ns = crate::arch::now_ns();
+        unsafe { crate::sched::sleep_queue::check_wakeups(now_ns); }
+
         unsafe {
             let cpu_id = crate::arch::current_cpu() as usize;
             let current = self.current[cpu_id];
@@ -330,6 +358,15 @@ impl Scheduler {
 
             let sched_ctx = (*current).sched_context;
             if sched_ctx.is_null() {
+                // Idle thread — check if woken thread should preempt
+                let new_tcb = self.schedule_unlocked();
+                if current != new_tcb {
+                    self.set_current(new_tcb);
+                    self.unlock();
+                    crate::mm::restore_irq(irq_flag);
+                    self.do_context_switch(current, new_tcb);
+                    return;
+                }
                 self.unlock();
                 crate::mm::restore_irq(irq_flag);
                 return;
@@ -343,23 +380,36 @@ impl Scheduler {
 
             // Check if budget exhausted
             if (*sched_ctx).remaining == 0 {
-                self.handle_budget_exhausted_unlocked(current);
-                // handle_budget_exhausted_unlocked enqueued + made schedule decision
-                // Check if switch is needed
-                let new_tcb = self.schedule_unlocked();
-                let old_tcb = current;
-                if old_tcb != new_tcb {
-                    self.set_current(new_tcb);
-                    self.unlock();
-                    crate::mm::restore_irq(irq_flag);
-                    self.do_context_switch(old_tcb, new_tcb);
-                    return;
+                // If cross-CPU TCB_SUSPEND set us Inactive, just schedule away
+                // without re-enqueuing (prevents resurrection)
+                if (*current).state == ThreadState::Inactive {
+                    let new_tcb = self.schedule_unlocked();
+                    if current != new_tcb {
+                        self.set_current(new_tcb);
+                        self.unlock();
+                        crate::mm::restore_irq(irq_flag);
+                        self.do_context_switch(current, new_tcb);
+                        return;
+                    }
+                } else {
+                    self.handle_budget_exhausted_unlocked(current);
+                    let new_tcb = self.schedule_unlocked();
+                    let old_tcb = current;
+                    if old_tcb != new_tcb {
+                        self.set_current(new_tcb);
+                        self.unlock();
+                        crate::mm::restore_irq(irq_flag);
+                        self.do_context_switch(old_tcb, new_tcb);
+                        return;
+                    }
                 }
             }
             // Check for preemption (earlier deadline ready)
             else if self.needs_reschedule() {
-                // Put current back in ready queue
-                self.enqueue_unlocked(current);
+                // Only re-enqueue if not suspended by cross-CPU TCB_SUSPEND
+                if (*current).state != ThreadState::Inactive {
+                    self.enqueue_unlocked(current);
+                }
                 let new_tcb = self.schedule_unlocked();
                 let old_tcb = current;
                 if old_tcb != new_tcb {
@@ -393,8 +443,10 @@ impl Scheduler {
                 return;
             }
 
-            // Re-enqueue current if it's a real thread (not idle)
-            if current != self.idle[cpu_id] {
+            // Re-enqueue current if it's a real thread (not idle) and still Running.
+            // The Running check prevents re-enqueuing Inactive threads that were
+            // suspended by a cross-CPU TCB_SUSPEND + IPI.
+            if current != self.idle[cpu_id] && (*current).state == ThreadState::Running {
                 self.enqueue_unlocked(current);
             }
 
@@ -447,8 +499,11 @@ impl Scheduler {
 
     /// Perform a context switch to the next thread.
     ///
-    /// Acquires the scheduler lock for the scheduling decision, then
-    /// releases it before performing the actual context switch.
+    /// # Preconditions
+    /// - SCHED_IPC_LOCK MUST be held by the caller. do_context_switch releases
+    ///   it before switching and reacquires on resume.
+    ///
+    /// Acquires the scheduler lock internally for the scheduling decision.
     pub fn reschedule(&mut self) {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
         self.lock();
@@ -532,11 +587,12 @@ impl Scheduler {
 
     /// Block current thread on VSpace teardown (MAY switch, manages IRQ state internally)
     ///
-    /// CRITICAL: This function may call reschedule() which performs context switch.
-    /// The function manages IRQ state internally - do NOT wrap with with_lock().
+    /// CRITICAL: This function may call do_context_switch() which releases/reacquires
+    /// SCHED_IPC_LOCK. The function manages both SCHED_IPC_LOCK and scheduler lock internally.
+    /// Do NOT wrap with with_lock().
     pub fn block_current_on_vspace(&mut self, tracking: &crate::mm::VSpaceTracking) {
-        // Take scheduler lock and disable IRQs
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
+        crate::mm::SCHED_IPC_LOCK.lock();
         self.lock();
 
         unsafe {
@@ -546,6 +602,7 @@ impl Scheduler {
             // Fast path: check if already inactive
             if !tracking.is_active() {
                 self.unlock();
+                crate::mm::SCHED_IPC_LOCK.unlock();
                 crate::mm::restore_irq(irq_flag);
                 return;
             }
@@ -562,17 +619,63 @@ impl Scheduler {
             let new_tcb = self.schedule_unlocked();
             let old_tcb = current;
 
-            // Release lock before context switch
+            // Release scheduler lock before context switch
             self.unlock();
 
             if old_tcb != new_tcb {
                 self.set_current(new_tcb);
+                // do_context_switch releases SCHED_IPC_LOCK before switch,
+                // reacquires on resume
                 self.do_context_switch(old_tcb, new_tcb);
             }
 
-            // Thread resumed - restore IRQ state
+            // After resume: SCHED_IPC_LOCK is held (reacquired by do_context_switch)
+            crate::mm::SCHED_IPC_LOCK.unlock();
             crate::mm::restore_irq(irq_flag);
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Sleep blocking (acquires lock internally)
+    // ---------------------------------------------------------------
+
+    /// Block current thread on nanosleep timer.
+    ///
+    /// Acquires the scheduler lock, sets up timer state, inserts into
+    /// the sleep queue, and performs context switch if needed.
+    /// This ensures sleep_queue::insert() is called with lock held.
+    pub fn block_current_sleeping(&mut self, wakeup_ns: u64) {
+        let irq_flag = unsafe { crate::mm::save_irq_disable() };
+        self.lock();
+
+        unsafe {
+            let cpu_id = crate::arch::current_cpu() as usize;
+            let current = self.current[cpu_id];
+            if current.is_null() {
+                self.unlock();
+                crate::mm::restore_irq(irq_flag);
+                return;
+            }
+
+            (*current).timer_wakeup_ns = wakeup_ns;
+            (*current).state = ThreadState::Blocked;
+            (*current).blocked_reason = Some(BlockedReason::TimerBlocked);
+
+            crate::sched::sleep_queue::insert(current);
+
+            let new_tcb = self.schedule_unlocked();
+            let old_tcb = current;
+            if old_tcb != new_tcb {
+                self.set_current(new_tcb);
+                self.unlock();
+                crate::mm::restore_irq(irq_flag);
+                self.do_context_switch(old_tcb, new_tcb);
+                return;
+            }
+        }
+
+        self.unlock();
+        unsafe { crate::mm::restore_irq(irq_flag) };
     }
 
     // ---------------------------------------------------------------
@@ -648,6 +751,25 @@ impl Scheduler {
 }
 
 static mut SCHEDULER: Scheduler = Scheduler::new();
+
+/// Per-CPU atomic tracking of the currently running TCB pointer.
+///
+/// Updated via `set_current()` and `schedule_unlocked()` with Release ordering.
+/// Read by `current_on_cpu()` with Acquire ordering. Used by cross-CPU
+/// `TCB_SUSPEND` to spin-wait until the target CPU has context-switched away.
+static CURRENT_ON_CPU: [AtomicUsize; MAX_CPUS] = {
+    const INIT: AtomicUsize = AtomicUsize::new(0);
+    [INIT; MAX_CPUS]
+};
+
+/// Read the current thread pointer for a given CPU (lock-free).
+///
+/// Returns the raw TCB pointer as `usize`. The caller can compare this
+/// against a known TCB address to determine if that thread is still
+/// executing on the target CPU.
+pub fn current_on_cpu(cpu: usize) -> usize {
+    CURRENT_ON_CPU[cpu].load(core::sync::atomic::Ordering::Acquire)
+}
 
 /// Global scheduler instance
 pub fn scheduler() -> &'static mut Scheduler {
