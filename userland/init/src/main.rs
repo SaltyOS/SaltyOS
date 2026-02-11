@@ -234,6 +234,7 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap) -> Cap {
 
     // First, track the EPs for inter-service wiring
     let mut console_ep: Cap = 0;
+    let mut console_cnode: Cap = 0;
     let mut nameserv_ep: Cap = 0;
     let mut vfs_ep: Cap = 0;
     let mut procmgr_ep: Cap = 0;
@@ -301,6 +302,7 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap) -> Cap {
             let ep = cap_base + COFF_EP;
             if bytes_eq(name, b"console") {
                 console_ep = ep;
+                console_cnode = cap_base + COFF_CNODE;
             } else if bytes_eq(name, b"nameserv") {
                 nameserv_ep = ep;
             } else if bytes_eq(name, b"vfs") {
@@ -317,6 +319,21 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap) -> Cap {
                     } else {
                         procmgr_ep = ep;
                         puts(b"[INIT] WARN: mint badged PM EP failed\n");
+                    }
+                }
+
+                // Late cap injection: give console the procmgr EP at slot 9
+                // so it can send ISIG signals (Ctrl-C → SIGINT, etc.)
+                if console_cnode != 0 && procmgr_ep != 0 {
+                    let err = invoke::cnode_copy(
+                        CAP_SELF_CSPACE, ep,
+                        console_cnode, 9,
+                        CAP_RIGHTS_ALL,
+                    );
+                    if err == 0 {
+                        puts(b"[INIT] Injected procmgr EP into console slot 9\n");
+                    } else {
+                        puts(b"[INIT] WARN: procmgr EP injection to console failed\n");
                     }
                 }
             }

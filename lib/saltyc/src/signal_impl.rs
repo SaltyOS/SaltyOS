@@ -86,8 +86,8 @@ pub unsafe extern "C" fn sigaction(
         // Fill old action if requested
         if !oact.is_null() {
             (*oact).sa_handler = (*(&raw const HANDLERS))[sig as usize];
-            (*oact).sa_mask = *(&raw const BLOCKED_MASK);
-            (*oact).sa_flags = 0;
+            (*oact).sa_mask = Sigset { bits: (*(&raw const salty::__sig_sa_mask))[sig as usize] };
+            (*oact).sa_flags = (*(&raw const salty::__sig_sa_flags))[sig as usize];
             (*oact).sa_restorer = 0;
         }
 
@@ -105,6 +105,10 @@ pub unsafe extern "C" fn sigaction(
                 errno::set_errno(errno::EINVAL);
                 return -1;
             }
+
+            // Store sa_mask and sa_flags in shared libsalty globals
+            (*(&raw mut salty::__sig_sa_mask))[sig as usize] = (*act).sa_mask.bits;
+            (*(&raw mut salty::__sig_sa_flags))[sig as usize] = (*act).sa_flags;
         }
 
         0
@@ -118,12 +122,12 @@ pub unsafe extern "C" fn sigprocmask(
     oldset: *mut Sigset,
 ) -> i32 {
     unsafe {
+        let current = *(&raw const salty::__sig_blocked_mask);
         if !oldset.is_null() {
-            (*oldset).bits = (*(&raw const BLOCKED_MASK)).bits;
+            (*oldset).bits = current;
         }
 
         if !set.is_null() {
-            let current = (*(&raw const BLOCKED_MASK)).bits;
             let new_bits = (*set).bits;
             let updated = match how {
                 SIG_BLOCK => current | new_bits,
@@ -134,6 +138,7 @@ pub unsafe extern "C" fn sigprocmask(
                     return -1;
                 }
             };
+            (*(&raw mut salty::__sig_blocked_mask)) = updated;
             (*(&raw mut BLOCKED_MASK)).bits = updated;
         }
 

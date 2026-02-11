@@ -41,6 +41,15 @@ pub static mut __sig_handlers: [usize; NSIG] = [0; NSIG];
 pub static mut __sig_initialized: i32 = 0;
 
 #[unsafe(no_mangle)]
+pub static mut __sig_blocked_mask: u32 = 0;
+
+#[unsafe(no_mangle)]
+pub static mut __sig_sa_mask: [u32; NSIG] = [0; NSIG];
+
+#[unsafe(no_mangle)]
+pub static mut __sig_sa_flags: [i32; NSIG] = [0; NSIG];
+
+#[unsafe(no_mangle)]
 #[linkage = "weak"]
 pub static mut __salty_next_frame_slot: u64 = 64;
 
@@ -449,6 +458,16 @@ pub extern "C" fn salty_dup2(oldfd: i32, newfd: i32) -> i32 {
     unsafe { posix::posix_dup2(oldfd, newfd) }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_dup3(oldfd: i32, newfd: i32, flags: i32) -> i32 {
+    unsafe { posix::posix_dup3(oldfd, newfd, flags) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_mkfifo(path: *const u8, mode: u32) -> i32 {
+    unsafe { posix::posix_mkfifo(path, mode) }
+}
+
 // ---------------------------------------------------------------------------
 // C ABI exports: Process groups and UID/GID
 // ---------------------------------------------------------------------------
@@ -525,6 +544,43 @@ pub extern "C" fn salty_sleep(seconds: u64) -> u64 {
 // ---------------------------------------------------------------------------
 // C ABI exports: fcntl / isatty / chdir / getcwd / ioctl
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// C ABI exports: Terminal I/O
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_tcgetattr(fd: i32, termios_p: *mut types::Termios) -> i32 {
+    unsafe { posix::posix_tcgetattr(fd, termios_p) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_tcsetattr(fd: i32, action: i32, termios_p: *const types::Termios) -> i32 {
+    unsafe { posix::posix_tcsetattr(fd, action, termios_p) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_epoll_create1(flags: i32) -> i32 {
+    let _ = flags;
+    unsafe { posix::posix_epoll_create() }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const types::EpollEvent) -> i32 {
+    unsafe {
+        let (events, data) = if !event.is_null() {
+            ((*event).events, (*event).data)
+        } else {
+            (0, 0)
+        };
+        posix::posix_epoll_ctl(epfd, op, fd, events, data)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_epoll_wait(epfd: i32, events: *mut types::EpollEvent, maxevents: i32, timeout: i32) -> i32 {
+    unsafe { posix::posix_epoll_wait(epfd, events, maxevents, timeout) }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn salty_fcntl(fd: i32, cmd: i32, arg: i64) -> i32 {

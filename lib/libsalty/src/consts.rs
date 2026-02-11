@@ -72,6 +72,8 @@ pub const IOPORT_OUT16: u64 = 0x73;
 // Console IPC message labels
 pub const CONSOLE_WRITE: u64 = 1;
 pub const CONSOLE_READ: u64 = 2;
+pub const CONSOLE_TCGETATTR: u64 = 3;
+pub const CONSOLE_TCSETATTR: u64 = 4;
 
 // Well-known cap slots
 pub const CAP_SELF_TCB: u64 = 0;
@@ -165,6 +167,13 @@ pub const POSIX_VFS_ISATTY: u64 = 34;
 pub const POSIX_VFS_FCNTL: u64 = 35;
 pub const POSIX_VFS_CHDIR: u64 = 36;
 pub const POSIX_VFS_GETCWD: u64 = 37;
+pub const POSIX_VFS_TCGETATTR: u64 = 38;
+pub const POSIX_VFS_TCSETATTR: u64 = 39;
+pub const POSIX_VFS_EPOLL_CREATE: u64 = 40;
+pub const POSIX_VFS_EPOLL_CTL: u64 = 41;
+pub const POSIX_VFS_EPOLL_WAIT: u64 = 42;
+pub const POSIX_VFS_DUP3: u64 = 43;
+pub const POSIX_VFS_MKFIFO: u64 = 44;
 
 // fcntl commands
 pub const F_DUPFD: i32 = 0;
@@ -212,6 +221,7 @@ pub const O_EXCL: u64 = 0x0080;
 pub const O_TRUNC: u64 = 0x0200;
 pub const O_APPEND: u64 = 0x0400;
 pub const O_NONBLOCK: u64 = 0x0800;
+pub const O_CLOEXEC: u64 = 0x80000;
 
 // SEEK_* constants
 pub const SEEK_SET: u64 = 0;
@@ -264,6 +274,9 @@ pub const NSIG: usize = 32;
 pub const SIG_DISP_DFL: u64 = 0;
 pub const SIG_DISP_IGN: u64 = 1;
 pub const SIG_DISP_CATCH: u64 = 2;
+
+// sigaction flags
+pub const SA_RESETHAND: i32 = 0x80000000u32 as i32;
 
 // PROT_* flags
 pub const PROT_NONE: i32 = 0x0;

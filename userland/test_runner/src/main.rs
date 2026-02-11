@@ -18,6 +18,8 @@ mod test_signal;
 mod test_socket;
 mod test_pipe;
 mod test_time;
+mod test_terminal;
+mod test_epoll;
 
 use salty::consts::*;
 use salty::ipc;
@@ -40,7 +42,7 @@ pub extern "C" fn _start() -> ! {
 
     puts(b"[TEST_RUNNER] SaltyOS Test Runner starting\n");
 
-    let tests: [(&[u8], fn() -> bool); 8] = [
+    let tests: [(&[u8], fn() -> bool); 10] = [
         (b"test_hello", test_hello::run),
         (b"test_fs", test_fs::run),
         (b"test_mmap", test_mmap::run),
@@ -49,6 +51,8 @@ pub extern "C" fn _start() -> ! {
         (b"test_socket", test_socket::run),
         (b"test_pipe", test_pipe::run),
         (b"test_time", test_time::run),
+        (b"test_terminal", test_terminal::run),
+        (b"test_epoll", test_epoll::run),
     ];
 
     let mut passed = 0u32;

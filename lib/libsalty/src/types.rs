@@ -371,6 +371,35 @@ impl Timeval {
     }
 }
 
+// Termios structure (matches saltyc layout)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Termios {
+    pub c_iflag: u32,
+    pub c_oflag: u32,
+    pub c_cflag: u32,
+    pub c_lflag: u32,
+    pub c_line: u8,
+    pub c_cc: [u8; 32],
+    pub c_ispeed: u32,
+    pub c_ospeed: u32,
+}
+
+impl Termios {
+    pub const fn zeroed() -> Self {
+        Termios {
+            c_iflag: 0,
+            c_oflag: 0,
+            c_cflag: 0,
+            c_lflag: 0,
+            c_line: 0,
+            c_cc: [0; 32],
+            c_ispeed: 0,
+            c_ospeed: 0,
+        }
+    }
+}
+
 // Epoll event
 #[repr(C)]
 #[derive(Clone, Copy)]

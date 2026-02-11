@@ -1129,31 +1129,18 @@ unsafe fn sig_terminate_proc(idx: usize, sig: usize) {
     }
 }
 
-unsafe fn handle_kill(msg: &SaltyMsg, reply: &mut SaltyMsg, _badge: u64) {
+/// Deliver a signal to a single process by table index.
+/// Returns true if the signal was delivered (or ignored), false if target invalid.
+unsafe fn deliver_signal_to(ti: usize, sig: usize) -> bool {
     unsafe {
-        let target_pid = msg.regs[0] as u32;
-        let sig = msg.regs[1] as usize;
-
-        if sig == 0 || sig >= NSIG {
-            reply.label = SALTY_INVALID_ARGUMENT;
-            return;
-        }
-
-        let Some(ti) = find_by_pid(target_pid) else {
-            reply.label = SALTY_NOT_FOUND;
-            return;
-        };
         if PROCTAB[ti].state != PROC_RUNNING && PROCTAB[ti].state != PROC_STOPPED {
-            reply.label = SALTY_NOT_FOUND;
-            return;
+            return false;
         }
 
         // SIGKILL: always terminate
         if sig == PM_SIGKILL {
             sig_terminate_proc(ti, sig);
-            reply.label = SALTY_OK;
-            reply.length = 0;
-            return;
+            return true;
         }
 
         // SIGSTOP: always stop
@@ -1173,9 +1160,7 @@ unsafe fn handle_kill(msg: &SaltyMsg, reply: &mut SaltyMsg, _badge: u64) {
                     }
                 }
             }
-            reply.label = SALTY_OK;
-            reply.length = 0;
-            return;
+            return true;
         }
 
         // SIGCONT: resume stopped
@@ -1198,39 +1183,67 @@ unsafe fn handle_kill(msg: &SaltyMsg, reply: &mut SaltyMsg, _badge: u64) {
             if PROCTAB[ti].sig_disposition[sig] == SIG_DISP_CATCH && PROCTAB[ti].signal_ntfn != 0 {
                 signal_ntfn(PROCTAB[ti].signal_ntfn, 1u64 << sig);
             }
-            reply.label = SALTY_OK;
-            reply.length = 0;
-            return;
+            return true;
         }
 
         // Cannot deliver most signals to stopped processes
         if PROCTAB[ti].state != PROC_RUNNING {
-            reply.label = SALTY_OK;
-            reply.length = 0;
-            return;
+            return true;
         }
 
         let disp = PROCTAB[ti].sig_disposition[sig];
 
         if disp == SIG_DISP_IGN {
-            reply.label = SALTY_OK;
-            reply.length = 0;
-            return;
+            return true;
         }
 
         if disp == SIG_DISP_DFL {
             if sig_default_is_terminate(sig) {
                 sig_terminate_proc(ti, sig);
             }
-            reply.label = SALTY_OK;
-            reply.length = 0;
-            return;
+            return true;
         }
 
         // SIG_DISP_CATCH: deliver via notification
         if PROCTAB[ti].signal_ntfn != 0 {
             signal_ntfn(PROCTAB[ti].signal_ntfn, 1u64 << sig);
         }
+        true
+    }
+}
+
+unsafe fn handle_kill(msg: &SaltyMsg, reply: &mut SaltyMsg, _badge: u64) {
+    unsafe {
+        let target_pid = msg.regs[0] as u32;
+        let sig = msg.regs[1] as usize;
+
+        if sig == 0 || sig >= NSIG {
+            reply.label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        // pid==0: send signal to all processes in the foreground process group (pgid==0)
+        if target_pid == 0 {
+            for i in 0..MAX_PROCESSES {
+                if PROCTAB[i].state != PROC_FREE && PROCTAB[i].pgid == 0 {
+                    deliver_signal_to(i, sig);
+                }
+            }
+            reply.label = SALTY_OK;
+            reply.length = 0;
+            return;
+        }
+
+        let Some(ti) = find_by_pid(target_pid) else {
+            reply.label = SALTY_NOT_FOUND;
+            return;
+        };
+
+        if !deliver_signal_to(ti, sig) {
+            reply.label = SALTY_NOT_FOUND;
+            return;
+        }
+
         reply.label = SALTY_OK;
         reply.length = 0;
     }

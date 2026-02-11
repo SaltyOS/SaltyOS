@@ -112,29 +112,64 @@ static mut DEFAULT_TERMIOS: Termios = Termios {
 };
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tcgetattr(_fd: i32, termios_p: *mut Termios) -> i32 {
+pub unsafe extern "C" fn tcgetattr(fd: i32, termios_p: *mut Termios) -> i32 {
     unsafe {
-        let src = &raw const DEFAULT_TERMIOS;
-        core::ptr::copy_nonoverlapping(src as *const u8, termios_p as *mut u8, core::mem::size_of::<Termios>());
-
-        // Set default control characters
-        (*termios_p).c_cc[VINTR] = 3;     // Ctrl-C
-        (*termios_p).c_cc[VQUIT] = 28;    // Ctrl-backslash
-        (*termios_p).c_cc[VERASE] = 127;  // DEL
-        (*termios_p).c_cc[VKILL] = 21;    // Ctrl-U
-        (*termios_p).c_cc[VEOF] = 4;      // Ctrl-D
-        (*termios_p).c_cc[VMIN] = 1;
-        (*termios_p).c_cc[VSTART] = 17;   // Ctrl-Q
-        (*termios_p).c_cc[VSTOP] = 19;    // Ctrl-S
-        (*termios_p).c_cc[VSUSP] = 26;    // Ctrl-Z
-
+        // Route through VFS → console server IPC
+        let mut salty_t = salty::types::Termios::zeroed();
+        let ret = salty::posix::posix_tcgetattr(fd, &raw mut salty_t);
+        if ret != 0 {
+            // Fallback to local defaults
+            let src = &raw const DEFAULT_TERMIOS;
+            core::ptr::copy_nonoverlapping(src as *const u8, termios_p as *mut u8, core::mem::size_of::<Termios>());
+            (*termios_p).c_cc[VINTR] = 3;
+            (*termios_p).c_cc[VQUIT] = 28;
+            (*termios_p).c_cc[VERASE] = 127;
+            (*termios_p).c_cc[VKILL] = 21;
+            (*termios_p).c_cc[VEOF] = 4;
+            (*termios_p).c_cc[VMIN] = 1;
+            (*termios_p).c_cc[VSTART] = 17;
+            (*termios_p).c_cc[VSTOP] = 19;
+            (*termios_p).c_cc[VSUSP] = 26;
+            return 0;
+        }
+        // Copy from salty Termios to saltyc Termios
+        (*termios_p).c_iflag = salty_t.c_iflag;
+        (*termios_p).c_oflag = salty_t.c_oflag;
+        (*termios_p).c_cflag = salty_t.c_cflag;
+        (*termios_p).c_lflag = salty_t.c_lflag;
+        (*termios_p).c_line = salty_t.c_line;
+        (*termios_p).c_ispeed = salty_t.c_ispeed;
+        (*termios_p).c_ospeed = salty_t.c_ospeed;
+        for i in 0..NCCS {
+            (*termios_p).c_cc[i] = salty_t.c_cc[i];
+        }
         0
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tcsetattr(_fd: i32, _action: i32, termios_p: *const Termios) -> i32 {
+pub unsafe extern "C" fn tcsetattr(fd: i32, action: i32, termios_p: *const Termios) -> i32 {
     unsafe {
+        // Route through VFS → console server IPC
+        let mut salty_t = salty::types::Termios::zeroed();
+        salty_t.c_iflag = (*termios_p).c_iflag;
+        salty_t.c_oflag = (*termios_p).c_oflag;
+        salty_t.c_cflag = (*termios_p).c_cflag;
+        salty_t.c_lflag = (*termios_p).c_lflag;
+        salty_t.c_line = (*termios_p).c_line;
+        salty_t.c_ispeed = (*termios_p).c_ispeed;
+        salty_t.c_ospeed = (*termios_p).c_ospeed;
+        for i in 0..NCCS {
+            salty_t.c_cc[i] = (*termios_p).c_cc[i];
+        }
+        let ret = salty::posix::posix_tcsetattr(fd, action, &raw const salty_t);
+        if ret != 0 {
+            // Fallback: update local static
+            let dst = &raw mut DEFAULT_TERMIOS;
+            core::ptr::copy_nonoverlapping(termios_p as *const u8, dst as *mut u8, core::mem::size_of::<Termios>());
+            return 0;
+        }
+        // Also update local cached copy
         let dst = &raw mut DEFAULT_TERMIOS;
         core::ptr::copy_nonoverlapping(termios_p as *const u8, dst as *mut u8, core::mem::size_of::<Termios>());
         0
