@@ -8,16 +8,17 @@ SaltyOS follows the **microkernel POSIX model** pioneered by Minix3 and QNX:
 
 - The kernel provides only primitives: IPC, scheduling, memory management, capabilities
 - POSIX semantics are implemented entirely in **userspace servers**
-- A modified **libc** translates POSIX calls to IPC messages
+- **libsalty** (Rust) provides POSIX wrappers that translate calls to IPC messages
+- **saltyc** (C) provides a standard C library on top of libsalty
 
 ```
 +-----------------------------------------------+
 |              Applications                      |
 +-----------------------------------------------+
-|           Modified musl libc                   |
+|    saltyc (C stdlib)  |  libsalty (Rust)       |
 |      [POSIX calls -> IPC + capabilities]       |
 +-----------------------------------------------+
-|  VFS  |  ProcMgr  |  NetStack  |  Drivers     |
+|  VFS  |  ProcMgr  |  Console  |  Drivers      |
 +-----------------------------------------------+
 |            SaltyOS Microkernel                 |
 |  [Endpoints, Notifications, CNodes, VSpace]   |
@@ -35,25 +36,19 @@ SaltyOS follows the **microkernel POSIX model** pioneered by Minix3 and QNX:
 
 ## Architecture
 
-### libc: Modified musl
+### Libraries: libsalty + saltyc
 
-SaltyOS uses a modified [musl libc](https://musl.libc.org/) for POSIX compatibility:
+SaltyOS uses a two-layer userspace library stack:
 
-- **MIT license**: Permissive, suitable for OS inclusion
-- **Small codebase**: ~100K lines (vs glibc's 1.5M)
-- **Static linking friendly**: Important for early userspace
-- **Clean syscall layer**: Easy to replace with IPC calls
+- **libsalty** (`lib/libsalty/`, Rust): System library providing raw syscall wrappers, IPC helpers, capability invocations, and POSIX compatibility functions (`posix.rs`, `posix_mm.rs`, `signals.rs`). Compiled as `libsalty.so` (shared) and linked statically into `init`.
+- **saltyc** (`lib/saltyc/`, C): Standard C library built on top of libsalty, providing stdio, stdlib, string, malloc, unistd, signal, termios, dirent, regex, and more.
 
-**Modification approach**:
-```c
-// Standard musl (Linux)
-long open(const char *path, int flags, mode_t mode) {
-    return syscall(SYS_open, path, flags, mode);
-}
-
-// SaltyOS musl
-long open(const char *path, int flags, mode_t mode) {
-    return vfs_ipc_open(path, flags, mode);  // IPC to VFS server
+**How POSIX calls work**:
+```rust
+// libsalty posix.rs — open() sends IPC to VFS server
+pub extern "C" fn open(path: *const u8, flags: i32, mode: u32) -> i32 {
+    // Build IPC message with VFS_OPEN label
+    // salty_call(vfs_ep, &msg) → VFS server handles it
 }
 ```
 
@@ -61,15 +56,15 @@ long open(const char *path, int flags, mode_t mode) {
 
 | Server | POSIX Functions |
 |--------|-----------------|
-| **VFS** | open, read, write, close, stat, lseek, mmap (file-backed), dup, pipe |
-| **ProcMgr** | fork, exec, exit, wait, getpid, kill, signal handling |
-| **NetStack** | socket, bind, connect, listen, accept, send, recv |
-| **MemMgr** | mmap (anonymous), munmap, mprotect, shm_open |
+| **VFS** | open, read, write, close, stat, lseek, dup/dup3, pipe/pipe2, mkfifo, socket (AF_UNIX), poll, epoll, shm_open/shm_unlink, ftruncate |
+| **ProcMgr** | fork, exec, exit, wait, getpid, kill, signal delivery, process groups |
+| **Console** | Serial I/O, line discipline (ICANON/ECHO/ISIG), tcgetattr/tcsetattr, signal generation (Ctrl-C/Ctrl-\/Ctrl-Z) |
+| **libsalty** | mmap (anonymous), munmap, mprotect, brk/sbrk, sigaction, sigprocmask, select |
 
 ### IPC Flow Example
 
 ```
-Application                    libc                      VFS Server
+Application                  libsalty                    VFS Server
     |                           |                            |
     | open("/etc/hosts", O_RDONLY)                           |
     |-------------------------->|                            |
@@ -87,9 +82,7 @@ Application                    libc                      VFS Server
 
 ## Supported Interfaces
 
-### Phase 1: Core (Minimal Viable)
-
-Essential for basic program execution.
+### File I/O, Process, and Memory
 
 **File I/O**:
 | Function | Status | Notes |
@@ -122,9 +115,7 @@ Essential for basic program execution.
 | `mprotect` | Implemented | posix_mm.h |
 | `brk`, `sbrk` | Implemented | posix_mm.h |
 
-### Phase 2: GUI-Ready
-
-Required for running graphical applications (Wayland, X11 via XWayland).
+### Sockets, Event Multiplexing, and Shared Memory
 
 **Unix Domain Sockets**:
 | Function | Status | Notes |
@@ -142,7 +133,7 @@ Required for running graphical applications (Wayland, X11 via XWayland).
 |----------|--------|-------|
 | `poll` | Implemented | VFS server + libsalty posix.rs |
 | `select` | Implemented | Wrapper around poll in libsalty |
-| `epoll_*` | Partial | Constants defined, epoll_create via /dev/epoll |
+| `epoll_create1`, `epoll_ctl`, `epoll_wait` | Implemented | VFS server + libsalty posix.rs |
 
 **POSIX Shared Memory**:
 | Function | Status | Notes |
@@ -152,40 +143,40 @@ Required for running graphical applications (Wayland, X11 via XWayland).
 | `mmap` (shared) | Implemented | MAP_SHARED flag support |
 | `ftruncate` | Implemented | VFS server + libsalty posix.rs |
 
-**Signals** (limited):
+**Signals**:
 | Function | Status | Notes |
 |----------|--------|-------|
-| `kill` | Implemented | Via ProcMgr IPC |
+| `kill` | Implemented | Via ProcMgr IPC, pid==0 kills process group |
 | `signal` | Implemented | Notification-based delivery |
-| `sigaction` | Planned | Full POSIX sigaction struct |
-| `sigprocmask` | Planned | |
+| `sigaction` | Implemented | sa_mask, SA_RESETHAND, pending re-raise |
+| `sigprocmask` | Implemented | Syncs with libsalty globals |
 
-### Phase 3: Extended
+### Pipes, FIFOs, and File Descriptors
 
-For broader application compatibility.
-
-**Pipes and FIFOs**:
 | Function | Status | Notes |
 |----------|--------|-------|
-| `pipe`, `pipe2` | Planned | |
-| `mkfifo` | Planned | |
-| `dup`, `dup2`, `dup3` | Planned | |
+| `pipe`, `pipe2` | Implemented | O_NONBLOCK, O_CLOEXEC flags |
+| `mkfifo` | Implemented | FIFO inode type with pipe-backed semantics |
+| `dup`, `dup2`, `dup3` | Implemented | O_CLOEXEC support, EINVAL validation |
 
-**Terminal**:
+### Terminal
+
 | Function | Status | Notes |
 |----------|--------|-------|
-| `isatty` | Planned | |
-| `tcgetattr`, `tcsetattr` | Planned | |
-| `ioctl` (tty) | Planned | |
+| `isatty` | Implemented | VFS server |
+| `tcgetattr`, `tcsetattr` | Implemented | Forwarded to console server |
+| Line discipline | Implemented | ICANON, ECHO/ECHOE/ECHOK/ECHOCTL, ISIG |
+| Signal generation | Implemented | Ctrl-C→SIGINT, Ctrl-\→SIGQUIT, Ctrl-Z→SIGTSTP |
 
-**Time**:
+### Time
+
 | Function | Status | Notes |
 |----------|--------|-------|
-| `gettimeofday` | Planned | |
-| `clock_gettime` | Planned | |
-| `nanosleep` | Planned | |
+| `clock_gettime` | Implemented | Kernel syscall #12, CLOCK_MONOTONIC/CLOCK_REALTIME |
+| `nanosleep` | Implemented | Kernel syscall #13, sleep queue based |
 
-**Networking** (TCP/IP):
+### Networking (TCP/IP)
+
 | Function | Status | Notes |
 |----------|--------|-------|
 | `socket(AF_INET, ...)` | Future | Via NetStack server |
@@ -235,19 +226,22 @@ ProcMgr grants NET_RAW capability to /usr/bin/ping at exec time
 
 ### Traditional Signal Semantics
 
-**Limitation**: Full POSIX signal semantics (async delivery, signal stacks, SA_RESTART) are complex.
+**Limitation**: SA_RESTART and alternate signal stacks (`sigaltstack`) are not yet supported.
 
-**Status**: Simplified implementation
-
-**Rationale**:
-- Async signal delivery is difficult to implement safely
-- Many modern programs use `signalfd` or event loops instead
-- Capability-based notification is more natural for SaltyOS
+**Status**: Largely implemented
 
 **What we provide**:
-- Synchronous signal checking (via ProcMgr queries)
-- `signalfd`-style notification integration
-- Basic `SIGTERM`, `SIGCHLD`, `SIGPIPE` handling
+- Notification-based async signal delivery
+- `sigaction` with `sa_mask` and `SA_RESETHAND`
+- `sigprocmask` for blocking/unblocking signals
+- Pending signal re-raising after handler execution
+- `kill` with pid==0 for process group delivery
+- Terminal-generated signals: SIGINT (Ctrl-C), SIGQUIT (Ctrl-\), SIGTSTP (Ctrl-Z)
+
+**Not yet implemented**:
+- `SA_RESTART` (auto-restart interrupted syscalls)
+- `sigaltstack` (alternate signal stacks)
+- Real-time signals (SIGRTMIN-SIGRTMAX)
 
 ## POSIX to SaltyOS Mapping
 
@@ -327,27 +321,26 @@ Modern X11 (Xorg 1.15+) no longer requires:
 ## Implementation Roadmap
 
 ```
-Phase 1: Core POSIX
-├── Modified musl libc
-├── VFS server (file I/O)
-├── ProcMgr (fork, exec, wait)
-└── Basic signal delivery
+Phase 1: Core POSIX                              [DONE]
+├── libsalty (Rust) + saltyc (C stdlib)
+├── VFS server (file I/O, ramfs, devfs)
+├── ProcMgr (fork, exec, wait, kill)
+└── Signal delivery (notification-based)
 
-Phase 2: GUI-Ready                     ✓ DONE
-├── Unix domain socket emulation        ✓
-├── SCM_RIGHTS (capability transfer)    ✓
-├── POSIX shared memory                 ✓
-├── poll/select                         ✓
-├── epoll (partial)
-└── Wayland compositor support
+Phase 2: GUI-Ready                                [DONE]
+├── Unix domain sockets (AF_UNIX)
+├── SCM_RIGHTS (fd passing via capability transfer)
+├── POSIX shared memory (shm_open, shm_unlink)
+├── poll/select/epoll
+├── Pipes, FIFOs, dup/dup3
+└── Terminal line discipline
 
-Phase 3: Extended Compatibility
-├── Full signal semantics
-├── Terminal handling
-├── TCP/IP networking
-└── Broader application testing
+Phase 3: Extended Compatibility                   [IN PROGRESS]
+├── SA_RESTART, sigaltstack                       [Planned]
+├── TCP/IP networking                             [Planned]
+└── Broader application testing                   [Ongoing]
 
-Phase 4: Optimization
+Phase 4: Optimization                            [Planned]
 ├── Zero-copy I/O paths
 ├── Async I/O (io_uring style)
 └── Performance tuning
@@ -356,7 +349,6 @@ Phase 4: Optimization
 ## References
 
 - [POSIX.1-2017 Specification](https://pubs.opengroup.org/onlinepubs/9699919799/)
-- [musl libc](https://musl.libc.org/)
 - [Wayland Protocol](https://wayland.freedesktop.org/docs/html/)
 - [QNX Resource Managers](https://www.qnx.com/developers/docs/)
 - [Minix3 Design](https://wiki.minix3.org/)

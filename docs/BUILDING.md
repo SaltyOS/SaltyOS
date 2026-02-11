@@ -150,7 +150,7 @@ Available options:
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `arch` | combo | x86_64 | Target architecture (x86_64, aarch64) |
+| `arch` | combo | x86_64 | Target architecture (x86_64) |
 | `build_boot` | bool | true | Build the bootloader |
 | `build_kernel` | bool | true | Build the microkernel |
 | `build_userland` | bool | false | Build userland components |
@@ -163,9 +163,6 @@ Available options:
 Reconfigure:
 
 ```bash
-# Change architecture
-meson configure build -Darch=aarch64
-
 # Enable userland build
 meson configure build -Dbuild_userland=true
 
@@ -228,8 +225,8 @@ qemu-system-x86_64 \
     -cpu qemu64 \
     -m 512M \
     -serial stdio \
-    -bios /usr/share/OVMF/OVMF_CODE.fd \
-    -drive file=build/saltyos.img,format=raw \
+    -bios /usr/share/edk2-ovmf/OVMF_CODE.fd \
+    -drive file=build/saltyos-uefi.img,format=raw \
     -no-reboot
 ```
 

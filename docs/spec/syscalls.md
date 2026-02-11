@@ -51,6 +51,10 @@ syscall_invoke:
 | 9 | `Invoke` | Invoke capability (generic) |
 | 10 | `DebugPutChar` | Debug output (development only) |
 | 11 | `DebugDumpState` | Dump thread state (development only) |
+| 12 | `ClockGetTime` | Read monotonic clock (nanoseconds) |
+| 13 | `NanoSleep` | Sleep for specified duration |
+| 14 | `DebugPutStr` | Debug string output (development only) |
+| 15 | `DebugPutBuf` | Debug buffer output (development only) |
 
 ## Message Info Word Format
 
@@ -323,6 +327,61 @@ Dump the current thread's register state to the kernel debug serial port.
 
 ```c
 long sys_debug_dump_state(void);
+```
+
+### ClockGetTime (12)
+
+Read the monotonic clock. Returns the current time in nanoseconds.
+
+```c
+long sys_clock_gettime(
+    uint64_t clock_id   // RDI: 0 = CLOCK_REALTIME, 1 = CLOCK_MONOTONIC
+);
+```
+
+**Returns:**
+- RAX = `0`, RDX = time in nanoseconds
+- RAX = `4` (InvalidArgument): clock_id > 1
+
+### NanoSleep (13)
+
+Sleep for the specified duration.
+
+```c
+long sys_nanosleep(
+    uint64_t seconds,      // RDI: Whole seconds to sleep
+    uint64_t nanoseconds   // RSI: Additional nanoseconds (0-999,999,999)
+);
+```
+
+**Returns:**
+- RAX = `0`: Sleep completed
+- RAX = `4` (InvalidArgument): nanoseconds >= 1,000,000,000
+
+**Behavior:**
+- If duration is 0, returns immediately
+- Thread is blocked until the wakeup time is reached
+
+### DebugPutStr (14)
+
+Write a string to the kernel debug serial port. Development use only.
+
+```c
+long sys_debug_putstr(
+    const char *buf,    // RDI: Pointer to string buffer
+    uint64_t len        // RSI: String length in bytes
+);
+```
+
+### DebugPutBuf (15)
+
+Write a buffer to the kernel debug serial port. Development use only.
+
+```c
+long sys_debug_putbuf(
+    const char *buf,    // RDI: Pointer to buffer
+    uint64_t len        // RSI: Buffer length in bytes
+);
 ```
 
 ## Capability Operations

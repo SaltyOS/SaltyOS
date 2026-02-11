@@ -16,7 +16,9 @@ SaltyOS is a capability-based microkernel designed with security and modularity 
 - **EDF Scheduler**: Earliest Deadline First scheduling for real-time workload support
 - **Multi-Architecture**: Designed for x86_64 with aarch64 support planned
 - **Custom Bootloader**: 3-stage bootloader supporting both BIOS and UEFI
-- **SaltyFS**: Copy-on-write filesystem with snapshot support (userspace driver)
+- **POSIX Compatibility Layer**: Signals, pipes, sockets, poll/epoll, shared memory, fork/exec
+- **C Standard Library (saltyc)**: Full stdio/stdlib/string/unistd for C program support
+- **Terminal Support**: Line discipline with canonical/raw mode, signal generation
 
 ## Project Status
 
@@ -31,21 +33,31 @@ SaltyOS is a capability-based microkernel designed with security and modularity 
 - [x] **EDF scheduler** (budget enforcement, deadline-based)
 - [x] **Context switching** (full save/restore, per-thread user RSP)
 - [x] **Interrupt handling** (IDT, IRQ routing via notifications)
-- [x] **System call dispatch** (12 syscalls, capability invocations)
+- [x] **System call dispatch** (16 syscalls, capability invocations)
 - [x] **ELF loader** (loads userspace from CPIO initrd)
-- [x] **Init process** (multi-phase bootstrap: IPC test, fault handling, console spawn)
-- [x] **Console server** (serial I/O via IoPort capabilities)
+- [x] **Init process** (service-based multi-phase bootstrap)
+- [x] **Console server** (serial I/O, line discipline, signal generation)
 - [x] **Runtime dynamic linker** (shared library loading)
 - [x] **Fault handling** (page fault delivery via fault endpoints, reply-to-resume)
 - [x] **IPC buffer** (message overflow MR4-MR19, capability transfer)
 - [x] **I/O port capabilities** (IoPort_In8/Out8/In16/Out16)
-- [x] **Debug syscalls** (DebugPutChar, DebugDumpState)
+- [x] **Debug syscalls** (DebugPutChar, DebugDumpState, DebugPutStr, DebugPutBuf)
 - [x] **Userspace servers** (procmgr, vfs, nameserv)
 - [x] **SMP** (ACPI MADT discovery, AP trampoline, per-CPU GDT/TSS, APIC timer, IPI reschedule/VSpace teardown, CPU affinity)
-
-### Recently Completed
-
 - [x] **IPC assembly fastpath** (hybrid asm/Rust for Call + ReplyRecv, short messages, no cap transfer)
+- [x] **POSIX compatibility** (signals, Unix domain sockets, poll/select/epoll, pipes/FIFOs, shm, fd passing, fork/exec)
+- [x] **Bound notifications** (bidirectional TCB↔Notification link, combined IPC wait)
+- [x] **SMP locking discipline** (lock ordering enforcement, atomic serial output)
+- [x] **Time syscalls** (ClockGetTime, NanoSleep)
+- [x] **saltyc C standard library** (stdio, stdlib, string, malloc, unistd, signal, termios, dirent, regex)
+- [x] **Terminal line discipline** (ICANON, ECHO, ISIG with Ctrl-C/Ctrl-\/Ctrl-Z, tcgetattr/tcsetattr)
+- [x] **Automated test suite** (test_runner with 10 modules: hello, fs, mmap, fork, signal, socket, pipe, time, terminal, epoll)
+
+### Planned
+
+- [ ] **SaltyFS** (copy-on-write filesystem with snapshot support)
+- [ ] **aarch64 port**
+- [ ] **Network stack**
 
 ## Architecture
 
@@ -156,14 +168,20 @@ SaltyOS/
 │       ├── sched/          # Scheduler
 │       └── syscall/        # System call handlers
 ├── userland/               # Userspace programs
-│   ├── init/               # First process (multi-phase bootstrap)
+│   ├── init/               # First process (service-based bootstrap)
 │   ├── console/            # Serial console server
-│   └── rtld/               # Runtime dynamic linker
+│   ├── rtld/               # Runtime dynamic linker
+│   ├── procmgr/            # Process manager (spawn/exit/waitpid)
+│   ├── vfs/                # Virtual filesystem server
+│   ├── nameserv/           # Name service (endpoint lookup)
+│   ├── drivers/            # Userspace device drivers
+│   ├── test_runner/        # Automated test suite
+│   └── services/           # Service descriptor files (.service)
 ├── lib/                    # Shared libraries
-│   └── libsalty/           # System call wrappers (salty.h + salty_impl.c)
-├── tools/                  # Build utilities and test scripts
-│   ├── test_boot.sh        # QEMU boot smoke test
-│   └── test_smp.sh         # SMP boot smoke test
+│   └── libsalty/           # System library (Rust, syscall wrappers + POSIX compat)
+├── tools/                  # Build utilities
+│   ├── mkcpio.py           # Pack userland ELFs + services into initrd.cpio
+│   └── mkimage.py          # Create bootable disk image
 └── docs/                   # Documentation
 ```
 
@@ -193,14 +211,17 @@ SaltyOS/
 ## Testing
 
 ```bash
-# Run QEMU boot smoke test
-just test-integration
+# Build and run in QEMU — watch serial for KERNEL PANIC or test_runner PASS/FAIL
+just run
 
-# Run SMP smoke test (boots with -smp 2)
-just test-smp
+# SMP smoke test (boots with 2 CPUs — race conditions only show with >1 CPU)
+just run-smp
 
-# Run all tests
-just test-all
+# Stress test with 4 CPUs
+just run-smp4
+
+# Headless debug (serial only, logs to qemu.log)
+just run-debug-headless
 ```
 
 ## Contributing

@@ -72,7 +72,6 @@ RDX = Argument 3 (mr0 / arg0)
 R10 = Argument 4 (mr1 / arg1) — RCX is clobbered by SYSCALL
 R8  = Argument 5 (mr2 / arg2)
 R9  = Argument 6 (mr3 / arg3)
-[stack] = Argument 7 (used by some IPC syscalls, e.g., ReplyRecv)
 ```
 
 **Return:**
