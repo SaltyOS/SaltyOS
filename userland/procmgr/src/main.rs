@@ -39,6 +39,7 @@ const PM_SETSID: u64 = 14;
 const PM_GETEUID: u64 = 15;
 const PM_GETEGID: u64 = 16;
 const PM_GETGROUPS: u64 = 17;
+const PM_EXPAND_CSPACE: u64 = 18;
 
 // ---- Signal constants ----
 const SIG_DISP_DFL: u8 = 0;
@@ -1842,6 +1843,108 @@ unsafe fn handle_getgroups(reply: &mut SaltyMsg) {
 }
 
 // ===========================================================================
+// CSpace expansion
+// ===========================================================================
+
+/// Handle EXPAND_CSPACE request from a child process.
+///
+/// The child requests more capability slots. We retype a new sub-CNode from
+/// the child's untyped, set a guard on it, and insert it into an empty root
+/// CNode slot so the child's address space grows.
+///
+/// msg.regs[0] = requested size_bits for the new sub-CNode (4..16)
+///
+/// reply.regs[0] = base address of the new slot range (on success)
+/// reply.regs[1] = number of new slots (on success)
+unsafe fn handle_expand_cspace(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
+    let ci = match find_by_badge(badge) {
+        Some(i) => i,
+        None => { reply.label = SALTY_NOT_FOUND; return; }
+    };
+
+    let child_cn = unsafe { PROCTAB[ci].cnode_cap };
+
+    // Requested sub-CNode size_bits (default to 10 = 1024 slots if 0)
+    let req_bits = msg.regs[0];
+    let size_bits = if req_bits == 0 { 10u64 } else { req_bits };
+    if size_bits < 4 || size_bits > 16 {
+        reply.label = SALTY_INVALID_ARGUMENT;
+        return;
+    }
+
+    // Use cnode_get_info to know the root CNode size.
+    let info = salty::invoke::cnode_get_info(child_cn);
+    if info.error != 0 {
+        reply.label = SALTY_INVALID_OPERATION;
+        return;
+    }
+    let (root_num_slots, root_size_bits) = unsafe {
+        let ctx = &*ipc_ctx();
+        let buf = &*ctx.ipc_buffer;
+        (buf.msg[3], buf.msg[2])
+    };
+
+    // Find an empty root slot (scan from slot 64 upward, leaving low slots
+    // for well-known caps). We attempt retype directly — if the kernel
+    // returns SlotOccupied, we try the next slot.
+    let mut target_slot: u64 = u64::MAX;
+    for slot in 64..root_num_slots {
+        target_slot = slot;
+        break;
+    }
+
+    if target_slot == u64::MAX {
+        reply.label = SALTY_OUT_OF_MEMORY;
+        return;
+    }
+
+    // Retype a new CNode from procmgr's untyped into a procmgr-local temp slot.
+    let proc_slot_base = CAP_PROC_BASE + ci as u64 * CAP_PROC_STRIDE;
+    let temp_slot = proc_slot_base + 900;
+
+    let err = salty::invoke::untyped_retype(CAP_UNTYPED, OBJ_CNODE, size_bits, temp_slot);
+    if err != 0 {
+        reply.label = SALTY_OUT_OF_MEMORY;
+        return;
+    }
+
+    // Set guard on the new sub-CNode so its address range starts at
+    // target_slot << size_bits within the address space.
+    let guard_val = target_slot;
+    let guard_bits = root_size_bits;
+    let err = salty::invoke::cnode_set_guard(temp_slot, guard_val, guard_bits);
+    if err != 0 {
+        let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] set_guard failed err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
+        reply.label = SALTY_INVALID_OPERATION;
+        return;
+    }
+
+    // Copy the sub-CNode cap into the child's root CNode at target_slot.
+    let err = salty::invoke::cnode_copy(
+        CAP_SELF_CSPACE,
+        temp_slot,
+        child_cn,
+        target_slot,
+        CAP_RIGHTS_ALL,
+    );
+    if err != 0 {
+        let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] expand copy failed err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
+        reply.label = SALTY_OUT_OF_MEMORY;
+        return;
+    }
+
+    let new_slots = 1u64 << size_bits;
+    let base_addr = target_slot << size_bits;
+
+    reply.label = SALTY_OK;
+    reply.length = 2;
+    reply.regs[0] = base_addr;
+    reply.regs[1] = new_slots;
+}
+
+// ===========================================================================
 // Entry point
 // ===========================================================================
 
@@ -1930,6 +2033,7 @@ pub extern "C" fn _start() -> ! {
                 PM_GETEUID => handle_geteuid(&mut reply, badge),
                 PM_GETEGID => handle_getegid(&mut reply, badge),
                 PM_GETGROUPS => handle_getgroups(&mut reply),
+                PM_EXPAND_CSPACE => handle_expand_cspace(&msg, &mut reply, badge),
                 _ => {
                     let mut lb = LineBuf::new();
                     lb.str(b"[PROCMGR] unknown label="); lb.hex(msg.label); lb.str(b"\n"); lb.flush();

@@ -221,7 +221,7 @@ if mkimage.found() and build_boot and build_kernel
     command: [mkimage,
       '--build-dir', meson.project_build_root(),
       '--output', '@OUTPUT@',
-      '--size', '8',
+      '--size', '16',
     ] + initrd_args,
     build_by_default: true,
   )

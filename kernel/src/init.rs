@@ -97,11 +97,14 @@ static INIT_USER_CODE: [u8; 12] = [
 const INIT_CNODE_SIZE_BITS: u8 = 12;
 const INIT_CNODE_SLOTS: usize = 1 << (INIT_CNODE_SIZE_BITS as usize);
 
-/// Static backing for init's CNode: header + 4096 CapRef slots.
-/// Memory layout matches CNode header followed by trailing slots.
+/// Static backing for init's CNode: header + guard fields + 4096 CapRef slots.
+/// Memory layout matches CNode header followed by guard and trailing slots.
 #[repr(C, align(16))]
 struct InitCNodeStorage {
     header: KernelObject,
+    guard_bits: u8,
+    _pad: [u8; 3],
+    guard: u64,
     slots: [CapRef; INIT_CNODE_SLOTS],
 }
 
@@ -111,6 +114,9 @@ static mut INIT_SCHED_CTX: SchedContext = SchedContext::new();
 static mut INIT_VSPACE: MaybeUninit<VSpace> = MaybeUninit::uninit();
 static mut INIT_CNODE_STORAGE: InitCNodeStorage = InitCNodeStorage {
     header: KernelObject::new(ObjectType::CNode, INIT_CNODE_SIZE_BITS),
+    guard_bits: 0,
+    _pad: [0; 3],
+    guard: 0,
     slots: [CapRef::null(); INIT_CNODE_SLOTS],
 };
 static mut INIT_UNTYPEDS: [UntypedMemory; MAX_INIT_UNTYPEDS] = {

@@ -34,6 +34,8 @@ pub const CNODE_MUTATE: u64 = 0x13;
 pub const CNODE_DELETE: u64 = 0x14;
 pub const CNODE_REVOKE: u64 = 0x15;
 pub const CNODE_SAVE_CALLER: u64 = 0x16;
+pub const CNODE_SET_GUARD: u64 = 0x17;
+pub const CNODE_GET_INFO: u64 = 0x18;
 
 // Untyped operations (0x20)
 pub const UNTYPED_RETYPE: u64 = 0x20;
@@ -211,6 +213,7 @@ pub const POSIX_PM_SETSID: u64 = 14;
 pub const POSIX_PM_GETEUID: u64 = 15;
 pub const POSIX_PM_GETEGID: u64 = 16;
 pub const POSIX_PM_GETGROUPS: u64 = 17;
+pub const POSIX_PM_EXPAND_CSPACE: u64 = 18;
 
 // Nameserv protocol labels
 pub const POSIX_NS_REGISTER: u64 = 1;

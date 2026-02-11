@@ -5,7 +5,7 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 mod cdt;
-mod cnode;
+pub(crate) mod cnode;
 pub mod ioport;
 mod object;
 mod refcount;

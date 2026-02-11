@@ -165,10 +165,16 @@ pub(crate) fn lookup_capability(cap_ptr: u64) -> Result<&'static Capability, Sys
 
         // Get thread's CSpace (CNode)
         let cspace = &*(*current_tcb).cspace_root;
+        let depth = (*current_tcb).cspace_depth;
 
-        // Look up capability in CSpace
-        // CNode::get() returns Option<&Capability>
-        cspace.get(cap_ptr as usize).ok_or(SyscallError::InvalidCapability)
+        if depth == 0 {
+            // Flat mode: direct slot index lookup (backward compatible)
+            cspace.get(cap_ptr as usize).ok_or(SyscallError::InvalidCapability)
+        } else {
+            // Multi-level mode: walk CNode tree
+            crate::cap::cnode::resolve_address(cspace, cap_ptr, depth)
+                .map_err(|_| SyscallError::InvalidCapability)
+        }
     }
 }
 
@@ -867,6 +873,75 @@ fn syscall_invoke(
                 result
             }
         }
+        (ObjectType::CNode, 0x17) => {
+            // CNODE_SET_GUARD: arg0 = guard value, arg1 = guard_bits
+            // CNode must be empty (all slots null) to prevent invalidating existing addresses.
+            if !cap.has_right(CapRights::WRITE) {
+                return SyscallResult::err(SyscallError::InsufficientRights);
+            }
+            if arg1 > 64 {
+                return SyscallResult::err(SyscallError::InvalidArgument);
+            }
+            unsafe {
+                let irq = save_irq_disable();
+                CAP_LOCK.lock();
+                let cnode = &mut *(cap.object as *mut CNode);
+                // Verify all slots are empty
+                let num_slots = cnode.num_slots();
+                let mut all_empty = true;
+                for i in 0..num_slots {
+                    if !cnode.is_slot_empty(i) {
+                        all_empty = false;
+                        break;
+                    }
+                }
+                if !all_empty {
+                    CAP_LOCK.unlock();
+                    restore_irq(irq);
+                    return SyscallResult::err(SyscallError::InvalidOperation);
+                }
+                cnode.guard = arg0;
+                cnode.guard_bits = arg1 as u8;
+                CAP_LOCK.unlock();
+                restore_irq(irq);
+                SyscallResult::ok(0)
+            }
+        }
+        (ObjectType::CNode, 0x18) => {
+            // CNODE_GET_INFO: returns guard, guard_bits, size_bits, num_slots
+            // via return value (packed) and IPC buffer.
+            if !cap.has_right(CapRights::READ) {
+                return SyscallResult::err(SyscallError::InsufficientRights);
+            }
+            unsafe {
+                let irq = save_irq_disable();
+                CAP_LOCK.lock();
+                let cnode = &*(cap.object as *const CNode);
+                let guard = cnode.guard;
+                let guard_bits = cnode.guard_bits as u64;
+                let size_bits = cnode.header.size_bits as u64;
+                let num_slots = cnode.num_slots() as u64;
+                CAP_LOCK.unlock();
+                restore_irq(irq);
+
+                // Write info to IPC buffer: msg[0]=guard, msg[1]=guard_bits,
+                // msg[2]=size_bits, msg[3]=num_slots
+                let scheduler = crate::sched::scheduler::scheduler();
+                let current = scheduler.current();
+                if !current.is_null() {
+                    let buf = (*current).ipc_buffer;
+                    if buf != 0 {
+                        let ipc_buf = buf as *mut crate::ipc::IpcBuffer;
+                        (*ipc_buf).msg[0] = guard;
+                        (*ipc_buf).msg[1] = guard_bits;
+                        (*ipc_buf).msg[2] = size_bits;
+                        (*ipc_buf).msg[3] = num_slots;
+                    }
+                }
+                SyscallResult::ok(0)
+            }
+        }
+
         // Untyped operations
         (ObjectType::Untyped, 0x20) => {
             // UNTYPED_RETYPE: arg0 = new_type, arg1 = size_bits, arg2 = dest_offset
@@ -887,8 +962,8 @@ fn syscall_invoke(
             syscall_tcb_suspend(&cap)
         }
         (ObjectType::Tcb, 0x43) => {
-            // TCB_SET_SPACE: arg0 = cspace_cap_ptr, arg1 = vspace_cap_ptr
-            syscall_tcb_set_space(&cap, arg0, arg1)
+            // TCB_SET_SPACE: arg0 = cspace_cap_ptr, arg1 = vspace_cap_ptr, arg2 = cspace_depth
+            syscall_tcb_set_space(&cap, arg0, arg1, arg2)
         }
         (ObjectType::Tcb, 0x44) => {
             // TCB_SET_AFFINITY: arg0 = cpu_id
@@ -1421,10 +1496,12 @@ fn syscall_tcb_suspend(cap: &Capability) -> SyscallResult {
 /// Args:
 /// - cspace_cap_ptr: Capability pointer to a CNode
 /// - vspace_cap_ptr: Capability pointer to a VSpace
+/// - cspace_depth: CSpace address depth (0 = flat mode, non-zero = multi-level tree)
 fn syscall_tcb_set_space(
     cap: &Capability,
     cspace_cap_ptr: u64,
     vspace_cap_ptr: u64,
+    cspace_depth: u64,
 ) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::CONFIGURE) {
         return SyscallResult::err(e);
@@ -1447,6 +1524,11 @@ fn syscall_tcb_set_space(
         return SyscallResult::err(e);
     }
 
+    // Validate depth (0 = flat, or reasonable bit width)
+    if cspace_depth > 64 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
     // TCB mutation under SCHED_IPC_LOCK
     unsafe {
         let irq = save_irq_disable();
@@ -1454,6 +1536,7 @@ fn syscall_tcb_set_space(
         let tcb = &mut *(cap.object as *mut Tcb);
         tcb.cspace_root = cspace_cap.object as *mut CNode;
         tcb.vspace_root = vspace_cap.object as *mut VSpace;
+        tcb.cspace_depth = cspace_depth as u8;
         SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
     }
@@ -1805,13 +1888,25 @@ fn syscall_untyped_retype(
         }
 
         let cspace = &mut *(*current_tcb).cspace_root;
+        let depth = (*current_tcb).cspace_depth;
 
-        let cap_ref = match cspace.get_ref(cap_ptr as usize) {
-            Some(r) => r,
-            None => {
-                CAP_LOCK.unlock();
-                restore_irq(irq);
-                return SyscallResult::err(SyscallError::InvalidCapability);
+        let cap_ref = if depth == 0 {
+            match cspace.get_ref(cap_ptr as usize) {
+                Some(r) => r,
+                None => {
+                    CAP_LOCK.unlock();
+                    restore_irq(irq);
+                    return SyscallResult::err(SyscallError::InvalidCapability);
+                }
+            }
+        } else {
+            match crate::cap::cnode::resolve_address_slot(cspace, cap_ptr, depth) {
+                Ok(r) => r,
+                Err(_) => {
+                    CAP_LOCK.unlock();
+                    restore_irq(irq);
+                    return SyscallResult::err(SyscallError::InvalidCapability);
+                }
             }
         };
         let untyped_slot = cap_ref.slot;

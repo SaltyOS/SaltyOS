@@ -8,8 +8,8 @@
 use super::Capability;
 
 /// Maximum number of capability slots system-wide
-/// 64K slots = ~3.6MB total (32 bytes cap + 26 bytes meta per slot)
-pub const MAX_SLOTS: usize = 65536;
+/// 128K slots — sufficient for multi-level CNode trees with dynamic expansion
+pub const MAX_SLOTS: usize = 131072;
 
 /// Invalid slot marker (used as null pointer equivalent)
 pub const INVALID_SLOT: CapSlot = 0xFFFF_FFFF;

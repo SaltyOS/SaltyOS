@@ -73,6 +73,8 @@ pub struct Tcb {
     pub vspace_root: *mut VSpace,
     /// Capability space root
     pub cspace_root: *mut CNode,
+    /// CSpace address depth (0 = flat single-level, non-zero = multi-level tree)
+    pub cspace_depth: u8,
     /// IPC buffer address
     pub ipc_buffer: u64,
     /// Cached receive CNode slot for incoming cap transfers
@@ -201,6 +203,7 @@ impl Tcb {
             context: ThreadContext::empty(),
             vspace_root: core::ptr::null_mut(),
             cspace_root: core::ptr::null_mut(),
+            cspace_depth: 0,
             ipc_buffer: 0,
             ipc_receive_cnode: 0,
             ipc_receive_index: 0,

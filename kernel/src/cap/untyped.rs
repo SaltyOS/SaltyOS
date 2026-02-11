@@ -403,11 +403,11 @@ impl UntypedMemory {
         }
 
         // Align watermark to object size (critical for Frame/VSpace page alignment).
-        // CNode only needs CapRef alignment (4 bytes), not full slot-array size,
-        // since CNodes are never user-mapped.
+        // CNode needs struct alignment (8 bytes for u64 guard field), not full
+        // slot-array size, since CNodes are never user-mapped.
         if obj_size > 0 {
             let align = if new_type == ObjectType::CNode {
-                core::mem::align_of::<CapRef>()
+                core::mem::align_of::<crate::cap::CNode>()
             } else {
                 obj_size
             };

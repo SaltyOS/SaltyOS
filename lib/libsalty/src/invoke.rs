@@ -26,6 +26,10 @@ pub fn tcb_set_space(tcb: Cap, cspace: Cap, vspace: Cap) -> i32 {
     invoke(tcb, TCB_SET_SPACE, cspace, vspace, 0, 0).error as i32
 }
 
+pub fn tcb_set_space_with_depth(tcb: Cap, cspace: Cap, vspace: Cap, depth: u64) -> i32 {
+    invoke(tcb, TCB_SET_SPACE, cspace, vspace, depth, 0).error as i32
+}
+
 pub fn tcb_set_fault_handler(tcb: Cap, fault_ep: Cap) -> i32 {
     invoke(tcb, TCB_SET_FAULT_HANDLER, fault_ep, 0, 0, 0).error as i32
 }
@@ -136,6 +140,14 @@ pub fn cnode_delete(cnode: Cap, slot: u64) -> i32 {
 
 pub fn cnode_revoke(cnode: Cap, slot: u64) -> i32 {
     invoke(cnode, CNODE_REVOKE, slot, 0, 0, 0).error as i32
+}
+
+pub fn cnode_set_guard(cnode: Cap, guard: u64, guard_bits: u64) -> i32 {
+    invoke(cnode, CNODE_SET_GUARD, guard, guard_bits, 0, 0).error as i32
+}
+
+pub fn cnode_get_info(cnode: Cap) -> SaltyResult {
+    invoke(cnode, CNODE_GET_INFO, 0, 0, 0, 0)
 }
 
 pub fn irq_handler_ack(irq_handler: Cap) -> i32 {

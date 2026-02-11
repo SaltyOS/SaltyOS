@@ -67,6 +67,14 @@ pub unsafe extern "C" fn fastpath_call_rust(
         return FastpathResult::slowpath();
     }
 
+    // Bail if process uses multi-level CNode tree (fastpath only supports flat mode)
+    unsafe {
+        let current_tcb = crate::sched::scheduler::scheduler().current();
+        if !current_tcb.is_null() && (*current_tcb).cspace_depth != 0 {
+            return FastpathResult::slowpath();
+        }
+    }
+
     // Locked cap lookup: copy to stack under CAP_LOCK to prevent torn reads.
     // CAP_LOCK is released BEFORE SCHED_IPC_LOCK is acquired (no ordering change).
     let irq_cap = unsafe { save_irq_disable() };
@@ -246,6 +254,14 @@ pub unsafe extern "C" fn fastpath_reply_recv_rust(
     let length = msg_info::get_length(msg_info);
     if length > 4 {
         return FastpathResult::slowpath();
+    }
+
+    // Bail if process uses multi-level CNode tree (fastpath only supports flat mode)
+    unsafe {
+        let current_tcb = crate::sched::scheduler::scheduler().current();
+        if !current_tcb.is_null() && (*current_tcb).cspace_depth != 0 {
+            return FastpathResult::slowpath();
+        }
     }
 
     // Locked cap lookup: copy to stack under CAP_LOCK to prevent torn reads.
