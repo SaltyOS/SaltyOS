@@ -944,6 +944,11 @@ fn syscall_invoke(
             // VSPACE_COPY_PAGE: arg0 = src_vaddr, arg1 = dst_frame_cap_ptr
             syscall_vspace_copy_page(&cap, arg0, arg1)
         }
+        (ObjectType::VSpace, 0x55) => {
+            // VSPACE_MAP_DEVICE: arg0 = device_untyped_cap_ptr,
+            //                    arg1 = page_offset, arg2 = virt_addr, arg3 = flags_bits
+            syscall_vspace_map_device(&cap, arg0, arg1, arg2, arg3)
+        }
 
         // SchedContext operations
         (ObjectType::SchedContext, 0x30) => {
@@ -2231,6 +2236,71 @@ fn syscall_vspace_copy_page(
     SyscallResult::ok(0)
 }
 
+/// VSPACE_MAP_DEVICE: Map a single 4K page from a device untyped region.
+///
+/// Args:
+/// - device_untyped_cap_ptr: Capability pointer to a device Untyped object
+/// - page_offset: Byte offset within the untyped region (must be 4K-aligned)
+/// - virt_addr: Virtual address to map at (must be 4K-aligned)
+/// - flags_bits: Mapping flags (same format as VSPACE_MAP)
+fn syscall_vspace_map_device(
+    cap: &Capability,
+    device_untyped_cap_ptr: u64,
+    page_offset: u64,
+    virt_addr: u64,
+    flags_bits: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::MAP) {
+        return SyscallResult::err(e);
+    }
+
+    if page_offset & 0xFFF != 0 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    let dev_cap = match lookup_cap_locked(device_untyped_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(&dev_cap, ObjectType::Untyped, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let dev_ut = &*(dev_cap.object as *const UntypedMemory);
+        if !dev_ut.is_device {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+
+        let end = match page_offset.checked_add(0x1000) {
+            Some(v) => v,
+            None => return SyscallResult::err(SyscallError::OutOfRange),
+        };
+        if end > dev_ut.size_bytes() as u64 {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+
+        let phys = match dev_ut.phys_addr.checked_add(page_offset) {
+            Some(v) => v,
+            None => return SyscallResult::err(SyscallError::OutOfRange),
+        };
+
+        let vspace = &mut *(cap.object as *mut VSpace);
+        let flags = PageFlags {
+            writable: flags_bits & 1 != 0,
+            user: flags_bits & 2 != 0,
+            executable: flags_bits & 4 != 0,
+            cache_disable: flags_bits & 8 != 0,
+            write_through: flags_bits & 16 != 0,
+        };
+
+        match vspace.map(virt_addr, phys, flags) {
+            Ok(()) => SyscallResult::ok(0),
+            Err(e) => SyscallResult::err(syscall_error_from_vspace_error(e)),
+        }
+    }
+}
+
 /// Convert VSpaceError to syscall error
 fn syscall_error_from_vspace_error(err: VSpaceError) -> SyscallError {
     match err {
@@ -2474,4 +2544,3 @@ pub unsafe extern "C" fn syscall_handle_rust(
 ) -> SyscallResult {
     handle(syscall, cap_ptr, arg0, arg1, arg2, arg3, arg4)
 }
-

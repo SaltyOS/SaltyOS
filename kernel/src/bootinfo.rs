@@ -141,6 +141,12 @@ pub struct FramebufferInfo {
     pub height: u32,
     pub pitch: u32,
     pub bpp: u8,
+    pub red_pos: u8,
+    pub red_size: u8,
+    pub green_pos: u8,
+    pub green_size: u8,
+    pub blue_pos: u8,
+    pub blue_size: u8,
 }
 
 /// Parsed boot information (kernel-internal representation)
@@ -176,6 +182,12 @@ static mut PARSED_BOOT_INFO: ParsedBootInfo = ParsedBootInfo {
         height: 0,
         pitch: 0,
         bpp: 0,
+        red_pos: 0,
+        red_size: 0,
+        green_pos: 0,
+        green_size: 0,
+        blue_pos: 0,
+        blue_size: 0,
     },
 };
 
@@ -274,6 +286,12 @@ pub unsafe fn parse(ptr: *const u8) -> Option<&'static ParsedBootInfo> {
                             height: fb.height,
                             pitch: fb.pitch,
                             bpp: fb.bpp as u8,
+                            red_pos: fb.red_pos,
+                            red_size: fb.red_size,
+                            green_pos: fb.green_pos,
+                            green_size: fb.green_size,
+                            blue_pos: fb.blue_pos,
+                            blue_size: fb.blue_size,
                         };
                     }
                 }

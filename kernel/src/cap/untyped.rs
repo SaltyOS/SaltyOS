@@ -347,10 +347,11 @@ unsafe fn init_untyped_metadata(
     cap_slot: CapSlot,
     phys_addr: PhysAddr,
     size_bits: u8,
+    is_device: bool,
 ) -> *mut crate::cap::object::KernelObject {
     let untyped_ptr = unsafe { UNTYPED_METADATA[cap_slot as usize].as_mut_ptr() };
     unsafe {
-        untyped_ptr.write(UntypedMemory::new(phys_addr, size_bits, false));
+        untyped_ptr.write(UntypedMemory::new(phys_addr, size_bits, is_device));
     }
     untyped_ptr as *mut crate::cap::object::KernelObject
 }
@@ -369,6 +370,13 @@ impl UntypedMemory {
         dest_cnode: &mut crate::cap::cnode::CNode,
         dest_offset: usize,
     ) -> Result<(), CapError> {
+        // Device memory can only be retyped into Frame or Untyped (no zeroing)
+        if self.is_device
+            && !matches!(new_type, ObjectType::Frame | ObjectType::Untyped)
+        {
+            return Err(CapError::InvalidOperation);
+        }
+
         let obj_size = object_size(new_type, size_bits)?;
         let total_size = obj_size * num_objects;
 
@@ -425,7 +433,7 @@ impl UntypedMemory {
                 match new_type {
                     ObjectType::Frame => init_frame_metadata(cap_slot, obj_addr, size_bits),
                     ObjectType::VSpace => init_vspace_metadata(cap_slot, obj_addr),
-                    ObjectType::Untyped => init_untyped_metadata(cap_slot, obj_addr, size_bits),
+                    ObjectType::Untyped => init_untyped_metadata(cap_slot, obj_addr, size_bits, self.is_device),
                     _ => match init_object(new_type, obj_addr, size_bits) {
                         Ok(obj) => obj,
                         Err(e) => {

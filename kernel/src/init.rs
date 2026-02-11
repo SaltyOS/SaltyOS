@@ -66,6 +66,8 @@ const CAP_COM1_IRQ: usize = 9;
 const CAP_COM1_NOTIFICATION: usize = 10;
 /// Initrd info slots (vaddr and size passed as badge values)
 const CAP_INITRD_VSPACE: usize = 11;
+/// Framebuffer device untyped
+const CAP_FB_UNTYPED: usize = 13;
 const CAP_UNTYPED_START: usize = 16;
 
 /// Initrd mapping virtual address (16 MB)
@@ -121,6 +123,9 @@ static mut INIT_COM1_IOPORT: IoPortRange = IoPortRange::new(0x3F8, 8);
 static mut INIT_COM1_IRQ: IrqHandler = IrqHandler::new(4);
 static mut INIT_COM1_NOTIFICATION: Notification = Notification::new();
 
+/// Framebuffer device untyped (static, never freed)
+static mut INIT_FB_UNTYPED: UntypedMemory = UntypedMemory::new(0, 0, true);
+
 /// Bootstrap the first user-mode init task
 pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
     crate::serial_puts("[INIT] Creating user VSpace\n");
@@ -164,7 +169,7 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
     if let Some(info) = boot_info {
         if info.initrd_addr != 0 && info.initrd_size != 0 {
             map_initrd(info, &mut vspace);
-            map_bootinfo(&mut vspace);
+            map_bootinfo(&mut vspace, boot_info);
         }
     }
 
@@ -242,6 +247,14 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
     }
 }
 
+/// Compute ceil(log2(n)), returning the smallest k such that 2^k >= n.
+fn ceil_log2(n: u64) -> u8 {
+    if n <= 1 {
+        return 0;
+    }
+    64 - (n - 1).leading_zeros() as u8
+}
+
 /// Set up init task's CSpace with well-known capabilities
 fn setup_init_cspace(boot_info: Option<&ParsedBootInfo>) {
     crate::serial_puts("[INIT] Setting up CSpace\n");
@@ -301,6 +314,34 @@ fn setup_init_cspace(boot_info: Option<&ParsedBootInfo>) {
             &raw mut INIT_COM1_NOTIFICATION as *mut crate::cap::KernelObject,
             ObjectType::Notification,
         );
+
+        // Slot 13: Framebuffer device untyped (if framebuffer is available)
+        if let Some(info) = boot_info {
+            let fb = &info.framebuffer;
+            if fb.addr != 0 && fb.pitch > 0 && fb.height > 0 {
+                let fb_size = fb.height as u64 * fb.pitch as u64;
+                let size_bits = ceil_log2(fb_size);
+
+                let fb_ut = &raw mut INIT_FB_UNTYPED;
+                (*fb_ut) = UntypedMemory::new(fb.addr, size_bits, true);
+
+                insert_static_cap(
+                    cnode,
+                    CAP_FB_UNTYPED,
+                    fb_ut as *mut crate::cap::KernelObject,
+                    ObjectType::Untyped,
+                );
+
+                {
+                    let s = crate::SerialGuard::acquire();
+                    s.puts("[INIT] Framebuffer: device untyped phys=");
+                    s.hex(fb.addr);
+                    s.puts(" size=2^");
+                    s.dec(size_bits as u64);
+                    s.putc(b'\n');
+                }
+            }
+        }
 
         // Slots 16+: Untyped memory capabilities from usable memory regions
         if let Some(info) = boot_info {
@@ -535,12 +576,24 @@ static mut INITRD_USER_VADDR: u64 = 0;
 static mut INITRD_USER_SIZE: u64 = 0;
 
 /// Map a boot info page at BOOTINFO_VADDR containing initrd location
+/// and framebuffer metadata.
 ///
-/// Layout (all u64, little-endian):
-///   offset 0: magic (0x534C5459_424F4F54 = "SLTYBOOT")
-///   offset 8: initrd virtual address
-///   offset 16: initrd size in bytes
-fn map_bootinfo(vspace: &mut VSpace) {
+/// Layout (little-endian):
+///   offset  0: magic (u64) = 0x534C5459_424F4F54 "SLTYBOOT"
+///   offset  8: initrd virtual address (u64)
+///   offset 16: initrd size in bytes (u64)
+///   offset 24: fb_phys_addr (u64)
+///   offset 32: fb_width (u32)
+///   offset 36: fb_height (u32)
+///   offset 40: fb_pitch (u32)
+///   offset 44: fb_bpp (u8)
+///   offset 45: fb_red_pos (u8)
+///   offset 46: fb_red_size (u8)
+///   offset 47: fb_green_pos (u8)
+///   offset 48: fb_green_size (u8)
+///   offset 49: fb_blue_pos (u8)
+///   offset 50: fb_blue_size (u8)
+fn map_bootinfo(vspace: &mut VSpace, boot_info: Option<&ParsedBootInfo>) {
     let frame_phys = boot_unwrap!(alloc_frame(), "bootinfo frame alloc failed");
     let frame_virt = phys_to_virt(frame_phys) as *mut u8;
     unsafe {
@@ -549,6 +602,25 @@ fn map_bootinfo(vspace: &mut VSpace) {
         data.write(0x534C5459_424F4F54); // magic "SLTYBOOT"
         data.add(1).write(INITRD_USER_VADDR);
         data.add(2).write(INITRD_USER_SIZE);
+
+        // Write framebuffer metadata if available
+        if let Some(info) = boot_info {
+            let fb = &info.framebuffer;
+            if fb.addr != 0 {
+                data.add(3).write(fb.addr);
+                let p32 = frame_virt.add(32) as *mut u32;
+                p32.write(fb.width);
+                p32.add(1).write(fb.height);
+                p32.add(2).write(fb.pitch);
+                *frame_virt.add(44) = fb.bpp;
+                *frame_virt.add(45) = fb.red_pos;
+                *frame_virt.add(46) = fb.red_size;
+                *frame_virt.add(47) = fb.green_pos;
+                *frame_virt.add(48) = fb.green_size;
+                *frame_virt.add(49) = fb.blue_pos;
+                *frame_virt.add(50) = fb.blue_size;
+            }
+        }
     }
     vspace
         .map(BOOTINFO_VADDR, frame_phys, PageFlags::USER_RO)

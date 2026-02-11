@@ -309,7 +309,7 @@ impl ServiceManager {
     }
 
     /// Returns true if the given service should be spawned directly by init
-    /// (pre-procmgr services). These are: console, nameserv, vfs, procmgr.
+    /// (pre-procmgr services). These are: console, nameserv, vfs, procmgr, display.
     pub fn is_pre_procmgr(&self, idx: usize) -> bool {
         if idx >= self.count {
             return false;
@@ -319,6 +319,7 @@ impl ServiceManager {
             || bytes_eq(name, b"nameserv")
             || bytes_eq(name, b"vfs")
             || bytes_eq(name, b"procmgr")
+            || bytes_eq(name, b"display")
     }
 
     /// Log the boot order

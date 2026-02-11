@@ -1,0 +1,8 @@
+[Service]
+Name=display
+Binary=display.elf
+Type=simple
+Restart=no
+
+[Dependencies]
+After=console nameserv

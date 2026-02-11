@@ -91,6 +91,9 @@ _start:
     ; Build Stage2Info structure
     call    build_stage2_info
 
+    ; Set up VBE framebuffer (optional — silent fallback if VBE fails)
+    call    setup_vbe
+
     ; Now transition to protected mode (32-bit)
     mov     si, msg_prot_mode
     call    print16
@@ -368,6 +371,191 @@ load_stage3:
     ret
 
 ; ============================================================================
+; VBE Framebuffer Setup
+; ============================================================================
+; Sets up a linear framebuffer via VESA BIOS Extensions (VBE 2.0+).
+; Writes framebuffer info to Stage2Info at STAGE2_INFO_ADDR.
+; If VBE fails at any step, returns silently (serial-only boot).
+
+VBE_CTRL_INFO   equ 0x2000          ; VBE controller info buffer (512 bytes)
+VBE_MODE_INFO   equ 0x2200          ; VBE mode info buffer (256 bytes)
+
+setup_vbe:
+    push    es
+    push    fs
+    push    di
+    push    si
+    push    bx
+    push    cx
+    push    dx
+
+    ; --- Step 1: Get VBE controller info ---
+    xor     ax, ax
+    mov     es, ax
+    mov     di, VBE_CTRL_INFO
+
+    ; Write "VBE2" signature to request VBE 2.0+ info
+    mov     dword [es:di], 0x32454256       ; "VBE2" in little-endian
+    mov     ax, 0x4F00
+    int     0x10
+    cmp     ax, 0x004F
+    jne     .vbe_fail
+
+    ; --- Step 2: Get mode list pointer (far pointer at offset 0x0E) ---
+    mov     si, [es:VBE_CTRL_INFO + 0x0E]  ; offset
+    mov     ax, [es:VBE_CTRL_INFO + 0x10]  ; segment
+    mov     fs, ax                          ; FS:SI = mode list
+
+    ; --- Step 3: Enumerate modes ---
+    mov     word [vbe_best_mode], 0xFFFF
+
+.vbe_mode_loop:
+    mov     cx, [fs:si]                     ; Read mode number
+    cmp     cx, 0xFFFF                      ; End of list?
+    je      .vbe_mode_done
+    add     si, 2                           ; Advance to next mode
+
+    ; Get mode info for this mode
+    push    si
+    push    cx
+    xor     ax, ax
+    mov     es, ax
+    mov     ax, 0x4F01
+    mov     di, VBE_MODE_INFO
+    int     0x10
+    pop     cx
+    pop     si
+
+    cmp     ax, 0x004F
+    jne     .vbe_mode_loop                  ; Skip if query failed
+
+    ; Check ModeAttributes: bit 0 (supported) and bit 7 (LFB available)
+    xor     ax, ax
+    mov     es, ax
+    mov     ax, [es:VBE_MODE_INFO]
+    test    ax, 0x0081
+    jz      .vbe_mode_loop
+
+    ; Check BitsPerPixel == 32
+    cmp     byte [es:VBE_MODE_INFO + 0x19], 32
+    jne     .vbe_mode_loop
+
+    ; Check MemoryModel == 6 (Direct Color)
+    cmp     byte [es:VBE_MODE_INFO + 0x1B], 6
+    jne     .vbe_mode_loop
+
+    ; Check XResolution >= 1024
+    cmp     word [es:VBE_MODE_INFO + 0x12], 1024
+    jb      .vbe_mode_loop
+
+    ; Check YResolution >= 768
+    cmp     word [es:VBE_MODE_INFO + 0x14], 768
+    jb      .vbe_mode_loop
+
+    ; This mode qualifies — check if it's exactly 1024x768
+    cmp     word [es:VBE_MODE_INFO + 0x12], 1024
+    jne     .vbe_not_exact
+    cmp     word [es:VBE_MODE_INFO + 0x14], 768
+    jne     .vbe_not_exact
+
+    ; Exact 1024x768 match — use this mode
+    mov     [vbe_best_mode], cx
+    jmp     .vbe_mode_done
+
+.vbe_not_exact:
+    ; Accept as fallback if no match yet
+    cmp     word [vbe_best_mode], 0xFFFF
+    jne     .vbe_mode_loop
+    mov     [vbe_best_mode], cx
+    jmp     .vbe_mode_loop
+
+.vbe_mode_done:
+    cmp     word [vbe_best_mode], 0xFFFF
+    je      .vbe_fail                       ; No suitable mode found
+
+    ; --- Step 4: Re-query mode info for the chosen mode ---
+    mov     cx, [vbe_best_mode]
+    xor     ax, ax
+    mov     es, ax
+    mov     ax, 0x4F01
+    mov     di, VBE_MODE_INFO
+    int     0x10
+    cmp     ax, 0x004F
+    jne     .vbe_fail
+
+    ; --- Step 5: Set the VBE mode (bit 14 = use LFB) ---
+    mov     bx, [vbe_best_mode]
+    or      bx, 0x4000
+    mov     ax, 0x4F02
+    int     0x10
+    cmp     ax, 0x004F
+    jne     .vbe_fail
+
+    ; --- Step 6: Write framebuffer info to Stage2Info ---
+    xor     ax, ax
+    mov     es, ax
+    mov     di, STAGE2_INFO_ADDR
+
+    ; framebuffer_addr (offset 72, uint64) = PhysBasePtr (mode info offset 0x28)
+    mov     eax, [es:VBE_MODE_INFO + 0x28]
+    mov     [es:di + 72], eax
+    mov     dword [es:di + 76], 0
+
+    ; framebuffer_width (offset 80, uint32) = XResolution (mode info offset 0x12)
+    movzx   eax, word [es:VBE_MODE_INFO + 0x12]
+    mov     [es:di + 80], eax
+
+    ; framebuffer_height (offset 84, uint32) = YResolution (mode info offset 0x14)
+    movzx   eax, word [es:VBE_MODE_INFO + 0x14]
+    mov     [es:di + 84], eax
+
+    ; framebuffer_pitch (offset 88, uint32) = BytesPerScanLine (mode info offset 0x10)
+    movzx   eax, word [es:VBE_MODE_INFO + 0x10]
+    mov     [es:di + 88], eax
+
+    ; framebuffer_bpp (offset 92, uint32) = BitsPerPixel (mode info offset 0x19)
+    movzx   eax, byte [es:VBE_MODE_INFO + 0x19]
+    mov     [es:di + 92], eax
+
+    ; Pixel format fields (VBE mode info):
+    ; 0x1F RedMaskSize, 0x20 RedFieldPosition,
+    ; 0x21 GreenMaskSize, 0x22 GreenFieldPosition,
+    ; 0x23 BlueMaskSize, 0x24 BlueFieldPosition.
+    mov     al, [es:VBE_MODE_INFO + 0x20]  ; RedFieldPosition
+    mov     [es:di + 136], al
+    mov     al, [es:VBE_MODE_INFO + 0x1F]  ; RedMaskSize
+    mov     [es:di + 137], al
+    mov     al, [es:VBE_MODE_INFO + 0x22]  ; GreenFieldPosition
+    mov     [es:di + 138], al
+    mov     al, [es:VBE_MODE_INFO + 0x21]  ; GreenMaskSize
+    mov     [es:di + 139], al
+    mov     al, [es:VBE_MODE_INFO + 0x24]  ; BlueFieldPosition
+    mov     [es:di + 140], al
+    mov     al, [es:VBE_MODE_INFO + 0x23]  ; BlueMaskSize
+    mov     [es:di + 141], al
+
+    ; Set STAGE2_FLAG_HAS_FRAMEBUFFER in flags (offset 12)
+    or      dword [es:di + 12], 0x08
+
+    mov     si, msg_vbe_ok
+    call    print16
+    jmp     .vbe_done
+
+.vbe_fail:
+    mov     si, msg_vbe_fail
+    call    print16
+
+.vbe_done:
+    pop     dx
+    pop     cx
+    pop     bx
+    pop     si
+    pop     di
+    pop     fs
+    pop     es
+    ret
+
+; ============================================================================
 ; Build Stage2Info Structure
 ; ============================================================================
 
@@ -513,7 +701,11 @@ msg_e820_ok:    db '  E820: OK', 13, 10, 0
 msg_e820_fail:  db '  E820: FAIL', 13, 10, 0
 msg_stage3_ok:  db '  Stage 3: OK', 13, 10, 0
 msg_stage3_fail: db '  Stage 3: FAIL', 13, 10, 0
+msg_vbe_ok:     db '  VBE: OK', 13, 10, 0
+msg_vbe_fail:   db '  VBE: N/A', 13, 10, 0
 msg_prot_mode:  db '  -> Protected Mode', 13, 10, 0
+
+vbe_best_mode:  dw 0xFFFF
 
 ; Disk Address Packet
 align 4

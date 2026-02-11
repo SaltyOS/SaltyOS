@@ -14,6 +14,7 @@ pub mod consts;
 pub mod cpio;
 pub mod elf_dynamic;
 pub mod elf_loader;
+pub mod framebuffer;
 pub mod invoke;
 pub mod ipc;
 pub mod posix;

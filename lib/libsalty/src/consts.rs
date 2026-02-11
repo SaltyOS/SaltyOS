@@ -58,6 +58,7 @@ pub const VSPACE_UNMAP: u64 = 0x51;
 pub const VSPACE_MAP_PT: u64 = 0x52;
 pub const VSPACE_WALK: u64 = 0x53;
 pub const VSPACE_COPY_PAGE: u64 = 0x54;
+pub const VSPACE_MAP_DEVICE: u64 = 0x55;
 
 // IRQ operations (0x60-0x63)
 pub const IRQ_HANDLER_ACK: u64 = 0x61;
@@ -89,6 +90,7 @@ pub const CAP_COM1_IRQ: u64 = 9;
 pub const CAP_COM1_NTFN: u64 = 10;
 pub const CAP_CONSOLE_EP: u64 = 11;
 pub const CAP_READINESS_NTFN: u64 = 12;
+pub const CAP_FB_UNTYPED: u64 = 13;
 pub const CAP_UNTYPED_START: u64 = 16;
 
 // Addresses
@@ -116,6 +118,8 @@ pub const SALTY_WOULD_BLOCK: u64 = 9;
 pub const VSPACE_FLAG_WRITABLE: u64 = 1 << 0;
 pub const VSPACE_FLAG_USER: u64 = 1 << 1;
 pub const VSPACE_FLAG_EXECUTABLE: u64 = 1 << 2;
+pub const VSPACE_FLAG_CACHE_DISABLE: u64 = 1 << 3;
+pub const VSPACE_FLAG_WRITE_THROUGH: u64 = 1 << 4;
 
 // Object types for Untyped_Retype
 pub const OBJ_UNTYPED: u64 = 1;

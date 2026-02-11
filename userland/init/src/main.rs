@@ -410,6 +410,10 @@ fn build_extras(name: &[u8], console_ep: Cap, ns_ep: Cap, vfs_ep: Cap) -> [Extra
             extras[1] = ExtraCapCopy { src: vfs_ep, dst: 9 };
         }
     }
+    // Display server gets framebuffer device untyped
+    if bytes_eq(name, b"display") {
+        extras[0] = ExtraCapCopy { src: CAP_FB_UNTYPED, dst: 13 };
+    }
 
     extras
 }

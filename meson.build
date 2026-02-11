@@ -171,12 +171,14 @@ if build_userland and mkcpio.found()
   svc_nameserv = files('userland/services/nameserv.service')
   svc_vfs = files('userland/services/vfs.service')
   svc_procmgr = files('userland/services/procmgr.service')
+  svc_display = files('userland/services/display.service')
   svc_test_runner = files('userland/services/test_runner.service')
 
   initrd = custom_target('initrd',
     input: [init_elf, console_elf, ld_salty_so, libsalty_so, libc_so,
-            nameserv_elf, procmgr_elf, vfs_elf, test_runner_elf,
-            svc_console, svc_nameserv, svc_vfs, svc_procmgr, svc_test_runner],
+            nameserv_elf, procmgr_elf, vfs_elf, display_elf, test_runner_elf,
+            svc_console, svc_nameserv, svc_vfs, svc_procmgr, svc_display,
+            svc_test_runner],
     output: 'initrd.cpio',
     command: [mkcpio,
       '--output', '@OUTPUT@',
@@ -188,12 +190,14 @@ if build_userland and mkcpio.found()
       'nameserv.elf=@INPUT5@',
       'procmgr.elf=@INPUT6@',
       'vfs.elf=@INPUT7@',
-      'test_runner.elf=@INPUT8@',
-      'services/console.service=@INPUT9@',
-      'services/nameserv.service=@INPUT10@',
-      'services/vfs.service=@INPUT11@',
-      'services/procmgr.service=@INPUT12@',
-      'services/test_runner.service=@INPUT13@',
+      'display.elf=@INPUT8@',
+      'test_runner.elf=@INPUT9@',
+      'services/console.service=@INPUT10@',
+      'services/nameserv.service=@INPUT11@',
+      'services/vfs.service=@INPUT12@',
+      'services/procmgr.service=@INPUT13@',
+      'services/display.service=@INPUT14@',
+      'services/test_runner.service=@INPUT15@',
     ],
     build_by_default: true,
   )

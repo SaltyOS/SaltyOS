@@ -74,6 +74,24 @@ pub fn vspace_copy_page(src_vspace: Cap, src_vaddr: u64, dst_frame: Cap) -> i32 
     invoke(src_vspace, VSPACE_COPY_PAGE, src_vaddr, dst_frame, 0, 0).error as i32
 }
 
+pub fn vspace_map_device(
+    vspace: Cap,
+    device_untyped: Cap,
+    page_offset: u64,
+    vaddr: u64,
+    flags: u64,
+) -> i32 {
+    invoke(
+        vspace,
+        VSPACE_MAP_DEVICE,
+        device_untyped,
+        page_offset,
+        vaddr,
+        flags,
+    )
+    .error as i32
+}
+
 pub fn cnode_copy(
     src_cnode: Cap,
     src_slot: u64,
