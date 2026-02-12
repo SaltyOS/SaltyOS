@@ -91,6 +91,7 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         case AT_SALTY_INITRD:    g_rtld.initrd_base = p[1]; break;
         case AT_SALTY_INITRD_SZ: g_rtld.initrd_size = p[1]; break;
         case AT_SALTY_FRAME_SLOT:g_rtld.next_frame_slot = p[1]; break;
+        case AT_SALTY_SHARED_LIB_BASE: g_rtld.shared_lib_base = p[1]; break;
         }
     }
 

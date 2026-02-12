@@ -216,6 +216,15 @@ int load_shared_library(struct rtld_state *st, const char *name,
     struct rtld_lib_page pages[RTLD_MAX_LIB_PAGES];
     size_t page_count = 0;
 
+    /* Check if this library was pre-mapped by procmgr */
+    int is_premapped = (st->shared_lib_base != 0
+                        && load_addr == st->shared_lib_base);
+    if (is_premapped) {
+        rtld_puts("[RTLD] Using pre-mapped shared pages for ");
+        rtld_puts(name);
+        rtld_puts("\n");
+    }
+
     /* Load each PT_LOAD segment */
     for (int i = 0; i < ehdr->e_phnum; i++) {
         Elf64_Phdr *ph = &phdrs[i];
@@ -231,6 +240,19 @@ int load_shared_library(struct rtld_state *st, const char *name,
           rtld_lb_str(&lb, "[RTLD]   LOAD ");
           rtld_lb_hex(&lb, seg_start); rtld_lb_str(&lb, "-");
           rtld_lb_hex(&lb, seg_end); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
+
+        /* RO segment already mapped by procmgr — record pages as device-mapped */
+        if (is_premapped && (ph->p_flags & PF_W) == 0) {
+            for (uint64_t page = seg_start; page < seg_end; page += PAGE_SIZE) {
+                if (page_count >= RTLD_MAX_LIB_PAGES) return -6;
+                pages[page_count].vaddr = page;
+                pages[page_count].frame_slot = 0;
+                pages[page_count].flags = flags;
+                pages[page_count].is_device = 1;
+                page_count++;
+            }
+            continue;
+        }
 
         /* Map pages for this segment */
         for (uint64_t page = seg_start; page < seg_end; page += PAGE_SIZE) {

@@ -105,6 +105,7 @@ const AT_SALTY_SCRATCH: u64 = 0x1002;
 const AT_SALTY_INITRD: u64 = 0x1003;
 const AT_SALTY_INITRD_SZ: u64 = 0x1004;
 const AT_SALTY_FRAME_SLOT: u64 = 0x1005;
+const AT_SALTY_SHARED_LIB_BASE: u64 = 0x1006;
 
 // ---- x86_64 page-table bits ----
 const X86_PTE_WRITABLE: u64 = 1 << 1;
@@ -1394,7 +1395,14 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             }
         }
 
-        // 7. Entry point and dynamic stack
+        // 7. Map shared library RO frames if available
+        let (shared_lib_base, _shared_lib_ro_pages) = if is_dynamic {
+            spawn_tx::map_shared_lib_to_vspace(proc_vs, rtld_result.base)
+        } else {
+            (0, 0)
+        };
+
+        // 8. Entry point and dynamic stack
         let mut new_entry = elf_result.entry;
         let mut new_rsp = CHILD_STACK_TOP;
 
@@ -1402,6 +1410,7 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             match spawn_tx::write_dynamic_stack(
                 elf_entry.data, elf_entry.data_len,
                 stk_frame, &elf_result, &rtld_result, initrd_size,
+                shared_lib_base,
             ) {
                 Ok(rsp) => { new_rsp = rsp; new_entry = rtld_result.entry; }
                 Err(()) => {
@@ -1412,7 +1421,7 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             }
         }
 
-        // 8. Suspend and reconfigure
+        // 9. Suspend and reconfigure
         salty::invoke::tcb_suspend(PROCTAB[idx].tcb_cap);
 
         // POSIX: exec resets caught signals to SIG_DFL
@@ -1705,6 +1714,9 @@ pub extern "C" fn _start() -> ! {
             CAP_UNTYPED_START,
             UT_MIRROR_COUNT as usize,
         );
+
+        // Pre-load shared library RO pages into frame cache
+        spawn_tx::init_shared_lib_cache(&mut *(&raw mut ALLOCATOR));
 
         // Register with name server
         if CAP_NAMESERV_EP != 0 {

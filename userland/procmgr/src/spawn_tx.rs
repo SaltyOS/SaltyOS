@@ -47,6 +47,7 @@ const SALTY_BUSY: u64 = salty::SALTY_BUSY;
 const SALTY_INVALID_ARGUMENT: u64 = salty::SALTY_INVALID_ARGUMENT;
 const VSPACE_FLAG_WRITABLE: u64 = salty::VSPACE_FLAG_WRITABLE;
 const VSPACE_FLAG_USER: u64 = salty::VSPACE_FLAG_USER;
+const VSPACE_FLAG_EXECUTABLE: u64 = salty::VSPACE_FLAG_EXECUTABLE;
 const CAP_RIGHTS_ALL: u64 = salty::CAP_RIGHTS_ALL;
 const INITRD_COPY_RIGHTS: u64 = (1 << 0) | (1 << 2) | (1 << 3);
 
@@ -93,12 +94,44 @@ const AT_SALTY_SCRATCH: u64 = super::AT_SALTY_SCRATCH;
 const AT_SALTY_INITRD: u64 = super::AT_SALTY_INITRD;
 const AT_SALTY_INITRD_SZ: u64 = super::AT_SALTY_INITRD_SZ;
 const AT_SALTY_FRAME_SLOT: u64 = super::AT_SALTY_FRAME_SLOT;
+const AT_SALTY_SHARED_LIB_BASE: u64 = super::AT_SALTY_SHARED_LIB_BASE;
 const UT_MIRROR_COUNT: Cap = super::UT_MIRROR_COUNT;
 const CHILD_UT_BITS_DEFAULT: u8 = super::CHILD_UT_BITS_DEFAULT;
 const READY_WAIT_YIELDS_STATIC: usize = super::READY_WAIT_YIELDS_STATIC;
 const READY_WAIT_YIELDS_DYNAMIC: usize = super::READY_WAIT_YIELDS_DYNAMIC;
 
 const PM_SPAWN_FLAG_WAIT_READY: u64 = super::PM_SPAWN_FLAG_WAIT_READY;
+
+// ===========================================================================
+// Shared library physical frame cache
+// ===========================================================================
+
+const MAX_SHARED_LIB_PAGES: usize = 128;
+
+#[derive(Clone, Copy)]
+struct SharedPage {
+    vaddr_offset: u64,
+    frame_cap: Cap,
+    flags: u64,
+}
+
+struct SharedLibCache {
+    initialized: bool,
+    page_count: usize,
+    pages: [SharedPage; MAX_SHARED_LIB_PAGES],
+}
+
+impl SharedLibCache {
+    const fn new() -> Self {
+        SharedLibCache {
+            initialized: false,
+            page_count: 0,
+            pages: [SharedPage { vaddr_offset: 0, frame_cap: 0, flags: 0 }; MAX_SHARED_LIB_PAGES],
+        }
+    }
+}
+
+static mut SHARED_LIB_CACHE: SharedLibCache = SharedLibCache::new();
 
 // ===========================================================================
 // Spawn plan
@@ -278,6 +311,210 @@ unsafe fn compute_lib_window_pages(
 }
 
 // ===========================================================================
+// Shared library frame cache: init and map
+// ===========================================================================
+
+/// Pre-load libsalty.so's read-only segments into a permanent frame cache.
+/// Called once at procmgr startup. On failure, cache stays uninitialized and
+/// all spawns fall through to the existing per-process path.
+pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
+    unsafe {
+        let cache = &mut *(&raw mut SHARED_LIB_CACHE);
+
+        let initrd = super::INITRD_VADDR as *const u8;
+        let initrd_size = super::read_boot_info_initrd_size();
+
+        // Find libsalty.so in initrd
+        let mut entry = CpioEntry::zeroed();
+        let name = b"libsalty.so";
+        if salty::cpio::cpio_find_file(
+            initrd, initrd_size, name.as_ptr(), 10, &raw mut entry,
+        ) == 0
+        {
+            puts(b"[PROCMGR] shared lib cache: libsalty.so not found\n");
+            return;
+        }
+
+        // Validate ELF header
+        if entry.data_len < core::mem::size_of::<Elf64Ehdr>() {
+            puts(b"[PROCMGR] shared lib cache: ELF too small\n");
+            return;
+        }
+        let ehdr = &*(entry.data as *const Elf64Ehdr);
+        if ehdr.e_ident[0] != 0x7F || ehdr.e_ident[1] != b'E'
+            || ehdr.e_ident[2] != b'L' || ehdr.e_ident[3] != b'F'
+        {
+            puts(b"[PROCMGR] shared lib cache: bad ELF magic\n");
+            return;
+        }
+        if ehdr.e_type != salty::ET_DYN {
+            puts(b"[PROCMGR] shared lib cache: not ET_DYN\n");
+            return;
+        }
+
+        // Find min_vaddr across PT_LOAD segments
+        let phdrs = entry.data.add(ehdr.e_phoff as usize) as *const Elf64Phdr;
+        let mut min_vaddr: u64 = u64::MAX;
+        for i in 0..ehdr.e_phnum as usize {
+            let ph = &*phdrs.add(i);
+            if ph.p_type == salty::PT_LOAD && ph.p_vaddr < min_vaddr {
+                min_vaddr = ph.p_vaddr;
+            }
+        }
+        if min_vaddr == u64::MAX {
+            puts(b"[PROCMGR] shared lib cache: no PT_LOAD segments\n");
+            return;
+        }
+
+        // Cache each page of each read-only PT_LOAD segment
+        let mut page_count: usize = 0;
+
+        for i in 0..ehdr.e_phnum as usize {
+            let ph = &*phdrs.add(i);
+            if ph.p_type != salty::PT_LOAD {
+                continue;
+            }
+            // Skip writable segments — those are per-process
+            if (ph.p_flags & salty::PF_W) != 0 {
+                continue;
+            }
+
+            let seg_vaddr = ph.p_vaddr;
+            let seg_start = seg_vaddr & !0xFFFu64;
+            let seg_end = (seg_vaddr + ph.p_memsz + 0xFFF) & !0xFFFu64;
+
+            let mut flags = VSPACE_FLAG_USER;
+            if (ph.p_flags & salty::PF_X) != 0 {
+                flags |= VSPACE_FLAG_EXECUTABLE;
+            }
+
+            let mut page = seg_start;
+            while page < seg_end {
+                if page_count >= MAX_SHARED_LIB_PAGES {
+                    puts(b"[PROCMGR] shared lib cache: too many pages\n");
+                    break;
+                }
+
+                // Allocate a permanent frame cap slot
+                let slot = match alloc.alloc_single_slot() {
+                    Some(s) => s,
+                    None => {
+                        puts(b"[PROCMGR] shared lib cache: slot alloc failed\n");
+                        return;
+                    }
+                };
+
+                // Retype frame
+                let err = alloc.retype_any(OBJ_FRAME, 0, slot);
+                if err != 0 {
+                    puts(b"[PROCMGR] shared lib cache: frame retype failed\n");
+                    alloc.free_single_slot(slot);
+                    return;
+                }
+
+                // Scratch-map to fill frame contents
+                let err = salty::invoke::vspace_map(
+                    CAP_SELF_VSPACE, slot, PROCMGR_SCRATCH_VADDR,
+                    VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+                );
+                if err != 0 {
+                    puts(b"[PROCMGR] shared lib cache: scratch map failed\n");
+                    return;
+                }
+
+                // Zero the page
+                let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
+                for j in 0..4096usize {
+                    core::ptr::write_volatile(scratch.add(j), 0);
+                }
+
+                // Copy file data for this page
+                let file_start = seg_vaddr;
+                let file_end = seg_vaddr + ph.p_filesz;
+                let copy_start = if page > file_start { page } else { file_start };
+                let copy_end = if page + 4096 < file_end { page + 4096 } else { file_end };
+
+                if copy_start < copy_end {
+                    let data_offset = (copy_start - seg_vaddr + ph.p_offset) as usize;
+                    let page_offset = (copy_start - page) as usize;
+                    let copy_len = (copy_end - copy_start) as usize;
+
+                    if data_offset + copy_len <= entry.data_len {
+                        let src = entry.data.add(data_offset);
+                        let dst = scratch.add(page_offset);
+                        for j in 0..copy_len {
+                            core::ptr::write_volatile(dst.add(j), *src.add(j));
+                        }
+                    }
+                }
+
+                // Unmap scratch
+                salty::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
+
+                // Store in cache
+                cache.pages[page_count] = SharedPage {
+                    vaddr_offset: page - min_vaddr,
+                    frame_cap: slot,
+                    flags,
+                };
+                page_count += 1;
+                page += 4096;
+            }
+        }
+
+        cache.page_count = page_count;
+        cache.initialized = true;
+
+        let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] shared lib cache: ");
+        lb.hex(page_count as u64);
+        lb.str(b" RO pages cached\n");
+        lb.flush();
+    }
+}
+
+/// Map cached shared library RO frames into a child VSpace.
+/// Returns (lib_load_addr, ro_page_count) on success, (0, 0) on failure.
+pub(crate) unsafe fn map_shared_lib_to_vspace(
+    child_vs: Cap,
+    rtld_base: u64,
+) -> (u64, u64) {
+    unsafe {
+        let cache = &*(&raw const SHARED_LIB_CACHE);
+        if !cache.initialized || cache.page_count == 0 {
+            return (0, 0);
+        }
+
+        let lib_load_addr = rtld_base + 0x80000;
+
+        for i in 0..cache.page_count {
+            let page = &cache.pages[i];
+            let vaddr = lib_load_addr + page.vaddr_offset;
+            let err = salty::invoke::vspace_map(
+                child_vs, page.frame_cap, vaddr, page.flags,
+            );
+            if err != 0 {
+                // Rollback already-mapped pages
+                let mut lb = LineBuf::new();
+                lb.str(b"[PROCMGR] shared lib map failed at ");
+                lb.hex(vaddr);
+                lb.str(b" err=");
+                lb.hex(err as u64);
+                lb.str(b"\n");
+                lb.flush();
+                for j in 0..i {
+                    let prev_vaddr = lib_load_addr + cache.pages[j].vaddr_offset;
+                    salty::invoke::vspace_unmap(child_vs, prev_vaddr);
+                }
+                return (0, 0);
+            }
+        }
+
+        (lib_load_addr, cache.page_count as u64)
+    }
+}
+
+// ===========================================================================
 // Shared helpers: load_rtld and write_dynamic_stack
 // ===========================================================================
 
@@ -336,6 +573,8 @@ pub(crate) unsafe fn load_rtld(
 /// Build the auxv/dynamic stack for a dynamically-linked child.
 /// `initrd_window_size` is the size of the initrd window visible to the child
 /// (may be less than full archive if using selective mapping).
+/// `shared_lib_base` is the load address of pre-mapped shared library RO pages
+/// (0 if not using shared lib cache).
 pub(crate) unsafe fn write_dynamic_stack(
     elf_data: *const u8,
     elf_data_len: usize,
@@ -343,6 +582,7 @@ pub(crate) unsafe fn write_dynamic_stack(
     elf_result: &ElfLoadResult,
     rtld_result: &ElfLoadResult,
     initrd_window_size: usize,
+    shared_lib_base: u64,
 ) -> Result<u64, ()> {
     unsafe {
         let err = salty::invoke::vspace_map(
@@ -366,7 +606,7 @@ pub(crate) unsafe fn write_dynamic_stack(
             return Err(());
         }
 
-        let auxv_entries: u64 = 13;
+        let auxv_entries: u64 = if shared_lib_base != 0 { 14 } else { 13 };
         let stack_frame_size: u64 = 3 * 8 + auxv_entries * 2 * 8 + 8;
 
         let stack_base = (PROCMGR_SCRATCH_VADDR + 4096 - stack_frame_size) as *mut u64;
@@ -390,6 +630,9 @@ pub(crate) unsafe fn write_dynamic_stack(
         w(AT_SALTY_INITRD);     w(CHILD_INITRD_VADDR);
         w(AT_SALTY_INITRD_SZ);  w(initrd_window_size as u64);
         w(AT_SALTY_FRAME_SLOT); w(CHILD_RTLD_FRAME_SLOT_START);
+        if shared_lib_base != 0 {
+            w(AT_SALTY_SHARED_LIB_BASE); w(shared_lib_base);
+        }
         w(AT_NULL);     w(0);
         w(0); // padding
 
@@ -771,6 +1014,13 @@ pub unsafe fn handle_spawn_tx(
             return;
         }
 
+        // ---- Map shared library RO frames if available ----
+        let (shared_lib_base, _shared_lib_ro_pages) = if plan.is_dynamic {
+            map_shared_lib_to_vspace(child_vs, rtld_result.base)
+        } else {
+            (0, 0)
+        };
+
         let mut child_entry_rip = elf_result.entry;
         let mut child_rsp = CHILD_STACK_TOP;
 
@@ -784,6 +1034,7 @@ pub unsafe fn handle_spawn_tx(
                 &elf_result,
                 &rtld_result,
                 initrd_window_size,
+                shared_lib_base,
             ) {
                 Ok(rsp) => {
                     child_rsp = rsp;

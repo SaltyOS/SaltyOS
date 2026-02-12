@@ -397,6 +397,7 @@ typedef struct {
 #define AT_SALTY_INITRD      0x1003
 #define AT_SALTY_INITRD_SZ   0x1004
 #define AT_SALTY_FRAME_SLOT  0x1005
+#define AT_SALTY_SHARED_LIB_BASE  0x1006
 
 /* ============================================================
  * CPIO parser (inline, self-contained)
@@ -537,6 +538,9 @@ struct rtld_state {
     uint64_t exe_phent;
     uint64_t exe_phnum;
     uint64_t rtld_base;
+
+    /* Shared library pre-mapping (0 if not pre-mapped) */
+    uint64_t shared_lib_base;
 };
 
 extern struct rtld_state g_rtld;
