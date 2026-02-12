@@ -2,7 +2,6 @@
 Name=test_runner
 Binary=test_runner.elf
 Type=simple
-MemoryKB=64
 Restart=no
 
 [Dependencies]

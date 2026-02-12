@@ -2,7 +2,6 @@
 Name=console
 Binary=console.elf
 Type=simple
-MemoryKB=64
 Restart=always
 
 [Dependencies]

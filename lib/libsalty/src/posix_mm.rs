@@ -23,6 +23,89 @@ static mut MM: PosixMmState = PosixMmState {
     initialized: 0,
 };
 
+const MM_UT_SCAN_END_FALLBACK: Cap = 200;
+static mut MM_NEXT_UT_HINT: Cap = CAP_UNTYPED_START;
+
+fn untyped_scan_end() -> Cap {
+    let mut end = MM_UT_SCAN_END_FALLBACK;
+    let info = invoke::cnode_get_info(CAP_SELF_CSPACE);
+    if info.error == 0 {
+        unsafe {
+            let ctx = &raw const crate::__salty_ipc_ctx;
+            if !(*ctx).ipc_buffer.is_null() {
+                let num_slots = (*(*ctx).ipc_buffer).msg[3];
+                if num_slots > CAP_UNTYPED_START && num_slots < end {
+                    end = num_slots;
+                }
+            }
+        }
+    }
+
+    if end <= CAP_UNTYPED_START {
+        CAP_UNTYPED_START + 1
+    } else {
+        end
+    }
+}
+
+unsafe fn try_retype_frame_any_untyped(frame_slot: Cap) -> i32 {
+    unsafe {
+        let mut err = invoke::untyped_retype(MM.untyped, OBJ_FRAME, 0, frame_slot);
+        if err == 0 {
+            MM_NEXT_UT_HINT = MM.untyped;
+            return 0;
+        }
+
+        let start = CAP_UNTYPED_START;
+        let end = untyped_scan_end();
+
+        let mut first = MM_NEXT_UT_HINT;
+        if first < start || first >= end {
+            first = start;
+        }
+
+        let mut best_err = err;
+
+        for ut in first..end {
+            if ut == MM.untyped {
+                continue;
+            }
+            err = invoke::untyped_retype(ut, OBJ_FRAME, 0, frame_slot);
+            if err == 0 {
+                MM.untyped = ut;
+                MM_NEXT_UT_HINT = ut;
+                return 0;
+            }
+            if err != SALTY_INVALID_CAPABILITY as i32
+                && err != SALTY_INVALID_OPERATION as i32
+                && err != SALTY_NOT_FOUND as i32
+            {
+                best_err = err;
+            }
+        }
+
+        for ut in start..first {
+            if ut == MM.untyped {
+                continue;
+            }
+            err = invoke::untyped_retype(ut, OBJ_FRAME, 0, frame_slot);
+            if err == 0 {
+                MM.untyped = ut;
+                MM_NEXT_UT_HINT = ut;
+                return 0;
+            }
+            if err != SALTY_INVALID_CAPABILITY as i32
+                && err != SALTY_INVALID_OPERATION as i32
+                && err != SALTY_NOT_FOUND as i32
+            {
+                best_err = err;
+            }
+        }
+
+        best_err
+    }
+}
+
 pub unsafe fn posix_mm_init(
     untyped: Cap,
     vspace: Cap,
@@ -37,6 +120,7 @@ pub unsafe fn posix_mm_init(
         MM.cspace = cspace;
         MM.next_frame_slot = first_frame_slot;
         MM.max_frame_slot = first_frame_slot + MM_MAX_FRAME_SLOTS;
+        MM_NEXT_UT_HINT = CAP_UNTYPED_START;
         MM.heap_base = heap_base;
         MM.heap_current = heap_base;
         MM.mmap_base = mmap_base;
@@ -50,16 +134,18 @@ pub unsafe fn posix_mm_init(
 
 unsafe fn alloc_frame() -> Cap {
     unsafe {
-        if MM.next_frame_slot >= MM.max_frame_slot {
-            return u64::MAX;
+        while MM.next_frame_slot < MM.max_frame_slot {
+            let slot = MM.next_frame_slot;
+            MM.next_frame_slot += 1;
+            if slot == 0 {
+                continue;
+            }
+            let err = try_retype_frame_any_untyped(slot);
+            if err == 0 {
+                return slot;
+            }
         }
-        let slot = MM.next_frame_slot;
-        MM.next_frame_slot += 1;
-        let err = invoke::untyped_retype(MM.untyped, OBJ_FRAME, 0, slot);
-        if err != 0 {
-            return u64::MAX;
-        }
-        slot
+        u64::MAX
     }
 }
 

@@ -512,13 +512,18 @@ pub unsafe fn elf_load(
                     }
 
                     let frame_slot = next_frame_slot(ctx);
-                    if frame_slot == u64::MAX {
+                    if frame_slot == u64::MAX || frame_slot == 0 {
                         return ELF_OUT_OF_MEMORY;
                     }
 
-                    let err = try_retype_frame_any_untyped(ctx, frame_slot);
-                    if err != 0 {
-                        return ELF_OUT_OF_MEMORY;
+                    // Some callers provide a frame-allocation callback that already
+                    // performs retype. In that mode, `untyped == 0` is used as a
+                    // sentinel to skip internal retype here.
+                    if ctx.untyped != 0 {
+                        let err = try_retype_frame_any_untyped(ctx, frame_slot);
+                        if err != 0 {
+                            return ELF_OUT_OF_MEMORY;
+                        }
                     }
 
                     let err = invoke::vspace_map(

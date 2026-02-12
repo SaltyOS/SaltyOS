@@ -18,7 +18,8 @@ const BITMAP_WORDS: usize = 60;
 
 /// Maximum untyped sources we track
 const MAX_UT_SOURCES: usize = 12;
-/// Maximum objects per reservation
+/// Maximum objects tracked explicitly per reservation.
+/// Rollback also sweeps the full reserved slot range, so tracking is best-effort.
 const MAX_RESERVE_OBJECTS: usize = 128;
 
 // ---- Data structures ----
@@ -389,9 +390,6 @@ impl Allocator {
         if self.reservation.next_offset >= self.reservation.slot_count {
             return Err(salty::SALTY_OUT_OF_MEMORY as i32);
         }
-        if self.reservation.object_count >= MAX_RESERVE_OBJECTS {
-            return Err(salty::SALTY_OUT_OF_MEMORY as i32);
-        }
 
         let slot = self.reservation_slot(self.reservation.next_offset);
         self.reservation.next_offset += 1;
@@ -401,12 +399,14 @@ impl Allocator {
             return Err(err);
         }
 
-        let obj_idx = self.reservation.object_count;
-        self.reservation.objects[obj_idx] = ReservedObject {
-            slot,
-            committed: true,
-        };
-        self.reservation.object_count += 1;
+        if self.reservation.object_count < MAX_RESERVE_OBJECTS {
+            let obj_idx = self.reservation.object_count;
+            self.reservation.objects[obj_idx] = ReservedObject {
+                slot,
+                committed: true,
+            };
+            self.reservation.object_count += 1;
+        }
 
         Ok(slot)
     }
@@ -424,9 +424,6 @@ impl Allocator {
         if offset >= self.reservation.slot_count {
             return Err(salty::SALTY_OUT_OF_MEMORY as i32);
         }
-        if self.reservation.object_count >= MAX_RESERVE_OBJECTS {
-            return Err(salty::SALTY_OUT_OF_MEMORY as i32);
-        }
 
         let slot = self.reservation_slot(offset);
         let err = self.retype_any(obj_type, size_bits, slot);
@@ -439,12 +436,14 @@ impl Allocator {
             self.reservation.next_offset = offset + 1;
         }
 
-        let obj_idx = self.reservation.object_count;
-        self.reservation.objects[obj_idx] = ReservedObject {
-            slot,
-            committed: true,
-        };
-        self.reservation.object_count += 1;
+        if self.reservation.object_count < MAX_RESERVE_OBJECTS {
+            let obj_idx = self.reservation.object_count;
+            self.reservation.objects[obj_idx] = ReservedObject {
+                slot,
+                committed: true,
+            };
+            self.reservation.object_count += 1;
+        }
 
         Ok(slot)
     }
@@ -465,16 +464,13 @@ impl Allocator {
             return;
         }
 
-        // Revoke+delete in reverse order
-        let mut i = self.reservation.object_count;
-        while i > 0 {
-            i -= 1;
-            let obj = &self.reservation.objects[i];
-            if obj.committed {
-                let err = salty::invoke::cnode_revoke(self.cap_self_cspace, obj.slot);
-                if err != 0 {
-                    salty::invoke::cnode_delete(self.cap_self_cspace, obj.slot);
-                }
+        // Revoke+delete full reserved range to handle reservations that
+        // realized more objects than explicit tracking capacity.
+        for off in 0..self.reservation.slot_count {
+            let slot = SLOT_POOL_BASE + (self.reservation.pool_base + off) as Cap;
+            let err = salty::invoke::cnode_revoke(self.cap_self_cspace, slot);
+            if err != 0 {
+                salty::invoke::cnode_delete(self.cap_self_cspace, slot);
             }
         }
 
