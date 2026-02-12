@@ -79,9 +79,9 @@ unsafe fn destroy_object(obj: *mut KernelObject, obj_type: ObjectType) {
             }
 
             ObjectType::Frame => {
-                // Single frame
+                // Frame object ownership is released independently of mappings.
                 let frame = &mut *(obj as *mut super::untyped::FrameObject);
-                crate::mm::free_frame(frame.phys_addr);
+                crate::mm::release_frame_object(frame.phys_addr, frame.size_bits);
             }
 
             ObjectType::CNode => {

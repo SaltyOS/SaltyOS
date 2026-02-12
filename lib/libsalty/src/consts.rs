@@ -54,13 +54,14 @@ pub const TCB_SET_IPC_BUFFER: u64 = 0x48;
 pub const TCB_BIND_NOTIFICATION: u64 = 0x49;
 pub const TCB_SET_FAULT_HANDLER: u64 = 0x4B;
 
-// VSpace operations (0x50-0x54)
+// VSpace operations (0x50-0x56)
 pub const VSPACE_MAP: u64 = 0x50;
 pub const VSPACE_UNMAP: u64 = 0x51;
 pub const VSPACE_MAP_PT: u64 = 0x52;
 pub const VSPACE_WALK: u64 = 0x53;
 pub const VSPACE_COPY_PAGE: u64 = 0x54;
 pub const VSPACE_MAP_DEVICE: u64 = 0x55;
+pub const VSPACE_CLONE_COW_PAGE: u64 = 0x56;
 
 // IRQ operations (0x60-0x63)
 pub const IRQ_HANDLER_ACK: u64 = 0x61;
@@ -123,6 +124,7 @@ pub const VSPACE_FLAG_USER: u64 = 1 << 1;
 pub const VSPACE_FLAG_EXECUTABLE: u64 = 1 << 2;
 pub const VSPACE_FLAG_CACHE_DISABLE: u64 = 1 << 3;
 pub const VSPACE_FLAG_WRITE_THROUGH: u64 = 1 << 4;
+pub const VSPACE_FLAG_COW: u64 = 1 << 5;
 
 // Object types for Untyped_Retype
 pub const OBJ_UNTYPED: u64 = 1;

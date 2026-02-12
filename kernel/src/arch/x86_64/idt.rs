@@ -262,6 +262,14 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
             let scheduler = crate::sched::scheduler::scheduler();
             let current = scheduler.current();
 
+            // Fast-path COW page fault handling in kernel.
+            if f.vector == 14 && !current.is_null() && !(*current).vspace_root.is_null() {
+                let vspace = &mut *(*current).vspace_root;
+                if let Ok(true) = vspace.handle_cow_fault(f.cr2, f.error_code) {
+                    return;
+                }
+            }
+
             if !current.is_null() && !(*current).fault_handler.is_null() {
                 let fault_ep = &mut *((*current).fault_handler
                     as *mut crate::ipc::Endpoint);

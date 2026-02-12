@@ -3,6 +3,7 @@
 
 use crate::consts::*;
 use crate::types::*;
+use core::sync::atomic::Ordering;
 
 fn sig_default_action(sig: i32) -> bool {
     // Returns true if default action is terminate
@@ -13,15 +14,7 @@ fn sig_default_action(sig: i32) -> bool {
 }
 
 unsafe fn sig_init() {
-    unsafe {
-        if crate::__sig_initialized != 0 {
-            return;
-        }
-        for i in 0..NSIG {
-            crate::__sig_handlers[i] = SIG_DFL;
-        }
-        crate::__sig_initialized = 1;
-    }
+    let _ = crate::__sig_initialized.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
 }
 
 pub unsafe fn posix_signal(sig: i32, handler: usize) -> usize {
@@ -35,8 +28,8 @@ pub unsafe fn posix_signal(sig: i32, handler: usize) -> usize {
             return usize::MAX; // SIG_ERR
         }
 
-        let old = crate::__sig_handlers[sig as usize];
-        crate::__sig_handlers[sig as usize] = handler;
+        let old = crate::__sig_handlers[sig as usize].load(Ordering::SeqCst);
+        crate::__sig_handlers[sig as usize].store(handler, Ordering::SeqCst);
 
         // Notify procmgr of disposition category
         let disp: u64 = if handler == SIG_DFL {
@@ -62,7 +55,7 @@ pub unsafe fn posix_signal(sig: i32, handler: usize) -> usize {
         );
         if err != 0 || reply.label != SALTY_OK {
             // Revert on failure
-            crate::__sig_handlers[sig as usize] = old;
+            crate::__sig_handlers[sig as usize].store(old, Ordering::SeqCst);
             return usize::MAX; // SIG_ERR
         }
 
@@ -95,7 +88,7 @@ pub unsafe fn posix_sigcheck() -> i32 {
                 continue;
             }
 
-            let handler = crate::__sig_handlers[sig as usize];
+            let handler = crate::__sig_handlers[sig as usize].load(Ordering::SeqCst);
             if handler == SIG_IGN {
                 // Ignore
             } else if handler == SIG_DFL {
@@ -111,7 +104,7 @@ pub unsafe fn posix_sigcheck() -> i32 {
                 // SA_RESETHAND: reset to SIG_DFL after first delivery
                 let sa_flags = (*(&raw const crate::__sig_sa_flags))[sig as usize];
                 if sa_flags & SA_RESETHAND != 0 {
-                    crate::__sig_handlers[sig as usize] = SIG_DFL;
+                    crate::__sig_handlers[sig as usize].store(SIG_DFL, Ordering::SeqCst);
                     // Notify procmgr of disposition change
                     let mut msg = SaltyMsg::zeroed();
                     let mut reply = SaltyMsg::zeroed();

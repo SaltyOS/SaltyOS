@@ -349,6 +349,7 @@ unsafe fn init_frame_metadata(
     size_bits: u8,
 ) -> *mut crate::cap::object::KernelObject {
     let actual_bits = if size_bits < 12 { 12 } else { size_bits };
+    crate::mm::retain_frame_object(phys_addr, actual_bits);
     // SAFETY: METADATA_STATE is initialized before any retype operations
     let frame_ptr = unsafe { (*(&raw const METADATA_STATE)).frame_ptr.add(cap_slot as usize) };
     let frame_ptr = unsafe { (*frame_ptr).as_mut_ptr() };

@@ -109,6 +109,7 @@ const AT_SALTY_SHARED_LIB_BASE: u64 = 0x1006;
 
 // ---- x86_64 page-table bits ----
 const X86_PTE_WRITABLE: u64 = 1 << 1;
+const X86_PTE_COW: u64 = 1 << 9;
 const X86_PTE_NX: u64 = 1 << 63;
 
 // ---- waitpid options ----
@@ -826,8 +827,8 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         let child_pid = NEXT_PID;
         NEXT_PID += 1;
 
-        // Count parent pages that need new frame allocation (skip IPC buf,
-        // initrd window pages, and shared lib RO pages from cache).
+        // Count parent pages as an upper bound for reservation sizing
+        // (skip IPC buf, initrd window pages, and shared lib RO cache pages).
         let mut page_count: usize = 0;
         {
             let mut walk_start: u64 = 0;
@@ -850,7 +851,7 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             }
         }
 
-        // Reserve: 7 fixed objects + page frames + margin
+        // Reserve with a generous upper bound (fixed objects + page budget + margin).
         let total_slots = 7 + page_count + 4;
         if !alloc.reserve(total_slots) {
             puts(b"[PROCMGR] FORK: slot reservation failed\n");
@@ -941,6 +942,22 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                     }
                 }
 
+                // Default path: clone page into child with kernel-managed COW.
+                // Keep the RSP page on explicit copy path so procmgr can patch
+                // the child fork trampoline frame before first resume.
+                if page_vaddr != rsp_page_vaddr {
+                    let cerr = salty::invoke::vspace_clone_cow_page(
+                        parent_vs,
+                        page_vaddr,
+                        child_vs,
+                        page_vaddr,
+                    );
+                    if cerr == 0 {
+                        total_pages += 1;
+                        continue;
+                    }
+                }
+
                 let next_frame = match alloc.realize_object(OBJ_FRAME, 0) {
                     Ok(s) => s,
                     Err(_) => {
@@ -962,7 +979,9 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                 }
 
                 let mut map_flags = VSPACE_FLAG_USER;
-                if page_flags & X86_PTE_WRITABLE != 0 { map_flags |= VSPACE_FLAG_WRITABLE; }
+                if page_flags & X86_PTE_WRITABLE != 0 || page_flags & X86_PTE_COW != 0 {
+                    map_flags |= VSPACE_FLAG_WRITABLE;
+                }
                 if page_flags & X86_PTE_NX == 0 { map_flags |= VSPACE_FLAG_EXECUTABLE; }
 
                 let err = salty::invoke::vspace_map(child_vs, next_frame, page_vaddr, map_flags);
@@ -1141,7 +1160,13 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             clone_msg.regs[1] = child_pid as u64;
             let err = ipc::call_ctx(ipc_ctx(), CAP_VFS_EP, &raw const clone_msg, &raw mut clone_reply);
             if err != 0 || clone_reply.label != SALTY_OK {
-                puts(b"[PROCMGR] FORK: VFS clone_fds failed, aborting fork\n");
+                let mut lb = LineBuf::new();
+                lb.str(b"[PROCMGR] FORK: VFS clone_fds failed err=");
+                lb.hex(err as u64);
+                lb.str(b" reply=");
+                lb.hex(clone_reply.label);
+                lb.str(b", aborting fork\n");
+                lb.flush();
                 alloc.rollback();
                 reply.label = SALTY_INVALID_OPERATION;
                 return;

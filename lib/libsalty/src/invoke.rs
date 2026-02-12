@@ -96,6 +96,23 @@ pub fn vspace_map_device(
     .error as i32
 }
 
+pub fn vspace_clone_cow_page(
+    src_vspace: Cap,
+    src_vaddr: u64,
+    dst_vspace: Cap,
+    dst_vaddr: u64,
+) -> i32 {
+    invoke(
+        src_vspace,
+        VSPACE_CLONE_COW_PAGE,
+        src_vaddr,
+        dst_vspace,
+        dst_vaddr,
+        0,
+    )
+    .error as i32
+}
+
 pub fn cnode_copy(
     src_cnode: Cap,
     src_slot: u64,

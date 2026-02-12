@@ -36,10 +36,11 @@ pub use types::*;
 pub static mut __salty_ipc_ctx: IpcContext = IpcContext::new();
 
 #[unsafe(no_mangle)]
-pub static mut __sig_handlers: [usize; NSIG] = [0; NSIG];
+pub static __sig_handlers: [core::sync::atomic::AtomicUsize; NSIG] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; NSIG];
 
 #[unsafe(no_mangle)]
-pub static mut __sig_initialized: i32 = 0;
+pub static __sig_initialized: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 
 #[unsafe(no_mangle)]
 pub static mut __sig_blocked_mask: u32 = 0;
@@ -242,6 +243,16 @@ pub extern "C" fn salty_vspace_copy_page(
     dst_frame: Cap,
 ) -> i32 {
     invoke::vspace_copy_page(src_vspace, src_vaddr, dst_frame)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_vspace_clone_cow_page(
+    src_vspace: Cap,
+    src_vaddr: u64,
+    dst_vspace: Cap,
+    dst_vaddr: u64,
+) -> i32 {
+    invoke::vspace_clone_cow_page(src_vspace, src_vaddr, dst_vspace, dst_vaddr)
 }
 
 #[unsafe(no_mangle)]

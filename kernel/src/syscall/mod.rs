@@ -1024,6 +1024,12 @@ fn syscall_invoke(
             //                    arg1 = page_offset, arg2 = virt_addr, arg3 = flags_bits
             syscall_vspace_map_device(&cap, arg0, arg1, arg2, arg3)
         }
+        (ObjectType::VSpace, 0x56) => {
+            // VSPACE_CLONE_COW_PAGE: arg0 = src_vaddr,
+            //                         arg1 = dst_vspace_cap_ptr,
+            //                         arg2 = dst_vaddr
+            syscall_vspace_clone_cow_page(&cap, arg0, arg1, arg2)
+        }
 
         // SchedContext operations
         (ObjectType::SchedContext, 0x30) => {
@@ -1965,6 +1971,7 @@ fn syscall_vspace_map(
             executable: flags_bits & 4 != 0,
             cache_disable: flags_bits & 8 != 0,
             write_through: flags_bits & 16 != 0,
+            cow: flags_bits & 32 != 0,
         };
 
         match vspace.map(virt_addr, frame.phys_addr, flags) {
@@ -2331,6 +2338,49 @@ fn syscall_vspace_copy_page(
     SyscallResult::ok(0)
 }
 
+/// VSPACE_CLONE_COW_PAGE: Share one source page into destination VSpace.
+///
+/// Writable source pages are converted to COW (read-only + software COW bit)
+/// and mapped into destination as COW. Read-only pages are shared directly.
+///
+/// Args:
+/// - src_vaddr: Source virtual page in the invoking VSpace
+/// - dst_vspace_cap_ptr: Capability pointer to destination VSpace
+/// - dst_vaddr: Destination virtual page in destination VSpace
+fn syscall_vspace_clone_cow_page(
+    cap: &Capability,
+    src_vaddr: u64,
+    dst_vspace_cap_ptr: u64,
+    dst_vaddr: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+    if !cap.has_right(CapRights::MAP) {
+        return SyscallResult::err(SyscallError::InsufficientRights);
+    }
+    if src_vaddr & 0xFFF != 0 || dst_vaddr & 0xFFF != 0 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    let dst_cap = match lookup_cap_locked(dst_vspace_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(&dst_cap, ObjectType::VSpace, CapRights::MAP) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let src_vs = &mut *(cap.object as *mut VSpace);
+        let dst_vs = &mut *(dst_cap.object as *mut VSpace);
+        match src_vs.clone_page_cow_to(src_vaddr, dst_vs, dst_vaddr) {
+            Ok(()) => SyscallResult::ok(0),
+            Err(e) => SyscallResult::err(syscall_error_from_vspace_error(e)),
+        }
+    }
+}
+
 /// VSPACE_MAP_DEVICE: Map a single 4K page from a device untyped region.
 ///
 /// Args:
@@ -2396,6 +2446,7 @@ fn syscall_vspace_map_device(
             executable: flags_bits & 4 != 0,
             cache_disable: flags_bits & 8 != 0,
             write_through: flags_bits & 16 != 0,
+            cow: flags_bits & 32 != 0,
         };
 
         match vspace.map(virt_addr, phys, flags) {

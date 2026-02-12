@@ -13,6 +13,7 @@ const ENTRY_WRITABLE: u64 = 1 << 1;
 const ENTRY_USER: u64 = 1 << 2;
 const ENTRY_WRITE_THROUGH: u64 = 1 << 3;
 const ENTRY_CACHE_DISABLE: u64 = 1 << 4;
+const ENTRY_COW: u64 = 1 << 9;
 const ENTRY_NO_EXECUTE: u64 = 1 << 63;
 
 /// Physical address mask in page table entry
@@ -932,6 +933,12 @@ impl VSpace {
             entry |= ENTRY_WRITE_THROUGH;
         }
 
+        if flags.cow {
+            // COW mappings are intentionally read-only until fault resolution.
+            entry &= !ENTRY_WRITABLE;
+            entry |= ENTRY_COW;
+        }
+
         entry
     }
 
@@ -996,6 +1003,7 @@ impl VSpace {
             // Create the mapping
             let entry_flags = Self::flags_to_entry_flags(flags);
             self.write_entry(virt, 1, phys | entry_flags)?;
+            super::retain_frame_mapping(phys);
 
             // Local TLB flush
             crate::arch::x86_64::paging::invlpg(virt);
@@ -1110,9 +1118,11 @@ impl VSpace {
             if entry & ENTRY_PRESENT == 0 {
                 return Err(VSpaceError::NotMapped);
             }
+            let phys = entry & ENTRY_ADDR_MASK;
 
             // Clear the entry
             self.write_entry(virt, 1, 0)?;
+            super::release_frame_mapping(phys);
 
             // Local TLB flush
             crate::arch::x86_64::paging::invlpg(virt);
@@ -1126,6 +1136,138 @@ impl VSpace {
         self.lock.unlock();
         unsafe { restore_irq(irq) };
 
+        result
+    }
+
+    /// Clone one source page into destination VSpace using COW semantics.
+    ///
+    /// - Read-only pages are shared directly.
+    /// - Writable pages are write-protected in source and mapped COW in destination.
+    pub fn clone_page_cow_to(
+        &mut self,
+        src_vaddr: VirtAddr,
+        dst: &mut VSpace,
+        dst_vaddr: VirtAddr,
+    ) -> Result<(), VSpaceError> {
+        if src_vaddr & (PAGE_SIZE as u64 - 1) != 0 || dst_vaddr & (PAGE_SIZE as u64 - 1) != 0 {
+            return Err(VSpaceError::Alignment);
+        }
+
+        let irq = unsafe { save_irq_disable() };
+
+        let same_vspace = core::ptr::eq(self, dst);
+        let self_first = (self as *const VSpace as usize) <= (dst as *const VSpace as usize);
+
+        if self_first {
+            self.lock.lock();
+            if !same_vspace {
+                dst.lock.lock();
+            }
+        } else {
+            dst.lock.lock();
+            self.lock.lock();
+        }
+
+        let result = (|| {
+            let src_entry = self.read_entry(src_vaddr, 1).ok_or(VSpaceError::NotMapped)?;
+            if src_entry & ENTRY_PRESENT == 0 {
+                return Err(VSpaceError::NotMapped);
+            }
+
+            let phys = src_entry & ENTRY_ADDR_MASK;
+            let mut shared_flags = src_entry & !ENTRY_ADDR_MASK;
+
+            if src_entry & ENTRY_WRITABLE != 0 {
+                shared_flags = (shared_flags & !ENTRY_WRITABLE) | ENTRY_COW;
+                self.write_entry(src_vaddr, 1, phys | shared_flags)?;
+                crate::arch::x86_64::paging::invlpg(src_vaddr);
+                self.tlb_shootdown(src_vaddr);
+            }
+
+            let is_user = (shared_flags & ENTRY_USER) != 0;
+            dst.ensure_table(dst_vaddr, 1, is_user)?;
+            if let Some(entry) = dst.read_entry(dst_vaddr, 1) {
+                if entry & ENTRY_PRESENT != 0 {
+                    return Err(VSpaceError::AlreadyMapped);
+                }
+            }
+
+            dst.write_entry(dst_vaddr, 1, phys | shared_flags)?;
+            super::retain_frame_mapping(phys);
+            crate::arch::x86_64::paging::invlpg(dst_vaddr);
+            dst.tlb_shootdown(dst_vaddr);
+
+            Ok(())
+        })();
+
+        if self_first {
+            if !same_vspace {
+                dst.lock.unlock();
+            }
+            self.lock.unlock();
+        } else {
+            self.lock.unlock();
+            dst.lock.unlock();
+        }
+
+        unsafe { restore_irq(irq) };
+        result
+    }
+
+    /// Resolve a user-mode write fault on a COW page.
+    ///
+    /// Returns Ok(true) if the fault was handled and execution can resume.
+    /// Returns Ok(false) if this was not a COW fault.
+    pub fn handle_cow_fault(
+        &mut self,
+        fault_addr: VirtAddr,
+        error_code: u64,
+    ) -> Result<bool, VSpaceError> {
+        // Need a present + write + user page fault.
+        if (error_code & 0x7) != 0x7 {
+            return Ok(false);
+        }
+
+        let page_vaddr = fault_addr & !((PAGE_SIZE as u64) - 1);
+
+        let irq = unsafe { save_irq_disable() };
+        self.lock.lock();
+
+        let result = (|| {
+            let entry = self.read_entry(page_vaddr, 1).ok_or(VSpaceError::NotMapped)?;
+            if entry & ENTRY_PRESENT == 0 || entry & ENTRY_COW == 0 {
+                return Ok(false);
+            }
+
+            let old_phys = entry & ENTRY_ADDR_MASK;
+            let new_phys = alloc_frame().ok_or(VSpaceError::OutOfMemory)?;
+
+            unsafe {
+                let src = phys_to_virt(old_phys) as *const u8;
+                let dst = phys_to_virt(new_phys) as *mut u8;
+                core::ptr::copy_nonoverlapping(src, dst, PAGE_SIZE);
+            }
+
+            let mut new_flags = entry & !ENTRY_ADDR_MASK;
+            new_flags |= ENTRY_WRITABLE;
+            new_flags &= !ENTRY_COW;
+
+            if self.write_entry(page_vaddr, 1, new_phys | new_flags).is_err() {
+                super::free_frame(new_phys);
+                return Err(VSpaceError::NotMapped);
+            }
+
+            super::retain_frame_mapping(new_phys);
+            super::release_frame_mapping(old_phys);
+
+            crate::arch::x86_64::paging::invlpg(page_vaddr);
+            self.tlb_shootdown(page_vaddr);
+
+            Ok(true)
+        })();
+
+        self.lock.unlock();
+        unsafe { restore_irq(irq) };
         result
     }
 
@@ -1334,6 +1476,15 @@ impl VSpace {
                     continue; // 2MB page (data)
                 }
                 let pt_addr = pde & ENTRY_ADDR_MASK;
+                let pt_virt = phys_to_virt(pt_addr) as *const PageTable;
+                let pt = &*pt_virt;
+                for j in 0..512 {
+                    let pte = pt.entry(j);
+                    if pte & ENTRY_PRESENT == 0 {
+                        continue;
+                    }
+                    super::release_frame_mapping(pte & ENTRY_ADDR_MASK);
+                }
                 free_frame(pt_addr);
             }
 
@@ -1454,6 +1605,7 @@ pub struct PageFlags {
     pub executable: bool,
     pub cache_disable: bool,
     pub write_through: bool,
+    pub cow: bool,
 }
 
 impl PageFlags {
@@ -1463,6 +1615,7 @@ impl PageFlags {
         executable: false,
         cache_disable: false,
         write_through: false,
+        cow: false,
     };
 
     pub const KERNEL_RW: Self = Self {
@@ -1471,6 +1624,7 @@ impl PageFlags {
         executable: false,
         cache_disable: false,
         write_through: false,
+        cow: false,
     };
 
     pub const KERNEL_RX: Self = Self {
@@ -1479,6 +1633,7 @@ impl PageFlags {
         executable: true,
         cache_disable: false,
         write_through: false,
+        cow: false,
     };
 
     pub const USER_RO: Self = Self {
@@ -1487,6 +1642,7 @@ impl PageFlags {
         executable: false,
         cache_disable: false,
         write_through: false,
+        cow: false,
     };
 
     pub const USER_RW: Self = Self {
@@ -1495,6 +1651,7 @@ impl PageFlags {
         executable: false,
         cache_disable: false,
         write_through: false,
+        cow: false,
     };
 
     pub const USER_RX: Self = Self {
@@ -1503,6 +1660,7 @@ impl PageFlags {
         executable: true,
         cache_disable: false,
         write_through: false,
+        cow: false,
     };
 }
 

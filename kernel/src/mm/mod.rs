@@ -140,6 +140,58 @@ pub fn free_frame(addr: PhysAddr) {
     unsafe { restore_irq(irq_flag) };
 }
 
+/// Retain one mapping reference for a physical page (SMP-safe).
+pub fn retain_frame_mapping(addr: PhysAddr) {
+    let irq_flag = unsafe { save_irq_disable() };
+    FRAME_LOCK.lock();
+    unsafe {
+        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
+            allocator.retain_mapping_ref(addr);
+        }
+    }
+    FRAME_LOCK.unlock();
+    unsafe { restore_irq(irq_flag) };
+}
+
+/// Release one mapping reference for a physical page (SMP-safe).
+pub fn release_frame_mapping(addr: PhysAddr) {
+    let irq_flag = unsafe { save_irq_disable() };
+    FRAME_LOCK.lock();
+    unsafe {
+        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
+            allocator.release_mapping_ref(addr);
+        }
+    }
+    FRAME_LOCK.unlock();
+    unsafe { restore_irq(irq_flag) };
+}
+
+/// Retain frame-object ownership references for a frame range (SMP-safe).
+pub fn retain_frame_object(addr: PhysAddr, size_bits: u8) {
+    let irq_flag = unsafe { save_irq_disable() };
+    FRAME_LOCK.lock();
+    unsafe {
+        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
+            allocator.retain_object_ref(addr, size_bits);
+        }
+    }
+    FRAME_LOCK.unlock();
+    unsafe { restore_irq(irq_flag) };
+}
+
+/// Release frame-object ownership references for a frame range (SMP-safe).
+pub fn release_frame_object(addr: PhysAddr, size_bits: u8) {
+    let irq_flag = unsafe { save_irq_disable() };
+    FRAME_LOCK.lock();
+    unsafe {
+        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
+            allocator.release_object_ref(addr, size_bits);
+        }
+    }
+    FRAME_LOCK.unlock();
+    unsafe { restore_irq(irq_flag) };
+}
+
 /// Free multiple contiguous frames
 pub fn free_frames(addr: PhysAddr, size_bytes: usize) {
     let num_frames = (size_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
