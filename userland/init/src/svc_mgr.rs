@@ -40,6 +40,7 @@ pub struct ServiceInstance {
     pub def: ServiceDef,
     pub state: ServiceState,
     pub cap_base: u64,
+    pub pre_ep: u64,
     pub pid: u32,
     pub restart_count: u16,
     pub exit_code: i32,
@@ -52,6 +53,7 @@ impl ServiceInstance {
             def: ServiceDef::zeroed(),
             state: ServiceState::Stopped,
             cap_base: 0,
+            pre_ep: 0,
             pid: 0,
             restart_count: 0,
             exit_code: 0,
@@ -306,19 +308,6 @@ impl ServiceManager {
         } else {
             self.services[idx].state = ServiceState::Failed;
         }
-    }
-
-    /// Returns true if the given service should be spawned directly by init
-    /// (pre-procmgr services). These are: console, nameserv, vfs, procmgr.
-    pub fn is_pre_procmgr(&self, idx: usize) -> bool {
-        if idx >= self.count {
-            return false;
-        }
-        let name = self.services[idx].def.name_bytes();
-        bytes_eq(name, b"console")
-            || bytes_eq(name, b"nameserv")
-            || bytes_eq(name, b"vfs")
-            || bytes_eq(name, b"procmgr")
     }
 
     /// Log the boot order

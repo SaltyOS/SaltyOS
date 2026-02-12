@@ -6,4 +6,8 @@ Restart=always
 
 [Dependencies]
 After=
-Before=nameserv vfs procmgr
+Before=procmgr nameserv vfs
+Requires=procmgr:9
+
+[Capabilities]
+CopyCap=8:4 9:5 10:6

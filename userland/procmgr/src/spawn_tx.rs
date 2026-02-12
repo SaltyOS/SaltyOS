@@ -106,7 +106,10 @@ const PM_SPAWN_FLAG_WAIT_READY: u64 = super::PM_SPAWN_FLAG_WAIT_READY;
 // Shared library physical frame cache
 // ===========================================================================
 
-const MAX_SHARED_LIB_PAGES: usize = 128;
+const MAX_SHARED_LIB_PAGES: usize = 192;
+
+/// Well-known CNode slots where init copies shared lib frame caps.
+const CAP_SHARED_LIB_CACHE_BASE: u64 = 0x80;
 
 #[derive(Clone, Copy)]
 struct SharedPage {
@@ -338,9 +341,10 @@ unsafe fn compute_lib_window_pages(
 // Shared library frame cache: init and map
 // ===========================================================================
 
-/// Pre-load libsalty.so's read-only segments into a permanent frame cache.
-/// Called once at procmgr startup. On failure, cache stays uninitialized and
-/// all spawns fall through to the existing per-process path.
+/// Pre-load shared library RO segments into a permanent frame cache.
+/// First checks for inherited frame caps from init (at CAP_SHARED_LIB_CACHE_BASE).
+/// If inherited caps exist, uses them directly (zero frame allocation).
+/// Otherwise falls back to self-allocation from the allocator.
 pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
     unsafe {
         let cache = &mut *(&raw mut SHARED_LIB_CACHE);
@@ -348,152 +352,260 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
         let initrd = super::INITRD_VADDR as *const u8;
         let initrd_size = super::read_boot_info_initrd_size();
 
-        // Find libsalty.so in initrd
-        let mut entry = CpioEntry::zeroed();
-        let name = b"libsalty.so";
-        if salty::cpio::cpio_find_file(
-            initrd, initrd_size, name.as_ptr(), 10, &raw mut entry,
-        ) == 0
-        {
-            puts(b"[PROCMGR] shared lib cache: libsalty.so not found\n");
+        // Check if init passed us inherited frame caps.
+        // Probe the first slot — if it contains a valid cap, init pre-loaded the cache.
+        let has_inherited = try_inherit_shared_lib_cache(cache, initrd, initrd_size);
+        if has_inherited {
             return;
         }
 
-        // Validate ELF header
-        if entry.data_len < core::mem::size_of::<Elf64Ehdr>() {
-            puts(b"[PROCMGR] shared lib cache: ELF too small\n");
-            return;
-        }
-        let ehdr = &*(entry.data as *const Elf64Ehdr);
-        if ehdr.e_ident[0] != 0x7F || ehdr.e_ident[1] != b'E'
-            || ehdr.e_ident[2] != b'L' || ehdr.e_ident[3] != b'F'
-        {
-            puts(b"[PROCMGR] shared lib cache: bad ELF magic\n");
-            return;
-        }
-        if ehdr.e_type != salty::ET_DYN {
-            puts(b"[PROCMGR] shared lib cache: not ET_DYN\n");
-            return;
-        }
+        // Fallback: build cache ourselves by parsing ELF and allocating frames
+        let libs: [&[u8]; 2] = [b"libsalty.so", b"libc.so"];
+        let mut cumulative_base: u64 = 0;
 
-        // Find min_vaddr across PT_LOAD segments
-        let phdrs = entry.data.add(ehdr.e_phoff as usize) as *const Elf64Phdr;
-        let mut min_vaddr: u64 = u64::MAX;
-        for i in 0..ehdr.e_phnum as usize {
-            let ph = &*phdrs.add(i);
-            if ph.p_type == salty::PT_LOAD && ph.p_vaddr < min_vaddr {
-                min_vaddr = ph.p_vaddr;
-            }
-        }
-        if min_vaddr == u64::MAX {
-            puts(b"[PROCMGR] shared lib cache: no PT_LOAD segments\n");
-            return;
-        }
-
-        // Cache each page of each read-only PT_LOAD segment
-        let mut page_count: usize = 0;
-
-        for i in 0..ehdr.e_phnum as usize {
-            let ph = &*phdrs.add(i);
-            if ph.p_type != salty::PT_LOAD {
-                continue;
-            }
-            // Skip writable segments — those are per-process
-            if (ph.p_flags & salty::PF_W) != 0 {
+        for lib_name in &libs {
+            let mut entry = CpioEntry::zeroed();
+            if salty::cpio::cpio_find_file(
+                initrd, initrd_size, lib_name.as_ptr(), lib_name.len(), &raw mut entry,
+            ) == 0
+            {
                 continue;
             }
 
-            let seg_vaddr = ph.p_vaddr;
-            let seg_start = seg_vaddr & !0xFFFu64;
-            let seg_end = (seg_vaddr + ph.p_memsz + 0xFFF) & !0xFFFu64;
-
-            let mut flags = VSPACE_FLAG_USER;
-            if (ph.p_flags & salty::PF_X) != 0 {
-                flags |= VSPACE_FLAG_EXECUTABLE;
+            if entry.data_len < core::mem::size_of::<Elf64Ehdr>() {
+                continue;
+            }
+            let ehdr = &*(entry.data as *const Elf64Ehdr);
+            if ehdr.e_ident[0] != 0x7F || ehdr.e_ident[1] != b'E'
+                || ehdr.e_ident[2] != b'L' || ehdr.e_ident[3] != b'F'
+            {
+                continue;
+            }
+            if ehdr.e_type != salty::ET_DYN {
+                continue;
             }
 
-            let mut page = seg_start;
-            while page < seg_end {
-                if page_count >= MAX_SHARED_LIB_PAGES {
-                    puts(b"[PROCMGR] shared lib cache: too many pages\n");
-                    break;
+            let phdrs = entry.data.add(ehdr.e_phoff as usize) as *const Elf64Phdr;
+            let mut min_vaddr: u64 = u64::MAX;
+            for i in 0..ehdr.e_phnum as usize {
+                let ph = &*phdrs.add(i);
+                if ph.p_type == salty::PT_LOAD && ph.p_vaddr < min_vaddr {
+                    min_vaddr = ph.p_vaddr;
+                }
+            }
+            if min_vaddr == u64::MAX {
+                continue;
+            }
+
+            for i in 0..ehdr.e_phnum as usize {
+                let ph = &*phdrs.add(i);
+                if ph.p_type != salty::PT_LOAD {
+                    continue;
+                }
+                if (ph.p_flags & salty::PF_W) != 0 {
+                    continue;
                 }
 
-                // Allocate a permanent frame cap slot
-                let slot = match alloc.alloc_single_slot() {
-                    Some(s) => s,
-                    None => {
-                        puts(b"[PROCMGR] shared lib cache: slot alloc failed\n");
-                        return;
+                let seg_vaddr = ph.p_vaddr;
+                let seg_start = seg_vaddr & !0xFFFu64;
+                let seg_end = (seg_vaddr + ph.p_memsz + 0xFFF) & !0xFFFu64;
+
+                let mut flags = VSPACE_FLAG_USER;
+                if (ph.p_flags & salty::PF_X) != 0 {
+                    flags |= VSPACE_FLAG_EXECUTABLE;
+                }
+
+                let mut page = seg_start;
+                while page < seg_end {
+                    if cache.page_count >= MAX_SHARED_LIB_PAGES {
+                        break;
                     }
-                };
 
-                // Retype frame
-                let err = alloc.retype_any(OBJ_FRAME, 0, slot);
-                if err != 0 {
-                    puts(b"[PROCMGR] shared lib cache: frame retype failed\n");
-                    alloc.free_single_slot(slot);
-                    return;
-                }
+                    let slot = match alloc.alloc_single_slot() {
+                        Some(s) => s,
+                        None => return,
+                    };
 
-                // Scratch-map to fill frame contents
-                let err = salty::invoke::vspace_map(
-                    CAP_SELF_VSPACE, slot, PROCMGR_SCRATCH_VADDR,
-                    VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
-                );
-                if err != 0 {
-                    puts(b"[PROCMGR] shared lib cache: scratch map failed\n");
-                    return;
-                }
+                    let err = alloc.retype_any(OBJ_FRAME, 0, slot);
+                    if err != 0 {
+                        alloc.free_single_slot(slot);
+                        // Partial cache is still usable
+                        break;
+                    }
 
-                // Zero the page
-                let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
-                for j in 0..4096usize {
-                    core::ptr::write_volatile(scratch.add(j), 0);
-                }
+                    let err = salty::invoke::vspace_map(
+                        CAP_SELF_VSPACE, slot, PROCMGR_SCRATCH_VADDR,
+                        VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+                    );
+                    if err != 0 {
+                        break;
+                    }
 
-                // Copy file data for this page
-                let file_start = seg_vaddr;
-                let file_end = seg_vaddr + ph.p_filesz;
-                let copy_start = if page > file_start { page } else { file_start };
-                let copy_end = if page + 4096 < file_end { page + 4096 } else { file_end };
+                    let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
+                    for j in 0..4096usize {
+                        core::ptr::write_volatile(scratch.add(j), 0);
+                    }
 
-                if copy_start < copy_end {
-                    let data_offset = (copy_start - seg_vaddr + ph.p_offset) as usize;
-                    let page_offset = (copy_start - page) as usize;
-                    let copy_len = (copy_end - copy_start) as usize;
+                    let file_start = seg_vaddr;
+                    let file_end = seg_vaddr + ph.p_filesz;
+                    let copy_start = if page > file_start { page } else { file_start };
+                    let copy_end = if page + 4096 < file_end { page + 4096 } else { file_end };
 
-                    if data_offset + copy_len <= entry.data_len {
-                        let src = entry.data.add(data_offset);
-                        let dst = scratch.add(page_offset);
-                        for j in 0..copy_len {
-                            core::ptr::write_volatile(dst.add(j), *src.add(j));
+                    if copy_start < copy_end {
+                        let data_offset = (copy_start - seg_vaddr + ph.p_offset) as usize;
+                        let page_offset = (copy_start - page) as usize;
+                        let copy_len = (copy_end - copy_start) as usize;
+
+                        if data_offset + copy_len <= entry.data_len {
+                            let src = entry.data.add(data_offset);
+                            let dst = scratch.add(page_offset);
+                            for j in 0..copy_len {
+                                core::ptr::write_volatile(dst.add(j), *src.add(j));
+                            }
                         }
                     }
+
+                    salty::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
+
+                    cache.pages[cache.page_count] = SharedPage {
+                        vaddr_offset: cumulative_base + (page - min_vaddr),
+                        frame_cap: slot,
+                        flags,
+                    };
+                    cache.page_count += 1;
+                    page += 4096;
                 }
-
-                // Unmap scratch
-                salty::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
-
-                // Store in cache
-                cache.pages[page_count] = SharedPage {
-                    vaddr_offset: page - min_vaddr,
-                    frame_cap: slot,
-                    flags,
-                };
-                page_count += 1;
-                page += 4096;
             }
+            cumulative_base += 0x80000;
         }
 
-        cache.page_count = page_count;
-        cache.initialized = true;
+        if cache.page_count > 0 {
+            cache.initialized = true;
+        }
 
         let mut lb = LineBuf::new();
         lb.str(b"[PROCMGR] shared lib cache: ");
-        lb.hex(page_count as u64);
-        lb.str(b" RO pages cached\n");
+        lb.hex(cache.page_count as u64);
+        lb.str(b" RO pages cached (self-allocated)\n");
         lb.flush();
+    }
+}
+
+/// Try to inherit pre-loaded shared library frame caps from init.
+/// Init copies frame caps to slots CAP_SHARED_LIB_CACHE_BASE..+N.
+/// We re-parse the same ELF headers to reconstruct the metadata
+/// (vaddr_offset, flags) and pair them with the inherited caps.
+/// Returns true if inheritance succeeded.
+unsafe fn try_inherit_shared_lib_cache(
+    cache: &mut SharedLibCache,
+    initrd: *const u8,
+    initrd_size: usize,
+) -> bool {
+    unsafe {
+        // Probe the first inherited slot to check if init passed us caps.
+        // Use vspace_map as a probe — if the cap exists and is a frame,
+        // this will succeed (we immediately unmap).
+        let probe_slot = CAP_SHARED_LIB_CACHE_BASE;
+        let probe_err = salty::invoke::vspace_map(
+            CAP_SELF_VSPACE, probe_slot, PROCMGR_SCRATCH_VADDR,
+            VSPACE_FLAG_USER,
+        );
+        if probe_err != 0 {
+            return false;
+        }
+        salty::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
+
+        puts(b"[PROCMGR] inherited shared lib caps from init\n");
+
+        // Walk both libraries in the same order as init's cache builder.
+        let libs: [&[u8]; 2] = [b"libsalty.so", b"libc.so"];
+        let mut inherited_idx: usize = 0;
+        let mut cumulative_base: u64 = 0;
+
+        for lib_name in &libs {
+            let mut entry = CpioEntry::zeroed();
+            if salty::cpio::cpio_find_file(
+                initrd, initrd_size, lib_name.as_ptr(), lib_name.len(), &raw mut entry,
+            ) == 0
+            {
+                continue;
+            }
+
+            if entry.data_len < core::mem::size_of::<Elf64Ehdr>() {
+                continue;
+            }
+            let ehdr = &*(entry.data as *const Elf64Ehdr);
+            if ehdr.e_ident[0] != 0x7F || ehdr.e_ident[1] != b'E'
+                || ehdr.e_ident[2] != b'L' || ehdr.e_ident[3] != b'F'
+            {
+                continue;
+            }
+            if ehdr.e_type != salty::ET_DYN {
+                continue;
+            }
+
+            let phdrs = entry.data.add(ehdr.e_phoff as usize) as *const Elf64Phdr;
+            let mut min_vaddr: u64 = u64::MAX;
+            for i in 0..ehdr.e_phnum as usize {
+                let ph = &*phdrs.add(i);
+                if ph.p_type == salty::PT_LOAD && ph.p_vaddr < min_vaddr {
+                    min_vaddr = ph.p_vaddr;
+                }
+            }
+            if min_vaddr == u64::MAX {
+                continue;
+            }
+
+            for i in 0..ehdr.e_phnum as usize {
+                let ph = &*phdrs.add(i);
+                if ph.p_type != salty::PT_LOAD || (ph.p_flags & salty::PF_W) != 0 {
+                    continue;
+                }
+
+                let seg_vaddr = ph.p_vaddr;
+                let seg_start = seg_vaddr & !0xFFFu64;
+                let seg_end = (seg_vaddr + ph.p_memsz + 0xFFF) & !0xFFFu64;
+
+                let mut flags = VSPACE_FLAG_USER;
+                if (ph.p_flags & salty::PF_X) != 0 {
+                    flags |= VSPACE_FLAG_EXECUTABLE;
+                }
+
+                let mut page = seg_start;
+                while page < seg_end {
+                    if cache.page_count >= MAX_SHARED_LIB_PAGES {
+                        break;
+                    }
+                    if inherited_idx >= MAX_SHARED_LIB_PAGES {
+                        break;
+                    }
+
+                    let cap_slot = CAP_SHARED_LIB_CACHE_BASE + inherited_idx as u64;
+
+                    cache.pages[cache.page_count] = SharedPage {
+                        vaddr_offset: cumulative_base + (page - min_vaddr),
+                        frame_cap: cap_slot,
+                        flags,
+                    };
+                    cache.page_count += 1;
+                    inherited_idx += 1;
+                    page += 4096;
+                }
+            }
+            cumulative_base += 0x80000;
+        }
+
+        if cache.page_count > 0 {
+            cache.initialized = true;
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] shared lib cache: ");
+            lb.hex(cache.page_count as u64);
+            lb.str(b" RO pages (inherited)\n");
+            lb.flush();
+            return true;
+        }
+
+        false
     }
 }
 

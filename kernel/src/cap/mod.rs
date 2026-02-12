@@ -291,22 +291,12 @@ impl Capability {
 /// physical memory. Must be called after `paging::init()` (direct map available).
 pub fn init() {
     let free = crate::mm::free_frame_count();
-    const LOWMEM_THRESHOLD_FRAMES: usize = 2048; // 8 MiB
-    const LOWMEM_MIN_SLOTS: usize = 512;
-    const NORMAL_MIN_SLOTS: usize = 128;
-
-    // Scale slot count with available memory:
-    //   4MB  (~768 free frames)  → 96 slots
-    //   128MB (~32K free frames) → 4096 slots
-    //   4GB  (~1M free frames)  → 131072 slots
-    // Clamp to [min, 131072]. In lowmem mode, reserve more slot headroom
-    // for dynamic-linker/frame-cap churn during early userspace bring-up.
-    let min_slots = if free <= LOWMEM_THRESHOLD_FRAMES {
-        LOWMEM_MIN_SLOTS
-    } else {
-        NORMAL_MIN_SLOTS
-    };
-    let num_slots = (free / 8).clamp(min_slots, 131_072);
+    // Slot demand is dominated by fixed boot costs (~240 shared-lib cache +
+    // copies, ~50/service × 6 services, ~30/fork) rather than RAM size.
+    // Floor of 768 covers the standard 6-service boot + test forks.
+    // Above ~3K frames the linear term dominates.
+    const MIN_CAP_SLOTS: usize = 768;
+    let num_slots = (free / 4).clamp(MIN_CAP_SLOTS, 131_072);
 
     {
         let s = crate::SerialGuard::acquire();

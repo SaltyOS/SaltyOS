@@ -3,7 +3,13 @@ Name=procmgr
 Binary=procmgr.elf
 Type=simple
 Restart=always
+CNodeBits=12
+MapInitrd=yes
 
 [Dependencies]
-After=console nameserv vfs
-Before=test_runner
+After=console
+Before=nameserv vfs test_runner
+Requires=nameserv:8 vfs:9
+
+[Capabilities]
+CopyCap=12:12 13:13

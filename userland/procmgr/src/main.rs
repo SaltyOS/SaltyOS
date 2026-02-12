@@ -140,7 +140,6 @@ const BOOTINFO_VADDR: u64 = salty::BOOTINFO_VADDR;
 const BOOTINFO_MAGIC: u64 = salty::BOOTINFO_MAGIC;
 
 static mut ALLOCATOR: alloc::Allocator = alloc::Allocator::new();
-
 fn read_boot_info_initrd_size() -> usize {
     unsafe {
         let page = BOOTINFO_VADDR as *const u64;
@@ -1826,7 +1825,11 @@ pub extern "C" fn _start() -> ! {
         // Pre-load shared library RO pages into frame cache
         spawn_tx::init_shared_lib_cache(&mut *(&raw mut ALLOCATOR));
 
-        // Register with name server
+        // Signal ready BEFORE registration — init needs to proceed to spawn nameserv.
+        // The registration Call will block in the EP send queue until nameserv starts.
+        signal_ready();
+
+        // Register with nameserv — blocks until nameserv Recv()s
         if CAP_NAMESERV_EP != 0 {
             let mut reg_msg = SaltyMsg::zeroed();
             let mut reg_reply = SaltyMsg::zeroed();
@@ -1838,18 +1841,14 @@ pub extern "C" fn _start() -> ! {
             for i in 0..svc_name.len() { *dst.add(i) = svc_name[i]; }
             reg_msg.regs[2] = 0;
             reg_msg.regs[3] = 0;
-
-            // Set up cap transfer: send our server EP
-            salty::ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
-
-            let err = salty::ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const reg_msg, &raw mut reg_reply);
+            ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
+            let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const reg_msg, &raw mut reg_reply);
             if err == 0 && reg_reply.label == SALTY_OK {
                 puts(b"[PROCMGR] registered with nameserv\n");
             } else {
                 puts(b"[PROCMGR] WARN: nameserv registration failed\n");
             }
         }
-        signal_ready();
 
         // Initial recv
         let mut msg = SaltyMsg::zeroed();

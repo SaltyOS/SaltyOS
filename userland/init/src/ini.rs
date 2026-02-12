@@ -6,6 +6,29 @@
 pub const MAX_SERVICE_NAME: usize = 32;
 pub const MAX_BINARY_NAME: usize = 48;
 pub const MAX_DEPS: usize = 8;
+pub const MAX_CAP_COPIES: usize = 6;
+pub const MAX_EP_NEEDS: usize = 4;
+pub const MAX_EP_INJECTS: usize = 2;
+
+#[derive(Clone, Copy)]
+pub struct CapCopyDef {
+    pub src_slot: u64,
+    pub dst_slot: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct EpNeedDef {
+    pub service: [u8; MAX_SERVICE_NAME],
+    pub service_len: u8,
+    pub dst_slot: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct EpInjectDef {
+    pub target: [u8; MAX_SERVICE_NAME],
+    pub target_len: u8,
+    pub target_slot: u64,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum ServiceType {
@@ -34,6 +57,14 @@ pub struct ServiceDef {
     pub before_count: u8,
     /// Memory budget in KiB (0 = system default).
     pub memory_kb: u16,
+    pub cnode_bits: u8,
+    pub map_initrd: bool,
+    pub caps: [CapCopyDef; MAX_CAP_COPIES],
+    pub cap_count: u8,
+    pub ep_needs: [EpNeedDef; MAX_EP_NEEDS],
+    pub ep_need_count: u8,
+    pub ep_injects: [EpInjectDef; MAX_EP_INJECTS],
+    pub ep_inject_count: u8,
 }
 
 impl ServiceDef {
@@ -50,6 +81,14 @@ impl ServiceDef {
             before: [[0; MAX_SERVICE_NAME]; MAX_DEPS],
             before_count: 0,
             memory_kb: 0,
+            cnode_bits: 0,
+            map_initrd: false,
+            caps: [CapCopyDef { src_slot: 0, dst_slot: 0 }; MAX_CAP_COPIES],
+            cap_count: 0,
+            ep_needs: [EpNeedDef { service: [0; MAX_SERVICE_NAME], service_len: 0, dst_slot: 0 }; MAX_EP_NEEDS],
+            ep_need_count: 0,
+            ep_injects: [EpInjectDef { target: [0; MAX_SERVICE_NAME], target_len: 0, target_slot: 0 }; MAX_EP_INJECTS],
+            ep_inject_count: 0,
         }
     }
 
@@ -83,6 +122,7 @@ enum Section {
     None,
     Service,
     Dependencies,
+    Capabilities,
 }
 
 fn trim_start(data: &[u8]) -> &[u8] {
@@ -173,6 +213,131 @@ fn parse_decimal_u16(data: &[u8]) -> u16 {
     val
 }
 
+fn parse_decimal_u64(data: &[u8]) -> u64 {
+    let mut val: u64 = 0;
+    for &b in data {
+        if b >= b'0' && b <= b'9' {
+            val = val.wrapping_mul(10).wrapping_add((b - b'0') as u64);
+        } else {
+            break;
+        }
+    }
+    val
+}
+
+fn parse_cap_copies(value: &[u8], caps: &mut [CapCopyDef; MAX_CAP_COPIES]) -> u8 {
+    let mut count: u8 = 0;
+    let mut i = 0;
+    let val = trim(value);
+
+    while i < val.len() && (count as usize) < MAX_CAP_COPIES {
+        while i < val.len() && (val[i] == b' ' || val[i] == b'\t') {
+            i += 1;
+        }
+        if i >= val.len() { break; }
+
+        let start = i;
+        while i < val.len() && val[i] != b' ' && val[i] != b'\t' {
+            i += 1;
+        }
+
+        let token = &val[start..i];
+        let mut colon = 0;
+        let mut found = false;
+        for j in 0..token.len() {
+            if token[j] == b':' {
+                colon = j;
+                found = true;
+                break;
+            }
+        }
+        if found {
+            caps[count as usize] = CapCopyDef {
+                src_slot: parse_decimal_u64(&token[..colon]),
+                dst_slot: parse_decimal_u64(&token[colon + 1..]),
+            };
+            count += 1;
+        }
+    }
+    count
+}
+
+fn parse_ep_needs(value: &[u8], needs: &mut [EpNeedDef; MAX_EP_NEEDS]) -> u8 {
+    let mut count: u8 = 0;
+    let mut i = 0;
+    let val = trim(value);
+
+    while i < val.len() && (count as usize) < MAX_EP_NEEDS {
+        while i < val.len() && (val[i] == b' ' || val[i] == b'\t') {
+            i += 1;
+        }
+        if i >= val.len() { break; }
+
+        let start = i;
+        while i < val.len() && val[i] != b' ' && val[i] != b'\t' {
+            i += 1;
+        }
+
+        let token = &val[start..i];
+        let mut colon = 0;
+        let mut found = false;
+        for j in 0..token.len() {
+            if token[j] == b':' {
+                colon = j;
+                found = true;
+                break;
+            }
+        }
+        if found {
+            let name = &token[..colon];
+            let mut entry = EpNeedDef { service: [0; MAX_SERVICE_NAME], service_len: 0, dst_slot: 0 };
+            entry.service_len = copy_to_buf(name, &mut entry.service);
+            entry.dst_slot = parse_decimal_u64(&token[colon + 1..]);
+            needs[count as usize] = entry;
+            count += 1;
+        }
+    }
+    count
+}
+
+fn parse_ep_injects(value: &[u8], injects: &mut [EpInjectDef; MAX_EP_INJECTS]) -> u8 {
+    let mut count: u8 = 0;
+    let mut i = 0;
+    let val = trim(value);
+
+    while i < val.len() && (count as usize) < MAX_EP_INJECTS {
+        while i < val.len() && (val[i] == b' ' || val[i] == b'\t') {
+            i += 1;
+        }
+        if i >= val.len() { break; }
+
+        let start = i;
+        while i < val.len() && val[i] != b' ' && val[i] != b'\t' {
+            i += 1;
+        }
+
+        let token = &val[start..i];
+        let mut colon = 0;
+        let mut found = false;
+        for j in 0..token.len() {
+            if token[j] == b':' {
+                colon = j;
+                found = true;
+                break;
+            }
+        }
+        if found {
+            let name = &token[..colon];
+            let mut entry = EpInjectDef { target: [0; MAX_SERVICE_NAME], target_len: 0, target_slot: 0 };
+            entry.target_len = copy_to_buf(name, &mut entry.target);
+            entry.target_slot = parse_decimal_u64(&token[colon + 1..]);
+            injects[count as usize] = entry;
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Parse a .service INI file from raw bytes.
 /// Returns true on success.
 pub fn parse_service(data: &[u8], out: &mut ServiceDef) -> bool {
@@ -199,6 +364,8 @@ pub fn parse_service(data: &[u8], out: &mut ServiceDef) -> bool {
                         section = Section::Service;
                     } else if bytes_eq_ci(section_name, b"Dependencies") {
                         section = Section::Dependencies;
+                    } else if bytes_eq_ci(section_name, b"Capabilities") {
+                        section = Section::Capabilities;
                     } else {
                         section = Section::None;
                     }
@@ -233,6 +400,10 @@ pub fn parse_service(data: &[u8], out: &mut ServiceDef) -> bool {
                                 }
                             } else if bytes_eq_ci(key, b"MemoryKB") {
                                 out.memory_kb = parse_decimal_u16(value);
+                            } else if bytes_eq_ci(key, b"CNodeBits") {
+                                out.cnode_bits = parse_decimal_u16(value) as u8;
+                            } else if bytes_eq_ci(key, b"MapInitrd") {
+                                out.map_initrd = bytes_eq_ci(value, b"yes");
                             } else if bytes_eq_ci(key, b"Restart") {
                                 if bytes_eq_ci(value, b"no") {
                                     out.restart = RestartPolicy::No;
@@ -248,6 +419,17 @@ pub fn parse_service(data: &[u8], out: &mut ServiceDef) -> bool {
                                 out.after_count = parse_dep_list(value, &mut out.after);
                             } else if bytes_eq_ci(key, b"Before") {
                                 out.before_count = parse_dep_list(value, &mut out.before);
+                            } else if bytes_eq_ci(key, b"Requires") {
+                                out.ep_need_count = parse_ep_needs(value, &mut out.ep_needs);
+                            }
+                        }
+                        Section::Capabilities => {
+                            if bytes_eq_ci(key, b"CopyCap") {
+                                out.cap_count = parse_cap_copies(value, &mut out.caps);
+                            } else if bytes_eq_ci(key, b"NeedEP") {
+                                out.ep_need_count = parse_ep_needs(value, &mut out.ep_needs);
+                            } else if bytes_eq_ci(key, b"InjectEP") {
+                                out.ep_inject_count = parse_ep_injects(value, &mut out.ep_injects);
                             }
                         }
                         Section::None => {}

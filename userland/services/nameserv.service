@@ -6,4 +6,4 @@ Restart=always
 
 [Dependencies]
 After=console
-Before=vfs procmgr
+Before=vfs

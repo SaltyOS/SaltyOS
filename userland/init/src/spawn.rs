@@ -12,6 +12,7 @@ use salty::serial::LineBuf;
 use salty::syscall;
 use salty::types::*;
 
+#[derive(Clone, Copy)]
 pub struct ExtraCapCopy {
     pub src: Cap,
     pub dst: u64,
@@ -29,6 +30,45 @@ const READY_SIGNAL_BITS: u64 = 1;
 const READY_WAIT_YIELDS_STATIC: usize = 20_000;
 const READY_WAIT_YIELDS_DYNAMIC: usize = 200_000;
 static mut NEXT_UT_HINT: Cap = CAP_UNTYPED_START;
+
+// ===========================================================================
+// Shared library physical frame cache
+// ===========================================================================
+
+const MAX_SHARED_LIB_PAGES: usize = 192;
+
+/// Well-known CNode slot range where cached frame caps are copied into
+/// procmgr's CSpace, enabling zero-allocation library sharing.
+const CAP_SHARED_LIB_CACHE_BASE: u64 = 0x80;
+
+#[derive(Clone, Copy)]
+struct SharedPage {
+    vaddr_offset: u64,
+    frame_cap: Cap,
+    flags: u64,
+}
+
+struct SharedLibCache {
+    initialized: bool,
+    page_count: usize,
+    pages: [SharedPage; MAX_SHARED_LIB_PAGES],
+}
+
+impl SharedLibCache {
+    const fn new() -> Self {
+        SharedLibCache {
+            initialized: false,
+            page_count: 0,
+            pages: [SharedPage { vaddr_offset: 0, frame_cap: 0, flags: 0 }; MAX_SHARED_LIB_PAGES],
+        }
+    }
+}
+
+static mut SHARED_LIB_CACHE: SharedLibCache = SharedLibCache::new();
+
+// ===========================================================================
+// Spawn memory budget
+// ===========================================================================
 
 #[derive(Clone, Copy)]
 struct SpawnMemoryBudget {
@@ -63,8 +103,8 @@ fn compute_spawn_memory_budget(is_dynamic: bool, requested_bits: u8) -> SpawnMem
     // does not over-reserve under lowmem. Runtime growth comes from mirrored
     // parent untyped caps as fallback.
     let mut boot_load_bits = runtime_bits;
-    if boot_load_bits > 16 {
-        boot_load_bits = 16;
+    if boot_load_bits > 17 {
+        boot_load_bits = 17;
     }
     if boot_load_bits < 15 {
         boot_load_bits = 15;
@@ -73,7 +113,7 @@ fn compute_spawn_memory_budget(is_dynamic: bool, requested_bits: u8) -> SpawnMem
     let runtime_mirror_slots = if runtime_bits >= 20 {
         8
     } else if runtime_bits >= 18 {
-        7
+        8
     } else if runtime_bits >= 16 {
         6
     } else {
@@ -296,6 +336,258 @@ unsafe fn allocate_child_untyped_budget(
     Err(last_err)
 }
 
+// ===========================================================================
+// Shared library cache: init + map
+// ===========================================================================
+
+/// Pre-load shared library RO segments into permanent frame caps.
+/// Called once at init startup. Processes both libsalty.so and libc.so.
+/// On failure, cache stays uninitialized and all spawns fall through
+/// to per-process RTLD allocation.
+pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
+    unsafe {
+        let cache = &mut *(&raw mut SHARED_LIB_CACHE);
+        let initrd = super::INITRD_VADDR as *const u8;
+        let initrd_size = super::INITRD_SIZE;
+
+        let libs: [&[u8]; 2] = [b"libsalty.so", b"libc.so"];
+        let mut cumulative_base: u64 = 0;
+
+        for lib_name in &libs {
+            let mut entry = CpioEntry::zeroed();
+            if salty::cpio::cpio_find_file(
+                initrd, initrd_size, lib_name.as_ptr(), lib_name.len(), &raw mut entry,
+            ) == 0
+            {
+                let mut lb = LineBuf::new();
+                lb.str(b"[INIT] shared lib cache: ");
+                lb.bytes(lib_name);
+                lb.str(b" not found, skipping\n");
+                lb.flush();
+                continue;
+            }
+
+            if entry.data_len < core::mem::size_of::<Elf64Ehdr>() {
+                continue;
+            }
+            let ehdr = &*(entry.data as *const Elf64Ehdr);
+            if ehdr.e_ident[0] != 0x7F || ehdr.e_ident[1] != b'E'
+                || ehdr.e_ident[2] != b'L' || ehdr.e_ident[3] != b'F'
+            {
+                continue;
+            }
+            if ehdr.e_type != salty::ET_DYN {
+                continue;
+            }
+
+            // Find min_vaddr across PT_LOAD segments
+            let phdrs = entry.data.add(ehdr.e_phoff as usize) as *const Elf64Phdr;
+            let mut min_vaddr: u64 = u64::MAX;
+            for i in 0..ehdr.e_phnum as usize {
+                let ph = &*phdrs.add(i);
+                if ph.p_type == salty::PT_LOAD && ph.p_vaddr < min_vaddr {
+                    min_vaddr = ph.p_vaddr;
+                }
+            }
+            if min_vaddr == u64::MAX {
+                continue;
+            }
+
+            // Cache each page of each read-only PT_LOAD segment
+            for i in 0..ehdr.e_phnum as usize {
+                let ph = &*phdrs.add(i);
+                if ph.p_type != salty::PT_LOAD {
+                    continue;
+                }
+                // Skip writable segments — those are per-process
+                if (ph.p_flags & salty::PF_W) != 0 {
+                    continue;
+                }
+
+                let seg_vaddr = ph.p_vaddr;
+                let seg_start = seg_vaddr & !0xFFFu64;
+                let seg_end = (seg_vaddr + ph.p_memsz + 0xFFF) & !0xFFFu64;
+
+                let mut flags = VSPACE_FLAG_USER;
+                if (ph.p_flags & salty::PF_X) != 0 {
+                    flags |= VSPACE_FLAG_EXECUTABLE;
+                }
+
+                let mut page = seg_start;
+                while page < seg_end {
+                    if cache.page_count >= MAX_SHARED_LIB_PAGES {
+                        puts(b"[INIT] shared lib cache: too many pages\n");
+                        break;
+                    }
+
+                    // Allocate a permanent frame cap slot
+                    let frame_slot = super::init_alloc_frame_slot(core::ptr::null_mut());
+
+                    // Retype frame from any available untyped
+                    let mut err = invoke::untyped_retype(root_ut, OBJ_FRAME, 0, frame_slot);
+                    if err != 0 {
+                        err = retype_from_any_untyped(OBJ_FRAME, 0, frame_slot);
+                    }
+                    if err != 0 {
+                        let mut lb = LineBuf::new();
+                        lb.str(b"[INIT] shared lib cache: frame retype failed err=");
+                        lb.hex(err as u64);
+                        lb.str(b"\n");
+                        lb.flush();
+                        // Partial cache is still usable — mark initialized with what we have
+                        break;
+                    }
+
+                    // Scratch-map to fill frame contents
+                    let err = invoke::vspace_map(
+                        CAP_SELF_VSPACE, frame_slot, SCRATCH_VADDR,
+                        VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+                    );
+                    if err != 0 {
+                        puts(b"[INIT] shared lib cache: scratch map failed\n");
+                        break;
+                    }
+
+                    // Zero the page
+                    let scratch = SCRATCH_VADDR as *mut u8;
+                    for j in 0..4096usize {
+                        core::ptr::write_volatile(scratch.add(j), 0);
+                    }
+
+                    // Copy file data for this page
+                    let file_start = seg_vaddr;
+                    let file_end = seg_vaddr + ph.p_filesz;
+                    let copy_start = if page > file_start { page } else { file_start };
+                    let copy_end = if page + 4096 < file_end { page + 4096 } else { file_end };
+
+                    if copy_start < copy_end {
+                        let data_offset = (copy_start - seg_vaddr + ph.p_offset) as usize;
+                        let page_offset = (copy_start - page) as usize;
+                        let copy_len = (copy_end - copy_start) as usize;
+
+                        if data_offset + copy_len <= entry.data_len {
+                            let src = entry.data.add(data_offset);
+                            let dst = scratch.add(page_offset);
+                            for j in 0..copy_len {
+                                core::ptr::write_volatile(dst.add(j), *src.add(j));
+                            }
+                        }
+                    }
+
+                    // Unmap scratch
+                    invoke::vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
+
+                    // Store in cache — use offset relative to this library's min_vaddr,
+                    // but also add a per-library base offset so that multi-library pages
+                    // don't overlap. The offset must match what RTLD sees when it loads
+                    // the library at (shared_lib_base + lib_vaddr_base).
+                    cache.pages[cache.page_count] = SharedPage {
+                        vaddr_offset: cumulative_base + (page - min_vaddr),
+                        frame_cap: frame_slot,
+                        flags,
+                    };
+                    cache.page_count += 1;
+                    page += 4096;
+                }
+            }
+            cumulative_base += 0x80000;
+        }
+
+        if cache.page_count > 0 {
+            cache.initialized = true;
+            let mut lb = LineBuf::new();
+            lb.str(b"[INIT] shared lib cache: ");
+            lb.hex(cache.page_count as u64);
+            lb.str(b" RO pages cached\n");
+            lb.flush();
+        }
+    }
+}
+
+/// Map cached shared library RO frames into a child VSpace.
+/// Returns the shared_lib_base address on success, 0 on failure.
+unsafe fn map_shared_lib_to_child(
+    child_vs: Cap,
+    _child_cn: Cap,
+    rtld_base: u64,
+) -> u64 {
+    unsafe {
+        let cache = &*(&raw const SHARED_LIB_CACHE);
+        if !cache.initialized || cache.page_count == 0 {
+            return 0;
+        }
+
+        let lib_load_addr = rtld_base + 0x80000;
+
+        for i in 0..cache.page_count {
+            let page = &cache.pages[i];
+            let vaddr = lib_load_addr + page.vaddr_offset;
+            let err = invoke::vspace_map(
+                child_vs, page.frame_cap, vaddr, page.flags,
+            );
+            if err != 0 {
+                let mut lb = LineBuf::new();
+                lb.str(b"[INIT] shared lib map failed at ");
+                lb.hex(vaddr);
+                lb.str(b" err=");
+                lb.hex(err as u64);
+                lb.str(b"\n");
+                lb.flush();
+                // Rollback already-mapped pages
+                for j in 0..i {
+                    let prev_vaddr = lib_load_addr + cache.pages[j].vaddr_offset;
+                    invoke::vspace_unmap(child_vs, prev_vaddr);
+                }
+                return 0;
+            }
+        }
+
+        lib_load_addr
+    }
+}
+
+/// Return the number of cached shared library pages (for Phase 4 handoff).
+pub fn shared_lib_cache_count() -> usize {
+    unsafe { (&*(&raw const SHARED_LIB_CACHE)).page_count }
+}
+
+/// Copy all cached shared library frame caps into a child CNode
+/// at slots CAP_SHARED_LIB_CACHE_BASE..CAP_SHARED_LIB_CACHE_BASE+count.
+unsafe fn copy_shared_lib_caps_to_child(child_cn: Cap) {
+    unsafe {
+        let cache = &*(&raw const SHARED_LIB_CACHE);
+        if !cache.initialized || cache.page_count == 0 {
+            return;
+        }
+
+        let mut copied: usize = 0;
+        for i in 0..cache.page_count {
+            let dst_slot = CAP_SHARED_LIB_CACHE_BASE + i as u64;
+            let err = invoke::cnode_copy(
+                CAP_SELF_CSPACE,
+                cache.pages[i].frame_cap,
+                child_cn,
+                dst_slot,
+                CAP_RIGHTS_ALL,
+            );
+            if err == 0 {
+                copied += 1;
+            }
+        }
+        if copied > 0 {
+            let mut lb = LineBuf::new();
+            lb.str(b"[INIT] copied ");
+            lb.hex(copied as u64);
+            lb.str(b" shared lib caps to child CNode\n");
+            lb.flush();
+        }
+    }
+}
+
+// ===========================================================================
+// Spawn server
+// ===========================================================================
+
 pub unsafe fn spawn_server(
     root_ut: Cap,
     cap_base: Cap,
@@ -305,6 +597,8 @@ pub unsafe fn spawn_server(
     map_initrd: bool,
     cnode_size_bits: u64,
     child_ut_bits: u8,
+    copy_shared_lib_caps: bool,
+    pre_ep: Cap,
 ) -> i32 {
     { let mut lb = LineBuf::new(); lb.str(b"[INIT] Spawning "); lb.bytes(label); lb.str(b" ("); lb.bytes(elf_name); lb.str(b")\n"); lb.flush(); }
 
@@ -322,10 +616,7 @@ pub unsafe fn spawn_server(
         if is_dynamic {
             { let mut lb = LineBuf::new(); lb.str(b"[INIT] "); lb.bytes(label); lb.str(b" is dynamically linked\n"); lb.flush(); }
         }
-        let mut budget = compute_spawn_memory_budget(is_dynamic, child_ut_bits);
-        if is_dynamic && label == b"vfs" && budget.boot_load_bits < 17 {
-            budget.boot_load_bits = 17;
-        }
+        let budget = compute_spawn_memory_budget(is_dynamic, child_ut_bits);
 
         let child_tcb = cap_base + super::COFF_TCB;
         let child_vs = cap_base + super::COFF_VSPACE;
@@ -388,7 +679,19 @@ pub unsafe fn spawn_server(
         retype!(OBJ_SCHED_CONTEXT, child_sc, b"SC");
         retype!(OBJ_FRAME, child_stk_fr, b"stack frame");
         retype!(OBJ_FRAME, child_ipc_fr, b"IPC frame");
-        retype!(OBJ_ENDPOINT, child_ep, b"EP");
+        if pre_ep != 0 {
+            let err = invoke::cnode_copy(
+                super::CAP_SELF_CSPACE, pre_ep,
+                super::CAP_SELF_CSPACE, child_ep,
+                CAP_RIGHTS_ALL,
+            );
+            if err != 0 {
+                puts(b"[INIT] copy pre-EP failed\n");
+                return -1;
+            }
+        } else {
+            retype!(OBJ_ENDPOINT, child_ep, b"EP");
+        }
         retype!(OBJ_NOTIFICATION, child_ready_ntfn, b"ready ntfn");
 
         let granted_bits = match allocate_child_untyped_budget(
@@ -730,9 +1033,20 @@ pub unsafe fn spawn_server(
             }
         }
 
+        if copy_shared_lib_caps {
+            copy_shared_lib_caps_to_child(child_cn);
+        }
+
         // Configure TCB
         let err = invoke::tcb_set_space(child_tcb, child_cn, child_vs);
         if err != 0 { puts(b"[INIT] TCB set_space failed\n"); return -1; }
+
+        // Map shared library RO frames into child VSpace
+        let shared_lib_base = if is_dynamic {
+            map_shared_lib_to_child(child_vs, child_cn, rtld_result.base)
+        } else {
+            0
+        };
 
         let mut child_entry = elf_result.entry;
         let mut child_rsp = super::SRV_STACK_TOP;
@@ -765,41 +1079,38 @@ pub unsafe fn spawn_server(
                 return -1;
             }
 
-            let srv_stack_frame_size: u64 = 3 * 8 + 13 * 2 * 8 + 8;
+            let auxv_count: u64 = if shared_lib_base != 0 { 14 } else { 13 };
+            let srv_stack_frame_size: u64 = 3 * 8 + auxv_count * 2 * 8 + 8;
             let stack_base = (SCRATCH_VADDR + 4096 - srv_stack_frame_size) as *mut u64;
 
             let mut idx: usize = 0;
-            core::ptr::write_volatile(stack_base.add(idx), 0); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), 0); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), 0); idx += 1;
+            macro_rules! w {
+                ($v:expr) => {
+                    core::ptr::write_volatile(stack_base.add(idx), $v);
+                    idx += 1;
+                };
+            }
+            w!(0); // argc
+            w!(0); // argv terminator
+            w!(0); // envp terminator
 
-            core::ptr::write_volatile(stack_base.add(idx), super::AT_PHDR); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), phdr_vaddr); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), super::AT_PHENT); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), phent); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), super::AT_PHNUM); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), phnum); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), super::AT_ENTRY); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), elf_result.entry); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), super::AT_BASE); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), rtld_result.base); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), super::AT_PAGESZ); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), 4096); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), super::AT_SALTY_UNTYPED); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), super::CAP_CHILD_UNTYPED_OFFSET); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), super::AT_SALTY_VSPACE); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), 1); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), super::AT_SALTY_SCRATCH); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), super::CHILD_SCRATCH_VADDR); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), super::AT_SALTY_INITRD); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), super::CHILD_INITRD_VADDR); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), super::AT_SALTY_INITRD_SZ); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), initrd_size as u64); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), super::AT_SALTY_FRAME_SLOT); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), super::CHILD_RTLD_FRAME_SLOT_START); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), super::AT_NULL); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), 0); idx += 1;
-            core::ptr::write_volatile(stack_base.add(idx), 0);
+            w!(super::AT_PHDR); w!(phdr_vaddr);
+            w!(super::AT_PHENT); w!(phent);
+            w!(super::AT_PHNUM); w!(phnum);
+            w!(super::AT_ENTRY); w!(elf_result.entry);
+            w!(super::AT_BASE); w!(rtld_result.base);
+            w!(super::AT_PAGESZ); w!(4096);
+            w!(super::AT_SALTY_UNTYPED); w!(super::CAP_CHILD_UNTYPED_OFFSET);
+            w!(super::AT_SALTY_VSPACE); w!(1);
+            w!(super::AT_SALTY_SCRATCH); w!(super::CHILD_SCRATCH_VADDR);
+            w!(super::AT_SALTY_INITRD); w!(super::CHILD_INITRD_VADDR);
+            w!(super::AT_SALTY_INITRD_SZ); w!(initrd_size as u64);
+            w!(super::AT_SALTY_FRAME_SLOT); w!(super::CHILD_RTLD_FRAME_SLOT_START);
+            if shared_lib_base != 0 {
+                w!(super::AT_SALTY_SHARED_LIB_BASE); w!(shared_lib_base);
+            }
+            w!(super::AT_NULL); w!(0);
+            w!(0); // padding
 
             invoke::vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
 

@@ -39,6 +39,7 @@ use spawn::ExtraCapCopy;
 
 const CAP_IPC_BUF_FRAME: u64 = 131;
 const CAP_UNTYPED_PROBE_TMP: u64 = 132;
+const EP_POOL_BASE: u64 = 140;
 
 const CAP_CHILD_BASE: u64 = 200;
 const CAP_CHILD_STRIDE: u64 = 128;
@@ -71,14 +72,9 @@ pub const SRV_STACK_PAGES: usize = 4;
 pub const SRV_STACK_SIZE: u64 = SRV_STACK_PAGES as u64 * 4096;
 pub const SRV_STACK_TOP: u64 = CHILD_STACK_VADDR + SRV_STACK_SIZE;
 
-const PROCMGR_CNODE_SIZE_BITS: u64 = 12;
-const CHILD_UT_BITS_DEFAULT: u8 = 16;  // 64KB fallback
-const CHILD_UT_BITS_CONSOLE: u8 = 17;  // 128KB
-const CHILD_UT_BITS_NAMESERV: u8 = 16; // 64KB
-const CHILD_UT_BITS_VFS: u8 = 18;      // 256KB
-const CHILD_UT_BITS_DISPLAY: u8 = 15;  // 32KB
-const CHILD_UT_BITS_PROCMGR: u8 = 20;  // 1MB for procmgr (spawns children via allocator)
 const PM_WAIT_ANY_CHILD: u64 = u32::MAX as u64;
+
+pub const AT_SALTY_SHARED_LIB_BASE: u64 = 0x1006;
 
 // Keep init's transient frame/cap allocations above per-service child slots
 // while staying inside init CSpace (0..4095).
@@ -170,6 +166,18 @@ unsafe fn read_boot_info() -> (u64, usize) {
     }
 }
 
+/// Read total usable RAM bytes from boot info page (offset 56).
+unsafe fn read_total_usable_bytes() -> u64 {
+    unsafe {
+        let page = BOOTINFO_VADDR as *const u64;
+        let magic = core::ptr::read_volatile(page);
+        if magic != BOOTINFO_MAGIC {
+            return 0;
+        }
+        core::ptr::read_volatile(page.add(7))
+    }
+}
+
 fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -191,23 +199,32 @@ fn memory_kb_to_ut_bits(kb: u16) -> u8 {
     bits
 }
 
-fn child_ut_bits_for_service(name: &[u8], memory_kb: u16) -> u8 {
+fn log2_floor(n: u64) -> u8 {
+    if n == 0 { return 0; }
+    63 - n.leading_zeros() as u8
+}
+
+/// Compute per-service memory budget dynamically from total usable RAM.
+/// Each service gets an equal share of 2/3 available RAM.
+/// MapInitrd services (process managers) get 4x boost.
+/// MemoryKB in .service overrides the formula.
+fn compute_service_budget(total_usable: u64, num_services: usize, memory_kb: u16, map_initrd: bool) -> u8 {
     if memory_kb > 0 {
         return memory_kb_to_ut_bits(memory_kb);
     }
-    if bytes_eq(name, b"console") {
-        CHILD_UT_BITS_CONSOLE
-    } else if bytes_eq(name, b"nameserv") {
-        CHILD_UT_BITS_NAMESERV
-    } else if bytes_eq(name, b"vfs") {
-        CHILD_UT_BITS_VFS
-    } else if bytes_eq(name, b"display") {
-        CHILD_UT_BITS_DISPLAY
-    } else if bytes_eq(name, b"procmgr") {
-        CHILD_UT_BITS_PROCMGR
-    } else {
-        CHILD_UT_BITS_DEFAULT
+
+    let svc_count = if num_services == 0 { 1 } else { num_services } as u64;
+    let per_svc = total_usable / (svc_count * 16);
+    let mut bits = log2_floor(per_svc);
+
+    if bits < 14 { bits = 14; }
+    if bits > 20 { bits = 20; }
+
+    if map_initrd {
+        bits = if bits + 2 > 21 { 21 } else { bits + 2 };
     }
+
+    bits
 }
 
 // ======================================================================
@@ -274,6 +291,27 @@ fn ends_with(haystack: &[u8], suffix: &[u8]) -> bool {
 }
 
 // ======================================================================
+// Pre-create service endpoints (socket activation)
+// ======================================================================
+
+unsafe fn pre_create_endpoints(mgr: &mut svc_mgr::ServiceManager, ut: Cap) {
+    puts(b"[INIT] Pre-creating service endpoints...\n");
+    for i in 0..mgr.count {
+        let ep_slot = EP_POOL_BASE + i as u64;
+        let err = invoke::untyped_retype(ut, salty::OBJ_ENDPOINT, 0, ep_slot);
+        if err == 0 {
+            mgr.services[i].pre_ep = ep_slot;
+        } else {
+            let mut lb = LineBuf::new();
+            lb.str(b"[INIT] WARN: pre-create EP for ");
+            lb.bytes(mgr.services[i].def.name_bytes());
+            lb.str(b" failed\n");
+            lb.flush();
+        }
+    }
+}
+
+// ======================================================================
 // Boot services
 // ======================================================================
 
@@ -282,16 +320,26 @@ fn get_cap_base(spawn_idx: u64) -> u64 {
     CAP_CHILD_BASE + CAP_CHILD_STRIDE * spawn_idx
 }
 
-unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap) -> Cap {
-    // Track which pre-procmgr slot we're on
-    let mut pre_spawn_idx: u64 = 0;
+/// Check whether procmgr's Requires= dependencies reference a given service name.
+/// Services that procmgr blocks on during startup must be init-spawned.
+fn is_procmgr_requires(mgr: &svc_mgr::ServiceManager, pm_idx: i32, name: &[u8]) -> bool {
+    if pm_idx < 0 {
+        return false;
+    }
+    let pm = &mgr.services[pm_idx as usize];
+    for i in 0..pm.def.ep_need_count as usize {
+        let dep_name = &pm.def.ep_needs[i].service[..pm.def.ep_needs[i].service_len as usize];
+        if bytes_eq(dep_name, name) {
+            return true;
+        }
+    }
+    false
+}
 
-    // First, track the EPs for inter-service wiring
-    let mut console_ep: Cap = 0;
-    let mut console_cnode: Cap = 0;
-    let mut nameserv_ep: Cap = 0;
-    let mut vfs_ep: Cap = 0;
+unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable: u64) -> Cap {
+    let mut pre_spawn_idx: u64 = 0;
     let mut procmgr_ep: Cap = 0;
+    let pm_svc_idx = mgr.find_service(b"procmgr");
 
     for order_idx in 0..mgr.boot_order_len {
         let svc_idx = mgr.boot_order[order_idx] as usize;
@@ -301,7 +349,6 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap) -> Cap {
             continue;
         }
 
-        // Check deps satisfied
         if !mgr.deps_satisfied(svc_idx) {
             { let mut lb = LineBuf::new(); lb.str(b"[INIT] Dependencies not met for "); lb.bytes(mgr.services[svc_idx].def.name_bytes()); lb.str(b", marking Failed\n"); lb.flush(); }
             mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
@@ -320,16 +367,63 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap) -> Cap {
         let elf_name = &bin_buf[..bin_len];
 
         mgr.set_state(svc_idx, svc_mgr::ServiceState::Starting);
+        // Determine whether this service must be init-spawned (pre-procmgr) or
+        // can go through procmgr's PM_SPAWN path. Init-spawned services don't
+        // get procmgr/vfs/nameserv EPs, so only services that truly need to
+        // boot before procmgr is ready should be init-spawned.
+        let is_pre_procmgr = bytes_eq(name, b"procmgr")
+            || mgr.services[svc_idx].def.cap_count > 0
+            || mgr.services[svc_idx].def.ep_need_count > 0
+            || mgr.services[svc_idx].def.ep_inject_count > 0
+            || is_procmgr_requires(mgr, pm_svc_idx, name);
 
-        if mgr.is_pre_procmgr(svc_idx) {
-            // Direct spawn via spawn_server
+        if is_pre_procmgr {
             let cap_base = get_cap_base(pre_spawn_idx);
 
-            let extras = build_extras(name, console_ep, nameserv_ep, vfs_ep);
-            let is_procmgr = bytes_eq(name, b"procmgr");
-            let cnode_bits = if is_procmgr { PROCMGR_CNODE_SIZE_BITS } else { 0 };
-            let map_initrd = is_procmgr;
-            let ut_bits = child_ut_bits_for_service(name, mgr.services[svc_idx].def.memory_kb);
+            // Copy capability-related fields to stack to avoid borrow conflicts
+            let cap_count = mgr.services[svc_idx].def.cap_count;
+            let caps = mgr.services[svc_idx].def.caps;
+            let ep_need_count = mgr.services[svc_idx].def.ep_need_count;
+            let ep_needs = mgr.services[svc_idx].def.ep_needs;
+            let ep_inject_count = mgr.services[svc_idx].def.ep_inject_count;
+            let ep_injects = mgr.services[svc_idx].def.ep_injects;
+            let cnode_bits = mgr.services[svc_idx].def.cnode_bits as u64;
+            let do_map_initrd = mgr.services[svc_idx].def.map_initrd;
+            let memory_kb = mgr.services[svc_idx].def.memory_kb;
+            let svc_pre_ep = mgr.services[svc_idx].pre_ep;
+
+            // Build extras from [Capabilities] declarations
+            let mut extras = [ExtraCapCopy { src: 0, dst: 0 }; 10];
+            let mut n: usize = 0;
+
+            for i in 0..cap_count as usize {
+                if n < extras.len() {
+                    extras[n] = ExtraCapCopy {
+                        src: caps[i].src_slot,
+                        dst: caps[i].dst_slot,
+                    };
+                    n += 1;
+                }
+            }
+
+            for i in 0..ep_need_count as usize {
+                let svc_name = &ep_needs[i].service[..ep_needs[i].service_len as usize];
+                let provider_idx = mgr.find_service(svc_name);
+                if provider_idx >= 0 && n < extras.len() {
+                    let pre_ep = mgr.services[provider_idx as usize].pre_ep;
+                    if pre_ep != 0 {
+                        extras[n] = ExtraCapCopy {
+                            src: pre_ep,
+                            dst: ep_needs[i].dst_slot,
+                        };
+                        n += 1;
+                    }
+                }
+            }
+
+            let ut_bits = compute_service_budget(total_usable, mgr.count, memory_kb, do_map_initrd);
+
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] "); lb.bytes(name); lb.str(b" budget=2^"); lb.hex(ut_bits as u64); lb.str(b"\n"); lb.flush(); }
 
             let err = unsafe {
                 spawn::spawn_server(
@@ -337,10 +431,12 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap) -> Cap {
                     cap_base,
                     elf_name,
                     name,
-                    &extras,
-                    map_initrd,
+                    &extras[..n],
+                    do_map_initrd,
                     cnode_bits,
                     ut_bits,
+                    do_map_initrd,
+                    svc_pre_ep,
                 )
             };
 
@@ -352,17 +448,34 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap) -> Cap {
 
             mgr.services[svc_idx].cap_base = cap_base;
 
-            // Record the EP for this service
-            let ep = cap_base + COFF_EP;
-            if bytes_eq(name, b"console") {
-                console_ep = ep;
-                console_cnode = cap_base + COFF_CNODE;
-            } else if bytes_eq(name, b"nameserv") {
-                nameserv_ep = ep;
-            } else if bytes_eq(name, b"vfs") {
-                vfs_ep = ep;
-            } else if bytes_eq(name, b"procmgr") {
-                // Mint a badged EP (badge=1 -> PID 1)
+            // Post-spawn EP injection from [Capabilities] InjectEP
+            for i in 0..ep_inject_count as usize {
+                let tgt_name = &ep_injects[i].target[..ep_injects[i].target_len as usize];
+                let tgt_idx = mgr.find_service(tgt_name);
+                if tgt_idx >= 0 && mgr.services[tgt_idx as usize].cap_base != 0 {
+                    let tgt_cnode = mgr.services[tgt_idx as usize].cap_base + COFF_CNODE;
+                    let err = invoke::cnode_copy(
+                        CAP_SELF_CSPACE,
+                        cap_base + COFF_EP,
+                        tgt_cnode,
+                        ep_injects[i].target_slot,
+                        CAP_RIGHTS_ALL,
+                    );
+                    if err == 0 {
+                        let mut lb = LineBuf::new();
+                        lb.str(b"[INIT] Injected EP into ");
+                        lb.bytes(tgt_name);
+                        lb.str(b" slot ");
+                        lb.hex(ep_injects[i].target_slot);
+                        lb.str(b"\n");
+                        lb.flush();
+                    }
+                }
+            }
+
+            // Mint badged procmgr EP for init's monitor loop
+            if bytes_eq(name, b"procmgr") {
+                let ep = cap_base + COFF_EP;
                 unsafe {
                     let pm_badged_slot = INIT_DYN_FRAME_NEXT;
                     INIT_DYN_FRAME_NEXT += 1;
@@ -375,27 +488,11 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap) -> Cap {
                         puts(b"[INIT] WARN: mint badged PM EP failed\n");
                     }
                 }
-
-                // Late cap injection: give console the procmgr EP at slot 9
-                // so it can send ISIG signals (Ctrl-C → SIGINT, etc.)
-                if console_cnode != 0 && procmgr_ep != 0 {
-                    let err = invoke::cnode_copy(
-                        CAP_SELF_CSPACE, ep,
-                        console_cnode, 9,
-                        CAP_RIGHTS_ALL,
-                    );
-                    if err == 0 {
-                        puts(b"[INIT] Injected procmgr EP into console slot 9\n");
-                    } else {
-                        puts(b"[INIT] WARN: procmgr EP injection to console failed\n");
-                    }
-                }
             }
 
             pre_spawn_idx += 1;
             mgr.set_state(svc_idx, svc_mgr::ServiceState::Running);
 
-            // Yield to let the service start
             syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
         } else {
             // Post-procmgr: spawn via procmgr IPC
@@ -405,12 +502,10 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap) -> Cap {
                 continue;
             }
 
-            // Give procmgr a few yields to be ready
             for _ in 0..5 {
                 syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
             }
 
-            // Strip .elf suffix for procmgr spawn name
             let spawn_name = if ends_with(elf_name, b".elf") {
                 &elf_name[..elf_name.len() - 4]
             } else {
@@ -432,49 +527,6 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap) -> Cap {
     procmgr_ep
 }
 
-fn build_extras(name: &[u8], console_ep: Cap, ns_ep: Cap, vfs_ep: Cap) -> [ExtraCapCopy; 5] {
-    let mut extras: [ExtraCapCopy; 5] = [
-        ExtraCapCopy { src: 0, dst: 0 },
-        ExtraCapCopy { src: 0, dst: 0 },
-        ExtraCapCopy { src: 0, dst: 0 },
-        ExtraCapCopy { src: 0, dst: 0 },
-        ExtraCapCopy { src: 0, dst: 0 },
-    ];
-
-    // Console gets IoPort, IRQ, Notification
-    if bytes_eq(name, b"console") {
-        extras[0] = ExtraCapCopy { src: CAP_COM1_IOPORT, dst: 4 };
-        extras[1] = ExtraCapCopy { src: CAP_COM1_IRQ, dst: 5 };
-        extras[2] = ExtraCapCopy { src: CAP_COM1_NTFN, dst: 6 };
-    }
-    // VFS gets console EP + nameserv EP
-    if bytes_eq(name, b"vfs") {
-        if console_ep != 0 {
-            extras[0] = ExtraCapCopy { src: console_ep, dst: 4 };
-        }
-        if ns_ep != 0 {
-            extras[1] = ExtraCapCopy { src: ns_ep, dst: 8 };
-        }
-    }
-    // procmgr gets nameserv EP + VFS EP
-    if bytes_eq(name, b"procmgr") {
-        if ns_ep != 0 {
-            extras[0] = ExtraCapCopy { src: ns_ep, dst: 8 };
-        }
-        if vfs_ep != 0 {
-            extras[1] = ExtraCapCopy { src: vfs_ep, dst: 9 };
-        }
-        extras[2] = ExtraCapCopy { src: CAP_INITRD_UNTYPED, dst: CAP_INITRD_UNTYPED };
-        extras[3] = ExtraCapCopy { src: CAP_FB_UNTYPED, dst: CAP_FB_UNTYPED };
-    }
-    // Display server gets framebuffer device untyped
-    if bytes_eq(name, b"display") {
-        extras[0] = ExtraCapCopy { src: CAP_FB_UNTYPED, dst: 13 };
-    }
-
-    extras
-}
-
 // ======================================================================
 // Service monitor loop
 // ======================================================================
@@ -485,7 +537,6 @@ fn find_service_by_pid(mgr: &svc_mgr::ServiceManager, pid: u32) -> i32 {
         if mgr.services[i].active
             && mgr.services[i].pid == pid
             && mgr.services[i].state == svc_mgr::ServiceState::Running
-            && !mgr.is_pre_procmgr(i)
         {
             return i as i32;
         }
@@ -658,6 +709,9 @@ pub extern "C" fn _start() -> ! {
     unsafe { INITRD_SIZE = initrd_size; }
     { let mut lb = LineBuf::new(); lb.str(b"[INIT] Initrd size from boot info: "); lb.hex(initrd_size as u64); lb.str(b" bytes\n"); lb.flush(); }
 
+    let total_usable = unsafe { read_total_usable_bytes() };
+    { let mut lb = LineBuf::new(); lb.str(b"[INIT] Total usable RAM: "); lb.hex(total_usable); lb.str(b" bytes\n"); lb.flush(); }
+
     // Optional self-tests (IPC + fault handling)
     // Check if selftest is enabled by looking for "selftest.enable" in CPIO
     let run_selftest = unsafe {
@@ -686,11 +740,13 @@ pub extern "C" fn _start() -> ! {
     unsafe { load_service_defs(&mut mgr) };
 
     if mgr.count == 0 {
-        puts(b"[INIT] No service definitions found, falling back to legacy boot\n");
-        // Fallback: legacy boot (direct spawn console + servers + run tests)
-        unsafe { legacy_boot(ut) };
+        puts(b"[INIT] No service definitions found in initrd\n");
         idle();
     }
+
+    // Pre-load shared library RO pages into a cache so all children share
+    // the same physical frames (saves ~120 frames per additional process).
+    unsafe { spawn::init_shared_lib_cache(ut) };
 
     // Build dependency graph and topological sort
     mgr.build_deps();
@@ -700,118 +756,14 @@ pub extern "C" fn _start() -> ! {
     }
     mgr.log_boot_order();
 
+    // Pre-create endpoints for socket activation (before any service spawns)
+    unsafe { pre_create_endpoints(&mut mgr, ut) };
+
     // Boot services in topological order
-    let pm_ep = unsafe { boot_services(&mut mgr, ut) };
+    let pm_ep = unsafe { boot_services(&mut mgr, ut, total_usable) };
 
     // Service monitor loop
     puts(b"[INIT] Entering service monitor loop\n");
     unsafe { service_monitor(&mut mgr, pm_ep) };
 }
 
-// ======================================================================
-// Legacy boot (fallback when no .service files found)
-// ======================================================================
-
-const LEGACY_CAP_NS_BASE: u64 = CAP_CHILD_BASE + CAP_CHILD_STRIDE * 1;
-const LEGACY_CAP_PM_BASE: u64 = CAP_CHILD_BASE + CAP_CHILD_STRIDE * 2;
-const LEGACY_CAP_VFS_BASE: u64 = CAP_CHILD_BASE + CAP_CHILD_STRIDE * 3;
-
-unsafe fn legacy_boot(ut: Cap) {
-    puts(b"\n[INIT] Legacy boot: Spawning console server\n");
-
-    unsafe {
-        // Phase 3: Spawn console
-        if spawn::spawn_server(ut, CAP_CHILD_BASE, b"console.elf", b"console",
-            &[
-                ExtraCapCopy { src: CAP_COM1_IOPORT, dst: 4 },
-                ExtraCapCopy { src: CAP_COM1_IRQ, dst: 5 },
-                ExtraCapCopy { src: CAP_COM1_NTFN, dst: 6 },
-            ], false, 0, child_ut_bits_for_service(b"console", 0)) != 0 {
-            puts(b"[INIT] FAIL: console spawn failed\n");
-            return;
-        }
-        syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-
-        let console_ep = CAP_CHILD_BASE + COFF_EP;
-        let ns_ep = LEGACY_CAP_NS_BASE + COFF_EP;
-        let vfs_ep = LEGACY_CAP_VFS_BASE + COFF_EP;
-        let mut pm_ep = LEGACY_CAP_PM_BASE + COFF_EP;
-
-        // Spawn nameserv
-        if spawn::spawn_server(ut, LEGACY_CAP_NS_BASE, b"nameserv.elf", b"nameserv", &[], false, 0, child_ut_bits_for_service(b"nameserv", 0)) != 0 {
-            puts(b"[INIT] FAIL: nameserv spawn failed\n");
-            return;
-        }
-        syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-
-        // Spawn VFS
-        let vfs_extras = [
-            ExtraCapCopy { src: console_ep, dst: 4 },
-            ExtraCapCopy { src: ns_ep, dst: 8 },
-        ];
-        if spawn::spawn_server(ut, LEGACY_CAP_VFS_BASE, b"vfs.elf", b"vfs", &vfs_extras, false, 0, child_ut_bits_for_service(b"vfs", 0)) != 0 {
-            puts(b"[INIT] FAIL: vfs spawn failed\n");
-            return;
-        }
-        syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-
-        // Spawn procmgr
-        let pm_extras = [
-            ExtraCapCopy { src: ns_ep, dst: 8 },
-            ExtraCapCopy { src: vfs_ep, dst: 9 },
-            ExtraCapCopy { src: CAP_INITRD_UNTYPED, dst: CAP_INITRD_UNTYPED },
-        ];
-        if spawn::spawn_server(ut, LEGACY_CAP_PM_BASE, b"procmgr.elf", b"procmgr", &pm_extras, true, PROCMGR_CNODE_SIZE_BITS, child_ut_bits_for_service(b"procmgr", 0)) != 0 {
-            puts(b"[INIT] FAIL: procmgr spawn failed\n");
-            return;
-        }
-
-        // Mint badged PM EP
-        let pm_badged_slot = INIT_DYN_FRAME_NEXT;
-        INIT_DYN_FRAME_NEXT += 1;
-        let merr = invoke::cnode_mint(CAP_SELF_CSPACE, pm_ep, CAP_SELF_CSPACE, pm_badged_slot, 1);
-        if merr == 0 {
-            pm_ep = pm_badged_slot;
-        }
-
-        syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-
-        for _ in 0..5 {
-            syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-        }
-
-        // Phase 5: Runtime tests via procmgr
-        puts(b"\n[INIT] Running userland runtime tests\n");
-
-        // Spawn test_runner via procmgr
-        puts(b"[INIT] spawn test_runner\n");
-        let pid = spawn::pm_spawn(pm_ep, b"test_runner");
-        if pid < 0 {
-            puts(b"[INIT] FAIL: spawn failed for test_runner\n");
-            return;
-        }
-
-        // Wait for test_runner to complete
-        let mut wait_msg = SaltyMsg::zeroed();
-        wait_msg.label = POSIX_PM_WAIT;
-        wait_msg.length = 1;
-        wait_msg.regs[0] = pid as u64;
-
-        let mut wait_reply = SaltyMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), pm_ep, &raw const wait_msg, &raw mut wait_reply);
-        if err != 0 || wait_reply.label != SALTY_OK {
-            puts(b"[INIT] FAIL: wait failed for test_runner\n");
-            return;
-        }
-        let status = wait_reply.regs[0] as i32;
-
-        { let mut lb = LineBuf::new(); lb.str(b"[INIT] test_runner exited with code "); lb.hex(status as u64); lb.str(b"\n"); lb.flush(); }
-
-        if (status & 0x7f) == 0 && ((status >> 8) & 0xff) == 42 {
-            puts(b"[INIT] All tests PASSED\n");
-        } else {
-            puts(b"[INIT] FAIL: test_runner did not pass\n");
-        }
-
-    }
-}

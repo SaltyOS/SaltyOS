@@ -6,4 +6,5 @@ Restart=always
 
 [Dependencies]
 After=console nameserv
-Before=procmgr
+Before=test_runner
+Requires=console:4 nameserv:8

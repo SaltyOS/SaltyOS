@@ -218,7 +218,7 @@ int load_shared_library(struct rtld_state *st, const char *name,
 
     /* Check if this library was pre-mapped by procmgr */
     int is_premapped = (st->shared_lib_base != 0
-                        && load_addr == st->shared_lib_base);
+                        && load_addr >= st->shared_lib_base);
     if (is_premapped) {
         rtld_puts("[RTLD] Using pre-mapped shared pages for ");
         rtld_puts(name);

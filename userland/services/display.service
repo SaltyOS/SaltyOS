@@ -6,4 +6,7 @@ Restart=no
 
 [Dependencies]
 After=console nameserv procmgr
+
+[Capabilities]
+CopyCap=13:13
 !

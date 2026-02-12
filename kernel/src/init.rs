@@ -429,7 +429,7 @@ unsafe fn create_untyped_caps(cnode: &mut CNode, _info: &ParsedBootInfo) {
     const MAX_SIZE_BITS: u8 = 28; // 256 MiB
     const MIN_SIZE_BITS: u8 = 12; // 4 KiB
     const NORMAL_MIN_KERNEL_RESERVE_FRAMES: usize = 1024; // 4 MiB
-    const LOWMEM_ABS_RESERVE_FRAMES: usize = 32; // 128 KiB reserved for kernel runtime allocations
+    const LOWMEM_ABS_RESERVE_FRAMES: usize = 16; // 64 KiB reserved for kernel runtime allocations
     const LOWMEM_THRESHOLD_FRAMES: usize = 2048; // 8 MiB
 
     let mut ut_index = 0;

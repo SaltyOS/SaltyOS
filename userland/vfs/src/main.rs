@@ -216,9 +216,12 @@ fn scale_limit(cap: usize, low: usize, mid: usize, usable_bytes: u64) -> usize {
 unsafe fn init_runtime_limits() {
     unsafe {
         let usable = read_boot_info_usable_bytes();
+        // Lowmem still mounts all initrd entries as inodes, so keep enough
+        // headroom for runtime-created paths (/tmp, /dev/shm, test files).
         LIMIT_INODES = scale_limit(MAX_INODES, 48, 64, usable);
-        LIMIT_WRITABLE = scale_limit(MAX_WRITABLE, 4, 6, usable);
-        LIMIT_CLIENTS = scale_limit(MAX_CLIENTS, 8, 10, usable);
+        LIMIT_WRITABLE = scale_limit(MAX_WRITABLE, 2, 6, usable);
+        // Fork-heavy test workloads need multiple transient client badges.
+        LIMIT_CLIENTS = scale_limit(MAX_CLIENTS, 10, 12, usable);
         LIMIT_FDS = scale_limit(MAX_FDS, 16, 24, usable);
         LIMIT_SOCKETS = scale_limit(MAX_SOCKETS, 4, 6, usable);
         LIMIT_POLL_WAITERS = scale_limit(MAX_POLL_WAITERS, 4, 6, usable);
