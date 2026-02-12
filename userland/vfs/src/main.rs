@@ -216,7 +216,7 @@ fn scale_limit(cap: usize, low: usize, mid: usize, usable_bytes: u64) -> usize {
 unsafe fn init_runtime_limits() {
     unsafe {
         let usable = read_boot_info_usable_bytes();
-        LIMIT_INODES = scale_limit(MAX_INODES, 32, 64, usable);
+        LIMIT_INODES = scale_limit(MAX_INODES, 48, 64, usable);
         LIMIT_WRITABLE = scale_limit(MAX_WRITABLE, 4, 6, usable);
         LIMIT_CLIENTS = scale_limit(MAX_CLIENTS, 4, 6, usable);
         LIMIT_FDS = scale_limit(MAX_FDS, 16, 24, usable);

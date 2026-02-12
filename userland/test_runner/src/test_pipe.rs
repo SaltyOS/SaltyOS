@@ -128,7 +128,7 @@ fn test_dup2() -> bool {
     }
 
     // dup2 write end to a specific fd (e.g., fd 20)
-    let target_fd = 20;
+    let target_fd = 10;
     let ret = unsafe { posix::posix_dup2(fds[1], target_fd) };
     if ret != target_fd {
         puts(b"  dup2() returned wrong fd\n");

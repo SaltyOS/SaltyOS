@@ -794,6 +794,26 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         let parent_pid = PROCTAB[parent_idx].pid;
         let parent_vs = PROCTAB[parent_idx].vspace_cap;
 
+        let parent_shared_base = PROCTAB[parent_idx].shared_lib_base;
+        let initrd_size = read_boot_info_initrd_size() as u64;
+        let mut initrd_phys_base = 0u64;
+        let mut initrd_phys_end = 0u64;
+        if initrd_size != 0 {
+            let err = salty::invoke::vspace_walk(parent_vs, CHILD_INITRD_VADDR, 1);
+            if err == 0 {
+                let ipc = IPC_BUF_VADDR as *const u64;
+                let count = core::ptr::read_volatile(ipc);
+                if count != 0 {
+                    let vaddr = core::ptr::read_volatile(ipc.add(2));
+                    let phys = core::ptr::read_volatile(ipc.add(3));
+                    if vaddr == CHILD_INITRD_VADDR {
+                        initrd_phys_base = phys;
+                        initrd_phys_end = phys + ((initrd_size + 0xFFF) & !0xFFF);
+                    }
+                }
+            }
+        }
+
         { let mut lb = LineBuf::new();
         lb.str(b"[PROCMGR] FORK from PID="); lb.hex(parent_pid as u64); lb.str(b"\n"); lb.flush(); }
 
@@ -806,7 +826,8 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         let child_pid = NEXT_PID;
         NEXT_PID += 1;
 
-        // Count parent pages first
+        // Count parent pages that need new frame allocation (skip IPC buf,
+        // initrd window pages, and shared lib RO pages from cache).
         let mut page_count: usize = 0;
         {
             let mut walk_start: u64 = 0;
@@ -819,7 +840,10 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                 if count == 0 { break; }
                 for i in 0..count as usize {
                     let page_vaddr = core::ptr::read_volatile(ipc.add(2 + i * 3));
-                    if page_vaddr != CHILD_IPC_BUF_VADDR { page_count += 1; }
+                    if page_vaddr == CHILD_IPC_BUF_VADDR { continue; }
+                    if page_vaddr >= CHILD_INITRD_VADDR { continue; }
+                    if spawn_tx::lookup_shared_lib_page(page_vaddr, parent_shared_base).is_some() { continue; }
+                    page_count += 1;
                 }
                 if next_addr == 0 { break; }
                 walk_start = next_addr;
@@ -855,27 +879,6 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         let child_ipc_fr = realize!(OBJ_FRAME, b"[PROCMGR] FORK: IPC frame retype failed\n");
         let child_sig_ntfn = realize!(OBJ_NOTIFICATION, b"[PROCMGR] FORK: signal ntfn retype failed\n");
 
-        // Child untyped with downshift
-        let child_ut_slot = {
-            let mut bits = CHILD_UT_BITS_DEFAULT;
-            let mut result: Option<Cap> = None;
-            while bits >= CHILD_UT_BITS_MIN {
-                match alloc.realize_object(OBJ_UNTYPED, bits as u64) {
-                    Ok(s) => { result = Some(s); break; }
-                    Err(_) => { bits -= 1; }
-                }
-            }
-            match result {
-                Some(s) => s,
-                None => {
-                    puts(b"[PROCMGR] FORK: child untyped unavailable\n");
-                    alloc.rollback();
-                    reply.label = SALTY_OUT_OF_MEMORY;
-                    return;
-                }
-            }
-        };
-
         // Walk parent VSpace again and copy pages
         let mut walk_start: u64 = 0;
         let mut total_pages = 0u64;
@@ -892,9 +895,51 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
 
             for i in 0..count as usize {
                 let page_vaddr = core::ptr::read_volatile(ipc.add(2 + i * 3));
-                let _page_phys = core::ptr::read_volatile(ipc.add(2 + i * 3 + 1));
+                let page_phys = core::ptr::read_volatile(ipc.add(2 + i * 3 + 1));
                 let page_flags = core::ptr::read_volatile(ipc.add(2 + i * 3 + 2));
                 if page_vaddr == CHILD_IPC_BUF_VADDR { continue; }
+
+                // Skip initrd window pages — child doesn't need them after fork
+                if page_vaddr >= CHILD_INITRD_VADDR { continue; }
+
+                // Share cached lib RO pages instead of copying
+                if let Some((cached_cap, cached_flags)) =
+                    spawn_tx::lookup_shared_lib_page(page_vaddr, parent_shared_base)
+                {
+                    let err = salty::invoke::vspace_map(child_vs, cached_cap, page_vaddr, cached_flags);
+                    if err != 0 {
+                        let mut lb = LineBuf::new();
+                        lb.str(b"[PROCMGR] FORK: shared lib map failed at "); lb.hex(page_vaddr);
+                        lb.str(b" err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
+                        alloc.rollback();
+                        reply.label = SALTY_OUT_OF_MEMORY;
+                        return;
+                    }
+                    total_pages += 1;
+                    continue;
+                }
+
+                // Preserve initrd-backed immutable pages as device mappings.
+                if initrd_phys_end > initrd_phys_base
+                    && (page_flags & X86_PTE_WRITABLE) == 0
+                    && page_phys >= initrd_phys_base
+                    && page_phys < initrd_phys_end
+                {
+                    let mut map_flags = VSPACE_FLAG_USER;
+                    if page_flags & X86_PTE_NX == 0 { map_flags |= VSPACE_FLAG_EXECUTABLE; }
+                    let dev_off = page_phys - initrd_phys_base;
+                    let derr = salty::invoke::vspace_map_device(
+                        child_vs,
+                        CAP_INITRD_UNTYPED,
+                        dev_off,
+                        page_vaddr,
+                        map_flags,
+                    );
+                    if derr == 0 {
+                        total_pages += 1;
+                        continue;
+                    }
+                }
 
                 let next_frame = match alloc.realize_object(OBJ_FRAME, 0) {
                     Ok(s) => s,
@@ -983,6 +1028,42 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             reply.label = SALTY_OUT_OF_MEMORY;
             return;
         }
+
+        // Child untyped with downshift.
+        // Allocate this after page-copy work so fork can prioritize frames.
+        let child_ut_slot = {
+            let mut bits = CHILD_UT_BITS_DEFAULT;
+            let mut result: Option<Cap> = None;
+            let mut selected_bits: u8 = 0;
+            while bits >= CHILD_UT_BITS_MIN {
+                match alloc.realize_object(OBJ_UNTYPED, bits as u64) {
+                    Ok(s) => {
+                        result = Some(s);
+                        selected_bits = bits;
+                        break;
+                    }
+                    Err(_) => {
+                        bits -= 1;
+                    }
+                }
+            }
+            match result {
+                Some(s) => {
+                    let mut lb = LineBuf::new();
+                    lb.str(b"[PROCMGR] FORK: child untyped bits=2^");
+                    lb.hex(selected_bits as u64);
+                    lb.str(b"\n");
+                    lb.flush();
+                    s
+                }
+                None => {
+                    puts(b"[PROCMGR] FORK: child untyped unavailable\n");
+                    alloc.rollback();
+                    reply.label = SALTY_OUT_OF_MEMORY;
+                    return;
+                }
+            }
+        };
 
         // Copy child untyped into child CNode
         let cerr = salty::invoke::cnode_copy(
@@ -1094,6 +1175,7 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         p.pgid = PROCTAB[parent_idx].pgid;
         p.slot_base = slot_base;
         p.slot_count = slot_count;
+        p.shared_lib_base = PROCTAB[parent_idx].shared_lib_base;
         for i in 0..NSIG {
             p.sig_disposition[i] = PROCTAB[parent_idx].sig_disposition[i];
         }
@@ -1451,6 +1533,7 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         // Record frame range
         PROCTAB[idx].frame_base = frame_base;
         PROCTAB[idx].frame_count = frame_count as u16;
+        PROCTAB[idx].shared_lib_base = shared_lib_base;
 
         { let mut lb = LineBuf::new();
         lb.str(b"[PROCMGR] EXEC: PID="); lb.hex(PROCTAB[idx].pid as u64);

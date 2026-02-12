@@ -49,6 +49,8 @@ pub struct Process {
     /// Secondary frame range from exec (freed on cleanup).
     pub frame_base: Cap,
     pub frame_count: u16,
+    /// Base address of shared library RO pages (from spawn_tx cache).
+    pub shared_lib_base: u64,
 }
 
 impl Process {
@@ -75,6 +77,7 @@ impl Process {
             slot_count: 0,
             frame_base: 0,
             frame_count: 0,
+            shared_lib_base: 0,
         }
     }
 }
@@ -181,6 +184,7 @@ pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
         p.slot_count = 0;
         p.frame_base = 0;
         p.frame_count = 0;
+        p.shared_lib_base = 0;
         for i in 0..NSIG {
             p.sig_disposition[i] = SIG_DISP_DFL;
         }

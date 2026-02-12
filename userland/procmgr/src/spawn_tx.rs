@@ -133,6 +133,30 @@ impl SharedLibCache {
 
 static mut SHARED_LIB_CACHE: SharedLibCache = SharedLibCache::new();
 
+/// Check if a virtual address falls within the shared library cache's RO pages
+/// and return the cached frame cap + flags if so.
+///
+/// # Safety
+/// Caller must ensure `SHARED_LIB_CACHE` is not being concurrently modified.
+pub(crate) unsafe fn lookup_shared_lib_page(vaddr: u64, lib_base: u64) -> Option<(Cap, u64)> {
+    unsafe {
+        let cache = &*(&raw const SHARED_LIB_CACHE);
+        if !cache.initialized || cache.page_count == 0 || lib_base == 0 {
+            return None;
+        }
+        if vaddr < lib_base {
+            return None;
+        }
+        let offset = vaddr - lib_base;
+        for i in 0..cache.page_count {
+            if cache.pages[i].vaddr_offset == offset {
+                return Some((cache.pages[i].frame_cap, cache.pages[i].flags));
+            }
+        }
+        None
+    }
+}
+
 // ===========================================================================
 // Spawn plan
 // ===========================================================================
@@ -1134,6 +1158,7 @@ pub unsafe fn handle_spawn_tx(
         p.pgid = pid;
         p.slot_base = slot_base;
         p.slot_count = slot_count;
+        p.shared_lib_base = shared_lib_base;
         for i in 0..proc_table::NSIG {
             p.sig_disposition[i] = proc_table::SIG_DISP_DFL;
         }
