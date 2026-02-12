@@ -2360,6 +2360,12 @@ fn syscall_vspace_map_device(
     if let Err(e) = validate_capability(&dev_cap, ObjectType::Untyped, CapRights::READ) {
         return SyscallResult::err(e);
     }
+    if (flags_bits & 1) != 0 && !dev_cap.has_right(CapRights::WRITE) {
+        return SyscallResult::err(SyscallError::InsufficientRights);
+    }
+    if (flags_bits & 4) != 0 && !dev_cap.has_right(CapRights::EXECUTE) {
+        return SyscallResult::err(SyscallError::InsufficientRights);
+    }
 
     unsafe {
         let dev_ut = &*(dev_cap.object as *const UntypedMemory);
@@ -2367,11 +2373,14 @@ fn syscall_vspace_map_device(
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
 
+        let map_limit = crate::init::initrd_device_limit_for(dev_ut as *const UntypedMemory)
+            .unwrap_or(dev_ut.size_bytes() as u64);
+
         let end = match page_offset.checked_add(0x1000) {
             Some(v) => v,
             None => return SyscallResult::err(SyscallError::OutOfRange),
         };
-        if end > dev_ut.size_bytes() as u64 {
+        if end > map_limit {
             return SyscallResult::err(SyscallError::OutOfRange);
         }
 

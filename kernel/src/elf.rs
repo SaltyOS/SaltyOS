@@ -13,6 +13,7 @@ use crate::mm::{alloc_frame, phys_to_virt, PAGE_SIZE};
 
 // ELF64 header
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Elf64Ehdr {
     e_ident: [u8; 16],
     e_type: u16,
@@ -32,6 +33,7 @@ struct Elf64Ehdr {
 
 // ELF64 program header
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Elf64Phdr {
     p_type: u32,
     p_flags: u32,
@@ -45,6 +47,7 @@ struct Elf64Phdr {
 
 // ELF64 dynamic entry
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Elf64Dyn {
     d_tag: i64,
     d_val: u64,
@@ -52,6 +55,7 @@ struct Elf64Dyn {
 
 // ELF64 RELA relocation entry
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Elf64Rela {
     r_offset: u64,
     r_info: u64,
@@ -125,6 +129,16 @@ fn page_align_up(v: u64) -> u64 {
     (v + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1)
 }
 
+/// Read a POD-like struct from an arbitrary byte offset without alignment assumptions.
+fn read_struct<T: Copy>(data: &[u8], offset: usize) -> Option<T> {
+    let size = core::mem::size_of::<T>();
+    let end = offset.checked_add(size)?;
+    if end > data.len() {
+        return None;
+    }
+    unsafe { Some(core::ptr::read_unaligned(data.as_ptr().add(offset) as *const T)) }
+}
+
 /// Load an ELF64 binary into a user VSpace.
 ///
 /// For ET_DYN (PIE): loads at `load_base`, applies RELA relocations.
@@ -140,13 +154,7 @@ pub fn load_elf(
     load_base: u64,
 ) -> Result<ElfLoadResult, ElfError> {
     // Validate minimum size
-    let ehdr_size = core::mem::size_of::<Elf64Ehdr>();
-    if data.len() < ehdr_size {
-        return Err(ElfError::TooSmall);
-    }
-
-    // Parse ELF header
-    let ehdr = unsafe { &*(data.as_ptr() as *const Elf64Ehdr) };
+    let ehdr = read_struct::<Elf64Ehdr>(data, 0).ok_or(ElfError::TooSmall)?;
 
     // Validate magic
     if ehdr.e_ident[0] != 0x7F
@@ -182,10 +190,9 @@ pub fn load_elf(
 
     for i in 0..phdr_count {
         let off = phdr_base + i * phdr_size;
-        if off + core::mem::size_of::<Elf64Phdr>() > data.len() {
+        let Some(phdr) = read_struct::<Elf64Phdr>(data, off) else {
             break;
-        }
-        let phdr = unsafe { &*(data.as_ptr().add(off) as *const Elf64Phdr) };
+        };
         if phdr.p_type == PT_LOAD {
             has_load = true;
             if phdr.p_vaddr < min_vaddr {
@@ -210,10 +217,9 @@ pub fn load_elf(
     // Load each PT_LOAD segment
     for i in 0..phdr_count {
         let off = phdr_base + i * phdr_size;
-        if off + core::mem::size_of::<Elf64Phdr>() > data.len() {
+        let Some(phdr) = read_struct::<Elf64Phdr>(data, off) else {
             break;
-        }
-        let phdr = unsafe { &*(data.as_ptr().add(off) as *const Elf64Phdr) };
+        };
         if phdr.p_type != PT_LOAD {
             continue;
         }
@@ -312,10 +318,9 @@ fn vaddr_to_file_offset(
 ) -> Result<usize, ElfError> {
     for i in 0..phdr_count {
         let off = phdr_base + i * phdr_size;
-        if off + core::mem::size_of::<Elf64Phdr>() > data.len() {
+        let Some(phdr) = read_struct::<Elf64Phdr>(data, off) else {
             break;
-        }
-        let phdr = unsafe { &*(data.as_ptr().add(off) as *const Elf64Phdr) };
+        };
         if phdr.p_type != PT_LOAD {
             continue;
         }
@@ -332,7 +337,7 @@ fn apply_relocations(
     delta: u64,
     vspace: &VSpace,
 ) -> Result<(), ElfError> {
-    let ehdr = unsafe { &*(data.as_ptr() as *const Elf64Ehdr) };
+    let ehdr = read_struct::<Elf64Ehdr>(data, 0).ok_or(ElfError::TooSmall)?;
     let phdr_base = ehdr.e_phoff as usize;
     let phdr_count = ehdr.e_phnum as usize;
     let phdr_size = ehdr.e_phentsize as usize;
@@ -343,10 +348,9 @@ fn apply_relocations(
 
     for i in 0..phdr_count {
         let off = phdr_base + i * phdr_size;
-        if off + core::mem::size_of::<Elf64Phdr>() > data.len() {
+        let Some(phdr) = read_struct::<Elf64Phdr>(data, off) else {
             break;
-        }
-        let phdr = unsafe { &*(data.as_ptr().add(off) as *const Elf64Phdr) };
+        };
         if phdr.p_type == PT_DYNAMIC {
             dyn_offset = phdr.p_offset;
             dyn_size = phdr.p_filesz;
@@ -369,7 +373,7 @@ fn apply_relocations(
     let dyn_end = (dyn_offset + dyn_size) as usize;
 
     while pos + dyn_entry_size <= dyn_end && pos + dyn_entry_size <= data.len() {
-        let dyn_entry = unsafe { &*(data.as_ptr().add(pos) as *const Elf64Dyn) };
+        let dyn_entry = read_struct::<Elf64Dyn>(data, pos).ok_or(ElfError::RelocFailed)?;
 
         if dyn_entry.d_tag == DT_NULL {
             break;
@@ -409,7 +413,7 @@ fn apply_relocations(
             return Err(ElfError::RelocFailed);
         }
 
-        let rela = unsafe { &*(data.as_ptr().add(entry_off) as *const Elf64Rela) };
+        let rela = read_struct::<Elf64Rela>(data, entry_off).ok_or(ElfError::RelocFailed)?;
         let reloc_type = (rela.r_info & 0xFFFF_FFFF) as u32;
 
         if reloc_type == R_X86_64_RELATIVE {

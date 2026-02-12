@@ -38,6 +38,7 @@ use spawn::ExtraCapCopy;
 // ======================================================================
 
 const CAP_IPC_BUF_FRAME: u64 = 131;
+const CAP_UNTYPED_PROBE_TMP: u64 = 132;
 
 const CAP_CHILD_BASE: u64 = 200;
 const CAP_CHILD_STRIDE: u64 = 128;
@@ -49,6 +50,7 @@ pub const COFF_SC: u64 = 3;
 pub const COFF_STACK_FR: u64 = 4;
 pub const COFF_EP: u64 = 5;
 pub const COFF_IPC_FR: u64 = 6;
+pub const COFF_READY_NTFN: u64 = 8;
 pub const COFF_FRAME_START: u64 = 16;
 
 pub const CAP_CHILD_UNTYPED_OFFSET: u64 = 7;
@@ -56,23 +58,31 @@ pub const CHILD_RTLD_FRAME_SLOT_START: u64 = 64;
 
 pub const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
-pub const CHILD_CODE_VADDR: u64 = 0x0000_0000_0040_0000;
-pub const CHILD_STACK_VADDR: u64 = 0x0000_0000_0080_0000;
-pub const CHILD_RTLD_VADDR: u64 = 0x0000_0000_0200_0000;
+// Keep code+rtld+libs+stack+IPC+scratch in one 2MiB PT window
+// (0x200000..0x3fffff) to reduce per-process PT pressure in lowmem boots.
+pub const CHILD_CODE_VADDR: u64 = 0x0000_0000_0021_0000;
+pub const CHILD_STACK_VADDR: u64 = 0x0000_0000_003F_8000;
+pub const CHILD_RTLD_VADDR: u64 = 0x0000_0000_0028_0000;
 pub const CHILD_INITRD_VADDR: u64 = 0x0000_0000_0100_0000;
-pub const CHILD_SCRATCH_VADDR: u64 = 0x0000_0000_0400_0000;
+pub const CHILD_SCRATCH_VADDR: u64 = 0x0000_0000_003F_F000;
 pub const CHILD_IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 pub const SRV_STACK_PAGES: usize = 4;
 pub const SRV_STACK_SIZE: u64 = SRV_STACK_PAGES as u64 * 4096;
 pub const SRV_STACK_TOP: u64 = CHILD_STACK_VADDR + SRV_STACK_SIZE;
 
-const PROCMGR_CNODE_SIZE_BITS: u64 = 15;
-const CHILD_UT_BITS_DEFAULT: u8 = 20;  // 1MB per child
-const CHILD_UT_BITS_PROCMGR: u8 = 25;  // 32MB for procmgr (spawns children)
+const PROCMGR_CNODE_SIZE_BITS: u64 = 12;
+const CHILD_UT_BITS_DEFAULT: u8 = 16;  // 64KB fallback
+const CHILD_UT_BITS_CONSOLE: u8 = 17;  // 128KB
+const CHILD_UT_BITS_NAMESERV: u8 = 16; // 64KB
+const CHILD_UT_BITS_VFS: u8 = 18;      // 256KB
+const CHILD_UT_BITS_DISPLAY: u8 = 15;  // 32KB
+const CHILD_UT_BITS_PROCMGR: u8 = 20;  // 1MB for procmgr (spawns children via allocator)
 const PM_WAIT_ANY_CHILD: u64 = u32::MAX as u64;
 
-const INIT_DYN_FRAME_MIN: u64 = 720;
+// Keep init's transient frame/cap allocations above per-service child slots
+// while staying inside init CSpace (0..4095).
+const INIT_DYN_FRAME_MIN: u64 = 1024;
 
 pub const AT_NULL: u64 = 0;
 pub const AT_PHDR: u64 = 3;
@@ -128,6 +138,22 @@ fn idle() -> ! {
     }
 }
 
+fn select_init_work_untyped() -> Cap {
+    let candidate = CAP_UNTYPED_START + 1;
+    let err = invoke::cnode_copy(
+        CAP_SELF_CSPACE,
+        candidate,
+        CAP_SELF_CSPACE,
+        CAP_UNTYPED_PROBE_TMP,
+        CAP_RIGHTS_ALL,
+    );
+    if err == 0 {
+        invoke::cnode_delete(CAP_SELF_CSPACE, CAP_UNTYPED_PROBE_TMP);
+        return candidate;
+    }
+    CAP_UNTYPED_START
+}
+
 /// Read the kernel boot info page at BOOTINFO_VADDR.
 /// Returns (initrd_vaddr, initrd_size).
 unsafe fn read_boot_info() -> (u64, usize) {
@@ -154,6 +180,34 @@ fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
         }
     }
     true
+}
+
+fn memory_kb_to_ut_bits(kb: u16) -> u8 {
+    let bytes = (kb as u32) * 1024;
+    let mut bits: u8 = 12;
+    while (1u32 << bits) < bytes && bits < 28 {
+        bits += 1;
+    }
+    bits
+}
+
+fn child_ut_bits_for_service(name: &[u8], memory_kb: u16) -> u8 {
+    if memory_kb > 0 {
+        return memory_kb_to_ut_bits(memory_kb);
+    }
+    if bytes_eq(name, b"console") {
+        CHILD_UT_BITS_CONSOLE
+    } else if bytes_eq(name, b"nameserv") {
+        CHILD_UT_BITS_NAMESERV
+    } else if bytes_eq(name, b"vfs") {
+        CHILD_UT_BITS_VFS
+    } else if bytes_eq(name, b"display") {
+        CHILD_UT_BITS_DISPLAY
+    } else if bytes_eq(name, b"procmgr") {
+        CHILD_UT_BITS_PROCMGR
+    } else {
+        CHILD_UT_BITS_DEFAULT
+    }
 }
 
 // ======================================================================
@@ -275,7 +329,7 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap) -> Cap {
             let is_procmgr = bytes_eq(name, b"procmgr");
             let cnode_bits = if is_procmgr { PROCMGR_CNODE_SIZE_BITS } else { 0 };
             let map_initrd = is_procmgr;
-            let ut_bits = if is_procmgr { CHILD_UT_BITS_PROCMGR } else { CHILD_UT_BITS_DEFAULT };
+            let ut_bits = child_ut_bits_for_service(name, mgr.services[svc_idx].def.memory_kb);
 
             let err = unsafe {
                 spawn::spawn_server(
@@ -378,8 +432,9 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap) -> Cap {
     procmgr_ep
 }
 
-fn build_extras(name: &[u8], console_ep: Cap, ns_ep: Cap, vfs_ep: Cap) -> [ExtraCapCopy; 4] {
-    let mut extras: [ExtraCapCopy; 4] = [
+fn build_extras(name: &[u8], console_ep: Cap, ns_ep: Cap, vfs_ep: Cap) -> [ExtraCapCopy; 5] {
+    let mut extras: [ExtraCapCopy; 5] = [
+        ExtraCapCopy { src: 0, dst: 0 },
         ExtraCapCopy { src: 0, dst: 0 },
         ExtraCapCopy { src: 0, dst: 0 },
         ExtraCapCopy { src: 0, dst: 0 },
@@ -409,6 +464,8 @@ fn build_extras(name: &[u8], console_ep: Cap, ns_ep: Cap, vfs_ep: Cap) -> [Extra
         if vfs_ep != 0 {
             extras[1] = ExtraCapCopy { src: vfs_ep, dst: 9 };
         }
+        extras[2] = ExtraCapCopy { src: CAP_INITRD_UNTYPED, dst: CAP_INITRD_UNTYPED };
+        extras[3] = ExtraCapCopy { src: CAP_FB_UNTYPED, dst: CAP_FB_UNTYPED };
     }
     // Display server gets framebuffer device untyped
     if bytes_eq(name, b"display") {
@@ -567,7 +624,8 @@ unsafe fn service_monitor(mgr: &mut svc_mgr::ServiceManager, pm_ep: Cap) -> ! {
 pub extern "C" fn _start() -> ! {
     puts(b"[INIT] SaltyOS init process starting\n");
 
-    let ut: Cap = CAP_UNTYPED_START;
+    let ut: Cap = select_init_work_untyped();
+    { let mut lb = LineBuf::new(); lb.str(b"[INIT] Bootstrap untyped slot="); lb.hex(ut); lb.str(b"\n"); lb.flush(); }
 
     // Set up IPC buffer for init
     let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, CAP_IPC_BUF_FRAME);
@@ -582,7 +640,11 @@ pub extern "C" fn _start() -> ! {
         VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
     );
     if err != 0 {
-        puts(b"[INIT] FAIL: IPC buf map\n");
+        let mut lb = LineBuf::new();
+        lb.str(b"[INIT] FAIL: IPC buf map err=");
+        lb.hex(err as u64);
+        lb.str(b"\n");
+        lb.flush();
         idle();
     }
     invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
@@ -664,7 +726,7 @@ unsafe fn legacy_boot(ut: Cap) {
                 ExtraCapCopy { src: CAP_COM1_IOPORT, dst: 4 },
                 ExtraCapCopy { src: CAP_COM1_IRQ, dst: 5 },
                 ExtraCapCopy { src: CAP_COM1_NTFN, dst: 6 },
-            ], false, 0, CHILD_UT_BITS_DEFAULT) != 0 {
+            ], false, 0, child_ut_bits_for_service(b"console", 0)) != 0 {
             puts(b"[INIT] FAIL: console spawn failed\n");
             return;
         }
@@ -676,7 +738,7 @@ unsafe fn legacy_boot(ut: Cap) {
         let mut pm_ep = LEGACY_CAP_PM_BASE + COFF_EP;
 
         // Spawn nameserv
-        if spawn::spawn_server(ut, LEGACY_CAP_NS_BASE, b"nameserv.elf", b"nameserv", &[], false, 0, CHILD_UT_BITS_DEFAULT) != 0 {
+        if spawn::spawn_server(ut, LEGACY_CAP_NS_BASE, b"nameserv.elf", b"nameserv", &[], false, 0, child_ut_bits_for_service(b"nameserv", 0)) != 0 {
             puts(b"[INIT] FAIL: nameserv spawn failed\n");
             return;
         }
@@ -687,7 +749,7 @@ unsafe fn legacy_boot(ut: Cap) {
             ExtraCapCopy { src: console_ep, dst: 4 },
             ExtraCapCopy { src: ns_ep, dst: 8 },
         ];
-        if spawn::spawn_server(ut, LEGACY_CAP_VFS_BASE, b"vfs.elf", b"vfs", &vfs_extras, false, 0, CHILD_UT_BITS_DEFAULT) != 0 {
+        if spawn::spawn_server(ut, LEGACY_CAP_VFS_BASE, b"vfs.elf", b"vfs", &vfs_extras, false, 0, child_ut_bits_for_service(b"vfs", 0)) != 0 {
             puts(b"[INIT] FAIL: vfs spawn failed\n");
             return;
         }
@@ -697,8 +759,9 @@ unsafe fn legacy_boot(ut: Cap) {
         let pm_extras = [
             ExtraCapCopy { src: ns_ep, dst: 8 },
             ExtraCapCopy { src: vfs_ep, dst: 9 },
+            ExtraCapCopy { src: CAP_INITRD_UNTYPED, dst: CAP_INITRD_UNTYPED },
         ];
-        if spawn::spawn_server(ut, LEGACY_CAP_PM_BASE, b"procmgr.elf", b"procmgr", &pm_extras, true, PROCMGR_CNODE_SIZE_BITS, CHILD_UT_BITS_PROCMGR) != 0 {
+        if spawn::spawn_server(ut, LEGACY_CAP_PM_BASE, b"procmgr.elf", b"procmgr", &pm_extras, true, PROCMGR_CNODE_SIZE_BITS, child_ut_bits_for_service(b"procmgr", 0)) != 0 {
             puts(b"[INIT] FAIL: procmgr spawn failed\n");
             return;
         }

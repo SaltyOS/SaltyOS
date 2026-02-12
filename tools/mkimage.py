@@ -727,6 +727,12 @@ def main():
         help='Build directory to find binaries'
     )
     parser.add_argument(
+        '--kernel',
+        type=Path,
+        default=None,
+        help='Kernel ELF path (defaults to build-dir/kernel/kernel.elf)'
+    )
+    parser.add_argument(
         '--efi',
         action='store_true',
         help='Create UEFI image (with ESP) instead of BIOS image'
@@ -745,7 +751,7 @@ def main():
         stage1_efi = args.build_dir / 'boot' / 'BOOTX64.EFI'
         stage2_efi = args.build_dir / 'boot' / 'stage2.efi'
         stage3 = args.build_dir / 'boot' / 'stage3_uefi.bin'
-        kernel = args.build_dir / 'kernel' / 'kernel.elf'
+        kernel = args.kernel if args.kernel is not None else args.build_dir / 'kernel' / 'kernel.elf'
 
         # Validate paths
         for name, path in [('Stage1 EFI', stage1_efi), ('Stage2 EFI', stage2_efi),
@@ -769,7 +775,7 @@ def main():
         mbr = args.build_dir / 'boot' / 'mbr.bin'
         stage2 = args.build_dir / 'boot' / 'stage2.bin'
         stage3 = args.build_dir / 'boot' / 'stage3.bin'
-        kernel = args.build_dir / 'kernel' / 'kernel.elf'
+        kernel = args.kernel if args.kernel is not None else args.build_dir / 'kernel' / 'kernel.elf'
 
         # Validate paths
         for name, path in [('MBR', mbr), ('Stage2', stage2),

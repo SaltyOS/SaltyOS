@@ -224,6 +224,10 @@ fn com1_init() {
     invoke::ioport_out8(CAP_IOPORT, COM1_IER, 0x01);
 }
 
+fn signal_ready() {
+    let _ = salty::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+}
+
 /// Write a byte slice with CR/LF translation via DebugPutStr syscall.
 fn console_puts(s: &[u8]) {
     let mut buf = [0u8; 80];
@@ -532,6 +536,7 @@ pub extern "C" fn _start() -> ! {
         // IPC messages and notification signals)
         invoke::tcb_bind_notification(CAP_SELF_TCB, CAP_NTFN);
     }
+    signal_ready();
 
     let mut ring = RingBuf::new();
     let mut line = LineBuf::new();

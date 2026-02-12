@@ -2,9 +2,8 @@
 //!
 //! Creates and dispatches the first user-mode task from kmain().
 //!
-//! If an initrd is present in BootInfo, loads init.elf from the CPIO archive
-//! using the kernel ELF loader. Otherwise falls back to a hardcoded bytecode
-//! yield loop.
+//! Loads init.elf from the initrd CPIO archive using the kernel ELF loader.
+//! The initrd is required; there is no hardcoded user-mode fallback.
 //!
 //! Sets up the init task's CSpace with well-known capability slots for
 //! TCB, VSpace, CSpace, and Untyped memory regions.
@@ -17,8 +16,11 @@ use crate::cap::{
 };
 use crate::ipc::{IrqHandler, Notification};
 use crate::mm::vspace::PageFlags;
-use crate::mm::{alloc_contiguous_frames, alloc_frame, phys_to_virt, VSpace, PAGE_SIZE};
+use crate::mm::{
+    alloc_contiguous_frames, alloc_frame, free_frame_count, phys_to_virt, VSpace, PAGE_SIZE,
+};
 use crate::sched::thread::{SchedContext, Tcb};
+use crate::bootinfo::MemoryKind;
 use crate::ParsedBootInfo;
 use core::mem::MaybeUninit;
 
@@ -64,8 +66,8 @@ const CAP_SELF_CSPACE: usize = 2;
 const CAP_COM1_IOPORT: usize = 8;
 const CAP_COM1_IRQ: usize = 9;
 const CAP_COM1_NOTIFICATION: usize = 10;
-/// Initrd info slots (vaddr and size passed as badge values)
-const CAP_INITRD_VSPACE: usize = 11;
+/// Initrd device untyped capability (for map_device into child VSpaces)
+const CAP_INITRD_UNTYPED: usize = 12;
 /// Framebuffer device untyped
 const CAP_FB_UNTYPED: usize = 13;
 const CAP_UNTYPED_START: usize = 16;
@@ -77,21 +79,6 @@ const BOOTINFO_VADDR: u64 = 0x0000_00C0_0000;
 
 /// Maximum number of untyped regions to hand to init
 const MAX_INIT_UNTYPEDS: usize = 64;
-
-/// Minimal user program: yield loop (fallback when no initrd)
-///
-/// ```asm
-/// loop:
-///   mov rax, 8       ; SYS_YIELD
-///   syscall
-///   jmp loop
-/// ```
-static INIT_USER_CODE: [u8; 12] = [
-    0x48, 0xC7, 0xC0, 0x08, 0x00, 0x00, 0x00, // mov rax, 8
-    0x0F, 0x05,                                 // syscall
-    0xEB, 0xF5,                                 // jmp -11 (back to mov)
-    0x00,                                       // padding
-];
 
 /// Init's CNode size: 4096 slots (2^12) to accommodate initrd mapping
 const INIT_CNODE_SIZE_BITS: u8 = 12;
@@ -131,6 +118,12 @@ static mut INIT_COM1_NOTIFICATION: Notification = Notification::new();
 
 /// Framebuffer device untyped (static, never freed)
 static mut INIT_FB_UNTYPED: UntypedMemory = UntypedMemory::new(0, 0, true);
+/// Initrd-backed pseudo-device untyped for zero-copy child initrd mapping
+static mut INIT_INITRD_UNTYPED: UntypedMemory = UntypedMemory::new(0, 0, true);
+/// Exact byte limit (page-aligned) for initrd map_device exposure
+static mut INITRD_DEVICE_LIMIT_BYTES: u64 = 0;
+/// Pointer identity for the initrd pseudo-device untyped object
+static mut INITRD_DEVICE_UT_PTR: *const UntypedMemory = core::ptr::null();
 
 /// Bootstrap the first user-mode init task
 pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
@@ -160,24 +153,21 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
     // Create VSpace from the new PML4
     let mut vspace = VSpace::new(pml4_phys);
 
-    // Load init program: try ELF from initrd, fall back to hardcoded bytecode
-    let (user_rip, user_stack_top) = if let Some(info) = boot_info {
-        if info.initrd_addr != 0 && info.initrd_size != 0 {
-            load_from_initrd(info, &mut vspace)
-        } else {
-            load_hardcoded_fallback(&mut vspace)
-        }
-    } else {
-        load_hardcoded_fallback(&mut vspace)
+    // Initrd is required now that kernel fallback init is removed.
+    let info = match boot_info {
+        Some(info) => info,
+        None => boot_fatal!("boot info missing; required initrd unavailable"),
     };
-
-    // Map initrd into user VSpace (for procmgr to parse CPIO)
-    if let Some(info) = boot_info {
-        if info.initrd_addr != 0 && info.initrd_size != 0 {
-            map_initrd(info, &mut vspace);
-            map_bootinfo(&mut vspace, boot_info);
-        }
+    if info.initrd_addr == 0 || info.initrd_size == 0 {
+        boot_fatal!("initrd missing; required init unavailable");
     }
+
+    // Load init program from initrd.
+    let (user_rip, user_stack_top) = load_from_initrd(info, &mut vspace);
+
+    // Map initrd + boot info into init address space.
+    map_initrd(info, &mut vspace);
+    map_bootinfo(&mut vspace, boot_info);
 
     // Allocate a kernel stack for the trampoline (used by context_switch → iretq)
     let tramp_stack_phys = boot_unwrap!(alloc_frame(), "trampoline stack alloc failed");
@@ -321,6 +311,36 @@ fn setup_init_cspace(boot_info: Option<&ParsedBootInfo>) {
             ObjectType::Notification,
         );
 
+        // Slot 12: Initrd pseudo-device untyped for map_device-based sharing
+        if let Some(info) = boot_info {
+            if info.initrd_addr != 0 && info.initrd_size != 0 {
+                let size_bits = ceil_log2(core::cmp::max(PAGE_SIZE as u64, info.initrd_size as u64));
+                let initrd_ut = &raw mut INIT_INITRD_UNTYPED;
+                (*initrd_ut) = UntypedMemory::new(info.initrd_addr, size_bits, true);
+                INITRD_DEVICE_LIMIT_BYTES =
+                    ((info.initrd_size as u64 + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64)
+                        * PAGE_SIZE as u64;
+                INITRD_DEVICE_UT_PTR = initrd_ut as *const UntypedMemory;
+
+                insert_static_cap_with_rights(
+                    cnode,
+                    CAP_INITRD_UNTYPED,
+                    initrd_ut as *mut crate::cap::KernelObject,
+                    ObjectType::Untyped,
+                    CapRights::READ | CapRights::EXECUTE | CapRights::GRANT,
+                );
+
+                {
+                    let s = crate::SerialGuard::acquire();
+                    s.puts("[INIT] Initrd: device untyped phys=");
+                    s.hex(info.initrd_addr);
+                    s.puts(" size=2^");
+                    s.dec(size_bits as u64);
+                    s.putc(b'\n');
+                }
+            }
+        }
+
         // Slot 13: Framebuffer device untyped (if framebuffer is available)
         if let Some(info) = boot_info {
             let fb = &info.framebuffer;
@@ -365,16 +385,41 @@ unsafe fn insert_static_cap(
     object: *mut crate::cap::KernelObject,
     obj_type: ObjectType,
 ) {
+    unsafe {
+        insert_static_cap_with_rights(cnode, cnode_index, object, obj_type, CapRights::ALL);
+    }
+}
+
+/// Insert a capability for a statically-allocated kernel object with explicit rights.
+unsafe fn insert_static_cap_with_rights(
+    cnode: &mut CNode,
+    cnode_index: usize,
+    object: *mut crate::cap::KernelObject,
+    obj_type: ObjectType,
+    rights: CapRights,
+) {
     let slot = boot_unwrap!(alloc_slot(), "cap slot alloc failed");
     let cap = get_cap_mut(slot);
     cap.object = object;
     cap.obj_type = obj_type;
-    cap.rights = CapRights::ALL;
+    cap.rights = rights;
     cap.depth = 0;
     cap.badge = 0;
     cnode
         .insert_ref(cnode_index, CapRef { slot })
         .unwrap_or_else(|_| boot_fatal!("CNode insert failed"));
+}
+
+/// If `obj` is the initrd pseudo-device untyped, returns its exact map limit bytes.
+pub fn initrd_device_limit_for(obj: *const UntypedMemory) -> Option<u64> {
+    unsafe {
+        let tracked = INITRD_DEVICE_UT_PTR;
+        if tracked.is_null() || obj != tracked {
+            None
+        } else {
+            Some(INITRD_DEVICE_LIMIT_BYTES)
+        }
+    }
 }
 
 /// Create untyped memory capabilities from boot info memory map
@@ -383,53 +428,117 @@ unsafe fn create_untyped_caps(cnode: &mut CNode, _info: &ParsedBootInfo) {
     // do not overlap frames already in use by the kernel.
     const MAX_SIZE_BITS: u8 = 28; // 256 MiB
     const MIN_SIZE_BITS: u8 = 12; // 4 KiB
+    const NORMAL_MIN_KERNEL_RESERVE_FRAMES: usize = 1024; // 4 MiB
+    const LOWMEM_ABS_RESERVE_FRAMES: usize = 32; // 128 KiB reserved for kernel runtime allocations
+    const LOWMEM_THRESHOLD_FRAMES: usize = 2048; // 8 MiB
 
     let mut ut_index = 0;
+    let mut free_frames = free_frame_count();
+    let reserve_frames = if free_frames <= LOWMEM_THRESHOLD_FRAMES {
+        core::cmp::max(LOWMEM_ABS_RESERVE_FRAMES, free_frames / 16)
+    } else {
+        core::cmp::max(NORMAL_MIN_KERNEL_RESERVE_FRAMES, free_frames / 8)
+    };
 
-    for size_bits in (MIN_SIZE_BITS..=MAX_SIZE_BITS).rev() {
-        if ut_index >= MAX_INIT_UNTYPEDS {
-            break;
-        }
+    {
+        let s = crate::SerialGuard::acquire();
+        s.puts("[INIT] Untyped reserve frames: ");
+        s.dec(reserve_frames as u64);
+        s.puts(" (free=");
+        s.dec(free_frames as u64);
+        s.puts(")\n");
+    }
 
+    // At lowmem, start from 1MB instead of 256MB to avoid wasting
+    // iteration and to produce multiple smaller regions for flexibility.
+    let start_bits = if free_frames <= LOWMEM_THRESHOLD_FRAMES {
+        if MAX_SIZE_BITS > 20 { 20 } else { MAX_SIZE_BITS }
+    } else {
+        MAX_SIZE_BITS
+    };
+
+    'size_loop: for size_bits in (MIN_SIZE_BITS..=start_bits).rev() {
         let size_bytes = 1usize << size_bits;
         let frame_count = size_bytes / PAGE_SIZE;
 
-        let Some(base) = alloc_contiguous_frames(frame_count) else {
-            continue;
-        };
+        // Allocate as many regions as possible at this size before moving
+        // to smaller chunks. This maximizes exposed untyped memory while
+        // still preferring larger blocks first.
+        while ut_index < MAX_INIT_UNTYPEDS {
+            // Keep a reserve for kernel page-table growth and runtime mappings.
+            if free_frames <= reserve_frames {
+                break 'size_loop;
+            }
+            if frame_count > free_frames.saturating_sub(reserve_frames) {
+                break;
+            }
 
-        // Initialize the UntypedMemory object in static storage
-        let ut = unsafe { &raw mut INIT_UNTYPEDS[ut_index] };
-        unsafe { (*ut) = UntypedMemory::new(base, size_bits, false); }
+            let Some(base) = alloc_contiguous_frames(frame_count) else {
+                break;
+            };
+            free_frames = free_frames.saturating_sub(frame_count);
 
-        // Allocate a global cap slot and populate it
-        let slot = boot_unwrap!(alloc_slot(), "untyped cap slot alloc failed");
-        let cap = get_cap_mut(slot);
-        cap.object = ut as *mut crate::cap::KernelObject;
-        cap.obj_type = ObjectType::Untyped;
-        cap.rights = CapRights::ALL;
-        cap.depth = 0;
-        cap.badge = 0;
+            // Initialize the UntypedMemory object in static storage
+            let ut = unsafe { &raw mut INIT_UNTYPEDS[ut_index] };
+            unsafe { (*ut) = UntypedMemory::new(base, size_bits, false); }
 
-        let cnode_slot = CAP_UNTYPED_START + ut_index;
-        cnode
-            .insert_ref(cnode_slot, CapRef { slot })
-            .unwrap_or_else(|_| boot_fatal!("untyped CNode insert failed"));
+            // Allocate a global cap slot and populate it
+            let slot = boot_unwrap!(alloc_slot(), "untyped cap slot alloc failed");
+            let cap = get_cap_mut(slot);
+            cap.object = ut as *mut crate::cap::KernelObject;
+            cap.obj_type = ObjectType::Untyped;
+            cap.rights = CapRights::ALL;
+            cap.depth = 0;
+            cap.badge = 0;
 
-        {
-            let s = crate::SerialGuard::acquire();
-            s.puts("[INIT]   Untyped ");
-            s.dec(ut_index as u64);
-            s.puts(": phys=");
-            s.hex(base);
-            s.puts(" size=");
-            s.hex(1u64 << size_bits);
-            s.puts(" (2^");
-            s.dec(size_bits as u64);
-            s.puts(")\n");
+            let cnode_slot = CAP_UNTYPED_START + ut_index;
+            cnode
+                .insert_ref(cnode_slot, CapRef { slot })
+                .unwrap_or_else(|_| boot_fatal!("untyped CNode insert failed"));
+
+            {
+                let s = crate::SerialGuard::acquire();
+                s.puts("[INIT]   Untyped ");
+                s.dec(ut_index as u64);
+                s.puts(": phys=");
+                s.hex(base);
+                s.puts(" size=");
+                s.hex(1u64 << size_bits);
+                s.puts(" (2^");
+                s.dec(size_bits as u64);
+                s.puts(")\n");
+            }
+
+            ut_index += 1;
         }
+    }
 
-        ut_index += 1;
+    // Low-memory fallback: ensure init gets at least one small untyped.
+    if ut_index == 0 && free_frames > LOWMEM_ABS_RESERVE_FRAMES {
+        if let Some(base) = alloc_frame() {
+            let ut = unsafe { &raw mut INIT_UNTYPEDS[ut_index] };
+            unsafe { (*ut) = UntypedMemory::new(base, MIN_SIZE_BITS, false); }
+
+            let slot = boot_unwrap!(alloc_slot(), "fallback untyped cap slot alloc failed");
+            let cap = get_cap_mut(slot);
+            cap.object = ut as *mut crate::cap::KernelObject;
+            cap.obj_type = ObjectType::Untyped;
+            cap.rights = CapRights::ALL;
+            cap.depth = 0;
+            cap.badge = 0;
+
+            cnode
+                .insert_ref(CAP_UNTYPED_START + ut_index, CapRef { slot })
+                .unwrap_or_else(|_| boot_fatal!("fallback untyped CNode insert failed"));
+
+            {
+                let s = crate::SerialGuard::acquire();
+                s.puts("[INIT]   Untyped fallback: phys=");
+                s.hex(base);
+                s.puts(" size=0x1000\n");
+            }
+            ut_index += 1;
+        }
     }
 
     if ut_index == 0 {
@@ -466,10 +575,7 @@ fn load_from_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) -> (u64, u64) {
             }
             entry.data
         }
-        None => {
-            crate::serial_puts("[INIT] WARNING: init.elf not found in initrd, using fallback\n");
-            return load_hardcoded_fallback(vspace);
-        }
+        None => boot_fatal!("init.elf not found in initrd"),
     };
 
     crate::serial_puts("[INIT] Loading ELF from initrd\n");
@@ -490,7 +596,7 @@ fn load_from_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) -> (u64, u64) {
                 crate::elf::ElfError::MapFailed => crate::serial_puts("map failed"),
             }
             crate::serial_puts("\n");
-            panic!("init ELF load failed");
+            boot_fatal!("init ELF load failed");
         }
     };
 
@@ -528,6 +634,7 @@ fn map_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) {
     let initrd_phys = info.initrd_addr;
     let initrd_size = info.initrd_size as usize;
     let num_pages = (initrd_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    let direct_map_ok = (initrd_phys & (PAGE_SIZE as u64 - 1)) == 0;
 
     {
         let s = crate::SerialGuard::acquire();
@@ -539,6 +646,12 @@ fn map_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) {
         s.dec(num_pages as u64);
         s.puts(" -> vaddr=");
         s.hex(INITRD_VADDR);
+        s.puts(" mode=");
+        if direct_map_ok {
+            s.puts("direct");
+        } else {
+            s.puts("copy");
+        }
         s.putc(b'\n');
     }
 
@@ -546,24 +659,27 @@ fn map_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) {
         let phys = initrd_phys + (i * PAGE_SIZE) as u64;
         let virt = INITRD_VADDR + (i * PAGE_SIZE) as u64;
 
-        // Allocate a new frame and copy the initrd data into it, since the
-        // original physical pages may not be frame-aligned or may overlap
-        // with kernel-managed memory.
-        let frame_phys = boot_unwrap!(alloc_frame(), "initrd frame alloc failed");
-        let frame_virt = phys_to_virt(frame_phys) as *mut u8;
-        let src = phys_to_virt(phys) as *const u8;
-        let copy_len = if (i + 1) * PAGE_SIZE > initrd_size {
-            initrd_size - i * PAGE_SIZE
+        let map_phys = if direct_map_ok {
+            phys
         } else {
-            PAGE_SIZE
+            // Fallback path for non-page-aligned bootloader initrd.
+            let frame_phys = boot_unwrap!(alloc_frame(), "initrd frame alloc failed");
+            let frame_virt = phys_to_virt(frame_phys) as *mut u8;
+            let src = phys_to_virt(phys) as *const u8;
+            let copy_len = if (i + 1) * PAGE_SIZE > initrd_size {
+                initrd_size - i * PAGE_SIZE
+            } else {
+                PAGE_SIZE
+            };
+            unsafe {
+                core::ptr::write_bytes(frame_virt, 0, PAGE_SIZE);
+                core::ptr::copy_nonoverlapping(src, frame_virt, copy_len);
+            }
+            frame_phys
         };
-        unsafe {
-            core::ptr::write_bytes(frame_virt, 0, PAGE_SIZE);
-            core::ptr::copy_nonoverlapping(src, frame_virt, copy_len);
-        }
 
         vspace
-            .map(virt, frame_phys, PageFlags::USER_RO)
+            .map(virt, map_phys, PageFlags::USER_RO)
             .unwrap_or_else(|_| boot_fatal!("initrd page map failed"));
     }
 
@@ -599,7 +715,12 @@ static mut INITRD_USER_SIZE: u64 = 0;
 ///   offset 48: fb_green_size (u8)
 ///   offset 49: fb_blue_pos (u8)
 ///   offset 50: fb_blue_size (u8)
+///   offset 56: total_usable_bytes (u64)
 fn map_bootinfo(vspace: &mut VSpace, boot_info: Option<&ParsedBootInfo>) {
+    let total_usable = match boot_info {
+        Some(info) => bootinfo_total_usable_bytes(info),
+        None => 0,
+    };
     let frame_phys = boot_unwrap!(alloc_frame(), "bootinfo frame alloc failed");
     let frame_virt = phys_to_virt(frame_phys) as *mut u8;
     unsafe {
@@ -627,6 +748,10 @@ fn map_bootinfo(vspace: &mut VSpace, boot_info: Option<&ParsedBootInfo>) {
                 *frame_virt.add(50) = fb.blue_size;
             }
         }
+
+        // Total usable memory in bytes (for userspace memory scaling)
+        let total_ptr = frame_virt.add(56) as *mut u64;
+        total_ptr.write(total_usable);
     }
     vspace
         .map(BOOTINFO_VADDR, frame_phys, PageFlags::USER_RO)
@@ -640,37 +765,13 @@ fn map_bootinfo(vspace: &mut VSpace, boot_info: Option<&ParsedBootInfo>) {
     }
 }
 
-/// Load the hardcoded yield-loop bytecode (fallback when no initrd)
-fn load_hardcoded_fallback(vspace: &mut VSpace) -> (u64, u64) {
-    crate::serial_puts("[INIT] Using hardcoded bytecode fallback\n");
-
-    // Allocate and map user code page
-    let code_phys = boot_unwrap!(alloc_frame(), "code frame alloc failed");
-    let code_virt = phys_to_virt(code_phys) as *mut u8;
-    unsafe {
-        core::ptr::write_bytes(code_virt, 0, PAGE_SIZE);
-        core::ptr::copy_nonoverlapping(
-            INIT_USER_CODE.as_ptr(),
-            code_virt,
-            INIT_USER_CODE.len(),
-        );
-    }
-    vspace
-        .map(INIT_CODE_VADDR, code_phys, PageFlags::USER_RX)
-        .unwrap_or_else(|_| boot_fatal!("code map failed"));
-
-    // Allocate and map a multi-page user stack
-    for pg in 0..INIT_STACK_PAGES {
-        let stack_phys = boot_unwrap!(alloc_frame(), "stack frame alloc failed");
-        let stack_virt = phys_to_virt(stack_phys) as *mut u8;
-        unsafe {
-            core::ptr::write_bytes(stack_virt, 0, PAGE_SIZE);
+fn bootinfo_total_usable_bytes(info: &ParsedBootInfo) -> u64 {
+    let mut total = 0u64;
+    for i in 0..info.memory_map_len {
+        let entry = info.memory_map[i];
+        if entry.kind == MemoryKind::Usable {
+            total = total.saturating_add(entry.length);
         }
-        let stack_vaddr = INIT_STACK_VADDR + (pg as u64) * PAGE_SIZE as u64;
-        vspace
-            .map(stack_vaddr, stack_phys, PageFlags::USER_RW)
-            .unwrap_or_else(|_| boot_fatal!("stack map failed"));
     }
-
-    (INIT_CODE_VADDR, INIT_STACK_TOP)
+    total
 }

@@ -177,3 +177,36 @@ pub const fn phys_to_virt(phys: PhysAddr) -> VirtAddr {
 pub const fn virt_to_phys(virt: VirtAddr) -> PhysAddr {
     virt - PHYS_MAP_OFFSET
 }
+
+/// Switch frame bitmap pointer from identity mapping to direct physical map.
+///
+/// Must be called exactly once, after `paging::init()` establishes the
+/// direct physical mapping and before the identity mapping is removed.
+pub fn remap_frame_bitmap() {
+    let irq_flag = unsafe { save_irq_disable() };
+    FRAME_LOCK.lock();
+    // SAFETY: Called once during single-CPU boot, after direct map is valid
+    unsafe {
+        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
+            allocator.remap_bitmap();
+        }
+    }
+    FRAME_LOCK.unlock();
+    unsafe { restore_irq(irq_flag) };
+    crate::serial_puts("[MM] Frame bitmap remapped to direct physical map\n");
+}
+
+/// Get the number of free physical frames (SMP-safe)
+pub fn free_frame_count() -> usize {
+    let irq_flag = unsafe { save_irq_disable() };
+    FRAME_LOCK.lock();
+    let count = unsafe {
+        match (*(&raw mut FRAME_ALLOCATOR)).as_ref() {
+            Some(allocator) => allocator.free_count(),
+            None => 0,
+        }
+    };
+    FRAME_LOCK.unlock();
+    unsafe { restore_irq(irq_flag) };
+    count
+}

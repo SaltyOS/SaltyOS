@@ -32,6 +32,10 @@ fn puts(s: &[u8]) {
     serial::serial_puts(s);
 }
 
+fn signal_ready() {
+    let _ = salty::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     // IPC buffer is pre-mapped by procmgr at 0x200000
@@ -41,6 +45,7 @@ pub extern "C" fn _start() -> ! {
     }
 
     puts(b"[TEST_RUNNER] SaltyOS Test Runner starting\n");
+    signal_ready();
 
     let tests: [(&[u8], fn() -> bool); 10] = [
         (b"test_hello", test_hello::run),

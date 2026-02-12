@@ -51,6 +51,30 @@ void parse_dynamic(struct link_map *map, Elf64_Dyn *dyn, uint64_t base) {
 /* Allocate a frame, map at scratch, copy data, unmap from scratch, map at target.
  * Returns 0 on success, nonzero on failure.
  */
+static uint64_t retype_frame_any(struct rtld_state *st, cap_t frame_slot) {
+    uint64_t err = rtld_retype_frame(st->untyped, frame_slot);
+    if (err == 0)
+        return 0;
+
+    uint64_t best_err = err;
+    for (cap_t ut = CAP_UNTYPED_START; ut < CAP_UNTYPED_END; ut++) {
+        if (ut == st->untyped)
+            continue;
+        err = rtld_retype_frame(ut, frame_slot);
+        if (err == 0) {
+            st->untyped = ut;
+            return 0;
+        }
+        if (err != SALTY_INVALID_CAPABILITY
+            && err != SALTY_INVALID_OPERATION
+            && err != SALTY_NOT_FOUND) {
+            best_err = err;
+        }
+    }
+
+    return best_err;
+}
+
 static int alloc_map_page(struct rtld_state *st, uint64_t vaddr, uint64_t flags,
                            const uint8_t *data, size_t data_offset,
                            size_t page_offset, size_t copy_len) {
@@ -58,7 +82,7 @@ static int alloc_map_page(struct rtld_state *st, uint64_t vaddr, uint64_t flags,
     uint64_t err;
 
     /* Retype a frame from untyped */
-    err = rtld_retype_frame(st->untyped, frame_slot);
+    err = retype_frame_any(st, frame_slot);
     if (err != 0) {
         { struct rtld_linebuf lb; rtld_lb_init(&lb);
           rtld_lb_str(&lb, "[RTLD] retype frame failed err=");
@@ -111,6 +135,7 @@ struct rtld_lib_page {
     uint64_t vaddr;
     cap_t frame_slot;
     uint64_t flags;
+    int is_device;
 };
 
 /* Update bytes in an already-mapped target page by scratch-mapping its frame. */
@@ -241,6 +266,16 @@ int load_shared_library(struct rtld_state *st, const char *name,
             }
 
             if (existing != SIZE_MAX) {
+                if (pages[existing].is_device) {
+                    /* Device-mapped pages are expected to be final RO/RX mappings.
+                     * If a later segment overlaps, fall back is not implemented. */
+                    if (copy_len != 0 || (pages[existing].flags | flags) != pages[existing].flags) {
+                        rtld_puts("[RTLD] overlapping device-mapped page unsupported\n");
+                        return -6;
+                    }
+                    continue;
+                }
+
                 int err = patch_mapped_page(st, pages[existing].frame_slot,
                                              cpio.data, data_offset,
                                              page_offset, copy_len);
@@ -272,6 +307,29 @@ int load_shared_library(struct rtld_state *st, const char *name,
                 return -6;
             }
 
+            /* Prefer direct initrd device mapping for fully-covered RO/RX pages.
+             * This avoids per-process frame allocation for immutable library code/data. */
+            if ((flags & VSPACE_FLAG_WRITABLE) == 0
+                && page_offset == 0
+                && copy_len == PAGE_SIZE) {
+                const uint8_t *src_page = cpio.data + data_offset;
+                if ((((uintptr_t)src_page) & (PAGE_SIZE - 1)) == 0) {
+                    uint64_t src_off = (uint64_t)((uintptr_t)src_page - (uintptr_t)st->initrd_base);
+                    if (src_off + PAGE_SIZE <= st->initrd_size) {
+                        uint64_t derr = rtld_vspace_map_device(
+                            st->vspace, CAP_INITRD_UNTYPED, src_off, page, flags);
+                        if (derr == 0) {
+                            pages[page_count].vaddr = page;
+                            pages[page_count].frame_slot = 0;
+                            pages[page_count].flags = flags;
+                            pages[page_count].is_device = 1;
+                            page_count++;
+                            continue;
+                        }
+                    }
+                }
+            }
+
             cap_t frame_slot = st->next_frame_slot;
             int err = alloc_map_page(st, page, flags,
                                       cpio.data, data_offset,
@@ -284,6 +342,7 @@ int load_shared_library(struct rtld_state *st, const char *name,
             pages[page_count].vaddr = page;
             pages[page_count].frame_slot = frame_slot;
             pages[page_count].flags = flags;
+            pages[page_count].is_device = 0;
             page_count++;
         }
     }

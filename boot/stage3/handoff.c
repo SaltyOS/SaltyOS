@@ -38,8 +38,8 @@ struct BootInfoHeader *handoff_build_bootinfo(
         struct BootInfoMemMapEntry *entries;
         uint32_t count = stage2_info->memmap_count;
 
-        /* Allocate temporary buffer for converted entries + 3 reservation entries */
-        uint32_t max_entries = count + 3;
+        /* Allocate temporary buffer for converted entries + 4 reservation entries */
+        uint32_t max_entries = count + 4;
         if (max_entries > CONFIG_MAX_MEM_REGIONS)
             max_entries = CONFIG_MAX_MEM_REGIONS;
         size_t entries_size = max_entries * sizeof(struct BootInfoMemMapEntry);
@@ -158,10 +158,10 @@ struct BootInfoHeader *handoff_build_bootinfo(
          */
         uint32_t total = count;
 
-        /* Reserve low memory (0 - 1MB) for bootloader */
+        /* Reserve boot page tables (active until kernel replaces CR3) */
         if (total < CONFIG_MAX_MEM_REGIONS) {
-            entries[total].base = 0;
-            entries[total].length = 0x100000;
+            entries[total].base = 0x80000;
+            entries[total].length = 0x9F000 - 0x80000;
             entries[total].type = MEMMAP_BOOTLOADER;
             entries[total].reserved = 0;
             total++;
@@ -172,6 +172,15 @@ struct BootInfoHeader *handoff_build_bootinfo(
             entries[total].base = kernel->phys_base;
             entries[total].length = kernel->mem_size;
             entries[total].type = MEMMAP_KERNEL;
+            entries[total].reserved = 0;
+            total++;
+        }
+
+        /* Reserve initrd region */
+        if (total < CONFIG_MAX_MEM_REGIONS && initrd_addr != 0 && initrd_size != 0) {
+            entries[total].base = initrd_addr;
+            entries[total].length = initrd_size;
+            entries[total].type = MEMMAP_INITRD;
             entries[total].reserved = 0;
             total++;
         }

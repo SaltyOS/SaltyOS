@@ -20,8 +20,6 @@ pub mod errno;
 pub mod malloc;
 pub mod mem;
 pub mod string;
-
-// Phase 2+
 pub mod stdio;
 pub mod unistd;
 pub mod process;

@@ -47,18 +47,51 @@ static uint8_t bootinfo_buffer[KB(16)] ALIGNED(4096);
 /* Kernel loading area */
 static uint64_t kernel_load_area = KERNEL_DEFAULT_LOAD;
 
-/*
- * Find suitable memory region for kernel
- */
-static uint64_t find_kernel_load_address(struct Stage2Info *info, uint64_t size)
+/* Sum usable RAM above 1MB from BIOS E820 map. */
+static uint64_t total_usable_ram(struct Stage2Info *info)
 {
     if (!info || info->memmap_count == 0)
-        return KERNEL_DEFAULT_LOAD;
+        return 0;
+
+    struct E820Entry *entries = (struct E820Entry *)(uintptr_t)info->memmap_addr;
+    uint32_t count = info->memmap_count;
+    uint64_t total = 0;
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (entries[i].type != 1)  /* E820_USABLE */
+            continue;
+
+        uint64_t base = entries[i].base;
+        uint64_t end = base + entries[i].length;
+
+        if (end <= MB(1))
+            continue;
+        if (base < MB(1))
+            base = MB(1);
+
+        if (end > base)
+            total += (end - base);
+    }
+
+    return total;
+}
+
+/*
+ * Find suitable memory region for kernel with explicit alignment.
+ * Returns 0 if no usable aligned region is large enough.
+ */
+static uint64_t find_kernel_load_address(struct Stage2Info *info, uint64_t size, uint64_t align)
+{
+    if (!info || info->memmap_count == 0)
+        return 0;
 
     struct E820Entry *entries = (struct E820Entry *)(uintptr_t)info->memmap_addr;
     uint32_t count = info->memmap_count;
 
-    /* Look for usable region >= 2MB aligned */
+    if (align < PAGE_SIZE_4K)
+        align = PAGE_SIZE_4K;
+
+    /* Look for usable region >= requested alignment */
     for (uint32_t i = 0; i < count; i++) {
         if (entries[i].type != 1)  /* E820_USABLE */
             continue;
@@ -73,16 +106,14 @@ static uint64_t find_kernel_load_address(struct Stage2Info *info, uint64_t size)
         if (base < KERNEL_DEFAULT_LOAD)
             base = KERNEL_DEFAULT_LOAD;
 
-        /* Align to 2MB */
-        base = ALIGN_UP(base, KERNEL_LOAD_ALIGN);
+        base = ALIGN_UP(base, align);
 
         /* Check if region is large enough */
         if (base + size <= end)
             return base;
     }
 
-    /* Fallback to default */
-    return KERNEL_DEFAULT_LOAD;
+    return 0;
 }
 
 /*
@@ -110,6 +141,22 @@ void stage3_entry(struct Stage2Info *info)
     print_str(" memmap_count=");
     print_dec(info->memmap_count);
     print_char('\n');
+#endif
+
+    uint64_t usable_bytes = total_usable_ram(info);
+    bool lowmem_mode = (usable_bytes != 0 && usable_bytes <= LOWMEM_TOTAL_BYTES);
+    uint64_t kernel_align = lowmem_mode ? KERNEL_LOWMEM_ALIGN : KERNEL_LOAD_ALIGN;
+
+#if CONFIG_DEBUG
+    print_str("Usable RAM above 1MB: ");
+    print_hex64(usable_bytes);
+    print_char('\n');
+    print_str("Kernel load alignment: ");
+    print_hex((uint32_t)kernel_align, 8);
+    print_char('\n');
+    if (lowmem_mode) {
+        print_line("Lowmem mode: enabled");
+    }
 #endif
 
     /* Initialize global context */
@@ -201,34 +248,70 @@ void stage3_entry(struct Stage2Info *info)
     }
 
     uint64_t elf_mem_size = max_vaddr - min_vaddr;
-    elf_mem_size = ALIGN_UP(elf_mem_size, KERNEL_LOAD_ALIGN);
+    elf_mem_size = ALIGN_UP(elf_mem_size, kernel_align);
 
     /*
-     * Find suitable load address with actual sizes:
-     * we need space for the raw file buffer + processed kernel segments.
+     * Find suitable load address.
+     *
+     * Split-load strategy: if the raw ELF file fits in the scratch area
+     * at 1MB (below the kernel load region), load it there and only
+     * reserve aligned space for the processed segments. In normal mode this
+     * is 2MB-aligned for huge-page friendliness; in lowmem mode it is 4KB.
+     * This avoids wasting large alignment padding between file buffer and
+     * final segments, enabling boot on systems with as little as 4MB RAM.
+     *
+     * For large kernels (>512KB), fall back to the original contiguous
+     * allocation that places both file buffer and segments in one block.
      */
-    uint64_t total_needed = ALIGN_UP(kernel_file_size, KERNEL_LOAD_ALIGN) + elf_mem_size;
-    kernel_load_area = find_kernel_load_address(info, total_needed);
+    void *kernel_buffer;
+    uint64_t final_load_addr;
 
-    print_str("Kernel load area: ");
-    print_hex((uint32_t)kernel_load_area, 8);
-    print_char('\n');
+    if (kernel_file_size <= (FILE_SCRATCH_LIMIT - FILE_SCRATCH_ADDR)) {
+        /* Small kernel: use 1MB scratch area for raw ELF file */
+        kernel_buffer = (void *)FILE_SCRATCH_ADDR;
 
-    /* Load full kernel ELF from disk */
-    print_line("Loading kernel...");
-    void *kernel_buffer = (void *)(uintptr_t)kernel_load_area;
+        print_line("Loading kernel (split-load)...");
+        ssize_t loaded = fs_load_from_entry(&g_boot_disk, kernel_entry_info,
+                                            kernel_buffer, kernel_file_size);
+        if (loaded < 0) {
+            stage3_panic("Failed to load kernel");
+        }
 
-    {
+        /* Only need space for processed segments (no file buffer overhead) */
+        kernel_load_area = find_kernel_load_address(info, elf_mem_size, kernel_align);
+        if (kernel_load_area == 0) {
+            print_str("Need kernel bytes: ");
+            print_hex((uint32_t)elf_mem_size, 8);
+            print_char('\n');
+            stage3_panic("Insufficient RAM for kernel");
+        }
+        final_load_addr = kernel_load_area;
+    } else {
+        /* Large kernel: contiguous allocation (file buffer + segments) */
+        uint64_t total_needed = ALIGN_UP(kernel_file_size, kernel_align) + elf_mem_size;
+        kernel_load_area = find_kernel_load_address(info, total_needed, kernel_align);
+        if (kernel_load_area == 0) {
+            print_str("Need kernel bytes: ");
+            print_hex((uint32_t)total_needed, 8);
+            print_char('\n');
+            stage3_panic("Insufficient RAM for kernel");
+        }
+        kernel_buffer = (void *)(uintptr_t)kernel_load_area;
+
+        print_line("Loading kernel...");
         ssize_t loaded = fs_load_from_entry(&g_boot_disk, kernel_entry_info,
                                             kernel_buffer, total_needed);
         if (loaded < 0) {
             stage3_panic("Failed to load kernel");
         }
+
+        final_load_addr = kernel_load_area + kernel_file_size;
+        final_load_addr = ALIGN_UP(final_load_addr, kernel_align);
     }
 
-    /* Compute final load address for processed kernel segments (after file buffer) */
-    uint64_t final_load_addr = kernel_load_area + kernel_file_size;
-    final_load_addr = ALIGN_UP(final_load_addr, KERNEL_LOAD_ALIGN);
+    print_str("Kernel load area: ");
+    print_hex((uint32_t)kernel_load_area, 8);
+    print_char('\n');
 
 #if CONFIG_DEBUG
     print_str("ELF: vaddr range ");
@@ -263,32 +346,33 @@ void stage3_entry(struct Stage2Info *info)
     print_hex64(load_result.entry);
     print_char('\n');
 
-    /* Find and load initrd if present */
+    /* Initrd is required now that kernel fallback init path is removed. */
     const struct BootManifestEntry *initrd_entry =
         manifest_find_entry(manifest, MANIFEST_ENTRY_INITRD);
 
-    if (initrd_entry && initrd_entry->size_bytes > 0) {
-        /* Calculate initrd load address (after kernel) */
-        uint64_t initrd_addr = g_ctx.kernel_phys_base + g_ctx.kernel_size;
-        initrd_addr = ALIGN_UP(initrd_addr, PAGE_SIZE_4K);
-
-        print_str("Loading initrd to ");
-        print_hex((uint32_t)initrd_addr, 8);
-        print_str(" size=");
-        print_hex((uint32_t)initrd_entry->size_bytes, 8);
-        print_char('\n');
-
-        ssize_t initrd_loaded = fs_load_from_entry(
-            &g_boot_disk, initrd_entry,
-            (void *)(uintptr_t)initrd_addr, initrd_entry->size_bytes);
-        if (initrd_loaded < 0) {
-            print_line("Warning: Failed to load initrd");
-        } else {
-            g_ctx.initrd_phys_addr = initrd_addr;
-            g_ctx.initrd_size = initrd_entry->size_bytes;
-            print_line("Initrd loaded");
-        }
+    if (!initrd_entry || initrd_entry->size_bytes == 0) {
+        stage3_panic("Missing required initrd");
     }
+
+    /* Calculate initrd load address (after kernel) */
+    uint64_t initrd_addr = g_ctx.kernel_phys_base + g_ctx.kernel_size;
+    initrd_addr = ALIGN_UP(initrd_addr, PAGE_SIZE_4K);
+
+    print_str("Loading initrd to ");
+    print_hex((uint32_t)initrd_addr, 8);
+    print_str(" size=");
+    print_hex((uint32_t)initrd_entry->size_bytes, 8);
+    print_char('\n');
+
+    ssize_t initrd_loaded = fs_load_from_entry(
+        &g_boot_disk, initrd_entry,
+        (void *)(uintptr_t)initrd_addr, initrd_entry->size_bytes);
+    if (initrd_loaded < 0) {
+        stage3_panic("Failed to load required initrd");
+    }
+    g_ctx.initrd_phys_addr = initrd_addr;
+    g_ctx.initrd_size = initrd_entry->size_bytes;
+    print_line("Initrd loaded");
 
     /* Set up page tables */
     print_line("Setting up page tables...");

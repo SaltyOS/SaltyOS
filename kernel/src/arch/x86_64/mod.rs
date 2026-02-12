@@ -105,6 +105,11 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // Initialize paging (kernel page tables already set up by bootloader)
     paging::init();
 
+    // Switch frame bitmap pointer from identity map to direct physical map.
+    // Must happen after paging::init() creates the direct map and before
+    // the identity map (PML4[0]) is removed.
+    crate::mm::remap_frame_bitmap();
+
     // Initialize PIT (for calibration and fallback)
     pit::init();
 

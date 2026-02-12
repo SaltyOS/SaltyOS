@@ -1,5 +1,4 @@
 //! Process spawning helpers
-//! Extracted from original init spawn_server/phase3_spawn_console.
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use salty::consts::*;
@@ -10,6 +9,7 @@ use salty::invoke;
 use salty::ipc;
 use salty::serial;
 use salty::serial::LineBuf;
+use salty::syscall;
 use salty::types::*;
 
 pub struct ExtraCapCopy {
@@ -21,8 +21,283 @@ fn puts(s: &[u8]) {
     serial::serial_puts(s);
 }
 
+const INIT_UT_SCAN_END_FALLBACK: Cap = 200;
+const CHILD_UT_BITS_MIN: u8 = 12;
+const UT_MIRROR_COUNT: Cap = 8;
+const INITRD_COPY_RIGHTS: u64 = (1 << 0) | (1 << 2) | (1 << 3); // READ|EXECUTE|GRANT
+const READY_SIGNAL_BITS: u64 = 1;
+const READY_WAIT_YIELDS_STATIC: usize = 20_000;
+const READY_WAIT_YIELDS_DYNAMIC: usize = 200_000;
+static mut NEXT_UT_HINT: Cap = CAP_UNTYPED_START;
+
+#[derive(Clone, Copy)]
+struct SpawnMemoryBudget {
+    boot_load_bits: u8,
+    runtime_bits: u8,
+    runtime_mirror_slots: Cap,
+}
+
+fn clamp_ut_bits(bits: u8) -> u8 {
+    let mut out = bits;
+    if out < CHILD_UT_BITS_MIN {
+        out = CHILD_UT_BITS_MIN;
+    }
+    if out > 28 {
+        out = 28;
+    }
+    out
+}
+
+fn compute_spawn_memory_budget(is_dynamic: bool, requested_bits: u8) -> SpawnMemoryBudget {
+    let runtime_bits = clamp_ut_bits(requested_bits);
+
+    if !is_dynamic {
+        return SpawnMemoryBudget {
+            boot_load_bits: runtime_bits,
+            runtime_bits,
+            runtime_mirror_slots: 0,
+        };
+    }
+
+    // Dynamic services get a bounded dedicated boot/load pool so main ELF load
+    // does not over-reserve under lowmem. Runtime growth comes from mirrored
+    // parent untyped caps as fallback.
+    let mut boot_load_bits = runtime_bits;
+    if boot_load_bits > 16 {
+        boot_load_bits = 16;
+    }
+    if boot_load_bits < 15 {
+        boot_load_bits = 15;
+    }
+
+    let runtime_mirror_slots = if runtime_bits >= 20 {
+        8
+    } else if runtime_bits >= 18 {
+        7
+    } else if runtime_bits >= 16 {
+        6
+    } else {
+        5
+    };
+
+    SpawnMemoryBudget {
+        boot_load_bits,
+        runtime_bits,
+        runtime_mirror_slots,
+    }
+}
+
+unsafe fn wait_for_child_ready(
+    child_tcb: Cap,
+    ready_ntfn: Cap,
+    label: &[u8],
+    wait_yields: usize,
+) -> i32 {
+    for _ in 0..wait_yields {
+        let poll = syscall::syscall(SYS_POLL, ready_ntfn, 0, 0, 0, 0, 0);
+        if poll.error == 0 {
+            if (poll.value & READY_SIGNAL_BITS) != 0 {
+                return 0;
+            }
+        } else if poll.error != SALTY_WOULD_BLOCK {
+            let mut lb = LineBuf::new();
+            lb.str(b"[INIT] ready poll failed err=");
+            lb.hex(poll.error);
+            lb.str(b"\n");
+            lb.flush();
+            let _ = invoke::tcb_suspend(child_tcb);
+            return -1;
+        }
+        let _ = syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+    }
+
+    let mut lb = LineBuf::new();
+    lb.str(b"[INIT] ");
+    lb.bytes(label);
+    lb.str(b" ready timeout\n");
+    lb.flush();
+    let _ = invoke::tcb_suspend(child_tcb);
+    -1
+}
+
+unsafe fn init_untyped_scan_end() -> Cap {
+    let mut end = INIT_UT_SCAN_END_FALLBACK;
+    let info = invoke::cnode_get_info(CAP_SELF_CSPACE);
+    if info.error == 0 {
+        let ctx = unsafe { &*super::ipc_ctx() };
+        if !ctx.ipc_buffer.is_null() {
+            let num_slots = unsafe { (*ctx.ipc_buffer).msg[3] };
+            if num_slots > CAP_UNTYPED_START && num_slots < end {
+                end = num_slots;
+            }
+        }
+    }
+    if end <= CAP_UNTYPED_START {
+        CAP_UNTYPED_START + 1
+    } else {
+        end
+    }
+}
+
+unsafe fn retype_from_any_untyped(new_type: u64, size_bits: u64, dest_slot: Cap) -> i32 {
+    unsafe { retype_from_any_untyped_with_source(new_type, size_bits, dest_slot, core::ptr::null_mut()) }
+}
+
+unsafe fn retype_from_any_untyped_with_source(
+    new_type: u64,
+    size_bits: u64,
+    dest_slot: Cap,
+    src_ut_out: *mut Cap,
+) -> i32 {
+    let start = CAP_UNTYPED_START;
+    let end = unsafe { init_untyped_scan_end() };
+
+    let mut first = unsafe { NEXT_UT_HINT };
+    if first < start || first >= end {
+        first = start;
+    }
+
+    let mut best_err = SALTY_OUT_OF_MEMORY as i32;
+
+    for ut in first..end {
+        let err = invoke::untyped_retype(ut, new_type, size_bits, dest_slot);
+        if err == 0 {
+            unsafe { NEXT_UT_HINT = ut; }
+            if !src_ut_out.is_null() {
+                unsafe { *src_ut_out = ut; }
+            }
+            return 0;
+        }
+        if err != SALTY_INVALID_CAPABILITY as i32
+            && err != SALTY_INVALID_OPERATION as i32
+            && err != SALTY_NOT_FOUND as i32
+        {
+            best_err = err;
+        }
+    }
+    for ut in start..first {
+        let err = invoke::untyped_retype(ut, new_type, size_bits, dest_slot);
+        if err == 0 {
+            unsafe { NEXT_UT_HINT = ut; }
+            if !src_ut_out.is_null() {
+                unsafe { *src_ut_out = ut; }
+            }
+            return 0;
+        }
+        if err != SALTY_INVALID_CAPABILITY as i32
+            && err != SALTY_INVALID_OPERATION as i32
+            && err != SALTY_NOT_FOUND as i32
+        {
+            best_err = err;
+        }
+    }
+
+    best_err
+}
+
+unsafe fn retype_from_any_untyped_excluding(
+    new_type: u64,
+    size_bits: u64,
+    dest_slot: Cap,
+    exclude_ut: Cap,
+    src_ut_out: *mut Cap,
+) -> i32 {
+    let start = CAP_UNTYPED_START;
+    let end = unsafe { init_untyped_scan_end() };
+
+    let mut first = unsafe { NEXT_UT_HINT };
+    if first < start || first >= end {
+        first = start;
+    }
+
+    let mut best_err = SALTY_OUT_OF_MEMORY as i32;
+
+    for ut in first..end {
+        if ut == exclude_ut {
+            continue;
+        }
+        let err = invoke::untyped_retype(ut, new_type, size_bits, dest_slot);
+        if err == 0 {
+            unsafe { NEXT_UT_HINT = ut; }
+            if !src_ut_out.is_null() {
+                unsafe { *src_ut_out = ut; }
+            }
+            return 0;
+        }
+        if err != SALTY_INVALID_CAPABILITY as i32
+            && err != SALTY_INVALID_OPERATION as i32
+            && err != SALTY_NOT_FOUND as i32
+        {
+            best_err = err;
+        }
+    }
+    for ut in start..first {
+        if ut == exclude_ut {
+            continue;
+        }
+        let err = invoke::untyped_retype(ut, new_type, size_bits, dest_slot);
+        if err == 0 {
+            unsafe { NEXT_UT_HINT = ut; }
+            if !src_ut_out.is_null() {
+                unsafe { *src_ut_out = ut; }
+            }
+            return 0;
+        }
+        if err != SALTY_INVALID_CAPABILITY as i32
+            && err != SALTY_INVALID_OPERATION as i32
+            && err != SALTY_NOT_FOUND as i32
+        {
+            best_err = err;
+        }
+    }
+
+    best_err
+}
+
+unsafe fn allocate_child_untyped_budget(
+    dest_slot: Cap,
+    preferred_bits: u8,
+    exclude_ut: Cap,
+    src_ut_out: *mut Cap,
+) -> Result<u8, i32> {
+    let mut bits = clamp_ut_bits(preferred_bits);
+    let mut last_err = SALTY_OUT_OF_MEMORY as i32;
+
+    while bits >= CHILD_UT_BITS_MIN {
+        let mut err = unsafe {
+            retype_from_any_untyped_excluding(
+                OBJ_UNTYPED,
+                bits as u64,
+                dest_slot,
+                exclude_ut,
+                src_ut_out,
+            )
+        };
+        if err != 0 {
+            err = unsafe {
+                retype_from_any_untyped_with_source(
+                    OBJ_UNTYPED,
+                    bits as u64,
+                    dest_slot,
+                    src_ut_out,
+                )
+            };
+        }
+        if err == 0 {
+            return Ok(bits);
+        }
+        last_err = err;
+        if bits == CHILD_UT_BITS_MIN {
+            break;
+        }
+        bits -= 1;
+    }
+
+    Err(last_err)
+}
+
 pub unsafe fn spawn_server(
-    ut: Cap,
+    root_ut: Cap,
     cap_base: Cap,
     elf_name: &[u8],
     label: &[u8],
@@ -47,6 +322,10 @@ pub unsafe fn spawn_server(
         if is_dynamic {
             { let mut lb = LineBuf::new(); lb.str(b"[INIT] "); lb.bytes(label); lb.str(b" is dynamically linked\n"); lb.flush(); }
         }
+        let mut budget = compute_spawn_memory_budget(is_dynamic, child_ut_bits);
+        if is_dynamic && label == b"vfs" && budget.boot_load_bits < 17 {
+            budget.boot_load_bits = 17;
+        }
 
         let child_tcb = cap_base + super::COFF_TCB;
         let child_vs = cap_base + super::COFF_VSPACE;
@@ -55,33 +334,98 @@ pub unsafe fn spawn_server(
         let child_stk_fr = cap_base + super::COFF_STACK_FR;
         let child_ipc_fr = cap_base + super::COFF_IPC_FR;
         let child_ep = cap_base + super::COFF_EP;
+        let child_ready_ntfn = cap_base + super::COFF_READY_NTFN;
+        let sub_ut_slot = cap_base + super::CAP_CHILD_UNTYPED_OFFSET;
+        let mut sub_ut_parent: Cap = CAP_UNTYPED_START;
+        // Allocate spawn-time objects from the init/root untyped pool.
+        // Reserve a dedicated boot/load untyped from a bounded budget, while
+        // runtime growth is supplied by mirrored untyped fallbacks.
+        let loader_ut = root_ut;
+
+        // Large CNodes (e.g. procmgr) must be created before small-object churn,
+        // otherwise monotonic untyped allocation can make the large retype fail.
+        // Prefer parent/root untyped for this so the child's dedicated untyped
+        // remains mostly available for runtime allocations.
+        if cnode_size_bits > 0 {
+            let mut err = retype_from_any_untyped(OBJ_CNODE, cnode_size_bits, child_cn);
+            if err != 0 {
+                err = invoke::untyped_retype(loader_ut, OBJ_CNODE, cnode_size_bits, child_cn);
+            }
+            if err != 0 {
+                let mut lb = LineBuf::new();
+                lb.str(b"[INIT] retype CNode (large) failed err=");
+                lb.hex(err as u64);
+                lb.str(b"\n");
+                lb.flush();
+                return -1;
+            }
+        }
 
         macro_rules! retype {
             ($obj:expr, $slot:expr, $name:expr) => {
-                let err = invoke::untyped_retype(ut, $obj, 0, $slot);
-                if err != 0 { let mut lb = LineBuf::new(); lb.str(b"[INIT] retype "); lb.bytes($name); lb.str(b" failed\n"); lb.flush(); return -1; }
+                let mut err = invoke::untyped_retype(loader_ut, $obj, 0, $slot);
+                if err != 0 {
+                    err = retype_from_any_untyped($obj, 0, $slot);
+                }
+                if err != 0 {
+                    let mut lb = LineBuf::new();
+                    lb.str(b"[INIT] retype ");
+                    lb.bytes($name);
+                    lb.str(b" failed err=");
+                    lb.hex(err as u64);
+                    lb.str(b"\n");
+                    lb.flush();
+                    return -1;
+                }
             };
         }
 
         retype!(OBJ_TCB, child_tcb, b"TCB");
         retype!(OBJ_VSPACE, child_vs, b"VSpace");
-        retype!(OBJ_CNODE, child_cn, b"CNode");
+        if cnode_size_bits == 0 {
+            retype!(OBJ_CNODE, child_cn, b"CNode");
+        }
         retype!(OBJ_SCHED_CONTEXT, child_sc, b"SC");
         retype!(OBJ_FRAME, child_stk_fr, b"stack frame");
         retype!(OBJ_FRAME, child_ipc_fr, b"IPC frame");
         retype!(OBJ_ENDPOINT, child_ep, b"EP");
+        retype!(OBJ_NOTIFICATION, child_ready_ntfn, b"ready ntfn");
 
-        if cnode_size_bits > 0 {
-            invoke::cnode_delete(CAP_SELF_CSPACE, child_cn);
-            let err = invoke::untyped_retype(ut, OBJ_CNODE, cnode_size_bits, child_cn);
-            if err != 0 {
-                puts(b"[INIT] retype CNode (large) failed\n");
+        let granted_bits = match allocate_child_untyped_budget(
+            sub_ut_slot,
+            budget.boot_load_bits,
+            loader_ut,
+            &raw mut sub_ut_parent,
+        ) {
+            Ok(bits) => bits,
+            Err(err) => {
+                let mut lb = LineBuf::new();
+                lb.str(b"[INIT] sub-untyped retype failed err=");
+                lb.hex(err as u64);
+                lb.str(b"\n");
+                lb.flush();
                 return -1;
             }
+        };
+        if granted_bits != budget.boot_load_bits {
+            let mut lb = LineBuf::new();
+            lb.str(b"[INIT] sub-untyped downshifted to 2^");
+            lb.hex(granted_bits as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
+        if budget.runtime_bits > granted_bits {
+            let mut lb = LineBuf::new();
+            lb.str(b"[INIT] runtime budget targets 2^");
+            lb.hex(budget.runtime_bits as u64);
+            lb.str(b", dedicated pool is 2^");
+            lb.hex(granted_bits as u64);
+            lb.str(b"\n");
+            lb.flush();
         }
 
         let mut loader_ctx = ElfLoaderCtx {
-            untyped: ut,
+            untyped: sub_ut_slot,
             self_vspace: CAP_SELF_VSPACE,
             child_vspace: child_vs,
             scratch_vaddr: SCRATCH_VADDR,
@@ -141,7 +485,10 @@ pub unsafe fn spawn_server(
                 frame_slot = child_stk_fr;
             } else {
                 frame_slot = super::init_alloc_frame_slot(core::ptr::null_mut());
-                let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, frame_slot);
+                let mut err = invoke::untyped_retype(loader_ut, OBJ_FRAME, 0, frame_slot);
+                if err != 0 {
+                    err = retype_from_any_untyped(OBJ_FRAME, 0, frame_slot);
+                }
                 if err != 0 {
                     puts(b"[INIT] stack frame retype failed\n");
                     return -1;
@@ -175,58 +522,95 @@ pub unsafe fn spawn_server(
         // Map initrd if needed
         if map_initrd || is_dynamic {
             let initrd_pages = (initrd_size + 4095) / 4096;
-            { let mut lb = LineBuf::new(); lb.str(b"[INIT] Mapping initrd into child ("); lb.hex(initrd_pages as u64); lb.str(b" pages)\n"); lb.flush(); }
+            let mut mapped_with_device = true;
+            { let mut lb = LineBuf::new(); lb.str(b"[INIT] Mapping initrd into child ("); lb.hex(initrd_pages as u64); lb.str(b" pages, mode=device)\n"); lb.flush(); }
 
             for pg in 0..initrd_pages {
-                let fr_slot = super::init_alloc_frame_slot(core::ptr::null_mut());
-                let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, fr_slot);
-                if err != 0 {
-                    puts(b"[INIT] initrd frame retype failed\n");
-                    return -1;
-                }
-
-                let err = invoke::vspace_map(
-                    CAP_SELF_VSPACE,
-                    fr_slot,
-                    SCRATCH_VADDR,
-                    VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
-                );
-                if err != 0 {
-                    puts(b"[INIT] initrd scratch map failed\n");
-                    return -1;
-                }
-
-                let scratch = SCRATCH_VADDR as *mut u8;
-                let isrc = initrd.add(pg * 4096);
-                let mut copy_len = 4096;
-                if pg * 4096 + copy_len > initrd_size {
-                    copy_len = initrd_size - pg * 4096;
-                }
-                for i in 0..copy_len {
-                    core::ptr::write_volatile(scratch.add(i), *isrc.add(i));
-                }
-                for i in copy_len..4096 {
-                    core::ptr::write_volatile(scratch.add(i), 0);
-                }
-
-                invoke::vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
-
-                let err = invoke::vspace_map(
+                let err = invoke::vspace_map_device(
                     child_vs,
-                    fr_slot,
+                    CAP_INITRD_UNTYPED,
+                    (pg as u64) * 4096,
                     super::CHILD_INITRD_VADDR + pg as u64 * 4096,
                     VSPACE_FLAG_USER,
                 );
                 if err != 0 {
-                    puts(b"[INIT] initrd child map failed\n");
-                    return -1;
+                    let mut lb = LineBuf::new();
+                    lb.str(b"[INIT] initrd device map failed pg=");
+                    lb.hex(pg as u64);
+                    lb.str(b" err=");
+                    lb.hex(err as u64);
+                    lb.str(b"\n");
+                    lb.flush();
+                    for mapped_pg in 0..pg {
+                        invoke::vspace_unmap(
+                            child_vs,
+                            super::CHILD_INITRD_VADDR + mapped_pg as u64 * 4096,
+                        );
+                    }
+                    mapped_with_device = false;
+                    break;
+                }
+            }
+
+            if !mapped_with_device {
+                { let mut lb = LineBuf::new(); lb.str(b"[INIT] Mapping initrd into child ("); lb.hex(initrd_pages as u64); lb.str(b" pages, mode=copy)\n"); lb.flush(); }
+                for pg in 0..initrd_pages {
+                    let fr_slot = super::init_alloc_frame_slot(core::ptr::null_mut());
+                    let mut err = invoke::untyped_retype(loader_ut, OBJ_FRAME, 0, fr_slot);
+                    if err != 0 {
+                        err = retype_from_any_untyped(OBJ_FRAME, 0, fr_slot);
+                    }
+                    if err != 0 {
+                        puts(b"[INIT] initrd frame retype failed\n");
+                        return -1;
+                    }
+
+                    let err = invoke::vspace_map(
+                        CAP_SELF_VSPACE,
+                        fr_slot,
+                        SCRATCH_VADDR,
+                        VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+                    );
+                    if err != 0 {
+                        puts(b"[INIT] initrd scratch map failed\n");
+                        return -1;
+                    }
+
+                    let scratch = SCRATCH_VADDR as *mut u8;
+                    let isrc = initrd.add(pg * 4096);
+                    let mut copy_len = 4096;
+                    if pg * 4096 + copy_len > initrd_size {
+                        copy_len = initrd_size - pg * 4096;
+                    }
+                    for i in 0..copy_len {
+                        core::ptr::write_volatile(scratch.add(i), *isrc.add(i));
+                    }
+                    for i in copy_len..4096 {
+                        core::ptr::write_volatile(scratch.add(i), 0);
+                    }
+
+                    invoke::vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
+
+                    let err = invoke::vspace_map(
+                        child_vs,
+                        fr_slot,
+                        super::CHILD_INITRD_VADDR + pg as u64 * 4096,
+                        VSPACE_FLAG_USER,
+                    );
+                    if err != 0 {
+                        puts(b"[INIT] initrd child map failed\n");
+                        return -1;
+                    }
                 }
             }
             puts(b"[INIT] Initrd mapped in child VSpace\n");
 
             // Map boot info page into child VSpace so it can read initrd size
             let bi_fr = super::init_alloc_frame_slot(core::ptr::null_mut());
-            let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, bi_fr);
+            let mut err = invoke::untyped_retype(loader_ut, OBJ_FRAME, 0, bi_fr);
+            if err != 0 {
+                err = retype_from_any_untyped(OBJ_FRAME, 0, bi_fr);
+            }
             if err != 0 {
                 puts(b"[INIT] bootinfo frame retype failed\n");
                 return -1;
@@ -274,28 +658,70 @@ pub unsafe fn spawn_server(
         if copy_cap!(child_vs, 1) != 0 { puts(b"[INIT] copy VSpace failed\n"); return -1; }
         if copy_cap!(child_cn, 2) != 0 { puts(b"[INIT] copy CNode failed\n"); return -1; }
         if copy_cap!(child_ep, 3) != 0 { puts(b"[INIT] copy EP failed\n"); return -1; }
-
-        // Retype a dedicated sub-untyped for this child so each child has
-        // exclusive memory — prevents SMP races on the shared untyped.
-        let sub_ut_slot = super::init_alloc_frame_slot(core::ptr::null_mut());
-        let err = invoke::untyped_retype(ut, OBJ_UNTYPED, child_ut_bits as u64, sub_ut_slot);
-        if err != 0 {
-            { let mut lb = LineBuf::new(); lb.str(b"[INIT] sub-untyped retype failed err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
-            if is_dynamic {
-                return -1;
+        if copy_cap!(child_ready_ntfn, CAP_READINESS_NTFN) != 0 {
+            puts(b"[INIT] copy ready ntfn failed\n");
+            return -1;
+        }
+        if is_dynamic {
+            let derr = invoke::cnode_copy(
+                CAP_SELF_CSPACE,
+                CAP_INITRD_UNTYPED,
+                child_cn,
+                CAP_INITRD_UNTYPED,
+                INITRD_COPY_RIGHTS,
+            );
+            if derr != 0 {
+                puts(b"[INIT] WARN: copy initrd untyped failed\n");
             }
         }
+
         let err = copy_cap!(sub_ut_slot, 7);
         if err != 0 {
-            if is_dynamic {
-                puts(b"[INIT] copy sub-Untyped to child failed\n");
-                return -1;
+            puts(b"[INIT] copy child Untyped failed\n");
+            return -1;
+        }
+
+        if is_dynamic {
+            // Mirror a few parent root-untyped caps into the child so rtld can
+            // fall back when the dedicated child untyped is exhausted.
+            let mirror_slots = if budget.runtime_mirror_slots > UT_MIRROR_COUNT {
+                UT_MIRROR_COUNT
+            } else {
+                budget.runtime_mirror_slots
+            };
+            let mirror_end = CAP_UNTYPED_START + mirror_slots;
+            let mut mirrored: u64 = 0;
+            for ut_slot in CAP_UNTYPED_START..mirror_end {
+                if ut_slot == CAP_INITRD_UNTYPED {
+                    continue;
+                }
+                let cerr = invoke::cnode_copy(
+                    CAP_SELF_CSPACE,
+                    ut_slot,
+                    child_cn,
+                    ut_slot,
+                    CAP_RIGHTS_ALL,
+                );
+                if cerr == 0 {
+                    mirrored += 1;
+                }
             }
-            puts(b"[INIT] WARN: copy sub-Untyped to child failed\n");
+            if mirrored == 0 {
+                puts(b"[INIT] WARN: no untyped mirrors copied for rtld fallback\n");
+            } else if mirrored < mirror_slots {
+                let mut lb = LineBuf::new();
+                lb.str(b"[INIT] rtld untyped mirrors copied=");
+                lb.hex(mirrored);
+                lb.str(b"\n");
+                lb.flush();
+            }
         }
 
         for extra in extras {
             if extra.src == 0 && extra.dst == 0 {
+                continue;
+            }
+            if is_dynamic && extra.dst == CAP_INITRD_UNTYPED {
                 continue;
             }
             let err = copy_cap!(extra.src, extra.dst);
@@ -382,7 +808,14 @@ pub unsafe fn spawn_server(
         }
 
         let err = invoke::tcb_configure(child_tcb, child_entry, child_rsp, 0);
-        if err != 0 { puts(b"[INIT] TCB configure failed\n"); return -1; }
+        if err != 0 {
+            let mut lb = LineBuf::new();
+            lb.str(b"[INIT] TCB configure failed err=");
+            lb.hex(err as u64);
+            lb.str(b"\n");
+            lb.flush();
+            return -1;
+        }
 
         invoke::tcb_set_ipc_buffer(child_tcb, super::CHILD_IPC_BUF_VADDR);
 
@@ -395,7 +828,16 @@ pub unsafe fn spawn_server(
         let err = invoke::tcb_resume(child_tcb);
         if err != 0 { puts(b"[INIT] TCB resume failed\n"); return -1; }
 
-        { let mut lb = LineBuf::new(); lb.str(b"[INIT] "); lb.bytes(label); lb.str(b" started!\n"); lb.flush(); }
+        let ready_wait_yields = if is_dynamic {
+            READY_WAIT_YIELDS_DYNAMIC
+        } else {
+            READY_WAIT_YIELDS_STATIC
+        };
+        if wait_for_child_ready(child_tcb, child_ready_ntfn, label, ready_wait_yields) != 0 {
+            return -1;
+        }
+
+        { let mut lb = LineBuf::new(); lb.str(b"[INIT] "); lb.bytes(label); lb.str(b" ready\n"); lb.flush(); }
         0
     }
 }
@@ -406,9 +848,10 @@ pub unsafe fn pm_spawn(pm_ep: Cap, prog: &[u8]) -> i32 {
         let len = prog.len();
         let mut spawn_msg = SaltyMsg::zeroed();
         spawn_msg.label = POSIX_PM_SPAWN;
-        spawn_msg.length = 1 + ((len as u64 + 7) / 8);
+        spawn_msg.length = 2 + ((len as u64 + 7) / 8);
         spawn_msg.regs[0] = len as u64;
-        let dst = &raw mut spawn_msg.regs[1] as *mut u8;
+        spawn_msg.regs[1] = POSIX_PM_SPAWN_FLAG_WAIT_READY;
+        let dst = &raw mut spawn_msg.regs[2] as *mut u8;
         for i in 0..len {
             *dst.add(i) = prog[i];
         }

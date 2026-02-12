@@ -203,10 +203,10 @@ impl CDT {
     /// - No cycles exist
     #[cfg(debug_assertions)]
     pub fn verify_integrity() -> Result<(), super::cnode::CapError> {
-        use crate::cap::slot::{get_meta, MAX_SLOTS};
+        use crate::cap::slot::{get_meta, max_slots};
         use super::cnode::CapError;
 
-        for slot in 0..MAX_SLOTS {
+        for slot in 0..max_slots() {
             let slot = slot as CapSlot;
             let meta = get_meta(slot);
 

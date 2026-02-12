@@ -33,6 +33,8 @@
 /* Kernel loading constraints */
 #define KERNEL_MIN_LOAD_ADDR    MB(2)       /* Load kernel at >=2MB */
 #define KERNEL_LOAD_ALIGN       MB(2)       /* 2MB alignment for huge pages */
+#define KERNEL_LOWMEM_ALIGN     KB(4)       /* 4KB alignment for low-memory load path */
+#define LOWMEM_TOTAL_BYTES      MB(8)       /* BIOS low-memory mode threshold */
 #define KERNEL_MAX_SIZE         MB(64)      /* Maximum kernel size */
 
 /* BootInfo buffer */
@@ -42,6 +44,10 @@
 /* Initial kernel stack */
 #define KERNEL_STACK_ADDR       0x180000    /* 1.5MB */
 #define KERNEL_STACK_SIZE       KB(64)      /* 64KB stack */
+
+/* ELF file scratch buffer (extended memory below kernel load area) */
+#define FILE_SCRATCH_ADDR       0x100000    /* 1MB - free extended memory */
+#define FILE_SCRATCH_LIMIT      0x180000    /* 1.5MB - before kernel stack */
 
 /* Global Stage 3 context */
 struct Stage3Context {

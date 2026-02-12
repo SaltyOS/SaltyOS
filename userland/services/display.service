@@ -2,7 +2,8 @@
 Name=display
 Binary=display.elf
 Type=simple
+MemoryKB=1024
 Restart=no
 
 [Dependencies]
-After=console nameserv
+After=console nameserv procmgr

@@ -91,8 +91,9 @@ pub const CAP_COM1_IOPORT: u64 = 8;
 pub const CAP_COM1_IRQ: u64 = 9;
 pub const CAP_COM1_NTFN: u64 = 10;
 pub const CAP_CONSOLE_EP: u64 = 11;
-pub const CAP_READINESS_NTFN: u64 = 12;
+pub const CAP_INITRD_UNTYPED: u64 = 12;
 pub const CAP_FB_UNTYPED: u64 = 13;
+pub const CAP_READINESS_NTFN: u64 = 14;
 pub const CAP_UNTYPED_START: u64 = 16;
 
 // Addresses
@@ -197,6 +198,7 @@ pub const TIOCGWINSZ: u64 = 0x5413;
 
 // Procmgr protocol labels
 pub const POSIX_PM_SPAWN: u64 = 1;
+pub const POSIX_PM_SPAWN_FLAG_WAIT_READY: u64 = 1 << 0;
 pub const POSIX_PM_EXIT: u64 = 2;
 pub const POSIX_PM_WAIT: u64 = 3;
 pub const POSIX_PM_GETPID: u64 = 4;
@@ -298,9 +300,9 @@ pub const MAP_FIXED: i32 = 0x10;
 pub const MAP_ANONYMOUS: i32 = 0x20;
 
 // Memory management limits
-pub const MM_MAX_REGIONS: usize = 128;
-pub const MM_MAX_FRAME_SLOTS: u64 = 1024;
-pub const MM_MAX_PAGES_PER_REGION: usize = 256;
+pub const MM_MAX_REGIONS: usize = 32;
+pub const MM_MAX_FRAME_SLOTS: u64 = 256;
+pub const MM_MAX_PAGES_PER_REGION: usize = 64;
 
 // ELF constants
 pub const ELF_PAGE_SIZE: u64 = 4096;

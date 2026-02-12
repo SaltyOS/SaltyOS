@@ -202,7 +202,7 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
     }
 
     /* 4. Load shared libraries: walk exe's DT_NEEDED entries */
-    uint64_t lib_load_addr = 0x0000000010000000ULL; /* 256 MB - base for shared libs */
+    uint64_t lib_load_addr = g_rtld.rtld_base + 0x80000ULL; /* 512KB after RTLD base */
 
     if (exe_dyn) {
         for (int i = 0; exe_dyn[i].d_tag != DT_NULL; i++) {
@@ -230,8 +230,8 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
                     for (;;) rtld_yield();
                 }
 
-                /* Advance load address for next library (16 MB apart) */
-                lib_load_addr += 0x0000000001000000ULL;
+                /* Advance load address for next library (512 KB apart) */
+                lib_load_addr += 0x80000ULL;
             }
         }
     }

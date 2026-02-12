@@ -81,6 +81,24 @@ core::arch::global_asm!(
     "push r15",                // RFLAGS
     "push 0x23",               // CS
     "push r12",                // user RIP
+    // Zero all GPRs to prevent kernel address leaks to user mode.
+    // context_switch only restores callee-saved regs; caller-saved regs
+    // retain kernel values that would otherwise leak into ring 3.
+    "xor eax, eax",
+    "xor ebx, ebx",
+    "xor ecx, ecx",
+    "xor edx, edx",
+    "xor esi, esi",
+    "xor edi, edi",
+    "xor ebp, ebp",
+    "xor r8d, r8d",
+    "xor r9d, r9d",
+    "xor r10d, r10d",
+    "xor r11d, r11d",
+    "xor r12d, r12d",
+    "xor r13d, r13d",
+    "xor r14d, r14d",
+    "xor r15d, r15d",
     "swapgs",
     "iretq",
     ".size usermode_trampoline, . - usermode_trampoline",

@@ -1,15 +1,11 @@
 //! Global Capability Slot Array
 //!
-//! Fixed-address capability slots with separate metadata for CDT links.
-//! Zero heap allocation - all slots are pre-allocated static array.
+//! Dynamically-allocated capability slots with separate metadata for CDT links.
+//! Slot count is determined at boot based on available physical memory.
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use super::Capability;
-
-/// Maximum number of capability slots system-wide
-/// 128K slots — sufficient for multi-level CNode trees with dynamic expansion
-pub const MAX_SLOTS: usize = 131072;
 
 /// Invalid slot marker (used as null pointer equivalent)
 pub const INVALID_SLOT: CapSlot = 0xFFFF_FFFF;
@@ -101,26 +97,99 @@ pub struct CapSlotStorage {
     pub meta: CapSlotMeta,
 }
 
-/// Global slot array (static, no heap)
-///
-/// All capabilities in the system are stored here at fixed addresses.
-/// CNodes contain references (slot indices) to these global slots.
-///
-/// # Safety
-/// Direct access to this static is unsafe. Use the accessor functions
-/// (get_cap, get_cap_mut, etc.) when possible. Raw pointer access is only
-/// for carefully audited internal use (e.g., untyped child tracking).
-pub static mut SLOTS: [CapSlotStorage; MAX_SLOTS] = [CapSlotStorage {
-    cap: Capability::null(),
-    meta: CapSlotMeta::free(),
-}; MAX_SLOTS];
+/// Dynamic slot array state
+struct SlotArrayState {
+    /// Pointer to dynamically-allocated SLOTS array
+    slots_ptr: *mut CapSlotStorage,
+    /// Pointer to dynamically-allocated bitmap
+    bitmap_ptr: *mut u64,
+    /// Number of slots in the array
+    num_slots: usize,
+}
 
-/// Slot bitmap for allocation tracking
-/// Each bit represents one slot (1 = allocated, 0 = free)
-static mut SLOT_BITMAP: [u64; MAX_SLOTS / 64] = [0; MAX_SLOTS / 64];
+// SAFETY: Pointers are only accessed under CAP_LOCK
+unsafe impl Sync for SlotArrayState {}
+
+/// Global dynamic slot state (initialized by init_slots)
+static mut SLOT_STATE: SlotArrayState = SlotArrayState {
+    slots_ptr: core::ptr::null_mut(),
+    bitmap_ptr: core::ptr::null_mut(),
+    num_slots: 0,
+};
 
 /// Next slot to check for allocation (simple optimization)
 static mut NEXT_SLOT: CapSlot = 0;
+
+/// Initialize dynamic slot array.
+///
+/// Allocates contiguous physical frames for the SLOTS array and bitmap,
+/// then initializes all slots as free.
+///
+/// # Safety
+/// Must be called exactly once during boot, after paging::init().
+/// The direct physical map must be available.
+pub unsafe fn init_slots(num_slots: usize) {
+    use crate::mm::{self, PAGE_SIZE};
+
+    let slot_size = core::mem::size_of::<CapSlotStorage>();
+    let slots_bytes = num_slots * slot_size;
+    let slots_pages = (slots_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    let bitmap_words = (num_slots + 63) / 64;
+    let bitmap_bytes = bitmap_words * 8;
+    let bitmap_pages = (bitmap_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    // Allocate physical frames for SLOTS array
+    let slots_phys = mm::alloc_contiguous_frames(slots_pages)
+        .expect("[CAP] SLOTS allocation failed");
+    let slots_virt = mm::phys_to_virt(slots_phys) as *mut CapSlotStorage;
+
+    // Allocate physical frames for bitmap
+    let bitmap_phys = mm::alloc_contiguous_frames(bitmap_pages)
+        .expect("[CAP] SLOT_BITMAP allocation failed");
+    let bitmap_virt = mm::phys_to_virt(bitmap_phys) as *mut u64;
+
+    // Zero bitmap
+    // SAFETY: bitmap_virt points to freshly allocated memory via direct map
+    unsafe {
+        core::ptr::write_bytes(bitmap_virt, 0, bitmap_words);
+    }
+
+    // Initialize all slots as free
+    // SAFETY: slots_virt points to freshly allocated memory via direct map
+    unsafe {
+        for i in 0..num_slots {
+            let slot = slots_virt.add(i);
+            (*slot).cap = Capability::null();
+            (*slot).meta = CapSlotMeta::free();
+        }
+    }
+
+    // SAFETY: Single-threaded init
+    unsafe {
+        let state = &mut *(&raw mut SLOT_STATE);
+        state.slots_ptr = slots_virt;
+        state.bitmap_ptr = bitmap_virt;
+        state.num_slots = num_slots;
+        (*(&raw mut NEXT_SLOT)) = 0;
+    }
+}
+
+/// Get pointer to the base of the SLOTS array.
+///
+/// Used by untyped.rs for raw pointer arithmetic on slot storage.
+#[inline]
+pub fn slots_ptr() -> *mut CapSlotStorage {
+    // SAFETY: SLOT_STATE is initialized before any cap operations
+    unsafe { (*(&raw const SLOT_STATE)).slots_ptr }
+}
+
+/// Get the dynamic slot count.
+#[inline]
+pub fn max_slots() -> usize {
+    // SAFETY: SLOT_STATE is initialized before any cap operations
+    unsafe { (*(&raw const SLOT_STATE)).num_slots }
+}
 
 /// Allocate a capability slot
 ///
@@ -128,18 +197,25 @@ static mut NEXT_SLOT: CapSlot = 0;
 /// Returns None if all slots are exhausted.
 pub fn alloc_slot() -> Option<CapSlot> {
     unsafe {
+        let state = &*(&raw const SLOT_STATE);
+        let num_slots = state.num_slots;
+        if num_slots == 0 {
+            return None;
+        }
+
         // Start from NEXT_SLOT and wrap around if needed
-        let start = NEXT_SLOT as usize;
+        let start = (*(&raw const NEXT_SLOT)) as usize;
 
         // Search from start to end
-        for i in start..MAX_SLOTS {
+        for i in start..num_slots {
             let idx = i / 64;
             let bit = i % 64;
-            if (SLOT_BITMAP[idx] & (1 << bit)) == 0 {
+            let bitmap = state.bitmap_ptr;
+            if ((*bitmap.add(idx)) & (1u64 << bit)) == 0 {
                 // Found free slot
-                SLOT_BITMAP[idx] |= 1 << bit;
-                SLOTS[i].meta = CapSlotMeta::occupied();
-                NEXT_SLOT = (i + 1) as CapSlot;
+                (*bitmap.add(idx)) |= 1u64 << bit;
+                (*state.slots_ptr.add(i)).meta = CapSlotMeta::occupied();
+                (*(&raw mut NEXT_SLOT)) = (i + 1) as CapSlot;
                 return Some(i as CapSlot);
             }
         }
@@ -148,11 +224,12 @@ pub fn alloc_slot() -> Option<CapSlot> {
         for i in 0..start {
             let idx = i / 64;
             let bit = i % 64;
-            if (SLOT_BITMAP[idx] & (1 << bit)) == 0 {
+            let bitmap = state.bitmap_ptr;
+            if ((*bitmap.add(idx)) & (1u64 << bit)) == 0 {
                 // Found free slot
-                SLOT_BITMAP[idx] |= 1 << bit;
-                SLOTS[i].meta = CapSlotMeta::occupied();
-                NEXT_SLOT = (i + 1) as CapSlot;
+                (*bitmap.add(idx)) |= 1u64 << bit;
+                (*state.slots_ptr.add(i)).meta = CapSlotMeta::occupied();
+                (*(&raw mut NEXT_SLOT)) = (i + 1) as CapSlot;
                 return Some(i as CapSlot);
             }
         }
@@ -168,41 +245,48 @@ pub fn alloc_slot() -> Option<CapSlot> {
 /// The slot must be empty (capability nullified) before freeing.
 pub fn free_slot(slot: CapSlot) {
     let idx = slot as usize;
-    if idx >= MAX_SLOTS {
+    // SAFETY: SLOT_STATE is initialized before any cap operations
+    let num_slots = unsafe { (*(&raw const SLOT_STATE)).num_slots };
+    if idx >= num_slots {
         return;
     }
 
     unsafe {
+        let state = &*(&raw const SLOT_STATE);
         let bitmap_idx = idx / 64;
         let bit = idx % 64;
-        SLOT_BITMAP[bitmap_idx] &= !(1 << bit);
-        SLOTS[idx].meta = CapSlotMeta::free();
+        (*state.bitmap_ptr.add(bitmap_idx)) &= !(1u64 << bit);
+        (*state.slots_ptr.add(idx)).meta = CapSlotMeta::free();
 
         // Update NEXT_SLOT if we freed a lower slot
-        if (slot as usize) < NEXT_SLOT as usize {
-            NEXT_SLOT = slot;
+        if (slot as usize) < (*(&raw const NEXT_SLOT)) as usize {
+            (*(&raw mut NEXT_SLOT)) = slot;
         }
     }
 }
 
 /// Get immutable reference to capability in slot
 pub fn get_cap(slot: CapSlot) -> &'static Capability {
-    unsafe { &SLOTS[slot as usize].cap }
+    // SAFETY: slot index is validated by caller (cap system invariant)
+    unsafe { &(*slots_ptr().add(slot as usize)).cap }
 }
 
 /// Get mutable reference to capability in slot
 pub fn get_cap_mut(slot: CapSlot) -> &'static mut Capability {
-    unsafe { &mut SLOTS[slot as usize].cap }
+    // SAFETY: slot index is validated by caller (cap system invariant)
+    unsafe { &mut (*slots_ptr().add(slot as usize)).cap }
 }
 
 /// Get immutable reference to slot metadata
 pub fn get_meta(slot: CapSlot) -> &'static CapSlotMeta {
-    unsafe { &SLOTS[slot as usize].meta }
+    // SAFETY: slot index is validated by caller (cap system invariant)
+    unsafe { &(*slots_ptr().add(slot as usize)).meta }
 }
 
 /// Get mutable reference to slot metadata
 pub fn get_meta_mut(slot: CapSlot) -> &'static mut CapSlotMeta {
-    unsafe { &mut SLOTS[slot as usize].meta }
+    // SAFETY: slot index is validated by caller (cap system invariant)
+    unsafe { &mut (*slots_ptr().add(slot as usize)).meta }
 }
 
 /// Nullify a capability (set to null capability)
@@ -231,9 +315,11 @@ pub fn is_slot_null(slot: CapSlot) -> bool {
 /// Get total number of allocated slots
 pub fn allocated_count() -> usize {
     unsafe {
+        let state = &*(&raw const SLOT_STATE);
+        let bitmap_words = (state.num_slots + 63) / 64;
         let mut count = 0;
-        for i in 0..(MAX_SLOTS / 64) {
-            count += SLOT_BITMAP[i].count_ones() as usize;
+        for i in 0..bitmap_words {
+            count += (*state.bitmap_ptr.add(i)).count_ones() as usize;
         }
         count
     }
@@ -241,7 +327,7 @@ pub fn allocated_count() -> usize {
 
 /// Get total number of free slots
 pub fn free_count() -> usize {
-    MAX_SLOTS - allocated_count()
+    max_slots() - allocated_count()
 }
 
 #[cfg(test)]

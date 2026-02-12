@@ -8,14 +8,6 @@
 #   core_obj, core_rmeta, compiler_builtins_obj, compiler_builtins_rmeta
 # =============================================================================
 
-# Find all Rust source files for proper change tracking
-# lib.rs is the crate root (input), other modules are dependencies for change detection
-all_rs_files = run_command(
-  'find', 'src', '-name', '*.rs',
-  capture: true,
-  check: true
-).stdout().strip()
-
 # Find all assembly source files
 all_asm_files = run_command(
   'find', 'src', '-name', '*.S',
@@ -23,9 +15,7 @@ all_asm_files = run_command(
   check: true
 ).stdout().strip()
 
-# Split into crate root and module dependencies
 kernel_crate_root = files('src/lib.rs')
-module_deps = files(all_rs_files.split('\n'))
 kernel_ld = meson.current_source_dir() / 'kernel.ld'
 
 # Paths to core and compiler_builtins metadata (built in rust/)
@@ -51,12 +41,12 @@ endif
 # Uses custom-built core library instead of sysroot
 kernel_obj = custom_target('kernel_obj',
   input: kernel_crate_root,
-  depend_files: module_deps,
   output: 'kernel.o',
+  depfile: 'kernel.d',
   command: [
     rustc,
     '--edition=2024',
-    '--emit=obj',
+    '--emit=obj=@OUTPUT@,dep-info=@DEPFILE@',
     '--crate-name=saltyos_kernel',
     '--target=' + rust_target,
     '-C', 'panic=abort',
@@ -68,7 +58,6 @@ kernel_obj = custom_target('kernel_obj',
     '--extern', 'core=' + rust_build_dir / 'libcore.rmeta',
     '--extern', 'compiler_builtins=' + rust_build_dir / 'libcompiler_builtins.rmeta',
     '-L', rust_build_dir,
-    '-o', '@OUTPUT@',
     '@INPUT@',
   ],
   depends: [core, compiler_builtins],
@@ -93,3 +82,22 @@ kernel = custom_target('kernel',
   build_by_default: true,
 )
 
+# Step 3: Link boot image kernel ELF with debug sections stripped.
+# Keep kernel.elf unchanged for local debugging/symbol work.
+kernel_boot = custom_target('kernel_boot',
+  input: [kernel_obj, core_obj, compiler_builtins_obj] + asm_objs,
+  output: 'kernel.boot.elf',
+  command: [
+    cc_cmd,
+    '-nostdlib',
+    '-fuse-ld=lld',
+    '-Wl,--pie',
+    '-Wl,--no-dynamic-linker',
+    '-Wl,-n',
+    '-Wl,-S',
+    '-Wl,-T,' + kernel_ld,
+    '-o', '@OUTPUT@',
+    '@INPUT@',
+  ],
+  build_by_default: true,
+)

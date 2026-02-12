@@ -33,6 +33,10 @@ fn idle() -> ! {
     }
 }
 
+fn signal_ready() {
+    let _ = syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+}
+
 /// Initialize the IPC context with the pre-mapped buffer from init
 fn setup_ipc_buffer() {
     unsafe {
@@ -165,6 +169,7 @@ pub extern "C" fn _start() -> ! {
     // Draw the test pattern
     draw_test_pattern(&fb);
 
+    signal_ready();
     puts(b"[DISPLAY] Test pattern drawn, idling\n");
     idle();
 }

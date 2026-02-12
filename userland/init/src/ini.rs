@@ -32,6 +32,8 @@ pub struct ServiceDef {
     pub after_count: u8,
     pub before: [[u8; MAX_SERVICE_NAME]; MAX_DEPS],
     pub before_count: u8,
+    /// Memory budget in KiB (0 = system default).
+    pub memory_kb: u16,
 }
 
 impl ServiceDef {
@@ -47,6 +49,7 @@ impl ServiceDef {
             after_count: 0,
             before: [[0; MAX_SERVICE_NAME]; MAX_DEPS],
             before_count: 0,
+            memory_kb: 0,
         }
     }
 
@@ -158,6 +161,18 @@ fn parse_dep_list(value: &[u8], deps: &mut [[u8; MAX_SERVICE_NAME]; MAX_DEPS]) -
     count
 }
 
+fn parse_decimal_u16(data: &[u8]) -> u16 {
+    let mut val: u16 = 0;
+    for &b in data {
+        if b >= b'0' && b <= b'9' {
+            val = val.wrapping_mul(10).wrapping_add((b - b'0') as u16);
+        } else {
+            break;
+        }
+    }
+    val
+}
+
 /// Parse a .service INI file from raw bytes.
 /// Returns true on success.
 pub fn parse_service(data: &[u8], out: &mut ServiceDef) -> bool {
@@ -216,6 +231,8 @@ pub fn parse_service(data: &[u8], out: &mut ServiceDef) -> bool {
                                 } else if bytes_eq_ci(value, b"notify") {
                                     out.svc_type = ServiceType::Notify;
                                 }
+                            } else if bytes_eq_ci(key, b"MemoryKB") {
+                                out.memory_kb = parse_decimal_u16(value);
                             } else if bytes_eq_ci(key, b"Restart") {
                                 if bytes_eq_ci(value, b"no") {
                                     out.restart = RestartPolicy::No;

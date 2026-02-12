@@ -286,9 +286,42 @@ impl Capability {
 }
 
 /// Initialize capability system
+///
+/// Dynamically allocates slot and metadata arrays proportional to available
+/// physical memory. Must be called after `paging::init()` (direct map available).
 pub fn init() {
-    // Static arrays are initialized at compile time
-    // No runtime initialization needed currently
+    let free = crate::mm::free_frame_count();
+    const LOWMEM_THRESHOLD_FRAMES: usize = 2048; // 8 MiB
+    const LOWMEM_MIN_SLOTS: usize = 512;
+    const NORMAL_MIN_SLOTS: usize = 128;
+
+    // Scale slot count with available memory:
+    //   4MB  (~768 free frames)  → 96 slots
+    //   128MB (~32K free frames) → 4096 slots
+    //   4GB  (~1M free frames)  → 131072 slots
+    // Clamp to [min, 131072]. In lowmem mode, reserve more slot headroom
+    // for dynamic-linker/frame-cap churn during early userspace bring-up.
+    let min_slots = if free <= LOWMEM_THRESHOLD_FRAMES {
+        LOWMEM_MIN_SLOTS
+    } else {
+        NORMAL_MIN_SLOTS
+    };
+    let num_slots = (free / 8).clamp(min_slots, 131_072);
+
+    {
+        let s = crate::SerialGuard::acquire();
+        s.puts("[CAP] Dynamic slot count: ");
+        s.dec(num_slots as u64);
+        s.puts(" (");
+        s.dec(free as u64);
+        s.puts(" free frames)\n");
+    }
+
+    // SAFETY: Called once during single-threaded boot, direct map available
+    unsafe {
+        slot::init_slots(num_slots);
+        untyped::init_metadata(num_slots);
+    }
 }
 
 #[cfg(test)]

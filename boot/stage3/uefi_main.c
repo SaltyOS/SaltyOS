@@ -146,7 +146,7 @@ void stage3_entry_64(struct Stage2Info *info)
     print_hex(kernel_file_size, 8);
     print_char('\n');
 
-    /* Load initrd from ESP (optional) */
+    /* Load initrd from ESP (required). */
     void *initrd_buffer = NULL;
     uint64_t initrd_file_size = 0;
     if (uefi_load_file(bs, image_handle, s_InitrdPath,
@@ -157,7 +157,7 @@ void stage3_entry_64(struct Stage2Info *info)
         print_hex(initrd_file_size, 8);
         print_char('\n');
     } else {
-        print_str("No initrd found on ESP (optional)\n");
+        stage3_panic("Failed to load required initrd from ESP");
     }
 
     /* Validate ELF header */
@@ -178,15 +178,27 @@ void stage3_entry_64(struct Stage2Info *info)
 
     uint64_t elf_mem_size = max_vaddr - min_vaddr;
 
-    /* Allocate pages for kernel segments (extra for 2MB alignment waste) */
-    uint64_t kernel_pages = EFI_SIZE_TO_PAGES(elf_mem_size + KERNEL_LOAD_ALIGN);
+    /*
+     * Allocate pages for kernel segments.
+     * Prefer 2MB alignment, but fall back to 4KB alignment under low memory.
+     */
+    uint64_t kernel_align = KERNEL_LOAD_ALIGN;
+    uint64_t kernel_pages = EFI_SIZE_TO_PAGES(elf_mem_size + kernel_align);
     uint64_t final_load_addr = 0;
     EFI_STATUS efi_status = bs->AllocatePages(AllocateAnyPages, EfiLoaderData,
                                                kernel_pages, &final_load_addr);
     if (EFI_ERROR(efi_status)) {
-        stage3_panic("Failed to allocate kernel pages");
+        kernel_align = KERNEL_LOWMEM_ALIGN;
+        kernel_pages = EFI_SIZE_TO_PAGES(elf_mem_size + kernel_align);
+        final_load_addr = 0;
+        efi_status = bs->AllocatePages(AllocateAnyPages, EfiLoaderData,
+                                       kernel_pages, &final_load_addr);
+        if (EFI_ERROR(efi_status)) {
+            stage3_panic("Failed to allocate kernel pages");
+        }
+        print_line("Kernel allocation fallback: 4KB alignment");
     }
-    final_load_addr = ALIGN_UP(final_load_addr, KERNEL_LOAD_ALIGN);
+    final_load_addr = ALIGN_UP(final_load_addr, kernel_align);
 
     /* Load kernel ELF segments */
     struct ElfLoadResult load_result;

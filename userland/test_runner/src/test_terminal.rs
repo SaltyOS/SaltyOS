@@ -3,7 +3,6 @@
 
 use salty::posix;
 use salty::serial;
-use salty::serial::LineBuf;
 use salty::types::*;
 
 fn puts(s: &[u8]) {

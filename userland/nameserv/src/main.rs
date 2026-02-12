@@ -62,6 +62,10 @@ fn ipc_ctx() -> *mut IpcContext {
     &raw mut salty::__salty_ipc_ctx
 }
 
+fn signal_ready() {
+    let _ = salty::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+}
+
 fn name_equal(a: &[u8], alen: u8, b: &[u8], blen: u8) -> bool {
     if alen != blen {
         return false;
@@ -196,6 +200,7 @@ pub extern "C" fn _start() -> ! {
     unsafe {
         ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_SERVICE_BASE, 0);
     }
+    signal_ready();
 
     // Initial recv
     let mut msg = SaltyMsg::zeroed();

@@ -6,7 +6,7 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use super::slot::{free_slot, get_cap, get_meta, CapSlot, INVALID_SLOT, MAX_SLOTS};
+use super::slot::{free_slot, get_cap, get_meta, CapSlot, INVALID_SLOT};
 use super::{CapError, ObjectType, CDT};
 use crate::cap::cnode::{effective_cnode_bits, CapRef};
 use crate::mm::{self, PhysAddr, PAGE_SIZE};
@@ -85,22 +85,64 @@ impl FrameObject {
     }
 }
 
-// Frame metadata is stored out-of-line from frame payload memory.
-// This prevents user mappings/writes to frame pages from corrupting
-// kernel metadata (e.g., phys_addr used by VSpace_Map).
-static mut FRAME_METADATA: [MaybeUninit<FrameObject>; MAX_SLOTS] =
-    [const { MaybeUninit::uninit() }; MAX_SLOTS];
+/// Dynamic metadata state (pointers to frame-allocated arrays)
+struct MetadataState {
+    frame_ptr: *mut MaybeUninit<FrameObject>,
+    vspace_ptr: *mut MaybeUninit<crate::mm::VSpace>,
+    untyped_ptr: *mut MaybeUninit<UntypedMemory>,
+}
 
-// VSpace metadata is also stored out-of-line. The untyped-allocated page is
-// used exclusively as the PML4 root page table.
-static mut VSPACE_METADATA: [MaybeUninit<crate::mm::VSpace>; MAX_SLOTS] =
-    [const { MaybeUninit::uninit() }; MAX_SLOTS];
+// SAFETY: Pointers are only accessed under CAP_LOCK
+unsafe impl Sync for MetadataState {}
 
-// Sub-untyped metadata is stored out-of-line to prevent child frame retypes
-// from overwriting the UntypedMemory struct (which would be at offset 0 of
-// the sub-untyped's physical region if stored in-band).
-static mut UNTYPED_METADATA: [MaybeUninit<UntypedMemory>; MAX_SLOTS] =
-    [const { MaybeUninit::uninit() }; MAX_SLOTS];
+static mut METADATA_STATE: MetadataState = MetadataState {
+    frame_ptr: core::ptr::null_mut(),
+    vspace_ptr: core::ptr::null_mut(),
+    untyped_ptr: core::ptr::null_mut(),
+};
+
+/// Initialize dynamically-allocated metadata arrays.
+///
+/// # Safety
+/// Must be called exactly once during boot, after paging::init().
+pub unsafe fn init_metadata(num_slots: usize) {
+    use crate::mm::PAGE_SIZE;
+
+    let frame_bytes = num_slots * core::mem::size_of::<MaybeUninit<FrameObject>>();
+    let frame_pages = (frame_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    let vspace_bytes = num_slots * core::mem::size_of::<MaybeUninit<crate::mm::VSpace>>();
+    let vspace_pages = (vspace_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    let untyped_bytes = num_slots * core::mem::size_of::<MaybeUninit<UntypedMemory>>();
+    let untyped_pages = (untyped_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    let frame_phys = mm::alloc_contiguous_frames(frame_pages)
+        .expect("[CAP] FRAME_METADATA allocation failed");
+    let vspace_phys = mm::alloc_contiguous_frames(vspace_pages)
+        .expect("[CAP] VSPACE_METADATA allocation failed");
+    let untyped_phys = mm::alloc_contiguous_frames(untyped_pages)
+        .expect("[CAP] UNTYPED_METADATA allocation failed");
+
+    // SAFETY: Single-threaded init, direct map available
+    unsafe {
+        let state = &mut *(&raw mut METADATA_STATE);
+        state.frame_ptr = mm::phys_to_virt(frame_phys) as *mut MaybeUninit<FrameObject>;
+        state.vspace_ptr = mm::phys_to_virt(vspace_phys) as *mut MaybeUninit<crate::mm::VSpace>;
+        state.untyped_ptr = mm::phys_to_virt(untyped_phys) as *mut MaybeUninit<UntypedMemory>;
+    }
+
+    {
+        let s = crate::SerialGuard::acquire();
+        s.puts("[CAP] Metadata arrays: frame=");
+        s.dec(frame_pages as u64);
+        s.puts("p, vspace=");
+        s.dec(vspace_pages as u64);
+        s.puts("p, untyped=");
+        s.dec(untyped_pages as u64);
+        s.puts("p\n");
+    }
+}
 
 /// Untyped child tracker
 ///
@@ -116,7 +158,7 @@ impl UntypedTracker {
     /// This is separate from the CDT child list (cdt_first_child).
     pub fn add_child(untyped_slot: CapSlot, child_slot: CapSlot) {
         unsafe {
-            let slots_ptr = core::ptr::addr_of_mut!(crate::cap::slot::SLOTS[0]);
+            let slots_ptr = crate::cap::slot::slots_ptr();
 
             let untyped_storage = &mut *slots_ptr.add(untyped_slot as usize);
             let child_storage = &mut *slots_ptr.add(child_slot as usize);
@@ -138,7 +180,7 @@ impl UntypedTracker {
     /// Called when an object is deleted.
     pub fn remove_child(untyped_slot: CapSlot, child_slot: CapSlot) {
         unsafe {
-            let slots_ptr = core::ptr::addr_of_mut!(crate::cap::slot::SLOTS[0]);
+            let slots_ptr = crate::cap::slot::slots_ptr();
 
             let untyped_storage = &mut *slots_ptr.add(untyped_slot as usize);
 
@@ -179,7 +221,7 @@ impl UntypedTracker {
     /// Used to prevent reset/untype when objects exist.
     pub fn has_children(untyped_slot: CapSlot) -> bool {
         unsafe {
-            let slots_ptr = core::ptr::addr_of!(crate::cap::slot::SLOTS[0]);
+            let slots_ptr = crate::cap::slot::slots_ptr() as *const super::slot::CapSlotStorage;
             let storage = &*slots_ptr.add(untyped_slot as usize);
             storage.meta.ut_first_child != INVALID_SLOT
         }
@@ -195,7 +237,7 @@ impl UntypedTracker {
         }
 
         unsafe {
-            let slots_ptr = core::ptr::addr_of!(crate::cap::slot::SLOTS[0]);
+            let slots_ptr = crate::cap::slot::slots_ptr() as *const super::slot::CapSlotStorage;
             let storage = &*slots_ptr.add(untyped_slot as usize);
             let obj_ptr = storage.cap.object as *mut UntypedMemory;
             (*obj_ptr).watermark = 0;
@@ -300,21 +342,23 @@ unsafe fn init_object(
     }
 }
 
-/// Initialize frame metadata in slot-indexed static storage.
+/// Initialize frame metadata in dynamically-allocated storage.
 unsafe fn init_frame_metadata(
     cap_slot: CapSlot,
     phys_addr: PhysAddr,
     size_bits: u8,
 ) -> *mut crate::cap::object::KernelObject {
     let actual_bits = if size_bits < 12 { 12 } else { size_bits };
-    let frame_ptr = unsafe { FRAME_METADATA[cap_slot as usize].as_mut_ptr() };
+    // SAFETY: METADATA_STATE is initialized before any retype operations
+    let frame_ptr = unsafe { (*(&raw const METADATA_STATE)).frame_ptr.add(cap_slot as usize) };
+    let frame_ptr = unsafe { (*frame_ptr).as_mut_ptr() };
     unsafe {
         frame_ptr.write(FrameObject::new(phys_addr, actual_bits));
     }
     frame_ptr as *mut crate::cap::object::KernelObject
 }
 
-/// Initialize VSpace metadata in slot-indexed static storage and initialize
+/// Initialize VSpace metadata in dynamically-allocated storage and initialize
 /// the provided physical page as a PML4 root.
 unsafe fn init_vspace_metadata(
     cap_slot: CapSlot,
@@ -332,14 +376,16 @@ unsafe fn init_vspace_metadata(
         }
     }
 
-    let vspace_ptr = unsafe { VSPACE_METADATA[cap_slot as usize].as_mut_ptr() };
+    // SAFETY: METADATA_STATE is initialized before any retype operations
+    let vspace_ptr = unsafe { (*(&raw const METADATA_STATE)).vspace_ptr.add(cap_slot as usize) };
+    let vspace_ptr = unsafe { (*vspace_ptr).as_mut_ptr() };
     unsafe {
         vspace_ptr.write(crate::mm::VSpace::new(pml4_phys));
     }
     vspace_ptr as *mut crate::cap::object::KernelObject
 }
 
-/// Initialize sub-untyped metadata in slot-indexed static storage.
+/// Initialize sub-untyped metadata in dynamically-allocated storage.
 ///
 /// # Safety
 /// Caller must ensure `cap_slot` is a valid, exclusively-owned slot index.
@@ -349,7 +395,9 @@ unsafe fn init_untyped_metadata(
     size_bits: u8,
     is_device: bool,
 ) -> *mut crate::cap::object::KernelObject {
-    let untyped_ptr = unsafe { UNTYPED_METADATA[cap_slot as usize].as_mut_ptr() };
+    // SAFETY: METADATA_STATE is initialized before any retype operations
+    let untyped_ptr = unsafe { (*(&raw const METADATA_STATE)).untyped_ptr.add(cap_slot as usize) };
+    let untyped_ptr = unsafe { (*untyped_ptr).as_mut_ptr() };
     unsafe {
         untyped_ptr.write(UntypedMemory::new(phys_addr, size_bits, is_device));
     }

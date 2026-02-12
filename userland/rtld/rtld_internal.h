@@ -171,6 +171,7 @@ static inline void *rtld_memset(void *dst, int c, size_t n) {
 #define UNTYPED_RETYPE      0x20
 #define VSPACE_MAP          0x50
 #define VSPACE_UNMAP        0x51
+#define VSPACE_MAP_DEVICE   0x55
 
 /* Object types */
 #define OBJ_FRAME  7
@@ -185,6 +186,16 @@ static inline void *rtld_memset(void *dst, int c, size_t n) {
 #define VSPACE_FLAG_EXECUTABLE    (1 << 2)
 
 typedef uint64_t cap_t;
+/* Well-known child cap slot for initrd pseudo-device untyped */
+#define CAP_INITRD_UNTYPED  12
+#define CAP_UNTYPED_START   16
+#define CAP_UNTYPED_END     24
+
+/* Salty error codes used for fallback filtering */
+#define SALTY_INVALID_CAPABILITY  1
+#define SALTY_INVALID_OPERATION   2
+#define SALTY_OUT_OF_MEMORY       5
+#define SALTY_NOT_FOUND           6
 
 struct rtld_syscall_result {
     uint64_t error;
@@ -226,6 +237,12 @@ static inline uint64_t rtld_vspace_map(cap_t vspace, cap_t frame,
 
 static inline uint64_t rtld_vspace_unmap(cap_t vspace, uint64_t vaddr) {
     return rtld_invoke(vspace, VSPACE_UNMAP, vaddr, 0, 0, 0);
+}
+
+static inline uint64_t rtld_vspace_map_device(cap_t vspace, cap_t dev_ut,
+                                               uint64_t page_offset,
+                                               uint64_t vaddr, uint64_t flags) {
+    return rtld_invoke(vspace, VSPACE_MAP_DEVICE, dev_ut, page_offset, vaddr, flags);
 }
 
 static inline void rtld_yield(void) {

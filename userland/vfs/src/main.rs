@@ -122,6 +122,8 @@ const MAX_CLIENTS: usize = 16;
 const MAX_FDS: usize = 32;
 const MAX_PATH_LEN: usize = 64;
 const MAX_NAME_LEN: usize = 32;
+const LOWMEM_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+const MIDMEM_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 
 // FD types
 const FD_TYPE_NONE: u8 = 0;
@@ -153,6 +155,17 @@ const CAP_REPLY_BASE: u64 = 32;
 const ROOT_INO: u32 = 1;
 
 const INITRD_VADDR: u64 = 0x0000_0000_0100_0000;
+static mut LIMIT_INODES: usize = MAX_INODES;
+static mut LIMIT_WRITABLE: usize = MAX_WRITABLE;
+static mut LIMIT_CLIENTS: usize = MAX_CLIENTS;
+static mut LIMIT_FDS: usize = MAX_FDS;
+static mut LIMIT_SOCKETS: usize = MAX_SOCKETS;
+static mut LIMIT_POLL_WAITERS: usize = MAX_POLL_WAITERS;
+static mut LIMIT_EPOLL_INSTANCES: usize = MAX_EPOLL_INSTANCES;
+static mut LIMIT_EPOLL_ENTRIES: usize = MAX_EPOLL_ENTRIES;
+static mut LIMIT_SHM_OBJECTS: usize = MAX_SHM_OBJECTS;
+static mut LIMIT_SHM_PAGES: usize = MAX_SHM_PAGES;
+static mut LIMIT_PIPES: usize = MAX_PIPES;
 
 fn read_boot_info_initrd_size() -> usize {
     unsafe {
@@ -164,6 +177,102 @@ fn read_boot_info_initrd_size() -> usize {
         core::ptr::read_volatile(page.add(2)) as usize
     }
 }
+
+fn read_boot_info_usable_bytes() -> u64 {
+    unsafe {
+        let page = BOOTINFO_VADDR as *const u64;
+        let magic = core::ptr::read_volatile(page);
+        if magic != BOOTINFO_MAGIC {
+            return 0;
+        }
+        core::ptr::read_volatile(page.add(7))
+    }
+}
+
+#[inline]
+fn scale_limit(cap: usize, low: usize, mid: usize, usable_bytes: u64) -> usize {
+    if usable_bytes == 0 {
+        return cap;
+    }
+    if usable_bytes <= LOWMEM_TOTAL_BYTES {
+        if low < 1 {
+            1
+        } else {
+            low
+        }
+    } else if usable_bytes <= MIDMEM_TOTAL_BYTES {
+        if mid < 1 {
+            1
+        } else if mid > cap {
+            cap
+        } else {
+            mid
+        }
+    } else {
+        cap
+    }
+}
+
+unsafe fn init_runtime_limits() {
+    unsafe {
+        let usable = read_boot_info_usable_bytes();
+        LIMIT_INODES = scale_limit(MAX_INODES, 32, 64, usable);
+        LIMIT_WRITABLE = scale_limit(MAX_WRITABLE, 4, 6, usable);
+        LIMIT_CLIENTS = scale_limit(MAX_CLIENTS, 4, 6, usable);
+        LIMIT_FDS = scale_limit(MAX_FDS, 16, 24, usable);
+        LIMIT_SOCKETS = scale_limit(MAX_SOCKETS, 4, 6, usable);
+        LIMIT_POLL_WAITERS = scale_limit(MAX_POLL_WAITERS, 4, 6, usable);
+        LIMIT_EPOLL_INSTANCES = scale_limit(MAX_EPOLL_INSTANCES, 2, 3, usable);
+        LIMIT_EPOLL_ENTRIES = scale_limit(MAX_EPOLL_ENTRIES, 4, 6, usable);
+        LIMIT_SHM_OBJECTS = scale_limit(MAX_SHM_OBJECTS, 2, 3, usable);
+        LIMIT_SHM_PAGES = scale_limit(MAX_SHM_PAGES, 8, 12, usable);
+        LIMIT_PIPES = scale_limit(MAX_PIPES, 4, 6, usable);
+
+        // Keep dependent limits coherent.
+        if LIMIT_EPOLL_ENTRIES > LIMIT_FDS {
+            LIMIT_EPOLL_ENTRIES = LIMIT_FDS;
+        }
+
+        let mut lb = LineBuf::new();
+        lb.str(b"[VFS] Runtime limits: inodes=");
+        lb.hex(LIMIT_INODES as u64);
+        lb.str(b" clients=");
+        lb.hex(LIMIT_CLIENTS as u64);
+        lb.str(b" fds=");
+        lb.hex(LIMIT_FDS as u64);
+        lb.str(b" sockets=");
+        lb.hex(LIMIT_SOCKETS as u64);
+        lb.str(b" shm_objs=");
+        lb.hex(LIMIT_SHM_OBJECTS as u64);
+        lb.str(b" shm_pages=");
+        lb.hex(LIMIT_SHM_PAGES as u64);
+        lb.str(b"\n");
+        lb.flush();
+    }
+}
+
+#[inline]
+fn max_inodes() -> usize { unsafe { LIMIT_INODES } }
+#[inline]
+fn max_writable() -> usize { unsafe { LIMIT_WRITABLE } }
+#[inline]
+fn max_clients() -> usize { unsafe { LIMIT_CLIENTS } }
+#[inline]
+fn max_fds() -> usize { unsafe { LIMIT_FDS } }
+#[inline]
+fn max_sockets() -> usize { unsafe { LIMIT_SOCKETS } }
+#[inline]
+fn max_poll_waiters() -> usize { unsafe { LIMIT_POLL_WAITERS } }
+#[inline]
+fn max_epoll_instances() -> usize { unsafe { LIMIT_EPOLL_INSTANCES } }
+#[inline]
+fn max_epoll_entries() -> usize { unsafe { LIMIT_EPOLL_ENTRIES } }
+#[inline]
+fn max_shm_objects() -> usize { unsafe { LIMIT_SHM_OBJECTS } }
+#[inline]
+fn max_shm_pages() -> usize { unsafe { LIMIT_SHM_PAGES } }
+#[inline]
+fn max_pipes() -> usize { unsafe { LIMIT_PIPES } }
 
 // ======================================================================
 // Data structures
@@ -286,20 +395,34 @@ impl ClientState {
 // Global state
 // ======================================================================
 
-static mut INODES: [RamfsInode; MAX_INODES] = {
-    const ZERO: RamfsInode = RamfsInode::zeroed();
-    [ZERO; MAX_INODES]
-};
+static mut INODES_PTR: *mut RamfsInode = core::ptr::null_mut();
 static mut NEXT_INO: u32 = 1;
 
-static mut WRITABLE_POOL: [[u8; WRITABLE_SIZE]; MAX_WRITABLE] =
-    [[0; WRITABLE_SIZE]; MAX_WRITABLE];
-static mut WRITABLE_USED: [u8; MAX_WRITABLE] = [0; MAX_WRITABLE];
+static mut WRITABLE_POOL_PTR: *mut [u8; WRITABLE_SIZE] = core::ptr::null_mut();
+static mut WRITABLE_USED_PTR: *mut u8 = core::ptr::null_mut();
 
-static mut CLIENTS: [ClientState; MAX_CLIENTS] = {
-    const ZERO: ClientState = ClientState::zeroed();
-    [ZERO; MAX_CLIENTS]
-};
+static mut CLIENTS_PTR: *mut ClientState = core::ptr::null_mut();
+
+macro_rules! INODES {
+    () => {
+        unsafe { core::slice::from_raw_parts_mut(INODES_PTR, max_inodes()) }
+    };
+}
+macro_rules! WRITABLE_POOL {
+    () => {
+        unsafe { core::slice::from_raw_parts_mut(WRITABLE_POOL_PTR, max_writable()) }
+    };
+}
+macro_rules! WRITABLE_USED {
+    () => {
+        unsafe { core::slice::from_raw_parts_mut(WRITABLE_USED_PTR, max_writable()) }
+    };
+}
+macro_rules! CLIENTS {
+    () => {
+        unsafe { core::slice::from_raw_parts_mut(CLIENTS_PTR, max_clients()) }
+    };
+}
 
 // ======================================================================
 // Socket data structures
@@ -366,11 +489,14 @@ impl SocketState {
 
 unsafe impl Sync for SocketState {}
 
-static mut SOCKETS: [SocketState; MAX_SOCKETS] = {
-    const ZERO: SocketState = SocketState::zeroed();
-    [ZERO; MAX_SOCKETS]
-};
+static mut SOCKETS_PTR: *mut SocketState = core::ptr::null_mut();
 static mut NEXT_SOCK_ID: u32 = 1;
+
+macro_rules! SOCKETS {
+    () => {
+        unsafe { core::slice::from_raw_parts_mut(SOCKETS_PTR, max_sockets()) }
+    };
+}
 
 // ======================================================================
 // Poll data structures
@@ -394,10 +520,13 @@ impl PollWaiter {
     }
 }
 
-static mut POLL_WAITERS: [PollWaiter; MAX_POLL_WAITERS] = {
-    const ZERO: PollWaiter = PollWaiter::zeroed();
-    [ZERO; MAX_POLL_WAITERS]
-};
+static mut POLL_WAITERS_PTR: *mut PollWaiter = core::ptr::null_mut();
+
+macro_rules! POLL_WAITERS {
+    () => {
+        unsafe { core::slice::from_raw_parts_mut(POLL_WAITERS_PTR, max_poll_waiters()) }
+    };
+}
 
 // ======================================================================
 // Epoll data structures
@@ -438,10 +567,13 @@ impl EpollInstance {
     }
 }
 
-static mut EPOLLS: [EpollInstance; MAX_EPOLL_INSTANCES] = {
-    const ZERO: EpollInstance = EpollInstance::zeroed();
-    [ZERO; MAX_EPOLL_INSTANCES]
-};
+static mut EPOLLS_PTR: *mut EpollInstance = core::ptr::null_mut();
+
+macro_rules! EPOLLS {
+    () => {
+        unsafe { core::slice::from_raw_parts_mut(EPOLLS_PTR, max_epoll_instances()) }
+    };
+}
 
 // ======================================================================
 // SHM data structures
@@ -463,10 +595,13 @@ impl ShmData {
 unsafe impl Sync for ShmData {}
 
 const MAX_SHM_OBJECTS: usize = 8;
-static mut SHM_DATA: [ShmData; MAX_SHM_OBJECTS] = {
-    const ZERO: ShmData = ShmData::zeroed();
-    [ZERO; MAX_SHM_OBJECTS]
-};
+static mut SHM_DATA_PTR: *mut ShmData = core::ptr::null_mut();
+
+macro_rules! SHM_DATA {
+    () => {
+        unsafe { core::slice::from_raw_parts_mut(SHM_DATA_PTR, max_shm_objects()) }
+    };
+}
 
 // ======================================================================
 // Pipe data structures
@@ -547,11 +682,14 @@ impl PipeState {
 
 unsafe impl Sync for PipeState {}
 
-static mut PIPES: [PipeState; MAX_PIPES] = {
-    const ZERO: PipeState = PipeState::zeroed();
-    [ZERO; MAX_PIPES]
-};
+static mut PIPES_PTR: *mut PipeState = core::ptr::null_mut();
 static mut NEXT_PIPE_ID: u32 = 1;
+
+macro_rules! PIPES {
+    () => {
+        unsafe { core::slice::from_raw_parts_mut(PIPES_PTR, max_pipes()) }
+    };
+}
 
 // Reply slot counter for deferred replies
 static mut NEXT_REPLY_SLOT: u64 = CAP_REPLY_BASE;
@@ -559,6 +697,245 @@ static mut NEXT_REPLY_SLOT: u64 = CAP_REPLY_BASE;
 // Dynamic SHM frame cap base — set at startup from __salty_next_frame_slot
 // to avoid collision with rtld-loaded library frame caps
 static mut VFS_SHM_CAP_BASE: u64 = 512;
+const VFS_UNTYPED_FALLBACK_COUNT: u64 = 8;
+const VFS_STATE_ARENA_VADDR_DEFAULT: u64 = 0x0000_0000_0500_0000;
+
+static mut VFS_STATE_ARENA_BASE: *mut u8 = core::ptr::null_mut();
+static mut VFS_STATE_ARENA_SIZE: usize = 0;
+static mut VFS_STATE_ARENA_OFF: usize = 0;
+static mut VFS_NEXT_FRAME_SLOT: u64 = 0;
+
+unsafe fn retype_frame_from_any_untyped(frame_slot: u64) -> u64 {
+    let mut err = salty::invoke::untyped_retype(CAP_UNTYPED, OBJ_FRAME, 0, frame_slot);
+    if err == 0 {
+        return 0;
+    }
+
+    let mut best_err = err as u64;
+    for ut in CAP_UNTYPED_START..(CAP_UNTYPED_START + VFS_UNTYPED_FALLBACK_COUNT) {
+        err = salty::invoke::untyped_retype(ut, OBJ_FRAME, 0, frame_slot);
+        if err == 0 {
+            return 0;
+        }
+        if err != SALTY_INVALID_CAPABILITY as i32
+            && err != SALTY_INVALID_OPERATION as i32
+            && err != SALTY_NOT_FOUND as i32
+        {
+            best_err = err as u64;
+        }
+    }
+
+    best_err
+}
+
+#[inline]
+fn align_up_usize(value: usize, align: usize) -> usize {
+    if align <= 1 {
+        value
+    } else {
+        (value + align - 1) & !(align - 1)
+    }
+}
+
+#[inline]
+fn layout_add(total: usize, bytes: usize, align: usize) -> Option<usize> {
+    let aligned = align_up_usize(total, align);
+    aligned.checked_add(bytes)
+}
+
+unsafe fn vfs_map_state_arena(total_bytes: usize) -> i32 {
+    if total_bytes == 0 {
+        return 0;
+    }
+
+    let pages = (total_bytes + 4095) / 4096;
+    let arena_bytes = pages * 4096;
+    let base = VFS_STATE_ARENA_VADDR_DEFAULT;
+
+    unsafe {
+        for pg in 0..pages {
+            let slot = VFS_NEXT_FRAME_SLOT;
+            VFS_NEXT_FRAME_SLOT = VFS_NEXT_FRAME_SLOT.wrapping_add(1);
+
+            let rerr = retype_frame_from_any_untyped(slot);
+            if rerr != 0 {
+                let mut lb = LineBuf::new();
+                lb.str(b"[VFS] state arena frame retype failed err=");
+                lb.hex(rerr);
+                lb.str(b"\n");
+                lb.flush();
+                return rerr as i32;
+            }
+
+            let vaddr = base + (pg as u64) * 4096;
+            let merr = salty::invoke::vspace_map(
+                CAP_SELF_VSPACE,
+                slot,
+                vaddr,
+                VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+            );
+            if merr != 0 {
+                let mut lb = LineBuf::new();
+                lb.str(b"[VFS] state arena map failed err=");
+                lb.hex(merr as u64);
+                lb.str(b"\n");
+                lb.flush();
+                return merr;
+            }
+        }
+
+        core::ptr::write_bytes(base as *mut u8, 0, arena_bytes);
+        VFS_STATE_ARENA_BASE = base as *mut u8;
+        VFS_STATE_ARENA_SIZE = arena_bytes;
+        VFS_STATE_ARENA_OFF = 0;
+    }
+
+    0
+}
+
+unsafe fn vfs_arena_alloc(bytes: usize, align: usize) -> *mut u8 {
+    if bytes == 0 {
+        return core::ptr::null_mut();
+    }
+
+    unsafe {
+        let start = align_up_usize(VFS_STATE_ARENA_OFF, align);
+        let Some(end) = start.checked_add(bytes) else {
+            return core::ptr::null_mut();
+        };
+        if end > VFS_STATE_ARENA_SIZE {
+            return core::ptr::null_mut();
+        }
+        VFS_STATE_ARENA_OFF = end;
+        VFS_STATE_ARENA_BASE.add(start)
+    }
+}
+
+unsafe fn init_dynamic_state_storage() -> i32 {
+    unsafe {
+        let inodes_bytes = core::mem::size_of::<RamfsInode>()
+            .checked_mul(max_inodes())
+            .unwrap_or(0);
+        let writable_pool_bytes = core::mem::size_of::<[u8; WRITABLE_SIZE]>()
+            .checked_mul(max_writable())
+            .unwrap_or(0);
+        let writable_used_bytes = core::mem::size_of::<u8>()
+            .checked_mul(max_writable())
+            .unwrap_or(0);
+        let clients_bytes = core::mem::size_of::<ClientState>()
+            .checked_mul(max_clients())
+            .unwrap_or(0);
+        let sockets_bytes = core::mem::size_of::<SocketState>()
+            .checked_mul(max_sockets())
+            .unwrap_or(0);
+        let poll_waiters_bytes = core::mem::size_of::<PollWaiter>()
+            .checked_mul(max_poll_waiters())
+            .unwrap_or(0);
+        let epolls_bytes = core::mem::size_of::<EpollInstance>()
+            .checked_mul(max_epoll_instances())
+            .unwrap_or(0);
+        let shm_bytes = core::mem::size_of::<ShmData>()
+            .checked_mul(max_shm_objects())
+            .unwrap_or(0);
+        let pipes_bytes = core::mem::size_of::<PipeState>()
+            .checked_mul(max_pipes())
+            .unwrap_or(0);
+
+        if inodes_bytes == 0
+            || writable_pool_bytes == 0
+            || clients_bytes == 0
+            || sockets_bytes == 0
+            || pipes_bytes == 0
+        {
+            return SALTY_OUT_OF_MEMORY as i32;
+        }
+
+        let mut total = 0usize;
+        total = match layout_add(total, inodes_bytes, core::mem::align_of::<RamfsInode>()) {
+            Some(v) => v,
+            None => return SALTY_OUT_OF_MEMORY as i32,
+        };
+        total = match layout_add(total, writable_pool_bytes, core::mem::align_of::<[u8; WRITABLE_SIZE]>()) {
+            Some(v) => v,
+            None => return SALTY_OUT_OF_MEMORY as i32,
+        };
+        total = match layout_add(total, writable_used_bytes, core::mem::align_of::<u8>()) {
+            Some(v) => v,
+            None => return SALTY_OUT_OF_MEMORY as i32,
+        };
+        total = match layout_add(total, clients_bytes, core::mem::align_of::<ClientState>()) {
+            Some(v) => v,
+            None => return SALTY_OUT_OF_MEMORY as i32,
+        };
+        total = match layout_add(total, sockets_bytes, core::mem::align_of::<SocketState>()) {
+            Some(v) => v,
+            None => return SALTY_OUT_OF_MEMORY as i32,
+        };
+        total = match layout_add(total, poll_waiters_bytes, core::mem::align_of::<PollWaiter>()) {
+            Some(v) => v,
+            None => return SALTY_OUT_OF_MEMORY as i32,
+        };
+        total = match layout_add(total, epolls_bytes, core::mem::align_of::<EpollInstance>()) {
+            Some(v) => v,
+            None => return SALTY_OUT_OF_MEMORY as i32,
+        };
+        total = match layout_add(total, shm_bytes, core::mem::align_of::<ShmData>()) {
+            Some(v) => v,
+            None => return SALTY_OUT_OF_MEMORY as i32,
+        };
+        total = match layout_add(total, pipes_bytes, core::mem::align_of::<PipeState>()) {
+            Some(v) => v,
+            None => return SALTY_OUT_OF_MEMORY as i32,
+        };
+
+        VFS_NEXT_FRAME_SLOT = salty::__salty_next_frame_slot;
+        let err = vfs_map_state_arena(total);
+        if err != 0 {
+            return err;
+        }
+
+        INODES_PTR = vfs_arena_alloc(inodes_bytes, core::mem::align_of::<RamfsInode>()) as *mut RamfsInode;
+        WRITABLE_POOL_PTR = vfs_arena_alloc(writable_pool_bytes, core::mem::align_of::<[u8; WRITABLE_SIZE]>())
+            as *mut [u8; WRITABLE_SIZE];
+        WRITABLE_USED_PTR = vfs_arena_alloc(writable_used_bytes, core::mem::align_of::<u8>());
+        CLIENTS_PTR = vfs_arena_alloc(clients_bytes, core::mem::align_of::<ClientState>()) as *mut ClientState;
+        SOCKETS_PTR = vfs_arena_alloc(sockets_bytes, core::mem::align_of::<SocketState>()) as *mut SocketState;
+        POLL_WAITERS_PTR = vfs_arena_alloc(poll_waiters_bytes, core::mem::align_of::<PollWaiter>()) as *mut PollWaiter;
+        EPOLLS_PTR = vfs_arena_alloc(epolls_bytes, core::mem::align_of::<EpollInstance>()) as *mut EpollInstance;
+        SHM_DATA_PTR = vfs_arena_alloc(shm_bytes, core::mem::align_of::<ShmData>()) as *mut ShmData;
+        PIPES_PTR = vfs_arena_alloc(pipes_bytes, core::mem::align_of::<PipeState>()) as *mut PipeState;
+
+        if INODES_PTR.is_null()
+            || WRITABLE_POOL_PTR.is_null()
+            || WRITABLE_USED_PTR.is_null()
+            || CLIENTS_PTR.is_null()
+            || SOCKETS_PTR.is_null()
+            || POLL_WAITERS_PTR.is_null()
+            || EPOLLS_PTR.is_null()
+            || SHM_DATA_PTR.is_null()
+            || PIPES_PTR.is_null()
+        {
+            return SALTY_OUT_OF_MEMORY as i32;
+        }
+
+        VFS_SHM_CAP_BASE = VFS_NEXT_FRAME_SLOT;
+        salty::__salty_next_frame_slot = VFS_NEXT_FRAME_SLOT;
+
+        let mut lb = LineBuf::new();
+        lb.str(b"[VFS] state arena: bytes=");
+        lb.hex(total as u64);
+        lb.str(b" pages=");
+        lb.hex(((total + 4095) / 4096) as u64);
+        lb.str(b" shm_cap_base=");
+        lb.hex(VFS_SHM_CAP_BASE);
+        lb.str(b" base=");
+        lb.hex(VFS_STATE_ARENA_BASE as u64);
+        lb.str(b"\n");
+        lb.flush();
+
+        0
+    }
+}
 
 // ======================================================================
 // Helper functions
@@ -566,6 +943,10 @@ static mut VFS_SHM_CAP_BASE: u64 = 512;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
+}
+
+fn signal_ready() {
+    let _ = salty::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 fn ipc_ctx() -> *mut IpcContext {
@@ -588,9 +969,9 @@ fn str_equal_raw(a: *const u8, alen: usize, b: *const u8, blen: usize) -> bool {
 
 unsafe fn inode_by_ino(ino: u32) -> *mut RamfsInode {
     unsafe {
-        for i in 0..MAX_INODES {
-            if INODES[i].active != 0 && INODES[i].ino == ino {
-                return &raw mut INODES[i];
+        for i in 0..max_inodes() {
+            if INODES!()[i].active != 0 && INODES!()[i].ino == ino {
+                return &raw mut INODES!()[i];
             }
         }
         core::ptr::null_mut()
@@ -599,9 +980,9 @@ unsafe fn inode_by_ino(ino: u32) -> *mut RamfsInode {
 
 unsafe fn alloc_inode() -> *mut RamfsInode {
     unsafe {
-        for i in 0..MAX_INODES {
-            if INODES[i].active == 0 {
-                let n = &raw mut INODES[i];
+        for i in 0..max_inodes() {
+            if INODES!()[i].active == 0 {
+                let n = &raw mut INODES!()[i];
                 (*n).active = 1;
                 (*n).ino = NEXT_INO;
                 NEXT_INO += 1;
@@ -624,13 +1005,13 @@ unsafe fn alloc_inode() -> *mut RamfsInode {
 
 unsafe fn alloc_writable() -> *mut u8 {
     unsafe {
-        for i in 0..MAX_WRITABLE {
-            if WRITABLE_USED[i] == 0 {
-                WRITABLE_USED[i] = 1;
+        for i in 0..max_writable() {
+            if WRITABLE_USED!()[i] == 0 {
+                WRITABLE_USED!()[i] = 1;
                 for j in 0..WRITABLE_SIZE {
-                    WRITABLE_POOL[i][j] = 0;
+                    WRITABLE_POOL!()[i][j] = 0;
                 }
-                return WRITABLE_POOL[i].as_mut_ptr();
+                return WRITABLE_POOL!()[i].as_mut_ptr();
             }
         }
         core::ptr::null_mut()
@@ -810,11 +1191,11 @@ unsafe fn resolve_parent(
 
 unsafe fn init_ramfs() {
     unsafe {
-        for i in 0..MAX_INODES {
-            INODES[i].active = 0;
+        for i in 0..max_inodes() {
+            INODES!()[i].active = 0;
         }
-        for i in 0..MAX_WRITABLE {
-            WRITABLE_USED[i] = 0;
+        for i in 0..max_writable() {
+            WRITABLE_USED!()[i] = 0;
         }
 
         // Create root directory (ino 1)
@@ -934,27 +1315,27 @@ unsafe fn init_ramfs() {
 
 unsafe fn get_client(badge: u64) -> *mut ClientState {
     unsafe {
-        for i in 0..MAX_CLIENTS {
-            if CLIENTS[i].active != 0 && CLIENTS[i].badge == badge {
-                return &raw mut CLIENTS[i];
+        for i in 0..max_clients() {
+            if CLIENTS!()[i].active != 0 && CLIENTS!()[i].badge == badge {
+                return &raw mut CLIENTS!()[i];
             }
         }
-        for i in 0..MAX_CLIENTS {
-            if CLIENTS[i].active == 0 {
-                CLIENTS[i].badge = badge;
-                CLIENTS[i].active = 1;
-                for j in 0..MAX_FDS {
-                    CLIENTS[i].fds[j].active = 0;
-                    CLIENTS[i].fd_flags[j] = 0;
+        for i in 0..max_clients() {
+            if CLIENTS!()[i].active == 0 {
+                CLIENTS!()[i].badge = badge;
+                CLIENTS!()[i].active = 1;
+                for j in 0..max_fds() {
+                    CLIENTS!()[i].fds[j].active = 0;
+                    CLIENTS!()[i].fd_flags[j] = 0;
                 }
                 // Initialize cwd to "/"
-                CLIENTS[i].cwd[0] = b'/';
+                CLIENTS!()[i].cwd[0] = b'/';
                 let mut k = 1;
                 while k < 128 {
-                    CLIENTS[i].cwd[k] = 0;
+                    CLIENTS!()[i].cwd[k] = 0;
                     k += 1;
                 }
-                return &raw mut CLIENTS[i];
+                return &raw mut CLIENTS!()[i];
             }
         }
         core::ptr::null_mut()
@@ -1061,7 +1442,7 @@ unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
             return;
         }
 
-        for fd in 0..MAX_FDS {
+        for fd in 0..max_fds() {
             if (*cli).fds[fd].active == 0 {
                 (*cli).fds[fd].active = 1;
                 (*cli).fds[fd].inode = (*inode).ino;
@@ -1116,7 +1497,7 @@ unsafe fn handle_read(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
         let mut count = (*msg).regs[1];
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32 || (*cli).fds[fd as usize].active == 0 {
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32 || (*cli).fds[fd as usize].active == 0 {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
@@ -1231,7 +1612,7 @@ unsafe fn handle_write(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
         let mut count = (*msg).regs[1];
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32 || (*cli).fds[fd as usize].active == 0 {
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32 || (*cli).fds[fd as usize].active == 0 {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
@@ -1339,7 +1720,7 @@ unsafe fn handle_close(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32 || (*cli).fds[fd as usize].active == 0 {
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32 || (*cli).fds[fd as usize].active == 0 {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
@@ -1355,7 +1736,7 @@ unsafe fn handle_lseek(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
         let whence = (*msg).regs[2] as i32;
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32 || (*cli).fds[fd as usize].active == 0 {
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32 || (*cli).fds[fd as usize].active == 0 {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
@@ -1412,7 +1793,7 @@ unsafe fn handle_fstat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32 || (*cli).fds[fd as usize].active == 0 {
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32 || (*cli).fds[fd as usize].active == 0 {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
@@ -1682,7 +2063,7 @@ unsafe fn handle_opendir(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
             return;
         }
 
-        for fd in 0..MAX_FDS {
+        for fd in 0..max_fds() {
             if (*cli).fds[fd].active == 0 {
                 (*cli).fds[fd].active = 1;
                 (*cli).fds[fd].fd_type = FD_TYPE_DIR;
@@ -1707,7 +2088,7 @@ unsafe fn handle_readdir(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
         let cli = get_client(badge);
         if cli.is_null()
             || fd < 0
-            || fd >= MAX_FDS as i32
+            || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
             || (*cli).fds[fd as usize].fd_type != FD_TYPE_DIR
         {
@@ -1770,9 +2151,9 @@ unsafe fn handle_readdir(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
 
 unsafe fn alloc_socket() -> *mut SocketState {
     unsafe {
-        for i in 0..MAX_SOCKETS {
-            if SOCKETS[i].active == 0 {
-                let s = &raw mut SOCKETS[i];
+        for i in 0..max_sockets() {
+            if SOCKETS!()[i].active == 0 {
+                let s = &raw mut SOCKETS!()[i];
                 (*s).active = 1;
                 (*s).sock_id = NEXT_SOCK_ID;
                 NEXT_SOCK_ID += 1;
@@ -1803,9 +2184,9 @@ unsafe fn alloc_socket() -> *mut SocketState {
 
 unsafe fn find_socket(sock_id: u32) -> *mut SocketState {
     unsafe {
-        for i in 0..MAX_SOCKETS {
-            if SOCKETS[i].active != 0 && SOCKETS[i].sock_id == sock_id {
-                return &raw mut SOCKETS[i];
+        for i in 0..max_sockets() {
+            if SOCKETS!()[i].active != 0 && SOCKETS!()[i].sock_id == sock_id {
+                return &raw mut SOCKETS!()[i];
             }
         }
         core::ptr::null_mut()
@@ -1863,8 +2244,8 @@ unsafe fn alloc_reply_slot() -> u64 {
 /// When fd == -1, broadcast: wake waiter for ANY fd with matching requested events.
 unsafe fn wake_poll_waiters(badge: u64, fd: i32, revents: u16) {
     unsafe {
-        for i in 0..MAX_POLL_WAITERS {
-            if POLL_WAITERS[i].active == 0 || POLL_WAITERS[i].badge != badge {
+        for i in 0..max_poll_waiters() {
+            if POLL_WAITERS!()[i].active == 0 || POLL_WAITERS!()[i].badge != badge {
                 continue;
             }
             if fd == -1 {
@@ -1872,8 +2253,8 @@ unsafe fn wake_poll_waiters(badge: u64, fd: i32, revents: u16) {
                 let mut wake_reply = SaltyMsg::zeroed();
                 wake_reply.label = SALTY_OK;
                 let mut ready_count: u64 = 0;
-                for j in 0..POLL_WAITERS[i].nfds as usize {
-                    let requested = POLL_WAITERS[i].fds[j].1;
+                for j in 0..POLL_WAITERS!()[i].nfds as usize {
+                    let requested = POLL_WAITERS!()[i].fds[j].1;
                     // POLLHUP/POLLERR always reported regardless of requested events
                     let matched = revents & (requested | 0x010 | 0x008);
                     if matched != 0 {
@@ -1883,21 +2264,21 @@ unsafe fn wake_poll_waiters(badge: u64, fd: i32, revents: u16) {
                 }
                 if ready_count > 0 {
                     wake_reply.regs[0] = ready_count;
-                    wake_reply.length = 1 + POLL_WAITERS[i].nfds as u64;
-                    ipc::send_ctx(ipc_ctx(), POLL_WAITERS[i].reply_slot, &raw const wake_reply);
-                    POLL_WAITERS[i].active = 0;
+                    wake_reply.length = 1 + POLL_WAITERS!()[i].nfds as u64;
+                    ipc::send_ctx(ipc_ctx(), POLL_WAITERS!()[i].reply_slot, &raw const wake_reply);
+                    POLL_WAITERS!()[i].active = 0;
                 }
             } else {
                 // Targeted: match specific fd
-                for j in 0..POLL_WAITERS[i].nfds as usize {
-                    if POLL_WAITERS[i].fds[j].0 == fd {
+                for j in 0..POLL_WAITERS!()[i].nfds as usize {
+                    if POLL_WAITERS!()[i].fds[j].0 == fd {
                         let mut wake_reply = SaltyMsg::zeroed();
                         wake_reply.label = SALTY_OK;
                         wake_reply.regs[0] = 1;
                         wake_reply.regs[1 + j] = revents as u64;
-                        wake_reply.length = 1 + POLL_WAITERS[i].nfds as u64;
-                        ipc::send_ctx(ipc_ctx(), POLL_WAITERS[i].reply_slot, &raw const wake_reply);
-                        POLL_WAITERS[i].active = 0;
+                        wake_reply.length = 1 + POLL_WAITERS!()[i].nfds as u64;
+                        ipc::send_ctx(ipc_ctx(), POLL_WAITERS!()[i].reply_slot, &raw const wake_reply);
+                        POLL_WAITERS!()[i].active = 0;
                         break;
                     }
                 }
@@ -1912,9 +2293,9 @@ unsafe fn wake_poll_waiters(badge: u64, fd: i32, revents: u16) {
 
 unsafe fn find_pipe(pipe_id: u32) -> *mut PipeState {
     unsafe {
-        for i in 0..MAX_PIPES {
-            if PIPES[i].active != 0 && PIPES[i].pipe_id == pipe_id {
-                return &raw mut PIPES[i];
+        for i in 0..max_pipes() {
+            if PIPES!()[i].active != 0 && PIPES!()[i].pipe_id == pipe_id {
+                return &raw mut PIPES!()[i];
             }
         }
         core::ptr::null_mut()
@@ -1923,9 +2304,9 @@ unsafe fn find_pipe(pipe_id: u32) -> *mut PipeState {
 
 unsafe fn alloc_pipe() -> *mut PipeState {
     unsafe {
-        for i in 0..MAX_PIPES {
-            if PIPES[i].active == 0 {
-                let p = &raw mut PIPES[i];
+        for i in 0..max_pipes() {
+            if PIPES!()[i].active == 0 {
+                let p = &raw mut PIPES!()[i];
                 (*p).active = 1;
                 (*p).pipe_id = NEXT_PIPE_ID;
                 NEXT_PIPE_ID += 1;
@@ -2085,9 +2466,9 @@ unsafe fn close_pipe(fde: *mut FdEntry) {
 unsafe fn wake_poll_waiters_pipe(pipe: *const PipeState, is_read_end: bool, revents: u16) {
     unsafe {
         let pipe_id = (*pipe).pipe_id;
-        for i in 0..MAX_POLL_WAITERS {
-            if POLL_WAITERS[i].active == 0 { continue; }
-            let badge = POLL_WAITERS[i].badge;
+        for i in 0..max_poll_waiters() {
+            if POLL_WAITERS!()[i].active == 0 { continue; }
+            let badge = POLL_WAITERS!()[i].badge;
             let cli = get_client_noalloc(badge);
             if cli.is_null() { continue; }
 
@@ -2095,16 +2476,16 @@ unsafe fn wake_poll_waiters_pipe(pipe: *const PipeState, is_read_end: bool, reve
             let mut wake_reply = SaltyMsg::zeroed();
             wake_reply.label = SALTY_OK;
 
-            for j in 0..POLL_WAITERS[i].nfds as usize {
-                let pfd = POLL_WAITERS[i].fds[j].0;
-                if pfd < 0 || pfd >= MAX_FDS as i32 { continue; }
+            for j in 0..POLL_WAITERS!()[i].nfds as usize {
+                let pfd = POLL_WAITERS!()[i].fds[j].0;
+                if pfd < 0 || pfd >= max_fds() as i32 { continue; }
                 let fde = &(*cli).fds[pfd as usize];
                 if fde.active == 0 || fde.fd_type != FD_TYPE_PIPE { continue; }
                 if fde.pipe_id() != pipe_id { continue; }
                 let fd_is_read = (fde.flags & O_ACCMODE) == 0;
                 if fd_is_read != is_read_end { continue; }
 
-                let requested = POLL_WAITERS[i].fds[j].1;
+                let requested = POLL_WAITERS!()[i].fds[j].1;
                 let matched = revents & (requested | 0x010 | 0x008);
                 if matched != 0 {
                     wake_reply.regs[1 + j] = matched as u64;
@@ -2114,9 +2495,9 @@ unsafe fn wake_poll_waiters_pipe(pipe: *const PipeState, is_read_end: bool, reve
 
             if ready_count > 0 {
                 wake_reply.regs[0] = ready_count;
-                wake_reply.length = 1 + POLL_WAITERS[i].nfds as u64;
-                ipc::send_ctx(ipc_ctx(), POLL_WAITERS[i].reply_slot, &raw const wake_reply);
-                POLL_WAITERS[i].active = 0;
+                wake_reply.length = 1 + POLL_WAITERS!()[i].nfds as u64;
+                ipc::send_ctx(ipc_ctx(), POLL_WAITERS!()[i].reply_slot, &raw const wake_reply);
+                POLL_WAITERS!()[i].active = 0;
             }
         }
     }
@@ -2125,9 +2506,9 @@ unsafe fn wake_poll_waiters_pipe(pipe: *const PipeState, is_read_end: bool, reve
 /// Look up client without allocating a new one if not found.
 unsafe fn get_client_noalloc(badge: u64) -> *mut ClientState {
     unsafe {
-        for i in 0..MAX_CLIENTS {
-            if CLIENTS[i].active != 0 && CLIENTS[i].badge == badge {
-                return &raw mut CLIENTS[i];
+        for i in 0..max_clients() {
+            if CLIENTS!()[i].active != 0 && CLIENTS!()[i].badge == badge {
+                return &raw mut CLIENTS!()[i];
             }
         }
         core::ptr::null_mut()
@@ -2158,7 +2539,7 @@ unsafe fn handle_pipe(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
 
         // Allocate read-end fd
         let mut read_fd: i32 = -1;
-        for i in 0..MAX_FDS {
+        for i in 0..max_fds() {
             if (*cli).fds[i].active == 0 {
                 read_fd = i as i32;
                 break;
@@ -2172,7 +2553,7 @@ unsafe fn handle_pipe(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
 
         // Allocate write-end fd
         let mut write_fd: i32 = -1;
-        for i in 0..MAX_FDS {
+        for i in 0..max_fds() {
             if (*cli).fds[i].active == 0 && i as i32 != read_fd {
                 write_fd = i as i32;
                 break;
@@ -2376,7 +2757,7 @@ unsafe fn handle_dup(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let oldfd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || oldfd < 0 || oldfd >= MAX_FDS as i32
+        if cli.is_null() || oldfd < 0 || oldfd >= max_fds() as i32
             || (*cli).fds[oldfd as usize].active == 0
         {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -2385,7 +2766,7 @@ unsafe fn handle_dup(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
 
         // Find lowest free fd
         let mut newfd: i32 = -1;
-        for i in 0..MAX_FDS {
+        for i in 0..max_fds() {
             if (*cli).fds[i].active == 0 {
                 newfd = i as i32;
                 break;
@@ -2409,8 +2790,8 @@ unsafe fn handle_dup2(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
         let oldfd = (*msg).regs[0] as i32;
         let newfd = (*msg).regs[1] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || oldfd < 0 || oldfd >= MAX_FDS as i32
-            || newfd < 0 || newfd >= MAX_FDS as i32
+        if cli.is_null() || oldfd < 0 || oldfd >= max_fds() as i32
+            || newfd < 0 || newfd >= max_fds() as i32
             || (*cli).fds[oldfd as usize].active == 0
         {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -2449,8 +2830,8 @@ unsafe fn handle_dup3(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
         let newfd = (*msg).regs[1] as i32;
         let flags = (*msg).regs[2] as u32;
         let cli = get_client(badge);
-        if cli.is_null() || oldfd < 0 || oldfd >= MAX_FDS as i32
-            || newfd < 0 || newfd >= MAX_FDS as i32
+        if cli.is_null() || oldfd < 0 || oldfd >= max_fds() as i32
+            || newfd < 0 || newfd >= max_fds() as i32
             || (*cli).fds[oldfd as usize].active == 0
         {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -2535,7 +2916,7 @@ unsafe fn handle_clone_fds(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
         }
 
         // Copy all FDs from parent to child
-        for i in 0..MAX_FDS {
+        for i in 0..max_fds() {
             (*child).fds[i] = (*parent).fds[i];
             (*child).fd_flags[i] = (*parent).fd_flags[i];
             if (*child).fds[i].active == 0 { continue; }
@@ -2579,7 +2960,7 @@ unsafe fn handle_isatty(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) 
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
         {
             (*reply).label = SALTY_OK;
@@ -2607,7 +2988,7 @@ unsafe fn handle_tcgetattr(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
         {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -2648,7 +3029,7 @@ unsafe fn handle_tcsetattr(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
         {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -2686,7 +3067,7 @@ unsafe fn handle_tcsetattr(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
 /// Check readiness of a single fd for given events. Returns revents bitmask.
 unsafe fn check_fd_readiness(cli: *const ClientState, fd: i32, events: u32) -> u32 {
     unsafe {
-        if fd < 0 || fd >= MAX_FDS as i32 || (*cli).fds[fd as usize].active == 0 {
+        if fd < 0 || fd >= max_fds() as i32 || (*cli).fds[fd as usize].active == 0 {
             return 0x020; // POLLNVAL
         }
 
@@ -2765,8 +3146,8 @@ unsafe fn handle_epoll_create(reply: *mut SaltyMsg, badge: u64) {
 
         // Find free epoll instance
         let mut epoll_idx: i32 = -1;
-        for i in 0..MAX_EPOLL_INSTANCES {
-            if EPOLLS[i].active == 0 {
+        for i in 0..max_epoll_instances() {
+            if EPOLLS!()[i].active == 0 {
                 epoll_idx = i as i32;
                 break;
             }
@@ -2778,7 +3159,7 @@ unsafe fn handle_epoll_create(reply: *mut SaltyMsg, badge: u64) {
 
         // Find free fd
         let mut fd: i32 = -1;
-        for i in 0..MAX_FDS {
+        for i in 0..max_fds() {
             if (*cli).fds[i].active == 0 {
                 fd = i as i32;
                 break;
@@ -2790,10 +3171,10 @@ unsafe fn handle_epoll_create(reply: *mut SaltyMsg, badge: u64) {
         }
 
         // Init epoll instance
-        EPOLLS[epoll_idx as usize].active = 1;
-        EPOLLS[epoll_idx as usize].owner_badge = badge;
-        for j in 0..MAX_EPOLL_ENTRIES {
-            EPOLLS[epoll_idx as usize].entries[j].active = 0;
+        EPOLLS!()[epoll_idx as usize].active = 1;
+        EPOLLS!()[epoll_idx as usize].owner_badge = badge;
+        for j in 0..max_epoll_entries() {
+            EPOLLS!()[epoll_idx as usize].entries[j].active = 0;
         }
 
         // Init fd entry
@@ -2819,7 +3200,7 @@ unsafe fn handle_epoll_ctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
         let data = (*msg).regs[4];
 
         let cli = get_client(badge);
-        if cli.is_null() || epfd < 0 || epfd >= MAX_FDS as i32
+        if cli.is_null() || epfd < 0 || epfd >= max_fds() as i32
             || (*cli).fds[epfd as usize].active == 0
             || (*cli).fds[epfd as usize].fd_type != FD_TYPE_EPOLL
         {
@@ -2828,23 +3209,23 @@ unsafe fn handle_epoll_ctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
         }
 
         let ep_idx = (*cli).fds[epfd as usize].sock_id as usize;
-        if ep_idx >= MAX_EPOLL_INSTANCES || EPOLLS[ep_idx].active == 0 {
+        if ep_idx >= max_epoll_instances() || EPOLLS!()[ep_idx].active == 0 {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
 
         // Validate target fd
-        if fd < 0 || fd >= MAX_FDS as i32 || (*cli).fds[fd as usize].active == 0 {
+        if fd < 0 || fd >= max_fds() as i32 || (*cli).fds[fd as usize].active == 0 {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
 
-        let ep = &mut EPOLLS[ep_idx];
+        let ep = &mut EPOLLS!()[ep_idx];
 
         match op {
             1 => { // EPOLL_CTL_ADD
                 // Check not already present
-                for i in 0..MAX_EPOLL_ENTRIES {
+                for i in 0..max_epoll_entries() {
                     if ep.entries[i].active != 0 && ep.entries[i].fd == fd {
                         (*reply).label = SALTY_INVALID_ARGUMENT; // EEXIST
                         return;
@@ -2852,7 +3233,7 @@ unsafe fn handle_epoll_ctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
                 }
                 // Find free slot
                 let mut slot: i32 = -1;
-                for i in 0..MAX_EPOLL_ENTRIES {
+                for i in 0..max_epoll_entries() {
                     if ep.entries[i].active == 0 {
                         slot = i as i32;
                         break;
@@ -2869,7 +3250,7 @@ unsafe fn handle_epoll_ctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
             }
             2 => { // EPOLL_CTL_DEL
                 let mut found = false;
-                for i in 0..MAX_EPOLL_ENTRIES {
+                for i in 0..max_epoll_entries() {
                     if ep.entries[i].active != 0 && ep.entries[i].fd == fd {
                         ep.entries[i].active = 0;
                         found = true;
@@ -2883,7 +3264,7 @@ unsafe fn handle_epoll_ctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
             }
             3 => { // EPOLL_CTL_MOD
                 let mut found = false;
-                for i in 0..MAX_EPOLL_ENTRIES {
+                for i in 0..max_epoll_entries() {
                     if ep.entries[i].active != 0 && ep.entries[i].fd == fd {
                         ep.entries[i].events = events;
                         ep.entries[i].data = data;
@@ -2914,7 +3295,7 @@ unsafe fn handle_epoll_wait(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u
         let timeout = (*msg).regs[2] as i32;
 
         let cli = get_client(badge);
-        if cli.is_null() || epfd < 0 || epfd >= MAX_FDS as i32
+        if cli.is_null() || epfd < 0 || epfd >= max_fds() as i32
             || (*cli).fds[epfd as usize].active == 0
             || (*cli).fds[epfd as usize].fd_type != FD_TYPE_EPOLL
         {
@@ -2923,17 +3304,17 @@ unsafe fn handle_epoll_wait(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u
         }
 
         let ep_idx = (*cli).fds[epfd as usize].sock_id as usize;
-        if ep_idx >= MAX_EPOLL_INSTANCES || EPOLLS[ep_idx].active == 0 {
+        if ep_idx >= max_epoll_instances() || EPOLLS!()[ep_idx].active == 0 {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return false;
         }
 
-        let ep = &EPOLLS[ep_idx];
+        let ep = &EPOLLS!()[ep_idx];
         let cap = if max_events > 8 { 8 } else { max_events };
         let mut ready_count: usize = 0;
 
         // Check readiness for each entry in the interest list
-        for i in 0..MAX_EPOLL_ENTRIES {
+        for i in 0..max_epoll_entries() {
             if ep.entries[i].active == 0 {
                 continue;
             }
@@ -2967,21 +3348,21 @@ unsafe fn handle_epoll_wait(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u
 
         // Build a synthetic poll waiter from epoll entries
         let mut found = false;
-        for w in 0..MAX_POLL_WAITERS {
-            if POLL_WAITERS[w].active == 0 {
-                POLL_WAITERS[w].active = 1;
-                POLL_WAITERS[w].badge = badge;
-                POLL_WAITERS[w].reply_slot = slot;
+        for w in 0..max_poll_waiters() {
+            if POLL_WAITERS!()[w].active == 0 {
+                POLL_WAITERS!()[w].active = 1;
+                POLL_WAITERS!()[w].badge = badge;
+                POLL_WAITERS!()[w].reply_slot = slot;
                 let mut n: u8 = 0;
-                for i in 0..MAX_EPOLL_ENTRIES {
+                for i in 0..max_epoll_entries() {
                     if ep.entries[i].active == 0 || n >= 8 {
                         continue;
                     }
-                    POLL_WAITERS[w].fds[n as usize].0 = ep.entries[i].fd;
-                    POLL_WAITERS[w].fds[n as usize].1 = ep.entries[i].events as u16;
+                    POLL_WAITERS!()[w].fds[n as usize].0 = ep.entries[i].fd;
+                    POLL_WAITERS!()[w].fds[n as usize].1 = ep.entries[i].events as u16;
                     n += 1;
                 }
-                POLL_WAITERS[w].nfds = n;
+                POLL_WAITERS!()[w].nfds = n;
                 found = true;
                 break;
             }
@@ -3004,7 +3385,7 @@ unsafe fn handle_ioctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
         let _arg = (*msg).regs[2];
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
         {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -3046,7 +3427,7 @@ unsafe fn handle_fcntl(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
         let arg = (*msg).regs[2] as i64;
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
         {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -3060,7 +3441,7 @@ unsafe fn handle_fcntl(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                 let min_fd = if arg < 0 { 0 } else { arg as usize };
                 let mut newfd: i32 = -1;
                 let mut i = min_fd;
-                while i < MAX_FDS {
+                while i < max_fds() {
                     if (*cli).fds[i].active == 0 {
                         newfd = i as i32;
                         break;
@@ -3224,7 +3605,7 @@ unsafe fn handle_socket(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) 
             return false;
         }
 
-        for fd in 0..MAX_FDS {
+        for fd in 0..max_fds() {
             if (*cli).fds[fd].active == 0 {
                 (*cli).fds[fd].active = 1;
                 (*cli).fds[fd].fd_type = FD_TYPE_SOCKET;
@@ -3247,7 +3628,7 @@ unsafe fn handle_bind(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) ->
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
             || (*cli).fds[fd as usize].fd_type != FD_TYPE_SOCKET
         {
@@ -3305,7 +3686,7 @@ unsafe fn handle_listen(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) 
         let backlog = (*msg).regs[1] as u8;
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
             || (*cli).fds[fd as usize].fd_type != FD_TYPE_SOCKET
         {
@@ -3330,7 +3711,7 @@ unsafe fn handle_accept(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) 
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
             || (*cli).fds[fd as usize].fd_type != FD_TYPE_SOCKET
         {
@@ -3388,7 +3769,7 @@ unsafe fn handle_accept(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) 
 
                 // Allocate fd for accepted socket
                 let mut new_fd: i32 = -1;
-                for fdn in 0..MAX_FDS {
+                for fdn in 0..max_fds() {
                     if (*cli).fds[fdn].active == 0 {
                         (*cli).fds[fdn].active = 1;
                         (*cli).fds[fdn].fd_type = FD_TYPE_SOCKET;
@@ -3441,7 +3822,7 @@ unsafe fn handle_connect(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
             || (*cli).fds[fd as usize].fd_type != FD_TYPE_SOCKET
         {
@@ -3466,12 +3847,12 @@ unsafe fn handle_connect(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
 
         // Find the listener
         let mut listen_sock: *mut SocketState = core::ptr::null_mut();
-        for i in 0..MAX_SOCKETS {
-            if SOCKETS[i].active != 0
-                && SOCKETS[i].state == SOCK_LISTENING
-                && SOCKETS[i].bound_ino == (*inode).ino
+        for i in 0..max_sockets() {
+            if SOCKETS!()[i].active != 0
+                && SOCKETS!()[i].state == SOCK_LISTENING
+                && SOCKETS!()[i].bound_ino == (*inode).ino
             {
-                listen_sock = &raw mut SOCKETS[i];
+                listen_sock = &raw mut SOCKETS!()[i];
                 break;
             }
         }
@@ -3500,7 +3881,7 @@ unsafe fn handle_connect(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
             let accepter_cli = get_client((*listen_sock).accept_badge);
             let mut new_fd: i32 = -1;
             if !accepter_cli.is_null() {
-                for fdn in 0..MAX_FDS {
+                for fdn in 0..max_fds() {
                     if (*accepter_cli).fds[fdn].active == 0 {
                         (*accepter_cli).fds[fdn].active = 1;
                         (*accepter_cli).fds[fdn].fd_type = FD_TYPE_SOCKET;
@@ -3560,7 +3941,7 @@ unsafe fn handle_shutdown(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64
         let how = (*msg).regs[1] as i32;
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
             || (*cli).fds[fd as usize].fd_type != FD_TYPE_SOCKET
         {
@@ -3627,7 +4008,7 @@ unsafe fn handle_sockpair(_msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
 
         let mut fd1: i32 = -1;
         let mut fd2: i32 = -1;
-        for fdn in 0..MAX_FDS {
+        for fdn in 0..max_fds() {
             if (*cli).fds[fdn].active == 0 {
                 if fd1 < 0 {
                     (*cli).fds[fdn].active = 1;
@@ -3832,7 +4213,7 @@ unsafe fn handle_sendmsg(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
         let fd_count = (*msg).regs[2] as u32;
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
             || (*cli).fds[fd as usize].fd_type != FD_TYPE_SOCKET
         {
@@ -3899,7 +4280,7 @@ unsafe fn handle_recvmsg(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
         let max_data = (*msg).regs[1];
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
             || (*cli).fds[fd as usize].fd_type != FD_TYPE_SOCKET
         {
@@ -3955,13 +4336,13 @@ unsafe fn handle_recvmsg(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
 
                 // Look up source client and fd
                 let src_cli = get_client(src_badge);
-                if src_cli.is_null() || src_fd < 0 || src_fd >= MAX_FDS as i32 { continue; }
+                if src_cli.is_null() || src_fd < 0 || src_fd >= max_fds() as i32 { continue; }
                 let src_fde = &(*src_cli).fds[src_fd as usize];
                 if src_fde.active == 0 { continue; }
 
                 // Duplicate fd into receiver's fd table
                 let mut new_fd: i32 = -1;
-                for fdn in 0..MAX_FDS {
+                for fdn in 0..max_fds() {
                     if (*cli).fds[fdn].active == 0 {
                         (*cli).fds[fdn] = *src_fde;
                         new_fd = fdn as i32;
@@ -4008,7 +4389,7 @@ unsafe fn handle_poll(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) ->
             let pfd = (*msg).regs[2 + i * 2] as i32;
             let events = (*msg).regs[2 + i * 2 + 1] as u16;
 
-            if pfd < 0 || pfd >= MAX_FDS as i32 || (*cli).fds[pfd as usize].active == 0 {
+            if pfd < 0 || pfd >= max_fds() as i32 || (*cli).fds[pfd as usize].active == 0 {
                 revents_arr[i] = 0x020; // POLLNVAL
                 ready_count += 1;
                 continue;
@@ -4103,15 +4484,15 @@ unsafe fn handle_poll(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) ->
         }
 
         let mut found = false;
-        for i in 0..MAX_POLL_WAITERS {
-            if POLL_WAITERS[i].active == 0 {
-                POLL_WAITERS[i].active = 1;
-                POLL_WAITERS[i].badge = badge;
-                POLL_WAITERS[i].reply_slot = slot;
-                POLL_WAITERS[i].nfds = actual_nfds as u8;
+        for i in 0..max_poll_waiters() {
+            if POLL_WAITERS!()[i].active == 0 {
+                POLL_WAITERS!()[i].active = 1;
+                POLL_WAITERS!()[i].badge = badge;
+                POLL_WAITERS!()[i].reply_slot = slot;
+                POLL_WAITERS!()[i].nfds = actual_nfds as u8;
                 for j in 0..actual_nfds as usize {
-                    POLL_WAITERS[i].fds[j].0 = (*msg).regs[2 + j * 2] as i32;
-                    POLL_WAITERS[i].fds[j].1 = (*msg).regs[2 + j * 2 + 1] as u16;
+                    POLL_WAITERS!()[i].fds[j].0 = (*msg).regs[2 + j * 2] as i32;
+                    POLL_WAITERS!()[i].fds[j].1 = (*msg).regs[2 + j * 2 + 1] as u16;
                 }
                 found = true;
                 break;
@@ -4162,7 +4543,7 @@ unsafe fn handle_shm_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64
                 (*reply).label = SALTY_OUT_OF_MEMORY;
                 return false;
             }
-            for fd in 0..MAX_FDS {
+            for fd in 0..max_fds() {
                 if (*cli).fds[fd].active == 0 {
                     (*cli).fds[fd].active = 1;
                     (*cli).fds[fd].fd_type = FD_TYPE_SHM;
@@ -4220,10 +4601,10 @@ unsafe fn handle_shm_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64
 
         // Allocate SHM data
         let mut shm_idx: i32 = -1;
-        for i in 0..MAX_SHM_OBJECTS {
-            if SHM_DATA[i].active == 0 {
+        for i in 0..max_shm_objects() {
+            if SHM_DATA!()[i].active == 0 {
                 shm_idx = i as i32;
-                SHM_DATA[i].active = 1;
+                SHM_DATA!()[i].active = 1;
                 break;
             }
         }
@@ -4243,7 +4624,7 @@ unsafe fn handle_shm_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64
             return false;
         }
 
-        for fd in 0..MAX_FDS {
+        for fd in 0..max_fds() {
             if (*cli).fds[fd].active == 0 {
                 (*cli).fds[fd].active = 1;
                 (*cli).fds[fd].fd_type = FD_TYPE_SHM;
@@ -4290,9 +4671,9 @@ unsafe fn handle_shm_unlink(msg: *const SaltyMsg, reply: *mut SaltyMsg) -> bool 
         }
         // Reset SHM data slot
         let shm_idx = (*inode).dev_type as usize;
-        if shm_idx < MAX_SHM_OBJECTS {
-            SHM_DATA[shm_idx].active = 0;
-            SHM_DATA[shm_idx].num_pages = 0;
+        if shm_idx < max_shm_objects() {
+            SHM_DATA!()[shm_idx].active = 0;
+            SHM_DATA!()[shm_idx].num_pages = 0;
         }
 
         (*inode).active = 0;
@@ -4307,7 +4688,7 @@ unsafe fn handle_ftruncate(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
         let length = (*msg).regs[1];
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= MAX_FDS as i32
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
         {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -4324,29 +4705,27 @@ unsafe fn handle_ftruncate(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
             }
 
             let shm_idx = (*inode).dev_type as usize;
-            if shm_idx >= MAX_SHM_OBJECTS {
+            if shm_idx >= max_shm_objects() {
                 (*reply).label = SALTY_INVALID_OPERATION;
                 return false;
             }
 
             let num_pages = ((length + 4095) / 4096) as u16;
-            if num_pages as usize > MAX_SHM_PAGES {
+            if num_pages as usize > max_shm_pages() {
                 (*reply).label = SALTY_OUT_OF_MEMORY;
                 return false;
             }
 
             // Allocate frames
-            let shm = &raw mut SHM_DATA[shm_idx];
-            let cap_untyped: u64 = 7; // CAP_UNTYPED for VFS
-
+            let shm = &raw mut SHM_DATA!()[shm_idx];
             // Use high cap slots for SHM frames: 192+
-            let frame_base: u64 = VFS_SHM_CAP_BASE + shm_idx as u64 * MAX_SHM_PAGES as u64;
+            let frame_base: u64 = VFS_SHM_CAP_BASE + shm_idx as u64 * max_shm_pages() as u64;
 
             for i in (*shm).num_pages..num_pages {
                 let slot = frame_base + i as u64;
-                let err = salty::invoke::untyped_retype(cap_untyped, 7 /* OBJ_FRAME */, 0, slot);
+                let err = retype_frame_from_any_untyped(slot);
                 if err != 0 {
-                    (*reply).label = SALTY_OUT_OF_MEMORY;
+                    (*reply).label = err;
                     return false;
                 }
                 (*shm).frame_slots[i as usize] = slot;
@@ -4390,7 +4769,16 @@ pub extern "C" fn _start() -> ! {
     puts(b"[VFS] IPC buffer ready\n");
 
     unsafe {
-        VFS_SHM_CAP_BASE = salty::__salty_next_frame_slot;
+        init_runtime_limits();
+        let derr = init_dynamic_state_storage();
+        if derr != 0 {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS] FAIL: state storage init err=");
+            lb.hex(derr as u64);
+            lb.str(b"\n");
+            lb.flush();
+            idle();
+        }
     }
 
     unsafe {
@@ -4425,6 +4813,8 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
+    signal_ready();
+
     // Initial recv
     let mut msg = SaltyMsg::zeroed();
     let mut badge: u64 = 0;
@@ -4447,7 +4837,7 @@ pub extern "C" fn _start() -> ! {
                 VFS_READ => {
                     let fd = msg.regs[0] as i32;
                     let cli = get_client(badge);
-                    if !cli.is_null() && fd >= 0 && fd < MAX_FDS as i32
+                    if !cli.is_null() && fd >= 0 && fd < max_fds() as i32
                         && (*cli).fds[fd as usize].active != 0
                     {
                         match (*cli).fds[fd as usize].fd_type {
@@ -4470,7 +4860,7 @@ pub extern "C" fn _start() -> ! {
                 VFS_WRITE => {
                     let fd = msg.regs[0] as i32;
                     let cli = get_client(badge);
-                    if !cli.is_null() && fd >= 0 && fd < MAX_FDS as i32
+                    if !cli.is_null() && fd >= 0 && fd < max_fds() as i32
                         && (*cli).fds[fd as usize].active != 0
                     {
                         match (*cli).fds[fd as usize].fd_type {
@@ -4493,7 +4883,7 @@ pub extern "C" fn _start() -> ! {
                 VFS_CLOSE => {
                     let fd = msg.regs[0] as i32;
                     let cli = get_client(badge);
-                    if !cli.is_null() && fd >= 0 && fd < MAX_FDS as i32
+                    if !cli.is_null() && fd >= 0 && fd < max_fds() as i32
                         && (*cli).fds[fd as usize].active != 0
                     {
                         match (*cli).fds[fd as usize].fd_type {
@@ -4505,8 +4895,8 @@ pub extern "C" fn _start() -> ! {
                             }
                             FD_TYPE_EPOLL => {
                                 let ep_idx = (*cli).fds[fd as usize].sock_id as usize;
-                                if ep_idx < MAX_EPOLL_INSTANCES {
-                                    EPOLLS[ep_idx].active = 0;
+                                if ep_idx < max_epoll_instances() {
+                                    EPOLLS!()[ep_idx].active = 0;
                                 }
                             }
                             _ => {}

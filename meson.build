@@ -39,6 +39,10 @@ nasm = find_program('nasm', required: build_boot)
 # Binary tools
 objcopy = find_program('llvm-objcopy', required: build_boot)
 lld_link = find_program('lld-link', required: build_boot)
+llvm_strip = find_program('llvm-strip', required: false)
+if not llvm_strip.found()
+  llvm_strip = find_program('strip', required: build_userland)
+endif
 
 # Rust: must be nightly (required for building core library)
 rustc = find_program('rustc', required: build_kernel or build_userland)
@@ -166,6 +170,68 @@ initrd_inputs = []
 initrd_target = []
 
 if build_userland and mkcpio.found()
+  # Strip all initrd payload binaries to minimize low-memory footprint.
+  initrd_init_elf = custom_target('initrd_init_elf',
+    input: init_boot_elf,
+    output: 'init.initrd.elf',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+  initrd_console_elf = custom_target('initrd_console_elf',
+    input: console_elf,
+    output: 'console.initrd.elf',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+  initrd_rtld_so = custom_target('initrd_rtld_so',
+    input: ld_salty_so,
+    output: 'ld-salty.initrd.so',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+  initrd_libsalty_so = custom_target('initrd_libsalty_so',
+    input: libsalty_so,
+    output: 'libsalty.initrd.so',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+  initrd_libc_so = custom_target('initrd_libc_so',
+    input: libc_so,
+    output: 'libc.initrd.so',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+  initrd_nameserv_elf = custom_target('initrd_nameserv_elf',
+    input: nameserv_elf,
+    output: 'nameserv.initrd.elf',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+  initrd_procmgr_elf = custom_target('initrd_procmgr_elf',
+    input: procmgr_elf,
+    output: 'procmgr.initrd.elf',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+  initrd_vfs_elf = custom_target('initrd_vfs_elf',
+    input: vfs_elf,
+    output: 'vfs.initrd.elf',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+  initrd_display_elf = custom_target('initrd_display_elf',
+    input: display_elf,
+    output: 'display.initrd.elf',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+  initrd_test_runner_elf = custom_target('initrd_test_runner_elf',
+    input: test_runner_elf,
+    output: 'test_runner.initrd.elf',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+
   # Service definition files
   svc_console = files('userland/services/console.service')
   svc_nameserv = files('userland/services/nameserv.service')
@@ -174,19 +240,24 @@ if build_userland and mkcpio.found()
   svc_display = files('userland/services/display.service')
   svc_test_runner = files('userland/services/test_runner.service')
 
+  # Shared libraries first for minimal library-window mapping.
+  mkcpio_script = files('tools/mkcpio.py')
   initrd = custom_target('initrd',
-    input: [init_elf, console_elf, ld_salty_so, libsalty_so, libc_so,
-            nameserv_elf, procmgr_elf, vfs_elf, display_elf, test_runner_elf,
+    input: [initrd_rtld_so, initrd_libsalty_so, initrd_libc_so,
+            initrd_init_elf, initrd_console_elf, initrd_nameserv_elf,
+            initrd_procmgr_elf, initrd_vfs_elf, initrd_display_elf,
+            initrd_test_runner_elf,
             svc_console, svc_nameserv, svc_vfs, svc_procmgr, svc_display,
             svc_test_runner],
+    depend_files: mkcpio_script,
     output: 'initrd.cpio',
     command: [mkcpio,
       '--output', '@OUTPUT@',
-      'init.elf=@INPUT0@',
-      'console.elf=@INPUT1@',
-      'ld-salty.so=@INPUT2@',
-      'libsalty.so=@INPUT3@',
-      'libc.so=@INPUT4@',
+      'ld-salty.so=@INPUT0@',
+      'libsalty.so=@INPUT1@',
+      'libc.so=@INPUT2@',
+      'init.elf=@INPUT3@',
+      'console.elf=@INPUT4@',
       'nameserv.elf=@INPUT5@',
       'procmgr.elf=@INPUT6@',
       'vfs.elf=@INPUT7@',
@@ -212,14 +283,18 @@ endif
 
 mkimage = find_program('tools/mkimage.py', required: false)
 
+mkimage_script = files('tools/mkimage.py')
+
 if mkimage.found() and build_boot and build_kernel
 
   # BIOS disk image
   disk_image = custom_target('disk_image',
-    input: [mbr, stage2, stage3, kernel] + initrd_inputs,
+    input: [mbr, stage2, stage3, kernel_boot] + initrd_inputs,
+    depend_files: mkimage_script,
     output: 'saltyos.img',
     command: [mkimage,
       '--build-dir', meson.project_build_root(),
+      '--kernel', kernel_boot.full_path(),
       '--output', '@OUTPUT@',
       '--size', '16',
     ] + initrd_args,
@@ -229,11 +304,13 @@ if mkimage.found() and build_boot and build_kernel
   # UEFI disk image
   if arch == 'x86_64'
     uefi_image = custom_target('uefi_image',
-      input: [efi, stage2_efi, stage3_uefi, kernel] + initrd_inputs,
+      input: [efi, stage2_efi, stage3_uefi, kernel_boot] + initrd_inputs,
+      depend_files: mkimage_script,
       output: 'saltyos-uefi.img',
       command: [mkimage,
         '--efi',
         '--build-dir', meson.project_build_root(),
+        '--kernel', kernel_boot.full_path(),
         '--output', '@OUTPUT@',
         '--size', '64',
       ] + initrd_args,

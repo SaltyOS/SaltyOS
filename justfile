@@ -76,6 +76,19 @@ run: build
         -no-reboot \
         -no-shutdown
 
+# Run in QEMU with lowmem (4MB)
+run-lowmem: build
+    qemu-system-x86_64 \
+        -machine q35 \
+        -cpu qemu64 \
+        -m 4M \
+        -serial stdio \
+        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
+        -device ahci,id=ahci \
+        -device ide-hd,drive=disk,bus=ahci.0 \
+        -no-reboot \
+        -no-shutdown
+
 # Run in QEMU with SMP (2 CPUs)
 run-smp: build
     qemu-system-x86_64 \

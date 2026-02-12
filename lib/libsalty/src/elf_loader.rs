@@ -14,6 +14,93 @@ fn page_align_up(v: u64) -> u64 {
     (v + ELF_PAGE_SIZE - 1) & !(ELF_PAGE_SIZE - 1)
 }
 
+const ELF_UT_SCAN_END_FALLBACK: Cap = 200;
+static mut NEXT_UT_HINT: Cap = CAP_UNTYPED_START;
+
+fn untyped_scan_end() -> Cap {
+    let mut end = ELF_UT_SCAN_END_FALLBACK;
+    let info = invoke::cnode_get_info(CAP_SELF_CSPACE);
+    if info.error == 0 {
+        unsafe {
+            let ctx = &raw const crate::__salty_ipc_ctx;
+            if !(*ctx).ipc_buffer.is_null() {
+                let num_slots = (*(*ctx).ipc_buffer).msg[3];
+                if num_slots > CAP_UNTYPED_START && num_slots < end {
+                    end = num_slots;
+                }
+            }
+        }
+    }
+
+    if end <= CAP_UNTYPED_START {
+        CAP_UNTYPED_START + 1
+    } else {
+        end
+    }
+}
+
+fn try_retype_frame_any_untyped(ctx: &mut ElfLoaderCtx, frame_slot: Cap) -> i32 {
+    let mut err = invoke::untyped_retype(ctx.untyped, OBJ_FRAME, 0, frame_slot);
+    if err == 0 {
+        unsafe {
+            NEXT_UT_HINT = ctx.untyped;
+        }
+        return 0;
+    }
+
+    let start = CAP_UNTYPED_START;
+    let end = untyped_scan_end();
+
+    let mut first = unsafe { NEXT_UT_HINT };
+    if first < start || first >= end {
+        first = start;
+    }
+
+    let mut best_err = err;
+
+    for ut in first..end {
+        if ut == ctx.untyped {
+            continue;
+        }
+        err = invoke::untyped_retype(ut, OBJ_FRAME, 0, frame_slot);
+        if err == 0 {
+            ctx.untyped = ut;
+            unsafe {
+                NEXT_UT_HINT = ut;
+            }
+            return 0;
+        }
+        if err != SALTY_INVALID_CAPABILITY as i32
+            && err != SALTY_INVALID_OPERATION as i32
+            && err != SALTY_NOT_FOUND as i32
+        {
+            best_err = err;
+        }
+    }
+
+    for ut in start..first {
+        if ut == ctx.untyped {
+            continue;
+        }
+        err = invoke::untyped_retype(ut, OBJ_FRAME, 0, frame_slot);
+        if err == 0 {
+            ctx.untyped = ut;
+            unsafe {
+                NEXT_UT_HINT = ut;
+            }
+            return 0;
+        }
+        if err != SALTY_INVALID_CAPABILITY as i32
+            && err != SALTY_INVALID_OPERATION as i32
+            && err != SALTY_NOT_FOUND as i32
+        {
+            best_err = err;
+        }
+    }
+
+    best_err
+}
+
 fn next_frame_slot(ctx: &mut ElfLoaderCtx) -> Cap {
     if let Some(alloc) = ctx.alloc_frame_slot {
         unsafe { alloc(ctx.alloc_opaque) }
@@ -429,8 +516,7 @@ pub unsafe fn elf_load(
                         return ELF_OUT_OF_MEMORY;
                     }
 
-                    let err =
-                        invoke::untyped_retype(ctx.untyped, OBJ_FRAME, 0, frame_slot);
+                    let err = try_retype_frame_any_untyped(ctx, frame_slot);
                     if err != 0 {
                         return ELF_OUT_OF_MEMORY;
                     }

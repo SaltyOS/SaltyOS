@@ -18,35 +18,16 @@ rust_userland_args = [
   '-L', rust_build_dir,
 ]
 
-# Rust source files (listed as depend_files for rebuild tracking)
-libsalty_rust_sources = files(
-  'src/lib.rs',
-  'src/consts.rs',
-  'src/types.rs',
-  'src/syscall.rs',
-  'src/ipc.rs',
-  'src/invoke.rs',
-  'src/serial.rs',
-  'src/posix.rs',
-  'src/posix_mm.rs',
-  'src/signals.rs',
-  'src/cpio.rs',
-  'src/elf_loader.rs',
-  'src/elf_dynamic.rs',
-)
-
 # Step 1: Rust -> .o + .rmeta
 libsalty_rust = custom_target('libsalty_rust',
   input: files('src/lib.rs'),
-  depend_files: libsalty_rust_sources,
   output: ['libsalty.o', 'libsalty.rmeta'],
+  depfile: 'libsalty.d',
   command: [rustc,
     rust_userland_args,
-    '--emit=obj,metadata',
+    '--emit=obj=@OUTPUT0@,metadata=@OUTPUT1@,dep-info=@DEPFILE@',
     '--crate-name=salty',
     '--crate-type=lib',
-    '--out-dir', '@OUTDIR@',
-    '-o', '@OUTPUT0@',
     '@INPUT@',
   ],
   depends: [core, compiler_builtins],
