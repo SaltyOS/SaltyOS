@@ -10,7 +10,10 @@
 void parse_dynamic(struct link_map *map, Elf64_Dyn *dyn, uint64_t base) {
     map->base = base;
     map->symtab = NULL;
+    map->symtab_count = 0;
+    map->sym_ent_size = sizeof(Elf64_Sym);
     map->strtab = NULL;
+    map->strtab_size = 0;
     map->gnu_hash = NULL;
     map->jmprel = NULL;
     map->jmprel_count = 0;
@@ -25,6 +28,13 @@ void parse_dynamic(struct link_map *map, Elf64_Dyn *dyn, uint64_t base) {
             break;
         case DT_STRTAB:
             map->strtab = (const char *)(base + dyn[i].d_val);
+            break;
+        case DT_STRSZ:
+            map->strtab_size = dyn[i].d_val;
+            break;
+        case DT_SYMENT:
+            if (dyn[i].d_val != 0)
+                map->sym_ent_size = dyn[i].d_val;
             break;
         case DT_GNU_HASH:
             map->gnu_hash = (uint32_t *)(base + dyn[i].d_val);
@@ -45,6 +55,16 @@ void parse_dynamic(struct link_map *map, Elf64_Dyn *dyn, uint64_t base) {
             map->rela_count = dyn[i].d_val / sizeof(Elf64_Rela);
             break;
         }
+    }
+
+    /* Derive an upper bound for dynsym entries when symtab precedes strtab.
+     * This holds for our userland link layout and enables safe bounds checks.
+     */
+    if (map->symtab && map->strtab
+        && map->sym_ent_size != 0
+        && (uintptr_t)map->strtab > (uintptr_t)map->symtab) {
+        uint64_t bytes = (uint64_t)((uintptr_t)map->strtab - (uintptr_t)map->symtab);
+        map->symtab_count = bytes / map->sym_ent_size;
     }
 }
 
@@ -369,6 +389,14 @@ int load_shared_library(struct rtld_state *st, const char *name,
         }
     }
 
+    /* Compute actual page-aligned load footprint */
+    uint64_t max_end = 0;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdrs[i].p_type != PT_LOAD) continue;
+        uint64_t seg_end = rtld_page_align_up(phdrs[i].p_vaddr + delta + phdrs[i].p_memsz);
+        if (seg_end > max_end) max_end = seg_end;
+    }
+
     /* Find PT_DYNAMIC and create link_map entry */
     Elf64_Dyn *lib_dyn = NULL;
     for (int i = 0; i < ehdr->e_phnum; i++) {
@@ -381,6 +409,7 @@ int load_shared_library(struct rtld_state *st, const char *name,
     struct link_map *map = &st->objects[st->nobjects];
     map->name = name;
     map->next = NULL;
+    map->load_size = (max_end > load_addr) ? (max_end - load_addr) : 0;
 
     if (lib_dyn)
         parse_dynamic(map, lib_dyn, base);

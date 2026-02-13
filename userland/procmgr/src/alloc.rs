@@ -111,6 +111,26 @@ impl SlotBitmap {
             self.hint = base;
         }
     }
+
+    /// Mark a pool-relative slot as occupied by non-allocator state.
+    fn mark_used(&mut self, index: usize) {
+        if index >= SLOT_POOL_SIZE {
+            return;
+        }
+        let word = index / 64;
+        let bit = index % 64;
+        self.bits[word] |= 1u64 << bit;
+        if index == self.hint {
+            while self.hint < SLOT_POOL_SIZE {
+                let w = self.hint / 64;
+                let b = self.hint % 64;
+                if (self.bits[w] & (1u64 << b)) == 0 {
+                    break;
+                }
+                self.hint += 1;
+            }
+        }
+    }
 }
 
 struct UntypedSource {
@@ -254,6 +274,16 @@ impl Allocator {
     pub fn alloc_slots(&mut self, count: usize) -> Option<(Cap, usize)> {
         let pool_idx = self.bitmap.alloc_contiguous(count)?;
         Some((SLOT_POOL_BASE + pool_idx as Cap, count))
+    }
+
+    /// Mark a pre-existing CSpace slot as used so allocator reservations
+    /// never overlap inherited/static capabilities.
+    pub fn mark_slot_used(&mut self, slot: Cap) {
+        if slot < SLOT_POOL_BASE {
+            return;
+        }
+        let pool_idx = (slot - SLOT_POOL_BASE) as usize;
+        self.bitmap.mark_used(pool_idx);
     }
 
     /// Free `count` contiguous CSpace slots starting at `base`.

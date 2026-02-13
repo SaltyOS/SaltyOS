@@ -2,6 +2,7 @@
 //! Extracted from main.rs for separation of concerns.
 //! SPDX-License-Identifier: GPL-2.0-only
 
+use salty::layout::VmLayoutPlan;
 use salty::types::Cap;
 
 // ---- Process states ----
@@ -19,6 +20,30 @@ pub const SIG_DISP_CATCH: u8 = 2;
 // ---- Limits ----
 pub const MAX_PROCESSES: usize = 16;
 pub const MAX_NAME_LEN: usize = 32;
+
+// ---- Per-process shared library mapping ----
+pub const MAX_PROC_MAPPED_LIBS: usize = 4;
+
+/// Compact record of which cached libraries were mapped into a process and
+/// at what base VA. Used by fork to identify and re-share cached frames.
+#[derive(Clone, Copy)]
+pub struct ProcLibMap {
+    pub count: u8,
+    /// Index into SharedLibCache.libs[] for each mapped library.
+    pub lib_idx: [u8; MAX_PROC_MAPPED_LIBS],
+    /// Mapped base VA for each library.
+    pub base: [u64; MAX_PROC_MAPPED_LIBS],
+}
+
+impl ProcLibMap {
+    pub const fn zeroed() -> Self {
+        ProcLibMap {
+            count: 0,
+            lib_idx: [0; MAX_PROC_MAPPED_LIBS],
+            base: [0; MAX_PROC_MAPPED_LIBS],
+        }
+    }
+}
 
 // ===========================================================================
 // Process struct
@@ -51,6 +76,10 @@ pub struct Process {
     pub frame_count: u16,
     /// Base address of shared library RO pages (from spawn_tx cache).
     pub shared_lib_base: u64,
+    /// Per-process library mapping (which cached libs, at what VAs).
+    pub lib_map: ProcLibMap,
+    /// VA layout used when this process was spawned/exec'd.
+    pub layout: VmLayoutPlan,
 }
 
 impl Process {
@@ -78,6 +107,8 @@ impl Process {
             frame_base: 0,
             frame_count: 0,
             shared_lib_base: 0,
+            lib_map: ProcLibMap::zeroed(),
+            layout: VmLayoutPlan::zeroed(),
         }
     }
 }
@@ -185,6 +216,7 @@ pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
         p.frame_base = 0;
         p.frame_count = 0;
         p.shared_lib_base = 0;
+        p.lib_map = ProcLibMap::zeroed();
         for i in 0..NSIG {
             p.sig_disposition[i] = SIG_DISP_DFL;
         }

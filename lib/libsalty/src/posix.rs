@@ -1708,6 +1708,344 @@ pub unsafe fn posix_getcwd(buf: *mut u8, size: u64) -> i32 {
     }
 }
 
+// ======================================================================
+// *at() family — dirfd-relative file operations
+// ======================================================================
+
+/// openat(dirfd, path, flags)
+/// IPC: reg[0]=dirfd, reg[1]=open_flags, reg[2..]=path(len+data)
+pub unsafe fn posix_openat(dirfd: i32, path: *const u8, flags: i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_OPENAT;
+        msg.regs[0] = dirfd as u32 as u64;
+        msg.regs[1] = flags as u32 as u64;
+        let path_len = pack_path(&raw mut msg, 2, path);
+        msg.length = 3 + ((path_len as u64 + 7) / 8);
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        reply.regs[0] as i32
+    }
+}
+
+/// fstatat(dirfd, path, statbuf, flags)
+/// IPC: reg[0]=dirfd, reg[1]=at_flags, reg[2..]=path(len+data)
+pub unsafe fn posix_fstatat(dirfd: i32, path: *const u8, st: *mut SaltyStat, at_flags: i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_FSTATAT;
+        msg.regs[0] = dirfd as u32 as u64;
+        msg.regs[1] = at_flags as u32 as u64;
+        let path_len = pack_path(&raw mut msg, 2, path);
+        msg.length = 3 + ((path_len as u64 + 7) / 8);
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+
+        if !st.is_null() {
+            (*st).st_ino = reply.regs[0];
+            (*st).st_mode = reply.regs[1];
+            (*st).st_nlink = reply.regs[2];
+            (*st).st_size = reply.regs[3];
+            (*st).st_uid = reply.regs[4];
+            (*st).st_gid = reply.regs[5];
+            (*st).st_mtime = reply.regs[6];
+            (*st).st_type = reply.regs[7];
+        }
+        0
+    }
+}
+
+/// unlinkat(dirfd, path, flags)
+/// IPC: reg[0]=dirfd, reg[1]=at_flags, reg[2..]=path(len+data)
+pub unsafe fn posix_unlinkat(dirfd: i32, path: *const u8, at_flags: i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_UNLINKAT;
+        msg.regs[0] = dirfd as u32 as u64;
+        msg.regs[1] = at_flags as u32 as u64;
+        let path_len = pack_path(&raw mut msg, 2, path);
+        msg.length = 3 + ((path_len as u64 + 7) / 8);
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        0
+    }
+}
+
+/// renameat(old_dirfd, old_path, new_dirfd, new_path)
+/// IPC: reg[0]=old_dirfd, reg[1]=new_dirfd, reg[2]=old_len, reg[3]=new_len, reg[4..]=paths
+pub unsafe fn posix_renameat(
+    old_dirfd: i32,
+    old_path: *const u8,
+    new_dirfd: i32,
+    new_path: *const u8,
+) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_RENAMEAT;
+
+        let mut old_len: u8 = 0;
+        while *old_path.add(old_len as usize) != 0 && old_len < 64 {
+            old_len += 1;
+        }
+        let mut new_len: u8 = 0;
+        while *new_path.add(new_len as usize) != 0 && new_len < 64 {
+            new_len += 1;
+        }
+
+        msg.regs[0] = old_dirfd as u32 as u64;
+        msg.regs[1] = new_dirfd as u32 as u64;
+        msg.regs[2] = old_len as u64;
+        msg.regs[3] = new_len as u64;
+        for i in 4..20 {
+            msg.regs[i] = 0;
+        }
+        let dst = &mut msg.regs[4] as *mut u64 as *mut u8;
+        for i in 0..old_len as usize {
+            *dst.add(i) = *old_path.add(i);
+        }
+        let dst2 = (&mut msg.regs[4 + ((old_len as usize + 7) / 8)]) as *mut u64 as *mut u8;
+        for i in 0..new_len as usize {
+            *dst2.add(i) = *new_path.add(i);
+        }
+        msg.length = 4 + ((old_len as u64 + 7) / 8) + ((new_len as u64 + 7) / 8);
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        0
+    }
+}
+
+/// mkdirat(dirfd, path, mode)
+/// IPC: reg[0]=dirfd, reg[1]=mode, reg[2..]=path(len+data)
+pub unsafe fn posix_mkdirat(dirfd: i32, path: *const u8, mode: i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_MKDIRAT;
+        msg.regs[0] = dirfd as u32 as u64;
+        msg.regs[1] = mode as u64;
+        let path_len = pack_path(&raw mut msg, 2, path);
+        msg.length = 3 + ((path_len as u64 + 7) / 8);
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        0
+    }
+}
+
+/// faccessat(dirfd, path, mode, flags)
+/// IPC: reg[0]=dirfd, reg[1]=mode, reg[2]=at_flags, reg[3..]=path(len+data)
+pub unsafe fn posix_faccessat(dirfd: i32, path: *const u8, mode: i32, at_flags: i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_FACCESSAT;
+        msg.regs[0] = dirfd as u32 as u64;
+        msg.regs[1] = mode as u64;
+        msg.regs[2] = at_flags as u32 as u64;
+        let path_len = pack_path(&raw mut msg, 3, path);
+        msg.length = 4 + ((path_len as u64 + 7) / 8);
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        0
+    }
+}
+
+/// fchmodat(dirfd, path, mode, flags)
+/// IPC: reg[0]=dirfd, reg[1]=mode, reg[2]=at_flags, reg[3..]=path(len+data)
+pub unsafe fn posix_fchmodat(dirfd: i32, path: *const u8, mode: u32, at_flags: i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_FCHMODAT;
+        msg.regs[0] = dirfd as u32 as u64;
+        msg.regs[1] = mode as u64;
+        msg.regs[2] = at_flags as u32 as u64;
+        let path_len = pack_path(&raw mut msg, 3, path);
+        msg.length = 4 + ((path_len as u64 + 7) / 8);
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        0
+    }
+}
+
+/// fchownat(dirfd, path, uid, gid, flags)
+/// IPC: reg[0]=dirfd, reg[1]=uid, reg[2]=gid, reg[3]=at_flags, reg[4..]=path(len+data)
+pub unsafe fn posix_fchownat(
+    dirfd: i32,
+    path: *const u8,
+    uid: u32,
+    gid: u32,
+    at_flags: i32,
+) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_FCHOWNAT;
+        msg.regs[0] = dirfd as u32 as u64;
+        msg.regs[1] = uid as u64;
+        msg.regs[2] = gid as u64;
+        msg.regs[3] = at_flags as u32 as u64;
+        let path_len = pack_path(&raw mut msg, 4, path);
+        msg.length = 5 + ((path_len as u64 + 7) / 8);
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        0
+    }
+}
+
+/// utimensat(dirfd, path, times, flags)
+/// IPC: reg[0]=dirfd, reg[1]=at_flags, reg[2..5]=times, reg[6..]=path(len+data)
+pub unsafe fn posix_utimensat(
+    dirfd: i32,
+    path: *const u8,
+    atime_sec: i64,
+    atime_nsec: i64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+    at_flags: i32,
+) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_UTIMENSAT;
+        msg.regs[0] = dirfd as u32 as u64;
+        msg.regs[1] = at_flags as u32 as u64;
+        msg.regs[2] = atime_sec as u64;
+        msg.regs[3] = atime_nsec as u64;
+        msg.regs[4] = mtime_sec as u64;
+        msg.regs[5] = mtime_nsec as u64;
+        let path_len = pack_path(&raw mut msg, 6, path);
+        msg.length = 7 + ((path_len as u64 + 7) / 8);
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        0
+    }
+}
+
+/// fchmod(fd, mode) — change mode on open fd
+/// IPC: reg[0]=fd, reg[1]=mode
+pub unsafe fn posix_fchmod(fd: i32, mode: u32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_FCHMOD;
+        msg.length = 2;
+        msg.regs[0] = fd as u64;
+        msg.regs[1] = mode as u64;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        0
+    }
+}
+
+/// fchown(fd, uid, gid) — change owner on open fd
+/// IPC: reg[0]=fd, reg[1]=uid, reg[2]=gid
+pub unsafe fn posix_fchown(fd: i32, uid: u32, gid: u32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_FCHOWN;
+        msg.length = 3;
+        msg.regs[0] = fd as u64;
+        msg.regs[1] = uid as u64;
+        msg.regs[2] = gid as u64;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        0
+    }
+}
+
 /// Framebuffer ioctl wrapper.
 ///
 /// Sends POSIX_VFS_IOCTL with an fb-specific command and unpacks up to 5 result registers.

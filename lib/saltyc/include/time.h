@@ -28,13 +28,6 @@ struct tm {
     int tm_isdst;
 };
 
-struct tms {
-    clock_t tms_utime;
-    clock_t tms_stime;
-    clock_t tms_cutime;
-    clock_t tms_cstime;
-};
-
 extern time_t    time(time_t *tloc);
 extern clock_t   clock(void);
 extern double    difftime(time_t time1, time_t time0);
@@ -55,8 +48,6 @@ extern size_t    strftime(char *s, size_t max, const char *format,
 
 extern int       clock_gettime(clockid_t clk_id, struct timespec *tp);
 extern int       nanosleep(const struct timespec *req, struct timespec *rem);
-extern clock_t   times(struct tms *buf);
-
 extern void      tzset(void);
 extern char     *tzname[2];
 extern long      timezone;

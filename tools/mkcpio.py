@@ -8,6 +8,10 @@ Used to create the initrd image containing the init ELF.
 
 Usage:
     python3 tools/mkcpio.py --output initrd.cpio init.elf=build/userland/init.elf
+    python3 tools/mkcpio.py --output initrd.cpio --port-dir build/ports \
+        --manifest build/ports/bash.manifest \
+        --manifest build/ports/freebsd-utils.manifest \
+        init.elf=build/userland/init.elf
 """
 
 import argparse
@@ -143,6 +147,28 @@ def create_cpio_archive(entries, output_path, page_align_exts):
     return len(archive)
 
 
+def load_manifest(manifest_path, port_dir):
+    """Load entries from a manifest file (initrd_path=filename per line)."""
+    entries = []
+    with open(manifest_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '=' not in line:
+                continue
+            name, filename = line.split('=', 1)
+            name = name.strip()
+            filename = filename.strip()
+            # Resolve filename relative to the manifest's directory
+            manifest_dir = Path(manifest_path).parent
+            filepath = manifest_dir / filename
+            if not filepath.exists() and port_dir:
+                filepath = Path(port_dir) / filename
+            entries.append((name, filepath))
+    return entries
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Create CPIO newc archive for SaltyOS initrd'
@@ -155,8 +181,20 @@ def main():
     )
     parser.add_argument(
         'entries',
-        nargs='+',
+        nargs='*',
         help='Files to include: name=path (e.g., init.elf=build/userland/init.elf)'
+    )
+    parser.add_argument(
+        '--manifest',
+        action='append',
+        default=[],
+        help='Load initrd entries from manifest file (initrd_path=filename)'
+    )
+    parser.add_argument(
+        '--port-dir',
+        type=Path,
+        default=None,
+        help='Base directory for resolving manifest file paths'
     )
     parser.add_argument(
         '--page-align-extensions',
@@ -173,6 +211,8 @@ def main():
     )
 
     entries = []
+
+    # Load positional entries (system binaries, services)
     for entry_str in args.entries:
         if '=' not in entry_str:
             print(f"Error: Entry must be name=path, got: {entry_str}", file=sys.stderr)
@@ -186,6 +226,22 @@ def main():
             sys.exit(1)
 
         entries.append((name, filepath))
+
+    # Load manifest entries (port outputs)
+    for manifest_path in args.manifest:
+        if not Path(manifest_path).exists():
+            print(f"Error: Manifest not found: {manifest_path}", file=sys.stderr)
+            sys.exit(1)
+        manifest_entries = load_manifest(manifest_path, args.port_dir)
+        for name, filepath in manifest_entries:
+            if not filepath.exists():
+                print(f"Error: File not found (from manifest {manifest_path}): {filepath}", file=sys.stderr)
+                sys.exit(1)
+        entries.extend(manifest_entries)
+
+    if not entries:
+        print("Error: No entries to archive", file=sys.stderr)
+        sys.exit(1)
 
     total_size = create_cpio_archive(entries, args.output, page_align_exts)
     print(f"Created CPIO archive: {args.output} ({total_size} bytes, {len(entries)} entries)")

@@ -33,6 +33,7 @@ pub const _SC_GETGR_R_SIZE_MAX: i32 = 69;
 pub const _SC_GETPW_R_SIZE_MAX: i32 = 70;
 pub const _SC_NPROCESSORS_CONF: i32 = 83;
 pub const _SC_NPROCESSORS_ONLN: i32 = 84;
+pub const _SC_PHYS_PAGES: i32 = 85;
 
 /// Copy `src` bytes into `dst`, padding the remainder with zeroes.
 unsafe fn copy_str(dst: *mut u8, dst_len: usize, src: &[u8]) {
@@ -65,6 +66,13 @@ pub unsafe extern "C" fn uname(buf: *mut Utsname) -> i32 {
         copy_str((*buf).machine.as_mut_ptr(), 65, b"x86_64");
     }
     0
+}
+
+/// __xuname — FreeBSD's uname() is a macro that calls __xuname(SYS_NMLN, buf).
+/// We ignore the nmln parameter and fill our standard Utsname.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __xuname(_nmln: i32, buf: *mut Utsname) -> i32 {
+    unsafe { uname(buf) }
 }
 
 #[unsafe(no_mangle)]
@@ -103,6 +111,7 @@ pub extern "C" fn sysconf(name: i32) -> i64 {
         _SC_LINE_MAX => 2048,
         _SC_GETPW_R_SIZE_MAX => 1024,
         _SC_GETGR_R_SIZE_MAX => 1024,
+        _SC_PHYS_PAGES => 65536, // 256 MB / 4096 bytes per page
         _ => -1,
     }
 }
@@ -140,4 +149,9 @@ pub unsafe extern "C" fn getrusage(_who: i32, usage: *mut u8) -> i32 {
         }
     }
     0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn getdtablesize() -> i32 {
+    256
 }

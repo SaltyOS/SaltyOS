@@ -3,10 +3,12 @@
 #define __STDLIB_H__
 
 #include <stddef.h>
+#include <sys/types.h>
 
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
 #define RAND_MAX     0x7FFFFFFF
+#define MB_CUR_MAX   1
 
 typedef struct {
     int quot;
@@ -73,10 +75,21 @@ extern void *bsearch(const void *key, const void *base, size_t nmemb,
                      size_t size,
                      int (*compar)(const void *, const void *));
 
+extern char *mktemp(char *tmpl);
 extern char *mkdtemp(char *tmpl);
 extern char *realpath(const char *path, char *resolved_path);
 extern int   system(const char *command);
 
 extern char **environ;
+
+/* BSD extensions */
+extern const char *getprogname(void);
+extern void        setprogname(const char *name);
+extern void        strmode(int mode, char *bp);
+extern void       *setmode(const char *mode_str);
+extern mode_t      getmode(const void *set, mode_t omode);
+
+/* BSD file flag stubs */
+extern char       *fflagstostr(unsigned long flags);
 
 #endif /* __STDLIB_H__ */

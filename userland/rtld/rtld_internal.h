@@ -503,13 +503,17 @@ struct link_map {
     uint64_t    base;       /* Load base address */
     const char *name;       /* Object name */
     Elf64_Sym  *symtab;     /* DT_SYMTAB */
+    uint64_t    symtab_count;
+    uint64_t    sym_ent_size;
     const char *strtab;     /* DT_STRTAB */
+    uint64_t    strtab_size;
     uint32_t   *gnu_hash;   /* DT_GNU_HASH */
     Elf64_Rela *jmprel;     /* DT_JMPREL (PLT relocations) */
     uint64_t    jmprel_count;
     uint64_t   *pltgot;     /* DT_PLTGOT */
     Elf64_Rela *rela;       /* DT_RELA (non-PLT relocations) */
     uint64_t    rela_count;
+    uint64_t    load_size;  /* Page-aligned total footprint in VA */
     struct link_map *next;
 };
 

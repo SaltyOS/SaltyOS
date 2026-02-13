@@ -23,4 +23,10 @@ typedef long           intptr_t;
 typedef unsigned long  uintptr_t;
 typedef long           id_t;
 
+/* BSD compatibility types */
+typedef unsigned char  u_char;
+typedef unsigned short u_short;
+typedef unsigned int   u_int;
+typedef unsigned long  u_long;
+
 #endif /* __SYS_TYPES_H__ */

@@ -535,6 +535,57 @@ pub unsafe extern "C" fn realpath(path: *const u8, resolved: *mut u8) -> *mut u8
     }
 }
 
+/// Monotonic counter for mktemp uniqueness.
+static mut MKTEMP_COUNTER: u64 = 0;
+
+/// Replace trailing 'X' characters in `template` with alphanumeric chars
+/// derived from a counter, producing a unique filename.  Deprecated POSIX
+/// function — does NOT create the file.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mktemp(template: *mut u8) -> *mut u8 {
+    const CHARS: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+    if template.is_null() {
+        return core::ptr::null_mut();
+    }
+
+    unsafe {
+        let len = crate::string::strlen(template);
+        if len == 0 {
+            return template;
+        }
+
+        // Find how many trailing X's there are
+        let mut xs: usize = 0;
+        let mut i = len;
+        while i > 0 && *template.add(i - 1) == b'X' {
+            xs += 1;
+            i -= 1;
+        }
+
+        if xs < 6 {
+            // POSIX requires at least 6 X's; return empty string on error
+            *template = 0;
+            errno::set_errno(errno::EINVAL);
+            return template;
+        }
+
+        let ctr = &raw mut MKTEMP_COUNTER;
+        *ctr = (*ctr).wrapping_add(1);
+        let mut val = *ctr;
+
+        let start = len - xs;
+        let mut j = start;
+        while j < len {
+            *template.add(j) = CHARS[(val % 36) as usize];
+            val /= 36;
+            j += 1;
+        }
+
+        template
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn mkdtemp(_template: *mut u8) -> *mut u8 {
     core::ptr::null_mut()

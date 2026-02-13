@@ -47,5 +47,25 @@ extern int *__errno_location(void);
 #define ENOTSOCK        88
 #define EADDRINUSE      98
 #define ECONNREFUSED    111
+#define EDEADLK         35
+#define ENOLCK          37
+#define ENODATA         61
+#define ETIME           62
+#define EPROTO          71
+#define EMULTIHOP       72
+#define EBADMSG         74
+#define EOPNOTSUPP      95
+#define ENOTSUP         EOPNOTSUPP
+#define EAFNOSUPPORT    97
+#define ECONNRESET      104
+#define ENOBUFS         105
+#define EISCONN         106
+#define ENOTCONN        107
+#define ETIMEDOUT       110
+#define EALREADY        114
+#define EINPROGRESS     115
+#define ECANCELED       125
+#define EOWNERDEAD      130
+#define ENOTRECOVERABLE 131
 
 #endif /* __ERRNO_H__ */

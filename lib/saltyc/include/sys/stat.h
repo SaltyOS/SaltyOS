@@ -21,7 +21,34 @@ struct stat {
     long          st_mtime_nsec;
     long          st_ctime;
     long          st_ctime_nsec;
+    unsigned long st_flags;
+    struct {
+        long tv_sec;
+        long tv_nsec;
+    } st_birthtim;
 };
+
+#define st_birthtime     st_birthtim.tv_sec
+#define st_birthtimespec st_birthtim
+
+/* BSD file flag constants */
+#define UF_SETTABLE     0x0000ffff
+#define UF_NODUMP       0x00000001
+#define UF_IMMUTABLE    0x00000002
+#define UF_APPEND       0x00000004
+#define UF_NOUNLINK     0x00000010
+#define UF_OPAQUE       0x00000008
+#define SF_SETTABLE     0xffff0000
+#define SF_ARCHIVED     0x00010000
+#define SF_IMMUTABLE    0x00020000
+#define SF_APPEND       0x00040000
+#define SF_NOUNLINK     0x00100000
+
+#define DEFFILEMODE     (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | \
+                         S_IROTH | S_IWOTH)
+#define ACCESSPERMS     (S_IRWXU | S_IRWXG | S_IRWXO)
+#define ALLPERMS        (S_ISUID | S_ISGID | S_ISVTX | S_IRWXU | \
+                         S_IRWXG | S_IRWXO)
 
 /* File type bits */
 #define S_IFMT   0170000
@@ -68,5 +95,19 @@ extern int fstat(int fd, struct stat *statbuf);
 extern mode_t umask(mode_t mask);
 extern int chmod(const char *pathname, mode_t mode);
 extern int fchmod(int fd, mode_t mode);
+
+#define UTIME_NOW   ((1 << 30) - 1)
+#define UTIME_OMIT  ((1 << 30) - 2)
+
+#include <time.h>
+
+extern int fstatat(int dirfd, const char *pathname, struct stat *statbuf,
+                   int flags);
+extern int mkdirat(int dirfd, const char *pathname, mode_t mode);
+extern int mknodat(int dirfd, const char *pathname, mode_t mode, dev_t dev);
+extern int fchmodat(int dirfd, const char *pathname, mode_t mode, int flags);
+extern int utimensat(int dirfd, const char *pathname,
+                     const struct timespec times[2], int flags);
+extern int futimens(int fd, const struct timespec times[2]);
 
 #endif /* __SYS_STAT_H__ */

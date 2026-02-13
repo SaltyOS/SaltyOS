@@ -59,19 +59,6 @@ pub const CHILD_RTLD_FRAME_SLOT_START: u64 = 64;
 
 pub const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
-// Keep code+rtld+libs+stack+IPC+scratch in one 2MiB PT window
-// (0x200000..0x3fffff) to reduce per-process PT pressure in lowmem boots.
-pub const CHILD_CODE_VADDR: u64 = 0x0000_0000_0021_0000;
-pub const CHILD_STACK_VADDR: u64 = 0x0000_0000_003F_8000;
-pub const CHILD_RTLD_VADDR: u64 = 0x0000_0000_0028_0000;
-pub const CHILD_INITRD_VADDR: u64 = 0x0000_0000_0100_0000;
-pub const CHILD_SCRATCH_VADDR: u64 = 0x0000_0000_003F_F000;
-pub const CHILD_IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
-
-pub const SRV_STACK_PAGES: usize = 4;
-pub const SRV_STACK_SIZE: u64 = SRV_STACK_PAGES as u64 * 4096;
-pub const SRV_STACK_TOP: u64 = CHILD_STACK_VADDR + SRV_STACK_SIZE;
-
 const PM_WAIT_ANY_CHILD: u64 = u32::MAX as u64;
 
 pub const AT_SALTY_SHARED_LIB_BASE: u64 = 0x1006;
@@ -514,8 +501,7 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                 elf_name
             };
 
-            let ready_timeout_ns = mgr.services[svc_idx].def.timeout_start_ns;
-            let pid = unsafe { spawn::pm_spawn(procmgr_ep, spawn_name, ready_timeout_ns) };
+            let pid = unsafe { spawn::pm_spawn(procmgr_ep, spawn_name, &mgr.services[svc_idx].def) };
             if pid < 0 {
                 { let mut lb = LineBuf::new(); lb.str(b"[INIT] Failed to spawn "); lb.bytes(name); lb.str(b" via procmgr\n"); lb.flush(); }
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
@@ -607,8 +593,7 @@ unsafe fn handle_child_exit(
                 elf_name
             };
 
-            let ready_timeout_ns = mgr.services[svc_idx].def.timeout_start_ns;
-            let new_pid = spawn::pm_spawn(pm_ep, spawn_name, ready_timeout_ns);
+            let new_pid = spawn::pm_spawn(pm_ep, spawn_name, &mgr.services[svc_idx].def);
             if new_pid < 0 {
                 puts(b"[INIT] Failed to restart service\n");
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);

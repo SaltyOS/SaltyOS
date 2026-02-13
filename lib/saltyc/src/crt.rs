@@ -34,6 +34,14 @@ pub unsafe extern "C" fn __libc_start_main(
         // Initialize memory manager
         init_mm_from_auxv(stack_ptr);
 
+        // Set program name from argv[0] for BSD err(3) functions
+        if argc > 0 && !(*argv).is_null() {
+            crate::misc_impl::setprogname(*argv);
+        }
+
+        // Initialize FreeBSD locale/rune compatibility
+        crate::compat::freebsd::rune::init_rune_locale();
+
         // Call main
         let ret = main_fn(argc, argv, envp);
 

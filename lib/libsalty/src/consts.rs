@@ -195,6 +195,31 @@ pub const POSIX_VFS_DUP3: u64 = 43;
 pub const POSIX_VFS_MKFIFO: u64 = 44;
 pub const POSIX_VFS_MMAP: u64 = 45;
 pub const POSIX_VFS_MUNMAP: u64 = 46;
+pub const POSIX_VFS_OPENAT: u64 = 47;
+pub const POSIX_VFS_FSTATAT: u64 = 48;
+pub const POSIX_VFS_UNLINKAT: u64 = 49;
+pub const POSIX_VFS_RENAMEAT: u64 = 50;
+pub const POSIX_VFS_MKDIRAT: u64 = 51;
+pub const POSIX_VFS_FACCESSAT: u64 = 52;
+pub const POSIX_VFS_FCHMODAT: u64 = 53;
+pub const POSIX_VFS_FCHOWNAT: u64 = 54;
+pub const POSIX_VFS_LINKAT: u64 = 55;
+pub const POSIX_VFS_SYMLINKAT: u64 = 56;
+pub const POSIX_VFS_READLINKAT: u64 = 57;
+pub const POSIX_VFS_UTIMENSAT: u64 = 58;
+pub const POSIX_VFS_FCHMOD: u64 = 59;
+pub const POSIX_VFS_FCHOWN: u64 = 60;
+
+// AT_* flags for *at() family
+pub const AT_FDCWD: i32 = -100;
+pub const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+pub const AT_REMOVEDIR: i32 = 0x200;
+pub const AT_SYMLINK_FOLLOW: i32 = 0x400;
+pub const AT_EMPTY_PATH: i32 = 0x1000;
+
+// utimensat special values
+pub const UTIME_NOW: i64 = (1 << 30) - 1;
+pub const UTIME_OMIT: i64 = (1 << 30) - 2;
 
 // fcntl commands
 pub const F_DUPFD: i32 = 0;
@@ -216,7 +241,53 @@ pub const FBIOGET_FSCREENINFO: u64 = 0x4602;
 
 // Procmgr protocol labels
 pub const POSIX_PM_SPAWN: u64 = 1;
-pub const POSIX_PM_SPAWN_FLAG_WAIT_READY: u64 = 1 << 0;
+
+// Spawn readiness modes (bits [1:0] of spawn_policy)
+pub const SPAWN_READY_IMMEDIATE: u64 = 0;
+pub const SPAWN_READY_NOTIFY: u64 = 1;
+
+/// Build a spawn_policy bitfield from components.
+///
+/// Layout:
+///   bits [1:0]  = readiness_mode (0=IMMEDIATE, 1=NOTIFY)
+///   bit  [2]    = map_initrd
+///   bit  [3]    = is_display
+///   bits [15:8] = cnode_bits (0=default 10-bit)
+///   bits [31:16] = memory_kb (0=procmgr default)
+pub const fn spawn_policy_build(
+    readiness_mode: u64,
+    map_initrd: bool,
+    is_display: bool,
+    cnode_bits: u8,
+    memory_kb: u16,
+) -> u64 {
+    let mut p = readiness_mode & 0x3;
+    if map_initrd { p |= 1 << 2; }
+    if is_display { p |= 1 << 3; }
+    p |= (cnode_bits as u64) << 8;
+    p |= (memory_kb as u64) << 16;
+    p
+}
+
+pub const fn spawn_policy_readiness(policy: u64) -> u64 {
+    policy & 0x3
+}
+
+pub const fn spawn_policy_map_initrd(policy: u64) -> bool {
+    (policy & (1 << 2)) != 0
+}
+
+pub const fn spawn_policy_is_display(policy: u64) -> bool {
+    (policy & (1 << 3)) != 0
+}
+
+pub const fn spawn_policy_cnode_bits(policy: u64) -> u8 {
+    ((policy >> 8) & 0xFF) as u8
+}
+
+pub const fn spawn_policy_memory_kb(policy: u64) -> u16 {
+    ((policy >> 16) & 0xFFFF) as u16
+}
 pub const POSIX_PM_EXIT: u64 = 2;
 pub const POSIX_PM_WAIT: u64 = 3;
 pub const POSIX_PM_GETPID: u64 = 4;
@@ -337,6 +408,8 @@ pub const PF_X: u32 = 1;
 pub const PF_W: u32 = 2;
 pub const PF_R: u32 = 4;
 pub const DT_NULL: i64 = 0;
+pub const DT_NEEDED: i64 = 1;
+pub const DT_STRTAB: i64 = 5;
 pub const DT_RELA: i64 = 7;
 pub const DT_RELASZ: i64 = 8;
 pub const DT_RELAENT: i64 = 9;

@@ -19,4 +19,17 @@ struct timezone {
 
 extern int gettimeofday(struct timeval *tv, void *tz);
 
+#define ITIMER_REAL    0
+#define ITIMER_VIRTUAL 1
+#define ITIMER_PROF    2
+
+struct itimerval {
+    struct timeval it_interval;
+    struct timeval it_value;
+};
+
+extern int setitimer(int which, const struct itimerval *new_value,
+                     struct itimerval *old_value);
+extern int getitimer(int which, struct itimerval *curr_value);
+
 #endif /* __SYS_TIME_H__ */

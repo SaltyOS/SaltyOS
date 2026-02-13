@@ -17,6 +17,7 @@ pub mod elf_loader;
 pub mod framebuffer;
 pub mod invoke;
 pub mod ipc;
+pub mod layout;
 pub mod posix;
 pub mod posix_mm;
 pub mod serial;

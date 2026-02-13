@@ -47,7 +47,7 @@ extern char *nl_langinfo(int item);
 extern size_t __ctype_get_mb_cur_max(void);
 
 /* wint_t conversion */
-#define btowc(c) ((wint_t)(unsigned char)(c))
-#define wctob(c) ((int)(unsigned char)(c))
+extern wint_t btowc(int c);
+extern int    wctob(wint_t c);
 
 #endif /* __WCHAR_H__ */

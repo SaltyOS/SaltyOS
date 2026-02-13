@@ -460,3 +460,44 @@ pub extern "C" fn strsignal(sig: i32) -> *const u8 {
         SIG_NAMES[0].as_ptr()
     }
 }
+
+// ---------------------------------------------------------------------------
+// BSD strlcpy / strlcat
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strlcpy(dst: *mut u8, src: *const u8, dstsize: usize) -> usize {
+    unsafe {
+        let srclen = strlen(src);
+        if dstsize > 0 {
+            let copy = if srclen < dstsize { srclen } else { dstsize - 1 };
+            core::ptr::copy_nonoverlapping(src, dst, copy);
+            *dst.add(copy) = 0;
+        }
+        srclen
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strlcat(dst: *mut u8, src: *const u8, dstsize: usize) -> usize {
+    unsafe {
+        let srclen = strlen(src);
+        let dstlen = strnlen(dst, dstsize);
+
+        // dst is not NUL-terminated within dstsize
+        if dstlen == dstsize {
+            return dstsize + srclen;
+        }
+
+        let remaining = dstsize - dstlen - 1;
+        let copy = if srclen < remaining + 1 {
+            srclen
+        } else {
+            remaining
+        };
+        core::ptr::copy_nonoverlapping(src, dst.add(dstlen), copy);
+        *dst.add(dstlen + copy) = 0;
+
+        dstlen + srclen
+    }
+}

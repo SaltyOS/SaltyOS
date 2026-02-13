@@ -302,6 +302,100 @@ unsafe fn write_to_page(
     0
 }
 
+/// Count the number of pages needed to load all PT_LOAD segments.
+/// Overcounts slightly when segments share pages, but overcounting is safe.
+///
+/// # Safety
+/// `data` must point to a valid ELF64 file of at least `data_len` bytes.
+pub unsafe fn elf_count_load_pages(data: *const u8, data_len: usize) -> usize {
+    if data_len < core::mem::size_of::<Elf64Ehdr>() {
+        return 0;
+    }
+    unsafe {
+        let ehdr = &*(data as *const Elf64Ehdr);
+        if ehdr.e_ident[0] != 0x7F
+            || ehdr.e_ident[1] != b'E'
+            || ehdr.e_ident[2] != b'L'
+            || ehdr.e_ident[3] != b'F'
+        {
+            return 0;
+        }
+
+        let phdr_base = ehdr.e_phoff as usize;
+        let phdr_count = ehdr.e_phnum as usize;
+        let phdr_size = ehdr.e_phentsize as usize;
+        let mut total: usize = 0;
+
+        for i in 0..phdr_count {
+            let off = phdr_base + i * phdr_size;
+            if off + core::mem::size_of::<Elf64Phdr>() > data_len {
+                break;
+            }
+            let phdr = &*(data.add(off) as *const Elf64Phdr);
+            if phdr.p_type != PT_LOAD {
+                continue;
+            }
+            let seg_start = page_align_down(phdr.p_vaddr);
+            let seg_end = page_align_up(phdr.p_vaddr + phdr.p_memsz);
+            if seg_end > seg_start {
+                total += ((seg_end - seg_start) / ELF_PAGE_SIZE) as usize;
+            }
+        }
+        total
+    }
+}
+
+/// Compute the total VA span needed to load all PT_LOAD segments.
+/// Returns `page_align_up(max_vaddr_end) - page_align_down(min_vaddr)`.
+///
+/// # Safety
+/// `data` must point to a valid ELF64 file of at least `data_len` bytes.
+pub unsafe fn elf_compute_load_span(data: *const u8, data_len: usize) -> u64 {
+    if data_len < core::mem::size_of::<Elf64Ehdr>() {
+        return 0;
+    }
+    unsafe {
+        let ehdr = &*(data as *const Elf64Ehdr);
+        if ehdr.e_ident[0] != 0x7F
+            || ehdr.e_ident[1] != b'E'
+            || ehdr.e_ident[2] != b'L'
+            || ehdr.e_ident[3] != b'F'
+        {
+            return 0;
+        }
+
+        let phdr_base = ehdr.e_phoff as usize;
+        let phdr_count = ehdr.e_phnum as usize;
+        let phdr_size = ehdr.e_phentsize as usize;
+        let mut min_vaddr: u64 = u64::MAX;
+        let mut max_vaddr_end: u64 = 0;
+
+        for i in 0..phdr_count {
+            let off = phdr_base + i * phdr_size;
+            if off + core::mem::size_of::<Elf64Phdr>() > data_len {
+                break;
+            }
+            let phdr = &*(data.add(off) as *const Elf64Phdr);
+            if phdr.p_type != PT_LOAD {
+                continue;
+            }
+            if phdr.p_vaddr < min_vaddr {
+                min_vaddr = phdr.p_vaddr;
+            }
+            let end = phdr.p_vaddr + phdr.p_memsz;
+            if end > max_vaddr_end {
+                max_vaddr_end = end;
+            }
+        }
+
+        if min_vaddr == u64::MAX || max_vaddr_end == 0 {
+            return 0;
+        }
+
+        page_align_up(max_vaddr_end) - page_align_down(min_vaddr)
+    }
+}
+
 pub unsafe fn elf_load(
     data: *const u8,
     data_len: usize,

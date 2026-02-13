@@ -776,3 +776,43 @@ pub unsafe extern "C" fn strftime(
         pos
     }
 }
+
+// ---------------------------------------------------------------------------
+// Interval timer stubs
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+pub struct Itimerval {
+    pub it_interval: Timeval,
+    pub it_value: Timeval,
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn setitimer(
+    _which: i32,
+    _new_value: *const Itimerval,
+    old_value: *mut Itimerval,
+) -> i32 {
+    unsafe {
+        if !old_value.is_null() {
+            (*old_value).it_interval.tv_sec = 0;
+            (*old_value).it_interval.tv_usec = 0;
+            (*old_value).it_value.tv_sec = 0;
+            (*old_value).it_value.tv_usec = 0;
+        }
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getitimer(_which: i32, curr_value: *mut Itimerval) -> i32 {
+    unsafe {
+        if !curr_value.is_null() {
+            (*curr_value).it_interval.tv_sec = 0;
+            (*curr_value).it_interval.tv_usec = 0;
+            (*curr_value).it_value.tv_sec = 0;
+            (*curr_value).it_value.tv_usec = 0;
+        }
+    }
+    0
+}

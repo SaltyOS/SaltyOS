@@ -27,6 +27,7 @@
 #define SIGTTIN     21
 #define SIGTTOU     22
 #define SIGWINCH    28
+#define SIGINFO     29
 
 #define NSIG        32
 
@@ -44,10 +45,31 @@
 #define SIG_UNBLOCK   1
 #define SIG_SETMASK   2
 
+typedef int sig_atomic_t;
 typedef unsigned int sigset_t;
 
+union sigval {
+    int   sival_int;
+    void *sival_ptr;
+};
+
+typedef struct siginfo {
+    int         si_signo;
+    int         si_code;
+    int         si_errno;
+    pid_t       si_pid;
+    uid_t       si_uid;
+    int         si_status;
+    void       *si_addr;
+    union sigval si_value;
+    long        _pad[4];
+} siginfo_t;
+
 struct sigaction {
-    unsigned long sa_handler;
+    union {
+        void (*sa_handler)(int);
+        void (*sa_sigaction)(int, siginfo_t *, void *);
+    };
     sigset_t      sa_mask;
     int           sa_flags;
     unsigned long sa_restorer;

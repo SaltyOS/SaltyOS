@@ -1,0 +1,447 @@
+//! Core POSIX miscellaneous functions
+//! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! BSD/FreeBSD-specific functions live in compat::freebsd.
+
+use crate::errno;
+use core::ptr::addr_of_mut;
+
+// ---------------------------------------------------------------------------
+// getprogname / setprogname — BSD program name accessors
+// ---------------------------------------------------------------------------
+
+static mut PROGNAME: *const u8 = b"\0".as_ptr();
+
+#[unsafe(no_mangle)]
+pub extern "C" fn getprogname() -> *const u8 {
+    // SAFETY: PROGNAME is only written via setprogname and during startup.
+    unsafe { *(&raw const PROGNAME) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn setprogname(name: *const u8) {
+    if name.is_null() {
+        return;
+    }
+    unsafe {
+        // Store the basename portion (after last '/')
+        let mut last_slash: *const u8 = core::ptr::null();
+        let mut p = name;
+        while *p != 0 {
+            if *p == b'/' {
+                last_slash = p;
+            }
+            p = p.add(1);
+        }
+        if !last_slash.is_null() {
+            *(&raw mut PROGNAME) = last_slash.add(1);
+        } else {
+            *(&raw mut PROGNAME) = name;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dirname / basename — POSIX string manipulation
+// ---------------------------------------------------------------------------
+
+static mut DIRNAME_BUF: [u8; 4096] = [0; 4096];
+static mut BASENAME_DOT: [u8; 2] = [b'.', 0];
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dirname(path: *mut u8) -> *mut u8 {
+    unsafe {
+        let buf = addr_of_mut!(DIRNAME_BUF) as *mut u8;
+
+        // NULL or empty → "."
+        if path.is_null() || *path == 0 {
+            *buf.add(0) = b'.';
+            *buf.add(1) = 0;
+            return buf;
+        }
+
+        // Measure length
+        let mut len = 0usize;
+        while *path.add(len) != 0 {
+            len += 1;
+        }
+
+        // Strip trailing slashes
+        while len > 1 && *path.add(len - 1) == b'/' {
+            len -= 1;
+        }
+
+        // Find last slash
+        let mut last_slash: isize = -1;
+        for i in (0..len).rev() {
+            if *path.add(i) == b'/' {
+                last_slash = i as isize;
+                break;
+            }
+        }
+
+        if last_slash < 0 {
+            // No slash → "."
+            *buf.add(0) = b'.';
+            *buf.add(1) = 0;
+            return buf;
+        }
+
+        if last_slash == 0 {
+            // Only root slash → "/"
+            *buf.add(0) = b'/';
+            *buf.add(1) = 0;
+            return buf;
+        }
+
+        // Strip trailing slashes from parent
+        let mut end = last_slash as usize;
+        while end > 1 && *path.add(end - 1) == b'/' {
+            end -= 1;
+        }
+
+        let copy_len = if end < 4095 { end } else { 4095 };
+        for i in 0..copy_len {
+            *buf.add(i) = *path.add(i);
+        }
+        *buf.add(copy_len) = 0;
+        buf
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn basename(path: *mut u8) -> *mut u8 {
+    unsafe {
+        let dot = addr_of_mut!(BASENAME_DOT) as *mut u8;
+
+        // NULL or empty → "."
+        if path.is_null() || *path == 0 {
+            *dot.add(0) = b'.';
+            *dot.add(1) = 0;
+            return dot;
+        }
+
+        let mut len = 0usize;
+        while *path.add(len) != 0 {
+            len += 1;
+        }
+
+        // Strip trailing slashes
+        while len > 1 && *path.add(len - 1) == b'/' {
+            len -= 1;
+        }
+
+        // All slashes → "/"
+        if len == 1 && *path == b'/' {
+            return path;
+        }
+
+        // Find last slash
+        let mut last_slash: isize = -1;
+        for i in (0..len).rev() {
+            if *path.add(i) == b'/' {
+                last_slash = i as isize;
+                break;
+            }
+        }
+
+        if last_slash < 0 {
+            // Null-terminate at len (strip trailing slashes)
+            *path.add(len) = 0;
+            return path;
+        }
+
+        let start = (last_slash + 1) as usize;
+        *path.add(len) = 0;
+        path.add(start)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sched_yield — maps to SYS_YIELD (syscall 8)
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sched_yield() -> i32 {
+    salty::syscall::syscall(salty::consts::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+    0
+}
+
+// ---------------------------------------------------------------------------
+// getpagesize — always 4096
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getpagesize() -> i32 {
+    4096
+}
+
+// ---------------------------------------------------------------------------
+// fsync / fdatasync — correct no-ops for ramfs
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fsync(_fd: i32) -> i32 {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fdatasync(_fd: i32) -> i32 {
+    0
+}
+
+// ---------------------------------------------------------------------------
+// utime / utimes — thin wrappers over utimensat
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+pub struct Utimbuf {
+    pub actime: i64,
+    pub modtime: i64,
+}
+
+#[repr(C)]
+pub struct CTimeval {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn utime(filename: *const u8, times: *const Utimbuf) -> i32 {
+    unsafe {
+        if filename.is_null() {
+            errno::set_errno(errno::EINVAL);
+            return -1;
+        }
+        let (atime_sec, atime_nsec, mtime_sec, mtime_nsec) = if times.is_null() {
+            // NULL → set both to current time
+            let utime_now: i64 = (1 << 30) - 1;
+            (0i64, utime_now, 0i64, utime_now)
+        } else {
+            // Utimbuf has seconds only, nsec = 0
+            ((*times).actime, 0i64, (*times).modtime, 0i64)
+        };
+        let ret = salty::posix::posix_utimensat(
+            salty::consts::AT_FDCWD,
+            filename,
+            atime_sec,
+            atime_nsec,
+            mtime_sec,
+            mtime_nsec,
+            0,
+        );
+        if ret < 0 {
+            errno::set_errno(errno::ENOENT);
+        }
+        ret
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn utimes(filename: *const u8, times: *const CTimeval) -> i32 {
+    unsafe {
+        if filename.is_null() {
+            errno::set_errno(errno::EINVAL);
+            return -1;
+        }
+        let (atime_sec, atime_nsec, mtime_sec, mtime_nsec) = if times.is_null() {
+            let utime_now: i64 = (1 << 30) - 1;
+            (0i64, utime_now, 0i64, utime_now)
+        } else {
+            // CTimeval has sec + usec, convert usec → nsec
+            (
+                (*times).tv_sec,
+                (*times).tv_usec * 1000,
+                (*times.add(1)).tv_sec,
+                (*times.add(1)).tv_usec * 1000,
+            )
+        };
+        let ret = salty::posix::posix_utimensat(
+            salty::consts::AT_FDCWD,
+            filename,
+            atime_sec,
+            atime_nsec,
+            mtime_sec,
+            mtime_nsec,
+            0,
+        );
+        if ret < 0 {
+            errno::set_errno(errno::ENOENT);
+        }
+        ret
+    }
+}
+
+// ---------------------------------------------------------------------------
+// user_from_uid / group_from_gid — user/group name lookup
+// ---------------------------------------------------------------------------
+
+static mut UID_BUF: [u8; 32] = [0; 32];
+static mut GID_BUF: [u8; 32] = [0; 32];
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn user_from_uid(uid: u32, noname: i32) -> *const u8 {
+    unsafe {
+        let pw = crate::pwd_impl::getpwuid(uid);
+        if !pw.is_null() {
+            return (*pw).pw_name;
+        }
+        if noname != 0 {
+            return core::ptr::null();
+        }
+        // Format UID as decimal string into static buffer
+        let buf = core::ptr::addr_of_mut!(UID_BUF) as *mut u8;
+        format_u32(uid, buf, 32);
+        buf
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn group_from_gid(gid: u32, noname: i32) -> *const u8 {
+    unsafe {
+        let gr = crate::pwd_impl::getgrgid(gid);
+        if !gr.is_null() {
+            return (*gr).gr_name;
+        }
+        if noname != 0 {
+            return core::ptr::null();
+        }
+        let buf = core::ptr::addr_of_mut!(GID_BUF) as *mut u8;
+        format_u32(gid, buf, 32);
+        buf
+    }
+}
+
+/// Format a u32 as a decimal string into a buffer, NUL-terminated.
+unsafe fn format_u32(mut val: u32, buf: *mut u8, buflen: usize) {
+    unsafe {
+        if buflen == 0 {
+            return;
+        }
+        let mut tmp = [0u8; 12]; // max 10 digits + NUL
+        let mut i = 0usize;
+        if val == 0 {
+            tmp[0] = b'0';
+            i = 1;
+        } else {
+            while val > 0 && i < 11 {
+                tmp[i] = b'0' + (val % 10) as u8;
+                val /= 10;
+                i += 1;
+            }
+        }
+        // Reverse into buf
+        let copy_len = if i < buflen - 1 { i } else { buflen - 1 };
+        for j in 0..copy_len {
+            *buf.add(j) = tmp[i - 1 - j];
+        }
+        *buf.add(copy_len) = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// getentropy — fill buffer with pseudo-random bytes
+// ---------------------------------------------------------------------------
+
+static mut ENTROPY_COUNTER: u64 = 0;
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getentropy(buf: *mut u8, buflen: usize) -> i32 {
+    if buf.is_null() || buflen > 256 {
+        errno::set_errno(errno::EINVAL);
+        return -1;
+    }
+
+    unsafe {
+        // Mix clock time, PID, and a monotonic counter
+        let mut ts = salty::types::Timespec::zeroed();
+        salty::posix::posix_clock_gettime(0, &mut ts);
+
+        let pid = salty::posix::posix_getpid() as u64;
+        let ctr = &raw mut ENTROPY_COUNTER;
+        *ctr = (*ctr).wrapping_add(1);
+
+        // Simple xorshift-based mixing
+        let mut state: u64 = ts.tv_sec
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(ts.tv_nsec)
+            .wrapping_mul(1442695040888963407)
+            .wrapping_add(pid)
+            .wrapping_mul(2862933555777941757)
+            .wrapping_add(*ctr);
+
+        let mut i = 0usize;
+        while i < buflen {
+            // xorshift64
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+
+            // Extract bytes from state
+            let bytes = state.to_le_bytes();
+            let mut j = 0usize;
+            while j < 8 && i < buflen {
+                *buf.add(i) = bytes[j];
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// copy_file_range — not supported
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copy_file_range(
+    _fd_in: i32,
+    _off_in: *mut i64,
+    _fd_out: i32,
+    _off_out: *mut i64,
+    _len: usize,
+    _flags: u32,
+) -> isize {
+    errno::set_errno(errno::ENOSYS);
+    -1
+}
+
+// ---------------------------------------------------------------------------
+// POSIX semaphores — not implemented
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sem_init(_sem: *mut u8, _pshared: i32, _value: u32) -> i32 {
+    errno::set_errno(errno::ENOSYS);
+    -1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sem_wait(_sem: *mut u8) -> i32 {
+    errno::set_errno(errno::ENOSYS);
+    -1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sem_post(_sem: *mut u8) -> i32 {
+    errno::set_errno(errno::ENOSYS);
+    -1
+}
+
+// ---------------------------------------------------------------------------
+// popen / pclose — pipe to process (not supported yet)
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn popen(_cmd: *const u8, _mode: *const u8) -> *mut u8 {
+    errno::set_errno(errno::ENOSYS);
+    core::ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pclose(_stream: *mut u8) -> i32 {
+    errno::set_errno(errno::ENOSYS);
+    -1
+}

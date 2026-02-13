@@ -27,9 +27,15 @@
 
 #define FD_CLOEXEC  1
 
-#define AT_FDCWD    (-100)
+#define AT_FDCWD            (-100)
+#define AT_SYMLINK_NOFOLLOW 0x100
+#define AT_REMOVEDIR        0x200
+#define AT_SYMLINK_FOLLOW   0x400
+#define AT_EMPTY_PATH       0x1000
 
 extern int open(const char *pathname, int flags, ...);
+extern int openat(int dirfd, const char *pathname, int flags, ...);
+extern int creat(const char *pathname, mode_t mode);
 extern int fcntl(int fd, int cmd, ...);
 
 #endif /* __FCNTL_H__ */

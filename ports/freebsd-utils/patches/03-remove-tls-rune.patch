@@ -1,0 +1,21 @@
+--- a/include/runetype.h	2026-02-13 23:15:32.435499677 +0900
++++ b/include/runetype.h	2026-02-13 23:15:44.021791794 +0900
+@@ -87,18 +87,10 @@
+ __BEGIN_DECLS
+ extern const _RuneLocale _DefaultRuneLocale;
+ extern const _RuneLocale *_CurrentRuneLocale;
+-#ifdef __RUNETYPE_INTERNAL
+-extern const _RuneLocale *__getCurrentRuneLocale(void);
+-#else
+-extern _Thread_local const _RuneLocale *_ThreadRuneLocale;
+ static __inline const _RuneLocale *__getCurrentRuneLocale(void)
+ {
+-
+-	if (_ThreadRuneLocale) 
+-		return _ThreadRuneLocale;
+ 	return _CurrentRuneLocale;
+ }
+-#endif /*__RUNETYPE_INTERNAL */
+ #define _CurrentRuneLocale (__getCurrentRuneLocale())
+ __END_DECLS
+ 

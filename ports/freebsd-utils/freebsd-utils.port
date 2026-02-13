@@ -1,0 +1,82 @@
+[port]
+name = freebsd-utils
+version = 14.2
+description = FreeBSD userland utilities for SaltyOS
+homepage = https://www.freebsd.org/
+license = BSD-2-Clause
+
+[source]
+url = https://github.com/freebsd/freebsd-src/archive/refs/tags/release/${version}.0.tar.gz
+subdir = freebsd-src-release-${version}.0
+sha256 = SKIP
+
+[build]
+type = targets
+
+[env]
+EXTRA_CFLAGS = -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers -Wno-missing-braces -Wno-gnu-designator -Wno-#warnings -D__FreeBSD_version=1402000 -DBOOTSTRAP_CAT -DNO_UDOM_SUPPORT -DWITHOUT_NLS
+
+[targets.cflags]
+-I${SRCDIR} -I${SRCDIR}/include -I${SRCDIR}/lib/libc/include
+-I${SRCDIR}/sys -I${SRCDIR}/sys/amd64/include -I${SRCDIR}/sys/x86/include
+-I${SRCDIR}/contrib -include sys/cdefs.h
+
+[targets]
+echo     = bin/echo/echo.c
+cat      = bin/cat/cat.c :: -DBOOTSTRAP_CAT
+ls       = bin/ls/ls.c bin/ls/cmp.c bin/ls/print.c bin/ls/util.c :: -Ibin/ls
+cp       = bin/cp/cp.c bin/cp/utils.c :: -Ibin/cp
+mv       = bin/mv/mv.c
+rm       = bin/rm/rm.c
+mkdir    = bin/mkdir/mkdir.c
+rmdir    = bin/rmdir/rmdir.c
+ln       = bin/ln/ln.c
+chmod    = bin/chmod/chmod.c
+test     = bin/test/test.c
+sleep    = bin/sleep/sleep.c
+pwd      = bin/pwd/pwd.c
+head     = usr.bin/head/head.c
+tail     = usr.bin/tail/tail.c usr.bin/tail/forward.c usr.bin/tail/misc.c usr.bin/tail/read.c usr.bin/tail/reverse.c :: -Iusr.bin/tail
+wc       = usr.bin/wc/wc.c
+sort     = usr.bin/sort/sort.c usr.bin/sort/bwstring.c usr.bin/sort/coll.c usr.bin/sort/file.c usr.bin/sort/mem.c usr.bin/sort/radixsort.c :: -Iusr.bin/sort
+uniq     = usr.bin/uniq/uniq.c
+basename = usr.bin/basename/basename.c
+dirname  = usr.bin/dirname/dirname.c
+env      = usr.bin/env/env.c
+tee      = usr.bin/tee/tee.c
+id       = usr.bin/id/id.c
+uname    = usr.bin/uname/uname.c
+true     = usr.bin/true/true.c
+false    = usr.bin/false/false.c
+
+[prepare]
+ln -sfn amd64/include ${SRCDIR}/sys/machine
+ln -sfn sys/x86/include ${SRCDIR}/x86
+
+[install]
+bin/echo = echo
+bin/cat = cat
+bin/ls = ls
+bin/cp = cp
+bin/mv = mv
+bin/rm = rm
+bin/mkdir = mkdir
+bin/rmdir = rmdir
+bin/ln = ln
+bin/chmod = chmod
+bin/test = test
+bin/sleep = sleep
+bin/pwd = pwd
+usr/bin/head = head
+usr/bin/tail = tail
+usr/bin/wc = wc
+usr/bin/sort = sort
+usr/bin/uniq = uniq
+usr/bin/basename = basename
+usr/bin/dirname = dirname
+usr/bin/env = env
+usr/bin/tee = tee
+usr/bin/id = id
+usr/bin/uname = uname
+usr/bin/true = true
+usr/bin/false = false

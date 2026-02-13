@@ -23,6 +23,11 @@ uint64_t gnu_hash_lookup(struct link_map *map, const char *name) {
     uint32_t symoffset = hashtab[1];
     uint32_t bloom_size = hashtab[2];
     uint32_t bloom_shift = hashtab[3];
+    if (nbuckets == 0 || bloom_size == 0)
+        return 0;
+    if (map->symtab_count != 0 && symoffset >= map->symtab_count)
+        return 0;
+
     uint64_t *bloom = (uint64_t *)&hashtab[4];
     uint32_t *buckets = (uint32_t *)&bloom[bloom_size];
     uint32_t *chain = &buckets[nbuckets];
@@ -39,13 +44,29 @@ uint64_t gnu_hash_lookup(struct link_map *map, const char *name) {
     uint32_t idx = buckets[h % nbuckets];
     if (idx < symoffset)
         return 0;
+    if (map->symtab_count != 0 && idx >= map->symtab_count)
+        return 0;
 
     /* Chain walk */
+    uint32_t max_steps = (map->symtab_count != 0 && map->symtab_count > symoffset)
+        ? (uint32_t)(map->symtab_count - symoffset)
+        : 4096;
+    uint32_t steps = 0;
     for (;;) {
+        if (steps++ >= max_steps)
+            return 0;
         uint32_t chain_hash = chain[idx - symoffset];
         /* Compare hashes (low bit is the end-of-chain marker, so mask it) */
         if ((h | 1) == (chain_hash | 1)) {
             Elf64_Sym *sym = &map->symtab[idx];
+            if (map->strtab_size != 0 && sym->st_name >= map->strtab_size) {
+                if (chain_hash & 1)
+                    break;
+                idx++;
+                if (map->symtab_count != 0 && idx >= map->symtab_count)
+                    break;
+                continue;
+            }
             if (rtld_strcmp(name, map->strtab + sym->st_name) == 0) {
                 if (sym->st_shndx != SHN_UNDEF)
                     return map->base + sym->st_value;
@@ -54,6 +75,8 @@ uint64_t gnu_hash_lookup(struct link_map *map, const char *name) {
         if (chain_hash & 1)
             break;  /* End of chain */
         idx++;
+        if (map->symtab_count != 0 && idx >= map->symtab_count)
+            break;
     }
 
     return 0;
@@ -63,12 +86,8 @@ uint64_t linear_lookup(struct link_map *map, const char *name) {
     if (!map->symtab || !map->strtab)
         return 0;
 
-    /* Without DT_HASH we don't know symtab size exactly.
-     * Use gnu_hash symoffset as a hint for the start of hashed symbols,
-     * and scan a reasonable bound.
-     */
     uint32_t start = 0;
-    uint32_t limit = 4096;
+    uint32_t limit = map->symtab_count != 0 ? (uint32_t)map->symtab_count : 4096;
 
     /* If gnu_hash is available, we know the structure but the name
      * wasn't found there. For linear fallback, scan from index 0.
@@ -82,6 +101,8 @@ uint64_t linear_lookup(struct link_map *map, const char *name) {
             break;
 
         if (sym->st_name == 0)
+            continue;
+        if (map->strtab_size != 0 && sym->st_name >= map->strtab_size)
             continue;
         if (sym->st_shndx == SHN_UNDEF)
             continue;

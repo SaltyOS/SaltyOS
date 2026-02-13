@@ -1,0 +1,152 @@
+--- a/usr.bin/uname/uname.c	2026-02-13 22:58:25.489066704 +0900
++++ b/usr.bin/uname/uname.c	2026-02-13 22:59:53.569469318 +0900
+@@ -46,7 +46,7 @@
+ #endif
+ 
+ #include <sys/param.h>
+-#include <sys/sysctl.h>
++#include <sys/utsname.h>
+ 
+ #include <err.h>
+ #include <stdio.h>
+@@ -202,76 +202,74 @@
+ 	printf("\n");
+ }
+ 
+-#define	NATIVE_SYSCTL2_GET(var,mib0,mib1)	\
+-static void					\
+-native_##var(void)				\
+-{						\
+-	int mib[] = { (mib0), (mib1) };		\
+-	size_t len;				\
+-	static char buf[1024];			\
+-	char **varp = &(var);			\
+-						\
+-	len = sizeof buf;			\
+-	if (sysctl(mib, sizeof mib / sizeof mib[0],	\
+-	   &buf, &len, NULL, 0) == -1)		\
+-		err(1, "sysctl");
+-
+-#define	NATIVE_SYSCTLNAME_GET(var,name)		\
+-static void					\
+-native_##var(void)				\
+-{						\
+-	size_t len;				\
+-	static char buf[1024];			\
+-	char **varp = &(var);			\
+-						\
+-	len = sizeof buf;			\
+-	if (sysctlbyname(name, &buf, &len, NULL,\
+-	    0) == -1)				\
+-		err(1, "sysctlbyname");
+-
+-#define	NATIVE_SET				\
+-	*varp = buf;				\
+-	return;					\
+-}	struct __hack
+-
+-#define	NATIVE_BUFFER	(buf)
+-#define	NATIVE_LENGTH	(len)
+-
+-NATIVE_SYSCTL2_GET(sysname, CTL_KERN, KERN_OSTYPE) {
+-} NATIVE_SET;
+-
+-NATIVE_SYSCTL2_GET(hostname, CTL_KERN, KERN_HOSTNAME) {
+-} NATIVE_SET;
+-
+-NATIVE_SYSCTL2_GET(release, CTL_KERN, KERN_OSRELEASE) {
+-} NATIVE_SET;
+-
+-NATIVE_SYSCTL2_GET(version, CTL_KERN, KERN_VERSION) {
+-	size_t n;
+-	char *p;
+-
+-	p = NATIVE_BUFFER;
+-	n = NATIVE_LENGTH;
+-	for (; n--; ++p)
+-		if (*p == '\n' || *p == '\t') {
+-			if (n > 1)
+-				*p = ' ';
+-			else
+-				*p = '\0';
+-		}
+-} NATIVE_SET;
++static struct utsname uts;
++static int uts_inited;
++
++static void
++ensure_utsname(void)
++{
++	if (!uts_inited) {
++		if (uname(&uts) == -1)
++			err(1, "uname");
++		uts_inited = 1;
++	}
++}
++
++static void
++native_sysname(void)
++{
++	ensure_utsname();
++	sysname = uts.sysname;
++}
++
++static void
++native_hostname(void)
++{
++	ensure_utsname();
++	hostname = uts.nodename;
++}
++
++static void
++native_release(void)
++{
++	ensure_utsname();
++	release = uts.release;
++}
+ 
+-NATIVE_SYSCTL2_GET(platform, CTL_HW, HW_MACHINE) {
+-} NATIVE_SET;
++static void
++native_version(void)
++{
++	ensure_utsname();
++	version = uts.version;
++}
+ 
+-NATIVE_SYSCTL2_GET(arch, CTL_HW, HW_MACHINE_ARCH) {
+-} NATIVE_SET;
++static void
++native_platform(void)
++{
++	ensure_utsname();
++	platform = uts.machine;
++}
+ 
+-NATIVE_SYSCTLNAME_GET(ident, "kern.ident") {
+-} NATIVE_SET;
++static void
++native_arch(void)
++{
++	ensure_utsname();
++	arch = uts.machine;
++}
++
++static void
++native_ident(void)
++{
++	static char buf[] = "SaltyOS";
++	ident = buf;
++}
+ 
+-NATIVE_SYSCTLNAME_GET(buildid, "kern.build_id") {
+-} NATIVE_SET;
++static void
++native_buildid(void)
++{
++	static char buf[] = "unknown";
++	buildid = buf;
++}
+ 
+ static void
+ native_uservers(void)

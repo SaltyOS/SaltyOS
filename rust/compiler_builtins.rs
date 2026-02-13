@@ -2,7 +2,7 @@
 //!
 //! Provides software floating-point intrinsics (IEEE 754) using pure integer
 //! math for `x86_64-unknown-none` targets where SSE is disabled. Also stubs
-//! out i128/u128 and f32 arithmetic intrinsics that are not needed.
+//! out i128/u128 intrinsics that are not needed.
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
@@ -23,18 +23,6 @@ macro_rules! define_panicking_intrinsics(
         )*
     }
 );
-
-// f32 arithmetic — not used in kernel or saltyc
-define_panicking_intrinsics!("`f32` should not be used", {
-    __addsf3,
-    __eqsf2,
-    __gesf2,
-    __lesf2,
-    __ltsf2,
-    __mulsf3,
-    __nesf2,
-    __unordsf2,
-});
 
 define_panicking_intrinsics!("`i128` should not be used", {
     __ashrti3,
@@ -65,8 +53,121 @@ const F64_FRAC_BITS: u32 = 52;
 const F64_IMPLICIT_BIT: u64 = 1 << F64_FRAC_BITS;
 
 // IEEE 754 single-precision constants
+const F32_SIGN_BIT: u32 = 1 << 31;
+const F32_EXP_MASK: u32 = 0x7F80_0000;
+const F32_FRAC_MASK: u32 = 0x007F_FFFF;
 const F32_EXP_BIAS: i32 = 127;
 const F32_FRAC_BITS: u32 = 23;
+
+#[inline(always)]
+fn f32_sign(bits: u32) -> u32 {
+    bits & F32_SIGN_BIT
+}
+
+#[inline(always)]
+fn f32_is_nan(bits: u32) -> bool {
+    (bits & !F32_SIGN_BIT) > F32_EXP_MASK
+}
+
+// ---------------------------------------------------------------------------
+// f32 arithmetic intrinsics implemented via f64 soft-float helpers
+// ---------------------------------------------------------------------------
+
+#[unsafe(export_name = "__addsf3")]
+pub extern "C" fn __addsf3(a: u32, b: u32) -> u32 {
+    __truncdfsf2(__adddf3(__extendsfdf2(a), __extendsfdf2(b)))
+}
+
+#[unsafe(export_name = "__subsf3")]
+pub extern "C" fn __subsf3(a: u32, b: u32) -> u32 {
+    __truncdfsf2(__subdf3(__extendsfdf2(a), __extendsfdf2(b)))
+}
+
+#[unsafe(export_name = "__mulsf3")]
+pub extern "C" fn __mulsf3(a: u32, b: u32) -> u32 {
+    __truncdfsf2(__muldf3(__extendsfdf2(a), __extendsfdf2(b)))
+}
+
+#[unsafe(export_name = "__divsf3")]
+pub extern "C" fn __divsf3(a: u32, b: u32) -> u32 {
+    __truncdfsf2(__divdf3(__extendsfdf2(a), __extendsfdf2(b)))
+}
+
+// ---------------------------------------------------------------------------
+// f32 comparison intrinsics
+// ---------------------------------------------------------------------------
+
+/// Compare two f32 values. Returns -1, 0, or 1.
+/// `nan_result` is returned if either operand is NaN.
+fn cmp_f32(a: u32, b: u32, nan_result: i32) -> i32 {
+    if f32_is_nan(a) || f32_is_nan(b) {
+        return nan_result;
+    }
+
+    let a_sign = f32_sign(a);
+    let b_sign = f32_sign(b);
+
+    // Both zero (positive or negative)
+    if (a & !F32_SIGN_BIT) == 0 && (b & !F32_SIGN_BIT) == 0 {
+        return 0;
+    }
+
+    // Different signs
+    if a_sign != b_sign {
+        return if a_sign != 0 { -1 } else { 1 };
+    }
+
+    // Same sign — compare magnitudes
+    let a_mag = a & !F32_SIGN_BIT;
+    let b_mag = b & !F32_SIGN_BIT;
+
+    if a_mag == b_mag {
+        return 0;
+    }
+
+    if a_sign != 0 {
+        // Both negative: larger magnitude is smaller value
+        if a_mag > b_mag { -1 } else { 1 }
+    } else {
+        // Both positive: larger magnitude is larger value
+        if a_mag > b_mag { 1 } else { -1 }
+    }
+}
+
+#[unsafe(export_name = "__ltsf2")]
+pub extern "C" fn __ltsf2(a: u32, b: u32) -> i32 {
+    cmp_f32(a, b, 1) // NaN -> not less than
+}
+
+#[unsafe(export_name = "__lesf2")]
+pub extern "C" fn __lesf2(a: u32, b: u32) -> i32 {
+    cmp_f32(a, b, 1) // NaN -> not less than or equal
+}
+
+#[unsafe(export_name = "__gtsf2")]
+pub extern "C" fn __gtsf2(a: u32, b: u32) -> i32 {
+    cmp_f32(a, b, -1) // NaN -> not greater than
+}
+
+#[unsafe(export_name = "__gesf2")]
+pub extern "C" fn __gesf2(a: u32, b: u32) -> i32 {
+    cmp_f32(a, b, -1) // NaN -> not greater than or equal
+}
+
+#[unsafe(export_name = "__eqsf2")]
+pub extern "C" fn __eqsf2(a: u32, b: u32) -> i32 {
+    cmp_f32(a, b, 1) // NaN -> not equal
+}
+
+#[unsafe(export_name = "__nesf2")]
+pub extern "C" fn __nesf2(a: u32, b: u32) -> i32 {
+    cmp_f32(a, b, 1) // NaN -> not equal
+}
+
+#[unsafe(export_name = "__unordsf2")]
+pub extern "C" fn __unordsf2(a: u32, b: u32) -> i32 {
+    if f32_is_nan(a) || f32_is_nan(b) { 1 } else { 0 }
+}
 
 #[inline(always)]
 fn f64_sign(bits: u64) -> u64 {
@@ -592,6 +693,11 @@ pub extern "C" fn __gedf2(a: u64, b: u64) -> i32 {
 #[unsafe(export_name = "__eqdf2")]
 pub extern "C" fn __eqdf2(a: u64, b: u64) -> i32 {
     cmp_f64(a, b, 1) // NaN → not equal
+}
+
+#[unsafe(export_name = "__nedf2")]
+pub extern "C" fn __nedf2(a: u64, b: u64) -> i32 {
+    cmp_f64(a, b, 1) // NaN → not equal (same semantics as __eqdf2)
 }
 
 #[unsafe(export_name = "__unorddf2")]

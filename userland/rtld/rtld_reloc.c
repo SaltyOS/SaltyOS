@@ -10,7 +10,14 @@
 /* Resolve a symbol by index from a given object's symtab */
 static uint64_t resolve_by_index(struct rtld_state *st, struct link_map *map,
                                   uint32_t sym_idx) {
+    if (map->symtab_count != 0 && sym_idx >= map->symtab_count) {
+        return 0;
+    }
+
     Elf64_Sym *sym = &map->symtab[sym_idx];
+    if (map->strtab_size != 0 && sym->st_name >= map->strtab_size) {
+        return 0;
+    }
     const char *name = map->strtab + sym->st_name;
 
     /* Search all loaded objects in link order */

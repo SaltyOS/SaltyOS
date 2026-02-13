@@ -36,6 +36,8 @@ static mut NEXT_UT_HINT: Cap = CAP_UNTYPED_START;
 // ===========================================================================
 
 const MAX_SHARED_LIB_PAGES: usize = 192;
+const MAX_CACHED_LIBS: usize = 4;
+const MAX_LIB_NAME: usize = 24;
 
 /// Well-known CNode slot range where cached frame caps are copied into
 /// procmgr's CSpace, enabling zero-allocation library sharing.
@@ -43,14 +45,39 @@ const CAP_SHARED_LIB_CACHE_BASE: u64 = 0x80;
 
 #[derive(Clone, Copy)]
 struct SharedPage {
+    /// Offset relative to the library's own min_vaddr (NOT cumulative).
     vaddr_offset: u64,
     frame_cap: Cap,
     flags: u64,
 }
 
+#[derive(Clone, Copy)]
+struct CachedLib {
+    name: [u8; MAX_LIB_NAME],
+    name_len: u8,
+    page_start: u16,
+    page_count: u16,
+    /// Full VA span of the library (including RW segments), page-aligned.
+    lib_span: u64,
+}
+
+impl CachedLib {
+    const fn zeroed() -> Self {
+        CachedLib {
+            name: [0u8; MAX_LIB_NAME],
+            name_len: 0,
+            page_start: 0,
+            page_count: 0,
+            lib_span: 0,
+        }
+    }
+}
+
 struct SharedLibCache {
     initialized: bool,
     page_count: usize,
+    lib_count: usize,
+    libs: [CachedLib; MAX_CACHED_LIBS],
     pages: [SharedPage; MAX_SHARED_LIB_PAGES],
 }
 
@@ -59,6 +86,8 @@ impl SharedLibCache {
         SharedLibCache {
             initialized: false,
             page_count: 0,
+            lib_count: 0,
+            libs: [CachedLib::zeroed(); MAX_CACHED_LIBS],
             pages: [SharedPage { vaddr_offset: 0, frame_cap: 0, flags: 0 }; MAX_SHARED_LIB_PAGES],
         }
     }
@@ -400,9 +429,12 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
         let initrd_size = super::INITRD_SIZE;
 
         let libs: [&[u8]; 2] = [b"libsalty.so", b"libc.so"];
-        let mut cumulative_base: u64 = 0;
 
         for lib_name in &libs {
+            if cache.lib_count >= MAX_CACHED_LIBS {
+                break;
+            }
+
             let mut entry = CpioEntry::zeroed();
             if salty::cpio::cpio_find_file(
                 initrd, initrd_size, lib_name.as_ptr(), lib_name.len(), &raw mut entry,
@@ -429,18 +461,33 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
                 continue;
             }
 
-            // Find min_vaddr across PT_LOAD segments
+            // Find min_vaddr and max_seg_end across PT_LOAD segments
             let phdrs = entry.data.add(ehdr.e_phoff as usize) as *const Elf64Phdr;
             let mut min_vaddr: u64 = u64::MAX;
+            let mut max_seg_end: u64 = 0;
             for i in 0..ehdr.e_phnum as usize {
                 let ph = &*phdrs.add(i);
-                if ph.p_type == salty::PT_LOAD && ph.p_vaddr < min_vaddr {
-                    min_vaddr = ph.p_vaddr;
+                if ph.p_type == salty::PT_LOAD {
+                    if ph.p_vaddr < min_vaddr { min_vaddr = ph.p_vaddr; }
+                    let se = (ph.p_vaddr + ph.p_memsz + 0xFFF) & !0xFFFu64;
+                    if se > max_seg_end { max_seg_end = se; }
                 }
             }
             if min_vaddr == u64::MAX {
                 continue;
             }
+            let lib_span = max_seg_end - (min_vaddr & !0xFFFu64);
+
+            // Start a new CachedLib entry
+            let li = cache.lib_count;
+            let page_start = cache.page_count as u16;
+            let mut lib_entry = CachedLib::zeroed();
+            let copy_len = if lib_name.len() > MAX_LIB_NAME { MAX_LIB_NAME } else { lib_name.len() };
+            for j in 0..copy_len {
+                lib_entry.name[j] = lib_name[j];
+            }
+            lib_entry.name_len = copy_len as u8;
+            lib_entry.lib_span = lib_span;
 
             // Cache each page of each read-only PT_LOAD segment
             for i in 0..ehdr.e_phnum as usize {
@@ -483,7 +530,6 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
                         lb.hex(err as u64);
                         lb.str(b"\n");
                         lb.flush();
-                        // Partial cache is still usable — mark initialized with what we have
                         break;
                     }
 
@@ -526,12 +572,9 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
                     // Unmap scratch
                     invoke::vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
 
-                    // Store in cache — use offset relative to this library's min_vaddr,
-                    // but also add a per-library base offset so that multi-library pages
-                    // don't overlap. The offset must match what RTLD sees when it loads
-                    // the library at (shared_lib_base + lib_vaddr_base).
+                    // Store in cache with offset relative to library's own min_vaddr.
                     cache.pages[cache.page_count] = SharedPage {
-                        vaddr_offset: cumulative_base + (page - min_vaddr),
+                        vaddr_offset: page - min_vaddr,
                         frame_cap: frame_slot,
                         flags,
                     };
@@ -539,7 +582,12 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
                     page += 4096;
                 }
             }
-            cumulative_base += 0x80000;
+
+            // Finalize CachedLib entry
+            lib_entry.page_start = page_start;
+            lib_entry.page_count = (cache.page_count as u16) - page_start;
+            cache.libs[li] = lib_entry;
+            cache.lib_count += 1;
         }
 
         if cache.page_count > 0 {
@@ -553,51 +601,122 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
     }
 }
 
-/// Map cached shared library RO frames into a child VSpace.
+/// Map cached shared library RO frames into a child VSpace, mapping only
+/// libraries listed in `needed` in their DT_NEEDED order.
+/// `shared_lib_base_vaddr` is the layout-computed VA where libs start.
 /// Returns the shared_lib_base address on success, 0 on failure.
 unsafe fn map_shared_lib_to_child(
     child_vs: Cap,
     _child_cn: Cap,
-    rtld_base: u64,
+    shared_lib_base_vaddr: u64,
+    needed: &salty::elf_dynamic::NeededLibs,
 ) -> u64 {
     unsafe {
         let cache = &*(&raw const SHARED_LIB_CACHE);
-        if !cache.initialized || cache.page_count == 0 {
+        if !cache.initialized || cache.page_count == 0 || shared_lib_base_vaddr == 0 {
+            return 0;
+        }
+        if needed.count == 0 {
             return 0;
         }
 
-        let lib_load_addr = rtld_base + 0x80000;
+        let mut running_base = shared_lib_base_vaddr;
+        let mut total_mapped = 0usize;
 
-        for i in 0..cache.page_count {
-            let page = &cache.pages[i];
-            let vaddr = lib_load_addr + page.vaddr_offset;
-            let err = invoke::vspace_map(
-                child_vs, page.frame_cap, vaddr, page.flags,
-            );
-            if err != 0 {
+        // Map libraries in DT_NEEDED order
+        for ni in 0..needed.count {
+            let name = &needed.names[ni][..needed.name_lens[ni]];
+
+            // Find this library in the cache
+            let mut found = false;
+            for li in 0..cache.lib_count {
+                let cl = &cache.libs[li];
+                let cl_name = &cl.name[..cl.name_len as usize];
+                if cl_name.len() != name.len() {
+                    continue;
+                }
+                let mut eq = true;
+                for k in 0..name.len() {
+                    if cl_name[k] != name[k] {
+                        eq = false;
+                        break;
+                    }
+                }
+                if !eq {
+                    continue;
+                }
+
+                // Map this library's RO pages at running_base
+                let ps = cl.page_start as usize;
+                let pc = cl.page_count as usize;
+                for pi in 0..pc {
+                    let page = &cache.pages[ps + pi];
+                    let vaddr = running_base + page.vaddr_offset;
+                    let err = invoke::vspace_map(child_vs, page.frame_cap, vaddr, page.flags);
+                    if err != 0 {
+                        let mut lb = LineBuf::new();
+                        lb.str(b"[INIT] shared lib map failed at ");
+                        lb.hex(vaddr);
+                        lb.str(b" err=");
+                        lb.hex(err as u64);
+                        lb.str(b"\n");
+                        lb.flush();
+                        return 0;
+                    }
+                    total_mapped += 1;
+                }
+
+                running_base += cl.lib_span + 4096; // advance past this lib + gap
+                found = true;
+                break;
+            }
+
+            if !found {
+                // Library not in cache — RTLD will load it from initrd
                 let mut lb = LineBuf::new();
-                lb.str(b"[INIT] shared lib map failed at ");
-                lb.hex(vaddr);
-                lb.str(b" err=");
-                lb.hex(err as u64);
+                lb.str(b"[INIT] shared lib cache miss: ");
+                lb.bytes(name);
                 lb.str(b"\n");
                 lb.flush();
-                // Rollback already-mapped pages
-                for j in 0..i {
-                    let prev_vaddr = lib_load_addr + cache.pages[j].vaddr_offset;
-                    invoke::vspace_unmap(child_vs, prev_vaddr);
-                }
-                return 0;
             }
         }
 
-        lib_load_addr
+        if total_mapped > 0 {
+            shared_lib_base_vaddr
+        } else {
+            0
+        }
     }
 }
 
-/// Return the number of cached shared library pages (for Phase 4 handoff).
-pub fn shared_lib_cache_count() -> usize {
-    unsafe { (&*(&raw const SHARED_LIB_CACHE)).page_count }
+/// Return the total VA pages needed for the specified DT_NEEDED libraries.
+/// This accounts for full library spans (including RW segments) plus inter-lib gaps.
+pub fn shared_lib_va_pages_for_needed(needed: &salty::elf_dynamic::NeededLibs) -> usize {
+    unsafe {
+        let cache = &*(&raw const SHARED_LIB_CACHE);
+        if !cache.initialized || needed.count == 0 {
+            return 0;
+        }
+        let mut total_bytes: u64 = 0;
+        for ni in 0..needed.count {
+            let name = &needed.names[ni][..needed.name_lens[ni]];
+            for li in 0..cache.lib_count {
+                let cl = &cache.libs[li];
+                let cl_name = &cl.name[..cl.name_len as usize];
+                if cl_name.len() == name.len() {
+                    let mut eq = true;
+                    for k in 0..name.len() {
+                        if cl_name[k] != name[k] { eq = false; break; }
+                    }
+                    if eq {
+                        total_bytes += cl.lib_span + 4096; // span + gap
+                        break;
+                    }
+                }
+            }
+        }
+        ((total_bytes + 0xFFF) / 0x1000) as usize
+    }
 }
 
 /// Copy all cached shared library frame caps into a child CNode
@@ -666,6 +785,41 @@ pub unsafe fn spawn_server(
         if is_dynamic {
             { let mut lb = LineBuf::new(); lb.str(b"[INIT] "); lb.bytes(label); lb.str(b" is dynamically linked\n"); lb.flush(); }
         }
+
+        // Pre-compute ELF and RTLD spans for layout computation
+        let elf_span = elf_loader::elf_compute_load_span(entry.data, entry.data_len);
+        let mut rtld_entry = CpioEntry::zeroed();
+        let rtld_span = if is_dynamic {
+            let rtld_name = b"ld-salty.so";
+            if cpio::cpio_find_file(initrd, initrd_size, rtld_name.as_ptr(), rtld_name.len(), &raw mut rtld_entry) == 0 {
+                puts(b"[INIT] rtld not found in initrd\n");
+                return -1;
+            }
+            elf_loader::elf_compute_load_span(rtld_entry.data, rtld_entry.data_len)
+        } else {
+            0
+        };
+
+        // Parse DT_NEEDED to determine which shared libs this ELF needs
+        let needed = if is_dynamic {
+            elf_dynamic::elf_get_needed(entry.data, entry.data_len)
+        } else {
+            salty::elf_dynamic::NeededLibs::new()
+        };
+
+        let shared_lib_pages = shared_lib_va_pages_for_needed(&needed);
+        let layout = salty::layout::compute_vm_layout(
+            elf_span,
+            rtld_span,
+            shared_lib_pages,
+            map_initrd || is_dynamic,
+            initrd_size,
+        );
+        if layout.stack_top == 0 {
+            puts(b"[INIT] ELF too large for VA layout\n");
+            return -1;
+        }
+
         let budget = compute_spawn_memory_budget(is_dynamic, child_ut_bits);
         let effective_ready_timeout_ns = compute_ready_timeout_ns(
             ready_timeout_ns,
@@ -800,7 +954,7 @@ pub unsafe fn spawn_server(
         let err = elf_loader::elf_load(
             entry.data,
             entry.data_len,
-            super::CHILD_CODE_VADDR,
+            layout.elf_code.base,
             &mut loader_ctx,
             &raw mut elf_result,
         );
@@ -814,17 +968,10 @@ pub unsafe fn spawn_server(
         let mut rtld_result = ElfLoadResult { entry: 0, base: 0, brk: 0 };
 
         if is_dynamic {
-            let rtld_name = b"ld-salty.so";
-            let mut rtld_entry = CpioEntry::zeroed();
-            if cpio::cpio_find_file(initrd, initrd_size, rtld_name.as_ptr(), rtld_name.len(), &raw mut rtld_entry) == 0 {
-                puts(b"[INIT] rtld not found in initrd\n");
-                return -1;
-            }
-
             let err = elf_loader::elf_load(
                 rtld_entry.data,
                 rtld_entry.data_len,
-                super::CHILD_RTLD_VADDR,
+                layout.rtld.base,
                 &mut loader_ctx,
                 &raw mut rtld_result,
             );
@@ -837,11 +984,12 @@ pub unsafe fn spawn_server(
         }
 
         // Map stack pages
-        for pg in 0..super::SRV_STACK_PAGES {
-            let page_vaddr = super::CHILD_STACK_VADDR + pg as u64 * 4096;
+        let stack_pages = layout.stack.page_count();
+        for pg in 0..stack_pages {
+            let page_vaddr = layout.stack.base + pg as u64 * 4096;
             let frame_slot;
 
-            if pg == super::SRV_STACK_PAGES - 1 {
+            if pg == stack_pages - 1 {
                 frame_slot = child_stk_fr;
             } else {
                 frame_slot = super::init_alloc_frame_slot(core::ptr::null_mut());
@@ -871,7 +1019,7 @@ pub unsafe fn spawn_server(
         let err = invoke::vspace_map(
             child_vs,
             child_ipc_fr,
-            super::CHILD_IPC_BUF_VADDR,
+            layout.ipc_buf.base,
             VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
         );
         if err != 0 {
@@ -890,7 +1038,7 @@ pub unsafe fn spawn_server(
                     child_vs,
                     CAP_INITRD_UNTYPED,
                     (pg as u64) * 4096,
-                    super::CHILD_INITRD_VADDR + pg as u64 * 4096,
+                    layout.initrd.base + pg as u64 * 4096,
                     VSPACE_FLAG_USER,
                 );
                 if err != 0 {
@@ -904,7 +1052,7 @@ pub unsafe fn spawn_server(
                     for mapped_pg in 0..pg {
                         invoke::vspace_unmap(
                             child_vs,
-                            super::CHILD_INITRD_VADDR + mapped_pg as u64 * 4096,
+                            layout.initrd.base + mapped_pg as u64 * 4096,
                         );
                     }
                     mapped_with_device = false;
@@ -954,7 +1102,7 @@ pub unsafe fn spawn_server(
                     let err = invoke::vspace_map(
                         child_vs,
                         fr_slot,
-                        super::CHILD_INITRD_VADDR + pg as u64 * 4096,
+                        layout.initrd.base + pg as u64 * 4096,
                         VSPACE_FLAG_USER,
                     );
                     if err != 0 {
@@ -1099,14 +1247,15 @@ pub unsafe fn spawn_server(
         if err != 0 { puts(b"[INIT] TCB set_space failed\n"); return -1; }
 
         // Map shared library RO frames into child VSpace
-        let shared_lib_base = if is_dynamic {
-            map_shared_lib_to_child(child_vs, child_cn, rtld_result.base)
+        // Shared libs start after RTLD's actual extent + 1-page gap
+        let shared_lib_base = if is_dynamic && layout.shared_libs.size > 0 {
+            map_shared_lib_to_child(child_vs, child_cn, layout.shared_libs.base, &needed)
         } else {
             0
         };
 
         let mut child_entry = elf_result.entry;
-        let mut child_rsp = super::SRV_STACK_TOP;
+        let mut child_rsp = layout.stack_top;
 
         if is_dynamic {
             let err = invoke::vspace_map(
@@ -1126,7 +1275,7 @@ pub unsafe fn spawn_server(
             if elf_dynamic::elf_get_phdr_info(
                 entry.data,
                 entry.data_len,
-                super::CHILD_CODE_VADDR,
+                layout.elf_code.base,
                 &raw mut phdr_vaddr,
                 &raw mut phent,
                 &raw mut phnum,
@@ -1159,8 +1308,8 @@ pub unsafe fn spawn_server(
             w!(super::AT_PAGESZ); w!(4096);
             w!(super::AT_SALTY_UNTYPED); w!(super::CAP_CHILD_UNTYPED_OFFSET);
             w!(super::AT_SALTY_VSPACE); w!(1);
-            w!(super::AT_SALTY_SCRATCH); w!(super::CHILD_SCRATCH_VADDR);
-            w!(super::AT_SALTY_INITRD); w!(super::CHILD_INITRD_VADDR);
+            w!(super::AT_SALTY_SCRATCH); w!(layout.scratch.base);
+            w!(super::AT_SALTY_INITRD); w!(layout.initrd.base);
             w!(super::AT_SALTY_INITRD_SZ); w!(initrd_size as u64);
             w!(super::AT_SALTY_FRAME_SLOT); w!(super::CHILD_RTLD_FRAME_SLOT_START);
             if shared_lib_base != 0 {
@@ -1171,7 +1320,7 @@ pub unsafe fn spawn_server(
 
             invoke::vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
 
-            child_rsp = super::SRV_STACK_TOP - srv_stack_frame_size;
+            child_rsp = layout.stack_top - srv_stack_frame_size;
             child_entry = rtld_result.entry;
         }
 
@@ -1185,7 +1334,7 @@ pub unsafe fn spawn_server(
             return -1;
         }
 
-        invoke::tcb_set_ipc_buffer(child_tcb, super::CHILD_IPC_BUF_VADDR);
+        invoke::tcb_set_ipc_buffer(child_tcb, layout.ipc_buf.base);
 
         let err = invoke::sc_configure(child_sc, 10000, 100000);
         if err != 0 { puts(b"[INIT] SC configure failed\n"); return -1; }
@@ -1211,16 +1360,45 @@ pub unsafe fn spawn_server(
 }
 
 /// Spawn via procmgr IPC (for post-procmgr services).
-pub unsafe fn pm_spawn(pm_ep: Cap, prog: &[u8], timeout_ns: u64) -> i32 {
+///
+/// Uses the new spawn wire format:
+///   regs[0] = name_len
+///   regs[1] = spawn_policy bitfield
+///   regs[2] = timeout_ns (only for NOTIFY mode, 0=auto)
+///   regs[3] = spawn_flags (reserved, 0)
+///   regs[4] = reserved (0)
+///   regs[5..] = name bytes packed into u64 words
+pub unsafe fn pm_spawn(pm_ep: Cap, prog: &[u8], def: &super::ini::ServiceDef) -> i32 {
     unsafe {
         let len = prog.len();
+
+        let readiness = match def.svc_type {
+            super::ini::ServiceType::Notify => SPAWN_READY_NOTIFY,
+            super::ini::ServiceType::Simple => SPAWN_READY_IMMEDIATE,
+        };
+        let policy = spawn_policy_build(
+            readiness,
+            def.map_initrd,
+            false, // is_display determined by procmgr from name
+            def.cnode_bits,
+            def.memory_kb,
+        );
+        let timeout_ns = if readiness == SPAWN_READY_NOTIFY {
+            def.timeout_start_ns
+        } else {
+            0
+        };
+
         let mut spawn_msg = SaltyMsg::zeroed();
         spawn_msg.label = POSIX_PM_SPAWN;
-        spawn_msg.length = 3 + ((len as u64 + 7) / 8);
+        let packed_name_words = ((len as u64) + 7) / 8;
+        spawn_msg.length = 5 + packed_name_words;
         spawn_msg.regs[0] = len as u64;
-        spawn_msg.regs[1] = POSIX_PM_SPAWN_FLAG_WAIT_READY;
+        spawn_msg.regs[1] = policy;
         spawn_msg.regs[2] = timeout_ns;
-        let dst = &raw mut spawn_msg.regs[3] as *mut u8;
+        spawn_msg.regs[3] = 0; // spawn_flags (reserved)
+        spawn_msg.regs[4] = 0; // reserved
+        let dst = &raw mut spawn_msg.regs[5] as *mut u8;
         for i in 0..len {
             *dst.add(i) = prog[i];
         }

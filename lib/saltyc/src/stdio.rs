@@ -53,6 +53,18 @@ pub static mut stdout: *mut FILE = core::ptr::null_mut();
 #[unsafe(no_mangle)]
 pub static mut stderr: *mut FILE = core::ptr::null_mut();
 
+// FreeBSD compatibility aliases — FreeBSD's stdio.h #defines stdout as __stdoutp
+#[unsafe(no_mangle)]
+pub static mut __stdinp: *mut FILE = core::ptr::null_mut();
+#[unsafe(no_mangle)]
+pub static mut __stdoutp: *mut FILE = core::ptr::null_mut();
+#[unsafe(no_mangle)]
+pub static mut __stderrp: *mut FILE = core::ptr::null_mut();
+
+// FreeBSD's libc threading indicator
+#[unsafe(no_mangle)]
+pub static mut __isthreaded: i32 = 0;
+
 // Initialize stdio pointers (called from module init or lazily)
 fn ensure_stdio_init() {
     unsafe {
@@ -60,6 +72,9 @@ fn ensure_stdio_init() {
             stdin = &raw mut STDIN_FILE;
             stdout = &raw mut STDOUT_FILE;
             stderr = &raw mut STDERR_FILE;
+            __stdinp = stdin;
+            __stdoutp = stdout;
+            __stderrp = stderr;
         }
     }
 }

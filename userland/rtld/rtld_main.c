@@ -203,7 +203,35 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
     }
 
     /* 4. Load shared libraries: walk exe's DT_NEEDED entries */
-    uint64_t lib_load_addr = g_rtld.rtld_base + 0x80000ULL; /* 512KB after RTLD base */
+    uint64_t lib_load_addr;
+    if (g_rtld.shared_lib_base != 0) {
+        /* Pre-mapped path: procmgr computed the shared lib base address */
+        lib_load_addr = g_rtld.shared_lib_base;
+    } else {
+        /* Self-loading fallback: compute lib base from RTLD's own load extent.
+         * Walk RTLD's phdrs to find max_end, then start libs after a 1-page gap.
+         */
+        Elf64_Ehdr *rtld_ehdr = (Elf64_Ehdr *)g_rtld.rtld_base;
+        Elf64_Phdr *rtld_phdrs = (Elf64_Phdr *)(g_rtld.rtld_base + rtld_ehdr->e_phoff);
+        uint64_t rtld_min_vaddr = UINT64_MAX;
+        for (int i = 0; i < rtld_ehdr->e_phnum; i++) {
+            if (rtld_phdrs[i].p_type == PT_LOAD && rtld_phdrs[i].p_vaddr < rtld_min_vaddr)
+                rtld_min_vaddr = rtld_phdrs[i].p_vaddr;
+        }
+        uint64_t rtld_delta = g_rtld.rtld_base - rtld_min_vaddr;
+        uint64_t rtld_max_end = 0;
+        for (int i = 0; i < rtld_ehdr->e_phnum; i++) {
+            if (rtld_phdrs[i].p_type == PT_LOAD) {
+                uint64_t mapped_end = rtld_page_align_up(
+                    rtld_phdrs[i].p_vaddr + rtld_delta + rtld_phdrs[i].p_memsz
+                );
+                if (mapped_end > rtld_max_end) rtld_max_end = mapped_end;
+            }
+        }
+        if (rtld_max_end == 0)
+            rtld_max_end = g_rtld.rtld_base + 0x80000ULL; /* conservative fallback */
+        lib_load_addr = rtld_max_end + PAGE_SIZE; /* 1-page gap */
+    }
 
     if (exe_dyn) {
         for (int i = 0; exe_dyn[i].d_tag != DT_NULL; i++) {
@@ -231,8 +259,11 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
                     for (;;) rtld_yield();
                 }
 
-                /* Advance load address for next library (512 KB apart) */
-                lib_load_addr += 0x80000ULL;
+                /* Advance load address by actual library footprint + 1-page gap */
+                struct link_map *loaded_map = &g_rtld.objects[g_rtld.nobjects - 1];
+                uint64_t advance = loaded_map->load_size;
+                if (advance == 0) advance = 0x80000ULL; /* fallback */
+                lib_load_addr += advance + PAGE_SIZE;
             }
         }
     }

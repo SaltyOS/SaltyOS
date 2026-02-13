@@ -1,0 +1,74 @@
+[port]
+name = bash
+version = 5.2.32
+description = GNU Bourne Again Shell
+homepage = https://www.gnu.org/software/bash/
+license = GPL-3.0
+
+[source]
+url = https://ftp.gnu.org/gnu/bash/bash-${version}.tar.gz
+subdir = bash-${version}
+sha256 = SKIP
+
+[build]
+type = autotools
+configure =
+    -C
+    --enable-minimal-config
+    --without-bash-malloc
+    --disable-nls
+    --disable-readline
+    --disable-history
+    --disable-bang-history
+    --disable-job-control
+    --disable-net-redirections
+    --disable-process-substitution
+    --disable-select
+    --disable-help-builtin
+    --disable-directory-stack
+    --disable-programmable-completion
+
+[env]
+CFLAGS_FOR_BUILD = -std=gnu89
+EXTRA_CFLAGS = -std=gnu89
+
+[autoconf_cache]
+ac_cv_func_mmap_fixed_mapped = yes
+ac_cv_func_strcoll_works = yes
+ac_cv_func_working_mktime = yes
+ac_cv_c_long_double = no
+ac_cv_func_setvbuf_reversed = no
+ac_cv_func_lstat_dereferences_slashed_symlink = yes
+bash_cv_func_sigsetjmp = present
+bash_cv_getcwd_malloc = yes
+bash_cv_job_control_missing = missing
+bash_cv_printf_a_format = no
+bash_cv_ulimit_maxfds = yes
+bash_cv_sys_named_pipes = present
+bash_cv_sys_siglist = yes
+bash_cv_under_sys_siglist = no
+bash_cv_unusable_rtsigs = no
+bash_cv_func_ctype_nonascii = no
+bash_cv_must_reinstall_sighandlers = no
+bash_cv_opendir_not_robust = no
+bash_cv_pgrp_pipe = no
+bash_cv_dup2_broken = no
+bash_cv_getenv_redef = yes
+bash_cv_wcontinued_broken = no
+bash_cv_wexitstatus_offset = 8
+gt_cv_int_divbyzero_sigfpe = no
+bash_cv_type_rlimit = rlim_t
+bash_cv_dev_fd = absent
+bash_cv_dev_stdin = absent
+ac_cv_type_u_int = yes
+ac_cv_type_u_long = yes
+bash_cv_type_unionwait = no
+ac_cv_header_sgtty_h = no
+bash_cv_speed_t_in_sys_types = no
+bash_cv_struct_winsize_header = termios.h
+
+[prepare]
+sed -i 's/^LIBS_FOR_BUILD = .*/LIBS_FOR_BUILD =/' ${SRCDIR}/support/Makefile.in
+
+[install]
+bash.elf = bash

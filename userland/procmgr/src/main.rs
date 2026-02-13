@@ -36,7 +36,6 @@ const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 // ---- Protocol labels ----
 const PM_SPAWN: u64 = 1;
-const PM_SPAWN_FLAG_WAIT_READY: u64 = 1 << 0;
 const PM_EXIT: u64 = 2;
 const PM_WAIT: u64 = 3;
 const PM_GETPID: u64 = 4;
@@ -60,18 +59,8 @@ const PM_SIGCHLD: usize = 17;
 const PM_SIGCONT: usize = 18;
 const PM_SIGSTOP: usize = 19;
 
-// ---- Child VSpace layout ----
-// Keep code+rtld+libs+stack+IPC+scratch in one 2MiB PT window
-// (0x200000..0x3fffff) to reduce per-process PT pressure in lowmem boots.
-const CHILD_CODE_VADDR: u64 = 0x0000_0000_0021_0000;
-const CHILD_STACK_VADDR: u64 = 0x0000_0000_003F_8000;
-const CHILD_STACK_PAGES: usize = 4;
-const CHILD_STACK_SIZE: u64 = CHILD_STACK_PAGES as u64 * 4096;
-const CHILD_STACK_TOP: u64 = CHILD_STACK_VADDR + CHILD_STACK_SIZE;
-const CHILD_IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
-const CHILD_RTLD_VADDR: u64 = 0x0000_0000_0028_0000;
-const CHILD_INITRD_VADDR: u64 = 0x0000_0000_0100_0000;
-const CHILD_SCRATCH_VADDR: u64 = 0x0000_0000_003F_F000;
+use salty::layout::{self, VmLayoutPlan};
+
 const CHILD_RTLD_FRAME_SLOT_START: u64 = 64;
 const PROCMGR_SCRATCH_VADDR: u64 = 0x0000_0000_0500_0000;
 
@@ -817,18 +806,20 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         let parent_vs = PROCTAB[parent_idx].vspace_cap;
 
         let parent_shared_base = PROCTAB[parent_idx].shared_lib_base;
+        let parent_lib_map = PROCTAB[parent_idx].lib_map;
+        let parent_layout = PROCTAB[parent_idx].layout;
         let initrd_size = read_boot_info_initrd_size() as u64;
         let mut initrd_phys_base = 0u64;
         let mut initrd_phys_end = 0u64;
-        if initrd_size != 0 {
-            let err = salty::invoke::vspace_walk(parent_vs, CHILD_INITRD_VADDR, 1);
+        if initrd_size != 0 && parent_layout.initrd.size > 0 {
+            let err = salty::invoke::vspace_walk(parent_vs, parent_layout.initrd.base, 1);
             if err == 0 {
                 let ipc = IPC_BUF_VADDR as *const u64;
                 let count = core::ptr::read_volatile(ipc);
                 if count != 0 {
                     let vaddr = core::ptr::read_volatile(ipc.add(2));
                     let phys = core::ptr::read_volatile(ipc.add(3));
-                    if vaddr == CHILD_INITRD_VADDR {
+                    if vaddr == parent_layout.initrd.base {
                         initrd_phys_base = phys;
                         initrd_phys_end = phys + ((initrd_size + 0xFFF) & !0xFFF);
                     }
@@ -862,9 +853,9 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                 if count == 0 { break; }
                 for i in 0..count as usize {
                     let page_vaddr = core::ptr::read_volatile(ipc.add(2 + i * 3));
-                    if page_vaddr == CHILD_IPC_BUF_VADDR { continue; }
-                    if page_vaddr >= CHILD_INITRD_VADDR { continue; }
-                    if spawn_tx::lookup_shared_lib_page(page_vaddr, parent_shared_base).is_some() { continue; }
+                    if page_vaddr == parent_layout.ipc_buf.base { continue; }
+                    if parent_layout.initrd.size > 0 && page_vaddr >= parent_layout.initrd.base { continue; }
+                    if spawn_tx::lookup_shared_lib_page(page_vaddr, &parent_lib_map).is_some() { continue; }
                     page_count += 1;
                 }
                 if next_addr == 0 { break; }
@@ -919,14 +910,14 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                 let page_vaddr = core::ptr::read_volatile(ipc.add(2 + i * 3));
                 let page_phys = core::ptr::read_volatile(ipc.add(2 + i * 3 + 1));
                 let page_flags = core::ptr::read_volatile(ipc.add(2 + i * 3 + 2));
-                if page_vaddr == CHILD_IPC_BUF_VADDR { continue; }
+                if page_vaddr == parent_layout.ipc_buf.base { continue; }
 
                 // Skip initrd window pages — child doesn't need them after fork
-                if page_vaddr >= CHILD_INITRD_VADDR { continue; }
+                if parent_layout.initrd.size > 0 && page_vaddr >= parent_layout.initrd.base { continue; }
 
                 // Share cached lib RO pages instead of copying
                 if let Some((cached_cap, cached_flags)) =
-                    spawn_tx::lookup_shared_lib_page(page_vaddr, parent_shared_base)
+                    spawn_tx::lookup_shared_lib_page(page_vaddr, &parent_lib_map)
                 {
                     let err = salty::invoke::vspace_map(child_vs, cached_cap, page_vaddr, cached_flags);
                     if err != 0 {
@@ -1059,7 +1050,7 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
 
         // Map IPC buffer in child
         let err = salty::invoke::vspace_map(
-            child_vs, child_ipc_fr, CHILD_IPC_BUF_VADDR,
+            child_vs, child_ipc_fr, parent_layout.ipc_buf.base,
             VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
         );
         if err != 0 {
@@ -1163,7 +1154,7 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             reply.label = SALTY_OUT_OF_MEMORY;
             return;
         }
-        let err = salty::invoke::tcb_set_ipc_buffer(child_tcb, CHILD_IPC_BUF_VADDR);
+        let err = salty::invoke::tcb_set_ipc_buffer(child_tcb, parent_layout.ipc_buf.base);
         if err != 0 {
             puts(b"[PROCMGR] FORK: set IPC buf failed\n");
             alloc.rollback();
@@ -1222,6 +1213,8 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         p.slot_base = slot_base;
         p.slot_count = slot_count;
         p.shared_lib_base = PROCTAB[parent_idx].shared_lib_base;
+        p.lib_map = parent_lib_map;
+        p.layout = parent_layout;
         for i in 0..NSIG {
             p.sig_disposition[i] = PROCTAB[parent_idx].sig_disposition[i];
         }
@@ -1306,7 +1299,7 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
 
             for i in 0..count {
                 let page_vaddr = core::ptr::read_volatile(ipc.add(2 + i as usize * 3));
-                if page_vaddr == CHILD_IPC_BUF_VADDR { continue; }
+                if page_vaddr == PROCTAB[idx].layout.ipc_buf.base { continue; }
                 salty::invoke::vspace_unmap(proc_vs, page_vaddr);
             }
 
@@ -1343,8 +1336,47 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             PROCTAB[idx].frame_count = 0;
         }
 
-        // 3. Allocate new frame slots
-        let estimated_frames = 40; // ELF + rtld + stack + initrd + boot_info + margin
+        // 3. Compute layout and allocate new frame slots based on actual ELF page counts
+        let elf_pages = unsafe {
+            salty::elf_loader::elf_count_load_pages(elf_entry.data, elf_entry.data_len)
+        };
+        let elf_span = unsafe {
+            salty::elf_loader::elf_compute_load_span(elf_entry.data, elf_entry.data_len)
+        };
+        let rtld_pages = if is_dynamic {
+            unsafe { spawn_tx::count_rtld_pages_for_exec(
+                elf_entry.data, elf_entry.data_len, initrd, initrd_size,
+            ) }
+        } else {
+            0
+        };
+        let rtld_span = if is_dynamic {
+            unsafe { spawn_tx::count_rtld_span_for_exec(
+                elf_entry.data, elf_entry.data_len, initrd, initrd_size,
+            ) }
+        } else {
+            0
+        };
+        // Parse DT_NEEDED for selective shared lib mapping
+        let needed = if is_dynamic {
+            unsafe { salty::elf_dynamic::elf_get_needed(elf_entry.data, elf_entry.data_len) }
+        } else {
+            salty::elf_dynamic::NeededLibs::new()
+        };
+        let shared_lib_cache_pages = spawn_tx::shared_lib_va_pages_for_needed(&needed);
+        let layout = layout::compute_vm_layout(
+            elf_span,
+            rtld_span,
+            shared_lib_cache_pages,
+            is_dynamic,
+            initrd_size,
+        );
+        if layout.stack_top == 0 {
+            puts(b"[PROCMGR] EXEC: ELF too large for VA layout\n");
+            reply.label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+        let estimated_frames = elf_pages + rtld_pages + layout.stack.page_count() + 6;
         let (frame_base, frame_count) = match alloc.alloc_slots(estimated_frames) {
             Some(pair) => pair,
             None => {
@@ -1402,7 +1434,7 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         let mut elf_result = ElfLoadResult { entry: 0, base: 0, brk: 0 };
         let err = salty::elf_loader::elf_load(
             elf_entry.data, elf_entry.data_len,
-            CHILD_CODE_VADDR, &mut loader_ctx, &raw mut elf_result,
+            layout.elf_code.base, &mut loader_ctx, &raw mut elf_result,
         );
         if err != 0 || exec_ctx.error != 0 {
             let mut lb = LineBuf::new();
@@ -1417,7 +1449,7 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         // 4b. Load rtld if dynamic
         let mut rtld_result = ElfLoadResult { entry: 0, base: 0, brk: 0 };
         if is_dynamic {
-            match spawn_tx::load_rtld(elf_entry.data, elf_entry.data_len, initrd, initrd_size, &mut loader_ctx) {
+            match spawn_tx::load_rtld(elf_entry.data, elf_entry.data_len, initrd, initrd_size, &mut loader_ctx, layout.rtld.base) {
                 Some(r) => rtld_result = r,
                 None => {
                     alloc.free_slots(frame_base, frame_count);
@@ -1433,7 +1465,8 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         }
 
         // 5. Set up new stack
-        for pg in 0..CHILD_STACK_PAGES {
+        let stack_pages = layout.stack.page_count();
+        for pg in 0..stack_pages {
             if next_frame >= frame_limit {
                 puts(b"[PROCMGR] EXEC: stack frame slot overflow\n");
                 alloc.free_slots(frame_base, frame_count);
@@ -1449,7 +1482,7 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                 return;
             }
             let err = salty::invoke::vspace_map(
-                proc_vs, fr, CHILD_STACK_VADDR + pg as u64 * 4096,
+                proc_vs, fr, layout.stack.base + pg as u64 * 4096,
                 VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
             );
             if err != 0 {
@@ -1468,11 +1501,11 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             for pg in 0..initrd_pages {
                 let err = salty::invoke::vspace_map_device(
                     proc_vs, CAP_INITRD_UNTYPED, (pg as u64) * 4096,
-                    CHILD_INITRD_VADDR + pg as u64 * 4096, VSPACE_FLAG_USER,
+                    layout.initrd.base + pg as u64 * 4096, VSPACE_FLAG_USER,
                 );
                 if err != 0 {
                     for mapped_pg in 0..pg {
-                        salty::invoke::vspace_unmap(proc_vs, CHILD_INITRD_VADDR + mapped_pg as u64 * 4096);
+                        salty::invoke::vspace_unmap(proc_vs, layout.initrd.base + mapped_pg as u64 * 4096);
                     }
                     mapped_device = false;
                     break;
@@ -1507,7 +1540,7 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                     for i in 0..copy_len { core::ptr::write_volatile(scratch.add(i), *src.add(i)); }
                     for i in copy_len..4096 { core::ptr::write_volatile(scratch.add(i), 0); }
                     salty::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
-                    let err = salty::invoke::vspace_map(proc_vs, fr, CHILD_INITRD_VADDR + pg as u64 * 4096, VSPACE_FLAG_USER);
+                    let err = salty::invoke::vspace_map(proc_vs, fr, layout.initrd.base + pg as u64 * 4096, VSPACE_FLAG_USER);
                     if err != 0 {
                         alloc.free_slots(frame_base, frame_count);
                         reply.label = SALTY_OUT_OF_MEMORY;
@@ -1548,15 +1581,15 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         }
 
         // 7. Map shared library RO frames if available
-        let (shared_lib_base, _shared_lib_ro_pages) = if is_dynamic {
-            spawn_tx::map_shared_lib_to_vspace(proc_vs, rtld_result.base)
+        let (shared_lib_base, shared_lib_map) = if is_dynamic {
+            unsafe { spawn_tx::map_shared_lib_to_vspace(proc_vs, layout.shared_libs.base, &needed) }
         } else {
-            (0, 0)
+            (0, proc_table::ProcLibMap::zeroed())
         };
 
         // 8. Entry point and dynamic stack
         let mut new_entry = elf_result.entry;
-        let mut new_rsp = CHILD_STACK_TOP;
+        let mut new_rsp = layout.stack_top;
 
         if is_dynamic {
             match spawn_tx::write_dynamic_stack(
@@ -1564,6 +1597,10 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                 stk_frame, &elf_result, &rtld_result, initrd_size,
                 shared_lib_base,
                 argc, envc, &exec_str_data, exec_str_len,
+                layout.elf_code.base,
+                layout.scratch.base,
+                layout.initrd.base,
+                layout.stack_top,
             ) {
                 Ok(rsp) => { new_rsp = rsp; new_entry = rtld_result.entry; }
                 Err(()) => {
@@ -1577,6 +1614,9 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             match spawn_tx::write_static_stack(
                 stk_frame,
                 argc, envc, &exec_str_data, exec_str_len,
+                layout.scratch.base,
+                layout.initrd.base,
+                layout.stack_top,
             ) {
                 Ok(rsp) => { new_rsp = rsp; }
                 Err(()) => {
@@ -1604,7 +1644,7 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             reply.label = SALTY_INVALID_ARGUMENT;
             return;
         }
-        salty::invoke::tcb_set_ipc_buffer(PROCTAB[idx].tcb_cap, CHILD_IPC_BUF_VADDR);
+        salty::invoke::tcb_set_ipc_buffer(PROCTAB[idx].tcb_cap, layout.ipc_buf.base);
 
         let err = salty::invoke::tcb_resume(PROCTAB[idx].tcb_cap);
         if err != 0 {
@@ -1618,6 +1658,8 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         PROCTAB[idx].frame_base = frame_base;
         PROCTAB[idx].frame_count = frame_count as u16;
         PROCTAB[idx].shared_lib_base = shared_lib_base;
+        PROCTAB[idx].lib_map = shared_lib_map;
+        PROCTAB[idx].layout = layout;
 
         { let mut lb = LineBuf::new();
         lb.str(b"[PROCMGR] EXEC: PID="); lb.hex(PROCTAB[idx].pid as u64);

@@ -38,5 +38,9 @@ pub mod pwd_impl;
 pub mod locale;
 pub mod glob_impl;
 pub mod select_impl;
+pub mod math_impl;
+pub mod misc_impl;
+pub mod compat;
+pub mod err_impl;
 
 // Panic handler is provided by libsalty (our dependency)

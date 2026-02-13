@@ -34,14 +34,28 @@ struct lconv {
 extern char        *setlocale(int category, const char *locale);
 extern struct lconv *localeconv(void);
 
-/* gettext stubs */
+/* gettext stubs — guarded so projects can #define them as macros */
+#ifndef textdomain
 extern char *textdomain(const char *domainname);
+#endif
+#ifndef bindtextdomain
 extern char *bindtextdomain(const char *domainname, const char *dirname);
+#endif
+#ifndef gettext
 extern char *gettext(const char *msgid);
+#endif
+#ifndef dgettext
 extern char *dgettext(const char *domainname, const char *msgid);
+#endif
+#ifndef dcgettext
 extern char *dcgettext(const char *domainname, const char *msgid, int category);
+#endif
+#ifndef ngettext
 extern char *ngettext(const char *msgid1, const char *msgid2, unsigned long n);
+#endif
+#ifndef dngettext
 extern char *dngettext(const char *domainname, const char *msgid1,
                        const char *msgid2, unsigned long n);
+#endif
 
 #endif /* __LOCALE_H__ */

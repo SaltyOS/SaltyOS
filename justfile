@@ -290,6 +290,28 @@ loc:
     @find kernel boot userland lib -name "*.rs" -o -name "*.c" -o -name "*.h" -o -name "*.asm" 2>/dev/null | xargs wc -l | tail -1
 
 # =============================================================================
+# Ports
+# =============================================================================
+
+# Build a specific port
+port NAME: build
+    {{builddir}}/tools/portbuild/portbuild build ports/{{NAME}} -o {{builddir}}/ports -b {{builddir}} -v
+
+# Fetch all port sources
+fetch-ports:
+    {{builddir}}/tools/portbuild/portbuild fetch ports/bash -b {{builddir}}
+    {{builddir}}/tools/portbuild/portbuild fetch ports/coreutils -b {{builddir}}
+
+# Clean port build artifacts
+clean-ports:
+    {{builddir}}/tools/portbuild/portbuild clean ports/bash
+    {{builddir}}/tools/portbuild/portbuild clean ports/coreutils
+
+# Show port info
+port-info NAME:
+    {{builddir}}/tools/portbuild/portbuild info ports/{{NAME}}
+
+# =============================================================================
 # Development Helpers
 # =============================================================================
 

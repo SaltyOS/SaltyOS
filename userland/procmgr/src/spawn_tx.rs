@@ -51,15 +51,8 @@ const VSPACE_FLAG_EXECUTABLE: u64 = salty::VSPACE_FLAG_EXECUTABLE;
 const CAP_RIGHTS_ALL: u64 = salty::CAP_RIGHTS_ALL;
 const INITRD_COPY_RIGHTS: u64 = (1 << 0) | (1 << 2) | (1 << 3);
 
-// Re-use parent module's layout constants
-const CHILD_CODE_VADDR: u64 = super::CHILD_CODE_VADDR;
-const CHILD_STACK_VADDR: u64 = super::CHILD_STACK_VADDR;
-const CHILD_STACK_PAGES: usize = super::CHILD_STACK_PAGES;
-const CHILD_STACK_TOP: u64 = super::CHILD_STACK_TOP;
-const CHILD_IPC_BUF_VADDR: u64 = super::CHILD_IPC_BUF_VADDR;
-const CHILD_RTLD_VADDR: u64 = super::CHILD_RTLD_VADDR;
-const CHILD_INITRD_VADDR: u64 = super::CHILD_INITRD_VADDR;
-const CHILD_SCRATCH_VADDR: u64 = super::CHILD_SCRATCH_VADDR;
+use salty::layout::{self, VmRegion, VmLayoutPlan, CHILD_STACK_PAGES};
+
 const CHILD_RTLD_FRAME_SLOT_START: u64 = super::CHILD_RTLD_FRAME_SLOT_START;
 const PROCMGR_SCRATCH_VADDR: u64 = super::PROCMGR_SCRATCH_VADDR;
 
@@ -99,27 +92,52 @@ const UT_MIRROR_COUNT: Cap = super::UT_MIRROR_COUNT;
 const CHILD_UT_BITS_DEFAULT: u8 = super::CHILD_UT_BITS_DEFAULT;
 const READY_TIMEOUT_NS_DEFAULT: u64 = super::READY_TIMEOUT_NS_DEFAULT;
 
-const PM_SPAWN_FLAG_WAIT_READY: u64 = super::PM_SPAWN_FLAG_WAIT_READY;
-
 // ===========================================================================
 // Shared library physical frame cache
 // ===========================================================================
 
 const MAX_SHARED_LIB_PAGES: usize = 192;
+const MAX_CACHED_LIBS: usize = 4;
+const MAX_LIB_NAME: usize = 24;
 
 /// Well-known CNode slots where init copies shared lib frame caps.
 const CAP_SHARED_LIB_CACHE_BASE: u64 = 0x80;
 
 #[derive(Clone, Copy)]
 struct SharedPage {
+    /// Offset relative to the library's own min_vaddr (NOT cumulative).
     vaddr_offset: u64,
     frame_cap: Cap,
     flags: u64,
 }
 
+#[derive(Clone, Copy)]
+struct CachedLib {
+    name: [u8; MAX_LIB_NAME],
+    name_len: u8,
+    page_start: u16,
+    page_count: u16,
+    /// Full VA span of the library (including RW segments), page-aligned.
+    lib_span: u64,
+}
+
+impl CachedLib {
+    const fn zeroed() -> Self {
+        CachedLib {
+            name: [0u8; MAX_LIB_NAME],
+            name_len: 0,
+            page_start: 0,
+            page_count: 0,
+            lib_span: 0,
+        }
+    }
+}
+
 struct SharedLibCache {
     initialized: bool,
     page_count: usize,
+    lib_count: usize,
+    libs: [CachedLib; MAX_CACHED_LIBS],
     pages: [SharedPage; MAX_SHARED_LIB_PAGES],
 }
 
@@ -128,6 +146,8 @@ impl SharedLibCache {
         SharedLibCache {
             initialized: false,
             page_count: 0,
+            lib_count: 0,
+            libs: [CachedLib::zeroed(); MAX_CACHED_LIBS],
             pages: [SharedPage { vaddr_offset: 0, frame_cap: 0, flags: 0 }; MAX_SHARED_LIB_PAGES],
         }
     }
@@ -136,23 +156,38 @@ impl SharedLibCache {
 static mut SHARED_LIB_CACHE: SharedLibCache = SharedLibCache::new();
 
 /// Check if a virtual address falls within the shared library cache's RO pages
-/// and return the cached frame cap + flags if so.
+/// for a specific process's library mapping, returning the cached frame cap + flags.
 ///
 /// # Safety
 /// Caller must ensure `SHARED_LIB_CACHE` is not being concurrently modified.
-pub(crate) unsafe fn lookup_shared_lib_page(vaddr: u64, lib_base: u64) -> Option<(Cap, u64)> {
+pub(crate) unsafe fn lookup_shared_lib_page(
+    vaddr: u64,
+    lib_map: &proc_table::ProcLibMap,
+) -> Option<(Cap, u64)> {
     unsafe {
         let cache = &*(&raw const SHARED_LIB_CACHE);
-        if !cache.initialized || cache.page_count == 0 || lib_base == 0 {
+        if !cache.initialized || lib_map.count == 0 {
             return None;
         }
-        if vaddr < lib_base {
-            return None;
-        }
-        let offset = vaddr - lib_base;
-        for i in 0..cache.page_count {
-            if cache.pages[i].vaddr_offset == offset {
-                return Some((cache.pages[i].frame_cap, cache.pages[i].flags));
+
+        // Check each mapped library
+        for mi in 0..lib_map.count as usize {
+            let li = lib_map.lib_idx[mi] as usize;
+            let mapped_base = lib_map.base[mi];
+            if li >= cache.lib_count {
+                continue;
+            }
+            let cl = &cache.libs[li];
+            if vaddr < mapped_base || vaddr >= mapped_base + cl.lib_span {
+                continue;
+            }
+            let offset = vaddr - mapped_base;
+            let ps = cl.page_start as usize;
+            let pc = cl.page_count as usize;
+            for pi in 0..pc {
+                if cache.pages[ps + pi].vaddr_offset == offset {
+                    return Some((cache.pages[ps + pi].frame_cap, cache.pages[ps + pi].flags));
+                }
             }
         }
         None
@@ -165,40 +200,181 @@ pub(crate) unsafe fn lookup_shared_lib_page(vaddr: u64, lib_base: u64) -> Option
 
 struct SpawnPlan {
     is_dynamic: bool,
-    wait_ready: bool,
+    readiness_mode: u64,
     ready_timeout_ns: u64,
     child_ut_bits: u8,
     total_slots: usize,
     is_display: bool,
     lib_window_pages: usize,
+    layout: VmLayoutPlan,
 }
 
-/// Estimate total slots needed for a spawn.
-fn estimate_slots(is_dynamic: bool) -> usize {
-    // Fixed objects: TCB, VSpace, CNode, SC, stack_frame, ipc_frame,
-    //   signal_ntfn, child_ut, ready_ntfn
-    let mut count = OFF_FIXED_END;
-
-    // Extra stack frames (4 pages total, 1 is at OFF_STACK_FR)
-    count += CHILD_STACK_PAGES - 1;
-
-    // ELF pages (estimate: ~10 for main binary)
-    count += 10;
-
-    if is_dynamic {
-        // rtld pages (~5)
-        count += 5;
-        // Boot info frame
-        count += 1;
-        // Initrd mapping: usually device-map (0 frames),
-        // but reserve a few for copy fallback
-        count += 4;
+/// Compute total slots needed for a spawn using actual page counts.
+fn compute_slot_budget(
+    elf_pages: usize,
+    rtld_pages: usize,
+    stack_pages: usize,
+    map_initrd: bool,
+    readiness_mode: u64,
+) -> usize {
+    let mut count = OFF_FIXED_END; // 9 fixed objects
+    count += stack_pages - 1;      // extra stack frames (1 is at OFF_STACK_FR)
+    count += elf_pages;            // actual ELF pages
+    count += rtld_pages;           // actual RTLD pages (0 if static)
+    if rtld_pages > 0 {
+        count += 1;                // boot_info frame
     }
-
-    // Margin for alignment/extras
-    count += 4;
-
+    if map_initrd {
+        count += 4;                // initrd copy fallback frames
+    }
+    // OFF_READY_NTFN slot is reserved in fixed layout regardless
+    let _ = readiness_mode;
+    count += 6;                    // margin for alignment/extras
     count
+}
+
+/// Count RTLD pages for use from exec path.
+///
+/// # Safety
+/// All pointers must be valid for their declared lengths.
+pub(crate) unsafe fn count_rtld_pages_for_exec(
+    elf_data: *const u8,
+    elf_data_len: usize,
+    initrd: *const u8,
+    initrd_size: usize,
+) -> usize {
+    unsafe { count_rtld_pages(elf_data, elf_data_len, initrd, initrd_size) }
+}
+
+/// Count RTLD VA span for use from exec path.
+///
+/// # Safety
+/// All pointers must be valid for their declared lengths.
+pub(crate) unsafe fn count_rtld_span_for_exec(
+    elf_data: *const u8,
+    elf_data_len: usize,
+    initrd: *const u8,
+    initrd_size: usize,
+) -> u64 {
+    unsafe { count_rtld_span(elf_data, elf_data_len, initrd, initrd_size) }
+}
+
+/// Count RTLD VA span by looking up the interpreter in the initrd.
+///
+/// # Safety
+/// All pointers must be valid for their declared lengths.
+unsafe fn count_rtld_span(
+    elf_data: *const u8,
+    elf_data_len: usize,
+    initrd: *const u8,
+    initrd_size: usize,
+) -> u64 {
+    unsafe {
+        let mut rtld_name = b"ld-salty.so".as_ptr();
+        let mut rtld_name_len = 10usize;
+
+        let interp = salty::elf_dynamic::elf_get_interp(elf_data, elf_data_len);
+        if !interp.is_null() && *interp != 0 {
+            let mut last = interp;
+            let mut p = interp;
+            while *p != 0 {
+                if *p == b'/' { last = p.add(1); }
+                p = p.add(1);
+            }
+            if *last != 0 {
+                rtld_name = last;
+                rtld_name_len = strlen(last);
+            }
+        }
+
+        let mut rtld_entry = CpioEntry::zeroed();
+        if salty::cpio::cpio_find_file(
+            initrd, initrd_size, rtld_name, rtld_name_len, &raw mut rtld_entry,
+        ) == 0
+        {
+            return 5 * 4096; // fallback estimate
+        }
+
+        let span = salty::elf_loader::elf_compute_load_span(
+            rtld_entry.data, rtld_entry.data_len,
+        );
+        if span == 0 { 5 * 4096 } else { span }
+    }
+}
+
+/// Return the total VA pages needed for the specified DT_NEEDED libraries.
+/// Accounts for full library spans (including RW segments) plus inter-lib gaps.
+pub(crate) fn shared_lib_va_pages_for_needed(
+    needed: &salty::elf_dynamic::NeededLibs,
+) -> usize {
+    unsafe {
+        let cache = &*(&raw const SHARED_LIB_CACHE);
+        if !cache.initialized || needed.count == 0 {
+            return 0;
+        }
+        let mut total_bytes: u64 = 0;
+        for ni in 0..needed.count {
+            let name = &needed.names[ni][..needed.name_lens[ni]];
+            for li in 0..cache.lib_count {
+                let cl = &cache.libs[li];
+                let cl_name = &cl.name[..cl.name_len as usize];
+                if cl_name.len() == name.len() {
+                    let mut eq = true;
+                    for k in 0..name.len() {
+                        if cl_name[k] != name[k] { eq = false; break; }
+                    }
+                    if eq {
+                        total_bytes += cl.lib_span + 4096; // span + gap
+                        break;
+                    }
+                }
+            }
+        }
+        ((total_bytes + 0xFFF) / 0x1000) as usize
+    }
+}
+
+/// Count RTLD pages by looking up the interpreter in the initrd.
+///
+/// # Safety
+/// All pointers must be valid for their declared lengths.
+unsafe fn count_rtld_pages(
+    elf_data: *const u8,
+    elf_data_len: usize,
+    initrd: *const u8,
+    initrd_size: usize,
+) -> usize {
+    unsafe {
+        let mut rtld_name = b"ld-salty.so".as_ptr();
+        let mut rtld_name_len = 10usize;
+
+        let interp = salty::elf_dynamic::elf_get_interp(elf_data, elf_data_len);
+        if !interp.is_null() && *interp != 0 {
+            let mut last = interp;
+            let mut p = interp;
+            while *p != 0 {
+                if *p == b'/' { last = p.add(1); }
+                p = p.add(1);
+            }
+            if *last != 0 {
+                rtld_name = last;
+                rtld_name_len = strlen(last);
+            }
+        }
+
+        let mut rtld_entry = CpioEntry::zeroed();
+        if salty::cpio::cpio_find_file(
+            initrd, initrd_size, rtld_name, rtld_name_len, &raw mut rtld_entry,
+        ) == 0
+        {
+            return 5; // fallback estimate if rtld not found
+        }
+
+        let pages = salty::elf_loader::elf_count_load_pages(
+            rtld_entry.data, rtld_entry.data_len,
+        );
+        if pages == 0 { 5 } else { pages }
+    }
 }
 
 // ===========================================================================
@@ -222,194 +398,6 @@ unsafe extern "C" fn spawn_alloc_frame(opaque: *mut u8) -> Cap {
             }
         }
     }
-}
-
-// ===========================================================================
-// Service profile lookup
-// ===========================================================================
-
-fn ascii_lower(b: u8) -> u8 {
-    if b >= b'A' && b <= b'Z' { b + 32 } else { b }
-}
-
-fn bytes_eq_ci(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    for i in 0..a.len() {
-        if ascii_lower(a[i]) != ascii_lower(b[i]) {
-            return false;
-        }
-    }
-    true
-}
-
-fn trim_ascii(mut s: &[u8]) -> &[u8] {
-    while !s.is_empty() && (s[0] == b' ' || s[0] == b'\t' || s[0] == b'\r') {
-        s = &s[1..];
-    }
-    while !s.is_empty() {
-        let c = s[s.len() - 1];
-        if c == b' ' || c == b'\t' || c == b'\r' {
-            s = &s[..s.len() - 1];
-        } else {
-            break;
-        }
-    }
-    s
-}
-
-fn parse_decimal_u64(data: &[u8]) -> u64 {
-    let mut val: u64 = 0;
-    for &b in data {
-        if b >= b'0' && b <= b'9' {
-            val = val.wrapping_mul(10).wrapping_add((b - b'0') as u64);
-        } else {
-            break;
-        }
-    }
-    val
-}
-
-fn parse_duration_ns(data: &[u8]) -> u64 {
-    let v = trim_ascii(data);
-    if v.is_empty() {
-        return 0;
-    }
-    if bytes_eq_ci(v, b"infinity") {
-        return 0;
-    }
-
-    let mut num_end = 0usize;
-    while num_end < v.len() && v[num_end] >= b'0' && v[num_end] <= b'9' {
-        num_end += 1;
-    }
-    if num_end == 0 {
-        return 0;
-    }
-
-    let n = parse_decimal_u64(&v[..num_end]);
-    let unit = trim_ascii(&v[num_end..]);
-    let scale = if unit.is_empty()
-        || bytes_eq_ci(unit, b"s")
-        || bytes_eq_ci(unit, b"sec")
-        || bytes_eq_ci(unit, b"secs")
-        || bytes_eq_ci(unit, b"second")
-        || bytes_eq_ci(unit, b"seconds")
-    {
-        1_000_000_000u64
-    } else if bytes_eq_ci(unit, b"ms")
-        || bytes_eq_ci(unit, b"msec")
-        || bytes_eq_ci(unit, b"msecs")
-    {
-        1_000_000u64
-    } else if bytes_eq_ci(unit, b"us")
-        || bytes_eq_ci(unit, b"usec")
-        || bytes_eq_ci(unit, b"usecs")
-    {
-        1_000u64
-    } else if bytes_eq_ci(unit, b"m")
-        || bytes_eq_ci(unit, b"min")
-        || bytes_eq_ci(unit, b"mins")
-        || bytes_eq_ci(unit, b"minute")
-        || bytes_eq_ci(unit, b"minutes")
-    {
-        60 * 1_000_000_000u64
-    } else if bytes_eq_ci(unit, b"h")
-        || bytes_eq_ci(unit, b"hr")
-        || bytes_eq_ci(unit, b"hrs")
-        || bytes_eq_ci(unit, b"hour")
-        || bytes_eq_ci(unit, b"hours")
-    {
-        60 * 60 * 1_000_000_000u64
-    } else {
-        1_000_000_000u64
-    };
-
-    n.saturating_mul(scale)
-}
-
-/// Look up startup profile values from a `.service` file in the initrd.
-/// Returns `(memory_kb, timeout_start_ns)`; each value is 0 when unspecified.
-unsafe fn lookup_service_profile(
-    initrd: *const u8,
-    initrd_size: usize,
-    elf_name: &[u8],
-    elf_name_len: usize,
-) -> (u16, u64) {
-    unsafe {
-        // Convert "foo.elf" → "services/foo.service"
-        let mut svc_path = [0u8; 64];
-        let prefix = b"services/";
-        let mut pos = 0usize;
-        for &b in prefix { svc_path[pos] = b; pos += 1; }
-
-        // Copy base name without .elf extension
-        let base_len = if elf_name_len > 4 { elf_name_len - 4 } else { elf_name_len };
-        for i in 0..base_len {
-            if pos >= 60 { return (0, 0); }
-            svc_path[pos] = elf_name[i];
-            pos += 1;
-        }
-        let suffix = b".service";
-        for &b in suffix { svc_path[pos] = b; pos += 1; }
-        svc_path[pos] = 0;
-
-        let mut entry = CpioEntry::zeroed();
-        if salty::cpio::cpio_find_file(initrd, initrd_size, svc_path.as_ptr(), pos, &raw mut entry) == 0 {
-            return (0, 0);
-        }
-
-        let data = core::slice::from_raw_parts(entry.data, entry.data_len);
-        let mut memory_kb: u16 = 0;
-        let mut timeout_start_ns: u64 = 0;
-
-        let mut line_start = 0usize;
-        while line_start < data.len() {
-            let mut line_end = line_start;
-            while line_end < data.len() && data[line_end] != b'\n' {
-                line_end += 1;
-            }
-            let line = trim_ascii(&data[line_start..line_end]);
-
-            if !line.is_empty() && line[0] != b'#' && line[0] != b';' {
-                let mut eq = 0usize;
-                let mut found_eq = false;
-                while eq < line.len() {
-                    if line[eq] == b'=' {
-                        found_eq = true;
-                        break;
-                    }
-                    eq += 1;
-                }
-                if found_eq {
-                    let key = trim_ascii(&line[..eq]);
-                    let value = trim_ascii(&line[eq + 1..]);
-                    if bytes_eq_ci(key, b"MemoryKB") {
-                        let parsed = parse_decimal_u64(value);
-                        memory_kb = if parsed > u16::MAX as u64 { u16::MAX } else { parsed as u16 };
-                    } else if bytes_eq_ci(key, b"TimeoutStartSec")
-                        || bytes_eq_ci(key, b"TimeoutSec")
-                    {
-                        timeout_start_ns = parse_duration_ns(value);
-                    }
-                }
-            }
-
-            line_start = line_end + 1;
-        }
-
-        (memory_kb, timeout_start_ns)
-    }
-}
-
-/// Convert MemoryKB to untyped size_bits: smallest power-of-2 >= kb*1024.
-fn memory_kb_to_ut_bits(kb: u16) -> u8 {
-    if kb == 0 { return CHILD_UT_BITS_DEFAULT; }
-    let bytes = (kb as u32) * 1024;
-    let mut bits: u8 = 12;
-    while (1u32 << bits) < bytes && bits < 28 { bits += 1; }
-    bits
 }
 
 fn compute_ready_timeout_ns(
@@ -501,16 +489,19 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
 
         // Check if init passed us inherited frame caps.
         // Probe the first slot — if it contains a valid cap, init pre-loaded the cache.
-        let has_inherited = try_inherit_shared_lib_cache(cache, initrd, initrd_size);
+        let has_inherited = try_inherit_shared_lib_cache(cache, initrd, initrd_size, alloc);
         if has_inherited {
             return;
         }
 
         // Fallback: build cache ourselves by parsing ELF and allocating frames
         let libs: [&[u8]; 2] = [b"libsalty.so", b"libc.so"];
-        let mut cumulative_base: u64 = 0;
 
         for lib_name in &libs {
+            if cache.lib_count >= MAX_CACHED_LIBS {
+                break;
+            }
+
             let mut entry = CpioEntry::zeroed();
             if salty::cpio::cpio_find_file(
                 initrd, initrd_size, lib_name.as_ptr(), lib_name.len(), &raw mut entry,
@@ -534,15 +525,29 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
 
             let phdrs = entry.data.add(ehdr.e_phoff as usize) as *const Elf64Phdr;
             let mut min_vaddr: u64 = u64::MAX;
+            let mut max_seg_end: u64 = 0;
             for i in 0..ehdr.e_phnum as usize {
                 let ph = &*phdrs.add(i);
-                if ph.p_type == salty::PT_LOAD && ph.p_vaddr < min_vaddr {
-                    min_vaddr = ph.p_vaddr;
+                if ph.p_type == salty::PT_LOAD {
+                    if ph.p_vaddr < min_vaddr { min_vaddr = ph.p_vaddr; }
+                    let se = (ph.p_vaddr + ph.p_memsz + 0xFFF) & !0xFFFu64;
+                    if se > max_seg_end { max_seg_end = se; }
                 }
             }
             if min_vaddr == u64::MAX {
                 continue;
             }
+            let lib_span = max_seg_end - (min_vaddr & !0xFFFu64);
+
+            let li = cache.lib_count;
+            let page_start = cache.page_count as u16;
+            let mut lib_entry = CachedLib::zeroed();
+            let copy_len = if lib_name.len() > MAX_LIB_NAME { MAX_LIB_NAME } else { lib_name.len() };
+            for j in 0..copy_len {
+                lib_entry.name[j] = lib_name[j];
+            }
+            lib_entry.name_len = copy_len as u8;
+            lib_entry.lib_span = lib_span;
 
             for i in 0..ehdr.e_phnum as usize {
                 let ph = &*phdrs.add(i);
@@ -576,7 +581,6 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
                     let err = alloc.retype_any(OBJ_FRAME, 0, slot);
                     if err != 0 {
                         alloc.free_single_slot(slot);
-                        // Partial cache is still usable
                         break;
                     }
 
@@ -615,7 +619,7 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
                     salty::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
 
                     cache.pages[cache.page_count] = SharedPage {
-                        vaddr_offset: cumulative_base + (page - min_vaddr),
+                        vaddr_offset: page - min_vaddr,
                         frame_cap: slot,
                         flags,
                     };
@@ -623,7 +627,11 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
                     page += 4096;
                 }
             }
-            cumulative_base += 0x80000;
+
+            lib_entry.page_start = page_start;
+            lib_entry.page_count = (cache.page_count as u16) - page_start;
+            cache.libs[li] = lib_entry;
+            cache.lib_count += 1;
         }
 
         if cache.page_count > 0 {
@@ -647,6 +655,7 @@ unsafe fn try_inherit_shared_lib_cache(
     cache: &mut SharedLibCache,
     initrd: *const u8,
     initrd_size: usize,
+    alloc: &mut Allocator,
 ) -> bool {
     unsafe {
         // Probe the first inherited slot to check if init passed us caps.
@@ -664,12 +673,22 @@ unsafe fn try_inherit_shared_lib_cache(
 
         puts(b"[PROCMGR] inherited shared lib caps from init\n");
 
+        // Reserve the entire inherited shared-lib slot namespace in allocator
+        // so transactional reservations never overlap these pre-existing caps.
+        for i in 0..MAX_SHARED_LIB_PAGES {
+            let cap_slot = CAP_SHARED_LIB_CACHE_BASE + i as u64;
+            alloc.mark_slot_used(cap_slot);
+        }
+
         // Walk both libraries in the same order as init's cache builder.
         let libs: [&[u8]; 2] = [b"libsalty.so", b"libc.so"];
         let mut inherited_idx: usize = 0;
-        let mut cumulative_base: u64 = 0;
 
         for lib_name in &libs {
+            if cache.lib_count >= MAX_CACHED_LIBS {
+                break;
+            }
+
             let mut entry = CpioEntry::zeroed();
             if salty::cpio::cpio_find_file(
                 initrd, initrd_size, lib_name.as_ptr(), lib_name.len(), &raw mut entry,
@@ -693,15 +712,29 @@ unsafe fn try_inherit_shared_lib_cache(
 
             let phdrs = entry.data.add(ehdr.e_phoff as usize) as *const Elf64Phdr;
             let mut min_vaddr: u64 = u64::MAX;
+            let mut max_seg_end: u64 = 0;
             for i in 0..ehdr.e_phnum as usize {
                 let ph = &*phdrs.add(i);
-                if ph.p_type == salty::PT_LOAD && ph.p_vaddr < min_vaddr {
-                    min_vaddr = ph.p_vaddr;
+                if ph.p_type == salty::PT_LOAD {
+                    if ph.p_vaddr < min_vaddr { min_vaddr = ph.p_vaddr; }
+                    let se = (ph.p_vaddr + ph.p_memsz + 0xFFF) & !0xFFFu64;
+                    if se > max_seg_end { max_seg_end = se; }
                 }
             }
             if min_vaddr == u64::MAX {
                 continue;
             }
+            let lib_span = max_seg_end - (min_vaddr & !0xFFFu64);
+
+            let li = cache.lib_count;
+            let page_start = cache.page_count as u16;
+            let mut lib_entry = CachedLib::zeroed();
+            let copy_len = if lib_name.len() > MAX_LIB_NAME { MAX_LIB_NAME } else { lib_name.len() };
+            for j in 0..copy_len {
+                lib_entry.name[j] = lib_name[j];
+            }
+            lib_entry.name_len = copy_len as u8;
+            lib_entry.lib_span = lib_span;
 
             for i in 0..ehdr.e_phnum as usize {
                 let ph = &*phdrs.add(i);
@@ -730,7 +763,7 @@ unsafe fn try_inherit_shared_lib_cache(
                     let cap_slot = CAP_SHARED_LIB_CACHE_BASE + inherited_idx as u64;
 
                     cache.pages[cache.page_count] = SharedPage {
-                        vaddr_offset: cumulative_base + (page - min_vaddr),
+                        vaddr_offset: page - min_vaddr,
                         frame_cap: cap_slot,
                         flags,
                     };
@@ -739,7 +772,11 @@ unsafe fn try_inherit_shared_lib_cache(
                     page += 4096;
                 }
             }
-            cumulative_base += 0x80000;
+
+            lib_entry.page_start = page_start;
+            lib_entry.page_count = (cache.page_count as u16) - page_start;
+            cache.libs[li] = lib_entry;
+            cache.lib_count += 1;
         }
 
         if cache.page_count > 0 {
@@ -756,44 +793,96 @@ unsafe fn try_inherit_shared_lib_cache(
     }
 }
 
-/// Map cached shared library RO frames into a child VSpace.
-/// Returns (lib_load_addr, ro_page_count) on success, (0, 0) on failure.
+/// Map cached shared library RO frames into a child VSpace, mapping only
+/// libraries listed in `needed` in their DT_NEEDED order.
+/// `shared_lib_base_vaddr` is the layout-computed VA where libs start.
+/// Returns (lib_load_addr, ProcLibMap) on success, (0, empty) on failure.
 pub(crate) unsafe fn map_shared_lib_to_vspace(
     child_vs: Cap,
-    rtld_base: u64,
-) -> (u64, u64) {
+    shared_lib_base_vaddr: u64,
+    needed: &salty::elf_dynamic::NeededLibs,
+) -> (u64, proc_table::ProcLibMap) {
+    let empty = proc_table::ProcLibMap::zeroed();
     unsafe {
         let cache = &*(&raw const SHARED_LIB_CACHE);
-        if !cache.initialized || cache.page_count == 0 {
-            return (0, 0);
+        if !cache.initialized || cache.page_count == 0 || shared_lib_base_vaddr == 0 {
+            return (0, empty);
+        }
+        if needed.count == 0 {
+            return (0, empty);
         }
 
-        let lib_load_addr = rtld_base + 0x80000;
+        let mut lib_map = proc_table::ProcLibMap::zeroed();
+        let mut running_base = shared_lib_base_vaddr;
 
-        for i in 0..cache.page_count {
-            let page = &cache.pages[i];
-            let vaddr = lib_load_addr + page.vaddr_offset;
-            let err = salty::invoke::vspace_map(
-                child_vs, page.frame_cap, vaddr, page.flags,
-            );
-            if err != 0 {
-                // Rollback already-mapped pages
+        // Map libraries in DT_NEEDED order
+        for ni in 0..needed.count {
+            let name = &needed.names[ni][..needed.name_lens[ni]];
+
+            // Find this library in the cache
+            let mut found = false;
+            for li in 0..cache.lib_count {
+                let cl = &cache.libs[li];
+                let cl_name = &cl.name[..cl.name_len as usize];
+                if cl_name.len() != name.len() {
+                    continue;
+                }
+                let mut eq = true;
+                for k in 0..name.len() {
+                    if cl_name[k] != name[k] {
+                        eq = false;
+                        break;
+                    }
+                }
+                if !eq {
+                    continue;
+                }
+
+                // Record in ProcLibMap
+                if (lib_map.count as usize) < proc_table::MAX_PROC_MAPPED_LIBS {
+                    lib_map.lib_idx[lib_map.count as usize] = li as u8;
+                    lib_map.base[lib_map.count as usize] = running_base;
+                    lib_map.count += 1;
+                }
+
+                // Map this library's RO pages at running_base
+                let ps = cl.page_start as usize;
+                let pc = cl.page_count as usize;
+                for pi in 0..pc {
+                    let page = &cache.pages[ps + pi];
+                    let vaddr = running_base + page.vaddr_offset;
+                    let err = salty::invoke::vspace_map(child_vs, page.frame_cap, vaddr, page.flags);
+                    if err != 0 {
+                        let mut lb = LineBuf::new();
+                        lb.str(b"[PROCMGR] shared lib map failed at ");
+                        lb.hex(vaddr);
+                        lb.str(b" err=");
+                        lb.hex(err as u64);
+                        lb.str(b"\n");
+                        lb.flush();
+                        return (0, empty);
+                    }
+                }
+
+                running_base += cl.lib_span + 4096; // advance past this lib + gap
+                found = true;
+                break;
+            }
+
+            if !found {
                 let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR] shared lib map failed at ");
-                lb.hex(vaddr);
-                lb.str(b" err=");
-                lb.hex(err as u64);
+                lb.str(b"[PROCMGR] shared lib cache miss: ");
+                lb.bytes(name);
                 lb.str(b"\n");
                 lb.flush();
-                for j in 0..i {
-                    let prev_vaddr = lib_load_addr + cache.pages[j].vaddr_offset;
-                    salty::invoke::vspace_unmap(child_vs, prev_vaddr);
-                }
-                return (0, 0);
             }
         }
 
-        (lib_load_addr, cache.page_count as u64)
+        if lib_map.count > 0 {
+            (shared_lib_base_vaddr, lib_map)
+        } else {
+            (0, empty)
+        }
     }
 }
 
@@ -814,6 +903,7 @@ pub(crate) unsafe fn load_rtld(
     initrd: *const u8,
     initrd_size: usize,
     loader_ctx: &mut ElfLoaderCtx,
+    rtld_load_base: u64,
 ) -> Option<ElfLoadResult> {
     unsafe {
         let mut rtld_name = b"ld-salty.so".as_ptr();
@@ -842,7 +932,7 @@ pub(crate) unsafe fn load_rtld(
         let mut rtld_result = ElfLoadResult { entry: 0, base: 0, brk: 0 };
         let err = salty::elf_loader::elf_load(
             rtld_entry.data, rtld_entry.data_len,
-            CHILD_RTLD_VADDR, loader_ctx, &raw mut rtld_result,
+            rtld_load_base, loader_ctx, &raw mut rtld_result,
         );
         if err != 0 {
             let mut lb = LineBuf::new();
@@ -873,6 +963,10 @@ pub(crate) unsafe fn write_dynamic_stack(
     envc: u32,
     str_data: &[u8],
     str_len: usize,
+    elf_load_base: u64,
+    scratch_vaddr: u64,
+    initrd_vaddr: u64,
+    stack_top: u64,
 ) -> Result<u64, ()> {
     unsafe {
         let err = salty::invoke::vspace_map(
@@ -888,7 +982,7 @@ pub(crate) unsafe fn write_dynamic_stack(
         let mut phent: u64 = 0;
         let mut phnum: u64 = 0;
         if salty::elf_dynamic::elf_get_phdr_info(
-            elf_data, elf_data_len, CHILD_CODE_VADDR,
+            elf_data, elf_data_len, elf_load_base,
             &raw mut phdr_vaddr, &raw mut phent, &raw mut phnum,
         ) != 0 {
             puts(b"[PROCMGR] dynamic phdr info extraction failed\n");
@@ -904,6 +998,9 @@ pub(crate) unsafe fn write_dynamic_stack(
             Some((auxv_entries, phdr_vaddr, phent, phnum,
                   elf_result.entry, rtld_result.base,
                   initrd_window_size as u64, shared_lib_base)),
+            scratch_vaddr,
+            initrd_vaddr,
+            stack_top,
         );
 
         salty::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
@@ -918,6 +1015,9 @@ pub(crate) unsafe fn write_static_stack(
     envc: u32,
     str_data: &[u8],
     str_len: usize,
+    scratch_vaddr: u64,
+    initrd_vaddr: u64,
+    stack_top: u64,
 ) -> Result<u64, ()> {
     unsafe {
         let err = salty::invoke::vspace_map(
@@ -929,7 +1029,10 @@ pub(crate) unsafe fn write_static_stack(
             return Err(());
         }
 
-        let rsp = write_stack_with_args(argc, envc, str_data, str_len, None);
+        let rsp = write_stack_with_args(
+            argc, envc, str_data, str_len, None,
+            scratch_vaddr, initrd_vaddr, stack_top,
+        );
 
         salty::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
         Ok(rsp)
@@ -955,11 +1058,14 @@ unsafe fn write_stack_with_args(
     str_data: &[u8],
     str_len: usize,
     auxv_info: Option<(u64, u64, u64, u64, u64, u64, u64, u64)>,
+    scratch_vaddr: u64,
+    initrd_vaddr: u64,
+    stack_top: u64,
 ) -> u64 {
     unsafe {
         let page_base = PROCMGR_SCRATCH_VADDR as *mut u8;
         // The child sees this page at the top of its stack
-        let child_page_base = CHILD_STACK_TOP - 4096;
+        let child_page_base = stack_top - 4096;
 
         // 1. Copy string data to the top of the page
         let str_area_start = 4096 - str_len;
@@ -1050,8 +1156,8 @@ unsafe fn write_stack_with_args(
                 w(AT_PAGESZ);   w(4096);
                 w(AT_SALTY_UNTYPED);    w(CHILD_CAP_UNTYPED);
                 w(AT_SALTY_VSPACE);     w(CHILD_CAP_VSPACE);
-                w(AT_SALTY_SCRATCH);    w(CHILD_SCRATCH_VADDR);
-                w(AT_SALTY_INITRD);     w(CHILD_INITRD_VADDR);
+                w(AT_SALTY_SCRATCH);    w(scratch_vaddr);
+                w(AT_SALTY_INITRD);     w(initrd_vaddr);
                 w(AT_SALTY_INITRD_SZ);  w(initrd_sz);
                 w(AT_SALTY_FRAME_SLOT); w(CHILD_RTLD_FRAME_SLOT_START);
                 if shared_lib != 0 {
@@ -1080,23 +1186,23 @@ pub unsafe fn handle_spawn_tx(
     alloc: &mut Allocator,
 ) {
     unsafe {
-        // Parse message
-        let mut name_reg_idx = 1usize;
-        let mut spawn_flags: u64 = 0;
-        let mut requested_timeout_ns: u64 = 0;
-        let packed_name_words = (msg.regs[0] + 7) / 8;
-        if msg.length >= 3 + packed_name_words {
-            spawn_flags = msg.regs[1];
-            requested_timeout_ns = msg.regs[2];
-            name_reg_idx = 3;
-        } else if msg.length >= 2 + packed_name_words {
-            // Backward-compatible path: flags present, no timeout field.
-            spawn_flags = msg.regs[1];
-            name_reg_idx = 2;
-        }
-        let wait_ready = (spawn_flags & PM_SPAWN_FLAG_WAIT_READY) != 0;
+        // Parse message — new wire format:
+        //   regs[0] = name_len
+        //   regs[1] = spawn_policy bitfield
+        //   regs[2] = timeout_ns
+        //   regs[3] = spawn_flags (reserved)
+        //   regs[4] = reserved
+        //   regs[5..] = name bytes
+        let name_reg_idx = 5usize;
+        let spawn_policy = msg.regs[1];
+        let requested_timeout_ns = msg.regs[2];
+        let readiness_mode = salty::spawn_policy_readiness(spawn_policy);
+        let policy_map_initrd = salty::spawn_policy_map_initrd(spawn_policy);
+        let policy_is_display = salty::spawn_policy_is_display(spawn_policy);
+        let policy_cnode_bits = salty::spawn_policy_cnode_bits(spawn_policy);
+        let policy_memory_kb = salty::spawn_policy_memory_kb(spawn_policy);
         let (name, name_len) = super::extract_name(msg, name_reg_idx);
-        let is_display = super::bytes_eq(&name[..name_len], b"display.elf");
+        let is_display = policy_is_display || super::bytes_eq(&name[..name_len], b"display.elf");
 
         {
             let mut lb = LineBuf::new();
@@ -1127,9 +1233,18 @@ pub unsafe fn handle_spawn_tx(
         }
 
         // ---- PREFLIGHT: Build SpawnPlan ----
-        let (service_kb, service_timeout_ns) =
-            lookup_service_profile(initrd, initrd_size, &name, name_len);
-        let child_ut_bits = memory_kb_to_ut_bits(service_kb);
+        // Memory budget: from spawn_policy (init-derived), or default
+        let child_ut_bits = if policy_memory_kb > 0 {
+            // Convert MemoryKB to untyped size_bits: smallest power-of-2 >= kb*1024
+            let bytes = (policy_memory_kb as u32) * 1024;
+            let mut bits: u8 = 12;
+            while (1u32 << bits) < bytes && bits < 28 { bits += 1; }
+            bits
+        } else {
+            CHILD_UT_BITS_DEFAULT
+        };
+
+        let do_map_initrd = is_dynamic || policy_map_initrd;
 
         let lib_window_pages = if is_dynamic {
             compute_lib_window_pages(initrd, initrd_size)
@@ -1137,32 +1252,75 @@ pub unsafe fn handle_spawn_tx(
             0
         };
 
-        let effective_timeout_ns = compute_ready_timeout_ns(
-            if requested_timeout_ns != 0 {
-                requested_timeout_ns
-            } else {
-                service_timeout_ns
-            },
-            is_dynamic,
-            elf_entry.data_len,
-            lib_window_pages,
-            child_ut_bits,
+        let effective_timeout_ns = if readiness_mode == salty::SPAWN_READY_NOTIFY {
+            compute_ready_timeout_ns(
+                requested_timeout_ns,
+                is_dynamic,
+                elf_entry.data_len,
+                lib_window_pages,
+                child_ut_bits,
+            )
+        } else {
+            0 // IMMEDIATE mode: no timeout needed
+        };
+
+        // Compute actual page counts and spans for dynamic slot budget and layout
+        let elf_pages = salty::elf_loader::elf_count_load_pages(
+            elf_entry.data, elf_entry.data_len,
         );
+        let elf_span = salty::elf_loader::elf_compute_load_span(
+            elf_entry.data, elf_entry.data_len,
+        );
+        let (rtld_pages, rtld_span) = if is_dynamic {
+            let rp = count_rtld_pages(elf_entry.data, elf_entry.data_len, initrd, initrd_size);
+            let rs = count_rtld_span(elf_entry.data, elf_entry.data_len, initrd, initrd_size);
+            (rp, rs)
+        } else {
+            (0, 0)
+        };
+
+        // Parse DT_NEEDED to determine which shared libs this ELF needs
+        let needed = if is_dynamic {
+            salty::elf_dynamic::elf_get_needed(elf_entry.data, elf_entry.data_len)
+        } else {
+            salty::elf_dynamic::NeededLibs::new()
+        };
+
+        let shared_lib_cache_pages = shared_lib_va_pages_for_needed(&needed);
+
+        let layout = layout::compute_vm_layout(
+            elf_span,
+            rtld_span,
+            shared_lib_cache_pages,
+            do_map_initrd,
+            lib_window_pages * 4096,
+        );
+
+        if layout.stack_top == 0 {
+            puts(b"[PROCMGR] ELF too large for VA layout\n");
+            reply.label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
 
         let plan = SpawnPlan {
             is_dynamic,
-            wait_ready,
+            readiness_mode,
             ready_timeout_ns: effective_timeout_ns,
             child_ut_bits,
-            total_slots: estimate_slots(is_dynamic),
+            total_slots: compute_slot_budget(
+                elf_pages, rtld_pages, CHILD_STACK_PAGES,
+                do_map_initrd,
+                readiness_mode,
+            ),
             is_display,
             lib_window_pages,
+            layout,
         };
 
-        if service_kb > 0 {
+        if policy_memory_kb > 0 {
             let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] service profile: MemoryKB=");
-            lb.hex(service_kb as u64);
+            lb.str(b"[PROCMGR] spawn policy: MemoryKB=");
+            lb.hex(policy_memory_kb as u64);
             lb.str(b" ut_bits=");
             lb.hex(plan.child_ut_bits as u64);
             lb.str(b"\n");
@@ -1219,7 +1377,8 @@ pub unsafe fn handle_spawn_tx(
 
         let child_tcb = realize!(OBJ_TCB, 0, OFF_TCB, b"TCB");
         let child_vs = realize!(OBJ_VSPACE, 0, OFF_VSPACE, b"VSpace");
-        let child_cn = realize!(OBJ_CNODE, 0, OFF_CNODE, b"CNode");
+        let cn_size_bits = if policy_cnode_bits > 0 { policy_cnode_bits as u64 } else { 0 };
+        let child_cn = realize!(OBJ_CNODE, cn_size_bits, OFF_CNODE, b"CNode");
         let child_sc = realize!(OBJ_SCHED_CONTEXT, 0, OFF_SC, b"SC");
         let child_stk_fr = realize!(OBJ_FRAME, 0, OFF_STACK_FR, b"stack frame");
         let child_ipc_fr = realize!(OBJ_FRAME, 0, OFF_IPC_FR, b"IPC frame");
@@ -1260,7 +1419,7 @@ pub unsafe fn handle_spawn_tx(
         let child_ut_slot = alloc.reservation_slot(OFF_CHILD_UT);
 
         let child_ready_ntfn;
-        if plan.wait_ready {
+        if plan.readiness_mode == salty::SPAWN_READY_NOTIFY {
             child_ready_ntfn = realize!(OBJ_NOTIFICATION, 0, OFF_READY_NTFN, b"ready ntfn");
         } else {
             child_ready_ntfn = 0;
@@ -1300,7 +1459,7 @@ pub unsafe fn handle_spawn_tx(
         let err = salty::elf_loader::elf_load(
             elf_entry.data,
             elf_entry.data_len,
-            CHILD_CODE_VADDR,
+            plan.layout.elf_code.base,
             &mut loader_ctx,
             &raw mut elf_result,
         );
@@ -1340,6 +1499,7 @@ pub unsafe fn handle_spawn_tx(
                 initrd,
                 initrd_size,
                 &mut loader_ctx,
+                plan.layout.rtld.base,
             ) {
                 Some(r) => rtld_result = r,
                 None => {
@@ -1356,10 +1516,11 @@ pub unsafe fn handle_spawn_tx(
         }
 
         // ---- Map stack pages ----
-        for pg in 0..CHILD_STACK_PAGES {
-            let page_vaddr = CHILD_STACK_VADDR + pg as u64 * 4096;
+        let stack_pages = plan.layout.stack.page_count();
+        for pg in 0..stack_pages {
+            let page_vaddr = plan.layout.stack.base + pg as u64 * 4096;
             let frame_slot;
-            if pg == CHILD_STACK_PAGES - 1 {
+            if pg == stack_pages - 1 {
                 frame_slot = child_stk_fr;
             } else {
                 match alloc.realize_object(OBJ_FRAME, 0) {
@@ -1394,7 +1555,7 @@ pub unsafe fn handle_spawn_tx(
         let err = salty::invoke::vspace_map(
             child_vs,
             child_ipc_fr,
-            CHILD_IPC_BUF_VADDR,
+            plan.layout.ipc_buf.base,
             VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
         );
         if err != 0 {
@@ -1407,7 +1568,7 @@ pub unsafe fn handle_spawn_tx(
         // ---- Map initrd and boot info for dynamic executables ----
         // Use selective library window mapping
         if plan.is_dynamic {
-            if map_initrd_to_child_tx(child_vs, initrd, initrd_size, alloc, plan.lib_window_pages) != 0 {
+            if map_initrd_to_child_tx(child_vs, initrd, initrd_size, alloc, plan.lib_window_pages, plan.layout.initrd.base) != 0 {
                 alloc.rollback();
                 reply.label = SALTY_OUT_OF_MEMORY;
                 return;
@@ -1441,7 +1602,7 @@ pub unsafe fn handle_spawn_tx(
             child_cn,
             child_sig_ntfn,
             child_ready_ntfn,
-            plan.wait_ready,
+            plan.readiness_mode == salty::SPAWN_READY_NOTIFY,
             plan.is_display,
             pid,
         );
@@ -1461,14 +1622,14 @@ pub unsafe fn handle_spawn_tx(
         }
 
         // ---- Map shared library RO frames if available ----
-        let (shared_lib_base, _shared_lib_ro_pages) = if plan.is_dynamic {
-            map_shared_lib_to_vspace(child_vs, rtld_result.base)
+        let (shared_lib_base, shared_lib_map) = if plan.is_dynamic {
+            map_shared_lib_to_vspace(child_vs, plan.layout.shared_libs.base, &needed)
         } else {
-            (0, 0)
+            (0, proc_table::ProcLibMap::zeroed())
         };
 
         let mut child_entry_rip = elf_result.entry;
-        let mut child_rsp = CHILD_STACK_TOP;
+        let mut child_rsp = plan.layout.stack_top;
 
         if plan.is_dynamic {
             // Pass library window size for AT_SALTY_INITRD_SZ
@@ -1482,6 +1643,10 @@ pub unsafe fn handle_spawn_tx(
                 initrd_window_size,
                 shared_lib_base,
                 0, 0, &[], 0,
+                plan.layout.elf_code.base,
+                plan.layout.scratch.base,
+                plan.layout.initrd.base,
+                plan.layout.stack_top,
             ) {
                 Ok(rsp) => {
                     child_rsp = rsp;
@@ -1504,7 +1669,7 @@ pub unsafe fn handle_spawn_tx(
             return;
         }
         let err =
-            salty::invoke::tcb_set_ipc_buffer(child_tcb, CHILD_IPC_BUF_VADDR);
+            salty::invoke::tcb_set_ipc_buffer(child_tcb, plan.layout.ipc_buf.base);
         if err != 0 {
             puts(b"[PROCMGR] set child IPC buffer failed\n");
             alloc.rollback();
@@ -1537,7 +1702,7 @@ pub unsafe fn handle_spawn_tx(
             return;
         }
 
-        if plan.wait_ready {
+        if plan.readiness_mode == salty::SPAWN_READY_NOTIFY {
             if super::wait_for_child_ready(
                 child_tcb,
                 child_ready_ntfn,
@@ -1577,6 +1742,8 @@ pub unsafe fn handle_spawn_tx(
         p.slot_base = slot_base;
         p.slot_count = slot_count;
         p.shared_lib_base = shared_lib_base;
+        p.lib_map = shared_lib_map;
+        p.layout = plan.layout;
         for i in 0..proc_table::NSIG {
             p.sig_disposition[i] = proc_table::SIG_DISP_DFL;
         }
@@ -1604,6 +1771,7 @@ unsafe fn map_initrd_to_child_tx(
     initrd_size: usize,
     alloc: &mut Allocator,
     lib_window_pages: usize,
+    initrd_base_vaddr: u64,
 ) -> i32 {
     unsafe {
         // Use library window if available, otherwise full initrd
@@ -1628,7 +1796,7 @@ unsafe fn map_initrd_to_child_tx(
                 child_vs,
                 CAP_INITRD_UNTYPED,
                 (pg as u64) * 4096,
-                CHILD_INITRD_VADDR + pg as u64 * 4096,
+                initrd_base_vaddr + pg as u64 * 4096,
                 VSPACE_FLAG_USER,
             );
             if err != 0 {
@@ -1642,7 +1810,7 @@ unsafe fn map_initrd_to_child_tx(
                 for mapped_pg in 0..pg {
                     salty::invoke::vspace_unmap(
                         child_vs,
-                        CHILD_INITRD_VADDR + mapped_pg as u64 * 4096,
+                        initrd_base_vaddr + mapped_pg as u64 * 4096,
                     );
                 }
                 mapped_with_device = false;
@@ -1696,7 +1864,7 @@ unsafe fn map_initrd_to_child_tx(
             let err = salty::invoke::vspace_map(
                 child_vs,
                 fr_slot,
-                CHILD_INITRD_VADDR + pg as u64 * 4096,
+                initrd_base_vaddr + pg as u64 * 4096,
                 VSPACE_FLAG_USER,
             );
             if err != 0 {

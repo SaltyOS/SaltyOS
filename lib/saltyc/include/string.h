@@ -54,4 +54,8 @@ extern void  bzero(void *s, size_t n);
 extern void  bcopy(const void *src, void *dest, size_t n);
 extern void  explicit_bzero(void *s, size_t n);
 
+/* BSD extensions */
+extern size_t strlcpy(char *dst, const char *src, size_t dstsize);
+extern size_t strlcat(char *dst, const char *src, size_t dstsize);
+
 #endif /* __STRING_H__ */
