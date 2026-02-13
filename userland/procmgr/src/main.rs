@@ -88,8 +88,8 @@ const CHILD_CAP_READINESS_NTFN: u64 = salty::CAP_READINESS_NTFN;
 const CHILD_UT_BITS_DEFAULT: u8 = 16;
 const CHILD_UT_BITS_MIN: u8 = 12;
 const READY_SIGNAL_BITS: u64 = 1;
-const READY_WAIT_YIELDS_STATIC: usize = 20_000;
-const READY_WAIT_YIELDS_DYNAMIC: usize = 200_000;
+const READY_TIMEOUT_NS_DEFAULT: u64 = 10_000_000_000; // 10s
+const READY_WAIT_YIELDS_FALLBACK: usize = 200_000;
 
 // ---- Auxiliary vector types ----
 const AT_NULL: u64 = 0;
@@ -211,9 +211,15 @@ unsafe fn wait_for_child_ready(
     child_tcb: Cap,
     ready_ntfn: Cap,
     child_name: &[u8],
-    wait_yields: usize,
+    timeout_ns: u64,
 ) -> i32 {
-    for _ in 0..wait_yields {
+    let start_ns = {
+        let now = salty::syscall::syscall(salty::SYS_CLOCK_GETTIME, 1, 0, 0, 0, 0, 0);
+        if now.error == 0 { Some(now.value) } else { None }
+    };
+    let mut yields: usize = 0;
+
+    loop {
         let poll = salty::syscall::syscall(salty::SYS_POLL, ready_ntfn, 0, 0, 0, 0, 0);
         if poll.error == 0 {
             if (poll.value & READY_SIGNAL_BITS) != 0 {
@@ -228,7 +234,23 @@ unsafe fn wait_for_child_ready(
             let _ = salty::invoke::tcb_suspend(child_tcb);
             return -1;
         }
+
+        let timed_out = if let Some(start) = start_ns {
+            let now = salty::syscall::syscall(salty::SYS_CLOCK_GETTIME, 1, 0, 0, 0, 0, 0);
+            if now.error == 0 {
+                now.value.saturating_sub(start) >= timeout_ns
+            } else {
+                yields >= READY_WAIT_YIELDS_FALLBACK
+            }
+        } else {
+            yields >= READY_WAIT_YIELDS_FALLBACK
+        };
+        if timed_out {
+            break;
+        }
+
         let _ = salty::syscall::syscall(salty::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        yields += 1;
     }
 
     let mut lb = LineBuf::new();

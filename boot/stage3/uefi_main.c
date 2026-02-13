@@ -15,6 +15,7 @@
 
 #include "../common/types.h"
 #include "../common/print.h"
+#include "../common/fb_console.h"
 #include "../common/bootinfo_tlv.h"
 #include "../common/stage2_info.h"
 #include "../common/efi/efi_types.h"
@@ -110,6 +111,16 @@ void stage3_entry_64(struct Stage2Info *info)
 {
     /* Initialize serial output */
     print_init(PRINT_TARGET_SERIAL);
+
+    /* Initialize framebuffer console if available */
+    if (info && (info->flags & STAGE2_FLAG_HAS_FRAMEBUFFER) &&
+        info->framebuffer_addr != 0) {
+        fb_console_init(info->framebuffer_addr,
+                        info->framebuffer_width, info->framebuffer_height,
+                        info->framebuffer_pitch, info->framebuffer_bpp,
+                        info->fb_red_pos, info->fb_green_pos, info->fb_blue_pos);
+        print_add_target(PRINT_TARGET_FB);
+    }
 
     print_line("=== SaltyOS Stage 3 (64-bit) ===");
 

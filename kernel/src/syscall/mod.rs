@@ -31,6 +31,7 @@ pub enum Syscall {
     NanoSleep = 13,
     DebugPutStr = 14,
     DebugPutBuf = 15,
+    DebugConsoleControl = 16,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -54,6 +55,7 @@ impl TryFrom<u64> for Syscall {
             13 => Ok(Syscall::NanoSleep),
             14 => Ok(Syscall::DebugPutStr),
             15 => Ok(Syscall::DebugPutBuf),
+            16 => Ok(Syscall::DebugConsoleControl),
             _ => Err(SyscallError::InvalidOperation),
         }
     }
@@ -1029,6 +1031,12 @@ fn syscall_invoke(
             //                         arg1 = dst_vspace_cap_ptr,
             //                         arg2 = dst_vaddr
             syscall_vspace_clone_cow_page(&cap, arg0, arg1, arg2)
+        }
+        (ObjectType::VSpace, 0x57) => {
+            // VSPACE_MAP_DEVICE_RANGE: arg0 = device_untyped_cap_ptr,
+            //   arg1 = offset_start, arg2 = vaddr_start,
+            //   arg3 = (count << 32) | flags
+            syscall_vspace_map_device_range(&cap, arg0, arg1, arg2, arg3)
         }
 
         // SchedContext operations
@@ -2424,6 +2432,7 @@ fn syscall_vspace_map_device(
         }
 
         let map_limit = crate::init::initrd_device_limit_for(dev_ut as *const UntypedMemory)
+            .or_else(|| crate::init::fb_device_limit_for(dev_ut as *const UntypedMemory))
             .unwrap_or(dev_ut.size_bytes() as u64);
 
         let end = match page_offset.checked_add(0x1000) {
@@ -2453,6 +2462,107 @@ fn syscall_vspace_map_device(
             Ok(()) => SyscallResult::ok(0),
             Err(e) => SyscallResult::err(syscall_error_from_vspace_error(e)),
         }
+    }
+}
+
+/// VSPACE_MAP_DEVICE_RANGE: Batch-map contiguous 4K pages from a device untyped.
+///
+/// Args:
+/// - device_untyped_cap_ptr: Capability pointer to a device Untyped object
+/// - offset_start: Starting byte offset within the untyped region (must be 4K-aligned)
+/// - vaddr_start: Starting virtual address (must be 4K-aligned)
+/// - count_and_flags: (count << 32) | flags — count is number of 4K pages, flags as VSPACE_MAP
+///
+/// Returns: pages_mapped in value field. On partial failure, returns count mapped so far.
+/// Capped at 8192 pages (32 MiB) per call.
+fn syscall_vspace_map_device_range(
+    cap: &Capability,
+    device_untyped_cap_ptr: u64,
+    offset_start: u64,
+    vaddr_start: u64,
+    count_and_flags: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::MAP) {
+        return SyscallResult::err(e);
+    }
+
+    let count = (count_and_flags >> 32) as u64;
+    let flags_bits = count_and_flags & 0xFFFF_FFFF;
+
+    if count == 0 {
+        return SyscallResult::ok(0);
+    }
+    if count > 8192 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+    if offset_start & 0xFFF != 0 || vaddr_start & 0xFFF != 0 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    let dev_cap = match lookup_cap_locked(device_untyped_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(&dev_cap, ObjectType::Untyped, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+    if (flags_bits & 1) != 0 && !dev_cap.has_right(CapRights::WRITE) {
+        return SyscallResult::err(SyscallError::InsufficientRights);
+    }
+    if (flags_bits & 4) != 0 && !dev_cap.has_right(CapRights::EXECUTE) {
+        return SyscallResult::err(SyscallError::InsufficientRights);
+    }
+
+    unsafe {
+        let dev_ut = &*(dev_cap.object as *const UntypedMemory);
+        if !dev_ut.is_device {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+
+        let map_limit = crate::init::initrd_device_limit_for(dev_ut as *const UntypedMemory)
+            .or_else(|| crate::init::fb_device_limit_for(dev_ut as *const UntypedMemory))
+            .unwrap_or(dev_ut.size_bytes() as u64);
+
+        // Bounds check the entire range up front
+        let total_bytes = match count.checked_mul(0x1000) {
+            Some(v) => v,
+            None => return SyscallResult::err(SyscallError::OutOfRange),
+        };
+        let end_offset = match offset_start.checked_add(total_bytes) {
+            Some(v) => v,
+            None => return SyscallResult::err(SyscallError::OutOfRange),
+        };
+        if end_offset > map_limit {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+
+        let flags = PageFlags {
+            writable: flags_bits & 1 != 0,
+            user: flags_bits & 2 != 0,
+            executable: flags_bits & 4 != 0,
+            cache_disable: flags_bits & 8 != 0,
+            write_through: flags_bits & 16 != 0,
+            cow: flags_bits & 32 != 0,
+        };
+
+        let vspace = &mut *(cap.object as *mut VSpace);
+        let base_phys = dev_ut.phys_addr;
+
+        for i in 0..count {
+            let phys = match base_phys.checked_add(offset_start + i * 0x1000) {
+                Some(v) => v,
+                None => return SyscallResult { error: 0, value: i },
+            };
+            let vaddr = match vaddr_start.checked_add(i * 0x1000) {
+                Some(v) => v,
+                None => return SyscallResult { error: 0, value: i },
+            };
+            if let Err(_) = vspace.map(vaddr, phys, flags) {
+                return SyscallResult { error: 0, value: i };
+            }
+        }
+
+        SyscallResult::ok(count)
     }
 }
 
@@ -2573,6 +2683,7 @@ pub fn handle(
             let irq = unsafe { save_irq_disable() };
             crate::SERIAL_LOCK.lock();
             crate::serial_putc_hw(cap_ptr as u8);
+            crate::console::flush_pending();
             crate::SERIAL_LOCK.unlock();
             unsafe { restore_irq(irq) };
             SyscallResult::ok(0)
@@ -2591,9 +2702,7 @@ pub fn handle(
             // SAFETY: save/restore IRQ flags around spinlock
             let irq = unsafe { save_irq_disable() };
             crate::SERIAL_LOCK.lock();
-            for i in 0..len {
-                crate::serial_putc_hw(data[i]);
-            }
+            crate::serial_write_hw(&data[..len]);
             crate::SERIAL_LOCK.unlock();
             unsafe { restore_irq(irq) };
             SyscallResult::ok(0)
@@ -2615,9 +2724,7 @@ pub fn handle(
             // SAFETY: save/restore IRQ flags around spinlock
             let irq = unsafe { save_irq_disable() };
             crate::SERIAL_LOCK.lock();
-            for i in 0..len {
-                crate::serial_putc_hw(kbuf[i]);
-            }
+            crate::serial_write_hw(&kbuf[..len]);
             crate::SERIAL_LOCK.unlock();
             unsafe { restore_irq(irq) };
             SyscallResult::ok(0)
@@ -2633,6 +2740,15 @@ pub fn handle(
                 restore_irq(irq);
                 result
             }
+        }
+        Syscall::DebugConsoleControl => {
+            // subcmd 0 = disable kernel framebuffer console, 1 = enable
+            match cap_ptr {
+                0 => crate::console::disable(),
+                1 => crate::console::enable(),
+                _ => return SyscallResult::err(SyscallError::InvalidArgument),
+            }
+            SyscallResult::ok(0)
         }
         Syscall::DebugDumpState => {
             // Read scheduler state under SCHED_IPC_LOCK

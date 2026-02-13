@@ -267,16 +267,112 @@ pub unsafe fn posix_sbrk(increment: i64) -> u64 {
     }
 }
 
+/// fd-backed mmap: sends POSIX_VFS_MMAP to VFS, receives device untyped cap,
+/// then maps it into our VSpace with WC flags.
+unsafe fn posix_mmap_fd(
+    _addr: *mut u8,
+    length: u64,
+    _prot: i32,
+    _flags: i32,
+    fd: i32,
+    offset: i64,
+) -> *mut u8 {
+    unsafe {
+        let len = (length + 4095) & !4095u64;
+        let num_pages = len / 4096;
+
+        // Allocate a free cap slot to receive the transferred capability
+        let recv_slot = MM.next_frame_slot;
+        if recv_slot >= MM.max_frame_slot {
+            return usize::MAX as *mut u8;
+        }
+        MM.next_frame_slot += 1;
+
+        // Prepare receive slot for IPC cap transfer
+        crate::ipc::set_receive_slot_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_SELF_CSPACE,
+            recv_slot,
+            0,
+        );
+
+        // Send POSIX_VFS_MMAP to VFS
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_MMAP;
+        msg.length = 5;
+        msg.regs[0] = fd as u64;
+        msg.regs[1] = offset as u64;
+        msg.regs[2] = len;
+        msg.regs[3] = _prot as u64;
+        msg.regs[4] = _flags as u64;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return usize::MAX as *mut u8;
+        }
+
+        // VFS returned: regs[0]=smem_len, regs[1]=pitch, regs[2]=flags_hint
+        // Cap was transferred into recv_slot
+
+        // Pick a mapping base address
+        let base = MM.mmap_next;
+        MM.mmap_next = base + len;
+
+        // Map using batch device range syscall with WC flags
+        let map_flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER | VSPACE_FLAG_WRITE_THROUGH;
+        let (map_err, mapped) = invoke::vspace_map_device_range(
+            MM.vspace,
+            recv_slot,
+            offset as u64,
+            base,
+            num_pages,
+            map_flags,
+        );
+        if map_err != 0 || mapped != num_pages {
+            return usize::MAX as *mut u8;
+        }
+
+        // Track in region table
+        let region = alloc_region();
+        if !region.is_null() {
+            (*region).base = base;
+            (*region).length = len;
+            (*region).region_type = MM_REGION_MMAP;
+            (*region).prot = _prot as u8;
+            (*region).num_pages = num_pages as u16;
+            // Store the device untyped cap slot for cleanup
+            (*region).frame_slots[0] = recv_slot;
+        }
+
+        base as *mut u8
+    }
+}
+
 pub unsafe fn posix_mmap(
     addr: *mut u8,
     length: u64,
     prot: i32,
     flags: i32,
-    _fd: i32,
-    _offset: i64,
+    fd: i32,
+    offset: i64,
 ) -> *mut u8 {
     unsafe {
-        if MM.initialized == 0 || flags & MAP_ANONYMOUS == 0 || length == 0 {
+        if MM.initialized == 0 || length == 0 {
+            return usize::MAX as *mut u8; // MAP_FAILED
+        }
+
+        // fd-backed mmap (e.g. /dev/fb0): delegate to VFS for cap transfer
+        if fd >= 0 && (flags & MAP_ANONYMOUS) == 0 {
+            return posix_mmap_fd(addr, length, prot, flags, fd, offset);
+        }
+
+        if (flags & MAP_ANONYMOUS) == 0 {
             return usize::MAX as *mut u8; // MAP_FAILED
         }
 

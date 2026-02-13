@@ -187,8 +187,43 @@ unsafe fn init_direct_map() {
     }
 }
 
+/// Program IA32_PAT MSR to enable Write-Combining.
+///
+/// Replaces the default PAT1 entry (Write-Through) with Write-Combining (WC).
+/// PAT1 is selected by PTE flags PWT=1, PCD=0, PAT=0, which corresponds to the
+/// existing `PageFlags::WriteThrough` bit. After this, setting WriteThrough on
+/// a PTE gives WC caching instead of WT.
+///
+/// Default PAT: 0x00070406_00070406 (PAT0=WB, PAT1=WT, PAT2=UC-, PAT3=UC, ...)
+/// New PAT:     0x00070406_00070401 (PAT0=WB, PAT1=WC, PAT2=UC-, PAT3=UC, ...)
+///
+/// # Safety
+/// Must be called during single-threaded boot, before any mapping uses PAT1.
+unsafe fn init_pat() {
+    const IA32_PAT: u32 = 0x277;
+    let new_pat: u64 = 0x00070406_00070401; // PAT1 = WC (0x01)
+    let lo = new_pat as u32;
+    let hi = (new_pat >> 32) as u32;
+    // SAFETY: IA32_PAT is a valid MSR; single-threaded boot context.
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") IA32_PAT,
+            in("eax") lo,
+            in("edx") hi,
+            options(nomem, nostack),
+        );
+    }
+}
+
 /// Initialize paging (kernel page tables set up by bootloader)
 pub fn init() {
+    // Program PAT MSR for Write-Combining support (PAT1 = WC)
+    // SAFETY: Single-threaded boot context, before any WC mappings
+    unsafe {
+        init_pat();
+    }
+
     // Set up direct physical mapping
     // SAFETY: Single-threaded boot context, frame allocator initialized
     unsafe {

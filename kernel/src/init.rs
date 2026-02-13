@@ -125,6 +125,11 @@ static mut INITRD_DEVICE_LIMIT_BYTES: u64 = 0;
 /// Pointer identity for the initrd pseudo-device untyped object
 static mut INITRD_DEVICE_UT_PTR: *const UntypedMemory = core::ptr::null();
 
+/// Exact byte limit (page-aligned) for framebuffer map_device exposure
+static mut FB_DEVICE_LIMIT_BYTES: u64 = 0;
+/// Pointer identity for the framebuffer device untyped object
+static mut FB_DEVICE_UT_PTR: *const UntypedMemory = core::ptr::null();
+
 /// Bootstrap the first user-mode init task
 pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
     crate::serial_puts("[INIT] Creating user VSpace\n");
@@ -351,6 +356,10 @@ fn setup_init_cspace(boot_info: Option<&ParsedBootInfo>) {
                 let fb_ut = &raw mut INIT_FB_UNTYPED;
                 (*fb_ut) = UntypedMemory::new(fb.addr, size_bits, true);
 
+                FB_DEVICE_LIMIT_BYTES =
+                    ((fb_size + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64) * PAGE_SIZE as u64;
+                FB_DEVICE_UT_PTR = fb_ut as *const UntypedMemory;
+
                 insert_static_cap(
                     cnode,
                     CAP_FB_UNTYPED,
@@ -418,6 +427,18 @@ pub fn initrd_device_limit_for(obj: *const UntypedMemory) -> Option<u64> {
             None
         } else {
             Some(INITRD_DEVICE_LIMIT_BYTES)
+        }
+    }
+}
+
+/// If `obj` is the framebuffer device untyped, returns its exact map limit bytes.
+pub fn fb_device_limit_for(obj: *const UntypedMemory) -> Option<u64> {
+    unsafe {
+        let tracked = FB_DEVICE_UT_PTR;
+        if tracked.is_null() || obj != tracked {
+            None
+        } else {
+            Some(FB_DEVICE_LIMIT_BYTES)
         }
     }
 }

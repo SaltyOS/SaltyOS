@@ -9,6 +9,8 @@ boot_common_src = files(
   'common/string.c',
   'common/print.c',
   'common/udiv64.c',
+  'common/fb_console.c',
+  'common/font_8x16.c',
 )
 
 # =============================================================================
@@ -290,10 +292,12 @@ stage3_uefi_c_src = files(
   'stage3/handoff.c',
 )
 
-# Stage 3 UEFI common sources (string, print - no udiv64 needed for 64-bit)
+# Stage 3 UEFI common sources (string, print, fb - no udiv64 needed for 64-bit)
 stage3_uefi_common_src = files(
   'common/string.c',
   'common/print.c',
+  'common/fb_console.c',
+  'common/font_8x16.c',
 )
 
 stage3_uefi_c_args = c_stage3_args + [

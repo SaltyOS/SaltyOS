@@ -39,6 +39,7 @@ use salty::types::*;
 const CAP_SERVER_EP: u64 = 3;
 const VFS_CAP_CONSOLE_EP: u64 = 4;
 const VFS_CAP_NAMESERV_EP: u64 = 8;
+const VFS_CAP_FB_UNTYPED: u64 = 30;
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 // VFS protocol labels
@@ -82,6 +83,8 @@ const VFS_EPOLL_CTL: u64 = 41;
 const VFS_EPOLL_WAIT: u64 = 42;
 const VFS_DUP3: u64 = 43;
 const VFS_MKFIFO: u64 = 44;
+const VFS_MMAP: u64 = 45;
+const VFS_MUNMAP: u64 = 46;
 
 // File type constants
 const FTYPE_NONE: u8 = 0;
@@ -112,6 +115,7 @@ const S_IFSOCK_L: u32 = 0o140000;
 const DEV_CONSOLE: u8 = 0;
 const DEV_NULL: u8 = 1;
 const DEV_ZERO: u8 = 2;
+const DEV_FB0: u8 = 3;
 
 // Limits
 const MAX_INODES: usize = 128;
@@ -405,6 +409,19 @@ static mut WRITABLE_POOL_PTR: *mut [u8; WRITABLE_SIZE] = core::ptr::null_mut();
 static mut WRITABLE_USED_PTR: *mut u8 = core::ptr::null_mut();
 
 static mut CLIENTS_PTR: *mut ClientState = core::ptr::null_mut();
+
+// Framebuffer info (read from bootinfo)
+static mut FB_WIDTH: u32 = 0;
+static mut FB_HEIGHT: u32 = 0;
+static mut FB_PITCH: u32 = 0;
+static mut FB_BPP: u8 = 0;
+static mut FB_RED_POS: u8 = 0;
+static mut FB_RED_SIZE: u8 = 0;
+static mut FB_GREEN_POS: u8 = 0;
+static mut FB_GREEN_SIZE: u8 = 0;
+static mut FB_BLUE_POS: u8 = 0;
+static mut FB_BLUE_SIZE: u8 = 0;
+static mut FB_MMAP_BADGE: u64 = 0;
 
 macro_rules! INODES {
     () => {
@@ -1192,6 +1209,27 @@ unsafe fn resolve_parent(
 // Initialization
 // ======================================================================
 
+unsafe fn init_fb_info() {
+    unsafe {
+        let bootinfo = BOOTINFO_VADDR as *const u8;
+        let magic = (bootinfo as *const u64).read();
+        if magic != BOOTINFO_MAGIC {
+            return;
+        }
+        let p32 = bootinfo.add(32) as *const u32;
+        FB_WIDTH = p32.read();
+        FB_HEIGHT = p32.add(1).read();
+        FB_PITCH = p32.add(2).read();
+        FB_BPP = *bootinfo.add(44);
+        FB_RED_POS = *bootinfo.add(45);
+        FB_RED_SIZE = *bootinfo.add(46);
+        FB_GREEN_POS = *bootinfo.add(47);
+        FB_GREEN_SIZE = *bootinfo.add(48);
+        FB_BLUE_POS = *bootinfo.add(49);
+        FB_BLUE_SIZE = *bootinfo.add(50);
+    }
+}
+
 unsafe fn init_ramfs() {
     unsafe {
         for i in 0..max_inodes() {
@@ -1238,6 +1276,14 @@ unsafe fn init_ramfs() {
         (*zero_dev).dev_type = DEV_ZERO;
         (*zero_dev).parent_ino = (*dev_dir).ino;
         dir_add_entry(dev_dir, b"zero".as_ptr(), 4, (*zero_dev).ino);
+
+        // Create /dev/fb0
+        let fb0_dev = alloc_inode();
+        (*fb0_dev).ftype = FTYPE_CHAR_DEVICE;
+        (*fb0_dev).mode = S_IFCHR_L | 0o666;
+        (*fb0_dev).dev_type = DEV_FB0;
+        (*fb0_dev).parent_ino = (*dev_dir).ino;
+        dir_add_entry(dev_dir, b"fb0".as_ptr(), 3, (*fb0_dev).ino);
 
         // Create /initrd directory
         let initrd_dir = alloc_inode();
@@ -1556,6 +1602,9 @@ unsafe fn handle_read(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                         *data.add(i) = 0;
                     }
                 }
+                DEV_FB0 => {
+                    (*reply).label = SALTY_INVALID_OPERATION;
+                }
                 _ => {
                     (*reply).label = SALTY_INVALID_OPERATION;
                 }
@@ -1667,6 +1716,9 @@ unsafe fn handle_write(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                     (*reply).label = SALTY_OK;
                     (*reply).length = 1;
                     (*reply).regs[0] = count;
+                }
+                DEV_FB0 => {
+                    (*reply).label = SALTY_INVALID_OPERATION;
                 }
                 _ => {
                     (*reply).label = SALTY_INVALID_OPERATION;
@@ -3395,6 +3447,13 @@ unsafe fn handle_ioctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
             return;
         }
 
+        if (*cli).fds[fd as usize].fd_type == FD_TYPE_DEVICE
+            && (*cli).fds[fd as usize].dev_type == DEV_FB0
+        {
+            handle_ioctl_fb0(request, reply);
+            return;
+        }
+
         match request {
             // TIOCGPGRP: get foreground process group
             0x540F => {
@@ -3420,6 +3479,82 @@ unsafe fn handle_ioctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                 (*reply).label = SALTY_INVALID_ARGUMENT;
             }
         }
+    }
+}
+
+unsafe fn handle_ioctl_fb0(request: u64, reply: *mut SaltyMsg) {
+    unsafe {
+        match request {
+            // FBIOGET_VSCREENINFO
+            0x4600 => {
+                (*reply).label = SALTY_OK;
+                (*reply).length = 5;
+                (*reply).regs[0] = FB_WIDTH as u64;
+                (*reply).regs[1] = FB_HEIGHT as u64;
+                (*reply).regs[2] = FB_BPP as u64;
+                (*reply).regs[3] = ((FB_RED_POS as u64) << 24)
+                    | ((FB_RED_SIZE as u64) << 16)
+                    | ((FB_GREEN_POS as u64) << 8)
+                    | (FB_GREEN_SIZE as u64);
+                (*reply).regs[4] = ((FB_BLUE_POS as u64) << 24)
+                    | ((FB_BLUE_SIZE as u64) << 16);
+            }
+            // FBIOGET_FSCREENINFO
+            0x4602 => {
+                (*reply).label = SALTY_OK;
+                (*reply).length = 3;
+                (*reply).regs[0] = FB_PITCH as u64;
+                (*reply).regs[1] = FB_HEIGHT as u64 * FB_PITCH as u64;
+                (*reply).regs[2] = 0; // type = packed pixels
+            }
+            _ => {
+                (*reply).label = SALTY_INVALID_ARGUMENT;
+            }
+        }
+    }
+}
+
+unsafe fn handle_mmap(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+    unsafe {
+        let fd = (*msg).regs[0] as i32;
+        let _offset = (*msg).regs[1];
+        let length = (*msg).regs[2];
+
+        let cli = get_client(badge);
+        if cli.is_null() || fd < 0 || fd >= max_fds() as i32
+            || (*cli).fds[fd as usize].active == 0
+        {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        let fde = &(*cli).fds[fd as usize];
+
+        if fde.fd_type != FD_TYPE_DEVICE || fde.dev_type != DEV_FB0 {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return;
+        }
+
+        if FB_MMAP_BADGE != 0 && FB_MMAP_BADGE != badge {
+            (*reply).label = SALTY_BUSY;
+            return;
+        }
+
+        let smem_len = FB_HEIGHT as u64 * FB_PITCH as u64;
+        if length > smem_len {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, VFS_CAP_FB_UNTYPED);
+
+        FB_MMAP_BADGE = badge;
+
+        (*reply).label = SALTY_OK;
+        (*reply).length = 3;
+        (*reply).regs[0] = smem_len;
+        (*reply).regs[1] = FB_PITCH as u64;
+        (*reply).regs[2] = 0;
     }
 }
 
@@ -4786,6 +4921,7 @@ pub extern "C" fn _start() -> ! {
 
     unsafe {
         init_ramfs();
+        init_fb_info();
     }
 
     puts(b"[VFS] Filesystem ready\n");
@@ -5004,6 +5140,9 @@ pub extern "C" fn _start() -> ! {
                 }
                 VFS_EPOLL_WAIT => {
                     skip_reply = handle_epoll_wait(&raw const msg, &raw mut reply, badge);
+                }
+                VFS_MMAP => {
+                    handle_mmap(&raw const msg, &raw mut reply, badge);
                 }
                 _ => {
                     { let mut lb = LineBuf::new(); lb.str(b"[VFS] unknown label="); lb.hex(msg.label); lb.str(b"\n"); lb.flush(); }

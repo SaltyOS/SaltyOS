@@ -12,6 +12,7 @@ mod arch;
 mod bootinfo;
 mod builtins;
 mod cap;
+mod console;
 mod cpio;
 mod elf;
 mod init;
@@ -53,6 +54,7 @@ pub(crate) static SERIAL_LOCK: mm::SpinLock = mm::SpinLock::new();
 // ---------------------------------------------------------------------------
 
 /// Write a single byte to COM1 hardware. No locking.
+/// Also mirrors output to the framebuffer console (if initialized).
 #[inline]
 pub(crate) fn serial_putc_hw(c: u8) {
     // SAFETY: COM1 is a standard x86 serial port
@@ -60,59 +62,66 @@ pub(crate) fn serial_putc_hw(c: u8) {
         while (arch::inb(SERIAL_PORT + 5) & 0x20) == 0 {}
         arch::outb(SERIAL_PORT, c);
     }
+    console::putc(c);
+}
+
+/// Write a byte slice to COM1 hardware and mirror it to framebuffer.
+#[inline]
+pub(crate) fn serial_write_hw(buf: &[u8]) {
+    if buf.is_empty() {
+        return;
+    }
+    for &c in buf {
+        // SAFETY: COM1 is a standard x86 serial port
+        unsafe {
+            while (arch::inb(SERIAL_PORT + 5) & 0x20) == 0 {}
+            arch::outb(SERIAL_PORT, c);
+        }
+    }
+    console::write(buf);
 }
 
 /// Write a string to COM1 without any locking. Panic/crash path only.
 pub(crate) fn serial_puts_raw(s: &str) {
-    for byte in s.bytes() {
-        serial_putc_hw(byte);
-    }
+    serial_write_hw(s.as_bytes());
 }
 
 /// Write a hexadecimal number to COM1 without any locking. Panic/crash path only.
 pub(crate) fn serial_hex_raw(mut val: u64) {
     const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-
-    serial_puts_raw("0x");
-
     if val == 0 {
-        serial_putc_hw(b'0');
+        serial_write_hw(b"0x0");
         return;
     }
-
-    let mut buf = [0u8; 16];
-    let mut pos = 15;
-
+    let mut buf = [0u8; 18]; // "0x" + max 16 hex digits
+    buf[0] = b'0';
+    buf[1] = b'x';
+    let mut pos = 17;
     while val > 0 {
         buf[pos] = HEX_CHARS[(val & 0xF) as usize];
         val >>= 4;
         pos -= 1;
     }
-
-    for &c in &buf[(pos + 1)..] {
-        serial_putc_hw(c);
-    }
+    let digit_start = pos + 1;
+    let digit_count = 18 - digit_start;
+    buf.copy_within(digit_start..18, 2);
+    serial_write_hw(&buf[..2 + digit_count]);
 }
 
 /// Write a decimal number to COM1 without any locking. Panic/crash path only.
 pub(crate) fn serial_dec_raw(mut val: u64) {
     if val == 0 {
-        serial_putc_hw(b'0');
+        serial_write_hw(b"0");
         return;
     }
-
     let mut buf = [0u8; 20];
     let mut pos = 19;
-
     while val > 0 {
         buf[pos] = b'0' + ((val % 10) as u8);
         val /= 10;
         pos -= 1;
     }
-
-    for &c in &buf[(pos + 1)..] {
-        serial_putc_hw(c);
-    }
+    serial_write_hw(&buf[(pos + 1)..]);
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +134,7 @@ pub(crate) fn serial_putc(c: u8) {
     let irq = unsafe { mm::save_irq_disable() };
     SERIAL_LOCK.lock();
     serial_putc_hw(c);
+    console::flush_pending();
     SERIAL_LOCK.unlock();
     unsafe { mm::restore_irq(irq) };
 }
@@ -134,9 +144,7 @@ pub(crate) fn serial_puts(s: &str) {
     // SAFETY: save/restore IRQ flags around spinlock to prevent deadlock
     let irq = unsafe { mm::save_irq_disable() };
     SERIAL_LOCK.lock();
-    for byte in s.bytes() {
-        serial_putc_hw(byte);
-    }
+    serial_write_hw(s.as_bytes());
     SERIAL_LOCK.unlock();
     unsafe { mm::restore_irq(irq) };
 }
@@ -164,47 +172,39 @@ pub(crate) fn serial_dec(val: u64) {
 /// Hex formatting without lock (used by SerialGuard and locked wrappers)
 fn serial_hex_impl(mut val: u64) {
     const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-    serial_putc_hw(b'0');
-    serial_putc_hw(b'x');
-
     if val == 0 {
-        serial_putc_hw(b'0');
+        serial_write_hw(b"0x0");
         return;
     }
-
-    let mut buf = [0u8; 16];
-    let mut pos = 15;
-
+    let mut buf = [0u8; 18]; // "0x" + max 16 hex digits
+    buf[0] = b'0';
+    buf[1] = b'x';
+    let mut pos = 17;
     while val > 0 {
         buf[pos] = HEX_CHARS[(val & 0xF) as usize];
         val >>= 4;
         pos -= 1;
     }
-
-    for &c in &buf[(pos + 1)..] {
-        serial_putc_hw(c);
-    }
+    let digit_start = pos + 1;
+    let digit_count = 18 - digit_start;
+    buf.copy_within(digit_start..18, 2);
+    serial_write_hw(&buf[..2 + digit_count]);
 }
 
 /// Decimal formatting without lock (used by SerialGuard and locked wrappers)
 fn serial_dec_impl(mut val: u64) {
     if val == 0 {
-        serial_putc_hw(b'0');
+        serial_write_hw(b"0");
         return;
     }
-
     let mut buf = [0u8; 20];
     let mut pos = 19;
-
     while val > 0 {
         buf[pos] = b'0' + ((val % 10) as u8);
         val /= 10;
         pos -= 1;
     }
-
-    for &c in &buf[(pos + 1)..] {
-        serial_putc_hw(c);
-    }
+    serial_write_hw(&buf[(pos + 1)..]);
 }
 
 // ---------------------------------------------------------------------------
@@ -237,9 +237,7 @@ impl SerialGuard {
     }
 
     pub fn puts(&self, s: &str) {
-        for byte in s.bytes() {
-            serial_putc_hw(byte);
-        }
+        serial_write_hw(s.as_bytes());
     }
 
     pub fn hex(&self, val: u64) {
@@ -257,6 +255,9 @@ impl SerialGuard {
 
 impl Drop for SerialGuard {
     fn drop(&mut self) {
+        // Flush all pending console output accumulated during this guard's scope
+        // into a single VRAM update, before releasing the lock.
+        console::flush_pending();
         SERIAL_LOCK.unlock();
         // SAFETY: restoring previously saved IRQ flags
         unsafe { mm::restore_irq(self.irq) };
@@ -299,6 +300,13 @@ pub extern "C" fn kmain(raw_boot_info: *const u8) -> ! {
     // Initialize architecture-specific subsystems
     arch::init(boot_info);
 
+    // Initialize framebuffer text console (mirrors serial to screen).
+    // Must be after arch::init() (paging + frame allocator) and before
+    // init_smp() so APs inherit the PML4[257] mapping.
+    if let Some(info) = boot_info {
+        console::init(&info.framebuffer);
+    }
+
     // Initialize capability system
     cap::init();
 
@@ -336,6 +344,10 @@ pub extern "C" fn kmain(raw_boot_info: *const u8) -> ! {
 /// Panic handler
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // Re-enable framebuffer console so crash output is visible on screen
+    // even if the display server had taken over
+    console::enable();
+
     // Use raw output — another CPU might hold SERIAL_LOCK
     serial_puts_raw("\n!!! KERNEL PANIC !!!\n");
 

@@ -21,6 +21,7 @@ pub const SYS_CLOCK_GETTIME: u64 = 12;
 pub const SYS_NANOSLEEP: u64 = 13;
 pub const SYS_DEBUG_PUTSTR: u64 = 14;
 pub const SYS_DEBUG_PUTBUF: u64 = 15;
+pub const SYS_DEBUG_CONSOLE_CONTROL: u64 = 16;
 
 // Clock IDs
 pub const CLOCK_MONOTONIC: i32 = 0;
@@ -62,6 +63,7 @@ pub const VSPACE_WALK: u64 = 0x53;
 pub const VSPACE_COPY_PAGE: u64 = 0x54;
 pub const VSPACE_MAP_DEVICE: u64 = 0x55;
 pub const VSPACE_CLONE_COW_PAGE: u64 = 0x56;
+pub const VSPACE_MAP_DEVICE_RANGE: u64 = 0x57;
 
 // IRQ operations (0x60-0x63)
 pub const IRQ_HANDLER_ACK: u64 = 0x61;
@@ -79,6 +81,13 @@ pub const CONSOLE_READ: u64 = 2;
 pub const CONSOLE_TCGETATTR: u64 = 3;
 pub const CONSOLE_TCSETATTR: u64 = 4;
 
+// Display server IPC message labels
+pub const DISPLAY_GET_INFO: u64 = 1;
+pub const DISPLAY_PRESENT: u64 = 2;
+pub const DISPLAY_FILL_RECT: u64 = 6;
+pub const DISPLAY_WRITE_TEXT: u64 = 7;
+pub const DISPLAY_TERMINAL_WRITE: u64 = 8;
+
 // Well-known cap slots
 pub const CAP_SELF_TCB: u64 = 0;
 pub const CAP_SELF_VSPACE: u64 = 1;
@@ -95,6 +104,7 @@ pub const CAP_CONSOLE_EP: u64 = 11;
 pub const CAP_INITRD_UNTYPED: u64 = 12;
 pub const CAP_FB_UNTYPED: u64 = 13;
 pub const CAP_READINESS_NTFN: u64 = 14;
+pub const CAP_DISPLAY_EP: u64 = 15;
 pub const CAP_UNTYPED_START: u64 = 16;
 
 // Addresses
@@ -183,6 +193,8 @@ pub const POSIX_VFS_EPOLL_CTL: u64 = 41;
 pub const POSIX_VFS_EPOLL_WAIT: u64 = 42;
 pub const POSIX_VFS_DUP3: u64 = 43;
 pub const POSIX_VFS_MKFIFO: u64 = 44;
+pub const POSIX_VFS_MMAP: u64 = 45;
+pub const POSIX_VFS_MUNMAP: u64 = 46;
 
 // fcntl commands
 pub const F_DUPFD: i32 = 0;
@@ -197,6 +209,10 @@ pub const FD_CLOEXEC: i32 = 1;
 pub const TIOCGPGRP: u64 = 0x540F;
 pub const TIOCSPGRP: u64 = 0x5410;
 pub const TIOCGWINSZ: u64 = 0x5413;
+
+// Framebuffer ioctl requests
+pub const FBIOGET_VSCREENINFO: u64 = 0x4600;
+pub const FBIOGET_FSCREENINFO: u64 = 0x4602;
 
 // Procmgr protocol labels
 pub const POSIX_PM_SPAWN: u64 = 1;

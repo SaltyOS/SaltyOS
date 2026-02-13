@@ -1,7 +1,7 @@
 [Service]
 Name=display
 Binary=display.elf
-Type=simple
+Type=notify
 Restart=no
 
 [Dependencies]
@@ -9,4 +9,4 @@ After=console nameserv procmgr
 
 [Capabilities]
 CopyCap=13:13
-!
+NeedEP=nameserv:5

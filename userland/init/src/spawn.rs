@@ -27,8 +27,8 @@ const CHILD_UT_BITS_MIN: u8 = 12;
 const UT_MIRROR_COUNT: Cap = 8;
 const INITRD_COPY_RIGHTS: u64 = (1 << 0) | (1 << 2) | (1 << 3); // READ|EXECUTE|GRANT
 const READY_SIGNAL_BITS: u64 = 1;
-const READY_WAIT_YIELDS_STATIC: usize = 20_000;
-const READY_WAIT_YIELDS_DYNAMIC: usize = 200_000;
+const READY_TIMEOUT_NS: u64 = 10_000_000_000; // 10s default
+const READY_WAIT_YIELDS_FALLBACK: usize = 200_000;
 static mut NEXT_UT_HINT: Cap = CAP_UNTYPED_START;
 
 // ===========================================================================
@@ -127,13 +127,46 @@ fn compute_spawn_memory_budget(is_dynamic: bool, requested_bits: u8) -> SpawnMem
     }
 }
 
+fn compute_ready_timeout_ns(
+    configured_timeout_ns: u64,
+    is_dynamic: bool,
+    elf_size_bytes: usize,
+    map_initrd: bool,
+    runtime_bits: u8,
+) -> u64 {
+    if configured_timeout_ns != 0 {
+        return configured_timeout_ns;
+    }
+
+    let mut timeout_ns = READY_TIMEOUT_NS;
+    if is_dynamic {
+        timeout_ns = timeout_ns.saturating_add(3_000_000_000);
+    }
+    if map_initrd {
+        timeout_ns = timeout_ns.saturating_add(1_000_000_000);
+    }
+    if runtime_bits >= 18 {
+        timeout_ns = timeout_ns.saturating_add(1_000_000_000);
+    }
+
+    let elf_chunks = ((elf_size_bytes as u64).saturating_add(128 * 1024 - 1)) / (128 * 1024);
+    let elf_bonus_ms = core::cmp::min(elf_chunks.saturating_mul(150), 4_000);
+    timeout_ns.saturating_add(elf_bonus_ms.saturating_mul(1_000_000))
+}
+
 unsafe fn wait_for_child_ready(
     child_tcb: Cap,
     ready_ntfn: Cap,
     label: &[u8],
-    wait_yields: usize,
+    timeout_ns: u64,
 ) -> i32 {
-    for _ in 0..wait_yields {
+    let start_ns = {
+        let now = syscall::syscall(SYS_CLOCK_GETTIME, 1, 0, 0, 0, 0, 0);
+        if now.error == 0 { Some(now.value) } else { None }
+    };
+    let mut yields: usize = 0;
+
+    loop {
         let poll = syscall::syscall(SYS_POLL, ready_ntfn, 0, 0, 0, 0, 0);
         if poll.error == 0 {
             if (poll.value & READY_SIGNAL_BITS) != 0 {
@@ -148,7 +181,23 @@ unsafe fn wait_for_child_ready(
             let _ = invoke::tcb_suspend(child_tcb);
             return -1;
         }
+
+        let timed_out = if let Some(start) = start_ns {
+            let now = syscall::syscall(SYS_CLOCK_GETTIME, 1, 0, 0, 0, 0, 0);
+            if now.error == 0 {
+                now.value.saturating_sub(start) >= timeout_ns
+            } else {
+                yields >= READY_WAIT_YIELDS_FALLBACK
+            }
+        } else {
+            yields >= READY_WAIT_YIELDS_FALLBACK
+        };
+        if timed_out {
+            break;
+        }
+
         let _ = syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        yields += 1;
     }
 
     let mut lb = LineBuf::new();
@@ -598,6 +647,7 @@ pub unsafe fn spawn_server(
     cnode_size_bits: u64,
     child_ut_bits: u8,
     copy_shared_lib_caps: bool,
+    ready_timeout_ns: u64,
     pre_ep: Cap,
 ) -> i32 {
     { let mut lb = LineBuf::new(); lb.str(b"[INIT] Spawning "); lb.bytes(label); lb.str(b" ("); lb.bytes(elf_name); lb.str(b")\n"); lb.flush(); }
@@ -617,6 +667,13 @@ pub unsafe fn spawn_server(
             { let mut lb = LineBuf::new(); lb.str(b"[INIT] "); lb.bytes(label); lb.str(b" is dynamically linked\n"); lb.flush(); }
         }
         let budget = compute_spawn_memory_budget(is_dynamic, child_ut_bits);
+        let effective_ready_timeout_ns = compute_ready_timeout_ns(
+            ready_timeout_ns,
+            is_dynamic,
+            entry.data_len,
+            map_initrd,
+            budget.runtime_bits,
+        );
 
         let child_tcb = cap_base + super::COFF_TCB;
         let child_vs = cap_base + super::COFF_VSPACE;
@@ -1139,12 +1196,12 @@ pub unsafe fn spawn_server(
         let err = invoke::tcb_resume(child_tcb);
         if err != 0 { puts(b"[INIT] TCB resume failed\n"); return -1; }
 
-        let ready_wait_yields = if is_dynamic {
-            READY_WAIT_YIELDS_DYNAMIC
-        } else {
-            READY_WAIT_YIELDS_STATIC
-        };
-        if wait_for_child_ready(child_tcb, child_ready_ntfn, label, ready_wait_yields) != 0 {
+        if wait_for_child_ready(
+            child_tcb,
+            child_ready_ntfn,
+            label,
+            effective_ready_timeout_ns,
+        ) != 0 {
             return -1;
         }
 
@@ -1154,15 +1211,16 @@ pub unsafe fn spawn_server(
 }
 
 /// Spawn via procmgr IPC (for post-procmgr services).
-pub unsafe fn pm_spawn(pm_ep: Cap, prog: &[u8]) -> i32 {
+pub unsafe fn pm_spawn(pm_ep: Cap, prog: &[u8], timeout_ns: u64) -> i32 {
     unsafe {
         let len = prog.len();
         let mut spawn_msg = SaltyMsg::zeroed();
         spawn_msg.label = POSIX_PM_SPAWN;
-        spawn_msg.length = 2 + ((len as u64 + 7) / 8);
+        spawn_msg.length = 3 + ((len as u64 + 7) / 8);
         spawn_msg.regs[0] = len as u64;
         spawn_msg.regs[1] = POSIX_PM_SPAWN_FLAG_WAIT_READY;
-        let dst = &raw mut spawn_msg.regs[2] as *mut u8;
+        spawn_msg.regs[2] = timeout_ns;
+        let dst = &raw mut spawn_msg.regs[3] as *mut u8;
         for i in 0..len {
             *dst.add(i) = prog[i];
         }

@@ -96,6 +96,30 @@ pub fn vspace_map_device(
     .error as i32
 }
 
+/// Batch-map contiguous 4K pages from a device untyped region.
+///
+/// Returns (error, pages_mapped). On success error==0 and pages_mapped==num_pages.
+/// On partial failure error==0 and pages_mapped < num_pages.
+pub fn vspace_map_device_range(
+    vspace: Cap,
+    device_untyped: Cap,
+    offset_start: u64,
+    vaddr_start: u64,
+    num_pages: u64,
+    flags: u64,
+) -> (i32, u64) {
+    let count_and_flags = (num_pages << 32) | (flags & 0xFFFF_FFFF);
+    let result = invoke(
+        vspace,
+        VSPACE_MAP_DEVICE_RANGE,
+        device_untyped,
+        offset_start,
+        vaddr_start,
+        count_and_flags,
+    );
+    (result.error as i32, result.value)
+}
+
 pub fn vspace_clone_cow_page(
     src_vspace: Cap,
     src_vaddr: u64,

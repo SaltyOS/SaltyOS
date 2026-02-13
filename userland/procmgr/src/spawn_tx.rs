@@ -97,8 +97,7 @@ const AT_SALTY_FRAME_SLOT: u64 = super::AT_SALTY_FRAME_SLOT;
 const AT_SALTY_SHARED_LIB_BASE: u64 = super::AT_SALTY_SHARED_LIB_BASE;
 const UT_MIRROR_COUNT: Cap = super::UT_MIRROR_COUNT;
 const CHILD_UT_BITS_DEFAULT: u8 = super::CHILD_UT_BITS_DEFAULT;
-const READY_WAIT_YIELDS_STATIC: usize = super::READY_WAIT_YIELDS_STATIC;
-const READY_WAIT_YIELDS_DYNAMIC: usize = super::READY_WAIT_YIELDS_DYNAMIC;
+const READY_TIMEOUT_NS_DEFAULT: u64 = super::READY_TIMEOUT_NS_DEFAULT;
 
 const PM_SPAWN_FLAG_WAIT_READY: u64 = super::PM_SPAWN_FLAG_WAIT_READY;
 
@@ -167,6 +166,7 @@ pub(crate) unsafe fn lookup_shared_lib_page(vaddr: u64, lib_base: u64) -> Option
 struct SpawnPlan {
     is_dynamic: bool,
     wait_ready: bool,
+    ready_timeout_ns: u64,
     child_ut_bits: u8,
     total_slots: usize,
     is_display: bool,
@@ -228,14 +228,115 @@ unsafe extern "C" fn spawn_alloc_frame(opaque: *mut u8) -> Cap {
 // Service profile lookup
 // ===========================================================================
 
-/// Look up MemoryKB from a `.service` file in the CPIO initrd.
-/// Returns 0 if not found or no MemoryKB field.
-unsafe fn lookup_service_memory_kb(
+fn ascii_lower(b: u8) -> u8 {
+    if b >= b'A' && b <= b'Z' { b + 32 } else { b }
+}
+
+fn bytes_eq_ci(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if ascii_lower(a[i]) != ascii_lower(b[i]) {
+            return false;
+        }
+    }
+    true
+}
+
+fn trim_ascii(mut s: &[u8]) -> &[u8] {
+    while !s.is_empty() && (s[0] == b' ' || s[0] == b'\t' || s[0] == b'\r') {
+        s = &s[1..];
+    }
+    while !s.is_empty() {
+        let c = s[s.len() - 1];
+        if c == b' ' || c == b'\t' || c == b'\r' {
+            s = &s[..s.len() - 1];
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+fn parse_decimal_u64(data: &[u8]) -> u64 {
+    let mut val: u64 = 0;
+    for &b in data {
+        if b >= b'0' && b <= b'9' {
+            val = val.wrapping_mul(10).wrapping_add((b - b'0') as u64);
+        } else {
+            break;
+        }
+    }
+    val
+}
+
+fn parse_duration_ns(data: &[u8]) -> u64 {
+    let v = trim_ascii(data);
+    if v.is_empty() {
+        return 0;
+    }
+    if bytes_eq_ci(v, b"infinity") {
+        return 0;
+    }
+
+    let mut num_end = 0usize;
+    while num_end < v.len() && v[num_end] >= b'0' && v[num_end] <= b'9' {
+        num_end += 1;
+    }
+    if num_end == 0 {
+        return 0;
+    }
+
+    let n = parse_decimal_u64(&v[..num_end]);
+    let unit = trim_ascii(&v[num_end..]);
+    let scale = if unit.is_empty()
+        || bytes_eq_ci(unit, b"s")
+        || bytes_eq_ci(unit, b"sec")
+        || bytes_eq_ci(unit, b"secs")
+        || bytes_eq_ci(unit, b"second")
+        || bytes_eq_ci(unit, b"seconds")
+    {
+        1_000_000_000u64
+    } else if bytes_eq_ci(unit, b"ms")
+        || bytes_eq_ci(unit, b"msec")
+        || bytes_eq_ci(unit, b"msecs")
+    {
+        1_000_000u64
+    } else if bytes_eq_ci(unit, b"us")
+        || bytes_eq_ci(unit, b"usec")
+        || bytes_eq_ci(unit, b"usecs")
+    {
+        1_000u64
+    } else if bytes_eq_ci(unit, b"m")
+        || bytes_eq_ci(unit, b"min")
+        || bytes_eq_ci(unit, b"mins")
+        || bytes_eq_ci(unit, b"minute")
+        || bytes_eq_ci(unit, b"minutes")
+    {
+        60 * 1_000_000_000u64
+    } else if bytes_eq_ci(unit, b"h")
+        || bytes_eq_ci(unit, b"hr")
+        || bytes_eq_ci(unit, b"hrs")
+        || bytes_eq_ci(unit, b"hour")
+        || bytes_eq_ci(unit, b"hours")
+    {
+        60 * 60 * 1_000_000_000u64
+    } else {
+        1_000_000_000u64
+    };
+
+    n.saturating_mul(scale)
+}
+
+/// Look up startup profile values from a `.service` file in the initrd.
+/// Returns `(memory_kb, timeout_start_ns)`; each value is 0 when unspecified.
+unsafe fn lookup_service_profile(
     initrd: *const u8,
     initrd_size: usize,
     elf_name: &[u8],
     elf_name_len: usize,
-) -> u16 {
+) -> (u16, u64) {
     unsafe {
         // Convert "foo.elf" → "services/foo.service"
         let mut svc_path = [0u8; 64];
@@ -246,7 +347,7 @@ unsafe fn lookup_service_memory_kb(
         // Copy base name without .elf extension
         let base_len = if elf_name_len > 4 { elf_name_len - 4 } else { elf_name_len };
         for i in 0..base_len {
-            if pos >= 60 { return 0; }
+            if pos >= 60 { return (0, 0); }
             svc_path[pos] = elf_name[i];
             pos += 1;
         }
@@ -256,30 +357,49 @@ unsafe fn lookup_service_memory_kb(
 
         let mut entry = CpioEntry::zeroed();
         if salty::cpio::cpio_find_file(initrd, initrd_size, svc_path.as_ptr(), pos, &raw mut entry) == 0 {
-            return 0;
+            return (0, 0);
         }
 
-        // Minimal parse: find "MemoryKB=" line and extract decimal value
         let data = core::slice::from_raw_parts(entry.data, entry.data_len);
-        let needle = b"MemoryKB=";
-        let mut i = 0usize;
-        while i + needle.len() < data.len() {
-            let mut matched = true;
-            for j in 0..needle.len() {
-                if data[i + j] != needle[j] { matched = false; break; }
+        let mut memory_kb: u16 = 0;
+        let mut timeout_start_ns: u64 = 0;
+
+        let mut line_start = 0usize;
+        while line_start < data.len() {
+            let mut line_end = line_start;
+            while line_end < data.len() && data[line_end] != b'\n' {
+                line_end += 1;
             }
-            if matched {
-                let mut val: u16 = 0;
-                let mut k = i + needle.len();
-                while k < data.len() && data[k] >= b'0' && data[k] <= b'9' {
-                    val = val * 10 + (data[k] - b'0') as u16;
-                    k += 1;
+            let line = trim_ascii(&data[line_start..line_end]);
+
+            if !line.is_empty() && line[0] != b'#' && line[0] != b';' {
+                let mut eq = 0usize;
+                let mut found_eq = false;
+                while eq < line.len() {
+                    if line[eq] == b'=' {
+                        found_eq = true;
+                        break;
+                    }
+                    eq += 1;
                 }
-                return val;
+                if found_eq {
+                    let key = trim_ascii(&line[..eq]);
+                    let value = trim_ascii(&line[eq + 1..]);
+                    if bytes_eq_ci(key, b"MemoryKB") {
+                        let parsed = parse_decimal_u64(value);
+                        memory_kb = if parsed > u16::MAX as u64 { u16::MAX } else { parsed as u16 };
+                    } else if bytes_eq_ci(key, b"TimeoutStartSec")
+                        || bytes_eq_ci(key, b"TimeoutSec")
+                    {
+                        timeout_start_ns = parse_duration_ns(value);
+                    }
+                }
             }
-            i += 1;
+
+            line_start = line_end + 1;
         }
-        0
+
+        (memory_kb, timeout_start_ns)
     }
 }
 
@@ -290,6 +410,33 @@ fn memory_kb_to_ut_bits(kb: u16) -> u8 {
     let mut bits: u8 = 12;
     while (1u32 << bits) < bytes && bits < 28 { bits += 1; }
     bits
+}
+
+fn compute_ready_timeout_ns(
+    configured_timeout_ns: u64,
+    is_dynamic: bool,
+    elf_size_bytes: usize,
+    lib_window_pages: usize,
+    child_ut_bits: u8,
+) -> u64 {
+    if configured_timeout_ns != 0 {
+        return configured_timeout_ns;
+    }
+
+    let mut timeout_ns = READY_TIMEOUT_NS_DEFAULT;
+    if is_dynamic {
+        timeout_ns = timeout_ns.saturating_add(3_000_000_000);
+    }
+    if child_ut_bits >= 18 {
+        timeout_ns = timeout_ns.saturating_add(1_000_000_000);
+    }
+
+    let elf_chunks = ((elf_size_bytes as u64).saturating_add(128 * 1024 - 1)) / (128 * 1024);
+    let elf_bonus_ms = core::cmp::min(elf_chunks.saturating_mul(150), 4_000);
+    timeout_ns = timeout_ns.saturating_add(elf_bonus_ms.saturating_mul(1_000_000));
+
+    let lib_bonus_ms = core::cmp::min(lib_window_pages as u64 * 8, 3_000);
+    timeout_ns.saturating_add(lib_bonus_ms.saturating_mul(1_000_000))
 }
 
 // ===========================================================================
@@ -793,8 +940,14 @@ pub unsafe fn handle_spawn_tx(
         // Parse message
         let mut name_reg_idx = 1usize;
         let mut spawn_flags: u64 = 0;
+        let mut requested_timeout_ns: u64 = 0;
         let packed_name_words = (msg.regs[0] + 7) / 8;
-        if msg.length >= 2 + packed_name_words {
+        if msg.length >= 3 + packed_name_words {
+            spawn_flags = msg.regs[1];
+            requested_timeout_ns = msg.regs[2];
+            name_reg_idx = 3;
+        } else if msg.length >= 2 + packed_name_words {
+            // Backward-compatible path: flags present, no timeout field.
             spawn_flags = msg.regs[1];
             name_reg_idx = 2;
         }
@@ -831,7 +984,8 @@ pub unsafe fn handle_spawn_tx(
         }
 
         // ---- PREFLIGHT: Build SpawnPlan ----
-        let service_kb = lookup_service_memory_kb(initrd, initrd_size, &name, name_len);
+        let (service_kb, service_timeout_ns) =
+            lookup_service_profile(initrd, initrd_size, &name, name_len);
         let child_ut_bits = memory_kb_to_ut_bits(service_kb);
 
         let lib_window_pages = if is_dynamic {
@@ -840,9 +994,22 @@ pub unsafe fn handle_spawn_tx(
             0
         };
 
+        let effective_timeout_ns = compute_ready_timeout_ns(
+            if requested_timeout_ns != 0 {
+                requested_timeout_ns
+            } else {
+                service_timeout_ns
+            },
+            is_dynamic,
+            elf_entry.data_len,
+            lib_window_pages,
+            child_ut_bits,
+        );
+
         let plan = SpawnPlan {
             is_dynamic,
             wait_ready,
+            ready_timeout_ns: effective_timeout_ns,
             child_ut_bits,
             total_slots: estimate_slots(is_dynamic),
             is_display,
@@ -1227,16 +1394,11 @@ pub unsafe fn handle_spawn_tx(
         }
 
         if plan.wait_ready {
-            let wait_yields = if plan.is_dynamic {
-                READY_WAIT_YIELDS_DYNAMIC
-            } else {
-                READY_WAIT_YIELDS_STATIC
-            };
             if super::wait_for_child_ready(
                 child_tcb,
                 child_ready_ntfn,
                 &name[..name_len],
-                wait_yields,
+                plan.ready_timeout_ns,
             ) != 0
             {
                 alloc.rollback();

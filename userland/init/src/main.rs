@@ -390,6 +390,7 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
             let cnode_bits = mgr.services[svc_idx].def.cnode_bits as u64;
             let do_map_initrd = mgr.services[svc_idx].def.map_initrd;
             let memory_kb = mgr.services[svc_idx].def.memory_kb;
+            let ready_timeout_ns = mgr.services[svc_idx].def.timeout_start_ns;
             let svc_pre_ep = mgr.services[svc_idx].pre_ep;
 
             // Build extras from [Capabilities] declarations
@@ -436,6 +437,7 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                     cnode_bits,
                     ut_bits,
                     do_map_initrd,
+                    ready_timeout_ns,
                     svc_pre_ep,
                 )
             };
@@ -512,7 +514,8 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                 elf_name
             };
 
-            let pid = unsafe { spawn::pm_spawn(procmgr_ep, spawn_name) };
+            let ready_timeout_ns = mgr.services[svc_idx].def.timeout_start_ns;
+            let pid = unsafe { spawn::pm_spawn(procmgr_ep, spawn_name, ready_timeout_ns) };
             if pid < 0 {
                 { let mut lb = LineBuf::new(); lb.str(b"[INIT] Failed to spawn "); lb.bytes(name); lb.str(b" via procmgr\n"); lb.flush(); }
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
@@ -604,7 +607,8 @@ unsafe fn handle_child_exit(
                 elf_name
             };
 
-            let new_pid = spawn::pm_spawn(pm_ep, spawn_name);
+            let ready_timeout_ns = mgr.services[svc_idx].def.timeout_start_ns;
+            let new_pid = spawn::pm_spawn(pm_ep, spawn_name, ready_timeout_ns);
             if new_pid < 0 {
                 puts(b"[INIT] Failed to restart service\n");
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
@@ -766,4 +770,3 @@ pub extern "C" fn _start() -> ! {
     puts(b"[INIT] Entering service monitor loop\n");
     unsafe { service_monitor(&mut mgr, pm_ep) };
 }
-

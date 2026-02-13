@@ -4,6 +4,7 @@
  */
 
 #include "print.h"
+#include "fb_console.h"
 #include "string.h"
 
 static uint32_t print_targets = 0;
@@ -143,6 +144,11 @@ void print_init(uint32_t targets)
     }
 }
 
+void print_add_target(uint32_t target)
+{
+    print_targets |= target;
+}
+
 void print_char(char c)
 {
     if (print_targets & PRINT_TARGET_SERIAL) {
@@ -153,6 +159,10 @@ void print_char(char c)
 
     if (print_targets & PRINT_TARGET_VGA) {
         vga_putc(c);
+    }
+
+    if (print_targets & PRINT_TARGET_FB) {
+        fb_console_putc(c);
     }
 }
 

@@ -57,6 +57,8 @@ pub struct ServiceDef {
     pub before_count: u8,
     /// Memory budget in KiB (0 = system default).
     pub memory_kb: u16,
+    /// Service startup ready timeout in nanoseconds (0 = auto).
+    pub timeout_start_ns: u64,
     pub cnode_bits: u8,
     pub map_initrd: bool,
     pub caps: [CapCopyDef; MAX_CAP_COPIES],
@@ -81,6 +83,7 @@ impl ServiceDef {
             before: [[0; MAX_SERVICE_NAME]; MAX_DEPS],
             before_count: 0,
             memory_kb: 0,
+            timeout_start_ns: 0,
             cnode_bits: 0,
             map_initrd: false,
             caps: [CapCopyDef { src_slot: 0, dst_slot: 0 }; MAX_CAP_COPIES],
@@ -223,6 +226,75 @@ fn parse_decimal_u64(data: &[u8]) -> u64 {
         }
     }
     val
+}
+
+/// Parse systemd-style timeout value into nanoseconds.
+///
+/// Supported forms:
+/// - `10` / `10s` / `10sec` / `10seconds`
+/// - `500ms`
+/// - `200us`
+/// - `2m` / `2min` / `2minutes`
+/// - `1h` / `1hr` / `1hour`
+/// - `infinity` (treated as 0 = auto/no fixed timeout)
+fn parse_duration_ns(data: &[u8]) -> u64 {
+    let v = trim(data);
+    if v.is_empty() {
+        return 0;
+    }
+    if bytes_eq_ci(v, b"infinity") {
+        return 0;
+    }
+
+    let mut num_end = 0usize;
+    while num_end < v.len() && v[num_end] >= b'0' && v[num_end] <= b'9' {
+        num_end += 1;
+    }
+    if num_end == 0 {
+        return 0;
+    }
+
+    let n = parse_decimal_u64(&v[..num_end]);
+    let unit = trim(&v[num_end..]);
+
+    let scale = if unit.is_empty()
+        || bytes_eq_ci(unit, b"s")
+        || bytes_eq_ci(unit, b"sec")
+        || bytes_eq_ci(unit, b"secs")
+        || bytes_eq_ci(unit, b"second")
+        || bytes_eq_ci(unit, b"seconds")
+    {
+        1_000_000_000u64
+    } else if bytes_eq_ci(unit, b"ms")
+        || bytes_eq_ci(unit, b"msec")
+        || bytes_eq_ci(unit, b"msecs")
+    {
+        1_000_000u64
+    } else if bytes_eq_ci(unit, b"us")
+        || bytes_eq_ci(unit, b"usec")
+        || bytes_eq_ci(unit, b"usecs")
+    {
+        1_000u64
+    } else if bytes_eq_ci(unit, b"m")
+        || bytes_eq_ci(unit, b"min")
+        || bytes_eq_ci(unit, b"mins")
+        || bytes_eq_ci(unit, b"minute")
+        || bytes_eq_ci(unit, b"minutes")
+    {
+        60 * 1_000_000_000u64
+    } else if bytes_eq_ci(unit, b"h")
+        || bytes_eq_ci(unit, b"hr")
+        || bytes_eq_ci(unit, b"hrs")
+        || bytes_eq_ci(unit, b"hour")
+        || bytes_eq_ci(unit, b"hours")
+    {
+        60 * 60 * 1_000_000_000u64
+    } else {
+        // Unknown suffix: keep systemd-like default of seconds.
+        1_000_000_000u64
+    };
+
+    n.saturating_mul(scale)
 }
 
 fn parse_cap_copies(value: &[u8], caps: &mut [CapCopyDef; MAX_CAP_COPIES]) -> u8 {
@@ -400,6 +472,10 @@ pub fn parse_service(data: &[u8], out: &mut ServiceDef) -> bool {
                                 }
                             } else if bytes_eq_ci(key, b"MemoryKB") {
                                 out.memory_kb = parse_decimal_u16(value);
+                            } else if bytes_eq_ci(key, b"TimeoutStartSec")
+                                || bytes_eq_ci(key, b"TimeoutSec")
+                            {
+                                out.timeout_start_ns = parse_duration_ns(value);
                             } else if bytes_eq_ci(key, b"CNodeBits") {
                                 out.cnode_bits = parse_decimal_u16(value) as u8;
                             } else if bytes_eq_ci(key, b"MapInitrd") {

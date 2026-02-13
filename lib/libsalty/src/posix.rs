@@ -1625,3 +1625,34 @@ pub unsafe fn posix_getcwd(buf: *mut u8, size: u64) -> i32 {
         0
     }
 }
+
+/// Framebuffer ioctl wrapper.
+///
+/// Sends POSIX_VFS_IOCTL with an fb-specific command and unpacks up to 5 result registers.
+pub unsafe fn posix_fb_ioctl(fd: i32, cmd: u64, result: *mut [u64; 5]) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_IOCTL;
+        msg.length = 3;
+        msg.regs[0] = fd as u64;
+        msg.regs[1] = cmd;
+        msg.regs[2] = 0;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        if !result.is_null() {
+            for i in 0..5 {
+                (*result)[i] = reply.regs[i];
+            }
+        }
+        0
+    }
+}
