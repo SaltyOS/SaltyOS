@@ -26,7 +26,6 @@ const FB_MAP_VADDR: u64 = 0x0000_0000_3000_0000;
 const SHADOW_BUF_VADDR: u64 = 0x0000_0000_3800_0000;
 
 const CAP_SERVER_EP: u64 = 5;
-const FRAME_SLOT_BASE: u64 = 64;
 const UNTYPED_SCAN_COUNT: u64 = 16;
 
 struct DisplayState {
@@ -283,20 +282,30 @@ fn map_framebuffer(fb: &framebuffer::FramebufferInfo) -> bool {
 }
 
 fn alloc_shadow_buffer(num_pages: u64) -> bool {
-    let mut next_slot = FRAME_SLOT_BASE;
+    // SAFETY: Reading RTLD-updated global to avoid frame slot collision with shared lib pages.
+    let mut next_slot = unsafe { salty::__salty_next_frame_slot };
 
     for i in 0..num_pages {
         let frame_slot = next_slot;
         next_slot += 1;
 
         let mut allocated = false;
-        for ut in CAP_UNTYPED_START..(CAP_UNTYPED_START + UNTYPED_SCAN_COUNT) {
-            let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, frame_slot);
-            if err == 0 {
-                allocated = true;
-                break;
+
+        // Try dedicated untyped first (slot 7), then mirrored parent untypeds
+        let err = invoke::untyped_retype(7, OBJ_FRAME, 0, frame_slot);
+        if err == 0 {
+            allocated = true;
+        }
+        if !allocated {
+            for ut in CAP_UNTYPED_START..(CAP_UNTYPED_START + UNTYPED_SCAN_COUNT) {
+                let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, frame_slot);
+                if err == 0 {
+                    allocated = true;
+                    break;
+                }
             }
         }
+
         if !allocated {
             let mut lb = LineBuf::new();
             lb.str(b"[DISPLAY] Shadow alloc failed at page ");
@@ -320,6 +329,10 @@ fn alloc_shadow_buffer(num_pages: u64) -> bool {
             return false;
         }
     }
+
+    // Update global so later allocations don't collide
+    // SAFETY: Single-threaded userland process, no concurrent access.
+    unsafe { salty::__salty_next_frame_slot = next_slot; }
 
     {
         let mut lb = LineBuf::new();
