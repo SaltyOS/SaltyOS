@@ -1249,11 +1249,35 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
 
         let (name, name_len) = extract_name(msg, 1);
 
+        // Parse argv/envp from message registers after the path
+        let path_regs = 1 + ((msg.regs[0] as usize + 7) / 8);
+        let mut argc: u32 = 0;
+        let mut envc: u32 = 0;
+        let mut exec_str_data = [0u8; 128];
+        let mut exec_str_len: usize = 0;
+        if msg.length as usize > path_regs {
+            let packed = msg.regs[path_regs];
+            argc = (packed >> 32) as u32;
+            envc = (packed & 0xFFFF_FFFF) as u32;
+            let str_start = path_regs + 1;
+            if msg.length as usize > str_start {
+                let str_regs = msg.length as usize - str_start;
+                let str_bytes = str_regs * 8;
+                exec_str_len = if str_bytes > 128 { 128 } else { str_bytes };
+                let src = &msg.regs[str_start] as *const u64 as *const u8;
+                for i in 0..exec_str_len {
+                    exec_str_data[i] = *src.add(i);
+                }
+            }
+        }
+
         { let mut lb = LineBuf::new();
         lb.str(b"[PROCMGR] EXEC PID="); lb.hex(PROCTAB[idx].pid as u64);
         lb.str(b" -> '");
         lb.bytes(&name[..name_len]);
-        lb.str(b"'\n");
+        lb.str(b"' argc="); lb.hex(argc as u64);
+        lb.str(b" envc="); lb.hex(envc as u64);
+        lb.str(b"\n");
         lb.flush(); }
 
         let initrd = INITRD_VADDR as *const u8;
@@ -1539,8 +1563,22 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                 elf_entry.data, elf_entry.data_len,
                 stk_frame, &elf_result, &rtld_result, initrd_size,
                 shared_lib_base,
+                argc, envc, &exec_str_data, exec_str_len,
             ) {
                 Ok(rsp) => { new_rsp = rsp; new_entry = rtld_result.entry; }
+                Err(()) => {
+                    alloc.free_slots(frame_base, frame_count);
+                    reply.label = SALTY_OUT_OF_MEMORY;
+                    return;
+                }
+            }
+        } else {
+            // Static executable: write argv/envp to the top stack frame
+            match spawn_tx::write_static_stack(
+                stk_frame,
+                argc, envc, &exec_str_data, exec_str_len,
+            ) {
+                Ok(rsp) => { new_rsp = rsp; }
                 Err(()) => {
                     alloc.free_slots(frame_base, frame_count);
                     reply.label = SALTY_OUT_OF_MEMORY;

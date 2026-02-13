@@ -1,0 +1,8 @@
+[Service]
+Name=hello
+Binary=hello.elf
+Type=simple
+Restart=no
+
+[Dependencies]
+After=console procmgr vfs

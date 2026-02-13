@@ -535,7 +535,11 @@ pub unsafe fn posix_closedir(dir_fd: i32) -> i32 {
     unsafe { posix_close(dir_fd) }
 }
 
-pub unsafe fn posix_execve(path: *const u8) -> i32 {
+pub unsafe fn posix_execve(
+    path: *const u8,
+    argv: *const *const u8,
+    envp: *const *const u8,
+) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
         let mut reply = SaltyMsg::zeroed();
@@ -546,15 +550,93 @@ pub unsafe fn posix_execve(path: *const u8) -> i32 {
             path_len += 1;
         }
 
+        // regs[0] = path_len
         msg.regs[0] = path_len as u64;
-        for i in 1..20 {
-            msg.regs[i] = 0;
-        }
         let dst = &mut msg.regs[1] as *mut u64 as *mut u8;
         for i in 0..path_len as usize {
             *dst.add(i) = *path.add(i);
         }
-        msg.length = 1 + ((path_len as u64 + 7) / 8);
+        let path_regs = 1 + ((path_len as u64 + 7) / 8) as usize;
+
+        // Count argc and envc, and total string data length
+        let mut argc: u32 = 0;
+        let mut envc: u32 = 0;
+        let mut total_str_len: usize = 0;
+
+        if !argv.is_null() {
+            let mut i = 0;
+            while !(*argv.add(i)).is_null() {
+                let mut slen = 0usize;
+                while *(*argv.add(i)).add(slen) != 0 {
+                    slen += 1;
+                }
+                total_str_len += slen + 1; // include null terminator
+                argc += 1;
+                i += 1;
+            }
+        }
+        if !envp.is_null() {
+            let mut i = 0;
+            while !(*envp.add(i)).is_null() {
+                let mut slen = 0usize;
+                while *(*envp.add(i)).add(slen) != 0 {
+                    slen += 1;
+                }
+                total_str_len += slen + 1;
+                envc += 1;
+                i += 1;
+            }
+        }
+
+        // regs[path_regs] = (argc << 32) | envc
+        let next = path_regs;
+        msg.regs[next] = ((argc as u64) << 32) | (envc as u64);
+
+        // Pack null-terminated strings contiguously into regs[next+1..]
+        let str_start = next + 1;
+        let avail_bytes = (20 - str_start) * 8;
+        let copy_len = if total_str_len > avail_bytes { avail_bytes } else { total_str_len };
+
+        let str_dst = &mut msg.regs[str_start] as *mut u64 as *mut u8;
+        let mut pos = 0usize;
+
+        if !argv.is_null() {
+            let mut i = 0;
+            while !(*argv.add(i)).is_null() && pos < copy_len {
+                let arg = *argv.add(i);
+                let mut j = 0usize;
+                while *arg.add(j) != 0 && pos < copy_len {
+                    *str_dst.add(pos) = *arg.add(j);
+                    pos += 1;
+                    j += 1;
+                }
+                if pos < copy_len {
+                    *str_dst.add(pos) = 0;
+                    pos += 1;
+                }
+                i += 1;
+            }
+        }
+        if !envp.is_null() {
+            let mut i = 0;
+            while !(*envp.add(i)).is_null() && pos < copy_len {
+                let env = *envp.add(i);
+                let mut j = 0usize;
+                while *env.add(j) != 0 && pos < copy_len {
+                    *str_dst.add(pos) = *env.add(j);
+                    pos += 1;
+                    j += 1;
+                }
+                if pos < copy_len {
+                    *str_dst.add(pos) = 0;
+                    pos += 1;
+                }
+                i += 1;
+            }
+        }
+
+        let str_regs = (pos + 7) / 8;
+        msg.length = (str_start + str_regs) as u64;
 
         let err = crate::ipc::call_ctx(
             &raw mut crate::__salty_ipc_ctx,

@@ -36,5 +36,7 @@ pub mod wchar;
 pub mod sysinfo;
 pub mod pwd_impl;
 pub mod locale;
+pub mod glob_impl;
+pub mod select_impl;
 
 // Panic handler is provided by libsalty (our dependency)

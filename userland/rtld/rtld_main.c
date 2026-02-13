@@ -291,6 +291,17 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         rtld_lb_flush(&lb);
     }
 
-    ((void (*)(void))g_rtld.exe_entry)();
+    /* Restore RSP to the original stack (argc/argv/envp/auxv from procmgr)
+     * and jump (not call) to the executable entry point.
+     * C programs expect standard stack layout at _start; a plain C call
+     * would push a return address and clobber the stack pointer.
+     */
+    __asm__ volatile(
+        "mov %0, %%rsp\n"
+        "xor %%rbp, %%rbp\n"
+        "jmp *%1\n"
+        : : "r"(sp), "r"((void *)(uintptr_t)g_rtld.exe_entry)
+        : "memory"
+    );
     __builtin_unreachable();
 }

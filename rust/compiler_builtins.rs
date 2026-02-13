@@ -797,3 +797,169 @@ pub extern "C" fn __extendsfdf2(a: u32) -> u64 {
     let f64_frac = frac << (F64_FRAC_BITS - F32_FRAC_BITS);
     f64_pack(sign, new_exp, f64_frac)
 }
+
+// ---------------------------------------------------------------------------
+// Unsigned integer → f64 conversions
+// ---------------------------------------------------------------------------
+
+/// __floatunsidf: u32 → f64
+#[unsafe(export_name = "__floatunsidf")]
+pub extern "C" fn __floatunsidf(a: u32) -> u64 {
+    if a == 0 {
+        return 0;
+    }
+    let mag = a as u64;
+    let msb = 63 - mag.leading_zeros() as i32;
+    let exp = msb + F64_EXP_BIAS;
+    let frac = if msb > 52 {
+        mag >> (msb - 52)
+    } else {
+        mag << (52 - msb)
+    };
+    f64_pack(0, exp, frac & F64_FRAC_MASK)
+}
+
+/// __floatundidf: u64 → f64
+#[unsafe(export_name = "__floatundidf")]
+pub extern "C" fn __floatundidf(a: u64) -> u64 {
+    if a == 0 {
+        return 0;
+    }
+    let msb = 63 - a.leading_zeros() as i32;
+    let exp = msb + F64_EXP_BIAS;
+    let frac = if msb > 52 {
+        let shift = msb - 52;
+        let dropped = a & ((1u64 << shift) - 1);
+        let halfway = 1u64 << (shift - 1);
+        let mut f = a >> shift;
+        if dropped > halfway || (dropped == halfway && (f & 1) != 0) {
+            f += 1;
+        }
+        f
+    } else {
+        a << (52 - msb)
+    };
+    if frac >= (F64_IMPLICIT_BIT << 1) {
+        f64_pack(0, exp + 1, (frac >> 1) & F64_FRAC_MASK)
+    } else {
+        f64_pack(0, exp, frac & F64_FRAC_MASK)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// f64 → integer conversions
+// ---------------------------------------------------------------------------
+
+/// __fixdfsi: f64 → i32 (truncate toward zero)
+#[unsafe(export_name = "__fixdfsi")]
+pub extern "C" fn __fixdfsi(a: u64) -> i32 {
+    let sign = f64_sign(a);
+    let exp = f64_exp(a);
+    let frac = f64_frac(a);
+
+    if exp == 0x7FF || (exp == 0 && frac == 0) {
+        return 0;
+    }
+
+    let unbiased = exp - F64_EXP_BIAS;
+    if unbiased < 0 {
+        return 0;
+    }
+    if unbiased >= 31 {
+        return if sign != 0 { i32::MIN } else { i32::MAX };
+    }
+
+    let sig = frac | F64_IMPLICIT_BIT;
+    let shift = F64_FRAC_BITS as i32 - unbiased;
+    let mag = if shift > 0 { (sig >> shift) as u32 } else { (sig << (-shift)) as u32 };
+
+    if sign != 0 {
+        -(mag as i32)
+    } else {
+        mag as i32
+    }
+}
+
+/// __fixdfdi: f64 → i64 (truncate toward zero)
+#[unsafe(export_name = "__fixdfdi")]
+pub extern "C" fn __fixdfdi(a: u64) -> i64 {
+    let sign = f64_sign(a);
+    let exp = f64_exp(a);
+    let frac = f64_frac(a);
+
+    if exp == 0x7FF || (exp == 0 && frac == 0) {
+        return 0;
+    }
+
+    let unbiased = exp - F64_EXP_BIAS;
+    if unbiased < 0 {
+        return 0;
+    }
+    if unbiased >= 63 {
+        return if sign != 0 { i64::MIN } else { i64::MAX };
+    }
+
+    let sig = frac | F64_IMPLICIT_BIT;
+    let shift = F64_FRAC_BITS as i32 - unbiased;
+    let mag = if shift > 0 { sig >> shift } else { sig << (-shift) };
+
+    if sign != 0 {
+        -(mag as i64)
+    } else {
+        mag as i64
+    }
+}
+
+/// __fixunsdfsi: f64 → u32 (truncate toward zero, unsigned)
+#[unsafe(export_name = "__fixunsdfsi")]
+pub extern "C" fn __fixunsdfsi(a: u64) -> u32 {
+    let sign = f64_sign(a);
+    if sign != 0 {
+        return 0; // negative → 0 for unsigned
+    }
+    let exp = f64_exp(a);
+    let frac = f64_frac(a);
+
+    if exp == 0x7FF || (exp == 0 && frac == 0) {
+        return 0;
+    }
+
+    let unbiased = exp - F64_EXP_BIAS;
+    if unbiased < 0 {
+        return 0;
+    }
+    if unbiased >= 32 {
+        return u32::MAX;
+    }
+
+    let sig = frac | F64_IMPLICIT_BIT;
+    let shift = F64_FRAC_BITS as i32 - unbiased;
+    if shift > 0 { (sig >> shift) as u32 } else { (sig << (-shift)) as u32 }
+}
+
+/// __fixunsdfdi: f64 → u64 (truncate toward zero, unsigned)
+#[unsafe(export_name = "__fixunsdfdi")]
+pub extern "C" fn __fixunsdfdi(a: u64) -> u64 {
+    let sign = f64_sign(a);
+    if sign != 0 {
+        return 0;
+    }
+    let exp = f64_exp(a);
+    let frac = f64_frac(a);
+
+    if exp == 0x7FF || (exp == 0 && frac == 0) {
+        return 0;
+    }
+
+    let unbiased = exp - F64_EXP_BIAS;
+    if unbiased < 0 {
+        return 0;
+    }
+    if unbiased >= 64 {
+        return u64::MAX;
+    }
+
+    let sig = frac | F64_IMPLICIT_BIT;
+    let shift = F64_FRAC_BITS as i32 - unbiased;
+    if shift > 0 { sig >> shift } else { sig << (-shift) }
+}

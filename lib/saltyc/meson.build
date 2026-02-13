@@ -61,3 +61,6 @@ libc_so = custom_target('libc_so',
   ],
   build_by_default: true,
 )
+
+saltyc_inc = include_directories('include')
+saltyc_inc_dir = meson.current_source_dir() / 'include'

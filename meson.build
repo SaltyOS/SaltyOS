@@ -231,6 +231,12 @@ if build_userland and mkcpio.found()
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
+  initrd_hello_elf = custom_target('initrd_hello_elf',
+    input: hello_elf,
+    output: 'hello.initrd.elf',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
 
   # Service definition files
   svc_console = files('userland/services/console.service')
@@ -239,6 +245,7 @@ if build_userland and mkcpio.found()
   svc_procmgr = files('userland/services/procmgr.service')
   svc_display = files('userland/services/display.service')
   svc_test_runner = files('userland/services/test_runner.service')
+  svc_hello = files('userland/services/hello.service')
 
   # Shared libraries first for minimal library-window mapping.
   mkcpio_script = files('tools/mkcpio.py')
@@ -246,9 +253,9 @@ if build_userland and mkcpio.found()
     input: [initrd_rtld_so, initrd_libsalty_so, initrd_libc_so,
             initrd_init_elf, initrd_console_elf, initrd_nameserv_elf,
             initrd_procmgr_elf, initrd_vfs_elf, initrd_display_elf,
-            initrd_test_runner_elf,
+            initrd_test_runner_elf, initrd_hello_elf,
             svc_console, svc_nameserv, svc_vfs, svc_procmgr, svc_display,
-            svc_test_runner],
+            svc_test_runner, svc_hello],
     depend_files: mkcpio_script,
     output: 'initrd.cpio',
     command: [mkcpio,
@@ -263,12 +270,14 @@ if build_userland and mkcpio.found()
       'vfs.elf=@INPUT7@',
       'display.elf=@INPUT8@',
       'test_runner.elf=@INPUT9@',
-      'services/console.service=@INPUT10@',
-      'services/nameserv.service=@INPUT11@',
-      'services/vfs.service=@INPUT12@',
-      'services/procmgr.service=@INPUT13@',
-      'services/display.service=@INPUT14@',
-      'services/test_runner.service=@INPUT15@',
+      'hello.elf=@INPUT10@',
+      'services/console.service=@INPUT11@',
+      'services/nameserv.service=@INPUT12@',
+      'services/vfs.service=@INPUT13@',
+      'services/procmgr.service=@INPUT14@',
+      'services/display.service=@INPUT15@',
+      'services/test_runner.service=@INPUT16@',
+      'services/hello.service=@INPUT17@',
     ],
     build_by_default: true,
   )

@@ -210,11 +210,27 @@ pub unsafe extern "C" fn fchdir(_fd: i32) -> i32 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getcwd(buf: *mut u8, size: usize) -> *mut u8 {
-    if buf.is_null() || size == 0 {
-        errno::set_errno(errno::EINVAL);
-        return core::ptr::null_mut();
-    }
     unsafe {
+        if buf.is_null() {
+            // GNU extension: allocate buffer
+            let alloc_size = if size == 0 { 4096 } else { size };
+            let p = crate::malloc::malloc(alloc_size);
+            if p.is_null() {
+                errno::set_errno(errno::ENOMEM);
+                return core::ptr::null_mut();
+            }
+            let ret = salty::posix::posix_getcwd(p, alloc_size as u64);
+            if ret < 0 {
+                crate::malloc::free(p);
+                errno::set_errno(errno::ERANGE);
+                return core::ptr::null_mut();
+            }
+            return p;
+        }
+        if size == 0 {
+            errno::set_errno(errno::EINVAL);
+            return core::ptr::null_mut();
+        }
         let ret = salty::posix::posix_getcwd(buf, size as u64);
         if ret < 0 {
             errno::set_errno(errno::ERANGE);

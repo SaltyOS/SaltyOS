@@ -858,6 +858,9 @@ pub(crate) unsafe fn load_rtld(
 /// (may be less than full archive if using selective mapping).
 /// `shared_lib_base` is the load address of pre-mapped shared library RO pages
 /// (0 if not using shared lib cache).
+/// `argc`/`envc`/`str_data`/`str_len`: serialized argv+envp strings (null-terminated,
+/// packed contiguously). When argc==0 and str_len==0, the stack gets argc=0 with
+/// no argv/envp pointers (backward-compatible spawn path).
 pub(crate) unsafe fn write_dynamic_stack(
     elf_data: *const u8,
     elf_data_len: usize,
@@ -866,6 +869,10 @@ pub(crate) unsafe fn write_dynamic_stack(
     rtld_result: &ElfLoadResult,
     initrd_window_size: usize,
     shared_lib_base: u64,
+    argc: u32,
+    envc: u32,
+    str_data: &[u8],
+    str_len: usize,
 ) -> Result<u64, ()> {
     unsafe {
         let err = salty::invoke::vspace_map(
@@ -890,37 +897,173 @@ pub(crate) unsafe fn write_dynamic_stack(
         }
 
         let auxv_entries: u64 = if shared_lib_base != 0 { 14 } else { 13 };
-        let stack_frame_size: u64 = 3 * 8 + auxv_entries * 2 * 8 + 8;
 
-        let stack_base = (PROCMGR_SCRATCH_VADDR + 4096 - stack_frame_size) as *mut u64;
-        let mut idx: usize = 0;
-        let mut w = |v: u64| {
-            core::ptr::write_volatile(stack_base.add(idx), v);
-            idx += 1;
-        };
-        w(0); // argc
-        w(0); // argv terminator
-        w(0); // envp terminator
-        w(AT_PHDR);     w(phdr_vaddr);
-        w(AT_PHENT);    w(phent);
-        w(AT_PHNUM);    w(phnum);
-        w(AT_ENTRY);    w(elf_result.entry);
-        w(AT_BASE);     w(rtld_result.base);
-        w(AT_PAGESZ);   w(4096);
-        w(AT_SALTY_UNTYPED);    w(CHILD_CAP_UNTYPED);
-        w(AT_SALTY_VSPACE);     w(CHILD_CAP_VSPACE);
-        w(AT_SALTY_SCRATCH);    w(CHILD_SCRATCH_VADDR);
-        w(AT_SALTY_INITRD);     w(CHILD_INITRD_VADDR);
-        w(AT_SALTY_INITRD_SZ);  w(initrd_window_size as u64);
-        w(AT_SALTY_FRAME_SLOT); w(CHILD_RTLD_FRAME_SLOT_START);
-        if shared_lib_base != 0 {
-            w(AT_SALTY_SHARED_LIB_BASE); w(shared_lib_base);
-        }
-        w(AT_NULL);     w(0);
-        w(0); // padding
+        // Build the stack using the helper, which handles argv/envp layout
+        let rsp = write_stack_with_args(
+            argc, envc, str_data, str_len,
+            Some((auxv_entries, phdr_vaddr, phent, phnum,
+                  elf_result.entry, rtld_result.base,
+                  initrd_window_size as u64, shared_lib_base)),
+        );
 
         salty::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
-        Ok(CHILD_STACK_TOP - stack_frame_size)
+        Ok(rsp)
+    }
+}
+
+/// Build a stack for a statically-linked exec with argv/envp but no auxv.
+pub(crate) unsafe fn write_static_stack(
+    stk_frame: Cap,
+    argc: u32,
+    envc: u32,
+    str_data: &[u8],
+    str_len: usize,
+) -> Result<u64, ()> {
+    unsafe {
+        let err = salty::invoke::vspace_map(
+            CAP_SELF_VSPACE, stk_frame, PROCMGR_SCRATCH_VADDR,
+            VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+        );
+        if err != 0 {
+            puts(b"[PROCMGR] static stack scratch map failed\n");
+            return Err(());
+        }
+
+        let rsp = write_stack_with_args(argc, envc, str_data, str_len, None);
+
+        salty::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
+        Ok(rsp)
+    }
+}
+
+/// Common helper: write System V ABI initial stack into the scratch-mapped page.
+///
+/// Stack layout (high to low):
+///   - string data (argv strings then envp strings, null-terminated)
+///   - padding to 16-byte align
+///   - auxv entries (if present) terminated by AT_NULL
+///   - envp[envc] = NULL
+///   - envp[0..envc-1] = pointers to envp strings
+///   - argv[argc] = NULL
+///   - argv[0..argc-1] = pointers to argv strings
+///   - argc                <-- RSP
+///
+/// `auxv_info` is Some(...) for dynamic executables, None for static.
+unsafe fn write_stack_with_args(
+    argc: u32,
+    envc: u32,
+    str_data: &[u8],
+    str_len: usize,
+    auxv_info: Option<(u64, u64, u64, u64, u64, u64, u64, u64)>,
+) -> u64 {
+    unsafe {
+        let page_base = PROCMGR_SCRATCH_VADDR as *mut u8;
+        // The child sees this page at the top of its stack
+        let child_page_base = CHILD_STACK_TOP - 4096;
+
+        // 1. Copy string data to the top of the page
+        let str_area_start = 4096 - str_len;
+        for i in 0..str_len {
+            core::ptr::write_volatile(page_base.add(str_area_start + i), str_data[i]);
+        }
+
+        // 2. Build pointer arrays for argv and envp by scanning the string data
+        // to find individual null-terminated strings.
+        let mut argv_ptrs = [0u64; 64];
+        let mut envp_ptrs = [0u64; 64];
+        let mut arg_idx: u32 = 0;
+        let mut env_idx: u32 = 0;
+        let mut pos = 0usize;
+
+        // Parse argv strings
+        while arg_idx < argc && pos < str_len {
+            let str_child_addr = child_page_base + str_area_start as u64 + pos as u64;
+            argv_ptrs[arg_idx as usize] = str_child_addr;
+            arg_idx += 1;
+            // Skip to end of this null-terminated string
+            while pos < str_len && str_data[pos] != 0 {
+                pos += 1;
+            }
+            if pos < str_len {
+                pos += 1; // skip null terminator
+            }
+        }
+
+        // Parse envp strings
+        while env_idx < envc && pos < str_len {
+            let str_child_addr = child_page_base + str_area_start as u64 + pos as u64;
+            envp_ptrs[env_idx as usize] = str_child_addr;
+            env_idx += 1;
+            while pos < str_len && str_data[pos] != 0 {
+                pos += 1;
+            }
+            if pos < str_len {
+                pos += 1;
+            }
+        }
+
+        // 3. Calculate the metadata size (argc + argv ptrs + NULL + envp ptrs + NULL + auxv)
+        let auxv_u64s: usize = match auxv_info {
+            Some((entries, ..)) => entries as usize * 2, // entries includes AT_NULL
+            None => 2, // AT_NULL entry only
+        };
+        let metadata_u64s = 1 // argc
+            + arg_idx as usize + 1 // argv + NULL
+            + env_idx as usize + 1 // envp + NULL
+            + auxv_u64s;
+
+        let metadata_bytes = metadata_u64s * 8;
+        // Align down from str_area_start to make room for metadata, 16-byte aligned
+        let metadata_end = str_area_start;
+        let metadata_start = (metadata_end - metadata_bytes) & !0xF;
+
+        let stack_u64 = (PROCMGR_SCRATCH_VADDR + metadata_start as u64) as *mut u64;
+        let mut wi: usize = 0;
+        let mut w = |v: u64| {
+            core::ptr::write_volatile(stack_u64.add(wi), v);
+            wi += 1;
+        };
+
+        // argc
+        w(arg_idx as u64);
+
+        // argv pointers
+        for i in 0..arg_idx as usize {
+            w(argv_ptrs[i]);
+        }
+        w(0); // argv NULL terminator
+
+        // envp pointers
+        for i in 0..env_idx as usize {
+            w(envp_ptrs[i]);
+        }
+        w(0); // envp NULL terminator
+
+        // auxv
+        match auxv_info {
+            Some((_, phdr, phent, phnum, entry, base, initrd_sz, shared_lib)) => {
+                w(AT_PHDR);     w(phdr);
+                w(AT_PHENT);    w(phent);
+                w(AT_PHNUM);    w(phnum);
+                w(AT_ENTRY);    w(entry);
+                w(AT_BASE);     w(base);
+                w(AT_PAGESZ);   w(4096);
+                w(AT_SALTY_UNTYPED);    w(CHILD_CAP_UNTYPED);
+                w(AT_SALTY_VSPACE);     w(CHILD_CAP_VSPACE);
+                w(AT_SALTY_SCRATCH);    w(CHILD_SCRATCH_VADDR);
+                w(AT_SALTY_INITRD);     w(CHILD_INITRD_VADDR);
+                w(AT_SALTY_INITRD_SZ);  w(initrd_sz);
+                w(AT_SALTY_FRAME_SLOT); w(CHILD_RTLD_FRAME_SLOT_START);
+                if shared_lib != 0 {
+                    w(AT_SALTY_SHARED_LIB_BASE); w(shared_lib);
+                }
+            }
+            None => {}
+        }
+        w(AT_NULL); w(0);
+
+        // RSP in child address space
+        child_page_base + metadata_start as u64
     }
 }
 
@@ -1338,6 +1481,7 @@ pub unsafe fn handle_spawn_tx(
                 &rtld_result,
                 initrd_window_size,
                 shared_lib_base,
+                0, 0, &[], 0,
             ) {
                 Ok(rsp) => {
                     child_rsp = rsp;

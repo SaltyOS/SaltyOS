@@ -26,11 +26,11 @@ pub unsafe extern "C" fn fork() -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn execve(
     path: *const u8,
-    _argv: *const *const u8,
-    _envp: *const *const u8,
+    argv: *const *const u8,
+    envp: *const *const u8,
 ) -> i32 {
     unsafe {
-        let ret = salty::posix::posix_execve(path);
+        let ret = salty::posix::posix_execve(path, argv, envp);
         if ret < 0 {
             errno::set_errno(errno::ENOENT);
         }
@@ -60,29 +60,63 @@ pub unsafe extern "C" fn execvp(file: *const u8, argv: *const *const u8) -> i32 
             return execve(file, argv, core::ptr::null());
         }
 
-        // Search PATH: for simplicity, try /bin/<file> directly
-        let mut path_buf = [0u8; 256];
-        let prefix = b"/bin/";
-        let mut pos = 0;
-        for &c in prefix {
-            if pos < 255 {
-                path_buf[pos] = c;
-                pos += 1;
-            }
-        }
-        let mut j = 0;
-        while *file.add(j) != 0 && pos < 255 {
-            path_buf[pos] = *file.add(j);
-            pos += 1;
-            j += 1;
-        }
-        path_buf[pos] = 0;
+        let file_len = crate::string::strlen(file);
 
-        let ret = execve(path_buf.as_ptr(), argv, core::ptr::null());
-        if ret < 0 {
-            errno::set_errno(errno::ENOENT);
+        // Get PATH from environment
+        let path_env = crate::env::getenv(b"PATH\0".as_ptr());
+        let default_path = b"/bin:/usr/bin\0".as_ptr();
+        let path = if path_env.is_null() || *path_env == 0 {
+            default_path
+        } else {
+            path_env
+        };
+
+        // Walk PATH components separated by ':'
+        let mut start = 0;
+        loop {
+            let mut end = start;
+            while *path.add(end) != 0 && *path.add(end) != b':' {
+                end += 1;
+            }
+
+            let comp_len = end - start;
+            if comp_len > 0 {
+                let mut path_buf = [0u8; 512];
+                let mut pos = 0;
+
+                for k in 0..comp_len {
+                    if pos < 510 {
+                        path_buf[pos] = *path.add(start + k);
+                        pos += 1;
+                    }
+                }
+
+                if pos > 0 && path_buf[pos - 1] != b'/' && pos < 510 {
+                    path_buf[pos] = b'/';
+                    pos += 1;
+                }
+
+                for k in 0..file_len {
+                    if pos < 511 {
+                        path_buf[pos] = *file.add(k);
+                        pos += 1;
+                    }
+                }
+                path_buf[pos] = 0;
+
+                let ret = execve(path_buf.as_ptr(), argv, core::ptr::null());
+                // execve only returns on error
+                let _ = ret;
+            }
+
+            if *path.add(end) == 0 {
+                break;
+            }
+            start = end + 1;
         }
-        ret
+
+        errno::set_errno(errno::ENOENT);
+        -1
     }
 }
 
