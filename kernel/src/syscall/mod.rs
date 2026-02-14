@@ -149,6 +149,10 @@ pub enum SyscallError {
 /// This is the primary capability lookup function used by all syscall handlers.
 /// It retrieves a capability from the current thread's CNode (capability space).
 ///
+/// When in flat mode (depth=0), first tries direct slot lookup. If the address
+/// exceeds the root CNode size, falls back to auto-detecting a sub-CNode in the
+/// root and resolving through the seL4-style guard+radix tree.
+///
 /// # Arguments
 /// * `cap_ptr` - Capability slot index in the thread's CSpace
 ///
@@ -170,13 +174,143 @@ pub(crate) fn lookup_capability(cap_ptr: u64) -> Result<&'static Capability, Sys
         let depth = (*current_tcb).cspace_depth;
 
         if depth == 0 {
-            // Flat mode: direct slot index lookup (backward compatible)
-            cspace.get(cap_ptr as usize).ok_or(SyscallError::InvalidCapability)
+            // Flat mode: try direct slot index lookup first
+            if let Some(cap) = cspace.get(cap_ptr as usize) {
+                return Ok(cap);
+            }
+            // Fallback: auto-detect sub-CNode and resolve through tree
+            lookup_expanded(cspace, cap_ptr)
         } else {
             // Multi-level mode: walk CNode tree
             crate::cap::cnode::resolve_address(cspace, cap_ptr, depth)
                 .map_err(|_| SyscallError::InvalidCapability)
         }
+    }
+}
+
+/// Auto-detect expanded CNode structure and resolve address through the tree.
+///
+/// When a flat lookup fails (address >= num_slots), this function probes root
+/// slots to find a sub-CNode. It computes the root index by shifting cap_ptr
+/// right by candidate sub_bits values, checks if root[root_idx] holds a CNode
+/// with matching size_bits, and resolves through the full tree.
+fn lookup_expanded(cspace: &CNode, cap_ptr: u64) -> Result<&'static Capability, SyscallError> {
+    let root_bits = cspace.header.size_bits as usize;
+
+    // Try sub_bits from 4..16 (all valid CNode sizes)
+    for sub_bits in 4usize..=16 {
+        let root_idx = (cap_ptr >> sub_bits) as usize;
+        if root_idx >= cspace.num_slots() {
+            continue;
+        }
+        if let Some(cap) = cspace.get(root_idx) {
+            if cap.obj_type == ObjectType::CNode && !cap.object.is_null() {
+                let sub_cnode = unsafe { &*(cap.object as *const CNode) };
+                if sub_cnode.header.size_bits as usize == sub_bits {
+                    let total_depth = (root_bits + sub_bits) as u8;
+                    return crate::cap::cnode::resolve_address(cspace, cap_ptr, total_depth)
+                        .map_err(|_| SyscallError::InvalidCapability);
+                }
+            }
+        }
+    }
+
+    Err(SyscallError::InvalidCapability)
+}
+
+/// Auto-detect expanded CNode and resolve to CapRef (for untyped cap lookup).
+///
+/// Same logic as `lookup_expanded` but returns a CapRef instead of &Capability.
+fn lookup_expanded_slot(
+    cspace: &CNode,
+    cap_ptr: u64,
+) -> Result<crate::cap::cnode::CapRef, SyscallError> {
+    let root_bits = cspace.header.size_bits as usize;
+
+    for sub_bits in 4usize..=16 {
+        let root_idx = (cap_ptr >> sub_bits) as usize;
+        if root_idx >= cspace.num_slots() {
+            continue;
+        }
+        if let Some(cap) = cspace.get(root_idx) {
+            if cap.obj_type == ObjectType::CNode && !cap.object.is_null() {
+                let sub_cnode = unsafe { &*(cap.object as *const CNode) };
+                if sub_cnode.header.size_bits as usize == sub_bits {
+                    let total_depth = (root_bits + sub_bits) as u8;
+                    return crate::cap::cnode::resolve_address_slot(cspace, cap_ptr, total_depth)
+                        .map_err(|_| SyscallError::InvalidCapability);
+                }
+            }
+        }
+    }
+
+    Err(SyscallError::InvalidCapability)
+}
+
+/// Auto-detect expanded CNode and resolve to (*mut CNode, slot_index) for write ops.
+fn lookup_expanded_for_slot(
+    cspace: &CNode,
+    cap_ptr: u64,
+) -> Result<(*mut CNode, usize), SyscallError> {
+    let root_bits = cspace.header.size_bits as usize;
+
+    for sub_bits in 4usize..=16 {
+        let root_idx = (cap_ptr >> sub_bits) as usize;
+        if root_idx >= cspace.num_slots() {
+            continue;
+        }
+        if let Some(cap) = cspace.get(root_idx) {
+            if cap.obj_type == ObjectType::CNode && !cap.object.is_null() {
+                let sub_cnode = unsafe { &*(cap.object as *const CNode) };
+                if sub_cnode.header.size_bits as usize == sub_bits {
+                    let total_depth = (root_bits + sub_bits) as u8;
+                    return crate::cap::cnode::resolve_address_for_slot(cspace, cap_ptr, total_depth)
+                        .map_err(|_| SyscallError::InvalidCapability);
+                }
+            }
+        }
+    }
+
+    Err(SyscallError::InvalidCapability)
+}
+
+/// Read invoke depth values from the current thread's IPC buffer reserved[] fields.
+///
+/// Returns (reserved[0] as u8, reserved[1] as u8). Used by CNode and Untyped
+/// invoke handlers to determine whether slot addresses should be resolved through
+/// a multi-level CNode tree.
+///
+/// depth=0 means flat mode (backward compatible, since reserved[] is zero-initialized).
+///
+/// # Safety
+/// Caller must ensure the current TCB is valid.
+unsafe fn read_invoke_depths(tcb: *const Tcb) -> (u8, u8) {
+    unsafe {
+        let buf = (*tcb).ipc_buffer;
+        if buf == 0 {
+            return (0, 0);
+        }
+        let ipc_buf = buf as *const crate::ipc::IpcBuffer;
+        ((*ipc_buf).reserved[0] as u8, (*ipc_buf).reserved[1] as u8)
+    }
+}
+
+/// Resolve a slot address within a CNode, using tree-walking when depth > 0.
+///
+/// When depth=0, returns the CNode pointer and flat index directly (backward compatible).
+/// When depth>0, walks the CNode tree using seL4-style guard+radix resolution.
+///
+/// Returns (leaf CNode pointer, leaf slot index) on success.
+fn resolve_invoke_slot(
+    cnode: &CNode,
+    addr: u64,
+    depth: u8,
+) -> Result<(*mut CNode, usize), SyscallError> {
+    if depth == 0 {
+        Ok((cnode as *const CNode as *mut CNode, addr as usize))
+    } else {
+        crate::cap::cnode::resolve_address_for_slot(cnode, addr, depth)
+            .map_err(|_| SyscallError::InvalidCapability)
     }
 }
 
@@ -619,7 +753,7 @@ fn syscall_signal(cap_ptr: u64, bits: u64) -> SyscallResult {
         let irq = save_irq_disable();
         SCHED_IPC_LOCK.lock();
         let notification = &mut *(cap.object as *mut Notification);
-        notification.signal(bits);
+        notification.signal(cap.badge | bits);
         SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
     }
@@ -693,9 +827,14 @@ fn syscall_invoke(
             // CNode_Copy: entire operation under CAP_LOCK
             //   arg0 = src slot index, arg1 = dest CNode cap_ptr
             //   arg2 = dest slot index, arg3 = rights mask
+            //   IPC buffer: reserved[0] = src_depth, reserved[1] = dest_depth
             unsafe {
                 let irq = save_irq_disable();
                 CAP_LOCK.lock();
+                let current_tcb = crate::sched::scheduler::scheduler().current();
+                let (src_depth, dest_depth) = if !current_tcb.is_null() {
+                    read_invoke_depths(current_tcb)
+                } else { (0, 0) };
                 let dest_cnode_cap = match lookup_capability(arg1) {
                     Ok(c) => c,
                     Err(e) => {
@@ -710,9 +849,17 @@ fn syscall_invoke(
                     return SyscallResult::err(e);
                 }
                 let rights = CapRights::from_bits(arg3 as u32);
-                let dest = &mut *(dest_cnode_cap.object as *mut CNode);
-                let src = &*(cap.object as *const CNode);
-                let result = match dest.copy_slot(arg2 as usize, src, arg0 as usize, rights) {
+                let src_root = &*(cap.object as *const CNode);
+                let dest_root = &*(dest_cnode_cap.object as *const CNode);
+                let (src_leaf, src_idx) = match resolve_invoke_slot(src_root, arg0, src_depth) {
+                    Ok(v) => v,
+                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                };
+                let (dest_leaf, dest_idx) = match resolve_invoke_slot(dest_root, arg2, dest_depth) {
+                    Ok(v) => v,
+                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                };
+                let result = match (&mut *dest_leaf).copy_slot(dest_idx, &*src_leaf, src_idx, rights) {
                     Ok(()) => SyscallResult::ok(0),
                     Err(e) => SyscallResult::err(syscall_error_from_cap_error(e)),
                 };
@@ -725,9 +872,14 @@ fn syscall_invoke(
             // CNode_Mint: entire operation under CAP_LOCK
             //   arg0 = src slot index, arg1 = dest CNode cap_ptr
             //   arg2 = dest slot index, arg3 = badge value
+            //   IPC buffer: reserved[0] = src_depth, reserved[1] = dest_depth
             unsafe {
                 let irq = save_irq_disable();
                 CAP_LOCK.lock();
+                let current_tcb = crate::sched::scheduler::scheduler().current();
+                let (src_depth, dest_depth) = if !current_tcb.is_null() {
+                    read_invoke_depths(current_tcb)
+                } else { (0, 0) };
                 let dest_cnode_cap = match lookup_capability(arg1) {
                     Ok(c) => c,
                     Err(e) => {
@@ -742,9 +894,17 @@ fn syscall_invoke(
                     return SyscallResult::err(e);
                 }
                 let rights = CapRights::from_bits(0xFFFFFFFF & !(1 << 3));
-                let dest = &mut *(dest_cnode_cap.object as *mut CNode);
-                let src = &*(cap.object as *const CNode);
-                let result = match dest.mint_slot(arg2 as usize, src, arg0 as usize, arg3, rights) {
+                let src_root = &*(cap.object as *const CNode);
+                let dest_root = &*(dest_cnode_cap.object as *const CNode);
+                let (src_leaf, src_idx) = match resolve_invoke_slot(src_root, arg0, src_depth) {
+                    Ok(v) => v,
+                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                };
+                let (dest_leaf, dest_idx) = match resolve_invoke_slot(dest_root, arg2, dest_depth) {
+                    Ok(v) => v,
+                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                };
+                let result = match (&mut *dest_leaf).mint_slot(dest_idx, &*src_leaf, src_idx, arg3, rights) {
                     Ok(()) => SyscallResult::ok(0),
                     Err(e) => SyscallResult::err(syscall_error_from_cap_error(e)),
                 };
@@ -756,9 +916,14 @@ fn syscall_invoke(
         (ObjectType::CNode, 0x12) => {
             // CNode_Move: entire operation under CAP_LOCK
             //   arg0 = dest slot index, arg1 = src CNode cap_ptr, arg2 = src slot index
+            //   IPC buffer: reserved[0] = dest_depth, reserved[1] = src_depth
             unsafe {
                 let irq = save_irq_disable();
                 CAP_LOCK.lock();
+                let current_tcb = crate::sched::scheduler::scheduler().current();
+                let (dest_depth, src_depth) = if !current_tcb.is_null() {
+                    read_invoke_depths(current_tcb)
+                } else { (0, 0) };
                 let src_cnode_cap = match lookup_capability(arg1) {
                     Ok(c) => c,
                     Err(e) => {
@@ -772,9 +937,17 @@ fn syscall_invoke(
                     restore_irq(irq);
                     return SyscallResult::err(e);
                 }
-                let dest = &mut *(cap.object as *mut CNode);
-                let src = &mut *(src_cnode_cap.object as *mut CNode);
-                let result = match dest.move_slot(arg0 as usize, src, arg2 as usize) {
+                let dest_root = &*(cap.object as *const CNode);
+                let src_root = &*(src_cnode_cap.object as *const CNode);
+                let (dest_leaf, dest_idx) = match resolve_invoke_slot(dest_root, arg0, dest_depth) {
+                    Ok(v) => v,
+                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                };
+                let (src_leaf, src_idx) = match resolve_invoke_slot(src_root, arg2, src_depth) {
+                    Ok(v) => v,
+                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                };
+                let result = match (&mut *dest_leaf).move_slot(dest_idx, &mut *src_leaf, src_idx) {
                     Ok(()) => SyscallResult::ok(0),
                     Err(e) => SyscallResult::err(syscall_error_from_cap_error(e)),
                 };
@@ -787,9 +960,14 @@ fn syscall_invoke(
             // CNode_Mutate: entire operation under CAP_LOCK
             //   arg0 = dest slot index, arg1 = src CNode cap_ptr
             //   arg2 = src slot index, arg3 = new badge value
+            //   IPC buffer: reserved[0] = dest_depth, reserved[1] = src_depth
             unsafe {
                 let irq = save_irq_disable();
                 CAP_LOCK.lock();
+                let current_tcb = crate::sched::scheduler::scheduler().current();
+                let (dest_depth, src_depth) = if !current_tcb.is_null() {
+                    read_invoke_depths(current_tcb)
+                } else { (0, 0) };
                 let src_cnode_cap = match lookup_capability(arg1) {
                     Ok(c) => c,
                     Err(e) => {
@@ -803,9 +981,17 @@ fn syscall_invoke(
                     restore_irq(irq);
                     return SyscallResult::err(e);
                 }
-                let dest = &mut *(cap.object as *mut CNode);
-                let src = &mut *(src_cnode_cap.object as *mut CNode);
-                let result = match dest.mutate_slot(arg0 as usize, src, arg2 as usize, arg3) {
+                let dest_root = &*(cap.object as *const CNode);
+                let src_root = &*(src_cnode_cap.object as *const CNode);
+                let (dest_leaf, dest_idx) = match resolve_invoke_slot(dest_root, arg0, dest_depth) {
+                    Ok(v) => v,
+                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                };
+                let (src_leaf, src_idx) = match resolve_invoke_slot(src_root, arg2, src_depth) {
+                    Ok(v) => v,
+                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                };
+                let result = match (&mut *dest_leaf).mutate_slot(dest_idx, &mut *src_leaf, src_idx, arg3) {
                     Ok(()) => SyscallResult::ok(0),
                     Err(e) => SyscallResult::err(syscall_error_from_cap_error(e)),
                 };
@@ -816,14 +1002,23 @@ fn syscall_invoke(
         }
         (ObjectType::CNode, 0x14) => {
             // CNode_Delete: entire operation under CAP_LOCK
+            //   IPC buffer: reserved[0] = depth for arg0
             if !cap.has_right(CapRights::WRITE) {
                 return SyscallResult::err(SyscallError::InsufficientRights);
             }
             unsafe {
                 let irq = save_irq_disable();
                 CAP_LOCK.lock();
-                let cnode = &mut *(cap.object as *mut CNode);
-                let result = match cnode.delete(arg0 as usize) {
+                let current_tcb = crate::sched::scheduler::scheduler().current();
+                let (depth, _) = if !current_tcb.is_null() {
+                    read_invoke_depths(current_tcb)
+                } else { (0, 0) };
+                let cnode_root = &*(cap.object as *const CNode);
+                let (leaf, idx) = match resolve_invoke_slot(cnode_root, arg0, depth) {
+                    Ok(v) => v,
+                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                };
+                let result = match (&mut *leaf).delete(idx) {
                     Ok(()) => SyscallResult::ok(0),
                     Err(e) => SyscallResult::err(syscall_error_from_cap_error(e)),
                 };
@@ -834,14 +1029,23 @@ fn syscall_invoke(
         }
         (ObjectType::CNode, 0x15) => {
             // CNode_Revoke: entire operation under CAP_LOCK
+            //   IPC buffer: reserved[0] = depth for arg0
             if !cap.has_right(CapRights::WRITE) {
                 return SyscallResult::err(SyscallError::InsufficientRights);
             }
             unsafe {
                 let irq = save_irq_disable();
                 CAP_LOCK.lock();
-                let cnode = &mut *(cap.object as *mut CNode);
-                let result = match cnode.revoke(arg0 as usize) {
+                let current_tcb = crate::sched::scheduler::scheduler().current();
+                let (depth, _) = if !current_tcb.is_null() {
+                    read_invoke_depths(current_tcb)
+                } else { (0, 0) };
+                let cnode_root = &*(cap.object as *const CNode);
+                let (leaf, idx) = match resolve_invoke_slot(cnode_root, arg0, depth) {
+                    Ok(v) => v,
+                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                };
+                let result = match (&mut *leaf).revoke(idx) {
                     Ok(()) => SyscallResult::ok(0),
                     Err(e) => SyscallResult::err(syscall_error_from_cap_error(e)),
                 };
@@ -853,20 +1057,26 @@ fn syscall_invoke(
         (ObjectType::CNode, 0x16) => {
             // CNode_SaveCaller: entire operation under CAP_LOCK
             //   arg0 = slot index to save the reply cap into
+            //   IPC buffer: reserved[0] = depth for arg0
             if !cap.has_right(CapRights::WRITE) {
                 return SyscallResult::err(SyscallError::InsufficientRights);
             }
             unsafe {
                 let irq = save_irq_disable();
                 CAP_LOCK.lock();
-                let cnode = &mut *(cap.object as *mut CNode);
                 let current_tcb = crate::sched::scheduler::scheduler().current();
                 if current_tcb.is_null() {
                     CAP_LOCK.unlock();
                     restore_irq(irq);
                     return SyscallResult::err(SyscallError::InvalidOperation);
                 }
-                let result = match cnode.save_caller(arg0 as usize, current_tcb) {
+                let (depth, _) = read_invoke_depths(current_tcb);
+                let cnode_root = &*(cap.object as *const CNode);
+                let (leaf, idx) = match resolve_invoke_slot(cnode_root, arg0, depth) {
+                    Ok(v) => v,
+                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                };
+                let result = match (&mut *leaf).save_caller(idx, current_tcb) {
                     Ok(()) => SyscallResult::ok(0),
                     Err(e) => SyscallResult::err(syscall_error_from_cap_error(e)),
                 };
@@ -1865,6 +2075,8 @@ fn syscall_sc_consumed(cap: &Capability) -> SyscallResult {
 /// - new_type_raw: ObjectType as u64 (must be 1..=10, not 0/Null)
 /// - size_bits: Size in bits (for variable-size objects)
 /// - dest_offset: Destination offset in current thread's CSpace
+///
+/// IPC buffer reserved[0] = dest_depth (0 = flat mode, backward compatible)
 fn syscall_untyped_retype(
     cap: &Capability,
     cap_ptr: u64,
@@ -1904,13 +2116,21 @@ fn syscall_untyped_retype(
         let cspace = &mut *(*current_tcb).cspace_root;
         let depth = (*current_tcb).cspace_depth;
 
+        // Resolve untyped cap_ref (may be in expanded slot)
         let cap_ref = if depth == 0 {
+            // Try flat first, then expanded fallback
             match cspace.get_ref(cap_ptr as usize) {
                 Some(r) => r,
                 None => {
-                    CAP_LOCK.unlock();
-                    restore_irq(irq);
-                    return SyscallResult::err(SyscallError::InvalidCapability);
+                    // Try expanded resolution for untyped caps in sub-CNodes
+                    match lookup_expanded_slot(cspace, cap_ptr) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            CAP_LOCK.unlock();
+                            restore_irq(irq);
+                            return SyscallResult::err(SyscallError::InvalidCapability);
+                        }
+                    }
                 }
             }
         } else {
@@ -1925,14 +2145,45 @@ fn syscall_untyped_retype(
         };
         let untyped_slot = cap_ref.slot;
 
+        // Read dest_depth from IPC buffer reserved[0]
+        let (dest_depth, _) = read_invoke_depths(current_tcb);
+
+        // Resolve destination CNode and slot index
+        let (dest_cn_ptr, dest_idx) = if dest_depth > 0 {
+            match resolve_invoke_slot(cspace, dest_offset, dest_depth) {
+                Ok(v) => v,
+                Err(e) => {
+                    CAP_LOCK.unlock();
+                    restore_irq(irq);
+                    return SyscallResult::err(e);
+                }
+            }
+        } else {
+            // Flat mode: try direct, then auto-detect expanded
+            if (dest_offset as usize) < cspace.num_slots() {
+                (cspace as *const CNode as *mut CNode, dest_offset as usize)
+            } else {
+                // Auto-detect expanded destination
+                match lookup_expanded_for_slot(cspace, dest_offset) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        CAP_LOCK.unlock();
+                        restore_irq(irq);
+                        return SyscallResult::err(e);
+                    }
+                }
+            }
+        };
+        let dest_cn = &mut *dest_cn_ptr;
+
         let untyped = &mut *(cap.object as *mut UntypedMemory);
         let result = match untyped.retype(
             untyped_slot,
             new_type,
             size_bits as u8,
             1,
-            cspace,
-            dest_offset as usize,
+            dest_cn,
+            dest_idx,
         ) {
             Ok(()) => SyscallResult::ok(0),
             Err(e) => SyscallResult::err(syscall_error_from_cap_error(e)),

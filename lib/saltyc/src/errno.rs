@@ -1,5 +1,12 @@
 //! errno implementation
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Global errno variable with `__errno_location()` accessor for C code.
+//! Values use Linux numbering (e.g. `ENOENT = 2`, `EINVAL = 22`).
+//!
+//! **Not thread-safe**: uses a single `static mut ERRNO`. This is correct
+//! for SaltyOS where each process is single-threaded. A multi-threaded
+//! implementation would need TLS.
 
 // errno constants
 pub const EPERM: i32 = 1;
@@ -72,14 +79,16 @@ pub unsafe extern "C" fn __errno_location() -> *mut i32 {
     &raw mut ERRNO
 }
 
-/// Set errno from Rust code
+/// Set errno from Rust code.
 pub fn set_errno(val: i32) {
+    // SAFETY: single-threaded process; no concurrent access to ERRNO.
     unsafe {
         ERRNO = val;
     }
 }
 
-/// Get errno from Rust code
+/// Get errno from Rust code.
 pub fn get_errno() -> i32 {
+    // SAFETY: single-threaded process; no concurrent access to ERRNO.
     unsafe { ERRNO }
 }

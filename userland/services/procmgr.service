@@ -5,11 +5,12 @@ Type=simple
 Restart=always
 CNodeBits=12
 MapInitrd=yes
+PreProcmgr=yes
 
 [Dependencies]
 After=console
 Before=nameserv vfs test_runner
-Requires=nameserv:8 vfs:9
 
 [Capabilities]
-CopyCap=12:12 13:13
+CopyCap=13:66
+NeedEP=nameserv:64 vfs:65

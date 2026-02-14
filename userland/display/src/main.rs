@@ -25,8 +25,10 @@ const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 const FB_MAP_VADDR: u64 = 0x0000_0000_3000_0000;
 const SHADOW_BUF_VADDR: u64 = 0x0000_0000_3800_0000;
 
-const CAP_SERVER_EP: u64 = 5;
-const UNTYPED_SCAN_COUNT: u64 = 16;
+// slot 3 is kept as procmgr EP for slot_alloc expansion; display service EP is separate.
+const CAP_SERVER_EP: u64 = 68;    // Pre-created display service EP (injected by procmgr)
+const CAP_FB_UNTYPED: u64 = 13;   // Standard well-known slot (consts::CAP_FB_UNTYPED)
+const CAP_NAMESERV_EP: u64 = 5;   // Standard well-known slot (consts::CAP_NAMESERV_EP)
 
 struct DisplayState {
     vram: *mut u8,
@@ -282,57 +284,47 @@ fn map_framebuffer(fb: &framebuffer::FramebufferInfo) -> bool {
 }
 
 fn alloc_shadow_buffer(num_pages: u64) -> bool {
-    // SAFETY: Reading RTLD-updated global to avoid frame slot collision with shared lib pages.
-    let mut next_slot = unsafe { salty::__salty_next_frame_slot };
+    let flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
+    const MAX_RETRIES: usize = 1000;
 
     for i in 0..num_pages {
-        let frame_slot = next_slot;
-        next_slot += 1;
-
-        let mut allocated = false;
-
-        // Try dedicated untyped first (slot 7), then mirrored parent untypeds
-        let err = invoke::untyped_retype(7, OBJ_FRAME, 0, frame_slot);
-        if err == 0 {
-            allocated = true;
-        }
-        if !allocated {
-            for ut in CAP_UNTYPED_START..(CAP_UNTYPED_START + UNTYPED_SCAN_COUNT) {
-                let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, frame_slot);
-                if err == 0 {
-                    allocated = true;
-                    break;
+        let vaddr = SHADOW_BUF_VADDR + i * 4096;
+        let mut retries = 0;
+        loop {
+            match salty::slot_alloc::slot_alloc_frame_map_async(CAP_SELF_VSPACE, vaddr, flags) {
+                salty::slot_alloc::SlotResult::Ok(_) => break,
+                salty::slot_alloc::SlotResult::WouldBlock => {
+                    retries += 1;
+                    if retries % 100 == 0 {
+                        let mut lb = LineBuf::new();
+                        lb.str(b"[DISPLAY] expand retry ");
+                        lb.dec(retries as u64);
+                        lb.str(b" page=");
+                        lb.hex(i);
+                        lb.str(b"\n");
+                        lb.flush();
+                    }
+                    if retries > MAX_RETRIES {
+                        let mut lb = LineBuf::new();
+                        lb.str(b"[DISPLAY] Shadow alloc max retries at page ");
+                        lb.hex(i);
+                        lb.str(b"\n");
+                        lb.flush();
+                        return false;
+                    }
+                    syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+                }
+                salty::slot_alloc::SlotResult::Exhausted => {
+                    let mut lb = LineBuf::new();
+                    lb.str(b"[DISPLAY] Shadow alloc exhausted at page ");
+                    lb.hex(i);
+                    lb.str(b"\n");
+                    lb.flush();
+                    return false;
                 }
             }
         }
-
-        if !allocated {
-            let mut lb = LineBuf::new();
-            lb.str(b"[DISPLAY] Shadow alloc failed at page ");
-            lb.hex(i);
-            lb.str(b"\n");
-            lb.flush();
-            return false;
-        }
-
-        let vaddr = SHADOW_BUF_VADDR + i * 4096;
-        let flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-        let err = invoke::vspace_map(CAP_SELF_VSPACE, frame_slot, vaddr, flags);
-        if err != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[DISPLAY] Shadow map failed at page ");
-            lb.hex(i);
-            lb.str(b" err=");
-            lb.hex(err as u64);
-            lb.str(b"\n");
-            lb.flush();
-            return false;
-        }
     }
-
-    // Update global so later allocations don't collide
-    // SAFETY: Single-threaded userland process, no concurrent access.
-    unsafe { salty::__salty_next_frame_slot = next_slot; }
 
     {
         let mut lb = LineBuf::new();
@@ -340,7 +332,9 @@ fn alloc_shadow_buffer(num_pages: u64) -> bool {
         lb.hex(num_pages);
         lb.str(b" shadow pages at ");
         lb.hex(SHADOW_BUF_VADDR);
-        lb.str(b"\n");
+        lb.str(b" (slot_alloc remaining=");
+        lb.hex(salty::slot_alloc::slot_alloc_remaining());
+        lb.str(b")\n");
         lb.flush();
     }
 
@@ -450,6 +444,21 @@ fn handle_terminal_write(state: &mut DisplayState, msg: &SaltyMsg, reply: &mut S
     let text_ptr = &msg.regs[1] as *const u64 as *const u8;
     let max_bytes = if data_len > 152 { 152 } else { data_len };
 
+    {
+        static mut DBG_COUNT: u32 = 0;
+        // SAFETY: Single-threaded server, no concurrent access.
+        let cnt = unsafe { &raw mut DBG_COUNT };
+        let c = unsafe { *cnt };
+        unsafe { *cnt = c + 1; }
+        if c < 3 {
+            let mut lb = LineBuf::new();
+            lb.str(b"[DISPLAY] terminal_write len=");
+            lb.dec(data_len as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
+    }
+
     for i in 0..max_bytes {
         // SAFETY: Reading text bytes from message registers, bounded by max_bytes.
         let c = unsafe { *text_ptr.add(i) };
@@ -473,6 +482,20 @@ pub extern "C" fn _start() -> ! {
     unsafe {
         invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
         ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
+    }
+
+    // Initialize per-process slot allocator from RTLD-exported globals
+    unsafe {
+        let base = *(&raw const salty::__salty_slot_base);
+        let count = *(&raw const salty::__salty_slot_count);
+        let expand_ep = *(&raw const salty::__salty_expand_ep);
+        if base != 0 {
+            salty::slot_alloc::slot_alloc_init(base, count, expand_ep);
+        } else {
+            puts(b"[DISPLAY] FATAL: slot pool not provided by RTLD/auxv\n");
+            signal_ready();
+            idle();
+        }
     }
 
     // Read framebuffer info from boot info page
@@ -552,6 +575,13 @@ pub extern "C" fn _start() -> ! {
     syscall(SYS_DEBUG_CONSOLE_CONTROL, 0, 0, 0, 0, 0, 0);
     puts(b"[DISPLAY] Kernel console disabled, display server owns FB\n");
 
+    // Clear screen to background color for a clean terminal
+    let w = state.width;
+    let h = state.height;
+    let bg = state.bg;
+    fill_rect(&mut state, 0, 0, w, h, bg);
+    flush_damage(&mut state);
+
     // Register with nameserv
     register_with_nameserv();
 
@@ -565,7 +595,11 @@ pub extern "C" fn _start() -> ! {
 
     let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
     if err != 0 {
-        puts(b"[DISPLAY] initial recv failed\n");
+        let mut lb = LineBuf::new();
+        lb.str(b"[DISPLAY] initial recv failed err=");
+        lb.hex(err as u64);
+        lb.str(b"\n");
+        lb.flush();
         idle();
     }
 

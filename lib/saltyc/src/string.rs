@@ -1,5 +1,10 @@
 //! String functions
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! NUL-terminated C string operations: `strlen`, `strcmp`, `strcpy`, `strcat`,
+//! `strchr`, `strrchr`, `strstr`, `strtok`, `strerror`, plus BSD extensions
+//! `strlcpy`, `strlcat`, `strsep`. The `strtok` function uses a static
+//! save pointer (not thread-safe, matches POSIX behavior).
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn strlen(s: *const u8) -> usize {

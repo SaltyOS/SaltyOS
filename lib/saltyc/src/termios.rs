@@ -1,5 +1,10 @@
 //! Terminal I/O (termios)
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Provides the `termios` struct and `tcgetattr`/`tcsetattr`/`cfmakeraw`/
+//! `cfgetospeed`/`cfsetospeed`/`cfgetispeed`/`cfsetispeed`. Attribute
+//! get/set are stored locally (not sent to a kernel terminal driver).
+//! Speed constants use Linux numbering (`B9600 = 13`, `B115200 = 0x1002`).
 
 pub const NCCS: usize = 32;
 

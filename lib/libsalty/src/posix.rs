@@ -1,9 +1,30 @@
 //! POSIX file I/O and process management wrappers
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Every POSIX operation is implemented as an IPC `Call` to either the VFS
+//! server (`CAP_VFS_EP`) or the process manager (`CAP_PROCMGR_EP`). The
+//! client packs arguments into a `SaltyMsg`, sends it, and unpacks the
+//! reply. No kernel objects are created -- all state lives in the servers.
+//!
+//! # Data transfer chunking
+//!
+//! `posix_read` and `posix_write` transfer data in chunks of up to 152/144
+//! bytes per IPC round-trip (limited by the 20-register message buffer).
+//! Large reads/writes loop until the full count is transferred or EOF.
+//!
+//! # Path encoding
+//!
+//! Filesystem paths are packed into message registers by `pack_path()`:
+//! `regs[offset]` = path length (max 64), followed by the path bytes
+//! packed into subsequent u64 registers.
 
 use crate::consts::*;
 use crate::types::*;
 
+/// Pack a null-terminated path into message registers starting at `offset`.
+///
+/// Writes the path length into `regs[offset]` and the path bytes (up to 64)
+/// into `regs[offset+1..]`. Returns the path length.
 unsafe fn pack_path(msg: *mut SaltyMsg, offset: usize, path: *const u8) -> u8 {
     unsafe {
         let mut path_len: u8 = 0;
@@ -22,6 +43,9 @@ unsafe fn pack_path(msg: *mut SaltyMsg, offset: usize, path: *const u8) -> u8 {
     }
 }
 
+/// Open a file at `path` with the given `flags` (O_RDONLY, O_CREAT, etc.).
+///
+/// Returns the new file descriptor on success, or -1 on error.
 pub unsafe fn posix_open(path: *const u8, flags: i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -45,6 +69,10 @@ pub unsafe fn posix_open(path: *const u8, flags: i32) -> i32 {
     }
 }
 
+/// Read up to `count` bytes from file descriptor `fd` into `buf`.
+///
+/// Performs chunked IPC reads (max 152 bytes per round-trip) in a loop.
+/// Returns the total bytes read, or -1 on error.
 pub unsafe fn posix_read(fd: i32, buf: *mut u8, count: u64) -> i64 {
     unsafe {
         let mut total: u64 = 0;
@@ -94,6 +122,10 @@ pub unsafe fn posix_read(fd: i32, buf: *mut u8, count: u64) -> i64 {
     }
 }
 
+/// Write up to `count` bytes from `buf` to file descriptor `fd`.
+///
+/// Performs chunked IPC writes (max 144 bytes per round-trip) in a loop.
+/// Returns the total bytes written, or -1 on error.
 pub unsafe fn posix_write(fd: i32, buf: *const u8, count: u64) -> i64 {
     unsafe {
         let mut total: u64 = 0;
@@ -137,6 +169,7 @@ pub unsafe fn posix_write(fd: i32, buf: *const u8, count: u64) -> i64 {
     }
 }
 
+/// Close a file descriptor. Returns 0 on success, -1 on error.
 pub unsafe fn posix_close(fd: i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -158,6 +191,12 @@ pub unsafe fn posix_close(fd: i32) -> i32 {
     }
 }
 
+/// Terminate the current process with `status`.
+///
+/// Sends `PM_EXIT` to the process manager via blocking Call. The procmgr
+/// never replies -- the child stays in ReplyWait until TCB_SUSPEND moves
+/// it to Inactive. This avoids the yield-loop that starves SCHED_IPC_LOCK
+/// on SMP.
 pub unsafe fn posix_exit(status: i32) -> ! {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -182,6 +221,7 @@ pub unsafe fn posix_exit(status: i32) -> ! {
     }
 }
 
+/// Return the process ID of the calling process.
 pub unsafe fn posix_getpid() -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -202,6 +242,7 @@ pub unsafe fn posix_getpid() -> i32 {
     }
 }
 
+/// Return the parent process ID of the calling process.
 pub unsafe fn posix_getppid() -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -222,6 +263,11 @@ pub unsafe fn posix_getppid() -> i32 {
     }
 }
 
+/// Wait for a child process to change state.
+///
+/// `pid` selects which child (-1 = any). `options` may include WNOHANG.
+/// On success, writes the wait status to `*status` and returns the child PID.
+/// Returns -1 on error.
 pub unsafe fn posix_waitpid3(pid: i32, status: *mut i32, options: i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -248,10 +294,13 @@ pub unsafe fn posix_waitpid3(pid: i32, status: *mut i32, options: i32) -> i32 {
     }
 }
 
+/// Convenience wrapper for `posix_waitpid3` with `options=0` (blocking).
 pub unsafe fn posix_waitpid(pid: i32, status: *mut i32) -> i32 {
     unsafe { posix_waitpid3(pid, status, 0) }
 }
 
+/// Get file status by path. Populates `*st` with inode, mode, size, etc.
+/// Returns 0 on success, -1 on error.
 pub unsafe fn posix_stat(path: *const u8, st: *mut SaltyStat) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -284,10 +333,12 @@ pub unsafe fn posix_stat(path: *const u8, st: *mut SaltyStat) -> i32 {
     }
 }
 
+/// Get file status by path (symlink-aware). Currently identical to `posix_stat`.
 pub unsafe fn posix_lstat(path: *const u8, st: *mut SaltyStat) -> i32 {
     unsafe { posix_stat(path, st) }
 }
 
+/// Get file status by open file descriptor. Returns 0 on success, -1 on error.
 pub unsafe fn posix_fstat(fd: i32, st: *mut SaltyStat) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -320,6 +371,8 @@ pub unsafe fn posix_fstat(fd: i32, st: *mut SaltyStat) -> i32 {
     }
 }
 
+/// Reposition the file offset of `fd`. `whence` is SEEK_SET/CUR/END.
+/// Returns the new offset on success, -1 on error.
 pub unsafe fn posix_lseek(fd: i32, offset: i64, whence: i32) -> i64 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -343,6 +396,8 @@ pub unsafe fn posix_lseek(fd: i32, offset: i64, whence: i32) -> i64 {
     }
 }
 
+/// Check file accessibility. `mode` is a bitmask of R_OK/W_OK/X_OK/F_OK.
+/// Returns 0 if access is permitted, -1 on error.
 pub unsafe fn posix_access(path: *const u8, mode: i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -365,6 +420,7 @@ pub unsafe fn posix_access(path: *const u8, mode: i32) -> i32 {
     }
 }
 
+/// Remove (unlink) a file by path. Returns 0 on success, -1 on error.
 pub unsafe fn posix_unlink(path: *const u8) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -386,6 +442,10 @@ pub unsafe fn posix_unlink(path: *const u8) -> i32 {
     }
 }
 
+/// Rename a file from `old_path` to `new_path`.
+///
+/// Both paths are packed into message registers (old_len, new_len, then
+/// path bytes). Returns 0 on success, -1 on error.
 pub unsafe fn posix_rename(old_path: *const u8, new_path: *const u8) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -429,6 +489,8 @@ pub unsafe fn posix_rename(old_path: *const u8, new_path: *const u8) -> i32 {
     }
 }
 
+/// Create a directory at `path` with permissions `mode`.
+/// Returns 0 on success, -1 on error.
 pub unsafe fn posix_mkdir(path: *const u8, mode: i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -451,6 +513,7 @@ pub unsafe fn posix_mkdir(path: *const u8, mode: i32) -> i32 {
     }
 }
 
+/// Remove an empty directory. Returns 0 on success, -1 on error.
 pub unsafe fn posix_rmdir(path: *const u8) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -472,6 +535,7 @@ pub unsafe fn posix_rmdir(path: *const u8) -> i32 {
     }
 }
 
+/// Open a directory for iteration. Returns a directory fd on success, -1 on error.
 pub unsafe fn posix_opendir(path: *const u8) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -493,6 +557,10 @@ pub unsafe fn posix_opendir(path: *const u8) -> i32 {
     }
 }
 
+/// Read the next directory entry from `dir_fd` into `*entry`.
+///
+/// Returns 1 if an entry was read, 0 at end-of-directory or on error.
+/// The entry name is unpacked from IPC registers and null-terminated.
 pub unsafe fn posix_readdir(dir_fd: i32, entry: *mut SaltyDirent) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -531,10 +599,17 @@ pub unsafe fn posix_readdir(dir_fd: i32, entry: *mut SaltyDirent) -> i32 {
     }
 }
 
+/// Close a directory fd. Delegates to `posix_close`.
 pub unsafe fn posix_closedir(dir_fd: i32) -> i32 {
     unsafe { posix_close(dir_fd) }
 }
 
+/// Replace the current process image with a new program.
+///
+/// Packs the executable path, argv, and envp into a single IPC message to
+/// the process manager. Arguments and environment strings are packed
+/// contiguously (null-terminated) into the remaining message registers.
+/// Returns 0 on success (caller is replaced), -1 on error.
 pub unsafe fn posix_execve(
     path: *const u8,
     argv: *const *const u8,
@@ -651,6 +726,7 @@ pub unsafe fn posix_execve(
     }
 }
 
+/// Send signal `sig` to process `pid`. Returns 0 on success, -1 on error.
 pub unsafe fn posix_kill(pid: i32, sig: i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -673,7 +749,9 @@ pub unsafe fn posix_kill(pid: i32, sig: i32) -> i32 {
     }
 }
 
-// posix_fork is defined in fork.S (assembly trampoline)
+/// Fork the current process, returning the child PID to the parent and 0
+/// to the child. Defined in `fork.S` (assembly trampoline that issues the
+/// PM_FORK IPC and re-initializes the child's IPC context).
 unsafe extern "C" {
     pub safe fn posix_fork() -> i32;
 }
@@ -682,6 +760,8 @@ unsafe extern "C" {
 // Socket operations
 // ======================================================================
 
+/// Create a socket. `domain` is AF_UNIX, `sock_type` is SOCK_STREAM/DGRAM.
+/// Returns the socket fd on success, -1 on error.
 pub unsafe fn posix_socket(domain: i32, sock_type: i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -704,6 +784,8 @@ pub unsafe fn posix_socket(domain: i32, sock_type: i32) -> i32 {
     }
 }
 
+/// Bind a Unix domain socket `fd` to the filesystem `path`.
+/// Returns 0 on success, -1 on error.
 pub unsafe fn posix_bind(fd: i32, path: *const u8) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -726,6 +808,8 @@ pub unsafe fn posix_bind(fd: i32, path: *const u8) -> i32 {
     }
 }
 
+/// Mark socket `fd` as a passive socket with `backlog` pending connections.
+/// Returns 0 on success, -1 on error.
 pub unsafe fn posix_listen(fd: i32, backlog: i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -748,6 +832,8 @@ pub unsafe fn posix_listen(fd: i32, backlog: i32) -> i32 {
     }
 }
 
+/// Accept a connection on listening socket `fd`.
+/// Returns the new connected socket fd, or -1 on error.
 pub unsafe fn posix_accept(fd: i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -769,6 +855,8 @@ pub unsafe fn posix_accept(fd: i32) -> i32 {
     }
 }
 
+/// Connect socket `fd` to the Unix domain address at `path`.
+/// Returns 0 on success, -1 on error.
 pub unsafe fn posix_connect(fd: i32, path: *const u8) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -791,6 +879,8 @@ pub unsafe fn posix_connect(fd: i32, path: *const u8) -> i32 {
     }
 }
 
+/// Shut down part of a socket connection. `how`: SHUT_RD/WR/RDWR.
+/// Returns 0 on success, -1 on error.
 pub unsafe fn posix_shutdown(fd: i32, how: i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -813,6 +903,8 @@ pub unsafe fn posix_shutdown(fd: i32, how: i32) -> i32 {
     }
 }
 
+/// Create a pair of connected Unix domain sockets.
+/// On success, writes `fds[0]` and `fds[1]` and returns 0.
 pub unsafe fn posix_socketpair(fds: *mut i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -837,6 +929,11 @@ pub unsafe fn posix_socketpair(fds: *mut i32) -> i32 {
     }
 }
 
+/// Send a message with optional file descriptor passing (ancillary data).
+///
+/// `data`/`data_len` is the payload (max 120 bytes per call).
+/// `fds_to_send`/`fd_count` lists file descriptors to pass via SCM_RIGHTS
+/// (max 4 per call). Returns bytes sent on success, -1 on error.
 pub unsafe fn posix_sendmsg(fd: i32, data: *const u8, data_len: u64, fds_to_send: *const i32, fd_count: u32) -> i64 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -879,6 +976,11 @@ pub unsafe fn posix_sendmsg(fd: i32, data: *const u8, data_len: u64, fds_to_send
     }
 }
 
+/// Receive a message with optional file descriptor passing (ancillary data).
+///
+/// Reads up to `data_len` bytes into `data`. Received file descriptors
+/// (SCM_RIGHTS) are written to `fds_out`, with `*fd_count` updated to the
+/// actual number received. Returns bytes received, -1 on error.
 pub unsafe fn posix_recvmsg(fd: i32, data: *mut u8, data_len: u64, fds_out: *mut i32, fd_count: *mut u32) -> i64 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -929,6 +1031,12 @@ pub unsafe fn posix_recvmsg(fd: i32, data: *mut u8, data_len: u64, fds_out: *mut
 // Poll / Select / Epoll
 // ======================================================================
 
+/// Wait for events on a set of file descriptors (max 8 per call).
+///
+/// Packs (fd, events) pairs into IPC registers. On return, `revents` in each
+/// `PollFd` is populated with the triggered event mask. `timeout` is in
+/// milliseconds (-1 = block indefinitely). Returns the number of ready fds,
+/// or -1 on error.
 pub unsafe fn posix_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -966,6 +1074,12 @@ pub unsafe fn posix_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32 {
     }
 }
 
+/// Synchronous I/O multiplexing via fd_set bitmasks.
+///
+/// Implemented by converting `readfds`/`writefds` bitmasks to a poll array,
+/// calling `posix_poll`, then rebuilding the bitmasks from results. Supports
+/// up to 64 fds (single u64 bitmask). Returns the number of ready fds, or
+/// -1 on error.
 pub unsafe fn posix_select(nfds: i32, readfds: *mut u64, writefds: *mut u64, timeout: i32) -> i32 {
     unsafe {
         // Simple implementation: convert fd_sets to poll array
@@ -1022,6 +1136,8 @@ pub unsafe fn posix_select(nfds: i32, readfds: *mut u64, writefds: *mut u64, tim
     }
 }
 
+/// Get terminal attributes for fd into `*termios_p`.
+/// Returns 0 on success, -1 on error.
 pub unsafe fn posix_tcgetattr(fd: i32, termios_p: *mut crate::types::Termios) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1058,6 +1174,9 @@ pub unsafe fn posix_tcgetattr(fd: i32, termios_p: *mut crate::types::Termios) ->
     }
 }
 
+/// Set terminal attributes for fd from `*termios_p`.
+/// `action` controls when changes take effect (TCSANOW/TCSADRAIN/TCSAFLUSH).
+/// Returns 0 on success, -1 on error.
 pub unsafe fn posix_tcsetattr(fd: i32, action: i32, termios_p: *const crate::types::Termios) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1091,6 +1210,7 @@ pub unsafe fn posix_tcsetattr(fd: i32, action: i32, termios_p: *const crate::typ
     }
 }
 
+/// Create an epoll instance. Returns the epoll fd, or -1 on error.
 pub unsafe fn posix_epoll_create() -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1111,6 +1231,8 @@ pub unsafe fn posix_epoll_create() -> i32 {
     }
 }
 
+/// Control an epoll instance: add/modify/delete `fd` with `events`/`data`.
+/// `op` is EPOLL_CTL_ADD/MOD/DEL. Returns 0 on success, -1 on error.
 pub unsafe fn posix_epoll_ctl(epfd: i32, op: i32, fd: i32, events: u32, data: u64) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1136,6 +1258,10 @@ pub unsafe fn posix_epoll_ctl(epfd: i32, op: i32, fd: i32, events: u32, data: u6
     }
 }
 
+/// Wait for events on an epoll instance.
+///
+/// Blocks until at least one event is ready or `timeout` milliseconds elapse.
+/// Returns the number of ready events written to `events`, or -1 on error.
 pub unsafe fn posix_epoll_wait(
     epfd: i32,
     events: *mut crate::types::EpollEvent,
@@ -1177,6 +1303,10 @@ pub unsafe fn posix_epoll_wait(
 // POSIX shared memory
 // ======================================================================
 
+/// Open a POSIX shared memory object by `name` (e.g. "/myshm").
+///
+/// Strips the leading '/' per POSIX convention before sending to VFS.
+/// Returns the shm fd on success, -1 on error.
 pub unsafe fn posix_shm_open(name: *const u8, flags: i32) -> i32 {
     unsafe {
         // POSIX: shm names are "/name"; strip leading '/' before sending bare name to VFS
@@ -1201,6 +1331,8 @@ pub unsafe fn posix_shm_open(name: *const u8, flags: i32) -> i32 {
     }
 }
 
+/// Remove a POSIX shared memory object by name.
+/// Returns 0 on success, -1 on error.
 pub unsafe fn posix_shm_unlink(name: *const u8) -> i32 {
     unsafe {
         // POSIX: shm names are "/name"; strip leading '/' before sending bare name to VFS
@@ -1228,10 +1360,14 @@ pub unsafe fn posix_shm_unlink(name: *const u8) -> i32 {
 // Pipe / dup
 // ======================================================================
 
+/// Create a pipe. Convenience wrapper for `posix_pipe2(fds, 0)`.
 pub unsafe fn posix_pipe(fds: *mut i32) -> i32 {
     unsafe { posix_pipe2(fds, 0) }
 }
 
+/// Create a pipe with `flags` (e.g. O_CLOEXEC, O_NONBLOCK).
+/// On success, `fds[0]` is the read end, `fds[1]` is the write end.
+/// Returns 0 on success, -1 on error.
 pub unsafe fn posix_pipe2(fds: *mut i32, flags: i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1255,6 +1391,7 @@ pub unsafe fn posix_pipe2(fds: *mut i32, flags: i32) -> i32 {
     }
 }
 
+/// Duplicate file descriptor `oldfd`. Returns the new fd, or -1 on error.
 pub unsafe fn posix_dup(oldfd: i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1276,6 +1413,8 @@ pub unsafe fn posix_dup(oldfd: i32) -> i32 {
     }
 }
 
+/// Duplicate `oldfd` to `newfd`, closing `newfd` first if open.
+/// Returns `newfd` on success, -1 on error.
 pub unsafe fn posix_dup2(oldfd: i32, newfd: i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1298,6 +1437,8 @@ pub unsafe fn posix_dup2(oldfd: i32, newfd: i32) -> i32 {
     }
 }
 
+/// Duplicate `oldfd` to `newfd` with `flags` (e.g. O_CLOEXEC).
+/// Returns `newfd` on success, -1 on error.
 pub unsafe fn posix_dup3(oldfd: i32, newfd: i32, flags: i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1321,6 +1462,7 @@ pub unsafe fn posix_dup3(oldfd: i32, newfd: i32, flags: i32) -> i32 {
     }
 }
 
+/// Create a named pipe (FIFO) at `path`. Returns 0 on success, -1 on error.
 pub unsafe fn posix_mkfifo(path: *const u8, _mode: u32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1347,6 +1489,9 @@ pub unsafe fn posix_mkfifo(path: *const u8, _mode: u32) -> i32 {
 // Time API
 // ======================================================================
 
+/// Read the monotonic clock, writing seconds and nanoseconds into `*ts`.
+/// Uses the kernel `SYS_CLOCK_GETTIME` syscall directly (no IPC).
+/// Returns 0 on success, -1 on error.
 pub unsafe fn posix_clock_gettime(clock_id: i32, ts: *mut crate::types::Timespec) -> i32 {
     unsafe {
         let res = crate::syscall::syscall(SYS_CLOCK_GETTIME, clock_id as u64, 0, 0, 0, 0, 0);
@@ -1360,6 +1505,9 @@ pub unsafe fn posix_clock_gettime(clock_id: i32, ts: *mut crate::types::Timespec
     }
 }
 
+/// Get the current time as seconds + microseconds into `*tv`.
+/// Uses the kernel clock syscall, converting nanoseconds to microseconds.
+/// Returns 0 on success, -1 on error.
 pub unsafe fn posix_gettimeofday(tv: *mut crate::types::Timeval) -> i32 {
     unsafe {
         let res = crate::syscall::syscall(SYS_CLOCK_GETTIME, 0, 0, 0, 0, 0, 0);
@@ -1373,6 +1521,9 @@ pub unsafe fn posix_gettimeofday(tv: *mut crate::types::Timeval) -> i32 {
     }
 }
 
+/// Sleep for the duration specified in `*req`.
+/// If `rem` is non-null, any remaining time after interruption is written
+/// there (always zero in current implementation). Returns 0 on success.
 pub unsafe fn posix_nanosleep(req: *const crate::types::Timespec, rem: *mut crate::types::Timespec) -> i32 {
     unsafe {
         let seconds = (*req).tv_sec;
@@ -1389,6 +1540,7 @@ pub unsafe fn posix_nanosleep(req: *const crate::types::Timespec, rem: *mut crat
     }
 }
 
+/// Sleep for `usec` microseconds. Returns 0 on success, -1 on error.
 pub unsafe fn posix_usleep(usec: u64) -> i32 {
     let seconds = usec / 1_000_000;
     let nanos = (usec % 1_000_000) * 1_000;
@@ -1396,11 +1548,14 @@ pub unsafe fn posix_usleep(usec: u64) -> i32 {
     if res.error != 0 { -1 } else { 0 }
 }
 
+/// Sleep for `seconds`. Returns 0 on success, or remaining seconds on error.
 pub unsafe fn posix_sleep(seconds: u64) -> u64 {
     let res = crate::syscall::syscall(SYS_NANOSLEEP, seconds, 0, 0, 0, 0, 0);
     if res.error != 0 { seconds } else { 0 }
 }
 
+/// Set the process group ID of process `pid` to `pgid`.
+/// Returns 0 on success, -1 on error.
 pub unsafe fn posix_setpgid(pid: i32, pgid: i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1423,6 +1578,7 @@ pub unsafe fn posix_setpgid(pid: i32, pgid: i32) -> i32 {
     }
 }
 
+/// Get the process group ID of process `pid`. Returns pgid or -1 on error.
 pub unsafe fn posix_getpgid(pid: i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1444,6 +1600,8 @@ pub unsafe fn posix_getpgid(pid: i32) -> i32 {
     }
 }
 
+/// Create a new session and set the process as session leader.
+/// Returns the new session ID, or -1 on error.
 pub unsafe fn posix_setsid() -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1464,6 +1622,7 @@ pub unsafe fn posix_setsid() -> i32 {
     }
 }
 
+/// Return the real user ID of the calling process.
 pub unsafe fn posix_getuid() -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1484,6 +1643,7 @@ pub unsafe fn posix_getuid() -> i32 {
     }
 }
 
+/// Return the effective user ID of the calling process.
 pub unsafe fn posix_geteuid() -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1504,6 +1664,7 @@ pub unsafe fn posix_geteuid() -> i32 {
     }
 }
 
+/// Return the real group ID of the calling process.
 pub unsafe fn posix_getgid() -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1524,6 +1685,7 @@ pub unsafe fn posix_getgid() -> i32 {
     }
 }
 
+/// Return the effective group ID of the calling process.
 pub unsafe fn posix_getegid() -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1544,6 +1706,7 @@ pub unsafe fn posix_getegid() -> i32 {
     }
 }
 
+/// Get supplementary group IDs. Returns the number of groups, or -1 on error.
 pub unsafe fn posix_getgroups(size: i32, _list: *mut i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1565,6 +1728,7 @@ pub unsafe fn posix_getgroups(size: i32, _list: *mut i32) -> i32 {
     }
 }
 
+/// Truncate file `fd` to `length` bytes. Returns 0 on success, -1 on error.
 pub unsafe fn posix_ftruncate(fd: i32, length: u64) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1591,6 +1755,8 @@ pub unsafe fn posix_ftruncate(fd: i32, length: u64) -> i32 {
 // fcntl / isatty / chdir / getcwd / ioctl
 // ======================================================================
 
+/// File control operations (F_GETFL, F_SETFL, F_DUPFD, etc.).
+/// Returns the result value on success, -1 on error.
 pub unsafe fn posix_fcntl(fd: i32, cmd: i32, arg: i64) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1614,6 +1780,7 @@ pub unsafe fn posix_fcntl(fd: i32, cmd: i32, arg: i64) -> i32 {
     }
 }
 
+/// Test whether `fd` refers to a terminal. Returns 1 if yes, 0 if not.
 pub unsafe fn posix_isatty(fd: i32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1635,6 +1802,7 @@ pub unsafe fn posix_isatty(fd: i32) -> i32 {
     }
 }
 
+/// Generic device I/O control. Returns the result value, or -1 on error.
 pub unsafe fn posix_ioctl(fd: i32, request: u64, arg: u64) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1658,6 +1826,8 @@ pub unsafe fn posix_ioctl(fd: i32, request: u64, arg: u64) -> i32 {
     }
 }
 
+/// Change the current working directory to `path`.
+/// Returns 0 on success, -1 on error.
 pub unsafe fn posix_chdir(path: *const u8) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -1679,6 +1849,8 @@ pub unsafe fn posix_chdir(path: *const u8) -> i32 {
     }
 }
 
+/// Get the current working directory, writing the null-terminated path
+/// into `buf` (up to `size` bytes). Returns 0 on success, -1 on error.
 pub unsafe fn posix_getcwd(buf: *mut u8, size: u64) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();

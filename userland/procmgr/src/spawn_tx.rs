@@ -65,12 +65,16 @@ const CHILD_CAP_NAMESERV: u64 = super::CHILD_CAP_NAMESERV;
 const CHILD_CAP_SIGNAL_NTFN: u64 = super::CHILD_CAP_SIGNAL_NTFN;
 const CHILD_CAP_UNTYPED: u64 = super::CHILD_CAP_UNTYPED;
 const CHILD_CAP_READINESS_NTFN: u64 = super::CHILD_CAP_READINESS_NTFN;
+const CHILD_CAP_EXPAND_NTFN: u64 = super::CHILD_CAP_EXPAND_NTFN;
+const CHILD_CAP_SERVICE_EP: u64 = super::CHILD_CAP_SERVICE_EP;
 
 const CAP_SELF_CSPACE: Cap = super::CAP_SELF_CSPACE;
 const CAP_SELF_VSPACE: Cap = super::CAP_SELF_VSPACE;
 const CAP_SERVER_EP: Cap = super::CAP_SERVER_EP;
+const CAP_RECV_SCRATCH: Cap = super::CAP_RECV_SCRATCH;
 const CAP_NAMESERV_EP: Cap = super::CAP_NAMESERV_EP;
 const CAP_VFS_EP: Cap = super::CAP_VFS_EP;
+const CAP_FB_UNTYPED: Cap = super::CAP_FB_UNTYPED;
 const CAP_INITRD_UNTYPED: Cap = super::CAP_INITRD_UNTYPED;
 const CAP_UNTYPED_START: Cap = super::CAP_UNTYPED_START;
 
@@ -88,9 +92,13 @@ const AT_SALTY_INITRD: u64 = super::AT_SALTY_INITRD;
 const AT_SALTY_INITRD_SZ: u64 = super::AT_SALTY_INITRD_SZ;
 const AT_SALTY_FRAME_SLOT: u64 = super::AT_SALTY_FRAME_SLOT;
 const AT_SALTY_SHARED_LIB_BASE: u64 = super::AT_SALTY_SHARED_LIB_BASE;
+const AT_SALTY_SLOT_BASE: u64 = super::AT_SALTY_SLOT_BASE;
+const AT_SALTY_SLOT_COUNT: u64 = super::AT_SALTY_SLOT_COUNT;
+const AT_SALTY_EXPAND_EP: u64 = super::AT_SALTY_EXPAND_EP;
 const UT_MIRROR_COUNT: Cap = super::UT_MIRROR_COUNT;
 const CHILD_UT_BITS_DEFAULT: u8 = super::CHILD_UT_BITS_DEFAULT;
 const READY_TIMEOUT_NS_DEFAULT: u64 = super::READY_TIMEOUT_NS_DEFAULT;
+const SPAWN_FLAG_USE_PRE_EP: u64 = salty::SPAWN_FLAG_USE_PRE_EP;
 
 // ===========================================================================
 // Shared library physical frame cache
@@ -967,6 +975,8 @@ pub(crate) unsafe fn write_dynamic_stack(
     scratch_vaddr: u64,
     initrd_vaddr: u64,
     stack_top: u64,
+    cnode_bits: u64,
+    slot_pool_floor: u64,
 ) -> Result<u64, ()> {
     unsafe {
         let err = salty::invoke::vspace_map(
@@ -990,14 +1000,26 @@ pub(crate) unsafe fn write_dynamic_stack(
             return Err(());
         }
 
-        let auxv_entries: u64 = if shared_lib_base != 0 { 14 } else { 13 };
+        // +2 for AT_SALTY_SLOT_BASE/COUNT, +1 for AT_SALTY_EXPAND_EP
+        let auxv_entries: u64 = if shared_lib_base != 0 { 17 } else { 16 };
+
+        // Compute slot pool for child: from frame_slot_start to CNode end
+        let effective_cnode_bits = if cnode_bits > 0 { cnode_bits } else { 10 };
+        let cnode_total_slots = 1u64 << effective_cnode_bits;
+        let slot_pool_base = if slot_pool_floor > CHILD_RTLD_FRAME_SLOT_START {
+            slot_pool_floor
+        } else {
+            CHILD_RTLD_FRAME_SLOT_START
+        };
+        let slot_pool_count = cnode_total_slots.saturating_sub(slot_pool_base);
 
         // Build the stack using the helper, which handles argv/envp layout
         let rsp = write_stack_with_args(
             argc, envc, str_data, str_len,
             Some((auxv_entries, phdr_vaddr, phent, phnum,
                   elf_result.entry, rtld_result.base,
-                  initrd_window_size as u64, shared_lib_base)),
+                  initrd_window_size as u64, shared_lib_base,
+                  slot_pool_base, slot_pool_count)),
             scratch_vaddr,
             initrd_vaddr,
             stack_top,
@@ -1057,7 +1079,7 @@ unsafe fn write_stack_with_args(
     envc: u32,
     str_data: &[u8],
     str_len: usize,
-    auxv_info: Option<(u64, u64, u64, u64, u64, u64, u64, u64)>,
+    auxv_info: Option<(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)>,
     scratch_vaddr: u64,
     initrd_vaddr: u64,
     stack_top: u64,
@@ -1147,7 +1169,7 @@ unsafe fn write_stack_with_args(
 
         // auxv
         match auxv_info {
-            Some((_, phdr, phent, phnum, entry, base, initrd_sz, shared_lib)) => {
+            Some((_, phdr, phent, phnum, entry, base, initrd_sz, shared_lib, slot_base, slot_count)) => {
                 w(AT_PHDR);     w(phdr);
                 w(AT_PHENT);    w(phent);
                 w(AT_PHNUM);    w(phnum);
@@ -1159,7 +1181,10 @@ unsafe fn write_stack_with_args(
                 w(AT_SALTY_SCRATCH);    w(scratch_vaddr);
                 w(AT_SALTY_INITRD);     w(initrd_vaddr);
                 w(AT_SALTY_INITRD_SZ);  w(initrd_sz);
-                w(AT_SALTY_FRAME_SLOT); w(CHILD_RTLD_FRAME_SLOT_START);
+                w(AT_SALTY_FRAME_SLOT); w(slot_base);
+                w(AT_SALTY_SLOT_BASE);  w(slot_base);
+                w(AT_SALTY_SLOT_COUNT); w(slot_count);
+                w(AT_SALTY_EXPAND_EP);  w(CHILD_CAP_EXPAND_NTFN); // minted notification for UT expansion
                 if shared_lib != 0 {
                     w(AT_SALTY_SHARED_LIB_BASE); w(shared_lib);
                 }
@@ -1190,12 +1215,14 @@ pub unsafe fn handle_spawn_tx(
         //   regs[0] = name_len
         //   regs[1] = spawn_policy bitfield
         //   regs[2] = timeout_ns
-        //   regs[3] = spawn_flags (reserved)
+        //   regs[3] = spawn_flags
         //   regs[4] = reserved
         //   regs[5..] = name bytes
         let name_reg_idx = 5usize;
         let spawn_policy = msg.regs[1];
         let requested_timeout_ns = msg.regs[2];
+        let spawn_flags = msg.regs[3];
+        let use_pre_ep = (spawn_flags & SPAWN_FLAG_USE_PRE_EP) != 0;
         let readiness_mode = salty::spawn_policy_readiness(spawn_policy);
         let policy_map_initrd = salty::spawn_policy_map_initrd(spawn_policy);
         let policy_is_display = salty::spawn_policy_is_display(spawn_policy);
@@ -1605,11 +1632,27 @@ pub unsafe fn handle_spawn_tx(
             plan.readiness_mode == salty::SPAWN_READY_NOTIFY,
             plan.is_display,
             pid,
+            if use_pre_ep { CAP_RECV_SCRATCH } else { 0 },
         );
         if err != 0 {
             alloc.rollback();
             reply.label = SALTY_OUT_OF_MEMORY;
             return;
+        }
+
+        // ---- Mint UT expansion notification into child CNode ----
+        // Badge = (1 << table_idx) so procmgr can identify which child signaled.
+        let pm_ntfn = unsafe { *(&raw const super::PM_BOUND_NTFN) };
+        if pm_ntfn != 0 {
+            let badge = 1u64 << slot_idx;
+            let err = salty::invoke::cnode_mint(
+                CAP_SELF_CSPACE, pm_ntfn,
+                child_cn, CHILD_CAP_EXPAND_NTFN,
+                badge,
+            );
+            if err != 0 {
+                puts(b"[PROCMGR] WARN: mint expand ntfn cap failed\n");
+            }
         }
 
         // ---- Configure TCB ----
@@ -1647,6 +1690,8 @@ pub unsafe fn handle_spawn_tx(
                 plan.layout.scratch.base,
                 plan.layout.initrd.base,
                 plan.layout.stack_top,
+                cn_size_bits,
+                if use_pre_ep { CHILD_CAP_SERVICE_EP + 1 } else { CHILD_RTLD_FRAME_SLOT_START },
             ) {
                 Ok(rsp) => {
                     child_rsp = rsp;
@@ -1934,6 +1979,7 @@ fn copy_child_caps_tx(
     with_ready_ntfn: bool,
     with_fb_untyped: bool,
     pid: u32,
+    pre_service_ep: Cap,
 ) -> i32 {
     let mut err;
     err = salty::invoke::cnode_copy(
@@ -1970,6 +2016,23 @@ fn copy_child_caps_tx(
         lb.str(b"\n");
         lb.flush();
         return err;
+    }
+
+    if pre_service_ep != 0 {
+        err = salty::invoke::cnode_move(
+            child_cn,
+            CHILD_CAP_SERVICE_EP,
+            CAP_SELF_CSPACE,
+            pre_service_ep,
+        );
+        if err != 0 {
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] copy pre-service EP failed err=");
+            lb.hex(err as u64);
+            lb.str(b"\n");
+            lb.flush();
+            return err;
+        }
     }
 
     err = salty::invoke::cnode_mint(
@@ -2016,7 +2079,7 @@ fn copy_child_caps_tx(
     if with_fb_untyped {
         err = salty::invoke::cnode_copy(
             CAP_SELF_CSPACE,
-            salty::CAP_FB_UNTYPED,
+            CAP_FB_UNTYPED,
             child_cn,
             salty::CAP_FB_UNTYPED,
             CAP_RIGHTS_ALL,

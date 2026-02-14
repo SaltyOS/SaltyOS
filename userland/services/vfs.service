@@ -3,11 +3,12 @@ Name=vfs
 Binary=vfs.elf
 Type=simple
 Restart=always
+PreProcmgr=yes
 
 [Dependencies]
 After=console nameserv
 Before=test_runner
-Requires=console:4 nameserv:8
 
 [Capabilities]
-CopyCap=13:30
+CopyCap=13:66
+NeedEP=console:64 nameserv:65

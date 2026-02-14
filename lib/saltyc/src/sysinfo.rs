@@ -1,5 +1,9 @@
 //! System information stubs
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Returns hardcoded values for `uname` (sysname="SaltyOS"), `sysconf`,
+//! `getrlimit`/`setrlimit`, `sysctl`, and `confstr`. These satisfy C
+//! library callers without requiring actual kernel support.
 
 use crate::errno;
 

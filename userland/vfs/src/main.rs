@@ -37,9 +37,9 @@ use salty::types::*;
 // ======================================================================
 
 const CAP_SERVER_EP: u64 = 3;
-const VFS_CAP_CONSOLE_EP: u64 = 4;
-const VFS_CAP_NAMESERV_EP: u64 = 8;
-const VFS_CAP_FB_UNTYPED: u64 = 30;
+const VFS_CAP_CONSOLE_EP: u64 = 64;    // NeedEP console:64
+const VFS_CAP_NAMESERV_EP: u64 = 65;   // NeedEP nameserv:65
+const VFS_CAP_FB_UNTYPED: u64 = 66;    // CopyCap 13:66
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 // VFS protocol labels
@@ -732,7 +732,7 @@ macro_rules! PIPES {
 // Reply slot counter for deferred replies
 static mut NEXT_REPLY_SLOT: u64 = CAP_REPLY_BASE;
 
-// Dynamic SHM frame cap base — set at startup from __salty_next_frame_slot
+// Dynamic SHM frame cap base — set at startup from slot_alloc position
 // to avoid collision with rtld-loaded library frame caps
 static mut VFS_SHM_CAP_BASE: u64 = 512;
 const VFS_UNTYPED_FALLBACK_COUNT: u64 = 8;
@@ -741,7 +741,6 @@ const VFS_STATE_ARENA_VADDR_DEFAULT: u64 = 0x0000_0000_0500_0000;
 static mut VFS_STATE_ARENA_BASE: *mut u8 = core::ptr::null_mut();
 static mut VFS_STATE_ARENA_SIZE: usize = 0;
 static mut VFS_STATE_ARENA_OFF: usize = 0;
-static mut VFS_NEXT_FRAME_SLOT: u64 = 0;
 
 unsafe fn retype_frame_from_any_untyped(frame_slot: u64) -> u64 {
     let mut err = salty::invoke::untyped_retype(CAP_UNTYPED, OBJ_FRAME, 0, frame_slot);
@@ -792,18 +791,17 @@ unsafe fn vfs_map_state_arena(total_bytes: usize) -> i32 {
 
     unsafe {
         for pg in 0..pages {
-            let slot = VFS_NEXT_FRAME_SLOT;
-            VFS_NEXT_FRAME_SLOT = VFS_NEXT_FRAME_SLOT.wrapping_add(1);
-
-            let rerr = retype_frame_from_any_untyped(slot);
-            if rerr != 0 {
-                let mut lb = LineBuf::new();
-                lb.str(b"[VFS] state arena frame retype failed err=");
-                lb.hex(rerr);
-                lb.str(b"\n");
-                lb.flush();
-                return rerr as i32;
-            }
+            let slot = match salty::slot_alloc::slot_alloc_frame() {
+                Some(s) => s,
+                None => {
+                    let mut lb = LineBuf::new();
+                    lb.str(b"[VFS] state arena slot_alloc_frame failed at page ");
+                    lb.hex(pg as u64);
+                    lb.str(b"\n");
+                    lb.flush();
+                    return SALTY_OUT_OF_MEMORY as i32;
+                }
+            };
 
             let vaddr = base + (pg as u64) * 4096;
             let merr = salty::invoke::vspace_map(
@@ -926,7 +924,6 @@ unsafe fn init_dynamic_state_storage() -> i32 {
             None => return SALTY_OUT_OF_MEMORY as i32,
         };
 
-        VFS_NEXT_FRAME_SLOT = salty::__salty_next_frame_slot;
         let err = vfs_map_state_arena(total);
         if err != 0 {
             return err;
@@ -956,8 +953,10 @@ unsafe fn init_dynamic_state_storage() -> i32 {
             return SALTY_OUT_OF_MEMORY as i32;
         }
 
-        VFS_SHM_CAP_BASE = VFS_NEXT_FRAME_SLOT;
-        salty::__salty_next_frame_slot = VFS_NEXT_FRAME_SLOT;
+        // SHM cap slots come from the slot allocator's current position
+        // (next slot to be allocated is the start of the SHM pool)
+        VFS_SHM_CAP_BASE = salty::slot_alloc::slot_alloc_base()
+            + (salty::slot_alloc::slot_alloc_count() - salty::slot_alloc::slot_alloc_remaining());
 
         let mut lb = LineBuf::new();
         lb.str(b"[VFS] state arena: bytes=");
@@ -5624,6 +5623,19 @@ pub extern "C" fn _start() -> ! {
     }
 
     puts(b"[VFS] IPC buffer ready\n");
+
+    // Initialize per-process slot allocator from RTLD-exported globals
+    unsafe {
+        let base = *(&raw const salty::__salty_slot_base);
+        let count = *(&raw const salty::__salty_slot_count);
+        let expand_ep = *(&raw const salty::__salty_expand_ep);
+        if base != 0 {
+            salty::slot_alloc::slot_alloc_init(base, count, expand_ep);
+        } else {
+            puts(b"[VFS] FATAL: slot pool not provided by RTLD/auxv\n");
+            idle();
+        }
+    }
 
     unsafe {
         init_runtime_limits();

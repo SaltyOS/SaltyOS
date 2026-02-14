@@ -30,6 +30,9 @@ fn x87_round_mode(x: f64, mode: u16) -> f64 {
     let mut cw_old: u16 = 0;
     let cw_new: u16;
     let mut result = x;
+    // SAFETY: x87 FPU inline asm. The control word is saved, modified for the
+    // desired rounding mode, used for one frndint, then restored. The FPU stack
+    // is left clean (st(0) is consumed by fstp and declared as clobbered).
     unsafe {
         asm!(
             "fnstcw word ptr [{cw}]",
@@ -176,6 +179,8 @@ pub extern "C" fn __signbitf(x: f32) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn sqrt(x: f64) -> f64 {
     let mut result = x;
+    // SAFETY: x87 FPU inline asm. Loads x onto the FPU stack, computes
+    // square root, stores result back. FPU stack is left clean.
     unsafe {
         asm!(
             "fld qword ptr [{r}]",
@@ -285,6 +290,8 @@ pub extern "C" fn llround(x: f64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn fmod(x: f64, y: f64) -> f64 {
     let mut result = x;
+    // SAFETY: x87 FPU inline asm. Uses fprem in a loop (checking C2 status
+    // bit) to compute the IEEE remainder. Both FPU stack slots are consumed.
     unsafe {
         asm!(
             "fld qword ptr [{y}]",
@@ -480,6 +487,7 @@ pub extern "C" fn ilogb(x: f64) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn sin(x: f64) -> f64 {
     let mut result = x;
+    // SAFETY: x87 FPU inline asm. fsin operates on st(0), result stored back.
     unsafe {
         asm!(
             "fld qword ptr [{r}]",
@@ -500,6 +508,7 @@ pub extern "C" fn sinf(x: f32) -> f32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn cos(x: f64) -> f64 {
     let mut result = x;
+    // SAFETY: x87 FPU inline asm. fcos operates on st(0), result stored back.
     unsafe {
         asm!(
             "fld qword ptr [{r}]",
@@ -520,6 +529,8 @@ pub extern "C" fn cosf(x: f32) -> f32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn tan(x: f64) -> f64 {
     let mut result = x;
+    // SAFETY: x87 FPU inline asm. fptan pushes 1.0 and tan(x) onto the FPU
+    // stack; both are consumed (fstp st(0) pops the 1.0, fstp stores tan).
     unsafe {
         asm!(
             "fld qword ptr [{r}]",
@@ -649,6 +660,8 @@ pub extern "C" fn log2f(x: f32) -> f32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn log(x: f64) -> f64 {
     let mut result = x;
+    // SAFETY: x87 FPU inline asm. fldln2 pushes ln(2), fyl2x computes
+    // ln(2) * log2(x) = ln(x). Both FPU stack slots are consumed.
     unsafe {
         asm!(
             "fldln2",
@@ -733,6 +746,10 @@ pub extern "C" fn exp2f(x: f32) -> f32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn exp(x: f64) -> f64 {
     let mut result = x;
+    // SAFETY: x87 FPU inline asm. Computes 2^(x*log2(e)) using the identity
+    // e^x = 2^(x*log2(e)). Splits into integer and fractional parts via
+    // frndint, uses f2xm1 for the fractional part, then fscale for the
+    // integer part. All FPU stack slots are properly consumed.
     unsafe {
         asm!(
             "fldl2e",

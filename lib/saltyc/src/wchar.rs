@@ -1,5 +1,11 @@
 //! Wide character / multibyte stubs (ASCII-only)
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Since SaltyOS uses an ASCII/UTF-8 locale, all multibyte functions treat
+//! each byte as a single character (`wchar_t = i32`, MB_CUR_MAX = 1).
+//! Wide string operations (`wcslen`, `wcscmp`, `wcscpy`, etc.) operate on
+//! 32-bit wchar_t arrays. Conversion functions (`wcstod`, `wcstoull`) narrow
+//! to byte strings and delegate to the narrow equivalents.
 
 pub type WcharT = i32;
 pub type WintT = u32;

@@ -1,5 +1,16 @@
 //! Buffered I/O (stdio)
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Provides the C standard `FILE`-based I/O layer. Each `FILE` wraps a POSIX
+//! file descriptor with an optional 1024-byte userspace buffer. Three buffer
+//! modes are supported: full (`_IOFBF`), line (`_IOLBF`, default for stdout),
+//! and unbuffered (`_IONBF`, default for stderr). At most 16 streams can be
+//! open simultaneously (3 reserved for stdin/stdout/stderr).
+//!
+//! The printf engine (`format_impl`) handles `%d`, `%i`, `%u`, `%x`, `%o`,
+//! `%s`, `%c`, `%p`, `%f`, `%e`, `%g`, `%n`, plus width/precision/flags.
+//! FreeBSD compatibility aliases (`__stdoutp`, `__stdinp`, `__stderrp`) are
+//! exported for ported FreeBSD utilities.
 
 use crate::errno;
 use core::ffi::VaList;
@@ -17,14 +28,22 @@ const _IONBF: i32 = 2;
 
 pub const EOF: i32 = -1;
 
+/// A buffered I/O stream wrapping a POSIX file descriptor.
 #[repr(C)]
 pub struct FILE {
+    /// Underlying POSIX file descriptor (-1 when closed).
     fd: i32,
+    /// Bitmask of FILE_READ, FILE_WRITE, FILE_APPEND, FILE_EOF, FILE_ERROR.
     flags: u32,
+    /// Internal I/O buffer (1024 bytes).
     buf: [u8; BUF_SIZE],
+    /// Current read/write position within `buf`.
     buf_pos: usize,
+    /// Number of valid bytes in `buf` (for read buffering).
     buf_len: usize,
+    /// Character pushed back via `ungetc()`, or -1 if none.
     ungetc_char: i32,
+    /// Buffer mode: `_IOFBF` (full), `_IOLBF` (line), `_IONBF` (unbuffered).
     buf_mode: i32,
 }
 
@@ -130,6 +149,14 @@ fn parse_mode(mode: *const u8) -> (u32, i32) {
     }
 }
 
+/// Open a file stream.
+///
+/// Parses the `mode` string ("r", "w", "a", "r+", "w+", "a+") to determine
+/// read/write/append flags and the corresponding `O_*` open flags. The file
+/// is opened via `posix_open`, then a `FILE` is allocated from the static
+/// pool (max 16 streams including stdin/stdout/stderr).
+///
+/// Returns null on invalid mode, open failure, or if the stream pool is full.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fopen(path: *const u8, mode: *const u8) -> *mut FILE {
     ensure_stdio_init();
@@ -555,6 +582,15 @@ pub unsafe extern "C" fn vsprintf(buf: *mut u8, fmt: *const u8, ap: VaList<'_>) 
     unsafe { vsnprintf(buf, usize::MAX, fmt, ap) }
 }
 
+/// Formatted output to a `FILE` stream.
+///
+/// Formats into a 4096-byte stack buffer via `vsnprintf`, then writes the
+/// result to the stream. Supports the full format specifier set: `%d`, `%i`,
+/// `%u`, `%x`/`%X`, `%o`, `%s`, `%c`, `%p`, `%f`, `%e`/`%E`, `%g`/`%G`,
+/// `%n`, `%%`, plus width, precision, and flag modifiers (`-`, `+`, ` `,
+/// `0`, `#`). Length modifiers `l`, `ll`, `h`, `hh`, `z`, `j` are handled.
+///
+/// Returns the number of bytes written, or a negative value on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vfprintf(f: *mut FILE, fmt: *const u8, ap: VaList<'_>) -> i32 {
     let mut buf = [0u8; 4096];

@@ -1,10 +1,21 @@
-//! POSIX signal handling
+//! POSIX signal handling via notification-based delivery
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Signals are delivered through a kernel notification object
+//! (`CAP_SIGNAL_NTFN`). Each signal number corresponds to a bit in the
+//! notification word. The process manager sets bits via `SYS_SIGNAL` when
+//! `kill()` is called. `posix_sigcheck()` polls the notification and
+//! dispatches handlers registered via `posix_signal()`.
+//!
+//! Signal disposition is tracked both locally (handler function pointers in
+//! `__sig_handlers`) and in the process manager (SIG_DFL/SIG_IGN/SIG_CATCH).
+//! Blocked signals are re-raised so they remain pending.
 
 use crate::consts::*;
 use crate::types::*;
 use core::sync::atomic::Ordering;
 
+/// Returns `true` if the default action for `sig` is to terminate the process.
 fn sig_default_action(sig: i32) -> bool {
     // Returns true if default action is terminate
     match sig {
@@ -13,10 +24,19 @@ fn sig_default_action(sig: i32) -> bool {
     }
 }
 
+/// One-shot initialization of signal state (idempotent via compare_exchange).
 unsafe fn sig_init() {
     let _ = crate::__sig_initialized.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
 }
 
+/// Install a signal handler for signal `sig`.
+///
+/// `handler` is one of: `SIG_DFL` (default), `SIG_IGN` (ignore), or a
+/// function pointer cast to `usize`. Returns the previous handler, or
+/// `SIG_ERR` (usize::MAX) on error.
+///
+/// Notifies the process manager of the new disposition category so it
+/// can decide whether to deliver or suppress signals.
 pub unsafe fn posix_signal(sig: i32, handler: usize) -> usize {
     unsafe {
         sig_init();
@@ -63,6 +83,16 @@ pub unsafe fn posix_signal(sig: i32, handler: usize) -> usize {
     }
 }
 
+/// Poll for pending signals and dispatch handlers.
+///
+/// Polls `CAP_SIGNAL_NTFN` for signal bits. For each pending signal:
+/// - If blocked: re-raises it via `SYS_SIGNAL` so it stays pending.
+/// - If SIG_IGN: silently consumed.
+/// - If SIG_DFL with terminate action: calls `posix_exit(128 + sig)`.
+/// - Otherwise: saves/restores the blocked mask, handles SA_RESETHAND,
+///   and calls the user handler function.
+///
+/// Returns the number of signals dispatched (0 if none pending).
 pub unsafe fn posix_sigcheck() -> i32 {
     unsafe {
         sig_init();

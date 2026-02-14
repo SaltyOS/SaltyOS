@@ -1,5 +1,11 @@
 //! Termcap — minimal dumb terminal support
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Provides `tgetent` (always succeeds), `tgetflag` (always false), `tgetnum`
+//! (returns `co=80`, `li=24`, -1 for others), `tgetstr` (returns null),
+//! `tputs` (outputs string directly), and `tgoto` (returns null).
+//! Sufficient for programs that probe terminal capabilities but fall back
+//! to dumb-terminal mode.
 
 use core::ptr;
 

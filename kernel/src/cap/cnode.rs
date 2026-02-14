@@ -513,6 +513,81 @@ pub enum CapError {
 /// Maximum depth for multi-level CNode resolution (prevents infinite loops)
 pub const MAX_RESOLVE_DEPTH: usize = 8;
 
+/// Resolve a capability address for write operations, returning (CNode*, leaf_index).
+///
+/// Same seL4-style guard+radix algorithm as `resolve_address`, but returns a mutable
+/// CNode pointer and the terminal slot index instead of the capability itself.
+/// This is needed for operations that modify CNode slots (retype, copy, delete, etc.)
+/// where the caller needs to operate on the leaf CNode directly.
+///
+/// # Arguments
+/// * `root` - Root CNode to start resolution from
+/// * `cap_addr` - Full capability address to resolve
+/// * `addr_bits` - Total number of significant bits in cap_addr
+///
+/// # Returns
+/// * `Ok((*mut CNode, usize))` - Pointer to the leaf CNode and the slot index within it
+/// * `Err(CapError)` - Resolution failed
+pub fn resolve_address_for_slot(
+    root: &CNode,
+    cap_addr: u64,
+    addr_bits: u8,
+) -> Result<(*mut CNode, usize), CapError> {
+    resolve_for_slot_inner(root, cap_addr, addr_bits as usize, 0)
+}
+
+fn resolve_for_slot_inner(
+    cnode: &CNode,
+    cap_addr: u64,
+    bits_remaining: usize,
+    depth: usize,
+) -> Result<(*mut CNode, usize), CapError> {
+    if depth > MAX_RESOLVE_DEPTH {
+        return Err(CapError::DepthExceeded);
+    }
+
+    let guard_bits = cnode.guard_bits as usize;
+    let radix = cnode.header.size_bits as usize;
+
+    if bits_remaining < guard_bits + radix {
+        return Err(CapError::InvalidSlot);
+    }
+
+    // Verify guard prefix
+    if guard_bits > 0 {
+        let shift = bits_remaining - guard_bits;
+        let mask = (1u64 << guard_bits) - 1;
+        let guard_val = (cap_addr >> shift) & mask;
+        if guard_val != cnode.guard {
+            return Err(CapError::GuardMismatch);
+        }
+    }
+    let bits_after_guard = bits_remaining - guard_bits;
+
+    // Index into slot array
+    let shift = bits_after_guard - radix;
+    let mask = (1u64 << radix) - 1;
+    let index = ((cap_addr >> shift) & mask) as usize;
+    let bits_left = bits_after_guard - radix;
+
+    if bits_left == 0 {
+        // Terminal — return the CNode pointer and index for write operations
+        return Ok((cnode as *const CNode as *mut CNode, index));
+    }
+
+    // Bits remaining — follow CNode pointer
+    let cap_ref = cnode.get_ref(index).ok_or(CapError::SlotEmpty)?;
+    let cap = cap_ref.get();
+
+    if cap.obj_type == super::ObjectType::CNode && !cap.object.is_null() {
+        let next_cnode = unsafe { &*(cap.object as *const CNode) };
+        return resolve_for_slot_inner(next_cnode, cap_addr, bits_left, depth + 1);
+    }
+
+    // Bits remaining but not a CNode — cannot continue resolution
+    Err(CapError::InvalidSlot)
+}
+
 /// Resolve a capability address through a multi-level CNode tree.
 ///
 /// Walks through CNode guards and slot arrays, following CNode capabilities

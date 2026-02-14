@@ -1,9 +1,15 @@
 //! saltyc — SaltyOS C Standard Library
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! Rust implementation of a C standard library for SaltyOS.
-//! All public functions are `#[unsafe(no_mangle)] pub extern "C"` for
-//! C ABI compatibility. Calls into libsalty for system operations.
+//! Rust implementation of a C standard library for SaltyOS. Provides POSIX
+//! and BSD-compatible C functions for ported userland programs (FreeBSD ls,
+//! cat, etc.). All public functions use `#[unsafe(no_mangle)] pub extern "C"`
+//! for C ABI compatibility and are linked into executables via `libsalty.so`.
+//!
+//! System operations (file I/O, memory management, process control) are
+//! delegated to `libsalty`, which communicates with kernel services via IPC.
+//! The library assumes single-threaded execution — `static mut` globals are
+//! used without synchronization.
 
 #![no_std]
 #![no_main]

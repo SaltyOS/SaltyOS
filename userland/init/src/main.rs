@@ -80,6 +80,10 @@ pub const AT_SALTY_SCRATCH: u64 = 0x1002;
 pub const AT_SALTY_INITRD: u64 = 0x1003;
 pub const AT_SALTY_INITRD_SZ: u64 = 0x1004;
 pub const AT_SALTY_FRAME_SLOT: u64 = 0x1005;
+pub const AT_SALTY_SLOT_BASE: u64 = 0x1007;
+pub const AT_SALTY_SLOT_COUNT: u64 = 0x1008;
+pub const AT_SALTY_EXPAND_EP: u64 = 0x1009;
+pub const CAP_EXPAND_EP: u64 = 9;
 
 // ======================================================================
 // Statics
@@ -135,6 +139,54 @@ fn select_init_work_untyped() -> Cap {
         return candidate;
     }
     CAP_UNTYPED_START
+}
+
+/// Validate that all service-declared cap slots are in the allowed range (>= 64).
+/// Returns error count.
+fn validate_service_caps(mgr: &svc_mgr::ServiceManager) -> u32 {
+    const MIN_SVC_SLOT: u64 = 64;
+    let mut errors: u32 = 0;
+    for i in 0..mgr.count {
+        let def = &mgr.services[i].def;
+        let name = def.name_bytes();
+        for c in 0..def.cap_count as usize {
+            if def.caps[c].dst_slot < MIN_SVC_SLOT {
+                let mut lb = LineBuf::new();
+                lb.str(b"[INIT] ERROR: ");
+                lb.bytes(name);
+                lb.str(b" CopyCap dst=");
+                lb.hex(def.caps[c].dst_slot);
+                lb.str(b" < 64 (reserved)\n");
+                lb.flush();
+                errors += 1;
+            }
+        }
+        for c in 0..def.ep_need_count as usize {
+            if def.ep_needs[c].dst_slot < MIN_SVC_SLOT {
+                let mut lb = LineBuf::new();
+                lb.str(b"[INIT] ERROR: ");
+                lb.bytes(name);
+                lb.str(b" NeedEP dst=");
+                lb.hex(def.ep_needs[c].dst_slot);
+                lb.str(b" < 64 (reserved)\n");
+                lb.flush();
+                errors += 1;
+            }
+        }
+        for c in 0..def.ep_inject_count as usize {
+            if def.ep_injects[c].target_slot < MIN_SVC_SLOT {
+                let mut lb = LineBuf::new();
+                lb.str(b"[INIT] ERROR: ");
+                lb.bytes(name);
+                lb.str(b" InjectEP target=");
+                lb.hex(def.ep_injects[c].target_slot);
+                lb.str(b" < 64 (reserved)\n");
+                lb.flush();
+                errors += 1;
+            }
+        }
+    }
+    errors
 }
 
 /// Read the kernel boot info page at BOOTINFO_VADDR.
@@ -292,7 +344,11 @@ unsafe fn pre_create_endpoints(mgr: &mut svc_mgr::ServiceManager, ut: Cap) {
             let mut lb = LineBuf::new();
             lb.str(b"[INIT] WARN: pre-create EP for ");
             lb.bytes(mgr.services[i].def.name_bytes());
-            lb.str(b" failed\n");
+            lb.str(b" slot=");
+            lb.hex(ep_slot);
+            lb.str(b" err=");
+            lb.hex(err as u64);
+            lb.str(b"\n");
             lb.flush();
         }
     }
@@ -326,6 +382,7 @@ fn is_procmgr_requires(mgr: &svc_mgr::ServiceManager, pm_idx: i32, name: &[u8]) 
 unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable: u64) -> Cap {
     let mut pre_spawn_idx: u64 = 0;
     let mut procmgr_ep: Cap = 0;
+    let mut procmgr_raw_ep: Cap = 0; // Raw (unbadged) EP for minting into children
     let pm_svc_idx = mgr.find_service(b"procmgr");
 
     for order_idx in 0..mgr.boot_order_len {
@@ -355,14 +412,10 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
 
         mgr.set_state(svc_idx, svc_mgr::ServiceState::Starting);
         // Determine whether this service must be init-spawned (pre-procmgr) or
-        // can go through procmgr's PM_SPAWN path. Init-spawned services don't
-        // get procmgr/vfs/nameserv EPs, so only services that truly need to
-        // boot before procmgr is ready should be init-spawned.
-        let is_pre_procmgr = bytes_eq(name, b"procmgr")
-            || mgr.services[svc_idx].def.cap_count > 0
-            || mgr.services[svc_idx].def.ep_need_count > 0
-            || mgr.services[svc_idx].def.ep_inject_count > 0
-            || is_procmgr_requires(mgr, pm_svc_idx, name);
+        // can go through procmgr's PM_SPAWN path. This is now explicitly
+        // controlled by .service files via PreProcmgr=yes.
+        let is_pre_procmgr = mgr.services[svc_idx].def.pre_procmgr
+            || bytes_eq(name, b"procmgr");
 
         if is_pre_procmgr {
             let cap_base = get_cap_base(pre_spawn_idx);
@@ -413,6 +466,8 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
 
             { let mut lb = LineBuf::new(); lb.str(b"[INIT] "); lb.bytes(name); lb.str(b" budget=2^"); lb.hex(ut_bits as u64); lb.str(b"\n"); lb.flush(); }
 
+            let is_procmgr_svc = bytes_eq(name, b"procmgr");
+            let child_badge = 0x1000 + pre_spawn_idx;
             let err = unsafe {
                 spawn::spawn_server(
                     ut,
@@ -426,6 +481,8 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                     do_map_initrd,
                     ready_timeout_ns,
                     svc_pre_ep,
+                    if is_procmgr_svc { 0 } else { procmgr_raw_ep },
+                    child_badge,
                 )
             };
 
@@ -458,13 +515,24 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                         lb.hex(ep_injects[i].target_slot);
                         lb.str(b"\n");
                         lb.flush();
+                    } else {
+                        let mut lb = LineBuf::new();
+                        lb.str(b"[INIT] ERROR: InjectEP into ");
+                        lb.bytes(tgt_name);
+                        lb.str(b" slot ");
+                        lb.hex(ep_injects[i].target_slot);
+                        lb.str(b" failed err=");
+                        lb.hex(err as u64);
+                        lb.str(b"\n");
+                        lb.flush();
                     }
                 }
             }
 
-            // Mint badged procmgr EP for init's monitor loop
+            // Mint badged procmgr EP for init's monitor loop + track raw EP
             if bytes_eq(name, b"procmgr") {
                 let ep = cap_base + COFF_EP;
+                procmgr_raw_ep = ep;
                 unsafe {
                     let pm_badged_slot = INIT_DYN_FRAME_NEXT;
                     INIT_DYN_FRAME_NEXT += 1;
@@ -501,7 +569,10 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                 elf_name
             };
 
-            let pid = unsafe { spawn::pm_spawn(procmgr_ep, spawn_name, &mgr.services[svc_idx].def) };
+            let pre_ep = mgr.services[svc_idx].pre_ep;
+            let pid = unsafe {
+                spawn::pm_spawn(procmgr_ep, spawn_name, &mgr.services[svc_idx].def, pre_ep)
+            };
             if pid < 0 {
                 { let mut lb = LineBuf::new(); lb.str(b"[INIT] Failed to spawn "); lb.bytes(name); lb.str(b" via procmgr\n"); lb.flush(); }
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
@@ -593,7 +664,8 @@ unsafe fn handle_child_exit(
                 elf_name
             };
 
-            let new_pid = spawn::pm_spawn(pm_ep, spawn_name, &mgr.services[svc_idx].def);
+            let pre_ep = mgr.services[svc_idx].pre_ep;
+            let new_pid = spawn::pm_spawn(pm_ep, spawn_name, &mgr.services[svc_idx].def, pre_ep);
             if new_pid < 0 {
                 puts(b"[INIT] Failed to restart service\n");
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
@@ -744,6 +816,17 @@ pub extern "C" fn _start() -> ! {
         puts(b"[INIT] WARNING: dependency cycle detected, some services may not start\n");
     }
     mgr.log_boot_order();
+
+    // Validate service-declared cap slots are in the safe range (>= 64)
+    let cap_errors = validate_service_caps(&mgr);
+    if cap_errors > 0 {
+        let mut lb = LineBuf::new();
+        lb.str(b"[INIT] FATAL: ");
+        lb.hex(cap_errors as u64);
+        lb.str(b" service cap slot(s) in reserved range [0..63]\n");
+        lb.flush();
+        idle();
+    }
 
     // Pre-create endpoints for socket activation (before any service spawns)
     unsafe { pre_create_endpoints(&mut mgr, ut) };

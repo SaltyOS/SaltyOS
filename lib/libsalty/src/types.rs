@@ -1,10 +1,17 @@
 //! Core types for SaltyOS userland
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! All types are #[repr(C)] for C ABI compatibility with rtld and libc.
+//! All types are `#[repr(C)]` for C ABI compatibility with `rtld` and `saltyc`.
+//! Structures here are shared across the Rust/C boundary and must remain
+//! layout-stable.
 
+/// Capability slot index. Caps are 64-bit integers that name a slot in the
+/// thread's CNode; the kernel resolves the slot to a fat capability object.
 pub type Cap = u64;
 
+/// Result of a raw syscall: `error` is 0 on success, otherwise an error code
+/// from `consts::SALTY_*`. `value` carries the return payload (e.g. badge,
+/// notification bits, clock value).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SaltyResult {
@@ -12,6 +19,12 @@ pub struct SaltyResult {
     pub value: u64,
 }
 
+/// IPC message buffer passed between userland and the kernel.
+///
+/// `label` identifies the operation (invoke label or POSIX protocol label).
+/// `length` is the number of valid message registers (0..20).
+/// `regs[0..3]` travel in CPU registers; `regs[4..19]` overflow via the
+/// IPC buffer page.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SaltyMsg {
@@ -21,6 +34,7 @@ pub struct SaltyMsg {
 }
 
 impl SaltyMsg {
+    /// Return a zero-initialized message (label=0, length=0, all regs=0).
     pub const fn zeroed() -> Self {
         SaltyMsg {
             label: 0,
@@ -30,6 +44,18 @@ impl SaltyMsg {
     }
 }
 
+/// Kernel-shared IPC buffer page (4096 bytes).
+///
+/// Mapped at a fixed virtual address per thread. The kernel reads/writes
+/// this page during IPC to transfer overflow message registers (MR4+),
+/// capability transfer slots, and receive-slot configuration.
+///
+/// - `msg[0..5]`: mirrors SaltyMsg header (label, length, regs[0..3])
+/// - `msg[6..21]`: overflow message registers (regs[4..19])
+/// - `badge`: sender badge written by kernel on receive
+/// - `caps[0..3]`: CNode slots of capabilities to transfer on send
+/// - `receive_cnode/index/depth`: destination for received capabilities
+/// - `reserved[0..1]`: depth hints for CNode hierarchy invocations
 #[repr(C)]
 pub struct IpcBuffer {
     pub msg: [u64; 22],
@@ -41,9 +67,13 @@ pub struct IpcBuffer {
     pub reserved: [u64; 478],
 }
 
+/// Per-thread IPC context: a pointer to the IPC buffer page and the
+/// number of capability slots staged for the next send operation.
 #[repr(C)]
 pub struct IpcContext {
+    /// Pointer to the kernel-shared IPC buffer page.
     pub ipc_buffer: *mut IpcBuffer,
+    /// Number of caps staged in `ipc_buffer.caps[]` for the next send.
     pub send_cap_count: i32,
 }
 
@@ -59,7 +89,7 @@ impl IpcContext {
     }
 }
 
-// ELF types
+/// ELF64 file header. Matches the System V ABI ELF specification.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Elf64Ehdr {
@@ -79,6 +109,7 @@ pub struct Elf64Ehdr {
     pub e_shstrndx: u16,
 }
 
+/// ELF64 program header. Describes a segment (PT_LOAD, PT_INTERP, etc.).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Elf64Phdr {
@@ -92,6 +123,7 @@ pub struct Elf64Phdr {
     pub p_align: u64,
 }
 
+/// ELF64 dynamic section entry (tag + value pair from PT_DYNAMIC).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Elf64Dyn {
@@ -99,6 +131,7 @@ pub struct Elf64Dyn {
     pub d_val: u64,
 }
 
+/// ELF64 relocation entry with explicit addend (used for R_X86_64_RELATIVE).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Elf64Rela {
@@ -107,6 +140,8 @@ pub struct Elf64Rela {
     pub r_addend: i64,
 }
 
+/// Result of loading an ELF binary: entry point, load base address, and
+/// the end of the loaded BSS (program break).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ElfLoadResult {
@@ -115,6 +150,8 @@ pub struct ElfLoadResult {
     pub brk: u64,
 }
 
+/// Tracks a single mapped page during ELF loading: its virtual address,
+/// the frame capability slot, and VSpace mapping flags.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ElfPageEntry {
@@ -123,20 +160,37 @@ pub struct ElfPageEntry {
     pub flags: u64,
 }
 
+/// Context for the userspace ELF loader.
+///
+/// The loader uses a "scratch-map" strategy: each page is temporarily mapped
+/// into the loader's own VSpace at `scratch_vaddr` for writing, then unmapped
+/// and remapped into the child's VSpace. This allows loading into a foreign
+/// address space without switching page tables.
 #[repr(C)]
 pub struct ElfLoaderCtx {
+    /// Untyped cap to retype frames from (0 = skip internal retype).
     pub untyped: Cap,
+    /// Loader's own VSpace cap (for scratch mapping).
     pub self_vspace: Cap,
+    /// Target child's VSpace cap.
     pub child_vspace: Cap,
+    /// Virtual address in the loader's VSpace used as a scratch page.
     pub scratch_vaddr: u64,
+    /// Next CNode slot to use for frame allocation (bump allocator).
     pub next_frame_slot: Cap,
+    /// Optional callback to allocate a frame slot (overrides bump allocator).
     pub alloc_frame_slot: Option<unsafe extern "C" fn(*mut u8) -> Cap>,
+    /// Opaque pointer passed to `alloc_frame_slot`.
     pub alloc_opaque: *mut u8,
+    /// Optional callback to record each (vaddr, frame_cap, flags) mapping.
     pub record_page: Option<unsafe extern "C" fn(*mut u8, u64, Cap, u64) -> i32>,
+    /// Opaque pointer passed to `record_page`.
     pub record_opaque: *mut u8,
 }
 
-// CPIO types
+/// CPIO archive entry (basic): name pointer/length and data pointer/length.
+/// Returned by `cpio_find_file` and `cpio_next`. Pointers reference data
+/// within the mapped archive (no copies).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CpioEntry {
@@ -157,6 +211,9 @@ impl CpioEntry {
     }
 }
 
+/// Extended CPIO archive entry: includes inode, mode, nlink, and mtime
+/// parsed from the CPIO newc header fields. Used by VFS to populate
+/// directory entries with proper metadata.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CpioEntryExt {
@@ -185,7 +242,8 @@ impl CpioEntryExt {
     }
 }
 
-// POSIX stat structure
+/// POSIX-compatible stat structure returned by `posix_stat` / `posix_fstat`.
+/// Fields are packed into IPC message registers by the VFS server.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SaltyStat {
@@ -214,7 +272,8 @@ impl SaltyStat {
     }
 }
 
-// POSIX directory entry
+/// POSIX-compatible directory entry returned by `posix_readdir`.
+/// `d_name` is null-terminated, max 61 chars + NUL.
 #[repr(C)]
 pub struct SaltyDirent {
     pub d_ino: u64,
@@ -234,7 +293,9 @@ impl SaltyDirent {
     }
 }
 
-// POSIX memory management types
+/// A tracked virtual memory region in the per-process memory manager.
+/// Each region records its base, length, type (heap/mmap/shm/free),
+/// protection bits, and the frame capability slots backing its pages.
 #[repr(C)]
 pub struct PosixMmRegion {
     pub base: u64,
@@ -262,38 +323,61 @@ pub const MM_REGION_FREE: u8 = 0;
 pub const MM_REGION_HEAP: u8 = 1;
 pub const MM_REGION_MMAP: u8 = 2;
 
+/// Global per-process memory management state for brk/mmap/munmap.
+///
+/// Tracks the heap (contiguous, grown via `brk`/`sbrk`) and mmap regions
+/// (non-contiguous, each with its own frame caps). The heap grows upward
+/// from `heap_base`; mmap regions are bump-allocated from `mmap_base`.
 #[repr(C)]
 pub struct PosixMmState {
+    /// Untyped cap to allocate frames from.
     pub untyped: Cap,
+    /// This process's VSpace cap for mapping.
     pub vspace: Cap,
+    /// This process's CSpace cap for slot management.
     pub cspace: Cap,
+    /// Next CNode slot for frame allocation.
     pub next_frame_slot: Cap,
+    /// Upper bound on frame slot allocation.
     pub max_frame_slot: Cap,
+    /// Fixed base address of the heap region.
     pub heap_base: u64,
+    /// Current program break (end of allocated heap).
     pub heap_current: u64,
+    /// Base address for mmap allocations.
     pub mmap_base: u64,
+    /// Next available mmap address (bump allocator).
     pub mmap_next: u64,
+    /// Region table tracking mmap/shm allocations.
     pub regions: [PosixMmRegion; crate::consts::MM_MAX_REGIONS],
+    /// Frame cap slots backing heap pages (indexed by page offset from base).
     pub heap_frame_slots: [Cap; crate::consts::MM_MAX_PAGES_PER_REGION],
+    /// 1 if initialized, 0 otherwise.
     pub initialized: i32,
 }
 
-// Wait status helpers (match POSIX encoding: low 7 bits = signal, bits 15:8 = exit code)
+/// Returns true if the child terminated normally (exit, not signal).
+/// POSIX encoding: low 7 bits = termination signal (0 = normal exit).
 pub fn wifexited(s: i32) -> bool {
     (s & 0x7f) == 0
 }
+/// Extract the exit code from a wait status (bits 15:8).
 pub fn wexitstatus(s: i32) -> i32 {
     (s >> 8) & 0xff
 }
+/// Returns true if the child was terminated by a signal.
 pub fn wifsignaled(s: i32) -> bool {
     (s & 0x7f) != 0 && (s & 0x7f) != 0x7f
 }
+/// Extract the signal number that caused termination.
 pub fn wtermsig(s: i32) -> i32 {
     s & 0x7f
 }
+/// Returns true if the child is currently stopped.
 pub fn wifstopped(s: i32) -> bool {
     (s & 0xff) == 0x7f
 }
+/// Extract the signal number that caused the child to stop.
 pub fn wstopsig(s: i32) -> i32 {
     (s >> 8) & 0xff
 }
@@ -308,7 +392,8 @@ pub const SIG_IGN: usize = 1;
 // SHM memory region type
 pub const MM_REGION_SHM: u8 = 3;
 
-// Socket address (Unix domain)
+/// Unix domain socket address. `sun_family` is `AF_UNIX` (1).
+/// `sun_path` holds the null-terminated filesystem path (max 64 bytes).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SockAddrUn {
@@ -325,7 +410,8 @@ impl SockAddrUn {
     }
 }
 
-// Poll file descriptor
+/// POSIX poll file descriptor: `fd` to monitor, requested `events`
+/// (POLLIN/POLLOUT), and returned `revents` filled by the kernel/VFS.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PollFd {
@@ -344,7 +430,7 @@ impl PollFd {
     }
 }
 
-// Time types
+/// POSIX timespec: seconds + nanoseconds (used by clock_gettime, nanosleep).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Timespec {
@@ -358,6 +444,7 @@ impl Timespec {
     }
 }
 
+/// POSIX timeval: seconds + microseconds (used by gettimeofday).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Timeval {
@@ -371,7 +458,8 @@ impl Timeval {
     }
 }
 
-// Termios structure (matches saltyc layout)
+/// POSIX termios structure for terminal I/O control. Layout matches `saltyc`.
+/// Packed into IPC messages for `tcgetattr`/`tcsetattr` VFS calls.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Termios {
@@ -400,7 +488,8 @@ impl Termios {
     }
 }
 
-// Epoll event
+/// Epoll event structure: `events` is a bitmask (EPOLLIN, EPOLLOUT, etc.),
+/// `data` is an opaque user value associated with the fd.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct EpollEvent {

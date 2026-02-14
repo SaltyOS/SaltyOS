@@ -1,5 +1,14 @@
 //! POSIX signal handling
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Single-threaded signal implementation backed by libsalty's notification
+//! mechanism. Signal handlers are registered via `salty::signals::posix_signal`,
+//! which sets up a kernel notification object to deliver signals asynchronously.
+//!
+//! The `sigaction` interface stores `sa_mask` and `sa_flags` in shared libsalty
+//! globals (`__sig_sa_mask`, `__sig_sa_flags`) so the signal delivery trampoline
+//! can apply the correct mask before invoking the handler. Up to 32 signals
+//! are supported (`NSIG = 32`).
 
 use crate::errno;
 
@@ -34,9 +43,18 @@ pub struct Sigset {
     pub bits: u32,
 }
 
+// SAFETY: single-threaded process; HANDLERS and BLOCKED_MASK are only
+// accessed from the main thread.
 static mut HANDLERS: [SighandlerT; NSIG] = [SIG_DFL; NSIG];
 static mut BLOCKED_MASK: Sigset = Sigset { bits: 0 };
 
+/// Install a signal handler for signal `sig`.
+///
+/// Registers the handler with libsalty's notification-based signal delivery
+/// via `salty::signals::posix_signal`. Both `SIG_DFL` and `SIG_IGN` are
+/// forwarded to libsalty so it can update the kernel notification mask.
+///
+/// Returns the previous handler on success, or `SIG_ERR` on failure.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn signal(sig: i32, handler: SighandlerT) -> SighandlerT {
     unsafe {

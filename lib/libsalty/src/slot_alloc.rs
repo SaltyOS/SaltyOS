@@ -1,0 +1,509 @@
+//! Per-process dynamic capability slot allocator
+//!
+//! Provides a bump allocator over a chained array of CNode slot segments.
+//! The initial segment is assigned by procmgr/init at spawn time. When all
+//! segments are exhausted, an async expansion protocol requests more slots
+//! from the process manager via NBSend + Call.
+//!
+//! Untyped expansion uses a Signal-based async protocol: the child signals
+//! a bound notification on the procmgr, which places untypeds at deterministic
+//! CNode slots (UT_EXPAND_BASE + N). The child probes those slots to detect
+//! completion — the probe retype doubles as both completion check and frame
+//! creation.
+//!
+//! The pool base and count are communicated via auxv entries
+//! `AT_SALTY_SLOT_BASE` and `AT_SALTY_SLOT_COUNT`.
+//!
+//! SPDX-License-Identifier: GPL-2.0-only
+
+use crate::consts::*;
+use crate::invoke;
+use crate::ipc;
+use crate::serial;
+use crate::syscall::syscall;
+use crate::types::Cap;
+
+const SLOT_EXPAND_BITS_DEFAULT: u64 = 10;
+const MAX_SEGMENTS: usize = 16;
+const MAX_EXTRA_UT: usize = MAX_UT_EXPANSIONS;
+
+/// A contiguous range of CNode slots available for allocation.
+#[derive(Clone, Copy)]
+struct Segment {
+    base: Cap,
+    count: u64,
+    next: u64,
+}
+
+/// Result of an async slot allocation attempt.
+#[derive(Clone, Copy, PartialEq)]
+pub enum SlotResult {
+    /// Successfully allocated a slot.
+    Ok(Cap),
+    /// Expansion in progress; caller should yield and retry.
+    WouldBlock,
+    /// All segments exhausted and expansion failed permanently.
+    Exhausted,
+}
+
+/// State machine for the CSpace expansion protocol.
+#[derive(Clone, Copy, PartialEq)]
+enum ExpandState {
+    /// No expansion in progress.
+    Idle,
+    /// NBSend sent to procmgr; waiting for expansion to complete.
+    Requested,
+    /// Expansion permanently failed (segment table full or procmgr error).
+    Failed,
+}
+
+/// Internal state for the per-process slot allocator.
+struct SlotAllocState {
+    segments: [Segment; MAX_SEGMENTS],
+    seg_count: usize,
+    active_seg: usize,
+    initialized: bool,
+    /// Procmgr EP for CSpace expansion (always CAP_PROCMGR_EP).
+    procmgr_ep: Cap,
+    /// Bound notification cap for UT expansion signaling.
+    expand_ntfn: Cap,
+    expand_state: ExpandState,
+    /// Root CNode size_bits (queried from cnode_get_info).
+    root_bits: u8,
+    /// Total CNode depth after expansion (root_bits + sub_bits), 0 if not expanded.
+    expanded_depth: u8,
+}
+
+static mut SLOT_ALLOC: SlotAllocState = SlotAllocState {
+    segments: [Segment { base: 0, count: 0, next: 0 }; MAX_SEGMENTS],
+    seg_count: 0,
+    active_seg: 0,
+    initialized: false,
+    procmgr_ep: 0,
+    expand_ntfn: 0,
+    expand_state: ExpandState::Idle,
+    root_bits: 0,
+    expanded_depth: 0,
+};
+
+// Dynamic untyped expansion state (Signal-based)
+static mut UT_EXPAND_REQUESTED: bool = false;
+static mut EXTRA_UT_SLOTS: [Cap; MAX_EXTRA_UT] = [0; MAX_EXTRA_UT];
+static mut EXTRA_UT_COUNT: usize = 0;
+static mut PENDING_FRAME_SLOT: Cap = 0;
+
+/// Initialize the per-process slot allocator.
+///
+/// Called during process startup (from CRT or RTLD) with values from auxv.
+/// `base==0` means "not provided".
+/// `expand_ep` is the notification cap for UT expansion signaling
+/// (from AT_SALTY_EXPAND_EP auxv), or 0 if not available.
+/// CSpace expansion always uses `CAP_PROCMGR_EP` directly.
+///
+/// # Safety
+/// Must be called exactly once during process initialization.
+pub unsafe fn slot_alloc_init(base: Cap, count: u64, expand_ep: u64) {
+    unsafe {
+        let state = &mut *(&raw mut SLOT_ALLOC);
+        state.segments[0] = Segment { base, count, next: 0 };
+        state.seg_count = 1;
+        state.active_seg = 0;
+        state.initialized = base != 0;
+        state.procmgr_ep = CAP_PROCMGR_EP;
+        state.expand_ntfn = expand_ep;
+        state.expand_state = ExpandState::Idle;
+        state.root_bits = 0;
+        state.expanded_depth = 0;
+    }
+}
+
+/// Check whether the slot allocator has been initialized.
+pub fn slot_alloc_is_initialized() -> bool {
+    unsafe { (*(&raw const SLOT_ALLOC)).initialized }
+}
+
+/// Return the pool base slot (first segment).
+pub fn slot_alloc_base() -> Cap {
+    unsafe {
+        let state = &*(&raw const SLOT_ALLOC);
+        if state.seg_count > 0 { state.segments[0].base } else { 0 }
+    }
+}
+
+/// Return the total pool size across all segments.
+pub fn slot_alloc_count() -> u64 {
+    unsafe {
+        let state = &*(&raw const SLOT_ALLOC);
+        let mut total: u64 = 0;
+        for i in 0..state.seg_count {
+            total += state.segments[i].count;
+        }
+        total
+    }
+}
+
+/// Return the number of slots remaining across all segments.
+pub fn slot_alloc_remaining() -> u64 {
+    unsafe {
+        let state = &*(&raw const SLOT_ALLOC);
+        if !state.initialized {
+            return 0;
+        }
+        let mut remaining: u64 = 0;
+        for i in state.active_seg..state.seg_count {
+            remaining += state.segments[i].count.saturating_sub(state.segments[i].next);
+        }
+        remaining
+    }
+}
+
+/// Override the procmgr EP used for expansion (escape hatch).
+pub fn slot_alloc_set_procmgr_ep(ep: Cap) {
+    unsafe {
+        (*(&raw mut SLOT_ALLOC)).procmgr_ep = ep;
+    }
+}
+
+/// Async slot allocation with self-healing NBSend expansion protocol.
+///
+/// Returns `SlotResult::Ok(cap)` on success, `WouldBlock` if expansion is
+/// in progress (caller should yield and retry), or `Exhausted` if expansion
+/// failed permanently.
+pub fn slot_alloc_async() -> SlotResult {
+    unsafe {
+        let state = &mut *(&raw mut SLOT_ALLOC);
+        if !state.initialized {
+            return SlotResult::Exhausted;
+        }
+
+        // Fast path: scan segment chain for an available slot
+        while state.active_seg < state.seg_count {
+            let seg = &mut state.segments[state.active_seg];
+            if seg.next < seg.count {
+                let slot = seg.base + seg.next;
+                seg.next += 1;
+                return SlotResult::Ok(slot);
+            }
+            state.active_seg += 1;
+        }
+
+        // All segments exhausted — enter CSpace expansion protocol
+        // CSpace expansion always uses CAP_PROCMGR_EP directly
+        let ep = CAP_PROCMGR_EP;
+
+        match state.expand_state {
+            ExpandState::Idle => {
+                // Send NBSend (fire-and-forget) to request async expansion
+                send_expand_nbsend(ep);
+                state.expand_state = ExpandState::Requested;
+                SlotResult::WouldBlock
+            }
+            ExpandState::Requested => {
+                // Re-send NBSend (idempotent, in case previous was dropped)
+                send_expand_nbsend(ep);
+
+                // Try to collect result via blocking Call
+                match collect_expand_result(ep) {
+                    CollectResult::Ok(base, count) => {
+                        if state.seg_count >= MAX_SEGMENTS {
+                            state.expand_state = ExpandState::Failed;
+                            return SlotResult::Exhausted;
+                        }
+                        // Append new segment
+                        let si = state.seg_count;
+                        state.segments[si] = Segment { base, count, next: 0 };
+                        state.seg_count += 1;
+                        state.active_seg = si;
+                        state.expand_state = ExpandState::Idle;
+
+                        // Track expansion depth for depth-aware invocations
+                        if state.root_bits == 0 {
+                            // Query root CNode size_bits
+                            let info = invoke::cnode_get_info(CAP_SELF_CSPACE);
+                            if info.error == 0 {
+                                let ctx = &raw const crate::__salty_ipc_ctx;
+                                if !(*ctx).ipc_buffer.is_null() {
+                                    state.root_bits = (*(*ctx).ipc_buffer).msg[2] as u8;
+                                }
+                            }
+                        }
+                        if state.root_bits > 0 {
+                            state.expanded_depth =
+                                state.root_bits + SLOT_EXPAND_BITS_DEFAULT as u8;
+                        }
+
+                        {
+                            let mut lb = serial::LineBuf::new();
+                            lb.str(b"[SLOT] expand: collected base=");
+                            lb.hex(base);
+                            lb.str(b" count=");
+                            lb.hex(count);
+                            lb.str(b" (seg ");
+                            lb.hex(si as u64);
+                            lb.str(b")\n");
+                            lb.flush();
+                        }
+
+                        // Allocate from the new segment
+                        let seg = &mut state.segments[si];
+                        let slot = seg.base + seg.next;
+                        seg.next += 1;
+                        SlotResult::Ok(slot)
+                    }
+                    CollectResult::Pending => {
+                        SlotResult::WouldBlock
+                    }
+                    CollectResult::Error => {
+                        state.expand_state = ExpandState::Failed;
+                        SlotResult::Exhausted
+                    }
+                }
+            }
+            ExpandState::Failed => {
+                SlotResult::Exhausted
+            }
+        }
+    }
+}
+
+/// Allocate a single CNode slot from the pool (sync wrapper).
+///
+/// Returns the absolute CNode slot index, or `None` if the pool is exhausted
+/// or expansion would block.
+pub fn slot_alloc() -> Option<Cap> {
+    match slot_alloc_async() {
+        SlotResult::Ok(cap) => Some(cap),
+        _ => None,
+    }
+}
+
+/// Allocate a single CNode slot and retype a frame into it from any
+/// available untyped capability.
+///
+/// This is the most common operation: allocate a slot and create a frame.
+/// Tries the dedicated untyped (slot 7) first, then scans mirrored untypeds.
+///
+/// Returns the frame's CNode slot on success, or `None` on failure.
+pub fn slot_alloc_frame() -> Option<Cap> {
+    let slot = slot_alloc()?;
+    let err = try_retype_frame(slot);
+    if err == 0 {
+        Some(slot)
+    } else {
+        None
+    }
+}
+
+/// Allocate a frame slot and map it at the given virtual address.
+///
+/// Convenience wrapper: alloc slot -> retype frame -> vspace_map.
+/// Returns the frame slot on success.
+pub fn slot_alloc_frame_map(vspace: Cap, vaddr: u64, flags: u64) -> Option<Cap> {
+    let slot = slot_alloc_frame()?;
+    let err = invoke::vspace_map(vspace, slot, vaddr, flags);
+    if err != 0 {
+        return None;
+    }
+    Some(slot)
+}
+
+/// Async version of slot_alloc_frame_map: uses slot_alloc_async internally.
+///
+/// Returns `SlotResult::Ok(frame_slot)` on success, `WouldBlock` if expansion
+/// is in progress (CNode slot or untyped), or `Exhausted` on permanent failure.
+///
+/// Untyped expansion uses Signal-based async protocol: signals the procmgr's
+/// bound notification, then probes deterministic expansion slots. The probe
+/// retype doubles as both completion check and frame creation.
+pub fn slot_alloc_frame_map_async(vspace: Cap, vaddr: u64, flags: u64) -> SlotResult {
+    unsafe {
+        // If we saved a frame slot from a previous WouldBlock, reuse it
+        let slot = if *(&raw const PENDING_FRAME_SLOT) != 0 {
+            *(&raw const PENDING_FRAME_SLOT)
+        } else {
+            match slot_alloc_async() {
+                SlotResult::Ok(s) => s,
+                other => return other,
+            }
+        };
+
+        let err = try_retype_frame(slot);
+        if err != 0 {
+            // Retype failed — enter Signal-based untyped expansion
+            let ntfn = (*(&raw const SLOT_ALLOC)).expand_ntfn;
+            let count = *(&raw const EXTRA_UT_COUNT);
+
+            if ntfn == 0 || count >= MAX_EXTRA_UT {
+                *(&raw mut PENDING_FRAME_SLOT) = 0;
+                return SlotResult::Exhausted;
+            }
+
+            if *(&raw const UT_EXPAND_REQUESTED) {
+                // Probe the deterministic expansion slot — acts as both
+                // completion check AND frame retype in one operation
+                let expected = UT_EXPAND_BASE + count as u64;
+                let probe = invoke::untyped_retype(expected, OBJ_FRAME, 0, slot);
+                if probe == 0 {
+                    // Expansion completed — register new untyped
+                    (*(&raw mut EXTRA_UT_SLOTS))[count] = expected;
+                    *(&raw mut EXTRA_UT_COUNT) = count + 1;
+                    *(&raw mut UT_EXPAND_REQUESTED) = false;
+                    *(&raw mut PENDING_FRAME_SLOT) = 0;
+
+                    {
+                        let mut lb = serial::LineBuf::new();
+                        lb.str(b"[SLOT] ut-expand: granted slot=");
+                        lb.hex(expected);
+                        lb.str(b"\n");
+                        lb.flush();
+                    }
+
+                    // Frame was already retyped by the probe — fall through to map
+                } else {
+                    // Not ready yet — re-signal (idempotent: OR same badge bit)
+                    syscall(SYS_SIGNAL, ntfn, 0, 0, 0, 0, 0);
+                    *(&raw mut PENDING_FRAME_SLOT) = slot;
+                    return SlotResult::WouldBlock;
+                }
+            } else {
+                // First request — signal procmgr's bound notification
+                syscall(SYS_SIGNAL, ntfn, 0, 0, 0, 0, 0);
+                *(&raw mut UT_EXPAND_REQUESTED) = true;
+                *(&raw mut PENDING_FRAME_SLOT) = slot;
+                return SlotResult::WouldBlock;
+            }
+        } else {
+            *(&raw mut PENDING_FRAME_SLOT) = 0;
+        }
+
+        // Map the frame
+        let err = invoke::vspace_map(vspace, slot, vaddr, flags);
+        if err != 0 {
+            return SlotResult::Exhausted;
+        }
+        SlotResult::Ok(slot)
+    }
+}
+
+/// Try to retype a frame from any available untyped, scanning primary
+/// untyped (slot 7), mirrored untypeds (CAP_UNTYPED_START..), then
+/// dynamically-granted untypeds (EXTRA_UT_SLOTS).
+fn try_retype_frame(dest_slot: Cap) -> i32 {
+    // Try dedicated untyped first
+    let err = invoke::untyped_retype(CAP_UNTYPED, OBJ_FRAME, 0, dest_slot);
+    if err == 0 {
+        return 0;
+    }
+
+    // Scan mirrored untyped caps
+    let scan_end = untyped_scan_end();
+    let mut last_err = err;
+    for ut in CAP_UNTYPED_START..scan_end {
+        let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, dest_slot);
+        if err == 0 {
+            return 0;
+        }
+        last_err = err;
+    }
+
+    // Try dynamically-granted untypeds
+    unsafe {
+        let count = *(&raw const EXTRA_UT_COUNT);
+        for i in 0..count {
+            let ut = (*(&raw const EXTRA_UT_SLOTS))[i];
+            if ut != 0 {
+                let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, dest_slot);
+                if err == 0 {
+                    return 0;
+                }
+                last_err = err;
+            }
+        }
+    }
+
+    last_err
+}
+
+/// Determine the upper bound for untyped cap scanning.
+fn untyped_scan_end() -> Cap {
+    let mut end: Cap = 200; // fallback
+    let info = invoke::cnode_get_info(CAP_SELF_CSPACE);
+    if info.error == 0 {
+        unsafe {
+            let ctx = &raw const crate::__salty_ipc_ctx;
+            if !(*ctx).ipc_buffer.is_null() {
+                let num_slots = (*(*ctx).ipc_buffer).msg[3];
+                if num_slots > CAP_UNTYPED_START && num_slots < end {
+                    end = num_slots;
+                }
+            }
+        }
+    }
+    if end <= CAP_UNTYPED_START {
+        CAP_UNTYPED_START + 1
+    } else {
+        end
+    }
+}
+
+// ===========================================================================
+// CSpace expansion protocol helpers
+// ===========================================================================
+
+/// Result of attempting to collect a CSpace expansion result from the procmgr.
+enum CollectResult {
+    Ok(Cap, u64),
+    Pending,
+    Error,
+}
+
+/// Send NBSend(PM_EXPAND_CSPACE_ASYNC, bits=10) to the procmgr EP.
+/// NBSend is fire-and-forget; if procmgr is busy, it's silently dropped.
+fn send_expand_nbsend(ep: Cap) {
+    unsafe {
+        let mut msg = crate::types::SaltyMsg::zeroed();
+        msg.label = POSIX_PM_EXPAND_CSPACE_ASYNC;
+        msg.length = 1;
+        msg.regs[0] = SLOT_EXPAND_BITS_DEFAULT;
+
+        let _ = ipc::nbsend_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            ep,
+            &raw const msg,
+        );
+    }
+}
+
+/// Call(PM_EXPAND_COLLECT) to collect expansion result.
+/// Returns Ok(base, count) on success, Pending if not ready, Error on failure.
+fn collect_expand_result(ep: Cap) -> CollectResult {
+    unsafe {
+        let mut msg = crate::types::SaltyMsg::zeroed();
+        let mut reply = crate::types::SaltyMsg::zeroed();
+        msg.label = POSIX_PM_EXPAND_COLLECT;
+        msg.length = 0;
+
+        let err = ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            ep,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 {
+            return CollectResult::Error;
+        }
+
+        if reply.label == SALTY_OK && reply.length >= 2 {
+            let base = reply.regs[0];
+            let count = reply.regs[1];
+            if base == 0 || count == 0 {
+                return CollectResult::Error;
+            }
+            CollectResult::Ok(base, count)
+        } else if reply.label == SALTY_PENDING {
+            CollectResult::Pending
+        } else {
+            CollectResult::Error
+        }
+    }
+}

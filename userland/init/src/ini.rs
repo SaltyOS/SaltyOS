@@ -61,6 +61,7 @@ pub struct ServiceDef {
     pub timeout_start_ns: u64,
     pub cnode_bits: u8,
     pub map_initrd: bool,
+    pub pre_procmgr: bool,
     pub caps: [CapCopyDef; MAX_CAP_COPIES],
     pub cap_count: u8,
     pub ep_needs: [EpNeedDef; MAX_EP_NEEDS],
@@ -86,6 +87,7 @@ impl ServiceDef {
             timeout_start_ns: 0,
             cnode_bits: 0,
             map_initrd: false,
+            pre_procmgr: false,
             caps: [CapCopyDef { src_slot: 0, dst_slot: 0 }; MAX_CAP_COPIES],
             cap_count: 0,
             ep_needs: [EpNeedDef { service: [0; MAX_SERVICE_NAME], service_len: 0, dst_slot: 0 }; MAX_EP_NEEDS],
@@ -480,6 +482,8 @@ pub fn parse_service(data: &[u8], out: &mut ServiceDef) -> bool {
                                 out.cnode_bits = parse_decimal_u16(value) as u8;
                             } else if bytes_eq_ci(key, b"MapInitrd") {
                                 out.map_initrd = bytes_eq_ci(value, b"yes");
+                            } else if bytes_eq_ci(key, b"PreProcmgr") {
+                                out.pre_procmgr = bytes_eq_ci(value, b"yes");
                             } else if bytes_eq_ci(key, b"Restart") {
                                 if bytes_eq_ci(value, b"no") {
                                     out.restart = RestartPolicy::No;

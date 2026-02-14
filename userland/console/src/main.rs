@@ -26,10 +26,11 @@ const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 // Cap layout (set up by init for the console server)
 const CAP_SERVER_EP: u64 = 3;
-const CAP_IOPORT: u64 = 4;
-const CAP_IRQ: u64 = 5;
-const CAP_NTFN: u64 = 6;
-const CAP_PROCMGR: u64 = 9; // Injected late by init after procmgr starts
+const CAP_IOPORT: u64 = 64;     // COM1 IoPort (CopyCap 8:64)
+const CAP_IRQ: u64 = 65;        // COM1 IRQ handler (CopyCap 9:65)
+const CAP_NTFN: u64 = 66;       // COM1 IRQ notification (CopyCap 10:66)
+const CAP_PROCMGR: u64 = 67;    // Procmgr EP (NeedEP procmgr:67)
+const CAP_DISPLAY_EP: u64 = 68; // Display EP (NeedEP display:68)
 
 // Slot used for saving reply cap when blocking a CONSOLE_READ caller
 const CAP_REPLY_SLOT: u64 = 32;
@@ -258,6 +259,40 @@ fn echo_ctrl(c: u8) {
     serial::serial_puts(&[b'^', c + 0x40]);
 }
 
+/// Forward output to the display server via non-blocking send.
+/// Silently fails if display EP is not yet injected.
+fn display_write(data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    let mut msg = SaltyMsg::zeroed();
+    msg.label = DISPLAY_TERMINAL_WRITE;
+    let len = if data.len() > 152 { 152 } else { data.len() };
+    msg.regs[0] = len as u64;
+    msg.length = 1 + (len as u64 + 7) / 8;
+    let dst = &raw mut msg.regs[1] as *mut u8;
+    // SAFETY: Writing data bytes into message register area, bounded by len <= 152.
+    unsafe {
+        for i in 0..len {
+            *dst.add(i) = data[i];
+        }
+        let ret = ipc::nbsend_ctx(ipc_ctx(), CAP_DISPLAY_EP, &raw const msg);
+        if ret != 0 {
+            static mut DBG_COUNT: u32 = 0;
+            let cnt = core::ptr::addr_of_mut!(DBG_COUNT);
+            let c = *cnt;
+            *cnt = c + 1;
+            if c < 5 {
+                let mut lb = salty::serial::LineBuf::new();
+                lb.str(b"[CON] display_write nbsend err=");
+                lb.hex(ret as u64);
+                lb.str(b"\n");
+                lb.flush();
+            }
+        }
+    }
+}
+
 /// Deliver line buffer contents to a pending reader via saved reply cap.
 fn deliver_line(line: &mut LineBuf, pending_reader: &mut bool) {
     if !*pending_reader || line.len == 0 {
@@ -315,6 +350,7 @@ unsafe fn handle_write(msg: *const SaltyMsg) {
             len as usize,
         );
         console_puts(data);
+        display_write(data);
     }
 }
 
@@ -354,6 +390,16 @@ fn handle_tcsetattr(msg: &SaltyMsg, termios: &mut ConsoleTermios, reply: &mut Sa
     reply.length = 0;
 }
 
+/// Push a byte to the display echo buffer, flushing if full.
+fn echo_push(buf: &mut [u8; 64], len: &mut usize, c: u8) {
+    if *len >= 64 {
+        display_write(&buf[..*len]);
+        *len = 0;
+    }
+    buf[*len] = c;
+    *len += 1;
+}
+
 /// Drain all available characters from COM1, apply line discipline.
 fn handle_irq(
     ring: &mut RingBuf,
@@ -364,6 +410,10 @@ fn handle_irq(
     let canonical = (termios.c_lflag & ICANON) != 0;
     let do_echo = (termios.c_lflag & ECHO) != 0;
     let do_isig = (termios.c_lflag & ISIG) != 0;
+
+    // Buffer for display echo — flushed once after the drain loop
+    let mut echo_buf = [0u8; 64];
+    let mut echo_len: usize = 0;
 
     loop {
         let lsr = invoke::ioport_in8(CAP_IOPORT, COM1_LSR);
@@ -378,6 +428,9 @@ fn handle_irq(
                 if (termios.c_lflag & ECHOCTL) != 0 {
                     echo_ctrl(c);
                     serial::serial_puts(b"\r\n");
+                    echo_push(&mut echo_buf, &mut echo_len, b'^');
+                    echo_push(&mut echo_buf, &mut echo_len, c + 0x40);
+                    echo_push(&mut echo_buf, &mut echo_len, b'\n');
                 }
                 send_signal(SIGINT);
                 if canonical { line.clear(); }
@@ -387,6 +440,9 @@ fn handle_irq(
                 if (termios.c_lflag & ECHOCTL) != 0 {
                     echo_ctrl(c);
                     serial::serial_puts(b"\r\n");
+                    echo_push(&mut echo_buf, &mut echo_len, b'^');
+                    echo_push(&mut echo_buf, &mut echo_len, c + 0x40);
+                    echo_push(&mut echo_buf, &mut echo_len, b'\n');
                 }
                 send_signal(SIGQUIT);
                 if canonical { line.clear(); }
@@ -396,6 +452,9 @@ fn handle_irq(
                 if (termios.c_lflag & ECHOCTL) != 0 {
                     echo_ctrl(c);
                     serial::serial_puts(b"\r\n");
+                    echo_push(&mut echo_buf, &mut echo_len, b'^');
+                    echo_push(&mut echo_buf, &mut echo_len, c + 0x40);
+                    echo_push(&mut echo_buf, &mut echo_len, b'\n');
                 }
                 send_signal(SIGTSTP);
                 if canonical { line.clear(); }
@@ -416,6 +475,7 @@ fn handle_irq(
                 if line.pop() {
                     if (termios.c_lflag & ECHOE) != 0 {
                         serial::serial_puts(b"\x08 \x08");
+                        echo_push(&mut echo_buf, &mut echo_len, 0x08);
                     }
                 }
                 continue;
@@ -427,6 +487,7 @@ fn handle_irq(
                     // Erase each character on terminal
                     for _ in 0..line.len {
                         serial::serial_puts(b"\x08 \x08");
+                        echo_push(&mut echo_buf, &mut echo_len, 0x08);
                     }
                 }
                 line.clear();
@@ -463,6 +524,7 @@ fn handle_irq(
                 line.push(b'\n');
                 if do_echo || (termios.c_lflag & ECHONL) != 0 {
                     serial::serial_puts(b"\r\n");
+                    echo_push(&mut echo_buf, &mut echo_len, b'\n');
                 }
                 // Deliver line
                 if *pending_reader {
@@ -478,8 +540,11 @@ fn handle_irq(
                 if do_echo {
                     if c < 0x20 && (termios.c_lflag & ECHOCTL) != 0 {
                         echo_ctrl(c);
+                        echo_push(&mut echo_buf, &mut echo_len, b'^');
+                        echo_push(&mut echo_buf, &mut echo_len, c + 0x40);
                     } else {
                         serial::serial_puts(&[c]);
+                        echo_push(&mut echo_buf, &mut echo_len, c);
                     }
                 }
             }
@@ -495,6 +560,7 @@ fn handle_irq(
             // === RAW MODE ===
             if do_echo {
                 serial::serial_puts(&[c]);
+                echo_push(&mut echo_buf, &mut echo_len, c);
             }
 
             // Push to ring buffer and deliver immediately if pending reader
@@ -514,6 +580,11 @@ fn handle_irq(
                 ring.push(c);
             }
         }
+    }
+
+    // Flush accumulated echo to display server
+    if echo_len > 0 {
+        display_write(&echo_buf[..echo_len]);
     }
 
     // Acknowledge the IRQ so it can fire again

@@ -44,6 +44,19 @@ pub extern "C" fn _start() -> ! {
         ipc::ipc_context_init(&raw mut salty::__salty_ipc_ctx, 0x200000 as *mut IpcBuffer);
     }
 
+    // Initialize per-process slot allocator from RTLD-exported globals
+    unsafe {
+        let base = *(&raw const salty::__salty_slot_base);
+        let count = *(&raw const salty::__salty_slot_count);
+        let expand_ep = *(&raw const salty::__salty_expand_ep);
+        if base != 0 {
+            salty::slot_alloc::slot_alloc_init(base, count, expand_ep);
+        } else {
+            puts(b"[TEST_RUNNER] FATAL: slot pool not provided by RTLD/auxv\n");
+            posix::posix_exit(1);
+        }
+    }
+
     puts(b"[TEST_RUNNER] SaltyOS Test Runner starting\n");
     signal_ready();
 

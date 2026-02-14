@@ -1,10 +1,31 @@
 //! Raw system call interface
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! Inline assembly wrappers for the SaltyOS syscall ABI.
+//! Single inline-assembly wrapper for all SaltyOS kernel syscalls.
+//!
+//! # Register ABI
+//!
+//! | Register | Direction | Purpose |
+//! |----------|-----------|---------|
+//! | `rax` | in/out | Syscall number in, error code out |
+//! | `rdi` | in | Argument 0 (e.g. cap slot) |
+//! | `rsi` | in | Argument 1 (e.g. msginfo) |
+//! | `rdx` | in/out | Argument 2 in, return value out |
+//! | `r10` | in | Argument 3 |
+//! | `r8` | in | Argument 4 |
+//! | `r9` | in | Argument 5 |
+//! | `rcx` | clobbered | Kernel overwrites with return RIP |
+//! | `r11` | clobbered | Kernel overwrites with saved RFLAGS |
+//!
+//! `options(nostack)` is used because the `syscall` instruction does not
+//! touch the user stack -- the kernel switches to its own per-thread stack.
 
 use crate::types::SaltyResult;
 
+/// Issue a raw syscall with up to 6 arguments.
+///
+/// Returns a [`SaltyResult`] with `error` (0 = success) and `value`
+/// (syscall-specific return payload).
 #[inline(always)]
 pub fn syscall(
     num: u64,

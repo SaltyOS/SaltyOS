@@ -1,5 +1,16 @@
 //! malloc/free/realloc/calloc — sbrk-based free-list allocator
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Simple first-fit allocator backed by `sbrk()` (via `posix_sbrk`).
+//! Every allocation has a 16-byte `BlockHeader` placed immediately before the
+//! returned pointer, storing the total block size and a free-list link.
+//!
+//! All allocations are aligned to 16 bytes (`ALIGN`). Blocks are split when
+//! the remainder exceeds `HEADER_SIZE + ALIGN` (32 bytes). The free list is
+//! kept sorted by address to enable bidirectional coalescing: on `free()`,
+//! adjacent blocks (both before and after) are merged when contiguous.
+//!
+//! Layout: `[BlockHeader (16 bytes)][user data (aligned to 16)]`
 
 use crate::errno;
 
@@ -7,10 +18,14 @@ use crate::errno;
 /// size includes the header itself
 const HEADER_SIZE: usize = 16;
 
+/// Header placed immediately before each allocated block.
 #[repr(C)]
 struct BlockHeader {
-    size: usize,   // total block size including header
-    next: *mut BlockHeader, // next free block (only valid when free)
+    /// Total block size in bytes, including this header.
+    size: usize,
+    /// Pointer to the next free block. Only valid when the block is on the
+    /// free list; undefined for allocated blocks.
+    next: *mut BlockHeader,
 }
 
 static mut FREE_LIST: *mut BlockHeader = core::ptr::null_mut();
@@ -22,6 +37,15 @@ fn align_up(n: usize, align: usize) -> usize {
     (n + align - 1) & !(align - 1)
 }
 
+/// Allocate `size` bytes of memory, returning a 16-byte-aligned pointer.
+///
+/// Uses first-fit search over the address-sorted free list. If a free block
+/// is large enough to hold both the requested allocation and a new free block
+/// (at least `HEADER_SIZE + ALIGN` = 32 bytes of remainder), it is split.
+/// Otherwise the entire block is used. When no suitable free block exists,
+/// new memory is obtained from `sbrk()`.
+///
+/// Returns null on failure (size == 0 or out of memory) and sets `errno`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn malloc(size: usize) -> *mut u8 {
     if size == 0 {
@@ -79,6 +103,12 @@ pub unsafe extern "C" fn malloc(size: usize) -> *mut u8 {
     }
 }
 
+/// Free a previously allocated block, returning it to the free list.
+///
+/// The block is inserted into the free list in address order. If the freed
+/// block is physically adjacent to the next or previous free block, they
+/// are coalesced into a single larger block (bidirectional coalescing).
+/// Passing null is a safe no-op.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free(ptr: *mut u8) {
     if ptr.is_null() {
@@ -204,6 +234,16 @@ pub unsafe extern "C" fn strndup(s: *const u8, n: usize) -> *mut u8 {
     }
 }
 
+/// Allocate memory with a specific alignment.
+///
+/// `alignment` must be a power of two and at least `sizeof(void*)` (8 bytes).
+/// Allocates `size + alignment` bytes to guarantee an aligned address within
+/// the block. Returns 0 on success, or an error code (`EINVAL` / `ENOMEM`)
+/// without setting `errno` (per POSIX).
+///
+/// Note: the over-allocation means the unaligned prefix bytes are leaked
+/// (not returned to the free list). This is acceptable for the rare usage
+/// pattern of this function.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn posix_memalign(
     memptr: *mut *mut u8,

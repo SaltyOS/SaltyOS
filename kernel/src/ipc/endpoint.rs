@@ -90,10 +90,8 @@ impl Endpoint {
                         }
                     };
 
-                    // Set up reply capability in receiver's TCB
-                    // The receiver (server) can now reply to the sender (client)
-                    (*receiver).reply_tcb = current;
-                    (*receiver).reply_can_grant = true;
+                    // Send/NBSend do NOT create a reply capability.
+                    // Only Call sets reply_tcb (see call() method).
 
                     self.transfer_message(current, receiver, msg, badge);
 
@@ -153,17 +151,17 @@ impl Endpoint {
                         _ => (Message::empty(), 0, false),
                     };
 
-                    // Set up reply capability in receiver's (current thread's) TCB
-                    // The receiver can now reply to the sender
-                    (*current).reply_tcb = sender;
-                    (*current).reply_can_grant = !matches!(
-                        (*sender).blocked_reason,
-                        Some(BlockedReason::FaultBlocked { .. })
-                    );
-
                     self.transfer_message(sender, current, &msg, badge);
 
                     if keep_blocked {
+                        // Set reply capability ONLY for Call/Fault senders.
+                        // Regular Send senders are woken immediately below
+                        // and must not be referenced by reply_tcb.
+                        (*current).reply_tcb = sender;
+                        (*current).reply_can_grant = !matches!(
+                            (*sender).blocked_reason,
+                            Some(BlockedReason::FaultBlocked { .. })
+                        );
                         // Fault/Call sender: keep blocked until reply (via reply_recv)
                         // Clear endpoint ref since it's no longer in the queue
                         (*sender).blocked_endpoint = core::ptr::null_mut();

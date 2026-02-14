@@ -1,5 +1,17 @@
 //! POSIX regex — basic NFA matcher
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Supports both Basic Regular Expressions (BRE, default) and Extended Regular
+//! Expressions (ERE, via `REG_EXTENDED`). Implemented as a backtracking NFA
+//! matcher operating directly on the pattern string (no compiled DFA).
+//!
+//! Supported syntax:
+//! - `.` (any char), `^` / `$` (anchors), `[...]` / `[^...]` (char classes)
+//! - `*` (zero or more), `+` / `?` (ERE only), `|` (ERE alternation)
+//! - `\\(` / `\\)` (BRE groups), `(` / `)` (ERE groups)
+//! - `\\` escapes, character ranges in classes (`a-z`)
+//! - `REG_ICASE` for case-insensitive matching
+//! - `REG_NEWLINE` to prevent `.` and `[^...]` from matching newlines
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -723,6 +735,17 @@ unsafe fn count_subexpressions(pattern: *const u8, len: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
+/// Compile a regular expression pattern for use with `regexec`.
+///
+/// Copies the pattern string into a heap-allocated buffer and counts
+/// subexpressions (capturing groups) for ERE mode. No bytecode or DFA
+/// is generated — matching is done by interpreting the pattern directly.
+///
+/// `cflags` is a bitwise OR of: `REG_EXTENDED` (ERE syntax), `REG_ICASE`
+/// (case-insensitive), `REG_NOSUB` (no subexpression reporting),
+/// `REG_NEWLINE` (newline-sensitive matching).
+///
+/// Returns 0 on success, or `REG_BADPAT` / `REG_ESPACE` on error.
 pub unsafe extern "C" fn regcomp(preg: *mut Regex, pattern: *const u8, cflags: i32) -> i32 {
     unsafe {
         if preg.is_null() || pattern.is_null() {

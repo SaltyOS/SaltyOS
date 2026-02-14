@@ -1,9 +1,28 @@
-//! libsalty - SaltyOS System Library (Rust)
+//! libsalty -- SaltyOS userspace system library (Rust)
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! Provides system call wrappers and IPC helpers for userland.
-//! All public functions are `#[unsafe(no_mangle)] pub extern "C"` for
-//! dynamic linking compatibility with rtld.
+//! This crate has a dual personality:
+//!
+//! 1. **Rust modules** -- `syscall`, `ipc`, `invoke`, `posix`, etc. provide
+//!    typed Rust APIs for kernel syscalls, IPC, capability invocations, POSIX
+//!    compatibility, ELF loading, and CPIO parsing.
+//!
+//! 2. **C ABI exports** -- Every `salty_*` function in this file is
+//!    `#[unsafe(no_mangle)] pub extern "C"` so that the runtime dynamic linker
+//!    (`rtld`) can resolve them from `libsalty.so`. C programs link against
+//!    these symbols via `saltyc`.
+//!
+//! # Global state
+//!
+//! - [`__salty_ipc_ctx`] -- Per-process IPC context (IPC buffer pointer +
+//!   send-cap counter). Initialized by `rtld` or the CRT before `main`.
+//! - `__sig_*` -- Signal handler table, blocked mask, and `sa_flags` / `sa_mask`
+//!   arrays for POSIX signal delivery.
+//! - `__salty_next_frame_slot` / `__salty_slot_base` / `__salty_slot_count` --
+//!   Weak symbols overridden by `rtld` with per-process slot allocator state
+//!   from auxv entries.
+//!
+//! See `docs/design/overview.md` for the overall SaltyOS architecture.
 
 #![no_std]
 #![no_main]
@@ -22,6 +41,7 @@ pub mod posix;
 pub mod posix_mm;
 pub mod serial;
 pub mod signals;
+pub mod slot_alloc;
 pub mod syscall;
 pub mod types;
 
@@ -33,28 +53,54 @@ pub use types::*;
 // Global state
 // ---------------------------------------------------------------------------
 
+/// Per-process IPC context holding the IPC buffer pointer and send-cap count.
+/// Initialized by `rtld` (dynamic) or the CRT (static) before `main`.
 #[unsafe(no_mangle)]
 pub static mut __salty_ipc_ctx: IpcContext = IpcContext::new();
 
+/// Per-signal handler function pointers (indexed by signal number).
+/// `SIG_DFL` (0) and `SIG_IGN` (1) are special sentinel values.
 #[unsafe(no_mangle)]
 pub static __sig_handlers: [core::sync::atomic::AtomicUsize; NSIG] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; NSIG];
 
+/// Atomic flag: 1 once signal infrastructure has been initialized.
 #[unsafe(no_mangle)]
 pub static __sig_initialized: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 
+/// Bitmask of currently blocked signals (bit N = signal N blocked).
 #[unsafe(no_mangle)]
 pub static mut __sig_blocked_mask: u32 = 0;
 
+/// Per-signal sa_mask: additional signals to block during handler execution.
 #[unsafe(no_mangle)]
 pub static mut __sig_sa_mask: [u32; NSIG] = [0; NSIG];
 
+/// Per-signal sa_flags (e.g. `SA_RESETHAND`).
 #[unsafe(no_mangle)]
 pub static mut __sig_sa_flags: [i32; NSIG] = [0; NSIG];
 
+/// Next available CNode slot for frame allocation. Weak symbol overridden
+/// by `rtld` with the value from the process's slot pool.
 #[unsafe(no_mangle)]
 #[linkage = "weak"]
 pub static mut __salty_next_frame_slot: u64 = 64;
+
+/// Base of the per-process CNode slot pool (from `AT_SALTY_SLOT_BASE` auxv).
+#[unsafe(no_mangle)]
+#[linkage = "weak"]
+pub static mut __salty_slot_base: u64 = 0;
+
+/// Number of slots in the per-process pool (from `AT_SALTY_SLOT_COUNT` auxv).
+#[unsafe(no_mangle)]
+#[linkage = "weak"]
+pub static mut __salty_slot_count: u64 = 0;
+
+/// Notification cap for untyped expansion signaling
+/// (from `AT_SALTY_EXPAND_EP` auxv). 0 if not available.
+#[unsafe(no_mangle)]
+#[linkage = "weak"]
+pub static mut __salty_expand_ep: u64 = 0;
 
 // ---------------------------------------------------------------------------
 // Panic handler (for libsalty.so and statically-linked binaries)
@@ -328,6 +374,13 @@ pub extern "C" fn salty_irq_handler_set_notification(irq_handler: Cap, ntfn: Cap
 // C ABI exports: Fork helper (called from fork.S)
 // ---------------------------------------------------------------------------
 
+/// Fork implementation called from the `fork.S` assembly trampoline.
+///
+/// `saved_rsp` points to a stack frame containing callee-saved registers
+/// (r15, r14, r13, r12, rbx, rbp, return RIP) saved by the assembly stub.
+/// These are packed into an IPC message to procmgr so it can configure the
+/// child thread's register state. Returns the child PID (>0) in the parent,
+/// or -1 on failure. The child resumes at `child_entry` (never returns here).
 #[unsafe(no_mangle)]
 pub extern "C" fn _posix_fork_impl(saved_rsp: u64, child_entry: u64) -> i32 {
     if saved_rsp == 0 || child_entry == 0 {

@@ -1,5 +1,10 @@
 //! select() implementation via poll()
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Implements `select(2)` by converting fd_set bitmasks to `PollFd` arrays
+//! and calling `posix_poll`. The `FdSet` type holds 1024 bits (matching
+//! `FD_SETSIZE`). C-callable `__fd_set`/`__fd_clr`/`__fd_isset`/`__fd_zero`
+//! wrappers are exported for use by C code's `FD_*` macros.
 
 use crate::errno;
 
@@ -51,6 +56,14 @@ pub struct Timeval {
     pub tv_usec: i64,
 }
 
+/// Synchronous I/O multiplexing.
+///
+/// Converts the `fd_set` bitmasks into a `PollFd` array (max 128 entries),
+/// calls `posix_poll` internally, then translates the `revents` results
+/// back into the caller's `fd_set` bitmasks. The timeout is converted from
+/// `struct timeval` (sec + usec) to a millisecond value for `poll`.
+///
+/// Returns the number of ready file descriptors, 0 on timeout, or -1 on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn select(
     nfds: i32,

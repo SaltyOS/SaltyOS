@@ -145,6 +145,7 @@ Three-level memory abstraction:
 | `procmgr` | Process lifecycle, capability distribution | Implemented |
 | `vfs` | Virtual filesystem (ramfs + devfs + initrd) | Implemented |
 | `nameserv` | Service discovery (endpoint lookup) | Implemented |
+| `ports/` | Cross-compiled C programs (bash, FreeBSD utils) | Implemented |
 | `drivers/` | Device drivers (PCI, NVMe, USB, etc.) | Planned |
 
 ## Boot Sequence
@@ -225,6 +226,7 @@ Standard L4/seL4 uses inline capabilities (single word). We chose fat capabiliti
 - SMP support (ACPI MADT parser, AP trampoline, per-CPU queues, IPI reschedule)
 - Userland and libsalty migrated from C to Rust
 - POSIX Phase 2 (GUI-ready): Unix domain sockets, poll/select, POSIX shared memory, fd passing
+- Ports system: C standard library (saltyc), portbuild tool, bash and FreeBSD utilities
 
 ## Future Directions
 

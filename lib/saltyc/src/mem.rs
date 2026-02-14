@@ -1,5 +1,10 @@
 //! Memory functions (compiler intrinsics)
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Byte-level implementations of `memcpy`, `memset`, `memmove`, `memcmp`,
+//! `memchr`, `memrchr`, `memmem`, and `bzero`. These are required as
+//! compiler intrinsics (`#[no_mangle]`) since Rust's codegen emits calls
+//! to them for large copies and zeroing.
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {

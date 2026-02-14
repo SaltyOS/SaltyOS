@@ -1,14 +1,25 @@
 //! Directory operations
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Implements `opendir`/`readdir`/`closedir` using a static pool of 16 `DIR`
+//! entries. Each `DIR` wraps a POSIX file descriptor obtained from
+//! `posix_open` with `O_DIRECTORY`. Directory entries are read one at a time
+//! via `posix_getdents`.
 
 use crate::errno;
 
+/// Directory entry returned by `readdir()`.
 #[repr(C)]
 pub struct Dirent {
+    /// Inode number.
     pub d_ino: u64,
+    /// Offset to the next directory entry (opaque).
     pub d_off: i64,
+    /// Length of this record in bytes.
     pub d_reclen: u16,
+    /// File type: `DT_REG` (8), `DT_DIR` (4), `DT_LNK` (10), `DT_UNKNOWN` (0).
     pub d_type: u8,
+    /// Null-terminated filename (max 255 characters + NUL).
     pub d_name: [u8; 256],
 }
 

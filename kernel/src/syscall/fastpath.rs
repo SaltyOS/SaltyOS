@@ -381,17 +381,15 @@ pub unsafe extern "C" fn fastpath_reply_recv_rust(
             return FastpathResult::slowpath();
         }
 
-        // Set reply capability in server's TCB
-        (*current).reply_tcb = sender;
-        (*current).reply_can_grant = true;
-
         // Write received message to server's TCB and IPC buffer
         (*current).saved_caller_msg = msg;
         (*current).saved_caller_badge = badge;
         write_msg_to_ipc_buffer(&msg, badge);
 
         if keep_blocked {
-            // Call sender: keep blocked until reply, transition to ReplyWait
+            // Call sender: set reply cap and keep blocked until reply
+            (*current).reply_tcb = sender;
+            (*current).reply_can_grant = true;
             (*sender).blocked_endpoint = core::ptr::null_mut();
             (*sender).blocked_reason = Some(BlockedReason::ReplyWait { msg, badge });
         } else {

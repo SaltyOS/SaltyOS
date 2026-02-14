@@ -1,8 +1,11 @@
 //! POSIX unistd wrappers
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! Each function calls the corresponding salty::posix::* or salty::posix_mm::*
-//! function and sets errno on failure.
+//! Thin wrappers around `salty::posix::*` and `salty::posix_mm::*` functions.
+//! Each wrapper translates negative return values into `errno` settings.
+//! Includes file I/O (`open`, `close`, `read`, `write`, `lseek`), directory
+//! operations (`mkdir`, `rmdir`, `unlink`, `rename`), stat family, `mmap`,
+//! `pipe`, `dup`/`dup2`, and the `*at()` family (`openat`, `fstatat`, etc.).
 
 use crate::errno;
 

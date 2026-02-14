@@ -1,5 +1,13 @@
 //! Time functions
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! UTC-only time implementation (no timezone or DST support). Time values use
+//! Unix epoch (seconds since 1970-01-01 00:00:00 UTC). The `Tm` struct follows
+//! POSIX conventions: `tm_mon` is 0-based (0 = January), `tm_year` is years
+//! since 1900, and `tm_wday` is 0 = Sunday.
+//!
+//! Non-reentrant functions (`localtime`, `gmtime`, `ctime`, `asctime`) use
+//! shared static buffers. The `_r` variants accept caller-provided buffers.
 
 use crate::errno;
 
@@ -10,16 +18,26 @@ use crate::errno;
 pub type TimeT = i64;
 pub type ClockT = i64;
 
+/// Broken-down time representation (POSIX `struct tm`).
 #[repr(C)]
 pub struct Tm {
+    /// Seconds (0-60; 60 for leap second).
     pub tm_sec: i32,
+    /// Minutes (0-59).
     pub tm_min: i32,
+    /// Hours (0-23).
     pub tm_hour: i32,
+    /// Day of the month (1-31).
     pub tm_mday: i32,
+    /// Month (0-11; 0 = January).
     pub tm_mon: i32,
+    /// Years since 1900 (e.g. 126 for year 2026).
     pub tm_year: i32,
+    /// Day of the week (0-6; 0 = Sunday).
     pub tm_wday: i32,
+    /// Day of the year (0-365).
     pub tm_yday: i32,
+    /// Daylight saving time flag. Always 0 (UTC only, no DST).
     pub tm_isdst: i32,
 }
 

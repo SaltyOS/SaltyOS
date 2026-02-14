@@ -3,11 +3,12 @@ Name=console
 Binary=console.elf
 Type=simple
 Restart=always
+PreProcmgr=yes
 
 [Dependencies]
 After=
 Before=procmgr nameserv vfs
-Requires=procmgr:9
 
 [Capabilities]
-CopyCap=8:4 9:5 10:6
+CopyCap=8:64 9:65 10:66
+NeedEP=procmgr:67 display:68

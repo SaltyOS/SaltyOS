@@ -768,6 +768,8 @@ pub unsafe fn spawn_server(
     copy_shared_lib_caps: bool,
     ready_timeout_ns: u64,
     pre_ep: Cap,
+    procmgr_ep: Cap,
+    spawn_badge: u64,
 ) -> i32 {
     { let mut lb = LineBuf::new(); lb.str(b"[INIT] Spawning "); lb.bytes(label); lb.str(b" ("); lb.bytes(elf_name); lb.str(b")\n"); lb.flush(); }
 
@@ -1234,7 +1236,36 @@ pub unsafe fn spawn_server(
             }
             let err = copy_cap!(extra.src, extra.dst);
             if err != 0 {
-                { let mut lb = LineBuf::new(); lb.str(b"[INIT] WARN: extra cap copy failed slot="); lb.hex(extra.dst); lb.str(b"\n"); lb.flush(); }
+                let mut lb = LineBuf::new();
+                lb.str(b"[INIT] ERROR: cap copy failed src=");
+                lb.hex(extra.src);
+                lb.str(b" dst=");
+                lb.hex(extra.dst);
+                lb.str(b" err=");
+                lb.hex(err as u64);
+                lb.str(b"\n");
+                lb.flush();
+                return -1;
+            }
+        }
+
+        // Auto-mint badged procmgr EP at child slot CAP_EXPAND_EP (9)
+        if procmgr_ep != 0 {
+            let err = invoke::cnode_mint(
+                CAP_SELF_CSPACE, procmgr_ep,
+                child_cn, super::CAP_EXPAND_EP,
+                spawn_badge,
+            );
+            if err != 0 {
+                puts(b"[INIT] WARN: mint expand EP failed\n");
+            } else {
+                let mut lb = LineBuf::new();
+                lb.str(b"[INIT] Minted expand EP badge=");
+                lb.hex(spawn_badge);
+                lb.str(b" slot=");
+                lb.hex(super::CAP_EXPAND_EP);
+                lb.str(b"\n");
+                lb.flush();
             }
         }
 
@@ -1285,7 +1316,10 @@ pub unsafe fn spawn_server(
                 return -1;
             }
 
-            let auxv_count: u64 = if shared_lib_base != 0 { 14 } else { 13 };
+            // +2 for AT_SALTY_SLOT_BASE/COUNT, +1 for AT_SALTY_EXPAND_EP if procmgr available
+            let has_expand_ep = procmgr_ep != 0;
+            let base_count: u64 = if shared_lib_base != 0 { 16 } else { 15 };
+            let auxv_count: u64 = if has_expand_ep { base_count + 1 } else { base_count };
             let srv_stack_frame_size: u64 = 3 * 8 + auxv_count * 2 * 8 + 8;
             let stack_base = (SCRATCH_VADDR + 4096 - srv_stack_frame_size) as *mut u64;
 
@@ -1311,7 +1345,33 @@ pub unsafe fn spawn_server(
             w!(super::AT_SALTY_SCRATCH); w!(layout.scratch.base);
             w!(super::AT_SALTY_INITRD); w!(layout.initrd.base);
             w!(super::AT_SALTY_INITRD_SZ); w!(initrd_size as u64);
-            w!(super::AT_SALTY_FRAME_SLOT); w!(super::CHILD_RTLD_FRAME_SLOT_START);
+            // Compute first free child CNode slot past extras and shared lib cache
+            let frame_slot_start = {
+                let mut s = super::CHILD_RTLD_FRAME_SLOT_START;
+                for extra in extras {
+                    if (extra.src != 0 || extra.dst != 0) && extra.dst + 1 > s {
+                        s = extra.dst + 1;
+                    }
+                }
+                let cache = &*(&raw const SHARED_LIB_CACHE);
+                if cache.initialized && cache.page_count > 0 {
+                    let cache_end = CAP_SHARED_LIB_CACHE_BASE + cache.page_count as u64;
+                    if cache_end > s {
+                        s = cache_end;
+                    }
+                }
+                s
+            };
+            w!(super::AT_SALTY_FRAME_SLOT); w!(frame_slot_start);
+            // Slot pool: from frame_slot_start to CNode end
+            let effective_cnode_bits: u64 = if cnode_size_bits > 0 { cnode_size_bits } else { 10 };
+            let cnode_total_slots: u64 = 1u64 << effective_cnode_bits;
+            let slot_pool_count = cnode_total_slots.saturating_sub(frame_slot_start);
+            w!(super::AT_SALTY_SLOT_BASE); w!(frame_slot_start);
+            w!(super::AT_SALTY_SLOT_COUNT); w!(slot_pool_count);
+            if has_expand_ep {
+                w!(super::AT_SALTY_EXPAND_EP); w!(super::CAP_EXPAND_EP);
+            }
             if shared_lib_base != 0 {
                 w!(super::AT_SALTY_SHARED_LIB_BASE); w!(shared_lib_base);
             }
@@ -1345,6 +1405,40 @@ pub unsafe fn spawn_server(
         let err = invoke::tcb_resume(child_tcb);
         if err != 0 { puts(b"[INIT] TCB resume failed\n"); return -1; }
 
+        // Register init-spawned service with procmgr (badge + CNode)
+        if procmgr_ep != 0 {
+            let mut reg_msg = SaltyMsg::zeroed();
+            let mut reg_reply = SaltyMsg::zeroed();
+            reg_msg.label = POSIX_PM_REGISTER;
+            reg_msg.length = 2;
+            reg_msg.regs[0] = spawn_badge;
+            // Transfer child CNode cap so procmgr can access child's untyped
+            ipc::set_send_cap_ctx(super::ipc_ctx(), 0, child_cn);
+            let reg_err = ipc::call_ctx(
+                super::ipc_ctx(), procmgr_ep,
+                &raw const reg_msg, &raw mut reg_reply,
+            );
+            if reg_err == 0 && reg_reply.label == SALTY_OK {
+                let mut lb = LineBuf::new();
+                lb.str(b"[INIT] PM_REGISTER ");
+                lb.bytes(label);
+                lb.str(b" ok pid=");
+                lb.dec(reg_reply.regs[0]);
+                lb.str(b"\n");
+                lb.flush();
+            } else {
+                let mut lb = LineBuf::new();
+                lb.str(b"[INIT] WARN: PM_REGISTER ");
+                lb.bytes(label);
+                lb.str(b" failed err=");
+                lb.hex(reg_err as u64);
+                lb.str(b" label=");
+                lb.hex(reg_reply.label);
+                lb.str(b"\n");
+                lb.flush();
+            }
+        }
+
         if wait_for_child_ready(
             child_tcb,
             child_ready_ntfn,
@@ -1365,10 +1459,15 @@ pub unsafe fn spawn_server(
 ///   regs[0] = name_len
 ///   regs[1] = spawn_policy bitfield
 ///   regs[2] = timeout_ns (only for NOTIFY mode, 0=auto)
-///   regs[3] = spawn_flags (reserved, 0)
+///   regs[3] = spawn_flags
 ///   regs[4] = reserved (0)
 ///   regs[5..] = name bytes packed into u64 words
-pub unsafe fn pm_spawn(pm_ep: Cap, prog: &[u8], def: &super::ini::ServiceDef) -> i32 {
+pub unsafe fn pm_spawn(
+    pm_ep: Cap,
+    prog: &[u8],
+    def: &super::ini::ServiceDef,
+    pre_ep: Cap,
+) -> i32 {
     unsafe {
         let len = prog.len();
 
@@ -1379,7 +1478,7 @@ pub unsafe fn pm_spawn(pm_ep: Cap, prog: &[u8], def: &super::ini::ServiceDef) ->
         let policy = spawn_policy_build(
             readiness,
             def.map_initrd,
-            false, // is_display determined by procmgr from name
+            false, // service class is determined by procmgr from binary name
             def.cnode_bits,
             def.memory_kb,
         );
@@ -1389,6 +1488,12 @@ pub unsafe fn pm_spawn(pm_ep: Cap, prog: &[u8], def: &super::ini::ServiceDef) ->
             0
         };
 
+        let mut spawn_flags: u64 = 0;
+        if pre_ep != 0 {
+            spawn_flags |= SPAWN_FLAG_USE_PRE_EP;
+            ipc::set_send_cap_ctx(super::ipc_ctx(), 0, pre_ep);
+        }
+
         let mut spawn_msg = SaltyMsg::zeroed();
         spawn_msg.label = POSIX_PM_SPAWN;
         let packed_name_words = ((len as u64) + 7) / 8;
@@ -1396,7 +1501,7 @@ pub unsafe fn pm_spawn(pm_ep: Cap, prog: &[u8], def: &super::ini::ServiceDef) ->
         spawn_msg.regs[0] = len as u64;
         spawn_msg.regs[1] = policy;
         spawn_msg.regs[2] = timeout_ns;
-        spawn_msg.regs[3] = 0; // spawn_flags (reserved)
+        spawn_msg.regs[3] = spawn_flags;
         spawn_msg.regs[4] = 0; // reserved
         let dst = &raw mut spawn_msg.regs[5] as *mut u8;
         for i in 0..len {

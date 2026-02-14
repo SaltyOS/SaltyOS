@@ -1,5 +1,9 @@
 //! Character classification (ASCII lookup table)
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! All classification functions use a 128-entry lookup table indexed by
+//! character value. Characters outside 0-127 return false for all tests.
+//! This covers ASCII only — no multibyte or Unicode support.
 
 const C: u8 = 0x01; // control
 const S: u8 = 0x02; // space

@@ -28,7 +28,9 @@ pub fn run() -> bool {
     puts(b"[TEST_FS] Starting filesystem tests\n");
 
     // Initialize posix_mm for memory allocation needs
-    let frame_slot = unsafe { salty::__salty_next_frame_slot };
+    // Use slot_alloc's current position as the frame slot base for posix_mm
+    let frame_slot = salty::slot_alloc::slot_alloc_base()
+        + (salty::slot_alloc::slot_alloc_count() - salty::slot_alloc::slot_alloc_remaining());
     unsafe {
         posix_mm::posix_mm_init(
             CAP_UNTYPED,

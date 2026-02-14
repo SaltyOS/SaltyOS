@@ -378,6 +378,14 @@ meson compile -C build -v
 
 This shows each command being executed.
 
+## Ports
+
+When `build_userland=true`, the build system automatically discovers and cross-compiles third-party C software from `ports/`. Each port is defined by a declarative `.port` file and built by the `portbuild` host tool.
+
+Currently available ports: GNU Bash 5.2.32, FreeBSD utilities (22 programs: echo, cat, ls, cp, mv, rm, etc.).
+
+See [Ports Build System](design/ports.md) for the full `.port` format specification, how to add new ports, and C standard library details.
+
 ## Development Workflow
 
 ### Recommended Workflow

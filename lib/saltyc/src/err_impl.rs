@@ -1,8 +1,11 @@
 //! BSD err(3) error reporting functions
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! Implements: err, errx, errc, warn, warnx, warnc, and their v-prefixed
-//! va_list variants (verr, verrx, vwarn, vwarnx, vwarnc).
+//! Implements: `err`, `errx`, `errc`, `warn`, `warnx`, `warnc`, and their
+//! `v`-prefixed `VaList` variants (`verr`, `verrx`, `vwarn`, `vwarnx`,
+//! `vwarnc`). Output format: `progname: message: strerror(errno)\n`.
+//! The `err`/`errx`/`errc` functions call `exit()` after printing; the
+//! `warn` variants return normally.
 
 use core::ffi::VaList;
 

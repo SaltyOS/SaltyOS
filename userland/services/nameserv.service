@@ -3,6 +3,7 @@ Name=nameserv
 Binary=nameserv.elf
 Type=simple
 Restart=always
+PreProcmgr=yes
 
 [Dependencies]
 After=console

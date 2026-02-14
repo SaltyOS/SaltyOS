@@ -1,5 +1,10 @@
 //! Password database stubs
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Provides a single hardcoded user entry (root, uid=0, gid=0) and a single
+//! group entry (root, gid=0). `getpwnam`, `getpwuid`, `getgrnam`, `getgrgid`
+//! all return pointers to static data. The `getpw*_r` reentrant variants
+//! copy data into caller-provided buffers.
 
 #[repr(C)]
 pub struct Passwd {

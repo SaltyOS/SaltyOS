@@ -1,7 +1,11 @@
 //! Process management
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! POSIX process management wrappers that call into salty::posix::* functions.
+//! POSIX process management wrappers: `fork`, `execve`, `execv`, `execvp`,
+//! `execl`, `execlp`, `waitpid`, `wait`, `kill`, `raise`, `abort`, and
+//! UID/GID accessors. All exec variants ultimately call `posix_execve`.
+//! The `execl`/`execlp` functions collect variadic arguments into a stack
+//! buffer (max 64 args).
 
 use crate::errno;
 

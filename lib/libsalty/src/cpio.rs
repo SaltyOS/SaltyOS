@@ -1,9 +1,19 @@
 //! CPIO newc archive parser
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Parses CPIO "newc" (070701) format archives used for the SaltyOS initrd.
+//! Provides three iteration styles: search by name (`cpio_find_file`),
+//! sequential iteration (`cpio_next`), and sequential iteration with
+//! extended metadata (`cpio_next_ext`). Also computes archive total size
+//! via `cpio_archive_size`.
+//!
+//! All functions work on raw byte pointers (no_std compatible) and validate
+//! the "070701" magic on each header.
 
 use crate::consts::CPIO_HEADER_SIZE;
 use crate::types::{CpioEntry, CpioEntryExt};
 
+/// Parse an 8-character hexadecimal field from a CPIO header.
 fn parse_hex8(bytes: *const u8) -> usize {
     let mut val: usize = 0;
     for i in 0..8 {
@@ -19,10 +29,12 @@ fn parse_hex8(bytes: *const u8) -> usize {
     val
 }
 
+/// Round up to the next 4-byte alignment (CPIO newc requirement).
 fn align4(n: usize) -> usize {
     (n + 3) & !3
 }
 
+/// Verify the "070701" magic bytes at the start of a CPIO header.
 fn check_magic(header: *const u8) -> bool {
     unsafe {
         *header.add(0) == b'0'
@@ -34,6 +46,7 @@ fn check_magic(header: *const u8) -> bool {
     }
 }
 
+/// Check if the entry name is "TRAILER!!!" (end-of-archive sentinel).
 fn is_trailer(name: *const u8, name_len: usize) -> bool {
     if name_len != 10 {
         return false;
@@ -47,6 +60,16 @@ fn is_trailer(name: *const u8, name_len: usize) -> bool {
     true
 }
 
+/// Search for a file by name in a CPIO archive.
+///
+/// Scans the archive from the beginning for an entry matching
+/// `name[0..name_len]`. On success, populates `*entry` with pointers
+/// to the name and data within the archive and returns 1. Returns 0
+/// if not found.
+///
+/// # Safety
+/// `archive` must point to a valid CPIO archive of at least `archive_len`
+/// bytes. `name` must be valid for `name_len` bytes.
 pub unsafe fn cpio_find_file(
     archive: *const u8,
     archive_len: usize,
@@ -115,6 +138,15 @@ pub unsafe fn cpio_find_file(
     }
 }
 
+/// Advance to the next entry in a CPIO archive.
+///
+/// Reads the entry at `*offset`, populates `*entry`, and advances
+/// `*offset` past this entry. Returns 1 if an entry was read, 0 at
+/// end-of-archive or on error.
+///
+/// # Safety
+/// `archive` must point to a valid CPIO archive. `offset` and `entry`
+/// must be valid pointers.
 pub unsafe fn cpio_next(
     archive: *const u8,
     archive_len: usize,
@@ -165,6 +197,13 @@ pub unsafe fn cpio_next(
     1
 }
 
+/// Advance to the next entry with extended metadata (ino, mode, nlink, mtime).
+///
+/// Like `cpio_next`, but also parses inode number, file mode, link count,
+/// and modification time from the CPIO header into `*entry`.
+///
+/// # Safety
+/// Same requirements as `cpio_next`.
 pub unsafe fn cpio_next_ext(
     archive: *const u8,
     archive_len: usize,
@@ -219,6 +258,14 @@ pub unsafe fn cpio_next_ext(
     1
 }
 
+/// Compute the total size of a CPIO archive (up to the TRAILER sentinel).
+///
+/// Scans headers until the trailer is found or `max_len` is reached.
+/// Returns the byte offset just past the trailer, or `max_len` if the
+/// archive is truncated.
+///
+/// # Safety
+/// `archive` must point to a valid buffer of at least `max_len` bytes.
 pub unsafe fn cpio_archive_size(archive: *const u8, max_len: usize) -> usize {
     let mut offset: usize = 0;
 

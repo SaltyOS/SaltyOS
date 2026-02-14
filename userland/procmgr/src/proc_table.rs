@@ -80,6 +80,16 @@ pub struct Process {
     pub lib_map: ProcLibMap,
     /// VA layout used when this process was spawned/exec'd.
     pub layout: VmLayoutPlan,
+    /// Async CSpace expansion: pending result flag.
+    pub expand_pending: bool,
+    /// Async CSpace expansion: result base address.
+    pub expand_result_base: u64,
+    /// Async CSpace expansion: result slot count.
+    pub expand_result_count: u64,
+    /// Procmgr-local cap to child's untyped (for init-registered services).
+    pub child_ut_cap: Cap,
+    /// Number of untyped expansions granted to this process (max 8).
+    pub ut_expand_count: u8,
 }
 
 impl Process {
@@ -109,6 +119,11 @@ impl Process {
             shared_lib_base: 0,
             lib_map: ProcLibMap::zeroed(),
             layout: VmLayoutPlan::zeroed(),
+            expand_pending: false,
+            expand_result_base: 0,
+            expand_result_count: 0,
+            child_ut_cap: 0,
+            ut_expand_count: 0,
         }
     }
 }
@@ -217,6 +232,11 @@ pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
         p.frame_count = 0;
         p.shared_lib_base = 0;
         p.lib_map = ProcLibMap::zeroed();
+        p.expand_pending = false;
+        p.expand_result_base = 0;
+        p.expand_result_count = 0;
+        p.child_ut_cap = 0;
+        p.ut_expand_count = 0;
         for i in 0..NSIG {
             p.sig_disposition[i] = SIG_DISP_DFL;
         }

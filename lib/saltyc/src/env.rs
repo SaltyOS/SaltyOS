@@ -1,5 +1,9 @@
 //! Environment variable management
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Stores up to 128 environment variables in a static array. The `environ`
+//! pointer is exported for C code. Variables are initialized from the stack-
+//! provided `envp` during CRT startup (`init_environ`).
 
 const MAX_ENV: usize = 128;
 

@@ -13,6 +13,11 @@ struct rtld_state g_rtld;
 /* Exported so applications can continue allocating frame slots after rtld */
 uint64_t __salty_next_frame_slot = 0;
 
+/* Exported per-process slot pool info for slot_alloc */
+uint64_t __salty_slot_base = 0;
+uint64_t __salty_slot_count = 0;
+uint64_t __salty_expand_ep = 0;
+
 void __attribute__((naked, noreturn)) _start(void) {
     __asm__ volatile(
         "mov %%rsp, %%rdi\n"
@@ -92,6 +97,9 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         case AT_SALTY_INITRD_SZ: g_rtld.initrd_size = p[1]; break;
         case AT_SALTY_FRAME_SLOT:g_rtld.next_frame_slot = p[1]; break;
         case AT_SALTY_SHARED_LIB_BASE: g_rtld.shared_lib_base = p[1]; break;
+        case AT_SALTY_SLOT_BASE:  g_rtld.slot_base = p[1]; break;
+        case AT_SALTY_SLOT_COUNT: g_rtld.slot_count = p[1]; break;
+        case AT_SALTY_EXPAND_EP:  g_rtld.expand_ep = p[1]; break;
         }
     }
 
@@ -310,6 +318,44 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         uint64_t slot_addr = resolve_symbol_addr(&g_rtld, "__salty_next_frame_slot");
         if (slot_addr != 0)
             *(volatile uint64_t *)slot_addr = g_rtld.next_frame_slot;
+    }
+
+    /* 7b. Export per-process slot pool info for slot_alloc.
+     * Advance base/count past the slots already consumed by RTLD itself
+     * (ld.so + DT_NEEDED library allocations), so user allocators start
+     * from the first truly free slot.
+     */
+    uint64_t export_slot_base = g_rtld.slot_base;
+    uint64_t export_slot_count = g_rtld.slot_count;
+    if (export_slot_base != 0 && export_slot_count != 0 &&
+        g_rtld.next_frame_slot >= export_slot_base) {
+        uint64_t used = g_rtld.next_frame_slot - export_slot_base;
+        if (used < export_slot_count) {
+            export_slot_base = g_rtld.next_frame_slot;
+            export_slot_count -= used;
+        } else {
+            export_slot_base = g_rtld.next_frame_slot;
+            export_slot_count = 0;
+        }
+    }
+
+    __salty_slot_base = export_slot_base;
+    __salty_slot_count = export_slot_count;
+    {
+        uint64_t base_addr = resolve_symbol_addr(&g_rtld, "__salty_slot_base");
+        if (base_addr != 0)
+            *(volatile uint64_t *)base_addr = export_slot_base;
+        uint64_t count_addr = resolve_symbol_addr(&g_rtld, "__salty_slot_count");
+        if (count_addr != 0)
+            *(volatile uint64_t *)count_addr = export_slot_count;
+    }
+
+    /* 7c. Export procmgr expansion EP slot for slot_alloc async expansion. */
+    __salty_expand_ep = g_rtld.expand_ep;
+    {
+        uint64_t ep_addr = resolve_symbol_addr(&g_rtld, "__salty_expand_ep");
+        if (ep_addr != 0)
+            *(volatile uint64_t *)ep_addr = g_rtld.expand_ep;
     }
 
     /* 8. Jump to executable entry point */

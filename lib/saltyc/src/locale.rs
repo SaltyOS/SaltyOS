@@ -1,5 +1,10 @@
 //! Locale stubs (C locale only)
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Only the "C" / "POSIX" locale is supported. `setlocale` always returns
+//! "C" regardless of the requested locale. `localeconv` returns a static
+//! `Lconv` with POSIX defaults. GNU gettext functions (`gettext`, `dgettext`,
+//! `ngettext`, `dcgettext`) pass through the message string unchanged.
 
 pub const LC_CTYPE: i32 = 0;
 pub const LC_NUMERIC: i32 = 1;

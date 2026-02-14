@@ -1,10 +1,16 @@
 //! SaltyOS system constants
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! Syscall numbers, invoke labels, error codes, cap slots, address constants.
-//! Must match kernel definitions.
+//! Userland source of truth for syscall numbers, capability invoke labels,
+//! error codes, well-known cap slots, VSpace flags, object types, POSIX
+//! protocol labels, ELF constants, and address layout.
+//!
+//! **These values must be kept in sync with the kernel.** The kernel defines
+//! its own copies in `kernel/src/syscall/mod.rs` and `kernel/src/cap/`.
+//! Any mismatch will cause silent protocol errors.
 
-// System call numbers (must match kernel/src/syscall/mod.rs Syscall enum)
+/// System call numbers. Each corresponds to a variant of the kernel's
+/// `Syscall` enum in `kernel/src/syscall/mod.rs`.
 pub const SYS_SEND: u64 = 0;
 pub const SYS_RECV: u64 = 1;
 pub const SYS_CALL: u64 = 2;
@@ -23,11 +29,11 @@ pub const SYS_DEBUG_PUTSTR: u64 = 14;
 pub const SYS_DEBUG_PUTBUF: u64 = 15;
 pub const SYS_DEBUG_CONSOLE_CONTROL: u64 = 16;
 
-// Clock IDs
+/// Clock IDs for `SYS_CLOCK_GETTIME`.
 pub const CLOCK_MONOTONIC: i32 = 0;
 pub const CLOCK_REALTIME: i32 = 1;
 
-// CNode operations (0x10-0x16)
+/// CNode invoke labels (0x10-0x18): copy, mint, move, mutate, delete, revoke, save_caller, set_guard, get_info.
 pub const CNODE_COPY: u64 = 0x10;
 pub const CNODE_MINT: u64 = 0x11;
 pub const CNODE_MOVE: u64 = 0x12;
@@ -38,14 +44,14 @@ pub const CNODE_SAVE_CALLER: u64 = 0x16;
 pub const CNODE_SET_GUARD: u64 = 0x17;
 pub const CNODE_GET_INFO: u64 = 0x18;
 
-// Untyped operations (0x20)
+/// Untyped invoke label (0x20): retype raw memory into typed kernel objects.
 pub const UNTYPED_RETYPE: u64 = 0x20;
 
-// SchedContext operations (0x30-0x34)
+/// SchedContext invoke labels (0x30-0x31): configure budget/period, bind to TCB.
 pub const SC_CONFIGURE: u64 = 0x30;
 pub const SC_BIND: u64 = 0x31;
 
-// TCB operations (0x40-0x4B)
+/// TCB invoke labels (0x40-0x4B): configure, resume, suspend, set_space, write_registers, etc.
 pub const TCB_CONFIGURE: u64 = 0x40;
 pub const TCB_RESUME: u64 = 0x41;
 pub const TCB_SUSPEND: u64 = 0x42;
@@ -55,7 +61,7 @@ pub const TCB_SET_IPC_BUFFER: u64 = 0x48;
 pub const TCB_BIND_NOTIFICATION: u64 = 0x49;
 pub const TCB_SET_FAULT_HANDLER: u64 = 0x4B;
 
-// VSpace operations (0x50-0x56)
+/// VSpace invoke labels (0x50-0x57): map, unmap, map_pt, walk, copy_page, map_device, clone_cow, map_device_range.
 pub const VSPACE_MAP: u64 = 0x50;
 pub const VSPACE_UNMAP: u64 = 0x51;
 pub const VSPACE_MAP_PT: u64 = 0x52;
@@ -65,30 +71,31 @@ pub const VSPACE_MAP_DEVICE: u64 = 0x55;
 pub const VSPACE_CLONE_COW_PAGE: u64 = 0x56;
 pub const VSPACE_MAP_DEVICE_RANGE: u64 = 0x57;
 
-// IRQ operations (0x60-0x63)
+/// IRQ handler invoke labels (0x61-0x62): acknowledge IRQ, set notification cap.
 pub const IRQ_HANDLER_ACK: u64 = 0x61;
 pub const IRQ_HANDLER_SET_NOTIFICATION: u64 = 0x62;
 
-// IoPort operations (0x70-0x73)
+/// I/O port invoke labels (0x70-0x73): 8-bit and 16-bit port read/write.
 pub const IOPORT_IN8: u64 = 0x70;
 pub const IOPORT_OUT8: u64 = 0x71;
 pub const IOPORT_IN16: u64 = 0x72;
 pub const IOPORT_OUT16: u64 = 0x73;
 
-// Console IPC message labels
+/// Console server IPC labels: read/write serial data, terminal attributes.
 pub const CONSOLE_WRITE: u64 = 1;
 pub const CONSOLE_READ: u64 = 2;
 pub const CONSOLE_TCGETATTR: u64 = 3;
 pub const CONSOLE_TCSETATTR: u64 = 4;
 
-// Display server IPC message labels
+/// Display server IPC labels: framebuffer info, present, fill, text, terminal writes.
 pub const DISPLAY_GET_INFO: u64 = 1;
 pub const DISPLAY_PRESENT: u64 = 2;
 pub const DISPLAY_FILL_RECT: u64 = 6;
 pub const DISPLAY_WRITE_TEXT: u64 = 7;
 pub const DISPLAY_TERMINAL_WRITE: u64 = 8;
 
-// Well-known cap slots
+/// Well-known capability slots. Set by the kernel for init, inherited by
+/// child processes. Slots 0-15 are reserved; 16+ are untyped memory.
 pub const CAP_SELF_TCB: u64 = 0;
 pub const CAP_SELF_VSPACE: u64 = 1;
 pub const CAP_SELF_CSPACE: u64 = 2;
@@ -98,6 +105,7 @@ pub const CAP_NAMESERV_EP: u64 = 5;
 pub const CAP_SIGNAL_NTFN: u64 = 6;
 pub const CAP_UNTYPED: u64 = 7;
 pub const CAP_COM1_IOPORT: u64 = 8;
+pub const CAP_EXPAND_EP: u64 = 9;
 pub const CAP_COM1_IRQ: u64 = 9;
 pub const CAP_COM1_NTFN: u64 = 10;
 pub const CAP_CONSOLE_EP: u64 = 11;
@@ -107,16 +115,16 @@ pub const CAP_READINESS_NTFN: u64 = 14;
 pub const CAP_DISPLAY_EP: u64 = 15;
 pub const CAP_UNTYPED_START: u64 = 16;
 
-// Addresses
+/// Fixed virtual addresses for well-known memory regions.
 pub const INITRD_VADDR: u64 = 0x0000_0000_0100_0000;
 pub const SCRATCH_VADDR: u64 = 0x0000_0000_0200_0000;
 pub const BOOTINFO_VADDR: u64 = 0x0000_0000_00C0_0000;
 pub const BOOTINFO_MAGIC: u64 = 0x534C5459_424F4F54; // "SLTYBOOT"
 
-// Capability rights
+/// Capability rights bitmask (all rights granted).
 pub const CAP_RIGHTS_ALL: u64 = 0xFFFF_FFFF;
 
-// Error codes
+/// Error codes returned in `SaltyResult.error`. Must match kernel `SyscallError` variants.
 pub const SALTY_OK: u64 = 0;
 pub const SALTY_INVALID_CAPABILITY: u64 = 1;
 pub const SALTY_INVALID_OPERATION: u64 = 2;
@@ -127,8 +135,9 @@ pub const SALTY_NOT_FOUND: u64 = 6;
 pub const SALTY_BUSY: u64 = 7;
 pub const SALTY_ALREADY_EXISTS: u64 = 8;
 pub const SALTY_WOULD_BLOCK: u64 = 9;
+pub const SALTY_PENDING: u64 = 0x80;
 
-// VSpace map flags
+/// VSpace page mapping flags (passed to `vspace_map`).
 pub const VSPACE_FLAG_WRITABLE: u64 = 1 << 0;
 pub const VSPACE_FLAG_USER: u64 = 1 << 1;
 pub const VSPACE_FLAG_EXECUTABLE: u64 = 1 << 2;
@@ -136,7 +145,7 @@ pub const VSPACE_FLAG_CACHE_DISABLE: u64 = 1 << 3;
 pub const VSPACE_FLAG_WRITE_THROUGH: u64 = 1 << 4;
 pub const VSPACE_FLAG_COW: u64 = 1 << 5;
 
-// Object types for Untyped_Retype
+/// Kernel object types for `UNTYPED_RETYPE`. Must match `kernel/src/cap/untyped.rs`.
 pub const OBJ_UNTYPED: u64 = 1;
 pub const OBJ_ENDPOINT: u64 = 2;
 pub const OBJ_NOTIFICATION: u64 = 3;
@@ -148,7 +157,8 @@ pub const OBJ_IRQ_HANDLER: u64 = 8;
 pub const OBJ_IO_PORT: u64 = 9;
 pub const OBJ_SCHED_CONTEXT: u64 = 10;
 
-// POSIX VFS protocol labels
+/// POSIX VFS IPC protocol labels. Each label identifies a file operation
+/// dispatched to the VFS server via `Call(CAP_VFS_EP, ...)`.
 pub const POSIX_VFS_OPEN: u64 = 1;
 pub const POSIX_VFS_READ: u64 = 2;
 pub const POSIX_VFS_WRITE: u64 = 3;
@@ -239,7 +249,8 @@ pub const TIOCGWINSZ: u64 = 0x5413;
 pub const FBIOGET_VSCREENINFO: u64 = 0x4600;
 pub const FBIOGET_FSCREENINFO: u64 = 0x4602;
 
-// Procmgr protocol labels
+/// Process manager IPC protocol labels. Operations dispatched via
+/// `Call(CAP_PROCMGR_EP, ...)`.
 pub const POSIX_PM_SPAWN: u64 = 1;
 
 // Spawn readiness modes (bits [1:0] of spawn_policy)
@@ -288,6 +299,10 @@ pub const fn spawn_policy_cnode_bits(policy: u64) -> u8 {
 pub const fn spawn_policy_memory_kb(policy: u64) -> u16 {
     ((policy >> 16) & 0xFFFF) as u16
 }
+
+// Spawn flags (msg.regs[3] in POSIX_PM_SPAWN wire format)
+pub const SPAWN_FLAG_USE_PRE_EP: u64 = 1 << 0;
+
 pub const POSIX_PM_EXIT: u64 = 2;
 pub const POSIX_PM_WAIT: u64 = 3;
 pub const POSIX_PM_GETPID: u64 = 4;
@@ -305,8 +320,14 @@ pub const POSIX_PM_GETEUID: u64 = 15;
 pub const POSIX_PM_GETEGID: u64 = 16;
 pub const POSIX_PM_GETGROUPS: u64 = 17;
 pub const POSIX_PM_EXPAND_CSPACE: u64 = 18;
+pub const POSIX_PM_EXPAND_CSPACE_ASYNC: u64 = 19;
+pub const POSIX_PM_EXPAND_COLLECT: u64 = 20;
+pub const POSIX_PM_REGISTER: u64 = 21;
+// Deterministic CNode slots for untyped expansion (last 8 slots of 10-bit CNode)
+pub const UT_EXPAND_BASE: u64 = 1016;
+pub const MAX_UT_EXPANSIONS: usize = 8;
 
-// Nameserv protocol labels
+/// Name service IPC protocol labels (register/lookup endpoint by name).
 pub const POSIX_NS_REGISTER: u64 = 1;
 pub const POSIX_NS_LOOKUP: u64 = 2;
 
@@ -393,7 +414,12 @@ pub const MM_MAX_REGIONS: usize = 32;
 pub const MM_MAX_FRAME_SLOTS: u64 = 256;
 pub const MM_MAX_PAGES_PER_REGION: usize = 64;
 
-// ELF constants
+// Userland slot allocator auxv types
+pub const AT_SALTY_SLOT_BASE: u64 = 0x1007;
+pub const AT_SALTY_SLOT_COUNT: u64 = 0x1008;
+pub const AT_SALTY_EXPAND_EP: u64 = 0x1009;
+
+/// ELF format constants (class, data encoding, types, segment types, relocation types).
 pub const ELF_PAGE_SIZE: u64 = 4096;
 pub const ELFCLASS64: u8 = 2;
 pub const ELFDATA2LSB: u8 = 1;
@@ -415,7 +441,7 @@ pub const DT_RELASZ: i64 = 8;
 pub const DT_RELAENT: i64 = 9;
 pub const R_X86_64_RELATIVE: u32 = 8;
 
-// ELF load errors
+/// ELF loader error codes returned by `elf_load`.
 pub const ELF_OK: i32 = 0;
 pub const ELF_NOT_ELF: i32 = 1;
 pub const ELF_NOT_64BIT: i32 = 2;
@@ -428,7 +454,7 @@ pub const ELF_OUT_OF_MEMORY: i32 = 8;
 pub const ELF_TOO_SMALL: i32 = 9;
 pub const ELF_MAP_FAILED: i32 = 11;
 
-// Socket constants
+/// Socket constants (AF_UNIX, SOCK_STREAM, SCM_RIGHTS, shutdown modes).
 pub const AF_UNIX: i32 = 1;
 pub const SOCK_STREAM: i32 = 1;
 pub const SCM_RIGHTS: i32 = 1;
@@ -437,14 +463,14 @@ pub const SHUT_RD: i32 = 0;
 pub const SHUT_WR: i32 = 1;
 pub const SHUT_RDWR: i32 = 2;
 
-// Poll event flags
+/// Poll event flags (POLLIN, POLLOUT, POLLERR, POLLHUP, POLLNVAL).
 pub const POLLIN: i16 = 0x001;
 pub const POLLOUT: i16 = 0x004;
 pub const POLLERR: i16 = 0x008;
 pub const POLLHUP: i16 = 0x010;
 pub const POLLNVAL: i16 = 0x020;
 
-// Epoll constants
+/// Epoll constants (CTL operations and event flags).
 pub const EPOLL_CTL_ADD: i32 = 1;
 pub const EPOLL_CTL_DEL: i32 = 2;
 pub const EPOLL_CTL_MOD: i32 = 3;
@@ -453,5 +479,5 @@ pub const EPOLLOUT: u32 = 0x004;
 pub const EPOLLERR: u32 = 0x008;
 pub const EPOLLHUP: u32 = 0x010;
 
-// CPIO header size
+/// CPIO newc header size in bytes (magic + fixed fields).
 pub const CPIO_HEADER_SIZE: usize = 110;

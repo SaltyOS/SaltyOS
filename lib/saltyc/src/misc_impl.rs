@@ -1,7 +1,13 @@
 //! Core POSIX miscellaneous functions
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! BSD/FreeBSD-specific functions live in compat::freebsd.
+//! Functions that don't fit in a specific POSIX header category:
+//! `getprogname`/`setprogname` (BSD program name), `dirname`/`basename`
+//! (path decomposition), `sched_yield`, `getpagesize`, `fsync`/`fdatasync`
+//! (no-ops for ramfs), `utime`/`utimes`, `user_from_uid`/`group_from_gid`,
+//! `getentropy` (pseudo-random fill), and various stubs (semaphores, popen).
+//!
+//! BSD/FreeBSD-specific functions live in `compat::freebsd`.
 
 use crate::errno;
 use core::ptr::addr_of_mut;
@@ -345,6 +351,14 @@ unsafe fn format_u32(mut val: u32, buf: *mut u8, buflen: usize) {
 
 static mut ENTROPY_COUNTER: u64 = 0;
 
+/// Fill a buffer with pseudo-random bytes.
+///
+/// **WARNING: NOT cryptographically secure.** Uses a simple xorshift64 PRNG
+/// seeded from the monotonic clock, PID, and a static counter. Suitable for
+/// non-security purposes (e.g. hash table seeding). `buflen` must be <= 256
+/// per POSIX.
+///
+/// Returns 0 on success, -1 on error (null buffer or buflen > 256).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getentropy(buf: *mut u8, buflen: usize) -> i32 {
     if buf.is_null() || buflen > 256 {

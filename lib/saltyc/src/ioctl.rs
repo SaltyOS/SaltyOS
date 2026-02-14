@@ -1,5 +1,8 @@
 //! ioctl system call wrapper
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Only `TIOCGWINSZ` is handled, returning a hardcoded 80x24 terminal size.
+//! All other ioctl requests return `ENOTTY`.
 
 use crate::errno;
 

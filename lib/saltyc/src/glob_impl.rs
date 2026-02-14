@@ -1,5 +1,11 @@
 //! glob() and fnmatch() implementation
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! `fnmatch` supports `*`, `?`, `[...]` character classes, `FNM_PATHNAME`,
+//! `FNM_PERIOD`, `FNM_NOESCAPE`, and `FNM_CASEFOLD` flags. `glob` expands
+//! pathname patterns by scanning directories via `opendir`/`readdir` and
+//! testing each entry with `fnmatch`. Results are collected into a heap-
+//! allocated `Glob` structure with optional sorting (`GLOB_NOSORT`).
 
 use crate::dirent_impl::{closedir, opendir, readdir};
 

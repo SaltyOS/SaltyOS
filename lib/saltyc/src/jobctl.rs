@@ -1,5 +1,9 @@
 //! Job control — process groups and sessions
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Thin wrappers around `salty::posix::posix_setpgid` / `posix_setsid` /
+//! `posix_getpgrp`. Terminal process group functions (`tcgetpgrp`,
+//! `tcsetpgrp`) return stubs since SaltyOS has no controlling terminal.
 
 use crate::errno;
 

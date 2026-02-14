@@ -1,10 +1,21 @@
 //! POSIX memory management (brk, sbrk, mmap, munmap, mprotect)
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Manages the user process heap and anonymous/fd-backed memory mappings.
+//! The heap grows upward from `heap_base` via `brk`/`sbrk`; anonymous
+//! `mmap` regions are allocated from `mmap_base` upward. Each region is
+//! tracked in a fixed-size table (`MM_MAX_REGIONS`).
+//!
+//! All page allocation uses the per-process slot allocator (`slot_alloc`)
+//! and kernel capability invocations (`untyped_retype`, `vspace_map`).
+//! fd-backed mmap (e.g. framebuffer) delegates to VFS for device cap
+//! transfer, then maps the device pages with write-combining flags.
 
 use crate::consts::*;
 use crate::invoke;
 use crate::types::*;
 
+/// Global memory management state. Initialized by `posix_mm_init`.
 static mut MM: PosixMmState = PosixMmState {
     untyped: 0,
     vspace: 0,
@@ -23,89 +34,15 @@ static mut MM: PosixMmState = PosixMmState {
     initialized: 0,
 };
 
-const MM_UT_SCAN_END_FALLBACK: Cap = 200;
-static mut MM_NEXT_UT_HINT: Cap = CAP_UNTYPED_START;
-
-fn untyped_scan_end() -> Cap {
-    let mut end = MM_UT_SCAN_END_FALLBACK;
-    let info = invoke::cnode_get_info(CAP_SELF_CSPACE);
-    if info.error == 0 {
-        unsafe {
-            let ctx = &raw const crate::__salty_ipc_ctx;
-            if !(*ctx).ipc_buffer.is_null() {
-                let num_slots = (*(*ctx).ipc_buffer).msg[3];
-                if num_slots > CAP_UNTYPED_START && num_slots < end {
-                    end = num_slots;
-                }
-            }
-        }
-    }
-
-    if end <= CAP_UNTYPED_START {
-        CAP_UNTYPED_START + 1
-    } else {
-        end
-    }
-}
-
-unsafe fn try_retype_frame_any_untyped(frame_slot: Cap) -> i32 {
-    unsafe {
-        let mut err = invoke::untyped_retype(MM.untyped, OBJ_FRAME, 0, frame_slot);
-        if err == 0 {
-            MM_NEXT_UT_HINT = MM.untyped;
-            return 0;
-        }
-
-        let start = CAP_UNTYPED_START;
-        let end = untyped_scan_end();
-
-        let mut first = MM_NEXT_UT_HINT;
-        if first < start || first >= end {
-            first = start;
-        }
-
-        let mut best_err = err;
-
-        for ut in first..end {
-            if ut == MM.untyped {
-                continue;
-            }
-            err = invoke::untyped_retype(ut, OBJ_FRAME, 0, frame_slot);
-            if err == 0 {
-                MM.untyped = ut;
-                MM_NEXT_UT_HINT = ut;
-                return 0;
-            }
-            if err != SALTY_INVALID_CAPABILITY as i32
-                && err != SALTY_INVALID_OPERATION as i32
-                && err != SALTY_NOT_FOUND as i32
-            {
-                best_err = err;
-            }
-        }
-
-        for ut in start..first {
-            if ut == MM.untyped {
-                continue;
-            }
-            err = invoke::untyped_retype(ut, OBJ_FRAME, 0, frame_slot);
-            if err == 0 {
-                MM.untyped = ut;
-                MM_NEXT_UT_HINT = ut;
-                return 0;
-            }
-            if err != SALTY_INVALID_CAPABILITY as i32
-                && err != SALTY_INVALID_OPERATION as i32
-                && err != SALTY_NOT_FOUND as i32
-            {
-                best_err = err;
-            }
-        }
-
-        best_err
-    }
-}
-
+/// Initialize the memory manager with capability slots and VA layout.
+///
+/// `untyped` is the memory source for frame allocation, `vspace`/`cspace`
+/// are the process's own root capabilities, `first_frame_slot` is the
+/// starting CNode slot for new frame objects, and `heap_base`/`mmap_base`
+/// set the virtual address origins for heap and mmap regions.
+///
+/// # Safety
+/// Must be called exactly once during process startup.
 pub unsafe fn posix_mm_init(
     untyped: Cap,
     vspace: Cap,
@@ -120,7 +57,6 @@ pub unsafe fn posix_mm_init(
         MM.cspace = cspace;
         MM.next_frame_slot = first_frame_slot;
         MM.max_frame_slot = first_frame_slot + MM_MAX_FRAME_SLOTS;
-        MM_NEXT_UT_HINT = CAP_UNTYPED_START;
         MM.heap_base = heap_base;
         MM.heap_current = heap_base;
         MM.mmap_base = mmap_base;
@@ -132,23 +68,21 @@ pub unsafe fn posix_mm_init(
     }
 }
 
+/// Allocate a CNode slot and retype a frame into it from the slot allocator.
+/// Returns the frame cap, or `u64::MAX` on failure.
 unsafe fn alloc_frame() -> Cap {
     unsafe {
-        while MM.next_frame_slot < MM.max_frame_slot {
-            let slot = MM.next_frame_slot;
-            MM.next_frame_slot += 1;
-            if slot == 0 {
-                continue;
-            }
-            let err = try_retype_frame_any_untyped(slot);
-            if err == 0 {
-                return slot;
-            }
+        if !crate::slot_alloc::slot_alloc_is_initialized() {
+            return u64::MAX;
         }
-        u64::MAX
+        match crate::slot_alloc::slot_alloc_frame() {
+            Some(slot) => slot,
+            None => u64::MAX,
+        }
     }
 }
 
+/// Convert POSIX protection flags (PROT_READ/WRITE/EXEC) to VSpace flags.
 unsafe fn prot_to_flags(prot: i32) -> u64 {
     let mut flags = VSPACE_FLAG_USER;
     if prot & PROT_WRITE != 0 {
@@ -160,10 +94,12 @@ unsafe fn prot_to_flags(prot: i32) -> u64 {
     flags
 }
 
+/// Map a frame at `vaddr` with POSIX protection flags.
 unsafe fn map_page(frame: Cap, vaddr: u64, prot: i32) -> i32 {
     unsafe { invoke::vspace_map(MM.vspace, frame, vaddr, prot_to_flags(prot)) }
 }
 
+/// Find a free slot in the region table. Returns null if all slots are in use.
 unsafe fn alloc_region() -> *mut PosixMmRegion {
     unsafe {
         for i in 0..MM_MAX_REGIONS {
@@ -175,6 +111,7 @@ unsafe fn alloc_region() -> *mut PosixMmRegion {
     }
 }
 
+/// Find the region containing virtual address `addr`. Returns null if not found.
 unsafe fn find_region(addr: u64) -> *mut PosixMmRegion {
     unsafe {
         for i in 0..MM_MAX_REGIONS {
@@ -187,6 +124,11 @@ unsafe fn find_region(addr: u64) -> *mut PosixMmRegion {
     }
 }
 
+/// Set the program break (end of heap) to `addr`.
+///
+/// If `addr` is above the current break, allocates and maps new pages.
+/// If below, unmaps and deletes the freed pages. New pages are zeroed.
+/// Returns 0 on success, -1 on error.
 pub unsafe fn posix_brk(addr: u64) -> i32 {
     unsafe {
         if MM.initialized == 0 {
@@ -239,6 +181,10 @@ pub unsafe fn posix_brk(addr: u64) -> i32 {
     }
 }
 
+/// Increment the program break by `increment` bytes.
+///
+/// Returns the previous break address on success, or `u64::MAX` on error.
+/// `increment == 0` returns the current break without changing it.
 pub unsafe fn posix_sbrk(increment: i64) -> u64 {
     unsafe {
         if MM.initialized == 0 {
@@ -282,11 +228,10 @@ unsafe fn posix_mmap_fd(
         let num_pages = len / 4096;
 
         // Allocate a free cap slot to receive the transferred capability
-        let recv_slot = MM.next_frame_slot;
-        if recv_slot >= MM.max_frame_slot {
-            return usize::MAX as *mut u8;
-        }
-        MM.next_frame_slot += 1;
+        let recv_slot = match crate::slot_alloc::slot_alloc() {
+            Some(s) => s,
+            None => return usize::MAX as *mut u8,
+        };
 
         // Prepare receive slot for IPC cap transfer
         crate::ipc::set_receive_slot_ctx(
@@ -354,6 +299,15 @@ unsafe fn posix_mmap_fd(
     }
 }
 
+/// Map pages into the process address space.
+///
+/// Supports two modes:
+/// - **Anonymous** (`MAP_ANONYMOUS`): allocates fresh frames, zeroes them,
+///   and maps at the next available mmap address (or at `addr` with `MAP_FIXED`).
+/// - **fd-backed** (`fd >= 0`): delegates to `posix_mmap_fd` which requests
+///   a device capability from VFS and maps it with write-combining flags.
+///
+/// Returns the mapped base address, or `MAP_FAILED` (usize::MAX) on error.
 pub unsafe fn posix_mmap(
     addr: *mut u8,
     length: u64,
@@ -438,6 +392,10 @@ pub unsafe fn posix_mmap(
     }
 }
 
+/// Unmap a previously mmap'd region at `addr`.
+///
+/// Unmaps all pages in the region, deletes frame capabilities, and frees
+/// the region table entry. Returns 0 on success, -1 on error.
 pub unsafe fn posix_munmap(addr: *mut u8, _length: u64) -> i32 {
     unsafe {
         if MM.initialized == 0 {
@@ -466,6 +424,10 @@ pub unsafe fn posix_munmap(addr: *mut u8, _length: u64) -> i32 {
     }
 }
 
+/// Change protection flags on an mmap'd region.
+///
+/// Unmaps and remaps each page with the new `prot` flags.
+/// Returns 0 on success, -1 on error.
 pub unsafe fn posix_mprotect(addr: *mut u8, _length: u64, prot: i32) -> i32 {
     unsafe {
         if MM.initialized == 0 {

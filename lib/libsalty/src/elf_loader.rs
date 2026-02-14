@@ -1,22 +1,41 @@
 //! Userspace ELF64 loader
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Loads ELF64 executables into a child process's VSpace using a
+//! scratch-map strategy: each page is temporarily mapped into the
+//! loader's own address space (at `scratch_vaddr`), populated with
+//! segment data, then remapped into the child's VSpace with the
+//! correct permissions.
+//!
+//! Supports both ET_EXEC (fixed address) and ET_DYN (PIE, relocated to
+//! `load_base`). R_X86_64_RELATIVE relocations are applied in-place
+//! via the scratch page technique.
+//!
+//! Frame allocation uses a pluggable strategy: callers can provide an
+//! `alloc_frame_slot` callback, or fall back to internal scanning of
+//! untyped capabilities.
 
 use crate::consts::*;
 use crate::invoke;
 use crate::serial;
 use crate::types::*;
 
+/// Round down to the nearest 4K page boundary.
 fn page_align_down(v: u64) -> u64 {
     v & !(ELF_PAGE_SIZE - 1)
 }
 
+/// Round up to the next 4K page boundary.
 fn page_align_up(v: u64) -> u64 {
     (v + ELF_PAGE_SIZE - 1) & !(ELF_PAGE_SIZE - 1)
 }
 
+/// Fallback upper bound for untyped cap scanning when CNode info is unavailable.
 const ELF_UT_SCAN_END_FALLBACK: Cap = 200;
+/// Hint for the last untyped that succeeded, to speed up scanning.
 static mut NEXT_UT_HINT: Cap = CAP_UNTYPED_START;
 
+/// Determine the upper bound for untyped cap scanning by querying the CNode.
 fn untyped_scan_end() -> Cap {
     let mut end = ELF_UT_SCAN_END_FALLBACK;
     let info = invoke::cnode_get_info(CAP_SELF_CSPACE);
@@ -39,6 +58,11 @@ fn untyped_scan_end() -> Cap {
     }
 }
 
+/// Try to retype a frame into `frame_slot` from any available untyped cap.
+///
+/// Tries the loader context's `untyped` first, then scans all untyped caps
+/// starting from a cached hint. Updates `ctx.untyped` and `NEXT_UT_HINT`
+/// on success to speed up future calls.
 fn try_retype_frame_any_untyped(ctx: &mut ElfLoaderCtx, frame_slot: Cap) -> i32 {
     let mut err = invoke::untyped_retype(ctx.untyped, OBJ_FRAME, 0, frame_slot);
     if err == 0 {
@@ -101,6 +125,7 @@ fn try_retype_frame_any_untyped(ctx: &mut ElfLoaderCtx, frame_slot: Cap) -> i32 
     best_err
 }
 
+/// Get the next frame slot, using the callback if provided or bumping the counter.
 fn next_frame_slot(ctx: &mut ElfLoaderCtx) -> Cap {
     if let Some(alloc) = ctx.alloc_frame_slot {
         unsafe { alloc(ctx.alloc_opaque) }
@@ -111,6 +136,7 @@ fn next_frame_slot(ctx: &mut ElfLoaderCtx) -> Cap {
     }
 }
 
+/// Record a page mapping via the callback, if one is configured.
 fn record_page_map(ctx: &ElfLoaderCtx, vaddr: u64, frame_cap: Cap, flags: u64) -> i32 {
     if let Some(record) = ctx.record_page {
         unsafe { record(ctx.record_opaque, vaddr, frame_cap, flags) }
@@ -119,6 +145,7 @@ fn record_page_map(ctx: &ElfLoaderCtx, vaddr: u64, frame_cap: Cap, flags: u64) -
     }
 }
 
+/// Convert ELF segment flags (PF_R/W/X) to VSpace mapping flags.
 fn phdr_to_flags(p_flags: u32) -> u64 {
     let mut flags = VSPACE_FLAG_USER;
     if p_flags & PF_W != 0 {
@@ -130,6 +157,7 @@ fn phdr_to_flags(p_flags: u32) -> u64 {
     flags
 }
 
+/// Convert a virtual address to its file offset using PT_LOAD segment info.
 fn vaddr_to_file_offset(
     data: *const u8,
     data_len: usize,
@@ -165,6 +193,11 @@ fn vaddr_to_file_offset(
     None
 }
 
+/// Apply R_X86_64_RELATIVE relocations for PIE binaries.
+///
+/// Reads the PT_DYNAMIC segment to find DT_RELA entries, then writes
+/// each relocated value through the scratch page. Only RELATIVE relocs
+/// are handled (sufficient for static PIE without symbol resolution).
 unsafe fn apply_relocations(
     data: *const u8,
     data_len: usize,
@@ -277,6 +310,10 @@ unsafe fn apply_relocations(
     }
 }
 
+/// Write a u64 value into a frame page at the given offset.
+///
+/// Temporarily maps the frame into the loader's scratch address, writes
+/// the value, then unmaps.
 unsafe fn write_to_page(
     ctx: &mut ElfLoaderCtx,
     frame_cap: Cap,
@@ -396,6 +433,18 @@ pub unsafe fn elf_compute_load_span(data: *const u8, data_len: usize) -> u64 {
     }
 }
 
+/// Load an ELF64 binary into a child process's VSpace.
+///
+/// Iterates PT_LOAD segments, allocating frames, copying segment data
+/// via scratch-map, and mapping pages into `ctx.child_vspace` with correct
+/// permissions. For PIE (ET_DYN), applies RELATIVE relocations.
+///
+/// On success, populates `*result` with the entry point, load base, and
+/// break address, and returns `ELF_OK`. On error, returns an ELF error code.
+///
+/// # Safety
+/// `data` must point to a valid ELF64 file of at least `data_len` bytes.
+/// `ctx` and `result` must be valid pointers.
 pub unsafe fn elf_load(
     data: *const u8,
     data_len: usize,

@@ -1,9 +1,18 @@
-//! Serial output via DebugPutBuf syscall
+//! Serial output via DebugPutChar/DebugPutBuf syscalls
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Provides atomic serial I/O for userspace diagnostic output. The kernel's
+//! `SYS_DEBUG_PUTBUF` copies up to 256 bytes from user memory and outputs
+//! them under `SERIAL_LOCK` in a single critical section, preventing
+//! interleaving with other threads or CPUs.
+//!
+//! The [`LineBuf`] struct accumulates multiple fragments (strings, hex
+//! numbers, decimals) into a single buffer and flushes atomically.
 
 use crate::consts::{SYS_DEBUG_PUTCHAR, SYS_DEBUG_PUTBUF};
 use crate::syscall::syscall;
 
+/// Write a single byte to the serial port via `SYS_DEBUG_PUTCHAR`.
 #[inline(always)]
 pub fn serial_putc(c: u8) {
     syscall(SYS_DEBUG_PUTCHAR, c as u64, 0, 0, 0, 0, 0);
@@ -89,10 +98,12 @@ pub struct LineBuf {
 }
 
 impl LineBuf {
+    /// Create a new empty line buffer.
     pub fn new() -> Self {
         Self { buf: [0; 256], pos: 0 }
     }
 
+    /// Append a byte slice to the buffer.
     pub fn str(&mut self, s: &[u8]) {
         for &b in s {
             if self.pos < self.buf.len() - 1 {
@@ -102,10 +113,12 @@ impl LineBuf {
         }
     }
 
+    /// Append a byte slice (alias for `str`).
     pub fn bytes(&mut self, s: &[u8]) {
         self.str(s);
     }
 
+    /// Append a hexadecimal number (with "0x" prefix) to the buffer.
     pub fn hex(&mut self, val: u64) {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         self.str(b"0x");
@@ -132,6 +145,7 @@ impl LineBuf {
         }
     }
 
+    /// Append a decimal number to the buffer.
     pub fn dec(&mut self, val: u64) {
         if val == 0 {
             if self.pos < self.buf.len() - 1 {
@@ -156,6 +170,7 @@ impl LineBuf {
         }
     }
 
+    /// Append a single byte to the buffer.
     pub fn putc(&mut self, c: u8) {
         if self.pos < self.buf.len() - 1 {
             self.buf[self.pos] = c;
@@ -163,6 +178,7 @@ impl LineBuf {
         }
     }
 
+    /// Flush the buffer to serial output atomically, then reset.
     pub fn flush(&mut self) {
         if self.pos > 0 {
             serial_puts(&self.buf[..self.pos]);

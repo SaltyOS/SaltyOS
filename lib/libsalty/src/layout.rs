@@ -6,10 +6,13 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-/// Number of stack pages allocated per child process.
+/// Number of 4K stack pages allocated per child process (default 16K stack).
 pub const CHILD_STACK_PAGES: usize = 4;
 
 // ---- Default VA addresses (private to layout computation) ----
+// These define the canonical user address space layout within the first
+// 2MiB and second 2MiB windows. If code regions overflow the first window,
+// the stack is relocated to the second window.
 const IPC_BUF_BASE: u64 = 0x0000_0000_0020_0000;
 const ELF_CODE_BASE: u64 = 0x0000_0000_0021_0000;
 const DEFAULT_STACK_BASE: u64 = 0x0000_0000_003F_8000;
@@ -24,32 +27,49 @@ const WINDOW2_SCRATCH_BASE: u64 = 0x0000_0000_007F_F000;
 /// A contiguous page-aligned region in the child's virtual address space.
 #[derive(Clone, Copy)]
 pub struct VmRegion {
+    /// Starting virtual address (page-aligned).
     pub base: u64,
+    /// Size in bytes (page-aligned).
     pub size: u64,
 }
 
 impl VmRegion {
+    /// An empty region (base=0, size=0).
     pub const fn zero() -> Self {
         VmRegion { base: 0, size: 0 }
     }
+    /// Virtual address one byte past the end of this region.
     pub const fn end(&self) -> u64 {
         self.base + self.size
     }
+    /// Number of 4K pages in this region.
     pub const fn page_count(&self) -> usize {
         (self.size / 0x1000) as usize
     }
 }
 
 /// Complete virtual address layout for a child process.
+///
+/// Each field is a `VmRegion` describing a contiguous mapping. Regions with
+/// `size == 0` are unused. `stack_top == 0` signals layout failure (code
+/// regions overflow all available windows).
 #[derive(Clone, Copy)]
 pub struct VmLayoutPlan {
+    /// IPC buffer page (1 page).
     pub ipc_buf: VmRegion,
+    /// ELF code/data segments.
     pub elf_code: VmRegion,
+    /// Runtime dynamic linker (rtld).
     pub rtld: VmRegion,
+    /// Shared library cache region.
     pub shared_libs: VmRegion,
+    /// User stack.
     pub stack: VmRegion,
+    /// Scratch page for ELF loader page-copy operations.
     pub scratch: VmRegion,
+    /// Initrd CPIO archive mapping window.
     pub initrd: VmRegion,
+    /// Top of stack (initial RSP value).
     pub stack_top: u64,
 }
 
@@ -68,6 +88,7 @@ impl VmLayoutPlan {
     }
 }
 
+/// Round up to the next 4K page boundary.
 fn page_align_up(v: u64) -> u64 {
     (v + 0xFFF) & !0xFFF
 }

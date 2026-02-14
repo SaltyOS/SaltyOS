@@ -1,9 +1,18 @@
 //! ELF dynamic linking helpers
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Utilities for inspecting ELF files before loading: detecting the
+//! presence of a PT_INTERP segment (runtime linker), extracting its
+//! path, listing DT_NEEDED shared library dependencies, and reading
+//! program header info for the auxiliary vector.
 
 use crate::consts::*;
 use crate::types::*;
 
+/// Check whether an ELF file has a PT_INTERP segment (i.e. needs a runtime linker).
+///
+/// # Safety
+/// `elf_data` must point to a valid ELF file of at least `elf_size` bytes.
 pub unsafe fn elf_has_interp(elf_data: *const u8, elf_size: usize) -> bool {
     if elf_size < core::mem::size_of::<Elf64Ehdr>() {
         return false;
@@ -29,6 +38,11 @@ pub unsafe fn elf_has_interp(elf_data: *const u8, elf_size: usize) -> bool {
     }
 }
 
+/// Return a pointer to the PT_INTERP string (runtime linker path) within the
+/// ELF data, or null if no PT_INTERP segment exists.
+///
+/// # Safety
+/// `elf_data` must point to a valid ELF file of at least `elf_size` bytes.
 pub unsafe fn elf_get_interp(elf_data: *const u8, elf_size: usize) -> *const u8 {
     if elf_size < core::mem::size_of::<Elf64Ehdr>() {
         return core::ptr::null();
@@ -61,9 +75,12 @@ pub unsafe fn elf_get_interp(elf_data: *const u8, elf_size: usize) -> *const u8 
 
 // ---- DT_NEEDED extraction ----
 
+/// Maximum number of DT_NEEDED shared library dependencies tracked.
 pub const MAX_NEEDED_LIBS: usize = 4;
+/// Maximum length of a DT_NEEDED library name (bytes).
 pub const MAX_NEEDED_NAME: usize = 24;
 
+/// Collection of DT_NEEDED library names extracted from an ELF binary.
 pub struct NeededLibs {
     pub count: usize,
     pub names: [[u8; MAX_NEEDED_NAME]; MAX_NEEDED_LIBS],
@@ -221,6 +238,14 @@ pub unsafe fn elf_get_needed(elf_data: *const u8, elf_size: usize) -> NeededLibs
     result
 }
 
+/// Extract program header table location for the auxiliary vector.
+///
+/// Writes the PHDR virtual address (relative to `load_base`), entry size,
+/// and count into the output pointers. Returns 0 on success, -1 on error.
+///
+/// # Safety
+/// `elf_data` must point to a valid ELF file of at least `elf_size` bytes.
+/// Output pointers must be valid and non-null.
 pub unsafe fn elf_get_phdr_info(
     elf_data: *const u8,
     elf_size: usize,

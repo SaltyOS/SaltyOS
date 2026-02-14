@@ -1,5 +1,11 @@
 //! stdlib -- conversion, search, random numbers
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! String-to-number conversions (`atoi`, `atol`, `strtol`, `strtoul`,
+//! `strtoll`, `strtoull`, `strtod`), sorting and searching (`qsort`,
+//! `bsearch`), pseudo-random number generation (`rand`, `srand`, `random`,
+//! `srandom`, `arc4random`), path resolution (`realpath`), and temporary
+//! file creation (`mkstemp`, `mktemp`).
 
 use crate::errno;
 

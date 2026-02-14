@@ -1,5 +1,29 @@
 //! C runtime startup
 //! SPDX-License-Identifier: GPL-2.0-only
+//!
+//! Entry point for all C programs on SaltyOS. The dynamic linker (`rtld`)
+//! calls `_start` (in `crt_start.S`), which calls `__libc_start_main` here.
+//!
+//! Initialization sequence:
+//! 1. Parse the initial stack layout: `argc`, `argv[]`, `envp[]`, `auxv[]`
+//! 2. Initialize `environ` from `envp`
+//! 3. Parse SaltyOS-specific auxv tags (`AT_SALTY_*`) to set up IPC context
+//! 4. Call `tcb_set_ipc_buffer` to configure the per-thread IPC buffer
+//! 5. Initialize `ipc_context` for libsalty IPC wrappers
+//! 6. Parse auxv for memory manager configuration (untyped cap, vspace, etc.)
+//! 7. Initialize the per-process slot allocator (preferring RTLD-exported pool)
+//! 8. Initialize `posix_mm` (heap and mmap regions)
+//! 9. Set program name from `argv[0]` for BSD `err(3)` functions
+//! 10. Initialize FreeBSD rune locale tables for `ctype.h` compatibility
+//!
+//! Custom auxv tags used by SaltyOS:
+//! - `0x1000` (`AT_SALTY_UNTYPED`): untyped memory capability slot
+//! - `0x1001` (`AT_SALTY_VSPACE`): VSpace capability slot
+//! - `0x1002` (`AT_SALTY_SCRATCH`): scratch virtual address region
+//! - `0x1005` (`AT_SALTY_FRAME_SLOT`): frame slot for page mapping
+//! - `0x1007` (`AT_SALTY_SLOT_BASE`): slot allocator pool base
+//! - `0x1008` (`AT_SALTY_SLOT_COUNT`): slot allocator pool size
+//! - `0x1009` (`AT_SALTY_EXPAND_EP`): endpoint for requesting more slots
 
 use crate::env;
 
@@ -73,7 +97,22 @@ unsafe fn init_ipc_from_auxv(stack_ptr: *const u64) {
     }
 }
 
-/// Initialize POSIX memory manager from auxv
+/// Initialize the POSIX memory manager and per-process slot allocator from auxv.
+///
+/// Parses SaltyOS-specific auxiliary vector entries (`AT_SALTY_*`) to discover:
+/// - Untyped memory capability (for backing `sbrk`/`mmap` allocations)
+/// - VSpace capability (for mapping frames into the address space)
+/// - Frame slot and scratch region addresses
+/// - Slot allocator pool (base + count) for capability slot management
+/// - Expand endpoint (for requesting additional slots from the process manager)
+///
+/// The RTLD (runtime dynamic linker) may have already consumed some slots while
+/// loading shared libraries, so its exported `__salty_slot_base` / `__salty_slot_count`
+/// take precedence over the raw auxv values when non-zero. Similarly, the RTLD's
+/// `__salty_expand_ep` overrides the auxv expand endpoint.
+///
+/// After slot allocation setup, the heap region is placed 1 MB after the scratch
+/// area, and the `mmap` region starts 16 MB after the heap base.
 unsafe fn init_mm_from_auxv(stack_ptr: *const u64) {
     unsafe {
         let argc = *stack_ptr as usize;
@@ -90,6 +129,9 @@ unsafe fn init_mm_from_auxv(stack_ptr: *const u64) {
         let mut vspace: u64 = salty::CAP_SELF_VSPACE;
         let mut frame_slot: u64 = 64;
         let mut scratch: u64 = salty::SCRATCH_VADDR;
+        let mut slot_base: u64 = 0;
+        let mut slot_count: u64 = 0;
+        let mut expand_ep: u64 = 0;
 
         loop {
             let tag = *p;
@@ -98,13 +140,37 @@ unsafe fn init_mm_from_auxv(stack_ptr: *const u64) {
                 break; // AT_NULL
             }
             match tag {
-                0x1000 => untyped = val,    // AT_SALTY_UNTYPED
-                0x1001 => vspace = val,     // AT_SALTY_VSPACE
-                0x1005 => frame_slot = val, // AT_SALTY_FRAME_SLOT
-                0x1002 => scratch = val,    // AT_SALTY_SCRATCH
+                0x1000 => untyped = val,     // AT_SALTY_UNTYPED
+                0x1001 => vspace = val,      // AT_SALTY_VSPACE
+                0x1005 => frame_slot = val,  // AT_SALTY_FRAME_SLOT
+                0x1002 => scratch = val,     // AT_SALTY_SCRATCH
+                0x1007 => slot_base = val,   // AT_SALTY_SLOT_BASE
+                0x1008 => slot_count = val,  // AT_SALTY_SLOT_COUNT
+                0x1009 => expand_ep = val,   // AT_SALTY_EXPAND_EP
                 _ => {}
             }
             p = p.add(2);
+        }
+
+        // Prefer RTLD-exported slot pool info because RTLD advances it past
+        // the slots consumed while loading shared libraries.
+        let rtld_base = *(&raw const salty::__salty_slot_base);
+        let rtld_count = *(&raw const salty::__salty_slot_count);
+        if rtld_base != 0 && rtld_count != 0 {
+            slot_base = rtld_base;
+            slot_count = rtld_count;
+        }
+
+        // Prefer RTLD-exported expand EP (set by rtld_main.c from auxv)
+        let rtld_expand_ep = *(&raw const salty::__salty_expand_ep);
+        if rtld_expand_ep != 0 {
+            expand_ep = rtld_expand_ep;
+        }
+
+        // Initialize per-process slot allocator only from dynamic slot-pool info.
+        // No legacy fallback to __salty_next_frame_slot.
+        if slot_base != 0 {
+            salty::slot_alloc::slot_alloc_init(slot_base, slot_count, expand_ep);
         }
 
         // Heap starts after scratch area
