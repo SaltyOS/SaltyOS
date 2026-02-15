@@ -6,8 +6,6 @@
 //! get/set are stored locally (not sent to a kernel terminal driver).
 //! Speed constants use Linux numbering (`B9600 = 13`, `B115200 = 0x1002`).
 
-use salty::serial::LineBuf;
-
 pub const NCCS: usize = 32;
 
 // Input flags (c_iflag)
@@ -117,24 +115,12 @@ static mut DEFAULT_TERMIOS: Termios = Termios {
     c_ispeed: B38400,
     c_ospeed: B38400,
 };
-static mut TERMIOS_DBG_BUDGET: u32 = 128;
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tcgetattr(fd: i32, termios_p: *mut Termios) -> i32 {
     unsafe {
         // Route through VFS → console server IPC
         let mut salty_t = salty::types::Termios::zeroed();
         let ret = salty::posix::posix_tcgetattr(fd, &raw mut salty_t);
-        if TERMIOS_DBG_BUDGET > 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[TERMIOS] tcgetattr fd=");
-            lb.dec(fd as u64);
-            lb.str(b" ret=");
-            lb.dec(ret as u64);
-            lb.str(b"\n");
-            lb.flush();
-            TERMIOS_DBG_BUDGET -= 1;
-        }
         if ret != 0 {
             // Fallback to local defaults
             let src = &raw const DEFAULT_TERMIOS;
@@ -181,18 +167,6 @@ pub unsafe extern "C" fn tcsetattr(fd: i32, action: i32, termios_p: *const Termi
             salty_t.c_cc[i] = (*termios_p).c_cc[i];
         }
         let ret = salty::posix::posix_tcsetattr(fd, action, &raw const salty_t);
-        if TERMIOS_DBG_BUDGET > 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[TERMIOS] tcsetattr fd=");
-            lb.dec(fd as u64);
-            lb.str(b" action=");
-            lb.dec(action as u64);
-            lb.str(b" ret=");
-            lb.dec(ret as u64);
-            lb.str(b"\n");
-            lb.flush();
-            TERMIOS_DBG_BUDGET -= 1;
-        }
         if ret != 0 {
             // Fallback: update local static
             let dst = &raw mut DEFAULT_TERMIOS;

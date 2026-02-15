@@ -504,8 +504,6 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
 
             let ut_bits = compute_service_budget(total_usable, mgr.count, memory_kb, do_map_initrd);
 
-            { let mut lb = LineBuf::new(); lb.str(b"[INIT] "); lb.bytes(name); lb.str(b" budget=2^"); lb.hex(ut_bits as u64); lb.str(b"\n"); lb.flush(); }
-
             let is_procmgr_svc = bytes_eq(name, b"procmgr");
             let child_badge = 0x1000 + pre_spawn_idx;
             let err = unsafe {

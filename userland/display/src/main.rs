@@ -444,21 +444,6 @@ fn handle_terminal_write(state: &mut DisplayState, msg: &SaltyMsg, reply: &mut S
     let text_ptr = &msg.regs[1] as *const u64 as *const u8;
     let max_bytes = if data_len > 152 { 152 } else { data_len };
 
-    {
-        static mut DBG_COUNT: u32 = 0;
-        // SAFETY: Single-threaded server, no concurrent access.
-        let cnt = unsafe { &raw mut DBG_COUNT };
-        let c = unsafe { *cnt };
-        unsafe { *cnt = c + 1; }
-        if c < 3 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[DISPLAY] terminal_write len=");
-            lb.dec(data_len as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
-    }
-
     for i in 0..max_bytes {
         // SAFETY: Reading text bytes from message registers, bounded by max_bytes.
         let c = unsafe { *text_ptr.add(i) };

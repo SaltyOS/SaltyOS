@@ -16,7 +16,6 @@ use salty::consts::*;
 use salty::invoke;
 use salty::ipc;
 use salty::serial;
-use salty::serial::LineBuf;
 use salty::types::*;
 
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
@@ -86,7 +85,7 @@ const DISPLAY_TX_CHUNK_MAX: usize = 152;
 static mut DISPLAY_TX_BUF: [u8; DISPLAY_TX_BUF_SIZE] = [0; DISPLAY_TX_BUF_SIZE];
 static mut DISPLAY_TX_HEAD: usize = 0;
 static mut DISPLAY_TX_TAIL: usize = 0;
-static mut INPUT_DBG_BUDGET: u32 = 64;
+
 
 // ======================================================================
 // PS/2 Keyboard: Scan Code Set 1 tables + modifier state
@@ -479,18 +478,6 @@ unsafe fn display_try_flush() {
 /// (ring buffer push + signal, no blocking IPC during input handling).
 fn forward_to_ttyd(raw: &[u8], raw_len: usize) {
     if raw_len == 0 { return; }
-    unsafe {
-        if INPUT_DBG_BUDGET > 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[CONSOLE][IN] len=");
-            lb.dec(raw_len as u64);
-            lb.str(b" b0=");
-            lb.hex(raw[0] as u64);
-            lb.str(b"\n");
-            lb.flush();
-            INPUT_DBG_BUDGET -= 1;
-        }
-    }
     let mut fwd = SaltyMsg::zeroed();
     fwd.label = TTYD_INPUT_EVENT;
     fwd.regs[0] = raw_len as u64;

@@ -1277,10 +1277,6 @@ pub unsafe fn handle_spawn_tx(
 
         let is_dynamic =
             salty::elf_dynamic::elf_has_interp(elf_entry.data, elf_entry.data_len);
-        if is_dynamic {
-            puts(b"[PROCMGR] ELF is dynamically linked\n");
-        }
-
         // ---- PREFLIGHT: Build SpawnPlan ----
         // Memory budget: from spawn_policy (init-derived), or default
         let child_ut_bits = if policy_memory_kb > 0 {
@@ -1474,14 +1470,6 @@ pub unsafe fn handle_spawn_tx(
             child_ready_ntfn = 0;
         }
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] Objects retyped for PID ");
-            lb.hex(pid as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
-
         // ---- REALIZE ELF pages ----
         let mut frame_alloc_ctx = FrameAllocCtx {
             alloc: alloc as *mut Allocator,
@@ -1525,14 +1513,6 @@ pub unsafe fn handle_spawn_tx(
             alloc.rollback();
             reply.label = SALTY_INVALID_ARGUMENT;
             return;
-        }
-
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] ELF loaded: entry=");
-            lb.hex(elf_result.entry);
-            lb.str(b"\n");
-            lb.flush();
         }
 
         // ---- Load rtld if dynamic ----
@@ -1941,14 +1921,6 @@ unsafe fn map_initrd_to_child_tx(
         } else {
             (initrd_size + 4095) / 4096
         };
-
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] initrd mapping: ");
-            lb.hex(map_pages as u64);
-            lb.str(b" pages (lib window)\n");
-            lb.flush();
-        }
 
         let mut mapped_with_device = true;
 

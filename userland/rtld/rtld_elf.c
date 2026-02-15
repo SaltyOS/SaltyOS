@@ -185,11 +185,6 @@ static int patch_mapped_page(struct rtld_state *st, cap_t frame_slot,
 
 int load_shared_library(struct rtld_state *st, const char *name,
                          uint64_t load_addr) {
-    { struct rtld_linebuf lb; rtld_lb_init(&lb);
-      rtld_lb_str(&lb, "[RTLD] Loading ");
-      rtld_lb_str(&lb, name); rtld_lb_str(&lb, " at ");
-      rtld_lb_hex(&lb, load_addr); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
-
     if (st->nobjects >= RTLD_MAX_OBJECTS) {
         rtld_puts("[RTLD] too many loaded objects\n");
         return -1;
@@ -204,10 +199,6 @@ int load_shared_library(struct rtld_state *st, const char *name,
           rtld_lb_str(&lb, name); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
         return -2;
     }
-
-    { struct rtld_linebuf lb; rtld_lb_init(&lb);
-      rtld_lb_str(&lb, "[RTLD] Found in initrd, size=");
-      rtld_lb_hex(&lb, cpio.data_len); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
 
     /* Validate ELF header */
     if (cpio.data_len < sizeof(Elf64_Ehdr))
@@ -239,11 +230,6 @@ int load_shared_library(struct rtld_state *st, const char *name,
     /* Check if this library was pre-mapped by procmgr */
     int is_premapped = (st->shared_lib_base != 0
                         && load_addr >= st->shared_lib_base);
-    if (is_premapped) {
-        rtld_puts("[RTLD] Using pre-mapped shared pages for ");
-        rtld_puts(name);
-        rtld_puts("\n");
-    }
 
     /* Load each PT_LOAD segment */
     for (int i = 0; i < ehdr->e_phnum; i++) {
@@ -255,11 +241,6 @@ int load_shared_library(struct rtld_state *st, const char *name,
         uint64_t seg_start = rtld_page_align_down(seg_vaddr);
         uint64_t seg_end = rtld_page_align_up(seg_vaddr + ph->p_memsz);
         uint64_t flags = rtld_elf_to_vspace_flags(ph->p_flags);
-
-        { struct rtld_linebuf lb; rtld_lb_init(&lb);
-          rtld_lb_str(&lb, "[RTLD]   LOAD ");
-          rtld_lb_hex(&lb, seg_start); rtld_lb_str(&lb, "-");
-          rtld_lb_hex(&lb, seg_end); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
 
         /* RO segment already mapped by procmgr — record pages as device-mapped */
         if (is_premapped && (ph->p_flags & PF_W) == 0) {
@@ -423,11 +404,6 @@ int load_shared_library(struct rtld_state *st, const char *name,
     tail->next = map;
 
     st->nobjects++;
-
-    { struct rtld_linebuf lb; rtld_lb_init(&lb);
-      rtld_lb_str(&lb, "[RTLD] Loaded ");
-      rtld_lb_str(&lb, name); rtld_lb_str(&lb, " base=");
-      rtld_lb_hex(&lb, base); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
 
     return 0;
 }

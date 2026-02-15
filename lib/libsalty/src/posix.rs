@@ -19,35 +19,7 @@
 //! packed into subsequent u64 registers.
 
 use crate::consts::*;
-use crate::serial::LineBuf;
 use crate::types::*;
-
-static mut POSIX_RW_DBG_BUDGET: u32 = 192;
-
-#[inline(always)]
-unsafe fn posix_dbg_rw(tag: &[u8], fd: i32, req: u64, err: i32, label: u64, val: u64) {
-    unsafe {
-        if POSIX_RW_DBG_BUDGET == 0 || fd < 0 || fd > 2 {
-            return;
-        }
-        POSIX_RW_DBG_BUDGET -= 1;
-        let mut lb = LineBuf::new();
-        lb.str(b"[POSIX] ");
-        lb.str(tag);
-        lb.str(b" fd=");
-        lb.dec(fd as u64);
-        lb.str(b" req=");
-        lb.dec(req);
-        lb.str(b" err=");
-        lb.hex(err as u64);
-        lb.str(b" lbl=");
-        lb.hex(label);
-        lb.str(b" val=");
-        lb.dec(val);
-        lb.str(b"\n");
-        lb.flush();
-    }
-}
 
 /// Pack a null-terminated path into message registers starting at `offset`.
 ///
@@ -124,7 +96,6 @@ pub unsafe fn posix_read(fd: i32, buf: *mut u8, count: u64) -> i64 {
                 &raw const msg,
                 &raw mut reply,
             );
-            posix_dbg_rw(b"read", fd, chunk, err, reply.label, reply.regs[0]);
             if err != 0 || reply.label != SALTY_OK {
                 return if total > 0 { total as i64 } else { -1 };
             }
@@ -183,7 +154,6 @@ pub unsafe fn posix_write(fd: i32, buf: *const u8, count: u64) -> i64 {
                 &raw const msg,
                 &raw mut reply,
             );
-            posix_dbg_rw(b"write", fd, chunk, err, reply.label, reply.regs[0]);
             if err != 0 || reply.label != SALTY_OK {
                 return if total > 0 { total as i64 } else { -1 };
             }
@@ -1077,13 +1047,8 @@ pub unsafe fn posix_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32 {
         msg.regs[0] = actual_nfds as u64;
         msg.regs[1] = timeout as u64;
 
-        let mut has_tty_fd = false;
-
         // Pack (fd, events) pairs into regs[2..]
         for i in 0..actual_nfds as usize {
-            if (*fds.add(i)).fd >= 0 && (*fds.add(i)).fd <= 2 {
-                has_tty_fd = true;
-            }
             msg.regs[2 + i * 2] = (*fds.add(i)).fd as u64;
             msg.regs[2 + i * 2 + 1] = (*fds.add(i)).events as u64;
         }
@@ -1095,16 +1060,6 @@ pub unsafe fn posix_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if has_tty_fd {
-            posix_dbg_rw(
-                b"poll",
-                0,
-                actual_nfds as u64,
-                err,
-                reply.label,
-                reply.regs[0],
-            );
-        }
         if err != 0 || reply.label != SALTY_OK {
             return -1;
         }

@@ -8,30 +8,6 @@
 //! `pipe`, `dup`/`dup2`, and the `*at()` family (`openat`, `fstatat`, etc.).
 
 use crate::errno;
-use salty::serial::LineBuf;
-
-static mut UNISTD_DBG_BUDGET: u32 = 160;
-
-#[inline(always)]
-unsafe fn unistd_dbg_rw(tag: &[u8], fd: i32, count: usize, ret: i64) {
-    unsafe {
-        if UNISTD_DBG_BUDGET == 0 {
-            return;
-        }
-        UNISTD_DBG_BUDGET -= 1;
-        let mut lb = LineBuf::new();
-        lb.str(b"[UNISTD] ");
-        lb.str(tag);
-        lb.str(b" fd=");
-        lb.dec(fd as u64);
-        lb.str(b" n=");
-        lb.dec(count as u64);
-        lb.str(b" -> ");
-        lb.dec(ret as u64);
-        lb.str(b"\n");
-        lb.flush();
-    }
-}
 
 // ---------------------------------------------------------------------------
 // C-compatible structures
@@ -147,7 +123,6 @@ pub unsafe extern "C" fn close(fd: i32) -> i32 {
 pub unsafe extern "C" fn read(fd: i32, buf: *mut u8, count: usize) -> isize {
     unsafe {
         let ret = salty::posix::posix_read(fd, buf, count as u64);
-        unistd_dbg_rw(b"read", fd, count, ret);
         if ret < 0 {
             errno::set_errno(errno::EIO);
         }
@@ -159,7 +134,6 @@ pub unsafe extern "C" fn read(fd: i32, buf: *mut u8, count: usize) -> isize {
 pub unsafe extern "C" fn write(fd: i32, buf: *const u8, count: usize) -> isize {
     unsafe {
         let ret = salty::posix::posix_write(fd, buf, count as u64);
-        unistd_dbg_rw(b"write", fd, count, ret);
         if ret < 0 {
             errno::set_errno(errno::EIO);
         }

@@ -166,21 +166,6 @@ pub fn release_frame_mapping(addr: PhysAddr) {
     unsafe { restore_irq(irq_flag) };
 }
 
-/// Debug helper: return `(map_refs, obj_refs, reclaimable)` for one frame.
-pub fn debug_frame_state(addr: PhysAddr) -> (u16, u16, u8) {
-    let irq_flag = unsafe { save_irq_disable() };
-    FRAME_LOCK.lock();
-    let state = unsafe {
-        match (*(&raw mut FRAME_ALLOCATOR)).as_ref() {
-            Some(allocator) => allocator.debug_state(addr),
-            None => (0, 0, 0),
-        }
-    };
-    FRAME_LOCK.unlock();
-    unsafe { restore_irq(irq_flag) };
-    state
-}
-
 /// Retain frame-object ownership references for a frame range (SMP-safe).
 pub fn retain_frame_object(addr: PhysAddr, size_bits: u8) {
     let irq_flag = unsafe { save_irq_disable() };

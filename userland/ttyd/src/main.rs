@@ -251,7 +251,6 @@ static mut DISPLAY_TX_BUF: [u8; DISPLAY_TX_BUF_SIZE] = [0; DISPLAY_TX_BUF_SIZE];
 static mut DISPLAY_TX_HEAD: usize = 0;
 static mut DISPLAY_TX_TAIL: usize = 0;
 static mut DISPLAY_TX_DROP_COUNT: u64 = 0;
-static mut DEBUG_BUDGET: u32 = 96;
 
 // ======================================================================
 // Helper functions
@@ -419,26 +418,12 @@ fn send_signal_pgid(pgid: u32, sig: i32) {
 /// Signal VFS's bound notification to wake it for PTY data.
 /// Badge bits encode the PTY id.
 fn signal_vfs(pty_id: usize) {
-    let r = salty::syscall::syscall(
+    let _r = salty::syscall::syscall(
         salty::SYS_SIGNAL,
         CAP_VFS_NTFN,
         1u64 << pty_id as u64,
         0, 0, 0, 0,
     );
-    unsafe {
-        if pty_id == 0 && DEBUG_BUDGET > 0 {
-            let mut lb = SerialLB::new();
-            lb.str(b"[TTYD][SIG] pty=");
-            lb.dec(pty_id as u64);
-            lb.str(b" err=");
-            lb.hex(r.error);
-            lb.str(b" bits=");
-            lb.hex(1u64 << pty_id as u64);
-            lb.str(b"\n");
-            lb.flush();
-            DEBUG_BUDGET -= 1;
-        }
-    }
 }
 
 /// Flush line buffer contents into the slave ring.
@@ -617,16 +602,6 @@ unsafe fn handle_input_event(msg: &SaltyMsg) {
         if count == 0 || count > 128 { return; }
 
         let src = &msg.regs[1] as *const u64 as *const u8;
-        if DEBUG_BUDGET > 0 {
-            let mut lb = SerialLB::new();
-            lb.str(b"[TTYD][IN] count=");
-            lb.dec(count as u64);
-            lb.str(b" b0=");
-            lb.hex(*src as u64);
-            lb.str(b"\n");
-            lb.flush();
-            DEBUG_BUDGET -= 1;
-        }
         let mut echo_buf = [0u8; 64];
         let mut echo_len: usize = 0;
 
@@ -657,18 +632,6 @@ unsafe fn handle_pty_read(msg: &SaltyMsg, reply: &mut SaltyMsg) {
 
         let pty = &mut *(&raw mut PTYS[pty_id]);
         let available = pty.slave_ring.len();
-        if pty_id == 0 && DEBUG_BUDGET > 0 {
-            let mut lb = SerialLB::new();
-            lb.str(b"[TTYD][RD] avail=");
-            lb.dec(available as u64);
-            lb.str(b" max=");
-            lb.dec(max_count as u64);
-            lb.str(b" pending=");
-            lb.dec(pty.vfs_pending as u64);
-            lb.str(b"\n");
-            lb.flush();
-            DEBUG_BUDGET -= 1;
-        }
 
         if available > 0 {
             let count = if available < max_count { available } else { max_count };
@@ -744,14 +707,6 @@ unsafe fn handle_pty_write(msg: &SaltyMsg, reply: &mut SaltyMsg) {
         }
 
         let pty = &*(&raw const PTYS[pty_id]);
-        if pty_id == 0 && DEBUG_BUDGET > 0 {
-            let mut lb = SerialLB::new();
-            lb.str(b"[TTYD][WR] count=");
-            lb.dec(count as u64);
-            lb.str(b"\n");
-            lb.flush();
-            DEBUG_BUDGET -= 1;
-        }
         let src = &msg.regs[2] as *const u64 as *const u8;
 
         // Apply OPOST processing
@@ -867,16 +822,6 @@ unsafe fn handle_pty_ioctl(msg: &SaltyMsg, reply: &mut SaltyMsg) {
                 // Validate against controlling-tty owner badge.
                 if pty.has_ctty && pty.ctty_owner_badge == caller_badge {
                     pty.fg_pgid = arg as u32;
-                    if DEBUG_BUDGET > 0 {
-                        let mut lb = SerialLB::new();
-                        lb.str(b"[TTYD][IOCTL] TIOCSPGRP pgid=");
-                        lb.hex(arg);
-                        lb.str(b" owner=");
-                        lb.hex(caller_badge);
-                        lb.str(b"\n");
-                        lb.flush();
-                        DEBUG_BUDGET -= 1;
-                    }
                     reply.label = SALTY_OK;
                     reply.length = 0;
                 } else {
@@ -890,14 +835,6 @@ unsafe fn handle_pty_ioctl(msg: &SaltyMsg, reply: &mut SaltyMsg) {
                 }
                 pty.has_ctty = true;
                 pty.ctty_owner_badge = caller_badge;
-                if DEBUG_BUDGET > 0 {
-                    let mut lb = SerialLB::new();
-                    lb.str(b"[TTYD][IOCTL] TIOCSCTTY owner=");
-                    lb.hex(caller_badge);
-                    lb.str(b"\n");
-                    lb.flush();
-                    DEBUG_BUDGET -= 1;
-                }
                 reply.label = SALTY_OK;
                 reply.length = 0;
             }

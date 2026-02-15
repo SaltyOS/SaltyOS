@@ -8,24 +8,8 @@
 //! buffer (max 64 args).
 
 use crate::errno;
-use salty::serial::LineBuf;
 
 const SIGABRT: i32 = 6;
-static mut WAITPID_DBG_BUDGET: u32 = 96;
-
-#[inline(always)]
-fn waitpid_caller_ra() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        let mut ra: u64;
-        core::arch::asm!("mov {}, [rsp]", out(reg) ra);
-        ra
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        0
-    }
-}
 
 // Maximum number of varargs we support for execl/execlp argv construction
 const MAX_EXEC_ARGS: usize = 64;
@@ -229,26 +213,8 @@ pub unsafe extern "C" fn getppid() -> i32 {
 pub unsafe extern "C" fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32 {
     unsafe {
         let ret = salty::posix::posix_waitpid3(pid, status, options);
-        let mut mapped_errno = 0;
         if ret < 0 {
             errno::set_errno(errno::ECHILD);
-            mapped_errno = errno::ECHILD;
-        }
-        if WAITPID_DBG_BUDGET > 0 && pid == -1 {
-            WAITPID_DBG_BUDGET -= 1;
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCESS] waitpid pid=");
-            lb.hex(pid as u64);
-            lb.str(b" opt=");
-            lb.hex(options as u64);
-            lb.str(b" ret=");
-            lb.hex(ret as u64);
-            lb.str(b" errno=");
-            lb.hex(mapped_errno as u64);
-            lb.str(b" ra=");
-            lb.hex(waitpid_caller_ra());
-            lb.str(b"\n");
-            lb.flush();
         }
         ret
     }

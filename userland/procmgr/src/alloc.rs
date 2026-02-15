@@ -344,17 +344,6 @@ impl Allocator {
                 self.ut_hint = i;
                 return 0;
             }
-            {
-                let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR] retype ut[");
-                lb.hex(i as u64);
-                lb.str(b"] cap=");
-                lb.hex(self.ut_sources[i].cap);
-                lb.str(b" err=");
-                lb.hex(err as u64);
-                lb.str(b"\n");
-                lb.flush();
-            }
             if err != salty::SALTY_INVALID_CAPABILITY as i32
                 && err != salty::SALTY_INVALID_OPERATION as i32
                 && err != salty::SALTY_NOT_FOUND as i32
@@ -377,17 +366,6 @@ impl Allocator {
             if err == 0 {
                 self.ut_hint = i;
                 return 0;
-            }
-            {
-                let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR] retype ut[");
-                lb.hex(i as u64);
-                lb.str(b"] cap=");
-                lb.hex(self.ut_sources[i].cap);
-                lb.str(b" err=");
-                lb.hex(err as u64);
-                lb.str(b"\n");
-                lb.flush();
             }
             if err != salty::SALTY_INVALID_CAPABILITY as i32
                 && err != salty::SALTY_INVALID_OPERATION as i32

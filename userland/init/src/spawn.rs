@@ -728,26 +728,15 @@ unsafe fn copy_shared_lib_caps_to_child(child_cn: Cap) {
             return;
         }
 
-        let mut copied: usize = 0;
         for i in 0..cache.page_count {
             let dst_slot = CAP_SHARED_LIB_CACHE_BASE + i as u64;
-            let err = invoke::cnode_copy(
+            let _ = invoke::cnode_copy(
                 CAP_SELF_CSPACE,
                 cache.pages[i].frame_cap,
                 child_cn,
                 dst_slot,
                 CAP_RIGHTS_ALL,
             );
-            if err == 0 {
-                copied += 1;
-            }
-        }
-        if copied > 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[INIT] copied ");
-            lb.hex(copied as u64);
-            lb.str(b" shared lib caps to child CNode\n");
-            lb.flush();
         }
     }
 }
@@ -804,9 +793,6 @@ pub unsafe fn spawn_server(
         }
 
         let is_dynamic = elf_dynamic::elf_has_interp(entry.data, entry.data_len);
-        if is_dynamic {
-            { let mut lb = LineBuf::new(); lb.str(b"[INIT] "); lb.bytes(label); lb.str(b" is dynamically linked\n"); lb.flush(); }
-        }
 
         // Pre-compute ELF and RTLD spans for layout computation
         let elf_span = elf_loader::elf_compute_load_span(entry.data, entry.data_len);
@@ -950,15 +936,6 @@ pub unsafe fn spawn_server(
             lb.str(b"\n");
             lb.flush();
         }
-        if budget.runtime_bits > granted_bits {
-            let mut lb = LineBuf::new();
-            lb.str(b"[INIT] runtime budget targets 2^");
-            lb.hex(budget.runtime_bits as u64);
-            lb.str(b", dedicated pool is 2^");
-            lb.hex(granted_bits as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
 
         let mut loader_ctx = ElfLoaderCtx {
             untyped: sub_ut_slot,
@@ -985,7 +962,6 @@ pub unsafe fn spawn_server(
             return -1;
         }
 
-        { let mut lb = LineBuf::new(); lb.str(b"[INIT] ELF loaded: entry="); lb.hex(elf_result.entry); lb.str(b"\n"); lb.flush(); }
 
         let mut rtld_result = ElfLoadResult { entry: 0, base: 0, brk: 0 };
 
@@ -1002,7 +978,6 @@ pub unsafe fn spawn_server(
                 return -1;
             }
 
-            { let mut lb = LineBuf::new(); lb.str(b"[INIT] rtld loaded: entry="); lb.hex(rtld_result.entry); lb.str(b" base="); lb.hex(rtld_result.base); lb.str(b"\n"); lb.flush(); }
         }
 
         // Map stack pages
@@ -1053,7 +1028,6 @@ pub unsafe fn spawn_server(
         if map_initrd || is_dynamic {
             let initrd_pages = (initrd_size + 4095) / 4096;
             let mut mapped_with_device = true;
-            { let mut lb = LineBuf::new(); lb.str(b"[INIT] Mapping initrd into child ("); lb.hex(initrd_pages as u64); lb.str(b" pages, mode=device)\n"); lb.flush(); }
 
             for pg in 0..initrd_pages {
                 let err = invoke::vspace_map_device(
@@ -1083,7 +1057,6 @@ pub unsafe fn spawn_server(
             }
 
             if !mapped_with_device {
-                { let mut lb = LineBuf::new(); lb.str(b"[INIT] Mapping initrd into child ("); lb.hex(initrd_pages as u64); lb.str(b" pages, mode=copy)\n"); lb.flush(); }
                 for pg in 0..initrd_pages {
                     let fr_slot = super::init_alloc_frame_slot(core::ptr::null_mut());
                     let mut err = invoke::untyped_retype(loader_ut, OBJ_FRAME, 0, fr_slot);
@@ -1133,8 +1106,6 @@ pub unsafe fn spawn_server(
                     }
                 }
             }
-            puts(b"[INIT] Initrd mapped in child VSpace\n");
-
             // Map init's persistent bootinfo snapshot page into child.
             let err = invoke::vspace_map(
                 child_vs,
@@ -1249,14 +1220,6 @@ pub unsafe fn spawn_server(
             );
             if err != 0 {
                 puts(b"[INIT] WARN: mint expand EP failed\n");
-            } else {
-                let mut lb = LineBuf::new();
-                lb.str(b"[INIT] Minted expand EP badge=");
-                lb.hex(spawn_badge);
-                lb.str(b" slot=");
-                lb.hex(super::CAP_EXPAND_EP);
-                lb.str(b"\n");
-                lb.flush();
             }
         }
 
@@ -1409,15 +1372,7 @@ pub unsafe fn spawn_server(
                 super::ipc_ctx(), procmgr_ep,
                 &raw const reg_msg, &raw mut reg_reply,
             );
-            if reg_err == 0 && reg_reply.label == SALTY_OK {
-                let mut lb = LineBuf::new();
-                lb.str(b"[INIT] PM_REGISTER ");
-                lb.bytes(label);
-                lb.str(b" ok pid=");
-                lb.dec(reg_reply.regs[0]);
-                lb.str(b"\n");
-                lb.flush();
-            } else {
+            if reg_err != 0 || reg_reply.label != SALTY_OK {
                 let mut lb = LineBuf::new();
                 lb.str(b"[INIT] WARN: PM_REGISTER ");
                 lb.bytes(label);

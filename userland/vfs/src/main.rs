@@ -459,9 +459,6 @@ static mut FB_GREEN_SIZE: u8 = 0;
 static mut FB_BLUE_POS: u8 = 0;
 static mut FB_BLUE_SIZE: u8 = 0;
 static mut FB_MMAP_BADGE: u64 = 0;
-// Shell-focused debug tracing target (badge set when /dev/pts/0 is opened).
-static mut SHELL_DEBUG_BADGE: u64 = 0;
-static mut PTY_NOTIFY_DEBUG_BUDGET: u32 = 24;
 
 macro_rules! INODES {
     () => {
@@ -1046,64 +1043,6 @@ fn str_equal_raw(a: *const u8, alen: usize, b: *const u8, blen: usize) -> bool {
         }
     }
     true
-}
-
-fn shell_dbg_enabled(badge: u64) -> bool {
-    unsafe { SHELL_DEBUG_BADGE != 0 && SHELL_DEBUG_BADGE == badge }
-}
-
-fn shell_dbg_is_pts0(path: *const u8, path_len: u8) -> bool {
-    const PTS0: &[u8] = b"/dev/pts/0";
-    if path_len as usize != PTS0.len() {
-        return false;
-    }
-    for i in 0..PTS0.len() {
-        unsafe {
-            if *path.add(i) != PTS0[i] {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-fn shell_dbg_maybe_track_pts0_open(path: *const u8, path_len: u8, badge: u64) {
-    unsafe {
-        if SHELL_DEBUG_BADGE != 0 || !shell_dbg_is_pts0(path, path_len) {
-            return;
-        }
-        SHELL_DEBUG_BADGE = badge;
-        let mut lb = LineBuf::new();
-        lb.str(b"[VFS][SHELL] tracking badge=");
-        lb.hex(badge);
-        lb.str(b" (opened /dev/pts/0)\n");
-        lb.flush();
-    }
-}
-
-fn shell_dbg_label_traced(label: u64) -> bool {
-    matches!(
-        label,
-        VFS_OPEN
-            | VFS_OPENAT
-            | VFS_READ
-            | VFS_WRITE
-            | VFS_CLOSE
-            | VFS_STAT
-            | VFS_FSTATAT
-            | VFS_ACCESS
-            | VFS_IOCTL
-            | VFS_ISATTY
-            | VFS_FCNTL
-            | VFS_TCGETATTR
-            | VFS_TCSETATTR
-            | VFS_POLL
-            | VFS_GETCWD
-            | VFS_CHDIR
-            | VFS_DUP
-            | VFS_DUP2
-            | VFS_DUP3
-    )
 }
 
 unsafe fn inode_by_ino(ino: u32) -> *mut RamfsInode {
@@ -1941,17 +1880,6 @@ unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
             return;
         }
 
-        shell_dbg_maybe_track_pts0_open(path.as_ptr(), path_len, badge);
-        if shell_dbg_enabled(badge) || shell_dbg_is_pts0(path.as_ptr(), path_len) {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS][SHELL] open path='");
-            lb.bytes(&path[..path_len as usize]);
-            lb.str(b"' flags=");
-            lb.hex(flags as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
-
         let mut inode = resolve_path(path.as_ptr(), path_len);
 
         if inode.is_null() {
@@ -1979,13 +1907,6 @@ unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
             }
 
             if inode.is_null() {
-                if shell_dbg_enabled(badge) {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[VFS][SHELL] open: not found path='");
-                    lb.bytes(&path[..path_len as usize]);
-                    lb.str(b"'\n");
-                    lb.flush();
-                }
                 (*reply).label = SALTY_NOT_FOUND;
                 return;
             }
@@ -2064,17 +1985,6 @@ unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                 (*reply).label = SALTY_OK;
                 (*reply).length = 1;
                 (*reply).regs[0] = fd as u64;
-                if shell_dbg_enabled(badge) {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[VFS][SHELL] open -> fd=");
-                    lb.dec(fd as u64);
-                    lb.str(b" dev=");
-                    lb.hex((*cli).fds[fd].dev_type as u64);
-                    lb.str(b" type=");
-                    lb.hex((*cli).fds[fd].fd_type as u64);
-                    lb.str(b"\n");
-                    lb.flush();
-                }
                 return;
             }
         }
@@ -2488,13 +2398,6 @@ unsafe fn handle_stat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
         let path_len = extract_path(msg, 0, path.as_mut_ptr());
-        if shell_dbg_enabled(badge) {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS][SHELL] stat path='");
-            lb.bytes(&path[..path_len as usize]);
-            lb.str(b"'\n");
-            lb.flush();
-        }
         let inode = if path_len > 0 && path[0] == b'/' {
             resolve_path(path.as_ptr(), path_len)
         } else {
@@ -2513,13 +2416,6 @@ unsafe fn handle_access(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) 
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
         let path_len = extract_path(msg, 1, path.as_mut_ptr());
-        if shell_dbg_enabled(badge) {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS][SHELL] access path='");
-            lb.bytes(&path[..path_len as usize]);
-            lb.str(b"'\n");
-            lb.flush();
-        }
         let inode = if path_len > 0 && path[0] == b'/' {
             resolve_path(path.as_ptr(), path_len)
         } else {
@@ -2888,19 +2784,6 @@ unsafe fn handle_openat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) 
         let mut path = [0u8; MAX_PATH_LEN];
         let path_len = extract_path(msg, 2, path.as_mut_ptr());
 
-        shell_dbg_maybe_track_pts0_open(path.as_ptr(), path_len, badge);
-        if shell_dbg_enabled(badge) {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS][SHELL] openat dirfd=");
-            lb.dec(dirfd as u64);
-            lb.str(b" path='");
-            lb.bytes(&path[..path_len as usize]);
-            lb.str(b"' flags=");
-            lb.hex(flags as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
-
         let start_ino = resolve_at_start(badge, dirfd, path.as_ptr(), path_len);
         if start_ino == 0 {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -2919,17 +2802,6 @@ unsafe fn handle_fstatat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
         let at_flags = (*msg).regs[1] as i32;
         let mut path = [0u8; MAX_PATH_LEN];
         let path_len = extract_path(msg, 2, path.as_mut_ptr());
-        if shell_dbg_enabled(badge) {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS][SHELL] fstatat dirfd=");
-            lb.dec(dirfd as u64);
-            lb.str(b" path='");
-            lb.bytes(&path[..path_len as usize]);
-            lb.str(b"' flags=");
-            lb.hex(at_flags as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
 
         let start_ino = resolve_at_start(badge, dirfd, path.as_ptr(), path_len);
         if start_ino == 0 && !((at_flags & AT_EMPTY_PATH_VAL) != 0 && path_len == 0) {
@@ -3590,14 +3462,6 @@ unsafe fn handle_pty_dev_read(
 /// Wakes pending PTY readers by collecting data from ttyd and forwarding to saved reply caps.
 unsafe fn handle_pty_notification(ntfn_badge: u64) {
     unsafe {
-        if PTY_NOTIFY_DEBUG_BUDGET > 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS][PTYN] badge=");
-            lb.hex(ntfn_badge);
-            lb.str(b"\n");
-            lb.flush();
-            PTY_NOTIFY_DEBUG_BUDGET -= 1;
-        }
         for pty_id in 0..MAX_PTYS {
             if ntfn_badge & (1u64 << pty_id) == 0 {
                 continue;
@@ -3620,22 +3484,6 @@ unsafe fn handle_pty_notification(ntfn_badge: u64) {
                 let cerr = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const creq, &raw mut creply);
 
                 let actual = creply.regs[0];
-                if PTY_NOTIFY_DEBUG_BUDGET > 0 {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[VFS][PTYN] pty=");
-                    lb.hex(pty_id as u64);
-                    lb.str(b" waiters=");
-                    lb.hex(PTY_PENDING_COUNT[pty_id] as u64);
-                    lb.str(b" call_err=");
-                    lb.hex(cerr as u64);
-                    lb.str(b" label=");
-                    lb.hex(creply.label);
-                    lb.str(b" actual=");
-                    lb.hex(actual);
-                    lb.str(b"\n");
-                    lb.flush();
-                    PTY_NOTIFY_DEBUG_BUDGET -= 1;
-                }
                 if actual == 0 {
                     break; // buffer drained
                 }
@@ -4555,9 +4403,6 @@ unsafe fn cleanup_client_state(dead_badge: u64) {
             }
         }
 
-        if SHELL_DEBUG_BADGE == dead_badge {
-            SHELL_DEBUG_BADGE = 0;
-        }
         (*cli) = ClientState::zeroed();
     }
 }
@@ -4577,13 +4422,6 @@ unsafe fn handle_client_exit(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
 unsafe fn handle_isatty(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
-        if shell_dbg_enabled(badge) {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS][SHELL] isatty fd=");
-            lb.dec(fd as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
         let cli = get_client(badge);
         if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
@@ -4613,13 +4451,6 @@ unsafe fn handle_isatty(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) 
 unsafe fn handle_tcgetattr(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
-        if shell_dbg_enabled(badge) {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS][SHELL] tcgetattr fd=");
-            lb.dec(fd as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
         let cli = get_client(badge);
         if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
@@ -4677,15 +4508,6 @@ unsafe fn handle_tcgetattr(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
 unsafe fn handle_tcsetattr(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
-        if shell_dbg_enabled(badge) {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS][SHELL] tcsetattr fd=");
-            lb.dec(fd as u64);
-            lb.str(b" action=");
-            lb.hex((*msg).regs[1]);
-            lb.str(b"\n");
-            lb.flush();
-        }
         let cli = get_client(badge);
         if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
@@ -5075,17 +4897,6 @@ unsafe fn handle_ioctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
         let fd = (*msg).regs[0] as i32;
         let request = (*msg).regs[1];
         let arg = (*msg).regs[2];
-        if shell_dbg_enabled(badge) {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS][SHELL] ioctl fd=");
-            lb.dec(fd as u64);
-            lb.str(b" req=");
-            lb.hex(request);
-            lb.str(b" arg=");
-            lb.hex(arg);
-            lb.str(b"\n");
-            lb.flush();
-        }
 
         let cli = get_client(badge);
         if cli.is_null() || fd < 0 || fd >= max_fds() as i32
@@ -5286,17 +5097,6 @@ unsafe fn handle_fcntl(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
         let fd = (*msg).regs[0] as i32;
         let cmd = (*msg).regs[1] as i32;
         let arg = (*msg).regs[2] as i64;
-        if shell_dbg_enabled(badge) {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS][SHELL] fcntl fd=");
-            lb.dec(fd as u64);
-            lb.str(b" cmd=");
-            lb.hex(cmd as u64);
-            lb.str(b" arg=");
-            lb.hex(arg as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
 
         let cli = get_client(badge);
         if cli.is_null() || fd < 0 || fd >= max_fds() as i32
@@ -6733,23 +6533,6 @@ pub extern "C" fn _start() -> ! {
     loop {
         let mut reply = SaltyMsg::zeroed();
         let mut skip_reply = false;
-        let shell_trace = shell_dbg_enabled(badge) && shell_dbg_label_traced(msg.label);
-        if shell_trace {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS][SHELL] <- l=");
-            lb.hex(msg.label);
-            lb.str(b" b=");
-            lb.hex(badge);
-            lb.str(b" r0=");
-            lb.hex(msg.regs[0]);
-            lb.str(b" r1=");
-            lb.hex(msg.regs[1]);
-            lb.str(b" r2=");
-            lb.hex(msg.regs[2]);
-            lb.str(b"\n");
-            lb.flush();
-        }
-
         // Check for bound notification wake-up (PTY data ready from ttyd).
         // Bound notifications have label=0 AND length=0; regular IPC with
         // length=0 (e.g. socketpair) will have label != 0.
@@ -6982,24 +6765,11 @@ pub extern "C" fn _start() -> ! {
                     skip_reply = true; // one-way PM_EXIT cleanup notification
                 }
                 _ => {
-                    { let mut lb = LineBuf::new(); lb.str(b"[VFS] unknown label="); lb.hex(msg.label); lb.str(b"\n"); lb.flush(); }
                     reply.label = SALTY_INVALID_OPERATION;
                 }
             }
         }
         } // close else block
-
-        if shell_trace {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS][SHELL] -> skip=");
-            lb.dec(skip_reply as u64);
-            lb.str(b" label=");
-            lb.hex(reply.label);
-            lb.str(b" r0=");
-            lb.hex(reply.regs[0]);
-            lb.str(b"\n");
-            lb.flush();
-        }
 
         let err = if skip_reply {
             unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) }

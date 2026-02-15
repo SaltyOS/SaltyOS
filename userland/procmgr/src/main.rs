@@ -147,10 +147,6 @@ const CHILD_CAP_EXPAND_NTFN: u64 = 9; // Minted notification for UT expansion si
 
 /// Procmgr's bound notification cap (for receiving UT expansion signals).
 static mut PM_BOUND_NTFN: Cap = 0;
-static mut PM_TRACE_BADGE: u64 = 0;
-static mut PM_TRACE_BUDGET: u32 = 256;
-static mut PM_WAIT_TRACE_BUDGET: u32 = 128;
-static mut PM_INJECT_DEBUG_BUDGET: u32 = 32;
 
 static mut ALLOCATOR: alloc::Allocator = alloc::Allocator::new();
 fn read_boot_info_initrd_size() -> usize {
@@ -201,17 +197,6 @@ fn strip_elf_suffix(name: &mut [u8], mut len: usize) -> usize {
         len -= 4;
     }
     len
-}
-
-fn path_basename(path: &[u8]) -> &[u8] {
-    let mut i = path.len();
-    while i > 0 {
-        if path[i - 1] == b'/' {
-            return &path[i..];
-        }
-        i -= 1;
-    }
-    path
 }
 
 /// Respawn a process by crafting a synthetic POSIX_PM_SPAWN message.
@@ -567,25 +552,6 @@ unsafe fn handle_wait(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) -> bool 
                     }
                 }
             }
-            if PM_TRACE_BADGE != 0 && badge == PM_TRACE_BADGE && PM_WAIT_TRACE_BUDGET > 0 {
-                PM_WAIT_TRACE_BUDGET -= 1;
-                let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR][WAIT] opt=");
-                lb.hex(options as u64);
-                lb.str(b" caller_pid=");
-                lb.hex(caller_pid as u64);
-                lb.str(b" children=");
-                lb.dec(child_count as u64);
-                lb.str(b" living=");
-                lb.dec(has_living as u64);
-                lb.str(b" zombie=");
-                lb.dec(zombie_idx.is_some() as u64);
-                lb.str(b" stopped=");
-                lb.dec(stopped_idx.is_some() as u64);
-                lb.str(b"\n");
-                lb.flush();
-            }
-
             if let Some(zi) = zombie_idx {
                 reply.label = SALTY_OK;
                 reply.length = 2;
@@ -703,16 +669,6 @@ unsafe fn handle_getpid(reply: &mut SaltyMsg, badge: u64) {
         reply.label = SALTY_NOT_FOUND;
         return;
     };
-    unsafe {
-        if PM_TRACE_BADGE != 0 && badge == PM_TRACE_BADGE && PM_TRACE_BUDGET > 0 {
-            PM_TRACE_BUDGET -= 1;
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR][TRACE] getpid->");
-            lb.hex(PROCTAB[idx].pid as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
-    }
     reply.label = SALTY_OK;
     reply.length = 1;
     reply.regs[0] = unsafe { PROCTAB[idx].pid as u64 };
@@ -723,16 +679,6 @@ unsafe fn handle_getppid(reply: &mut SaltyMsg, badge: u64) {
         reply.label = SALTY_NOT_FOUND;
         return;
     };
-    unsafe {
-        if PM_TRACE_BADGE != 0 && badge == PM_TRACE_BADGE && PM_TRACE_BUDGET > 0 {
-            PM_TRACE_BUDGET -= 1;
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR][TRACE] getppid->");
-            lb.hex(PROCTAB[idx].ppid as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
-    }
     reply.label = SALTY_OK;
     reply.length = 1;
     reply.regs[0] = unsafe { PROCTAB[idx].ppid as u64 };
@@ -995,20 +941,6 @@ unsafe fn handle_inject_cap(msg: &SaltyMsg, reply: &mut SaltyMsg) {
             return;
         }
 
-        if PM_INJECT_DEBUG_BUDGET > 0 {
-            let probe = salty::syscall::syscall(salty::SYS_SIGNAL, CAP_RECV_SCRATCH, 0, 0, 0, 0, 0);
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR][INJECT] pid=");
-            lb.hex(pid as u64);
-            lb.str(b" dst=");
-            lb.hex(dst_slot);
-            lb.str(b" probe_sig_err=");
-            lb.hex(probe.error);
-            lb.str(b"\n");
-            lb.flush();
-            PM_INJECT_DEBUG_BUDGET -= 1;
-        }
-
         // Cap was received at CAP_RECV_SCRATCH via IPC cap transfer.
         // Move it into the child slot so the scratch slot is freed for the
         // next injected cap in the same boot sequence.
@@ -1016,14 +948,6 @@ unsafe fn handle_inject_cap(msg: &SaltyMsg, reply: &mut SaltyMsg) {
             child_cn, dst_slot,
             CAP_SELF_CSPACE, CAP_RECV_SCRATCH,
         );
-        if PM_INJECT_DEBUG_BUDGET > 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR][INJECT] copy_err=");
-            lb.hex(err as u64);
-            lb.str(b"\n");
-            lb.flush();
-            PM_INJECT_DEBUG_BUDGET -= 1;
-        }
         reply.label = if err == 0 { SALTY_OK } else { SALTY_INVALID_OPERATION };
     }
 }
@@ -1152,16 +1076,8 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
 
         // Walk parent VSpace again and copy pages
         let mut walk_start: u64 = 0;
-        let mut total_pages = 0u64;
-        let mut cow_shared_pages = 0u64;
         let child_entry_page = child_entry & !0xFFFu64;
         let mut child_entry_path: u64 = 0;
-        let mut skipped_ipc_pages = 0u64;
-        let mut skipped_initrd_pages = 0u64;
-        let mut first_skipped_initrd = 0u64;
-        let mut last_skipped_initrd = 0u64;
-        let mut max_seen_page = 0u64;
-        let mut max_cloned_page = 0u64;
 
         loop {
             let err = salty::invoke::vspace_walk(parent_vs, walk_start, 6);
@@ -1173,24 +1089,15 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
 
             for i in 0..count as usize {
                 let page_vaddr = core::ptr::read_volatile(ipc.add(2 + i * 3));
-                if page_vaddr > max_seen_page {
-                    max_seen_page = page_vaddr;
-                }
                 if page_vaddr == parent_layout.ipc_buf.base {
-                    skipped_ipc_pages += 1;
                     continue;
                 }
 
-                // Skip initrd window pages — child doesn't need them after fork
+                // Skip initrd window pages -- child doesn't need them after fork
                 if parent_layout.initrd.size > 0
                     && page_vaddr >= initrd_base
                     && page_vaddr < initrd_end
                 {
-                    skipped_initrd_pages += 1;
-                    if first_skipped_initrd == 0 {
-                        first_skipped_initrd = page_vaddr;
-                    }
-                    last_skipped_initrd = page_vaddr;
                     continue;
                 }
 
@@ -1216,45 +1123,12 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                 if page_vaddr == child_entry_page {
                     child_entry_path = 3; // COW clone
                 }
-                if page_vaddr > max_cloned_page {
-                    max_cloned_page = page_vaddr;
-                }
-                cow_shared_pages += 1;
-                total_pages += 1;
             }
 
             if next_addr == 0 { break; }
             walk_start = next_addr;
         }
 
-        { let mut lb = LineBuf::new();
-        lb.str(b"[PROCMGR] FORK: mapped "); lb.hex(total_pages); lb.str(b" pages\n"); lb.flush(); }
-        { let mut lb = LineBuf::new();
-        lb.str(b"[PROCMGR] FORK: cow_shared="); lb.hex(cow_shared_pages);
-        lb.str(b"\n"); lb.flush(); }
-        { let mut lb = LineBuf::new();
-        lb.str(b"[PROCMGR] FORK: child_entry_page="); lb.hex(child_entry_page);
-        lb.str(b" path="); lb.hex(child_entry_path);
-        lb.str(b"\n"); lb.flush(); }
-        { let mut lb = LineBuf::new();
-        lb.str(b"[PROCMGR] FORK: seen_max="); lb.hex(max_seen_page);
-        lb.str(b" cloned_max="); lb.hex(max_cloned_page);
-        lb.str(b" skip_ipc="); lb.hex(skipped_ipc_pages);
-        lb.str(b" skip_initrd="); lb.hex(skipped_initrd_pages);
-        lb.str(b"\n"); lb.flush(); }
-        if skipped_initrd_pages > 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] FORK: skip_initrd_range first=");
-            lb.hex(first_skipped_initrd);
-            lb.str(b" last=");
-            lb.hex(last_skipped_initrd);
-            lb.str(b" initrd_base=");
-            lb.hex(parent_layout.initrd.base);
-            lb.str(b" initrd_size=");
-            lb.hex(parent_layout.initrd.size);
-            lb.str(b"\n");
-            lb.flush();
-        }
         if child_entry_path != 3 {
             puts(b"[PROCMGR] FORK: child entry page missing after COW clone\n");
             alloc.rollback();
@@ -1279,12 +1153,10 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         let child_ut_slot = {
             let mut bits = CHILD_UT_BITS_DEFAULT;
             let mut result: Option<Cap> = None;
-            let mut selected_bits: u8 = 0;
             while bits >= CHILD_UT_BITS_MIN {
                 match alloc.realize_object(OBJ_UNTYPED, bits as u64) {
                     Ok(s) => {
                         result = Some(s);
-                        selected_bits = bits;
                         break;
                     }
                     Err(_) => {
@@ -1293,14 +1165,7 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                 }
             }
             match result {
-                Some(s) => {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[PROCMGR] FORK: child untyped bits=2^");
-                    lb.hex(selected_bits as u64);
-                    lb.str(b"\n");
-                    lb.flush();
-                    s
-                }
+                Some(s) => s,
                 None => {
                     puts(b"[PROCMGR] FORK: child untyped unavailable\n");
                     alloc.rollback();
@@ -1519,56 +1384,6 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         lb.str(b" envc="); lb.hex(envc as u64);
         lb.str(b"\n");
         lb.flush(); }
-        if bytes_eq(path_basename(&name[..name_len]), b"bash") {
-            PM_TRACE_BADGE = badge;
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] tracing badge=");
-            lb.hex(badge);
-            lb.str(b" (bash)\n");
-            lb.flush();
-
-            // Dump argv/envp as parsed from exec payload to verify shell mode.
-            let mut pos = 0usize;
-            for ai in 0..argc {
-                if pos >= exec_str_len {
-                    break;
-                }
-                let start = pos;
-                while pos < exec_str_len && exec_str_data[pos] != 0 {
-                    pos += 1;
-                }
-                let mut ab = LineBuf::new();
-                ab.str(b"[PROCMGR][BASH_ARG] i=");
-                ab.dec(ai as u64);
-                ab.str(b" v='");
-                ab.bytes(&exec_str_data[start..pos]);
-                ab.str(b"'\n");
-                ab.flush();
-                if pos < exec_str_len {
-                    pos += 1;
-                }
-            }
-            for ei in 0..envc {
-                if pos >= exec_str_len {
-                    break;
-                }
-                let start = pos;
-                while pos < exec_str_len && exec_str_data[pos] != 0 {
-                    pos += 1;
-                }
-                let mut eb = LineBuf::new();
-                eb.str(b"[PROCMGR][BASH_ENV] i=");
-                eb.dec(ei as u64);
-                eb.str(b" v='");
-                eb.bytes(&exec_str_data[start..pos]);
-                eb.str(b"'\n");
-                eb.flush();
-                if pos < exec_str_len {
-                    pos += 1;
-                }
-            }
-        }
-
         let initrd = INITRD_VADDR as *const u8;
         let initrd_size = read_boot_info_initrd_size();
 
@@ -2717,21 +2532,6 @@ pub extern "C" fn _start() -> ! {
         loop {
             let mut reply = SaltyMsg::zeroed();
             let mut skip_reply = false;
-            if PM_TRACE_BADGE != 0 && badge == PM_TRACE_BADGE && msg.label != 0 && PM_TRACE_BUDGET > 0 {
-                PM_TRACE_BUDGET -= 1;
-                let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR][TRACE] l=");
-                lb.hex(msg.label);
-                lb.str(b" b=");
-                lb.hex(badge);
-                lb.str(b" r0=");
-                lb.hex(msg.regs[0]);
-                lb.str(b" r1=");
-                lb.hex(msg.regs[1]);
-                lb.str(b"\n");
-                lb.flush();
-            }
-
             // Bound notification delivery: label=0 and badge!=0 means the
             // kernel delivered a notification word instead of an IPC message.
             // Process UT expansion requests encoded as badge bits.
