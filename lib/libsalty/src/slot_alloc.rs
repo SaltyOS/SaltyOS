@@ -266,14 +266,70 @@ pub fn slot_alloc_async() -> SlotResult {
     }
 }
 
-/// Allocate a single CNode slot from the pool (sync wrapper).
+/// Allocate a single CNode slot from the pool (synchronous path).
 ///
 /// Returns the absolute CNode slot index, or `None` if the pool is exhausted
-/// or expansion would block.
+/// or a blocking CSpace expansion request fails.
 pub fn slot_alloc() -> Option<Cap> {
-    match slot_alloc_async() {
-        SlotResult::Ok(cap) => Some(cap),
-        _ => None,
+    unsafe {
+        let state = &mut *(&raw mut SLOT_ALLOC);
+        if !state.initialized {
+            return None;
+        }
+
+        // Fast path: allocate from existing segments.
+        while state.active_seg < state.seg_count {
+            let seg = &mut state.segments[state.active_seg];
+            if seg.next < seg.count {
+                let slot = seg.base + seg.next;
+                seg.next += 1;
+                return Some(slot);
+            }
+            state.active_seg += 1;
+        }
+
+        // Slow path: perform a blocking CSpace expansion request.
+        let ep = if state.procmgr_ep != 0 {
+            state.procmgr_ep
+        } else {
+            CAP_PROCMGR_EP
+        };
+        let (base, count) = request_expand_blocking(ep)?;
+        if state.seg_count >= MAX_SEGMENTS {
+            state.expand_state = ExpandState::Failed;
+            return None;
+        }
+
+        let si = state.seg_count;
+        state.segments[si] = Segment {
+            base,
+            count,
+            next: 0,
+        };
+        state.seg_count += 1;
+        state.active_seg = si;
+        state.expand_state = ExpandState::Idle;
+        update_expansion_depth(state);
+
+        {
+            let mut lb = serial::LineBuf::new();
+            lb.str(b"[SLOT] expand(sync): base=");
+            lb.hex(base);
+            lb.str(b" count=");
+            lb.hex(count);
+            lb.str(b" (seg ");
+            lb.hex(si as u64);
+            lb.str(b")\n");
+            lb.flush();
+        }
+
+        let seg = &mut state.segments[si];
+        if seg.next >= seg.count {
+            return None;
+        }
+        let slot = seg.base + seg.next;
+        seg.next += 1;
+        Some(slot)
     }
 }
 
@@ -505,5 +561,52 @@ fn collect_expand_result(ep: Cap) -> CollectResult {
         } else {
             CollectResult::Error
         }
+    }
+}
+
+/// Perform blocking PM_EXPAND_CSPACE Call and return the new segment.
+fn request_expand_blocking(ep: Cap) -> Option<(Cap, u64)> {
+    unsafe {
+        let mut msg = crate::types::SaltyMsg::zeroed();
+        let mut reply = crate::types::SaltyMsg::zeroed();
+        msg.label = POSIX_PM_EXPAND_CSPACE;
+        msg.length = 1;
+        msg.regs[0] = SLOT_EXPAND_BITS_DEFAULT;
+
+        let err = ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            ep,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK || reply.length < 2 {
+            return None;
+        }
+
+        let base = reply.regs[0];
+        let count = reply.regs[1];
+        if base == 0 || count == 0 {
+            None
+        } else {
+            Some((base, count))
+        }
+    }
+}
+
+/// Cache the expanded CSpace depth used by depth-aware invoke helpers.
+fn update_expansion_depth(state: &mut SlotAllocState) {
+    if state.root_bits == 0 {
+        let info = invoke::cnode_get_info(CAP_SELF_CSPACE);
+        if info.error == 0 {
+            unsafe {
+                let ctx = &raw const crate::__salty_ipc_ctx;
+                if !(*ctx).ipc_buffer.is_null() {
+                    state.root_bits = (*(*ctx).ipc_buffer).msg[2] as u8;
+                }
+            }
+        }
+    }
+    if state.root_bits > 0 {
+        state.expanded_depth = state.root_bits + SLOT_EXPAND_BITS_DEFAULT as u8;
     }
 }

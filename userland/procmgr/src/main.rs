@@ -111,11 +111,6 @@ const AT_SALTY_SLOT_BASE: u64 = 0x1007;
 const AT_SALTY_SLOT_COUNT: u64 = 0x1008;
 const AT_SALTY_EXPAND_EP: u64 = 0x1009;
 
-// ---- x86_64 page-table bits ----
-const X86_PTE_WRITABLE: u64 = 1 << 1;
-const X86_PTE_COW: u64 = 1 << 9;
-const X86_PTE_NX: u64 = 1 << 63;
-
 // ---- waitpid options ----
 const WNOHANG: u32 = 1;
 const WUNTRACED: u32 = 2;
@@ -1067,21 +1062,9 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
 
         let parent_rsp = msg.regs[0];
         let child_entry = msg.regs[1];
-        let saved_rbp = msg.regs[2];
-        let saved_rbx = msg.regs[3];
-        let saved_r12 = msg.regs[4];
-        let saved_r13 = msg.regs[5];
-        let saved_r14 = msg.regs[6];
-        let saved_r15 = msg.regs[7];
-        let return_rip = msg.regs[8];
 
-        if child_entry == 0 || return_rip == 0 {
+        if child_entry == 0 {
             reply.label = SALTY_INVALID_ARGUMENT;
-            return;
-        }
-        if (parent_rsp & 0xFFF) > (4096 - 56) {
-            puts(b"[PROCMGR] FORK: parent stack frame crosses page boundary\n");
-            reply.label = SALTY_INVALID_OPERATION;
             return;
         }
 
@@ -1096,25 +1079,8 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         let parent_shared_base = PROCTAB[parent_idx].shared_lib_base;
         let parent_lib_map = PROCTAB[parent_idx].lib_map;
         let parent_layout = PROCTAB[parent_idx].layout;
-        let initrd_size = read_boot_info_initrd_size() as u64;
-        let mut initrd_phys_base = 0u64;
-        let mut initrd_phys_end = 0u64;
-        if initrd_size != 0 && parent_layout.initrd.size > 0 {
-            let err = salty::invoke::vspace_walk(parent_vs, parent_layout.initrd.base, 1);
-            if err == 0 {
-                let ipc = IPC_BUF_VADDR as *const u64;
-                let count = core::ptr::read_volatile(ipc);
-                if count != 0 {
-                    let vaddr = core::ptr::read_volatile(ipc.add(2));
-                    let phys = core::ptr::read_volatile(ipc.add(3));
-                    if vaddr == parent_layout.initrd.base {
-                        initrd_phys_base = phys;
-                        initrd_phys_end = phys + ((initrd_size + 0xFFF) & !0xFFF);
-                    }
-                }
-            }
-        }
-
+        let initrd_base = parent_layout.initrd.base;
+        let initrd_end = parent_layout.initrd.base.saturating_add(parent_layout.initrd.size);
         { let mut lb = LineBuf::new();
         lb.str(b"[PROCMGR] FORK from PID="); lb.hex(parent_pid as u64); lb.str(b"\n"); lb.flush(); }
 
@@ -1128,7 +1094,7 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         NEXT_PID += 1;
 
         // Count parent pages as an upper bound for reservation sizing
-        // (skip IPC buf, initrd window pages, and shared lib RO cache pages).
+        // (skip IPC buf and initrd window pages).
         let mut page_count: usize = 0;
         {
             let mut walk_start: u64 = 0;
@@ -1142,8 +1108,12 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                 for i in 0..count as usize {
                     let page_vaddr = core::ptr::read_volatile(ipc.add(2 + i * 3));
                     if page_vaddr == parent_layout.ipc_buf.base { continue; }
-                    if parent_layout.initrd.size > 0 && page_vaddr >= parent_layout.initrd.base { continue; }
-                    if spawn_tx::lookup_shared_lib_page(page_vaddr, &parent_lib_map).is_some() { continue; }
+                    if parent_layout.initrd.size > 0
+                        && page_vaddr >= initrd_base
+                        && page_vaddr < initrd_end
+                    {
+                        continue;
+                    }
                     page_count += 1;
                 }
                 if next_addr == 0 { break; }
@@ -1183,8 +1153,15 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         // Walk parent VSpace again and copy pages
         let mut walk_start: u64 = 0;
         let mut total_pages = 0u64;
-        let rsp_page_vaddr = parent_rsp & !0xFFFu64;
-        let mut rsp_frame: Cap = 0;
+        let mut cow_shared_pages = 0u64;
+        let child_entry_page = child_entry & !0xFFFu64;
+        let mut child_entry_path: u64 = 0;
+        let mut skipped_ipc_pages = 0u64;
+        let mut skipped_initrd_pages = 0u64;
+        let mut first_skipped_initrd = 0u64;
+        let mut last_skipped_initrd = 0u64;
+        let mut max_seen_page = 0u64;
+        let mut max_cloned_page = 0u64;
 
         loop {
             let err = salty::invoke::vspace_walk(parent_vs, walk_start, 6);
@@ -1196,93 +1173,53 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
 
             for i in 0..count as usize {
                 let page_vaddr = core::ptr::read_volatile(ipc.add(2 + i * 3));
-                let page_phys = core::ptr::read_volatile(ipc.add(2 + i * 3 + 1));
-                let page_flags = core::ptr::read_volatile(ipc.add(2 + i * 3 + 2));
-                if page_vaddr == parent_layout.ipc_buf.base { continue; }
-
-                // Skip initrd window pages — child doesn't need them after fork
-                if parent_layout.initrd.size > 0 && page_vaddr >= parent_layout.initrd.base { continue; }
-
-                // Share cached lib RO pages instead of copying
-                if let Some((cached_cap, cached_flags)) =
-                    spawn_tx::lookup_shared_lib_page(page_vaddr, &parent_lib_map)
-                {
-                    let err = salty::invoke::vspace_map(child_vs, cached_cap, page_vaddr, cached_flags);
-                    if err != 0 {
-                        let mut lb = LineBuf::new();
-                        lb.str(b"[PROCMGR] FORK: shared lib map failed at "); lb.hex(page_vaddr);
-                        lb.str(b" err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
-                        alloc.rollback();
-                        reply.label = SALTY_OUT_OF_MEMORY;
-                        return;
-                    }
-                    total_pages += 1;
+                if page_vaddr > max_seen_page {
+                    max_seen_page = page_vaddr;
+                }
+                if page_vaddr == parent_layout.ipc_buf.base {
+                    skipped_ipc_pages += 1;
                     continue;
                 }
 
-                // Preserve initrd-backed immutable pages as device mappings.
-                if initrd_phys_end > initrd_phys_base
-                    && (page_flags & X86_PTE_WRITABLE) == 0
-                    && page_phys >= initrd_phys_base
-                    && page_phys < initrd_phys_end
+                // Skip initrd window pages — child doesn't need them after fork
+                if parent_layout.initrd.size > 0
+                    && page_vaddr >= initrd_base
+                    && page_vaddr < initrd_end
                 {
-                    let mut map_flags = VSPACE_FLAG_USER;
-                    if page_flags & X86_PTE_NX == 0 { map_flags |= VSPACE_FLAG_EXECUTABLE; }
-                    let dev_off = page_phys - initrd_phys_base;
-                    let derr = salty::invoke::vspace_map_device(
-                        child_vs,
-                        CAP_INITRD_UNTYPED,
-                        dev_off,
-                        page_vaddr,
-                        map_flags,
-                    );
-                    if derr == 0 {
-                        total_pages += 1;
-                        continue;
+                    skipped_initrd_pages += 1;
+                    if first_skipped_initrd == 0 {
+                        first_skipped_initrd = page_vaddr;
                     }
+                    last_skipped_initrd = page_vaddr;
+                    continue;
                 }
 
-                // Policy: keep fork on eager copy path for now.
-                // COW path currently reproduces child-start corruption at RIP=0x3484ac
-                // under interactive shell exec workloads.
-
-                let copied_frame = match alloc.realize_object(OBJ_FRAME, 0) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        puts(b"[PROCMGR] FORK: frame retype failed\n");
-                        alloc.rollback();
-                        reply.label = SALTY_OUT_OF_MEMORY;
-                        return;
-                    }
-                };
-
-                let err = salty::invoke::vspace_copy_page(parent_vs, page_vaddr, copied_frame);
-                if err != 0 {
+                let cerr = salty::invoke::vspace_clone_cow_page(
+                    parent_vs,
+                    page_vaddr,
+                    child_vs,
+                    page_vaddr,
+                );
+                if cerr != 0 {
                     let mut lb = LineBuf::new();
-                    lb.str(b"[PROCMGR] FORK: copy_page failed at "); lb.hex(page_vaddr);
-                    lb.str(b" err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
+                    lb.str(b"[PROCMGR] FORK: clone_cow failed at ");
+                    lb.hex(page_vaddr);
+                    lb.str(b" err=");
+                    lb.hex(cerr as u64);
+                    lb.str(b"\n");
+                    lb.flush();
                     alloc.rollback();
                     reply.label = SALTY_INVALID_OPERATION;
                     return;
                 }
 
-                let mut map_flags = VSPACE_FLAG_USER;
-                if page_flags & X86_PTE_WRITABLE != 0 || page_flags & X86_PTE_COW != 0 {
-                    map_flags |= VSPACE_FLAG_WRITABLE;
+                if page_vaddr == child_entry_page {
+                    child_entry_path = 3; // COW clone
                 }
-                if page_flags & X86_PTE_NX == 0 { map_flags |= VSPACE_FLAG_EXECUTABLE; }
-
-                let err = salty::invoke::vspace_map(child_vs, copied_frame, page_vaddr, map_flags);
-                if err != 0 {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[PROCMGR] FORK: child map failed at "); lb.hex(page_vaddr);
-                    lb.str(b" err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
-                    alloc.rollback();
-                    reply.label = SALTY_OUT_OF_MEMORY;
-                    return;
+                if page_vaddr > max_cloned_page {
+                    max_cloned_page = page_vaddr;
                 }
-
-                if page_vaddr == rsp_page_vaddr { rsp_frame = copied_frame; }
+                cow_shared_pages += 1;
                 total_pages += 1;
             }
 
@@ -1292,37 +1229,38 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
 
         { let mut lb = LineBuf::new();
         lb.str(b"[PROCMGR] FORK: mapped "); lb.hex(total_pages); lb.str(b" pages\n"); lb.flush(); }
-
-        if rsp_frame == 0 {
-            puts(b"[PROCMGR] FORK: parent RSP page not mapped in child\n");
+        { let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] FORK: cow_shared="); lb.hex(cow_shared_pages);
+        lb.str(b"\n"); lb.flush(); }
+        { let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] FORK: child_entry_page="); lb.hex(child_entry_page);
+        lb.str(b" path="); lb.hex(child_entry_path);
+        lb.str(b"\n"); lb.flush(); }
+        { let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] FORK: seen_max="); lb.hex(max_seen_page);
+        lb.str(b" cloned_max="); lb.hex(max_cloned_page);
+        lb.str(b" skip_ipc="); lb.hex(skipped_ipc_pages);
+        lb.str(b" skip_initrd="); lb.hex(skipped_initrd_pages);
+        lb.str(b"\n"); lb.flush(); }
+        if skipped_initrd_pages > 0 {
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] FORK: skip_initrd_range first=");
+            lb.hex(first_skipped_initrd);
+            lb.str(b" last=");
+            lb.hex(last_skipped_initrd);
+            lb.str(b" initrd_base=");
+            lb.hex(parent_layout.initrd.base);
+            lb.str(b" initrd_size=");
+            lb.hex(parent_layout.initrd.size);
+            lb.str(b"\n");
+            lb.flush();
+        }
+        if child_entry_path != 3 {
+            puts(b"[PROCMGR] FORK: child entry page missing after COW clone\n");
             alloc.rollback();
             reply.label = SALTY_INVALID_OPERATION;
             return;
         }
-
-        // Reconstruct fork trampoline frame on child stack
-        let err = salty::invoke::vspace_map(
-            CAP_SELF_VSPACE, rsp_frame, PROCMGR_SCRATCH_VADDR,
-            VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
-        );
-        if err != 0 {
-            puts(b"[PROCMGR] FORK: stack scratch map failed\n");
-            alloc.rollback();
-            reply.label = SALTY_OUT_OF_MEMORY;
-            return;
-        }
-        {
-            let off = (parent_rsp - rsp_page_vaddr) as usize;
-            let saved = (PROCMGR_SCRATCH_VADDR + off as u64) as *mut u64;
-            core::ptr::write_volatile(saved.add(0), saved_r15);
-            core::ptr::write_volatile(saved.add(1), saved_r14);
-            core::ptr::write_volatile(saved.add(2), saved_r13);
-            core::ptr::write_volatile(saved.add(3), saved_r12);
-            core::ptr::write_volatile(saved.add(4), saved_rbx);
-            core::ptr::write_volatile(saved.add(5), saved_rbp);
-            core::ptr::write_volatile(saved.add(6), return_rip);
-        }
-        salty::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
 
         // Map IPC buffer in child
         let err = salty::invoke::vspace_map(
@@ -2327,7 +2265,7 @@ unsafe fn handle_expand_cspace(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64)
         reply.label = SALTY_INVALID_OPERATION;
         return;
     }
-    let (root_num_slots, root_size_bits) = unsafe {
+    let (root_num_slots, _root_size_bits) = unsafe {
         let ctx = &*ipc_ctx();
         let buf = &*ctx.ipc_buffer;
         (buf.msg[3], buf.msg[2])
@@ -2337,20 +2275,15 @@ unsafe fn handle_expand_cspace(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64)
     // at the first free one.
     let mut target_slot: u64 = u64::MAX;
 
-    // Retype a new CNode from this child's dedicated untyped into a
-    // procmgr-local temp slot.
-    let proc_slot_base = unsafe { PROCTAB[ci].slot_base };
-    let child_ut = if proc_slot_base != 0 { proc_slot_base + 7 } else { 0 };
-    if child_ut == 0 {
-        reply.label = SALTY_INVALID_OPERATION;
-        return;
-    }
+    // Retype a new sub-CNode into a procmgr-local temp slot.
+    // Use allocator-wide untyped sources instead of a per-child dedicated
+    // untyped so expansion keeps working after child-local UT depletion.
     let temp_slot = match unsafe { (&mut *(&raw mut ALLOCATOR)).alloc_single_slot() } {
         Some(s) => s,
         None => { reply.label = SALTY_OUT_OF_MEMORY; return; }
     };
 
-    let err = salty::invoke::untyped_retype(child_ut, OBJ_CNODE, size_bits, temp_slot);
+    let err = unsafe { (&mut *(&raw mut ALLOCATOR)).retype_any(OBJ_CNODE, size_bits, temp_slot) };
     if err != 0 {
         unsafe { (&mut *(&raw mut ALLOCATOR)).free_single_slot(temp_slot) };
         reply.label = SALTY_OUT_OF_MEMORY;
@@ -2431,21 +2364,10 @@ unsafe fn handle_expand_cspace_async(msg: &SaltyMsg, badge: u64) {
         if info.error != 0 {
             return;
         }
-        let (root_num_slots, root_size_bits) = {
+        let (root_num_slots, _root_size_bits) = {
             let ctx = &*ipc_ctx();
             let buf = &*ctx.ipc_buffer;
             (buf.msg[3], buf.msg[2])
-        };
-
-        // Determine child untyped: init-registered uses child_ut_cap,
-        // procmgr-spawned uses slot_base + 7
-        let proc_slot_base = PROCTAB[ci].slot_base;
-        let child_ut = if PROCTAB[ci].child_ut_cap != 0 {
-            PROCTAB[ci].child_ut_cap
-        } else if proc_slot_base != 0 {
-            proc_slot_base + 7
-        } else {
-            return;
         };
 
         let temp_slot = match (&mut *(&raw mut ALLOCATOR)).alloc_single_slot() {
@@ -2453,7 +2375,7 @@ unsafe fn handle_expand_cspace_async(msg: &SaltyMsg, badge: u64) {
             None => return,
         };
 
-        let err = salty::invoke::untyped_retype(child_ut, OBJ_CNODE, size_bits, temp_slot);
+        let err = (&mut *(&raw mut ALLOCATOR)).retype_any(OBJ_CNODE, size_bits, temp_slot);
         if err != 0 {
             (&mut *(&raw mut ALLOCATOR)).free_single_slot(temp_slot);
             return;

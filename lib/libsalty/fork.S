@@ -27,10 +27,15 @@ posix_fork:
     pushq   %r14
     pushq   %r15
 
+    /* Keep SysV stack alignment (16-byte) across the call.
+     * Entry RSP is 8 mod 16; after six pushes it's still 8 mod 16. */
+    subq    $8, %rsp
+
     /* Call _posix_fork_impl(saved_rsp, child_entry) */
-    movq    %rsp, %rdi              /* arg0 = current RSP (after pushes) */
+    leaq    8(%rsp), %rdi           /* arg0 = saved RSP (after pushes) */
     leaq    fork_child_entry(%rip), %rsi  /* arg1 = child entry address */
     call    _posix_fork_impl@PLT
+    addq    $8, %rsp
 
     /* Parent returns here with child PID in %eax (or -1 on error) */
     popq    %r15

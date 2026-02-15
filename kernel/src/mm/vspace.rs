@@ -31,6 +31,22 @@ const MAX_VSPACES: usize = 256;
 
 /// Maximum number of deferred free entries
 const MAX_DEFERRED: usize = 256;
+static COW_DEBUG_CLONE_BUDGET: AtomicU32 = AtomicU32::new(0);
+static COW_DEBUG_FAULT_BUDGET: AtomicU32 = AtomicU32::new(16);
+
+#[inline]
+fn take_debug_ticket(budget: &AtomicU32) -> bool {
+    loop {
+        let cur = budget.load(Ordering::Relaxed);
+        if cur == 0 {
+            return false;
+        }
+        if budget.compare_exchange_weak(cur, cur - 1, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+        {
+            return true;
+        }
+    }
+}
 
 /// VSpaceTracking pool - static allocation, no heap
 ///
@@ -1122,13 +1138,14 @@ impl VSpace {
 
             // Clear the entry
             self.write_entry(virt, 1, 0)?;
-            super::release_frame_mapping(phys);
 
-            // Local TLB flush
+            // TLB invalidation BEFORE refcount release: remote CPUs may still
+            // cache the stale entry. Flush first so no CPU can access the frame
+            // via stale TLB after we drop the mapping reference.
             crate::arch::x86_64::paging::invlpg(virt);
-
-            // Remote TLB shootdown
             self.tlb_shootdown(virt);
+
+            super::release_frame_mapping(phys);
 
             Ok(())
         })();
@@ -1197,6 +1214,25 @@ impl VSpace {
             crate::arch::x86_64::paging::invlpg(dst_vaddr);
             dst.tlb_shootdown(dst_vaddr);
 
+            if take_debug_ticket(&COW_DEBUG_CLONE_BUDGET) {
+                let (mr, orf, rec) = super::debug_frame_state(phys);
+                crate::serial_puts_raw("[COW][CLONE] src=");
+                crate::serial_hex_raw(src_vaddr);
+                crate::serial_puts_raw(" dst=");
+                crate::serial_hex_raw(dst_vaddr);
+                crate::serial_puts_raw(" phys=");
+                crate::serial_hex_raw(phys);
+                crate::serial_puts_raw(" flags=");
+                crate::serial_hex_raw(shared_flags);
+                crate::serial_puts_raw(" map_refs=");
+                crate::serial_hex_raw(mr as u64);
+                crate::serial_puts_raw(" obj_refs=");
+                crate::serial_hex_raw(orf as u64);
+                crate::serial_puts_raw(" reclaimable=");
+                crate::serial_hex_raw(rec as u64);
+                crate::serial_puts_raw("\n");
+            }
+
             Ok(())
         })();
 
@@ -1242,6 +1278,12 @@ impl VSpace {
             let old_phys = entry & ENTRY_ADDR_MASK;
             let new_phys = alloc_frame().ok_or(VSpaceError::OutOfMemory)?;
 
+            let old_before = if take_debug_ticket(&COW_DEBUG_FAULT_BUDGET) {
+                Some(super::debug_frame_state(old_phys))
+            } else {
+                None
+            };
+
             unsafe {
                 let src = phys_to_virt(old_phys) as *const u8;
                 let dst = phys_to_virt(new_phys) as *mut u8;
@@ -1257,11 +1299,43 @@ impl VSpace {
                 return Err(VSpaceError::NotMapped);
             }
 
+            // TLB invalidation BEFORE refcount release: remote CPUs may still
+            // cache the stale read-only entry pointing to old_phys.
+            crate::arch::x86_64::paging::invlpg(page_vaddr);
+            self.tlb_shootdown(page_vaddr);
+
             super::retain_frame_mapping(new_phys);
             super::release_frame_mapping(old_phys);
 
-            crate::arch::x86_64::paging::invlpg(page_vaddr);
-            self.tlb_shootdown(page_vaddr);
+            if let Some((old_mr_before, old_or_before, old_rec_before)) = old_before {
+                let (old_mr_after, old_or_after, old_rec_after) = super::debug_frame_state(old_phys);
+                let (new_mr_after, new_or_after, new_rec_after) = super::debug_frame_state(new_phys);
+                crate::serial_puts_raw("[COW][FAULT] vaddr=");
+                crate::serial_hex_raw(page_vaddr);
+                crate::serial_puts_raw(" old=");
+                crate::serial_hex_raw(old_phys);
+                crate::serial_puts_raw(" new=");
+                crate::serial_hex_raw(new_phys);
+                crate::serial_puts_raw(" old_mr ");
+                crate::serial_hex_raw(old_mr_before as u64);
+                crate::serial_puts_raw("->");
+                crate::serial_hex_raw(old_mr_after as u64);
+                crate::serial_puts_raw(" old_or ");
+                crate::serial_hex_raw(old_or_before as u64);
+                crate::serial_puts_raw("->");
+                crate::serial_hex_raw(old_or_after as u64);
+                crate::serial_puts_raw(" old_rec ");
+                crate::serial_hex_raw(old_rec_before as u64);
+                crate::serial_puts_raw("->");
+                crate::serial_hex_raw(old_rec_after as u64);
+                crate::serial_puts_raw(" new_mr=");
+                crate::serial_hex_raw(new_mr_after as u64);
+                crate::serial_puts_raw(" new_or=");
+                crate::serial_hex_raw(new_or_after as u64);
+                crate::serial_puts_raw(" new_rec=");
+                crate::serial_hex_raw(new_rec_after as u64);
+                crate::serial_puts_raw("\n");
+            }
 
             Ok(true)
         })();

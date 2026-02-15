@@ -374,6 +374,8 @@ pub extern "C" fn salty_irq_handler_set_notification(irq_handler: Cap, ntfn: Cap
 // C ABI exports: Fork helper (called from fork.S)
 // ---------------------------------------------------------------------------
 
+static mut FORK_STACK_CHECK_BUDGET: u32 = 8;
+
 /// Fork implementation called from the `fork.S` assembly trampoline.
 ///
 /// `saved_rsp` points to a stack frame containing callee-saved registers
@@ -389,6 +391,10 @@ pub extern "C" fn _posix_fork_impl(saved_rsp: u64, child_entry: u64) -> i32 {
 
     unsafe {
         let saved = saved_rsp as *const u64;
+        let mut before = [0u64; 7];
+        for (i, slot) in before.iter_mut().enumerate() {
+            *slot = *saved.add(i);
+        }
 
         let mut msg = SaltyMsg::zeroed();
         let mut reply = SaltyMsg::zeroed();
@@ -412,6 +418,27 @@ pub extern "C" fn _posix_fork_impl(saved_rsp: u64, child_entry: u64) -> i32 {
         );
         if err != 0 || reply.label != SALTY_OK {
             return -1;
+        }
+
+        if FORK_STACK_CHECK_BUDGET > 0 {
+            for (i, was) in before.iter().enumerate() {
+                let now = *saved.add(i);
+                if now != *was {
+                    let mut lb = serial::LineBuf::new();
+                    lb.str(b"[FORKCHK] parent stack changed idx=");
+                    lb.hex(i as u64);
+                    lb.str(b" was=");
+                    lb.hex(*was);
+                    lb.str(b" now=");
+                    lb.hex(now);
+                    lb.str(b" rsp=");
+                    lb.hex(saved_rsp);
+                    lb.str(b"\n");
+                    lb.flush();
+                    break;
+                }
+            }
+            FORK_STACK_CHECK_BUDGET -= 1;
         }
 
         reply.regs[0] as i32

@@ -474,6 +474,18 @@ impl FrameAllocator {
         }
     }
 
+    /// Return allocator bookkeeping state for one physical frame.
+    ///
+    /// Returns `(map_refs, obj_refs, reclaimable)` for debugging.
+    pub fn debug_state(&self, addr: PhysAddr) -> (u16, u16, u8) {
+        if let Some(frame) = self.frame_index(addr) {
+            if frame < self.total {
+                return (self.map_refs[frame], self.obj_refs[frame], self.reclaimable[frame]);
+            }
+        }
+        (0, 0, 0)
+    }
+
     /// Switch bitmap pointer from identity mapping to direct physical map.
     ///
     /// Called after `paging::init()` creates the direct physical mapping.

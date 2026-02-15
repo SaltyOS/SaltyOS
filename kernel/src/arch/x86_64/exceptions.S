@@ -94,12 +94,15 @@ exception_common:
     swapgs
 1:
 
-    // Read CR2 before it gets clobbered (only meaningful for #PF but harmless)
+    // Preserve user RAX while capturing CR2.
+    // Previous code did `mov %cr2, %rax` then pushed %rax twice, which
+    // restored user RAX as CR2 on iret (register corruption after #PF).
+    push %rax                   // temp: original user RAX
     mov %cr2, %rax
-    push %rax                   // cr2
+    xchg %rax, (%rsp)           // stack top = CR2, RAX = original user RAX
 
     // Save all general-purpose registers
-    push %rax
+    push %rax                   // original user RAX
     push %rbx
     push %rcx
     push %rdx
