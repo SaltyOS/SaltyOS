@@ -55,7 +55,7 @@ impl SaltyMsg {
 /// - `badge`: sender badge written by kernel on receive
 /// - `caps[0..3]`: CNode slots of capabilities to transfer on send
 /// - `receive_cnode/index/depth`: destination for received capabilities
-/// - `reserved[0..1]`: depth hints for CNode hierarchy invocations
+/// - `reserved[0..1]`: reserved for future ABI extensions
 #[repr(C)]
 pub struct IpcBuffer {
     pub msg: [u64; 22],

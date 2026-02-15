@@ -83,6 +83,10 @@ pub struct Tcb {
     pub ipc_receive_index: u64,
     /// Cached receive depth for incoming cap transfers
     pub ipc_receive_depth: u64,
+    /// Pending invoke depth for argument 0 (set by SYS_SET_INVOKE_DEPTHS)
+    pub invoke_depth0: u8,
+    /// Pending invoke depth for argument 1 (set by SYS_SET_INVOKE_DEPTHS)
+    pub invoke_depth1: u8,
     /// Scheduling context
     pub sched_context: *mut SchedContext,
     /// CPU affinity (0xFFFF_FFFF = any CPU, otherwise specific CPU ID)
@@ -212,6 +216,8 @@ impl Tcb {
             ipc_receive_cnode: 0,
             ipc_receive_index: 0,
             ipc_receive_depth: 0,
+            invoke_depth0: 0,
+            invoke_depth1: 0,
             sched_context: core::ptr::null_mut(),
             cpu_affinity: 0xFFFF_FFFF,
             next: core::ptr::null_mut(),
@@ -247,6 +253,8 @@ impl Tcb {
         self.blocked_notification = core::ptr::null_mut();
         self.blocked_vspace_tracking = core::ptr::null_mut();
         self.vspace_wait_next = core::ptr::null_mut();
+        self.invoke_depth0 = 0;
+        self.invoke_depth1 = 0;
 
         // If we have a reply capability, wake the blocked caller
         // This handles the case where a server dies before replying

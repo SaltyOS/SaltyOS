@@ -347,8 +347,17 @@ unsafe fn init_frame_metadata(
     cap_slot: CapSlot,
     phys_addr: PhysAddr,
     size_bits: u8,
+    zero_fill: bool,
 ) -> *mut crate::cap::object::KernelObject {
     let actual_bits = if size_bits < 12 { 12 } else { size_bits };
+    if zero_fill {
+        let frame_virt = mm::phys_to_virt(phys_addr) as *mut u8;
+        // Security invariant: newly retyped RAM-backed frames must be zeroed
+        // before exposure to userspace.
+        unsafe {
+            core::ptr::write_bytes(frame_virt, 0, 1usize << actual_bits);
+        }
+    }
     crate::mm::retain_frame_object(phys_addr, actual_bits);
     // SAFETY: METADATA_STATE is initialized before any retype operations
     let frame_ptr = unsafe { (*(&raw const METADATA_STATE)).frame_ptr.add(cap_slot as usize) };
@@ -480,7 +489,7 @@ impl UntypedMemory {
             // Initialize object
             let object = unsafe {
                 match new_type {
-                    ObjectType::Frame => init_frame_metadata(cap_slot, obj_addr, size_bits),
+                    ObjectType::Frame => init_frame_metadata(cap_slot, obj_addr, size_bits, !self.is_device),
                     ObjectType::VSpace => init_vspace_metadata(cap_slot, obj_addr),
                     ObjectType::Untyped => init_untyped_metadata(cap_slot, obj_addr, size_bits, self.is_device),
                     _ => match init_object(new_type, obj_addr, size_bits) {

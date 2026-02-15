@@ -28,6 +28,7 @@ pub const SYS_NANOSLEEP: u64 = 13;
 pub const SYS_DEBUG_PUTSTR: u64 = 14;
 pub const SYS_DEBUG_PUTBUF: u64 = 15;
 pub const SYS_DEBUG_CONSOLE_CONTROL: u64 = 16;
+pub const SYS_SET_INVOKE_DEPTHS: u64 = 17;
 
 /// Clock IDs for `SYS_CLOCK_GETTIME`.
 pub const CLOCK_MONOTONIC: i32 = 0;

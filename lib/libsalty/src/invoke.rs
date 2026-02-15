@@ -298,16 +298,10 @@ pub fn ioport_out16(ioport: Cap, offset: u64, value: u16) {
 // Depth-aware helpers for CNode hierarchy (expanded CSpace)
 // ===========================================================================
 
-/// Write invoke depths into IPC buffer reserved[0..1] for the next invoke call.
-/// depth=0 means flat mode (backward compatible).
+/// Write per-thread invoke depths for the next depth-aware invoke call.
+/// depth=0 means flat mode.
 fn write_invoke_depth(d0: u8, d1: u8) {
-    unsafe {
-        let ctx = &raw const crate::__salty_ipc_ctx;
-        if !(*ctx).ipc_buffer.is_null() {
-            (*(*ctx).ipc_buffer).reserved[0] = d0 as u64;
-            (*(*ctx).ipc_buffer).reserved[1] = d1 as u64;
-        }
-    }
+    let _ = syscall(SYS_SET_INVOKE_DEPTHS, d0 as u64, d1 as u64, 0, 0, 0, 0);
 }
 
 pub fn cnode_copy_depth(

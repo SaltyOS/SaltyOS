@@ -32,6 +32,7 @@ pub enum Syscall {
     DebugPutStr = 14,
     DebugPutBuf = 15,
     DebugConsoleControl = 16,
+    SetInvokeDepths = 17,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -56,6 +57,7 @@ impl TryFrom<u64> for Syscall {
             14 => Ok(Syscall::DebugPutStr),
             15 => Ok(Syscall::DebugPutBuf),
             16 => Ok(Syscall::DebugConsoleControl),
+            17 => Ok(Syscall::SetInvokeDepths),
             _ => Err(SyscallError::InvalidOperation),
         }
     }
@@ -274,24 +276,21 @@ fn lookup_expanded_for_slot(
     Err(SyscallError::InvalidCapability)
 }
 
-/// Read invoke depth values from the current thread's IPC buffer reserved[] fields.
+/// Consume pending invoke depth values from the current thread.
 ///
-/// Returns (reserved[0] as u8, reserved[1] as u8). Used by CNode and Untyped
-/// invoke handlers to determine whether slot addresses should be resolved through
-/// a multi-level CNode tree.
-///
-/// depth=0 means flat mode (backward compatible, since reserved[] is zero-initialized).
+/// Depths are written via SYS_SET_INVOKE_DEPTHS and consumed by the next
+/// depth-aware invoke. After read, both values are reset to 0 to avoid stale
+/// depth state affecting future invokes.
 ///
 /// # Safety
 /// Caller must ensure the current TCB is valid.
-unsafe fn read_invoke_depths(tcb: *const Tcb) -> (u8, u8) {
+unsafe fn read_invoke_depths(tcb: *mut Tcb) -> (u8, u8) {
     unsafe {
-        let buf = (*tcb).ipc_buffer;
-        if buf == 0 {
-            return (0, 0);
-        }
-        let ipc_buf = buf as *const crate::ipc::IpcBuffer;
-        ((*ipc_buf).reserved[0] as u8, (*ipc_buf).reserved[1] as u8)
+        let d0 = (*tcb).invoke_depth0;
+        let d1 = (*tcb).invoke_depth1;
+        (*tcb).invoke_depth0 = 0;
+        (*tcb).invoke_depth1 = 0;
+        (d0, d1)
     }
 }
 
@@ -823,6 +822,34 @@ fn syscall_poll(cap_ptr: u64) -> SyscallResult {
     }
 }
 
+/// Set per-thread invoke depth hints for the next depth-aware capability invoke.
+///
+/// Args:
+/// - depth0: depth hint for invoke arg0 slot address
+/// - depth1: depth hint for invoke arg1 slot address
+fn syscall_set_invoke_depths(depth0: u64, depth1: u64) -> SyscallResult {
+    if depth0 > 64 || depth1 > 64 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    unsafe {
+        let irq = save_irq_disable();
+        SCHED_IPC_LOCK.lock();
+        let current_tcb = crate::sched::scheduler::scheduler().current();
+        if current_tcb.is_null() {
+            SCHED_IPC_LOCK.unlock();
+            restore_irq(irq);
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+        (*current_tcb).invoke_depth0 = depth0 as u8;
+        (*current_tcb).invoke_depth1 = depth1 as u8;
+        SCHED_IPC_LOCK.unlock();
+        restore_irq(irq);
+    }
+
+    SyscallResult::ok(0)
+}
+
 /// Invoke capability operation
 fn syscall_invoke(
     cap_ptr: u64,
@@ -843,7 +870,7 @@ fn syscall_invoke(
             // CNode_Copy: entire operation under CAP_LOCK
             //   arg0 = src slot index, arg1 = dest CNode cap_ptr
             //   arg2 = dest slot index, arg3 = rights mask
-            //   IPC buffer: reserved[0] = src_depth, reserved[1] = dest_depth
+            //   Depths from SYS_SET_INVOKE_DEPTHS: d0=src_depth, d1=dest_depth
             unsafe {
                 let irq = save_irq_disable();
                 CAP_LOCK.lock();
@@ -888,7 +915,7 @@ fn syscall_invoke(
             // CNode_Mint: entire operation under CAP_LOCK
             //   arg0 = src slot index, arg1 = dest CNode cap_ptr
             //   arg2 = dest slot index, arg3 = badge value
-            //   IPC buffer: reserved[0] = src_depth, reserved[1] = dest_depth
+            //   Depths from SYS_SET_INVOKE_DEPTHS: d0=src_depth, d1=dest_depth
             unsafe {
                 let irq = save_irq_disable();
                 CAP_LOCK.lock();
@@ -932,7 +959,7 @@ fn syscall_invoke(
         (ObjectType::CNode, 0x12) => {
             // CNode_Move: entire operation under CAP_LOCK
             //   arg0 = dest slot index, arg1 = src CNode cap_ptr, arg2 = src slot index
-            //   IPC buffer: reserved[0] = dest_depth, reserved[1] = src_depth
+            //   Depths from SYS_SET_INVOKE_DEPTHS: d0=dest_depth, d1=src_depth
             unsafe {
                 let irq = save_irq_disable();
                 CAP_LOCK.lock();
@@ -976,7 +1003,7 @@ fn syscall_invoke(
             // CNode_Mutate: entire operation under CAP_LOCK
             //   arg0 = dest slot index, arg1 = src CNode cap_ptr
             //   arg2 = src slot index, arg3 = new badge value
-            //   IPC buffer: reserved[0] = dest_depth, reserved[1] = src_depth
+            //   Depths from SYS_SET_INVOKE_DEPTHS: d0=dest_depth, d1=src_depth
             unsafe {
                 let irq = save_irq_disable();
                 CAP_LOCK.lock();
@@ -1018,7 +1045,7 @@ fn syscall_invoke(
         }
         (ObjectType::CNode, 0x14) => {
             // CNode_Delete: entire operation under CAP_LOCK
-            //   IPC buffer: reserved[0] = depth for arg0
+            //   Depth from SYS_SET_INVOKE_DEPTHS: d0=arg0 depth
             if !cap.has_right(CapRights::WRITE) {
                 return SyscallResult::err(SyscallError::InsufficientRights);
             }
@@ -1045,7 +1072,7 @@ fn syscall_invoke(
         }
         (ObjectType::CNode, 0x15) => {
             // CNode_Revoke: entire operation under CAP_LOCK
-            //   IPC buffer: reserved[0] = depth for arg0
+            //   Depth from SYS_SET_INVOKE_DEPTHS: d0=arg0 depth
             if !cap.has_right(CapRights::WRITE) {
                 return SyscallResult::err(SyscallError::InsufficientRights);
             }
@@ -1073,7 +1100,7 @@ fn syscall_invoke(
         (ObjectType::CNode, 0x16) => {
             // CNode_SaveCaller: entire operation under CAP_LOCK
             //   arg0 = slot index to save the reply cap into
-            //   IPC buffer: reserved[0] = depth for arg0
+            //   Depth from SYS_SET_INVOKE_DEPTHS: d0=arg0 depth
             if !cap.has_right(CapRights::WRITE) {
                 return SyscallResult::err(SyscallError::InsufficientRights);
             }
@@ -2097,7 +2124,7 @@ fn syscall_sc_consumed(cap: &Capability) -> SyscallResult {
 /// - size_bits: Size in bits (for variable-size objects)
 /// - dest_offset: Destination offset in current thread's CSpace
 ///
-/// IPC buffer reserved[0] = dest_depth (0 = flat mode, backward compatible)
+/// Dest depth comes from per-thread invoke state set by SYS_SET_INVOKE_DEPTHS.
 fn syscall_untyped_retype(
     cap: &Capability,
     cap_ptr: u64,
@@ -2166,7 +2193,7 @@ fn syscall_untyped_retype(
         };
         let untyped_slot = cap_ref.slot;
 
-        // Read dest_depth from IPC buffer reserved[0]
+        // Read dest_depth from per-thread invoke state
         let (dest_depth, _) = read_invoke_depths(current_tcb);
 
         // Resolve destination CNode and slot index
@@ -2950,6 +2977,7 @@ pub fn handle(
             SyscallResult::ok(0)
         }
         Syscall::Invoke => syscall_invoke(cap_ptr, msg_info, mr0, mr1, mr2, mr3),
+        Syscall::SetInvokeDepths => syscall_set_invoke_depths(cap_ptr, msg_info),
         Syscall::DebugPutChar => {
             // SAFETY: save/restore IRQ flags around spinlock
             let irq = unsafe { save_irq_disable() };
