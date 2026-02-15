@@ -9,6 +9,8 @@ pub const MAX_DEPS: usize = 8;
 pub const MAX_CAP_COPIES: usize = 6;
 pub const MAX_EP_NEEDS: usize = 4;
 pub const MAX_EP_INJECTS: usize = 2;
+pub const MAX_SPAWN_ARGS_BYTES: usize = 96;
+pub const MAX_SPAWN_ARGS: usize = 6;
 
 #[derive(Clone, Copy)]
 pub struct CapCopyDef {
@@ -68,6 +70,10 @@ pub struct ServiceDef {
     pub ep_need_count: u8,
     pub ep_injects: [EpInjectDef; MAX_EP_INJECTS],
     pub ep_inject_count: u8,
+    /// NUL-separated argv entries appended after argv[0] by procmgr spawn path.
+    pub spawn_args: [u8; MAX_SPAWN_ARGS_BYTES],
+    pub spawn_args_len: u8,
+    pub spawn_argc: u8,
 }
 
 impl ServiceDef {
@@ -94,6 +100,9 @@ impl ServiceDef {
             ep_need_count: 0,
             ep_injects: [EpInjectDef { target: [0; MAX_SERVICE_NAME], target_len: 0, target_slot: 0 }; MAX_EP_INJECTS],
             ep_inject_count: 0,
+            spawn_args: [0; MAX_SPAWN_ARGS_BYTES],
+            spawn_args_len: 0,
+            spawn_argc: 0,
         }
     }
 
@@ -412,6 +421,48 @@ fn parse_ep_injects(value: &[u8], injects: &mut [EpInjectDef; MAX_EP_INJECTS]) -
     count
 }
 
+fn parse_spawn_args(value: &[u8], out: &mut [u8; MAX_SPAWN_ARGS_BYTES]) -> (u8, u8) {
+    let val = trim(value);
+    let mut i = 0usize;
+    let mut out_len = 0usize;
+    let mut argc = 0u8;
+
+    while i < val.len() && (argc as usize) < MAX_SPAWN_ARGS {
+        while i < val.len() && (val[i] == b' ' || val[i] == b'\t') {
+            i += 1;
+        }
+        if i >= val.len() {
+            break;
+        }
+
+        let start = i;
+        while i < val.len() && val[i] != b' ' && val[i] != b'\t' {
+            i += 1;
+        }
+        let tok = &val[start..i];
+        if tok.is_empty() {
+            continue;
+        }
+        if out_len + tok.len() + 1 > out.len() {
+            break;
+        }
+
+        for &b in tok {
+            out[out_len] = b;
+            out_len += 1;
+        }
+        out[out_len] = 0;
+        out_len += 1;
+        argc = argc.saturating_add(1);
+    }
+
+    for b in out.iter_mut().skip(out_len) {
+        *b = 0;
+    }
+
+    (out_len as u8, argc)
+}
+
 /// Parse a .service INI file from raw bytes.
 /// Returns true on success.
 pub fn parse_service(data: &[u8], out: &mut ServiceDef) -> bool {
@@ -484,6 +535,10 @@ pub fn parse_service(data: &[u8], out: &mut ServiceDef) -> bool {
                                 out.map_initrd = bytes_eq_ci(value, b"yes");
                             } else if bytes_eq_ci(key, b"PreProcmgr") {
                                 out.pre_procmgr = bytes_eq_ci(value, b"yes");
+                            } else if bytes_eq_ci(key, b"Args") {
+                                let (args_len, argc) = parse_spawn_args(value, &mut out.spawn_args);
+                                out.spawn_args_len = args_len;
+                                out.spawn_argc = argc;
                             } else if bytes_eq_ci(key, b"Restart") {
                                 if bytes_eq_ci(value, b"no") {
                                     out.restart = RestartPolicy::No;

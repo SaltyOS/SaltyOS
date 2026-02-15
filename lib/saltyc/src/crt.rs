@@ -66,6 +66,26 @@ pub unsafe extern "C" fn __libc_start_main(
         // Initialize FreeBSD locale/rune compatibility
         crate::compat::freebsd::rune::init_rune_locale();
 
+        // Probe fd 0: if already open (inherited from exec), skip /dev/console.
+        // dup(0) succeeds if fd 0 exists (exec'd process), fails if empty (fresh spawn).
+        let probe = salty::posix::posix_dup(0);
+        if probe >= 0 {
+            // fd 0 exists — inherited from exec caller (getty→bash).
+            // Close the test fd and leave fd 0/1/2 as-is.
+            salty::posix::posix_close(probe);
+        } else {
+            // fd 0 doesn't exist — fresh spawn. Open /dev/console.
+            let fd0 = salty::posix::posix_open(b"/dev/console\0".as_ptr(), 2); // O_RDWR
+            if fd0 >= 0 {
+                salty::posix::posix_dup(fd0); // fd 1
+                salty::posix::posix_dup(fd0); // fd 2
+            }
+        }
+
+        // Initialize stdio pointers (stdin/stdout/stderr) so that programs
+        // using fprintf(stderr, ...) etc. get valid FILE* from the GOT.
+        crate::stdio::ensure_stdio_init();
+
         // Call main
         let ret = main_fn(argc, argv, envp);
 

@@ -1,6 +1,6 @@
 [Service]
 Name=display
-Binary=display.elf
+Binary=display
 Type=notify
 Restart=no
 

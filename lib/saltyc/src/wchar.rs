@@ -134,6 +134,212 @@ pub extern "C" fn wctob(c: WintT) -> i32 {
 // Wide character classification
 // ---------------------------------------------------------------------------
 
+#[inline]
+fn is_ascii(wc: WintT) -> bool {
+    wc <= 0x7f
+}
+
+#[inline]
+fn is_alpha_ascii(wc: WintT) -> bool {
+    (wc >= b'A' as u32 && wc <= b'Z' as u32)
+        || (wc >= b'a' as u32 && wc <= b'z' as u32)
+}
+
+#[inline]
+fn is_digit_ascii(wc: WintT) -> bool {
+    wc >= b'0' as u32 && wc <= b'9' as u32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn iswalpha(wc: WintT) -> i32 {
+    if is_alpha_ascii(wc) { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn iswdigit(wc: WintT) -> i32 {
+    if is_digit_ascii(wc) { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn iswalnum(wc: WintT) -> i32 {
+    if is_alpha_ascii(wc) || is_digit_ascii(wc) { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn iswspace(wc: WintT) -> i32 {
+    if wc == b' ' as u32
+        || wc == b'\t' as u32
+        || wc == b'\n' as u32
+        || wc == b'\r' as u32
+        || wc == b'\x0b' as u32
+        || wc == b'\x0c' as u32
+    {
+        1
+    } else {
+        0
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn iswupper(wc: WintT) -> i32 {
+    if wc >= b'A' as u32 && wc <= b'Z' as u32 { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn iswlower(wc: WintT) -> i32 {
+    if wc >= b'a' as u32 && wc <= b'z' as u32 { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn iswprint(wc: WintT) -> i32 {
+    if wc >= 0x20 && wc <= 0x7e { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn iswcntrl(wc: WintT) -> i32 {
+    if (is_ascii(wc) && wc < 0x20) || wc == 0x7f { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn iswgraph(wc: WintT) -> i32 {
+    if wc >= 0x21 && wc <= 0x7e { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn iswblank(wc: WintT) -> i32 {
+    if wc == b' ' as u32 || wc == b'\t' as u32 { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn iswxdigit(wc: WintT) -> i32 {
+    if is_digit_ascii(wc)
+        || (wc >= b'a' as u32 && wc <= b'f' as u32)
+        || (wc >= b'A' as u32 && wc <= b'F' as u32)
+    {
+        1
+    } else {
+        0
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn iswpunct(wc: WintT) -> i32 {
+    if iswgraph(wc) != 0 && iswalnum(wc) == 0 { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn towlower(wc: WintT) -> WintT {
+    if wc >= b'A' as u32 && wc <= b'Z' as u32 {
+        wc + 32
+    } else {
+        wc
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn towupper(wc: WintT) -> WintT {
+    if wc >= b'a' as u32 && wc <= b'z' as u32 {
+        wc - 32
+    } else {
+        wc
+    }
+}
+
+const WCTYPE_ALPHA: u64 = 1;
+const WCTYPE_DIGIT: u64 = 2;
+const WCTYPE_ALNUM: u64 = 3;
+const WCTYPE_SPACE: u64 = 4;
+const WCTYPE_UPPER: u64 = 5;
+const WCTYPE_LOWER: u64 = 6;
+const WCTYPE_PRINT: u64 = 7;
+const WCTYPE_CNTRL: u64 = 8;
+const WCTYPE_PUNCT: u64 = 9;
+const WCTYPE_BLANK: u64 = 10;
+const WCTYPE_XDIGIT: u64 = 11;
+const WCTYPE_GRAPH: u64 = 12;
+
+const WCTRANS_TOLOWER: u64 = 1;
+const WCTRANS_TOUPPER: u64 = 2;
+
+unsafe fn wc_name_eq(name: *const u8, lit: &[u8]) -> bool {
+    unsafe {
+        let mut i = 0usize;
+        while i < lit.len() {
+            if *name.add(i) != lit[i] {
+                return false;
+            }
+            i += 1;
+        }
+        *name.add(lit.len()) == 0
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wctype(name: *const u8) -> u64 {
+    if name.is_null() {
+        return 0;
+    }
+    unsafe {
+        if wc_name_eq(name, b"alpha") { WCTYPE_ALPHA }
+        else if wc_name_eq(name, b"digit") { WCTYPE_DIGIT }
+        else if wc_name_eq(name, b"alnum") { WCTYPE_ALNUM }
+        else if wc_name_eq(name, b"space") { WCTYPE_SPACE }
+        else if wc_name_eq(name, b"upper") { WCTYPE_UPPER }
+        else if wc_name_eq(name, b"lower") { WCTYPE_LOWER }
+        else if wc_name_eq(name, b"print") { WCTYPE_PRINT }
+        else if wc_name_eq(name, b"cntrl") { WCTYPE_CNTRL }
+        else if wc_name_eq(name, b"punct") { WCTYPE_PUNCT }
+        else if wc_name_eq(name, b"blank") { WCTYPE_BLANK }
+        else if wc_name_eq(name, b"xdigit") { WCTYPE_XDIGIT }
+        else if wc_name_eq(name, b"graph") { WCTYPE_GRAPH }
+        else { 0 }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn iswctype(wc: WintT, desc: u64) -> i32 {
+    match desc {
+        WCTYPE_ALPHA => iswalpha(wc),
+        WCTYPE_DIGIT => iswdigit(wc),
+        WCTYPE_ALNUM => iswalnum(wc),
+        WCTYPE_SPACE => iswspace(wc),
+        WCTYPE_UPPER => iswupper(wc),
+        WCTYPE_LOWER => iswlower(wc),
+        WCTYPE_PRINT => iswprint(wc),
+        WCTYPE_CNTRL => iswcntrl(wc),
+        WCTYPE_PUNCT => iswpunct(wc),
+        WCTYPE_BLANK => iswblank(wc),
+        WCTYPE_XDIGIT => iswxdigit(wc),
+        WCTYPE_GRAPH => iswgraph(wc),
+        _ => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wctrans(name: *const u8) -> u64 {
+    if name.is_null() {
+        return 0;
+    }
+    unsafe {
+        if wc_name_eq(name, b"tolower") {
+            WCTRANS_TOLOWER
+        } else if wc_name_eq(name, b"toupper") {
+            WCTRANS_TOUPPER
+        } else {
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn towctrans(wc: WintT, desc: u64) -> WintT {
+    match desc {
+        WCTRANS_TOLOWER => towlower(wc),
+        WCTRANS_TOUPPER => towupper(wc),
+        _ => wc,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn wcwidth(wc: WcharT) -> i32 {
     if wc < 32 {
@@ -334,6 +540,24 @@ pub unsafe extern "C" fn wmemset(
     }
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wmemchr(
+    ws: *const WcharT,
+    wc: WcharT,
+    n: usize,
+) -> *mut WcharT {
+    unsafe {
+        let mut i: usize = 0;
+        while i < n {
+            if *ws.add(i) == wc {
+                return ws.add(i) as *mut WcharT;
+            }
+            i += 1;
+        }
+        core::ptr::null_mut()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Multibyte state / string conversions
 // ---------------------------------------------------------------------------
@@ -427,11 +651,15 @@ pub unsafe extern "C" fn wcsrtombs(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nl_langinfo(item: i32) -> *const u8 {
-    if item == 14 {
-        // CODESET
-        b"UTF-8\0".as_ptr()
-    } else {
-        b"\0".as_ptr()
+    const ABMON: [&[u8]; 12] = [
+        b"Jan\0", b"Feb\0", b"Mar\0", b"Apr\0", b"May\0", b"Jun\0",
+        b"Jul\0", b"Aug\0", b"Sep\0", b"Oct\0", b"Nov\0", b"Dec\0",
+    ];
+    match item {
+        14 => b"UTF-8\0".as_ptr(), // CODESET
+        33..=44 => ABMON[(item - 33) as usize].as_ptr(),
+        51 => b"md\0".as_ptr(),    // D_MD_ORDER
+        _ => b"\0".as_ptr(),
     }
 }
 

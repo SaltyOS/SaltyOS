@@ -8,6 +8,12 @@ use crate::sched::thread::{BlockedReason, Tcb, ThreadState};
 
 use crate::sched::scheduler::scheduler as get_scheduler;
 
+/// Depth of the per-endpoint fire-and-forget queue used by `NBSend`.
+///
+/// Only messages without capability transfer are enqueued. Messages with
+/// extra caps still require an active receiver for immediate transfer.
+const NBSEND_QUEUE_DEPTH: usize = 64;
+
 /// Endpoint state
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum EndpointState {
@@ -29,6 +35,12 @@ pub struct Endpoint {
     send_queue: WaitQueue,
     /// Queue of waiting receivers
     recv_queue: WaitQueue,
+    /// Ring buffer for non-blocking fire-and-forget messages.
+    nbsend_msgs: [Message; NBSEND_QUEUE_DEPTH],
+    nbsend_badges: [u64; NBSEND_QUEUE_DEPTH],
+    nbsend_head: usize,
+    nbsend_tail: usize,
+    nbsend_count: usize,
 }
 
 impl Endpoint {
@@ -38,12 +50,50 @@ impl Endpoint {
             state: EndpointState::Idle,
             send_queue: WaitQueue::new(),
             recv_queue: WaitQueue::new(),
+            nbsend_msgs: [Message::empty(); NBSEND_QUEUE_DEPTH],
+            nbsend_badges: [0; NBSEND_QUEUE_DEPTH],
+            nbsend_head: 0,
+            nbsend_tail: 0,
+            nbsend_count: 0,
         }
     }
 
     /// Get the current endpoint state
     pub fn state(&self) -> EndpointState {
         self.state
+    }
+
+    /// Push an async `NBSend` message into the endpoint-local ring buffer.
+    ///
+    /// Returns `false` when the queue is full.
+    fn enqueue_nbsend(&mut self, msg: &Message, badge: u64) -> bool {
+        if self.nbsend_count >= NBSEND_QUEUE_DEPTH {
+            return false;
+        }
+
+        let mut queued = *msg;
+        // Queued async messages cannot transfer caps after sender resumes.
+        queued.extra_caps = 0;
+        queued.caps = [0; 4];
+
+        self.nbsend_msgs[self.nbsend_tail] = queued;
+        self.nbsend_badges[self.nbsend_tail] = badge;
+        self.nbsend_tail = (self.nbsend_tail + 1) % NBSEND_QUEUE_DEPTH;
+        self.nbsend_count += 1;
+        true
+    }
+
+    /// Pop one queued async `NBSend` message, if present.
+    fn dequeue_nbsend(&mut self) -> Option<(Message, u64)> {
+        if self.nbsend_count == 0 {
+            return None;
+        }
+
+        let msg = self.nbsend_msgs[self.nbsend_head];
+        let badge = self.nbsend_badges[self.nbsend_head];
+        self.nbsend_head = (self.nbsend_head + 1) % NBSEND_QUEUE_DEPTH;
+        self.nbsend_count -= 1;
+        Some((msg, badge))
     }
 
     /// Cache the current thread's receive-slot configuration from its IPC buffer.
@@ -113,6 +163,54 @@ impl Endpoint {
 
                     let reason = BlockedReason::SendBlocked { msg: *msg, badge };
                     block_current_thread(current, reason);
+                }
+            }
+        }
+    }
+
+    /// Non-blocking send.
+    ///
+    /// Behavior:
+    /// - If a receiver is waiting, deliver immediately (same as send fastpath).
+    /// - Otherwise, enqueue in endpoint-local async queue and return.
+    /// - If queue is full (or message needs cap transfer without receiver), fail.
+    ///
+    /// Returns `true` on success, `false` if message cannot be accepted.
+    pub fn nbsend(&mut self, msg: &Message, badge: u64) -> bool {
+        unsafe {
+            let current = get_scheduler().current();
+
+            match self.state {
+                EndpointState::RecvBlocked => {
+                    // Receiver waiting: deliver immediately so caps (if any) can transfer.
+                    if let Some(receiver) = self.recv_queue.pop() {
+                        self.transfer_message(current, receiver, msg, badge);
+
+                        (*receiver).state = ThreadState::Ready;
+                        (*receiver).blocked_endpoint = core::ptr::null_mut();
+                        get_scheduler().enqueue(receiver);
+
+                        if self.recv_queue.is_empty() {
+                            self.state = EndpointState::Idle;
+                        }
+                        true
+                    } else {
+                        // State inconsistency: recover and fall back to async queue.
+                        self.state = EndpointState::Idle;
+                        if msg.extra_caps != 0 {
+                            false
+                        } else {
+                            self.enqueue_nbsend(msg, badge)
+                        }
+                    }
+                }
+                EndpointState::Idle | EndpointState::SendBlocked => {
+                    // No active receiver: only cap-less messages are queueable.
+                    if msg.extra_caps != 0 {
+                        false
+                    } else {
+                        self.enqueue_nbsend(msg, badge)
+                    }
                 }
             }
         }
@@ -193,6 +291,11 @@ impl Endpoint {
                     (msg, badge)
                 }
                 EndpointState::Idle | EndpointState::RecvBlocked => {
+                    // Drain queued async NBSend messages before blocking.
+                    if let Some((msg, badge)) = self.dequeue_nbsend() {
+                        return (msg, badge);
+                    }
+
                     // SLOWPATH: No sender - check bound notification before blocking
                     // If thread has a bound notification with pending bits, return
                     // those immediately instead of blocking on the endpoint.
@@ -551,6 +654,9 @@ impl Endpoint {
             }
 
             self.state = EndpointState::Idle;
+            self.nbsend_head = 0;
+            self.nbsend_tail = 0;
+            self.nbsend_count = 0;
         }
     }
 }

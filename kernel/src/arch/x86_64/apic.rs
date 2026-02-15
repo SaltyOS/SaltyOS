@@ -17,7 +17,7 @@
 
 use super::outb;
 use crate::mm::PHYS_MAP_OFFSET;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicBool, Ordering};
 
 /// Local APIC base address (physical)
 pub const LAPIC_BASE: u64 = 0xFEE0_0000;
@@ -1089,5 +1089,127 @@ pub fn handle_ipi(kind: IpiKind) {
             // Handled by irq_handler_ipi_tlb_shootdown (own assembly stub),
             // not through handle_ipi. This arm should never be reached.
         }
+    }
+}
+
+// ======================================================================
+// I/O APIC support
+// ======================================================================
+
+/// IOAPIC virtual base address (set during init_ioapic)
+static IOAPIC_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// Whether IOAPIC has been initialized
+static IOAPIC_READY: AtomicBool = AtomicBool::new(false);
+
+/// IOAPIC MMIO register offsets
+const IOREGSEL: u64 = 0x00;
+const IOWIN: u64 = 0x10;
+
+/// IOAPIC registers
+const IOAPIC_REG_ID: u32 = 0x00;
+const IOAPIC_REG_VER: u32 = 0x01;
+
+/// Redirection entry flags
+const IOAPIC_MASKED: u32 = 1 << 16;
+
+/// Read an IOAPIC register via indirect MMIO access.
+///
+/// # Safety
+/// IOAPIC must be mapped and `IOAPIC_BASE` must be valid.
+unsafe fn ioapic_read(reg: u32) -> u32 {
+    unsafe {
+        let base = IOAPIC_BASE.load(Ordering::Acquire);
+        let sel = base as *mut u32;
+        let win = (base + IOWIN) as *const u32;
+        sel.write_volatile(reg);
+        win.read_volatile()
+    }
+}
+
+/// Write an IOAPIC register via indirect MMIO access.
+///
+/// # Safety
+/// IOAPIC must be mapped and `IOAPIC_BASE` must be valid.
+unsafe fn ioapic_write(reg: u32, val: u32) {
+    unsafe {
+        let base = IOAPIC_BASE.load(Ordering::Acquire);
+        let sel = base as *mut u32;
+        let win = (base + IOWIN) as *mut u32;
+        sel.write_volatile(reg);
+        win.write_volatile(val);
+    }
+}
+
+/// Initialize the I/O APIC and configure redirection entries for
+/// ISA IRQs that the kernel needs (IRQ1 = keyboard, IRQ4 = COM1).
+///
+/// Maps the IOAPIC MMIO region using the direct physical mapping,
+/// masks all redirection entries, then unmasks IRQ1 and IRQ4 routed
+/// to the BSP's Local APIC.
+///
+/// # Arguments
+/// * `ioapic_phys` - Physical address of the IOAPIC (from MADT)
+/// * `bsp_apic_id` - APIC ID of the BSP (destination for routed IRQs)
+pub fn init_ioapic(ioapic_phys: u32, bsp_apic_id: u8) {
+    // Map IOAPIC MMIO via the direct physical mapping (same approach as LAPIC)
+    let virt = ioapic_phys as u64 + PHYS_MAP_OFFSET;
+    IOAPIC_BASE.store(virt, Ordering::Release);
+
+    {
+        let s = crate::SerialGuard::acquire();
+        s.puts("[IOAPIC] phys=");
+        s.hex(ioapic_phys as u64);
+        s.puts(" virt=");
+        s.hex(virt);
+        s.putc(b'\n');
+    }
+
+    unsafe {
+        // Read version register to get max redirection entries
+        let ver = ioapic_read(IOAPIC_REG_VER);
+        let max_entry = ((ver >> 16) & 0xFF) as u32;
+
+        {
+            let s = crate::SerialGuard::acquire();
+            s.puts("[IOAPIC] version=");
+            s.hex(ver as u64);
+            s.puts(" max_entry=");
+            s.dec(max_entry as u64);
+            s.putc(b'\n');
+        }
+
+        // Mask all redirection entries first
+        for i in 0..=max_entry {
+            let reg_lo = 0x10 + 2 * i;
+            let reg_hi = 0x10 + 2 * i + 1;
+            // Low 32 bits: masked, vector = i+32
+            ioapic_write(reg_lo, IOAPIC_MASKED | ((i + 32) & 0xFF));
+            // High 32 bits: destination = 0 (doesn't matter, entry is masked)
+            ioapic_write(reg_hi, 0);
+        }
+
+        // Enable IRQ1 (keyboard) → vector 33, routed to BSP
+        // Low: vector=33, delivery=Fixed(0), destmode=Physical(0),
+        //      polarity=ActiveHigh(0), trigger=Edge(0), mask=0
+        let irq1_lo: u32 = 33; // vector 33, all other bits 0 = fixed, physical, active-high, edge, unmasked
+        let irq1_hi: u32 = (bsp_apic_id as u32) << 24;
+        ioapic_write(0x10 + 2 * 1, irq1_lo);
+        ioapic_write(0x10 + 2 * 1 + 1, irq1_hi);
+
+        // Enable IRQ4 (COM1) → vector 36, routed to BSP
+        let irq4_lo: u32 = 36; // vector 36
+        let irq4_hi: u32 = (bsp_apic_id as u32) << 24;
+        ioapic_write(0x10 + 2 * 4, irq4_lo);
+        ioapic_write(0x10 + 2 * 4 + 1, irq4_hi);
+    }
+
+    IOAPIC_READY.store(true, Ordering::Release);
+
+    {
+        let s = crate::SerialGuard::acquire();
+        s.puts("[IOAPIC] IRQ1 (keyboard) → vec 33, IRQ4 (COM1) → vec 36, dest APIC ");
+        s.dec(bsp_apic_id as u64);
+        s.putc(b'\n');
     }
 }

@@ -7,6 +7,7 @@
 
 int   expand_number(const char *buf, int64_t *num);
 char *fgetln(FILE *fp, size_t *lenp);
+char *getbsize(int *headerlenp, long *blocksizep);
 
 /* humanize_number flags */
 #define HN_DECIMAL      0x01

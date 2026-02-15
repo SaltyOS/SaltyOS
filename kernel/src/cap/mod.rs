@@ -244,8 +244,8 @@ impl Capability {
         new_rights: CapRights,
         dest_slot: CapSlot,
     ) -> Result<(), CapError> {
-        // Only endpoints can be badged
-        if self.obj_type != ObjectType::Endpoint {
+        // Only endpoints and notifications can be badged
+        if self.obj_type != ObjectType::Endpoint && self.obj_type != ObjectType::Notification {
             return Err(CapError::InvalidOperation);
         }
 

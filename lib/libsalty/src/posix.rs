@@ -19,7 +19,35 @@
 //! packed into subsequent u64 registers.
 
 use crate::consts::*;
+use crate::serial::LineBuf;
 use crate::types::*;
+
+static mut POSIX_RW_DBG_BUDGET: u32 = 192;
+
+#[inline(always)]
+unsafe fn posix_dbg_rw(tag: &[u8], fd: i32, req: u64, err: i32, label: u64, val: u64) {
+    unsafe {
+        if POSIX_RW_DBG_BUDGET == 0 || fd < 0 || fd > 2 {
+            return;
+        }
+        POSIX_RW_DBG_BUDGET -= 1;
+        let mut lb = LineBuf::new();
+        lb.str(b"[POSIX] ");
+        lb.str(tag);
+        lb.str(b" fd=");
+        lb.dec(fd as u64);
+        lb.str(b" req=");
+        lb.dec(req);
+        lb.str(b" err=");
+        lb.hex(err as u64);
+        lb.str(b" lbl=");
+        lb.hex(label);
+        lb.str(b" val=");
+        lb.dec(val);
+        lb.str(b"\n");
+        lb.flush();
+    }
+}
 
 /// Pack a null-terminated path into message registers starting at `offset`.
 ///
@@ -96,6 +124,7 @@ pub unsafe fn posix_read(fd: i32, buf: *mut u8, count: u64) -> i64 {
                 &raw const msg,
                 &raw mut reply,
             );
+            posix_dbg_rw(b"read", fd, chunk, err, reply.label, reply.regs[0]);
             if err != 0 || reply.label != SALTY_OK {
                 return if total > 0 { total as i64 } else { -1 };
             }
@@ -154,6 +183,7 @@ pub unsafe fn posix_write(fd: i32, buf: *const u8, count: u64) -> i64 {
                 &raw const msg,
                 &raw mut reply,
             );
+            posix_dbg_rw(b"write", fd, chunk, err, reply.label, reply.regs[0]);
             if err != 0 || reply.label != SALTY_OK {
                 return if total > 0 { total as i64 } else { -1 };
             }
@@ -1047,8 +1077,13 @@ pub unsafe fn posix_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32 {
         msg.regs[0] = actual_nfds as u64;
         msg.regs[1] = timeout as u64;
 
+        let mut has_tty_fd = false;
+
         // Pack (fd, events) pairs into regs[2..]
         for i in 0..actual_nfds as usize {
+            if (*fds.add(i)).fd >= 0 && (*fds.add(i)).fd <= 2 {
+                has_tty_fd = true;
+            }
             msg.regs[2 + i * 2] = (*fds.add(i)).fd as u64;
             msg.regs[2 + i * 2 + 1] = (*fds.add(i)).events as u64;
         }
@@ -1060,6 +1095,16 @@ pub unsafe fn posix_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
+        if has_tty_fd {
+            posix_dbg_rw(
+                b"poll",
+                0,
+                actual_nfds as u64,
+                err,
+                reply.label,
+                reply.regs[0],
+            );
+        }
         if err != 0 || reply.label != SALTY_OK {
             return -1;
         }
@@ -1622,6 +1667,29 @@ pub unsafe fn posix_setsid() -> i32 {
     }
 }
 
+/// Get the session ID of process `pid` (or caller when `pid==0`).
+/// Returns sid on success, -1 on error.
+pub unsafe fn posix_getsid(pid: i32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_PM_GETSID;
+        msg.length = 1;
+        msg.regs[0] = pid as u32 as u64;
+
+        let err = crate::ipc::call_ctx(
+            &raw mut crate::__salty_ipc_ctx,
+            CAP_PROCMGR_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        reply.regs[0] as i32
+    }
+}
+
 /// Return the real user ID of the calling process.
 pub unsafe fn posix_getuid() -> i32 {
     unsafe {
@@ -1853,6 +1921,10 @@ pub unsafe fn posix_chdir(path: *const u8) -> i32 {
 /// into `buf` (up to `size` bytes). Returns 0 on success, -1 on error.
 pub unsafe fn posix_getcwd(buf: *mut u8, size: u64) -> i32 {
     unsafe {
+        if buf.is_null() || size == 0 {
+            return -1;
+        }
+
         let mut msg = SaltyMsg::zeroed();
         let mut reply = SaltyMsg::zeroed();
         msg.label = POSIX_VFS_GETCWD;
@@ -1870,12 +1942,20 @@ pub unsafe fn posix_getcwd(buf: *mut u8, size: u64) -> i32 {
         }
 
         let path_len = reply.regs[0] as usize;
+        let size_usize = size as usize;
+        if path_len + 1 > size_usize {
+            return -1;
+        }
+        let reply_data_bytes = (reply.length.saturating_sub(1) * 8) as usize;
+        if path_len > reply_data_bytes {
+            return -1;
+        }
+
         let src = &reply.regs[1] as *const u64 as *const u8;
-        let copy_len = if path_len < size as usize { path_len } else { size as usize - 1 };
-        for i in 0..copy_len {
+        for i in 0..path_len {
             *buf.add(i) = *src.add(i);
         }
-        *buf.add(copy_len) = 0;
+        *buf.add(path_len) = 0;
         0
     }
 }

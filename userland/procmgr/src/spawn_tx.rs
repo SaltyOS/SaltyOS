@@ -99,6 +99,7 @@ const UT_MIRROR_COUNT: Cap = super::UT_MIRROR_COUNT;
 const CHILD_UT_BITS_DEFAULT: u8 = super::CHILD_UT_BITS_DEFAULT;
 const READY_TIMEOUT_NS_DEFAULT: u64 = super::READY_TIMEOUT_NS_DEFAULT;
 const SPAWN_FLAG_USE_PRE_EP: u64 = salty::SPAWN_FLAG_USE_PRE_EP;
+const SPAWN_FLAG_RESPAWN: u64 = salty::SPAWN_FLAG_RESPAWN;
 
 // ===========================================================================
 // Shared library physical frame cache
@@ -1216,12 +1217,16 @@ pub unsafe fn handle_spawn_tx(
         //   regs[1] = spawn_policy bitfield
         //   regs[2] = timeout_ns
         //   regs[3] = spawn_flags
-        //   regs[4] = reserved
-        //   regs[5..] = name bytes
+        //   regs[4] = spawn_args_len (NUL-separated args bytes)
+        //   regs[5..] = name bytes, then spawn args bytes
         let name_reg_idx = 5usize;
         let spawn_policy = msg.regs[1];
         let requested_timeout_ns = msg.regs[2];
         let spawn_flags = msg.regs[3];
+        let spawn_args_len = msg.regs[4] as usize;
+        let name_len_wire = msg.regs[0] as usize;
+        let name_words = (name_len_wire + 7) / 8;
+        let args_reg_idx = name_reg_idx + name_words;
         let use_pre_ep = (spawn_flags & SPAWN_FLAG_USE_PRE_EP) != 0;
         let readiness_mode = salty::spawn_policy_readiness(spawn_policy);
         let policy_map_initrd = salty::spawn_policy_map_initrd(spawn_policy);
@@ -1229,7 +1234,7 @@ pub unsafe fn handle_spawn_tx(
         let policy_cnode_bits = salty::spawn_policy_cnode_bits(spawn_policy);
         let policy_memory_kb = salty::spawn_policy_memory_kb(spawn_policy);
         let (name, name_len) = super::extract_name(msg, name_reg_idx);
-        let is_display = policy_is_display || super::bytes_eq(&name[..name_len], b"display.elf");
+        let is_display = policy_is_display || super::bytes_eq(&name[..name_len], b"display");
 
         {
             let mut lb = LineBuf::new();
@@ -1244,10 +1249,27 @@ pub unsafe fn handle_spawn_tx(
 
         // Find ELF in initrd
         let mut elf_entry = CpioEntry::zeroed();
-        if salty::cpio::cpio_find_file(
+        let mut found = salty::cpio::cpio_find_file(
             initrd, initrd_size, name.as_ptr(), name_len, &raw mut elf_entry,
-        ) == 0
-        {
+        ) != 0;
+        if !found && name_len + 4 <= proc_table::MAX_NAME_LEN {
+            let mut legacy = [0u8; proc_table::MAX_NAME_LEN + 5];
+            for i in 0..name_len {
+                legacy[i] = name[i];
+            }
+            legacy[name_len] = b'.';
+            legacy[name_len + 1] = b'e';
+            legacy[name_len + 2] = b'l';
+            legacy[name_len + 3] = b'f';
+            found = salty::cpio::cpio_find_file(
+                initrd,
+                initrd_size,
+                legacy.as_ptr(),
+                name_len + 4,
+                &raw mut elf_entry,
+            ) != 0;
+        }
+        if !found {
             puts(b"[PROCMGR] ELF not found in initrd\n");
             reply.label = SALTY_NOT_FOUND;
             return;
@@ -1677,6 +1699,74 @@ pub unsafe fn handle_spawn_tx(
         if plan.is_dynamic {
             // Pass library window size for AT_SALTY_INITRD_SZ
             let initrd_window_size = plan.lib_window_pages * 4096;
+
+            // Build argv/envp for the child process.
+            let mut str_buf = [0u8; 256];
+            let mut str_pos = 0usize;
+
+            // argv[0]: "/bin/<name>" (extensionless runtime name)
+            let prefix = b"/bin/";
+            for &b in prefix {
+                if str_pos < str_buf.len() { str_buf[str_pos] = b; str_pos += 1; }
+            }
+            let base_len = if name_len >= 4
+                && name[name_len - 4] == b'.'
+                && name[name_len - 3] == b'e'
+                && name[name_len - 2] == b'l'
+                && name[name_len - 1] == b'f'
+            {
+                name_len - 4
+            } else {
+                name_len
+            };
+            for i in 0..base_len {
+                if str_pos < str_buf.len() { str_buf[str_pos] = name[i]; str_pos += 1; }
+            }
+            if str_pos < str_buf.len() { str_buf[str_pos] = 0; str_pos += 1; } // NUL
+
+            let mut argc: u32 = 1;
+            if spawn_args_len > 0
+                && msg.length as usize > args_reg_idx
+                && str_pos < str_buf.len()
+            {
+                let src = &msg.regs[args_reg_idx] as *const u64 as *const u8;
+                let copy_len = core::cmp::min(spawn_args_len, str_buf.len() - str_pos);
+                let mut saw_nonzero = false;
+                let mut in_arg = false;
+                for i in 0..copy_len {
+                    let b = *src.add(i);
+                    str_buf[str_pos] = b;
+                    str_pos += 1;
+                    if b != 0 {
+                        saw_nonzero = true;
+                        if !in_arg {
+                            in_arg = true;
+                            argc += 1;
+                        }
+                    } else {
+                        in_arg = false;
+                    }
+                }
+                if saw_nonzero && in_arg && str_pos < str_buf.len() {
+                    str_buf[str_pos] = 0;
+                    str_pos += 1;
+                }
+            }
+
+            // envp strings
+            let env_strs: [&[u8]; 4] = [
+                b"PATH=/bin",
+                b"HOME=/",
+                b"TERM=dumb",
+                b"SHELL=/bin/sh",
+            ];
+            for env in &env_strs {
+                for &b in *env {
+                    if str_pos < str_buf.len() { str_buf[str_pos] = b; str_pos += 1; }
+                }
+                if str_pos < str_buf.len() { str_buf[str_pos] = 0; str_pos += 1; } // NUL
+            }
+
             match write_dynamic_stack(
                 elf_entry.data,
                 elf_entry.data_len,
@@ -1685,7 +1775,7 @@ pub unsafe fn handle_spawn_tx(
                 &rtld_result,
                 initrd_window_size,
                 shared_lib_base,
-                0, 0, &[], 0,
+                argc, 4, &str_buf, str_pos,
                 plan.layout.elf_code.base,
                 plan.layout.scratch.base,
                 plan.layout.initrd.base,
@@ -1773,6 +1863,11 @@ pub unsafe fn handle_spawn_tx(
         } else {
             0
         };
+        p.sid = if let Some(ci) = caller_idx {
+            proc_table::PROCTAB[ci].sid
+        } else {
+            pid
+        };
         p.state = proc_table::PROC_RUNNING;
         p.exit_code = 0;
         p.badge = pid as u64;
@@ -1783,14 +1878,35 @@ pub unsafe fn handle_spawn_tx(
         p.waiter_reply = 0;
         p.waiter_pid = 0;
         p.signal_ntfn = child_sig_ntfn;
-        p.pgid = pid;
+        p.pgid = if let Some(ci) = caller_idx {
+            proc_table::PROCTAB[ci].pgid
+        } else {
+            pid
+        };
         p.slot_base = slot_base;
         p.slot_count = slot_count;
         p.shared_lib_base = shared_lib_base;
         p.lib_map = shared_lib_map;
         p.layout = plan.layout;
+        p.has_service_ep = use_pre_ep;
         for i in 0..proc_table::NSIG {
             p.sig_disposition[i] = proc_table::SIG_DISP_DFL;
+        }
+
+        // SPAWN_FLAG_RESPAWN: mark process for automatic restart on exit
+        if (spawn_flags & SPAWN_FLAG_RESPAWN) != 0 {
+            p.respawn = true;
+            let copy_len = if name_len > proc_table::MAX_NAME_LEN {
+                proc_table::MAX_NAME_LEN
+            } else {
+                name_len
+            };
+            for i in 0..copy_len {
+                p.respawn_binary[i] = name[i];
+            }
+            for i in copy_len..proc_table::MAX_NAME_LEN {
+                p.respawn_binary[i] = 0;
+            }
         }
 
         {

@@ -4,7 +4,7 @@
 
 /* jmp_buf: 8 x 64-bit registers (rbx, rbp, r12-r15, rsp, rip) */
 typedef unsigned long jmp_buf[8];
-typedef unsigned long sigjmp_buf[8];
+typedef unsigned long sigjmp_buf[10];
 
 extern int  setjmp(jmp_buf env);
 extern void longjmp(jmp_buf env, int val);

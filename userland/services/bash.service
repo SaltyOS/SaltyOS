@@ -1,8 +1,0 @@
-[Service]
-Name=bash
-Binary=bash.elf
-Type=simple
-Restart=no
-
-[Dependencies]
-After=console procmgr vfs

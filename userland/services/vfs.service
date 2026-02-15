@@ -1,6 +1,6 @@
 [Service]
 Name=vfs
-Binary=vfs.elf
+Binary=vfs
 Type=simple
 Restart=always
 PreProcmgr=yes
@@ -10,5 +10,5 @@ After=console nameserv
 Before=test_runner
 
 [Capabilities]
-CopyCap=13:66
-NeedEP=console:64 nameserv:65
+CopyCap=13:66 14:68
+NeedEP=console:64 nameserv:65 ttyd:67

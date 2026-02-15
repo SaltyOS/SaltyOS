@@ -165,6 +165,20 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
         }
     };
 
+    // Initialize IOAPIC BEFORE the cpu_count check — even single-CPU systems
+    // need IOAPIC for routing external hardware IRQs (keyboard, COM1).
+    if madt_info.io_apic_addr != 0 {
+        // Find BSP APIC ID from the CPU descriptors
+        let mut bsp_apic_id: u8 = 0;
+        for i in 0..madt_info.cpu_count {
+            if madt_info.cpus[i].is_bsp {
+                bsp_apic_id = madt_info.cpus[i].apic_id;
+                break;
+            }
+        }
+        apic::init_ioapic(madt_info.io_apic_addr, bsp_apic_id);
+    }
+
     if madt_info.cpu_count <= 1 {
         crate::serial_puts("[SMP] Only 1 CPU found, no APs to start\n");
         return;

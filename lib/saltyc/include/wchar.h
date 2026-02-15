@@ -34,10 +34,12 @@ extern wchar_t *wcschr(const wchar_t *ws, wchar_t wc);
 extern wchar_t *wcsrchr(const wchar_t *ws, wchar_t wc);
 extern wchar_t *wcscat(wchar_t *dst, const wchar_t *src);
 extern wchar_t *wcsncat(wchar_t *dst, const wchar_t *src, size_t n);
+extern wchar_t *wcsdup(const wchar_t *src);
 
 /* Wide memory operations */
 extern wchar_t *wmemcpy(wchar_t *dst, const wchar_t *src, size_t n);
 extern wchar_t *wmemset(wchar_t *dst, wchar_t wc, size_t n);
+extern wchar_t *wmemchr(const wchar_t *ws, wchar_t wc, size_t n);
 
 /* Wide character width */
 extern int wcwidth(wchar_t wc);

@@ -778,7 +778,27 @@ pub unsafe fn spawn_server(
         let initrd_size = super::INITRD_SIZE;
 
         let mut entry = CpioEntry::zeroed();
-        if cpio::cpio_find_file(initrd, initrd_size, elf_name.as_ptr(), elf_name.len(), &raw mut entry) == 0 {
+        let mut found = cpio::cpio_find_file(
+            initrd, initrd_size, elf_name.as_ptr(), elf_name.len(), &raw mut entry,
+        ) != 0;
+        if !found && elf_name.len() + 4 <= 96 {
+            let mut legacy = [0u8; 96];
+            for i in 0..elf_name.len() {
+                legacy[i] = elf_name[i];
+            }
+            legacy[elf_name.len()] = b'.';
+            legacy[elf_name.len() + 1] = b'e';
+            legacy[elf_name.len() + 2] = b'l';
+            legacy[elf_name.len() + 3] = b'f';
+            found = cpio::cpio_find_file(
+                initrd,
+                initrd_size,
+                legacy.as_ptr(),
+                elf_name.len() + 4,
+                &raw mut entry,
+            ) != 0;
+        }
+        if !found {
             { let mut lb = LineBuf::new(); lb.str(b"[INIT] "); lb.bytes(elf_name); lb.str(b" not found in initrd\n"); lb.flush(); }
             return -1;
         }
@@ -1115,39 +1135,10 @@ pub unsafe fn spawn_server(
             }
             puts(b"[INIT] Initrd mapped in child VSpace\n");
 
-            // Map boot info page into child VSpace so it can read initrd size
-            let bi_fr = super::init_alloc_frame_slot(core::ptr::null_mut());
-            let mut err = invoke::untyped_retype(loader_ut, OBJ_FRAME, 0, bi_fr);
-            if err != 0 {
-                err = retype_from_any_untyped(OBJ_FRAME, 0, bi_fr);
-            }
-            if err != 0 {
-                puts(b"[INIT] bootinfo frame retype failed\n");
-                return -1;
-            }
-
-            let err = invoke::vspace_map(
-                CAP_SELF_VSPACE,
-                bi_fr,
-                SCRATCH_VADDR,
-                VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
-            );
-            if err != 0 {
-                puts(b"[INIT] bootinfo scratch map failed\n");
-                return -1;
-            }
-
-            let bi_src = BOOTINFO_VADDR as *const u8;
-            let scratch = SCRATCH_VADDR as *mut u8;
-            for i in 0..4096usize {
-                core::ptr::write_volatile(scratch.add(i), core::ptr::read_volatile(bi_src.add(i)));
-            }
-
-            invoke::vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
-
+            // Map init's persistent bootinfo snapshot page into child.
             let err = invoke::vspace_map(
                 child_vs,
-                bi_fr,
+                super::CAP_BOOTINFO_SNAPSHOT_FRAME,
                 BOOTINFO_VADDR,
                 VSPACE_FLAG_USER,
             );
@@ -1460,8 +1451,8 @@ pub unsafe fn spawn_server(
 ///   regs[1] = spawn_policy bitfield
 ///   regs[2] = timeout_ns (only for NOTIFY mode, 0=auto)
 ///   regs[3] = spawn_flags
-///   regs[4] = reserved (0)
-///   regs[5..] = name bytes packed into u64 words
+///   regs[4] = spawn_args_len (NUL-separated args bytes)
+///   regs[5..] = name bytes packed into u64 words, then spawn_args bytes
 pub unsafe fn pm_spawn(
     pm_ep: Cap,
     prog: &[u8],
@@ -1493,19 +1484,28 @@ pub unsafe fn pm_spawn(
             spawn_flags |= SPAWN_FLAG_USE_PRE_EP;
             ipc::set_send_cap_ctx(super::ipc_ctx(), 0, pre_ep);
         }
+        if matches!(def.restart, super::ini::RestartPolicy::Always) {
+            spawn_flags |= SPAWN_FLAG_RESPAWN;
+        }
 
         let mut spawn_msg = SaltyMsg::zeroed();
         spawn_msg.label = POSIX_PM_SPAWN;
         let packed_name_words = ((len as u64) + 7) / 8;
-        spawn_msg.length = 5 + packed_name_words;
+        let args_len = def.spawn_args_len as u64;
+        let packed_args_words = (args_len + 7) / 8;
+        spawn_msg.length = 5 + packed_name_words + packed_args_words;
         spawn_msg.regs[0] = len as u64;
         spawn_msg.regs[1] = policy;
         spawn_msg.regs[2] = timeout_ns;
         spawn_msg.regs[3] = spawn_flags;
-        spawn_msg.regs[4] = 0; // reserved
+        spawn_msg.regs[4] = args_len;
         let dst = &raw mut spawn_msg.regs[5] as *mut u8;
         for i in 0..len {
             *dst.add(i) = prog[i];
+        }
+        let args_dst = dst.add(packed_name_words as usize * 8);
+        for i in 0..(def.spawn_args_len as usize) {
+            *args_dst.add(i) = def.spawn_args[i];
         }
 
         let mut spawn_reply = SaltyMsg::zeroed();
@@ -1515,5 +1515,26 @@ pub unsafe fn pm_spawn(
         }
 
         spawn_reply.regs[0] as i32
+    }
+}
+
+/// Inject a capability into a procmgr-managed child's CSpace.
+/// Uses PM_INJECT_CAP IPC to have procmgr copy the cap into the child.
+pub unsafe fn pm_inject_cap(pm_ep: Cap, pid: u32, dst_slot: u64, cap: Cap) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        msg.label = POSIX_PM_INJECT_CAP;
+        msg.length = 2;
+        msg.regs[0] = pid as u64;
+        msg.regs[1] = dst_slot;
+        ipc::set_send_cap_ctx(super::ipc_ctx(), 0, cap);
+
+        let mut reply = SaltyMsg::zeroed();
+        let err = ipc::call_ctx(super::ipc_ctx(), pm_ep, &raw const msg, &raw mut reply);
+        if err != 0 || reply.label != SALTY_OK {
+            -1
+        } else {
+            0
+        }
     }
 }

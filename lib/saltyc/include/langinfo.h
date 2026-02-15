@@ -21,12 +21,24 @@ typedef int nl_item;
 #define ABDAY_1     13
 #define MON_1       21
 #define ABMON_1     33
+#define ABMON_2     34
+#define ABMON_3     35
+#define ABMON_4     36
+#define ABMON_5     37
+#define ABMON_6     38
+#define ABMON_7     39
+#define ABMON_8     40
+#define ABMON_9     41
+#define ABMON_10    42
+#define ABMON_11    43
+#define ABMON_12    44
 #define RADIXCHAR   45
 #define THOUSEP     46
 #define YESEXPR     47
 #define NOEXPR      48
 #define CRNCYSTR    49
 #define ERA         50
+#define D_MD_ORDER  51
 
 extern char *nl_langinfo(nl_item item);
 

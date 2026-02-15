@@ -52,6 +52,7 @@ impl ProcLibMap {
 pub struct Process {
     pub pid: u32,
     pub ppid: u32,
+    pub sid: u32,
     pub state: u8,
     pub exit_code: i32,
     pub badge: u64,
@@ -90,6 +91,12 @@ pub struct Process {
     pub child_ut_cap: Cap,
     /// Number of untyped expansions granted to this process (max 8).
     pub ut_expand_count: u8,
+    /// Whether this process has a pre-created service EP at CHILD_CAP_SERVICE_EP.
+    pub has_service_ep: bool,
+    /// Restart on exit (set by SPAWN_FLAG_RESPAWN).
+    pub respawn: bool,
+    /// NUL-terminated binary name for respawn.
+    pub respawn_binary: [u8; MAX_NAME_LEN],
 }
 
 impl Process {
@@ -97,6 +104,7 @@ impl Process {
         Process {
             pid: 0,
             ppid: 0,
+            sid: 0,
             state: PROC_FREE,
             exit_code: 0,
             badge: 0,
@@ -124,6 +132,9 @@ impl Process {
             expand_result_count: 0,
             child_ut_cap: 0,
             ut_expand_count: 0,
+            has_service_ep: false,
+            respawn: false,
+            respawn_binary: [0; MAX_NAME_LEN],
         }
     }
 }
@@ -213,6 +224,7 @@ pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
         let p = &mut PROCTAB[idx];
         p.pid = 0;
         p.ppid = 0;
+        p.sid = 0;
         p.exit_code = 0;
         p.badge = 0;
         p.tcb_cap = 0;
@@ -237,6 +249,11 @@ pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
         p.expand_result_count = 0;
         p.child_ut_cap = 0;
         p.ut_expand_count = 0;
+        p.has_service_ep = false;
+        p.respawn = false;
+        for i in 0..MAX_NAME_LEN {
+            p.respawn_binary[i] = 0;
+        }
         for i in 0..NSIG {
             p.sig_disposition[i] = SIG_DISP_DFL;
         }

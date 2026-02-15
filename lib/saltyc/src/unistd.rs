@@ -8,38 +8,62 @@
 //! `pipe`, `dup`/`dup2`, and the `*at()` family (`openat`, `fstatat`, etc.).
 
 use crate::errno;
+use salty::serial::LineBuf;
+
+static mut UNISTD_DBG_BUDGET: u32 = 160;
+
+#[inline(always)]
+unsafe fn unistd_dbg_rw(tag: &[u8], fd: i32, count: usize, ret: i64) {
+    unsafe {
+        if UNISTD_DBG_BUDGET == 0 {
+            return;
+        }
+        UNISTD_DBG_BUDGET -= 1;
+        let mut lb = LineBuf::new();
+        lb.str(b"[UNISTD] ");
+        lb.str(tag);
+        lb.str(b" fd=");
+        lb.dec(fd as u64);
+        lb.str(b" n=");
+        lb.dec(count as u64);
+        lb.str(b" -> ");
+        lb.dec(ret as u64);
+        lb.str(b"\n");
+        lb.flush();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // C-compatible structures
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-pub struct Stat {
-    pub st_dev: u64,
-    pub st_ino: u64,
-    pub st_mode: u32,
-    pub st_nlink: u32,
-    pub st_uid: u32,
-    pub st_gid: u32,
-    pub st_rdev: u64,
-    pub st_size: i64,
-    pub st_blksize: i64,
-    pub st_blocks: i64,
-    pub st_atime: i64,
-    pub st_atime_nsec: i64,
-    pub st_mtime: i64,
-    pub st_mtime_nsec: i64,
-    pub st_ctime: i64,
-    pub st_ctime_nsec: i64,
-    pub st_flags: u64,
-    pub st_birthtim_tv_sec: i64,
-    pub st_birthtim_tv_nsec: i64,
-}
-
-#[repr(C)]
 pub struct Timespec {
     pub tv_sec: i64,
     pub tv_nsec: i64,
+}
+
+#[repr(C)]
+pub struct Stat {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_nlink: u64,
+    pub st_mode: u16,
+    pub st_padding0: i16,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_padding1: i32,
+    pub st_rdev: u64,
+    pub st_atim: Timespec,
+    pub st_mtim: Timespec,
+    pub st_ctim: Timespec,
+    pub st_birthtim: Timespec,
+    pub st_size: i64,
+    pub st_blocks: i64,
+    pub st_blksize: i32,
+    pub st_flags: u32,
+    pub st_gen: u64,
+    pub st_spare: [u64; 10],
 }
 
 // ---------------------------------------------------------------------------
@@ -48,25 +72,39 @@ pub struct Timespec {
 
 unsafe fn translate_stat(salty_stat: &salty::types::SaltyStat, out: *mut Stat) {
     unsafe {
+        core::ptr::write_bytes(out, 0, 1);
+
         (*out).st_dev = 0;
         (*out).st_ino = salty_stat.st_ino;
-        (*out).st_mode = salty_stat.st_mode as u32;
-        (*out).st_nlink = salty_stat.st_nlink as u32;
+        (*out).st_nlink = salty_stat.st_nlink;
+        (*out).st_mode = (salty_stat.st_mode & 0xffff) as u16;
+        (*out).st_padding0 = 0;
         (*out).st_uid = salty_stat.st_uid as u32;
         (*out).st_gid = salty_stat.st_gid as u32;
+        (*out).st_padding1 = 0;
         (*out).st_rdev = 0;
         (*out).st_size = salty_stat.st_size as i64;
-        (*out).st_blksize = 0;
-        (*out).st_blocks = 0;
-        (*out).st_atime = 0;
-        (*out).st_atime_nsec = 0;
-        (*out).st_mtime = salty_stat.st_mtime as i64;
-        (*out).st_mtime_nsec = 0;
-        (*out).st_ctime = 0;
-        (*out).st_ctime_nsec = 0;
+
+        let blocks = salty_stat.st_size.saturating_add(511) / 512;
+        (*out).st_blocks = if blocks > i64::MAX as u64 {
+            i64::MAX
+        } else {
+            blocks as i64
+        };
+        (*out).st_blksize = 4096;
+
+        let mtime = salty_stat.st_mtime as i64;
+        (*out).st_atim.tv_sec = mtime;
+        (*out).st_atim.tv_nsec = 0;
+        (*out).st_mtim.tv_sec = mtime;
+        (*out).st_mtim.tv_nsec = 0;
+        (*out).st_ctim.tv_sec = mtime;
+        (*out).st_ctim.tv_nsec = 0;
+        (*out).st_birthtim.tv_sec = mtime;
+        (*out).st_birthtim.tv_nsec = 0;
+
         (*out).st_flags = 0;
-        (*out).st_birthtim_tv_sec = (*out).st_ctime;
-        (*out).st_birthtim_tv_nsec = (*out).st_ctime_nsec;
+        (*out).st_gen = 0;
     }
 }
 
@@ -109,6 +147,7 @@ pub unsafe extern "C" fn close(fd: i32) -> i32 {
 pub unsafe extern "C" fn read(fd: i32, buf: *mut u8, count: usize) -> isize {
     unsafe {
         let ret = salty::posix::posix_read(fd, buf, count as u64);
+        unistd_dbg_rw(b"read", fd, count, ret);
         if ret < 0 {
             errno::set_errno(errno::EIO);
         }
@@ -120,6 +159,7 @@ pub unsafe extern "C" fn read(fd: i32, buf: *mut u8, count: usize) -> isize {
 pub unsafe extern "C" fn write(fd: i32, buf: *const u8, count: usize) -> isize {
     unsafe {
         let ret = salty::posix::posix_write(fd, buf, count as u64);
+        unistd_dbg_rw(b"write", fd, count, ret);
         if ret < 0 {
             errno::set_errno(errno::EIO);
         }
@@ -924,4 +964,3 @@ pub unsafe extern "C" fn dup3(oldfd: i32, newfd: i32, flags: i32) -> i32 {
         ret
     }
 }
-

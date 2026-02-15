@@ -113,6 +113,10 @@ pub struct Tcb {
     pub bound_notification: *mut u8,
     /// Kernel stack top for syscall entry (per-thread kernel stack)
     pub kernel_stack_top: u64,
+    /// User stack upper bound (initial user RSP from configure)
+    pub user_stack_top: u64,
+    /// Lowest virtual address eligible for automatic stack growth
+    pub user_stack_min: u64,
     /// Wakeup time in nanoseconds (for nanosleep)
     pub timer_wakeup_ns: u64,
     /// Next pointer for sleep queue (intrusive singly-linked list)
@@ -223,6 +227,8 @@ impl Tcb {
             fault_handler: core::ptr::null_mut(),
             bound_notification: core::ptr::null_mut(),
             kernel_stack_top: 0,
+            user_stack_top: 0,
+            user_stack_min: 0,
             timer_wakeup_ns: 0,
             sleep_next: core::ptr::null_mut(),
         }
@@ -256,6 +262,8 @@ impl Tcb {
         self.reply_tcb = core::ptr::null_mut();
         self.reply_can_grant = false;
         self.fault_handler = core::ptr::null_mut();
+        self.user_stack_top = 0;
+        self.user_stack_min = 0;
         self.timer_wakeup_ns = 0;
         self.sleep_next = core::ptr::null_mut();
 

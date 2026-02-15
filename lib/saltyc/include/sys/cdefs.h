@@ -78,9 +78,6 @@
 #define __has_builtin(x) 0
 #endif
 
-/* Capsicum stubs */
-#define __cap_rights_init(version, ...) {}
-
 /* Minimum/Maximum macros if not already defined */
 #ifndef __min
 #define __min(a, b) ((a) < (b) ? (a) : (b))

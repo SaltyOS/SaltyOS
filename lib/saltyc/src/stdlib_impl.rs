@@ -512,8 +512,35 @@ pub unsafe extern "C" fn rand_r(seedp: *mut u32) -> i32 {
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-pub extern "C" fn system(_command: *const u8) -> i32 {
-    -1
+pub unsafe extern "C" fn system(command: *const u8) -> i32 {
+    unsafe {
+        // system(NULL) returns nonzero to indicate a shell is available
+        if command.is_null() {
+            return 1;
+        }
+
+        let pid = crate::process::fork();
+        if pid < 0 {
+            return -1;
+        }
+
+        if pid == 0 {
+            // Child: exec /bin/sh -c <command>
+            crate::process::execl(
+                b"/bin/sh\0".as_ptr(),
+                b"sh\0".as_ptr(),
+                b"-c\0".as_ptr(),
+                command,
+                core::ptr::null::<u8>(),
+            );
+            crate::crt::_exit(127);
+        }
+
+        // Parent: wait for child
+        let mut status: i32 = 0;
+        crate::process::waitpid(pid, &mut status, 0);
+        status
+    }
 }
 
 #[unsafe(no_mangle)]

@@ -88,6 +88,9 @@ extern void        setprogname(const char *name);
 extern void        strmode(int mode, char *bp);
 extern void       *setmode(const char *mode_str);
 extern mode_t      getmode(const void *set, mode_t omode);
+extern long long   strtonum(const char *numstr, long long minval,
+                            long long maxval, const char **errstrp);
+extern char       *getbsize(int *headerlenp, long *blocksizep);
 
 /* BSD file flag stubs */
 extern char       *fflagstostr(unsigned long flags);

@@ -249,6 +249,16 @@ static inline void rtld_yield(void) {
     rtld_syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
 }
 
+/* Terminate process via PM_EXIT to procmgr (cap slot 3).
+ * PM_EXIT label = 2, length = 1, MR0 = exit_code. */
+#define CAP_PROCMGR_EP   3
+#define PM_EXIT_LABEL     2
+static inline void __attribute__((noreturn)) rtld_exit(int code) {
+    uint64_t msg_info = ((uint64_t)PM_EXIT_LABEL << 12) | 1;
+    rtld_syscall(SYS_SEND, CAP_PROCMGR_EP, msg_info, (uint64_t)code, 0, 0, 0);
+    for (;;) rtld_yield();
+}
+
 /* ============================================================
  * ELF64 Types
  * ============================================================ */

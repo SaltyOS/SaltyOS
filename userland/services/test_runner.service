@@ -1,9 +1,9 @@
 [Service]
 Name=test_runner
-Binary=test_runner.elf
+Binary=test_runner
 Type=simple
 Restart=no
 
 [Dependencies]
-After=procmgr vfs
+After=procmgr vfs getty
 Before=

@@ -12,6 +12,7 @@
 #define MAXBSIZE        65536
 #define DEV_BSIZE       512
 #define MAXLOGNAME      17
+#define MAXPHYS         131072
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))

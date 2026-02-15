@@ -2,10 +2,10 @@
 #ifndef __SYS_TYPES_H__
 #define __SYS_TYPES_H__
 
-typedef long           pid_t;
+typedef int            pid_t;
 typedef unsigned int   uid_t;
 typedef unsigned int   gid_t;
-typedef unsigned int   mode_t;
+typedef unsigned short mode_t;
 typedef long           off_t;
 typedef unsigned long  size_t;
 typedef long           ssize_t;
@@ -15,7 +15,7 @@ typedef int            clockid_t;
 typedef unsigned long  ino_t;
 typedef unsigned long  dev_t;
 typedef unsigned long  nlink_t;
-typedef unsigned long  blksize_t;
+typedef int            blksize_t;
 typedef long           blkcnt_t;
 typedef unsigned long  useconds_t;
 typedef long           suseconds_t;

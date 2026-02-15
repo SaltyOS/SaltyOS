@@ -7,7 +7,7 @@
 pub mod fastpath;
 
 use crate::cap::{CapError, CapRights, Capability, CNode, FrameObject, IoPortRange, ObjectType, UntypedMemory};
-use crate::ipc::{Endpoint, EndpointState, Message, Notification};
+use crate::ipc::{Endpoint, Message, Notification};
 use crate::mm::{save_irq_disable, restore_irq, SCHED_IPC_LOCK, CAP_LOCK};
 use crate::mm::vspace::{PageFlags, VSpace, VSpaceError};
 use crate::sched::thread::{BlockedReason, SchedContext, Tcb, ThreadState};
@@ -480,6 +480,23 @@ pub(crate) unsafe fn write_msg_to_ipc_buffer(msg: &Message, badge: u64) {
         if current.is_null() { return; }
         let buf = (*current).ipc_buffer;
         if buf == 0 { return; }
+
+        // Defensive guard: user processes can set IPC buffer addresses, and
+        // mappings may disappear after exec/fork bugs. Never fault the kernel
+        // while writing a reply — drop the write if the page is not mapped.
+        if validate_ipc_buffer_addr(buf).is_err() {
+            (*current).ipc_buffer = 0;
+            return;
+        }
+        if (*current).vspace_root.is_null() {
+            return;
+        }
+        let vspace = &*(*current).vspace_root;
+        if vspace.resolve_page(buf).is_none() {
+            (*current).ipc_buffer = 0;
+            return;
+        }
+
         let ipc_buf = buf as *mut crate::ipc::IpcBuffer;
 
         // Write header: label and length
@@ -724,8 +741,7 @@ fn syscall_nbsend(
         let irq = save_irq_disable();
         SCHED_IPC_LOCK.lock();
         let endpoint = &mut *(cap.object as *mut Endpoint);
-        let result = if endpoint.state() == EndpointState::RecvBlocked {
-            endpoint.send(&msg, cap.badge);
+        let result = if endpoint.nbsend(&msg, cap.badge) {
             SyscallResult::ok(0)
         } else {
             SyscallResult::err(SyscallError::WouldBlock)
@@ -1507,6 +1523,9 @@ fn syscall_tcb_configure(
     entry_rsp: u64,
     ipc_buffer: u64,
 ) -> SyscallResult {
+    // Maximum automatic user-stack growth window below the configured top.
+    const USER_STACK_GROW_LIMIT: u64 = 0x0010_0000; // 1 MiB
+
     if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::CONFIGURE) {
         return SyscallResult::err(e);
     }
@@ -1557,6 +1576,8 @@ fn syscall_tcb_configure(
             tcb.context.r15 = 0x0202;
             tcb.context.rflags = 0x202;
             tcb.ipc_buffer = ipc_buffer;
+            tcb.user_stack_top = entry_rsp;
+            tcb.user_stack_min = entry_rsp.saturating_sub(USER_STACK_GROW_LIMIT);
             SCHED_IPC_LOCK.unlock();
             restore_irq(irq);
         } else {

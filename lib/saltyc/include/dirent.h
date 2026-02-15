@@ -5,10 +5,13 @@
 #include <sys/types.h>
 
 struct dirent {
-    unsigned long d_ino;
-    long          d_off;
+    unsigned long  d_ino;
+    long           d_off;
     unsigned short d_reclen;
     unsigned char  d_type;
+    unsigned char  d_pad0;
+    unsigned short d_namlen;
+    unsigned short d_pad1;
     char           d_name[256];
 };
 

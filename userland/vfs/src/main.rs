@@ -39,7 +39,9 @@ use salty::types::*;
 const CAP_SERVER_EP: u64 = 3;
 const VFS_CAP_CONSOLE_EP: u64 = 64;    // NeedEP console:64
 const VFS_CAP_NAMESERV_EP: u64 = 65;   // NeedEP nameserv:65
+const VFS_CAP_TTYD_EP: u64 = 67;       // NeedEP ttyd:67
 const VFS_CAP_FB_UNTYPED: u64 = 66;    // CopyCap 13:66
+const VFS_CAP_PTY_NTFN: u64 = 68;     // CopyCap 14:68 (PTY data-ready notification)
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 // VFS protocol labels
@@ -99,6 +101,19 @@ const VFS_READLINKAT: u64 = 57;
 const VFS_UTIMENSAT: u64 = 58;
 const VFS_FCHMOD: u64 = 59;
 const VFS_FCHOWN: u64 = 60;
+const VFS_CLIENT_EXIT: u64 = 61;
+
+const TTYD_GET_FG_PGRP: u64 = 1;
+const TTYD_SET_FG_PGRP: u64 = 2;
+const TTYD_SET_CTTY: u64 = 3;
+const TTYD_DROP_CTTY: u64 = 4;
+const TTYD_PTY_READ: u64 = 11;
+const TTYD_PTY_WRITE: u64 = 12;
+const TTYD_PTY_TCGETATTR: u64 = 14;
+const TTYD_PTY_TCSETATTR: u64 = 15;
+const TTYD_PTY_IOCTL: u64 = 16;
+const TTYD_PTY_POLL: u64 = 17;
+const TTYD_PTY_COLLECT: u64 = 19;
 
 const AT_FDCWD_VAL: i32 = -100;
 const AT_REMOVEDIR_VAL: i32 = 0x200;
@@ -134,6 +149,7 @@ const DEV_CONSOLE: u8 = 0;
 const DEV_NULL: u8 = 1;
 const DEV_ZERO: u8 = 2;
 const DEV_FB0: u8 = 3;
+const DEV_PTY_SLAVE: u8 = 4;
 
 // Limits
 const MAX_INODES: usize = 128;
@@ -170,8 +186,11 @@ const MAX_POLL_WAITERS: usize = 16;
 const MAX_SHM_PAGES: usize = 64;
 const MAX_PENDING_CONN: usize = 4;
 
-// Cap slot ranges for deferred reply
+// Cap slot range for deferred replies.
+// Keep this strictly below 64 so it never collides with service-injected caps
+// (NeedEP/CopyCap are validated to use slots >= 64) or rtld runtime slot pool.
 const CAP_REPLY_BASE: u64 = 32;
+const CAP_REPLY_LIMIT: u64 = 63;
 
 // Root inode
 const ROOT_INO: u32 = 1;
@@ -440,6 +459,9 @@ static mut FB_GREEN_SIZE: u8 = 0;
 static mut FB_BLUE_POS: u8 = 0;
 static mut FB_BLUE_SIZE: u8 = 0;
 static mut FB_MMAP_BADGE: u64 = 0;
+// Shell-focused debug tracing target (badge set when /dev/pts/0 is opened).
+static mut SHELL_DEBUG_BADGE: u64 = 0;
+static mut PTY_NOTIFY_DEBUG_BUDGET: u32 = 24;
 
 macro_rules! INODES {
     () => {
@@ -729,6 +751,28 @@ macro_rules! PIPES {
     };
 }
 
+// PTY pending reader queue for deferred terminal reads
+const MAX_PTYS: usize = 4;
+const MAX_PTY_WAITERS: usize = 4;
+
+#[derive(Clone, Copy)]
+struct PtyPendingReader {
+    active: u8,
+    badge: u64,
+    reply_slot: u64,
+    max_count: u64,
+}
+
+impl PtyPendingReader {
+    const fn zeroed() -> Self {
+        PtyPendingReader { active: 0, badge: 0, reply_slot: 0, max_count: 0 }
+    }
+}
+
+static mut PTY_PENDING: [[PtyPendingReader; MAX_PTY_WAITERS]; MAX_PTYS] =
+    [[PtyPendingReader::zeroed(); MAX_PTY_WAITERS]; MAX_PTYS];
+static mut PTY_PENDING_COUNT: [usize; MAX_PTYS] = [0; MAX_PTYS];
+
 // Reply slot counter for deferred replies
 static mut NEXT_REPLY_SLOT: u64 = CAP_REPLY_BASE;
 
@@ -1004,6 +1048,64 @@ fn str_equal_raw(a: *const u8, alen: usize, b: *const u8, blen: usize) -> bool {
     true
 }
 
+fn shell_dbg_enabled(badge: u64) -> bool {
+    unsafe { SHELL_DEBUG_BADGE != 0 && SHELL_DEBUG_BADGE == badge }
+}
+
+fn shell_dbg_is_pts0(path: *const u8, path_len: u8) -> bool {
+    const PTS0: &[u8] = b"/dev/pts/0";
+    if path_len as usize != PTS0.len() {
+        return false;
+    }
+    for i in 0..PTS0.len() {
+        unsafe {
+            if *path.add(i) != PTS0[i] {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn shell_dbg_maybe_track_pts0_open(path: *const u8, path_len: u8, badge: u64) {
+    unsafe {
+        if SHELL_DEBUG_BADGE != 0 || !shell_dbg_is_pts0(path, path_len) {
+            return;
+        }
+        SHELL_DEBUG_BADGE = badge;
+        let mut lb = LineBuf::new();
+        lb.str(b"[VFS][SHELL] tracking badge=");
+        lb.hex(badge);
+        lb.str(b" (opened /dev/pts/0)\n");
+        lb.flush();
+    }
+}
+
+fn shell_dbg_label_traced(label: u64) -> bool {
+    matches!(
+        label,
+        VFS_OPEN
+            | VFS_OPENAT
+            | VFS_READ
+            | VFS_WRITE
+            | VFS_CLOSE
+            | VFS_STAT
+            | VFS_FSTATAT
+            | VFS_ACCESS
+            | VFS_IOCTL
+            | VFS_ISATTY
+            | VFS_FCNTL
+            | VFS_TCGETATTR
+            | VFS_TCSETATTR
+            | VFS_POLL
+            | VFS_GETCWD
+            | VFS_CHDIR
+            | VFS_DUP
+            | VFS_DUP2
+            | VFS_DUP3
+    )
+}
+
 unsafe fn inode_by_ino(ino: u32) -> *mut RamfsInode {
     unsafe {
         for i in 0..max_inodes() {
@@ -1114,11 +1216,173 @@ unsafe fn dir_remove_entry(dir: *mut RamfsInode, name: *const u8, name_len: u8) 
     }
 }
 
+unsafe fn ensure_readonly_dir(parent: *mut RamfsInode, name: *const u8, name_len: u8) -> *mut RamfsInode {
+    unsafe {
+        let existing = dir_find_entry(parent, name, name_len);
+        if !existing.is_null() {
+            let inode = inode_by_ino((*existing).ino);
+            if inode.is_null() || (*inode).ftype != FTYPE_DIRECTORY {
+                return core::ptr::null_mut();
+            }
+            return inode;
+        }
+
+        let dir = alloc_inode();
+        if dir.is_null() {
+            return core::ptr::null_mut();
+        }
+
+        (*dir).ftype = FTYPE_DIRECTORY;
+        (*dir).mode = S_IFDIR_L | 0o555;
+        (*dir).readonly = 1;
+        (*dir).nlink = 2;
+        (*dir).parent_ino = (*parent).ino;
+
+        if dir_add_entry(parent, name, name_len, (*dir).ino) != 0 {
+            (*dir).active = 0;
+            return core::ptr::null_mut();
+        }
+        dir
+    }
+}
+
+unsafe fn mount_initrd_entry(root: *mut RamfsInode, entry: &CpioEntryExt) -> bool {
+    unsafe {
+        if root.is_null() || entry.name.is_null() || entry.name_len == 0 {
+            return false;
+        }
+
+        // Normalize CPIO path:
+        // - drop leading '/'
+        // - drop leading "./"
+        // - strip trailing '/'
+        let mut start = 0usize;
+        let mut end = entry.name_len;
+
+        while start < end && *entry.name.add(start) == b'/' {
+            start += 1;
+        }
+        while start + 1 < end && *entry.name.add(start) == b'.' && *entry.name.add(start + 1) == b'/' {
+            start += 2;
+        }
+        while end > start && *entry.name.add(end - 1) == b'/' {
+            end -= 1;
+        }
+
+        if start >= end {
+            return true;
+        }
+
+        let mut current = root;
+        let mut pos = start;
+
+        while pos < end {
+            while pos < end && *entry.name.add(pos) == b'/' {
+                pos += 1;
+            }
+            if pos >= end {
+                break;
+            }
+
+            let comp_start = pos;
+            while pos < end && *entry.name.add(pos) != b'/' {
+                pos += 1;
+            }
+            let comp_len = pos - comp_start;
+            if comp_len == 0 || comp_len >= MAX_NAME_LEN {
+                return false;
+            }
+
+            let mut next = pos;
+            while next < end && *entry.name.add(next) == b'/' {
+                next += 1;
+            }
+            let is_leaf = next >= end;
+
+            if !is_leaf {
+                let dir = ensure_readonly_dir(current, entry.name.add(comp_start), comp_len as u8);
+                if dir.is_null() {
+                    return false;
+                }
+                current = dir;
+                continue;
+            }
+
+            let leaf_name = entry.name.add(comp_start);
+            let leaf_len = comp_len as u8;
+            let leaf_mode = if entry.mode != 0 { entry.mode } else { S_IFREG_L | 0o444 };
+            let leaf_is_dir = (leaf_mode & S_IFMT_L) == S_IFDIR_L;
+
+            let existing = dir_find_entry(current, leaf_name, leaf_len);
+            if !existing.is_null() {
+                let inode = inode_by_ino((*existing).ino);
+                if inode.is_null() {
+                    return false;
+                }
+                if leaf_is_dir && (*inode).ftype == FTYPE_DIRECTORY {
+                    (*inode).mode = leaf_mode;
+                    (*inode).readonly = 1;
+                    (*inode).nlink = if entry.nlink != 0 { entry.nlink } else { 2 };
+                    (*inode).mtime = entry.mtime;
+                    (*inode).parent_ino = (*current).ino;
+                    return true;
+                }
+                if !leaf_is_dir && (*inode).ftype == FTYPE_REGULAR {
+                    (*inode).mode = leaf_mode;
+                    (*inode).readonly = 1;
+                    (*inode).nlink = if entry.nlink != 0 { entry.nlink } else { 1 };
+                    (*inode).mtime = entry.mtime;
+                    (*inode).size = entry.data_len as u64;
+                    (*inode).ro_data = entry.data;
+                    (*inode).rw_data = core::ptr::null_mut();
+                    (*inode).parent_ino = (*current).ino;
+                    return true;
+                }
+                return false;
+            }
+
+            let inode = alloc_inode();
+            if inode.is_null() {
+                return false;
+            }
+
+            (*inode).readonly = 1;
+            (*inode).mode = leaf_mode;
+            (*inode).mtime = entry.mtime;
+            (*inode).parent_ino = (*current).ino;
+            (*inode).nlink = if entry.nlink != 0 {
+                entry.nlink
+            } else if leaf_is_dir {
+                2
+            } else {
+                1
+            };
+
+            if leaf_is_dir {
+                (*inode).ftype = FTYPE_DIRECTORY;
+                (*inode).size = 0;
+            } else {
+                (*inode).ftype = FTYPE_REGULAR;
+                (*inode).size = entry.data_len as u64;
+                (*inode).ro_data = entry.data;
+            }
+
+            if dir_add_entry(current, leaf_name, leaf_len, (*inode).ino) != 0 {
+                (*inode).active = 0;
+                return false;
+            }
+            return true;
+        }
+
+        true
+    }
+}
+
 // ======================================================================
 // Path resolution
 // ======================================================================
 
-unsafe fn resolve_path(path: *const u8, path_len: u8) -> *mut RamfsInode {
+unsafe fn resolve_path_raw(path: *const u8, path_len: u8) -> *mut RamfsInode {
     unsafe {
         if path_len == 0 {
             return core::ptr::null_mut();
@@ -1159,6 +1423,22 @@ unsafe fn resolve_path(path: *const u8, path_len: u8) -> *mut RamfsInode {
                 pos += 1;
             }
 
+            // Handle "." — stay at current directory
+            if comp_len == 1 && *path.add(start) == b'.' {
+                continue;
+            }
+            // Handle ".." — move to parent
+            if comp_len == 2 && *path.add(start) == b'.' && *path.add(start + 1) == b'.' {
+                current = inode_by_ino((*current).parent_ino);
+                if current.is_null() {
+                    current = inode_by_ino(ROOT_INO);
+                    if current.is_null() {
+                        return core::ptr::null_mut();
+                    }
+                }
+                continue;
+            }
+
             let de = dir_find_entry(current, path.add(start), comp_len as u8);
             if de.is_null() {
                 return core::ptr::null_mut();
@@ -1171,6 +1451,69 @@ unsafe fn resolve_path(path: *const u8, path_len: u8) -> *mut RamfsInode {
         }
 
         current
+    }
+}
+
+fn is_initrd_prefixed_path(path: *const u8, path_len: u8) -> bool {
+    unsafe {
+        const PREFIX: &[u8] = b"/initrd";
+        let plen = path_len as usize;
+        if plen < PREFIX.len() {
+            return false;
+        }
+        for (i, b) in PREFIX.iter().enumerate() {
+            if *path.add(i) != *b {
+                return false;
+            }
+        }
+        plen == PREFIX.len() || *path.add(PREFIX.len()) == b'/'
+    }
+}
+
+fn path_has_component_prefix(path: *const u8, path_len: u8, prefix: &[u8]) -> bool {
+    unsafe {
+        let plen = path_len as usize;
+        if plen < prefix.len() {
+            return false;
+        }
+        for (i, b) in prefix.iter().enumerate() {
+            if *path.add(i) != *b {
+                return false;
+            }
+        }
+        plen == prefix.len() || *path.add(prefix.len()) == b'/'
+    }
+}
+
+unsafe fn resolve_path(path: *const u8, path_len: u8) -> *mut RamfsInode {
+    unsafe {
+        let direct = resolve_path_raw(path, path_len);
+        if !direct.is_null() {
+            return direct;
+        }
+
+        // Root path fallback for immutable initrd command trees.
+        // Keep this narrow so writable paths (/tmp, /dev, ...) are not remapped.
+        let allow_fallback = path_has_component_prefix(path, path_len, b"/bin")
+            || path_has_component_prefix(path, path_len, b"/usr");
+
+        if allow_fallback && !is_initrd_prefixed_path(path, path_len) {
+            const PREFIX: &[u8] = b"/initrd";
+            let in_len = path_len as usize;
+            let out_len = PREFIX.len() + in_len;
+            if out_len <= MAX_PATH_LEN {
+                let mut prefixed = [0u8; MAX_PATH_LEN];
+                for (i, b) in PREFIX.iter().enumerate() {
+                    prefixed[i] = *b;
+                }
+                for i in 0..in_len {
+                    prefixed[PREFIX.len() + i] = *path.add(i);
+                }
+                return resolve_path_raw(prefixed.as_ptr(), out_len as u8);
+            }
+        }
+
+        core::ptr::null_mut()
     }
 }
 
@@ -1261,6 +1604,22 @@ unsafe fn resolve_path_from(start_ino: u32, path: *const u8, path_len: u8) -> *m
 
             if pos < plen && *path.add(pos) == b'/' {
                 pos += 1;
+            }
+
+            // Handle "." — stay at current directory
+            if comp_len == 1 && *path.add(start) == b'.' {
+                continue;
+            }
+            // Handle ".." — move to parent
+            if comp_len == 2 && *path.add(start) == b'.' && *path.add(start + 1) == b'.' {
+                current = inode_by_ino((*current).parent_ino);
+                if current.is_null() {
+                    current = inode_by_ino(ROOT_INO);
+                    if current.is_null() {
+                        return core::ptr::null_mut();
+                    }
+                }
+                continue;
             }
 
             let de = dir_find_entry(current, path.add(start), comp_len as u8);
@@ -1452,6 +1811,32 @@ unsafe fn init_ramfs() {
         (*fb0_dev).parent_ino = (*dev_dir).ino;
         dir_add_entry(dev_dir, b"fb0".as_ptr(), 3, (*fb0_dev).ino);
 
+        // Create /dev/pts directory
+        let pts_dir = alloc_inode();
+        (*pts_dir).ftype = FTYPE_DIRECTORY;
+        (*pts_dir).mode = S_IFDIR_L | 0o755;
+        (*pts_dir).nlink = 2;
+        (*pts_dir).parent_ino = (*dev_dir).ino;
+        dir_add_entry(dev_dir, b"pts".as_ptr(), 3, (*pts_dir).ino);
+
+        // Create /dev/pts/0 — PTY slave device
+        let pts0 = alloc_inode();
+        (*pts0).ftype = FTYPE_CHAR_DEVICE;
+        (*pts0).mode = S_IFCHR_L | 0o666;
+        (*pts0).dev_type = DEV_PTY_SLAVE;
+        (*pts0).size = 0; // pty_id = 0
+        (*pts0).parent_ino = (*pts_dir).ino;
+        dir_add_entry(pts_dir, b"0".as_ptr(), 1, (*pts0).ino);
+
+        // Create /dev/tty (resolves to PTY slave for single-terminal system)
+        let tty_dev = alloc_inode();
+        (*tty_dev).ftype = FTYPE_CHAR_DEVICE;
+        (*tty_dev).mode = S_IFCHR_L | 0o666;
+        (*tty_dev).dev_type = DEV_PTY_SLAVE;
+        (*tty_dev).size = 0; // pty_id = 0
+        (*tty_dev).parent_ino = (*dev_dir).ino;
+        dir_add_entry(dev_dir, b"tty".as_ptr(), 3, (*tty_dev).ino);
+
         // Create /initrd directory
         let initrd_dir = alloc_inode();
         (*initrd_dir).ftype = FTYPE_DIRECTORY;
@@ -1476,49 +1861,9 @@ unsafe fn init_ramfs() {
             if entry.name_len == 1 && *entry.name == b'.' {
                 continue;
             }
-            if entry.name_len >= MAX_NAME_LEN {
-                continue;
+            if mount_initrd_entry(initrd_dir, &entry) {
+                file_count += 1;
             }
-
-            let file_inode = alloc_inode();
-            if file_inode.is_null() {
-                break;
-            }
-
-            (*file_inode).readonly = 1;
-            if entry.ino != 0 {
-                (*file_inode).ino = entry.ino;
-            }
-            if entry.mode != 0 {
-                (*file_inode).mode = entry.mode;
-            } else {
-                (*file_inode).mode = S_IFREG_L | 0o444;
-            }
-            if entry.nlink != 0 {
-                (*file_inode).nlink = entry.nlink;
-            } else {
-                (*file_inode).nlink = 1;
-            }
-            (*file_inode).mtime = entry.mtime;
-            (*file_inode).size = entry.data_len as u64;
-            (*file_inode).ro_data = entry.data;
-            (*file_inode).parent_ino = (*initrd_dir).ino;
-
-            if (entry.mode & S_IFMT_L) == S_IFDIR_L {
-                (*file_inode).ftype = FTYPE_DIRECTORY;
-            } else {
-                (*file_inode).ftype = FTYPE_REGULAR;
-            }
-
-            dir_add_entry(
-                initrd_dir,
-                entry.name,
-                entry.name_len as u8,
-                (*file_inode).ino,
-            );
-            file_count += 1;
-
-            { let mut lb = LineBuf::new(); lb.str(b"[VFS] initrd: "); lb.bytes(core::slice::from_raw_parts(entry.name, entry.name_len)); lb.str(b" ("); lb.hex(entry.data_len as u64); lb.str(b")\n"); lb.flush(); }
         }
 
         { let mut lb = LineBuf::new(); lb.str(b"[VFS] Mounted "); lb.hex(file_count as u64); lb.str(b" initrd files\n"); lb.flush(); }
@@ -1596,6 +1941,17 @@ unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
             return;
         }
 
+        shell_dbg_maybe_track_pts0_open(path.as_ptr(), path_len, badge);
+        if shell_dbg_enabled(badge) || shell_dbg_is_pts0(path.as_ptr(), path_len) {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS][SHELL] open path='");
+            lb.bytes(&path[..path_len as usize]);
+            lb.str(b"' flags=");
+            lb.hex(flags as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
+
         let mut inode = resolve_path(path.as_ptr(), path_len);
 
         if inode.is_null() {
@@ -1623,7 +1979,13 @@ unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
             }
 
             if inode.is_null() {
-                { let mut lb = LineBuf::new(); lb.str(b"[VFS] OPEN: not found '"); lb.bytes(&path[..path_len as usize]); lb.str(b"'\n"); lb.flush(); }
+                if shell_dbg_enabled(badge) {
+                    let mut lb = LineBuf::new();
+                    lb.str(b"[VFS][SHELL] open: not found path='");
+                    lb.bytes(&path[..path_len as usize]);
+                    lb.str(b"'\n");
+                    lb.flush();
+                }
                 (*reply).label = SALTY_NOT_FOUND;
                 return;
             }
@@ -1669,6 +2031,9 @@ unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                 if (*inode).ftype == FTYPE_CHAR_DEVICE {
                     (*cli).fds[fd].fd_type = FD_TYPE_DEVICE;
                     (*cli).fds[fd].dev_type = (*inode).dev_type;
+                    if (*inode).dev_type == DEV_PTY_SLAVE {
+                        (*cli).fds[fd].sock_id = (*inode).size as u32; // pty_id
+                    }
                 } else if (*inode).ftype == FTYPE_DIRECTORY {
                     (*cli).fds[fd].fd_type = FD_TYPE_DIR;
                 } else if (*inode).ftype == FTYPE_FIFO {
@@ -1699,6 +2064,17 @@ unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                 (*reply).label = SALTY_OK;
                 (*reply).length = 1;
                 (*reply).regs[0] = fd as u64;
+                if shell_dbg_enabled(badge) {
+                    let mut lb = LineBuf::new();
+                    lb.str(b"[VFS][SHELL] open -> fd=");
+                    lb.dec(fd as u64);
+                    lb.str(b" dev=");
+                    lb.hex((*cli).fds[fd].dev_type as u64);
+                    lb.str(b" type=");
+                    lb.hex((*cli).fds[fd].fd_type as u64);
+                    lb.str(b"\n");
+                    lb.flush();
+                }
                 return;
             }
         }
@@ -1742,17 +2118,22 @@ unsafe fn handle_read(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                         (*reply).label = SALTY_INVALID_OPERATION;
                         return;
                     }
-                    let c = creply.regs[0];
-                    if c == u64::MAX {
+
+                    let read_count = creply.regs[0];
+                    if read_count == 0 {
                         (*reply).label = SALTY_OK;
                         (*reply).length = 1;
                         (*reply).regs[0] = 0;
                     } else {
+                        let actual = if read_count > count { count } else { read_count };
                         (*reply).label = SALTY_OK;
-                        (*reply).length = 2;
-                        (*reply).regs[0] = 1;
-                        let data = &raw mut (*reply).regs[1] as *mut u8;
-                        *data = c as u8;
+                        (*reply).length = 1 + (actual + 7) / 8;
+                        (*reply).regs[0] = actual;
+                        let src = &creply.regs[1] as *const u64 as *const u8;
+                        let dst = &raw mut (*reply).regs[1] as *mut u8;
+                        for i in 0..actual as usize {
+                            *dst.add(i) = *src.add(i);
+                        }
                     }
                 }
                 DEV_NULL => {
@@ -1771,6 +2152,33 @@ unsafe fn handle_read(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                 }
                 DEV_FB0 => {
                     (*reply).label = SALTY_INVALID_OPERATION;
+                }
+                DEV_PTY_SLAVE => {
+                    // PTY reads should go through main loop dispatch for deferred support.
+                    // If we end up here, do a non-blocking try-read.
+                    let pty_id = fde.sock_id as u64;
+                    let mut treq = SaltyMsg::zeroed();
+                    let mut treply = SaltyMsg::zeroed();
+                    treq.label = TTYD_PTY_READ;
+                    treq.regs[0] = pty_id;
+                    treq.regs[1] = count;
+                    treq.length = 2;
+                    let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+                    if err != 0 || treply.label != SALTY_OK {
+                        (*reply).label = SALTY_INVALID_OPERATION;
+                        return;
+                    }
+                    let actual = treply.regs[0];
+                    (*reply).label = SALTY_OK;
+                    (*reply).length = 1 + (actual + 7) / 8;
+                    (*reply).regs[0] = actual;
+                    if actual > 0 {
+                        let src = &treply.regs[1] as *const u64 as *const u8;
+                        let dst = &raw mut (*reply).regs[1] as *mut u8;
+                        for i in 0..actual as usize {
+                            *dst.add(i) = *src.add(i);
+                        }
+                    }
                 }
                 _ => {
                     (*reply).label = SALTY_INVALID_OPERATION;
@@ -1883,6 +2291,36 @@ unsafe fn handle_write(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                     (*reply).label = SALTY_OK;
                     (*reply).length = 1;
                     (*reply).regs[0] = count;
+                }
+                DEV_PTY_SLAVE => {
+                    // Forward write to ttyd for OPOST processing + serial/display output
+                    let pty_id = fde.sock_id as u64;
+                    let src = &(*msg).regs[2] as *const u64 as *const u8;
+                    let mut sent: u64 = 0;
+                    while sent < count {
+                        let mut treq = SaltyMsg::zeroed();
+                        let mut treply = SaltyMsg::zeroed();
+                        let mut chunk = count - sent;
+                        if chunk > 136 { // 17 regs * 8 bytes (regs[2..19])
+                            chunk = 136;
+                        }
+                        treq.label = TTYD_PTY_WRITE;
+                        treq.regs[0] = pty_id;
+                        treq.regs[1] = chunk;
+                        let dst = &raw mut treq.regs[2] as *mut u8;
+                        for i in 0..chunk as usize {
+                            *dst.add(i) = *src.add(sent as usize + i);
+                        }
+                        treq.length = 2 + (chunk + 7) / 8;
+                        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+                        if err != 0 || treply.label != SALTY_OK {
+                            break;
+                        }
+                        sent += chunk;
+                    }
+                    (*reply).label = if sent > 0 { SALTY_OK } else { SALTY_INVALID_OPERATION };
+                    (*reply).length = 1;
+                    (*reply).regs[0] = sent;
                 }
                 DEV_FB0 => {
                     (*reply).label = SALTY_INVALID_OPERATION;
@@ -2028,11 +2466,41 @@ unsafe fn handle_fstat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     }
 }
 
-unsafe fn handle_stat(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
+unsafe fn get_client_cwd_ino(badge: u64) -> u32 {
+    unsafe {
+        let cli = get_client_noalloc(badge);
+        if cli.is_null() {
+            return ROOT_INO;
+        }
+        let mut cwd_len: usize = 0;
+        while cwd_len < 128 && (*cli).cwd[cwd_len] != 0 {
+            cwd_len += 1;
+        }
+        if cwd_len == 0 {
+            return ROOT_INO;
+        }
+        let inode = resolve_path((*cli).cwd.as_ptr(), cwd_len as u8);
+        if inode.is_null() { ROOT_INO } else { (*inode).ino }
+    }
+}
+
+unsafe fn handle_stat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
         let path_len = extract_path(msg, 0, path.as_mut_ptr());
-        let inode = resolve_path(path.as_ptr(), path_len);
+        if shell_dbg_enabled(badge) {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS][SHELL] stat path='");
+            lb.bytes(&path[..path_len as usize]);
+            lb.str(b"'\n");
+            lb.flush();
+        }
+        let inode = if path_len > 0 && path[0] == b'/' {
+            resolve_path(path.as_ptr(), path_len)
+        } else {
+            let cwd_ino = get_client_cwd_ino(badge);
+            resolve_path_from(cwd_ino, path.as_ptr(), path_len)
+        };
         if inode.is_null() {
             (*reply).label = SALTY_NOT_FOUND;
             return;
@@ -2041,11 +2509,23 @@ unsafe fn handle_stat(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
     }
 }
 
-unsafe fn handle_access(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
+unsafe fn handle_access(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
         let path_len = extract_path(msg, 1, path.as_mut_ptr());
-        let inode = resolve_path(path.as_ptr(), path_len);
+        if shell_dbg_enabled(badge) {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS][SHELL] access path='");
+            lb.bytes(&path[..path_len as usize]);
+            lb.str(b"'\n");
+            lb.flush();
+        }
+        let inode = if path_len > 0 && path[0] == b'/' {
+            resolve_path(path.as_ptr(), path_len)
+        } else {
+            let cwd_ino = get_client_cwd_ino(badge);
+            resolve_path_from(cwd_ino, path.as_ptr(), path_len)
+        };
         if inode.is_null() {
             (*reply).label = SALTY_NOT_FOUND;
             return;
@@ -2359,6 +2839,9 @@ unsafe fn do_open(
                 if (*inode).ftype == FTYPE_CHAR_DEVICE {
                     (*cli).fds[fd].fd_type = FD_TYPE_DEVICE;
                     (*cli).fds[fd].dev_type = (*inode).dev_type;
+                    if (*inode).dev_type == DEV_PTY_SLAVE {
+                        (*cli).fds[fd].sock_id = (*inode).size as u32; // pty_id
+                    }
                 } else if (*inode).ftype == FTYPE_DIRECTORY {
                     (*cli).fds[fd].fd_type = FD_TYPE_DIR;
                 } else if (*inode).ftype == FTYPE_FIFO {
@@ -2405,6 +2888,19 @@ unsafe fn handle_openat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) 
         let mut path = [0u8; MAX_PATH_LEN];
         let path_len = extract_path(msg, 2, path.as_mut_ptr());
 
+        shell_dbg_maybe_track_pts0_open(path.as_ptr(), path_len, badge);
+        if shell_dbg_enabled(badge) {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS][SHELL] openat dirfd=");
+            lb.dec(dirfd as u64);
+            lb.str(b" path='");
+            lb.bytes(&path[..path_len as usize]);
+            lb.str(b"' flags=");
+            lb.hex(flags as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
+
         let start_ino = resolve_at_start(badge, dirfd, path.as_ptr(), path_len);
         if start_ino == 0 {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -2423,6 +2919,17 @@ unsafe fn handle_fstatat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
         let at_flags = (*msg).regs[1] as i32;
         let mut path = [0u8; MAX_PATH_LEN];
         let path_len = extract_path(msg, 2, path.as_mut_ptr());
+        if shell_dbg_enabled(badge) {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS][SHELL] fstatat dirfd=");
+            lb.dec(dirfd as u64);
+            lb.str(b" path='");
+            lb.bytes(&path[..path_len as usize]);
+            lb.str(b"' flags=");
+            lb.hex(at_flags as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
 
         let start_ino = resolve_at_start(badge, dirfd, path.as_ptr(), path_len);
         if start_ino == 0 && !((at_flags & AT_EMPTY_PATH_VAL) != 0 && path_len == 0) {
@@ -3006,10 +3513,171 @@ unsafe fn alloc_reply_slot() -> u64 {
     unsafe {
         let slot = NEXT_REPLY_SLOT;
         NEXT_REPLY_SLOT += 1;
-        if NEXT_REPLY_SLOT > CAP_REPLY_BASE + 64 {
+        if NEXT_REPLY_SLOT > CAP_REPLY_LIMIT {
             NEXT_REPLY_SLOT = CAP_REPLY_BASE;
         }
         slot
+    }
+}
+
+/// Handle a deferred PTY device read. Called from main loop when fd is DEV_PTY_SLAVE.
+/// Returns true if reply is deferred (skip_reply), false if reply is ready now.
+unsafe fn handle_pty_dev_read(
+    msg: *const SaltyMsg, fde: *mut FdEntry, reply: *mut SaltyMsg, badge: u64,
+) -> bool {
+    unsafe {
+        let count = (*msg).regs[1];
+        let max = if count > 152 { 152 } else { count };
+        let pty_id = (*fde).sock_id as u64;
+
+        // Try-read from ttyd (always returns immediately)
+        let mut treq = SaltyMsg::zeroed();
+        let mut treply = SaltyMsg::zeroed();
+        treq.label = TTYD_PTY_READ;
+        treq.regs[0] = pty_id;
+        treq.regs[1] = max;
+        treq.length = 2;
+
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+        if err != 0 || treply.label != SALTY_OK {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return false;
+        }
+
+        let actual = treply.regs[0];
+        if actual > 0 {
+            // Data available — return immediately
+            (*reply).label = SALTY_OK;
+            (*reply).length = 1 + (actual + 7) / 8;
+            (*reply).regs[0] = actual;
+            let src = &treply.regs[1] as *const u64 as *const u8;
+            let dst = &raw mut (*reply).regs[1] as *mut u8;
+            for i in 0..actual as usize {
+                *dst.add(i) = *src.add(i);
+            }
+            return false;
+        }
+
+        // WOULD_BLOCK — save caller's reply cap, enqueue pending reader
+        let pid = pty_id as usize;
+        if pid >= MAX_PTYS || PTY_PENDING_COUNT[pid] >= MAX_PTY_WAITERS {
+            (*reply).label = SALTY_BUSY;
+            return false;
+        }
+
+        let slot = alloc_reply_slot();
+        let save_err = salty::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
+        if save_err != 0 {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return false;
+        }
+
+        let idx = PTY_PENDING_COUNT[pid];
+        PTY_PENDING[pid][idx] = PtyPendingReader {
+            active: 1,
+            badge,
+            reply_slot: slot,
+            max_count: max,
+        };
+        PTY_PENDING_COUNT[pid] += 1;
+
+        true // deferred — VFS will wake this reader when ttyd signals data-ready
+    }
+}
+
+/// Handle bound notification from ttyd signalling PTY data ready.
+/// Called when VFS wakes from reply_recv with a notification (msg.length==0, badge!=0).
+/// Wakes pending PTY readers by collecting data from ttyd and forwarding to saved reply caps.
+unsafe fn handle_pty_notification(ntfn_badge: u64) {
+    unsafe {
+        if PTY_NOTIFY_DEBUG_BUDGET > 0 {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS][PTYN] badge=");
+            lb.hex(ntfn_badge);
+            lb.str(b"\n");
+            lb.flush();
+            PTY_NOTIFY_DEBUG_BUDGET -= 1;
+        }
+        for pty_id in 0..MAX_PTYS {
+            if ntfn_badge & (1u64 << pty_id) == 0 {
+                continue;
+            }
+
+            // Wake pending readers for this PTY in FIFO order
+            while PTY_PENDING_COUNT[pty_id] > 0 {
+                let reader = PTY_PENDING[pty_id][0];
+                if reader.active == 0 {
+                    break;
+                }
+
+                // Collect data from ttyd
+                let mut creq = SaltyMsg::zeroed();
+                let mut creply = SaltyMsg::zeroed();
+                creq.label = TTYD_PTY_COLLECT;
+                creq.regs[0] = pty_id as u64;
+                creq.regs[1] = reader.max_count;
+                creq.length = 2;
+                let cerr = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const creq, &raw mut creply);
+
+                let actual = creply.regs[0];
+                if PTY_NOTIFY_DEBUG_BUDGET > 0 {
+                    let mut lb = LineBuf::new();
+                    lb.str(b"[VFS][PTYN] pty=");
+                    lb.hex(pty_id as u64);
+                    lb.str(b" waiters=");
+                    lb.hex(PTY_PENDING_COUNT[pty_id] as u64);
+                    lb.str(b" call_err=");
+                    lb.hex(cerr as u64);
+                    lb.str(b" label=");
+                    lb.hex(creply.label);
+                    lb.str(b" actual=");
+                    lb.hex(actual);
+                    lb.str(b"\n");
+                    lb.flush();
+                    PTY_NOTIFY_DEBUG_BUDGET -= 1;
+                }
+                if actual == 0 {
+                    break; // buffer drained
+                }
+
+                // Forward data to saved client reply cap
+                let mut wake = SaltyMsg::zeroed();
+                wake.label = SALTY_OK;
+                wake.length = 1 + (actual + 7) / 8;
+                wake.regs[0] = actual;
+                let src = &creply.regs[1] as *const u64 as *const u8;
+                let dst = &raw mut wake.regs[1] as *mut u8;
+                for i in 0..actual as usize {
+                    *dst.add(i) = *src.add(i);
+                }
+                ipc::send_ctx(ipc_ctx(), reader.reply_slot, &raw const wake);
+
+                // Shift remaining waiters forward (FIFO)
+                for j in 1..PTY_PENDING_COUNT[pty_id] {
+                    PTY_PENDING[pty_id][j - 1] = PTY_PENDING[pty_id][j];
+                }
+                PTY_PENDING_COUNT[pty_id] -= 1;
+                if PTY_PENDING_COUNT[pty_id] < MAX_PTY_WAITERS {
+                    PTY_PENDING[pty_id][PTY_PENDING_COUNT[pty_id]] = PtyPendingReader::zeroed();
+                }
+            }
+
+            // Wake poll/epoll waiters for PTY fds (POLLIN event)
+            // Iterate all clients to find PTY fds on this pty_id
+            for ci in 0..max_clients() {
+                let cli = &*(&raw const CLIENTS!()[ci]);
+                if cli.active == 0 { continue; }
+                for fi in 0..max_fds() {
+                    if cli.fds[fi].active != 0
+                        && cli.fds[fi].fd_type == FD_TYPE_DEVICE
+                        && cli.fds[fi].dev_type == DEV_PTY_SLAVE
+                        && cli.fds[fi].sock_id as usize == pty_id
+                    {
+                        wake_poll_waiters(cli.badge, fi as i32, 0x001); // POLLIN
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -3725,6 +4393,183 @@ unsafe fn handle_clone_fds(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
     }
 }
 
+#[inline(always)]
+unsafe fn send_client_exit_error(reply_slot: u64) {
+    unsafe {
+        if reply_slot == 0 {
+            return;
+        }
+        let mut wake = SaltyMsg::zeroed();
+        wake.label = SALTY_INVALID_OPERATION;
+        ipc::send_ctx(ipc_ctx(), reply_slot, &raw const wake);
+    }
+}
+
+unsafe fn purge_poll_waiters_by_badge(dead_badge: u64) {
+    unsafe {
+        for i in 0..max_poll_waiters() {
+            if POLL_WAITERS!()[i].active == 0 || POLL_WAITERS!()[i].badge != dead_badge {
+                continue;
+            }
+            send_client_exit_error(POLL_WAITERS!()[i].reply_slot);
+            POLL_WAITERS!()[i] = PollWaiter::zeroed();
+        }
+    }
+}
+
+unsafe fn purge_pty_waiters_by_badge(dead_badge: u64) {
+    unsafe {
+        for pty in 0..MAX_PTYS {
+            let mut r = 0usize;
+            while r < PTY_PENDING_COUNT[pty] {
+                let ent = PTY_PENDING[pty][r];
+                if ent.active == 0 || ent.badge != dead_badge {
+                    r += 1;
+                    continue;
+                }
+                send_client_exit_error(ent.reply_slot);
+                for j in (r + 1)..PTY_PENDING_COUNT[pty] {
+                    PTY_PENDING[pty][j - 1] = PTY_PENDING[pty][j];
+                }
+                PTY_PENDING_COUNT[pty] -= 1;
+                PTY_PENDING[pty][PTY_PENDING_COUNT[pty]] = PtyPendingReader::zeroed();
+            }
+        }
+    }
+}
+
+unsafe fn purge_pipe_waiters_by_badge(pipe: *mut PipeState, dead_badge: u64) {
+    unsafe {
+        let recv_count = (*pipe).recv_waiter_count as usize;
+        let mut recv_dst = 0usize;
+        for i in 0..recv_count {
+            let w = (*pipe).recv_waiters[i];
+            if w.badge == dead_badge {
+                send_client_exit_error(w.reply_slot);
+            } else {
+                (*pipe).recv_waiters[recv_dst] = w;
+                recv_dst += 1;
+            }
+        }
+        let recv_kept = recv_dst as u8;
+        while recv_dst < MAX_PIPE_WAITERS {
+            (*pipe).recv_waiters[recv_dst] = PipeReadWaiter::zeroed();
+            recv_dst += 1;
+        }
+        (*pipe).recv_waiter_count = recv_kept;
+
+        let write_count = (*pipe).write_waiter_count as usize;
+        let mut write_dst = 0usize;
+        for i in 0..write_count {
+            let w = (*pipe).write_waiters[i];
+            if w.badge == dead_badge {
+                send_client_exit_error(w.reply_slot);
+            } else {
+                (*pipe).write_waiters[write_dst] = w;
+                write_dst += 1;
+            }
+        }
+        let write_kept = write_dst as u8;
+        while write_dst < MAX_PIPE_WAITERS {
+            (*pipe).write_waiters[write_dst] = PipeWriteWaiter::zeroed();
+            write_dst += 1;
+        }
+        (*pipe).write_waiter_count = write_kept;
+    }
+}
+
+unsafe fn purge_socket_waiters_by_badge(sock: *mut SocketState, dead_badge: u64) {
+    unsafe {
+        if (*sock).accept_badge == dead_badge {
+            send_client_exit_error((*sock).accept_reply_slot);
+            (*sock).accept_reply_slot = 0;
+            (*sock).accept_badge = 0;
+        }
+        if (*sock).recv_badge == dead_badge {
+            send_client_exit_error((*sock).recv_reply_slot);
+            (*sock).recv_reply_slot = 0;
+            (*sock).recv_badge = 0;
+        }
+        let mut pending = 0u8;
+        for i in 0..MAX_PENDING_CONN {
+            if (*sock).pending[i].active != 0 && (*sock).pending[i].client_badge == dead_badge {
+                send_client_exit_error((*sock).pending[i].reply_slot);
+                (*sock).pending[i] = PendingConn::zeroed();
+            }
+            if (*sock).pending[i].active != 0 {
+                pending = pending.saturating_add(1);
+            }
+        }
+        (*sock).pending_count = pending;
+    }
+}
+
+unsafe fn cleanup_client_state(dead_badge: u64) {
+    unsafe {
+        let cli = get_client_noalloc(dead_badge);
+        if cli.is_null() {
+            return;
+        }
+
+        // Clear all deferred waiters/callers tied to this badge before fd teardown.
+        purge_poll_waiters_by_badge(dead_badge);
+        purge_pty_waiters_by_badge(dead_badge);
+
+        for i in 0..max_pipes() {
+            if PIPES!()[i].active != 0 {
+                purge_pipe_waiters_by_badge(&raw mut PIPES!()[i], dead_badge);
+            }
+        }
+
+        for i in 0..max_sockets() {
+            if SOCKETS!()[i].active != 0 {
+                purge_socket_waiters_by_badge(&raw mut SOCKETS!()[i], dead_badge);
+            }
+        }
+
+        // Close every open fd owned by the dead client to drop pipe/socket refs.
+        for i in 0..max_fds() {
+            let fde = &raw mut (*cli).fds[i];
+            if (*fde).active == 0 {
+                continue;
+            }
+            match (*fde).fd_type {
+                FD_TYPE_SOCKET => close_socket(fde),
+                FD_TYPE_PIPE => close_pipe(fde),
+                FD_TYPE_EPOLL => {
+                    let ep_idx = (*fde).sock_id as usize;
+                    if ep_idx < max_epoll_instances() {
+                        EPOLLS!()[ep_idx].active = 0;
+                    }
+                }
+                _ => {}
+            }
+            (*cli).fds[i] = FdEntry::zeroed();
+            (*cli).fd_flags[i] = 0;
+        }
+
+        // Defensive cleanup for leaked epoll instances.
+        for i in 0..max_epoll_instances() {
+            if EPOLLS!()[i].active != 0 && EPOLLS!()[i].owner_badge == dead_badge {
+                EPOLLS!()[i] = EpollInstance::zeroed();
+            }
+        }
+
+        if SHELL_DEBUG_BADGE == dead_badge {
+            SHELL_DEBUG_BADGE = 0;
+        }
+        (*cli) = ClientState::zeroed();
+    }
+}
+
+unsafe fn handle_client_exit(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
+    unsafe {
+        let dead_badge = (*msg).regs[0];
+        cleanup_client_state(dead_badge);
+        (*reply).label = SALTY_OK;
+    }
+}
+
 // ======================================================================
 // isatty / ioctl / fcntl / chdir / getcwd handlers
 // ======================================================================
@@ -3732,6 +4577,13 @@ unsafe fn handle_clone_fds(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
 unsafe fn handle_isatty(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
+        if shell_dbg_enabled(badge) {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS][SHELL] isatty fd=");
+            lb.dec(fd as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
         let cli = get_client(badge);
         if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
@@ -3743,7 +4595,8 @@ unsafe fn handle_isatty(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) 
         }
 
         let is_tty = if (*cli).fds[fd as usize].fd_type == FD_TYPE_DEVICE
-            && (*cli).fds[fd as usize].dev_type == DEV_CONSOLE
+            && ((*cli).fds[fd as usize].dev_type == DEV_CONSOLE
+                || (*cli).fds[fd as usize].dev_type == DEV_PTY_SLAVE)
         {
             1u64
         } else {
@@ -3756,10 +4609,17 @@ unsafe fn handle_isatty(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) 
     }
 }
 
-/// Forward tcgetattr to console server via CONSOLE_TCGETATTR IPC
+/// Forward tcgetattr to ttyd (for PTY) or console server (for /dev/console)
 unsafe fn handle_tcgetattr(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
+        if shell_dbg_enabled(badge) {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS][SHELL] tcgetattr fd=");
+            lb.dec(fd as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
         let cli = get_client(badge);
         if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
@@ -3768,39 +4628,64 @@ unsafe fn handle_tcgetattr(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
             return;
         }
 
-        // Only console device supports termios
-        if (*cli).fds[fd as usize].fd_type != FD_TYPE_DEVICE
-            || (*cli).fds[fd as usize].dev_type != DEV_CONSOLE
-        {
+        let fde = &(*cli).fds[fd as usize];
+        if fde.fd_type != FD_TYPE_DEVICE {
             (*reply).label = SALTY_INVALID_OPERATION;
             return;
         }
 
-        // Forward to console server
-        let mut creq = SaltyMsg::zeroed();
-        let mut creply = SaltyMsg::zeroed();
-        creq.label = CONSOLE_TCGETATTR;
-        creq.length = 0;
-
-        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_CONSOLE_EP, &raw const creq, &raw mut creply);
-        if err != 0 || creply.label != SALTY_OK {
+        if fde.dev_type == DEV_PTY_SLAVE {
+            // Forward to ttyd via TTYD_PTY_TCGETATTR
+            let mut treq = SaltyMsg::zeroed();
+            let mut treply = SaltyMsg::zeroed();
+            treq.label = TTYD_PTY_TCGETATTR;
+            treq.regs[0] = fde.sock_id as u64; // pty_id
+            treq.length = 1;
+            let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+            if err != 0 || treply.label != SALTY_OK {
+                (*reply).label = SALTY_INVALID_OPERATION;
+                return;
+            }
+            (*reply).label = SALTY_OK;
+            (*reply).length = treply.length;
+            for i in 0..treply.length as usize {
+                (*reply).regs[i] = treply.regs[i];
+            }
+        } else if fde.dev_type == DEV_CONSOLE {
+            // Forward to console server
+            let mut creq = SaltyMsg::zeroed();
+            let mut creply = SaltyMsg::zeroed();
+            creq.label = CONSOLE_TCGETATTR;
+            creq.length = 0;
+            let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_CONSOLE_EP, &raw const creq, &raw mut creply);
+            if err != 0 || creply.label != SALTY_OK {
+                (*reply).label = SALTY_INVALID_OPERATION;
+                return;
+            }
+            (*reply).label = SALTY_OK;
+            (*reply).length = creply.length;
+            for i in 0..creply.length as usize {
+                (*reply).regs[i] = creply.regs[i];
+            }
+        } else {
             (*reply).label = SALTY_INVALID_OPERATION;
-            return;
-        }
-
-        // Pass through console's reply (flags + c_cc in regs[0..9])
-        (*reply).label = SALTY_OK;
-        (*reply).length = creply.length;
-        for i in 0..creply.length as usize {
-            (*reply).regs[i] = creply.regs[i];
         }
     }
 }
 
-/// Forward tcsetattr to console server via CONSOLE_TCSETATTR IPC
+/// Forward tcsetattr to ttyd (for PTY) or console server (for /dev/console)
 unsafe fn handle_tcsetattr(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
+        if shell_dbg_enabled(badge) {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS][SHELL] tcsetattr fd=");
+            lb.dec(fd as u64);
+            lb.str(b" action=");
+            lb.hex((*msg).regs[1]);
+            lb.str(b"\n");
+            lb.flush();
+        }
         let cli = get_client(badge);
         if cli.is_null() || fd < 0 || fd >= max_fds() as i32
             || (*cli).fds[fd as usize].active == 0
@@ -3809,31 +4694,51 @@ unsafe fn handle_tcsetattr(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
             return;
         }
 
-        // Only console device supports termios
-        if (*cli).fds[fd as usize].fd_type != FD_TYPE_DEVICE
-            || (*cli).fds[fd as usize].dev_type != DEV_CONSOLE
-        {
+        let fde = &(*cli).fds[fd as usize];
+        if fde.fd_type != FD_TYPE_DEVICE {
             (*reply).label = SALTY_INVALID_OPERATION;
             return;
         }
 
-        // Forward to console server — regs[0]=fd, regs[1]=action, regs[2..11]=termios data
-        let mut creq = SaltyMsg::zeroed();
-        let mut creply = SaltyMsg::zeroed();
-        creq.label = CONSOLE_TCSETATTR;
-        creq.length = (*msg).length;
-        for i in 0..(*msg).length as usize {
-            creq.regs[i] = (*msg).regs[i];
-        }
-
-        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_CONSOLE_EP, &raw const creq, &raw mut creply);
-        if err != 0 || creply.label != SALTY_OK {
+        if fde.dev_type == DEV_PTY_SLAVE {
+            // Forward to ttyd via TTYD_PTY_TCSETATTR
+            // msg layout: regs[0]=fd, regs[1]=action, regs[2..11]=termios data
+            let mut treq = SaltyMsg::zeroed();
+            let mut treply = SaltyMsg::zeroed();
+            treq.label = TTYD_PTY_TCSETATTR;
+            treq.regs[0] = fde.sock_id as u64; // pty_id
+            // Copy termios data from regs[1..] (action + flags + c_cc)
+            let copy_len = if (*msg).length > 1 { (*msg).length - 1 } else { 0 };
+            for i in 0..copy_len as usize {
+                treq.regs[i + 1] = (*msg).regs[i + 1];
+            }
+            treq.length = 1 + copy_len;
+            let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+            if err != 0 || treply.label != SALTY_OK {
+                (*reply).label = SALTY_INVALID_OPERATION;
+                return;
+            }
+            (*reply).label = SALTY_OK;
+            (*reply).length = 0;
+        } else if fde.dev_type == DEV_CONSOLE {
+            // Forward to console server
+            let mut creq = SaltyMsg::zeroed();
+            let mut creply = SaltyMsg::zeroed();
+            creq.label = CONSOLE_TCSETATTR;
+            creq.length = (*msg).length;
+            for i in 0..(*msg).length as usize {
+                creq.regs[i] = (*msg).regs[i];
+            }
+            let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_CONSOLE_EP, &raw const creq, &raw mut creply);
+            if err != 0 || creply.label != SALTY_OK {
+                (*reply).label = SALTY_INVALID_OPERATION;
+                return;
+            }
+            (*reply).label = SALTY_OK;
+            (*reply).length = 0;
+        } else {
             (*reply).label = SALTY_INVALID_OPERATION;
-            return;
         }
-
-        (*reply).label = SALTY_OK;
-        (*reply).length = 0;
     }
 }
 
@@ -3853,8 +4758,22 @@ unsafe fn check_fd_readiness(cli: *const ClientState, fd: i32, events: u32) -> u
                 if events & 0x004 != 0 { rev |= 0x004; }
             }
             FD_TYPE_DEVICE => {
-                if events & 0x004 != 0 { rev |= 0x004; }
-                if events & 0x001 != 0 { rev |= 0x001; }
+                if fde.dev_type == DEV_PTY_SLAVE {
+                    // Query ttyd for PTY readiness
+                    let mut treq = SaltyMsg::zeroed();
+                    let mut treply = SaltyMsg::zeroed();
+                    treq.label = TTYD_PTY_POLL;
+                    treq.regs[0] = fde.sock_id as u64; // pty_id
+                    treq.regs[1] = events as u64;
+                    treq.length = 2;
+                    let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+                    if err == 0 && treply.label == SALTY_OK {
+                        rev = treply.regs[0] as u32;
+                    }
+                } else {
+                    if events & 0x004 != 0 { rev |= 0x004; }
+                    if events & 0x001 != 0 { rev |= 0x001; }
+                }
             }
             FD_TYPE_SOCKET => {
                 let sock = find_socket(fde.sock_id);
@@ -4155,7 +5074,18 @@ unsafe fn handle_ioctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let request = (*msg).regs[1];
-        let _arg = (*msg).regs[2];
+        let arg = (*msg).regs[2];
+        if shell_dbg_enabled(badge) {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS][SHELL] ioctl fd=");
+            lb.dec(fd as u64);
+            lb.str(b" req=");
+            lb.hex(request);
+            lb.str(b" arg=");
+            lb.hex(arg);
+            lb.str(b"\n");
+            lb.flush();
+        }
 
         let cli = get_client(badge);
         if cli.is_null() || fd < 0 || fd >= max_fds() as i32
@@ -4165,33 +5095,108 @@ unsafe fn handle_ioctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
             return;
         }
 
-        if (*cli).fds[fd as usize].fd_type == FD_TYPE_DEVICE
-            && (*cli).fds[fd as usize].dev_type == DEV_FB0
-        {
+        let fde = &(*cli).fds[fd as usize];
+
+        if fde.fd_type == FD_TYPE_DEVICE && fde.dev_type == DEV_FB0 {
             handle_ioctl_fb0(request, reply);
             return;
         }
 
+        // Terminal ioctls — supported by both console and PTY devices
+        if fde.fd_type != FD_TYPE_DEVICE
+            || (fde.dev_type != DEV_CONSOLE && fde.dev_type != DEV_PTY_SLAVE)
+        {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return;
+        }
+
+        let pty_id = if fde.dev_type == DEV_PTY_SLAVE { fde.sock_id as u64 } else { 0u64 };
+
         match request {
             // TIOCGPGRP: get foreground process group
             0x540F => {
+                let mut treq = SaltyMsg::zeroed();
+                let mut treply = SaltyMsg::zeroed();
+                treq.label = TTYD_PTY_IOCTL;
+                treq.regs[0] = pty_id;
+                treq.regs[1] = 0x540F; // TIOCGPGRP
+                treq.regs[2] = 0;
+                treq.regs[3] = badge;
+                treq.length = 4;
+                let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+                if err != 0 || treply.label != SALTY_OK {
+                    (*reply).label = SALTY_INVALID_OPERATION;
+                    return;
+                }
                 (*reply).label = SALTY_OK;
                 (*reply).length = 1;
-                (*reply).regs[0] = 0; // pgid 0 (single process group)
+                (*reply).regs[0] = treply.regs[0];
             }
-            // TIOCSPGRP: set foreground process group (accept and ignore)
+            // TIOCSPGRP: set foreground process group
             0x5410 => {
-                (*reply).label = SALTY_OK;
-                (*reply).length = 1;
-                (*reply).regs[0] = 0;
+                let mut treq = SaltyMsg::zeroed();
+                let mut treply = SaltyMsg::zeroed();
+                treq.label = TTYD_PTY_IOCTL;
+                treq.regs[0] = pty_id;
+                treq.regs[1] = 0x5410; // TIOCSPGRP
+                treq.regs[2] = (*msg).regs[2]; // pgid
+                treq.regs[3] = badge;
+                treq.length = 4;
+                let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+                (*reply).label = if err == 0 { treply.label } else { SALTY_INVALID_OPERATION };
+                (*reply).length = 0;
+            }
+            // TIOCSCTTY: acquire controlling tty
+            0x540E => {
+                let mut treq = SaltyMsg::zeroed();
+                let mut treply = SaltyMsg::zeroed();
+                treq.label = TTYD_PTY_IOCTL;
+                treq.regs[0] = pty_id;
+                treq.regs[1] = 0x540E; // TIOCSCTTY
+                treq.regs[2] = 0;
+                treq.regs[3] = badge;
+                treq.length = 4;
+                let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+                (*reply).label = if err == 0 { treply.label } else { SALTY_INVALID_OPERATION };
+                (*reply).length = 0;
+            }
+            // TIOCNOTTY: release controlling tty
+            0x5422 => {
+                let mut treq = SaltyMsg::zeroed();
+                let mut treply = SaltyMsg::zeroed();
+                treq.label = TTYD_PTY_IOCTL;
+                treq.regs[0] = pty_id;
+                treq.regs[1] = 0x5422; // TIOCNOTTY
+                treq.regs[2] = 0;
+                treq.regs[3] = badge;
+                treq.length = 4;
+                let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+                (*reply).label = if err == 0 { treply.label } else { SALTY_INVALID_OPERATION };
+                (*reply).length = 0;
             }
             // TIOCGWINSZ: get terminal window size
             0x5413 => {
+                let mut treq = SaltyMsg::zeroed();
+                let mut treply = SaltyMsg::zeroed();
+                treq.label = TTYD_PTY_IOCTL;
+                treq.regs[0] = pty_id;
+                treq.regs[1] = 0x5413; // TIOCGWINSZ
+                treq.regs[2] = 0;
+                treq.regs[3] = badge;
+                treq.length = 4;
+                let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+                if err != 0 || treply.label != SALTY_OK {
+                    // Fallback to default 80x24
+                    (*reply).label = SALTY_OK;
+                    (*reply).length = 2;
+                    (*reply).regs[0] = (24u64 << 16) | 80u64;
+                    (*reply).regs[1] = 0;
+                    return;
+                }
                 (*reply).label = SALTY_OK;
                 (*reply).length = 2;
-                // Pack rows(16) | cols(16) into regs[0], xpixel(16) | ypixel(16) into regs[1]
-                (*reply).regs[0] = (24u64 << 16) | 80u64; // rows=24, cols=80
-                (*reply).regs[1] = 0; // xpixel=0, ypixel=0
+                (*reply).regs[0] = treply.regs[0];
+                (*reply).regs[1] = treply.regs[1];
             }
             _ => {
                 (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -4281,6 +5286,17 @@ unsafe fn handle_fcntl(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
         let fd = (*msg).regs[0] as i32;
         let cmd = (*msg).regs[1] as i32;
         let arg = (*msg).regs[2] as i64;
+        if shell_dbg_enabled(badge) {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS][SHELL] fcntl fd=");
+            lb.dec(fd as u64);
+            lb.str(b" cmd=");
+            lb.hex(cmd as u64);
+            lb.str(b" arg=");
+            lb.hex(arg as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
 
         let cli = get_client(badge);
         if cli.is_null() || fd < 0 || fd >= max_fds() as i32
@@ -4424,9 +5440,14 @@ unsafe fn handle_getcwd(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) 
             (*cli).cwd[1] = 0;
         }
 
-        // Pack cwd bytes into reply regs[1..] (up to 152 bytes)
-        let copy_len = if cwd_len < 152 { cwd_len } else { 152 };
-        let _ = max_size; // acknowledged but we always send the actual cwd
+        // POSIX getcwd(): caller buffer must fit full path + trailing NUL.
+        if max_size == 0 || cwd_len + 1 > max_size {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        // Pack cwd bytes into reply regs[1..]
+        let copy_len = cwd_len;
         (*reply).label = SALTY_OK;
         (*reply).regs[0] = copy_len as u64;
         let dst = &mut (*reply).regs[1] as *mut u64 as *mut u8;
@@ -5683,6 +6704,16 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
+    // Bind PTY notification to VFS TCB for data-ready wake-ups from ttyd
+    {
+        let err = salty::invoke::tcb_bind_notification(CAP_SELF_TCB, VFS_CAP_PTY_NTFN);
+        if err == 0 {
+            puts(b"[VFS] PTY notification bound to TCB\n");
+        } else {
+            puts(b"[VFS] WARN: PTY notification bind failed\n");
+        }
+    }
+
     signal_ready();
 
     // Initial recv
@@ -5697,10 +6728,35 @@ pub extern "C" fn _start() -> ! {
 
     // Server loop — supports deferred replies via save_caller pattern.
     // Handlers return bool: true = deferred (skip reply), false = reply now.
+    // Bound notification from ttyd (PTY data-ready) wakes recv/reply_recv
+    // with badge = notification word, msg.length = 0.
     loop {
         let mut reply = SaltyMsg::zeroed();
         let mut skip_reply = false;
+        let shell_trace = shell_dbg_enabled(badge) && shell_dbg_label_traced(msg.label);
+        if shell_trace {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS][SHELL] <- l=");
+            lb.hex(msg.label);
+            lb.str(b" b=");
+            lb.hex(badge);
+            lb.str(b" r0=");
+            lb.hex(msg.regs[0]);
+            lb.str(b" r1=");
+            lb.hex(msg.regs[1]);
+            lb.str(b" r2=");
+            lb.hex(msg.regs[2]);
+            lb.str(b"\n");
+            lb.flush();
+        }
 
+        // Check for bound notification wake-up (PTY data ready from ttyd).
+        // Bound notifications have label=0 AND length=0; regular IPC with
+        // length=0 (e.g. socketpair) will have label != 0.
+        if msg.length == 0 && msg.label == 0 && badge != 0 {
+            unsafe { handle_pty_notification(badge); }
+            skip_reply = true; // no client to reply to
+        } else {
         unsafe {
             match msg.label {
                 VFS_OPEN => { handle_open(&raw const msg, &raw mut reply, badge); }
@@ -5718,6 +6774,15 @@ pub extern "C" fn _start() -> ! {
                             FD_TYPE_PIPE => {
                                 skip_reply = handle_pipe_read(
                                     &raw const msg, &raw mut (*cli).fds[fd as usize], &raw mut reply, badge);
+                            }
+                            FD_TYPE_DEVICE => {
+                                if (*cli).fds[fd as usize].dev_type == DEV_PTY_SLAVE {
+                                    skip_reply = handle_pty_dev_read(
+                                        &raw const msg, &raw mut (*cli).fds[fd as usize],
+                                        &raw mut reply, badge);
+                                } else {
+                                    handle_read(&raw const msg, &raw mut reply, badge);
+                                }
                             }
                             _ => {
                                 handle_read(&raw const msg, &raw mut reply, badge);
@@ -5774,17 +6839,17 @@ pub extern "C" fn _start() -> ! {
                     }
                     handle_close(&raw const msg, &raw mut reply, badge);
                 }
-                VFS_STAT => { handle_stat(&raw const msg, &raw mut reply); }
+                VFS_STAT => { handle_stat(&raw const msg, &raw mut reply, badge); }
                 VFS_LSEEK => { handle_lseek(&raw const msg, &raw mut reply, badge); }
                 VFS_FSTAT => { handle_fstat(&raw const msg, &raw mut reply, badge); }
-                VFS_ACCESS => { handle_access(&raw const msg, &raw mut reply); }
+                VFS_ACCESS => { handle_access(&raw const msg, &raw mut reply, badge); }
                 VFS_UNLINK => { handle_unlink(&raw const msg, &raw mut reply); }
                 VFS_RENAME => { handle_rename(&raw const msg, &raw mut reply); }
                 VFS_MKDIR => { handle_mkdir(&raw const msg, &raw mut reply); }
                 VFS_RMDIR => { handle_rmdir(&raw const msg, &raw mut reply); }
                 VFS_OPENDIR => { handle_opendir(&raw const msg, &raw mut reply, badge); }
                 VFS_READDIR => { handle_readdir(&raw const msg, &raw mut reply, badge); }
-                VFS_LSTAT => { handle_stat(&raw const msg, &raw mut reply); }
+                VFS_LSTAT => { handle_stat(&raw const msg, &raw mut reply, badge); }
                 VFS_POLL => {
                     skip_reply = handle_poll(&raw const msg, &raw mut reply, badge);
                 }
@@ -5912,11 +6977,28 @@ pub extern "C" fn _start() -> ! {
                 VFS_FCHOWN => {
                     handle_fchown(&raw const msg, &raw mut reply, badge);
                 }
+                VFS_CLIENT_EXIT => {
+                    handle_client_exit(&raw const msg, &raw mut reply);
+                    skip_reply = true; // one-way PM_EXIT cleanup notification
+                }
                 _ => {
                     { let mut lb = LineBuf::new(); lb.str(b"[VFS] unknown label="); lb.hex(msg.label); lb.str(b"\n"); lb.flush(); }
                     reply.label = SALTY_INVALID_OPERATION;
                 }
             }
+        }
+        } // close else block
+
+        if shell_trace {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS][SHELL] -> skip=");
+            lb.dec(skip_reply as u64);
+            lb.str(b" label=");
+            lb.hex(reply.label);
+            lb.str(b" r0=");
+            lb.hex(reply.regs[0]);
+            lb.str(b"\n");
+            lb.flush();
         }
 
         let err = if skip_reply {

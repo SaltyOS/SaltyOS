@@ -39,7 +39,12 @@ use spawn::ExtraCapCopy;
 
 const CAP_IPC_BUF_FRAME: u64 = 131;
 const CAP_UNTYPED_PROBE_TMP: u64 = 132;
+pub const CAP_BOOTINFO_SNAPSHOT_FRAME: u64 = 133;
 const EP_POOL_BASE: u64 = 140;
+
+/// Shared notification for VFS↔TTYD PTY data-ready signalling.
+/// Created from untyped at boot; copied to VFS (for TCB binding) and TTYD (for signalling).
+const CAP_PTY_NTFN: u64 = 14;
 
 const CAP_CHILD_BASE: u64 = 200;
 const CAP_CHILD_STRIDE: u64 = 128;
@@ -214,6 +219,41 @@ unsafe fn read_total_usable_bytes() -> u64 {
             return 0;
         }
         core::ptr::read_volatile(page.add(7))
+    }
+}
+
+/// Create a persistent boot info snapshot frame in init's CSpace.
+///
+/// The kernel-owned boot info mapping at BOOTINFO_VADDR is copied exactly once
+/// into CAP_BOOTINFO_SNAPSHOT_FRAME. Spawn paths then map this frame directly
+/// into children, avoiding repeated direct reads from BOOTINFO_VADDR.
+unsafe fn init_bootinfo_snapshot_frame(ut: Cap) -> bool {
+    unsafe {
+        let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, CAP_BOOTINFO_SNAPSHOT_FRAME);
+        if err != 0 {
+            puts(b"[INIT] FAIL: bootinfo snapshot frame retype\n");
+            return false;
+        }
+
+        let err = invoke::vspace_map(
+            CAP_SELF_VSPACE,
+            CAP_BOOTINFO_SNAPSHOT_FRAME,
+            SCRATCH_VADDR,
+            VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+        );
+        if err != 0 {
+            puts(b"[INIT] FAIL: bootinfo snapshot scratch map\n");
+            return false;
+        }
+
+        let src = BOOTINFO_VADDR as *const u8;
+        let dst = SCRATCH_VADDR as *mut u8;
+        for i in 0..4096usize {
+            core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i)));
+        }
+
+        invoke::vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
+        true
     }
 }
 
@@ -563,11 +603,13 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                 syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
             }
 
-            let spawn_name = if ends_with(elf_name, b".elf") {
-                &elf_name[..elf_name.len() - 4]
-            } else {
-                elf_name
-            };
+            let spawn_name = elf_name;
+
+            // Copy NeedEP/CopyCap fields to stack before borrow
+            let ep_need_count = mgr.services[svc_idx].def.ep_need_count;
+            let ep_needs = mgr.services[svc_idx].def.ep_needs;
+            let cap_count = mgr.services[svc_idx].def.cap_count;
+            let caps = mgr.services[svc_idx].def.caps;
 
             let pre_ep = mgr.services[svc_idx].pre_ep;
             let pid = unsafe {
@@ -577,6 +619,54 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                 { let mut lb = LineBuf::new(); lb.str(b"[INIT] Failed to spawn "); lb.bytes(name); lb.str(b" via procmgr\n"); lb.flush(); }
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
                 continue;
+            }
+
+            // Inject NeedEP caps into child via PM_INJECT_CAP
+            for i in 0..ep_need_count as usize {
+                let svc_name = &ep_needs[i].service[..ep_needs[i].service_len as usize];
+                let provider_idx = mgr.find_service(svc_name);
+                if provider_idx >= 0 {
+                    let provider_ep = mgr.services[provider_idx as usize].pre_ep;
+                    if provider_ep != 0 {
+                        let r = unsafe {
+                            spawn::pm_inject_cap(
+                                procmgr_ep, pid as u32,
+                                ep_needs[i].dst_slot, provider_ep,
+                            )
+                        };
+                        if r != 0 {
+                            let mut lb = LineBuf::new();
+                            lb.str(b"[INIT] WARN: inject NeedEP ");
+                            lb.bytes(svc_name);
+                            lb.str(b" slot=");
+                            lb.hex(ep_needs[i].dst_slot);
+                            lb.str(b" failed\n");
+                            lb.flush();
+                        }
+                    }
+                }
+            }
+
+            // Inject CopyCap caps into child via PM_INJECT_CAP
+            for i in 0..cap_count as usize {
+                if caps[i].src_slot == 0 && caps[i].dst_slot == 0 {
+                    continue;
+                }
+                let r = unsafe {
+                    spawn::pm_inject_cap(
+                        procmgr_ep, pid as u32,
+                        caps[i].dst_slot, caps[i].src_slot,
+                    )
+                };
+                if r != 0 {
+                    let mut lb = LineBuf::new();
+                    lb.str(b"[INIT] WARN: inject CopyCap src=");
+                    lb.hex(caps[i].src_slot);
+                    lb.str(b" dst=");
+                    lb.hex(caps[i].dst_slot);
+                    lb.str(b" failed\n");
+                    lb.flush();
+                }
             }
 
             mgr.services[svc_idx].pid = pid as u32;
@@ -658,11 +748,7 @@ unsafe fn handle_child_exit(
             bin_buf[..bin_len].copy_from_slice(&mgr.services[svc_idx].def.binary[..bin_len]);
             let elf_name = &bin_buf[..bin_len];
 
-            let spawn_name = if ends_with(elf_name, b".elf") {
-                &elf_name[..elf_name.len() - 4]
-            } else {
-                elf_name
-            };
+            let spawn_name = elf_name;
 
             let pre_ep = mgr.services[svc_idx].pre_ep;
             let new_pid = spawn::pm_spawn(pm_ep, spawn_name, &mgr.services[svc_idx].def, pre_ep);
@@ -773,6 +859,10 @@ pub extern "C" fn _start() -> ! {
     let total_usable = unsafe { read_total_usable_bytes() };
     { let mut lb = LineBuf::new(); lb.str(b"[INIT] Total usable RAM: "); lb.hex(total_usable); lb.str(b" bytes\n"); lb.flush(); }
 
+    if unsafe { !init_bootinfo_snapshot_frame(ut) } {
+        idle();
+    }
+
     // Optional self-tests (IPC + fault handling)
     // Check if selftest is enabled by looking for "selftest.enable" in CPIO
     let run_selftest = unsafe {
@@ -826,6 +916,20 @@ pub extern "C" fn _start() -> ! {
         lb.str(b" service cap slot(s) in reserved range [0..63]\n");
         lb.flush();
         idle();
+    }
+
+    // Create shared PTY notification for VFS↔TTYD data-ready signalling
+    {
+        let err = invoke::untyped_retype(ut, OBJ_NOTIFICATION, 0, CAP_PTY_NTFN);
+        if err != 0 {
+            let mut lb = LineBuf::new();
+            lb.str(b"[INIT] WARN: PTY notification retype failed err=");
+            lb.hex(err as u64);
+            lb.str(b"\n");
+            lb.flush();
+        } else {
+            puts(b"[INIT] PTY notification created at slot 14\n");
+        }
     }
 
     // Pre-create endpoints for socket activation (before any service spawns)

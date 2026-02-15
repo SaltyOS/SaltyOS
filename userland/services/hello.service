@@ -1,6 +1,6 @@
 [Service]
 Name=hello
-Binary=hello.elf
+Binary=hello
 Type=simple
 Restart=no
 

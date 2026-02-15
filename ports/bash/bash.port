@@ -30,7 +30,7 @@ configure =
 
 [env]
 CFLAGS_FOR_BUILD = -std=gnu89
-EXTRA_CFLAGS = -std=gnu89
+EXTRA_CFLAGS = -std=gnu89 -mgeneral-regs-only -mno-sse -mno-sse2 -mno-mmx -msoft-float
 
 [autoconf_cache]
 ac_cv_func_mmap_fixed_mapped = yes

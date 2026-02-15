@@ -1271,6 +1271,88 @@ impl VSpace {
         result
     }
 
+    /// Resolve a user-mode non-present write fault by growing the user stack.
+    ///
+    /// Returns Ok(true) if one new stack page was mapped and execution can resume.
+    /// Returns Ok(false) if this fault does not qualify as stack growth.
+    pub fn handle_stack_growth_fault(
+        &mut self,
+        fault_addr: VirtAddr,
+        error_code: u64,
+        user_rsp: VirtAddr,
+        stack_top: VirtAddr,
+        stack_min: VirtAddr,
+    ) -> Result<bool, VSpaceError> {
+        // Need a user-mode, write, non-present fault.
+        if (error_code & 0x7) != 0x6 {
+            return Ok(false);
+        }
+        if stack_top == 0 || stack_min == 0 || stack_min >= stack_top {
+            return Ok(false);
+        }
+        if user_rsp < stack_min || user_rsp >= stack_top {
+            return Ok(false);
+        }
+
+        let page_vaddr = fault_addr & !((PAGE_SIZE as u64) - 1);
+        if page_vaddr < stack_min || page_vaddr >= stack_top {
+            return Ok(false);
+        }
+
+        // Keep growth close to the faulting stack pointer.
+        // This avoids mapping unrelated holes far below the current stack.
+        let rsp_page = user_rsp & !((PAGE_SIZE as u64) - 1);
+        let page_size = PAGE_SIZE as u64;
+        if page_vaddr + page_size < rsp_page.saturating_sub(page_size) {
+            return Ok(false);
+        }
+
+        let irq = unsafe { save_irq_disable() };
+        self.lock.lock();
+
+        let result = (|| {
+            // Already present => not a stack-growth miss.
+            if let Some(entry) = self.read_entry(page_vaddr, 1) {
+                if entry & ENTRY_PRESENT != 0 {
+                    return Ok(false);
+                }
+            }
+
+            let new_phys = alloc_frame().ok_or(VSpaceError::OutOfMemory)?;
+            unsafe {
+                core::ptr::write_bytes(phys_to_virt(new_phys) as *mut u8, 0, PAGE_SIZE);
+            }
+
+            if let Err(e) = self.ensure_table(page_vaddr, 1, true) {
+                super::free_frame(new_phys);
+                return Err(e);
+            }
+
+            // Re-check after table creation to avoid racing with any concurrent mapper.
+            if let Some(entry) = self.read_entry(page_vaddr, 1) {
+                if entry & ENTRY_PRESENT != 0 {
+                    super::free_frame(new_phys);
+                    return Ok(false);
+                }
+            }
+
+            let entry_flags = Self::flags_to_entry_flags(PageFlags::USER_RW);
+            if self.write_entry(page_vaddr, 1, new_phys | entry_flags).is_err() {
+                super::free_frame(new_phys);
+                return Err(VSpaceError::NotMapped);
+            }
+
+            super::retain_frame_mapping(new_phys);
+            crate::arch::x86_64::paging::invlpg(page_vaddr);
+            self.tlb_shootdown(page_vaddr);
+            Ok(true)
+        })();
+
+        self.lock.unlock();
+        unsafe { restore_irq(irq) };
+        result
+    }
+
     /// Atomically switch to this VSpace (non-blocking)
     ///
     /// Uses deactivate_nosched() and centralized finish_deactivate() for

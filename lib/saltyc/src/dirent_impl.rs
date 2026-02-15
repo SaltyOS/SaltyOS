@@ -19,6 +19,12 @@ pub struct Dirent {
     pub d_reclen: u16,
     /// File type: `DT_REG` (8), `DT_DIR` (4), `DT_LNK` (10), `DT_UNKNOWN` (0).
     pub d_type: u8,
+    /// ABI padding/alignment field (matches FreeBSD dirent layout).
+    pub d_pad0: u8,
+    /// Length of string in d_name.
+    pub d_namlen: u16,
+    /// ABI padding/alignment field (matches FreeBSD dirent layout).
+    pub d_pad1: u16,
     /// Null-terminated filename (max 255 characters + NUL).
     pub d_name: [u8; 256],
 }
@@ -30,6 +36,9 @@ impl Dirent {
             d_off: 0,
             d_reclen: 0,
             d_type: 0,
+            d_pad0: 0,
+            d_namlen: 0,
+            d_pad1: 0,
             d_name: [0; 256],
         }
     }
@@ -135,11 +144,14 @@ pub unsafe extern "C" fn readdir(dir: *mut DIR) -> *mut Dirent {
         (*dir).entry.d_off = 0;
         (*dir).entry.d_reclen = core::mem::size_of::<Dirent>() as u16;
         (*dir).entry.d_type = salty_entry.d_type;
+        (*dir).entry.d_pad0 = 0;
+        (*dir).entry.d_pad1 = 0;
 
         // Copy name, capping at the smaller of SaltyDirent.d_name (62 bytes)
         // and our d_name (256 bytes)
         let name_len = salty_entry.d_namlen as usize;
         let copy_len = if name_len < 62 { name_len } else { 61 };
+        (*dir).entry.d_namlen = copy_len as u16;
         for i in 0..copy_len {
             (*dir).entry.d_name[i] = salty_entry.d_name[i];
         }

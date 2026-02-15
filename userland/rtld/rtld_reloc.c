@@ -131,7 +131,7 @@ uint64_t _dl_fixup(struct link_map *map, uint64_t reloc_index) {
         { struct rtld_linebuf lb; rtld_lb_init(&lb);
           rtld_lb_str(&lb, "[RTLD] FATAL: lazy resolve failed for: ");
           rtld_lb_str(&lb, name); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
-        for (;;) rtld_yield();
+        rtld_exit(127);
     }
 
     /* Patch the GOT entry so next call goes directly */

@@ -2,7 +2,7 @@
 //!
 //! Creates and dispatches the first user-mode task from kmain().
 //!
-//! Loads init.elf from the initrd CPIO archive using the kernel ELF loader.
+//! Loads init from the initrd CPIO archive using the kernel ELF loader.
 //! The initrd is required; there is no hardcoded user-mode fallback.
 //!
 //! Sets up the init task's CSpace with well-known capability slots for
@@ -62,6 +62,9 @@ const INIT_STACK_TOP: u64 = INIT_STACK_VADDR + INIT_STACK_SIZE;
 const CAP_SELF_TCB: usize = 0;
 const CAP_SELF_VSPACE: usize = 1;
 const CAP_SELF_CSPACE: usize = 2;
+/// PS/2 keyboard capabilities
+const CAP_KBD_IOPORT: usize = 6;
+const CAP_KBD_IRQ: usize = 7;
 /// COM1 serial port capabilities
 const CAP_COM1_IOPORT: usize = 8;
 const CAP_COM1_IRQ: usize = 9;
@@ -115,6 +118,10 @@ static mut INIT_UNTYPEDS: [UntypedMemory; MAX_INIT_UNTYPEDS] = {
 static mut INIT_COM1_IOPORT: IoPortRange = IoPortRange::new(0x3F8, 8);
 static mut INIT_COM1_IRQ: IrqHandler = IrqHandler::new(4);
 static mut INIT_COM1_NOTIFICATION: Notification = Notification::new();
+
+/// PS/2 keyboard objects (static, never freed)
+static mut INIT_KBD_IOPORT: IoPortRange = IoPortRange::new(0x60, 5); // ports 0x60-0x64
+static mut INIT_KBD_IRQ: IrqHandler = IrqHandler::new(1);           // IRQ1
 
 /// Framebuffer device untyped (static, never freed)
 static mut INIT_FB_UNTYPED: UntypedMemory = UntypedMemory::new(0, 0, true);
@@ -315,6 +322,26 @@ fn setup_init_cspace(boot_info: Option<&ParsedBootInfo>) {
             &raw mut INIT_COM1_NOTIFICATION as *mut crate::cap::KernelObject,
             ObjectType::Notification,
         );
+
+        // Slot 6: PS/2 Keyboard IoPort (ports 0x60-0x64)
+        insert_static_cap(
+            cnode,
+            CAP_KBD_IOPORT,
+            &raw mut INIT_KBD_IOPORT as *mut crate::cap::KernelObject,
+            ObjectType::IoPort,
+        );
+
+        // Slot 7: PS/2 Keyboard IRQ handler (IRQ1)
+        {
+            let irq_ptr = &raw mut INIT_KBD_IRQ;
+            insert_static_cap(
+                cnode,
+                CAP_KBD_IRQ,
+                irq_ptr as *mut crate::cap::KernelObject,
+                ObjectType::IrqHandler,
+            );
+            crate::ipc::irq::register_handler(1, irq_ptr);
+        }
 
         // Slot 12: Initrd pseudo-device untyped for map_device-based sharing
         if let Some(info) = boot_info {
@@ -574,7 +601,7 @@ unsafe fn create_untyped_caps(cnode: &mut CNode, _info: &ParsedBootInfo) {
     }
 }
 
-/// Load init.elf from CPIO initrd using the kernel ELF loader
+/// Load init from CPIO initrd using the kernel ELF loader
 fn load_from_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) -> (u64, u64) {
     crate::serial_puts("[INIT] Parsing CPIO initrd\n");
 
@@ -585,18 +612,19 @@ fn load_from_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) -> (u64, u64) {
         )
     };
 
-    let elf_entry = crate::cpio::find_file(initrd, "init.elf");
+    let elf_entry = crate::cpio::find_file(initrd, "init")
+        .or_else(|| crate::cpio::find_file(initrd, "init.elf"));
     let elf_data = match elf_entry {
         Some(entry) => {
             {
                 let s = crate::SerialGuard::acquire();
-                s.puts("[INIT] Found init.elf in initrd (");
+                s.puts("[INIT] Found init in initrd (");
                 s.dec(entry.data.len() as u64);
                 s.puts(" bytes)\n");
             }
             entry.data
         }
-        None => boot_fatal!("init.elf not found in initrd"),
+        None => boot_fatal!("init not found in initrd"),
     };
 
     crate::serial_puts("[INIT] Loading ELF from initrd\n");

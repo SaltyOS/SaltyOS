@@ -1,6 +1,6 @@
 [Service]
 Name=procmgr
-Binary=procmgr.elf
+Binary=procmgr
 Type=simple
 Restart=always
 CNodeBits=12

@@ -1,6 +1,6 @@
 [Service]
 Name=nameserv
-Binary=nameserv.elf
+Binary=nameserv
 Type=simple
 Restart=always
 PreProcmgr=yes

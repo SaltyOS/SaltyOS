@@ -58,6 +58,11 @@ const PM_EXPAND_CSPACE: u64 = 18;
 const PM_EXPAND_CSPACE_ASYNC: u64 = 19;
 const PM_EXPAND_COLLECT: u64 = 20;
 const PM_REGISTER: u64 = 21;
+const PM_GETSID: u64 = 22;
+const PM_GETPGID_BADGE: u64 = 23;
+const PM_GETSID_BADGE: u64 = 24;
+const PM_KILL_PGID: u64 = 25;
+const PM_INJECT_CAP: u64 = 26;
 const SALTY_PENDING: u64 = 0x80;
 
 const PM_SIGKILL: usize = 9;
@@ -133,6 +138,7 @@ const VSPACE_FLAG_WRITABLE: u64 = salty::VSPACE_FLAG_WRITABLE;
 const VSPACE_FLAG_USER: u64 = salty::VSPACE_FLAG_USER;
 const VSPACE_FLAG_EXECUTABLE: u64 = salty::VSPACE_FLAG_EXECUTABLE;
 const CAP_RIGHTS_ALL: u64 = salty::CAP_RIGHTS_ALL;
+const INITRD_COPY_RIGHTS: u64 = (1 << 0) | (1 << 2) | (1 << 3);
 const UT_MIRROR_COUNT: Cap = 8;
 const INITRD_VADDR: u64 = salty::INITRD_VADDR;
 const BOOTINFO_VADDR: u64 = salty::BOOTINFO_VADDR;
@@ -146,6 +152,10 @@ const CHILD_CAP_EXPAND_NTFN: u64 = 9; // Minted notification for UT expansion si
 
 /// Procmgr's bound notification cap (for receiving UT expansion signals).
 static mut PM_BOUND_NTFN: Cap = 0;
+static mut PM_TRACE_BADGE: u64 = 0;
+static mut PM_TRACE_BUDGET: u32 = 256;
+static mut PM_WAIT_TRACE_BUDGET: u32 = 128;
+static mut PM_INJECT_DEBUG_BUDGET: u32 = 32;
 
 static mut ALLOCATOR: alloc::Allocator = alloc::Allocator::new();
 fn read_boot_info_initrd_size() -> usize {
@@ -186,7 +196,89 @@ fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     true
 }
 
-/// Extract ELF name from message regs, append ".elf" if needed.
+fn strip_elf_suffix(name: &mut [u8], mut len: usize) -> usize {
+    if len >= 4
+        && name[len - 4] == b'.'
+        && name[len - 3] == b'e'
+        && name[len - 2] == b'l'
+        && name[len - 1] == b'f'
+    {
+        len -= 4;
+    }
+    len
+}
+
+fn path_basename(path: &[u8]) -> &[u8] {
+    let mut i = path.len();
+    while i > 0 {
+        if path[i - 1] == b'/' {
+            return &path[i..];
+        }
+        i -= 1;
+    }
+    path
+}
+
+/// Respawn a process by crafting a synthetic POSIX_PM_SPAWN message.
+/// Called from handle_exit when the process has the respawn flag set.
+unsafe fn respawn_process(binary: &[u8; MAX_NAME_LEN]) {
+    unsafe {
+        let mut name_len = 0usize;
+        while name_len < MAX_NAME_LEN && binary[name_len] != 0 {
+            name_len += 1;
+        }
+        if name_len == 0 {
+            return;
+        }
+
+        let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] Respawning: ");
+        lb.bytes(&binary[..name_len]);
+        lb.str(b"\n");
+        lb.flush();
+
+        // Build synthetic spawn message
+        let mut msg = SaltyMsg::zeroed();
+        msg.label = PM_SPAWN;
+        let packed_name_words = (name_len as u64 + 7) / 8;
+        msg.regs[0] = name_len as u64;
+        // policy: SPAWN_READY_IMMEDIATE, no initrd, no display, default cnode
+        msg.regs[1] = salty::SPAWN_READY_IMMEDIATE;
+        msg.regs[2] = 0; // timeout
+        msg.regs[3] = salty::SPAWN_FLAG_RESPAWN; // preserve respawn flag
+        msg.regs[4] = 0; // no spawn args
+        msg.length = 5 + packed_name_words;
+
+        let dst = &raw mut msg.regs[5] as *mut u8;
+        for i in 0..name_len {
+            *dst.add(i) = binary[i];
+        }
+
+        let mut reply = SaltyMsg::zeroed();
+        let alloc = &mut *(&raw mut ALLOCATOR);
+        spawn_tx::handle_spawn_tx(&msg, &mut reply, 0, alloc);
+
+        if reply.label == SALTY_OK {
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] Respawned PID=");
+            lb.hex(reply.regs[0]);
+            lb.str(b"\n");
+            lb.flush();
+        } else {
+            // Retry once after a short delay
+            salty::serial::serial_puts(b"[PROCMGR] Respawn failed, retrying...\n");
+            salty::syscall::syscall(salty::SYS_NANOSLEEP, 100_000_000, 0, 0, 0, 0, 0);
+            let mut reply2 = SaltyMsg::zeroed();
+            spawn_tx::handle_spawn_tx(&msg, &mut reply2, 0, alloc);
+            if reply2.label != SALTY_OK {
+                salty::serial::serial_puts(b"[PROCMGR] Respawn retry failed\n");
+            }
+        }
+    }
+}
+
+/// Extract process path/name from message regs and normalize by stripping
+/// an optional trailing ".elf" suffix.
 /// Returns the name buffer and its length.
 fn extract_name(msg: &SaltyMsg, name_reg_idx: usize) -> ([u8; MAX_NAME_LEN + 5], usize) {
     let mut name = [0u8; MAX_NAME_LEN + 5];
@@ -200,17 +292,7 @@ fn extract_name(msg: &SaltyMsg, name_reg_idx: usize) -> ([u8; MAX_NAME_LEN + 5],
         }
     }
 
-    let has_elf = name_len >= 4
-        && name[name_len - 4] == b'.'
-        && name[name_len - 3] == b'e'
-        && name[name_len - 2] == b'l'
-        && name[name_len - 1] == b'f';
-    if !has_elf && name_len + 4 <= MAX_NAME_LEN {
-        name[name_len] = b'.'; name_len += 1;
-        name[name_len] = b'e'; name_len += 1;
-        name[name_len] = b'l'; name_len += 1;
-        name[name_len] = b'f'; name_len += 1;
-    }
+    name_len = strip_elf_suffix(&mut name, name_len);
     name[name_len] = 0;
     (name, name_len)
 }
@@ -341,8 +423,41 @@ unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         lb.str(b"[PROCMGR] EXIT PID="); lb.hex(PROCTAB[idx].pid as u64);
         lb.str(b" code="); lb.hex(exit_code as u64); lb.str(b"\n"); lb.flush(); }
 
+        // Ensure VFS tears down all per-client fd state/refcounts for this badge.
+        // Use non-blocking send so PM_EXIT path cannot wedge waiting for VFS reply.
+        let mut vfs_msg = SaltyMsg::zeroed();
+        vfs_msg.label = salty::consts::POSIX_VFS_CLIENT_EXIT;
+        vfs_msg.length = 1;
+        vfs_msg.regs[0] = badge;
+        let mut vfs_err = 0i32;
+        let mut vfs_sent = false;
+        for _ in 0..16 {
+            vfs_err = ipc::nbsend_ctx(ipc_ctx(), CAP_VFS_EP, &raw const vfs_msg);
+            if vfs_err == 0 {
+                vfs_sent = true;
+                break;
+            }
+            salty::syscall::syscall(salty::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        }
+        if !vfs_sent {
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] EXIT: VFS client-exit sync failed err=");
+            lb.hex(vfs_err as u64);
+            lb.str(b" badge=");
+            lb.hex(badge);
+            lb.str(b"\n");
+            lb.flush();
+        }
+
         PROCTAB[idx].state = PROC_ZOMBIE;
         PROCTAB[idx].exit_code = exit_code;
+
+        // Save respawn info before cleanup clears it
+        let should_respawn = PROCTAB[idx].respawn;
+        let mut saved_binary = [0u8; MAX_NAME_LEN];
+        if should_respawn {
+            saved_binary = PROCTAB[idx].respawn_binary;
+        }
 
         salty::invoke::invoke(PROCTAB[idx].tcb_cap, salty::TCB_SUSPEND, 0, 0, 0, 0);
 
@@ -376,10 +491,14 @@ unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             PROCTAB[idx].waiter_pid = 0;
             free_proc_alloc_slots(idx);
             cleanup_proc_resources(idx, CAP_SELF_CSPACE);
+            if should_respawn {
+                respawn_process(&saved_binary);
+            }
             return;
         }
 
         // Wake any-child waiter on parent
+        let mut reaped = false;
         if let Some(pi) = find_by_pid(ppid) {
             if PROCTAB[pi].waiting_for_any != 0 {
                 { let mut lb = LineBuf::new();
@@ -400,7 +519,19 @@ unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                 PROCTAB[pi].waiting_for_any = 0;
                 free_proc_alloc_slots(idx);
                 cleanup_proc_resources(idx, CAP_SELF_CSPACE);
+                reaped = true;
             }
+        }
+
+        // Respawnable process with no waiter: reap immediately and respawn
+        if !reaped && should_respawn {
+            free_proc_alloc_slots(idx);
+            cleanup_proc_resources(idx, CAP_SELF_CSPACE);
+            reaped = true;
+        }
+
+        if reaped && should_respawn {
+            respawn_process(&saved_binary);
         }
     }
 }
@@ -426,9 +557,11 @@ unsafe fn handle_wait(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) -> bool 
             let mut zombie_idx: Option<usize> = None;
             let mut stopped_idx: Option<usize> = None;
             let mut has_living = false;
+            let mut child_count: u32 = 0;
 
             for i in 0..MAX_PROCESSES {
                 if PROCTAB[i].state != PROC_FREE && PROCTAB[i].ppid == caller_pid {
+                    child_count += 1;
                     if PROCTAB[i].state == PROC_ZOMBIE && zombie_idx.is_none() {
                         zombie_idx = Some(i);
                     } else if PROCTAB[i].state == PROC_STOPPED && stopped_idx.is_none() {
@@ -438,6 +571,24 @@ unsafe fn handle_wait(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) -> bool 
                         has_living = true;
                     }
                 }
+            }
+            if PM_TRACE_BADGE != 0 && badge == PM_TRACE_BADGE && PM_WAIT_TRACE_BUDGET > 0 {
+                PM_WAIT_TRACE_BUDGET -= 1;
+                let mut lb = LineBuf::new();
+                lb.str(b"[PROCMGR][WAIT] opt=");
+                lb.hex(options as u64);
+                lb.str(b" caller_pid=");
+                lb.hex(caller_pid as u64);
+                lb.str(b" children=");
+                lb.dec(child_count as u64);
+                lb.str(b" living=");
+                lb.dec(has_living as u64);
+                lb.str(b" zombie=");
+                lb.dec(zombie_idx.is_some() as u64);
+                lb.str(b" stopped=");
+                lb.dec(stopped_idx.is_some() as u64);
+                lb.str(b"\n");
+                lb.flush();
             }
 
             if let Some(zi) = zombie_idx {
@@ -557,6 +708,16 @@ unsafe fn handle_getpid(reply: &mut SaltyMsg, badge: u64) {
         reply.label = SALTY_NOT_FOUND;
         return;
     };
+    unsafe {
+        if PM_TRACE_BADGE != 0 && badge == PM_TRACE_BADGE && PM_TRACE_BUDGET > 0 {
+            PM_TRACE_BUDGET -= 1;
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR][TRACE] getpid->");
+            lb.hex(PROCTAB[idx].pid as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
+    }
     reply.label = SALTY_OK;
     reply.length = 1;
     reply.regs[0] = unsafe { PROCTAB[idx].pid as u64 };
@@ -567,6 +728,16 @@ unsafe fn handle_getppid(reply: &mut SaltyMsg, badge: u64) {
         reply.label = SALTY_NOT_FOUND;
         return;
     };
+    unsafe {
+        if PM_TRACE_BADGE != 0 && badge == PM_TRACE_BADGE && PM_TRACE_BUDGET > 0 {
+            PM_TRACE_BUDGET -= 1;
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR][TRACE] getppid->");
+            lb.hex(PROCTAB[idx].ppid as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
+    }
     reply.label = SALTY_OK;
     reply.length = 1;
     reply.regs[0] = unsafe { PROCTAB[idx].ppid as u64 };
@@ -727,7 +898,7 @@ unsafe fn deliver_signal_to(ti: usize, sig: usize) -> bool {
     }
 }
 
-unsafe fn handle_kill(msg: &SaltyMsg, reply: &mut SaltyMsg, _badge: u64) {
+unsafe fn handle_kill(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
     unsafe {
         let target_pid = msg.regs[0] as u32;
         let sig = msg.regs[1] as usize;
@@ -737,12 +908,23 @@ unsafe fn handle_kill(msg: &SaltyMsg, reply: &mut SaltyMsg, _badge: u64) {
             return;
         }
 
-        // pid==0: send signal to all processes in the foreground process group (pgid==0)
+        let Some(caller_idx) = find_by_badge(badge) else {
+            reply.label = SALTY_NOT_FOUND;
+            return;
+        };
+
+        // pid==0: send signal to all processes in caller's process group.
         if target_pid == 0 {
+            let caller_pgid = PROCTAB[caller_idx].pgid;
+            let mut delivered = false;
             for i in 0..MAX_PROCESSES {
-                if PROCTAB[i].state != PROC_FREE && PROCTAB[i].pgid == 0 {
-                    deliver_signal_to(i, sig);
+                if PROCTAB[i].state != PROC_FREE && PROCTAB[i].pgid == caller_pgid {
+                    delivered |= deliver_signal_to(i, sig);
                 }
+            }
+            if !delivered {
+                reply.label = SALTY_NOT_FOUND;
+                return;
             }
             reply.label = SALTY_OK;
             reply.length = 0;
@@ -761,6 +943,93 @@ unsafe fn handle_kill(msg: &SaltyMsg, reply: &mut SaltyMsg, _badge: u64) {
 
         reply.label = SALTY_OK;
         reply.length = 0;
+    }
+}
+
+/// POSIX_PM_KILL_PGID: send signal to an explicit process group.
+/// Called by ttyd when ISIG chars arrive (e.g., Ctrl-C → SIGINT to fg_pgrp).
+/// msg.regs[0] = target_pgid, msg.regs[1] = sig
+unsafe fn handle_kill_pgid(msg: &SaltyMsg, reply: &mut SaltyMsg) {
+    unsafe {
+        let target_pgid = msg.regs[0] as u32;
+        let sig = msg.regs[1] as usize;
+
+        if sig == 0 || sig >= NSIG {
+            reply.label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        let mut delivered = false;
+        for i in 0..MAX_PROCESSES {
+            if PROCTAB[i].state != PROC_FREE && PROCTAB[i].pgid == target_pgid {
+                delivered |= deliver_signal_to(i, sig);
+            }
+        }
+
+        if !delivered {
+            reply.label = SALTY_NOT_FOUND;
+            return;
+        }
+
+        reply.label = SALTY_OK;
+        reply.length = 0;
+    }
+}
+
+/// PM_INJECT_CAP: inject a capability into a child's CSpace.
+/// Called by init after pm_spawn to deliver NeedEP/CopyCap caps.
+///   msg.regs[0] = target PID
+///   msg.regs[1] = dst_slot in child's CSpace
+///   extra_caps[0] = cap to inject (received at CAP_RECV_SCRATCH)
+unsafe fn handle_inject_cap(msg: &SaltyMsg, reply: &mut SaltyMsg) {
+    unsafe {
+        let pid = msg.regs[0] as u32;
+        let dst_slot = msg.regs[1];
+
+        let idx = match find_by_pid(pid) {
+            Some(i) => i,
+            None => {
+                reply.label = SALTY_INVALID_ARGUMENT;
+                return;
+            }
+        };
+
+        let child_cn = PROCTAB[idx].cnode_cap;
+        if child_cn == 0 {
+            reply.label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        if PM_INJECT_DEBUG_BUDGET > 0 {
+            let probe = salty::syscall::syscall(salty::SYS_SIGNAL, CAP_RECV_SCRATCH, 0, 0, 0, 0, 0);
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR][INJECT] pid=");
+            lb.hex(pid as u64);
+            lb.str(b" dst=");
+            lb.hex(dst_slot);
+            lb.str(b" probe_sig_err=");
+            lb.hex(probe.error);
+            lb.str(b"\n");
+            lb.flush();
+            PM_INJECT_DEBUG_BUDGET -= 1;
+        }
+
+        // Cap was received at CAP_RECV_SCRATCH via IPC cap transfer.
+        // Move it into the child slot so the scratch slot is freed for the
+        // next injected cap in the same boot sequence.
+        let err = salty::invoke::cnode_move(
+            child_cn, dst_slot,
+            CAP_SELF_CSPACE, CAP_RECV_SCRATCH,
+        );
+        if PM_INJECT_DEBUG_BUDGET > 0 {
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR][INJECT] copy_err=");
+            lb.hex(err as u64);
+            lb.str(b"\n");
+            lb.flush();
+            PM_INJECT_DEBUG_BUDGET -= 1;
+        }
+        reply.label = if err == 0 { SALTY_OK } else { SALTY_INVALID_OPERATION };
     }
 }
 
@@ -973,23 +1242,11 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                     }
                 }
 
-                // Default path: clone page into child with kernel-managed COW.
-                // Keep the RSP page on explicit copy path so procmgr can patch
-                // the child fork trampoline frame before first resume.
-                if page_vaddr != rsp_page_vaddr {
-                    let cerr = salty::invoke::vspace_clone_cow_page(
-                        parent_vs,
-                        page_vaddr,
-                        child_vs,
-                        page_vaddr,
-                    );
-                    if cerr == 0 {
-                        total_pages += 1;
-                        continue;
-                    }
-                }
+                // Policy: keep fork on eager copy path for now.
+                // COW path currently reproduces child-start corruption at RIP=0x3484ac
+                // under interactive shell exec workloads.
 
-                let next_frame = match alloc.realize_object(OBJ_FRAME, 0) {
+                let copied_frame = match alloc.realize_object(OBJ_FRAME, 0) {
                     Ok(s) => s,
                     Err(_) => {
                         puts(b"[PROCMGR] FORK: frame retype failed\n");
@@ -999,7 +1256,7 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                     }
                 };
 
-                let err = salty::invoke::vspace_copy_page(parent_vs, page_vaddr, next_frame);
+                let err = salty::invoke::vspace_copy_page(parent_vs, page_vaddr, copied_frame);
                 if err != 0 {
                     let mut lb = LineBuf::new();
                     lb.str(b"[PROCMGR] FORK: copy_page failed at "); lb.hex(page_vaddr);
@@ -1015,7 +1272,7 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                 }
                 if page_flags & X86_PTE_NX == 0 { map_flags |= VSPACE_FLAG_EXECUTABLE; }
 
-                let err = salty::invoke::vspace_map(child_vs, next_frame, page_vaddr, map_flags);
+                let err = salty::invoke::vspace_map(child_vs, copied_frame, page_vaddr, map_flags);
                 if err != 0 {
                     let mut lb = LineBuf::new();
                     lb.str(b"[PROCMGR] FORK: child map failed at "); lb.hex(page_vaddr);
@@ -1025,7 +1282,7 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                     return;
                 }
 
-                if page_vaddr == rsp_page_vaddr { rsp_frame = next_frame; }
+                if page_vaddr == rsp_page_vaddr { rsp_frame = copied_frame; }
                 total_pages += 1;
             }
 
@@ -1034,7 +1291,7 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         }
 
         { let mut lb = LineBuf::new();
-        lb.str(b"[PROCMGR] FORK: copied "); lb.hex(total_pages); lb.str(b" pages\n"); lb.flush(); }
+        lb.str(b"[PROCMGR] FORK: mapped "); lb.hex(total_pages); lb.str(b" pages\n"); lb.flush(); }
 
         if rsp_frame == 0 {
             puts(b"[PROCMGR] FORK: parent RSP page not mapped in child\n");
@@ -1157,6 +1414,24 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         }
         let _ = salty::invoke::cnode_copy(CAP_SELF_CSPACE, CAP_NAMESERV_EP, child_cn, CHILD_CAP_NAMESERV, CAP_RIGHTS_ALL);
         let _ = salty::invoke::cnode_copy(CAP_SELF_CSPACE, child_sig_ntfn, child_cn, CHILD_CAP_SIGNAL_NTFN, CAP_RIGHTS_ALL);
+        // Keep fork child cap layout aligned with spawn path so rtld/slot alloc
+        // can use initrd device mapping and mirrored untyped sources.
+        let _ = salty::invoke::cnode_copy(
+            CAP_SELF_CSPACE,
+            CAP_INITRD_UNTYPED,
+            child_cn,
+            CAP_INITRD_UNTYPED,
+            INITRD_COPY_RIGHTS,
+        );
+        for ut_slot in CAP_UNTYPED_START..(CAP_UNTYPED_START + UT_MIRROR_COUNT) {
+            let _ = salty::invoke::cnode_copy(
+                CAP_SELF_CSPACE,
+                ut_slot,
+                child_cn,
+                ut_slot,
+                CAP_RIGHTS_ALL,
+            );
+        }
 
         // Mint UT expansion notification into child CNode
         let pm_ntfn = *(&raw const PM_BOUND_NTFN);
@@ -1229,6 +1504,7 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         let p = &mut PROCTAB[slot_idx];
         p.pid = child_pid;
         p.ppid = parent_pid;
+        p.sid = PROCTAB[parent_idx].sid;
         p.state = PROC_RUNNING;
         p.exit_code = 0;
         p.badge = child_pid as u64;
@@ -1245,6 +1521,9 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         p.shared_lib_base = PROCTAB[parent_idx].shared_lib_base;
         p.lib_map = parent_lib_map;
         p.layout = parent_layout;
+        p.child_ut_cap = child_ut_slot;
+        p.ut_expand_count = 0;
+        p.has_service_ep = PROCTAB[parent_idx].has_service_ep;
         for i in 0..NSIG {
             p.sig_disposition[i] = PROCTAB[parent_idx].sig_disposition[i];
         }
@@ -1302,12 +1581,96 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         lb.str(b" envc="); lb.hex(envc as u64);
         lb.str(b"\n");
         lb.flush(); }
+        if bytes_eq(path_basename(&name[..name_len]), b"bash") {
+            PM_TRACE_BADGE = badge;
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] tracing badge=");
+            lb.hex(badge);
+            lb.str(b" (bash)\n");
+            lb.flush();
+
+            // Dump argv/envp as parsed from exec payload to verify shell mode.
+            let mut pos = 0usize;
+            for ai in 0..argc {
+                if pos >= exec_str_len {
+                    break;
+                }
+                let start = pos;
+                while pos < exec_str_len && exec_str_data[pos] != 0 {
+                    pos += 1;
+                }
+                let mut ab = LineBuf::new();
+                ab.str(b"[PROCMGR][BASH_ARG] i=");
+                ab.dec(ai as u64);
+                ab.str(b" v='");
+                ab.bytes(&exec_str_data[start..pos]);
+                ab.str(b"'\n");
+                ab.flush();
+                if pos < exec_str_len {
+                    pos += 1;
+                }
+            }
+            for ei in 0..envc {
+                if pos >= exec_str_len {
+                    break;
+                }
+                let start = pos;
+                while pos < exec_str_len && exec_str_data[pos] != 0 {
+                    pos += 1;
+                }
+                let mut eb = LineBuf::new();
+                eb.str(b"[PROCMGR][BASH_ENV] i=");
+                eb.dec(ei as u64);
+                eb.str(b" v='");
+                eb.bytes(&exec_str_data[start..pos]);
+                eb.str(b"'\n");
+                eb.flush();
+                if pos < exec_str_len {
+                    pos += 1;
+                }
+            }
+        }
 
         let initrd = INITRD_VADDR as *const u8;
         let initrd_size = read_boot_info_initrd_size();
 
         let mut elf_entry = CpioEntry::zeroed();
-        if salty::cpio::cpio_find_file(initrd, initrd_size, name.as_ptr(), name_len, &raw mut elf_entry) == 0 {
+
+        let mut found = salty::cpio::cpio_find_file(
+            initrd, initrd_size, name.as_ptr(), name_len, &raw mut elf_entry,
+        ) != 0;
+        let mut base_off = 0usize;
+        let mut base_len = name_len;
+        if !found && name_len > 0 && name[0] == b'/' {
+            base_off = 1;
+            base_len = name_len - 1;
+            found = salty::cpio::cpio_find_file(
+                initrd,
+                initrd_size,
+                (&name[base_off]) as *const u8,
+                base_len,
+                &raw mut elf_entry,
+            ) != 0;
+        }
+
+        if !found && base_len + 4 <= MAX_NAME_LEN {
+            let mut legacy = [0u8; MAX_NAME_LEN + 5];
+            for i in 0..base_len {
+                legacy[i] = name[base_off + i];
+            }
+            legacy[base_len] = b'.';
+            legacy[base_len + 1] = b'e';
+            legacy[base_len + 2] = b'l';
+            legacy[base_len + 3] = b'f';
+            found = salty::cpio::cpio_find_file(
+                initrd,
+                initrd_size,
+                legacy.as_ptr(),
+                base_len + 4,
+                &raw mut elf_entry,
+            ) != 0;
+        }
+        if !found {
             puts(b"[PROCMGR] EXEC: ELF not found\n");
             reply.label = SALTY_NOT_FOUND;
             return;
@@ -1335,6 +1698,33 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
 
             if next_addr == 0 { break; }
             walk_start = next_addr;
+        }
+
+        // 2a. Clean old RTLD/dynamic slots from child CSpace to prevent slot collision
+        {
+            let child_cn = PROCTAB[idx].cnode_cap;
+            let frame_floor = if PROCTAB[idx].has_service_ep {
+                CHILD_CAP_SERVICE_EP + 1
+            } else {
+                CHILD_RTLD_FRAME_SLOT_START
+            };
+            // Query CNode size for upper bound
+            let mut cnode_bits: u64 = 10;
+            let cinfo = salty::invoke::cnode_get_info(child_cn);
+            if cinfo.error == 0 {
+                let ctx = &*ipc_ctx();
+                if !ctx.ipc_buffer.is_null() {
+                    let buf = &*ctx.ipc_buffer;
+                    let bits = buf.msg[2];
+                    if bits >= 4 && bits <= 16 {
+                        cnode_bits = bits;
+                    }
+                }
+            }
+            let cnode_total = 1u64 << cnode_bits;
+            for slot in frame_floor..cnode_total {
+                salty::invoke::cnode_delete(child_cn, slot);
+            }
         }
 
         // 2. Free old frame slots beyond the fixed objects
@@ -1647,7 +2037,7 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
                 layout.initrd.base,
                 layout.stack_top,
                 exec_cnode_bits,
-                CHILD_RTLD_FRAME_SLOT_START,
+                if PROCTAB[idx].has_service_ep { CHILD_CAP_SERVICE_EP + 1 } else { CHILD_RTLD_FRAME_SLOT_START },
             ) {
                 Ok(rsp) => { new_rsp = rsp; new_entry = rtld_result.entry; }
                 Err(()) => {
@@ -1730,6 +2120,7 @@ unsafe fn handle_setpgid(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             return;
         };
         let caller_pid = PROCTAB[caller_idx].pid;
+        let caller_sid = PROCTAB[caller_idx].sid;
 
         // pid=0 means self
         if target_pid == 0 {
@@ -1744,6 +2135,32 @@ unsafe fn handle_setpgid(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             reply.label = SALTY_NOT_FOUND;
             return;
         };
+
+        if target_pid != caller_pid && PROCTAB[ti].ppid != caller_pid {
+            reply.label = SALTY_INVALID_OPERATION;
+            return;
+        }
+
+        if PROCTAB[ti].sid != caller_sid {
+            reply.label = SALTY_INVALID_OPERATION;
+            return;
+        }
+
+        if PROCTAB[ti].pid == PROCTAB[ti].sid {
+            reply.label = SALTY_INVALID_OPERATION;
+            return;
+        }
+
+        if pgid != target_pid {
+            let Some(gi) = find_by_pid(pgid) else {
+                reply.label = SALTY_NOT_FOUND;
+                return;
+            };
+            if PROCTAB[gi].sid != PROCTAB[ti].sid {
+                reply.label = SALTY_INVALID_OPERATION;
+                return;
+            }
+        }
 
         PROCTAB[ti].pgid = pgid;
         reply.label = SALTY_OK;
@@ -1781,10 +2198,66 @@ unsafe fn handle_setsid(reply: &mut SaltyMsg, badge: u64) {
             return;
         };
         let pid = PROCTAB[idx].pid;
+        if PROCTAB[idx].pgid == pid {
+            reply.label = SALTY_INVALID_OPERATION;
+            return;
+        }
+        PROCTAB[idx].sid = pid;
         PROCTAB[idx].pgid = pid;
         reply.label = SALTY_OK;
         reply.length = 1;
         reply.regs[0] = pid as u64;
+    }
+}
+
+unsafe fn handle_getsid(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
+    unsafe {
+        let mut target_pid = msg.regs[0] as u32;
+
+        if target_pid == 0 {
+            let Some(caller_idx) = find_by_badge(badge) else {
+                reply.label = SALTY_NOT_FOUND;
+                return;
+            };
+            target_pid = PROCTAB[caller_idx].pid;
+        }
+
+        let Some(ti) = find_by_pid(target_pid) else {
+            reply.label = SALTY_NOT_FOUND;
+            return;
+        };
+
+        reply.label = SALTY_OK;
+        reply.length = 1;
+        reply.regs[0] = PROCTAB[ti].sid as u64;
+    }
+}
+
+unsafe fn handle_getpgid_badge(msg: &SaltyMsg, reply: &mut SaltyMsg) {
+    unsafe {
+        let target_badge = msg.regs[0];
+        let Some(ti) = find_by_badge(target_badge) else {
+            reply.label = SALTY_NOT_FOUND;
+            return;
+        };
+
+        reply.label = SALTY_OK;
+        reply.length = 1;
+        reply.regs[0] = PROCTAB[ti].pgid as u64;
+    }
+}
+
+unsafe fn handle_getsid_badge(msg: &SaltyMsg, reply: &mut SaltyMsg) {
+    unsafe {
+        let target_badge = msg.regs[0];
+        let Some(ti) = find_by_badge(target_badge) else {
+            reply.label = SALTY_NOT_FOUND;
+            return;
+        };
+
+        reply.label = SALTY_OK;
+        reply.length = 1;
+        reply.regs[0] = PROCTAB[ti].sid as u64;
     }
 }
 
@@ -2166,6 +2639,8 @@ unsafe fn handle_register(msg: &SaltyMsg, reply: &mut SaltyMsg, _badge: u64) {
 
         PROCTAB[ci].pid = NEXT_PID;
         NEXT_PID += 1;
+        PROCTAB[ci].sid = PROCTAB[ci].pid;
+        PROCTAB[ci].pgid = PROCTAB[ci].pid;
         PROCTAB[ci].badge = reg_badge;
         PROCTAB[ci].state = PROC_RUNNING;
         PROCTAB[ci].cnode_cap = cn_perm;
@@ -2244,6 +2719,11 @@ pub extern "C" fn _start() -> ! {
             UT_MIRROR_COUNT as usize,
         );
 
+        // Pre-load shared library RO pages into frame cache.
+        // Must happen before any allocator use — init copies shared lib caps
+        // into slots 0x80+, which can overlap SLOT_POOL_BASE (256).
+        spawn_tx::init_shared_lib_cache(&mut *(&raw mut ALLOCATOR));
+
         // Create and bind a notification for UT expansion signaling.
         // Children signal this notification; procmgr detects via bound notification
         // delivery during recv/reply_recv.
@@ -2257,7 +2737,7 @@ pub extern "C" fn _start() -> ! {
                 }
             };
             if ntfn_slot != 0 {
-                let err = salty::invoke::untyped_retype(CAP_UNTYPED, OBJ_NOTIFICATION, 0, ntfn_slot);
+                let err = alloc.retype_any(OBJ_NOTIFICATION, 0, ntfn_slot);
                 if err != 0 {
                     puts(b"[PROCMGR] WARN: retype notification failed\n");
                     alloc.free_single_slot(ntfn_slot);
@@ -2272,9 +2752,6 @@ pub extern "C" fn _start() -> ! {
                 }
             }
         }
-
-        // Pre-load shared library RO pages into frame cache
-        spawn_tx::init_shared_lib_cache(&mut *(&raw mut ALLOCATOR));
 
         // Signal ready BEFORE registration — init needs to proceed to spawn nameserv.
         // The registration Call will block in the EP send queue until nameserv starts.
@@ -2318,6 +2795,20 @@ pub extern "C" fn _start() -> ! {
         loop {
             let mut reply = SaltyMsg::zeroed();
             let mut skip_reply = false;
+            if PM_TRACE_BADGE != 0 && badge == PM_TRACE_BADGE && msg.label != 0 && PM_TRACE_BUDGET > 0 {
+                PM_TRACE_BUDGET -= 1;
+                let mut lb = LineBuf::new();
+                lb.str(b"[PROCMGR][TRACE] l=");
+                lb.hex(msg.label);
+                lb.str(b" b=");
+                lb.hex(badge);
+                lb.str(b" r0=");
+                lb.hex(msg.regs[0]);
+                lb.str(b" r1=");
+                lb.hex(msg.regs[1]);
+                lb.str(b"\n");
+                lb.flush();
+            }
 
             // Bound notification delivery: label=0 and badge!=0 means the
             // kernel delivered a notification word instead of an IPC message.
@@ -2344,12 +2835,15 @@ pub extern "C" fn _start() -> ! {
                 }
                 PM_GETPPID => handle_getppid(&mut reply, badge),
                 PM_KILL => handle_kill(&msg, &mut reply, badge),
+                PM_KILL_PGID => handle_kill_pgid(&msg, &mut reply),
+                PM_INJECT_CAP => handle_inject_cap(&msg, &mut reply),
                 PM_SIGACTION => handle_sigaction(&msg, &mut reply, badge),
                 PM_GETUID => handle_getuid(&mut reply, badge),
                 PM_GETGID => handle_getgid(&mut reply, badge),
                 PM_SETPGID => handle_setpgid(&msg, &mut reply, badge),
                 PM_GETPGID => handle_getpgid(&msg, &mut reply, badge),
                 PM_SETSID => handle_setsid(&mut reply, badge),
+                PM_GETSID => handle_getsid(&msg, &mut reply, badge),
                 PM_GETEUID => handle_geteuid(&mut reply, badge),
                 PM_GETEGID => handle_getegid(&mut reply, badge),
                 PM_GETGROUPS => handle_getgroups(&mut reply),
@@ -2360,6 +2854,8 @@ pub extern "C" fn _start() -> ! {
                 }
                 PM_EXPAND_COLLECT => handle_expand_collect(&mut reply, badge),
                 PM_REGISTER => handle_register(&msg, &mut reply, badge),
+                PM_GETPGID_BADGE => handle_getpgid_badge(&msg, &mut reply),
+                PM_GETSID_BADGE => handle_getsid_badge(&msg, &mut reply),
                 _ => {
                     let mut lb = LineBuf::new();
                     lb.str(b"[PROCMGR] unknown label="); lb.hex(msg.label); lb.str(b"\n"); lb.flush();

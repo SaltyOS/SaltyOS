@@ -445,17 +445,125 @@ pub unsafe extern "C" fn sem_post(_sem: *mut u8) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// popen / pclose — pipe to process (not supported yet)
+// popen / pclose — pipe to process via fork+exec
 // ---------------------------------------------------------------------------
 
+const MAX_POPEN_ENTRIES: usize = 8;
+
+struct PopenEntry {
+    fp: *mut crate::stdio::FILE,
+    pid: i32,
+}
+
+static mut POPEN_TABLE: [PopenEntry; MAX_POPEN_ENTRIES] = {
+    const EMPTY: PopenEntry = PopenEntry { fp: core::ptr::null_mut(), pid: 0 };
+    [EMPTY; MAX_POPEN_ENTRIES]
+};
+
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn popen(_cmd: *const u8, _mode: *const u8) -> *mut u8 {
-    errno::set_errno(errno::ENOSYS);
-    core::ptr::null_mut()
+pub unsafe extern "C" fn popen(cmd: *const u8, mode: *const u8) -> *mut crate::stdio::FILE {
+    unsafe {
+        if cmd.is_null() || mode.is_null() {
+            errno::set_errno(errno::EINVAL);
+            return core::ptr::null_mut();
+        }
+
+        let m = *mode;
+        let is_read = m == b'r';
+        let is_write = m == b'w';
+        if !is_read && !is_write {
+            errno::set_errno(errno::EINVAL);
+            return core::ptr::null_mut();
+        }
+
+        let mut fds = [0i32; 2];
+        if crate::unistd::pipe(fds.as_mut_ptr()) < 0 {
+            return core::ptr::null_mut();
+        }
+
+        let pid = crate::process::fork();
+        if pid < 0 {
+            salty::posix::posix_close(fds[0]);
+            salty::posix::posix_close(fds[1]);
+            return core::ptr::null_mut();
+        }
+
+        if pid == 0 {
+            // Child
+            if is_read {
+                salty::posix::posix_close(fds[0]);
+                crate::unistd::dup2(fds[1], 1); // stdout → pipe write end
+                salty::posix::posix_close(fds[1]);
+            } else {
+                salty::posix::posix_close(fds[1]);
+                crate::unistd::dup2(fds[0], 0); // stdin → pipe read end
+                salty::posix::posix_close(fds[0]);
+            }
+            crate::process::execl(
+                b"/bin/sh\0".as_ptr(),
+                b"sh\0".as_ptr(),
+                b"-c\0".as_ptr(),
+                cmd,
+                core::ptr::null::<u8>(),
+            );
+            crate::crt::_exit(127);
+        }
+
+        // Parent
+        let (parent_fd, close_fd) = if is_read {
+            (fds[0], fds[1])
+        } else {
+            (fds[1], fds[0])
+        };
+        salty::posix::posix_close(close_fd);
+
+        let mode_str = if is_read { b"r\0".as_ptr() } else { b"w\0".as_ptr() };
+        let fp = crate::stdio::fdopen(parent_fd, mode_str);
+        if fp.is_null() {
+            salty::posix::posix_close(parent_fd);
+            return core::ptr::null_mut();
+        }
+
+        // Record in popen table for pclose
+        for entry in &mut *addr_of_mut!(POPEN_TABLE) {
+            if entry.fp.is_null() {
+                entry.fp = fp;
+                entry.pid = pid;
+                break;
+            }
+        }
+
+        fp
+    }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pclose(_stream: *mut u8) -> i32 {
-    errno::set_errno(errno::ENOSYS);
-    -1
+pub unsafe extern "C" fn pclose(stream: *mut crate::stdio::FILE) -> i32 {
+    unsafe {
+        if stream.is_null() {
+            errno::set_errno(errno::EINVAL);
+            return -1;
+        }
+
+        let mut pid: i32 = -1;
+        for entry in &mut *addr_of_mut!(POPEN_TABLE) {
+            if entry.fp == stream {
+                pid = entry.pid;
+                entry.fp = core::ptr::null_mut();
+                entry.pid = 0;
+                break;
+            }
+        }
+
+        crate::stdio::fclose(stream);
+
+        if pid < 0 {
+            errno::set_errno(errno::ECHILD);
+            return -1;
+        }
+
+        let mut status: i32 = 0;
+        crate::process::waitpid(pid, &mut status, 0);
+        status
+    }
 }

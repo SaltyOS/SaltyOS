@@ -3,32 +3,38 @@
 #define __SYS_STAT_H__
 
 #include <sys/types.h>
+#include <time.h>
 
 struct stat {
     unsigned long st_dev;
     unsigned long st_ino;
-    unsigned int  st_mode;
-    unsigned int  st_nlink;
+    unsigned long st_nlink;
+    mode_t        st_mode;
+    short         st_padding0;
     unsigned int  st_uid;
     unsigned int  st_gid;
+    int           st_padding1;
     unsigned long st_rdev;
+    struct timespec st_atim;
+    struct timespec st_mtim;
+    struct timespec st_ctim;
+    struct timespec st_birthtim;
     long          st_size;
-    long          st_blksize;
     long          st_blocks;
-    long          st_atime;
-    long          st_atime_nsec;
-    long          st_mtime;
-    long          st_mtime_nsec;
-    long          st_ctime;
-    long          st_ctime_nsec;
-    unsigned long st_flags;
-    struct {
-        long tv_sec;
-        long tv_nsec;
-    } st_birthtim;
+    int           st_blksize;
+    unsigned int  st_flags;
+    unsigned long st_gen;
+    unsigned long st_spare[10];
 };
 
+#define st_atime         st_atim.tv_sec
+#define st_atime_nsec    st_atim.tv_nsec
+#define st_mtime         st_mtim.tv_sec
+#define st_mtime_nsec    st_mtim.tv_nsec
+#define st_ctime         st_ctim.tv_sec
+#define st_ctime_nsec    st_ctim.tv_nsec
 #define st_birthtime     st_birthtim.tv_sec
+#define st_birthtime_nsec st_birthtim.tv_nsec
 #define st_birthtimespec st_birthtim
 
 /* BSD file flag constants */
@@ -59,6 +65,7 @@ struct stat {
 #define S_IFDIR  0040000
 #define S_IFCHR  0020000
 #define S_IFIFO  0010000
+#define S_IFWHT  0160000
 
 /* File type test macros */
 #define S_ISREG(m)  (((m) & S_IFMT) == S_IFREG)
@@ -98,8 +105,6 @@ extern int fchmod(int fd, mode_t mode);
 
 #define UTIME_NOW   ((1 << 30) - 1)
 #define UTIME_OMIT  ((1 << 30) - 2)
-
-#include <time.h>
 
 extern int fstatat(int dirfd, const char *pathname, struct stat *statbuf,
                    int flags);

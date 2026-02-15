@@ -1,0 +1,13 @@
+[Service]
+Name=ttyd
+Binary=ttyd
+Type=notify
+Restart=always
+
+[Dependencies]
+After=console nameserv procmgr vfs
+Before=getty
+
+[Capabilities]
+CopyCap=14:66
+NeedEP=display:65

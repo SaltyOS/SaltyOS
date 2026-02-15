@@ -554,6 +554,11 @@ pub extern "C" fn salty_setsid() -> i32 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn salty_getsid(pid: i32) -> i32 {
+    unsafe { posix::posix_getsid(pid) }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn salty_getuid() -> i32 {
     unsafe { posix::posix_getuid() }
 }

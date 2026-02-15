@@ -1,6 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef __FCNTL_H__
 #define __FCNTL_H__
+/* FreeBSD-compatible guard name */
+#ifndef _SYS_FCNTL_H_
+#define _SYS_FCNTL_H_
+#endif
 
 #include <sys/types.h>
 
@@ -24,6 +28,13 @@
 #define F_SETFD     2
 #define F_GETFL     3
 #define F_SETFL     4
+#define F_GETLK     5
+#define F_SETLK     6
+#define F_SETLKW    7
+
+#define F_RDLCK     0
+#define F_WRLCK     1
+#define F_UNLCK     2
 
 #define FD_CLOEXEC  1
 

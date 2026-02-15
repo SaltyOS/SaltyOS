@@ -264,7 +264,7 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
                     rtld_lb_hex(&lb, (uint64_t)err);
                     rtld_lb_str(&lb, "\n");
                     rtld_lb_flush(&lb);
-                    for (;;) rtld_yield();
+                    rtld_exit(127);
                 }
 
                 /* Advance load address by actual library footprint + 1-page gap */

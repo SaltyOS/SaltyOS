@@ -82,10 +82,10 @@ pub static mut __stderrp: *mut FILE = core::ptr::null_mut();
 
 // FreeBSD's libc threading indicator
 #[unsafe(no_mangle)]
-pub static mut __isthreaded: i32 = 0;
+pub static mut __isthreaded: i32 = 1;
 
 // Initialize stdio pointers (called from module init or lazily)
-fn ensure_stdio_init() {
+pub(crate) fn ensure_stdio_init() {
     unsafe {
         if stdin.is_null() {
             stdin = &raw mut STDIN_FILE;
@@ -277,6 +277,11 @@ pub unsafe extern "C" fn fgetc(f: *mut FILE) -> i32 {
             return c;
         }
         if (*f).buf_pos >= (*f).buf_len {
+            // Flush stdout before blocking on stdin (C standard compliance).
+            // Ensures prompts appear before read blocks.
+            if !stdout.is_null() && f == stdin {
+                fflush(stdout);
+            }
             let n = salty::posix::posix_read((*f).fd, (*f).buf.as_mut_ptr(), BUF_SIZE as u64);
             if n <= 0 {
                 (*f).flags |= if n == 0 { FILE_EOF } else { FILE_ERROR };
@@ -608,6 +613,7 @@ pub unsafe extern "C" fn vfprintf(f: *mut FILE, fmt: *const u8, ap: VaList<'_>) 
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fprintf(f: *mut FILE, fmt: *const u8, args: ...) -> i32 {
+    ensure_stdio_init();
     unsafe { vfprintf(f, fmt, args) }
 }
 

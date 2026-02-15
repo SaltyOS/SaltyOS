@@ -1,0 +1,9 @@
+[Service]
+Name=getty
+Binary=getty
+Type=simple
+Restart=always
+
+[Dependencies]
+After=console nameserv procmgr vfs ttyd
+Before=test_runner hello

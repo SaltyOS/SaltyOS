@@ -149,6 +149,7 @@ extern int     getpagesize(void);
 
 extern char   *optarg;
 extern int     optind, opterr, optopt;
+extern int     getopt(int argc, char * const argv[], const char *optstring);
 
 /* BSD extensions */
 extern const char *user_from_uid(uid_t uid, int noname);

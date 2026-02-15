@@ -23,12 +23,25 @@
 /* Maximum path length we support */
 #define FTS_MAXPATH 4096
 
+typedef struct {
+    char **argv;            /* owned argv copy */
+    int argc;               /* number of roots */
+    int arg_idx;            /* current root index */
+    int state;              /* traversal state */
+} FTS_PRIV;
+
 /* Saved comparator for qsort wrapper (single-threaded, no reentrancy issue) */
-static int (*fts_saved_compar)(const FTSENT **, const FTSENT **);
+static int (*fts_saved_compar)(const FTSENT * const *, const FTSENT * const *);
+
+static FTS_PRIV *fts_priv(FTS *sp)
+{
+    return (FTS_PRIV *)sp->fts_clientptr;
+}
 
 static int fts_qsort_wrapper(const void *a, const void *b)
 {
-    return fts_saved_compar((const FTSENT **)a, (const FTSENT **)b);
+    return fts_saved_compar((const FTSENT * const *)a,
+                            (const FTSENT * const *)b);
 }
 
 /* ------------------------------------------------------------------ */
@@ -52,22 +65,29 @@ static FTSENT *fts_alloc(FTS *sp, const char *name, size_t namelen,
     p->fts_path  = (char *)p->fts_statp + sizeof(struct stat);
     memcpy(p->fts_path, path, pathlen);
     p->fts_path[pathlen] = '\0';
-    p->fts_pathlen = (unsigned short)pathlen;
+    p->fts_pathlen = pathlen;
 
     p->fts_name = p->fts_path + pathlen + 1;
     memcpy(p->fts_name, name, namelen);
     p->fts_name[namelen] = '\0';
-    p->fts_namelen = (unsigned short)namelen;
+    p->fts_namelen = namelen;
 
     /* NOCHDIR mode: access path is the full path */
     p->fts_accpath = p->fts_path;
     p->fts_info = FTS_INIT;
+    p->fts_flags = 0;
+    p->fts_instr = FTS_NOINSTR;
     p->fts_link = NULL;
     p->fts_parent = NULL;
     p->fts_cycle = NULL;
     p->fts_number = 0;
     p->fts_pointer = NULL;
     p->fts_errno = 0;
+    p->fts_symfd = -1;
+    p->fts_ino = 0;
+    p->fts_dev = 0;
+    p->fts_nlink = 0;
+    p->fts_fts = sp;
 
     (void)sp;
     return p;
@@ -126,12 +146,8 @@ static int fts_stat_entry(FTS *sp, FTSENT *ent)
     int opts = sp->fts_options;
     int rc;
 
-    if (opts & FTS_NOSTAT) {
-        ent->fts_info = FTS_NSOK;
-        return 0;
-    }
-
-    if (opts & FTS_LOGICAL) {
+    if ((opts & FTS_LOGICAL)
+        || ((opts & FTS_COMFOLLOW) && ent->fts_level == FTS_ROOTLEVEL)) {
         rc = stat(ent->fts_path, ent->fts_statp);
     } else {
         /* FTS_PHYSICAL: use lstat to not follow symlinks */
@@ -143,6 +159,10 @@ static int fts_stat_entry(FTS *sp, FTSENT *ent)
         ent->fts_info = FTS_NS;
         return -1;
     }
+
+    ent->fts_ino = ent->fts_statp->st_ino;
+    ent->fts_dev = ent->fts_statp->st_dev;
+    ent->fts_nlink = ent->fts_statp->st_nlink;
 
     unsigned int mode = ent->fts_statp->st_mode;
 
@@ -172,7 +192,7 @@ static int fts_stat_entry(FTS *sp, FTSENT *ent)
  * Read directory contents and build a linked list of child FTSENT nodes.
  * Returns the head of the list, or NULL on error/empty.
  */
-static FTSENT *fts_build_children(FTS *sp, FTSENT *parent)
+static FTSENT *fts_build_children(FTS *sp, FTSENT *parent, int nameonly)
 {
     DIR *dirp = opendir(parent->fts_path);
     if (!dirp) {
@@ -217,10 +237,14 @@ static FTSENT *fts_build_children(FTS *sp, FTSENT *parent)
         child->fts_level = parent->fts_level + 1;
         child->fts_parent = parent;
 
-        fts_stat_entry(sp, child);
+        if (nameonly) {
+            child->fts_info = FTS_NSOK;
+        } else {
+            fts_stat_entry(sp, child);
+        }
 
         /* Check FTS_XDEV: skip entries on different device */
-        if ((sp->fts_options & FTS_XDEV) && child->fts_info != FTS_NS
+        if (!nameonly && (sp->fts_options & FTS_XDEV) && child->fts_info != FTS_NS
             && child->fts_info != FTS_NSOK) {
             if (child->fts_statp->st_dev != sp->fts_dev) {
                 free(child);
@@ -272,12 +296,85 @@ static FTSENT *fts_build_children(FTS *sp, FTSENT *parent)
     return head;
 }
 
+/*
+ * Build an FTSENT list for the original argv root paths.
+ * Used by callers that query fts_children() before the first fts_read().
+ */
+static FTSENT *fts_build_roots(FTS *sp, int nameonly)
+{
+    FTS_PRIV *priv = fts_priv(sp);
+    if (!priv)
+        return NULL;
+
+    FTSENT *head = NULL;
+    FTSENT *tail = NULL;
+
+    for (int i = 0; i < priv->argc; i++) {
+        const char *root = priv->argv[i];
+        size_t rlen = strlen(root);
+        while (rlen > 1 && root[rlen - 1] == '/')
+            rlen--;
+
+        const char *name = fts_basename(root);
+        size_t nlen = strlen(name);
+        FTSENT *ent = fts_alloc(sp, name, nlen, root, rlen);
+        if (!ent)
+            continue;
+
+        ent->fts_level = FTS_ROOTLEVEL;
+        ent->fts_parent = NULL;
+
+        if (nameonly) {
+            ent->fts_info = FTS_NSOK;
+        } else {
+            fts_stat_entry(sp, ent);
+        }
+
+        ent->fts_link = NULL;
+        if (!head) {
+            head = ent;
+            tail = ent;
+        } else {
+            tail->fts_link = ent;
+            tail = ent;
+        }
+    }
+
+    if (head && sp->fts_compar) {
+        int n = 0;
+        for (FTSENT *p = head; p; p = p->fts_link)
+            n++;
+
+        if (n > 1) {
+            FTSENT **arr = malloc((size_t)n * sizeof(FTSENT *));
+            if (arr) {
+                int i = 0;
+                for (FTSENT *p = head; p; p = p->fts_link)
+                    arr[i++] = p;
+
+                fts_saved_compar = sp->fts_compar;
+                qsort(arr, (size_t)n, sizeof(FTSENT *), fts_qsort_wrapper);
+
+                for (i = 0; i < n - 1; i++)
+                    arr[i]->fts_link = arr[i + 1];
+                arr[n - 1]->fts_link = NULL;
+                head = arr[0];
+
+                free(arr);
+            }
+        }
+    }
+
+    return head;
+}
+
 /* ------------------------------------------------------------------ */
 /* Public API                                                          */
 /* ------------------------------------------------------------------ */
 
 FTS *fts_open(char * const *argv, int options,
-              int (*compar)(const FTSENT **, const FTSENT **))
+              int (*compar)(const FTSENT * const *,
+                            const FTSENT * const *))
 {
     if (!argv || !*argv) {
         errno = EINVAL;
@@ -287,9 +384,16 @@ FTS *fts_open(char * const *argv, int options,
     FTS *sp = calloc(1, sizeof(FTS));
     if (!sp)
         return NULL;
+    FTS_PRIV *priv = calloc(1, sizeof(FTS_PRIV));
+    if (!priv) {
+        free(sp);
+        return NULL;
+    }
 
     sp->fts_options = options | FTS_NOCHDIR; /* always nochdir */
     sp->fts_compar = compar;
+    sp->fts_clientptr = priv;
+    sp->fts_rfd = -1;
 
     /* Count argv entries */
     int argc = 0;
@@ -297,31 +401,34 @@ FTS *fts_open(char * const *argv, int options,
         argc++;
 
     if (argc == 0) {
+        free(priv);
         free(sp);
         errno = EINVAL;
         return NULL;
     }
 
     /* Copy argv */
-    sp->fts_argv = malloc(((size_t)argc + 1) * sizeof(char *));
-    if (!sp->fts_argv) {
+    priv->argv = malloc(((size_t)argc + 1) * sizeof(char *));
+    if (!priv->argv) {
+        free(priv);
         free(sp);
         return NULL;
     }
     for (int i = 0; i < argc; i++) {
-        sp->fts_argv[i] = strdup(argv[i]);
-        if (!sp->fts_argv[i]) {
+        priv->argv[i] = strdup(argv[i]);
+        if (!priv->argv[i]) {
             for (int j = 0; j < i; j++)
-                free(sp->fts_argv[j]);
-            free(sp->fts_argv);
+                free(priv->argv[j]);
+            free(priv->argv);
+            free(priv);
             free(sp);
             return NULL;
         }
     }
-    sp->fts_argv[argc] = NULL;
-    sp->fts_argc = argc;
-    sp->fts_arg_idx = 0;
-    sp->fts_state = STATE_ROOTS;
+    priv->argv[argc] = NULL;
+    priv->argc = argc;
+    priv->arg_idx = 0;
+    priv->state = STATE_ROOTS;
     sp->fts_cur = NULL;
     sp->fts_child = NULL;
     sp->fts_array = NULL;
@@ -339,18 +446,23 @@ FTSENT *fts_read(FTS *sp)
         errno = EINVAL;
         return NULL;
     }
+    FTS_PRIV *priv = fts_priv(sp);
+    if (!priv) {
+        errno = EINVAL;
+        return NULL;
+    }
 
     for (;;) {
-        switch (sp->fts_state) {
+        switch (priv->state) {
 
         case STATE_ROOTS: {
             /* Return root entries one at a time from argv */
-            if (sp->fts_arg_idx >= sp->fts_argc) {
-                sp->fts_state = STATE_DONE;
+            if (priv->arg_idx >= priv->argc) {
+                priv->state = STATE_DONE;
                 return NULL;
             }
 
-            char *root = sp->fts_argv[sp->fts_arg_idx++];
+            char *root = priv->argv[priv->arg_idx++];
             size_t rlen = strlen(root);
 
             /* Strip trailing slashes for consistent paths */
@@ -372,7 +484,7 @@ FTSENT *fts_read(FTS *sp)
             fts_stat_entry(sp, ent);
 
             /* Record starting device for FTS_XDEV */
-            if (sp->fts_arg_idx == 1 && ent->fts_info != FTS_NS
+            if (priv->arg_idx == 1 && ent->fts_info != FTS_NS
                 && ent->fts_info != FTS_NSOK) {
                 sp->fts_dev = ent->fts_statp->st_dev;
             }
@@ -381,9 +493,9 @@ FTSENT *fts_read(FTS *sp)
 
             /* If it is a directory, push to children state */
             if (ent->fts_info == FTS_D) {
-                sp->fts_state = STATE_CHILDREN;
+                priv->state = STATE_CHILDREN;
                 /* Build child list and chain onto entry */
-                sp->fts_child = fts_build_children(sp, ent);
+                sp->fts_child = fts_build_children(sp, ent, 0);
             }
             /* If more roots remain and this isn't a directory, stay in ROOTS */
 
@@ -408,7 +520,7 @@ FTSENT *fts_read(FTS *sp)
                      * postorder.
                      */
                     child->fts_link = sp->fts_child;
-                    sp->fts_child = fts_build_children(sp, child);
+                    sp->fts_child = fts_build_children(sp, child, 0);
                 }
 
                 return child;
@@ -418,7 +530,7 @@ FTSENT *fts_read(FTS *sp)
              * No more children — return postorder (FTS_DP) for the
              * current directory, then resume its parent's sibling list.
              */
-            sp->fts_state = STATE_POSTORDER;
+            priv->state = STATE_POSTORDER;
             continue;
         }
 
@@ -429,7 +541,7 @@ FTSENT *fts_read(FTS *sp)
              */
             FTSENT *cur = sp->fts_cur;
             if (!cur) {
-                sp->fts_state = STATE_ROOTS;
+                priv->state = STATE_ROOTS;
                 continue;
             }
 
@@ -450,7 +562,7 @@ FTSENT *fts_read(FTS *sp)
 
             if (!dir) {
                 /* Back at root level, continue to next root */
-                sp->fts_state = STATE_ROOTS;
+                priv->state = STATE_ROOTS;
                 continue;
             }
 
@@ -458,7 +570,7 @@ FTSENT *fts_read(FTS *sp)
             FTSENT *dp = fts_alloc(sp, dir->fts_name, dir->fts_namelen,
                                    dir->fts_path, dir->fts_pathlen);
             if (!dp) {
-                sp->fts_state = STATE_ROOTS;
+                priv->state = STATE_ROOTS;
                 continue;
             }
             dp->fts_info = FTS_DP;
@@ -474,7 +586,7 @@ FTSENT *fts_read(FTS *sp)
             dir->fts_link = NULL;
 
             if (sp->fts_child) {
-                sp->fts_state = STATE_CHILDREN;
+                priv->state = STATE_CHILDREN;
             } else if (dir->fts_parent) {
                 /*
                  * The parent directory may also be done.
@@ -482,15 +594,15 @@ FTSENT *fts_read(FTS *sp)
                  * handles it.
                  */
                 sp->fts_cur = dir->fts_parent;
-                sp->fts_state = STATE_POSTORDER;
+                priv->state = STATE_POSTORDER;
 
                 /* Only emit DP if the parent is itself a directory */
                 if (dir->fts_parent->fts_info != FTS_D) {
-                    sp->fts_state = STATE_ROOTS;
+                    priv->state = STATE_ROOTS;
                 }
             } else {
                 /* Root directory finished, return to roots */
-                sp->fts_state = STATE_ROOTS;
+                priv->state = STATE_ROOTS;
             }
 
             return dp;
@@ -505,12 +617,25 @@ FTSENT *fts_read(FTS *sp)
 
 FTSENT *fts_children(FTS *sp, int instr)
 {
-    if (!sp || !sp->fts_cur) {
+    if (!sp) {
+        errno = EINVAL;
+        return NULL;
+    }
+    FTS_PRIV *priv = fts_priv(sp);
+    if (!priv) {
         errno = EINVAL;
         return NULL;
     }
 
-    (void)instr;
+    if (sp->fts_cur == NULL) {
+        /*
+         * BSD fts allows querying children right after fts_open():
+         * this returns the root argument list.
+         */
+        if (priv->arg_idx == 0 && priv->state == STATE_ROOTS)
+            return fts_build_roots(sp, (instr & FTS_NAMEONLY) != 0);
+        return NULL;
+    }
 
     FTSENT *cur = sp->fts_cur;
 
@@ -523,7 +648,7 @@ FTSENT *fts_children(FTS *sp, int instr)
      * child list — callers use fts_children() to peek at children
      * without advancing the traversal.
      */
-    return fts_build_children(sp, cur);
+    return fts_build_children(sp, cur, (instr & FTS_NAMEONLY) != 0);
 }
 
 int fts_set(FTS *sp, FTSENT *ent, int instr)
@@ -579,6 +704,7 @@ int fts_close(FTS *sp)
 {
     if (!sp)
         return 0;
+    FTS_PRIV *priv = fts_priv(sp);
 
     /* Free remaining child list */
     fts_free_list(sp->fts_child);
@@ -590,11 +716,14 @@ int fts_close(FTS *sp)
      * track all allocations, but for this minimal version callers
      * should not use entries after fts_close(). */
 
-    /* Free argv copies */
-    if (sp->fts_argv) {
-        for (int i = 0; i < sp->fts_argc; i++)
-            free(sp->fts_argv[i]);
-        free(sp->fts_argv);
+    /* Free private argv copy and state */
+    if (priv) {
+        if (priv->argv) {
+            for (int i = 0; i < priv->argc; i++)
+                free(priv->argv[i]);
+            free(priv->argv);
+        }
+        free(priv);
     }
 
     /* Free sort array if allocated */

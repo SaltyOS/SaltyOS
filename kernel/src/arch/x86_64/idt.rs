@@ -268,6 +268,15 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
                 if let Ok(true) = vspace.handle_cow_fault(f.cr2, f.error_code) {
                     return;
                 }
+                if let Ok(true) = vspace.handle_stack_growth_fault(
+                    f.cr2,
+                    f.error_code,
+                    f.rsp,
+                    (*current).user_stack_top,
+                    (*current).user_stack_min,
+                ) {
+                    return;
+                }
             }
 
             if !current.is_null() && !(*current).fault_handler.is_null() {

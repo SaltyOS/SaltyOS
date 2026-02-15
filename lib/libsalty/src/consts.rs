@@ -87,6 +87,23 @@ pub const CONSOLE_READ: u64 = 2;
 pub const CONSOLE_TCGETATTR: u64 = 3;
 pub const CONSOLE_TCSETATTR: u64 = 4;
 
+/// TTYD PTY driver IPC labels.
+pub const TTYD_GET_FG_PGRP: u64 = 1;
+pub const TTYD_SET_FG_PGRP: u64 = 2;
+pub const TTYD_SET_CTTY: u64 = 3;
+pub const TTYD_DROP_CTTY: u64 = 4;
+pub const TTYD_PTY_ALLOC: u64 = 10;
+pub const TTYD_PTY_READ: u64 = 11;
+pub const TTYD_PTY_WRITE: u64 = 12;
+pub const TTYD_PTY_CLOSE: u64 = 13;
+pub const TTYD_PTY_TCGETATTR: u64 = 14;
+pub const TTYD_PTY_TCSETATTR: u64 = 15;
+pub const TTYD_PTY_IOCTL: u64 = 16;
+pub const TTYD_PTY_POLL: u64 = 17;
+pub const TTYD_INPUT_EVENT: u64 = 18;
+pub const TTYD_PTY_COLLECT: u64 = 19;
+pub const TTYD_PTY_MASTER_WRITE: u64 = 20;
+
 /// Display server IPC labels: framebuffer info, present, fill, text, terminal writes.
 pub const DISPLAY_GET_INFO: u64 = 1;
 pub const DISPLAY_PRESENT: u64 = 2;
@@ -219,6 +236,7 @@ pub const POSIX_VFS_READLINKAT: u64 = 57;
 pub const POSIX_VFS_UTIMENSAT: u64 = 58;
 pub const POSIX_VFS_FCHMOD: u64 = 59;
 pub const POSIX_VFS_FCHOWN: u64 = 60;
+pub const POSIX_VFS_CLIENT_EXIT: u64 = 61;
 
 // AT_* flags for *at() family
 pub const AT_FDCWD: i32 = -100;
@@ -243,7 +261,9 @@ pub const FD_CLOEXEC: i32 = 1;
 // ioctl requests
 pub const TIOCGPGRP: u64 = 0x540F;
 pub const TIOCSPGRP: u64 = 0x5410;
+pub const TIOCSCTTY: u64 = 0x540E;
 pub const TIOCGWINSZ: u64 = 0x5413;
+pub const TIOCNOTTY: u64 = 0x5422;
 
 // Framebuffer ioctl requests
 pub const FBIOGET_VSCREENINFO: u64 = 0x4600;
@@ -302,6 +322,7 @@ pub const fn spawn_policy_memory_kb(policy: u64) -> u16 {
 
 // Spawn flags (msg.regs[3] in POSIX_PM_SPAWN wire format)
 pub const SPAWN_FLAG_USE_PRE_EP: u64 = 1 << 0;
+pub const SPAWN_FLAG_RESPAWN: u64 = 1 << 1;
 
 pub const POSIX_PM_EXIT: u64 = 2;
 pub const POSIX_PM_WAIT: u64 = 3;
@@ -323,6 +344,11 @@ pub const POSIX_PM_EXPAND_CSPACE: u64 = 18;
 pub const POSIX_PM_EXPAND_CSPACE_ASYNC: u64 = 19;
 pub const POSIX_PM_EXPAND_COLLECT: u64 = 20;
 pub const POSIX_PM_REGISTER: u64 = 21;
+pub const POSIX_PM_GETSID: u64 = 22;
+pub const POSIX_PM_GETPGID_BADGE: u64 = 23;
+pub const POSIX_PM_GETSID_BADGE: u64 = 24;
+pub const POSIX_PM_KILL_PGID: u64 = 25;
+pub const POSIX_PM_INJECT_CAP: u64 = 26;
 // Deterministic CNode slots for untyped expansion (last 8 slots of 10-bit CNode)
 pub const UT_EXPAND_BASE: u64 = 1016;
 pub const MAX_UT_EXPANSIONS: usize = 8;
@@ -478,6 +504,14 @@ pub const EPOLLIN: u32 = 0x001;
 pub const EPOLLOUT: u32 = 0x004;
 pub const EPOLLERR: u32 = 0x008;
 pub const EPOLLHUP: u32 = 0x010;
+
+/// VFS device type constants.
+pub const DEV_CONSOLE: u8 = 0;
+pub const DEV_NULL: u8 = 1;
+pub const DEV_ZERO: u8 = 2;
+pub const DEV_FB0: u8 = 3;
+pub const DEV_PTY_SLAVE: u8 = 4;
+pub const DEV_PTMX: u8 = 5;
 
 /// CPIO newc header size in bytes (magic + fixed fields).
 pub const CPIO_HEADER_SIZE: usize = 110;

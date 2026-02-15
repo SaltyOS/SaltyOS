@@ -57,5 +57,6 @@ extern void  explicit_bzero(void *s, size_t n);
 /* BSD extensions */
 extern size_t strlcpy(char *dst, const char *src, size_t dstsize);
 extern size_t strlcat(char *dst, const char *src, size_t dstsize);
+extern int    strverscmp(const char *s1, const char *s2);
 
 #endif /* __STRING_H__ */
