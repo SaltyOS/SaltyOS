@@ -8,6 +8,8 @@ pub mod ap_boot;
 mod boot;
 mod context;
 mod cpu;
+pub mod cpuid;
+pub mod fpu;
 mod gdt;
 mod idt;
 pub mod paging;
@@ -90,6 +92,12 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     }
 
     crate::serial_puts("[ARCH] idt::init() returned successfully\n");
+
+    // Detect CPU features (SSE, XSAVE, etc.) — needed by FPU init
+    cpuid::init();
+
+    // Configure FPU/SSE hardware on BSP (CR0, CR4, XCR0)
+    fpu::init_bsp();
 
     // Initialize memory management (frame allocator needed by paging::init())
     if let Some(info) = boot_info {

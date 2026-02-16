@@ -4,7 +4,7 @@
  *
  * Stage 3 BIOS path: loads the manifest, kernel, and initrd
  * using BTX for disk I/O, sets up page tables, and transfers control
- * to the kernel via 32-bit → 64-bit mode switch.
+ * to the kernel via 32-bit -> 64-bit mode switch.
  *
  * Entry state (from Stage 2):
  * - 32-bit protected mode
@@ -25,6 +25,7 @@
 #include "elf.h"
 #include "paging.h"
 #include "handoff.h"
+#include "boot_alloc.h"
 #include "disk/disk.h"
 #include "fs/fs.h"
 #include "arch/x86/bios/mode_switch.h"
@@ -36,17 +37,11 @@
 /* Bounce buffer for temporary reads (shared with bios_disk.c) */
 #define BOUNCE_BUF              0x60000
 
-/* Kernel load address (chosen from memory map) */
-#define KERNEL_DEFAULT_LOAD     MB(2)
-
 /* ELF preread size in sectors */
 #define ELF_PREREAD_SECTORS     8
 
-/* BootInfo buffer (aligned) */
-static uint8_t bootinfo_buffer[KB(16)] ALIGNED(4096);
-
-/* Kernel loading area */
-static uint64_t kernel_load_area = KERNEL_DEFAULT_LOAD;
+/* Page table pool size */
+#define PT_POOL_SIZE            KB(128)
 
 /* Sum usable RAM above 1MB from BIOS E820 map. */
 static uint64_t total_usable_ram(struct Stage2Info *info)
@@ -75,46 +70,6 @@ static uint64_t total_usable_ram(struct Stage2Info *info)
     }
 
     return total;
-}
-
-/*
- * Find suitable memory region for kernel with explicit alignment.
- * Returns 0 if no usable aligned region is large enough.
- */
-static uint64_t find_kernel_load_address(struct Stage2Info *info, uint64_t size, uint64_t align)
-{
-    if (!info || info->memmap_count == 0)
-        return 0;
-
-    struct E820Entry *entries = (struct E820Entry *)(uintptr_t)info->memmap_addr;
-    uint32_t count = info->memmap_count;
-
-    if (align < PAGE_SIZE_4K)
-        align = PAGE_SIZE_4K;
-
-    /* Look for usable region >= requested alignment */
-    for (uint32_t i = 0; i < count; i++) {
-        if (entries[i].type != 1)  /* E820_USABLE */
-            continue;
-
-        uint64_t base = entries[i].base;
-        uint64_t end = base + entries[i].length;
-
-        /* Must be above 2MB to avoid bootloader areas */
-        if (end <= KERNEL_DEFAULT_LOAD)
-            continue;
-
-        if (base < KERNEL_DEFAULT_LOAD)
-            base = KERNEL_DEFAULT_LOAD;
-
-        base = ALIGN_UP(base, align);
-
-        /* Check if region is large enough */
-        if (base + size <= end)
-            return base;
-    }
-
-    return 0;
 }
 
 /*
@@ -177,6 +132,10 @@ void stage3_entry(struct Stage2Info *info)
     g_ctx.kernel_entry = 0;
     g_ctx.initrd_phys_addr = 0;
     g_ctx.initrd_size = 0;
+
+    /* Initialize BootAlloc (bump allocator starting at 2MB) */
+    struct BootAlloc ba;
+    boot_alloc_init_bios(&ba, info->memmap_addr, info->memmap_count, MB(2));
 
     /* Initialize disk subsystem */
     if (disk_init(info->boot_drive) != DISK_OK) {
@@ -262,20 +221,24 @@ void stage3_entry(struct Stage2Info *info)
     elf_mem_size = ALIGN_UP(elf_mem_size, kernel_align);
 
     /*
-     * Find suitable load address.
+     * Find suitable load address via BootAlloc.
      *
      * Split-load strategy: if the raw ELF file fits in the scratch area
      * at 1MB (below the kernel load region), load it there and only
-     * reserve aligned space for the processed segments. In normal mode this
+     * allocate aligned space for the processed segments. In normal mode this
      * is 2MB-aligned for huge-page friendliness; in lowmem mode it is 4KB.
      * This avoids wasting large alignment padding between file buffer and
      * final segments, enabling boot on systems with as little as 4MB RAM.
      *
-     * For large kernels (>512KB), fall back to the original contiguous
-     * allocation that places both file buffer and segments in one block.
+     * For large kernels (>512KB), fall back to a contiguous allocation
+     * that places both file buffer and segments in one block.
+     *
+     * The scratch area (FILE_SCRATCH_ADDR) is temporary and NOT tracked by
+     * BootAlloc. BootAlloc starts at MB(2), above the scratch area.
      */
     void *kernel_buffer;
     uint64_t final_load_addr;
+    uint64_t kernel_load_area;
 
     if (kernel_file_size <= (FILE_SCRATCH_LIMIT - FILE_SCRATCH_ADDR)) {
         /* Small kernel: use 1MB scratch area for raw ELF file */
@@ -288,8 +251,9 @@ void stage3_entry(struct Stage2Info *info)
             stage3_panic("Failed to load kernel");
         }
 
-        /* Only need space for processed segments (no file buffer overhead) */
-        kernel_load_area = find_kernel_load_address(info, elf_mem_size, kernel_align);
+        /* Allocate space for processed segments only */
+        kernel_load_area = boot_alloc(&ba, elf_mem_size, kernel_align,
+                                       BOOT_ALLOC_KERNEL);
         if (kernel_load_area == 0) {
             print_str("Need kernel bytes: ");
             print_hex((uint32_t)elf_mem_size, 8);
@@ -300,7 +264,8 @@ void stage3_entry(struct Stage2Info *info)
     } else {
         /* Large kernel: contiguous allocation (file buffer + segments) */
         uint64_t total_needed = ALIGN_UP(kernel_file_size, kernel_align) + elf_mem_size;
-        kernel_load_area = find_kernel_load_address(info, total_needed, kernel_align);
+        kernel_load_area = boot_alloc(&ba, total_needed, kernel_align,
+                                       BOOT_ALLOC_KERNEL);
         if (kernel_load_area == 0) {
             print_str("Need kernel bytes: ");
             print_hex((uint32_t)total_needed, 8);
@@ -365,9 +330,12 @@ void stage3_entry(struct Stage2Info *info)
         stage3_panic("Missing required initrd");
     }
 
-    /* Calculate initrd load address (after kernel) */
-    uint64_t initrd_addr = g_ctx.kernel_phys_base + g_ctx.kernel_size;
-    initrd_addr = ALIGN_UP(initrd_addr, PAGE_SIZE_4K);
+    /* Allocate space for initrd via BootAlloc */
+    uint64_t initrd_addr = boot_alloc(&ba, initrd_entry->size_bytes,
+                                       PAGE_SIZE_4K, BOOT_ALLOC_INITRD);
+    if (initrd_addr == 0) {
+        stage3_panic("Failed to allocate initrd memory");
+    }
 
     print_str("Loading initrd to ");
     print_hex((uint32_t)initrd_addr, 8);
@@ -385,19 +353,44 @@ void stage3_entry(struct Stage2Info *info)
     g_ctx.initrd_size = initrd_entry->size_bytes;
     print_line("Initrd loaded");
 
-    /* Set up page tables */
+    /* Allocate page table pool via BootAlloc */
+    uint64_t pt_pool = boot_alloc(&ba, PT_POOL_SIZE, PAGE_SIZE_4K,
+                                   BOOT_ALLOC_PAGE_TABLES);
+    if (pt_pool == 0) {
+        stage3_panic("Failed to allocate page table pool");
+    }
+
+    /* Set up page tables using dynamic pool */
     print_line("Setting up page tables...");
-    uint64_t pml4 = paging_init(g_ctx.kernel_phys_base, g_ctx.kernel_size);
+    uint64_t pml4 = paging_init_dynamic(pt_pool, PT_POOL_SIZE,
+                                         g_ctx.kernel_phys_base,
+                                         g_ctx.kernel_size);
     if (pml4 == 0) {
         stage3_panic("Failed to set up page tables");
+    }
+
+    /* Allocate kernel stack via BootAlloc */
+    uint64_t stack_addr = boot_alloc(&ba, KERNEL_STACK_SIZE, PAGE_SIZE_4K,
+                                      BOOT_ALLOC_STACK);
+    if (stack_addr == 0) {
+        stage3_panic("Failed to allocate kernel stack");
+    }
+    g_ctx.kernel_stack_top = stack_addr + KERNEL_STACK_SIZE;
+
+    /* Allocate BootInfo buffer via BootAlloc */
+    uint64_t bi_buf = boot_alloc(&ba, BOOTINFO_BUFFER_SIZE, PAGE_SIZE_4K,
+                                  BOOT_ALLOC_BOOTINFO);
+    if (bi_buf == 0) {
+        stage3_panic("Failed to allocate BootInfo buffer");
     }
 
     /* Build BootInfo */
     print_line("Building BootInfo...");
     struct BootInfoHeader *bootinfo = handoff_build_bootinfo(
-        bootinfo_buffer, sizeof(bootinfo_buffer),
+        (void *)(uintptr_t)bi_buf, BOOTINFO_BUFFER_SIZE,
         info, &load_result,
-        g_ctx.initrd_phys_addr, g_ctx.initrd_size);
+        g_ctx.initrd_phys_addr, g_ctx.initrd_size,
+        ba.records, ba.record_count);
 
     if (!bootinfo) {
         stage3_panic("Failed to build BootInfo");
@@ -410,7 +403,7 @@ void stage3_entry(struct Stage2Info *info)
         (uint32_t)pml4,
         g_ctx.kernel_entry,
         (uint64_t)(uintptr_t)bootinfo,
-        KERNEL_STACK_ADDR + KERNEL_STACK_SIZE);
+        g_ctx.kernel_stack_top);
 
     /* Never reached */
     stage3_panic("Returned from kernel");

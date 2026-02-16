@@ -37,12 +37,10 @@
 #define LOWMEM_TOTAL_BYTES      MB(8)       /* BIOS low-memory mode threshold */
 #define KERNEL_MAX_SIZE         MB(64)      /* Maximum kernel size */
 
-/* BootInfo buffer */
-#define BOOTINFO_BUFFER_ADDR    0x100000    /* 1MB */
+/* BootInfo buffer size (dynamically allocated by BootAlloc) */
 #define BOOTINFO_BUFFER_SIZE    KB(16)      /* 16KB for BootInfo */
 
-/* Initial kernel stack */
-#define KERNEL_STACK_ADDR       0x180000    /* 1.5MB */
+/* Initial kernel stack size (dynamically allocated by BootAlloc) */
 #define KERNEL_STACK_SIZE       KB(64)      /* 64KB stack */
 
 /* ELF file scratch buffer (extended memory below kernel load area) */
@@ -64,6 +62,9 @@ struct Stage3Context {
     /* Initrd info (optional) */
     uint64_t initrd_phys_addr;
     uint64_t initrd_size;
+
+    /* Kernel stack (dynamically allocated) */
+    uint64_t kernel_stack_top;
 
     /* Boot disk */
     uint8_t boot_drive;

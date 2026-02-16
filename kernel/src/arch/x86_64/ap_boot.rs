@@ -51,6 +51,9 @@ pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
     super::apic::init_ap();
     crate::serial_puts("[AP] Local APIC initialized\n");
 
+    // 6.5. Initialize FPU/SSE hardware on this AP
+    super::fpu::init_ap();
+
     // 7. Allocate IST stack for double fault on this CPU
     init_ap_exception_stacks(cpu_id);
     crate::serial_puts("[AP] IST stacks allocated\n");

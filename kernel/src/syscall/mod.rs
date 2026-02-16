@@ -1251,6 +1251,10 @@ fn syscall_invoke(
             // TCB_SET_FAULT_HANDLER: arg0 = fault_ep_cap_ptr
             syscall_tcb_set_fault_handler(&cap, arg0)
         }
+        (ObjectType::Tcb, 0x4C) => {
+            // TCB_COPY_FPU: copy FPU state from source TCB (arg0) to dest TCB (cap)
+            syscall_tcb_copy_fpu(&cap, arg0)
+        }
 
         // VSpace operations
         (ObjectType::VSpace, 0x50) => {
@@ -1604,6 +1608,9 @@ fn syscall_tcb_configure(
             tcb.ipc_buffer = ipc_buffer;
             tcb.user_stack_top = entry_rsp;
             tcb.user_stack_min = entry_rsp.saturating_sub(USER_STACK_GROW_LIMIT);
+            // Reset FPU state for fresh execution (exec replaces the process image)
+            tcb.fpu_initialized = false;
+            tcb.fpu_state = crate::sched::thread::XSaveArea::zeroed();
             SCHED_IPC_LOCK.unlock();
             restore_irq(irq);
         } else {
@@ -2093,6 +2100,51 @@ fn syscall_tcb_set_fault_handler(
         tcb.fault_handler = ep_cap.object as *mut u8;
         SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// TCB_COPY_FPU: Copy FPU/SSE state from source TCB to destination TCB
+///
+/// Used by procmgr during fork to preserve the parent's FPU state in the child.
+/// Args:
+/// - dest_cap: destination (child) TCB capability
+/// - src_cap_ptr: slot index of source (parent) TCB capability
+fn syscall_tcb_copy_fpu(
+    dest_cap: &Capability,
+    src_cap_ptr: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(dest_cap, ObjectType::Tcb, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    // Look up source TCB cap under CAP_LOCK
+    let src_cap = match lookup_cap_locked(src_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(&src_cap, ObjectType::Tcb, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let dest_tcb = dest_cap.object as *mut Tcb;
+        let src_tcb = src_cap.object as *mut Tcb;
+
+        // If source thread is the current FPU owner on this CPU, flush its
+        // state from hardware registers into the TCB before copying.
+        // The source is typically blocked in IPC (during fork), but its state
+        // may still be live in hardware if it was the last FPU user on this CPU.
+        crate::arch::fpu::flush_if_owner(src_tcb as *mut u8);
+
+        // Copy FPU state
+        core::ptr::copy_nonoverlapping(
+            (*src_tcb).fpu_state.data.as_ptr(),
+            (*dest_tcb).fpu_state.data.as_mut_ptr(),
+            832,
+        );
+        (*dest_tcb).fpu_initialized = (*src_tcb).fpu_initialized;
     }
 
     SyscallResult::ok(0)

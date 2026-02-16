@@ -1267,6 +1267,14 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             reply.label = SALTY_OUT_OF_MEMORY;
             return;
         }
+        // Copy parent's FPU/SSE state to child (preserves XMM registers across fork)
+        let err = salty::invoke::tcb_copy_fpu(child_tcb, PROCTAB[parent_idx].tcb_cap);
+        if err != 0 {
+            puts(b"[PROCMGR] FORK: copy FPU state failed\n");
+            alloc.rollback();
+            reply.label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
         let err = salty::invoke::tcb_set_ipc_buffer(child_tcb, parent_layout.ipc_buf.base);
         if err != 0 {
             puts(b"[PROCMGR] FORK: set IPC buf failed\n");

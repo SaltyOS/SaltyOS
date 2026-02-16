@@ -12,13 +12,29 @@
 #include "../common/string.h"
 #include "config.h"
 
+/* Map BootAlloc tags to BootInfo memory map types */
+static uint32_t tag_to_memmap_type(uint32_t tag)
+{
+    switch (tag) {
+    case BOOT_ALLOC_KERNEL:      return MEMMAP_KERNEL;
+    case BOOT_ALLOC_INITRD:      return MEMMAP_INITRD;
+    case BOOT_ALLOC_BOOTINFO:    return MEMMAP_BOOTINFO;
+    case BOOT_ALLOC_PAGE_TABLES: return MEMMAP_BOOTLOADER;
+    case BOOT_ALLOC_STACK:       return MEMMAP_BOOTLOADER;
+    case BOOT_ALLOC_GENERIC:     return MEMMAP_BOOTLOADER;
+    default:                     return MEMMAP_BOOTLOADER;
+    }
+}
+
 struct BootInfoHeader *handoff_build_bootinfo(
     void *buffer,
     size_t buffer_size,
     struct Stage2Info *stage2_info,
     struct ElfLoadResult *kernel,
     uint64_t initrd_addr,
-    uint64_t initrd_size)
+    uint64_t initrd_size,
+    const struct BootAllocRecord *alloc_records,
+    uint32_t alloc_record_count)
 {
     struct BootInfoBuilder builder;
 
@@ -37,23 +53,22 @@ struct BootInfoHeader *handoff_build_bootinfo(
     if (stage2_info->memmap_addr && stage2_info->memmap_count > 0) {
         struct BootInfoMemMapEntry *entries;
         uint32_t count = stage2_info->memmap_count;
-        const uint32_t reserve_entries = 4; /* bootloader + kernel + initrd + bootinfo */
         uint32_t memmap_capacity;
 
         /*
-         * Reserve room for synthetic reservation entries to avoid truncating
-         * bootloader/kernel/initrd/bootinfo carve-outs under large firmware maps.
+         * Reserve room for BootAlloc record entries to avoid truncating
+         * carve-outs under large firmware maps.
          */
-        if (CONFIG_MAX_MEM_REGIONS > reserve_entries) {
-            memmap_capacity = CONFIG_MAX_MEM_REGIONS - reserve_entries;
+        if (CONFIG_MAX_MEM_REGIONS > alloc_record_count) {
+            memmap_capacity = CONFIG_MAX_MEM_REGIONS - alloc_record_count;
         } else {
             memmap_capacity = 0;
         }
         if (count > memmap_capacity)
             count = memmap_capacity;
 
-        /* Allocate temporary buffer for converted entries + reservation entries */
-        uint32_t max_entries = count + reserve_entries;
+        /* Allocate temporary buffer for converted entries + BootAlloc records */
+        uint32_t max_entries = count + alloc_record_count;
         size_t entries_size = max_entries * sizeof(struct BootInfoMemMapEntry);
         entries = (struct BootInfoMemMapEntry *)((uint8_t *)buffer + buffer_size - entries_size);
 
@@ -165,43 +180,15 @@ struct BootInfoHeader *handoff_build_bootinfo(
         }
 
         /*
-         * Append reservation entries so the kernel knows which regions
-         * are occupied by the bootloader, kernel image, and BootInfo.
+         * Append BootAlloc records so the kernel knows which regions
+         * are occupied by the bootloader, kernel, initrd, page tables, etc.
          */
         uint32_t total = count;
 
-        /* Reserve boot page tables (active until kernel replaces CR3) */
-        if (total < CONFIG_MAX_MEM_REGIONS) {
-            entries[total].base = 0x80000;
-            entries[total].length = 0x9F000 - 0x80000;
-            entries[total].type = MEMMAP_BOOTLOADER;
-            entries[total].reserved = 0;
-            total++;
-        }
-
-        /* Reserve kernel image region */
-        if (total < CONFIG_MAX_MEM_REGIONS && kernel->phys_base != 0) {
-            entries[total].base = kernel->phys_base;
-            entries[total].length = kernel->mem_size;
-            entries[total].type = MEMMAP_KERNEL;
-            entries[total].reserved = 0;
-            total++;
-        }
-
-        /* Reserve initrd region */
-        if (total < CONFIG_MAX_MEM_REGIONS && initrd_addr != 0 && initrd_size != 0) {
-            entries[total].base = initrd_addr;
-            entries[total].length = initrd_size;
-            entries[total].type = MEMMAP_INITRD;
-            entries[total].reserved = 0;
-            total++;
-        }
-
-        /* Reserve BootInfo buffer region */
-        if (total < CONFIG_MAX_MEM_REGIONS) {
-            entries[total].base = (uint64_t)(uintptr_t)buffer;
-            entries[total].length = buffer_size;
-            entries[total].type = MEMMAP_BOOTINFO;
+        for (uint32_t i = 0; i < alloc_record_count && total < CONFIG_MAX_MEM_REGIONS; i++) {
+            entries[total].base = alloc_records[i].phys_addr;
+            entries[total].length = alloc_records[i].size;
+            entries[total].type = tag_to_memmap_type(alloc_records[i].tag);
             entries[total].reserved = 0;
             total++;
         }

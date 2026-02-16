@@ -72,13 +72,6 @@ pub unsafe extern "C" fn uname(buf: *mut Utsname) -> i32 {
     0
 }
 
-/// __xuname — FreeBSD's uname() is a macro that calls __xuname(SYS_NMLN, buf).
-/// We ignore the nmln parameter and fill our standard Utsname.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __xuname(_nmln: i32, buf: *mut Utsname) -> i32 {
-    unsafe { uname(buf) }
-}
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gethostname(name: *mut u8, len: usize) -> i32 {
     if name.is_null() || len == 0 {

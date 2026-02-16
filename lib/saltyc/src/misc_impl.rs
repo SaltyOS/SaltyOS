@@ -13,41 +13,6 @@ use crate::errno;
 use core::ptr::addr_of_mut;
 
 // ---------------------------------------------------------------------------
-// getprogname / setprogname — BSD program name accessors
-// ---------------------------------------------------------------------------
-
-static mut PROGNAME: *const u8 = b"\0".as_ptr();
-
-#[unsafe(no_mangle)]
-pub extern "C" fn getprogname() -> *const u8 {
-    // SAFETY: PROGNAME is only written via setprogname and during startup.
-    unsafe { *(&raw const PROGNAME) }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn setprogname(name: *const u8) {
-    if name.is_null() {
-        return;
-    }
-    unsafe {
-        // Store the basename portion (after last '/')
-        let mut last_slash: *const u8 = core::ptr::null();
-        let mut p = name;
-        while *p != 0 {
-            if *p == b'/' {
-                last_slash = p;
-            }
-            p = p.add(1);
-        }
-        if !last_slash.is_null() {
-            *(&raw mut PROGNAME) = last_slash.add(1);
-        } else {
-            *(&raw mut PROGNAME) = name;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // dirname / basename — POSIX string manipulation
 // ---------------------------------------------------------------------------
 

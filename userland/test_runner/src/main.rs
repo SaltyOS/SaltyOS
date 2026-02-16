@@ -20,6 +20,8 @@ mod test_pipe;
 mod test_time;
 mod test_terminal;
 mod test_epoll;
+#[cfg(saltyc_sse2)]
+mod test_sse;
 
 use salty::consts::*;
 use salty::ipc;
@@ -60,7 +62,7 @@ pub extern "C" fn _start() -> ! {
     puts(b"[TEST_RUNNER] SaltyOS Test Runner starting\n");
     signal_ready();
 
-    let tests: [(&[u8], fn() -> bool); 10] = [
+    let base_tests: [(&[u8], fn() -> bool); 10] = [
         (b"test_hello", test_hello::run),
         (b"test_fs", test_fs::run),
         (b"test_mmap", test_mmap::run),
@@ -72,22 +74,36 @@ pub extern "C" fn _start() -> ! {
         (b"test_terminal", test_terminal::run),
         (b"test_epoll", test_epoll::run),
     ];
+    #[cfg(saltyc_sse2)]
+    let sse_tests: [(&[u8], fn() -> bool); 1] = [
+        (b"test_sse", test_sse::run),
+    ];
+    #[cfg(not(saltyc_sse2))]
+    let sse_tests: [(&[u8], fn() -> bool); 0] = [];
 
     let mut passed = 0u32;
     let mut failed = 0u32;
 
-    for (name, test_fn) in &tests {
-        { let mut lb = LineBuf::new(); lb.str(b"[TEST_RUNNER] Running "); lb.str(name); lb.str(b"...\n"); lb.flush(); }
-
-        let result = test_fn();
-        if result {
-            { let mut lb = LineBuf::new(); lb.str(b"[TEST_RUNNER] "); lb.str(name); lb.str(b" ... PASS\n"); lb.flush(); }
-            passed += 1;
-        } else {
-            { let mut lb = LineBuf::new(); lb.str(b"[TEST_RUNNER] "); lb.str(name); lb.str(b" ... FAIL\n"); lb.flush(); }
-            failed += 1;
+    fn run_suite(
+        tests: &[(&[u8], fn() -> bool)],
+        passed: &mut u32,
+        failed: &mut u32,
+    ) {
+        for (name, test_fn) in tests {
+            { let mut lb = LineBuf::new(); lb.str(b"[TEST_RUNNER] Running "); lb.str(name); lb.str(b"...\n"); lb.flush(); }
+            let result = test_fn();
+            if result {
+                { let mut lb = LineBuf::new(); lb.str(b"[TEST_RUNNER] "); lb.str(name); lb.str(b" ... PASS\n"); lb.flush(); }
+                *passed += 1;
+            } else {
+                { let mut lb = LineBuf::new(); lb.str(b"[TEST_RUNNER] "); lb.str(name); lb.str(b" ... FAIL\n"); lb.flush(); }
+                *failed += 1;
+            }
         }
     }
+
+    run_suite(&base_tests, &mut passed, &mut failed);
+    run_suite(&sse_tests, &mut passed, &mut failed);
 
     { let mut lb = LineBuf::new(); lb.str(b"[TEST_RUNNER] Results: "); lb.dec(passed as u64); lb.str(b" passed, "); lb.dec(failed as u64); lb.str(b" failed\n"); lb.flush(); }
 

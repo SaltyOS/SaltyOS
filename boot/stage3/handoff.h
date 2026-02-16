@@ -12,6 +12,7 @@
 #include "../common/bootinfo_tlv.h"
 #include "../common/stage2_info.h"
 #include "elf.h"
+#include "boot_alloc.h"
 
 /*
  * Build BootInfo structure
@@ -22,6 +23,8 @@
  * @param kernel: Kernel load result
  * @param initrd_addr: Initrd physical address (0 if none)
  * @param initrd_size: Initrd size (0 if none)
+ * @param alloc_records: BootAlloc allocation records
+ * @param alloc_record_count: Number of allocation records
  *
  * Returns: Pointer to completed BootInfo, or NULL on failure
  */
@@ -31,6 +34,8 @@ struct BootInfoHeader *handoff_build_bootinfo(
     struct Stage2Info *stage2_info,
     struct ElfLoadResult *kernel,
     uint64_t initrd_addr,
-    uint64_t initrd_size);
+    uint64_t initrd_size,
+    const struct BootAllocRecord *alloc_records,
+    uint32_t alloc_record_count);
 
 #endif /* BOOT_STAGE3_HANDOFF_H */

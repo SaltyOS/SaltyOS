@@ -74,20 +74,4 @@
 #define KERNEL_VIRT_BASE        0xFFFFFFFF80000000ULL   /* -2GB */
 #define KERNEL_PHYS_MAP_BASE    0xFFFF800000000000ULL   /* Direct physical map */
 
-/* =============================================================================
- * Page Table Physical Addresses (Stage 3 Memory Layout)
- *
- * These addresses are chosen to be above the bootloader code but
- * below the kernel load area. Stage 2 reserves this space.
- * =============================================================================
- */
-
-#define STAGE3_PML4_ADDR        0x80000     /* PML4 table */
-#define STAGE3_PDPT_ADDR        0x81000     /* PDPT table (identity map) */
-#define STAGE3_PD_ADDR          0x82000     /* PD table (identity map) */
-
-/* Dynamic page table allocation starts after reserved tables */
-#define STAGE3_PT_ALLOC_START   0x84000     /* First allocatable page table */
-#define STAGE3_PT_ALLOC_END     0x9F000     /* End of page table area (below EBDA at 0x9FC00) */
-
 #endif /* BOOT_STAGE3_ARCH_X86_PAGING_IMPL_H */

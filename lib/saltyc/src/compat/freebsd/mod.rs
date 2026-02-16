@@ -18,5 +18,7 @@ pub mod bsd_io;
 pub mod bsd_flags;
 pub mod bsd_misc;
 pub mod bsd_sort;
+pub mod bsd_err;
+pub mod bsd_stdio;
 pub mod mntent;
 pub mod statvfs;

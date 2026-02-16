@@ -60,7 +60,7 @@ pub unsafe extern "C" fn __libc_start_main(
 
         // Set program name from argv[0] for BSD err(3) functions
         if argc > 0 && !(*argv).is_null() {
-            crate::misc_impl::setprogname(*argv);
+            crate::compat::freebsd::bsd_misc::setprogname(*argv);
         }
 
         // Initialize FreeBSD locale/rune compatibility

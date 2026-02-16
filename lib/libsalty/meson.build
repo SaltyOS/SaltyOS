@@ -18,6 +18,12 @@ rust_userland_args = [
   '-L', rust_build_dir,
 ]
 
+# SSE2-accelerated saltyc routines — auto-enabled on x86_64 (ISA baseline).
+if get_option('arch') == 'x86_64'
+  rust_userland_args += ['--cfg=saltyc_sse2',
+    '-C', 'target-feature=+sse,+sse2,-soft-float']
+endif
+
 # Step 1: Rust -> .o + .rmeta
 libsalty_rust = custom_target('libsalty_rust',
   input: files('src/lib.rs'),

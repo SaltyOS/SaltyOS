@@ -6,6 +6,21 @@ use crate::cap::{KernelObject, ObjectType};
 use crate::cap::CNode;
 use crate::mm::VSpace;
 
+/// XSAVE state area for FPU/SSE context
+///
+/// Must be 64-byte aligned for XSAVE instruction requirements.
+/// Size covers x87 (512) + XSAVE header (64) + AVX (256) = 832 bytes.
+#[repr(C, align(64))]
+pub struct XSaveArea {
+    pub data: [u8; 832],
+}
+
+impl XSaveArea {
+    pub const fn zeroed() -> Self {
+        Self { data: [0u8; 832] }
+    }
+}
+
 /// Thread state
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ThreadState {
@@ -125,6 +140,10 @@ pub struct Tcb {
     pub timer_wakeup_ns: u64,
     /// Next pointer for sleep queue (intrusive singly-linked list)
     pub sleep_next: *mut Tcb,
+    /// XSAVE FPU/SSE state (64-byte aligned, 832 bytes)
+    pub fpu_state: XSaveArea,
+    /// Whether this thread has used FPU instructions (lazy init on first #NM)
+    pub fpu_initialized: bool,
 }
 
 /// Saved thread context
@@ -237,6 +256,8 @@ impl Tcb {
             user_stack_min: 0,
             timer_wakeup_ns: 0,
             sleep_next: core::ptr::null_mut(),
+            fpu_state: XSaveArea::zeroed(),
+            fpu_initialized: false,
         }
     }
 
@@ -283,6 +304,10 @@ impl Tcb {
             }
         }
         self.bound_notification = core::ptr::null_mut();
+
+        // Clear FPU ownership if this TCB is the current CPU's FPU owner
+        crate::arch::fpu::disown_if_current(self as *mut Tcb as *mut u8);
+        self.fpu_initialized = false;
     }
 }
 

@@ -36,22 +36,6 @@
  */
 
 /*
- * Initialize page tables for kernel
- *
- * Creates the page table structure required for kernel execution:
- * - Identity map for bootloader use
- * - Higher-half mapping for kernel at architecture-specific base
- * - Direct physical memory map (optional, architecture-dependent)
- *
- * @param kernel_phys: Physical address where kernel is loaded
- * @param kernel_size: Size of kernel in bytes
- *
- * Returns: Physical address of root page table, or 0 on failure
- *          (PML4 on x86_64, TTBR0/TTBR1 on aarch64)
- */
-uint64_t paging_init(uint64_t kernel_phys, uint64_t kernel_size);
-
-/*
  * Map a region in the page tables
  *
  * Maps a contiguous physical region to a virtual address range.
@@ -81,8 +65,8 @@ void paging_load_cr3(uint64_t root_table);
 /*
  * Initialize page tables using a dynamically allocated pool
  *
- * Used by the UEFI path where page tables can't use fixed addresses
- * because memory is allocated via Boot Services.
+ * Used by both BIOS and UEFI paths. All page tables are allocated
+ * from the provided pool rather than fixed addresses.
  *
  * @param pt_pool_base: Physical address of page table pool
  * @param pt_pool_size: Size of pool in bytes

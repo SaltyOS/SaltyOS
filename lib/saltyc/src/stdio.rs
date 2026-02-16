@@ -72,18 +72,6 @@ pub static mut stdout: *mut FILE = core::ptr::null_mut();
 #[unsafe(no_mangle)]
 pub static mut stderr: *mut FILE = core::ptr::null_mut();
 
-// FreeBSD compatibility aliases — FreeBSD's stdio.h #defines stdout as __stdoutp
-#[unsafe(no_mangle)]
-pub static mut __stdinp: *mut FILE = core::ptr::null_mut();
-#[unsafe(no_mangle)]
-pub static mut __stdoutp: *mut FILE = core::ptr::null_mut();
-#[unsafe(no_mangle)]
-pub static mut __stderrp: *mut FILE = core::ptr::null_mut();
-
-// FreeBSD's libc threading indicator
-#[unsafe(no_mangle)]
-pub static mut __isthreaded: i32 = 1;
-
 // Initialize stdio pointers (called from module init or lazily)
 pub(crate) fn ensure_stdio_init() {
     unsafe {
@@ -91,9 +79,10 @@ pub(crate) fn ensure_stdio_init() {
             stdin = &raw mut STDIN_FILE;
             stdout = &raw mut STDOUT_FILE;
             stderr = &raw mut STDERR_FILE;
-            __stdinp = stdin;
-            __stdoutp = stdout;
-            __stderrp = stderr;
+            // Sync FreeBSD compatibility aliases
+            crate::compat::freebsd::bsd_stdio::__stdinp = stdin;
+            crate::compat::freebsd::bsd_stdio::__stdoutp = stdout;
+            crate::compat::freebsd::bsd_stdio::__stderrp = stderr;
         }
     }
 }
@@ -955,6 +944,109 @@ unsafe fn sscanf_impl(s: *const u8, fmt: *const u8, ap: &mut VaList<'_>) -> i32 
                         matched += 1;
                     }
                 }
+                b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
+                    while *s.add(si) == b' ' || *s.add(si) == b'\t' {
+                        si += 1;
+                    }
+                    if *s.add(si) == 0 { break; }
+
+                    let start = si;
+                    let max_chars = if has_width { width } else { usize::MAX };
+                    let mut consumed = 0usize;
+
+                    // Optional sign
+                    if consumed < max_chars {
+                        let c = *s.add(si);
+                        if c == b'+' || c == b'-' {
+                            si += 1;
+                            consumed += 1;
+                        }
+                    }
+
+                    // Integer digits
+                    let mut int_digits = 0usize;
+                    while consumed < max_chars {
+                        let c = *s.add(si);
+                        if c < b'0' || c > b'9' {
+                            break;
+                        }
+                        si += 1;
+                        consumed += 1;
+                        int_digits += 1;
+                    }
+
+                    // Fractional digits
+                    let mut frac_digits = 0usize;
+                    if consumed < max_chars && *s.add(si) == b'.' {
+                        si += 1;
+                        consumed += 1;
+                        while consumed < max_chars {
+                            let c = *s.add(si);
+                            if c < b'0' || c > b'9' {
+                                break;
+                            }
+                            si += 1;
+                            consumed += 1;
+                            frac_digits += 1;
+                        }
+                    }
+
+                    // At least one digit is required.
+                    if int_digits == 0 && frac_digits == 0 {
+                        si = start;
+                        break;
+                    }
+
+                    // Optional exponent. If malformed, roll back and stop before 'e'/'E'.
+                    if consumed < max_chars {
+                        let c = *s.add(si);
+                        if c == b'e' || c == b'E' {
+                            let exp_start = si;
+                            si += 1;
+                            consumed += 1;
+
+                            if consumed < max_chars {
+                                let sign = *s.add(si);
+                                if sign == b'+' || sign == b'-' {
+                                    si += 1;
+                                    consumed += 1;
+                                }
+                            }
+
+                            let mut exp_digits = 0usize;
+                            while consumed < max_chars {
+                                let d = *s.add(si);
+                                if d < b'0' || d > b'9' {
+                                    break;
+                                }
+                                si += 1;
+                                consumed += 1;
+                                exp_digits += 1;
+                            }
+
+                            if exp_digits == 0 {
+                                si = exp_start;
+                            }
+                        }
+                    }
+
+                    if !suppress {
+                        let value = parse_scanned_float(s, start, si);
+                        // scanf: %f writes float*, %lf writes double*
+                        if length == 3 {
+                            let p = ap.arg::<*mut f64>();
+                            if !p.is_null() {
+                                *p = value;
+                            }
+                        } else {
+                            let p = ap.arg::<*mut f32>();
+                            if !p.is_null() {
+                                *p = value as f32;
+                            }
+                        }
+                        matched += 1;
+                    }
+                }
                 b's' => {
                     while *s.add(si) == b' ' || *s.add(si) == b'\t' {
                         si += 1;
@@ -1095,6 +1187,90 @@ fn char_to_digit(c: u8, base: u64) -> i32 {
         _ => return -1,
     };
     if (val as u64) < base { val } else { -1 }
+}
+
+unsafe fn parse_scanned_float(s: *const u8, start: usize, end: usize) -> f64 {
+    unsafe {
+        let mut i = start;
+        let mut negative = false;
+        if i < end {
+            let c = *s.add(i);
+            if c == b'+' {
+                i += 1;
+            } else if c == b'-' {
+                negative = true;
+                i += 1;
+            }
+        }
+
+        let mut result: f64 = 0.0;
+
+        while i < end {
+            let c = *s.add(i);
+            if c < b'0' || c > b'9' {
+                break;
+            }
+            result = result * 10.0 + (c - b'0') as f64;
+            i += 1;
+        }
+
+        if i < end && *s.add(i) == b'.' {
+            i += 1;
+            let mut frac: f64 = 0.1;
+            while i < end {
+                let c = *s.add(i);
+                if c < b'0' || c > b'9' {
+                    break;
+                }
+                result += (c - b'0') as f64 * frac;
+                frac *= 0.1;
+                i += 1;
+            }
+        }
+
+        if i < end {
+            let c = *s.add(i);
+            if c == b'e' || c == b'E' {
+                i += 1;
+                let mut exp_neg = false;
+                if i < end {
+                    let sign = *s.add(i);
+                    if sign == b'+' {
+                        i += 1;
+                    } else if sign == b'-' {
+                        exp_neg = true;
+                        i += 1;
+                    }
+                }
+
+                let mut exp: i32 = 0;
+                while i < end {
+                    let d = *s.add(i);
+                    if d < b'0' || d > b'9' {
+                        break;
+                    }
+                    exp = exp.saturating_mul(10).saturating_add((d - b'0') as i32);
+                    i += 1;
+                }
+
+                // Avoid pathological runtime on absurd exponent lengths.
+                let exp_limited = core::cmp::min(exp, 1024);
+                let mut power: f64 = 1.0;
+                let mut k = 0;
+                while k < exp_limited {
+                    power *= 10.0;
+                    k += 1;
+                }
+                if exp_neg {
+                    result /= power;
+                } else {
+                    result *= power;
+                }
+            }
+        }
+
+        if negative { -result } else { result }
+    }
 }
 
 // ======================================================================

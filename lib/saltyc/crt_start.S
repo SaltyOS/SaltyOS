@@ -14,7 +14,7 @@
 
 _start:
     xorl    %ebp, %ebp          /* Mark deepest stack frame */
-    movq    %rsp, %rsi          /* arg2 = initial stack pointer */
+    movq    %rsp, %rsi          /* arg2 = initial stack pointer (argc at [rsp]) */
     andq    $-16, %rsp          /* Align stack to 16 bytes */
     leaq    main(%rip), %rdi    /* arg1 = pointer to main */
     call    __libc_start_main   /* Never returns */

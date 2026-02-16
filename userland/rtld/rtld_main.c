@@ -318,10 +318,10 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
     }
 
     /* 8. Jump to executable entry point.
-     * Restore RSP to the original stack (argc/argv/envp/auxv from procmgr)
-     * and jump (not call) to the executable entry point.
-     * C programs expect standard stack layout at _start; a plain C call
-     * would push a return address and clobber the stack pointer.
+     * Process-entry ABI in SaltyOS:
+     *   - [RSP+0] = argc
+     *   - RSP % 16 == 8 at entry
+     * Startup code for both C and Rust relies on this contract.
      */
     __asm__ volatile(
         "mov %0, %%rsp\n"

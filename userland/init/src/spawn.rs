@@ -1275,7 +1275,10 @@ pub unsafe fn spawn_server(
             let base_count: u64 = if shared_lib_base != 0 { 16 } else { 15 };
             let auxv_count: u64 = if has_expand_ep { base_count + 1 } else { base_count };
             let srv_stack_frame_size: u64 = 3 * 8 + auxv_count * 2 * 8 + 8;
-            let stack_base = (SCRATCH_VADDR + 4096 - srv_stack_frame_size) as *mut u64;
+            // Process-entry ABI: argc at [RSP], with RSP % 16 == 8.
+            let stack_rsp_bias: u64 = 8;
+            let stack_base =
+                (SCRATCH_VADDR + 4096 - srv_stack_frame_size - stack_rsp_bias) as *mut u64;
 
             let mut idx: usize = 0;
             macro_rules! w {
@@ -1334,7 +1337,7 @@ pub unsafe fn spawn_server(
 
             invoke::vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
 
-            child_rsp = layout.stack_top - srv_stack_frame_size;
+            child_rsp = layout.stack_top - srv_stack_frame_size - stack_rsp_bias;
             child_entry = rtld_result.entry;
         }
 

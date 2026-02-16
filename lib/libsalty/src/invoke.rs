@@ -91,6 +91,12 @@ pub fn tcb_bind_notification(tcb: Cap, ntfn: Cap) -> i32 {
     invoke(tcb, TCB_BIND_NOTIFICATION, ntfn, 0, 0, 0).error as i32
 }
 
+/// Copy FPU/SSE state from source TCB to destination TCB.
+/// Used during fork to preserve the parent's floating-point state.
+pub fn tcb_copy_fpu(dest_tcb: Cap, src_tcb: Cap) -> i32 {
+    invoke(dest_tcb, TCB_COPY_FPU, src_tcb, 0, 0, 0).error as i32
+}
+
 // ---- SchedContext operations ----
 
 /// Configure a scheduling context with budget and period (microseconds).

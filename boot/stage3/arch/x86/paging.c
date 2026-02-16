@@ -23,8 +23,8 @@
  * =============================================================================
  */
 
-static uintptr_t next_page_table = STAGE3_PT_ALLOC_START;
-static uintptr_t page_table_limit = STAGE3_PT_ALLOC_END;
+static uintptr_t next_page_table = 0;
+static uintptr_t page_table_limit = 0;
 
 static uintptr_t alloc_page_table(void)
 {
@@ -143,24 +143,6 @@ static uint64_t paging_setup_maps(uintptr_t pml4,
     }
 
     return (uint64_t)pml4;
-}
-
-uint64_t paging_init(uint64_t kernel_phys, uint64_t kernel_size)
-{
-    uintptr_t pml4 = (uintptr_t)STAGE3_PML4_ADDR;
-
-#if CONFIG_DEBUG
-    print_str("Paging: kernel_phys=");
-    print_hex(kernel_phys, 16);
-    print_str(" size=");
-    print_hex(kernel_size, 16);
-    print_char('\n');
-#endif
-
-    /* Clear PML4 */
-    memset((void *)pml4, 0, 4096);
-
-    return paging_setup_maps(pml4, kernel_phys, kernel_size);
 }
 
 uint64_t paging_init_dynamic(uint64_t pt_pool_base, uint64_t pt_pool_size,

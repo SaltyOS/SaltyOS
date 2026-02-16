@@ -13,12 +13,14 @@
 
 #![no_std]
 #![no_main]
+#![no_builtins]
 #![allow(internal_features)]
 #![feature(c_variadic)]
 #![feature(linkage)]
 
 extern crate salty;
 
+pub mod arch;
 pub mod crt;
 pub mod ctype;
 pub mod env;
@@ -47,6 +49,5 @@ pub mod select_impl;
 pub mod math_impl;
 pub mod misc_impl;
 pub mod compat;
-pub mod err_impl;
 
 // Panic handler is provided by libsalty (our dependency)

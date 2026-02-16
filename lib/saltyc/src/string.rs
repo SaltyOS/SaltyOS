@@ -6,15 +6,11 @@
 //! `strlcpy`, `strlcat`, `strsep`. The `strtok` function uses a static
 //! save pointer (not thread-safe, matches POSIX behavior).
 
+use crate::arch::{Arch, ArchString};
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
-    unsafe {
-        let mut len = 0;
-        while *s.add(len) != 0 {
-            len += 1;
-        }
-        len
-    }
+    unsafe { <Arch as ArchString>::strlen(s) }
 }
 
 #[unsafe(no_mangle)]

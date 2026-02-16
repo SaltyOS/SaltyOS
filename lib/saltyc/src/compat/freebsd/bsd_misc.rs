@@ -6,6 +6,56 @@
 
 use crate::errno;
 
+// ---------------------------------------------------------------------------
+// getprogname / setprogname — BSD program name accessors
+// ---------------------------------------------------------------------------
+
+static mut PROGNAME: *const u8 = b"\0".as_ptr();
+
+#[unsafe(no_mangle)]
+pub extern "C" fn getprogname() -> *const u8 {
+    // SAFETY: PROGNAME is only written via setprogname and during startup.
+    unsafe { *(&raw const PROGNAME) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn setprogname(name: *const u8) {
+    if name.is_null() {
+        return;
+    }
+    unsafe {
+        // Store the basename portion (after last '/')
+        let mut last_slash: *const u8 = core::ptr::null();
+        let mut p = name;
+        while *p != 0 {
+            if *p == b'/' {
+                last_slash = p;
+            }
+            p = p.add(1);
+        }
+        if !last_slash.is_null() {
+            *(&raw mut PROGNAME) = last_slash.add(1);
+        } else {
+            *(&raw mut PROGNAME) = name;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// __xuname — FreeBSD uname wrapper
+// ---------------------------------------------------------------------------
+
+/// __xuname — FreeBSD's uname() is a macro that calls __xuname(SYS_NMLN, buf).
+/// We ignore the nmln parameter and fill our standard Utsname.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __xuname(_nmln: i32, buf: *mut crate::sysinfo::Utsname) -> i32 {
+    unsafe { crate::sysinfo::uname(buf) }
+}
+
+// ---------------------------------------------------------------------------
+// FreeBSD-specific miscellaneous functions
+// ---------------------------------------------------------------------------
+
 /// getosreldate — FreeBSD OS release date.
 #[unsafe(no_mangle)]
 pub extern "C" fn getosreldate() -> i32 {

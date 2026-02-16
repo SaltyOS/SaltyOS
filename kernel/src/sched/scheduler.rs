@@ -320,6 +320,9 @@ impl Scheduler {
             // Release SCHED_IPC_LOCK before context switch (IF=0, no interrupts possible)
             crate::mm::SCHED_IPC_LOCK.unlock();
 
+            // Set CR0.TS so the new thread's first FPU use triggers #NM for lazy switching
+            crate::arch::fpu::set_ts();
+
             // Pure register save/restore — no shared state accessed
             let old_ctx = &mut (*old_tcb).context as *mut _;
             let new_ctx = &(*new_tcb).context as *const _;

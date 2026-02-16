@@ -25,6 +25,7 @@
 #include "elf.h"
 #include "paging.h"
 #include "handoff.h"
+#include "boot_alloc.h"
 
 /* GUIDs for UEFI file loading */
 static EFI_GUID s_LoadedImageGuid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
@@ -37,6 +38,9 @@ static CHAR16 s_KernelPath[] = { '\\','E','F','I','\\','S','A','L','T','Y',
 
 static CHAR16 s_InitrdPath[] = { '\\','E','F','I','\\','S','A','L','T','Y',
     'O','S','\\','i','n','i','t','r','d','.','i','m','g', 0 };
+
+/* Page table pool: 32 pages = 128KB */
+#define PT_POOL_PAGES   32
 
 /*
  * Load a file from ESP using UEFI Boot Services
@@ -141,7 +145,11 @@ void stage3_entry_64(struct Stage2Info *info)
 
     EFI_BOOT_SERVICES *bs = systable->BootServices;
 
-    /* Load kernel from ESP */
+    /* Initialize BootAlloc (UEFI wrapper) */
+    struct BootAlloc ba;
+    boot_alloc_init_uefi(&ba, (uint64_t)(uintptr_t)bs);
+
+    /* Load kernel from ESP (temp buffer, not tracked by BootAlloc) */
     print_line("Loading kernel from ESP...");
     void *kernel_buffer = NULL;
     uint64_t kernel_file_size = 0;
@@ -157,11 +165,14 @@ void stage3_entry_64(struct Stage2Info *info)
     print_hex(kernel_file_size, 8);
     print_char('\n');
 
-    /* Load initrd from ESP (required). */
+    /* Load initrd from ESP (required). Register with BootAlloc. */
     void *initrd_buffer = NULL;
     uint64_t initrd_file_size = 0;
     if (uefi_load_file(bs, image_handle, s_InitrdPath,
                         &initrd_buffer, &initrd_file_size) == 0) {
+        /* Register uefi_load_file's allocation with BootAlloc */
+        boot_alloc_register(&ba, (uint64_t)(uintptr_t)initrd_buffer,
+                            initrd_file_size, BOOT_ALLOC_INITRD);
         print_str("Initrd loaded: addr=0x");
         print_hex((uint64_t)(uintptr_t)initrd_buffer, 16);
         print_str(" size=");
@@ -190,26 +201,22 @@ void stage3_entry_64(struct Stage2Info *info)
     uint64_t elf_mem_size = max_vaddr - min_vaddr;
 
     /*
-     * Allocate pages for kernel segments.
+     * Allocate pages for kernel segments via BootAlloc.
      * Prefer 2MB alignment, but fall back to 4KB alignment under low memory.
      */
     uint64_t kernel_align = KERNEL_LOAD_ALIGN;
-    uint64_t kernel_pages = EFI_SIZE_TO_PAGES(elf_mem_size + kernel_align);
-    uint64_t final_load_addr = 0;
-    EFI_STATUS efi_status = bs->AllocatePages(AllocateAnyPages, EfiLoaderData,
-                                               kernel_pages, &final_load_addr);
-    if (EFI_ERROR(efi_status)) {
+    uint64_t kernel_pages_addr = boot_alloc(&ba, elf_mem_size + kernel_align,
+                                             PAGE_SIZE_4K, BOOT_ALLOC_KERNEL);
+    if (kernel_pages_addr == 0) {
         kernel_align = KERNEL_LOWMEM_ALIGN;
-        kernel_pages = EFI_SIZE_TO_PAGES(elf_mem_size + kernel_align);
-        final_load_addr = 0;
-        efi_status = bs->AllocatePages(AllocateAnyPages, EfiLoaderData,
-                                       kernel_pages, &final_load_addr);
-        if (EFI_ERROR(efi_status)) {
+        kernel_pages_addr = boot_alloc(&ba, elf_mem_size + kernel_align,
+                                        PAGE_SIZE_4K, BOOT_ALLOC_KERNEL);
+        if (kernel_pages_addr == 0) {
             stage3_panic("Failed to allocate kernel pages");
         }
         print_line("Kernel allocation fallback: 4KB alignment");
     }
-    final_load_addr = ALIGN_UP(final_load_addr, kernel_align);
+    uint64_t final_load_addr = ALIGN_UP(kernel_pages_addr, kernel_align);
 
     /* Load kernel ELF segments */
     struct ElfLoadResult load_result;
@@ -228,14 +235,29 @@ void stage3_entry_64(struct Stage2Info *info)
     print_hex(load_result.entry, 16);
     print_char('\n');
 
-    /* Allocate pages for page tables */
-    uint64_t pt_pool_pages = 32;  /* 128KB for page tables */
-    uint64_t pt_pool_base = 0;
-    efi_status = bs->AllocatePages(AllocateAnyPages, EfiLoaderData,
-                                   pt_pool_pages, &pt_pool_base);
-    if (EFI_ERROR(efi_status)) {
+    /* Allocate page table pool via BootAlloc */
+    uint64_t pt_pool_base = boot_alloc(&ba, PT_POOL_PAGES * 4096,
+                                        PAGE_SIZE_4K, BOOT_ALLOC_PAGE_TABLES);
+    if (pt_pool_base == 0) {
         stage3_panic("Failed to allocate page table pages");
     }
+
+    /* Allocate kernel stack via BootAlloc */
+    uint64_t stack_addr = boot_alloc(&ba, KERNEL_STACK_SIZE, PAGE_SIZE_4K,
+                                      BOOT_ALLOC_STACK);
+    if (stack_addr == 0) {
+        stage3_panic("Failed to allocate kernel stack");
+    }
+
+    /* Allocate BootInfo buffer via BootAlloc */
+    uint64_t bi_buf = boot_alloc(&ba, BOOTINFO_BUFFER_SIZE, PAGE_SIZE_4K,
+                                  BOOT_ALLOC_BOOTINFO);
+    if (bi_buf == 0) {
+        stage3_panic("Failed to allocate BootInfo buffer");
+    }
+
+    /* Finalize BootAlloc before ExitBootServices */
+    boot_alloc_finalize_uefi(&ba);
 
     /*
      * GetMemoryMap + ExitBootServices
@@ -254,7 +276,7 @@ void stage3_entry_64(struct Stage2Info *info)
     uint8_t *memmap_buf = NULL;
 
     /* Step 1: Query required size */
-    efi_status = bs->GetMemoryMap(&memmap_size, NULL,
+    EFI_STATUS efi_status = bs->GetMemoryMap(&memmap_size, NULL,
                                   &map_key, &desc_size, &desc_version);
     /* Expected: EFI_BUFFER_TOO_SMALL, memmap_size now holds required size */
 
@@ -310,19 +332,18 @@ void stage3_entry_64(struct Stage2Info *info)
      */
 
     /* Set up page tables using dynamically allocated pool */
-    uint64_t pml4 = paging_init_dynamic(pt_pool_base, pt_pool_pages * 4096,
+    uint64_t pml4 = paging_init_dynamic(pt_pool_base, PT_POOL_PAGES * 4096,
                                          load_result.phys_base, load_result.mem_size);
     if (pml4 == 0) {
         stage3_panic("Failed to set up page tables");
     }
 
     /* Build BootInfo */
-    static uint8_t bootinfo_buffer_64[KB(16)] ALIGNED(4096);
-
     struct BootInfoHeader *bootinfo = handoff_build_bootinfo(
-        bootinfo_buffer_64, sizeof(bootinfo_buffer_64),
+        (void *)(uintptr_t)bi_buf, BOOTINFO_BUFFER_SIZE,
         info, &load_result,
-        (uint64_t)(uintptr_t)initrd_buffer, initrd_file_size);
+        (uint64_t)(uintptr_t)initrd_buffer, initrd_file_size,
+        ba.records, ba.record_count);
 
     if (!bootinfo) {
         stage3_panic("Failed to build BootInfo");
@@ -338,7 +359,7 @@ void stage3_entry_64(struct Stage2Info *info)
         "mov %1, %%rdi\n\t"
         "jmp *%2\n\t"
         :
-        : "r"((uint64_t)(KERNEL_STACK_ADDR + KERNEL_STACK_SIZE)),
+        : "r"((uint64_t)(stack_addr + KERNEL_STACK_SIZE)),
           "r"((uint64_t)(uintptr_t)bootinfo),
           "r"(load_result.entry)
         : "memory"

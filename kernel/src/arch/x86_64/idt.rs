@@ -257,6 +257,18 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
         return;
     }
 
+    // Vector 7: #NM Device Not Available — lazy FPU/SSE switching
+    if f.vector == 7 {
+        if (f.cs & 3) == 0 {
+            // Kernel should never use FPU — this is a bug
+            crate::serial_puts_raw("\n*** FATAL: #NM in kernel mode — kernel must not use FPU ***\n");
+            loop { super::halt(); }
+        }
+        // SAFETY: Called from exception context with current thread set
+        unsafe { super::fpu::handle_nm(); }
+        return;
+    }
+
     // User-mode exception: try fault delivery via IPC
     if (f.cs & 3) != 0 {
         unsafe {

@@ -672,7 +672,9 @@ fn load_from_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) -> (u64, u64) {
             .unwrap_or_else(|_| boot_fatal!("stack map failed"));
     }
 
-    (result.entry, INIT_STACK_TOP)
+    // x86-64 C ABI: extern "C" fn _start expects RSP ≡ 8 (mod 16),
+    // simulating a call instruction having pushed a return address.
+    (result.entry, INIT_STACK_TOP - 8)
 }
 
 /// Map initrd into user VSpace as read-only pages

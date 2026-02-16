@@ -219,6 +219,7 @@ stage3_v86_src = files(
 stage3_c_src = files(
   'stage3/main.c',
   'stage3/bios_main.c',
+  'stage3/boot_alloc.c',
   'stage3/elf.c',
   'stage3/arch/x86/paging.c',
   'stage3/handoff.c',
@@ -287,6 +288,7 @@ stage3_uefi_entry_asm = custom_target('stage3_uefi_entry_asm',
 stage3_uefi_c_src = files(
   'stage3/main.c',
   'stage3/uefi_main.c',
+  'stage3/boot_alloc.c',
   'stage3/elf.c',
   'stage3/arch/x86/paging.c',
   'stage3/handoff.c',

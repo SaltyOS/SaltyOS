@@ -1073,6 +1073,7 @@ pub(crate) unsafe fn write_static_stack(
 ///   - argv[argc] = NULL
 ///   - argv[0..argc-1] = pointers to argv strings
 ///   - argc                <-- RSP
+///   - entry alignment: RSP % 16 == 8
 ///
 /// `auxv_info` is Some(...) for dynamic executables, None for static.
 unsafe fn write_stack_with_args(
@@ -1142,9 +1143,13 @@ unsafe fn write_stack_with_args(
             + auxv_u64s;
 
         let metadata_bytes = metadata_u64s * 8;
-        // Align down from str_area_start to make room for metadata, 16-byte aligned
+        // Process-entry ABI: argc at [RSP], with RSP % 16 == 8.
+        // Place metadata at an 8-byte-biased 16-byte boundary.
         let metadata_end = str_area_start;
-        let metadata_start = (metadata_end - metadata_bytes) & !0xF;
+        let mut metadata_start = (metadata_end - metadata_bytes) & !0xF;
+        if metadata_start >= 8 {
+            metadata_start -= 8;
+        }
 
         let stack_u64 = (PROCMGR_SCRATCH_VADDR + metadata_start as u64) as *mut u64;
         let mut wi: usize = 0;

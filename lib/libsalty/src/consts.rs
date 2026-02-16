@@ -61,6 +61,7 @@ pub const TCB_WRITE_REGISTERS: u64 = 0x46;
 pub const TCB_SET_IPC_BUFFER: u64 = 0x48;
 pub const TCB_BIND_NOTIFICATION: u64 = 0x49;
 pub const TCB_SET_FAULT_HANDLER: u64 = 0x4B;
+pub const TCB_COPY_FPU: u64 = 0x4C;
 
 /// VSpace invoke labels (0x50-0x57): map, unmap, map_pt, walk, copy_page, map_device, clone_cow, map_device_range.
 pub const VSPACE_MAP: u64 = 0x50;

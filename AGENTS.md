@@ -117,6 +117,9 @@ No hidden background agents are assumed. Every action is attributable to the age
 - Must be minimal and scoped.
 - Preserve existing license headers and project style conventions.
 - Respect Rust 2024 rules (`unsafe_op_in_unsafe_fn`, no `static mut` references, etc.).
+- For x86_64 paging/TLB paths, do not use `options(nomem)` on inline asm that must be ordered with page-table updates (for example `invlpg`, `mov cr3`, shootdown-related sequences).
+- Rationale: `nomem` can allow compiler reordering of PTE stores past TLB flush operations and mask bugs as timing-dependent behavior.
+- Prefer `options(nostack[, preserves_flags])` for these instructions; keep explicit fences when they document ordering intent.
 
 ### Secrets
 - Do not read or exfiltrate secrets (`~/.ssh`, tokens, key files, secret env vars).

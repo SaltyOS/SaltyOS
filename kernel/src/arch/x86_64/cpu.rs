@@ -17,6 +17,9 @@ pub const MAX_CPUS: usize = 16;
 /// Offset 4: padding (u32)
 /// Offset 8: kernel_stack (u64)
 /// Offset 16: saved_rsp (u64)
+/// Offset 24: fpu_owner (u64) — pointer to TCB that owns FPU state in hardware
+///
+/// Assembly accesses GS:0, GS:8, GS:16 only — offset 24+ is safe for Rust.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PerCpuData {
@@ -26,8 +29,10 @@ pub struct PerCpuData {
     pub kernel_stack: u64,
     /// Saved user RSP during syscall
     pub saved_rsp: u64,
+    /// Pointer to TCB that owns the current FPU/SSE state in hardware registers
+    pub fpu_owner: u64,
     /// Reserved for future use
-    _reserved: [u64; 13],
+    _reserved: [u64; 12],
 }
 
 /// Per-CPU data for each CPU
@@ -36,7 +41,8 @@ static mut PER_CPU_DATA: [PerCpuData; MAX_CPUS] = {
         cpu_id: 0,
         kernel_stack: 0,
         saved_rsp: 0,
-        _reserved: [0; 13],
+        fpu_owner: 0,
+        _reserved: [0; 12],
     };
     [INIT; MAX_CPUS]
 };
@@ -173,4 +179,38 @@ pub fn get_kernel_stack() -> u64 {
         );
     }
     stack_top
+}
+
+/// Get the FPU owner pointer for the current CPU
+///
+/// Returns the raw TCB pointer (as *mut u8) of the thread whose FPU state
+/// is currently in the hardware registers. Null if no thread owns FPU.
+#[inline]
+pub fn get_fpu_owner() -> *mut u8 {
+    let owner: u64;
+    unsafe {
+        // SAFETY: GS:24 corresponds to fpu_owner field in PerCpuData
+        core::arch::asm!(
+            "mov {}, gs:[24]",
+            out(reg) owner,
+            options(nostack, pure, readonly)
+        );
+    }
+    owner as *mut u8
+}
+
+/// Set the FPU owner pointer for the current CPU
+///
+/// # Safety
+/// Must be called with interrupts disabled or from interrupt context.
+#[inline]
+pub unsafe fn set_fpu_owner(ptr: *mut u8) {
+    // SAFETY: GS:24 corresponds to fpu_owner field in PerCpuData
+    unsafe {
+        core::arch::asm!(
+            "mov gs:[24], {}",
+            in(reg) ptr as u64,
+            options(nostack)
+        );
+    }
 }
