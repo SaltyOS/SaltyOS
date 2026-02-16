@@ -127,6 +127,52 @@ pub fn vspace_walk(vspace: Cap, start_vaddr: u64, max_entries: u64) -> i32 {
     invoke(vspace, VSPACE_WALK, start_vaddr, max_entries, 0, 0).error as i32
 }
 
+/// Start word offset in IPC buffer page for `VSPACE_WALK` tuples (new ABI).
+pub const VSPACE_WALK_ENTRY_BASE_WORD: usize = 30;
+/// Tuple width in u64 words: `(vaddr, phys, flags)`.
+pub const VSPACE_WALK_ENTRY_WORDS: usize = 3;
+
+/// Read `(count, next_vaddr)` from the latest `VSPACE_WALK` result.
+#[inline]
+pub fn vspace_walk_result_header() -> Option<(u64, u64)> {
+    unsafe {
+        let ipc_words = walk_ipc_words()?;
+        Some((
+            core::ptr::read_volatile(ipc_words),
+            core::ptr::read_volatile(ipc_words.add(1)),
+        ))
+    }
+}
+
+/// Read one `(vaddr, phys, flags)` tuple from the latest `VSPACE_WALK` result.
+pub fn vspace_walk_result_entry(index: usize) -> Option<(u64, u64, u64)> {
+    unsafe {
+        let ipc_words = walk_ipc_words()?;
+        let offset = VSPACE_WALK_ENTRY_BASE_WORD
+            .checked_add(index.checked_mul(VSPACE_WALK_ENTRY_WORDS)?)?;
+        let ipc_words_total = core::mem::size_of::<IpcBuffer>() / core::mem::size_of::<u64>();
+        if offset + 2 >= ipc_words_total {
+            return None;
+        }
+
+        Some((
+            core::ptr::read_volatile(ipc_words.add(offset)),
+            core::ptr::read_volatile(ipc_words.add(offset + 1)),
+            core::ptr::read_volatile(ipc_words.add(offset + 2)),
+        ))
+    }
+}
+
+#[inline]
+unsafe fn walk_ipc_words() -> Option<*const u64> {
+    let ctx = &raw const crate::__salty_ipc_ctx;
+    let ipc_buffer = unsafe { (*ctx).ipc_buffer };
+    if ipc_buffer.is_null() {
+        return None;
+    }
+    Some(ipc_buffer as *const u64)
+}
+
 /// Copy page contents from `src_vaddr` in `src_vspace` into `dst_frame`.
 pub fn vspace_copy_page(src_vspace: Cap, src_vaddr: u64, dst_frame: Cap) -> i32 {
     invoke(src_vspace, VSPACE_COPY_PAGE, src_vaddr, dst_frame, 0, 0).error as i32

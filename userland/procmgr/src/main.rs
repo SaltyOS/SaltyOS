@@ -35,6 +35,7 @@ const CAP_RECV_SCRATCH: Cap = 15;  // Scratch slot for receiving transferred cap
 const CAP_UNTYPED_START: Cap = 16;
 
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
+const VSPACE_WALK_BATCH: u64 = 48;
 
 // ---- Protocol labels ----
 const PM_SPAWN: u64 = 1;
@@ -1023,14 +1024,16 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         {
             let mut walk_start: u64 = 0;
             loop {
-                let err = salty::invoke::vspace_walk(parent_vs, walk_start, 6);
+                let err = salty::invoke::vspace_walk(parent_vs, walk_start, VSPACE_WALK_BATCH);
                 if err != 0 { break; }
-                let ipc = IPC_BUF_VADDR as *const u64;
-                let count = core::ptr::read_volatile(ipc);
-                let next_addr = core::ptr::read_volatile(ipc.add(1));
+                let Some((count, next_addr)) = salty::invoke::vspace_walk_result_header() else {
+                    break;
+                };
                 if count == 0 { break; }
                 for i in 0..count as usize {
-                    let page_vaddr = core::ptr::read_volatile(ipc.add(2 + i * 3));
+                    let Some((page_vaddr, _, _)) = salty::invoke::vspace_walk_result_entry(i) else {
+                        break;
+                    };
                     if page_vaddr == parent_layout.ipc_buf.base { continue; }
                     if parent_layout.initrd.size > 0
                         && page_vaddr >= initrd_base
@@ -1080,15 +1083,17 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         let mut child_entry_path: u64 = 0;
 
         loop {
-            let err = salty::invoke::vspace_walk(parent_vs, walk_start, 6);
+            let err = salty::invoke::vspace_walk(parent_vs, walk_start, VSPACE_WALK_BATCH);
             if err != 0 { break; }
-            let ipc = IPC_BUF_VADDR as *const u64;
-            let count = core::ptr::read_volatile(ipc);
-            let next_addr = core::ptr::read_volatile(ipc.add(1));
+            let Some((count, next_addr)) = salty::invoke::vspace_walk_result_header() else {
+                break;
+            };
             if count == 0 { break; }
 
             for i in 0..count as usize {
-                let page_vaddr = core::ptr::read_volatile(ipc.add(2 + i * 3));
+                let Some((page_vaddr, _, _)) = salty::invoke::vspace_walk_result_entry(i) else {
+                    break;
+                };
                 if page_vaddr == parent_layout.ipc_buf.base {
                     continue;
                 }
@@ -1435,16 +1440,17 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         // 1. Unmap existing user pages
         let mut walk_start: u64 = 0;
         loop {
-            let err = salty::invoke::vspace_walk(proc_vs, walk_start, 6);
+            let err = salty::invoke::vspace_walk(proc_vs, walk_start, VSPACE_WALK_BATCH);
             if err != 0 { break; }
-
-            let ipc = IPC_BUF_VADDR as *const u64;
-            let count = core::ptr::read_volatile(ipc);
-            let next_addr = core::ptr::read_volatile(ipc.add(1));
+            let Some((count, next_addr)) = salty::invoke::vspace_walk_result_header() else {
+                break;
+            };
             if count == 0 { break; }
 
             for i in 0..count {
-                let page_vaddr = core::ptr::read_volatile(ipc.add(2 + i as usize * 3));
+                let Some((page_vaddr, _, _)) = salty::invoke::vspace_walk_result_entry(i as usize) else {
+                    break;
+                };
                 if page_vaddr == PROCTAB[idx].layout.ipc_buf.base { continue; }
                 salty::invoke::vspace_unmap(proc_vs, page_vaddr);
             }

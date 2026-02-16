@@ -63,7 +63,8 @@ pub struct IpcBuffer {
     pub receive_index: u64,     // 0x0E0: 8 bytes
     /// CNode depth for receive
     pub receive_depth: u64,     // 0x0E8: 8 bytes
-    /// Reserved for future use
+    /// Reserved/extended payload area used by invoke extensions.
+    /// VSPACE_WALK writes tuples at word offset 30.
     pub reserved: [u64; 478],   // 0x0F0: 3824 bytes
 }
 

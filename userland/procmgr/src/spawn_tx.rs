@@ -1735,7 +1735,7 @@ pub unsafe fn handle_spawn_tx(
 
             // envp strings
             let env_strs: [&[u8]; 4] = [
-                b"PATH=/bin",
+                b"PATH=/bin:/usr/bin",
                 b"HOME=/",
                 b"TERM=dumb",
                 b"SHELL=/bin/sh",

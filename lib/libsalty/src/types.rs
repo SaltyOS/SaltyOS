@@ -55,7 +55,8 @@ impl SaltyMsg {
 /// - `badge`: sender badge written by kernel on receive
 /// - `caps[0..3]`: CNode slots of capabilities to transfer on send
 /// - `receive_cnode/index/depth`: destination for received capabilities
-/// - `reserved[0..1]`: reserved for future ABI extensions
+/// - `reserved[0..]`: syscall-specific extended payload area.
+///   `VSPACE_WALK` writes tuples at word offset 30.
 #[repr(C)]
 pub struct IpcBuffer {
     pub msg: [u64; 22],

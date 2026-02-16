@@ -37,11 +37,23 @@ struct BootInfoHeader *handoff_build_bootinfo(
     if (stage2_info->memmap_addr && stage2_info->memmap_count > 0) {
         struct BootInfoMemMapEntry *entries;
         uint32_t count = stage2_info->memmap_count;
+        const uint32_t reserve_entries = 4; /* bootloader + kernel + initrd + bootinfo */
+        uint32_t memmap_capacity;
 
-        /* Allocate temporary buffer for converted entries + 4 reservation entries */
-        uint32_t max_entries = count + 4;
-        if (max_entries > CONFIG_MAX_MEM_REGIONS)
-            max_entries = CONFIG_MAX_MEM_REGIONS;
+        /*
+         * Reserve room for synthetic reservation entries to avoid truncating
+         * bootloader/kernel/initrd/bootinfo carve-outs under large firmware maps.
+         */
+        if (CONFIG_MAX_MEM_REGIONS > reserve_entries) {
+            memmap_capacity = CONFIG_MAX_MEM_REGIONS - reserve_entries;
+        } else {
+            memmap_capacity = 0;
+        }
+        if (count > memmap_capacity)
+            count = memmap_capacity;
+
+        /* Allocate temporary buffer for converted entries + reservation entries */
+        uint32_t max_entries = count + reserve_entries;
         size_t entries_size = max_entries * sizeof(struct BootInfoMemMapEntry);
         entries = (struct BootInfoMemMapEntry *)((uint8_t *)buffer + buffer_size - entries_size);
 

@@ -35,11 +35,17 @@ impl PageTable {
     }
 
     pub fn entry(&self, index: usize) -> u64 {
-        self.entries[index]
+        // Volatile read: PTEs are read by the hardware page walker and may be
+        // modified by other CPUs. Prevents the compiler from caching or
+        // eliminating PTE reads across invlpg/IPI boundaries.
+        unsafe { core::ptr::read_volatile(&self.entries[index]) }
     }
 
     pub fn set_entry(&mut self, index: usize, entry: u64) {
-        self.entries[index] = entry;
+        // Volatile write: every PTE store is architecturally significant.
+        // Prevents the compiler from reordering or eliminating stores
+        // relative to subsequent TLB invalidation.
+        unsafe { core::ptr::write_volatile(&mut self.entries[index], entry) }
     }
 }
 
@@ -56,14 +62,14 @@ pub fn read_cr3() -> u64 {
 pub unsafe fn write_cr3(value: u64) {
     // SAFETY: Caller ensures value is a valid page table address
     unsafe {
-        core::arch::asm!("mov cr3, {}", in(reg) value, options(nomem, nostack));
+        core::arch::asm!("mov cr3, {}", in(reg) value, options(nostack));
     }
 }
 
 /// Flush TLB for a single page
 pub fn invlpg(addr: u64) {
     unsafe {
-        core::arch::asm!("invlpg [{}]", in(reg) addr, options(nomem, nostack));
+        core::arch::asm!("invlpg [{}]", in(reg) addr, options(nostack));
     }
 }
 

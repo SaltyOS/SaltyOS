@@ -22,6 +22,9 @@ const ENTRY_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 /// User PML4 range: entries 0..255 (lower half)
 const USER_PML4_MAX: usize = 256;
 
+/// Maximum number of entries returned by one `walk_pages` call.
+const WALK_MAX_RESULTS: usize = 48;
+
 /// Maximum number of CPUs (from arch module)
 use crate::arch::MAX_CPUS;
 
@@ -31,6 +34,10 @@ const MAX_VSPACES: usize = 256;
 
 /// Maximum number of deferred free entries
 const MAX_DEFERRED: usize = 256;
+
+/// Number of mapped pages at/above which range mapping uses one-shot full TLB
+/// flush instead of per-page invalidation.
+const RANGE_TLB_GLOBAL_THRESHOLD: usize = 8;
 /// VSpaceTracking pool - static allocation, no heap
 ///
 /// All VSpaceTracking objects are allocated from this pool.
@@ -968,6 +975,48 @@ impl VSpace {
         }
     }
 
+    /// Send full TLB flush IPI to all remote CPUs that have this VSpace loaded.
+    fn tlb_shootdown_all(&self) {
+        if self.tracking.is_null() {
+            return;
+        }
+        let cpu_id = crate::arch::current_cpu() as usize;
+        let tracking = unsafe { &*self.tracking };
+
+        for word_idx in 0..tracking.active_mask.len() {
+            let mask = tracking.active_mask[word_idx].load(Ordering::Acquire);
+            if mask == 0 {
+                continue;
+            }
+            for bit in 0..32 {
+                if mask & (1 << bit) != 0 {
+                    let target = word_idx * 32 + bit;
+                    if target < MAX_CPUS && target != cpu_id {
+                        unsafe {
+                            crate::arch::send_ipi(target, crate::arch::IpiKind::TlbShootdownAll);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check whether this VSpace is currently active on the calling CPU.
+    #[inline]
+    fn active_on_current_cpu(&self) -> bool {
+        if self.tracking.is_null() {
+            return false;
+        }
+        let cpu_id = crate::arch::current_cpu() as usize;
+        let word = cpu_id / 32;
+        let bit = cpu_id % 32;
+        let tracking = unsafe { &*self.tracking };
+        if word >= tracking.active_mask.len() {
+            return false;
+        }
+        (tracking.active_mask[word].load(Ordering::Acquire) & (1 << bit)) != 0
+    }
+
     /// Map a page
     pub fn map(
         &mut self,
@@ -1017,6 +1066,88 @@ impl VSpace {
         unsafe { restore_irq(irq) };
 
         result
+    }
+
+    /// Map a contiguous page range and return how many pages were mapped.
+    ///
+    /// Stops on the first mapping failure and returns the count mapped so far.
+    /// This mirrors the partial-success contract used by VSPACE_MAP_DEVICE_RANGE.
+    pub fn map_range_partial(
+        &mut self,
+        virt_start: VirtAddr,
+        phys_start: PhysAddr,
+        count: usize,
+        flags: PageFlags,
+    ) -> Result<usize, VSpaceError> {
+        if count == 0 {
+            return Ok(0);
+        }
+        if virt_start & (PAGE_SIZE as u64 - 1) != 0 || phys_start & (PAGE_SIZE as u64 - 1) != 0 {
+            return Err(VSpaceError::Alignment);
+        }
+
+        let page_size = PAGE_SIZE as u64;
+        let irq = unsafe { save_irq_disable() };
+        self.lock.lock();
+
+        let mut mapped = 0usize;
+        let entry_flags = Self::flags_to_entry_flags(flags);
+        let mut virt = virt_start;
+        let mut phys = phys_start;
+
+        for _ in 0..count {
+            if self.ensure_table(virt, 1, flags.user).is_err() {
+                break;
+            }
+            if let Some(entry) = self.read_entry(virt, 1) {
+                if entry & ENTRY_PRESENT != 0 {
+                    break;
+                }
+            }
+            if self.write_entry(virt, 1, phys | entry_flags).is_err() {
+                break;
+            }
+            super::retain_frame_mapping(phys);
+            mapped += 1;
+
+            virt = match virt.checked_add(page_size) {
+                Some(v) => v,
+                None => break,
+            };
+            phys = match phys.checked_add(page_size) {
+                Some(p) => p,
+                None => break,
+            };
+        }
+
+        if mapped > RANGE_TLB_GLOBAL_THRESHOLD {
+            if self.active_on_current_cpu() {
+                let cr3 = crate::arch::x86_64::paging::read_cr3();
+                unsafe {
+                    crate::arch::x86_64::paging::write_cr3(cr3);
+                }
+            }
+            self.tlb_shootdown_all();
+        } else if mapped > 0 {
+            let do_local_flush = self.active_on_current_cpu();
+            let mut flush_virt = virt_start;
+            for i in 0..mapped {
+                if do_local_flush {
+                    crate::arch::x86_64::paging::invlpg(flush_virt);
+                }
+                self.tlb_shootdown(flush_virt);
+                if i + 1 < mapped {
+                    flush_virt = match flush_virt.checked_add(page_size) {
+                        Some(v) => v,
+                        None => break,
+                    };
+                }
+            }
+        }
+
+        self.lock.unlock();
+        unsafe { restore_irq(irq) };
+        Ok(mapped)
     }
 
     /// Install a page table at a specific level
@@ -1583,9 +1714,13 @@ impl VSpace {
         &self,
         start_vaddr: VirtAddr,
         max_entries: usize,
-    ) -> (usize, VirtAddr, [(VirtAddr, PhysAddr, u64); 6]) {
-        let mut results = [(0u64, 0u64, 0u64); 6];
-        let max = if max_entries > 6 { 6 } else { max_entries };
+    ) -> (usize, VirtAddr, [(VirtAddr, PhysAddr, u64); WALK_MAX_RESULTS]) {
+        let mut results = [(0u64, 0u64, 0u64); WALK_MAX_RESULTS];
+        let max = if max_entries > WALK_MAX_RESULTS {
+            WALK_MAX_RESULTS
+        } else {
+            max_entries
+        };
         let mut count = 0usize;
         let mut vaddr = start_vaddr & !0xFFF; // Align to page
 

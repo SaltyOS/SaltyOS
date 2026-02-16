@@ -265,6 +265,7 @@ irq_stub_sched_ipc timer
 irq_stub_nobkl ipi_vspace_teardown
 irq_stub_sched_ipc ipi_reschedule
 irq_stub_nobkl ipi_tlb_shootdown
+irq_stub_nobkl ipi_tlb_shootdown_all
 
 // ---------------------------------------------------------------------------
 // Generic IRQ stubs for external hardware interrupts (vectors 33-47)

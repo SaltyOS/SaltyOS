@@ -26,6 +26,9 @@ use crate::types::Cap;
 const SLOT_EXPAND_BITS_DEFAULT: u64 = 10;
 const MAX_SEGMENTS: usize = 16;
 const MAX_EXTRA_UT: usize = MAX_UT_EXPANSIONS;
+const MIRRORED_UT_SCAN_LIMIT: usize = 200;
+const MIRRORED_UT_BITMAP_BITS: usize = MIRRORED_UT_SCAN_LIMIT - CAP_UNTYPED_START as usize;
+const MIRRORED_UT_BITMAP_WORDS: usize = (MIRRORED_UT_BITMAP_BITS + 63) / 64;
 
 /// A contiguous range of CNode slots available for allocation.
 #[derive(Clone, Copy)]
@@ -91,6 +94,11 @@ static mut UT_EXPAND_REQUESTED: bool = false;
 static mut EXTRA_UT_SLOTS: [Cap; MAX_EXTRA_UT] = [0; MAX_EXTRA_UT];
 static mut EXTRA_UT_COUNT: usize = 0;
 static mut PENDING_FRAME_SLOT: Cap = 0;
+static mut MIRRORED_UT_HINT: Cap = CAP_UNTYPED_START;
+static mut EXTRA_UT_HINT: usize = 0;
+static mut UNTYPED_SCAN_END_CACHE: Cap = 0;
+static mut MIRRORED_UT_SKIP_BITMAP: [u64; MIRRORED_UT_BITMAP_WORDS] = [0; MIRRORED_UT_BITMAP_WORDS];
+static mut EXTRA_UT_SKIP_MASK: u16 = 0;
 
 /// Initialize the per-process slot allocator.
 ///
@@ -114,6 +122,15 @@ pub unsafe fn slot_alloc_init(base: Cap, count: u64, expand_ep: u64) {
         state.expand_state = ExpandState::Idle;
         state.root_bits = 0;
         state.expanded_depth = 0;
+        *(&raw mut UT_EXPAND_REQUESTED) = false;
+        *(&raw mut EXTRA_UT_SLOTS) = [0; MAX_EXTRA_UT];
+        *(&raw mut EXTRA_UT_COUNT) = 0;
+        *(&raw mut PENDING_FRAME_SLOT) = 0;
+        *(&raw mut MIRRORED_UT_HINT) = CAP_UNTYPED_START;
+        *(&raw mut EXTRA_UT_HINT) = 0;
+        *(&raw mut UNTYPED_SCAN_END_CACHE) = 0;
+        *(&raw mut MIRRORED_UT_SKIP_BITMAP) = [0; MIRRORED_UT_BITMAP_WORDS];
+        *(&raw mut EXTRA_UT_SKIP_MASK) = 0;
     }
 }
 
@@ -215,6 +232,7 @@ pub fn slot_alloc_async() -> SlotResult {
                         state.seg_count += 1;
                         state.active_seg = si;
                         state.expand_state = ExpandState::Idle;
+                        *(&raw mut UNTYPED_SCAN_END_CACHE) = 0;
 
                         // Track expansion depth for depth-aware invocations
                         if state.root_bits == 0 {
@@ -309,6 +327,7 @@ pub fn slot_alloc() -> Option<Cap> {
         state.seg_count += 1;
         state.active_seg = si;
         state.expand_state = ExpandState::Idle;
+        *(&raw mut UNTYPED_SCAN_END_CACHE) = 0;
         update_expansion_depth(state);
 
         {
@@ -403,6 +422,7 @@ pub fn slot_alloc_frame_map_async(vspace: Cap, vaddr: u64, flags: u64) -> SlotRe
                     // Expansion completed — register new untyped
                     (*(&raw mut EXTRA_UT_SLOTS))[count] = expected;
                     *(&raw mut EXTRA_UT_COUNT) = count + 1;
+                    extra_ut_clear_skipped(count);
                     *(&raw mut UT_EXPAND_REQUESTED) = false;
                     *(&raw mut PENDING_FRAME_SLOT) = 0;
 
@@ -451,33 +471,162 @@ fn try_retype_frame(dest_slot: Cap) -> i32 {
         return 0;
     }
 
-    // Scan mirrored untyped caps
-    let scan_end = untyped_scan_end();
     let mut last_err = err;
-    for ut in CAP_UNTYPED_START..scan_end {
-        let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, dest_slot);
-        if err == 0 {
-            return 0;
-        }
-        last_err = err;
-    }
+    let scan_end = cached_untyped_scan_end();
 
-    // Try dynamically-granted untypeds
-    unsafe {
-        let count = *(&raw const EXTRA_UT_COUNT);
-        for i in 0..count {
-            let ut = (*(&raw const EXTRA_UT_SLOTS))[i];
-            if ut != 0 {
+    // Scan mirrored untyped caps, starting from the last successful source.
+    if scan_end > CAP_UNTYPED_START {
+        let span = scan_end - CAP_UNTYPED_START;
+        let mut ut = unsafe {
+            let hint = *(&raw const MIRRORED_UT_HINT);
+            if hint >= CAP_UNTYPED_START && hint < scan_end {
+                hint
+            } else {
+                CAP_UNTYPED_START
+            }
+        };
+        for _ in 0..span {
+            let idx = (ut - CAP_UNTYPED_START) as usize;
+            if !mirrored_ut_is_skipped(idx) {
                 let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, dest_slot);
                 if err == 0 {
+                    unsafe {
+                        *(&raw mut MIRRORED_UT_HINT) = next_mirrored_ut(ut, scan_end);
+                    }
                     return 0;
                 }
+                if is_permanent_untyped_failure(err) {
+                    mirrored_ut_mark_skipped(idx);
+                }
                 last_err = err;
+            }
+            ut = next_mirrored_ut(ut, scan_end);
+        }
+    }
+
+    // Try dynamically-granted untypeds with a round-robin hint.
+    unsafe {
+        let count = *(&raw const EXTRA_UT_COUNT);
+        if count != 0 {
+            let mut idx = *(&raw const EXTRA_UT_HINT);
+            if idx >= count {
+                idx = 0;
+            }
+            for _ in 0..count {
+                if extra_ut_is_skipped(idx) {
+                    idx += 1;
+                    if idx == count {
+                        idx = 0;
+                    }
+                    continue;
+                }
+
+                let ut = (*(&raw const EXTRA_UT_SLOTS))[idx];
+                if ut != 0 {
+                    let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, dest_slot);
+                    if err == 0 {
+                        *(&raw mut EXTRA_UT_HINT) = if idx + 1 < count { idx + 1 } else { 0 };
+                        return 0;
+                    }
+                    if is_permanent_untyped_failure(err) {
+                        extra_ut_mark_skipped(idx);
+                    }
+                    last_err = err;
+                }
+                idx += 1;
+                if idx == count {
+                    idx = 0;
+                }
             }
         }
     }
 
     last_err
+}
+
+#[inline]
+fn next_mirrored_ut(ut: Cap, scan_end: Cap) -> Cap {
+    if ut + 1 < scan_end {
+        ut + 1
+    } else {
+        CAP_UNTYPED_START
+    }
+}
+
+#[inline]
+fn is_permanent_untyped_failure(err: i32) -> bool {
+    err == SALTY_INVALID_CAPABILITY as i32
+        || err == SALTY_INVALID_OPERATION as i32
+        || err == SALTY_INSUFFICIENT_RIGHTS as i32
+        || err == SALTY_NOT_FOUND as i32
+}
+
+#[inline]
+fn mirrored_ut_is_skipped(idx: usize) -> bool {
+    let word = idx / 64;
+    if word >= MIRRORED_UT_BITMAP_WORDS {
+        return false;
+    }
+    let bit = 1u64 << (idx % 64);
+    unsafe { ((*(&raw const MIRRORED_UT_SKIP_BITMAP))[word] & bit) != 0 }
+}
+
+#[inline]
+fn mirrored_ut_mark_skipped(idx: usize) {
+    let word = idx / 64;
+    if word >= MIRRORED_UT_BITMAP_WORDS {
+        return;
+    }
+    let bit = 1u64 << (idx % 64);
+    unsafe {
+        (*(&raw mut MIRRORED_UT_SKIP_BITMAP))[word] |= bit;
+    }
+}
+
+#[inline]
+fn extra_ut_is_skipped(idx: usize) -> bool {
+    if idx >= 16 {
+        return false;
+    }
+    let bit = 1u16 << idx;
+    unsafe { (*(&raw const EXTRA_UT_SKIP_MASK) & bit) != 0 }
+}
+
+#[inline]
+fn extra_ut_mark_skipped(idx: usize) {
+    if idx >= 16 {
+        return;
+    }
+    let bit = 1u16 << idx;
+    unsafe {
+        *(&raw mut EXTRA_UT_SKIP_MASK) |= bit;
+    }
+}
+
+#[inline]
+fn extra_ut_clear_skipped(idx: usize) {
+    if idx >= 16 {
+        return;
+    }
+    let bit = 1u16 << idx;
+    unsafe {
+        *(&raw mut EXTRA_UT_SKIP_MASK) &= !bit;
+    }
+}
+
+#[inline]
+fn cached_untyped_scan_end() -> Cap {
+    unsafe {
+        let cached = *(&raw const UNTYPED_SCAN_END_CACHE);
+        if cached > CAP_UNTYPED_START {
+            return cached;
+        }
+    }
+    let end = untyped_scan_end();
+    unsafe {
+        *(&raw mut UNTYPED_SCAN_END_CACHE) = end;
+    }
+    end
 }
 
 /// Determine the upper bound for untyped cap scanning.

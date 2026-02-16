@@ -157,7 +157,8 @@ pub fn tlb_shootdown_addr(cpu_id: usize) -> u64 {
 pub enum IpiKind {
     VSpaceTeardown = 0,
     Reschedule = 1,
-    TlbShootdown = 8,  // vector 48 (avoids conflict with generic IRQ vectors 42-47)
+    TlbShootdown = 8,     // vector 48 (single-page inval)
+    TlbShootdownAll = 9,  // vector 49 (full TLB flush)
 }
 
 impl IpiKind {
@@ -1087,6 +1088,10 @@ pub fn handle_ipi(kind: IpiKind) {
         }
         IpiKind::TlbShootdown => {
             // Handled by irq_handler_ipi_tlb_shootdown (own assembly stub),
+            // not through handle_ipi. This arm should never be reached.
+        }
+        IpiKind::TlbShootdownAll => {
+            // Handled by irq_handler_ipi_tlb_shootdown_all (own assembly stub),
             // not through handle_ipi. This arm should never be reached.
         }
     }

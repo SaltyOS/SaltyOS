@@ -204,6 +204,7 @@ unsafe extern "C" {
     fn irq_stub_ipi_vspace_teardown();
     fn irq_stub_ipi_reschedule();
     fn irq_stub_ipi_tlb_shootdown();
+    fn irq_stub_ipi_tlb_shootdown_all();
 
     // Generic IRQ stubs for external hardware interrupts
     fn irq_stub_generic_33();
@@ -329,7 +330,7 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
     // For user-mode: SCHED_IPC_LOCK is held (assembly acquired it)
     // For kernel-mode: SCHED_IPC_LOCK is NOT held (assembly skipped it)
     // Use raw serial — this is a crash path, another CPU may hold SERIAL_LOCK
-    unsafe {
+    {
         crate::serial_puts_raw("\n*** EXCEPTION: ");
         crate::serial_puts_raw(f.exception_name());
         crate::serial_puts_raw(" (vector ");
@@ -352,23 +353,23 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
 
             // Dump PTE chain for the faulting address to diagnose NX at any level
             if f.error_code & 16 != 0 {
-                let cr3: u64;
-                core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
+                use super::paging::PageTable;
+                let cr3 = super::paging::read_cr3();
                 let addr_mask: u64 = 0x000F_FFFF_FFFF_F000;
                 let nx_bit: u64 = 1u64 << 63;
 
-                let pml4 = crate::mm::phys_to_virt(cr3 & addr_mask) as *const u64;
+                let pml4 = unsafe { &*(crate::mm::phys_to_virt(cr3 & addr_mask) as *const PageTable) };
                 let pml4_idx = ((f.cr2 >> 39) & 0x1FF) as usize;
-                let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
+                let pml4e = pml4.entry(pml4_idx);
                 crate::serial_puts_raw("  PML4E["); crate::serial_dec_raw(pml4_idx as u64);
                 crate::serial_puts_raw("]="); crate::serial_hex_raw(pml4e);
                 if pml4e & nx_bit != 0 { crate::serial_puts_raw(" NX!"); }
                 crate::serial_putc_hw(b'\n');
 
                 if pml4e & 1 != 0 {
-                    let pdpt = crate::mm::phys_to_virt(pml4e & addr_mask) as *const u64;
+                    let pdpt = unsafe { &*(crate::mm::phys_to_virt(pml4e & addr_mask) as *const PageTable) };
                     let pdpt_idx = ((f.cr2 >> 30) & 0x1FF) as usize;
-                    let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
+                    let pdpte = pdpt.entry(pdpt_idx);
                     crate::serial_puts_raw("  PDPTE["); crate::serial_dec_raw(pdpt_idx as u64);
                     crate::serial_puts_raw("]="); crate::serial_hex_raw(pdpte);
                     if pdpte & nx_bit != 0 { crate::serial_puts_raw(" NX!"); }
@@ -378,9 +379,9 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
                         if pdpte & (1 << 7) != 0 {
                             crate::serial_puts_raw("  PDPTE is 1GB page (PS=1), no PD\n");
                         } else {
-                            let pd = crate::mm::phys_to_virt(pdpte & addr_mask) as *const u64;
+                            let pd = unsafe { &*(crate::mm::phys_to_virt(pdpte & addr_mask) as *const PageTable) };
                             let pd_idx = ((f.cr2 >> 21) & 0x1FF) as usize;
-                            let pde = core::ptr::read_volatile(pd.add(pd_idx));
+                            let pde = pd.entry(pd_idx);
                             crate::serial_puts_raw("  PDE["); crate::serial_dec_raw(pd_idx as u64);
                             crate::serial_puts_raw("]="); crate::serial_hex_raw(pde);
                             if pde & nx_bit != 0 { crate::serial_puts_raw(" NX!"); }
@@ -390,9 +391,9 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
                                 if pde & (1 << 7) != 0 {
                                     crate::serial_puts_raw("  PDE is 2MB page (PS=1), no PT\n");
                                 } else {
-                                    let pt = crate::mm::phys_to_virt(pde & addr_mask) as *const u64;
+                                    let pt = unsafe { &*(crate::mm::phys_to_virt(pde & addr_mask) as *const PageTable) };
                                     let pt_idx = ((f.cr2 >> 12) & 0x1FF) as usize;
-                                    let pte = core::ptr::read_volatile(pt.add(pt_idx));
+                                    let pte = pt.entry(pt_idx);
                                     crate::serial_puts_raw("  PTE["); crate::serial_dec_raw(pt_idx as u64);
                                     crate::serial_puts_raw("]="); crate::serial_hex_raw(pte);
                                     if pte & nx_bit != 0 { crate::serial_puts_raw(" NX!"); }
@@ -556,7 +557,9 @@ pub fn init() {
         idt.entries[41].set_handler(irq_stub_ipi_reschedule as *const () as u64);
         // Vector 48: IPI TLB Shootdown
         idt.entries[48].set_handler(irq_stub_ipi_tlb_shootdown as *const () as u64);
-        crate::serial_puts("[IDT] IPI handlers set (vectors 40-41, 48)\n");
+        // Vector 49: IPI full TLB Shootdown
+        idt.entries[49].set_handler(irq_stub_ipi_tlb_shootdown_all as *const () as u64);
+        crate::serial_puts("[IDT] IPI handlers set (vectors 40-41, 48-49)\n");
 
         // Generic external IRQ handlers (vectors 33-39, 42-47)
         idt.entries[33].set_handler(irq_stub_generic_33 as *const () as u64);
@@ -681,9 +684,22 @@ extern "C" fn irq_handler_ipi_tlb_shootdown() {
         let cpu_id = crate::arch::current_cpu() as usize;
         let addr = super::apic::tlb_shootdown_addr(cpu_id);
         if addr != 0 {
-            unsafe {
-                core::arch::asm!("invlpg [{}]", in(reg) addr, options(nostack, preserves_flags));
-            }
+            super::paging::invlpg(addr);
+        }
+        super::apic::eoi();
+    }
+}
+
+/// IPI full TLB Shootdown handler (called from assembly stub irq_stub_ipi_tlb_shootdown_all)
+///
+/// Vector 49 — sent when many PTEs are updated in one operation.
+/// Reloading CR3 flushes non-global TLB entries in one step.
+#[unsafe(no_mangle)]
+extern "C" fn irq_handler_ipi_tlb_shootdown_all() {
+    if super::has_apic() {
+        let cr3 = super::paging::read_cr3();
+        unsafe {
+            super::paging::write_cr3(cr3);
         }
         super::apic::eoi();
     }

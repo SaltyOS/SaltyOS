@@ -106,7 +106,7 @@ fn write_gs_base_msr(base: u64) {
             in("ecx") IA32_GS_BASE_MSR,
             in("eax") low,
             in("edx") high,
-            options(nostack, nomem)
+            options(nostack)
         );
     }
 }
@@ -122,7 +122,7 @@ fn write_kernel_gs_base_msr(base: u64) {
             in("ecx") IA32_KERNEL_GS_BASE_MSR,
             in("eax") low,
             in("edx") high,
-            options(nostack, nomem)
+            options(nostack)
         );
     }
 }

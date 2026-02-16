@@ -71,14 +71,12 @@ pub unsafe fn posix_mm_init(
 /// Allocate a CNode slot and retype a frame into it from the slot allocator.
 /// Returns the frame cap, or `u64::MAX` on failure.
 unsafe fn alloc_frame() -> Cap {
-    unsafe {
-        if !crate::slot_alloc::slot_alloc_is_initialized() {
-            return u64::MAX;
-        }
-        match crate::slot_alloc::slot_alloc_frame() {
-            Some(slot) => slot,
-            None => u64::MAX,
-        }
+    if !crate::slot_alloc::slot_alloc_is_initialized() {
+        return u64::MAX;
+    }
+    match crate::slot_alloc::slot_alloc_frame() {
+        Some(slot) => slot,
+        None => u64::MAX,
     }
 }
 
@@ -124,6 +122,90 @@ unsafe fn find_region(addr: u64) -> *mut PosixMmRegion {
     }
 }
 
+/// Roll back heap growth in [start_va, end_va) by unmapping pages and
+/// deleting tracked frame caps.
+unsafe fn rollback_heap_growth(start_va: u64, end_va: u64) {
+    unsafe {
+        let mut va = start_va;
+        while va < end_va {
+            invoke::vspace_unmap(MM.vspace, va);
+            let idx = ((va - MM.heap_base) / 4096) as usize;
+            if idx < MM_MAX_PAGES_PER_REGION {
+                let frame = MM.heap_frame_slots[idx];
+                if frame != 0 {
+                    invoke::cnode_delete(MM.cspace, frame);
+                    MM.heap_frame_slots[idx] = 0;
+                }
+            }
+            va += 4096;
+        }
+    }
+}
+
+/// Roll back anonymous mmap pages already mapped in `region`.
+unsafe fn rollback_mmap_pages(region: *mut PosixMmRegion, mapped_pages: usize) {
+    unsafe {
+        for i in 0..mapped_pages {
+            let va = (*region).base + i as u64 * 4096;
+            invoke::vspace_unmap(MM.vspace, va);
+            let frame = (*region).frame_slots[i];
+            if frame != 0 {
+                invoke::cnode_delete(MM.cspace, frame);
+                (*region).frame_slots[i] = 0;
+            }
+        }
+    }
+}
+
+/// Find the first available mmap hole of `len` bytes (page-aligned).
+unsafe fn find_mmap_hole(len: u64) -> Option<u64> {
+    unsafe {
+        let mut candidate = MM.mmap_base;
+        loop {
+            let candidate_end = candidate.checked_add(len)?;
+            let mut overlap_end: u64 = 0;
+            let mut overlapped = false;
+
+            for i in 0..MM_MAX_REGIONS {
+                let r = &MM.regions[i];
+                if r.region_type != MM_REGION_MMAP {
+                    continue;
+                }
+                let r_start = r.base;
+                let r_end = r.base.checked_add(r.length)?;
+                if candidate_end <= r_start || candidate >= r_end {
+                    continue;
+                }
+                if !overlapped || r_end < overlap_end {
+                    overlap_end = r_end;
+                    overlapped = true;
+                }
+            }
+
+            if !overlapped {
+                return Some(candidate);
+            }
+            if overlap_end <= candidate {
+                return None;
+            }
+            candidate = overlap_end;
+        }
+    }
+}
+
+/// Reserve an mmap base for `len` bytes using first-fit hole search.
+/// Advances `mmap_next` only when the chosen range reaches past current top.
+unsafe fn reserve_mmap_base(len: u64) -> Option<u64> {
+    unsafe {
+        let base = find_mmap_hole(len)?;
+        let end = base.checked_add(len)?;
+        if end > MM.mmap_next {
+            MM.mmap_next = end;
+        }
+        Some(base)
+    }
+}
+
 /// Set the program break (end of heap) to `addr`.
 ///
 /// If `addr` is above the current break, allocates and maps new pages.
@@ -138,29 +220,46 @@ pub unsafe fn posix_brk(addr: u64) -> i32 {
             return -1;
         }
 
-        let old_page = (MM.heap_current + 4095) & !4095u64;
-        let new_page = (addr + 4095) & !4095u64;
+        let old_page = match MM.heap_current.checked_add(4095) {
+            Some(v) => v & !4095u64,
+            None => return -1,
+        };
+        let new_page = match addr.checked_add(4095) {
+            Some(v) => v & !4095u64,
+            None => return -1,
+        };
+        let max_heap_end = match MM
+            .heap_base
+            .checked_add((MM_MAX_PAGES_PER_REGION as u64) * 4096)
+        {
+            Some(v) => v,
+            None => return -1,
+        };
+        if new_page > max_heap_end {
+            return -1;
+        }
 
         if new_page > old_page {
             let mut va = old_page;
             while va < new_page {
                 let frame = alloc_frame();
                 if frame == u64::MAX {
+                    rollback_heap_growth(old_page, va);
+                    return -1;
+                }
+                let idx = ((va - MM.heap_base) / 4096) as usize;
+                if idx >= MM_MAX_PAGES_PER_REGION || MM.heap_frame_slots[idx] != 0 {
+                    invoke::cnode_delete(MM.cspace, frame);
+                    rollback_heap_growth(old_page, va);
                     return -1;
                 }
                 let err = map_page(frame, va, PROT_READ | PROT_WRITE);
                 if err != 0 {
+                    invoke::cnode_delete(MM.cspace, frame);
+                    rollback_heap_growth(old_page, va);
                     return -1;
                 }
-                let idx = ((va - MM.heap_base) / 4096) as usize;
-                if idx < MM_MAX_PAGES_PER_REGION {
-                    MM.heap_frame_slots[idx] = frame;
-                }
-                // Zero the page
-                let p = va as *mut u8;
-                for i in 0..4096usize {
-                    core::ptr::write_volatile(p.add(i), 0);
-                }
+                MM.heap_frame_slots[idx] = frame;
                 va += 4096;
             }
         } else if new_page < old_page {
@@ -224,8 +323,25 @@ unsafe fn posix_mmap_fd(
     offset: i64,
 ) -> *mut u8 {
     unsafe {
-        let len = (length + 4095) & !4095u64;
+        if offset < 0 {
+            return usize::MAX as *mut u8;
+        }
+
+        let len = match length.checked_add(4095) {
+            Some(v) => v & !4095u64,
+            None => return usize::MAX as *mut u8,
+        };
         let num_pages = len / 4096;
+        if num_pages > u16::MAX as u64 {
+            return usize::MAX as *mut u8;
+        }
+
+        // Region tracking must be available before mapping so failure paths can
+        // clean up deterministically.
+        let region = alloc_region();
+        if region.is_null() {
+            return usize::MAX as *mut u8;
+        }
 
         // Allocate a free cap slot to receive the transferred capability
         let recv_slot = match crate::slot_alloc::slot_alloc() {
@@ -259,6 +375,8 @@ unsafe fn posix_mmap_fd(
             &raw mut reply,
         );
         if err != 0 || reply.label != SALTY_OK {
+            // If transfer happened before error, drop any received cap.
+            invoke::cnode_delete(MM.cspace, recv_slot);
             return usize::MAX as *mut u8;
         }
 
@@ -266,8 +384,14 @@ unsafe fn posix_mmap_fd(
         // Cap was transferred into recv_slot
 
         // Pick a mapping base address
-        let base = MM.mmap_next;
-        MM.mmap_next = base + len;
+        let old_mmap_next = MM.mmap_next;
+        let base = match reserve_mmap_base(len) {
+            Some(v) => v,
+            None => {
+                invoke::cnode_delete(MM.cspace, recv_slot);
+                return usize::MAX as *mut u8;
+            }
+        };
 
         // Map using batch device range syscall with WC flags
         let map_flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER | VSPACE_FLAG_WRITE_THROUGH;
@@ -280,20 +404,23 @@ unsafe fn posix_mmap_fd(
             map_flags,
         );
         if map_err != 0 || mapped != num_pages {
+            for i in 0..mapped {
+                invoke::vspace_unmap(MM.vspace, base + i * 4096);
+            }
+            invoke::cnode_delete(MM.cspace, recv_slot);
+            MM.mmap_next = old_mmap_next;
             return usize::MAX as *mut u8;
         }
 
         // Track in region table
-        let region = alloc_region();
-        if !region.is_null() {
-            (*region).base = base;
-            (*region).length = len;
-            (*region).region_type = MM_REGION_MMAP;
-            (*region).prot = _prot as u8;
-            (*region).num_pages = num_pages as u16;
-            // Store the device untyped cap slot for cleanup
-            (*region).frame_slots[0] = recv_slot;
-        }
+        *region = PosixMmRegion::zeroed();
+        (*region).base = base;
+        (*region).length = len;
+        (*region).region_type = MM_REGION_MMAP;
+        (*region).prot = _prot as u8;
+        (*region).num_pages = num_pages as u16;
+        // Store the device untyped cap slot for cleanup
+        (*region).frame_slots[0] = recv_slot;
 
         base as *mut u8
     }
@@ -330,7 +457,10 @@ pub unsafe fn posix_mmap(
             return usize::MAX as *mut u8; // MAP_FAILED
         }
 
-        let len = (length + 4095) & !4095u64;
+        let len = match length.checked_add(4095) {
+            Some(v) => v & !4095u64,
+            None => return usize::MAX as *mut u8,
+        };
         let num_pages = (len / 4096) as usize;
 
         if num_pages > MM_MAX_PAGES_PER_REGION {
@@ -342,6 +472,8 @@ pub unsafe fn posix_mmap(
             return usize::MAX as *mut u8;
         }
 
+        let mut restore_mmap_next_on_fail = false;
+        let old_mmap_next = MM.mmap_next;
         let base = if (flags & MAP_FIXED) != 0 && !addr.is_null() {
             let fixed_base = (addr as u64) & !4095u64;
             let existing = find_region(fixed_base);
@@ -350,11 +482,16 @@ pub unsafe fn posix_mmap(
             }
             fixed_base
         } else {
-            let b = MM.mmap_next;
-            MM.mmap_next = b + len;
-            b
+            match reserve_mmap_base(len) {
+                Some(v) => {
+                    restore_mmap_next_on_fail = true;
+                    v
+                }
+                None => return usize::MAX as *mut u8,
+            }
         };
 
+        *region = PosixMmRegion::zeroed();
         (*region).base = base;
         (*region).length = len;
         (*region).region_type = MM_REGION_MMAP;
@@ -364,27 +501,25 @@ pub unsafe fn posix_mmap(
         for i in 0..num_pages {
             let frame = alloc_frame();
             if frame == u64::MAX {
-                for j in 0..i {
-                    invoke::vspace_unmap(MM.vspace, base + j as u64 * 4096);
-                }
+                rollback_mmap_pages(region, i);
                 (*region).region_type = MM_REGION_FREE;
+                if restore_mmap_next_on_fail {
+                    MM.mmap_next = old_mmap_next;
+                }
                 return usize::MAX as *mut u8;
             }
             (*region).frame_slots[i] = frame;
 
             let err = map_page(frame, base + i as u64 * 4096, prot);
             if err != 0 {
-                for j in 0..i {
-                    invoke::vspace_unmap(MM.vspace, base + j as u64 * 4096);
-                }
+                invoke::cnode_delete(MM.cspace, frame);
+                (*region).frame_slots[i] = 0;
+                rollback_mmap_pages(region, i);
                 (*region).region_type = MM_REGION_FREE;
+                if restore_mmap_next_on_fail {
+                    MM.mmap_next = old_mmap_next;
+                }
                 return usize::MAX as *mut u8;
-            }
-
-            // Zero the page
-            let p = (base + i as u64 * 4096) as *mut u8;
-            for k in 0..4096usize {
-                core::ptr::write_volatile(p.add(k), 0);
             }
         }
 
@@ -411,15 +546,29 @@ pub unsafe fn posix_munmap(addr: *mut u8, _length: u64) -> i32 {
             return -1;
         }
 
-        for i in 0..(*region).num_pages as usize {
+        let pages = (*region).num_pages as usize;
+        for i in 0..pages {
             invoke::vspace_unmap(MM.vspace, (*region).base + i as u64 * 4096);
-            if (*region).frame_slots[i] != 0 {
-                invoke::cnode_delete(MM.cspace, (*region).frame_slots[i]);
-                (*region).frame_slots[i] = 0;
+        }
+
+        if pages > MM_MAX_PAGES_PER_REGION {
+            // Device-backed mmap can span more than frame_slots[] capacity.
+            // For that case we store only the transferred device cap in slot 0.
+            if (*region).frame_slots[0] != 0 {
+                invoke::cnode_delete(MM.cspace, (*region).frame_slots[0]);
+                (*region).frame_slots[0] = 0;
+            }
+        } else {
+            for i in 0..pages {
+                if (*region).frame_slots[i] != 0 {
+                    invoke::cnode_delete(MM.cspace, (*region).frame_slots[i]);
+                    (*region).frame_slots[i] = 0;
+                }
             }
         }
 
         (*region).region_type = MM_REGION_FREE;
+        (*region).num_pages = 0;
         0
     }
 }
@@ -437,6 +586,9 @@ pub unsafe fn posix_mprotect(addr: *mut u8, _length: u64, prot: i32) -> i32 {
         let base = addr as u64;
         let region = find_region(base);
         if region.is_null() || (*region).region_type != MM_REGION_MMAP {
+            return -1;
+        }
+        if (*region).num_pages as usize > MM_MAX_PAGES_PER_REGION {
             return -1;
         }
 

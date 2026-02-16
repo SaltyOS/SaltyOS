@@ -11,7 +11,6 @@ use crate::ipc::{Endpoint, Message, Notification};
 use crate::mm::{save_irq_disable, restore_irq, SCHED_IPC_LOCK, CAP_LOCK};
 use crate::mm::vspace::{PageFlags, VSpace, VSpaceError};
 use crate::sched::thread::{BlockedReason, SchedContext, Tcb, ThreadState};
-
 /// System call numbers
 #[repr(u64)]
 pub enum Syscall {
@@ -2559,12 +2558,12 @@ fn syscall_vspace_map_pt(
 ///
 /// Args:
 /// - start_vaddr: Virtual address to start scanning from
-/// - max_entries: Maximum number of entries to return (capped at 6)
+/// - max_entries: Maximum number of entries to return
 ///
 /// Returns via IPC buffer:
 ///   msg[0] = count (number of entries)
 ///   msg[1] = next_vaddr (0 if done)
-///   msg[2..] = (vaddr, phys, flags) tuples, 3 u64s each
+///   words[30..] = (vaddr, phys, flags) tuples, 3 u64s each
 fn syscall_vspace_walk(
     cap: &Capability,
     start_vaddr: u64,
@@ -2575,8 +2574,19 @@ fn syscall_vspace_walk(
     }
 
     unsafe {
+        const EXT_ENTRY_BASE_WORD: usize = 30;
+        const WALK_MAGIC: u64 = 0x5357_4c4b_434f_4d50; // "SWLKCOMP"
+
         let vspace = &*(cap.object as *const VSpace);
-        let max = if max_entries > 6 { 6 } else { max_entries as usize };
+        let ipc_words_total =
+            core::mem::size_of::<crate::ipc::IpcBuffer>() / core::mem::size_of::<u64>();
+        let ext_capacity = (ipc_words_total - EXT_ENTRY_BASE_WORD) / 3;
+        let requested = if max_entries > usize::MAX as u64 {
+            usize::MAX
+        } else {
+            max_entries as usize
+        };
+        let max = core::cmp::min(requested, ext_capacity);
         let (count, next_vaddr, entries) = vspace.walk_pages(start_vaddr, max);
 
         // Write results to caller's IPC buffer
@@ -2590,13 +2600,17 @@ fn syscall_vspace_walk(
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
         let ipc_buf = buf as *mut crate::ipc::IpcBuffer;
+        let ipc_words = ipc_buf as *mut u64;
 
         (*ipc_buf).msg[0] = count as u64;
         (*ipc_buf).msg[1] = next_vaddr;
+        // Mark that extended tuple area is valid for this reply.
+        *ipc_words.add(ipc_words_total - 1) = WALK_MAGIC;
         for i in 0..count {
-            (*ipc_buf).msg[2 + i * 3] = entries[i].0;     // vaddr
-            (*ipc_buf).msg[2 + i * 3 + 1] = entries[i].1; // phys
-            (*ipc_buf).msg[2 + i * 3 + 2] = entries[i].2; // flags
+            let out = EXT_ENTRY_BASE_WORD + i * 3;
+            *ipc_words.add(out) = entries[i].0;         // vaddr
+            *ipc_words.add(out + 1) = entries[i].1;     // phys
+            *ipc_words.add(out + 2) = entries[i].2;     // flags
         }
     }
 
@@ -2846,22 +2860,15 @@ fn syscall_vspace_map_device_range(
 
         let vspace = &mut *(cap.object as *mut VSpace);
         let base_phys = dev_ut.phys_addr;
+        let phys_start = match base_phys.checked_add(offset_start) {
+            Some(v) => v,
+            None => return SyscallResult::err(SyscallError::OutOfRange),
+        };
 
-        for i in 0..count {
-            let phys = match base_phys.checked_add(offset_start + i * 0x1000) {
-                Some(v) => v,
-                None => return SyscallResult { error: 0, value: i },
-            };
-            let vaddr = match vaddr_start.checked_add(i * 0x1000) {
-                Some(v) => v,
-                None => return SyscallResult { error: 0, value: i },
-            };
-            if let Err(_) = vspace.map(vaddr, phys, flags) {
-                return SyscallResult { error: 0, value: i };
-            }
+        match vspace.map_range_partial(vaddr_start, phys_start, count as usize, flags) {
+            Ok(mapped) => SyscallResult::ok(mapped as u64),
+            Err(e) => SyscallResult::err(syscall_error_from_vspace_error(e)),
         }
-
-        SyscallResult::ok(count)
     }
 }
 

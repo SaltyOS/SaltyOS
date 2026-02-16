@@ -243,44 +243,148 @@ impl FrameAllocator {
         }
     }
 
+    #[inline]
+    fn bit_range_mask(start_bit: usize, end_bit: usize) -> u64 {
+        debug_assert!(start_bit <= end_bit);
+        debug_assert!(end_bit <= 64);
+        if start_bit == end_bit {
+            return 0;
+        }
+        let high = if end_bit == 64 {
+            u64::MAX
+        } else {
+            (1u64 << end_bit) - 1
+        };
+        let low = if start_bit == 0 {
+            0
+        } else {
+            (1u64 << start_bit) - 1
+        };
+        high & !low
+    }
+
+    #[inline]
+    fn mark_frame_allocated(&mut self, frame: usize) {
+        let idx = frame / 64;
+        let bit = frame % 64;
+        self.bitmap[idx] &= !(1u64 << bit);
+        self.map_refs[frame] = 0;
+        self.obj_refs[frame] = 0;
+        self.reclaimable[frame] = 1;
+        self.free -= 1;
+        self.next_free = frame + 1;
+    }
+
+    fn find_free_frame_in_range(&self, start: usize, end: usize) -> Option<usize> {
+        if start >= end {
+            return None;
+        }
+        let mut word_idx = start / 64;
+        while word_idx < self.bitmap.len() {
+            let word_base = word_idx * 64;
+            if word_base >= end {
+                break;
+            }
+
+            let start_bit = if word_idx == start / 64 { start % 64 } else { 0 };
+            let end_bit = if word_base + 64 > end {
+                end - word_base
+            } else {
+                64
+            };
+            let mask = Self::bit_range_mask(start_bit, end_bit);
+            let free_bits = self.bitmap[word_idx] & mask;
+            if free_bits != 0 {
+                let bit = free_bits.trailing_zeros() as usize;
+                return Some(word_base + bit);
+            }
+            word_idx += 1;
+        }
+        None
+    }
+
+    fn find_contiguous_run_in_range(&self, start: usize, end: usize, count: usize) -> Option<usize> {
+        if start >= end || count == 0 {
+            return None;
+        }
+
+        let mut run_start = 0usize;
+        let mut run_len = 0usize;
+        let mut word_idx = start / 64;
+
+        while word_idx < self.bitmap.len() {
+            let word_base = word_idx * 64;
+            if word_base >= end {
+                break;
+            }
+
+            let start_bit = if word_idx == start / 64 { start % 64 } else { 0 };
+            let end_bit = if word_base + 64 > end {
+                end - word_base
+            } else {
+                64
+            };
+            let valid_bits = end_bit.saturating_sub(start_bit);
+            if valid_bits == 0 {
+                word_idx += 1;
+                continue;
+            }
+
+            let mask = Self::bit_range_mask(start_bit, end_bit);
+            let mut bits = (self.bitmap[word_idx] & mask) >> start_bit;
+            if bits == 0 {
+                run_len = 0;
+                word_idx += 1;
+                continue;
+            }
+
+            let mut pos = 0usize;
+            while pos < valid_bits {
+                if bits == 0 {
+                    run_len = 0;
+                    break;
+                }
+
+                let zeros = bits.trailing_zeros() as usize;
+                if zeros > 0 {
+                    run_len = 0;
+                    pos += zeros;
+                    bits >>= zeros;
+                    continue;
+                }
+
+                let ones = bits.trailing_ones() as usize;
+                let take = core::cmp::min(ones, valid_bits - pos);
+                if run_len == 0 {
+                    run_start = word_base + start_bit + pos;
+                }
+                run_len += take;
+                if run_len >= count {
+                    return Some(run_start);
+                }
+                pos += take;
+                bits >>= take;
+            }
+
+            word_idx += 1;
+        }
+
+        None
+    }
+
     pub fn alloc(&mut self) -> Option<PhysAddr> {
         let split = self.next_free.min(self.total);
 
         // First pass: [next_free, total)
-        for i in split..self.total {
-            let idx = i / 64;
-            let bit = i % 64;
-
-            let word = self.bitmap[idx];
-            if word & (1u64 << bit) != 0 {
-                // Found free frame, mark as used
-                self.bitmap[idx] &= !(1u64 << bit);
-                self.map_refs[i] = 0;
-                self.obj_refs[i] = 0;
-                self.reclaimable[i] = 1;
-
-                self.free -= 1;
-                self.next_free = i + 1;
-                return Some((i * PAGE_SIZE) as PhysAddr);
-            }
+        if let Some(frame) = self.find_free_frame_in_range(split, self.total) {
+            self.mark_frame_allocated(frame);
+            return Some((frame * PAGE_SIZE) as PhysAddr);
         }
 
         // Second pass (wrap-around): [0, next_free)
-        for i in 0..split {
-            let idx = i / 64;
-            let bit = i % 64;
-
-            let word = self.bitmap[idx];
-            if word & (1u64 << bit) != 0 {
-                self.bitmap[idx] &= !(1u64 << bit);
-                self.map_refs[i] = 0;
-                self.obj_refs[i] = 0;
-                self.reclaimable[i] = 1;
-
-                self.free -= 1;
-                self.next_free = i + 1;
-                return Some((i * PAGE_SIZE) as PhysAddr);
-            }
+        if let Some(frame) = self.find_free_frame_in_range(0, split) {
+            self.mark_frame_allocated(frame);
+            return Some((frame * PAGE_SIZE) as PhysAddr);
         }
 
         None
@@ -315,78 +419,22 @@ impl FrameAllocator {
         }
 
         let split = self.next_free.min(self.total);
-        let mut run_start = split;
-        let mut run_len = 0usize;
+        let run_start = self
+            .find_contiguous_run_in_range(split, self.total, count)
+            .or_else(|| self.find_contiguous_run_in_range(0, split, count))?;
 
-        // First pass: [next_free, total)
-        let mut i = split;
-        while i < self.total {
-            let idx = i / 64;
-            let bit = i % 64;
-
-            if self.bitmap[idx] & (1u64 << bit) != 0 {
-                // Frame is free
-                if run_len == 0 {
-                    run_start = i;
-                }
-                run_len += 1;
-                if run_len == count {
-                    // Found a contiguous run, mark all as used
-                    for j in run_start..(run_start + count) {
-                        let jidx = j / 64;
-                        let jbit = j % 64;
-                        self.bitmap[jidx] &= !(1u64 << jbit);
-                        self.map_refs[j] = 0;
-                        self.obj_refs[j] = 0;
-                        self.reclaimable[j] = 1;
-                    }
-                    self.free -= count;
-                    self.next_free = run_start + count;
-                    return Some((run_start * PAGE_SIZE) as PhysAddr);
-                }
-            } else {
-                // Frame is used, reset run
-                run_len = 0;
-            }
-            i += 1;
+        // Found a contiguous run, mark all as used
+        for j in run_start..(run_start + count) {
+            let jidx = j / 64;
+            let jbit = j % 64;
+            self.bitmap[jidx] &= !(1u64 << jbit);
+            self.map_refs[j] = 0;
+            self.obj_refs[j] = 0;
+            self.reclaimable[j] = 1;
         }
-
-        // Second pass (wrap-around): [0, next_free)
-        run_start = 0;
-        run_len = 0;
-        i = 0;
-        while i < split {
-            let idx = i / 64;
-            let bit = i % 64;
-
-            if self.bitmap[idx] & (1u64 << bit) != 0 {
-                // Frame is free
-                if run_len == 0 {
-                    run_start = i;
-                }
-                run_len += 1;
-                if run_len == count {
-                    // Found a contiguous run, mark all as used
-                    for j in run_start..(run_start + count) {
-                        let jidx = j / 64;
-                        let jbit = j % 64;
-                        self.bitmap[jidx] &= !(1u64 << jbit);
-                        self.map_refs[j] = 0;
-                        self.obj_refs[j] = 0;
-                        self.reclaimable[j] = 1;
-                    }
-                    self.free -= count;
-                    self.next_free = run_start + count;
-                    return Some((run_start * PAGE_SIZE) as PhysAddr);
-                }
-            } else {
-                // Frame is used, reset run
-                run_len = 0;
-            }
-            i += 1;
-        }
-
-        None
+        self.free -= count;
+        self.next_free = run_start + count;
+        Some((run_start * PAGE_SIZE) as PhysAddr)
     }
 
     pub fn free_count(&self) -> usize {
