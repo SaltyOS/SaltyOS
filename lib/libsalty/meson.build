@@ -24,6 +24,12 @@ if get_option('arch') == 'x86_64'
     '-C', 'target-feature=+sse,+sse2,-soft-float']
 endif
 
+# fork.S compile-time feature flags
+fork_asm_args = []
+if get_option('arch') == 'x86_64'
+  fork_asm_args += ['-DSALTY_X86_SIMD=1']
+endif
+
 # Step 1: Rust -> .o + .rmeta
 libsalty_rust = custom_target('libsalty_rust',
   input: files('src/lib.rs'),
@@ -47,7 +53,7 @@ libsalty_rmeta = libsalty_rust[1]
 fork_obj = custom_target('fork_asm',
   input: files('fork.S'),
   output: 'fork.o',
-  command: [cc_cmd, '-c', '@INPUT@', '-o', '@OUTPUT@'],
+  command: [cc_cmd, fork_asm_args, '-c', '@INPUT@', '-o', '@OUTPUT@'],
   build_by_default: true,
 )
 

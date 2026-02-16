@@ -380,6 +380,8 @@ static mut FORK_STACK_CHECK_BUDGET: u32 = 8;
 ///
 /// `saved_rsp` points to a stack frame containing callee-saved registers
 /// (r15, r14, r13, r12, rbx, rbp, return RIP) saved by the assembly stub.
+/// When userland SSE2 is enabled, a 256-byte XMM0-15 save block lives below
+/// `saved_rsp` and is restored by the parent return path and `fork_child_entry`.
 /// These are packed into an IPC message to procmgr so it can configure the
 /// child thread's register state. Returns the child PID (>0) in the parent,
 /// or -1 on failure. The child resumes at `child_entry` (never returns here).

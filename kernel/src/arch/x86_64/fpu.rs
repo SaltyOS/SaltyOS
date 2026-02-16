@@ -81,6 +81,20 @@ unsafe fn configure_fpu_hardware() {
 
         // Initialize x87 FPU to known state
         core::arch::asm!("fninit", options(nostack));
+
+        // Verify our static XSAVE buffer is large enough for the configured XCR0.
+        // Currently XCR0=0x3 (x87+SSE) needs ≤576B and our buffer is 832B, but if
+        // someone adds AVX-512 bits to XCR0 in the future, this catches the overflow
+        // before it silently corrupts adjacent TCB fields.
+        let needed = super::cpuid::xsave_area_size();
+        if needed > 832 {
+            let s = crate::SerialGuard::acquire();
+            s.puts("*** FATAL: XSAVE area size (");
+            s.dec(needed as u64);
+            s.puts(") exceeds TCB buffer (832) ***\n");
+            drop(s);
+            loop { super::halt(); }
+        }
     }
 }
 

@@ -2132,18 +2132,22 @@ fn syscall_tcb_copy_fpu(
         let dest_tcb = dest_cap.object as *mut Tcb;
         let src_tcb = src_cap.object as *mut Tcb;
 
-        // If source thread is the current FPU owner on this CPU, flush its
-        // state from hardware registers into the TCB before copying.
-        // The source is typically blocked in IPC (during fork), but its state
-        // may still be live in hardware if it was the last FPU user on this CPU.
-        crate::arch::fpu::flush_if_owner(src_tcb as *mut u8);
+        // Only copy FPU state if the source thread has actually used FPU.
+        // Threads that never touched FPU instructions have fpu_initialized=false,
+        // so we skip the 832-byte memcpy and hardware flush entirely.
+        if (*src_tcb).fpu_initialized {
+            // If source thread is the current FPU owner on this CPU, flush its
+            // state from hardware registers into the TCB before copying.
+            // The source is typically blocked in IPC (during fork), but its state
+            // may still be live in hardware if it was the last FPU user on this CPU.
+            crate::arch::fpu::flush_if_owner(src_tcb as *mut u8);
 
-        // Copy FPU state
-        core::ptr::copy_nonoverlapping(
-            (*src_tcb).fpu_state.data.as_ptr(),
-            (*dest_tcb).fpu_state.data.as_mut_ptr(),
-            832,
-        );
+            core::ptr::copy_nonoverlapping(
+                (*src_tcb).fpu_state.data.as_ptr(),
+                (*dest_tcb).fpu_state.data.as_mut_ptr(),
+                832,
+            );
+        }
         (*dest_tcb).fpu_initialized = (*src_tcb).fpu_initialized;
     }
 
