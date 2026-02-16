@@ -187,10 +187,12 @@ unsafe fn init_mm_from_auxv(stack_ptr: *const u64) {
             expand_ep = rtld_expand_ep;
         }
 
+        let cspace_ntfn = *(&raw const salty::__salty_cspace_ntfn);
+
         // Initialize per-process slot allocator only from dynamic slot-pool info.
         // No legacy fallback to __salty_next_frame_slot.
         if slot_base != 0 {
-            salty::slot_alloc::slot_alloc_init(slot_base, slot_count, expand_ep);
+            salty::slot_alloc::slot_alloc_init(slot_base, slot_count, expand_ep, cspace_ntfn);
         }
 
         // Heap starts after scratch area

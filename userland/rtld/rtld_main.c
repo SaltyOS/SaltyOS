@@ -17,6 +17,7 @@ uint64_t __salty_next_frame_slot = 0;
 uint64_t __salty_slot_base = 0;
 uint64_t __salty_slot_count = 0;
 uint64_t __salty_expand_ep = 0;
+uint64_t __salty_cspace_ntfn = 0;
 
 void __attribute__((naked, noreturn)) _start(void) {
     __asm__ volatile(
@@ -100,6 +101,7 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         case AT_SALTY_SLOT_BASE:  g_rtld.slot_base = p[1]; break;
         case AT_SALTY_SLOT_COUNT: g_rtld.slot_count = p[1]; break;
         case AT_SALTY_EXPAND_EP:  g_rtld.expand_ep = p[1]; break;
+        case AT_SALTY_CSPACE_NTFN: g_rtld.cspace_ntfn = p[1]; break;
         }
     }
 
@@ -315,6 +317,14 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         uint64_t ep_addr = resolve_symbol_addr(&g_rtld, "__salty_expand_ep");
         if (ep_addr != 0)
             *(volatile uint64_t *)ep_addr = g_rtld.expand_ep;
+    }
+
+    /* 7d. Export CSpace expansion notification cap for slot_alloc. */
+    __salty_cspace_ntfn = g_rtld.cspace_ntfn;
+    {
+        uint64_t ntfn_addr = resolve_symbol_addr(&g_rtld, "__salty_cspace_ntfn");
+        if (ntfn_addr != 0)
+            *(volatile uint64_t *)ntfn_addr = g_rtld.cspace_ntfn;
     }
 
     /* 8. Jump to executable entry point.

@@ -54,9 +54,9 @@ pub enum SlotResult {
 enum ExpandState {
     /// No expansion in progress.
     Idle,
-    /// NBSend sent to procmgr; waiting for expansion to complete.
+    /// Signal sent to procmgr; probing for sub-CNode at deterministic slot.
     Requested,
-    /// Expansion permanently failed (segment table full or procmgr error).
+    /// Expansion permanently failed (segment table full or max expansions).
     Failed,
 }
 
@@ -70,11 +70,15 @@ struct SlotAllocState {
     procmgr_ep: Cap,
     /// Bound notification cap for UT expansion signaling.
     expand_ntfn: Cap,
+    /// Notification cap for CSpace expansion signaling.
+    cspace_ntfn: Cap,
     expand_state: ExpandState,
     /// Root CNode size_bits (queried from cnode_get_info).
     root_bits: u8,
     /// Total CNode depth after expansion (root_bits + sub_bits), 0 if not expanded.
     expanded_depth: u8,
+    /// Number of completed CSpace expansions (probed sub-CNodes).
+    cspace_expand_count: usize,
 }
 
 static mut SLOT_ALLOC: SlotAllocState = SlotAllocState {
@@ -84,9 +88,11 @@ static mut SLOT_ALLOC: SlotAllocState = SlotAllocState {
     initialized: false,
     procmgr_ep: 0,
     expand_ntfn: 0,
+    cspace_ntfn: 0,
     expand_state: ExpandState::Idle,
     root_bits: 0,
     expanded_depth: 0,
+    cspace_expand_count: 0,
 };
 
 // Dynamic untyped expansion state (Signal-based)
@@ -106,11 +112,12 @@ static mut EXTRA_UT_SKIP_MASK: u16 = 0;
 /// `base==0` means "not provided".
 /// `expand_ep` is the notification cap for UT expansion signaling
 /// (from AT_SALTY_EXPAND_EP auxv), or 0 if not available.
-/// CSpace expansion always uses `CAP_PROCMGR_EP` directly.
+/// `cspace_ntfn` is the notification cap for CSpace expansion signaling
+/// (from AT_SALTY_CSPACE_NTFN auxv), or 0 if not available.
 ///
 /// # Safety
 /// Must be called exactly once during process initialization.
-pub unsafe fn slot_alloc_init(base: Cap, count: u64, expand_ep: u64) {
+pub unsafe fn slot_alloc_init(base: Cap, count: u64, expand_ep: u64, cspace_ntfn: u64) {
     unsafe {
         let state = &mut *(&raw mut SLOT_ALLOC);
         state.segments[0] = Segment { base, count, next: 0 };
@@ -119,9 +126,11 @@ pub unsafe fn slot_alloc_init(base: Cap, count: u64, expand_ep: u64) {
         state.initialized = base != 0;
         state.procmgr_ep = CAP_PROCMGR_EP;
         state.expand_ntfn = expand_ep;
+        state.cspace_ntfn = cspace_ntfn;
         state.expand_state = ExpandState::Idle;
         state.root_bits = 0;
         state.expanded_depth = 0;
+        state.cspace_expand_count = 0;
         *(&raw mut UT_EXPAND_REQUESTED) = false;
         *(&raw mut EXTRA_UT_SLOTS) = [0; MAX_EXTRA_UT];
         *(&raw mut EXTRA_UT_COUNT) = 0;
@@ -204,77 +213,89 @@ pub fn slot_alloc_async() -> SlotResult {
             state.active_seg += 1;
         }
 
-        // All segments exhausted — enter CSpace expansion protocol
-        // CSpace expansion always uses CAP_PROCMGR_EP directly
-        let ep = CAP_PROCMGR_EP;
+        // All segments exhausted — enter CSpace expansion protocol.
+        // Uses Signal+probe: signal the procmgr's bound notification, then
+        // probe the deterministic root CNode slot to detect when the sub-CNode
+        // has been placed there by the procmgr.
+        let ntfn = state.cspace_ntfn;
 
         match state.expand_state {
             ExpandState::Idle => {
-                // Send NBSend (fire-and-forget) to request async expansion
-                send_expand_nbsend(ep);
+                if ntfn == 0 || state.cspace_expand_count >= MAX_CSPACE_EXPANSIONS {
+                    // No cspace ntfn or max expansions reached — fall back to
+                    // blocking expansion via procmgr EP if available.
+                    return try_blocking_cspace_expand(state);
+                }
+                // Ensure root_bits is known for depth-aware probing
+                ensure_root_bits(state);
+
+                // Signal procmgr's bound notification for CSpace expansion
+                syscall(SYS_SIGNAL, ntfn, 0, 0, 0, 0, 0);
                 state.expand_state = ExpandState::Requested;
                 SlotResult::WouldBlock
             }
             ExpandState::Requested => {
-                // Re-send NBSend (idempotent, in case previous was dropped)
-                send_expand_nbsend(ep);
+                // Probe: try copying a known cap into the first slot of the
+                // expected sub-CNode. If the sub-CNode exists, the copy
+                // succeeds. We then delete the probe cap and register the
+                // new segment.
+                let probe_root_slot = CSPACE_EXPAND_BASE + state.cspace_expand_count as u64;
+                let expanded_depth = state.root_bits + SLOT_EXPAND_BITS_DEFAULT as u8;
+                let probe_addr = probe_root_slot << SLOT_EXPAND_BITS_DEFAULT;
 
-                // Try to collect result via blocking Call
-                match collect_expand_result(ep) {
-                    CollectResult::Ok(base, count) => {
-                        if state.seg_count >= MAX_SEGMENTS {
-                            state.expand_state = ExpandState::Failed;
-                            return SlotResult::Exhausted;
-                        }
-                        // Append new segment
-                        let si = state.seg_count;
-                        state.segments[si] = Segment { base, count, next: 0 };
-                        state.seg_count += 1;
-                        state.active_seg = si;
-                        state.expand_state = ExpandState::Idle;
-                        *(&raw mut UNTYPED_SCAN_END_CACHE) = 0;
+                let err = invoke::cnode_copy_depth(
+                    CAP_SELF_CSPACE, CAP_SELF_TCB,
+                    CAP_SELF_CSPACE, probe_addr,
+                    CAP_RIGHTS_ALL,
+                    0, expanded_depth,
+                );
+                if err == 0 {
+                    // Sub-CNode exists — clean up probe cap
+                    invoke::cnode_delete_depth(
+                        CAP_SELF_CSPACE, probe_addr, expanded_depth,
+                    );
 
-                        // Track expansion depth for depth-aware invocations
-                        if state.root_bits == 0 {
-                            // Query root CNode size_bits
-                            let info = invoke::cnode_get_info(CAP_SELF_CSPACE);
-                            if info.error == 0 {
-                                let ctx = &raw const crate::__salty_ipc_ctx;
-                                if !(*ctx).ipc_buffer.is_null() {
-                                    state.root_bits = (*(*ctx).ipc_buffer).msg[2] as u8;
-                                }
-                            }
-                        }
-                        if state.root_bits > 0 {
-                            state.expanded_depth =
-                                state.root_bits + SLOT_EXPAND_BITS_DEFAULT as u8;
-                        }
+                    let base = probe_addr;
+                    let count = 1u64 << SLOT_EXPAND_BITS_DEFAULT;
 
-                        {
-                            let mut lb = serial::LineBuf::new();
-                            lb.str(b"[SLOT] expand: collected base=");
-                            lb.hex(base);
-                            lb.str(b" count=");
-                            lb.hex(count);
-                            lb.str(b" (seg ");
-                            lb.hex(si as u64);
-                            lb.str(b")\n");
-                            lb.flush();
-                        }
-
-                        // Allocate from the new segment
-                        let seg = &mut state.segments[si];
-                        let slot = seg.base + seg.next;
-                        seg.next += 1;
-                        SlotResult::Ok(slot)
-                    }
-                    CollectResult::Pending => {
-                        SlotResult::WouldBlock
-                    }
-                    CollectResult::Error => {
+                    if state.seg_count >= MAX_SEGMENTS {
                         state.expand_state = ExpandState::Failed;
-                        SlotResult::Exhausted
+                        return SlotResult::Exhausted;
                     }
+
+                    let si = state.seg_count;
+                    state.segments[si] = Segment { base, count, next: 0 };
+                    state.seg_count += 1;
+                    state.active_seg = si;
+                    state.cspace_expand_count += 1;
+                    state.expand_state = ExpandState::Idle;
+                    *(&raw mut UNTYPED_SCAN_END_CACHE) = 0;
+
+                    if state.root_bits > 0 {
+                        state.expanded_depth = expanded_depth;
+                    }
+
+                    {
+                        let mut lb = serial::LineBuf::new();
+                        lb.str(b"[SLOT] cspace-expand: probed base=");
+                        lb.hex(base);
+                        lb.str(b" count=");
+                        lb.hex(count);
+                        lb.str(b" (seg ");
+                        lb.hex(si as u64);
+                        lb.str(b")\n");
+                        lb.flush();
+                    }
+
+                    // Allocate from the new segment
+                    let seg = &mut state.segments[si];
+                    let slot = seg.base + seg.next;
+                    seg.next += 1;
+                    SlotResult::Ok(slot)
+                } else {
+                    // Not ready yet — re-signal (idempotent: OR same badge bit)
+                    syscall(SYS_SIGNAL, ntfn, 0, 0, 0, 0, 0);
+                    SlotResult::WouldBlock
                 }
             }
             ExpandState::Failed => {
@@ -655,60 +676,63 @@ fn untyped_scan_end() -> Cap {
 // CSpace expansion protocol helpers
 // ===========================================================================
 
-/// Result of attempting to collect a CSpace expansion result from the procmgr.
-enum CollectResult {
-    Ok(Cap, u64),
-    Pending,
-    Error,
-}
-
-/// Send NBSend(PM_EXPAND_CSPACE_ASYNC, bits=10) to the procmgr EP.
-/// NBSend is fire-and-forget; if procmgr is busy, it's silently dropped.
-fn send_expand_nbsend(ep: Cap) {
-    unsafe {
-        let mut msg = crate::types::SaltyMsg::zeroed();
-        msg.label = POSIX_PM_EXPAND_CSPACE_ASYNC;
-        msg.length = 1;
-        msg.regs[0] = SLOT_EXPAND_BITS_DEFAULT;
-
-        let _ = ipc::nbsend_ctx(
-            &raw mut crate::__salty_ipc_ctx,
-            ep,
-            &raw const msg,
-        );
+/// Ensure root_bits is populated (lazy query on first expansion).
+fn ensure_root_bits(state: &mut SlotAllocState) {
+    if state.root_bits == 0 {
+        let info = invoke::cnode_get_info(CAP_SELF_CSPACE);
+        if info.error == 0 {
+            unsafe {
+                let ctx = &raw const crate::__salty_ipc_ctx;
+                if !(*ctx).ipc_buffer.is_null() {
+                    state.root_bits = (*(*ctx).ipc_buffer).msg[2] as u8;
+                }
+            }
+        }
     }
 }
 
-/// Call(PM_EXPAND_COLLECT) to collect expansion result.
-/// Returns Ok(base, count) on success, Pending if not ready, Error on failure.
-fn collect_expand_result(ep: Cap) -> CollectResult {
-    unsafe {
-        let mut msg = crate::types::SaltyMsg::zeroed();
-        let mut reply = crate::types::SaltyMsg::zeroed();
-        msg.label = POSIX_PM_EXPAND_COLLECT;
-        msg.length = 0;
-
-        let err = ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
-            ep,
-            &raw const msg,
-            &raw mut reply,
-        );
-        if err != 0 {
-            return CollectResult::Error;
-        }
-
-        if reply.label == SALTY_OK && reply.length >= 2 {
-            let base = reply.regs[0];
-            let count = reply.regs[1];
-            if base == 0 || count == 0 {
-                return CollectResult::Error;
+/// Fallback: try a synchronous blocking CSpace expansion via procmgr EP.
+/// Used when cspace_ntfn is unavailable or max async expansions are reached.
+fn try_blocking_cspace_expand(state: &mut SlotAllocState) -> SlotResult {
+    let ep = if state.procmgr_ep != 0 {
+        state.procmgr_ep
+    } else {
+        CAP_PROCMGR_EP
+    };
+    match request_expand_blocking(ep) {
+        Some((base, count)) => {
+            if state.seg_count >= MAX_SEGMENTS {
+                state.expand_state = ExpandState::Failed;
+                return SlotResult::Exhausted;
             }
-            CollectResult::Ok(base, count)
-        } else if reply.label == SALTY_PENDING {
-            CollectResult::Pending
-        } else {
-            CollectResult::Error
+            let si = state.seg_count;
+            state.segments[si] = Segment { base, count, next: 0 };
+            state.seg_count += 1;
+            state.active_seg = si;
+            state.expand_state = ExpandState::Idle;
+            unsafe { *(&raw mut UNTYPED_SCAN_END_CACHE) = 0; }
+            update_expansion_depth(state);
+
+            {
+                let mut lb = serial::LineBuf::new();
+                lb.str(b"[SLOT] cspace-expand(sync): base=");
+                lb.hex(base);
+                lb.str(b" count=");
+                lb.hex(count);
+                lb.str(b" (seg ");
+                lb.hex(si as u64);
+                lb.str(b")\n");
+                lb.flush();
+            }
+
+            let seg = &mut state.segments[si];
+            let slot = seg.base + seg.next;
+            seg.next += 1;
+            SlotResult::Ok(slot)
+        }
+        None => {
+            state.expand_state = ExpandState::Failed;
+            SlotResult::Exhausted
         }
     }
 }

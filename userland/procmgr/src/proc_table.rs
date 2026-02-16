@@ -91,6 +91,8 @@ pub struct Process {
     pub child_ut_cap: Cap,
     /// Number of untyped expansions granted to this process (max 8).
     pub ut_expand_count: u8,
+    /// Number of CSpace expansions granted to this process (max 8).
+    pub cspace_expand_count: u8,
     /// Whether this process has a pre-created service EP at CHILD_CAP_SERVICE_EP.
     pub has_service_ep: bool,
     /// Restart on exit (set by SPAWN_FLAG_RESPAWN).
@@ -132,6 +134,7 @@ impl Process {
             expand_result_count: 0,
             child_ut_cap: 0,
             ut_expand_count: 0,
+            cspace_expand_count: 0,
             has_service_ep: false,
             respawn: false,
             respawn_binary: [0; MAX_NAME_LEN],
@@ -249,6 +252,7 @@ pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
         p.expand_result_count = 0;
         p.child_ut_cap = 0;
         p.ut_expand_count = 0;
+        p.cspace_expand_count = 0;
         p.has_service_ep = false;
         p.respawn = false;
         for i in 0..MAX_NAME_LEN {

@@ -411,6 +411,7 @@ typedef struct {
 #define AT_SALTY_SLOT_BASE   0x1007
 #define AT_SALTY_SLOT_COUNT  0x1008
 #define AT_SALTY_EXPAND_EP   0x1009
+#define AT_SALTY_CSPACE_NTFN 0x100A
 
 /* ============================================================
  * CPIO parser (inline, self-contained)
@@ -565,6 +566,9 @@ struct rtld_state {
 
     /* Procmgr expansion EP slot (from AT_SALTY_EXPAND_EP) */
     uint64_t expand_ep;
+
+    /* CSpace expansion notification cap (from AT_SALTY_CSPACE_NTFN) */
+    uint64_t cspace_ntfn;
 };
 
 extern struct rtld_state g_rtld;

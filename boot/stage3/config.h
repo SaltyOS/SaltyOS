@@ -27,7 +27,7 @@
 #define CONFIG_FS_SALTYFS       0
 
 /* Maximum number of memory regions to track */
-#define CONFIG_MAX_MEM_REGIONS  128
+#define CONFIG_MAX_MEM_REGIONS  256
 
 /* Maximum kernel command line length */
 #define CONFIG_MAX_CMDLINE      256

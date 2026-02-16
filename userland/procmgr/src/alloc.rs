@@ -344,12 +344,7 @@ impl Allocator {
                 self.ut_hint = i;
                 return 0;
             }
-            if err != salty::SALTY_INVALID_CAPABILITY as i32
-                && err != salty::SALTY_INVALID_OPERATION as i32
-                && err != salty::SALTY_NOT_FOUND as i32
-            {
-                best_err = err;
-            }
+            best_err = err;
         }
 
         // Second pass: wrap around
@@ -367,12 +362,7 @@ impl Allocator {
                 self.ut_hint = i;
                 return 0;
             }
-            if err != salty::SALTY_INVALID_CAPABILITY as i32
-                && err != salty::SALTY_INVALID_OPERATION as i32
-                && err != salty::SALTY_NOT_FOUND as i32
-            {
-                best_err = err;
-            }
+            best_err = err;
         }
 
         {

@@ -111,6 +111,7 @@ const AT_SALTY_SHARED_LIB_BASE: u64 = 0x1006;
 const AT_SALTY_SLOT_BASE: u64 = 0x1007;
 const AT_SALTY_SLOT_COUNT: u64 = 0x1008;
 const AT_SALTY_EXPAND_EP: u64 = 0x1009;
+const AT_SALTY_CSPACE_NTFN: u64 = 0x100A;
 
 // ---- waitpid options ----
 const WNOHANG: u32 = 1;
@@ -145,8 +146,12 @@ const UT_EXPAND_BASE: u64 = salty::consts::UT_EXPAND_BASE;
 const MAX_UT_EXPANSIONS: usize = salty::consts::MAX_UT_EXPANSIONS;
 const UT_EXPAND_BITS: u64 = 20; // 1MB per expansion untyped
 const CHILD_CAP_EXPAND_NTFN: u64 = 9; // Minted notification for UT expansion signaling
+const CHILD_CAP_CSPACE_NTFN: u64 = 10; // Minted notification for CSpace expansion signaling
+const CSPACE_EXPAND_BASE: u64 = salty::consts::CSPACE_EXPAND_BASE;
+const MAX_CSPACE_EXPANSIONS: usize = salty::consts::MAX_CSPACE_EXPANSIONS;
+const CSPACE_EXPAND_BITS: u64 = 10; // 1024 slots per expansion sub-CNode
 
-/// Procmgr's bound notification cap (for receiving UT expansion signals).
+/// Procmgr's bound notification cap (for receiving UT/CSpace expansion signals).
 static mut PM_BOUND_NTFN: Cap = 0;
 
 static mut ALLOCATOR: alloc::Allocator = alloc::Allocator::new();
@@ -304,6 +309,22 @@ unsafe fn wait_for_child_ready(
             lb.flush();
             let _ = salty::invoke::tcb_suspend(child_tcb);
             return -1;
+        }
+
+        // Service expansion requests during child startup by polling the
+        // bound notification. Without this, a child that needs CSpace or UT
+        // expansion before signaling readiness would deadlock.
+        unsafe {
+            let bound_ntfn = *(&raw const PM_BOUND_NTFN);
+            if bound_ntfn != 0 {
+                let np = salty::syscall::syscall(salty::SYS_POLL, bound_ntfn, 0, 0, 0, 0, 0);
+                if np.error == 0 && np.value != 0 {
+                    let ut_bits = np.value & 0xFFFF;
+                    let cs_bits = (np.value >> 16) & 0xFFFF;
+                    if ut_bits != 0 { handle_ut_expand_notification(ut_bits); }
+                    if cs_bits != 0 { handle_cspace_expand_ntfn(cs_bits); }
+                }
+            }
         }
 
         let timed_out = if let Some(start) = start_ns {
@@ -2314,16 +2335,18 @@ unsafe fn handle_ut_expand_notification(bits: u64) {
                 continue;
             }
 
-            // Copy the untyped into child's CNode at the deterministic slot
-            let copy_err = salty::invoke::cnode_copy(
-                CAP_SELF_CSPACE, pm_slot,
+            // Move the untyped into child's CNode at the deterministic slot.
+            // cnode_move transfers atomically without creating a CDT parent→child
+            // relationship, so the source slot becomes empty and can be freed.
+            let move_err = salty::invoke::cnode_move(
                 child_cn, dest_child_slot,
-                CAP_RIGHTS_ALL,
+                CAP_SELF_CSPACE, pm_slot,
             );
-            salty::invoke::cnode_delete(CAP_SELF_CSPACE, pm_slot);
-            alloc.free_single_slot(pm_slot);
+            if move_err == 0 {
+                alloc.free_single_slot(pm_slot);
+            }
 
-            if copy_err != 0 {
+            if move_err != 0 {
                 continue;
             }
 
@@ -2336,6 +2359,79 @@ unsafe fn handle_ut_expand_notification(bits: u64) {
                 lb.str(b"B untyped to idx=");
                 lb.hex(i as u64);
                 lb.str(b" slot=");
+                lb.hex(dest_child_slot);
+                lb.str(b"\n");
+                lb.flush();
+            }
+        }
+    }
+}
+
+/// Handle CSpace expansion requests delivered via bound notification (upper 16 bits).
+///
+/// Each bit i (0-15) in `bits` corresponds to PROCTAB[i]. When a child signals
+/// the procmgr's bound notification with badge = 1 << (16 + idx), the kernel ORs
+/// the badge bits. We retype a sub-CNode and copy it into the child's root CNode
+/// at deterministic slots [CSPACE_EXPAND_BASE .. CSPACE_EXPAND_BASE + count).
+unsafe fn handle_cspace_expand_ntfn(bits: u64) {
+    unsafe {
+        let alloc = &mut *(&raw mut ALLOCATOR);
+        for i in 0..MAX_PROCESSES {
+            if bits & (1u64 << i) == 0 { continue; }
+            if PROCTAB[i].state != PROC_RUNNING { continue; }
+
+            let n = PROCTAB[i].cspace_expand_count as u64;
+            if n >= MAX_CSPACE_EXPANSIONS as u64 { continue; }
+
+            let child_cn = PROCTAB[i].cnode_cap;
+            if child_cn == 0 { continue; }
+
+            let dest_child_slot = CSPACE_EXPAND_BASE + n;
+
+            // Allocate temp slot and retype sub-CNode from procmgr's pool
+            let pm_slot = match alloc.alloc_single_slot() {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let err = alloc.retype_any(OBJ_CNODE, CSPACE_EXPAND_BITS, pm_slot);
+            if err != 0 {
+                alloc.free_single_slot(pm_slot);
+                continue;
+            }
+
+            // Sub-CNode: guard=0, guard_bits=0 (flat two-level addressing)
+            let err = salty::invoke::cnode_set_guard(pm_slot, 0, 0);
+            if err != 0 {
+                salty::invoke::cnode_delete(CAP_SELF_CSPACE, pm_slot);
+                alloc.free_single_slot(pm_slot);
+                continue;
+            }
+
+            // Move into child's root CNode at the deterministic slot.
+            // cnode_move transfers atomically without creating a CDT parent→child
+            // relationship, so the source slot becomes empty and can be freed.
+            let move_err = salty::invoke::cnode_move(
+                child_cn, dest_child_slot,
+                CAP_SELF_CSPACE, pm_slot,
+            );
+            if move_err == 0 {
+                alloc.free_single_slot(pm_slot);
+            }
+
+            if move_err != 0 {
+                continue;
+            }
+
+            PROCTAB[i].cspace_expand_count += 1;
+
+            {
+                let mut lb = LineBuf::new();
+                lb.str(b"[PROCMGR] cspace-expand: granted ");
+                lb.hex(1u64 << CSPACE_EXPAND_BITS);
+                lb.str(b" slots to idx=");
+                lb.hex(i as u64);
+                lb.str(b" root_slot=");
                 lb.hex(dest_child_slot);
                 lb.str(b"\n");
                 lb.flush();
@@ -2418,6 +2514,14 @@ unsafe fn handle_register(msg: &SaltyMsg, reply: &mut SaltyMsg, _badge: u64) {
                 CAP_SELF_CSPACE, pm_ntfn,
                 cn_perm, CHILD_CAP_EXPAND_NTFN,
                 ntfn_badge,
+            );
+
+            // Mint CSpace expansion notification (upper 16 bits badge)
+            let cs_badge = 1u64 << (16 + ci);
+            let _ = salty::invoke::cnode_mint(
+                CAP_SELF_CSPACE, pm_ntfn,
+                cn_perm, CHILD_CAP_CSPACE_NTFN,
+                cs_badge,
             );
         }
 
@@ -2548,9 +2652,12 @@ pub extern "C" fn _start() -> ! {
             let mut skip_reply = false;
             // Bound notification delivery: label=0 and badge!=0 means the
             // kernel delivered a notification word instead of an IPC message.
-            // Process UT expansion requests encoded as badge bits.
+            // Lower 16 bits: UT expansion, upper 16 bits: CSpace expansion.
             if msg.label == 0 && badge != 0 {
-                handle_ut_expand_notification(badge);
+                let ut_bits = badge & 0xFFFF;
+                let cs_bits = (badge >> 16) & 0xFFFF;
+                if ut_bits != 0 { handle_ut_expand_notification(ut_bits); }
+                if cs_bits != 0 { handle_cspace_expand_ntfn(cs_bits); }
                 skip_reply = true;
             } else {
 

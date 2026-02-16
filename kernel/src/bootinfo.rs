@@ -10,7 +10,7 @@ const BOOTINFO_MAGIC: u64 = 0x53414C5459424F4F;
 const BOOTINFO_VERSION: u16 = 1;
 
 /// Maximum memory map entries we support
-const MAX_MEMMAP_ENTRIES: usize = 128;
+const MAX_MEMMAP_ENTRIES: usize = 256;
 
 // TLV type identifiers (matches bootinfo_tlv.h)
 const TLV_END: u16 = 0;

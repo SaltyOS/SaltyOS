@@ -351,6 +351,11 @@ pub const POSIX_PM_GETPGID_BADGE: u64 = 23;
 pub const POSIX_PM_GETSID_BADGE: u64 = 24;
 pub const POSIX_PM_KILL_PGID: u64 = 25;
 pub const POSIX_PM_INJECT_CAP: u64 = 26;
+// Deterministic CNode slots for CSpace expansion (root slots 1008-1015)
+pub const CSPACE_EXPAND_BASE: u64 = 1008;
+pub const MAX_CSPACE_EXPANSIONS: usize = 8;
+pub const CAP_CSPACE_EXPAND_NTFN: u64 = 10;
+
 // Deterministic CNode slots for untyped expansion (last 8 slots of 10-bit CNode)
 pub const UT_EXPAND_BASE: u64 = 1016;
 pub const MAX_UT_EXPANSIONS: usize = 8;
@@ -446,6 +451,7 @@ pub const MM_MAX_PAGES_PER_REGION: usize = 64;
 pub const AT_SALTY_SLOT_BASE: u64 = 0x1007;
 pub const AT_SALTY_SLOT_COUNT: u64 = 0x1008;
 pub const AT_SALTY_EXPAND_EP: u64 = 0x1009;
+pub const AT_SALTY_CSPACE_NTFN: u64 = 0x100A;
 
 /// ELF format constants (class, data encoding, types, segment types, relocation types).
 pub const ELF_PAGE_SIZE: u64 = 4096;

@@ -102,6 +102,12 @@ pub static mut __salty_slot_count: u64 = 0;
 #[linkage = "weak"]
 pub static mut __salty_expand_ep: u64 = 0;
 
+/// Notification cap for CSpace expansion signaling
+/// (from `AT_SALTY_CSPACE_NTFN` auxv). 0 if not available.
+#[unsafe(no_mangle)]
+#[linkage = "weak"]
+pub static mut __salty_cspace_ntfn: u64 = 0;
+
 // ---------------------------------------------------------------------------
 // Panic handler (for libsalty.so and statically-linked binaries)
 // ---------------------------------------------------------------------------

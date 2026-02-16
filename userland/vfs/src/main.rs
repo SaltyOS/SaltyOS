@@ -6450,8 +6450,9 @@ pub extern "C" fn _start() -> ! {
         let base = *(&raw const salty::__salty_slot_base);
         let count = *(&raw const salty::__salty_slot_count);
         let expand_ep = *(&raw const salty::__salty_expand_ep);
+        let cspace_ntfn = *(&raw const salty::__salty_cspace_ntfn);
         if base != 0 {
-            salty::slot_alloc::slot_alloc_init(base, count, expand_ep);
+            salty::slot_alloc::slot_alloc_init(base, count, expand_ep, cspace_ntfn);
         } else {
             puts(b"[VFS] FATAL: slot pool not provided by RTLD/auxv\n");
             idle();

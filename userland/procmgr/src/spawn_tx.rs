@@ -95,6 +95,9 @@ const AT_SALTY_SHARED_LIB_BASE: u64 = super::AT_SALTY_SHARED_LIB_BASE;
 const AT_SALTY_SLOT_BASE: u64 = super::AT_SALTY_SLOT_BASE;
 const AT_SALTY_SLOT_COUNT: u64 = super::AT_SALTY_SLOT_COUNT;
 const AT_SALTY_EXPAND_EP: u64 = super::AT_SALTY_EXPAND_EP;
+const AT_SALTY_CSPACE_NTFN: u64 = super::AT_SALTY_CSPACE_NTFN;
+const CHILD_CAP_CSPACE_NTFN: u64 = super::CHILD_CAP_CSPACE_NTFN;
+const CSPACE_EXPAND_BASE: u64 = super::CSPACE_EXPAND_BASE;
 const UT_MIRROR_COUNT: Cap = super::UT_MIRROR_COUNT;
 const CHILD_UT_BITS_DEFAULT: u8 = super::CHILD_UT_BITS_DEFAULT;
 const READY_TIMEOUT_NS_DEFAULT: u64 = super::READY_TIMEOUT_NS_DEFAULT;
@@ -1001,18 +1004,19 @@ pub(crate) unsafe fn write_dynamic_stack(
             return Err(());
         }
 
-        // +2 for AT_SALTY_SLOT_BASE/COUNT, +1 for AT_SALTY_EXPAND_EP
-        let auxv_entries: u64 = if shared_lib_base != 0 { 17 } else { 16 };
+        // +2 for AT_SALTY_SLOT_BASE/COUNT, +1 for AT_SALTY_EXPAND_EP, +1 for AT_SALTY_CSPACE_NTFN
+        let auxv_entries: u64 = if shared_lib_base != 0 { 18 } else { 17 };
 
-        // Compute slot pool for child: from frame_slot_start to CNode end
-        let effective_cnode_bits = if cnode_bits > 0 { cnode_bits } else { 10 };
-        let cnode_total_slots = 1u64 << effective_cnode_bits;
+        // Compute slot pool for child: from frame_slot_start to CSPACE_EXPAND_BASE.
+        // Slots [CSPACE_EXPAND_BASE..CSPACE_EXPAND_BASE+8) are reserved for
+        // CSpace expansion sub-CNodes, and [UT_EXPAND_BASE..UT_EXPAND_BASE+8)
+        // are reserved for UT expansion untypeds.
         let slot_pool_base = if slot_pool_floor > CHILD_RTLD_FRAME_SLOT_START {
             slot_pool_floor
         } else {
             CHILD_RTLD_FRAME_SLOT_START
         };
-        let slot_pool_count = cnode_total_slots.saturating_sub(slot_pool_base);
+        let slot_pool_count = CSPACE_EXPAND_BASE.saturating_sub(slot_pool_base);
 
         // Build the stack using the helper, which handles argv/envp layout
         let rsp = write_stack_with_args(
@@ -1191,6 +1195,7 @@ unsafe fn write_stack_with_args(
                 w(AT_SALTY_SLOT_BASE);  w(slot_base);
                 w(AT_SALTY_SLOT_COUNT); w(slot_count);
                 w(AT_SALTY_EXPAND_EP);  w(CHILD_CAP_EXPAND_NTFN); // minted notification for UT expansion
+                w(AT_SALTY_CSPACE_NTFN); w(CHILD_CAP_CSPACE_NTFN); // minted notification for CSpace expansion
                 if shared_lib != 0 {
                     w(AT_SALTY_SHARED_LIB_BASE); w(shared_lib);
                 }
@@ -1660,6 +1665,19 @@ pub unsafe fn handle_spawn_tx(
             if err != 0 {
                 puts(b"[PROCMGR] WARN: mint expand ntfn cap failed\n");
             }
+
+            // ---- Mint CSpace expansion notification into child CNode ----
+            // Badge uses upper 16 bits: (1 << (16 + table_idx)) to distinguish
+            // from UT expansion (lower 16 bits).
+            let cs_badge = 1u64 << (16 + slot_idx);
+            let err = salty::invoke::cnode_mint(
+                CAP_SELF_CSPACE, pm_ntfn,
+                child_cn, CHILD_CAP_CSPACE_NTFN,
+                cs_badge,
+            );
+            if err != 0 {
+                puts(b"[PROCMGR] WARN: mint cspace ntfn cap failed\n");
+            }
         }
 
         // ---- Configure TCB ----
@@ -1822,6 +1840,14 @@ pub unsafe fn handle_spawn_tx(
             return;
         }
 
+        // Pre-populate minimal PROCTAB fields so that CSpace/UT expansion
+        // handlers (called from wait_for_child_ready's bound-ntfn poll)
+        // can identify and serve this child.
+        proc_table::PROCTAB[slot_idx].state = proc_table::PROC_RUNNING;
+        proc_table::PROCTAB[slot_idx].cnode_cap = child_cn;
+        proc_table::PROCTAB[slot_idx].pid = pid;
+        proc_table::PROCTAB[slot_idx].badge = pid as u64;
+
         if plan.readiness_mode == salty::SPAWN_READY_NOTIFY {
             if super::wait_for_child_ready(
                 child_tcb,
@@ -1830,6 +1856,10 @@ pub unsafe fn handle_spawn_tx(
                 plan.ready_timeout_ns,
             ) != 0
             {
+                proc_table::PROCTAB[slot_idx].state = proc_table::PROC_FREE;
+                proc_table::PROCTAB[slot_idx].cnode_cap = 0;
+                proc_table::PROCTAB[slot_idx].pid = 0;
+                proc_table::PROCTAB[slot_idx].badge = 0;
                 alloc.rollback();
                 reply.label = SALTY_BUSY;
                 return;

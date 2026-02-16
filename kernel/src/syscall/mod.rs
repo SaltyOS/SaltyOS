@@ -1750,6 +1750,10 @@ fn syscall_tcb_suspend(cap: &Capability) -> SyscallResult {
                     }
                     tcb.state = ThreadState::Inactive;
                     tcb.blocked_reason = None;
+                    tcb.reply_tcb = core::ptr::null_mut();
+                    tcb.reply_can_grant = false;
+                    tcb.saved_caller_msg = crate::ipc::Message::empty();
+                    tcb.saved_caller_badge = 0;
                 });
             }
             ThreadState::Waiting => {
