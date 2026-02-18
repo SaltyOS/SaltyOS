@@ -10,22 +10,20 @@
 //! 3. Parse SaltyOS-specific auxv tags (`AT_SALTY_*`) to set up IPC context
 //! 4. Call `tcb_set_ipc_buffer` to configure the per-thread IPC buffer
 //! 5. Initialize `ipc_context` for libsalty IPC wrappers
-//! 6. Parse auxv for memory manager configuration (untyped cap, vspace, etc.)
-//! 7. Initialize the per-process slot allocator (preferring RTLD-exported pool)
-//! 8. Initialize `posix_mm` (heap and mmap regions)
-//! 9. Set program name from `argv[0]` for BSD `err(3)` functions
-//! 10. Initialize FreeBSD rune locale tables for `ctype.h` compatibility
+//! 6. Initialize the per-process slot allocator (preferring RTLD-exported pool)
+//! 7. Initialize `posix_mm` with the mmsrv endpoint (slot 7)
+//! 8. Set program name from `argv[0]` for BSD `err(3)` functions
+//! 9. Initialize FreeBSD rune locale tables for `ctype.h` compatibility
 //!
 //! Custom auxv tags used by SaltyOS:
-//! - `0x1000` (`AT_SALTY_UNTYPED`): untyped memory capability slot
-//! - `0x1001` (`AT_SALTY_VSPACE`): VSpace capability slot
-//! - `0x1002` (`AT_SALTY_SCRATCH`): scratch virtual address region
-//! - `0x1005` (`AT_SALTY_FRAME_SLOT`): frame slot for page mapping
 //! - `0x1007` (`AT_SALTY_SLOT_BASE`): slot allocator pool base
 //! - `0x1008` (`AT_SALTY_SLOT_COUNT`): slot allocator pool size
-//! - `0x1009` (`AT_SALTY_EXPAND_EP`): endpoint for requesting more slots
 
 use crate::env;
+
+// Standard child CSpace layout
+const CAP_SELF_TCB: u64 = 0;
+const CAP_MMSRV_EP: u64 = 7;
 
 /// Maximum number of atexit handlers
 const ATEXIT_MAX: usize = 32;
@@ -109,7 +107,7 @@ unsafe fn init_ipc_from_auxv(stack_ptr: *const u64) {
         }
         let _auxv = p.add(1); // past envp NULL terminator — points to auxv pairs
         let ipc_buf_vaddr: u64 = 0x0000_0000_0020_0000;
-        salty::invoke::tcb_set_ipc_buffer(salty::CAP_SELF_TCB, ipc_buf_vaddr);
+        salty::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, ipc_buf_vaddr);
         salty::ipc::ipc_context_init(
             &raw mut salty::__salty_ipc_ctx,
             ipc_buf_vaddr as *mut salty::types::IpcBuffer,
@@ -117,22 +115,13 @@ unsafe fn init_ipc_from_auxv(stack_ptr: *const u64) {
     }
 }
 
-/// Initialize the POSIX memory manager and per-process slot allocator from auxv.
+/// Initialize the per-process slot allocator and POSIX memory manager from auxv.
 ///
-/// Parses SaltyOS-specific auxiliary vector entries (`AT_SALTY_*`) to discover:
-/// - Untyped memory capability (for backing `sbrk`/`mmap` allocations)
-/// - VSpace capability (for mapping frames into the address space)
-/// - Frame slot and scratch region addresses
-/// - Slot allocator pool (base + count) for capability slot management
-/// - Expand endpoint (for requesting additional slots from the process manager)
-///
-/// The RTLD (runtime dynamic linker) may have already consumed some slots while
-/// loading shared libraries, so its exported `__salty_slot_base` / `__salty_slot_count`
-/// take precedence over the raw auxv values when non-zero. Similarly, the RTLD's
-/// `__salty_expand_ep` overrides the auxv expand endpoint.
-///
-/// After slot allocation setup, the heap region is placed 1 MB after the scratch
-/// area, and the `mmap` region starts 16 MB after the heap base.
+/// Parses SaltyOS-specific auxiliary vector entries (`AT_SALTY_*`) to discover
+/// the slot allocator pool and the mmsrv endpoint capability. The RTLD may
+/// have already consumed some slots, so its exported values take precedence
+/// over raw auxv. The mmsrv endpoint (CAP_MMSRV_EP = slot 7) is provided by
+/// the process manager at spawn time for all post-mmsrv processes.
 unsafe fn init_mm_from_auxv(stack_ptr: *const u64) {
     unsafe {
         let argc = *stack_ptr as usize;
@@ -145,13 +134,8 @@ unsafe fn init_mm_from_auxv(stack_ptr: *const u64) {
         p = p.add(1);
 
         // Parse auxv
-        let mut untyped: u64 = salty::CAP_UNTYPED;
-        let mut vspace: u64 = salty::CAP_SELF_VSPACE;
-        let mut frame_slot: u64 = 64;
-        let mut scratch: u64 = salty::SCRATCH_VADDR;
         let mut slot_base: u64 = 0;
         let mut slot_count: u64 = 0;
-        let mut expand_ep: u64 = 0;
 
         loop {
             let tag = *p;
@@ -160,13 +144,8 @@ unsafe fn init_mm_from_auxv(stack_ptr: *const u64) {
                 break; // AT_NULL
             }
             match tag {
-                0x1000 => untyped = val,     // AT_SALTY_UNTYPED
-                0x1001 => vspace = val,      // AT_SALTY_VSPACE
-                0x1005 => frame_slot = val,  // AT_SALTY_FRAME_SLOT
-                0x1002 => scratch = val,     // AT_SALTY_SCRATCH
                 0x1007 => slot_base = val,   // AT_SALTY_SLOT_BASE
                 0x1008 => slot_count = val,  // AT_SALTY_SLOT_COUNT
-                0x1009 => expand_ep = val,   // AT_SALTY_EXPAND_EP
                 _ => {}
             }
             p = p.add(2);
@@ -181,32 +160,15 @@ unsafe fn init_mm_from_auxv(stack_ptr: *const u64) {
             slot_count = rtld_count;
         }
 
-        // Prefer RTLD-exported expand EP (set by rtld_main.c from auxv)
-        let rtld_expand_ep = *(&raw const salty::__salty_expand_ep);
-        if rtld_expand_ep != 0 {
-            expand_ep = rtld_expand_ep;
-        }
-
         let cspace_ntfn = *(&raw const salty::__salty_cspace_ntfn);
 
-        // Initialize per-process slot allocator only from dynamic slot-pool info.
-        // No legacy fallback to __salty_next_frame_slot.
+        // Initialize per-process slot allocator
         if slot_base != 0 {
-            salty::slot_alloc::slot_alloc_init(slot_base, slot_count, expand_ep, cspace_ntfn);
+            salty::slot_alloc::slot_alloc_init(slot_base, slot_count, cspace_ntfn);
         }
 
-        // Heap starts after scratch area
-        let heap_base = scratch + 0x100000; // 1MB after scratch
-        let mmap_base = heap_base + 0x1000000; // 16MB after heap base
-
-        salty::posix_mm::posix_mm_init(
-            untyped,
-            vspace,
-            salty::CAP_SELF_CSPACE,
-            frame_slot,
-            heap_base,
-            mmap_base,
-        );
+        // Initialize posix_mm with the mmsrv endpoint (slot 7 for post-mmsrv processes)
+        salty::posix_mm::posix_mm_init(CAP_MMSRV_EP);
     }
 }
 

@@ -2,7 +2,7 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use super::{alloc_frame, free_frame, phys_to_virt, PhysAddr, SpinLock, VirtAddr, PAGE_SIZE};
+use super::{alloc_frame, phys_to_virt, PhysAddr, SpinLock, VirtAddr, PAGE_SIZE};
 use crate::arch::x86_64::paging::PageTable;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -28,81 +28,43 @@ const WALK_MAX_RESULTS: usize = 48;
 /// Maximum number of CPUs (from arch module)
 use crate::arch::MAX_CPUS;
 
-/// Maximum number of concurrent VSpaces (including kernel VSpace)
-/// This is a hard limit - each process needs one VSpace
-const MAX_VSPACES: usize = 256;
-
 /// Maximum number of deferred free entries
 const MAX_DEFERRED: usize = 256;
 
 /// Number of mapped pages at/above which range mapping uses one-shot full TLB
 /// flush instead of per-page invalidation.
 const RANGE_TLB_GLOBAL_THRESHOLD: usize = 8;
-/// VSpaceTracking pool - static allocation, no heap
+
+/// Static VSpaceTracking storage for the kernel VSpace (never destroyed).
 ///
-/// All VSpaceTracking objects are allocated from this pool.
-/// Uses a free list for O(1) allocation/deallocation.
-/// PROTECTED BY: TRACKING_POOL_LOCK
-static mut TRACKING_POOL: [VSpaceTracking; MAX_VSPACES] =
-    [const { VSpaceTracking::new(0) }; MAX_VSPACES];
-static mut TRACKING_FREE_LIST: [*mut VSpaceTracking; MAX_VSPACES] =
-    [core::ptr::null_mut(); MAX_VSPACES];
-static mut TRACKING_FREE_COUNT: usize = MAX_VSPACES;
-static mut TRACKING_POOL_LOCK: SpinLock = SpinLock::new();
+/// User VSpaces have their tracking embedded in the untyped allocation
+/// (seL4-style: all kernel object metadata lives in untyped memory).
+static mut KERNEL_VSPACE_TRACKING_STORAGE: VSpaceTracking = VSpaceTracking::new(0);
 
-/// Initialize VSpaceTracking pool (call during boot)
+/// Byte offset of VSpaceTracking within a VSpace untyped allocation.
 ///
-/// Sets up the free list with all available tracking objects.
-fn init_tracking_pool() {
-    unsafe {
-        TRACKING_FREE_COUNT = MAX_VSPACES;
-        for i in 0..MAX_VSPACES {
-            TRACKING_FREE_LIST[i] = &raw mut TRACKING_POOL[i];
-        }
-    }
-}
+/// VSpace layout in untyped memory:
+///   [0 .. PAGE_SIZE)       = PML4 page table root (4KB, page-aligned)
+///   [PAGE_SIZE .. PAGE_SIZE + TRACKING_SIZE) = VSpaceTracking
+pub const VSPACE_TRACKING_OFFSET: usize = PAGE_SIZE;
 
-/// Allocate a VSpaceTracking from the pool
-///
-/// Returns None if pool is exhausted.
-/// Must be called with IRQs disabled (or from single-threaded boot context).
-fn alloc_tracking(root: PhysAddr) -> Option<*mut VSpaceTracking> {
-    unsafe {
-        let lock = &raw const TRACKING_POOL_LOCK;
-        (*lock).lock();
+/// Size of VSpaceTracking rounded up to 64-byte alignment.
+pub const VSPACE_TRACKING_SIZE: usize = {
+    let raw = core::mem::size_of::<VSpaceTracking>();
+    (raw + 63) & !63
+};
 
-        if TRACKING_FREE_COUNT == 0 {
-            (*lock).unlock();
-            return None;
-        }
+/// Total untyped allocation size for a VSpace object (PML4 + embedded tracking).
+pub const VSPACE_OBJECT_SIZE: usize = PAGE_SIZE + VSPACE_TRACKING_SIZE;
 
-        TRACKING_FREE_COUNT -= 1;
-        let tracking = TRACKING_FREE_LIST[TRACKING_FREE_COUNT];
-        TRACKING_FREE_LIST[TRACKING_FREE_COUNT] = core::ptr::null_mut();
-
-        (*lock).unlock();
-
-        // Initialize the tracking object
-        (*tracking) = VSpaceTracking::new(root);
-        Some(tracking)
-    }
-}
-
-/// Deallocate a VSpaceTracking back to the pool
+/// Derive VSpaceTracking pointer from a VSpace's PML4 physical address.
 ///
 /// # Safety
-/// Must be called with IRQs disabled and TRACKING_POOL_LOCK held.
-/// This is ONLY called from deferred free processing with lock already held.
-unsafe fn dealloc_tracking_locked(tracking: *mut VSpaceTracking) {
-    unsafe {
-        if TRACKING_FREE_COUNT >= MAX_VSPACES {
-            // Pool full - should never happen
-            return;
-        }
-
-        TRACKING_FREE_LIST[TRACKING_FREE_COUNT] = tracking;
-        TRACKING_FREE_COUNT += 1;
-    }
+/// The PML4 must have been allocated with `VSPACE_OBJECT_SIZE` bytes from untyped,
+/// so that the tracking area at `pml4_phys + PAGE_SIZE` is valid memory.
+#[inline]
+pub unsafe fn tracking_from_vspace_phys(pml4_phys: PhysAddr) -> *mut VSpaceTracking {
+    phys_to_virt(pml4_phys + VSPACE_TRACKING_OFFSET as u64) as *mut VSpaceTracking
 }
 
 /// VSpace lifecycle states
@@ -175,8 +137,11 @@ static mut DEFERRED_FREE_LOCK: SpinLock = SpinLock::new();
 
 /// VSpace lifecycle tracking for SMP-safe teardown
 ///
-/// Memory management: VSpaceTracking is allocated from a static pool
-/// (no heap allocation) to allow deferred free. VSpace contains *mut VSpaceTracking pointer.
+/// Memory management: VSpaceTracking is embedded in the VSpace's untyped
+/// allocation at offset PAGE_SIZE from the PML4 root (seL4-style: all kernel
+/// object metadata lives in untyped memory). The kernel VSpace uses static
+/// storage instead. Deferred free ensures no CPU references tracking after
+/// removal from the deferred list.
 ///
 /// # Safety Invariant for Sync
 ///
@@ -397,17 +362,14 @@ pub fn kernel_vspace_root() -> PhysAddr {
 
 /// Initialize kernel VSpace (called during boot)
 pub fn init_kernel_vspace(kernel_pml4: PhysAddr) {
-    // Initialize tracking pool first (single-threaded boot context)
-    init_tracking_pool();
-
     unsafe {
         KERNEL_PML4_PHYS = kernel_pml4;
-        // Allocate from pool for kernel VSpace (always succeeds during boot)
-        let tracking =
-            alloc_tracking(kernel_pml4).expect("Failed to allocate kernel VSpace tracking");
-        KERNEL_VSPACE_TRACKING = tracking;
+        // Initialize kernel VSpaceTracking in static storage (not from untyped)
+        let storage = &raw mut KERNEL_VSPACE_TRACKING_STORAGE;
+        (*storage) = VSpaceTracking::new(kernel_pml4);
+        KERNEL_VSPACE_TRACKING = storage as *const VSpaceTracking;
         let cpu_id = crate::arch::current_cpu() as usize;
-        CURRENT_VSPACE_TRACKING[cpu_id] = tracking;
+        CURRENT_VSPACE_TRACKING[cpu_id] = storage as *const VSpaceTracking;
     }
 }
 
@@ -566,14 +528,11 @@ pub unsafe fn defer_free_tracking(tracking: *mut VSpaceTracking) {
 /// IMPORTANT: Collects pointers to free while holding lock, but actual
 /// deallocation happens after releasing lock to avoid reentrancy issues.
 pub fn process_deferred_free() {
-    let mut to_free: [*mut VSpaceTracking; MAX_DEFERRED] = [core::ptr::null_mut(); MAX_DEFERRED];
-    let mut to_free_count = 0;
-
     unsafe {
         let lock = &raw const DEFERRED_FREE_LOCK;
         (*lock).lock();
 
-        // Scan for entries that can be freed
+        // Scan for entries that have reached quiescent state
         let mut write_idx = 0;
         for read_idx in 0..DEFERRED_FREE_COUNT {
             let tracking = DEFERRED_FREE_LIST[read_idx];
@@ -602,12 +561,10 @@ pub fn process_deferred_free() {
             }
 
             if can_free {
-                // Mark for freeing (outside lock)
-                debug_assert!(to_free_count < MAX_DEFERRED, "to_free overflow");
-                to_free[to_free_count] = tracking;
-                to_free_count += 1;
-
-                // Clear from list
+                // Remove from deferred list. No pool deallocation needed:
+                // tracking memory is embedded in the VSpace's untyped
+                // allocation (seL4-style). Memory reclaimed when untyped
+                // parent is revoked.
                 DEFERRED_FREE_LIST[read_idx] = core::ptr::null_mut();
             } else {
                 // Keep for next time - compact the list
@@ -620,31 +577,6 @@ pub fn process_deferred_free() {
         }
         DEFERRED_FREE_COUNT = write_idx;
 
-        (*lock).unlock();
-    }
-
-    // Actual deallocation happens OUTSIDE the lock
-    // This prevents reentrancy issues with allocator
-    for i in 0..to_free_count {
-        unsafe {
-            // Take lock for pool deallocation
-            let lock = &raw const TRACKING_POOL_LOCK;
-            (*lock).lock();
-            dealloc_tracking_locked(to_free[i]);
-            (*lock).unlock();
-        }
-    }
-}
-
-/// Deallocate VSpaceTracking (internal)
-///
-/// VSpaceTracking is allocated from the tracking pool.
-/// This must be called with TRACKING_POOL_LOCK held.
-unsafe fn dealloc_tracking(tracking: *mut VSpaceTracking) {
-    unsafe {
-        let lock = &raw const TRACKING_POOL_LOCK;
-        (*lock).lock();
-        dealloc_tracking_locked(tracking);
         (*lock).unlock();
     }
 }
@@ -670,18 +602,24 @@ pub struct VSpace {
     pub header: crate::cap::KernelObject,
     /// Physical address of PML4
     root: PhysAddr,
-    /// VSpaceTracking is allocated from static pool for deferred free support
-    /// Pool allocation allows tracking to outlive VSpace
+    /// VSpaceTracking pointer — embedded in untyped allocation at root + PAGE_SIZE
+    /// (seL4-style: all kernel object metadata lives in untyped memory).
+    /// For kernel VSpace, points to static storage.
     tracking: *mut VSpaceTracking,
     /// Per-VSpace lock for page table modifications (map/unmap/install_page_table)
     lock: SpinLock,
 }
 
 impl VSpace {
-    pub fn new(pml4_addr: PhysAddr) -> Self {
-        // Allocate tracking from pool - allows deferred free without heap
-        let tracking = alloc_tracking(pml4_addr).expect("VSpace tracking pool exhausted");
-
+    /// Create a new VSpace with an externally-provided VSpaceTracking pointer.
+    ///
+    /// For user VSpaces, `tracking` points to the embedded tracking area
+    /// within the untyped allocation (at `pml4_addr + PAGE_SIZE`).
+    /// For the kernel VSpace, `tracking` points to static storage.
+    ///
+    /// # Safety
+    /// The tracking pointer must be valid and initialized with `VSpaceTracking::new()`.
+    pub fn new(pml4_addr: PhysAddr, tracking: *mut VSpaceTracking) -> Self {
         Self {
             header: crate::cap::KernelObject::new(
                 crate::cap::ObjectType::VSpace,
@@ -825,6 +763,10 @@ impl VSpace {
             // If entry doesn't exist, create a new page table
             if entry & ENTRY_PRESENT == 0 {
                 let new_frame = alloc_frame().ok_or(VSpaceError::OutOfMemory)?;
+
+                // SAFETY: retain before the PDE is visible so the frame cannot
+                // be reclaimed between alloc_frame() and the PDE write.
+                super::retain_frame_mapping(new_frame);
                 let new_table_virt = phys_to_virt(new_frame) as *mut PageTable;
 
                 // Zero the new page table
@@ -1051,6 +993,7 @@ impl VSpace {
             // Create the mapping
             let entry_flags = Self::flags_to_entry_flags(flags);
             self.write_entry(virt, 1, phys | entry_flags)?;
+
             super::retain_frame_mapping(phys);
 
             // Local TLB flush
@@ -1221,6 +1164,9 @@ impl VSpace {
             }
 
             parent_table.set_entry(idx, pt_phys | table_flags);
+            // Protect the installed PT frame from premature reclamation if the
+            // user-held Frame capability is later deleted (release_frame_object).
+            super::retain_frame_mapping(pt_phys);
             // No TLB shootdown needed — new empty table has no cached entries
             Ok(())
         })();
@@ -1266,6 +1212,40 @@ impl VSpace {
 
         self.lock.unlock();
         unsafe { restore_irq(irq) };
+
+        result
+    }
+
+    /// Change the protection flags on an already-mapped page.
+    ///
+    /// The physical frame stays the same; only PTE flag bits are updated.
+    /// Issues local `invlpg` + TLB shootdown to remote CPUs.
+    pub fn protect(&mut self, virt: VirtAddr, flags: PageFlags) -> Result<(), VSpaceError> {
+        if virt & (PAGE_SIZE as u64 - 1) != 0 {
+            return Err(VSpaceError::Alignment);
+        }
+
+        let irq = unsafe { save_irq_disable() };
+        self.lock.lock();
+
+        let result = (|| {
+            let entry = self.read_entry(virt, 1).ok_or(VSpaceError::NotMapped)?;
+            if entry & ENTRY_PRESENT == 0 {
+                return Err(VSpaceError::NotMapped);
+            }
+            let phys = entry & ENTRY_ADDR_MASK;
+            let new_entry = phys | Self::flags_to_entry_flags(flags);
+            self.write_entry(virt, 1, new_entry)?;
+            Ok(())
+        })();
+
+        self.lock.unlock();
+        unsafe { restore_irq(irq) };
+
+        if result.is_ok() {
+            crate::arch::x86_64::paging::invlpg(virt);
+            self.tlb_shootdown(virt);
+        }
 
         result
     }
@@ -1652,7 +1632,10 @@ impl VSpace {
                 self.free_pdpt_recursive(pdpt_addr);
             }
 
-            free_frame(pml4_addr);
+            // Do NOT free the PML4 frame — it was carved from untyped memory
+            // (init_vspace_metadata in untyped.rs:377), not allocated from the
+            // frame allocator. Its lifetime is managed by the parent untyped's
+            // watermark. Freeing it would corrupt the frame allocator bitmap.
         }
     }
 
@@ -1673,7 +1656,7 @@ impl VSpace {
                 self.free_pd_recursive(pd_addr);
             }
 
-            free_frame(pdpt_addr);
+            super::release_frame_mapping(pdpt_addr);
         }
     }
 
@@ -1700,10 +1683,10 @@ impl VSpace {
                     }
                     super::release_frame_mapping(pte & ENTRY_ADDR_MASK);
                 }
-                free_frame(pt_addr);
+                super::release_frame_mapping(pt_addr);
             }
 
-            free_frame(pd_addr);
+            super::release_frame_mapping(pd_addr);
         }
     }
 

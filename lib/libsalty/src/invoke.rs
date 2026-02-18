@@ -122,6 +122,11 @@ pub fn vspace_unmap(vspace: Cap, vaddr: u64) -> i32 {
     invoke(vspace, VSPACE_UNMAP, vaddr, 0, 0, 0).error as i32
 }
 
+/// Change protection flags on the page at `vaddr` in the given VSpace.
+pub fn vspace_protect(vspace: Cap, vaddr: u64, flags: u64) -> i32 {
+    invoke(vspace, VSPACE_PROTECT, vaddr, flags, 0, 0).error as i32
+}
+
 /// Map an intermediate page table at the given level for `vaddr`.
 pub fn vspace_map_pt(vspace: Cap, frame: Cap, vaddr: u64, level: u64) -> i32 {
     invoke(vspace, VSPACE_MAP_PT, frame, vaddr, level, 0).error as i32

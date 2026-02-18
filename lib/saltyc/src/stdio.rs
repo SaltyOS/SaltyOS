@@ -993,7 +993,6 @@ unsafe fn sscanf_impl(s: *const u8, fmt: *const u8, ap: &mut VaList<'_>) -> i32 
 
                     // At least one digit is required.
                     if int_digits == 0 && frac_digits == 0 {
-                        si = start;
                         break;
                     }
 

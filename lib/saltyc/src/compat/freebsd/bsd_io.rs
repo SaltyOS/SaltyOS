@@ -17,5 +17,5 @@ unsafe extern "C" {
 /// FreeBSD getc() macro calls __srget when the read buffer is empty.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __srget(stream: *mut u8) -> i32 {
-    unsafe { fgetc(stream) }
+    fgetc(stream)
 }

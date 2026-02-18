@@ -16,11 +16,17 @@ use salty::types::*;
 pub struct ExtraCapCopy {
     pub src: Cap,
     pub dst: u64,
+    /// Optional badge to apply when copying endpoint capabilities.
+    /// 0 means plain cnode_copy; non-zero uses cnode_mint.
+    pub badge: u64,
 }
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
 }
+
+// Import from parent module
+use super::{CAP_SELF_VSPACE, CAP_SELF_CSPACE, CAP_INITRD_UNTYPED, CAP_UNTYPED_START, CAP_READINESS_NTFN};
 
 const INIT_UT_SCAN_END_FALLBACK: Cap = 200;
 const CHILD_UT_BITS_MIN: u8 = 12;
@@ -38,6 +44,36 @@ static mut NEXT_UT_HINT: Cap = CAP_UNTYPED_START;
 const MAX_SHARED_LIB_PAGES: usize = 192;
 const MAX_CACHED_LIBS: usize = 4;
 const MAX_LIB_NAME: usize = 24;
+const MAX_RW_SEGS: usize = 4;
+
+#[derive(Clone, Copy)]
+struct RwSegInfo {
+    /// Offset from library min_vaddr (page-aligned down).
+    vaddr_offset: u64,
+    /// ELF p_offset for file data.
+    file_offset: u64,
+    /// p_filesz (bytes to copy from file; rest is BSS → zero).
+    file_size: u64,
+    /// Raw p_vaddr (for sub-page offset calculation).
+    seg_vaddr: u64,
+    /// p_memsz.
+    memsz: u64,
+    /// VSpace flags (WRITABLE | USER).
+    flags: u64,
+}
+
+impl RwSegInfo {
+    const fn zeroed() -> Self {
+        RwSegInfo {
+            vaddr_offset: 0,
+            file_offset: 0,
+            file_size: 0,
+            seg_vaddr: 0,
+            memsz: 0,
+            flags: 0,
+        }
+    }
+}
 
 /// Well-known CNode slot range where cached frame caps are copied into
 /// procmgr's CSpace, enabling zero-allocation library sharing.
@@ -59,6 +95,8 @@ struct CachedLib {
     page_count: u16,
     /// Full VA span of the library (including RW segments), page-aligned.
     lib_span: u64,
+    rw_segs: [RwSegInfo; MAX_RW_SEGS],
+    rw_seg_count: u8,
 }
 
 impl CachedLib {
@@ -69,6 +107,8 @@ impl CachedLib {
             page_start: 0,
             page_count: 0,
             lib_span: 0,
+            rw_segs: [RwSegInfo::zeroed(); MAX_RW_SEGS],
+            rw_seg_count: 0,
         }
     }
 }
@@ -495,8 +535,24 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
                 if ph.p_type != salty::PT_LOAD {
                     continue;
                 }
-                // Skip writable segments — those are per-process
+                // Record RW segments as metadata (mapped per-child later)
                 if (ph.p_flags & salty::PF_W) != 0 {
+                    if (lib_entry.rw_seg_count as usize) < MAX_RW_SEGS {
+                        let idx = lib_entry.rw_seg_count as usize;
+                        let mut rw_flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
+                        if (ph.p_flags & salty::PF_X) != 0 {
+                            rw_flags |= VSPACE_FLAG_EXECUTABLE;
+                        }
+                        lib_entry.rw_segs[idx] = RwSegInfo {
+                            vaddr_offset: (ph.p_vaddr & !0xFFFu64) - (min_vaddr & !0xFFFu64),
+                            file_offset: ph.p_offset,
+                            file_size: ph.p_filesz,
+                            seg_vaddr: ph.p_vaddr,
+                            memsz: ph.p_memsz,
+                            flags: rw_flags,
+                        };
+                        lib_entry.rw_seg_count += 1;
+                    }
                     continue;
                 }
 
@@ -610,6 +666,7 @@ unsafe fn map_shared_lib_to_child(
     _child_cn: Cap,
     shared_lib_base_vaddr: u64,
     needed: &salty::elf_dynamic::NeededLibs,
+    root_ut: Cap,
 ) -> u64 {
     unsafe {
         let cache = &*(&raw const SHARED_LIB_CACHE);
@@ -664,6 +721,115 @@ unsafe fn map_shared_lib_to_child(
                         return 0;
                     }
                     total_mapped += 1;
+                }
+
+                // Map RW segments (per-child private copies)
+                if cl.rw_seg_count > 0 {
+                    // Find library in initrd to get file data for .data copy
+                    let initrd = super::INITRD_VADDR as *const u8;
+                    let initrd_size = super::INITRD_SIZE;
+                    let mut lib_entry = CpioEntry::zeroed();
+                    let lib_name = &cl.name[..cl.name_len as usize];
+                    let lib_found = salty::cpio::cpio_find_file(
+                        initrd, initrd_size,
+                        lib_name.as_ptr(), lib_name.len(),
+                        &raw mut lib_entry,
+                    ) != 0;
+
+                    for si in 0..cl.rw_seg_count as usize {
+                        let rw = &cl.rw_segs[si];
+                        let seg_start = running_base + rw.vaddr_offset;
+                        let seg_end = (running_base + rw.vaddr_offset
+                            + (rw.seg_vaddr & 0xFFF)
+                            + rw.memsz + 0xFFF) & !0xFFFu64;
+
+                        let mut page = seg_start;
+                        while page < seg_end {
+                            let frame_slot = super::init_alloc_frame_slot(core::ptr::null_mut());
+                            let mut err = invoke::untyped_retype(root_ut, OBJ_FRAME, 0, frame_slot);
+                            if err != 0 {
+                                err = retype_from_any_untyped(OBJ_FRAME, 0, frame_slot);
+                            }
+                            if err != 0 {
+                                let mut lb = LineBuf::new();
+                                lb.str(b"[INIT] RW frame retype failed err=");
+                                lb.hex(err as u64);
+                                lb.str(b"\n");
+                                lb.flush();
+                                return 0;
+                            }
+
+                            let err = invoke::vspace_map(
+                                CAP_SELF_VSPACE, frame_slot, SCRATCH_VADDR,
+                                VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+                            );
+                            if err != 0 {
+                                puts(b"[INIT] RW scratch map failed\n");
+                                return 0;
+                            }
+
+                            // Zero the page
+                            let scratch = SCRATCH_VADDR as *mut u8;
+                            for j in 0..4096usize {
+                                core::ptr::write_volatile(scratch.add(j), 0);
+                            }
+
+                            // Copy file data if available
+                            if lib_found && rw.file_size > 0 {
+                                let sub_page_off = (rw.seg_vaddr & 0xFFF) as usize;
+                                let file_off = rw.file_offset as usize;
+                                let data_len = rw.file_size as usize;
+                                // page_rel: offset of this page relative to seg_start
+                                let page_rel = (page - seg_start) as usize;
+                                // file data starts at sub_page_off bytes into the first page
+                                let file_region_start = sub_page_off;
+                                let file_region_end = sub_page_off + data_len;
+                                // range of bytes covered by this page within the segment
+                                let page_byte_start = page_rel;
+                                let page_byte_end = page_rel + 4096;
+                                let copy_start = if page_byte_start > file_region_start {
+                                    page_byte_start
+                                } else {
+                                    file_region_start
+                                };
+                                let copy_end = if page_byte_end < file_region_end {
+                                    page_byte_end
+                                } else {
+                                    file_region_end
+                                };
+                                if copy_start < copy_end {
+                                    let src_off = file_off + (copy_start - sub_page_off);
+                                    let dst_off = copy_start - page_rel;
+                                    let len = copy_end - copy_start;
+                                    if src_off + len <= lib_entry.data_len {
+                                        let src = lib_entry.data.add(src_off);
+                                        let dst = scratch.add(dst_off);
+                                        for j in 0..len {
+                                            core::ptr::write_volatile(dst.add(j), *src.add(j));
+                                        }
+                                    }
+                                }
+                            }
+
+                            invoke::vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
+
+                            let err = invoke::vspace_map(
+                                child_vs, frame_slot, page, rw.flags,
+                            );
+                            if err != 0 {
+                                let mut lb = LineBuf::new();
+                                lb.str(b"[INIT] RW child map failed at ");
+                                lb.hex(page);
+                                lb.str(b" err=");
+                                lb.hex(err as u64);
+                                lb.str(b"\n");
+                                lb.flush();
+                                return 0;
+                            }
+                            total_mapped += 1;
+                            page += 4096;
+                        }
+                    }
                 }
 
                 running_base += cl.lib_span + 4096; // advance past this lib + gap
@@ -757,6 +923,7 @@ pub unsafe fn spawn_server(
     copy_shared_lib_caps: bool,
     ready_timeout_ns: u64,
     pre_ep: Cap,
+    mmsrv_ep: Cap,
     procmgr_ep: Cap,
     spawn_badge: u64,
 ) -> i32 {
@@ -1056,6 +1223,16 @@ pub unsafe fn spawn_server(
                 }
             }
 
+            if mapped_with_device {
+                let mut lb = LineBuf::new();
+                lb.str(b"[INIT] initrd device-mapped: ");
+                lb.dec(initrd_pages as u64);
+                lb.str(b" pages at ");
+                lb.hex(layout.initrd.base);
+                lb.str(b"\n");
+                lb.flush();
+            }
+
             if !mapped_with_device {
                 for pg in 0..initrd_pages {
                     let fr_slot = super::init_alloc_frame_slot(core::ptr::null_mut());
@@ -1105,6 +1282,13 @@ pub unsafe fn spawn_server(
                         return -1;
                     }
                 }
+                let mut lb = LineBuf::new();
+                lb.str(b"[INIT] initrd copy-mapped: ");
+                lb.dec(initrd_pages as u64);
+                lb.str(b" pages at ");
+                lb.hex(layout.initrd.base);
+                lb.str(b"\n");
+                lb.flush();
             }
             // Map init's persistent bootinfo snapshot page into child.
             let err = invoke::vspace_map(
@@ -1196,7 +1380,17 @@ pub unsafe fn spawn_server(
             if is_dynamic && extra.dst == CAP_INITRD_UNTYPED {
                 continue;
             }
-            let err = copy_cap!(extra.src, extra.dst);
+            let err = if extra.badge != 0 {
+                invoke::cnode_mint(
+                    CAP_SELF_CSPACE,
+                    extra.src,
+                    child_cn,
+                    extra.dst,
+                    extra.badge,
+                )
+            } else {
+                copy_cap!(extra.src, extra.dst)
+            };
             if err != 0 {
                 let mut lb = LineBuf::new();
                 lb.str(b"[INIT] ERROR: cap copy failed src=");
@@ -1231,10 +1425,36 @@ pub unsafe fn spawn_server(
         let err = invoke::tcb_set_space(child_tcb, child_cn, child_vs);
         if err != 0 { puts(b"[INIT] TCB set_space failed\n"); return -1; }
 
+        // Set fault handler so VMFaults route to mmsrv for demand paging
+        if mmsrv_ep != 0 {
+            let fault_ep_slot = super::init_alloc_frame_slot(core::ptr::null_mut());
+            let err = invoke::cnode_mint(
+                CAP_SELF_CSPACE, mmsrv_ep,
+                CAP_SELF_CSPACE, fault_ep_slot,
+                spawn_badge,
+            );
+            if err == 0 {
+                let err2 = invoke::tcb_set_fault_handler(child_tcb, fault_ep_slot);
+                if err2 != 0 {
+                    let mut lb = LineBuf::new();
+                    lb.str(b"[INIT] WARN: tcb_set_fault_handler failed err=");
+                    lb.hex(err2 as u64);
+                    lb.str(b"\n");
+                    lb.flush();
+                }
+            } else {
+                let mut lb = LineBuf::new();
+                lb.str(b"[INIT] WARN: fault EP mint failed err=");
+                lb.hex(err as u64);
+                lb.str(b"\n");
+                lb.flush();
+            }
+        }
+
         // Map shared library RO frames into child VSpace
         // Shared libs start after RTLD's actual extent + 1-page gap
         let shared_lib_base = if is_dynamic && layout.shared_libs.size > 0 {
-            map_shared_lib_to_child(child_vs, child_cn, layout.shared_libs.base, &needed)
+            map_shared_lib_to_child(child_vs, child_cn, layout.shared_libs.base, &needed, root_ut)
         } else {
             0
         };
@@ -1334,6 +1554,7 @@ pub unsafe fn spawn_server(
             }
             w!(super::AT_NULL); w!(0);
             w!(0); // padding
+            let _ = idx;
 
             invoke::vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
 
@@ -1358,6 +1579,40 @@ pub unsafe fn spawn_server(
 
         let err = invoke::sc_bind(child_sc, child_tcb);
         if err != 0 { puts(b"[INIT] SC bind failed\n"); return -1; }
+
+        // Register pre-procmgr child with mmsrv before first user instruction.
+        // This guarantees posix_mmap()/brk() works immediately on service start.
+        if mmsrv_ep != 0 {
+            let heap_base = layout.elf_code.end();
+            let mmap_base = salty::layout::compute_mmap_base(&layout, heap_base);
+            let mut mm_msg = SaltyMsg::zeroed();
+            let mut mm_reply = SaltyMsg::zeroed();
+            mm_msg.label = MM_REGISTER;
+            mm_msg.length = 4;
+            mm_msg.regs[0] = spawn_badge;
+            mm_msg.regs[1] = heap_base;
+            mm_msg.regs[2] = mmap_base;
+            mm_msg.regs[3] = 0; // PID not assigned yet in init-spawn path
+            ipc::set_send_cap_ctx(super::ipc_ctx(), 0, child_vs);
+            let mm_err = ipc::call_ctx(
+                super::ipc_ctx(),
+                mmsrv_ep,
+                &raw const mm_msg,
+                &raw mut mm_reply,
+            );
+            if mm_err != 0 || (mm_reply.label != SALTY_OK && mm_reply.label != SALTY_ALREADY_EXISTS) {
+                let mut lb = LineBuf::new();
+                lb.str(b"[INIT] WARN: MM_REGISTER ");
+                lb.bytes(label);
+                lb.str(b" failed err=");
+                lb.hex(mm_err as u64);
+                lb.str(b" label=");
+                lb.hex(mm_reply.label);
+                lb.str(b"\n");
+                lb.flush();
+                return -1;
+            }
+        }
 
         let err = invoke::tcb_resume(child_tcb);
         if err != 0 { puts(b"[INIT] TCB resume failed\n"); return -1; }
@@ -1442,10 +1697,6 @@ pub unsafe fn pm_spawn(
             spawn_flags |= SPAWN_FLAG_USE_PRE_EP;
             ipc::set_send_cap_ctx(super::ipc_ctx(), 0, pre_ep);
         }
-        if matches!(def.restart, super::ini::RestartPolicy::Always) {
-            spawn_flags |= SPAWN_FLAG_RESPAWN;
-        }
-
         let mut spawn_msg = SaltyMsg::zeroed();
         spawn_msg.label = POSIX_PM_SPAWN;
         let packed_name_words = ((len as u64) + 7) / 8;

@@ -30,6 +30,11 @@ use salty::serial;
 use salty::serial::LineBuf;
 use salty::types::*;
 
+// Standard child CSpace layout
+const CAP_SELF_TCB: u64 = 0;
+const CAP_MMSRV_EP: u64 = 7;
+const CAP_READINESS_NTFN: u64 = 14;
+
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
 }
@@ -50,10 +55,9 @@ pub extern "C" fn _start() -> ! {
     unsafe {
         let base = *(&raw const salty::__salty_slot_base);
         let count = *(&raw const salty::__salty_slot_count);
-        let expand_ep = *(&raw const salty::__salty_expand_ep);
         let cspace_ntfn = *(&raw const salty::__salty_cspace_ntfn);
         if base != 0 {
-            salty::slot_alloc::slot_alloc_init(base, count, expand_ep, cspace_ntfn);
+            salty::slot_alloc::slot_alloc_init(base, count, cspace_ntfn);
         } else {
             puts(b"[TEST_RUNNER] FATAL: slot pool not provided by RTLD/auxv\n");
             posix::posix_exit(1);

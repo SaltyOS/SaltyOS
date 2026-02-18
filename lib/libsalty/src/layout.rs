@@ -19,6 +19,8 @@ const DEFAULT_STACK_BASE: u64 = 0x0000_0000_003F_8000;
 const DEFAULT_SCRATCH_BASE: u64 = 0x0000_0000_003F_F000;
 const DEFAULT_STACK_TOP: u64 = DEFAULT_STACK_BASE + (CHILD_STACK_PAGES as u64) * 0x1000;
 const INITRD_BASE: u64 = 0x0000_0000_0100_0000;
+/// Gap between existing mapped regions and the start of mmap allocations.
+const MMAP_BASE_GAP: u64 = 0x0100_0000; // 16 MiB
 
 // Second 2MiB window for stack relocation
 const WINDOW2_STACK_BASE: u64 = 0x0000_0000_007F_8000;
@@ -86,11 +88,56 @@ impl VmLayoutPlan {
             stack_top: 0,
         }
     }
+
+    /// End of the highest code region (shared_libs > rtld > elf_code).
+    /// Heap should start here to avoid colliding with loaded code.
+    pub fn code_end(&self) -> u64 {
+        if self.shared_libs.size > 0 {
+            self.shared_libs.end()
+        } else if self.rtld.size > 0 {
+            self.rtld.end()
+        } else {
+            self.elf_code.end()
+        }
+    }
+
+    /// Highest mapped virtual end address across all planned regions.
+    pub fn max_mapped_end(&self) -> u64 {
+        let mut high = 0u64;
+        let regions = [
+            self.ipc_buf,
+            self.elf_code,
+            self.rtld,
+            self.shared_libs,
+            self.stack,
+            self.scratch,
+            self.initrd,
+        ];
+        for r in regions {
+            if r.size == 0 {
+                continue;
+            }
+            let end = r.end();
+            if end > high {
+                high = end;
+            }
+        }
+        high
+    }
 }
 
 /// Round up to the next 4K page boundary.
 fn page_align_up(v: u64) -> u64 {
     (v + 0xFFF) & !0xFFF
+}
+
+/// Compute a collision-safe default mmap base for a process layout.
+///
+/// Starts after the highest currently-mapped VA region and heap base, with a
+/// fixed guard gap to keep brk growth and anonymous mmap naturally separated.
+pub fn compute_mmap_base(plan: &VmLayoutPlan, heap_base: u64) -> u64 {
+    let high = core::cmp::max(plan.max_mapped_end(), heap_base);
+    page_align_up(high.saturating_add(MMAP_BASE_GAP))
 }
 
 /// Compute a dynamic VA layout for a child process.

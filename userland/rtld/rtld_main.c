@@ -16,7 +16,6 @@ uint64_t __salty_next_frame_slot = 0;
 /* Exported per-process slot pool info for slot_alloc */
 uint64_t __salty_slot_base = 0;
 uint64_t __salty_slot_count = 0;
-uint64_t __salty_expand_ep = 0;
 uint64_t __salty_cspace_ntfn = 0;
 
 void __attribute__((naked, noreturn)) _start(void) {
@@ -100,7 +99,6 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         case AT_SALTY_SHARED_LIB_BASE: g_rtld.shared_lib_base = p[1]; break;
         case AT_SALTY_SLOT_BASE:  g_rtld.slot_base = p[1]; break;
         case AT_SALTY_SLOT_COUNT: g_rtld.slot_count = p[1]; break;
-        case AT_SALTY_EXPAND_EP:  g_rtld.expand_ep = p[1]; break;
         case AT_SALTY_CSPACE_NTFN: g_rtld.cspace_ntfn = p[1]; break;
         }
     }
@@ -311,15 +309,7 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
             *(volatile uint64_t *)count_addr = export_slot_count;
     }
 
-    /* 7c. Export procmgr expansion EP slot for slot_alloc async expansion. */
-    __salty_expand_ep = g_rtld.expand_ep;
-    {
-        uint64_t ep_addr = resolve_symbol_addr(&g_rtld, "__salty_expand_ep");
-        if (ep_addr != 0)
-            *(volatile uint64_t *)ep_addr = g_rtld.expand_ep;
-    }
-
-    /* 7d. Export CSpace expansion notification cap for slot_alloc. */
+    /* 7c. Export CSpace expansion notification cap for slot_alloc. */
     __salty_cspace_ntfn = g_rtld.cspace_ntfn;
     {
         uint64_t ntfn_addr = resolve_symbol_addr(&g_rtld, "__salty_cspace_ntfn");

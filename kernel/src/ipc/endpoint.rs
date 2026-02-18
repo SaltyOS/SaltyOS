@@ -58,6 +58,19 @@ impl Endpoint {
         }
     }
 
+    /// Initialize an endpoint in-place without constructing a large by-value
+    /// temporary (which can inflate kernel stack usage in retype paths).
+    ///
+    /// # Safety
+    /// `ptr` must point to writable memory large enough for `Endpoint`.
+    pub unsafe fn init_at(ptr: *mut Endpoint) {
+        unsafe {
+            core::ptr::write_bytes(ptr as *mut u8, 0, core::mem::size_of::<Endpoint>());
+            (*ptr).header = KernelObject::new(ObjectType::Endpoint, 0);
+            (*ptr).state = EndpointState::Idle;
+        }
+    }
+
     /// Get the current endpoint state
     pub fn state(&self) -> EndpointState {
         self.state
@@ -527,7 +540,7 @@ impl Endpoint {
             (*faulting_tcb).state = ThreadState::Blocked;
             (*faulting_tcb).blocked_reason = Some(BlockedReason::FaultBlocked {
                 msg: *msg,
-                badge: 0,
+                badge: (*faulting_tcb).fault_handler_badge,
             });
 
             match self.state {
@@ -549,8 +562,8 @@ impl Endpoint {
                     (*receiver).reply_tcb = faulting_tcb;
                     (*receiver).reply_can_grant = false;
 
-                    // Transfer fault message to handler
-                    self.transfer_message(faulting_tcb, receiver, msg, 0);
+                    // Transfer fault message to handler (badge identifies faulting client)
+                    self.transfer_message(faulting_tcb, receiver, msg, (*faulting_tcb).fault_handler_badge);
 
                     // Wake handler
                     (*receiver).state = ThreadState::Ready;

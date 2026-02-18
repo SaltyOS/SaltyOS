@@ -1,0 +1,14 @@
+[Service]
+Name=mmsrv
+Binary=mmsrv
+Type=simple
+Restart=always
+PreProcmgr=yes
+CNodeBits=14
+
+[Dependencies]
+After=console nameserv
+Before=vfs procmgr
+
+[Capabilities]
+NeedEP=nameserv:64

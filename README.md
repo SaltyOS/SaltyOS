@@ -42,7 +42,7 @@ SaltyOS is a capability-based microkernel designed with security and modularity 
 - [x] **IPC buffer** (message overflow MR4-MR19, capability transfer)
 - [x] **I/O port capabilities** (IoPort_In8/Out8/In16/Out16)
 - [x] **Debug syscalls** (DebugPutChar, DebugDumpState, DebugPutStr, DebugPutBuf)
-- [x] **Userspace servers** (procmgr, vfs, nameserv)
+- [x] **Userspace servers** (procmgr, vfs, nameserv, mmsrv, display)
 - [x] **SMP** (ACPI MADT discovery, AP trampoline, per-CPU GDT/TSS, APIC timer, IPI reschedule/VSpace teardown, CPU affinity)
 - [x] **IPC assembly fastpath** (hybrid asm/Rust for Call + ReplyRecv, short messages, no cap transfer)
 - [x] **POSIX compatibility** (signals, Unix domain sockets, poll/select/epoll, pipes/FIFOs, shm, fd passing, fork/exec)
@@ -52,6 +52,10 @@ SaltyOS is a capability-based microkernel designed with security and modularity 
 - [x] **saltyc C standard library** (stdio, stdlib, string, malloc, unistd, signal, termios, dirent, regex)
 - [x] **Terminal line discipline** (ICANON, ECHO, ISIG with Ctrl-C/Ctrl-\/Ctrl-Z, tcgetattr/tcsetattr)
 - [x] **Automated test suite** (test_runner with 10 modules: hello, fs, mmap, fork, signal, socket, pipe, time, terminal, epoll)
+- [x] **Framebuffer display server** (shadow buffer, damage tracking, WC-optimized flush)
+- [x] **Centralized memory server (mmsrv)** (frame allocation, VSpace mapping, brk/mmap/fork delegation)
+- [x] **FPU/SSE lazy context switching** (per-thread FPU state, SSE2-optimized libc routines)
+- [x] **Declarative service wiring** (.service files with dependency graph, topological sort boot ordering)
 
 ### Planned
 
@@ -62,22 +66,22 @@ SaltyOS is a capability-based microkernel designed with security and modularity 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Userspace                               │
-├──────────┬──────────┬──────────┬──────────┬──────────┬──────────┤
-│   init   │ console  │  procmgr │   vfs    │ nameserv │   apps   │
-│          │ (serial) │          │          │          │          │
-└────┬─────┴────┬─────┴────┬─────┴────┬─────┴────┬─────┴──────────┘
-     │          │          │          │          │
-     │      IPC (Endpoints + Notifications)     │
-     │          │          │          │          │
-┌────┴──────────┴──────────┴──────────┴──────────┴─────────────────┐
-│                     SaltyOS Microkernel                          │
-├──────────┬──────────┬──────────┬──────────┬──────────┬───────────┤
-│Capability│   IPC    │Scheduler │  Memory  │   SMP    │   Arch    │
-│  System  │Endpoints │  (EDF)   │Management│ (APIC/   │ (x86_64)  │
-│          │          │          │          │  IPI)    │           │
-└──────────┴──────────┴──────────┴──────────┴──────────┴───────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              Userspace                                       │
+├────────┬─────────┬────────┬────────┬──────┬──────────┬─────────┬─────────────┤
+│  init  │ console │ mmsrv  │procmgr │ vfs  │ nameserv │ display │    apps     │
+│        │(serial) │(pager) │        │      │          │  (fb)   │             │
+└───┬────┴────┬────┴───┬────┴───┬────┴──┬───┴────┬─────┴────┬────┴─────────────┘
+    │         │        │        │       │        │          │
+    │         │    IPC (Endpoints + Notifications)         │
+    │         │        │        │       │        │          │
+┌───┴─────────┴────────┴────────┴───────┴────────┴──────────┴──────────────────┐
+│                          SaltyOS Microkernel                                  │
+├──────────┬──────────┬──────────┬──────────┬──────────┬────────────────────────┤
+│Capability│   IPC    │Scheduler │  Memory  │   SMP    │   Arch (x86_64)        │
+│  System  │Endpoints │  (EDF)   │Management│ (APIC/   │   GDT/IDT/APIC        │
+│          │          │          │          │  IPI)    │                        │
+└──────────┴──────────┴──────────┴──────────┴──────────┴────────────────────────┘
 ```
 
 ## Building
@@ -171,14 +175,16 @@ SaltyOS/
 │   ├── init/               # First process (service-based bootstrap)
 │   ├── console/            # Serial console server
 │   ├── rtld/               # Runtime dynamic linker
+│   ├── mmsrv/              # Memory manager server (centralized pager)
 │   ├── procmgr/            # Process manager (spawn/exit/waitpid)
 │   ├── vfs/                # Virtual filesystem server
 │   ├── nameserv/           # Name service (endpoint lookup)
-│   ├── drivers/            # Userspace device drivers
+│   ├── display/            # Framebuffer display server
 │   ├── test_runner/        # Automated test suite
 │   └── services/           # Service descriptor files (.service)
 ├── lib/                    # Shared libraries
-│   └── libsalty/           # System library (Rust, syscall wrappers + POSIX compat)
+│   ├── libsalty/           # System library (Rust, syscall wrappers + POSIX compat)
+│   └── saltyc/             # C standard library (stdio, math, string, malloc, etc.)
 ├── tools/                  # Build utilities
 │   ├── mkcpio.py           # Pack userland ELFs + services into initrd.cpio
 │   └── mkimage.py          # Create bootable disk image
@@ -193,7 +199,7 @@ SaltyOS/
 - Thread management and EDF scheduling with budget enforcement and CPU affinity
 - Synchronous IPC (endpoints) and async notifications
 - Virtual address space management (VSpace) with page tables
-- Physical memory allocation (frame allocator, slab allocator)
+- Physical memory allocation (frame allocator, untyped retype)
 - Capability-based access control (fat capabilities, CDT)
 - Context switching and interrupt handling
 - IRQ routing to userspace via notification capabilities
@@ -203,6 +209,7 @@ SaltyOS/
 ### What the Kernel Does NOT Do (Userspace)
 
 - Filesystem (VFS is a userspace server)
+- Memory allocation policy (mmsrv pager handles brk/mmap/frame allocation)
 - Network stack
 - Device drivers (userspace, with mapped MMIO)
 - Process management policy (userspace procmgr)

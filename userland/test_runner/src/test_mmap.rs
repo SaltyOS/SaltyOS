@@ -7,6 +7,8 @@ use salty::posix_mm;
 use salty::serial;
 use salty::serial::LineBuf;
 
+const CAP_MMSRV_EP: u64 = 7;
+
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
 }
@@ -14,19 +16,9 @@ fn puts(s: &[u8]) {
 pub fn run() -> bool {
     puts(b"[TEST_MMAP] Starting memory management tests\n");
 
-    // Initialize posix_mm with caps from procmgr
-    // Use slot_alloc's current position as the frame slot base for posix_mm
-    let frame_slot = salty::slot_alloc::slot_alloc_base()
-        + (salty::slot_alloc::slot_alloc_count() - salty::slot_alloc::slot_alloc_remaining());
+    // Initialize posix_mm with the mmsrv endpoint (slot 7)
     unsafe {
-        posix_mm::posix_mm_init(
-            CAP_UNTYPED,
-            CAP_SELF_VSPACE,
-            CAP_SELF_CSPACE,
-            frame_slot,
-            0x12000000, // heap base (avoid rtld-loaded libs)
-            0x20000000, // mmap base
-        );
+        posix_mm::posix_mm_init(CAP_MMSRV_EP);
     }
 
     // Test 1: sbrk

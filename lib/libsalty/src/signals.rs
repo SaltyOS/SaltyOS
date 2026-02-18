@@ -15,6 +15,10 @@ use crate::consts::*;
 use crate::types::*;
 use core::sync::atomic::Ordering;
 
+// Standard child CSpace layout
+const CAP_PROCMGR_EP: u64 = 3;
+const CAP_SIGNAL_NTFN: u64 = 6;
+
 /// Returns `true` if the default action for `sig` is to terminate the process.
 fn sig_default_action(sig: i32) -> bool {
     // Returns true if default action is terminate

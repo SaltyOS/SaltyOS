@@ -102,6 +102,8 @@ struct InitCNodeStorage {
 static mut INIT_TCB: Tcb = Tcb::new();
 static mut INIT_SCHED_CTX: SchedContext = SchedContext::new();
 static mut INIT_VSPACE: MaybeUninit<VSpace> = MaybeUninit::uninit();
+/// Static VSpaceTracking for init's VSpace (bootstrap, not from untyped)
+static mut INIT_VSPACE_TRACKING: crate::mm::VSpaceTracking = crate::mm::VSpaceTracking::new(0);
 static mut INIT_CNODE_STORAGE: InitCNodeStorage = InitCNodeStorage {
     header: KernelObject::new(ObjectType::CNode, INIT_CNODE_SIZE_BITS),
     guard_bits: 0,
@@ -162,8 +164,12 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
         }
     }
 
-    // Create VSpace from the new PML4
-    let mut vspace = VSpace::new(pml4_phys);
+    // Create VSpace from the new PML4 with static tracking (bootstrap, not from untyped)
+    unsafe {
+        let tracking = &raw mut INIT_VSPACE_TRACKING;
+        (*tracking) = crate::mm::VSpaceTracking::new(pml4_phys);
+    }
+    let mut vspace = VSpace::new(pml4_phys, &raw mut INIT_VSPACE_TRACKING);
 
     // Initrd is required now that kernel fallback init is removed.
     let info = match boot_info {

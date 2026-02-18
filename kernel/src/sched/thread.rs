@@ -128,6 +128,8 @@ pub struct Tcb {
     pub reply_can_grant: bool,
     /// Fault handler endpoint (for delivering faults to userspace handler)
     pub fault_handler: *mut u8,
+    /// Badge of the fault handler endpoint capability
+    pub fault_handler_badge: u64,
     /// Bound notification for combined IPC wait
     pub bound_notification: *mut u8,
     /// Kernel stack top for syscall entry (per-thread kernel stack)
@@ -250,6 +252,7 @@ impl Tcb {
             reply_tcb: core::ptr::null_mut(),
             reply_can_grant: false,
             fault_handler: core::ptr::null_mut(),
+            fault_handler_badge: 0,
             bound_notification: core::ptr::null_mut(),
             kernel_stack_top: 0,
             user_stack_top: 0,
@@ -258,6 +261,19 @@ impl Tcb {
             sleep_next: core::ptr::null_mut(),
             fpu_state: XSaveArea::zeroed(),
             fpu_initialized: false,
+        }
+    }
+
+    /// Initialize a TCB in-place without constructing a large by-value temporary.
+    ///
+    /// # Safety
+    /// `ptr` must point to writable memory large enough for `Tcb`.
+    pub unsafe fn init_at(ptr: *mut Tcb) {
+        unsafe {
+            core::ptr::write_bytes(ptr as *mut u8, 0, core::mem::size_of::<Tcb>());
+            (*ptr).header = KernelObject::new(ObjectType::Tcb, 0);
+            (*ptr).state = ThreadState::Inactive;
+            (*ptr).cpu_affinity = 0xFFFF_FFFF;
         }
     }
 
@@ -291,6 +307,7 @@ impl Tcb {
         self.reply_tcb = core::ptr::null_mut();
         self.reply_can_grant = false;
         self.fault_handler = core::ptr::null_mut();
+        self.fault_handler_badge = 0;
         self.user_stack_top = 0;
         self.user_stack_min = 0;
         self.timer_wakeup_ns = 0;

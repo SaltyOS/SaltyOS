@@ -261,7 +261,7 @@ fn object_size(obj_type: ObjectType, size_bits: u8) -> Result<usize, CapError> {
                 + ((1usize << bits) * core::mem::size_of::<CapRef>()))
         }
         ObjectType::Tcb => Ok(core::mem::size_of::<crate::sched::thread::Tcb>()),
-        ObjectType::VSpace => Ok(PAGE_SIZE), // Page table (always 4KB-aligned PML4)
+        ObjectType::VSpace => Ok(crate::mm::vspace::VSPACE_OBJECT_SIZE), // PML4 + embedded VSpaceTracking
         ObjectType::Frame => {
             // Minimum 4KB page; size_bits=0 defaults to PAGE_SIZE
             let bits = if size_bits < 12 { 12 } else { size_bits };
@@ -289,7 +289,7 @@ unsafe fn init_object(
         match obj_type {
             ObjectType::Endpoint => {
                 let ep = virt_addr as *mut crate::ipc::Endpoint;
-                ep.write(crate::ipc::Endpoint::new());
+                crate::ipc::Endpoint::init_at(ep);
                 Ok(ep as *mut KernelObject)
             }
 
@@ -311,7 +311,7 @@ unsafe fn init_object(
 
             ObjectType::Tcb => {
                 let tcb = virt_addr as *mut crate::sched::thread::Tcb;
-                tcb.write(crate::sched::thread::Tcb::new());
+                crate::sched::thread::Tcb::init_at(tcb);
                 Ok(tcb as *mut KernelObject)
             }
 
@@ -370,6 +370,10 @@ unsafe fn init_frame_metadata(
 
 /// Initialize VSpace metadata in dynamically-allocated storage and initialize
 /// the provided physical page as a PML4 root.
+///
+/// The untyped allocation for VSpace is `VSPACE_OBJECT_SIZE` bytes:
+///   [0..PAGE_SIZE)  = PML4 page table root
+///   [PAGE_SIZE..)   = embedded VSpaceTracking (seL4-style)
 unsafe fn init_vspace_metadata(
     cap_slot: CapSlot,
     pml4_phys: PhysAddr,
@@ -384,15 +388,17 @@ unsafe fn init_vspace_metadata(
         for i in 256..512 {
             pml4_virt.add(i).write(kernel_pml4.add(i).read());
         }
-    }
 
-    // SAFETY: METADATA_STATE is initialized before any retype operations
-    let vspace_ptr = unsafe { (*(&raw const METADATA_STATE)).vspace_ptr.add(cap_slot as usize) };
-    let vspace_ptr = unsafe { (*vspace_ptr).as_mut_ptr() };
-    unsafe {
-        vspace_ptr.write(crate::mm::VSpace::new(pml4_phys));
+        // Initialize embedded VSpaceTracking at pml4_phys + PAGE_SIZE
+        let tracking_ptr = crate::mm::vspace::tracking_from_vspace_phys(pml4_phys);
+        core::ptr::write(tracking_ptr, crate::mm::VSpaceTracking::new(pml4_phys));
+
+        // SAFETY: METADATA_STATE is initialized before any retype operations
+        let vspace_ptr = (*(&raw const METADATA_STATE)).vspace_ptr.add(cap_slot as usize);
+        let vspace_ptr = (*vspace_ptr).as_mut_ptr();
+        vspace_ptr.write(crate::mm::VSpace::new(pml4_phys, tracking_ptr));
+        vspace_ptr as *mut crate::cap::object::KernelObject
     }
-    vspace_ptr as *mut crate::cap::object::KernelObject
 }
 
 /// Initialize sub-untyped metadata in dynamically-allocated storage.
@@ -466,10 +472,19 @@ impl UntypedMemory {
         if obj_size > 0 {
             let align = if new_type == ObjectType::CNode {
                 core::mem::align_of::<crate::cap::CNode>()
+            } else if new_type == ObjectType::VSpace {
+                PAGE_SIZE // PML4 must be page-aligned; trailing tracking doesn't need obj_size alignment
             } else {
                 obj_size
             };
-            let aligned = (self.watermark as usize + align - 1) & !(align - 1);
+            let watermark = self.watermark as usize;
+            let rounded = watermark
+                .checked_add(align - 1)
+                .ok_or(CapError::InsufficientMemory)?;
+            let aligned = (rounded / align) * align;
+            if aligned > self.size_bytes() || aligned > u32::MAX as usize {
+                return Err(CapError::InsufficientMemory);
+            }
             self.watermark = aligned as u32;
 
             // Re-check after alignment

@@ -864,6 +864,18 @@ fn syscall_invoke(
         Err(e) => return SyscallResult::err(e),
     };
 
+    syscall_invoke_inner(cap, label, cap_ptr, arg0, arg1, arg2, arg3)
+}
+
+fn syscall_invoke_inner(
+    cap: crate::cap::Capability,
+    label: u64,
+    cap_ptr: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+) -> SyscallResult {
     match (cap.obj_type, label) {
         (ObjectType::CNode, 0x10) => {
             // CNode_Copy: entire operation under CAP_LOCK
@@ -1293,6 +1305,10 @@ fn syscall_invoke(
             //   arg1 = offset_start, arg2 = vaddr_start,
             //   arg3 = (count << 32) | flags
             syscall_vspace_map_device_range(&cap, arg0, arg1, arg2, arg3)
+        }
+        (ObjectType::VSpace, 0x58) => {
+            // VSPACE_PROTECT: arg0 = virt_addr, arg1 = flags_bits
+            syscall_vspace_protect(&cap, arg0, arg1)
         }
 
         // SchedContext operations
@@ -2102,6 +2118,7 @@ fn syscall_tcb_set_fault_handler(
         SCHED_IPC_LOCK.lock();
         let tcb = &mut *(cap.object as *mut Tcb);
         tcb.fault_handler = ep_cap.object as *mut u8;
+        tcb.fault_handler_badge = ep_cap.badge;
         SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
     }
@@ -2359,6 +2376,34 @@ fn syscall_vspace_unmap(cap: &Capability, virt_addr: u64) -> SyscallResult {
     unsafe {
         let vspace = &mut *(cap.object as *mut VSpace);
         match vspace.unmap(virt_addr) {
+            Ok(()) => SyscallResult::ok(0),
+            Err(e) => SyscallResult::err(syscall_error_from_vspace_error(e)),
+        }
+    }
+}
+
+/// VSPACE_PROTECT: Change protection flags on a mapped page
+///
+/// Args:
+/// - virt_addr: Virtual address of the page
+/// - flags_bits: New mapping flags (bit 0=writable, bit 1=user, bit 2=executable)
+fn syscall_vspace_protect(cap: &Capability, virt_addr: u64, flags_bits: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::MAP) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let vspace = &mut *(cap.object as *mut VSpace);
+        let flags = PageFlags {
+            writable: flags_bits & 1 != 0,
+            user: flags_bits & 2 != 0,
+            executable: flags_bits & 4 != 0,
+            cache_disable: flags_bits & 8 != 0,
+            write_through: flags_bits & 16 != 0,
+            cow: flags_bits & 32 != 0,
+        };
+
+        match vspace.protect(virt_addr, flags) {
             Ok(()) => SyscallResult::ok(0),
             Err(e) => SyscallResult::err(syscall_error_from_vspace_error(e)),
         }

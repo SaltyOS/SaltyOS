@@ -24,6 +24,7 @@ const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_CSPACE: u64 = 2;
 const CAP_SERVER_EP: u64 = 3;
+const CAP_READINESS_NTFN: u64 = 14;
 const CAP_IOPORT: u64 = 64;     // COM1 IoPort (CopyCap 8:64)
 const CAP_IRQ: u64 = 65;        // COM1 IRQ handler (CopyCap 9:65)
 const CAP_NTFN: u64 = 66;       // COM1+PS/2 IRQ notification (CopyCap 10:66)

@@ -23,6 +23,7 @@ pub struct EpNeedDef {
     pub service: [u8; MAX_SERVICE_NAME],
     pub service_len: u8,
     pub dst_slot: u64,
+    pub badged: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -96,7 +97,7 @@ impl ServiceDef {
             pre_procmgr: false,
             caps: [CapCopyDef { src_slot: 0, dst_slot: 0 }; MAX_CAP_COPIES],
             cap_count: 0,
-            ep_needs: [EpNeedDef { service: [0; MAX_SERVICE_NAME], service_len: 0, dst_slot: 0 }; MAX_EP_NEEDS],
+            ep_needs: [EpNeedDef { service: [0; MAX_SERVICE_NAME], service_len: 0, dst_slot: 0, badged: false }; MAX_EP_NEEDS],
             ep_need_count: 0,
             ep_injects: [EpInjectDef { target: [0; MAX_SERVICE_NAME], target_len: 0, target_slot: 0 }; MAX_EP_INJECTS],
             ep_inject_count: 0,
@@ -362,20 +363,49 @@ fn parse_ep_needs(value: &[u8], needs: &mut [EpNeedDef; MAX_EP_NEEDS]) -> u8 {
         }
 
         let token = &val[start..i];
-        let mut colon = 0;
+        let mut first_colon = 0;
         let mut found = false;
         for j in 0..token.len() {
             if token[j] == b':' {
-                colon = j;
+                first_colon = j;
                 found = true;
                 break;
             }
         }
         if found {
-            let name = &token[..colon];
-            let mut entry = EpNeedDef { service: [0; MAX_SERVICE_NAME], service_len: 0, dst_slot: 0 };
+            let name = &token[..first_colon];
+            let rest = &token[first_colon + 1..];
+
+            // Look for second colon separating slot from :badge flag
+            let mut second_colon = 0;
+            let mut found_second = false;
+            for j in 0..rest.len() {
+                if rest[j] == b':' {
+                    second_colon = j;
+                    found_second = true;
+                    break;
+                }
+            }
+
+            let mut entry = EpNeedDef {
+                service: [0; MAX_SERVICE_NAME],
+                service_len: 0,
+                dst_slot: 0,
+                badged: false,
+            };
             entry.service_len = copy_to_buf(name, &mut entry.service);
-            entry.dst_slot = parse_decimal_u64(&token[colon + 1..]);
+
+            if found_second {
+                // Parse slot from rest[..second_colon], check for "badge" flag
+                entry.dst_slot = parse_decimal_u64(&rest[..second_colon]);
+                let flag = &rest[second_colon + 1..];
+                entry.badged = bytes_eq_ci(flag, b"badge");
+            } else {
+                // No second colon, just parse slot
+                entry.dst_slot = parse_decimal_u64(rest);
+                entry.badged = false;
+            }
+
             needs[count as usize] = entry;
             count += 1;
         }

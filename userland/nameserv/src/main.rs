@@ -25,7 +25,10 @@ use salty::serial;
 use salty::serial::LineBuf;
 use salty::types::*;
 
+const CAP_SELF_TCB: u64 = 0;
+const CAP_SELF_CSPACE: u64 = 2;
 const CAP_SERVER_EP: u64 = 3;
+const CAP_READINESS_NTFN: u64 = 14;
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 const CAP_SERVICE_BASE: u64 = 32;

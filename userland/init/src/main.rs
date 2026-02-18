@@ -37,6 +37,12 @@ use spawn::ExtraCapCopy;
 // Constants
 // ======================================================================
 
+pub const CAP_SELF_TCB: u64 = 0;
+pub const CAP_SELF_VSPACE: u64 = 1;
+pub const CAP_SELF_CSPACE: u64 = 2;
+pub const CAP_INITRD_UNTYPED: u64 = 12;
+pub const CAP_READINESS_NTFN: u64 = 14;
+pub const CAP_UNTYPED_START: u64 = 16;
 const CAP_IPC_BUF_FRAME: u64 = 131;
 const CAP_UNTYPED_PROBE_TMP: u64 = 132;
 pub const CAP_BOOTINFO_SNAPSHOT_FRAME: u64 = 133;
@@ -403,27 +409,11 @@ fn get_cap_base(spawn_idx: u64) -> u64 {
     CAP_CHILD_BASE + CAP_CHILD_STRIDE * spawn_idx
 }
 
-/// Check whether procmgr's Requires= dependencies reference a given service name.
-/// Services that procmgr blocks on during startup must be init-spawned.
-fn is_procmgr_requires(mgr: &svc_mgr::ServiceManager, pm_idx: i32, name: &[u8]) -> bool {
-    if pm_idx < 0 {
-        return false;
-    }
-    let pm = &mgr.services[pm_idx as usize];
-    for i in 0..pm.def.ep_need_count as usize {
-        let dep_name = &pm.def.ep_needs[i].service[..pm.def.ep_needs[i].service_len as usize];
-        if bytes_eq(dep_name, name) {
-            return true;
-        }
-    }
-    false
-}
-
 unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable: u64) -> Cap {
     let mut pre_spawn_idx: u64 = 0;
     let mut procmgr_ep: Cap = 0;
     let mut procmgr_raw_ep: Cap = 0; // Raw (unbadged) EP for minting into children
-    let pm_svc_idx = mgr.find_service(b"procmgr");
+    let _pm_svc_idx = mgr.find_service(b"procmgr");
 
     for order_idx in 0..mgr.boot_order_len {
         let svc_idx = mgr.boot_order[order_idx] as usize;
@@ -459,6 +449,7 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
 
         if is_pre_procmgr {
             let cap_base = get_cap_base(pre_spawn_idx);
+            let child_badge = 0x1000 + pre_spawn_idx;
 
             // Copy capability-related fields to stack to avoid borrow conflicts
             let cap_count = mgr.services[svc_idx].def.cap_count;
@@ -474,14 +465,16 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
             let svc_pre_ep = mgr.services[svc_idx].pre_ep;
 
             // Build extras from [Capabilities] declarations
-            let mut extras = [ExtraCapCopy { src: 0, dst: 0 }; 10];
+            let mut extras = [ExtraCapCopy { src: 0, dst: 0, badge: 0 }; 10];
             let mut n: usize = 0;
+            let mut mmsrv_ep_src: Cap = 0;
 
             for i in 0..cap_count as usize {
                 if n < extras.len() {
                     extras[n] = ExtraCapCopy {
                         src: caps[i].src_slot,
                         dst: caps[i].dst_slot,
+                        badge: 0,
                     };
                     n += 1;
                 }
@@ -493,9 +486,13 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                 if provider_idx >= 0 && n < extras.len() {
                     let pre_ep = mgr.services[provider_idx as usize].pre_ep;
                     if pre_ep != 0 {
+                        if bytes_eq(svc_name, b"mmsrv") {
+                            mmsrv_ep_src = pre_ep;
+                        }
                         extras[n] = ExtraCapCopy {
                             src: pre_ep,
                             dst: ep_needs[i].dst_slot,
+                            badge: if ep_needs[i].badged { child_badge } else { 0 },
                         };
                         n += 1;
                     }
@@ -503,9 +500,6 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
             }
 
             let ut_bits = compute_service_budget(total_usable, mgr.count, memory_kb, do_map_initrd);
-
-            let is_procmgr_svc = bytes_eq(name, b"procmgr");
-            let child_badge = 0x1000 + pre_spawn_idx;
             let err = unsafe {
                 spawn::spawn_server(
                     ut,
@@ -519,7 +513,8 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                     do_map_initrd,
                     ready_timeout_ns,
                     svc_pre_ep,
-                    if is_procmgr_svc { 0 } else { procmgr_raw_ep },
+                    mmsrv_ep_src,
+                    procmgr_raw_ep,
                     child_badge,
                 )
             };

@@ -294,69 +294,6 @@ impl SaltyDirent {
     }
 }
 
-/// A tracked virtual memory region in the per-process memory manager.
-/// Each region records its base, length, type (heap/mmap/shm/free),
-/// protection bits, and the frame capability slots backing its pages.
-#[repr(C)]
-pub struct PosixMmRegion {
-    pub base: u64,
-    pub length: u64,
-    pub region_type: u8,
-    pub prot: u8,
-    pub num_pages: u16,
-    pub frame_slots: [Cap; crate::consts::MM_MAX_PAGES_PER_REGION],
-}
-
-impl PosixMmRegion {
-    pub const fn zeroed() -> Self {
-        PosixMmRegion {
-            base: 0,
-            length: 0,
-            region_type: MM_REGION_FREE,
-            prot: 0,
-            num_pages: 0,
-            frame_slots: [0; crate::consts::MM_MAX_PAGES_PER_REGION],
-        }
-    }
-}
-
-pub const MM_REGION_FREE: u8 = 0;
-pub const MM_REGION_HEAP: u8 = 1;
-pub const MM_REGION_MMAP: u8 = 2;
-
-/// Global per-process memory management state for brk/mmap/munmap.
-///
-/// Tracks the heap (contiguous, grown via `brk`/`sbrk`) and mmap regions
-/// (non-contiguous, each with its own frame caps). The heap grows upward
-/// from `heap_base`; mmap regions are bump-allocated from `mmap_base`.
-#[repr(C)]
-pub struct PosixMmState {
-    /// Untyped cap to allocate frames from.
-    pub untyped: Cap,
-    /// This process's VSpace cap for mapping.
-    pub vspace: Cap,
-    /// This process's CSpace cap for slot management.
-    pub cspace: Cap,
-    /// Next CNode slot for frame allocation.
-    pub next_frame_slot: Cap,
-    /// Upper bound on frame slot allocation.
-    pub max_frame_slot: Cap,
-    /// Fixed base address of the heap region.
-    pub heap_base: u64,
-    /// Current program break (end of allocated heap).
-    pub heap_current: u64,
-    /// Base address for mmap allocations.
-    pub mmap_base: u64,
-    /// Next available mmap address (bump allocator).
-    pub mmap_next: u64,
-    /// Region table tracking mmap/shm allocations.
-    pub regions: [PosixMmRegion; crate::consts::MM_MAX_REGIONS],
-    /// Frame cap slots backing heap pages (indexed by page offset from base).
-    pub heap_frame_slots: [Cap; crate::consts::MM_MAX_PAGES_PER_REGION],
-    /// 1 if initialized, 0 otherwise.
-    pub initialized: i32,
-}
-
 /// Returns true if the child terminated normally (exit, not signal).
 /// POSIX encoding: low 7 bits = termination signal (0 = normal exit).
 pub fn wifexited(s: i32) -> bool {
@@ -389,9 +326,6 @@ pub type SigHandlerT = Option<unsafe extern "C" fn(i32)>;
 // Special handler values encoded as usize
 pub const SIG_DFL: usize = 0;
 pub const SIG_IGN: usize = 1;
-
-// SHM memory region type
-pub const MM_REGION_SHM: u8 = 3;
 
 /// Unix domain socket address. `sun_family` is `AF_UNIX` (1).
 /// `sun_path` holds the null-terminated filesystem path (max 64 bytes).

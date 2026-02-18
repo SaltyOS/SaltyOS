@@ -20,6 +20,10 @@ use crate::invoke;
 use crate::serial;
 use crate::types::*;
 
+// Standard child CSpace layout
+const CAP_SELF_CSPACE: u64 = 2;
+const CAP_UNTYPED_START: u64 = 16;
+
 /// Round down to the nearest 4K page boundary.
 fn page_align_down(v: u64) -> u64 {
     v & !(ELF_PAGE_SIZE - 1)

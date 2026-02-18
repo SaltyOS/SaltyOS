@@ -23,12 +23,15 @@ use salty::types::*;
 
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 const FB_MAP_VADDR: u64 = 0x0000_0000_3000_0000;
-const SHADOW_BUF_VADDR: u64 = 0x0000_0000_3800_0000;
 
 // slot 3 is kept as procmgr EP for slot_alloc expansion; display service EP is separate.
-const CAP_SERVER_EP: u64 = 68;    // Pre-created display service EP (injected by procmgr)
-const CAP_FB_UNTYPED: u64 = 13;   // Standard well-known slot (consts::CAP_FB_UNTYPED)
+const CAP_SELF_TCB: u64 = 0;
+const CAP_SELF_VSPACE: u64 = 1;
 const CAP_NAMESERV_EP: u64 = 5;   // Standard well-known slot (consts::CAP_NAMESERV_EP)
+const CAP_MMSRV_EP: u64 = 7;
+const CAP_FB_UNTYPED: u64 = 13;   // Standard well-known slot (consts::CAP_FB_UNTYPED)
+const CAP_READINESS_NTFN: u64 = 14;
+const CAP_SERVER_EP: u64 = 68;    // Pre-created display service EP (injected by procmgr)
 
 struct DisplayState {
     vram: *mut u8,
@@ -283,62 +286,34 @@ fn map_framebuffer(fb: &framebuffer::FramebufferInfo) -> bool {
     true
 }
 
-fn alloc_shadow_buffer(num_pages: u64) -> bool {
-    let flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-    const MAX_RETRIES: usize = 1000;
-
-    for i in 0..num_pages {
-        let vaddr = SHADOW_BUF_VADDR + i * 4096;
-        let mut retries = 0;
-        loop {
-            match salty::slot_alloc::slot_alloc_frame_map_async(CAP_SELF_VSPACE, vaddr, flags) {
-                salty::slot_alloc::SlotResult::Ok(_) => break,
-                salty::slot_alloc::SlotResult::WouldBlock => {
-                    retries += 1;
-                    if retries % 100 == 0 {
-                        let mut lb = LineBuf::new();
-                        lb.str(b"[DISPLAY] expand retry ");
-                        lb.dec(retries as u64);
-                        lb.str(b" page=");
-                        lb.hex(i);
-                        lb.str(b"\n");
-                        lb.flush();
-                    }
-                    if retries > MAX_RETRIES {
-                        let mut lb = LineBuf::new();
-                        lb.str(b"[DISPLAY] Shadow alloc max retries at page ");
-                        lb.hex(i);
-                        lb.str(b"\n");
-                        lb.flush();
-                        return false;
-                    }
-                    syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-                }
-                salty::slot_alloc::SlotResult::Exhausted => {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[DISPLAY] Shadow alloc exhausted at page ");
-                    lb.hex(i);
-                    lb.str(b"\n");
-                    lb.flush();
-                    return false;
-                }
-            }
-        }
+fn alloc_shadow_buffer(fb_size: u64) -> *mut u8 {
+    let len = (fb_size + 4095) & !4095u64;
+    let ptr = unsafe {
+        salty::posix_mm::posix_mmap(
+            core::ptr::null_mut(),
+            len,
+            0x3,  // PROT_READ | PROT_WRITE
+            0x22, // MAP_PRIVATE | MAP_ANONYMOUS
+            -1,
+            0,
+        )
+    };
+    if ptr == usize::MAX as *mut u8 || ptr.is_null() {
+        serial::serial_puts(b"[DISPLAY] Shadow buffer posix_mmap failed\n");
+        return core::ptr::null_mut();
     }
 
     {
         let mut lb = LineBuf::new();
-        lb.str(b"[DISPLAY] Allocated ");
-        lb.hex(num_pages);
-        lb.str(b" shadow pages at ");
-        lb.hex(SHADOW_BUF_VADDR);
-        lb.str(b" (slot_alloc remaining=");
-        lb.hex(salty::slot_alloc::slot_alloc_remaining());
-        lb.str(b")\n");
+        lb.str(b"[DISPLAY] Shadow buffer: ");
+        lb.hex(len / 4096);
+        lb.str(b" pages at ");
+        lb.hex(ptr as u64);
+        lb.str(b"\n");
         lb.flush();
     }
 
-    true
+    ptr
 }
 
 fn register_with_nameserv() -> bool {
@@ -473,10 +448,9 @@ pub extern "C" fn _start() -> ! {
     unsafe {
         let base = *(&raw const salty::__salty_slot_base);
         let count = *(&raw const salty::__salty_slot_count);
-        let expand_ep = *(&raw const salty::__salty_expand_ep);
         let cspace_ntfn = *(&raw const salty::__salty_cspace_ntfn);
         if base != 0 {
-            salty::slot_alloc::slot_alloc_init(base, count, expand_ep, cspace_ntfn);
+            salty::slot_alloc::slot_alloc_init(base, count, cspace_ntfn);
         } else {
             puts(b"[DISPLAY] FATAL: slot pool not provided by RTLD/auxv\n");
             signal_ready();
@@ -508,6 +482,11 @@ pub extern "C" fn _start() -> ! {
         lb.flush();
     }
 
+    // Initialize mmsrv client for posix_mmap
+    unsafe {
+        salty::posix_mm::posix_mm_init(CAP_MMSRV_EP);
+    }
+
     // Map framebuffer with write-combining (WRITE_THROUGH flag)
     if !map_framebuffer(&fb) {
         puts(b"[DISPLAY] Failed to map framebuffer\n");
@@ -515,10 +494,10 @@ pub extern "C" fn _start() -> ! {
         idle();
     }
 
-    // Allocate shadow buffer
+    // Allocate shadow buffer via mmsrv
     let fb_size = fb.height as u64 * fb.pitch as u64;
-    let shadow_pages = (fb_size + 4095) / 4096;
-    if !alloc_shadow_buffer(shadow_pages) {
+    let shadow_ptr = alloc_shadow_buffer(fb_size);
+    if shadow_ptr.is_null() {
         puts(b"[DISPLAY] Failed to allocate shadow buffer\n");
         signal_ready();
         idle();
@@ -529,14 +508,14 @@ pub extern "C" fn _start() -> ! {
     unsafe {
         core::ptr::copy_nonoverlapping(
             FB_MAP_VADDR as *const u8,
-            SHADOW_BUF_VADDR as *mut u8,
+            shadow_ptr,
             fb_size as usize,
         );
     }
 
     let mut state = DisplayState {
         vram: FB_MAP_VADDR as *mut u8,
-        shadow: SHADOW_BUF_VADDR as *mut u8,
+        shadow: shadow_ptr,
         width: fb.width,
         height: fb.height,
         pitch: fb.pitch,

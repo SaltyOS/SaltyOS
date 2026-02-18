@@ -112,7 +112,7 @@ restore_irq(irq);
 
 - **`#![no_std]` with only `core`** — no `alloc` crate, no heap allocation
 - **No floating point in kernel** — target `x86_64-unknown-none` with `-mno-sse -mno-mmx -mno-avx`
-- **Slab allocator for fixed kernel objects only** — objects are never freed (owned by untyped memory parent). Pointers to kernel objects remain valid for the lifetime of the system.
+- **No kernel heap or slab** — all kernel objects are carved from untyped memory via `retype`. Objects are never freed (owned by untyped memory parent). Pointers to kernel objects remain valid for the lifetime of the system.
 - **Never `.unwrap()` or `.expect()`** in kernel hot paths — use `match` or `if let`
 - **EOI before schedulable code** — context switch can happen inside `timer_tick()`. Always send `eoi()` before calling any function that might trigger a context switch, or the APIC blocks all further timer interrupts.
 - **Per-thread state on kernel stack, not per-CPU globals** — per-CPU `%gs:16` (saved_rsp) is shared state that gets overwritten by other threads' syscalls. Save user RSP on the per-thread kernel stack instead.
@@ -148,7 +148,7 @@ restore_irq(irq);
 | `arch/x86_64/` | GDT, IDT, APIC, paging, SMP (AP trampoline), per-CPU data |
 | `cap/` | CNode (4-16 bit slots), Untyped retype, CDT, IoPort caps |
 | `ipc/` | Endpoints (sync rendezvous), Notifications (async bitmap), IRQ routing |
-| `mm/` | VSpace (page tables), Frame allocator, Slab allocator |
+| `mm/` | VSpace (page tables, COW, VSpaceTracking), Frame allocator (bitmap PMM) |
 | `sched/` | EDF scheduler (per-CPU ready queues), TCB, context switch, sleep queue |
 | `syscall/` | 14 syscalls, capability invocation dispatch, IPC fastpath |
 
@@ -194,6 +194,7 @@ Set by kernel for init; inherited by child processes:
 | 3 | CAP_PROCMGR_EP | Process manager endpoint |
 | 4 | CAP_VFS_EP | VFS server endpoint |
 | 5 | CAP_NAMESERV_EP | Name service endpoint |
+| 7 | CAP_MMSRV_EP | Memory manager server endpoint |
 | 8 | CAP_COM1_IOPORT | Serial port I/O port |
 | 11 | CAP_CONSOLE_EP | Console server endpoint |
 | 16+ | CAP_UNTYPED_START | Untyped memory capabilities |
@@ -214,6 +215,7 @@ Include paths are relative to `boot/` root (Meson `-I` flag). Files in `stage3/a
 | `init` | First process — service-based multi-phase bootstrap |
 | `rtld` | Runtime dynamic linker (loads libsalty.so) |
 | `console` | Serial console server (IoPort cap for COM1) |
+| `mmsrv` | Memory manager server (centralized frame allocation, VSpace mapping) |
 | `procmgr` | Process manager (spawn/exit/waitpid) |
 | `vfs` | Virtual filesystem server (ramfs + devfs + Unix sockets + shm + poll) |
 | `nameserv` | Name service (endpoint lookup) |

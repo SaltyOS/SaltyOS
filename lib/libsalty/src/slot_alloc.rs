@@ -2,14 +2,8 @@
 //!
 //! Provides a bump allocator over a chained array of CNode slot segments.
 //! The initial segment is assigned by procmgr/init at spawn time. When all
-//! segments are exhausted, an async expansion protocol requests more slots
-//! from the process manager via NBSend + Call.
-//!
-//! Untyped expansion uses a Signal-based async protocol: the child signals
-//! a bound notification on the procmgr, which places untypeds at deterministic
-//! CNode slots (UT_EXPAND_BASE + N). The child probes those slots to detect
-//! completion — the probe retype doubles as both completion check and frame
-//! creation.
+//! segments are exhausted, an expansion protocol requests more slots from
+//! the process manager (CSpace expansion via Signal+probe or blocking Call).
 //!
 //! The pool base and count are communicated via auxv entries
 //! `AT_SALTY_SLOT_BASE` and `AT_SALTY_SLOT_COUNT`.
@@ -23,12 +17,13 @@ use crate::serial;
 use crate::syscall::syscall;
 use crate::types::Cap;
 
+// Standard child CSpace layout
+const CAP_SELF_TCB: u64 = 0;
+const CAP_SELF_CSPACE: u64 = 2;
+const CAP_PROCMGR_EP: u64 = 3;
+
 const SLOT_EXPAND_BITS_DEFAULT: u64 = 10;
 const MAX_SEGMENTS: usize = 16;
-const MAX_EXTRA_UT: usize = MAX_UT_EXPANSIONS;
-const MIRRORED_UT_SCAN_LIMIT: usize = 200;
-const MIRRORED_UT_BITMAP_BITS: usize = MIRRORED_UT_SCAN_LIMIT - CAP_UNTYPED_START as usize;
-const MIRRORED_UT_BITMAP_WORDS: usize = (MIRRORED_UT_BITMAP_BITS + 63) / 64;
 
 /// A contiguous range of CNode slots available for allocation.
 #[derive(Clone, Copy)]
@@ -68,8 +63,6 @@ struct SlotAllocState {
     initialized: bool,
     /// Procmgr EP for CSpace expansion (always CAP_PROCMGR_EP).
     procmgr_ep: Cap,
-    /// Bound notification cap for UT expansion signaling.
-    expand_ntfn: Cap,
     /// Notification cap for CSpace expansion signaling.
     cspace_ntfn: Cap,
     expand_state: ExpandState,
@@ -87,7 +80,6 @@ static mut SLOT_ALLOC: SlotAllocState = SlotAllocState {
     active_seg: 0,
     initialized: false,
     procmgr_ep: 0,
-    expand_ntfn: 0,
     cspace_ntfn: 0,
     expand_state: ExpandState::Idle,
     root_bits: 0,
@@ -95,29 +87,17 @@ static mut SLOT_ALLOC: SlotAllocState = SlotAllocState {
     cspace_expand_count: 0,
 };
 
-// Dynamic untyped expansion state (Signal-based)
-static mut UT_EXPAND_REQUESTED: bool = false;
-static mut EXTRA_UT_SLOTS: [Cap; MAX_EXTRA_UT] = [0; MAX_EXTRA_UT];
-static mut EXTRA_UT_COUNT: usize = 0;
-static mut PENDING_FRAME_SLOT: Cap = 0;
-static mut MIRRORED_UT_HINT: Cap = CAP_UNTYPED_START;
-static mut EXTRA_UT_HINT: usize = 0;
-static mut UNTYPED_SCAN_END_CACHE: Cap = 0;
-static mut MIRRORED_UT_SKIP_BITMAP: [u64; MIRRORED_UT_BITMAP_WORDS] = [0; MIRRORED_UT_BITMAP_WORDS];
-static mut EXTRA_UT_SKIP_MASK: u16 = 0;
 
 /// Initialize the per-process slot allocator.
 ///
 /// Called during process startup (from CRT or RTLD) with values from auxv.
 /// `base==0` means "not provided".
-/// `expand_ep` is the notification cap for UT expansion signaling
-/// (from AT_SALTY_EXPAND_EP auxv), or 0 if not available.
 /// `cspace_ntfn` is the notification cap for CSpace expansion signaling
 /// (from AT_SALTY_CSPACE_NTFN auxv), or 0 if not available.
 ///
 /// # Safety
 /// Must be called exactly once during process initialization.
-pub unsafe fn slot_alloc_init(base: Cap, count: u64, expand_ep: u64, cspace_ntfn: u64) {
+pub unsafe fn slot_alloc_init(base: Cap, count: u64, cspace_ntfn: u64) {
     unsafe {
         let state = &mut *(&raw mut SLOT_ALLOC);
         state.segments[0] = Segment { base, count, next: 0 };
@@ -125,21 +105,11 @@ pub unsafe fn slot_alloc_init(base: Cap, count: u64, expand_ep: u64, cspace_ntfn
         state.active_seg = 0;
         state.initialized = base != 0;
         state.procmgr_ep = CAP_PROCMGR_EP;
-        state.expand_ntfn = expand_ep;
         state.cspace_ntfn = cspace_ntfn;
         state.expand_state = ExpandState::Idle;
         state.root_bits = 0;
         state.expanded_depth = 0;
         state.cspace_expand_count = 0;
-        *(&raw mut UT_EXPAND_REQUESTED) = false;
-        *(&raw mut EXTRA_UT_SLOTS) = [0; MAX_EXTRA_UT];
-        *(&raw mut EXTRA_UT_COUNT) = 0;
-        *(&raw mut PENDING_FRAME_SLOT) = 0;
-        *(&raw mut MIRRORED_UT_HINT) = CAP_UNTYPED_START;
-        *(&raw mut EXTRA_UT_HINT) = 0;
-        *(&raw mut UNTYPED_SCAN_END_CACHE) = 0;
-        *(&raw mut MIRRORED_UT_SKIP_BITMAP) = [0; MIRRORED_UT_BITMAP_WORDS];
-        *(&raw mut EXTRA_UT_SKIP_MASK) = 0;
     }
 }
 
@@ -269,7 +239,6 @@ pub fn slot_alloc_async() -> SlotResult {
                     state.active_seg = si;
                     state.cspace_expand_count += 1;
                     state.expand_state = ExpandState::Idle;
-                    *(&raw mut UNTYPED_SCAN_END_CACHE) = 0;
 
                     if state.root_bits > 0 {
                         state.expanded_depth = expanded_depth;
@@ -348,7 +317,6 @@ pub fn slot_alloc() -> Option<Cap> {
         state.seg_count += 1;
         state.active_seg = si;
         state.expand_state = ExpandState::Idle;
-        *(&raw mut UNTYPED_SCAN_END_CACHE) = 0;
         update_expansion_depth(state);
 
         {
@@ -370,305 +338,6 @@ pub fn slot_alloc() -> Option<Cap> {
         let slot = seg.base + seg.next;
         seg.next += 1;
         Some(slot)
-    }
-}
-
-/// Allocate a single CNode slot and retype a frame into it from any
-/// available untyped capability.
-///
-/// This is the most common operation: allocate a slot and create a frame.
-/// Tries the dedicated untyped (slot 7) first, then scans mirrored untypeds.
-///
-/// Returns the frame's CNode slot on success, or `None` on failure.
-pub fn slot_alloc_frame() -> Option<Cap> {
-    let slot = slot_alloc()?;
-    let err = try_retype_frame(slot);
-    if err == 0 {
-        Some(slot)
-    } else {
-        None
-    }
-}
-
-/// Allocate a frame slot and map it at the given virtual address.
-///
-/// Convenience wrapper: alloc slot -> retype frame -> vspace_map.
-/// Returns the frame slot on success.
-pub fn slot_alloc_frame_map(vspace: Cap, vaddr: u64, flags: u64) -> Option<Cap> {
-    let slot = slot_alloc_frame()?;
-    let err = invoke::vspace_map(vspace, slot, vaddr, flags);
-    if err != 0 {
-        return None;
-    }
-    Some(slot)
-}
-
-/// Async version of slot_alloc_frame_map: uses slot_alloc_async internally.
-///
-/// Returns `SlotResult::Ok(frame_slot)` on success, `WouldBlock` if expansion
-/// is in progress (CNode slot or untyped), or `Exhausted` on permanent failure.
-///
-/// Untyped expansion uses Signal-based async protocol: signals the procmgr's
-/// bound notification, then probes deterministic expansion slots. The probe
-/// retype doubles as both completion check and frame creation.
-pub fn slot_alloc_frame_map_async(vspace: Cap, vaddr: u64, flags: u64) -> SlotResult {
-    unsafe {
-        // If we saved a frame slot from a previous WouldBlock, reuse it
-        let slot = if *(&raw const PENDING_FRAME_SLOT) != 0 {
-            *(&raw const PENDING_FRAME_SLOT)
-        } else {
-            match slot_alloc_async() {
-                SlotResult::Ok(s) => s,
-                other => return other,
-            }
-        };
-
-        let err = try_retype_frame(slot);
-        if err != 0 {
-            // Retype failed — enter Signal-based untyped expansion
-            let ntfn = (*(&raw const SLOT_ALLOC)).expand_ntfn;
-            let count = *(&raw const EXTRA_UT_COUNT);
-
-            if ntfn == 0 || count >= MAX_EXTRA_UT {
-                *(&raw mut PENDING_FRAME_SLOT) = 0;
-                return SlotResult::Exhausted;
-            }
-
-            if *(&raw const UT_EXPAND_REQUESTED) {
-                // Probe the deterministic expansion slot — acts as both
-                // completion check AND frame retype in one operation
-                let expected = UT_EXPAND_BASE + count as u64;
-                let probe = invoke::untyped_retype(expected, OBJ_FRAME, 0, slot);
-                if probe == 0 {
-                    // Expansion completed — register new untyped
-                    (*(&raw mut EXTRA_UT_SLOTS))[count] = expected;
-                    *(&raw mut EXTRA_UT_COUNT) = count + 1;
-                    extra_ut_clear_skipped(count);
-                    *(&raw mut UT_EXPAND_REQUESTED) = false;
-                    *(&raw mut PENDING_FRAME_SLOT) = 0;
-
-                    {
-                        let mut lb = serial::LineBuf::new();
-                        lb.str(b"[SLOT] ut-expand: granted slot=");
-                        lb.hex(expected);
-                        lb.str(b"\n");
-                        lb.flush();
-                    }
-
-                    // Frame was already retyped by the probe — fall through to map
-                } else {
-                    // Not ready yet — re-signal (idempotent: OR same badge bit)
-                    syscall(SYS_SIGNAL, ntfn, 0, 0, 0, 0, 0);
-                    *(&raw mut PENDING_FRAME_SLOT) = slot;
-                    return SlotResult::WouldBlock;
-                }
-            } else {
-                // First request — signal procmgr's bound notification
-                syscall(SYS_SIGNAL, ntfn, 0, 0, 0, 0, 0);
-                *(&raw mut UT_EXPAND_REQUESTED) = true;
-                *(&raw mut PENDING_FRAME_SLOT) = slot;
-                return SlotResult::WouldBlock;
-            }
-        } else {
-            *(&raw mut PENDING_FRAME_SLOT) = 0;
-        }
-
-        // Map the frame
-        let err = invoke::vspace_map(vspace, slot, vaddr, flags);
-        if err != 0 {
-            return SlotResult::Exhausted;
-        }
-        SlotResult::Ok(slot)
-    }
-}
-
-/// Try to retype a frame from any available untyped, scanning primary
-/// untyped (slot 7), mirrored untypeds (CAP_UNTYPED_START..), then
-/// dynamically-granted untypeds (EXTRA_UT_SLOTS).
-fn try_retype_frame(dest_slot: Cap) -> i32 {
-    // Try dedicated untyped first
-    let err = invoke::untyped_retype(CAP_UNTYPED, OBJ_FRAME, 0, dest_slot);
-    if err == 0 {
-        return 0;
-    }
-
-    let mut last_err = err;
-    let scan_end = cached_untyped_scan_end();
-
-    // Scan mirrored untyped caps, starting from the last successful source.
-    if scan_end > CAP_UNTYPED_START {
-        let span = scan_end - CAP_UNTYPED_START;
-        let mut ut = unsafe {
-            let hint = *(&raw const MIRRORED_UT_HINT);
-            if hint >= CAP_UNTYPED_START && hint < scan_end {
-                hint
-            } else {
-                CAP_UNTYPED_START
-            }
-        };
-        for _ in 0..span {
-            let idx = (ut - CAP_UNTYPED_START) as usize;
-            if !mirrored_ut_is_skipped(idx) {
-                let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, dest_slot);
-                if err == 0 {
-                    unsafe {
-                        *(&raw mut MIRRORED_UT_HINT) = next_mirrored_ut(ut, scan_end);
-                    }
-                    return 0;
-                }
-                if is_permanent_untyped_failure(err) {
-                    mirrored_ut_mark_skipped(idx);
-                }
-                last_err = err;
-            }
-            ut = next_mirrored_ut(ut, scan_end);
-        }
-    }
-
-    // Try dynamically-granted untypeds with a round-robin hint.
-    unsafe {
-        let count = *(&raw const EXTRA_UT_COUNT);
-        if count != 0 {
-            let mut idx = *(&raw const EXTRA_UT_HINT);
-            if idx >= count {
-                idx = 0;
-            }
-            for _ in 0..count {
-                if extra_ut_is_skipped(idx) {
-                    idx += 1;
-                    if idx == count {
-                        idx = 0;
-                    }
-                    continue;
-                }
-
-                let ut = (*(&raw const EXTRA_UT_SLOTS))[idx];
-                if ut != 0 {
-                    let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, dest_slot);
-                    if err == 0 {
-                        *(&raw mut EXTRA_UT_HINT) = if idx + 1 < count { idx + 1 } else { 0 };
-                        return 0;
-                    }
-                    if is_permanent_untyped_failure(err) {
-                        extra_ut_mark_skipped(idx);
-                    }
-                    last_err = err;
-                }
-                idx += 1;
-                if idx == count {
-                    idx = 0;
-                }
-            }
-        }
-    }
-
-    last_err
-}
-
-#[inline]
-fn next_mirrored_ut(ut: Cap, scan_end: Cap) -> Cap {
-    if ut + 1 < scan_end {
-        ut + 1
-    } else {
-        CAP_UNTYPED_START
-    }
-}
-
-#[inline]
-fn is_permanent_untyped_failure(err: i32) -> bool {
-    err == SALTY_INVALID_CAPABILITY as i32
-        || err == SALTY_INVALID_OPERATION as i32
-        || err == SALTY_INSUFFICIENT_RIGHTS as i32
-        || err == SALTY_NOT_FOUND as i32
-}
-
-#[inline]
-fn mirrored_ut_is_skipped(idx: usize) -> bool {
-    let word = idx / 64;
-    if word >= MIRRORED_UT_BITMAP_WORDS {
-        return false;
-    }
-    let bit = 1u64 << (idx % 64);
-    unsafe { ((*(&raw const MIRRORED_UT_SKIP_BITMAP))[word] & bit) != 0 }
-}
-
-#[inline]
-fn mirrored_ut_mark_skipped(idx: usize) {
-    let word = idx / 64;
-    if word >= MIRRORED_UT_BITMAP_WORDS {
-        return;
-    }
-    let bit = 1u64 << (idx % 64);
-    unsafe {
-        (*(&raw mut MIRRORED_UT_SKIP_BITMAP))[word] |= bit;
-    }
-}
-
-#[inline]
-fn extra_ut_is_skipped(idx: usize) -> bool {
-    if idx >= 16 {
-        return false;
-    }
-    let bit = 1u16 << idx;
-    unsafe { (*(&raw const EXTRA_UT_SKIP_MASK) & bit) != 0 }
-}
-
-#[inline]
-fn extra_ut_mark_skipped(idx: usize) {
-    if idx >= 16 {
-        return;
-    }
-    let bit = 1u16 << idx;
-    unsafe {
-        *(&raw mut EXTRA_UT_SKIP_MASK) |= bit;
-    }
-}
-
-#[inline]
-fn extra_ut_clear_skipped(idx: usize) {
-    if idx >= 16 {
-        return;
-    }
-    let bit = 1u16 << idx;
-    unsafe {
-        *(&raw mut EXTRA_UT_SKIP_MASK) &= !bit;
-    }
-}
-
-#[inline]
-fn cached_untyped_scan_end() -> Cap {
-    unsafe {
-        let cached = *(&raw const UNTYPED_SCAN_END_CACHE);
-        if cached > CAP_UNTYPED_START {
-            return cached;
-        }
-    }
-    let end = untyped_scan_end();
-    unsafe {
-        *(&raw mut UNTYPED_SCAN_END_CACHE) = end;
-    }
-    end
-}
-
-/// Determine the upper bound for untyped cap scanning.
-fn untyped_scan_end() -> Cap {
-    let mut end: Cap = 200; // fallback
-    let info = invoke::cnode_get_info(CAP_SELF_CSPACE);
-    if info.error == 0 {
-        unsafe {
-            let ctx = &raw const crate::__salty_ipc_ctx;
-            if !(*ctx).ipc_buffer.is_null() {
-                let num_slots = (*(*ctx).ipc_buffer).msg[3];
-                if num_slots > CAP_UNTYPED_START && num_slots < end {
-                    end = num_slots;
-                }
-            }
-        }
-    }
-    if end <= CAP_UNTYPED_START {
-        CAP_UNTYPED_START + 1
-    } else {
-        end
     }
 }
 
@@ -710,7 +379,6 @@ fn try_blocking_cspace_expand(state: &mut SlotAllocState) -> SlotResult {
             state.seg_count += 1;
             state.active_seg = si;
             state.expand_state = ExpandState::Idle;
-            unsafe { *(&raw mut UNTYPED_SCAN_END_CACHE) = 0; }
             update_expansion_depth(state);
 
             {

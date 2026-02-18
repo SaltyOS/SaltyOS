@@ -416,79 +416,55 @@ fn ensure_page_tables(
 }
 ```
 
-## Slab Allocator
+## Kernel Object Allocation (seL4-style)
 
-The kernel uses a slab allocator for fixed-size kernel objects:
+SaltyOS follows the seL4 model: **all kernel objects are carved from untyped memory
+via the `retype` operation**. There is no kernel heap, slab allocator, or dynamic
+memory pool. This provides several properties:
 
-```rust
-/// Slab allocator for kernel objects
-pub struct SlabAllocator {
-    /// Slabs for different object sizes
-    slabs: [Slab; NUM_SLAB_SIZES],
-}
+1. **Deterministic allocation** — no hidden OOM inside the kernel
+2. **Authority tracking** — every object has an untyped parent in the Capability
+   Derivation Tree (CDT), enabling revocation
+3. **No kernel-internal fragmentation** — userspace controls memory layout
 
-/// A slab for one object size
-pub struct Slab {
-    /// Object size
-    size: usize,
-    
-    /// List of partially full pages
-    partial: LinkedList<SlabPage>,
-    
-    /// List of completely full pages
-    full: LinkedList<SlabPage>,
-    
-    /// Free object count
-    free_count: usize,
-}
+### Retype Flow
 
-/// A page used for slab allocation
-pub struct SlabPage {
-    /// Bitmap of free slots
-    free_bitmap: u64,
-    
-    /// Number of free slots
-    free_slots: u8,
-    
-    /// Object size
-    obj_size: u16,
-    
-    /// Start of object array
-    objects: [u8; PAGE_SIZE - 16],
-}
-
-impl SlabAllocator {
-    /// Allocate an object of given size
-    pub fn alloc(&mut self, size: usize) -> Option<*mut u8> {
-        let slab_idx = size_to_slab_index(size)?;
-        let slab = &mut self.slabs[slab_idx];
-        
-        // Try to allocate from partial slab
-        if let Some(page) = slab.partial.front_mut() {
-            if let Some(ptr) = page.alloc() {
-                if page.is_full() {
-                    let page = slab.partial.pop_front().unwrap();
-                    slab.full.push_back(page);
-                }
-                return Some(ptr);
-            }
-        }
-        
-        // Need a new slab page
-        // (This would need to come from untyped memory)
-        None
-    }
-    
-    /// Free an object
-    pub fn free(&mut self, ptr: *mut u8, size: usize) {
-        let slab_idx = size_to_slab_index(size).unwrap();
-        let slab = &mut self.slabs[slab_idx];
-        
-        // Find which page contains this pointer
-        // ... and mark slot as free
-    }
-}
 ```
+Untyped capability (user) ──retype──► Typed object (kernel creates in-place)
+                                      │
+                                      ├─ TCB
+                                      ├─ CNode
+                                      ├─ Endpoint
+                                      ├─ Notification
+                                      ├─ VSpace (+ VSpaceTracking at phys+4096)
+                                      ├─ Frame (min size_bits=12, 4KB)
+                                      └─ SchedContext
+```
+
+Each object is initialized at the untyped's watermark offset. The watermark
+advances monotonically — objects are never freed back to the untyped. To
+reclaim memory, the entire untyped must be revoked (which destroys all derived
+capabilities and objects).
+
+### VSpaceTracking
+
+When a VSpace object is retyped, an additional 4KB `VSpaceTracking` structure is
+placed immediately after the page table root (at `vspace_phys + 4096`). This
+structure tracks per-page metadata (COW refcounts, mapping state) and is embedded
+in the untyped allocation rather than using a separate slab.
+
+### Centralized Memory Server (mmsrv)
+
+In userspace, `mmsrv` is the centralized pager that owns the root untyped
+capabilities and serves frame allocation requests from all processes:
+
+- **MM_REGISTER/DEREGISTER** — register/deregister a client process
+- **MM_MAP_BATCH** — allocate N frames and map into a client's VSpace
+- **MM_MAP_WINDOW** — dual-map frames into both target and caller VSpaces
+  (write window pattern for stack/boot-info initialization)
+- **MM_UNMAP_WINDOW** — remove caller's write window, target mapping persists
+- **MM_BRK / MM_MMAP / MM_MUNMAP** — POSIX-style heap and mmap
+- **MM_FORK_REGIONS** — COW-clone a parent's VSpace regions for fork
 
 ## Kernel Address Space
 
@@ -503,8 +479,8 @@ impl SlabAllocator {
 │           Kernel Text/Data/BSS          │
 │           (Loaded by bootloader)        │
 ├─────────────────────────────────────────┤ 0xFFFFFFFF00000000
-│           Kernel Heap                   │
-│           (Slab allocator)              │
+│           Kernel Object Space            │
+│           (Untyped retype region)       │
 ├─────────────────────────────────────────┤ 0xFFFFFFFE00000000
 │           Device MMIO                   │
 ├─────────────────────────────────────────┤ 0xFFFF800000000000

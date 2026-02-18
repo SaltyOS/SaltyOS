@@ -134,7 +134,7 @@ pub unsafe extern "C" fn __assert(
     _line: i32,
     _expr: *const u8,
 ) -> ! {
-    unsafe { abort() }
+    abort()
 }
 
 static mut GETBSIZE_BUF: [u8; 32] = [0; 32];

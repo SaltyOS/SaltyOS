@@ -242,8 +242,8 @@ int load_shared_library(struct rtld_state *st, const char *name,
         uint64_t seg_end = rtld_page_align_up(seg_vaddr + ph->p_memsz);
         uint64_t flags = rtld_elf_to_vspace_flags(ph->p_flags);
 
-        /* RO segment already mapped by procmgr — record pages as device-mapped */
-        if (is_premapped && (ph->p_flags & PF_W) == 0) {
+        /* Segment already mapped by procmgr — record pages as device-managed */
+        if (is_premapped) {
             for (uint64_t page = seg_start; page < seg_end; page += PAGE_SIZE) {
                 if (page_count >= RTLD_MAX_LIB_PAGES) return -6;
                 pages[page_count].vaddr = page;

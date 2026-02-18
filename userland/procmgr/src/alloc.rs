@@ -230,7 +230,6 @@ impl Allocator {
         &mut self,
         cap_self_cspace: Cap,
         primary_ut: Cap,
-        _primary_ut_bits: u8,
         mirror_start: Cap,
         mirror_count: usize,
     ) {

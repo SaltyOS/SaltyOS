@@ -18,7 +18,7 @@ pub const SIG_DISP_IGN: u8 = 1;
 pub const SIG_DISP_CATCH: u8 = 2;
 
 // ---- Limits ----
-pub const MAX_PROCESSES: usize = 16;
+pub const INITIAL_CAPACITY: usize = 16;
 pub const MAX_NAME_LEN: usize = 32;
 
 // ---- Per-process shared library mapping ----
@@ -72,9 +72,6 @@ pub struct Process {
     /// Set by the allocator during spawn; used for cleanup.
     pub slot_base: Cap,
     pub slot_count: u16,
-    /// Secondary frame range from exec (freed on cleanup).
-    pub frame_base: Cap,
-    pub frame_count: u16,
     /// Base address of shared library RO pages (from spawn_tx cache).
     pub shared_lib_base: u64,
     /// Per-process library mapping (which cached libs, at what VAs).
@@ -87,12 +84,10 @@ pub struct Process {
     pub expand_result_base: u64,
     /// Async CSpace expansion: result slot count.
     pub expand_result_count: u64,
-    /// Procmgr-local cap to child's untyped (for init-registered services).
-    pub child_ut_cap: Cap,
-    /// Number of untyped expansions granted to this process (max 8).
-    pub ut_expand_count: u8,
     /// Number of CSpace expansions granted to this process (max 8).
     pub cspace_expand_count: u8,
+    /// Whether this process is registered with mmsrv.
+    pub mmsrv_registered: bool,
     /// Whether this process has a pre-created service EP at CHILD_CAP_SERVICE_EP.
     pub has_service_ep: bool,
     /// Restart on exit (set by SPAWN_FLAG_RESPAWN).
@@ -124,17 +119,14 @@ impl Process {
             pgid: 0,
             slot_base: 0,
             slot_count: 0,
-            frame_base: 0,
-            frame_count: 0,
             shared_lib_base: 0,
             lib_map: ProcLibMap::zeroed(),
             layout: VmLayoutPlan::zeroed(),
             expand_pending: false,
             expand_result_base: 0,
             expand_result_count: 0,
-            child_ut_cap: 0,
-            ut_expand_count: 0,
             cspace_expand_count: 0,
+            mmsrv_registered: false,
             has_service_ep: false,
             respawn: false,
             respawn_binary: [0; MAX_NAME_LEN],
@@ -143,14 +135,117 @@ impl Process {
 }
 
 // ===========================================================================
-// Static state
+// Growable process table
 // ===========================================================================
 
-pub static mut PROCTAB: [Process; MAX_PROCESSES] = {
-    const ZERO: Process = Process::zeroed();
-    [ZERO; MAX_PROCESSES]
-};
+/// Pointer to the process table (mmap'd memory).
+static mut PROCTAB_PTR: *mut Process = core::ptr::null_mut();
+/// Current capacity of the table.
+static mut PROCTAB_CAP: usize = 0;
+
 pub static mut NEXT_PID: u32 = 2;
+
+/// Initialize the process table via posix_mmap.
+///
+/// Must be called once at procmgr startup, after mmsrv is available.
+pub unsafe fn init_proctab() {
+    unsafe {
+        let cap = INITIAL_CAPACITY;
+        let size = cap * core::mem::size_of::<Process>();
+        let pages = (size + 4095) / 4096;
+        let ptr = salty::posix_mm::posix_mmap(
+            core::ptr::null_mut(),
+            (pages * 4096) as u64,
+            0x3, // PROT_READ | PROT_WRITE
+            0x22, // MAP_PRIVATE | MAP_ANONYMOUS
+            -1,
+            0,
+        );
+        if ptr.is_null() || ptr == usize::MAX as *mut u8 {
+            salty::serial::serial_puts(b"[PROCMGR] FATAL: proctab mmap failed\n");
+            return;
+        }
+        PROCTAB_PTR = ptr as *mut Process;
+        PROCTAB_CAP = cap;
+
+        // Initialize all entries to zeroed
+        for i in 0..cap {
+            core::ptr::write(PROCTAB_PTR.add(i), Process::zeroed());
+        }
+    }
+}
+
+/// Get the current capacity of the process table.
+#[inline]
+pub fn proctab_cap() -> usize {
+    unsafe { PROCTAB_CAP }
+}
+
+/// Access a process entry by index.
+///
+/// # Safety
+/// Caller must ensure `idx < proctab_cap()`.
+#[inline]
+pub unsafe fn proctab(idx: usize) -> &'static mut Process {
+    unsafe { &mut *PROCTAB_PTR.add(idx) }
+}
+
+/// Grow the process table by doubling capacity.
+///
+/// Returns true on success, false on failure.
+unsafe fn grow_proctab() -> bool {
+    unsafe {
+        let old_cap = PROCTAB_CAP;
+        let new_cap = old_cap * 2;
+        let old_size = old_cap * core::mem::size_of::<Process>();
+        let new_size = new_cap * core::mem::size_of::<Process>();
+        let new_pages = (new_size + 4095) / 4096;
+
+        let new_raw = salty::posix_mm::posix_mmap(
+            core::ptr::null_mut(),
+            (new_pages * 4096) as u64,
+            0x3, // PROT_READ | PROT_WRITE
+            0x22, // MAP_PRIVATE | MAP_ANONYMOUS
+            -1,
+            0,
+        );
+        if new_raw.is_null() || new_raw == usize::MAX as *mut u8 {
+            salty::serial::serial_puts(b"[PROCMGR] proctab grow failed\n");
+            return false;
+        }
+
+        let new_ptr = new_raw as *mut Process;
+
+        // Copy old entries
+        let src = PROCTAB_PTR as *const u8;
+        let dst = new_ptr as *mut u8;
+        for i in 0..old_size {
+            core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i)));
+        }
+
+        // Initialize new entries to zeroed
+        for i in old_cap..new_cap {
+            core::ptr::write(new_ptr.add(i), Process::zeroed());
+        }
+
+        // Unmap old region
+        let old_pages = (old_size + 4095) / 4096;
+        salty::posix_mm::posix_munmap(PROCTAB_PTR as *mut u8, (old_pages * 4096) as u64);
+
+        PROCTAB_PTR = new_ptr;
+        PROCTAB_CAP = new_cap;
+
+        {
+            let mut lb = salty::serial::LineBuf::new();
+            lb.str(b"[PROCMGR] proctab grown to ");
+            lb.hex(new_cap as u64);
+            lb.str(b" entries\n");
+            lb.flush();
+        }
+
+        true
+    }
+}
 
 // ===========================================================================
 // Lookup helpers
@@ -158,8 +253,10 @@ pub static mut NEXT_PID: u32 = 2;
 
 pub fn find_by_badge(badge: u64) -> Option<usize> {
     unsafe {
-        for i in 0..MAX_PROCESSES {
-            if PROCTAB[i].state != PROC_FREE && PROCTAB[i].badge == badge {
+        let cap = PROCTAB_CAP;
+        for i in 0..cap {
+            let p = &*PROCTAB_PTR.add(i);
+            if p.state != PROC_FREE && p.badge == badge {
                 return Some(i);
             }
         }
@@ -169,8 +266,10 @@ pub fn find_by_badge(badge: u64) -> Option<usize> {
 
 pub fn find_by_pid(pid: u32) -> Option<usize> {
     unsafe {
-        for i in 0..MAX_PROCESSES {
-            if PROCTAB[i].state != PROC_FREE && PROCTAB[i].pid == pid {
+        let cap = PROCTAB_CAP;
+        for i in 0..cap {
+            let p = &*PROCTAB_PTR.add(i);
+            if p.state != PROC_FREE && p.pid == pid {
                 return Some(i);
             }
         }
@@ -180,10 +279,17 @@ pub fn find_by_pid(pid: u32) -> Option<usize> {
 
 pub fn alloc_proc() -> Option<usize> {
     unsafe {
-        for i in 0..MAX_PROCESSES {
-            if PROCTAB[i].state == PROC_FREE {
+        let cap = PROCTAB_CAP;
+        for i in 0..cap {
+            let p = &*PROCTAB_PTR.add(i);
+            if p.state == PROC_FREE {
                 return Some(i);
             }
+        }
+        // All slots full — try to grow
+        if grow_proctab() {
+            // First slot in the new region
+            return Some(cap);
         }
     }
     None
@@ -195,7 +301,8 @@ pub fn alloc_proc() -> Option<usize> {
 /// otherwise falls back to stride-based cleanup for legacy compatibility.
 pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
     unsafe {
-        let child_cn = PROCTAB[idx].cnode_cap;
+        let p = &*PROCTAB_PTR.add(idx);
+        let child_cn = p.cnode_cap;
 
         // Revoke all caps in child's CNode
         if child_cn != 0 {
@@ -209,8 +316,8 @@ pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
         }
 
         // Revoke procmgr-side caps for this process
-        let base = PROCTAB[idx].slot_base;
-        let count = PROCTAB[idx].slot_count as u64;
+        let base = p.slot_base;
+        let count = p.slot_count as u64;
 
         if count > 0 {
             // New allocator path: clean up only the allocated range
@@ -224,7 +331,7 @@ pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
         }
 
         // Reset process entry
-        let p = &mut PROCTAB[idx];
+        let p = &mut *PROCTAB_PTR.add(idx);
         p.pid = 0;
         p.ppid = 0;
         p.sid = 0;
@@ -243,16 +350,13 @@ pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
         p.pgid = 0;
         p.slot_base = 0;
         p.slot_count = 0;
-        p.frame_base = 0;
-        p.frame_count = 0;
         p.shared_lib_base = 0;
         p.lib_map = ProcLibMap::zeroed();
         p.expand_pending = false;
         p.expand_result_base = 0;
         p.expand_result_count = 0;
-        p.child_ut_cap = 0;
-        p.ut_expand_count = 0;
         p.cspace_expand_count = 0;
+        p.mmsrv_registered = false;
         p.has_service_ep = false;
         p.respawn = false;
         for i in 0..MAX_NAME_LEN {

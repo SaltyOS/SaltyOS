@@ -63,7 +63,7 @@ pub const TCB_BIND_NOTIFICATION: u64 = 0x49;
 pub const TCB_SET_FAULT_HANDLER: u64 = 0x4B;
 pub const TCB_COPY_FPU: u64 = 0x4C;
 
-/// VSpace invoke labels (0x50-0x57): map, unmap, map_pt, walk, copy_page, map_device, clone_cow, map_device_range.
+/// VSpace invoke labels (0x50-0x58): map, unmap, map_pt, walk, copy_page, map_device, clone_cow, map_device_range, protect.
 pub const VSPACE_MAP: u64 = 0x50;
 pub const VSPACE_UNMAP: u64 = 0x51;
 pub const VSPACE_MAP_PT: u64 = 0x52;
@@ -72,6 +72,7 @@ pub const VSPACE_COPY_PAGE: u64 = 0x54;
 pub const VSPACE_MAP_DEVICE: u64 = 0x55;
 pub const VSPACE_CLONE_COW_PAGE: u64 = 0x56;
 pub const VSPACE_MAP_DEVICE_RANGE: u64 = 0x57;
+pub const VSPACE_PROTECT: u64 = 0x58;
 
 /// IRQ handler invoke labels (0x61-0x62): acknowledge IRQ, set notification cap.
 pub const IRQ_HANDLER_ACK: u64 = 0x61;
@@ -105,6 +106,7 @@ pub const TTYD_PTY_POLL: u64 = 17;
 pub const TTYD_INPUT_EVENT: u64 = 18;
 pub const TTYD_PTY_COLLECT: u64 = 19;
 pub const TTYD_PTY_MASTER_WRITE: u64 = 20;
+pub const TTYD_CLIENT_EXIT: u64 = 21;
 
 /// Display server IPC labels: framebuffer info, present, fill, text, terminal writes.
 pub const DISPLAY_GET_INFO: u64 = 1;
@@ -113,26 +115,6 @@ pub const DISPLAY_FILL_RECT: u64 = 6;
 pub const DISPLAY_WRITE_TEXT: u64 = 7;
 pub const DISPLAY_TERMINAL_WRITE: u64 = 8;
 
-/// Well-known capability slots. Set by the kernel for init, inherited by
-/// child processes. Slots 0-15 are reserved; 16+ are untyped memory.
-pub const CAP_SELF_TCB: u64 = 0;
-pub const CAP_SELF_VSPACE: u64 = 1;
-pub const CAP_SELF_CSPACE: u64 = 2;
-pub const CAP_PROCMGR_EP: u64 = 3;
-pub const CAP_VFS_EP: u64 = 4;
-pub const CAP_NAMESERV_EP: u64 = 5;
-pub const CAP_SIGNAL_NTFN: u64 = 6;
-pub const CAP_UNTYPED: u64 = 7;
-pub const CAP_COM1_IOPORT: u64 = 8;
-pub const CAP_EXPAND_EP: u64 = 9;
-pub const CAP_COM1_IRQ: u64 = 9;
-pub const CAP_COM1_NTFN: u64 = 10;
-pub const CAP_CONSOLE_EP: u64 = 11;
-pub const CAP_INITRD_UNTYPED: u64 = 12;
-pub const CAP_FB_UNTYPED: u64 = 13;
-pub const CAP_READINESS_NTFN: u64 = 14;
-pub const CAP_DISPLAY_EP: u64 = 15;
-pub const CAP_UNTYPED_START: u64 = 16;
 
 /// Fixed virtual addresses for well-known memory regions.
 pub const INITRD_VADDR: u64 = 0x0000_0000_0100_0000;
@@ -154,6 +136,11 @@ pub const SALTY_NOT_FOUND: u64 = 6;
 pub const SALTY_BUSY: u64 = 7;
 pub const SALTY_ALREADY_EXISTS: u64 = 8;
 pub const SALTY_WOULD_BLOCK: u64 = 9;
+pub const SALTY_BAD_ADDRESS: u64 = 10;
+pub const SALTY_OUT_OF_RANGE: u64 = 11;
+pub const SALTY_CANCELLED: u64 = 12;
+pub const SALTY_RESTART: u64 = 13;
+pub const SALTY_DEADLOCK: u64 = 14;
 pub const SALTY_PENDING: u64 = 0x80;
 
 /// VSpace page mapping flags (passed to `vspace_map`).
@@ -354,11 +341,22 @@ pub const POSIX_PM_INJECT_CAP: u64 = 26;
 // Deterministic CNode slots for CSpace expansion (root slots 1008-1015)
 pub const CSPACE_EXPAND_BASE: u64 = 1008;
 pub const MAX_CSPACE_EXPANSIONS: usize = 8;
-pub const CAP_CSPACE_EXPAND_NTFN: u64 = 10;
 
-// Deterministic CNode slots for untyped expansion (last 8 slots of 10-bit CNode)
-pub const UT_EXPAND_BASE: u64 = 1016;
-pub const MAX_UT_EXPANSIONS: usize = 8;
+/// Memory server (mmsrv) IPC protocol labels (0x80-0x8F range).
+pub const MM_REGISTER: u64 = 0x80;
+pub const MM_DEREGISTER: u64 = 0x81;
+pub const MM_BRK: u64 = 0x82;
+pub const MM_SBRK: u64 = 0x83;
+pub const MM_MMAP: u64 = 0x84;
+pub const MM_MUNMAP: u64 = 0x85;
+pub const MM_MPROTECT: u64 = 0x86;
+pub const MM_MAP_BATCH: u64 = 0x87;
+pub const MM_MAP_WINDOW: u64 = 0x88;
+pub const MM_UNMAP_WINDOW: u64 = 0x89;
+pub const MM_SHM_CREATE: u64 = 0x8A;
+pub const MM_SHM_MAP: u64 = 0x8B;
+pub const MM_SHM_UNMAP: u64 = 0x8C;
+pub const MM_FORK_REGIONS: u64 = 0x8D;
 
 /// Name service IPC protocol labels (register/lookup endpoint by name).
 pub const POSIX_NS_REGISTER: u64 = 1;
@@ -441,16 +439,11 @@ pub const MAP_SHARED: i32 = 0x01;
 pub const MAP_PRIVATE: i32 = 0x02;
 pub const MAP_FIXED: i32 = 0x10;
 pub const MAP_ANONYMOUS: i32 = 0x20;
-
-// Memory management limits
-pub const MM_MAX_REGIONS: usize = 32;
-pub const MM_MAX_FRAME_SLOTS: u64 = 256;
-pub const MM_MAX_PAGES_PER_REGION: usize = 64;
+pub const MAP_LAZY: i32 = 0x40;
 
 // Userland slot allocator auxv types
 pub const AT_SALTY_SLOT_BASE: u64 = 0x1007;
 pub const AT_SALTY_SLOT_COUNT: u64 = 0x1008;
-pub const AT_SALTY_EXPAND_EP: u64 = 0x1009;
 pub const AT_SALTY_CSPACE_NTFN: u64 = 0x100A;
 
 /// ELF format constants (class, data encoding, types, segment types, relocation types).

@@ -149,7 +149,7 @@ A first-fit free-list allocator backed by `sbrk()` (via libsalty's `posix_sbrk`)
 - **Coalescing:** The free list is sorted by address. On `free()`, adjacent blocks (both before and after) are merged when contiguous.
 - **No thread-safety:** Single `static mut FREE_LIST` with no locking.
 
-The allocator is deliberately simple. Performance-critical paths in SaltyOS use capability-based memory (untyped retype + frame map) rather than malloc.
+The allocator is deliberately simple. Performance-critical paths in SaltyOS use `posix_mmap()` (delegated to mmsrv via IPC) rather than malloc.
 
 ### CRT Initialization
 
@@ -157,7 +157,7 @@ The CRT startup parses the SaltyOS auxiliary vector (`auxv`) to discover per-pro
 
 | Tag | Constant | Purpose |
 |-----|----------|---------|
-| `0x1000` | `AT_SALTY_UNTYPED` | Untyped memory capability slot |
+| `0x1000` | `AT_SALTY_UNTYPED` | Untyped memory cap (rtld bootstrap only; general frame alloc via mmsrv) |
 | `0x1001` | `AT_SALTY_VSPACE` | VSpace capability slot |
 | `0x1002` | `AT_SALTY_SCRATCH` | Scratch virtual address region |
 | `0x1005` | `AT_SALTY_FRAME_SLOT` | Frame slot for page mapping |
@@ -174,7 +174,7 @@ After slot allocation setup, the heap region is placed 1 MB after the scratch ar
 | Tag | Name | Type | Description |
 |-----|------|------|-------------|
 | `0x0000` | `AT_NULL` | - | End of auxv |
-| `0x1000` | `AT_SALTY_UNTYPED` | slot | Untyped memory cap for backing sbrk/mmap |
+| `0x1000` | `AT_SALTY_UNTYPED` | slot | Untyped memory cap (rtld bootstrap only; general frame allocation via mmsrv) |
 | `0x1001` | `AT_SALTY_VSPACE` | slot | VSpace cap for mapping frames |
 | `0x1002` | `AT_SALTY_SCRATCH` | vaddr | Scratch region base address |
 | `0x1005` | `AT_SALTY_FRAME_SLOT` | slot | CSpace slot for temporary frames |

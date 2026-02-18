@@ -72,8 +72,6 @@ All error codes are defined in `consts.rs` and must match kernel `SyscallError` 
 | `Timespec` | `#[repr(C)]` | Time: tv_sec (u64), tv_nsec (u64) |
 | `Timeval` | `#[repr(C)]` | Time: tv_sec (u64), tv_usec (u64) |
 | `Termios` | `#[repr(C)]` | Terminal attrs: c_iflag, c_oflag, c_cflag, c_lflag, c_line, c_cc[32], c_ispeed, c_ospeed |
-| `PosixMmRegion` | `#[repr(C)]` | Memory region: base, length, region_type, prot, num_pages, frame_slots[64] |
-| `PosixMmState` | `#[repr(C)]` | Global MM state: untyped, vspace, cspace, heap/mmap state, region table |
 | `SigHandlerT` | `Option<unsafe extern "C" fn(i32)>` | Signal handler function pointer |
 
 ### ELF Types
@@ -540,13 +538,10 @@ Clock IDs: `CLOCK_MONOTONIC` (0), `CLOCK_REALTIME` (1).
 ### Initialization
 
 ```rust
-pub unsafe fn posix_mm_init(
-    untyped: Cap, vspace: Cap, cspace: Cap,
-    first_frame_slot: Cap, heap_base: u64, mmap_base: u64,
-)
+pub unsafe fn posix_mm_init(mmsrv_ep: Cap)
 ```
 
-Initialize the per-process memory manager. Must be called once during startup. Sets up the untyped source for frame allocation, VA layout for heap and mmap regions.
+Initialize the per-process memory client. Must be called once during startup. Stores the process-local mmsrv endpoint used by `brk`/`sbrk`/anonymous `mmap` IPC.
 
 ### Heap Management
 
@@ -570,9 +565,7 @@ Initialize the per-process memory manager. Must be called once during startup. S
 Protection flags: `PROT_NONE` (0), `PROT_READ` (1), `PROT_WRITE` (2), `PROT_EXEC` (4).
 Map flags: `MAP_SHARED` (0x01), `MAP_PRIVATE` (0x02), `MAP_FIXED` (0x10), `MAP_ANONYMOUS` (0x20).
 
-Region types: `MM_REGION_FREE` (0), `MM_REGION_HEAP` (1), `MM_REGION_MMAP` (2), `MM_REGION_SHM` (3).
-
-Limits: `MM_MAX_REGIONS` (32), `MM_MAX_FRAME_SLOTS` (256), `MM_MAX_PAGES_PER_REGION` (64).
+**Memory management is delegated to mmsrv** (centralized pager). Anonymous `mmap()`, `brk()`, `sbrk()` send IPC to mmsrv (slot 7: `CAP_MMSRV_EP`). Device-backed mmaps go through VFS. No hardcoded limits — all regions and frame tracking are growable.
 
 ---
 
@@ -657,17 +650,15 @@ pub enum SlotResult {
 | `slot_alloc_set_procmgr_ep` | `(ep: Cap)` | Override procmgr EP for expansion |
 | `slot_alloc` | `() -> Option<Cap>` | Allocate one CNode slot (sync) |
 | `slot_alloc_async` | `() -> SlotResult` | Allocate with async expansion protocol |
-| `slot_alloc_frame` | `() -> Option<Cap>` | Allocate slot + retype frame from any untyped |
-| `slot_alloc_frame_map` | `(vspace: Cap, vaddr: u64, flags: u64) -> Option<Cap>` | Alloc slot + retype frame + map |
-| `slot_alloc_frame_map_async` | `(vspace: Cap, vaddr: u64, flags: u64) -> SlotResult` | Async version with Signal-based UT expansion |
 
-### Expansion Protocol
+**Frame allocation:** Delegated to mmsrv. Use `posix_mmap()` for anonymous memory (IPC to `CAP_MMSRV_EP` slot 7).
 
-When all segments are exhausted:
-1. **CSpace expansion:** NBSend `PM_EXPAND_CSPACE_ASYNC` to procmgr, then Call `PM_EXPAND_COLLECT` to get new segment base/count.
-2. **Untyped expansion:** Signal the procmgr's bound notification, then probe deterministic expansion slots (`UT_EXPAND_BASE + N`). The probe retype doubles as both completion check and frame creation.
+### CSpace Expansion Protocol
 
-Expansion constants: `UT_EXPAND_BASE` (1016), `MAX_UT_EXPANSIONS` (8).
+When all CSpace segments are exhausted:
+1. NBSend `PM_EXPAND_CSPACE_ASYNC` to procmgr
+2. Call `PM_EXPAND_COLLECT` to get new segment base/count
+
 Auxv types: `AT_SALTY_SLOT_BASE` (0x1007), `AT_SALTY_SLOT_COUNT` (0x1008), `AT_SALTY_EXPAND_EP` (0x1009).
 
 ---

@@ -21,6 +21,10 @@
 use crate::consts::*;
 use crate::types::*;
 
+// Standard child CSpace layout (set by procmgr at spawn time)
+const CAP_PROCMGR_EP: u64 = 3;
+const CAP_VFS_EP: u64 = 4;
+
 /// Pack a null-terminated path into message registers starting at `offset`.
 ///
 /// Writes the path length into `regs[offset]` and the path bytes (up to 64)

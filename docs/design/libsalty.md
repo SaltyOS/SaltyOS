@@ -102,8 +102,8 @@ yield loop. No `unwrap()` or `expect()` calls exist in the library.
   | syscall(num,a0..a5)   |   +----+-----+ +------------------+
   | inline asm "syscall"  |        |       | slot_alloc.rs    |
   +----------+------------+        |       | slot_alloc()     |
-             |                     |       | slot_alloc_frame |
-             v                     v       | async expansion  |
+             |                     |       | async expansion  |
+             v                     v       +------------------+
   +-----------------------+   +---------+  +------------------+
   |  Kernel syscall entry |   | VFS /   |
   |  (syscall.S)          |   | procmgr |  +------------------+
@@ -423,8 +423,9 @@ and capability invocations:
 - **munmap:** Unmaps pages and deletes frame capabilities.
 - **mprotect:** Unmaps and remaps each page with new permission flags.
 
-The memory manager state (`PosixMmState`) is a module-level static,
-initialized during process startup.
+Memory management is fully delegated to mmsrv (centralized pager).
+Anonymous memory operations (`mmap`, `brk`, `sbrk`) send IPC to `CAP_MMSRV_EP`.
+No local state tracking for anonymous regions.
 
 ### Signal Handling
 
@@ -474,7 +475,10 @@ This two-phase protocol (NBSend then Call) ensures the caller never
 blocks indefinitely on expansion. If the NBSend is dropped (procmgr
 busy), the next attempt resends it.
 
-**Untyped expansion:** When all untyped capabilities are exhausted:
+**Untyped expansion (legacy path for rtld/init bootstrap only):**
+
+When all untyped capabilities are exhausted during early bootstrap
+(before mmsrv is available):
 
 1. Signal the procmgr's bound notification (`expand_ntfn`)
 2. Procmgr allocates a new untyped and places it at a deterministic
@@ -482,11 +486,16 @@ busy), the next attempt resends it.
 3. The probe retype (`untyped_retype(expected_slot, OBJ_FRAME, ...)`)
    doubles as both completion check and frame creation
 
+**Note:** This direct untyped expansion protocol is only used by rtld
+and init during bootstrap, before the memory manager server (mmsrv) is
+running. Regular userland processes delegate all frame allocation to
+mmsrv via `posix_mmap()`.
+
 **Convenience wrappers:**
 - `slot_alloc()` -- Allocate one CNode slot (sync)
-- `slot_alloc_frame()` -- Allocate slot + retype frame from any untyped
-- `slot_alloc_frame_map()` -- Allocate + retype + map at virtual address
-- `slot_alloc_frame_map_async()` -- Full async version with expansion
+- `slot_alloc_async()` -- Allocate with async CSpace expansion
+
+**Frame allocation** is delegated to mmsrv. Use `posix_mmap()` instead.
 
 ### VM Layout Planning
 
@@ -586,7 +595,7 @@ All mutable global state in libsalty:
 | `EXTRA_UT_SLOTS` | `[Cap; 8]` | `slot_alloc.rs` | Dynamically-granted untyped caps |
 | `EXTRA_UT_COUNT` | `usize` | `slot_alloc.rs` | Number of extra untypeds granted |
 | `PENDING_FRAME_SLOT` | `Cap` | `slot_alloc.rs` | Saved slot across async WouldBlock |
-| `MM` | `PosixMmState` | `posix_mm.rs` | Memory manager state (heap, mmap regions, frames) |
+| `DEVICE_REGIONS` | `[DeviceRegion; 4]` | `posix_mm.rs` | Device-backed mmap tracking (framebuffer, etc.) |
 | `NEXT_UT_HINT` | `Cap` | `elf_loader.rs` | Hint for untyped scanning during ELF load |
 
 **Why this is safe:** SaltyOS userland processes are single-threaded.

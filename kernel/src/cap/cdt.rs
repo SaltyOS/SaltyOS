@@ -7,7 +7,8 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use super::slot::{
-    free_slot, get_cap, get_meta, get_meta_mut, nullify_capability, CapSlot, INVALID_SLOT,
+    free_slot, get_cap, get_meta, get_meta_mut, nullify_capability, CapSlot, SlotState,
+    INVALID_SLOT,
 };
 
 /// CDT operations
@@ -133,8 +134,19 @@ impl CDT {
     /// 3. Decrement object refcount (destroy if 0)
     /// 4. Nullify capability
     /// 5. Free the slot
-    fn delete_capability(slot: CapSlot) {
+    ///
+    /// # Safety
+    /// Must be called under CAP_LOCK. Safe to call on already-deleted slots
+    /// (idempotent due to SlotState::Free guard).
+    pub(crate) fn delete_capability(slot: CapSlot) {
         let meta = get_meta(slot);
+
+        // Guard against double-delete: if slot already free, return immediately.
+        // This can happen when CNode cleanup iterates slots that were already
+        // deleted by a prior CDT::revoke of their parent.
+        if meta.state == SlotState::Free {
+            return;
+        }
 
         // 1. Remove from CDT
         Self::remove(slot);

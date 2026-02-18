@@ -255,10 +255,17 @@ if build_userland and mkcpio.found()
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
+  initrd_mmsrv_elf = custom_target('initrd_mmsrv_elf',
+    input: mmsrv_elf,
+    output: 'mmsrv.initrd.elf',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
 
   # Service definition files
   svc_console = files('userland/services/console.service')
   svc_nameserv = files('userland/services/nameserv.service')
+  svc_mmsrv = files('userland/services/mmsrv.service')
   svc_vfs = files('userland/services/vfs.service')
   svc_procmgr = files('userland/services/procmgr.service')
   svc_display = files('userland/services/display.service')
@@ -275,8 +282,9 @@ if build_userland and mkcpio.found()
             initrd_init_elf, initrd_console_elf, initrd_nameserv_elf,
           initrd_procmgr_elf, initrd_vfs_elf, initrd_display_elf,
           initrd_ttyd_elf, initrd_test_runner_elf, initrd_hello_elf,
-          initrd_getty_elf,
-            svc_console, svc_nameserv, svc_vfs, svc_procmgr, svc_display,
+          initrd_getty_elf, initrd_mmsrv_elf,
+            svc_console, svc_nameserv, svc_mmsrv,
+          svc_vfs, svc_procmgr, svc_display,
           svc_ttyd, svc_test_runner, svc_hello, svc_getty],
     depends: port_depends,
     depend_files: mkcpio_script,
@@ -289,7 +297,7 @@ if build_userland and mkcpio.found()
       'ld-salty.so=@INPUT0@',
       'libsalty.so=@INPUT1@',
       'libc.so=@INPUT2@',
-      # System services (inputs 3-12)
+      # System services (inputs 3-13)
       'init=@INPUT3@',
       'console=@INPUT4@',
       'nameserv=@INPUT5@',
@@ -300,16 +308,18 @@ if build_userland and mkcpio.found()
       'test_runner=@INPUT10@',
       'hello=@INPUT11@',
       'getty=@INPUT12@',
-      # Service definitions (inputs 13-21)
-      'services/console.service=@INPUT13@',
-      'services/nameserv.service=@INPUT14@',
-      'services/vfs.service=@INPUT15@',
-      'services/procmgr.service=@INPUT16@',
-      'services/display.service=@INPUT17@',
-      'services/ttyd.service=@INPUT18@',
-      'services/test_runner.service=@INPUT19@',
-      'services/hello.service=@INPUT20@',
-      'services/getty.service=@INPUT21@',
+      'mmsrv=@INPUT13@',
+      # Service definitions (inputs 14-23)
+      'services/console.service=@INPUT14@',
+      'services/nameserv.service=@INPUT15@',
+      'services/mmsrv.service=@INPUT16@',
+      'services/vfs.service=@INPUT17@',
+      'services/procmgr.service=@INPUT18@',
+      'services/display.service=@INPUT19@',
+      'services/ttyd.service=@INPUT20@',
+      'services/test_runner.service=@INPUT21@',
+      'services/hello.service=@INPUT22@',
+      'services/getty.service=@INPUT23@',
     ],
     build_by_default: true,
   )

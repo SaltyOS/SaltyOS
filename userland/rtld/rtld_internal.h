@@ -410,7 +410,6 @@ typedef struct {
 #define AT_SALTY_SHARED_LIB_BASE  0x1006
 #define AT_SALTY_SLOT_BASE   0x1007
 #define AT_SALTY_SLOT_COUNT  0x1008
-#define AT_SALTY_EXPAND_EP   0x1009
 #define AT_SALTY_CSPACE_NTFN 0x100A
 
 /* ============================================================
@@ -563,9 +562,6 @@ struct rtld_state {
     /* Per-process slot pool (from AT_SALTY_SLOT_BASE/COUNT) */
     uint64_t slot_base;
     uint64_t slot_count;
-
-    /* Procmgr expansion EP slot (from AT_SALTY_EXPAND_EP) */
-    uint64_t expand_ep;
 
     /* CSpace expansion notification cap (from AT_SALTY_CSPACE_NTFN) */
     uint64_t cspace_ntfn;

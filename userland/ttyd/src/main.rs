@@ -32,6 +32,7 @@ const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_CSPACE: u64 = 2;
 const CAP_PROCMGR_EP: u64 = 3;
 const CAP_NAMESERV_EP: u64 = 5;
+const CAP_READINESS_NTFN: u64 = 14;
 const CAP_DISPLAY_EP: u64 = 65;
 const CAP_VFS_NTFN: u64 = 66;
 const CAP_SERVER_EP: u64 = 68;
@@ -265,7 +266,7 @@ fn ipc_ctx() -> *mut IpcContext {
 }
 
 fn signal_ready() {
-    let _ = salty::syscall::syscall(salty::SYS_SIGNAL, salty::CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = salty::syscall::syscall(salty::SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 /// Echo a control character as ^X to serial.
@@ -1074,6 +1075,21 @@ pub extern "C" fn _start() -> ! {
             }
             TTYD_PTY_POLL => {
                 unsafe { handle_pty_poll(&msg, &mut reply) };
+            }
+            TTYD_CLIENT_EXIT => {
+                let dead_badge = msg.regs[0];
+                unsafe {
+                    for i in 0..MAX_PTYS {
+                        let pty = &mut *(&raw mut PTYS[i]);
+                        if pty.has_ctty && pty.ctty_owner_badge == dead_badge {
+                            pty.has_ctty = false;
+                            pty.ctty_owner_badge = 0;
+                            pty.fg_pgid = 0;
+                        }
+                    }
+                }
+                reply.label = SALTY_OK;
+                reply.length = 0;
             }
             // Legacy labels (backward compat, redirect to PTY 0)
             TTYD_GET_FG_PGRP | TTYD_SET_FG_PGRP | TTYD_SET_CTTY | TTYD_DROP_CTTY => {

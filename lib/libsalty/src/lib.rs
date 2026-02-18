@@ -49,6 +49,9 @@ pub mod types;
 pub use consts::*;
 pub use types::*;
 
+// Standard child CSpace layout
+const CAP_PROCMGR_EP: u64 = 3;
+
 // ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
@@ -95,12 +98,6 @@ pub static mut __salty_slot_base: u64 = 0;
 #[unsafe(no_mangle)]
 #[linkage = "weak"]
 pub static mut __salty_slot_count: u64 = 0;
-
-/// Notification cap for untyped expansion signaling
-/// (from `AT_SALTY_EXPAND_EP` auxv). 0 if not available.
-#[unsafe(no_mangle)]
-#[linkage = "weak"]
-pub static mut __salty_expand_ep: u64 = 0;
 
 /// Notification cap for CSpace expansion signaling
 /// (from `AT_SALTY_CSPACE_NTFN` auxv). 0 if not available.

@@ -106,7 +106,10 @@ impl CNode {
     }
 
     /// Get pointer to slot at `index` (no bounds check)
-    unsafe fn slot_ptr(&self, index: usize) -> *const CapRef {
+    ///
+    /// # Safety
+    /// Caller must ensure `index < num_slots()`.
+    pub(crate) unsafe fn slot_ptr(&self, index: usize) -> *const CapRef {
         unsafe {
             let base = (self as *const CNode).add(1) as *const CapRef;
             base.add(index)

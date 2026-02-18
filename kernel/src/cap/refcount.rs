@@ -85,14 +85,39 @@ unsafe fn destroy_object(obj: *mut KernelObject, obj_type: ObjectType) {
             }
 
             ObjectType::CNode => {
-                // CNode cleanup - all slots should be empty
-                // The CNode memory itself will be freed
+                // CNode cleanup: delete all capabilities stored in slots
+                let cnode = &mut *(obj as *mut super::cnode::CNode);
+                let num_slots = cnode.num_slots();
+
+                #[cfg(debug_assertions)]
+                crate::println!("[REFCOUNT] CNode destroy: cleaning up {} slots", num_slots);
+
+                // Iterate all slots and delete any non-null capabilities.
+                // delete_capability is idempotent (checks SlotState::Free) and
+                // safe to call recursively (bounded by MAX_RESOLVE_DEPTH).
+                for i in 0..num_slots {
+                    // SAFETY: slot_ptr is within bounds (i < num_slots)
+                    let cap_ref = *cnode.slot_ptr(i);
+                    if cap_ref.slot != super::slot::INVALID_SLOT {
+                        super::cdt::CDT::delete_capability(cap_ref.slot);
+                    }
+                }
+
+                #[cfg(debug_assertions)]
+                crate::println!("[REFCOUNT] CNode destroy: cleanup complete");
             }
 
             ObjectType::VSpace => {
                 // Page table cleanup
                 let vspace = &mut *(obj as *mut crate::mm::VSpace);
+
+                #[cfg(debug_assertions)]
+                crate::println!("[REFCOUNT] VSpace destroy: cleaning up page tables");
+
                 vspace.cleanup();
+
+                #[cfg(debug_assertions)]
+                crate::println!("[REFCOUNT] VSpace destroy: cleanup complete");
             }
 
             ObjectType::Tcb => {

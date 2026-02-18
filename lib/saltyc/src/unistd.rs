@@ -389,9 +389,9 @@ pub unsafe extern "C" fn fstat(fd: i32, buf: *mut Stat) -> i32 {
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-struct Iovec {
-    iov_base: *const u8,
-    iov_len: usize,
+pub struct Iovec {
+    pub iov_base: *const u8,
+    pub iov_len: usize,
 }
 
 #[unsafe(no_mangle)]

@@ -8,9 +8,9 @@ MapInitrd=yes
 PreProcmgr=yes
 
 [Dependencies]
-After=console
-Before=nameserv vfs test_runner
+After=console mmsrv
+Before=vfs test_runner
 
 [Capabilities]
 CopyCap=13:66
-NeedEP=nameserv:64 vfs:65
+NeedEP=nameserv:64 vfs:65 mmsrv:67:badge mmsrv:68

@@ -10,6 +10,8 @@ use salty::serial::LineBuf;
 use salty::syscall::syscall;
 use salty::types::*;
 
+use super::{CAP_SELF_TCB, CAP_SELF_VSPACE, CAP_SELF_CSPACE};
+
 const CAP_TEST_EP: u64 = 128;
 const CAP_TEST_TCB: u64 = 129;
 const CAP_TEST_SC: u64 = 130;
