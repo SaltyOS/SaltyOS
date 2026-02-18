@@ -13,11 +13,12 @@ pub const MAX_CPUS: usize = 16;
 /// Per-CPU data structure
 ///
 /// Layout is fixed with #[repr(C)] to ensure assembly compatibility.
-/// Offset 0: cpu_id (u32)
-/// Offset 4: padding (u32)
-/// Offset 8: kernel_stack (u64)
+/// Offset 0:  cpu_id (u32)
+/// Offset 4:  padding (u32)  [implicit]
+/// Offset 8:  kernel_stack (u64)
 /// Offset 16: saved_rsp (u64)
 /// Offset 24: fpu_owner (u64) — pointer to TCB that owns FPU state in hardware
+/// Offset 32: invoke_seq (u64) — per-CPU monotonic invoke counter for diagnostics
 ///
 /// Assembly accesses GS:0, GS:8, GS:16 only — offset 24+ is safe for Rust.
 #[repr(C)]
@@ -31,8 +32,11 @@ pub struct PerCpuData {
     pub saved_rsp: u64,
     /// Pointer to TCB that owns the current FPU/SSE state in hardware registers
     pub fpu_owner: u64,
+    /// Per-CPU monotonic sequence number incremented at every capability invocation.
+    /// Used as a diagnostic correlation ID in kernel trace logs.
+    pub invoke_seq: u64,
     /// Reserved for future use
-    _reserved: [u64; 12],
+    _reserved: [u64; 11],
 }
 
 /// Per-CPU data for each CPU
@@ -42,7 +46,8 @@ static mut PER_CPU_DATA: [PerCpuData; MAX_CPUS] = {
         kernel_stack: 0,
         saved_rsp: 0,
         fpu_owner: 0,
-        _reserved: [0; 12],
+        invoke_seq: 0,
+        _reserved: [0; 11],
     };
     [INIT; MAX_CPUS]
 };
@@ -149,6 +154,41 @@ pub unsafe fn set_cpu_apic_id(cpu_id: usize, apic_id: u32) {
 /// Get the hardware APIC ID for a logical CPU index
 pub fn get_apic_id_for_cpu(cpu_id: usize) -> u32 {
     unsafe { CPU_APIC_IDS[cpu_id] }
+}
+
+/// Increment and return the per-CPU invoke sequence counter.
+///
+/// Used to stamp capability invocations with a monotonic correlation ID
+/// for diagnostic trace logs. Not visible to userspace.
+#[inline]
+pub fn next_invoke_seq() -> u64 {
+    let seq: u64;
+    unsafe {
+        // SAFETY: GS:32 corresponds to invoke_seq field in PerCpuData.
+        // This is a simple RMW on a per-CPU field; no other CPU touches it.
+        core::arch::asm!(
+            "add qword ptr gs:[32], 1",
+            "mov {}, gs:[32]",
+            out(reg) seq,
+            options(nostack)
+        );
+    }
+    seq
+}
+
+/// Read the current per-CPU invoke sequence counter (without incrementing).
+#[inline]
+pub fn current_invoke_seq() -> u64 {
+    let seq: u64;
+    unsafe {
+        // SAFETY: GS:32 corresponds to invoke_seq field in PerCpuData.
+        core::arch::asm!(
+            "mov {}, gs:[32]",
+            out(reg) seq,
+            options(nostack, pure, readonly)
+        );
+    }
+    seq
 }
 
 /// Set kernel stack for the current CPU

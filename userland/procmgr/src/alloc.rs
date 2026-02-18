@@ -382,6 +382,134 @@ impl Allocator {
         best_err
     }
 
+    /// Retype a core kernel object (TCB/VSpace/CNode/SchedContext).
+    ///
+    /// Prefers the primary untyped (index 0, CAP_UNTYPED slot) before falling
+    /// back to mirrors. This reduces fragmentation and keeps core objects in a
+    /// predictable region of the untyped pool.
+    pub fn retype_core_object(&mut self, obj_type: u64, size_bits: u64, dest_slot: Cap) -> i32 {
+        if self.ut_count == 0 {
+            return salty::SALTY_OUT_OF_MEMORY as i32;
+        }
+
+        // Try primary untyped first (index 0)
+        if self.ut_sources[0].active {
+            let err = salty::invoke::untyped_retype(
+                self.ut_sources[0].cap,
+                obj_type,
+                size_bits,
+                dest_slot,
+            );
+            if err == 0 {
+                self.ut_hint = 0;
+                return 0;
+            }
+        }
+
+        // Fallback: scan mirrors (indices 1..ut_count)
+        let mut best_err = salty::SALTY_OUT_OF_MEMORY as i32;
+        for i in 1..self.ut_count {
+            if !self.ut_sources[i].active {
+                continue;
+            }
+            let err = salty::invoke::untyped_retype(
+                self.ut_sources[i].cap,
+                obj_type,
+                size_bits,
+                dest_slot,
+            );
+            if err == 0 {
+                self.ut_hint = i;
+                return 0;
+            }
+            best_err = err;
+        }
+
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] retype_core_object: all ");
+            lb.hex(self.ut_count as u64);
+            lb.str(b" sources failed, best_err=");
+            lb.hex(best_err as u64);
+            lb.str(b" dest=");
+            lb.hex(dest_slot);
+            lb.str(b" type=");
+            lb.hex(obj_type);
+            lb.str(b" bits=");
+            lb.hex(size_bits);
+            lb.str(b"\n");
+            lb.flush();
+        }
+        best_err
+    }
+
+    /// Realize a core kernel object (TCB/VSpace/CNode/SchedContext) into the
+    /// next available reservation slot, preferring the primary untyped source.
+    pub fn realize_core_object(&mut self, obj_type: u64, size_bits: u64) -> Result<Cap, i32> {
+        if !self.reservation.active {
+            return Err(salty::SALTY_INVALID_OPERATION as i32);
+        }
+        if self.reservation.next_offset >= self.reservation.slot_count {
+            return Err(salty::SALTY_OUT_OF_MEMORY as i32);
+        }
+
+        let slot = self.reservation_slot(self.reservation.next_offset);
+        self.reservation.next_offset += 1;
+
+        let err = self.retype_core_object(obj_type, size_bits, slot);
+        if err != 0 {
+            return Err(err);
+        }
+
+        if self.reservation.object_count < MAX_RESERVE_OBJECTS {
+            let obj_idx = self.reservation.object_count;
+            self.reservation.objects[obj_idx] = ReservedObject {
+                slot,
+                committed: true,
+            };
+            self.reservation.object_count += 1;
+        }
+
+        Ok(slot)
+    }
+
+    /// Realize a core kernel object into a specific offset within the reservation,
+    /// preferring the primary untyped source.
+    pub fn realize_core_object_at(
+        &mut self,
+        obj_type: u64,
+        size_bits: u64,
+        offset: usize,
+    ) -> Result<Cap, i32> {
+        if !self.reservation.active {
+            return Err(salty::SALTY_INVALID_OPERATION as i32);
+        }
+        if offset >= self.reservation.slot_count {
+            return Err(salty::SALTY_OUT_OF_MEMORY as i32);
+        }
+
+        let slot = self.reservation_slot(offset);
+        let err = self.retype_core_object(obj_type, size_bits, slot);
+        if err != 0 {
+            return Err(err);
+        }
+
+        if offset >= self.reservation.next_offset {
+            self.reservation.next_offset = offset + 1;
+        }
+
+        if self.reservation.object_count < MAX_RESERVE_OBJECTS {
+            let obj_idx = self.reservation.object_count;
+            self.reservation.objects[obj_idx] = ReservedObject {
+                slot,
+                committed: true,
+            };
+            self.reservation.object_count += 1;
+        }
+
+        Ok(slot)
+    }
+
     // -----------------------------------------------------------------------
     // Transactional reservation
     // -----------------------------------------------------------------------

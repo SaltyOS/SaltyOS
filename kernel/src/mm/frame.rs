@@ -20,6 +20,10 @@ struct BitmapState {
     obj_ref_phys: PhysAddr,
     /// Physical address of per-frame reclaimability flags (u8[MAX_FRAMES])
     reclaimable_phys: PhysAddr,
+    /// Physical address of per-frame page-table ownership flags (u8[MAX_FRAMES])
+    pt_owned_phys: PhysAddr,
+    /// Physical address of per-frame kernel-runtime flags (u8[MAX_FRAMES])
+    kernel_rt_phys: PhysAddr,
     /// Number of tracked frames (array length for refcounts)
     frame_count: usize,
 }
@@ -31,6 +35,8 @@ static mut BITMAP_STATE: BitmapState = BitmapState {
     map_ref_phys: 0,
     obj_ref_phys: 0,
     reclaimable_phys: 0,
+    pt_owned_phys: 0,
+    kernel_rt_phys: 0,
     frame_count: 0,
 };
 
@@ -50,6 +56,10 @@ pub struct FrameAllocator {
     obj_refs: &'static mut [u16],
     /// Per-frame reclaimability flag (1 = allocator-owned/reclaimable)
     reclaimable: &'static mut [u8],
+    /// Per-frame page-table ownership flag (1 = used as page table, never reclaim)
+    pt_owned: &'static mut [u8],
+    /// Per-frame kernel-runtime flag (1 = allocated for kernel use, reject untyped exposure)
+    kernel_rt: &'static mut [u8],
 }
 
 impl FrameAllocator {
@@ -84,7 +94,12 @@ impl FrameAllocator {
         let obj_ref_pages = (obj_ref_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
         let reclaimable_bytes = max_frames * core::mem::size_of::<u8>();
         let reclaimable_pages = (reclaimable_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-        let metadata_pages = bitmap_pages + map_ref_pages + obj_ref_pages + reclaimable_pages;
+        let pt_owned_bytes = max_frames * core::mem::size_of::<u8>();
+        let pt_owned_pages = (pt_owned_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+        let kernel_rt_bytes = max_frames * core::mem::size_of::<u8>();
+        let kernel_rt_pages = (kernel_rt_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+        let metadata_pages =
+            bitmap_pages + map_ref_pages + obj_ref_pages + reclaimable_pages + pt_owned_pages + kernel_rt_pages;
 
         // Find a usable region below 1GB large enough for the bitmap.
         // Must be below 1GB to be accessible via bootloader identity mapping.
@@ -129,17 +144,23 @@ impl FrameAllocator {
         let map_ref_phys = bitmap_phys + (bitmap_pages * PAGE_SIZE) as u64;
         let obj_ref_phys = map_ref_phys + (map_ref_pages * PAGE_SIZE) as u64;
         let reclaimable_phys = obj_ref_phys + (obj_ref_pages * PAGE_SIZE) as u64;
+        let pt_owned_phys = reclaimable_phys + (reclaimable_pages * PAGE_SIZE) as u64;
+        let kernel_rt_phys = pt_owned_phys + (pt_owned_pages * PAGE_SIZE) as u64;
         let map_ref_ptr = map_ref_phys as *mut u16;
         let obj_ref_ptr = obj_ref_phys as *mut u16;
         let reclaimable_ptr = reclaimable_phys as *mut u8;
+        let pt_owned_ptr = pt_owned_phys as *mut u8;
+        let kernel_rt_ptr = kernel_rt_phys as *mut u8;
 
-        // Zero the bitmap
+        // Zero the bitmap and all per-frame arrays
         // SAFETY: bitmap_phys points to usable memory accessible via identity map
         unsafe {
             core::ptr::write_bytes(bitmap_ptr, 0, word_count);
             core::ptr::write_bytes(map_ref_ptr, 0, max_frames);
             core::ptr::write_bytes(obj_ref_ptr, 0, max_frames);
             core::ptr::write_bytes(reclaimable_ptr, 0, max_frames);
+            core::ptr::write_bytes(pt_owned_ptr, 0, max_frames);
+            core::ptr::write_bytes(kernel_rt_ptr, 0, max_frames);
         }
 
         // SAFETY: Single-threaded init, identity mapping valid
@@ -151,6 +172,10 @@ impl FrameAllocator {
             unsafe { core::slice::from_raw_parts_mut(obj_ref_ptr, max_frames) };
         let reclaimable: &'static mut [u8] =
             unsafe { core::slice::from_raw_parts_mut(reclaimable_ptr, max_frames) };
+        let pt_owned: &'static mut [u8] =
+            unsafe { core::slice::from_raw_parts_mut(pt_owned_ptr, max_frames) };
+        let kernel_rt: &'static mut [u8] =
+            unsafe { core::slice::from_raw_parts_mut(kernel_rt_ptr, max_frames) };
 
         // Save state for remap
         // SAFETY: Single-threaded init
@@ -161,6 +186,8 @@ impl FrameAllocator {
             state.map_ref_phys = map_ref_phys;
             state.obj_ref_phys = obj_ref_phys;
             state.reclaimable_phys = reclaimable_phys;
+            state.pt_owned_phys = pt_owned_phys;
+            state.kernel_rt_phys = kernel_rt_phys;
             state.frame_count = max_frames;
         }
 
@@ -172,6 +199,8 @@ impl FrameAllocator {
             map_refs,
             obj_refs,
             reclaimable,
+            pt_owned,
+            kernel_rt,
         };
 
         // First pass: mark usable memory regions as free
@@ -482,6 +511,11 @@ impl FrameAllocator {
         if self.reclaimable[frame] == 0 {
             return;
         }
+        // Page-table frames are never reclaimed via refcount — only via explicit
+        // VSpace teardown which calls clear_pt_owned() first.
+        if self.pt_owned[frame] != 0 {
+            return;
+        }
         if self.map_refs[frame] != 0 || self.obj_refs[frame] != 0 {
             return;
         }
@@ -491,9 +525,39 @@ impl FrameAllocator {
             self.bitmap[idx] |= 1u64 << bit;
             self.free += 1;
             self.reclaimable[frame] = 0;
+            // Clear kernel-runtime flag when frame is returned to free pool
+            self.kernel_rt[frame] = 0;
             if frame < self.next_free {
                 self.next_free = frame;
             }
+        }
+    }
+
+    /// Mark a frame as used for page tables (prevents refcount-driven reclamation).
+    pub fn mark_pt_owned(&mut self, addr: PhysAddr) {
+        if let Some(frame) = self.frame_index(addr) {
+            self.pt_owned[frame] = 1;
+        }
+    }
+
+    /// Clear the page-table ownership flag (called during VSpace teardown before release).
+    pub fn clear_pt_owned(&mut self, addr: PhysAddr) {
+        if let Some(frame) = self.frame_index(addr) {
+            self.pt_owned[frame] = 0;
+        }
+    }
+
+    /// Mark a frame as allocated for kernel runtime use (debug: reject untyped exposure).
+    pub fn mark_kernel_runtime(&mut self, addr: PhysAddr) {
+        if let Some(frame) = self.frame_index(addr) {
+            self.kernel_rt[frame] = 1;
+        }
+    }
+
+    /// Clear the kernel-runtime flag (called during VSpace teardown alongside clear_pt_owned).
+    pub fn clear_kernel_runtime(&mut self, addr: PhysAddr) {
+        if let Some(frame) = self.frame_index(addr) {
+            self.kernel_rt[frame] = 0;
         }
     }
 
@@ -511,9 +575,17 @@ impl FrameAllocator {
             if self.reclaimable[frame] == 0 {
                 return;
             }
-            if self.map_refs[frame] != 0 {
-                self.map_refs[frame] -= 1;
+            if self.map_refs[frame] == 0 {
+                // Underflow: caller released more than it retained.
+                #[cfg(debug_assertions)]
+                {
+                    crate::serial_puts("[FRAME] WARNING: release_mapping_ref underflow at ");
+                    crate::serial_hex(addr);
+                    crate::serial_puts("\n");
+                }
+                return;
             }
+            self.map_refs[frame] -= 1;
             self.try_release_frame(frame);
         }
     }
@@ -525,6 +597,13 @@ impl FrameAllocator {
         for i in 0..pages {
             let frame = base + i;
             if frame < self.total {
+                #[cfg(debug_assertions)]
+                if self.kernel_rt[frame] != 0 {
+                    let frame_addr = (frame * PAGE_SIZE) as PhysAddr;
+                    crate::serial_puts("[FRAME] BUG: retain_object_ref on kernel-runtime frame ");
+                    crate::serial_hex(frame_addr);
+                    crate::serial_puts("\n");
+                }
                 self.reclaimable[frame] = 1;
                 self.obj_refs[frame] = self.obj_refs[frame].saturating_add(1);
             }
@@ -538,9 +617,18 @@ impl FrameAllocator {
         for i in 0..pages {
             let frame = base + i;
             if frame < self.total {
-                if self.obj_refs[frame] != 0 {
-                    self.obj_refs[frame] -= 1;
+                if self.obj_refs[frame] == 0 {
+                    // Underflow: caller released more than it retained.
+                    #[cfg(debug_assertions)]
+                    {
+                        let frame_addr = (frame * PAGE_SIZE) as PhysAddr;
+                        crate::serial_puts("[FRAME] WARNING: release_object_ref underflow at ");
+                        crate::serial_hex(frame_addr);
+                        crate::serial_puts("\n");
+                    }
+                    continue;
                 }
+                self.obj_refs[frame] -= 1;
                 self.try_release_frame(frame);
             }
         }
@@ -560,6 +648,8 @@ impl FrameAllocator {
         let map_ref_virt = super::phys_to_virt(state.map_ref_phys) as *mut u16;
         let obj_ref_virt = super::phys_to_virt(state.obj_ref_phys) as *mut u16;
         let reclaimable_virt = super::phys_to_virt(state.reclaimable_phys) as *mut u8;
+        let pt_owned_virt = super::phys_to_virt(state.pt_owned_phys) as *mut u8;
+        let kernel_rt_virt = super::phys_to_virt(state.kernel_rt_phys) as *mut u8;
         // SAFETY: The direct physical map covers the bitmap's physical address.
         // The underlying memory is the same; we're just changing the pointer.
         self.bitmap = unsafe { core::slice::from_raw_parts_mut(new_virt, state.word_count) };
@@ -567,5 +657,9 @@ impl FrameAllocator {
         self.obj_refs = unsafe { core::slice::from_raw_parts_mut(obj_ref_virt, state.frame_count) };
         self.reclaimable =
             unsafe { core::slice::from_raw_parts_mut(reclaimable_virt, state.frame_count) };
+        self.pt_owned =
+            unsafe { core::slice::from_raw_parts_mut(pt_owned_virt, state.frame_count) };
+        self.kernel_rt =
+            unsafe { core::slice::from_raw_parts_mut(kernel_rt_virt, state.frame_count) };
     }
 }

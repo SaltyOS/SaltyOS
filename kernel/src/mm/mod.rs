@@ -191,6 +191,60 @@ pub fn release_frame_object(addr: PhysAddr, size_bits: u8) {
     unsafe { restore_irq(irq_flag) };
 }
 
+/// Mark a frame as used for page tables — prevents refcount-driven reclamation (SMP-safe).
+pub fn mark_frame_pt_owned(addr: PhysAddr) {
+    let irq_flag = unsafe { save_irq_disable() };
+    FRAME_LOCK.lock();
+    unsafe {
+        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
+            allocator.mark_pt_owned(addr);
+        }
+    }
+    FRAME_LOCK.unlock();
+    unsafe { restore_irq(irq_flag) };
+}
+
+/// Clear the page-table ownership flag for a frame (SMP-safe).
+/// Call this before release_frame_mapping() during VSpace teardown.
+pub fn clear_frame_pt_owned(addr: PhysAddr) {
+    let irq_flag = unsafe { save_irq_disable() };
+    FRAME_LOCK.lock();
+    unsafe {
+        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
+            allocator.clear_pt_owned(addr);
+        }
+    }
+    FRAME_LOCK.unlock();
+    unsafe { restore_irq(irq_flag) };
+}
+
+/// Mark a frame as allocated for kernel runtime use (SMP-safe).
+pub fn mark_frame_kernel_runtime(addr: PhysAddr) {
+    let irq_flag = unsafe { save_irq_disable() };
+    FRAME_LOCK.lock();
+    unsafe {
+        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
+            allocator.mark_kernel_runtime(addr);
+        }
+    }
+    FRAME_LOCK.unlock();
+    unsafe { restore_irq(irq_flag) };
+}
+
+/// Clear the kernel-runtime flag for a frame (SMP-safe).
+/// Call before release_frame_mapping() for kernel-runtime frames during teardown.
+pub fn clear_frame_kernel_runtime(addr: PhysAddr) {
+    let irq_flag = unsafe { save_irq_disable() };
+    FRAME_LOCK.lock();
+    unsafe {
+        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
+            allocator.clear_kernel_runtime(addr);
+        }
+    }
+    FRAME_LOCK.unlock();
+    unsafe { restore_irq(irq_flag) };
+}
+
 /// Free multiple contiguous frames
 pub fn free_frames(addr: PhysAddr, size_bytes: usize) {
     let num_frames = (size_bytes + PAGE_SIZE - 1) / PAGE_SIZE;

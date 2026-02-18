@@ -264,6 +264,52 @@ impl Drop for SerialGuard {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Compile-time-gated kernel log macros
+// ---------------------------------------------------------------------------
+
+/// Trace-level log. Compiled out unless `klog_trace` cfg is set.
+///
+/// The body receives a reference to a `SerialGuard` named `_g`. Use it to
+/// emit output with `_g.puts(...)`, `_g.hex(...)`, `_g.dec(...)`, etc.
+/// The guard (and its lock) is released when the block exits.
+///
+/// Example:
+/// ```rust
+/// ktrace!({
+///     _g.puts("[RETYPE] seq=");
+///     _g.hex(crate::arch::current_invoke_seq());
+///     _g.putc(b'\n');
+/// });
+/// ```
+#[allow(unused_macros)]
+macro_rules! ktrace {
+    ($body:block) => {
+        #[cfg(klog_trace)]
+        {
+            let _g = $crate::SerialGuard::acquire();
+            $body
+        }
+    };
+}
+
+/// Debug-level log. Compiled out unless `klog_debug` (or `klog_trace`) cfg is set.
+///
+/// Same usage as `ktrace!`.
+#[allow(unused_macros)]
+macro_rules! kdebug {
+    ($body:block) => {
+        #[cfg(klog_debug)]
+        {
+            let _g = $crate::SerialGuard::acquire();
+            $body
+        }
+    };
+}
+
+pub(crate) use ktrace;
+pub(crate) use kdebug;
+
 /// Kernel entry point (called from bootloader)
 ///
 /// The bootloader passes a pointer to a TLV-encoded BootInfo structure via RDI.

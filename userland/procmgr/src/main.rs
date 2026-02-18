@@ -1067,6 +1067,20 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             return;
         }
 
+        // Core objects (TCB/VSpace/CNode/SC) prefer primary untyped.
+        macro_rules! realize_core {
+            ($ty:expr, $what:expr) => {
+                match alloc.realize_core_object($ty, 0) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        puts($what);
+                        alloc.rollback();
+                        reply.label = SALTY_OUT_OF_MEMORY;
+                        return;
+                    }
+                }
+            };
+        }
         macro_rules! realize {
             ($ty:expr, $what:expr) => {
                 match alloc.realize_object($ty, 0) {
@@ -1081,10 +1095,10 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             };
         }
 
-        let child_tcb = realize!(OBJ_TCB, b"[PROCMGR] FORK: TCB retype failed\n");
-        let child_vs = realize!(OBJ_VSPACE, b"[PROCMGR] FORK: VSpace retype failed\n");
-        let child_cn = realize!(OBJ_CNODE, b"[PROCMGR] FORK: CNode retype failed\n");
-        let child_sc = realize!(OBJ_SCHED_CONTEXT, b"[PROCMGR] FORK: SC retype failed\n");
+        let child_tcb = realize_core!(OBJ_TCB, b"[PROCMGR] FORK: TCB retype failed\n");
+        let child_vs = realize_core!(OBJ_VSPACE, b"[PROCMGR] FORK: VSpace retype failed\n");
+        let child_cn = realize_core!(OBJ_CNODE, b"[PROCMGR] FORK: CNode retype failed\n");
+        let child_sc = realize_core!(OBJ_SCHED_CONTEXT, b"[PROCMGR] FORK: SC retype failed\n");
         // IPC frame allocated by mmsrv via MM_MAP_BATCH below
         let child_sig_ntfn = realize!(OBJ_NOTIFICATION, b"[PROCMGR] FORK: signal ntfn retype failed\n");
 
@@ -2022,7 +2036,7 @@ unsafe fn handle_expand_cspace(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64)
         None => { reply.label = SALTY_OUT_OF_MEMORY; return; }
     };
 
-    let err = unsafe { (&mut *(&raw mut ALLOCATOR)).retype_any(OBJ_CNODE, size_bits, temp_slot) };
+    let err = unsafe { (&mut *(&raw mut ALLOCATOR)).retype_core_object(OBJ_CNODE, size_bits, temp_slot) };
     if err != 0 {
         unsafe { (&mut *(&raw mut ALLOCATOR)).free_single_slot(temp_slot) };
         reply.label = SALTY_OUT_OF_MEMORY;
@@ -2114,7 +2128,7 @@ unsafe fn handle_expand_cspace_async(msg: &SaltyMsg, badge: u64) {
             None => return,
         };
 
-        let err = (&mut *(&raw mut ALLOCATOR)).retype_any(OBJ_CNODE, size_bits, temp_slot);
+        let err = (&mut *(&raw mut ALLOCATOR)).retype_core_object(OBJ_CNODE, size_bits, temp_slot);
         if err != 0 {
             (&mut *(&raw mut ALLOCATOR)).free_single_slot(temp_slot);
             return;
@@ -2204,7 +2218,7 @@ unsafe fn handle_cspace_expand_ntfn(bits: u64) {
                 None => continue,
             };
 
-            let err = alloc.retype_any(OBJ_CNODE, CSPACE_EXPAND_BITS, pm_slot);
+            let err = alloc.retype_core_object(OBJ_CNODE, CSPACE_EXPAND_BITS, pm_slot);
             if err != 0 {
                 alloc.free_single_slot(pm_slot);
                 continue;

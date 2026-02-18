@@ -7,7 +7,7 @@ pub mod x86_64;
 
 // Re-export architecture-specific items
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::{current_cpu, set_kernel_stack, set_tss_rsp0, MAX_CPUS};
+pub use x86_64::{current_cpu, next_invoke_seq, current_invoke_seq, set_kernel_stack, set_tss_rsp0, MAX_CPUS};
 
 // Re-export context switch interface
 #[cfg(target_arch = "x86_64")]

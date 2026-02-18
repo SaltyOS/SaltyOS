@@ -2032,6 +2032,27 @@ pub unsafe fn handle_spawn_tx(
         }
 
         // ---- REALIZE fixed objects ----
+        // Core objects (TCB/VSpace/CNode/SC) prefer primary untyped to reduce
+        // fragmentation; non-core objects (Notification) use any source.
+        macro_rules! realize_core {
+            ($ty:expr, $sz:expr, $off:expr, $what:expr) => {
+                match alloc.realize_core_object_at($ty, $sz, $off) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let mut lb = LineBuf::new();
+                        lb.str(b"[PROCMGR] retype ");
+                        lb.bytes($what);
+                        lb.str(b" failed err=");
+                        lb.hex(e as u64);
+                        lb.str(b"\n");
+                        lb.flush();
+                        alloc.rollback();
+                        reply.label = SALTY_OUT_OF_MEMORY;
+                        return;
+                    }
+                }
+            };
+        }
         macro_rules! realize {
             ($ty:expr, $sz:expr, $off:expr, $what:expr) => {
                 match alloc.realize_object_at($ty, $sz, $off) {
@@ -2052,11 +2073,11 @@ pub unsafe fn handle_spawn_tx(
             };
         }
 
-        let child_tcb = realize!(OBJ_TCB, 0, OFF_TCB, b"TCB");
-        let child_vs = realize!(OBJ_VSPACE, 0, OFF_VSPACE, b"VSpace");
+        let child_tcb = realize_core!(OBJ_TCB, 0, OFF_TCB, b"TCB");
+        let child_vs = realize_core!(OBJ_VSPACE, 0, OFF_VSPACE, b"VSpace");
         let cn_size_bits = if policy_cnode_bits > 0 { policy_cnode_bits as u64 } else { 0 };
-        let child_cn = realize!(OBJ_CNODE, cn_size_bits, OFF_CNODE, b"CNode");
-        let child_sc = realize!(OBJ_SCHED_CONTEXT, 0, OFF_SC, b"SC");
+        let child_cn = realize_core!(OBJ_CNODE, cn_size_bits, OFF_CNODE, b"CNode");
+        let child_sc = realize_core!(OBJ_SCHED_CONTEXT, 0, OFF_SC, b"SC");
         // OFF_STACK_FR and OFF_IPC_FR slots left unused — frames allocated by mmsrv
         let child_sig_ntfn = realize!(OBJ_NOTIFICATION, 0, OFF_SIGNAL_NTFN, b"signal ntfn");
 

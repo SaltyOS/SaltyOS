@@ -37,6 +37,21 @@ if all_asm_files != ''
   endforeach
 endif
 
+# Compile-time log-level cfg flags for the kernel.
+# These enable the ktrace!/kdebug! macros in lib.rs at zero runtime cost when off.
+log_level = get_option('kernel_log_level')
+if log_level == 'trace'
+  rust_log_cfgs = ['--cfg', 'klog_trace', '--cfg', 'klog_debug', '--cfg', 'klog_info', '--cfg', 'klog_warn']
+elif log_level == 'debug'
+  rust_log_cfgs = ['--cfg', 'klog_debug', '--cfg', 'klog_info', '--cfg', 'klog_warn']
+elif log_level == 'info'
+  rust_log_cfgs = ['--cfg', 'klog_info', '--cfg', 'klog_warn']
+elif log_level == 'warn'
+  rust_log_cfgs = ['--cfg', 'klog_warn']
+else  # 'error' or unrecognized
+  rust_log_cfgs = []
+endif
+
 # Step 1: Compile Rust kernel to object file
 # Uses custom-built core library instead of sysroot
 kernel_obj = custom_target('kernel_obj',
@@ -58,6 +73,7 @@ kernel_obj = custom_target('kernel_obj',
     '--extern', 'core=' + rust_build_dir / 'libcore.rmeta',
     '--extern', 'compiler_builtins=' + rust_build_dir / 'libcompiler_builtins.rmeta',
     '-L', rust_build_dir,
+  ] + rust_log_cfgs + [
     '@INPUT@',
   ],
   depends: [core, compiler_builtins],

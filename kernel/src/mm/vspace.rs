@@ -767,6 +767,21 @@ impl VSpace {
                 // SAFETY: retain before the PDE is visible so the frame cannot
                 // be reclaimed between alloc_frame() and the PDE write.
                 super::retain_frame_mapping(new_frame);
+                // Mark as page-table frame and kernel-runtime: prevents accidental
+                // reclamation via refcount bugs and exposure via untyped retype.
+                super::mark_frame_pt_owned(new_frame);
+                super::mark_frame_kernel_runtime(new_frame);
+                crate::ktrace!({
+                    _g.puts("[PT_ALLOC] seq=");
+                    _g.hex(crate::arch::current_invoke_seq());
+                    _g.puts(" vaddr=");
+                    _g.hex(vaddr);
+                    _g.puts(" level=");
+                    _g.hex(current_level as u64);
+                    _g.puts(" frame=");
+                    _g.hex(new_frame);
+                    _g.putc(b'\n');
+                });
                 let new_table_virt = phys_to_virt(new_frame) as *mut PageTable;
 
                 // Zero the new page table
@@ -1353,6 +1368,10 @@ impl VSpace {
             let old_phys = entry & ENTRY_ADDR_MASK;
             let new_phys = alloc_frame().ok_or(VSpaceError::OutOfMemory)?;
 
+            // Mark as kernel-runtime: this frame was allocated by the kernel for a
+            // COW copy and should not be exposed via untyped retype while in use.
+            super::mark_frame_kernel_runtime(new_phys);
+
             unsafe {
                 let src = phys_to_virt(old_phys) as *const u8;
                 let dst = phys_to_virt(new_phys) as *mut u8;
@@ -1364,6 +1383,7 @@ impl VSpace {
             new_flags &= !ENTRY_COW;
 
             if self.write_entry(page_vaddr, 1, new_phys | new_flags).is_err() {
+                super::clear_frame_kernel_runtime(new_phys);
                 super::free_frame(new_phys);
                 return Err(VSpaceError::NotMapped);
             }
@@ -1656,6 +1676,10 @@ impl VSpace {
                 self.free_pd_recursive(pd_addr);
             }
 
+            // Clear PT-ownership flags before releasing — these flags were set in
+            // ensure_table() to prevent accidental refcount-driven reclamation.
+            super::clear_frame_pt_owned(pdpt_addr);
+            super::clear_frame_kernel_runtime(pdpt_addr);
             super::release_frame_mapping(pdpt_addr);
         }
     }
@@ -1683,9 +1707,15 @@ impl VSpace {
                     }
                     super::release_frame_mapping(pte & ENTRY_ADDR_MASK);
                 }
+                // Clear PT-ownership flags before releasing PT frame.
+                super::clear_frame_pt_owned(pt_addr);
+                super::clear_frame_kernel_runtime(pt_addr);
                 super::release_frame_mapping(pt_addr);
             }
 
+            // Clear PT-ownership flags before releasing PD frame.
+            super::clear_frame_pt_owned(pd_addr);
+            super::clear_frame_kernel_runtime(pd_addr);
             super::release_frame_mapping(pd_addr);
         }
     }

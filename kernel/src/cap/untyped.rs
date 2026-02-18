@@ -350,6 +350,17 @@ unsafe fn init_frame_metadata(
     zero_fill: bool,
 ) -> *mut crate::cap::object::KernelObject {
     let actual_bits = if size_bits < 12 { 12 } else { size_bits };
+    crate::ktrace!({
+        _g.puts("[FRAME_META] seq=");
+        _g.hex(crate::arch::current_invoke_seq());
+        _g.puts(" phys=");
+        _g.hex(phys_addr);
+        _g.puts(" bits=");
+        _g.hex(actual_bits as u64);
+        _g.puts(" slot=");
+        _g.hex(cap_slot as u64);
+        _g.putc(b'\n');
+    });
     if zero_fill {
         let frame_virt = mm::phys_to_virt(phys_addr) as *mut u8;
         // Security invariant: newly retyped RAM-backed frames must be zeroed

@@ -858,6 +858,18 @@ fn syscall_invoke(
     arg2: u64,
     arg3: u64,
 ) -> SyscallResult {
+    // Stamp this invocation with a per-CPU monotonic sequence number for tracing.
+    let seq = crate::arch::next_invoke_seq();
+    crate::kdebug!({
+        _g.puts("[INVOKE] seq=");
+        _g.hex(seq);
+        _g.puts(" cap=");
+        _g.hex(cap_ptr);
+        _g.puts(" label=");
+        _g.hex(label);
+        _g.putc(b'\n');
+    });
+
     // Phase 1: Initial cap lookup under CAP_LOCK
     let cap = match lookup_cap_locked(cap_ptr) {
         Ok(c) => c,
@@ -2208,6 +2220,21 @@ fn syscall_untyped_retype(
     size_bits: u64,
     dest_offset: u64,
 ) -> SyscallResult {
+    let retype_seq = crate::arch::current_invoke_seq();
+    crate::kdebug!({
+        _g.puts("[RETYPE] seq=");
+        _g.hex(retype_seq);
+        _g.puts(" cap=");
+        _g.hex(cap_ptr);
+        _g.puts(" type=");
+        _g.hex(new_type_raw);
+        _g.puts(" bits=");
+        _g.hex(size_bits);
+        _g.puts(" dest=");
+        _g.hex(dest_offset);
+        _g.putc(b'\n');
+    });
+
     if let Err(e) = validate_capability(cap, ObjectType::Untyped, CapRights::RETYPE) {
         return SyscallResult::err(e);
     }
@@ -2300,7 +2327,20 @@ fn syscall_untyped_retype(
         };
         let dest_cn = &mut *dest_cn_ptr;
 
-        let untyped = &mut *(cap.object as *mut UntypedMemory);
+        // Re-read the capability from the authoritative slot: the slot may have
+        // been modified between the initial lookup (before CAP_LOCK) and now.
+        let live_cap = *crate::cap::get_cap(untyped_slot);
+        if live_cap.obj_type != ObjectType::Untyped || live_cap.object.is_null() {
+            CAP_LOCK.unlock();
+            restore_irq(irq);
+            return SyscallResult::err(SyscallError::InvalidCapability);
+        }
+        if !live_cap.rights.contains(CapRights::RETYPE) {
+            CAP_LOCK.unlock();
+            restore_irq(irq);
+            return SyscallResult::err(SyscallError::InsufficientRights);
+        }
+        let untyped = &mut *(live_cap.object as *mut UntypedMemory);
         let result = match untyped.retype(
             untyped_slot,
             new_type,
