@@ -42,7 +42,10 @@ pub mod posix_mm;
 pub mod serial;
 pub mod signals;
 pub mod slot_alloc;
+pub mod pthread;
+pub mod sync;
 pub mod syscall;
+pub mod tls;
 pub mod types;
 
 // Re-export for convenience
@@ -135,17 +138,17 @@ pub extern "C" fn salty_invoke(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn salty_send(ep: Cap, msg: *const SaltyMsg) -> i32 {
-    unsafe { ipc::send_ctx(&raw mut __salty_ipc_ctx, ep, msg) }
+    unsafe { ipc::send_ctx(tls::current_ipc_ctx(), ep, msg) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn salty_recv(ep: Cap, msg: *mut SaltyMsg, badge: *mut u64) -> i32 {
-    unsafe { ipc::recv_ctx(&raw mut __salty_ipc_ctx, ep, msg, badge) }
+    unsafe { ipc::recv_ctx(tls::current_ipc_ctx(), ep, msg, badge) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn salty_call(ep: Cap, msg: *const SaltyMsg, reply: *mut SaltyMsg) -> i32 {
-    unsafe { ipc::call_ctx(&raw mut __salty_ipc_ctx, ep, msg, reply) }
+    unsafe { ipc::call_ctx(tls::current_ipc_ctx(), ep, msg, reply) }
 }
 
 #[unsafe(no_mangle)]
@@ -155,12 +158,12 @@ pub extern "C" fn salty_reply_recv(
     out_msg: *mut SaltyMsg,
     badge: *mut u64,
 ) -> i32 {
-    unsafe { ipc::reply_recv_ctx(&raw mut __salty_ipc_ctx, ep, reply, out_msg, badge) }
+    unsafe { ipc::reply_recv_ctx(tls::current_ipc_ctx(), ep, reply, out_msg, badge) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn salty_nbsend(ep: Cap, msg: *const SaltyMsg) -> i32 {
-    unsafe { ipc::nbsend_ctx(&raw mut __salty_ipc_ctx, ep, msg) }
+    unsafe { ipc::nbsend_ctx(tls::current_ipc_ctx(), ep, msg) }
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +376,21 @@ pub extern "C" fn salty_irq_handler_set_notification(irq_handler: Cap, ntfn: Cap
     invoke::irq_handler_set_notification(irq_handler, ntfn)
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_tcb_set_tls_base(tcb: Cap, tls_base: u64) -> i32 {
+    invoke::tcb_set_tls_base(tcb, tls_base)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_futex_wait(addr: *const u32, expected: u32) -> i32 {
+    syscall::syscall(SYS_FUTEX, addr as u64, FUTEX_WAIT, expected as u64, 0, 0, 0).error as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_futex_wake(addr: *const u32, count: u32) -> i32 {
+    syscall::syscall(SYS_FUTEX, addr as u64, FUTEX_WAKE, count as u64, 0, 0, 0).value as i32
+}
+
 // ---------------------------------------------------------------------------
 // C ABI exports: Fork helper (called from fork.S)
 // ---------------------------------------------------------------------------
@@ -415,8 +433,18 @@ pub extern "C" fn _posix_fork_impl(saved_rsp: u64, child_entry: u64) -> i32 {
         msg.regs[7] = *saved.add(0); // r15
         msg.regs[8] = *saved.add(6); // return RIP
 
+        // Pass parent's TLS base so procmgr can set FS_BASE on the child TCB.
+        // The child has a COW copy of the parent's TLS block at the same virtual
+        // address, so it needs the same FS_BASE to avoid faulting on fs:[0].
+        let tls_base: u64 = match tls::current_tls() {
+            Some(ptr) => ptr as u64,
+            None => 0,
+        };
+        msg.regs[9] = tls_base;
+        msg.length = 10;
+
         let err = ipc::call_ctx(
-            &raw mut __salty_ipc_ctx,
+            tls::current_ipc_ctx(),
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
@@ -708,4 +736,46 @@ pub extern "C" fn salty_chdir(path: *const u8) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn salty_getcwd(buf: *mut u8, size: u64) -> i32 {
     unsafe { posix::posix_getcwd(buf, size) }
+}
+
+// ---------------------------------------------------------------------------
+// C ABI exports: pthread operations
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_pthread_create(
+    thread_out: *mut pthread::PthreadT,
+    start_fn: unsafe extern "C" fn(*mut u8) -> *mut u8,
+    arg: *mut u8,
+) -> i32 {
+    unsafe { pthread::pthread_create(thread_out, start_fn, arg) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_pthread_join(thread: pthread::PthreadT, retval: *mut *mut u8) -> i32 {
+    unsafe { pthread::pthread_join(thread, retval) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_pthread_exit(retval: *mut u8) -> ! {
+    unsafe { pthread::pthread_exit(retval) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_pthread_self() -> pthread::PthreadT {
+    pthread::pthread_self()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_pthread_detach(thread: pthread::PthreadT) -> i32 {
+    unsafe { pthread::pthread_detach(thread) }
+}
+
+// ---------------------------------------------------------------------------
+// C ABI exports: TLS initialization
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_init_tls() {
+    unsafe { tls::init_main_thread_tls() }
 }

@@ -29,6 +29,11 @@ pub const SYS_DEBUG_PUTSTR: u64 = 14;
 pub const SYS_DEBUG_PUTBUF: u64 = 15;
 pub const SYS_DEBUG_CONSOLE_CONTROL: u64 = 16;
 pub const SYS_SET_INVOKE_DEPTHS: u64 = 17;
+pub const SYS_FUTEX: u64 = 18;
+
+/// Futex operation codes (arg1 of SYS_FUTEX)
+pub const FUTEX_WAIT: u64 = 0;
+pub const FUTEX_WAKE: u64 = 1;
 
 /// Clock IDs for `SYS_CLOCK_GETTIME`.
 pub const CLOCK_MONOTONIC: i32 = 0;
@@ -62,6 +67,7 @@ pub const TCB_SET_IPC_BUFFER: u64 = 0x48;
 pub const TCB_BIND_NOTIFICATION: u64 = 0x49;
 pub const TCB_SET_FAULT_HANDLER: u64 = 0x4B;
 pub const TCB_COPY_FPU: u64 = 0x4C;
+pub const TCB_SET_TLS_BASE: u64 = 0x4D;
 
 /// VSpace invoke labels (0x50-0x58): map, unmap, map_pt, walk, copy_page, map_device, clone_cow, map_device_range, protect.
 pub const VSPACE_MAP: u64 = 0x50;
@@ -357,6 +363,8 @@ pub const MM_SHM_CREATE: u64 = 0x8A;
 pub const MM_SHM_MAP: u64 = 0x8B;
 pub const MM_SHM_UNMAP: u64 = 0x8C;
 pub const MM_FORK_REGIONS: u64 = 0x8D;
+pub const MM_ALLOC_THREAD_OBJECTS: u64 = 0x8E;
+pub const MM_FREE_THREAD_OBJECTS: u64 = 0x8F;
 
 /// Name service IPC protocol labels (register/lookup endpoint by name).
 pub const POSIX_NS_REGISTER: u64 = 1;

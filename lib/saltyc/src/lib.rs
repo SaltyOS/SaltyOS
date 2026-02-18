@@ -8,8 +8,8 @@
 //!
 //! System operations (file I/O, memory management, process control) are
 //! delegated to `libsalty`, which communicates with kernel services via IPC.
-//! The library assumes single-threaded execution — `static mut` globals are
-//! used without synchronization.
+//! Core subsystems (malloc, errno) are thread-safe via spinlocks and TLS.
+//! stdio FILE operations are not yet fully locked.
 
 #![no_std]
 #![no_main]
@@ -48,6 +48,7 @@ pub mod glob_impl;
 pub mod select_impl;
 pub mod math_impl;
 pub mod misc_impl;
+pub mod pthread_impl;
 pub mod compat;
 
 // Panic handler is provided by libsalty (our dependency)

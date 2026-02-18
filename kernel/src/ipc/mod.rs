@@ -5,6 +5,7 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 mod endpoint;
+pub mod futex;
 pub mod irq;
 mod notification;
 mod queue;

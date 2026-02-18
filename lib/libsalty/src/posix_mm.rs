@@ -25,10 +25,29 @@ static mut MM_INITIALIZED: bool = false;
 /// Bump allocator for fd-backed (device) mappings. Separate address range
 /// from the mmsrv-managed heap/mmap space so they never collide.
 const DEVICE_MMAP_BASE: u64 = 0x0000_0000_8000_0000; // 2 GB
+const DEVICE_MMAP_LIMIT: u64 = 0x0000_0001_0000_0000; // 4 GB (2 GB range)
 static mut DEVICE_MMAP_NEXT: u64 = DEVICE_MMAP_BASE;
 
 /// Minimal tracking for device-mapped regions (needed for munmap cleanup).
 const MAX_DEVICE_REGIONS: usize = 4;
+
+/// Spinlock protecting DEVICE_MMAP_NEXT and DEVICE_REGIONS for thread safety.
+static DEVICE_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[inline]
+fn device_lock_acquire() {
+    use core::sync::atomic::Ordering;
+    while DEVICE_LOCK.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        while DEVICE_LOCK.load(Ordering::Relaxed) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+#[inline]
+fn device_lock_release() {
+    DEVICE_LOCK.store(0, core::sync::atomic::Ordering::Release);
+}
 
 struct DeviceRegion {
     base: u64,
@@ -80,7 +99,7 @@ pub unsafe fn posix_brk(addr: u64) -> i32 {
         msg.length = 1;
         msg.regs[0] = addr;
         let err = ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             *(&raw const MMSRV_EP),
             &raw const msg,
             &raw mut reply,
@@ -102,7 +121,7 @@ pub unsafe fn posix_sbrk(increment: i64) -> u64 {
         msg.length = 1;
         msg.regs[0] = increment as u64;
         let err = ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             *(&raw const MMSRV_EP),
             &raw const msg,
             &raw mut reply,
@@ -151,7 +170,7 @@ unsafe fn posix_mmap_fd(
 
         // Prepare receive slot for IPC cap transfer
         ipc::set_receive_slot_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_SELF_CSPACE,
             recv_slot,
             0,
@@ -169,7 +188,7 @@ unsafe fn posix_mmap_fd(
         msg.regs[4] = _flags as u64;
 
         let err = ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -186,9 +205,19 @@ unsafe fn posix_mmap_fd(
             return reply.regs[0] as *mut u8;
         }
 
-        // Pick a mapping base from the device-mmap bump allocator
+        // Pick a mapping base from the device-mmap bump allocator (locked)
+        device_lock_acquire();
         let base = *(&raw const DEVICE_MMAP_NEXT);
-        *(&raw mut DEVICE_MMAP_NEXT) = base + len;
+        let new_next = match base.checked_add(len) {
+            Some(n) if n <= DEVICE_MMAP_LIMIT => n,
+            _ => {
+                device_lock_release();
+                invoke::cnode_delete(CAP_SELF_CSPACE, recv_slot);
+                return usize::MAX as *mut u8;
+            }
+        };
+        *(&raw mut DEVICE_MMAP_NEXT) = new_next;
+        device_lock_release();
 
         // Map using batch device range syscall with WC flags
         let map_flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER | VSPACE_FLAG_WRITE_THROUGH;
@@ -205,12 +234,19 @@ unsafe fn posix_mmap_fd(
                 invoke::vspace_unmap(CAP_SELF_VSPACE, base + i * 4096);
             }
             invoke::cnode_delete(CAP_SELF_CSPACE, recv_slot);
-            *(&raw mut DEVICE_MMAP_NEXT) = base; // rollback
+            // Conditional rollback: only if no one else has bumped past us
+            device_lock_acquire();
+            if *(&raw const DEVICE_MMAP_NEXT) == new_next {
+                *(&raw mut DEVICE_MMAP_NEXT) = base;
+            }
+            device_lock_release();
             return usize::MAX as *mut u8;
         }
 
-        // Track for munmap cleanup
+        // Track for munmap cleanup (locked)
+        device_lock_acquire();
         let regions = &raw mut DEVICE_REGIONS;
+        let mut tracked = false;
         for i in 0..MAX_DEVICE_REGIONS {
             if !(*regions)[i].active {
                 (*regions)[i] = DeviceRegion {
@@ -219,8 +255,25 @@ unsafe fn posix_mmap_fd(
                     device_cap: recv_slot,
                     active: true,
                 };
+                tracked = true;
                 break;
             }
+        }
+        device_lock_release();
+
+        if !tracked {
+            // No tracking slot available — unmap everything and fail
+            for i in 0..num_pages {
+                invoke::vspace_unmap(CAP_SELF_VSPACE, base + i * 4096);
+            }
+            invoke::cnode_delete(CAP_SELF_CSPACE, recv_slot);
+            // Conditional rollback
+            device_lock_acquire();
+            if *(&raw const DEVICE_MMAP_NEXT) == new_next {
+                *(&raw mut DEVICE_MMAP_NEXT) = base;
+            }
+            device_lock_release();
+            return usize::MAX as *mut u8;
         }
 
         base as *mut u8
@@ -265,7 +318,7 @@ pub unsafe fn posix_mmap(
         msg.regs[2] = prot as u64;
         msg.regs[3] = flags as u64;
         let err = ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             *(&raw const MMSRV_EP),
             &raw const msg,
             &raw mut reply,
@@ -291,6 +344,7 @@ pub unsafe fn posix_munmap(addr: *mut u8, length: u64) -> i32 {
         let base = addr as u64;
 
         // Check if this is a device-backed region (local tracking)
+        device_lock_acquire();
         let regions = &raw mut DEVICE_REGIONS;
         for i in 0..MAX_DEVICE_REGIONS {
             if (*regions)[i].active && (*regions)[i].base == base {
@@ -303,9 +357,11 @@ pub unsafe fn posix_munmap(addr: *mut u8, length: u64) -> i32 {
                     invoke::cnode_delete(CAP_SELF_CSPACE, r.device_cap);
                 }
                 r.active = false;
+                device_lock_release();
                 return 0;
             }
         }
+        device_lock_release();
 
         // Anonymous region → mmsrv IPC
         let mut msg = SaltyMsg::zeroed();
@@ -315,7 +371,7 @@ pub unsafe fn posix_munmap(addr: *mut u8, length: u64) -> i32 {
         msg.regs[0] = base;
         msg.regs[1] = length;
         let err = ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             *(&raw const MMSRV_EP),
             &raw const msg,
             &raw mut reply,
@@ -339,7 +395,7 @@ pub unsafe fn posix_mprotect(addr: *mut u8, length: u64, prot: i32) -> i32 {
         msg.regs[1] = length;
         msg.regs[2] = prot as u64;
         let err = ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             *(&raw const MMSRV_EP),
             &raw const msg,
             &raw mut reply,

@@ -87,6 +87,24 @@ static mut SLOT_ALLOC: SlotAllocState = SlotAllocState {
     cspace_expand_count: 0,
 };
 
+/// Spinlock protecting SLOT_ALLOC state for thread safety.
+static SLOT_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[inline]
+fn slot_lock_acquire() {
+    use core::sync::atomic::Ordering;
+    while SLOT_LOCK.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        while SLOT_LOCK.load(Ordering::Relaxed) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+#[inline]
+fn slot_lock_release() {
+    SLOT_LOCK.store(0, core::sync::atomic::Ordering::Release);
+}
+
 
 /// Initialize the per-process slot allocator.
 ///
@@ -166,6 +184,13 @@ pub fn slot_alloc_set_procmgr_ep(ep: Cap) {
 /// in progress (caller should yield and retry), or `Exhausted` if expansion
 /// failed permanently.
 pub fn slot_alloc_async() -> SlotResult {
+    slot_lock_acquire();
+    let result = unsafe { slot_alloc_async_inner() };
+    slot_lock_release();
+    result
+}
+
+unsafe fn slot_alloc_async_inner() -> SlotResult {
     unsafe {
         let state = &mut *(&raw mut SLOT_ALLOC);
         if !state.initialized {
@@ -274,11 +299,100 @@ pub fn slot_alloc_async() -> SlotResult {
     }
 }
 
+/// Allocate `count` consecutive CNode slots from the pool (synchronous path).
+///
+/// Returns the base slot index, or `None` if no segment has enough contiguous
+/// room and a blocking CSpace expansion request fails.
+///
+/// Uses a local scan index to avoid advancing `active_seg` past partially-used
+/// segments (which would permanently waste their remaining slots for future
+/// `slot_alloc()` calls).
+pub fn slot_alloc_consecutive(count: u64) -> Option<Cap> {
+    slot_lock_acquire();
+    let result = unsafe { slot_alloc_consecutive_inner(count) };
+    slot_lock_release();
+    result
+}
+
+unsafe fn slot_alloc_consecutive_inner(count: u64) -> Option<Cap> {
+    unsafe {
+        let state = &mut *(&raw mut SLOT_ALLOC);
+        if !state.initialized || count == 0 {
+            return None;
+        }
+
+        // Scan from active_seg forward using a LOCAL index.
+        // Do NOT modify state.active_seg — a segment with <count remaining
+        // slots may still have room for single slot_alloc() calls.
+        let mut scan = state.active_seg;
+        while scan < state.seg_count {
+            let seg = &mut state.segments[scan];
+            if count <= seg.count && seg.next <= seg.count - count {
+                let base = seg.base + seg.next;
+                seg.next += count;
+                return Some(base);
+            }
+            scan += 1;
+        }
+
+        // Slow path: perform a blocking CSpace expansion request.
+        let ep = if state.procmgr_ep != 0 {
+            state.procmgr_ep
+        } else {
+            CAP_PROCMGR_EP
+        };
+        let (base, seg_count) = request_expand_blocking(ep)?;
+        if state.seg_count >= MAX_SEGMENTS {
+            state.expand_state = ExpandState::Failed;
+            return None;
+        }
+
+        let si = state.seg_count;
+        state.segments[si] = Segment {
+            base,
+            count: seg_count,
+            next: 0,
+        };
+        state.seg_count += 1;
+        state.expand_state = ExpandState::Idle;
+        update_expansion_depth(state);
+
+        {
+            let mut lb = serial::LineBuf::new();
+            lb.str(b"[SLOT] expand(consec): base=");
+            lb.hex(base);
+            lb.str(b" count=");
+            lb.hex(seg_count);
+            lb.str(b" (seg ");
+            lb.hex(si as u64);
+            lb.str(b")\n");
+            lb.flush();
+        }
+
+        // Allocate from the newly created segment
+        let seg = &mut state.segments[si];
+        if count <= seg.count && seg.next <= seg.count - count {
+            let slot_base = seg.base + seg.next;
+            seg.next += count;
+            Some(slot_base)
+        } else {
+            None
+        }
+    }
+}
+
 /// Allocate a single CNode slot from the pool (synchronous path).
 ///
 /// Returns the absolute CNode slot index, or `None` if the pool is exhausted
 /// or a blocking CSpace expansion request fails.
 pub fn slot_alloc() -> Option<Cap> {
+    slot_lock_acquire();
+    let result = unsafe { slot_alloc_inner() };
+    slot_lock_release();
+    result
+}
+
+unsafe fn slot_alloc_inner() -> Option<Cap> {
     unsafe {
         let state = &mut *(&raw mut SLOT_ALLOC);
         if !state.initialized {
@@ -351,7 +465,7 @@ fn ensure_root_bits(state: &mut SlotAllocState) {
         let info = invoke::cnode_get_info(CAP_SELF_CSPACE);
         if info.error == 0 {
             unsafe {
-                let ctx = &raw const crate::__salty_ipc_ctx;
+                let ctx = crate::tls::current_ipc_ctx();
                 if !(*ctx).ipc_buffer.is_null() {
                     state.root_bits = (*(*ctx).ipc_buffer).msg[2] as u8;
                 }
@@ -415,7 +529,7 @@ fn request_expand_blocking(ep: Cap) -> Option<(Cap, u64)> {
         msg.regs[0] = SLOT_EXPAND_BITS_DEFAULT;
 
         let err = ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             ep,
             &raw const msg,
             &raw mut reply,
@@ -440,7 +554,7 @@ fn update_expansion_depth(state: &mut SlotAllocState) {
         let info = invoke::cnode_get_info(CAP_SELF_CSPACE);
         if info.error == 0 {
             unsafe {
-                let ctx = &raw const crate::__salty_ipc_ctx;
+                let ctx = crate::tls::current_ipc_ctx();
                 if !(*ctx).ipc_buffer.is_null() {
                     state.root_bits = (*(*ctx).ipc_buffer).msg[2] as u8;
                 }

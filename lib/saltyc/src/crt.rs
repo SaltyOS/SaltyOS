@@ -56,6 +56,9 @@ pub unsafe extern "C" fn __libc_start_main(
         // Initialize memory manager
         init_mm_from_auxv(stack_ptr);
 
+        // Initialize TLS for the main thread (must come after IPC + MM init)
+        salty::tls::init_main_thread_tls();
+
         // Set program name from argv[0] for BSD err(3) functions
         if argc > 0 && !(*argv).is_null() {
             crate::compat::freebsd::bsd_misc::setprogname(*argv);

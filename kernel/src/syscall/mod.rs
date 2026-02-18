@@ -32,6 +32,7 @@ pub enum Syscall {
     DebugPutBuf = 15,
     DebugConsoleControl = 16,
     SetInvokeDepths = 17,
+    Futex = 18,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -57,6 +58,7 @@ impl TryFrom<u64> for Syscall {
             15 => Ok(Syscall::DebugPutBuf),
             16 => Ok(Syscall::DebugConsoleControl),
             17 => Ok(Syscall::SetInvokeDepths),
+            18 => Ok(Syscall::Futex),
             _ => Err(SyscallError::InvalidOperation),
         }
     }
@@ -1279,6 +1281,10 @@ fn syscall_invoke_inner(
             // TCB_COPY_FPU: copy FPU state from source TCB (arg0) to dest TCB (cap)
             syscall_tcb_copy_fpu(&cap, arg0)
         }
+        (ObjectType::Tcb, 0x4D) => {
+            // TCB_SET_TLS_BASE: arg0 = tls_base address
+            syscall_tcb_set_tls_base(&cap, arg0)
+        }
 
         // VSpace operations
         (ObjectType::VSpace, 0x50) => {
@@ -1687,6 +1693,9 @@ fn syscall_tcb_resume(cap: &Capability) -> SyscallResult {
                         ntfn.remove_waiter(tcb as *mut Tcb);
                         tcb.blocked_notification = core::ptr::null_mut();
                     }
+                    if matches!(tcb.blocked_reason, Some(BlockedReason::FutexBlocked)) {
+                        crate::ipc::futex::futex_remove_thread(tcb as *mut Tcb);
+                    }
                     tcb.blocked_reason = None;
                     sched.enqueue_unlocked(tcb as *mut Tcb);
                 });
@@ -1775,6 +1784,9 @@ fn syscall_tcb_suspend(cap: &Capability) -> SyscallResult {
                         let ntfn = &mut *(tcb.blocked_notification as *mut crate::ipc::Notification);
                         ntfn.remove_waiter(tcb as *mut Tcb);
                         tcb.blocked_notification = core::ptr::null_mut();
+                    }
+                    if matches!(tcb.blocked_reason, Some(BlockedReason::FutexBlocked)) {
+                        crate::ipc::futex::futex_remove_thread(tcb as *mut Tcb);
                     }
                     tcb.state = ThreadState::Inactive;
                     tcb.blocked_reason = None;
@@ -2182,6 +2194,52 @@ fn syscall_tcb_copy_fpu(
             );
         }
         (*dest_tcb).fpu_initialized = (*src_tcb).fpu_initialized;
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// TCB_SET_TLS_BASE: Set the FS_BASE (TLS pointer) for a thread.
+/// If the target is the current thread, also writes IA32_FS_BASE immediately.
+fn syscall_tcb_set_tls_base(
+    cap: &Capability,
+    tls_base: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    // Canonical user address check: 0 (clear) or positive-half canonical
+    if tls_base != 0 && tls_base >= 0x0000_8000_0000_0000 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    unsafe {
+        let irq = save_irq_disable();
+        SCHED_IPC_LOCK.lock();
+
+        let tcb = cap.object as *mut Tcb;
+        let current = crate::sched::scheduler::scheduler().current();
+
+        if tcb == current {
+            // Self: write field + apply MSR immediately
+            (*tcb).tls_base = tls_base;
+            crate::arch::write_fs_base(tls_base);
+        } else {
+            // Reject if target is Running on another CPU — do_context_switch
+            // would overwrite our write with read_fs_base() when that CPU
+            // context-switches away from the target thread.
+            if (*tcb).state == ThreadState::Running {
+                SCHED_IPC_LOCK.unlock();
+                restore_irq(irq);
+                return SyscallResult::err(SyscallError::InvalidOperation);
+            }
+            // Target is Inactive/Ready/Blocked — safe to write field
+            (*tcb).tls_base = tls_base;
+        }
+
+        SCHED_IPC_LOCK.unlock();
+        restore_irq(irq);
     }
 
     SyscallResult::ok(0)
@@ -3236,6 +3294,12 @@ pub fn handle(
                 restore_irq(irq);
             }
             SyscallResult::ok(0)
+        }
+        Syscall::Futex => {
+            // cap_ptr = user virtual address (futex word)
+            // msg_info = operation (FUTEX_WAIT=0, FUTEX_WAKE=1)
+            // mr0 = expected value (for WAIT) or max wake count (for WAKE)
+            crate::ipc::futex::syscall_futex(cap_ptr, msg_info, mr0)
         }
     }
 }

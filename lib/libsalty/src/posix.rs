@@ -61,7 +61,7 @@ pub unsafe fn posix_open(path: *const u8, flags: i32) -> i32 {
         msg.length = 3 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -95,7 +95,7 @@ pub unsafe fn posix_read(fd: i32, buf: *mut u8, count: u64) -> i64 {
             msg.regs[1] = chunk;
 
             let err = crate::ipc::call_ctx(
-                &raw mut crate::__salty_ipc_ctx,
+                crate::tls::current_ipc_ctx(),
                 CAP_VFS_EP,
                 &raw const msg,
                 &raw mut reply,
@@ -153,7 +153,7 @@ pub unsafe fn posix_write(fd: i32, buf: *const u8, count: u64) -> i64 {
             }
 
             let err = crate::ipc::call_ctx(
-                &raw mut crate::__salty_ipc_ctx,
+                crate::tls::current_ipc_ctx(),
                 CAP_VFS_EP,
                 &raw const msg,
                 &raw mut reply,
@@ -183,7 +183,7 @@ pub unsafe fn posix_close(fd: i32) -> i32 {
         msg.regs[0] = fd as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -213,7 +213,7 @@ pub unsafe fn posix_exit(status: i32) -> ! {
         // This avoids the yield-loop that starves SCHED_IPC_LOCK on SMP.
         let mut reply = SaltyMsg::zeroed();
         crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
@@ -234,7 +234,7 @@ pub unsafe fn posix_getpid() -> i32 {
         msg.length = 0;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
@@ -255,7 +255,7 @@ pub unsafe fn posix_getppid() -> i32 {
         msg.length = 0;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
@@ -282,7 +282,7 @@ pub unsafe fn posix_waitpid3(pid: i32, status: *mut i32, options: i32) -> i32 {
         msg.regs[1] = options as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
@@ -314,7 +314,7 @@ pub unsafe fn posix_stat(path: *const u8, st: *mut SaltyStat) -> i32 {
         msg.length = 1 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -352,7 +352,7 @@ pub unsafe fn posix_fstat(fd: i32, st: *mut SaltyStat) -> i32 {
         msg.regs[0] = fd as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -388,7 +388,7 @@ pub unsafe fn posix_lseek(fd: i32, offset: i64, whence: i32) -> i64 {
         msg.regs[2] = whence as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -412,7 +412,7 @@ pub unsafe fn posix_access(path: *const u8, mode: i32) -> i32 {
         msg.length = 2 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -434,7 +434,7 @@ pub unsafe fn posix_unlink(path: *const u8) -> i32 {
         msg.length = 1 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -481,7 +481,7 @@ pub unsafe fn posix_rename(old_path: *const u8, new_path: *const u8) -> i32 {
         msg.length = 2 + ((old_len as u64 + 7) / 8) + ((new_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -505,7 +505,7 @@ pub unsafe fn posix_mkdir(path: *const u8, mode: i32) -> i32 {
         msg.length = 2 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -527,7 +527,7 @@ pub unsafe fn posix_rmdir(path: *const u8) -> i32 {
         msg.length = 1 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -549,7 +549,7 @@ pub unsafe fn posix_opendir(path: *const u8) -> i32 {
         msg.length = 1 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -574,7 +574,7 @@ pub unsafe fn posix_readdir(dir_fd: i32, entry: *mut SaltyDirent) -> i32 {
         msg.regs[0] = dir_fd as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -718,7 +718,7 @@ pub unsafe fn posix_execve(
         msg.length = (str_start + str_regs) as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
@@ -741,7 +741,7 @@ pub unsafe fn posix_kill(pid: i32, sig: i32) -> i32 {
         msg.regs[1] = sig as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
@@ -776,7 +776,7 @@ pub unsafe fn posix_socket(domain: i32, sock_type: i32) -> i32 {
         msg.regs[1] = sock_type as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -800,7 +800,7 @@ pub unsafe fn posix_bind(fd: i32, path: *const u8) -> i32 {
         msg.length = 2 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -824,7 +824,7 @@ pub unsafe fn posix_listen(fd: i32, backlog: i32) -> i32 {
         msg.regs[1] = backlog as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -847,7 +847,7 @@ pub unsafe fn posix_accept(fd: i32) -> i32 {
         msg.regs[0] = fd as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -871,7 +871,7 @@ pub unsafe fn posix_connect(fd: i32, path: *const u8) -> i32 {
         msg.length = 2 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -895,7 +895,7 @@ pub unsafe fn posix_shutdown(fd: i32, how: i32) -> i32 {
         msg.regs[1] = how as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -917,7 +917,7 @@ pub unsafe fn posix_socketpair(fds: *mut i32) -> i32 {
         msg.length = 0;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -968,7 +968,7 @@ pub unsafe fn posix_sendmsg(fd: i32, data: *const u8, data_len: u64, fds_to_send
         msg.length = 3 + data_regs + ((actual_fds as u64 * 4 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -995,7 +995,7 @@ pub unsafe fn posix_recvmsg(fd: i32, data: *mut u8, data_len: u64, fds_out: *mut
         msg.regs[1] = data_len;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1059,7 +1059,7 @@ pub unsafe fn posix_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32 {
         msg.length = 2 + actual_nfds as u64 * 2;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1151,7 +1151,7 @@ pub unsafe fn posix_tcgetattr(fd: i32, termios_p: *mut crate::types::Termios) ->
         msg.regs[0] = fd as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1202,7 +1202,7 @@ pub unsafe fn posix_tcsetattr(fd: i32, action: i32, termios_p: *const crate::typ
         }
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1223,7 +1223,7 @@ pub unsafe fn posix_epoll_create() -> i32 {
         msg.length = 0;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1250,7 +1250,7 @@ pub unsafe fn posix_epoll_ctl(epfd: i32, op: i32, fd: i32, events: u32, data: u6
         msg.regs[4] = data;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1282,7 +1282,7 @@ pub unsafe fn posix_epoll_wait(
         msg.regs[2] = timeout as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1323,7 +1323,7 @@ pub unsafe fn posix_shm_open(name: *const u8, flags: i32) -> i32 {
         msg.length = 2 + ((name_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1348,7 +1348,7 @@ pub unsafe fn posix_shm_unlink(name: *const u8) -> i32 {
         msg.length = 1 + ((name_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1381,7 +1381,7 @@ pub unsafe fn posix_pipe2(fds: *mut i32, flags: i32) -> i32 {
         msg.regs[0] = flags as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1405,7 +1405,7 @@ pub unsafe fn posix_dup(oldfd: i32) -> i32 {
         msg.regs[0] = oldfd as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1429,7 +1429,7 @@ pub unsafe fn posix_dup2(oldfd: i32, newfd: i32) -> i32 {
         msg.regs[1] = newfd as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1454,7 +1454,7 @@ pub unsafe fn posix_dup3(oldfd: i32, newfd: i32, flags: i32) -> i32 {
         msg.regs[2] = flags as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1477,7 +1477,7 @@ pub unsafe fn posix_mkfifo(path: *const u8, _mode: u32) -> i32 {
         msg.length = 2 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1570,7 +1570,7 @@ pub unsafe fn posix_setpgid(pid: i32, pgid: i32) -> i32 {
         msg.regs[1] = pgid as u32 as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
@@ -1592,7 +1592,7 @@ pub unsafe fn posix_getpgid(pid: i32) -> i32 {
         msg.regs[0] = pid as u32 as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
@@ -1614,7 +1614,7 @@ pub unsafe fn posix_setsid() -> i32 {
         msg.length = 0;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
@@ -1637,7 +1637,7 @@ pub unsafe fn posix_getsid(pid: i32) -> i32 {
         msg.regs[0] = pid as u32 as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
@@ -1658,7 +1658,7 @@ pub unsafe fn posix_getuid() -> i32 {
         msg.length = 0;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
@@ -1679,7 +1679,7 @@ pub unsafe fn posix_geteuid() -> i32 {
         msg.length = 0;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
@@ -1700,7 +1700,7 @@ pub unsafe fn posix_getgid() -> i32 {
         msg.length = 0;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
@@ -1721,7 +1721,7 @@ pub unsafe fn posix_getegid() -> i32 {
         msg.length = 0;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
@@ -1743,7 +1743,7 @@ pub unsafe fn posix_getgroups(size: i32, _list: *mut i32) -> i32 {
         msg.regs[0] = size as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
@@ -1766,7 +1766,7 @@ pub unsafe fn posix_ftruncate(fd: i32, length: u64) -> i32 {
         msg.regs[1] = length;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1795,7 +1795,7 @@ pub unsafe fn posix_fcntl(fd: i32, cmd: i32, arg: i64) -> i32 {
         msg.regs[2] = arg as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1817,7 +1817,7 @@ pub unsafe fn posix_isatty(fd: i32) -> i32 {
         msg.regs[0] = fd as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1841,7 +1841,7 @@ pub unsafe fn posix_ioctl(fd: i32, request: u64, arg: u64) -> i32 {
         msg.regs[2] = arg;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1864,7 +1864,7 @@ pub unsafe fn posix_chdir(path: *const u8) -> i32 {
         msg.length = 1 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1891,7 +1891,7 @@ pub unsafe fn posix_getcwd(buf: *mut u8, size: u64) -> i32 {
         msg.regs[0] = size;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1936,7 +1936,7 @@ pub unsafe fn posix_openat(dirfd: i32, path: *const u8, flags: i32) -> i32 {
         msg.length = 3 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1961,7 +1961,7 @@ pub unsafe fn posix_fstatat(dirfd: i32, path: *const u8, st: *mut SaltyStat, at_
         msg.length = 3 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -1997,7 +1997,7 @@ pub unsafe fn posix_unlinkat(dirfd: i32, path: *const u8, at_flags: i32) -> i32 
         msg.length = 3 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -2049,7 +2049,7 @@ pub unsafe fn posix_renameat(
         msg.length = 4 + ((old_len as u64 + 7) / 8) + ((new_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -2074,7 +2074,7 @@ pub unsafe fn posix_mkdirat(dirfd: i32, path: *const u8, mode: i32) -> i32 {
         msg.length = 3 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -2100,7 +2100,7 @@ pub unsafe fn posix_faccessat(dirfd: i32, path: *const u8, mode: i32, at_flags: 
         msg.length = 4 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -2126,7 +2126,7 @@ pub unsafe fn posix_fchmodat(dirfd: i32, path: *const u8, mode: u32, at_flags: i
         msg.length = 4 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -2159,7 +2159,7 @@ pub unsafe fn posix_fchownat(
         msg.length = 5 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -2196,7 +2196,7 @@ pub unsafe fn posix_utimensat(
         msg.length = 7 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -2220,7 +2220,7 @@ pub unsafe fn posix_fchmod(fd: i32, mode: u32) -> i32 {
         msg.regs[1] = mode as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -2245,7 +2245,7 @@ pub unsafe fn posix_fchown(fd: i32, uid: u32, gid: u32) -> i32 {
         msg.regs[2] = gid as u64;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
@@ -2271,7 +2271,7 @@ pub unsafe fn posix_fb_ioctl(fd: i32, cmd: u64, result: *mut [u64; 5]) -> i32 {
         msg.regs[2] = 0;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,

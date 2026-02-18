@@ -2,6 +2,8 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+/// IA32_FS_BASE MSR address
+const IA32_FS_BASE_MSR: u32 = 0xC000_0100;
 /// IA32_GS_BASE MSR address
 const IA32_GS_BASE_MSR: u32 = 0xC000_0101;
 /// IA32_KERNEL_GS_BASE MSR address
@@ -250,6 +252,45 @@ pub unsafe fn set_fpu_owner(ptr: *mut u8) {
         core::arch::asm!(
             "mov gs:[24], {}",
             in(reg) ptr as u64,
+            options(nostack)
+        );
+    }
+}
+
+/// Read the current FS_BASE MSR value (user TLS base pointer).
+#[inline]
+pub fn read_fs_base() -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        // SAFETY: Reading IA32_FS_BASE is a non-destructive MSR read.
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") IA32_FS_BASE_MSR,
+            out("eax") low,
+            out("edx") high,
+            options(nostack)
+        );
+    }
+    (high as u64) << 32 | (low as u64)
+}
+
+/// Write the FS_BASE MSR (user TLS base pointer).
+///
+/// # Safety
+/// Must be called with interrupts disabled. The base address must be a
+/// valid user-mode TLS pointer (or 0 to clear).
+#[inline]
+pub unsafe fn write_fs_base(base: u64) {
+    let low = base as u32;
+    let high = (base >> 32) as u32;
+    unsafe {
+        // SAFETY: Writing IA32_FS_BASE sets the user-visible FS segment base.
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") IA32_FS_BASE_MSR,
+            in("eax") low,
+            in("edx") high,
             options(nostack)
         );
     }

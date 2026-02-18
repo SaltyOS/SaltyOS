@@ -16,7 +16,7 @@ pub mod paging;
 mod pit;
 
 pub use apic::{send_ipi, set_tlb_shootdown_addr, IpiKind};
-pub use cpu::{current_cpu, set_kernel_stack, next_invoke_seq, current_invoke_seq, MAX_CPUS};
+pub use cpu::{current_cpu, set_kernel_stack, next_invoke_seq, current_invoke_seq, read_fs_base, write_fs_base, MAX_CPUS};
 pub use gdt::set_tss_rsp0;
 
 use core::sync::atomic::{AtomicBool, Ordering};

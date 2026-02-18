@@ -4,9 +4,8 @@
 //! Global errno variable with `__errno_location()` accessor for C code.
 //! Values use Linux numbering (e.g. `ENOENT = 2`, `EINVAL = 22`).
 //!
-//! **Not thread-safe**: uses a single `static mut ERRNO`. This is correct
-//! for SaltyOS where each process is single-threaded. A multi-threaded
-//! implementation would need TLS.
+//! Thread-safe: uses per-thread errno via the TLS block when available,
+//! falling back to a global variable during early single-threaded startup.
 
 // errno constants
 pub const EPERM: i32 = 1;
@@ -72,23 +71,32 @@ pub const ECANCELED: i32 = 125;
 pub const EOWNERDEAD: i32 = 130;
 pub const ENOTRECOVERABLE: i32 = 131;
 
+/// Global fallback errno for when TLS is not yet initialized.
 static mut ERRNO: i32 = 0;
 
+/// Return a pointer to the per-thread errno.
+///
+/// Uses the TLS block's `errno` field if TLS is initialized, otherwise
+/// falls back to the global `ERRNO` (safe during early single-threaded
+/// startup before threads are created).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __errno_location() -> *mut i32 {
-    &raw mut ERRNO
+    let tls_ptr = salty::tls::current_errno();
+    if !tls_ptr.is_null() {
+        tls_ptr
+    } else {
+        &raw mut ERRNO
+    }
 }
 
 /// Set errno from Rust code.
 pub fn set_errno(val: i32) {
-    // SAFETY: single-threaded process; no concurrent access to ERRNO.
     unsafe {
-        ERRNO = val;
+        *__errno_location() = val;
     }
 }
 
 /// Get errno from Rust code.
 pub fn get_errno() -> i32 {
-    // SAFETY: single-threaded process; no concurrent access to ERRNO.
-    unsafe { ERRNO }
+    unsafe { *__errno_location() }
 }

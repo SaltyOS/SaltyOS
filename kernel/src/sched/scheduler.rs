@@ -317,11 +317,18 @@ impl Scheduler {
                 crate::arch::set_tss_rsp0((*new_tcb).kernel_stack_top);
             }
 
+            // Save outgoing thread's TLS base (FS_BASE MSR)
+            (*old_tcb).tls_base = crate::arch::read_fs_base();
+
             // Release SCHED_IPC_LOCK before context switch (IF=0, no interrupts possible)
             crate::mm::SCHED_IPC_LOCK.unlock();
 
             // Set CR0.TS so the new thread's first FPU use triggers #NM for lazy switching
             crate::arch::fpu::set_ts();
+
+            // Restore incoming thread's TLS base (FS_BASE MSR).
+            // Always write — 0 clears the previous thread's FS_BASE.
+            crate::arch::write_fs_base((*new_tcb).tls_base);
 
             // Pure register save/restore — no shared state accessed
             let old_ctx = &mut (*old_tcb).context as *mut _;

@@ -45,7 +45,7 @@ fn untyped_scan_end() -> Cap {
     let info = invoke::cnode_get_info(CAP_SELF_CSPACE);
     if info.error == 0 {
         unsafe {
-            let ctx = &raw const crate::__salty_ipc_ctx;
+            let ctx = crate::tls::current_ipc_ctx();
             if !(*ctx).ipc_buffer.is_null() {
                 let num_slots = (*(*ctx).ipc_buffer).msg[3];
                 if num_slots > CAP_UNTYPED_START && num_slots < end {

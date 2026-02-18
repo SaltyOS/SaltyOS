@@ -10,9 +10,29 @@
 //! kept sorted by address to enable bidirectional coalescing: on `free()`,
 //! adjacent blocks (both before and after) are merged when contiguous.
 //!
+//! Thread safety: a global spinlock serializes all heap operations.
+//!
 //! Layout: `[BlockHeader (16 bytes)][user data (aligned to 16)]`
 
 use crate::errno;
+
+/// Spinlock protecting the global free list for thread safety.
+static HEAP_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[inline]
+fn heap_lock_acquire() {
+    use core::sync::atomic::Ordering;
+    while HEAP_LOCK.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        while HEAP_LOCK.load(Ordering::Relaxed) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+#[inline]
+fn heap_lock_release() {
+    HEAP_LOCK.store(0, core::sync::atomic::Ordering::Release);
+}
 
 /// Allocation header stored before each allocation
 /// size includes the header itself
@@ -37,17 +57,11 @@ fn align_up(n: usize, align: usize) -> usize {
     (n + align - 1) & !(align - 1)
 }
 
-/// Allocate `size` bytes of memory, returning a 16-byte-aligned pointer.
-///
-/// Uses first-fit search over the address-sorted free list. If a free block
-/// is large enough to hold both the requested allocation and a new free block
-/// (at least `HEADER_SIZE + ALIGN` = 32 bytes of remainder), it is split.
-/// Otherwise the entire block is used. When no suitable free block exists,
-/// new memory is obtained from `sbrk()`.
-///
-/// Returns null on failure (size == 0 or out of memory) and sets `errno`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn malloc(size: usize) -> *mut u8 {
+// ---------------------------------------------------------------------------
+// Internal (unlocked) implementations
+// ---------------------------------------------------------------------------
+
+unsafe fn malloc_inner(size: usize) -> *mut u8 {
     if size == 0 {
         return core::ptr::null_mut();
     }
@@ -103,14 +117,7 @@ pub unsafe extern "C" fn malloc(size: usize) -> *mut u8 {
     }
 }
 
-/// Free a previously allocated block, returning it to the free list.
-///
-/// The block is inserted into the free list in address order. If the freed
-/// block is physically adjacent to the next or previous free block, they
-/// are coalesced into a single larger block (bidirectional coalescing).
-/// Passing null is a safe no-op.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn free(ptr: *mut u8) {
+unsafe fn free_inner(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
@@ -151,6 +158,25 @@ pub unsafe extern "C" fn free(ptr: *mut u8) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Public (locked) API
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn malloc(size: usize) -> *mut u8 {
+    heap_lock_acquire();
+    let result = unsafe { malloc_inner(size) };
+    heap_lock_release();
+    result
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn free(ptr: *mut u8) {
+    heap_lock_acquire();
+    unsafe { free_inner(ptr) };
+    heap_lock_release();
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn realloc(ptr: *mut u8, size: usize) -> *mut u8 {
     if ptr.is_null() {
@@ -161,12 +187,14 @@ pub unsafe extern "C" fn realloc(ptr: *mut u8, size: usize) -> *mut u8 {
         return core::ptr::null_mut();
     }
 
-    unsafe {
+    heap_lock_acquire();
+    let result = unsafe {
         let header = ptr.sub(HEADER_SIZE) as *const BlockHeader;
         let old_data_size = (*header).size - HEADER_SIZE;
 
-        let new_ptr = malloc(size);
+        let new_ptr = malloc_inner(size);
         if new_ptr.is_null() {
+            heap_lock_release();
             return core::ptr::null_mut();
         }
 
@@ -176,9 +204,11 @@ pub unsafe extern "C" fn realloc(ptr: *mut u8, size: usize) -> *mut u8 {
             size
         };
         core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
-        free(ptr);
+        free_inner(ptr);
         new_ptr
-    }
+    };
+    heap_lock_release();
+    result
 }
 
 #[unsafe(no_mangle)]

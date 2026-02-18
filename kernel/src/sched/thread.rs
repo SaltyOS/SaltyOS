@@ -71,6 +71,8 @@ pub enum BlockedReason {
     },
     /// Blocked on nanosleep timer
     TimerBlocked,
+    /// Blocked on futex wait
+    FutexBlocked,
 }
 
 /// Thread Control Block
@@ -146,6 +148,14 @@ pub struct Tcb {
     pub fpu_state: XSaveArea,
     /// Whether this thread has used FPU instructions (lazy init on first #NM)
     pub fpu_initialized: bool,
+    /// Thread-local storage base address (FS_BASE MSR value)
+    pub tls_base: u64,
+    /// Next TCB in futex wait queue (intrusive linked list)
+    pub futex_next: *mut Tcb,
+    /// Virtual address this thread is waiting on (for futex)
+    pub futex_addr: u64,
+    /// VSpace pointer for futex address space identification
+    pub futex_vspace: *mut VSpace,
 }
 
 /// Saved thread context
@@ -261,6 +271,10 @@ impl Tcb {
             sleep_next: core::ptr::null_mut(),
             fpu_state: XSaveArea::zeroed(),
             fpu_initialized: false,
+            tls_base: 0,
+            futex_next: core::ptr::null_mut(),
+            futex_addr: 0,
+            futex_vspace: core::ptr::null_mut(),
         }
     }
 
@@ -325,6 +339,12 @@ impl Tcb {
         // Clear FPU ownership if this TCB is the current CPU's FPU owner
         crate::arch::fpu::disown_if_current(self as *mut Tcb as *mut u8);
         self.fpu_initialized = false;
+
+        // Clear TLS and futex state
+        self.tls_base = 0;
+        self.futex_next = core::ptr::null_mut();
+        self.futex_addr = 0;
+        self.futex_vspace = core::ptr::null_mut();
     }
 }
 

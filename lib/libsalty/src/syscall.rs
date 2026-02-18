@@ -55,3 +55,35 @@ pub fn syscall(
     }
     SaltyResult { error, value }
 }
+
+/// Futex wait: block if `*addr == expected`, return 0 on wake.
+/// Returns SALTY_WOULD_BLOCK (9) if value changed.
+#[inline]
+pub fn futex_wait(addr: *const u32, expected: u32) -> u64 {
+    syscall(
+        crate::consts::SYS_FUTEX,
+        addr as u64,
+        crate::consts::FUTEX_WAIT,
+        expected as u64,
+        0,
+        0,
+        0,
+    )
+    .error
+}
+
+/// Futex wake: wake up to `count` threads waiting on `addr`.
+/// Returns the number of threads actually woken.
+#[inline]
+pub fn futex_wake(addr: *const u32, count: u32) -> u64 {
+    syscall(
+        crate::consts::SYS_FUTEX,
+        addr as u64,
+        crate::consts::FUTEX_WAKE,
+        count as u64,
+        0,
+        0,
+        0,
+    )
+    .value
+}

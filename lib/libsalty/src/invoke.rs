@@ -97,6 +97,12 @@ pub fn tcb_copy_fpu(dest_tcb: Cap, src_tcb: Cap) -> i32 {
     invoke(dest_tcb, TCB_COPY_FPU, src_tcb, 0, 0, 0).error as i32
 }
 
+/// Set the TLS base address (FS_BASE) for a TCB.
+/// If the target is the current thread, applies immediately.
+pub fn tcb_set_tls_base(tcb: Cap, tls_base: u64) -> i32 {
+    invoke(tcb, TCB_SET_TLS_BASE, tls_base, 0, 0, 0).error as i32
+}
+
 // ---- SchedContext operations ----
 
 /// Configure a scheduling context with budget and period (microseconds).
@@ -176,7 +182,7 @@ pub fn vspace_walk_result_entry(index: usize) -> Option<(u64, u64, u64)> {
 
 #[inline]
 unsafe fn walk_ipc_words() -> Option<*const u64> {
-    let ctx = &raw const crate::__salty_ipc_ctx;
+    let ctx = crate::tls::current_ipc_ctx();
     let ipc_buffer = unsafe { (*ctx).ipc_buffer };
     if ipc_buffer.is_null() {
         return None;

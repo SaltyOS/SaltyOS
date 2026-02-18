@@ -1276,6 +1276,17 @@ unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
             reply.label = SALTY_OUT_OF_MEMORY;
             return;
         }
+        // Copy parent's TLS base to child TCB so FS_BASE is correct after
+        // context switch.  The child has a COW copy of the parent's TLS block
+        // at the same virtual address, so it needs the same FS_BASE.
+        let parent_tls_base = msg.regs[9];
+        if parent_tls_base != 0 {
+            let err = salty::invoke::tcb_set_tls_base(child_tcb, parent_tls_base);
+            if err != 0 {
+                puts(b"[PROCMGR] FORK: set TLS base failed\n");
+            }
+        }
+
         let err = salty::invoke::tcb_set_ipc_buffer(child_tcb, parent_layout.ipc_buf.base);
         if err != 0 {
             puts(b"[PROCMGR] FORK: set IPC buf failed\n");

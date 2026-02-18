@@ -72,7 +72,7 @@ pub unsafe fn posix_signal(sig: i32, handler: usize) -> usize {
         msg.regs[1] = disp;
 
         let err = crate::ipc::call_ctx(
-            &raw mut crate::__salty_ipc_ctx,
+            crate::tls::current_ipc_ctx(),
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
@@ -147,7 +147,7 @@ pub unsafe fn posix_sigcheck() -> i32 {
                     msg.regs[0] = sig as u64;
                     msg.regs[1] = SIG_DISP_DFL;
                     let _ = crate::ipc::call_ctx(
-                        &raw mut crate::__salty_ipc_ctx,
+                        crate::tls::current_ipc_ctx(),
                         CAP_PROCMGR_EP,
                         &raw const msg,
                         &raw mut reply,

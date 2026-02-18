@@ -304,6 +304,11 @@ static mut NEXT_RECV_SLOT: Cap = RECV_SLOT_BASE;
 static mut CURRENT_RECV_SLOT: Cap = 0;
 static mut RECV_SLOT_KEPT: bool = false;
 
+/// Deferred cap cleanup: slots to delete at the start of the next server loop
+/// iteration (after reply_recv has completed the cap transfer to the client).
+static mut PENDING_CLEANUP_SLOTS: [u64; 4] = [0; 4];
+static mut PENDING_CLEANUP_COUNT: usize = 0;
+
 // ---------------------------------------------------------------------------
 // SHM object tracking (growable, pointer-based)
 // ---------------------------------------------------------------------------
@@ -355,7 +360,7 @@ fn puts(s: &[u8]) {
 }
 
 fn ipc_ctx() -> *mut IpcContext {
-    &raw mut salty::__salty_ipc_ctx
+    salty::tls::current_ipc_ctx()
 }
 
 fn signal_ready() {
@@ -1435,6 +1440,74 @@ unsafe fn handle_mm_fork_regions(msg: *const SaltyMsg, _caller_badge: u64, reply
     }
 }
 
+/// MM_ALLOC_THREAD_OBJECTS: allocate TCB + SchedContext + IPC buffer Frame.
+///
+/// The client sends 3 destination CNode slots in MR0, MR1, MR2 where
+/// the resulting caps should be placed. mmsrv retypes the objects into
+/// temporary slots, then transfers them back via IPC cap transfer.
+///
+/// Reply: label = SALTY_OK with 3 caps transferred, or error.
+unsafe fn handle_mm_alloc_thread_objects(
+    _msg: *const SaltyMsg,
+    _caller_badge: u64,
+    reply: *mut SaltyMsg,
+) {
+    unsafe {
+        // Allocate 3 temp slots for the new objects
+        let tcb_slot = match salty::slot_alloc::slot_alloc() {
+            Some(s) => s,
+            None => { (*reply).label = SALTY_OUT_OF_MEMORY; return; }
+        };
+        let sc_slot = match salty::slot_alloc::slot_alloc() {
+            Some(s) => s,
+            None => { (*reply).label = SALTY_OUT_OF_MEMORY; return; }
+        };
+        let frame_slot = match salty::slot_alloc::slot_alloc() {
+            Some(s) => s,
+            None => { (*reply).label = SALTY_OUT_OF_MEMORY; return; }
+        };
+
+        // Retype: TCB (0 size_bits = default)
+        let err = retype_any(OBJ_TCB, 0, tcb_slot);
+        if err != 0 {
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
+
+        // Retype: SchedContext (0 size_bits = default)
+        let err = retype_any(OBJ_SCHED_CONTEXT, 0, sc_slot);
+        if err != 0 {
+            // Clean up TCB
+            invoke::cnode_delete(CAP_SELF_CSPACE, tcb_slot);
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
+
+        // Retype: Frame (12 size_bits = 4K page for IPC buffer)
+        let err = retype_any(OBJ_FRAME, 12, frame_slot);
+        if err != 0 {
+            invoke::cnode_delete(CAP_SELF_CSPACE, tcb_slot);
+            invoke::cnode_delete(CAP_SELF_CSPACE, sc_slot);
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
+
+        // Transfer 3 caps to the caller via IPC cap transfer
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, tcb_slot);
+        ipc::set_send_cap_ctx(ipc_ctx(), 1, sc_slot);
+        ipc::set_send_cap_ctx(ipc_ctx(), 2, frame_slot);
+
+        // Schedule cleanup of server-side temp slots after reply completes.
+        // The reply_recv is atomic: the kernel transfers caps during reply,
+        // then blocks for the next message. We clean up on the next iteration.
+        *(&raw mut PENDING_CLEANUP_SLOTS) = [tcb_slot, sc_slot, frame_slot, 0];
+        *(&raw mut PENDING_CLEANUP_COUNT) = 3;
+
+        (*reply).label = SALTY_OK;
+        (*reply).length = 0;
+    }
+}
+
 /// MM_SHM_CREATE: allocate frames for a SHM object.
 ///   MR0 = shm_id
 ///   MR1 = num_pages
@@ -1833,6 +1906,18 @@ pub extern "C" fn _start() -> ! {
         // so the faulting thread stays permanently blocked rather than re-faulting.
         let mut skip_reply = false;
 
+        // Drain deferred slot cleanup from previous iteration
+        unsafe {
+            let count = *(&raw const PENDING_CLEANUP_COUNT);
+            for i in 0..count {
+                let slot = (*(&raw const PENDING_CLEANUP_SLOTS))[i];
+                if slot != 0 {
+                    invoke::cnode_delete(CAP_SELF_CSPACE, slot);
+                }
+            }
+            *(&raw mut PENDING_CLEANUP_COUNT) = 0;
+        }
+
         unsafe {
             match msg.label {
                 MM_REGISTER => handle_mm_register(&raw const msg, badge, &raw mut reply),
@@ -1846,6 +1931,7 @@ pub extern "C" fn _start() -> ! {
                 MM_MAP_WINDOW => handle_mm_map_window(&raw const msg, badge, &raw mut reply),
                 MM_UNMAP_WINDOW => handle_mm_unmap_window(&raw const msg, badge, &raw mut reply),
                 MM_FORK_REGIONS => handle_mm_fork_regions(&raw const msg, badge, &raw mut reply),
+                MM_ALLOC_THREAD_OBJECTS => handle_mm_alloc_thread_objects(&raw const msg, badge, &raw mut reply),
                 MM_SHM_CREATE => handle_mm_shm_create(&raw const msg, badge, &raw mut reply),
                 MM_SHM_MAP => handle_mm_shm_map(&raw const msg, badge, &raw mut reply),
                 MM_SHM_UNMAP => handle_mm_shm_unmap(&raw const msg, badge, &raw mut reply),
