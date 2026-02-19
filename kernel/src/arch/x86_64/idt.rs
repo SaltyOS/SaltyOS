@@ -838,8 +838,12 @@ extern "C" fn irq_handler_ipi_vspace_teardown() {
 #[unsafe(no_mangle)]
 extern "C" fn irq_handler_ipi_reschedule() {
     if super::has_apic() {
-        super::apic::handle_ipi(super::apic::IpiKind::Reschedule);
+        // Send EOI BEFORE handle_ipi: handle_reschedule_ipi() may context-switch
+        // via do_context_switch(), and the old thread may not resume for a long
+        // time. Without early EOI, the LAPIC ISR bit for vector 41 stays set,
+        // blocking all priority-class-2 vectors (32-47) including the timer.
         super::apic::eoi();
+        super::apic::handle_ipi(super::apic::IpiKind::Reschedule);
     }
 }
 

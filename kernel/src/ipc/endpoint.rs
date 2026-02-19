@@ -156,17 +156,18 @@ impl Endpoint {
                     // Send/NBSend do NOT create a reply capability.
                     // Only Call sets reply_tcb (see call() method).
 
+                    // Update endpoint state BEFORE transfer_message: cap transfer
+                    // may release SCHED_IPC_LOCK, so the endpoint must be consistent.
+                    if self.recv_queue.is_empty() {
+                        self.state = EndpointState::Idle;
+                    }
+
                     self.transfer_message(current, receiver, msg, badge);
 
                     // Wake receiver
                     (*receiver).state = ThreadState::Ready;
                     (*receiver).blocked_endpoint = core::ptr::null_mut();
                     get_scheduler().enqueue(receiver);
-
-                    // Update state
-                    if self.recv_queue.is_empty() {
-                        self.state = EndpointState::Idle;
-                    }
                 }
                 EndpointState::Idle | EndpointState::SendBlocked => {
                     // SLOWPATH: No receiver - block sender
@@ -197,15 +198,15 @@ impl Endpoint {
                 EndpointState::RecvBlocked => {
                     // Receiver waiting: deliver immediately so caps (if any) can transfer.
                     if let Some(receiver) = self.recv_queue.pop() {
+                        if self.recv_queue.is_empty() {
+                            self.state = EndpointState::Idle;
+                        }
+
                         self.transfer_message(current, receiver, msg, badge);
 
                         (*receiver).state = ThreadState::Ready;
                         (*receiver).blocked_endpoint = core::ptr::null_mut();
                         get_scheduler().enqueue(receiver);
-
-                        if self.recv_queue.is_empty() {
-                            self.state = EndpointState::Idle;
-                        }
                         true
                     } else {
                         // State inconsistency: recover and fall back to async queue.
@@ -262,6 +263,12 @@ impl Endpoint {
                         _ => (Message::empty(), 0, false),
                     };
 
+                    // Update endpoint state BEFORE transfer_message: cap transfer
+                    // may release SCHED_IPC_LOCK, so the endpoint must be consistent.
+                    if self.send_queue.is_empty() {
+                        self.state = EndpointState::Idle;
+                    }
+
                     self.transfer_message(sender, current, &msg, badge);
 
                     if keep_blocked {
@@ -294,11 +301,6 @@ impl Endpoint {
                         (*sender).blocked_reason = None;
                         (*sender).blocked_endpoint = core::ptr::null_mut();
                         get_scheduler().enqueue(sender);
-                    }
-
-                    // Update state
-                    if self.send_queue.is_empty() {
-                        self.state = EndpointState::Idle;
                     }
 
                     (msg, badge)
@@ -377,17 +379,18 @@ impl Endpoint {
                     (*receiver).reply_tcb = current;
                     (*receiver).reply_can_grant = true;
 
+                    // Update endpoint state BEFORE transfer_message: cap transfer
+                    // may release SCHED_IPC_LOCK, so the endpoint must be consistent.
+                    if self.recv_queue.is_empty() {
+                        self.state = EndpointState::Idle;
+                    }
+
                     self.transfer_message(current, receiver, msg, badge);
 
                     // Wake receiver
                     (*receiver).state = ThreadState::Ready;
                     (*receiver).blocked_endpoint = core::ptr::null_mut();
                     get_scheduler().enqueue(receiver);
-
-                    // Update endpoint state
-                    if self.recv_queue.is_empty() {
-                        self.state = EndpointState::Idle;
-                    }
 
                     // Caller sleeps until reply_recv() wakes it
                     get_scheduler().reschedule();
@@ -477,7 +480,11 @@ impl Endpoint {
                     return;
                 }
 
-                // Acquire CAP_LOCK for slot array access (nesting: SCHED_IPC_LOCK → CAP_LOCK)
+                // Release SCHED_IPC_LOCK before acquiring CAP_LOCK to maintain
+                // lock ordering: CAP_LOCK → SCHED_IPC_LOCK (never the reverse).
+                // Safe: receiver already dequeued, message data copied, IF=0 (no
+                // timer on this CPU), only CSpace slot copying remains.
+                crate::mm::SCHED_IPC_LOCK.unlock();
                 crate::mm::CAP_LOCK.lock();
                 for i in 0..cap_count as u64 {
                     let src_slot_idx = msg.caps[i as usize];
@@ -520,6 +527,7 @@ impl Endpoint {
                     );
                 }
                 crate::mm::CAP_LOCK.unlock();
+                crate::mm::SCHED_IPC_LOCK.lock();
             }
         }
     }
@@ -562,6 +570,12 @@ impl Endpoint {
                     (*receiver).reply_tcb = faulting_tcb;
                     (*receiver).reply_can_grant = false;
 
+                    // Update endpoint state BEFORE transfer_message: cap transfer
+                    // may release SCHED_IPC_LOCK, so the endpoint must be consistent.
+                    if self.recv_queue.is_empty() {
+                        self.state = EndpointState::Idle;
+                    }
+
                     // Transfer fault message to handler (badge identifies faulting client)
                     self.transfer_message(faulting_tcb, receiver, msg, (*faulting_tcb).fault_handler_badge);
 
@@ -569,10 +583,6 @@ impl Endpoint {
                     (*receiver).state = ThreadState::Ready;
                     (*receiver).blocked_endpoint = core::ptr::null_mut();
                     get_scheduler().enqueue(receiver);
-
-                    if self.recv_queue.is_empty() {
-                        self.state = EndpointState::Idle;
-                    }
                 }
                 _ => {
                     // Slowpath: no handler waiting — queue faulting thread as sender
