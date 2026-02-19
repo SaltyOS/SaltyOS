@@ -115,8 +115,17 @@ static PER_CPU_TSC_BOOT: [AtomicU64; super::cpu::MAX_CPUS] = {
     [INIT; super::cpu::MAX_CPUS]
 };
 
-/// Last returned timestamp for global monotonicity (all CPUs)
-static LAST_NS: AtomicU64 = AtomicU64::new(0);
+/// Global floor timestamp in nanoseconds.
+///
+/// Published by BSP timer ticks and used as a cross-CPU lower bound so AP
+/// time never falls behind BSP wall-clock progress.
+static GLOBAL_FLOOR_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Per-CPU last returned timestamp for local monotonicity without global CAS.
+static LAST_NS_PER_CPU: [AtomicU64; super::cpu::MAX_CPUS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; super::cpu::MAX_CPUS]
+};
 
 /// Read the x86 Time Stamp Counter
 #[inline]
@@ -407,55 +416,46 @@ pub fn now_us() -> u64 {
 ///
 /// Uses per-CPU TSC for sub-microsecond precision when calibrated.
 /// Falls back to tick-based timing before calibration completes.
-/// A global monotonicity guard ensures time never goes backwards,
-/// even when threads migrate between CPUs with different TSC origins.
+/// Guarantees:
+/// - Per-CPU monotonicity (`LAST_NS_PER_CPU`)
+/// - Cross-CPU lower bound: returned time is always >= BSP global floor time
+///   published from timer ticks (`GLOBAL_FLOOR_NS`).
 pub fn now_ns() -> u64 {
     let tsc_per_us = TSC_PER_US.load(Ordering::Acquire);
     let tick_ns = TICK_COUNTER.load(Ordering::Relaxed) * 1_000_000;
+    let floor_ns = GLOBAL_FLOOR_NS.load(Ordering::Acquire).max(tick_ns);
 
     let raw_ns = if tsc_per_us == 0 {
-        tick_ns
+        floor_ns
     } else {
         let cpu = crate::arch::current_cpu() as usize;
         let boot = PER_CPU_TSC_BOOT[cpu].load(Ordering::Relaxed);
         if boot == 0 {
-            tick_ns
+            floor_ns
         } else {
             let delta = rdtsc().wrapping_sub(boot);
             let tsc_ns = (delta * 1000) / tsc_per_us as u64;
-            // Floor at TICK_COUNTER time to prevent large drift
-            tsc_ns.max(tick_ns)
+            // Floor at BSP tick-derived time to prevent backward drift.
+            tsc_ns.max(floor_ns)
         }
     };
 
-    // Global monotonicity guard: never return less than previous value
-    loop {
-        let last = LAST_NS.load(Ordering::Acquire);
-        if raw_ns > last {
-            match LAST_NS.compare_exchange_weak(
-                last,
-                raw_ns,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return raw_ns,
-                Err(_) => continue,
-            }
-        } else {
-            // Time would go backwards — return last seen value + 1ns
-            // to maintain strict monotonicity
-            let bumped = last + 1;
-            match LAST_NS.compare_exchange_weak(
-                last,
-                bumped,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return bumped,
-                Err(_) => continue,
-            }
-        }
-    }
+    // Clamp per-CPU interpolation to a narrow window above the BSP floor.
+    // This prevents far-future jumps from cross-CPU TSC skew while preserving
+    // sub-ms resolution within a bounded range.
+    const MAX_SKEW_NS: u64 = 2_000_000; // +2ms above floor_ns
+    let upper = floor_ns.saturating_add(MAX_SKEW_NS);
+    let bounded_ns = raw_ns.clamp(floor_ns, upper);
+
+    let cpu = crate::arch::current_cpu() as usize;
+    let last = LAST_NS_PER_CPU[cpu].load(Ordering::Relaxed);
+    let next = if bounded_ns > last {
+        bounded_ns
+    } else {
+        last.saturating_add(1)
+    };
+    LAST_NS_PER_CPU[cpu].store(next, Ordering::Relaxed);
+    next
 }
 
 /// Calibrate APIC timer using PIT
@@ -614,7 +614,8 @@ pub fn timer_handler() {
 
     // Only BSP increments tick counter so ticks represent wall-clock time
     if crate::arch::current_cpu() == 0 {
-        TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let next_tick = TICK_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+        GLOBAL_FLOOR_NS.store(next_tick * 1_000_000, Ordering::Release);
     }
 
     // Send EOI BEFORE timer_tick: if budget exhaustion triggers a context switch,
