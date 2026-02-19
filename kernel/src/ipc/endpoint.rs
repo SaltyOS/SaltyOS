@@ -648,7 +648,13 @@ impl Endpoint {
     /// Cleanup when endpoint is destroyed
     ///
     /// Wake all blocked threads with error.
+    /// Called from destroy_object() with CAP_LOCK held and IRQs disabled.
+    /// Acquires SCHED_IPC_LOCK to safely manipulate IPC queues and TCB state.
     pub fn cleanup(&mut self) {
+        // Lock ordering: CAP_LOCK (held by caller) → SCHED_IPC_LOCK — correct.
+        // IRQs are already disabled from the CAP_LOCK acquisition path.
+        crate::mm::SCHED_IPC_LOCK.lock();
+
         unsafe {
             // Wake all blocked senders
             while let Some(sender) = self.send_queue.pop() {
@@ -671,5 +677,7 @@ impl Endpoint {
             self.nbsend_tail = 0;
             self.nbsend_count = 0;
         }
+
+        crate::mm::SCHED_IPC_LOCK.unlock();
     }
 }

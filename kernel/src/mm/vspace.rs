@@ -1251,16 +1251,17 @@ impl VSpace {
             let phys = entry & ENTRY_ADDR_MASK;
             let new_entry = phys | Self::flags_to_entry_flags(flags);
             self.write_entry(virt, 1, new_entry)?;
+
+            // TLB invalidation inside lock scope to prevent race where another
+            // CPU modifies the PTE between our unlock and shootdown, causing
+            // the newer mapping to be incorrectly flushed.
+            crate::arch::x86_64::paging::invlpg(virt);
+            self.tlb_shootdown(virt);
             Ok(())
         })();
 
         self.lock.unlock();
         unsafe { restore_irq(irq) };
-
-        if result.is_ok() {
-            crate::arch::x86_64::paging::invlpg(virt);
-            self.tlb_shootdown(virt);
-        }
 
         result
     }

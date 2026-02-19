@@ -126,7 +126,13 @@ impl Notification {
     /// Cleanup when notification is destroyed
     ///
     /// Wake any waiting thread and clear bound_tcb.
+    /// Called from destroy_object() with CAP_LOCK held and IRQs disabled.
+    /// Acquires SCHED_IPC_LOCK to safely manipulate waiter state and bound_tcb.
     pub fn cleanup(&mut self) {
+        // Lock ordering: CAP_LOCK (held by caller) → SCHED_IPC_LOCK — correct.
+        // IRQs are already disabled from the CAP_LOCK acquisition path.
+        crate::mm::SCHED_IPC_LOCK.lock();
+
         unsafe {
             if !self.waiting.is_null() {
                 let waiter = self.waiting;
@@ -145,5 +151,7 @@ impl Notification {
                 self.bound_tcb = core::ptr::null_mut();
             }
         }
+
+        crate::mm::SCHED_IPC_LOCK.unlock();
     }
 }
