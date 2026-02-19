@@ -23,13 +23,13 @@
  */
 
 /*
- * When compiling with --target=x86_64-unknown-uefi, MS ABI is the default.
- * When compiling for other targets, we need to explicitly request MS ABI.
+ * UEFI on x86_64 requires Microsoft x64 ABI regardless of toolchain target.
+ * Some clang target combinations may still default to SysV ABI, so force it.
  */
-#if defined(EFI_BUILD) || defined(_WIN64)
-#define EFIAPI
-#else
+#if defined(__x86_64__) || defined(_M_X64)
 #define EFIAPI __attribute__((ms_abi))
+#else
+#define EFIAPI
 #endif
 
 /* =============================================================================
