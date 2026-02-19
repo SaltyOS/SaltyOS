@@ -748,7 +748,7 @@ pub extern "C" fn salty_pthread_create(
     start_fn: unsafe extern "C" fn(*mut u8) -> *mut u8,
     arg: *mut u8,
 ) -> i32 {
-    unsafe { pthread::pthread_create(thread_out, start_fn, arg) }
+    unsafe { pthread::pthread_create(thread_out, core::ptr::null(), start_fn, arg) }
 }
 
 #[unsafe(no_mangle)]

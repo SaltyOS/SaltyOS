@@ -34,6 +34,7 @@ pub const SYS_FUTEX: u64 = 18;
 /// Futex operation codes (arg1 of SYS_FUTEX)
 pub const FUTEX_WAIT: u64 = 0;
 pub const FUTEX_WAKE: u64 = 1;
+pub const FUTEX_WAIT_TIMEOUT: u64 = 2;
 
 /// Clock IDs for `SYS_CLOCK_GETTIME`.
 pub const CLOCK_MONOTONIC: i32 = 0;

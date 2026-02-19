@@ -5,8 +5,27 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use crate::syscall::{futex_wait, futex_wake};
+use crate::syscall::{futex_wait, futex_wait_timeout, futex_wake};
 use core::sync::atomic::{AtomicU32, Ordering};
+
+#[inline]
+fn monotonic_now_ns() -> u64 {
+    crate::syscall::syscall(
+        crate::consts::SYS_CLOCK_GETTIME,
+        crate::consts::CLOCK_MONOTONIC as u64,
+        0,
+        0,
+        0,
+        0,
+        0,
+    )
+    .value
+}
+
+#[inline]
+fn remaining_timeout_ns(deadline_ns: u64) -> u64 {
+    deadline_ns.saturating_sub(monotonic_now_ns())
+}
 
 // =========================================================================
 // Mutex: futex-based, 3-state (0=unlocked, 1=locked, 2=locked+waiters)
@@ -50,6 +69,43 @@ impl Mutex {
         }
     }
 
+    /// Acquire the mutex with a timeout in nanoseconds.
+    /// Returns true if the lock was acquired, false on timeout.
+    pub fn lock_timeout(&self, timeout_ns: u64) -> bool {
+        let deadline_ns = monotonic_now_ns().saturating_add(timeout_ns);
+
+        // Fast path: uncontended CAS 0 → 1
+        if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            return true;
+        }
+
+        // Slow path: swap to 2 (locked + waiters) and futex_wait_timeout
+        loop {
+            let prev = self.state.swap(2, Ordering::Acquire);
+            if prev == 0 {
+                return true;
+            }
+
+            let remaining_ns = remaining_timeout_ns(deadline_ns);
+            if remaining_ns == 0 {
+                // Timeout — try one last time before giving up
+                if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                    return true;
+                }
+                return false;
+            }
+
+            let err = futex_wait_timeout(self.futex_ptr(), 2, remaining_ns);
+            if err == crate::consts::SALTY_CANCELLED {
+                // Timeout — try one last time before giving up
+                if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                    return true;
+                }
+                return false;
+            }
+        }
+    }
+
     /// Try to acquire the mutex without blocking.
     /// Returns true if the lock was acquired, false otherwise.
     pub fn try_lock(&self) -> bool {
@@ -68,6 +124,299 @@ impl Mutex {
     #[inline]
     fn futex_ptr(&self) -> *const u32 {
         // SAFETY: AtomicU32 has the same layout as u32
+        &self.state as *const AtomicU32 as *const u32
+    }
+}
+
+// =========================================================================
+// TypedMutex: RECURSIVE and ERRORCHECK mutex types
+// =========================================================================
+
+/// Mutex type constants
+pub const MUTEX_NORMAL: u8 = 0;
+pub const MUTEX_RECURSIVE: u8 = 1;
+pub const MUTEX_ERRORCHECK: u8 = 2;
+
+/// Typed mutex supporting NORMAL, RECURSIVE, and ERRORCHECK semantics.
+///
+/// Layout is `#[repr(C)]` for C ABI compatibility. Fits in 24 bytes.
+#[repr(C)]
+pub struct TypedMutex {
+    /// Futex word: 0=unlocked, 1=locked, 2=locked+waiters
+    state: AtomicU32,
+    /// Mutex type (NORMAL, RECURSIVE, ERRORCHECK)
+    mutex_type: u8,
+    _pad: [u8; 3],
+    /// Thread ID of the current owner (u64::MAX = no owner)
+    owner: core::sync::atomic::AtomicU64,
+    /// Recursion depth (RECURSIVE only)
+    count: AtomicU32,
+    _pad2: [u8; 4],
+}
+
+impl TypedMutex {
+    pub const fn new(mutex_type: u8) -> Self {
+        TypedMutex {
+            state: AtomicU32::new(0),
+            mutex_type,
+            _pad: [0; 3],
+            owner: core::sync::atomic::AtomicU64::new(u64::MAX),
+            count: AtomicU32::new(0),
+            _pad2: [0; 4],
+        }
+    }
+
+    /// Get the current thread's ID from TLS.
+    #[inline]
+    fn current_thread_id() -> u64 {
+        if let Some(tls) = crate::tls::current_tls() {
+            unsafe { (*tls).thread_id }
+        } else {
+            0
+        }
+    }
+
+    /// Lock the typed mutex. Returns 0 on success, errno on error.
+    pub fn lock(&self) -> i32 {
+        let tid = Self::current_thread_id();
+
+        match self.mutex_type {
+            MUTEX_RECURSIVE => {
+                // If already owned by this thread, just increment count
+                if self.owner.load(Ordering::Relaxed) == tid {
+                    self.count.fetch_add(1, Ordering::Relaxed);
+                    return 0;
+                }
+                self.lock_inner();
+                self.owner.store(tid, Ordering::Relaxed);
+                self.count.store(1, Ordering::Relaxed);
+                0
+            }
+            MUTEX_ERRORCHECK => {
+                // If already owned by this thread, return EDEADLK
+                if self.owner.load(Ordering::Relaxed) == tid {
+                    return 35; // EDEADLK
+                }
+                self.lock_inner();
+                self.owner.store(tid, Ordering::Relaxed);
+                0
+            }
+            _ => {
+                self.lock_inner();
+                0
+            }
+        }
+    }
+
+    /// Try to lock the typed mutex. Returns 0 on success, errno on error.
+    pub fn try_lock(&self) -> i32 {
+        let tid = Self::current_thread_id();
+
+        match self.mutex_type {
+            MUTEX_RECURSIVE => {
+                if self.owner.load(Ordering::Relaxed) == tid {
+                    self.count.fetch_add(1, Ordering::Relaxed);
+                    return 0;
+                }
+                if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                    self.owner.store(tid, Ordering::Relaxed);
+                    self.count.store(1, Ordering::Relaxed);
+                    0
+                } else {
+                    16 // EBUSY
+                }
+            }
+            MUTEX_ERRORCHECK => {
+                if self.owner.load(Ordering::Relaxed) == tid {
+                    return 16; // EBUSY
+                }
+                if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                    self.owner.store(tid, Ordering::Relaxed);
+                    0
+                } else {
+                    16 // EBUSY
+                }
+            }
+            _ => {
+                if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                    0
+                } else {
+                    16 // EBUSY
+                }
+            }
+        }
+    }
+
+    /// Unlock the typed mutex. Returns 0 on success, errno on error.
+    pub fn unlock(&self) -> i32 {
+        match self.mutex_type {
+            MUTEX_RECURSIVE => {
+                let tid = Self::current_thread_id();
+                if self.owner.load(Ordering::Relaxed) != tid {
+                    return 1; // EPERM
+                }
+                let prev_count = self.count.fetch_sub(1, Ordering::Relaxed);
+                if prev_count <= 1 {
+                    // Final unlock
+                    self.owner.store(u64::MAX, Ordering::Relaxed);
+                    self.count.store(0, Ordering::Relaxed);
+                    self.unlock_inner();
+                }
+                0
+            }
+            MUTEX_ERRORCHECK => {
+                let tid = Self::current_thread_id();
+                if self.owner.load(Ordering::Relaxed) != tid {
+                    return 1; // EPERM
+                }
+                self.owner.store(u64::MAX, Ordering::Relaxed);
+                self.unlock_inner();
+                0
+            }
+            _ => {
+                self.unlock_inner();
+                0
+            }
+        }
+    }
+
+    /// Lock with timeout. Returns 0 on success, errno on error/timeout.
+    pub fn lock_timeout(&self, timeout_ns: u64) -> i32 {
+        let tid = Self::current_thread_id();
+
+        match self.mutex_type {
+            MUTEX_RECURSIVE => {
+                if self.owner.load(Ordering::Relaxed) == tid {
+                    self.count.fetch_add(1, Ordering::Relaxed);
+                    return 0;
+                }
+                if !self.lock_inner_timeout(timeout_ns) {
+                    return 110; // ETIMEDOUT
+                }
+                self.owner.store(tid, Ordering::Relaxed);
+                self.count.store(1, Ordering::Relaxed);
+                0
+            }
+            MUTEX_ERRORCHECK => {
+                if self.owner.load(Ordering::Relaxed) == tid {
+                    return 35; // EDEADLK
+                }
+                if !self.lock_inner_timeout(timeout_ns) {
+                    return 110; // ETIMEDOUT
+                }
+                self.owner.store(tid, Ordering::Relaxed);
+                0
+            }
+            _ => {
+                if !self.lock_inner_timeout(timeout_ns) {
+                    110 // ETIMEDOUT
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// Internal: acquire the futex lock (blocking).
+    fn lock_inner(&self) {
+        if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            return;
+        }
+        loop {
+            let prev = self.state.swap(2, Ordering::Acquire);
+            if prev == 0 {
+                return;
+            }
+            futex_wait(self.futex_ptr(), 2);
+        }
+    }
+
+    /// Internal: acquire the futex lock with timeout. Returns true on success.
+    fn lock_inner_timeout(&self, timeout_ns: u64) -> bool {
+        let deadline_ns = monotonic_now_ns().saturating_add(timeout_ns);
+
+        if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            return true;
+        }
+        loop {
+            let prev = self.state.swap(2, Ordering::Acquire);
+            if prev == 0 {
+                return true;
+            }
+
+            let remaining_ns = remaining_timeout_ns(deadline_ns);
+            if remaining_ns == 0 {
+                // Timeout — last-chance try
+                if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                    return true;
+                }
+                return false;
+            }
+
+            let err = futex_wait_timeout(self.futex_ptr(), 2, remaining_ns);
+            if err == crate::consts::SALTY_CANCELLED {
+                // Timeout — last-chance try
+                if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                    return true;
+                }
+                return false;
+            }
+        }
+    }
+
+    /// Internal: release the futex lock.
+    fn unlock_inner(&self) {
+        let prev = self.state.swap(0, Ordering::Release);
+        if prev == 2 {
+            futex_wake(self.futex_ptr(), 1);
+        }
+    }
+
+    /// Unlock for condvar wait: fully releases the lock regardless of recursion
+    /// depth, and returns the saved count for later restoration.
+    ///
+    /// Returns 0 if the caller is not the mutex owner (RECURSIVE/ERRORCHECK).
+    /// The caller must check for 0 and skip the wait if ownership verification fails.
+    pub(crate) fn condvar_unlock(&self) -> u32 {
+        match self.mutex_type {
+            MUTEX_RECURSIVE => {
+                let tid = Self::current_thread_id();
+                if self.owner.load(Ordering::Relaxed) != tid {
+                    return 0; // Caller is not the owner
+                }
+                let saved = self.count.swap(0, Ordering::Relaxed);
+                self.owner.store(u64::MAX, Ordering::Relaxed);
+                self.unlock_inner();
+                saved
+            }
+            MUTEX_ERRORCHECK => {
+                let tid = Self::current_thread_id();
+                if self.owner.load(Ordering::Relaxed) != tid {
+                    return 0; // Caller is not the owner
+                }
+                self.owner.store(u64::MAX, Ordering::Relaxed);
+                self.unlock_inner();
+                1
+            }
+            _ => {
+                self.unlock_inner();
+                1
+            }
+        }
+    }
+
+    /// Re-lock after condvar wait: reacquires the lock and restores owner/count.
+    pub(crate) fn condvar_relock(&self, saved_count: u32) {
+        self.lock_inner();
+        let tid = Self::current_thread_id();
+        self.owner.store(tid, Ordering::Relaxed);
+        if self.mutex_type == MUTEX_RECURSIVE {
+            self.count.store(saved_count, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn futex_ptr(&self) -> *const u32 {
         &self.state as *const AtomicU32 as *const u32
     }
 }
@@ -96,12 +445,60 @@ impl Condvar {
     /// Wait on the condition variable, releasing `mutex` atomically.
     ///
     /// The caller must hold `mutex`. It is released before blocking and
-    /// re-acquired before returning.
+    /// re-acquired before returning. This is a cancellation point.
     pub fn wait(&self, mutex: &Mutex) {
         let current_seq = self.seq.load(Ordering::Relaxed);
         mutex.unlock();
         futex_wait(self.futex_ptr(), current_seq);
         mutex.lock();
+        // Cancellation point: check after re-acquiring mutex
+        check_cancellation();
+    }
+
+    /// Wait on the condition variable with a timeout in nanoseconds.
+    ///
+    /// Returns 0 on successful wake, 110 (ETIMEDOUT) on timeout.
+    /// This is a cancellation point.
+    pub fn wait_timeout(&self, mutex: &Mutex, timeout_ns: u64) -> i32 {
+        let current_seq = self.seq.load(Ordering::Relaxed);
+        mutex.unlock();
+        let err = futex_wait_timeout(self.futex_ptr(), current_seq, timeout_ns);
+        mutex.lock();
+        // Cancellation point: check after re-acquiring mutex
+        check_cancellation();
+        if err == crate::consts::SALTY_CANCELLED { 110 } else { 0 }
+    }
+
+    /// Wait on the condition variable with a typed mutex (RECURSIVE/ERRORCHECK).
+    ///
+    /// Fully releases the mutex (saving recursion count), blocks, then
+    /// re-acquires with the original count restored. This is a cancellation point.
+    pub fn wait_typed(&self, mutex: &TypedMutex) -> i32 {
+        let current_seq = self.seq.load(Ordering::Relaxed);
+        let saved = mutex.condvar_unlock();
+        if saved == 0 {
+            return 1; // EPERM — caller doesn't own the mutex
+        }
+        futex_wait(self.futex_ptr(), current_seq);
+        mutex.condvar_relock(saved);
+        check_cancellation();
+        0
+    }
+
+    /// Wait on the condition variable with a typed mutex and timeout.
+    ///
+    /// Returns 0 on successful wake, 110 (ETIMEDOUT) on timeout.
+    /// This is a cancellation point.
+    pub fn wait_timeout_typed(&self, mutex: &TypedMutex, timeout_ns: u64) -> i32 {
+        let current_seq = self.seq.load(Ordering::Relaxed);
+        let saved = mutex.condvar_unlock();
+        if saved == 0 {
+            return 1; // EPERM — caller doesn't own the mutex
+        }
+        let err = futex_wait_timeout(self.futex_ptr(), current_seq, timeout_ns);
+        mutex.condvar_relock(saved);
+        check_cancellation();
+        if err == crate::consts::SALTY_CANCELLED { 110 } else { 0 }
     }
 
     /// Wake one waiting thread.
@@ -282,14 +679,14 @@ impl Once {
 
     /// Execute `f` if this is the first call. All subsequent calls are no-ops.
     /// Concurrent callers block until the first caller's `f` returns.
-    pub fn call_once(&self, f: fn()) {
+    pub fn call_once(&self, f: unsafe extern "C" fn()) {
         match self.state.load(Ordering::Acquire) {
             ONCE_COMPLETE => return,
             ONCE_UNINIT => {
                 if self.state.compare_exchange(
                     ONCE_UNINIT, ONCE_RUNNING, Ordering::Acquire, Ordering::Relaxed,
                 ).is_ok() {
-                    f();
+                    unsafe { f() };
                     self.state.store(ONCE_COMPLETE, Ordering::Release);
                     futex_wake(self.futex_ptr(), u32::MAX);
                     return;
@@ -311,5 +708,24 @@ impl Once {
     #[inline]
     fn futex_ptr(&self) -> *const u32 {
         &self.state as *const AtomicU32 as *const u32
+    }
+}
+
+// =========================================================================
+// Cancellation support
+// =========================================================================
+
+/// Check for pending cancellation at a cancellation point.
+///
+/// If a cancellation is pending and enabled, invokes `pthread_testcancel()`
+/// which runs cleanup handlers and calls `pthread_exit(PTHREAD_CANCELED)`.
+fn check_cancellation() {
+    if let Some(tls) = crate::tls::current_tls() {
+        unsafe {
+            let pending = core::ptr::read_volatile(&raw const (*tls).cancel_pending);
+            if pending != 0 && (*tls).cancel_state == 0 {
+                crate::pthread::pthread_testcancel();
+            }
+        }
     }
 }

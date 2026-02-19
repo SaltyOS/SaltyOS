@@ -73,6 +73,8 @@ pub enum BlockedReason {
     TimerBlocked,
     /// Blocked on futex wait
     FutexBlocked,
+    /// Blocked on futex wait with timeout (in both futex hash + sleep queue)
+    FutexTimedBlocked,
 }
 
 /// Thread Control Block
@@ -156,6 +158,8 @@ pub struct Tcb {
     pub futex_addr: u64,
     /// VSpace pointer for futex address space identification
     pub futex_vspace: *mut VSpace,
+    /// Futex timed wait result: 0 = woken by futex_wake, non-zero = timeout
+    pub futex_wakeup_result: u64,
 }
 
 /// Saved thread context
@@ -275,6 +279,7 @@ impl Tcb {
             futex_next: core::ptr::null_mut(),
             futex_addr: 0,
             futex_vspace: core::ptr::null_mut(),
+            futex_wakeup_result: 0,
         }
     }
 
@@ -345,6 +350,7 @@ impl Tcb {
         self.futex_next = core::ptr::null_mut();
         self.futex_addr = 0;
         self.futex_vspace = core::ptr::null_mut();
+        self.futex_wakeup_result = 0;
     }
 }
 

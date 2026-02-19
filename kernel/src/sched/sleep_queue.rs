@@ -5,7 +5,7 @@
 //! Sorted singly-linked list by timer_wakeup_ns.
 //! All operations run with scheduler lock held.
 
-use crate::sched::thread::{Tcb, ThreadState};
+use crate::sched::thread::{BlockedReason, Tcb, ThreadState};
 
 static mut HEAD: *mut Tcb = core::ptr::null_mut();
 
@@ -81,6 +81,14 @@ pub unsafe fn check_wakeups(now_ns: u64) -> usize {
             *head_ptr = (*tcb).sleep_next;
             (*tcb).sleep_next = core::ptr::null_mut();
             (*tcb).timer_wakeup_ns = 0;
+
+            // If this thread was doing a futex timed wait, remove it from
+            // the futex hash table and mark timeout result
+            if matches!((*tcb).blocked_reason, Some(BlockedReason::FutexTimedBlocked)) {
+                crate::ipc::futex::futex_remove_thread(tcb);
+                (*tcb).futex_wakeup_result = 12; // SyscallError::Cancelled = timeout
+            }
+
             (*tcb).state = ThreadState::Ready;
             (*tcb).blocked_reason = None;
             crate::sched::scheduler::scheduler().enqueue_unlocked(tcb);

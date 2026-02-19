@@ -77,9 +77,10 @@ pub unsafe fn futex_remove_thread(tcb: *mut Tcb) {
 /// Futex syscall dispatcher.
 ///
 /// - `addr`: user virtual address of the futex word (u32)
-/// - `op`: FUTEX_WAIT (0) or FUTEX_WAKE (1)
+/// - `op`: FUTEX_WAIT (0), FUTEX_WAKE (1), or FUTEX_WAIT_TIMEOUT (2)
 /// - `val`: expected value (WAIT) or max wake count (WAKE)
-pub fn syscall_futex(addr: u64, op: u64, val: u64) -> SyscallResult {
+/// - `extra`: timeout in nanoseconds (for FUTEX_WAIT_TIMEOUT)
+pub fn syscall_futex(addr: u64, op: u64, val: u64, extra: u64) -> SyscallResult {
     // Validate address is in user range and aligned
     if addr == 0 || addr >= 0x0000_8000_0000_0000 || (addr & 3) != 0 {
         return SyscallResult::err(SyscallError::InvalidArgument);
@@ -88,6 +89,7 @@ pub fn syscall_futex(addr: u64, op: u64, val: u64) -> SyscallResult {
     match op {
         0 => futex_wait(addr, val as u32),
         1 => futex_wake(addr, val as u32),
+        2 => futex_wait_timeout(addr, val as u32, extra),
         _ => SyscallResult::err(SyscallError::InvalidOperation),
     }
 }
@@ -149,6 +151,83 @@ fn futex_wait(addr: u64, expected: u32) -> SyscallResult {
     }
 }
 
+/// FUTEX_WAIT_TIMEOUT: atomically check *addr == expected, then block with timeout.
+///
+/// The thread is placed in *both* the futex hash table (for futex_wake) and the
+/// sleep queue (for timer-based wakeup). Whichever fires first removes the thread
+/// from both queues.
+///
+/// Returns 0 on successful wake, SALTY_WOULD_BLOCK (9) if *addr != expected,
+/// SALTY_CANCELLED (12) on timeout.
+fn futex_wait_timeout(addr: u64, expected: u32, timeout_ns: u64) -> SyscallResult {
+    unsafe {
+        let irq = save_irq_disable();
+        SCHED_IPC_LOCK.lock();
+
+        let current = scheduler().current();
+        if current.is_null() || (*current).vspace_root.is_null() {
+            SCHED_IPC_LOCK.unlock();
+            restore_irq(irq);
+            return SyscallResult::err(SyscallError::InvalidArgument);
+        }
+
+        // Read the user futex word
+        let user_word = core::ptr::read_volatile(addr as *const u32);
+        if user_word != expected {
+            SCHED_IPC_LOCK.unlock();
+            restore_irq(irq);
+            return SyscallResult::err(SyscallError::WouldBlock);
+        }
+
+        // Compute absolute wakeup time
+        let now_ns = crate::arch::now_ns();
+        let wakeup_ns = now_ns.saturating_add(timeout_ns);
+
+        // Check for already-expired timeout
+        if timeout_ns == 0 {
+            SCHED_IPC_LOCK.unlock();
+            restore_irq(irq);
+            return SyscallResult::err(SyscallError::Cancelled);
+        }
+
+        // Set up TCB for futex + timed blocking
+        let vspace = (*current).vspace_root;
+        (*current).futex_addr = addr;
+        (*current).futex_vspace = vspace;
+        (*current).futex_next = core::ptr::null_mut();
+        (*current).futex_wakeup_result = 0;
+        (*current).state = ThreadState::Blocked;
+        (*current).blocked_reason = Some(BlockedReason::FutexTimedBlocked);
+
+        // Insert into futex hash bucket (same as futex_wait)
+        let bucket = futex_hash(vspace, addr);
+        let head = &raw mut FUTEX_TABLE[bucket];
+        if (*head).is_null() {
+            *head = current;
+        } else {
+            let mut tail = *head;
+            while !(*tail).futex_next.is_null() {
+                tail = (*tail).futex_next;
+            }
+            (*tail).futex_next = current;
+        }
+
+        // Insert into sleep queue and context-switch (acquires scheduler lock internally)
+        scheduler().block_current_futex_timed(wakeup_ns);
+
+        // After wakeup: SCHED_IPC_LOCK is held
+        let result = (*current).futex_wakeup_result;
+        SCHED_IPC_LOCK.unlock();
+        restore_irq(irq);
+
+        if result != 0 {
+            SyscallResult::err(SyscallError::Cancelled)
+        } else {
+            SyscallResult::ok(0)
+        }
+    }
+}
+
 /// FUTEX_WAKE: wake up to `count` threads waiting on the given address.
 ///
 /// Returns the number of threads actually woken.
@@ -185,12 +264,27 @@ fn futex_wake(addr: u64, count: u32) -> SyscallResult {
                     (*prev).futex_next = next;
                 }
 
-                // Wake the thread
+                // Clear futex linkage (safe: node already removed from bucket above)
                 (*node).futex_next = core::ptr::null_mut();
                 (*node).futex_addr = 0;
                 (*node).futex_vspace = core::ptr::null_mut();
-                (*node).blocked_reason = None;
-                scheduler().enqueue_unlocked(node);
+
+                // If this was a timed wait, also remove from sleep queue
+                // Hold scheduler lock across both sleep_queue::remove AND enqueue_unlocked
+                if matches!((*node).blocked_reason, Some(BlockedReason::FutexTimedBlocked)) {
+                    scheduler().lock();
+                    crate::sched::sleep_queue::remove(node);
+                    (*node).timer_wakeup_ns = 0;
+                    (*node).futex_wakeup_result = 0; // woken by wake, not timeout
+                    (*node).blocked_reason = None;
+                    scheduler().enqueue_unlocked(node);
+                    scheduler().unlock();
+                } else {
+                    (*node).blocked_reason = None;
+                    scheduler().lock();
+                    scheduler().enqueue_unlocked(node);
+                    scheduler().unlock();
+                }
 
                 woken += 1;
                 // Don't update prev — node was removed

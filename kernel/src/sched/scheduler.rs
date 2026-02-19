@@ -689,6 +689,55 @@ impl Scheduler {
     }
 
     // ---------------------------------------------------------------
+    // Futex timed blocking (inserts into sleep queue, requires lock)
+    // ---------------------------------------------------------------
+
+    /// Block current thread for a futex timed wait.
+    ///
+    /// The caller has already set the thread's state to Blocked and
+    /// blocked_reason to FutexTimedBlocked, and inserted it into the
+    /// futex hash table. This method inserts the thread into the sleep
+    /// queue and performs a context switch.
+    ///
+    /// # Preconditions
+    /// - SCHED_IPC_LOCK MUST be held by the caller (released before switch,
+    ///   reacquired on resume).
+    /// - Thread state and futex fields already configured by caller.
+    pub fn block_current_futex_timed(&mut self, wakeup_ns: u64) {
+        let irq_flag = unsafe { crate::mm::save_irq_disable() };
+        self.lock();
+
+        unsafe {
+            let cpu_id = crate::arch::current_cpu() as usize;
+            let current = self.current[cpu_id];
+            if current.is_null() {
+                self.unlock();
+                crate::mm::restore_irq(irq_flag);
+                return;
+            }
+
+            // Set timer wakeup and insert into sleep queue
+            (*current).timer_wakeup_ns = wakeup_ns;
+            crate::sched::sleep_queue::insert(current);
+
+            let new_tcb = self.schedule_unlocked();
+            let old_tcb = current;
+            if old_tcb != new_tcb {
+                self.set_current(new_tcb);
+                self.unlock();
+                crate::mm::restore_irq(irq_flag);
+                // SAFETY: SCHED_IPC_LOCK is held; do_context_switch releases
+                // before switch and reacquires on resume.
+                self.do_context_switch(old_tcb, new_tcb);
+                return;
+            }
+        }
+
+        self.unlock();
+        unsafe { crate::mm::restore_irq(irq_flag) };
+    }
+
+    // ---------------------------------------------------------------
     // Kernel exit epilogue
     // ---------------------------------------------------------------
 

@@ -1696,6 +1696,12 @@ fn syscall_tcb_resume(cap: &Capability) -> SyscallResult {
                     if matches!(tcb.blocked_reason, Some(BlockedReason::FutexBlocked)) {
                         crate::ipc::futex::futex_remove_thread(tcb as *mut Tcb);
                     }
+                    if matches!(tcb.blocked_reason, Some(BlockedReason::FutexTimedBlocked)) {
+                        crate::ipc::futex::futex_remove_thread(tcb as *mut Tcb);
+                        crate::sched::sleep_queue::remove(tcb as *mut Tcb);
+                        tcb.timer_wakeup_ns = 0;
+                        tcb.futex_wakeup_result = 0;
+                    }
                     tcb.blocked_reason = None;
                     sched.enqueue_unlocked(tcb as *mut Tcb);
                 });
@@ -1787,6 +1793,12 @@ fn syscall_tcb_suspend(cap: &Capability) -> SyscallResult {
                     }
                     if matches!(tcb.blocked_reason, Some(BlockedReason::FutexBlocked)) {
                         crate::ipc::futex::futex_remove_thread(tcb as *mut Tcb);
+                    }
+                    if matches!(tcb.blocked_reason, Some(BlockedReason::FutexTimedBlocked)) {
+                        crate::ipc::futex::futex_remove_thread(tcb as *mut Tcb);
+                        crate::sched::sleep_queue::remove(tcb as *mut Tcb);
+                        tcb.timer_wakeup_ns = 0;
+                        tcb.futex_wakeup_result = 0;
                     }
                     tcb.state = ThreadState::Inactive;
                     tcb.blocked_reason = None;
@@ -3297,9 +3309,10 @@ pub fn handle(
         }
         Syscall::Futex => {
             // cap_ptr = user virtual address (futex word)
-            // msg_info = operation (FUTEX_WAIT=0, FUTEX_WAKE=1)
+            // msg_info = operation (FUTEX_WAIT=0, FUTEX_WAKE=1, FUTEX_WAIT_TIMEOUT=2)
             // mr0 = expected value (for WAIT) or max wake count (for WAKE)
-            crate::ipc::futex::syscall_futex(cap_ptr, msg_info, mr0)
+            // mr1 = timeout in nanoseconds (for FUTEX_WAIT_TIMEOUT)
+            crate::ipc::futex::syscall_futex(cap_ptr, msg_info, mr0, mr1)
         }
     }
 }

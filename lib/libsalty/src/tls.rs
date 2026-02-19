@@ -6,6 +6,9 @@
 //! The main thread's TLS block is statically allocated. Spawned threads have
 //! their TLS blocks placed at the top of their stack (below the guard page).
 //!
+//! Thread lifecycle fields (stack, caps, join state) live in the ThreadControl
+//! pool (`pthread.rs`), not here. TLS holds only per-thread runtime state.
+//!
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use crate::types::IpcContext;
@@ -21,6 +24,10 @@ static TLS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// Layout is `#[repr(C)]` for ABI stability. The `self_ptr` field MUST be
 /// first — the x86_64 TLS ABI mandates that `%fs:0` dereferences to the
 /// TLS block's own address.
+///
+/// Lifecycle fields (stack base/size, cap slots, join state, exit value)
+/// have been moved to `ThreadControl` in `pthread.rs`. The `control`
+/// back-pointer connects this TLS block to its owning ThreadControl slot.
 #[repr(C)]
 pub struct ThreadLocalBlock {
     /// Self-pointer: `%fs:0 == &self` (x86_64 TLS ABI requirement)
@@ -33,29 +40,31 @@ pub struct ThreadLocalBlock {
     pub errno: i32,
     /// Padding for alignment
     _pad0: i32,
-    /// Base address of this thread's stack allocation
-    pub stack_base: u64,
-    /// Size of this thread's stack allocation (bytes)
-    pub stack_size: u64,
-    /// CNode slot of this thread's TCB capability
-    pub tcb_cap: u64,
-    /// CNode slot of this thread's SchedContext capability
-    pub sc_cap: u64,
-    /// Join state: 0=joinable, 1=detached, 2=exited
-    pub join_state: u32,
-    /// Futex word for pthread_join synchronization
-    pub join_futex: u32,
-    /// Return value from pthread_exit / thread function
-    pub exit_value: *mut u8,
+    /// Back-pointer to owning ThreadControl slot (opaque to avoid circular deps)
+    pub control: *mut u8,
+    /// Cancellation state: 0=ENABLE, 1=DISABLE
+    pub cancel_state: u32,
+    /// Cancellation type: 0=DEFERRED (only type supported)
+    pub cancel_type: u32,
+    /// Set to 1 when cancellation has been requested
+    pub cancel_pending: u32,
+    _pad1: u32,
+    /// LIFO stack of cleanup handlers (intrusive linked list)
+    pub cleanup_stack: *mut CleanupHandler,
+}
+
+/// Cleanup handler node for pthread_cleanup_push/pop.
+#[repr(C)]
+pub struct CleanupHandler {
+    pub routine: unsafe extern "C" fn(*mut u8),
+    pub arg: *mut u8,
+    pub next: *mut CleanupHandler,
 }
 
 unsafe impl Send for ThreadLocalBlock {}
 unsafe impl Sync for ThreadLocalBlock {}
-
-/// Join state constants
-pub const JOIN_JOINABLE: u32 = 0;
-pub const JOIN_DETACHED: u32 = 1;
-pub const JOIN_EXITED: u32 = 2;
+unsafe impl Send for CleanupHandler {}
+unsafe impl Sync for CleanupHandler {}
 
 impl ThreadLocalBlock {
     /// Create a zeroed TLS block with self_ptr set to null.
@@ -67,13 +76,12 @@ impl ThreadLocalBlock {
             thread_id: 0,
             errno: 0,
             _pad0: 0,
-            stack_base: 0,
-            stack_size: 0,
-            tcb_cap: 0,
-            sc_cap: 0,
-            join_state: JOIN_JOINABLE,
-            join_futex: 0,
-            exit_value: core::ptr::null_mut(),
+            control: core::ptr::null_mut(),
+            cancel_state: 0,
+            cancel_type: 0,
+            cancel_pending: 0,
+            _pad1: 0,
+            cleanup_stack: core::ptr::null_mut(),
         }
     }
 }
@@ -159,9 +167,6 @@ pub unsafe fn init_main_thread_tls() {
         // Main thread is thread 0
         (*tls).thread_id = 0;
 
-        // TCB cap is always slot 0 for the main thread
-        (*tls).tcb_cap = 0; // CAP_SELF_TCB
-
         // Set FS_BASE via kernel invoke
         let tls_addr = tls as u64;
         let err = crate::invoke::tcb_set_tls_base(0, tls_addr); // CAP_SELF_TCB = 0
@@ -171,5 +176,8 @@ pub unsafe fn init_main_thread_tls() {
         if err == 0 {
             TLS_INITIALIZED.store(true, Ordering::Release);
         }
+
+        // Initialize the main thread's ThreadControl pool slot (slot 0)
+        crate::pthread::init_main_thread_control(tls);
     }
 }

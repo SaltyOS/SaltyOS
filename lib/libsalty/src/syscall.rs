@@ -72,6 +72,23 @@ pub fn futex_wait(addr: *const u32, expected: u32) -> u64 {
     .error
 }
 
+/// Futex wait with timeout: block if `*addr == expected`, wake after timeout_ns.
+/// Returns 0 on successful wake, SALTY_WOULD_BLOCK (9) if value changed,
+/// SALTY_CANCELLED (12) on timeout.
+#[inline]
+pub fn futex_wait_timeout(addr: *const u32, expected: u32, timeout_ns: u64) -> u64 {
+    syscall(
+        crate::consts::SYS_FUTEX,
+        addr as u64,
+        crate::consts::FUTEX_WAIT_TIMEOUT,
+        expected as u64,
+        timeout_ns,
+        0,
+        0,
+    )
+    .error
+}
+
 /// Futex wake: wake up to `count` threads waiting on `addr`.
 /// Returns the number of threads actually woken.
 #[inline]

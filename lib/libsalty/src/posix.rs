@@ -203,6 +203,9 @@ pub unsafe fn posix_close(fd: i32) -> i32 {
 /// on SMP.
 pub unsafe fn posix_exit(status: i32) -> ! {
     unsafe {
+        // Final userspace-side cleanup of exited pthread slots before process teardown.
+        crate::pthread::process_exit_reap();
+
         let mut msg = SaltyMsg::zeroed();
         msg.label = POSIX_PM_EXIT;
         msg.length = 1;
