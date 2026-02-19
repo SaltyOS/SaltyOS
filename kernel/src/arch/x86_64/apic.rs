@@ -90,10 +90,13 @@ const TIMER_MASK: u32 = 1 << 16;
 /// Timer divide value (divide by 16)
 const TIMER_DIVIDE_16: u32 = 0x3;
 
+/// APIC timer fallback value (used when calibration is invalid).
+const DEFAULT_TIMER_TICKS_PER_MS: u32 = 10000;
+
 /// Timer ticks per millisecond (calibrated at boot)
 /// Default fallback value assumes ~100 MHz APIC bus frequency
 /// This is calibrated during initialization using the PIT
-static TIMER_TICKS_PER_MS: AtomicU32 = AtomicU32::new(10000);
+static TIMER_TICKS_PER_MS: AtomicU32 = AtomicU32::new(DEFAULT_TIMER_TICKS_PER_MS);
 
 /// ICR (Interrupt Command Register) bits
 const ICR_DS: u32 = 1 << 12; // Destination shorthand
@@ -108,6 +111,13 @@ static TSC_BOOT: AtomicU64 = AtomicU64::new(0);
 
 /// TSC ticks per microsecond (calibrated via PIT)
 static TSC_PER_US: AtomicU32 = AtomicU32::new(0);
+
+/// True if TSC is approved as the active high-resolution clocksource.
+///
+/// Enabled only when:
+/// - TSC calibration produced a non-zero rate
+/// - CPUID reports invariant TSC
+static TSC_CLOCKSOURCE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Per-CPU TSC boot value (calibrated during init for each CPU)
 static PER_CPU_TSC_BOOT: [AtomicU64; super::cpu::MAX_CPUS] = {
@@ -343,14 +353,51 @@ pub fn init() {
 unsafe fn init_timer() {
     unsafe {
         // Calibrate timer using PIT (also calibrates TSC_PER_US)
-        let calibrated_ticks = calibrate_timer();
+        let (calibrated_ticks, used_fallback) = calibrate_timer();
         TIMER_TICKS_PER_MS.store(calibrated_ticks, Ordering::Release);
 
-        // Record boot TSC after calibration completes
-        TSC_BOOT.store(rdtsc(), Ordering::Release);
+        let tsc_per_us = TSC_PER_US.load(Ordering::Acquire);
+        let has_invariant_tsc = super::cpuid::has_invariant_tsc();
+        let tsc_clock_enabled = tsc_per_us > 0 && has_invariant_tsc;
+        TSC_CLOCKSOURCE_ENABLED.store(tsc_clock_enabled, Ordering::Release);
 
-        // Also set BSP's per-CPU TSC boot value
-        PER_CPU_TSC_BOOT[0].store(TSC_BOOT.load(Ordering::Relaxed), Ordering::Release);
+        if tsc_clock_enabled {
+            // Record boot TSC after calibration completes.
+            let tsc_boot = rdtsc();
+            TSC_BOOT.store(tsc_boot, Ordering::Release);
+            PER_CPU_TSC_BOOT[0].store(tsc_boot, Ordering::Release);
+        } else {
+            TSC_BOOT.store(0, Ordering::Release);
+            PER_CPU_TSC_BOOT[0].store(0, Ordering::Release);
+        }
+
+        {
+            let s = crate::SerialGuard::acquire();
+            s.puts("[TIMER] APIC ticks/ms=");
+            s.dec(calibrated_ticks as u64);
+            s.puts(" fallback=");
+            s.dec(used_fallback as u64);
+            s.puts(" tsc_per_us=");
+            s.dec(tsc_per_us as u64);
+            s.puts(" inv_tsc=");
+            s.dec(has_invariant_tsc as u64);
+            s.puts(" source=");
+            if tsc_clock_enabled {
+                s.puts("tsc");
+            } else {
+                s.puts("tick");
+            }
+            s.putc(b'\n');
+
+            if used_fallback {
+                s.puts("[WARN] APIC timer calibration fell back to default ticks/ms\n");
+            }
+            if tsc_per_us == 0 {
+                s.puts("[WARN] TSC calibration unavailable; using tick clocksource\n");
+            } else if !has_invariant_tsc {
+                s.puts("[WARN] Non-invariant TSC detected; disabling TSC clocksource\n");
+            }
+        }
 
         // Set timer divide configuration (divide by 16)
         lapic_write(LAPIC_TIMER_DIVIDE, TIMER_DIVIDE_16);
@@ -414,18 +461,20 @@ pub fn now_us() -> u64 {
 
 /// Get elapsed time in nanoseconds
 ///
-/// Uses per-CPU TSC for sub-microsecond precision when calibrated.
-/// Falls back to tick-based timing before calibration completes.
+/// Uses per-CPU TSC for sub-microsecond precision when calibrated and
+/// CPUID reports invariant TSC; otherwise uses tick-based timing.
 /// Guarantees:
 /// - Per-CPU monotonicity (`LAST_NS_PER_CPU`)
 /// - Cross-CPU lower bound: returned time is always >= BSP global floor time
 ///   published from timer ticks (`GLOBAL_FLOOR_NS`).
 pub fn now_ns() -> u64 {
     let tsc_per_us = TSC_PER_US.load(Ordering::Acquire);
+    let tsc_enabled = TSC_CLOCKSOURCE_ENABLED.load(Ordering::Acquire);
+    let inv_tsc_global = super::cpuid::has_invariant_tsc();
     let tick_ns = TICK_COUNTER.load(Ordering::Relaxed) * 1_000_000;
     let floor_ns = GLOBAL_FLOOR_NS.load(Ordering::Acquire).max(tick_ns);
 
-    let raw_ns = if tsc_per_us == 0 {
+    let raw_ns = if !tsc_enabled || !inv_tsc_global || tsc_per_us == 0 {
         floor_ns
     } else {
         let cpu = crate::arch::current_cpu() as usize;
@@ -465,29 +514,30 @@ pub fn now_ns() -> u64 {
 ///
 /// # Algorithm
 /// 1. Save current APIC timer configuration
-/// 2. Set APIC timer to one-shot mode with maximum count
-/// 3. Use PIT counter to measure time until APIC timer expires
-/// 4. Calculate actual APIC ticks per millisecond
+/// 2. Set APIC timer to one-shot mode with a very large count
+/// 3. Measure APIC down-counter delta over a fixed PIT-measured interval
+/// 4. Calculate APIC ticks per millisecond
 /// 5. Restore original timer configuration
 ///
 /// # Returns
-/// The calibrated number of APIC timer ticks per millisecond.
-/// If calibration fails, returns the default fallback value.
-unsafe fn calibrate_timer() -> u32 {
-    /// Default fallback value (assumes ~100 MHz APIC bus frequency)
-    const DEFAULT_TICKS_PER_MS: u32 = 10000;
-
-    /// Reasonable bounds for calibrated value (sanity check)
+/// Returns `(ticks_per_ms, used_fallback)`.
+/// `used_fallback = true` means a default tick rate was used.
+unsafe fn calibrate_timer() -> (u32, bool) {
+    /// Reasonable bounds for calibrated value (sanity check).
+    /// Min: ~16 MHz APIC bus / 16 divider.  Max: ~16 GHz / 16 divider.
     const MIN_TICKS_PER_MS: u32 = 1000;
-    const MAX_TICKS_PER_MS: u32 = 100000;
+    const MAX_TICKS_PER_MS: u32 = 1_000_000;
 
-    /// APIC count value for calibration (slightly less than max)
-    /// Using max - 1000 to account for threshold check overhead
-    const APIC_COUNT: u32 = 0xFFFF_FFFF - 1000;
+    /// PIT wraps to measure for APIC calibration (1 wrap ~= 1ms).
+    /// Larger windows reduce quantization error.
+    const CALIBRATION_WINDOW_MS: u64 = 32;
 
-    /// Timeout: if we don't see APIC timer expire within ~55ms (one PIT period),
-    /// something is wrong - fall back to default value
-    const PIT_TIMEOUT_TICKS: u16 = 65; // ~55ms at 1193 Hz
+    /// APIC one-shot start value used during calibration.
+    /// Keep this high so it will not expire during the PIT measurement window.
+    const APIC_COUNT: u32 = 0xFFFF_FFFF - 1;
+
+    /// Safety timeout for PIT sampling loops to avoid hangs if PIT stalls.
+    const MAX_CALIBRATION_SPINS: u32 = 20_000_000;
 
     unsafe {
         // Step 1: Save current APIC timer configuration
@@ -506,73 +556,71 @@ unsafe fn calibrate_timer() -> u32 {
         let start_count = APIC_COUNT;
         lapic_write(LAPIC_TIMER_INITIAL, start_count);
 
-        // Step 3: Wait for APIC timer to expire, measuring with PIT and TSC
-        let tsc_start = rdtsc();
-        let pit_start = super::pit::read_counter();
-        let mut timer_current: u32;
-
-        // Wait for APIC timer to count down (with timeout protection)
+        // Step 3a: Synchronize to a PIT wrap edge for a clean window start.
+        let mut pit_prev = super::pit::read_counter() as u64;
+        let mut spins: u32 = 0;
         loop {
-            timer_current = lapic_read(LAPIC_TIMER_CURRENT);
-
-            // Check if timer has expired (reached zero or wrapped)
-            if timer_current == 0 || timer_current >= start_count {
-                break;
-            }
-
-            // Timeout check: if PIT has counted down too far, abort
-            let pit_current = super::pit::read_counter();
-            let pit_elapsed = if pit_current <= pit_start {
-                pit_start - pit_current
-            } else {
-                // Wrapped around (PIT counts down from 0xFFFF to 0)
-                pit_start + (0xFFFF as u16 - pit_current) + 1
-            };
-
-            if pit_elapsed > PIT_TIMEOUT_TICKS {
-                // Calibration failed - timer didn't expire in time
-                // Restore original configuration and return default
+            spins = spins.saturating_add(1);
+            if spins > MAX_CALIBRATION_SPINS {
                 lapic_write(LAPIC_TIMER_DIVIDE, original_divide);
                 lapic_write(LAPIC_TIMER_INITIAL, original_initial);
                 lapic_write(LAPIC_LVT_TIMER, original_lvt);
-                return DEFAULT_TICKS_PER_MS;
+                return (DEFAULT_TIMER_TICKS_PER_MS, true);
             }
+
+            let pit_current = super::pit::read_counter() as u64;
+            // PIT counts down and jumps high on reload; this upward jump marks one wrap.
+            if pit_current > pit_prev {
+                break;
+            }
+            pit_prev = pit_current;
+            core::hint::spin_loop();
         }
 
-        // Read final PIT counter value and APIC timer end value
-        let pit_end = super::pit::read_counter();
-        let end_count = lapic_read(LAPIC_TIMER_CURRENT);
+        // Step 3b: Restart APIC count at PIT edge, then measure for N PIT wraps.
+        lapic_write(LAPIC_TIMER_INITIAL, start_count);
+        let tsc_start = rdtsc();
 
-        // Calculate PIT ticks elapsed
-        let pit_elapsed = if pit_end <= pit_start {
-            pit_start - pit_end
-        } else {
-            // Wrapped around
-            pit_start + (0xFFFF as u16 - pit_end) + 1
-        };
+        let mut wraps: u64 = 0;
+        let mut pit_prev = super::pit::read_counter() as u64;
+        spins = 0;
+        while wraps < CALIBRATION_WINDOW_MS {
+            spins = spins.saturating_add(1);
+            if spins > MAX_CALIBRATION_SPINS {
+                lapic_write(LAPIC_TIMER_DIVIDE, original_divide);
+                lapic_write(LAPIC_TIMER_INITIAL, original_initial);
+                lapic_write(LAPIC_LVT_TIMER, original_lvt);
+                return (DEFAULT_TIMER_TICKS_PER_MS, true);
+            }
+
+            let pit_current = super::pit::read_counter() as u64;
+            if pit_current > pit_prev {
+                wraps = wraps.saturating_add(1);
+            }
+            pit_prev = pit_current;
+            core::hint::spin_loop();
+        }
+
+        // Read APIC timer end value at the end of the PIT wrap window.
+        let end_count = lapic_read(LAPIC_TIMER_CURRENT);
 
         // Read TSC at end of calibration
         let tsc_end = rdtsc();
 
         // Calculate actual APIC ticks elapsed (down-counter: start > end)
-        let apic_ticks = (start_count - end_count) as u64;
+        let apic_ticks = (start_count as u64).saturating_sub(end_count as u64);
 
         // Calibrate TSC frequency from the same PIT-measured interval
         let tsc_elapsed = tsc_end.wrapping_sub(tsc_start);
 
-        // Step 4: Calculate APIC ticks per millisecond
-        // Formula: (APIC_count * PIT_FREQUENCY) / (PIT_ticks_elapsed * TIMER_DIVIDE * 1000)
-        let pit_freq = super::pit::PIT_FREQUENCY as u64;
-        let pit_elapsed_u64 = pit_elapsed as u64;
-        let timer_divide = 16u64;
-
-        let ticks_per_ms = (apic_ticks * pit_freq) / (pit_elapsed_u64 * timer_divide * 1000);
+        // Step 4: Calculate APIC ticks per millisecond.
+        let measured_ms = wraps.max(1);
+        let ticks_per_ms = apic_ticks / measured_ms;
 
         // Compute TSC ticks per microsecond:
-        // time_us = (pit_elapsed * 1_000_000) / pit_freq
-        // tsc_per_us = tsc_elapsed / time_us
-        //            = (tsc_elapsed * pit_freq) / (pit_elapsed * 1_000_000)
-        let tsc_per_us_val = (tsc_elapsed * pit_freq) / (pit_elapsed_u64 * 1_000_000);
+        // tsc_per_us = tsc_elapsed / elapsed_us, with elapsed_us ~= wraps * 1000.
+        let elapsed_us = measured_ms.saturating_mul(1000);
+        let tsc_per_us_val = tsc_elapsed / elapsed_us.max(1);
         if tsc_per_us_val > 0 && tsc_per_us_val <= u32::MAX as u64 {
             TSC_PER_US.store(tsc_per_us_val as u32, Ordering::Release);
         }
@@ -580,9 +628,9 @@ unsafe fn calibrate_timer() -> u32 {
         // Sanity check: reject values outside reasonable bounds
         let calibrated =
             if ticks_per_ms >= MIN_TICKS_PER_MS as u64 && ticks_per_ms <= MAX_TICKS_PER_MS as u64 {
-                ticks_per_ms as u32
+                (ticks_per_ms as u32, false)
             } else {
-                DEFAULT_TICKS_PER_MS
+                (DEFAULT_TIMER_TICKS_PER_MS, true)
             };
 
         // Step 5: Restore original timer configuration
@@ -1010,8 +1058,10 @@ pub fn init_ap() {
         // TICK_COUNTER (BSP-only, 1ms resolution) gives approximate elapsed time.
         // We compute what this CPU's rdtsc() "would have been" at time=0.
         let cpu_id = crate::arch::current_cpu() as usize;
+        let tsc_enabled = TSC_CLOCKSOURCE_ENABLED.load(Ordering::Acquire);
+        let inv_tsc_global = super::cpuid::has_invariant_tsc();
         let tsc_per_us = TSC_PER_US.load(Ordering::Acquire);
-        if tsc_per_us > 0 {
+        if tsc_enabled && inv_tsc_global && tsc_per_us > 0 {
             let ticks = TICK_COUNTER.load(Ordering::Acquire);
             let my_tsc = rdtsc();
             // elapsed_tsc = ticks_ms * 1000_us/ms * tsc_per_us
@@ -1020,6 +1070,8 @@ pub fn init_ap() {
                 my_tsc.wrapping_sub(elapsed_tsc),
                 Ordering::Release,
             );
+        } else {
+            PER_CPU_TSC_BOOT[cpu_id].store(0, Ordering::Release);
         }
     }
 }

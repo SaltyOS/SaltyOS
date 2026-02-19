@@ -43,6 +43,10 @@ pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
     super::idt::load();
     crate::serial_puts("[AP] IDT loaded\n");
 
+    // 4.5 Register this AP's CPUID features into the global intersection.
+    // Must run before feature-dependent init (APIC/FPU).
+    super::cpuid::register_ap(cpu_id);
+
     // 5. Initialize SYSCALL MSRs for this CPU
     init_ap_syscalls(cpu_id);
     crate::serial_puts("[AP] SYSCALL MSRs configured\n");
