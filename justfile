@@ -196,29 +196,95 @@ gdb:
 
 # Run with UEFI firmware
 run-uefi: image-uefi
-    qemu-system-x86_64 \
-        -machine q35 \
-        -cpu qemu64 \
-        -m 512M \
-        -serial stdio \
-        -bios /usr/share/edk2-ovmf/OVMF_CODE.fd \
-        -drive file={{builddir}}/saltyos-uefi.img,format=raw \
-        -no-reboot \
-        -no-shutdown
+    bash -eu -c '\
+        ovmf_code="${OVMF_CODE:-}"; \
+        ovmf_vars="${OVMF_VARS:-}"; \
+        if [ -z "$ovmf_code" ]; then \
+            for cand in /usr/share/edk2-ovmf/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd; do \
+                if [ -f "$cand" ]; then ovmf_code="$cand"; break; fi; \
+            done; \
+        fi; \
+        if [ -z "$ovmf_vars" ]; then \
+            for cand in /usr/share/edk2-ovmf/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd; do \
+                if [ -f "$cand" ]; then ovmf_vars="$cand"; break; fi; \
+            done; \
+        fi; \
+        if [ -z "$ovmf_code" ]; then \
+            echo "OVMF firmware not found. Set OVMF_CODE (and optionally OVMF_VARS)." >&2; \
+            exit 1; \
+        fi; \
+        if [ -n "$ovmf_vars" ] && [ -f "$ovmf_vars" ]; then \
+            ovmf_vars_runtime="{{builddir}}/OVMF_VARS.fd"; \
+            if [ ! -f "$ovmf_vars_runtime" ]; then cp "$ovmf_vars" "$ovmf_vars_runtime"; fi; \
+            qemu-system-x86_64 \
+                -machine q35 \
+                -cpu qemu64 \
+                -m 512M \
+                -serial stdio \
+                -drive if=pflash,format=raw,readonly=on,file="$ovmf_code" \
+                -drive if=pflash,format=raw,file="$ovmf_vars_runtime" \
+                -drive file={{builddir}}/saltyos-uefi.img,format=raw \
+                -no-reboot \
+                -no-shutdown; \
+        else \
+            qemu-system-x86_64 \
+                -machine q35 \
+                -cpu qemu64 \
+                -m 512M \
+                -serial stdio \
+                -bios "$ovmf_code" \
+                -drive file={{builddir}}/saltyos-uefi.img,format=raw \
+                -no-reboot \
+                -no-shutdown; \
+        fi'
 
 # Run UEFI with debug output
 run-uefi-debug: image-uefi
-    qemu-system-x86_64 \
-        -machine q35 \
-        -cpu qemu64 \
-        -m 512M \
-        -serial stdio \
-        -bios /usr/share/edk2-ovmf/OVMF_CODE.fd \
-        -drive file={{builddir}}/saltyos-uefi.img,format=raw \
-        -no-reboot \
-        -no-shutdown \
-        -d int,cpu_reset \
-        -D qemu.log
+    bash -eu -c '\
+        ovmf_code="${OVMF_CODE:-}"; \
+        ovmf_vars="${OVMF_VARS:-}"; \
+        if [ -z "$ovmf_code" ]; then \
+            for cand in /usr/share/edk2-ovmf/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd; do \
+                if [ -f "$cand" ]; then ovmf_code="$cand"; break; fi; \
+            done; \
+        fi; \
+        if [ -z "$ovmf_vars" ]; then \
+            for cand in /usr/share/edk2-ovmf/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd; do \
+                if [ -f "$cand" ]; then ovmf_vars="$cand"; break; fi; \
+            done; \
+        fi; \
+        if [ -z "$ovmf_code" ]; then \
+            echo "OVMF firmware not found. Set OVMF_CODE (and optionally OVMF_VARS)." >&2; \
+            exit 1; \
+        fi; \
+        if [ -n "$ovmf_vars" ] && [ -f "$ovmf_vars" ]; then \
+            ovmf_vars_runtime="{{builddir}}/OVMF_VARS.fd"; \
+            if [ ! -f "$ovmf_vars_runtime" ]; then cp "$ovmf_vars" "$ovmf_vars_runtime"; fi; \
+            qemu-system-x86_64 \
+                -machine q35 \
+                -cpu qemu64 \
+                -m 512M \
+                -serial stdio \
+                -drive if=pflash,format=raw,readonly=on,file="$ovmf_code" \
+                -drive if=pflash,format=raw,file="$ovmf_vars_runtime" \
+                -drive file={{builddir}}/saltyos-uefi.img,format=raw \
+                -no-reboot \
+                -no-shutdown \
+                -d int,cpu_reset \
+                -D qemu.log; \
+        else \
+            qemu-system-x86_64 \
+                -machine q35 \
+                -cpu qemu64 \
+                -m 512M \
+                -serial stdio \
+                -bios "$ovmf_code" \
+                -drive file={{builddir}}/saltyos-uefi.img,format=raw \
+                -no-reboot \
+                -no-shutdown \
+                -d int,cpu_reset \
+                -D qemu.log; \
+        fi'
 
 # Run with debug output (headless, no GUI window)
 run-debug-headless: build
@@ -238,18 +304,53 @@ run-debug-headless: build
 
 # Run UEFI with debug output (headless, no GUI window)
 run-uefi-debug-headless: image-uefi
-    qemu-system-x86_64 \
-        -machine q35 \
-        -cpu qemu64 \
-        -m 512M \
-        -serial stdio \
-        -display none \
-        -bios /usr/share/edk2-ovmf/OVMF_CODE.fd \
-        -drive file={{builddir}}/saltyos-uefi.img,format=raw \
-        -no-reboot \
-        -no-shutdown \
-        -d int,cpu_reset \
-        -D qemu.log
+    bash -eu -c '\
+        ovmf_code="${OVMF_CODE:-}"; \
+        ovmf_vars="${OVMF_VARS:-}"; \
+        if [ -z "$ovmf_code" ]; then \
+            for cand in /usr/share/edk2-ovmf/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd; do \
+                if [ -f "$cand" ]; then ovmf_code="$cand"; break; fi; \
+            done; \
+        fi; \
+        if [ -z "$ovmf_vars" ]; then \
+            for cand in /usr/share/edk2-ovmf/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd; do \
+                if [ -f "$cand" ]; then ovmf_vars="$cand"; break; fi; \
+            done; \
+        fi; \
+        if [ -z "$ovmf_code" ]; then \
+            echo "OVMF firmware not found. Set OVMF_CODE (and optionally OVMF_VARS)." >&2; \
+            exit 1; \
+        fi; \
+        if [ -n "$ovmf_vars" ] && [ -f "$ovmf_vars" ]; then \
+            ovmf_vars_runtime="{{builddir}}/OVMF_VARS.fd"; \
+            if [ ! -f "$ovmf_vars_runtime" ]; then cp "$ovmf_vars" "$ovmf_vars_runtime"; fi; \
+            qemu-system-x86_64 \
+                -machine q35 \
+                -cpu qemu64 \
+                -m 512M \
+                -serial stdio \
+                -display none \
+                -drive if=pflash,format=raw,readonly=on,file="$ovmf_code" \
+                -drive if=pflash,format=raw,file="$ovmf_vars_runtime" \
+                -drive file={{builddir}}/saltyos-uefi.img,format=raw \
+                -no-reboot \
+                -no-shutdown \
+                -d int,cpu_reset \
+                -D qemu.log; \
+        else \
+            qemu-system-x86_64 \
+                -machine q35 \
+                -cpu qemu64 \
+                -m 512M \
+                -serial stdio \
+                -display none \
+                -bios "$ovmf_code" \
+                -drive file={{builddir}}/saltyos-uefi.img,format=raw \
+                -no-reboot \
+                -no-shutdown \
+                -d int,cpu_reset \
+                -D qemu.log; \
+        fi'
 
 # =============================================================================
 # Utilities
