@@ -79,11 +79,13 @@ impl Scheduler {
                 (*current).next = tcb;
             }
 
-            // If thread has specific CPU affinity, check if target CPU needs waking
+            // Wake an idle CPU so it can pick up this thread
             let affinity = (*tcb).cpu_affinity;
+            let this_cpu = crate::arch::current_cpu() as usize;
+
             if affinity != 0xFFFF_FFFF {
+                // Specific affinity: IPI target if idle
                 let target = affinity as usize;
-                let this_cpu = crate::arch::current_cpu() as usize;
                 if target != this_cpu
                     && target < MAX_CPUS
                     && !self.idle[target].is_null()
@@ -93,6 +95,17 @@ impl Scheduler {
                         target,
                         crate::arch::IpiKind::Reschedule,
                     );
+                }
+            } else {
+                // Any-CPU affinity: IPI one idle CPU so it picks up the thread
+                for cpu in 0..MAX_CPUS {
+                    if cpu != this_cpu
+                        && !self.idle[cpu].is_null()
+                        && self.current[cpu] == self.idle[cpu]
+                    {
+                        crate::arch::send_ipi(cpu, crate::arch::IpiKind::Reschedule);
+                        break;
+                    }
                 }
             }
         }
