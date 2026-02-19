@@ -412,6 +412,12 @@ impl Scheduler {
             // Release SCHED_IPC_LOCK before context switch (IF=0, no interrupts possible)
             crate::mm::SCHED_IPC_LOCK.unlock();
 
+            // Save outgoing thread's FPU state if it owns the hardware registers.
+            // This ensures the TCB buffer is up-to-date before the thread can be
+            // migrated to another CPU (where flush_if_owner would miss it).
+            // SAFETY: old_tcb is a valid Tcb pointer from scheduler.current[].
+            crate::arch::fpu::save_on_switch(old_tcb as *mut u8);
+
             // Set CR0.TS so the new thread's first FPU use triggers #NM for lazy switching
             crate::arch::fpu::set_ts();
 

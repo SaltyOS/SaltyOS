@@ -275,10 +275,35 @@ fn clear_ts() {
 /// `tcb_ptr` must be a valid pointer to a Tcb.
 pub unsafe fn flush_if_owner(tcb_ptr: *mut u8) {
     if cpu::get_fpu_owner() == tcb_ptr {
-        // SAFETY: Caller guarantees tcb_ptr is valid Tcb
+        // SAFETY: Caller guarantees tcb_ptr is valid Tcb.
+        // Clear TS before XSAVE — if the caller reached here via a path that
+        // set CR0.TS (e.g. fork on the same CPU after context switch), XSAVE
+        // would trigger a kernel #NM.
         unsafe {
+            clear_ts();
             let tcb = &mut *(tcb_ptr as *mut Tcb);
             xsave_current(&mut tcb.fpu_state);
+        }
+    }
+}
+
+/// Save outgoing thread's FPU state to its TCB buffer during context switch.
+///
+/// If the given TCB is the current CPU's FPU owner, saves the live hardware
+/// state into the TCB's XSaveArea and releases ownership. This ensures the
+/// buffer is up-to-date before the thread migrates to another CPU.
+///
+/// # Safety
+/// `tcb_ptr` must be a valid pointer to a Tcb.
+pub unsafe fn save_on_switch(tcb_ptr: *mut u8) {
+    if cpu::get_fpu_owner() == tcb_ptr {
+        // SAFETY: Caller guarantees tcb_ptr is valid Tcb.
+        // Clear TS before XSAVE to prevent kernel #NM.
+        unsafe {
+            clear_ts();
+            let tcb = &mut *(tcb_ptr as *mut Tcb);
+            xsave_current(&mut tcb.fpu_state);
+            cpu::set_fpu_owner(core::ptr::null_mut());
         }
     }
 }
