@@ -35,9 +35,9 @@ SECTIONS
         *(.data .data.*)
     }
 
-    .got     : { *(.got) }
-    .got.plt : { *(.got.plt) }
-    .dynamic : { *(.dynamic) }
+    .got      : { *(.got) }
+    .dynamic  : { *(.dynamic) }
+    .got.plt  : { *(.got.plt) }
 
     .bss ALIGN(4K) : {
         *(.bss .bss.*)
