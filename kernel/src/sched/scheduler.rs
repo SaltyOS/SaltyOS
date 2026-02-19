@@ -14,6 +14,12 @@ pub struct Scheduler {
     current: [*mut Tcb; MAX_CPUS],
     /// Per-CPU idle thread
     idle: [*mut Tcb; MAX_CPUS],
+    /// Per-CPU deferred enqueue slot.
+    ///
+    /// Holds a thread that should be enqueued AFTER `context_switch` saves
+    /// its registers. Prevents the double-schedule race where another CPU
+    /// dequeues and switches to a thread before its context is saved.
+    pending_enqueue: [*mut Tcb; MAX_CPUS],
     /// Lock state (simple test-and-set spinlock)
     lock_state: core::sync::atomic::AtomicU8,
 }
@@ -24,6 +30,7 @@ impl Scheduler {
             ready_head: core::ptr::null_mut(),
             current: [core::ptr::null_mut(); MAX_CPUS],
             idle: [core::ptr::null_mut(); MAX_CPUS],
+            pending_enqueue: [core::ptr::null_mut(); MAX_CPUS],
             lock_state: core::sync::atomic::AtomicU8::new(0),
         }
     }
@@ -138,7 +145,6 @@ impl Scheduler {
             while !current.is_null() {
                 let affinity = (*current).cpu_affinity;
                 if affinity == 0xFFFF_FFFF || affinity as usize == cpu_id {
-                    // Remove from queue
                     if prev.is_null() {
                         self.ready_head = (*current).next;
                     } else {
@@ -305,6 +311,61 @@ impl Scheduler {
     }
 
     // ---------------------------------------------------------------
+    // Deferred enqueue helpers
+    // ---------------------------------------------------------------
+
+    /// Mark thread for deferred enqueue after context switch completes.
+    ///
+    /// Sets state to Ready but does NOT insert into the ready queue.
+    /// The thread will be enqueued by `process_pending_enqueue()` after
+    /// `context_switch` has saved its registers.
+    ///
+    /// If there is already a pending thread in the slot (e.g. from a
+    /// previous switch to a fresh thread whose entry point never returned
+    /// through `do_context_switch`), it is enqueued now before being
+    /// overwritten.
+    ///
+    /// Caller MUST hold the scheduler lock.
+    fn set_pending_enqueue(&mut self, cpu_id: usize, tcb: *mut Tcb) {
+        // Flush any stale pending before overwriting (safety net for
+        // switches to fresh threads that skip process_pending_enqueue).
+        let old = self.pending_enqueue[cpu_id];
+        if !old.is_null() {
+            unsafe {
+                if (*old).state == ThreadState::Ready {
+                    self.enqueue_unlocked(old);
+                }
+            }
+            self.pending_enqueue[cpu_id] = core::ptr::null_mut();
+        }
+
+        unsafe {
+            (*tcb).state = ThreadState::Ready;
+        }
+        self.pending_enqueue[cpu_id] = tcb;
+    }
+
+    /// Process deferred enqueue after context switch.
+    ///
+    /// If there is a pending thread and its state is still Ready
+    /// (guards against TCB_SUSPEND setting Inactive), enqueue it.
+    /// Clears the pending slot.
+    ///
+    /// Caller MUST hold the scheduler lock.
+    fn process_pending_enqueue(&mut self) {
+        let cpu_id = crate::arch::current_cpu() as usize;
+        let tcb = self.pending_enqueue[cpu_id];
+        if !tcb.is_null() {
+            self.pending_enqueue[cpu_id] = core::ptr::null_mut();
+            unsafe {
+                if (*tcb).state == ThreadState::Ready {
+                    self.enqueue_unlocked(tcb);
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Context switch helpers
     // ---------------------------------------------------------------
 
@@ -315,12 +376,27 @@ impl Scheduler {
     ///   and reacquires it on resume. Callers without it cause a lock leak.
     /// - Scheduler lock (`lock_state`) MUST NOT be held.
     unsafe fn do_context_switch(&mut self, old_tcb: *mut Tcb, new_tcb: *mut Tcb) {
+        // Shadow new_tcb so we can reassign on VSpace failure
+        let mut new_tcb = new_tcb;
+
         unsafe {
             // Switch to the target thread's user VSpace
             if !(*new_tcb).vspace_root.is_null() {
                 let vspace = &*(*new_tcb).vspace_root;
                 if !vspace.switch_to() {
-                    crate::serial_puts("[SCHED] WARN: VSpace switch failed\n");
+                    // VSpace Dying/Dead — cannot switch to this thread.
+                    // Mark it inactive and fall back to idle thread.
+                    (*new_tcb).state = ThreadState::Inactive;
+
+                    self.lock();
+                    let cpu_id = crate::arch::current_cpu() as usize;
+                    let idle = self.idle[cpu_id];
+                    self.set_current(idle);
+                    self.unlock();
+
+                    // Idle has null vspace_root — VSpace switch will be
+                    // skipped below, keeping the current CR3.
+                    new_tcb = idle;
                 }
             }
 
@@ -350,6 +426,13 @@ impl Scheduler {
 
             // Reacquire SCHED_IPC_LOCK after resume
             crate::mm::SCHED_IPC_LOCK.lock();
+
+            // Process deferred enqueue now that context is saved.
+            // The thread that was pending before the switch can now safely
+            // appear in the ready queue (its registers are saved).
+            self.lock();
+            self.process_pending_enqueue();
+            self.unlock();
         }
     }
 
@@ -415,31 +498,39 @@ impl Scheduler {
                         return;
                     }
                 } else {
-                    self.handle_budget_exhausted_unlocked(current);
+                    self.replenish_budget_unlocked(current);
+                    self.set_pending_enqueue(cpu_id, current);
                     let new_tcb = self.schedule_unlocked();
-                    let old_tcb = current;
-                    if old_tcb != new_tcb {
+                    if new_tcb == self.idle[cpu_id] && !self.pending_enqueue[cpu_id].is_null() {
+                        // No real thread available — cancel pending, keep current
+                        self.pending_enqueue[cpu_id] = core::ptr::null_mut();
+                        (*current).state = ThreadState::Running;
+                    } else if current != new_tcb {
                         self.set_current(new_tcb);
                         self.unlock();
                         crate::mm::restore_irq(irq_flag);
-                        self.do_context_switch(old_tcb, new_tcb);
+                        self.do_context_switch(current, new_tcb);
                         return;
                     }
                 }
             }
             // Check for preemption (earlier deadline ready)
             else if self.needs_reschedule() {
-                // Only re-enqueue if not suspended by cross-CPU TCB_SUSPEND
+                // Deferred enqueue: mark Ready but don't insert into queue yet.
+                // process_pending_enqueue() runs after context_switch saves registers.
                 if (*current).state != ThreadState::Inactive {
-                    self.enqueue_unlocked(current);
+                    self.set_pending_enqueue(cpu_id, current);
                 }
                 let new_tcb = self.schedule_unlocked();
-                let old_tcb = current;
-                if old_tcb != new_tcb {
+                if new_tcb == self.idle[cpu_id] && !self.pending_enqueue[cpu_id].is_null() {
+                    // No real thread available — cancel pending, keep current
+                    self.pending_enqueue[cpu_id] = core::ptr::null_mut();
+                    (*current).state = ThreadState::Running;
+                } else if current != new_tcb {
                     self.set_current(new_tcb);
                     self.unlock();
                     crate::mm::restore_irq(irq_flag);
-                    self.do_context_switch(old_tcb, new_tcb);
+                    self.do_context_switch(current, new_tcb);
                     return;
                 }
             }
@@ -466,15 +557,19 @@ impl Scheduler {
                 return;
             }
 
-            // Re-enqueue current if it's a real thread (not idle) and still Running.
+            // Deferred enqueue: mark Ready but don't insert into queue yet.
             // The Running check prevents re-enqueuing Inactive threads that were
             // suspended by a cross-CPU TCB_SUSPEND + IPI.
             if current != self.idle[cpu_id] && (*current).state == ThreadState::Running {
-                self.enqueue_unlocked(current);
+                self.set_pending_enqueue(cpu_id, current);
             }
 
             let new_tcb = self.schedule_unlocked();
-            if current != new_tcb {
+            if new_tcb == self.idle[cpu_id] && !self.pending_enqueue[cpu_id].is_null() {
+                // No real thread available — cancel pending, keep current
+                self.pending_enqueue[cpu_id] = core::ptr::null_mut();
+                (*current).state = ThreadState::Running;
+            } else if current != new_tcb {
                 self.set_current(new_tcb);
                 self.unlock();
                 crate::mm::restore_irq(irq_flag);
@@ -487,10 +582,13 @@ impl Scheduler {
         unsafe { crate::mm::restore_irq(irq_flag) };
     }
 
-    /// Handle budget exhaustion for a thread — unlocked variant.
+    /// Replenish budget for a thread whose budget expired — unlocked variant.
+    ///
+    /// Advances deadline, updates priority, and replenishes budget.
+    /// Does NOT enqueue the thread — caller must use `set_pending_enqueue()`.
     ///
     /// Caller MUST hold the scheduler lock.
-    fn handle_budget_exhausted_unlocked(&mut self, tcb: *mut Tcb) {
+    fn replenish_budget_unlocked(&mut self, tcb: *mut Tcb) {
         unsafe {
             let sched_ctx = (*tcb).sched_context;
             if sched_ctx.is_null() {
@@ -510,9 +608,6 @@ impl Scheduler {
 
             // Replenish budget
             (*sched_ctx).remaining = (*sched_ctx).budget;
-
-            // Re-enqueue thread (enqueue sets state = Ready)
-            self.enqueue_unlocked(tcb);
         }
     }
 
@@ -552,6 +647,53 @@ impl Scheduler {
 
             self.do_context_switch(old_tcb, new_tcb);
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Yield (acquires lock, deferred enqueue before context switch)
+    // ---------------------------------------------------------------
+
+    /// Yield the current thread to the scheduler.
+    ///
+    /// Uses deferred enqueue to prevent double-schedule race on SMP:
+    /// the current thread is NOT inserted into the ready queue until
+    /// `context_switch` has saved its registers.
+    ///
+    /// # Preconditions
+    /// - SCHED_IPC_LOCK MUST be held by the caller.
+    pub fn yield_current(&mut self) {
+        let irq_flag = unsafe { crate::mm::save_irq_disable() };
+        self.lock();
+
+        unsafe {
+            let cpu_id = crate::arch::current_cpu() as usize;
+            let current = self.current[cpu_id];
+            if current.is_null() || current == self.idle[cpu_id] {
+                self.unlock();
+                crate::mm::restore_irq(irq_flag);
+                return;
+            }
+
+            if (*current).state != ThreadState::Inactive {
+                self.set_pending_enqueue(cpu_id, current);
+            }
+
+            let new_tcb = self.schedule_unlocked();
+            if new_tcb == self.idle[cpu_id] && !self.pending_enqueue[cpu_id].is_null() {
+                // No real thread available — cancel pending, keep current
+                self.pending_enqueue[cpu_id] = core::ptr::null_mut();
+                (*current).state = ThreadState::Running;
+            } else if current != new_tcb {
+                self.set_current(new_tcb);
+                self.unlock();
+                crate::mm::restore_irq(irq_flag);
+                self.do_context_switch(current, new_tcb);
+                return;
+            }
+        }
+
+        self.unlock();
+        unsafe { crate::mm::restore_irq(irq_flag) };
     }
 
     // ---------------------------------------------------------------

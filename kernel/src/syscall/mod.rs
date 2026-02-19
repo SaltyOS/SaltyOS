@@ -1557,13 +1557,10 @@ fn syscall_sc_yield_to(cap: &Capability, target_sc_cap_ptr: u64) -> SyscallResul
         current_sc.remaining = 0;
 
         let scheduler = crate::sched::scheduler::scheduler();
-        let current_tcb = scheduler.current();
-        if !current_tcb.is_null() {
-            scheduler.enqueue(current_tcb);
-            // reschedule acquires internal lock; do_context_switch
-            // releases/reacquires SCHED_IPC_LOCK around context_switch
-            scheduler.reschedule();
-        }
+        // Use deferred enqueue to avoid SMP double-schedule race:
+        // do not place the running TCB into ready queue before its context
+        // has been saved by context_switch.
+        scheduler.yield_current();
         SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
     }
@@ -3178,21 +3175,13 @@ pub fn handle(
         Syscall::Wait => syscall_wait(cap_ptr),
         Syscall::Poll => syscall_poll(cap_ptr),
         Syscall::Yield => {
-            // Yield under SCHED_IPC_LOCK (reschedule may context-switch)
+            // Yield under SCHED_IPC_LOCK using deferred enqueue.
+            // The current thread is NOT placed in the ready queue until
+            // context_switch has saved its registers (prevents SMP race).
             unsafe {
                 let irq = save_irq_disable();
                 SCHED_IPC_LOCK.lock();
-                let sched = crate::sched::scheduler::scheduler();
-                let current = sched.current();
-                if !current.is_null() && current != sched.get_idle() {
-                    // Guard: cross-CPU TCB_SUSPEND may have set state to
-                    // Inactive between syscall entry and lock acquisition.
-                    // Do not re-enqueue — just reschedule away.
-                    if (*current).state != ThreadState::Inactive {
-                        sched.enqueue(current);
-                    }
-                    sched.reschedule();
-                }
+                crate::sched::scheduler::scheduler().yield_current();
                 SCHED_IPC_LOCK.unlock();
                 restore_irq(irq);
             }

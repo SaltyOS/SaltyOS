@@ -185,18 +185,14 @@ unsafe fn allocate_idle_stack() -> u64 {
 /// Yield current thread
 ///
 /// Called by a thread to voluntarily give up the CPU.
-/// The thread is placed back in the ready queue and a reschedule is triggered.
-/// SCHED_IPC_LOCK is held across reschedule (do_context_switch releases/reacquires it).
+/// Uses deferred enqueue — the thread is NOT placed in the ready queue
+/// until context_switch has saved its registers (prevents SMP race).
+/// SCHED_IPC_LOCK is held across yield (do_context_switch releases/reacquires it).
 pub fn yield_now() {
     unsafe {
         let irq = crate::mm::save_irq_disable();
         crate::mm::SCHED_IPC_LOCK.lock();
-        let sched = scheduler();
-        let current = sched.current();
-        if !current.is_null() && current != sched.get_idle() {
-            sched.enqueue(current);
-            sched.reschedule();
-        }
+        scheduler().yield_current();
         crate::mm::SCHED_IPC_LOCK.unlock();
         crate::mm::restore_irq(irq);
     }
