@@ -454,6 +454,10 @@ impl Scheduler {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
         self.lock();
 
+        // Flush any deferred enqueue left over from a previous switch to a
+        // fresh thread whose entry point never returned through do_context_switch.
+        self.process_pending_enqueue();
+
         // Wake expired sleepers
         let now_ns = crate::arch::now_ns();
         unsafe { crate::sched::sleep_queue::check_wakeups(now_ns); }
@@ -554,6 +558,10 @@ impl Scheduler {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
         self.lock();
 
+        // Flush any deferred enqueue left over from a previous switch to a
+        // fresh thread whose entry point never returned through do_context_switch.
+        self.process_pending_enqueue();
+
         unsafe {
             let cpu_id = crate::arch::current_cpu() as usize;
             let current = self.current[cpu_id];
@@ -631,6 +639,10 @@ impl Scheduler {
     pub fn reschedule(&mut self) {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
         self.lock();
+
+        // Flush any deferred enqueue left over from a previous switch to a
+        // fresh thread whose entry point never returned through do_context_switch.
+        self.process_pending_enqueue();
 
         unsafe {
             let cpu_id = crate::arch::current_cpu() as usize;

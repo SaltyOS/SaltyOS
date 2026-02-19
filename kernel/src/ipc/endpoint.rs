@@ -162,12 +162,21 @@ impl Endpoint {
                         self.state = EndpointState::Idle;
                     }
 
+                    // Clear receiver's blocked markers BEFORE transfer_message:
+                    // transfer_message may release SCHED_IPC_LOCK for cap transfer,
+                    // during which notification.signal() could see stale RecvBlocked
+                    // state and double-enqueue the receiver.
+                    (*receiver).blocked_reason = None;
+                    (*receiver).blocked_endpoint = core::ptr::null_mut();
+
                     self.transfer_message(current, receiver, msg, badge);
 
-                    // Wake receiver
-                    (*receiver).state = ThreadState::Ready;
-                    (*receiver).blocked_endpoint = core::ptr::null_mut();
-                    get_scheduler().enqueue(receiver);
+                    // Guard: if receiver was suspended during transfer_message's
+                    // SCHED_IPC_LOCK release window (cap transfer), don't resurrect.
+                    if (*receiver).state != ThreadState::Inactive {
+                        (*receiver).state = ThreadState::Ready;
+                        get_scheduler().enqueue(receiver);
+                    }
                 }
                 EndpointState::Idle | EndpointState::SendBlocked => {
                     // SLOWPATH: No receiver - block sender
@@ -202,11 +211,16 @@ impl Endpoint {
                             self.state = EndpointState::Idle;
                         }
 
+                        // Clear blocked markers before transfer_message (see send()).
+                        (*receiver).blocked_reason = None;
+                        (*receiver).blocked_endpoint = core::ptr::null_mut();
+
                         self.transfer_message(current, receiver, msg, badge);
 
-                        (*receiver).state = ThreadState::Ready;
-                        (*receiver).blocked_endpoint = core::ptr::null_mut();
-                        get_scheduler().enqueue(receiver);
+                        if (*receiver).state != ThreadState::Inactive {
+                            (*receiver).state = ThreadState::Ready;
+                            get_scheduler().enqueue(receiver);
+                        }
                         true
                     } else {
                         // State inconsistency: recover and fall back to async queue.
@@ -385,12 +399,17 @@ impl Endpoint {
                         self.state = EndpointState::Idle;
                     }
 
+                    // Clear blocked markers before transfer_message (see send()).
+                    (*receiver).blocked_reason = None;
+                    (*receiver).blocked_endpoint = core::ptr::null_mut();
+
                     self.transfer_message(current, receiver, msg, badge);
 
-                    // Wake receiver
-                    (*receiver).state = ThreadState::Ready;
-                    (*receiver).blocked_endpoint = core::ptr::null_mut();
-                    get_scheduler().enqueue(receiver);
+                    // Wake receiver (guard against suspension during cap transfer)
+                    if (*receiver).state != ThreadState::Inactive {
+                        (*receiver).state = ThreadState::Ready;
+                        get_scheduler().enqueue(receiver);
+                    }
 
                     // Caller sleeps until reply_recv() wakes it
                     get_scheduler().reschedule();
@@ -576,13 +595,18 @@ impl Endpoint {
                         self.state = EndpointState::Idle;
                     }
 
+                    // Clear blocked markers before transfer_message (see send()).
+                    (*receiver).blocked_reason = None;
+                    (*receiver).blocked_endpoint = core::ptr::null_mut();
+
                     // Transfer fault message to handler (badge identifies faulting client)
                     self.transfer_message(faulting_tcb, receiver, msg, (*faulting_tcb).fault_handler_badge);
 
-                    // Wake handler
-                    (*receiver).state = ThreadState::Ready;
-                    (*receiver).blocked_endpoint = core::ptr::null_mut();
-                    get_scheduler().enqueue(receiver);
+                    // Wake handler (guard against suspension during cap transfer)
+                    if (*receiver).state != ThreadState::Inactive {
+                        (*receiver).state = ThreadState::Ready;
+                        get_scheduler().enqueue(receiver);
+                    }
                 }
                 _ => {
                     // Slowpath: no handler waiting — queue faulting thread as sender
