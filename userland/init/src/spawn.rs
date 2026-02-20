@@ -736,6 +736,15 @@ unsafe fn map_shared_lib_to_child(
                         &raw mut lib_entry,
                     ) != 0;
 
+                    // Track RW pages mapped so far for this library to
+                    // handle overlapping PT_LOAD segments (lld-20 RELRO
+                    // split produces two RW segments whose page-aligned
+                    // starts can land on the same page).
+                    const MAX_RW_TRACK: usize = 16;
+                    let mut rw_track_vaddr: [u64; MAX_RW_TRACK] = [0; MAX_RW_TRACK];
+                    let mut rw_track_cap: [Cap; MAX_RW_TRACK] = [0; MAX_RW_TRACK];
+                    let mut rw_track_count: usize = 0;
+
                     for si in 0..cl.rw_seg_count as usize {
                         let rw = &cl.rw_segs[si];
                         let seg_start = running_base + rw.vaddr_offset;
@@ -745,6 +754,69 @@ unsafe fn map_shared_lib_to_child(
 
                         let mut page = seg_start;
                         while page < seg_end {
+                            // Check if this page was already mapped by a
+                            // previous RW segment (overlap case).
+                            let mut existing_cap: Cap = 0;
+                            for j in 0..rw_track_count {
+                                if rw_track_vaddr[j] == page {
+                                    existing_cap = rw_track_cap[j];
+                                    break;
+                                }
+                            }
+
+                            if existing_cap != 0 {
+                                // Overlap: scratch-map existing frame, patch
+                                // this segment's data without zeroing, then
+                                // skip the child VSpace map (already mapped).
+                                if lib_found && rw.file_size > 0 {
+                                    let err = invoke::vspace_map(
+                                        CAP_SELF_VSPACE, existing_cap, SCRATCH_VADDR,
+                                        VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+                                    );
+                                    if err != 0 {
+                                        puts(b"[INIT] RW overlap scratch map failed\n");
+                                        return 0;
+                                    }
+
+                                    let scratch = SCRATCH_VADDR as *mut u8;
+                                    let sub_page_off = (rw.seg_vaddr & 0xFFF) as usize;
+                                    let file_off = rw.file_offset as usize;
+                                    let data_len = rw.file_size as usize;
+                                    let page_rel = (page - seg_start) as usize;
+                                    let file_region_start = sub_page_off;
+                                    let file_region_end = sub_page_off + data_len;
+                                    let page_byte_start = page_rel;
+                                    let page_byte_end = page_rel + 4096;
+                                    let copy_start = if page_byte_start > file_region_start {
+                                        page_byte_start
+                                    } else {
+                                        file_region_start
+                                    };
+                                    let copy_end = if page_byte_end < file_region_end {
+                                        page_byte_end
+                                    } else {
+                                        file_region_end
+                                    };
+                                    if copy_start < copy_end {
+                                        let src_off = file_off + (copy_start - sub_page_off);
+                                        let dst_off = copy_start - page_rel;
+                                        let len = copy_end - copy_start;
+                                        if src_off + len <= lib_entry.data_len {
+                                            let src = lib_entry.data.add(src_off);
+                                            let dst = scratch.add(dst_off);
+                                            for j in 0..len {
+                                                core::ptr::write_volatile(dst.add(j), *src.add(j));
+                                            }
+                                        }
+                                    }
+
+                                    invoke::vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
+                                }
+                                page += 4096;
+                                continue;
+                            }
+
+                            // New page: allocate frame, zero, copy, map.
                             let frame_slot = super::init_alloc_frame_slot(core::ptr::null_mut());
                             let mut err = invoke::untyped_retype(root_ut, OBJ_FRAME, 0, frame_slot);
                             if err != 0 {
@@ -826,6 +898,14 @@ unsafe fn map_shared_lib_to_child(
                                 lb.flush();
                                 return 0;
                             }
+
+                            // Record this page for overlap detection
+                            if rw_track_count < MAX_RW_TRACK {
+                                rw_track_vaddr[rw_track_count] = page;
+                                rw_track_cap[rw_track_count] = frame_slot;
+                                rw_track_count += 1;
+                            }
+
                             total_mapped += 1;
                             page += 4096;
                         }

@@ -836,8 +836,13 @@ pub(crate) unsafe fn map_shared_lib_to_vspace(
 }
 
 /// Allocate and populate RW segment pages for a shared library in a child process.
-/// Uses mmsrv MM_MAP_WINDOW to dual-map each page (child + procmgr scratch),
+/// Uses mmsrv MM_MAP_WINDOW to dual-map pages (child + procmgr scratch),
 /// copies .data content from procmgr's own initrd mapping, zeroes BSS, and unmaps scratch.
+///
+/// lld-20 RELRO split can produce multiple RW PT_LOAD segments whose page-aligned
+/// ranges overlap (e.g. seg4 vaddr=0x43000, seg5 vaddr=0x43F20 both page-align to
+/// 0x43000). To avoid AlreadyMapped errors, we merge all RW segments into a single
+/// contiguous page range and call MM_MAP_WINDOW once.
 /// Returns true on success.
 unsafe fn map_rw_segments(
     cl: &CachedLib,
@@ -863,70 +868,89 @@ unsafe fn map_rw_segments(
             return false;
         }
 
+        // Compute the merged page range across all RW segments to handle
+        // overlapping pages from lld-20's RELRO split.
+        let mut merged_start = u64::MAX;
+        let mut merged_end: u64 = 0;
+        let mut merged_flags: u64 = 0;
         for si in 0..cl.rw_seg_count as usize {
             let rw = &cl.rw_segs[si];
             let seg_start = running_base + rw.vaddr_offset;
             let seg_end = (running_base + rw.vaddr_offset
-                + (rw.seg_vaddr & 0xFFF)  // sub-page offset
+                + (rw.seg_vaddr & 0xFFF)
                 + rw.memsz + 0xFFF) & !0xFFFu64;
-            let num_pages = ((seg_end - seg_start) / 4096) as usize;
-            if num_pages == 0 {
+            if seg_start < merged_start { merged_start = seg_start; }
+            if seg_end > merged_end { merged_end = seg_end; }
+            merged_flags |= rw.flags;
+        }
+        if merged_start >= merged_end {
+            return true;
+        }
+        let merged_pages = ((merged_end - merged_start) / 4096) as usize;
+        if merged_pages == 0 {
+            return true;
+        }
+
+        // Single MM_MAP_WINDOW call for the merged range
+        let mut mm_msg = SaltyMsg::zeroed();
+        let mut mm_reply = SaltyMsg::zeroed();
+        mm_msg.label = salty::consts::MM_MAP_WINDOW;
+        mm_msg.length = 5;
+        mm_msg.regs[0] = pid as u64;
+        mm_msg.regs[1] = merged_start;
+        mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
+        mm_msg.regs[3] = merged_pages as u64;
+        mm_msg.regs[4] = merged_flags;
+        salty::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
+        let err = salty::ipc::call_ctx(
+            super::ipc_ctx(), CAP_MMSRV_EP,
+            &raw const mm_msg, &raw mut mm_reply,
+        );
+        if err != 0 || mm_reply.label != SALTY_OK
+            || mm_reply.regs[0] != merged_pages as u64
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] RW MAP_WINDOW failed err=");
+            lb.hex(err as u64);
+            lb.str(b" mapped=");
+            lb.hex(mm_reply.regs[0]);
+            lb.str(b"\n");
+            lb.flush();
+            return false;
+        }
+
+        // Zero the entire merged window
+        let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
+        for j in 0..merged_pages * 4096 {
+            core::ptr::write_volatile(scratch.add(j), 0u8);
+        }
+
+        // Copy file data from each segment at its correct offset
+        for si in 0..cl.rw_seg_count as usize {
+            let rw = &cl.rw_segs[si];
+            if rw.file_size == 0 {
                 continue;
             }
+            let seg_start = running_base + rw.vaddr_offset;
+            let sub_page_off = (rw.seg_vaddr & 0xFFF) as usize;
+            let file_off = rw.file_offset as usize;
+            let copy_len = rw.file_size as usize;
 
-            // Allocate via MM_MAP_WINDOW: dual-mapped to child + procmgr scratch
-            let mut mm_msg = SaltyMsg::zeroed();
-            let mut mm_reply = SaltyMsg::zeroed();
-            mm_msg.label = salty::consts::MM_MAP_WINDOW;
-            mm_msg.length = 5;
-            mm_msg.regs[0] = pid as u64;
-            mm_msg.regs[1] = seg_start;
-            mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
-            mm_msg.regs[3] = num_pages as u64;
-            mm_msg.regs[4] = rw.flags;
-            salty::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-            let err = salty::ipc::call_ctx(
-                super::ipc_ctx(), CAP_MMSRV_EP,
-                &raw const mm_msg, &raw mut mm_reply,
-            );
-            if err != 0 || mm_reply.label != SALTY_OK
-                || mm_reply.regs[0] != num_pages as u64
-            {
-                let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR] RW MAP_WINDOW failed err=");
-                lb.hex(err as u64);
-                lb.str(b" mapped=");
-                lb.hex(mm_reply.regs[0]);
-                lb.str(b"\n");
-                lb.flush();
-                return false;
-            }
+            // Offset into the scratch window: distance from merged_start
+            // to this segment's page-aligned start, plus sub-page offset
+            let window_off = (seg_start - merged_start) as usize + sub_page_off;
 
-            // Zero the entire window first
-            let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
-            for j in 0..num_pages * 4096 {
-                core::ptr::write_volatile(scratch.add(j), 0u8);
-            }
-
-            // Copy file data (.data section content)
-            if rw.file_size > 0 {
-                // Sub-page offset of segment start within the first page
-                let sub_page_off = (rw.seg_vaddr & 0xFFF) as usize;
-                let file_off = rw.file_offset as usize;
-                let copy_len = rw.file_size as usize;
-
-                if file_off + copy_len <= entry.data_len {
-                    let src = entry.data.add(file_off);
-                    let dst = scratch.add(sub_page_off);
-                    for j in 0..copy_len {
-                        core::ptr::write_volatile(dst.add(j), *src.add(j));
-                    }
+            if file_off + copy_len <= entry.data_len {
+                let src = entry.data.add(file_off);
+                let dst = scratch.add(window_off);
+                for j in 0..copy_len {
+                    core::ptr::write_volatile(dst.add(j), *src.add(j));
                 }
             }
-
-            // Unmap scratch window (child mapping persists)
-            unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, num_pages as u64);
         }
+
+        // Unmap scratch window (child mapping persists)
+        unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, merged_pages as u64);
 
         true
     }
