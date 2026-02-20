@@ -11,7 +11,7 @@
  * - A20 line enabled
  * - Interrupts disabled
  * - EDI = Stage2Info physical address (passed on stack in cdecl)
- * - BTX trampoline initialized for BIOS disk access
+ * - BTX is initialized here after selecting a low-memory workspace
  */
 
 #include "../common/types.h"
@@ -20,6 +20,7 @@
 #include "../common/manifest.h"
 #include "../common/bootinfo_tlv.h"
 #include "../common/stage2_info.h"
+#include "../common/arch/x86/bios/v86.h"
 #include "stage3.h"
 #include "config.h"
 #include "elf.h"
@@ -36,6 +37,15 @@
 
 /* Bounce buffer for temporary reads (shared with bios_disk.c) */
 #define BOUNCE_BUF              0x60000
+
+/*
+ * BTX low-memory workspace search window.
+ *
+ * Keep this below manifest/memmap/stage3 load areas, and above the legacy
+ * Stage2 region. We select a usable E820 range inside this window at runtime.
+ */
+#define BTX_WORKSPACE_WINDOW_BASE   0x18000U
+#define BTX_WORKSPACE_WINDOW_LIMIT  0x28000U
 
 /* ELF preread size in sectors */
 #define ELF_PREREAD_SECTORS     8
@@ -72,6 +82,46 @@ static uint64_t total_usable_ram(struct Stage2Info *info)
     return total;
 }
 
+/* Pick a low-memory workspace for BTX from the BIOS E820 map. */
+static uint32_t alloc_btx_workspace(const struct Stage2Info *info)
+{
+    if (!info || info->memmap_format != MEMMAP_FORMAT_E820 ||
+        info->memmap_count == 0) {
+        return 0;
+    }
+
+    const struct E820Entry *entries =
+        (const struct E820Entry *)(uintptr_t)info->memmap_addr;
+
+    for (uint32_t i = 0; i < info->memmap_count; i++) {
+        if (entries[i].type != 1)  /* E820_USABLE */
+            continue;
+
+        uint64_t region_base = entries[i].base;
+        uint64_t region_end = entries[i].base + entries[i].length;
+        if (region_end <= region_base)
+            continue;
+
+        if (region_end <= BTX_WORKSPACE_WINDOW_BASE ||
+            region_base >= BTX_WORKSPACE_WINDOW_LIMIT) {
+            continue;
+        }
+
+        if (region_base < BTX_WORKSPACE_WINDOW_BASE)
+            region_base = BTX_WORKSPACE_WINDOW_BASE;
+        if (region_end > BTX_WORKSPACE_WINDOW_LIMIT)
+            region_end = BTX_WORKSPACE_WINDOW_LIMIT;
+
+        uint32_t candidate =
+            (uint32_t)ALIGN_UP((uint32_t)region_base, V86_WORKSPACE_ALIGN);
+
+        if ((uint64_t)candidate + V86_WORKSPACE_SIZE <= region_end)
+            return candidate;
+    }
+
+    return 0;
+}
+
 /*
  * Stage 3 main entry point
  *
@@ -99,6 +149,15 @@ void stage3_entry(struct Stage2Info *info)
         stage3_panic("Invalid Stage2Info");
     }
 
+    uint32_t btx_workspace = alloc_btx_workspace(info);
+    if (btx_workspace == 0) {
+        stage3_panic("Failed to allocate BTX workspace");
+    }
+
+    if (v86_init(btx_workspace, V86_WORKSPACE_SIZE) != 0) {
+        stage3_panic("Failed to initialize BTX");
+    }
+
 #if CONFIG_DEBUG
     print_str("Stage2Info at ");
     print_hex((uintptr_t)info, 8);
@@ -106,6 +165,8 @@ void stage3_entry(struct Stage2Info *info)
     print_dec(info->boot_mode);
     print_str(" memmap_count=");
     print_dec(info->memmap_count);
+    print_str(" btx_ws=");
+    print_hex(btx_workspace, 8);
     print_char('\n');
 #endif
 

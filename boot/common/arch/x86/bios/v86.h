@@ -73,12 +73,25 @@ extern struct V86Regs v86;
 void v86int(void);
 
 /*
- * Initialize V86/BTX subsystem
+ * Low-memory workspace requirements for BTX PM<->RM transitions.
  *
- * Sets up TSS, IDT, and other structures needed for V86 mode.
- * Must be called once before any v86int() calls.
+ * The workspace must be:
+ * - below 1MB
+ * - paragraph-aligned (16 bytes)
+ * - at least V86_WORKSPACE_SIZE bytes
  */
-void v86_init(void);
+#define V86_WORKSPACE_ALIGN  16U
+#define V86_WORKSPACE_SIZE   0x1000U
+
+/*
+ * Initialize V86/BTX subsystem.
+ *
+ * @param workspace_base: Physical base address of low-memory workspace.
+ * @param workspace_size: Size of workspace in bytes.
+ *
+ * Returns: 0 on success, -1 on failure.
+ */
+int v86_init(uint32_t workspace_base, uint32_t workspace_size);
 
 /* ========================================================================= */
 /* Convenience macros for common BIOS calls                                  */
@@ -87,8 +100,8 @@ void v86_init(void);
 /*
  * Convert linear address to segment:offset
  */
-#define VTOPSEG(addr)   (((uint32_t)(addr) >> 4) & 0xF000)
-#define VTOPOFF(addr)   ((uint32_t)(addr) & 0xFFFF)
+#define VTOPSEG(addr)   (((uint32_t)(addr) >> 4) & 0xFFFF)
+#define VTOPOFF(addr)   ((uint32_t)(addr) & 0xF)
 
 /*
  * Convert segment:offset to linear address

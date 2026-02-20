@@ -568,6 +568,7 @@ build_stage2_info:
     mov     di, STAGE2_INFO_ADDR
 
     ; Clear the structure
+    cld
     mov     cx, 256 / 2
     xor     ax, ax
     rep     stosw

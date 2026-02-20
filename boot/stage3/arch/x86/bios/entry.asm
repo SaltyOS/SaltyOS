@@ -37,6 +37,7 @@ _start:
     extern __bss_start
     extern __bss_end
 
+    cld                             ; Ensure forward direction for rep stosb
     mov     edi, __bss_start
     mov     ecx, __bss_end
     sub     ecx, edi
@@ -53,11 +54,6 @@ _start:
     ; Set up our own stack
     extern __stack_top
     mov     esp, __stack_top
-
-    ; Initialize V86/BTX subsystem for BIOS calls
-    ; This sets up GDT, IDT, TSS for V86 mode
-    extern  v86_init
-    call    v86_init
 
     ; Call C entry point
     ; In 32-bit cdecl, first argument goes on stack

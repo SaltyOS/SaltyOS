@@ -16,12 +16,18 @@ int bios_disk_read(uint8_t drive, uint64_t lba, uint16_t count, void *buffer)
     /* DAP must be in low memory (below 1MB) */
     volatile struct DiskAddressPacket *dap =
         (volatile struct DiskAddressPacket *)0x6E00;
+    uintptr_t addr = (uintptr_t)buffer;
 
     dap->size = 16;
     dap->reserved = 0;
     dap->count = count;
-    dap->offset = (uint16_t)((uintptr_t)buffer & 0xFFFF);
-    dap->segment = (uint16_t)(((uintptr_t)buffer >> 4) & 0xF000);
+    /*
+     * Use canonical 16:4 real-mode addressing (segment = linear >> 4,
+     * offset = linear & 0xF). This matches Stage 2 and avoids BIOS edge
+     * cases with large offsets near 64K boundaries.
+     */
+    dap->offset = (uint16_t)(addr & 0xF);
+    dap->segment = (uint16_t)((addr >> 4) & 0xFFFF);
     dap->lba = lba;
 
     v86.ctl = V86_FLAGS;

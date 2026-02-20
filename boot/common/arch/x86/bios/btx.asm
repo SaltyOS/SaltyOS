@@ -11,7 +11,8 @@
 ; use call32(), SMM, or whatever it needs. This is the same pattern
 ; used by GRUB and other production bootloaders.
 ;
-; API: v86_init(), v86int(), and the v86 register struct are unchanged.
+; API: v86_init(workspace_base, workspace_size), v86int(), and the v86
+; register struct are unchanged.
 ;
 
 [BITS 32]
@@ -20,14 +21,17 @@
 ; Constants
 ; =============================================================================
 
-; Low-memory layout for PM <-> RM communication
-REG_BUF         equ 0x0500      ; Register buffer (52 bytes)
-SAVED_GDTR      equ 0x0540      ; Saved PM GDTR (6 bytes)
-SAVED_IDTR      equ 0x0548      ; Saved PM IDTR (6 bytes)
-SAVED_ESP       equ 0x0550      ; Saved PM ESP (4 bytes)
-SAVED_SS        equ 0x0554      ; Saved PM SS (4 bytes)
-RM_IDTR         equ 0x0590      ; Real-mode IDTR (6 bytes)
-TRAMPOLINE      equ 0x0600      ; Real-mode trampoline destination
+; Low-memory workspace layout (all offsets are relative to workspace base).
+REG_BUF_OFF         equ 0x000       ; Register buffer (52 bytes)
+SAVED_GDTR_OFF      equ 0x040       ; Saved PM GDTR (6 bytes)
+SAVED_IDTR_OFF      equ 0x048       ; Saved PM IDTR (6 bytes)
+SAVED_ESP_OFF       equ 0x050       ; Saved PM ESP (4 bytes)
+SAVED_SS_OFF        equ 0x054       ; Saved PM SS (4 bytes)
+RM_IDTR_OFF         equ 0x090       ; Real-mode IDTR (6 bytes)
+PM16_BRIDGE_OFF     equ 0x0C0       ; 16-bit PM->RM bridge destination
+TRAMPOLINE_OFF      equ 0x100       ; Real-mode trampoline destination
+RM_STACK_TOP_OFF    equ 0x0FF0      ; Temporary real-mode stack top
+WORKSPACE_MIN_SIZE  equ 0x1000
 
 ; GDT selectors (transition GDT)
 SEL_CODE32      equ 0x08        ; 32-bit code, flat 4GB, DPL=0
@@ -52,7 +56,7 @@ V86_FS          equ 0x30
 V86_GS          equ 0x34
 V86_EFL         equ 0x38
 
-; Register buffer offsets (at REG_BUF = 0x500)
+; Register buffer offsets (at REG_BUF_OFF)
 BUF_EAX         equ 0x00
 BUF_ECX         equ 0x04
 BUF_EDX         equ 0x08
@@ -96,6 +100,18 @@ v86:
 pm_esp:         dd 0
 pm_ss:          dd 0
 
+; Runtime-selected low-memory workspace metadata
+ws_base:            dd 0
+ws_seg:             dd 0
+ws_reg_buf_ptr:     dd 0
+ws_saved_gdtr_ptr:  dd 0
+ws_saved_idtr_ptr:  dd 0
+ws_saved_esp_ptr:   dd 0
+ws_saved_ss_ptr:    dd 0
+ws_rm_idtr_ptr:     dd 0
+ws_pm16_ptr:        dd 0
+ws_tramp_ptr:       dd 0
+
 ; =============================================================================
 ; BSS Section
 ; =============================================================================
@@ -121,8 +137,15 @@ section .text
 ; -----------------------------------------------------------------------------
 ; v86_init - Initialize BTX subsystem for real-mode BIOS callbacks
 ;
-; Sets up the transition GDT (with 16-bit entries), writes the real-mode
-; IDTR to low memory, and copies the trampoline code to 0x0600.
+; Args (cdecl):
+;   [ebp+8]  = workspace_base (physical, < 1MB, 16-byte aligned)
+;   [ebp+12] = workspace_size
+;
+; Sets up the transition GDT and initializes runtime-selected workspace
+; pointers for PM <-> RM transitions.
+;
+; Returns:
+;   eax = 0 on success, -1 on failure
 ; -----------------------------------------------------------------------------
 global v86_init
 v86_init:
@@ -131,6 +154,47 @@ v86_init:
     push    ebx
     push    esi
     push    edi
+
+    cld                             ; Ensure forward direction for string ops
+
+    ; Validate workspace arguments.
+    mov     eax, [ebp + 8]          ; workspace_base
+    mov     edx, [ebp + 12]         ; workspace_size
+
+    test    eax, 0xF                ; paragraph alignment
+    jnz     .fail
+
+    cmp     edx, WORKSPACE_MIN_SIZE
+    jb      .fail
+
+    lea     ecx, [eax + WORKSPACE_MIN_SIZE]
+    cmp     ecx, eax                ; overflow check
+    jb      .fail
+    cmp     ecx, 0x000A0000         ; below VGA window
+    ja      .fail
+
+    ; Cache workspace metadata and pointers.
+    mov     [ws_base], eax
+    mov     ecx, eax
+    shr     ecx, 4
+    mov     [ws_seg], ecx
+
+    lea     ecx, [eax + REG_BUF_OFF]
+    mov     [ws_reg_buf_ptr], ecx
+    lea     ecx, [eax + SAVED_GDTR_OFF]
+    mov     [ws_saved_gdtr_ptr], ecx
+    lea     ecx, [eax + SAVED_IDTR_OFF]
+    mov     [ws_saved_idtr_ptr], ecx
+    lea     ecx, [eax + SAVED_ESP_OFF]
+    mov     [ws_saved_esp_ptr], ecx
+    lea     ecx, [eax + SAVED_SS_OFF]
+    mov     [ws_saved_ss_ptr], ecx
+    lea     ecx, [eax + RM_IDTR_OFF]
+    mov     [ws_rm_idtr_ptr], ecx
+    lea     ecx, [eax + PM16_BRIDGE_OFF]
+    mov     [ws_pm16_ptr], ecx
+    lea     ecx, [eax + TRAMPOLINE_OFF]
+    mov     [ws_tramp_ptr], ecx
 
     ; --- Set up transition GDT ---
 
@@ -150,13 +214,36 @@ v86_init:
     mov     dword [trans_gdt + 0x10], 0x0000FFFF
     mov     dword [trans_gdt + 0x14], 0x00CF9200
 
-    ; Entry 3 (0x18): 16-bit code - base=0, limit=0xFFFFF, byte gran, DPL=0
-    mov     dword [trans_gdt + 0x18], 0x0000FFFF
-    mov     dword [trans_gdt + 0x1C], 0x000F9A00
+    ; Entry 3 (0x18): 16-bit code - base=workspace, limit=0xFFFFF, byte gran
+    ;
+    ; GDT base encoding: bits 31:24 are implicitly zero because `and eax, 0xFF`
+    ; discards them. This is correct because the workspace is required to be
+    ; below 0xA0000 (< 1MB), well within the 16MB limit of this encoding.
+    mov     ebx, [ws_base]
+    mov     eax, ebx
+    shl     eax, 16
+    and     eax, 0xFFFF0000
+    or      eax, 0x0000FFFF
+    mov     dword [trans_gdt + 0x18], eax
 
-    ; Entry 4 (0x20): 16-bit data - base=0, limit=0xFFFFF, byte gran, DPL=0
-    mov     dword [trans_gdt + 0x20], 0x0000FFFF
-    mov     dword [trans_gdt + 0x24], 0x000F9200
+    mov     eax, ebx
+    shr     eax, 16
+    and     eax, 0xFF
+    or      eax, 0x000F9A00
+    mov     dword [trans_gdt + 0x1C], eax
+
+    ; Entry 4 (0x20): 16-bit data - base=workspace, limit=0xFFFFF, byte gran
+    mov     eax, ebx
+    shl     eax, 16
+    and     eax, 0xFFFF0000
+    or      eax, 0x0000FFFF
+    mov     dword [trans_gdt + 0x20], eax
+
+    mov     eax, ebx
+    shr     eax, 16
+    and     eax, 0xFF
+    or      eax, 0x000F9200
+    mov     dword [trans_gdt + 0x24], eax
 
     ; Load transition GDT
     mov     word [trans_gdtr], trans_gdt_end - trans_gdt - 1
@@ -175,16 +262,46 @@ v86_init:
     mov     gs, ax
     mov     ss, ax
 
-    ; --- Write real-mode IDTR to low memory (0x0590) ---
-    mov     word [RM_IDTR], 0x03FF
-    mov     dword [RM_IDTR + 2], 0x00000000
+    ; --- Write real-mode IDTR to workspace ---
+    mov     edi, [ws_rm_idtr_ptr]
+    mov     word [edi], 0x03FF
+    mov     dword [edi + 2], 0x00000000
 
-    ; --- Copy trampoline to 0x0600 ---
+    ; --- Copy 16-bit PM bridge into workspace ---
+    mov     esi, pm16_entry
+    mov     edi, [ws_pm16_ptr]
+    mov     ecx, pm16_entry_end - pm16_entry
+    rep     movsb
+
+    ; --- Copy trampoline into workspace ---
     mov     esi, rm_trampoline
-    mov     edi, TRAMPOLINE
+    mov     edi, [ws_tramp_ptr]
     mov     ecx, rm_trampoline_end - rm_trampoline
     rep     movsb
 
+    ; Patch PM16 RM jump segment with runtime workspace segment.
+    mov     edi, [ws_pm16_ptr]
+    mov     ax, [ws_seg]
+    mov     [edi + (pm16_rm_jump - pm16_entry) + 3], ax
+
+    xor     eax, eax
+    jmp     .done
+
+.fail:
+    xor     eax, eax
+    mov     [ws_base], eax
+    mov     [ws_seg], eax
+    mov     [ws_reg_buf_ptr], eax
+    mov     [ws_saved_gdtr_ptr], eax
+    mov     [ws_saved_idtr_ptr], eax
+    mov     [ws_saved_esp_ptr], eax
+    mov     [ws_saved_ss_ptr], eax
+    mov     [ws_rm_idtr_ptr], eax
+    mov     [ws_pm16_ptr], eax
+    mov     [ws_tramp_ptr], eax
+    mov     eax, -1
+
+.done:
     pop     edi
     pop     esi
     pop     ebx
@@ -206,6 +323,15 @@ v86int:
     push    edi
     pushfd
 
+    ; v86_init() must run first.
+    cmp     dword [ws_base], 0
+    jne     .have_workspace
+
+    ; Surface failure to callers via carry flag in v86.efl.
+    mov     dword [v86 + V86_EFL], 1
+    jmp     .return
+
+.have_workspace:
     cli
 
     ; Save current GDT and IDT
@@ -216,58 +342,94 @@ v86int:
     mov     [pm_esp], esp
     mov     [pm_ss], ss
 
-    ; Copy PM state to low memory so trampoline can restore it
+    ; Copy PM state to workspace so trampoline can restore it
+    mov     edi, [ws_saved_gdtr_ptr]
     mov     eax, [saved_gdtr]
-    mov     [SAVED_GDTR], eax
+    mov     [edi], eax
     mov     ax, [saved_gdtr + 4]
-    mov     [SAVED_GDTR + 4], ax
+    mov     [edi + 4], ax
 
+    mov     edi, [ws_saved_idtr_ptr]
     mov     eax, [saved_idtr]
-    mov     [SAVED_IDTR], eax
+    mov     [edi], eax
     mov     ax, [saved_idtr + 4]
-    mov     [SAVED_IDTR + 4], ax
+    mov     [edi + 4], ax
 
+    mov     edi, [ws_saved_esp_ptr]
     mov     eax, [pm_esp]
-    mov     [SAVED_ESP], eax
+    mov     [edi], eax
+    mov     edi, [ws_saved_ss_ptr]
     mov     eax, [pm_ss]
-    mov     [SAVED_SS], eax
+    mov     [edi], eax
 
-    ; Copy v86 register fields to low-memory buffer at 0x500
+    ; Copy v86 register fields into workspace register buffer.
+    mov     edi, [ws_reg_buf_ptr]
     mov     eax, [v86 + V86_EAX]
-    mov     [REG_BUF + BUF_EAX], eax
+    mov     [edi + BUF_EAX], eax
     mov     eax, [v86 + V86_ECX]
-    mov     [REG_BUF + BUF_ECX], eax
+    mov     [edi + BUF_ECX], eax
     mov     eax, [v86 + V86_EDX]
-    mov     [REG_BUF + BUF_EDX], eax
+    mov     [edi + BUF_EDX], eax
     mov     eax, [v86 + V86_EBX]
-    mov     [REG_BUF + BUF_EBX], eax
+    mov     [edi + BUF_EBX], eax
     mov     eax, [v86 + V86_ESP]
-    mov     [REG_BUF + BUF_ESP], eax
+    mov     [edi + BUF_ESP], eax
     mov     eax, [v86 + V86_EBP]
-    mov     [REG_BUF + BUF_EBP], eax
+    mov     [edi + BUF_EBP], eax
     mov     eax, [v86 + V86_ESI]
-    mov     [REG_BUF + BUF_ESI], eax
+    mov     [edi + BUF_ESI], eax
     mov     eax, [v86 + V86_EDI]
-    mov     [REG_BUF + BUF_EDI], eax
-
+    mov     [edi + BUF_EDI], eax
     mov     eax, [v86 + V86_DS]
-    mov     [REG_BUF + BUF_DS], eax
+    mov     [edi + BUF_DS], eax
     mov     eax, [v86 + V86_ES]
-    mov     [REG_BUF + BUF_ES], eax
+    mov     [edi + BUF_ES], eax
     mov     eax, [v86 + V86_FS]
-    mov     [REG_BUF + BUF_FS], eax
+    mov     [edi + BUF_FS], eax
     mov     eax, [v86 + V86_GS]
-    mov     [REG_BUF + BUF_GS], eax
+    mov     [edi + BUF_GS], eax
 
-    ; Patch INT number in trampoline (at the copied location in low memory)
+    ; Re-copy bridge/trampoline into workspace.
+    cld
+    mov     esi, pm16_entry
+    mov     edi, [ws_pm16_ptr]
+    mov     ecx, pm16_entry_end - pm16_entry
+    rep     movsb
+
+    mov     esi, rm_trampoline
+    mov     edi, [ws_tramp_ptr]
+    mov     ecx, rm_trampoline_end - rm_trampoline
+    rep     movsb
+
+    ; Refresh RM IDTR (workspace may be clobbered by firmware).
+    mov     edi, [ws_rm_idtr_ptr]
+    mov     word [edi], 0x03FF
+    mov     dword [edi + 2], 0x00000000
+
+    ; Patch PM16 bridge jump segment with runtime workspace segment.
+    mov     edi, [ws_pm16_ptr]
+    mov     ax, [ws_seg]
+    mov     [edi + (pm16_rm_jump - pm16_entry) + 3], ax
+
+    ; Patch INT number in copied trampoline.
+    mov     edi, [ws_tramp_ptr]
     mov     al, [v86 + V86_ADDR]
-    mov     [TRAMPOLINE + (rm_int_patch - rm_trampoline) + 1], al
+    mov     [edi + (rm_int_patch - rm_trampoline) + 1], al
 
     ; Load transition GDT
     lgdt    [trans_gdtr]
 
-    ; Far jump to 16-bit protected mode code
-    jmp     SEL_CODE16:pm16_entry
+    ; Far jump to 16-bit bridge (descriptor base points to workspace).
+    jmp     SEL_CODE16:PM16_BRIDGE_OFF
+
+.return:
+    ; Restore callee-saved registers and return
+    popfd
+    pop     edi
+    pop     esi
+    pop     ebx
+    pop     ebp
+    ret
 
 ; -----------------------------------------------------------------------------
 ; 16-bit protected mode bridge
@@ -288,52 +450,56 @@ pm16_entry:
     and     al, 0xFE
     mov     cr0, eax
 
-    ; Far jump to real-mode trampoline at 0x0600
-    jmp     0x0000:TRAMPOLINE
+    ; Far jump to real-mode trampoline in runtime-selected workspace.
+    ; Segment is patched at runtime by v86_init()/v86int().
+pm16_rm_jump:
+    jmp     0x0000:TRAMPOLINE_OFF
+pm16_entry_end:
 
 ; =============================================================================
-; Real-mode trampoline (copied to 0x0600 at init time)
+; Real-mode trampoline (copied into workspace and refreshed each call)
 ;
-; Runs in genuine real mode. Loads registers from buffer at 0x500,
+; Runs in genuine real mode. Loads registers from workspace buffer,
 ; executes the BIOS interrupt, saves results, re-enters protected mode.
 ; =============================================================================
 rm_trampoline:
-    ; Set up real-mode segments and stack
-    xor     ax, ax
+    ; Set up real-mode segments and stack using workspace segment.
+    push    cs
+    pop     ax
     mov     ds, ax
     mov     es, ax
     mov     fs, ax
     mov     gs, ax
     mov     ss, ax
-    mov     sp, 0x7C00
+    mov     sp, RM_STACK_TOP_OFF
 
     ; Load real-mode IVT
-    lidt    [0x0590]
+    lidt    [RM_IDTR_OFF]
 
-    ; Load GPRs from register buffer at 0x500
-    mov     ecx, [0x0500 + BUF_ECX]
-    mov     edx, [0x0500 + BUF_EDX]
-    mov     ebx, [0x0500 + BUF_EBX]
-    mov     ebp, [0x0500 + BUF_EBP]
-    mov     esi, [0x0500 + BUF_ESI]
-    mov     edi, [0x0500 + BUF_EDI]
+    ; Load GPRs from workspace register buffer.
+    mov     ecx, [REG_BUF_OFF + BUF_ECX]
+    mov     edx, [REG_BUF_OFF + BUF_EDX]
+    mov     ebx, [REG_BUF_OFF + BUF_EBX]
+    mov     ebp, [REG_BUF_OFF + BUF_EBP]
+    mov     esi, [REG_BUF_OFF + BUF_ESI]
+    mov     edi, [REG_BUF_OFF + BUF_EDI]
 
-    ; Load segment registers (while DS=0 for buffer access)
-    mov     es, [0x0500 + BUF_ES]
-    mov     fs, [0x0500 + BUF_FS]
-    mov     gs, [0x0500 + BUF_GS]
+    ; Load segment registers (while DS=workspace segment for buffer access).
+    mov     es, [REG_BUF_OFF + BUF_ES]
+    mov     fs, [REG_BUF_OFF + BUF_FS]
+    mov     gs, [REG_BUF_OFF + BUF_GS]
 
-    ; Push target DS value (while DS still =0)
-    push    word [0x0500 + BUF_DS]
+    ; Push target DS value.
+    push    word [REG_BUF_OFF + BUF_DS]
 
     ; Load EAX last
-    mov     eax, [0x0500 + BUF_EAX]
+    mov     eax, [REG_BUF_OFF + BUF_EAX]
 
     ; Load DS from stack
     pop     ds
 
-    ; Execute BIOS interrupt
-    sti
+    ; Execute BIOS interrupt with IRQs masked in this transition window.
+    ; This avoids timer IRQ re-entry while PM/RM state is half-switched.
 rm_int_patch:
     int     0x00                    ; Patched with actual INT number
     cli
@@ -342,7 +508,8 @@ rm_int_patch:
     ; MOV does not modify flags, so EFLAGS from BIOS call are preserved.
     ; CLI does not modify arithmetic flags (CF, ZF, SF, OF, PF).
     ;
-    ; Save EAX and DS first (we need EAX as scratch and DS=0 for buffer).
+    ; Save EAX and DS first (we need EAX as scratch and then restore DS
+    ; to the workspace segment for buffer access).
     ; Use the stack (PUSH doesn't modify flags either).
     push    eax                     ; Save BIOS return EAX (4 bytes)
     push    ds                      ; Save BIOS return DS  (2 bytes)
@@ -350,8 +517,9 @@ rm_int_patch:
     ; Now save EFLAGS (still pristine from BIOS call)
     pushfd                          ; Save EFLAGS (4 bytes)
 
-    ; Set DS=0 for buffer access (MOV doesn't modify flags)
-    mov     ax, 0
+    ; Set DS=workspace segment for buffer access (MOV doesn't modify flags)
+    push    cs
+    pop     ax
     mov     ds, ax
 
     ; Stack layout (SP grows down):
@@ -360,30 +528,33 @@ rm_int_patch:
     ;   [SP+6]  = EAX     (4 bytes, from push eax)
 
     ; Store EFLAGS from stack
-    pop     dword [0x0500 + BUF_EFL]    ; Pop 4 bytes (pushfd result)
+    pop     dword [REG_BUF_OFF + BUF_EFL]    ; Pop 4 bytes (pushfd result)
 
     ; Store DS from stack (16-bit pop; upper 16 bits of dword slot are
     ; already zero from the v86int pre-copy of the C-set segment value)
-    pop     word [0x0500 + BUF_DS]      ; Pop 2 bytes
+    pop     word [REG_BUF_OFF + BUF_DS]      ; Pop 2 bytes
 
     ; Store EAX from stack
-    pop     dword [0x0500 + BUF_EAX]    ; Pop 4 bytes
+    pop     dword [REG_BUF_OFF + BUF_EAX]    ; Pop 4 bytes
 
     ; Store remaining GPRs (still have original BIOS return values)
-    mov     [0x0500 + BUF_ECX], ecx
-    mov     [0x0500 + BUF_EDX], edx
-    mov     [0x0500 + BUF_EBX], ebx
-    mov     [0x0500 + BUF_EBP], ebp
-    mov     [0x0500 + BUF_ESI], esi
-    mov     [0x0500 + BUF_EDI], edi
+    mov     [REG_BUF_OFF + BUF_ECX], ecx
+    mov     [REG_BUF_OFF + BUF_EDX], edx
+    mov     [REG_BUF_OFF + BUF_EBX], ebx
+    mov     [REG_BUF_OFF + BUF_EBP], ebp
+    mov     [REG_BUF_OFF + BUF_ESI], esi
+    mov     [REG_BUF_OFF + BUF_EDI], edi
 
     ; Store segment registers (16-bit stores; upper halves already zero)
-    mov     [0x0500 + BUF_ES], es
-    mov     [0x0500 + BUF_FS], fs
-    mov     [0x0500 + BUF_GS], gs
+    mov     [REG_BUF_OFF + BUF_ES], es
+    mov     [REG_BUF_OFF + BUF_FS], fs
+    mov     [REG_BUF_OFF + BUF_GS], gs
 
     ; Re-enter protected mode
-    lgdt    [0x0540]                ; Restore PM GDTR
+    lgdt    [SAVED_GDTR_OFF]        ; Restore PM GDTR
+    ; Preload PM IDT before setting PE to avoid a tiny window where
+    ; PE=1 but IDT still points at the real-mode IVT.
+    lidt    [SAVED_IDTR_OFF]
 
     mov     eax, cr0
     or      al, 1
@@ -400,6 +571,9 @@ rm_trampoline_end:
 ; =============================================================================
 [BITS 32]
 pm32_return:
+    cli
+    cld
+
     ; Reload 32-bit data segments
     mov     ax, SEL_DATA32
     mov     ds, ax
@@ -407,39 +581,45 @@ pm32_return:
     mov     fs, ax
     mov     gs, ax
 
-    ; Restore IDTR
-    lidt    [SAVED_IDTR]
-
-    ; Restore PM stack
-    mov     ss, [SAVED_SS]
-    mov     esp, [SAVED_ESP]
+    ; Restore PM stack.
+    ; Preload both SS and ESP values so that `mov esp` is the very next
+    ; instruction after `mov ss`, staying within the 1-instruction IRQ
+    ; inhibition window. (PM IDTR was already restored by the trampoline
+    ; at SAVED_IDTR_OFF before re-entering protected mode.)
+    mov     ebx, [ws_saved_esp_ptr]
+    mov     ebx, [ebx]             ; preload ESP value
+    mov     eax, [ws_saved_ss_ptr]
+    mov     ax, [eax]              ; preload SS value
+    mov     ss, ax                 ; SS updated — next insn is IRQ-inhibited
+    mov     esp, ebx               ; ESP set within inhibition window
 
     ; Copy register buffer back to v86 struct
-    mov     eax, [REG_BUF + BUF_EAX]
+    mov     esi, [ws_reg_buf_ptr]
+    mov     eax, [esi + BUF_EAX]
     mov     [v86 + V86_EAX], eax
-    mov     eax, [REG_BUF + BUF_ECX]
+    mov     eax, [esi + BUF_ECX]
     mov     [v86 + V86_ECX], eax
-    mov     eax, [REG_BUF + BUF_EDX]
+    mov     eax, [esi + BUF_EDX]
     mov     [v86 + V86_EDX], eax
-    mov     eax, [REG_BUF + BUF_EBX]
+    mov     eax, [esi + BUF_EBX]
     mov     [v86 + V86_EBX], eax
-    mov     eax, [REG_BUF + BUF_EBP]
+    mov     eax, [esi + BUF_EBP]
     mov     [v86 + V86_EBP], eax
-    mov     eax, [REG_BUF + BUF_ESI]
+    mov     eax, [esi + BUF_ESI]
     mov     [v86 + V86_ESI], eax
-    mov     eax, [REG_BUF + BUF_EDI]
+    mov     eax, [esi + BUF_EDI]
     mov     [v86 + V86_EDI], eax
 
-    mov     eax, [REG_BUF + BUF_DS]
+    mov     eax, [esi + BUF_DS]
     mov     [v86 + V86_DS], eax
-    mov     eax, [REG_BUF + BUF_ES]
+    mov     eax, [esi + BUF_ES]
     mov     [v86 + V86_ES], eax
-    mov     eax, [REG_BUF + BUF_FS]
+    mov     eax, [esi + BUF_FS]
     mov     [v86 + V86_FS], eax
-    mov     eax, [REG_BUF + BUF_GS]
+    mov     eax, [esi + BUF_GS]
     mov     [v86 + V86_GS], eax
 
-    mov     eax, [REG_BUF + BUF_EFL]
+    mov     eax, [esi + BUF_EFL]
     mov     [v86 + V86_EFL], eax
 
     ; Restore callee-saved registers and return

@@ -18,7 +18,7 @@
  *
  * Must be called from protected mode before any BIOS calls.
  */
-#define btx_init() v86_init()
+#define btx_init(base, size) v86_init((base), (size))
 
 /*
  * Convenience function: INT 13h extended read
