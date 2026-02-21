@@ -345,6 +345,8 @@ pub const POSIX_PM_GETPGID_BADGE: u64 = 23;
 pub const POSIX_PM_GETSID_BADGE: u64 = 24;
 pub const POSIX_PM_KILL_PGID: u64 = 25;
 pub const POSIX_PM_INJECT_CAP: u64 = 26;
+pub const POSIX_PM_LIST_PIDS: u64 = 27;
+pub const POSIX_PM_GET_PROC_INFO: u64 = 28;
 // Deterministic CNode slots for CSpace expansion (root slots 1008-1015)
 pub const CSPACE_EXPAND_BASE: u64 = 1008;
 pub const MAX_CSPACE_EXPANSIONS: usize = 8;
@@ -366,6 +368,7 @@ pub const MM_SHM_UNMAP: u64 = 0x8C;
 pub const MM_FORK_REGIONS: u64 = 0x8D;
 pub const MM_ALLOC_THREAD_OBJECTS: u64 = 0x8E;
 pub const MM_FREE_THREAD_OBJECTS: u64 = 0x8F;
+pub const MM_GET_CLIENT_STATS: u64 = 0x90;
 
 /// Name service IPC protocol labels (register/lookup endpoint by name).
 pub const POSIX_NS_REGISTER: u64 = 1;
@@ -394,6 +397,7 @@ pub const S_IFCHR: u64 = 0o020000;
 pub const S_IFREG: u64 = 0o100000;
 pub const S_IFSOCK: u64 = 0o140000;
 pub const S_IFIFO: u64 = 0o010000;
+pub const S_IFLNK: u64 = 0o120000;
 
 // Access mode flags
 pub const F_OK: u64 = 0;
@@ -406,6 +410,7 @@ pub const DT_DIR: u8 = 4;
 pub const DT_CHR: u8 = 2;
 pub const DT_SOCK: u8 = 12;
 pub const DT_FIFO: u8 = 1;
+pub const DT_LNK: u8 = 10;
 
 // waitpid options
 pub const WNOHANG: u64 = 1;

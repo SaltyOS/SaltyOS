@@ -34,6 +34,12 @@ use salty::types::*;
 use spawn::ExtraCapCopy;
 
 // ======================================================================
+// Globals (BSS) — too large for the 16 KiB stack
+// ======================================================================
+
+static mut SVC_MGR: svc_mgr::ServiceManager = svc_mgr::ServiceManager::new();
+
+// ======================================================================
 // Constants
 // ======================================================================
 
@@ -880,8 +886,9 @@ pub extern "C" fn _start() -> ! {
     }
 
     // Load service definitions from CPIO
-    let mut mgr = svc_mgr::ServiceManager::new();
-    unsafe { load_service_defs(&mut mgr) };
+    // ServiceManager is ~20 KiB — lives in BSS (static) to avoid stack overflow.
+    let mgr = unsafe { &mut *core::ptr::addr_of_mut!(SVC_MGR) };
+    unsafe { load_service_defs(mgr) };
 
     if mgr.count == 0 {
         puts(b"[INIT] No service definitions found in initrd\n");
@@ -926,12 +933,12 @@ pub extern "C" fn _start() -> ! {
     }
 
     // Pre-create endpoints for socket activation (before any service spawns)
-    unsafe { pre_create_endpoints(&mut mgr, ut) };
+    unsafe { pre_create_endpoints(mgr, ut) };
 
     // Boot services in topological order
-    let pm_ep = unsafe { boot_services(&mut mgr, ut, total_usable) };
+    let pm_ep = unsafe { boot_services(mgr, ut, total_usable) };
 
     // Service monitor loop
     puts(b"[INIT] Entering service monitor loop\n");
-    unsafe { service_monitor(&mut mgr, pm_ep) };
+    unsafe { service_monitor(mgr, pm_ep) };
 }

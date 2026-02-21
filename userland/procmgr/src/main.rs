@@ -65,6 +65,8 @@ const PM_GETPGID_BADGE: u64 = 23;
 const PM_GETSID_BADGE: u64 = 24;
 const PM_KILL_PGID: u64 = 25;
 const PM_INJECT_CAP: u64 = 26;
+const PM_LIST_PIDS: u64 = 27;
+const PM_GET_PROC_INFO: u64 = 28;
 const SALTY_PENDING: u64 = 0x80;
 
 const PM_SIGKILL: usize = 9;
@@ -1800,6 +1802,17 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         proctab(idx).lib_map = shared_lib_map;
         proctab(idx).layout = layout;
 
+        // Update process name from exec binary
+        {
+            let name_copy = if name_len > 31 { 31 } else { name_len };
+            for i in 0..name_copy {
+                proctab(idx).name[i] = name[i];
+            }
+            for i in name_copy..32 {
+                proctab(idx).name[i] = 0;
+            }
+        }
+
         { let mut lb = LineBuf::new();
         lb.str(b"[PROCMGR] EXEC: PID="); lb.hex(proctab(idx).pid as u64);
         lb.str(b" -> entry="); lb.hex(new_entry); lb.str(b"\n"); lb.flush(); }
@@ -2523,6 +2536,8 @@ pub extern "C" fn _start() -> ! {
                 PM_REGISTER => handle_register(&msg, &mut reply, badge),
                 PM_GETPGID_BADGE => handle_getpgid_badge(&msg, &mut reply),
                 PM_GETSID_BADGE => handle_getsid_badge(&msg, &mut reply),
+                PM_LIST_PIDS => handle_list_pids(&mut reply),
+                PM_GET_PROC_INFO => handle_get_proc_info(&msg, &mut reply),
                 _ => {
                     let mut lb = LineBuf::new();
                     lb.str(b"[PROCMGR] unknown label="); lb.hex(msg.label); lb.str(b"\n"); lb.flush();
@@ -2549,6 +2564,52 @@ pub extern "C" fn _start() -> ! {
     }
 
     idle();
+}
+
+/// List all active PIDs.
+/// Reply: regs[0..18] = PIDs (up to 18), regs[19] = count.
+unsafe fn handle_list_pids(reply: &mut SaltyMsg) {
+    unsafe {
+        let cap = proc_table::proctab_cap();
+        let mut count: usize = 0;
+        for i in 0..cap {
+            let p = &*proc_table::proctab(i);
+            if p.state != proc_table::PROC_FREE && count < 19 {
+                reply.regs[count] = p.pid as u64;
+                count += 1;
+            }
+        }
+        reply.regs[19] = count as u64;
+        reply.label = SALTY_OK;
+        reply.length = 20;
+    }
+}
+
+/// Get process info for a given PID.
+/// Request: regs[0] = pid
+/// Reply: regs[0]=pid, regs[1]=ppid, regs[2]=pgid, regs[3]=sid,
+///        regs[4]=state, regs[5..9]=name(32B)
+unsafe fn handle_get_proc_info(msg: &SaltyMsg, reply: &mut SaltyMsg) {
+    unsafe {
+        let pid = msg.regs[0] as u32;
+        let Some(idx) = proc_table::find_by_pid(pid) else {
+            reply.label = SALTY_NOT_FOUND;
+            return;
+        };
+        let p = &*proc_table::proctab(idx);
+        reply.regs[0] = p.pid as u64;
+        reply.regs[1] = p.ppid as u64;
+        reply.regs[2] = p.pgid as u64;
+        reply.regs[3] = p.sid as u64;
+        reply.regs[4] = p.state as u64;
+        // Pack name (32 bytes = 4 u64s) into regs[5..9]
+        let dst = &mut reply.regs[5] as *mut u64 as *mut u8;
+        for i in 0..32 {
+            *dst.add(i) = p.name[i];
+        }
+        reply.label = SALTY_OK;
+        reply.length = 9;
+    }
 }
 
 fn idle() -> ! {

@@ -48,6 +48,7 @@ const VFS_CAP_TTYD_EP: u64 = 67;       // NeedEP ttyd:67
 const VFS_CAP_FB_UNTYPED: u64 = 66;    // CopyCap 13:66
 const VFS_CAP_PTY_NTFN: u64 = 68;     // CopyCap 14:68 (PTY data-ready notification)
 const VFS_CAP_MMSRV_EP: u64 = 69;     // NeedEP mmsrv:69
+const VFS_CAP_PROCMGR_EP: u64 = 70;   // NeedEP procmgr:70
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 // VFS protocol labels
@@ -133,6 +134,15 @@ const FTYPE_DIRECTORY: u8 = 3;
 const FTYPE_SOCKET: u8 = 4;
 const FTYPE_SHM: u8 = 5;
 const FTYPE_FIFO: u8 = 6;
+const FTYPE_SYMLINK: u8 = 7;
+const FTYPE_PROC_FILE: u8 = 8;
+
+// /proc file subtypes (stored in dev_type for FTYPE_PROC_FILE inodes)
+const PROC_FILE_STATUS: u8 = 1;
+const PROC_FILE_STAT: u8 = 2;
+const PROC_FILE_MAPS: u8 = 3;
+const PROC_FILE_ROOT: u8 = 4;  // /proc directory itself
+const PROC_FILE_PID_DIR: u8 = 5; // /proc/<pid> directory
 
 // Open flags
 const O_ACCMODE: u32 = 0x0003;
@@ -149,6 +159,7 @@ const S_IFDIR_L: u32 = 0o040000;
 const S_IFCHR_L: u32 = 0o020000;
 const S_IFREG_L: u32 = 0o100000;
 const S_IFSOCK_L: u32 = 0o140000;
+const S_IFLNK_L: u32 = 0o120000;
 
 // Device types
 const DEV_CONSOLE: u8 = 0;
@@ -156,6 +167,7 @@ const DEV_NULL: u8 = 1;
 const DEV_ZERO: u8 = 2;
 const DEV_FB0: u8 = 3;
 const DEV_PTY_SLAVE: u8 = 4;
+const DEV_URANDOM: u8 = 5;
 
 // Initial capacities (growable pools)
 const INITIAL_INODES: usize = 128;
@@ -165,8 +177,8 @@ const WRITABLE_SIZE: usize = 8192;
 const INITIAL_CLIENTS: usize = 16;
 const INITIAL_FDS: usize = 32;
 // Semantic limits (not pool sizes)
-const MAX_PATH_LEN: usize = 64;
-const MAX_NAME_LEN: usize = 32;
+const MAX_PATH_LEN: usize = 128;
+const MAX_NAME_LEN: usize = 255;
 
 // FD types
 const FD_TYPE_NONE: u8 = 0;
@@ -272,6 +284,7 @@ struct RamfsInode {
     dirents_cap: u16,
     ro_data: *const u8,
     rw_data: *mut u8,
+    open_count: u32,
 }
 
 impl RamfsInode {
@@ -291,6 +304,7 @@ impl RamfsInode {
             dirents_cap: 0,
             ro_data: core::ptr::null(),
             rw_data: core::ptr::null_mut(),
+            open_count: 0,
         }
     }
 }
@@ -363,7 +377,14 @@ static mut NEXT_INO: u32 = 1;
 
 static mut WRITABLE_POOL_PTR: *mut [u8; WRITABLE_SIZE] = core::ptr::null_mut();
 static mut WRITABLE_USED_PTR: *mut u8 = core::ptr::null_mut();
+static mut WRITABLE_NEXT_PTR: *mut u32 = core::ptr::null_mut();
 static mut WRITABLE_CAP: usize = 0;
+
+// Symlink target pool: each slot holds a target path of up to MAX_PATH_LEN bytes
+const INITIAL_SYMLINKS: usize = 32;
+static mut SYMLINK_POOL_PTR: *mut [u8; MAX_PATH_LEN] = core::ptr::null_mut();
+static mut SYMLINK_USED_PTR: *mut u8 = core::ptr::null_mut();
+static mut SYMLINK_CAP: usize = 0;
 
 static mut CLIENTS_PTR: *mut ClientState = core::ptr::null_mut();
 static mut CLIENTS_CAP: usize = 0;
@@ -899,6 +920,40 @@ unsafe fn init_dynamic_state_storage() -> i32 {
         WRITABLE_USED_PTR = ptr;
         // Note: WRITABLE_CAP already set above for pool count
 
+        // Allocate WRITABLE_NEXT array (parallel to WRITABLE_USED)
+        let next_bytes = 32 * core::mem::size_of::<u32>();
+        let next_pages = (next_bytes + 4095) / 4096;
+        let next_ptr = salty::posix_mm::posix_mmap(
+            core::ptr::null_mut(),
+            (next_pages * 4096) as u64,
+            0x3, 0x22, -1, 0,
+        );
+        if next_ptr.is_null() || next_ptr == usize::MAX as *mut u8 {
+            return SALTY_OUT_OF_MEMORY as i32;
+        }
+        // Initialize all NEXT entries to u32::MAX (no chain)
+        let next_arr = next_ptr as *mut u32;
+        for i in 0..32 {
+            *next_arr.add(i) = u32::MAX;
+        }
+        WRITABLE_NEXT_PTR = next_arr;
+
+        // Allocate symlink pool
+        if alloc_pool(&raw mut SYMLINK_POOL_PTR, &raw mut SYMLINK_CAP, INITIAL_SYMLINKS) != 0 {
+            return SALTY_OUT_OF_MEMORY as i32;
+        }
+        let sym_used_pages = (INITIAL_SYMLINKS + 4095) / 4096;
+        let sym_used_ptr = salty::posix_mm::posix_mmap(
+            core::ptr::null_mut(),
+            (sym_used_pages * 4096) as u64,
+            0x3, 0x22, -1, 0,
+        );
+        if sym_used_ptr.is_null() || sym_used_ptr == usize::MAX as *mut u8 {
+            return SALTY_OUT_OF_MEMORY as i32;
+        }
+        core::ptr::write_bytes(sym_used_ptr, 0, sym_used_pages * 4096);
+        SYMLINK_USED_PTR = sym_used_ptr;
+
         if alloc_pool(&raw mut CLIENTS_PTR, &raw mut CLIENTS_CAP, 16) != 0 {
             return SALTY_OUT_OF_MEMORY as i32;
         }
@@ -942,6 +997,47 @@ fn ipc_ctx() -> *mut IpcContext {
     &raw mut salty::__salty_ipc_ctx
 }
 
+// ======================================================================
+// xorshift128+ PRNG for /dev/urandom
+// ======================================================================
+
+static mut URANDOM_S0: u64 = 0;
+static mut URANDOM_S1: u64 = 0;
+
+/// Inode number of /proc directory root.
+static mut PROC_ROOT_INO: u32 = 0;
+
+unsafe fn urandom_init() {
+    unsafe {
+        // Seed from monotonic clock + RDTSC
+        let mut ts = Timespec::zeroed();
+        salty::syscall::syscall(SYS_CLOCK_GETTIME, 0, &raw mut ts as u64, 0, 0, 0, 0);
+        let tsc_lo: u32;
+        let tsc_hi: u32;
+        core::arch::asm!("rdtsc", out("eax") tsc_lo, out("edx") tsc_hi);
+        let tsc: u64 = (tsc_hi as u64) << 32 | tsc_lo as u64;
+        URANDOM_S0 = ts.tv_nsec ^ tsc;
+        URANDOM_S1 = ts.tv_sec.wrapping_mul(6364136223846793005).wrapping_add(tsc);
+        // Ensure non-zero state
+        if URANDOM_S0 == 0 && URANDOM_S1 == 0 {
+            URANDOM_S0 = 0x0123456789ABCDEF;
+            URANDOM_S1 = 0xFEDCBA9876543210;
+        }
+    }
+}
+
+unsafe fn urandom_next() -> u64 {
+    unsafe {
+        let mut s1 = URANDOM_S0;
+        let s0 = URANDOM_S1;
+        let result = s0.wrapping_add(s1);
+        URANDOM_S0 = s0;
+        s1 ^= s1 << 23;
+        URANDOM_S1 = s1 ^ s0 ^ (s1 >> 17) ^ (s0 >> 26);
+        result
+    }
+}
+
 fn str_equal_raw(a: *const u8, alen: usize, b: *const u8, blen: usize) -> bool {
     if alen != blen {
         return false;
@@ -982,6 +1078,7 @@ unsafe fn alloc_inode() -> *mut RamfsInode {
                 (*n).parent_ino = 0;
                 (*n).ro_data = core::ptr::null();
                 (*n).rw_data = core::ptr::null_mut();
+                (*n).open_count = 0;
                 // Allocate dirents array if not yet allocated
                 if (*n).dirents.is_null() {
                     let ptr = vfs_alloc_array::<RamfsDirent>(INITIAL_DIRENTS);
@@ -1015,6 +1112,7 @@ unsafe fn alloc_writable() -> *mut u8 {
         for i in 0..max_writable() {
             if WRITABLE_USED!()[i] == 0 {
                 WRITABLE_USED!()[i] = 1;
+                *WRITABLE_NEXT_PTR.add(i) = u32::MAX;
                 for j in 0..WRITABLE_SIZE {
                     WRITABLE_POOL!()[i][j] = 0;
                 }
@@ -1029,7 +1127,203 @@ unsafe fn alloc_writable() -> *mut u8 {
     }
 }
 
-/// Grow WRITABLE_POOL and WRITABLE_USED arrays in lock-step.
+/// Get the slot index for a writable data pointer.
+unsafe fn slot_index_of(rw_data: *const u8) -> u32 {
+    unsafe {
+        let base = WRITABLE_POOL_PTR as *const u8;
+        let offset = rw_data as usize - base as usize;
+        (offset / WRITABLE_SIZE) as u32
+    }
+}
+
+/// Free an entire chain of writable slots starting from `rw_data`.
+unsafe fn free_chain(rw_data: *const u8) {
+    unsafe {
+        if rw_data.is_null() {
+            return;
+        }
+        let mut idx = slot_index_of(rw_data);
+        while (idx as usize) < max_writable() {
+            WRITABLE_USED!()[idx as usize] = 0;
+            let next = *WRITABLE_NEXT_PTR.add(idx as usize);
+            *WRITABLE_NEXT_PTR.add(idx as usize) = u32::MAX;
+            if next == u32::MAX {
+                break;
+            }
+            idx = next;
+        }
+    }
+}
+
+/// Free an inode and its associated storage (chain or symlink target).
+unsafe fn free_inode(inode: *mut RamfsInode) {
+    unsafe {
+        if (*inode).ftype == FTYPE_SYMLINK {
+            free_symlink_target((*inode).rw_data);
+        } else {
+            free_chain((*inode).rw_data);
+        }
+        (*inode).rw_data = core::ptr::null_mut();
+        (*inode).active = 0;
+    }
+}
+
+/// Increment the open reference count on an inode.
+unsafe fn inode_open(ino: u32) {
+    unsafe {
+        let inode = inode_by_ino(ino);
+        if !inode.is_null() {
+            (*inode).open_count += 1;
+        }
+    }
+}
+
+/// Decrement the open reference count on an inode.
+/// If nlink==0 and open_count drops to 0, free the inode storage.
+unsafe fn inode_close(ino: u32) {
+    unsafe {
+        let inode = inode_by_ino(ino);
+        if !inode.is_null() && (*inode).open_count > 0 {
+            (*inode).open_count -= 1;
+            if (*inode).nlink == 0 && (*inode).open_count == 0 {
+                free_inode(inode);
+            }
+        }
+    }
+}
+
+/// Read from a chain of writable slots.
+/// Returns number of bytes actually read.
+unsafe fn chain_read(rw_data: *const u8, offset: u64, dst: *mut u8, count: u64) -> u64 {
+    unsafe {
+        if rw_data.is_null() || count == 0 {
+            return 0;
+        }
+        let mut slot_idx = slot_index_of(rw_data);
+        // Skip slots to reach the right offset
+        let mut skip_slots = (offset as usize) / WRITABLE_SIZE;
+        while skip_slots > 0 && slot_idx != u32::MAX && (slot_idx as usize) < max_writable() {
+            slot_idx = *WRITABLE_NEXT_PTR.add(slot_idx as usize);
+            skip_slots -= 1;
+        }
+        if slot_idx == u32::MAX || (slot_idx as usize) >= max_writable() {
+            return 0;
+        }
+        let mut slot_off = (offset as usize) % WRITABLE_SIZE;
+        let mut total: u64 = 0;
+        while total < count && slot_idx != u32::MAX && (slot_idx as usize) < max_writable() {
+            let avail = WRITABLE_SIZE - slot_off;
+            let want = (count - total) as usize;
+            let n = if want < avail { want } else { avail };
+            let src = WRITABLE_POOL!()[slot_idx as usize].as_ptr().add(slot_off);
+            core::ptr::copy_nonoverlapping(src, dst.add(total as usize), n);
+            total += n as u64;
+            slot_off = 0;
+            slot_idx = *WRITABLE_NEXT_PTR.add(slot_idx as usize);
+        }
+        total
+    }
+}
+
+/// Write to a chain of writable slots, extending the chain as needed.
+/// Returns number of bytes actually written, or 0 on allocation failure.
+unsafe fn chain_write(rw_data: *mut u8, offset: u64, src: *const u8, count: u64) -> u64 {
+    unsafe {
+        if rw_data.is_null() || count == 0 {
+            return 0;
+        }
+        let first_idx = slot_index_of(rw_data);
+        // Navigate to the slot containing `offset`, extending if needed
+        let target_slot_num = (offset as usize) / WRITABLE_SIZE;
+        let mut slot_idx = first_idx;
+        for _ in 0..target_slot_num {
+            let next = *WRITABLE_NEXT_PTR.add(slot_idx as usize);
+            if next == u32::MAX || (next as usize) >= max_writable() {
+                // Need to extend
+                let new_slot = alloc_writable();
+                if new_slot.is_null() {
+                    return 0;
+                }
+                let new_idx = slot_index_of(new_slot);
+                *WRITABLE_NEXT_PTR.add(slot_idx as usize) = new_idx;
+                slot_idx = new_idx;
+            } else {
+                slot_idx = next;
+            }
+        }
+        let mut slot_off = (offset as usize) % WRITABLE_SIZE;
+        let mut total: u64 = 0;
+        while total < count {
+            if (slot_idx as usize) >= max_writable() {
+                break;
+            }
+            let avail = WRITABLE_SIZE - slot_off;
+            let want = (count - total) as usize;
+            let n = if want < avail { want } else { avail };
+            let dst_ptr = WRITABLE_POOL!()[slot_idx as usize].as_mut_ptr().add(slot_off);
+            core::ptr::copy_nonoverlapping(src.add(total as usize), dst_ptr, n);
+            total += n as u64;
+            slot_off = 0;
+            if total < count {
+                let next = *WRITABLE_NEXT_PTR.add(slot_idx as usize);
+                if next == u32::MAX || (next as usize) >= max_writable() {
+                    let new_slot = alloc_writable();
+                    if new_slot.is_null() {
+                        break;
+                    }
+                    let new_idx = slot_index_of(new_slot);
+                    *WRITABLE_NEXT_PTR.add(slot_idx as usize) = new_idx;
+                    slot_idx = new_idx;
+                } else {
+                    slot_idx = next;
+                }
+            }
+        }
+        total
+    }
+}
+
+/// Truncate a chain: free slots beyond `new_size` bytes.
+unsafe fn chain_truncate(rw_data: *mut u8, new_size: u64) {
+    unsafe {
+        if rw_data.is_null() {
+            return;
+        }
+        let keep_slots = if new_size == 0 { 1 } else { ((new_size as usize) + WRITABLE_SIZE - 1) / WRITABLE_SIZE };
+        let mut slot_idx = slot_index_of(rw_data);
+        let mut count = 1usize;
+        // Walk to the last slot we want to keep
+        while count < keep_slots && slot_idx != u32::MAX && (slot_idx as usize) < max_writable() {
+            let next = *WRITABLE_NEXT_PTR.add(slot_idx as usize);
+            if next == u32::MAX {
+                return; // Chain is already shorter
+            }
+            slot_idx = next;
+            count += 1;
+        }
+        // Free everything after this slot
+        let tail = *WRITABLE_NEXT_PTR.add(slot_idx as usize);
+        *WRITABLE_NEXT_PTR.add(slot_idx as usize) = u32::MAX;
+        if tail != u32::MAX {
+            // Walk and free the tail chain
+            let mut idx = tail;
+            while idx != u32::MAX && (idx as usize) < max_writable() {
+                WRITABLE_USED!()[idx as usize] = 0;
+                let next = *WRITABLE_NEXT_PTR.add(idx as usize);
+                *WRITABLE_NEXT_PTR.add(idx as usize) = u32::MAX;
+                idx = next;
+            }
+        }
+        // Zero out data beyond new_size in the last kept slot
+        let off_in_slot = (new_size as usize) % WRITABLE_SIZE;
+        if off_in_slot > 0 {
+            let p = WRITABLE_POOL!()[slot_idx as usize].as_mut_ptr().add(off_in_slot);
+            core::ptr::write_bytes(p, 0, WRITABLE_SIZE - off_in_slot);
+        }
+    }
+}
+
+/// Grow WRITABLE_POOL, WRITABLE_USED, and WRITABLE_NEXT arrays in lock-step.
 unsafe fn grow_writable_pool() -> i32 {
     unsafe {
         let old_cap = WRITABLE_CAP;
@@ -1054,20 +1348,77 @@ unsafe fn grow_writable_pool() -> i32 {
             0x3, 0x22, -1, 0,
         );
         if new_used_ptr.is_null() || new_used_ptr == usize::MAX as *mut u8 {
-            // Pool already grew; can't rollback easily. Return error.
             return -1;
         }
-        // Copy old used flags
         let old_used_ptr = WRITABLE_USED_PTR;
         core::ptr::copy_nonoverlapping(old_used_ptr, new_used_ptr, old_cap);
         core::ptr::write_bytes(new_used_ptr.add(old_cap), 0, new_cap - old_cap);
-        // Free old used array
         if !old_used_ptr.is_null() {
             let old_used_pages = (old_cap + 4095) / 4096;
             salty::posix_mm::posix_munmap(old_used_ptr, (old_used_pages * 4096) as u64);
         }
         WRITABLE_USED_PTR = new_used_ptr;
+
+        // Grow WRITABLE_NEXT
+        let next_bytes = new_cap * core::mem::size_of::<u32>();
+        let next_pages = (next_bytes + 4095) / 4096;
+        let new_next_ptr = salty::posix_mm::posix_mmap(
+            core::ptr::null_mut(),
+            (next_pages * 4096) as u64,
+            0x3, 0x22, -1, 0,
+        );
+        if new_next_ptr.is_null() || new_next_ptr == usize::MAX as *mut u8 {
+            return -1;
+        }
+        let new_next = new_next_ptr as *mut u32;
+        let old_next_ptr = WRITABLE_NEXT_PTR;
+        core::ptr::copy_nonoverlapping(old_next_ptr, new_next, old_cap);
+        // Initialize new entries to u32::MAX
+        for i in old_cap..new_cap {
+            *new_next.add(i) = u32::MAX;
+        }
+        if !old_next_ptr.is_null() {
+            let old_next_bytes = old_cap * core::mem::size_of::<u32>();
+            let old_next_pages = (old_next_bytes + 4095) / 4096;
+            salty::posix_mm::posix_munmap(old_next_ptr as *mut u8, (old_next_pages * 4096) as u64);
+        }
+        WRITABLE_NEXT_PTR = new_next;
         0
+    }
+}
+
+/// Allocate a symlink pool slot and store the target path.
+/// Returns a pointer to the pool entry, or null on failure.
+unsafe fn alloc_symlink_target(target: *const u8, target_len: u8) -> *mut u8 {
+    unsafe {
+        for i in 0..SYMLINK_CAP {
+            if *SYMLINK_USED_PTR.add(i) == 0 {
+                *SYMLINK_USED_PTR.add(i) = 1;
+                let slot = &raw mut (*SYMLINK_POOL_PTR.add(i));
+                let dst = slot as *mut u8;
+                core::ptr::write_bytes(dst, 0, MAX_PATH_LEN);
+                for j in 0..target_len as usize {
+                    *dst.add(j) = *target.add(j);
+                }
+                return dst;
+            }
+        }
+        core::ptr::null_mut()
+    }
+}
+
+/// Free a symlink pool slot given the pointer into the pool.
+unsafe fn free_symlink_target(ptr: *mut u8) {
+    unsafe {
+        if ptr.is_null() || SYMLINK_POOL_PTR.is_null() {
+            return;
+        }
+        let base = SYMLINK_POOL_PTR as *mut u8;
+        let offset = ptr as usize - base as usize;
+        let idx = offset / MAX_PATH_LEN;
+        if idx < SYMLINK_CAP {
+            *SYMLINK_USED_PTR.add(idx) = 0;
+        }
     }
 }
 
@@ -1234,6 +1585,7 @@ unsafe fn mount_initrd_entry(root: *mut RamfsInode, entry: &CpioEntryExt) -> boo
             let leaf_len = comp_len as u8;
             let leaf_mode = if entry.mode != 0 { entry.mode } else { S_IFREG_L | 0o444 };
             let leaf_is_dir = (leaf_mode & S_IFMT_L) == S_IFDIR_L;
+            let leaf_is_symlink = (leaf_mode & S_IFMT_L) == S_IFLNK_L;
 
             let existing = dir_find_entry(current, leaf_name, leaf_len);
             if !existing.is_null() {
@@ -1283,6 +1635,10 @@ unsafe fn mount_initrd_entry(root: *mut RamfsInode, entry: &CpioEntryExt) -> boo
             if leaf_is_dir {
                 (*inode).ftype = FTYPE_DIRECTORY;
                 (*inode).size = 0;
+            } else if leaf_is_symlink {
+                (*inode).ftype = FTYPE_SYMLINK;
+                (*inode).size = entry.data_len as u64;
+                (*inode).ro_data = entry.data;
             } else {
                 (*inode).ftype = FTYPE_REGULAR;
                 (*inode).size = entry.data_len as u64;
@@ -1304,9 +1660,30 @@ unsafe fn mount_initrd_entry(root: *mut RamfsInode, entry: &CpioEntryExt) -> boo
 // Path resolution
 // ======================================================================
 
-unsafe fn resolve_path_raw(path: *const u8, path_len: u8) -> *mut RamfsInode {
+/// Read the symlink target from an inode.
+/// For writable symlinks, target is in rw_data (symlink pool).
+/// For readonly (CPIO) symlinks, target is in ro_data.
+/// Returns the target pointer and length.
+unsafe fn symlink_target(inode: *const RamfsInode) -> (*const u8, u8) {
     unsafe {
-        if path_len == 0 {
+        if !(*inode).rw_data.is_null() {
+            return ((*inode).rw_data as *const u8, (*inode).size as u8);
+        }
+        if !(*inode).ro_data.is_null() {
+            return ((*inode).ro_data, (*inode).size as u8);
+        }
+        (core::ptr::null(), 0)
+    }
+}
+
+/// Inner path resolution with symlink following.
+/// `follow_final`: if true, follow symlink on the last component.
+/// `depth`: recursion depth for cycle detection (max 8).
+unsafe fn resolve_path_raw_inner(
+    path: *const u8, path_len: u8, follow_final: bool, depth: u8,
+) -> *mut RamfsInode {
+    unsafe {
+        if path_len == 0 || depth > 8 {
             return core::ptr::null_mut();
         }
 
@@ -1315,7 +1692,6 @@ unsafe fn resolve_path_raw(path: *const u8, path_len: u8) -> *mut RamfsInode {
             return core::ptr::null_mut();
         }
 
-        // Root itself
         if path_len == 1 && *path == b'/' {
             return current;
         }
@@ -1345,11 +1721,9 @@ unsafe fn resolve_path_raw(path: *const u8, path_len: u8) -> *mut RamfsInode {
                 pos += 1;
             }
 
-            // Handle "." — stay at current directory
             if comp_len == 1 && *path.add(start) == b'.' {
                 continue;
             }
-            // Handle ".." — move to parent
             if comp_len == 2 && *path.add(start) == b'.' && *path.add(start + 1) == b'.' {
                 current = inode_by_ino((*current).parent_ino);
                 if current.is_null() {
@@ -1370,10 +1744,54 @@ unsafe fn resolve_path_raw(path: *const u8, path_len: u8) -> *mut RamfsInode {
             if current.is_null() {
                 return core::ptr::null_mut();
             }
+
+            // Check if this component is a symlink
+            if (*current).ftype == FTYPE_SYMLINK {
+                let is_last = pos >= plen;
+                if is_last && !follow_final {
+                    // Return the symlink inode itself (for lstat/readlink)
+                    return current;
+                }
+                // Follow the symlink
+                let (target, target_len) = symlink_target(current);
+                if target.is_null() || target_len == 0 {
+                    return core::ptr::null_mut();
+                }
+                if pos >= plen {
+                    // Last component: just resolve target
+                    return resolve_path_raw_inner(target, target_len, true, depth + 1);
+                }
+                // Not last component: concatenate target + remaining path
+                let remaining_len = plen - pos;
+                let total = target_len as usize + 1 + remaining_len; // target + "/" + rest
+                if total > MAX_PATH_LEN {
+                    return core::ptr::null_mut();
+                }
+                let mut combined = [0u8; MAX_PATH_LEN];
+                for i in 0..target_len as usize {
+                    combined[i] = *target.add(i);
+                }
+                combined[target_len as usize] = b'/';
+                for i in 0..remaining_len {
+                    combined[target_len as usize + 1 + i] = *path.add(pos + i);
+                }
+                return resolve_path_raw_inner(
+                    combined.as_ptr(), total as u8, follow_final, depth + 1,
+                );
+            }
         }
 
         current
     }
+}
+
+unsafe fn resolve_path_raw(path: *const u8, path_len: u8) -> *mut RamfsInode {
+    unsafe { resolve_path_raw_inner(path, path_len, true, 0) }
+}
+
+/// Resolve path without following the final symlink component.
+unsafe fn resolve_path_raw_nofollow(path: *const u8, path_len: u8) -> *mut RamfsInode {
+    unsafe { resolve_path_raw_inner(path, path_len, false, 0) }
 }
 
 fn is_initrd_prefixed_path(path: *const u8, path_len: u8) -> bool {
@@ -1759,6 +2177,33 @@ unsafe fn init_ramfs() {
         (*tty_dev).parent_ino = (*dev_dir).ino;
         dir_add_entry(dev_dir, b"tty".as_ptr(), 3, (*tty_dev).ino);
 
+        // Create /dev/urandom
+        let urandom_dev = alloc_inode();
+        (*urandom_dev).ftype = FTYPE_CHAR_DEVICE;
+        (*urandom_dev).mode = S_IFCHR_L | 0o666;
+        (*urandom_dev).dev_type = DEV_URANDOM;
+        (*urandom_dev).parent_ino = (*dev_dir).ino;
+        dir_add_entry(dev_dir, b"urandom".as_ptr(), 7, (*urandom_dev).ino);
+
+        // Create /dev/random (alias for urandom)
+        let random_dev = alloc_inode();
+        (*random_dev).ftype = FTYPE_CHAR_DEVICE;
+        (*random_dev).mode = S_IFCHR_L | 0o666;
+        (*random_dev).dev_type = DEV_URANDOM;
+        (*random_dev).parent_ino = (*dev_dir).ino;
+        dir_add_entry(dev_dir, b"random".as_ptr(), 6, (*random_dev).ino);
+
+        // Create /proc directory (virtual, dynamic content)
+        let proc_dir = alloc_inode();
+        (*proc_dir).ftype = FTYPE_PROC_FILE;
+        (*proc_dir).dev_type = PROC_FILE_ROOT;
+        (*proc_dir).mode = S_IFDIR_L | 0o555;
+        (*proc_dir).readonly = 1;
+        (*proc_dir).nlink = 2;
+        (*proc_dir).parent_ino = (*root).ino;
+        dir_add_entry(root, b"proc".as_ptr(), 4, (*proc_dir).ino);
+        PROC_ROOT_INO = (*proc_dir).ino;
+
         // Create /initrd directory
         let initrd_dir = alloc_inode();
         (*initrd_dir).ftype = FTYPE_DIRECTORY;
@@ -1883,6 +2328,15 @@ unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
             return;
         }
 
+        // /proc virtual paths — intercept before resolve
+        if path_len >= 6 && path[0] == b'/' && path[1] == b'p' && path[2] == b'r'
+            && path[3] == b'o' && path[4] == b'c' && path[5] == b'/'
+        {
+            if handle_proc_open(path.as_ptr(), path_len, reply, badge) {
+                return;
+            }
+        }
+
         let mut inode = resolve_path(path.as_ptr(), path_len);
 
         if inode.is_null() {
@@ -1934,6 +2388,9 @@ unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                 return;
             }
             if (flags & O_TRUNC) != 0 && flags_allow_write(flags) {
+                if !(*inode).rw_data.is_null() {
+                    chain_truncate((*inode).rw_data, 0);
+                }
                 (*inode).size = 0;
             }
         }
@@ -1985,6 +2442,7 @@ unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                     }
                 }
 
+                inode_open((*inode).ino);
                 (*reply).label = SALTY_OK;
                 (*reply).length = 1;
                 (*reply).regs[0] = fd as u64;
@@ -2063,6 +2521,31 @@ unsafe fn handle_read(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                         *data.add(i) = 0;
                     }
                 }
+                DEV_URANDOM => {
+                    (*reply).label = SALTY_OK;
+                    (*reply).length = 1 + (count + 7) / 8;
+                    (*reply).regs[0] = count;
+                    let data = &raw mut (*reply).regs[1] as *mut u8;
+                    let mut i: u64 = 0;
+                    while i + 8 <= count {
+                        let v = urandom_next();
+                        let bytes = v.to_le_bytes();
+                        for j in 0..8 {
+                            *data.add(i as usize + j) = bytes[j];
+                        }
+                        i += 8;
+                    }
+                    if i < count {
+                        let v = urandom_next();
+                        let bytes = v.to_le_bytes();
+                        let mut j = 0usize;
+                        while i < count {
+                            *data.add(i as usize) = bytes[j];
+                            i += 1;
+                            j += 1;
+                        }
+                    }
+                }
                 DEV_FB0 => {
                     (*reply).label = SALTY_INVALID_OPERATION;
                 }
@@ -2104,6 +2587,15 @@ unsafe fn handle_read(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                     return;
                 }
 
+                // /proc virtual files
+                if (*inode).ftype == FTYPE_PROC_FILE {
+                    let offset = fde.offset;
+                    handle_proc_read(inode, offset, reply);
+                    let bytes_read = (*reply).regs[0];
+                    (*(*cli).fds.add(fd as usize)).offset += bytes_read;
+                    return;
+                }
+
                 let offset = fde.offset;
                 if offset >= (*inode).size {
                     (*reply).label = SALTY_OK;
@@ -2117,11 +2609,15 @@ unsafe fn handle_read(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                     count = avail;
                 }
 
-                let src: *const u8;
+                let dst = &raw mut (*reply).regs[1] as *mut u8;
                 if !(*inode).ro_data.is_null() {
-                    src = (*inode).ro_data.add(offset as usize);
+                    let src = (*inode).ro_data.add(offset as usize);
+                    for i in 0..count as usize {
+                        *dst.add(i) = *src.add(i);
+                    }
                 } else if !(*inode).rw_data.is_null() {
-                    src = (*inode).rw_data.add(offset as usize);
+                    let actual = chain_read((*inode).rw_data, offset, dst, count);
+                    count = actual;
                 } else {
                     (*reply).label = SALTY_OK;
                     (*reply).length = 1;
@@ -2132,10 +2628,6 @@ unsafe fn handle_read(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                 (*reply).label = SALTY_OK;
                 (*reply).length = 1 + (count + 7) / 8;
                 (*reply).regs[0] = count;
-                let dst = &raw mut (*reply).regs[1] as *mut u8;
-                for i in 0..count as usize {
-                    *dst.add(i) = *src.add(i);
-                }
 
                 fde.offset = offset + count;
             }
@@ -2200,7 +2692,7 @@ unsafe fn handle_write(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                     (*reply).length = 1;
                     (*reply).regs[0] = sent;
                 }
-                DEV_NULL | DEV_ZERO => {
+                DEV_NULL | DEV_ZERO | DEV_URANDOM => {
                     (*reply).label = SALTY_OK;
                     (*reply).length = 1;
                     (*reply).regs[0] = count;
@@ -2262,16 +2754,13 @@ unsafe fn handle_write(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                     offset = (*inode).size;
                 }
 
-                if offset >= WRITABLE_SIZE as u64 {
-                    count = 0;
-                } else if offset + count > WRITABLE_SIZE as u64 {
-                    count = WRITABLE_SIZE as u64 - offset;
-                }
-
                 let src = &(*msg).regs[2] as *const u64 as *const u8;
-                for i in 0..count as usize {
-                    *(*inode).rw_data.add(offset as usize + i) = *src.add(i);
+                let written = chain_write((*inode).rw_data, offset, src, count);
+                if written == 0 && count > 0 {
+                    (*reply).label = SALTY_OUT_OF_MEMORY;
+                    return;
                 }
+                count = written;
 
                 fde.offset = offset + count;
                 if fde.offset > (*inode).size {
@@ -2319,6 +2808,11 @@ unsafe fn handle_close(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                     &raw mut mm_reply_msg,
                 );
             }
+        }
+
+        // Decrement inode open count
+        if fde.fd_type != FD_TYPE_PIPE && fde.fd_type != FD_TYPE_SOCKET {
+            inode_close(fde.inode);
         }
 
         (*(*cli).fds.add(fd as usize)).active = 0;
@@ -2432,6 +2926,14 @@ unsafe fn handle_stat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
             resolve_path_from(cwd_ino, path.as_ptr(), path_len)
         };
         if inode.is_null() {
+            // Try /proc virtual paths
+            if path_len >= 6 && path[0] == b'/' && path[1] == b'p' && path[2] == b'r'
+                && path[3] == b'o' && path[4] == b'c' && path[5] == b'/'
+            {
+                if handle_proc_stat(path.as_ptr(), path_len, reply, badge) {
+                    return;
+                }
+            }
             (*reply).label = SALTY_NOT_FOUND;
             return;
         }
@@ -2450,6 +2952,15 @@ unsafe fn handle_access(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) 
             resolve_path_from(cwd_ino, path.as_ptr(), path_len)
         };
         if inode.is_null() {
+            // /proc virtual paths always accessible (read-only)
+            if path_len >= 6 && path[0] == b'/' && path[1] == b'p' && path[2] == b'r'
+                && path[3] == b'o' && path[4] == b'c' && path[5] == b'/'
+            {
+                if handle_proc_stat(path.as_ptr(), path_len, &mut SaltyMsg::zeroed(), badge) {
+                    (*reply).label = SALTY_OK;
+                    return;
+                }
+            }
             (*reply).label = SALTY_NOT_FOUND;
             return;
         }
@@ -2483,7 +2994,10 @@ unsafe fn handle_unlink(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
         }
 
         (*de).active = 0;
-        (*inode).active = 0;
+        (*inode).nlink = (*inode).nlink.saturating_sub(1);
+        if (*inode).nlink == 0 && (*inode).open_count == 0 {
+            free_inode(inode);
+        }
         (*reply).label = SALTY_OK;
     }
 }
@@ -2545,7 +3059,10 @@ unsafe fn handle_rename(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
         if !existing.is_null() {
             let old_inode = inode_by_ino((*existing).ino);
             if !old_inode.is_null() {
-                (*old_inode).active = 0;
+                (*old_inode).nlink = (*old_inode).nlink.saturating_sub(1);
+                if (*old_inode).nlink == 0 && (*old_inode).open_count == 0 {
+                    free_inode(old_inode);
+                }
             }
             (*existing).active = 0;
         }
@@ -2691,6 +3208,18 @@ unsafe fn do_open(
             return;
         }
 
+        // /proc virtual paths — intercept absolute paths before resolve
+        if path_len >= 6 {
+            let p = path;
+            if *p == b'/' && *p.add(1) == b'p' && *p.add(2) == b'r'
+                && *p.add(3) == b'o' && *p.add(4) == b'c' && *p.add(5) == b'/'
+            {
+                if handle_proc_open(path, path_len, reply, badge) {
+                    return;
+                }
+            }
+        }
+
         let mut inode = resolve_path_from(start_ino, path, path_len);
 
         if inode.is_null() {
@@ -2741,6 +3270,9 @@ unsafe fn do_open(
                 return;
             }
             if (flags & O_TRUNC) != 0 && flags_allow_write(flags) {
+                if !(*inode).rw_data.is_null() {
+                    chain_truncate((*inode).rw_data, 0);
+                }
                 (*inode).size = 0;
             }
         }
@@ -2791,6 +3323,7 @@ unsafe fn do_open(
                     }
                 }
 
+                inode_open((*inode).ino);
                 (*reply).label = SALTY_OK;
                 (*reply).length = 1;
                 (*reply).regs[0] = fd as u64;
@@ -2855,6 +3388,14 @@ unsafe fn handle_fstatat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
         };
 
         if inode.is_null() {
+            // Try /proc virtual paths
+            if path_len >= 6 && path[0] == b'/' && path[1] == b'p' && path[2] == b'r'
+                && path[3] == b'o' && path[4] == b'c' && path[5] == b'/'
+            {
+                if handle_proc_stat(path.as_ptr(), path_len, reply, badge) {
+                    return;
+                }
+            }
             (*reply).label = SALTY_NOT_FOUND;
             return;
         }
@@ -2926,7 +3467,10 @@ unsafe fn handle_unlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64
                 return;
             }
             (*de).active = 0;
-            (*inode).active = 0;
+            (*inode).nlink = (*inode).nlink.saturating_sub(1);
+            if (*inode).nlink == 0 && (*inode).open_count == 0 {
+                free_inode(inode);
+            }
             (*reply).label = SALTY_OK;
         }
     }
@@ -2998,7 +3542,10 @@ unsafe fn handle_renameat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64
         if !existing.is_null() {
             let old_inode = inode_by_ino((*existing).ino);
             if !old_inode.is_null() {
-                (*old_inode).active = 0;
+                (*old_inode).nlink = (*old_inode).nlink.saturating_sub(1);
+                if (*old_inode).nlink == 0 && (*old_inode).open_count == 0 {
+                    free_inode(old_inode);
+                }
             }
             (*existing).active = 0;
         }
@@ -3230,8 +3777,28 @@ unsafe fn handle_opendir(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
         let mut path = [0u8; MAX_PATH_LEN];
         let path_len = extract_path(msg, 0, path.as_mut_ptr());
 
+        // /proc sub-paths that don't resolve as real inodes
+        if path_len >= 6 && path[0] == b'/' && path[1] == b'p' && path[2] == b'r'
+            && path[3] == b'o' && path[4] == b'c' && path[5] == b'/'
+        {
+            if handle_proc_open(path.as_ptr(), path_len, reply, badge) {
+                return;
+            }
+        }
+
         let inode = resolve_path(path.as_ptr(), path_len);
-        if inode.is_null() || (*inode).ftype != FTYPE_DIRECTORY {
+        let is_dir = if inode.is_null() {
+            false
+        } else if (*inode).ftype == FTYPE_DIRECTORY {
+            true
+        } else if (*inode).ftype == FTYPE_PROC_FILE
+            && ((*inode).dev_type == PROC_FILE_ROOT || (*inode).dev_type == PROC_FILE_PID_DIR)
+        {
+            true
+        } else {
+            false
+        };
+        if !is_dir {
             (*reply).label = SALTY_NOT_FOUND;
             return;
         }
@@ -3249,6 +3816,7 @@ unsafe fn handle_opendir(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
                 (*(*cli).fds.add(fd)).inode = (*inode).ino;
                 (*(*cli).fds.add(fd)).offset = 0;
                 (*(*cli).fds.add(fd)).dir_cursor = 0;
+                inode_open((*inode).ino);
                 (*reply).label = SALTY_OK;
                 (*reply).length = 1;
                 (*reply).regs[0] = fd as u64;
@@ -3281,6 +3849,18 @@ unsafe fn handle_readdir(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
             return;
         }
 
+        // /proc virtual directories
+        if (*dir).ftype == FTYPE_PROC_FILE {
+            let cursor = (*(*cli).fds.add(fd as usize)).dir_cursor;
+            handle_proc_readdir(dir, cursor, reply);
+            if (*reply).label == SALTY_OK && (*reply).regs[0] != 0 {
+                // Advance cursor: use regs[1] (next cursor) if set by proc_readdir
+                (*(*cli).fds.add(fd as usize)).dir_cursor = (*reply).regs[1] as u32;
+                (*reply).regs[1] = 0; // clear before returning to client
+            }
+            return;
+        }
+
         let cursor = (*(*cli).fds.add(fd as usize)).dir_cursor;
         for i in (cursor as usize)..(*dir).dirents_cap as usize {
             if (*(*dir).dirents.add(i)).active != 0 {
@@ -3290,6 +3870,8 @@ unsafe fn handle_readdir(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
                         FTYPE_REGULAR => 8,     // DT_REG
                         FTYPE_DIRECTORY => 4,   // DT_DIR
                         FTYPE_CHAR_DEVICE => 2, // DT_CHR
+                        FTYPE_SYMLINK => 10,    // DT_LNK
+                        FTYPE_PROC_FILE => 4,   // DT_DIR (proc virtual dir)
                         _ => 0,
                     }
                 } else {
@@ -4167,6 +4749,8 @@ unsafe fn handle_dup2(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                 close_socket(fde);
             } else if (*fde).fd_type == FD_TYPE_PIPE {
                 close_pipe(fde);
+            } else {
+                inode_close((*fde).inode);
             }
             (*(*cli).fds.add(newfd as usize)).active = 0;
         }
@@ -4206,6 +4790,8 @@ unsafe fn handle_dup3(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                 close_socket(fde);
             } else if (*fde).fd_type == FD_TYPE_PIPE {
                 close_pipe(fde);
+            } else {
+                inode_close((*fde).inode);
             }
             (*(*cli).fds.add(newfd as usize)).active = 0;
         }
@@ -4245,6 +4831,8 @@ unsafe fn dup_fd_entry(cli: *mut ClientState, oldfd: i32, newfd: i32) {
             if !sock.is_null() {
                 (*sock).refcount += 1;
             }
+        } else {
+            inode_open(fde.inode);
         }
     }
 }
@@ -4315,6 +4903,12 @@ unsafe fn handle_clone_fds(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
                 if !sock.is_null() {
                     (*sock).refcount += 1;
                 }
+            }
+            // Increment inode open count for inode-based FDs
+            if (*(*child).fds.add(i)).fd_type != FD_TYPE_PIPE
+                && (*(*child).fds.add(i)).fd_type != FD_TYPE_SOCKET
+            {
+                inode_open((*(*child).fds.add(i)).inode);
             }
         }
 
@@ -4478,7 +5072,12 @@ unsafe fn cleanup_client_state(dead_badge: u64) {
                         EPOLLS!()[ep_idx].active = 0;
                     }
                 }
-                _ => {}
+                _ => {
+                    // Decrement inode open_count; frees if nlink==0
+                    if (*fde).inode != 0 {
+                        inode_close((*fde).inode);
+                    }
+                }
             }
             *(*cli).fds.add(i) = FdEntry::zeroed();
             *(*cli).fd_flags.add(i) = 0;
@@ -6420,6 +7019,7 @@ unsafe fn handle_shm_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64
                     (*(*cli).fds.add(fd)).active = 1;
                     (*(*cli).fds.add(fd)).fd_type = FD_TYPE_SHM;
                     (*(*cli).fds.add(fd)).inode = (*existing).ino;
+                    inode_open((*existing).ino);
                     (*reply).label = SALTY_OK;
                     (*reply).length = 1;
                     (*reply).regs[0] = fd as u64;
@@ -6517,6 +7117,7 @@ unsafe fn handle_shm_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64
                 (*(*cli).fds.add(fd)).active = 1;
                 (*(*cli).fds.add(fd)).fd_type = FD_TYPE_SHM;
                 (*(*cli).fds.add(fd)).inode = (*inode).ino;
+                inode_open((*inode).ino);
                 (*reply).label = SALTY_OK;
                 (*reply).length = 1;
                 (*reply).regs[0] = fd as u64;
@@ -6639,9 +7240,952 @@ unsafe fn handle_ftruncate(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
             (*reply).label = SALTY_INVALID_OPERATION;
             return false;
         }
+        if !(*inode).rw_data.is_null() && length < (*inode).size {
+            chain_truncate((*inode).rw_data, length);
+        }
         (*inode).size = length;
         (*reply).label = SALTY_OK;
         false
+    }
+}
+
+// ======================================================================
+// Link handlers
+// ======================================================================
+
+/// linkat(olddirfd, oldpath, newdirfd, newpath, flags)
+/// IPC: regs[0]=old_len, regs[1..9]=oldpath(64B), regs[9]=new_len, regs[10..18]=newpath(64B)
+unsafe fn handle_linkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+    unsafe {
+        let old_len = (*msg).regs[0] as u8;
+        if old_len == 0 || old_len as usize > 64 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+        let new_len = (*msg).regs[9] as u8;
+        if new_len == 0 || new_len as usize > 64 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        // Extract old path
+        let mut old_path = [0u8; MAX_PATH_LEN];
+        let src_old = &(*msg).regs[1] as *const u64 as *const u8;
+        for i in 0..old_len as usize {
+            old_path[i] = *src_old.add(i);
+        }
+
+        // Extract new path
+        let mut new_path = [0u8; MAX_PATH_LEN];
+        let src_new = &(*msg).regs[10] as *const u64 as *const u8;
+        for i in 0..new_len as usize {
+            new_path[i] = *src_new.add(i);
+        }
+
+        // Resolve old path to inode (follow symlinks)
+        let cli = get_client(badge);
+        if cli.is_null() {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        // Resolve old path (absolute or relative to cwd)
+        let target = if old_path[0] == b'/' {
+            resolve_path_raw(old_path.as_ptr(), old_len)
+        } else {
+            let mut cwd_len: usize = 0;
+            while cwd_len < 128 && (*cli).cwd[cwd_len] != 0 { cwd_len += 1; }
+            let total = cwd_len + 1 + old_len as usize;
+            if total > MAX_PATH_LEN {
+                (*reply).label = SALTY_NOT_FOUND;
+                return;
+            }
+            let mut abs = [0u8; MAX_PATH_LEN];
+            for i in 0..cwd_len { abs[i] = (*cli).cwd[i]; }
+            abs[cwd_len] = b'/';
+            for i in 0..old_len as usize { abs[cwd_len + 1 + i] = old_path[i]; }
+            resolve_path_raw(abs.as_ptr(), total as u8)
+        };
+        if target.is_null() {
+            (*reply).label = SALTY_NOT_FOUND;
+            return;
+        }
+
+        // Cannot hard-link directories
+        if (*target).ftype == FTYPE_DIRECTORY {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return;
+        }
+
+        // Resolve new path parent (absolute or relative to cwd)
+        let mut abs_new = [0u8; MAX_PATH_LEN];
+        let abs_new_len: u8;
+        if new_path[0] == b'/' {
+            for i in 0..new_len as usize { abs_new[i] = new_path[i]; }
+            abs_new_len = new_len;
+        } else {
+            let mut cwd_len: usize = 0;
+            while cwd_len < 128 && (*cli).cwd[cwd_len] != 0 { cwd_len += 1; }
+            let total = cwd_len + 1 + new_len as usize;
+            if total > MAX_PATH_LEN {
+                (*reply).label = SALTY_NOT_FOUND;
+                return;
+            }
+            for i in 0..cwd_len { abs_new[i] = (*cli).cwd[i]; }
+            abs_new[cwd_len] = b'/';
+            for i in 0..new_len as usize { abs_new[cwd_len + 1 + i] = new_path[i]; }
+            abs_new_len = total as u8;
+        }
+
+        let mut child_name: *const u8 = core::ptr::null();
+        let mut child_len: u8 = 0;
+        let new_parent = resolve_parent(abs_new.as_ptr(), abs_new_len, &mut child_name, &mut child_len);
+        if new_parent.is_null() || (*new_parent).readonly != 0 {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return;
+        }
+
+        // Check new name doesn't already exist
+        let existing = dir_find_entry(new_parent, child_name, child_len);
+        if !existing.is_null() {
+            (*reply).label = SALTY_ALREADY_EXISTS;
+            return;
+        }
+
+        // Add new directory entry pointing to the same inode
+        if dir_add_entry(new_parent, child_name, child_len, (*target).ino) != 0 {
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
+
+        (*target).nlink += 1;
+        (*reply).label = SALTY_OK;
+    }
+}
+
+/// symlinkat(target, newdirfd, linkpath)
+/// IPC: regs[0]=target_len, regs[1..9]=target(64B), regs[9]=link_len, regs[10..18]=link(64B)
+unsafe fn handle_symlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+    unsafe {
+        // Dual-path IPC: regs[1..9]=target(64B), regs[10..18]=link(64B)
+        let target_len = (*msg).regs[0] as u8;
+        if target_len == 0 || target_len > 64 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+        let mut target = [0u8; MAX_PATH_LEN];
+        let raw_target = &(*msg).regs[1] as *const u64 as *const u8;
+        for i in 0..target_len as usize {
+            target[i] = *raw_target.add(i);
+        }
+
+        let link_len = (*msg).regs[9] as u8;
+        if link_len == 0 || link_len > 64 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+        let mut link_path = [0u8; MAX_PATH_LEN];
+        let raw_link = &(*msg).regs[10] as *const u64 as *const u8;
+        for i in 0..link_len as usize {
+            link_path[i] = *raw_link.add(i);
+        }
+
+        // Resolve parent of the link
+        let mut child_name: *const u8 = core::ptr::null();
+        let mut child_len: u8 = 0;
+        let parent = resolve_parent(link_path.as_ptr(), link_len, &mut child_name, &mut child_len);
+        if parent.is_null() || (*parent).ftype != FTYPE_DIRECTORY || (*parent).readonly != 0 {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return;
+        }
+        if child_len == 0 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        // Check that target name doesn't already exist
+        let existing = dir_find_entry(parent, child_name, child_len);
+        if !existing.is_null() {
+            (*reply).label = SALTY_ALREADY_EXISTS;
+            return;
+        }
+
+        // Allocate symlink target in pool
+        let sym_data = alloc_symlink_target(target.as_ptr(), target_len);
+        if sym_data.is_null() {
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
+
+        // Allocate inode
+        let inode = alloc_inode();
+        if inode.is_null() {
+            free_symlink_target(sym_data);
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
+
+        (*inode).ftype = FTYPE_SYMLINK;
+        (*inode).mode = S_IFLNK_L | 0o777;
+        (*inode).nlink = 1;
+        (*inode).size = target_len as u64;
+        (*inode).rw_data = sym_data;
+        (*inode).parent_ino = (*parent).ino;
+
+        dir_add_entry(parent, child_name, child_len, (*inode).ino);
+        (*reply).label = SALTY_OK;
+    }
+}
+
+/// readlinkat(dirfd, path) -> target
+/// IPC in: regs[0]=path_len, regs[1..]=path
+/// IPC out: regs[0]=target_len, regs[1..]=target
+unsafe fn handle_readlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, _badge: u64) {
+    unsafe {
+        let mut path = [0u8; MAX_PATH_LEN];
+        let path_len = extract_path(msg, 0, path.as_mut_ptr());
+
+        if path_len == 0 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        let inode = resolve_path_raw_nofollow(path.as_ptr(), path_len);
+        if inode.is_null() {
+            (*reply).label = SALTY_NOT_FOUND;
+            return;
+        }
+
+        if (*inode).ftype != FTYPE_SYMLINK {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return;
+        }
+
+        let (target, target_len) = symlink_target(inode);
+        if target.is_null() || target_len == 0 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        (*reply).label = SALTY_OK;
+        (*reply).regs[0] = target_len as u64;
+        (*reply).length = 1 + ((target_len as u64 + 7) / 8);
+        let dst = &raw mut (*reply).regs[1] as *mut u8;
+        for i in 0..target_len as usize {
+            *dst.add(i) = *target.add(i);
+        }
+    }
+}
+
+/// lstat: stat without following final symlink
+unsafe fn handle_lstat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+    unsafe {
+        let mut path = [0u8; MAX_PATH_LEN];
+        let path_len = extract_path(msg, 0, path.as_mut_ptr());
+        let inode = if path_len > 0 && path[0] == b'/' {
+            resolve_path_raw_nofollow(path.as_ptr(), path_len)
+        } else {
+            // Relative path: resolve with cwd
+            let cwd_ino = get_client_cwd_ino(badge);
+            // Build absolute path from cwd + relative
+            let cli = get_client_noalloc(badge);
+            if cli.is_null() {
+                (*reply).label = SALTY_NOT_FOUND;
+                return;
+            }
+            let mut cwd_len: usize = 0;
+            while cwd_len < 128 && (*cli).cwd[cwd_len] != 0 {
+                cwd_len += 1;
+            }
+            if cwd_len == 0 || path_len == 0 {
+                resolve_path_raw_nofollow(path.as_ptr(), path_len)
+            } else {
+                // Build absolute path: cwd + "/" + path
+                let total = cwd_len + 1 + path_len as usize;
+                if total > MAX_PATH_LEN {
+                    (*reply).label = SALTY_NOT_FOUND;
+                    return;
+                }
+                let mut abs = [0u8; MAX_PATH_LEN];
+                for i in 0..cwd_len {
+                    abs[i] = (*cli).cwd[i];
+                }
+                abs[cwd_len] = b'/';
+                for i in 0..path_len as usize {
+                    abs[cwd_len + 1 + i] = path[i];
+                }
+                resolve_path_raw_nofollow(abs.as_ptr(), total as u8)
+            }
+        };
+        if inode.is_null() {
+            // Try /proc virtual paths
+            if path_len >= 6 && path[0] == b'/' && path[1] == b'p' && path[2] == b'r'
+                && path[3] == b'o' && path[4] == b'c' && path[5] == b'/'
+            {
+                if handle_proc_stat(path.as_ptr(), path_len, reply, badge) {
+                    return;
+                }
+            }
+            (*reply).label = SALTY_NOT_FOUND;
+            return;
+        }
+        fill_stat_reply(reply, inode);
+    }
+}
+
+// ======================================================================
+// /proc filesystem
+// ======================================================================
+
+/// Parse a decimal PID string (up to 10 digits). Returns (pid, true) or (0, false).
+fn parse_pid(buf: &[u8]) -> (u32, bool) {
+    if buf.is_empty() || buf.len() > 10 {
+        return (0, false);
+    }
+    let mut val: u32 = 0;
+    for &b in buf {
+        if b < b'0' || b > b'9' {
+            return (0, false);
+        }
+        val = val.wrapping_mul(10).wrapping_add((b - b'0') as u32);
+    }
+    (val, true)
+}
+
+/// Format u32 as decimal into buf. Returns number of bytes written.
+fn fmt_u32(mut v: u32, buf: &mut [u8]) -> usize {
+    if v == 0 {
+        if !buf.is_empty() { buf[0] = b'0'; }
+        return 1;
+    }
+    let mut tmp = [0u8; 10];
+    let mut len = 0usize;
+    while v > 0 && len < 10 {
+        tmp[len] = b'0' + (v % 10) as u8;
+        v /= 10;
+        len += 1;
+    }
+    for i in 0..len {
+        if i < buf.len() {
+            buf[i] = tmp[len - 1 - i];
+        }
+    }
+    len
+}
+
+/// Format u64 as hex into buf. Returns number of bytes written.
+fn fmt_u64_hex(mut v: u64, buf: &mut [u8]) -> usize {
+    if v == 0 {
+        if buf.len() >= 3 { buf[0] = b'0'; buf[1] = b'x'; buf[2] = b'0'; return 3; }
+        return 0;
+    }
+    let mut tmp = [0u8; 16];
+    let mut len = 0usize;
+    while v > 0 && len < 16 {
+        let d = (v & 0xf) as u8;
+        tmp[len] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+        v >>= 4;
+        len += 1;
+    }
+    if buf.len() < len + 2 { return 0; }
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..len {
+        buf[2 + i] = tmp[len - 1 - i];
+    }
+    len + 2
+}
+
+/// Query procmgr for list of PIDs. Returns count (up to 19).
+unsafe fn proc_list_pids(pids: &mut [u32; 19]) -> usize {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_PM_LIST_PIDS;
+        msg.length = 0;
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_PROCMGR_EP, &raw const msg, &raw mut reply);
+        if err != 0 || reply.label != SALTY_OK {
+            return 0;
+        }
+        let count = reply.regs[19] as usize;
+        let n = if count > 19 { 19 } else { count };
+        for i in 0..n {
+            pids[i] = reply.regs[i] as u32;
+        }
+        n
+    }
+}
+
+/// Query procmgr for process info. Returns true on success.
+unsafe fn proc_get_info(
+    pid: u32, ppid: &mut u32, pgid: &mut u32, sid: &mut u32,
+    state: &mut u8, name: &mut [u8; 32],
+) -> bool {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_PM_GET_PROC_INFO;
+        msg.length = 1;
+        msg.regs[0] = pid as u64;
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_PROCMGR_EP, &raw const msg, &raw mut reply);
+        if err != 0 || reply.label != SALTY_OK {
+            return false;
+        }
+        *ppid = reply.regs[1] as u32;
+        *pgid = reply.regs[2] as u32;
+        *sid = reply.regs[3] as u32;
+        *state = reply.regs[4] as u8;
+        let src = &reply.regs[5] as *const u64 as *const u8;
+        for i in 0..32 {
+            name[i] = *src.add(i);
+        }
+        true
+    }
+}
+
+/// Query mmsrv for client memory stats. Returns true on success.
+unsafe fn proc_get_mem_stats(
+    pid: u32, heap_base: &mut u64, heap_current: &mut u64,
+    region_count: &mut u64, total_pages: &mut u64,
+) -> bool {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = MM_GET_CLIENT_STATS;
+        msg.length = 1;
+        msg.regs[0] = pid as u64;
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_MMSRV_EP, &raw const msg, &raw mut reply);
+        if err != 0 || reply.label != SALTY_OK {
+            return false;
+        }
+        *heap_base = reply.regs[0];
+        *heap_current = reply.regs[1];
+        *region_count = reply.regs[2];
+        *total_pages = reply.regs[3];
+        true
+    }
+}
+
+/// Generate /proc/<pid>/status content. Returns bytes written.
+unsafe fn proc_gen_status(pid: u32, buf: *mut u8, buf_size: usize) -> usize {
+    unsafe {
+        let mut ppid: u32 = 0;
+        let mut pgid: u32 = 0;
+        let mut sid: u32 = 0;
+        let mut state: u8 = 0;
+        let mut name = [0u8; 32];
+        if !proc_get_info(pid, &mut ppid, &mut pgid, &mut sid, &mut state, &mut name) {
+            return 0;
+        }
+
+        // Find name length
+        let mut name_len = 0usize;
+        while name_len < 32 && name[name_len] != 0 { name_len += 1; }
+        if name_len == 0 { name[0] = b'?'; name_len = 1; }
+
+        let mut pos = 0usize;
+        let mut tmp = [0u8; 12];
+
+        // "Name:\t<name>\n"
+        let hdr = b"Name:\t";
+        for b in hdr { if pos < buf_size { *buf.add(pos) = *b; pos += 1; } }
+        for i in 0..name_len { if pos < buf_size { *buf.add(pos) = name[i]; pos += 1; } }
+        if pos < buf_size { *buf.add(pos) = b'\n'; pos += 1; }
+
+        // "State:\t<R/Z/T>\n"
+        let hdr = b"State:\t";
+        for b in hdr { if pos < buf_size { *buf.add(pos) = *b; pos += 1; } }
+        let st_char = match state { 1 => b'R', 2 => b'Z', 3 => b'T', _ => b'?' };
+        if pos < buf_size { *buf.add(pos) = st_char; pos += 1; }
+        if pos < buf_size { *buf.add(pos) = b'\n'; pos += 1; }
+
+        // "Pid:\t<pid>\n"
+        let hdr = b"Pid:\t";
+        for b in hdr { if pos < buf_size { *buf.add(pos) = *b; pos += 1; } }
+        let n = fmt_u32(pid, &mut tmp);
+        for i in 0..n { if pos < buf_size { *buf.add(pos) = tmp[i]; pos += 1; } }
+        if pos < buf_size { *buf.add(pos) = b'\n'; pos += 1; }
+
+        // "PPid:\t<ppid>\n"
+        let hdr = b"PPid:\t";
+        for b in hdr { if pos < buf_size { *buf.add(pos) = *b; pos += 1; } }
+        let n = fmt_u32(ppid, &mut tmp);
+        for i in 0..n { if pos < buf_size { *buf.add(pos) = tmp[i]; pos += 1; } }
+        if pos < buf_size { *buf.add(pos) = b'\n'; pos += 1; }
+
+        // "Pgid:\t<pgid>\n"
+        let hdr = b"Pgid:\t";
+        for b in hdr { if pos < buf_size { *buf.add(pos) = *b; pos += 1; } }
+        let n = fmt_u32(pgid, &mut tmp);
+        for i in 0..n { if pos < buf_size { *buf.add(pos) = tmp[i]; pos += 1; } }
+        if pos < buf_size { *buf.add(pos) = b'\n'; pos += 1; }
+
+        // "Sid:\t<sid>\n"
+        let hdr = b"Sid:\t";
+        for b in hdr { if pos < buf_size { *buf.add(pos) = *b; pos += 1; } }
+        let n = fmt_u32(sid, &mut tmp);
+        for i in 0..n { if pos < buf_size { *buf.add(pos) = tmp[i]; pos += 1; } }
+        if pos < buf_size { *buf.add(pos) = b'\n'; pos += 1; }
+
+        pos
+    }
+}
+
+/// Generate /proc/<pid>/stat content (single-line). Returns bytes written.
+unsafe fn proc_gen_stat(pid: u32, buf: *mut u8, buf_size: usize) -> usize {
+    unsafe {
+        let mut ppid: u32 = 0;
+        let mut pgid: u32 = 0;
+        let mut sid: u32 = 0;
+        let mut state: u8 = 0;
+        let mut name = [0u8; 32];
+        if !proc_get_info(pid, &mut ppid, &mut pgid, &mut sid, &mut state, &mut name) {
+            return 0;
+        }
+
+        let mut name_len = 0usize;
+        while name_len < 32 && name[name_len] != 0 { name_len += 1; }
+        if name_len == 0 { name[0] = b'?'; name_len = 1; }
+
+        let mut pos = 0usize;
+        let mut tmp = [0u8; 12];
+
+        // "<pid> (<name>) <state> <ppid> <pgid> <sid>\n"
+        let n = fmt_u32(pid, &mut tmp);
+        for i in 0..n { if pos < buf_size { *buf.add(pos) = tmp[i]; pos += 1; } }
+        if pos < buf_size { *buf.add(pos) = b' '; pos += 1; }
+        if pos < buf_size { *buf.add(pos) = b'('; pos += 1; }
+        for i in 0..name_len { if pos < buf_size { *buf.add(pos) = name[i]; pos += 1; } }
+        if pos < buf_size { *buf.add(pos) = b')'; pos += 1; }
+        if pos < buf_size { *buf.add(pos) = b' '; pos += 1; }
+        let st_char = match state { 1 => b'R', 2 => b'Z', 3 => b'T', _ => b'?' };
+        if pos < buf_size { *buf.add(pos) = st_char; pos += 1; }
+        if pos < buf_size { *buf.add(pos) = b' '; pos += 1; }
+        let n = fmt_u32(ppid, &mut tmp);
+        for i in 0..n { if pos < buf_size { *buf.add(pos) = tmp[i]; pos += 1; } }
+        if pos < buf_size { *buf.add(pos) = b' '; pos += 1; }
+        let n = fmt_u32(pgid, &mut tmp);
+        for i in 0..n { if pos < buf_size { *buf.add(pos) = tmp[i]; pos += 1; } }
+        if pos < buf_size { *buf.add(pos) = b' '; pos += 1; }
+        let n = fmt_u32(sid, &mut tmp);
+        for i in 0..n { if pos < buf_size { *buf.add(pos) = tmp[i]; pos += 1; } }
+        if pos < buf_size { *buf.add(pos) = b'\n'; pos += 1; }
+
+        pos
+    }
+}
+
+/// Handle open for /proc paths. Creates temporary proc file inode.
+/// Returns true if handled (and reply is set), false if not a /proc path.
+unsafe fn handle_proc_open(
+    path: *const u8, path_len: u8, reply: *mut SaltyMsg, badge: u64,
+) -> bool {
+    unsafe {
+        // Check if path starts with "/proc/"
+        if path_len < 6 { return false; }
+        let proc_prefix = b"/proc/";
+        for i in 0..6 {
+            if *path.add(i) != proc_prefix[i] { return false; }
+        }
+
+        let rest = path.add(6);
+        let rest_len = path_len - 6;
+
+        // Check for /proc/self -> resolve to client's PID
+        let is_self_prefix = rest_len >= 4
+            && *rest == b's' && *rest.add(1) == b'e'
+            && *rest.add(2) == b'l' && *rest.add(3) == b'f';
+
+        let (pid, file_offset) = if is_self_prefix && (rest_len == 4 || *rest.add(4) == b'/') {
+            // /proc/self/... — get client PID from procmgr
+            let mut msg = SaltyMsg::zeroed();
+            let mut pm_reply = SaltyMsg::zeroed();
+            msg.label = POSIX_PM_GETPID;
+            msg.length = 0;
+            let ctx = ipc_ctx();
+            // Use the client's badge to identify them to procmgr
+            // Actually, VFS needs to ask procmgr about this badge.
+            // For now use a direct getpid approach via badge lookup.
+            // The procmgr identifies callers by badge. We need the PID for
+            // the requesting client. We have their badge in `badge`.
+            // Use PM_GETPGID_BADGE which takes a badge and returns info.
+            // Actually, let's do a simpler approach: call PM_GET_PROC_INFO
+            // We don't have the PID yet... Let's use the PM_LIST_PIDS and
+            // match by iterating. This is complex — instead, let's just use
+            // PID 1 as fallback for self for now.
+            //
+            // Actually, let's ask procmgr for getpid using the client badge.
+            // PM_REGISTER takes badge→pid mapping. PM_GETPGID_BADGE takes badge in regs[0].
+            // But what returns PID from badge? Let's check...
+            // The simplest: iterate clients and find the client by badge,
+            // then use client's stored info.
+            //
+            // Actually we can just forward the call to procmgr as if from
+            // the client. But VFS calls procmgr with its own badge.
+            //
+            // Simpler approach: just look up the badge in our client table
+            // and see if they have a PID recorded. Or we can just not support
+            // /proc/self initially and require numeric PIDs.
+            let cli = get_client_noalloc(badge);
+            if cli.is_null() {
+                (*reply).label = SALTY_NOT_FOUND;
+                return true;
+            }
+            // Client badge encodes PID: badge = pid
+            let client_pid = (badge & 0xFFFF) as u32;
+            if rest_len == 4 {
+                // /proc/self (just the dir itself)
+                (client_pid, 4u8)
+            } else {
+                (client_pid, 5u8) // skip "self/"
+            }
+        } else {
+            // /proc/<pid>/... — parse numeric PID
+            let mut pid_end = 0u8;
+            while (pid_end as usize) < rest_len as usize && *rest.add(pid_end as usize) != b'/' {
+                pid_end += 1;
+            }
+            let mut pid_buf = [0u8; 10];
+            for i in 0..pid_end as usize {
+                if i < 10 { pid_buf[i] = *rest.add(i); }
+            }
+            let (pid, ok) = parse_pid(&pid_buf[..pid_end as usize]);
+            if !ok {
+                (*reply).label = SALTY_NOT_FOUND;
+                return true;
+            }
+            (pid, pid_end)
+        };
+
+        // What file under /proc/<pid>/?
+        let after_pid = rest.add(file_offset as usize);
+        let after_len = if file_offset < rest_len { rest_len - file_offset } else { 0 };
+
+        if after_len == 0 {
+            // /proc/<pid> — the directory itself; open as dir
+            // Allocate temp proc inode
+            let inode = alloc_inode();
+            if inode.is_null() {
+                (*reply).label = SALTY_OUT_OF_MEMORY;
+                return true;
+            }
+            (*inode).ftype = FTYPE_PROC_FILE;
+            (*inode).dev_type = PROC_FILE_PID_DIR;
+            (*inode).mode = S_IFDIR_L | 0o555;
+            (*inode).readonly = 1;
+            (*inode).nlink = 0; // temp inode — freed when last FD closes
+            (*inode).size = pid as u64; // store PID in size field
+
+            let cli = get_client(badge);
+            if cli.is_null() { (*reply).label = SALTY_OUT_OF_MEMORY; (*inode).active = 0; return true; }
+            for fd in 0..(*cli).fds_cap as usize {
+                if (*(*cli).fds.add(fd)).active == 0 {
+                    (*(*cli).fds.add(fd)).active = 1;
+                    (*(*cli).fds.add(fd)).fd_type = FD_TYPE_DIR;
+                    (*(*cli).fds.add(fd)).inode = (*inode).ino;
+                    (*(*cli).fds.add(fd)).offset = 0;
+                    (*(*cli).fds.add(fd)).dir_cursor = 0;
+                    inode_open((*inode).ino);
+                    (*reply).label = SALTY_OK;
+                    (*reply).length = 1;
+                    (*reply).regs[0] = fd as u64;
+                    return true;
+                }
+            }
+            (*inode).active = 0;
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return true;
+        }
+
+        // Skip leading '/'
+        let (file_name, file_name_len) = if after_len > 0 && *after_pid == b'/' {
+            (after_pid.add(1), after_len - 1)
+        } else {
+            (after_pid, after_len)
+        };
+
+        // Determine file type
+        let proc_type = if file_name_len == 6 && mem_eq(file_name, b"status".as_ptr(), 6) {
+            PROC_FILE_STATUS
+        } else if file_name_len == 4 && mem_eq(file_name, b"stat".as_ptr(), 4) {
+            PROC_FILE_STAT
+        } else if file_name_len == 4 && mem_eq(file_name, b"maps".as_ptr(), 4) {
+            PROC_FILE_MAPS
+        } else {
+            (*reply).label = SALTY_NOT_FOUND;
+            return true;
+        };
+
+        // Allocate temporary inode for this proc file
+        let inode = alloc_inode();
+        if inode.is_null() {
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return true;
+        }
+        (*inode).ftype = FTYPE_PROC_FILE;
+        (*inode).dev_type = proc_type;
+        (*inode).mode = S_IFREG_L | 0o444;
+        (*inode).readonly = 1;
+        (*inode).nlink = 0; // temp inode — freed when last FD closes
+        (*inode).size = pid as u64; // store PID in size field
+
+        let cli = get_client(badge);
+        if cli.is_null() { (*reply).label = SALTY_OUT_OF_MEMORY; (*inode).active = 0; return true; }
+        for fd in 0..(*cli).fds_cap as usize {
+            if (*(*cli).fds.add(fd)).active == 0 {
+                (*(*cli).fds.add(fd)).active = 1;
+                (*(*cli).fds.add(fd)).fd_type = FD_TYPE_FILE;
+                (*(*cli).fds.add(fd)).inode = (*inode).ino;
+                (*(*cli).fds.add(fd)).offset = 0;
+                (*(*cli).fds.add(fd)).dir_cursor = 0;
+                (*(*cli).fds.add(fd)).flags = 0; // O_RDONLY
+                inode_open((*inode).ino);
+                (*reply).label = SALTY_OK;
+                (*reply).length = 1;
+                (*reply).regs[0] = fd as u64;
+                return true;
+            }
+        }
+        (*inode).active = 0;
+        (*reply).label = SALTY_OUT_OF_MEMORY;
+        true
+    }
+}
+
+/// Simple memory comparison (no libc).
+fn mem_eq(a: *const u8, b: *const u8, len: usize) -> bool {
+    for i in 0..len {
+        unsafe {
+            if *a.add(i) != *b.add(i) { return false; }
+        }
+    }
+    true
+}
+
+/// Handle stat/lstat for /proc virtual paths that don't resolve as real inodes.
+/// Returns true if the path was handled (even if error).
+unsafe fn handle_proc_stat(
+    path: *const u8, path_len: u8, reply: *mut SaltyMsg, badge: u64,
+) -> bool {
+    unsafe {
+        // Path must start with "/proc/" (caller already checked)
+        if path_len < 6 { return false; }
+
+        let rest = path.add(6);
+        let rest_len = path_len - 6;
+
+        // Parse "self" or numeric PID
+        let is_self_prefix = rest_len >= 4
+            && *rest == b's' && *rest.add(1) == b'e'
+            && *rest.add(2) == b'l' && *rest.add(3) == b'f';
+
+        let (pid, file_offset) = if is_self_prefix && (rest_len == 4 || *rest.add(4) == b'/') {
+            let client_pid = (badge & 0xFFFF) as u32;
+            if rest_len == 4 { (client_pid, 4u8) } else { (client_pid, 5u8) }
+        } else {
+            let mut pid_end = 0u8;
+            while (pid_end as usize) < rest_len as usize && *rest.add(pid_end as usize) != b'/' {
+                pid_end += 1;
+            }
+            let (pid, ok) = parse_pid(&core::slice::from_raw_parts(rest, pid_end as usize));
+            if !ok {
+                (*reply).label = SALTY_NOT_FOUND;
+                return true;
+            }
+            (pid, pid_end)
+        };
+
+        let after_pid = rest.add(file_offset as usize);
+        let after_len = if file_offset < rest_len { rest_len - file_offset } else { 0 };
+
+        if after_len == 0 {
+            // /proc/<pid> — directory
+            (*reply).label = SALTY_OK;
+            (*reply).length = 8;
+            (*reply).regs[0] = pid as u64; // ino
+            (*reply).regs[1] = (S_IFDIR_L | 0o555) as u64; // mode
+            (*reply).regs[2] = 2; // nlink
+            (*reply).regs[3] = 0; // size
+            (*reply).regs[4] = 0; // uid
+            (*reply).regs[5] = 0; // gid
+            (*reply).regs[6] = 0; // mtime
+            (*reply).regs[7] = FTYPE_PROC_FILE as u64;
+            return true;
+        }
+
+        let (file_name, file_name_len) = if after_len > 0 && *after_pid == b'/' {
+            (after_pid.add(1), after_len - 1)
+        } else {
+            (after_pid, after_len)
+        };
+
+        let is_known = (file_name_len == 6 && mem_eq(file_name, b"status".as_ptr(), 6))
+            || (file_name_len == 4 && mem_eq(file_name, b"stat".as_ptr(), 4))
+            || (file_name_len == 4 && mem_eq(file_name, b"maps".as_ptr(), 4));
+
+        if !is_known {
+            (*reply).label = SALTY_NOT_FOUND;
+            return true;
+        }
+
+        // Regular file stat
+        (*reply).label = SALTY_OK;
+        (*reply).length = 8;
+        (*reply).regs[0] = 0; // ino (virtual)
+        (*reply).regs[1] = (S_IFREG_L | 0o444) as u64; // mode
+        (*reply).regs[2] = 1; // nlink
+        (*reply).regs[3] = 0; // size (unknown for virtual files)
+        (*reply).regs[4] = 0; // uid
+        (*reply).regs[5] = 0; // gid
+        (*reply).regs[6] = 0; // mtime
+        (*reply).regs[7] = FTYPE_PROC_FILE as u64;
+        true
+    }
+}
+
+/// Handle read for FTYPE_PROC_FILE inodes.
+/// Generates content on-the-fly from procmgr/mmsrv.
+unsafe fn handle_proc_read(
+    inode: *const RamfsInode, offset: u64, reply: *mut SaltyMsg,
+) {
+    unsafe {
+        let pid = (*inode).size as u32;
+        let proc_type = (*inode).dev_type;
+
+        // Generate content into a stack buffer
+        let mut content = [0u8; 512];
+        let content_len = match proc_type {
+            PROC_FILE_STATUS => proc_gen_status(pid, content.as_mut_ptr(), 512),
+            PROC_FILE_STAT => proc_gen_stat(pid, content.as_mut_ptr(), 512),
+            PROC_FILE_MAPS => {
+                // /proc/<pid>/maps — query mmsrv for memory stats
+                let mut heap_base: u64 = 0;
+                let mut heap_current: u64 = 0;
+                let mut region_count: u64 = 0;
+                let mut total_pages: u64 = 0;
+                if proc_get_mem_stats(pid, &mut heap_base, &mut heap_current,
+                    &mut region_count, &mut total_pages)
+                {
+                    let mut pos = 0usize;
+                    let mut tmp = [0u8; 20];
+                    // "heap: <base>-<current> <pages> pages\n"
+                    let hdr = b"heap: ";
+                    for b in hdr { if pos < 512 { content[pos] = *b; pos += 1; } }
+                    let n = fmt_u64_hex(heap_base, &mut tmp);
+                    for i in 0..n { if pos < 512 { content[pos] = tmp[i]; pos += 1; } }
+                    if pos < 512 { content[pos] = b'-'; pos += 1; }
+                    let n = fmt_u64_hex(heap_current, &mut tmp);
+                    for i in 0..n { if pos < 512 { content[pos] = tmp[i]; pos += 1; } }
+                    if pos < 512 { content[pos] = b'\n'; pos += 1; }
+                    // "regions: <count>\n"
+                    let hdr = b"regions: ";
+                    for b in hdr { if pos < 512 { content[pos] = *b; pos += 1; } }
+                    let n = fmt_u32(region_count as u32, &mut tmp);
+                    for i in 0..n { if pos < 512 { content[pos] = tmp[i]; pos += 1; } }
+                    if pos < 512 { content[pos] = b'\n'; pos += 1; }
+                    // "pages: <total>\n"
+                    let hdr = b"pages: ";
+                    for b in hdr { if pos < 512 { content[pos] = *b; pos += 1; } }
+                    let n = fmt_u32(total_pages as u32, &mut tmp);
+                    for i in 0..n { if pos < 512 { content[pos] = tmp[i]; pos += 1; } }
+                    if pos < 512 { content[pos] = b'\n'; pos += 1; }
+                    pos
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+
+        if offset as usize >= content_len {
+            // EOF
+            (*reply).label = SALTY_OK;
+            (*reply).length = 1;
+            (*reply).regs[0] = 0;
+            return;
+        }
+
+        let available = content_len - offset as usize;
+        let max_ipc = 152; // 19 regs * 8 bytes
+        let to_copy = if available < max_ipc { available } else { max_ipc };
+
+        let dst = &mut (*reply).regs[1] as *mut u64 as *mut u8;
+        for i in 0..to_copy {
+            *dst.add(i) = content[offset as usize + i];
+        }
+        (*reply).label = SALTY_OK;
+        (*reply).length = 1 + ((to_copy as u64 + 7) / 8);
+        (*reply).regs[0] = to_copy as u64;
+    }
+}
+
+/// Handle readdir for /proc root — returns PID entries.
+unsafe fn handle_proc_readdir(
+    inode: *const RamfsInode, cursor: u32, reply: *mut SaltyMsg,
+) {
+    unsafe {
+        if (*inode).dev_type == PROC_FILE_ROOT {
+            // /proc root readdir: list PIDs + "self"
+            let mut pids = [0u32; 19];
+            let count = proc_list_pids(&mut pids);
+
+            // cursor 0 = "self", then PIDs
+            if cursor == 0 {
+                // Return "self" entry
+                (*reply).label = SALTY_OK;
+                (*reply).regs[0] = 4; // name_len = 4
+                (*reply).regs[1] = cursor as u64 + 1; // next cursor
+                (*reply).regs[2] = 0; // ino
+                (*reply).regs[3] = 10; // DT_LNK
+                let dst = &mut (*reply).regs[4] as *mut u64 as *mut u8;
+                *dst = b's'; *dst.add(1) = b'e'; *dst.add(2) = b'l'; *dst.add(3) = b'f';
+                (*reply).length = 5;
+                return;
+            }
+
+            let idx = (cursor - 1) as usize;
+            if idx >= count {
+                // No more entries
+                (*reply).label = SALTY_OK;
+                (*reply).regs[0] = 0; // name_len = 0 → end
+                (*reply).length = 1;
+                return;
+            }
+
+            // Format PID as string
+            let mut name_buf = [0u8; 10];
+            let name_len = fmt_u32(pids[idx], &mut name_buf);
+
+            (*reply).label = SALTY_OK;
+            (*reply).regs[0] = name_len as u64;
+            (*reply).regs[1] = cursor as u64 + 1;
+            (*reply).regs[2] = pids[idx] as u64; // ino = pid
+            (*reply).regs[3] = 4; // DT_DIR
+            let dst = &mut (*reply).regs[4] as *mut u64 as *mut u8;
+            for i in 0..name_len { *dst.add(i) = name_buf[i]; }
+            (*reply).length = 5;
+        } else if (*inode).dev_type == PROC_FILE_PID_DIR {
+            // /proc/<pid> readdir: list status, stat, maps
+            let entries: &[&[u8]] = &[b"status", b"stat", b"maps"];
+            let cursor_idx = cursor as usize;
+            if cursor_idx >= entries.len() {
+                (*reply).label = SALTY_OK;
+                (*reply).regs[0] = 0;
+                (*reply).length = 1;
+                return;
+            }
+            let entry = entries[cursor_idx];
+            (*reply).label = SALTY_OK;
+            (*reply).regs[0] = entry.len() as u64;
+            (*reply).regs[1] = cursor as u64 + 1;
+            (*reply).regs[2] = 0; // ino
+            (*reply).regs[3] = 8; // DT_REG
+            let dst = &mut (*reply).regs[4] as *mut u64 as *mut u8;
+            for i in 0..entry.len() { *dst.add(i) = entry[i]; }
+            (*reply).length = 5;
+        } else {
+            (*reply).label = SALTY_NOT_FOUND;
+        }
     }
 }
 
@@ -6695,6 +8239,7 @@ pub extern "C" fn _start() -> ! {
     }
 
     unsafe {
+        urandom_init();
         init_ramfs();
         init_fb_info();
     }
@@ -6855,7 +8400,7 @@ pub extern "C" fn _start() -> ! {
                 VFS_RMDIR => { handle_rmdir(&raw const msg, &raw mut reply); }
                 VFS_OPENDIR => { handle_opendir(&raw const msg, &raw mut reply, badge); }
                 VFS_READDIR => { handle_readdir(&raw const msg, &raw mut reply, badge); }
-                VFS_LSTAT => { handle_stat(&raw const msg, &raw mut reply, badge); }
+                VFS_LSTAT => { handle_lstat(&raw const msg, &raw mut reply, badge); }
                 VFS_POLL => {
                     skip_reply = handle_poll(&raw const msg, &raw mut reply, badge);
                 }
@@ -6970,9 +8515,14 @@ pub extern "C" fn _start() -> ! {
                 VFS_FCHOWNAT => {
                     handle_fchownat(&raw const msg, &raw mut reply, badge);
                 }
-                VFS_LINKAT | VFS_SYMLINKAT | VFS_READLINKAT => {
-                    // No hard links or symlinks — ENOSYS
-                    reply.label = SALTY_INVALID_OPERATION;
+                VFS_LINKAT => {
+                    handle_linkat(&raw const msg, &raw mut reply, badge);
+                }
+                VFS_SYMLINKAT => {
+                    handle_symlinkat(&raw const msg, &raw mut reply, badge);
+                }
+                VFS_READLINKAT => {
+                    handle_readlinkat(&raw const msg, &raw mut reply, badge);
                 }
                 VFS_UTIMENSAT => {
                     handle_utimensat(&raw const msg, &raw mut reply, badge);

@@ -1802,6 +1802,41 @@ unsafe fn handle_mm_map_batch(msg: *const SaltyMsg, _caller_badge: u64, reply: *
     }
 }
 
+/// MM_GET_CLIENT_STATS: return memory stats for a client identified by PID.
+/// Request: regs[0] = pid
+/// Reply: regs[0]=heap_base, regs[1]=heap_current, regs[2]=region_count, regs[3]=total_pages
+unsafe fn handle_mm_get_client_stats(msg: *const SaltyMsg, _badge: u64, reply: *mut SaltyMsg) {
+    unsafe {
+        let pid = (*msg).regs[0] as u32;
+        let ptr = *(&raw const CLIENTS_PTR);
+        let cap = *(&raw const CLIENTS_CAP);
+        let mut found = false;
+        for i in 0..cap {
+            let c = ptr.add(i);
+            if (*c).active && (*c).pid == pid {
+                (*reply).regs[0] = (*c).heap_base;
+                (*reply).regs[1] = (*c).heap_current;
+                (*reply).regs[2] = (*c).region_count as u64;
+                let mut total_pages: u64 = 0;
+                for r in 0..(*c).region_count {
+                    let region = (*c).regions.add(r);
+                    if (*region).active {
+                        total_pages += (*region).frame_count as u64;
+                    }
+                }
+                (*reply).regs[3] = total_pages;
+                (*reply).label = SALTY_OK;
+                (*reply).length = 4;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            (*reply).label = SALTY_NOT_FOUND;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -1935,6 +1970,7 @@ pub extern "C" fn _start() -> ! {
                 MM_SHM_CREATE => handle_mm_shm_create(&raw const msg, badge, &raw mut reply),
                 MM_SHM_MAP => handle_mm_shm_map(&raw const msg, badge, &raw mut reply),
                 MM_SHM_UNMAP => handle_mm_shm_unmap(&raw const msg, badge, &raw mut reply),
+                MM_GET_CLIENT_STATS => handle_mm_get_client_stats(&raw const msg, badge, &raw mut reply),
                 // VMFault: label=2 from kernel FaultType::VMFault.
                 // Badge identifies the faulting client. Replying resumes the faulting thread.
                 //

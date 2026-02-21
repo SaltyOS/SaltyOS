@@ -2593,6 +2593,17 @@ pub unsafe fn handle_spawn_tx(
         }
 
         // SPAWN_FLAG_RESPAWN: mark process for automatic restart on exit
+        // Set process name (up to 31 chars + NUL)
+        {
+            let name_copy = if name_len > 31 { 31 } else { name_len };
+            for i in 0..name_copy {
+                p.name[i] = name[i];
+            }
+            for i in name_copy..32 {
+                p.name[i] = 0;
+            }
+        }
+
         if (spawn_flags & SPAWN_FLAG_RESPAWN) != 0 {
             p.respawn = true;
             let copy_len = if name_len > proc_table::MAX_NAME_LEN {

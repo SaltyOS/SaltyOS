@@ -94,6 +94,8 @@ pub struct Process {
     pub respawn: bool,
     /// NUL-terminated binary name for respawn.
     pub respawn_binary: [u8; MAX_NAME_LEN],
+    /// NUL-terminated process name (set at spawn/exec).
+    pub name: [u8; 32],
 }
 
 impl Process {
@@ -130,6 +132,7 @@ impl Process {
             has_service_ep: false,
             respawn: false,
             respawn_binary: [0; MAX_NAME_LEN],
+            name: [0; 32],
         }
     }
 }

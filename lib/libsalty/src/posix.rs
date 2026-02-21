@@ -32,7 +32,7 @@ const CAP_VFS_EP: u64 = 4;
 unsafe fn pack_path(msg: *mut SaltyMsg, offset: usize, path: *const u8) -> u8 {
     unsafe {
         let mut path_len: u8 = 0;
-        while *path.add(path_len as usize) != 0 && path_len < 64 {
+        while *path.add(path_len as usize) != 0 && path_len < 128 {
             path_len += 1;
         }
         (*msg).regs[offset] = path_len as u64;
@@ -342,7 +342,35 @@ pub unsafe fn posix_stat(path: *const u8, st: *mut SaltyStat) -> i32 {
 
 /// Get file status by path (symlink-aware). Currently identical to `posix_stat`.
 pub unsafe fn posix_lstat(path: *const u8, st: *mut SaltyStat) -> i32 {
-    unsafe { posix_stat(path, st) }
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_LSTAT;
+        let path_len = pack_path(&raw mut msg, 0, path);
+        msg.length = 1 + ((path_len as u64 + 7) / 8);
+
+        let err = crate::ipc::call_ctx(
+            crate::tls::current_ipc_ctx(),
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+
+        if !st.is_null() {
+            (*st).st_ino = reply.regs[0];
+            (*st).st_mode = reply.regs[1];
+            (*st).st_nlink = reply.regs[2];
+            (*st).st_size = reply.regs[3];
+            (*st).st_uid = reply.regs[4];
+            (*st).st_gid = reply.regs[5];
+            (*st).st_mtime = reply.regs[6];
+            (*st).st_type = reply.regs[7];
+        }
+        0
+    }
 }
 
 /// Get file status by open file descriptor. Returns 0 on success, -1 on error.
@@ -596,7 +624,7 @@ pub unsafe fn posix_readdir(dir_fd: i32, entry: *mut SaltyDirent) -> i32 {
             (*entry).d_ino = reply.regs[2];
             (*entry).d_type = reply.regs[3] as u8;
             let src = &reply.regs[4] as *const u64 as *const u8;
-            let max_copy = if name_len < 61 { name_len } else { 61 };
+            let max_copy = if name_len < 127 { name_len } else { 127 };
             for i in 0..max_copy as usize {
                 (*entry).d_name[i] = *src.add(i);
             }
@@ -2286,6 +2314,161 @@ pub unsafe fn posix_fb_ioctl(fd: i32, cmd: u64, result: *mut [u64; 5]) -> i32 {
             for i in 0..5 {
                 (*result)[i] = reply.regs[i];
             }
+        }
+        0
+    }
+}
+
+/// Create a symbolic link at `linkpath` pointing to `target`.
+/// Returns 0 on success, -1 on error.
+pub unsafe fn posix_symlink(target: *const u8, linkpath: *const u8) -> i32 {
+    unsafe { posix_symlinkat(target, -100, linkpath) }
+}
+
+/// Create a symbolic link at `linkpath` (relative to `newdirfd`) pointing to `target`.
+/// IPC layout: regs[0]=target_len, regs[1..9]=target(64B), regs[9]=link_len, regs[10..18]=link(64B)
+/// Returns 0 on success, -1 on error.
+pub unsafe fn posix_symlinkat(target: *const u8, newdirfd: i32, linkpath: *const u8) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_SYMLINKAT;
+
+        // Measure target length
+        let mut target_len: u8 = 0;
+        while *target.add(target_len as usize) != 0 && target_len < 64 {
+            target_len += 1;
+        }
+
+        // Measure link path length
+        let mut link_len: u8 = 0;
+        while *linkpath.add(link_len as usize) != 0 && link_len < 64 {
+            link_len += 1;
+        }
+
+        // Pack target into regs[0..9]: regs[0]=target_len, regs[1..9]=target bytes
+        msg.regs[0] = target_len as u64;
+        let dst = &mut msg.regs[1] as *mut u64 as *mut u8;
+        for i in 0..target_len as usize {
+            *dst.add(i) = *target.add(i);
+        }
+
+        // Pack link path into regs[9..18]: regs[9]=link_len, regs[10..18]=link bytes
+        msg.regs[9] = link_len as u64;
+        let dst2 = &mut msg.regs[10] as *mut u64 as *mut u8;
+        for i in 0..link_len as usize {
+            *dst2.add(i) = *linkpath.add(i);
+        }
+
+        msg.length = 18;
+
+        let err = crate::ipc::call_ctx(
+            crate::tls::current_ipc_ctx(),
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+        0
+    }
+}
+
+/// Read the target of a symbolic link at `path`.
+/// Returns the number of bytes placed in `buf`, or -1 on error.
+pub unsafe fn posix_readlink(path: *const u8, buf: *mut u8, bufsiz: usize) -> i64 {
+    unsafe { posix_readlinkat(-100, path, buf, bufsiz) }
+}
+
+/// Read the target of a symbolic link at `path` (relative to `dirfd`).
+/// IPC layout: regs[0]=path_len, regs[1..]=path bytes
+/// Reply: regs[0]=target_len, regs[1..]=target bytes
+/// Returns the number of bytes placed in `buf`, or -1 on error.
+pub unsafe fn posix_readlinkat(dirfd: i32, path: *const u8, buf: *mut u8, bufsiz: usize) -> i64 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_READLINKAT;
+        let path_len = pack_path(&raw mut msg, 0, path);
+        msg.length = 1 + ((path_len as u64 + 7) / 8);
+
+        let err = crate::ipc::call_ctx(
+            crate::tls::current_ipc_ctx(),
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
+        }
+
+        let target_len = reply.regs[0] as usize;
+        let copy_len = if target_len < bufsiz { target_len } else { bufsiz };
+        let src = &reply.regs[1] as *const u64 as *const u8;
+        for i in 0..copy_len {
+            *buf.add(i) = *src.add(i);
+        }
+        copy_len as i64
+    }
+}
+
+/// Create a hard link: `newpath` becomes an additional name for `oldpath`.
+/// Returns 0 on success, -1 on error.
+pub unsafe fn posix_link(oldpath: *const u8, newpath: *const u8) -> i32 {
+    unsafe { posix_linkat(-100, oldpath, -100, newpath, 0) }
+}
+
+/// Create a hard link: `newpath` (relative to `newdirfd`) becomes an additional
+/// name for the file at `oldpath` (relative to `olddirfd`).
+/// IPC layout: regs[0]=old_len, regs[1..9]=oldpath(64B), regs[9]=new_len, regs[10..18]=newpath(64B)
+/// Returns 0 on success, -1 on error.
+pub unsafe fn posix_linkat(
+    _olddirfd: i32, oldpath: *const u8,
+    _newdirfd: i32, newpath: *const u8,
+    _flags: i32,
+) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_VFS_LINKAT;
+
+        // Measure old path length
+        let mut old_len: u8 = 0;
+        while *oldpath.add(old_len as usize) != 0 && old_len < 64 {
+            old_len += 1;
+        }
+
+        // Measure new path length
+        let mut new_len: u8 = 0;
+        while *newpath.add(new_len as usize) != 0 && new_len < 64 {
+            new_len += 1;
+        }
+
+        // Pack old path into regs[0..9]
+        msg.regs[0] = old_len as u64;
+        let dst = &mut msg.regs[1] as *mut u64 as *mut u8;
+        for i in 0..old_len as usize {
+            *dst.add(i) = *oldpath.add(i);
+        }
+
+        // Pack new path into regs[9..18]
+        msg.regs[9] = new_len as u64;
+        let dst2 = &mut msg.regs[10] as *mut u64 as *mut u8;
+        for i in 0..new_len as usize {
+            *dst2.add(i) = *newpath.add(i);
+        }
+
+        msg.length = 18;
+
+        let err = crate::ipc::call_ctx(
+            crate::tls::current_ipc_ctx(),
+            CAP_VFS_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != SALTY_OK {
+            return -1;
         }
         0
     }

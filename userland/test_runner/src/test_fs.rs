@@ -299,6 +299,253 @@ pub fn run() -> bool {
         posix::posix_rmdir(b"/tmp2\0".as_ptr());
     }
 
+    // Test 13: /dev/urandom
+    puts(b"[TEST_FS] Test 13: /dev/urandom\n");
+    let fd = unsafe { posix::posix_open(b"/dev/urandom\0".as_ptr(), O_RDONLY as i32) };
+    if fd < 0 {
+        puts(b"[TEST_FS] FAIL: open /dev/urandom failed\n");
+        return false;
+    }
+    let mut ubuf1 = [0u8; 32];
+    let mut ubuf2 = [0u8; 32];
+    let r1 = unsafe { posix::posix_read(fd, ubuf1.as_mut_ptr(), 32) };
+    let r2 = unsafe { posix::posix_read(fd, ubuf2.as_mut_ptr(), 32) };
+    unsafe { posix::posix_close(fd) };
+    if r1 != 32 || r2 != 32 {
+        puts(b"[TEST_FS] FAIL: urandom read count wrong\n");
+        return false;
+    }
+    // Check non-zero (probabilistic but extremely unlikely to fail)
+    let mut all_zero = true;
+    for i in 0..32 {
+        if ubuf1[i] != 0 { all_zero = false; break; }
+    }
+    if all_zero {
+        puts(b"[TEST_FS] FAIL: urandom returned all zeros\n");
+        return false;
+    }
+    // Two reads should differ
+    let mut same = true;
+    for i in 0..32 {
+        if ubuf1[i] != ubuf2[i] { same = false; break; }
+    }
+    if same {
+        puts(b"[TEST_FS] FAIL: two urandom reads identical\n");
+        return false;
+    }
+    puts(b"[TEST_FS] PASS: /dev/urandom OK\n");
+
+    // Test 14: Long path (>64 bytes)
+    puts(b"[TEST_FS] Test 14: long path\n");
+    unsafe { posix::posix_mkdir(b"/tmp\0".as_ptr(), 0o755) };
+    unsafe { posix::posix_mkdir(b"/tmp/a_very_long_directory_name_here\0".as_ptr(), 0o755) };
+    // Path = /tmp/a_very_long_directory_name_here/test_long_path.txt (total > 64 bytes)
+    let long_path = b"/tmp/a_very_long_directory_name_here/test_long_path.txt\0";
+    let fd = unsafe { posix::posix_open(long_path.as_ptr(), (O_CREAT | O_RDWR) as i32) };
+    if fd < 0 {
+        puts(b"[TEST_FS] FAIL: open long path failed\n");
+        return false;
+    }
+    unsafe {
+        posix::posix_write(fd, b"long".as_ptr(), 4);
+        posix::posix_close(fd);
+    }
+    let ret = unsafe { posix::posix_stat(long_path.as_ptr(), &raw mut st) };
+    if ret != 0 {
+        puts(b"[TEST_FS] FAIL: stat long path failed\n");
+        return false;
+    }
+    // Cleanup
+    unsafe {
+        posix::posix_unlink(long_path.as_ptr());
+        posix::posix_rmdir(b"/tmp/a_very_long_directory_name_here\0".as_ptr());
+    }
+    puts(b"[TEST_FS] PASS: long path OK\n");
+
+    // Test 15: Large file (>8KB)
+    puts(b"[TEST_FS] Test 15: large file write/read\n");
+    let fd = unsafe { posix::posix_open(b"/tmp/bigfile\0".as_ptr(), (O_CREAT | O_RDWR) as i32) };
+    if fd < 0 {
+        puts(b"[TEST_FS] FAIL: create bigfile failed\n");
+        return false;
+    }
+    // Write 10KB of data (pattern: byte position mod 251)
+    let mut wbuf = [0u8; 128];
+    let target_size: usize = 10240;
+    let mut written_total: usize = 0;
+    while written_total < target_size {
+        let chunk = if target_size - written_total < 128 { target_size - written_total } else { 128 };
+        for j in 0..chunk {
+            wbuf[j] = ((written_total + j) % 251) as u8;
+        }
+        let w = unsafe { posix::posix_write(fd, wbuf.as_ptr(), chunk as u64) };
+        if w <= 0 {
+            puts(b"[TEST_FS] FAIL: large write returned 0\n");
+            return false;
+        }
+        written_total += w as usize;
+    }
+    unsafe { posix::posix_close(fd) };
+
+    // Re-open and verify
+    let fd = unsafe { posix::posix_open(b"/tmp/bigfile\0".as_ptr(), O_RDONLY as i32) };
+    if fd < 0 {
+        puts(b"[TEST_FS] FAIL: re-open bigfile failed\n");
+        return false;
+    }
+    let mut read_total: usize = 0;
+    let mut rbuf = [0u8; 128];
+    loop {
+        let r = unsafe { posix::posix_read(fd, rbuf.as_mut_ptr(), 128) };
+        if r <= 0 { break; }
+        for j in 0..r as usize {
+            if rbuf[j] != ((read_total + j) % 251) as u8 {
+                puts(b"[TEST_FS] FAIL: large file data mismatch\n");
+                unsafe { posix::posix_close(fd) };
+                return false;
+            }
+        }
+        read_total += r as usize;
+    }
+    unsafe { posix::posix_close(fd) };
+    if read_total != target_size {
+        puts(b"[TEST_FS] FAIL: large file size mismatch\n");
+        return false;
+    }
+    unsafe { posix::posix_unlink(b"/tmp/bigfile\0".as_ptr()) };
+    puts(b"[TEST_FS] PASS: large file (10KB) write/read OK\n");
+
+    // Test 16: Symlink
+    puts(b"[TEST_FS] Test 16: symlink\n");
+    let fd = unsafe { posix::posix_open(b"/tmp/orig.txt\0".as_ptr(), (O_CREAT | O_RDWR) as i32) };
+    if fd < 0 {
+        puts(b"[TEST_FS] FAIL: create orig.txt failed\n");
+        return false;
+    }
+    unsafe {
+        posix::posix_write(fd, b"symlink_test".as_ptr(), 12);
+        posix::posix_close(fd);
+    }
+    let ret = unsafe { posix::posix_symlink(b"/tmp/orig.txt\0".as_ptr(), b"/tmp/link.txt\0".as_ptr()) };
+    if ret != 0 {
+        puts(b"[TEST_FS] FAIL: symlink creation failed\n");
+        return false;
+    }
+    // Read through symlink
+    let fd = unsafe { posix::posix_open(b"/tmp/link.txt\0".as_ptr(), O_RDONLY as i32) };
+    if fd < 0 {
+        puts(b"[TEST_FS] FAIL: open through symlink failed\n");
+        return false;
+    }
+    buf = [0u8; 64];
+    let rd = unsafe { posix::posix_read(fd, buf.as_mut_ptr(), 64) };
+    unsafe { posix::posix_close(fd) };
+    if rd != 12 || !streq(&buf[..12], b"symlink_test") {
+        puts(b"[TEST_FS] FAIL: symlink read-through wrong\n");
+        return false;
+    }
+    // readlink
+    let mut lbuf = [0u8; 128];
+    let rl = unsafe { posix::posix_readlink(b"/tmp/link.txt\0".as_ptr(), lbuf.as_mut_ptr(), 128) };
+    if rl <= 0 {
+        puts(b"[TEST_FS] FAIL: readlink failed\n");
+        return false;
+    }
+    if !streq(&lbuf[..rl as usize], b"/tmp/orig.txt") {
+        puts(b"[TEST_FS] FAIL: readlink target mismatch\n");
+        return false;
+    }
+    // lstat shows symlink type
+    let ret = unsafe { posix::posix_lstat(b"/tmp/link.txt\0".as_ptr(), &raw mut st) };
+    if ret != 0 {
+        puts(b"[TEST_FS] FAIL: lstat on symlink failed\n");
+        return false;
+    }
+    if (st.st_mode & S_IFMT) != S_IFLNK {
+        puts(b"[TEST_FS] FAIL: lstat mode is not symlink\n");
+        return false;
+    }
+    // stat follows symlink — should show regular file
+    let ret = unsafe { posix::posix_stat(b"/tmp/link.txt\0".as_ptr(), &raw mut st) };
+    if ret != 0 || (st.st_mode & S_IFMT) != S_IFREG {
+        puts(b"[TEST_FS] FAIL: stat through symlink not regular\n");
+        return false;
+    }
+    unsafe {
+        posix::posix_unlink(b"/tmp/link.txt\0".as_ptr());
+        posix::posix_unlink(b"/tmp/orig.txt\0".as_ptr());
+    }
+    puts(b"[TEST_FS] PASS: symlink OK\n");
+
+    // Test 17: Hard link
+    puts(b"[TEST_FS] Test 17: hard link\n");
+    let fd = unsafe { posix::posix_open(b"/tmp/src.txt\0".as_ptr(), (O_CREAT | O_RDWR) as i32) };
+    if fd < 0 {
+        puts(b"[TEST_FS] FAIL: create src.txt failed\n");
+        return false;
+    }
+    unsafe {
+        posix::posix_write(fd, b"hardlink".as_ptr(), 8);
+        posix::posix_close(fd);
+    }
+    let ret = unsafe { posix::posix_link(b"/tmp/src.txt\0".as_ptr(), b"/tmp/dst.txt\0".as_ptr()) };
+    if ret != 0 {
+        puts(b"[TEST_FS] FAIL: link creation failed\n");
+        return false;
+    }
+    // Check nlink == 2
+    let ret = unsafe { posix::posix_stat(b"/tmp/src.txt\0".as_ptr(), &raw mut st) };
+    if ret != 0 || st.st_nlink != 2 {
+        puts(b"[TEST_FS] FAIL: nlink should be 2 after link\n");
+        return false;
+    }
+    // Unlink original, read through hardlink
+    unsafe { posix::posix_unlink(b"/tmp/src.txt\0".as_ptr()) };
+    let fd = unsafe { posix::posix_open(b"/tmp/dst.txt\0".as_ptr(), O_RDONLY as i32) };
+    if fd < 0 {
+        puts(b"[TEST_FS] FAIL: open hardlink after unlink original failed\n");
+        return false;
+    }
+    buf = [0u8; 64];
+    let rd = unsafe { posix::posix_read(fd, buf.as_mut_ptr(), 64) };
+    unsafe { posix::posix_close(fd) };
+    if rd != 8 || !streq(&buf[..8], b"hardlink") {
+        puts(b"[TEST_FS] FAIL: hardlink read-through wrong\n");
+        return false;
+    }
+    unsafe { posix::posix_unlink(b"/tmp/dst.txt\0".as_ptr()) };
+    puts(b"[TEST_FS] PASS: hard link OK\n");
+
+    // Test 18: /proc/self/status
+    puts(b"[TEST_FS] Test 18: /proc/self/status\n");
+    let ret = unsafe { posix::posix_stat(b"/proc\0".as_ptr(), &raw mut st) };
+    if ret != 0 {
+        puts(b"[TEST_FS] FAIL: stat /proc failed\n");
+        return false;
+    }
+    let fd = unsafe { posix::posix_open(b"/proc/self/status\0".as_ptr(), O_RDONLY as i32) };
+    if fd < 0 {
+        puts(b"[TEST_FS] FAIL: open /proc/self/status failed\n");
+        return false;
+    }
+    buf = [0u8; 64];
+    let rd = unsafe { posix::posix_read(fd, buf.as_mut_ptr(), 64) };
+    unsafe { posix::posix_close(fd) };
+    if rd <= 0 {
+        puts(b"[TEST_FS] FAIL: read /proc/self/status empty\n");
+        return false;
+    }
+    // Should start with "Name:" or "Pid:"
+    let has_pid = rd >= 4 && (buf[0] == b'N' || buf[0] == b'P');
+    if !has_pid {
+        puts(b"[TEST_FS] FAIL: /proc/self/status unexpected content\n");
+        return false;
+    }
+    puts(b"[TEST_FS] PASS: /proc/self/status OK\n");
+
+    // Cleanup /tmp
+    unsafe { posix::posix_rmdir(b"/tmp\0".as_ptr()) };
+
     puts(b"[TEST_FS] All filesystem tests PASSED\n");
     true
 }

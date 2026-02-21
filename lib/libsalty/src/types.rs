@@ -274,13 +274,13 @@ impl SaltyStat {
 }
 
 /// POSIX-compatible directory entry returned by `posix_readdir`.
-/// `d_name` is null-terminated, max 61 chars + NUL.
+/// `d_name` is null-terminated, max 127 chars + NUL.
 #[repr(C)]
 pub struct SaltyDirent {
     pub d_ino: u64,
     pub d_type: u8,
     pub d_namlen: u8,
-    pub d_name: [u8; 62],
+    pub d_name: [u8; 128],
 }
 
 impl SaltyDirent {
@@ -289,7 +289,7 @@ impl SaltyDirent {
             d_ino: 0,
             d_type: 0,
             d_namlen: 0,
-            d_name: [0; 62],
+            d_name: [0; 128],
         }
     }
 }
