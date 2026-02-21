@@ -2582,6 +2582,194 @@ unsafe fn mount_read_inline(
     }
 }
 
+/// Create a file via the mounted filesystem server.
+unsafe fn mount_create(
+    mount_idx: usize, parent_ino: u64,
+    name: *const u8, name_len: u8, mode: u32,
+) -> u64 {
+    unsafe {
+        let m = &*(&raw const MOUNTS[mount_idx]);
+        let mut req = SaltyMsg::zeroed();
+        req.label = SALTYFS_CREATE;
+        req.regs[0] = parent_ino;
+        req.regs[1] = mode as u64;
+        req.regs[2] = name_len as u64;
+        let dst = &raw mut req.regs[3] as *mut u8;
+        for i in 0..name_len as usize {
+            *dst.add(i) = *name.add(i);
+        }
+        req.length = 3 + ((name_len as u64) + 7) / 8;
+        let mut reply = SaltyMsg::zeroed();
+        ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut reply);
+        if reply.label != SALTY_OK {
+            return 0;
+        }
+        reply.regs[0]
+    }
+}
+
+/// Write data via the mounted filesystem server.
+unsafe fn mount_write_inline(
+    mount_idx: usize, remote_ino: u64, offset: u64,
+    data: *const u8, count: u64, reply: *mut SaltyMsg,
+) {
+    unsafe {
+        let m = &*(&raw const MOUNTS[mount_idx]);
+        let mut req = SaltyMsg::zeroed();
+        req.label = SALTYFS_WRITE_INLINE;
+        req.regs[0] = remote_ino;
+        req.regs[1] = offset;
+        req.regs[2] = count;
+        let dst = &raw mut req.regs[3] as *mut u8;
+        for i in 0..count as usize {
+            *dst.add(i) = *data.add(i);
+        }
+        req.length = 3 + (count + 7) / 8;
+        let mut fs_reply = SaltyMsg::zeroed();
+        ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
+        if fs_reply.label != SALTY_OK {
+            (*reply).label = fs_reply.label;
+            return;
+        }
+        (*reply).label = SALTY_OK;
+        (*reply).length = 1;
+        (*reply).regs[0] = fs_reply.regs[0];
+    }
+}
+
+/// Create a directory via the mounted filesystem server.
+unsafe fn mount_mkdir(
+    mount_idx: usize, parent_ino: u64,
+    name: *const u8, name_len: u8, mode: u32, reply: *mut SaltyMsg,
+) {
+    unsafe {
+        let m = &*(&raw const MOUNTS[mount_idx]);
+        let mut req = SaltyMsg::zeroed();
+        req.label = SALTYFS_MKDIR;
+        req.regs[0] = parent_ino;
+        req.regs[1] = mode as u64;
+        req.regs[2] = name_len as u64;
+        let dst = &raw mut req.regs[3] as *mut u8;
+        for i in 0..name_len as usize {
+            *dst.add(i) = *name.add(i);
+        }
+        req.length = 3 + ((name_len as u64) + 7) / 8;
+        let mut fs_reply = SaltyMsg::zeroed();
+        ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
+        (*reply).label = fs_reply.label;
+    }
+}
+
+/// Unlink a file via the mounted filesystem server.
+unsafe fn mount_unlink(
+    mount_idx: usize, parent_ino: u64,
+    name: *const u8, name_len: u8, reply: *mut SaltyMsg,
+) {
+    unsafe {
+        let m = &*(&raw const MOUNTS[mount_idx]);
+        let mut req = SaltyMsg::zeroed();
+        req.label = SALTYFS_UNLINK;
+        req.regs[0] = parent_ino;
+        req.regs[1] = name_len as u64;
+        let dst = &raw mut req.regs[2] as *mut u8;
+        for i in 0..name_len as usize {
+            *dst.add(i) = *name.add(i);
+        }
+        req.length = 2 + ((name_len as u64) + 7) / 8;
+        let mut fs_reply = SaltyMsg::zeroed();
+        ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
+        (*reply).label = fs_reply.label;
+    }
+}
+
+/// Remove a directory via the mounted filesystem server.
+unsafe fn mount_rmdir(
+    mount_idx: usize, parent_ino: u64,
+    name: *const u8, name_len: u8, reply: *mut SaltyMsg,
+) {
+    unsafe {
+        let m = &*(&raw const MOUNTS[mount_idx]);
+        let mut req = SaltyMsg::zeroed();
+        req.label = SALTYFS_RMDIR;
+        req.regs[0] = parent_ino;
+        req.regs[1] = name_len as u64;
+        let dst = &raw mut req.regs[2] as *mut u8;
+        for i in 0..name_len as usize {
+            *dst.add(i) = *name.add(i);
+        }
+        req.length = 2 + ((name_len as u64) + 7) / 8;
+        let mut fs_reply = SaltyMsg::zeroed();
+        ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
+        (*reply).label = fs_reply.label;
+    }
+}
+
+/// Rename a file/directory via the mounted filesystem server.
+unsafe fn mount_rename(
+    mount_idx: usize,
+    old_parent_ino: u64, old_name: *const u8, old_name_len: u8,
+    new_parent_ino: u64, new_name: *const u8, new_name_len: u8,
+    reply: *mut SaltyMsg,
+) {
+    unsafe {
+        let m = &*(&raw const MOUNTS[mount_idx]);
+        let mut req = SaltyMsg::zeroed();
+        req.label = SALTYFS_RENAME;
+        req.regs[0] = old_parent_ino;
+        req.regs[1] = old_name_len as u64;
+        let dst = &raw mut req.regs[2] as *mut u8;
+        for i in 0..old_name_len as usize {
+            *dst.add(i) = *old_name.add(i);
+        }
+        req.regs[5] = new_parent_ino;
+        req.regs[6] = new_name_len as u64;
+        let dst2 = &raw mut req.regs[7] as *mut u8;
+        for i in 0..new_name_len as usize {
+            *dst2.add(i) = *new_name.add(i);
+        }
+        req.length = 10;
+        let mut fs_reply = SaltyMsg::zeroed();
+        ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
+        (*reply).label = fs_reply.label;
+    }
+}
+
+/// Truncate a file via the mounted filesystem server.
+unsafe fn mount_truncate(
+    mount_idx: usize, remote_ino: u64, new_size: u64, reply: *mut SaltyMsg,
+) {
+    unsafe {
+        let m = &*(&raw const MOUNTS[mount_idx]);
+        let mut req = SaltyMsg::zeroed();
+        req.label = SALTYFS_TRUNCATE;
+        req.regs[0] = remote_ino;
+        req.regs[1] = new_size;
+        req.length = 2;
+        let mut fs_reply = SaltyMsg::zeroed();
+        ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
+        (*reply).label = fs_reply.label;
+    }
+}
+
+/// Split a sub-path into parent directory and leaf name components.
+/// Returns (parent_start, parent_len, leaf_start, leaf_len).
+fn split_mount_sub_path(
+    sub_path: *const u8, sub_len: u8,
+) -> (usize, u8, usize, u8) {
+    let mut last_slash: i32 = -1;
+    for i in (0..sub_len as usize).rev() {
+        if unsafe { *sub_path.add(i) } == b'/' {
+            last_slash = i as i32;
+            break;
+        }
+    }
+    if last_slash < 0 {
+        (0, 0, 0, sub_len)
+    } else {
+        (0, last_slash as u8, (last_slash + 1) as usize, sub_len - (last_slash as u8 + 1))
+    }
+}
+
 unsafe fn mount_readdir_emit_cached(fde: *mut FdEntry, reply: *mut SaltyMsg) {
     unsafe {
         let fd = &mut *fde;
@@ -2843,15 +3031,37 @@ unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
             let (_, sub_start, sub_len) = parse_mount_path(path_slice, path_len);
             if sub_len > 0 {
                 // File within mount — lookup and open
-                let remote_ino = mount_lookup(mount_idx, path_ptr.add(sub_start), sub_len);
+                let mut remote_ino = mount_lookup(mount_idx, path_ptr.add(sub_start), sub_len);
                 if remote_ino == 0 {
-                    (*reply).label = SALTY_NOT_FOUND;
-                    return;
+                    if (flags & O_CREAT) == 0 {
+                        (*reply).label = SALTY_NOT_FOUND;
+                        return;
+                    }
+                    // O_CREAT: create the file via mount FS server
+                    let (p_start, p_len, l_start, l_len) =
+                        split_mount_sub_path(path_ptr.add(sub_start), sub_len);
+                    let parent_ino = if p_len == 0 {
+                        (*(&raw const MOUNTS[mount_idx])).root_ino as u64
+                    } else {
+                        mount_lookup(mount_idx, path_ptr.add(sub_start + p_start), p_len)
+                    };
+                    if parent_ino == 0 {
+                        (*reply).label = SALTY_NOT_FOUND;
+                        return;
+                    }
+                    remote_ino = mount_create(
+                        mount_idx, parent_ino,
+                        path_ptr.add(sub_start + l_start), l_len, 0o644,
+                    );
+                    if remote_ino == 0 {
+                        (*reply).label = SALTY_INVALID_OPERATION;
+                        return;
+                    }
                 }
 
                 // Stat the remote inode for metadata
                 let stat = mount_stat(mount_idx, remote_ino);
-                let (size, _mode, _nlink, _mtime, is_dir) = match stat {
+                let (_size, _mode, _nlink, _mtime, is_dir) = match stat {
                     Some(s) => s,
                     None => {
                         (*reply).label = SALTY_NOT_FOUND;
@@ -2889,10 +3099,15 @@ unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
                     return;
                 }
 
-                // Regular file: read-only
-                if flags_allow_write(flags) {
-                    (*reply).label = SALTY_INVALID_OPERATION;
-                    return;
+                // Regular file: allow both read and write
+                // Handle O_TRUNC
+                if (flags & O_TRUNC) != 0 && flags_allow_write(flags) {
+                    let mut trunc_reply = SaltyMsg::zeroed();
+                    mount_truncate(mount_idx, remote_ino, 0, &raw mut trunc_reply);
+                    if trunc_reply.label != SALTY_OK {
+                        (*reply).label = trunc_reply.label;
+                        return;
+                    }
                 }
 
                 let cli = get_client(badge);
@@ -3802,6 +4017,28 @@ unsafe fn handle_unlink(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) 
             return;
         };
 
+        // Mount intercept
+        let path_slice = core::slice::from_raw_parts(path_ptr, path_len as usize);
+        if let Some(mount_idx) = find_mount_for_path(path_slice, path_len) {
+            let (_, sub_start, sub_len) = parse_mount_path(path_slice, path_len);
+            if sub_len > 0 {
+                let (p_start, p_len, l_start, l_len) =
+                    split_mount_sub_path(path_ptr.add(sub_start), sub_len);
+                let parent_ino = if p_len == 0 {
+                    (*(&raw const MOUNTS[mount_idx])).root_ino as u64
+                } else {
+                    mount_lookup(mount_idx, path_ptr.add(sub_start + p_start), p_len)
+                };
+                if parent_ino == 0 {
+                    (*reply).label = SALTY_NOT_FOUND;
+                    return;
+                }
+                mount_unlink(mount_idx, parent_ino,
+                    path_ptr.add(sub_start + l_start), l_len, reply);
+                return;
+            }
+        }
+
         let mut child_name: *const u8 = core::ptr::null();
         let mut child_len: u8 = 0;
         let parent = resolve_parent(path_ptr, path_len, &mut child_name, &mut child_len);
@@ -3871,6 +4108,60 @@ unsafe fn handle_rename(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) 
             return;
         };
 
+        // Mount intercept: both old and new must be in the same mount
+        let old_slice = core::slice::from_raw_parts(old_ptr, old_norm_len as usize);
+        let new_slice = core::slice::from_raw_parts(new_ptr, new_norm_len as usize);
+        let old_mount = find_mount_for_path(old_slice, old_norm_len);
+        let new_mount = find_mount_for_path(new_slice, new_norm_len);
+        match (old_mount, new_mount) {
+            (Some(oi), Some(ni)) if oi == ni => {
+                // Both paths in same mount — forward to FS server
+                let (_, old_sub_start, old_sub_len) =
+                    parse_mount_path(old_slice, old_norm_len);
+                let (_, new_sub_start, new_sub_len) =
+                    parse_mount_path(new_slice, new_norm_len);
+                if old_sub_len > 0 && new_sub_len > 0 {
+                    let (op_start, op_len, ol_start, ol_len) =
+                        split_mount_sub_path(old_ptr.add(old_sub_start), old_sub_len);
+                    let old_parent_ino = if op_len == 0 {
+                        (*(&raw const MOUNTS[oi])).root_ino as u64
+                    } else {
+                        mount_lookup(oi, old_ptr.add(old_sub_start + op_start), op_len)
+                    };
+                    if old_parent_ino == 0 {
+                        (*reply).label = SALTY_NOT_FOUND;
+                        return;
+                    }
+                    let (np_start, np_len, nl_start, nl_len) =
+                        split_mount_sub_path(new_ptr.add(new_sub_start), new_sub_len);
+                    let new_parent_ino = if np_len == 0 {
+                        (*(&raw const MOUNTS[oi])).root_ino as u64
+                    } else {
+                        mount_lookup(oi, new_ptr.add(new_sub_start + np_start), np_len)
+                    };
+                    if new_parent_ino == 0 {
+                        (*reply).label = SALTY_NOT_FOUND;
+                        return;
+                    }
+                    mount_rename(
+                        oi,
+                        old_parent_ino,
+                        old_ptr.add(old_sub_start + ol_start), ol_len,
+                        new_parent_ino,
+                        new_ptr.add(new_sub_start + nl_start), nl_len,
+                        reply,
+                    );
+                    return;
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                // Cross-mount rename not supported
+                (*reply).label = SALTY_INVALID_OPERATION;
+                return;
+            }
+            _ => {}
+        }
+
         // Resolve old parent + child
         let mut old_child: *const u8 = core::ptr::null();
         let mut old_child_len: u8 = 0;
@@ -3934,6 +4225,29 @@ unsafe fn handle_mkdir(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         };
+
+        // Mount intercept
+        let path_slice = core::slice::from_raw_parts(path_ptr, path_len as usize);
+        if let Some(mount_idx) = find_mount_for_path(path_slice, path_len) {
+            let (_, sub_start, sub_len) = parse_mount_path(path_slice, path_len);
+            if sub_len > 0 {
+                let (p_start, p_len, l_start, l_len) =
+                    split_mount_sub_path(path_ptr.add(sub_start), sub_len);
+                let parent_ino = if p_len == 0 {
+                    (*(&raw const MOUNTS[mount_idx])).root_ino as u64
+                } else {
+                    mount_lookup(mount_idx, path_ptr.add(sub_start + p_start), p_len)
+                };
+                if parent_ino == 0 {
+                    (*reply).label = SALTY_NOT_FOUND;
+                    return;
+                }
+                let mode = (*msg).regs[0] as u32 & 0o777;
+                mount_mkdir(mount_idx, parent_ino,
+                    path_ptr.add(sub_start + l_start), l_len, mode, reply);
+                return;
+            }
+        }
 
         let existing = resolve_path(path_ptr, path_len);
         if !existing.is_null() {
@@ -4035,6 +4349,28 @@ unsafe fn handle_rmdir(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         };
+
+        // Mount intercept
+        let path_slice = core::slice::from_raw_parts(path_ptr, path_len as usize);
+        if let Some(mount_idx) = find_mount_for_path(path_slice, path_len) {
+            let (_, sub_start, sub_len) = parse_mount_path(path_slice, path_len);
+            if sub_len > 0 {
+                let (p_start, p_len, l_start, l_len) =
+                    split_mount_sub_path(path_ptr.add(sub_start), sub_len);
+                let parent_ino = if p_len == 0 {
+                    (*(&raw const MOUNTS[mount_idx])).root_ino as u64
+                } else {
+                    mount_lookup(mount_idx, path_ptr.add(sub_start + p_start), p_len)
+                };
+                if parent_ino == 0 {
+                    (*reply).label = SALTY_NOT_FOUND;
+                    return;
+                }
+                mount_rmdir(mount_idx, parent_ino,
+                    path_ptr.add(sub_start + l_start), l_len, reply);
+                return;
+            }
+        }
 
         let inode = resolve_path(path_ptr, path_len);
         if inode.is_null() || (*inode).ftype != FTYPE_DIRECTORY {
@@ -8189,6 +8525,12 @@ unsafe fn handle_ftruncate(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
 
         let fde = *(*cli).fds.add(fd as usize);
 
+        if fde.fd_type == FD_TYPE_MOUNT {
+            mount_truncate(
+                fde.dev_type as usize, fde.sock_id as u64, length, reply);
+            return false;
+        }
+
         if fde.fd_type == FD_TYPE_SHM {
             let inode = inode_by_ino(fde.inode);
             if inode.is_null() || (*inode).ftype != FTYPE_SHM {
@@ -9359,6 +9701,33 @@ pub extern "C" fn _start() -> ! {
                             FD_TYPE_PIPE => {
                                 skip_reply = handle_pipe_write(
                                     &raw const msg, (*cli).fds.add(fd as usize), &raw mut reply, badge);
+                            }
+                            FD_TYPE_MOUNT => {
+                                let fde = &mut *(*cli).fds.add(fd as usize);
+                                if !flags_allow_write(fde.flags) {
+                                    reply.label = SALTY_INVALID_OPERATION;
+                                } else {
+                                    let mount_idx = fde.dev_type as usize;
+                                    let remote_ino = fde.sock_id as u64;
+                                    let mut count = msg.regs[1];
+                                    if count > 136 { count = 136; }
+                                    let mut offset = fde.offset;
+                                    if (fde.flags & O_APPEND) != 0 {
+                                        if let Some((sz, _, _, _, _)) =
+                                            mount_stat(mount_idx, remote_ino) {
+                                            offset = sz;
+                                        }
+                                    }
+                                    let src = &msg.regs[2] as *const u64 as *const u8;
+                                    mount_write_inline(
+                                        mount_idx, remote_ino, offset,
+                                        src, count, &raw mut reply,
+                                    );
+                                    if reply.label == SALTY_OK {
+                                        let written = reply.regs[0];
+                                        fde.offset = offset + written;
+                                    }
+                                }
                             }
                             _ => {
                                 handle_write(&raw const msg, &raw mut reply, badge);

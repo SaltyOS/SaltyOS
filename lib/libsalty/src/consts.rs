@@ -165,6 +165,13 @@ pub const SALTYFS_READDIR: u64 = 4;
 pub const SALTYFS_STAT: u64 = 5;
 pub const SALTYFS_GETINFO: u64 = 6;
 pub const SALTYFS_READ_INLINE: u64 = 7;
+pub const SALTYFS_WRITE_INLINE: u64 = 8;
+pub const SALTYFS_CREATE: u64 = 9;
+pub const SALTYFS_MKDIR: u64 = 10;
+pub const SALTYFS_UNLINK: u64 = 11;
+pub const SALTYFS_RMDIR: u64 = 12;
+pub const SALTYFS_RENAME: u64 = 13;
+pub const SALTYFS_TRUNCATE: u64 = 14;
 
 /// Fixed virtual addresses for well-known memory regions.
 pub const INITRD_VADDR: u64 = 0x0000_0000_0100_0000;
