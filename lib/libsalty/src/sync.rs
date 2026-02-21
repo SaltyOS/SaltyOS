@@ -598,6 +598,96 @@ impl RWLock {
         futex_wake(self.writer_futex_ptr(), u32::MAX);
     }
 
+    /// Try to acquire a shared (read) lock without blocking.
+    /// Returns true if acquired, false if a writer holds the lock.
+    pub fn try_read_lock(&self) -> bool {
+        loop {
+            let s = self.state.load(Ordering::Relaxed);
+            if s & WRITER_BIT != 0 {
+                return false;
+            }
+            if self.state.compare_exchange_weak(
+                s, s + 1, Ordering::Acquire, Ordering::Relaxed,
+            ).is_ok() {
+                return true;
+            }
+        }
+    }
+
+    /// Try to acquire an exclusive (write) lock without blocking.
+    /// Returns true if acquired, false if any readers or writer hold the lock.
+    pub fn try_write_lock(&self) -> bool {
+        self.state
+            .compare_exchange(0, WRITER_BIT, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Acquire a shared (read) lock with a timeout in nanoseconds.
+    /// Returns true if acquired, false on timeout.
+    pub fn read_lock_timeout(&self, timeout_ns: u64) -> bool {
+        let deadline_ns = monotonic_now_ns().saturating_add(timeout_ns);
+        loop {
+            let s = self.state.load(Ordering::Relaxed);
+            if s & WRITER_BIT == 0 {
+                if self.state.compare_exchange_weak(
+                    s, s + 1, Ordering::Acquire, Ordering::Relaxed,
+                ).is_ok() {
+                    return true;
+                }
+                continue;
+            }
+            let remaining = remaining_timeout_ns(deadline_ns);
+            if remaining == 0 {
+                return false;
+            }
+            let wake_val = self.writer_wake.load(Ordering::Relaxed);
+            let err = futex_wait_timeout(self.writer_futex_ptr(), wake_val, remaining);
+            if err == crate::consts::SALTY_CANCELLED {
+                // Timeout — one last try
+                let s2 = self.state.load(Ordering::Relaxed);
+                if s2 & WRITER_BIT == 0 {
+                    if self.state.compare_exchange(
+                        s2, s2 + 1, Ordering::Acquire, Ordering::Relaxed,
+                    ).is_ok() {
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
+    }
+
+    /// Acquire an exclusive (write) lock with a timeout in nanoseconds.
+    /// Returns true if acquired, false on timeout.
+    pub fn write_lock_timeout(&self, timeout_ns: u64) -> bool {
+        let deadline_ns = monotonic_now_ns().saturating_add(timeout_ns);
+        loop {
+            if self.state.compare_exchange_weak(
+                0, WRITER_BIT, Ordering::Acquire, Ordering::Relaxed,
+            ).is_ok() {
+                return true;
+            }
+            let s = self.state.load(Ordering::Relaxed);
+            if s != 0 {
+                let remaining = remaining_timeout_ns(deadline_ns);
+                if remaining == 0 {
+                    return false;
+                }
+                let wake_val = self.writer_wake.load(Ordering::Relaxed);
+                let err = futex_wait_timeout(self.writer_futex_ptr(), wake_val, remaining);
+                if err == crate::consts::SALTY_CANCELLED {
+                    // Timeout — one last try
+                    if self.state.compare_exchange(
+                        0, WRITER_BIT, Ordering::Acquire, Ordering::Relaxed,
+                    ).is_ok() {
+                        return true;
+                    }
+                    return false;
+                }
+            }
+        }
+    }
+
     #[inline]
     fn writer_futex_ptr(&self) -> *const u32 {
         &self.writer_wake as *const AtomicU32 as *const u32
@@ -652,6 +742,148 @@ impl Barrier {
     #[inline]
     fn phase_futex_ptr(&self) -> *const u32 {
         &self.phase as *const AtomicU32 as *const u32
+    }
+}
+
+// =========================================================================
+// Semaphore: futex-based counting semaphore
+// =========================================================================
+
+/// Maximum value for a POSIX semaphore.
+pub const SEM_VALUE_MAX: u32 = i32::MAX as u32;
+
+/// Counting semaphore.
+///
+/// The count itself is the futex word: waiters call `futex_wait(ptr, 0)` when
+/// the count is zero, and `post` wakes one waiter when count transitions
+/// from 0 to 1.
+#[repr(C)]
+pub struct Semaphore {
+    count: AtomicU32,
+}
+
+impl Semaphore {
+    pub const fn new(initial: u32) -> Self {
+        Semaphore {
+            count: AtomicU32::new(initial),
+        }
+    }
+
+    /// Re-initialize the semaphore. Returns 0 on success, -1 if value exceeds
+    /// SEM_VALUE_MAX.
+    pub fn init(&self, value: u32) -> i32 {
+        if value > SEM_VALUE_MAX {
+            return -1;
+        }
+        self.count.store(value, Ordering::Release);
+        if value > 0 {
+            futex_wake(self.futex_ptr(), u32::MAX);
+        }
+        0
+    }
+
+    /// Decrement (wait). Blocks if the count is zero.
+    pub fn wait(&self) {
+        loop {
+            let c = self.count.load(Ordering::Relaxed);
+            if c > 0 {
+                if self.count.compare_exchange_weak(
+                    c, c - 1, Ordering::Acquire, Ordering::Relaxed,
+                ).is_ok() {
+                    return;
+                }
+            } else {
+                futex_wait(self.futex_ptr(), 0);
+            }
+        }
+    }
+
+    /// Try to decrement without blocking.
+    /// Returns true if decremented, false if count was zero.
+    pub fn try_wait(&self) -> bool {
+        loop {
+            let c = self.count.load(Ordering::Relaxed);
+            if c == 0 {
+                return false;
+            }
+            if self.count.compare_exchange_weak(
+                c, c - 1, Ordering::Acquire, Ordering::Relaxed,
+            ).is_ok() {
+                return true;
+            }
+        }
+    }
+
+    /// Decrement with timeout in nanoseconds.
+    /// Returns 0 on success, 110 (ETIMEDOUT) on timeout.
+    pub fn wait_timeout(&self, timeout_ns: u64) -> i32 {
+        let deadline_ns = monotonic_now_ns().saturating_add(timeout_ns);
+        loop {
+            let c = self.count.load(Ordering::Relaxed);
+            if c > 0 {
+                if self.count.compare_exchange_weak(
+                    c, c - 1, Ordering::Acquire, Ordering::Relaxed,
+                ).is_ok() {
+                    return 0;
+                }
+                continue;
+            }
+            let remaining = remaining_timeout_ns(deadline_ns);
+            if remaining == 0 {
+                // Last-chance try
+                let c2 = self.count.load(Ordering::Relaxed);
+                if c2 > 0 {
+                    if self.count.compare_exchange(
+                        c2, c2 - 1, Ordering::Acquire, Ordering::Relaxed,
+                    ).is_ok() {
+                        return 0;
+                    }
+                }
+                return 110; // ETIMEDOUT
+            }
+            let err = futex_wait_timeout(self.futex_ptr(), 0, remaining);
+            if err == crate::consts::SALTY_CANCELLED {
+                // Last-chance try
+                let c2 = self.count.load(Ordering::Relaxed);
+                if c2 > 0 {
+                    if self.count.compare_exchange(
+                        c2, c2 - 1, Ordering::Acquire, Ordering::Relaxed,
+                    ).is_ok() {
+                        return 0;
+                    }
+                }
+                return 110; // ETIMEDOUT
+            }
+        }
+    }
+
+    /// Increment (post). Returns 0 on success, -1 on overflow.
+    pub fn post(&self) -> i32 {
+        loop {
+            let c = self.count.load(Ordering::Relaxed);
+            if c >= SEM_VALUE_MAX {
+                return -1;
+            }
+            if self.count.compare_exchange_weak(
+                c, c + 1, Ordering::Release, Ordering::Relaxed,
+            ).is_ok() {
+                if c == 0 {
+                    // Was zero, wake one waiter
+                    futex_wake(self.futex_ptr(), 1);
+                }
+                return 0;
+            }
+        }
+    }
+
+    /// Get the current value.
+    pub fn get_value(&self) -> i32 {
+        self.count.load(Ordering::Relaxed) as i32
+    }
+
+    #[inline]
+    fn futex_ptr(&self) -> *const u32 {
+        &self.count as *const AtomicU32 as *const u32
     }
 }
 

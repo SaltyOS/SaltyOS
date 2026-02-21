@@ -388,25 +388,142 @@ pub unsafe extern "C" fn copy_file_range(
 }
 
 // ---------------------------------------------------------------------------
-// POSIX semaphores — not implemented
+// POSIX semaphores — backed by salty::sync::Semaphore
 // ---------------------------------------------------------------------------
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sem_init(_sem: *mut u8, _pshared: i32, _value: u32) -> i32 {
-    errno::set_errno(errno::ENOSYS);
-    -1
+/// Timespec for timed semaphore operations (matches pthread_impl.rs layout)
+#[repr(C)]
+struct SemTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+fn sem_timespec_to_relative_ns(abstime: &SemTimespec) -> u64 {
+    let now = salty::syscall::syscall(salty::consts::SYS_CLOCK_GETTIME, 0, 0, 0, 0, 0, 0);
+    let now_ns = now.value;
+    let target_ns = (abstime.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(abstime.tv_nsec as u64);
+    target_ns.saturating_sub(now_ns)
+}
+
+#[inline]
+fn sem_validate_timespec(ts: &SemTimespec) -> bool {
+    ts.tv_sec >= 0 && ts.tv_nsec >= 0 && ts.tv_nsec < 1_000_000_000
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sem_wait(_sem: *mut u8) -> i32 {
-    errno::set_errno(errno::ENOSYS);
-    -1
+pub unsafe extern "C" fn sem_init(sem: *mut u8, pshared: i32, value: u32) -> i32 {
+    if sem.is_null() {
+        errno::set_errno(errno::EINVAL);
+        return -1;
+    }
+    if pshared != 0 {
+        errno::set_errno(errno::ENOSYS);
+        return -1;
+    }
+    if value > salty::sync::SEM_VALUE_MAX {
+        errno::set_errno(errno::EINVAL);
+        return -1;
+    }
+    unsafe {
+        core::ptr::write(sem as *mut salty::sync::Semaphore, salty::sync::Semaphore::new(value));
+    }
+    0
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sem_post(_sem: *mut u8) -> i32 {
-    errno::set_errno(errno::ENOSYS);
-    -1
+pub unsafe extern "C" fn sem_destroy(_sem: *mut u8) -> i32 {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sem_wait(sem: *mut u8) -> i32 {
+    if sem.is_null() {
+        errno::set_errno(errno::EINVAL);
+        return -1;
+    }
+    unsafe {
+        let s = &*(sem as *const salty::sync::Semaphore);
+        s.wait();
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sem_trywait(sem: *mut u8) -> i32 {
+    if sem.is_null() {
+        errno::set_errno(errno::EINVAL);
+        return -1;
+    }
+    unsafe {
+        let s = &*(sem as *const salty::sync::Semaphore);
+        if s.try_wait() {
+            0
+        } else {
+            errno::set_errno(errno::EAGAIN);
+            -1
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sem_timedwait(sem: *mut u8, abstime: *const SemTimespec) -> i32 {
+    if sem.is_null() || abstime.is_null() {
+        errno::set_errno(errno::EINVAL);
+        return -1;
+    }
+    unsafe {
+        if !sem_validate_timespec(&*abstime) {
+            errno::set_errno(errno::EINVAL);
+            return -1;
+        }
+        let s = &*(sem as *const salty::sync::Semaphore);
+        let timeout_ns = sem_timespec_to_relative_ns(&*abstime);
+        if timeout_ns == 0 {
+            if s.try_wait() {
+                return 0;
+            }
+            errno::set_errno(errno::ETIMEDOUT);
+            return -1;
+        }
+        let ret = s.wait_timeout(timeout_ns);
+        if ret != 0 {
+            errno::set_errno(errno::ETIMEDOUT);
+            return -1;
+        }
+        0
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sem_post(sem: *mut u8) -> i32 {
+    if sem.is_null() {
+        errno::set_errno(errno::EINVAL);
+        return -1;
+    }
+    unsafe {
+        let s = &*(sem as *const salty::sync::Semaphore);
+        let ret = s.post();
+        if ret < 0 {
+            errno::set_errno(errno::EOVERFLOW);
+            return -1;
+        }
+        0
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sem_getvalue(sem: *mut u8, sval: *mut i32) -> i32 {
+    if sem.is_null() || sval.is_null() {
+        errno::set_errno(errno::EINVAL);
+        return -1;
+    }
+    unsafe {
+        let s = &*(sem as *const salty::sync::Semaphore);
+        *sval = s.get_value();
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------

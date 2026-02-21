@@ -619,13 +619,210 @@ fn test_attr_stacksize() -> bool {
 }
 
 // =========================================================================
+// Test 13: RWLock try — try_read_lock succeeds, try_write_lock fails while readers exist
+// =========================================================================
+
+fn test_rwlock_try() -> bool {
+    let rw = sync::RWLock::new();
+
+    // try_read_lock should succeed when no writer
+    if !rw.try_read_lock() {
+        puts(b"  try_read_lock failed on free lock\n");
+        return false;
+    }
+
+    // Second try_read_lock should also succeed (multiple readers)
+    if !rw.try_read_lock() {
+        puts(b"  second try_read_lock failed\n");
+        rw.read_unlock();
+        return false;
+    }
+
+    // try_write_lock should fail while readers hold the lock
+    if rw.try_write_lock() {
+        puts(b"  try_write_lock succeeded with readers\n");
+        rw.write_unlock();
+        rw.read_unlock();
+        rw.read_unlock();
+        return false;
+    }
+
+    rw.read_unlock();
+    rw.read_unlock();
+
+    // Now try_write_lock should succeed
+    if !rw.try_write_lock() {
+        puts(b"  try_write_lock failed on free lock\n");
+        return false;
+    }
+
+    // try_read_lock should fail while writer holds the lock
+    if rw.try_read_lock() {
+        puts(b"  try_read_lock succeeded with writer\n");
+        rw.read_unlock();
+        rw.write_unlock();
+        return false;
+    }
+
+    rw.write_unlock();
+
+    puts(b"  rwlock_try: ok\n");
+    true
+}
+
+// =========================================================================
+// Test 14: Semaphore basic — init, wait, post, get_value
+// =========================================================================
+
+fn test_semaphore_basic() -> bool {
+    let sem = sync::Semaphore::new(1);
+
+    // Initial value should be 1
+    if sem.get_value() != 1 {
+        puts(b"  initial value not 1\n");
+        return false;
+    }
+
+    // Wait should succeed (decrement 1→0)
+    sem.wait();
+    if sem.get_value() != 0 {
+        puts(b"  value after wait not 0\n");
+        return false;
+    }
+
+    // Post should increment (0→1)
+    let ret = sem.post();
+    if ret != 0 {
+        puts(b"  post failed\n");
+        return false;
+    }
+    if sem.get_value() != 1 {
+        puts(b"  value after post not 1\n");
+        return false;
+    }
+
+    // Post again (1→2)
+    sem.post();
+    if sem.get_value() != 2 {
+        puts(b"  value after second post not 2\n");
+        return false;
+    }
+
+    // Wait twice to drain
+    sem.wait();
+    sem.wait();
+    if sem.get_value() != 0 {
+        puts(b"  value after draining not 0\n");
+        return false;
+    }
+
+    puts(b"  semaphore_basic: ok\n");
+    true
+}
+
+// =========================================================================
+// Test 15: Semaphore producer/consumer — 2 threads
+// =========================================================================
+
+static SEM_PROD: sync::Semaphore = sync::Semaphore::new(0);
+static SEM_RESULT: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "C" fn thread_sem_consumer(_arg: *mut u8) -> *mut u8 {
+    // Wait for the producer to post
+    SEM_PROD.wait();
+    SEM_RESULT.store(42, Ordering::Release);
+    core::ptr::null_mut()
+}
+
+fn test_semaphore_producer_consumer() -> bool {
+    SEM_RESULT.store(0, Ordering::Relaxed);
+
+    let mut consumer: pthread::PthreadT = core::ptr::null_mut();
+    let ret = unsafe {
+        pthread::pthread_create(&raw mut consumer, core::ptr::null(), thread_sem_consumer, core::ptr::null_mut())
+    };
+    if ret != 0 {
+        puts(b"  create consumer failed\n");
+        return false;
+    }
+
+    // Let consumer block on wait
+    for _ in 0..30 {
+        salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+    }
+
+    // Consumer should still be waiting
+    if SEM_RESULT.load(Ordering::Acquire) != 0 {
+        puts(b"  consumer woke too early\n");
+        SEM_PROD.post(); // unblock consumer so it can exit
+        unsafe { pthread::pthread_join(consumer, core::ptr::null_mut()); }
+        return false;
+    }
+
+    // Signal the consumer
+    SEM_PROD.post();
+
+    let ret = unsafe { pthread::pthread_join(consumer, core::ptr::null_mut()) };
+    if ret != 0 {
+        puts(b"  join consumer failed\n");
+        return false;
+    }
+
+    if SEM_RESULT.load(Ordering::Acquire) != 42 {
+        puts(b"  consumer did not complete\n");
+        return false;
+    }
+
+    puts(b"  semaphore_producer_consumer: ok\n");
+    true
+}
+
+// =========================================================================
+// Test 16: Semaphore try_wait — count=0 returns false, count>0 returns true
+// =========================================================================
+
+fn test_semaphore_trywait() -> bool {
+    let sem = sync::Semaphore::new(0);
+
+    // try_wait on empty semaphore should fail
+    if sem.try_wait() {
+        puts(b"  try_wait succeeded on empty\n");
+        return false;
+    }
+
+    // Post to make count=1
+    sem.post();
+
+    // try_wait should now succeed
+    if !sem.try_wait() {
+        puts(b"  try_wait failed with count=1\n");
+        return false;
+    }
+
+    // After successful try_wait, count should be 0
+    if sem.get_value() != 0 {
+        puts(b"  value after try_wait not 0\n");
+        return false;
+    }
+
+    // try_wait should fail again
+    if sem.try_wait() {
+        puts(b"  try_wait succeeded after drain\n");
+        return false;
+    }
+
+    puts(b"  semaphore_trywait: ok\n");
+    true
+}
+
+// =========================================================================
 // Test runner entry point
 // =========================================================================
 
 pub fn run() -> bool {
     puts(b"  --- pthread test suite ---\n");
 
-    let tests: [(&[u8], fn() -> bool); 12] = [
+    let tests: [(&[u8], fn() -> bool); 16] = [
         (b"create_join", test_create_join),
         (b"detach", test_detach),
         (b"mutex_normal", test_mutex_normal),
@@ -638,6 +835,10 @@ pub fn run() -> bool {
         (b"barrier", test_barrier),
         (b"cancel", test_cancel),
         (b"attr_stacksize", test_attr_stacksize),
+        (b"rwlock_try", test_rwlock_try),
+        (b"semaphore_basic", test_semaphore_basic),
+        (b"semaphore_producer_consumer", test_semaphore_producer_consumer),
+        (b"semaphore_trywait", test_semaphore_trywait),
     ];
 
     let mut all_pass = true;

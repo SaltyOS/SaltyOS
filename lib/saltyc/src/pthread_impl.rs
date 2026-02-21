@@ -470,6 +470,70 @@ pub unsafe extern "C" fn pthread_rwlock_destroy(_rwlock: *mut PthreadRwlockT) ->
     0
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_rwlock_tryrdlock(rwlock: *mut PthreadRwlockT) -> i32 {
+    if rwlock.is_null() {
+        return errno::EINVAL;
+    }
+    unsafe {
+        let rw = &*(rwlock as *const salty::sync::RWLock);
+        if rw.try_read_lock() { 0 } else { errno::EBUSY }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_rwlock_trywrlock(rwlock: *mut PthreadRwlockT) -> i32 {
+    if rwlock.is_null() {
+        return errno::EINVAL;
+    }
+    unsafe {
+        let rw = &*(rwlock as *const salty::sync::RWLock);
+        if rw.try_write_lock() { 0 } else { errno::EBUSY }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_rwlock_timedrdlock(
+    rwlock: *mut PthreadRwlockT,
+    abstime: *const Timespec,
+) -> i32 {
+    if rwlock.is_null() || abstime.is_null() {
+        return errno::EINVAL;
+    }
+    unsafe {
+        if !validate_timespec(&*abstime) {
+            return errno::EINVAL;
+        }
+        let rw = &*(rwlock as *const salty::sync::RWLock);
+        let timeout_ns = timespec_to_relative_ns(&*abstime);
+        if timeout_ns == 0 {
+            return if rw.try_read_lock() { 0 } else { errno::ETIMEDOUT };
+        }
+        if rw.read_lock_timeout(timeout_ns) { 0 } else { errno::ETIMEDOUT }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_rwlock_timedwrlock(
+    rwlock: *mut PthreadRwlockT,
+    abstime: *const Timespec,
+) -> i32 {
+    if rwlock.is_null() || abstime.is_null() {
+        return errno::EINVAL;
+    }
+    unsafe {
+        if !validate_timespec(&*abstime) {
+            return errno::EINVAL;
+        }
+        let rw = &*(rwlock as *const salty::sync::RWLock);
+        let timeout_ns = timespec_to_relative_ns(&*abstime);
+        if timeout_ns == 0 {
+            return if rw.try_write_lock() { 0 } else { errno::ETIMEDOUT };
+        }
+        if rw.write_lock_timeout(timeout_ns) { 0 } else { errno::ETIMEDOUT }
+    }
+}
+
 // =========================================================================
 // Barrier
 // =========================================================================
