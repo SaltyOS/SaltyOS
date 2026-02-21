@@ -423,6 +423,41 @@ watch:
 # Quick rebuild and run
 rr: build run
 
+# Generate SaltyFS test image
+mksaltyfs:
+    python3 tools/mksaltyfs.py -o test_data.img -s 64M
+
+# Run with virtio-blk data disk (requires test_data.img — run `just mksaltyfs` first)
+run-blk: build
+    qemu-system-x86_64 \
+        -machine q35 \
+        -cpu qemu64 \
+        -m 512M \
+        -serial stdio \
+        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
+        -device ahci,id=ahci \
+        -device ide-hd,drive=disk,bus=ahci.0 \
+        -drive file=test_data.img,format=raw,if=none,id=datadisk \
+        -device virtio-blk-pci,drive=datadisk \
+        -no-reboot \
+        -no-shutdown
+
+# Run with virtio-blk and SMP
+run-blk-smp: build
+    qemu-system-x86_64 \
+        -machine q35 \
+        -cpu qemu64 \
+        -smp 2 \
+        -m 512M \
+        -serial stdio \
+        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
+        -device ahci,id=ahci \
+        -device ide-hd,drive=disk,bus=ahci.0 \
+        -drive file=test_data.img,format=raw,if=none,id=datadisk \
+        -device virtio-blk-pci,drive=datadisk \
+        -no-reboot \
+        -no-shutdown
+
 # Create a new component skeleton
 new-component NAME:
     @echo "Creating component: {{NAME}}"

@@ -1751,6 +1751,7 @@ pub unsafe fn pm_spawn(
     prog: &[u8],
     def: &super::ini::ServiceDef,
     pre_ep: Cap,
+    start_suspended: bool,
 ) -> i32 {
     unsafe {
         let len = prog.len();
@@ -1776,6 +1777,9 @@ pub unsafe fn pm_spawn(
         if pre_ep != 0 {
             spawn_flags |= SPAWN_FLAG_USE_PRE_EP;
             ipc::set_send_cap_ctx(super::ipc_ctx(), 0, pre_ep);
+        }
+        if start_suspended {
+            spawn_flags |= SPAWN_FLAG_START_SUSPENDED;
         }
         let mut spawn_msg = SaltyMsg::zeroed();
         spawn_msg.label = POSIX_PM_SPAWN;
@@ -1804,6 +1808,25 @@ pub unsafe fn pm_spawn(
         }
 
         spawn_reply.regs[0] as i32
+    }
+}
+
+/// Resume a procmgr-managed child that was spawned with START_SUSPENDED.
+/// Uses PM_RESUME so boot sequencing is not coupled to signal semantics.
+pub unsafe fn pm_resume_child(pm_ep: Cap, pid: u32) -> i32 {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        msg.label = POSIX_PM_RESUME;
+        msg.length = 1;
+        msg.regs[0] = pid as u64;
+
+        let mut reply = SaltyMsg::zeroed();
+        let err = ipc::call_ctx(super::ipc_ctx(), pm_ep, &raw const msg, &raw mut reply);
+        if err != 0 || reply.label != SALTY_OK {
+            -1
+        } else {
+            0
+        }
     }
 }
 

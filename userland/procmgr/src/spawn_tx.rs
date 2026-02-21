@@ -96,6 +96,7 @@ const CSPACE_EXPAND_BASE: u64 = super::CSPACE_EXPAND_BASE;
 const READY_TIMEOUT_NS_DEFAULT: u64 = super::READY_TIMEOUT_NS_DEFAULT;
 const SPAWN_FLAG_USE_PRE_EP: u64 = salty::SPAWN_FLAG_USE_PRE_EP;
 const SPAWN_FLAG_RESPAWN: u64 = salty::SPAWN_FLAG_RESPAWN;
+const SPAWN_FLAG_START_SUSPENDED: u64 = salty::SPAWN_FLAG_START_SUSPENDED;
 
 // ===========================================================================
 // Shared library physical frame cache
@@ -1253,8 +1254,12 @@ pub(crate) unsafe fn exec_load_elf_mmsrv(
     result: *mut ElfLoadResult,
 ) -> i32 {
     unsafe {
-        use salty::consts::*;
-        use salty::types::*;
+        use salty::consts::{
+            ELFCLASS64, ELFDATA2LSB, ET_EXEC, ET_DYN, EM_X86_64,
+            PT_LOAD, PF_W, PF_X, MM_MAP_WINDOW,
+            ELF_TOO_SMALL, ELF_NOT_ELF, ELF_NOT_64BIT, ELF_NOT_LE,
+            ELF_BAD_TYPE, ELF_BAD_ARCH, ELF_NO_LOAD, ELF_OUT_OF_MEMORY, ELF_MAP_FAILED,
+        };
 
         if data_len < core::mem::size_of::<Elf64Ehdr>() {
             return ELF_TOO_SMALL;
@@ -1459,8 +1464,11 @@ unsafe fn exec_apply_relocs(
     span_start: u64,
 ) {
     unsafe {
-        use salty::consts::*;
-        use salty::types::*;
+        use salty::consts::{
+            PT_DYNAMIC, PT_LOAD,
+            DT_NULL, DT_RELA, DT_RELASZ, DT_RELAENT,
+            R_X86_64_RELATIVE,
+        };
 
         let phdr_base = ehdr.e_phoff as usize;
         let phdr_count = ehdr.e_phnum as usize;
@@ -1917,6 +1925,7 @@ pub unsafe fn handle_spawn_tx(
         let name_words = (name_len_wire + 7) / 8;
         let args_reg_idx = name_reg_idx + name_words;
         let use_pre_ep = (spawn_flags & SPAWN_FLAG_USE_PRE_EP) != 0;
+        let start_suspended = (spawn_flags & SPAWN_FLAG_START_SUSPENDED) != 0;
         let readiness_mode = salty::spawn_policy_readiness(spawn_policy);
         let policy_map_initrd = salty::spawn_policy_map_initrd(spawn_policy);
         let policy_is_display = salty::spawn_policy_is_display(spawn_policy);
@@ -2512,25 +2521,31 @@ pub unsafe fn handle_spawn_tx(
             return;
         }
 
-        // ---- Start ----
-        let err = salty::invoke::tcb_resume(child_tcb);
-        if err != 0 {
-            puts(b"[PROCMGR] TCB resume failed\n");
-            deregister_from_mmsrv(pid);
-            alloc.rollback();
-            reply.label = SALTY_OUT_OF_MEMORY;
-            return;
-        }
-
         // Pre-populate minimal PROCTAB fields so that CSpace expansion
         // handlers (called from wait_for_child_ready's bound-ntfn poll)
         // can identify and serve this child.
-        proc_table::proctab(slot_idx).state = proc_table::PROC_RUNNING;
+        proc_table::proctab(slot_idx).state = if start_suspended {
+            proc_table::PROC_STOPPED
+        } else {
+            proc_table::PROC_RUNNING
+        };
         proc_table::proctab(slot_idx).cnode_cap = child_cn;
         proc_table::proctab(slot_idx).pid = pid;
         proc_table::proctab(slot_idx).badge = pid as u64;
 
-        if plan.readiness_mode == salty::SPAWN_READY_NOTIFY {
+        // ---- Start ----
+        if !start_suspended {
+            let err = salty::invoke::tcb_resume(child_tcb);
+            if err != 0 {
+                puts(b"[PROCMGR] TCB resume failed\n");
+                deregister_from_mmsrv(pid);
+                alloc.rollback();
+                reply.label = SALTY_OUT_OF_MEMORY;
+                return;
+            }
+        }
+
+        if !start_suspended && plan.readiness_mode == salty::SPAWN_READY_NOTIFY {
             if super::wait_for_child_ready(
                 child_tcb,
                 child_ready_ntfn,
@@ -2566,7 +2581,11 @@ pub unsafe fn handle_spawn_tx(
         } else {
             pid
         };
-        p.state = proc_table::PROC_RUNNING;
+        p.state = if start_suspended {
+            proc_table::PROC_STOPPED
+        } else {
+            proc_table::PROC_RUNNING
+        };
         p.exit_code = 0;
         p.badge = pid as u64;
         p.tcb_cap = child_tcb;

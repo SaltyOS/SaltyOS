@@ -67,6 +67,7 @@ const PM_KILL_PGID: u64 = 25;
 const PM_INJECT_CAP: u64 = 26;
 const PM_LIST_PIDS: u64 = 27;
 const PM_GET_PROC_INFO: u64 = 28;
+const PM_RESUME: u64 = 29;
 const SALTY_PENDING: u64 = 0x80;
 
 const PM_SIGKILL: usize = 9;
@@ -963,6 +964,43 @@ unsafe fn handle_inject_cap(msg: &SaltyMsg, reply: &mut SaltyMsg) {
             CAP_SELF_CSPACE, CAP_RECV_SCRATCH,
         );
         reply.label = if err == 0 { SALTY_OK } else { SALTY_INVALID_OPERATION };
+    }
+}
+
+/// PM_RESUME: resume a process that was spawned with START_SUSPENDED.
+///   msg.regs[0] = target PID
+unsafe fn handle_resume(msg: &SaltyMsg, reply: &mut SaltyMsg) {
+    unsafe {
+        let pid = msg.regs[0] as u32;
+        let idx = match find_by_pid(pid) {
+            Some(i) => i,
+            None => {
+                reply.label = SALTY_NOT_FOUND;
+                return;
+            }
+        };
+
+        if proctab(idx).state == PROC_FREE || proctab(idx).state == PROC_ZOMBIE {
+            reply.label = SALTY_INVALID_OPERATION;
+            return;
+        }
+
+        if proctab(idx).state == PROC_RUNNING {
+            reply.label = SALTY_OK;
+            reply.length = 0;
+            return;
+        }
+
+        let err = salty::invoke::tcb_resume(proctab(idx).tcb_cap);
+        if err != 0 {
+            reply.label = SALTY_INVALID_OPERATION;
+            return;
+        }
+
+        proctab(idx).state = PROC_RUNNING;
+        proctab(idx).stop_status = 0;
+        reply.label = SALTY_OK;
+        reply.length = 0;
     }
 }
 
@@ -2517,6 +2555,7 @@ pub extern "C" fn _start() -> ! {
                 PM_KILL => handle_kill(&msg, &mut reply, badge),
                 PM_KILL_PGID => handle_kill_pgid(&msg, &mut reply),
                 PM_INJECT_CAP => handle_inject_cap(&msg, &mut reply),
+                PM_RESUME => handle_resume(&msg, &mut reply),
                 PM_SIGACTION => handle_sigaction(&msg, &mut reply, badge),
                 PM_GETUID => handle_getuid(&mut reply, badge),
                 PM_GETGID => handle_getgid(&mut reply, badge),

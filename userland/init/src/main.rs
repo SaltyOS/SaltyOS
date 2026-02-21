@@ -318,6 +318,78 @@ fn compute_service_budget(total_usable: u64, num_services: usize, memory_kb: u16
     bits
 }
 
+/// Inject NeedEP/CopyCap caps into a suspended procmgr child, then resume it.
+/// Returns true on success.
+unsafe fn inject_caps_and_resume(
+    mgr: &svc_mgr::ServiceManager,
+    svc_idx: usize,
+    procmgr_ep: Cap,
+    pid: u32,
+) -> bool {
+    unsafe {
+        let name = mgr.services[svc_idx].def.name_bytes();
+        let ep_need_count = mgr.services[svc_idx].def.ep_need_count;
+        let ep_needs = mgr.services[svc_idx].def.ep_needs;
+        let cap_count = mgr.services[svc_idx].def.cap_count;
+        let caps = mgr.services[svc_idx].def.caps;
+
+        // Inject NeedEP caps into child via PM_INJECT_CAP
+        for i in 0..ep_need_count as usize {
+            let svc_name = &ep_needs[i].service[..ep_needs[i].service_len as usize];
+            let provider_idx = mgr.find_service(svc_name);
+            if provider_idx >= 0 {
+                let provider_ep = mgr.services[provider_idx as usize].pre_ep;
+                if provider_ep != 0 {
+                    let r = spawn::pm_inject_cap(
+                        procmgr_ep, pid,
+                        ep_needs[i].dst_slot, provider_ep,
+                    );
+                    if r != 0 {
+                        let mut lb = LineBuf::new();
+                        lb.str(b"[INIT] WARN: inject NeedEP ");
+                        lb.bytes(svc_name);
+                        lb.str(b" slot=");
+                        lb.hex(ep_needs[i].dst_slot);
+                        lb.str(b" failed\n");
+                        lb.flush();
+                    }
+                }
+            }
+        }
+
+        // Inject CopyCap caps into child via PM_INJECT_CAP
+        for i in 0..cap_count as usize {
+            if caps[i].src_slot == 0 && caps[i].dst_slot == 0 {
+                continue;
+            }
+            let r = spawn::pm_inject_cap(
+                procmgr_ep, pid,
+                caps[i].dst_slot, caps[i].src_slot,
+            );
+            if r != 0 {
+                let mut lb = LineBuf::new();
+                lb.str(b"[INIT] WARN: inject CopyCap src=");
+                lb.hex(caps[i].src_slot);
+                lb.str(b" dst=");
+                lb.hex(caps[i].dst_slot);
+                lb.str(b" failed\n");
+                lb.flush();
+            }
+        }
+
+        // Child was spawned suspended; resume only after all cap injections.
+        if spawn::pm_resume_child(procmgr_ep, pid) != 0 {
+            let mut lb = LineBuf::new();
+            lb.str(b"[INIT] Failed to resume ");
+            lb.bytes(name);
+            lb.str(b"\n");
+            lb.flush();
+            return false;
+        }
+        true
+    }
+}
+
 // ======================================================================
 // Service loading from CPIO
 // ======================================================================
@@ -604,15 +676,15 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
 
             let spawn_name = elf_name;
 
-            // Copy NeedEP/CopyCap fields to stack before borrow
-            let ep_need_count = mgr.services[svc_idx].def.ep_need_count;
-            let ep_needs = mgr.services[svc_idx].def.ep_needs;
-            let cap_count = mgr.services[svc_idx].def.cap_count;
-            let caps = mgr.services[svc_idx].def.caps;
-
             let pre_ep = mgr.services[svc_idx].pre_ep;
             let pid = unsafe {
-                spawn::pm_spawn(procmgr_ep, spawn_name, &mgr.services[svc_idx].def, pre_ep)
+                spawn::pm_spawn(
+                    procmgr_ep,
+                    spawn_name,
+                    &mgr.services[svc_idx].def,
+                    pre_ep,
+                    true,
+                )
             };
             if pid < 0 {
                 { let mut lb = LineBuf::new(); lb.str(b"[INIT] Failed to spawn "); lb.bytes(name); lb.str(b" via procmgr\n"); lb.flush(); }
@@ -620,52 +692,9 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                 continue;
             }
 
-            // Inject NeedEP caps into child via PM_INJECT_CAP
-            for i in 0..ep_need_count as usize {
-                let svc_name = &ep_needs[i].service[..ep_needs[i].service_len as usize];
-                let provider_idx = mgr.find_service(svc_name);
-                if provider_idx >= 0 {
-                    let provider_ep = mgr.services[provider_idx as usize].pre_ep;
-                    if provider_ep != 0 {
-                        let r = unsafe {
-                            spawn::pm_inject_cap(
-                                procmgr_ep, pid as u32,
-                                ep_needs[i].dst_slot, provider_ep,
-                            )
-                        };
-                        if r != 0 {
-                            let mut lb = LineBuf::new();
-                            lb.str(b"[INIT] WARN: inject NeedEP ");
-                            lb.bytes(svc_name);
-                            lb.str(b" slot=");
-                            lb.hex(ep_needs[i].dst_slot);
-                            lb.str(b" failed\n");
-                            lb.flush();
-                        }
-                    }
-                }
-            }
-
-            // Inject CopyCap caps into child via PM_INJECT_CAP
-            for i in 0..cap_count as usize {
-                if caps[i].src_slot == 0 && caps[i].dst_slot == 0 {
-                    continue;
-                }
-                let r = unsafe {
-                    spawn::pm_inject_cap(
-                        procmgr_ep, pid as u32,
-                        caps[i].dst_slot, caps[i].src_slot,
-                    )
-                };
-                if r != 0 {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[INIT] WARN: inject CopyCap src=");
-                    lb.hex(caps[i].src_slot);
-                    lb.str(b" dst=");
-                    lb.hex(caps[i].dst_slot);
-                    lb.str(b" failed\n");
-                    lb.flush();
-                }
+            if !unsafe { inject_caps_and_resume(mgr, svc_idx, procmgr_ep, pid as u32) } {
+                mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
+                continue;
             }
 
             mgr.services[svc_idx].pid = pid as u32;
@@ -750,9 +779,11 @@ unsafe fn handle_child_exit(
             let spawn_name = elf_name;
 
             let pre_ep = mgr.services[svc_idx].pre_ep;
-            let new_pid = spawn::pm_spawn(pm_ep, spawn_name, &mgr.services[svc_idx].def, pre_ep);
+            let new_pid = spawn::pm_spawn(pm_ep, spawn_name, &mgr.services[svc_idx].def, pre_ep, true);
             if new_pid < 0 {
                 puts(b"[INIT] Failed to restart service\n");
+                mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
+            } else if !inject_caps_and_resume(mgr, svc_idx, pm_ep, new_pid as u32) {
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
             } else {
                 mgr.services[svc_idx].pid = new_pid as u32;

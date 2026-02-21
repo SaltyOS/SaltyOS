@@ -136,6 +136,7 @@ const FTYPE_SHM: u8 = 5;
 const FTYPE_FIFO: u8 = 6;
 const FTYPE_SYMLINK: u8 = 7;
 const FTYPE_PROC_FILE: u8 = 8;
+const FTYPE_MOUNT_POINT: u8 = 9;
 
 // /proc file subtypes (stored in dev_type for FTYPE_PROC_FILE inodes)
 const PROC_FILE_STATUS: u8 = 1;
@@ -311,6 +312,28 @@ impl RamfsInode {
 
 unsafe impl Sync for RamfsInode {}
 
+const MOUNT_READDIR_BATCH_MAX: usize = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MountReaddirEntry {
+    ino: u64,
+    d_type: u8,
+    name_len: u8,
+    name: [u8; 16],
+}
+
+impl MountReaddirEntry {
+    const fn zeroed() -> Self {
+        MountReaddirEntry {
+            ino: 0,
+            d_type: 0,
+            name_len: 0,
+            name: [0; 16],
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct FdEntry {
@@ -322,6 +345,10 @@ struct FdEntry {
     dev_type: u8,
     flags: u32,
     sock_id: u32,
+    mount_batch_count: u8,
+    mount_batch_index: u8,
+    mount_batch_next_cursor: u32,
+    mount_batch: [MountReaddirEntry; MOUNT_READDIR_BATCH_MAX],
 }
 
 impl FdEntry {
@@ -335,6 +362,10 @@ impl FdEntry {
             dev_type: 0,
             flags: 0,
             sock_id: 0,
+            mount_batch_count: 0,
+            mount_batch_index: 0,
+            mount_batch_next_cursor: 0,
+            mount_batch: [MountReaddirEntry::zeroed(); MOUNT_READDIR_BATCH_MAX],
         }
     }
 
@@ -613,6 +644,7 @@ const PIPE_BUF_SIZE: usize = 4096;
 const INITIAL_PIPES: usize = 16;
 const FD_TYPE_PIPE: u8 = 7;
 const FD_TYPE_EPOLL: u8 = 8;
+const FD_TYPE_MOUNT: u8 = 9;
 const INITIAL_PIPE_WAITERS: usize = 4;
 
 const VFS_PIPE: u64 = 29;
@@ -1703,8 +1735,16 @@ unsafe fn resolve_path_raw_inner(
 
         let plen = path_len as usize;
         while pos < plen {
-            if (*current).ftype != FTYPE_DIRECTORY {
+            if (*current).ftype != FTYPE_DIRECTORY
+                && (*current).ftype != FTYPE_MOUNT_POINT
+            {
                 return core::ptr::null_mut();
+            }
+
+            // Mount point with remaining path: return the mount point itself.
+            // The caller (handle_open etc.) detects FTYPE_MOUNT_POINT and proxies.
+            if (*current).ftype == FTYPE_MOUNT_POINT {
+                return current;
             }
 
             let start = pos;
@@ -1928,8 +1968,13 @@ unsafe fn resolve_path_from(start_ino: u32, path: *const u8, path_len: u8) -> *m
         let mut pos: usize = 0;
         let plen = path_len as usize;
         while pos < plen {
-            if (*current).ftype != FTYPE_DIRECTORY {
+            if (*current).ftype != FTYPE_DIRECTORY
+                && (*current).ftype != FTYPE_MOUNT_POINT
+            {
                 return core::ptr::null_mut();
+            }
+            if (*current).ftype == FTYPE_MOUNT_POINT {
+                return current;
             }
 
             let start = pos;
@@ -2204,6 +2249,24 @@ unsafe fn init_ramfs() {
         dir_add_entry(root, b"proc".as_ptr(), 4, (*proc_dir).ino);
         PROC_ROOT_INO = (*proc_dir).ino;
 
+        // Create /mnt directory
+        let mnt_dir = alloc_inode();
+        (*mnt_dir).ftype = FTYPE_DIRECTORY;
+        (*mnt_dir).mode = S_IFDIR_L | 0o755;
+        (*mnt_dir).nlink = 2;
+        (*mnt_dir).parent_ino = (*root).ino;
+        dir_add_entry(root, b"mnt".as_ptr(), 3, (*mnt_dir).ino);
+
+        // Create /mnt/data as mount point directory
+        let mnt_data = alloc_inode();
+        (*mnt_data).ftype = FTYPE_MOUNT_POINT;
+        (*mnt_data).mode = S_IFDIR_L | 0o555;
+        (*mnt_data).readonly = 1;
+        (*mnt_data).nlink = 2;
+        (*mnt_data).parent_ino = (*mnt_dir).ino;
+        dir_add_entry(mnt_dir, b"data".as_ptr(), 4, (*mnt_data).ino);
+        MOUNT_DATA_INO = (*mnt_data).ino;
+
         // Create /initrd directory
         let initrd_dir = alloc_inode();
         (*initrd_dir).ftype = FTYPE_DIRECTORY;
@@ -2314,30 +2377,555 @@ fn flags_allow_write(flags: u32) -> bool {
 }
 
 // ======================================================================
+// Mount point support
+// ======================================================================
+
+const MAX_MOUNTS: usize = 4;
+
+#[derive(Clone, Copy)]
+struct MountEntry {
+    active: u8,
+    mount_ino: u32,    // VFS inode for the mount point directory
+    fs_cap: u64,       // Cap slot of mounted FS server endpoint
+    root_ino: u32,     // Root inode number in the mounted FS
+}
+
+impl MountEntry {
+    const fn zeroed() -> Self {
+        MountEntry { active: 0, mount_ino: 0, fs_cap: 0, root_ino: 0 }
+    }
+}
+
+static mut MOUNTS: [MountEntry; MAX_MOUNTS] = [MountEntry::zeroed(); MAX_MOUNTS];
+static mut MOUNT_DATA_INO: u32 = 0; // inode number of /mnt/data
+static mut MOUNT_TRIED: u8 = 0;     // counter: max 3 attempts for saltyfs mount
+
+/// Check if path starts with "/mnt/data" and return the sub-path within the mount.
+/// Returns (is_mount, sub_path_start, sub_path_len).
+/// - "/mnt/data" or "/mnt/data/" → exact mount point (sub_path_len=0)
+/// - "/mnt/data/foo" → sub_path = "foo"
+fn parse_mount_path(path: &[u8], path_len: u8) -> (bool, usize, u8) {
+    const PREFIX: &[u8] = b"/mnt/data";
+    let plen = path_len as usize;
+    if plen < PREFIX.len() {
+        return (false, 0, 0);
+    }
+    for i in 0..PREFIX.len() {
+        if path[i] != PREFIX[i] {
+            return (false, 0, 0);
+        }
+    }
+    if plen == PREFIX.len() {
+        // Exact "/mnt/data"
+        return (true, plen, 0);
+    }
+    if path[PREFIX.len()] != b'/' {
+        return (false, 0, 0);
+    }
+    // "/mnt/data/..."
+    let sub_start = PREFIX.len() + 1;
+    let sub_len = plen - sub_start;
+    (true, sub_start, sub_len as u8)
+}
+
+/// Find mount entry for a path. Returns mount index or None.
+/// On first access to a mount path, triggers lazy mount discovery via nameserv.
+unsafe fn find_mount_for_path(path: &[u8], path_len: u8) -> Option<usize> {
+    let (is_mount, _, _) = parse_mount_path(path, path_len);
+    if !is_mount {
+        return None;
+    }
+    unsafe {
+        let mnt_ino = *(&raw const MOUNT_DATA_INO);
+        // Check existing mounts
+        for i in 0..MAX_MOUNTS {
+            let m = &*(&raw const MOUNTS[i]);
+            if m.active != 0 && m.mount_ino == mnt_ino {
+                return Some(i);
+            }
+        }
+        // Lazy mount: attempt once if not yet tried
+        if *(&raw const MOUNT_TRIED) < 3 {
+            setup_saltyfs_mount();
+            // Re-check after mount attempt
+            for i in 0..MAX_MOUNTS {
+                let m = &*(&raw const MOUNTS[i]);
+                if m.active != 0 && m.mount_ino == mnt_ino {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Multi-component lookup within a mounted filesystem.
+/// E.g. for sub_path "a/b/c", does LOOKUP(root,"a") then LOOKUP(a_ino,"b") etc.
+/// Returns remote inode number, or 0 on failure.
+unsafe fn mount_lookup(mount_idx: usize, sub_path: *const u8, sub_path_len: u8) -> u64 {
+    unsafe {
+        let m = &*(&raw const MOUNTS[mount_idx]);
+        let mut current_ino = m.root_ino as u64;
+
+        if sub_path_len == 0 {
+            return current_ino;
+        }
+
+        let mut pos: usize = 0;
+        let plen = sub_path_len as usize;
+
+        while pos < plen {
+            // Skip leading slashes
+            while pos < plen && *sub_path.add(pos) == b'/' {
+                pos += 1;
+            }
+            if pos >= plen {
+                break;
+            }
+
+            let start = pos;
+            while pos < plen && *sub_path.add(pos) != b'/' {
+                pos += 1;
+            }
+            let comp_len = pos - start;
+            if comp_len == 0 {
+                continue;
+            }
+            if comp_len > 24 {
+                return 0; // name too long for IPC
+            }
+
+            // Send SALTYFS_LOOKUP
+            let mut req = SaltyMsg::zeroed();
+            req.label = SALTYFS_LOOKUP;
+            req.regs[0] = current_ino;
+            req.regs[1] = comp_len as u64;
+            let name_dst = &raw mut req.regs[2] as *mut u8;
+            for i in 0..comp_len {
+                *name_dst.add(i) = *sub_path.add(start + i);
+            }
+            req.length = 2 + ((comp_len as u64) + 7) / 8;
+
+            let mut reply = SaltyMsg::zeroed();
+            ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut reply);
+
+            if reply.label != SALTY_OK {
+                return 0;
+            }
+            current_ino = reply.regs[0];
+        }
+
+        current_ino
+    }
+}
+
+/// Get stat info from mounted filesystem for a remote inode.
+/// Returns (size, mode, nlink, mtime, is_dir).
+unsafe fn mount_stat(mount_idx: usize, remote_ino: u64) -> Option<(u64, u32, u32, u64, bool)> {
+    unsafe {
+        let m = &*(&raw const MOUNTS[mount_idx]);
+        let mut req = SaltyMsg::zeroed();
+        req.label = SALTYFS_STAT;
+        req.regs[0] = remote_ino;
+        req.length = 1;
+
+        let mut reply = SaltyMsg::zeroed();
+        ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut reply);
+
+        if reply.label != SALTY_OK {
+            return None;
+        }
+
+        let size = reply.regs[1];
+        let mode = reply.regs[2] as u32;
+        let nlink = reply.regs[3] as u32;
+        let mtime = reply.regs[4];
+        let is_dir = (mode & S_IFMT_L) == S_IFDIR_L;
+        Some((size, mode, nlink, mtime, is_dir))
+    }
+}
+
+/// Read data inline from mounted filesystem. Returns bytes in IPC registers.
+unsafe fn mount_read_inline(
+    mount_idx: usize, remote_ino: u64, offset: u64, count: u64,
+    reply: *mut SaltyMsg,
+) {
+    unsafe {
+        let m = &*(&raw const MOUNTS[mount_idx]);
+        let mut req = SaltyMsg::zeroed();
+        req.label = SALTYFS_READ_INLINE;
+        req.regs[0] = remote_ino;
+        req.regs[1] = offset;
+        req.regs[2] = count;
+        req.length = 3;
+
+        let mut fs_reply = SaltyMsg::zeroed();
+        ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
+
+        if fs_reply.label != SALTY_OK {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return;
+        }
+
+        let bytes_read = fs_reply.regs[0];
+        (*reply).label = SALTY_OK;
+        (*reply).length = 1 + (bytes_read + 7) / 8;
+        (*reply).regs[0] = bytes_read;
+
+        if bytes_read > 0 {
+            let src = &fs_reply.regs[1] as *const u64 as *const u8;
+            let dst = &raw mut (*reply).regs[1] as *mut u8;
+            for i in 0..bytes_read as usize {
+                *dst.add(i) = *src.add(i);
+            }
+        }
+    }
+}
+
+unsafe fn mount_readdir_emit_cached(fde: *mut FdEntry, reply: *mut SaltyMsg) {
+    unsafe {
+        let fd = &mut *fde;
+        let idx = fd.mount_batch_index as usize;
+        let ent = &fd.mount_batch[idx];
+
+        (*reply).label = SALTY_OK;
+        (*reply).length = 5 + ((ent.name_len as u64 + 7) / 8);
+        (*reply).regs[0] = ent.name_len as u64;
+        (*reply).regs[1] = 0; // reserved
+        (*reply).regs[2] = ent.ino;
+        (*reply).regs[3] = ent.d_type as u64;
+        for j in 4..20 {
+            (*reply).regs[j] = 0;
+        }
+        let dst = &raw mut (*reply).regs[4] as *mut u8;
+        for j in 0..ent.name_len as usize {
+            *dst.add(j) = ent.name[j];
+        }
+
+        fd.mount_batch_index = fd.mount_batch_index.saturating_add(1);
+        if fd.mount_batch_index >= fd.mount_batch_count {
+            fd.mount_batch_index = 0;
+            fd.mount_batch_count = 0;
+            fd.dir_cursor = if fd.mount_batch_next_cursor == 0 {
+                u32::MAX
+            } else {
+                fd.mount_batch_next_cursor
+            };
+        }
+    }
+}
+
+/// Read directory entries from mounted filesystem with per-FD batching.
+/// SaltyFS may return multiple entries; VFS returns one entry per call while
+/// consuming cached batch entries across subsequent calls.
+unsafe fn mount_readdir(
+    mount_idx: usize, fde: *mut FdEntry, dir_ino: u64, reply: *mut SaltyMsg,
+) {
+    unsafe {
+        let fd = &mut *fde;
+
+        if fd.dir_cursor == u32::MAX {
+            (*reply).label = SALTY_OK;
+            (*reply).length = 1;
+            (*reply).regs[0] = 0;
+            return;
+        }
+
+        if fd.mount_batch_count > 0 && fd.mount_batch_index < fd.mount_batch_count {
+            mount_readdir_emit_cached(fde, reply);
+            return;
+        }
+
+        let m = &*(&raw const MOUNTS[mount_idx]);
+        let mut req = SaltyMsg::zeroed();
+        req.label = SALTYFS_READDIR;
+        req.regs[0] = dir_ino;
+        req.regs[1] = fd.dir_cursor as u64;
+        req.length = 2;
+
+        let mut fs_reply = SaltyMsg::zeroed();
+        ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
+
+        if fs_reply.label != SALTY_OK {
+            (*reply).label = SALTY_OK;
+            (*reply).length = 1;
+            (*reply).regs[0] = 0;
+            fd.dir_cursor = u32::MAX;
+            return;
+        }
+
+        // saltyfs readdir format:
+        // regs[0]=next_cursor, then groups of 4:
+        // (child_ino, dir_type, name_lo, name_hi)
+        let next_cursor = fs_reply.regs[0] as u32;
+        let num_entries = (fs_reply.length.saturating_sub(1)) / 4;
+        if num_entries == 0 {
+            (*reply).label = SALTY_OK;
+            (*reply).length = 1;
+            (*reply).regs[0] = 0;
+            fd.dir_cursor = u32::MAX;
+            return;
+        }
+
+        let take = core::cmp::min(num_entries as usize, MOUNT_READDIR_BATCH_MAX);
+        for n in 0..take {
+            let base = 1 + n * 4;
+            let child_ino = fs_reply.regs[base];
+            let dir_type = fs_reply.regs[base + 1] as u8;
+            let name_lo = fs_reply.regs[base + 2];
+            let name_hi = fs_reply.regs[base + 3];
+
+            let lo = name_lo.to_le_bytes();
+            let hi = name_hi.to_le_bytes();
+            let mut name = [0u8; 16];
+            for j in 0..8 {
+                name[j] = lo[j];
+            }
+            for j in 0..8 {
+                name[8 + j] = hi[j];
+            }
+            let mut name_len: u8 = 0;
+            for b in name.iter() {
+                if *b == 0 {
+                    break;
+                }
+                name_len += 1;
+            }
+
+            let d_type = match dir_type {
+                1 => 8, // DT_REG
+                2 => 4, // DT_DIR
+                _ => 0, // DT_UNKNOWN
+            };
+
+            fd.mount_batch[n].ino = child_ino;
+            fd.mount_batch[n].d_type = d_type;
+            fd.mount_batch[n].name_len = name_len;
+            fd.mount_batch[n].name = name;
+        }
+
+        fd.mount_batch_count = take as u8;
+        fd.mount_batch_index = 0;
+        fd.mount_batch_next_cursor = next_cursor;
+        mount_readdir_emit_cached(fde, reply);
+    }
+}
+
+/// Discover saltyfs endpoint via name service and mount at /mnt/data.
+/// Called lazily on first access to /mnt/data path. Non-fatal: if saltyfs
+/// is not available, VFS continues without mount.
+unsafe fn setup_saltyfs_mount() {
+    unsafe {
+        *(&raw mut MOUNT_TRIED) += 1;
+
+        let mnt_ino = *(&raw const MOUNT_DATA_INO);
+        if mnt_ino == 0 {
+            puts(b"[VFS] No /mnt/data inode for mount\n");
+            return;
+        }
+
+        // Allocate a slot to receive the saltyfs endpoint cap
+        let fs_slot = match salty::slot_alloc::slot_alloc() {
+            Some(s) => s,
+            None => {
+                puts(b"[VFS] saltyfs: no slot available\n");
+                return;
+            }
+        };
+
+        // Look up "saltyfs" via nameserv
+        ipc::set_receive_slot_ctx(
+            ipc_ctx(), CAP_SELF_CSPACE, fs_slot, 16, // 16-bit CNode depth
+        );
+
+        let mut ns_req = SaltyMsg::zeroed();
+        ns_req.label = POSIX_NS_LOOKUP;
+        let name = b"saltyfs";
+        ns_req.regs[0] = name.len() as u64;
+        ns_req.length = 1 + (name.len() as u64 + 7) / 8;
+        let ns_dst = &raw mut ns_req.regs[1] as *mut u8;
+        for i in 0..name.len() {
+            *ns_dst.add(i) = name[i];
+        }
+
+        let mut ns_reply = SaltyMsg::zeroed();
+        let err = ipc::call_ctx(
+            ipc_ctx(), VFS_CAP_NAMESERV_EP,
+            &raw const ns_req, &raw mut ns_reply,
+        );
+
+        if err != 0 || ns_reply.label != SALTY_OK {
+            puts(b"[VFS] saltyfs not found in nameserv (ok if no data disk)\n");
+            return;
+        }
+
+        puts(b"[VFS] Found saltyfs endpoint via nameserv\n");
+
+        // Send SALTYFS_MOUNT to saltyfs server
+        let mut mnt_req = SaltyMsg::zeroed();
+        mnt_req.label = SALTYFS_MOUNT;
+        mnt_req.length = 0;
+
+        let mut mnt_reply = SaltyMsg::zeroed();
+        let merr = ipc::call_ctx(ipc_ctx(), fs_slot, &raw const mnt_req, &raw mut mnt_reply);
+
+        if merr != 0 || (mnt_reply.label != SALTY_OK && mnt_reply.label != SALTY_ALREADY_EXISTS) {
+            {
+                let mut lb = LineBuf::new();
+                lb.str(b"[VFS] saltyfs mount failed err=");
+                lb.hex(merr as u64);
+                lb.str(b" label=");
+                lb.hex(mnt_reply.label);
+                lb.str(b"\n");
+                lb.flush();
+            }
+            return;
+        }
+
+        let root_ino = mnt_reply.regs[0] as u32;
+
+        // Register in mount table
+        for i in 0..MAX_MOUNTS {
+            if (*(&raw const MOUNTS[i])).active == 0 {
+                (*(&raw mut MOUNTS[i])).active = 1;
+                (*(&raw mut MOUNTS[i])).mount_ino = mnt_ino;
+                (*(&raw mut MOUNTS[i])).fs_cap = fs_slot;
+                (*(&raw mut MOUNTS[i])).root_ino = root_ino;
+                break;
+            }
+        }
+
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS] Mounted saltyfs at /mnt/data root_ino=");
+            lb.hex(root_ino as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
+    }
+}
+
+// ======================================================================
 // Request handlers
 // ======================================================================
 
 unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
+        let mut abs_path = [0u8; MAX_PATH_LEN];
         let flags = (*msg).regs[1] as u32;
-        let path_len = extract_path(msg, 2, path.as_mut_ptr());
+        let raw_len = extract_path(msg, 2, path.as_mut_ptr());
 
-        if path_len == 0 {
+        if raw_len == 0 {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
 
+        let Some((path_ptr, path_len)) = normalize_path_for_client(
+            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
+        ) else {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        };
+        let path_slice = core::slice::from_raw_parts(path_ptr, path_len as usize);
+
         // /proc virtual paths — intercept before resolve
-        if path_len >= 6 && path[0] == b'/' && path[1] == b'p' && path[2] == b'r'
-            && path[3] == b'o' && path[4] == b'c' && path[5] == b'/'
+        if path_len >= 6 && *path_ptr == b'/' && *path_ptr.add(1) == b'p' && *path_ptr.add(2) == b'r'
+            && *path_ptr.add(3) == b'o' && *path_ptr.add(4) == b'c' && *path_ptr.add(5) == b'/'
         {
-            if handle_proc_open(path.as_ptr(), path_len, reply, badge) {
+            if handle_proc_open(path_ptr, path_len, reply, badge) {
                 return;
             }
         }
 
-        let mut inode = resolve_path(path.as_ptr(), path_len);
+        // Mount point intercept: paths under /mnt/data/
+        if let Some(mount_idx) = find_mount_for_path(path_slice, path_len) {
+            let (_, sub_start, sub_len) = parse_mount_path(path_slice, path_len);
+            if sub_len > 0 {
+                // File within mount — lookup and open
+                let remote_ino = mount_lookup(mount_idx, path_ptr.add(sub_start), sub_len);
+                if remote_ino == 0 {
+                    (*reply).label = SALTY_NOT_FOUND;
+                    return;
+                }
+
+                // Stat the remote inode for metadata
+                let stat = mount_stat(mount_idx, remote_ino);
+                let (size, _mode, _nlink, _mtime, is_dir) = match stat {
+                    Some(s) => s,
+                    None => {
+                        (*reply).label = SALTY_NOT_FOUND;
+                        return;
+                    }
+                };
+
+                if is_dir {
+                    // Directory open: use handle_opendir-style logic
+                    let cli = get_client(badge);
+                    if cli.is_null() {
+                        (*reply).label = SALTY_OUT_OF_MEMORY;
+                        return;
+                    }
+                    for fd in 0..(*cli).fds_cap as usize {
+                        if (*(*cli).fds.add(fd)).active == 0 {
+                            (*(*cli).fds.add(fd)).active = 1;
+                            (*(*cli).fds.add(fd)).fd_type = FD_TYPE_MOUNT;
+                            (*(*cli).fds.add(fd)).inode = MOUNT_DATA_INO;
+                            (*(*cli).fds.add(fd)).offset = 0;
+                            (*(*cli).fds.add(fd)).dir_cursor = 0;
+                            (*(*cli).fds.add(fd)).sock_id = remote_ino as u32;
+                            (*(*cli).fds.add(fd)).dev_type = mount_idx as u8;
+                            (*(*cli).fds.add(fd)).flags = flags;
+                            (*(*cli).fds.add(fd)).mount_batch_count = 0;
+                            (*(*cli).fds.add(fd)).mount_batch_index = 0;
+                            (*(*cli).fds.add(fd)).mount_batch_next_cursor = 0;
+                            (*reply).label = SALTY_OK;
+                            (*reply).length = 1;
+                            (*reply).regs[0] = fd as u64;
+                            return;
+                        }
+                    }
+                    (*reply).label = SALTY_OUT_OF_MEMORY;
+                    return;
+                }
+
+                // Regular file: read-only
+                if flags_allow_write(flags) {
+                    (*reply).label = SALTY_INVALID_OPERATION;
+                    return;
+                }
+
+                let cli = get_client(badge);
+                if cli.is_null() {
+                    (*reply).label = SALTY_OUT_OF_MEMORY;
+                    return;
+                }
+                for fd in 0..(*cli).fds_cap as usize {
+                    if (*(*cli).fds.add(fd)).active == 0 {
+                        (*(*cli).fds.add(fd)).active = 1;
+                        (*(*cli).fds.add(fd)).fd_type = FD_TYPE_MOUNT;
+                        (*(*cli).fds.add(fd)).inode = MOUNT_DATA_INO;
+                        (*(*cli).fds.add(fd)).offset = 0;
+                        (*(*cli).fds.add(fd)).dir_cursor = 0;
+                        (*(*cli).fds.add(fd)).sock_id = remote_ino as u32;
+                        (*(*cli).fds.add(fd)).dev_type = mount_idx as u8;
+                        (*(*cli).fds.add(fd)).flags = flags;
+                        (*(*cli).fds.add(fd)).mount_batch_count = 0;
+                        (*(*cli).fds.add(fd)).mount_batch_index = 0;
+                        (*(*cli).fds.add(fd)).mount_batch_next_cursor = 0;
+                        (*reply).label = SALTY_OK;
+                        (*reply).length = 1;
+                        (*reply).regs[0] = fd as u64;
+                        return;
+                    }
+                }
+                (*reply).label = SALTY_OUT_OF_MEMORY;
+                return;
+            }
+            // Exact "/mnt/data" — falls through to resolve_path (it's a local dir)
+        }
+
+        let mut inode = resolve_path(path_ptr, path_len);
 
         if inode.is_null() {
             if (flags & O_CREAT) == 0 {
@@ -2347,7 +2935,7 @@ unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
 
             let mut child_name: *const u8 = core::ptr::null();
             let mut child_len: u8 = 0;
-            let parent = resolve_parent(path.as_ptr(), path_len, &mut child_name, &mut child_len);
+            let parent = resolve_parent(path_ptr, path_len, &mut child_name, &mut child_len);
             if !parent.is_null()
                 && (*parent).ftype == FTYPE_DIRECTORY
                 && (*parent).readonly == 0
@@ -2832,21 +3420,32 @@ unsafe fn handle_lseek(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
             return;
         }
 
-        if (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_FILE {
+        let fdt = (*(*cli).fds.add(fd as usize)).fd_type;
+        if fdt != FD_TYPE_FILE && fdt != FD_TYPE_MOUNT {
             (*reply).label = SALTY_INVALID_OPERATION;
             return;
         }
 
-        let inode = inode_by_ino((*(*cli).fds.add(fd as usize)).inode);
-        if inode.is_null() {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
-            return;
-        }
+        // For mount FDs, we need the file size from the remote FS for SEEK_END
+        let file_size: u64 = if fdt == FD_TYPE_MOUNT {
+            let fde = &*(*cli).fds.add(fd as usize);
+            match mount_stat(fde.dev_type as usize, fde.sock_id as u64) {
+                Some((size, _, _, _, _)) => size,
+                None => 0,
+            }
+        } else {
+            let inode = inode_by_ino((*(*cli).fds.add(fd as usize)).inode);
+            if inode.is_null() {
+                (*reply).label = SALTY_INVALID_ARGUMENT;
+                return;
+            }
+            (*inode).size
+        };
 
         let new_offset: i64 = match whence {
             0 => offset, // SEEK_SET
             1 => (*(*cli).fds.add(fd as usize)).offset as i64 + offset, // SEEK_CUR
-            2 => (*inode).size as i64 + offset, // SEEK_END
+            2 => file_size as i64 + offset, // SEEK_END
             _ => {
                 (*reply).label = SALTY_INVALID_ARGUMENT;
                 return;
@@ -2876,7 +3475,11 @@ unsafe fn fill_stat_reply(reply: *mut SaltyMsg, inode: *const RamfsInode) {
         (*reply).regs[4] = 0; // uid
         (*reply).regs[5] = 0; // gid
         (*reply).regs[6] = (*inode).mtime as u64;
-        (*reply).regs[7] = (*inode).ftype as u64;
+        (*reply).regs[7] = if (*inode).ftype == FTYPE_MOUNT_POINT {
+            FTYPE_DIRECTORY as u64
+        } else {
+            (*inode).ftype as u64
+        };
     }
 }
 
@@ -2888,6 +3491,36 @@ unsafe fn handle_fstat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
+
+        // Mount FD: proxy stat to remote FS
+        if (*(*cli).fds.add(fd as usize)).fd_type == FD_TYPE_MOUNT {
+            let fde = &*(*cli).fds.add(fd as usize);
+            let mount_idx = fde.dev_type as usize;
+            let remote_ino = fde.sock_id as u64;
+            match mount_stat(mount_idx, remote_ino) {
+                Some((size, mode, nlink, mtime, _)) => {
+                    (*reply).label = SALTY_OK;
+                    (*reply).length = 8;
+                    (*reply).regs[0] = remote_ino;
+                    (*reply).regs[1] = mode as u64;
+                    (*reply).regs[2] = nlink as u64;
+                    (*reply).regs[3] = size;
+                    (*reply).regs[4] = 0;
+                    (*reply).regs[5] = 0;
+                    (*reply).regs[6] = mtime;
+                    (*reply).regs[7] = if (mode & S_IFMT_L) == S_IFDIR_L {
+                        FTYPE_DIRECTORY as u64
+                    } else {
+                        FTYPE_REGULAR as u64
+                    };
+                }
+                None => {
+                    (*reply).label = SALTY_INVALID_ARGUMENT;
+                }
+            }
+            return;
+        }
+
         let inode = inode_by_ino((*(*cli).fds.add(fd as usize)).inode);
         if inode.is_null() {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -2915,22 +3548,200 @@ unsafe fn get_client_cwd_ino(badge: u64) -> u32 {
     }
 }
 
+/// Normalize a user path to canonical absolute form using the caller's cwd.
+/// This collapses repeated '/', '.' and '..' components.
+/// Returns (absolute_path_ptr, absolute_len).
+unsafe fn normalize_path_for_client(
+    badge: u64,
+    in_path: *const u8,
+    in_len: u8,
+    tmp_abs: *mut u8,
+) -> Option<(*const u8, u8)> {
+    unsafe {
+        if in_len == 0 {
+            return None;
+        }
+        let mut raw_abs = [0u8; MAX_PATH_LEN];
+        let raw_len: usize;
+
+        if *in_path == b'/' {
+            raw_len = in_len as usize;
+            if raw_len == 0 || raw_len > MAX_PATH_LEN {
+                return None;
+            }
+            for i in 0..raw_len {
+                raw_abs[i] = *in_path.add(i);
+            }
+        } else {
+            let cli = get_client_noalloc(badge);
+            if cli.is_null() {
+                return None;
+            }
+
+            let mut cwd_len: usize = 0;
+            while cwd_len < 128 && (*cli).cwd[cwd_len] != 0 {
+                cwd_len += 1;
+            }
+            if cwd_len == 0 {
+                cwd_len = 1;
+            }
+
+            let cwd_is_root = cwd_len == 1 && (*cli).cwd[0] == b'/';
+            let rel_len = in_len as usize;
+            raw_len = if cwd_is_root { 1 + rel_len } else { cwd_len + 1 + rel_len };
+            if raw_len > MAX_PATH_LEN {
+                return None;
+            }
+
+            if cwd_is_root {
+                raw_abs[0] = b'/';
+                for i in 0..rel_len {
+                    raw_abs[1 + i] = *in_path.add(i);
+                }
+            } else {
+                for i in 0..cwd_len {
+                    raw_abs[i] = (*cli).cwd[i];
+                }
+                raw_abs[cwd_len] = b'/';
+                for i in 0..rel_len {
+                    raw_abs[cwd_len + 1 + i] = *in_path.add(i);
+                }
+            }
+        }
+
+        // Canonicalize absolute path in raw_abs into tmp_abs.
+        // Output always starts with '/' and has no trailing slash except root.
+        let mut out_len: usize = 1;
+        *tmp_abs = b'/';
+        let mut comp_starts = [0usize; MAX_PATH_LEN / 2];
+        let mut depth: usize = 0;
+
+        let mut pos: usize = 0;
+        if raw_len > 0 && raw_abs[0] == b'/' {
+            pos = 1;
+        }
+
+        while pos < raw_len {
+            while pos < raw_len && raw_abs[pos] == b'/' {
+                pos += 1;
+            }
+            if pos >= raw_len {
+                break;
+            }
+
+            let start = pos;
+            while pos < raw_len && raw_abs[pos] != b'/' {
+                pos += 1;
+            }
+            let seg_len = pos - start;
+            if seg_len == 0 {
+                continue;
+            }
+
+            if seg_len == 1 && raw_abs[start] == b'.' {
+                continue;
+            }
+            if seg_len == 2 && raw_abs[start] == b'.' && raw_abs[start + 1] == b'.' {
+                if depth > 0 {
+                    depth -= 1;
+                    out_len = comp_starts[depth];
+                    if out_len == 0 {
+                        out_len = 1;
+                        *tmp_abs = b'/';
+                    }
+                }
+                continue;
+            }
+
+            if depth >= comp_starts.len() {
+                return None;
+            }
+            if out_len > 1 {
+                if out_len >= MAX_PATH_LEN {
+                    return None;
+                }
+                *tmp_abs.add(out_len) = b'/';
+                out_len += 1;
+            }
+            comp_starts[depth] = out_len;
+            depth += 1;
+
+            if out_len + seg_len > MAX_PATH_LEN {
+                return None;
+            }
+            for i in 0..seg_len {
+                *tmp_abs.add(out_len + i) = raw_abs[start + i];
+            }
+            out_len += seg_len;
+        }
+
+        if out_len == 0 || out_len > u8::MAX as usize {
+            return None;
+        }
+        Some((tmp_abs as *const u8, out_len as u8))
+    }
+}
+
 unsafe fn handle_stat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
-        let path_len = extract_path(msg, 0, path.as_mut_ptr());
-        let inode = if path_len > 0 && path[0] == b'/' {
-            resolve_path(path.as_ptr(), path_len)
-        } else {
-            let cwd_ino = get_client_cwd_ino(badge);
-            resolve_path_from(cwd_ino, path.as_ptr(), path_len)
+        let mut abs_path = [0u8; MAX_PATH_LEN];
+        let raw_len = extract_path(msg, 0, path.as_mut_ptr());
+        if raw_len == 0 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+        let Some((path_ptr, path_len)) = normalize_path_for_client(
+            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
+        ) else {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
         };
+        let path_slice = core::slice::from_raw_parts(path_ptr, path_len as usize);
+
+        // Mount point intercept for stat
+        if let Some(mount_idx) = find_mount_for_path(path_slice, path_len) {
+            let (_, sub_start, sub_len) = parse_mount_path(path_slice, path_len);
+            if sub_len > 0 {
+                let remote_ino = mount_lookup(mount_idx, path_ptr.add(sub_start), sub_len);
+                if remote_ino == 0 {
+                    (*reply).label = SALTY_NOT_FOUND;
+                    return;
+                }
+                match mount_stat(mount_idx, remote_ino) {
+                    Some((size, mode, nlink, mtime, _)) => {
+                        (*reply).label = SALTY_OK;
+                        (*reply).length = 8;
+                        (*reply).regs[0] = remote_ino;
+                        (*reply).regs[1] = mode as u64;
+                        (*reply).regs[2] = nlink as u64;
+                        (*reply).regs[3] = size;
+                        (*reply).regs[4] = 0; // uid
+                        (*reply).regs[5] = 0; // gid
+                        (*reply).regs[6] = mtime;
+                        (*reply).regs[7] = if (mode & S_IFMT_L) == S_IFDIR_L {
+                            FTYPE_DIRECTORY as u64
+                        } else {
+                            FTYPE_REGULAR as u64
+                        };
+                    }
+                    None => {
+                        (*reply).label = SALTY_NOT_FOUND;
+                    }
+                }
+                return;
+            }
+            // Exact mount point — fall through to local resolve
+        }
+
+        let inode = resolve_path(path_ptr, path_len);
         if inode.is_null() {
             // Try /proc virtual paths
-            if path_len >= 6 && path[0] == b'/' && path[1] == b'p' && path[2] == b'r'
-                && path[3] == b'o' && path[4] == b'c' && path[5] == b'/'
+            if path_len >= 6 && *path_ptr == b'/' && *path_ptr.add(1) == b'p'
+                && *path_ptr.add(2) == b'r' && *path_ptr.add(3) == b'o'
+                && *path_ptr.add(4) == b'c' && *path_ptr.add(5) == b'/'
             {
-                if handle_proc_stat(path.as_ptr(), path_len, reply, badge) {
+                if handle_proc_stat(path_ptr, path_len, reply, badge) {
                     return;
                 }
             }
@@ -2944,19 +3755,26 @@ unsafe fn handle_stat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
 unsafe fn handle_access(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
-        let path_len = extract_path(msg, 1, path.as_mut_ptr());
-        let inode = if path_len > 0 && path[0] == b'/' {
-            resolve_path(path.as_ptr(), path_len)
-        } else {
-            let cwd_ino = get_client_cwd_ino(badge);
-            resolve_path_from(cwd_ino, path.as_ptr(), path_len)
+        let mut abs_path = [0u8; MAX_PATH_LEN];
+        let raw_len = extract_path(msg, 1, path.as_mut_ptr());
+        if raw_len == 0 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+        let Some((path_ptr, path_len)) = normalize_path_for_client(
+            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
+        ) else {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
         };
+        let inode = resolve_path(path_ptr, path_len);
         if inode.is_null() {
             // /proc virtual paths always accessible (read-only)
-            if path_len >= 6 && path[0] == b'/' && path[1] == b'p' && path[2] == b'r'
-                && path[3] == b'o' && path[4] == b'c' && path[5] == b'/'
+            if path_len >= 6 && *path_ptr == b'/' && *path_ptr.add(1) == b'p'
+                && *path_ptr.add(2) == b'r' && *path_ptr.add(3) == b'o'
+                && *path_ptr.add(4) == b'c' && *path_ptr.add(5) == b'/'
             {
-                if handle_proc_stat(path.as_ptr(), path_len, &mut SaltyMsg::zeroed(), badge) {
+                if handle_proc_stat(path_ptr, path_len, &mut SaltyMsg::zeroed(), badge) {
                     (*reply).label = SALTY_OK;
                     return;
                 }
@@ -2968,14 +3786,25 @@ unsafe fn handle_access(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) 
     }
 }
 
-unsafe fn handle_unlink(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
+unsafe fn handle_unlink(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
-        let path_len = extract_path(msg, 0, path.as_mut_ptr());
+        let mut abs_path = [0u8; MAX_PATH_LEN];
+        let raw_len = extract_path(msg, 0, path.as_mut_ptr());
+        if raw_len == 0 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+        let Some((path_ptr, path_len)) = normalize_path_for_client(
+            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
+        ) else {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        };
 
         let mut child_name: *const u8 = core::ptr::null();
         let mut child_len: u8 = 0;
-        let parent = resolve_parent(path.as_ptr(), path_len, &mut child_name, &mut child_len);
+        let parent = resolve_parent(path_ptr, path_len, &mut child_name, &mut child_len);
         if parent.is_null() || (*parent).readonly != 0 {
             (*reply).label = SALTY_INVALID_OPERATION;
             return;
@@ -3002,7 +3831,7 @@ unsafe fn handle_unlink(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
     }
 }
 
-unsafe fn handle_rename(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
+unsafe fn handle_rename(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let mut old_len = (*msg).regs[0] as u8;
         let mut new_len = (*msg).regs[1] as u8;
@@ -3015,6 +3844,8 @@ unsafe fn handle_rename(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
 
         let mut old_path = [0u8; MAX_PATH_LEN];
         let mut new_path = [0u8; MAX_PATH_LEN];
+        let mut old_abs = [0u8; MAX_PATH_LEN];
+        let mut new_abs = [0u8; MAX_PATH_LEN];
         let raw = &(*msg).regs[2] as *const u64 as *const u8;
         for i in 0..old_len as usize {
             old_path[i] = *raw.add(i);
@@ -3023,12 +3854,28 @@ unsafe fn handle_rename(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
         for i in 0..new_len as usize {
             new_path[i] = *raw2.add(i);
         }
+        if old_len == 0 || new_len == 0 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+        let Some((old_ptr, old_norm_len)) = normalize_path_for_client(
+            badge, old_path.as_ptr(), old_len, old_abs.as_mut_ptr(),
+        ) else {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        };
+        let Some((new_ptr, new_norm_len)) = normalize_path_for_client(
+            badge, new_path.as_ptr(), new_len, new_abs.as_mut_ptr(),
+        ) else {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        };
 
         // Resolve old parent + child
         let mut old_child: *const u8 = core::ptr::null();
         let mut old_child_len: u8 = 0;
         let old_parent =
-            resolve_parent(old_path.as_ptr(), old_len, &mut old_child, &mut old_child_len);
+            resolve_parent(old_ptr, old_norm_len, &mut old_child, &mut old_child_len);
         if old_parent.is_null() || (*old_parent).readonly != 0 {
             (*reply).label = SALTY_INVALID_OPERATION;
             return;
@@ -3045,7 +3892,7 @@ unsafe fn handle_rename(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
         let mut new_child: *const u8 = core::ptr::null();
         let mut new_child_len: u8 = 0;
         let new_parent =
-            resolve_parent(new_path.as_ptr(), new_len, &mut new_child, &mut new_child_len);
+            resolve_parent(new_ptr, new_norm_len, &mut new_child, &mut new_child_len);
         if new_parent.is_null() || (*new_parent).readonly != 0 {
             (*reply).label = SALTY_INVALID_OPERATION;
             return;
@@ -3072,12 +3919,23 @@ unsafe fn handle_rename(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
     }
 }
 
-unsafe fn handle_mkdir(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
+unsafe fn handle_mkdir(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
-        let path_len = extract_path(msg, 1, path.as_mut_ptr());
+        let mut abs_path = [0u8; MAX_PATH_LEN];
+        let raw_len = extract_path(msg, 1, path.as_mut_ptr());
+        if raw_len == 0 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+        let Some((path_ptr, path_len)) = normalize_path_for_client(
+            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
+        ) else {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        };
 
-        let existing = resolve_path(path.as_ptr(), path_len);
+        let existing = resolve_path(path_ptr, path_len);
         if !existing.is_null() {
             (*reply).label = SALTY_ALREADY_EXISTS;
             return;
@@ -3085,7 +3943,7 @@ unsafe fn handle_mkdir(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
 
         let mut child_name: *const u8 = core::ptr::null();
         let mut child_len: u8 = 0;
-        let parent = resolve_parent(path.as_ptr(), path_len, &mut child_name, &mut child_len);
+        let parent = resolve_parent(path_ptr, path_len, &mut child_name, &mut child_len);
         if parent.is_null() || (*parent).ftype != FTYPE_DIRECTORY || (*parent).readonly != 0 {
             (*reply).label = SALTY_INVALID_OPERATION;
             return;
@@ -3107,12 +3965,23 @@ unsafe fn handle_mkdir(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
     }
 }
 
-unsafe fn handle_mkfifo(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
+unsafe fn handle_mkfifo(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
-        let path_len = extract_path(msg, 1, path.as_mut_ptr());
+        let mut abs_path = [0u8; MAX_PATH_LEN];
+        let raw_len = extract_path(msg, 1, path.as_mut_ptr());
+        if raw_len == 0 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+        let Some((path_ptr, path_len)) = normalize_path_for_client(
+            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
+        ) else {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        };
 
-        let existing = resolve_path(path.as_ptr(), path_len);
+        let existing = resolve_path(path_ptr, path_len);
         if !existing.is_null() {
             (*reply).label = SALTY_ALREADY_EXISTS;
             return;
@@ -3120,7 +3989,7 @@ unsafe fn handle_mkfifo(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
 
         let mut child_name: *const u8 = core::ptr::null();
         let mut child_len: u8 = 0;
-        let parent = resolve_parent(path.as_ptr(), path_len, &mut child_name, &mut child_len);
+        let parent = resolve_parent(path_ptr, path_len, &mut child_name, &mut child_len);
         if parent.is_null() || (*parent).ftype != FTYPE_DIRECTORY || (*parent).readonly != 0 {
             (*reply).label = SALTY_INVALID_OPERATION;
             return;
@@ -3151,12 +4020,23 @@ unsafe fn handle_mkfifo(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
     }
 }
 
-unsafe fn handle_rmdir(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
+unsafe fn handle_rmdir(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
-        let path_len = extract_path(msg, 0, path.as_mut_ptr());
+        let mut abs_path = [0u8; MAX_PATH_LEN];
+        let raw_len = extract_path(msg, 0, path.as_mut_ptr());
+        if raw_len == 0 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+        let Some((path_ptr, path_len)) = normalize_path_for_client(
+            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
+        ) else {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        };
 
-        let inode = resolve_path(path.as_ptr(), path_len);
+        let inode = resolve_path(path_ptr, path_len);
         if inode.is_null() || (*inode).ftype != FTYPE_DIRECTORY {
             (*reply).label = SALTY_NOT_FOUND;
             return;
@@ -3178,7 +4058,7 @@ unsafe fn handle_rmdir(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
         // Remove from parent
         let mut child_name: *const u8 = core::ptr::null();
         let mut child_len: u8 = 0;
-        let parent = resolve_parent(path.as_ptr(), path_len, &mut child_name, &mut child_len);
+        let parent = resolve_parent(path_ptr, path_len, &mut child_name, &mut child_len);
         if !parent.is_null() {
             dir_remove_entry(parent, child_name, child_len);
         }
@@ -3775,21 +4655,77 @@ unsafe fn handle_utimensat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
 unsafe fn handle_opendir(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
-        let path_len = extract_path(msg, 0, path.as_mut_ptr());
+        let mut abs_path = [0u8; MAX_PATH_LEN];
+        let raw_len = extract_path(msg, 0, path.as_mut_ptr());
+        if raw_len == 0 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+        let Some((path_ptr, path_len)) = normalize_path_for_client(
+            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
+        ) else {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        };
+        let path_slice = core::slice::from_raw_parts(path_ptr, path_len as usize);
 
         // /proc sub-paths that don't resolve as real inodes
-        if path_len >= 6 && path[0] == b'/' && path[1] == b'p' && path[2] == b'r'
-            && path[3] == b'o' && path[4] == b'c' && path[5] == b'/'
+        if path_len >= 6 && *path_ptr == b'/' && *path_ptr.add(1) == b'p'
+            && *path_ptr.add(2) == b'r' && *path_ptr.add(3) == b'o'
+            && *path_ptr.add(4) == b'c' && *path_ptr.add(5) == b'/'
         {
-            if handle_proc_open(path.as_ptr(), path_len, reply, badge) {
+            if handle_proc_open(path_ptr, path_len, reply, badge) {
                 return;
             }
         }
 
-        let inode = resolve_path(path.as_ptr(), path_len);
+        // Mount point intercept for opendir
+        if let Some(mount_idx) = find_mount_for_path(path_slice, path_len) {
+            let (_, sub_start, sub_len) = parse_mount_path(path_slice, path_len);
+            let remote_ino = if sub_len > 0 {
+                mount_lookup(mount_idx, path_ptr.add(sub_start), sub_len)
+            } else {
+                (*(&raw const MOUNTS[mount_idx])).root_ino as u64
+            };
+            if remote_ino == 0 {
+                (*reply).label = SALTY_NOT_FOUND;
+                return;
+            }
+
+            let cli = get_client(badge);
+            if cli.is_null() {
+                (*reply).label = SALTY_OUT_OF_MEMORY;
+                return;
+            }
+            for fd in 0..(*cli).fds_cap as usize {
+                if (*(*cli).fds.add(fd)).active == 0 {
+                    (*(*cli).fds.add(fd)).active = 1;
+                    (*(*cli).fds.add(fd)).fd_type = FD_TYPE_MOUNT;
+                    (*(*cli).fds.add(fd)).inode = MOUNT_DATA_INO;
+                    (*(*cli).fds.add(fd)).offset = 0;
+                    (*(*cli).fds.add(fd)).dir_cursor = 0;
+                    (*(*cli).fds.add(fd)).sock_id = remote_ino as u32;
+                    (*(*cli).fds.add(fd)).dev_type = mount_idx as u8;
+                    (*(*cli).fds.add(fd)).flags = 0;
+                    (*(*cli).fds.add(fd)).mount_batch_count = 0;
+                    (*(*cli).fds.add(fd)).mount_batch_index = 0;
+                    (*(*cli).fds.add(fd)).mount_batch_next_cursor = 0;
+                    (*reply).label = SALTY_OK;
+                    (*reply).length = 1;
+                    (*reply).regs[0] = fd as u64;
+                    return;
+                }
+            }
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
+
+        let inode = resolve_path(path_ptr, path_len);
         let is_dir = if inode.is_null() {
             false
         } else if (*inode).ftype == FTYPE_DIRECTORY {
+            true
+        } else if (*inode).ftype == FTYPE_MOUNT_POINT {
             true
         } else if (*inode).ftype == FTYPE_PROC_FILE
             && ((*inode).dev_type == PROC_FILE_ROOT || (*inode).dev_type == PROC_FILE_PID_DIR)
@@ -3799,6 +4735,43 @@ unsafe fn handle_opendir(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
             false
         };
         if !is_dir {
+            (*reply).label = SALTY_NOT_FOUND;
+            return;
+        }
+
+        // If the resolved inode is a mount point, open it as a mount dir
+        if (*inode).ftype == FTYPE_MOUNT_POINT {
+            for i in 0..MAX_MOUNTS {
+                let m = &*(&raw const MOUNTS[i]);
+                if m.active != 0 && m.mount_ino == (*inode).ino {
+                    let cli = get_client(badge);
+                    if cli.is_null() {
+                        (*reply).label = SALTY_OUT_OF_MEMORY;
+                        return;
+                    }
+                    for fd in 0..(*cli).fds_cap as usize {
+                        if (*(*cli).fds.add(fd)).active == 0 {
+                            (*(*cli).fds.add(fd)).active = 1;
+                            (*(*cli).fds.add(fd)).fd_type = FD_TYPE_MOUNT;
+                            (*(*cli).fds.add(fd)).inode = (*inode).ino;
+                            (*(*cli).fds.add(fd)).offset = 0;
+                            (*(*cli).fds.add(fd)).dir_cursor = 0;
+                            (*(*cli).fds.add(fd)).sock_id = m.root_ino;
+                            (*(*cli).fds.add(fd)).dev_type = i as u8;
+                            (*(*cli).fds.add(fd)).flags = 0;
+                            (*(*cli).fds.add(fd)).mount_batch_count = 0;
+                            (*(*cli).fds.add(fd)).mount_batch_index = 0;
+                            (*(*cli).fds.add(fd)).mount_batch_next_cursor = 0;
+                            (*reply).label = SALTY_OK;
+                            (*reply).length = 1;
+                            (*reply).regs[0] = fd as u64;
+                            return;
+                        }
+                    }
+                    (*reply).label = SALTY_OUT_OF_MEMORY;
+                    return;
+                }
+            }
             (*reply).label = SALTY_NOT_FOUND;
             return;
         }
@@ -3872,6 +4845,7 @@ unsafe fn handle_readdir(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
                         FTYPE_CHAR_DEVICE => 2, // DT_CHR
                         FTYPE_SYMLINK => 10,    // DT_LNK
                         FTYPE_PROC_FILE => 4,   // DT_DIR (proc virtual dir)
+                        FTYPE_MOUNT_POINT => 4, // DT_DIR (mount point)
                         _ => 0,
                     }
                 } else {
@@ -5946,19 +6920,26 @@ unsafe fn handle_fcntl(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
 unsafe fn handle_chdir(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
-        let path_len = extract_path(msg, 0, path.as_mut_ptr());
-        if path_len == 0 {
+        let mut abs_path = [0u8; MAX_PATH_LEN];
+        let raw_len = extract_path(msg, 0, path.as_mut_ptr());
+        if raw_len == 0 {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
+        let Some((path_ptr, path_len)) = normalize_path_for_client(
+            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
+        ) else {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        };
 
         // Validate that path exists and is a directory
-        let inode = resolve_path(path.as_ptr(), path_len);
+        let inode = resolve_path(path_ptr, path_len);
         if inode.is_null() {
             (*reply).label = SALTY_NOT_FOUND;
             return;
         }
-        if (*inode).ftype != FTYPE_DIRECTORY {
+        if (*inode).ftype != FTYPE_DIRECTORY && (*inode).ftype != FTYPE_MOUNT_POINT {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
@@ -5973,7 +6954,7 @@ unsafe fn handle_chdir(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
         let copy_len = if (path_len as usize) < 127 { path_len as usize } else { 127 };
         let mut i = 0;
         while i < copy_len {
-            (*cli).cwd[i] = path[i];
+            (*cli).cwd[i] = *path_ptr.add(i);
             i += 1;
         }
         // Ensure null-terminated
@@ -6092,10 +7073,21 @@ unsafe fn handle_bind(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) ->
 
         // Extract path
         let mut path = [0u8; MAX_PATH_LEN];
-        let path_len = extract_path(msg, 1, path.as_mut_ptr());
+        let mut abs_path = [0u8; MAX_PATH_LEN];
+        let raw_len = extract_path(msg, 1, path.as_mut_ptr());
+        if raw_len == 0 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return false;
+        }
+        let Some((path_ptr, path_len)) = normalize_path_for_client(
+            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
+        ) else {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return false;
+        };
 
         // Create a socket inode at this path
-        let existing = resolve_path(path.as_ptr(), path_len);
+        let existing = resolve_path(path_ptr, path_len);
         if !existing.is_null() {
             (*reply).label = SALTY_ALREADY_EXISTS;
             return false;
@@ -6103,7 +7095,7 @@ unsafe fn handle_bind(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) ->
 
         let mut child_name: *const u8 = core::ptr::null();
         let mut child_len: u8 = 0;
-        let parent = resolve_parent(path.as_ptr(), path_len, &mut child_name, &mut child_len);
+        let parent = resolve_parent(path_ptr, path_len, &mut child_name, &mut child_len);
         if parent.is_null() || (*parent).ftype != FTYPE_DIRECTORY || (*parent).readonly != 0 {
             (*reply).label = SALTY_INVALID_OPERATION;
             return false;
@@ -6286,8 +7278,19 @@ unsafe fn handle_connect(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64)
 
         // Resolve path to find listening socket
         let mut path = [0u8; MAX_PATH_LEN];
-        let path_len = extract_path(msg, 1, path.as_mut_ptr());
-        let inode = resolve_path(path.as_ptr(), path_len);
+        let mut abs_path = [0u8; MAX_PATH_LEN];
+        let raw_len = extract_path(msg, 1, path.as_mut_ptr());
+        if raw_len == 0 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return false;
+        }
+        let Some((path_ptr, path_len)) = normalize_path_for_client(
+            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
+        ) else {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return false;
+        };
+        let inode = resolve_path(path_ptr, path_len);
         if inode.is_null() || (*inode).ftype != FTYPE_SOCKET {
             (*reply).label = SALTY_NOT_FOUND;
             return false;
@@ -7440,17 +8443,24 @@ unsafe fn handle_symlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u6
 /// readlinkat(dirfd, path) -> target
 /// IPC in: regs[0]=path_len, regs[1..]=path
 /// IPC out: regs[0]=target_len, regs[1..]=target
-unsafe fn handle_readlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, _badge: u64) {
+unsafe fn handle_readlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
-        let path_len = extract_path(msg, 0, path.as_mut_ptr());
+        let mut abs_path = [0u8; MAX_PATH_LEN];
+        let raw_len = extract_path(msg, 0, path.as_mut_ptr());
 
-        if path_len == 0 {
+        if raw_len == 0 {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
+        let Some((path_ptr, path_len)) = normalize_path_for_client(
+            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
+        ) else {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        };
 
-        let inode = resolve_path_raw_nofollow(path.as_ptr(), path_len);
+        let inode = resolve_path_raw_nofollow(path_ptr, path_len);
         if inode.is_null() {
             (*reply).label = SALTY_NOT_FOUND;
             return;
@@ -7481,48 +8491,26 @@ unsafe fn handle_readlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, _badge: 
 unsafe fn handle_lstat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
-        let path_len = extract_path(msg, 0, path.as_mut_ptr());
-        let inode = if path_len > 0 && path[0] == b'/' {
-            resolve_path_raw_nofollow(path.as_ptr(), path_len)
-        } else {
-            // Relative path: resolve with cwd
-            let cwd_ino = get_client_cwd_ino(badge);
-            // Build absolute path from cwd + relative
-            let cli = get_client_noalloc(badge);
-            if cli.is_null() {
-                (*reply).label = SALTY_NOT_FOUND;
-                return;
-            }
-            let mut cwd_len: usize = 0;
-            while cwd_len < 128 && (*cli).cwd[cwd_len] != 0 {
-                cwd_len += 1;
-            }
-            if cwd_len == 0 || path_len == 0 {
-                resolve_path_raw_nofollow(path.as_ptr(), path_len)
-            } else {
-                // Build absolute path: cwd + "/" + path
-                let total = cwd_len + 1 + path_len as usize;
-                if total > MAX_PATH_LEN {
-                    (*reply).label = SALTY_NOT_FOUND;
-                    return;
-                }
-                let mut abs = [0u8; MAX_PATH_LEN];
-                for i in 0..cwd_len {
-                    abs[i] = (*cli).cwd[i];
-                }
-                abs[cwd_len] = b'/';
-                for i in 0..path_len as usize {
-                    abs[cwd_len + 1 + i] = path[i];
-                }
-                resolve_path_raw_nofollow(abs.as_ptr(), total as u8)
-            }
+        let mut abs_path = [0u8; MAX_PATH_LEN];
+        let raw_len = extract_path(msg, 0, path.as_mut_ptr());
+        if raw_len == 0 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+        let Some((path_ptr, path_len)) = normalize_path_for_client(
+            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
+        ) else {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
         };
+        let inode = resolve_path_raw_nofollow(path_ptr, path_len);
         if inode.is_null() {
             // Try /proc virtual paths
-            if path_len >= 6 && path[0] == b'/' && path[1] == b'p' && path[2] == b'r'
-                && path[3] == b'o' && path[4] == b'c' && path[5] == b'/'
+            if path_len >= 6 && *path_ptr == b'/' && *path_ptr.add(1) == b'p'
+                && *path_ptr.add(2) == b'r' && *path_ptr.add(3) == b'o'
+                && *path_ptr.add(4) == b'c' && *path_ptr.add(5) == b'/'
             {
-                if handle_proc_stat(path.as_ptr(), path_len, reply, badge) {
+                if handle_proc_stat(path_ptr, path_len, reply, badge) {
                     return;
                 }
             }
@@ -8335,6 +9323,20 @@ pub extern "C" fn _start() -> ! {
                                     handle_read(&raw const msg, &raw mut reply, badge);
                                 }
                             }
+                            FD_TYPE_MOUNT => {
+                                let fde = &mut *(*cli).fds.add(fd as usize);
+                                let mount_idx = fde.dev_type as usize;
+                                let remote_ino = fde.sock_id as u64;
+                                let mut count = msg.regs[1];
+                                if count > 152 { count = 152; }
+                                mount_read_inline(
+                                    mount_idx, remote_ino, fde.offset, count,
+                                    &raw mut reply);
+                                if reply.label == SALTY_OK {
+                                    let bytes_read = reply.regs[0];
+                                    fde.offset += bytes_read;
+                                }
+                            }
                             _ => {
                                 handle_read(&raw const msg, &raw mut reply, badge);
                             }
@@ -8394,12 +9396,26 @@ pub extern "C" fn _start() -> ! {
                 VFS_LSEEK => { handle_lseek(&raw const msg, &raw mut reply, badge); }
                 VFS_FSTAT => { handle_fstat(&raw const msg, &raw mut reply, badge); }
                 VFS_ACCESS => { handle_access(&raw const msg, &raw mut reply, badge); }
-                VFS_UNLINK => { handle_unlink(&raw const msg, &raw mut reply); }
-                VFS_RENAME => { handle_rename(&raw const msg, &raw mut reply); }
-                VFS_MKDIR => { handle_mkdir(&raw const msg, &raw mut reply); }
-                VFS_RMDIR => { handle_rmdir(&raw const msg, &raw mut reply); }
+                VFS_UNLINK => { handle_unlink(&raw const msg, &raw mut reply, badge); }
+                VFS_RENAME => { handle_rename(&raw const msg, &raw mut reply, badge); }
+                VFS_MKDIR => { handle_mkdir(&raw const msg, &raw mut reply, badge); }
+                VFS_RMDIR => { handle_rmdir(&raw const msg, &raw mut reply, badge); }
                 VFS_OPENDIR => { handle_opendir(&raw const msg, &raw mut reply, badge); }
-                VFS_READDIR => { handle_readdir(&raw const msg, &raw mut reply, badge); }
+                VFS_READDIR => {
+                    let fd = msg.regs[0] as i32;
+                    let cli = get_client(badge);
+                    if !cli.is_null() && fd >= 0 && fd < (*cli).fds_cap as i32
+                        && (*(*cli).fds.add(fd as usize)).active != 0
+                        && (*(*cli).fds.add(fd as usize)).fd_type == FD_TYPE_MOUNT
+                    {
+                        let fde = &mut *(*cli).fds.add(fd as usize);
+                        let mount_idx = fde.dev_type as usize;
+                        let remote_ino = fde.sock_id as u64;
+                        mount_readdir(mount_idx, fde as *mut FdEntry, remote_ino, &raw mut reply);
+                    } else {
+                        handle_readdir(&raw const msg, &raw mut reply, badge);
+                    }
+                }
                 VFS_LSTAT => { handle_lstat(&raw const msg, &raw mut reply, badge); }
                 VFS_POLL => {
                     skip_reply = handle_poll(&raw const msg, &raw mut reply, badge);
@@ -8477,7 +9493,7 @@ pub extern "C" fn _start() -> ! {
                     handle_dup3(&raw const msg, &raw mut reply, badge);
                 }
                 VFS_MKFIFO => {
-                    handle_mkfifo(&raw const msg, &raw mut reply);
+                    handle_mkfifo(&raw const msg, &raw mut reply, badge);
                 }
                 VFS_EPOLL_CREATE => {
                     handle_epoll_create(&raw mut reply, badge);

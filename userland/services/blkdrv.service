@@ -1,0 +1,12 @@
+[Service]
+Name=blkdrv
+Binary=blkdrv
+Type=simple
+Restart=always
+
+[Dependencies]
+After=pcisrv nameserv mmsrv
+Before=saltyfs
+
+[Capabilities]
+NeedEP=pcisrv:64

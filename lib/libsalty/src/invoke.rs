@@ -357,6 +357,59 @@ pub fn ioport_out16(ioport: Cap, offset: u64, value: u16) {
     invoke(ioport, IOPORT_OUT16, offset, value as u64, 0, 0);
 }
 
+/// Read a 32-bit value from an I/O port at the given offset.
+pub fn ioport_in32(ioport: Cap, offset: u64) -> u32 {
+    invoke(ioport, IOPORT_IN32, offset, 0, 0, 0).value as u32
+}
+
+/// Write a 32-bit value to an I/O port at the given offset.
+pub fn ioport_out32(ioport: Cap, offset: u64, value: u32) {
+    invoke(ioport, IOPORT_OUT32, offset, value as u64, 0, 0);
+}
+
+/// Configure base port and count on a freshly retyped IoPort (one-shot).
+pub fn ioport_configure(ioport: Cap, base_port: u64, num_ports: u64) -> i32 {
+    invoke(ioport, IOPORT_CONFIGURE, base_port, num_ports, 0, 0).error as i32
+}
+
+/// Create an IoPort capability from a physical I/O port range.
+/// Requires IrqControl cap (IrqHandler type with CONFIGURE rights).
+pub fn ioport_create(
+    irq_ctrl: Cap,
+    base_port: u64,
+    num_ports: u64,
+    dest_cnode: Cap,
+    dest_slot: u64,
+) -> i32 {
+    invoke(irq_ctrl, IOPORT_CREATE, base_port, num_ports, dest_cnode, dest_slot).error as i32
+}
+
+// ---- IRQ control operations ----
+
+/// Acquire an IRQ handler capability. The IrqHandler cap at `irq_ctrl`
+/// must have CONFIGURE rights. Sets the handler's IRQ number and
+/// auto-unmasks the IOAPIC redirection entry.
+pub fn irq_control_get(irq_ctrl: Cap, irq_num: u64) -> i32 {
+    invoke(irq_ctrl, IRQ_CONTROL_GET, irq_num, 0, 0, 0).error as i32
+}
+
+/// Clear (unbind notification + unregister) an IRQ handler.
+pub fn irq_handler_clear(irq_handler: Cap) -> i32 {
+    invoke(irq_handler, IRQ_HANDLER_CLEAR, 0, 0, 0, 0).error as i32
+}
+
+/// Create a device untyped capability from a physical MMIO address.
+/// Requires IrqControl cap (slot with CONFIGURE rights, IrqHandler type).
+pub fn device_untyped_create(
+    irq_ctrl: Cap,
+    phys_addr: u64,
+    size_bits: u64,
+    dest_cnode: Cap,
+    dest_slot: u64,
+) -> i32 {
+    invoke(irq_ctrl, DEVICE_UNTYPED_CREATE, phys_addr, size_bits, dest_cnode, dest_slot).error as i32
+}
+
 // ===========================================================================
 // Depth-aware helpers for CNode hierarchy (expanded CSpace)
 // ===========================================================================

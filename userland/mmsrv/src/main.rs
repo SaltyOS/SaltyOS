@@ -1617,10 +1617,10 @@ unsafe fn handle_mm_shm_create(msg: *const SaltyMsg, _caller_badge: u64, reply: 
 ///   MR2 = vaddr
 ///   MR3 = prot (vspace flags)
 ///   Reply: label = SALTY_OK, MR0 = mapped_base
-unsafe fn handle_mm_shm_map(msg: *const SaltyMsg, _caller_badge: u64, reply: *mut SaltyMsg) {
+unsafe fn handle_mm_shm_map(msg: *const SaltyMsg, caller_badge: u64, reply: *mut SaltyMsg) {
     unsafe {
         let shm_id = (*msg).regs[0];
-        let client_badge = (*msg).regs[1];
+        let client_badge = if (*msg).regs[1] == 0 { caller_badge } else { (*msg).regs[1] };
         let requested_vaddr = (*msg).regs[2];
         let flags = (*msg).regs[3];
 

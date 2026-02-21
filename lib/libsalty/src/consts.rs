@@ -81,15 +81,24 @@ pub const VSPACE_CLONE_COW_PAGE: u64 = 0x56;
 pub const VSPACE_MAP_DEVICE_RANGE: u64 = 0x57;
 pub const VSPACE_PROTECT: u64 = 0x58;
 
-/// IRQ handler invoke labels (0x61-0x62): acknowledge IRQ, set notification cap.
+/// IRQ control invoke label (0x60): acquire IRQ handler capability.
+pub const IRQ_CONTROL_GET: u64 = 0x60;
+/// IRQ handler invoke labels (0x61-0x63): acknowledge, set notification, clear.
 pub const IRQ_HANDLER_ACK: u64 = 0x61;
 pub const IRQ_HANDLER_SET_NOTIFICATION: u64 = 0x62;
+pub const IRQ_HANDLER_CLEAR: u64 = 0x63;
+/// Device untyped creation (on IrqControl cap): create device untyped from MMIO phys address.
+pub const DEVICE_UNTYPED_CREATE: u64 = 0x64;
 
-/// I/O port invoke labels (0x70-0x73): 8-bit and 16-bit port read/write.
+/// I/O port invoke labels (0x70-0x76): 8/16/32-bit port read/write + configure.
 pub const IOPORT_IN8: u64 = 0x70;
 pub const IOPORT_OUT8: u64 = 0x71;
 pub const IOPORT_IN16: u64 = 0x72;
 pub const IOPORT_OUT16: u64 = 0x73;
+pub const IOPORT_IN32: u64 = 0x74;
+pub const IOPORT_OUT32: u64 = 0x75;
+pub const IOPORT_CONFIGURE: u64 = 0x76;
+pub const IOPORT_CREATE: u64 = 0x77;
 
 /// Console server IPC labels: read/write serial data, terminal attributes.
 pub const CONSOLE_WRITE: u64 = 1;
@@ -122,6 +131,40 @@ pub const DISPLAY_FILL_RECT: u64 = 6;
 pub const DISPLAY_WRITE_TEXT: u64 = 7;
 pub const DISPLAY_TERMINAL_WRITE: u64 = 8;
 
+
+/// Well-known capability slot indices (set by kernel for init, inherited by children).
+pub const CAP_SELF_TCB: u64 = 0;
+pub const CAP_SELF_VSPACE: u64 = 1;
+pub const CAP_SELF_CSPACE: u64 = 2;
+pub const CAP_PROCMGR_EP: u64 = 3;
+pub const CAP_VFS_EP: u64 = 4;
+pub const CAP_NAMESERV_EP: u64 = 5;
+pub const CAP_MMSRV_EP: u64 = 7;
+pub const CAP_COM1_IOPORT: u64 = 8;
+pub const CAP_CONSOLE_EP: u64 = 11;
+pub const CAP_PCI_IOPORT: u64 = 15;
+pub const CAP_UNTYPED_START: u64 = 16;
+
+/// PCI enumeration server IPC labels.
+pub const PCI_FIND_DEVICE: u64 = 1;
+pub const PCI_GET_CAPS: u64 = 2;
+pub const PCI_LIST: u64 = 3;
+
+/// Block device driver IPC labels.
+pub const BLK_READ: u64 = 1;
+pub const BLK_WRITE: u64 = 2;
+pub const BLK_GET_INFO: u64 = 3;
+pub const BLK_FLUSH: u64 = 4;
+pub const BLK_GET_SHM_ID: u64 = 5;
+
+/// SaltyFS server IPC labels.
+pub const SALTYFS_MOUNT: u64 = 1;
+pub const SALTYFS_LOOKUP: u64 = 2;
+pub const SALTYFS_READ: u64 = 3;
+pub const SALTYFS_READDIR: u64 = 4;
+pub const SALTYFS_STAT: u64 = 5;
+pub const SALTYFS_GETINFO: u64 = 6;
+pub const SALTYFS_READ_INLINE: u64 = 7;
 
 /// Fixed virtual addresses for well-known memory regions.
 pub const INITRD_VADDR: u64 = 0x0000_0000_0100_0000;
@@ -319,6 +362,9 @@ pub const fn spawn_policy_memory_kb(policy: u64) -> u16 {
 // Spawn flags (msg.regs[3] in POSIX_PM_SPAWN wire format)
 pub const SPAWN_FLAG_USE_PRE_EP: u64 = 1 << 0;
 pub const SPAWN_FLAG_RESPAWN: u64 = 1 << 1;
+/// Spawn child fully configured but keep it suspended (no initial TCB_RESUME).
+/// Used by init to inject caps before first instruction executes.
+pub const SPAWN_FLAG_START_SUSPENDED: u64 = 1 << 2;
 
 pub const POSIX_PM_EXIT: u64 = 2;
 pub const POSIX_PM_WAIT: u64 = 3;
@@ -347,6 +393,7 @@ pub const POSIX_PM_KILL_PGID: u64 = 25;
 pub const POSIX_PM_INJECT_CAP: u64 = 26;
 pub const POSIX_PM_LIST_PIDS: u64 = 27;
 pub const POSIX_PM_GET_PROC_INFO: u64 = 28;
+pub const POSIX_PM_RESUME: u64 = 29;
 // Deterministic CNode slots for CSpace expansion (root slots 1008-1015)
 pub const CSPACE_EXPAND_BASE: u64 = 1008;
 pub const MAX_CSPACE_EXPANSIONS: usize = 8;

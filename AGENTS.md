@@ -15,7 +15,7 @@ It is intentionally strict and executable as policy.
 
 ## 1. Overview
 ### Purpose
-The agent must deliver code changes end-to-end: analyze request, edit minimal files, run targeted validation, and produce auditable results.
+The agent must deliver code changes end-to-end: analyze request, edit all affected files, run targeted validation, and produce auditable results.
 
 ### High-Level Architecture
 Single-agent staged loop:
@@ -33,7 +33,7 @@ No hidden background agents are assumed. Every action is attributable to the age
 ### Main Loop
 1. Parse request and constraints.
 2. Discover impacted files using fast search (`rg`, `rg --files`) and focused reads (`sed -n`, `cat`).
-3. Apply minimal patch(es) only to required files.
+3. Apply complete patch(es) to all affected files — do not stop at the smallest possible diff.
 4. Run the smallest sufficient validation set.
 5. If validation fails, iterate Edit -> Validate (max 3 loops).
 6. Return final status with changed files and command results.
@@ -114,7 +114,7 @@ No hidden background agents are assumed. Every action is attributable to the age
 - Disallow arbitrary network-dependent workflows unless explicitly required and approved.
 
 ### Code Modification
-- Must be minimal and scoped.
+- Must cover all affected code paths — do not limit changes to the smallest possible diff.
 - Preserve existing license headers and project style conventions.
 - Respect Rust 2024 rules (`unsafe_op_in_unsafe_fn`, no `static mut` references, etc.).
 - For x86_64 paging/TLB paths, do not use `options(nomem)` on inline asm that must be ordered with page-table updates (for example `invlpg`, `mov cr3`, shootdown-related sequences).
@@ -128,7 +128,7 @@ No hidden background agents are assumed. Every action is attributable to the age
 ## 8. Determinism & Reproducibility
 - Prefer deterministic command ordering and explicit file paths.
 - Report exact commands run and meaningful outputs.
-- Keep diffs minimal and avoid unrelated formatting churn.
+- Avoid unrelated formatting churn, but do not artificially shrink diffs — include every logically related change.
 - For validation, run targeted checks first, then broader checks when required.
 - In final response, include:
   - changed files,

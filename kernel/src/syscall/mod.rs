@@ -1368,6 +1368,16 @@ fn syscall_invoke_inner(
             // IRQ_HANDLER_CLEAR
             syscall_irq_handler_clear(&cap)
         }
+        (ObjectType::IrqHandler, 0x64) => {
+            // DEVICE_UNTYPED_CREATE: arg0 = phys_addr, arg1 = size_bits,
+            // arg2 = dest_cnode_cap, arg3 = dest_slot
+            syscall_device_untyped_create(&cap, arg0, arg1, arg2, arg3)
+        }
+        (ObjectType::IrqHandler, 0x77) => {
+            // IOPORT_CREATE: arg0 = base_port, arg1 = num_ports,
+            // arg2 = dest_cnode_cap, arg3 = dest_slot
+            syscall_ioport_create(&cap, arg0, arg1, arg2, arg3)
+        }
 
         // IoPort operations
         (ObjectType::IoPort, 0x70) => {
@@ -1385,6 +1395,18 @@ fn syscall_invoke_inner(
         (ObjectType::IoPort, 0x73) => {
             // IOPORT_OUT16: arg0 = port offset, arg1 = value
             syscall_ioport_out16(&cap, arg0, arg1)
+        }
+        (ObjectType::IoPort, 0x74) => {
+            // IOPORT_IN32: arg0 = port offset
+            syscall_ioport_in32(&cap, arg0)
+        }
+        (ObjectType::IoPort, 0x75) => {
+            // IOPORT_OUT32: arg0 = port offset, arg1 = value
+            syscall_ioport_out32(&cap, arg0, arg1)
+        }
+        (ObjectType::IoPort, 0x76) => {
+            // IOPORT_CONFIGURE: arg0 = base_port, arg1 = num_ports
+            syscall_ioport_configure(&cap, arg0, arg1)
         }
 
         _ => SyscallResult::err(SyscallError::InvalidOperation),
@@ -2553,6 +2575,9 @@ fn syscall_irq_control_get(
         restore_irq(irq);
     }
 
+    // Dynamically unmask the IOAPIC redirection entry for this IRQ
+    crate::arch::ioapic_unmask(irq_num as u32);
+
     SyscallResult::ok(0)
 }
 
@@ -2609,20 +2634,163 @@ fn syscall_irq_handler_set_notification(
     SyscallResult::ok(0)
 }
 
-/// IRQ_HANDLER_CLEAR: Unbind notification from IRQ handler
+/// IRQ_HANDLER_CLEAR: Unbind notification from IRQ handler and mask IOAPIC
 fn syscall_irq_handler_clear(cap: &Capability) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::IrqHandler, CapRights::CONFIGURE) {
         return SyscallResult::err(e);
     }
 
     // IRQ handler mutation under SCHED_IPC_LOCK
+    let irq_num;
     unsafe {
         let irq = save_irq_disable();
         SCHED_IPC_LOCK.lock();
         let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
+        irq_num = irq_handler.irq_num;
         irq_handler.notification = core::ptr::null_mut();
         SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
+    }
+
+    // Mask the IOAPIC entry for this IRQ
+    crate::arch::ioapic_mask(irq_num);
+
+    SyscallResult::ok(0)
+}
+
+/// DEVICE_UNTYPED_CREATE: Create a device untyped capability for MMIO access
+///
+/// Requires IrqControl (IrqHandler type with CONFIGURE rights).
+/// Creates a device untyped from a physical address and places the cap in
+/// the caller's CSpace.
+///
+/// Args:
+/// - phys_addr: Physical address of the MMIO region (must be page-aligned)
+/// - size_bits: Log2 size of the region (minimum 12 = 4KB)
+/// - dest_cnode_cap: Capability pointer to destination CNode
+/// - dest_slot: Slot index in destination CNode
+fn syscall_device_untyped_create(
+    cap: &Capability,
+    phys_addr: u64,
+    size_bits: u64,
+    dest_cnode_cap: u64,
+    dest_slot: u64,
+) -> SyscallResult {
+    // Require IrqHandler type with CONFIGURE rights (acts as IrqControl)
+    if let Err(e) = validate_capability(cap, ObjectType::IrqHandler, CapRights::CONFIGURE) {
+        return SyscallResult::err(e);
+    }
+
+    // Validate args
+    if size_bits < 12 || size_bits > 32 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+    if phys_addr & 0xFFF != 0 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    // Look up destination CNode
+    let dest_cap = match lookup_cap_locked(dest_cnode_cap) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(&dest_cap, ObjectType::CNode, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    // Allocate from the device untyped pool
+    let ut_ptr = match crate::init::alloc_device_untyped(phys_addr, size_bits as u8) {
+        Some(ptr) => ptr,
+        None => return SyscallResult::err(SyscallError::OutOfMemory),
+    };
+
+    // Allocate a cap slot and set it up
+    let slot = match crate::cap::alloc_slot() {
+        Some(s) => s,
+        None => return SyscallResult::err(SyscallError::OutOfMemory),
+    };
+    let new_cap = crate::cap::get_cap_mut(slot);
+    new_cap.object = ut_ptr as *mut crate::cap::KernelObject;
+    new_cap.obj_type = ObjectType::Untyped;
+    new_cap.rights = crate::cap::CapRights::ALL;
+    new_cap.depth = 0;
+    new_cap.badge = 0;
+
+    // Insert into destination CNode
+    unsafe {
+        let dest_cnode = &mut *(dest_cap.object as *mut CNode);
+        if let Err(_) = dest_cnode.insert_ref(dest_slot as usize, crate::cap::CapRef { slot }) {
+            return SyscallResult::err(SyscallError::AlreadyExists);
+        }
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// IOPORT_CREATE: Create an IoPort capability for an I/O port range
+///
+/// Requires IrqControl (IrqHandler type with CONFIGURE rights).
+/// Creates an IoPort cap from a base port and port count, and places
+/// the cap in the caller's CSpace.
+///
+/// Args:
+/// - base_port: Base I/O port number
+/// - num_ports: Number of consecutive ports
+/// - dest_cnode_cap: Capability pointer to destination CNode
+/// - dest_slot: Slot index in destination CNode
+fn syscall_ioport_create(
+    cap: &Capability,
+    base_port: u64,
+    num_ports: u64,
+    dest_cnode_cap: u64,
+    dest_slot: u64,
+) -> SyscallResult {
+    // Require IrqHandler type with CONFIGURE rights (acts as IrqControl)
+    if let Err(e) = validate_capability(cap, ObjectType::IrqHandler, CapRights::CONFIGURE) {
+        return SyscallResult::err(e);
+    }
+
+    // Validate args
+    if base_port > 0xFFFF || num_ports == 0 || num_ports > 0xFFFF {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+    if base_port + num_ports > 0x10000 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    // Look up destination CNode
+    let dest_cap = match lookup_cap_locked(dest_cnode_cap) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(&dest_cap, ObjectType::CNode, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    // Allocate from the dynamic IoPort pool
+    let iop_ptr = match crate::init::alloc_dynamic_ioport(base_port as u16, num_ports as u16) {
+        Some(ptr) => ptr,
+        None => return SyscallResult::err(SyscallError::OutOfMemory),
+    };
+
+    // Allocate a cap slot and set it up
+    let slot = match crate::cap::alloc_slot() {
+        Some(s) => s,
+        None => return SyscallResult::err(SyscallError::OutOfMemory),
+    };
+    let new_cap = crate::cap::get_cap_mut(slot);
+    new_cap.object = iop_ptr as *mut crate::cap::KernelObject;
+    new_cap.obj_type = ObjectType::IoPort;
+    new_cap.rights = crate::cap::CapRights::ALL;
+    new_cap.depth = 0;
+    new_cap.badge = 0;
+
+    // Insert into destination CNode
+    unsafe {
+        let dest_cnode = &mut *(dest_cap.object as *mut CNode);
+        if let Err(_) = dest_cnode.insert_ref(dest_slot as usize, crate::cap::CapRef { slot }) {
+            return SyscallResult::err(SyscallError::AlreadyExists);
+        }
     }
 
     SyscallResult::ok(0)
@@ -2721,6 +2889,87 @@ fn syscall_ioport_out16(cap: &Capability, offset: u64, value: u64) -> SyscallRes
             None => return SyscallResult::err(SyscallError::OutOfRange),
         };
         core::arch::asm!("out dx, ax", in("ax") value as u16, in("dx") port, options(nomem, nostack));
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// IOPORT_IN32: Read a 32-bit dword from an I/O port
+///
+/// Args:
+/// - offset: Port offset within the IoPort range
+fn syscall_ioport_in32(cap: &Capability, offset: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let ioport = &*(cap.object as *const IoPortRange);
+        if offset + 3 >= ioport.num_ports as u64 {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+        let port = match ioport.base_port.checked_add(offset as u16) {
+            Some(p) => p,
+            None => return SyscallResult::err(SyscallError::OutOfRange),
+        };
+        let val: u32;
+        core::arch::asm!("in eax, dx", out("eax") val, in("dx") port, options(nomem, nostack));
+        SyscallResult::ok(val as u64)
+    }
+}
+
+/// IOPORT_OUT32: Write a 32-bit dword to an I/O port
+///
+/// Args:
+/// - offset: Port offset within the IoPort range
+/// - value: 32-bit value to write
+fn syscall_ioport_out32(cap: &Capability, offset: u64, value: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let ioport = &*(cap.object as *const IoPortRange);
+        if offset + 3 >= ioport.num_ports as u64 {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+        let port = match ioport.base_port.checked_add(offset as u16) {
+            Some(p) => p,
+            None => return SyscallResult::err(SyscallError::OutOfRange),
+        };
+        core::arch::asm!("out dx, eax", in("eax") value as u32, in("dx") port, options(nomem, nostack));
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// IOPORT_CONFIGURE: Set base port and port count on a freshly retyped IoPort
+///
+/// Can only be called once (when num_ports == 0). Prevents double-configuration.
+///
+/// Args:
+/// - base_port: Base I/O port number
+/// - num_ports: Number of ports in the range
+fn syscall_ioport_configure(cap: &Capability, base_port: u64, num_ports: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::CONFIGURE) {
+        return SyscallResult::err(e);
+    }
+
+    if base_port > 0xFFFF || num_ports == 0 || num_ports > 0xFFFF {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+    if base_port + num_ports > 0x10000 {
+        return SyscallResult::err(SyscallError::OutOfRange);
+    }
+
+    unsafe {
+        let ioport = &mut *(cap.object as *mut IoPortRange);
+        // One-shot: reject if already configured
+        if ioport.num_ports > 0 {
+            return SyscallResult::err(SyscallError::AlreadyExists);
+        }
+        ioport.base_port = base_port as u16;
+        ioport.num_ports = num_ports as u16;
     }
 
     SyscallResult::ok(0)

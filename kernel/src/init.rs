@@ -125,10 +125,40 @@ static mut INIT_COM1_NOTIFICATION: Notification = Notification::new();
 static mut INIT_KBD_IOPORT: IoPortRange = IoPortRange::new(0x60, 5); // ports 0x60-0x64
 static mut INIT_KBD_IRQ: IrqHandler = IrqHandler::new(1);           // IRQ1
 
+/// PCI config space I/O port (0xCF8..0xCFF, 8 ports for CONFIG_ADDRESS + CONFIG_DATA)
+static mut INIT_PCI_IOPORT: IoPortRange = IoPortRange::new(0xCF8, 8);
+/// PCI config space IoPort well-known slot index
+const CAP_PCI_IOPORT: usize = 15;
+
+/// IrqControl capability (IrqHandler with CONFIGURE rights, for dynamic IoPort creation)
+static mut INIT_IRQ_CONTROL: IrqHandler = IrqHandler::new(0);
+/// IrqControl well-known slot index (init slot 11, shared with pcisrv via CopyCap)
+const CAP_IRQ_CONTROL: usize = 11;
+
 /// Framebuffer device untyped (static, never freed)
 static mut INIT_FB_UNTYPED: UntypedMemory = UntypedMemory::new(0, 0, true);
 /// Initrd-backed pseudo-device untyped for zero-copy child initrd mapping
 static mut INIT_INITRD_UNTYPED: UntypedMemory = UntypedMemory::new(0, 0, true);
+
+/// Maximum number of dynamically-created device untypeds (for PCI BAR MMIO etc.)
+const MAX_DEVICE_UNTYPEDS: usize = 16;
+/// Pool of device untyped objects for runtime MMIO provisioning
+static mut DEVICE_UNTYPED_POOL: [UntypedMemory; MAX_DEVICE_UNTYPEDS] = {
+    const EMPTY: UntypedMemory = UntypedMemory::new(0, 0, true);
+    [EMPTY; MAX_DEVICE_UNTYPEDS]
+};
+/// Next free index in the device untyped pool
+static mut DEVICE_UNTYPED_NEXT: usize = 0;
+
+/// Maximum number of dynamically-created IoPort ranges (for PCI I/O BAR provisioning)
+const MAX_DYNAMIC_IOPORTS: usize = 8;
+/// Pool of IoPort range objects for runtime provisioning
+static mut DYNAMIC_IOPORT_POOL: [IoPortRange; MAX_DYNAMIC_IOPORTS] = {
+    const EMPTY: IoPortRange = IoPortRange::new(0, 0);
+    [EMPTY; MAX_DYNAMIC_IOPORTS]
+};
+/// Next free index in the dynamic IoPort pool
+static mut DYNAMIC_IOPORT_NEXT: usize = 0;
 /// Exact byte limit (page-aligned) for initrd map_device exposure
 static mut INITRD_DEVICE_LIMIT_BYTES: u64 = 0;
 /// Pointer identity for the initrd pseudo-device untyped object
@@ -349,6 +379,22 @@ fn setup_init_cspace(boot_info: Option<&ParsedBootInfo>) {
             crate::ipc::irq::register_handler(1, irq_ptr);
         }
 
+        // Slot 11: IrqControl (IrqHandler with ALL rights, for dynamic IoPort/DeviceUntyped creation)
+        insert_static_cap(
+            cnode,
+            CAP_IRQ_CONTROL,
+            &raw mut INIT_IRQ_CONTROL as *mut crate::cap::KernelObject,
+            ObjectType::IrqHandler,
+        );
+
+        // Slot 15: PCI config space IoPort (0xCF8..0xCFF, 8 ports)
+        insert_static_cap(
+            cnode,
+            CAP_PCI_IOPORT,
+            &raw mut INIT_PCI_IOPORT as *mut crate::cap::KernelObject,
+            ObjectType::IoPort,
+        );
+
         // Slot 12: Initrd pseudo-device untyped for map_device-based sharing
         if let Some(info) = boot_info {
             if info.initrd_addr != 0 && info.initrd_size != 0 {
@@ -461,6 +507,38 @@ pub fn initrd_device_limit_for(obj: *const UntypedMemory) -> Option<u64> {
         } else {
             Some(INITRD_DEVICE_LIMIT_BYTES)
         }
+    }
+}
+
+/// Allocate a device untyped from the static pool for MMIO provisioning.
+///
+/// Returns a pointer to the initialized UntypedMemory, or None if pool is full.
+pub fn alloc_device_untyped(phys_addr: u64, size_bits: u8) -> Option<*mut UntypedMemory> {
+    unsafe {
+        let idx = DEVICE_UNTYPED_NEXT;
+        if idx >= MAX_DEVICE_UNTYPEDS {
+            return None;
+        }
+        DEVICE_UNTYPED_NEXT = idx + 1;
+        let ut = &raw mut DEVICE_UNTYPED_POOL[idx];
+        (*ut) = UntypedMemory::new(phys_addr, size_bits, true);
+        Some(ut)
+    }
+}
+
+/// Allocate an IoPort range from the static pool for runtime provisioning.
+///
+/// Returns a pointer to the initialized IoPortRange, or None if pool is full.
+pub fn alloc_dynamic_ioport(base_port: u16, num_ports: u16) -> Option<*mut IoPortRange> {
+    unsafe {
+        let idx = DYNAMIC_IOPORT_NEXT;
+        if idx >= MAX_DYNAMIC_IOPORTS {
+            return None;
+        }
+        DYNAMIC_IOPORT_NEXT = idx + 1;
+        let iop = &raw mut DYNAMIC_IOPORT_POOL[idx];
+        (*iop) = IoPortRange::new(base_port, num_ports);
+        Some(iop)
     }
 }
 

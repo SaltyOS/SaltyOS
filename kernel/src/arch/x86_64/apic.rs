@@ -1271,3 +1271,45 @@ pub fn init_ioapic(ioapic_phys: u32, bsp_apic_id: u8) {
         s.putc(b'\n');
     }
 }
+
+/// Dynamically unmask an IOAPIC redirection entry for the given IRQ.
+///
+/// Sets the entry to: fixed delivery, physical destination mode, edge-triggered,
+/// active-high, unmasked, routed to BSP. Vector = irq + 32.
+///
+/// # Safety
+/// IOAPIC must be initialized (`init_ioapic` called first).
+pub fn ioapic_unmask(irq: u32) {
+    if !IOAPIC_READY.load(Ordering::Acquire) {
+        return;
+    }
+
+    let vector = irq + 32;
+    let bsp_apic_id = super::cpu::get_apic_id_for_cpu(0);
+    let reg_lo = 0x10 + 2 * irq;
+    let reg_hi = 0x10 + 2 * irq + 1;
+
+    unsafe {
+        // Low: vector, fixed delivery(0), physical dest(0), active-high(0),
+        // edge-trigger(0), unmasked(0)
+        ioapic_write(reg_lo, vector & 0xFF);
+        // High: destination APIC ID in bits [31:24]
+        ioapic_write(reg_hi, bsp_apic_id << 24);
+    }
+}
+
+/// Mask an IOAPIC redirection entry for the given IRQ.
+///
+/// # Safety
+/// IOAPIC must be initialized (`init_ioapic` called first).
+pub fn ioapic_mask(irq: u32) {
+    if !IOAPIC_READY.load(Ordering::Acquire) {
+        return;
+    }
+
+    let reg_lo = 0x10 + 2 * irq;
+    unsafe {
+        let current = ioapic_read(reg_lo);
+        ioapic_write(reg_lo, current | IOAPIC_MASKED);
+    }
+}

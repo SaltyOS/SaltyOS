@@ -1,0 +1,11 @@
+[Service]
+Name=saltyfs
+Binary=saltyfs
+Type=simple
+Restart=always
+
+[Dependencies]
+After=blkdrv nameserv mmsrv
+
+[Capabilities]
+NeedEP=blkdrv:64
