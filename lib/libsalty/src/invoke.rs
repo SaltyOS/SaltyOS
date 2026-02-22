@@ -256,6 +256,34 @@ pub fn vspace_clone_cow_page(
     .error as i32
 }
 
+/// Install a demand-page PTE at `vaddr` in the given VSpace.
+///
+/// On first user access, the kernel allocates a zero-fill frame directly
+/// (no IPC to mmsrv), making the page present.
+pub fn vspace_map_demand(vspace: Cap, vaddr: u64, flags: u64) -> i32 {
+    invoke(vspace, VSPACE_MAP_DEMAND, vaddr, flags, 0, 0).error as i32
+}
+
+/// Install demand-page PTEs for a contiguous range.
+///
+/// Returns (error, pages_mapped). On success error==0 and pages_mapped==count.
+pub fn vspace_map_demand_range(
+    vspace: Cap,
+    vaddr_start: u64,
+    count: u64,
+    flags: u64,
+) -> (i32, u64) {
+    let result = invoke(
+        vspace,
+        VSPACE_MAP_DEMAND_RANGE,
+        vaddr_start,
+        count,
+        flags,
+        0,
+    );
+    (result.error as i32, result.value)
+}
+
 // ---- CNode operations ----
 
 /// Copy a capability from `src_cnode[src_slot]` to `dest_cnode[dest_slot]`

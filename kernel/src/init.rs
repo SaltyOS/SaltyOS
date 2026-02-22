@@ -274,6 +274,10 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
         (*tcb).vspace_root = (&raw mut INIT_VSPACE).cast::<VSpace>();
         (*tcb).cspace_root = &raw mut INIT_CNODE_STORAGE as *mut CNode;
         (*tcb).kernel_stack_top = kstack_top;
+        (*tcb).stack_canary = crate::arch::generate_stack_canary();
+
+        // Seed %gs:40 with init's canary so the first syscall entry picks it up
+        crate::arch::set_per_cpu_canary((*tcb).stack_canary);
 
         // Set per-CPU kernel stack to init's stack before first scheduling
         crate::arch::set_kernel_stack(kstack_top);

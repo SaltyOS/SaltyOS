@@ -30,6 +30,10 @@ pub struct Scheduler {
     pub idle_ticks: [u64; MAX_CPUS],
     /// Per-CPU IPI reschedule count
     pub ipi_reschedules: [u64; MAX_CPUS],
+    /// Number of online CPUs (set during init/init_cpu)
+    pub online_cpus: u32,
+    /// Timer tick counter for periodic rebalancing
+    rebalance_counter: u64,
 }
 
 impl Scheduler {
@@ -44,6 +48,8 @@ impl Scheduler {
             timer_ticks: [0; MAX_CPUS],
             idle_ticks: [0; MAX_CPUS],
             ipi_reschedules: [0; MAX_CPUS],
+            online_cpus: 0,
+            rebalance_counter: 0,
         }
     }
 
@@ -254,6 +260,7 @@ impl Scheduler {
         if let Some(tcb) = self.dequeue_for_cpu_unlocked(cpu_id) {
             unsafe {
                 (*tcb).state = ThreadState::Running;
+                (*tcb).last_cpu = cpu_id as u32;
             }
             self.current[cpu_id] = tcb;
             CURRENT_ON_CPU[cpu_id].store(tcb as usize, core::sync::atomic::Ordering::Release);
@@ -441,6 +448,11 @@ impl Scheduler {
             // Always write — 0 clears the previous thread's FS_BASE.
             crate::arch::write_fs_base((*new_tcb).tls_base);
 
+            // Update per-CPU canary cache to incoming thread's canary.
+            // Ensures the assembly canary check at syscall exit matches
+            // even if the thread migrated from a different CPU.
+            crate::arch::set_per_cpu_canary((*new_tcb).stack_canary);
+
             // Pure register save/restore — no shared state accessed
             let old_ctx = &mut (*old_tcb).context as *mut _;
             let new_ctx = &(*new_tcb).context as *const _;
@@ -566,8 +578,35 @@ impl Scheduler {
             }
         }
 
+        // Periodic load balancing: BSP checks every 100 ticks (~100ms)
+        let rebalance_ipi_mask = unsafe {
+            let cpu_id = crate::arch::current_cpu() as usize;
+            if cpu_id == 0 {
+                self.rebalance_counter += 1;
+                if self.rebalance_counter >= 100 {
+                    self.rebalance_counter = 0;
+                    self.try_rebalance()
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        };
+
         self.unlock();
         unsafe { crate::mm::restore_irq(irq_flag) };
+
+        // Send rebalance IPIs AFTER releasing lock to prevent deadlock
+        if rebalance_ipi_mask != 0 {
+            for cpu in 0..MAX_CPUS {
+                if rebalance_ipi_mask & (1 << cpu) != 0 {
+                    unsafe {
+                        crate::arch::send_ipi(cpu, crate::arch::IpiKind::Reschedule);
+                    }
+                }
+            }
+        }
     }
 
     /// Handle reschedule IPI — checks ready queue for work on this CPU.
@@ -638,12 +677,73 @@ impl Scheduler {
                 (*sched_ctx).deadline = u64::MAX;
             }
 
-            // Update priority (deadline) in TCB
-            (*tcb).priority = (*sched_ctx).deadline;
+            // Update base priority (unaffected by PIP)
+            (*tcb).base_priority = (*sched_ctx).deadline;
+
+            // Update effective priority only if no active PIP donation
+            if (*tcb).pip_donation_count == 0 {
+                (*tcb).priority = (*sched_ctx).deadline;
+            }
 
             // Replenish budget
             (*sched_ctx).remaining = (*sched_ctx).budget;
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Load balancing
+    // ---------------------------------------------------------------
+
+    /// Periodic rebalancing: check if any CPU is running a lower-priority
+    /// thread while the ready queue has a higher-priority compatible thread.
+    ///
+    /// Returns a bitmask of CPUs that should receive a reschedule IPI.
+    /// IPIs are sent AFTER the scheduler lock is released to avoid
+    /// deadlocks (target CPU spins on lock in IPI handler).
+    ///
+    /// Caller MUST hold the scheduler lock.
+    fn try_rebalance(&mut self) -> u32 {
+        let mut ipi_mask: u32 = 0;
+        let this_cpu = crate::arch::current_cpu() as usize;
+        let online = self.online_cpus as usize;
+
+        // Walk the ready queue: for each ready thread, check if any CPU
+        // is running a worse-priority (later deadline) thread that could
+        // be preempted.
+        unsafe {
+            let mut ready = self.ready_head;
+            while !ready.is_null() {
+                let ready_affinity = (*ready).cpu_affinity;
+                let ready_prio = (*ready).priority;
+
+                for cpu in 0..online {
+                    if cpu == this_cpu {
+                        continue; // this CPU handles its own preemption
+                    }
+                    if ipi_mask & (1 << cpu) != 0 {
+                        continue; // already sending IPI to this CPU
+                    }
+                    // Check affinity compatibility
+                    if ready_affinity != 0xFFFF_FFFF && ready_affinity as usize != cpu {
+                        continue;
+                    }
+                    let running = self.current[cpu];
+                    if running.is_null() || running == self.idle[cpu] {
+                        // Idle CPU — it will pick up work from reschedule IPI
+                        ipi_mask |= 1 << cpu;
+                        break; // this ready thread will be picked up
+                    }
+                    if ready_prio < (*running).priority {
+                        // Ready thread has earlier deadline than running thread
+                        ipi_mask |= 1 << cpu;
+                        break;
+                    }
+                }
+                ready = (*ready).next;
+            }
+        }
+
+        ipi_mask
     }
 
     // ---------------------------------------------------------------

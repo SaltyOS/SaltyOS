@@ -821,9 +821,23 @@ unsafe fn handle_mm_mmap(msg: *const SaltyMsg, badge: u64, reply: *mut SaltyMsg)
         (*region).lazy = is_lazy;
 
         if is_lazy {
-            // Lazy path: VA reservation only, no frame allocation
-            // All frame_caps entries are 0 (unallocated sentinel)
-            // First access triggers VMFault → mmsrv maps one page → resume
+            // Lazy path: install demand-page PTEs via kernel syscall.
+            // On first access, the kernel allocates a zero-fill frame directly
+            // (no VMFault IPC round-trip needed).
+            let map_flags = {
+                let mut f: u64 = VSPACE_FLAG_USER;
+                if _prot & 0x2 != 0 { f |= VSPACE_FLAG_WRITABLE; }
+                if _prot & 0x4 != 0 { f |= VSPACE_FLAG_EXECUTABLE; }
+                f
+            };
+            let (err, mapped) = invoke::vspace_map_demand_range(
+                vspace_cap, base, num_pages as u64, map_flags,
+            );
+            if err != 0 || mapped == 0 {
+                (*region).active = false;
+                (*reply).label = SALTY_OUT_OF_MEMORY;
+                return;
+            }
             (*client).mmap_next = base + len;
             (*reply).label = SALTY_OK;
             (*reply).length = 1;

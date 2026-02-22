@@ -73,7 +73,7 @@ pub fn init_bsp() {
         PER_CPU_DATA[0].cpu_id = 0;
 
         // Seed per-CPU stack canary from hardware RNG (RDSEED/RDRAND)
-        PER_CPU_DATA[0].stack_canary = init_stack_canary();
+        PER_CPU_DATA[0].stack_canary = generate_stack_canary();
 
         {
             let s = crate::SerialGuard::acquire();
@@ -98,13 +98,13 @@ pub fn init_bsp() {
 /// Must be called after GS base is set for this CPU.
 pub fn init_ap_canary(cpu_id: usize) {
     unsafe {
-        PER_CPU_DATA[cpu_id].stack_canary = init_stack_canary();
+        PER_CPU_DATA[cpu_id].stack_canary = generate_stack_canary();
     }
 }
 
-/// Generate a per-CPU stack canary seed.
+/// Generate a random stack canary value.
 /// Uses RDSEED (best), falls back to RDRAND, then TSC.
-fn init_stack_canary() -> u64 {
+pub fn generate_stack_canary() -> u64 {
     if let Some(val) = crate::rng::rdseed64() {
         return val;
     }
@@ -115,6 +115,22 @@ fn init_stack_canary() -> u64 {
         core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nostack));
     }
     (((hi as u64) << 32) | (lo as u64)) ^ 0xDEAD_BEEF_CAFE_BABE
+}
+
+/// Update the per-CPU canary cache at %gs:40 to the given thread's canary.
+///
+/// Called during context switch so that the assembly canary check at
+/// syscall exit matches even if the thread migrated from a different CPU.
+#[inline(always)]
+pub fn set_per_cpu_canary(canary: u64) {
+    unsafe {
+        // SAFETY: GS:40 corresponds to stack_canary field in PerCpuData.
+        core::arch::asm!(
+            "mov gs:[40], {}",
+            in(reg) canary,
+            options(nostack)
+        );
+    }
 }
 
 /// Get the current CPU ID

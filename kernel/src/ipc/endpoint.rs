@@ -312,6 +312,10 @@ impl Endpoint {
                             (*sender).blocked_reason,
                             Some(BlockedReason::FaultBlocked { .. })
                         );
+
+                        // Priority inheritance: boost server if caller has earlier deadline
+                        crate::sched::pip::pip_donate(sender, current);
+
                         // Fault/Call sender: keep blocked until reply (via reply_recv)
                         // Clear endpoint ref since it's no longer in the queue
                         (*sender).blocked_endpoint = core::ptr::null_mut();
@@ -411,6 +415,9 @@ impl Endpoint {
                     (*receiver).reply_tcb = current;
                     (*receiver).reply_can_grant = true;
 
+                    // Priority inheritance: boost server if caller has earlier deadline
+                    crate::sched::pip::pip_donate(current, receiver);
+
                     // Update endpoint state BEFORE transfer_message: cap transfer
                     // may release SCHED_IPC_LOCK, so the endpoint must be consistent.
                     if self.recv_queue.is_empty() {
@@ -466,6 +473,9 @@ impl Endpoint {
             let caller = (*current).reply_tcb;
 
             if !caller.is_null() {
+                // Revert priority inheritance before reply
+                crate::sched::pip::pip_undonate(current, caller);
+
                 // Transfer reply message to caller's TCB.
                 // Fault replies cannot grant capabilities.
                 if (*current).reply_can_grant {
@@ -825,6 +835,10 @@ impl Endpoint {
                             (*sender).blocked_reason,
                             Some(BlockedReason::FaultBlocked { .. })
                         );
+
+                        // Priority inheritance: boost server if caller has earlier deadline
+                        crate::sched::pip::pip_donate(sender, current);
+
                         (*sender).blocked_endpoint = core::ptr::null_mut();
                         if matches!(
                             (*sender).blocked_reason,

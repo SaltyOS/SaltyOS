@@ -93,8 +93,14 @@ pub struct Tcb {
     pub header: KernelObject,
     /// Thread state
     pub state: ThreadState,
-    /// Priority (for EDF: deadline)
+    /// Priority (for EDF: effective deadline, may be boosted by PIP)
     pub priority: u64,
+    /// Base priority (original EDF deadline, unaffected by inheritance)
+    pub base_priority: u64,
+    /// TCB pointer this thread is donating priority to (PIP chain)
+    pub pip_donating_to: *mut Tcb,
+    /// Number of priority donations currently received (0 or 1)
+    pub pip_donation_count: u16,
     /// Saved registers
     pub context: ThreadContext,
     /// Virtual address space root
@@ -119,6 +125,8 @@ pub struct Tcb {
     pub sched_context: *mut SchedContext,
     /// CPU affinity (0xFFFF_FFFF = any CPU, otherwise specific CPU ID)
     pub cpu_affinity: u32,
+    /// Last CPU this thread ran on (cache affinity hint for load balancer)
+    pub last_cpu: u32,
     /// Next thread in queue
     pub next: *mut Tcb,
     /// Why this thread is blocked (valid when state == Blocked/Waiting)
@@ -147,6 +155,10 @@ pub struct Tcb {
     pub bound_notification: *mut u8,
     /// Kernel stack top for syscall entry (per-thread kernel stack)
     pub kernel_stack_top: u64,
+    /// Per-thread stack canary (verified at syscall exit against %gs:40).
+    /// Each thread gets its own unique canary so migration across CPUs
+    /// does not cause false-positive corruption panics.
+    pub stack_canary: u64,
     /// User stack upper bound (initial user RSP from configure)
     pub user_stack_top: u64,
     /// Lowest virtual address eligible for automatic stack growth
@@ -252,6 +264,9 @@ impl Tcb {
             header: KernelObject::new(ObjectType::Tcb, 0),
             state: ThreadState::Inactive,
             priority: 0,
+            base_priority: 0,
+            pip_donating_to: core::ptr::null_mut(),
+            pip_donation_count: 0,
             context: ThreadContext::empty(),
             vspace_root: core::ptr::null_mut(),
             cspace_root: core::ptr::null_mut(),
@@ -264,6 +279,7 @@ impl Tcb {
             invoke_depth1: 0,
             sched_context: core::ptr::null_mut(),
             cpu_affinity: 0xFFFF_FFFF,
+            last_cpu: 0xFFFF_FFFF,
             next: core::ptr::null_mut(),
             blocked_reason: None,
             saved_caller_badge: 0,
@@ -278,6 +294,7 @@ impl Tcb {
             fault_handler_badge: 0,
             bound_notification: core::ptr::null_mut(),
             kernel_stack_top: 0,
+            stack_canary: 0,
             user_stack_top: 0,
             user_stack_min: 0,
             timer_wakeup_ns: 0,
@@ -302,6 +319,7 @@ impl Tcb {
             (*ptr).header = KernelObject::new(ObjectType::Tcb, 0);
             (*ptr).state = ThreadState::Inactive;
             (*ptr).cpu_affinity = 0xFFFF_FFFF;
+            (*ptr).last_cpu = 0xFFFF_FFFF;
         }
     }
 
@@ -349,6 +367,11 @@ impl Tcb {
             }
         }
         self.bound_notification = core::ptr::null_mut();
+
+        // Clean up PIP state: revert donation to holder if active
+        unsafe {
+            crate::sched::pip::pip_cleanup(self as *mut Tcb);
+        }
 
         // Clear FPU ownership if this TCB is the current CPU's FPU owner
         crate::arch::fpu::disown_if_current(self as *mut Tcb as *mut u8);

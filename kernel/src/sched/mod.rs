@@ -4,6 +4,7 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+pub mod pip;
 pub mod scheduler;
 pub mod sleep_queue;
 pub mod thread;
@@ -93,6 +94,7 @@ pub fn init() {
         (*idle_tcb).ipc_buffer = 0;
         (*idle_tcb).next = core::ptr::null_mut();
         (*idle_tcb).cpu_affinity = 0; // Pin idle thread to BSP
+        (*idle_tcb).stack_canary = crate::arch::generate_stack_canary();
     }
 
     // Allocate and set up stack
@@ -112,6 +114,7 @@ pub fn init() {
     // The first context switch will save the bootstrap context and switch to idle
     scheduler().set_idle(0, idle_tcb);
     scheduler().set_current(&raw mut BOOTSTRAP_TCB);
+    scheduler().online_cpus = 1;
 }
 
 /// Initialize scheduler for an Application Processor
@@ -130,6 +133,7 @@ pub fn init_cpu(cpu_id: usize) {
         (*idle_tcb).ipc_buffer = 0;
         (*idle_tcb).next = core::ptr::null_mut();
         (*idle_tcb).cpu_affinity = cpu_id as u32;
+        (*idle_tcb).stack_canary = crate::arch::generate_stack_canary();
     }
 
     let idle_stack = unsafe { allocate_idle_stack() };
@@ -145,6 +149,7 @@ pub fn init_cpu(cpu_id: usize) {
 
     scheduler().set_idle(cpu_id, idle_tcb);
     scheduler().set_current(idle_tcb);
+    scheduler().online_cpus += 1;
 }
 
 /// Per-CPU idle TCBs (static, never freed)

@@ -172,6 +172,25 @@ pub unsafe extern "C" fn fastpath_call_rust(
         (*receiver).reply_tcb = current;
         (*receiver).reply_can_grant = true;
 
+        // Priority inheritance: boost server if caller has earlier deadline.
+        // Fastpath only handles non-transitive case; if receiver is itself
+        // donating to someone, bail to slowpath for transitive propagation.
+        if !(*receiver).pip_donating_to.is_null() {
+            // Transitive PIP — undo and bail to slowpath
+            (*receiver).reply_tcb = core::ptr::null_mut();
+            (*receiver).reply_can_grant = false;
+            (*current).state = ThreadState::Running;
+            (*current).blocked_reason = None;
+            endpoint.fastpath_push_recv(receiver);
+            if endpoint.state() == EndpointState::Idle {
+                endpoint.fastpath_set_state(EndpointState::RecvBlocked);
+            }
+            SCHED_IPC_LOCK.unlock();
+            restore_irq(irq);
+            return FastpathResult::slowpath();
+        }
+        crate::sched::pip::pip_donate(current, receiver);
+
         // Transfer message to receiver's TCB (no cap transfer on fastpath)
         (*receiver).saved_caller_msg = msg;
         (*receiver).saved_caller_badge = badge;
@@ -204,6 +223,11 @@ pub unsafe extern "C" fn fastpath_call_rust(
 
         // Release SCHED_IPC_LOCK before context switch (IF=0, no interrupts possible)
         SCHED_IPC_LOCK.unlock();
+
+        // Update per-CPU canary cache to receiver's canary before switching.
+        // The receiver resumes mid-syscall and eventually returns through the
+        // assembly canary check — %gs:40 must match the receiver's saved canary.
+        crate::arch::set_per_cpu_canary((*receiver).stack_canary);
 
         // Context switch: caller suspends here, resumes when reply wakes it
         let old_ctx = &mut (*current).context as *mut _;
@@ -314,6 +338,9 @@ pub unsafe extern "C" fn fastpath_reply_recv_rust(
                 return FastpathResult::slowpath();
             }
 
+            // Revert priority inheritance before reply
+            crate::sched::pip::pip_undonate(current, caller);
+
             // Build reply message inline
             let reply_label = msg_info::get_label(msg_info);
             let mut reply_msg = Message::empty();
@@ -390,6 +417,8 @@ pub unsafe extern "C" fn fastpath_reply_recv_rust(
             // Call sender: set reply cap and keep blocked until reply
             (*current).reply_tcb = sender;
             (*current).reply_can_grant = true;
+            // Priority inheritance: boost server if caller has earlier deadline
+            crate::sched::pip::pip_donate(sender, current);
             (*sender).blocked_endpoint = core::ptr::null_mut();
             (*sender).blocked_reason = Some(BlockedReason::ReplyWait { msg, badge });
         } else {

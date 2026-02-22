@@ -14,6 +14,9 @@ const ENTRY_USER: u64 = 1 << 2;
 const ENTRY_WRITE_THROUGH: u64 = 1 << 3;
 const ENTRY_CACHE_DISABLE: u64 = 1 << 4;
 const ENTRY_COW: u64 = 1 << 9;
+/// Demand page marker: PTE with PRESENT=0, DEMAND=1 triggers kernel fast-path
+/// allocation on #PF instead of IPC to mmsrv. Bit 10 is OS-available when PRESENT=0.
+const ENTRY_DEMAND: u64 = 1 << 10;
 const ENTRY_NO_EXECUTE: u64 = 1 << 63;
 
 /// Physical address mask in page table entry
@@ -1206,6 +1209,13 @@ impl VSpace {
         let result = (|| {
             // Check if mapped
             let entry = self.read_entry(virt, 1).ok_or(VSpaceError::NotMapped)?;
+
+            // Demand PTE (PRESENT=0, DEMAND=1): no frame to release, just clear
+            if entry & ENTRY_PRESENT == 0 && entry & ENTRY_DEMAND != 0 {
+                self.write_entry(virt, 1, 0)?;
+                return Ok(());
+            }
+
             if entry & ENTRY_PRESENT == 0 {
                 return Err(VSpaceError::NotMapped);
             }
@@ -1245,6 +1255,15 @@ impl VSpace {
 
         let result = (|| {
             let entry = self.read_entry(virt, 1).ok_or(VSpaceError::NotMapped)?;
+
+            // Demand PTE (PRESENT=0, DEMAND=1): update stored flags
+            if entry & ENTRY_PRESENT == 0 && entry & ENTRY_DEMAND != 0 {
+                let entry_flags = Self::flags_to_entry_flags(flags);
+                let new_demand = (entry_flags & !ENTRY_PRESENT) | ENTRY_DEMAND;
+                self.write_entry(virt, 1, new_demand)?;
+                return Ok(());
+            }
+
             if entry & ENTRY_PRESENT == 0 {
                 return Err(VSpaceError::NotMapped);
             }
@@ -1297,6 +1316,20 @@ impl VSpace {
 
         let result = (|| {
             let src_entry = self.read_entry(src_vaddr, 1).ok_or(VSpaceError::NotMapped)?;
+
+            // Demand PTE (PRESENT=0, DEMAND=1): copy to child as-is (no frame sharing)
+            if src_entry & ENTRY_PRESENT == 0 && src_entry & ENTRY_DEMAND != 0 {
+                let is_user = (src_entry & ENTRY_USER) != 0;
+                dst.ensure_table(dst_vaddr, 1, is_user)?;
+                if let Some(entry) = dst.read_entry(dst_vaddr, 1) {
+                    if entry & ENTRY_PRESENT != 0 || entry & ENTRY_DEMAND != 0 {
+                        return Err(VSpaceError::AlreadyMapped);
+                    }
+                }
+                dst.write_entry(dst_vaddr, 1, src_entry)?;
+                return Ok(());
+            }
+
             if src_entry & ENTRY_PRESENT == 0 {
                 return Err(VSpaceError::NotMapped);
             }
@@ -1479,6 +1512,157 @@ impl VSpace {
             super::retain_frame_mapping(new_phys);
             crate::arch::x86_64::paging::invlpg(page_vaddr);
             self.tlb_shootdown(page_vaddr);
+            Ok(true)
+        })();
+
+        self.lock.unlock();
+        unsafe { restore_irq(irq) };
+        result
+    }
+
+    /// Install a demand-page PTE: PRESENT=0, ENTRY_DEMAND=1, flags stored.
+    ///
+    /// On first user access, #PF → `handle_demand_fault` allocates a zero-fill
+    /// frame and makes the page PRESENT, avoiding IPC to mmsrv.
+    pub fn map_demand(
+        &mut self,
+        virt: VirtAddr,
+        flags: PageFlags,
+    ) -> Result<(), VSpaceError> {
+        if virt & (PAGE_SIZE as u64 - 1) != 0 {
+            return Err(VSpaceError::Alignment);
+        }
+
+        let irq = unsafe { save_irq_disable() };
+        self.lock.lock();
+
+        let result = (|| {
+            self.ensure_table(virt, 1, flags.user)?;
+
+            // Check if already mapped (present or demand)
+            if let Some(entry) = self.read_entry(virt, 1) {
+                if entry & ENTRY_PRESENT != 0 || entry & ENTRY_DEMAND != 0 {
+                    return Err(VSpaceError::AlreadyMapped);
+                }
+            }
+
+            // Build demand PTE: NOT present, DEMAND bit set, flags stored
+            let entry_flags = Self::flags_to_entry_flags(flags);
+            // Strip PRESENT so the PTE triggers #PF; keep all other flags.
+            let demand_entry = (entry_flags & !ENTRY_PRESENT) | ENTRY_DEMAND;
+            self.write_entry(virt, 1, demand_entry)?;
+
+            Ok(())
+        })();
+
+        self.lock.unlock();
+        unsafe { restore_irq(irq) };
+        result
+    }
+
+    /// Install demand-page PTEs for a contiguous range.
+    ///
+    /// Returns the number of pages successfully set up.
+    pub fn map_demand_range(
+        &mut self,
+        virt_start: VirtAddr,
+        count: usize,
+        flags: PageFlags,
+    ) -> Result<usize, VSpaceError> {
+        if count == 0 {
+            return Ok(0);
+        }
+        if virt_start & (PAGE_SIZE as u64 - 1) != 0 {
+            return Err(VSpaceError::Alignment);
+        }
+
+        let page_size = PAGE_SIZE as u64;
+        let irq = unsafe { save_irq_disable() };
+        self.lock.lock();
+
+        let entry_flags = Self::flags_to_entry_flags(flags);
+        let demand_entry = (entry_flags & !ENTRY_PRESENT) | ENTRY_DEMAND;
+
+        let mut mapped = 0usize;
+        let mut virt = virt_start;
+
+        for _ in 0..count {
+            if self.ensure_table(virt, 1, flags.user).is_err() {
+                break;
+            }
+            if let Some(entry) = self.read_entry(virt, 1) {
+                if entry & ENTRY_PRESENT != 0 || entry & ENTRY_DEMAND != 0 {
+                    break;
+                }
+            }
+            if self.write_entry(virt, 1, demand_entry).is_err() {
+                break;
+            }
+            mapped += 1;
+            virt = match virt.checked_add(page_size) {
+                Some(v) => v,
+                None => break,
+            };
+        }
+
+        self.lock.unlock();
+        unsafe { restore_irq(irq) };
+        Ok(mapped)
+    }
+
+    /// Handle a demand-page fault: allocate a zero-fill frame and make
+    /// the PTE PRESENT.
+    ///
+    /// Returns `Ok(true)` if the fault was handled (demand PTE found and resolved).
+    /// Returns `Ok(false)` if the PTE is not a demand page (caller should try
+    /// other fault handlers or IPC fallback).
+    ///
+    /// Lock ordering: VSpace.lock → MM_LOCK (alloc_frame) — matches existing ordering.
+    pub fn handle_demand_fault(
+        &mut self,
+        fault_addr: VirtAddr,
+        _error_code: u64,
+    ) -> Result<bool, VSpaceError> {
+        let page_vaddr = fault_addr & !((PAGE_SIZE as u64) - 1);
+
+        let irq = unsafe { save_irq_disable() };
+        self.lock.lock();
+
+        let result = (|| {
+            let entry = match self.read_entry(page_vaddr, 1) {
+                Some(e) => e,
+                None => return Ok(false),
+            };
+
+            // Already present — another CPU resolved this demand fault concurrently
+            if entry & ENTRY_PRESENT != 0 {
+                return Ok(false);
+            }
+            // Not a demand page — let other fault handlers deal with it
+            if entry & ENTRY_DEMAND == 0 {
+                return Ok(false);
+            }
+
+            // Allocate a zero-fill frame
+            let new_phys = alloc_frame().ok_or(VSpaceError::OutOfMemory)?;
+            // SAFETY: phys_to_virt returns kernel-mapped address for the frame
+            unsafe {
+                core::ptr::write_bytes(phys_to_virt(new_phys) as *mut u8, 0, PAGE_SIZE);
+            }
+            super::mark_frame_kernel_runtime(new_phys);
+
+            // Build final PTE: restore original flags, add PRESENT, clear DEMAND
+            let new_entry = (entry & !ENTRY_DEMAND) | ENTRY_PRESENT | new_phys;
+            if self.write_entry(page_vaddr, 1, new_entry).is_err() {
+                super::clear_frame_kernel_runtime(new_phys);
+                super::free_frame(new_phys);
+                return Err(VSpaceError::NotMapped);
+            }
+
+            super::retain_frame_mapping(new_phys);
+            crate::arch::x86_64::paging::invlpg(page_vaddr);
+            self.tlb_shootdown(page_vaddr);
+
             Ok(true)
         })();
 

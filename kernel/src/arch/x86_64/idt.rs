@@ -278,9 +278,15 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
             // Fast-path COW page fault handling in kernel.
             if f.vector == 14 && !current.is_null() && !(*current).vspace_root.is_null() {
                 let vspace = &mut *(*current).vspace_root;
+                // COW: PRESENT=1, write fault
                 if let Ok(true) = vspace.handle_cow_fault(f.cr2, f.error_code) {
                     return;
                 }
+                // Demand paging: PRESENT=0, DEMAND bit set in PTE
+                if let Ok(true) = vspace.handle_demand_fault(f.cr2, f.error_code) {
+                    return;
+                }
+                // Stack growth: PRESENT=0, address near stack pointer
                 if let Ok(true) = vspace.handle_stack_growth_fault(
                     f.cr2,
                     f.error_code,

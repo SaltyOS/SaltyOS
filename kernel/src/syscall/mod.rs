@@ -1340,6 +1340,14 @@ fn syscall_invoke_inner(
             // VSPACE_PROTECT: arg0 = virt_addr, arg1 = flags_bits
             syscall_vspace_protect(&cap, arg0, arg1)
         }
+        (ObjectType::VSpace, 0x59) => {
+            // VSPACE_MAP_DEMAND: arg0 = virt_addr, arg1 = flags_bits
+            syscall_vspace_map_demand(&cap, arg0, arg1)
+        }
+        (ObjectType::VSpace, 0x5A) => {
+            // VSPACE_MAP_DEMAND_RANGE: arg0 = virt_addr, arg1 = count, arg2 = flags_bits
+            syscall_vspace_map_demand_range(&cap, arg0, arg1, arg2)
+        }
 
         // SchedContext operations
         (ObjectType::SchedContext, 0x30) => {
@@ -1513,6 +1521,7 @@ fn syscall_sc_bind(cap: &Capability, tcb_cap_ptr: u64) -> SyscallResult {
 
         sc.bound_tcb = tcb as *mut Tcb;
         tcb.sched_context = sc as *mut SchedContext;
+        tcb.base_priority = sc.deadline;
         tcb.priority = sc.deadline;
 
         if tcb.state == ThreadState::Ready {
@@ -1645,6 +1654,7 @@ fn syscall_tcb_configure(
         let kstack_top = kstack_virt + crate::mm::PAGE_SIZE as u64;
         core::ptr::write_bytes(kstack_virt as *mut u8, 0, crate::mm::PAGE_SIZE);
         tcb.kernel_stack_top = kstack_top;
+        tcb.stack_canary = crate::arch::generate_stack_canary();
 
         if !tcb.vspace_root.is_null() {
             let vspace = &*tcb.vspace_root;
@@ -1766,6 +1776,9 @@ fn syscall_tcb_suspend(cap: &Capability) -> SyscallResult {
         SCHED_IPC_LOCK.lock();
         let tcb = &mut *(cap.object as *mut Tcb);
         let scheduler = crate::sched::scheduler::scheduler();
+
+        // Clean up PIP state before suspension
+        crate::sched::pip::pip_cleanup(tcb as *mut Tcb);
 
         match tcb.state {
             ThreadState::Running => {
@@ -2025,6 +2038,7 @@ fn syscall_tcb_set_priority(cap: &Capability, priority: u64) -> SyscallResult {
         let irq = save_irq_disable();
         SCHED_IPC_LOCK.lock();
         let tcb = &mut *(cap.object as *mut Tcb);
+        tcb.base_priority = priority;
         tcb.priority = priority;
 
         if tcb.state == ThreadState::Ready {
@@ -2556,6 +2570,80 @@ fn syscall_vspace_protect(cap: &Capability, virt_addr: u64, flags_bits: u64) -> 
 
         match vspace.protect(virt_addr, flags) {
             Ok(()) => SyscallResult::ok(0),
+            Err(e) => SyscallResult::err(syscall_error_from_vspace_error(e)),
+        }
+    }
+}
+
+/// VSPACE_MAP_DEMAND: Install demand-page PTE at a single virtual address.
+///
+/// Args:
+/// - virt_addr: Virtual address to set up for demand paging
+/// - flags_bits: Mapping flags (writable, user, executable, etc.)
+fn syscall_vspace_map_demand(cap: &Capability, virt_addr: u64, flags_bits: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::MAP) {
+        return SyscallResult::err(e);
+    }
+
+    // W^X: writable + executable is not permitted
+    if (flags_bits & 1 != 0) && (flags_bits & 4 != 0) {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    unsafe {
+        let vspace = &mut *(cap.object as *mut VSpace);
+        let flags = PageFlags {
+            writable: flags_bits & 1 != 0,
+            user: flags_bits & 2 != 0,
+            executable: flags_bits & 4 != 0,
+            cache_disable: flags_bits & 8 != 0,
+            write_through: flags_bits & 16 != 0,
+            cow: false,
+        };
+
+        match vspace.map_demand(virt_addr, flags) {
+            Ok(()) => SyscallResult::ok(0),
+            Err(e) => SyscallResult::err(syscall_error_from_vspace_error(e)),
+        }
+    }
+}
+
+/// VSPACE_MAP_DEMAND_RANGE: Install demand-page PTEs for a contiguous range.
+///
+/// Args:
+/// - virt_addr: Start virtual address
+/// - count: Number of pages
+/// - flags_bits: Mapping flags
+///
+/// Returns number of pages successfully set up in value field.
+fn syscall_vspace_map_demand_range(
+    cap: &Capability,
+    virt_addr: u64,
+    count: u64,
+    flags_bits: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::MAP) {
+        return SyscallResult::err(e);
+    }
+
+    // W^X: writable + executable is not permitted
+    if (flags_bits & 1 != 0) && (flags_bits & 4 != 0) {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    unsafe {
+        let vspace = &mut *(cap.object as *mut VSpace);
+        let flags = PageFlags {
+            writable: flags_bits & 1 != 0,
+            user: flags_bits & 2 != 0,
+            executable: flags_bits & 4 != 0,
+            cache_disable: flags_bits & 8 != 0,
+            write_through: flags_bits & 16 != 0,
+            cow: false,
+        };
+
+        match vspace.map_demand_range(virt_addr, count as usize, flags) {
+            Ok(mapped) => SyscallResult::ok(mapped as u64),
             Err(e) => SyscallResult::err(syscall_error_from_vspace_error(e)),
         }
     }
