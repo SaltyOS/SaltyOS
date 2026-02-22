@@ -41,7 +41,7 @@ Cargo.lock
 
 # Debug
 *.log
-core
+/core
 *.core
 
 # Generated
