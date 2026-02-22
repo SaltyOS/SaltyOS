@@ -834,3 +834,151 @@ pub unsafe extern "C" fn getitimer(_which: i32, curr_value: *mut Itimerval) -> i
     }
     0
 }
+
+// ---------------------------------------------------------------------------
+// timegm / strptime
+// ---------------------------------------------------------------------------
+
+/// timegm — like mktime() but always interprets tm as UTC.
+/// Since SaltyOS is UTC-only, this is identical to mktime().
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn timegm(tm: *mut Tm) -> TimeT {
+    unsafe { mktime(tm) }
+}
+
+/// strptime — parse a time string according to a format.
+/// Minimal implementation supporting: %Y %m %d %H %M %S %T %D %n %t %%
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strptime(
+    buf: *const u8,
+    fmt: *const u8,
+    tm: *mut Tm,
+) -> *mut u8 {
+    unsafe {
+        if buf.is_null() || fmt.is_null() || tm.is_null() {
+            return core::ptr::null_mut();
+        }
+
+        let mut bi: usize = 0; // index into buf
+        let mut fi: usize = 0; // index into fmt
+
+        while *fmt.add(fi) != 0 {
+            let fc = *fmt.add(fi);
+
+            if fc == b'%' {
+                fi += 1;
+                if *fmt.add(fi) == 0 {
+                    break;
+                }
+                let spec = *fmt.add(fi);
+                fi += 1;
+
+                match spec {
+                    b'Y' => {
+                        // 4-digit year
+                        let (val, adv) = parse_digits(buf.add(bi), 4);
+                        if adv == 0 { return core::ptr::null_mut(); }
+                        (*tm).tm_year = val - 1900;
+                        bi += adv;
+                    }
+                    b'm' => {
+                        // 1-2 digit month (01-12)
+                        let (val, adv) = parse_digits(buf.add(bi), 2);
+                        if adv == 0 { return core::ptr::null_mut(); }
+                        (*tm).tm_mon = val - 1;
+                        bi += adv;
+                    }
+                    b'd' => {
+                        // 1-2 digit day (01-31)
+                        let (val, adv) = parse_digits(buf.add(bi), 2);
+                        if adv == 0 { return core::ptr::null_mut(); }
+                        (*tm).tm_mday = val;
+                        bi += adv;
+                    }
+                    b'H' => {
+                        // 1-2 digit hour (00-23)
+                        let (val, adv) = parse_digits(buf.add(bi), 2);
+                        if adv == 0 { return core::ptr::null_mut(); }
+                        (*tm).tm_hour = val;
+                        bi += adv;
+                    }
+                    b'M' => {
+                        // 1-2 digit minute (00-59)
+                        let (val, adv) = parse_digits(buf.add(bi), 2);
+                        if adv == 0 { return core::ptr::null_mut(); }
+                        (*tm).tm_min = val;
+                        bi += adv;
+                    }
+                    b'S' => {
+                        // 1-2 digit second (00-60)
+                        let (val, adv) = parse_digits(buf.add(bi), 2);
+                        if adv == 0 { return core::ptr::null_mut(); }
+                        (*tm).tm_sec = val;
+                        bi += adv;
+                    }
+                    b'T' => {
+                        // %H:%M:%S
+                        let result = strptime(buf.add(bi), b"%H:%M:%S\0".as_ptr(), tm);
+                        if result.is_null() { return core::ptr::null_mut(); }
+                        bi += result.offset_from(buf.add(bi)) as usize;
+                    }
+                    b'D' => {
+                        // %m/%d/%y
+                        let result = strptime(buf.add(bi), b"%m/%d/%y\0".as_ptr(), tm);
+                        if result.is_null() { return core::ptr::null_mut(); }
+                        bi += result.offset_from(buf.add(bi)) as usize;
+                    }
+                    b'y' => {
+                        // 2-digit year (00-99, maps to 1969-2068)
+                        let (val, adv) = parse_digits(buf.add(bi), 2);
+                        if adv == 0 { return core::ptr::null_mut(); }
+                        (*tm).tm_year = if val >= 69 { val } else { val + 100 };
+                        bi += adv;
+                    }
+                    b'n' | b't' => {
+                        // Skip whitespace
+                        while *buf.add(bi) == b' ' || *buf.add(bi) == b'\t' || *buf.add(bi) == b'\n' {
+                            bi += 1;
+                        }
+                    }
+                    b'%' => {
+                        if *buf.add(bi) != b'%' { return core::ptr::null_mut(); }
+                        bi += 1;
+                    }
+                    _ => {
+                        // Unknown specifier, fail
+                        return core::ptr::null_mut();
+                    }
+                }
+            } else if fc == b' ' || fc == b'\t' {
+                // Format whitespace matches any amount of input whitespace
+                fi += 1;
+                while *buf.add(bi) == b' ' || *buf.add(bi) == b'\t' {
+                    bi += 1;
+                }
+            } else {
+                // Literal character match
+                if *buf.add(bi) != fc {
+                    return core::ptr::null_mut();
+                }
+                bi += 1;
+                fi += 1;
+            }
+        }
+
+        buf.add(bi) as *mut u8
+    }
+}
+
+/// Parse up to `max_digits` decimal digits from `s`. Returns (value, chars_consumed).
+unsafe fn parse_digits(s: *const u8, max_digits: usize) -> (i32, usize) {
+    unsafe {
+        let mut val: i32 = 0;
+        let mut i: usize = 0;
+        while i < max_digits && *s.add(i) >= b'0' && *s.add(i) <= b'9' {
+            val = val * 10 + (*s.add(i) - b'0') as i32;
+            i += 1;
+        }
+        (val, i)
+    }
+}

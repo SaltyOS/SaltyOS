@@ -1,0 +1,13 @@
+--- a/usr.bin/tr/str.c	2026-02-23 00:00:00.000000000 +0900
++++ b/usr.bin/tr/str.c	2026-02-23 00:00:00.000000000 +0900
+@@ -38,6 +38,10 @@
+ #include <ctype.h>
+ #include <err.h>
+ #include <errno.h>
++
++/* SaltyOS: iswrune is FreeBSD-specific; treat all wchar_t as valid runes */
++#define iswrune(c) (1)
++
+ #include <limits.h>
+ #include <stdio.h>
+ #include <stdlib.h>

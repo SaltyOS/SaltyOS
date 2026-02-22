@@ -52,4 +52,14 @@ extern size_t __ctype_get_mb_cur_max(void);
 extern wint_t btowc(int c);
 extern int    wctob(wint_t c);
 
+/* Wide character I/O */
+#ifndef __STDIO_H__
+typedef struct FILE FILE;
+#endif
+extern wint_t fgetwc(FILE *stream);
+extern wint_t fputwc(wint_t wc, FILE *stream);
+extern wint_t getwc(FILE *stream);
+extern wint_t getwchar(void);
+extern wint_t putwchar(wint_t wc);
+
 #endif /* __WCHAR_H__ */

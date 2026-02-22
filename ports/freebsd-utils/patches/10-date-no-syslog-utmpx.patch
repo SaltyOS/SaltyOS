@@ -1,0 +1,38 @@
+--- a/bin/date/date.c	2026-02-23 00:00:00.000000000 +0900
++++ b/bin/date/date.c	2026-02-23 00:00:00.000000000 +0900
+@@ -44,8 +44,6 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <syslog.h>
+-#include <utmpx.h>
+ #include <unistd.h>
+ #include <locale.h>
+
+@@ -186,7 +184,6 @@
+ setthetime(const char *fmt, const char *p, int jflag)
+ {
+ 	struct tm *lt;
+-	struct utmpx utx;
+ 	const char *dot, *t;
+ 	time_t now, tv;
+ 	int century;
+@@ -283,18 +280,6 @@
+ 		err(1, "clock_settime");
+
+ 	tval = tv;
+-	if ((localtime(&tval)) == NULL)
+-		errx(1, "invalid time");
+-
+-	utx.ut_type = OLD_TIME;
+-	memset(utx.ut_id, 0, sizeof(utx.ut_id));
+-	(void)gettimeofday(&utx.ut_tv, NULL);
+-	pututxline(&utx);
+-	utx.ut_type = NEW_TIME;
+-	(void)gettimeofday(&utx.ut_tv, NULL);
+-	pututxline(&utx);
+-
+-	syslog(LOG_AUTH | LOG_NOTICE, "date set by %s", logname);
+ }
+
+ static void

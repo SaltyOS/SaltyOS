@@ -1,0 +1,39 @@
+--- a/usr.bin/stat/stat.c	2026-02-23 00:00:00.000000000 +0900
++++ b/usr.bin/stat/stat.c	2026-02-23 00:00:00.000000000 +0900
+@@ -38,7 +38,6 @@
+ #include <sys/cdefs.h>
+ #include <sys/stat.h>
+ #include <sys/param.h>
+-#include <sys/mount.h>
+
+ #include <ctype.h>
+ #include <err.h>
+@@ -52,6 +51,28 @@
+ #include <time.h>
+ #include <unistd.h>
+
++/* SaltyOS: stub devname/fdevname_r (not available) */
++static const char *
++devname(dev_t dev, mode_t type)
++{
++	(void)dev;
++	(void)type;
++	return "unknown";
++}
++
++static int
++fdevname_r(int fd, char *buf, int len)
++{
++	(void)fd;
++	if (buf && len > 0)
++		buf[0] = '\0';
++	return -1;
++}
++
++/* SaltyOS: stub statfs (not available) */
++#define f_fstypename "unknown"
++#define f_mntonname  "/"
++
+ #define	DEF_FORMAT \
+ 	"%d %i %Sp %l %Su %Sg %r %z \"%Sa\" \"%Sm\" \"%Sc\" \"%SB\" " \
+ 	"%k %b %#Xf %N"

@@ -53,4 +53,7 @@ extern char     *tzname[2];
 extern long      timezone;
 extern int       daylight;
 
+extern time_t    timegm(struct tm *tm);
+extern char     *strptime(const char *s, const char *format, struct tm *tm);
+
 #endif /* __TIME_H__ */

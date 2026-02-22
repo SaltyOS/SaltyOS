@@ -1,0 +1,74 @@
+--- a/usr.bin/find/function.c	2026-02-23 00:00:00.000000000 +0900
++++ b/usr.bin/find/function.c	2026-02-23 00:00:00.000000000 +0900
+@@ -37,8 +37,6 @@
+ #include <sys/stat.h>
+ #include <sys/wait.h>
+ #include <sys/mount.h>
+-#include <sys/acl.h>
+-#include <sys/ucred.h>
+
+ #include <dirent.h>
+ #include <err.h>
+@@ -856,34 +854,6 @@
+ PLAN *
+ c_acl(OPTION *option, char ***argvp __unused)
+ {
+-	ftsoptions &= ~FTS_NOSTAT;
+-	return palloc(option);
+-}
+-
+-static int
+-f_acl(PLAN *plan __unused, FTSENT *entry)
+-{
+-	acl_t facl;
+-	acl_type_t acl_type;
+-	int acl_supported = 0, ret, trivial;
+-
+-	if (S_ISLNK(entry->fts_statp->st_mode))
+-		return 0;
+-
+-	ret = pathconf(entry->fts_accpath, _PC_ACL_NFS4);
+-	if (ret > 0) {
+-		acl_supported = 1;
+-		acl_type = ACL_TYPE_NFS4;
+-	} else {
+-		ret = pathconf(entry->fts_accpath, _PC_ACL_EXTENDED);
+-		if (ret > 0) {
+-			acl_supported = 1;
+-			acl_type = ACL_TYPE_ACCESS;
+-		}
+-	}
+-	if (acl_supported == 0)
+-		return 0;
+-
+-	facl = acl_get_link_np(entry->fts_accpath, acl_type);
+-	if (facl != NULL) {
+-		if (acl_is_trivial_np(facl, &trivial)) {
+-			acl_free(facl);
+-			return 0;
+-		}
+-		if (!trivial) {
+-			acl_free(facl);
+-			return 1;
+-		}
+-		acl_free(facl);
+-	}
+ 	return 0;
+ }
++
++static int
++f_acl(PLAN *plan __unused, FTSENT *entry __unused)
++{
++	/* SaltyOS: no ACL support */
++	return 0;
++}
+--- a/usr.bin/find/option.c	2026-02-23 00:00:00.000000000 +0900
++++ b/usr.bin/find/option.c	2026-02-23 00:00:00.000000000 +0900
+@@ -34,7 +34,6 @@
+
+ #include <sys/types.h>
+ #include <sys/stat.h>
+-#include <sys/ucred.h>
+
+ #include <err.h>
+ #include <fts.h>

@@ -838,3 +838,49 @@ pub unsafe extern "C" fn fwprintf(
     crate::errno::set_errno(crate::errno::ENOSYS);
     -1
 }
+
+// ---------------------------------------------------------------------------
+// Wide character I/O (C locale: wchar_t == byte)
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    safe fn fgetc(stream: *mut crate::stdio::FILE) -> i32;
+    safe fn fputc(c: i32, stream: *mut crate::stdio::FILE) -> i32;
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fgetwc(stream: *mut crate::stdio::FILE) -> WintT {
+    let c = fgetc(stream);
+    if c < 0 { WEOF } else { c as WintT }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fputwc(wc: WintT, stream: *mut crate::stdio::FILE) -> WintT {
+    if wc > 0x7f {
+        crate::errno::set_errno(crate::errno::EILSEQ);
+        return WEOF;
+    }
+    let c = fputc(wc as i32, stream);
+    if c < 0 { WEOF } else { wc }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getwc(stream: *mut crate::stdio::FILE) -> WintT {
+    unsafe { fgetwc(stream) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getwchar() -> WintT {
+    crate::stdio::ensure_stdio_init();
+    unsafe {
+        fgetwc((*(&raw const crate::stdio::stdin)))
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn putwchar(wc: WintT) -> WintT {
+    crate::stdio::ensure_stdio_init();
+    unsafe {
+        fputwc(wc, (*(&raw const crate::stdio::stdout)))
+    }
+}

@@ -1,0 +1,14 @@
+--- a/usr.bin/grep/grep.h	2026-02-23 00:00:00.000000000 +0900
++++ b/usr.bin/grep/grep.h	2026-02-23 00:00:00.000000000 +0900
+@@ -33,6 +33,11 @@
+ #include <stdbool.h>
+ #include <stdio.h>
+
++/* SaltyOS: disable compression support (no bzlib/zlib available) */
++#define WITHOUT_BZIP2 1
++#define WITHOUT_GZIP 1
++#define WITHOUT_LZMA 1
++
+ #ifndef WITHOUT_BZIP2
+ #include <bzlib.h>
+ #endif
