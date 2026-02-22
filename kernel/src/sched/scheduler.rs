@@ -22,6 +22,14 @@ pub struct Scheduler {
     pending_enqueue: [*mut Tcb; MAX_CPUS],
     /// Lock state (simple test-and-set spinlock)
     lock_state: core::sync::atomic::AtomicU8,
+    /// Per-CPU context switch count
+    pub context_switches: [u64; MAX_CPUS],
+    /// Per-CPU timer tick count
+    pub timer_ticks: [u64; MAX_CPUS],
+    /// Per-CPU idle tick count
+    pub idle_ticks: [u64; MAX_CPUS],
+    /// Per-CPU IPI reschedule count
+    pub ipi_reschedules: [u64; MAX_CPUS],
 }
 
 impl Scheduler {
@@ -32,6 +40,10 @@ impl Scheduler {
             idle: [core::ptr::null_mut(); MAX_CPUS],
             pending_enqueue: [core::ptr::null_mut(); MAX_CPUS],
             lock_state: core::sync::atomic::AtomicU8::new(0),
+            context_switches: [0; MAX_CPUS],
+            timer_ticks: [0; MAX_CPUS],
+            idle_ticks: [0; MAX_CPUS],
+            ipi_reschedules: [0; MAX_CPUS],
         }
     }
 
@@ -379,6 +391,10 @@ impl Scheduler {
         // Shadow new_tcb so we can reassign on VSpace failure
         let mut new_tcb = new_tcb;
 
+        // Count context switches on this CPU
+        let cs_cpu = crate::arch::current_cpu() as usize;
+        self.context_switches[cs_cpu] += 1;
+
         unsafe {
             // Switch to the target thread's user VSpace
             if !(*new_tcb).vspace_root.is_null() {
@@ -466,6 +482,9 @@ impl Scheduler {
             let cpu_id = crate::arch::current_cpu() as usize;
             let current = self.current[cpu_id];
 
+            // Count timer ticks on this CPU
+            self.timer_ticks[cpu_id] += 1;
+
             if current.is_null() {
                 self.unlock();
                 crate::mm::restore_irq(irq_flag);
@@ -474,7 +493,8 @@ impl Scheduler {
 
             let sched_ctx = (*current).sched_context;
             if sched_ctx.is_null() {
-                // Idle thread — check if woken thread should preempt
+                // Idle thread — count idle tick and check if woken thread should preempt
+                self.idle_ticks[cpu_id] += 1;
                 let new_tcb = self.schedule_unlocked();
                 if current != new_tcb {
                     self.set_current(new_tcb);
@@ -564,6 +584,7 @@ impl Scheduler {
 
         unsafe {
             let cpu_id = crate::arch::current_cpu() as usize;
+            self.ipi_reschedules[cpu_id] += 1;
             let current = self.current[cpu_id];
             if current.is_null() {
                 self.unlock();

@@ -34,6 +34,9 @@ pub enum Syscall {
     SetInvokeDepths = 17,
     Futex = 18,
     GetRandom = 19,
+    Shutdown = 20,
+    SendTimed = 21,
+    RecvTimed = 22,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -61,6 +64,9 @@ impl TryFrom<u64> for Syscall {
             17 => Ok(Syscall::SetInvokeDepths),
             18 => Ok(Syscall::Futex),
             19 => Ok(Syscall::GetRandom),
+            20 => Ok(Syscall::Shutdown),
+            21 => Ok(Syscall::SendTimed),
+            22 => Ok(Syscall::RecvTimed),
             _ => Err(SyscallError::InvalidOperation),
         }
     }
@@ -3568,6 +3574,25 @@ pub fn handle(
                     s.putc(b'\n');
                     drop(s);
                 }
+                // Print scheduling statistics
+                for cpu in 0..crate::arch::MAX_CPUS {
+                    if scheduler.timer_ticks[cpu] == 0 && cpu > 0 {
+                        continue;
+                    }
+                    let s = crate::SerialGuard::acquire();
+                    s.puts("[SCHED STATS] CPU");
+                    s.dec(cpu as u64);
+                    s.puts(": ctx=");
+                    s.dec(scheduler.context_switches[cpu]);
+                    s.puts(" tick=");
+                    s.dec(scheduler.timer_ticks[cpu]);
+                    s.puts(" idle=");
+                    s.dec(scheduler.idle_ticks[cpu]);
+                    s.puts(" ipi=");
+                    s.dec(scheduler.ipi_reschedules[cpu]);
+                    s.putc(b'\n');
+                    drop(s);
+                }
                 SCHED_IPC_LOCK.unlock();
                 restore_irq(irq);
             }
@@ -3586,6 +3611,78 @@ pub fn handle(
             match crate::rng::rdrand64() {
                 Some(val) => SyscallResult::ok(val),
                 None => SyscallResult::err(SyscallError::InvalidOperation),
+            }
+        }
+        Syscall::Shutdown => {
+            // ACPI S5 power off. Does not return.
+            crate::arch::shutdown();
+        }
+        Syscall::SendTimed => {
+            // cap_ptr = cap slot, msg_info = message info, mr0 = MR0, mr1 = timeout_ns
+            // Returns 0 on success, Cancelled (12) on timeout
+            let cap = match lookup_cap_locked(cap_ptr) {
+                Ok(c) => c,
+                Err(e) => return SyscallResult::err(e),
+            };
+
+            if cap.obj_type != ObjectType::Endpoint {
+                return SyscallResult::err(SyscallError::InvalidCapability);
+            }
+            if let Err(e) = validate_endpoint_cap(&cap, CapRights::SEND) {
+                return SyscallResult::err(e);
+            }
+
+            let msg = construct_message(msg_info, mr0, 0, 0, 0);
+            let timeout_ns = mr1;
+
+            unsafe {
+                let irq = save_irq_disable();
+                SCHED_IPC_LOCK.lock();
+                let endpoint = &mut *(cap.object as *mut Endpoint);
+                let result = endpoint.send_timeout(&msg, cap.badge, timeout_ns);
+                SCHED_IPC_LOCK.unlock();
+                restore_irq(irq);
+
+                if result == 0 {
+                    SyscallResult::ok(0)
+                } else {
+                    SyscallResult::err(SyscallError::Cancelled)
+                }
+            }
+        }
+        Syscall::RecvTimed => {
+            // cap_ptr = cap slot, msg_info = timeout_ns
+            // Returns badge in value, 0 in error on success, Cancelled (12) on timeout
+            let cap = match lookup_cap_locked(cap_ptr) {
+                Ok(c) => c,
+                Err(e) => return SyscallResult::err(e),
+            };
+
+            if cap.obj_type != ObjectType::Endpoint {
+                return SyscallResult::err(SyscallError::InvalidCapability);
+            }
+            if let Err(e) = validate_endpoint_cap(&cap, CapRights::RECV) {
+                return SyscallResult::err(e);
+            }
+
+            let timeout_ns = msg_info;
+
+            unsafe {
+                let irq = save_irq_disable();
+                SCHED_IPC_LOCK.lock();
+                let endpoint = &mut *(cap.object as *mut Endpoint);
+                let (msg, badge, result) = endpoint.recv_timeout(timeout_ns);
+                if result == 0 {
+                    write_msg_to_ipc_buffer(&msg, badge);
+                }
+                SCHED_IPC_LOCK.unlock();
+                restore_irq(irq);
+
+                if result == 0 {
+                    SyscallResult::ok(badge)
+                } else {
+                    SyscallResult::err(SyscallError::Cancelled)
+                }
             }
         }
     }

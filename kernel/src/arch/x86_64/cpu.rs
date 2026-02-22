@@ -21,8 +21,9 @@ pub const MAX_CPUS: usize = 16;
 /// Offset 16: saved_rsp (u64)
 /// Offset 24: fpu_owner (u64) — pointer to TCB that owns FPU state in hardware
 /// Offset 32: invoke_seq (u64) — per-CPU monotonic invoke counter for diagnostics
+/// Offset 40: stack_canary (u64) — per-CPU canary for syscall stack corruption detection
 ///
-/// Assembly accesses GS:0, GS:8, GS:16 only — offset 24+ is safe for Rust.
+/// Assembly accesses GS:0, GS:8, GS:16, GS:40 — offset 24+ is safe for Rust.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PerCpuData {
@@ -37,8 +38,11 @@ pub struct PerCpuData {
     /// Per-CPU monotonic sequence number incremented at every capability invocation.
     /// Used as a diagnostic correlation ID in kernel trace logs.
     pub invoke_seq: u64,
+    /// Per-CPU stack canary value for syscall stack overflow detection.
+    /// Seeded from RDSEED/RDRAND during BSP/AP init.
+    pub stack_canary: u64,
     /// Reserved for future use
-    _reserved: [u64; 11],
+    _reserved: [u64; 10],
 }
 
 /// Per-CPU data for each CPU
@@ -49,7 +53,8 @@ static mut PER_CPU_DATA: [PerCpuData; MAX_CPUS] = {
         saved_rsp: 0,
         fpu_owner: 0,
         invoke_seq: 0,
-        _reserved: [0; 11],
+        stack_canary: 0,
+        _reserved: [0; 10],
     };
     [INIT; MAX_CPUS]
 };
@@ -67,6 +72,9 @@ pub fn init_bsp() {
 
         PER_CPU_DATA[0].cpu_id = 0;
 
+        // Seed per-CPU stack canary from hardware RNG (RDSEED/RDRAND)
+        PER_CPU_DATA[0].stack_canary = init_stack_canary();
+
         {
             let s = crate::SerialGuard::acquire();
             s.puts("[CPU] PER_CPU_DATA addr: ");
@@ -82,6 +90,31 @@ pub fn init_bsp() {
 
         crate::serial_puts("[CPU] GS base set successfully\n");
     }
+}
+
+/// Initialize stack canary for an AP (Application Processor).
+///
+/// # Safety
+/// Must be called after GS base is set for this CPU.
+pub fn init_ap_canary(cpu_id: usize) {
+    unsafe {
+        PER_CPU_DATA[cpu_id].stack_canary = init_stack_canary();
+    }
+}
+
+/// Generate a per-CPU stack canary seed.
+/// Uses RDSEED (best), falls back to RDRAND, then TSC.
+fn init_stack_canary() -> u64 {
+    if let Some(val) = crate::rng::rdseed64() {
+        return val;
+    }
+    // Fallback: read TSC and mix with a constant
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nostack));
+    }
+    (((hi as u64) << 32) | (lo as u64)) ^ 0xDEAD_BEEF_CAFE_BABE
 }
 
 /// Get the current CPU ID

@@ -89,6 +89,20 @@ pub unsafe fn check_wakeups(now_ns: u64) -> usize {
                 (*tcb).futex_wakeup_result = 12; // SyscallError::Cancelled = timeout
             }
 
+            // If this thread was doing a timed IPC send/recv, remove it from
+            // the endpoint's wait queue and mark timeout result
+            if matches!(
+                (*tcb).blocked_reason,
+                Some(BlockedReason::SendTimedBlocked { .. }) | Some(BlockedReason::RecvTimedBlocked)
+            ) {
+                let ep = (*tcb).blocked_endpoint as *mut crate::ipc::Endpoint;
+                if !ep.is_null() {
+                    (*ep).remove_from_queue(tcb);
+                    (*tcb).blocked_endpoint = core::ptr::null_mut();
+                }
+                (*tcb).futex_wakeup_result = 12; // SyscallError::Cancelled = timeout
+            }
+
             (*tcb).state = ThreadState::Ready;
             (*tcb).blocked_reason = None;
             crate::sched::scheduler::scheduler().enqueue_unlocked(tcb);

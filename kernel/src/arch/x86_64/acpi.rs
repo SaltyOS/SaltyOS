@@ -432,6 +432,153 @@ unsafe fn parse_madt_entries(madt_phys: u64) -> Option<MadtInfo> {
     }
 }
 
+/// ACPI power management info extracted from FADT
+pub struct AcpiPowerInfo {
+    /// PM1a Control Block I/O port
+    pub pm1a_cnt_blk: u16,
+    /// PM1b Control Block I/O port (0 if not present)
+    pub pm1b_cnt_blk: u16,
+    /// SLP_TYPa value for S5 (deep power off)
+    pub slp_typ_s5: u16,
+    /// Whether the FADT was successfully parsed
+    pub valid: bool,
+}
+
+static mut ACPI_POWER: AcpiPowerInfo = AcpiPowerInfo {
+    pm1a_cnt_blk: 0,
+    pm1b_cnt_blk: 0,
+    slp_typ_s5: 0,
+    valid: false,
+};
+
+/// FADT (Fixed ACPI Description Table) — partial definition
+/// We only need fields up to pm1b_cnt_blk (offset 68 + 4 = 72 bytes)
+#[repr(C, packed)]
+struct Fadt {
+    header: SdtHeader,          // 0..36
+    firmware_ctrl: u32,         // 36
+    dsdt: u32,                  // 40
+    _reserved1: u8,             // 44
+    preferred_pm_profile: u8,   // 45
+    sci_int: u16,               // 46
+    smi_cmd: u32,               // 48
+    acpi_enable: u8,            // 52
+    acpi_disable: u8,           // 53
+    s4bios_req: u8,             // 54
+    pstate_cnt: u8,             // 55
+    pm1a_evt_blk: u32,          // 56
+    pm1b_evt_blk: u32,          // 60
+    pm1a_cnt_blk: u32,          // 64
+    pm1b_cnt_blk: u32,          // 68
+}
+
+/// Search XSDT (64-bit pointers) for the FADT table (signature "FACP")
+unsafe fn find_fadt_in_xsdt(xsdt_phys: u64) -> Option<u64> {
+    let xsdt_ptr: *const SdtHeader = phys_to_ptr(xsdt_phys);
+    let xsdt = unsafe { &*xsdt_ptr };
+
+    let header_size = core::mem::size_of::<SdtHeader>();
+    let entry_count = (xsdt.length as usize - header_size) / 8;
+    let entries_ptr = unsafe { (xsdt_ptr as *const u8).add(header_size) as *const u64 };
+
+    for i in 0..entry_count {
+        let table_phys = unsafe { core::ptr::read_unaligned(entries_ptr.add(i)) };
+        let table_hdr: *const SdtHeader = phys_to_ptr(table_phys);
+        let sig = unsafe { (*table_hdr).signature };
+        if &sig == b"FACP" {
+            return Some(table_phys);
+        }
+    }
+    None
+}
+
+/// Search RSDT (32-bit pointers) for the FADT table (signature "FACP")
+unsafe fn find_fadt_in_rsdt(rsdt_phys: u64) -> Option<u64> {
+    let rsdt_ptr: *const SdtHeader = phys_to_ptr(rsdt_phys);
+    let rsdt = unsafe { &*rsdt_ptr };
+
+    let header_size = core::mem::size_of::<SdtHeader>();
+    let entry_count = (rsdt.length as usize - header_size) / 4;
+    let entries_ptr = unsafe { (rsdt_ptr as *const u8).add(header_size) as *const u32 };
+
+    for i in 0..entry_count {
+        let table_phys = unsafe { core::ptr::read_unaligned(entries_ptr.add(i)) } as u64;
+        let table_hdr: *const SdtHeader = phys_to_ptr(table_phys);
+        let sig = unsafe { (*table_hdr).signature };
+        if &sig == b"FACP" {
+            return Some(table_phys);
+        }
+    }
+    None
+}
+
+/// Parse the FADT to extract PM1a/PM1b control block ports for shutdown.
+///
+/// # Safety
+/// `rsdp_phys` must be a valid physical address of the ACPI RSDP structure.
+pub unsafe fn parse_fadt(rsdp_phys: u64) {
+    if rsdp_phys == 0 {
+        return;
+    }
+
+    let rsdp_ptr: *const Rsdp = phys_to_ptr(rsdp_phys);
+    let rsdp = unsafe { &*rsdp_ptr };
+
+    if &rsdp.signature != b"RSD PTR " {
+        return;
+    }
+
+    let fadt_phys = if rsdp.revision >= 2 {
+        let rsdp2 = unsafe { &*(rsdp_ptr as *const Rsdp2) };
+        unsafe { find_fadt_in_xsdt(rsdp2.xsdt_address) }
+    } else {
+        unsafe { find_fadt_in_rsdt(rsdp.rsdt_address as u64) }
+    };
+
+    let fadt_phys = match fadt_phys {
+        Some(addr) => addr,
+        None => {
+            crate::serial_puts("[ACPI] FADT not found\n");
+            return;
+        }
+    };
+
+    let fadt_ptr: *const Fadt = phys_to_ptr(fadt_phys);
+    let fadt = unsafe { &*fadt_ptr };
+
+    // Validate minimum length
+    if (fadt.header.length as usize) < core::mem::size_of::<Fadt>() {
+        crate::serial_puts("[ACPI] FADT too short\n");
+        return;
+    }
+
+    let pm1a = fadt.pm1a_cnt_blk as u16;
+    let pm1b = fadt.pm1b_cnt_blk as u16;
+
+    unsafe {
+        ACPI_POWER.pm1a_cnt_blk = pm1a;
+        ACPI_POWER.pm1b_cnt_blk = pm1b;
+        // QEMU uses SLP_TYPa=0 for S5 on i440fx/Q35
+        ACPI_POWER.slp_typ_s5 = 0;
+        ACPI_POWER.valid = pm1a != 0;
+    }
+
+    {
+        let s = crate::SerialGuard::acquire();
+        s.puts("[ACPI] FADT parsed: PM1a_CNT=");
+        s.hex(pm1a as u64);
+        s.puts(" PM1b_CNT=");
+        s.hex(pm1b as u64);
+        s.putc(b'\n');
+    }
+}
+
+/// Get the parsed ACPI power management info.
+pub fn get_power_info() -> &'static AcpiPowerInfo {
+    // SAFETY: ACPI_POWER is only written during boot (single-threaded).
+    unsafe { &*(&raw const ACPI_POWER) }
+}
+
 /// Read the BSP's Local APIC ID from the APIC ID register
 unsafe fn read_bsp_apic_id() -> u8 {
     let apic_base = super::apic::LAPIC_BASE + PHYS_MAP_OFFSET;

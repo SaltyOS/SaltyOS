@@ -79,6 +79,16 @@ pub fn start_timer() {
     x86_64::start_timer();
 }
 
+/// Perform ACPI S5 shutdown (power off). Does not return.
+pub fn shutdown() -> ! {
+    #[cfg(target_arch = "x86_64")]
+    x86_64::shutdown();
+    #[cfg(not(target_arch = "x86_64"))]
+    loop {
+        halt();
+    }
+}
+
 /// Output byte to I/O port
 ///
 /// # Safety

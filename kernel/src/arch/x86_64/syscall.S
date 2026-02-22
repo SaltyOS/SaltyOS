@@ -11,6 +11,7 @@
 //! - Offset 4: padding
 //! - Offset 8: kernel_stack (u64)
 //! - Offset 16: saved_rsp (u64) — scratch only, NOT used for return
+//! - Offset 40: stack_canary (u64) — per-CPU canary for stack overflow detection
 //!
 //! CRITICAL: The user RSP is saved on the per-thread kernel stack, NOT in
 //! per-CPU data. This ensures it survives context switches when another
@@ -101,11 +102,19 @@ syscall_entry:
     # 7th argument (User R9) on stack for syscall_handle_rust.
     # User R9 was saved at RSP+64 (9th push from top). After sub $16,
     # it shifts to RSP+80. We use r10 as scratch (already remapped to r8).
+    # Layout: [rsp+0] = arg7, [rsp+8] = stack canary
     sub  $16, %rsp
     mov  80(%rsp), %r10
     mov  %r10, (%rsp)
+    mov  %gs:40, %r10
+    mov  %r10, 8(%rsp)
 
     call syscall_handle_rust
+
+    # Verify stack canary before returning to userspace
+    mov  8(%rsp), %r10
+    cmp  %r10, %gs:40
+    jne  .Lstack_corrupt
 
     add  $16, %rsp
 
@@ -204,5 +213,17 @@ syscall_entry:
     mov 64(%rsp), %r9
     mov 72(%rsp), %r10
     jmp .Lslowpath
+
+    # --------------------------------------------------------------------------
+    # Stack Canary Corruption Handler
+    # --------------------------------------------------------------------------
+.Lstack_corrupt:
+    lea  stack_canary_msg(%rip), %rdi
+    call kernel_panic
+
+.section .rodata
+stack_canary_msg:
+    .asciz "[PANIC] Kernel stack canary corrupted — buffer overflow detected"
+.section .text
 
 .size syscall_entry, . - syscall_entry

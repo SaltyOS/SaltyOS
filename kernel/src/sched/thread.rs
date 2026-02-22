@@ -75,6 +75,15 @@ pub enum BlockedReason {
     FutexBlocked,
     /// Blocked on futex wait with timeout (in both futex hash + sleep queue)
     FutexTimedBlocked,
+    /// Blocked on send with timeout (in both endpoint send queue + sleep queue)
+    SendTimedBlocked {
+        /// Message to send
+        msg: super::super::ipc::Message,
+        /// Badge (sender identity)
+        badge: u64,
+    },
+    /// Blocked on receive with timeout (in both endpoint recv queue + sleep queue)
+    RecvTimedBlocked,
 }
 
 /// Thread Control Block

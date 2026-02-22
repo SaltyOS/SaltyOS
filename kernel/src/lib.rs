@@ -416,3 +416,26 @@ fn panic(info: &PanicInfo) -> ! {
         arch::halt();
     }
 }
+
+/// C-callable panic function for assembly code.
+///
+/// # Safety
+/// `msg` must be a valid NUL-terminated C string pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kernel_panic(msg: *const u8) -> ! {
+    console::enable();
+    serial_puts_raw("\n!!! KERNEL PANIC !!!\n  ");
+    if !msg.is_null() {
+        unsafe {
+            let mut p = msg;
+            while *p != 0 {
+                serial_putc_hw(*p);
+                p = p.add(1);
+            }
+        }
+    }
+    serial_putc_hw(b'\n');
+    loop {
+        arch::halt();
+    }
+}

@@ -162,6 +162,12 @@ impl Endpoint {
                         self.state = EndpointState::Idle;
                     }
 
+                    // If receiver was timed, remove from sleep queue
+                    if matches!((*receiver).blocked_reason, Some(BlockedReason::RecvTimedBlocked)) {
+                        crate::sched::sleep_queue::remove(receiver);
+                        (*receiver).timer_wakeup_ns = 0;
+                    }
+
                     // Clear receiver's blocked markers BEFORE transfer_message:
                     // transfer_message may release SCHED_IPC_LOCK for cap transfer,
                     // during which notification.signal() could see stale RecvBlocked
@@ -209,6 +215,12 @@ impl Endpoint {
                     if let Some(receiver) = self.recv_queue.pop() {
                         if self.recv_queue.is_empty() {
                             self.state = EndpointState::Idle;
+                        }
+
+                        // If receiver was timed, remove from sleep queue
+                        if matches!((*receiver).blocked_reason, Some(BlockedReason::RecvTimedBlocked)) {
+                            crate::sched::sleep_queue::remove(receiver);
+                            (*receiver).timer_wakeup_ns = 0;
                         }
 
                         // Clear blocked markers before transfer_message (see send()).
@@ -272,6 +284,12 @@ impl Endpoint {
                     // whether sender should be kept blocked (fault/call) or woken
                     let (msg, badge, keep_blocked) = match (*sender).blocked_reason {
                         Some(BlockedReason::SendBlocked { msg, badge }) => (msg, badge, false),
+                        Some(BlockedReason::SendTimedBlocked { msg, badge }) => {
+                            // Remove timed sender from sleep queue
+                            crate::sched::sleep_queue::remove(sender);
+                            (*sender).timer_wakeup_ns = 0;
+                            (msg, badge, false)
+                        }
                         Some(BlockedReason::FaultBlocked { msg, badge }) => (msg, badge, true),
                         Some(BlockedReason::CallSendBlocked { msg, badge }) => (msg, badge, true),
                         _ => (Message::empty(), 0, false),
@@ -397,6 +415,12 @@ impl Endpoint {
                     // may release SCHED_IPC_LOCK, so the endpoint must be consistent.
                     if self.recv_queue.is_empty() {
                         self.state = EndpointState::Idle;
+                    }
+
+                    // If receiver was timed, remove from sleep queue
+                    if matches!((*receiver).blocked_reason, Some(BlockedReason::RecvTimedBlocked)) {
+                        crate::sched::sleep_queue::remove(receiver);
+                        (*receiver).timer_wakeup_ns = 0;
                     }
 
                     // Clear blocked markers before transfer_message (see send()).
@@ -679,6 +703,202 @@ impl Endpoint {
         self.state = state;
     }
 
+    /// Send with timeout (blocks until receiver ready or timeout expires).
+    ///
+    /// Returns 0 on success, `SyscallError::Cancelled` (12) on timeout.
+    /// Uses dual-queue pattern: thread is in both endpoint send queue and sleep queue.
+    pub fn send_timeout(&mut self, msg: &Message, badge: u64, timeout_ns: u64) -> u64 {
+        unsafe {
+            let current = get_scheduler().current();
+
+            match self.state {
+                EndpointState::RecvBlocked => {
+                    // FASTPATH: Receiver waiting - transfer immediately
+                    let receiver = match self.recv_queue.pop() {
+                        Some(r) => r,
+                        None => {
+                            self.state = EndpointState::Idle;
+                            // Fall through to slowpath below
+                            return self.send_timeout_slowpath(current, msg, badge, timeout_ns);
+                        }
+                    };
+
+                    if self.recv_queue.is_empty() {
+                        self.state = EndpointState::Idle;
+                    }
+
+                    // If receiver was timed, remove from sleep queue
+                    if matches!((*receiver).blocked_reason, Some(BlockedReason::RecvTimedBlocked)) {
+                        crate::sched::sleep_queue::remove(receiver);
+                        (*receiver).timer_wakeup_ns = 0;
+                    }
+
+                    (*receiver).blocked_reason = None;
+                    (*receiver).blocked_endpoint = core::ptr::null_mut();
+
+                    self.transfer_message(current, receiver, msg, badge);
+
+                    if (*receiver).state != ThreadState::Inactive {
+                        (*receiver).state = ThreadState::Ready;
+                        get_scheduler().enqueue(receiver);
+                    }
+                    0 // success
+                }
+                EndpointState::Idle | EndpointState::SendBlocked => {
+                    self.send_timeout_slowpath(current, msg, badge, timeout_ns)
+                }
+            }
+        }
+    }
+
+    /// Slowpath for send_timeout: block sender in dual queue.
+    unsafe fn send_timeout_slowpath(
+        &mut self,
+        current: *mut Tcb,
+        msg: &Message,
+        badge: u64,
+        timeout_ns: u64,
+    ) -> u64 {
+        unsafe {
+            self.send_queue.push(current);
+            self.state = EndpointState::SendBlocked;
+            (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
+            (*current).blocked_reason = Some(BlockedReason::SendTimedBlocked {
+                msg: *msg,
+                badge,
+            });
+            (*current).state = ThreadState::Blocked;
+            (*current).futex_wakeup_result = 0;
+
+            // Insert into sleep queue for timeout wakeup
+            let now_ns = crate::arch::now_ns();
+            let wakeup_ns = now_ns.saturating_add(timeout_ns);
+            get_scheduler().block_current_futex_timed(wakeup_ns);
+
+            // When we resume: check if we timed out
+            (*current).futex_wakeup_result
+        }
+    }
+
+    /// Receive with timeout (blocks until sender ready or timeout expires).
+    ///
+    /// Returns `(msg, badge, result)` where result is 0 on success or
+    /// `SyscallError::Cancelled` (12) on timeout.
+    pub fn recv_timeout(&mut self, timeout_ns: u64) -> (Message, u64, u64) {
+        unsafe {
+            let current = get_scheduler().current();
+            Endpoint::cache_receive_slot(current);
+
+            match self.state {
+                EndpointState::SendBlocked => {
+                    // FASTPATH: Sender waiting - transfer immediately
+                    let sender = match self.send_queue.pop() {
+                        Some(s) => s,
+                        None => {
+                            self.state = EndpointState::Idle;
+                            return self.recv_timeout_slowpath(current, timeout_ns);
+                        }
+                    };
+
+                    let (msg, badge, keep_blocked) = match (*sender).blocked_reason {
+                        Some(BlockedReason::SendBlocked { msg, badge }) => (msg, badge, false),
+                        Some(BlockedReason::SendTimedBlocked { msg, badge }) => {
+                            // Remove timed sender from sleep queue
+                            crate::sched::sleep_queue::remove(sender);
+                            (*sender).timer_wakeup_ns = 0;
+                            (msg, badge, false)
+                        }
+                        Some(BlockedReason::FaultBlocked { msg, badge }) => (msg, badge, true),
+                        Some(BlockedReason::CallSendBlocked { msg, badge }) => (msg, badge, true),
+                        _ => (Message::empty(), 0, false),
+                    };
+
+                    if self.send_queue.is_empty() {
+                        self.state = EndpointState::Idle;
+                    }
+
+                    self.transfer_message(sender, current, &msg, badge);
+
+                    if keep_blocked {
+                        (*current).reply_tcb = sender;
+                        (*current).reply_can_grant = !matches!(
+                            (*sender).blocked_reason,
+                            Some(BlockedReason::FaultBlocked { .. })
+                        );
+                        (*sender).blocked_endpoint = core::ptr::null_mut();
+                        if matches!(
+                            (*sender).blocked_reason,
+                            Some(BlockedReason::CallSendBlocked { .. })
+                        ) {
+                            (*sender).blocked_reason = Some(BlockedReason::ReplyWait {
+                                msg,
+                                badge,
+                            });
+                        }
+                    } else {
+                        (*sender).state = ThreadState::Ready;
+                        (*sender).blocked_reason = None;
+                        (*sender).blocked_endpoint = core::ptr::null_mut();
+                        get_scheduler().enqueue(sender);
+                    }
+
+                    (msg, badge, 0) // success
+                }
+                EndpointState::Idle | EndpointState::RecvBlocked => {
+                    // Drain queued async NBSend messages before blocking
+                    if let Some((msg, badge)) = self.dequeue_nbsend() {
+                        return (msg, badge, 0);
+                    }
+
+                    // Check bound notification
+                    if !(*current).bound_notification.is_null() {
+                        let ntfn = &mut *((*current).bound_notification
+                            as *mut super::Notification);
+                        let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
+                        if bits != 0 {
+                            return (Message::empty(), bits, 0);
+                        }
+                    }
+
+                    self.recv_timeout_slowpath(current, timeout_ns)
+                }
+            }
+        }
+    }
+
+    /// Slowpath for recv_timeout: block receiver in dual queue.
+    unsafe fn recv_timeout_slowpath(
+        &mut self,
+        current: *mut Tcb,
+        timeout_ns: u64,
+    ) -> (Message, u64, u64) {
+        unsafe {
+            self.recv_queue.push(current);
+            self.state = EndpointState::RecvBlocked;
+            (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
+            (*current).blocked_reason = Some(BlockedReason::RecvTimedBlocked);
+            (*current).state = ThreadState::Blocked;
+            (*current).futex_wakeup_result = 0;
+
+            // Insert into sleep queue for timeout wakeup
+            let now_ns = crate::arch::now_ns();
+            let wakeup_ns = now_ns.saturating_add(timeout_ns);
+            get_scheduler().block_current_futex_timed(wakeup_ns);
+
+            // When we resume: check result
+            let result = (*current).futex_wakeup_result;
+            if result != 0 {
+                // Timed out — return empty message
+                (Message::empty(), 0, result)
+            } else {
+                // Woken by sender — message is in saved_caller_*
+                let msg = (*current).saved_caller_msg;
+                let badge = (*current).saved_caller_badge;
+                (msg, badge, 0)
+            }
+        }
+    }
+
     /// Cleanup when endpoint is destroyed
     ///
     /// Wake all blocked threads with error.
@@ -692,6 +912,11 @@ impl Endpoint {
         unsafe {
             // Wake all blocked senders
             while let Some(sender) = self.send_queue.pop() {
+                // Remove timed senders from sleep queue
+                if matches!((*sender).blocked_reason, Some(BlockedReason::SendTimedBlocked { .. })) {
+                    crate::sched::sleep_queue::remove(sender);
+                    (*sender).timer_wakeup_ns = 0;
+                }
                 (*sender).state = ThreadState::Ready;
                 (*sender).blocked_reason = None;
                 (*sender).blocked_endpoint = core::ptr::null_mut();
@@ -700,6 +925,11 @@ impl Endpoint {
 
             // Wake all blocked receivers
             while let Some(receiver) = self.recv_queue.pop() {
+                // Remove timed receivers from sleep queue
+                if matches!((*receiver).blocked_reason, Some(BlockedReason::RecvTimedBlocked)) {
+                    crate::sched::sleep_queue::remove(receiver);
+                    (*receiver).timer_wakeup_ns = 0;
+                }
                 (*receiver).state = ThreadState::Ready;
                 (*receiver).blocked_reason = None;
                 (*receiver).blocked_endpoint = core::ptr::null_mut();

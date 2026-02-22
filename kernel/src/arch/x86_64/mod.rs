@@ -165,6 +165,9 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
         }
     };
 
+    // Parse ACPI FADT for shutdown support (before MADT — reuses same RSDP)
+    unsafe { acpi::parse_fadt(rsdp_addr); }
+
     // Parse ACPI MADT
     let madt_info = match unsafe { acpi::parse_madt(rsdp_addr) } {
         Some(info) => info,
@@ -254,6 +257,46 @@ pub unsafe fn inb(port: u16) -> u8 {
         );
     }
     value
+}
+
+/// Output 16-bit word to port
+#[inline(always)]
+pub unsafe fn outw(port: u16, value: u16) {
+    // SAFETY: Caller ensures port access is valid
+    unsafe {
+        core::arch::asm!(
+            "out dx, ax",
+            in("dx") port,
+            in("ax") value,
+            options(nomem, nostack)
+        );
+    }
+}
+
+/// Perform ACPI S5 shutdown (power off).
+///
+/// Writes SLP_EN | SLP_TYP to PM1a_CNT_BLK. Falls back to QEMU default
+/// port 0x604 if FADT was not parsed.
+pub fn shutdown() -> ! {
+    let power = acpi::get_power_info();
+    let port = if power.valid { power.pm1a_cnt_blk } else { 0x604 };
+    // SLP_EN (bit 13) | SLP_TYPa (bits 12:10)
+    let val: u16 = (power.slp_typ_s5 << 10) | (1 << 13);
+
+    crate::serial_puts("[SHUTDOWN] Powering off via ACPI S5\n");
+    cli();
+    // SAFETY: Writing to PM1a_CNT_BLK with SLP_EN triggers hardware power off.
+    unsafe { outw(port, val); }
+
+    // If PM1b is also present, write to it as well
+    if power.pm1b_cnt_blk != 0 {
+        unsafe { outw(power.pm1b_cnt_blk, val); }
+    }
+
+    // Should not reach here; loop halt as fallback
+    loop {
+        halt();
+    }
 }
 
 /// Allocate IST stacks for critical exceptions (called after mm::init)

@@ -31,6 +31,9 @@ pub const SYS_DEBUG_CONSOLE_CONTROL: u64 = 16;
 pub const SYS_SET_INVOKE_DEPTHS: u64 = 17;
 pub const SYS_FUTEX: u64 = 18;
 pub const SYS_GETRANDOM: u64 = 19;
+pub const SYS_SHUTDOWN: u64 = 20;
+pub const SYS_SEND_TIMED: u64 = 21;
+pub const SYS_RECV_TIMED: u64 = 22;
 
 /// Futex operation codes (arg1 of SYS_FUTEX)
 pub const FUTEX_WAIT: u64 = 0;

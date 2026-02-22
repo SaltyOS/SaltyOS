@@ -117,3 +117,48 @@ pub fn sys_getrandom() -> Option<u64> {
         None
     }
 }
+
+/// Trigger ACPI S5 power-off shutdown.
+///
+/// This syscall does not return on success. The system is powered off.
+#[inline]
+pub fn sys_shutdown() -> ! {
+    syscall(crate::consts::SYS_SHUTDOWN, 0, 0, 0, 0, 0, 0);
+    // Should never reach here; the kernel halts
+    loop {}
+}
+
+/// Send message to endpoint with timeout.
+///
+/// Returns 0 on success, `SALTY_CANCELLED` (12) on timeout.
+#[inline]
+pub fn sys_send_timed(cap: u64, msg_info: u64, mr0: u64, timeout_ns: u64) -> u64 {
+    syscall(
+        crate::consts::SYS_SEND_TIMED,
+        cap,
+        msg_info,
+        mr0,
+        timeout_ns,
+        0,
+        0,
+    )
+    .error
+}
+
+/// Receive message from endpoint with timeout.
+///
+/// Returns `SaltyResult` where:
+/// - `error == 0, value == badge` on success (message in IPC buffer)
+/// - `error == SALTY_CANCELLED` on timeout
+#[inline]
+pub fn sys_recv_timed(cap: u64, timeout_ns: u64) -> SaltyResult {
+    syscall(
+        crate::consts::SYS_RECV_TIMED,
+        cap,
+        timeout_ns,
+        0,
+        0,
+        0,
+        0,
+    )
+}
