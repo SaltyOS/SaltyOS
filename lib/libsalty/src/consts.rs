@@ -434,16 +434,17 @@ pub const MM_GET_CLIENT_STATS: u64 = 0x90;
 pub const POSIX_NS_REGISTER: u64 = 1;
 pub const POSIX_NS_LOOKUP: u64 = 2;
 
-// O_* flags
-pub const O_RDONLY: u64 = 0x0000;
-pub const O_WRONLY: u64 = 0x0001;
-pub const O_RDWR: u64 = 0x0002;
-pub const O_CREAT: u64 = 0x0040;
-pub const O_EXCL: u64 = 0x0080;
-pub const O_TRUNC: u64 = 0x0200;
-pub const O_APPEND: u64 = 0x0400;
-pub const O_NONBLOCK: u64 = 0x0800;
-pub const O_CLOEXEC: u64 = 0x80000;
+// O_* flags (POSIX: int → u32)
+pub const O_RDONLY: u32 = 0x0000;
+pub const O_WRONLY: u32 = 0x0001;
+pub const O_RDWR: u32 = 0x0002;
+pub const O_ACCMODE: u32 = 0x0003;
+pub const O_CREAT: u32 = 0x0040;
+pub const O_EXCL: u32 = 0x0080;
+pub const O_TRUNC: u32 = 0x0200;
+pub const O_APPEND: u32 = 0x0400;
+pub const O_NONBLOCK: u32 = 0x0800;
+pub const O_CLOEXEC: u32 = 0x80000;
 
 // SEEK_* constants
 pub const SEEK_SET: u64 = 0;

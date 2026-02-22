@@ -77,7 +77,6 @@ No `Cargo.toml` files — all Rust code is compiled via Meson with direct `rustc
 
 ### Build Gotchas
 
-- **`just distclean` is required** after adding/removing source files or editing any `meson.build`. The kernel `meson.build` auto-discovers `.rs` files via `find`, but the file list is only refreshed on `meson setup`.
 - **Clang is enforced.** The build fails with gcc. Do not suggest `cargo build`, `cargo test`, or create `Cargo.toml` files — this project does not use Cargo.
 - **Rust flags live in `meson.build`**, not `.cargo/config.toml`.
 - **Linker scripts:** `kernel/kernel.ld` (kernel), `lib/libsalty/libsalty.ld` (shared lib).
