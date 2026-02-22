@@ -55,7 +55,7 @@ Every kernel object is accessed through capabilities:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Fat Capability (128+ bits)               │
+│                   Fat Capability (256 bits / 32 bytes)       │
 ├─────────────────┬───────────────┬───────────────┬───────────┤
 │  Object Pointer │    Rights     │    Badge      │   Type    │
 │     (64 bits)   │   (32 bits)   │  (64 bits)    │  (8 bits) │
@@ -131,22 +131,31 @@ Three-level memory abstraction:
 | `cap/` | Capability management, CNode operations |
 | `ipc/` | Endpoints, Notifications, message transfer |
 | `sched/` | EDF scheduler, thread management |
-| `mm/` | VSpace, Frame allocation, Slab allocator |
+| `mm/` | Bitmap-based physical frame allocator (PMM), VSpace page table management with COW support |
 | `syscall/` | System call dispatch and handling |
 | `arch/` | Architecture-specific code (GDT, IDT, paging) |
 
 ### Userspace Components
 
-| Component | Responsibility | Status |
-|-----------|---------------|--------|
-| `init` | System initialization, server spawning | Implemented |
-| `console` | Serial console server (COM1 via IoPort caps) | Implemented |
-| `rtld` | Runtime dynamic linker (shared library loading) | Implemented |
-| `procmgr` | Process lifecycle, capability distribution | Implemented |
-| `vfs` | Virtual filesystem (ramfs + devfs + initrd) | Implemented |
-| `nameserv` | Service discovery (endpoint lookup) | Implemented |
-| `ports/` | Cross-compiled C programs (bash, FreeBSD utils) | Implemented |
-| `drivers/` | Device drivers (PCI, NVMe, USB, etc.) | Planned |
+Organized in a domain-based layout under `userland/`:
+
+| Component | Path | Responsibility | Status |
+|-----------|------|---------------|--------|
+| `init` | `core/init/` | System initialization, service-based multi-phase bootstrap | Implemented |
+| `rtld` | `core/rtld/` | Runtime dynamic linker (loads libsalty.so) | Implemented |
+| `mmsrv` | `core/mmsrv/` | Memory manager server (centralized frame allocation, VSpace mapping) | Implemented |
+| `procmgr` | `core/procmgr/` | Process manager (spawn/exit/waitpid/fork/exec) | Implemented |
+| `nameserv` | `core/nameserv/` | Service discovery (endpoint lookup) | Implemented |
+| `vfs` | `servers/vfs/` | Virtual filesystem (ramfs + devfs + Unix sockets + shm + poll + procfs + pipes) | Implemented |
+| `console` | `servers/console/` | Serial console server (IoPort cap for COM1, keyboard input) | Implemented |
+| `ttyd` | `servers/ttyd/` | PTY driver server (pseudo-terminal allocation, line discipline) | Implemented |
+| `getty` | `servers/getty/` | Terminal login service | Implemented |
+| `blkdrv` | `drivers/blkdrv/` | Block device driver (virtio-blk) | Implemented |
+| `pcisrv` | `drivers/pcisrv/` | PCI enumeration server | Implemented |
+| `display` | `drivers/display/` | Framebuffer display server | Implemented |
+| `saltyfs` | `fs/saltyfs/` | SaltyFS filesystem server (on-disk filesystem) | Implemented |
+| `test_runner` | `tests/test_runner/` | Automated test suite | Implemented |
+| `hello` | `tests/hello/` | Hello world test program | Implemented |
 
 ## Boot Sequence
 
@@ -213,7 +222,7 @@ Standard L4/seL4 uses inline capabilities (single word). We chose fat capabiliti
 - EDF scheduler with budget enforcement
 - Virtual memory management (VSpace map/unmap/MapPT)
 - IRQ handling via notifications with IRQHandler capabilities
-- I/O port capabilities (IoPort_In8/Out8/In16/Out16)
+- I/O port capabilities (IoPort_In8/Out8/In16/Out16/In32/Out32/Configure/Create)
 - POSIX signals via notification-based delivery
 - Debug syscalls (DebugPutChar, DebugDumpState)
 - 3-stage bootloader (BIOS and UEFI)
@@ -223,7 +232,7 @@ Standard L4/seL4 uses inline capabilities (single word). We chose fat capabiliti
 - Process manager (spawn, exit, waitpid)
 - VFS server (ramfs + devfs + initrd + Unix domain sockets + shared memory + poll)
 - Name service (endpoint lookup)
-- SMP support (ACPI MADT parser, AP trampoline, per-CPU queues, IPI reschedule)
+- SMP support (ACPI MADT parser, AP trampoline, global ready queue with affinity, IPI reschedule)
 - Userland and libsalty migrated from C to Rust
 - POSIX Phase 2 (GUI-ready): Unix domain sockets, poll/select, POSIX shared memory, fd passing
 - Ports system: C standard library (saltyc), portbuild tool, bash and FreeBSD utilities
@@ -233,9 +242,7 @@ Standard L4/seL4 uses inline capabilities (single word). We chose fat capabiliti
 1. **Formal Verification**: seL4-style proofs for critical paths
 2. **Nested Virtualization**: Hypervisor mode for VMs
 3. **Network Stack**: Userspace TCP/IP implementation
-4. **GUI Compositor**: Wayland-like display server (POSIX socket/shm prerequisites done)
-5. **Pipes and FIFOs**: pipe, pipe2, dup, mkfifo
-6. **Terminal Handling**: isatty, tcgetattr/tcsetattr, ioctl
+4. **GUI Compositor**: Wayland-like display server (POSIX socket/shm prerequisites done, framebuffer display server available)
 
 ## References
 

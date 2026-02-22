@@ -144,12 +144,19 @@ restore_irq(irq);
 | Module | Purpose |
 |--------|---------|
 | `lib.rs` | Entry (`kmain`), serial I/O, panic handler |
-| `arch/x86_64/` | GDT, IDT, APIC, paging, SMP (AP trampoline), per-CPU data |
-| `cap/` | CNode (4-16 bit slots), Untyped retype, CDT, IoPort caps |
-| `ipc/` | Endpoints (sync rendezvous), Notifications (async bitmap), IRQ routing |
-| `mm/` | VSpace (page tables, COW, VSpaceTracking), Frame allocator (bitmap PMM) |
-| `sched/` | EDF scheduler (per-CPU ready queues), TCB, context switch, sleep queue |
-| `syscall/` | 14 syscalls, capability invocation dispatch, IPC fastpath |
+| `bootinfo.rs` | Boot info TLV parsing |
+| `builtins.rs` | Compiler built-in stubs (memcpy, memset) |
+| `cpio.rs` | CPIO archive parser for initrd |
+| `elf.rs` | ELF binary loader |
+| `init.rs` | Init task bootstrap, CSpace setup |
+| `rng.rs` | RDRAND-based random number generator |
+| `arch/x86_64/` | GDT, IDT, APIC, ACPI, paging, SMP, CPUID, FPU, PIT, SMAP/SMEP |
+| `cap/` | CNode, Untyped retype, CDT, IoPort caps, refcounting |
+| `console/` | Kernel console output (serial + framebuffer) |
+| `ipc/` | Endpoints, Notifications, Futex, IRQ routing, IPC queue |
+| `mm/` | VSpace (page tables, COW, demand paging), Bitmap PMM |
+| `sched/` | EDF scheduler, TCB, PIP, sleep queue, context switch |
+| `syscall/` | 23 syscalls, capability invocation dispatch, IPC fastpath |
 
 **Key assembly files** in `kernel/src/arch/x86_64/`:
 - `syscall.S` — Syscall entry/exit via `syscall`/`sysretq`. User RSP is saved on the **per-thread kernel stack** (not per-CPU `%gs:16`) to prevent RSP corruption during context switches. IPC fastpath dispatch happens here (checks RAX==2 for Call, RAX==3 for ReplyRecv before slowpath).
@@ -176,14 +183,41 @@ Syscall instruction: `syscall` (not `int 0x80`). Number in `rax`, args in `rdi, 
 | 11 | DebugDumpState | Dump CPU state |
 | 12 | ClockGetTime | Read monotonic clock |
 | 13 | NanoSleep | Sleep for duration |
+| 14 | DebugPutStr | Write string to serial |
+| 15 | DebugPutBuf | Write buffer to serial |
+| 16 | DebugConsoleControl | Enable/disable kernel console |
+| 17 | SetInvokeDepths | Set CNode resolve depths |
+| 18 | Futex | Userspace futex (wait/wake/requeue) |
+| 19 | GetRandom | Get random bytes via RDRAND |
+| 20 | Shutdown | ACPI system shutdown |
+| 21 | SendTimed | Blocking send with timeout |
+| 22 | RecvTimed | Blocking receive with timeout |
 
 **Message info encoding** (seL4-style): bits 6:0 = length (0-127 MRs), bits 11:7 = extra caps, bits 51:12 = label. MR0-MR3 in registers, MR4-MR19 via IPC buffer.
 
-**Invoke labels** (defined in `lib/libsalty/src/consts.rs`): CNode ops `0x10-0x16`, Untyped `0x20`, SchedContext `0x30-0x34`, TCB `0x40-0x4B`, VSpace `0x50-0x53`, IRQ `0x60-0x63`, IoPort `0x70-0x73`.
+**Invoke labels** (defined in `lib/libsalty/src/consts.rs`): CNode ops `0x10-0x18`, Untyped `0x20`, SchedContext `0x30-0x31`, TCB `0x40-0x4D`, VSpace `0x50-0x5A`, IRQ `0x60-0x64`, IoPort `0x70-0x77`.
 
 ### Well-Known Capability Slots
 
-Set by kernel for init; inherited by child processes:
+**Kernel-side init slots** (set in `kernel/src/init.rs` for the init task):
+
+| Slot | Name | Description |
+|------|------|-------------|
+| 0 | CAP_SELF_TCB | Thread's own TCB |
+| 1 | CAP_SELF_VSPACE | Thread's page table root |
+| 2 | CAP_SELF_CSPACE | Thread's CNode root |
+| 6 | CAP_KBD_IOPORT | PS/2 keyboard I/O port |
+| 7 | CAP_KBD_IRQ | PS/2 keyboard IRQ handler |
+| 8 | CAP_COM1_IOPORT | COM1 serial I/O port |
+| 9 | CAP_COM1_IRQ | COM1 IRQ handler |
+| 10 | CAP_COM1_NOTIFICATION | COM1 IRQ notification |
+| 11 | CAP_IRQ_CONTROL | IRQ control (dynamic IoPort creation) |
+| 12 | CAP_INITRD_UNTYPED | Initrd device untyped |
+| 13 | CAP_FB_UNTYPED | Framebuffer device untyped |
+| 15 | CAP_PCI_IOPORT | PCI config space I/O port |
+| 16+ | CAP_UNTYPED_START | Untyped memory capabilities |
+
+**Userland child convention** (defined in `lib/libsalty/src/consts.rs`, set by procmgr):
 
 | Slot | Name | Description |
 |------|------|-------------|
@@ -196,6 +230,7 @@ Set by kernel for init; inherited by child processes:
 | 7 | CAP_MMSRV_EP | Memory manager server endpoint |
 | 8 | CAP_COM1_IOPORT | Serial port I/O port |
 | 11 | CAP_CONSOLE_EP | Console server endpoint |
+| 15 | CAP_PCI_IOPORT | PCI config space I/O port |
 | 16+ | CAP_UNTYPED_START | Untyped memory capabilities |
 
 ### Bootloader (C/ASM, `boot/`)
@@ -209,16 +244,24 @@ Include paths are relative to `boot/` root (Meson `-I` flag). Files in `stage3/a
 
 ### Userland (Rust, `userland/`)
 
-| Program | Role |
-|---------|------|
-| `init` | First process — service-based multi-phase bootstrap |
-| `rtld` | Runtime dynamic linker (loads libsalty.so) |
-| `console` | Serial console server (IoPort cap for COM1) |
-| `mmsrv` | Memory manager server (centralized frame allocation, VSpace mapping) |
-| `procmgr` | Process manager (spawn/exit/waitpid) |
-| `vfs` | Virtual filesystem server (ramfs + devfs + Unix sockets + shm + poll) |
-| `nameserv` | Name service (endpoint lookup) |
-| `test_runner` | Automated test suite (hello, fs, mmap, fork, signal, socket, pipe, time) |
+Domain-based layout with programs organized by function:
+
+| Program | Path | Role |
+|---------|------|------|
+| `init` | `core/init` | First process — service-based multi-phase bootstrap |
+| `rtld` | `core/rtld` | Runtime dynamic linker (loads libsalty.so) |
+| `mmsrv` | `core/mmsrv` | Memory manager server (centralized frame allocation, VSpace mapping) |
+| `procmgr` | `core/procmgr` | Process manager (spawn/exit/waitpid) |
+| `nameserv` | `core/nameserv` | Name service (endpoint lookup) |
+| `vfs` | `servers/vfs` | Virtual filesystem server (ramfs + devfs + Unix sockets + shm + poll) |
+| `console` | `servers/console` | Serial console server (IoPort cap for COM1) |
+| `ttyd` | `servers/ttyd` | TTY daemon |
+| `getty` | `servers/getty` | Getty (login prompt) |
+| `blkdrv` | `drivers/blkdrv` | Block device driver (virtio) |
+| `pcisrv` | `drivers/pcisrv` | PCI server |
+| `display` | `drivers/display` | Display driver |
+| `saltyfs` | `fs/saltyfs` | SaltyFS filesystem server |
+| `test_runner` | `tests/test_runner` | Automated test suite (hello, fs, mmap, fork, signal, socket, pipe, time) |
 
 **Service-based bootstrap**: Init reads `.service` files from `userland/services/` in the initrd to determine boot order and dependencies. Each `.service` file declares `[Service]` (name, binary, type, restart policy) and `[Dependencies]` (After/Before ordering).
 
@@ -234,9 +277,17 @@ Key modules:
 - `syscall.rs` — Raw syscall wrappers (inline asm)
 - `ipc.rs` — IPC wrappers (call, send, recv, reply_recv)
 - `invoke.rs` — Capability invocation helpers (CNode/Untyped/TCB/VSpace/IRQ/IoPort ops)
-- `posix.rs` / `posix_mm.rs` — POSIX compatibility (file I/O, fork, exec, sockets, poll, shm, mmap)
+- `posix/` — POSIX compatibility directory with submodules: `at`, `file`, `misc`, `pipe`, `poll`, `proc`, `socket`
+- `posix_mm.rs` — POSIX memory management (mmap, shm)
 - `signals.rs` — POSIX signal delivery via notifications
 - `cpio.rs` / `elf_loader.rs` / `elf_dynamic.rs` — CPIO parsing, ELF loading, dynamic linking support
+- `framebuffer.rs` — Framebuffer access
+- `layout.rs` — Memory layout definitions
+- `serial.rs` — Serial port I/O
+- `slot_alloc.rs` — Capability slot allocator
+- `pthread.rs` — POSIX threads support
+- `sync.rs` — Synchronization primitives (Mutex, RWLock, Semaphore)
+- `tls.rs` — Thread-local storage
 - `fork.S` — Fork assembly stub
 
 ## Rust 2024 Edition
@@ -314,7 +365,7 @@ Format: `<type>(<scope>): <subject>` (scope is optional for cross-cutting change
 
 **Types:** `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `perf`
 
-**Scopes:** `kernel`, `boot`, `ipc`, `sched`, `cap`, `mm`, `vspace`, `syscall`, `libsalty`, `init`, `procmgr`, `vfs`, `console`, `nameserv`, `test_runner`
+**Scopes:** `kernel`, `boot`, `ipc`, `sched`, `cap`, `mm`, `vspace`, `syscall`, `libsalty`, `init`, `procmgr`, `vfs`, `console`, `nameserv`, `test_runner`, `mmsrv`, `rtld`, `ttyd`, `getty`, `blkdrv`, `pcisrv`, `display`, `saltyfs`
 
 Examples:
 ```

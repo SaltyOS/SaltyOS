@@ -55,6 +55,13 @@ syscall_invoke:
 | 13 | `NanoSleep` | Sleep for specified duration |
 | 14 | `DebugPutStr` | Debug string output (development only) |
 | 15 | `DebugPutBuf` | Debug buffer output (development only) |
+| 16 | `DebugConsoleControl` | Enable/disable kernel console (development only) |
+| 17 | `SetInvokeDepths` | Set CNode resolve depths for invoke |
+| 18 | `Futex` | Userspace futex operations |
+| 19 | `GetRandom` | Get random bytes via RDRAND |
+| 20 | `Shutdown` | ACPI system shutdown |
+| 21 | `SendTimed` | Blocking send with timeout |
+| 22 | `RecvTimed` | Blocking receive with timeout |
 
 ## Message Info Word Format
 
@@ -384,6 +391,163 @@ long sys_debug_putbuf(
 );
 ```
 
+### DebugConsoleControl (16)
+
+Enable or disable the kernel debug console. Development use only.
+
+```c
+long sys_debug_console_control(
+    uint64_t enable     // RDI: 1 = enable, 0 = disable
+);
+```
+
+**Arguments:**
+- `enable`: Non-zero to enable kernel console output, zero to disable
+
+**Returns:**
+- `0`: Success
+
+---
+
+### SetInvokeDepths (17)
+
+Set CNode resolve depths for subsequent invoke operations.
+
+```c
+long sys_set_invoke_depths(
+    uint64_t src_depth,  // RDI: Source CNode resolve depth
+    uint64_t dst_depth   // RSI: Destination CNode resolve depth
+);
+```
+
+**Arguments:**
+- `src_depth`: Bit depth for resolving the source CNode capability
+- `dst_depth`: Bit depth for resolving the destination CNode capability
+
+**Returns:**
+- `0`: Success
+- `4` (InvalidArgument): Depth out of valid range
+
+---
+
+### Futex (18)
+
+Userspace futex operations for synchronization primitives.
+
+```c
+long sys_futex(
+    uint64_t *addr,      // RDI: Pointer to futex word
+    uint64_t op,         // RSI: Operation (0=wait, 1=wake, 2=wait_timeout)
+    uint64_t val,        // RDX: Expected value (wait) or count (wake)
+    uint64_t timeout_ns  // R10: Timeout in nanoseconds (wait_timeout only)
+);
+```
+
+**Arguments:**
+- `addr`: Pointer to a 64-bit futex word in user memory
+- `op`: Operation code:
+  - `0` (FUTEX_WAIT): Block if `*addr == val`
+  - `1` (FUTEX_WAKE): Wake up to `val` waiters
+  - `2` (FUTEX_WAIT_TIMEOUT): Block if `*addr == val`, with timeout
+- `val`: Expected value for wait operations, or number of threads to wake
+- `timeout_ns`: Timeout in nanoseconds (only for op=2)
+
+**Returns:**
+- RAX = `0`: Success (wait completed or threads woken)
+- RAX = `9` (WouldBlock): `*addr != val` at time of check (wait operations)
+- RAX = `4` (InvalidArgument): Invalid operation code
+- RAX = `10` (BadAddress): Invalid futex address
+- RAX = `12` (Cancelled): Wait timed out (op=2)
+
+---
+
+### GetRandom (19)
+
+Return a hardware random 64-bit value via the RDRAND instruction.
+
+```c
+uint64_t sys_getrandom(void);
+```
+
+**Arguments:** None.
+
+**Returns:**
+- RAX = `0`, RDX = random 64-bit value
+- RAX = `2` (InvalidOperation): RDRAND instruction unavailable
+
+---
+
+### Shutdown (20)
+
+Initiate ACPI system shutdown. This powers off the machine.
+
+```c
+long sys_shutdown(void);
+```
+
+**Returns:**
+- Does not return on success (system powers off)
+- RAX = `2` (InvalidOperation): ACPI shutdown not available
+
+---
+
+### SendTimed (21)
+
+Blocking send with a timeout.
+
+```c
+long sys_send_timed(
+    cap_t endpoint,      // RDI: Endpoint capability
+    uint64_t msg_info,   // RSI: Message info word
+    uint64_t mr0,        // RDX: Message register 0
+    uint64_t timeout_ns  // R10: Timeout in nanoseconds
+);
+```
+
+**Arguments:**
+- `endpoint`: Capability to endpoint (must have SEND right)
+- `msg_info`: Packed message info (label, length, extra_caps)
+- `mr0`: First message register
+- `timeout_ns`: Maximum time to wait for a receiver, in nanoseconds
+
+**Returns:**
+- `0`: Success (message delivered)
+- `1` (InvalidCapability): Invalid capability
+- `3` (InsufficientRights): Missing SEND right
+- `12` (Cancelled): Timeout expired before a receiver arrived
+
+**Behavior:**
+- Like Send, but returns with `Cancelled` if no receiver arrives within the timeout
+- If timeout_ns is 0, behaves like NBSend
+
+---
+
+### RecvTimed (22)
+
+Blocking receive with a timeout.
+
+```c
+long sys_recv_timed(
+    cap_t endpoint,      // RDI: Endpoint capability
+    uint64_t timeout_ns  // RSI: Timeout in nanoseconds
+);
+```
+
+**Arguments:**
+- `endpoint`: Capability to endpoint (must have RECV right)
+- `timeout_ns`: Maximum time to wait for a sender, in nanoseconds
+
+**Returns:**
+- RAX = `0`: Success, badge in RDX (sender badge; message written to IPC buffer)
+- RAX = `1` (InvalidCapability): Invalid capability
+- RAX = `12` (Cancelled): Timeout expired before a sender arrived
+
+**Behavior:**
+- Like Recv, but returns with `Cancelled` if no sender arrives within the timeout
+- On success, the message is written to the thread's IPC buffer and the sender badge is returned in RDX
+
+---
+
 ## Capability Operations
 
 ### TCB Invocations
@@ -402,6 +566,8 @@ long sys_debug_putbuf(
 | 0x49 | `TCB_BindNotification` | Bind notification for combined wait |
 | 0x4A | `TCB_UnbindNotification` | Unbind notification |
 | 0x4B | `TCB_SetFaultHandler` | Set fault handler endpoint |
+| 0x4C | `TCB_CopyFpu` | Copy FPU state between TCBs |
+| 0x4D | `TCB_SetTlsBase` | Set thread-local storage base |
 
 #### TCB_Configure (0x40)
 
@@ -483,6 +649,26 @@ arg0 = fault_ep_cap_ptr  (capability pointer to Endpoint)
 
 The fault endpoint must be an Endpoint capability. Set to 0 to clear the fault handler.
 
+#### TCB_CopyFpu (0x4C)
+
+Copy FPU/SSE state from one TCB to another. Used during fork to duplicate floating-point context.
+
+```
+arg0 = src_tcb_cap_ptr  (capability pointer to source TCB)
+```
+
+Copies the full FXSAVE/XSAVE area from the source TCB to the invoked TCB. Both TCBs must not be Running. Requires WRITE right on destination and READ right on source.
+
+#### TCB_SetTlsBase (0x4D)
+
+Set the thread-local storage base address (FS base register) for a thread.
+
+```
+arg0 = tls_base          (virtual address for FS base)
+```
+
+Sets the FS segment base for the target thread. Takes effect on next context switch to the thread. Requires WRITE right.
+
 ---
 
 ### CNode Invocations
@@ -496,6 +682,8 @@ The fault endpoint must be an Endpoint capability. Set to 0 to clear the fault h
 | 0x14 | `CNode_Delete` | Delete single capability |
 | 0x15 | `CNode_Revoke` | Revoke capability and all descendants |
 | 0x16 | `CNode_SaveCaller` | Save reply capability to slot |
+| 0x17 | `CNode_SetGuard` | Set CNode guard bits |
+| 0x18 | `CNode_GetInfo` | Get CNode metadata |
 
 #### CNode_Copy (0x10)
 
@@ -587,6 +775,30 @@ Save the current thread's reply capability into a CNode slot. This enables defer
 
 The reply capability is one-shot and is cleared from the current thread's TCB.
 
+#### CNode_SetGuard (0x17)
+
+Set the guard bits for a CNode. Guards allow multiple CNodes to be composed into a multi-level CSpace via guarded page-table-like lookup.
+
+```
+  cap_ptr (RDI) - CNode capability (invoked)
+  label   (RSI) - 0x17 (CNode_SetGuard)
+  arg0    (RDX) - Guard value (bits to match during CSpace lookup)
+  arg1    (R10) - Guard size in bits (0 = no guard)
+```
+
+Requires WRITE right. Returns `InvalidArgument` if guard size exceeds maximum.
+
+#### CNode_GetInfo (0x18)
+
+Query CNode metadata (size, guard, depth).
+
+```
+  cap_ptr (RDI) - CNode capability (invoked)
+  label   (RSI) - 0x18 (CNode_GetInfo)
+```
+
+**Returns:** CNode size bits in RDX. Requires READ right.
+
 ---
 
 ### VSpace Invocations
@@ -596,6 +808,14 @@ The reply capability is one-shot and is cleared from the current thread's TCB.
 | 0x50 | `VSpace_Map` | Map frame into VSpace |
 | 0x51 | `VSpace_Unmap` | Unmap page |
 | 0x52 | `VSpace_MapPT` | Install page table at specific level |
+| 0x53 | `VSpace_Walk` | Walk page tables, return mapping info |
+| 0x54 | `VSpace_CopyPage` | Copy page content between VSpaces |
+| 0x55 | `VSpace_MapDevice` | Map device memory (uncacheable) |
+| 0x56 | `VSpace_CloneCowPage` | Clone page with COW semantics |
+| 0x57 | `VSpace_MapDeviceRange` | Batch device mapping |
+| 0x58 | `VSpace_Protect` | Change page protection flags |
+| 0x59 | `VSpace_MapDemand` | Map demand-paged region |
+| 0x5A | `VSpace_MapDemandRange` | Batch demand-page mapping |
 
 #### VSpace_Map (0x50)
 
@@ -613,6 +833,7 @@ arg2 = flags_bits      (see flags below)
 | 2 | executable | Page is executable (NX cleared) |
 | 3 | cache_disable | PCD: disable caching (for MMIO) |
 | 4 | write_through | PWT: write-through caching |
+| 5 | cow | Copy-on-write: page is shared read-only until written |
 
 #### VSpace_MapPT (0x52)
 
@@ -625,6 +846,98 @@ arg2 = level           (1=PT, 2=PD, 3=PDPT)
 ```
 
 The frame is zeroed and installed as a page table at the specified level. Returns `AlreadyExists` if an entry already exists at that level.
+
+#### VSpace_Walk (0x53)
+
+Walk the page tables and return mapping information for a virtual address.
+
+```
+arg0 = virt_addr       (virtual address to query)
+```
+
+**Returns:** Physical address and flags in RDX if mapped, or `NotFound` if the address is not mapped. Requires READ right.
+
+#### VSpace_CopyPage (0x54)
+
+Copy page content from one VSpace to another.
+
+```
+arg0 = src_vspace_cap  (capability pointer to source VSpace)
+arg1 = src_vaddr       (source virtual address)
+arg2 = dst_vaddr       (destination virtual address in invoked VSpace)
+```
+
+Copies the contents of one 4KB page to another. Both pages must be mapped. Requires WRITE right on destination VSpace and READ right on source VSpace.
+
+#### VSpace_MapDevice (0x55)
+
+Map device memory (MMIO) with uncacheable attributes.
+
+```
+arg0 = frame_cap_ptr   (capability pointer to frame)
+arg1 = virt_addr       (virtual address to map at)
+arg2 = flags_bits      (flags with cache_disable forced on)
+```
+
+Like VSpace_Map but forces PCD (cache disable) and PWT (write-through) flags, suitable for memory-mapped I/O regions.
+
+#### VSpace_CloneCowPage (0x56)
+
+Clone a page with copy-on-write semantics.
+
+```
+arg0 = src_vaddr       (source virtual address)
+arg1 = dst_vspace_cap  (capability pointer to destination VSpace)
+arg2 = dst_vaddr       (destination virtual address)
+```
+
+Maps the same physical frame into the destination VSpace as read-only with the COW flag set. A write fault on either mapping triggers a copy.
+
+#### VSpace_MapDeviceRange (0x57)
+
+Batch device memory mapping for contiguous MMIO regions.
+
+```
+arg0 = frame_cap_ptr   (capability pointer to first frame)
+arg1 = virt_addr       (starting virtual address)
+arg2 = num_pages       (number of 4KB pages to map)
+```
+
+Maps `num_pages` contiguous frames starting at `frame_cap_ptr` with device (uncacheable) attributes.
+
+#### VSpace_Protect (0x58)
+
+Change protection flags on an existing page mapping.
+
+```
+arg0 = virt_addr       (virtual address of mapped page)
+arg1 = new_flags       (new flags bits, same format as VSpace_Map)
+```
+
+Updates the page table entry flags without remapping. Requires WRITE right. Returns `NotFound` if the page is not mapped.
+
+#### VSpace_MapDemand (0x59)
+
+Map a demand-paged region. The physical frame is not allocated until first access.
+
+```
+arg0 = virt_addr       (virtual address to map)
+arg1 = flags_bits      (flags for the eventual mapping)
+```
+
+Creates a page table entry that triggers a page fault on first access. The fault handler (mmsrv) allocates a frame and completes the mapping.
+
+#### VSpace_MapDemandRange (0x5A)
+
+Batch demand-page mapping for contiguous virtual regions.
+
+```
+arg0 = virt_addr       (starting virtual address)
+arg1 = num_pages       (number of 4KB pages)
+arg2 = flags_bits      (flags for the eventual mappings)
+```
+
+Like VSpace_MapDemand but for a contiguous range of pages.
 
 ---
 
@@ -693,6 +1006,7 @@ Query cumulative consumed time (in ticks) for this scheduling context.
 | 0x61 | `IRQHandler_Ack` | Acknowledge IRQ (re-enable delivery) |
 | 0x62 | `IRQHandler_SetNotification` | Bind notification to IRQ |
 | 0x63 | `IRQHandler_Clear` | Unbind notification from IRQ |
+| 0x64 | `Device_UntypedCreate` | Create device untyped from MMIO physical address |
 
 #### IRQControl_Get (0x60)
 
@@ -722,6 +1036,24 @@ arg0 = ntfn_cap_ptr  (capability pointer to Notification)
 
 Unbind the notification from the IRQ handler.
 
+#### Device_UntypedCreate (0x64)
+
+Create a device untyped capability covering a physical MMIO address range. Used to grant userspace drivers access to device memory regions.
+
+```
+arg0 = phys_addr       (physical base address of device MMIO region)
+arg1 = size_bits       (log2 of region size, e.g., 12 for 4KB)
+arg2 = dest_cnode_cap  (capability pointer to destination CNode)
+arg3 = dest_slot       (destination slot index within destination CNode)
+```
+
+**Returns:**
+- `0`: Success, device untyped capability placed in dest_slot
+- `4` (InvalidArgument): Invalid size_bits or unaligned address
+- `8` (AlreadyExists): Destination slot is occupied
+
+The resulting untyped capability can be retyped into Frame objects for device memory mapping.
+
 ---
 
 ### IoPort Invocations
@@ -734,6 +1066,10 @@ I/O port capabilities provide controlled access to x86 I/O ports. Each IoPort ca
 | 0x71 | `IoPort_Out8` | Write 8-bit value to port |
 | 0x72 | `IoPort_In16` | Read 16-bit value from port |
 | 0x73 | `IoPort_Out16` | Write 16-bit value to port |
+| 0x74 | `IoPort_In32` | Read 32-bit value from port |
+| 0x75 | `IoPort_Out32` | Write 32-bit value to port |
+| 0x76 | `IoPort_Configure` | Configure port range |
+| 0x77 | `IoPort_Create` | Create new IoPort capability |
 
 #### IoPort_In8 (0x70)
 
@@ -777,6 +1113,53 @@ arg1 = value         (16-bit value to write)
 
 Requires WRITE right.
 
+#### IoPort_In32 (0x74)
+
+Read a 32-bit value from an I/O port.
+
+```
+arg0 = offset        (port offset within the IoPort range)
+```
+
+**Returns:** Value in RDX. Requires READ right.
+
+#### IoPort_Out32 (0x75)
+
+Write a 32-bit value to an I/O port.
+
+```
+arg0 = offset        (port offset within the IoPort range)
+arg1 = value         (32-bit value to write)
+```
+
+Requires WRITE right.
+
+#### IoPort_Configure (0x76)
+
+Configure the port range covered by an IoPort capability.
+
+```
+arg0 = base_port     (starting I/O port number)
+arg1 = size          (number of ports in range)
+```
+
+Requires WRITE right. Returns `InvalidArgument` if the port range is invalid or exceeds 0xFFFF.
+
+#### IoPort_Create (0x77)
+
+Create a new IoPort capability for a specified port range.
+
+```
+arg0 = base_port     (starting I/O port number)
+arg1 = size          (number of ports in range)
+arg2 = dest_slot     (destination slot index in current CSpace)
+```
+
+**Returns:**
+- `0`: Success, IoPort capability placed in dest_slot
+- `4` (InvalidArgument): Invalid port range
+- `8` (AlreadyExists): Destination slot is occupied
+
 ---
 
 ## Error Codes
@@ -806,13 +1189,13 @@ SaltyOS uses positive error codes (returned in RAX).
 ```
 Offset  Size   Field
 ──────  ─────  ─────────────────
-0x000   160    msg[20] — Message registers MR0-MR19
-0x0A0   8      badge — Received sender badge
-0x0A8   32     caps[4] — Capability slots to transfer (sender-side)
-0x0C8   8      receive_cnode — CNode cap for receiving caps
-0x0D0   8      receive_index — Starting slot index in receive CNode
-0x0D8   8      receive_depth — CNode depth for cap lookup
-0x0E0   3840   reserved[480] — Reserved for future use
+0x000   176    msg[22] — Message buffer (label, length, MR0-MR19)
+0x0B0   8      badge — Received sender badge
+0x0B8   32     caps[4] — Capability slots to transfer (sender-side)
+0x0D8   8      receive_cnode — CNode cap for receiving caps
+0x0E0   8      receive_index — Starting slot index in receive CNode
+0x0E8   8      receive_depth — CNode depth for cap lookup
+0x0F0   3824   reserved[478] — Reserved for future use
 ──────  ─────  ─────────────────
 Total:  4096   (one 4KB page)
 ```

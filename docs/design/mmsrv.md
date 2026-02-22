@@ -76,7 +76,7 @@ Set by init in `spawn.rs`:
 
 ## 3. IPC Protocol
 
-### Message Labels (0x80-0x8D Range)
+### Message Labels (0x80-0x90 Range)
 
 Defined in `lib/libsalty/src/consts.rs`:
 
@@ -96,6 +96,9 @@ Defined in `lib/libsalty/src/consts.rs`:
 | 0x8B | `MM_SHM_MAP` | vfs | Map SHM into client VSpace |
 | 0x8C | `MM_SHM_UNMAP` | vfs | Unmap SHM from client VSpace |
 | 0x8D | `MM_FORK_REGIONS` | procmgr | Clone parent's region state to child |
+| 0x8E | `MM_ALLOC_THREAD_OBJECTS` | procmgr | Allocate TCB + SchedContext for new thread |
+| 0x8F | `MM_FREE_THREAD_OBJECTS` | procmgr | Free thread objects on exit |
+| 0x90 | `MM_GET_CLIENT_STATS` | any | Query per-client memory usage |
 
 ### Message Layouts
 
