@@ -2658,9 +2658,10 @@ fn syscall_vspace_map_demand_range(
 fn syscall_irq_control_get(
     cap: &Capability,
     irq_num: u64,
-    _dest_cnode_cap: u64,
-    _dest_slot: u64,
+    dest_cnode_cap: u64,
+    dest_slot: u64,
 ) -> SyscallResult {
+    // Require IrqHandler type with CONFIGURE rights (acts as IrqControl)
     if let Err(e) = validate_capability(cap, ObjectType::IrqHandler, CapRights::CONFIGURE) {
         return SyscallResult::err(e);
     }
@@ -2669,14 +2670,26 @@ fn syscall_irq_control_get(
         return SyscallResult::err(SyscallError::OutOfRange);
     }
 
-    // IRQ handler mutation under SCHED_IPC_LOCK
+    // Look up destination CNode
+    let dest_cap = match lookup_cap_locked(dest_cnode_cap) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(&dest_cap, ObjectType::CNode, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    // Allocate a new IrqHandler from the dynamic pool
+    let handler_ptr = match crate::init::alloc_dynamic_irq_handler(irq_num as u32) {
+        Some(ptr) => ptr,
+        None => return SyscallResult::err(SyscallError::OutOfMemory),
+    };
+
+    // Register in global IRQ table under SCHED_IPC_LOCK
     unsafe {
         let irq = save_irq_disable();
         SCHED_IPC_LOCK.lock();
-        let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
-        irq_handler.irq_num = irq_num as u32;
-
-        if !crate::ipc::irq::register_handler(irq_num as usize, irq_handler as *mut _) {
+        if !crate::ipc::irq::register_handler(irq_num as usize, handler_ptr) {
             SCHED_IPC_LOCK.unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::AlreadyExists);
@@ -2687,6 +2700,26 @@ fn syscall_irq_control_get(
 
     // Dynamically unmask the IOAPIC redirection entry for this IRQ
     crate::arch::ioapic_unmask(irq_num as u32);
+
+    // Allocate a cap slot and set it up
+    let slot = match crate::cap::alloc_slot() {
+        Some(s) => s,
+        None => return SyscallResult::err(SyscallError::OutOfMemory),
+    };
+    let new_cap = crate::cap::get_cap_mut(slot);
+    new_cap.object = handler_ptr as *mut crate::cap::KernelObject;
+    new_cap.obj_type = ObjectType::IrqHandler;
+    new_cap.rights = crate::cap::CapRights::ALL;
+    new_cap.depth = 0;
+    new_cap.badge = 0;
+
+    // Insert into destination CNode
+    unsafe {
+        let dest_cnode = &mut *(dest_cap.object as *mut CNode);
+        if let Err(_) = dest_cnode.insert_ref(dest_slot as usize, crate::cap::CapRef { slot }) {
+            return SyscallResult::err(SyscallError::AlreadyExists);
+        }
+    }
 
     SyscallResult::ok(0)
 }

@@ -61,6 +61,7 @@ struct PciDevice {
     bar_sizes: [u32; 6],
     ioport_slots: [u64; 6],
     devut_slots: [u64; 6],
+    irq_handler_slot: u64,
     active: bool,
 }
 
@@ -79,6 +80,7 @@ impl PciDevice {
             bar_sizes: [0; 6],
             ioport_slots: [0; 6],
             devut_slots: [0; 6],
+            irq_handler_slot: 0,
             active: false,
         }
     }
@@ -235,6 +237,19 @@ fn scan_bus() {
                         }
                     }
                 }
+
+                // Create IRQ handler cap for devices with valid IRQ lines
+                if irq_line != 0 && irq_line != 0xFF {
+                    let slot = *(&raw const NEXT_CAP_SLOT);
+                    *(&raw mut NEXT_CAP_SLOT) = slot + 1;
+                    let err = invoke::irq_control_get(
+                        CAP_IRQ_CONTROL, irq_line as u64,
+                        CAP_SELF_CSPACE, slot,
+                    );
+                    if err == 0 {
+                        entry.irq_handler_slot = slot;
+                    }
+                }
             }
 
             {
@@ -382,10 +397,12 @@ fn handle_get_caps(msg: &SaltyMsg) -> SaltyMsg {
     reply.regs[3] = d.irq_line as u64;
     // regs[4] = BAR type: 0=MMIO, 1=I/O
     reply.regs[4] = if bar0_is_io { 1 } else { 0 };
+    // regs[5] = has IRQ handler cap: 0=no, 1=yes (extra cap #1)
+    reply.regs[5] = if d.irq_handler_slot != 0 { 1 } else { 0 };
     reply.label = 0;
-    reply.length = 5;
+    reply.length = 6;
 
-    // Transfer IoPort cap for I/O BAR or device untyped cap for MMIO BAR
+    // Transfer IoPort cap for I/O BAR or device untyped cap for MMIO BAR (extra cap #0)
     if bar0_is_io && d.ioport_slots[0] != 0 {
         unsafe {
             ipc::set_send_cap_ctx(ipc_ctx(), 0, d.ioport_slots[0]);
@@ -393,6 +410,13 @@ fn handle_get_caps(msg: &SaltyMsg) -> SaltyMsg {
     } else if !bar0_is_io && d.devut_slots[0] != 0 {
         unsafe {
             ipc::set_send_cap_ctx(ipc_ctx(), 0, d.devut_slots[0]);
+        }
+    }
+
+    // Transfer IRQ handler cap (extra cap #1)
+    if d.irq_handler_slot != 0 {
+        unsafe {
+            ipc::set_send_cap_ctx(ipc_ctx(), 1, d.irq_handler_slot);
         }
     }
 

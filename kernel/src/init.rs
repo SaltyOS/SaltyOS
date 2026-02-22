@@ -150,6 +150,16 @@ static mut DEVICE_UNTYPED_POOL: [UntypedMemory; MAX_DEVICE_UNTYPEDS] = {
 /// Next free index in the device untyped pool
 static mut DEVICE_UNTYPED_NEXT: usize = 0;
 
+/// Maximum number of dynamically-created IRQ handlers (for per-device IRQ routing)
+const MAX_DYNAMIC_IRQ_HANDLERS: usize = 8;
+/// Pool of IRQ handler objects for runtime provisioning
+static mut DYNAMIC_IRQ_HANDLER_POOL: [IrqHandler; MAX_DYNAMIC_IRQ_HANDLERS] = {
+    const EMPTY: IrqHandler = IrqHandler::new(0);
+    [EMPTY; MAX_DYNAMIC_IRQ_HANDLERS]
+};
+/// Next free index in the dynamic IRQ handler pool
+static mut DYNAMIC_IRQ_HANDLER_NEXT: usize = 0;
+
 /// Maximum number of dynamically-created IoPort ranges (for PCI I/O BAR provisioning)
 const MAX_DYNAMIC_IOPORTS: usize = 8;
 /// Pool of IoPort range objects for runtime provisioning
@@ -543,6 +553,22 @@ pub fn alloc_dynamic_ioport(base_port: u16, num_ports: u16) -> Option<*mut IoPor
         let iop = &raw mut DYNAMIC_IOPORT_POOL[idx];
         (*iop) = IoPortRange::new(base_port, num_ports);
         Some(iop)
+    }
+}
+
+/// Allocate an IrqHandler from the static pool for runtime provisioning.
+///
+/// Returns a pointer to the initialized IrqHandler, or None if pool is full.
+pub fn alloc_dynamic_irq_handler(irq_num: u32) -> Option<*mut IrqHandler> {
+    unsafe {
+        let idx = DYNAMIC_IRQ_HANDLER_NEXT;
+        if idx >= MAX_DYNAMIC_IRQ_HANDLERS {
+            return None;
+        }
+        DYNAMIC_IRQ_HANDLER_NEXT = idx + 1;
+        let handler = &raw mut DYNAMIC_IRQ_HANDLER_POOL[idx];
+        (*handler) = IrqHandler::new(irq_num);
+        Some(handler)
     }
 }
 

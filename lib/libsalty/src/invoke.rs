@@ -414,11 +414,14 @@ pub fn ioport_create(
 
 // ---- IRQ control operations ----
 
-/// Acquire an IRQ handler capability. The IrqHandler cap at `irq_ctrl`
-/// must have CONFIGURE rights. Sets the handler's IRQ number and
-/// auto-unmasks the IOAPIC redirection entry.
-pub fn irq_control_get(irq_ctrl: Cap, irq_num: u64) -> i32 {
-    invoke(irq_ctrl, IRQ_CONTROL_GET, irq_num, 0, 0, 0).error as i32
+/// Acquire an IRQ handler capability. Allocates a new IrqHandler object
+/// from the kernel's dynamic pool, registers it for the given IRQ number,
+/// auto-unmasks the IOAPIC, and places the resulting cap at `dest_slot`
+/// in `dest_cnode`.
+///
+/// The IrqHandler cap at `irq_ctrl` must have CONFIGURE rights (IrqControl).
+pub fn irq_control_get(irq_ctrl: Cap, irq_num: u64, dest_cnode: Cap, dest_slot: u64) -> i32 {
+    invoke(irq_ctrl, IRQ_CONTROL_GET, irq_num, dest_cnode, dest_slot, 0).error as i32
 }
 
 /// Clear (unbind notification + unregister) an IRQ handler.

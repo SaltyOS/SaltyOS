@@ -20,6 +20,7 @@ subdir('servers/getty')
 # Hardware drivers
 subdir('drivers/blkdrv')
 subdir('drivers/pcisrv')
+subdir('drivers/netdrv')
 subdir('drivers/display')
 
 # Filesystems

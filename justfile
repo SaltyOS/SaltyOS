@@ -458,6 +458,21 @@ run-blk-smp: build
         -no-reboot \
         -no-shutdown
 
+# Run with virtio-net NIC
+run-net: build
+    qemu-system-x86_64 \
+        -machine q35 \
+        -cpu qemu64 \
+        -m 512M \
+        -serial stdio \
+        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
+        -device ahci,id=ahci \
+        -device ide-hd,drive=disk,bus=ahci.0 \
+        -netdev user,id=net0 \
+        -device virtio-net-pci,netdev=net0 \
+        -no-reboot \
+        -no-shutdown
+
 # Create a new component skeleton
 new-component NAME:
     @echo "Creating component: {{NAME}}"
