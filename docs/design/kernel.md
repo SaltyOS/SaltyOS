@@ -30,12 +30,13 @@ The kernel should be as small as possible while still providing necessary mechan
 | IRQ delivery | Device drivers |
 | Timer | Time services |
 
-### No Dynamic Allocation (Future Goal)
+### No Dynamic Allocation
 
 Following seL4's approach:
-- All kernel memory is pre-allocated at boot
-- Objects are created by "retyping" untyped memory
-- No malloc/free in kernel paths
+- All kernel objects are carved from untyped memory via `retype`
+- No kernel heap, slab allocator, or `alloc` crate
+- Objects are never freed (owned by parent untyped memory)
+- No `Vec`, `Box`, `HashMap`, or `String` — only raw pointers, fixed-size arrays, and static storage
 - Enables formal verification
 
 ### Bounded Execution Time
@@ -51,42 +52,66 @@ All system calls should have bounded worst-case execution time (WCET):
 
 ```
 kernel/src/
-├── lib.rs              # Entry point, panic handler
-├── arch/               # Architecture-specific
+├── lib.rs              # Entry (kmain), serial I/O, panic handler
+├── bootinfo.rs         # Boot info TLV parsing from bootloader
+├── builtins.rs         # Compiler built-in function stubs (memcpy, memset, etc.)
+├── cpio.rs             # CPIO archive parser for initrd
+├── elf.rs              # ELF binary loader for init task
+├── init.rs             # Init task bootstrap (CSpace setup, capability grants)
+├── rng.rs              # RDRAND-based random number generator
+├── arch/
 │   ├── mod.rs
 │   └── x86_64/
 │       ├── mod.rs
-│       ├── boot.rs     # Arch initialization
-│       ├── gdt.rs      # Global Descriptor Table
-│       ├── idt.rs      # Interrupt Descriptor Table
-│       ├── paging.rs   # Page table management
-│       ├── context.rs  # Context switching
-│       ├── serial.rs   # Debug output
-│       └── timer.rs    # APIC timer
-├── cap/                # Capability system
-│   ├── mod.rs
-│   ├── cnode.rs        # CNode implementation
-│   ├── object.rs       # Kernel object types
-│   └── rights.rs       # Capability rights
-├── ipc/                # IPC subsystem
-│   ├── mod.rs
-│   ├── endpoint.rs     # Synchronous IPC
-│   └── notification.rs # Async signaling
-├── mm/                 # Memory management
-│   ├── mod.rs
-│   ├── frame.rs        # Physical frame allocator
-│   ├── vspace.rs       # Virtual address spaces
-│   ├── slab.rs         # Kernel object allocator
-│   └── untyped.rs      # Untyped memory management
-├── sched/              # Scheduler
-│   ├── mod.rs
-│   ├── thread.rs       # Thread Control Block
-│   ├── scheduler.rs    # EDF scheduler
-│   └── context.rs      # Scheduling context
-└── syscall/            # System calls
-    ├── mod.rs
-    ├── invoke.rs       # Capability invocation
-    └── handlers.rs     # Syscall implementations
+│       ├── acpi.rs     # ACPI table parsing (MADT, FADT for shutdown)
+│       ├── ap_boot.rs  # Application Processor startup
+│       ├── ap_tramp.S  # AP trampoline (real → long mode)
+│       ├── apic.rs     # Local APIC + I/O APIC + IPI messaging
+│       ├── boot.rs     # BSP early boot (GDT/IDT/paging init)
+│       ├── context.rs  # Context switch (save/restore registers)
+│       ├── cpu.rs      # CPU state, MSR access, per-CPU data
+│       ├── cpuid.rs    # CPUID feature detection
+│       ├── exceptions.S # IDT exception handlers
+│       ├── fpu.rs      # FPU/SSE state save/restore (FXSAVE/FXRSTOR)
+│       ├── gdt.rs      # GDT + TSS setup (per-CPU)
+│       ├── idt.rs      # IDT setup + interrupt handlers
+│       ├── paging.rs   # Page table manipulation (4-level)
+│       ├── pit.rs      # PIT timer for APIC calibration
+│       ├── smap.rs     # SMAP/SMEP enforcement
+│       └── syscall.S   # Syscall entry/exit, IPC fastpath
+├── cap/
+│   ├── mod.rs          # Capability struct (32-byte fat cap), CapRights
+│   ├── cdt.rs          # Capability Derivation Tree
+│   ├── cnode.rs        # CNode (capability table, 4-16 bit slots)
+│   ├── ioport.rs       # I/O port range capabilities
+│   ├── object.rs       # ObjectType enum, KernelObject header
+│   ├── refcount.rs     # Object reference counting
+│   ├── slot.rs         # Slot allocation/access helpers
+│   └── untyped.rs      # Untyped memory retype
+├── console/
+│   ├── mod.rs          # Kernel console output multiplexer
+│   ├── fb.rs           # Framebuffer console driver
+│   └── font.rs         # Built-in 8x16 bitmap font
+├── ipc/
+│   ├── mod.rs          # IPC types (Message, IpcBuffer), fault types
+│   ├── endpoint.rs     # Synchronous rendezvous endpoints
+│   ├── futex.rs        # Userspace futex (wait/wake/requeue)
+│   ├── irq.rs          # Hardware IRQ routing to notifications
+│   ├── notification.rs # Asynchronous notification (bitmap signaling)
+│   └── queue.rs        # IPC wait queue management
+├── mm/
+│   ├── mod.rs          # Memory management globals, lock ordering, helpers
+│   ├── frame.rs        # Bitmap-based physical frame allocator (PMM)
+│   └── vspace.rs       # VSpace (page tables, COW, demand paging, VSpaceTracking)
+├── sched/
+│   ├── mod.rs          # Scheduler module entry
+│   ├── pip.rs          # Priority Inheritance Protocol
+│   ├── scheduler.rs    # EDF scheduler (global ready queue)
+│   ├── sleep_queue.rs  # Timed sleep queue (NanoSleep, timed IPC)
+│   └── thread.rs       # TCB, SchedContext, ThreadState, context switch
+└── syscall/
+    ├── mod.rs          # 23 syscalls, capability invocation dispatch
+    └── fastpath.rs     # IPC fastpath (Call/ReplyRecv optimization)
 ```
 
 ## Kernel Entry
@@ -96,7 +121,7 @@ kernel/src/
 ```mermaid
 graph TD
     A[Bootloader Jump] --> B[_start assembly]
-    B --> C[kernel_main]
+    B --> C[kmain]
     C --> D[arch_init]
     D --> E[mm_init]
     E --> F[cap_init]
@@ -112,40 +137,47 @@ graph TD
 
 #![no_std]
 #![no_main]
-#![feature(naked_functions)]
 
 mod arch;
+mod bootinfo;
+mod builtins;
 mod cap;
+mod cpio;
+mod elf;
+mod init;
 mod ipc;
 mod mm;
+mod rng;
 mod sched;
 mod syscall;
 
 use core::panic::PanicInfo;
 
-/// Kernel entry point (called from bootloader)
+/// Kernel entry point (called from bootloader with BootInfo pointer in RDI)
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_main(boot_info: &'static BootInfo) -> ! {
+pub extern "C" fn kmain(boot_info_addr: u64) -> ! {
+    // Parse TLV-encoded boot info from bootloader
+    let boot_info = bootinfo::parse(boot_info_addr);
+
     // Initialize serial for early debug output
-    arch::serial::init();
+    serial_init();
     kprintln!("SaltyOS kernel starting...");
-    
-    // Architecture-specific initialization
-    arch::init(boot_info);
-    
-    // Initialize memory management
-    mm::init(boot_info);
-    
+
+    // Architecture-specific initialization (GDT, IDT, paging, APIC, SMP)
+    arch::init(&boot_info);
+
+    // Initialize physical frame allocator and memory management
+    mm::init(&boot_info);
+
     // Initialize capability system
     cap::init();
-    
+
     // Initialize scheduler
     sched::init();
-    
-    // Create and run init task
-    let init_tcb = create_init_task(boot_info);
-    sched::add_thread(init_tcb);
-    
+
+    // Create init task: parse CPIO initrd, load ELF, set up CSpace
+    init::create_init_task(&boot_info);
+
     // Start the scheduler (never returns)
     sched::start();
 }
@@ -154,7 +186,7 @@ pub extern "C" fn kernel_main(boot_info: &'static BootInfo) -> ! {
 fn panic(info: &PanicInfo) -> ! {
     kprintln!("KERNEL PANIC: {}", info);
     loop {
-        arch::halt();
+        arch::x86_64::halt();
     }
 }
 ```
@@ -166,65 +198,65 @@ fn panic(info: &PanicInfo) -> ! {
 ```rust
 // kernel/src/arch/x86_64/mod.rs
 
+pub mod acpi;
+pub mod ap_boot;
+pub mod apic;
 pub mod boot;
+pub mod context;
+pub mod cpu;
+pub mod cpuid;
+pub mod fpu;
 pub mod gdt;
 pub mod idt;
 pub mod paging;
-pub mod context;
-pub mod serial;
-pub mod timer;
+pub mod pit;
+pub mod smap;
 
-use crate::BootInfo;
-
-/// Initialize x86_64 architecture
+/// Initialize x86_64 architecture (called from kmain)
+///
+/// Initialization order matters — GDT/IDT must be set up before APIC,
+/// paging before SMP, and PIT calibration before APIC timer.
 pub fn init(boot_info: &BootInfo) {
-    // Set up Global Descriptor Table
-    gdt::init();
-    kprintln!("  GDT initialized");
-    
-    // Set up Interrupt Descriptor Table
+    // Per-CPU GDT + TSS setup
+    gdt::init_bsp();
+
+    // IDT with exception handlers and IRQ vectors
     idt::init();
-    kprintln!("  IDT initialized");
-    
-    // Set up kernel page tables
+
+    // Initialize paging (remap kernel, set up higher-half mappings)
     paging::init(boot_info);
-    kprintln!("  Paging initialized");
-    
-    // Initialize APIC timer
-    timer::init();
-    kprintln!("  Timer initialized");
-}
 
-/// Halt the CPU
-#[inline]
-pub fn halt() {
-    unsafe {
-        core::arch::asm!("hlt");
-    }
-}
+    // CPUID feature detection (NX, SMEP, SMAP, RDRAND)
+    cpuid::detect_features();
 
-/// Disable interrupts
-#[inline]
-pub fn disable_interrupts() {
-    unsafe {
-        core::arch::asm!("cli");
-    }
-}
+    // Enable SMAP/SMEP if available
+    smap::init();
 
-/// Enable interrupts
-#[inline]
-pub fn enable_interrupts() {
-    unsafe {
-        core::arch::asm!("sti");
-    }
+    // ACPI table parsing (MADT for CPU topology, FADT for shutdown)
+    acpi::init(boot_info);
+
+    // Local APIC + I/O APIC initialization
+    apic::init();
+
+    // PIT calibration for APIC timer frequency
+    pit::calibrate_apic_timer();
+
+    // Start Application Processors (SMP)
+    ap_boot::start_aps();
 }
 ```
 
 ### GDT Setup
 
+Each CPU gets its own GDT and TSS. GDT/TSS storage is a per-CPU static array
+(no heap allocation). Rust 2024 disallows `&mut` of `static mut`, so per-CPU
+data is accessed via raw pointers (`core::ptr::addr_of_mut!`) or through
+`SyncUnsafeCell`-based per-CPU storage.
+
 ```rust
 // kernel/src/arch/x86_64/gdt.rs
 
+use core::cell::SyncUnsafeCell;
 use core::mem::size_of;
 
 #[repr(C, packed)]
@@ -237,62 +269,50 @@ struct GdtEntry {
     base_high: u8,
 }
 
-#[repr(C, packed)]
-struct TssEntry {
-    // ... TSS fields for syscall stack
-}
+/// Per-CPU GDT + TSS storage (one per CPU, indexed by APIC ID)
+/// No heap allocation — statically sized for MAX_CPUS.
+static PER_CPU_GDT: [SyncUnsafeCell<Gdt>; MAX_CPUS] = /* zero-initialized */;
+static PER_CPU_TSS: [SyncUnsafeCell<Tss>; MAX_CPUS] = /* zero-initialized */;
 
-#[repr(C, packed)]
-struct Gdt {
-    null: GdtEntry,
-    kernel_code: GdtEntry,
-    kernel_data: GdtEntry,
-    user_code: GdtEntry,
-    user_data: GdtEntry,
-    tss: [u64; 2],  // TSS is 16 bytes in long mode
-}
-
-static mut GDT: Gdt = Gdt::new();
-static mut TSS: TssEntry = TssEntry::new();
-
-pub fn init() {
+/// Initialize GDT and TSS for the bootstrap processor.
+/// AP processors call init_ap() from the AP trampoline.
+pub fn init_bsp() {
+    let cpu_id = 0;
+    // SAFETY: Single-threaded during BSP init, no concurrent access.
     unsafe {
-        // Set up TSS for syscall stack
-        TSS.rsp0 = KERNEL_STACK_TOP;
-        
-        // Set TSS entry in GDT
-        let tss_addr = &TSS as *const _ as u64;
-        GDT.tss[0] = make_tss_entry_low(tss_addr);
-        GDT.tss[1] = make_tss_entry_high(tss_addr);
-        
-        // Load GDT
+        let gdt = &mut *PER_CPU_GDT[cpu_id].get();
+        let tss = &mut *PER_CPU_TSS[cpu_id].get();
+
+        // Set up TSS with kernel stack pointer
+        tss.rsp0 = per_cpu_kernel_stack_top(cpu_id);
+
+        // Encode TSS descriptor in GDT
+        let tss_addr = tss as *const _ as u64;
+        gdt.tss_low = make_tss_entry_low(tss_addr);
+        gdt.tss_high = make_tss_entry_high(tss_addr);
+
+        // Load GDT via lgdt
         let gdt_ptr = GdtPtr {
             limit: (size_of::<Gdt>() - 1) as u16,
-            base: &GDT as *const _ as u64,
+            base: gdt as *const _ as u64,
         };
-        
-        core::arch::asm!(
-            "lgdt [{}]",
-            in(reg) &gdt_ptr,
-            options(nostack)
-        );
-        
-        // Load TSS
-        core::arch::asm!(
-            "ltr ax",
-            in("ax") 0x28u16,  // TSS selector
-            options(nostack)
-        );
+        core::arch::asm!("lgdt [{}]", in(reg) &gdt_ptr, options(nostack));
+
+        // Load TSS selector
+        core::arch::asm!("ltr ax", in("ax") TSS_SELECTOR, options(nostack));
     }
 }
 ```
 
 ### Interrupt Handling
 
+Exception and IRQ entry points are defined in assembly (`exceptions.S`) which
+saves full register state, then calls Rust handler functions via `extern "C"`.
+The IDT is a static 256-entry array accessed through raw pointers (Rust 2024
+disallows `&mut` of `static mut`).
+
 ```rust
 // kernel/src/arch/x86_64/idt.rs
-
-use core::mem::size_of;
 
 #[repr(C, packed)]
 struct IdtEntry {
@@ -305,62 +325,49 @@ struct IdtEntry {
     reserved: u32,
 }
 
-static mut IDT: [IdtEntry; 256] = [IdtEntry::missing(); 256];
+/// Static IDT — 256 entries, accessed via raw pointer.
+static IDT: SyncUnsafeCell<[IdtEntry; 256]> = /* zero-initialized */;
 
-// Exception handlers
-extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
-    kprintln!("EXCEPTION: Divide by zero\n{:#?}", frame);
-    loop { crate::arch::halt(); }
-}
+pub fn init() {
+    // SAFETY: Single-threaded during BSP init.
+    unsafe {
+        let idt = &mut *IDT.get();
 
-extern "x86-interrupt" fn page_fault_handler(
-    frame: InterruptStackFrame,
-    error_code: u64,
-) {
-    let addr: u64;
-    unsafe { core::arch::asm!("mov {}, cr2", out(reg) addr); }
-    
-    // Check if this is a user page fault
-    if error_code & 0x4 != 0 {
-        // User mode fault - deliver to handler via IPC
-        handle_user_page_fault(addr, error_code);
-    } else {
-        // Kernel fault - panic
-        kprintln!("KERNEL PAGE FAULT at {:#x}", addr);
-        kprintln!("{:#?}", frame);
-        loop { crate::arch::halt(); }
+        // Exception handlers (assembly stubs in exceptions.S)
+        idt[0].set_handler(asm_divide_error as u64);   // #DE
+        idt[6].set_handler(asm_invalid_opcode as u64);  // #UD
+        idt[13].set_handler(asm_general_protection as u64); // #GP
+        idt[14].set_handler(asm_page_fault as u64);     // #PF
+
+        // Timer interrupt (vector 32)
+        idt[32].set_handler(asm_timer_handler as u64);
+
+        // IPI vectors
+        idt[0xFD].set_handler(asm_ipi_reschedule as u64);
+        idt[0xFE].set_handler(asm_ipi_tlb_shootdown as u64);
+
+        // Load IDT
+        let idt_ptr = IdtPtr {
+            limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
+            base: idt as *const _ as u64,
+        };
+        core::arch::asm!("lidt [{}]", in(reg) &idt_ptr, options(nostack));
     }
 }
 
-// Timer interrupt for preemption
-extern "x86-interrupt" fn timer_handler(frame: InterruptStackFrame) {
-    // Acknowledge interrupt
-    unsafe { LAPIC.eoi(); }
-    
-    // Trigger scheduler
-    crate::sched::timer_tick();
-}
-
-pub fn init() {
-    unsafe {
-        // Set up exception handlers
-        IDT[0].set_handler(divide_error_handler as u64);
-        IDT[14].set_handler(page_fault_handler as u64);
-        
-        // Set up timer interrupt
-        IDT[32].set_handler(timer_handler as u64);
-        
-        // Load IDT
-        let idt_ptr = IdtPtr {
-            limit: (size_of::<[IdtEntry; 256]>() - 1) as u16,
-            base: &IDT as *const _ as u64,
-        };
-        
-        core::arch::asm!(
-            "lidt [{}]",
-            in(reg) &idt_ptr,
-            options(nostack)
-        );
+/// Page fault handler (called from exceptions.S after register save).
+/// For user-mode faults, delivers fault info via IPC to the thread's
+/// fault handler endpoint. For kernel faults, panics.
+///
+/// IMPORTANT: EOI must be sent before any code that might trigger a
+/// context switch.
+#[unsafe(no_mangle)]
+pub extern "C" fn handle_page_fault(error_code: u64, fault_addr: u64) {
+    if error_code & 0x4 != 0 {
+        // User mode fault — deliver via fault IPC or demand-page
+        handle_user_page_fault(fault_addr, error_code);
+    } else {
+        panic!("KERNEL PAGE FAULT at {:#x}, error={:#x}", fault_addr, error_code);
     }
 }
 ```
@@ -369,110 +376,58 @@ pub fn init() {
 
 ### Thread Control Block
 
+TCBs are kernel objects (carved from untyped memory via retype, never heap-allocated).
+All references to other kernel objects are raw pointers, not smart pointers.
+
 ```rust
 // kernel/src/sched/thread.rs
 
-use crate::arch::context::Context;
-use crate::cap::{CNodeRef, VSpaceRef};
-
-/// Thread state
+/// Thread state — determines schedulability and blocking reason
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ThreadState {
-    /// Ready to run
     Ready,
-    /// Currently running
     Running,
-    /// Blocked on IPC
-    BlockedOnSend { endpoint: EndpointRef },
-    /// Blocked on IPC
-    BlockedOnReceive { endpoint: EndpointRef },
-    /// Blocked on notification
-    BlockedOnNotification { notification: NotificationRef },
-    /// Suspended (not schedulable)
-    Suspended,
+    SendBlocked,         // Blocked on synchronous send
+    RecvBlocked,         // Blocked on synchronous receive
+    NotificationWait,    // Blocked waiting on notification
+    FutexBlocked,        // Blocked on futex wait
+    Sleeping,            // Blocked on NanoSleep / timed wait
+    Suspended,           // Not schedulable
 }
 
-/// Thread Control Block
+/// Thread Control Block (kernel object, allocated from untyped memory)
+#[repr(C)]
 pub struct Tcb {
-    /// Unique thread ID
-    pub id: ThreadId,
-    
-    /// Thread name (for debugging)
-    pub name: [u8; 32],
-    
-    /// Current state
-    pub state: ThreadState,
-    
-    /// Saved CPU context
-    pub context: Context,
-    
-    /// Associated scheduling context
-    pub sched_context: Option<SchedContextRef>,
-    
-    /// Thread's CSpace root
-    pub cspace: CNodeRef,
-    
-    /// Thread's VSpace
-    pub vspace: VSpaceRef,
-    
-    /// IPC buffer location
-    pub ipc_buffer: VirtAddr,
-    
-    /// Fault handler endpoint
-    pub fault_handler: Option<EndpointRef>,
-    
-    /// Bound notification (for combined wait)
-    pub bound_notification: Option<NotificationRef>,
-    
-    /// Priority (used for tiebreaking in EDF)
-    pub priority: u8,
-}
+    pub header: KernelObject,            // Must be first field
 
-impl Tcb {
-    /// Create a new thread
-    pub fn new(
-        id: ThreadId,
-        cspace: CNodeRef,
-        vspace: VSpaceRef,
-    ) -> Self {
-        Self {
-            id,
-            name: [0; 32],
-            state: ThreadState::Suspended,
-            context: Context::new(),
-            sched_context: None,
-            cspace,
-            vspace,
-            ipc_buffer: VirtAddr::new(0),
-            fault_handler: None,
-            bound_notification: None,
-            priority: 128,
-        }
-    }
-    
-    /// Configure thread entry point
-    pub fn configure(
-        &mut self,
-        entry: VirtAddr,
-        stack: VirtAddr,
-        ipc_buffer: VirtAddr,
-    ) {
-        self.context.set_entry(entry);
-        self.context.set_stack(stack);
-        self.ipc_buffer = ipc_buffer;
-    }
-    
-    /// Resume the thread (make schedulable)
-    pub fn resume(&mut self) {
-        if self.state == ThreadState::Suspended {
-            self.state = ThreadState::Ready;
-        }
-    }
-    
-    /// Suspend the thread
-    pub fn suspend(&mut self) {
-        self.state = ThreadState::Suspended;
-    }
+    pub state: ThreadState,
+    pub context: Context,                // Saved CPU registers
+
+    // Capability space and address space (raw pointers to kernel objects)
+    pub cspace: *mut CNode,              // Thread's CNode root
+    pub vspace: *mut VSpace,             // Thread's page table root
+
+    // IPC state
+    pub ipc_buffer: u64,                 // Virtual address of IPC buffer page
+    pub blocking_object: *mut KernelObject, // Endpoint/Notification we're blocked on
+    pub fault_handler_ep: *mut Endpoint, // Null if no fault handler
+
+    // Scheduling
+    pub sched_context: *mut SchedContext, // EDF parameters (period, deadline, budget)
+    pub priority: u8,                    // Tiebreaker for equal-deadline threads
+    pub cpu_affinity: u8,                // Preferred CPU (0xFF = any)
+
+    // Bound notification (bidirectional TCB <-> Notification link)
+    pub bound_notification: *mut Notification, // Null if unbound
+
+    // Linked list pointers for wait queues and ready queues
+    pub queue_next: *mut Tcb,
+    pub queue_prev: *mut Tcb,
+
+    // Stack canary for kernel stack overflow detection
+    pub stack_canary: u64,
+
+    pub name: [u8; 32],                 // Debug name
 }
 ```
 
@@ -575,145 +530,135 @@ pub unsafe extern "C" fn switch_context(
 
 ### Syscall Entry
 
+Syscall entry is via the `syscall` instruction. The assembly stub in
+`syscall.S` saves user RSP on the per-thread kernel stack (not per-CPU
+`%gs:16`), checks for IPC fastpath (RAX==2 for Call, RAX==3 for ReplyRecv),
+and falls through to the Rust slowpath handler for all other syscalls.
+
 ```rust
 // kernel/src/syscall/mod.rs
 
-mod invoke;
-mod handlers;
+mod fastpath;
 
-use crate::arch::Context;
-
-/// System call numbers
+/// System call numbers (23 total)
 #[repr(u64)]
 pub enum Syscall {
     Send = 0,
     Recv = 1,
     Call = 2,
     ReplyRecv = 3,
-    Yield = 4,
-    DebugPutChar = 5,
+    NBSend = 4,
+    Signal = 5,
+    Wait = 6,
+    Poll = 7,
+    Yield = 8,
+    Invoke = 9,
+    DebugPutChar = 10,
+    DebugDumpState = 11,
+    ClockGetTime = 12,
+    NanoSleep = 13,
+    DebugPutStr = 14,
+    DebugPutBuf = 15,
+    DebugConsoleControl = 16,
+    SetInvokeDepths = 17,
+    Futex = 18,
+    GetRandom = 19,
+    Shutdown = 20,
+    SendTimed = 21,
+    RecvTimed = 22,
 }
 
-/// System call handler entry point
+/// Slowpath syscall handler (called from syscall.S assembly stub).
+/// Returns error in RAX, value in RDX.
+///
+/// The assembly entry point saves user RSP on the per-thread kernel stack
+/// and dispatches Call/ReplyRecv to the fastpath before reaching here.
 #[unsafe(no_mangle)]
-pub extern "C" fn syscall_handler(
-    syscall: u64,
-    arg1: u64,
-    arg2: u64,
-    arg3: u64,
-    arg4: u64,
-    arg5: u64,
-    arg6: u64,
+pub extern "C" fn syscall_handle_rust(
+    syscall_nr: u64,
+    arg1: u64,  // rdi
+    arg2: u64,  // rsi
+    arg3: u64,  // rdx
+    arg4: u64,  // r10
+    arg5: u64,  // r8
+    arg6: u64,  // r9
 ) -> u64 {
-    let current = crate::sched::current_thread();
-    
-    match syscall {
-        0 => handlers::sys_send(current, arg1, arg2, arg3),
-        1 => handlers::sys_recv(current, arg1, arg2),
-        2 => handlers::sys_call(current, arg1, arg2, arg3),
-        3 => handlers::sys_reply_recv(current, arg1, arg2, arg3),
-        4 => {
-            crate::sched::yield_current();
-            0
-        }
-        5 => {
-            crate::arch::serial::putc(arg1 as u8 as char);
-            0
-        }
-        _ => {
-            // Unknown syscall
-            u64::MAX
-        }
-    }
-}
+    let nr = match Syscall::try_from(syscall_nr) {
+        Ok(s) => s,
+        Err(_) => return SyscallError::InvalidSyscall as u64,
+    };
 
-/// x86_64 syscall entry (from SYSCALL instruction)
-#[naked]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn syscall_entry() {
-    core::arch::asm!(
-        // Swap to kernel stack
-        "swapgs",
-        "mov gs:[0], rsp",       // Save user stack
-        "mov rsp, gs:[8]",       // Load kernel stack
-        
-        // Save user context
-        "push rcx",              // User RIP
-        "push r11",              // User RFLAGS
-        "push gs:[0]",           // User RSP
-        
-        // Call handler
-        "mov rcx, r10",          // arg4 was in r10
-        "call syscall_handler",
-        
-        // Restore user context
-        "pop rsp",               // Restore through swapgs
-        "mov gs:[0], rsp",
-        "pop r11",
-        "pop rcx",
-        
-        "swapgs",
-        "sysretq",
-        options(noreturn)
-    );
+    match nr {
+        Syscall::Send => handle_send(arg1, arg2, arg3),
+        Syscall::Recv => handle_recv(arg1, arg2),
+        Syscall::Call => handle_call(arg1, arg2, arg3),
+        Syscall::ReplyRecv => handle_reply_recv(arg1, arg2, arg3),
+        Syscall::Invoke => handle_invoke(arg1, arg2, arg3, arg4, arg5, arg6),
+        Syscall::Yield => { sched::yield_current(); 0 }
+        Syscall::Futex => handle_futex(arg1, arg2, arg3, arg4),
+        Syscall::NanoSleep => handle_nanosleep(arg1, arg2),
+        Syscall::ClockGetTime => handle_clock_gettime(arg1),
+        Syscall::Shutdown => handle_shutdown(),
+        // ... remaining syscalls dispatched similarly
+        _ => SyscallError::InvalidSyscall as u64,
+    }
 }
 ```
 
 ### Capability Invocation
 
+The Invoke syscall (number 9) dispatches to object-type-specific handlers
+based on the capability's `obj_type` field. The invoke label (passed in the
+message info) determines the specific operation within each type.
+
 ```rust
-// kernel/src/syscall/invoke.rs
+// kernel/src/syscall/mod.rs (handle_invoke function)
 
-use crate::cap::{Capability, CapType, Rights};
-use crate::sched::Tcb;
+/// Invoke a capability. The cap slot is looked up in the thread's CSpace,
+/// then dispatched based on ObjectType and invoke label.
+fn handle_invoke(
+    cap_slot: u64,
+    msg_info: u64,
+    mr0: u64,
+    mr1: u64,
+    mr2: u64,
+    mr3: u64,
+) -> u64 {
+    let irq = save_irq_disable();
 
-/// Result of capability invocation
-pub enum InvokeResult {
-    Success(u64),
-    Error(SyscallError),
-    Blocked,  // Thread is now blocked
-}
-
-/// Invoke a capability
-pub fn invoke_capability(
-    tcb: &mut Tcb,
-    cap_ptr: u64,
-    label: u64,
-    msg: &IpcMessage,
-) -> InvokeResult {
-    // Look up capability in thread's CSpace
-    let cap = match tcb.cspace.lookup(cap_ptr) {
-        Some(c) => c,
-        None => return InvokeResult::Error(SyscallError::InvalidCapability),
+    // Look up capability in current thread's CSpace
+    CAP_LOCK.lock();
+    let cap = match cspace_lookup(current_thread(), cap_slot) {
+        Ok(c) => c,
+        Err(e) => {
+            CAP_LOCK.unlock();
+            restore_irq(irq);
+            return syscall_error_from_cap_error(e) as u64;
+        }
     };
-    
-    // Dispatch based on capability type
-    match cap.cap_type {
-        CapType::Endpoint => {
-            invoke_endpoint(tcb, cap, label, msg)
-        }
-        CapType::Notification => {
-            invoke_notification(tcb, cap, label)
-        }
-        CapType::Tcb => {
-            invoke_tcb(tcb, cap, label, msg)
-        }
-        CapType::CNode => {
-            invoke_cnode(tcb, cap, label, msg)
-        }
-        CapType::VSpace => {
-            invoke_vspace(tcb, cap, label, msg)
-        }
-        CapType::Frame => {
-            invoke_frame(tcb, cap, label, msg)
-        }
-        CapType::Untyped => {
-            invoke_untyped(tcb, cap, label, msg)
-        }
-        CapType::IrqHandler => {
-            invoke_irq_handler(tcb, cap, label, msg)
-        }
-        _ => InvokeResult::Error(SyscallError::InvalidCapability),
+
+    // Copy cap to stack, release CAP_LOCK before further operations
+    let cap_copy = *cap;
+    CAP_LOCK.unlock();
+
+    let label = msg_info_label(msg_info);
+
+    // Dispatch based on object type
+    let result = match cap_copy.obj_type {
+        ObjectType::CNode       => invoke_cnode(&cap_copy, label, mr0, mr1, mr2, mr3),
+        ObjectType::Untyped     => invoke_untyped(&cap_copy, label, mr0, mr1, mr2, mr3),
+        ObjectType::Tcb         => invoke_tcb(&cap_copy, label, mr0, mr1, mr2, mr3),
+        ObjectType::VSpace      => invoke_vspace(&cap_copy, label, mr0, mr1, mr2),
+        ObjectType::SchedContext => invoke_sched_context(&cap_copy, label, mr0, mr1, mr2),
+        ObjectType::IrqHandler  => invoke_irq(&cap_copy, label, mr0, mr1),
+        ObjectType::IoPort      => invoke_ioport(&cap_copy, label, mr0, mr1),
+        _ => Err(SyscallError::InvalidCapability),
+    };
+
+    restore_irq(irq);
+    match result {
+        Ok(val) => val,
+        Err(e) => e as u64,
     }
 }
 ```
@@ -722,82 +667,79 @@ pub fn invoke_capability(
 
 ### Object Types
 
+All kernel objects are carved from untyped memory via `retype` — there is no
+kernel heap or slab allocator. Each kernel object struct has a `KernelObject`
+header as its **first field**, which holds a reference count and object type.
+Capabilities point to kernel objects via raw `*mut KernelObject` pointers;
+the pointer can be cast to the concrete type since the header is at offset 0.
+
+Objects are never freed — they are owned by their parent untyped memory
+capability. Pointers to kernel objects remain valid for the lifetime of the
+system.
+
 ```rust
 // kernel/src/cap/object.rs
 
-/// All kernel object types
-pub enum KernelObject {
-    Endpoint(Endpoint),
-    Notification(Notification),
-    Tcb(Box<Tcb>),
-    CNode(CNode),
-    VSpace(VSpace),
-    Frame(Frame),
-    Untyped(Untyped),
-    IrqHandler(IrqHandler),
-    SchedContext(SchedContext),
+/// Object type discriminant (stored in KernelObject header and Capability)
+#[repr(u8)]
+pub enum ObjectType {
+    Null = 0,
+    Untyped = 1,
+    Endpoint = 2,
+    Notification = 3,
+    Tcb = 4,
+    CNode = 5,
+    VSpace = 6,
+    Frame = 7,
+    IrqHandler = 8,
+    IoPort = 9,
+    SchedContext = 10,
 }
 
-/// Reference-counted pointer to kernel object
-pub struct ObjectRef<T> {
-    ptr: NonNull<T>,
+/// Common header for all kernel objects (must be first field in every object struct)
+#[repr(C)]
+pub struct KernelObject {
+    pub obj_type: ObjectType,
+    pub refcount: u32,
 }
 
-impl<T> ObjectRef<T> {
-    /// Get a reference to the object
-    pub fn get(&self) -> &T {
-        unsafe { self.ptr.as_ref() }
-    }
-    
-    /// Get a mutable reference to the object
-    pub fn get_mut(&mut self) -> &mut T {
-        unsafe { self.ptr.as_mut() }
-    }
+// Example: Endpoint struct with KernelObject header
+#[repr(C)]
+pub struct Endpoint {
+    pub header: KernelObject,       // Must be first field
+    pub send_queue: *mut Tcb,       // Linked list of senders (raw pointer, no Vec)
+    pub recv_queue: *mut Tcb,       // Linked list of receivers
 }
 
-/// Object sizes for allocation
-pub const OBJECT_SIZES: &[(CapType, usize)] = &[
-    (CapType::Endpoint, size_of::<Endpoint>()),
-    (CapType::Notification, size_of::<Notification>()),
-    (CapType::Tcb, size_of::<Tcb>()),
-    (CapType::CNode, 0),  // Variable size
-    (CapType::VSpace, size_of::<VSpace>()),
-    (CapType::Frame, 0),  // 4KB page
-    (CapType::SchedContext, size_of::<SchedContext>()),
-];
+// Capabilities reference objects through raw pointers.
+// The capability's obj_type field tells you how to cast:
+//   let ep: *mut Endpoint = cap.object as *mut Endpoint;
 ```
 
 ## Kernel Configuration
 
 ### Compile-Time Configuration
 
-```rust
-// kernel/src/config.rs
+Configuration is set via Meson build options (not a separate Rust config file).
+Key constants are defined as `const` values in the relevant modules:
 
-/// Maximum number of CPUs supported
+```rust
+// Constants spread across kernel modules (set via Meson -D options or hardcoded)
+
+/// Maximum number of CPUs supported (Meson: -Dmax_cpus=16)
 pub const MAX_CPUS: usize = 16;
 
-/// Kernel stack size per thread
+/// Kernel stack size per thread (Meson: -Dkernel_stack_size=16384)
 pub const KERNEL_STACK_SIZE: usize = 16384;
 
-/// Maximum threads in the system
-pub const MAX_THREADS: usize = 1024;
+/// IPC message registers passed in CPU registers (MR0-MR3)
+pub const IPC_MR_REGS: usize = 4;
 
-/// Timer tick interval (microseconds)
-pub const TIMER_TICK_US: u64 = 1000;  // 1ms
+/// IPC buffer msg[] array size (label + length + MR0-MR19 = 22 words)
+pub const IPC_MAX_MRS: usize = 22;
 
-/// IPC message registers
-pub const IPC_MESSAGE_REGS: usize = 4;
-
-/// Maximum IPC message length (bytes)
-pub const IPC_MAX_LENGTH: usize = 120;
-
-/// Kernel log level
-#[cfg(debug_assertions)]
-pub const LOG_LEVEL: LogLevel = LogLevel::Debug;
-
-#[cfg(not(debug_assertions))]
-pub const LOG_LEVEL: LogLevel = LogLevel::Info;
+/// Kernel log level (Meson: -Dkernel_log_level=info)
+/// Controlled at build time; levels: error, warn, info, debug, trace
 ```
 
 ## Invariants and Safety

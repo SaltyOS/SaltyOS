@@ -44,6 +44,9 @@ outside the kernel.
 | `elf_loader.rs` | 687 | Userspace ELF64 loader with PIE relocation support |
 | `elf_dynamic.rs` | 244 | ELF dynamic linking helpers (PT_INTERP, DT_NEEDED extraction) |
 | `fork.S` | 55 | Fork assembly trampoline (callee-save register preservation) |
+| `pthread.rs` | - | POSIX threads: pthread_create, pthread_join, mutexes, condvars, rwlocks |
+| `sync.rs` | - | Synchronization primitives: futex-based Mutex, RWLock, Semaphore |
+| `tls.rs` | - | Thread-local storage setup and access |
 
 ## 2. Design Principles
 
@@ -212,7 +215,7 @@ The `msginfo()` function encodes these fields; `msginfo_label()`,
 
 Short messages (up to 4 registers) are passed entirely in CPU registers
 via the syscall ABI (`rdi`=cap, `rsi`=msginfo, `rdx`=MR0, `r10`=MR1,
-`r8`=MR2, `r9`=MR3). Messages with 5-20 registers use overflow:
+`r8`=MR2, `r9`=MR3). Messages with 5-22 registers use overflow:
 MR0-MR3 go in registers, MR4-MR19 are written to `ipc_buffer.msg[6..21]`
 by `write_overflow_ctx()` before the syscall.
 
@@ -306,7 +309,7 @@ after CSpace expansion.
 
 Also has a `untyped_retype_depth()` variant for expanded CSpaces.
 
-### TCB Operations (0x40-0x4B)
+### TCB Operations (0x40-0x4D)
 
 | Label | Function | Purpose |
 |-------|----------|---------|
@@ -318,8 +321,10 @@ Also has a `untyped_retype_depth()` variant for expanded CSpaces.
 | `TCB_SET_IPC_BUFFER` (0x48) | `tcb_set_ipc_buffer()` | Set IPC buffer address |
 | `TCB_BIND_NOTIFICATION` (0x49) | `tcb_bind_notification()` | Bind notification for combined wait |
 | `TCB_SET_FAULT_HANDLER` (0x4B) | `tcb_set_fault_handler()` | Set fault endpoint |
+| `TCB_COPY_FPU` (0x4C) | `tcb_copy_fpu()` | Copy FPU state between threads |
+| `TCB_SET_TLS_BASE` (0x4D) | `tcb_set_tls_base()` | Set thread-local storage base address |
 
-### VSpace Operations (0x50-0x57)
+### VSpace Operations (0x50-0x5A)
 
 | Label | Function | Purpose |
 |-------|----------|---------|
@@ -331,6 +336,9 @@ Also has a `untyped_retype_depth()` variant for expanded CSpaces.
 | `VSPACE_MAP_DEVICE` (0x55) | `vspace_map_device()` | Map device memory page |
 | `VSPACE_CLONE_COW_PAGE` (0x56) | `vspace_clone_cow_page()` | COW clone between VSpaces |
 | `VSPACE_MAP_DEVICE_RANGE` (0x57) | `vspace_map_device_range()` | Batch-map device pages |
+| `VSPACE_PROTECT` (0x58) | `vspace_protect()` | Change page protection flags |
+| `VSPACE_MAP_DEMAND` (0x59) | `vspace_map_demand()` | Map a demand-paged region |
+| `VSPACE_MAP_DEMAND_RANGE` (0x5A) | `vspace_map_demand_range()` | Batch-map demand-paged regions |
 
 ### Scheduling Operations (0x30-0x31)
 
@@ -339,14 +347,17 @@ Also has a `untyped_retype_depth()` variant for expanded CSpaces.
 | `SC_CONFIGURE` (0x30) | `sc_configure()` | Set budget and period (microseconds) |
 | `SC_BIND` (0x31) | `sc_bind()` | Bind scheduling context to TCB |
 
-### IRQ Operations (0x61-0x62)
+### IRQ Operations (0x60-0x64)
 
 | Label | Function | Purpose |
 |-------|----------|---------|
+| `IRQ_CONTROL_GET` (0x60) | `irq_control_get()` | Allocate IRQ handler cap from IRQ control |
 | `IRQ_HANDLER_ACK` (0x61) | `irq_handler_ack()` | Acknowledge IRQ |
 | `IRQ_HANDLER_SET_NOTIFICATION` (0x62) | `irq_handler_set_notification()` | Route IRQ to notification |
+| `IRQ_HANDLER_CLEAR` (0x63) | `irq_handler_clear()` | Clear IRQ handler notification |
+| `IRQ_DEVICE_UNTYPED_CREATE` (0x64) | `irq_device_untyped_create()` | Create device untyped from IRQ region |
 
-### IoPort Operations (0x70-0x73)
+### IoPort Operations (0x70-0x77)
 
 | Label | Function | Purpose |
 |-------|----------|---------|
@@ -354,6 +365,10 @@ Also has a `untyped_retype_depth()` variant for expanded CSpaces.
 | `IOPORT_OUT8` (0x71) | `ioport_out8()` | Write 8-bit I/O port |
 | `IOPORT_IN16` (0x72) | `ioport_in16()` | Read 16-bit I/O port |
 | `IOPORT_OUT16` (0x73) | `ioport_out16()` | Write 16-bit I/O port |
+| `IOPORT_IN32` (0x74) | `ioport_in32()` | Read 32-bit I/O port |
+| `IOPORT_OUT32` (0x75) | `ioport_out32()` | Write 32-bit I/O port |
+| `IOPORT_CONFIGURE` (0x76) | `ioport_configure()` | Configure I/O port range |
+| `IOPORT_CREATE` (0x77) | `ioport_create()` | Create new IoPort capability |
 
 ## 7. POSIX Compatibility Layer
 

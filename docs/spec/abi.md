@@ -177,13 +177,13 @@ struct tcb_config {
 ```c
 // IPC Buffer layout (4KB page, 512 x uint64_t)
 struct salty_ipc_buffer {
-    uint64_t msg[20];           // 0x000: MR0..MR19 (160 bytes)
-    uint64_t badge;             // 0x0A0: Received badge
-    uint64_t caps[4];           // 0x0A8: Cap slots to transfer (sender-side)
-    uint64_t receive_cnode;     // 0x0C8: CNode for receiving caps
-    uint64_t receive_index;     // 0x0D0: Starting slot index
-    uint64_t receive_depth;     // 0x0D8: CNode depth
-    uint64_t reserved[480];     // 0x0E0: Reserved / future use
+    uint64_t msg[22];           // 0x000: label, length, MR0..MR19 (176 bytes)
+    uint64_t badge;             // 0x0B0: Received badge
+    uint64_t caps[4];           // 0x0B8: Cap slots to transfer (sender-side)
+    uint64_t receive_cnode;     // 0x0D8: CNode for receiving caps
+    uint64_t receive_index;     // 0x0E0: Starting slot index
+    uint64_t receive_depth;     // 0x0E8: CNode depth
+    uint64_t reserved[478];     // 0x0F0: Reserved / future use
 };
 
 _Static_assert(sizeof(struct salty_ipc_buffer) == 4096, "IPC buffer size");
@@ -192,7 +192,7 @@ _Static_assert(sizeof(struct salty_ipc_buffer) == 4096, "IPC buffer size");
 **Register vs. IPC buffer message passing:**
 
 - MR0-MR3 are passed in CPU registers (RDX, R10, R8, R9) for low latency.
-- If `length > 4`, MR4-MR19 overflow to the thread's IPC buffer (`msg[4]` through `msg[19]`).
+- If `length > 4`, MR4-MR19 overflow to the thread's IPC buffer (`msg[6]` through `msg[21]`, since `msg[0]`=label, `msg[1]`=length).
 - The kernel reads/writes the IPC buffer at the virtual address set via `TCB_SetIPCBuffer`.
 
 ## Virtual Address Space Layout

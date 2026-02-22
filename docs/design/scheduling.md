@@ -10,6 +10,16 @@ SaltyOS uses EDF scheduling with budget enforcement, inspired by seL4's MCS (Mix
 - **Temporal isolation**: Budget limits prevent starvation
 - **Flexibility**: Both real-time and best-effort workloads
 
+## Source Modules
+
+| File | Purpose |
+|------|---------|
+| `sched/mod.rs` | Module entry, re-exports |
+| `sched/scheduler.rs` | EDF scheduler, global ready queue, context switch |
+| `sched/thread.rs` | TCB, SchedContext, ThreadState definitions |
+| `sched/pip.rs` | Priority Inheritance Protocol (prevents priority inversion in IPC) |
+| `sched/sleep_queue.rs` | Timed sleep queue (NanoSleep, timed IPC timeouts) |
+
 ## Scheduling Model
 
 ### Scheduling Context
@@ -34,8 +44,8 @@ pub struct SchedContext {
     /// Absolute deadline for current period
     deadline: u64,
     
-    /// Thread bound to this SC
-    bound_tcb: Option<TcbRef>,
+    /// Thread bound to this SC (raw pointer; null if unbound)
+    bound_tcb: *mut Tcb,
     
     /// Priority (for tiebreaking)
     priority: u8,
@@ -86,29 +96,38 @@ Earliest Deadline First:
 - Optimal for uniprocessor systems (can schedule any feasible workload)
 
 ```rust
-/// EDF scheduler
+/// EDF scheduler (single global ready queue, no heap allocation).
+/// Implemented in sched/scheduler.rs.
 pub struct Scheduler {
-    /// Ready queue ordered by deadline
-    ready_queue: BinaryHeap<SchedContextRef, DeadlineOrder>,
-    
-    /// Currently running SC per CPU
-    current: [Option<SchedContextRef>; MAX_CPUS],
-    
-    /// Exhausted SCs waiting for replenishment
-    replenish_queue: VecDeque<SchedContextRef>,
+    /// Global ready queue head, sorted by deadline.
+    /// Intrusive linked list threaded through TCB fields
+    /// (no BinaryHeap/Vec -- raw pointers in #![no_std] kernel).
+    ready_head: *mut Tcb,
+
+    /// Currently running thread per CPU
+    current: [*mut Tcb; MAX_CPUS],
+
+    /// Per-CPU idle thread
+    idle: [*mut Tcb; MAX_CPUS],
 }
 
 impl Scheduler {
-    /// Get next thread to run
-    pub fn pick_next(&mut self, cpu: usize) -> Option<TcbRef> {
-        // Get SC with earliest deadline
-        let sc = self.ready_queue.pop()?;
-        
-        self.current[cpu] = Some(sc.clone());
-        sc.state = ScState::Running;
-        
-        // Return bound thread
-        sc.bound_tcb
+    /// Get next thread to run on the given CPU.
+    /// Walks the global ready list to find the earliest-deadline
+    /// thread whose affinity allows running on this CPU.
+    /// Returns a raw pointer to the TCB (null if no runnable thread).
+    pub fn pick_next(&mut self, cpu: usize) -> *mut Tcb {
+        // Walk global ready list, find first TCB eligible for this CPU
+        let tcb = self.dequeue_for_cpu_unlocked(cpu);
+        if tcb.is_null() {
+            return core::ptr::null_mut();
+        }
+
+        self.current[cpu] = tcb;
+        // SAFETY: tcb is a valid pointer from the ready queue
+        unsafe { (*tcb).state = ThreadState::Running; }
+
+        tcb
     }
 }
 ```
@@ -165,26 +184,29 @@ pub fn timer_tick() {
 ### Budget Exhaustion
 
 ```rust
-fn handle_budget_exhausted(cpu: usize, sc: &mut SchedContext) {
-    sc.remaining = 0;
-    sc.state = ScState::Exhausted;
-    
-    // Calculate replenishment time
-    if sc.period > 0 {
-        // Periodic: replenish at next period boundary
-        sc.replenish_time = sc.deadline;
-        sc.deadline += sc.period;
-    } else {
-        // Sporadic: replenish after cooldown
-        sc.replenish_time = timer::now_us() + SPORADIC_COOLDOWN;
+fn handle_budget_exhausted(cpu: usize, sc: *mut SchedContext) {
+    // SAFETY: sc is the current CPU's running SC, guaranteed valid
+    unsafe {
+        (*sc).remaining = 0;
+        (*sc).state = ScState::Exhausted;
+
+        // Calculate replenishment time
+        if (*sc).period > 0 {
+            // Periodic: replenish at next period boundary
+            (*sc).replenish_time = (*sc).deadline;
+            (*sc).deadline += (*sc).period;
+        } else {
+            // Sporadic: replenish after cooldown
+            (*sc).replenish_time = timer::now_us() + SPORADIC_COOLDOWN;
+        }
     }
-    
-    // Add to replenishment queue
-    replenish_queue.push(sc.clone());
-    
+
+    // Add to replenishment queue (sorted by replenish_time)
+    replenish_queue.insert(sc);
+
     // Remove from current
-    current[cpu] = None;
-    
+    current[cpu] = core::ptr::null_mut();
+
     // Reschedule
     schedule(cpu);
 }
@@ -193,23 +215,27 @@ fn handle_budget_exhausted(cpu: usize, sc: &mut SchedContext) {
 ### Budget Replenishment
 
 ```rust
-/// Check for SCs ready for replenishment
+/// Check for SCs ready for replenishment.
+/// The replenish queue is sorted by replenish_time (earliest first).
 pub fn check_replenishments() {
     let now = timer::now_us();
-    
-    while let Some(sc) = replenish_queue.front() {
-        if sc.replenish_time <= now {
-            let sc = replenish_queue.pop_front().unwrap();
-            
-            // Restore budget
-            sc.remaining = sc.budget;
-            sc.state = ScState::Ready;
-            
-            // Add back to ready queue
-            ready_queue.push(sc);
-        } else {
-            break;  // Queue is ordered by replenish time
+
+    // Pop all SCs whose replenish_time has passed
+    while let Some(sc) = replenish_queue.peek_earliest() {
+        // SAFETY: sc is a valid pointer from the replenish queue
+        if unsafe { (*sc).replenish_time } > now {
+            break;  // Remaining entries are in the future
         }
+
+        let sc = replenish_queue.pop_earliest();
+        // Restore budget and re-enqueue
+        unsafe {
+            (*sc).remaining = (*sc).budget;
+            (*sc).state = ScState::Ready;
+        }
+
+        // Insert back into the global ready queue
+        enqueue_unlocked(sc);
     }
 }
 ```
@@ -231,36 +257,49 @@ fn should_preempt(cpu: usize, current: &SchedContext) -> bool {
 ### Context Switch
 
 ```rust
-/// Perform a context switch
+/// Perform a context switch.
+/// Called with SCHED_IPC_LOCK held; releases it before the actual
+/// switch and reacquires on resume (see lock ordering in mm/mod.rs).
 pub fn schedule(cpu: usize) {
-    let old = current[cpu].take();
-    let new = pick_next(cpu);
-    
-    if let (Some(old), Some(new)) = (&old, &new) {
-        if old.id == new.id {
-            // Same SC, no switch needed
-            current[cpu] = old.clone();
-            return;
+    let old = current[cpu];
+    let new_tcb = pick_next(cpu);  // sets current[cpu]
+
+    // If same thread, no switch needed
+    if !old.is_null() && !new_tcb.is_null() {
+        // SAFETY: both pointers were just validated as non-null
+        unsafe {
+            if (*old).bound_tcb == new_tcb {
+                current[cpu] = old;
+                return;
+            }
         }
     }
-    
-    // Put old SC back in ready queue if still runnable
-    if let Some(old) = old {
-        if old.state == ScState::Running && old.remaining > 0 {
-            old.state = ScState::Ready;
-            ready_queue.push(old);
+
+    // Put old thread back in global ready queue if still runnable
+    if !old.is_null() {
+        unsafe {
+            if (*old).state == ScState::Running && (*old).remaining > 0 {
+                (*old).state = ScState::Ready;
+                enqueue_unlocked(old);
+            }
         }
     }
-    
+
     // Switch to new thread
-    if let Some(new) = new {
-        let old_tcb = old.and_then(|sc| sc.bound_tcb);
-        let new_tcb = new.bound_tcb.unwrap();
-        
-        if let Some(old_tcb) = old_tcb {
-            arch::switch_context(&mut old_tcb.context, &new_tcb.context);
+    if !new_tcb.is_null() {
+        let old_tcb = if !old.is_null() {
+            unsafe { (*old).bound_tcb }
         } else {
-            arch::switch_to(&new_tcb.context);
+            core::ptr::null_mut()
+        };
+
+        if !old_tcb.is_null() {
+            // SAFETY: both TCB pointers are valid kernel objects
+            unsafe {
+                arch::switch_context(&mut (*old_tcb).context, &(*new_tcb).context);
+            }
+        } else {
+            unsafe { arch::switch_to(&(*new_tcb).context); }
         }
     } else {
         // No runnable thread - idle
@@ -308,30 +347,68 @@ When Thread A blocks on Thread B:
 3. B completes, A resumes
 4. B's priority reverts
 
+The implementation in `sched/pip.rs` handles priority inheritance during IPC
+blocking. When a sender with an earlier deadline blocks on an endpoint whose
+receiver has a later deadline, the receiver's effective deadline is temporarily
+lowered:
+
 ```rust
-fn do_send_blocking(
-    sender: &mut Tcb,
-    endpoint: &mut Endpoint,
-) {
-    // Block sender
-    sender.state = ThreadState::BlockedOnSend { endpoint };
-    endpoint.send_queue.push(sender);
-    
-    // Priority inheritance: if receiver has later deadline
-    if let Some(receiver_sc) = get_receiver_sc(endpoint) {
-        if let Some(sender_sc) = sender.sched_context {
-            if sender_sc.deadline < receiver_sc.deadline {
-                // Inherit sender's deadline temporarily
-                receiver_sc.inherited_deadline = Some(sender_sc.deadline);
-                // Re-sort in ready queue
-                ready_queue.update(receiver_sc);
-            }
+/// Called when sender blocks on endpoint (simplified from sched/pip.rs)
+fn do_send_blocking(sender: *mut Tcb, endpoint: *mut Endpoint) {
+    // SAFETY: sender and endpoint are valid kernel object pointers
+    unsafe {
+        (*sender).state = ThreadState::BlockedOnSend;
+        (*endpoint).send_queue.enqueue(sender);
+
+        // Priority inheritance (pip.rs):
+        // If the receiver's SC has a later deadline than the sender's SC,
+        // temporarily inherit the sender's deadline.
+        let receiver = (*endpoint).recv_queue.peek();
+        if !receiver.is_null() {
+            pip::maybe_inherit_priority(sender, receiver);
+            // Re-sort receiver in ready queue if deadline changed
         }
     }
-    
-    schedule();
+
+    schedule(current_cpu());
 }
+
+// In sched/pip.rs:
+// - Inheritance is transitive across IPC chains
+// - Reverted automatically on reply/ReplyRecv completion
 ```
+
+### Priority Inheritance Protocol (sched/pip.rs)
+
+The priority inheritance logic is implemented in `sched/pip.rs`. When a
+high-priority thread blocks on an endpoint (Send) and a lower-priority thread
+is the receiver, the kernel temporarily elevates the receiver's effective
+deadline to match the sender's. This prevents unbounded priority inversion where
+a medium-priority thread could starve the low-priority receiver and transitively
+block the high-priority sender.
+
+Key behaviors:
+- Inheritance is transitive: if thread A waits on B which waits on C, C inherits A's deadline
+- Inheritance is automatically reverted when the IPC completes (reply or ReplyRecv)
+- The ready queue is re-sorted after inheritance changes
+
+### Sleep Queue (sched/sleep_queue.rs)
+
+The sleep queue (`sched/sleep_queue.rs`) manages threads that are sleeping for
+a bounded duration. It is used by:
+
+- **NanoSleep** (syscall 13) -- sleep for a specified number of nanoseconds
+- **SendTimed** (syscall 21) -- blocking send with timeout
+- **RecvTimed** (syscall 22) -- blocking receive with timeout
+
+The sleep queue is a sorted intrusive linked list ordered by absolute wakeup
+time. On each timer tick, the kernel checks the head of the queue and wakes
+all threads whose deadline has passed. Woken threads are moved to the
+`ThreadState::Ready` state and enqueued on the global ready queue.
+
+For timed IPC, the thread is simultaneously on both the endpoint's wait queue
+and the sleep queue. Whichever fires first (partner arrival or timeout) removes
+the thread from the other queue.
 
 ## Sporadic Servers
 
@@ -358,19 +435,17 @@ Sporadic servers:
 
 ## SMP Considerations
 
-### Per-CPU Run Queues
+### Global Ready Queue with Affinity-Aware Dequeue
+
+The scheduler uses a **single global ready queue** (`ready_head`), not
+per-CPU queues. CPU affinity is stored in each TCB (as a `u8` CPU ID,
+`0xFF` = any CPU). When a CPU needs work, `dequeue_for_cpu_unlocked(cpu)`
+walks the global list and picks the earliest-deadline thread whose affinity
+matches:
 
 ```rust
-pub struct PerCpuScheduler {
-    /// Per-CPU ready queues
-    ready_queues: [ReadyQueue; MAX_CPUS],
-    
-    /// Global ready queue for unbound threads
-    global_queue: ReadyQueue,
-    
-    /// CPU affinity masks
-    affinity: HashMap<SchedContextId, CpuSet>,
-}
+/// In Tcb:
+pub cpu_affinity: u8,    // Preferred CPU (0xFF = any CPU)
 ```
 
 ### Load Balancing
@@ -393,10 +468,10 @@ fn balance_load() {
 ```rust
 /// Wake a thread on another CPU
 fn cross_cpu_wakeup(tcb: TcbRef, target_cpu: usize) {
-    // Add to target CPU's ready queue
-    ready_queues[target_cpu].push(tcb);
-    
-    // Send IPI to trigger reschedule
+    // Add to global ready queue
+    enqueue_unlocked(tcb);
+
+    // Send IPI to trigger reschedule on target CPU
     arch::send_ipi(target_cpu, IPI_RESCHEDULE);
 }
 ```
@@ -441,43 +516,39 @@ pub const DEFAULT_SCHED_CONFIG: SchedConfig = SchedConfig {
 
 ### SC Operations
 
+SchedContext has two invoke labels (0x30-0x31):
+
+| Label | Name | Description |
+|-------|------|-------------|
+| 0x30 | SC_CONFIGURE | Set budget, period, and priority |
+| 0x31 | SC_BIND | Bind SC to a TCB |
+
 ```rust
-/// Scheduling context system calls
+/// Scheduling context invocation dispatch
 pub fn invoke_sched_context(
     tcb: &mut Tcb,
     cap: &Capability,
     label: u64,
     msg: &IpcMessage,
 ) -> InvokeResult {
+    // SAFETY: cap.object points to a SchedContext allocated via untyped retype
     let sc = unsafe { &mut *(cap.object as *mut SchedContext) };
-    
+
     match label {
         // Configure SC parameters
         SC_CONFIGURE => {
             let budget = msg.get_word(0);
             let period = msg.get_word(1);
             let priority = msg.get_word(2) as u8;
-            
             sc_configure(sc, budget, period, priority)
         }
-        
+
         // Bind SC to a TCB
         SC_BIND => {
             let tcb_cap = msg.get_cap(0);
             sc_bind(sc, tcb_cap)
         }
-        
-        // Unbind SC from TCB
-        SC_UNBIND => {
-            sc_unbind(sc)
-        }
-        
-        // Yield remaining budget
-        SC_YIELD_TO => {
-            let target_cap = msg.get_cap(0);
-            sc_yield_to(sc, target_cap)
-        }
-        
+
         _ => InvokeResult::Error(SyscallError::InvalidOperation),
     }
 }
@@ -486,17 +557,21 @@ pub fn invoke_sched_context(
 ### Yield
 
 ```rust
-/// Yield CPU time
+/// Yield CPU time (syscall 8)
 pub fn sys_yield() {
-    let current = current_thread();
-    
-    if let Some(sc) = &current.sched_context {
-        sc.state = ScState::Ready;
-        ready_queue.push(sc.clone());
-        current[current_cpu()] = None;
+    let cpu = current_cpu();
+    let sc = current[cpu];
+
+    if !sc.is_null() {
+        // SAFETY: sc is the current CPU's running SC
+        unsafe {
+            (*sc).state = ScState::Ready;
+            enqueue_unlocked(sc);
+        }
+        current[cpu] = core::ptr::null_mut();
     }
-    
-    schedule();
+
+    schedule(cpu);
 }
 ```
 
@@ -506,16 +581,17 @@ Each CPU has an idle thread:
 
 ```rust
 fn idle_thread() -> ! {
+    let cpu = current_cpu();
     loop {
-        // Enable interrupts and halt
+        // Enable interrupts and halt until next interrupt
         arch::enable_interrupts();
         arch::halt();
-        
-        // Woken by interrupt - check for work
+
+        // Woken by interrupt (timer tick, IPI, etc.) - check for work
         arch::disable_interrupts();
-        
-        if !ready_queue.is_empty() {
-            schedule();
+
+        if !ready_head.is_null() {
+            schedule(cpu);
         }
     }
 }

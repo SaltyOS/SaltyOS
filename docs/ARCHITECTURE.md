@@ -56,16 +56,19 @@ graph TB
     subgraph "IPC Subsystem"
         EP[Endpoints]
         NOTIF[Notifications]
+        FUTEX[Futex]
+        QUEUE[IPC Queue]
     end
 
     subgraph "Memory Management"
         VSPACE[VSpace]
         FRAME[Frame Allocator]
-        SLAB[Slab Allocator]
     end
 
     subgraph "Capability System"
         CNODE[CNode]
+        CDT[CDT]
+        IOPORT[IoPort Caps]
         KOBJ[Kernel Objects]
         RIGHTS[Rights Management]
     end
@@ -97,6 +100,8 @@ graph TB
 | `Frame` | Physical memory page | retype, map |
 | `Untyped` | Raw physical memory | retype |
 | `IRQHandler` | Interrupt handler | ack, set_notification |
+| `IoPort` | I/O port range access | in, out |
+| `SchedContext` | Scheduling context | bind, set_params |
 
 ### Address Space Layout (x86_64)
 
@@ -105,8 +110,6 @@ graph TB
 │              Kernel Space               │
 │         (Higher Half Mapping)           │
 ├─────────────────────────────────────────┤ 0xFFFFFFFF80000000
-│            Kernel Heap                  │
-├─────────────────────────────────────────┤ 0xFFFFFFFF00000000
 │        Direct Physical Mapping          │
 │      (all physical memory mapped)       │
 ├─────────────────────────────────────────┤ 0xFFFF800000000000
@@ -311,9 +314,9 @@ graph LR
                         ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                   Frame Allocator                            │
-│               (Buddy or Bitmap based)                        │
+│                    (Bitmap based)                             │
 ├─────────────────────────────────────────────────────────────┤
-│  Free list: [Frame 0] -> [Frame 1] -> [Frame 2] -> ...      │
+│  Bitmap: [1][1][0][0][1][0][0][0][0][1] ...  (1=used)       │
 └─────────────────────────────────────────────────────────────┘
                         │
                         ▼
@@ -377,77 +380,130 @@ graph TB
 ```
 SaltyOS/
 ├── boot/
-│   ├── stage1/
+│   ├── meson.build
+│   ├── common/
+│   │   ├── bootinfo_tlv.h, manifest.h, types.h
+│   │   ├── string.c/h, print.c/h, udiv64.c
+│   │   ├── fb_console.c/h, font_8x16.c/h, stage2_info.h
+│   │   ├── arch/x86/bios/
+│   │   │   ├── btx.asm, btx.h, v86.c, v86.h
+│   │   └── efi/
+│   │       ├── efi_types.h, efi_protocol.h, print.c/h
+│   ├── stage1/arch/x86/
 │   │   ├── bios/
-│   │   │   ├── mbr.asm           # BIOS MBR entry
-│   │   │   └── vbr.asm           # Volume boot record
+│   │   │   ├── mbr.asm, mbr         # BIOS MBR entry
 │   │   └── uefi/
-│   │       └── entry.c           # UEFI application
-│   ├── stage2/
-│   │   ├── loader.c              # Stage 3 loader
-│   │   ├── long_mode.asm         # x86_64 mode switch
-│   │   └── paging_early.c        # Early page tables
-│   ├── stage3/
-│   │   ├── main.c                # Kernel loader
-│   │   ├── elf.c                 # ELF parser
-│   │   └── fs/
-│   │       ├── saltyfs.c         # SaltyFS read-only driver
-│   │       └── fat32.c           # FAT32 for ESP
-│   └── common/
-│       ├── print.c               # Debug output
-│       └── types.h               # Basic types
+│   │       └── entry.c, efi.ld      # UEFI PE/COFF entry
+│   ├── stage2/arch/x86/
+│   │   ├── bios/
+│   │   │   ├── entry.asm, a20.c/h, gdt.c/h, memory.c/h, stage2.ld
+│   │   └── uefi/
+│   │       ├── main.c, stage2.ld
+│   └── stage3/
+│       ├── bios_main.c, boot_alloc.c/h, config.h, elf.c/h, handoff.c/h
+│       ├── arch/x86/
+│       │   ├── cpu.h, paging.c, paging_impl.h
+│       │   ├── bios/
+│       │   │   ├── entry.asm, mode_switch.asm/h, stage3.ld
+│       │   └── uefi/
+│       │       ├── entry_uefi.asm, stage3.ld
+│       ├── disk/
+│       │   ├── disk.h, bios_disk.c, memory_disk.c
+│       └── fs/
+│           ├── fs.h, fat32.c, raw.c, saltyfs.c
 │
 ├── kernel/
 │   └── src/
-│       ├── lib.rs                # Kernel entry
+│       ├── lib.rs                # Kernel entry (kmain), serial I/O, panic handler
+│       ├── bootinfo.rs           # Boot info TLV parsing
+│       ├── builtins.rs           # Compiler built-in stubs (memcpy, memset)
+│       ├── cpio.rs               # CPIO archive parser for initrd
+│       ├── elf.rs                # ELF binary loader
+│       ├── init.rs               # Init task bootstrap, CSpace setup
+│       ├── rng.rs                # RDRAND-based random number generator
 │       ├── arch/
 │       │   ├── mod.rs
 │       │   └── x86_64/
-│       │       ├── mod.rs
-│       │       ├── boot.rs       # Arch init
-│       │       ├── gdt.rs        # GDT setup
-│       │       ├── idt.rs        # IDT/interrupts
-│       │       └── paging.rs     # Page tables
+│       │       ├── mod.rs, acpi.rs, ap_boot.rs, ap_tramp.S, apic.rs
+│       │       ├── boot.rs, context.rs, cpu.rs, cpuid.rs
+│       │       ├── exceptions.S, fpu.rs, gdt.rs, idt.rs
+│       │       ├── paging.rs, pit.rs, smap.rs, syscall.S
 │       ├── cap/
-│       │   ├── mod.rs
-│       │   ├── cnode.rs          # CNode implementation
-│       │   └── object.rs         # Kernel objects
+│       │   ├── mod.rs, cdt.rs, cnode.rs, ioport.rs
+│       │   ├── object.rs, refcount.rs, slot.rs, untyped.rs
+│       ├── console/
+│       │   ├── mod.rs, fb.rs, font.rs
 │       ├── ipc/
-│       │   ├── mod.rs
-│       │   ├── endpoint.rs       # Sync IPC
-│       │   └── notification.rs   # Async signals
+│       │   ├── mod.rs, endpoint.rs, futex.rs
+│       │   ├── irq.rs, notification.rs, queue.rs
 │       ├── mm/
-│       │   ├── mod.rs
-│       │   ├── frame.rs          # Physical allocator
-│       │   ├── vspace.rs         # Virtual spaces
-│       │   └── slab.rs           # Kernel allocator
+│       │   ├── mod.rs, frame.rs, vspace.rs
 │       ├── sched/
-│       │   ├── mod.rs
-│       │   ├── thread.rs         # TCB
-│       │   └── scheduler.rs      # EDF scheduler
+│       │   ├── mod.rs, pip.rs, scheduler.rs
+│       │   ├── sleep_queue.rs, thread.rs
 │       └── syscall/
-│           └── mod.rs            # Syscall dispatch
+│           ├── mod.rs, fastpath.rs
 │
 ├── userland/
-│   ├── init/                     # First process
-│   ├── procmgr/                  # Process manager
-│   ├── vfs/                      # VFS server
-│   ├── console/                  # Console driver
-│   ├── nameserv/                 # Name service
-│   └── drivers/                  # Device drivers
+│   ├── core/
+│   │   ├── init/                 # First process (service-based bootstrap)
+│   │   │   └── src/ (main.rs, ini.rs, selftest.rs, spawn.rs, svc_mgr.rs)
+│   │   ├── rtld/                 # Runtime dynamic linker
+│   │   ├── mmsrv/               # Memory manager server
+│   │   │   └── src/ (main.rs)
+│   │   ├── procmgr/             # Process manager (spawn/exit/waitpid)
+│   │   │   └── src/ (main.rs, alloc.rs, proc_table.rs, spawn_tx.rs)
+│   │   └── nameserv/            # Name service (endpoint lookup)
+│   │       └── src/ (main.rs)
+│   ├── servers/
+│   │   ├── vfs/                  # VFS server (ramfs + devfs + sockets + shm + poll)
+│   │   │   └── src/ (main.rs, at_ops.rs, client.rs, consts.rs, fileops.rs,
+│   │   │            misc.rs, mount.rs, path.rs, pipe.rs, poll.rs,
+│   │   │            procfs.rs, ramfs.rs, socket.rs, types.rs)
+│   │   ├── console/              # Serial console server
+│   │   │   └── src/ (main.rs, kbd.rs)
+│   │   ├── ttyd/                 # TTY daemon
+│   │   │   └── src/ (main.rs, handlers.rs, input.rs, types.rs)
+│   │   └── getty/                # Getty (login prompt)
+│   │       └── src/ (main.rs)
+│   ├── drivers/
+│   │   ├── blkdrv/               # Block device driver (virtio)
+│   │   │   └── src/ (main.rs, handlers.rs, virtio.rs)
+│   │   ├── pcisrv/               # PCI server
+│   │   │   └── src/ (main.rs)
+│   │   └── display/              # Display driver
+│   │       └── src/ (main.rs, font.rs)
+│   ├── fs/
+│   │   └── saltyfs/              # SaltyFS filesystem server
+│   │       └── src/ (main.rs, alloc.rs, block.rs, btree.rs, consts.rs,
+│   │                crc.rs, handlers.rs, types.rs)
+│   ├── tests/
+│   │   ├── test_runner/          # Automated test suite
+│   │   │   └── src/ (main.rs + test_*.rs modules)
+│   │   └── hello/                # Hello world test
+│   └── services/                 # .service files for boot ordering
 │
 ├── lib/
-│   ├── libsalty/                 # Syscall wrappers
-│   └── libc/                     # POSIX C library
+│   └── libsalty/                 # Userspace system library
+│       └── src/ (consts.rs, cpio.rs, elf_dynamic.rs, elf_loader.rs,
+│                framebuffer.rs, invoke.rs, ipc.rs, layout.rs, lib.rs,
+│                posix/ (mod.rs, at.rs, file.rs, misc.rs, pipe.rs,
+│                        poll.rs, proc.rs, socket.rs),
+│                posix_mm.rs, serial.rs, signals.rs, slot_alloc.rs,
+│                pthread.rs, sync.rs, syscall.rs, tls.rs, types.rs,
+│                fork.S)
 │
 ├── tools/
+│   ├── cross/x86_64.txt          # Meson cross file
+│   ├── mkcpio.py                 # CPIO initrd packer
 │   ├── mkimage.py                # Disk image creator
-│   └── cross/
-│       └── x86_64.txt            # Meson cross file
+│   ├── mksaltyfs.py              # SaltyFS image builder
+│   └── portbuild/                # Port build system
+│       ├── main.rs, build.rs, config.rs, deps.rs, extract.rs
+│       ├── fetch.rs, meson.build, parser.rs, stamps.rs, vars.rs
 │
 └── docs/
     ├── ARCHITECTURE.md           # This file
-    ├── BUILDING.md               # Build instructions
     ├── design/                   # Design documents
     └── spec/                     # Specifications
 ```

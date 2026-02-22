@@ -24,6 +24,9 @@ This dual-primitive design follows the L4/seL4 tradition, providing both reliabl
 | Capability transfer via IPC | Implemented |
 | Fault delivery via endpoint | Implemented |
 | IPC assembly fastpath | Implemented |
+| Timed IPC (SendTimed/RecvTimed) | Implemented |
+| Futex (userspace mutex primitive) | Implemented |
+| IPC wait queue management | Implemented |
 
 ## Synchronous IPC (Endpoints)
 
@@ -107,13 +110,13 @@ Each thread has an IPC buffer (4KB page) mapped at a configurable virtual addres
 ```rust
 #[repr(C)]
 pub struct IpcBuffer {
-    pub msg: [u64; 20],         // 0x000: MR0..MR19
-    pub badge: u64,             // 0x0A0: Received badge
-    pub caps: [u64; 4],         // 0x0A8: Cap slots to transfer (sender-side)
-    pub receive_cnode: u64,     // 0x0C8: CNode for receiving caps
-    pub receive_index: u64,     // 0x0D0: Starting slot index
-    pub receive_depth: u64,     // 0x0D8: CNode depth
-    pub reserved: [u64; 480],   // 0x0E0: Future use
+    pub msg: [u64; 22],         // 0x000: label, length, MR0..MR19 (176 bytes)
+    pub badge: u64,             // 0x0B0: Received badge
+    pub caps: [u64; 4],         // 0x0B8: Cap slots to transfer (sender-side)
+    pub receive_cnode: u64,     // 0x0D8: CNode for receiving caps
+    pub receive_index: u64,     // 0x0E0: Starting slot index
+    pub receive_depth: u64,     // 0x0E8: CNode depth
+    pub reserved: [u64; 478],   // 0x0F0: Future use (3824 bytes)
 }
 ```
 
@@ -264,6 +267,53 @@ Hardware IRQ → Kernel IRQ Handler → Signal Notification → Wake Driver Thre
 ```
 
 Each IRQ handler object binds to a notification. When the IRQ fires, the kernel signals `1 << (irq_num % 64)` into the notification word.
+
+## Timed IPC
+
+Two additional syscalls extend the basic Send/Recv with timeout support:
+
+| Syscall # | Name | Description |
+|-----------|------|-------------|
+| 21 | SendTimed | Blocking send with timeout (microseconds) |
+| 22 | RecvTimed | Blocking receive with timeout (microseconds) |
+
+When the timeout expires before a partner arrives, the blocked thread is removed
+from the endpoint's wait queue by the sleep queue timer and the syscall returns
+`SALTY_TIMEOUT`. This uses the same sleep queue infrastructure as `NanoSleep`
+(syscall 13), implemented in `sched/sleep_queue.rs`.
+
+Timed IPC prevents indefinite blocking in client-server interactions. A server
+can use `RecvTimed` to periodically perform housekeeping even when no client
+requests arrive, and a client can use `SendTimed` to detect unresponsive servers.
+
+## Futex
+
+The kernel provides a userspace futex primitive (syscall 18, implemented in
+`ipc/futex.rs`) for building efficient userspace synchronization:
+
+| Operation | Description |
+|-----------|-------------|
+| FUTEX_WAIT | Sleep if `*uaddr == expected_val`, wake on FUTEX_WAKE |
+| FUTEX_WAKE | Wake up to N threads sleeping on `uaddr` |
+| FUTEX_REQUEUE | Wake N threads, requeue remaining to a different `uaddr` |
+
+The futex syscall takes a userspace virtual address as the wait key. The kernel
+hashes the (VSpace, vaddr) pair to locate the wait queue. Threads blocked on a
+futex are in `ThreadState::BlockedOnFutex` and can be woken by any thread that
+calls FUTEX_WAKE on the same address.
+
+Futexes are the building block for userspace mutexes, condition variables,
+semaphores, and rwlocks in libsalty (see `lib/libsalty/src/sync/`).
+
+## IPC Wait Queue
+
+Wait queues (`ipc/queue.rs`) are the shared infrastructure underlying endpoint
+send/recv queues, notification waiters, and futex wait lists. Each queue is an
+intrusive linked list threaded through TCB fields (no heap allocation):
+
+- `tcb.queue_next` / `tcb.queue_prev` -- doubly-linked list pointers
+- Enqueue/dequeue are O(1) operations
+- Priority-ordered insertion is used when priority inheritance is active
 
 ## Performance Considerations
 

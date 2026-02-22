@@ -8,12 +8,15 @@ SaltyOS memory management follows the capability-based model:
 
 - **Untyped Memory**: Raw physical memory, the source of all objects
 - **Frames**: 4KB physical pages that can be mapped
-- **VSpace**: Virtual address space (page table hierarchy)
-- **Page Tables**: Intermediate levels (PML4, PDPT, PD, PT on x86_64)
+- **VSpace**: Virtual address space (page table hierarchy, including intermediate levels PML4/PDPT/PD/PT on x86_64)
 
-All memory access requires appropriate capabilities.
+Page tables are managed internally by VSpace operations -- there is no separate `PageTable` kernel object type. All memory access requires appropriate capabilities.
 
 ## Physical Memory Management
+
+Physical frame allocation uses a bitmap-based PMM (`mm/frame.rs`), not a buddy
+allocator or slab allocator. Each bit represents one 4KB frame. The bitmap is
+a fixed-size static array sized for the maximum supported physical memory.
 
 ### Memory Map from Bootloader
 
@@ -64,8 +67,8 @@ pub struct Untyped {
     /// Is this device memory (uncacheable)?
     is_device: bool,
     
-    /// Children (for revocation)
-    children: Vec<ObjectRef>,
+    /// Children tracked via Capability Derivation Tree (CDT)
+    /// -- no Vec/heap; parent-child links are embedded in capabilities
 }
 
 impl Untyped {
@@ -74,34 +77,37 @@ impl Untyped {
         self.size - self.watermark
     }
     
-    /// Retype to create kernel objects
+    /// Retype to create a kernel object.
+    /// Called via Untyped_Retype invocation (label 0x20).
+    /// The new object is initialized in-place at the watermark offset.
+    /// The caller provides a destination CNode slot; the kernel writes
+    /// a capability for the new object into that slot.
     pub fn retype(
         &mut self,
         object_type: CapType,
         size_bits: u8,
-        count: usize,
-    ) -> Result<Vec<ObjectRef>, MemError> {
+        dest_cnode: *mut CNode,
+        dest_index: usize,
+        dest_depth: u8,
+    ) -> Result<(), MemError> {
         let obj_size = object_size(object_type, size_bits);
-        let total = obj_size * count;
-        
+
         // Alignment check
         let aligned_watermark = align_up(self.watermark, obj_size);
-        
-        if aligned_watermark + total > self.size {
+
+        if aligned_watermark + obj_size > self.size {
             return Err(MemError::InsufficientMemory);
         }
-        
-        let mut objects = Vec::with_capacity(count);
-        
-        for i in 0..count {
-            let phys = self.base + aligned_watermark + (i * obj_size);
-            let obj = create_object_at(object_type, phys, size_bits)?;
-            self.children.push(obj.clone());
-            objects.push(obj);
-        }
-        
-        self.watermark = aligned_watermark + total;
-        Ok(objects)
+
+        let phys = self.base + aligned_watermark;
+        // SAFETY: phys points to zeroed memory within the untyped region
+        let obj_ptr = create_object_at(object_type, phys, size_bits)?;
+
+        // Install capability into destination CNode slot
+        install_cap(dest_cnode, dest_index, dest_depth, object_type, obj_ptr)?;
+
+        self.watermark = aligned_watermark + obj_size;
+        Ok(())
     }
 }
 ```
@@ -121,10 +127,10 @@ pub fn object_size(obj_type: CapType, size_bits: u8) -> usize {
         CapType::CNode => size_of::<Capability>() * (1 << size_bits),
         CapType::Untyped => 1 << size_bits,
         
-        // Page-sized objects
+        // Page-sized objects (no separate PageTable type;
+        // intermediate page tables are managed by VSpace internally)
         CapType::Frame => PAGE_SIZE,
-        CapType::PageTable => PAGE_SIZE,
-        CapType::VSpace => PAGE_SIZE,  // Top-level page table
+        CapType::VSpace => PAGE_SIZE,  // Top-level page table (+ VSpaceTracking at phys+4096)
         
         _ => 0,
     }
@@ -136,30 +142,26 @@ pub const PAGE_BITS: usize = 12;
 
 ## Frames
 
-A Frame represents a 4KB physical page:
+A Frame represents a 4KB physical page. Frames are standalone kernel objects
+created via `Untyped_Retype` with `object_type = Frame`. The `FrameObject`
+struct (defined in `cap/untyped.rs`) tracks the physical address and size:
 
 ```rust
-/// Physical memory frame
-pub struct Frame {
-    /// Physical address
-    phys: PhysAddr,
-    
-    /// Frame size (usually 4KB, but can be 2MB or 1GB for huge pages)
-    size_bits: u8,
-    
-    /// Is this device memory?
-    is_device: bool,
-    
-    /// Current mappings (for unmapping on revoke)
-    mappings: Vec<Mapping>,
-}
-
-/// A mapping of this frame in a VSpace
-struct Mapping {
-    vspace: VSpaceRef,
-    vaddr: VirtAddr,
+/// Single frame object (for Frame capabilities)
+/// Defined in kernel/src/cap/untyped.rs
+#[repr(C)]
+pub struct FrameObject {
+    /// Kernel object header (must be first for refcount access)
+    pub header: KernelObject,
+    pub phys_addr: PhysAddr,
+    pub size_bits: u8,
 }
 ```
+
+The kernel's bitmap-based physical memory manager (`mm/frame.rs`) tracks
+which 4KB physical frames are allocated using a bitmap (one bit per frame).
+Frame capabilities point to the `FrameObject` and carry rights inline in
+the capability metadata.
 
 ### Frame Sizes
 
@@ -193,17 +195,17 @@ pub struct ArchVSpace {
 }
 ```
 
-### Page Table Structure
+### Page Table Entries (kernel-internal)
+
+Page tables are not exposed as a separate kernel object type. They are managed
+internally by VSpace operations (MAP_PT allocates from an untyped frame and
+installs it in the page table hierarchy). The kernel accesses page table entries
+as raw 512-entry arrays via the physical-to-virtual direct map:
 
 ```rust
-/// Generic page table
-pub struct PageTable {
-    /// Physical address of this table
-    phys: PhysAddr,
-    
-    /// Entries
-    entries: [PageTableEntry; 512],
-}
+/// A page table is a 4KB-aligned array of 512 entries,
+/// accessed via phys_to_virt() on the physical address.
+/// (No standalone PageTable struct -- just raw pointer access.)
 
 /// Page table entry
 #[repr(transparent)]
@@ -361,12 +363,9 @@ pub fn map_frame(
     // Flush TLB for this address
     arch::flush_tlb_page(vaddr);
     
-    // Record mapping for revocation
-    frame.mappings.push(Mapping {
-        vspace: vspace.as_ref(),
-        vaddr,
-    });
-    
+    // Mapping is tracked in VSpaceTracking (embedded in the VSpace's
+    // untyped allocation at vspace_phys + 4096), not in the frame itself.
+
     Ok(())
 }
 ```
@@ -577,43 +576,132 @@ fn handle_user_page_fault(
 }
 ```
 
+## VSpace Page Flags
+
+Flags passed in the `rights`/`flags` argument of VSpace mapping operations:
+
+| Bit | Value | Name | Description |
+|-----|-------|------|-------------|
+| 0 | 0x01 | VSPACE_FLAG_WRITABLE | Page is writable |
+| 1 | 0x02 | VSPACE_FLAG_USER | Page is accessible from user mode |
+| 2 | 0x04 | VSPACE_FLAG_EXECUTABLE | Page is executable (NX bit cleared) |
+| 3 | 0x08 | VSPACE_FLAG_CACHE_DISABLE | Disable caching (for device memory) |
+| 4 | 0x10 | VSPACE_FLAG_WRITE_THROUGH | Write-through caching |
+| 5 | 0x20 | VSPACE_FLAG_COW | Copy-on-write semantics |
+
 ## VSpace Operations via Syscalls
 
+All VSpace operations are invoked via `Invoke` (syscall 9) on a VSpace capability. The label determines the operation:
+
+| Label | Name | Description |
+|-------|------|-------------|
+| 0x50 | VSPACE_MAP | Map a frame into the VSpace |
+| 0x51 | VSPACE_UNMAP | Unmap a page from the VSpace |
+| 0x52 | VSPACE_MAP_PT | Map an intermediate page table |
+| 0x53 | VSPACE_WALK | Walk page tables, return mapping info for an address |
+| 0x54 | VSPACE_COPY_PAGE | Copy page content between VSpaces |
+| 0x55 | VSPACE_MAP_DEVICE | Map device memory (uncacheable) |
+| 0x56 | VSPACE_CLONE_COW_PAGE | Clone a page with COW semantics |
+| 0x57 | VSPACE_MAP_DEVICE_RANGE | Batch device mapping (multiple contiguous pages) |
+| 0x58 | VSPACE_PROTECT | Change page protection flags on an existing mapping |
+| 0x59 | VSPACE_MAP_DEMAND | Map a demand-paged region (page fault triggers allocation) |
+| 0x5A | VSPACE_MAP_DEMAND_RANGE | Batch demand-page mapping |
+
 ```rust
-/// VSpace capability invocation
+/// VSpace capability invocation dispatch
 fn invoke_vspace(
     tcb: &mut Tcb,
     cap: &Capability,
     label: u64,
     msg: &IpcMessage,
 ) -> InvokeResult {
+    // SAFETY: cap.object points to a VSpace allocated via untyped retype
     let vspace = unsafe { &mut *(cap.object as *mut VSpace) };
-    
+
     match label {
-        // Map a frame
+        // Map a frame into the VSpace
         VSPACE_MAP => {
             let frame_cap = msg.get_cap(0);
             let vaddr = VirtAddr::new(msg.get_word(0));
-            let rights = MapRights::from_bits_truncate(msg.get_word(1) as u32);
-            
-            vspace_map(vspace, frame_cap, vaddr, rights)
+            let flags = msg.get_word(1) as u32;
+            vspace_map(vspace, frame_cap, vaddr, flags)
         }
-        
+
         // Unmap a page
         VSPACE_UNMAP => {
             let vaddr = VirtAddr::new(msg.get_word(0));
             vspace_unmap(vspace, vaddr)
         }
-        
-        // Map a page table object
+
+        // Map an intermediate page table at a given level
         VSPACE_MAP_PT => {
             let pt_cap = msg.get_cap(0);
             let vaddr = VirtAddr::new(msg.get_word(0));
             let level = msg.get_word(1) as u8;
-            
             vspace_map_pt(vspace, pt_cap, vaddr, level)
         }
-        
+
+        // Walk page tables, return physical address and flags
+        VSPACE_WALK => {
+            let vaddr = VirtAddr::new(msg.get_word(0));
+            vspace_walk(vspace, vaddr)
+        }
+
+        // Copy page content between VSpaces
+        VSPACE_COPY_PAGE => {
+            let src_vaddr = VirtAddr::new(msg.get_word(0));
+            let dst_vspace_cap = msg.get_cap(0);
+            let dst_vaddr = VirtAddr::new(msg.get_word(1));
+            vspace_copy_page(vspace, src_vaddr, dst_vspace_cap, dst_vaddr)
+        }
+
+        // Map device memory (uncacheable)
+        VSPACE_MAP_DEVICE => {
+            let phys = PhysAddr::new(msg.get_word(0));
+            let vaddr = VirtAddr::new(msg.get_word(1));
+            let flags = msg.get_word(2) as u32;
+            vspace_map_device(vspace, phys, vaddr, flags)
+        }
+
+        // Clone a page with COW semantics
+        VSPACE_CLONE_COW_PAGE => {
+            let src_vaddr = VirtAddr::new(msg.get_word(0));
+            let dst_vspace_cap = msg.get_cap(0);
+            let dst_vaddr = VirtAddr::new(msg.get_word(1));
+            vspace_clone_cow_page(vspace, src_vaddr, dst_vspace_cap, dst_vaddr)
+        }
+
+        // Batch device mapping (multiple contiguous pages)
+        VSPACE_MAP_DEVICE_RANGE => {
+            let phys = PhysAddr::new(msg.get_word(0));
+            let vaddr = VirtAddr::new(msg.get_word(1));
+            let num_pages = msg.get_word(2) as usize;
+            let flags = msg.get_word(3) as u32;
+            vspace_map_device_range(vspace, phys, vaddr, num_pages, flags)
+        }
+
+        // Change page protection flags
+        VSPACE_PROTECT => {
+            let vaddr = VirtAddr::new(msg.get_word(0));
+            let new_flags = msg.get_word(1) as u32;
+            vspace_protect(vspace, vaddr, new_flags)
+        }
+
+        // Map a demand-paged region (page fault triggers allocation)
+        VSPACE_MAP_DEMAND => {
+            let vaddr = VirtAddr::new(msg.get_word(0));
+            let flags = msg.get_word(1) as u32;
+            vspace_map_demand(vspace, vaddr, flags)
+        }
+
+        // Batch demand-page mapping
+        VSPACE_MAP_DEMAND_RANGE => {
+            let vaddr = VirtAddr::new(msg.get_word(0));
+            let num_pages = msg.get_word(1) as usize;
+            let flags = msg.get_word(2) as u32;
+            vspace_map_demand_range(vspace, vaddr, num_pages, flags)
+        }
+
         _ => InvokeResult::Error(SyscallError::InvalidOperation),
     }
 }
@@ -635,15 +723,17 @@ When a Frame capability is revoked:
 2. TLB is flushed on all CPUs
 3. Any threads accessing that memory will fault
 
+Revocation walks the Capability Derivation Tree (CDT) to find all
+derived capabilities. For each mapping tracked in VSpaceTracking, the
+kernel unmaps the page and flushes the TLB:
+
 ```rust
-fn revoke_frame(frame: &mut Frame) {
-    // Remove all mappings
-    for mapping in frame.mappings.drain(..) {
-        let vspace = mapping.vspace.get_mut();
-        let _ = unmap(vspace, mapping.vaddr);
-    }
-    
-    // Flush TLB on all CPUs
+fn revoke_frame(cap: &Capability) {
+    // Walk CDT children of this frame capability
+    // For each derived mapping, unmap from the target VSpace
+    // (VSpaceTracking at vspace_phys + 4096 records per-page metadata)
+
+    // Flush TLB on all CPUs via IPI
     arch::flush_tlb_all();
 }
 ```
