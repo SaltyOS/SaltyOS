@@ -539,10 +539,8 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
                 if (ph.p_flags & salty::PF_W) != 0 {
                     if (lib_entry.rw_seg_count as usize) < MAX_RW_SEGS {
                         let idx = lib_entry.rw_seg_count as usize;
-                        let mut rw_flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-                        if (ph.p_flags & salty::PF_X) != 0 {
-                            rw_flags |= VSPACE_FLAG_EXECUTABLE;
-                        }
+                        // W^X: writable segments never get executable permission
+                        let rw_flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
                         lib_entry.rw_segs[idx] = RwSegInfo {
                             vaddr_offset: (ph.p_vaddr & !0xFFFu64) - (min_vaddr & !0xFFFu64),
                             file_offset: ph.p_offset,
@@ -1063,12 +1061,13 @@ pub unsafe fn spawn_server(
         };
 
         let shared_lib_pages = shared_lib_va_pages_for_needed(&needed);
-        let layout = salty::layout::compute_vm_layout(
+        let layout = salty::layout::compute_vm_layout_randomized(
             elf_span,
             rtld_span,
             shared_lib_pages,
             map_initrd || is_dynamic,
             initrd_size,
+            || salty::syscall::sys_getrandom(),
         );
         if layout.stack_top == 0 {
             puts(b"[INIT] ELF too large for VA layout\n");

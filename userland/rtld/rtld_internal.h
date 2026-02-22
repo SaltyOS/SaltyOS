@@ -593,11 +593,13 @@ static inline uint64_t rtld_page_align_up(uint64_t v) {
     return (v + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
 }
 
-/* Convert ELF p_flags to VSpace mapping flags */
+/* Convert ELF p_flags to VSpace mapping flags (W^X: W and X are mutually exclusive) */
 static inline uint64_t rtld_elf_to_vspace_flags(uint32_t p_flags) {
     uint64_t flags = VSPACE_FLAG_USER;
-    if (p_flags & PF_W) flags |= VSPACE_FLAG_WRITABLE;
-    if (p_flags & PF_X) flags |= VSPACE_FLAG_EXECUTABLE;
+    if (p_flags & PF_W)
+        flags |= VSPACE_FLAG_WRITABLE;
+    else if (p_flags & PF_X)
+        flags |= VSPACE_FLAG_EXECUTABLE;
     return flags;
 }
 

@@ -308,6 +308,9 @@ int load_shared_library(struct rtld_state *st, const char *name,
                 }
 
                 uint64_t merged_flags = pages[existing].flags | flags;
+                /* W^X: if merge would produce W+X, drop X */
+                if ((merged_flags & VSPACE_FLAG_WRITABLE) && (merged_flags & VSPACE_FLAG_EXECUTABLE))
+                    merged_flags &= ~VSPACE_FLAG_EXECUTABLE;
                 if (merged_flags != pages[existing].flags) {
                     rtld_vspace_unmap(st->vspace, page);
                     uint64_t remap_err = rtld_vspace_map(st->vspace,

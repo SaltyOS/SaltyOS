@@ -18,6 +18,7 @@ mod elf;
 mod init;
 mod ipc;
 mod mm;
+mod rng;
 mod sched;
 mod syscall;
 

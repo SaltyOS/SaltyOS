@@ -104,3 +104,16 @@ pub fn futex_wake(addr: *const u32, count: u32) -> u64 {
     )
     .value
 }
+
+/// Get a 64-bit hardware random number from the kernel (RDRAND).
+///
+/// Returns `Some(value)` on success, `None` if the hardware RNG is unavailable.
+#[inline]
+pub fn sys_getrandom() -> Option<u64> {
+    let r = syscall(crate::consts::SYS_GETRANDOM, 0, 0, 0, 0, 0, 0);
+    if r.error == 0 {
+        Some(r.value)
+    } else {
+        None
+    }
+}

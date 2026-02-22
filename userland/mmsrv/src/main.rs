@@ -1166,12 +1166,11 @@ unsafe fn handle_mm_mprotect(msg: *const SaltyMsg, badge: u64, reply: *mut Salty
             return;
         }
 
-        // Convert PROT_* → VSPACE_FLAG_*
+        // Convert PROT_* → VSPACE_FLAG_* (W^X: W and X are mutually exclusive)
         let mut flags = VSPACE_FLAG_USER;
         if prot & PROT_WRITE as u8 != 0 {
             flags |= VSPACE_FLAG_WRITABLE;
-        }
-        if prot & PROT_EXEC as u8 != 0 {
+        } else if prot & PROT_EXEC as u8 != 0 {
             flags |= VSPACE_FLAG_EXECUTABLE;
         }
 

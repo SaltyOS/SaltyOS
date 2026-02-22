@@ -1652,12 +1652,13 @@ unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
         } else {
             0
         };
-        let layout = layout::compute_vm_layout(
+        let layout = layout::compute_vm_layout_randomized(
             elf_span,
             rtld_span,
             shared_lib_cache_pages,
             is_dynamic,
             lib_window_pages * 4096,
+            || salty::syscall::sys_getrandom(),
         );
         if layout.stack_top == 0 {
             puts(b"[PROCMGR] EXEC: ELF too large for VA layout\n");

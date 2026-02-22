@@ -64,6 +64,15 @@ unsafe fn configure_fpu_hardware() {
         if super::cpuid::has_xsave() {
             cr4 |= 1 << 18;
         }
+        // SMEP: prevent kernel from executing user-mode pages (CR4 bit 20)
+        if super::cpuid::has_smep() {
+            cr4 |= 1 << 20;
+        }
+        // SMAP: prevent kernel from accessing user-mode pages unless EFLAGS.AC=1 (CR4 bit 21)
+        if super::cpuid::has_smap() {
+            cr4 |= 1 << 21;
+            super::smap::enable_smap_runtime();
+        }
         core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack));
 
         // XCR0 configuration (if XSAVE available):

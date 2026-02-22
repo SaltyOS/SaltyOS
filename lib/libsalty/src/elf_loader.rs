@@ -150,12 +150,14 @@ fn record_page_map(ctx: &ElfLoaderCtx, vaddr: u64, frame_cap: Cap, flags: u64) -
 }
 
 /// Convert ELF segment flags (PF_R/W/X) to VSpace mapping flags.
+/// Enforces W^X: if both W and X are set, writable wins (executable is dropped).
 fn phdr_to_flags(p_flags: u32) -> u64 {
     let mut flags = VSPACE_FLAG_USER;
-    if p_flags & PF_W != 0 {
+    let w = p_flags & PF_W != 0;
+    let x = p_flags & PF_X != 0;
+    if w {
         flags |= VSPACE_FLAG_WRITABLE;
-    }
-    if p_flags & PF_X != 0 {
+    } else if x {
         flags |= VSPACE_FLAG_EXECUTABLE;
     }
     flags
@@ -633,8 +635,11 @@ pub unsafe fn elf_load(
                         }
                     }
 
-                    // Merge permissions
-                    let merged_flags = pages[existing_idx].flags | flags;
+                    // Merge permissions, enforcing W^X: if merge would produce W+X, drop X
+                    let mut merged_flags = pages[existing_idx].flags | flags;
+                    if (merged_flags & VSPACE_FLAG_WRITABLE != 0) && (merged_flags & VSPACE_FLAG_EXECUTABLE != 0) {
+                        merged_flags &= !VSPACE_FLAG_EXECUTABLE;
+                    }
                     if merged_flags != pages[existing_idx].flags {
                         invoke::vspace_unmap(ctx.child_vspace, page_vaddr);
                         let remap_err = invoke::vspace_map(

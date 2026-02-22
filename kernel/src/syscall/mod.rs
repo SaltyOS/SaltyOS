@@ -33,6 +33,7 @@ pub enum Syscall {
     DebugConsoleControl = 16,
     SetInvokeDepths = 17,
     Futex = 18,
+    GetRandom = 19,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -59,6 +60,7 @@ impl TryFrom<u64> for Syscall {
             16 => Ok(Syscall::DebugConsoleControl),
             17 => Ok(Syscall::SetInvokeDepths),
             18 => Ok(Syscall::Futex),
+            19 => Ok(Syscall::GetRandom),
             _ => Err(SyscallError::InvalidOperation),
         }
     }
@@ -445,6 +447,8 @@ fn construct_message(
                 let buf = (*current).ipc_buffer;
                 if buf != 0 {
                     let ipc_buf = buf as *const crate::ipc::IpcBuffer;
+                    // SMAP: temporarily allow user memory access
+                    let _guard = crate::arch::smap::UserAccessGuard::new();
 
                     if length > 4 {
                         let overflow = (length - 4).min(16);
@@ -498,6 +502,8 @@ pub(crate) unsafe fn write_msg_to_ipc_buffer(msg: &Message, badge: u64) {
         }
 
         let ipc_buf = buf as *mut crate::ipc::IpcBuffer;
+        // SMAP: temporarily allow user memory access for IPC buffer write
+        let _guard = crate::arch::smap::UserAccessGuard::new();
 
         // Write header: label and length
         (*ipc_buf).msg[0] = msg.label;
@@ -2472,6 +2478,11 @@ fn syscall_vspace_map(
         return SyscallResult::err(e);
     }
 
+    // W^X: writable + executable is not permitted
+    if (flags_bits & 1 != 0) && (flags_bits & 4 != 0) {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
     // VSpace operation (per-VSpace lock added in Task 6)
     unsafe {
         let frame = &*(frame_cap.object as *const FrameObject);
@@ -2519,6 +2530,11 @@ fn syscall_vspace_unmap(cap: &Capability, virt_addr: u64) -> SyscallResult {
 fn syscall_vspace_protect(cap: &Capability, virt_addr: u64, flags_bits: u64) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::MAP) {
         return SyscallResult::err(e);
+    }
+
+    // W^X: writable + executable is not permitted
+    if (flags_bits & 1 != 0) && (flags_bits & 4 != 0) {
+        return SyscallResult::err(SyscallError::InvalidArgument);
     }
 
     unsafe {
@@ -3198,6 +3214,10 @@ fn syscall_vspace_map_device(
     if (flags_bits & 4) != 0 && !dev_cap.has_right(CapRights::EXECUTE) {
         return SyscallResult::err(SyscallError::InsufficientRights);
     }
+    // W^X: writable + executable is not permitted
+    if (flags_bits & 1 != 0) && (flags_bits & 4 != 0) {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
 
     unsafe {
         let dev_ut = &*(dev_cap.object as *const UntypedMemory);
@@ -3285,6 +3305,10 @@ fn syscall_vspace_map_device_range(
     }
     if (flags_bits & 4) != 0 && !dev_cap.has_right(CapRights::EXECUTE) {
         return SyscallResult::err(SyscallError::InsufficientRights);
+    }
+    // W^X: writable + executable is not permitted
+    if (flags_bits & 1 != 0) && (flags_bits & 4 != 0) {
+        return SyscallResult::err(SyscallError::InvalidArgument);
     }
 
     unsafe {
@@ -3476,10 +3500,14 @@ pub fn handle(
             // Copy from user space into kernel stack buffer before acquiring lock
             let user_ptr = cap_ptr as *const u8;
             let mut kbuf = [0u8; 256];
-            for i in 0..len {
-                // SAFETY: pointer validated above to be in user space range;
-                // user pages are accessible via the active VSpace page tables
-                kbuf[i] = unsafe { core::ptr::read_volatile(user_ptr.add(i)) };
+            {
+                // SMAP: temporarily allow user memory access
+                let _guard = crate::arch::smap::UserAccessGuard::new();
+                for i in 0..len {
+                    // SAFETY: pointer validated above to be in user space range;
+                    // user pages are accessible via the active VSpace page tables
+                    kbuf[i] = unsafe { core::ptr::read_volatile(user_ptr.add(i)) };
+                }
             }
             // SAFETY: save/restore IRQ flags around spinlock
             let irq = unsafe { save_irq_disable() };
@@ -3551,6 +3579,14 @@ pub fn handle(
             // mr0 = expected value (for WAIT) or max wake count (for WAKE)
             // mr1 = timeout in nanoseconds (for FUTEX_WAIT_TIMEOUT)
             crate::ipc::futex::syscall_futex(cap_ptr, msg_info, mr0, mr1)
+        }
+        Syscall::GetRandom => {
+            // Returns a 64-bit hardware random number via RDRAND.
+            // No arguments needed. Returns value in RDX.
+            match crate::rng::rdrand64() {
+                Some(val) => SyscallResult::ok(val),
+                None => SyscallResult::err(SyscallError::InvalidOperation),
+            }
         }
     }
 }

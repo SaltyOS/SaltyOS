@@ -111,7 +111,11 @@ fn futex_wait(addr: u64, expected: u32) -> SyscallResult {
 
         // Read the user futex word. The kernel shares the user's page tables
         // so we can read the user address directly while in kernel mode.
-        let user_word = core::ptr::read_volatile(addr as *const u32);
+        // SMAP: temporarily allow user memory access for the futex word read.
+        let user_word = {
+            let _guard = crate::arch::smap::UserAccessGuard::new();
+            core::ptr::read_volatile(addr as *const u32)
+        };
         if user_word != expected {
             SCHED_IPC_LOCK.unlock();
             restore_irq(irq);
@@ -172,7 +176,11 @@ fn futex_wait_timeout(addr: u64, expected: u32, timeout_ns: u64) -> SyscallResul
         }
 
         // Read the user futex word
-        let user_word = core::ptr::read_volatile(addr as *const u32);
+        // SMAP: temporarily allow user memory access for the futex word read.
+        let user_word = {
+            let _guard = crate::arch::smap::UserAccessGuard::new();
+            core::ptr::read_volatile(addr as *const u32)
+        };
         if user_word != expected {
             SCHED_IPC_LOCK.unlock();
             restore_irq(irq);

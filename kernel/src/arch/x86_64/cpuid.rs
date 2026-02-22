@@ -14,6 +14,10 @@ const FEAT_SSE2: u32 = 1 << 1;
 const FEAT_FXSR: u32 = 1 << 2;
 const FEAT_XSAVE: u32 = 1 << 3;
 const FEAT_INVARIANT_TSC: u32 = 1 << 4;
+const FEAT_SMEP: u32 = 1 << 5;
+const FEAT_SMAP: u32 = 1 << 6;
+const FEAT_RDRAND: u32 = 1 << 7;
+const FEAT_RDSEED: u32 = 1 << 8;
 
 /// Features that must be present on every CPU for this kernel configuration.
 const REQUIRED_MASK: u32 = FEAT_SSE | FEAT_SSE2 | FEAT_FXSR;
@@ -121,6 +125,28 @@ fn read_local_features() -> CpuFeatures {
     if (ecx & (1 << 26)) != 0 {
         bits |= FEAT_XSAVE;
     }
+    // CPUID leaf 1 ECX bit 30 = RDRAND
+    if (ecx & (1 << 30)) != 0 {
+        bits |= FEAT_RDRAND;
+    }
+
+    // CPUID leaf 7, subleaf 0: structured extended features
+    {
+        // SAFETY: CPUID is always safe to call
+        let (_, ebx7, _, _) = unsafe { cpuid_leaf(7, 0) };
+        // EBX bit 7 = SMEP
+        if (ebx7 & (1 << 7)) != 0 {
+            bits |= FEAT_SMEP;
+        }
+        // EBX bit 18 = RDSEED
+        if (ebx7 & (1 << 18)) != 0 {
+            bits |= FEAT_RDSEED;
+        }
+        // EBX bit 20 = SMAP
+        if (ebx7 & (1 << 20)) != 0 {
+            bits |= FEAT_SMAP;
+        }
+    }
 
     // CPUID 0x80000007 EDX bit 8 = Invariant TSC.
     if cpuid_max_extended_leaf() >= 0x8000_0007 {
@@ -161,6 +187,14 @@ fn log_snapshot(cpu_id: usize, f: CpuFeatures) {
     s.dec(has_bit(f.bits, FEAT_XSAVE) as u64);
     s.puts(" INV_TSC=");
     s.dec(has_bit(f.bits, FEAT_INVARIANT_TSC) as u64);
+    s.puts(" SMEP=");
+    s.dec(has_bit(f.bits, FEAT_SMEP) as u64);
+    s.puts(" SMAP=");
+    s.dec(has_bit(f.bits, FEAT_SMAP) as u64);
+    s.puts(" RDRAND=");
+    s.dec(has_bit(f.bits, FEAT_RDRAND) as u64);
+    s.puts(" RDSEED=");
+    s.dec(has_bit(f.bits, FEAT_RDSEED) as u64);
     s.puts(" area_size=");
     s.dec(f.xsave_area_size as u64);
     s.putc(b'\n');
@@ -190,6 +224,18 @@ fn log_global_downgrade(cpu_id: usize, old_bits: u32, new_bits: u32) {
     }
     if has_bit(dropped, FEAT_INVARIANT_TSC) {
         s.puts(" INV_TSC");
+    }
+    if has_bit(dropped, FEAT_SMEP) {
+        s.puts(" SMEP");
+    }
+    if has_bit(dropped, FEAT_SMAP) {
+        s.puts(" SMAP");
+    }
+    if has_bit(dropped, FEAT_RDRAND) {
+        s.puts(" RDRAND");
+    }
+    if has_bit(dropped, FEAT_RDSEED) {
+        s.puts(" RDSEED");
     }
     s.putc(b'\n');
 }
@@ -305,6 +351,30 @@ pub fn has_xsave() -> bool {
 #[inline]
 pub fn has_invariant_tsc() -> bool {
     has_bit(GLOBAL_BITS.load(Ordering::Acquire), FEAT_INVARIANT_TSC)
+}
+
+/// Check if SMEP (Supervisor Mode Execution Prevention) is globally supported.
+#[inline]
+pub fn has_smep() -> bool {
+    has_bit(GLOBAL_BITS.load(Ordering::Acquire), FEAT_SMEP)
+}
+
+/// Check if SMAP (Supervisor Mode Access Prevention) is globally supported.
+#[inline]
+pub fn has_smap() -> bool {
+    has_bit(GLOBAL_BITS.load(Ordering::Acquire), FEAT_SMAP)
+}
+
+/// Check if RDRAND is globally supported.
+#[inline]
+pub fn has_rdrand() -> bool {
+    has_bit(GLOBAL_BITS.load(Ordering::Acquire), FEAT_RDRAND)
+}
+
+/// Check if RDSEED is globally supported.
+#[inline]
+pub fn has_rdseed() -> bool {
+    has_bit(GLOBAL_BITS.load(Ordering::Acquire), FEAT_RDSEED)
 }
 
 /// Check if SSE is supported on a specific CPU.

@@ -14,6 +14,7 @@ mod gdt;
 mod idt;
 pub mod paging;
 mod pit;
+pub mod smap;
 
 pub use apic::{send_ipi, set_tlb_shootdown_addr, IpiKind, ioapic_unmask, ioapic_mask};
 pub use cpu::{current_cpu, set_kernel_stack, next_invoke_seq, current_invoke_seq, read_fs_base, write_fs_base, MAX_CPUS};
@@ -356,11 +357,13 @@ pub fn init_syscalls() {
             options(nostack)
         );
 
-        // Write IA32_FMASK (clear IF on syscall, disable interrupts)
+        // Write IA32_FMASK: clear IF (bit 9) and AC (bit 18) on syscall.
+        // IF=0 disables interrupts; AC=0 re-enables SMAP protection so
+        // user-set AC cannot bypass SMAP in the kernel syscall path.
         core::arch::asm!(
             "wrmsr",
             in("rcx") 0xC0000084u32,  // IA32_FMASK
-            in("rax") 0x200u32,       // Clear IF flag
+            in("rax") (0x200u32 | 0x40000u32),  // Clear IF + AC
             in("rdx") 0u32,
             options(nostack)
         );

@@ -461,10 +461,8 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
                 if (ph.p_flags & salty::PF_W) != 0 {
                     if (lib_entry.rw_seg_count as usize) < MAX_RW_SEGS {
                         let idx = lib_entry.rw_seg_count as usize;
-                        let mut flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-                        if (ph.p_flags & salty::PF_X) != 0 {
-                            flags |= VSPACE_FLAG_EXECUTABLE;
-                        }
+                        // W^X: writable segments never get executable permission
+                        let flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
                         lib_entry.rw_segs[idx] = RwSegInfo {
                             vaddr_offset: (ph.p_vaddr & !0xFFFu64) - (min_vaddr & !0xFFFu64),
                             file_offset: ph.p_offset,
@@ -666,10 +664,8 @@ unsafe fn try_inherit_shared_lib_cache(
                 if (ph.p_flags & salty::PF_W) != 0 {
                     if (lib_entry.rw_seg_count as usize) < MAX_RW_SEGS {
                         let idx = lib_entry.rw_seg_count as usize;
-                        let mut flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-                        if (ph.p_flags & salty::PF_X) != 0 {
-                            flags |= VSPACE_FLAG_EXECUTABLE;
-                        }
+                        // W^X: writable segments never get executable permission
+                        let flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
                         lib_entry.rw_segs[idx] = RwSegInfo {
                             vaddr_offset: (ph.p_vaddr & !0xFFFu64) - (min_vaddr & !0xFFFu64),
                             file_offset: ph.p_offset,
@@ -1420,12 +1416,11 @@ pub(crate) unsafe fn exec_load_elf_mmsrv(
             let seg_end = seg_vaddr + phdr.p_memsz;
             let seg_end_page = (seg_end + 0xFFF) & !0xFFFu64;
 
-            // Convert ELF segment flags to VSpace flags
+            // Convert ELF segment flags to VSpace flags (W^X: W and X are mutually exclusive)
             let mut flags: u64 = VSPACE_FLAG_USER;
             if phdr.p_flags & PF_W != 0 {
                 flags |= VSPACE_FLAG_WRITABLE;
-            }
-            if phdr.p_flags & PF_X != 0 {
+            } else if phdr.p_flags & PF_X != 0 {
                 flags |= VSPACE_FLAG_EXECUTABLE;
             }
 
@@ -2013,12 +2008,13 @@ pub unsafe fn handle_spawn_tx(
 
         let shared_lib_cache_pages = shared_lib_va_pages_for_needed(&needed);
 
-        let layout = layout::compute_vm_layout(
+        let layout = layout::compute_vm_layout_randomized(
             elf_span,
             rtld_span,
             shared_lib_cache_pages,
             do_map_initrd,
             lib_window_pages * 4096,
+            || salty::syscall::sys_getrandom(),
         );
 
         if layout.stack_top == 0 {

@@ -4,6 +4,9 @@
 //! of its ELF, RTLD, and shared library regions. Eliminates hardcoded VA
 //! constants across init and procmgr.
 //!
+//! Supports ASLR via `compute_vm_layout_randomized()`, which applies random
+//! page-aligned offsets to the code base and stack base.
+//!
 //! SPDX-License-Identifier: GPL-2.0-only
 
 /// Number of 4K stack pages allocated per child process (default 16K stack).
@@ -196,6 +199,109 @@ pub fn compute_vm_layout(
     } else {
         (VmRegion::zero(), VmRegion::zero(), 0)
     };
+
+    let initrd = if map_initrd && initrd_window_size > 0 {
+        VmRegion { base: INITRD_BASE, size: page_align_up(initrd_window_size as u64) }
+    } else {
+        VmRegion::zero()
+    };
+
+    VmLayoutPlan {
+        ipc_buf,
+        elf_code,
+        rtld,
+        shared_libs,
+        stack,
+        scratch,
+        initrd,
+        stack_top,
+    }
+}
+
+/// Maximum ASLR slide for code base (in pages). 256 pages = 1 MiB entropy.
+const ASLR_CODE_MAX_PAGES: u64 = 256;
+/// Maximum ASLR slide for stack base (in pages). 64 pages = 256 KiB entropy.
+const ASLR_STACK_MAX_PAGES: u64 = 64;
+
+/// Compute a randomized VA layout for a child process (ASLR).
+///
+/// Applies random page-aligned offsets to the code base and stack base.
+/// If `rand_u64` returns `None` (hardware RNG unavailable), falls back
+/// to the deterministic layout.
+///
+/// `rand_u64` is a callback that returns a random u64.
+pub fn compute_vm_layout_randomized(
+    elf_span: u64,
+    rtld_span: u64,
+    shared_lib_cache_pages: usize,
+    map_initrd: bool,
+    initrd_window_size: usize,
+    rand_u64: fn() -> Option<u64>,
+) -> VmLayoutPlan {
+    // Get random offsets; fall back to 0 if RNG unavailable
+    let code_slide = match rand_u64() {
+        Some(v) => (v % ASLR_CODE_MAX_PAGES) * 0x1000,
+        None => 0,
+    };
+    let stack_slide = match rand_u64() {
+        Some(v) => (v % ASLR_STACK_MAX_PAGES) * 0x1000,
+        None => 0,
+    };
+
+    let ipc_buf = VmRegion { base: IPC_BUF_BASE, size: 0x1000 };
+
+    let code_base = ELF_CODE_BASE + code_slide;
+    let elf_code = VmRegion { base: code_base, size: page_align_up(elf_span) };
+
+    let rtld = if rtld_span > 0 {
+        let base = page_align_up(elf_code.end() + 0x1000);
+        VmRegion { base, size: page_align_up(rtld_span) }
+    } else {
+        VmRegion::zero()
+    };
+
+    let shared_libs = if shared_lib_cache_pages > 0 && rtld.size > 0 {
+        let base = page_align_up(rtld.end() + 0x1000);
+        VmRegion { base, size: (shared_lib_cache_pages as u64) * 0x1000 }
+    } else {
+        VmRegion::zero()
+    };
+
+    let code_end = if shared_libs.size > 0 {
+        shared_libs.end()
+    } else if rtld.size > 0 {
+        rtld.end()
+    } else {
+        elf_code.end()
+    };
+
+    let stack_size = (CHILD_STACK_PAGES as u64) * 0x1000;
+
+    // Stack base with ASLR: slide down from default base (stack_slide reduces the
+    // base address, creating a random gap above the code region).
+    let (stack, scratch, stack_top) = if code_end <= DEFAULT_STACK_BASE.saturating_sub(stack_slide) {
+        let sbase = DEFAULT_STACK_BASE - stack_slide;
+        (
+            VmRegion { base: sbase, size: stack_size },
+            VmRegion { base: DEFAULT_SCRATCH_BASE, size: 0x1000 },
+            sbase + stack_size,
+        )
+    } else if code_end <= WINDOW2_STACK_BASE.saturating_sub(stack_slide) {
+        let sbase = WINDOW2_STACK_BASE - stack_slide;
+        (
+            VmRegion { base: sbase, size: stack_size },
+            VmRegion { base: WINDOW2_SCRATCH_BASE, size: 0x1000 },
+            sbase + stack_size,
+        )
+    } else {
+        // Fall back to deterministic layout if ASLR causes overflow
+        return compute_vm_layout(elf_span, rtld_span, shared_lib_cache_pages, map_initrd, initrd_window_size);
+    };
+
+    // Verify stack doesn't overlap scratch page
+    if stack.end() > scratch.base {
+        return compute_vm_layout(elf_span, rtld_span, shared_lib_cache_pages, map_initrd, initrd_window_size);
+    }
 
     let initrd = if map_initrd && initrd_window_size > 0 {
         VmRegion { base: INITRD_BASE, size: page_align_up(initrd_window_size as u64) }

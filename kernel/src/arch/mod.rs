@@ -25,6 +25,14 @@ pub use x86_64::{ioapic_unmask, ioapic_mask};
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::fpu;
 
+// Re-export CPUID feature detection sub-module
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::cpuid;
+
+// Re-export SMAP sub-module (stac/clac, UserAccessGuard)
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::smap;
+
 /// Initialize architecture-specific subsystems
 pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     #[cfg(target_arch = "x86_64")]

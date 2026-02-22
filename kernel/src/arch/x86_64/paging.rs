@@ -171,11 +171,14 @@ unsafe fn init_direct_map() {
                 break;
             }
 
-            // Create 2MB huge page entry (Present | Writable | Huge)
+            // Create 2MB huge page entry (Present | Writable | Huge | NoExecute)
+            // NX prevents code execution from the direct physical map.
+            // Kernel code runs from PIE virtual addresses, not through this map.
             let entry = phys_addr
                 | (PageFlags::Present as u64)
                 | (PageFlags::Writable as u64)
-                | (PageFlags::HugePage as u64);
+                | (PageFlags::HugePage as u64)
+                | (PageFlags::NoExecute as u64);
             pd.set_entry(pd_entry_idx, entry);
         }
     }
