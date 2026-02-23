@@ -47,13 +47,31 @@ pub(crate) unsafe fn handle_setpgid(msg: &SaltyMsg, reply: &mut SaltyMsg, badge:
             return;
         }
 
+        // Idempotent: target already in the requested group
+        if proctab(ti).pgid == pgid {
+            reply.label = super::SALTY_OK;
+            reply.length = 0;
+            return;
+        }
+
+        // POSIX: the target process group must already exist in the caller's session.
+        // A group exists as long as any non-FREE process has that pgid -- we can't
+        // rely on find_by_pid(pgid) because the group leader may have already exited.
         if pgid != target_pid {
-            let Some(gi) = find_by_pid(pgid) else {
+            let target_sid = proctab(ti).sid;
+            let mut pg_exists = false;
+            for i in 0..crate::proc_table::proctab_cap() {
+                let p = proctab(i);
+                if p.state != crate::proc_table::PROC_FREE
+                    && p.pgid == pgid
+                    && p.sid == target_sid
+                {
+                    pg_exists = true;
+                    break;
+                }
+            }
+            if !pg_exists {
                 reply.label = super::SALTY_NOT_FOUND;
-                return;
-            };
-            if proctab(gi).sid != proctab(ti).sid {
-                reply.label = super::SALTY_INVALID_OPERATION;
                 return;
             }
         }
