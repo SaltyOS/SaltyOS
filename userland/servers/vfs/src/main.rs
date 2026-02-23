@@ -787,7 +787,7 @@ pub extern "C" fn _start() -> ! {
                                 let mount_idx = fde.dev_type as usize;
                                 let remote_ino = fde.sock_id as u64;
                                 let count = msg.regs[1];
-                                if count > 152 && *(&raw const VFS_SHM_ACTIVE) {
+                                if *(&raw const VFS_SHM_ACTIVE) {
                                     // SHM bulk read path
                                     mount::mount_read_shm(
                                         mount_idx, remote_ino, fde.offset, count,

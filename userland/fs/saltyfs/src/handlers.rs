@@ -30,6 +30,24 @@ fn fnv1a_hash(name: &[u8]) -> u64 {
     h
 }
 
+/// Insert a DIR_ITEM with linear probing on FNV-1a hash collision.
+/// Returns false if insertion fails (out of memory or too many collisions).
+fn dir_item_insert(parent_ino: u64, name: &[u8], dir_buf: &[u8]) -> bool {
+    let mut key = BTreeKey {
+        object_id: parent_ino,
+        item_type: SALTY_DIR_ITEM,
+        offset: fnv1a_hash(name),
+    };
+    let root_tree = unsafe { (*(&raw const SB)).root_tree };
+    for _ in 0..16 {
+        if btree_find_item(root_tree, &key).is_none() {
+            return btree_cow_insert(&key, dir_buf);
+        }
+        key.offset = key.offset.wrapping_add(1);
+    }
+    false
+}
+
 /// Find the actual BTreeKey for a DIR_ITEM entry by scanning for a matching name.
 /// Returns None if no matching entry is found. This handles both old-style
 /// (offset=child_ino) and new-style (offset=fnv1a_hash(name)) DIR_ITEM keys.
@@ -521,6 +539,17 @@ pub(crate) fn handle_read(msg: &SaltyMsg) -> SaltyMsg {
     let count = msg.regs[2];
     let shm_offset = msg.regs[3];
 
+    // Validate SHM bounds
+    let shm_size = if unsafe { *(&raw const crate::VFS_SHM_MAPPED) } {
+        VFS_SHM_PAGES * 4096
+    } else {
+        SHM_SIZE
+    };
+    if shm_offset >= shm_size || count > shm_size - shm_offset {
+        reply.label = SALTY_INVALID_ARGUMENT;
+        return reply;
+    }
+
     // Use VFS SHM if mapped, otherwise blkdrv SHM
     let dest_base = if unsafe { *(&raw const crate::VFS_SHM_MAPPED) } {
         VFS_SHM_VADDR + shm_offset
@@ -690,15 +719,10 @@ pub(crate) fn handle_create(msg: &SaltyMsg) -> SaltyMsg {
         return reply;
     }
 
-    // Insert DIR_ITEM
+    // Insert DIR_ITEM (with linear probing on hash collision)
     let mut dir_buf = [0u8; 256];
     let dir_len = build_dir_item(new_ino, &name_buf[..name_len as usize], 1, &mut dir_buf);
-    let dir_key = BTreeKey {
-        object_id: parent_ino,
-        item_type: SALTY_DIR_ITEM,
-        offset: fnv1a_hash(&name_buf[..name_len as usize]),
-    };
-    if !btree_cow_insert(&dir_key, &dir_buf[..dir_len]) {
+    if !dir_item_insert(parent_ino, &name_buf[..name_len as usize], &dir_buf[..dir_len]) {
         reply.label = SALTY_OUT_OF_MEMORY;
         return reply;
     }
@@ -1061,15 +1085,10 @@ pub(crate) fn handle_mkdir_fs(msg: &SaltyMsg) -> SaltyMsg {
         return reply;
     }
 
-    // Insert DIR_ITEM in parent
+    // Insert DIR_ITEM in parent (with linear probing on hash collision)
     let mut dir_buf = [0u8; 256];
     let dir_len = build_dir_item(new_ino, &name_buf[..name_len as usize], 4, &mut dir_buf); // type 4 = directory
-    let dir_key = BTreeKey {
-        object_id: parent_ino,
-        item_type: SALTY_DIR_ITEM,
-        offset: fnv1a_hash(&name_buf[..name_len as usize]),
-    };
-    if !btree_cow_insert(&dir_key, &dir_buf[..dir_len]) {
+    if !dir_item_insert(parent_ino, &name_buf[..name_len as usize], &dir_buf[..dir_len]) {
         reply.label = SALTY_OUT_OF_MEMORY;
         return reply;
     }
@@ -1382,15 +1401,10 @@ pub(crate) fn handle_rename_fs(msg: &SaltyMsg) -> SaltyMsg {
         None => 1u8,
     };
 
-    // Insert new DIR_ITEM (use fnv1a_hash for offset to avoid key collisions)
+    // Insert new DIR_ITEM (with linear probing on hash collision)
     let mut dir_buf = [0u8; 256];
     let dir_len = build_dir_item(child_ino, &new_name[..new_name_len as usize], dir_type, &mut dir_buf);
-    let new_dir_key = BTreeKey {
-        object_id: new_parent,
-        item_type: SALTY_DIR_ITEM,
-        offset: fnv1a_hash(&new_name[..new_name_len as usize]),
-    };
-    if !btree_cow_insert(&new_dir_key, &dir_buf[..dir_len]) {
+    if !dir_item_insert(new_parent, &new_name[..new_name_len as usize], &dir_buf[..dir_len]) {
         reply.label = SALTY_OUT_OF_MEMORY;
         return reply;
     }
@@ -1598,6 +1612,13 @@ pub(crate) fn handle_write_shm(msg: &SaltyMsg) -> SaltyMsg {
     let offset = msg.regs[1];
     let count = msg.regs[2];
     let shm_offset = msg.regs[3];
+
+    // Validate SHM bounds
+    let shm_size = VFS_SHM_PAGES * 4096;
+    if shm_offset >= shm_size || count > shm_size - shm_offset {
+        reply.label = SALTY_INVALID_ARGUMENT;
+        return reply;
+    }
 
     let inode = match get_inode(ino) {
         Some(i) => i,
@@ -1863,18 +1884,15 @@ pub(crate) fn handle_symlink(msg: &SaltyMsg) -> SaltyMsg {
         return reply;
     }
 
-    // Insert DIR_ITEM with type 7 (symlink)
+    // Insert DIR_ITEM with type 7 (symlink), with linear probing on hash collision
     let mut dir_buf = [0u8; 256];
     let dir_len = build_dir_item(new_ino, &name_buf[..name_len], 7, &mut dir_buf);
-    let dir_key = BTreeKey {
-        object_id: parent_ino,
-        item_type: SALTY_DIR_ITEM,
-        offset: fnv1a_hash(&name_buf[..name_len]),
-    };
-    if !btree_cow_insert(&dir_key, &dir_buf[..dir_len]) {
+    if !dir_item_insert(parent_ino, &name_buf[..name_len], &dir_buf[..dir_len]) {
         reply.label = SALTY_OUT_OF_MEMORY;
         return reply;
     }
+
+    update_inode_mtime(parent_ino);
 
     reply.label = SALTY_OK;
     reply.length = 1;
@@ -2012,16 +2030,11 @@ pub(crate) fn handle_link(msg: &SaltyMsg) -> SaltyMsg {
         return reply;
     }
 
-    // Insert DIR_ITEM (use fnv1a_hash for offset to avoid key collisions with multiple links)
+    // Insert DIR_ITEM (with linear probing on hash collision)
     let dir_type: u8 = if inode.mode & 0o170000 == 0o120000 { 7 } else { 1 };
     let mut dir_buf = [0u8; 256];
     let dir_len = build_dir_item(existing_ino, &name_buf[..name_len], dir_type, &mut dir_buf);
-    let dir_key = BTreeKey {
-        object_id: new_parent,
-        item_type: SALTY_DIR_ITEM,
-        offset: fnv1a_hash(&name_buf[..name_len]),
-    };
-    if !btree_cow_insert(&dir_key, &dir_buf[..dir_len]) {
+    if !dir_item_insert(new_parent, &name_buf[..name_len], &dir_buf[..dir_len]) {
         reply.label = SALTY_OUT_OF_MEMORY;
         return reply;
     }
@@ -2039,6 +2052,8 @@ pub(crate) fn handle_link(msg: &SaltyMsg) -> SaltyMsg {
         reply.label = SALTY_OUT_OF_MEMORY;
         return reply;
     }
+
+    update_inode_mtime(new_parent);
 
     reply.label = SALTY_OK;
     reply.length = 1;

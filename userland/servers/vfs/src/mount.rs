@@ -714,17 +714,21 @@ pub(crate) unsafe fn mount_symlink(
         let mut req = SaltyMsg::zeroed();
         req.label = SALTYFS_SYMLINK;
         req.regs[0] = parent_ino;
+        if name_len as usize > 72 || target_len as usize > 64 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
         req.regs[1] = name_len as u64;
         req.regs[2] = target_len as u64;
         // MR3..MR11 = link name (72 bytes max)
         let dst_name = &raw mut req.regs[3] as *mut u8;
-        let copy_name = core::cmp::min(name_len as usize, 72);
+        let copy_name = name_len as usize;
         for i in 0..copy_name {
             *dst_name.add(i) = *name.add(i);
         }
         // MR12..MR19 = target (64 bytes max)
         let dst_target = &raw mut req.regs[12] as *mut u8;
-        let copy_target = core::cmp::min(target_len as usize, 64);
+        let copy_target = target_len as usize;
         for i in 0..copy_target {
             *dst_target.add(i) = *target.add(i);
         }
@@ -787,7 +791,11 @@ pub(crate) unsafe fn mount_link(
         req.label = SALTYFS_LINK;
         req.regs[0] = existing_ino;
         req.regs[1] = new_parent_ino;
-        let copy = core::cmp::min(name_len as usize, 136);
+        if name_len as usize > 136 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+        let copy = name_len as usize;
         req.regs[2] = copy as u64;
         // MR3..MR19 = name (136 bytes max)
         let dst = &raw mut req.regs[3] as *mut u8;
