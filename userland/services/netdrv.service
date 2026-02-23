@@ -10,4 +10,3 @@ Before=vfs
 
 [Capabilities]
 NeedEP=pcisrv:64
-CopyCap=11:84

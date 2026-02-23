@@ -151,7 +151,7 @@ static mut DEVICE_UNTYPED_POOL: [UntypedMemory; MAX_DEVICE_UNTYPEDS] = {
 static mut DEVICE_UNTYPED_NEXT: usize = 0;
 
 /// Maximum number of dynamically-created IRQ handlers (for per-device IRQ routing)
-const MAX_DYNAMIC_IRQ_HANDLERS: usize = 8;
+const MAX_DYNAMIC_IRQ_HANDLERS: usize = 32;
 /// Pool of IRQ handler objects for runtime provisioning
 static mut DYNAMIC_IRQ_HANDLER_POOL: [IrqHandler; MAX_DYNAMIC_IRQ_HANDLERS] = {
     const EMPTY: IrqHandler = IrqHandler::new(0);

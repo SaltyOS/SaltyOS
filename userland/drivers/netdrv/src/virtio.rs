@@ -17,10 +17,8 @@ const CAP_SELF_CSPACE: u64 = 2;
 const CAP_PCISRV_EP: u64 = 64;
 const CAP_MMSRV_EP: u64 = 7;
 
-/// Slot for dynamically received IoPort cap from pcisrv
-const CAP_RECEIVED_IOPORT: u64 = 80;
-/// Slot for dynamically received device untyped cap from pcisrv (MMIO BAR)
-const CAP_RECEIVED_DEVUT: u64 = 81;
+/// Slot for dynamically received BAR cap from pcisrv (IoPort or device untyped)
+const CAP_RECEIVED_BAR: u64 = 80;
 
 /// virtio-net PCI vendor/device IDs (legacy transitional)
 const VIRTIO_VENDOR: u16 = 0x1AF4;
@@ -104,6 +102,7 @@ static mut TX_QUEUE_BASE: u64 = 0;
 static mut TX_AVAIL_OFF: u64 = 0;
 static mut TX_USED_OFF: u64 = 0;
 static mut TX_AVAIL_IDX: u16 = 0;
+static mut TX_LAST_USED_IDX: u16 = 0;
 
 // DMA buffer pools
 static mut RX_BUF_BASE: u64 = 0;
@@ -226,6 +225,11 @@ fn bar_write32(offset: u64, val: u32) {
 fn vaddr_to_phys(vaddr: u64) -> u64 {
     let err = invoke::vspace_walk(CAP_SELF_VSPACE, vaddr, 1);
     if err != 0 {
+        let mut lb = LineBuf::new();
+        lb.str(b"[netdrv] vspace_walk failed: ");
+        lb.dec(err as u64);
+        lb.putc(b'\n');
+        lb.flush();
         return 0;
     }
     match invoke::vspace_walk_result_entry(0) {
@@ -260,8 +264,9 @@ pub(crate) fn find_virtio_net() -> Option<(u8, u8, u8, u32, u64)> {
     Some((bus, dev, func, bar0 as u32, bar0))
 }
 
-/// Get BAR/IRQ info from pcisrv. Returns (bar_base, bar_bits, bar_size, irq, bar_is_io).
-pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u32, u8, bool)> {
+/// Get BAR/IRQ info from pcisrv.
+/// Returns (bar_base, bar_bits, bar_size, irq, bar_is_io, has_irq_handler).
+pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u32, u8, bool, bool)> {
     let mut msg = SaltyMsg::zeroed();
     msg.label = PCI_GET_CAPS;
     msg.length = 3;
@@ -269,9 +274,9 @@ pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u
     msg.regs[1] = dev as u64;
     msg.regs[2] = func as u64;
 
-    // SAFETY: Set up receive slot for IoPort or device untyped cap transfer.
+    // SAFETY: Set up receive slot for BAR cap (IoPort or device untyped) transfer.
     unsafe {
-        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_RECEIVED_IOPORT, 0);
+        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_RECEIVED_BAR, 0);
     }
 
     let mut reply = SaltyMsg::zeroed();
@@ -281,20 +286,17 @@ pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u
         return None;
     }
     let bar_is_io = reply.regs[4] != 0;
+    let has_irq_handler = reply.regs[5] != 0;
 
     if bar_is_io {
         // Received an IoPort cap at slot 80
         // SAFETY: Single-threaded init path; PCI_IOPORT_CAP written once.
-        unsafe { *(&raw mut PCI_IOPORT_CAP) = CAP_RECEIVED_IOPORT; }
-    } else {
-        // Received a device untyped cap for MMIO -- move to DEVUT slot
-        let _ = invoke::cnode_move(
-            CAP_SELF_CSPACE, CAP_RECEIVED_DEVUT,
-            CAP_SELF_CSPACE, CAP_RECEIVED_IOPORT,
-        );
+        unsafe { *(&raw mut PCI_IOPORT_CAP) = CAP_RECEIVED_BAR; }
     }
+    // For MMIO BAR, the device untyped cap stays at slot 80 (CAP_RECEIVED_BAR).
+    // IRQ handler cap from pcisrv (extra cap #1) is at slot 81.
 
-    Some((reply.regs[0], reply.regs[1], reply.regs[2] as u32, reply.regs[3] as u8, bar_is_io))
+    Some((reply.regs[0], reply.regs[1], reply.regs[2] as u32, reply.regs[3] as u8, bar_is_io, has_irq_handler))
 }
 
 // --- Virtio init ---
@@ -327,7 +329,7 @@ pub(crate) fn init_virtio(bar0_raw: u32, bar_size: u32) -> bool {
         }
         let (err, _mapped) = invoke::vspace_map_device_range(
             CAP_SELF_VSPACE,
-            CAP_RECEIVED_DEVUT,
+            CAP_RECEIVED_BAR,
             0,
             BAR0_VADDR,
             num_pages,
@@ -335,6 +337,7 @@ pub(crate) fn init_virtio(bar0_raw: u32, bar_size: u32) -> bool {
         );
         if err != 0 {
             puts(b"[netdrv] MMIO BAR mapping failed\n");
+            bar_write8(VIRTIO_DEVICE_STATUS, 0);
             return false;
         }
         puts(b"[netdrv] BAR0 MMIO mapped\n");
@@ -376,10 +379,7 @@ fn setup_queue(queue_idx: u16, hint_vaddr: u64) -> Option<(u64, u64, u64, u16)> 
     // Zero virtqueue memory
     // SAFETY: vq_base was just allocated and mapped; zeroing it is valid.
     unsafe {
-        let vq_ptr = vq_base as *mut u8;
-        for i in 0..(vq_pages * 4096) as usize {
-            *vq_ptr.add(i) = 0;
-        }
+        core::ptr::write_bytes(vq_base as *mut u8, 0, (vq_pages * 4096) as usize);
     }
 
     // Get physical address
@@ -434,6 +434,7 @@ fn virtio_negotiate() -> bool {
         Some(v) => v,
         None => {
             puts(b"[netdrv] Failed to set up RX queue\n");
+            bar_write8(VIRTIO_DEVICE_STATUS, 0);
             return false;
         }
     };
@@ -450,6 +451,7 @@ fn virtio_negotiate() -> bool {
         Some(v) => v,
         None => {
             puts(b"[netdrv] Failed to set up TX queue\n");
+            bar_write8(VIRTIO_DEVICE_STATUS, 0);
             return false;
         }
     };
@@ -481,6 +483,7 @@ fn virtio_negotiate() -> bool {
     // Allocate DMA buffer pools
     if !alloc_dma_buffers() {
         puts(b"[netdrv] Failed to allocate DMA buffers\n");
+        bar_write8(VIRTIO_DEVICE_STATUS, 0);
         return false;
     }
 
@@ -524,14 +527,8 @@ fn alloc_dma_buffers() -> bool {
     // Zero buffer memory
     // SAFETY: Memory was just allocated and mapped.
     unsafe {
-        let rx_ptr = rx_base as *mut u8;
-        for i in 0..(rx_pages * 4096) as usize {
-            *rx_ptr.add(i) = 0;
-        }
-        let tx_ptr = tx_base as *mut u8;
-        for i in 0..(tx_pages * 4096) as usize {
-            *tx_ptr.add(i) = 0;
-        }
+        core::ptr::write_bytes(rx_base as *mut u8, 0, (rx_pages * 4096) as usize);
+        core::ptr::write_bytes(tx_base as *mut u8, 0, (tx_pages * 4096) as usize);
     }
 
     // Compute physical addresses for each buffer
@@ -606,9 +603,21 @@ pub(crate) fn read_isr() -> u8 {
     bar_read8(VIRTIO_ISR_STATUS)
 }
 
+/// Reclaim completed TX buffers by updating our local used index.
+fn tx_reclaim() {
+    // SAFETY: Single-threaded driver.
+    unsafe {
+        let base = *(&raw const TX_QUEUE_BASE);
+        let used_off = *(&raw const TX_USED_OFF);
+        let used_idx_ptr = (base + used_off + 2) as *const u16;
+        *(&raw mut TX_LAST_USED_IDX) = used_idx_ptr.read_volatile();
+    }
+}
+
 /// Transmit a packet. `data` is the raw Ethernet frame (no VirtioNetHdr).
 ///
 /// Prepends a zeroed VirtioNetHdr and submits the buffer to the TX ring.
+/// Returns false if the packet is too large or all TX buffers are in-flight.
 pub(crate) fn tx_packet(data: &[u8]) -> bool {
     let total_len = VIRTIO_NET_HDR_SIZE + data.len();
     if total_len > BUF_SIZE {
@@ -623,6 +632,16 @@ pub(crate) fn tx_packet(data: &[u8]) -> bool {
         }
         let avail_idx = *(&raw const TX_AVAIL_IDX);
 
+        // Check that we have a free TX buffer before overwriting
+        let inflight = avail_idx.wrapping_sub(*(&raw const TX_LAST_USED_IDX));
+        if inflight as usize >= TX_BUF_COUNT {
+            tx_reclaim();
+            let inflight = (*(&raw const TX_AVAIL_IDX)).wrapping_sub(*(&raw const TX_LAST_USED_IDX));
+            if inflight as usize >= TX_BUF_COUNT {
+                return false;
+            }
+        }
+
         // Use avail_idx mod TX_BUF_COUNT as the buffer index
         let buf_idx = (avail_idx as usize) % TX_BUF_COUNT;
         let tx_base_val = *(&raw const TX_BUF_BASE);
@@ -632,10 +651,8 @@ pub(crate) fn tx_packet(data: &[u8]) -> bool {
         let buf_vaddr = tx_base_val + (buf_idx * BUF_SIZE) as u64;
         let buf_ptr = buf_vaddr as *mut u8;
 
-        // Zero the VirtioNetHdr (10 bytes)
-        for i in 0..VIRTIO_NET_HDR_SIZE {
-            *buf_ptr.add(i) = 0;
-        }
+        // Zero the VirtioNetHdr
+        core::ptr::write_bytes(buf_ptr, 0, VIRTIO_NET_HDR_SIZE);
         // Copy packet data
         for i in 0..data.len() {
             *buf_ptr.add(VIRTIO_NET_HDR_SIZE + i) = data[i];
@@ -689,11 +706,16 @@ pub(crate) fn rx_poll() -> Option<(usize, usize)> {
             return None;
         }
 
-        // Read the used ring entry
+        // Read the used ring entry with volatile reads (device-written memory)
         let entry_off = used_off + 4 + ((last_used as usize % qsz) * 8) as u64;
         let used_entry = (base + entry_off) as *const u32;
-        let desc_id = (*used_entry) as usize;
-        let byte_len = (*used_entry.add(1)) as usize;
+        let desc_id = used_entry.read_volatile() as usize;
+        let byte_len = used_entry.add(1).read_volatile() as usize;
+
+        // Validate descriptor index from device
+        if desc_id >= qsz {
+            return None;
+        }
 
         *(&raw mut RX_LAST_USED_IDX) = last_used.wrapping_add(1);
 
@@ -705,8 +727,16 @@ pub(crate) fn rx_poll() -> Option<(usize, usize)> {
 ///
 /// The returned slice includes the VirtioNetHdr prefix. Callers should skip
 /// the first `VIRTIO_NET_HDR_SIZE` bytes for the actual Ethernet frame.
+///
+/// Callers must process the returned data before calling `rx_repost()` for
+/// the same `buf_idx`, as reposting makes the buffer writable by the device.
 pub(crate) fn rx_get_data(buf_idx: usize, len: usize) -> &'static [u8] {
-    // SAFETY: buf_idx < RX_BUF_COUNT, memory is allocated and mapped.
+    if buf_idx >= RX_BUF_COUNT {
+        return &[];
+    }
+    // SAFETY: buf_idx < RX_BUF_COUNT (checked above), memory is allocated and
+    // mapped during init. Single-threaded driver; caller processes data before
+    // calling rx_repost() which re-posts the buffer to the device.
     unsafe {
         let rx_base_val = *(&raw const RX_BUF_BASE);
         let buf_vaddr = rx_base_val + (buf_idx * BUF_SIZE) as u64;
@@ -717,7 +747,10 @@ pub(crate) fn rx_get_data(buf_idx: usize, len: usize) -> &'static [u8] {
 
 /// Re-post a receive buffer back to the RX available ring.
 pub(crate) fn rx_repost(buf_idx: usize) {
-    // SAFETY: Single-threaded driver.
+    if buf_idx >= RX_BUF_COUNT {
+        return;
+    }
+    // SAFETY: Single-threaded driver. buf_idx validated above.
     unsafe {
         let base = *(&raw const RX_QUEUE_BASE);
         let avail_off = *(&raw const RX_AVAIL_OFF);

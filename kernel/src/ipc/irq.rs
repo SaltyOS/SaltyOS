@@ -99,6 +99,15 @@ pub fn register_handler(irq_num: usize, handler: *mut IrqHandler) -> bool {
     }
 }
 
+/// Check whether an IRQ handler is already registered for the given IRQ number.
+pub fn is_handler_registered(irq_num: usize) -> bool {
+    if irq_num >= MAX_IRQS {
+        return false;
+    }
+    // SAFETY: Single-threaded access guarded by SCHED_IPC_LOCK at call site.
+    unsafe { !(*(&raw const IRQ_HANDLERS))[irq_num].is_null() }
+}
+
 /// Unregister an IRQ handler from the global table
 pub fn unregister_handler(irq_num: usize) {
     if irq_num >= MAX_IRQS {

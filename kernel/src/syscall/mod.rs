@@ -2679,24 +2679,37 @@ fn syscall_irq_control_get(
         return SyscallResult::err(e);
     }
 
-    // Allocate a new IrqHandler from the dynamic pool
-    let handler_ptr = match crate::init::alloc_dynamic_irq_handler(irq_num as u32) {
-        Some(ptr) => ptr,
-        None => return SyscallResult::err(SyscallError::OutOfMemory),
-    };
-
-    // Register in global IRQ table under SCHED_IPC_LOCK
-    unsafe {
+    // Allocate + register under a single SCHED_IPC_LOCK hold to prevent SMP races.
+    // Two CPUs calling irq_control_get for the same IRQ would otherwise both succeed
+    // the alloc, then one would fail register_handler.
+    let handler_ptr = unsafe {
         let irq = save_irq_disable();
         SCHED_IPC_LOCK.lock();
-        if !crate::ipc::irq::register_handler(irq_num as usize, handler_ptr) {
+
+        // Check if already registered
+        if crate::ipc::irq::is_handler_registered(irq_num as usize) {
             SCHED_IPC_LOCK.unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::AlreadyExists);
         }
+
+        // Allocate from pool while still under lock
+        let ptr = match crate::init::alloc_dynamic_irq_handler(irq_num as u32) {
+            Some(p) => p,
+            None => {
+                SCHED_IPC_LOCK.unlock();
+                restore_irq(irq);
+                return SyscallResult::err(SyscallError::OutOfMemory);
+            }
+        };
+
+        // Register — guaranteed to succeed since we checked above
+        crate::ipc::irq::register_handler(irq_num as usize, ptr);
+
         SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
-    }
+        ptr
+    };
 
     // Dynamically unmask the IOAPIC redirection entry for this IRQ
     crate::arch::ioapic_unmask(irq_num as u32);
@@ -2704,7 +2717,18 @@ fn syscall_irq_control_get(
     // Allocate a cap slot and set it up
     let slot = match crate::cap::alloc_slot() {
         Some(s) => s,
-        None => return SyscallResult::err(SyscallError::OutOfMemory),
+        None => {
+            // Rollback: unregister handler and re-mask IRQ
+            unsafe {
+                let irq = save_irq_disable();
+                SCHED_IPC_LOCK.lock();
+                crate::ipc::irq::unregister_handler(irq_num as usize);
+                SCHED_IPC_LOCK.unlock();
+                restore_irq(irq);
+            }
+            crate::arch::ioapic_mask(irq_num as u32);
+            return SyscallResult::err(SyscallError::OutOfMemory);
+        }
     };
     let new_cap = crate::cap::get_cap_mut(slot);
     new_cap.object = handler_ptr as *mut crate::cap::KernelObject;
@@ -2715,8 +2739,17 @@ fn syscall_irq_control_get(
 
     // Insert into destination CNode
     unsafe {
+        // SAFETY: dest_cap.object was validated as ObjectType::CNode above.
         let dest_cnode = &mut *(dest_cap.object as *mut CNode);
         if let Err(_) = dest_cnode.insert_ref(dest_slot as usize, crate::cap::CapRef { slot }) {
+            // Rollback: free slot, unregister handler, re-mask IRQ
+            crate::cap::free_slot(slot);
+            let irq = save_irq_disable();
+            SCHED_IPC_LOCK.lock();
+            crate::ipc::irq::unregister_handler(irq_num as usize);
+            SCHED_IPC_LOCK.unlock();
+            restore_irq(irq);
+            crate::arch::ioapic_mask(irq_num as u32);
             return SyscallResult::err(SyscallError::AlreadyExists);
         }
     }

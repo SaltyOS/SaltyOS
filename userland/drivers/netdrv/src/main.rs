@@ -15,10 +15,8 @@
 //!   5  = nameserv endpoint
 //!   7  = mmsrv endpoint
 //!   80 = received BAR cap (IoPort or device untyped) from pcisrv
-//!   81 = received device untyped cap (if MMIO, moved from 80)
-//!   82 = IRQ handler (created via irq_control_get)
-//!   83 = IRQ notification (retyped from untyped)
-//!   84 = IRQ control cap (CopyCap from init slot 11)
+//!   81 = IRQ handler cap (received from pcisrv via PCI_GET_CAPS extra cap #1)
+//!   82 = IRQ notification (retyped from untyped)
 
 #![no_std]
 #![no_main]
@@ -40,9 +38,10 @@ const CAP_SELF_CSPACE: u64 = 2;
 const CAP_SERVER_EP: u64 = 68;
 const CAP_READINESS_NTFN: u64 = 14;
 const CAP_NAMESERV_EP: u64 = 5;
-const CAP_IRQ_HANDLER: u64 = 82;
-const CAP_IRQ_NOTIFICATION: u64 = 83;
-const CAP_IRQ_CONTROL: u64 = 84;
+const CAP_IRQ_HANDLER: u64 = 81;
+const CAP_IRQ_NOTIFICATION: u64 = 82;
+
+static mut IRQ_ENABLED: bool = false;
 
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
@@ -88,11 +87,18 @@ fn register_nameserv() {
 
 /// Set up IRQ handling for the device.
 ///
-/// 1. Create Notification from untyped at slot 16
-/// 2. Create IRQ handler via irq_control_get
-/// 3. Bind IRQ handler to notification
-/// 4. Bind notification to our TCB
-fn setup_irq(irq_line: u8) -> bool {
+/// Uses the IRQ handler cap received from pcisrv (slot 81) rather than
+/// creating one via irq_control_get, following least-privilege principles.
+///
+/// 1. Retype a Notification from untyped memory
+/// 2. Bind IRQ handler (from pcisrv) to notification
+/// 3. Bind notification to our TCB for Recv wakeup
+fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
+    if !has_irq_handler {
+        puts(b"[netdrv] No IRQ handler cap from pcisrv, skipping IRQ setup\n");
+        return false;
+    }
+
     // Step 1: Retype a Notification object from untyped memory
     let err = invoke::untyped_retype(CAP_UNTYPED_START, OBJ_NOTIFICATION, 0, CAP_IRQ_NOTIFICATION);
     if err != 0 {
@@ -104,18 +110,7 @@ fn setup_irq(irq_line: u8) -> bool {
         return false;
     }
 
-    // Step 2: Create IRQ handler from IRQ control cap
-    let err = invoke::irq_control_get(CAP_IRQ_CONTROL, irq_line as u64, CAP_SELF_CSPACE, CAP_IRQ_HANDLER);
-    if err != 0 {
-        let mut lb = LineBuf::new();
-        lb.str(b"[netdrv] Failed to create IRQ handler: ");
-        lb.dec(err as u64);
-        lb.putc(b'\n');
-        lb.flush();
-        return false;
-    }
-
-    // Step 3: Bind IRQ handler to notification
+    // Step 2: Bind IRQ handler to notification
     let err = invoke::irq_handler_set_notification(CAP_IRQ_HANDLER, CAP_IRQ_NOTIFICATION);
     if err != 0 {
         let mut lb = LineBuf::new();
@@ -126,7 +121,7 @@ fn setup_irq(irq_line: u8) -> bool {
         return false;
     }
 
-    // Step 4: Bind notification to our TCB for Recv wakeup
+    // Step 3: Bind notification to our TCB for Recv wakeup
     let err = invoke::tcb_bind_notification(CAP_SELF_TCB, CAP_IRQ_NOTIFICATION);
     if err != 0 {
         let mut lb = LineBuf::new();
@@ -139,6 +134,9 @@ fn setup_irq(irq_line: u8) -> bool {
 
     // Initial ACK to unmask the IRQ
     let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
+
+    // SAFETY: Single-threaded init path; written once before event loop.
+    unsafe { *(&raw mut IRQ_ENABLED) = true; }
 
     {
         let mut lb = LineBuf::new();
@@ -195,6 +193,9 @@ fn process_packet(data: &[u8]) {
 
 /// Self-test: send ARP for gateway, then ping it.
 fn self_test_ping() {
+    // SAFETY: IRQ_ENABLED is set during init before this is called.
+    let irq_enabled = unsafe { *(&raw const IRQ_ENABLED) };
+
     puts(b"[netdrv] Self-test: ARP request for 10.0.2.2\n");
     net::arp::request(&mac_addr(), net::ipv4::OUR_IP, net::ipv4::GATEWAY_IP);
 
@@ -206,6 +207,9 @@ fn self_test_ping() {
         let isr = virtio::read_isr();
         if isr != 0 {
             drain_rx();
+            if irq_enabled {
+                let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
+            }
         }
     }
 
@@ -220,6 +224,9 @@ fn self_test_ping() {
                 let isr = virtio::read_isr();
                 if isr != 0 {
                     drain_rx();
+                    if irq_enabled {
+                        let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
+                    }
                 }
             }
         }
@@ -232,6 +239,21 @@ fn self_test_ping() {
 /// Main event loop: wait for IRQ notifications or IPC requests.
 fn event_loop() -> ! {
     puts(b"[netdrv] Entering event loop\n");
+
+    // SAFETY: IRQ_ENABLED is set during init before event loop starts.
+    let irq_enabled = unsafe { *(&raw const IRQ_ENABLED) };
+
+    if !irq_enabled {
+        // Polling fallback: no IRQ, yield and poll ISR directly
+        puts(b"[netdrv] No IRQ, using yield-based polling\n");
+        loop {
+            let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+            let isr = virtio::read_isr();
+            if isr != 0 {
+                drain_rx();
+            }
+        }
+    }
 
     let ctx = ipc_ctx();
     let mut msg = SaltyMsg::zeroed();
@@ -270,6 +292,7 @@ pub extern "C" fn _start() -> ! {
 
     // Discover and initialize virtio-net device
     let mut irq_line: u8 = 0;
+    let mut has_irq_handler = false;
     let mut device_ok = false;
 
     match virtio::find_virtio_net() {
@@ -287,8 +310,9 @@ pub extern "C" fn _start() -> ! {
             }
 
             match virtio::get_device_caps(bus, dev, func) {
-                Some((_bar_phys, _bar_bits, bar_size, irq, _bar_is_io)) => {
+                Some((_bar_phys, _bar_bits, bar_size, irq, _bar_is_io, has_irq)) => {
                     irq_line = irq;
+                    has_irq_handler = has_irq;
                     {
                         let mut lb = LineBuf::new();
                         lb.str(b"[netdrv] IRQ=");
@@ -315,7 +339,7 @@ pub extern "C" fn _start() -> ! {
 
     // Set up IRQ handling
     if device_ok && irq_line > 0 {
-        if setup_irq(irq_line) {
+        if setup_irq(irq_line, has_irq_handler) {
             puts(b"[netdrv] IRQ handling enabled\n");
         } else {
             puts(b"[netdrv] IRQ setup failed, using polling mode\n");
