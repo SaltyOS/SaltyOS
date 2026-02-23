@@ -1,0 +1,66 @@
+[port]
+name = nano
+version = 8.3
+description = GNU nano text editor (tiny build)
+homepage = https://www.nano-editor.org/
+license = GPL-3.0
+
+[source]
+url = https://www.nano-editor.org/dist/v8/nano-${version}.tar.xz
+subdir = nano-${version}
+sha256 = SKIP
+
+[build]
+type = autotools
+configure =
+    -C
+    --enable-tiny
+    --disable-nls
+    --disable-utf8
+    --disable-browser
+    --disable-color
+    --disable-comment
+    --disable-extra
+    --disable-formatter
+    --disable-help
+    --disable-histories
+    --disable-justify
+    --disable-linenumbers
+    --disable-mouse
+    --disable-multibuffer
+    --disable-nanorc
+    --disable-operatingdir
+    --disable-speller
+    --disable-tabcomp
+    --disable-wordcompletion
+    --disable-wrapping
+    --without-libintl-prefix
+
+[depends]
+build = ncurses
+
+[env]
+CFLAGS_FOR_BUILD =
+NCURSES_CFLAGS =
+NCURSES_LIBS = -lncursesw
+EXTRA_CFLAGS = -I${PORTDIR}/../ncurses/work/ncurses-6.5/include -Wno-implicit-function-declaration
+EXTRA_LDFLAGS = -L${PORTDIR}/../ncurses/stage
+EXTRA_LIBS = -lncursesw
+
+[autoconf_cache]
+ac_cv_lib_ncursesw_initscr = yes
+ac_cv_func_use_default_colors = yes
+ac_cv_func_set_escdelay = yes
+ac_cv_func_key_defined = yes
+ac_cv_header_ncursesw_ncurses_h = no
+ac_cv_header_ncurses_h = yes
+
+[prepare]
+# Remove sys/vt.h dependency (SaltyOS has no virtual terminal ioctls)
+sed -i '/sys\/vt\.h/d' ${SRCDIR}/src/nano.c || true
+sed -i 's/VT_GETSTATE/DISABLED_VT_GETSTATE/g' ${SRCDIR}/src/nano.c || true
+# Replace mkstemps() with mkstemp() if present
+sed -i 's/mkstemps(tempfile_name, strlen(extension))/mkstemp(tempfile_name)/g' ${SRCDIR}/src/files.c || true
+
+[install]
+bin/nano = src/nano

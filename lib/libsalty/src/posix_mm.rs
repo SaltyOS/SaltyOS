@@ -79,6 +79,11 @@ pub unsafe fn posix_mm_init(mmsrv_ep: Cap) {
     unsafe {
         *(&raw mut MMSRV_EP) = mmsrv_ep;
         *(&raw mut MM_INITIALIZED) = mmsrv_ep != 0;
+        let mut lb = crate::serial::LineBuf::new();
+        lb.str(b"[MM] init ep=");
+        lb.hex(mmsrv_ep);
+        if mmsrv_ep != 0 { lb.str(b" OK\n"); } else { lb.str(b" FAIL\n"); }
+        lb.flush();
     }
 }
 
@@ -127,6 +132,15 @@ pub unsafe fn posix_sbrk(increment: i64) -> u64 {
             &raw mut reply,
         );
         if err != 0 || reply.label != SALTY_OK {
+            let mut lb = crate::serial::LineBuf::new();
+            lb.str(b"[MM] sbrk FAIL inc=");
+            lb.hex(increment as u64);
+            lb.str(b" err=");
+            lb.hex(err as u64);
+            lb.str(b" label=");
+            lb.hex(reply.label);
+            lb.str(b"\n");
+            lb.flush();
             u64::MAX
         } else {
             reply.regs[0]

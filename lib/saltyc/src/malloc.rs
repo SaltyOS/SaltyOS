@@ -106,6 +106,11 @@ unsafe fn malloc_inner(size: usize) -> *mut u8 {
         // No free block found, get more memory from sbrk
         let ptr = salty::posix_mm::posix_sbrk(total as i64);
         if ptr == u64::MAX {
+            let mut lb = salty::serial::LineBuf::new();
+            lb.str(b"[MALLOC] sbrk FAILED size=");
+            lb.hex(total as u64);
+            lb.str(b"\n");
+            lb.flush();
             errno::set_errno(errno::ENOMEM);
             return core::ptr::null_mut();
         }
@@ -223,6 +228,15 @@ pub unsafe extern "C" fn calloc(nmemb: usize, size: usize) -> *mut u8 {
 
     unsafe {
         let ptr = malloc(total);
+        if ptr.is_null() && total > 0 {
+            let mut lb = salty::serial::LineBuf::new();
+            lb.str(b"[CALLOC] NULL nmemb=");
+            lb.hex(nmemb as u64);
+            lb.str(b" size=");
+            lb.hex(size as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
         if !ptr.is_null() {
             core::ptr::write_bytes(ptr, 0, total);
         }

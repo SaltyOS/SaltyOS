@@ -1,12 +1,21 @@
 //! Terminal (termios) tests
 //! SPDX-License-Identifier: GPL-2.0-only
 
+use salty::consts::TIOCGWINSZ;
 use salty::posix;
 use salty::serial;
 use salty::types::*;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
+}
+
+#[repr(C)]
+struct Winsize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
 }
 
 pub fn run() -> bool {
@@ -51,8 +60,35 @@ pub fn run() -> bool {
     }
     puts(b"[TEST_TERMINAL] PASS: tcgetattr returned correct c_lflag\n");
 
-    // Test 2: tcsetattr — switch to raw mode and verify
-    puts(b"[TEST_TERMINAL] Test 2: tcsetattr raw mode\n");
+    // Test 2: ioctl(TIOCGWINSZ) writes a struct winsize
+    puts(b"[TEST_TERMINAL] Test 2: ioctl(TIOCGWINSZ)\n");
+    let mut ws = Winsize {
+        ws_row: 0xFFFF,
+        ws_col: 0xFFFF,
+        ws_xpixel: 0xFFFF,
+        ws_ypixel: 0xFFFF,
+    };
+    let ret = unsafe {
+        posix::posix_ioctl(
+            fd,
+            TIOCGWINSZ,
+            (&raw mut ws as *mut Winsize).cast::<u8>() as u64,
+        )
+    };
+    if ret != 0 {
+        puts(b"[TEST_TERMINAL] FAIL: ioctl(TIOCGWINSZ) returned error\n");
+        unsafe { posix::posix_close(fd) };
+        return false;
+    }
+    if ws.ws_row == 0 || ws.ws_col == 0 || ws.ws_row > 500 || ws.ws_col > 1000 {
+        puts(b"[TEST_TERMINAL] FAIL: ioctl(TIOCGWINSZ) returned invalid size\n");
+        unsafe { posix::posix_close(fd) };
+        return false;
+    }
+    puts(b"[TEST_TERMINAL] PASS: ioctl(TIOCGWINSZ) filled winsize\n");
+
+    // Test 3: tcsetattr — switch to raw mode and verify
+    puts(b"[TEST_TERMINAL] Test 3: tcsetattr raw mode\n");
     let mut raw = termios;
     raw.c_lflag &= !(0o000002 | 0o000010 | 0o000001 | 0o100000); // clear ICANON|ECHO|ISIG|IEXTEN
     raw.c_iflag &= !(0o000400 | 0o002000); // clear ICRNL|IXON
@@ -85,8 +121,8 @@ pub fn run() -> bool {
     }
     puts(b"[TEST_TERMINAL] PASS: raw mode verified\n");
 
-    // Test 3: Restore original termios
-    puts(b"[TEST_TERMINAL] Test 3: restore original termios\n");
+    // Test 4: Restore original termios
+    puts(b"[TEST_TERMINAL] Test 4: restore original termios\n");
     let ret = unsafe { posix::posix_tcsetattr(fd, 0, &raw const termios) };
     if ret != 0 {
         puts(b"[TEST_TERMINAL] FAIL: tcsetattr restore failed\n");

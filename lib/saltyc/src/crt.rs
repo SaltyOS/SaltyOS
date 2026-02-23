@@ -87,6 +87,21 @@ pub unsafe extern "C" fn __libc_start_main(
         // using fprintf(stderr, ...) etc. get valid FILE* from the GOT.
         crate::stdio::ensure_stdio_init();
 
+        // Debug: verify malloc works before entering main
+        {
+            let test_ptr = crate::malloc::calloc(128, 28);
+            if test_ptr.is_null() {
+                let mut lb = salty::serial::LineBuf::new();
+                lb.str(b"[CRT] pre-main calloc(128,28) FAILED\n");
+                lb.flush();
+            } else {
+                let mut lb = salty::serial::LineBuf::new();
+                lb.str(b"[CRT] pre-main calloc OK\n");
+                lb.flush();
+                crate::malloc::free(test_ptr);
+            }
+        }
+
         // Call main
         let ret = main_fn(argc, argv, envp);
 

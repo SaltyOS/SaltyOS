@@ -783,7 +783,7 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         }
 
         // 4. Re-register with mmsrv for the new exec image
-        let heap_base = layout.code_end();
+        let heap_base = layout.heap_base();
         let mmap_base = salty::layout::compute_mmap_base(&layout, heap_base);
         super::spawn_tx::register_with_mmsrv(pid, proc_vs, heap_base, mmap_base);
 

@@ -41,7 +41,11 @@ fn run_shell(
 }
 
 /// Build cross-compile environment variables, with optional per-port overrides
-fn cross_env(env: &BuildEnv, overrides: &HashMap<String, String>) -> HashMap<String, String> {
+fn cross_env(
+    env: &BuildEnv,
+    overrides: &HashMap<String, String>,
+    var_map: &HashMap<String, String>,
+) -> HashMap<String, String> {
     let mut vars = HashMap::new();
 
     vars.insert("CC".to_string(), env.cc.clone());
@@ -60,9 +64,10 @@ fn cross_env(env: &BuildEnv, overrides: &HashMap<String, String>) -> HashMap<Str
     // Prevent autotools from trying to run target binaries
     vars.insert("cross_compiling".to_string(), "yes".to_string());
 
-    // Apply per-port environment overrides from [env] section
+    // Apply per-port environment overrides from [env] section,
+    // substituting ${BUILDDIR}, ${SRCDIR} etc. in values.
     for (k, v) in overrides {
-        vars.insert(k.clone(), v.clone());
+        vars.insert(k.clone(), vars::substitute(v, var_map));
     }
 
     // Support EXTRA_CFLAGS / EXTRA_LDFLAGS / EXTRA_LIBS: append to the
@@ -185,7 +190,7 @@ pub fn do_prepare(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Result<
         return Err(format!("Source directory not found: {}", src.display()));
     }
 
-    let cross_vars = cross_env(env, &port.env_overrides);
+    let cross_vars = cross_env(env, &port.env_overrides, &var_map);
     run_shell(&script, &src, &cross_vars, env.verbose)
 }
 
@@ -197,7 +202,7 @@ pub fn do_configure(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Resul
     }
 
     let var_map = vars::build_var_map(port, port_dir, env);
-    let cross_vars = cross_env(env, &port.env_overrides);
+    let cross_vars = cross_env(env, &port.env_overrides, &var_map);
 
     match port.build_type {
         BuildType::Autotools => {
@@ -267,7 +272,8 @@ pub fn do_build(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Result<()
         return Err(format!("Source directory not found: {}", src.display()));
     }
 
-    let cross_vars = cross_env(env, &port.env_overrides);
+    let var_map = vars::build_var_map(port, port_dir, env);
+    let cross_vars = cross_env(env, &port.env_overrides, &var_map);
 
     match port.build_type {
         BuildType::Autotools | BuildType::Make | BuildType::Custom => {
@@ -301,7 +307,7 @@ pub fn do_build_targets(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> R
         .map_err(|e| format!("Cannot create .salty-build/: {}", e))?;
 
     let var_map = vars::build_var_map(port, port_dir, env);
-    let cross_vars = cross_env(env, &port.env_overrides);
+    let cross_vars = cross_env(env, &port.env_overrides, &var_map);
     let common_cflags = vars::substitute(&port.targets_cflags, &var_map);
 
     for target in &port.targets {
@@ -349,10 +355,11 @@ pub fn do_build_targets(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> R
     Ok(())
 }
 
-/// Flatten an initrd path to an .elf filename: "bin/echo" -> "echo.elf"
+/// Flatten an initrd path to an output filename: "bin/echo" -> "echo.elf"
+/// Preserves `.so` extensions for shared library outputs.
 fn flatten_to_elf(initrd_path: &str) -> String {
     let base = initrd_path.rsplit('/').next().unwrap_or(initrd_path);
-    if base.ends_with(".elf") {
+    if base.ends_with(".elf") || base.ends_with(".so") || base.ends_with(".a") {
         base.to_string()
     } else {
         format!("{}.elf", base)
@@ -403,9 +410,14 @@ pub fn do_stage(
         fs::copy(&src_file, &stage_target)
             .map_err(|e| format!("Cannot copy to stage: {}", e))?;
 
-        // Strip with llvm-strip
+        // Strip with llvm-strip (use --strip-debug for .a archives to preserve symbol tables)
+        let strip_flag = if out_name.ends_with(".a") {
+            "--strip-debug"
+        } else {
+            "--strip-all"
+        };
         let strip_status = Command::new(&env.strip)
-            .args(["--strip-all", "-o"])
+            .args([strip_flag, "-o"])
             .arg(&output_target)
             .arg(&stage_target)
             .status();

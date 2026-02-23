@@ -459,8 +459,8 @@ pub(crate) unsafe fn handle_ioctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
                     // Fallback to default 80x24
                     (*reply).label = SALTY_OK;
                     (*reply).length = 2;
-                    (*reply).regs[0] = (24u64 << 16) | 80u64;
-                    (*reply).regs[1] = 0;
+                    (*reply).regs[0] = 24;
+                    (*reply).regs[1] = 80;
                     return;
                 }
                 (*reply).label = SALTY_OK;

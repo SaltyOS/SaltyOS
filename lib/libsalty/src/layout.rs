@@ -23,7 +23,7 @@ const DEFAULT_SCRATCH_BASE: u64 = 0x0000_0000_003F_F000;
 const DEFAULT_STACK_TOP: u64 = DEFAULT_STACK_BASE + (CHILD_STACK_PAGES as u64) * 0x1000;
 const INITRD_BASE: u64 = 0x0000_0000_0100_0000;
 /// Gap between existing mapped regions and the start of mmap allocations.
-const MMAP_BASE_GAP: u64 = 0x0100_0000; // 16 MiB
+const MMAP_BASE_GAP: u64 = 0x1000_0000; // 256 MiB
 
 // Second 2MiB window for stack relocation
 const WINDOW2_STACK_BASE: u64 = 0x0000_0000_007F_8000;
@@ -93,7 +93,6 @@ impl VmLayoutPlan {
     }
 
     /// End of the highest code region (shared_libs > rtld > elf_code).
-    /// Heap should start here to avoid colliding with loaded code.
     pub fn code_end(&self) -> u64 {
         if self.shared_libs.size > 0 {
             self.shared_libs.end()
@@ -102,6 +101,22 @@ impl VmLayoutPlan {
         } else {
             self.elf_code.end()
         }
+    }
+
+    /// Starting address for the heap. Above all code, stack, and scratch
+    /// regions to prevent upward heap growth from colliding with them.
+    pub fn heap_base(&self) -> u64 {
+        let mut highest = self.code_end();
+        if self.stack.size > 0 && self.stack.end() > highest {
+            highest = self.stack.end();
+        }
+        if self.scratch.size > 0 && self.scratch.end() > highest {
+            highest = self.scratch.end();
+        }
+        if self.initrd.size > 0 && self.initrd.end() > highest {
+            highest = self.initrd.end();
+        }
+        page_align_up(highest)
     }
 
     /// Highest mapped virtual end address across all planned regions.

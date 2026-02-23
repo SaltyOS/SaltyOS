@@ -310,11 +310,11 @@ pub unsafe fn handle_pty_ioctl(msg: &SaltyMsg, reply: &mut SaltyMsg) {
                 }
             }
             TIOCGWINSZ => {
-                // Return 80x24 (standard terminal size)
+                // Return actual display dimensions (queried from display server at startup)
                 reply.label = SALTY_OK;
                 reply.length = 2;
-                reply.regs[0] = 24; // rows
-                reply.regs[1] = 80; // cols
+                reply.regs[0] = *(&raw const crate::types::WINSIZE_ROWS) as u64;
+                reply.regs[1] = *(&raw const crate::types::WINSIZE_COLS) as u64;
             }
             _ => {
                 reply.label = SALTY_INVALID_OPERATION;
