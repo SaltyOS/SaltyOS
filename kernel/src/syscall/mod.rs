@@ -2680,18 +2680,10 @@ fn syscall_irq_control_get(
     }
 
     // Allocate + register under a single SCHED_IPC_LOCK hold to prevent SMP races.
-    // Two CPUs calling irq_control_get for the same IRQ would otherwise both succeed
-    // the alloc, then one would fail register_handler.
+    // Shared IRQs are allowed: multiple handlers can coexist on the same IRQ line.
     let handler_ptr = unsafe {
         let irq = save_irq_disable();
         SCHED_IPC_LOCK.lock();
-
-        // Check if already registered
-        if crate::ipc::irq::is_handler_registered(irq_num as usize) {
-            SCHED_IPC_LOCK.unlock();
-            restore_irq(irq);
-            return SyscallResult::err(SyscallError::AlreadyExists);
-        }
 
         // Allocate from pool while still under lock
         let ptr = match crate::init::alloc_dynamic_irq_handler(irq_num as u32) {
@@ -2703,7 +2695,7 @@ fn syscall_irq_control_get(
             }
         };
 
-        // Register — guaranteed to succeed since we checked above
+        // Prepend to handler chain (shared IRQs: multiple handlers per IRQ)
         crate::ipc::irq::register_handler(irq_num as usize, ptr);
 
         SCHED_IPC_LOCK.unlock();
@@ -2718,15 +2710,19 @@ fn syscall_irq_control_get(
     let slot = match crate::cap::alloc_slot() {
         Some(s) => s,
         None => {
-            // Rollback: unregister handler and re-mask IRQ
+            // Rollback: unregister handler
             unsafe {
                 let irq = save_irq_disable();
                 SCHED_IPC_LOCK.lock();
-                crate::ipc::irq::unregister_handler(irq_num as usize);
+                crate::ipc::irq::unregister_handler(handler_ptr);
+                // Only mask IOAPIC if no other handler remains on this IRQ
+                let should_mask = !crate::ipc::irq::has_handlers(irq_num as usize);
                 SCHED_IPC_LOCK.unlock();
                 restore_irq(irq);
+                if should_mask {
+                    crate::arch::ioapic_mask(irq_num as u32);
+                }
             }
-            crate::arch::ioapic_mask(irq_num as u32);
             return SyscallResult::err(SyscallError::OutOfMemory);
         }
     };
@@ -2742,14 +2738,17 @@ fn syscall_irq_control_get(
         // SAFETY: dest_cap.object was validated as ObjectType::CNode above.
         let dest_cnode = &mut *(dest_cap.object as *mut CNode);
         if let Err(_) = dest_cnode.insert_ref(dest_slot as usize, crate::cap::CapRef { slot }) {
-            // Rollback: free slot, unregister handler, re-mask IRQ
+            // Rollback: free slot, unregister handler
             crate::cap::free_slot(slot);
             let irq = save_irq_disable();
             SCHED_IPC_LOCK.lock();
-            crate::ipc::irq::unregister_handler(irq_num as usize);
+            crate::ipc::irq::unregister_handler(handler_ptr);
+            let should_mask = !crate::ipc::irq::has_handlers(irq_num as usize);
             SCHED_IPC_LOCK.unlock();
             restore_irq(irq);
-            crate::arch::ioapic_mask(irq_num as u32);
+            if should_mask {
+                crate::arch::ioapic_mask(irq_num as u32);
+            }
             return SyscallResult::err(SyscallError::AlreadyExists);
         }
     }
@@ -2810,7 +2809,10 @@ fn syscall_irq_handler_set_notification(
     SyscallResult::ok(0)
 }
 
-/// IRQ_HANDLER_CLEAR: Unbind notification from IRQ handler and mask IOAPIC
+/// IRQ_HANDLER_CLEAR: Unbind notification from IRQ handler
+///
+/// Only masks the IOAPIC if no other handler on the same IRQ still has a
+/// bound notification (shared IRQ support).
 fn syscall_irq_handler_clear(cap: &Capability) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::IrqHandler, CapRights::CONFIGURE) {
         return SyscallResult::err(e);
@@ -2818,18 +2820,22 @@ fn syscall_irq_handler_clear(cap: &Capability) -> SyscallResult {
 
     // IRQ handler mutation under SCHED_IPC_LOCK
     let irq_num;
+    let should_mask;
     unsafe {
         let irq = save_irq_disable();
         SCHED_IPC_LOCK.lock();
         let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
         irq_num = irq_handler.irq_num;
         irq_handler.notification = core::ptr::null_mut();
+        // Only mask if no other handler on this IRQ has a notification
+        should_mask = !crate::ipc::irq::has_active_notification(irq_num as usize);
         SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
     }
 
-    // Mask the IOAPIC entry for this IRQ
-    crate::arch::ioapic_mask(irq_num);
+    if should_mask {
+        crate::arch::ioapic_mask(irq_num);
+    }
 
     SyscallResult::ok(0)
 }

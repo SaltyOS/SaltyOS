@@ -248,6 +248,14 @@ fn scan_bus() {
                     );
                     if err == 0 {
                         entry.irq_handler_slot = slot;
+                    } else {
+                        let mut lb = LineBuf::new();
+                        lb.str(b"[pcisrv] irq_control_get IRQ ");
+                        lb.dec(irq_line as u64);
+                        lb.str(b" failed: ");
+                        lb.dec(err as u64);
+                        lb.putc(b'\n');
+                        lb.flush();
                     }
                 }
             }

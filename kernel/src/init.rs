@@ -150,8 +150,10 @@ static mut DEVICE_UNTYPED_POOL: [UntypedMemory; MAX_DEVICE_UNTYPEDS] = {
 /// Next free index in the device untyped pool
 static mut DEVICE_UNTYPED_NEXT: usize = 0;
 
-/// Maximum number of dynamically-created IRQ handlers (for per-device IRQ routing)
-const MAX_DYNAMIC_IRQ_HANDLERS: usize = 32;
+/// Maximum number of dynamically-created IRQ handlers (for per-device IRQ routing).
+/// Sized for shared IRQs: QEMU q35 assigns the same IRQ to multiple PCI devices,
+/// so each device gets its own handler even when sharing an IRQ line.
+const MAX_DYNAMIC_IRQ_HANDLERS: usize = 64;
 /// Pool of IRQ handler objects for runtime provisioning
 static mut DYNAMIC_IRQ_HANDLER_POOL: [IrqHandler; MAX_DYNAMIC_IRQ_HANDLERS] = {
     const EMPTY: IrqHandler = IrqHandler::new(0);
