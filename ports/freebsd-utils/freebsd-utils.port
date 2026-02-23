@@ -98,4 +98,5 @@ usr/bin/touch = touch
 usr/bin/tr = tr
 usr/bin/cut = cut
 usr/bin/stat = stat
+# stat dispatches on argv[0]: behaves as readlink when called as readlink
 usr/bin/readlink = stat

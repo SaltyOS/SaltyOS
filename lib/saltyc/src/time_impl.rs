@@ -943,7 +943,7 @@ pub unsafe extern "C" fn strptime(
                     }
                     b'n' | b't' => {
                         // Skip whitespace
-                        while *buf.add(bi) == b' ' || *buf.add(bi) == b'\t' || *buf.add(bi) == b'\n' {
+                        while *buf.add(bi) != 0 && (*buf.add(bi) == b' ' || *buf.add(bi) == b'\t' || *buf.add(bi) == b'\n') {
                             bi += 1;
                         }
                     }
@@ -959,7 +959,7 @@ pub unsafe extern "C" fn strptime(
             } else if fc == b' ' || fc == b'\t' {
                 // Format whitespace matches any amount of input whitespace
                 fi += 1;
-                while *buf.add(bi) == b' ' || *buf.add(bi) == b'\t' {
+                while *buf.add(bi) != 0 && (*buf.add(bi) == b' ' || *buf.add(bi) == b'\t') {
                     bi += 1;
                 }
             } else {

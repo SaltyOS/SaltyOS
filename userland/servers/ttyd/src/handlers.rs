@@ -266,7 +266,7 @@ pub unsafe fn handle_pty_ioctl(msg: &SaltyMsg, reply: &mut SaltyMsg) {
                 reply.regs[0] = pty.fg_pgid as u64;
             }
             TIOCSPGRP => {
-                if pty.has_ctty {
+                if pty.has_ctty && pty.ctty_owner_badge == caller_badge {
                     pty.fg_pgid = arg as u32;
                     reply.label = SALTY_OK;
                     reply.length = 0;

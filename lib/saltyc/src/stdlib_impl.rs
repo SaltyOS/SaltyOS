@@ -654,13 +654,12 @@ pub unsafe extern "C" fn mkdtemp(template: *mut u8) -> *mut u8 {
 
         let start = len - xs;
 
-        static mut MKDTEMP_COUNTER: u64 = 0;
-        let ctr = &raw mut MKDTEMP_COUNTER;
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static MKDTEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
         let mut attempt: u32 = 0;
         while attempt < MAX_ATTEMPTS {
-            *ctr = (*ctr).wrapping_add(1);
-            let mut val = *ctr;
+            let mut val = MKDTEMP_COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
 
             let mut j = start;
             while j < len {
