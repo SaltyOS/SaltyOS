@@ -464,9 +464,21 @@ pub unsafe extern "C" fn umask(_mask: u32) -> u32 {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn truncate(_path: *const u8, _length: i64) -> i32 {
-    errno::set_errno(errno::ENOSYS);
-    -1
+pub unsafe extern "C" fn truncate(path: *const u8, length: i64) -> i32 {
+    unsafe {
+        let fd = salty::posix::posix_open(path, salty::O_WRONLY as i32);
+        if fd < 0 {
+            errno::set_errno(errno::ENOENT);
+            return -1;
+        }
+        let ret = salty::posix::posix_ftruncate(fd, length as u64);
+        salty::posix::posix_close(fd);
+        if ret < 0 {
+            errno::set_errno(errno::EINVAL);
+            return -1;
+        }
+        0
+    }
 }
 
 #[unsafe(no_mangle)]

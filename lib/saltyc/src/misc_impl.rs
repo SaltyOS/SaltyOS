@@ -374,17 +374,136 @@ pub unsafe extern "C" fn getentropy(buf: *mut u8, buflen: usize) -> i32 {
 // copy_file_range — not supported
 // ---------------------------------------------------------------------------
 
+/// copy_file_range — copy data between file descriptors
+///
+/// Copies up to `len` bytes from `fd_in` to `fd_out`.  If `off_in` or
+/// `off_out` are non-null, they specify (and are updated with) the offset to
+/// use instead of the current file position.  `flags` is reserved and must be 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn copy_file_range(
-    _fd_in: i32,
-    _off_in: *mut i64,
-    _fd_out: i32,
-    _off_out: *mut i64,
-    _len: usize,
+    fd_in: i32,
+    off_in: *mut i64,
+    fd_out: i32,
+    off_out: *mut i64,
+    len: usize,
     _flags: u32,
 ) -> isize {
-    errno::set_errno(errno::ENOSYS);
-    -1
+    unsafe {
+        // If off_in is provided, seek to that offset (saving current pos)
+        let saved_in: i64 = if !off_in.is_null() {
+            let cur = salty::posix::posix_lseek(fd_in, 0, salty::consts::SEEK_CUR as i32);
+            if cur < 0 {
+                errno::set_errno(errno::EBADF);
+                return -1;
+            }
+            let ret = salty::posix::posix_lseek(fd_in, *off_in, salty::consts::SEEK_SET as i32);
+            if ret < 0 {
+                errno::set_errno(errno::EINVAL);
+                return -1;
+            }
+            cur
+        } else {
+            -1
+        };
+
+        let saved_out: i64 = if !off_out.is_null() {
+            let cur = salty::posix::posix_lseek(fd_out, 0, salty::consts::SEEK_CUR as i32);
+            if cur < 0 {
+                // Restore fd_in if we moved it
+                if !off_in.is_null() {
+                    salty::posix::posix_lseek(fd_in, saved_in, salty::consts::SEEK_SET as i32);
+                }
+                errno::set_errno(errno::EBADF);
+                return -1;
+            }
+            let ret = salty::posix::posix_lseek(fd_out, *off_out, salty::consts::SEEK_SET as i32);
+            if ret < 0 {
+                if !off_in.is_null() {
+                    salty::posix::posix_lseek(fd_in, saved_in, salty::consts::SEEK_SET as i32);
+                }
+                errno::set_errno(errno::EINVAL);
+                return -1;
+            }
+            cur
+        } else {
+            -1
+        };
+
+        // Read/write loop with stack buffer
+        let mut buf = [0u8; 4096];
+        let mut total: usize = 0;
+
+        while total < len {
+            let chunk = if len - total < 4096 { len - total } else { 4096 };
+            let nr = salty::posix::posix_read(fd_in, buf.as_mut_ptr(), chunk as u64);
+            if nr < 0 {
+                if total == 0 {
+                    // Restore positions and report error
+                    if !off_in.is_null() {
+                        salty::posix::posix_lseek(fd_in, saved_in, salty::consts::SEEK_SET as i32);
+                    }
+                    if !off_out.is_null() {
+                        salty::posix::posix_lseek(fd_out, saved_out, salty::consts::SEEK_SET as i32);
+                    }
+                    errno::set_errno(errno::EIO);
+                    return -1;
+                }
+                break;
+            }
+            if nr == 0 {
+                break; // EOF
+            }
+
+            let mut written: usize = 0;
+            while written < nr as usize {
+                let nw = salty::posix::posix_write(
+                    fd_out,
+                    buf.as_ptr().add(written),
+                    (nr as usize - written) as u64,
+                );
+                if nw < 0 {
+                    if total == 0 && written == 0 {
+                        if !off_in.is_null() {
+                            salty::posix::posix_lseek(fd_in, saved_in, salty::consts::SEEK_SET as i32);
+                        }
+                        if !off_out.is_null() {
+                            salty::posix::posix_lseek(fd_out, saved_out, salty::consts::SEEK_SET as i32);
+                        }
+                        errno::set_errno(errno::EIO);
+                        return -1;
+                    }
+                    // Partial copy — update offsets and return what we have
+                    total += written;
+                    if !off_in.is_null() {
+                        *off_in += total as i64;
+                        salty::posix::posix_lseek(fd_in, saved_in, salty::consts::SEEK_SET as i32);
+                    }
+                    if !off_out.is_null() {
+                        *off_out += total as i64;
+                        salty::posix::posix_lseek(fd_out, saved_out, salty::consts::SEEK_SET as i32);
+                    }
+                    return total as isize;
+                }
+                if nw == 0 {
+                    break;
+                }
+                written += nw as usize;
+            }
+            total += written;
+        }
+
+        // Update offset pointers and restore file positions
+        if !off_in.is_null() {
+            *off_in += total as i64;
+            salty::posix::posix_lseek(fd_in, saved_in, salty::consts::SEEK_SET as i32);
+        }
+        if !off_out.is_null() {
+            *off_out += total as i64;
+            salty::posix::posix_lseek(fd_out, saved_out, salty::consts::SEEK_SET as i32);
+        }
+
+        total as isize
+    }
 }
 
 // ---------------------------------------------------------------------------
