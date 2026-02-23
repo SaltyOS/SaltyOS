@@ -103,6 +103,7 @@ static mut TX_AVAIL_OFF: u64 = 0;
 static mut TX_USED_OFF: u64 = 0;
 static mut TX_AVAIL_IDX: u16 = 0;
 static mut TX_LAST_USED_IDX: u16 = 0;
+static mut TX_INFLIGHT_LIMIT: usize = TX_BUF_COUNT;
 
 // DMA buffer pools
 static mut RX_BUF_BASE: u64 = 0;
@@ -478,6 +479,7 @@ fn virtio_negotiate() -> bool {
         *(&raw mut TX_AVAIL_OFF) = tx_avail;
         *(&raw mut TX_USED_OFF) = tx_used;
         *(&raw mut TX_AVAIL_IDX) = 0;
+        *(&raw mut TX_INFLIGHT_LIMIT) = core::cmp::min(TX_BUF_COUNT, tx_qsz as usize);
     }
 
     // Allocate DMA buffer pools
@@ -586,10 +588,16 @@ fn prefill_rx_ring() {
             *avail_ring = i as u16;
         }
 
+        // Ensure descriptor writes are visible before updating avail index
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
         // Update available ring index
         let avail_idx_ptr = (base + avail_off + 2) as *mut u16;
         *avail_idx_ptr = fill_count as u16;
         *(&raw mut RX_AVAIL_IDX) = fill_count as u16;
+
+        // Ensure avail index write is visible before device notify
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
         // Notify device about RX queue (queue 0)
         bar_write16(VIRTIO_QUEUE_NOTIFY, 0);
@@ -633,11 +641,12 @@ pub(crate) fn tx_packet(data: &[u8]) -> bool {
         let avail_idx = *(&raw const TX_AVAIL_IDX);
 
         // Check that we have a free TX buffer before overwriting
+        let limit = *(&raw const TX_INFLIGHT_LIMIT);
         let inflight = avail_idx.wrapping_sub(*(&raw const TX_LAST_USED_IDX));
-        if inflight as usize >= TX_BUF_COUNT {
+        if inflight as usize >= limit {
             tx_reclaim();
             let inflight = (*(&raw const TX_AVAIL_IDX)).wrapping_sub(*(&raw const TX_LAST_USED_IDX));
-            if inflight as usize >= TX_BUF_COUNT {
+            if inflight as usize >= limit {
                 return false;
             }
         }

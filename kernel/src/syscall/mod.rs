@@ -2737,7 +2737,7 @@ fn syscall_irq_control_get(
     unsafe {
         // SAFETY: dest_cap.object was validated as ObjectType::CNode above.
         let dest_cnode = &mut *(dest_cap.object as *mut CNode);
-        if let Err(_) = dest_cnode.insert_ref(dest_slot as usize, crate::cap::CapRef { slot }) {
+        if let Err(e) = dest_cnode.insert_ref(dest_slot as usize, crate::cap::CapRef { slot }) {
             // Rollback: free slot, unregister handler
             crate::cap::free_slot(slot);
             let irq = save_irq_disable();
@@ -2749,7 +2749,11 @@ fn syscall_irq_control_get(
             if should_mask {
                 crate::arch::ioapic_mask(irq_num as u32);
             }
-            return SyscallResult::err(SyscallError::AlreadyExists);
+            let syscall_err = match e {
+                CapError::InvalidSlot => SyscallError::OutOfRange,
+                _ => SyscallError::AlreadyExists,
+            };
+            return SyscallResult::err(syscall_err);
         }
     }
 
@@ -2901,8 +2905,12 @@ fn syscall_device_untyped_create(
     // Insert into destination CNode
     unsafe {
         let dest_cnode = &mut *(dest_cap.object as *mut CNode);
-        if let Err(_) = dest_cnode.insert_ref(dest_slot as usize, crate::cap::CapRef { slot }) {
-            return SyscallResult::err(SyscallError::AlreadyExists);
+        if let Err(e) = dest_cnode.insert_ref(dest_slot as usize, crate::cap::CapRef { slot }) {
+            let syscall_err = match e {
+                CapError::InvalidSlot => SyscallError::OutOfRange,
+                _ => SyscallError::AlreadyExists,
+            };
+            return SyscallResult::err(syscall_err);
         }
     }
 
@@ -2970,8 +2978,12 @@ fn syscall_ioport_create(
     // Insert into destination CNode
     unsafe {
         let dest_cnode = &mut *(dest_cap.object as *mut CNode);
-        if let Err(_) = dest_cnode.insert_ref(dest_slot as usize, crate::cap::CapRef { slot }) {
-            return SyscallResult::err(SyscallError::AlreadyExists);
+        if let Err(e) = dest_cnode.insert_ref(dest_slot as usize, crate::cap::CapRef { slot }) {
+            let syscall_err = match e {
+                CapError::InvalidSlot => SyscallError::OutOfRange,
+                _ => SyscallError::AlreadyExists,
+            };
+            return SyscallResult::err(syscall_err);
         }
     }
 

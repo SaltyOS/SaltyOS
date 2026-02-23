@@ -489,6 +489,7 @@ pub extern "C" fn _start() -> ! {
                 MM_SHM_MAP => shm::handle_mm_shm_map(&raw const msg, badge, &raw mut reply),
                 MM_SHM_UNMAP => shm::handle_mm_shm_unmap(&raw const msg, badge, &raw mut reply),
                 MM_GET_CLIENT_STATS => client::handle_mm_get_client_stats(&raw const msg, badge, &raw mut reply),
+                MM_ALLOC_OBJECT => mmap::handle_mm_alloc_object(&raw const msg, badge, &raw mut reply),
                 // VMFault: label=2 from kernel FaultType::VMFault.
                 // Badge identifies the faulting client. Replying resumes the faulting thread.
                 //

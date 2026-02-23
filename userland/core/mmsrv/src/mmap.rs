@@ -811,6 +811,40 @@ pub(crate) unsafe fn handle_mm_alloc_thread_objects(
     }
 }
 
+/// MM_ALLOC_OBJECT: allocate a single kernel object of any type.
+///
+/// Request: MR0 = obj_type, MR1 = size_bits, length = 2
+/// Reply: label = SALTY_OK with 1 cap transferred, or SALTY_OUT_OF_MEMORY.
+pub(crate) unsafe fn handle_mm_alloc_object(
+    msg: *const SaltyMsg,
+    _caller_badge: u64,
+    reply: *mut SaltyMsg,
+) {
+    unsafe {
+        let obj_type = (*msg).regs[0];
+        let size_bits = (*msg).regs[1];
+
+        let slot = match salty::slot_alloc::slot_alloc() {
+            Some(s) => s,
+            None => { (*reply).label = SALTY_OUT_OF_MEMORY; return; }
+        };
+
+        let err = super::retype_any(obj_type, size_bits, slot);
+        if err != 0 {
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
+
+        ipc::set_send_cap_ctx(super::ipc_ctx(), 0, slot);
+
+        *(&raw mut super::PENDING_CLEANUP_SLOTS) = [slot, 0, 0, 0];
+        *(&raw mut super::PENDING_CLEANUP_COUNT) = 1;
+
+        (*reply).label = SALTY_OK;
+        (*reply).length = 0;
+    }
+}
+
 /// MM_MAP_BATCH: procmgr batch-maps N frames for spawn.
 ///   MR0 = target client badge
 ///   MR1 = start vaddr

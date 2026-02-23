@@ -38,6 +38,7 @@ const CAP_SELF_CSPACE: u64 = 2;
 const CAP_SERVER_EP: u64 = 68;
 const CAP_READINESS_NTFN: u64 = 14;
 const CAP_NAMESERV_EP: u64 = 5;
+const CAP_MMSRV_EP: u64 = 7;
 const CAP_IRQ_HANDLER: u64 = 81;
 const CAP_IRQ_NOTIFICATION: u64 = 82;
 
@@ -99,12 +100,23 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
         return false;
     }
 
-    // Step 1: Retype a Notification object from untyped memory
-    let err = invoke::untyped_retype(CAP_UNTYPED_START, OBJ_NOTIFICATION, 0, CAP_IRQ_NOTIFICATION);
-    if err != 0 {
+    // Step 1: Allocate a Notification object via mmsrv
+    // SAFETY: IPC context is valid; set up receive slot for cap transfer.
+    unsafe {
+        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_IRQ_NOTIFICATION, 0);
+    }
+    let mut msg = SaltyMsg::zeroed();
+    msg.label = MM_ALLOC_OBJECT;
+    msg.regs[0] = OBJ_NOTIFICATION;
+    msg.regs[1] = 0;
+    msg.length = 2;
+    let mut alloc_reply = SaltyMsg::zeroed();
+    // SAFETY: IPC context is valid; making RPC to mmsrv.
+    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_MMSRV_EP, &raw const msg, &raw mut alloc_reply) };
+    if err != 0 || alloc_reply.label != SALTY_OK {
         let mut lb = LineBuf::new();
-        lb.str(b"[netdrv] Failed to retype Notification: ");
-        lb.dec(err as u64);
+        lb.str(b"[netdrv] Failed to allocate Notification via mmsrv: ");
+        lb.dec(if err != 0 { err as u64 } else { alloc_reply.label });
         lb.putc(b'\n');
         lb.flush();
         return false;
@@ -211,6 +223,7 @@ fn self_test_ping() {
                 let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
             }
         }
+        let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
     match net::arp::lookup(net::ipv4::GATEWAY_IP) {
@@ -228,6 +241,7 @@ fn self_test_ping() {
                         let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
                     }
                 }
+                let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
             }
         }
         None => {
