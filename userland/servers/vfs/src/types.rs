@@ -161,7 +161,12 @@ pub(crate) struct PendingConn {
 
 impl PendingConn {
     pub(crate) const fn zeroed() -> Self {
-        PendingConn { active: 0, client_badge: 0, sock_id: 0, reply_slot: 0 }
+        PendingConn {
+            active: 0,
+            client_badge: 0,
+            sock_id: 0,
+            reply_slot: 0,
+        }
     }
 }
 
@@ -195,16 +200,28 @@ pub(crate) struct SocketState {
 impl SocketState {
     pub(crate) const fn zeroed() -> Self {
         SocketState {
-            active: 0, state: SOCK_UNBOUND, sock_id: 0, bound_ino: 0,
-            backlog: 0, pending_count: 0,
-            pending: core::ptr::null_mut(), pending_cap: 0,
-            peer_sock_id: 0, peer_badge: 0,
+            active: 0,
+            state: SOCK_UNBOUND,
+            sock_id: 0,
+            bound_ino: 0,
+            backlog: 0,
+            pending_count: 0,
+            pending: core::ptr::null_mut(),
+            pending_cap: 0,
+            peer_sock_id: 0,
+            peer_badge: 0,
             data_buf: [0; SOCK_BUF_SIZE],
-            data_head: 0, data_tail: 0,
-            accept_reply_slot: 0, accept_badge: 0,
-            recv_reply_slot: 0, recv_badge: 0,
-            pending_caps: [0; 4], pending_cap_count: 0,
-            shut_rd: 0, shut_wr: 0, peer_closed: 0,
+            data_head: 0,
+            data_tail: 0,
+            accept_reply_slot: 0,
+            accept_badge: 0,
+            recv_reply_slot: 0,
+            recv_badge: 0,
+            pending_caps: [0; 4],
+            pending_cap_count: 0,
+            shut_rd: 0,
+            shut_wr: 0,
+            peer_closed: 0,
             refcount: 0,
         }
     }
@@ -224,8 +241,11 @@ pub(crate) struct PollWaiter {
 impl PollWaiter {
     pub(crate) const fn zeroed() -> Self {
         PollWaiter {
-            active: 0, badge: 0, reply_slot: 0,
-            fds: [(-1, 0); 8], nfds: 0,
+            active: 0,
+            badge: 0,
+            reply_slot: 0,
+            fds: [(-1, 0); 8],
+            nfds: 0,
         }
     }
 }
@@ -239,7 +259,12 @@ pub(crate) struct EpollEntry {
 
 impl EpollEntry {
     pub(crate) const fn zeroed() -> Self {
-        EpollEntry { active: 0, fd: -1, events: 0, data: 0 }
+        EpollEntry {
+            active: 0,
+            fd: -1,
+            events: 0,
+            data: 0,
+        }
     }
 }
 
@@ -269,7 +294,10 @@ pub(crate) struct ShmData {
 
 impl ShmData {
     pub(crate) const fn zeroed() -> Self {
-        ShmData { active: 0, num_pages: 0 }
+        ShmData {
+            active: 0,
+            num_pages: 0,
+        }
     }
 }
 
@@ -285,7 +313,11 @@ pub(crate) struct PipeReadWaiter {
 
 impl PipeReadWaiter {
     pub(crate) const fn zeroed() -> Self {
-        PipeReadWaiter { reply_slot: 0, badge: 0, requested_len: 0 }
+        PipeReadWaiter {
+            reply_slot: 0,
+            badge: 0,
+            requested_len: 0,
+        }
     }
 }
 
@@ -300,7 +332,12 @@ pub(crate) struct PipeWriteWaiter {
 
 impl PipeWriteWaiter {
     pub(crate) const fn zeroed() -> Self {
-        PipeWriteWaiter { reply_slot: 0, badge: 0, data: [0; 144], data_len: 0 }
+        PipeWriteWaiter {
+            reply_slot: 0,
+            badge: 0,
+            data: [0; 144],
+            data_len: 0,
+        }
     }
 }
 
@@ -353,20 +390,30 @@ pub(crate) struct PtyPendingReader {
 
 impl PtyPendingReader {
     pub(crate) const fn zeroed() -> Self {
-        PtyPendingReader { active: 0, badge: 0, reply_slot: 0, max_count: 0 }
+        PtyPendingReader {
+            active: 0,
+            badge: 0,
+            reply_slot: 0,
+            max_count: 0,
+        }
     }
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct MountEntry {
     pub(crate) active: u8,
-    pub(crate) mount_ino: u32,    // VFS inode for the mount point directory
-    pub(crate) fs_cap: u64,       // Cap slot of mounted FS server endpoint
-    pub(crate) root_ino: u32,     // Root inode number in the mounted FS
+    pub(crate) mount_ino: u32, // VFS inode for the mount point directory
+    pub(crate) fs_cap: u64,    // Cap slot of mounted FS server endpoint
+    pub(crate) root_ino: u32,  // Root inode number in the mounted FS
 }
 
 impl MountEntry {
     pub(crate) const fn zeroed() -> Self {
-        MountEntry { active: 0, mount_ino: 0, fs_cap: 0, root_ino: 0 }
+        MountEntry {
+            active: 0,
+            mount_ino: 0,
+            fs_cap: 0,
+            root_ino: 0,
+        }
     }
 }

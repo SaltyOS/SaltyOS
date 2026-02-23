@@ -8,13 +8,13 @@ pub(crate) const CAP_SELF_CSPACE: u64 = 2;
 pub(crate) const CAP_SERVER_EP: u64 = 3;
 pub(crate) const CAP_INITRD_UNTYPED: u64 = 12;
 pub(crate) const CAP_READINESS_NTFN: u64 = 14;
-pub(crate) const VFS_CAP_CONSOLE_EP: u64 = 64;    // NeedEP console:64
-pub(crate) const VFS_CAP_NAMESERV_EP: u64 = 65;   // NeedEP nameserv:65
-pub(crate) const VFS_CAP_TTYD_EP: u64 = 67;       // NeedEP ttyd:67
-pub(crate) const VFS_CAP_FB_UNTYPED: u64 = 66;    // CopyCap 13:66
-pub(crate) const VFS_CAP_PTY_NTFN: u64 = 68;     // CopyCap 14:68 (PTY data-ready notification)
-pub(crate) const VFS_CAP_MMSRV_EP: u64 = 69;     // NeedEP mmsrv:69
-pub(crate) const VFS_CAP_PROCMGR_EP: u64 = 70;   // NeedEP procmgr:70
+pub(crate) const VFS_CAP_CONSOLE_EP: u64 = 64; // NeedEP console:64
+pub(crate) const VFS_CAP_NAMESERV_EP: u64 = 65; // NeedEP nameserv:65
+pub(crate) const VFS_CAP_TTYD_EP: u64 = 67; // NeedEP ttyd:67
+pub(crate) const VFS_CAP_FB_UNTYPED: u64 = 66; // CopyCap 13:66
+pub(crate) const VFS_CAP_PTY_NTFN: u64 = 68; // CopyCap 14:68 (PTY data-ready notification)
+pub(crate) const VFS_CAP_MMSRV_EP: u64 = 69; // NeedEP mmsrv:69
+pub(crate) const VFS_CAP_PROCMGR_EP: u64 = 70; // NeedEP procmgr:70
 pub(crate) const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 // VFS protocol labels
@@ -79,6 +79,8 @@ pub(crate) const VFS_UTIMENSAT: u64 = 58;
 pub(crate) const VFS_FCHMOD: u64 = 59;
 pub(crate) const VFS_FCHOWN: u64 = 60;
 pub(crate) const VFS_CLIENT_EXIT: u64 = 61;
+pub(crate) const VFS_PREAD: u64 = 62;
+pub(crate) const VFS_PWRITE: u64 = 63;
 
 pub(crate) const TTYD_GET_FG_PGRP: u64 = 1;
 pub(crate) const TTYD_SET_FG_PGRP: u64 = 2;
@@ -112,7 +114,7 @@ pub(crate) const FTYPE_MOUNT_POINT: u8 = 9;
 pub(crate) const PROC_FILE_STATUS: u8 = 1;
 pub(crate) const PROC_FILE_STAT: u8 = 2;
 pub(crate) const PROC_FILE_MAPS: u8 = 3;
-pub(crate) const PROC_FILE_ROOT: u8 = 4;  // /proc directory itself
+pub(crate) const PROC_FILE_ROOT: u8 = 4; // /proc directory itself
 pub(crate) const PROC_FILE_PID_DIR: u8 = 5; // /proc/<pid> directory
 
 // Open flags — use salty::consts::O_* (POSIX u32)
@@ -164,7 +166,7 @@ pub(crate) const SOCK_CLOSED: u8 = 5;
 pub(crate) const INITIAL_SOCKETS: usize = 32;
 pub(crate) const SOCK_BUF_SIZE: usize = 4096;
 pub(crate) const INITIAL_POLL_WAITERS: usize = 16;
-pub(crate) const MAX_SHM_PAGES: usize = 64;  // Per-SHM limit (semantic)
+pub(crate) const MAX_SHM_PAGES: usize = 64; // Per-SHM limit (semantic)
 pub(crate) const INITIAL_PENDING_CONN: usize = 4;
 
 // Cap slot range for deferred replies.

@@ -9,9 +9,7 @@ use salty::types::*;
 use crate::consts::*;
 use crate::types::*;
 use crate::{
-    puts, str_equal_raw,
-    max_inodes, max_writable,
-    vfs_alloc_array, vfs_grow_pool, vfs_grow_array,
+    max_inodes, max_writable, puts, str_equal_raw, vfs_alloc_array, vfs_grow_array, vfs_grow_pool,
     INODES, WRITABLE_POOL, WRITABLE_USED,
 };
 
@@ -74,10 +72,11 @@ pub(crate) unsafe fn alloc_inode() -> *mut RamfsInode {
             &raw mut crate::INODES_PTR as *mut *mut u8,
             &raw mut crate::INODES_CAP,
             core::mem::size_of::<RamfsInode>(),
-        ) != 0 {
+        ) != 0
+        {
             return core::ptr::null_mut();
         }
-        alloc_inode()  // Tail-recursive retry
+        alloc_inode() // Tail-recursive retry
     }
 }
 
@@ -234,7 +233,9 @@ pub(crate) unsafe fn chain_write(rw_data: *mut u8, offset: u64, src: *const u8, 
             let avail = WRITABLE_SIZE - slot_off;
             let want = (count - total) as usize;
             let n = if want < avail { want } else { avail };
-            let dst_ptr = WRITABLE_POOL!()[slot_idx as usize].as_mut_ptr().add(slot_off);
+            let dst_ptr = WRITABLE_POOL!()[slot_idx as usize]
+                .as_mut_ptr()
+                .add(slot_off);
             core::ptr::copy_nonoverlapping(src.add(total as usize), dst_ptr, n);
             total += n as u64;
             slot_off = 0;
@@ -263,7 +264,11 @@ pub(crate) unsafe fn chain_truncate(rw_data: *mut u8, new_size: u64) {
         if rw_data.is_null() {
             return;
         }
-        let keep_slots = if new_size == 0 { 1 } else { ((new_size as usize) + WRITABLE_SIZE - 1) / WRITABLE_SIZE };
+        let keep_slots = if new_size == 0 {
+            1
+        } else {
+            ((new_size as usize) + WRITABLE_SIZE - 1) / WRITABLE_SIZE
+        };
         let mut slot_idx = slot_index_of(rw_data);
         let mut count = 1usize;
         // Walk to the last slot we want to keep
@@ -291,7 +296,9 @@ pub(crate) unsafe fn chain_truncate(rw_data: *mut u8, new_size: u64) {
         // Zero out data beyond new_size in the last kept slot
         let off_in_slot = (new_size as usize) % WRITABLE_SIZE;
         if off_in_slot > 0 {
-            let p = WRITABLE_POOL!()[slot_idx as usize].as_mut_ptr().add(off_in_slot);
+            let p = WRITABLE_POOL!()[slot_idx as usize]
+                .as_mut_ptr()
+                .add(off_in_slot);
             core::ptr::write_bytes(p, 0, WRITABLE_SIZE - off_in_slot);
         }
     }
@@ -310,7 +317,8 @@ pub(crate) unsafe fn grow_writable_pool() -> i32 {
             &raw mut crate::WRITABLE_POOL_PTR as *mut *mut u8,
             &raw mut crate::WRITABLE_CAP,
             core::mem::size_of::<[u8; WRITABLE_SIZE]>(),
-        ) != 0 {
+        ) != 0
+        {
             return -1;
         }
         // Grow WRITABLE_USED (WRITABLE_CAP was updated by vfs_grow_pool above)
@@ -319,7 +327,10 @@ pub(crate) unsafe fn grow_writable_pool() -> i32 {
         let new_used_ptr = salty::posix_mm::posix_mmap(
             core::ptr::null_mut(),
             (used_pages * 4096) as u64,
-            0x3, 0x22, -1, 0,
+            0x3,
+            0x22,
+            -1,
+            0,
         );
         if new_used_ptr.is_null() || new_used_ptr == usize::MAX as *mut u8 {
             return -1;
@@ -339,7 +350,10 @@ pub(crate) unsafe fn grow_writable_pool() -> i32 {
         let new_next_ptr = salty::posix_mm::posix_mmap(
             core::ptr::null_mut(),
             (next_pages * 4096) as u64,
-            0x3, 0x22, -1, 0,
+            0x3,
+            0x22,
+            -1,
+            0,
         );
         if new_next_ptr.is_null() || new_next_ptr == usize::MAX as *mut u8 {
             return -1;
@@ -396,7 +410,12 @@ pub(crate) unsafe fn free_symlink_target(ptr: *mut u8) {
     }
 }
 
-pub(crate) unsafe fn dir_add_entry(dir: *mut RamfsInode, name: *const u8, name_len: u8, child_ino: u32) -> i32 {
+pub(crate) unsafe fn dir_add_entry(
+    dir: *mut RamfsInode,
+    name: *const u8,
+    name_len: u8,
+    child_ino: u32,
+) -> i32 {
     unsafe {
         for i in 0..(*dir).dirents_cap as usize {
             if (*(*dir).dirents.add(i)).active == 0 {
@@ -426,7 +445,11 @@ pub(crate) unsafe fn dir_add_entry(dir: *mut RamfsInode, name: *const u8, name_l
     }
 }
 
-pub(crate) unsafe fn dir_find_entry(dir: *mut RamfsInode, name: *const u8, name_len: u8) -> *mut RamfsDirent {
+pub(crate) unsafe fn dir_find_entry(
+    dir: *mut RamfsInode,
+    name: *const u8,
+    name_len: u8,
+) -> *mut RamfsDirent {
     unsafe {
         for i in 0..(*dir).dirents_cap as usize {
             if (*(*dir).dirents.add(i)).active != 0
@@ -463,7 +486,11 @@ pub(crate) unsafe fn dir_remove_entry(dir: *mut RamfsInode, name: *const u8, nam
     }
 }
 
-pub(crate) unsafe fn ensure_readonly_dir(parent: *mut RamfsInode, name: *const u8, name_len: u8) -> *mut RamfsInode {
+pub(crate) unsafe fn ensure_readonly_dir(
+    parent: *mut RamfsInode,
+    name: *const u8,
+    name_len: u8,
+) -> *mut RamfsInode {
     unsafe {
         let existing = dir_find_entry(parent, name, name_len);
         if !existing.is_null() {
@@ -509,7 +536,10 @@ pub(crate) unsafe fn mount_initrd_entry(root: *mut RamfsInode, entry: &CpioEntry
         while start < end && *entry.name.add(start) == b'/' {
             start += 1;
         }
-        while start + 1 < end && *entry.name.add(start) == b'.' && *entry.name.add(start + 1) == b'/' {
+        while start + 1 < end
+            && *entry.name.add(start) == b'.'
+            && *entry.name.add(start + 1) == b'/'
+        {
             start += 2;
         }
         while end > start && *entry.name.add(end - 1) == b'/' {
@@ -557,7 +587,11 @@ pub(crate) unsafe fn mount_initrd_entry(root: *mut RamfsInode, entry: &CpioEntry
 
             let leaf_name = entry.name.add(comp_start);
             let leaf_len = comp_len as u8;
-            let leaf_mode = if entry.mode != 0 { entry.mode } else { S_IFREG_L | 0o444 };
+            let leaf_mode = if entry.mode != 0 {
+                entry.mode
+            } else {
+                S_IFREG_L | 0o444
+            };
             let leaf_is_dir = (leaf_mode & S_IFMT_L) == S_IFDIR_L;
             let leaf_is_symlink = (leaf_mode & S_IFMT_L) == S_IFLNK_L;
 
@@ -790,7 +824,13 @@ pub(crate) unsafe fn init_ramfs() {
         let initrd = INITRD_VADDR as *const u8;
         let initrd_size = read_boot_info_initrd_size();
 
-        { let mut lb = LineBuf::new(); lb.str(b"[VFS] Initrd size: "); lb.hex(initrd_size as u64); lb.str(b" bytes\n"); lb.flush(); }
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS] Initrd size: ");
+            lb.hex(initrd_size as u64);
+            lb.str(b" bytes\n");
+            lb.flush();
+        }
 
         let mut offset: usize = 0;
         let mut entry = CpioEntryExt::zeroed();
@@ -806,6 +846,12 @@ pub(crate) unsafe fn init_ramfs() {
             }
         }
 
-        { let mut lb = LineBuf::new(); lb.str(b"[VFS] Mounted "); lb.hex(file_count as u64); lb.str(b" initrd files\n"); lb.flush(); }
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS] Mounted ");
+            lb.hex(file_count as u64);
+            lb.str(b" initrd files\n");
+            lb.flush();
+        }
     }
 }

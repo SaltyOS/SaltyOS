@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! POSIX file operations (open, read, write, close, stat, lseek, access, unlink).
 
+use super::{pack_path, CAP_VFS_EP};
 use crate::consts::*;
 use crate::types::*;
-use super::{pack_path, CAP_VFS_EP};
 
 /// Open a file at `path` with the given `flags` (O_RDONLY, O_CREAT, etc.).
 /// `mode` specifies permission bits when creating a file (masked with 0o777).
@@ -25,8 +25,11 @@ pub unsafe fn posix_open(path: *const u8, flags: i32, mode: u32) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         reply.regs[0] as i32
     }
@@ -60,7 +63,14 @@ pub unsafe fn posix_read(fd: i32, buf: *mut u8, count: u64) -> i64 {
                 &raw mut reply,
             );
             if err != 0 || reply.label != SALTY_OK {
-                return if total > 0 { total as i64 } else { -1 };
+                if total > 0 {
+                    return total as i64;
+                }
+                return if err != 0 {
+                    -5
+                } else {
+                    super::salty_err_to_posix(reply.label) as i64
+                };
             }
 
             let actual = reply.regs[0];
@@ -118,7 +128,132 @@ pub unsafe fn posix_write(fd: i32, buf: *const u8, count: u64) -> i64 {
                 &raw mut reply,
             );
             if err != 0 || reply.label != SALTY_OK {
-                return if total > 0 { total as i64 } else { -1 };
+                if total > 0 {
+                    return total as i64;
+                }
+                return if err != 0 {
+                    -5
+                } else {
+                    super::salty_err_to_posix(reply.label) as i64
+                };
+            }
+
+            let actual = reply.regs[0];
+            total += actual;
+            if actual < chunk {
+                break;
+            }
+        }
+
+        total as i64
+    }
+}
+
+/// Read up to `count` bytes from `fd` at `offset` without changing the file offset.
+///
+/// Uses a dedicated VFS PREAD protocol so the server handles the offset
+/// atomically without touching the fd cursor.
+/// Returns the number of bytes read, or a negative errno on error.
+pub unsafe fn posix_pread(fd: i32, buf: *mut u8, count: u64, offset: i64) -> i64 {
+    unsafe {
+        let mut total: u64 = 0;
+
+        while total < count {
+            let mut chunk = count - total;
+            if chunk > 152 {
+                chunk = 152;
+            }
+
+            let mut msg = SaltyMsg::zeroed();
+            let mut reply = SaltyMsg::zeroed();
+            msg.label = POSIX_VFS_PREAD;
+            msg.length = 3;
+            msg.regs[0] = fd as u64;
+            msg.regs[1] = chunk;
+            msg.regs[2] = (offset as i64 + total as i64) as u64;
+
+            let err = crate::ipc::call_ctx(
+                crate::tls::current_ipc_ctx(),
+                CAP_VFS_EP,
+                &raw const msg,
+                &raw mut reply,
+            );
+            if err != 0 || reply.label != SALTY_OK {
+                if total > 0 {
+                    return total as i64;
+                }
+                return if err != 0 {
+                    -5
+                } else {
+                    super::salty_err_to_posix(reply.label) as i64
+                };
+            }
+
+            let actual = reply.regs[0];
+            if actual == 0 {
+                break;
+            }
+
+            let src = &reply.regs[1] as *const u64 as *const u8;
+            for i in 0..actual as usize {
+                if total as usize + i < count as usize {
+                    *buf.add(total as usize + i) = *src.add(i);
+                }
+            }
+
+            total += actual;
+            if actual < chunk {
+                break;
+            }
+        }
+
+        total as i64
+    }
+}
+
+/// Write up to `count` bytes to `fd` at `offset` without changing the file offset.
+///
+/// Uses a dedicated VFS PWRITE protocol so the server handles the offset
+/// atomically without touching the fd cursor.
+/// Returns the number of bytes written, or a negative errno on error.
+pub unsafe fn posix_pwrite(fd: i32, buf: *const u8, count: u64, offset: i64) -> i64 {
+    unsafe {
+        let mut total: u64 = 0;
+
+        while total < count {
+            let mut chunk = count - total;
+            if chunk > 136 {
+                chunk = 136;
+            }
+
+            let mut msg = SaltyMsg::zeroed();
+            let mut reply = SaltyMsg::zeroed();
+            msg.label = POSIX_VFS_PWRITE;
+            msg.length = 3 + ((chunk + 7) / 8);
+            msg.regs[0] = fd as u64;
+            msg.regs[1] = chunk;
+            msg.regs[2] = (offset as i64 + total as i64) as u64;
+
+            let dst = &mut msg.regs[3] as *mut u64 as *mut u8;
+            for i in 0..chunk as usize {
+                *dst.add(i) = *buf.add(total as usize + i);
+            }
+
+            let err = crate::ipc::call_ctx(
+                crate::tls::current_ipc_ctx(),
+                CAP_VFS_EP,
+                &raw const msg,
+                &raw mut reply,
+            );
+            if err != 0 || reply.label != SALTY_OK {
+                if total > 0 {
+                    return total as i64;
+                }
+                return if err != 0 {
+                    -5
+                } else {
+                    super::salty_err_to_posix(reply.label) as i64
+                };
             }
 
             let actual = reply.regs[0];
@@ -147,8 +282,11 @@ pub unsafe fn posix_close(fd: i32) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -170,8 +308,11 @@ pub unsafe fn posix_stat(path: *const u8, st: *mut SaltyStat) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
 
         if !st.is_null() {
@@ -203,8 +344,11 @@ pub unsafe fn posix_lstat(path: *const u8, st: *mut SaltyStat) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
 
         if !st.is_null() {
@@ -236,8 +380,11 @@ pub unsafe fn posix_fstat(fd: i32, st: *mut SaltyStat) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
 
         if !st.is_null() {
@@ -272,8 +419,11 @@ pub unsafe fn posix_lseek(fd: i32, offset: i64, whence: i32) -> i64 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label) as i64;
         }
         reply.regs[0] as i64
     }
@@ -296,8 +446,11 @@ pub unsafe fn posix_access(path: *const u8, mode: i32) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -318,8 +471,11 @@ pub unsafe fn posix_unlink(path: *const u8) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -365,8 +521,11 @@ pub unsafe fn posix_rename(old_path: *const u8, new_path: *const u8) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -389,8 +548,11 @@ pub unsafe fn posix_mkdir(path: *const u8, mode: i32) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -411,8 +573,11 @@ pub unsafe fn posix_rmdir(path: *const u8) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -433,8 +598,11 @@ pub unsafe fn posix_opendir(path: *const u8) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         reply.regs[0] as i32
     }
@@ -503,8 +671,11 @@ pub unsafe fn posix_ftruncate(fd: i32, length: u64) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }

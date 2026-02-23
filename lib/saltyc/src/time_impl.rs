@@ -84,9 +84,7 @@ static mut CTIME_BUF: [u8; 64] = [0; 64];
 // Day and month name tables
 // ---------------------------------------------------------------------------
 
-static WDAY_ABBR: [&[u8]; 7] = [
-    b"Sun", b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat",
-];
+static WDAY_ABBR: [&[u8]; 7] = [b"Sun", b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat"];
 
 static WDAY_FULL: [&[u8]; 7] = [
     b"Sunday",
@@ -99,8 +97,7 @@ static WDAY_FULL: [&[u8]; 7] = [
 ];
 
 static MON_ABBR: [&[u8]; 12] = [
-    b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun",
-    b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec",
+    b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec",
 ];
 
 static MON_FULL: [&[u8]; 12] = [
@@ -129,7 +126,11 @@ fn is_leap_year(year: i32) -> bool {
 }
 
 fn days_in_year(year: i32) -> i32 {
-    if is_leap_year(year) { 366 } else { 365 }
+    if is_leap_year(year) {
+        366
+    } else {
+        365
+    }
 }
 
 fn days_in_month(month: i32, year: i32) -> i32 {
@@ -357,7 +358,7 @@ pub unsafe extern "C" fn gettimeofday(tv: *mut Timeval, _tz: *mut u8) -> i32 {
         let mut stv = salty::types::Timeval::zeroed();
         let ret = salty::posix::posix_gettimeofday(&raw mut stv);
         if ret < 0 {
-            errno::set_errno(errno::EIO);
+            errno::set_errno(-ret);
             return -1;
         }
         if !tv.is_null() {
@@ -374,7 +375,7 @@ pub unsafe extern "C" fn clock_gettime(clock_id: i32, tp: *mut Timespec) -> i32 
         let mut sts = salty::types::Timespec::zeroed();
         let ret = salty::posix::posix_clock_gettime(clock_id, &raw mut sts);
         if ret < 0 {
-            errno::set_errno(errno::EINVAL);
+            errno::set_errno(-ret);
             return -1;
         }
         if !tp.is_null() {
@@ -529,9 +530,7 @@ pub unsafe extern "C" fn asctime_r(tm: *const Tm, buf: *mut u8) -> *mut u8 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn asctime(tm: *const Tm) -> *mut u8 {
-    unsafe {
-        asctime_r(tm, (&raw mut ASCTIME_BUF) as *mut u8)
-    }
+    unsafe { asctime_r(tm, (&raw mut ASCTIME_BUF) as *mut u8) }
 }
 
 #[unsafe(no_mangle)]
@@ -557,9 +556,7 @@ pub unsafe extern "C" fn ctime_r(timep: *const TimeT, buf: *mut u8) -> *mut u8 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ctime(timep: *const TimeT) -> *mut u8 {
-    unsafe {
-        ctime_r(timep, (&raw mut CTIME_BUF) as *mut u8)
-    }
+    unsafe { ctime_r(timep, (&raw mut CTIME_BUF) as *mut u8) }
 }
 
 #[unsafe(no_mangle)]
@@ -605,29 +602,27 @@ pub unsafe extern "C" fn strftime(
             let written = match spec {
                 // %% — literal %
                 b'%' => {
-                    if avail < 1 { return 0; }
+                    if avail < 1 {
+                        return 0;
+                    }
                     *buf.add(pos) = b'%';
                     1
                 }
 
                 // %Y — 4-digit year
-                b'Y' => {
-                    write_padded(buf.add(pos), avail, (*tm).tm_year + 1900, 4)
-                }
+                b'Y' => write_padded(buf.add(pos), avail, (*tm).tm_year + 1900, 4),
 
                 // %m — month 01-12
-                b'm' => {
-                    write_padded(buf.add(pos), avail, (*tm).tm_mon + 1, 2)
-                }
+                b'm' => write_padded(buf.add(pos), avail, (*tm).tm_mon + 1, 2),
 
                 // %d — day 01-31
-                b'd' => {
-                    write_padded(buf.add(pos), avail, (*tm).tm_mday, 2)
-                }
+                b'd' => write_padded(buf.add(pos), avail, (*tm).tm_mday, 2),
 
                 // %e — day with space-padding
                 b'e' => {
-                    if avail < 2 { return 0; }
+                    if avail < 2 {
+                        return 0;
+                    }
                     if (*tm).tm_mday < 10 {
                         *buf.add(pos) = b' ';
                         1 + write_padded(buf.add(pos + 1), avail - 1, (*tm).tm_mday, 1)
@@ -637,9 +632,7 @@ pub unsafe extern "C" fn strftime(
                 }
 
                 // %H — hour 00-23
-                b'H' => {
-                    write_padded(buf.add(pos), avail, (*tm).tm_hour, 2)
-                }
+                b'H' => write_padded(buf.add(pos), avail, (*tm).tm_hour, 2),
 
                 // %I — hour 01-12
                 b'I' => {
@@ -649,18 +642,18 @@ pub unsafe extern "C" fn strftime(
                 }
 
                 // %M — minute 00-59
-                b'M' => {
-                    write_padded(buf.add(pos), avail, (*tm).tm_min, 2)
-                }
+                b'M' => write_padded(buf.add(pos), avail, (*tm).tm_min, 2),
 
                 // %S — second 00-60
-                b'S' => {
-                    write_padded(buf.add(pos), avail, (*tm).tm_sec, 2)
-                }
+                b'S' => write_padded(buf.add(pos), avail, (*tm).tm_sec, 2),
 
                 // %p — AM/PM
                 b'p' => {
-                    let s = if (*tm).tm_hour < 12 { b"AM" as &[u8] } else { b"PM" };
+                    let s = if (*tm).tm_hour < 12 {
+                        b"AM" as &[u8]
+                    } else {
+                        b"PM"
+                    };
                     write_str(buf.add(pos), avail, s)
                 }
 
@@ -706,39 +699,44 @@ pub unsafe extern "C" fn strftime(
 
                 // %c — date and time: "Day Mon DD HH:MM:SS YYYY"
                 b'c' => {
-                    let n = strftime(buf.add(pos), avail + 1, b"%a %b %e %H:%M:%S %Y\0".as_ptr(), tm);
-                    if n == 0 && avail > 0 { return 0; }
+                    let n = strftime(
+                        buf.add(pos),
+                        avail + 1,
+                        b"%a %b %e %H:%M:%S %Y\0".as_ptr(),
+                        tm,
+                    );
+                    if n == 0 && avail > 0 {
+                        return 0;
+                    }
                     n
                 }
 
                 // %x — date: "MM/DD/YY"
                 b'x' => {
                     let n = strftime(buf.add(pos), avail + 1, b"%m/%d/%y\0".as_ptr(), tm);
-                    if n == 0 && avail > 0 { return 0; }
+                    if n == 0 && avail > 0 {
+                        return 0;
+                    }
                     n
                 }
 
                 // %X — time: "HH:MM:SS"
                 b'X' => {
                     let n = strftime(buf.add(pos), avail + 1, b"%H:%M:%S\0".as_ptr(), tm);
-                    if n == 0 && avail > 0 { return 0; }
+                    if n == 0 && avail > 0 {
+                        return 0;
+                    }
                     n
                 }
 
                 // %y — 2-digit year
-                b'y' => {
-                    write_padded(buf.add(pos), avail, ((*tm).tm_year + 1900) % 100, 2)
-                }
+                b'y' => write_padded(buf.add(pos), avail, ((*tm).tm_year + 1900) % 100, 2),
 
                 // %j — day of year 001-366
-                b'j' => {
-                    write_padded(buf.add(pos), avail, (*tm).tm_yday + 1, 3)
-                }
+                b'j' => write_padded(buf.add(pos), avail, (*tm).tm_yday + 1, 3),
 
                 // %w — weekday 0-6 (Sunday=0)
-                b'w' => {
-                    write_padded(buf.add(pos), avail, (*tm).tm_wday, 1)
-                }
+                b'w' => write_padded(buf.add(pos), avail, (*tm).tm_wday, 1),
 
                 // %u — weekday 1-7 (Monday=1)
                 b'u' => {
@@ -747,41 +745,49 @@ pub unsafe extern "C" fn strftime(
                 }
 
                 // %Z — timezone name (always UTC)
-                b'Z' => {
-                    write_str(buf.add(pos), avail, b"UTC")
-                }
+                b'Z' => write_str(buf.add(pos), avail, b"UTC"),
 
                 // %R — %H:%M
                 b'R' => {
                     let n = strftime(buf.add(pos), avail + 1, b"%H:%M\0".as_ptr(), tm);
-                    if n == 0 && avail > 0 { return 0; }
+                    if n == 0 && avail > 0 {
+                        return 0;
+                    }
                     n
                 }
 
                 // %T — %H:%M:%S
                 b'T' => {
                     let n = strftime(buf.add(pos), avail + 1, b"%H:%M:%S\0".as_ptr(), tm);
-                    if n == 0 && avail > 0 { return 0; }
+                    if n == 0 && avail > 0 {
+                        return 0;
+                    }
                     n
                 }
 
                 // %n — newline
                 b'n' => {
-                    if avail < 1 { return 0; }
+                    if avail < 1 {
+                        return 0;
+                    }
                     *buf.add(pos) = b'\n';
                     1
                 }
 
                 // %t — tab
                 b't' => {
-                    if avail < 1 { return 0; }
+                    if avail < 1 {
+                        return 0;
+                    }
                     *buf.add(pos) = b'\t';
                     1
                 }
 
                 // Unknown specifier: output as-is
                 _ => {
-                    if avail < 2 { return 0; }
+                    if avail < 2 {
+                        return 0;
+                    }
                     *buf.add(pos) = b'%';
                     *buf.add(pos + 1) = spec;
                     2
@@ -855,11 +861,7 @@ pub unsafe extern "C" fn timegm(tm: *mut Tm) -> TimeT {
 /// strptime — parse a time string according to a format.
 /// Minimal implementation supporting: %Y %m %d %H %M %S %T %D %n %t %%
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn strptime(
-    buf: *const u8,
-    fmt: *const u8,
-    tm: *mut Tm,
-) -> *mut u8 {
+pub unsafe extern "C" fn strptime(buf: *const u8, fmt: *const u8, tm: *mut Tm) -> *mut u8 {
     unsafe {
         if buf.is_null() || fmt.is_null() || tm.is_null() {
             return core::ptr::null_mut();
@@ -883,72 +885,96 @@ pub unsafe extern "C" fn strptime(
                     b'Y' => {
                         // 4-digit year
                         let (val, adv) = parse_digits(buf.add(bi), 4);
-                        if adv != 4 { return core::ptr::null_mut(); }
+                        if adv != 4 {
+                            return core::ptr::null_mut();
+                        }
                         (*tm).tm_year = val - 1900;
                         bi += adv;
                     }
                     b'm' => {
                         // 1-2 digit month (01-12)
                         let (val, adv) = parse_digits(buf.add(bi), 2);
-                        if adv == 0 || val < 1 || val > 12 { return core::ptr::null_mut(); }
+                        if adv == 0 || val < 1 || val > 12 {
+                            return core::ptr::null_mut();
+                        }
                         (*tm).tm_mon = val - 1;
                         bi += adv;
                     }
                     b'd' => {
                         // 1-2 digit day (01-31)
                         let (val, adv) = parse_digits(buf.add(bi), 2);
-                        if adv == 0 || val < 1 || val > 31 { return core::ptr::null_mut(); }
+                        if adv == 0 || val < 1 || val > 31 {
+                            return core::ptr::null_mut();
+                        }
                         (*tm).tm_mday = val;
                         bi += adv;
                     }
                     b'H' => {
                         // 1-2 digit hour (00-23)
                         let (val, adv) = parse_digits(buf.add(bi), 2);
-                        if adv == 0 || val > 23 { return core::ptr::null_mut(); }
+                        if adv == 0 || val > 23 {
+                            return core::ptr::null_mut();
+                        }
                         (*tm).tm_hour = val;
                         bi += adv;
                     }
                     b'M' => {
                         // 1-2 digit minute (00-59)
                         let (val, adv) = parse_digits(buf.add(bi), 2);
-                        if adv == 0 || val > 59 { return core::ptr::null_mut(); }
+                        if adv == 0 || val > 59 {
+                            return core::ptr::null_mut();
+                        }
                         (*tm).tm_min = val;
                         bi += adv;
                     }
                     b'S' => {
                         // 1-2 digit second (00-60, leap second)
                         let (val, adv) = parse_digits(buf.add(bi), 2);
-                        if adv == 0 || val > 60 { return core::ptr::null_mut(); }
+                        if adv == 0 || val > 60 {
+                            return core::ptr::null_mut();
+                        }
                         (*tm).tm_sec = val;
                         bi += adv;
                     }
                     b'T' => {
                         // %H:%M:%S
                         let result = strptime(buf.add(bi), b"%H:%M:%S\0".as_ptr(), tm);
-                        if result.is_null() { return core::ptr::null_mut(); }
+                        if result.is_null() {
+                            return core::ptr::null_mut();
+                        }
                         bi += (result as *const u8).offset_from(buf.add(bi)) as usize;
                     }
                     b'D' => {
                         // %m/%d/%y
                         let result = strptime(buf.add(bi), b"%m/%d/%y\0".as_ptr(), tm);
-                        if result.is_null() { return core::ptr::null_mut(); }
+                        if result.is_null() {
+                            return core::ptr::null_mut();
+                        }
                         bi += (result as *const u8).offset_from(buf.add(bi)) as usize;
                     }
                     b'y' => {
                         // 2-digit year (00-99, maps to 1969-2068)
                         let (val, adv) = parse_digits(buf.add(bi), 2);
-                        if adv != 2 { return core::ptr::null_mut(); }
+                        if adv != 2 {
+                            return core::ptr::null_mut();
+                        }
                         (*tm).tm_year = if val >= 69 { val } else { val + 100 };
                         bi += adv;
                     }
                     b'n' | b't' => {
                         // Skip whitespace
-                        while *buf.add(bi) != 0 && (*buf.add(bi) == b' ' || *buf.add(bi) == b'\t' || *buf.add(bi) == b'\n') {
+                        while *buf.add(bi) != 0
+                            && (*buf.add(bi) == b' '
+                                || *buf.add(bi) == b'\t'
+                                || *buf.add(bi) == b'\n')
+                        {
                             bi += 1;
                         }
                     }
                     b'%' => {
-                        if *buf.add(bi) != b'%' { return core::ptr::null_mut(); }
+                        if *buf.add(bi) != b'%' {
+                            return core::ptr::null_mut();
+                        }
                         bi += 1;
                     }
                     _ => {

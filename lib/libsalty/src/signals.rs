@@ -96,6 +96,11 @@ pub unsafe fn posix_signal(sig: i32, handler: usize) -> usize {
 /// - Otherwise: saves/restores the blocked mask, handles SA_RESETHAND,
 ///   and calls the user handler function.
 ///
+/// Note: SA_RESTART has no effect in SaltyOS. Signals are delivered
+/// cooperatively — system calls (IPC) are never interrupted, so there
+/// is no syscall to restart. SA_RESTART is stored but intentionally
+/// not checked here.
+///
 /// Returns the number of signals dispatched (0 if none pending).
 pub unsafe fn posix_sigcheck() -> i32 {
     unsafe {

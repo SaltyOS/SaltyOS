@@ -202,7 +202,8 @@ pub unsafe extern "C" fn utime(filename: *const u8, times: *const Utimbuf) -> i3
             0,
         );
         if ret < 0 {
-            errno::set_errno(errno::ENOENT);
+            errno::set_errno(-ret);
+            return -1;
         }
         ret
     }
@@ -237,7 +238,8 @@ pub unsafe extern "C" fn utimes(filename: *const u8, times: *const CTimeval) -> 
             0,
         );
         if ret < 0 {
-            errno::set_errno(errno::ENOENT);
+            errno::set_errno(-ret);
+            return -1;
         }
         ret
     }
@@ -341,7 +343,8 @@ pub unsafe extern "C" fn getentropy(buf: *mut u8, buflen: usize) -> i32 {
         *ctr = (*ctr).wrapping_add(1);
 
         // Simple xorshift-based mixing
-        let mut state: u64 = ts.tv_sec
+        let mut state: u64 = ts
+            .tv_sec
             .wrapping_mul(6364136223846793005)
             .wrapping_add(ts.tv_nsec)
             .wrapping_mul(1442695040888963407)
@@ -434,7 +437,11 @@ pub unsafe extern "C" fn copy_file_range(
         let mut total: usize = 0;
 
         while total < len {
-            let chunk = if len - total < 4096 { len - total } else { 4096 };
+            let chunk = if len - total < 4096 {
+                len - total
+            } else {
+                4096
+            };
             let nr = salty::posix::posix_read(fd_in, buf.as_mut_ptr(), chunk as u64);
             if nr < 0 {
                 if total == 0 {
@@ -443,7 +450,11 @@ pub unsafe extern "C" fn copy_file_range(
                         salty::posix::posix_lseek(fd_in, saved_in, salty::consts::SEEK_SET as i32);
                     }
                     if !off_out.is_null() {
-                        salty::posix::posix_lseek(fd_out, saved_out, salty::consts::SEEK_SET as i32);
+                        salty::posix::posix_lseek(
+                            fd_out,
+                            saved_out,
+                            salty::consts::SEEK_SET as i32,
+                        );
                     }
                     errno::set_errno(errno::EIO);
                     return -1;
@@ -464,10 +475,18 @@ pub unsafe extern "C" fn copy_file_range(
                 if nw < 0 {
                     if total == 0 && written == 0 {
                         if !off_in.is_null() {
-                            salty::posix::posix_lseek(fd_in, saved_in, salty::consts::SEEK_SET as i32);
+                            salty::posix::posix_lseek(
+                                fd_in,
+                                saved_in,
+                                salty::consts::SEEK_SET as i32,
+                            );
                         }
                         if !off_out.is_null() {
-                            salty::posix::posix_lseek(fd_out, saved_out, salty::consts::SEEK_SET as i32);
+                            salty::posix::posix_lseek(
+                                fd_out,
+                                saved_out,
+                                salty::consts::SEEK_SET as i32,
+                            );
                         }
                         errno::set_errno(errno::EIO);
                         return -1;
@@ -480,7 +499,11 @@ pub unsafe extern "C" fn copy_file_range(
                     }
                     if !off_out.is_null() {
                         *off_out += total as i64;
-                        salty::posix::posix_lseek(fd_out, saved_out, salty::consts::SEEK_SET as i32);
+                        salty::posix::posix_lseek(
+                            fd_out,
+                            saved_out,
+                            salty::consts::SEEK_SET as i32,
+                        );
                     }
                     return total as isize;
                 }
@@ -546,7 +569,10 @@ pub unsafe extern "C" fn sem_init(sem: *mut u8, pshared: i32, value: u32) -> i32
         return -1;
     }
     unsafe {
-        core::ptr::write(sem as *mut salty::sync::Semaphore, salty::sync::Semaphore::new(value));
+        core::ptr::write(
+            sem as *mut salty::sync::Semaphore,
+            salty::sync::Semaphore::new(value),
+        );
     }
     0
 }
@@ -657,7 +683,10 @@ struct PopenEntry {
 }
 
 static mut POPEN_TABLE: [PopenEntry; MAX_POPEN_ENTRIES] = {
-    const EMPTY: PopenEntry = PopenEntry { fp: core::ptr::null_mut(), pid: 0 };
+    const EMPTY: PopenEntry = PopenEntry {
+        fp: core::ptr::null_mut(),
+        pid: 0,
+    };
     [EMPTY; MAX_POPEN_ENTRIES]
 };
 
@@ -718,7 +747,11 @@ pub unsafe extern "C" fn popen(cmd: *const u8, mode: *const u8) -> *mut crate::s
         };
         salty::posix::posix_close(close_fd);
 
-        let mode_str = if is_read { b"r\0".as_ptr() } else { b"w\0".as_ptr() };
+        let mode_str = if is_read {
+            b"r\0".as_ptr()
+        } else {
+            b"w\0".as_ptr()
+        };
         let fp = crate::stdio::fdopen(parent_fd, mode_str);
         if fp.is_null() {
             salty::posix::posix_close(parent_fd);

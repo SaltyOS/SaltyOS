@@ -5,26 +5,27 @@ use salty::consts::*;
 use salty::ipc;
 use salty::types::*;
 
+use crate::client::{extract_path, get_client};
 use crate::consts::*;
-use crate::types::*;
-use crate::client::{get_client, extract_path};
-use crate::ramfs::{inode_by_ino, alloc_inode, dir_add_entry, dir_remove_entry, chain_truncate};
-use crate::path::{resolve_path, resolve_parent};
-use crate::poll::wake_poll_waiters;
-use crate::socket::alloc_reply_slot;
-use crate::pipe::dup_fd_entry;
 use crate::fileops::normalize_path_for_client;
 use crate::mount::mount_truncate;
+use crate::path::{resolve_parent, resolve_path};
+use crate::pipe::dup_fd_entry;
+use crate::poll::wake_poll_waiters;
+use crate::ramfs::{alloc_inode, chain_truncate, dir_add_entry, dir_remove_entry, inode_by_ino};
+use crate::socket::alloc_reply_slot;
+use crate::types::*;
 use crate::{
-    ipc_ctx, max_clients, max_shm_objects, max_shm_pages,
-    vfs_grow_pool,
-    CLIENTS, SHM_DATA,
+    ipc_ctx, max_clients, max_shm_objects, max_shm_pages, vfs_grow_pool, CLIENTS, SHM_DATA,
 };
 
 /// Handle a deferred PTY device read. Called from main loop when fd is DEV_PTY_SLAVE.
 /// Returns true if reply is deferred (skip_reply), false if reply is ready now.
 pub(crate) unsafe fn handle_pty_dev_read(
-    msg: *const SaltyMsg, fde: *mut FdEntry, reply: *mut SaltyMsg, badge: u64,
+    msg: *const SaltyMsg,
+    fde: *mut FdEntry,
+    reply: *mut SaltyMsg,
+    badge: u64,
 ) -> bool {
     unsafe {
         let count = (*msg).regs[1];
@@ -110,7 +111,8 @@ pub(crate) unsafe fn handle_pty_notification(ntfn_badge: u64) {
                 creq.regs[0] = pty_id as u64;
                 creq.regs[1] = reader.max_count;
                 creq.length = 2;
-                let cerr = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const creq, &raw mut creply);
+                let cerr =
+                    ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const creq, &raw mut creply);
 
                 let actual = creply.regs[0];
                 if actual == 0 {
@@ -135,7 +137,8 @@ pub(crate) unsafe fn handle_pty_notification(ntfn_badge: u64) {
                 }
                 crate::PTY_PENDING_COUNT[pty_id] -= 1;
                 if crate::PTY_PENDING_COUNT[pty_id] < MAX_PTY_WAITERS {
-                    crate::PTY_PENDING[pty_id][crate::PTY_PENDING_COUNT[pty_id]] = PtyPendingReader::zeroed();
+                    crate::PTY_PENDING[pty_id][crate::PTY_PENDING_COUNT[pty_id]] =
+                        PtyPendingReader::zeroed();
                 }
             }
 
@@ -143,7 +146,9 @@ pub(crate) unsafe fn handle_pty_notification(ntfn_badge: u64) {
             // Iterate all clients to find PTY fds on this pty_id
             for ci in 0..max_clients() {
                 let cli = &*(&raw const CLIENTS!()[ci]);
-                if cli.active == 0 { continue; }
+                if cli.active == 0 {
+                    continue;
+                }
                 for fi in 0..(*cli).fds_cap as usize {
                     if (*cli.fds.add(fi)).active != 0
                         && (*cli.fds.add(fi)).fd_type == FD_TYPE_DEVICE
@@ -162,7 +167,9 @@ pub(crate) unsafe fn handle_isatty(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
         {
             (*reply).label = SALTY_OK;
@@ -191,7 +198,9 @@ pub(crate) unsafe fn handle_tcgetattr(msg: *const SaltyMsg, reply: *mut SaltyMsg
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
         {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -227,7 +236,12 @@ pub(crate) unsafe fn handle_tcgetattr(msg: *const SaltyMsg, reply: *mut SaltyMsg
             let mut creply = SaltyMsg::zeroed();
             creq.label = CONSOLE_TCGETATTR;
             creq.length = 0;
-            let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_CONSOLE_EP, &raw const creq, &raw mut creply);
+            let err = ipc::call_ctx(
+                ipc_ctx(),
+                VFS_CAP_CONSOLE_EP,
+                &raw const creq,
+                &raw mut creply,
+            );
             if err != 0 || creply.label != SALTY_OK {
                 (*reply).label = SALTY_INVALID_OPERATION;
                 return;
@@ -248,7 +262,9 @@ pub(crate) unsafe fn handle_tcsetattr(msg: *const SaltyMsg, reply: *mut SaltyMsg
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
         {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -268,8 +284,12 @@ pub(crate) unsafe fn handle_tcsetattr(msg: *const SaltyMsg, reply: *mut SaltyMsg
             let mut treply = SaltyMsg::zeroed();
             treq.label = TTYD_PTY_TCSETATTR;
             treq.regs[0] = fde.sock_id as u64; // pty_id
-            // Copy termios data from regs[1..] (action + flags + c_cc)
-            let copy_len = if (*msg).length > 1 { (*msg).length - 1 } else { 0 };
+                                               // Copy termios data from regs[1..] (action + flags + c_cc)
+            let copy_len = if (*msg).length > 1 {
+                (*msg).length - 1
+            } else {
+                0
+            };
             for i in 0..copy_len as usize {
                 treq.regs[i + 1] = (*msg).regs[i + 1];
             }
@@ -290,7 +310,12 @@ pub(crate) unsafe fn handle_tcsetattr(msg: *const SaltyMsg, reply: *mut SaltyMsg
             for i in 0..(*msg).length as usize {
                 creq.regs[i] = (*msg).regs[i];
             }
-            let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_CONSOLE_EP, &raw const creq, &raw mut creply);
+            let err = ipc::call_ctx(
+                ipc_ctx(),
+                VFS_CAP_CONSOLE_EP,
+                &raw const creq,
+                &raw mut creply,
+            );
             if err != 0 || creply.label != SALTY_OK {
                 (*reply).label = SALTY_INVALID_OPERATION;
                 return;
@@ -310,7 +335,9 @@ pub(crate) unsafe fn handle_ioctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
         let arg = (*msg).regs[2];
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
         {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -332,7 +359,11 @@ pub(crate) unsafe fn handle_ioctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
             return;
         }
 
-        let pty_id = if fde.dev_type == DEV_PTY_SLAVE { fde.sock_id as u64 } else { 0u64 };
+        let pty_id = if fde.dev_type == DEV_PTY_SLAVE {
+            fde.sock_id as u64
+        } else {
+            0u64
+        };
 
         match request {
             // TIOCGPGRP: get foreground process group
@@ -345,7 +376,8 @@ pub(crate) unsafe fn handle_ioctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
                 treq.regs[2] = 0;
                 treq.regs[3] = badge;
                 treq.length = 4;
-                let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+                let err =
+                    ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
                 if err != 0 || treply.label != SALTY_OK {
                     (*reply).label = SALTY_INVALID_OPERATION;
                     return;
@@ -364,8 +396,13 @@ pub(crate) unsafe fn handle_ioctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
                 treq.regs[2] = (*msg).regs[2]; // pgid
                 treq.regs[3] = badge;
                 treq.length = 4;
-                let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
-                (*reply).label = if err == 0 { treply.label } else { SALTY_INVALID_OPERATION };
+                let err =
+                    ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+                (*reply).label = if err == 0 {
+                    treply.label
+                } else {
+                    SALTY_INVALID_OPERATION
+                };
                 (*reply).length = 0;
             }
             // TIOCSCTTY: acquire controlling tty
@@ -378,8 +415,13 @@ pub(crate) unsafe fn handle_ioctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
                 treq.regs[2] = 0;
                 treq.regs[3] = badge;
                 treq.length = 4;
-                let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
-                (*reply).label = if err == 0 { treply.label } else { SALTY_INVALID_OPERATION };
+                let err =
+                    ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+                (*reply).label = if err == 0 {
+                    treply.label
+                } else {
+                    SALTY_INVALID_OPERATION
+                };
                 (*reply).length = 0;
             }
             // TIOCNOTTY: release controlling tty
@@ -392,8 +434,13 @@ pub(crate) unsafe fn handle_ioctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
                 treq.regs[2] = 0;
                 treq.regs[3] = badge;
                 treq.length = 4;
-                let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
-                (*reply).label = if err == 0 { treply.label } else { SALTY_INVALID_OPERATION };
+                let err =
+                    ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+                (*reply).label = if err == 0 {
+                    treply.label
+                } else {
+                    SALTY_INVALID_OPERATION
+                };
                 (*reply).length = 0;
             }
             // TIOCGWINSZ: get terminal window size
@@ -406,7 +453,8 @@ pub(crate) unsafe fn handle_ioctl(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
                 treq.regs[2] = 0;
                 treq.regs[3] = badge;
                 treq.length = 4;
-                let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+                let err =
+                    ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
                 if err != 0 || treply.label != SALTY_OK {
                     // Fallback to default 80x24
                     (*reply).label = SALTY_OK;
@@ -441,8 +489,8 @@ pub(crate) unsafe fn handle_ioctl_fb0(request: u64, reply: *mut SaltyMsg) {
                     | ((crate::FB_RED_SIZE as u64) << 16)
                     | ((crate::FB_GREEN_POS as u64) << 8)
                     | (crate::FB_GREEN_SIZE as u64);
-                (*reply).regs[4] = ((crate::FB_BLUE_POS as u64) << 24)
-                    | ((crate::FB_BLUE_SIZE as u64) << 16);
+                (*reply).regs[4] =
+                    ((crate::FB_BLUE_POS as u64) << 24) | ((crate::FB_BLUE_SIZE as u64) << 16);
             }
             // FBIOGET_FSCREENINFO
             0x4602 => {
@@ -476,7 +524,9 @@ pub(crate) unsafe fn handle_mmap(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
         let length = (*msg).regs[2];
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
         {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -506,8 +556,8 @@ pub(crate) unsafe fn handle_mmap(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
             mm_msg.label = MM_SHM_MAP;
             mm_msg.length = 4;
             mm_msg.regs[0] = shm_idx as u64;
-            mm_msg.regs[1] = badge;          // client badge = pid
-            mm_msg.regs[2] = 0;              // vaddr = 0 (let mmsrv pick)
+            mm_msg.regs[1] = badge; // client badge = pid
+            mm_msg.regs[2] = 0; // vaddr = 0 (let mmsrv pick)
             mm_msg.regs[3] = prot;
             let err = ipc::call_ctx(
                 ipc_ctx(),
@@ -527,7 +577,7 @@ pub(crate) unsafe fn handle_mmap(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
             (*reply).length = 3;
             (*reply).regs[0] = mm_reply.regs[0]; // mapped base addr
             (*reply).regs[1] = 0;
-            (*reply).regs[2] = 1;                // server-side mapped flag
+            (*reply).regs[2] = 1; // server-side mapped flag
             return;
         }
 
@@ -567,7 +617,9 @@ pub(crate) unsafe fn handle_fcntl(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
         let arg = (*msg).regs[2] as i64;
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
         {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -649,9 +701,9 @@ pub(crate) unsafe fn handle_chdir(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
-        let Some((path_ptr, path_len)) = normalize_path_for_client(
-            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
-        ) else {
+        let Some((path_ptr, path_len)) =
+            normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
+        else {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         };
@@ -674,7 +726,11 @@ pub(crate) unsafe fn handle_chdir(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
         }
 
         // Store the new cwd
-        let copy_len = if (path_len as usize) < 127 { path_len as usize } else { 127 };
+        let copy_len = if (path_len as usize) < 127 {
+            path_len as usize
+        } else {
+            127
+        };
         let mut i = 0;
         while i < copy_len {
             (*cli).cwd[i] = *path_ptr.add(i);
@@ -735,7 +791,11 @@ pub(crate) unsafe fn handle_getcwd(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
     }
 }
 
-pub(crate) unsafe fn handle_shm_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) -> bool {
+pub(crate) unsafe fn handle_shm_open(
+    msg: *const SaltyMsg,
+    reply: *mut SaltyMsg,
+    badge: u64,
+) -> bool {
     unsafe {
         let flags = (*msg).regs[0] as u32;
         let mut path = [0u8; MAX_PATH_LEN];
@@ -744,9 +804,13 @@ pub(crate) unsafe fn handle_shm_open(msg: *const SaltyMsg, reply: *mut SaltyMsg,
         // Build full path /dev/shm/<name>
         let mut full_path = [0u8; MAX_PATH_LEN];
         let prefix = b"/dev/shm/";
-        for i in 0..prefix.len() { full_path[i] = prefix[i]; }
+        for i in 0..prefix.len() {
+            full_path[i] = prefix[i];
+        }
         for i in 0..name_len as usize {
-            if prefix.len() + i >= MAX_PATH_LEN { break; }
+            if prefix.len() + i >= MAX_PATH_LEN {
+                break;
+            }
             full_path[prefix.len() + i] = path[i];
         }
         let full_len = (prefix.len() + name_len as usize) as u8;
@@ -780,7 +844,8 @@ pub(crate) unsafe fn handle_shm_open(msg: *const SaltyMsg, reply: *mut SaltyMsg,
             return false;
         }
 
-        if (flags & O_CREAT) == 0 { // O_CREAT not set
+        if (flags & O_CREAT) == 0 {
+            // O_CREAT not set
             (*reply).label = SALTY_NOT_FOUND;
             return false;
         }
@@ -836,7 +901,8 @@ pub(crate) unsafe fn handle_shm_open(msg: *const SaltyMsg, reply: *mut SaltyMsg,
                 &raw mut crate::SHM_DATA_PTR as *mut *mut u8,
                 &raw mut crate::SHM_CAP,
                 core::mem::size_of::<ShmData>(),
-            ) == 0 {
+            ) == 0
+            {
                 for i in 0..max_shm_objects() {
                     if SHM_DATA!()[i].active == 0 {
                         shm_idx = i as i32;
@@ -888,9 +954,13 @@ pub(crate) unsafe fn handle_shm_unlink(msg: *const SaltyMsg, reply: *mut SaltyMs
 
         let mut full_path = [0u8; MAX_PATH_LEN];
         let prefix = b"/dev/shm/";
-        for i in 0..prefix.len() { full_path[i] = prefix[i]; }
+        for i in 0..prefix.len() {
+            full_path[i] = prefix[i];
+        }
         for i in 0..name_len as usize {
-            if prefix.len() + i >= MAX_PATH_LEN { break; }
+            if prefix.len() + i >= MAX_PATH_LEN {
+                break;
+            }
             full_path[prefix.len() + i] = path[i];
         }
         let full_len = (prefix.len() + name_len as usize) as u8;
@@ -904,7 +974,12 @@ pub(crate) unsafe fn handle_shm_unlink(msg: *const SaltyMsg, reply: *mut SaltyMs
         // Remove from parent
         let mut child_name: *const u8 = core::ptr::null();
         let mut child_len: u8 = 0;
-        let parent = resolve_parent(full_path.as_ptr(), full_len, &mut child_name, &mut child_len);
+        let parent = resolve_parent(
+            full_path.as_ptr(),
+            full_len,
+            &mut child_name,
+            &mut child_len,
+        );
         if !parent.is_null() {
             dir_remove_entry(parent, child_name, child_len);
         }
@@ -921,13 +996,19 @@ pub(crate) unsafe fn handle_shm_unlink(msg: *const SaltyMsg, reply: *mut SaltyMs
     }
 }
 
-pub(crate) unsafe fn handle_ftruncate(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) -> bool {
+pub(crate) unsafe fn handle_ftruncate(
+    msg: *const SaltyMsg,
+    reply: *mut SaltyMsg,
+    badge: u64,
+) -> bool {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let length = (*msg).regs[1];
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
         {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -937,8 +1018,7 @@ pub(crate) unsafe fn handle_ftruncate(msg: *const SaltyMsg, reply: *mut SaltyMsg
         let fde = *(*cli).fds.add(fd as usize);
 
         if fde.fd_type == FD_TYPE_MOUNT {
-            mount_truncate(
-                fde.dev_type as usize, fde.sock_id as u64, length, reply);
+            mount_truncate(fde.dev_type as usize, fde.sock_id as u64, length, reply);
             return false;
         }
 

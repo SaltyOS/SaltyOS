@@ -5,11 +5,7 @@
 use salty::serial::LineBuf;
 use salty::types::*;
 
-use crate::proc_table::{
-    alloc_proc, find_by_badge, proctab, proctab_cap,
-    NEXT_PID,
-    PROC_RUNNING,
-};
+use crate::proc_table::{alloc_proc, find_by_badge, proctab, proctab_cap, NEXT_PID, PROC_RUNNING};
 
 /// Handle EXPAND_CSPACE request from a child process.
 ///
@@ -24,7 +20,10 @@ use crate::proc_table::{
 pub(crate) unsafe fn handle_expand_cspace(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
     let ci = match find_by_badge(badge) {
         Some(i) => i,
-        None => { reply.label = super::SALTY_NOT_FOUND; return; }
+        None => {
+            reply.label = super::SALTY_NOT_FOUND;
+            return;
+        }
     };
 
     let child_cn = unsafe { proctab(ci).cnode_cap };
@@ -58,10 +57,19 @@ pub(crate) unsafe fn handle_expand_cspace(msg: &SaltyMsg, reply: &mut SaltyMsg, 
     // untyped so expansion keeps working after child-local UT depletion.
     let temp_slot = match unsafe { (&mut *(&raw mut super::ALLOCATOR)).alloc_single_slot() } {
         Some(s) => s,
-        None => { reply.label = super::SALTY_OUT_OF_MEMORY; return; }
+        None => {
+            reply.label = super::SALTY_OUT_OF_MEMORY;
+            return;
+        }
     };
 
-    let err = unsafe { (&mut *(&raw mut super::ALLOCATOR)).retype_core_object(super::OBJ_CNODE, size_bits, temp_slot) };
+    let err = unsafe {
+        (&mut *(&raw mut super::ALLOCATOR)).retype_core_object(
+            super::OBJ_CNODE,
+            size_bits,
+            temp_slot,
+        )
+    };
     if err != 0 {
         unsafe { (&mut *(&raw mut super::ALLOCATOR)).free_single_slot(temp_slot) };
         reply.label = super::SALTY_OUT_OF_MEMORY;
@@ -76,7 +84,10 @@ pub(crate) unsafe fn handle_expand_cspace(msg: &SaltyMsg, reply: &mut SaltyMsg, 
     let err = salty::invoke::cnode_set_guard(temp_slot, 0, 0);
     if err != 0 {
         let mut lb = LineBuf::new();
-        lb.str(b"[PROCMGR] set_guard failed err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
+        lb.str(b"[PROCMGR] set_guard failed err=");
+        lb.hex(err as u64);
+        lb.str(b"\n");
+        lb.flush();
         salty::invoke::cnode_delete(super::CAP_SELF_CSPACE, temp_slot);
         unsafe { (&mut *(&raw mut super::ALLOCATOR)).free_single_slot(temp_slot) };
         reply.label = super::SALTY_INVALID_OPERATION;
@@ -149,7 +160,11 @@ pub(crate) unsafe fn handle_expand_cspace_async(msg: &SaltyMsg, badge: u64) {
             None => return,
         };
 
-        let err = (&mut *(&raw mut super::ALLOCATOR)).retype_core_object(super::OBJ_CNODE, size_bits, temp_slot);
+        let err = (&mut *(&raw mut super::ALLOCATOR)).retype_core_object(
+            super::OBJ_CNODE,
+            size_bits,
+            temp_slot,
+        );
         if err != 0 {
             (&mut *(&raw mut super::ALLOCATOR)).free_single_slot(temp_slot);
             return;
@@ -166,8 +181,10 @@ pub(crate) unsafe fn handle_expand_cspace_async(msg: &SaltyMsg, badge: u64) {
         let mut target_slot: u64 = u64::MAX;
         for slot in 64..root_num_slots {
             let err = salty::invoke::cnode_copy(
-                super::CAP_SELF_CSPACE, temp_slot,
-                child_cn, slot,
+                super::CAP_SELF_CSPACE,
+                temp_slot,
+                child_cn,
+                slot,
                 super::CAP_RIGHTS_ALL,
             );
             if err == 0 {
@@ -196,7 +213,10 @@ pub(crate) unsafe fn handle_expand_cspace_async(msg: &SaltyMsg, badge: u64) {
 pub(crate) unsafe fn handle_expand_collect(reply: &mut SaltyMsg, badge: u64) {
     let ci = match find_by_badge(badge) {
         Some(i) => i,
-        None => { reply.label = super::SALTY_NOT_FOUND; return; }
+        None => {
+            reply.label = super::SALTY_NOT_FOUND;
+            return;
+        }
     };
 
     unsafe {
@@ -222,14 +242,22 @@ pub(crate) unsafe fn handle_cspace_expand_ntfn(bits: u64) {
     unsafe {
         let alloc = &mut *(&raw mut super::ALLOCATOR);
         for i in 0..proctab_cap() {
-            if bits & (1u64 << i) == 0 { continue; }
-            if proctab(i).state != PROC_RUNNING { continue; }
+            if bits & (1u64 << i) == 0 {
+                continue;
+            }
+            if proctab(i).state != PROC_RUNNING {
+                continue;
+            }
 
             let n = proctab(i).cspace_expand_count as u64;
-            if n >= super::MAX_CSPACE_EXPANSIONS as u64 { continue; }
+            if n >= super::MAX_CSPACE_EXPANSIONS as u64 {
+                continue;
+            }
 
             let child_cn = proctab(i).cnode_cap;
-            if child_cn == 0 { continue; }
+            if child_cn == 0 {
+                continue;
+            }
 
             let dest_child_slot = super::CSPACE_EXPAND_BASE + n;
 
@@ -239,7 +267,8 @@ pub(crate) unsafe fn handle_cspace_expand_ntfn(bits: u64) {
                 None => continue,
             };
 
-            let err = alloc.retype_core_object(super::OBJ_CNODE, super::CSPACE_EXPAND_BITS, pm_slot);
+            let err =
+                alloc.retype_core_object(super::OBJ_CNODE, super::CSPACE_EXPAND_BITS, pm_slot);
             if err != 0 {
                 alloc.free_single_slot(pm_slot);
                 continue;
@@ -257,8 +286,10 @@ pub(crate) unsafe fn handle_cspace_expand_ntfn(bits: u64) {
             // cnode_move transfers atomically without creating a CDT parent->child
             // relationship, so the source slot becomes empty and can be freed.
             let move_err = salty::invoke::cnode_move(
-                child_cn, dest_child_slot,
-                super::CAP_SELF_CSPACE, pm_slot,
+                child_cn,
+                dest_child_slot,
+                super::CAP_SELF_CSPACE,
+                pm_slot,
             );
             if move_err == 0 {
                 alloc.free_single_slot(pm_slot);
@@ -307,11 +338,16 @@ pub(crate) unsafe fn handle_register(msg: &SaltyMsg, reply: &mut SaltyMsg, _badg
         // which would prevent cnode_delete(scratch) from clearing the slot.
         let cn_perm = match (&mut *(&raw mut super::ALLOCATOR)).alloc_single_slot() {
             Some(s) => s,
-            None => { reply.label = super::SALTY_OUT_OF_MEMORY; return; }
+            None => {
+                reply.label = super::SALTY_OUT_OF_MEMORY;
+                return;
+            }
         };
         let err = salty::invoke::cnode_move(
-            super::CAP_SELF_CSPACE, cn_perm,
-            super::CAP_SELF_CSPACE, child_cn_scratch,
+            super::CAP_SELF_CSPACE,
+            cn_perm,
+            super::CAP_SELF_CSPACE,
+            child_cn_scratch,
         );
         if err != 0 {
             (&mut *(&raw mut super::ALLOCATOR)).free_single_slot(cn_perm);
@@ -342,8 +378,10 @@ pub(crate) unsafe fn handle_register(msg: &SaltyMsg, reply: &mut SaltyMsg, _badg
         if pm_ntfn != 0 {
             let cs_badge = 1u64 << (16 + ci);
             let _ = salty::invoke::cnode_mint(
-                super::CAP_SELF_CSPACE, pm_ntfn,
-                cn_perm, super::CHILD_CAP_CSPACE_NTFN,
+                super::CAP_SELF_CSPACE,
+                pm_ntfn,
+                cn_perm,
+                super::CHILD_CAP_CSPACE_NTFN,
                 cs_badge,
             );
         }

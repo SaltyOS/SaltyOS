@@ -5,16 +5,14 @@ use salty::consts::*;
 use salty::ipc;
 use salty::types::*;
 
-use crate::consts::*;
-use crate::types::*;
-use crate::ramfs::{inode_open, inode_close};
 use crate::client::{get_client, get_client_noalloc};
-use crate::socket::{find_socket, alloc_reply_slot, close_socket};
+use crate::consts::*;
+use crate::ramfs::{inode_close, inode_open};
+use crate::socket::{alloc_reply_slot, close_socket, find_socket};
+use crate::types::*;
 use crate::{
-    ipc_ctx, max_pipes, max_poll_waiters,
-    vfs_alloc_array, vfs_grow_pool, vfs_grow_array_with_min,
-    PIPES, PIPES_PTR, PIPES_CAP, POLL_WAITERS,
-    NEXT_PIPE_ID,
+    ipc_ctx, max_pipes, max_poll_waiters, vfs_alloc_array, vfs_grow_array_with_min, vfs_grow_pool,
+    NEXT_PIPE_ID, PIPES, PIPES_CAP, PIPES_PTR, POLL_WAITERS,
 };
 
 pub(crate) unsafe fn find_pipe(pipe_id: u32) -> *mut PipeState {
@@ -63,7 +61,8 @@ pub(crate) unsafe fn alloc_pipe() -> *mut PipeState {
             &raw mut PIPES_PTR as *mut *mut u8,
             &raw mut PIPES_CAP,
             core::mem::size_of::<PipeState>(),
-        ) != 0 {
+        ) != 0
+        {
             return core::ptr::null_mut();
         }
         alloc_pipe()
@@ -74,7 +73,11 @@ pub(crate) unsafe fn pipe_buf_len(p: *const PipeState) -> u16 {
     unsafe {
         let h = (*p).data_head;
         let t = (*p).data_tail;
-        if h >= t { h - t } else { PIPE_BUF_SIZE as u16 - t + h }
+        if h >= t {
+            h - t
+        } else {
+            PIPE_BUF_SIZE as u16 - t + h
+        }
     }
 }
 
@@ -107,10 +110,17 @@ pub(crate) unsafe fn pipe_buf_read(p: *mut PipeState, data: *mut u8, len: u16) -
 }
 
 /// Push a read waiter onto the pipe's FIFO queue. Returns false if full.
-pub(crate) unsafe fn pipe_push_recv_waiter(pipe: *mut PipeState, slot: u64, badge: u64, req_len: u16) -> bool {
+pub(crate) unsafe fn pipe_push_recv_waiter(
+    pipe: *mut PipeState,
+    slot: u64,
+    badge: u64,
+    req_len: u16,
+) -> bool {
     unsafe {
         let count = (*pipe).recv_waiter_count as usize;
-        if count >= (*pipe).recv_waiter_cap as usize { return false; }
+        if count >= (*pipe).recv_waiter_cap as usize {
+            return false;
+        }
         (*(*pipe).recv_waiters.add(count)).reply_slot = slot;
         (*(*pipe).recv_waiters.add(count)).badge = badge;
         (*(*pipe).recv_waiters.add(count)).requested_len = req_len;
@@ -123,7 +133,9 @@ pub(crate) unsafe fn pipe_push_recv_waiter(pipe: *mut PipeState, slot: u64, badg
 pub(crate) unsafe fn pipe_pop_recv_waiter(pipe: *mut PipeState) -> Option<PipeReadWaiter> {
     unsafe {
         let count = (*pipe).recv_waiter_count as usize;
-        if count == 0 { return None; }
+        if count == 0 {
+            return None;
+        }
         let waiter = *(*pipe).recv_waiters.add(0);
         // Shift remaining waiters down
         for i in 1..count {
@@ -136,10 +148,18 @@ pub(crate) unsafe fn pipe_pop_recv_waiter(pipe: *mut PipeState) -> Option<PipeRe
 }
 
 /// Push a write waiter onto the pipe's FIFO queue with saved data. Returns false if full.
-pub(crate) unsafe fn pipe_push_write_waiter(pipe: *mut PipeState, slot: u64, badge: u64, src: *const u8, len: u16) -> bool {
+pub(crate) unsafe fn pipe_push_write_waiter(
+    pipe: *mut PipeState,
+    slot: u64,
+    badge: u64,
+    src: *const u8,
+    len: u16,
+) -> bool {
     unsafe {
         let count = (*pipe).write_waiter_count as usize;
-        if count >= (*pipe).write_waiter_cap as usize { return false; }
+        if count >= (*pipe).write_waiter_cap as usize {
+            return false;
+        }
         (*(*pipe).write_waiters.add(count)).reply_slot = slot;
         (*(*pipe).write_waiters.add(count)).badge = badge;
         (*(*pipe).write_waiters.add(count)).data_len = len;
@@ -156,7 +176,9 @@ pub(crate) unsafe fn pipe_push_write_waiter(pipe: *mut PipeState, slot: u64, bad
 pub(crate) unsafe fn pipe_pop_write_waiter(pipe: *mut PipeState) -> Option<PipeWriteWaiter> {
     unsafe {
         let count = (*pipe).write_waiter_count as usize;
-        if count == 0 { return None; }
+        if count == 0 {
+            return None;
+        }
         let waiter = *(*pipe).write_waiters.add(0);
         // Shift remaining waiters down
         for i in 1..count {
@@ -172,7 +194,9 @@ pub(crate) unsafe fn pipe_pop_write_waiter(pipe: *mut PipeState) -> Option<PipeW
 pub(crate) unsafe fn close_pipe(fde: *mut FdEntry) {
     unsafe {
         let pipe = find_pipe((*fde).pipe_id());
-        if pipe.is_null() { return; }
+        if pipe.is_null() {
+            return;
+        }
 
         let is_read_end = ((*fde).flags & O_ACCMODE) == 0; // O_RDONLY = 0
         if is_read_end {
@@ -210,14 +234,22 @@ pub(crate) unsafe fn close_pipe(fde: *mut FdEntry) {
 
 /// Wake poll waiters for any fd that is a pipe end matching the given pipe.
 /// `is_read_end`: true = wake waiters on read-end fds, false = wake waiters on write-end fds.
-pub(crate) unsafe fn wake_poll_waiters_pipe(pipe: *const PipeState, is_read_end: bool, revents: u16) {
+pub(crate) unsafe fn wake_poll_waiters_pipe(
+    pipe: *const PipeState,
+    is_read_end: bool,
+    revents: u16,
+) {
     unsafe {
         let pipe_id = (*pipe).pipe_id;
         for i in 0..max_poll_waiters() {
-            if POLL_WAITERS!()[i].active == 0 { continue; }
+            if POLL_WAITERS!()[i].active == 0 {
+                continue;
+            }
             let badge = POLL_WAITERS!()[i].badge;
             let cli = get_client_noalloc(badge);
-            if cli.is_null() { continue; }
+            if cli.is_null() {
+                continue;
+            }
 
             let mut ready_count: u64 = 0;
             let mut wake_reply = SaltyMsg::zeroed();
@@ -225,12 +257,20 @@ pub(crate) unsafe fn wake_poll_waiters_pipe(pipe: *const PipeState, is_read_end:
 
             for j in 0..POLL_WAITERS!()[i].nfds as usize {
                 let pfd = POLL_WAITERS!()[i].fds[j].0;
-                if pfd < 0 || pfd >= (*cli).fds_cap as i32 { continue; }
+                if pfd < 0 || pfd >= (*cli).fds_cap as i32 {
+                    continue;
+                }
                 let fde = *(*cli).fds.add(pfd as usize);
-                if fde.active == 0 || fde.fd_type != FD_TYPE_PIPE { continue; }
-                if fde.pipe_id() != pipe_id { continue; }
+                if fde.active == 0 || fde.fd_type != FD_TYPE_PIPE {
+                    continue;
+                }
+                if fde.pipe_id() != pipe_id {
+                    continue;
+                }
                 let fd_is_read = (fde.flags & O_ACCMODE) == 0;
-                if fd_is_read != is_read_end { continue; }
+                if fd_is_read != is_read_end {
+                    continue;
+                }
 
                 let requested = POLL_WAITERS!()[i].fds[j].1;
                 let matched = revents & (requested | 0x010 | 0x008);
@@ -243,7 +283,11 @@ pub(crate) unsafe fn wake_poll_waiters_pipe(pipe: *const PipeState, is_read_end:
             if ready_count > 0 {
                 wake_reply.regs[0] = ready_count;
                 wake_reply.length = 1 + POLL_WAITERS!()[i].nfds as u64;
-                ipc::send_ctx(ipc_ctx(), POLL_WAITERS!()[i].reply_slot, &raw const wake_reply);
+                ipc::send_ctx(
+                    ipc_ctx(),
+                    POLL_WAITERS!()[i].reply_slot,
+                    &raw const wake_reply,
+                );
                 POLL_WAITERS!()[i].active = 0;
             }
         }
@@ -300,19 +344,28 @@ pub(crate) unsafe fn handle_pipe(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
         (*(*cli).fds.add(read_fd as usize)).active = 1;
         (*(*cli).fds.add(read_fd as usize)).fd_type = FD_TYPE_PIPE;
         (*(*cli).fds.add(read_fd as usize)).sock_id = (*pipe).pipe_id; // reuse sock_id for pipe_id
-        (*(*cli).fds.add(read_fd as usize)).flags = if flags & O_NONBLOCK != 0 { O_NONBLOCK } else { 0 }; // O_NONBLOCK on read end
+        (*(*cli).fds.add(read_fd as usize)).flags = if flags & O_NONBLOCK != 0 {
+            O_NONBLOCK
+        } else {
+            0
+        }; // O_NONBLOCK on read end
         (*(*cli).fds.add(read_fd as usize)).offset = 0;
 
         // Set up write-end fd
         (*(*cli).fds.add(write_fd as usize)).active = 1;
         (*(*cli).fds.add(write_fd as usize)).fd_type = FD_TYPE_PIPE;
         (*(*cli).fds.add(write_fd as usize)).sock_id = (*pipe).pipe_id;
-        (*(*cli).fds.add(write_fd as usize)).flags = O_WRONLY | (if flags & O_NONBLOCK != 0 { O_NONBLOCK } else { 0 }); // O_WRONLY + O_NONBLOCK
+        (*(*cli).fds.add(write_fd as usize)).flags = O_WRONLY
+            | (if flags & O_NONBLOCK != 0 {
+                O_NONBLOCK
+            } else {
+                0
+            }); // O_WRONLY + O_NONBLOCK
         (*(*cli).fds.add(write_fd as usize)).offset = 0;
 
         // O_CLOEXEC
         if flags & O_CLOEXEC != 0 {
-            *(*cli).fd_flags.add(read_fd as usize) = 1;  // FD_CLOEXEC
+            *(*cli).fd_flags.add(read_fd as usize) = 1; // FD_CLOEXEC
             *(*cli).fd_flags.add(write_fd as usize) = 1;
         }
 
@@ -324,7 +377,12 @@ pub(crate) unsafe fn handle_pipe(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
 }
 
 /// Handle read on a pipe fd
-pub(crate) unsafe fn handle_pipe_read(msg: *const SaltyMsg, fde: *mut FdEntry, reply: *mut SaltyMsg, badge: u64) -> bool {
+pub(crate) unsafe fn handle_pipe_read(
+    msg: *const SaltyMsg,
+    fde: *mut FdEntry,
+    reply: *mut SaltyMsg,
+    badge: u64,
+) -> bool {
     unsafe {
         // Bug 6: Verify read-end access mode
         if ((*fde).flags & O_ACCMODE) != 0 {
@@ -344,8 +402,12 @@ pub(crate) unsafe fn handle_pipe_read(msg: *const SaltyMsg, fde: *mut FdEntry, r
         let avail = pipe_buf_len(pipe);
         if avail > 0 {
             let mut count = avail;
-            if requested > 0 && requested < count { count = requested; }
-            if count > 152 { count = 152; }
+            if requested > 0 && requested < count {
+                count = requested;
+            }
+            if count > 152 {
+                count = 152;
+            }
             let dst = &raw mut (*reply).regs[1] as *mut u8;
             let actual = pipe_buf_read(pipe, dst, count);
             (*reply).label = SALTY_OK;
@@ -389,7 +451,11 @@ pub(crate) unsafe fn handle_pipe_read(msg: *const SaltyMsg, fde: *mut FdEntry, r
             (*reply).label = SALTY_INVALID_OPERATION;
             return false;
         }
-        let req_len = if requested > 0 && requested < 152 { requested } else { 152 };
+        let req_len = if requested > 0 && requested < 152 {
+            requested
+        } else {
+            152
+        };
         if !pipe_push_recv_waiter(pipe, slot, badge, req_len) {
             // Waiter queue full — return EAGAIN
             (*reply).label = SALTY_WOULD_BLOCK;
@@ -400,7 +466,12 @@ pub(crate) unsafe fn handle_pipe_read(msg: *const SaltyMsg, fde: *mut FdEntry, r
 }
 
 /// Handle write on a pipe fd
-pub(crate) unsafe fn handle_pipe_write(msg: *const SaltyMsg, fde: *mut FdEntry, reply: *mut SaltyMsg, badge: u64) -> bool {
+pub(crate) unsafe fn handle_pipe_write(
+    msg: *const SaltyMsg,
+    fde: *mut FdEntry,
+    reply: *mut SaltyMsg,
+    badge: u64,
+) -> bool {
     unsafe {
         // Bug 6: Verify write-end access mode
         if ((*fde).flags & O_ACCMODE) != O_WRONLY {
@@ -424,7 +495,9 @@ pub(crate) unsafe fn handle_pipe_write(msg: *const SaltyMsg, fde: *mut FdEntry, 
         let count = (*msg).regs[1];
         let src = &(*msg).regs[2] as *const u64 as *const u8;
         let mut actual_count = count;
-        if actual_count > 144 { actual_count = 144; }
+        if actual_count > 144 {
+            actual_count = 144;
+        }
 
         let free = pipe_buf_free(pipe);
         if free == 0 {
@@ -457,8 +530,12 @@ pub(crate) unsafe fn handle_pipe_write(msg: *const SaltyMsg, fde: *mut FdEntry, 
                 let mut wake = SaltyMsg::zeroed();
                 let avail = pipe_buf_len(pipe);
                 let mut rcount = avail;
-                if w.requested_len > 0 && w.requested_len < rcount { rcount = w.requested_len; }
-                if rcount > 152 { rcount = 152; }
+                if w.requested_len > 0 && w.requested_len < rcount {
+                    rcount = w.requested_len;
+                }
+                if rcount > 152 {
+                    rcount = 152;
+                }
                 let dst = &raw mut wake.regs[1] as *mut u8;
                 let actual = pipe_buf_read(pipe, dst, rcount);
                 wake.label = SALTY_OK;
@@ -484,7 +561,9 @@ pub(crate) unsafe fn handle_dup(msg: *const SaltyMsg, reply: *mut SaltyMsg, badg
     unsafe {
         let oldfd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || oldfd < 0 || oldfd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || oldfd < 0
+            || oldfd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(oldfd as usize)).active == 0
         {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -517,8 +596,11 @@ pub(crate) unsafe fn handle_dup2(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
         let oldfd = (*msg).regs[0] as i32;
         let newfd = (*msg).regs[1] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || oldfd < 0 || oldfd >= (*cli).fds_cap as i32
-            || newfd < 0 || newfd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || oldfd < 0
+            || oldfd >= (*cli).fds_cap as i32
+            || newfd < 0
+            || newfd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(oldfd as usize)).active == 0
         {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -559,8 +641,11 @@ pub(crate) unsafe fn handle_dup3(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
         let newfd = (*msg).regs[1] as i32;
         let flags = (*msg).regs[2] as u32;
         let cli = get_client(badge);
-        if cli.is_null() || oldfd < 0 || oldfd >= (*cli).fds_cap as i32
-            || newfd < 0 || newfd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || oldfd < 0
+            || oldfd >= (*cli).fds_cap as i32
+            || newfd < 0
+            || newfd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(oldfd as usize)).active == 0
         {
             (*reply).label = SALTY_INVALID_ARGUMENT;
@@ -647,16 +732,10 @@ pub(crate) unsafe fn handle_clone_fds(msg: *const SaltyMsg, reply: *mut SaltyMsg
         // If parent has more FDs than child, grow child's FD table to match
         if (*parent).fds_cap > (*child).fds_cap {
             let required = (*parent).fds_cap as usize;
-            let (new_fds, new_cap) = vfs_grow_array_with_min(
-                (*child).fds,
-                (*child).fds_cap as usize,
-                required,
-            );
-            let (new_flags, _) = vfs_grow_array_with_min(
-                (*child).fd_flags,
-                (*child).fds_cap as usize,
-                required,
-            );
+            let (new_fds, new_cap) =
+                vfs_grow_array_with_min((*child).fds, (*child).fds_cap as usize, required);
+            let (new_flags, _) =
+                vfs_grow_array_with_min((*child).fd_flags, (*child).fds_cap as usize, required);
             if new_fds.is_null() || new_flags.is_null() {
                 (*reply).label = SALTY_OUT_OF_MEMORY;
                 return;
@@ -670,7 +749,9 @@ pub(crate) unsafe fn handle_clone_fds(msg: *const SaltyMsg, reply: *mut SaltyMsg
         for i in 0..(*parent).fds_cap as usize {
             *(*child).fds.add(i) = *(*parent).fds.add(i);
             *(*child).fd_flags.add(i) = *(*parent).fd_flags.add(i);
-            if (*(*child).fds.add(i)).active == 0 { continue; }
+            if (*(*child).fds.add(i)).active == 0 {
+                continue;
+            }
             // Increment pipe refcounts
             if (*(*child).fds.add(i)).fd_type == FD_TYPE_PIPE {
                 let pipe = find_pipe((*(*child).fds.add(i)).pipe_id());

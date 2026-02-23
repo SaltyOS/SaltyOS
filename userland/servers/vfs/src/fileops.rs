@@ -5,23 +5,23 @@ use salty::consts::*;
 use salty::ipc;
 use salty::types::*;
 
+use crate::client::{
+    extract_path, flags_allow_read, flags_allow_write, get_client, get_client_noalloc,
+};
 use crate::consts::*;
-use crate::types::*;
-use crate::ramfs::{
-    inode_by_ino, alloc_inode, free_inode, inode_open, inode_close,
-    chain_read, chain_write, chain_truncate, alloc_writable,
-    dir_add_entry, dir_find_entry, dir_remove_entry,
-};
-use crate::path::{resolve_path, resolve_parent};
-use crate::client::{get_client, get_client_noalloc, extract_path, flags_allow_read, flags_allow_write};
-use crate::pipe::{find_pipe, alloc_pipe};
-use crate::procfs::{handle_proc_open, handle_proc_stat, handle_proc_read, handle_proc_readdir};
-use crate::mount::{
-    find_mount_for_path, parse_mount_path, mount_lookup, mount_stat,
-    mount_create, mount_truncate, mount_unlink, mount_rename,
-    mount_mkdir, mount_rmdir, split_mount_sub_path,
-};
 use crate::ipc_ctx;
+use crate::mount::{
+    find_mount_for_path, mount_create, mount_lookup, mount_mkdir, mount_rename, mount_rmdir,
+    mount_stat, mount_truncate, mount_unlink, parse_mount_path, split_mount_sub_path,
+};
+use crate::path::{resolve_parent, resolve_path};
+use crate::pipe::{alloc_pipe, find_pipe};
+use crate::procfs::{handle_proc_open, handle_proc_read, handle_proc_readdir, handle_proc_stat};
+use crate::ramfs::{
+    alloc_inode, alloc_writable, chain_read, chain_truncate, chain_write, dir_add_entry,
+    dir_find_entry, dir_remove_entry, free_inode, inode_by_ino, inode_close, inode_open,
+};
+use crate::types::*;
 
 /// Normalize a user path to canonical absolute form using the caller's cwd.
 /// This collapses repeated '/', '.' and '..' components.
@@ -63,7 +63,11 @@ pub(crate) unsafe fn normalize_path_for_client(
 
             let cwd_is_root = cwd_len == 1 && (*cli).cwd[0] == b'/';
             let rel_len = in_len as usize;
-            raw_len = if cwd_is_root { 1 + rel_len } else { cwd_len + 1 + rel_len };
+            raw_len = if cwd_is_root {
+                1 + rel_len
+            } else {
+                cwd_len + 1 + rel_len
+            };
             if raw_len > MAX_PATH_LEN {
                 return None;
             }
@@ -170,17 +174,22 @@ pub(crate) unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
             return;
         }
 
-        let Some((path_ptr, path_len)) = normalize_path_for_client(
-            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
-        ) else {
+        let Some((path_ptr, path_len)) =
+            normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
+        else {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         };
         let path_slice = core::slice::from_raw_parts(path_ptr, path_len as usize);
 
         // /proc virtual paths — intercept before resolve
-        if path_len >= 6 && *path_ptr == b'/' && *path_ptr.add(1) == b'p' && *path_ptr.add(2) == b'r'
-            && *path_ptr.add(3) == b'o' && *path_ptr.add(4) == b'c' && *path_ptr.add(5) == b'/'
+        if path_len >= 6
+            && *path_ptr == b'/'
+            && *path_ptr.add(1) == b'p'
+            && *path_ptr.add(2) == b'r'
+            && *path_ptr.add(3) == b'o'
+            && *path_ptr.add(4) == b'c'
+            && *path_ptr.add(5) == b'/'
         {
             if handle_proc_open(path_ptr, path_len, reply, badge) {
                 return;
@@ -424,7 +433,11 @@ pub(crate) unsafe fn handle_read(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
         let mut count = (*msg).regs[1];
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32 || (*(*cli).fds.add(fd as usize)).active == 0 {
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
+            || (*(*cli).fds.add(fd as usize)).active == 0
+        {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
@@ -448,7 +461,12 @@ pub(crate) unsafe fn handle_read(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
                     creq.label = CONSOLE_READ;
                     creq.length = 0;
 
-                    let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_CONSOLE_EP, &raw const creq, &raw mut creply);
+                    let err = ipc::call_ctx(
+                        ipc_ctx(),
+                        VFS_CAP_CONSOLE_EP,
+                        &raw const creq,
+                        &raw mut creply,
+                    );
                     if err != 0 || creply.label != SALTY_OK {
                         (*reply).label = SALTY_INVALID_OPERATION;
                         return;
@@ -460,7 +478,11 @@ pub(crate) unsafe fn handle_read(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
                         (*reply).length = 1;
                         (*reply).regs[0] = 0;
                     } else {
-                        let actual = if read_count > count { count } else { read_count };
+                        let actual = if read_count > count {
+                            count
+                        } else {
+                            read_count
+                        };
                         (*reply).label = SALTY_OK;
                         (*reply).length = 1 + (actual + 7) / 8;
                         (*reply).regs[0] = actual;
@@ -523,7 +545,8 @@ pub(crate) unsafe fn handle_read(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
                     treq.regs[0] = pty_id;
                     treq.regs[1] = count;
                     treq.length = 2;
-                    let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+                    let err =
+                        ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
                     if err != 0 || treply.label != SALTY_OK {
                         (*reply).label = SALTY_INVALID_OPERATION;
                         return;
@@ -608,7 +631,11 @@ pub(crate) unsafe fn handle_write(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
         let mut count = (*msg).regs[1];
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32 || (*(*cli).fds.add(fd as usize)).active == 0 {
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
+            || (*(*cli).fds.add(fd as usize)).active == 0
+        {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
@@ -646,13 +673,22 @@ pub(crate) unsafe fn handle_write(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
                             *dst.add(i) = *src.add(sent as usize + i);
                         }
 
-                        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_CONSOLE_EP, &raw const creq, &raw mut creply);
+                        let err = ipc::call_ctx(
+                            ipc_ctx(),
+                            VFS_CAP_CONSOLE_EP,
+                            &raw const creq,
+                            &raw mut creply,
+                        );
                         if err != 0 || creply.label != SALTY_OK {
                             break;
                         }
                         sent += chunk;
                     }
-                    (*reply).label = if sent > 0 { SALTY_OK } else { SALTY_INVALID_OPERATION };
+                    (*reply).label = if sent > 0 {
+                        SALTY_OK
+                    } else {
+                        SALTY_INVALID_OPERATION
+                    };
                     (*reply).length = 1;
                     (*reply).regs[0] = sent;
                 }
@@ -670,7 +706,8 @@ pub(crate) unsafe fn handle_write(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
                         let mut treq = SaltyMsg::zeroed();
                         let mut treply = SaltyMsg::zeroed();
                         let mut chunk = count - sent;
-                        if chunk > 136 { // 17 regs * 8 bytes (regs[2..19])
+                        if chunk > 136 {
+                            // 17 regs * 8 bytes (regs[2..19])
                             chunk = 136;
                         }
                         treq.label = TTYD_PTY_WRITE;
@@ -681,13 +718,22 @@ pub(crate) unsafe fn handle_write(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
                             *dst.add(i) = *src.add(sent as usize + i);
                         }
                         treq.length = 2 + (chunk + 7) / 8;
-                        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+                        let err = ipc::call_ctx(
+                            ipc_ctx(),
+                            VFS_CAP_TTYD_EP,
+                            &raw const treq,
+                            &raw mut treply,
+                        );
                         if err != 0 || treply.label != SALTY_OK {
                             break;
                         }
                         sent += chunk;
                     }
-                    (*reply).label = if sent > 0 { SALTY_OK } else { SALTY_INVALID_OPERATION };
+                    (*reply).label = if sent > 0 {
+                        SALTY_OK
+                    } else {
+                        SALTY_INVALID_OPERATION
+                    };
                     (*reply).length = 1;
                     (*reply).regs[0] = sent;
                 }
@@ -742,11 +788,161 @@ pub(crate) unsafe fn handle_write(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
     }
 }
 
+/// Positioned read: read at an explicit offset without updating the fd cursor.
+/// IPC: regs[0]=fd, regs[1]=count, regs[2]=offset (i64).
+/// Only supported for FD_TYPE_FILE (not devices, pipes, or sockets).
+pub(crate) unsafe fn handle_pread(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+    unsafe {
+        let fd = (*msg).regs[0] as i32;
+        let mut count = (*msg).regs[1];
+        let offset = (*msg).regs[2];
+
+        let cli = get_client(badge);
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
+            || (*(*cli).fds.add(fd as usize)).active == 0
+        {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        if count > 152 {
+            count = 152;
+        }
+
+        let fde = &*(*cli).fds.add(fd as usize);
+
+        if !flags_allow_read(fde.flags) {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return;
+        }
+
+        if fde.fd_type != FD_TYPE_FILE {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return;
+        }
+
+        let inode = inode_by_ino(fde.inode);
+        if inode.is_null() {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        if offset >= (*inode).size {
+            (*reply).label = SALTY_OK;
+            (*reply).length = 1;
+            (*reply).regs[0] = 0;
+            return;
+        }
+
+        let avail = (*inode).size - offset;
+        if count > avail {
+            count = avail;
+        }
+
+        let dst = &raw mut (*reply).regs[1] as *mut u8;
+        if !(*inode).ro_data.is_null() {
+            let src = (*inode).ro_data.add(offset as usize);
+            for i in 0..count as usize {
+                *dst.add(i) = *src.add(i);
+            }
+        } else if !(*inode).rw_data.is_null() {
+            let actual = chain_read((*inode).rw_data, offset, dst, count);
+            count = actual;
+        } else {
+            (*reply).label = SALTY_OK;
+            (*reply).length = 1;
+            (*reply).regs[0] = 0;
+            return;
+        }
+
+        (*reply).label = SALTY_OK;
+        (*reply).length = 1 + (count + 7) / 8;
+        (*reply).regs[0] = count;
+        // Note: fd cursor (fde.offset) is NOT updated
+    }
+}
+
+/// Positioned write: write at an explicit offset without updating the fd cursor.
+/// IPC: regs[0]=fd, regs[1]=count, regs[2]=offset (i64), regs[3..]=data.
+/// Only supported for FD_TYPE_FILE (not devices, pipes, or sockets).
+pub(crate) unsafe fn handle_pwrite(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+    unsafe {
+        let fd = (*msg).regs[0] as i32;
+        let mut count = (*msg).regs[1];
+        let offset = (*msg).regs[2];
+
+        let cli = get_client(badge);
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
+            || (*(*cli).fds.add(fd as usize)).active == 0
+        {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+
+        // Data starts at regs[3], max 17 regs available (regs[3..19]) = 136 bytes
+        if count > 136 {
+            count = 136;
+        }
+
+        let fde = &*(*cli).fds.add(fd as usize);
+
+        if !flags_allow_write(fde.flags) {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return;
+        }
+
+        if fde.fd_type != FD_TYPE_FILE {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return;
+        }
+
+        let inode = inode_by_ino(fde.inode);
+        if inode.is_null() || (*inode).readonly != 0 {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return;
+        }
+
+        if (*inode).rw_data.is_null() {
+            (*inode).rw_data = alloc_writable();
+            if (*inode).rw_data.is_null() {
+                (*reply).label = SALTY_OUT_OF_MEMORY;
+                return;
+            }
+        }
+
+        let src = &(*msg).regs[3] as *const u64 as *const u8;
+        let written = chain_write((*inode).rw_data, offset, src, count);
+        if written == 0 && count > 0 {
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            return;
+        }
+        count = written;
+
+        let end = offset + count;
+        if end > (*inode).size {
+            (*inode).size = end;
+        }
+
+        (*reply).label = SALTY_OK;
+        (*reply).length = 1;
+        (*reply).regs[0] = count;
+        // Note: fd cursor (fde.offset) is NOT updated
+    }
+}
+
 pub(crate) unsafe fn handle_close(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32 || (*(*cli).fds.add(fd as usize)).active == 0 {
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
+            || (*(*cli).fds.add(fd as usize)).active == 0
+        {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
@@ -791,7 +987,11 @@ pub(crate) unsafe fn handle_lseek(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
         let whence = (*msg).regs[2] as i32;
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32 || (*(*cli).fds.add(fd as usize)).active == 0 {
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
+            || (*(*cli).fds.add(fd as usize)).active == 0
+        {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
@@ -819,9 +1019,9 @@ pub(crate) unsafe fn handle_lseek(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
         };
 
         let new_offset: i64 = match whence {
-            0 => offset, // SEEK_SET
+            0 => offset,                                                // SEEK_SET
             1 => (*(*cli).fds.add(fd as usize)).offset as i64 + offset, // SEEK_CUR
-            2 => file_size as i64 + offset, // SEEK_END
+            2 => file_size as i64 + offset,                             // SEEK_END
             _ => {
                 (*reply).label = SALTY_INVALID_ARGUMENT;
                 return;
@@ -863,7 +1063,11 @@ pub(crate) unsafe fn handle_fstat(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32 || (*(*cli).fds.add(fd as usize)).active == 0 {
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
+            || (*(*cli).fds.add(fd as usize)).active == 0
+        {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
@@ -915,9 +1119,9 @@ pub(crate) unsafe fn handle_stat(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
-        let Some((path_ptr, path_len)) = normalize_path_for_client(
-            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
-        ) else {
+        let Some((path_ptr, path_len)) =
+            normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
+        else {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         };
@@ -961,9 +1165,13 @@ pub(crate) unsafe fn handle_stat(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
         let inode = resolve_path(path_ptr, path_len);
         if inode.is_null() {
             // Try /proc virtual paths
-            if path_len >= 6 && *path_ptr == b'/' && *path_ptr.add(1) == b'p'
-                && *path_ptr.add(2) == b'r' && *path_ptr.add(3) == b'o'
-                && *path_ptr.add(4) == b'c' && *path_ptr.add(5) == b'/'
+            if path_len >= 6
+                && *path_ptr == b'/'
+                && *path_ptr.add(1) == b'p'
+                && *path_ptr.add(2) == b'r'
+                && *path_ptr.add(3) == b'o'
+                && *path_ptr.add(4) == b'c'
+                && *path_ptr.add(5) == b'/'
             {
                 if handle_proc_stat(path_ptr, path_len, reply, badge) {
                     return;
@@ -985,18 +1193,22 @@ pub(crate) unsafe fn handle_access(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
-        let Some((path_ptr, path_len)) = normalize_path_for_client(
-            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
-        ) else {
+        let Some((path_ptr, path_len)) =
+            normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
+        else {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         };
         let inode = resolve_path(path_ptr, path_len);
         if inode.is_null() {
             // /proc virtual paths always accessible (read-only)
-            if path_len >= 6 && *path_ptr == b'/' && *path_ptr.add(1) == b'p'
-                && *path_ptr.add(2) == b'r' && *path_ptr.add(3) == b'o'
-                && *path_ptr.add(4) == b'c' && *path_ptr.add(5) == b'/'
+            if path_len >= 6
+                && *path_ptr == b'/'
+                && *path_ptr.add(1) == b'p'
+                && *path_ptr.add(2) == b'r'
+                && *path_ptr.add(3) == b'o'
+                && *path_ptr.add(4) == b'c'
+                && *path_ptr.add(5) == b'/'
             {
                 if handle_proc_stat(path_ptr, path_len, &mut SaltyMsg::zeroed(), badge) {
                     (*reply).label = SALTY_OK;
@@ -1019,9 +1231,9 @@ pub(crate) unsafe fn handle_unlink(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
-        let Some((path_ptr, path_len)) = normalize_path_for_client(
-            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
-        ) else {
+        let Some((path_ptr, path_len)) =
+            normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
+        else {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         };
@@ -1042,8 +1254,13 @@ pub(crate) unsafe fn handle_unlink(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
                     (*reply).label = SALTY_NOT_FOUND;
                     return;
                 }
-                mount_unlink(mount_idx, parent_ino,
-                    path_ptr.add(sub_start + l_start), l_len, reply);
+                mount_unlink(
+                    mount_idx,
+                    parent_ino,
+                    path_ptr.add(sub_start + l_start),
+                    l_len,
+                    reply,
+                );
                 return;
             }
         }
@@ -1104,15 +1321,15 @@ pub(crate) unsafe fn handle_rename(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
-        let Some((old_ptr, old_norm_len)) = normalize_path_for_client(
-            badge, old_path.as_ptr(), old_len, old_abs.as_mut_ptr(),
-        ) else {
+        let Some((old_ptr, old_norm_len)) =
+            normalize_path_for_client(badge, old_path.as_ptr(), old_len, old_abs.as_mut_ptr())
+        else {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         };
-        let Some((new_ptr, new_norm_len)) = normalize_path_for_client(
-            badge, new_path.as_ptr(), new_len, new_abs.as_mut_ptr(),
-        ) else {
+        let Some((new_ptr, new_norm_len)) =
+            normalize_path_for_client(badge, new_path.as_ptr(), new_len, new_abs.as_mut_ptr())
+        else {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         };
@@ -1125,10 +1342,8 @@ pub(crate) unsafe fn handle_rename(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
         match (old_mount, new_mount) {
             (Some(oi), Some(ni)) if oi == ni => {
                 // Both paths in same mount — forward to FS server
-                let (_, old_sub_start, old_sub_len) =
-                    parse_mount_path(old_slice, old_norm_len);
-                let (_, new_sub_start, new_sub_len) =
-                    parse_mount_path(new_slice, new_norm_len);
+                let (_, old_sub_start, old_sub_len) = parse_mount_path(old_slice, old_norm_len);
+                let (_, new_sub_start, new_sub_len) = parse_mount_path(new_slice, new_norm_len);
                 if old_sub_len > 0 && new_sub_len > 0 {
                     let (op_start, op_len, ol_start, ol_len) =
                         split_mount_sub_path(old_ptr.add(old_sub_start), old_sub_len);
@@ -1155,9 +1370,11 @@ pub(crate) unsafe fn handle_rename(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
                     mount_rename(
                         oi,
                         old_parent_ino,
-                        old_ptr.add(old_sub_start + ol_start), ol_len,
+                        old_ptr.add(old_sub_start + ol_start),
+                        ol_len,
                         new_parent_ino,
-                        new_ptr.add(new_sub_start + nl_start), nl_len,
+                        new_ptr.add(new_sub_start + nl_start),
+                        nl_len,
                         reply,
                     );
                     return;
@@ -1174,8 +1391,7 @@ pub(crate) unsafe fn handle_rename(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
         // Resolve old parent + child
         let mut old_child: *const u8 = core::ptr::null();
         let mut old_child_len: u8 = 0;
-        let old_parent =
-            resolve_parent(old_ptr, old_norm_len, &mut old_child, &mut old_child_len);
+        let old_parent = resolve_parent(old_ptr, old_norm_len, &mut old_child, &mut old_child_len);
         if old_parent.is_null() || (*old_parent).readonly != 0 {
             (*reply).label = SALTY_INVALID_OPERATION;
             return;
@@ -1191,8 +1407,7 @@ pub(crate) unsafe fn handle_rename(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
         // Resolve new parent + child
         let mut new_child: *const u8 = core::ptr::null();
         let mut new_child_len: u8 = 0;
-        let new_parent =
-            resolve_parent(new_ptr, new_norm_len, &mut new_child, &mut new_child_len);
+        let new_parent = resolve_parent(new_ptr, new_norm_len, &mut new_child, &mut new_child_len);
         if new_parent.is_null() || (*new_parent).readonly != 0 {
             (*reply).label = SALTY_INVALID_OPERATION;
             return;
@@ -1228,9 +1443,9 @@ pub(crate) unsafe fn handle_mkdir(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
-        let Some((path_ptr, path_len)) = normalize_path_for_client(
-            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
-        ) else {
+        let Some((path_ptr, path_len)) =
+            normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
+        else {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         };
@@ -1252,8 +1467,14 @@ pub(crate) unsafe fn handle_mkdir(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
                     return;
                 }
                 let mode = (*msg).regs[0] as u32 & 0o777;
-                mount_mkdir(mount_idx, parent_ino,
-                    path_ptr.add(sub_start + l_start), l_len, mode, reply);
+                mount_mkdir(
+                    mount_idx,
+                    parent_ino,
+                    path_ptr.add(sub_start + l_start),
+                    l_len,
+                    mode,
+                    reply,
+                );
                 return;
             }
         }
@@ -1297,9 +1518,9 @@ pub(crate) unsafe fn handle_mkfifo(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
-        let Some((path_ptr, path_len)) = normalize_path_for_client(
-            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
-        ) else {
+        let Some((path_ptr, path_len)) =
+            normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
+        else {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         };
@@ -1352,9 +1573,9 @@ pub(crate) unsafe fn handle_rmdir(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
-        let Some((path_ptr, path_len)) = normalize_path_for_client(
-            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
-        ) else {
+        let Some((path_ptr, path_len)) =
+            normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
+        else {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         };
@@ -1375,8 +1596,13 @@ pub(crate) unsafe fn handle_rmdir(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
                     (*reply).label = SALTY_NOT_FOUND;
                     return;
                 }
-                mount_rmdir(mount_idx, parent_ino,
-                    path_ptr.add(sub_start + l_start), l_len, reply);
+                mount_rmdir(
+                    mount_idx,
+                    parent_ino,
+                    path_ptr.add(sub_start + l_start),
+                    l_len,
+                    reply,
+                );
                 return;
             }
         }
@@ -1422,18 +1648,22 @@ pub(crate) unsafe fn handle_opendir(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
-        let Some((path_ptr, path_len)) = normalize_path_for_client(
-            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
-        ) else {
+        let Some((path_ptr, path_len)) =
+            normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
+        else {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         };
         let path_slice = core::slice::from_raw_parts(path_ptr, path_len as usize);
 
         // /proc sub-paths that don't resolve as real inodes
-        if path_len >= 6 && *path_ptr == b'/' && *path_ptr.add(1) == b'p'
-            && *path_ptr.add(2) == b'r' && *path_ptr.add(3) == b'o'
-            && *path_ptr.add(4) == b'c' && *path_ptr.add(5) == b'/'
+        if path_len >= 6
+            && *path_ptr == b'/'
+            && *path_ptr.add(1) == b'p'
+            && *path_ptr.add(2) == b'r'
+            && *path_ptr.add(3) == b'o'
+            && *path_ptr.add(4) == b'c'
+            && *path_ptr.add(5) == b'/'
         {
             if handle_proc_open(path_ptr, path_len, reply, badge) {
                 return;

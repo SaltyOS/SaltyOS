@@ -6,16 +6,14 @@ use salty::ipc;
 use salty::types::*;
 
 use crate::consts::*;
-use crate::types::*;
-use crate::ramfs::{inode_by_ino, inode_close};
 use crate::path::resolve_path;
-use crate::socket::close_socket;
 use crate::pipe::close_pipe;
+use crate::ramfs::{inode_by_ino, inode_close};
+use crate::socket::close_socket;
+use crate::types::*;
 use crate::{
-    ipc_ctx, max_clients, max_pipes, max_sockets,
-    max_poll_waiters, max_epoll_instances,
-    vfs_alloc_array, vfs_grow_pool,
-    CLIENTS, POLL_WAITERS, SOCKETS, PIPES, EPOLLS,
+    ipc_ctx, max_clients, max_epoll_instances, max_pipes, max_poll_waiters, max_sockets,
+    vfs_alloc_array, vfs_grow_pool, CLIENTS, EPOLLS, PIPES, POLL_WAITERS, SOCKETS,
 };
 
 pub(crate) unsafe fn get_client(badge: u64) -> *mut ClientState {
@@ -60,7 +58,8 @@ pub(crate) unsafe fn get_client(badge: u64) -> *mut ClientState {
             &raw mut crate::CLIENTS_PTR as *mut *mut u8,
             &raw mut crate::CLIENTS_CAP,
             core::mem::size_of::<ClientState>(),
-        ) != 0 {
+        ) != 0
+        {
             return core::ptr::null_mut();
         }
         get_client(badge)
@@ -104,7 +103,11 @@ pub(crate) unsafe fn get_client_cwd_ino(badge: u64) -> u32 {
             return ROOT_INO;
         }
         let inode = resolve_path((*cli).cwd.as_ptr(), cwd_len as u8);
-        if inode.is_null() { ROOT_INO } else { (*inode).ino }
+        if inode.is_null() {
+            ROOT_INO
+        } else {
+            (*inode).ino
+        }
     }
 }
 
@@ -217,7 +220,9 @@ pub(crate) unsafe fn purge_socket_waiters_by_badge(sock: *mut SocketState, dead_
         }
         let mut pending = 0u8;
         for i in 0..(*sock).pending_cap as usize {
-            if (*(*sock).pending.add(i)).active != 0 && (*(*sock).pending.add(i)).client_badge == dead_badge {
+            if (*(*sock).pending.add(i)).active != 0
+                && (*(*sock).pending.add(i)).client_badge == dead_badge
+            {
                 send_client_exit_error((*(*sock).pending.add(i)).reply_slot);
                 *(*sock).pending.add(i) = PendingConn::zeroed();
             }

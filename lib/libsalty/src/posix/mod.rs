@@ -41,6 +41,30 @@ use crate::types::*;
 const CAP_PROCMGR_EP: u64 = 3;
 const CAP_VFS_EP: u64 = 4;
 
+/// Convert a server error label to a negative POSIX errno code.
+///
+/// Servers return specific error codes in `reply.label`. This translates them
+/// to negative errno values so saltyc can extract the correct errno.
+pub(crate) fn salty_err_to_posix(label: u64) -> i32 {
+    match label {
+        SALTY_OK => 0,
+        SALTY_NOT_FOUND => -2,                // ENOENT
+        SALTY_ALREADY_EXISTS => -17,           // EEXIST
+        SALTY_INVALID_ARGUMENT => -22,         // EINVAL
+        SALTY_OUT_OF_MEMORY => -12,            // ENOMEM
+        SALTY_BUSY => -16,                     // EBUSY
+        SALTY_WOULD_BLOCK => -11,              // EAGAIN
+        SALTY_BAD_ADDRESS => -14,              // EFAULT
+        SALTY_INSUFFICIENT_RIGHTS => -13,      // EACCES
+        SALTY_INVALID_CAPABILITY => -9,        // EBADF
+        SALTY_DEADLOCK => -35,                 // EDEADLK
+        SALTY_INVALID_OPERATION => -1,         // EPERM
+        SALTY_OUT_OF_RANGE => -34,             // ERANGE
+        SALTY_CANCELLED => -125,               // ECANCELED
+        _ => -5,                               // EIO (generic)
+    }
+}
+
 /// Pack a null-terminated path into message registers starting at `offset`.
 ///
 /// Writes the path length into `regs[offset]` and the path bytes (up to 64)

@@ -34,8 +34,11 @@ pub unsafe fn posix_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
 
         let ready_count = reply.regs[0] as i32;
@@ -124,8 +127,11 @@ pub unsafe fn posix_epoll_create() -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         reply.regs[0] as i32
     }
@@ -151,8 +157,11 @@ pub unsafe fn posix_epoll_ctl(epfd: i32, op: i32, fd: i32, events: u32, data: u6
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -183,8 +192,11 @@ pub unsafe fn posix_epoll_wait(
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
 
         let count = reply.regs[0] as i32;

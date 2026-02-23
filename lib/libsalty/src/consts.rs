@@ -294,6 +294,8 @@ pub const POSIX_VFS_UTIMENSAT: u64 = 58;
 pub const POSIX_VFS_FCHMOD: u64 = 59;
 pub const POSIX_VFS_FCHOWN: u64 = 60;
 pub const POSIX_VFS_CLIENT_EXIT: u64 = 61;
+pub const POSIX_VFS_PREAD: u64 = 62;
+pub const POSIX_VFS_PWRITE: u64 = 63;
 
 // AT_* flags for *at() family
 pub const AT_FDCWD: i32 = -100;
@@ -412,6 +414,7 @@ pub const POSIX_PM_INJECT_CAP: u64 = 26;
 pub const POSIX_PM_LIST_PIDS: u64 = 27;
 pub const POSIX_PM_GET_PROC_INFO: u64 = 28;
 pub const POSIX_PM_RESUME: u64 = 29;
+pub const POSIX_PM_UMASK: u64 = 30;
 // Deterministic CNode slots for CSpace expansion (root slots 1008-1015)
 pub const CSPACE_EXPAND_BASE: u64 = 1008;
 pub const MAX_CSPACE_EXPANSIONS: usize = 8;

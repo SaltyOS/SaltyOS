@@ -24,8 +24,11 @@ pub unsafe fn posix_openat(dirfd: i32, path: *const u8, flags: i32, mode: u32) -
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         reply.regs[0] as i32
     }
@@ -49,8 +52,11 @@ pub unsafe fn posix_fstatat(dirfd: i32, path: *const u8, st: *mut SaltyStat, at_
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
 
         if !st.is_null() {
@@ -85,8 +91,11 @@ pub unsafe fn posix_unlinkat(dirfd: i32, path: *const u8, at_flags: i32) -> i32 
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -137,8 +146,11 @@ pub unsafe fn posix_renameat(
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -162,8 +174,11 @@ pub unsafe fn posix_mkdirat(dirfd: i32, path: *const u8, mode: i32) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -188,8 +203,11 @@ pub unsafe fn posix_faccessat(dirfd: i32, path: *const u8, mode: i32, at_flags: 
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -214,8 +232,11 @@ pub unsafe fn posix_fchmodat(dirfd: i32, path: *const u8, mode: u32, at_flags: i
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -247,8 +268,11 @@ pub unsafe fn posix_fchownat(
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -284,8 +308,11 @@ pub unsafe fn posix_utimensat(
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -337,8 +364,11 @@ pub unsafe fn posix_symlinkat(target: *const u8, newdirfd: i32, linkpath: *const
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -362,8 +392,11 @@ pub unsafe fn posix_readlinkat(_dirfd: i32, path: *const u8, buf: *mut u8, bufsi
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label) as i64;
         }
 
         let target_len = reply.regs[0] as usize;
@@ -424,8 +457,11 @@ pub unsafe fn posix_linkat(
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }

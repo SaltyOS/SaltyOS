@@ -17,6 +17,11 @@ pub const SIG_DFL: SighandlerT = 0;
 pub const SIG_IGN: SighandlerT = 1;
 pub const SIG_ERR: SighandlerT = usize::MAX;
 
+// SA_RESTART: In SaltyOS, POSIX signals are delivered cooperatively via
+// notification polling (posix_sigcheck). System calls (IPC to VFS/procmgr)
+// complete atomically from userland's perspective and are never interrupted
+// by signals. Therefore SA_RESTART has no behavioral effect — it is stored
+// in __sig_sa_flags for sigaction() compatibility but intentionally unused.
 pub const SA_RESTART: i32 = 0x10000000;
 pub const SA_NOCLDSTOP: i32 = 0x00000001;
 pub const SA_NOCLDWAIT: i32 = 0x00000002;
@@ -63,7 +68,11 @@ pub unsafe extern "C" fn signal(sig: i32, handler: SighandlerT) -> SighandlerT {
             return SIG_ERR;
         }
 
-        let old = *(&raw const HANDLERS).cast::<[SighandlerT; NSIG]>().as_ref().unwrap_unchecked().get_unchecked(sig as usize);
+        let old = *(&raw const HANDLERS)
+            .cast::<[SighandlerT; NSIG]>()
+            .as_ref()
+            .unwrap_unchecked()
+            .get_unchecked(sig as usize);
         (*(&raw mut HANDLERS))[sig as usize] = handler;
 
         // If handler is a catch function (not SIG_DFL or SIG_IGN), register with libsalty
@@ -90,11 +99,7 @@ pub unsafe extern "C" fn signal(sig: i32, handler: SighandlerT) -> SighandlerT {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sigaction(
-    sig: i32,
-    act: *const Sigaction,
-    oact: *mut Sigaction,
-) -> i32 {
+pub unsafe extern "C" fn sigaction(sig: i32, act: *const Sigaction, oact: *mut Sigaction) -> i32 {
     unsafe {
         if sig <= 0 || sig >= NSIG as i32 {
             errno::set_errno(errno::EINVAL);
@@ -104,7 +109,9 @@ pub unsafe extern "C" fn sigaction(
         // Fill old action if requested
         if !oact.is_null() {
             (*oact).sa_handler = (*(&raw const HANDLERS))[sig as usize];
-            (*oact).sa_mask = Sigset { bits: (*(&raw const salty::__sig_sa_mask))[sig as usize] };
+            (*oact).sa_mask = Sigset {
+                bits: (*(&raw const salty::__sig_sa_mask))[sig as usize],
+            };
             (*oact).sa_flags = (*(&raw const salty::__sig_sa_flags))[sig as usize];
             (*oact).sa_restorer = 0;
         }
@@ -134,11 +141,7 @@ pub unsafe extern "C" fn sigaction(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sigprocmask(
-    how: i32,
-    set: *const Sigset,
-    oldset: *mut Sigset,
-) -> i32 {
+pub unsafe extern "C" fn sigprocmask(how: i32, set: *const Sigset, oldset: *mut Sigset) -> i32 {
     unsafe {
         let current = *(&raw const salty::__sig_blocked_mask);
         if !oldset.is_null() {
@@ -165,19 +168,58 @@ pub unsafe extern "C" fn sigprocmask(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sigsuspend(_mask: *const Sigset) -> i32 {
-    errno::set_errno(errno::EINTR);
-    -1
+pub unsafe extern "C" fn sigsuspend(mask: *const Sigset) -> i32 {
+    if mask.is_null() {
+        errno::set_errno(errno::EFAULT);
+        return -1;
+    }
+    unsafe {
+        // Save current blocked mask
+        let saved = *(&raw const salty::__sig_blocked_mask);
+        // Apply temporary mask
+        (*(&raw mut salty::__sig_blocked_mask)) = (*mask).bits;
+        (*(&raw mut BLOCKED_MASK)).bits = (*mask).bits;
+
+        // Wait on signal notification (blocking)
+        let cap_signal_ntfn: u64 = 6;
+        salty::salty_wait(cap_signal_ntfn);
+
+        // Dispatch pending signals
+        salty::signals::posix_sigcheck();
+
+        // Restore original mask
+        (*(&raw mut salty::__sig_blocked_mask)) = saved;
+        (*(&raw mut BLOCKED_MASK)).bits = saved;
+
+        errno::set_errno(errno::EINTR);
+        -1 // POSIX: always returns -1 with EINTR
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sigpending(set: *mut Sigset) -> i32 {
-    if !set.is_null() {
-        unsafe {
+    if set.is_null() {
+        errno::set_errno(errno::EFAULT);
+        return -1;
+    }
+    unsafe {
+        // Non-blocking poll for notification bits
+        let cap_signal_ntfn: u64 = 6;
+        let mut bits: u64 = 0;
+        let err = salty::salty_poll(cap_signal_ntfn, &raw mut bits);
+
+        if err == 0 && bits != 0 {
+            // Re-signal ALL consumed bits back (poll is destructive)
+            salty::salty_signal(cap_signal_ntfn, bits);
+
+            // Pending = signaled AND blocked
+            let blocked = *(&raw const salty::__sig_blocked_mask);
+            (*set).bits = (bits as u32) & blocked;
+        } else {
             (*set).bits = 0;
         }
+        0
     }
-    0
 }
 
 #[unsafe(no_mangle)]
@@ -275,13 +317,13 @@ pub static sys_signame: [SyncPtr; NSIG] = [
     SyncPtr(b"TSTP\0".as_ptr()),   // 20 SIGTSTP
     SyncPtr(b"TTIN\0".as_ptr()),   // 21 SIGTTIN
     SyncPtr(b"TTOU\0".as_ptr()),   // 22 SIGTTOU
-    SyncPtr(core::ptr::null()),     // 23 (undefined)
-    SyncPtr(core::ptr::null()),     // 24 (undefined)
-    SyncPtr(core::ptr::null()),     // 25 (undefined)
-    SyncPtr(core::ptr::null()),     // 26 (undefined)
-    SyncPtr(core::ptr::null()),     // 27 (undefined)
+    SyncPtr(core::ptr::null()),    // 23 (undefined)
+    SyncPtr(core::ptr::null()),    // 24 (undefined)
+    SyncPtr(core::ptr::null()),    // 25 (undefined)
+    SyncPtr(core::ptr::null()),    // 26 (undefined)
+    SyncPtr(core::ptr::null()),    // 27 (undefined)
     SyncPtr(b"WINCH\0".as_ptr()),  // 28 SIGWINCH
     SyncPtr(b"INFO\0".as_ptr()),   // 29 SIGINFO
-    SyncPtr(core::ptr::null()),     // 30 (undefined)
-    SyncPtr(core::ptr::null()),     // 31 (undefined)
+    SyncPtr(core::ptr::null()),    // 30 (undefined)
+    SyncPtr(core::ptr::null()),    // 31 (undefined)
 ];

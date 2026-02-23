@@ -5,17 +5,15 @@ use salty::consts::*;
 use salty::ipc;
 use salty::types::*;
 
+use crate::client::{extract_path, get_client};
 use crate::consts::*;
-use crate::types::*;
-use crate::ramfs::{inode_by_ino, alloc_inode, dir_add_entry};
-use crate::path::{resolve_path, resolve_parent};
-use crate::client::{get_client, extract_path};
 use crate::fileops::normalize_path_for_client;
+use crate::path::{resolve_parent, resolve_path};
+use crate::ramfs::{alloc_inode, dir_add_entry, inode_by_ino};
+use crate::types::*;
 use crate::{
-    ipc_ctx, max_sockets,
-    vfs_alloc_array, vfs_grow_pool,
-    SOCKETS, SOCKETS_PTR, SOCKETS_CAP,
-    NEXT_SOCK_ID, NEXT_REPLY_SLOT,
+    ipc_ctx, max_sockets, vfs_alloc_array, vfs_grow_pool, NEXT_REPLY_SLOT, NEXT_SOCK_ID, SOCKETS,
+    SOCKETS_CAP, SOCKETS_PTR,
 };
 
 pub(crate) unsafe fn alloc_socket() -> *mut SocketState {
@@ -40,7 +38,9 @@ pub(crate) unsafe fn alloc_socket() -> *mut SocketState {
                     (*s).pending = ptr;
                     (*s).pending_cap = INITIAL_PENDING_CONN as u8;
                 }
-                for j in 0..(*s).pending_cap as usize { (*(*s).pending.add(j)).active = 0; }
+                for j in 0..(*s).pending_cap as usize {
+                    (*(*s).pending.add(j)).active = 0;
+                }
                 (*s).peer_sock_id = 0;
                 (*s).peer_badge = 0;
                 (*s).data_head = 0;
@@ -62,7 +62,8 @@ pub(crate) unsafe fn alloc_socket() -> *mut SocketState {
             &raw mut SOCKETS_PTR as *mut *mut u8,
             &raw mut SOCKETS_CAP,
             core::mem::size_of::<SocketState>(),
-        ) != 0 {
+        ) != 0
+        {
             return core::ptr::null_mut();
         }
         alloc_socket()
@@ -84,7 +85,11 @@ pub(crate) unsafe fn sock_buf_len(s: *const SocketState) -> u16 {
     unsafe {
         let h = (*s).data_head;
         let t = (*s).data_tail;
-        if h >= t { h - t } else { SOCK_BUF_SIZE as u16 - t + h }
+        if h >= t {
+            h - t
+        } else {
+            SOCK_BUF_SIZE as u16 - t + h
+        }
     }
 }
 
@@ -168,7 +173,9 @@ pub(crate) unsafe fn handle_bind(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_SOCKET
         {
@@ -190,9 +197,9 @@ pub(crate) unsafe fn handle_bind(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return false;
         }
-        let Some((path_ptr, path_len)) = normalize_path_for_client(
-            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
-        ) else {
+        let Some((path_ptr, path_len)) =
+            normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
+        else {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return false;
         };
@@ -237,7 +244,9 @@ pub(crate) unsafe fn handle_listen(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
         let backlog = (*msg).regs[1] as u8;
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_SOCKET
         {
@@ -252,7 +261,11 @@ pub(crate) unsafe fn handle_listen(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
         }
 
         (*sock).state = SOCK_LISTENING;
-        (*sock).backlog = if backlog > (*sock).pending_cap { (*sock).pending_cap } else { backlog };
+        (*sock).backlog = if backlog > (*sock).pending_cap {
+            (*sock).pending_cap
+        } else {
+            backlog
+        };
         (*reply).label = SALTY_OK;
         false
     }
@@ -262,7 +275,9 @@ pub(crate) unsafe fn handle_accept(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_SOCKET
         {
@@ -369,11 +384,17 @@ pub(crate) unsafe fn handle_accept(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
     }
 }
 
-pub(crate) unsafe fn handle_connect(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) -> bool {
+pub(crate) unsafe fn handle_connect(
+    msg: *const SaltyMsg,
+    reply: *mut SaltyMsg,
+    badge: u64,
+) -> bool {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_SOCKET
         {
@@ -395,9 +416,9 @@ pub(crate) unsafe fn handle_connect(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return false;
         }
-        let Some((path_ptr, path_len)) = normalize_path_for_client(
-            badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr(),
-        ) else {
+        let Some((path_ptr, path_len)) =
+            normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
+        else {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return false;
         };
@@ -459,7 +480,11 @@ pub(crate) unsafe fn handle_connect(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
             wake_reply.label = SALTY_OK;
             wake_reply.length = 1;
             wake_reply.regs[0] = if new_fd >= 0 { new_fd as u64 } else { u64::MAX };
-            ipc::send_ctx(ipc_ctx(), (*listen_sock).accept_reply_slot, &raw const wake_reply);
+            ipc::send_ctx(
+                ipc_ctx(),
+                (*listen_sock).accept_reply_slot,
+                &raw const wake_reply,
+            );
             (*listen_sock).accept_reply_slot = 0;
             (*listen_sock).accept_badge = 0;
 
@@ -497,13 +522,19 @@ pub(crate) unsafe fn handle_connect(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
     }
 }
 
-pub(crate) unsafe fn handle_shutdown(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) -> bool {
+pub(crate) unsafe fn handle_shutdown(
+    msg: *const SaltyMsg,
+    reply: *mut SaltyMsg,
+    badge: u64,
+) -> bool {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let how = (*msg).regs[1] as i32;
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_SOCKET
         {
@@ -517,7 +548,9 @@ pub(crate) unsafe fn handle_shutdown(msg: *const SaltyMsg, reply: *mut SaltyMsg,
             return false;
         }
 
-        if how == 0 || how == 2 { (*sock).shut_rd = 1; }
+        if how == 0 || how == 2 {
+            (*sock).shut_rd = 1;
+        }
         if how == 1 || how == 2 {
             (*sock).shut_wr = 1;
             // Signal peer
@@ -534,7 +567,8 @@ pub(crate) unsafe fn handle_shutdown(msg: *const SaltyMsg, reply: *mut SaltyMsg,
                         ipc::send_ctx(ipc_ctx(), (*peer).recv_reply_slot, &raw const wake);
                         (*peer).recv_reply_slot = 0;
                     }
-                    crate::poll::wake_poll_waiters((*peer).peer_badge, -1, 0x010); // POLLHUP
+                    crate::poll::wake_poll_waiters((*peer).peer_badge, -1, 0x010);
+                    // POLLHUP
                 }
             }
         }
@@ -544,7 +578,11 @@ pub(crate) unsafe fn handle_shutdown(msg: *const SaltyMsg, reply: *mut SaltyMsg,
     }
 }
 
-pub(crate) unsafe fn handle_sockpair(_msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) -> bool {
+pub(crate) unsafe fn handle_sockpair(
+    _msg: *const SaltyMsg,
+    reply: *mut SaltyMsg,
+    badge: u64,
+) -> bool {
     unsafe {
         let cli = get_client(badge);
         if cli.is_null() {
@@ -555,8 +593,12 @@ pub(crate) unsafe fn handle_sockpair(_msg: *const SaltyMsg, reply: *mut SaltyMsg
         let s1 = alloc_socket();
         let s2 = alloc_socket();
         if s1.is_null() || s2.is_null() {
-            if !s1.is_null() { (*s1).active = 0; }
-            if !s2.is_null() { (*s2).active = 0; }
+            if !s1.is_null() {
+                (*s1).active = 0;
+            }
+            if !s2.is_null() {
+                (*s2).active = 0;
+            }
             (*reply).label = SALTY_OUT_OF_MEMORY;
             return false;
         }
@@ -590,7 +632,9 @@ pub(crate) unsafe fn handle_sockpair(_msg: *const SaltyMsg, reply: *mut SaltyMsg
         if fd1 < 0 || fd2 < 0 {
             (*s1).active = 0;
             (*s2).active = 0;
-            if fd1 >= 0 { (*(*cli).fds.add(fd1 as usize)).active = 0; }
+            if fd1 >= 0 {
+                (*(*cli).fds.add(fd1 as usize)).active = 0;
+            }
             (*reply).label = SALTY_OUT_OF_MEMORY;
             return false;
         }
@@ -604,7 +648,11 @@ pub(crate) unsafe fn handle_sockpair(_msg: *const SaltyMsg, reply: *mut SaltyMsg
 }
 
 /// Handle read on a socket fd
-pub(crate) unsafe fn handle_socket_read(fde: *mut FdEntry, reply: *mut SaltyMsg, badge: u64) -> bool {
+pub(crate) unsafe fn handle_socket_read(
+    fde: *mut FdEntry,
+    reply: *mut SaltyMsg,
+    badge: u64,
+) -> bool {
     unsafe {
         let sock = find_socket((*fde).sock_id);
         if sock.is_null() || (*sock).state != SOCK_CONNECTED {
@@ -622,7 +670,9 @@ pub(crate) unsafe fn handle_socket_read(fde: *mut FdEntry, reply: *mut SaltyMsg,
         let avail = sock_buf_len(sock);
         if avail > 0 {
             let mut count = avail;
-            if count > 152 { count = 152; }
+            if count > 152 {
+                count = 152;
+            }
             let dst = &raw mut (*reply).regs[1] as *mut u8;
             let actual = sock_buf_read(sock, dst, count);
             (*reply).label = SALTY_OK;
@@ -657,7 +707,11 @@ pub(crate) unsafe fn handle_socket_read(fde: *mut FdEntry, reply: *mut SaltyMsg,
 }
 
 /// Handle write on a socket fd
-pub(crate) unsafe fn handle_socket_write(msg: *const SaltyMsg, fde: *mut FdEntry, reply: *mut SaltyMsg) -> bool {
+pub(crate) unsafe fn handle_socket_write(
+    msg: *const SaltyMsg,
+    fde: *mut FdEntry,
+    reply: *mut SaltyMsg,
+) -> bool {
     unsafe {
         let sock = find_socket((*fde).sock_id);
         if sock.is_null() || (*sock).state != SOCK_CONNECTED || (*sock).shut_wr != 0 {
@@ -674,7 +728,9 @@ pub(crate) unsafe fn handle_socket_write(msg: *const SaltyMsg, fde: *mut FdEntry
         let count = (*msg).regs[1];
         let src = &(*msg).regs[2] as *const u64 as *const u8;
         let mut actual_count = count;
-        if actual_count > 144 { actual_count = 144; }
+        if actual_count > 144 {
+            actual_count = 144;
+        }
 
         let written = sock_buf_write(peer, src, actual_count as u16);
 
@@ -683,7 +739,9 @@ pub(crate) unsafe fn handle_socket_write(msg: *const SaltyMsg, fde: *mut FdEntry
             let mut wake = SaltyMsg::zeroed();
             let avail = sock_buf_len(peer);
             let mut rcount = avail;
-            if rcount > 152 { rcount = 152; }
+            if rcount > 152 {
+                rcount = 152;
+            }
             let dst = &raw mut wake.regs[1] as *mut u8;
             let actual = sock_buf_read(peer, dst, rcount);
             wake.label = SALTY_OK;
@@ -709,11 +767,15 @@ pub(crate) unsafe fn handle_socket_write(msg: *const SaltyMsg, fde: *mut FdEntry
 pub(crate) unsafe fn close_socket(fde: *mut FdEntry) {
     unsafe {
         let sock = find_socket((*fde).sock_id);
-        if sock.is_null() { return; }
+        if sock.is_null() {
+            return;
+        }
 
         // Decrement refcount — only destroy socket when last fd is closed
         (*sock).refcount = (*sock).refcount.saturating_sub(1);
-        if (*sock).refcount > 0 { return; }
+        if (*sock).refcount > 0 {
+            return;
+        }
 
         // Signal peer
         if (*sock).peer_sock_id != 0 {
@@ -745,7 +807,11 @@ pub(crate) unsafe fn close_socket(fde: *mut FdEntry) {
             if (*(*sock).pending.add(i)).active != 0 && (*(*sock).pending.add(i)).reply_slot != 0 {
                 let mut wake = SaltyMsg::zeroed();
                 wake.label = SALTY_INVALID_OPERATION;
-                ipc::send_ctx(ipc_ctx(), (*(*sock).pending.add(i)).reply_slot, &raw const wake);
+                ipc::send_ctx(
+                    ipc_ctx(),
+                    (*(*sock).pending.add(i)).reply_slot,
+                    &raw const wake,
+                );
                 (*(*sock).pending.add(i)).active = 0;
             }
         }
@@ -764,14 +830,20 @@ pub(crate) unsafe fn close_socket(fde: *mut FdEntry) {
     }
 }
 
-pub(crate) unsafe fn handle_sendmsg(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) -> bool {
+pub(crate) unsafe fn handle_sendmsg(
+    msg: *const SaltyMsg,
+    reply: *mut SaltyMsg,
+    badge: u64,
+) -> bool {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let data_len = (*msg).regs[1];
         let fd_count = (*msg).regs[2] as u32;
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_SOCKET
         {
@@ -793,7 +865,9 @@ pub(crate) unsafe fn handle_sendmsg(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
 
         // Write data to peer's buffer
         let mut actual_data = data_len;
-        if actual_data > 120 { actual_data = 120; }
+        if actual_data > 120 {
+            actual_data = 120;
+        }
         let src = &(*msg).regs[3] as *const u64 as *const u8;
         let written = sock_buf_write(peer, src, actual_data as u16);
 
@@ -806,7 +880,8 @@ pub(crate) unsafe fn handle_sendmsg(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
         let fd_src = &(*msg).regs[3 + data_regs as usize] as *const u64 as *const i32;
         for i in 0..actual_fds as usize {
             // Store as (badge, fd) pair: badge of sender and fd index
-            (*peer).pending_caps[i] = ((badge << 32) | (*fd_src.add(i) as u32 as u64)) & 0xFFFF_FFFF_FFFF_FFFF;
+            (*peer).pending_caps[i] =
+                ((badge << 32) | (*fd_src.add(i) as u32 as u64)) & 0xFFFF_FFFF_FFFF_FFFF;
         }
 
         // Wake blocked reader on peer
@@ -814,7 +889,9 @@ pub(crate) unsafe fn handle_sendmsg(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
             let mut wake = SaltyMsg::zeroed();
             let avail = sock_buf_len(peer);
             let mut rcount = avail;
-            if rcount > 120 { rcount = 120; }
+            if rcount > 120 {
+                rcount = 120;
+            }
             let dst = &raw mut wake.regs[2] as *mut u8;
             let actual = sock_buf_read(peer, dst, rcount);
             wake.label = SALTY_OK;
@@ -832,13 +909,19 @@ pub(crate) unsafe fn handle_sendmsg(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
     }
 }
 
-pub(crate) unsafe fn handle_recvmsg(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) -> bool {
+pub(crate) unsafe fn handle_recvmsg(
+    msg: *const SaltyMsg,
+    reply: *mut SaltyMsg,
+    badge: u64,
+) -> bool {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let max_data = (*msg).regs[1];
 
         let cli = get_client(badge);
-        if cli.is_null() || fd < 0 || fd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || fd < 0
+            || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_SOCKET
         {
@@ -876,7 +959,9 @@ pub(crate) unsafe fn handle_recvmsg(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
 
         // Read data
         let mut count = if avail > 120 { 120 } else { avail };
-        if count as u64 > max_data { count = max_data as u16; }
+        if count as u64 > max_data {
+            count = max_data as u16;
+        }
         let dst = &raw mut (*reply).regs[2] as *mut u8;
         let actual = sock_buf_read(sock, dst, count);
 
@@ -894,9 +979,13 @@ pub(crate) unsafe fn handle_recvmsg(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
 
                 // Look up source client and fd
                 let src_cli = get_client(src_badge);
-                if src_cli.is_null() || src_fd < 0 || src_fd >= (*src_cli).fds_cap as i32 { continue; }
+                if src_cli.is_null() || src_fd < 0 || src_fd >= (*src_cli).fds_cap as i32 {
+                    continue;
+                }
                 let src_fde = *(*src_cli).fds.add(src_fd as usize);
-                if src_fde.active == 0 { continue; }
+                if src_fde.active == 0 {
+                    continue;
+                }
 
                 // Duplicate fd into receiver's fd table
                 let mut new_fd: i32 = -1;
