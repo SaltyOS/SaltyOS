@@ -20,7 +20,7 @@ use crate::client::{get_client, get_client_noalloc, extract_path, flags_allow_wr
 use crate::procfs::{handle_proc_open, handle_proc_stat};
 use crate::fileops::{normalize_path_for_client, fill_stat_reply};
 use crate::pipe::find_pipe;
-use crate::mount::{find_mount_for_path, parse_mount_path, mount_lookup, split_mount_sub_path};
+use crate::mount::{find_mount_for_path, parse_mount_path, mount_lookup, split_mount_sub_path, mount_symlink, mount_readlink, mount_link};
 
 /// Inner open logic parameterized by start_ino.
 /// Reused by handle_open (start_ino=ROOT_INO) and handle_openat.
@@ -29,6 +29,7 @@ pub(crate) unsafe fn do_open(
     path: *const u8,
     path_len: u8,
     flags: u32,
+    mode: u32,
     reply: *mut SaltyMsg,
     badge: u64,
 ) {
@@ -75,7 +76,7 @@ pub(crate) unsafe fn do_open(
                     use crate::mount::mount_create;
                     remote_ino = mount_create(
                         mount_idx, parent_ino,
-                        path.add(sub_start + l_start), l_len, 0o644,
+                        path.add(sub_start + l_start), l_len, mode & 0o777,
                     );
                     if remote_ino == 0 {
                         (*reply).label = SALTY_INVALID_OPERATION;
@@ -131,7 +132,7 @@ pub(crate) unsafe fn do_open(
                 inode = alloc_inode();
                 if !inode.is_null() {
                     (*inode).ftype = FTYPE_REGULAR;
-                    (*inode).mode = S_IFREG_L | 0o644;
+                    (*inode).mode = S_IFREG_L | (mode & 0o777);
                     (*inode).parent_ino = (*parent).ino;
                     (*inode).rw_data = core::ptr::null_mut();
                     dir_add_entry(parent, child_name, child_len, (*inode).ino);
@@ -264,14 +265,15 @@ pub(crate) unsafe fn do_open(
     }
 }
 
-/// openat(dirfd, path, flags)
-/// IPC: reg[0]=dirfd, reg[1]=open_flags, reg[2..]=path(len+data)
+/// openat(dirfd, path, flags, mode)
+/// IPC: reg[0]=dirfd, reg[1]=open_flags, reg[2]=mode, reg[3..]=path(len+data)
 pub(crate) unsafe fn handle_openat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
     unsafe {
         let dirfd = (*msg).regs[0] as i32;
         let flags = (*msg).regs[1] as u32;
+        let mode = (*msg).regs[2] as u32;
         let mut path = [0u8; MAX_PATH_LEN];
-        let path_len = extract_path(msg, 2, path.as_mut_ptr());
+        let path_len = extract_path(msg, 3, path.as_mut_ptr());
 
         let start_ino = resolve_at_start(badge, dirfd, path.as_ptr(), path_len);
         if start_ino == 0 {
@@ -279,7 +281,7 @@ pub(crate) unsafe fn handle_openat(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
             return;
         }
 
-        do_open(start_ino, path.as_ptr(), path_len, flags, reply, badge);
+        do_open(start_ino, path.as_ptr(), path_len, flags, mode, reply, badge);
     }
 }
 
@@ -730,16 +732,18 @@ pub(crate) unsafe fn handle_linkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
             new_path[i] = *src_new.add(i);
         }
 
-        // Resolve old path to inode (follow symlinks)
+        // Build absolute paths for mount check
         let cli = get_client(badge);
         if cli.is_null() {
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         }
 
-        // Resolve old path (absolute or relative to cwd)
-        let target = if old_path[0] == b'/' {
-            resolve_path_raw(old_path.as_ptr(), old_len)
+        let mut abs_old = [0u8; MAX_PATH_LEN];
+        let abs_old_len: u8;
+        if old_path[0] == b'/' {
+            for i in 0..old_len as usize { abs_old[i] = old_path[i]; }
+            abs_old_len = old_len;
         } else {
             let mut cwd_len: usize = 0;
             while cwd_len < 128 && (*cli).cwd[cwd_len] != 0 { cwd_len += 1; }
@@ -748,24 +752,12 @@ pub(crate) unsafe fn handle_linkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
                 (*reply).label = SALTY_NOT_FOUND;
                 return;
             }
-            let mut abs = [0u8; MAX_PATH_LEN];
-            for i in 0..cwd_len { abs[i] = (*cli).cwd[i]; }
-            abs[cwd_len] = b'/';
-            for i in 0..old_len as usize { abs[cwd_len + 1 + i] = old_path[i]; }
-            resolve_path_raw(abs.as_ptr(), total as u8)
-        };
-        if target.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
-            return;
+            for i in 0..cwd_len { abs_old[i] = (*cli).cwd[i]; }
+            abs_old[cwd_len] = b'/';
+            for i in 0..old_len as usize { abs_old[cwd_len + 1 + i] = old_path[i]; }
+            abs_old_len = total as u8;
         }
 
-        // Cannot hard-link directories
-        if (*target).ftype == FTYPE_DIRECTORY {
-            (*reply).label = SALTY_INVALID_OPERATION;
-            return;
-        }
-
-        // Resolve new path parent (absolute or relative to cwd)
         let mut abs_new = [0u8; MAX_PATH_LEN];
         let abs_new_len: u8;
         if new_path[0] == b'/' {
@@ -785,6 +777,65 @@ pub(crate) unsafe fn handle_linkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
             abs_new_len = total as u8;
         }
 
+        // Mount path intercept — both paths must be on the same mount
+        let old_mount = find_mount_for_path(&abs_old, abs_old_len);
+        let new_mount = find_mount_for_path(&abs_new, abs_new_len);
+        if old_mount.is_some() || new_mount.is_some() {
+            if old_mount != new_mount {
+                // Cross-filesystem link not supported
+                (*reply).label = SALTY_INVALID_OPERATION;
+                return;
+            }
+            let mount_idx = old_mount.unwrap();
+            let (_, old_sub_start, old_sub_len) = parse_mount_path(&abs_old, abs_old_len);
+            let (_, new_sub_start, new_sub_len) = parse_mount_path(&abs_new, abs_new_len);
+
+            // Resolve old path to existing inode on SaltyFS
+            let existing_ino = mount_lookup(mount_idx, abs_old.as_ptr().add(old_sub_start), old_sub_len);
+            if existing_ino == 0 {
+                (*reply).label = SALTY_NOT_FOUND;
+                return;
+            }
+
+            // Split new path into parent + leaf
+            let (np_start, np_len, nl_start, nl_len) =
+                split_mount_sub_path(abs_new.as_ptr().add(new_sub_start), new_sub_len);
+            let new_parent_ino = if np_len == 0 {
+                (*(&raw const crate::MOUNTS[mount_idx])).root_ino as u64
+            } else {
+                mount_lookup(mount_idx, abs_new.as_ptr().add(new_sub_start + np_start), np_len)
+            };
+            if new_parent_ino == 0 {
+                (*reply).label = SALTY_NOT_FOUND;
+                return;
+            }
+
+            mount_link(
+                mount_idx, existing_ino, new_parent_ino,
+                abs_new.as_ptr().add(new_sub_start + nl_start), nl_len,
+                reply,
+            );
+            return;
+        }
+
+        // Resolve old path (absolute or relative to cwd)
+        let target = if old_path[0] == b'/' {
+            resolve_path_raw(old_path.as_ptr(), old_len)
+        } else {
+            resolve_path_raw(abs_old.as_ptr(), abs_old_len)
+        };
+        if target.is_null() {
+            (*reply).label = SALTY_NOT_FOUND;
+            return;
+        }
+
+        // Cannot hard-link directories
+        if (*target).ftype == FTYPE_DIRECTORY {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return;
+        }
+
+        // Resolve new path parent (already have abs_new from mount check above)
         let mut child_name: *const u8 = core::ptr::null();
         let mut child_len: u8 = 0;
         let new_parent = resolve_parent(abs_new.as_ptr(), abs_new_len, &mut child_name, &mut child_len);
@@ -837,6 +888,54 @@ pub(crate) unsafe fn handle_symlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg
         let raw_link = &(*msg).regs[11] as *const u64 as *const u8;
         for i in 0..link_len as usize {
             link_path[i] = *raw_link.add(i);
+        }
+
+        // Build absolute link path for mount check
+        let mut abs_link = [0u8; MAX_PATH_LEN];
+        let abs_link_len: u8;
+        if link_path[0] == b'/' {
+            for i in 0..link_len as usize { abs_link[i] = link_path[i]; }
+            abs_link_len = link_len;
+        } else {
+            let cli = get_client(badge);
+            if cli.is_null() {
+                (*reply).label = SALTY_INVALID_ARGUMENT;
+                return;
+            }
+            let mut cwd_len: usize = 0;
+            while cwd_len < 128 && (*cli).cwd[cwd_len] != 0 { cwd_len += 1; }
+            let total = cwd_len + 1 + link_len as usize;
+            if total > MAX_PATH_LEN {
+                (*reply).label = SALTY_NOT_FOUND;
+                return;
+            }
+            for i in 0..cwd_len { abs_link[i] = (*cli).cwd[i]; }
+            abs_link[cwd_len] = b'/';
+            for i in 0..link_len as usize { abs_link[cwd_len + 1 + i] = link_path[i]; }
+            abs_link_len = total as u8;
+        }
+
+        // Mount path intercept
+        if let Some(mount_idx) = find_mount_for_path(&abs_link, abs_link_len) {
+            let (_, sub_start, sub_len) = parse_mount_path(&abs_link, abs_link_len);
+            let (p_start, p_len, l_start, l_len) =
+                split_mount_sub_path(abs_link.as_ptr().add(sub_start), sub_len);
+            let parent_ino = if p_len == 0 {
+                (*(&raw const crate::MOUNTS[mount_idx])).root_ino as u64
+            } else {
+                mount_lookup(mount_idx, abs_link.as_ptr().add(sub_start + p_start), p_len)
+            };
+            if parent_ino == 0 {
+                (*reply).label = SALTY_NOT_FOUND;
+                return;
+            }
+            mount_symlink(
+                mount_idx, parent_ino,
+                abs_link.as_ptr().add(sub_start + l_start), l_len,
+                target.as_ptr(), target_len,
+                reply,
+            );
+            return;
         }
 
         // Resolve start inode for the link path using newdirfd
@@ -912,6 +1011,22 @@ pub(crate) unsafe fn handle_readlinkat(msg: *const SaltyMsg, reply: *mut SaltyMs
             (*reply).label = SALTY_INVALID_ARGUMENT;
             return;
         };
+
+        // Mount path intercept for readlink
+        if let Some(mount_idx) = find_mount_for_path(
+            core::slice::from_raw_parts(path_ptr, path_len as usize), path_len,
+        ) {
+            let (_, sub_start, sub_len) = parse_mount_path(
+                core::slice::from_raw_parts(path_ptr, path_len as usize), path_len,
+            );
+            let remote_ino = mount_lookup(mount_idx, path_ptr.add(sub_start), sub_len);
+            if remote_ino == 0 {
+                (*reply).label = SALTY_NOT_FOUND;
+                return;
+            }
+            mount_readlink(mount_idx, remote_ino, reply);
+            return;
+        }
 
         let inode = resolve_path_raw_nofollow(path_ptr, path_len);
         if inode.is_null() {

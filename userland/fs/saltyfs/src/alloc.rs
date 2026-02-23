@@ -93,6 +93,26 @@ pub(crate) fn free_block(block_nr: u64) {
     }
 }
 
+/// Count actually-used blocks by scanning the entire bitmap.
+pub(crate) fn count_used_blocks() -> u64 {
+    unsafe {
+        let total = (*(&raw const SB)).total_blocks;
+        let mut used: u64 = 0;
+        for block_nr in 0..total {
+            let bitmap_idx = block_nr / 32768;
+            let bit_in_block = (block_nr % 32768) as usize;
+            let byte_idx = bit_in_block / 8;
+            let bit_idx = bit_in_block % 8;
+            if let Some(slot) = bitmap_load(bitmap_idx) {
+                if ((*(&raw const BITMAP_CACHE[slot]))[byte_idx] & (1 << bit_idx)) != 0 {
+                    used += 1;
+                }
+            }
+        }
+        used
+    }
+}
+
 /// Flush all dirty bitmap cache entries to disk.
 pub(crate) fn bitmap_flush() -> bool {
     unsafe {

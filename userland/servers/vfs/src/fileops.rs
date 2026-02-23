@@ -161,6 +161,7 @@ pub(crate) unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
         let mut abs_path = [0u8; MAX_PATH_LEN];
+        let mode = (*msg).regs[0] as u32;
         let flags = (*msg).regs[1] as u32;
         let raw_len = extract_path(msg, 2, path.as_mut_ptr());
 
@@ -211,7 +212,7 @@ pub(crate) unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
                     }
                     remote_ino = mount_create(
                         mount_idx, parent_ino,
-                        path_ptr.add(sub_start + l_start), l_len, 0o644,
+                        path_ptr.add(sub_start + l_start), l_len, mode & 0o777,
                     );
                     if remote_ino == 0 {
                         (*reply).label = SALTY_INVALID_OPERATION;
@@ -319,7 +320,7 @@ pub(crate) unsafe fn handle_open(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
                 inode = alloc_inode();
                 if !inode.is_null() {
                     (*inode).ftype = FTYPE_REGULAR;
-                    (*inode).mode = S_IFREG_L | 0o644;
+                    (*inode).mode = S_IFREG_L | (mode & 0o777);
                     (*inode).parent_ino = (*parent).ino;
                     (*inode).rw_data = core::ptr::null_mut();
                     dir_add_entry(parent, child_name, child_len, (*inode).ino);

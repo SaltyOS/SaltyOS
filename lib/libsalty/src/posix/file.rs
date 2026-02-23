@@ -6,14 +6,15 @@ use crate::types::*;
 use super::{pack_path, CAP_VFS_EP};
 
 /// Open a file at `path` with the given `flags` (O_RDONLY, O_CREAT, etc.).
+/// `mode` specifies permission bits when creating a file (masked with 0o777).
 ///
 /// Returns the new file descriptor on success, or -1 on error.
-pub unsafe fn posix_open(path: *const u8, flags: i32) -> i32 {
+pub unsafe fn posix_open(path: *const u8, flags: i32, mode: u32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
         let mut reply = SaltyMsg::zeroed();
         msg.label = POSIX_VFS_OPEN;
-        msg.regs[0] = 0;
+        msg.regs[0] = mode as u64;
         msg.regs[1] = flags as u32 as u64;
         let path_len = pack_path(&raw mut msg, 2, path);
         msg.length = 3 + ((path_len as u64 + 7) / 8);

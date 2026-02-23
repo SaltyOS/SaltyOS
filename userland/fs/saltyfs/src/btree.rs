@@ -133,6 +133,134 @@ pub(crate) fn btree_search(root_block: u64, key: &BTreeKey) -> *const u8 {
     core::ptr::null() // max depth exceeded
 }
 
+/// Find the separator key for the next leaf after the one containing `key`.
+/// Walks the path from root to leaf, then looks for the next sibling child pointer
+/// in parent/ancestor nodes. Returns None if the current leaf is the last one.
+fn find_next_leaf_key(root_block: u64, key: &BTreeKey) -> Option<BTreeKey> {
+    let path = btree_search_path(root_block, key)?;
+
+    if path.depth == 0 {
+        return None; // Root is the only leaf
+    }
+
+    // Walk up from the leaf's parent to find a level with a next child
+    let mut lev = path.depth;
+    while lev > 0 {
+        lev -= 1;
+        let parent_block = path.blocks[lev];
+        let child_idx = path.indices[lev] as usize;
+
+        let parent_data = read_block(parent_block);
+        if parent_data.is_null() {
+            continue;
+        }
+        let hdr = unsafe { &*(parent_data as *const BTreeNodeHeader) };
+        let next_idx = child_idx + 1;
+        if next_idx < hdr.num_items as usize {
+            let ptrs_start = unsafe {
+                parent_data.add(core::mem::size_of::<BTreeNodeHeader>())
+            };
+            let ptr_size = core::mem::size_of::<BTreePointer>();
+            let next_ptr = unsafe {
+                core::ptr::read_unaligned(
+                    ptrs_start.add(next_idx * ptr_size) as *const BTreePointer,
+                )
+            };
+            return Some(next_ptr.key);
+        }
+    }
+
+    None
+}
+
+/// Iterate all B-tree items for a given inode and item type across multiple leaves.
+/// Calls `callback` for each matching item. The callback returns true to continue
+/// or false to stop early. Returns total number of items visited.
+pub(crate) fn btree_find_all_for_ino<F>(
+    root_block: u64,
+    ino: u64,
+    item_type: u8,
+    mut callback: F,
+) -> u32
+where
+    F: FnMut(&BTreeKey, *const u8, u32) -> bool,
+{
+    let mut total = 0u32;
+    let mut search_key = BTreeKey {
+        object_id: ino,
+        item_type,
+        offset: 0,
+    };
+    let mut prev_leaf_block: u64 = u64::MAX;
+
+    for _ in 0..1024 {
+        let leaf = btree_search(root_block, &search_key);
+        if leaf.is_null() {
+            break;
+        }
+
+        let hdr = unsafe { &*(leaf as *const BTreeNodeHeader) };
+        if hdr.num_items == 0 {
+            break;
+        }
+
+        // Same leaf detection: if btree_search routes us back to the same leaf,
+        // use parent pointers to find the next leaf's separator key.
+        if hdr.block_nr == prev_leaf_block {
+            match find_next_leaf_key(root_block, &search_key) {
+                Some(next_key) => {
+                    if next_key.object_id > ino
+                        || (next_key.object_id == ino && next_key.item_type > item_type)
+                    {
+                        break; // Past our range
+                    }
+                    search_key = next_key;
+                    prev_leaf_block = u64::MAX;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        prev_leaf_block = hdr.block_nr;
+
+        let mut found_in_leaf = false;
+        let mut stopped = false;
+
+        unsafe {
+            let items_start = leaf.add(core::mem::size_of::<BTreeNodeHeader>());
+            let item_size = core::mem::size_of::<BTreeItem>();
+
+            for i in 0..hdr.num_items as usize {
+                let item = core::ptr::read_unaligned(
+                    items_start.add(i * item_size) as *const BTreeItem,
+                );
+                if item.key.object_id == ino
+                    && item.key.item_type == item_type
+                    && item.key.offset >= search_key.offset
+                {
+                    let data_ptr = leaf.add(item.offset as usize);
+                    if !callback(&item.key, data_ptr, item.size) {
+                        stopped = true;
+                        total += 1;
+                        break;
+                    }
+                    total += 1;
+                    found_in_leaf = true;
+                    if item.key.offset < u64::MAX {
+                        search_key.offset = item.key.offset + 1;
+                    }
+                }
+            }
+        }
+
+        if stopped || !found_in_leaf {
+            break;
+        }
+    }
+
+    total
+}
+
 /// Search the B-tree for a specific item.
 pub(crate) fn btree_find_item(root_block: u64, key: &BTreeKey) -> Option<(*const u8, u32)> {
     let leaf = btree_search(root_block, key);

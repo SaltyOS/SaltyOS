@@ -5,17 +5,18 @@ use crate::consts::*;
 use crate::types::*;
 use super::{pack_path, CAP_VFS_EP};
 
-/// openat(dirfd, path, flags)
-/// IPC: reg[0]=dirfd, reg[1]=open_flags, reg[2..]=path(len+data)
-pub unsafe fn posix_openat(dirfd: i32, path: *const u8, flags: i32) -> i32 {
+/// openat(dirfd, path, flags, mode)
+/// IPC: reg[0]=dirfd, reg[1]=open_flags, reg[2]=mode, reg[3..]=path(len+data)
+pub unsafe fn posix_openat(dirfd: i32, path: *const u8, flags: i32, mode: u32) -> i32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
         let mut reply = SaltyMsg::zeroed();
         msg.label = POSIX_VFS_OPENAT;
         msg.regs[0] = dirfd as u32 as u64;
         msg.regs[1] = flags as u32 as u64;
-        let path_len = pack_path(&raw mut msg, 2, path);
-        msg.length = 3 + ((path_len as u64 + 7) / 8);
+        msg.regs[2] = mode as u64;
+        let path_len = pack_path(&raw mut msg, 3, path);
+        msg.length = 4 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
             crate::tls::current_ipc_ctx(),

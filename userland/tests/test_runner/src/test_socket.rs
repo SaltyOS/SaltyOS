@@ -179,7 +179,7 @@ fn test_scm_rights() -> bool {
     }
 
     // Open a file to pass
-    let file_fd = unsafe { posix::posix_open(b"/dev/null\0".as_ptr(), O_RDWR as i32) };
+    let file_fd = unsafe { posix::posix_open(b"/dev/null\0".as_ptr(), O_RDWR as i32, 0) };
     if file_fd < 0 {
         puts(b"[TEST_SOCKET] FAIL: open /dev/null failed\n");
         unsafe {

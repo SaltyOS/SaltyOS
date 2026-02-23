@@ -72,6 +72,9 @@ static mut BITMAP_CACHE_DIRTY: [bool; BITMAP_CACHE_SLOTS] = [false; BITMAP_CACHE
 static mut BITMAP_BLOCK_COUNT: u64 = 0;
 static mut ALLOC_HINT: u64 = 0;
 
+/// VFS-SaltyFS shared memory state
+static mut VFS_SHM_MAPPED: bool = false;
+
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
 }
@@ -121,7 +124,8 @@ fn server_loop() -> ! {
     unsafe { ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge); }
 
     loop {
-        let reply = match msg.label {
+        let label = msg.label;
+        let reply = match label {
             SALTYFS_MOUNT => handlers::handle_mount(),
             SALTYFS_LOOKUP => handlers::handle_lookup(&msg),
             SALTYFS_READ => handlers::handle_read(&msg),
@@ -136,12 +140,32 @@ fn server_loop() -> ! {
             SALTYFS_RMDIR => handlers::handle_rmdir_fs(&msg),
             SALTYFS_RENAME => handlers::handle_rename_fs(&msg),
             SALTYFS_TRUNCATE => handlers::handle_truncate_fs(&msg),
+            SALTYFS_SHM_SETUP => handlers::handle_shm_setup(&msg),
+            SALTYFS_WRITE => handlers::handle_write_shm(&msg),
+            SALTYFS_SYMLINK => handlers::handle_symlink(&msg),
+            SALTYFS_READLINK => handlers::handle_readlink(&msg),
+            SALTYFS_LINK => handlers::handle_link(&msg),
             _ => {
                 let mut r = SaltyMsg::zeroed();
                 r.label = SALTY_INVALID_OPERATION;
                 r
             }
         };
+
+        // Flush dirty cache blocks after mutating operations
+        if label == SALTYFS_WRITE_INLINE
+            || label == SALTYFS_WRITE
+            || label == SALTYFS_CREATE
+            || label == SALTYFS_MKDIR
+            || label == SALTYFS_UNLINK
+            || label == SALTYFS_RMDIR
+            || label == SALTYFS_RENAME
+            || label == SALTYFS_TRUNCATE
+            || label == SALTYFS_SYMLINK
+            || label == SALTYFS_LINK
+        {
+            block::cache_flush_all();
+        }
 
         msg = SaltyMsg::zeroed();
         badge = 0;
@@ -178,6 +202,23 @@ pub extern "C" fn _start() -> ! {
     } else {
         unsafe { *(&raw mut MOUNTED) = true; }
         alloc::init_bitmap();
+
+        // Bitmap consistency check: verify used_blocks matches actual bitmap
+        let actual_used = alloc::count_used_blocks();
+        let sb_used = unsafe { (*(&raw const SB)).used_blocks };
+        if actual_used != sb_used {
+            {
+                let mut lb = salty::serial::LineBuf::new();
+                lb.str(b"[saltyfs] WARN: bitmap mismatch: sb.used_blocks=");
+                lb.dec(sb_used);
+                lb.str(b" actual=");
+                lb.dec(actual_used);
+                lb.str(b" (correcting)\n");
+                lb.flush();
+            }
+            unsafe { (*(&raw mut SB)).used_blocks = actual_used; }
+        }
+
         block::discover_max_inode();
     }
 

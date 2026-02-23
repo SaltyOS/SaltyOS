@@ -18,9 +18,9 @@ pub(crate) const SHM_SIZE: u64 = 256 * 1024; // 256KB (64 pages)
 pub(crate) const DEFAULT_BLOCK_SIZE: u64 = 4096;
 pub(crate) const SECTOR_SIZE: u64 = 512;
 
-/// Block cache: 64 blocks cached in memory
+/// Block cache: 256 blocks cached in memory (1MB)
 pub(crate) const CACHE_VADDR: u64 = 0x0000_0000_5100_0000;
-pub(crate) const CACHE_SLOTS: usize = 64;
+pub(crate) const CACHE_SLOTS: usize = 256;
 /// Each cache slot is one block (4KB)
 pub(crate) const CACHE_SLOT_SIZE: usize = 4096;
 pub(crate) const CACHE_TOTAL_PAGES: u64 = (CACHE_SLOTS * CACHE_SLOT_SIZE / 4096) as u64;
@@ -38,6 +38,10 @@ pub(crate) const SALTY_EXTENT_DATA: u8 = 0x05;
 /// Extent types
 pub(crate) const EXTENT_INLINE: u8 = 0;
 pub(crate) const EXTENT_REGULAR: u8 = 1;
+
+/// VFS-SaltyFS shared memory for bulk data transport
+pub(crate) const VFS_SHM_VADDR: u64 = 0x0000_0000_5200_0000;
+pub(crate) const VFS_SHM_PAGES: u64 = 64; // 256KB
 
 /// Bitmap block allocator
 pub(crate) const BITMAP_CACHE_SLOTS: usize = 4;

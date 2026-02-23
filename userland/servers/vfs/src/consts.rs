@@ -178,7 +178,7 @@ pub(crate) const ROOT_INO: u32 = 1;
 
 pub(crate) const INITRD_VADDR: u64 = 0x0000_0000_0100_0000;
 
-pub(crate) const MOUNT_READDIR_BATCH_MAX: usize = 4;
+pub(crate) const MOUNT_READDIR_BATCH_MAX: usize = 3;
 
 pub(crate) const INITIAL_EPOLLS: usize = 8;
 pub(crate) const INITIAL_EPOLL_ENTRIES: usize = 16;
@@ -192,6 +192,11 @@ pub(crate) const INITIAL_PIPE_WAITERS: usize = 4;
 pub(crate) const INITIAL_SYMLINKS: usize = 32;
 
 pub(crate) const MAX_MOUNTS: usize = 4;
+
+/// VFS-SaltyFS shared memory for bulk data transport
+pub(crate) const VFS_SALTYFS_SHM_VADDR: u64 = 0x0000_0000_5000_0000;
+pub(crate) const VFS_SALTYFS_SHM_PAGES: u64 = 64; // 256KB
+pub(crate) const VFS_SALTYFS_SHM_ID: u64 = 0x56534653; // "VSFS"
 
 // PTY pending reader queue for deferred terminal reads
 pub(crate) const MAX_PTYS: usize = 4;
