@@ -4,7 +4,48 @@
 
 use super::thread::{BlockedReason, Tcb, ThreadState};
 use crate::arch::MAX_CPUS;
+use crate::cap::ObjectType;
 use core::sync::atomic::AtomicUsize;
+
+unsafe extern "C" {
+    static _text_start: u8;
+    static _text_end: u8;
+}
+
+#[inline]
+fn is_canonical_addr(addr: u64) -> bool {
+    let sign = (addr >> 47) & 1;
+    let upper = addr >> 48;
+    if sign == 0 { upper == 0 } else { upper == 0xFFFF }
+}
+
+#[inline]
+fn is_kernel_addr(addr: u64) -> bool {
+    is_canonical_addr(addr) && addr >= crate::mm::PHYS_MAP_OFFSET
+}
+
+#[inline]
+fn is_aligned_to<T>(addr: u64) -> bool {
+    let align = core::mem::align_of::<T>() as u64;
+    addr & (align - 1) == 0
+}
+
+#[inline]
+fn checked_cpu_id(site: &'static str) -> usize {
+    let cpu_id = crate::arch::current_cpu() as usize;
+    if cpu_id >= MAX_CPUS {
+        panic!("[SCHED] {}: invalid current_cpu={} (max={})", site, cpu_id, MAX_CPUS);
+    }
+    cpu_id
+}
+
+#[inline]
+fn is_bootstrap_tcb(tcb: *mut Tcb) -> bool {
+    if tcb.is_null() {
+        return false;
+    }
+    core::ptr::eq(tcb, &raw mut super::BOOTSTRAP_TCB)
+}
 
 /// EDF Scheduler
 pub struct Scheduler {
@@ -89,6 +130,25 @@ impl Scheduler {
     /// Caller MUST hold the scheduler lock.
     pub fn enqueue_unlocked(&mut self, tcb: *mut Tcb) {
         unsafe {
+            let cpu_id = checked_cpu_id("enqueue_unlocked");
+            self.validate_tcb_ptr(tcb, "enqueue_unlocked", cpu_id);
+
+            // Bootstrap TCB represents kmain's transient boot context. It has no
+            // dedicated per-thread kernel stack and must never be scheduled
+            // again after the first switch away from bootstrap.
+            if is_bootstrap_tcb(tcb) {
+                (*tcb).state = ThreadState::Inactive;
+                return;
+            }
+
+            // If the thread is still waiting for its outgoing context to be
+            // saved on some CPU, defer actual queue insertion until that CPU
+            // flushes its pending slot.
+            if self.is_pending_on_any_cpu(tcb) {
+                (*tcb).state = ThreadState::Ready;
+                return;
+            }
+
             (*tcb).state = ThreadState::Ready;
 
             // Insert sorted by deadline (priority field stores deadline)
@@ -333,6 +393,88 @@ impl Scheduler {
     // Deferred enqueue helpers
     // ---------------------------------------------------------------
 
+    /// Validate a TCB pointer before dereferencing it in scheduler hot paths.
+    ///
+    /// These checks intentionally fail-fast on obviously corrupted pointers so
+    /// we panic at the source instead of returning into random data later.
+    unsafe fn validate_tcb_ptr(&self, tcb: *mut Tcb, site: &'static str, cpu_id: usize) {
+        let addr = tcb as u64;
+        if tcb.is_null() {
+            panic!("[SCHED] {}: null TCB pointer (cpu={})", site, cpu_id);
+        }
+        if !is_kernel_addr(addr) {
+            panic!(
+                "[SCHED] {}: non-kernel/non-canonical TCB pointer 0x{:x} (cpu={})",
+                site, addr, cpu_id
+            );
+        }
+        if !is_aligned_to::<Tcb>(addr) {
+            panic!(
+                "[SCHED] {}: misaligned TCB pointer 0x{:x} (align={} cpu={})",
+                site,
+                addr,
+                core::mem::align_of::<Tcb>(),
+                cpu_id
+            );
+        }
+        let obj_type_raw = unsafe {
+            core::ptr::addr_of!((*tcb).header.obj_type)
+                .cast::<u8>()
+                .read_unaligned()
+        };
+        if obj_type_raw != ObjectType::Tcb as u8 {
+            panic!(
+                "[SCHED] {}: bad TCB obj_type={} at 0x{:x} (cpu={})",
+                site,
+                obj_type_raw,
+                addr,
+                cpu_id
+            );
+        }
+    }
+
+    /// Validate the incoming target context before low-level register restore.
+    ///
+    /// `context_switch` assumes `new_tcb->context.rsp/rip` are valid kernel
+    /// values and will `ret` to `rip`. If either is corrupt, stack/control-flow
+    /// corruption propagates far from the source.
+    unsafe fn validate_switch_target_context(&self, new_tcb: *mut Tcb) {
+        let cpu_id = checked_cpu_id("validate_switch_target_context");
+        unsafe {
+            self.validate_tcb_ptr(new_tcb, "switch target", cpu_id);
+
+            let rip = (*new_tcb).context.rip;
+            let rsp = (*new_tcb).context.rsp;
+            let kstack = (*new_tcb).kernel_stack_top;
+            let text_start = core::ptr::addr_of!(_text_start) as u64;
+            let text_end = core::ptr::addr_of!(_text_end) as u64;
+
+            if kstack == 0 || !is_kernel_addr(kstack) || !is_aligned_to::<u64>(kstack) {
+                panic!(
+                    "[SCHED] switch target: bad kernel_stack_top=0x{:x} tcb=0x{:x} cpu={}",
+                    kstack, new_tcb as u64, cpu_id
+                );
+            }
+
+            if rip < text_start || rip >= text_end {
+                panic!(
+                    "[SCHED] switch target: RIP out of kernel .text rip=0x{:x} text=[0x{:x},0x{:x}) tcb=0x{:x} cpu={}",
+                    rip, text_start, text_end, new_tcb as u64, cpu_id
+                );
+            }
+            if !is_kernel_addr(rsp) || (rsp & 0xF) != 0 {
+                panic!(
+                    "[SCHED] switch target: bad RSP=0x{:x} (kernel={} align16={}) tcb=0x{:x} cpu={}",
+                    rsp,
+                    is_kernel_addr(rsp),
+                    (rsp & 0xF) == 0,
+                    new_tcb as u64,
+                    cpu_id
+                );
+            }
+        }
+    }
+
     /// Mark thread for deferred enqueue after context switch completes.
     ///
     /// Sets state to Ready but does NOT insert into the ready queue.
@@ -346,22 +488,99 @@ impl Scheduler {
     ///
     /// Caller MUST hold the scheduler lock.
     fn set_pending_enqueue(&mut self, cpu_id: usize, tcb: *mut Tcb) {
+        if cpu_id >= MAX_CPUS {
+            panic!(
+                "[SCHED] set_pending_enqueue: invalid cpu_id={} (max={})",
+                cpu_id, MAX_CPUS
+            );
+        }
+        if is_bootstrap_tcb(tcb) {
+            unsafe {
+                self.validate_tcb_ptr(tcb, "set_pending_enqueue bootstrap", cpu_id);
+                (*tcb).state = ThreadState::Inactive;
+            }
+            return;
+        }
         // Flush any stale pending before overwriting (safety net for
         // switches to fresh threads that skip process_pending_enqueue).
         let old = self.pending_enqueue[cpu_id];
-        if !old.is_null() {
+        if old == tcb {
             unsafe {
+                self.validate_tcb_ptr(tcb, "set_pending_enqueue same slot", cpu_id);
+                (*tcb).state = ThreadState::Ready;
+            }
+            return;
+        }
+        if !old.is_null() {
+            // Clear first so enqueue_unlocked() doesn't see the stale slot and
+            // suppress queue insertion.
+            self.pending_enqueue[cpu_id] = core::ptr::null_mut();
+            unsafe {
+                self.validate_tcb_ptr(old, "set_pending_enqueue stale slot", cpu_id);
                 if (*old).state == ThreadState::Ready {
                     self.enqueue_unlocked(old);
                 }
             }
-            self.pending_enqueue[cpu_id] = core::ptr::null_mut();
         }
 
         unsafe {
+            self.validate_tcb_ptr(tcb, "set_pending_enqueue new slot", cpu_id);
             (*tcb).state = ThreadState::Ready;
         }
         self.pending_enqueue[cpu_id] = tcb;
+    }
+
+    /// Track an outgoing thread in a non-Ready state (typically Blocked).
+    ///
+    /// This protects against a cross-CPU wake racing with `context_switch`:
+    /// the waker may mark the thread Ready, but enqueue_unlocked() will defer
+    /// the queue insertion until the pending slot is flushed after registers are
+    /// safely saved.
+    ///
+    /// Caller MUST hold the scheduler lock.
+    fn track_pending_switch_out(&mut self, cpu_id: usize, tcb: *mut Tcb) {
+        if cpu_id >= MAX_CPUS {
+            panic!(
+                "[SCHED] track_pending_switch_out: invalid cpu_id={} (max={})",
+                cpu_id, MAX_CPUS
+            );
+        }
+        if is_bootstrap_tcb(tcb) {
+            unsafe {
+                self.validate_tcb_ptr(tcb, "track_pending_switch_out bootstrap", cpu_id);
+                (*tcb).state = ThreadState::Inactive;
+            }
+            return;
+        }
+
+        let old = self.pending_enqueue[cpu_id];
+        if !old.is_null() && old != tcb {
+            // Clear first so enqueue_unlocked() doesn't suppress stale flush.
+            self.pending_enqueue[cpu_id] = core::ptr::null_mut();
+            unsafe {
+                self.validate_tcb_ptr(old, "track_pending_switch_out stale slot", cpu_id);
+                if (*old).state == ThreadState::Ready {
+                    self.enqueue_unlocked(old);
+                }
+            }
+        }
+
+        unsafe {
+            self.validate_tcb_ptr(tcb, "track_pending_switch_out", cpu_id);
+        }
+        self.pending_enqueue[cpu_id] = tcb;
+    }
+
+    /// Returns true if a thread is present in any deferred-switch slot.
+    ///
+    /// Caller MUST hold the scheduler lock.
+    fn is_pending_on_any_cpu(&self, tcb: *mut Tcb) -> bool {
+        for cpu in 0..MAX_CPUS {
+            if self.pending_enqueue[cpu] == tcb {
+                return true;
+            }
+        }
+        false
     }
 
     /// Process deferred enqueue after context switch.
@@ -372,11 +591,12 @@ impl Scheduler {
     ///
     /// Caller MUST hold the scheduler lock.
     fn process_pending_enqueue(&mut self) {
-        let cpu_id = crate::arch::current_cpu() as usize;
+        let cpu_id = checked_cpu_id("process_pending_enqueue");
         let tcb = self.pending_enqueue[cpu_id];
         if !tcb.is_null() {
             self.pending_enqueue[cpu_id] = core::ptr::null_mut();
             unsafe {
+                self.validate_tcb_ptr(tcb, "process_pending_enqueue", cpu_id);
                 if (*tcb).state == ThreadState::Ready {
                     self.enqueue_unlocked(tcb);
                 }
@@ -384,41 +604,74 @@ impl Scheduler {
         }
     }
 
-    /// Fastpath resume housekeeping after a direct `context_switch()`.
-    ///
-    /// IPC fastpath performs a direct register context switch and bypasses
-    /// `do_context_switch()`, so it must explicitly flush deferred enqueue once
-    /// the old thread's registers have been saved.
-    ///
-    /// # Preconditions
-    /// - `SCHED_IPC_LOCK` is held.
-    /// - IRQs are disabled.
-    pub fn process_pending_enqueue_after_direct_switch(&mut self) {
-        self.lock();
-        self.process_pending_enqueue();
-        self.unlock();
-    }
-
     // ---------------------------------------------------------------
     // Context switch helpers
     // ---------------------------------------------------------------
 
-    /// Perform the actual context switch (VSpace, kernel stack, registers).
+    /// Ensure the outgoing thread is represented in the deferred slot before
+    /// releasing SCHED_IPC_LOCK and switching away.
+    ///
+    /// This closes the race where another CPU wakes a thread (Blocked->Ready)
+    /// before `context_switch` has saved the outgoing kernel continuation.
     ///
     /// # Preconditions
-    /// - SCHED_IPC_LOCK MUST be held: this function releases it before switching
-    ///   and reacquires it on resume. Callers without it cause a lock leak.
-    /// - Scheduler lock (`lock_state`) MUST NOT be held.
-    unsafe fn do_context_switch(&mut self, old_tcb: *mut Tcb, new_tcb: *mut Tcb) {
-        // Shadow new_tcb so we can reassign on VSpace failure
+    /// - SCHED_IPC_LOCK is held by the caller.
+    /// - Scheduler lock is NOT held.
+    unsafe fn track_outgoing_before_switch(&mut self, old_tcb: *mut Tcb) {
+        if old_tcb.is_null() {
+            return;
+        }
+
+        let cpu_id = checked_cpu_id("track_outgoing_before_switch");
+        self.lock();
+        unsafe {
+            if old_tcb == self.idle[cpu_id] || self.is_pending_on_any_cpu(old_tcb) {
+                self.unlock();
+                return;
+            }
+
+            self.validate_tcb_ptr(old_tcb, "track_outgoing_before_switch", cpu_id);
+            match (*old_tcb).state {
+                ThreadState::Running | ThreadState::Ready => {
+                    self.set_pending_enqueue(cpu_id, old_tcb);
+                }
+                ThreadState::Inactive | ThreadState::Blocked | ThreadState::Waiting => {
+                    self.track_pending_switch_out(cpu_id, old_tcb);
+                }
+            }
+        }
+        self.unlock();
+    }
+
+    #[inline]
+    fn bump_context_switch_count(&mut self) {
+        let cs_cpu = checked_cpu_id("bump_context_switch_count");
+        self.context_switches[cs_cpu] += 1;
+    }
+
+    /// Install the target thread's kernel stack into per-CPU entry state.
+    ///
+    /// This updates both the syscall-entry kernel stack cache (`GS:8`) and
+    /// the TSS RSP0 used for privilege transitions.
+    unsafe fn install_switch_kernel_stack(&self, new_tcb: *mut Tcb) {
+        unsafe {
+            if (*new_tcb).kernel_stack_top != 0 {
+                crate::arch::set_kernel_stack((*new_tcb).kernel_stack_top);
+                crate::arch::set_tss_rsp0((*new_tcb).kernel_stack_top);
+            }
+        }
+    }
+
+    /// Prepare a switch target for the normal scheduler path.
+    ///
+    /// Handles VSpace-switch failure by marking the target inactive and
+    /// falling back to this CPU's idle thread, matching historical behavior.
+    ///
+    /// Returns the actual thread to switch to (possibly idle fallback).
+    unsafe fn prepare_switch_target_full(&mut self, new_tcb: *mut Tcb) -> *mut Tcb {
         let mut new_tcb = new_tcb;
 
-        // Count context switches on this CPU
-        let cs_cpu = crate::arch::current_cpu() as usize;
-        self.context_switches[cs_cpu] += 1;
-
         unsafe {
-            // Switch to the target thread's user VSpace
             if !(*new_tcb).vspace_root.is_null() {
                 let vspace = &*(*new_tcb).vspace_root;
                 if !vspace.switch_to() {
@@ -427,7 +680,7 @@ impl Scheduler {
                     (*new_tcb).state = ThreadState::Inactive;
 
                     self.lock();
-                    let cpu_id = crate::arch::current_cpu() as usize;
+                    let cpu_id = checked_cpu_id("prepare_switch_target_full");
                     let idle = self.idle[cpu_id];
                     self.set_current(idle);
                     self.unlock();
@@ -438,11 +691,44 @@ impl Scheduler {
                 }
             }
 
-            // Switch per-CPU kernel stack
-            if (*new_tcb).kernel_stack_top != 0 {
-                crate::arch::set_kernel_stack((*new_tcb).kernel_stack_top);
-                crate::arch::set_tss_rsp0((*new_tcb).kernel_stack_top);
+            self.install_switch_kernel_stack(new_tcb);
+        }
+
+        new_tcb
+    }
+
+    /// Prepare a switch target for IPC fastpath.
+    ///
+    /// Fastpath already validated the receiver's basic invariants, so this
+    /// path skips scheduler fallback logic in the common case. If activation
+    /// fails (e.g. VSpace turned Dying concurrently), returns `false` so the
+    /// caller can fall back to the checked path.
+    unsafe fn prepare_switch_target_fast(&self, new_tcb: *mut Tcb) -> bool {
+        unsafe {
+            if (*new_tcb).vspace_root.is_null() || (*new_tcb).kernel_stack_top == 0 {
+                return false;
             }
+
+            let vspace = &*(*new_tcb).vspace_root;
+            if !vspace.switch_to() {
+                return false;
+            }
+
+            self.install_switch_kernel_stack(new_tcb);
+        }
+
+        true
+    }
+
+    /// Shared low-level switch sequence after the target thread is prepared.
+    ///
+    /// This is the delicate portion that must remain consistent across normal
+    /// scheduler switches and IPC fastpath direct switches.
+    unsafe fn switch_common(&mut self, old_tcb: *mut Tcb, new_tcb: *mut Tcb) {
+        unsafe {
+            let cpu_id = checked_cpu_id("switch_common");
+            self.validate_tcb_ptr(old_tcb, "switch old_tcb", cpu_id);
+            self.validate_switch_target_context(new_tcb);
 
             // Save outgoing thread's TLS base (FS_BASE MSR)
             (*old_tcb).tls_base = crate::arch::read_fs_base();
@@ -453,7 +739,6 @@ impl Scheduler {
             // Save outgoing thread's FPU state if it owns the hardware registers.
             // This ensures the TCB buffer is up-to-date before the thread can be
             // migrated to another CPU (where flush_if_owner would miss it).
-            // SAFETY: old_tcb is a valid Tcb pointer from scheduler.current[].
             crate::arch::fpu::save_on_switch(old_tcb as *mut u8);
 
             // Set CR0.TS so the new thread's first FPU use triggers #NM for lazy switching
@@ -464,11 +749,9 @@ impl Scheduler {
             crate::arch::write_fs_base((*new_tcb).tls_base);
 
             // Update per-CPU canary cache to incoming thread's canary.
-            // Ensures the assembly canary check at syscall exit matches
-            // even if the thread migrated from a different CPU.
             crate::arch::set_per_cpu_canary((*new_tcb).stack_canary);
 
-            // Pure register save/restore — no shared state accessed
+            // Pure register save/restore — no shared state accessed.
             let old_ctx = &mut (*old_tcb).context as *mut _;
             let new_ctx = &(*new_tcb).context as *const _;
             crate::arch::context_switch(old_ctx, new_ctx);
@@ -477,11 +760,55 @@ impl Scheduler {
             crate::mm::SCHED_IPC_LOCK.lock();
 
             // Process deferred enqueue now that context is saved.
-            // The thread that was pending before the switch can now safely
-            // appear in the ready queue (its registers are saved).
             self.lock();
             self.process_pending_enqueue();
             self.unlock();
+        }
+    }
+
+    /// Fastpath-specific switch path that shares the common register/TLS/FPU
+    /// sequence but uses a lighter target-preparation step in the hot path.
+    unsafe fn switch_common_fast(&mut self, old_tcb: *mut Tcb, new_tcb: *mut Tcb) {
+        unsafe {
+            if self.prepare_switch_target_fast(new_tcb) {
+                self.switch_common(old_tcb, new_tcb);
+            } else {
+                // Fall back to the fully-checked preparation path on races.
+                let prepared = self.prepare_switch_target_full(new_tcb);
+                self.switch_common(old_tcb, prepared);
+            }
+        }
+    }
+
+    /// Fastpath wrapper for the scheduler's full context-switch path.
+    ///
+    /// IPC fastpath uses this to avoid duplicating switch machinery while still
+    /// preserving a lighter-weight target-preparation path.
+    ///
+    /// # Preconditions
+    /// - `SCHED_IPC_LOCK` MUST be held.
+    /// - Scheduler lock MUST NOT be held.
+    /// - `set_current(new_tcb)` and thread state transitions were already done.
+    pub(crate) unsafe fn do_context_switch_fastpath(&mut self, old_tcb: *mut Tcb, new_tcb: *mut Tcb) {
+        unsafe {
+            self.track_outgoing_before_switch(old_tcb);
+            self.bump_context_switch_count();
+            self.switch_common_fast(old_tcb, new_tcb);
+        }
+    }
+
+    /// Perform the actual context switch (VSpace, kernel stack, registers).
+    ///
+    /// # Preconditions
+    /// - SCHED_IPC_LOCK MUST be held: this function releases it before switching
+    ///   and reacquires it on resume. Callers without it cause a lock leak.
+    /// - Scheduler lock (`lock_state`) MUST NOT be held.
+    unsafe fn do_context_switch(&mut self, old_tcb: *mut Tcb, new_tcb: *mut Tcb) {
+        unsafe {
+            self.track_outgoing_before_switch(old_tcb);
+            self.bump_context_switch_count();
+            let prepared = self.prepare_switch_target_full(new_tcb);
+            self.switch_common(old_tcb, prepared);
         }
     }
 
@@ -783,6 +1110,13 @@ impl Scheduler {
         unsafe {
             let cpu_id = crate::arch::current_cpu() as usize;
             let old_tcb = self.current[cpu_id];
+            if !old_tcb.is_null() && old_tcb != self.idle[cpu_id] {
+                match (*old_tcb).state {
+                    ThreadState::Running => self.set_pending_enqueue(cpu_id, old_tcb),
+                    ThreadState::Inactive => {}
+                    _ => self.track_pending_switch_out(cpu_id, old_tcb),
+                }
+            }
             let new_tcb = self.schedule_unlocked();
 
             if old_tcb == new_tcb {
@@ -937,6 +1271,9 @@ impl Scheduler {
             // Make schedule decision while still holding lock
             let new_tcb = self.schedule_unlocked();
             let old_tcb = current;
+            if old_tcb != new_tcb {
+                self.track_pending_switch_out(cpu_id, old_tcb);
+            }
 
             // Release scheduler lock before context switch
             self.unlock();
@@ -985,6 +1322,7 @@ impl Scheduler {
             let new_tcb = self.schedule_unlocked();
             let old_tcb = current;
             if old_tcb != new_tcb {
+                self.track_pending_switch_out(cpu_id, old_tcb);
                 self.set_current(new_tcb);
                 self.unlock();
                 crate::mm::restore_irq(irq_flag);
@@ -1032,6 +1370,7 @@ impl Scheduler {
             let new_tcb = self.schedule_unlocked();
             let old_tcb = current;
             if old_tcb != new_tcb {
+                self.track_pending_switch_out(cpu_id, old_tcb);
                 self.set_current(new_tcb);
                 self.unlock();
                 crate::mm::restore_irq(irq_flag);

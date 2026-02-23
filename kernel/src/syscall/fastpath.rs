@@ -204,54 +204,15 @@ pub unsafe extern "C" fn fastpath_call_rust(
             endpoint.fastpath_set_state(EndpointState::Idle);
         }
 
-        // Direct switch: set receiver as current, switch VSpace + kernel stack
-        // Hold scheduler lock for queue/current-pointer mutations
+        // Direct switch setup: publish receiver as current under scheduler lock.
         sched.lock();
-        let cs_cpu = crate::arch::current_cpu() as usize;
-        sched.context_switches[cs_cpu] += 1;
         sched.set_current(receiver);
         (*receiver).state = ThreadState::Running;
         sched.unlock();
 
-        if !(*receiver).vspace_root.is_null() {
-            let vspace = &*(*receiver).vspace_root;
-            vspace.switch_to();
-        }
-
-        if (*receiver).kernel_stack_top != 0 {
-            crate::arch::set_kernel_stack((*receiver).kernel_stack_top);
-            crate::arch::set_tss_rsp0((*receiver).kernel_stack_top);
-        }
-
-        // Mirror do_context_switch(): preserve per-thread TLS across a direct
-        // fastpath context switch.
-        (*current).tls_base = crate::arch::read_fs_base();
-
-        // Release SCHED_IPC_LOCK before context switch (IF=0, no interrupts possible)
-        SCHED_IPC_LOCK.unlock();
-
-        // Mirror do_context_switch() FPU/TLS handling to avoid diverging CPU-local
-        // state when fastpath bypasses the scheduler's normal switch path.
-        crate::arch::fpu::save_on_switch(current as *mut u8);
-        crate::arch::fpu::set_ts();
-        crate::arch::write_fs_base((*receiver).tls_base);
-
-        // Update per-CPU canary cache to receiver's canary before switching.
-        // The receiver resumes mid-syscall and eventually returns through the
-        // assembly canary check — %gs:40 must match the receiver's saved canary.
-        crate::arch::set_per_cpu_canary((*receiver).stack_canary);
-
-        // Context switch: caller suspends here, resumes when reply wakes it
-        let old_ctx = &mut (*current).context as *mut _;
-        let new_ctx = &(*receiver).context as *const _;
-        crate::arch::context_switch(old_ctx, new_ctx);
-
-        // Reacquire SCHED_IPC_LOCK after resume
-        SCHED_IPC_LOCK.lock();
-
-        // `do_context_switch()` normally flushes deferred enqueue after the old
-        // thread's registers are safely stored. Fastpath must do the same.
-        sched.process_pending_enqueue_after_direct_switch();
+        // Use the scheduler's shared switch machinery (with a fastpath-specific
+        // target-prepare step) instead of a hand-rolled switch subset.
+        sched.do_context_switch_fastpath(current, receiver);
 
         // --- Caller has been woken by reply ---
         // At this point, current thread IS the original caller again.

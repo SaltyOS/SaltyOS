@@ -1989,7 +1989,7 @@ fn syscall_tcb_read_registers(cap: &Capability, _flags: u64) -> SyscallResult {
         let irq = save_irq_disable();
         SCHED_IPC_LOCK.lock();
         let tcb = &*(cap.object as *const Tcb);
-        let result = if tcb.state == ThreadState::Running {
+        let result = if tcb.state != ThreadState::Inactive {
             SyscallResult::err(SyscallError::Busy)
         } else {
             SyscallResult::ok(tcb.context.rip)
@@ -2021,7 +2021,10 @@ fn syscall_tcb_write_registers(
         let irq = save_irq_disable();
         SCHED_IPC_LOCK.lock();
         let tcb = &mut *(cap.object as *mut Tcb);
-        if tcb.state == ThreadState::Running {
+        // The saved `context` for Ready/Blocked/Waiting threads is often a
+        // kernel continuation (e.g. switch_common resume point), not user RIP/RSP.
+        // Allowing writes in those states can corrupt kernel return paths.
+        if tcb.state != ThreadState::Inactive {
             SCHED_IPC_LOCK.unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::Busy);

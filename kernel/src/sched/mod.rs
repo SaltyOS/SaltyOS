@@ -105,6 +105,7 @@ pub fn init() {
     unsafe {
         (*idle_tcb).context.rip = idle_thread as *const () as u64;
         (*idle_tcb).context.rsp = stack_top;
+        (*idle_tcb).kernel_stack_top = stack_top;
         (*idle_tcb).context.rflags = 0x202; // Interrupts enabled
         (*idle_tcb).context.cs = 0x08; // Kernel code segment
         (*idle_tcb).context.ss = 0x10; // Kernel data segment
@@ -143,6 +144,7 @@ pub fn init_cpu(cpu_id: usize) {
     unsafe {
         (*idle_tcb).context.rip = idle_thread as *const () as u64;
         (*idle_tcb).context.rsp = stack_top;
+        (*idle_tcb).kernel_stack_top = stack_top;
         (*idle_tcb).context.rflags = 0x202; // Interrupts enabled
         (*idle_tcb).context.cs = 0x08; // Kernel code segment
         (*idle_tcb).context.ss = 0x10; // Kernel data segment
