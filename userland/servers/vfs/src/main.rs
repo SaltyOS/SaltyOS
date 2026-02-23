@@ -95,6 +95,8 @@ pub(crate) static mut VFS_SHM_ACTIVE: bool = false;
 
 pub(crate) static mut URANDOM_S0: u64 = 0;
 pub(crate) static mut URANDOM_S1: u64 = 0;
+pub(crate) static mut URANDOM_COUNTER: u64 = 0;
+const URANDOM_RESEED_INTERVAL: u64 = 1024;
 
 pub(crate) static mut PROC_ROOT_INO: u32 = 0;
 
@@ -496,6 +498,20 @@ pub(crate) fn ipc_ctx() -> *mut IpcContext {
 
 pub(crate) unsafe fn urandom_init() {
     unsafe {
+        // Primary: hardware RDRAND via kernel syscall
+        let r0 = salty::syscall::sys_getrandom();
+        let r1 = salty::syscall::sys_getrandom();
+        if let (Some(s0), Some(s1)) = (r0, r1) {
+            URANDOM_S0 = s0;
+            URANDOM_S1 = s1;
+            // xorshift128+ requires non-zero state
+            if URANDOM_S0 == 0 && URANDOM_S1 == 0 {
+                URANDOM_S0 = s0 | 1;
+            }
+            return;
+        }
+
+        // Fallback: TSC + clock (original method)
         let mut ts = Timespec::zeroed();
         salty::syscall::syscall(SYS_CLOCK_GETTIME, 0, &raw mut ts as u64, 0, 0, 0, 0);
         let tsc_lo: u32;
@@ -516,6 +532,14 @@ pub(crate) unsafe fn urandom_init() {
 
 pub(crate) unsafe fn urandom_next() -> u64 {
     unsafe {
+        URANDOM_COUNTER += 1;
+        if URANDOM_COUNTER >= URANDOM_RESEED_INTERVAL {
+            URANDOM_COUNTER = 0;
+            if let Some(fresh) = salty::syscall::sys_getrandom() {
+                URANDOM_S1 ^= fresh;
+            }
+        }
+
         let mut s1 = URANDOM_S0;
         let s0 = URANDOM_S1;
         let result = s0.wrapping_add(s1);
