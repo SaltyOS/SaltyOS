@@ -9,19 +9,19 @@
 
 extern crate salty;
 
-mod consts;
-mod types;
-mod ramfs;
-mod path;
-mod client;
-mod mount;
-mod fileops;
 mod at_ops;
-mod socket;
+mod client;
+mod consts;
+mod fileops;
+mod misc;
+mod mount;
+mod path;
 mod pipe;
 mod poll;
-mod misc;
 mod procfs;
+mod ramfs;
+mod socket;
+mod types;
 
 use salty::consts::*;
 use salty::cpio;
@@ -112,14 +112,18 @@ macro_rules! INODES {
 #[macro_export]
 macro_rules! WRITABLE_POOL {
     () => {
-        unsafe { core::slice::from_raw_parts_mut($crate::WRITABLE_POOL_PTR, $crate::max_writable()) }
+        unsafe {
+            core::slice::from_raw_parts_mut($crate::WRITABLE_POOL_PTR, $crate::max_writable())
+        }
     };
 }
 
 #[macro_export]
 macro_rules! WRITABLE_USED {
     () => {
-        unsafe { core::slice::from_raw_parts_mut($crate::WRITABLE_USED_PTR, $crate::max_writable()) }
+        unsafe {
+            core::slice::from_raw_parts_mut($crate::WRITABLE_USED_PTR, $crate::max_writable())
+        }
     };
 }
 
@@ -140,14 +144,18 @@ macro_rules! SOCKETS {
 #[macro_export]
 macro_rules! POLL_WAITERS {
     () => {
-        unsafe { core::slice::from_raw_parts_mut($crate::POLL_WAITERS_PTR, $crate::max_poll_waiters()) }
+        unsafe {
+            core::slice::from_raw_parts_mut($crate::POLL_WAITERS_PTR, $crate::max_poll_waiters())
+        }
     };
 }
 
 #[macro_export]
 macro_rules! EPOLLS {
     () => {
-        unsafe { core::slice::from_raw_parts_mut($crate::EPOLLS_PTR, $crate::max_epoll_instances()) }
+        unsafe {
+            core::slice::from_raw_parts_mut($crate::EPOLLS_PTR, $crate::max_epoll_instances())
+        }
     };
 }
 
@@ -169,23 +177,41 @@ macro_rules! PIPES {
 // Capacity accessor functions
 // ======================================================================
 
-pub(crate) fn max_inodes() -> usize { unsafe { *(&raw const INODES_CAP) } }
+pub(crate) fn max_inodes() -> usize {
+    unsafe { *(&raw const INODES_CAP) }
+}
 
-pub(crate) fn max_writable() -> usize { unsafe { *(&raw const WRITABLE_CAP) } }
+pub(crate) fn max_writable() -> usize {
+    unsafe { *(&raw const WRITABLE_CAP) }
+}
 
-pub(crate) fn max_clients() -> usize { unsafe { *(&raw const CLIENTS_CAP) } }
+pub(crate) fn max_clients() -> usize {
+    unsafe { *(&raw const CLIENTS_CAP) }
+}
 
-pub(crate) fn max_sockets() -> usize { unsafe { *(&raw const SOCKETS_CAP) } }
+pub(crate) fn max_sockets() -> usize {
+    unsafe { *(&raw const SOCKETS_CAP) }
+}
 
-pub(crate) fn max_poll_waiters() -> usize { unsafe { *(&raw const POLL_WAITERS_CAP) } }
+pub(crate) fn max_poll_waiters() -> usize {
+    unsafe { *(&raw const POLL_WAITERS_CAP) }
+}
 
-pub(crate) fn max_epoll_instances() -> usize { unsafe { *(&raw const EPOLLS_CAP) } }
+pub(crate) fn max_epoll_instances() -> usize {
+    unsafe { *(&raw const EPOLLS_CAP) }
+}
 
-pub(crate) fn max_shm_objects() -> usize { unsafe { *(&raw const SHM_CAP) } }
+pub(crate) fn max_shm_objects() -> usize {
+    unsafe { *(&raw const SHM_CAP) }
+}
 
-pub(crate) fn max_shm_pages() -> usize { MAX_SHM_PAGES }
+pub(crate) fn max_shm_pages() -> usize {
+    MAX_SHM_PAGES
+}
 
-pub(crate) fn max_pipes() -> usize { unsafe { *(&raw const PIPES_CAP) } }
+pub(crate) fn max_pipes() -> usize {
+    unsafe { *(&raw const PIPES_CAP) }
+}
 
 // ======================================================================
 // Pool allocation functions
@@ -219,7 +245,10 @@ pub(crate) unsafe fn vfs_grow_pool_with_min(
         salty::posix_mm::posix_mmap(
             core::ptr::null_mut(),
             (new_pages * 4096) as u64,
-            0x3, 0x22, -1, 0,
+            0x3,
+            0x22,
+            -1,
+            0,
         )
     };
     if new_ptr.is_null() || new_ptr == usize::MAX as *mut u8 {
@@ -253,9 +282,7 @@ pub(crate) unsafe fn vfs_grow_pool(
 
 pub(crate) unsafe fn vfs_alloc_array<T>(count: usize) -> *mut T {
     unsafe {
-        let bytes = core::mem::size_of::<T>()
-            .checked_mul(count)
-            .unwrap_or(0);
+        let bytes = core::mem::size_of::<T>().checked_mul(count).unwrap_or(0);
         if bytes == 0 {
             return core::ptr::null_mut();
         }
@@ -263,7 +290,10 @@ pub(crate) unsafe fn vfs_alloc_array<T>(count: usize) -> *mut T {
         let ptr = salty::posix_mm::posix_mmap(
             core::ptr::null_mut(),
             (pages * 4096) as u64,
-            0x3, 0x22, -1, 0,
+            0x3,
+            0x22,
+            -1,
+            0,
         );
         if ptr.is_null() || ptr == usize::MAX as *mut u8 {
             return core::ptr::null_mut();
@@ -325,7 +355,10 @@ unsafe fn init_dynamic_state_storage() -> i32 {
             salty::posix_mm::posix_mmap(
                 core::ptr::null_mut(),
                 (pages * 4096) as u64,
-                0x3, 0x22, -1, 0,
+                0x3,
+                0x22,
+                -1,
+                0,
             )
         };
         if ptr.is_null() || ptr == usize::MAX as *mut u8 {
@@ -343,7 +376,12 @@ unsafe fn init_dynamic_state_storage() -> i32 {
         if alloc_pool(&raw mut INODES_PTR, &raw mut INODES_CAP, INITIAL_INODES) != 0 {
             return SALTY_OUT_OF_MEMORY as i32;
         }
-        if alloc_pool(&raw mut WRITABLE_POOL_PTR, &raw mut WRITABLE_CAP, INITIAL_WRITABLE) != 0 {
+        if alloc_pool(
+            &raw mut WRITABLE_POOL_PTR,
+            &raw mut WRITABLE_CAP,
+            INITIAL_WRITABLE,
+        ) != 0
+        {
             return SALTY_OUT_OF_MEMORY as i32;
         }
         let writable_used_bytes = INITIAL_WRITABLE;
@@ -351,7 +389,10 @@ unsafe fn init_dynamic_state_storage() -> i32 {
         let ptr = salty::posix_mm::posix_mmap(
             core::ptr::null_mut(),
             (writable_used_pages * 4096) as u64,
-            0x3, 0x22, -1, 0,
+            0x3,
+            0x22,
+            -1,
+            0,
         );
         if ptr.is_null() || ptr == usize::MAX as *mut u8 {
             return SALTY_OUT_OF_MEMORY as i32;
@@ -364,7 +405,10 @@ unsafe fn init_dynamic_state_storage() -> i32 {
         let next_ptr = salty::posix_mm::posix_mmap(
             core::ptr::null_mut(),
             (next_pages * 4096) as u64,
-            0x3, 0x22, -1, 0,
+            0x3,
+            0x22,
+            -1,
+            0,
         );
         if next_ptr.is_null() || next_ptr == usize::MAX as *mut u8 {
             return SALTY_OUT_OF_MEMORY as i32;
@@ -375,14 +419,22 @@ unsafe fn init_dynamic_state_storage() -> i32 {
         }
         WRITABLE_NEXT_PTR = next_arr;
 
-        if alloc_pool(&raw mut SYMLINK_POOL_PTR, &raw mut SYMLINK_CAP, INITIAL_SYMLINKS) != 0 {
+        if alloc_pool(
+            &raw mut SYMLINK_POOL_PTR,
+            &raw mut SYMLINK_CAP,
+            INITIAL_SYMLINKS,
+        ) != 0
+        {
             return SALTY_OUT_OF_MEMORY as i32;
         }
         let sym_used_pages = (INITIAL_SYMLINKS + 4095) / 4096;
         let sym_used_ptr = salty::posix_mm::posix_mmap(
             core::ptr::null_mut(),
             (sym_used_pages * 4096) as u64,
-            0x3, 0x22, -1, 0,
+            0x3,
+            0x22,
+            -1,
+            0,
         );
         if sym_used_ptr.is_null() || sym_used_ptr == usize::MAX as *mut u8 {
             return SALTY_OUT_OF_MEMORY as i32;
@@ -396,7 +448,12 @@ unsafe fn init_dynamic_state_storage() -> i32 {
         if alloc_pool(&raw mut SOCKETS_PTR, &raw mut SOCKETS_CAP, INITIAL_SOCKETS) != 0 {
             return SALTY_OUT_OF_MEMORY as i32;
         }
-        if alloc_pool(&raw mut POLL_WAITERS_PTR, &raw mut POLL_WAITERS_CAP, INITIAL_POLL_WAITERS) != 0 {
+        if alloc_pool(
+            &raw mut POLL_WAITERS_PTR,
+            &raw mut POLL_WAITERS_CAP,
+            INITIAL_POLL_WAITERS,
+        ) != 0
+        {
             return SALTY_OUT_OF_MEMORY as i32;
         }
         if alloc_pool(&raw mut EPOLLS_PTR, &raw mut EPOLLS_CAP, INITIAL_EPOLLS) != 0 {
@@ -446,7 +503,10 @@ pub(crate) unsafe fn urandom_init() {
         core::arch::asm!("rdtsc", out("eax") tsc_lo, out("edx") tsc_hi);
         let tsc: u64 = (tsc_hi as u64) << 32 | tsc_lo as u64;
         URANDOM_S0 = ts.tv_nsec ^ tsc;
-        URANDOM_S1 = ts.tv_sec.wrapping_mul(6364136223846793005).wrapping_add(tsc);
+        URANDOM_S1 = ts
+            .tv_sec
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(tsc);
         if URANDOM_S0 == 0 && URANDOM_S1 == 0 {
             URANDOM_S0 = 0x0123456789ABCDEF;
             URANDOM_S1 = 0xFEDCBA9876543210;
@@ -628,7 +688,13 @@ unsafe fn init_ramfs() {
         let initrd = INITRD_VADDR as *const u8;
         let initrd_size = ramfs::read_boot_info_initrd_size();
 
-        { let mut lb = LineBuf::new(); lb.str(b"[VFS] Initrd size: "); lb.hex(initrd_size as u64); lb.str(b" bytes\n"); lb.flush(); }
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS] Initrd size: ");
+            lb.hex(initrd_size as u64);
+            lb.str(b" bytes\n");
+            lb.flush();
+        }
 
         let mut offset: usize = 0;
         let mut entry = CpioEntryExt::zeroed();
@@ -643,7 +709,13 @@ unsafe fn init_ramfs() {
             }
         }
 
-        { let mut lb = LineBuf::new(); lb.str(b"[VFS] Mounted "); lb.hex(file_count as u64); lb.str(b" initrd files\n"); lb.flush(); }
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS] Mounted ");
+            lb.hex(file_count as u64);
+            lb.str(b" initrd files\n");
+            lb.flush();
+        }
     }
 }
 
@@ -657,7 +729,13 @@ pub extern "C" fn _start() -> ! {
 
     let err = salty::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
     if err != 0 {
-        { let mut lb = LineBuf::new(); lb.str(b"[VFS] FAIL: set IPC buffer err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[VFS] FAIL: set IPC buffer err=");
+            lb.hex(err as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
         idle();
     }
     unsafe {
@@ -718,7 +796,12 @@ pub extern "C" fn _start() -> ! {
 
         unsafe {
             ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
-            let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NAMESERV_EP, &raw const reg_msg, &raw mut reg_reply);
+            let err = ipc::call_ctx(
+                ipc_ctx(),
+                VFS_CAP_NAMESERV_EP,
+                &raw const reg_msg,
+                &raw mut reg_reply,
+            );
             if err == 0 && reg_reply.label == SALTY_OK {
                 puts(b"[VFS] registered with nameserv\n");
             } else {
@@ -752,346 +835,420 @@ pub extern "C" fn _start() -> ! {
         let mut skip_reply = false;
 
         if msg.length == 0 && msg.label == 0 && badge != 0 {
-            unsafe { misc::handle_pty_notification(badge); }
+            unsafe {
+                misc::handle_pty_notification(badge);
+            }
             skip_reply = true;
         } else {
-        unsafe {
-            match msg.label {
-                VFS_OPEN => { fileops::handle_open(&raw const msg, &raw mut reply, badge); }
-                VFS_READ => {
-                    let fd = msg.regs[0] as i32;
-                    let cli = client::get_client(badge);
-                    if !cli.is_null() && fd >= 0 && fd < (*cli).fds_cap as i32
-                        && (*(*cli).fds.add(fd as usize)).active != 0
-                    {
-                        match (*(*cli).fds.add(fd as usize)).fd_type {
-                            FD_TYPE_SOCKET => {
-                                skip_reply = socket::handle_socket_read(
-                                    (*cli).fds.add(fd as usize), &raw mut reply, badge);
-                            }
-                            FD_TYPE_PIPE => {
-                                skip_reply = pipe::handle_pipe_read(
-                                    &raw const msg, (*cli).fds.add(fd as usize), &raw mut reply, badge);
-                            }
-                            FD_TYPE_DEVICE => {
-                                if (*(*cli).fds.add(fd as usize)).dev_type == DEV_PTY_SLAVE {
-                                    skip_reply = misc::handle_pty_dev_read(
-                                        &raw const msg, (*cli).fds.add(fd as usize),
-                                        &raw mut reply, badge);
-                                } else {
-                                    fileops::handle_read(&raw const msg, &raw mut reply, badge);
-                                }
-                            }
-                            FD_TYPE_MOUNT => {
-                                let fde = &mut *(*cli).fds.add(fd as usize);
-                                let mount_idx = fde.dev_type as usize;
-                                let remote_ino = fde.sock_id as u64;
-                                let count = msg.regs[1];
-                                if *(&raw const VFS_SHM_ACTIVE) {
-                                    // SHM bulk read path
-                                    mount::mount_read_shm(
-                                        mount_idx, remote_ino, fde.offset, count,
-                                        0, &raw mut reply);
-                                    if reply.label == SALTY_OK {
-                                        let bytes_read = reply.regs[0];
-                                        // Copy from SHM to reply registers (up to 152 bytes)
-                                        let copy_len = bytes_read.min(152);
-                                        reply.length = 1 + (copy_len + 7) / 8;
-                                        let src = VFS_SALTYFS_SHM_VADDR as *const u8;
-                                        let dst = &raw mut reply.regs[1] as *mut u8;
-                                        for j in 0..copy_len as usize {
-                                            *dst.add(j) = *src.add(j);
-                                        }
-                                        fde.offset += bytes_read;
-                                    }
-                                } else {
-                                    let capped = count.min(152);
-                                    mount::mount_read_inline(
-                                        mount_idx, remote_ino, fde.offset, capped,
-                                        &raw mut reply);
-                                    if reply.label == SALTY_OK {
-                                        let bytes_read = reply.regs[0];
-                                        fde.offset += bytes_read;
-                                    }
-                                }
-                            }
-                            _ => {
-                                fileops::handle_read(&raw const msg, &raw mut reply, badge);
-                            }
-                        }
-                    } else {
-                        fileops::handle_read(&raw const msg, &raw mut reply, badge);
+            unsafe {
+                match msg.label {
+                    VFS_OPEN => {
+                        fileops::handle_open(&raw const msg, &raw mut reply, badge);
                     }
-                }
-                VFS_WRITE => {
-                    let fd = msg.regs[0] as i32;
-                    let cli = client::get_client(badge);
-                    if !cli.is_null() && fd >= 0 && fd < (*cli).fds_cap as i32
-                        && (*(*cli).fds.add(fd as usize)).active != 0
-                    {
-                        match (*(*cli).fds.add(fd as usize)).fd_type {
-                            FD_TYPE_SOCKET => {
-                                skip_reply = socket::handle_socket_write(
-                                    &raw const msg, (*cli).fds.add(fd as usize), &raw mut reply);
-                            }
-                            FD_TYPE_PIPE => {
-                                skip_reply = pipe::handle_pipe_write(
-                                    &raw const msg, (*cli).fds.add(fd as usize), &raw mut reply, badge);
-                            }
-                            FD_TYPE_MOUNT => {
-                                let fde = &mut *(*cli).fds.add(fd as usize);
-                                if !client::flags_allow_write(fde.flags) {
-                                    reply.label = SALTY_INVALID_OPERATION;
-                                } else {
+                    VFS_READ => {
+                        let fd = msg.regs[0] as i32;
+                        let cli = client::get_client(badge);
+                        if !cli.is_null()
+                            && fd >= 0
+                            && fd < (*cli).fds_cap as i32
+                            && (*(*cli).fds.add(fd as usize)).active != 0
+                        {
+                            match (*(*cli).fds.add(fd as usize)).fd_type {
+                                FD_TYPE_SOCKET => {
+                                    skip_reply = socket::handle_socket_read(
+                                        (*cli).fds.add(fd as usize),
+                                        &raw mut reply,
+                                        badge,
+                                    );
+                                }
+                                FD_TYPE_PIPE => {
+                                    skip_reply = pipe::handle_pipe_read(
+                                        &raw const msg,
+                                        (*cli).fds.add(fd as usize),
+                                        &raw mut reply,
+                                        badge,
+                                    );
+                                }
+                                FD_TYPE_DEVICE => {
+                                    if (*(*cli).fds.add(fd as usize)).dev_type == DEV_PTY_SLAVE {
+                                        skip_reply = misc::handle_pty_dev_read(
+                                            &raw const msg,
+                                            (*cli).fds.add(fd as usize),
+                                            &raw mut reply,
+                                            badge,
+                                        );
+                                    } else {
+                                        fileops::handle_read(&raw const msg, &raw mut reply, badge);
+                                    }
+                                }
+                                FD_TYPE_MOUNT => {
+                                    let fde = &mut *(*cli).fds.add(fd as usize);
                                     let mount_idx = fde.dev_type as usize;
                                     let remote_ino = fde.sock_id as u64;
                                     let count = msg.regs[1];
-                                    let mut offset = fde.offset;
-                                    if (fde.flags & O_APPEND) != 0 {
-                                        if let Some((sz, _, _, _, _)) =
-                                            mount::mount_stat(mount_idx, remote_ino) {
-                                            offset = sz;
-                                        }
-                                    }
-                                    if count > 136 && *(&raw const VFS_SHM_ACTIVE) {
-                                        // SHM bulk write path: copy data to SHM
-                                        // Clamp to source (MR2..MR19 = 144 bytes) and SHM size
-                                        let max_inline: u64 = 18 * 8;
-                                        let shm_limit: u64 = VFS_SALTYFS_SHM_PAGES * 4096;
-                                        let safe_count = count.min(max_inline).min(shm_limit);
-                                        let src = &msg.regs[2] as *const u64 as *const u8;
-                                        let dst = VFS_SALTYFS_SHM_VADDR as *mut u8;
-                                        for j in 0..safe_count as usize {
-                                            *dst.add(j) = *src.add(j);
-                                        }
-                                        mount::mount_write_shm(
-                                            mount_idx, remote_ino, offset, safe_count,
+                                    if *(&raw const VFS_SHM_ACTIVE) {
+                                        // SHM bulk read path
+                                        mount::mount_read_shm(
+                                            mount_idx, remote_ino, fde.offset, count,
                                             0, &raw mut reply,
                                         );
+                                        if reply.label == SALTY_OK {
+                                            let bytes_read = reply.regs[0];
+                                            let copy_len = bytes_read.min(152);
+                                            reply.length = 1 + (copy_len + 7) / 8;
+                                            let src = VFS_SALTYFS_SHM_VADDR as *const u8;
+                                            let dst = &raw mut reply.regs[1] as *mut u8;
+                                            for j in 0..copy_len as usize {
+                                                *dst.add(j) = *src.add(j);
+                                            }
+                                        }
                                     } else {
-                                        let capped = count.min(136);
-                                        let src = &msg.regs[2] as *const u64 as *const u8;
-                                        mount::mount_write_inline(
-                                            mount_idx, remote_ino, offset,
-                                            src, capped, &raw mut reply,
+                                        let capped = count.min(152);
+                                        mount::mount_read_inline(
+                                            mount_idx, remote_ino, fde.offset, capped,
+                                            &raw mut reply,
                                         );
                                     }
                                     if reply.label == SALTY_OK {
-                                        let written = reply.regs[0];
-                                        fde.offset = offset + written;
+                                        let bytes_read = reply.regs[0];
+                                        fde.offset += bytes_read;
                                     }
                                 }
-                            }
-                            _ => {
-                                fileops::handle_write(&raw const msg, &raw mut reply, badge);
-                            }
-                        }
-                    } else {
-                        fileops::handle_write(&raw const msg, &raw mut reply, badge);
-                    }
-                }
-                VFS_CLOSE => {
-                    let fd = msg.regs[0] as i32;
-                    let cli = client::get_client(badge);
-                    if !cli.is_null() && fd >= 0 && fd < (*cli).fds_cap as i32
-                        && (*(*cli).fds.add(fd as usize)).active != 0
-                    {
-                        match (*(*cli).fds.add(fd as usize)).fd_type {
-                            FD_TYPE_SOCKET => {
-                                socket::close_socket((*cli).fds.add(fd as usize));
-                            }
-                            FD_TYPE_PIPE => {
-                                pipe::close_pipe((*cli).fds.add(fd as usize));
-                            }
-                            FD_TYPE_EPOLL => {
-                                let ep_idx = (*(*cli).fds.add(fd as usize)).sock_id as usize;
-                                if ep_idx < max_epoll_instances() {
-                                    EPOLLS!()[ep_idx].active = 0;
+                                _ => {
+                                    fileops::handle_read(&raw const msg, &raw mut reply, badge);
                                 }
                             }
-                            _ => {}
+                        } else {
+                            fileops::handle_read(&raw const msg, &raw mut reply, badge);
                         }
                     }
-                    fileops::handle_close(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_STAT => { fileops::handle_stat(&raw const msg, &raw mut reply, badge); }
-                VFS_LSEEK => { fileops::handle_lseek(&raw const msg, &raw mut reply, badge); }
-                VFS_FSTAT => { fileops::handle_fstat(&raw const msg, &raw mut reply, badge); }
-                VFS_ACCESS => { fileops::handle_access(&raw const msg, &raw mut reply, badge); }
-                VFS_UNLINK => { fileops::handle_unlink(&raw const msg, &raw mut reply, badge); }
-                VFS_RENAME => { fileops::handle_rename(&raw const msg, &raw mut reply, badge); }
-                VFS_MKDIR => { fileops::handle_mkdir(&raw const msg, &raw mut reply, badge); }
-                VFS_RMDIR => { fileops::handle_rmdir(&raw const msg, &raw mut reply, badge); }
-                VFS_OPENDIR => { fileops::handle_opendir(&raw const msg, &raw mut reply, badge); }
-                VFS_READDIR => {
-                    let fd = msg.regs[0] as i32;
-                    let cli = client::get_client(badge);
-                    if !cli.is_null() && fd >= 0 && fd < (*cli).fds_cap as i32
-                        && (*(*cli).fds.add(fd as usize)).active != 0
-                        && (*(*cli).fds.add(fd as usize)).fd_type == FD_TYPE_MOUNT
-                    {
-                        let fde = &mut *(*cli).fds.add(fd as usize);
-                        let mount_idx = fde.dev_type as usize;
-                        let remote_ino = fde.sock_id as u64;
-                        mount::mount_readdir(mount_idx, fde as *mut FdEntry, remote_ino, &raw mut reply);
-                    } else {
-                        fileops::handle_readdir(&raw const msg, &raw mut reply, badge);
+                    VFS_WRITE => {
+                        let fd = msg.regs[0] as i32;
+                        let cli = client::get_client(badge);
+                        if !cli.is_null()
+                            && fd >= 0
+                            && fd < (*cli).fds_cap as i32
+                            && (*(*cli).fds.add(fd as usize)).active != 0
+                        {
+                            match (*(*cli).fds.add(fd as usize)).fd_type {
+                                FD_TYPE_SOCKET => {
+                                    skip_reply = socket::handle_socket_write(
+                                        &raw const msg,
+                                        (*cli).fds.add(fd as usize),
+                                        &raw mut reply,
+                                    );
+                                }
+                                FD_TYPE_PIPE => {
+                                    skip_reply = pipe::handle_pipe_write(
+                                        &raw const msg,
+                                        (*cli).fds.add(fd as usize),
+                                        &raw mut reply,
+                                        badge,
+                                    );
+                                }
+                                FD_TYPE_MOUNT => {
+                                    let fde = &mut *(*cli).fds.add(fd as usize);
+                                    if !client::flags_allow_write(fde.flags) {
+                                        reply.label = SALTY_INVALID_OPERATION;
+                                    } else {
+                                        let mount_idx = fde.dev_type as usize;
+                                        let remote_ino = fde.sock_id as u64;
+                                        let count = msg.regs[1];
+                                        let mut offset = fde.offset;
+                                        if (fde.flags & O_APPEND) != 0 {
+                                            if let Some((sz, _, _, _, _)) =
+                                                mount::mount_stat(mount_idx, remote_ino)
+                                            {
+                                                offset = sz;
+                                            }
+                                        }
+                                        if count > 136 && *(&raw const VFS_SHM_ACTIVE) {
+                                            // SHM bulk write path
+                                            let max_inline: u64 = 18 * 8;
+                                            let shm_limit: u64 = VFS_SALTYFS_SHM_PAGES * 4096;
+                                            let safe_count = count.min(max_inline).min(shm_limit);
+                                            let src = &msg.regs[2] as *const u64 as *const u8;
+                                            let dst = VFS_SALTYFS_SHM_VADDR as *mut u8;
+                                            for j in 0..safe_count as usize {
+                                                *dst.add(j) = *src.add(j);
+                                            }
+                                            mount::mount_write_shm(
+                                                mount_idx, remote_ino, offset, safe_count,
+                                                0, &raw mut reply,
+                                            );
+                                        } else {
+                                            let capped = count.min(136);
+                                            let src = &msg.regs[2] as *const u64 as *const u8;
+                                            mount::mount_write_inline(
+                                                mount_idx, remote_ino, offset,
+                                                src, capped, &raw mut reply,
+                                            );
+                                        }
+                                        if reply.label == SALTY_OK {
+                                            let written = reply.regs[0];
+                                            fde.offset = offset + written;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    fileops::handle_write(&raw const msg, &raw mut reply, badge);
+                                }
+                            }
+                        } else {
+                            fileops::handle_write(&raw const msg, &raw mut reply, badge);
+                        }
+                    }
+                    VFS_CLOSE => {
+                        let fd = msg.regs[0] as i32;
+                        let cli = client::get_client(badge);
+                        if !cli.is_null()
+                            && fd >= 0
+                            && fd < (*cli).fds_cap as i32
+                            && (*(*cli).fds.add(fd as usize)).active != 0
+                        {
+                            match (*(*cli).fds.add(fd as usize)).fd_type {
+                                FD_TYPE_SOCKET => {
+                                    socket::close_socket((*cli).fds.add(fd as usize));
+                                }
+                                FD_TYPE_PIPE => {
+                                    pipe::close_pipe((*cli).fds.add(fd as usize));
+                                }
+                                FD_TYPE_EPOLL => {
+                                    let ep_idx = (*(*cli).fds.add(fd as usize)).sock_id as usize;
+                                    if ep_idx < max_epoll_instances() {
+                                        EPOLLS!()[ep_idx].active = 0;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        fileops::handle_close(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_STAT => {
+                        fileops::handle_stat(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_LSEEK => {
+                        fileops::handle_lseek(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_FSTAT => {
+                        fileops::handle_fstat(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_ACCESS => {
+                        fileops::handle_access(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_UNLINK => {
+                        fileops::handle_unlink(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_RENAME => {
+                        fileops::handle_rename(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_MKDIR => {
+                        fileops::handle_mkdir(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_RMDIR => {
+                        fileops::handle_rmdir(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_OPENDIR => {
+                        fileops::handle_opendir(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_READDIR => {
+                        let fd = msg.regs[0] as i32;
+                        let cli = client::get_client(badge);
+                        if !cli.is_null()
+                            && fd >= 0
+                            && fd < (*cli).fds_cap as i32
+                            && (*(*cli).fds.add(fd as usize)).active != 0
+                            && (*(*cli).fds.add(fd as usize)).fd_type == FD_TYPE_MOUNT
+                        {
+                            let fde = &mut *(*cli).fds.add(fd as usize);
+                            let mount_idx = fde.dev_type as usize;
+                            let remote_ino = fde.sock_id as u64;
+                            mount::mount_readdir(
+                                mount_idx,
+                                fde as *mut FdEntry,
+                                remote_ino,
+                                &raw mut reply,
+                            );
+                        } else {
+                            fileops::handle_readdir(&raw const msg, &raw mut reply, badge);
+                        }
+                    }
+                    VFS_LSTAT => {
+                        at_ops::handle_lstat(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_POLL => {
+                        skip_reply = poll::handle_poll(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_SHM_OPEN => {
+                        skip_reply = misc::handle_shm_open(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_SHM_UNLINK => {
+                        skip_reply = misc::handle_shm_unlink(&raw const msg, &raw mut reply);
+                    }
+                    VFS_FTRUNCATE => {
+                        skip_reply = misc::handle_ftruncate(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_SOCKET => {
+                        skip_reply = socket::handle_socket(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_BIND => {
+                        skip_reply = socket::handle_bind(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_LISTEN => {
+                        skip_reply = socket::handle_listen(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_ACCEPT => {
+                        skip_reply = socket::handle_accept(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_CONNECT => {
+                        skip_reply = socket::handle_connect(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_SENDMSG => {
+                        skip_reply = socket::handle_sendmsg(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_RECVMSG => {
+                        skip_reply = socket::handle_recvmsg(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_SOCKPAIR => {
+                        skip_reply = socket::handle_sockpair(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_SHUTDOWN => {
+                        skip_reply = socket::handle_shutdown(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_PIPE => {
+                        pipe::handle_pipe(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_DUP => {
+                        pipe::handle_dup(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_DUP2 => {
+                        pipe::handle_dup2(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_CLONE_FDS => {
+                        pipe::handle_clone_fds(&raw const msg, &raw mut reply);
+                    }
+                    VFS_ISATTY => {
+                        misc::handle_isatty(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_IOCTL => {
+                        misc::handle_ioctl(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_FCNTL => {
+                        misc::handle_fcntl(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_CHDIR => {
+                        misc::handle_chdir(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_GETCWD => {
+                        misc::handle_getcwd(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_TCGETATTR => {
+                        misc::handle_tcgetattr(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_TCSETATTR => {
+                        misc::handle_tcsetattr(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_DUP3 => {
+                        pipe::handle_dup3(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_MKFIFO => {
+                        fileops::handle_mkfifo(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_EPOLL_CREATE => {
+                        poll::handle_epoll_create(&raw mut reply, badge);
+                    }
+                    VFS_EPOLL_CTL => {
+                        poll::handle_epoll_ctl(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_EPOLL_WAIT => {
+                        skip_reply = poll::handle_epoll_wait(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_MMAP => {
+                        misc::handle_mmap(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_MUNMAP => {
+                        misc::handle_munmap(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_OPENAT => {
+                        at_ops::handle_openat(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_FSTATAT => {
+                        at_ops::handle_fstatat(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_UNLINKAT => {
+                        at_ops::handle_unlinkat(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_RENAMEAT => {
+                        at_ops::handle_renameat(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_MKDIRAT => {
+                        at_ops::handle_mkdirat(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_FACCESSAT => {
+                        at_ops::handle_faccessat(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_FCHMODAT => {
+                        at_ops::handle_fchmodat(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_FCHOWNAT => {
+                        at_ops::handle_fchownat(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_LINKAT => {
+                        at_ops::handle_linkat(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_SYMLINKAT => {
+                        at_ops::handle_symlinkat(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_READLINKAT => {
+                        at_ops::handle_readlinkat(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_UTIMENSAT => {
+                        at_ops::handle_utimensat(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_FCHMOD => {
+                        at_ops::handle_fchmod(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_FCHOWN => {
+                        at_ops::handle_fchown(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_CLIENT_EXIT => {
+                        client::handle_client_exit(&raw const msg, &raw mut reply);
+                        skip_reply = true;
+                    }
+                    VFS_PREAD => {
+                        fileops::handle_pread(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_PWRITE => {
+                        fileops::handle_pwrite(&raw const msg, &raw mut reply, badge);
+                    }
+                    _ => {
+                        reply.label = SALTY_INVALID_OPERATION;
                     }
                 }
-                VFS_LSTAT => { at_ops::handle_lstat(&raw const msg, &raw mut reply, badge); }
-                VFS_POLL => {
-                    skip_reply = poll::handle_poll(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_SHM_OPEN => {
-                    skip_reply = misc::handle_shm_open(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_SHM_UNLINK => {
-                    skip_reply = misc::handle_shm_unlink(&raw const msg, &raw mut reply);
-                }
-                VFS_FTRUNCATE => {
-                    skip_reply = misc::handle_ftruncate(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_SOCKET => {
-                    skip_reply = socket::handle_socket(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_BIND => {
-                    skip_reply = socket::handle_bind(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_LISTEN => {
-                    skip_reply = socket::handle_listen(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_ACCEPT => {
-                    skip_reply = socket::handle_accept(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_CONNECT => {
-                    skip_reply = socket::handle_connect(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_SENDMSG => {
-                    skip_reply = socket::handle_sendmsg(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_RECVMSG => {
-                    skip_reply = socket::handle_recvmsg(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_SOCKPAIR => {
-                    skip_reply = socket::handle_sockpair(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_SHUTDOWN => {
-                    skip_reply = socket::handle_shutdown(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_PIPE => {
-                    pipe::handle_pipe(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_DUP => {
-                    pipe::handle_dup(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_DUP2 => {
-                    pipe::handle_dup2(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_CLONE_FDS => {
-                    pipe::handle_clone_fds(&raw const msg, &raw mut reply);
-                }
-                VFS_ISATTY => {
-                    misc::handle_isatty(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_IOCTL => {
-                    misc::handle_ioctl(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_FCNTL => {
-                    misc::handle_fcntl(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_CHDIR => {
-                    misc::handle_chdir(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_GETCWD => {
-                    misc::handle_getcwd(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_TCGETATTR => {
-                    misc::handle_tcgetattr(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_TCSETATTR => {
-                    misc::handle_tcsetattr(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_DUP3 => {
-                    pipe::handle_dup3(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_MKFIFO => {
-                    fileops::handle_mkfifo(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_EPOLL_CREATE => {
-                    poll::handle_epoll_create(&raw mut reply, badge);
-                }
-                VFS_EPOLL_CTL => {
-                    poll::handle_epoll_ctl(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_EPOLL_WAIT => {
-                    skip_reply = poll::handle_epoll_wait(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_MMAP => {
-                    misc::handle_mmap(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_MUNMAP => {
-                    misc::handle_munmap(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_OPENAT => {
-                    at_ops::handle_openat(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_FSTATAT => {
-                    at_ops::handle_fstatat(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_UNLINKAT => {
-                    at_ops::handle_unlinkat(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_RENAMEAT => {
-                    at_ops::handle_renameat(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_MKDIRAT => {
-                    at_ops::handle_mkdirat(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_FACCESSAT => {
-                    at_ops::handle_faccessat(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_FCHMODAT => {
-                    at_ops::handle_fchmodat(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_FCHOWNAT => {
-                    at_ops::handle_fchownat(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_LINKAT => {
-                    at_ops::handle_linkat(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_SYMLINKAT => {
-                    at_ops::handle_symlinkat(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_READLINKAT => {
-                    at_ops::handle_readlinkat(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_UTIMENSAT => {
-                    at_ops::handle_utimensat(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_FCHMOD => {
-                    at_ops::handle_fchmod(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_FCHOWN => {
-                    at_ops::handle_fchown(&raw const msg, &raw mut reply, badge);
-                }
-                VFS_CLIENT_EXIT => {
-                    client::handle_client_exit(&raw const msg, &raw mut reply);
-                    skip_reply = true;
-                }
-                _ => {
-                    reply.label = SALTY_INVALID_OPERATION;
-                }
             }
-        }
         }
 
         let err = if skip_reply {
             unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) }
         } else {
-            unsafe { ipc::reply_recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw const reply, &raw mut msg, &raw mut badge) }
+            unsafe {
+                ipc::reply_recv_ctx(
+                    ipc_ctx(),
+                    CAP_SERVER_EP,
+                    &raw const reply,
+                    &raw mut msg,
+                    &raw mut badge,
+                )
+            }
         };
         if err != 0 {
-            { let mut lb = LineBuf::new(); lb.str(b"[VFS] reply_recv failed err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
+            {
+                let mut lb = LineBuf::new();
+                lb.str(b"[VFS] reply_recv failed err=");
+                lb.hex(err as u64);
+                lb.str(b"\n");
+                lb.flush();
+            }
             break;
         }
     }

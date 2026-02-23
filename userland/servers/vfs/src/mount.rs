@@ -113,7 +113,10 @@ pub(crate) unsafe fn mount_lookup(mount_idx: usize, sub_path: *const u8, sub_pat
     }
 }
 
-pub(crate) unsafe fn mount_stat(mount_idx: usize, remote_ino: u64) -> Option<(u64, u32, u32, u64, bool)> {
+pub(crate) unsafe fn mount_stat(
+    mount_idx: usize,
+    remote_ino: u64,
+) -> Option<(u64, u32, u32, u64, bool)> {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
@@ -139,7 +142,10 @@ pub(crate) unsafe fn mount_stat(mount_idx: usize, remote_ino: u64) -> Option<(u6
 }
 
 pub(crate) unsafe fn mount_read_inline(
-    mount_idx: usize, remote_ino: u64, offset: u64, count: u64,
+    mount_idx: usize,
+    remote_ino: u64,
+    offset: u64,
+    count: u64,
     reply: *mut SaltyMsg,
 ) {
     unsafe {
@@ -176,8 +182,11 @@ pub(crate) unsafe fn mount_read_inline(
 }
 
 pub(crate) unsafe fn mount_create(
-    mount_idx: usize, parent_ino: u64,
-    name: *const u8, name_len: u8, mode: u32,
+    mount_idx: usize,
+    parent_ino: u64,
+    name: *const u8,
+    name_len: u8,
+    mode: u32,
 ) -> u64 {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
@@ -202,8 +211,12 @@ pub(crate) unsafe fn mount_create(
 }
 
 pub(crate) unsafe fn mount_write_inline(
-    mount_idx: usize, remote_ino: u64, offset: u64,
-    data: *const u8, count: u64, reply: *mut SaltyMsg,
+    mount_idx: usize,
+    remote_ino: u64,
+    offset: u64,
+    data: *const u8,
+    count: u64,
+    reply: *mut SaltyMsg,
 ) {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
@@ -231,8 +244,12 @@ pub(crate) unsafe fn mount_write_inline(
 }
 
 pub(crate) unsafe fn mount_mkdir(
-    mount_idx: usize, parent_ino: u64,
-    name: *const u8, name_len: u8, mode: u32, reply: *mut SaltyMsg,
+    mount_idx: usize,
+    parent_ino: u64,
+    name: *const u8,
+    name_len: u8,
+    mode: u32,
+    reply: *mut SaltyMsg,
 ) {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
@@ -254,8 +271,11 @@ pub(crate) unsafe fn mount_mkdir(
 }
 
 pub(crate) unsafe fn mount_unlink(
-    mount_idx: usize, parent_ino: u64,
-    name: *const u8, name_len: u8, reply: *mut SaltyMsg,
+    mount_idx: usize,
+    parent_ino: u64,
+    name: *const u8,
+    name_len: u8,
+    reply: *mut SaltyMsg,
 ) {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
@@ -276,8 +296,11 @@ pub(crate) unsafe fn mount_unlink(
 }
 
 pub(crate) unsafe fn mount_rmdir(
-    mount_idx: usize, parent_ino: u64,
-    name: *const u8, name_len: u8, reply: *mut SaltyMsg,
+    mount_idx: usize,
+    parent_ino: u64,
+    name: *const u8,
+    name_len: u8,
+    reply: *mut SaltyMsg,
 ) {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
@@ -299,8 +322,12 @@ pub(crate) unsafe fn mount_rmdir(
 
 pub(crate) unsafe fn mount_rename(
     mount_idx: usize,
-    old_parent_ino: u64, old_name: *const u8, old_name_len: u8,
-    new_parent_ino: u64, new_name: *const u8, new_name_len: u8,
+    old_parent_ino: u64,
+    old_name: *const u8,
+    old_name_len: u8,
+    new_parent_ino: u64,
+    new_name: *const u8,
+    new_name_len: u8,
     reply: *mut SaltyMsg,
 ) {
     unsafe {
@@ -333,7 +360,10 @@ pub(crate) unsafe fn mount_rename(
 }
 
 pub(crate) unsafe fn mount_truncate(
-    mount_idx: usize, remote_ino: u64, new_size: u64, reply: *mut SaltyMsg,
+    mount_idx: usize,
+    remote_ino: u64,
+    new_size: u64,
+    reply: *mut SaltyMsg,
 ) {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
@@ -419,7 +449,12 @@ pub(crate) fn split_mount_sub_path(
     if last_slash < 0 {
         (0, 0, 0, sub_len)
     } else {
-        (0, last_slash as u8, (last_slash + 1) as usize, sub_len - (last_slash as u8 + 1))
+        (
+            0,
+            last_slash as u8,
+            (last_slash + 1) as usize,
+            sub_len - (last_slash as u8 + 1),
+        )
     }
 }
 
@@ -457,7 +492,10 @@ pub(crate) unsafe fn mount_readdir_emit_cached(fde: *mut FdEntry, reply: *mut Sa
 }
 
 pub(crate) unsafe fn mount_readdir(
-    mount_idx: usize, fde: *mut FdEntry, dir_ino: u64, reply: *mut SaltyMsg,
+    mount_idx: usize,
+    fde: *mut FdEntry,
+    dir_ino: u64,
+    reply: *mut SaltyMsg,
 ) {
     unsafe {
         let fd = &mut *fde;
@@ -567,9 +605,7 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
             }
         };
 
-        ipc::set_receive_slot_ctx(
-            ipc_ctx(), CAP_SELF_CSPACE, fs_slot, 16,
-        );
+        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, fs_slot, 16);
 
         let mut ns_req = SaltyMsg::zeroed();
         ns_req.label = POSIX_NS_LOOKUP;
@@ -583,8 +619,10 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
 
         let mut ns_reply = SaltyMsg::zeroed();
         let err = ipc::call_ctx(
-            ipc_ctx(), VFS_CAP_NAMESERV_EP,
-            &raw const ns_req, &raw mut ns_reply,
+            ipc_ctx(),
+            VFS_CAP_NAMESERV_EP,
+            &raw const ns_req,
+            &raw mut ns_reply,
         );
 
         if err != 0 || ns_reply.label != SALTY_OK {

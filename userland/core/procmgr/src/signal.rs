@@ -5,14 +5,11 @@
 use salty::serial::LineBuf;
 use salty::types::*;
 
-use crate::proc_table::{
-    cleanup_proc_resources, find_by_badge, find_by_pid,
-    proctab, proctab_cap,
-    NSIG,
-    PROC_FREE, PROC_RUNNING, PROC_STOPPED, PROC_ZOMBIE,
-    SIG_DISP_CATCH, SIG_DISP_DFL, SIG_DISP_IGN,
-};
 use crate::exit_wait::free_proc_alloc_slots;
+use crate::proc_table::{
+    cleanup_proc_resources, find_by_badge, find_by_pid, proctab, proctab_cap, NSIG, PROC_FREE,
+    PROC_RUNNING, PROC_STOPPED, PROC_ZOMBIE, SIG_DISP_CATCH, SIG_DISP_DFL, SIG_DISP_IGN,
+};
 
 fn signal_ntfn(ntfn: Cap, bits: u64) {
     salty::syscall::syscall(salty::SYS_SIGNAL, ntfn, bits, 0, 0, 0, 0);
@@ -31,7 +28,10 @@ fn sig_default_is_terminate(sig: usize) -> bool {
 }
 
 fn sig_default_is_stop(sig: usize) -> bool {
-    matches!(sig, super::PM_SIGTSTP | super::PM_SIGTTIN | super::PM_SIGTTOU)
+    matches!(
+        sig,
+        super::PM_SIGTSTP | super::PM_SIGTTIN | super::PM_SIGTTOU
+    )
 }
 
 unsafe fn sig_stop_proc(idx: usize, sig: usize) {
@@ -60,9 +60,15 @@ unsafe fn sig_terminate_proc(idx: usize, sig: usize) {
     unsafe {
         let exit_code = (sig & 0x7f) as i32;
 
-        { let mut lb = LineBuf::new();
-        lb.str(b"[PROCMGR] SIGKILL/terminate PID="); lb.hex(proctab(idx).pid as u64);
-        lb.str(b" sig="); lb.hex(sig as u64); lb.str(b"\n"); lb.flush(); }
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] SIGKILL/terminate PID=");
+            lb.hex(proctab(idx).pid as u64);
+            lb.str(b" sig=");
+            lb.hex(sig as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
 
         salty::invoke::invoke(proctab(idx).tcb_cap, salty::TCB_SUSPEND, 0, 0, 0, 0);
         proctab(idx).state = PROC_ZOMBIE;
@@ -297,10 +303,16 @@ pub(crate) unsafe fn handle_inject_cap(msg: &SaltyMsg, reply: &mut SaltyMsg) {
         // Move it into the child slot so the scratch slot is freed for the
         // next injected cap in the same boot sequence.
         let err = salty::invoke::cnode_move(
-            child_cn, dst_slot,
-            super::CAP_SELF_CSPACE, super::CAP_RECV_SCRATCH,
+            child_cn,
+            dst_slot,
+            super::CAP_SELF_CSPACE,
+            super::CAP_RECV_SCRATCH,
         );
-        reply.label = if err == 0 { super::SALTY_OK } else { super::SALTY_INVALID_OPERATION };
+        reply.label = if err == 0 {
+            super::SALTY_OK
+        } else {
+            super::SALTY_INVALID_OPERATION
+        };
     }
 }
 

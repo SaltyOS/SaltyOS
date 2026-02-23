@@ -5,16 +5,14 @@ use salty::consts::*;
 use salty::ipc;
 use salty::types::*;
 
-use crate::consts::*;
-use crate::types::*;
 use crate::client::get_client;
-use crate::socket::{find_socket, sock_buf_len, sock_buf_free, alloc_reply_slot};
-use crate::pipe::{find_pipe, pipe_buf_len, pipe_buf_free};
+use crate::consts::*;
+use crate::pipe::{find_pipe, pipe_buf_free, pipe_buf_len};
+use crate::socket::{alloc_reply_slot, find_socket, sock_buf_free, sock_buf_len};
+use crate::types::*;
 use crate::{
-    ipc_ctx, max_poll_waiters, max_epoll_instances,
-    vfs_alloc_array, vfs_grow_pool,
-    POLL_WAITERS, POLL_WAITERS_PTR, POLL_WAITERS_CAP,
-    EPOLLS, EPOLLS_PTR, EPOLLS_CAP,
+    ipc_ctx, max_epoll_instances, max_poll_waiters, vfs_alloc_array, vfs_grow_pool, EPOLLS,
+    EPOLLS_CAP, EPOLLS_PTR, POLL_WAITERS, POLL_WAITERS_CAP, POLL_WAITERS_PTR,
 };
 
 /// Wake poll waiters that match a given fd for a given badge.
@@ -42,7 +40,11 @@ pub(crate) unsafe fn wake_poll_waiters(badge: u64, fd: i32, revents: u16) {
                 if ready_count > 0 {
                     wake_reply.regs[0] = ready_count;
                     wake_reply.length = 1 + POLL_WAITERS!()[i].nfds as u64;
-                    ipc::send_ctx(ipc_ctx(), POLL_WAITERS!()[i].reply_slot, &raw const wake_reply);
+                    ipc::send_ctx(
+                        ipc_ctx(),
+                        POLL_WAITERS!()[i].reply_slot,
+                        &raw const wake_reply,
+                    );
                     POLL_WAITERS!()[i].active = 0;
                 }
             } else {
@@ -54,7 +56,11 @@ pub(crate) unsafe fn wake_poll_waiters(badge: u64, fd: i32, revents: u16) {
                         wake_reply.regs[0] = 1;
                         wake_reply.regs[1 + j] = revents as u64;
                         wake_reply.length = 1 + POLL_WAITERS!()[i].nfds as u64;
-                        ipc::send_ctx(ipc_ctx(), POLL_WAITERS!()[i].reply_slot, &raw const wake_reply);
+                        ipc::send_ctx(
+                            ipc_ctx(),
+                            POLL_WAITERS!()[i].reply_slot,
+                            &raw const wake_reply,
+                        );
                         POLL_WAITERS!()[i].active = 0;
                         break;
                     }
@@ -76,8 +82,12 @@ pub(crate) unsafe fn check_fd_readiness(cli: *const ClientState, fd: i32, events
 
         match fde.fd_type {
             FD_TYPE_FILE | FD_TYPE_DIR => {
-                if events & 0x001 != 0 { rev |= 0x001; }
-                if events & 0x004 != 0 { rev |= 0x004; }
+                if events & 0x001 != 0 {
+                    rev |= 0x001;
+                }
+                if events & 0x004 != 0 {
+                    rev |= 0x004;
+                }
             }
             FD_TYPE_DEVICE => {
                 if fde.dev_type == DEV_PTY_SLAVE {
@@ -88,13 +98,18 @@ pub(crate) unsafe fn check_fd_readiness(cli: *const ClientState, fd: i32, events
                     treq.regs[0] = fde.sock_id as u64; // pty_id
                     treq.regs[1] = events as u64;
                     treq.length = 2;
-                    let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+                    let err =
+                        ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
                     if err == 0 && treply.label == SALTY_OK {
                         rev = treply.regs[0] as u32;
                     }
                 } else {
-                    if events & 0x004 != 0 { rev |= 0x004; }
-                    if events & 0x001 != 0 { rev |= 0x001; }
+                    if events & 0x004 != 0 {
+                        rev |= 0x004;
+                    }
+                    if events & 0x001 != 0 {
+                        rev |= 0x001;
+                    }
                 }
             }
             FD_TYPE_SOCKET => {
@@ -172,7 +187,8 @@ pub(crate) unsafe fn handle_epoll_create(reply: *mut SaltyMsg, badge: u64) {
                 &raw mut EPOLLS_PTR as *mut *mut u8,
                 &raw mut EPOLLS_CAP,
                 core::mem::size_of::<EpollInstance>(),
-            ) != 0 {
+            ) != 0
+            {
                 (*reply).label = SALTY_OUT_OF_MEMORY;
                 return;
             }
@@ -243,7 +259,9 @@ pub(crate) unsafe fn handle_epoll_ctl(msg: *const SaltyMsg, reply: *mut SaltyMsg
         let data = (*msg).regs[4];
 
         let cli = get_client(badge);
-        if cli.is_null() || epfd < 0 || epfd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || epfd < 0
+            || epfd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(epfd as usize)).active == 0
             || (*(*cli).fds.add(epfd as usize)).fd_type != FD_TYPE_EPOLL
         {
@@ -266,7 +284,8 @@ pub(crate) unsafe fn handle_epoll_ctl(msg: *const SaltyMsg, reply: *mut SaltyMsg
         let ep = &mut EPOLLS!()[ep_idx];
 
         match op {
-            1 => { // EPOLL_CTL_ADD
+            1 => {
+                // EPOLL_CTL_ADD
                 // Check not already present
                 for i in 0..(*ep).entries_cap as usize {
                     if (*ep.entries.add(i)).active != 0 && (*ep.entries.add(i)).fd == fd {
@@ -291,7 +310,8 @@ pub(crate) unsafe fn handle_epoll_ctl(msg: *const SaltyMsg, reply: *mut SaltyMsg
                 (*ep.entries.add(slot as usize)).events = events;
                 (*ep.entries.add(slot as usize)).data = data;
             }
-            2 => { // EPOLL_CTL_DEL
+            2 => {
+                // EPOLL_CTL_DEL
                 let mut found = false;
                 for i in 0..(*ep).entries_cap as usize {
                     if (*ep.entries.add(i)).active != 0 && (*ep.entries.add(i)).fd == fd {
@@ -305,7 +325,8 @@ pub(crate) unsafe fn handle_epoll_ctl(msg: *const SaltyMsg, reply: *mut SaltyMsg
                     return;
                 }
             }
-            3 => { // EPOLL_CTL_MOD
+            3 => {
+                // EPOLL_CTL_MOD
                 let mut found = false;
                 for i in 0..(*ep).entries_cap as usize {
                     if (*ep.entries.add(i)).active != 0 && (*ep.entries.add(i)).fd == fd {
@@ -331,14 +352,20 @@ pub(crate) unsafe fn handle_epoll_ctl(msg: *const SaltyMsg, reply: *mut SaltyMsg
     }
 }
 
-pub(crate) unsafe fn handle_epoll_wait(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) -> bool {
+pub(crate) unsafe fn handle_epoll_wait(
+    msg: *const SaltyMsg,
+    reply: *mut SaltyMsg,
+    badge: u64,
+) -> bool {
     unsafe {
         let epfd = (*msg).regs[0] as i32;
         let max_events = (*msg).regs[1] as usize;
         let timeout = (*msg).regs[2] as i32;
 
         let cli = get_client(badge);
-        if cli.is_null() || epfd < 0 || epfd >= (*cli).fds_cap as i32
+        if cli.is_null()
+            || epfd < 0
+            || epfd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(epfd as usize)).active == 0
             || (*(*cli).fds.add(epfd as usize)).fd_type != FD_TYPE_EPOLL
         {
@@ -440,7 +467,10 @@ pub(crate) unsafe fn handle_poll(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
             let pfd = (*msg).regs[2 + i * 2] as i32;
             let events = (*msg).regs[2 + i * 2 + 1] as u16;
 
-            if pfd < 0 || pfd >= (*cli).fds_cap as i32 || (*(*cli).fds.add(pfd as usize)).active == 0 {
+            if pfd < 0
+                || pfd >= (*cli).fds_cap as i32
+                || (*(*cli).fds.add(pfd as usize)).active == 0
+            {
                 revents_arr[i] = 0x020; // POLLNVAL
                 ready_count += 1;
                 continue;
@@ -452,22 +482,32 @@ pub(crate) unsafe fn handle_poll(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
             match fde.fd_type {
                 FD_TYPE_FILE | FD_TYPE_DIR => {
                     // Files/dirs always ready
-                    if events & 0x001 != 0 { rev |= 0x001; } // POLLIN
-                    if events & 0x004 != 0 { rev |= 0x004; } // POLLOUT
+                    if events & 0x001 != 0 {
+                        rev |= 0x001;
+                    } // POLLIN
+                    if events & 0x004 != 0 {
+                        rev |= 0x004;
+                    } // POLLOUT
                 }
                 FD_TYPE_DEVICE => {
-                    if events & 0x004 != 0 { rev |= 0x004; } // POLLOUT always
-                    if events & 0x001 != 0 { rev |= 0x001; } // POLLIN - assume ready for console
+                    if events & 0x004 != 0 {
+                        rev |= 0x004;
+                    } // POLLOUT always
+                    if events & 0x001 != 0 {
+                        rev |= 0x001;
+                    } // POLLIN - assume ready for console
                 }
                 FD_TYPE_SOCKET => {
                     let sock = find_socket(fde.sock_id);
                     if !sock.is_null() && (*sock).state == SOCK_CONNECTED {
-                        if events & 0x001 != 0 { // POLLIN
+                        if events & 0x001 != 0 {
+                            // POLLIN
                             if sock_buf_len(sock) > 0 || (*sock).peer_closed != 0 {
                                 rev |= 0x001;
                             }
                         }
-                        if events & 0x004 != 0 { // POLLOUT
+                        if events & 0x004 != 0 {
+                            // POLLOUT
                             let peer = find_socket((*sock).peer_sock_id);
                             if !peer.is_null() && sock_buf_free(peer) > 0 {
                                 rev |= 0x004;
@@ -513,7 +553,9 @@ pub(crate) unsafe fn handle_poll(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
             }
 
             revents_arr[i] = rev;
-            if rev != 0 { ready_count += 1; }
+            if rev != 0 {
+                ready_count += 1;
+            }
         }
 
         if ready_count > 0 || timeout == 0 {
@@ -556,7 +598,8 @@ pub(crate) unsafe fn handle_poll(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
                 &raw mut POLL_WAITERS_PTR as *mut *mut u8,
                 &raw mut POLL_WAITERS_CAP,
                 core::mem::size_of::<PollWaiter>(),
-            ) == 0 {
+            ) == 0
+            {
                 for i in 0..max_poll_waiters() {
                     if POLL_WAITERS!()[i].active == 0 {
                         POLL_WAITERS!()[i].active = 1;

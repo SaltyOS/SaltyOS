@@ -35,7 +35,7 @@ pub unsafe extern "C" fn ioctl(fd: i32, request: u64, mut args: ...) -> i32 {
 
     let ret = unsafe { salty::posix::posix_ioctl(fd, request, arg) };
     if ret < 0 {
-        errno::set_errno(errno::EINVAL);
+        errno::set_errno(-ret);
         return -1;
     }
     ret

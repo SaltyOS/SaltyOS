@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Path resolution with symlink following and mount point detection.
 
-use crate::consts::*;
-use crate::types::*;
-use crate::ramfs::{inode_by_ino, dir_find_entry};
 use crate::client::get_client;
+use crate::consts::*;
+use crate::ramfs::{dir_find_entry, inode_by_ino};
+use crate::types::*;
 
 /// Read the symlink target from an inode.
 /// For writable symlinks, target is in rw_data (symlink pool).
@@ -26,7 +26,10 @@ pub(crate) unsafe fn symlink_target(inode: *const RamfsInode) -> (*const u8, u8)
 /// `follow_final`: if true, follow symlink on the last component.
 /// `depth`: recursion depth for cycle detection (max 8).
 unsafe fn resolve_path_raw_inner(
-    path: *const u8, path_len: u8, follow_final: bool, depth: u8,
+    path: *const u8,
+    path_len: u8,
+    follow_final: bool,
+    depth: u8,
 ) -> *mut RamfsInode {
     unsafe {
         if path_len == 0 || depth > 8 {
@@ -49,9 +52,7 @@ unsafe fn resolve_path_raw_inner(
 
         let plen = path_len as usize;
         while pos < plen {
-            if (*current).ftype != FTYPE_DIRECTORY
-                && (*current).ftype != FTYPE_MOUNT_POINT
-            {
+            if (*current).ftype != FTYPE_DIRECTORY && (*current).ftype != FTYPE_MOUNT_POINT {
                 return core::ptr::null_mut();
             }
 
@@ -130,7 +131,10 @@ unsafe fn resolve_path_raw_inner(
                     combined[target_len as usize + 1 + i] = *path.add(pos + i);
                 }
                 return resolve_path_raw_inner(
-                    combined.as_ptr(), total as u8, follow_final, depth + 1,
+                    combined.as_ptr(),
+                    total as u8,
+                    follow_final,
+                    depth + 1,
                 );
             }
         }
@@ -262,7 +266,11 @@ pub(crate) unsafe fn resolve_parent(
 /// Resolve a path starting from a given inode (for *at() semantics).
 /// Absolute paths always start from ROOT_INO regardless of start_ino.
 /// Empty path returns the start inode itself (for AT_EMPTY_PATH).
-pub(crate) unsafe fn resolve_path_from(start_ino: u32, path: *const u8, path_len: u8) -> *mut RamfsInode {
+pub(crate) unsafe fn resolve_path_from(
+    start_ino: u32,
+    path: *const u8,
+    path_len: u8,
+) -> *mut RamfsInode {
     unsafe {
         if path_len == 0 {
             return inode_by_ino(start_ino);
@@ -282,9 +290,7 @@ pub(crate) unsafe fn resolve_path_from(start_ino: u32, path: *const u8, path_len
         let mut pos: usize = 0;
         let plen = path_len as usize;
         while pos < plen {
-            if (*current).ftype != FTYPE_DIRECTORY
-                && (*current).ftype != FTYPE_MOUNT_POINT
-            {
+            if (*current).ftype != FTYPE_DIRECTORY && (*current).ftype != FTYPE_MOUNT_POINT {
                 return core::ptr::null_mut();
             }
             if (*current).ftype == FTYPE_MOUNT_POINT {
@@ -391,7 +397,12 @@ pub(crate) unsafe fn resolve_parent_from(
 
 /// Determine the start inode for an *at() call given dirfd and path.
 /// Returns 0 on error.
-pub(crate) unsafe fn resolve_at_start(badge: u64, dirfd: i32, path: *const u8, path_len: u8) -> u32 {
+pub(crate) unsafe fn resolve_at_start(
+    badge: u64,
+    dirfd: i32,
+    path: *const u8,
+    path_len: u8,
+) -> u32 {
     unsafe {
         // Absolute path always starts from root
         if path_len > 0 && *path == b'/' {
@@ -423,7 +434,10 @@ pub(crate) unsafe fn resolve_at_start(badge: u64, dirfd: i32, path: *const u8, p
         if cli.is_null() {
             return 0;
         }
-        if dirfd < 0 || dirfd >= (*cli).fds_cap as i32 || (*(*cli).fds.add(dirfd as usize)).active == 0 {
+        if dirfd < 0
+            || dirfd >= (*cli).fds_cap as i32
+            || (*(*cli).fds.add(dirfd as usize)).active == 0
+        {
             return 0;
         }
         (*(*cli).fds.add(dirfd as usize)).inode

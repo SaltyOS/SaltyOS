@@ -5,8 +5,8 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use salty::types::Cap;
 use salty::serial::LineBuf;
+use salty::types::Cap;
 
 // ---- Pool layout ----
 /// Slots 0..255 are reserved for well-known caps (server EP, untypeds, etc.)
@@ -248,10 +248,7 @@ impl Allocator {
                 break;
             }
             let cap = mirror_start + i as u64;
-            self.ut_sources[self.ut_count] = UntypedSource {
-                cap,
-                active: true,
-            };
+            self.ut_sources[self.ut_count] = UntypedSource { cap, active: true };
             self.ut_count += 1;
         }
 
@@ -637,12 +634,9 @@ impl Allocator {
         }
 
         // Free bitmap slots
-        self.bitmap.free_contiguous(
-            self.reservation.pool_base,
-            self.reservation.slot_count,
-        );
+        self.bitmap
+            .free_contiguous(self.reservation.pool_base, self.reservation.slot_count);
 
         self.reservation = Reservation::empty();
     }
-
 }

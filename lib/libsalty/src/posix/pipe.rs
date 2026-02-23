@@ -27,8 +27,11 @@ pub unsafe fn posix_pipe2(fds: *mut i32, flags: i32) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         *fds = reply.regs[0] as i32;       // read fd
         *fds.add(1) = reply.regs[1] as i32; // write fd
@@ -51,8 +54,11 @@ pub unsafe fn posix_dup(oldfd: i32) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         reply.regs[0] as i32
     }
@@ -75,8 +81,11 @@ pub unsafe fn posix_dup2(oldfd: i32, newfd: i32) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         reply.regs[0] as i32
     }
@@ -100,20 +109,24 @@ pub unsafe fn posix_dup3(oldfd: i32, newfd: i32, flags: i32) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         reply.regs[0] as i32
     }
 }
 
 /// Create a named pipe (FIFO) at `path`. Returns 0 on success, -1 on error.
-pub unsafe fn posix_mkfifo(path: *const u8, _mode: u32) -> i32 {
+pub unsafe fn posix_mkfifo(path: *const u8, mode: u32) -> i32 {
     unsafe {
+        let mode = mode & !super::misc::get_umask();
         let mut msg = SaltyMsg::zeroed();
         let mut reply = SaltyMsg::zeroed();
         msg.label = POSIX_VFS_MKFIFO;
-        msg.regs[0] = 0; // reserved
+        msg.regs[0] = mode as u64;
         let path_len = pack_path(&raw mut msg, 1, path);
         msg.length = 2 + ((path_len as u64 + 7) / 8);
 
@@ -123,8 +136,11 @@ pub unsafe fn posix_mkfifo(path: *const u8, _mode: u32) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }

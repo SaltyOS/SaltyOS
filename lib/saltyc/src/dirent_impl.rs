@@ -108,7 +108,7 @@ pub unsafe extern "C" fn opendir(path: *const u8) -> *mut DIR {
     unsafe {
         let fd = salty::posix::posix_opendir(path);
         if fd < 0 {
-            errno::set_errno(errno::ENOENT);
+            errno::set_errno(-fd);
             return core::ptr::null_mut();
         }
 

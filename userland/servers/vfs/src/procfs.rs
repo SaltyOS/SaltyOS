@@ -5,11 +5,11 @@ use salty::consts::*;
 use salty::ipc;
 use salty::types::*;
 
-use crate::consts::*;
-use crate::types::*;
-use crate::ramfs::{inode_by_ino, alloc_inode, inode_open};
 use crate::client::{get_client, get_client_noalloc};
+use crate::consts::*;
 use crate::ipc_ctx;
+use crate::ramfs::{alloc_inode, inode_by_ino, inode_open};
+use crate::types::*;
 
 pub(crate) fn parse_pid(buf: &[u8]) -> (u32, bool) {
     if buf.is_empty() || buf.len() > 10 {
@@ -28,7 +28,9 @@ pub(crate) fn parse_pid(buf: &[u8]) -> (u32, bool) {
 /// Format u32 as decimal into buf. Returns number of bytes written.
 pub(crate) fn fmt_u32(mut v: u32, buf: &mut [u8]) -> usize {
     if v == 0 {
-        if !buf.is_empty() { buf[0] = b'0'; }
+        if !buf.is_empty() {
+            buf[0] = b'0';
+        }
         return 1;
     }
     let mut tmp = [0u8; 10];
@@ -49,7 +51,12 @@ pub(crate) fn fmt_u32(mut v: u32, buf: &mut [u8]) -> usize {
 /// Format u64 as hex into buf. Returns number of bytes written.
 pub(crate) fn fmt_u64_hex(mut v: u64, buf: &mut [u8]) -> usize {
     if v == 0 {
-        if buf.len() >= 3 { buf[0] = b'0'; buf[1] = b'x'; buf[2] = b'0'; return 3; }
+        if buf.len() >= 3 {
+            buf[0] = b'0';
+            buf[1] = b'x';
+            buf[2] = b'0';
+            return 3;
+        }
         return 0;
     }
     let mut tmp = [0u8; 16];
@@ -60,7 +67,9 @@ pub(crate) fn fmt_u64_hex(mut v: u64, buf: &mut [u8]) -> usize {
         v >>= 4;
         len += 1;
     }
-    if buf.len() < len + 2 { return 0; }
+    if buf.len() < len + 2 {
+        return 0;
+    }
     buf[0] = b'0';
     buf[1] = b'x';
     for i in 0..len {
@@ -76,7 +85,12 @@ unsafe fn proc_list_pids(pids: &mut [u32; 19]) -> usize {
         let mut reply = SaltyMsg::zeroed();
         msg.label = POSIX_PM_LIST_PIDS;
         msg.length = 0;
-        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_PROCMGR_EP, &raw const msg, &raw mut reply);
+        let err = ipc::call_ctx(
+            ipc_ctx(),
+            VFS_CAP_PROCMGR_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
         if err != 0 || reply.label != SALTY_OK {
             return 0;
         }
@@ -91,8 +105,12 @@ unsafe fn proc_list_pids(pids: &mut [u32; 19]) -> usize {
 
 /// Query procmgr for process info. Returns true on success.
 unsafe fn proc_get_info(
-    pid: u32, ppid: &mut u32, pgid: &mut u32, sid: &mut u32,
-    state: &mut u8, name: &mut [u8; 32],
+    pid: u32,
+    ppid: &mut u32,
+    pgid: &mut u32,
+    sid: &mut u32,
+    state: &mut u8,
+    name: &mut [u8; 32],
 ) -> bool {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -100,7 +118,12 @@ unsafe fn proc_get_info(
         msg.label = POSIX_PM_GET_PROC_INFO;
         msg.length = 1;
         msg.regs[0] = pid as u64;
-        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_PROCMGR_EP, &raw const msg, &raw mut reply);
+        let err = ipc::call_ctx(
+            ipc_ctx(),
+            VFS_CAP_PROCMGR_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
         if err != 0 || reply.label != SALTY_OK {
             return false;
         }
@@ -118,8 +141,11 @@ unsafe fn proc_get_info(
 
 /// Query mmsrv for client memory stats. Returns true on success.
 unsafe fn proc_get_mem_stats(
-    pid: u32, heap_base: &mut u64, heap_current: &mut u64,
-    region_count: &mut u64, total_pages: &mut u64,
+    pid: u32,
+    heap_base: &mut u64,
+    heap_current: &mut u64,
+    region_count: &mut u64,
+    total_pages: &mut u64,
 ) -> bool {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -153,52 +179,138 @@ unsafe fn proc_gen_status(pid: u32, buf: *mut u8, buf_size: usize) -> usize {
 
         // Find name length
         let mut name_len = 0usize;
-        while name_len < 32 && name[name_len] != 0 { name_len += 1; }
-        if name_len == 0 { name[0] = b'?'; name_len = 1; }
+        while name_len < 32 && name[name_len] != 0 {
+            name_len += 1;
+        }
+        if name_len == 0 {
+            name[0] = b'?';
+            name_len = 1;
+        }
 
         let mut pos = 0usize;
         let mut tmp = [0u8; 12];
 
         // "Name:\t<name>\n"
         let hdr = b"Name:\t";
-        for b in hdr { if pos < buf_size { *buf.add(pos) = *b; pos += 1; } }
-        for i in 0..name_len { if pos < buf_size { *buf.add(pos) = name[i]; pos += 1; } }
-        if pos < buf_size { *buf.add(pos) = b'\n'; pos += 1; }
+        for b in hdr {
+            if pos < buf_size {
+                *buf.add(pos) = *b;
+                pos += 1;
+            }
+        }
+        for i in 0..name_len {
+            if pos < buf_size {
+                *buf.add(pos) = name[i];
+                pos += 1;
+            }
+        }
+        if pos < buf_size {
+            *buf.add(pos) = b'\n';
+            pos += 1;
+        }
 
         // "State:\t<R/Z/T>\n"
         let hdr = b"State:\t";
-        for b in hdr { if pos < buf_size { *buf.add(pos) = *b; pos += 1; } }
-        let st_char = match state { 1 => b'R', 2 => b'Z', 3 => b'T', _ => b'?' };
-        if pos < buf_size { *buf.add(pos) = st_char; pos += 1; }
-        if pos < buf_size { *buf.add(pos) = b'\n'; pos += 1; }
+        for b in hdr {
+            if pos < buf_size {
+                *buf.add(pos) = *b;
+                pos += 1;
+            }
+        }
+        let st_char = match state {
+            1 => b'R',
+            2 => b'Z',
+            3 => b'T',
+            _ => b'?',
+        };
+        if pos < buf_size {
+            *buf.add(pos) = st_char;
+            pos += 1;
+        }
+        if pos < buf_size {
+            *buf.add(pos) = b'\n';
+            pos += 1;
+        }
 
         // "Pid:\t<pid>\n"
         let hdr = b"Pid:\t";
-        for b in hdr { if pos < buf_size { *buf.add(pos) = *b; pos += 1; } }
+        for b in hdr {
+            if pos < buf_size {
+                *buf.add(pos) = *b;
+                pos += 1;
+            }
+        }
         let n = fmt_u32(pid, &mut tmp);
-        for i in 0..n { if pos < buf_size { *buf.add(pos) = tmp[i]; pos += 1; } }
-        if pos < buf_size { *buf.add(pos) = b'\n'; pos += 1; }
+        for i in 0..n {
+            if pos < buf_size {
+                *buf.add(pos) = tmp[i];
+                pos += 1;
+            }
+        }
+        if pos < buf_size {
+            *buf.add(pos) = b'\n';
+            pos += 1;
+        }
 
         // "PPid:\t<ppid>\n"
         let hdr = b"PPid:\t";
-        for b in hdr { if pos < buf_size { *buf.add(pos) = *b; pos += 1; } }
+        for b in hdr {
+            if pos < buf_size {
+                *buf.add(pos) = *b;
+                pos += 1;
+            }
+        }
         let n = fmt_u32(ppid, &mut tmp);
-        for i in 0..n { if pos < buf_size { *buf.add(pos) = tmp[i]; pos += 1; } }
-        if pos < buf_size { *buf.add(pos) = b'\n'; pos += 1; }
+        for i in 0..n {
+            if pos < buf_size {
+                *buf.add(pos) = tmp[i];
+                pos += 1;
+            }
+        }
+        if pos < buf_size {
+            *buf.add(pos) = b'\n';
+            pos += 1;
+        }
 
         // "Pgid:\t<pgid>\n"
         let hdr = b"Pgid:\t";
-        for b in hdr { if pos < buf_size { *buf.add(pos) = *b; pos += 1; } }
+        for b in hdr {
+            if pos < buf_size {
+                *buf.add(pos) = *b;
+                pos += 1;
+            }
+        }
         let n = fmt_u32(pgid, &mut tmp);
-        for i in 0..n { if pos < buf_size { *buf.add(pos) = tmp[i]; pos += 1; } }
-        if pos < buf_size { *buf.add(pos) = b'\n'; pos += 1; }
+        for i in 0..n {
+            if pos < buf_size {
+                *buf.add(pos) = tmp[i];
+                pos += 1;
+            }
+        }
+        if pos < buf_size {
+            *buf.add(pos) = b'\n';
+            pos += 1;
+        }
 
         // "Sid:\t<sid>\n"
         let hdr = b"Sid:\t";
-        for b in hdr { if pos < buf_size { *buf.add(pos) = *b; pos += 1; } }
+        for b in hdr {
+            if pos < buf_size {
+                *buf.add(pos) = *b;
+                pos += 1;
+            }
+        }
         let n = fmt_u32(sid, &mut tmp);
-        for i in 0..n { if pos < buf_size { *buf.add(pos) = tmp[i]; pos += 1; } }
-        if pos < buf_size { *buf.add(pos) = b'\n'; pos += 1; }
+        for i in 0..n {
+            if pos < buf_size {
+                *buf.add(pos) = tmp[i];
+                pos += 1;
+            }
+        }
+        if pos < buf_size {
+            *buf.add(pos) = b'\n';
+            pos += 1;
+        }
 
         pos
     }
@@ -217,32 +329,94 @@ unsafe fn proc_gen_stat(pid: u32, buf: *mut u8, buf_size: usize) -> usize {
         }
 
         let mut name_len = 0usize;
-        while name_len < 32 && name[name_len] != 0 { name_len += 1; }
-        if name_len == 0 { name[0] = b'?'; name_len = 1; }
+        while name_len < 32 && name[name_len] != 0 {
+            name_len += 1;
+        }
+        if name_len == 0 {
+            name[0] = b'?';
+            name_len = 1;
+        }
 
         let mut pos = 0usize;
         let mut tmp = [0u8; 12];
 
         // "<pid> (<name>) <state> <ppid> <pgid> <sid>\n"
         let n = fmt_u32(pid, &mut tmp);
-        for i in 0..n { if pos < buf_size { *buf.add(pos) = tmp[i]; pos += 1; } }
-        if pos < buf_size { *buf.add(pos) = b' '; pos += 1; }
-        if pos < buf_size { *buf.add(pos) = b'('; pos += 1; }
-        for i in 0..name_len { if pos < buf_size { *buf.add(pos) = name[i]; pos += 1; } }
-        if pos < buf_size { *buf.add(pos) = b')'; pos += 1; }
-        if pos < buf_size { *buf.add(pos) = b' '; pos += 1; }
-        let st_char = match state { 1 => b'R', 2 => b'Z', 3 => b'T', _ => b'?' };
-        if pos < buf_size { *buf.add(pos) = st_char; pos += 1; }
-        if pos < buf_size { *buf.add(pos) = b' '; pos += 1; }
+        for i in 0..n {
+            if pos < buf_size {
+                *buf.add(pos) = tmp[i];
+                pos += 1;
+            }
+        }
+        if pos < buf_size {
+            *buf.add(pos) = b' ';
+            pos += 1;
+        }
+        if pos < buf_size {
+            *buf.add(pos) = b'(';
+            pos += 1;
+        }
+        for i in 0..name_len {
+            if pos < buf_size {
+                *buf.add(pos) = name[i];
+                pos += 1;
+            }
+        }
+        if pos < buf_size {
+            *buf.add(pos) = b')';
+            pos += 1;
+        }
+        if pos < buf_size {
+            *buf.add(pos) = b' ';
+            pos += 1;
+        }
+        let st_char = match state {
+            1 => b'R',
+            2 => b'Z',
+            3 => b'T',
+            _ => b'?',
+        };
+        if pos < buf_size {
+            *buf.add(pos) = st_char;
+            pos += 1;
+        }
+        if pos < buf_size {
+            *buf.add(pos) = b' ';
+            pos += 1;
+        }
         let n = fmt_u32(ppid, &mut tmp);
-        for i in 0..n { if pos < buf_size { *buf.add(pos) = tmp[i]; pos += 1; } }
-        if pos < buf_size { *buf.add(pos) = b' '; pos += 1; }
+        for i in 0..n {
+            if pos < buf_size {
+                *buf.add(pos) = tmp[i];
+                pos += 1;
+            }
+        }
+        if pos < buf_size {
+            *buf.add(pos) = b' ';
+            pos += 1;
+        }
         let n = fmt_u32(pgid, &mut tmp);
-        for i in 0..n { if pos < buf_size { *buf.add(pos) = tmp[i]; pos += 1; } }
-        if pos < buf_size { *buf.add(pos) = b' '; pos += 1; }
+        for i in 0..n {
+            if pos < buf_size {
+                *buf.add(pos) = tmp[i];
+                pos += 1;
+            }
+        }
+        if pos < buf_size {
+            *buf.add(pos) = b' ';
+            pos += 1;
+        }
         let n = fmt_u32(sid, &mut tmp);
-        for i in 0..n { if pos < buf_size { *buf.add(pos) = tmp[i]; pos += 1; } }
-        if pos < buf_size { *buf.add(pos) = b'\n'; pos += 1; }
+        for i in 0..n {
+            if pos < buf_size {
+                *buf.add(pos) = tmp[i];
+                pos += 1;
+            }
+        }
+        if pos < buf_size {
+            *buf.add(pos) = b'\n';
+            pos += 1;
+        }
 
         pos
     }
@@ -251,14 +425,21 @@ unsafe fn proc_gen_stat(pid: u32, buf: *mut u8, buf_size: usize) -> usize {
 /// Handle open for /proc paths. Creates temporary proc file inode.
 /// Returns true if handled (and reply is set), false if not a /proc path.
 pub(crate) unsafe fn handle_proc_open(
-    path: *const u8, path_len: u8, reply: *mut SaltyMsg, badge: u64,
+    path: *const u8,
+    path_len: u8,
+    reply: *mut SaltyMsg,
+    badge: u64,
 ) -> bool {
     unsafe {
         // Check if path starts with "/proc/"
-        if path_len < 6 { return false; }
+        if path_len < 6 {
+            return false;
+        }
         let proc_prefix = b"/proc/";
         for i in 0..6 {
-            if *path.add(i) != proc_prefix[i] { return false; }
+            if *path.add(i) != proc_prefix[i] {
+                return false;
+            }
         }
 
         let rest = path.add(6);
@@ -266,8 +447,10 @@ pub(crate) unsafe fn handle_proc_open(
 
         // Check for /proc/self -> resolve to client's PID
         let is_self_prefix = rest_len >= 4
-            && *rest == b's' && *rest.add(1) == b'e'
-            && *rest.add(2) == b'l' && *rest.add(3) == b'f';
+            && *rest == b's'
+            && *rest.add(1) == b'e'
+            && *rest.add(2) == b'l'
+            && *rest.add(3) == b'f';
 
         let (pid, file_offset) = if is_self_prefix && (rest_len == 4 || *rest.add(4) == b'/') {
             let cli = get_client_noalloc(badge);
@@ -291,7 +474,9 @@ pub(crate) unsafe fn handle_proc_open(
             }
             let mut pid_buf = [0u8; 10];
             for i in 0..pid_end as usize {
-                if i < 10 { pid_buf[i] = *rest.add(i); }
+                if i < 10 {
+                    pid_buf[i] = *rest.add(i);
+                }
             }
             let (pid, ok) = parse_pid(&pid_buf[..pid_end as usize]);
             if !ok {
@@ -303,7 +488,11 @@ pub(crate) unsafe fn handle_proc_open(
 
         // What file under /proc/<pid>/?
         let after_pid = rest.add(file_offset as usize);
-        let after_len = if file_offset < rest_len { rest_len - file_offset } else { 0 };
+        let after_len = if file_offset < rest_len {
+            rest_len - file_offset
+        } else {
+            0
+        };
 
         if after_len == 0 {
             // /proc/<pid> — the directory itself; open as dir
@@ -320,7 +509,11 @@ pub(crate) unsafe fn handle_proc_open(
             (*inode).size = pid as u64; // store PID in size field
 
             let cli = get_client(badge);
-            if cli.is_null() { (*reply).label = SALTY_OUT_OF_MEMORY; (*inode).active = 0; return true; }
+            if cli.is_null() {
+                (*reply).label = SALTY_OUT_OF_MEMORY;
+                (*inode).active = 0;
+                return true;
+            }
             for fd in 0..(*cli).fds_cap as usize {
                 if (*(*cli).fds.add(fd)).active == 0 {
                     (*(*cli).fds.add(fd)).active = 1;
@@ -373,7 +566,11 @@ pub(crate) unsafe fn handle_proc_open(
         (*inode).size = pid as u64; // store PID in size field
 
         let cli = get_client(badge);
-        if cli.is_null() { (*reply).label = SALTY_OUT_OF_MEMORY; (*inode).active = 0; return true; }
+        if cli.is_null() {
+            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*inode).active = 0;
+            return true;
+        }
         for fd in 0..(*cli).fds_cap as usize {
             if (*(*cli).fds.add(fd)).active == 0 {
                 (*(*cli).fds.add(fd)).active = 1;
@@ -399,7 +596,9 @@ pub(crate) unsafe fn handle_proc_open(
 pub(crate) fn mem_eq(a: *const u8, b: *const u8, len: usize) -> bool {
     for i in 0..len {
         unsafe {
-            if *a.add(i) != *b.add(i) { return false; }
+            if *a.add(i) != *b.add(i) {
+                return false;
+            }
         }
     }
     true
@@ -408,23 +607,34 @@ pub(crate) fn mem_eq(a: *const u8, b: *const u8, len: usize) -> bool {
 /// Handle stat/lstat for /proc virtual paths that don't resolve as real inodes.
 /// Returns true if the path was handled (even if error).
 pub(crate) unsafe fn handle_proc_stat(
-    path: *const u8, path_len: u8, reply: *mut SaltyMsg, badge: u64,
+    path: *const u8,
+    path_len: u8,
+    reply: *mut SaltyMsg,
+    badge: u64,
 ) -> bool {
     unsafe {
         // Path must start with "/proc/" (caller already checked)
-        if path_len < 6 { return false; }
+        if path_len < 6 {
+            return false;
+        }
 
         let rest = path.add(6);
         let rest_len = path_len - 6;
 
         // Parse "self" or numeric PID
         let is_self_prefix = rest_len >= 4
-            && *rest == b's' && *rest.add(1) == b'e'
-            && *rest.add(2) == b'l' && *rest.add(3) == b'f';
+            && *rest == b's'
+            && *rest.add(1) == b'e'
+            && *rest.add(2) == b'l'
+            && *rest.add(3) == b'f';
 
         let (pid, file_offset) = if is_self_prefix && (rest_len == 4 || *rest.add(4) == b'/') {
             let client_pid = (badge & 0xFFFF) as u32;
-            if rest_len == 4 { (client_pid, 4u8) } else { (client_pid, 5u8) }
+            if rest_len == 4 {
+                (client_pid, 4u8)
+            } else {
+                (client_pid, 5u8)
+            }
         } else {
             let mut pid_end = 0u8;
             while (pid_end as usize) < rest_len as usize && *rest.add(pid_end as usize) != b'/' {
@@ -439,7 +649,11 @@ pub(crate) unsafe fn handle_proc_stat(
         };
 
         let after_pid = rest.add(file_offset as usize);
-        let after_len = if file_offset < rest_len { rest_len - file_offset } else { 0 };
+        let after_len = if file_offset < rest_len {
+            rest_len - file_offset
+        } else {
+            0
+        };
 
         if after_len == 0 {
             // /proc/<pid> — directory
@@ -488,9 +702,7 @@ pub(crate) unsafe fn handle_proc_stat(
 
 /// Handle read for FTYPE_PROC_FILE inodes.
 /// Generates content on-the-fly from procmgr/mmsrv.
-pub(crate) unsafe fn handle_proc_read(
-    inode: *const RamfsInode, offset: u64, reply: *mut SaltyMsg,
-) {
+pub(crate) unsafe fn handle_proc_read(inode: *const RamfsInode, offset: u64, reply: *mut SaltyMsg) {
     unsafe {
         let pid = (*inode).size as u32;
         let proc_type = (*inode).dev_type;
@@ -506,32 +718,83 @@ pub(crate) unsafe fn handle_proc_read(
                 let mut heap_current: u64 = 0;
                 let mut region_count: u64 = 0;
                 let mut total_pages: u64 = 0;
-                if proc_get_mem_stats(pid, &mut heap_base, &mut heap_current,
-                    &mut region_count, &mut total_pages)
-                {
+                if proc_get_mem_stats(
+                    pid,
+                    &mut heap_base,
+                    &mut heap_current,
+                    &mut region_count,
+                    &mut total_pages,
+                ) {
                     let mut pos = 0usize;
                     let mut tmp = [0u8; 20];
                     // "heap: <base>-<current> <pages> pages\n"
                     let hdr = b"heap: ";
-                    for b in hdr { if pos < 512 { content[pos] = *b; pos += 1; } }
+                    for b in hdr {
+                        if pos < 512 {
+                            content[pos] = *b;
+                            pos += 1;
+                        }
+                    }
                     let n = fmt_u64_hex(heap_base, &mut tmp);
-                    for i in 0..n { if pos < 512 { content[pos] = tmp[i]; pos += 1; } }
-                    if pos < 512 { content[pos] = b'-'; pos += 1; }
+                    for i in 0..n {
+                        if pos < 512 {
+                            content[pos] = tmp[i];
+                            pos += 1;
+                        }
+                    }
+                    if pos < 512 {
+                        content[pos] = b'-';
+                        pos += 1;
+                    }
                     let n = fmt_u64_hex(heap_current, &mut tmp);
-                    for i in 0..n { if pos < 512 { content[pos] = tmp[i]; pos += 1; } }
-                    if pos < 512 { content[pos] = b'\n'; pos += 1; }
+                    for i in 0..n {
+                        if pos < 512 {
+                            content[pos] = tmp[i];
+                            pos += 1;
+                        }
+                    }
+                    if pos < 512 {
+                        content[pos] = b'\n';
+                        pos += 1;
+                    }
                     // "regions: <count>\n"
                     let hdr = b"regions: ";
-                    for b in hdr { if pos < 512 { content[pos] = *b; pos += 1; } }
+                    for b in hdr {
+                        if pos < 512 {
+                            content[pos] = *b;
+                            pos += 1;
+                        }
+                    }
                     let n = fmt_u32(region_count as u32, &mut tmp);
-                    for i in 0..n { if pos < 512 { content[pos] = tmp[i]; pos += 1; } }
-                    if pos < 512 { content[pos] = b'\n'; pos += 1; }
+                    for i in 0..n {
+                        if pos < 512 {
+                            content[pos] = tmp[i];
+                            pos += 1;
+                        }
+                    }
+                    if pos < 512 {
+                        content[pos] = b'\n';
+                        pos += 1;
+                    }
                     // "pages: <total>\n"
                     let hdr = b"pages: ";
-                    for b in hdr { if pos < 512 { content[pos] = *b; pos += 1; } }
+                    for b in hdr {
+                        if pos < 512 {
+                            content[pos] = *b;
+                            pos += 1;
+                        }
+                    }
                     let n = fmt_u32(total_pages as u32, &mut tmp);
-                    for i in 0..n { if pos < 512 { content[pos] = tmp[i]; pos += 1; } }
-                    if pos < 512 { content[pos] = b'\n'; pos += 1; }
+                    for i in 0..n {
+                        if pos < 512 {
+                            content[pos] = tmp[i];
+                            pos += 1;
+                        }
+                    }
+                    if pos < 512 {
+                        content[pos] = b'\n';
+                        pos += 1;
+                    }
                     pos
                 } else {
                     0
@@ -550,7 +813,11 @@ pub(crate) unsafe fn handle_proc_read(
 
         let available = content_len - offset as usize;
         let max_ipc = 152; // 19 regs * 8 bytes
-        let to_copy = if available < max_ipc { available } else { max_ipc };
+        let to_copy = if available < max_ipc {
+            available
+        } else {
+            max_ipc
+        };
 
         let dst = &mut (*reply).regs[1] as *mut u64 as *mut u8;
         for i in 0..to_copy {
@@ -564,7 +831,9 @@ pub(crate) unsafe fn handle_proc_read(
 
 /// Handle readdir for /proc root — returns PID entries.
 pub(crate) unsafe fn handle_proc_readdir(
-    inode: *const RamfsInode, cursor: u32, reply: *mut SaltyMsg,
+    inode: *const RamfsInode,
+    cursor: u32,
+    reply: *mut SaltyMsg,
 ) {
     unsafe {
         if (*inode).dev_type == PROC_FILE_ROOT {
@@ -581,7 +850,10 @@ pub(crate) unsafe fn handle_proc_readdir(
                 (*reply).regs[2] = 0; // ino
                 (*reply).regs[3] = 10; // DT_LNK
                 let dst = &mut (*reply).regs[4] as *mut u64 as *mut u8;
-                *dst = b's'; *dst.add(1) = b'e'; *dst.add(2) = b'l'; *dst.add(3) = b'f';
+                *dst = b's';
+                *dst.add(1) = b'e';
+                *dst.add(2) = b'l';
+                *dst.add(3) = b'f';
                 (*reply).length = 5;
                 return;
             }
@@ -605,7 +877,9 @@ pub(crate) unsafe fn handle_proc_readdir(
             (*reply).regs[2] = pids[idx] as u64; // ino = pid
             (*reply).regs[3] = 4; // DT_DIR
             let dst = &mut (*reply).regs[4] as *mut u64 as *mut u8;
-            for i in 0..name_len { *dst.add(i) = name_buf[i]; }
+            for i in 0..name_len {
+                *dst.add(i) = name_buf[i];
+            }
             (*reply).length = 5;
         } else if (*inode).dev_type == PROC_FILE_PID_DIR {
             // /proc/<pid> readdir: list status, stat, maps
@@ -624,7 +898,9 @@ pub(crate) unsafe fn handle_proc_readdir(
             (*reply).regs[2] = 0; // ino
             (*reply).regs[3] = 8; // DT_REG
             let dst = &mut (*reply).regs[4] as *mut u64 as *mut u8;
-            for i in 0..entry.len() { *dst.add(i) = entry[i]; }
+            for i in 0..entry.len() {
+                *dst.add(i) = entry[i];
+            }
             (*reply).length = 5;
         } else {
             (*reply).label = SALTY_NOT_FOUND;

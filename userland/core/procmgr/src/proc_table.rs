@@ -96,6 +96,8 @@ pub struct Process {
     pub respawn_binary: [u8; MAX_NAME_LEN],
     /// NUL-terminated process name (set at spawn/exec).
     pub name: [u8; 32],
+    /// File creation mask (default 0o022).
+    pub umask: u32,
 }
 
 impl Process {
@@ -133,6 +135,7 @@ impl Process {
             respawn: false,
             respawn_binary: [0; MAX_NAME_LEN],
             name: [0; 32],
+            umask: 0o022,
         }
     }
 }
@@ -159,7 +162,7 @@ pub unsafe fn init_proctab() {
         let ptr = salty::posix_mm::posix_mmap(
             core::ptr::null_mut(),
             (pages * 4096) as u64,
-            0x3, // PROT_READ | PROT_WRITE
+            0x3,  // PROT_READ | PROT_WRITE
             0x22, // MAP_PRIVATE | MAP_ANONYMOUS
             -1,
             0,
@@ -207,7 +210,7 @@ unsafe fn grow_proctab() -> bool {
         let new_raw = salty::posix_mm::posix_mmap(
             core::ptr::null_mut(),
             (new_pages * 4096) as u64,
-            0x3, // PROT_READ | PROT_WRITE
+            0x3,  // PROT_READ | PROT_WRITE
             0x22, // MAP_PRIVATE | MAP_ANONYMOUS
             -1,
             0,
@@ -368,6 +371,7 @@ pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
         for i in 0..NSIG {
             p.sig_disposition[i] = SIG_DISP_DFL;
         }
+        p.umask = 0o022;
         p.state = PROC_FREE;
     }
 }

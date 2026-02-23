@@ -7,11 +7,8 @@ use salty::serial::LineBuf;
 use salty::types::*;
 
 use crate::proc_table::{
-    alloc_proc, cleanup_proc_resources, find_by_badge, find_by_pid,
-    proctab, proctab_cap,
-    MAX_NAME_LEN,
-    PROC_FREE, PROC_RUNNING, PROC_STOPPED, PROC_ZOMBIE,
-    SIG_DISP_CATCH,
+    alloc_proc, cleanup_proc_resources, find_by_badge, find_by_pid, proctab, proctab_cap,
+    MAX_NAME_LEN, PROC_FREE, PROC_RUNNING, PROC_STOPPED, PROC_ZOMBIE, SIG_DISP_CATCH,
 };
 
 fn signal_ntfn(ntfn: Cap, bits: u64) {
@@ -116,14 +113,23 @@ pub(crate) unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
 
         let Some(idx) = find_by_badge(badge) else {
             let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] EXIT from unknown badge="); lb.hex(badge); lb.str(b"\n"); lb.flush();
+            lb.str(b"[PROCMGR] EXIT from unknown badge=");
+            lb.hex(badge);
+            lb.str(b"\n");
+            lb.flush();
             reply.label = super::SALTY_NOT_FOUND;
             return;
         };
 
-        { let mut lb = LineBuf::new();
-        lb.str(b"[PROCMGR] EXIT PID="); lb.hex(proctab(idx).pid as u64);
-        lb.str(b" code="); lb.hex(exit_code as u64); lb.str(b"\n"); lb.flush(); }
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] EXIT PID=");
+            lb.hex(proctab(idx).pid as u64);
+            lb.str(b" code=");
+            lb.hex(exit_code as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
 
         // Deregister from mmsrv if registered
         if proctab(idx).mmsrv_registered {
@@ -132,7 +138,12 @@ pub(crate) unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             mm_msg.label = salty::consts::MM_DEREGISTER;
             mm_msg.length = 1;
             mm_msg.regs[0] = badge;
-            let _ = ipc::call_ctx(super::ipc_ctx(), super::CAP_MMSRV_EP, &raw const mm_msg, &raw mut mm_reply);
+            let _ = ipc::call_ctx(
+                super::ipc_ctx(),
+                super::CAP_MMSRV_EP,
+                &raw const mm_msg,
+                &raw mut mm_reply,
+            );
         }
 
         // Ensure VFS tears down all per-client fd state/refcounts for this badge.
@@ -186,8 +197,13 @@ pub(crate) unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
 
         // Wake specific-child waiter
         if proctab(idx).waiter_reply != 0 {
-            { let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] Waking waiter for PID="); lb.hex(proctab(idx).pid as u64); lb.str(b"\n"); lb.flush(); }
+            {
+                let mut lb = LineBuf::new();
+                lb.str(b"[PROCMGR] Waking waiter for PID=");
+                lb.hex(proctab(idx).pid as u64);
+                lb.str(b"\n");
+                lb.flush();
+            }
 
             let mut wake = SaltyMsg::zeroed();
             wake.label = super::SALTY_OK;
@@ -213,9 +229,15 @@ pub(crate) unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         let mut reaped = false;
         if let Some(pi) = find_by_pid(ppid) {
             if proctab(pi).waiting_for_any != 0 {
-                { let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR] Waking any-waiter parent PID="); lb.hex(proctab(pi).pid as u64);
-                lb.str(b" for child PID="); lb.hex(proctab(idx).pid as u64); lb.str(b"\n"); lb.flush(); }
+                {
+                    let mut lb = LineBuf::new();
+                    lb.str(b"[PROCMGR] Waking any-waiter parent PID=");
+                    lb.hex(proctab(pi).pid as u64);
+                    lb.str(b" for child PID=");
+                    lb.hex(proctab(idx).pid as u64);
+                    lb.str(b"\n");
+                    lb.flush();
+                }
 
                 let mut wake = SaltyMsg::zeroed();
                 wake.label = super::SALTY_OK;
@@ -316,7 +338,10 @@ pub(crate) unsafe fn handle_wait(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             // Block
             let reply_slot = match (&mut *(&raw mut super::ALLOCATOR)).alloc_single_slot() {
                 Some(s) => s,
-                None => { reply.label = super::SALTY_OUT_OF_MEMORY; return false; }
+                None => {
+                    reply.label = super::SALTY_OUT_OF_MEMORY;
+                    return false;
+                }
             };
             let err = salty::invoke::cnode_save_caller(super::CAP_SELF_CSPACE, reply_slot);
             if err != 0 {
@@ -326,8 +351,13 @@ pub(crate) unsafe fn handle_wait(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             }
             proctab(caller_idx).any_waiter_reply = reply_slot;
             proctab(caller_idx).waiting_for_any = 1;
-            { let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] WAIT(-1) blocking parent PID="); lb.hex(caller_pid as u64); lb.str(b"\n"); lb.flush(); }
+            {
+                let mut lb = LineBuf::new();
+                lb.str(b"[PROCMGR] WAIT(-1) blocking parent PID=");
+                lb.hex(caller_pid as u64);
+                lb.str(b"\n");
+                lb.flush();
+            }
             return true;
         }
 
@@ -370,20 +400,31 @@ pub(crate) unsafe fn handle_wait(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         // Block
         let reply_slot = match (&mut *(&raw mut super::ALLOCATOR)).alloc_single_slot() {
             Some(s) => s,
-            None => { reply.label = super::SALTY_OUT_OF_MEMORY; return false; }
+            None => {
+                reply.label = super::SALTY_OUT_OF_MEMORY;
+                return false;
+            }
         };
         let err = salty::invoke::cnode_save_caller(super::CAP_SELF_CSPACE, reply_slot);
         if err != 0 {
             let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] save_caller failed for WAIT, err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
+            lb.str(b"[PROCMGR] save_caller failed for WAIT, err=");
+            lb.hex(err as u64);
+            lb.str(b"\n");
+            lb.flush();
             (&mut *(&raw mut super::ALLOCATOR)).free_single_slot(reply_slot);
             reply.label = super::SALTY_OUT_OF_MEMORY;
             return false;
         }
         proctab(ci).waiter_reply = reply_slot;
         proctab(ci).waiter_pid = caller_pid;
-        { let mut lb = LineBuf::new();
-        lb.str(b"[PROCMGR] WAIT blocking for PID="); lb.hex(child_pid as u64); lb.str(b"\n"); lb.flush(); }
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] WAIT blocking for PID=");
+            lb.hex(child_pid as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
         true
     }
 }

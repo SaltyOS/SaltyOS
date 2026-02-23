@@ -22,8 +22,11 @@ pub unsafe fn posix_socket(domain: i32, sock_type: i32) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         reply.regs[0] as i32
     }
@@ -46,8 +49,11 @@ pub unsafe fn posix_bind(fd: i32, path: *const u8) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -70,8 +76,11 @@ pub unsafe fn posix_listen(fd: i32, backlog: i32) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -93,8 +102,11 @@ pub unsafe fn posix_accept(fd: i32) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         reply.regs[0] as i32
     }
@@ -117,8 +129,11 @@ pub unsafe fn posix_connect(fd: i32, path: *const u8) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -141,8 +156,11 @@ pub unsafe fn posix_shutdown(fd: i32, how: i32) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         0
     }
@@ -163,8 +181,11 @@ pub unsafe fn posix_socketpair(fds: *mut i32) -> i32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label);
         }
         if !fds.is_null() {
             *fds = reply.regs[0] as i32;
@@ -214,8 +235,11 @@ pub unsafe fn posix_sendmsg(fd: i32, data: *const u8, data_len: u64, fds_to_send
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label) as i64;
         }
         reply.regs[0] as i64
     }
@@ -241,8 +265,11 @@ pub unsafe fn posix_recvmsg(fd: i32, data: *mut u8, data_len: u64, fds_out: *mut
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return -1;
+        if err != 0 {
+            return -5; // EIO
+        }
+        if reply.label != SALTY_OK {
+            return super::salty_err_to_posix(reply.label) as i64;
         }
 
         let actual_data = reply.regs[0];

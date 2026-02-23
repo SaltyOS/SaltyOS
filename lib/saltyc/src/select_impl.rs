@@ -107,7 +107,11 @@ pub unsafe extern "C" fn select(
 
         // Build PollFd array (max 128 for stack)
         const MAX_POLL: usize = 128;
-        let actual_count = if (count as usize) < MAX_POLL { count as usize } else { MAX_POLL };
+        let actual_count = if (count as usize) < MAX_POLL {
+            count as usize
+        } else {
+            MAX_POLL
+        };
         let mut poll_fds: [salty::PollFd; MAX_POLL] = core::mem::zeroed();
         let mut fd_map: [i32; MAX_POLL] = [0; MAX_POLL]; // map index -> original fd
         let mut pi = 0;
@@ -141,24 +145,30 @@ pub unsafe extern "C" fn select(
             -1 // infinite
         } else {
             let ms = (*timeout).tv_sec * 1000 + (*timeout).tv_usec / 1000;
-            if ms > i32::MAX as i64 { i32::MAX } else { ms as i32 }
+            if ms > i32::MAX as i64 {
+                i32::MAX
+            } else {
+                ms as i32
+            }
         };
 
-        let ret = salty::posix::posix_poll(
-            poll_fds.as_mut_ptr(),
-            pi as u32,
-            timeout_ms,
-        );
+        let ret = salty::posix::posix_poll(poll_fds.as_mut_ptr(), pi as u32, timeout_ms);
 
         if ret < 0 {
-            errno::set_errno(errno::EINVAL);
+            errno::set_errno(-ret);
             return -1;
         }
 
         // Clear the fd_sets and re-populate with results
-        if !readfds.is_null() { fd_zero(readfds); }
-        if !writefds.is_null() { fd_zero(writefds); }
-        if !exceptfds.is_null() { fd_zero(exceptfds); }
+        if !readfds.is_null() {
+            fd_zero(readfds);
+        }
+        if !writefds.is_null() {
+            fd_zero(writefds);
+        }
+        if !exceptfds.is_null() {
+            fd_zero(exceptfds);
+        }
 
         let mut ready = 0;
         for i in 0..pi {
@@ -166,19 +176,26 @@ pub unsafe extern "C" fn select(
             let rev = poll_fds[i].revents;
             let mut counted = false;
 
-            if !readfds.is_null()
-                && (rev & (salty::POLLIN | salty::POLLHUP | salty::POLLERR)) != 0
+            if !readfds.is_null() && (rev & (salty::POLLIN | salty::POLLHUP | salty::POLLERR)) != 0
             {
                 fd_set(fd, readfds);
-                if !counted { ready += 1; counted = true; }
+                if !counted {
+                    ready += 1;
+                    counted = true;
+                }
             }
             if !writefds.is_null() && (rev & salty::POLLOUT) != 0 {
                 fd_set(fd, writefds);
-                if !counted { ready += 1; counted = true; }
+                if !counted {
+                    ready += 1;
+                    counted = true;
+                }
             }
             if !exceptfds.is_null() && (rev & salty::POLLERR) != 0 {
                 fd_set(fd, exceptfds);
-                if !counted { ready += 1; }
+                if !counted {
+                    ready += 1;
+                }
             }
         }
 
@@ -189,7 +206,9 @@ pub unsafe extern "C" fn select(
 // C-callable FD_SET/FD_CLR/FD_ISSET/FD_ZERO functions
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __fd_set(fd: i32, set: *mut FdSet) {
-    unsafe { fd_set(fd, set); }
+    unsafe {
+        fd_set(fd, set);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -211,5 +230,7 @@ pub extern "C" fn __fd_isset(fd: i32, set: *const FdSet) -> i32 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __fd_zero(set: *mut FdSet) {
-    unsafe { fd_zero(set); }
+    unsafe {
+        fd_zero(set);
+    }
 }

@@ -22,7 +22,8 @@ const MAX_EXEC_ARGS: usize = 64;
 pub unsafe extern "C" fn fork() -> i32 {
     let ret = salty::posix::posix_fork();
     if ret < 0 {
-        errno::set_errno(errno::EAGAIN);
+        errno::set_errno(-ret);
+        return -1;
     }
     ret
 }
@@ -36,7 +37,8 @@ pub unsafe extern "C" fn execve(
     unsafe {
         let ret = salty::posix::posix_execve(path, argv, envp);
         if ret < 0 {
-            errno::set_errno(errno::ENOENT);
+            errno::set_errno(-ret);
+            return -1;
         }
         ret
     }
@@ -214,7 +216,8 @@ pub unsafe extern "C" fn waitpid(pid: i32, status: *mut i32, options: i32) -> i3
     unsafe {
         let ret = salty::posix::posix_waitpid3(pid, status, options);
         if ret < 0 {
-            errno::set_errno(errno::ECHILD);
+            errno::set_errno(-ret);
+            return -1;
         }
         ret
     }
@@ -231,12 +234,7 @@ pub unsafe extern "C" fn wait3(status: *mut i32, options: i32, _rusage: *mut u8)
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wait4(
-    pid: i32,
-    status: *mut i32,
-    options: i32,
-    _rusage: *mut u8,
-) -> i32 {
+pub unsafe extern "C" fn wait4(pid: i32, status: *mut i32, options: i32, _rusage: *mut u8) -> i32 {
     unsafe { waitpid(pid, status, options) }
 }
 
@@ -283,7 +281,8 @@ pub unsafe extern "C" fn kill(pid: i32, sig: i32) -> i32 {
     unsafe {
         let ret = salty::posix::posix_kill(pid, sig);
         if ret < 0 {
-            errno::set_errno(errno::ESRCH);
+            errno::set_errno(-ret);
+            return -1;
         }
         ret
     }

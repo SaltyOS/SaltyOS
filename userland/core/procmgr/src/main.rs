@@ -20,10 +20,7 @@ use salty::serial::LineBuf;
 use salty::types::*;
 
 use proc_table::{
-    find_by_badge, find_by_pid,
-    init_proctab, proctab, proctab_cap,
-    MAX_NAME_LEN,
-    PROC_FREE,
+    find_by_badge, find_by_pid, init_proctab, proctab, proctab_cap, MAX_NAME_LEN, PROC_FREE,
 };
 
 // ---- Cap layout (set by init for this process) ----
@@ -32,11 +29,11 @@ const CAP_SELF_VSPACE: Cap = 1;
 const CAP_SELF_CSPACE: Cap = 2;
 const CAP_SERVER_EP: Cap = 3;
 const CAP_UNTYPED: Cap = 7;
-const CAP_NAMESERV_EP: Cap = 64;   // NeedEP nameserv:64
-const CAP_VFS_EP: Cap = 65;        // NeedEP vfs:65
-const CAP_FB_UNTYPED: Cap = 66;    // CopyCap 13:66
+const CAP_NAMESERV_EP: Cap = 64; // NeedEP nameserv:64
+const CAP_VFS_EP: Cap = 65; // NeedEP vfs:65
+const CAP_FB_UNTYPED: Cap = 66; // CopyCap 13:66
 const CAP_INITRD_UNTYPED: Cap = 12;
-const CAP_RECV_SCRATCH: Cap = 15;  // Scratch slot for receiving transferred caps
+const CAP_RECV_SCRATCH: Cap = 15; // Scratch slot for receiving transferred caps
 const CAP_UNTYPED_START: Cap = 16;
 
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
@@ -72,6 +69,7 @@ const PM_INJECT_CAP: u64 = 26;
 const PM_LIST_PIDS: u64 = 27;
 const PM_GET_PROC_INFO: u64 = 28;
 const PM_RESUME: u64 = 29;
+const PM_UMASK: u64 = 30;
 const SALTY_PENDING: u64 = 0x80;
 
 const PM_SIGKILL: usize = 9;
@@ -176,8 +174,12 @@ fn read_boot_info_initrd_size() -> usize {
 // Helpers
 // ===========================================================================
 
-fn puts(s: &[u8]) { salty::serial::serial_puts(s); }
-fn ipc_ctx() -> *mut IpcContext { &raw mut salty::__salty_ipc_ctx }
+fn puts(s: &[u8]) {
+    salty::serial::serial_puts(s);
+}
+fn ipc_ctx() -> *mut IpcContext {
+    &raw mut salty::__salty_ipc_ctx
+}
 
 fn signal_ready() {
     let _ = salty::syscall::syscall(salty::SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
@@ -213,7 +215,9 @@ fn strip_elf_suffix(name: &mut [u8], mut len: usize) -> usize {
 fn extract_name(msg: &SaltyMsg, name_reg_idx: usize) -> ([u8; MAX_NAME_LEN + 5], usize) {
     let mut name = [0u8; MAX_NAME_LEN + 5];
     let mut name_len = msg.regs[0] as usize;
-    if name_len > MAX_NAME_LEN { name_len = MAX_NAME_LEN; }
+    if name_len > MAX_NAME_LEN {
+        name_len = MAX_NAME_LEN;
+    }
 
     for i in 0..name_len {
         unsafe {
@@ -235,7 +239,11 @@ unsafe fn wait_for_child_ready(
 ) -> i32 {
     let start_ns = {
         let now = salty::syscall::syscall(salty::SYS_CLOCK_GETTIME, 1, 0, 0, 0, 0, 0);
-        if now.error == 0 { Some(now.value) } else { None }
+        if now.error == 0 {
+            Some(now.value)
+        } else {
+            None
+        }
     };
     let mut yields: usize = 0;
 
@@ -264,7 +272,9 @@ unsafe fn wait_for_child_ready(
                 let np = salty::syscall::syscall(salty::SYS_POLL, bound_ntfn, 0, 0, 0, 0, 0);
                 if np.error == 0 && np.value != 0 {
                     let cs_bits = (np.value >> 16) & 0xFFFF;
-                    if cs_bits != 0 { cspace::handle_cspace_expand_ntfn(cs_bits); }
+                    if cs_bits != 0 {
+                        cspace::handle_cspace_expand_ntfn(cs_bits);
+                    }
                 }
             }
         }
@@ -367,6 +377,25 @@ unsafe fn handle_get_proc_info(msg: &SaltyMsg, reply: &mut SaltyMsg) {
 }
 
 // ===========================================================================
+// handle_umask
+// ===========================================================================
+
+unsafe fn handle_umask(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
+    let Some(idx) = find_by_badge(badge) else {
+        reply.label = SALTY_NOT_FOUND;
+        return;
+    };
+    unsafe {
+        let p = proctab(idx);
+        let old = p.umask;
+        p.umask = (msg.regs[0] as u32) & 0o777;
+        reply.label = SALTY_OK;
+        reply.length = 1;
+        reply.regs[0] = old as u64;
+    }
+}
+
+// ===========================================================================
 // Entry point
 // ===========================================================================
 
@@ -379,7 +408,10 @@ pub extern "C" fn _start() -> ! {
         let err = salty::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
         if err != 0 {
             let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] FAIL: set IPC buffer err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
+            lb.str(b"[PROCMGR] FAIL: set IPC buffer err=");
+            lb.hex(err as u64);
+            lb.str(b"\n");
+            lb.flush();
             idle();
         }
         salty::ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
@@ -446,11 +478,18 @@ pub extern "C" fn _start() -> ! {
             reg_msg.regs[0] = svc_name.len() as u64;
             reg_msg.length = 1 + (svc_name.len() as u64 + 7) / 8;
             let dst = &raw mut reg_msg.regs[1] as *mut u8;
-            for i in 0..svc_name.len() { *dst.add(i) = svc_name[i]; }
+            for i in 0..svc_name.len() {
+                *dst.add(i) = svc_name[i];
+            }
             reg_msg.regs[2] = 0;
             reg_msg.regs[3] = 0;
             ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
-            let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const reg_msg, &raw mut reg_reply);
+            let err = ipc::call_ctx(
+                ipc_ctx(),
+                CAP_NAMESERV_EP,
+                &raw const reg_msg,
+                &raw mut reg_reply,
+            );
             if err == 0 && reg_reply.label == SALTY_OK {
                 puts(b"[PROCMGR] registered with nameserv\n");
             } else {
@@ -493,58 +532,69 @@ pub extern "C" fn _start() -> ! {
             // Upper 16 bits: CSpace expansion.
             if msg.label == 0 && badge != 0 {
                 let cs_bits = (badge >> 16) & 0xFFFF;
-                if cs_bits != 0 { cspace::handle_cspace_expand_ntfn(cs_bits); }
+                if cs_bits != 0 {
+                    cspace::handle_cspace_expand_ntfn(cs_bits);
+                }
                 skip_reply = true;
             } else {
-
-            match msg.label {
-                PM_SPAWN => spawn_tx::handle_spawn_tx(&msg, &mut reply, badge, &mut *(&raw mut ALLOCATOR)),
-                PM_EXIT => {
-                    exit_wait::handle_exit(&msg, &mut reply, badge);
-                    skip_reply = true;
+                match msg.label {
+                    PM_SPAWN => spawn_tx::handle_spawn_tx(
+                        &msg,
+                        &mut reply,
+                        badge,
+                        &mut *(&raw mut ALLOCATOR),
+                    ),
+                    PM_EXIT => {
+                        exit_wait::handle_exit(&msg, &mut reply, badge);
+                        skip_reply = true;
+                    }
+                    PM_WAIT => {
+                        skip_reply = exit_wait::handle_wait(&msg, &mut reply, badge);
+                    }
+                    PM_GETPID => handle_getpid(&mut reply, badge),
+                    PM_FORK => fork_exec::handle_fork(&msg, &mut reply, badge),
+                    PM_EXEC => {
+                        fork_exec::handle_exec(&msg, &mut reply, badge);
+                        if reply.label == 0 {
+                            skip_reply = true;
+                        }
+                    }
+                    PM_GETPPID => handle_getppid(&mut reply, badge),
+                    PM_KILL => signal::handle_kill(&msg, &mut reply, badge),
+                    PM_KILL_PGID => signal::handle_kill_pgid(&msg, &mut reply),
+                    PM_INJECT_CAP => signal::handle_inject_cap(&msg, &mut reply),
+                    PM_RESUME => signal::handle_resume(&msg, &mut reply),
+                    PM_SIGACTION => signal::handle_sigaction(&msg, &mut reply, badge),
+                    PM_GETUID => session::handle_getuid(&mut reply, badge),
+                    PM_GETGID => session::handle_getgid(&mut reply, badge),
+                    PM_SETPGID => session::handle_setpgid(&msg, &mut reply, badge),
+                    PM_GETPGID => session::handle_getpgid(&msg, &mut reply, badge),
+                    PM_SETSID => session::handle_setsid(&mut reply, badge),
+                    PM_GETSID => session::handle_getsid(&msg, &mut reply, badge),
+                    PM_GETEUID => session::handle_geteuid(&mut reply, badge),
+                    PM_GETEGID => session::handle_getegid(&mut reply, badge),
+                    PM_GETGROUPS => session::handle_getgroups(&mut reply),
+                    PM_EXPAND_CSPACE => cspace::handle_expand_cspace(&msg, &mut reply, badge),
+                    PM_EXPAND_CSPACE_ASYNC => {
+                        cspace::handle_expand_cspace_async(&msg, badge);
+                        skip_reply = true;
+                    }
+                    PM_EXPAND_COLLECT => cspace::handle_expand_collect(&mut reply, badge),
+                    PM_REGISTER => cspace::handle_register(&msg, &mut reply, badge),
+                    PM_GETPGID_BADGE => session::handle_getpgid_badge(&msg, &mut reply),
+                    PM_GETSID_BADGE => session::handle_getsid_badge(&msg, &mut reply),
+                    PM_LIST_PIDS => handle_list_pids(&mut reply),
+                    PM_GET_PROC_INFO => handle_get_proc_info(&msg, &mut reply),
+                    PM_UMASK => handle_umask(&msg, &mut reply, badge),
+                    _ => {
+                        let mut lb = LineBuf::new();
+                        lb.str(b"[PROCMGR] unknown label=");
+                        lb.hex(msg.label);
+                        lb.str(b"\n");
+                        lb.flush();
+                        reply.label = SALTY_INVALID_OPERATION;
+                    }
                 }
-                PM_WAIT => {
-                    skip_reply = exit_wait::handle_wait(&msg, &mut reply, badge);
-                }
-                PM_GETPID => handle_getpid(&mut reply, badge),
-                PM_FORK => fork_exec::handle_fork(&msg, &mut reply, badge),
-                PM_EXEC => {
-                    fork_exec::handle_exec(&msg, &mut reply, badge);
-                    if reply.label == 0 { skip_reply = true; }
-                }
-                PM_GETPPID => handle_getppid(&mut reply, badge),
-                PM_KILL => signal::handle_kill(&msg, &mut reply, badge),
-                PM_KILL_PGID => signal::handle_kill_pgid(&msg, &mut reply),
-                PM_INJECT_CAP => signal::handle_inject_cap(&msg, &mut reply),
-                PM_RESUME => signal::handle_resume(&msg, &mut reply),
-                PM_SIGACTION => signal::handle_sigaction(&msg, &mut reply, badge),
-                PM_GETUID => session::handle_getuid(&mut reply, badge),
-                PM_GETGID => session::handle_getgid(&mut reply, badge),
-                PM_SETPGID => session::handle_setpgid(&msg, &mut reply, badge),
-                PM_GETPGID => session::handle_getpgid(&msg, &mut reply, badge),
-                PM_SETSID => session::handle_setsid(&mut reply, badge),
-                PM_GETSID => session::handle_getsid(&msg, &mut reply, badge),
-                PM_GETEUID => session::handle_geteuid(&mut reply, badge),
-                PM_GETEGID => session::handle_getegid(&mut reply, badge),
-                PM_GETGROUPS => session::handle_getgroups(&mut reply),
-                PM_EXPAND_CSPACE => cspace::handle_expand_cspace(&msg, &mut reply, badge),
-                PM_EXPAND_CSPACE_ASYNC => {
-                    cspace::handle_expand_cspace_async(&msg, badge);
-                    skip_reply = true;
-                }
-                PM_EXPAND_COLLECT => cspace::handle_expand_collect(&mut reply, badge),
-                PM_REGISTER => cspace::handle_register(&msg, &mut reply, badge),
-                PM_GETPGID_BADGE => session::handle_getpgid_badge(&msg, &mut reply),
-                PM_GETSID_BADGE => session::handle_getsid_badge(&msg, &mut reply),
-                PM_LIST_PIDS => handle_list_pids(&mut reply),
-                PM_GET_PROC_INFO => handle_get_proc_info(&msg, &mut reply),
-                _ => {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[PROCMGR] unknown label="); lb.hex(msg.label); lb.str(b"\n"); lb.flush();
-                    reply.label = SALTY_INVALID_OPERATION;
-                }
-            }
-
             } // end else (notification vs IPC dispatch)
 
             salty::invoke::cnode_delete(CAP_SELF_CSPACE, CAP_RECV_SCRATCH);
@@ -553,11 +603,20 @@ pub extern "C" fn _start() -> ! {
             let err = if skip_reply {
                 salty::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
             } else {
-                salty::ipc::reply_recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw const reply, &raw mut msg, &raw mut badge)
+                salty::ipc::reply_recv_ctx(
+                    ipc_ctx(),
+                    CAP_SERVER_EP,
+                    &raw const reply,
+                    &raw mut msg,
+                    &raw mut badge,
+                )
             };
             if err != 0 {
                 let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR] reply_recv failed err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush();
+                lb.str(b"[PROCMGR] reply_recv failed err=");
+                lb.hex(err as u64);
+                lb.str(b"\n");
+                lb.flush();
                 break;
             }
         }
@@ -567,5 +626,7 @@ pub extern "C" fn _start() -> ! {
 }
 
 fn idle() -> ! {
-    loop { salty::syscall::syscall(salty::SYS_YIELD, 0, 0, 0, 0, 0, 0); }
+    loop {
+        salty::syscall::syscall(salty::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+    }
 }
