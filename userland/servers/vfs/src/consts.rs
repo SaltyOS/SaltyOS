@@ -15,6 +15,9 @@ pub(crate) const VFS_CAP_FB_UNTYPED: u64 = 66; // CopyCap 13:66
 pub(crate) const VFS_CAP_PTY_NTFN: u64 = 68; // CopyCap 14:68 (PTY data-ready notification)
 pub(crate) const VFS_CAP_MMSRV_EP: u64 = 69; // NeedEP mmsrv:69
 pub(crate) const VFS_CAP_PROCMGR_EP: u64 = 70; // NeedEP procmgr:70
+pub(crate) const VFS_CAP_NETDRV_EP: u64 = 71; // NeedEP netdrv:71
+pub(crate) const VFS_CAP_NETDRV_CALLBACK_EP: u64 = 72; // badged copy of server EP for netdrv callbacks
+pub(crate) const NETDRV_CALLBACK_BADGE: u64 = 0x4E37D;
 pub(crate) const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 // VFS protocol labels
@@ -153,6 +156,7 @@ pub(crate) const FD_TYPE_SHM: u8 = 5;
 pub(crate) const FD_TYPE_PIPE: u8 = 7;
 pub(crate) const FD_TYPE_EPOLL: u8 = 8;
 pub(crate) const FD_TYPE_MOUNT: u8 = 9;
+pub(crate) const FD_TYPE_INET_SOCKET: u8 = 10;
 
 // Socket states
 pub(crate) const SOCK_UNBOUND: u8 = 0;

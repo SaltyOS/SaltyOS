@@ -3,7 +3,8 @@
 //!
 //! Discovers a virtio-net PCI device via pcisrv, initializes the virtio
 //! transport (legacy PCI), sets up IRQ handling, and serves as the network
-//! driver. Responds to ARP and ICMP (ping) automatically.
+//! driver. Implements TCP/UDP over IPv4 and exposes a NET_* IPC interface
+//! for VFS to forward POSIX socket operations.
 //!
 //! Cap layout:
 //!   0  = self TCB
@@ -17,18 +18,19 @@
 //!   80 = received BAR cap (IoPort or device untyped) from pcisrv
 //!   81 = IRQ handler cap (received from pcisrv via PCI_GET_CAPS extra cap #1)
 //!   82 = IRQ notification (retyped from untyped)
+//!   83 = VFS callback endpoint (received from VFS via NET_REGISTER_VFS)
 
 #![no_std]
 #![no_main]
 
 extern crate salty;
 
-mod virtio;
 mod net;
+mod virtio;
 
 use salty::consts::*;
-use salty::ipc;
 use salty::invoke;
+use salty::ipc;
 use salty::serial;
 use salty::serial::LineBuf;
 use salty::types::*;
@@ -41,8 +43,10 @@ const CAP_NAMESERV_EP: u64 = 5;
 const CAP_MMSRV_EP: u64 = 7;
 const CAP_IRQ_HANDLER: u64 = 81;
 const CAP_IRQ_NOTIFICATION: u64 = 82;
+const CAP_VFS_CALLBACK_EP: u64 = 83;
 
 static mut IRQ_ENABLED: bool = false;
+static mut VFS_REGISTERED: bool = false;
 
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
@@ -112,11 +116,22 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
     msg.length = 2;
     let mut alloc_reply = SaltyMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_MMSRV_EP, &raw const msg, &raw mut alloc_reply) };
+    let err = unsafe {
+        ipc::call_ctx(
+            ipc_ctx(),
+            CAP_MMSRV_EP,
+            &raw const msg,
+            &raw mut alloc_reply,
+        )
+    };
     if err != 0 || alloc_reply.label != SALTY_OK {
         let mut lb = LineBuf::new();
         lb.str(b"[netdrv] Failed to allocate Notification via mmsrv: ");
-        lb.dec(if err != 0 { err as u64 } else { alloc_reply.label });
+        lb.dec(if err != 0 {
+            err as u64
+        } else {
+            alloc_reply.label
+        });
         lb.putc(b'\n');
         lb.flush();
         return false;
@@ -148,7 +163,9 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
     let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
 
     // SAFETY: Single-threaded init path; written once before event loop.
-    unsafe { *(&raw mut IRQ_ENABLED) = true; }
+    unsafe {
+        *(&raw mut IRQ_ENABLED) = true;
+    }
 
     {
         let mut lb = LineBuf::new();
@@ -193,8 +210,17 @@ fn process_packet(data: &[u8]) {
             }
             net::ethernet::ETHERTYPE_IPV4 => {
                 if let Some((ip_hdr, ip_payload)) = net::ipv4::parse(payload) {
-                    if ip_hdr.protocol == net::ipv4::PROTO_ICMP {
-                        net::icmp::handle(&mac_addr(), net::ipv4::OUR_IP, &ip_hdr, ip_payload);
+                    match ip_hdr.protocol {
+                        net::ipv4::PROTO_ICMP => {
+                            net::icmp::handle(&mac_addr(), net::ipv4::OUR_IP, &ip_hdr, ip_payload);
+                        }
+                        net::ipv4::PROTO_TCP => {
+                            net::tcp::handle_segment(&ip_hdr, ip_payload);
+                        }
+                        net::ipv4::PROTO_UDP => {
+                            net::udp::handle_datagram(&ip_hdr, ip_payload);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -250,7 +276,382 @@ fn self_test_ping() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// IPC dispatch — handles all NET_* labels from VFS
+// ---------------------------------------------------------------------------
+
+/// Dispatch a single IPC request from VFS (or any client).
+///
+/// All operations return immediately: synchronous operations fill `reply`
+/// with the result; asynchronous operations (connect, recv, accept) return
+/// `SALTY_PENDING` and the TCP/UDP state machine will push a completion
+/// later (delivered to VFS via the callback endpoint).
+fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) {
+    match msg.label {
+        NET_REGISTER_VFS => {
+            // VFS registers its badged callback EP as an extra cap.
+            // The cap was placed in our receive slot (CAP_VFS_CALLBACK_EP)
+            // by the kernel during the IPC.
+            // SAFETY: Single-threaded; written once.
+            unsafe {
+                *(&raw mut VFS_REGISTERED) = true;
+            }
+            puts(b"[netdrv] VFS callback EP registered\n");
+            reply.label = SALTY_OK;
+        }
+        NET_SOCKET => {
+            let sock_type = msg.regs[0] as i32;
+            let id = if sock_type == SOCK_STREAM {
+                net::tcp::tcp_socket()
+            } else if sock_type == SOCK_DGRAM {
+                net::udp::udp_socket()
+            } else {
+                -1
+            };
+            if id >= 0 {
+                reply.label = SALTY_OK;
+                reply.regs[0] = id as u64;
+                reply.length = 1;
+            } else {
+                reply.label = SALTY_OUT_OF_MEMORY;
+            }
+        }
+        NET_CONNECT => {
+            let conn_id = msg.regs[0] as u32;
+            let ip = msg.regs[1] as u32;
+            let port = msg.regs[2] as u16;
+            if conn_id >= 1000 {
+                // UDP connect: store default destination, always immediate
+                let result = net::udp::udp_connect(conn_id, ip, port);
+                reply.label = if result == 0 {
+                    SALTY_OK
+                } else {
+                    SALTY_INVALID_ARGUMENT
+                };
+            } else {
+                // TCP connect: sends SYN, returns -1 (pending)
+                let result = net::tcp::tcp_connect(conn_id, ip, port);
+                if result == -1 {
+                    reply.label = SALTY_PENDING;
+                } else {
+                    reply.label = SALTY_INVALID_ARGUMENT;
+                }
+            }
+        }
+        NET_BIND => {
+            let conn_id = msg.regs[0] as u32;
+            let ip = msg.regs[1] as u32;
+            let port = msg.regs[2] as u16;
+            let result = if conn_id >= 1000 {
+                net::udp::udp_bind(conn_id, ip, port)
+            } else {
+                net::tcp::tcp_bind(conn_id, ip, port)
+            };
+            reply.label = if result == 0 {
+                SALTY_OK
+            } else {
+                SALTY_INVALID_ARGUMENT
+            };
+        }
+        NET_LISTEN => {
+            let conn_id = msg.regs[0] as u32;
+            let backlog = msg.regs[1] as u8;
+            let result = net::tcp::tcp_listen(conn_id, backlog);
+            reply.label = if result == 0 {
+                SALTY_OK
+            } else {
+                SALTY_INVALID_ARGUMENT
+            };
+        }
+        NET_ACCEPT => {
+            let conn_id = msg.regs[0] as u32;
+            let result = net::tcp::tcp_accept(conn_id);
+            if result == -1 {
+                // No pending connections — tell VFS this is async
+                net::tcp::set_pending_accept(conn_id);
+                reply.label = SALTY_PENDING;
+            } else if result > 0 {
+                // Connection already in backlog, completed immediately
+                let new_cid = result as u32;
+                let (ip, port) = net::tcp::tcp_getpeername(new_cid);
+                reply.label = SALTY_OK;
+                reply.regs[0] = new_cid as u64;
+                reply.regs[1] = ip as u64;
+                reply.regs[2] = port as u64;
+                reply.length = 3;
+            } else {
+                reply.label = SALTY_INVALID_ARGUMENT;
+            }
+        }
+        NET_SEND => {
+            let conn_id = msg.regs[0] as u32;
+            let len = msg.regs[1] as usize;
+            let actual_len = core::cmp::min(len, 144);
+            // SAFETY: Reading data bytes from IPC message register area.
+            let data = unsafe {
+                let data_ptr = &msg.regs[2] as *const u64 as *const u8;
+                core::slice::from_raw_parts(data_ptr, actual_len)
+            };
+            let sent = if conn_id >= 1000 {
+                net::udp::udp_send(conn_id, data)
+            } else {
+                net::tcp::tcp_send(conn_id, data)
+            };
+            reply.label = SALTY_OK;
+            reply.regs[0] = if sent >= 0 { sent as u64 } else { 0 };
+            reply.length = 1;
+        }
+        NET_RECV => {
+            let conn_id = msg.regs[0] as u32;
+            let max_len = msg.regs[1] as u16;
+            let capped = core::cmp::min(max_len, 152) as usize;
+            // SAFETY: Writing data into reply register area.
+            let buf = unsafe {
+                let dst = &raw mut reply.regs[1] as *mut u8;
+                core::slice::from_raw_parts_mut(dst, capped)
+            };
+            let result = if conn_id >= 1000 {
+                net::udp::udp_recv(conn_id, buf)
+            } else {
+                net::tcp::tcp_recv(conn_id, buf)
+            };
+            if result == -1 {
+                // No data available — tell VFS this is async
+                if conn_id >= 1000 {
+                    net::udp::set_pending_recv(conn_id, capped as u16);
+                } else {
+                    net::tcp::set_pending_recv(conn_id, capped as u16);
+                }
+                reply.label = SALTY_PENDING;
+            } else {
+                reply.label = SALTY_OK;
+                reply.regs[0] = result as u64;
+                reply.length = 1 + ((result as u64 + 7) / 8);
+            }
+        }
+        NET_SENDTO => {
+            let conn_id = msg.regs[0] as u32;
+            let ip = msg.regs[1] as u32;
+            let port = msg.regs[2] as u16;
+            let len = msg.regs[3] as usize;
+            let actual = core::cmp::min(len, 128);
+            // SAFETY: Reading data bytes from IPC message register area.
+            let data = unsafe {
+                let data_ptr = &msg.regs[4] as *const u64 as *const u8;
+                core::slice::from_raw_parts(data_ptr, actual)
+            };
+            let sent = net::udp::udp_sendto(conn_id, data, ip, port);
+            reply.label = SALTY_OK;
+            reply.regs[0] = if sent >= 0 { sent as u64 } else { 0 };
+            reply.length = 1;
+        }
+        NET_RECVFROM => {
+            let conn_id = msg.regs[0] as u32;
+            let max_len = msg.regs[1] as u16;
+            let capped = core::cmp::min(max_len, 136) as usize;
+            // SAFETY: Writing data into reply register area.
+            let buf = unsafe {
+                let dst = &raw mut reply.regs[3] as *mut u8;
+                core::slice::from_raw_parts_mut(dst, capped)
+            };
+            let (result, src_ip, src_port) = net::udp::udp_recvfrom(conn_id, buf);
+            if result == -1 {
+                net::udp::set_pending_recv(conn_id, capped as u16);
+                reply.label = SALTY_PENDING;
+            } else {
+                reply.label = SALTY_OK;
+                reply.regs[0] = result as u64;
+                reply.regs[1] = src_ip as u64;
+                reply.regs[2] = src_port as u64;
+                reply.length = 3 + ((result as u64 + 7) / 8);
+            }
+        }
+        NET_CLOSE => {
+            let conn_id = msg.regs[0] as u32;
+            if conn_id >= 1000 {
+                net::udp::udp_close(conn_id);
+            } else {
+                net::tcp::tcp_close(conn_id);
+            }
+            reply.label = SALTY_OK;
+        }
+        NET_SHUTDOWN => {
+            let conn_id = msg.regs[0] as u32;
+            let how = msg.regs[1] as i32;
+            net::tcp::tcp_shutdown(conn_id, how);
+            reply.label = SALTY_OK;
+        }
+        NET_GETSOCKNAME => {
+            let conn_id = msg.regs[0] as u32;
+            let (ip, port) = if conn_id >= 1000 {
+                net::udp::udp_getsockname(conn_id)
+            } else {
+                net::tcp::tcp_getsockname(conn_id)
+            };
+            reply.label = SALTY_OK;
+            reply.regs[0] = ip as u64;
+            reply.regs[1] = port as u64;
+            reply.length = 2;
+        }
+        NET_GETPEERNAME => {
+            let conn_id = msg.regs[0] as u32;
+            let (ip, port) = if conn_id >= 1000 {
+                net::udp::udp_getpeername(conn_id)
+            } else {
+                net::tcp::tcp_getpeername(conn_id)
+            };
+            reply.label = SALTY_OK;
+            reply.regs[0] = ip as u64;
+            reply.regs[1] = port as u64;
+            reply.length = 2;
+        }
+        _ => {
+            reply.label = SALTY_INVALID_OPERATION;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async completion delivery to VFS
+// ---------------------------------------------------------------------------
+
+/// Notify VFS that an async operation has completed by calling its badged
+/// callback endpoint. VFS sees this as a NET_COMPLETE message with
+/// badge == NETDRV_CALLBACK_BADGE.
+///
+/// Message format sent to VFS:
+///   label = NET_COMPLETE
+///   regs[0] = conn_id (the connection this completion belongs to)
+///   regs[1] = result  (SALTY_OK, SALTY_CONN_REFUSED, etc.)
+///   regs[2] = op_type (INET_OP_CONNECT, INET_OP_RECV, etc.)
+///   regs[3] = data_len / extra_conn_id (depends on op_type)
+///   regs[4] = extra_ip / data start
+///   regs[5] = extra_port
+///   regs[6..] = data bytes (for recv/recvfrom)
+fn notify_vfs_completion(
+    conn_id: u32,
+    result: u64,
+    op_type: u8,
+    data: &[u8],
+    data_len: usize,
+    extra_conn_id: u32,
+    extra_ip: u32,
+    extra_port: u16,
+) {
+    // SAFETY: Single-threaded driver; VFS_REGISTERED is set once.
+    let registered = unsafe { *(&raw const VFS_REGISTERED) };
+    if !registered {
+        return;
+    }
+
+    let mut msg = SaltyMsg::zeroed();
+    msg.label = NET_COMPLETE;
+    msg.regs[0] = conn_id as u64;
+    msg.regs[1] = result;
+    msg.regs[2] = op_type as u64;
+
+    match op_type {
+        INET_OP_CONNECT => {
+            msg.length = 3;
+        }
+        INET_OP_RECV => {
+            msg.regs[3] = data_len as u64;
+            // Copy data into regs[4..]
+            let max_data = core::cmp::min(data_len, 128);
+            if max_data > 0 {
+                // SAFETY: Writing data bytes into message register area.
+                unsafe {
+                    let dst = &raw mut msg.regs[4] as *mut u8;
+                    for i in 0..max_data {
+                        *dst.add(i) = data[i];
+                    }
+                }
+            }
+            msg.length = 4 + ((max_data as u64 + 7) / 8);
+        }
+        INET_OP_ACCEPT => {
+            msg.regs[3] = extra_conn_id as u64;
+            msg.regs[4] = extra_ip as u64;
+            msg.regs[5] = extra_port as u64;
+            msg.length = 6;
+        }
+        INET_OP_RECVFROM => {
+            msg.regs[3] = data_len as u64;
+            msg.regs[4] = extra_ip as u64;
+            msg.regs[5] = extra_port as u64;
+            // Copy data into regs[6..]
+            let max_data = core::cmp::min(data_len, 112);
+            if max_data > 0 {
+                // SAFETY: Writing data bytes into message register area.
+                unsafe {
+                    let dst = &raw mut msg.regs[6] as *mut u8;
+                    for i in 0..max_data {
+                        *dst.add(i) = data[i];
+                    }
+                }
+            }
+            msg.length = 6 + ((max_data as u64 + 7) / 8);
+        }
+        _ => {
+            msg.length = 3;
+        }
+    }
+
+    let mut resp = SaltyMsg::zeroed();
+    // SAFETY: IPC context is valid; VFS callback EP is in slot 83.
+    unsafe {
+        ipc::call_ctx(
+            ipc_ctx(),
+            CAP_VFS_CALLBACK_EP,
+            &raw const msg,
+            &raw mut resp,
+        );
+    }
+}
+
+/// Drain all pending completions from TCP and UDP modules, delivering each
+/// to VFS via the callback endpoint.
+///
+/// Called after IRQ processing (when VFS is in its event loop, not blocked
+/// on a netdrv call) and after timer processing.
+fn drain_completion_queue() {
+    while let Some(c) = net::tcp::pop_completion() {
+        notify_vfs_completion(
+            c.conn_id,
+            c.result,
+            c.op_type,
+            &c.data[..c.data_len],
+            c.data_len,
+            c.extra_conn_id,
+            c.extra_ip,
+            c.extra_port,
+        );
+    }
+    while let Some(c) = net::udp::pop_completion() {
+        notify_vfs_completion(
+            c.conn_id,
+            c.result,
+            c.op_type,
+            &c.data[..c.data_len],
+            c.data_len,
+            c.extra_conn_id,
+            c.extra_ip,
+            c.extra_port,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Event loop
+// ---------------------------------------------------------------------------
+
 /// Main event loop: wait for IRQ notifications or IPC requests.
+///
+/// Uses a recv / reply_recv pattern:
+/// - On IRQ notification (badge != 0): process packets, run TCP timers,
+///   drain completion queue (callbacks to VFS), then recv again.
+/// - On IPC request (badge == 0): dispatch the request, fill reply, then
+///   reply_recv (atomically reply and wait for next event).
 fn event_loop(device_ok: bool) -> ! {
     puts(b"[netdrv] Entering event loop\n");
 
@@ -281,23 +682,52 @@ fn event_loop(device_ok: bool) -> ! {
     let mut msg = SaltyMsg::zeroed();
     let mut badge: u64 = 0;
 
-    // Initial recv
+    // Set up receive slot for VFS callback EP (slot 83).
+    // VFS sends its badged EP via NET_REGISTER_VFS with extra_caps=1.
+    // SAFETY: IPC context is valid.
+    unsafe {
+        ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_VFS_CALLBACK_EP, 0);
+    }
+
+    // Initial recv — wait for first event
     // SAFETY: IPC context is valid; server EP was set up by procmgr.
-    unsafe { ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge); }
+    unsafe {
+        ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge);
+    }
 
     loop {
         if badge != 0 {
             // Woken by bound notification (IRQ)
             handle_irq();
-        } else {
-            // IPC request on server endpoint -- not yet implemented
-        }
+            net::tcp::process_timers();
+            drain_completion_queue();
 
-        // Wait for next event
-        msg = SaltyMsg::zeroed();
-        badge = 0;
-        // SAFETY: IPC context is valid.
-        unsafe { ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge); }
+            // Wait for next event (no reply needed for notifications)
+            msg = SaltyMsg::zeroed();
+            badge = 0;
+            // SAFETY: IPC context is valid.
+            unsafe {
+                ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge);
+            }
+        } else {
+            // IPC request on server endpoint
+            let mut reply = SaltyMsg::zeroed();
+            dispatch_ipc(&msg, &mut reply);
+
+            // Reply to caller AND wait for next event atomically
+            msg = SaltyMsg::zeroed();
+            badge = 0;
+            // SAFETY: IPC context is valid.
+            unsafe {
+                ipc::reply_recv_ctx(
+                    ctx,
+                    CAP_SERVER_EP,
+                    &raw const reply,
+                    &raw mut msg,
+                    &raw mut badge,
+                );
+            }
+        }
     }
 }
 

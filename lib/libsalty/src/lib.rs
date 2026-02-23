@@ -39,10 +39,10 @@ pub mod ipc;
 pub mod layout;
 pub mod posix;
 pub mod posix_mm;
+pub mod pthread;
 pub mod serial;
 pub mod signals;
 pub mod slot_alloc;
-pub mod pthread;
 pub mod sync;
 pub mod syscall;
 pub mod tls;
@@ -290,11 +290,7 @@ pub extern "C" fn salty_vspace_walk(vspace: Cap, start_vaddr: u64, max_entries: 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn salty_vspace_copy_page(
-    src_vspace: Cap,
-    src_vaddr: u64,
-    dst_frame: Cap,
-) -> i32 {
+pub extern "C" fn salty_vspace_copy_page(src_vspace: Cap, src_vaddr: u64, dst_frame: Cap) -> i32 {
     invoke::vspace_copy_page(src_vspace, src_vaddr, dst_frame)
 }
 
@@ -511,8 +507,8 @@ pub extern "C" fn salty_socket(domain: i32, sock_type: i32) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn salty_bind(fd: i32, path: *const u8) -> i32 {
-    unsafe { posix::posix_bind(fd, path) }
+pub extern "C" fn salty_bind(fd: i32, path: *const u8, addr_len: u32) -> i32 {
+    unsafe { posix::posix_bind(fd, path, addr_len) }
 }
 
 #[unsafe(no_mangle)]
@@ -526,8 +522,8 @@ pub extern "C" fn salty_accept(fd: i32) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn salty_connect(fd: i32, path: *const u8) -> i32 {
-    unsafe { posix::posix_connect(fd, path) }
+pub extern "C" fn salty_connect(fd: i32, path: *const u8, addr_len: u32) -> i32 {
+    unsafe { posix::posix_connect(fd, path, addr_len) }
 }
 
 #[unsafe(no_mangle)]
@@ -697,7 +693,12 @@ pub extern "C" fn salty_epoll_create1(flags: i32) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn salty_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const types::EpollEvent) -> i32 {
+pub extern "C" fn salty_epoll_ctl(
+    epfd: i32,
+    op: i32,
+    fd: i32,
+    event: *const types::EpollEvent,
+) -> i32 {
     unsafe {
         let (events, data) = if !event.is_null() {
             ((*event).events, (*event).data)
@@ -709,7 +710,12 @@ pub extern "C" fn salty_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const typ
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn salty_epoll_wait(epfd: i32, events: *mut types::EpollEvent, maxevents: i32, timeout: i32) -> i32 {
+pub extern "C" fn salty_epoll_wait(
+    epfd: i32,
+    events: *mut types::EpollEvent,
+    maxevents: i32,
+    timeout: i32,
+) -> i32 {
     unsafe { posix::posix_epoll_wait(epfd, events, maxevents, timeout) }
 }
 
