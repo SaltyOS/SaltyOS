@@ -683,6 +683,15 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
                     *(&raw mut crate::VFS_SHM_ACTIVE) = true;
                 } else {
                     puts(b"[VFS] saltyfs SHM setup failed (non-fatal)\n");
+                    // Cleanup: unmap VFS SHM since SaltyFS didn't establish transport
+                    let mut shm_unmap = SaltyMsg::zeroed();
+                    shm_unmap.label = MM_SHM_UNMAP;
+                    shm_unmap.length = 3;
+                    shm_unmap.regs[0] = VFS_SALTYFS_SHM_ID;
+                    shm_unmap.regs[1] = 0; // 0 = caller's own badge
+                    shm_unmap.regs[2] = VFS_SALTYFS_SHM_VADDR;
+                    let mut unmap_reply = SaltyMsg::zeroed();
+                    let _ = ipc::call_ctx(ipc_ctx(), VFS_CAP_MMSRV_EP, &raw const shm_unmap, &raw mut unmap_reply);
                 }
             }
         }
@@ -778,10 +787,10 @@ pub(crate) unsafe fn mount_link(
         req.label = SALTYFS_LINK;
         req.regs[0] = existing_ino;
         req.regs[1] = new_parent_ino;
-        req.regs[2] = name_len as u64;
+        let copy = core::cmp::min(name_len as usize, 136);
+        req.regs[2] = copy as u64;
         // MR3..MR19 = name (136 bytes max)
         let dst = &raw mut req.regs[3] as *mut u8;
-        let copy = core::cmp::min(name_len as usize, 136);
         for i in 0..copy {
             *dst.add(i) = *name.add(i);
         }

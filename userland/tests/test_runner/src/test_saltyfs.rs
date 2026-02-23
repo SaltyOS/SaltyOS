@@ -70,7 +70,7 @@ pub fn run() -> bool {
     puts(b"[TEST_SALTYFS] Test 3: create + write + read file\n");
     {
         let path = b"/mnt/data/testdir/test.txt\0";
-        let fd = unsafe { posix::posix_open(path.as_ptr(), (O_CREAT | O_WRONLY) as i32, 0o644) };
+        let fd = unsafe { posix::posix_open(path.as_ptr(), (O_CREAT | O_TRUNC | O_WRONLY) as i32, 0o644) };
         if fd < 0 {
             puts(b"[TEST_SALTYFS] FAIL: open for write failed\n");
             return false;

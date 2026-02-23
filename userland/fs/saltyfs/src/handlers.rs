@@ -226,7 +226,7 @@ fn read_file_data(ino: u64, file_offset: u64, count: u64, dest_base: u64) -> u64
 }
 
 /// Read directory entries from a directory inode, using cross-leaf iteration.
-/// Returns up to 4 entries per call via MR registers.
+/// Returns up to 3 entries per call via MR registers.
 /// `cursor` is the entry index among matching DIR_ITEM keys.
 fn readdir_entries(
     dir_ino: u64,
@@ -427,7 +427,9 @@ fn delete_all_extents(ino: u64) {
                 item_type: SALTY_EXTENT_DATA,
                 offset: offsets[i],
             };
-            btree_cow_delete(&ext_key);
+            if !btree_cow_delete(&ext_key) {
+                puts(b"[saltyfs] WARN: extent delete failed during cleanup\n");
+            }
         }
     }
 }
@@ -694,7 +696,7 @@ pub(crate) fn handle_create(msg: &SaltyMsg) -> SaltyMsg {
     let dir_key = BTreeKey {
         object_id: parent_ino,
         item_type: SALTY_DIR_ITEM,
-        offset: new_ino,
+        offset: fnv1a_hash(&name_buf[..name_len as usize]),
     };
     if !btree_cow_insert(&dir_key, &dir_buf[..dir_len]) {
         reply.label = SALTY_OUT_OF_MEMORY;
@@ -1065,7 +1067,7 @@ pub(crate) fn handle_mkdir_fs(msg: &SaltyMsg) -> SaltyMsg {
     let dir_key = BTreeKey {
         object_id: parent_ino,
         item_type: SALTY_DIR_ITEM,
-        offset: new_ino,
+        offset: fnv1a_hash(&name_buf[..name_len as usize]),
     };
     if !btree_cow_insert(&dir_key, &dir_buf[..dir_len]) {
         reply.label = SALTY_OUT_OF_MEMORY;
@@ -1867,7 +1869,7 @@ pub(crate) fn handle_symlink(msg: &SaltyMsg) -> SaltyMsg {
     let dir_key = BTreeKey {
         object_id: parent_ino,
         item_type: SALTY_DIR_ITEM,
-        offset: new_ino,
+        offset: fnv1a_hash(&name_buf[..name_len]),
     };
     if !btree_cow_insert(&dir_key, &dir_buf[..dir_len]) {
         reply.label = SALTY_OUT_OF_MEMORY;

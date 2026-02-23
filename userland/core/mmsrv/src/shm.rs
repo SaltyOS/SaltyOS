@@ -190,10 +190,10 @@ pub(crate) unsafe fn handle_mm_shm_map(msg: *const SaltyMsg, caller_badge: u64, 
 ///   MR1 = client badge
 ///   MR2 = vaddr (base address of the mapping)
 ///   Reply: label = SALTY_OK
-pub(crate) unsafe fn handle_mm_shm_unmap(msg: *const SaltyMsg, _caller_badge: u64, reply: *mut SaltyMsg) {
+pub(crate) unsafe fn handle_mm_shm_unmap(msg: *const SaltyMsg, caller_badge: u64, reply: *mut SaltyMsg) {
     unsafe {
         let shm_id = (*msg).regs[0];
-        let client_badge = (*msg).regs[1];
+        let client_badge = if (*msg).regs[1] == 0 { caller_badge } else { (*msg).regs[1] };
         let vaddr = (*msg).regs[2];
 
         let shm = find_shm_by_id(shm_id);
