@@ -10,6 +10,7 @@ typedef unsigned int wint_t;
 typedef unsigned int mbstate_t;
 
 #define WEOF ((wint_t)0xFFFFFFFF)
+#define WINT_MAX ((wint_t)0xFFFFFFFF)
 
 /* Multibyte / wide conversions */
 extern size_t mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *ps);
@@ -51,5 +52,13 @@ extern size_t __ctype_get_mb_cur_max(void);
 /* wint_t conversion */
 extern wint_t btowc(int c);
 extern int    wctob(wint_t c);
+
+/* Wide character I/O */
+#include <stdio.h>
+extern wint_t fgetwc(FILE *stream);
+extern wint_t fputwc(wint_t wc, FILE *stream);
+extern wint_t getwc(FILE *stream);
+extern wint_t getwchar(void);
+extern wint_t putwchar(wint_t wc);
 
 #endif /* __WCHAR_H__ */

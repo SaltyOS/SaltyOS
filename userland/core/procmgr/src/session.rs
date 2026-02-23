@@ -4,7 +4,7 @@
 
 use salty::types::*;
 
-use crate::proc_table::{find_by_badge, find_by_pid, proctab};
+use crate::proc_table::{find_by_badge, find_by_pid, proctab, PROC_ZOMBIE};
 
 pub(crate) unsafe fn handle_setpgid(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
     unsafe {
@@ -136,6 +136,12 @@ pub(crate) unsafe fn handle_getpgid_badge(msg: &SaltyMsg, reply: &mut SaltyMsg) 
             reply.label = super::SALTY_NOT_FOUND;
             return;
         };
+
+        // Zombies are effectively dead -- don't report their pgid
+        if proctab(ti).state == PROC_ZOMBIE {
+            reply.label = super::SALTY_NOT_FOUND;
+            return;
+        }
 
         reply.label = super::SALTY_OK;
         reply.length = 1;

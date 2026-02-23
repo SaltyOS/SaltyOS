@@ -236,3 +236,52 @@ pub extern "C" fn sigismember(set: *const Sigset, sig: i32) -> i32 {
 pub extern "C" fn siginterrupt(_sig: i32, _flag: i32) -> i32 {
     0
 }
+
+// ---------------------------------------------------------------------------
+// Signal name table
+// ---------------------------------------------------------------------------
+
+/// Wrapper to make `*const u8` usable in statics (raw pointers lack `Sync`).
+#[repr(transparent)]
+struct SyncPtr(*const u8);
+// SAFETY: All pointers in sys_signame point to static byte string literals
+// which are immutable and have 'static lifetime.
+unsafe impl Sync for SyncPtr {}
+
+/// Signal name table indexed by signal number.
+/// `sys_signame[1]` = "HUP", `sys_signame[2]` = "INT", etc.
+#[unsafe(no_mangle)]
+pub static sys_signame: [SyncPtr; NSIG] = [
+    SyncPtr(b"EXIT\0".as_ptr()),   // 0
+    SyncPtr(b"HUP\0".as_ptr()),    // 1 SIGHUP
+    SyncPtr(b"INT\0".as_ptr()),    // 2 SIGINT
+    SyncPtr(b"QUIT\0".as_ptr()),   // 3 SIGQUIT
+    SyncPtr(b"ILL\0".as_ptr()),    // 4 SIGILL
+    SyncPtr(b"TRAP\0".as_ptr()),   // 5 SIGTRAP
+    SyncPtr(b"ABRT\0".as_ptr()),   // 6 SIGABRT
+    SyncPtr(b"BUS\0".as_ptr()),    // 7 SIGBUS
+    SyncPtr(b"FPE\0".as_ptr()),    // 8 SIGFPE
+    SyncPtr(b"KILL\0".as_ptr()),   // 9 SIGKILL
+    SyncPtr(b"USR1\0".as_ptr()),   // 10 SIGUSR1
+    SyncPtr(b"SEGV\0".as_ptr()),   // 11 SIGSEGV
+    SyncPtr(b"USR2\0".as_ptr()),   // 12 SIGUSR2
+    SyncPtr(b"PIPE\0".as_ptr()),   // 13 SIGPIPE
+    SyncPtr(b"ALRM\0".as_ptr()),   // 14 SIGALRM
+    SyncPtr(b"TERM\0".as_ptr()),   // 15 SIGTERM
+    SyncPtr(b"STKFLT\0".as_ptr()), // 16 SIGSTKFLT
+    SyncPtr(b"CHLD\0".as_ptr()),   // 17 SIGCHLD
+    SyncPtr(b"CONT\0".as_ptr()),   // 18 SIGCONT
+    SyncPtr(b"STOP\0".as_ptr()),   // 19 SIGSTOP
+    SyncPtr(b"TSTP\0".as_ptr()),   // 20 SIGTSTP
+    SyncPtr(b"TTIN\0".as_ptr()),   // 21 SIGTTIN
+    SyncPtr(b"TTOU\0".as_ptr()),   // 22 SIGTTOU
+    SyncPtr(core::ptr::null()),     // 23 (undefined)
+    SyncPtr(core::ptr::null()),     // 24 (undefined)
+    SyncPtr(core::ptr::null()),     // 25 (undefined)
+    SyncPtr(core::ptr::null()),     // 26 (undefined)
+    SyncPtr(core::ptr::null()),     // 27 (undefined)
+    SyncPtr(b"WINCH\0".as_ptr()),  // 28 SIGWINCH
+    SyncPtr(b"INFO\0".as_ptr()),   // 29 SIGINFO
+    SyncPtr(core::ptr::null()),     // 30 (undefined)
+    SyncPtr(core::ptr::null()),     // 31 (undefined)
+];

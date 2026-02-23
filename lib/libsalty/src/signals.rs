@@ -23,7 +23,7 @@ const CAP_SIGNAL_NTFN: u64 = 6;
 fn sig_default_action(sig: i32) -> bool {
     // Returns true if default action is terminate
     match sig {
-        SIGCHLD | SIGCONT | SIGSTOP => false,
+        SIGCHLD | SIGCONT | SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU => false,
         _ => true,
     }
 }

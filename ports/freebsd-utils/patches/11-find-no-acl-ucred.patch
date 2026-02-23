@@ -1,0 +1,107 @@
+--- a/usr.bin/find/function.c	2026-02-23 00:00:00.000000000 +0900
++++ b/usr.bin/find/function.c	2026-02-23 00:00:00.000000000 +0900
+@@ -38,10 +38,8 @@
+ 
+ #include <sys/cdefs.h>
+ #include <sys/param.h>
+-#include <sys/ucred.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+-#include <sys/acl.h>
+ #include <sys/wait.h>
+ #include <sys/mount.h>
+ 
+@@ -62,6 +60,18 @@
+ 
+ #include "find.h"
+ 
++/* SaltyOS: stub get_date — no yacc to generate getdate.c */
++time_t
++get_date(char *p)
++{
++	struct tm tm;
++	memset(&tm, 0, sizeof(tm));
++	if (strptime(p, "%Y-%m-%d %H:%M:%S", &tm) != NULL ||
++	    strptime(p, "%b %d %H:%M:%S %Y", &tm) != NULL)
++		return mktime(&tm);
++	return (time_t)-1;
++}
++
+ static PLAN *palloc(OPTION *);
+ static long long find_parsenum(PLAN *, const char *, char *, char *);
+ static long long find_parsetime(PLAN *, const char *, char *);
+@@ -362,58 +372,17 @@
+ 	return new;
+ }
+ 
+-#ifdef ACL_TYPE_NFS4
+ /*
+  * -acl function --
+  *
+  *	Show files with EXTENDED ACL attributes.
+  */
+ int
+-f_acl(PLAN *plan __unused, FTSENT *entry)
++f_acl(PLAN *plan __unused, FTSENT *entry __unused)
+ {
+-	acl_t facl;
+-	acl_type_t acl_type;
+-	int acl_supported = 0, ret, trivial;
+-
+-	if (S_ISLNK(entry->fts_statp->st_mode))
+-		return 0;
+-	ret = pathconf(entry->fts_accpath, _PC_ACL_NFS4);
+-	if (ret > 0) {
+-		acl_supported = 1;
+-		acl_type = ACL_TYPE_NFS4;
+-	} else if (ret < 0 && errno != EINVAL) {
+-		warn("%s", entry->fts_accpath);
+-		return (0);
+-	}
+-	if (acl_supported == 0) {
+-		ret = pathconf(entry->fts_accpath, _PC_ACL_EXTENDED);
+-		if (ret > 0) {
+-			acl_supported = 1;
+-			acl_type = ACL_TYPE_ACCESS;
+-		} else if (ret < 0 && errno != EINVAL) {
+-			warn("%s", entry->fts_accpath);
+-			return (0);
+-		}
+-	}
+-	if (acl_supported == 0)
+-		return (0);
+-
+-	facl = acl_get_file(entry->fts_accpath, acl_type);
+-	if (facl == NULL) {
+-		warn("%s", entry->fts_accpath);
+-		return (0);
+-	}
+-	ret = acl_is_trivial_np(facl, &trivial);
+-	acl_free(facl);
+-	if (ret) {
+-		warn("%s", entry->fts_accpath);
+-		return (0);
+-	}
+-	if (trivial)
+-		return (0);
+-	return (1);
++	/* SaltyOS: no ACL support */
++	return (0);
+ }
+-#endif
+ 
+ PLAN *
+ c_acl(OPTION *option, char ***argvp __unused)
+
+--- a/usr.bin/find/option.c	2026-02-23 00:00:00.000000000 +0900
++++ b/usr.bin/find/option.c	2026-02-23 00:00:00.000000000 +0900
+@@ -63,9 +63,7 @@
+ 	{ "-Btime",	c_Xtime,	f_Xtime,	F_TIME_B },
+ #endif
+ 	{ "-a",		c_and,		NULL,		0 },
+-#ifdef ACL_TYPE_NFS4
+ 	{ "-acl",	c_acl,		f_acl,		0 },
+-#endif
+ 	{ "-amin",	c_Xmin,		f_Xmin,		F_TIME_A },
+ 	{ "-and",	c_and,		NULL,		0 },
+ 	{ "-anewer",	c_newer,	f_newer,	F_TIME_A },

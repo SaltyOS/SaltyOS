@@ -95,4 +95,7 @@ extern int   kill(pid_t pid, int sig);
 extern int   killpg(pid_t pgrp, int sig);
 extern int   raise(int sig);
 
+extern const char * const sys_signame[];
+extern char *strsignal(int sig);
+
 #endif /* __SIGNAL_H__ */

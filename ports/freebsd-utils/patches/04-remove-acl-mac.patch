@@ -1,5 +1,5 @@
---- a/bin/cp/utils.c
-+++ b/bin/cp/utils.c
+--- a/bin/cp/utils.c	2026-02-23 00:00:00.000000000 +0900
++++ b/bin/cp/utils.c	2026-02-23 00:00:00.000000000 +0900
 @@ -36,7 +36,6 @@
  #endif /* not lint */
  #include <sys/cdefs.h>
@@ -148,8 +148,8 @@
  	return (0);
  }
  
---- a/bin/ls/print.c
-+++ b/bin/ls/print.c
+--- a/bin/ls/print.c	2026-02-23 00:00:00.000000000 +0900
++++ b/bin/ls/print.c	2026-02-23 00:00:00.000000000 +0900
 @@ -40,8 +40,6 @@
  #include <sys/cdefs.h>
  #include <sys/param.h>
@@ -226,8 +226,8 @@
 -		buf[10] = '+';
 -	acl_free(facl);
  }
---- a/bin/ls/ls.c
-+++ b/bin/ls/ls.c
+--- a/bin/ls/ls.c	2026-02-23 00:00:00.000000000 +0900
++++ b/bin/ls/ls.c	2026-02-23 00:00:00.000000000 +0900
 @@ -47,8 +47,6 @@
  #include <sys/param.h>
  #include <sys/stat.h>
@@ -293,8 +293,8 @@
  					labelstrlen = strlen(labelstr);
  					if (labelstrlen > maxlabelstr)
  						maxlabelstr = labelstrlen;
---- a/usr.bin/id/id.c
-+++ b/usr.bin/id/id.c
+--- a/usr.bin/id/id.c	2026-02-23 00:00:00.000000000 +0900
++++ b/usr.bin/id/id.c	2026-02-23 00:00:00.000000000 +0900
 @@ -42,8 +42,6 @@
  #endif /* not lint */
  #include <sys/cdefs.h>
@@ -331,8 +331,8 @@
  }
  
  static struct passwd *
---- a/bin/mv/mv.c
-+++ b/bin/mv/mv.c
+--- a/bin/mv/mv.c	2026-02-23 00:00:00.000000000 +0900
++++ b/bin/mv/mv.c	2026-02-23 00:00:00.000000000 +0900
 @@ -45,7 +45,6 @@
  #endif
  #include <sys/cdefs.h>

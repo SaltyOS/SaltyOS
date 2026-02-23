@@ -1,6 +1,5 @@
-diff --git a/bin/cat/cat.c b/bin/cat/cat.c
---- a/bin/cat/cat.c
-+++ b/bin/cat/cat.c
+--- a/bin/cat/cat.c	2026-02-23 00:00:00.000000000 +0900
++++ b/bin/cat/cat.c	2026-02-23 00:00:00.000000000 +0900
 @@ -216,12 +216,14 @@
  			err(EXIT_FAILURE, "stdout");
  	}

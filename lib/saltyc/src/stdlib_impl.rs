@@ -619,8 +619,66 @@ pub unsafe extern "C" fn mktemp(template: *mut u8) -> *mut u8 {
     }
 }
 
+/// mkdtemp — create a unique temporary directory
+///
+/// Replaces trailing XXXXXX in `template` with unique characters and creates
+/// the directory with mode 0700.  Returns `template` on success, NULL on error.
 #[unsafe(no_mangle)]
-pub extern "C" fn mkdtemp(_template: *mut u8) -> *mut u8 {
-    core::ptr::null_mut()
+pub unsafe extern "C" fn mkdtemp(template: *mut u8) -> *mut u8 {
+    const CHARS: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    const MAX_ATTEMPTS: u32 = 256;
+
+    if template.is_null() {
+        return core::ptr::null_mut();
+    }
+
+    unsafe {
+        let len = crate::string::strlen(template);
+        if len < 6 {
+            errno::set_errno(errno::EINVAL);
+            return core::ptr::null_mut();
+        }
+
+        // Count trailing X's
+        let mut xs: usize = 0;
+        let mut i = len;
+        while i > 0 && *template.add(i - 1) == b'X' {
+            xs += 1;
+            i -= 1;
+        }
+
+        if xs < 6 {
+            errno::set_errno(errno::EINVAL);
+            return core::ptr::null_mut();
+        }
+
+        let start = len - xs;
+
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static MKDTEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let mut attempt: u32 = 0;
+        while attempt < MAX_ATTEMPTS {
+            let mut val = MKDTEMP_COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+
+            let mut j = start;
+            while j < len {
+                *template.add(j) = CHARS[(val % 36) as usize];
+                val /= 36;
+                j += 1;
+            }
+
+            let ret = salty::posix::posix_mkdir(template, 0o700);
+            if ret == 0 {
+                return template;
+            }
+            // posix_mkdir returns -1 on any error; retry with next name
+            attempt += 1;
+        }
+
+        errno::set_errno(errno::EEXIST);
+        *template.add(start) = 0;
+        core::ptr::null_mut()
+    }
 }
 

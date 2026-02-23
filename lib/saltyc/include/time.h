@@ -47,10 +47,14 @@ extern size_t    strftime(char *s, size_t max, const char *format,
                           const struct tm *tm);
 
 extern int       clock_gettime(clockid_t clk_id, struct timespec *tp);
+extern int       clock_settime(clockid_t clk_id, const struct timespec *tp);
 extern int       nanosleep(const struct timespec *req, struct timespec *rem);
 extern void      tzset(void);
 extern char     *tzname[2];
 extern long      timezone;
 extern int       daylight;
+
+extern time_t    timegm(struct tm *tm);
+extern char     *strptime(const char *s, const char *format, struct tm *tm);
 
 #endif /* __TIME_H__ */
