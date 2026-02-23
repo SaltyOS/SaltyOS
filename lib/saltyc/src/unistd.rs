@@ -102,10 +102,7 @@ pub unsafe extern "C" fn open(path: *const u8, flags: i32) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn creat(path: *const u8, _mode: u32) -> i32 {
     // creat(path, mode) == open(path, O_WRONLY|O_CREAT|O_TRUNC, mode)
-    const O_WRONLY: i32 = 0x0001;
-    const O_CREAT: i32 = 0x0100;
-    const O_TRUNC: i32 = 0x0200;
-    unsafe { open(path, O_WRONLY | O_CREAT | O_TRUNC) }
+    unsafe { open(path, (salty::O_WRONLY | salty::O_CREAT | salty::O_TRUNC) as i32) }
 }
 
 #[unsafe(no_mangle)]
