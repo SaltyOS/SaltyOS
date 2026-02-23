@@ -1,5 +1,5 @@
---- a/include/runetype.h	2026-02-13 23:15:32.435499677 +0900
-+++ b/include/runetype.h	2026-02-13 23:15:44.021791794 +0900
+--- a/include/runetype.h	2026-02-23 00:00:00.000000000 +0900
++++ b/include/runetype.h	2026-02-23 00:00:00.000000000 +0900
 @@ -87,18 +87,10 @@
  __BEGIN_DECLS
  extern const _RuneLocale _DefaultRuneLocale;

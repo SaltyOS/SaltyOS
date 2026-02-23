@@ -1,13 +1,27 @@
 --- a/usr.bin/tr/str.c	2026-02-23 00:00:00.000000000 +0900
 +++ b/usr.bin/tr/str.c	2026-02-23 00:00:00.000000000 +0900
-@@ -38,6 +38,10 @@
- #include <ctype.h>
- #include <err.h>
- #include <errno.h>
-+
+@@ -46,6 +46,10 @@
+ #include <wchar.h>
+ #include <wctype.h>
+ 
 +/* SaltyOS: iswrune is FreeBSD-specific; treat all wchar_t as valid runes */
++#undef iswrune
 +#define iswrune(c) (1)
 +
- #include <limits.h>
- #include <stdio.h>
- #include <stdlib.h>
+ #include "extern.h"
+ 
+ static int      backslash(STR *, int *);
+--- a/usr.bin/tr/tr.c	2026-02-23 00:00:00.000000000 +0900
++++ b/usr.bin/tr/tr.c	2026-02-23 00:00:00.000000000 +0900
+@@ -56,6 +56,11 @@
+ #include <wchar.h>
+ #include <wctype.h>
+ 
++/* SaltyOS: WINT_MAX not available in FreeBSD stdint.h */
++#ifndef WINT_MAX
++#define WINT_MAX 0xFFFFFFFFU
++#endif
++
+ #include "cmap.h"
+ #include "cset.h"
+ #include "extern.h"

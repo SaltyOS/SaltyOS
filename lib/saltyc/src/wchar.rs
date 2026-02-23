@@ -316,6 +316,18 @@ pub extern "C" fn iswctype(wc: WintT, desc: u64) -> i32 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn nextwctype(wc: WintT, desc: u64) -> WintT {
+    let mut next = if wc == WEOF { 0 } else { wc + 1 };
+    while next < 0x80 {
+        if iswctype(next, desc) != 0 {
+            return next;
+        }
+        next += 1;
+    }
+    WEOF
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wctrans(name: *const u8) -> u64 {
     if name.is_null() {
         return 0;
@@ -856,6 +868,9 @@ pub unsafe extern "C" fn fgetwc(stream: *mut crate::stdio::FILE) -> WintT {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fputwc(wc: WintT, stream: *mut crate::stdio::FILE) -> WintT {
+    if wc == WEOF {
+        return WEOF;
+    }
     if wc > 0x7f {
         crate::errno::set_errno(crate::errno::EILSEQ);
         return WEOF;

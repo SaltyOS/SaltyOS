@@ -1,10 +1,9 @@
 --- a/bin/kill/kill.c	2026-02-23 00:00:00.000000000 +0900
 +++ b/bin/kill/kill.c	2026-02-23 00:00:00.000000000 +0900
-@@ -43,6 +43,30 @@
- #include <stdio.h>
+@@ -53,6 +53,24 @@
  #include <stdlib.h>
  #include <string.h>
-+
+ 
 +/* SaltyOS: provide sys_signame fallback if not available from libc */
 +#ifndef HAVE_SYS_SIGNAME
 +#ifndef NSIG
@@ -17,13 +16,12 @@
 +	[9] = "KILL",  [10] = "USR1", [11] = "SEGV",  [12] = "USR2",
 +	[13] = "PIPE", [14] = "ALRM", [15] = "TERM",  [16] = "STKFLT",
 +	[17] = "CHLD", [18] = "CONT", [19] = "STOP",  [20] = "TSTP",
-+	[21] = "TTIN", [22] = "TTOU", [23] = "URG",   [24] = "XCPU",
-+	[25] = "XFSZ", [26] = "VTALRM", [27] = "PROF",
-+	[28] = "WINCH", [29] = "INFO", [30] = "USR1",  [31] = "USR2",
++	[21] = "TTIN", [22] = "TTOU",
++	[28] = "WINCH", [29] = "INFO",
 +};
 +#define sys_signame local_sys_signame
 +#endif
 +
- #include <unistd.h>
-
- static void nosig(const char *);
+ #ifdef SHELL
+ #define main killcmd
+ #include "bltin/bltin.h"

@@ -600,6 +600,11 @@ pub unsafe extern "C" fn mmap(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn madvise(_addr: *mut u8, _length: usize, _advice: i32) -> i32 {
+    0
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn munmap(addr: *mut u8, length: usize) -> i32 {
     unsafe {
         let ret = salty::posix_mm::posix_munmap(addr, length as u64);

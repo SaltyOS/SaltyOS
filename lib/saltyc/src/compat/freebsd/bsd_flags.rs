@@ -117,6 +117,24 @@ pub unsafe extern "C" fn setmode(mode_str: *const u8) -> *mut u8 {
     }
 }
 
+/// strtofflags — parse file flags string. Stub: no flags supported.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strtofflags(
+    _flags: *mut *mut u8,
+    setp: *mut u64,
+    clrp: *mut u64,
+) -> i32 {
+    unsafe {
+        if !setp.is_null() {
+            *setp = 0;
+        }
+        if !clrp.is_null() {
+            *clrp = 0;
+        }
+    }
+    0
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getmode(set: *const u8, omode: u32) -> u32 {
     unsafe {

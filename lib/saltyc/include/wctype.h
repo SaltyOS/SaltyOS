@@ -24,6 +24,7 @@ extern wint_t towlower(wint_t wc);
 
 extern wctype_t  wctype(const char *name);
 extern int       iswctype(wint_t wc, wctype_t desc);
+extern wint_t    nextwctype(wint_t wc, wctype_t desc);
 extern wctrans_t wctrans(const char *name);
 extern wint_t    towctrans(wint_t wc, wctrans_t desc);
 

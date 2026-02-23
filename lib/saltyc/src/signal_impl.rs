@@ -275,13 +275,13 @@ pub static sys_signame: [SyncPtr; NSIG] = [
     SyncPtr(b"TSTP\0".as_ptr()),   // 20 SIGTSTP
     SyncPtr(b"TTIN\0".as_ptr()),   // 21 SIGTTIN
     SyncPtr(b"TTOU\0".as_ptr()),   // 22 SIGTTOU
-    SyncPtr(b"URG\0".as_ptr()),    // 23
-    SyncPtr(b"XCPU\0".as_ptr()),   // 24
-    SyncPtr(b"XFSZ\0".as_ptr()),   // 25
-    SyncPtr(b"VTALRM\0".as_ptr()), // 26
-    SyncPtr(b"PROF\0".as_ptr()),   // 27
+    SyncPtr(core::ptr::null()),     // 23 (undefined)
+    SyncPtr(core::ptr::null()),     // 24 (undefined)
+    SyncPtr(core::ptr::null()),     // 25 (undefined)
+    SyncPtr(core::ptr::null()),     // 26 (undefined)
+    SyncPtr(core::ptr::null()),     // 27 (undefined)
     SyncPtr(b"WINCH\0".as_ptr()),  // 28 SIGWINCH
     SyncPtr(b"INFO\0".as_ptr()),   // 29 SIGINFO
-    SyncPtr(b"USR1\0".as_ptr()),   // 30 (unused, filler)
-    SyncPtr(b"USR2\0".as_ptr()),   // 31 (unused, filler)
+    SyncPtr(core::ptr::null()),     // 30 (undefined)
+    SyncPtr(core::ptr::null()),     // 31 (undefined)
 ];

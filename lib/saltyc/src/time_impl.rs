@@ -386,6 +386,12 @@ pub unsafe extern "C" fn clock_gettime(clock_id: i32, tp: *mut Timespec) -> i32 
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn clock_settime(_clock_id: i32, _tp: *const Timespec) -> i32 {
+    errno::set_errno(errno::EPERM);
+    -1
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn clock() -> ClockT {
     unsafe {
         let secs = get_epoch_secs();
@@ -877,42 +883,42 @@ pub unsafe extern "C" fn strptime(
                     b'Y' => {
                         // 4-digit year
                         let (val, adv) = parse_digits(buf.add(bi), 4);
-                        if adv == 0 { return core::ptr::null_mut(); }
+                        if adv != 4 { return core::ptr::null_mut(); }
                         (*tm).tm_year = val - 1900;
                         bi += adv;
                     }
                     b'm' => {
                         // 1-2 digit month (01-12)
                         let (val, adv) = parse_digits(buf.add(bi), 2);
-                        if adv == 0 { return core::ptr::null_mut(); }
+                        if adv == 0 || val < 1 || val > 12 { return core::ptr::null_mut(); }
                         (*tm).tm_mon = val - 1;
                         bi += adv;
                     }
                     b'd' => {
                         // 1-2 digit day (01-31)
                         let (val, adv) = parse_digits(buf.add(bi), 2);
-                        if adv == 0 { return core::ptr::null_mut(); }
+                        if adv == 0 || val < 1 || val > 31 { return core::ptr::null_mut(); }
                         (*tm).tm_mday = val;
                         bi += adv;
                     }
                     b'H' => {
                         // 1-2 digit hour (00-23)
                         let (val, adv) = parse_digits(buf.add(bi), 2);
-                        if adv == 0 { return core::ptr::null_mut(); }
+                        if adv == 0 || val > 23 { return core::ptr::null_mut(); }
                         (*tm).tm_hour = val;
                         bi += adv;
                     }
                     b'M' => {
                         // 1-2 digit minute (00-59)
                         let (val, adv) = parse_digits(buf.add(bi), 2);
-                        if adv == 0 { return core::ptr::null_mut(); }
+                        if adv == 0 || val > 59 { return core::ptr::null_mut(); }
                         (*tm).tm_min = val;
                         bi += adv;
                     }
                     b'S' => {
-                        // 1-2 digit second (00-60)
+                        // 1-2 digit second (00-60, leap second)
                         let (val, adv) = parse_digits(buf.add(bi), 2);
-                        if adv == 0 { return core::ptr::null_mut(); }
+                        if adv == 0 || val > 60 { return core::ptr::null_mut(); }
                         (*tm).tm_sec = val;
                         bi += adv;
                     }
@@ -920,18 +926,18 @@ pub unsafe extern "C" fn strptime(
                         // %H:%M:%S
                         let result = strptime(buf.add(bi), b"%H:%M:%S\0".as_ptr(), tm);
                         if result.is_null() { return core::ptr::null_mut(); }
-                        bi += result.offset_from(buf.add(bi)) as usize;
+                        bi += (result as *const u8).offset_from(buf.add(bi)) as usize;
                     }
                     b'D' => {
                         // %m/%d/%y
                         let result = strptime(buf.add(bi), b"%m/%d/%y\0".as_ptr(), tm);
                         if result.is_null() { return core::ptr::null_mut(); }
-                        bi += result.offset_from(buf.add(bi)) as usize;
+                        bi += (result as *const u8).offset_from(buf.add(bi)) as usize;
                     }
                     b'y' => {
                         // 2-digit year (00-99, maps to 1969-2068)
                         let (val, adv) = parse_digits(buf.add(bi), 2);
-                        if adv == 0 { return core::ptr::null_mut(); }
+                        if adv != 2 { return core::ptr::null_mut(); }
                         (*tm).tm_year = if val >= 69 { val } else { val + 100 };
                         bi += adv;
                     }

@@ -236,3 +236,75 @@ pub unsafe extern "C" fn statfs(_path: *const u8, _buf: *mut u8) -> i32 {
     errno::set_errno(errno::ENOSYS);
     -1
 }
+
+// ---------------------------------------------------------------------------
+// BSD string/number conversions
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    safe fn strtol(s: *const u8, endptr: *mut *mut u8, base: i32) -> i64;
+    safe fn strtoul(s: *const u8, endptr: *mut *mut u8, base: i32) -> u64;
+    safe fn strcspn(s: *const u8, reject: *const u8) -> usize;
+    safe fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
+    safe fn free(ptr: *mut u8);
+}
+
+/// strtoq — BSD legacy alias for strtoll.
+#[unsafe(no_mangle)]
+pub extern "C" fn strtoq(s: *const u8, endptr: *mut *mut u8, base: i32) -> i64 {
+    strtol(s, endptr, base)
+}
+
+/// strtouq — BSD legacy alias for strtoull.
+#[unsafe(no_mangle)]
+pub extern "C" fn strtouq(s: *const u8, endptr: *mut *mut u8, base: i32) -> u64 {
+    strtoul(s, endptr, base)
+}
+
+/// strsep — 4.4BSD string tokenizer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strsep(stringp: *mut *mut u8, delim: *const u8) -> *mut u8 {
+    unsafe {
+        let s = *stringp;
+        if s.is_null() {
+            return core::ptr::null_mut();
+        }
+        let span = strcspn(s, delim);
+        if *s.add(span) != 0 {
+            *s.add(span) = 0;
+            *stringp = s.add(span + 1);
+        } else {
+            *stringp = core::ptr::null_mut();
+        }
+        s
+    }
+}
+
+/// sys_nsig — BSD signal count.
+#[unsafe(no_mangle)]
+pub static sys_nsig: i32 = 32;
+
+/// reallocf — BSD realloc that frees ptr on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn reallocf(ptr: *mut u8, size: usize) -> *mut u8 {
+    let result = realloc(ptr, size);
+    if result.is_null() && size != 0 {
+        free(ptr);
+    }
+    result
+}
+
+/// rpmatch — BSD yes/no response matching.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rpmatch(response: *const u8) -> i32 {
+    unsafe {
+        if response.is_null() || *response == 0 {
+            return -1;
+        }
+        match *response {
+            b'y' | b'Y' => 1,
+            b'n' | b'N' => 0,
+            _ => -1,
+        }
+    }
+}

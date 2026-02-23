@@ -24,6 +24,7 @@
 extern void *mmap(void *addr, size_t length, int prot, int flags,
                   int fd, off_t offset);
 extern int   munmap(void *addr, size_t length);
+extern int   madvise(void *addr, size_t length, int advice);
 extern int   mprotect(void *addr, size_t len, int prot);
 extern int   msync(void *addr, size_t length, int flags);
 extern int   shm_open(const char *name, int oflag, mode_t mode);
