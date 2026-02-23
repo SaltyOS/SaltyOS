@@ -86,7 +86,7 @@ pub(crate) unsafe fn mount_lookup(mount_idx: usize, sub_path: *const u8, sub_pat
             if comp_len == 0 {
                 continue;
             }
-            if comp_len > 24 {
+            if comp_len > 144 {
                 return 0;
             }
 
@@ -308,19 +308,24 @@ pub(crate) unsafe fn mount_rename(
         let m = &(*mounts)[mount_idx];
         let mut req = SaltyMsg::zeroed();
         req.label = SALTYFS_RENAME;
+        // MR4..MR11 = old name (64 bytes), MR12..MR19 = new name (64 bytes)
+        if old_name_len > 64 || new_name_len > 64 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
         req.regs[0] = old_parent_ino;
         req.regs[1] = old_name_len as u64;
-        let dst = &raw mut req.regs[2] as *mut u8;
+        req.regs[2] = new_parent_ino;
+        req.regs[3] = new_name_len as u64;
+        let dst = &raw mut req.regs[4] as *mut u8;
         for i in 0..old_name_len as usize {
             *dst.add(i) = *old_name.add(i);
         }
-        req.regs[5] = new_parent_ino;
-        req.regs[6] = new_name_len as u64;
-        let dst2 = &raw mut req.regs[7] as *mut u8;
+        let dst2 = &raw mut req.regs[12] as *mut u8;
         for i in 0..new_name_len as usize {
             *dst2.add(i) = *new_name.add(i);
         }
-        req.length = 10;
+        req.length = 20;
         let mut fs_reply = SaltyMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
         (*reply).label = fs_reply.label;
@@ -341,6 +346,63 @@ pub(crate) unsafe fn mount_truncate(
         let mut fs_reply = SaltyMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
         (*reply).label = fs_reply.label;
+    }
+}
+
+/// SHM-based read from mounted filesystem. Data is placed in VFS-SaltyFS SHM.
+pub(crate) unsafe fn mount_read_shm(
+    mount_idx: usize, remote_ino: u64, offset: u64, count: u64,
+    shm_offset: u64, reply: *mut SaltyMsg,
+) {
+    unsafe {
+        let mounts = &raw const crate::MOUNTS;
+        let m = &(*mounts)[mount_idx];
+        let mut req = SaltyMsg::zeroed();
+        req.label = SALTYFS_READ;
+        req.regs[0] = remote_ino;
+        req.regs[1] = offset;
+        req.regs[2] = count;
+        req.regs[3] = shm_offset;
+        req.length = 4;
+
+        let mut fs_reply = SaltyMsg::zeroed();
+        ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
+
+        if fs_reply.label != SALTY_OK {
+            (*reply).label = SALTY_INVALID_OPERATION;
+            return;
+        }
+
+        (*reply).label = SALTY_OK;
+        (*reply).length = 1;
+        (*reply).regs[0] = fs_reply.regs[0]; // bytes_read
+    }
+}
+
+/// SHM-based write to mounted filesystem. Data is in VFS-SaltyFS SHM.
+pub(crate) unsafe fn mount_write_shm(
+    mount_idx: usize, remote_ino: u64, offset: u64, count: u64,
+    shm_offset: u64, reply: *mut SaltyMsg,
+) {
+    unsafe {
+        let mounts = &raw const crate::MOUNTS;
+        let m = &(*mounts)[mount_idx];
+        let mut req = SaltyMsg::zeroed();
+        req.label = SALTYFS_WRITE;
+        req.regs[0] = remote_ino;
+        req.regs[1] = offset;
+        req.regs[2] = count;
+        req.regs[3] = shm_offset;
+        req.length = 4;
+
+        let mut fs_reply = SaltyMsg::zeroed();
+        ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
+
+        (*reply).label = fs_reply.label;
+        if fs_reply.label == SALTY_OK {
+            (*reply).length = 1;
+            (*reply).regs[0] = fs_reply.regs[0]; // bytes_written
+        }
     }
 }
 
@@ -432,7 +494,7 @@ pub(crate) unsafe fn mount_readdir(
         }
 
         let next_cursor = fs_reply.regs[0] as u32;
-        let num_entries = (fs_reply.length.saturating_sub(1)) / 4;
+        let num_entries = (fs_reply.length.saturating_sub(1)) / 6;
         if num_entries == 0 {
             (*reply).label = SALTY_OK;
             (*reply).length = 1;
@@ -443,20 +505,22 @@ pub(crate) unsafe fn mount_readdir(
 
         let take = core::cmp::min(num_entries as usize, MOUNT_READDIR_BATCH_MAX);
         for n in 0..take {
-            let base = 1 + n * 4;
+            let base = 1 + n * 6;
             let child_ino = fs_reply.regs[base];
             let dir_type = fs_reply.regs[base + 1] as u8;
-            let name_lo = fs_reply.regs[base + 2];
-            let name_hi = fs_reply.regs[base + 3];
+            let name_regs = [
+                fs_reply.regs[base + 2],
+                fs_reply.regs[base + 3],
+                fs_reply.regs[base + 4],
+                fs_reply.regs[base + 5],
+            ];
 
-            let lo = name_lo.to_le_bytes();
-            let hi = name_hi.to_le_bytes();
-            let mut name = [0u8; 16];
-            for j in 0..8 {
-                name[j] = lo[j];
-            }
-            for j in 0..8 {
-                name[8 + j] = hi[j];
+            let mut name = [0u8; 32];
+            for r in 0..4 {
+                let bytes = name_regs[r].to_le_bytes();
+                for j in 0..8 {
+                    name[r * 8 + j] = bytes[j];
+                }
             }
             let mut name_len: u8 = 0;
             for b in name.iter() {
@@ -570,5 +634,177 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
             lb.str(b"\n");
             lb.flush();
         }
+
+        // Set up VFS-SaltyFS SHM for bulk data transport
+        let mut shm_create = SaltyMsg::zeroed();
+        shm_create.label = MM_SHM_CREATE;
+        shm_create.length = 2;
+        shm_create.regs[0] = VFS_SALTYFS_SHM_ID;
+        shm_create.regs[1] = VFS_SALTYFS_SHM_PAGES;
+
+        let mut shm_reply = SaltyMsg::zeroed();
+        let serr = ipc::call_ctx(
+            ipc_ctx(), VFS_CAP_MMSRV_EP,
+            &raw const shm_create, &raw mut shm_reply,
+        );
+        if serr != 0 || (shm_reply.label != 0 && shm_reply.label != SALTY_ALREADY_EXISTS) {
+            puts(b"[VFS] saltyfs SHM create failed (non-fatal)\n");
+        } else {
+            // Map SHM into VFS address space
+            let mut shm_map = SaltyMsg::zeroed();
+            shm_map.label = MM_SHM_MAP;
+            shm_map.length = 4;
+            shm_map.regs[0] = VFS_SALTYFS_SHM_ID;
+            shm_map.regs[1] = 0;
+            shm_map.regs[2] = VFS_SALTYFS_SHM_VADDR;
+            shm_map.regs[3] = 0x3; // RW
+
+            let mut map_reply = SaltyMsg::zeroed();
+            let merr2 = ipc::call_ctx(
+                ipc_ctx(), VFS_CAP_MMSRV_EP,
+                &raw const shm_map, &raw mut map_reply,
+            );
+            if merr2 != 0 || map_reply.label != 0 {
+                puts(b"[VFS] saltyfs SHM map failed (non-fatal)\n");
+            } else {
+                // Send SHM ID to SaltyFS so it can map the same region
+                let mut setup_msg = SaltyMsg::zeroed();
+                setup_msg.label = SALTYFS_SHM_SETUP;
+                setup_msg.regs[0] = VFS_SALTYFS_SHM_ID;
+                setup_msg.length = 1;
+
+                let mut setup_reply = SaltyMsg::zeroed();
+                let serr2 = ipc::call_ctx(
+                    ipc_ctx(), fs_slot,
+                    &raw const setup_msg, &raw mut setup_reply,
+                );
+                if serr2 == 0 && setup_reply.label == SALTY_OK {
+                    puts(b"[VFS] saltyfs SHM transport established\n");
+                    *(&raw mut crate::VFS_SHM_ACTIVE) = true;
+                } else {
+                    puts(b"[VFS] saltyfs SHM setup failed (non-fatal)\n");
+                    // Cleanup: unmap VFS SHM since SaltyFS didn't establish transport
+                    let mut shm_unmap = SaltyMsg::zeroed();
+                    shm_unmap.label = MM_SHM_UNMAP;
+                    shm_unmap.length = 3;
+                    shm_unmap.regs[0] = VFS_SALTYFS_SHM_ID;
+                    shm_unmap.regs[1] = 0; // 0 = caller's own badge
+                    shm_unmap.regs[2] = VFS_SALTYFS_SHM_VADDR;
+                    let mut unmap_reply = SaltyMsg::zeroed();
+                    let _ = ipc::call_ctx(ipc_ctx(), VFS_CAP_MMSRV_EP, &raw const shm_unmap, &raw mut unmap_reply);
+                }
+            }
+        }
+    }
+}
+
+/// Create a symlink on the mounted SaltyFS filesystem.
+/// parent_ino = inode of parent directory on the remote FS
+/// name/name_len = name of the symlink entry
+/// target/target_len = symlink target path
+pub(crate) unsafe fn mount_symlink(
+    mount_idx: usize, parent_ino: u64,
+    name: *const u8, name_len: u8,
+    target: *const u8, target_len: u8,
+    reply: *mut SaltyMsg,
+) {
+    unsafe {
+        let mounts = &raw const crate::MOUNTS;
+        let m = &(*mounts)[mount_idx];
+        let mut req = SaltyMsg::zeroed();
+        req.label = SALTYFS_SYMLINK;
+        req.regs[0] = parent_ino;
+        if name_len as usize > 72 || target_len as usize > 64 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+        req.regs[1] = name_len as u64;
+        req.regs[2] = target_len as u64;
+        // MR3..MR11 = link name (72 bytes max)
+        let dst_name = &raw mut req.regs[3] as *mut u8;
+        let copy_name = name_len as usize;
+        for i in 0..copy_name {
+            *dst_name.add(i) = *name.add(i);
+        }
+        // MR12..MR19 = target (64 bytes max)
+        let dst_target = &raw mut req.regs[12] as *mut u8;
+        let copy_target = target_len as usize;
+        for i in 0..copy_target {
+            *dst_target.add(i) = *target.add(i);
+        }
+        req.length = 20;
+        let mut fs_reply = SaltyMsg::zeroed();
+        ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
+        (*reply).label = fs_reply.label;
+        if fs_reply.label == SALTY_OK {
+            (*reply).regs[0] = fs_reply.regs[0]; // new_ino
+        }
+    }
+}
+
+/// Read a symlink target from the mounted SaltyFS filesystem.
+pub(crate) unsafe fn mount_readlink(
+    mount_idx: usize, remote_ino: u64, reply: *mut SaltyMsg,
+) {
+    unsafe {
+        let mounts = &raw const crate::MOUNTS;
+        let m = &(*mounts)[mount_idx];
+        let mut req = SaltyMsg::zeroed();
+        req.label = SALTYFS_READLINK;
+        req.regs[0] = remote_ino;
+        req.length = 1;
+
+        let mut fs_reply = SaltyMsg::zeroed();
+        ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
+
+        if fs_reply.label != SALTY_OK {
+            (*reply).label = fs_reply.label;
+            return;
+        }
+
+        // Copy target data from SaltyFS reply to VFS reply
+        (*reply).label = SALTY_OK;
+        (*reply).regs[0] = fs_reply.regs[0]; // target_len
+        (*reply).length = fs_reply.length;
+        let target_len = fs_reply.regs[0] as usize;
+        if target_len > 0 {
+            let src = &fs_reply.regs[1] as *const u64 as *const u8;
+            let dst = &raw mut (*reply).regs[1] as *mut u8;
+            let copy = core::cmp::min(target_len, 152);
+            for i in 0..copy {
+                *dst.add(i) = *src.add(i);
+            }
+        }
+    }
+}
+
+/// Create a hard link on the mounted SaltyFS filesystem.
+pub(crate) unsafe fn mount_link(
+    mount_idx: usize, existing_ino: u64,
+    new_parent_ino: u64, name: *const u8, name_len: u8,
+    reply: *mut SaltyMsg,
+) {
+    unsafe {
+        let mounts = &raw const crate::MOUNTS;
+        let m = &(*mounts)[mount_idx];
+        let mut req = SaltyMsg::zeroed();
+        req.label = SALTYFS_LINK;
+        req.regs[0] = existing_ino;
+        req.regs[1] = new_parent_ino;
+        if name_len as usize > 136 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
+        let copy = name_len as usize;
+        req.regs[2] = copy as u64;
+        // MR3..MR19 = name (136 bytes max)
+        let dst = &raw mut req.regs[3] as *mut u8;
+        for i in 0..copy {
+            *dst.add(i) = *name.add(i);
+        }
+        req.length = 3 + ((copy as u64) + 7) / 8;
+        let mut fs_reply = SaltyMsg::zeroed();
+        ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
+        (*reply).label = fs_reply.label;
     }
 }

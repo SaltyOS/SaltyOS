@@ -178,6 +178,11 @@ pub const SALTYFS_UNLINK: u64 = 11;
 pub const SALTYFS_RMDIR: u64 = 12;
 pub const SALTYFS_RENAME: u64 = 13;
 pub const SALTYFS_TRUNCATE: u64 = 14;
+pub const SALTYFS_SHM_SETUP: u64 = 15;
+pub const SALTYFS_WRITE: u64 = 16;
+pub const SALTYFS_SYMLINK: u64 = 17;
+pub const SALTYFS_READLINK: u64 = 18;
+pub const SALTYFS_LINK: u64 = 19;
 
 /// Fixed virtual addresses for well-known memory regions.
 pub const INITRD_VADDR: u64 = 0x0000_0000_0100_0000;

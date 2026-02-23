@@ -13,7 +13,7 @@ pub fn run() -> bool {
     puts(b"[TEST_TERMINAL] Starting terminal tests\n");
 
     // Open /dev/console explicitly (test_runner doesn't have fd 0 pre-opened)
-    let fd = unsafe { posix::posix_open(b"/dev/console\0".as_ptr(), 0) };
+    let fd = unsafe { posix::posix_open(b"/dev/console\0".as_ptr(), 0, 0) };
     if fd < 0 {
         puts(b"[TEST_TERMINAL] FAIL: could not open /dev/console\n");
         return false;

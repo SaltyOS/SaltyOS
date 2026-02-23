@@ -88,6 +88,23 @@ pub(crate) fn cache_flush_block(block_nr: u64) -> bool {
     true
 }
 
+/// Flush all dirty blocks from the block cache to disk.
+pub(crate) fn cache_flush_all() {
+    unsafe {
+        for i in 0..CACHE_SLOTS {
+            if *(&raw const CACHE_DIRTY[i]) {
+                let block_nr = *(&raw const CACHE_BLOCK_NR[i]);
+                if block_nr != u64::MAX {
+                    let ptr = (CACHE_VADDR + (i as u64) * CACHE_SLOT_SIZE as u64) as *const u8;
+                    if write_block(block_nr, ptr) {
+                        *(&raw mut CACHE_DIRTY[i]) = false;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Remove a block from the cache.
 pub(crate) fn cache_invalidate(block_nr: u64) {
     unsafe {

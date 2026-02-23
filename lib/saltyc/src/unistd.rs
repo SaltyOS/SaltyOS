@@ -89,9 +89,14 @@ unsafe fn translate_stat(salty_stat: &salty::types::SaltyStat, out: *mut Stat) {
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn open(path: *const u8, flags: i32) -> i32 {
+pub unsafe extern "C" fn open(path: *const u8, flags: i32, mut args: ...) -> i32 {
     unsafe {
-        let ret = salty::posix::posix_open(path, flags);
+        let mode: u32 = if (flags & salty::O_CREAT as i32) != 0 {
+            args.arg::<u32>()
+        } else {
+            0
+        };
+        let ret = salty::posix::posix_open(path, flags, mode);
         if ret < 0 {
             errno::set_errno(errno::ENOENT);
         }
@@ -463,7 +468,7 @@ pub unsafe extern "C" fn umask(_mask: u32) -> u32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn truncate(path: *const u8, length: i64) -> i32 {
     unsafe {
-        let fd = salty::posix::posix_open(path, salty::O_WRONLY as i32);
+        let fd = salty::posix::posix_open(path, salty::O_WRONLY as i32, 0);
         if fd < 0 {
             errno::set_errno(errno::ENOENT);
             return -1;
@@ -725,9 +730,14 @@ pub unsafe extern "C" fn flock(_fd: i32, _operation: i32) -> i32 {
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn openat(dirfd: i32, path: *const u8, flags: i32, mut _args: ...) -> i32 {
+pub unsafe extern "C" fn openat(dirfd: i32, path: *const u8, flags: i32, mut args: ...) -> i32 {
     unsafe {
-        let ret = salty::posix::posix_openat(dirfd, path, flags);
+        let mode: u32 = if (flags & salty::O_CREAT as i32) != 0 {
+            args.arg::<u32>()
+        } else {
+            0
+        };
+        let ret = salty::posix::posix_openat(dirfd, path, flags, mode);
         if ret < 0 {
             errno::set_errno(errno::ENOENT);
         }

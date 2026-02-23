@@ -72,7 +72,7 @@ pub(crate) struct MountReaddirEntry {
     pub(crate) ino: u64,
     pub(crate) d_type: u8,
     pub(crate) name_len: u8,
-    pub(crate) name: [u8; 16],
+    pub(crate) name: [u8; 32],
 }
 
 impl MountReaddirEntry {
@@ -81,7 +81,7 @@ impl MountReaddirEntry {
             ino: 0,
             d_type: 0,
             name_len: 0,
-            name: [0; 16],
+            name: [0; 32],
         }
     }
 }

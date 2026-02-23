@@ -91,6 +91,7 @@ pub(crate) static mut NEXT_REPLY_SLOT: u64 = CAP_REPLY_BASE;
 pub(crate) static mut MOUNTS: [MountEntry; MAX_MOUNTS] = [MountEntry::zeroed(); MAX_MOUNTS];
 pub(crate) static mut MOUNT_DATA_INO: u32 = 0;
 pub(crate) static mut MOUNT_TRIED: u8 = 0;
+pub(crate) static mut VFS_SHM_ACTIVE: bool = false;
 
 pub(crate) static mut URANDOM_S0: u64 = 0;
 pub(crate) static mut URANDOM_S1: u64 = 0;
@@ -785,14 +786,33 @@ pub extern "C" fn _start() -> ! {
                                 let fde = &mut *(*cli).fds.add(fd as usize);
                                 let mount_idx = fde.dev_type as usize;
                                 let remote_ino = fde.sock_id as u64;
-                                let mut count = msg.regs[1];
-                                if count > 152 { count = 152; }
-                                mount::mount_read_inline(
-                                    mount_idx, remote_ino, fde.offset, count,
-                                    &raw mut reply);
-                                if reply.label == SALTY_OK {
-                                    let bytes_read = reply.regs[0];
-                                    fde.offset += bytes_read;
+                                let count = msg.regs[1];
+                                if *(&raw const VFS_SHM_ACTIVE) {
+                                    // SHM bulk read path
+                                    mount::mount_read_shm(
+                                        mount_idx, remote_ino, fde.offset, count,
+                                        0, &raw mut reply);
+                                    if reply.label == SALTY_OK {
+                                        let bytes_read = reply.regs[0];
+                                        // Copy from SHM to reply registers (up to 152 bytes)
+                                        let copy_len = bytes_read.min(152);
+                                        reply.length = 1 + (copy_len + 7) / 8;
+                                        let src = VFS_SALTYFS_SHM_VADDR as *const u8;
+                                        let dst = &raw mut reply.regs[1] as *mut u8;
+                                        for j in 0..copy_len as usize {
+                                            *dst.add(j) = *src.add(j);
+                                        }
+                                        fde.offset += bytes_read;
+                                    }
+                                } else {
+                                    let capped = count.min(152);
+                                    mount::mount_read_inline(
+                                        mount_idx, remote_ino, fde.offset, capped,
+                                        &raw mut reply);
+                                    if reply.label == SALTY_OK {
+                                        let bytes_read = reply.regs[0];
+                                        fde.offset += bytes_read;
+                                    }
                                 }
                             }
                             _ => {
@@ -825,8 +845,7 @@ pub extern "C" fn _start() -> ! {
                                 } else {
                                     let mount_idx = fde.dev_type as usize;
                                     let remote_ino = fde.sock_id as u64;
-                                    let mut count = msg.regs[1];
-                                    if count > 136 { count = 136; }
+                                    let count = msg.regs[1];
                                     let mut offset = fde.offset;
                                     if (fde.flags & O_APPEND) != 0 {
                                         if let Some((sz, _, _, _, _)) =
@@ -834,11 +853,29 @@ pub extern "C" fn _start() -> ! {
                                             offset = sz;
                                         }
                                     }
-                                    let src = &msg.regs[2] as *const u64 as *const u8;
-                                    mount::mount_write_inline(
-                                        mount_idx, remote_ino, offset,
-                                        src, count, &raw mut reply,
-                                    );
+                                    if count > 136 && *(&raw const VFS_SHM_ACTIVE) {
+                                        // SHM bulk write path: copy data to SHM
+                                        // Clamp to source (MR2..MR19 = 144 bytes) and SHM size
+                                        let max_inline: u64 = 18 * 8;
+                                        let shm_limit: u64 = VFS_SALTYFS_SHM_PAGES * 4096;
+                                        let safe_count = count.min(max_inline).min(shm_limit);
+                                        let src = &msg.regs[2] as *const u64 as *const u8;
+                                        let dst = VFS_SALTYFS_SHM_VADDR as *mut u8;
+                                        for j in 0..safe_count as usize {
+                                            *dst.add(j) = *src.add(j);
+                                        }
+                                        mount::mount_write_shm(
+                                            mount_idx, remote_ino, offset, safe_count,
+                                            0, &raw mut reply,
+                                        );
+                                    } else {
+                                        let capped = count.min(136);
+                                        let src = &msg.regs[2] as *const u64 as *const u8;
+                                        mount::mount_write_inline(
+                                            mount_idx, remote_ino, offset,
+                                            src, capped, &raw mut reply,
+                                        );
+                                    }
                                     if reply.label == SALTY_OK {
                                         let written = reply.regs[0];
                                         fde.offset = offset + written;

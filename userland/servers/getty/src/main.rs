@@ -33,7 +33,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         }
 
         // 3. Open PTY slave as fd 0
-        let fd0 = posix_open(b"/dev/pts/0\0".as_ptr(), 2); // O_RDWR
+        let fd0 = posix_open(b"/dev/pts/0\0".as_ptr(), 2, 0); // O_RDWR
         if fd0 < 0 {
             salty::serial::serial_puts(b"[getty] failed to open /dev/pts/0\n");
             posix_exit(1);

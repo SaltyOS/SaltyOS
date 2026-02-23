@@ -115,7 +115,7 @@ pub fn run() -> bool {
 
     // Test 6: create + write + read round-trip
     puts(b"[TEST_FS] Test 6: file create/write/read round-trip\n");
-    let fd = unsafe { posix::posix_open(b"/tmp/test.txt\0".as_ptr(), (O_CREAT | O_RDWR) as i32) };
+    let fd = unsafe { posix::posix_open(b"/tmp/test.txt\0".as_ptr(), (O_CREAT | O_RDWR) as i32, 0o644) };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: open /tmp/test.txt O_CREAT failed\n");
         return false;
@@ -130,7 +130,7 @@ pub fn run() -> bool {
     unsafe { posix::posix_close(fd) };
 
     // Re-open and read back
-    let fd = unsafe { posix::posix_open(b"/tmp/test.txt\0".as_ptr(), O_RDONLY as i32) };
+    let fd = unsafe { posix::posix_open(b"/tmp/test.txt\0".as_ptr(), O_RDONLY as i32, 0) };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: re-open /tmp/test.txt failed\n");
         return false;
@@ -170,7 +170,7 @@ pub fn run() -> bool {
 
     // Test 8: fstat on an open file
     puts(b"[TEST_FS] Test 8: fstat\n");
-    let fd = unsafe { posix::posix_open(b"/tmp/test.txt\0".as_ptr(), O_RDONLY as i32) };
+    let fd = unsafe { posix::posix_open(b"/tmp/test.txt\0".as_ptr(), O_RDONLY as i32, 0) };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: open for fstat failed\n");
         return false;
@@ -257,7 +257,7 @@ pub fn run() -> bool {
         puts(b"[TEST_FS] FAIL: mkdir /tmp2 failed\n");
         return false;
     }
-    let fd = unsafe { posix::posix_open(b"/tmp2/a.txt\0".as_ptr(), (O_CREAT | O_RDWR) as i32) };
+    let fd = unsafe { posix::posix_open(b"/tmp2/a.txt\0".as_ptr(), (O_CREAT | O_RDWR) as i32, 0o644) };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: create /tmp2/a.txt failed\n");
         return false;
@@ -279,7 +279,7 @@ pub fn run() -> bool {
         return false;
     }
 
-    let fd = unsafe { posix::posix_open(b"/tmp2/b.txt\0".as_ptr(), O_RDONLY as i32) };
+    let fd = unsafe { posix::posix_open(b"/tmp2/b.txt\0".as_ptr(), O_RDONLY as i32, 0) };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: open renamed file failed\n");
         return false;
@@ -301,7 +301,7 @@ pub fn run() -> bool {
 
     // Test 13: /dev/urandom
     puts(b"[TEST_FS] Test 13: /dev/urandom\n");
-    let fd = unsafe { posix::posix_open(b"/dev/urandom\0".as_ptr(), O_RDONLY as i32) };
+    let fd = unsafe { posix::posix_open(b"/dev/urandom\0".as_ptr(), O_RDONLY as i32, 0) };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: open /dev/urandom failed\n");
         return false;
@@ -341,7 +341,7 @@ pub fn run() -> bool {
     unsafe { posix::posix_mkdir(b"/tmp/a_very_long_directory_name_here\0".as_ptr(), 0o755) };
     // Path = /tmp/a_very_long_directory_name_here/test_long_path.txt (total > 64 bytes)
     let long_path = b"/tmp/a_very_long_directory_name_here/test_long_path.txt\0";
-    let fd = unsafe { posix::posix_open(long_path.as_ptr(), (O_CREAT | O_RDWR) as i32) };
+    let fd = unsafe { posix::posix_open(long_path.as_ptr(), (O_CREAT | O_RDWR) as i32, 0o644) };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: open long path failed\n");
         return false;
@@ -364,7 +364,7 @@ pub fn run() -> bool {
 
     // Test 15: Large file (>8KB)
     puts(b"[TEST_FS] Test 15: large file write/read\n");
-    let fd = unsafe { posix::posix_open(b"/tmp/bigfile\0".as_ptr(), (O_CREAT | O_RDWR) as i32) };
+    let fd = unsafe { posix::posix_open(b"/tmp/bigfile\0".as_ptr(), (O_CREAT | O_RDWR) as i32, 0o644) };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: create bigfile failed\n");
         return false;
@@ -388,7 +388,7 @@ pub fn run() -> bool {
     unsafe { posix::posix_close(fd) };
 
     // Re-open and verify
-    let fd = unsafe { posix::posix_open(b"/tmp/bigfile\0".as_ptr(), O_RDONLY as i32) };
+    let fd = unsafe { posix::posix_open(b"/tmp/bigfile\0".as_ptr(), O_RDONLY as i32, 0) };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: re-open bigfile failed\n");
         return false;
@@ -417,7 +417,7 @@ pub fn run() -> bool {
 
     // Test 16: Symlink
     puts(b"[TEST_FS] Test 16: symlink\n");
-    let fd = unsafe { posix::posix_open(b"/tmp/orig.txt\0".as_ptr(), (O_CREAT | O_RDWR) as i32) };
+    let fd = unsafe { posix::posix_open(b"/tmp/orig.txt\0".as_ptr(), (O_CREAT | O_RDWR) as i32, 0o644) };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: create orig.txt failed\n");
         return false;
@@ -432,7 +432,7 @@ pub fn run() -> bool {
         return false;
     }
     // Read through symlink
-    let fd = unsafe { posix::posix_open(b"/tmp/link.txt\0".as_ptr(), O_RDONLY as i32) };
+    let fd = unsafe { posix::posix_open(b"/tmp/link.txt\0".as_ptr(), O_RDONLY as i32, 0) };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: open through symlink failed\n");
         return false;
@@ -479,7 +479,7 @@ pub fn run() -> bool {
 
     // Test 17: Hard link
     puts(b"[TEST_FS] Test 17: hard link\n");
-    let fd = unsafe { posix::posix_open(b"/tmp/src.txt\0".as_ptr(), (O_CREAT | O_RDWR) as i32) };
+    let fd = unsafe { posix::posix_open(b"/tmp/src.txt\0".as_ptr(), (O_CREAT | O_RDWR) as i32, 0o644) };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: create src.txt failed\n");
         return false;
@@ -501,7 +501,7 @@ pub fn run() -> bool {
     }
     // Unlink original, read through hardlink
     unsafe { posix::posix_unlink(b"/tmp/src.txt\0".as_ptr()) };
-    let fd = unsafe { posix::posix_open(b"/tmp/dst.txt\0".as_ptr(), O_RDONLY as i32) };
+    let fd = unsafe { posix::posix_open(b"/tmp/dst.txt\0".as_ptr(), O_RDONLY as i32, 0) };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: open hardlink after unlink original failed\n");
         return false;
@@ -523,7 +523,7 @@ pub fn run() -> bool {
         puts(b"[TEST_FS] FAIL: stat /proc failed\n");
         return false;
     }
-    let fd = unsafe { posix::posix_open(b"/proc/self/status\0".as_ptr(), O_RDONLY as i32) };
+    let fd = unsafe { posix::posix_open(b"/proc/self/status\0".as_ptr(), O_RDONLY as i32, 0) };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: open /proc/self/status failed\n");
         return false;

@@ -156,7 +156,8 @@ pub unsafe extern "C" fn fopen(path: *const u8, mode: *const u8) -> *mut FILE {
     }
 
     unsafe {
-        let fd = salty::posix::posix_open(path, oflags);
+        let open_mode: u32 = if (oflags & salty::O_CREAT as i32) != 0 { 0o644 } else { 0 };
+        let fd = salty::posix::posix_open(path, oflags, open_mode);
         if fd < 0 {
             errno::set_errno(errno::ENOENT);
             return core::ptr::null_mut();
@@ -207,7 +208,8 @@ pub unsafe extern "C" fn freopen(
         fflush(f);
         salty::posix::posix_close((*f).fd);
         let (flags, oflags) = parse_mode(mode);
-        let fd = salty::posix::posix_open(path, oflags);
+        let open_mode: u32 = if (oflags & salty::O_CREAT as i32) != 0 { 0o644 } else { 0 };
+        let fd = salty::posix::posix_open(path, oflags, open_mode);
         if fd < 0 {
             (*f).fd = -1;
             return core::ptr::null_mut();
@@ -1323,7 +1325,7 @@ pub unsafe extern "C" fn mkstemp(template: *mut u8) -> i32 {
         for i in 0..6 {
             *template.add(base + i) = digits[((n >> (i * 4)) & 0xf) as usize];
         }
-        salty::posix::posix_open(template, (salty::O_RDWR | salty::O_CREAT | salty::O_EXCL) as i32)
+        salty::posix::posix_open(template, (salty::O_RDWR | salty::O_CREAT | salty::O_EXCL) as i32, 0o600)
     }
 }
 

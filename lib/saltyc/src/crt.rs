@@ -76,7 +76,7 @@ pub unsafe extern "C" fn __libc_start_main(
             salty::posix::posix_close(probe);
         } else {
             // fd 0 doesn't exist — fresh spawn. Open /dev/console.
-            let fd0 = salty::posix::posix_open(b"/dev/console\0".as_ptr(), 2); // O_RDWR
+            let fd0 = salty::posix::posix_open(b"/dev/console\0".as_ptr(), 2, 0); // O_RDWR
             if fd0 >= 0 {
                 salty::posix::posix_dup(fd0); // fd 1
                 salty::posix::posix_dup(fd0); // fd 2
