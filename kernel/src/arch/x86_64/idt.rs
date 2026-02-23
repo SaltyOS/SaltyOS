@@ -280,10 +280,23 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
                 let vspace = &mut *(*current).vspace_root;
                 // COW: PRESENT=1, write fault
                 if let Ok(true) = vspace.handle_cow_fault(f.cr2, f.error_code) {
+                    // If thread was concurrently suspended (TCB_SUSPEND from
+                    // another CPU) between faulting and completing the handler,
+                    // do not return to userspace — reschedule instead.
+                    // SCHED_IPC_LOCK is already held by the assembly exception
+                    // stub for user-mode exceptions. Just reschedule directly.
+                    if (*current).state == crate::sched::thread::ThreadState::Inactive {
+                        scheduler.reschedule();
+                    }
                     return;
                 }
                 // Demand paging: PRESENT=0, DEMAND bit set in PTE
                 if let Ok(true) = vspace.handle_demand_fault(f.cr2, f.error_code) {
+                    // SCHED_IPC_LOCK is already held by the assembly exception
+                    // stub for user-mode exceptions. Just reschedule directly.
+                    if (*current).state == crate::sched::thread::ThreadState::Inactive {
+                        scheduler.reschedule();
+                    }
                     return;
                 }
                 // Stack growth: PRESENT=0, address near stack pointer
@@ -294,6 +307,11 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
                     (*current).user_stack_top,
                     (*current).user_stack_min,
                 ) {
+                    // SCHED_IPC_LOCK is already held by the assembly exception
+                    // stub for user-mode exceptions. Just reschedule directly.
+                    if (*current).state == crate::sched::thread::ThreadState::Inactive {
+                        scheduler.reschedule();
+                    }
                     return;
                 }
             }

@@ -604,6 +604,14 @@ impl Endpoint {
     /// Slowpath: no handler → queue faulting thread as sender
     pub fn deliver_fault(&mut self, faulting_tcb: *mut Tcb, msg: &Message) {
         unsafe {
+            // Guard: if the thread was suspended (Inactive) between faulting
+            // and acquiring SCHED_IPC_LOCK, do not deliver the fault.
+            // This prevents zombie process revival on SMP — TCB_SUSPEND sets
+            // Inactive under SCHED_IPC_LOCK, so this check is race-free.
+            if (*faulting_tcb).state == ThreadState::Inactive {
+                return;
+            }
+
             // Set faulting thread state BEFORE fastpath/slowpath branch.
             // This ensures both paths have correct state — previously the
             // slowpath left blocked_reason as None, causing recv() to

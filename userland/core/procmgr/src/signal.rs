@@ -71,6 +71,42 @@ unsafe fn sig_terminate_proc(idx: usize, sig: usize) {
         }
 
         salty::invoke::invoke(proctab(idx).tcb_cap, salty::TCB_SUSPEND, 0, 0, 0, 0);
+
+        // Deregister from mmsrv so it stops processing faults for this process
+        if proctab(idx).mmsrv_registered {
+            let mut mm_msg = SaltyMsg::zeroed();
+            let mut mm_reply = SaltyMsg::zeroed();
+            mm_msg.label = salty::consts::MM_DEREGISTER;
+            mm_msg.length = 1;
+            mm_msg.regs[0] = proctab(idx).badge;
+            let _ = salty::ipc::call_ctx(
+                super::ipc_ctx(),
+                super::CAP_MMSRV_EP,
+                &raw const mm_msg,
+                &raw mut mm_reply,
+            );
+            proctab(idx).mmsrv_registered = false;
+        }
+
+        // Notify VFS to tear down fd state for this process
+        {
+            let mut vfs_msg = SaltyMsg::zeroed();
+            vfs_msg.label = salty::consts::POSIX_VFS_CLIENT_EXIT;
+            vfs_msg.length = 1;
+            vfs_msg.regs[0] = proctab(idx).badge;
+            for _ in 0..16 {
+                let err = salty::ipc::nbsend_ctx(
+                    super::ipc_ctx(),
+                    super::CAP_VFS_EP,
+                    &raw const vfs_msg,
+                );
+                if err == 0 {
+                    break;
+                }
+                salty::syscall::syscall(salty::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+            }
+        }
+
         proctab(idx).state = PROC_ZOMBIE;
         proctab(idx).exit_code = exit_code;
 
