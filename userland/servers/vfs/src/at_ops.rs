@@ -7,7 +7,7 @@ use salty::types::*;
 use crate::client::{extract_path, flags_allow_write, get_client, get_client_noalloc};
 use crate::consts::*;
 use crate::fileops::{fill_stat_reply, normalize_path_for_client};
-use crate::mount::{find_mount_for_path, mount_lookup, parse_mount_path, split_mount_sub_path, mount_symlink, mount_readlink, mount_link};
+use crate::mount::{find_mount_for_path, mount_lookup, mount_stat, parse_mount_path, split_mount_sub_path, mount_symlink, mount_readlink, mount_link};
 use crate::path::{
     resolve_at_start, resolve_parent, resolve_parent_from, resolve_path, resolve_path_from,
     resolve_path_raw, resolve_path_raw_nofollow, symlink_target,
@@ -53,23 +53,35 @@ pub(crate) unsafe fn do_open(
             }
         }
 
-        // Mount point intercept — only applies to absolute paths under /mnt/data/
-        let path_slice = core::slice::from_raw_parts(path, path_len as usize);
-        if let Some(mount_idx) = find_mount_for_path(path_slice, path_len) {
-            let (_, sub_start, sub_len) = parse_mount_path(path_slice, path_len);
+        // Mount point intercept — normalize relative paths to absolute first
+        let mut abs_buf = [0u8; MAX_PATH_LEN];
+        let (check_ptr, check_len): (*const u8, u8) = if *path != b'/' {
+            if let Some(pair) =
+                normalize_path_for_client(badge, path, path_len, abs_buf.as_mut_ptr())
+            {
+                pair
+            } else {
+                (path, path_len)
+            }
+        } else {
+            (path, path_len)
+        };
+        let check_slice = core::slice::from_raw_parts(check_ptr, check_len as usize);
+        if let Some(mount_idx) = find_mount_for_path(check_slice, check_len) {
+            let (_, sub_start, sub_len) = parse_mount_path(check_slice, check_len);
             if sub_len > 0 {
-                let mut remote_ino = mount_lookup(mount_idx, path.add(sub_start), sub_len);
+                let mut remote_ino = mount_lookup(mount_idx, check_ptr.add(sub_start), sub_len);
                 if remote_ino == 0 {
                     if (flags & O_CREAT) == 0 {
                         (*reply).label = SALTY_NOT_FOUND;
                         return;
                     }
                     let (p_start, p_len, l_start, l_len) =
-                        split_mount_sub_path(path.add(sub_start), sub_len);
+                        split_mount_sub_path(check_ptr.add(sub_start), sub_len);
                     let parent_ino = if p_len == 0 {
                         (*(&raw const crate::MOUNTS[mount_idx])).root_ino as u64
                     } else {
-                        mount_lookup(mount_idx, path.add(sub_start + p_start), p_len)
+                        mount_lookup(mount_idx, check_ptr.add(sub_start + p_start), p_len)
                     };
                     if parent_ino == 0 {
                         (*reply).label = SALTY_NOT_FOUND;
@@ -78,7 +90,7 @@ pub(crate) unsafe fn do_open(
                     use crate::mount::mount_create;
                     remote_ino = mount_create(
                         mount_idx, parent_ino,
-                        path.add(sub_start + l_start), l_len, mode & 0o777,
+                        check_ptr.add(sub_start + l_start), l_len, mode & 0o777,
                     );
                     if remote_ino == 0 {
                         (*reply).label = SALTY_INVALID_OPERATION;
@@ -319,6 +331,45 @@ pub(crate) unsafe fn handle_fstatat(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
             }
             inode_by_ino((*(*cli).fds.add(dirfd as usize)).inode)
         } else {
+            // Normalize relative paths and check for mount points
+            let mut abs_buf = [0u8; MAX_PATH_LEN];
+            if let Some((norm_ptr, norm_len)) =
+                normalize_path_for_client(badge, path.as_ptr(), path_len, abs_buf.as_mut_ptr())
+            {
+                let norm_slice = core::slice::from_raw_parts(norm_ptr, norm_len as usize);
+                if let Some(mount_idx) = find_mount_for_path(norm_slice, norm_len) {
+                    let (_, sub_start, sub_len) = parse_mount_path(norm_slice, norm_len);
+                    if sub_len > 0 {
+                        let remote_ino = mount_lookup(mount_idx, norm_ptr.add(sub_start), sub_len);
+                        if remote_ino == 0 {
+                            (*reply).label = SALTY_NOT_FOUND;
+                            return;
+                        }
+                        match mount_stat(mount_idx, remote_ino) {
+                            Some((size, mode, nlink, mtime, _)) => {
+                                (*reply).label = SALTY_OK;
+                                (*reply).length = 8;
+                                (*reply).regs[0] = remote_ino;
+                                (*reply).regs[1] = mode as u64;
+                                (*reply).regs[2] = nlink as u64;
+                                (*reply).regs[3] = size;
+                                (*reply).regs[4] = 0;
+                                (*reply).regs[5] = 0;
+                                (*reply).regs[6] = mtime;
+                                (*reply).regs[7] = if (mode & S_IFMT_L) == S_IFDIR_L {
+                                    FTYPE_DIRECTORY as u64
+                                } else {
+                                    FTYPE_REGULAR as u64
+                                };
+                            }
+                            None => {
+                                (*reply).label = SALTY_NOT_FOUND;
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
             resolve_path_from(start_ino, path.as_ptr(), path_len)
         };
 
@@ -705,6 +756,18 @@ pub(crate) unsafe fn handle_utimensat(msg: *const SaltyMsg, reply: *mut SaltyMsg
             if start_ino == 0 {
                 (*reply).label = SALTY_INVALID_ARGUMENT;
                 return;
+            }
+            // Normalize relative paths and check for mount points
+            let mut abs_buf = [0u8; MAX_PATH_LEN];
+            if let Some((norm_ptr, norm_len)) =
+                normalize_path_for_client(badge, path.as_ptr(), path_len, abs_buf.as_mut_ptr())
+            {
+                let norm_slice = core::slice::from_raw_parts(norm_ptr, norm_len as usize);
+                if let Some(_mount_idx) = find_mount_for_path(norm_slice, norm_len) {
+                    // No SaltyFS utimensat support yet — return OK silently
+                    (*reply).label = SALTY_OK;
+                    return;
+                }
             }
             resolve_path_from(start_ino, path.as_ptr(), path_len)
         };

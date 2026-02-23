@@ -73,6 +73,15 @@ def crc32c(data: bytes) -> int:
     return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
 
 
+def fnv1a_hash(name: bytes) -> int:
+    """FNV-1a hash matching handlers.rs:24-31."""
+    h = 0xcbf29ce484222325
+    for b in name:
+        h ^= b
+        h = (h * 0x00000100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
 def pack_btree_key(object_id: int, item_type: int, offset: int) -> bytes:
     """Pack a BTreeKey (packed struct: u64, u8, u64 = 17 bytes)."""
     return struct.pack("<QBQ", object_id, item_type, offset)
@@ -345,7 +354,7 @@ def create_saltyfs_image(output_path: Path, size: int, files: list):
         # Directory entry under root
         dir_item_data = pack_dir_item(file_ino, fname_bytes, dir_type=1)
         btree_items.append((
-            pack_btree_key(ROOT_INO, SALTY_DIR_ITEM, file_ino),
+            pack_btree_key(ROOT_INO, SALTY_DIR_ITEM, fnv1a_hash(fname_bytes)),
             dir_item_data,
         ))
 
@@ -382,6 +391,16 @@ def create_saltyfs_image(output_path: Path, size: int, files: list):
             file_data_blocks.append((data_block, content))
 
     used_blocks = next_data_block
+
+    # Sort items by key to maintain B-tree invariant
+    def btree_key_sort(item):
+        key_bytes = item[0]
+        object_id = struct.unpack_from("<Q", key_bytes, 0)[0]
+        item_type = key_bytes[8]
+        offset = struct.unpack_from("<Q", key_bytes, 9)[0]
+        return (object_id, item_type, offset)
+
+    btree_items.sort(key=btree_key_sort)
 
     # Build the root B-tree leaf node
     root_btree = build_btree_leaf(

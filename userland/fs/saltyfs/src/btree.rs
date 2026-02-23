@@ -225,7 +225,10 @@ where
 
         let mut found_in_leaf = false;
         let mut stopped = false;
+        let mut leaf_max_offset = search_key.offset;
 
+        // SAFETY: leaf pointer is valid and points to a mapped B-tree node block.
+        // Items are read via read_unaligned to handle packed layout.
         unsafe {
             let items_start = leaf.add(core::mem::size_of::<BTreeNodeHeader>());
             let item_size = core::mem::size_of::<BTreeItem>();
@@ -246,11 +249,19 @@ where
                     }
                     total += 1;
                     found_in_leaf = true;
-                    if item.key.offset < u64::MAX {
-                        search_key.offset = item.key.offset + 1;
+                    if item.key.offset >= leaf_max_offset {
+                        if item.key.offset < u64::MAX {
+                            leaf_max_offset = item.key.offset + 1;
+                        } else {
+                            leaf_max_offset = u64::MAX;
+                        }
                     }
                 }
             }
+        }
+
+        if !stopped {
+            search_key.offset = leaf_max_offset;
         }
 
         if stopped || !found_in_leaf {
