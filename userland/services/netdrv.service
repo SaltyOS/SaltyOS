@@ -1,0 +1,12 @@
+[Service]
+Name=netdrv
+Binary=netdrv
+Type=simple
+Restart=always
+
+[Dependencies]
+After=pcisrv nameserv mmsrv
+Before=vfs
+
+[Capabilities]
+NeedEP=pcisrv:64

@@ -1,6 +1,9 @@
 //! IRQ Handler
 //!
 //! Kernel object for routing hardware interrupts to userspace via notifications.
+//! Supports shared IRQs: multiple handlers can be registered for the same IRQ
+//! line via a singly-linked list per IRQ. Each handler is independently
+//! acknowledged; `dispatch_irq()` signals every acknowledged handler.
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
@@ -23,6 +26,8 @@ pub struct IrqHandler {
     pub acknowledged: bool,
     /// Whether this handler is active (registered in the global table)
     pub active: bool,
+    /// Next handler in chain for the same IRQ (shared IRQ support)
+    pub next: *mut IrqHandler,
 }
 
 impl IrqHandler {
@@ -33,83 +38,133 @@ impl IrqHandler {
             notification: core::ptr::null_mut(),
             acknowledged: true,
             active: false,
+            next: core::ptr::null_mut(),
         }
     }
 
     /// Cleanup when IRQ handler is destroyed
     pub fn cleanup(&mut self) {
         if self.active {
-            unregister_handler(self.irq_num as usize);
+            // SAFETY: self is a valid IrqHandler pointer; unregister_handler
+            // removes it from the per-IRQ chain.
+            unregister_handler(self as *mut IrqHandler);
             self.active = false;
         }
         self.notification = core::ptr::null_mut();
     }
 }
 
-/// Global IRQ handler table
+/// Global IRQ handler table — each entry is the head of a linked list of handlers.
 static mut IRQ_HANDLERS: [*mut IrqHandler; MAX_IRQS] = [core::ptr::null_mut(); MAX_IRQS];
 
 /// Dispatch an IRQ from the IDT handler
 ///
 /// Called from the interrupt handler when a hardware IRQ fires.
-/// If a handler is registered and has a bound notification, signals it.
+/// Walks the handler chain for the given IRQ and signals every
+/// acknowledged handler's notification.
 pub fn dispatch_irq(irq_num: usize) {
     if irq_num >= MAX_IRQS {
         return;
     }
 
+    // SAFETY: Called from interrupt context with interrupts disabled.
+    // IRQ_HANDLERS is only mutated under SCHED_IPC_LOCK which cannot
+    // be held during interrupt dispatch (EOI is sent before schedulable code).
     unsafe {
-        let handler = IRQ_HANDLERS[irq_num];
-        if handler.is_null() {
-            return;
-        }
-
-        let h = &mut *handler;
-        if !h.acknowledged {
-            // IRQ not yet acknowledged by userspace, skip
-            return;
-        }
-
-        // Mark as pending (unacknowledged)
-        h.acknowledged = false;
-
-        // Signal the bound notification
-        if !h.notification.is_null() {
-            let ntfn = &mut *h.notification;
-            ntfn.signal(1u64 << (irq_num % 64));
+        let mut cur = (*(&raw const IRQ_HANDLERS))[irq_num];
+        while !cur.is_null() {
+            let h = &mut *cur;
+            if h.acknowledged && !h.notification.is_null() {
+                h.acknowledged = false;
+                (*h.notification).signal(1u64 << (irq_num % 64));
+            }
+            cur = h.next;
         }
     }
 }
 
-/// Register an IRQ handler in the global table
+/// Register an IRQ handler by prepending it to the chain for its IRQ.
 ///
-/// Returns false if the IRQ already has a handler registered.
+/// Always succeeds for valid IRQ numbers (shared IRQs are allowed).
+/// Caller must hold SCHED_IPC_LOCK.
 pub fn register_handler(irq_num: usize, handler: *mut IrqHandler) -> bool {
     if irq_num >= MAX_IRQS {
         return false;
     }
 
+    // SAFETY: Caller holds SCHED_IPC_LOCK; single-writer access to IRQ_HANDLERS.
     unsafe {
-        if !IRQ_HANDLERS[irq_num].is_null() {
-            return false;
-        }
-        IRQ_HANDLERS[irq_num] = handler;
+        let head = (*(&raw const IRQ_HANDLERS))[irq_num];
+        (*handler).next = head;
         (*handler).active = true;
+        (*(&raw mut IRQ_HANDLERS))[irq_num] = handler;
         true
     }
 }
 
-/// Unregister an IRQ handler from the global table
-pub fn unregister_handler(irq_num: usize) {
+/// Check whether any handler is registered for this IRQ.
+///
+/// Caller must hold SCHED_IPC_LOCK.
+pub fn has_handlers(irq_num: usize) -> bool {
     if irq_num >= MAX_IRQS {
+        return false;
+    }
+    // SAFETY: Single-threaded access guarded by SCHED_IPC_LOCK at call site.
+    unsafe { !(*(&raw const IRQ_HANDLERS))[irq_num].is_null() }
+}
+
+/// Check whether any handler in the chain has a bound notification.
+///
+/// Used to decide whether to mask the IOAPIC when a handler's notification
+/// is cleared — only mask if no other handler still has an active notification.
+///
+/// Caller must hold SCHED_IPC_LOCK.
+pub fn has_active_notification(irq_num: usize) -> bool {
+    if irq_num >= MAX_IRQS {
+        return false;
+    }
+    // SAFETY: Caller holds SCHED_IPC_LOCK.
+    unsafe {
+        let mut cur = (*(&raw const IRQ_HANDLERS))[irq_num];
+        while !cur.is_null() {
+            if !(*cur).notification.is_null() {
+                return true;
+            }
+            cur = (*cur).next;
+        }
+        false
+    }
+}
+
+/// Remove a specific handler from its IRQ chain.
+///
+/// Caller must hold SCHED_IPC_LOCK.
+pub fn unregister_handler(handler: *mut IrqHandler) {
+    if handler.is_null() {
         return;
     }
-
+    // SAFETY: Caller holds SCHED_IPC_LOCK; single-writer access to IRQ_HANDLERS.
     unsafe {
-        let handler = IRQ_HANDLERS[irq_num];
-        if !handler.is_null() {
-            (*handler).active = false;
+        let irq_num = (*handler).irq_num as usize;
+        if irq_num >= MAX_IRQS {
+            return;
         }
-        IRQ_HANDLERS[irq_num] = core::ptr::null_mut();
+        (*handler).active = false;
+
+        let head = (*(&raw const IRQ_HANDLERS))[irq_num];
+        if head == handler {
+            // Removing head of chain
+            (*(&raw mut IRQ_HANDLERS))[irq_num] = (*handler).next;
+        } else {
+            // Walk chain to find predecessor
+            let mut prev = head;
+            while !prev.is_null() && (*prev).next != handler {
+                prev = (*prev).next;
+            }
+            if !prev.is_null() {
+                (*prev).next = (*handler).next;
+            }
+        }
+        (*handler).next = core::ptr::null_mut();
     }
 }

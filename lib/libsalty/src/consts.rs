@@ -429,6 +429,7 @@ pub const MM_FORK_REGIONS: u64 = 0x8D;
 pub const MM_ALLOC_THREAD_OBJECTS: u64 = 0x8E;
 pub const MM_FREE_THREAD_OBJECTS: u64 = 0x8F;
 pub const MM_GET_CLIENT_STATS: u64 = 0x90;
+pub const MM_ALLOC_OBJECT: u64 = 0x91;
 
 /// Name service IPC protocol labels (register/lookup endpoint by name).
 pub const POSIX_NS_REGISTER: u64 = 1;
