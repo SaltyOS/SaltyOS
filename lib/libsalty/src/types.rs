@@ -345,6 +345,27 @@ impl SockAddrUn {
     }
 }
 
+/// IPv4 socket address. `family` is `AF_INET` (2).
+/// `port` and `addr` are in **host byte order** (not network byte order).
+/// For example, 10.0.2.2 is `0x0A000202`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SockAddrIn {
+    pub family: u16,
+    pub port: u16,
+    pub addr: u32,
+}
+
+impl SockAddrIn {
+    pub const fn zeroed() -> Self {
+        SockAddrIn {
+            family: 0,
+            port: 0,
+            addr: 0,
+        }
+    }
+}
+
 /// POSIX poll file descriptor: `fd` to monitor, requested `events`
 /// (POLLIN/POLLOUT), and returned `revents` filled by the kernel/VFS.
 #[repr(C)]

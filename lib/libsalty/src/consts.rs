@@ -565,14 +565,48 @@ pub const ELF_OUT_OF_MEMORY: i32 = 8;
 pub const ELF_TOO_SMALL: i32 = 9;
 pub const ELF_MAP_FAILED: i32 = 11;
 
-/// Socket constants (AF_UNIX, SOCK_STREAM, SCM_RIGHTS, shutdown modes).
+/// Socket constants (address families, socket types, shutdown modes).
 pub const AF_UNIX: i32 = 1;
+pub const AF_INET: i32 = 2;
 pub const SOCK_STREAM: i32 = 1;
+pub const SOCK_DGRAM: i32 = 2;
+pub const IPPROTO_TCP: i32 = 6;
+pub const IPPROTO_UDP: i32 = 17;
 pub const SCM_RIGHTS: i32 = 1;
 pub const SOL_SOCKET: i32 = 1;
 pub const SHUT_RD: i32 = 0;
 pub const SHUT_WR: i32 = 1;
 pub const SHUT_RDWR: i32 = 2;
+
+/// Network stack IPC labels (netdrv protocol).
+pub const NET_SOCKET: u64 = 0xA0;
+pub const NET_CONNECT: u64 = 0xA1;
+pub const NET_SEND: u64 = 0xA2;
+pub const NET_RECV: u64 = 0xA3;
+pub const NET_CLOSE: u64 = 0xA4;
+pub const NET_BIND: u64 = 0xA5;
+pub const NET_LISTEN: u64 = 0xA6;
+pub const NET_ACCEPT: u64 = 0xA7;
+pub const NET_SENDTO: u64 = 0xA8;
+pub const NET_RECVFROM: u64 = 0xA9;
+pub const NET_SHUTDOWN: u64 = 0xAA;
+pub const NET_GETSOCKNAME: u64 = 0xAB;
+pub const NET_GETPEERNAME: u64 = 0xAC;
+pub const NET_SETSOCKOPT: u64 = 0xAD;
+pub const NET_GETSOCKOPT: u64 = 0xAE;
+pub const NET_POLL_STATUS: u64 = 0xAF;
+pub const NET_REGISTER_VFS: u64 = 0xB0;
+pub const NET_COMPLETE: u64 = 0xB1;
+
+/// Extended error codes for network operations.
+pub const SALTY_CONN_REFUSED: u64 = 21;
+pub const SALTY_TIMED_OUT: u64 = 22;
+
+/// Async operation type codes (used in NET_COMPLETE callbacks).
+pub const INET_OP_CONNECT: u8 = 1;
+pub const INET_OP_RECV: u8 = 2;
+pub const INET_OP_ACCEPT: u8 = 3;
+pub const INET_OP_RECVFROM: u8 = 4;
 
 /// Poll event flags (POLLIN, POLLOUT, POLLERR, POLLHUP, POLLNVAL).
 pub const POLLIN: i16 = 0x001;

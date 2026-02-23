@@ -61,6 +61,8 @@ pub(crate) fn salty_err_to_posix(label: u64) -> i32 {
         SALTY_INVALID_OPERATION => -1,         // EPERM
         SALTY_OUT_OF_RANGE => -34,             // ERANGE
         SALTY_CANCELLED => -125,               // ECANCELED
+        SALTY_CONN_REFUSED => -111,            // ECONNREFUSED
+        SALTY_TIMED_OUT => -110,               // ETIMEDOUT
         _ => -5,                               // EIO (generic)
     }
 }
