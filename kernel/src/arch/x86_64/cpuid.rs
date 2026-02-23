@@ -86,7 +86,7 @@ unsafe fn cpuid_leaf(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
             ebx_out = lateout(reg) ebx,
             inlateout("ecx") subleaf => ecx,
             lateout("edx") edx,
-            options(nostack),
+            // push/pop rbx touches the current stack, so `nostack` is invalid.
         );
     }
     (eax, ebx, ecx, edx)

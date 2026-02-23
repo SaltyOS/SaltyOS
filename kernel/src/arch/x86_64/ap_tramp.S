@@ -10,6 +10,8 @@
 //!   0x8FF8: per-CPU kernel stack top (u64)
 //!   0x8FE8: cpu_id (u32)
 //!   0x8FE0: ap_entry function pointer (u64)
+//!   0x8F02: consumed flag (u16, AP writes 0xACE1 after reading mailbox)
+//!   0x8F00: magic (u16, AP writes 0xCAFE on trampoline entry)
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
@@ -112,6 +114,10 @@ _ap_lm64:
 
     // Load ap_entry function pointer (set by BSP at 0x8FE0)
     mov  0x8FE0, %rax
+
+    // Signal BSP that all mailbox values have been consumed into registers.
+    // BSP checks this flag before overwriting the mailbox for the next AP.
+    movw $0xACE1, 0x8F02
 
     // Call ap_entry(cpu_id)
     call *%rax

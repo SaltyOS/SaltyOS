@@ -391,7 +391,8 @@ pub fn init() {
 }
 
 unsafe fn reload_segments() {
-    // SAFETY: Called after GDT is loaded with valid segments
+    // SAFETY: Called after GDT is loaded with valid segments.
+    // This block uses push/retfq which modify RSP, so no `options(nostack)`.
     unsafe {
         core::arch::asm!(
             // Reload CS via far return
@@ -407,7 +408,6 @@ unsafe fn reload_segments() {
             "mov fs, ax",
             "mov gs, ax",
             "mov ss, ax",
-            options(nostack)
         );
     }
 }

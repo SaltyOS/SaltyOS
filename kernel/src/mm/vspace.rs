@@ -608,7 +608,9 @@ fn irqs_disabled() -> bool {
         core::arch::asm!(
             "pushfq; pop {}",
             out(reg) rflags,
-            options(nomem, nostack)
+            // pushfq/pop touches the current stack, so this asm must not use
+            // `nostack` (and it does access memory via the stack).
+            options(preserves_flags)
         );
     }
     (rflags & (1 << 9)) == 0
@@ -2124,7 +2126,9 @@ pub unsafe fn save_irq_disable() -> u64 {
         core::arch::asm!(
             "pushfq; pop {}",
             out(reg) rflags,
-            options(nomem, nostack)
+            // pushfq/pop touches the current stack, so this asm must not use
+            // `nostack` (and it does access memory via the stack).
+            options(preserves_flags)
         );
         core::arch::asm!("cli", options(nomem, nostack));
         rflags

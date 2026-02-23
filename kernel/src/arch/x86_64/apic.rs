@@ -731,15 +731,38 @@ static AP_READY: [core::sync::atomic::AtomicBool; super::cpu::MAX_CPUS] = {
     [INIT; super::cpu::MAX_CPUS]
 };
 
+/// Per-CPU "claimed" bitmap to detect duplicate cpu_id assignment.
+/// An AP atomically swaps this to `true` on entry; a second AP with the
+/// same cpu_id sees `true` and halts instead of corrupting the first AP's stack.
+static AP_CLAIMED: [core::sync::atomic::AtomicBool; super::cpu::MAX_CPUS] = {
+    const INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    [INIT; super::cpu::MAX_CPUS]
+};
+
+/// Clear the claimed flag for a cpu_id (BSP calls this before sending SIPI).
+pub fn clear_ap_claimed(cpu_id: usize) {
+    AP_CLAIMED[cpu_id].store(false, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Atomically claim a cpu_id. Returns `true` if this caller is the first
+/// to claim it, `false` if another AP already claimed this slot.
+pub fn try_claim_ap(cpu_id: usize) -> bool {
+    !AP_CLAIMED[cpu_id].swap(true, core::sync::atomic::Ordering::SeqCst)
+}
+
 /// Get AP boot count
 pub fn ap_boot_count() -> usize {
     AP_BOOT_COUNT.load(core::sync::atomic::Ordering::SeqCst)
 }
 
-/// Signal that an AP has finished initialization
+/// Signal that an AP has finished initialization.
+///
+/// Idempotent: only increments AP_BOOT_COUNT on the first call for a given
+/// cpu_id, preventing double-counting if a duplicate AP somehow reaches here.
 pub fn signal_ap_ready(cpu_id: usize) {
-    AP_READY[cpu_id].store(true, core::sync::atomic::Ordering::SeqCst);
-    AP_BOOT_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    if !AP_READY[cpu_id].swap(true, core::sync::atomic::Ordering::SeqCst) {
+        AP_BOOT_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Trampoline communication area addresses (physical)
@@ -748,6 +771,8 @@ const TRAMPOLINE_PML4: u64 = 0x8FF0;
 const TRAMPOLINE_STACK: u64 = 0x8FF8;
 const TRAMPOLINE_CPU_ID: u64 = 0x8FE8;
 const TRAMPOLINE_ENTRY: u64 = 0x8FE0;
+/// Consumed flag: AP writes 0xACE1 here after reading all mailbox values.
+const TRAMPOLINE_CONSUMED: u64 = 0x8F02;
 
 /// SIPI vector (physical page number: 0x8000 / 0x1000 = 0x08)
 const SIPI_VECTOR: u32 = 0x08;
@@ -892,6 +917,13 @@ pub unsafe fn start_aps(cpu_descriptors: &[super::acpi::CpuDescriptor], cpu_coun
             let magic_ptr = (0x8F00u64 + PHYS_MAP_OFFSET) as *mut u16;
             magic_ptr.write_volatile(0);
 
+            // Clear consumed flag (AP writes 0xACE1 after reading mailbox)
+            let consumed_ptr = (TRAMPOLINE_CONSUMED + PHYS_MAP_OFFSET) as *mut u16;
+            consumed_ptr.write_volatile(0);
+
+            // Clear claimed flag so the AP can atomically claim this cpu_id
+            clear_ap_claimed(cpu_id as usize);
+
             // Verify trampoline code was copied by reading first bytes
             let verify_ptr = (TRAMPOLINE_BASE + PHYS_MAP_OFFSET) as *const u8;
             let byte0 = verify_ptr.read_volatile();
@@ -982,6 +1014,31 @@ pub unsafe fn start_aps(cpu_descriptors: &[super::acpi::CpuDescriptor], cpu_coun
                             super::outb(0x3F8, d);
                         }
                         serial(")\n");
+                    }
+
+                    // Check if the AP consumed the mailbox before we overwrite it.
+                    // The AP writes 0xACE1 to TRAMPOLINE_CONSUMED after reading
+                    // all mailbox values into registers.
+                    let consumed_ptr = (TRAMPOLINE_CONSUMED + PHYS_MAP_OFFSET) as *const u16;
+                    let consumed = consumed_ptr.read_volatile();
+                    if consumed != 0xACE1 {
+                        let magic = magic_ptr.read_volatile();
+                        if magic == 0xCAFE {
+                            // Trampoline reached but mailbox not yet consumed —
+                            // AP is in mode transition. Spin briefly for consumption.
+                            serial("[SMP]   Waiting for mailbox consumption...\n");
+                            let mut consumed_wait = 10; // 10ms
+                            while consumed_wait > 0 {
+                                super::pit::delay_us(1_000);
+                                if consumed_ptr.read_volatile() == 0xACE1 {
+                                    break;
+                                }
+                                consumed_wait -= 1;
+                            }
+                            if consumed_ptr.read_volatile() != 0xACE1 {
+                                serial("[SMP]   Mailbox NOT consumed, poisoning\n");
+                            }
+                        }
                     }
 
                     // Poison trampoline CPU_ID to catch late arrivals

@@ -384,6 +384,21 @@ impl Scheduler {
         }
     }
 
+    /// Fastpath resume housekeeping after a direct `context_switch()`.
+    ///
+    /// IPC fastpath performs a direct register context switch and bypasses
+    /// `do_context_switch()`, so it must explicitly flush deferred enqueue once
+    /// the old thread's registers have been saved.
+    ///
+    /// # Preconditions
+    /// - `SCHED_IPC_LOCK` is held.
+    /// - IRQs are disabled.
+    pub fn process_pending_enqueue_after_direct_switch(&mut self) {
+        self.lock();
+        self.process_pending_enqueue();
+        self.unlock();
+    }
+
     // ---------------------------------------------------------------
     // Context switch helpers
     // ---------------------------------------------------------------

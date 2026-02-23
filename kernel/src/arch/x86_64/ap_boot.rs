@@ -27,6 +27,17 @@ pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
         }
     }
 
+    // Guard: detect duplicate cpu_id. If another AP already claimed this slot,
+    // two APs would share the same kernel stack → immediate corruption.
+    if !super::apic::try_claim_ap(cpu_id) {
+        crate::serial_puts("[AP] DUPLICATE cpu_id detected, halting\n");
+        loop {
+            unsafe {
+                core::arch::asm!("hlt", options(nomem, nostack));
+            }
+        }
+    }
+
     {
         let s = crate::SerialGuard::acquire();
         s.puts("[AP] Entry cpu_id=");

@@ -207,6 +207,8 @@ pub unsafe extern "C" fn fastpath_call_rust(
         // Direct switch: set receiver as current, switch VSpace + kernel stack
         // Hold scheduler lock for queue/current-pointer mutations
         sched.lock();
+        let cs_cpu = crate::arch::current_cpu() as usize;
+        sched.context_switches[cs_cpu] += 1;
         sched.set_current(receiver);
         (*receiver).state = ThreadState::Running;
         sched.unlock();
@@ -221,8 +223,18 @@ pub unsafe extern "C" fn fastpath_call_rust(
             crate::arch::set_tss_rsp0((*receiver).kernel_stack_top);
         }
 
+        // Mirror do_context_switch(): preserve per-thread TLS across a direct
+        // fastpath context switch.
+        (*current).tls_base = crate::arch::read_fs_base();
+
         // Release SCHED_IPC_LOCK before context switch (IF=0, no interrupts possible)
         SCHED_IPC_LOCK.unlock();
+
+        // Mirror do_context_switch() FPU/TLS handling to avoid diverging CPU-local
+        // state when fastpath bypasses the scheduler's normal switch path.
+        crate::arch::fpu::save_on_switch(current as *mut u8);
+        crate::arch::fpu::set_ts();
+        crate::arch::write_fs_base((*receiver).tls_base);
 
         // Update per-CPU canary cache to receiver's canary before switching.
         // The receiver resumes mid-syscall and eventually returns through the
@@ -236,6 +248,10 @@ pub unsafe extern "C" fn fastpath_call_rust(
 
         // Reacquire SCHED_IPC_LOCK after resume
         SCHED_IPC_LOCK.lock();
+
+        // `do_context_switch()` normally flushes deferred enqueue after the old
+        // thread's registers are safely stored. Fastpath must do the same.
+        sched.process_pending_enqueue_after_direct_switch();
 
         // --- Caller has been woken by reply ---
         // At this point, current thread IS the original caller again.
