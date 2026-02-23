@@ -11,7 +11,8 @@ pub use frame::FrameAllocator;
 pub use vspace::{
     advance_quiescent_gen, current_vspace_tracking, kernel_vspace_root, kernel_vspace_tracking,
     process_deferred_free, restore_irq, save_irq_disable, set_current_vspace_tracking,
-    set_pending_deactivate, take_pending_deactivate, DeactivateResult, VSpace, VSpaceTracking,
+    set_online_cpu_count, set_pending_deactivate, take_pending_deactivate, DeactivateResult,
+    VSpace, VSpaceTracking,
 };
 
 use crate::ParsedBootInfo;

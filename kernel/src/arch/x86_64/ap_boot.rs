@@ -17,6 +17,16 @@
 /// Called from assembly trampoline with a specific ABI.
 #[unsafe(no_mangle)]
 pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
+    // Guard: poisoned CPU_ID (0xFFFF_FFFF) means this AP arrived after BSP
+    // gave up waiting. Halt permanently to prevent using stale trampoline params.
+    if cpu_id >= super::cpu::MAX_CPUS {
+        loop {
+            unsafe {
+                core::arch::asm!("hlt", options(nomem, nostack));
+            }
+        }
+    }
+
     {
         let s = crate::SerialGuard::acquire();
         s.puts("[AP] Entry cpu_id=");

@@ -115,6 +115,7 @@ pub fn init() {
     scheduler().set_idle(0, idle_tcb);
     scheduler().set_current(&raw mut BOOTSTRAP_TCB);
     scheduler().online_cpus = 1;
+    crate::mm::set_online_cpu_count(1);
 }
 
 /// Initialize scheduler for an Application Processor
@@ -150,6 +151,7 @@ pub fn init_cpu(cpu_id: usize) {
     scheduler().set_idle(cpu_id, idle_tcb);
     scheduler().set_current(idle_tcb);
     scheduler().online_cpus += 1;
+    crate::mm::set_online_cpu_count(scheduler().online_cpus);
 }
 
 /// Per-CPU idle TCBs (static, never freed)

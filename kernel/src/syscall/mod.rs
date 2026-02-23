@@ -155,6 +155,10 @@ pub enum SyscallError {
     Deadlock = 14,
 }
 
+/// Maximum spin iterations waiting for cross-CPU suspend to complete.
+/// ~1ms at 2GHz — the target CPU will process the IPI within single-digit microseconds.
+const SUSPEND_SPIN_LIMIT: u32 = 2_000_000;
+
 /// Look up capability from current thread's CSpace
 ///
 /// This is the primary capability lookup function used by all syscall handlers.
@@ -1805,8 +1809,13 @@ fn syscall_tcb_suspend(cap: &Capability) -> SyscallResult {
                         // Spin until target CPU has context-switched away.
                         // Bounded: IPI + handler is single-digit microseconds.
                         // No ABA: TCB pointers are never freed/reused in this kernel.
+                        let mut spins: u32 = 0;
                         while crate::sched::scheduler::current_on_cpu(cpu) == target_tcb_ptr {
                             core::hint::spin_loop();
+                            spins += 1;
+                            if spins >= SUSPEND_SPIN_LIMIT {
+                                return SyscallResult::err(SyscallError::Busy);
+                            }
                         }
                         return SyscallResult::ok(0);
                     }

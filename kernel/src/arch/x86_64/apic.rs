@@ -700,9 +700,7 @@ pub unsafe fn send_ipi(cpu_id: usize, kind: IpiKind) {
 
     unsafe {
         // Ensure previous IPI has been delivered
-        while lapic_read(LAPIC_ICR0) & (1 << 12) != 0 {
-            core::hint::spin_loop();
-        }
+        wait_icr_idle();
 
         // Look up the real hardware APIC ID for this logical CPU index.
         // On hardware where APIC IDs differ from sequential indices
@@ -755,6 +753,28 @@ const ICR_INIT: u32 = 0x500;
 const ICR_STARTUP: u32 = 0x600;
 const ICR_LEVEL_ASSERT: u32 = 0x4000;
 const ICR_LEVEL_DEASSERT: u32 = 0x0000;
+
+/// Maximum iterations to wait for ICR delivery status to become idle.
+/// ~50us at 2GHz — more than enough for any delivery mode on real hardware.
+const ICR_IDLE_TIMEOUT: u32 = 100_000;
+
+/// Wait for the ICR delivery status bit to clear (idle).
+///
+/// Returns `true` if ICR became idle within the timeout, `false` on timeout.
+///
+/// # Safety
+/// LAPIC must be initialized and mapped.
+unsafe fn wait_icr_idle() -> bool {
+    for _ in 0..ICR_IDLE_TIMEOUT {
+        // SAFETY: LAPIC is initialized (caller precondition)
+        if unsafe { lapic_read(LAPIC_ICR0) } & (1 << 12) == 0 {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    crate::serial_puts("[APIC] WARNING: ICR delivery timeout\n");
+    false
+}
 
 // Assembly symbols for trampoline code bounds
 unsafe extern "C" {
@@ -911,6 +931,11 @@ pub unsafe fn start_aps(cpu_descriptors: &[super::acpi::CpuDescriptor], cpu_coun
             // Wait 10ms for INIT to be received and processed
             super::pit::delay_us(10_000);
 
+            // Intel MP spec requires deassert after INIT assert
+            send_init_deassert();
+            // 200us settling time before first SIPI
+            super::pit::delay_us(200);
+
             // Send SIPI (twice per Intel spec)
             // SIPI vector = physical page number of trampoline code
             send_sipi(apic_id, SIPI_VECTOR);
@@ -942,6 +967,16 @@ pub unsafe fn start_aps(cpu_descriptors: &[super::acpi::CpuDescriptor], cpu_coun
                         }
                         serial(")\n");
                     }
+
+                    // Poison trampoline CPU_ID to catch late arrivals
+                    // SAFETY: PHYS_MAP_OFFSET is valid, address is in trampoline comm area
+                    let cpuid_ptr = (TRAMPOLINE_CPU_ID + PHYS_MAP_OFFSET) as *mut u32;
+                    cpuid_ptr.write_volatile(0xFFFF_FFFF);
+
+                    // Reset timed-out AP to INIT state (Intel-recommended abort)
+                    send_init_ipi(apic_id);
+                    super::pit::delay_us(10_000);
+
                     break;
                 }
             }
@@ -964,9 +999,7 @@ pub unsafe fn start_aps(cpu_descriptors: &[super::acpi::CpuDescriptor], cpu_coun
 unsafe fn send_init_ipi(apic_id: u8) {
     unsafe {
         // Wait for ICR to be idle
-        while lapic_read(LAPIC_ICR0) & (1 << 12) != 0 {
-            core::hint::spin_loop();
-        }
+        wait_icr_idle();
 
         // Set destination APIC ID
         lapic_write(LAPIC_ICR1, (apic_id as u32) << 24);
@@ -975,9 +1008,7 @@ unsafe fn send_init_ipi(apic_id: u8) {
         lapic_write(LAPIC_ICR0, ICR_INIT | ICR_LEVEL_ASSERT | (1 << 15));
 
         // Wait for delivery
-        while lapic_read(LAPIC_ICR0) & (1 << 12) != 0 {
-            core::hint::spin_loop();
-        }
+        wait_icr_idle();
     }
 }
 
@@ -988,9 +1019,7 @@ unsafe fn send_init_ipi(apic_id: u8) {
 unsafe fn send_init_deassert() {
     unsafe {
         // Wait for ICR to be idle
-        while lapic_read(LAPIC_ICR0) & (1 << 12) != 0 {
-            core::hint::spin_loop();
-        }
+        wait_icr_idle();
 
         // Broadcast INIT de-assert (all including self)
         // Delivery mode = INIT, Level = de-assert, Trigger = level
@@ -998,9 +1027,7 @@ unsafe fn send_init_deassert() {
         lapic_write(LAPIC_ICR0, ICR_INIT | (1 << 15) | (0b10 << 18));
 
         // Wait for delivery
-        while lapic_read(LAPIC_ICR0) & (1 << 12) != 0 {
-            core::hint::spin_loop();
-        }
+        wait_icr_idle();
     }
 }
 
@@ -1008,9 +1035,7 @@ unsafe fn send_init_deassert() {
 unsafe fn send_sipi(apic_id: u8, vector: u32) {
     unsafe {
         // Wait for ICR to be idle
-        while lapic_read(LAPIC_ICR0) & (1 << 12) != 0 {
-            core::hint::spin_loop();
-        }
+        wait_icr_idle();
 
         // Set destination APIC ID
         lapic_write(LAPIC_ICR1, (apic_id as u32) << 24);
@@ -1019,9 +1044,7 @@ unsafe fn send_sipi(apic_id: u8, vector: u32) {
         lapic_write(LAPIC_ICR0, ICR_STARTUP | vector);
 
         // Wait for delivery
-        while lapic_read(LAPIC_ICR0) & (1 << 12) != 0 {
-            core::hint::spin_loop();
-        }
+        wait_icr_idle();
     }
 }
 

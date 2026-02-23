@@ -125,6 +125,14 @@ static mut PENDING_GENERATION: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0
 /// Global retire generation counter - increments for each retired tracking
 static mut GLOBAL_RETIRE_GEN: AtomicU64 = AtomicU64::new(0);
 
+/// Number of CPUs currently online (updated by scheduler init)
+static ONLINE_CPU_COUNT: AtomicU32 = AtomicU32::new(1);
+
+/// Set the online CPU count (called from scheduler init/init_cpu)
+pub fn set_online_cpu_count(count: u32) {
+    ONLINE_CPU_COUNT.store(count, Ordering::Release);
+}
+
 // SpinLock is imported from super (mm/mod.rs)
 
 /// Deferred free list for VSpaceTracking
@@ -176,6 +184,10 @@ pub struct VSpaceTracking {
     /// Free condition: all PENDING_GENERATION[cpu] > retire_snapshot[cpu]
     retire_snapshot: [AtomicU64; MAX_CPUS],
 
+    /// Number of online CPUs when this tracking was retired.
+    /// Only iterate this many CPUs when checking quiescent state.
+    retire_online_cpus: AtomicU32,
+
     /// Intrusive wait queue head (protected by scheduler lock)
     /// SAFETY: ONLY accessed via waiter_head_get/set_locked() from scheduler module
     /// with scheduler lock held AND IRQs disabled!
@@ -196,6 +208,7 @@ impl VSpaceTracking {
             ipi_sent: AtomicU8::new(0),
             retire_gen: AtomicU64::new(0),
             retire_snapshot: [const { AtomicU64::new(0) }; MAX_CPUS],
+            retire_online_cpus: AtomicU32::new(0),
             waiter_head: UnsafeCell::new(core::ptr::null_mut()),
         }
     }
@@ -498,8 +511,10 @@ pub unsafe fn defer_free_tracking(tracking: *mut VSpaceTracking) {
         let retire_gen = (*retire_gen_ptr).fetch_add(1, Ordering::AcqRel) + 1;
         (*tracking).retire_gen.store(retire_gen, Ordering::Release);
 
-        // Take snapshot of each CPU's generation at retire time
-        for cpu in 0..MAX_CPUS {
+        // Snapshot only online CPUs — non-existent CPUs never advance generation
+        let online = ONLINE_CPU_COUNT.load(Ordering::Acquire) as usize;
+        (*tracking).retire_online_cpus.store(online as u32, Ordering::Release);
+        for cpu in 0..online {
             let cpu_gen = PENDING_GENERATION[cpu].load(Ordering::Acquire);
             (*tracking).retire_snapshot[cpu].store(cpu_gen, Ordering::Release);
         }
@@ -546,8 +561,9 @@ pub fn process_deferred_free() {
             // Check quiescent state conditions
             let mut can_free = true;
 
-            // Condition 1: All CPUs passed their snapshot
-            for cpu in 0..MAX_CPUS {
+            // Condition 1: All CPUs (online at retire time) passed their snapshot
+            let online_at_retire = (*tracking).retire_online_cpus.load(Ordering::Acquire) as usize;
+            for cpu in 0..online_at_retire {
                 let cpu_gen = PENDING_GENERATION[cpu].load(Ordering::Acquire);
                 let snapshot = (*tracking).retire_snapshot[cpu].load(Ordering::Acquire);
                 if cpu_gen <= snapshot {
