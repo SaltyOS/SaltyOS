@@ -182,7 +182,14 @@ pub(crate) unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             saved_binary = proctab(idx).respawn_binary;
         }
 
-        salty::invoke::invoke(proctab(idx).tcb_cap, salty::TCB_SUSPEND, 0, 0, 0, 0);
+        let susp_err = salty::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 16);
+        if susp_err != 0 {
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] WARN: tcb_suspend failed in exit PID=");
+            lb.hex(proctab(idx).pid as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
 
         // Deliver SIGCHLD to parent
         let ppid = proctab(idx).ppid;

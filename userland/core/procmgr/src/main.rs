@@ -135,6 +135,7 @@ const SALTY_NOT_FOUND: u64 = salty::SALTY_NOT_FOUND;
 const SALTY_INVALID_ARGUMENT: u64 = salty::SALTY_INVALID_ARGUMENT;
 const SALTY_INVALID_OPERATION: u64 = salty::SALTY_INVALID_OPERATION;
 const SALTY_WOULD_BLOCK: u64 = salty::SALTY_WOULD_BLOCK;
+const SALTY_BUSY: u64 = salty::SALTY_BUSY;
 const VSPACE_FLAG_WRITABLE: u64 = salty::VSPACE_FLAG_WRITABLE;
 const VSPACE_FLAG_USER: u64 = salty::VSPACE_FLAG_USER;
 const CAP_RIGHTS_ALL: u64 = salty::CAP_RIGHTS_ALL;
@@ -259,7 +260,7 @@ unsafe fn wait_for_child_ready(
             lb.hex(poll.error);
             lb.str(b"\n");
             lb.flush();
-            let _ = salty::invoke::tcb_suspend(child_tcb);
+            let _ = salty::invoke::tcb_suspend_retry(child_tcb, 4);
             return -1;
         }
 
@@ -302,7 +303,7 @@ unsafe fn wait_for_child_ready(
     lb.bytes(child_name);
     lb.str(b"\n");
     lb.flush();
-    let _ = salty::invoke::tcb_suspend(child_tcb);
+    let _ = salty::invoke::tcb_suspend_retry(child_tcb, 4);
     -1
 }
 

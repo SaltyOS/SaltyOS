@@ -85,6 +85,20 @@ pub fn tcb_suspend(tcb: Cap) -> i32 {
     invoke(tcb, TCB_SUSPEND, 0, 0, 0, 0).error as i32
 }
 
+/// Suspend a thread, retrying on Busy (cross-CPU contention).
+/// Yields between retries to give the target CPU time to context-switch.
+/// Returns 0 on success, or the last error code after max retries.
+pub fn tcb_suspend_retry(tcb: Cap, max_retries: u32) -> i32 {
+    for _ in 0..max_retries {
+        let err = tcb_suspend(tcb);
+        if err != crate::consts::SALTY_BUSY as i32 {
+            return err;
+        }
+        crate::syscall::syscall(crate::consts::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+    }
+    tcb_suspend(tcb)
+}
+
 /// Bind a notification object to a TCB. Signals on the notification
 /// will wake the thread if it is blocked on Recv.
 pub fn tcb_bind_notification(tcb: Cap, ntfn: Cap) -> i32 {

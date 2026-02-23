@@ -1654,6 +1654,14 @@ fn syscall_tcb_configure(
         SCHED_IPC_LOCK.lock();
         let tcb = &mut *(cap.object as *mut Tcb);
 
+        // Only allow configuring threads that are Inactive.
+        // Configuring a Running/Ready/Blocked thread would corrupt its context.
+        if tcb.state != ThreadState::Inactive {
+            SCHED_IPC_LOCK.unlock();
+            restore_irq(irq);
+            return SyscallResult::err(SyscallError::Busy);
+        }
+
         let kstack_virt = crate::mm::phys_to_virt(kstack_phys);
         let kstack_top = kstack_virt + crate::mm::PAGE_SIZE as u64;
         core::ptr::write_bytes(kstack_virt as *mut u8, 0, crate::mm::PAGE_SIZE);

@@ -523,7 +523,7 @@ pub unsafe fn pthread_exit(retval: *mut u8) -> ! {
 
         // Suspend self — we can't deallocate our own stack while running on it.
         // The joining thread or the process exit path handles cleanup.
-        invoke::tcb_suspend(self_tcb);
+        invoke::tcb_suspend_retry(self_tcb, 4);
 
         // Should never reach here
         loop {
@@ -546,7 +546,7 @@ unsafe fn cleanup_thread(tc: *mut ThreadControl) {
 
         // Suspend the thread's TCB (should already be suspended)
         if tcb_cap != 0 {
-            invoke::tcb_suspend(tcb_cap);
+            invoke::tcb_suspend_retry(tcb_cap, 4);
         }
 
         // Unmap and free the stack (this also destroys the TLS block)

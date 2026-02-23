@@ -975,7 +975,13 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         super::spawn_tx::unmap_window_from_mmsrv(super::PROCMGR_SCRATCH_VADDR, 1);
 
         // 11. Suspend and reconfigure
-        salty::invoke::tcb_suspend(proctab(idx).tcb_cap);
+        let susp_err = salty::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 16);
+        if susp_err != 0 {
+            super::puts(b"[PROCMGR] EXEC: tcb_suspend failed\n");
+            super::spawn_tx::deregister_from_mmsrv(pid);
+            reply.label = super::SALTY_BUSY;
+            return;
+        }
 
         // POSIX: exec resets caught signals to SIG_DFL
         for i in 0..NSIG {

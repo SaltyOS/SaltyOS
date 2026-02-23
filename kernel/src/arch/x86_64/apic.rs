@@ -699,8 +699,12 @@ pub unsafe fn send_ipi(cpu_id: usize, kind: IpiKind) {
     }
 
     unsafe {
-        // Ensure previous IPI has been delivered
-        wait_icr_idle();
+        // Ensure previous IPI has been delivered.
+        // Log but continue on timeout — skipping a runtime IPI would cause
+        // worse problems (missed reschedules, stale TLB entries).
+        if !wait_icr_idle() {
+            crate::serial_puts("[APIC] WARNING: send_ipi pre-send ICR stuck, proceeding\n");
+        }
 
         // Look up the real hardware APIC ID for this logical CPU index.
         // On hardware where APIC IDs differ from sequential indices
@@ -926,21 +930,33 @@ pub unsafe fn start_aps(cpu_descriptors: &[super::acpi::CpuDescriptor], cpu_coun
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
             // Send INIT IPI (level assert)
-            send_init_ipi(apic_id);
+            if !send_init_ipi(apic_id) {
+                serial("[SMP] INIT IPI failed for AP, skipping\n");
+                continue;
+            }
 
             // Wait 10ms for INIT to be received and processed
             super::pit::delay_us(10_000);
 
             // Intel MP spec requires deassert after INIT assert
-            send_init_deassert();
+            if !send_init_deassert() {
+                serial("[SMP] INIT deassert failed for AP, skipping\n");
+                continue;
+            }
             // 200us settling time before first SIPI
             super::pit::delay_us(200);
 
             // Send SIPI (twice per Intel spec)
             // SIPI vector = physical page number of trampoline code
-            send_sipi(apic_id, SIPI_VECTOR);
+            if !send_sipi(apic_id, SIPI_VECTOR) {
+                serial("[SMP] first SIPI failed for AP, skipping\n");
+                continue;
+            }
             super::pit::delay_us(200);
-            send_sipi(apic_id, SIPI_VECTOR);
+            if !send_sipi(apic_id, SIPI_VECTOR) {
+                serial("[SMP] second SIPI failed for AP, skipping\n");
+                continue;
+            }
 
             // Wait for AP to signal ready (timeout after 500ms)
             let mut timeout = 500;
@@ -974,7 +990,7 @@ pub unsafe fn start_aps(cpu_descriptors: &[super::acpi::CpuDescriptor], cpu_coun
                     cpuid_ptr.write_volatile(0xFFFF_FFFF);
 
                     // Reset timed-out AP to INIT state (Intel-recommended abort)
-                    send_init_ipi(apic_id);
+                    let _ = send_init_ipi(apic_id);
                     super::pit::delay_us(10_000);
 
                     break;
@@ -995,11 +1011,14 @@ pub unsafe fn start_aps(cpu_descriptors: &[super::acpi::CpuDescriptor], cpu_coun
     }
 }
 
-/// Send INIT IPI to a specific APIC ID
-unsafe fn send_init_ipi(apic_id: u8) {
+/// Send INIT IPI to a specific APIC ID.
+/// Returns `true` if both pre-send and post-send ICR waits succeeded.
+unsafe fn send_init_ipi(apic_id: u8) -> bool {
     unsafe {
         // Wait for ICR to be idle
-        wait_icr_idle();
+        if !wait_icr_idle() {
+            return false;
+        }
 
         // Set destination APIC ID
         lapic_write(LAPIC_ICR1, (apic_id as u32) << 24);
@@ -1008,18 +1027,21 @@ unsafe fn send_init_ipi(apic_id: u8) {
         lapic_write(LAPIC_ICR0, ICR_INIT | ICR_LEVEL_ASSERT | (1 << 15));
 
         // Wait for delivery
-        wait_icr_idle();
+        wait_icr_idle()
     }
 }
 
-/// Send INIT IPI (level de-assert) broadcast
+/// Send INIT IPI (level de-assert) broadcast.
+/// Returns `true` if both pre-send and post-send ICR waits succeeded.
 ///
 /// This is required by the Intel MP specification after the INIT assert.
 /// It is a broadcast de-assert (all CPUs), not targeted.
-unsafe fn send_init_deassert() {
+unsafe fn send_init_deassert() -> bool {
     unsafe {
         // Wait for ICR to be idle
-        wait_icr_idle();
+        if !wait_icr_idle() {
+            return false;
+        }
 
         // Broadcast INIT de-assert (all including self)
         // Delivery mode = INIT, Level = de-assert, Trigger = level
@@ -1027,15 +1049,18 @@ unsafe fn send_init_deassert() {
         lapic_write(LAPIC_ICR0, ICR_INIT | (1 << 15) | (0b10 << 18));
 
         // Wait for delivery
-        wait_icr_idle();
+        wait_icr_idle()
     }
 }
 
-/// Send Startup IPI (SIPI) to a specific APIC ID
-unsafe fn send_sipi(apic_id: u8, vector: u32) {
+/// Send Startup IPI (SIPI) to a specific APIC ID.
+/// Returns `true` if both pre-send and post-send ICR waits succeeded.
+unsafe fn send_sipi(apic_id: u8, vector: u32) -> bool {
     unsafe {
         // Wait for ICR to be idle
-        wait_icr_idle();
+        if !wait_icr_idle() {
+            return false;
+        }
 
         // Set destination APIC ID
         lapic_write(LAPIC_ICR1, (apic_id as u32) << 24);
@@ -1044,7 +1069,7 @@ unsafe fn send_sipi(apic_id: u8, vector: u32) {
         lapic_write(LAPIC_ICR0, ICR_STARTUP | vector);
 
         // Wait for delivery
-        wait_icr_idle();
+        wait_icr_idle()
     }
 }
 

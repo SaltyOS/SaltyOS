@@ -40,7 +40,7 @@ unsafe fn sig_stop_proc(idx: usize, sig: usize) {
             return;
         }
 
-        salty::invoke::invoke(proctab(idx).tcb_cap, salty::TCB_SUSPEND, 0, 0, 0, 0);
+        salty::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 16);
         proctab(idx).state = PROC_STOPPED;
         proctab(idx).stop_status = ((sig as i32) << 8) | 0x7f;
 
@@ -70,7 +70,14 @@ unsafe fn sig_terminate_proc(idx: usize, sig: usize) {
             lb.flush();
         }
 
-        salty::invoke::invoke(proctab(idx).tcb_cap, salty::TCB_SUSPEND, 0, 0, 0, 0);
+        let susp_err = salty::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 16);
+        if susp_err != 0 {
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] WARN: tcb_suspend failed in terminate PID=");
+            lb.hex(proctab(idx).pid as u64);
+            lb.str(b"\n");
+            lb.flush();
+        }
 
         // Deregister from mmsrv so it stops processing faults for this process
         if proctab(idx).mmsrv_registered {

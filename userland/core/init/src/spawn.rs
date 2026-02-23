@@ -247,7 +247,7 @@ unsafe fn wait_for_child_ready(
             lb.hex(poll.error);
             lb.str(b"\n");
             lb.flush();
-            let _ = invoke::tcb_suspend(child_tcb);
+            let _ = invoke::tcb_suspend_retry(child_tcb, 4);
             return -1;
         }
 
@@ -274,7 +274,7 @@ unsafe fn wait_for_child_ready(
     lb.bytes(label);
     lb.str(b" ready timeout\n");
     lb.flush();
-    let _ = invoke::tcb_suspend(child_tcb);
+    let _ = invoke::tcb_suspend_retry(child_tcb, 4);
     -1
 }
 

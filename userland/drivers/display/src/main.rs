@@ -112,6 +112,22 @@ fn flush_damage(state: &mut DisplayState) {
     state.damage_max_y = 0;
 }
 
+#[inline(always)]
+unsafe fn write_pixel(dst: *mut u8, pixel: u32, bpp_bytes: usize) {
+    unsafe {
+        match bpp_bytes {
+            4 => core::ptr::write(dst as *mut u32, pixel),
+            3 => {
+                *dst = pixel as u8;
+                *dst.add(1) = (pixel >> 8) as u8;
+                *dst.add(2) = (pixel >> 16) as u8;
+            }
+            2 => core::ptr::write(dst as *mut u16, pixel as u16),
+            _ => core::ptr::write(dst as *mut u32, pixel),
+        }
+    }
+}
+
 fn draw_glyph(state: &mut DisplayState, c: u8, col: u32, row: u32) {
     let gw = font::GLYPH_WIDTH;
     let gh = font::GLYPH_HEIGHT;
@@ -138,8 +154,7 @@ fn draw_glyph(state: &mut DisplayState, c: u8, col: u32, row: u32) {
             let off = y_off + (px as usize + gx) * bpp_bytes;
             // SAFETY: Bounds checked above, shadow buffer is mapped.
             unsafe {
-                let dst = state.shadow.add(off) as *mut u32;
-                core::ptr::write(dst, pixel);
+                write_pixel(state.shadow.add(off), pixel, bpp_bytes);
             }
         }
     }
@@ -164,8 +179,7 @@ fn fill_rect(state: &mut DisplayState, x: u32, y: u32, w: u32, h: u32, color: u3
             let off = row_off + col as usize * bpp_bytes;
             // SAFETY: Bounds checked above, shadow buffer is mapped.
             unsafe {
-                let dst = state.shadow.add(off) as *mut u32;
-                core::ptr::write(dst, color);
+                write_pixel(state.shadow.add(off), color, bpp_bytes);
             }
         }
     }
