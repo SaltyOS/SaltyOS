@@ -49,8 +49,13 @@ pub fn run() -> bool {
     {
         let ret = unsafe { posix::posix_mkdir(b"/mnt/data/testdir\0".as_ptr(), 0o755) };
         if ret != 0 {
-            puts(b"[TEST_SALTYFS] FAIL: mkdir /mnt/data/testdir failed\n");
-            return false;
+            // On re-run the directory may already exist; treat that as success
+            let mut st2 = SaltyStat::zeroed();
+            let sret = unsafe { posix::posix_stat(b"/mnt/data/testdir\0".as_ptr(), &raw mut st2) };
+            if sret != 0 || (st2.st_mode & S_IFMT) != S_IFDIR {
+                puts(b"[TEST_SALTYFS] FAIL: mkdir /mnt/data/testdir failed\n");
+                return false;
+            }
         }
         let mut st = SaltyStat::zeroed();
         let ret = unsafe { posix::posix_stat(b"/mnt/data/testdir\0".as_ptr(), &raw mut st) };

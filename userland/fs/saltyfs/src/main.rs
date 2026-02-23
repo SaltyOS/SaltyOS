@@ -217,6 +217,7 @@ pub extern "C" fn _start() -> ! {
                 lb.flush();
             }
             unsafe { (*(&raw mut SB)).used_blocks = actual_used; }
+            block::write_superblock();
         }
 
         block::discover_max_inode();

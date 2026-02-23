@@ -308,6 +308,11 @@ pub(crate) unsafe fn mount_rename(
         let m = &(*mounts)[mount_idx];
         let mut req = SaltyMsg::zeroed();
         req.label = SALTYFS_RENAME;
+        // MR4..MR11 = old name (64 bytes), MR12..MR19 = new name (64 bytes)
+        if old_name_len > 64 || new_name_len > 64 {
+            (*reply).label = SALTY_INVALID_ARGUMENT;
+            return;
+        }
         req.regs[0] = old_parent_ino;
         req.regs[1] = old_name_len as u64;
         req.regs[2] = new_parent_ino;
@@ -780,7 +785,7 @@ pub(crate) unsafe fn mount_link(
         for i in 0..copy {
             *dst.add(i) = *name.add(i);
         }
-        req.length = 3 + ((name_len as u64) + 7) / 8;
+        req.length = 3 + ((copy as u64) + 7) / 8;
         let mut fs_reply = SaltyMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
         (*reply).label = fs_reply.label;

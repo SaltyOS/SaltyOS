@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! IPC request handlers for file operations.
+//!
+//! Name length limits are dictated by IPC message register packing:
+//! - 136 bytes (MR3..MR19): create, mkdir, link name fields
+//! - 144 bytes (MR2..MR19): lookup, unlink, rmdir name fields
+//! - 72 bytes (MR3..MR11): symlink link name (old name in rename)
+//! - 64 bytes (MR12..MR19): symlink target, rename new name
 
 use salty::consts::*;
 use salty::serial::LineBuf;
@@ -7,41 +13,33 @@ use salty::types::*;
 
 use crate::alloc::{alloc_block, free_block, bitmap_flush};
 use crate::block::{read_block, write_block, read_superblock};
-use crate::btree::{btree_search, btree_find_item, btree_leaf_find_all, btree_find_all_for_ino, btree_cow_insert, btree_cow_delete, btree_cow_update};
+use crate::btree::{btree_find_item, btree_find_all_for_ino, btree_cow_insert, btree_cow_delete, btree_cow_update};
 use crate::consts::*;
 use crate::types::*;
 use crate::{puts, SB, BLOCK_SIZE, MOUNTED, NEXT_INO};
 
-/// Look up a directory entry by name within a directory inode.
-pub(crate) fn lookup_in_dir(dir_ino: u64, name: *const u8, name_len: u8) -> Option<u64> {
-    let root_tree = unsafe { (*(&raw const SB)).root_tree };
-
-    // Search for DIR_ITEM entries under dir_ino
-    let search_key = BTreeKey {
-        object_id: dir_ino,
-        item_type: SALTY_DIR_ITEM,
-        offset: 0,
-    };
-
-    let leaf = btree_search(root_tree, &search_key);
-    if leaf.is_null() {
-        return None;
+/// FNV-1a hash for generating DIR_ITEM key offsets from entry names.
+/// Used for hardlink entries where reusing the target inode number
+/// as key offset would cause collisions.
+fn fnv1a_hash(name: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in name {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x00000100000001B3);
     }
+    h
+}
 
-    unsafe {
-        let hdr = &*(leaf as *const BTreeNodeHeader);
-        let items_start = leaf.add(core::mem::size_of::<BTreeNodeHeader>());
-        let item_size = core::mem::size_of::<BTreeItem>();
+/// Find the actual BTreeKey for a DIR_ITEM entry by scanning for a matching name.
+/// Returns None if no matching entry is found. This handles both old-style
+/// (offset=child_ino) and new-style (offset=fnv1a_hash(name)) DIR_ITEM keys.
+fn find_dir_item_key(dir_ino: u64, name: *const u8, name_len: u8) -> Option<BTreeKey> {
+    let root_tree = unsafe { (*(&raw const SB)).root_tree };
+    let mut found_key: Option<BTreeKey> = None;
 
-        for i in 0..hdr.num_items as usize {
-            let item = core::ptr::read_unaligned(items_start.add(i * item_size) as *const BTreeItem);
-            if item.key.object_id != dir_ino || item.key.item_type != SALTY_DIR_ITEM {
-                continue;
-            }
-
-            let data_ptr = leaf.add(item.offset as usize);
-            let (child_ino, entry_name_len, _dir_type) = parse_dir_item_header(data_ptr);
-
+    btree_find_all_for_ino(root_tree, dir_ino, SALTY_DIR_ITEM, |key, data_ptr, _size| {
+        unsafe {
+            let (_, entry_name_len, _) = parse_dir_item_header(data_ptr);
             if entry_name_len as u8 == name_len {
                 let entry_name = data_ptr.add(DIR_ITEM_HEADER_SIZE);
                 let mut match_found = true;
@@ -52,13 +50,45 @@ pub(crate) fn lookup_in_dir(dir_ino: u64, name: *const u8, name_len: u8) -> Opti
                     }
                 }
                 if match_found {
-                    return Some(child_ino);
+                    found_key = Some(*key);
+                    return false;
                 }
             }
         }
-    }
+        true
+    });
 
-    None
+    found_key
+}
+
+/// Look up a directory entry by name within a directory inode.
+/// Uses cross-leaf B-tree iteration to handle directories spanning multiple leaves.
+pub(crate) fn lookup_in_dir(dir_ino: u64, name: *const u8, name_len: u8) -> Option<u64> {
+    let root_tree = unsafe { (*(&raw const SB)).root_tree };
+    let mut result: Option<u64> = None;
+
+    btree_find_all_for_ino(root_tree, dir_ino, SALTY_DIR_ITEM, |_key, data_ptr, _size| {
+        unsafe {
+            let (child_ino, entry_name_len, _dir_type) = parse_dir_item_header(data_ptr);
+            if entry_name_len as u8 == name_len {
+                let entry_name = data_ptr.add(DIR_ITEM_HEADER_SIZE);
+                let mut match_found = true;
+                for j in 0..name_len as usize {
+                    if *entry_name.add(j) != *name.add(j) {
+                        match_found = false;
+                        break;
+                    }
+                }
+                if match_found {
+                    result = Some(child_ino);
+                    return false; // stop iteration
+                }
+            }
+        }
+        true // continue
+    });
+
+    result
 }
 
 /// Get inode info for a given inode number.
@@ -353,44 +383,52 @@ fn build_extent_regular(out: &mut [u8; 304], size: u64, disk_bytenr: u64, disk_n
 }
 
 /// Delete all extent data items for an inode, freeing data blocks for regular extents.
+/// Processes in batches of 128 to handle files with arbitrarily many extents.
 fn delete_all_extents(ino: u64) {
-    let root_tree = unsafe { (*(&raw const SB)).root_tree };
     let bs = unsafe { *(&raw const BLOCK_SIZE) };
 
-    // Collect all extent offsets first (can't delete while iterating)
-    let mut offsets = [0u64; 128];
-    let mut types = [0u8; 128];
-    let mut disk_addrs = [0u64; 128];
-    let mut disk_sizes = [0u64; 128];
-    let mut count = 0usize;
+    loop {
+        // Re-read root_tree each iteration since COW mutations update it
+        let root_tree = unsafe { (*(&raw const SB)).root_tree };
 
-    btree_find_all_for_ino(root_tree, ino, SALTY_EXTENT_DATA, |key, data_ptr, _size| {
-        if count < 128 {
-            let ext = unsafe { &*(data_ptr as *const ExtentData) };
-            offsets[count] = key.offset;
-            types[count] = ext.extent_type;
-            disk_addrs[count] = ext.disk_bytenr;
-            disk_sizes[count] = ext.disk_num_bytes;
-            count += 1;
-        }
-        true
-    });
+        // Collect up to 128 extents (can't delete while iterating)
+        let mut offsets = [0u64; 128];
+        let mut types = [0u8; 128];
+        let mut disk_addrs = [0u64; 128];
+        let mut disk_sizes = [0u64; 128];
+        let mut count = 0usize;
 
-    for i in 0..count {
-        // Free data blocks for regular extents
-        if types[i] == EXTENT_REGULAR && disk_addrs[i] != 0 {
-            let block_start = disk_addrs[i] / bs;
-            let block_count = (disk_sizes[i] + bs - 1) / bs;
-            for b in 0..block_count {
-                free_block(block_start + b);
+        btree_find_all_for_ino(root_tree, ino, SALTY_EXTENT_DATA, |key, data_ptr, _size| {
+            if count < 128 {
+                let ext = unsafe { &*(data_ptr as *const ExtentData) };
+                offsets[count] = key.offset;
+                types[count] = ext.extent_type;
+                disk_addrs[count] = ext.disk_bytenr;
+                disk_sizes[count] = ext.disk_num_bytes;
+                count += 1;
             }
+            count < 128
+        });
+
+        if count == 0 {
+            break;
         }
-        let ext_key = BTreeKey {
-            object_id: ino,
-            item_type: SALTY_EXTENT_DATA,
-            offset: offsets[i],
-        };
-        btree_cow_delete(&ext_key);
+
+        for i in 0..count {
+            if types[i] == EXTENT_REGULAR && disk_addrs[i] != 0 {
+                let block_start = disk_addrs[i] / bs;
+                let block_count = (disk_sizes[i] + bs - 1) / bs;
+                for b in 0..block_count {
+                    free_block(block_start + b);
+                }
+            }
+            let ext_key = BTreeKey {
+                object_id: ino,
+                item_type: SALTY_EXTENT_DATA,
+                offset: offsets[i],
+            };
+            btree_cow_delete(&ext_key);
+        }
     }
 }
 
@@ -1087,11 +1125,13 @@ pub(crate) fn handle_unlink_fs(msg: &SaltyMsg) -> SaltyMsg {
         return reply;
     }
 
-    // Delete DIR_ITEM
-    let dir_key = BTreeKey {
-        object_id: parent_ino,
-        item_type: SALTY_DIR_ITEM,
-        offset: child_ino,
+    // Delete DIR_ITEM (find actual key by name to handle both ino-keyed and hash-keyed entries)
+    let dir_key = match find_dir_item_key(parent_ino, name_buf.as_ptr(), name_len) {
+        Some(k) => k,
+        None => {
+            reply.label = SALTY_NOT_FOUND;
+            return reply;
+        }
     };
     if !btree_cow_delete(&dir_key) {
         reply.label = SALTY_OUT_OF_MEMORY;
@@ -1180,30 +1220,25 @@ pub(crate) fn handle_rmdir_fs(msg: &SaltyMsg) -> SaltyMsg {
         return reply;
     }
 
-    // Check if directory is empty
+    // Check if directory is empty (cross-leaf iteration)
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
-    let search_key = BTreeKey {
-        object_id: child_ino,
-        item_type: SALTY_DIR_ITEM,
-        offset: 0,
-    };
-    let leaf = btree_search(root_tree, &search_key);
-    if !leaf.is_null() {
-        let mut has_entries = false;
-        btree_leaf_find_all(leaf, child_ino, SALTY_DIR_ITEM, |_, _, _| {
-            has_entries = true;
-        });
-        if has_entries {
-            reply.label = SALTY_INVALID_OPERATION;
-            return reply;
-        }
+    let mut has_entries = false;
+    btree_find_all_for_ino(root_tree, child_ino, SALTY_DIR_ITEM, |_, _, _| {
+        has_entries = true;
+        false // stop on first entry found
+    });
+    if has_entries {
+        reply.label = SALTY_INVALID_OPERATION;
+        return reply;
     }
 
-    // Delete DIR_ITEM from parent
-    let dir_key = BTreeKey {
-        object_id: parent_ino,
-        item_type: SALTY_DIR_ITEM,
-        offset: child_ino,
+    // Delete DIR_ITEM from parent (find actual key by name)
+    let dir_key = match find_dir_item_key(parent_ino, name_buf.as_ptr(), name_len) {
+        Some(k) => k,
+        None => {
+            reply.label = SALTY_NOT_FOUND;
+            return reply;
+        }
     };
     if !btree_cow_delete(&dir_key) {
         reply.label = SALTY_OUT_OF_MEMORY;
@@ -1280,10 +1315,12 @@ pub(crate) fn handle_rename_fs(msg: &SaltyMsg) -> SaltyMsg {
             reply.label = SALTY_OK;
             return reply;
         }
-        let existing_dir_key = BTreeKey {
-            object_id: new_parent,
-            item_type: SALTY_DIR_ITEM,
-            offset: existing_ino,
+        let existing_dir_key = match find_dir_item_key(new_parent, new_name.as_ptr(), new_name_len) {
+            Some(k) => k,
+            None => {
+                reply.label = SALTY_NOT_FOUND;
+                return reply;
+            }
         };
         if !btree_cow_delete(&existing_dir_key) {
             reply.label = SALTY_OUT_OF_MEMORY;
@@ -1322,11 +1359,13 @@ pub(crate) fn handle_rename_fs(msg: &SaltyMsg) -> SaltyMsg {
         }
     }
 
-    // Delete old DIR_ITEM
-    let old_dir_key = BTreeKey {
-        object_id: old_parent,
-        item_type: SALTY_DIR_ITEM,
-        offset: child_ino,
+    // Delete old DIR_ITEM (find actual key by name)
+    let old_dir_key = match find_dir_item_key(old_parent, old_name.as_ptr(), old_name_len) {
+        Some(k) => k,
+        None => {
+            reply.label = SALTY_NOT_FOUND;
+            return reply;
+        }
     };
     if !btree_cow_delete(&old_dir_key) {
         reply.label = SALTY_OUT_OF_MEMORY;
@@ -1341,13 +1380,13 @@ pub(crate) fn handle_rename_fs(msg: &SaltyMsg) -> SaltyMsg {
         None => 1u8,
     };
 
-    // Insert new DIR_ITEM
+    // Insert new DIR_ITEM (use fnv1a_hash for offset to avoid key collisions)
     let mut dir_buf = [0u8; 256];
     let dir_len = build_dir_item(child_ino, &new_name[..new_name_len as usize], dir_type, &mut dir_buf);
     let new_dir_key = BTreeKey {
         object_id: new_parent,
         item_type: SALTY_DIR_ITEM,
-        offset: child_ino,
+        offset: fnv1a_hash(&new_name[..new_name_len as usize]),
     };
     if !btree_cow_insert(&new_dir_key, &dir_buf[..dir_len]) {
         reply.label = SALTY_OUT_OF_MEMORY;
@@ -1403,96 +1442,91 @@ pub(crate) fn handle_truncate_fs(msg: &SaltyMsg) -> SaltyMsg {
         return reply;
     }
 
-    // Collect all extent items for this inode
+    // Handle inline extent at offset 0 if present (one-time, not batched)
+    let ext_key_0 = BTreeKey {
+        object_id: ino,
+        item_type: SALTY_EXTENT_DATA,
+        offset: 0,
+    };
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
-    let mut ext_offsets = [0u64; 128];
-    let mut ext_types = [0u8; 128];
-    let mut ext_disk_bytenr = [0u64; 128];
-    let mut ext_disk_num = [0u64; 128];
-    let mut ext_count = 0usize;
-
-    btree_find_all_for_ino(root_tree, ino, SALTY_EXTENT_DATA, |key, data_ptr, size| {
-        if ext_count < 128 {
-            let ext = unsafe { &*(data_ptr as *const ExtentData) };
-            ext_offsets[ext_count] = key.offset;
-            ext_types[ext_count] = ext.extent_type;
-            ext_disk_bytenr[ext_count] = ext.disk_bytenr;
-            ext_disk_num[ext_count] = ext.disk_num_bytes;
-            ext_count += 1;
-        }
-        true
-    });
-
-    // Process extents: delete those entirely beyond new_size
-    for i in 0..ext_count {
-        let ext_offset = ext_offsets[i];
-        let ext_type = ext_types[i];
-
-        if ext_type == EXTENT_INLINE && ext_offset == 0 {
+    if let Some((ext_ptr, ext_size)) = btree_find_item(root_tree, &ext_key_0) {
+        let ext = unsafe { &*(ext_ptr as *const ExtentData) };
+        if ext.extent_type == EXTENT_INLINE {
             if new_size == 0 {
-                let ext_key = BTreeKey {
-                    object_id: ino,
-                    item_type: SALTY_EXTENT_DATA,
-                    offset: 0,
-                };
-                if !btree_cow_delete(&ext_key) {
+                if !btree_cow_delete(&ext_key_0) {
                     reply.label = SALTY_OUT_OF_MEMORY;
                     return reply;
                 }
             } else {
-                // Truncate inline data
-                let ext_key = BTreeKey {
-                    object_id: ino,
-                    item_type: SALTY_EXTENT_DATA,
-                    offset: 0,
-                };
-                let root_tree = unsafe { (*(&raw const SB)).root_tree };
-                if let Some((ext_ptr, ext_size)) = btree_find_item(root_tree, &ext_key) {
-                    let ext_hdr_size = core::mem::size_of::<ExtentData>();
-                    let inline_len = (ext_size as usize).saturating_sub(ext_hdr_size);
-                    let mut data = [0u8; 208];
-                    unsafe {
-                        let src = ext_ptr.add(ext_hdr_size);
-                        for j in 0..inline_len.min(208) {
-                            data[j] = *src.add(j);
-                        }
-                    }
-                    if !btree_cow_delete(&ext_key) {
-                        reply.label = SALTY_OUT_OF_MEMORY;
-                        return reply;
-                    }
-                    let mut extent_buf = [0u8; 304];
-                    build_extent_inline(
-                        &mut extent_buf,
-                        new_size,
-                        &data[..new_size as usize],
-                    );
-                    let ext_total = ext_hdr_size + new_size as usize;
-                    if !btree_cow_insert(&ext_key, &extent_buf[..ext_total]) {
-                        reply.label = SALTY_OUT_OF_MEMORY;
-                        return reply;
+                let ext_hdr_size = core::mem::size_of::<ExtentData>();
+                let inline_len = (ext_size as usize).saturating_sub(ext_hdr_size);
+                let mut data = [0u8; 208];
+                unsafe {
+                    let src = ext_ptr.add(ext_hdr_size);
+                    for j in 0..inline_len.min(208) {
+                        data[j] = *src.add(j);
                     }
                 }
-            }
-        } else if ext_type == EXTENT_REGULAR {
-            // Block-aligned extent at ext_offset; covers [ext_offset, ext_offset+bs)
-            if ext_offset >= new_size {
-                // Entirely beyond new_size — delete and free data block
-                if ext_disk_bytenr[i] != 0 {
-                    let block_start = ext_disk_bytenr[i] / bs;
-                    let block_count = (ext_disk_num[i] + bs - 1) / bs;
-                    for b in 0..block_count {
-                        free_block(block_start + b);
-                    }
+                if !btree_cow_delete(&ext_key_0) {
+                    reply.label = SALTY_OUT_OF_MEMORY;
+                    return reply;
                 }
-                let ext_key = BTreeKey {
-                    object_id: ino,
-                    item_type: SALTY_EXTENT_DATA,
-                    offset: ext_offset,
-                };
-                btree_cow_delete(&ext_key);
+                let ext_hdr_size2 = core::mem::size_of::<ExtentData>();
+                let mut extent_buf = [0u8; 304];
+                build_extent_inline(
+                    &mut extent_buf,
+                    new_size,
+                    &data[..new_size as usize],
+                );
+                let ext_total = ext_hdr_size2 + new_size as usize;
+                if !btree_cow_insert(&ext_key_0, &extent_buf[..ext_total]) {
+                    reply.label = SALTY_OUT_OF_MEMORY;
+                    return reply;
+                }
             }
-            // Extents partially within new_size keep their block; inode.size is authoritative
+        }
+    }
+
+    // Delete regular extents beyond new_size in batches of 128
+    loop {
+        let root_tree = unsafe { (*(&raw const SB)).root_tree };
+        let mut ext_offsets = [0u64; 128];
+        let mut ext_disk_bytenr = [0u64; 128];
+        let mut ext_disk_num = [0u64; 128];
+        let mut ext_count = 0usize;
+
+        btree_find_all_for_ino(root_tree, ino, SALTY_EXTENT_DATA, |key, data_ptr, _size| {
+            let ext = unsafe { &*(data_ptr as *const ExtentData) };
+            if ext.extent_type == EXTENT_REGULAR && key.offset >= new_size {
+                if ext_count < 128 {
+                    ext_offsets[ext_count] = key.offset;
+                    ext_disk_bytenr[ext_count] = ext.disk_bytenr;
+                    ext_disk_num[ext_count] = ext.disk_num_bytes;
+                    ext_count += 1;
+                }
+                return ext_count < 128;
+            }
+            true
+        });
+
+        if ext_count == 0 {
+            break;
+        }
+
+        for i in 0..ext_count {
+            if ext_disk_bytenr[i] != 0 {
+                let block_start = ext_disk_bytenr[i] / bs;
+                let block_count = (ext_disk_num[i] + bs - 1) / bs;
+                for b in 0..block_count {
+                    free_block(block_start + b);
+                }
+            }
+            let ext_key = BTreeKey {
+                object_id: ino,
+                item_type: SALTY_EXTENT_DATA,
+                offset: ext_offsets[i],
+            };
+            btree_cow_delete(&ext_key);
         }
     }
 
@@ -1976,14 +2010,14 @@ pub(crate) fn handle_link(msg: &SaltyMsg) -> SaltyMsg {
         return reply;
     }
 
-    // Insert DIR_ITEM (type 1 for regular file)
+    // Insert DIR_ITEM (use fnv1a_hash for offset to avoid key collisions with multiple links)
     let dir_type: u8 = if inode.mode & 0o170000 == 0o120000 { 7 } else { 1 };
     let mut dir_buf = [0u8; 256];
     let dir_len = build_dir_item(existing_ino, &name_buf[..name_len], dir_type, &mut dir_buf);
     let dir_key = BTreeKey {
         object_id: new_parent,
         item_type: SALTY_DIR_ITEM,
-        offset: existing_ino,
+        offset: fnv1a_hash(&name_buf[..name_len]),
     };
     if !btree_cow_insert(&dir_key, &dir_buf[..dir_len]) {
         reply.label = SALTY_OUT_OF_MEMORY;

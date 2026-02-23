@@ -855,13 +855,17 @@ pub extern "C" fn _start() -> ! {
                                     }
                                     if count > 136 && *(&raw const VFS_SHM_ACTIVE) {
                                         // SHM bulk write path: copy data to SHM
+                                        // Clamp to source (MR2..MR19 = 144 bytes) and SHM size
+                                        let max_inline: u64 = 18 * 8;
+                                        let shm_limit: u64 = VFS_SALTYFS_SHM_PAGES * 4096;
+                                        let safe_count = count.min(max_inline).min(shm_limit);
                                         let src = &msg.regs[2] as *const u64 as *const u8;
                                         let dst = VFS_SALTYFS_SHM_VADDR as *mut u8;
-                                        for j in 0..count as usize {
+                                        for j in 0..safe_count as usize {
                                             *dst.add(j) = *src.add(j);
                                         }
                                         mount::mount_write_shm(
-                                            mount_idx, remote_ino, offset, count,
+                                            mount_idx, remote_ino, offset, safe_count,
                                             0, &raw mut reply,
                                         );
                                     } else {
