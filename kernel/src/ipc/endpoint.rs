@@ -473,28 +473,38 @@ impl Endpoint {
             let caller = (*current).reply_tcb;
 
             if !caller.is_null() {
-                // Revert priority inheritance before reply
-                crate::sched::pip::pip_undonate(current, caller);
+                let caller_replyable = (*caller).state == ThreadState::Blocked
+                    && matches!(
+                        (*caller).blocked_reason,
+                        Some(BlockedReason::ReplyWait { .. }) | Some(BlockedReason::FaultBlocked { .. })
+                    );
 
-                // Transfer reply message to caller's TCB.
-                // Fault replies cannot grant capabilities.
-                if (*current).reply_can_grant {
-                    self.transfer_message(current, caller, reply, 0);
-                } else {
-                    let mut no_grant_reply = *reply;
-                    no_grant_reply.extra_caps = 0;
-                    no_grant_reply.caps = [0; 4];
-                    self.transfer_message(current, caller, &no_grant_reply, 0);
+                if caller_replyable {
+                    // Revert priority inheritance before reply
+                    crate::sched::pip::pip_undonate(current, caller);
+
+                    // Transfer reply message to caller's TCB.
+                    // Fault replies cannot grant capabilities.
+                    if (*current).reply_can_grant {
+                        self.transfer_message(current, caller, reply, 0);
+                    } else {
+                        let mut no_grant_reply = *reply;
+                        no_grant_reply.extra_caps = 0;
+                        no_grant_reply.caps = [0; 4];
+                        self.transfer_message(current, caller, &no_grant_reply, 0);
+                    }
+
+                    // Clear caller's blocked reason
+                    (*caller).blocked_reason = None;
+
+                    // Wake the caller
+                    (*caller).state = ThreadState::Ready;
+                    get_scheduler().enqueue(caller);
                 }
 
-                // Clear caller's blocked reason
-                (*caller).blocked_reason = None;
-
-                // Wake the caller
-                (*caller).state = ThreadState::Ready;
-                get_scheduler().enqueue(caller);
-
-                // Clear reply capability (one-shot)
+                // Clear reply capability (one-shot). This also drops stale reply
+                // caps left behind by paths like exec() that intentionally do not
+                // send a reply before replacing/resuming the caller.
                 (*current).reply_tcb = core::ptr::null_mut();
                 (*current).reply_can_grant = false;
             }

@@ -19,7 +19,41 @@ fn signal_ntfn(ntfn: Cap, bits: u64) {
 }
 
 fn sig_default_is_terminate(sig: usize) -> bool {
-    !matches!(sig, super::PM_SIGCHLD | super::PM_SIGCONT | super::PM_SIGSTOP)
+    !matches!(
+        sig,
+        super::PM_SIGCHLD
+            | super::PM_SIGCONT
+            | super::PM_SIGSTOP
+            | super::PM_SIGTSTP
+            | super::PM_SIGTTIN
+            | super::PM_SIGTTOU
+    )
+}
+
+fn sig_default_is_stop(sig: usize) -> bool {
+    matches!(sig, super::PM_SIGTSTP | super::PM_SIGTTIN | super::PM_SIGTTOU)
+}
+
+unsafe fn sig_stop_proc(idx: usize, sig: usize) {
+    unsafe {
+        if proctab(idx).state != PROC_RUNNING {
+            return;
+        }
+
+        salty::invoke::invoke(proctab(idx).tcb_cap, salty::TCB_SUSPEND, 0, 0, 0, 0);
+        proctab(idx).state = PROC_STOPPED;
+        proctab(idx).stop_status = ((sig as i32) << 8) | 0x7f;
+
+        let ppid = proctab(idx).ppid;
+        if let Some(pi) = find_by_pid(ppid) {
+            if (proctab(pi).state == PROC_RUNNING || proctab(pi).state == PROC_STOPPED)
+                && proctab(pi).signal_ntfn != 0
+                && proctab(pi).sig_disposition[super::PM_SIGCHLD] == SIG_DISP_CATCH
+            {
+                signal_ntfn(proctab(pi).signal_ntfn, 1u64 << super::PM_SIGCHLD);
+            }
+        }
+    }
 }
 
 unsafe fn sig_terminate_proc(idx: usize, sig: usize) {
@@ -102,21 +136,7 @@ unsafe fn deliver_signal_to(ti: usize, sig: usize) -> bool {
 
         // SIGSTOP: always stop
         if sig == super::PM_SIGSTOP {
-            if proctab(ti).state == PROC_RUNNING {
-                salty::invoke::invoke(proctab(ti).tcb_cap, salty::TCB_SUSPEND, 0, 0, 0, 0);
-                proctab(ti).state = PROC_STOPPED;
-                proctab(ti).stop_status = ((sig as i32) << 8) | 0x7f;
-
-                let ppid = proctab(ti).ppid;
-                if let Some(pi) = find_by_pid(ppid) {
-                    if (proctab(pi).state == PROC_RUNNING || proctab(pi).state == PROC_STOPPED)
-                        && proctab(pi).signal_ntfn != 0
-                        && proctab(pi).sig_disposition[super::PM_SIGCHLD] == SIG_DISP_CATCH
-                    {
-                        signal_ntfn(proctab(pi).signal_ntfn, 1u64 << super::PM_SIGCHLD);
-                    }
-                }
-            }
+            sig_stop_proc(ti, sig);
             return true;
         }
 
@@ -155,7 +175,9 @@ unsafe fn deliver_signal_to(ti: usize, sig: usize) -> bool {
         }
 
         if disp == SIG_DISP_DFL {
-            if sig_default_is_terminate(sig) {
+            if sig_default_is_stop(sig) {
+                sig_stop_proc(ti, sig);
+            } else if sig_default_is_terminate(sig) {
                 sig_terminate_proc(ti, sig);
             }
             return true;

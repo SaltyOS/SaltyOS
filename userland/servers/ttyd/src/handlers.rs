@@ -2,11 +2,29 @@
 //! IPC request handlers for PTY operations.
 
 use salty::consts::*;
+use salty::ipc;
 use salty::serial;
 use salty::types::*;
 
 use crate::types::*;
-use crate::PTYS;
+use crate::{ipc_ctx, PTYS};
+
+fn procmgr_get_pgid_by_badge(badge: u64) -> Option<u32> {
+    unsafe {
+        let mut msg = SaltyMsg::zeroed();
+        let mut reply = SaltyMsg::zeroed();
+        msg.label = POSIX_PM_GETPGID_BADGE;
+        msg.length = 1;
+        msg.regs[0] = badge;
+
+        let err = ipc::call_ctx(ipc_ctx(), CAP_PROCMGR_EP, &raw const msg, &raw mut reply);
+        if err != 0 || reply.label != SALTY_OK || reply.length < 1 {
+            return None;
+        }
+
+        Some(reply.regs[0] as u32)
+    }
+}
 
 /// TTYD_PTY_READ: try-read from slave side (called by VFS).
 /// msg.regs[0] = pty_id, msg.regs[1] = max_count
@@ -205,13 +223,50 @@ pub unsafe fn handle_pty_ioctl(msg: &SaltyMsg, reply: &mut SaltyMsg) {
 
         match cmd {
             TIOCGPGRP => {
+                // Clear stale fg_pgid from dead unowned sessions.
+                // When has_ctty is false, fg_pgid may linger from a previous
+                // auto-populate. Validate that the backing process is alive.
+                if !pty.has_ctty && pty.ctty_owner_badge == 0 && pty.fg_pgid != 0 {
+                    if procmgr_get_pgid_by_badge(pty.fg_pgid as u64).is_none() {
+                        pty.fg_pgid = 0;
+                    }
+                }
+
+                // If ctty owner is dead, reset ownership state
+                if pty.has_ctty && pty.ctty_owner_badge != 0
+                    && pty.ctty_owner_badge != caller_badge
+                {
+                    if !procmgr_get_pgid_by_badge(pty.ctty_owner_badge).is_some() {
+                        pty.has_ctty = false;
+                        pty.ctty_owner_badge = 0;
+                        pty.fg_pgid = 0;
+                    }
+                }
+
+                // Correct fg_pgid if caller owns ctty but pgid drifted
+                if pty.has_ctty && pty.ctty_owner_badge == caller_badge && pty.fg_pgid != 0 {
+                    if let Some(pgid) = procmgr_get_pgid_by_badge(caller_badge) {
+                        if pgid != 0 && pty.fg_pgid != pgid {
+                            pty.fg_pgid = pgid;
+                        }
+                    }
+                }
+
+                // Auto-populate fg_pgid from caller when unset
+                if pty.fg_pgid == 0 {
+                    if let Some(pgid) = procmgr_get_pgid_by_badge(caller_badge) {
+                        if pgid != 0 {
+                            pty.fg_pgid = pgid;
+                        }
+                    }
+                }
+
                 reply.label = SALTY_OK;
                 reply.length = 1;
                 reply.regs[0] = pty.fg_pgid as u64;
             }
             TIOCSPGRP => {
-                // Validate against controlling-tty owner badge.
-                if pty.has_ctty && pty.ctty_owner_badge == caller_badge {
+                if pty.has_ctty {
                     pty.fg_pgid = arg as u32;
                     reply.label = SALTY_OK;
                     reply.length = 0;
@@ -221,11 +276,25 @@ pub unsafe fn handle_pty_ioctl(msg: &SaltyMsg, reply: &mut SaltyMsg) {
             }
             TIOCSCTTY => {
                 if pty.has_ctty && pty.ctty_owner_badge != caller_badge {
-                    reply.label = SALTY_BUSY;
-                    return;
+                    let old_alive =
+                        procmgr_get_pgid_by_badge(pty.ctty_owner_badge).is_some();
+                    if old_alive {
+                        reply.label = SALTY_BUSY;
+                        return;
+                    }
+                    // Old owner is dead -- reset and allow takeover
+                    pty.fg_pgid = 0;
                 }
+                let newly_acquired = !pty.has_ctty || pty.fg_pgid == 0;
                 pty.has_ctty = true;
                 pty.ctty_owner_badge = caller_badge;
+                if newly_acquired {
+                    if let Some(pgid) = procmgr_get_pgid_by_badge(caller_badge) {
+                        pty.fg_pgid = pgid;
+                    } else if caller_badge != 0 && caller_badge <= u32::MAX as u64 {
+                        pty.fg_pgid = caller_badge as u32;
+                    }
+                }
                 reply.label = SALTY_OK;
                 reply.length = 0;
             }
@@ -321,8 +390,13 @@ pub unsafe fn handle_legacy(label: u64, msg: &SaltyMsg, reply: &mut SaltyMsg) {
             unsafe {
                 let pty = &mut *(&raw mut PTYS[0]);
                 if pty.has_ctty && pty.ctty_owner_badge != caller_badge {
-                    reply.label = SALTY_BUSY;
-                    return;
+                    let old_alive =
+                        procmgr_get_pgid_by_badge(pty.ctty_owner_badge).is_some();
+                    if old_alive {
+                        reply.label = SALTY_BUSY;
+                        return;
+                    }
+                    pty.fg_pgid = 0;
                 }
                 pty.has_ctty = true;
                 pty.ctty_owner_badge = caller_badge;

@@ -278,6 +278,8 @@ pub extern "C" fn _start() -> ! {
                             pty.has_ctty = false;
                             pty.ctty_owner_badge = 0;
                             pty.fg_pgid = 0;
+                        } else if pty.fg_pgid == dead_badge as u32 {
+                            pty.fg_pgid = 0;
                         }
                     }
                 }

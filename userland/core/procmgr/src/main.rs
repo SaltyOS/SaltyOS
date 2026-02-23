@@ -78,6 +78,9 @@ const PM_SIGKILL: usize = 9;
 const PM_SIGCHLD: usize = 17;
 const PM_SIGCONT: usize = 18;
 const PM_SIGSTOP: usize = 19;
+const PM_SIGTSTP: usize = 20;
+const PM_SIGTTIN: usize = 21;
+const PM_SIGTTOU: usize = 22;
 
 use salty::layout::{self};
 
