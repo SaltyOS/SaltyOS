@@ -237,20 +237,28 @@ fn self_test_ping() {
 }
 
 /// Main event loop: wait for IRQ notifications or IPC requests.
-fn event_loop() -> ! {
+fn event_loop(device_ok: bool) -> ! {
     puts(b"[netdrv] Entering event loop\n");
 
     // SAFETY: IRQ_ENABLED is set during init before event loop starts.
     let irq_enabled = unsafe { *(&raw const IRQ_ENABLED) };
 
     if !irq_enabled {
-        // Polling fallback: no IRQ, yield and poll ISR directly
-        puts(b"[netdrv] No IRQ, using yield-based polling\n");
-        loop {
-            let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-            let isr = virtio::read_isr();
-            if isr != 0 {
-                drain_rx();
+        if device_ok {
+            // Polling fallback: no IRQ, yield and poll ISR directly
+            puts(b"[netdrv] No IRQ, using yield-based polling\n");
+            loop {
+                let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+                let isr = virtio::read_isr();
+                if isr != 0 {
+                    drain_rx();
+                }
+            }
+        } else {
+            // No device present — idle loop with no hardware access
+            puts(b"[netdrv] No device, idling\n");
+            loop {
+                let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
             }
         }
     }
@@ -356,5 +364,5 @@ pub extern "C" fn _start() -> ! {
     register_nameserv();
     signal_ready();
 
-    event_loop()
+    event_loop(device_ok)
 }
