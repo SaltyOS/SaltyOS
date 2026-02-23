@@ -180,9 +180,14 @@ pub unsafe extern "C" fn sigsuspend(mask: *const Sigset) -> i32 {
         (*(&raw mut salty::__sig_blocked_mask)) = (*mask).bits;
         (*(&raw mut BLOCKED_MASK)).bits = (*mask).bits;
 
-        // Wait on signal notification (blocking)
+        // Wait on signal notification (blocking).
+        // salty_wait atomically swaps notification bits to 0 (consuming them).
+        // We must repost the consumed bits so posix_sigcheck can find them.
         let cap_signal_ntfn: u64 = 6;
-        salty::salty_wait(cap_signal_ntfn);
+        let pending_bits = salty::salty_wait(cap_signal_ntfn);
+        if pending_bits != 0 {
+            salty::salty_signal(cap_signal_ntfn, pending_bits);
+        }
 
         // Dispatch pending signals
         salty::signals::posix_sigcheck();

@@ -1553,8 +1553,9 @@ pub(crate) unsafe fn handle_mkfifo(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
             return;
         }
 
+        let mode = (*msg).regs[0] as u32 & 0o777;
         (*fifo).ftype = FTYPE_FIFO;
-        (*fifo).mode = S_IFREG_L | 0o666; // Use regular file mode bits for FIFO
+        (*fifo).mode = S_IFREG_L | mode;
         (*fifo).nlink = 1;
         (*fifo).parent_ino = (*parent).ino;
         (*fifo).size = (*pipe).pipe_id as u64; // Store pipe_id in size field

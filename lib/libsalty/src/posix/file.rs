@@ -11,6 +11,7 @@ use crate::types::*;
 /// Returns the new file descriptor on success, or -1 on error.
 pub unsafe fn posix_open(path: *const u8, flags: i32, mode: u32) -> i32 {
     unsafe {
+        let mode = mode & !super::misc::get_umask();
         let mut msg = SaltyMsg::zeroed();
         let mut reply = SaltyMsg::zeroed();
         msg.label = POSIX_VFS_OPEN;
@@ -155,6 +156,9 @@ pub unsafe fn posix_write(fd: i32, buf: *const u8, count: u64) -> i64 {
 /// atomically without touching the fd cursor.
 /// Returns the number of bytes read, or a negative errno on error.
 pub unsafe fn posix_pread(fd: i32, buf: *mut u8, count: u64, offset: i64) -> i64 {
+    if offset < 0 {
+        return -22; // EINVAL
+    }
     unsafe {
         let mut total: u64 = 0;
 
@@ -170,7 +174,11 @@ pub unsafe fn posix_pread(fd: i32, buf: *mut u8, count: u64, offset: i64) -> i64
             msg.length = 3;
             msg.regs[0] = fd as u64;
             msg.regs[1] = chunk;
-            msg.regs[2] = (offset as i64 + total as i64) as u64;
+            let cur_off = match (offset as u64).checked_add(total) {
+                Some(v) => v,
+                None => return if total > 0 { total as i64 } else { -22 }, // EINVAL
+            };
+            msg.regs[2] = cur_off;
 
             let err = crate::ipc::call_ctx(
                 crate::tls::current_ipc_ctx(),
@@ -217,6 +225,9 @@ pub unsafe fn posix_pread(fd: i32, buf: *mut u8, count: u64, offset: i64) -> i64
 /// atomically without touching the fd cursor.
 /// Returns the number of bytes written, or a negative errno on error.
 pub unsafe fn posix_pwrite(fd: i32, buf: *const u8, count: u64, offset: i64) -> i64 {
+    if offset < 0 {
+        return -22; // EINVAL
+    }
     unsafe {
         let mut total: u64 = 0;
 
@@ -232,7 +243,11 @@ pub unsafe fn posix_pwrite(fd: i32, buf: *const u8, count: u64, offset: i64) -> 
             msg.length = 3 + ((chunk + 7) / 8);
             msg.regs[0] = fd as u64;
             msg.regs[1] = chunk;
-            msg.regs[2] = (offset as i64 + total as i64) as u64;
+            let cur_off = match (offset as u64).checked_add(total) {
+                Some(v) => v,
+                None => return if total > 0 { total as i64 } else { -22 }, // EINVAL
+            };
+            msg.regs[2] = cur_off;
 
             let dst = &mut msg.regs[3] as *mut u64 as *mut u8;
             for i in 0..chunk as usize {
@@ -535,6 +550,7 @@ pub unsafe fn posix_rename(old_path: *const u8, new_path: *const u8) -> i32 {
 /// Returns 0 on success, -1 on error.
 pub unsafe fn posix_mkdir(path: *const u8, mode: i32) -> i32 {
     unsafe {
+        let mode = (mode as u32) & !super::misc::get_umask();
         let mut msg = SaltyMsg::zeroed();
         let mut reply = SaltyMsg::zeroed();
         msg.label = POSIX_VFS_MKDIR;

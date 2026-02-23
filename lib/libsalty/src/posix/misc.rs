@@ -339,9 +339,20 @@ pub unsafe fn posix_fb_ioctl(fd: i32, cmd: u64, result: *mut [u64; 5]) -> i32 {
     }
 }
 
+// Process-local umask cache. Fork copies the address space, so children
+// inherit the value automatically. Single-threaded processes only.
+static mut UMASK_CACHE: u32 = 0o022;
+
+/// Return the current cached umask value.
+pub(crate) unsafe fn get_umask() -> u32 {
+    unsafe { core::ptr::read_volatile(&raw const UMASK_CACHE) }
+}
+
 /// Set the file creation mask. Returns the previous mask.
 ///
 /// IPC to procmgr: regs[0] = new mask. Reply: regs[0] = old mask.
+/// Also updates the local cache so file creation functions can apply it
+/// without an extra IPC round-trip.
 pub unsafe fn posix_umask(mask: u32) -> u32 {
     unsafe {
         let mut msg = SaltyMsg::zeroed();
@@ -357,10 +368,15 @@ pub unsafe fn posix_umask(mask: u32) -> u32 {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
-            return 0o022; // Fallback default
-        }
-        reply.regs[0] as u32
+        let old = if err != 0 || reply.label != SALTY_OK {
+            let prev = core::ptr::read_volatile(&raw const UMASK_CACHE);
+            core::ptr::write_volatile(&raw mut UMASK_CACHE, mask & 0o777);
+            prev
+        } else {
+            core::ptr::write_volatile(&raw mut UMASK_CACHE, mask & 0o777);
+            reply.regs[0] as u32
+        };
+        old
     }
 }
 

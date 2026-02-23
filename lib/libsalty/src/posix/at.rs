@@ -9,6 +9,7 @@ use super::{pack_path, CAP_VFS_EP};
 /// IPC: reg[0]=dirfd, reg[1]=open_flags, reg[2]=mode, reg[3..]=path(len+data)
 pub unsafe fn posix_openat(dirfd: i32, path: *const u8, flags: i32, mode: u32) -> i32 {
     unsafe {
+        let mode = mode & !super::misc::get_umask();
         let mut msg = SaltyMsg::zeroed();
         let mut reply = SaltyMsg::zeroed();
         msg.label = POSIX_VFS_OPENAT;
@@ -160,6 +161,7 @@ pub unsafe fn posix_renameat(
 /// IPC: reg[0]=dirfd, reg[1]=mode, reg[2..]=path(len+data)
 pub unsafe fn posix_mkdirat(dirfd: i32, path: *const u8, mode: i32) -> i32 {
     unsafe {
+        let mode = (mode as u32) & !super::misc::get_umask();
         let mut msg = SaltyMsg::zeroed();
         let mut reply = SaltyMsg::zeroed();
         msg.label = POSIX_VFS_MKDIRAT;
