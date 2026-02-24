@@ -702,6 +702,18 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) {
             reply.regs[1] = port as u64;
             reply.length = 2;
         }
+        NET_POLL_STATUS => {
+            let conn_id = msg.regs[0] as u32;
+            let events = msg.regs[1] as u16;
+            let revents = if conn_id >= 1000 {
+                net::udp::udp_poll_status(conn_id, events)
+            } else {
+                net::tcp::tcp_poll_status(conn_id, events)
+            };
+            reply.label = SALTY_OK;
+            reply.regs[0] = revents as u64;
+            reply.length = 1;
+        }
         _ => {
             reply.label = SALTY_INVALID_OPERATION;
         }
@@ -751,9 +763,8 @@ fn notify_vfs_completion(
             msg.length = 3;
         }
         INET_OP_RECV => {
-            msg.regs[3] = data_len as u64;
-            // Copy data into regs[4..]
             let max_data = core::cmp::min(data_len, 128);
+            msg.regs[3] = max_data as u64;
             if max_data > 0 {
                 // SAFETY: Writing data bytes into message register area.
                 unsafe {
@@ -774,11 +785,10 @@ fn notify_vfs_completion(
             msg.length = 6;
         }
         INET_OP_RECVFROM => {
-            msg.regs[3] = data_len as u64;
+            let max_data = core::cmp::min(data_len, 112);
+            msg.regs[3] = max_data as u64;
             msg.regs[4] = extra_ip as u64;
             msg.regs[5] = extra_port as u64;
-            // Copy data into regs[6..]
-            let max_data = core::cmp::min(data_len, 112);
             if max_data > 0 {
                 // SAFETY: Writing data bytes into message register area.
                 unsafe {

@@ -788,16 +788,17 @@ pub(crate) unsafe fn handle_netsrv_callback(msg: *const SaltyMsg, reply: *mut Sa
                     client_reply.label = result;
                     if result == SALTY_OK {
                         let data_len = (*msg).regs[3] as usize;
-                        client_reply.regs[0] = data_len as u64;
-                        if data_len > 0 {
+                        // Cap to max bytes that fit in regs[4..20] (16 regs * 8 = 128)
+                        let actual_len = if data_len > 128 { 128 } else { data_len };
+                        client_reply.regs[0] = actual_len as u64;
+                        if actual_len > 0 {
                             let src = &(*msg).regs[4] as *const u64 as *const u8;
                             let dst = &raw mut client_reply.regs[1] as *mut u8;
-                            let copy_len = if data_len > 152 { 152 } else { data_len };
-                            for i in 0..copy_len {
+                            for i in 0..actual_len {
                                 *dst.add(i) = *src.add(i);
                             }
                         }
-                        client_reply.length = 1 + ((data_len as u64 + 7) / 8);
+                        client_reply.length = 1 + ((actual_len as u64 + 7) / 8);
                     } else {
                         client_reply.regs[0] = 0;
                         client_reply.length = 1;
@@ -807,20 +808,21 @@ pub(crate) unsafe fn handle_netsrv_callback(msg: *const SaltyMsg, reply: *mut Sa
                     client_reply.label = result;
                     if result == SALTY_OK {
                         let data_len = (*msg).regs[3] as usize;
+                        // Cap to max bytes that fit in regs[6..20] (14 regs * 8 = 112)
+                        let actual_len = if data_len > 112 { 112 } else { data_len };
                         let src_ip = (*msg).regs[4] as u32;
                         let src_port = (*msg).regs[5] as u16;
-                        client_reply.regs[0] = data_len as u64;
+                        client_reply.regs[0] = actual_len as u64;
                         client_reply.regs[1] = src_ip as u64;
                         client_reply.regs[2] = src_port as u64;
-                        if data_len > 0 {
+                        if actual_len > 0 {
                             let src = &(*msg).regs[6] as *const u64 as *const u8;
                             let dst = &raw mut client_reply.regs[3] as *mut u8;
-                            let copy_len = if data_len > 104 { 104 } else { data_len };
-                            for i in 0..copy_len {
+                            for i in 0..actual_len {
                                 *dst.add(i) = *src.add(i);
                             }
                         }
-                        client_reply.length = 3 + ((data_len as u64 + 7) / 8);
+                        client_reply.length = 3 + ((actual_len as u64 + 7) / 8);
                     } else {
                         client_reply.regs[0] = 0;
                         client_reply.length = 1;

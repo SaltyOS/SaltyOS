@@ -436,6 +436,31 @@ pub(crate) fn udp_getpeername(conn_id: u32) -> (u32, u16) {
     }
 }
 
+/// Query poll readiness for a UDP socket.
+///
+/// UDP sockets are always writable. Readable if buffered datagrams exist.
+pub(crate) fn udp_poll_status(conn_id: u32, events: u16) -> u16 {
+    let idx = match find_socket(conn_id) {
+        Some(i) => i,
+        None => return 0x020, // POLLNVAL
+    };
+    // SAFETY: Single-threaded driver; reading socket state.
+    unsafe {
+        let sockets = &raw const UDP_SOCKETS;
+        let sock = &(*sockets)[idx];
+        let mut rev: u16 = 0;
+
+        if events & 0x001 != 0 && sock.rx_entry_head != sock.rx_entry_tail {
+            rev |= 0x001; // POLLIN
+        }
+        if events & 0x004 != 0 {
+            rev |= 0x004; // POLLOUT (always writable)
+        }
+
+        rev
+    }
+}
+
 /// Handle an incoming UDP datagram from the IP layer.
 ///
 /// Parses the UDP header, finds the matching socket by destination port,

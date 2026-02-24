@@ -156,6 +156,24 @@ pub(crate) unsafe fn check_fd_readiness(cli: *const ClientState, fd: i32, events
                     }
                 }
             }
+            FD_TYPE_INET_SOCKET => {
+                // Query netsrv for inet socket readiness
+                let mut nreq = SaltyMsg::zeroed();
+                let mut nreply = SaltyMsg::zeroed();
+                nreq.label = NET_POLL_STATUS;
+                nreq.regs[0] = fde.sock_id as u64;
+                nreq.regs[1] = events as u64;
+                nreq.length = 2;
+                let err = ipc::call_ctx(
+                    ipc_ctx(),
+                    VFS_CAP_NETSRV_EP,
+                    &raw const nreq,
+                    &raw mut nreply,
+                );
+                if err == 0 && nreply.label == SALTY_OK {
+                    rev = nreply.regs[0] as u32;
+                }
+            }
             _ => {
                 return 0x020; // POLLNVAL
             }
@@ -543,6 +561,24 @@ pub(crate) unsafe fn handle_poll(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
                                 rev |= 0x008; // POLLERR — no readers
                             }
                         }
+                    }
+                }
+                FD_TYPE_INET_SOCKET => {
+                    // Query netsrv for inet socket readiness
+                    let mut nreq = SaltyMsg::zeroed();
+                    let mut nreply = SaltyMsg::zeroed();
+                    nreq.label = NET_POLL_STATUS;
+                    nreq.regs[0] = fde.sock_id as u64;
+                    nreq.regs[1] = events as u64;
+                    nreq.length = 2;
+                    let err = ipc::call_ctx(
+                        ipc_ctx(),
+                        VFS_CAP_NETSRV_EP,
+                        &raw const nreq,
+                        &raw mut nreply,
+                    );
+                    if err == 0 && nreply.label == SALTY_OK {
+                        rev = nreply.regs[0] as u16;
                     }
                 }
                 _ => {

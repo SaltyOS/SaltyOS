@@ -137,7 +137,7 @@ pub(crate) unsafe fn handle_socket(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
         let domain = (*msg).regs[0] as i32;
         let sock_type = (*msg).regs[1] as i32;
 
-        // AF_INET sockets go through netdrv
+        // AF_INET sockets are forwarded to the internet stack via crate::inet
         if domain == salty::consts::AF_INET {
             return crate::inet::handle_inet_socket(msg, reply, badge, sock_type);
         }

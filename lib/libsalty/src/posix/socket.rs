@@ -41,6 +41,12 @@ pub unsafe fn posix_socket(domain: i32, sock_type: i32) -> i32 {
 /// Returns 0 on success, negative errno on error.
 pub unsafe fn posix_bind(fd: i32, addr: *const u8, addr_len: u32) -> i32 {
     unsafe {
+        if addr.is_null() {
+            return -14; // EFAULT
+        }
+        if addr_len < 2 {
+            return -22; // EINVAL
+        }
         let family = *(addr as *const u16);
         let mut msg = SaltyMsg::zeroed();
         let mut reply = SaltyMsg::zeroed();
@@ -48,6 +54,9 @@ pub unsafe fn posix_bind(fd: i32, addr: *const u8, addr_len: u32) -> i32 {
         msg.regs[0] = fd as u64;
 
         if family == AF_INET as u16 {
+            if addr_len < 8 {
+                return -22; // EINVAL
+            }
             let sa = &*(addr as *const SockAddrIn);
             msg.regs[1] = AF_INET as u64;
             msg.regs[2] = sa.addr as u64;
@@ -56,7 +65,8 @@ pub unsafe fn posix_bind(fd: i32, addr: *const u8, addr_len: u32) -> i32 {
         } else {
             // AF_UNIX: pack path from SockAddrUn.sun_path (offset 2 in struct)
             let path = addr.add(2);
-            let path_len = pack_path(&raw mut msg, 1, path);
+            let max = (addr_len - 2) as usize;
+            let path_len = pack_path(&raw mut msg, 1, path, max);
             msg.length = 2 + ((path_len as u64 + 7) / 8);
         }
 
@@ -136,6 +146,12 @@ pub unsafe fn posix_accept(fd: i32) -> i32 {
 /// Returns 0 on success, negative errno on error.
 pub unsafe fn posix_connect(fd: i32, addr: *const u8, addr_len: u32) -> i32 {
     unsafe {
+        if addr.is_null() {
+            return -14; // EFAULT
+        }
+        if addr_len < 2 {
+            return -22; // EINVAL
+        }
         let family = *(addr as *const u16);
         let mut msg = SaltyMsg::zeroed();
         let mut reply = SaltyMsg::zeroed();
@@ -143,13 +159,18 @@ pub unsafe fn posix_connect(fd: i32, addr: *const u8, addr_len: u32) -> i32 {
         msg.regs[0] = fd as u64;
 
         if family == AF_INET as u16 {
+            if addr_len < 8 {
+                return -22; // EINVAL
+            }
             let sa = &*(addr as *const SockAddrIn);
             msg.regs[1] = sa.addr as u64;
             msg.regs[2] = sa.port as u64;
             msg.length = 3;
         } else {
-            // AF_UNIX: addr is path directly (legacy interface)
-            let path_len = pack_path(&raw mut msg, 1, addr);
+            // AF_UNIX: pack path from SockAddrUn.sun_path (offset 2 in struct)
+            let path = addr.add(2);
+            let max = (addr_len - 2) as usize;
+            let path_len = pack_path(&raw mut msg, 1, path, max);
             msg.length = 2 + ((path_len as u64 + 7) / 8);
         }
 

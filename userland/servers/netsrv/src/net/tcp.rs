@@ -1028,6 +1028,65 @@ pub(crate) fn tcp_getpeername(conn_id: u32) -> (u32, u16) {
     }
 }
 
+/// Query poll readiness for a TCP connection.
+///
+/// Returns a revents bitmask matching POSIX poll semantics:
+///   POLLIN  (0x001) = data available to read, or peer closed (EOF)
+///   POLLOUT (0x004) = can write without blocking
+///   POLLHUP (0x010) = peer closed
+///   POLLERR (0x008) = connection error (RST)
+pub(crate) fn tcp_poll_status(conn_id: u32, events: u16) -> u16 {
+    let idx = match find_tcb_by_conn_id(conn_id) {
+        Some(i) => i,
+        None => return 0x020, // POLLNVAL
+    };
+    // SAFETY: Single-threaded driver.
+    unsafe {
+        let tcb = &(*(&raw const TCBS))[idx];
+        let mut rev: u16 = 0;
+
+        match tcb.state {
+            TcpState::Established => {
+                if events & 0x001 != 0 && tcb.rx_buf.len > 0 {
+                    rev |= 0x001; // POLLIN
+                }
+                if events & 0x004 != 0 && tcb.tx_buf.available() > 0 {
+                    rev |= 0x004; // POLLOUT
+                }
+            }
+            TcpState::CloseWait => {
+                // Peer sent FIN: readable (EOF), writable
+                if events & 0x001 != 0 {
+                    rev |= 0x001; // POLLIN (EOF)
+                }
+                if events & 0x004 != 0 && tcb.tx_buf.available() > 0 {
+                    rev |= 0x004; // POLLOUT
+                }
+                rev |= 0x010; // POLLHUP
+            }
+            TcpState::FinWait1 | TcpState::FinWait2 | TcpState::Closing | TcpState::TimeWait => {
+                if events & 0x001 != 0 && tcb.rx_buf.len > 0 {
+                    rev |= 0x001; // POLLIN (remaining data)
+                }
+                rev |= 0x010; // POLLHUP
+            }
+            TcpState::Listen => {
+                if events & 0x001 != 0 && tcb.backlog_count > 0 {
+                    rev |= 0x001; // POLLIN (pending connection)
+                }
+            }
+            TcpState::SynSent | TcpState::SynReceived => {
+                // Connecting, not yet ready
+            }
+            TcpState::LastAck | TcpState::Closed => {
+                rev |= 0x010; // POLLHUP
+            }
+        }
+
+        rev
+    }
+}
+
 pub(crate) fn set_pending_recv(conn_id: u32, max_len: u16) {
     if let Some(idx) = find_tcb_by_conn_id(conn_id) {
         // SAFETY: Single-threaded driver.

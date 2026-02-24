@@ -127,7 +127,7 @@ pub unsafe fn posix_mkfifo(path: *const u8, mode: u32) -> i32 {
         let mut reply = SaltyMsg::zeroed();
         msg.label = POSIX_VFS_MKFIFO;
         msg.regs[0] = mode as u64;
-        let path_len = pack_path(&raw mut msg, 1, path);
+        let path_len = pack_path(&raw mut msg, 1, path, 128);
         msg.length = 2 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
