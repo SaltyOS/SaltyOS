@@ -73,6 +73,10 @@ run: build
         -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
         -device ahci,id=ahci \
         -device ide-hd,drive=disk,bus=ahci.0 \
+        -drive file=test_data.img,format=raw,if=none,id=datadisk \
+        -device virtio-blk-pci,drive=datadisk \
+        -netdev user,id=net0 \
+        -device virtio-net-pci,netdev=net0 \
         -no-reboot \
         -no-shutdown
 
@@ -86,6 +90,10 @@ run-4m: build
         -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
         -device ahci,id=ahci \
         -device ide-hd,drive=disk,bus=ahci.0 \
+        -drive file=test_data.img,format=raw,if=none,id=datadisk \
+        -device virtio-blk-pci,drive=datadisk \
+        -netdev user,id=net0 \
+        -device virtio-net-pci,netdev=net0 \
         -no-reboot \
         -no-shutdown
 
@@ -99,6 +107,10 @@ run-8m: build
         -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
         -device ahci,id=ahci \
         -device ide-hd,drive=disk,bus=ahci.0 \
+        -drive file=test_data.img,format=raw,if=none,id=datadisk \
+        -device virtio-blk-pci,drive=datadisk \
+        -netdev user,id=net0 \
+        -device virtio-net-pci,netdev=net0 \
         -no-reboot \
         -no-shutdown
 
@@ -112,6 +124,10 @@ run-16m: build
         -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
         -device ahci,id=ahci \
         -device ide-hd,drive=disk,bus=ahci.0 \
+        -drive file=test_data.img,format=raw,if=none,id=datadisk \
+        -device virtio-blk-pci,drive=datadisk \
+        -netdev user,id=net0 \
+        -device virtio-net-pci,netdev=net0 \
         -no-reboot \
         -no-shutdown
 
@@ -126,6 +142,10 @@ run-smp: build
         -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
         -device ahci,id=ahci \
         -device ide-hd,drive=disk,bus=ahci.0 \
+        -drive file=test_data.img,format=raw,if=none,id=datadisk \
+        -device virtio-blk-pci,drive=datadisk \
+        -netdev user,id=net0 \
+        -device virtio-net-pci,netdev=net0 \
         -no-reboot \
         -no-shutdown
 
@@ -141,6 +161,10 @@ run-smp-debug: build
         -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
         -device ahci,id=ahci \
         -device ide-hd,drive=disk,bus=ahci.0 \
+        -drive file=test_data.img,format=raw,if=none,id=datadisk \
+        -device virtio-blk-pci,drive=datadisk \
+        -netdev user,id=net0 \
+        -device virtio-net-pci,netdev=net0 \
         -no-reboot \
         -no-shutdown \
         -d int,cpu_reset \
@@ -157,6 +181,10 @@ run-smp4: build
         -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
         -device ahci,id=ahci \
         -device ide-hd,drive=disk,bus=ahci.0 \
+        -drive file=test_data.img,format=raw,if=none,id=datadisk \
+        -device virtio-blk-pci,drive=datadisk \
+        -netdev user,id=net0 \
+        -device virtio-net-pci,netdev=net0 \
         -no-reboot \
         -no-shutdown
 
@@ -170,6 +198,10 @@ run-debug: build
         -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
         -device ahci,id=ahci \
         -device ide-hd,drive=disk,bus=ahci.0 \
+        -drive file=test_data.img,format=raw,if=none,id=datadisk \
+        -device virtio-blk-pci,drive=datadisk \
+        -netdev user,id=net0 \
+        -device virtio-net-pci,netdev=net0 \
         -no-reboot \
         -no-shutdown \
         -d int,cpu_reset \
@@ -185,6 +217,10 @@ run-gdb: build
         -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
         -device ahci,id=ahci \
         -device ide-hd,drive=disk,bus=ahci.0 \
+        -drive file=test_data.img,format=raw,if=none,id=datadisk \
+        -device virtio-blk-pci,drive=datadisk \
+        -netdev user,id=net0 \
+        -device virtio-net-pci,netdev=net0 \
         -no-reboot \
         -no-shutdown \
         -s -S
@@ -224,6 +260,10 @@ run-uefi: image-uefi
                 -drive if=pflash,format=raw,readonly=on,file="$ovmf_code" \
                 -drive if=pflash,format=raw,file="$ovmf_vars_runtime" \
                 -drive file={{builddir}}/saltyos-uefi.img,format=raw \
+                -drive file=test_data.img,format=raw,if=none,id=datadisk \
+                -device virtio-blk-pci,drive=datadisk \
+                -netdev user,id=net0 \
+                -device virtio-net-pci,netdev=net0 \
                 -no-reboot \
                 -no-shutdown; \
         else \
@@ -234,6 +274,10 @@ run-uefi: image-uefi
                 -serial stdio \
                 -bios "$ovmf_code" \
                 -drive file={{builddir}}/saltyos-uefi.img,format=raw \
+                -drive file=test_data.img,format=raw,if=none,id=datadisk \
+                -device virtio-blk-pci,drive=datadisk \
+                -netdev user,id=net0 \
+                -device virtio-net-pci,netdev=net0 \
                 -no-reboot \
                 -no-shutdown; \
         fi'
@@ -268,6 +312,10 @@ run-uefi-debug: image-uefi
                 -drive if=pflash,format=raw,readonly=on,file="$ovmf_code" \
                 -drive if=pflash,format=raw,file="$ovmf_vars_runtime" \
                 -drive file={{builddir}}/saltyos-uefi.img,format=raw \
+                -drive file=test_data.img,format=raw,if=none,id=datadisk \
+                -device virtio-blk-pci,drive=datadisk \
+                -netdev user,id=net0 \
+                -device virtio-net-pci,netdev=net0 \
                 -no-reboot \
                 -no-shutdown \
                 -d int,cpu_reset \
@@ -280,6 +328,10 @@ run-uefi-debug: image-uefi
                 -serial stdio \
                 -bios "$ovmf_code" \
                 -drive file={{builddir}}/saltyos-uefi.img,format=raw \
+                -drive file=test_data.img,format=raw,if=none,id=datadisk \
+                -device virtio-blk-pci,drive=datadisk \
+                -netdev user,id=net0 \
+                -device virtio-net-pci,netdev=net0 \
                 -no-reboot \
                 -no-shutdown \
                 -d int,cpu_reset \
@@ -297,6 +349,10 @@ run-debug-headless: build
         -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
         -device ahci,id=ahci \
         -device ide-hd,drive=disk,bus=ahci.0 \
+        -drive file=test_data.img,format=raw,if=none,id=datadisk \
+        -device virtio-blk-pci,drive=datadisk \
+        -netdev user,id=net0 \
+        -device virtio-net-pci,netdev=net0 \
         -no-reboot \
         -no-shutdown \
         -d int,cpu_reset \
@@ -333,6 +389,10 @@ run-uefi-debug-headless: image-uefi
                 -drive if=pflash,format=raw,readonly=on,file="$ovmf_code" \
                 -drive if=pflash,format=raw,file="$ovmf_vars_runtime" \
                 -drive file={{builddir}}/saltyos-uefi.img,format=raw \
+                -drive file=test_data.img,format=raw,if=none,id=datadisk \
+                -device virtio-blk-pci,drive=datadisk \
+                -netdev user,id=net0 \
+                -device virtio-net-pci,netdev=net0 \
                 -no-reboot \
                 -no-shutdown \
                 -d int,cpu_reset \
@@ -346,6 +406,10 @@ run-uefi-debug-headless: image-uefi
                 -display none \
                 -bios "$ovmf_code" \
                 -drive file={{builddir}}/saltyos-uefi.img,format=raw \
+                -drive file=test_data.img,format=raw,if=none,id=datadisk \
+                -device virtio-blk-pci,drive=datadisk \
+                -netdev user,id=net0 \
+                -device virtio-net-pci,netdev=net0 \
                 -no-reboot \
                 -no-shutdown \
                 -d int,cpu_reset \
@@ -426,52 +490,6 @@ rr: build run
 # Generate SaltyFS test image
 mksaltyfs:
     python3 tools/mksaltyfs.py -o test_data.img -s 64M
-
-# Run with virtio-blk data disk (requires test_data.img — run `just mksaltyfs` first)
-run-blk: build
-    qemu-system-x86_64 \
-        -machine q35 \
-        -cpu qemu64 \
-        -m 512M \
-        -serial stdio \
-        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
-        -device ahci,id=ahci \
-        -device ide-hd,drive=disk,bus=ahci.0 \
-        -drive file=test_data.img,format=raw,if=none,id=datadisk \
-        -device virtio-blk-pci,drive=datadisk \
-        -no-reboot \
-        -no-shutdown
-
-# Run with virtio-blk and SMP
-run-blk-smp: build
-    qemu-system-x86_64 \
-        -machine q35 \
-        -cpu qemu64 \
-        -smp 2 \
-        -m 512M \
-        -serial stdio \
-        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
-        -device ahci,id=ahci \
-        -device ide-hd,drive=disk,bus=ahci.0 \
-        -drive file=test_data.img,format=raw,if=none,id=datadisk \
-        -device virtio-blk-pci,drive=datadisk \
-        -no-reboot \
-        -no-shutdown
-
-# Run with virtio-net NIC
-run-net: build
-    qemu-system-x86_64 \
-        -machine q35 \
-        -cpu qemu64 \
-        -m 512M \
-        -serial stdio \
-        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
-        -device ahci,id=ahci \
-        -device ide-hd,drive=disk,bus=ahci.0 \
-        -netdev user,id=net0 \
-        -device virtio-net-pci,netdev=net0 \
-        -no-reboot \
-        -no-shutdown
 
 # Create a new component skeleton
 new-component NAME:
