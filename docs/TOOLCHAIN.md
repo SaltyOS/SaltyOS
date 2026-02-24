@@ -291,10 +291,10 @@ The `x86_64-unknown-saltyos` target is for **userland** code. The kernel uses a 
 |----------|--------|----------|
 | SSE/FPU | disabled (soft-float) | enabled (SSE2) |
 | Code model | kernel | small |
-| Relocation | static | PIC |
+| Relocation | PIC | PIC |
 | Red zone | disabled | allowed |
 
-The `core` library is built with `x86_64-unknown-none` (no SSE) so it can be linked into both kernel and userland safely.
+The `core` library is built twice: once with the kernel JSON target (soft-float, kernel code model) and once with `x86_64-unknown-saltyos` (SSE2, small code model). This ensures each binary links against a `core` compiled with matching ABI and target settings.
 
 ### What the target implies
 
