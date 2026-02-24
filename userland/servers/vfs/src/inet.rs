@@ -734,7 +734,10 @@ pub(crate) unsafe fn close_inet_socket(fde: *mut FdEntry) {
         req.regs[0] = conn_id as u64;
         req.length = 1;
         let mut resp = SaltyMsg::zeroed();
-        let _ = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
+        if err != 0 || resp.label != SALTY_OK {
+            crate::puts(b"[VFS] inet: close_inet_socket failed\n");
+        }
     }
 }
 

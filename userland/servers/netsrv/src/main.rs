@@ -106,7 +106,7 @@ pub(crate) fn shm_tx_enqueue(frame: &[u8]) -> bool {
         let hdr = base as *mut u32;
         let tx_head = *hdr.add(2); // offset 0x08
         let tx_tail = core::ptr::read_volatile(hdr.add(3)); // offset 0x0C, netdrv writes this
-        let slot_count = *hdr.add(5); // offset 0x14
+        let slot_count = core::ptr::read_volatile(hdr.add(5)); // offset 0x14
         if slot_count == 0 {
             return false;
         }
@@ -160,7 +160,7 @@ fn shm_rx_dequeue(buf: &mut [u8; 2048]) -> Option<usize> {
         let data = (slot_base + 2) as *const u8;
         core::ptr::copy_nonoverlapping(data, buf.as_mut_ptr(), len);
 
-        let slot_count = *hdr.add(4); // offset 0x10
+        let slot_count = core::ptr::read_volatile(hdr.add(4)); // offset 0x10
         if slot_count == 0 {
             return None;
         }

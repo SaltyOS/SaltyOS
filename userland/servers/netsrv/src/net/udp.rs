@@ -107,7 +107,8 @@ fn push_completion(c: Completion) {
         let tail = *(&raw const COMP_TAIL);
         let next_head = (head + 1) % MAX_COMPLETIONS;
         if next_head == tail {
-            return; // queue full, drop
+            crate::puts(b"[netsrv] WARN: UDP completion queue full, dropping\n");
+            return;
         }
         let slot = (&raw mut COMPLETIONS)
             .cast::<Option<Completion>>()
@@ -526,6 +527,19 @@ pub(crate) fn handle_datagram(ip_hdr: &super::ipv4::Ipv4Header, data: &[u8]) {
         // Check if we have space in rx_buf
         if payload.len() > UDP_RX_BUF_SIZE {
             return; // datagram too large for buffer
+        }
+
+        // Check available space in rx_buf by summing active entry lengths
+        let mut used: usize = 0;
+        let mut scan = sock.rx_entry_tail as usize;
+        while scan != head {
+            if sock.rx_entries[scan].active {
+                used += sock.rx_entries[scan].len as usize;
+            }
+            scan = (scan + 1) % MAX_UDP_RX_ENTRIES;
+        }
+        if payload.len() > UDP_RX_BUF_SIZE - used {
+            return; // drop packet, data buffer full
         }
 
         let offset = sock.rx_head;

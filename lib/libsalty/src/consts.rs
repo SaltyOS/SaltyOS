@@ -578,7 +578,7 @@ pub const SHUT_RD: i32 = 0;
 pub const SHUT_WR: i32 = 1;
 pub const SHUT_RDWR: i32 = 2;
 
-/// Network stack IPC labels (netdrv protocol).
+/// Network stack IPC labels (netsrv protocol).
 pub const NET_SOCKET: u64 = 0xA0;
 pub const NET_CONNECT: u64 = 0xA1;
 pub const NET_SEND: u64 = 0xA2;

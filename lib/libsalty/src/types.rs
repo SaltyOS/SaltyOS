@@ -346,8 +346,13 @@ impl SockAddrUn {
 }
 
 /// IPv4 socket address. `family` is `AF_INET` (2).
+///
 /// `port` and `addr` are in **host byte order** (not network byte order).
-/// For example, 10.0.2.2 is `0x0A000202`.
+/// This is an intentional deviation from the POSIX `sockaddr_in` convention
+/// to avoid byte-swapping overhead in a single-architecture OS. All netsrv
+/// IPC messages pass these values in host byte order.
+///
+/// Example: 10.0.2.2 is `0x0A000202`, port 80 is `80` (not `0x5000`).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SockAddrIn {

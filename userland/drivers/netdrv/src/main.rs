@@ -228,7 +228,7 @@ fn shm_rx_enqueue(frame: &[u8]) -> bool {
         let hdr = base as *mut u32;
         let rx_head = *hdr.add(0);
         let rx_tail = core::ptr::read_volatile(hdr.add(1));
-        let slot_count = *hdr.add(4); // offset 0x10
+        let slot_count = core::ptr::read_volatile(hdr.add(4)); // offset 0x10
         let next = (rx_head + 1) % slot_count;
         if next == rx_tail {
             return false;
@@ -274,7 +274,7 @@ fn shm_tx_dequeue(buf: &mut [u8; 2048]) -> Option<usize> {
         let data = (slot_base + 2) as *const u8;
         core::ptr::copy_nonoverlapping(data, buf.as_mut_ptr(), len);
 
-        let slot_count = *hdr.add(5); // offset 0x14
+        let slot_count = core::ptr::read_volatile(hdr.add(5)); // offset 0x14
         core::ptr::write_volatile(hdr.add(3), (tx_tail + 1) % slot_count);
         Some(len)
     }

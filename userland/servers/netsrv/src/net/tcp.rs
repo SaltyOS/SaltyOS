@@ -273,6 +273,7 @@ fn push_completion(c: Completion) {
     unsafe {
         let count = *(&raw const COMP_COUNT);
         if count >= MAX_COMPLETIONS {
+            crate::puts(b"[netsrv] WARN: TCP completion queue full, dropping\n");
             return;
         }
         let tail = *(&raw const COMP_TAIL);
@@ -1781,6 +1782,9 @@ fn process_data(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
 
         let written = tcb.rx_buf.write(payload);
         tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(written as u32);
+        // TCP window field is 16 bits (max 65535). Our rx_buf capacity is
+        // TCP_RX_BUF_SIZE (8192) which fits in u16. Window scaling (RFC
+        // 7323) is not implemented.
         tcb.rcv_wnd = tcb.rx_buf.available() as u16;
 
         // Send ACK
@@ -1812,6 +1816,9 @@ fn process_data(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
             };
             let n = tcb.rx_buf.read(&mut comp.data[..max]);
             comp.data_len = n;
+            // TCP window field is 16 bits (max 65535). Our rx_buf capacity is
+            // TCP_RX_BUF_SIZE (8192) which fits in u16. Window scaling (RFC
+            // 7323) is not implemented.
             tcb.rcv_wnd = tcb.rx_buf.available() as u16;
             push_completion(comp);
         }
@@ -1979,6 +1986,10 @@ pub(crate) fn process_timers() {
                         let send_len = core::cmp::min(tcb.tx_buf.len, tcb.mss as usize);
                         let mut payload = [0u8; 1460];
                         let n = tcb.tx_buf.peek_all(&mut payload[..send_len]);
+                        // Reset snd_nxt to snd_una so the retransmitted segment starts at
+                        // the first unacknowledged byte. tx_buf.peek_all reads from the
+                        // buffer head (which corresponds to snd_una). After sending,
+                        // snd_nxt advances by the retransmitted byte count.
                         tcb.snd_nxt = tcb.snd_una;
                         send_tcp_segment(
                             tcb.local_ip,
