@@ -5,7 +5,8 @@
 # Inherited from parent:
 #   cc_cmd, rustc, rust_target, c_kernel_args
 # Inherited from rust/:
-#   core_obj, core_rmeta, compiler_builtins_obj, compiler_builtins_rmeta
+#   core_kernel_obj, core_kernel_rmeta,
+#   compiler_builtins_kernel_obj, compiler_builtins_kernel_rmeta
 # =============================================================================
 
 # Find all assembly source files
@@ -18,7 +19,7 @@ all_asm_files = run_command(
 kernel_crate_root = files('src/lib.rs')
 kernel_ld = meson.current_source_dir() / 'kernel.ld'
 
-# Paths to core and compiler_builtins metadata (built in rust/)
+# Paths to Rust build outputs (for -L search path)
 rust_build_dir = meson.project_build_root() / 'rust'
 
 # Compile assembly files to object files
@@ -60,29 +61,23 @@ kernel_obj = custom_target('kernel_obj',
   depfile: 'kernel.d',
   command: [
     rustc,
-    '--edition=2024',
+    rust_kernel_args,
     '--emit=obj=@OUTPUT@,dep-info=@DEPFILE@',
     '--crate-name=saltyos_kernel',
-    '--target=' + rust_target,
-    '-C', 'panic=abort',
-    '-C', 'opt-level=2',
-    '-C', 'debuginfo=2',
-    '-C', 'code-model=small',
-    '-C', 'relocation-model=pic',
     '--sysroot=/dev/null',
-    '--extern', 'core=' + rust_build_dir / 'libcore.rmeta',
-    '--extern', 'compiler_builtins=' + rust_build_dir / 'libcompiler_builtins.rmeta',
+    '--extern', 'core=' + core_kernel_rmeta.full_path(),
+    '--extern', 'compiler_builtins=' + compiler_builtins_kernel_rmeta.full_path(),
     '-L', rust_build_dir,
   ] + rust_log_cfgs + [
     '@INPUT@',
   ],
-  depends: [core, compiler_builtins],
+  depends: [core_kernel, compiler_builtins_kernel],
   build_by_default: true,
 )
 
 # Step 2: Link kernel object with core, compiler_builtins, and assembly objects into ELF executable
 kernel = custom_target('kernel',
-  input: [kernel_obj, core_obj, compiler_builtins_obj] + asm_objs,
+  input: [kernel_obj, core_kernel_obj, compiler_builtins_kernel_obj] + asm_objs,
   output: 'kernel.elf',
   command: [
     cc_cmd,
@@ -101,7 +96,7 @@ kernel = custom_target('kernel',
 # Step 3: Link boot image kernel ELF with debug sections stripped.
 # Keep kernel.elf unchanged for local debugging/symbol work.
 kernel_boot = custom_target('kernel_boot',
-  input: [kernel_obj, core_obj, compiler_builtins_obj] + asm_objs,
+  input: [kernel_obj, core_kernel_obj, compiler_builtins_kernel_obj] + asm_objs,
   output: 'kernel.boot.elf',
   command: [
     cc_cmd,

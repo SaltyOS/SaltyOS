@@ -11,6 +11,7 @@ pub struct BuildEnv {
     pub ar: String,
     pub ranlib: String,
     pub strip: String,
+    pub autotools_host: String,
     pub salty_host: String,
     pub salty_inc: PathBuf,
     pub build_root: PathBuf,
@@ -36,9 +37,31 @@ impl BuildEnv {
         let saltyc_dir = build_root.join("lib").join("saltyc");
         let rust_dir = build_root.join("rust");
 
+        // Resolve the SaltyOS clang: prefer SALTYOS_TOOLCHAIN_PREFIX env var,
+        // then derive from build_root (../../build-toolchain/prefix).
+        // Falls back to system clang if the custom binary is not found.
+        let cc = {
+            let prefix = std::env::var("SALTYOS_TOOLCHAIN_PREFIX")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    build_root
+                        .parent()
+                        .unwrap_or(&build_root)
+                        .join("build-toolchain")
+                        .join("prefix")
+                });
+            let cc_path = prefix.join("bin").join("clang");
+            if cc_path.is_file() {
+                cc_path.to_string_lossy().into_owned()
+            } else {
+                "clang".to_string()
+            }
+        };
+
         // Get clang's resource directory for compiler-provided headers
-        // (float.h, stdarg.h builtins, etc.)
-        let clang_resource_dir = std::process::Command::new("clang")
+        // (float.h, stdarg.h builtins, etc.). Use the same clang as CC so
+        // headers match the compiler.
+        let clang_resource_dir = std::process::Command::new(&cc)
             .args(["--print-resource-dir"])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -46,24 +69,23 @@ impl BuildEnv {
 
         // Build CFLAGS for cross compilation
         // -fno-builtin omitted: autotools needs builtin recognition for function checks
+        // Ports are built in hosted mode for autotools probes; keep builtins enabled.
+        // -fPIC is implied by --target=x86_64-unknown-saltyos.
         let cflags = format!(
-            "-ffreestanding -nostdlib -nostdinc \
-             -fno-stack-protector \
-             -mno-red-zone -fPIC \
+            "-nostdinc -fno-stack-protector \
              -isystem {salty_inc} \
              -isystem {clang_res}/include \
-             --target=x86_64-unknown-none",
+             --target=x86_64-unknown-saltyos",
             salty_inc = salty_inc.display(),
             clang_res = clang_resource_dir,
         );
 
         // LDFLAGS: linker search paths and flags (autotools prepends before source)
+        // -fuse-ld=lld and the executable dynamic linker are provided by the target.
         let ldflags = format!(
             "-nostdlib -nostartfiles \
-             -fuse-ld=lld \
-             --target=x86_64-unknown-none \
-             -L{saltyc} -L{libsalty} -L{rust} \
-             -Wl,--dynamic-linker,/lib/ld-salty.so",
+             --target=x86_64-unknown-saltyos \
+             -L{saltyc} -L{libsalty} -L{rust}",
             saltyc = saltyc_dir.display(),
             libsalty = libsalty_dir.display(),
             rust = rust_dir.display(),
@@ -79,14 +101,17 @@ impl BuildEnv {
         );
 
         BuildEnv {
-            cc: "clang".to_string(),
+            cc,
             cflags,
             ldflags,
             libs,
             ar: "llvm-ar".to_string(),
             ranlib: "llvm-ranlib".to_string(),
             strip: "llvm-strip".to_string(),
-            salty_host: "x86_64-unknown-none".to_string(),
+            // Autotools' config.sub does not know "saltyos" yet. Use a canonical
+            // host tuple for configure while keeping the real target in CC/CFLAGS.
+            autotools_host: "x86_64-unknown-elf".to_string(),
+            salty_host: "x86_64-unknown-saltyos".to_string(),
             salty_inc,
             build_root,
             nproc: jobs,

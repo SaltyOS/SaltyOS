@@ -46,16 +46,24 @@ endif
 
 # Rust: must be nightly (required for building core library)
 rustc = find_program('rustc', required: build_kernel or build_userland)
+rustc_version = 'not checked'
+rust_lib_src = 'N/A'
 
 fs = import('fs')
 
 if build_kernel or build_userland
-  # Verify nightly toolchain
+  # Record version for summary/errors.
   rustc_version = run_command(rustc, '--version', capture: true, check: true).stdout().strip()
-  if not rustc_version.contains('nightly')
-    error('SaltyOS requires nightly rustc for building core library.\n' +
+
+  # Functional check: we need a compiler that accepts unstable options (-Z),
+  # which covers nightly and self-built dev rustc.
+  rustc_unstable_probe = run_command(rustc, '-Z', 'unstable-options', '--version',
+    capture: true, check: false)
+  if rustc_unstable_probe.returncode() != 0
+    error('SaltyOS requires a rustc that supports unstable options (-Z) for core/custom-target builds.\n' +
+          'rustc: ' + rustc.full_path() + '\n' +
           'Got: ' + rustc_version + '\n' +
-          'Fix: rustup default nightly, or add nightly bin to PATH')
+          'Fix: use rustup nightly or the patched stage1 rustc from just toolchain-build-rust.')
   endif
 
   # Get rust-src path from sysroot
@@ -75,13 +83,30 @@ endif
 # =============================================================================
 
 if arch == 'x86_64'
-  rust_target = 'x86_64-unknown-none'
+  rust_target = 'x86_64-unknown-saltyos'
+  c_target = 'x86_64-unknown-saltyos'
   efi_target = 'x86_64-unknown-uefi'
+  rust_kernel_target = meson.project_source_root() / 'kernel/x86_64-saltyos.json'
+  rust_kernel_target_needs_unstable = true
 elif arch == 'aarch64'
   rust_target = 'aarch64-unknown-none'
+  c_target = 'aarch64-unknown-none'
   efi_target = 'aarch64-unknown-uefi'
+  rust_kernel_target = rust_target
+  rust_kernel_target_needs_unstable = false
 else
   error('Unsupported architecture: ' + arch)
+endif
+
+# Userland builds require rustc to provide the configured built-in target.
+if build_userland
+  rust_target_list = run_command(rustc, '--print', 'target-list', capture: true, check: true).stdout()
+  if not rust_target_list.contains(rust_target)
+    error('Selected rustc does not provide target "' + rust_target + '".\n' +
+          'rustc: ' + rustc.full_path() + '\n' +
+          'Fix: use the patched stage1 rustc (e.g. just toolchain-build-rust),\n' +
+          'then rerun setup with SALTYOS_TOOLCHAIN_PREFIX or RUSTC set accordingly.')
+  endif
 endif
 
 # =============================================================================
@@ -127,16 +152,17 @@ else
   c_kernel_args = c_freestanding_args
 endif
 
-# Rust flags
+# Rust flags (x86_64 kernel uses JSON spec for soft-float/kernel code model)
 rust_kernel_args = [
   '--edition=2024',
-  '--target=' + rust_target,
+  '--target=' + rust_kernel_target,
   '-C', 'panic=abort',
   '-C', 'opt-level=2',
-  '-C', 'code-model=kernel',
-  '-C', 'relocation-model=static',
-  '-C', 'soft-float',
+  '-C', 'debuginfo=2',
 ]
+if rust_kernel_target_needs_unstable
+  rust_kernel_args += ['-Z', 'unstable-options']
+endif
 
 # =============================================================================
 # Subdirectories
