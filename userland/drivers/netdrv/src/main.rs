@@ -23,10 +23,9 @@
 //!   14 = readiness notification
 //!   64 = pcisrv endpoint
 //!   68 = server endpoint (pre-created service EP)
-//!   80 = netsrv's RX notification cap (received during DRIVER_REGISTER)
+//!   84 = netsrv's RX notification cap (received during DRIVER_REGISTER)
 //!   81 = IRQ handler cap (received from pcisrv via PCI_GET_CAPS extra cap #1)
-//!   82 = IRQ notification (retyped from untyped)
-//!   83 = minted copy of IRQ notification with badge=0x2, sent to netsrv
+//!   82 = IRQ notification (retyped from untyped, sent to netsrv via IPC)
 
 #![no_std]
 #![no_main]
@@ -54,8 +53,7 @@ const CAP_NAMESERV_EP: u64 = 5;
 const CAP_MMSRV_EP: u64 = 7;
 const CAP_IRQ_HANDLER: u64 = 81;
 const CAP_IRQ_NOTIFICATION: u64 = 82;
-const CAP_NETSRV_RX_NTFN: u64 = 80;
-const CAP_IRQ_NTFN_BADGED_TX: u64 = 83;
+const CAP_NETSRV_RX_NTFN: u64 = 84;
 
 // ---------------------------------------------------------------------------
 // SHM ring buffer constants
@@ -377,24 +375,12 @@ fn handle_driver_register(msg: &SaltyMsg, reply: &mut SaltyMsg) {
         *(&raw mut SHM_BASE) = SHM_VADDR;
     }
 
-    // Mint a badged copy of our IRQ notification with badge=TX_BADGE for netsrv
-    let err = invoke::cnode_mint(
-        CAP_SELF_CSPACE,
-        CAP_IRQ_NOTIFICATION,
-        CAP_SELF_CSPACE,
-        CAP_IRQ_NTFN_BADGED_TX,
-        TX_BADGE,
-    );
-    if err != 0 {
-        puts(b"[netdrv] Failed to mint TX notification\n");
-        reply.label = SALTY_INVALID_OPERATION;
-        return;
-    }
-
-    // Send TX notification cap back as extra cap in reply
+    // Send our IRQ notification cap (unbadged, retains GRANT right) as extra
+    // cap in reply.  netsrv will pass TX_BADGE via the `bits` argument of
+    // SYS_SIGNAL instead of relying on cap.badge.
     // SAFETY: IPC context is valid; setting extra cap for reply.
     unsafe {
-        ipc::set_send_cap_ctx(ctx, 0, CAP_IRQ_NTFN_BADGED_TX);
+        ipc::set_send_cap_ctx(ctx, 0, CAP_IRQ_NOTIFICATION);
     }
 
     // Reply with MAC address

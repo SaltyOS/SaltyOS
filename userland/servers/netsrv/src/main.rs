@@ -15,8 +15,7 @@
 //!   64 = netdrv endpoint (NeedEP=netdrv:64)
 //!   65 = nameserv endpoint #2 (NeedEP=nameserv:65, for registration)
 //!   68 = server endpoint (pre-created service EP)
-//!   80 = RX notification (allocated via mmsrv)
-//!   81 = RX notification badged (minted with badge 0x1, sent to netdrv)
+//!   80 = RX notification (allocated via mmsrv, sent to netdrv via IPC)
 //!   82 = TX notification (received from netdrv during DRIVER_REGISTER)
 //!   83 = VFS callback endpoint (received from VFS via NET_REGISTER_VFS)
 
@@ -47,7 +46,6 @@ const CAP_NETDRV_EP: u64 = 64;
 const CAP_NAMESERV_EP2: u64 = 65;
 const CAP_SERVER_EP: u64 = 68;
 const CAP_RX_NOTIFICATION: u64 = 80;
-const CAP_RX_NOTIFICATION_BADGED: u64 = 81;
 const CAP_TX_NOTIFICATION: u64 = 82;
 const CAP_VFS_CALLBACK_EP: u64 = 83;
 
@@ -60,6 +58,7 @@ const SHM_VADDR: u64 = 0x0000_0000_6000_0000;
 const NET_SHM_ID: u64 = 0x4E455400; // "NET\0"
 const NET_SHM_PAGES: u64 = 32;
 const RX_BADGE: u64 = 0x1;
+const TX_BADGE: u64 = 0x2;
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -68,6 +67,8 @@ const RX_BADGE: u64 = 0x1;
 static mut MAC_ADDR: [u8; 6] = [0; 6];
 static mut VFS_REGISTERED: bool = false;
 static mut SHM_BASE: u64 = 0;
+static mut SELF_TEST_PHASE: u8 = 0;
+static mut SELF_TEST_TICKS: u32 = 0;
 
 // ---------------------------------------------------------------------------
 // Utility functions
@@ -129,8 +130,12 @@ pub(crate) fn shm_tx_enqueue(frame: &[u8]) -> bool {
 }
 
 /// Signal netdrv that TX frames are available.
+///
+/// The TX notification cap received from netdrv is unbadged (badge=0).
+/// We pass TX_BADGE via the `bits` argument so netdrv sees badge & 0x2 != 0
+/// in its event loop (kernel computes: notification.signal(cap.badge | bits)).
 pub(crate) fn signal_netdrv_tx() {
-    let _ = salty::syscall::syscall(SYS_SIGNAL, CAP_TX_NOTIFICATION, 1, 0, 0, 0, 0);
+    let _ = salty::syscall::syscall(SYS_SIGNAL, CAP_TX_NOTIFICATION, TX_BADGE, 0, 0, 0, 0);
 }
 
 /// Read a frame from the SHM RX ring. Returns the frame length on success.
@@ -266,23 +271,6 @@ fn setup_notification() -> bool {
         return false;
     }
 
-    // Mint badged copy (badge 0x1 = RX_BADGE)
-    let err = invoke::cnode_mint(
-        CAP_SELF_CSPACE,
-        CAP_RX_NOTIFICATION,
-        CAP_SELF_CSPACE,
-        CAP_RX_NOTIFICATION_BADGED,
-        RX_BADGE,
-    );
-    if err != 0 {
-        let mut lb = LineBuf::new();
-        lb.str(b"[netsrv] Failed to mint badged notification: ");
-        lb.dec(err as u64);
-        lb.putc(b'\n');
-        lb.flush();
-        return false;
-    }
-
     puts(b"[netsrv] Notification allocated and bound\n");
     true
 }
@@ -295,10 +283,12 @@ fn driver_register() -> bool {
     let ctx = ipc_ctx();
 
     // Send DRIVER_REGISTER to netdrv EP (slot 64)
-    // extra_caps=1: send badged RX notification (slot 81) to netdrv
+    // extra_caps=1: send original RX notification (slot 80, retains GRANT
+    // right so IPC cap transfer succeeds) to netdrv.  netdrv signals us
+    // with bits=1 to indicate RX frames available.
     // SAFETY: IPC context is valid; setting up send/receive caps.
     unsafe {
-        ipc::set_send_cap_ctx(ctx, 0, CAP_RX_NOTIFICATION_BADGED);
+        ipc::set_send_cap_ctx(ctx, 0, CAP_RX_NOTIFICATION);
         // Set receive slot for TX notification from netdrv
         ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_TX_NOTIFICATION, 0);
     }
@@ -430,46 +420,75 @@ fn process_rx_from_shm() {
 // Self-test: ARP + ICMP ping
 // ---------------------------------------------------------------------------
 
-fn self_test_ping() {
-    puts(b"[netsrv] Self-test: ARP request for 10.0.2.2\n");
-    net::arp::request(&mac_addr(), net::ipv4::OUR_IP, net::ipv4::GATEWAY_IP);
-
-    // Poll SHM for ARP reply (with early break)
-    let mut i: u64 = 0;
-    while i < 100_000 {
-        if net::arp::lookup(net::ipv4::GATEWAY_IP).is_some() {
-            break;
-        }
-        process_rx_from_shm();
-        let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-        i += 1;
+/// Non-blocking self-test state machine, called from the event loop.
+///
+/// Phase 0: waiting for ARP reply for gateway → on success, send ICMP echo,
+///          advance to phase 1.
+/// Phase 1: waiting for ICMP echo reply → on success, log and advance to
+///          phase 2 (done).
+/// Each phase times out after 200 ticks.
+fn check_self_test() {
+    // SAFETY: Single-threaded server; globals written only here.
+    let phase = unsafe { *(&raw const SELF_TEST_PHASE) };
+    if phase >= 2 {
+        return; // done
     }
 
-    match net::arp::lookup(net::ipv4::GATEWAY_IP) {
-        Some(_) => {
-            puts(b"[netsrv] ARP reply received for gateway\n");
-            puts(b"[netsrv] Sending ICMP echo to 10.0.2.2 seq=1\n");
-            net::icmp::reset_echo_reply_flag();
-            net::icmp::send_echo_request(
-                &mac_addr(),
-                net::ipv4::OUR_IP,
-                net::ipv4::GATEWAY_IP,
-                1,
-            );
+    let ticks = unsafe { *(&raw const SELF_TEST_TICKS) };
 
-            let mut j: u64 = 0;
-            while j < 100_000 {
-                if net::icmp::echo_reply_received() {
-                    break;
+    match phase {
+        0 => {
+            if net::arp::lookup(net::ipv4::GATEWAY_IP).is_some() {
+                puts(b"[netsrv] ARP reply received for gateway\n");
+                puts(b"[netsrv] Sending ICMP echo to 10.0.2.2 seq=1\n");
+                net::icmp::reset_echo_reply_flag();
+                net::icmp::send_echo_request(
+                    &mac_addr(),
+                    net::ipv4::OUR_IP,
+                    net::ipv4::GATEWAY_IP,
+                    1,
+                );
+                // SAFETY: Single-threaded server.
+                unsafe {
+                    *(&raw mut SELF_TEST_PHASE) = 1;
+                    *(&raw mut SELF_TEST_TICKS) = 0;
                 }
-                process_rx_from_shm();
-                let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-                j += 1;
+            } else {
+                // SAFETY: Single-threaded server.
+                unsafe {
+                    *(&raw mut SELF_TEST_TICKS) = ticks + 1;
+                }
+                if ticks + 1 >= 200 {
+                    puts(b"[netsrv] ARP timeout for gateway\n");
+                    // SAFETY: Single-threaded server.
+                    unsafe {
+                        *(&raw mut SELF_TEST_PHASE) = 2;
+                    }
+                }
             }
         }
-        None => {
-            puts(b"[netsrv] ARP timeout for gateway\n");
+        1 => {
+            if net::icmp::echo_reply_received() {
+                puts(b"[netsrv] ICMP echo reply received\n");
+                // SAFETY: Single-threaded server.
+                unsafe {
+                    *(&raw mut SELF_TEST_PHASE) = 2;
+                }
+            } else {
+                // SAFETY: Single-threaded server.
+                unsafe {
+                    *(&raw mut SELF_TEST_TICKS) = ticks + 1;
+                }
+                if ticks + 1 >= 200 {
+                    puts(b"[netsrv] ICMP echo reply timeout\n");
+                    // SAFETY: Single-threaded server.
+                    unsafe {
+                        *(&raw mut SELF_TEST_PHASE) = 2;
+                    }
+                }
+            }
         }
+        _ => {}
     }
 }
 
@@ -886,6 +905,7 @@ fn event_loop() -> ! {
         if badge != 0 {
             // Woken by bound notification: RX frames available from netdrv
             process_rx_from_shm();
+            check_self_test();
             net::tcp::process_timers();
             drain_completion_queue();
 
@@ -951,9 +971,10 @@ pub extern "C" fn _start() -> ! {
         idle();
     }
 
-    // 4. Self-test: ARP + ICMP ping
+    // 4. Fire-and-forget ARP request for self-test (checked in event loop)
     puts(b"[netsrv] IP: 10.0.2.15/24, GW: 10.0.2.2\n");
-    self_test_ping();
+    puts(b"[netsrv] Self-test: ARP request for 10.0.2.2\n");
+    net::arp::request(&mac_addr(), net::ipv4::OUR_IP, net::ipv4::GATEWAY_IP);
 
     // 5. Register with name service
     register_nameserv();
