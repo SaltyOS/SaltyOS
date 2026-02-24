@@ -531,6 +531,10 @@ toolchain-build-rust:
       echo '[build]'
       echo 'target = ["x86_64-unknown-linux-gnu"]'
       echo ''
+      echo '[install]'
+      echo "prefix = \"$SALTYOS_TOOLCHAIN_PREFIX\""
+      echo 'sysconfdir = "etc"'
+      echo ''
       echo '[llvm]'
       echo 'download-ci-llvm = false'
       echo ''
@@ -541,16 +545,13 @@ toolchain-build-rust:
       echo "llvm-config = \"$llvm_config_path\""
       echo "llvm-filecheck = \"$filecheck_path\""
     } > "$config_path"
-    python3 "$SALTYOS_RUST_SRC_DIR/x.py" build \
+    python3 "$SALTYOS_RUST_SRC_DIR/x.py" install \
       --src "$SALTYOS_RUST_SRC_DIR" \
       --build-dir "$SALTYOS_RUST_BUILD_DIR" \
       --config "$config_path" \
       --stage 1 \
-      library
-    ln -sf "$SALTYOS_RUST_BUILD_DIR/x86_64-unknown-linux-gnu/stage1/bin/rustc" \
-           "$SALTYOS_TOOLCHAIN_PREFIX/bin/rustc"
-    echo "Linked stage1 rustc into prefix:"
-    echo "  $SALTYOS_TOOLCHAIN_PREFIX/bin/rustc -> $SALTYOS_RUST_BUILD_DIR/x86_64-unknown-linux-gnu/stage1/bin/rustc"
+      compiler/rustc library/std src
+    echo "Installed stage1 rustc into prefix: $SALTYOS_TOOLCHAIN_PREFIX"
 
 # Format all source code
 fmt:

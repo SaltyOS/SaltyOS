@@ -178,7 +178,7 @@ clang --target=x86_64-unknown-saltyos -### /dev/null 2>&1 \
 # Expected: ld.lld, -pie, /lib/ld-salty.so
 ```
 
-## Step 4: Build Rust (Stage 1)
+## Step 4: Build and Install Rust (Stage 1)
 
 Rust bootstrap needs the patched LLVM via `llvm-config`, and the key belongs under the host target table (`[target.x86_64-unknown-linux-gnu]`), not under `[llvm]`.
 
@@ -198,6 +198,10 @@ cat > "$SALTYOS_TOOLCHAIN_BUILD_ROOT/rust-bootstrap.toml" <<EOF
 [build]
 target = ["x86_64-unknown-linux-gnu"]
 
+[install]
+prefix = "${SALTYOS_TOOLCHAIN_PREFIX}"
+sysconfdir = "etc"
+
 [llvm]
 download-ci-llvm = false
 
@@ -209,16 +213,17 @@ llvm-config = "${SALTYOS_TOOLCHAIN_PREFIX}/bin/llvm-config"
 llvm-filecheck = "${SALTYOS_TOOLCHAIN_PREFIX}/bin/FileCheck"
 EOF
 
-python3 "$SALTYOS_RUST_SRC_DIR/x.py" build \
+python3 "$SALTYOS_RUST_SRC_DIR/x.py" install \
   --src "$SALTYOS_RUST_SRC_DIR" \
   --build-dir "$SALTYOS_RUST_BUILD_DIR" \
   --config "$SALTYOS_TOOLCHAIN_BUILD_ROOT/rust-bootstrap.toml" \
   --stage 1 \
-  library
+  compiler/rustc library/std src
 ```
 
 Notes:
 
+- `x.py install` copies the stage1 compiler, standard libraries, and rust-src into the prefix — no symlinks needed.
 - `x.py` may download the stage0 toolchain on first use (network access required).
 - Using `--build-dir "$SALTYOS_RUST_BUILD_DIR"` avoids placing Rust build artifacts under `toolchain/rust/build/`.
 
@@ -226,31 +231,24 @@ Notes:
 
 ```bash
 source tools/toolchain/env.sh
-RUSTC="$SALTYOS_RUST_BUILD_DIR/x86_64-unknown-linux-gnu/stage1/bin/rustc"
+
+# rustc is a real binary in the prefix (not a symlink)
+file "$SALTYOS_TOOLCHAIN_PREFIX/bin/rustc"
+
+# Sysroot resolves to the prefix
+"$SALTYOS_TOOLCHAIN_PREFIX/bin/rustc" --print sysroot
 
 # Target is registered
-"$RUSTC" --print target-list | grep saltyos
+"$SALTYOS_TOOLCHAIN_PREFIX/bin/rustc" --print target-list | grep saltyos
 # Expected: x86_64-unknown-saltyos
 
-# Target cfg
-"$RUSTC" --print cfg --target x86_64-unknown-saltyos | grep saltyos
-# Expected: target_os="saltyos"
+# rust-src is available (needed by Meson for core library cross-compilation)
+ls "$SALTYOS_TOOLCHAIN_PREFIX/lib/rustlib/src/rust/library/core/src/lib.rs"
 ```
 
-## Step 5: Expose Stage1 `rustc` in the Prefix
+## Step 5: Validate Toolchain
 
-LLVM installs into the prefix directly; Rust stage1 `rustc` lives in the Rust build dir. Link the stage1 compiler into the same prefix so the active toolchain is in one place:
-
-If you used `just toolchain-build-rust`, this symlink step is already done automatically.
-
-```bash
-source tools/toolchain/env.sh
-mkdir -p "$SALTYOS_TOOLCHAIN_PREFIX/bin"
-ln -sf "$SALTYOS_RUST_BUILD_DIR/x86_64-unknown-linux-gnu/stage1/bin/rustc" \
-       "$SALTYOS_TOOLCHAIN_PREFIX/bin/rustc"
-```
-
-Then run:
+Run the toolchain doctor to verify the prefix is complete:
 
 ```bash
 tools/toolchain/doctor.sh
@@ -333,13 +331,12 @@ git commit --no-gpg-sign -m "chore(toolchain): update llvm and rust submodules"
 source tools/toolchain/env.sh
 ninja -C "$SALTYOS_LLVM_BUILD_DIR" -j"$(nproc)"
 ninja -C "$SALTYOS_LLVM_BUILD_DIR" install
-python3 "$SALTYOS_RUST_SRC_DIR/x.py" build \
+python3 "$SALTYOS_RUST_SRC_DIR/x.py" install \
   --src "$SALTYOS_RUST_SRC_DIR" \
   --build-dir "$SALTYOS_RUST_BUILD_DIR" \
+  --config "$SALTYOS_TOOLCHAIN_BUILD_ROOT/rust-bootstrap.toml" \
   --stage 1 \
-  library
-ln -sf "$SALTYOS_RUST_BUILD_DIR/x86_64-unknown-linux-gnu/stage1/bin/rustc" \
-       "$SALTYOS_TOOLCHAIN_PREFIX/bin/rustc"
+  compiler/rustc library/std src
 ```
 
 ## Troubleshooting

@@ -86,8 +86,7 @@ if [[ -x "${SALTYOS_TOOLCHAIN_PREFIX}/bin/rustc" ]]; then
 elif [[ -x "${SALTYOS_RUST_STAGE1_RUSTC}" ]]; then
   rustc_bin="${SALTYOS_RUST_STAGE1_RUSTC}"
   warn "Prefix rustc missing; using stage1 rustc directly: ${rustc_bin}"
-  warn "Link it into the prefix with:"
-  warn "  ln -sf \"${SALTYOS_RUST_STAGE1_RUSTC}\" \"${SALTYOS_TOOLCHAIN_PREFIX}/bin/rustc\""
+  warn "Install it into the prefix with: just toolchain-build-rust"
 else
   rustc_bin=""
   fail "No usable rustc found in prefix or stage1 build"
