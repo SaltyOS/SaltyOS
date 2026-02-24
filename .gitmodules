@@ -1,0 +1,6 @@
+[submodule "toolchain/llvm-project"]
+	path = toolchain/llvm-project
+	url = https://github.com/SaltyOS/llvm-project.git
+[submodule "toolchain/rust"]
+	path = toolchain/rust
+	url = https://github.com/SaltyOS/rust.git
