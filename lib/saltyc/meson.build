@@ -28,7 +28,7 @@ saltyc_obj = saltyc_rust[0]
 crt_start_obj = custom_target('crt_start_asm',
   input: files('crt_start.S'),
   output: 'crt_start.o',
-  command: [cc_cmd, '-c', '@INPUT@', '-o', '@OUTPUT@'],
+  command: [cc_cmd, '--target=' + c_target, '-c', '@INPUT@', '-o', '@OUTPUT@'],
   build_by_default: true,
 )
 
@@ -36,37 +36,32 @@ crt_start_obj = custom_target('crt_start_asm',
 setjmp_obj = custom_target('setjmp_asm',
   input: files('setjmp.S'),
   output: 'setjmp.o',
-  command: [cc_cmd, '-c', '@INPUT@', '-o', '@OUTPUT@'],
+  command: [cc_cmd, '--target=' + c_target, '-c', '@INPUT@', '-o', '@OUTPUT@'],
   build_by_default: true,
 )
 
-# Step 3b: fts.c -> fts.o (BSD file tree stream, compiled as C)
 # Need clang's resource dir for compiler-provided headers (stddef.h, etc.)
 _clang_resource_dir = run_command(
   cc_cmd[0], '--print-resource-dir', capture: true, check: true,
 ).stdout().strip()
 
-fts_obj = custom_target('fts_c',
-  input: files('fts.c'),
-  output: 'fts.o',
-  command: [cc_cmd,
-    '-ffreestanding', '-nostdlib', '-nostdinc',
-    '-fno-stack-protector', '-mno-red-zone',
-    '-fPIC',
-    '-isystem', meson.current_source_dir() / 'include',
-    '-isystem', _clang_resource_dir / 'include',
-    '-c', '@INPUT@', '-o', '@OUTPUT@'],
-  build_by_default: true,
-)
-
-# Common C compile flags for freestanding libc components
+# Common C compile flags for freestanding libc components linked into libc.so.
+# Keep libc internals freestanding, but force PIC for shared-library linkage.
 _saltyc_c_flags = [
-  '-ffreestanding', '-nostdlib', '-nostdinc',
-  '-fno-stack-protector', '-mno-red-zone',
+  '--target=' + c_target,
+  '-ffreestanding', '-nostdinc', '-fno-stack-protector', '-mno-red-zone',
   '-fPIC',
   '-isystem', meson.current_source_dir() / 'include',
   '-isystem', _clang_resource_dir / 'include',
 ]
+
+# Step 3b: fts.c -> fts.o (BSD file tree stream, compiled as C)
+fts_obj = custom_target('fts_c',
+  input: files('fts.c'),
+  output: 'fts.o',
+  command: [cc_cmd, _saltyc_c_flags, '-c', '@INPUT@', '-o', '@OUTPUT@'],
+  build_by_default: true,
+)
 
 # Step 3c: getopt.c -> getopt.o (POSIX getopt + GNU getopt_long)
 getopt_obj = custom_target('getopt_c',
@@ -117,13 +112,12 @@ libc_so = custom_target('libc_so',
           md5_obj, cap_fileargs_obj, xo_stub_obj, core_obj, compiler_builtins_obj],
   output: 'libc.so',
   command: [cc_cmd,
-    '-fPIC', '-shared',
-    '-nostdlib', '-nostartfiles', '-ffreestanding',
+    '--target=' + c_target,
+    '-shared',
+    '-nostdlib', '-nostartfiles',
     '-fno-stack-protector',
     '-mno-red-zone',
-    '-fuse-ld=lld',
     '-Wl,-soname,libc.so',
-    '-Wl,--hash-style=gnu',
     '-T', saltyc_link,
     '-o', '@OUTPUT@',
     '@INPUT@',

@@ -218,7 +218,7 @@ pub fn do_configure(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Resul
             }
 
             let mut args = vec![
-                format!("--host={}", env.salty_host),
+                format!("--host={}", env.autotools_host),
                 "--prefix=/usr".to_string(),
             ];
 

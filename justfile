@@ -11,29 +11,61 @@ builddir := "build"
 # Setup & Configuration
 # =============================================================================
 
+# Internal: shared setup implementation
+[private]
+_setup-impl suffix arch:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="{{builddir}}{{suffix}}"
+    source tools/toolchain/env.sh
+    if [ -z "${CC:-}" ]; then
+      cc_path="$SALTYOS_TOOLCHAIN_PREFIX/bin/clang"
+      if [ -x "$cc_path" ]; then
+        CC="$cc_path"
+      else
+        echo "No clang found." >&2
+        echo "Checked prefix: $cc_path" >&2
+        echo "Run 'just toolchain-build-llvm', set SALTYOS_TOOLCHAIN_PREFIX, or override CC=/path/to/clang." >&2
+        exit 1
+      fi
+    fi
+    if [ -z "${RUSTC:-}" ]; then
+      rustc_path="$SALTYOS_TOOLCHAIN_PREFIX/bin/rustc"
+      if [ -x "$rustc_path" ]; then
+        RUSTC="$rustc_path"
+      else
+        echo "No rustc found." >&2
+        echo "Checked prefix: $rustc_path" >&2
+        echo "Checked stage1: $SALTYOS_RUST_STAGE1_RUSTC" >&2
+        echo "Run 'just toolchain-build-rust', set SALTYOS_TOOLCHAIN_PREFIX, or override RUSTC=/path/to/rustc." >&2
+        exit 1
+      fi
+    fi
+    mkdir -p "$dir"
+    {
+      printf '[binaries]\n'
+      printf 'c     = %s\n' "'${CC}'"
+      printf 'rustc = %s\n' "'${RUSTC}'"
+      prefix="${SALTYOS_TOOLCHAIN_PREFIX}/bin"
+      for tool in llvm-objcopy lld-link llvm-strip llvm-ar; do
+        [ -x "${prefix}/${tool}" ] && printf '%s = %s\n' "${tool}" "'${prefix}/${tool}'"
+      done
+    } > "$dir/toolchain.ini"
+    meson setup "$dir" \
+      --native-file="$dir/toolchain.ini" \
+      -Darch={{arch}} \
+      -Dbuild_boot=true \
+      -Dbuild_kernel=true \
+      -Dbuild_userland=true
+
 # Configure the build (run once)
-setup:
-    meson setup {{builddir}} \
-        -Darch={{arch}} \
-        -Dbuild_boot=true \
-        -Dbuild_kernel=true \
-        -Dbuild_userland=true
+setup: (_setup-impl "" arch)
 
 # Configure for x86_64
-setup-x86_64:
-    meson setup {{builddir}}-x86_64 \
-        -Darch=x86_64 \
-        -Dbuild_boot=true \
-        -Dbuild_kernel=true \
-        -Dbuild_userland=true
+setup-x86_64: (_setup-impl "-x86_64" "x86_64")
 
 # Configure for aarch64
-setup-aarch64:
-    meson setup {{builddir}}-aarch64 \
-        -Darch=aarch64 \
-        -Dbuild_boot=true \
-        -Dbuild_kernel=true \
-        -Dbuild_userland=true
+setup-aarch64: (_setup-impl "-aarch64" "aarch64")
 
 # Reconfigure with new options
 reconfigure *ARGS:
@@ -432,6 +464,94 @@ image-uefi: build
 info:
     meson configure {{builddir}}
 
+# Print shell exports for the workspace-local toolchain layout
+# Usage: eval "$(just toolchain-env)"
+toolchain-env:
+    bash tools/toolchain/env.sh --print
+
+# Validate that the active clang/rustc/llvm-config match the SaltyOS target setup
+toolchain-doctor:
+    bash tools/toolchain/doctor.sh
+
+# Create the recommended workspace-local toolchain layout directories
+toolchain-setup:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source tools/toolchain/env.sh
+    mkdir -p "$SALTYOS_LLVM_BUILD_DIR" "$SALTYOS_RUST_BUILD_DIR" "$SALTYOS_TOOLCHAIN_PREFIX/bin"
+    echo "Initialized toolchain directories:"
+    echo "  LLVM build : $SALTYOS_LLVM_BUILD_DIR"
+    echo "  Rust build : $SALTYOS_RUST_BUILD_DIR"
+    echo "  Prefix     : $SALTYOS_TOOLCHAIN_PREFIX"
+    echo
+    echo "Next:"
+    echo "  just toolchain-build-llvm"
+    echo "  just toolchain-build-rust"
+
+# Configure, build, and install the patched LLVM/Clang/LLD into the local prefix
+toolchain-build-llvm:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source tools/toolchain/env.sh
+    mkdir -p "$SALTYOS_LLVM_BUILD_DIR" "$SALTYOS_TOOLCHAIN_PREFIX"
+    cmake -S "$SALTYOS_LLVM_SRC_DIR/llvm" -B "$SALTYOS_LLVM_BUILD_DIR" -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DLLVM_ENABLE_PROJECTS="clang;lld" \
+      -DLLVM_TARGETS_TO_BUILD="X86" \
+      -DLLVM_INSTALL_UTILS=ON \
+      -DCMAKE_INSTALL_PREFIX="$SALTYOS_TOOLCHAIN_PREFIX"
+    ninja -C "$SALTYOS_LLVM_BUILD_DIR" -j"$(nproc)"
+    ninja -C "$SALTYOS_LLVM_BUILD_DIR" install
+    if [ ! -x "$SALTYOS_TOOLCHAIN_PREFIX/bin/FileCheck" ] && [ -x "$SALTYOS_LLVM_BUILD_DIR/bin/FileCheck" ]; then
+      ln -sf "$SALTYOS_LLVM_BUILD_DIR/bin/FileCheck" "$SALTYOS_TOOLCHAIN_PREFIX/bin/FileCheck"
+      echo "Linked FileCheck into prefix:"
+      echo "  $SALTYOS_TOOLCHAIN_PREFIX/bin/FileCheck -> $SALTYOS_LLVM_BUILD_DIR/bin/FileCheck"
+    fi
+
+# Build the patched Rust stage1 libraries/compiler using the local LLVM prefix
+toolchain-build-rust:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source tools/toolchain/env.sh
+    mkdir -p "$SALTYOS_RUST_BUILD_DIR" "$SALTYOS_TOOLCHAIN_BUILD_ROOT" "$SALTYOS_TOOLCHAIN_PREFIX/bin"
+    llvm_config_path="$SALTYOS_TOOLCHAIN_PREFIX/bin/llvm-config"
+    if [ ! -x "$llvm_config_path" ]; then
+      echo "Missing llvm-config in prefix: $llvm_config_path" >&2
+      echo "Run 'just toolchain-build-llvm' first (or set SALTYOS_TOOLCHAIN_PREFIX to an existing install)." >&2
+      exit 1
+    fi
+    filecheck_path="$SALTYOS_TOOLCHAIN_PREFIX/bin/FileCheck"
+    if [ ! -x "$filecheck_path" ]; then
+      echo "Missing FileCheck in prefix: $filecheck_path" >&2
+      echo "Run 'just toolchain-build-llvm' first (it installs/links FileCheck into the prefix)." >&2
+      exit 1
+    fi
+    config_path="$SALTYOS_TOOLCHAIN_BUILD_ROOT/rust-bootstrap.toml"
+    {
+      echo '[build]'
+      echo 'target = ["x86_64-unknown-linux-gnu"]'
+      echo ''
+      echo '[llvm]'
+      echo 'download-ci-llvm = false'
+      echo ''
+      echo '[rust]'
+      echo 'use-lld = true'
+      echo ''
+      echo '[target.x86_64-unknown-linux-gnu]'
+      echo "llvm-config = \"$llvm_config_path\""
+      echo "llvm-filecheck = \"$filecheck_path\""
+    } > "$config_path"
+    python3 "$SALTYOS_RUST_SRC_DIR/x.py" build \
+      --src "$SALTYOS_RUST_SRC_DIR" \
+      --build-dir "$SALTYOS_RUST_BUILD_DIR" \
+      --config "$config_path" \
+      --stage 1 \
+      library
+    ln -sf "$SALTYOS_RUST_BUILD_DIR/x86_64-unknown-linux-gnu/stage1/bin/rustc" \
+           "$SALTYOS_TOOLCHAIN_PREFIX/bin/rustc"
+    echo "Linked stage1 rustc into prefix:"
+    echo "  $SALTYOS_TOOLCHAIN_PREFIX/bin/rustc -> $SALTYOS_RUST_BUILD_DIR/x86_64-unknown-linux-gnu/stage1/bin/rustc"
+
 # Format all source code
 fmt:
     find kernel -name "*.rs" -exec rustfmt {} \;
@@ -460,6 +580,9 @@ loc:
 
 # Build a specific port
 port NAME: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source tools/toolchain/env.sh
     {{builddir}}/tools/portbuild/portbuild build ports/{{NAME}} -o {{builddir}}/ports -b {{builddir}} -v
 
 # Fetch all port sources

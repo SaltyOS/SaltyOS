@@ -445,5 +445,6 @@ meson test -C build
 
 - [README.md](../README.md) - Project overview
 - [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture
+- [TOOLCHAIN.md](TOOLCHAIN.md) - Building the patched LLVM/Clang and Rust toolchain
 - [design/](design/) - Design documents
 - [spec/](spec/) - Technical specifications
