@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! AF_INET socket forwarding to netdrv.
+//! AF_INET socket forwarding to netsrv.
 //!
-//! VFS acts as a proxy between userland POSIX socket calls and netdrv's
+//! VFS acts as a proxy between userland POSIX socket calls and netsrv's
 //! TCP/UDP stack. Non-blocking operations (socket, bind, listen, send,
 //! getsockname, close) are forwarded synchronously. Blocking operations
 //! (connect, recv, accept) save the client's reply cap and return
-//! asynchronously via netdrv's badged callback EP.
+//! asynchronously via netsrv's badged callback EP.
 
 use salty::consts::*;
 use salty::invoke;
@@ -92,36 +92,36 @@ unsafe fn find_pending(conn_id: u32, op_type: u8) -> Option<(u64, u64)> {
 // Initialization
 // ======================================================================
 
-/// Create badged EP and register with netdrv.
+/// Create badged EP and register with netsrv.
 ///
 /// Called from VFS _start() before the event loop.
 pub(crate) unsafe fn inet_init() {
-    // SAFETY: Minting a badged copy of our server EP for netdrv callbacks.
+    // SAFETY: Minting a badged copy of our server EP for netsrv callbacks.
     unsafe {
         let err = invoke::cnode_mint(
             CAP_SELF_CSPACE,
             CAP_SERVER_EP,
             CAP_SELF_CSPACE,
-            VFS_CAP_NETDRV_CALLBACK_EP,
-            NETDRV_CALLBACK_BADGE,
+            VFS_CAP_NETSRV_CALLBACK_EP,
+            NETSRV_CALLBACK_BADGE,
         );
         if err != 0 {
             crate::puts(b"[VFS] inet: failed to mint callback EP\n");
             return;
         }
 
-        // Call netdrv with NET_REGISTER_VFS, transferring the badged EP
-        ipc::set_send_cap_ctx(ipc_ctx(), 0, VFS_CAP_NETDRV_CALLBACK_EP);
+        // Call netsrv with NET_REGISTER_VFS, transferring the badged EP
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, VFS_CAP_NETSRV_CALLBACK_EP);
 
         let mut msg = SaltyMsg::zeroed();
         msg.label = NET_REGISTER_VFS;
         msg.length = 0;
         let mut resp = SaltyMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETDRV_EP, &raw const msg, &raw mut resp);
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const msg, &raw mut resp);
         if err != 0 || resp.label != SALTY_OK {
-            crate::puts(b"[VFS] inet: failed to register with netdrv\n");
+            crate::puts(b"[VFS] inet: failed to register with netsrv\n");
         } else {
-            crate::puts(b"[VFS] inet: registered callback EP with netdrv\n");
+            crate::puts(b"[VFS] inet: registered callback EP with netsrv\n");
         }
     }
 }
@@ -130,21 +130,21 @@ pub(crate) unsafe fn inet_init() {
 // Non-blocking forwarding: socket
 // ======================================================================
 
-/// Forward NET_SOCKET to netdrv, create FD_TYPE_INET_SOCKET fd.
+/// Forward NET_SOCKET to netsrv, create FD_TYPE_INET_SOCKET fd.
 pub(crate) unsafe fn handle_inet_socket(
     _msg: *const SaltyMsg,
     reply: *mut SaltyMsg,
     badge: u64,
     sock_type: i32,
 ) -> bool {
-    // SAFETY: IPC context is valid; making synchronous RPC to netdrv.
+    // SAFETY: IPC context is valid; making synchronous RPC to netsrv.
     unsafe {
         let mut req = SaltyMsg::zeroed();
         req.label = NET_SOCKET;
         req.regs[0] = sock_type as u64;
         req.length = 1;
         let mut resp = SaltyMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETDRV_EP, &raw const req, &raw mut resp);
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         if err != 0 || resp.label != SALTY_OK {
             (*reply).label = if err != 0 {
                 SALTY_INVALID_OPERATION
@@ -175,7 +175,7 @@ pub(crate) unsafe fn handle_inet_socket(
             }
         }
 
-        // No free fd — close the netdrv conn
+        // No free fd — close the netsrv conn
         let mut close_req = SaltyMsg::zeroed();
         close_req.label = NET_CLOSE;
         close_req.regs[0] = conn_id as u64;
@@ -183,7 +183,7 @@ pub(crate) unsafe fn handle_inet_socket(
         let mut close_resp = SaltyMsg::zeroed();
         let _ = ipc::call_ctx(
             ipc_ctx(),
-            VFS_CAP_NETDRV_EP,
+            VFS_CAP_NETSRV_EP,
             &raw const close_req,
             &raw mut close_resp,
         );
@@ -220,7 +220,7 @@ pub(crate) unsafe fn handle_inet_connect(
 
         let conn_id = (*(*cli).fds.add(fd as usize)).sock_id;
 
-        // Save client's reply cap BEFORE calling netdrv
+        // Save client's reply cap BEFORE calling netsrv
         let client_slot = alloc_reply_slot();
         let err = invoke::cnode_save_caller(CAP_SELF_CSPACE, client_slot);
         if err != 0 {
@@ -228,7 +228,7 @@ pub(crate) unsafe fn handle_inet_connect(
             return false;
         }
 
-        // Call netdrv synchronously
+        // Call netsrv synchronously
         let mut req = SaltyMsg::zeroed();
         req.label = NET_CONNECT;
         req.regs[0] = conn_id as u64;
@@ -236,7 +236,7 @@ pub(crate) unsafe fn handle_inet_connect(
         req.regs[2] = port as u64;
         req.length = 3;
         let mut resp = SaltyMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETDRV_EP, &raw const req, &raw mut resp);
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
 
         if err != 0 {
             let mut client_reply = SaltyMsg::zeroed();
@@ -298,7 +298,7 @@ pub(crate) unsafe fn handle_inet_bind(
         req.regs[2] = port as u64;
         req.length = 3;
         let mut resp = SaltyMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETDRV_EP, &raw const req, &raw mut resp);
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         (*reply).label = if err != 0 {
             SALTY_INVALID_OPERATION
         } else {
@@ -341,7 +341,7 @@ pub(crate) unsafe fn handle_inet_listen(
         req.regs[1] = backlog as u64;
         req.length = 2;
         let mut resp = SaltyMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETDRV_EP, &raw const req, &raw mut resp);
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         (*reply).label = if err != 0 {
             SALTY_INVALID_OPERATION
         } else {
@@ -388,7 +388,7 @@ pub(crate) unsafe fn handle_inet_accept(
         req.regs[0] = conn_id as u64;
         req.length = 1;
         let mut resp = SaltyMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETDRV_EP, &raw const req, &raw mut resp);
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
 
         if err != 0 {
             let mut client_reply = SaltyMsg::zeroed();
@@ -462,7 +462,7 @@ pub(crate) unsafe fn handle_inet_write(
         req.length = 2 + ((actual as u64 + 7) / 8);
 
         let mut resp = SaltyMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETDRV_EP, &raw const req, &raw mut resp);
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         if err != 0 {
             (*reply).label = SALTY_INVALID_OPERATION;
         } else {
@@ -504,7 +504,7 @@ pub(crate) unsafe fn handle_inet_read(
         req.regs[1] = capped as u64;
         req.length = 2;
         let mut resp = SaltyMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETDRV_EP, &raw const req, &raw mut resp);
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
 
         if err != 0 {
             let mut client_reply = SaltyMsg::zeroed();
@@ -586,7 +586,7 @@ pub(crate) unsafe fn handle_inet_sendto(
         req.length = 4 + ((actual as u64 + 7) / 8);
 
         let mut resp = SaltyMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETDRV_EP, &raw const req, &raw mut resp);
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         if err != 0 {
             (*reply).label = SALTY_INVALID_OPERATION;
         } else {
@@ -639,7 +639,7 @@ pub(crate) unsafe fn handle_inet_recvfrom(
         req.regs[1] = capped as u64;
         req.length = 2;
         let mut resp = SaltyMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETDRV_EP, &raw const req, &raw mut resp);
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
 
         if err != 0 {
             let mut client_reply = SaltyMsg::zeroed();
@@ -711,7 +711,7 @@ pub(crate) unsafe fn handle_inet_shutdown(
         req.regs[1] = how as u64;
         req.length = 2;
         let mut resp = SaltyMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETDRV_EP, &raw const req, &raw mut resp);
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         (*reply).label = if err != 0 {
             SALTY_INVALID_OPERATION
         } else {
@@ -734,7 +734,7 @@ pub(crate) unsafe fn close_inet_socket(fde: *mut FdEntry) {
         req.regs[0] = conn_id as u64;
         req.length = 1;
         let mut resp = SaltyMsg::zeroed();
-        let _ = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETDRV_EP, &raw const req, &raw mut resp);
+        let _ = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
     }
 }
 
@@ -764,13 +764,13 @@ unsafe fn alloc_inet_fd(badge: u64, conn_id: u32) -> Option<i32> {
 }
 
 // ======================================================================
-// Callback handler: NET_COMPLETE from netdrv
+// Callback handler: NET_COMPLETE from netsrv
 // ======================================================================
 
-/// Handle async completion callback from netdrv.
+/// Handle async completion callback from netsrv.
 ///
-/// Called when VFS receives IPC with badge == NETDRV_CALLBACK_BADGE.
-pub(crate) unsafe fn handle_netdrv_callback(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
+/// Called when VFS receives IPC with badge == NETSRV_CALLBACK_BADGE.
+pub(crate) unsafe fn handle_netsrv_callback(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
         let conn_id = (*msg).regs[0] as u32;
@@ -854,7 +854,7 @@ pub(crate) unsafe fn handle_netdrv_callback(msg: *const SaltyMsg, reply: *mut Sa
             ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
         }
 
-        // Reply OK to netdrv (completing the callback IPC)
+        // Reply OK to netsrv (completing the callback IPC)
         (*reply).label = SALTY_OK;
     }
 }

@@ -3,7 +3,6 @@
 //!
 //! Maintains a static ARP table and handles ARP request/reply packets.
 
-use crate::virtio;
 use super::ethernet;
 
 const ARP_TABLE_SIZE: usize = 16;
@@ -17,7 +16,7 @@ const ARP_PACKET_LEN: usize = 28; // Ethernet+IPv4 ARP
 
 /// Look up a MAC address for the given IPv4 address.
 pub(crate) fn lookup(ip: u32) -> Option<[u8; 6]> {
-    // SAFETY: Single-threaded userland driver; only this module accesses ARP_TABLE.
+    // SAFETY: Single-threaded userland server; only this module accesses ARP_TABLE.
     unsafe {
         let table = &*(&raw const ARP_TABLE);
         for entry in table.iter() {
@@ -31,7 +30,7 @@ pub(crate) fn lookup(ip: u32) -> Option<[u8; 6]> {
 
 /// Insert or update an ARP table entry.
 fn arp_table_insert(ip: u32, mac: [u8; 6]) {
-    // SAFETY: Single-threaded userland driver; only this module accesses ARP_TABLE.
+    // SAFETY: Single-threaded userland server; only this module accesses ARP_TABLE.
     unsafe {
         let table = &mut *(&raw mut ARP_TABLE);
         // Update existing entry
@@ -94,7 +93,7 @@ pub(crate) fn handle_packet(our_mac: &[u8; 6], our_ip: u32, data: &[u8]) {
     }
 }
 
-/// Send an ARP reply.
+/// Send an ARP reply via the SHM TX ring.
 fn send_reply(our_mac: &[u8; 6], our_ip: u32, target_mac: &[u8; 6], target_ip: u32) {
     let mut arp = [0u8; ARP_PACKET_LEN];
 
@@ -134,11 +133,12 @@ fn send_reply(our_mac: &[u8; 6], our_ip: u32, target_mac: &[u8; 6], target_ip: u
         &mut frame,
     );
     if len > 0 {
-        virtio::tx_packet(&frame[..len]);
+        crate::shm_tx_enqueue(&frame[..len]);
+        crate::signal_netdrv_tx();
     }
 }
 
-/// Send an ARP request for `target_ip`.
+/// Send an ARP request for `target_ip` via the SHM TX ring.
 pub(crate) fn request(our_mac: &[u8; 6], our_ip: u32, target_ip: u32) {
     let mut arp = [0u8; ARP_PACKET_LEN];
 
@@ -178,6 +178,7 @@ pub(crate) fn request(our_mac: &[u8; 6], our_ip: u32, target_ip: u32) {
         &mut frame,
     );
     if len > 0 {
-        virtio::tx_packet(&frame[..len]);
+        crate::shm_tx_enqueue(&frame[..len]);
+        crate::signal_netdrv_tx();
     }
 }

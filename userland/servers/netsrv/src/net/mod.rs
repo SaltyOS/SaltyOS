@@ -1,21 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Network protocol stack modules.
 
+pub(crate) mod arp;
 pub(crate) mod checksum;
 pub(crate) mod ethernet;
-pub(crate) mod arp;
-pub(crate) mod ipv4;
 pub(crate) mod icmp;
+pub(crate) mod ipv4;
 pub(crate) mod tcp;
 pub(crate) mod udp;
-
-use crate::virtio;
 
 /// Send an IPv4 packet through the network stack.
 ///
 /// Resolves the next-hop MAC via ARP, wraps payload in IPv4 + Ethernet, and
-/// transmits via virtio. Returns silently if no ARP entry exists for the
-/// next hop (caller should call `ensure_arp` first if needed).
+/// transmits via the SHM TX ring to netdrv. Returns silently if no ARP entry
+/// exists for the next hop.
 pub(crate) fn send_ip_packet(
     our_mac: &[u8; 6],
     our_ip: u32,
@@ -37,7 +35,7 @@ pub(crate) fn send_ip_packet(
         None => return,
     };
 
-    // Wrap in Ethernet and transmit
+    // Wrap in Ethernet and transmit via SHM
     let mut frame = [0u8; 1536];
     let frame_len = ethernet::build(
         dst_mac,
@@ -47,7 +45,8 @@ pub(crate) fn send_ip_packet(
         &mut frame,
     );
     if frame_len > 0 {
-        virtio::tx_packet(&frame[..frame_len]);
+        crate::shm_tx_enqueue(&frame[..frame_len]);
+        crate::signal_netdrv_tx();
     }
 }
 

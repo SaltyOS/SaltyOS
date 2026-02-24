@@ -598,6 +598,10 @@ pub const NET_POLL_STATUS: u64 = 0xAF;
 pub const NET_REGISTER_VFS: u64 = 0xB0;
 pub const NET_COMPLETE: u64 = 0xB1;
 
+/// Driver registration IPC labels (driver↔server protocol).
+pub const DRIVER_REGISTER: u64 = 0xC0;
+pub const DRIVER_GET_INFO: u64 = 0xC1;
+
 /// Extended error codes for network operations.
 pub const SALTY_CONN_REFUSED: u64 = 21;
 pub const SALTY_TIMED_OUT: u64 = 22;

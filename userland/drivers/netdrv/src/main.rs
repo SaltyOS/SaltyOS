@@ -1,31 +1,38 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! SaltyOS virtio-net Network Device Driver
+//! SaltyOS virtio-net Hardware-Only Network Device Driver
 //!
 //! Discovers a virtio-net PCI device via pcisrv, initializes the virtio
-//! transport (legacy PCI), sets up IRQ handling, and serves as the network
-//! driver. Implements TCP/UDP over IPv4 and exposes a NET_* IPC interface
-//! for VFS to forward POSIX socket operations.
+//! transport (legacy PCI), sets up IRQ handling, and forwards raw Ethernet
+//! frames between the hardware and netsrv via SHM ring buffers.
+//!
+//! netsrv owns the protocol stack (TCP/IP, ARP, ICMP, etc.). This driver
+//! only does hardware I/O and frame forwarding.
+//!
+//! Communication with netsrv:
+//!   - SHM ring buffers (128KB, 32 pages) for RX and TX frame exchange
+//!   - Notification signaling: netdrv signals netsrv when RX frames are
+//!     available; netsrv signals netdrv (via badged notification) when TX
+//!     frames are queued.
 //!
 //! Cap layout:
 //!   0  = self TCB
 //!   1  = self VSpace
 //!   2  = self CSpace
-//!   68 = server endpoint (pre-created service EP)
-//!   14 = readiness notification
-//!   64 = pcisrv endpoint
 //!   5  = nameserv endpoint
 //!   7  = mmsrv endpoint
-//!   80 = received BAR cap (IoPort or device untyped) from pcisrv
+//!   14 = readiness notification
+//!   64 = pcisrv endpoint
+//!   68 = server endpoint (pre-created service EP)
+//!   80 = netsrv's RX notification cap (received during DRIVER_REGISTER)
 //!   81 = IRQ handler cap (received from pcisrv via PCI_GET_CAPS extra cap #1)
 //!   82 = IRQ notification (retyped from untyped)
-//!   83 = VFS callback endpoint (received from VFS via NET_REGISTER_VFS)
+//!   83 = minted copy of IRQ notification with badge=0x2, sent to netsrv
 
 #![no_std]
 #![no_main]
 
 extern crate salty;
 
-mod net;
 mod virtio;
 
 use salty::consts::*;
@@ -35,6 +42,10 @@ use salty::serial;
 use salty::serial::LineBuf;
 use salty::types::*;
 
+// ---------------------------------------------------------------------------
+// Capability slot constants
+// ---------------------------------------------------------------------------
+
 const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_CSPACE: u64 = 2;
 const CAP_SERVER_EP: u64 = 68;
@@ -43,12 +54,30 @@ const CAP_NAMESERV_EP: u64 = 5;
 const CAP_MMSRV_EP: u64 = 7;
 const CAP_IRQ_HANDLER: u64 = 81;
 const CAP_IRQ_NOTIFICATION: u64 = 82;
-const CAP_VFS_CALLBACK_EP: u64 = 83;
+const CAP_NETSRV_RX_NTFN: u64 = 80;
+const CAP_IRQ_NTFN_BADGED_TX: u64 = 83;
+
+// ---------------------------------------------------------------------------
+// SHM ring buffer constants
+// ---------------------------------------------------------------------------
+
+const SHM_VADDR: u64 = 0x0000_0000_6000_0000;
+const NET_SHM_ID: u64 = 0x4E455400;
+const TX_BADGE: u64 = 0x2;
+
+// ---------------------------------------------------------------------------
+// Driver state
+// ---------------------------------------------------------------------------
 
 static mut IRQ_ENABLED: bool = false;
-static mut VFS_REGISTERED: bool = false;
+static mut SHM_BASE: u64 = 0;
+static mut NETSRV_RX_NTFN: u64 = 0;
 
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
+
+// ---------------------------------------------------------------------------
+// Utility functions
+// ---------------------------------------------------------------------------
 
 pub(crate) fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -89,6 +118,10 @@ fn register_nameserv() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// IRQ setup
+// ---------------------------------------------------------------------------
 
 /// Set up IRQ handling for the device.
 ///
@@ -177,468 +210,207 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
     true
 }
 
-/// Process all pending received packets.
+// ---------------------------------------------------------------------------
+// SHM ring buffer operations
+// ---------------------------------------------------------------------------
+
+/// Enqueue a received Ethernet frame into the SHM RX ring for netsrv.
+///
+/// Returns true if the frame was enqueued, false if the ring is full or SHM
+/// is not yet mapped.
+fn shm_rx_enqueue(frame: &[u8]) -> bool {
+    // SAFETY: SHM_BASE is set once during DRIVER_REGISTER before any enqueue
+    // calls. Single-threaded driver. All pointer arithmetic is within the
+    // mapped SHM region (header at offset 0, RX ring at offset 0x1000).
+    unsafe {
+        let base = *(&raw const SHM_BASE);
+        if base == 0 {
+            return false;
+        }
+        let hdr = base as *mut u32;
+        let rx_head = *hdr.add(0);
+        let rx_tail = core::ptr::read_volatile(hdr.add(1));
+        let slot_count = *hdr.add(4); // offset 0x10
+        let next = (rx_head + 1) % slot_count;
+        if next == rx_tail {
+            return false;
+        }
+
+        let slot_base = base + 0x1000 + (rx_head as u64) * 2048;
+        let len = core::cmp::min(frame.len(), 1998);
+        let len_ptr = slot_base as *mut u16;
+        *len_ptr = len as u16;
+        let data_ptr = (slot_base + 2) as *mut u8;
+        core::ptr::copy_nonoverlapping(frame.as_ptr(), data_ptr, len);
+
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        core::ptr::write_volatile(hdr.add(0), next);
+        true
+    }
+}
+
+/// Dequeue a TX frame from the SHM TX ring (queued by netsrv).
+///
+/// Returns the frame length if a frame was dequeued, None if the ring is
+/// empty or SHM is not yet mapped.
+fn shm_tx_dequeue(buf: &mut [u8; 2048]) -> Option<usize> {
+    // SAFETY: SHM_BASE is set once during DRIVER_REGISTER. Single-threaded
+    // driver. All pointer arithmetic is within the mapped SHM region (header
+    // at offset 0, TX ring at offset 0x11000).
+    unsafe {
+        let base = *(&raw const SHM_BASE);
+        if base == 0 {
+            return None;
+        }
+        let hdr = base as *mut u32;
+        let tx_head = core::ptr::read_volatile(hdr.add(2));
+        let tx_tail = *hdr.add(3);
+        if tx_head == tx_tail {
+            return None;
+        }
+
+        let slot_base = base + 0x11000 + (tx_tail as u64) * 2048;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let len = *(slot_base as *const u16) as usize;
+        let len = core::cmp::min(len, 1998);
+        let data = (slot_base + 2) as *const u8;
+        core::ptr::copy_nonoverlapping(data, buf.as_mut_ptr(), len);
+
+        let slot_count = *hdr.add(5); // offset 0x14
+        core::ptr::write_volatile(hdr.add(3), (tx_tail + 1) % slot_count);
+        Some(len)
+    }
+}
+
+/// Signal netsrv that RX frames are available in the SHM ring.
+fn signal_netsrv_rx() {
+    // SAFETY: NETSRV_RX_NTFN is set during DRIVER_REGISTER before any
+    // signal calls. Single-threaded driver.
+    let cap = unsafe { *(&raw const NETSRV_RX_NTFN) };
+    if cap != 0 {
+        let _ = salty::syscall::syscall(SYS_SIGNAL, cap, 1, 0, 0, 0, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RX/TX frame processing
+// ---------------------------------------------------------------------------
+
+/// Process all pending received packets from virtio and enqueue them into
+/// the SHM RX ring for netsrv.
 fn drain_rx() {
+    let mut any_enqueued = false;
     while let Some((buf_idx, len)) = virtio::rx_poll() {
         let data = virtio::rx_get_data(buf_idx, len);
         // Skip VirtioNetHdr (10 bytes) to get the Ethernet frame
         if len > virtio::VIRTIO_NET_HDR_SIZE {
             let pkt = &data[virtio::VIRTIO_NET_HDR_SIZE..];
-            process_packet(pkt);
+            if shm_rx_enqueue(pkt) {
+                any_enqueued = true;
+            }
         }
         virtio::rx_repost(buf_idx);
     }
-}
-
-/// Handle an IRQ from the virtio device.
-fn handle_irq() {
-    let isr = virtio::read_isr();
-    if isr == 0 {
-        return;
-    }
-    drain_rx();
-    // Acknowledge IRQ to re-enable it
-    let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
-}
-
-/// Dispatch a received Ethernet frame through the protocol stack.
-fn process_packet(data: &[u8]) {
-    if let Some((eth_hdr, payload)) = net::ethernet::parse(data) {
-        match eth_hdr.ethertype {
-            net::ethernet::ETHERTYPE_ARP => {
-                net::arp::handle_packet(&mac_addr(), net::ipv4::OUR_IP, payload);
-            }
-            net::ethernet::ETHERTYPE_IPV4 => {
-                if let Some((ip_hdr, ip_payload)) = net::ipv4::parse(payload) {
-                    match ip_hdr.protocol {
-                        net::ipv4::PROTO_ICMP => {
-                            net::icmp::handle(&mac_addr(), net::ipv4::OUR_IP, &ip_hdr, ip_payload);
-                        }
-                        net::ipv4::PROTO_TCP => {
-                            net::tcp::handle_segment(&ip_hdr, ip_payload);
-                        }
-                        net::ipv4::PROTO_UDP => {
-                            net::udp::handle_datagram(&ip_hdr, ip_payload);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
+    if any_enqueued {
+        signal_netsrv_rx();
     }
 }
 
-/// Self-test: send ARP for gateway, then ping it.
-fn self_test_ping() {
-    // SAFETY: IRQ_ENABLED is set during init before this is called.
-    let irq_enabled = unsafe { *(&raw const IRQ_ENABLED) };
-
-    puts(b"[netdrv] Self-test: ARP request for 10.0.2.2\n");
-    net::arp::request(&mac_addr(), net::ipv4::OUR_IP, net::ipv4::GATEWAY_IP);
-
-    // Poll for ARP reply
-    for _ in 0..1_000_000u64 {
-        if net::arp::lookup(net::ipv4::GATEWAY_IP).is_some() {
-            break;
-        }
-        let isr = virtio::read_isr();
-        if isr != 0 {
-            drain_rx();
-            if irq_enabled {
-                let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
-            }
-        }
-        let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-    }
-
-    match net::arp::lookup(net::ipv4::GATEWAY_IP) {
-        Some(_mac) => {
-            puts(b"[netdrv] ARP reply received for gateway\n");
-            puts(b"[netdrv] Sending ICMP echo to 10.0.2.2 seq=1\n");
-            net::icmp::send_echo_request(&mac_addr(), net::ipv4::OUR_IP, net::ipv4::GATEWAY_IP, 1);
-
-            // Poll for ICMP reply
-            for _ in 0..1_000_000u64 {
-                let isr = virtio::read_isr();
-                if isr != 0 {
-                    drain_rx();
-                    if irq_enabled {
-                        let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
-                    }
-                }
-                let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-            }
-        }
-        None => {
-            puts(b"[netdrv] ARP timeout for gateway\n");
-        }
+/// Drain all pending TX frames from the SHM TX ring (queued by netsrv) and
+/// transmit them via virtio.
+fn drain_tx_ring() {
+    let mut buf = [0u8; 2048];
+    while let Some(len) = shm_tx_dequeue(&mut buf) {
+        virtio::tx_packet(&buf[..len]);
     }
 }
 
 // ---------------------------------------------------------------------------
-// IPC dispatch — handles all NET_* labels from VFS
+// DRIVER_REGISTER IPC handler
 // ---------------------------------------------------------------------------
 
-/// Dispatch a single IPC request from VFS (or any client).
+/// Handle the DRIVER_REGISTER IPC from netsrv.
 ///
-/// All operations return immediately: synchronous operations fill `reply`
-/// with the result; asynchronous operations (connect, recv, accept) return
-/// `SALTY_PENDING` and the TCP/UDP state machine will push a completion
-/// later (delivered to VFS via the callback endpoint).
-fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) {
-    match msg.label {
-        NET_REGISTER_VFS => {
-            // VFS registers its badged callback EP as an extra cap.
-            // The cap was placed in our receive slot (CAP_VFS_CALLBACK_EP)
-            // by the kernel during the IPC.
-            // SAFETY: Single-threaded; written once.
-            unsafe {
-                *(&raw mut VFS_REGISTERED) = true;
-            }
-            puts(b"[netdrv] VFS callback EP registered\n");
-            reply.label = SALTY_OK;
-        }
-        NET_SOCKET => {
-            let sock_type = msg.regs[0] as i32;
-            let id = if sock_type == SOCK_STREAM {
-                net::tcp::tcp_socket()
-            } else if sock_type == SOCK_DGRAM {
-                net::udp::udp_socket()
-            } else {
-                -1
-            };
-            if id >= 0 {
-                reply.label = SALTY_OK;
-                reply.regs[0] = id as u64;
-                reply.length = 1;
-            } else {
-                reply.label = SALTY_OUT_OF_MEMORY;
-            }
-        }
-        NET_CONNECT => {
-            let conn_id = msg.regs[0] as u32;
-            let ip = msg.regs[1] as u32;
-            let port = msg.regs[2] as u16;
-            if conn_id >= 1000 {
-                // UDP connect: store default destination, always immediate
-                let result = net::udp::udp_connect(conn_id, ip, port);
-                reply.label = if result == 0 {
-                    SALTY_OK
-                } else {
-                    SALTY_INVALID_ARGUMENT
-                };
-            } else {
-                // TCP connect: sends SYN, returns -1 (pending)
-                let result = net::tcp::tcp_connect(conn_id, ip, port);
-                if result == -1 {
-                    reply.label = SALTY_PENDING;
-                } else {
-                    reply.label = SALTY_INVALID_ARGUMENT;
-                }
-            }
-        }
-        NET_BIND => {
-            let conn_id = msg.regs[0] as u32;
-            let ip = msg.regs[1] as u32;
-            let port = msg.regs[2] as u16;
-            let result = if conn_id >= 1000 {
-                net::udp::udp_bind(conn_id, ip, port)
-            } else {
-                net::tcp::tcp_bind(conn_id, ip, port)
-            };
-            reply.label = if result == 0 {
-                SALTY_OK
-            } else {
-                SALTY_INVALID_ARGUMENT
-            };
-        }
-        NET_LISTEN => {
-            let conn_id = msg.regs[0] as u32;
-            let backlog = msg.regs[1] as u8;
-            let result = net::tcp::tcp_listen(conn_id, backlog);
-            reply.label = if result == 0 {
-                SALTY_OK
-            } else {
-                SALTY_INVALID_ARGUMENT
-            };
-        }
-        NET_ACCEPT => {
-            let conn_id = msg.regs[0] as u32;
-            let result = net::tcp::tcp_accept(conn_id);
-            if result == -1 {
-                // No pending connections — tell VFS this is async
-                net::tcp::set_pending_accept(conn_id);
-                reply.label = SALTY_PENDING;
-            } else if result > 0 {
-                // Connection already in backlog, completed immediately
-                let new_cid = result as u32;
-                let (ip, port) = net::tcp::tcp_getpeername(new_cid);
-                reply.label = SALTY_OK;
-                reply.regs[0] = new_cid as u64;
-                reply.regs[1] = ip as u64;
-                reply.regs[2] = port as u64;
-                reply.length = 3;
-            } else {
-                reply.label = SALTY_INVALID_ARGUMENT;
-            }
-        }
-        NET_SEND => {
-            let conn_id = msg.regs[0] as u32;
-            let len = msg.regs[1] as usize;
-            let actual_len = core::cmp::min(len, 144);
-            // SAFETY: Reading data bytes from IPC message register area.
-            let data = unsafe {
-                let data_ptr = &msg.regs[2] as *const u64 as *const u8;
-                core::slice::from_raw_parts(data_ptr, actual_len)
-            };
-            let sent = if conn_id >= 1000 {
-                net::udp::udp_send(conn_id, data)
-            } else {
-                net::tcp::tcp_send(conn_id, data)
-            };
-            reply.label = SALTY_OK;
-            reply.regs[0] = if sent >= 0 { sent as u64 } else { 0 };
-            reply.length = 1;
-        }
-        NET_RECV => {
-            let conn_id = msg.regs[0] as u32;
-            let max_len = msg.regs[1] as u16;
-            let capped = core::cmp::min(max_len, 152) as usize;
-            // SAFETY: Writing data into reply register area.
-            let buf = unsafe {
-                let dst = &raw mut reply.regs[1] as *mut u8;
-                core::slice::from_raw_parts_mut(dst, capped)
-            };
-            let result = if conn_id >= 1000 {
-                net::udp::udp_recv(conn_id, buf)
-            } else {
-                net::tcp::tcp_recv(conn_id, buf)
-            };
-            if result == -1 {
-                // No data available — tell VFS this is async
-                if conn_id >= 1000 {
-                    net::udp::set_pending_recv(conn_id, capped as u16);
-                } else {
-                    net::tcp::set_pending_recv(conn_id, capped as u16);
-                }
-                reply.label = SALTY_PENDING;
-            } else {
-                reply.label = SALTY_OK;
-                reply.regs[0] = result as u64;
-                reply.length = 1 + ((result as u64 + 7) / 8);
-            }
-        }
-        NET_SENDTO => {
-            let conn_id = msg.regs[0] as u32;
-            let ip = msg.regs[1] as u32;
-            let port = msg.regs[2] as u16;
-            let len = msg.regs[3] as usize;
-            let actual = core::cmp::min(len, 128);
-            // SAFETY: Reading data bytes from IPC message register area.
-            let data = unsafe {
-                let data_ptr = &msg.regs[4] as *const u64 as *const u8;
-                core::slice::from_raw_parts(data_ptr, actual)
-            };
-            let sent = net::udp::udp_sendto(conn_id, data, ip, port);
-            reply.label = SALTY_OK;
-            reply.regs[0] = if sent >= 0 { sent as u64 } else { 0 };
-            reply.length = 1;
-        }
-        NET_RECVFROM => {
-            let conn_id = msg.regs[0] as u32;
-            let max_len = msg.regs[1] as u16;
-            let capped = core::cmp::min(max_len, 136) as usize;
-            // SAFETY: Writing data into reply register area.
-            let buf = unsafe {
-                let dst = &raw mut reply.regs[3] as *mut u8;
-                core::slice::from_raw_parts_mut(dst, capped)
-            };
-            let (result, src_ip, src_port) = net::udp::udp_recvfrom(conn_id, buf);
-            if result == -1 {
-                net::udp::set_pending_recv(conn_id, capped as u16);
-                reply.label = SALTY_PENDING;
-            } else {
-                reply.label = SALTY_OK;
-                reply.regs[0] = result as u64;
-                reply.regs[1] = src_ip as u64;
-                reply.regs[2] = src_port as u64;
-                reply.length = 3 + ((result as u64 + 7) / 8);
-            }
-        }
-        NET_CLOSE => {
-            let conn_id = msg.regs[0] as u32;
-            if conn_id >= 1000 {
-                net::udp::udp_close(conn_id);
-            } else {
-                net::tcp::tcp_close(conn_id);
-            }
-            reply.label = SALTY_OK;
-        }
-        NET_SHUTDOWN => {
-            let conn_id = msg.regs[0] as u32;
-            let how = msg.regs[1] as i32;
-            net::tcp::tcp_shutdown(conn_id, how);
-            reply.label = SALTY_OK;
-        }
-        NET_GETSOCKNAME => {
-            let conn_id = msg.regs[0] as u32;
-            let (ip, port) = if conn_id >= 1000 {
-                net::udp::udp_getsockname(conn_id)
-            } else {
-                net::tcp::tcp_getsockname(conn_id)
-            };
-            reply.label = SALTY_OK;
-            reply.regs[0] = ip as u64;
-            reply.regs[1] = port as u64;
-            reply.length = 2;
-        }
-        NET_GETPEERNAME => {
-            let conn_id = msg.regs[0] as u32;
-            let (ip, port) = if conn_id >= 1000 {
-                net::udp::udp_getpeername(conn_id)
-            } else {
-                net::tcp::tcp_getpeername(conn_id)
-            };
-            reply.label = SALTY_OK;
-            reply.regs[0] = ip as u64;
-            reply.regs[1] = port as u64;
-            reply.length = 2;
-        }
-        _ => {
-            reply.label = SALTY_INVALID_OPERATION;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Async completion delivery to VFS
-// ---------------------------------------------------------------------------
-
-/// Notify VFS that an async operation has completed by calling its badged
-/// callback endpoint. VFS sees this as a NET_COMPLETE message with
-/// badge == NETDRV_CALLBACK_BADGE.
+/// netsrv sends DRIVER_REGISTER with:
+///   regs[0] = SHM ID (must match NET_SHM_ID)
+///   extra_caps[0] = netsrv's badged RX notification cap
 ///
-/// Message format sent to VFS:
-///   label = NET_COMPLETE
-///   regs[0] = conn_id (the connection this completion belongs to)
-///   regs[1] = result  (SALTY_OK, SALTY_CONN_REFUSED, etc.)
-///   regs[2] = op_type (INET_OP_CONNECT, INET_OP_RECV, etc.)
-///   regs[3] = data_len / extra_conn_id (depends on op_type)
-///   regs[4] = extra_ip / data start
-///   regs[5] = extra_port
-///   regs[6..] = data bytes (for recv/recvfrom)
-fn notify_vfs_completion(
-    conn_id: u32,
-    result: u64,
-    op_type: u8,
-    data: &[u8],
-    data_len: usize,
-    extra_conn_id: u32,
-    extra_ip: u32,
-    extra_port: u16,
-) {
-    // SAFETY: Single-threaded driver; VFS_REGISTERED is set once.
-    let registered = unsafe { *(&raw const VFS_REGISTERED) };
-    if !registered {
+/// On success, replies with:
+///   label = SALTY_OK
+///   regs[0] = MAC address low 4 bytes (network order)
+///   regs[1] = MAC address high 2 bytes (network order)
+///   regs[2] = link status (1 = up)
+///   extra_caps[0] = badged copy of our IRQ notification (badge=TX_BADGE)
+fn handle_driver_register(msg: &SaltyMsg, reply: &mut SaltyMsg) {
+    let shm_id = msg.regs[0];
+    if shm_id != NET_SHM_ID {
+        reply.label = SALTY_INVALID_ARGUMENT;
         return;
     }
 
-    let mut msg = SaltyMsg::zeroed();
-    msg.label = NET_COMPLETE;
-    msg.regs[0] = conn_id as u64;
-    msg.regs[1] = result;
-    msg.regs[2] = op_type as u64;
-
-    match op_type {
-        INET_OP_CONNECT => {
-            msg.length = 3;
-        }
-        INET_OP_RECV => {
-            msg.regs[3] = data_len as u64;
-            // Copy data into regs[4..]
-            let max_data = core::cmp::min(data_len, 128);
-            if max_data > 0 {
-                // SAFETY: Writing data bytes into message register area.
-                unsafe {
-                    let dst = &raw mut msg.regs[4] as *mut u8;
-                    for i in 0..max_data {
-                        *dst.add(i) = data[i];
-                    }
-                }
-            }
-            msg.length = 4 + ((max_data as u64 + 7) / 8);
-        }
-        INET_OP_ACCEPT => {
-            msg.regs[3] = extra_conn_id as u64;
-            msg.regs[4] = extra_ip as u64;
-            msg.regs[5] = extra_port as u64;
-            msg.length = 6;
-        }
-        INET_OP_RECVFROM => {
-            msg.regs[3] = data_len as u64;
-            msg.regs[4] = extra_ip as u64;
-            msg.regs[5] = extra_port as u64;
-            // Copy data into regs[6..]
-            let max_data = core::cmp::min(data_len, 112);
-            if max_data > 0 {
-                // SAFETY: Writing data bytes into message register area.
-                unsafe {
-                    let dst = &raw mut msg.regs[6] as *mut u8;
-                    for i in 0..max_data {
-                        *dst.add(i) = data[i];
-                    }
-                }
-            }
-            msg.length = 6 + ((max_data as u64 + 7) / 8);
-        }
-        _ => {
-            msg.length = 3;
-        }
-    }
-
-    let mut resp = SaltyMsg::zeroed();
-    // SAFETY: IPC context is valid; VFS callback EP is in slot 83.
+    // Store netsrv's RX notification cap (received as extra_cap from the Call).
+    // The cap was placed in CAP_NETSRV_RX_NTFN by the receive slot setup.
+    // SAFETY: Single-threaded driver; written once during registration.
     unsafe {
-        ipc::call_ctx(
-            ipc_ctx(),
-            CAP_VFS_CALLBACK_EP,
-            &raw const msg,
-            &raw mut resp,
-        );
+        *(&raw mut NETSRV_RX_NTFN) = CAP_NETSRV_RX_NTFN;
     }
-}
 
-/// Drain all pending completions from TCP and UDP modules, delivering each
-/// to VFS via the callback endpoint.
-///
-/// Called after IRQ processing (when VFS is in its event loop, not blocked
-/// on a netdrv call) and after timer processing.
-fn drain_completion_queue() {
-    while let Some(c) = net::tcp::pop_completion() {
-        notify_vfs_completion(
-            c.conn_id,
-            c.result,
-            c.op_type,
-            &c.data[..c.data_len],
-            c.data_len,
-            c.extra_conn_id,
-            c.extra_ip,
-            c.extra_port,
-        );
+    // Map the SHM into our address space via mmsrv
+    let ctx = ipc_ctx();
+    let mut map_msg = SaltyMsg::zeroed();
+    map_msg.label = MM_SHM_MAP;
+    map_msg.regs[0] = NET_SHM_ID;
+    map_msg.regs[1] = 0; // client_badge: 0 = map into caller (netdrv)
+    map_msg.regs[2] = SHM_VADDR;
+    map_msg.regs[3] = 0x3; // RW permissions
+    map_msg.length = 4;
+    let mut map_reply = SaltyMsg::zeroed();
+    // SAFETY: IPC context is valid; making RPC to mmsrv.
+    let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const map_msg, &raw mut map_reply) };
+    if err != 0 || map_reply.label != SALTY_OK {
+        puts(b"[netdrv] Failed to map SHM\n");
+        reply.label = SALTY_INVALID_OPERATION;
+        return;
     }
-    while let Some(c) = net::udp::pop_completion() {
-        notify_vfs_completion(
-            c.conn_id,
-            c.result,
-            c.op_type,
-            &c.data[..c.data_len],
-            c.data_len,
-            c.extra_conn_id,
-            c.extra_ip,
-            c.extra_port,
-        );
+    // SAFETY: Single-threaded driver; written once during registration.
+    unsafe {
+        *(&raw mut SHM_BASE) = SHM_VADDR;
     }
+
+    // Mint a badged copy of our IRQ notification with badge=TX_BADGE for netsrv
+    let err = invoke::cnode_mint(
+        CAP_SELF_CSPACE,
+        CAP_IRQ_NOTIFICATION,
+        CAP_SELF_CSPACE,
+        CAP_IRQ_NTFN_BADGED_TX,
+        TX_BADGE,
+    );
+    if err != 0 {
+        puts(b"[netdrv] Failed to mint TX notification\n");
+        reply.label = SALTY_INVALID_OPERATION;
+        return;
+    }
+
+    // Send TX notification cap back as extra cap in reply
+    // SAFETY: IPC context is valid; setting extra cap for reply.
+    unsafe {
+        ipc::set_send_cap_ctx(ctx, 0, CAP_IRQ_NTFN_BADGED_TX);
+    }
+
+    // Reply with MAC address
+    let mac = mac_addr();
+    let mac_lo = ((mac[0] as u32) << 24)
+        | ((mac[1] as u32) << 16)
+        | ((mac[2] as u32) << 8)
+        | (mac[3] as u32);
+    let mac_hi = ((mac[4] as u16) << 8) | (mac[5] as u16);
+    reply.label = SALTY_OK;
+    reply.regs[0] = mac_lo as u64;
+    reply.regs[1] = mac_hi as u64;
+    reply.regs[2] = 1; // link status: up
+    reply.length = 3;
+
+    puts(b"[netdrv] DRIVER_REGISTER complete, SHM mapped\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -648,10 +420,10 @@ fn drain_completion_queue() {
 /// Main event loop: wait for IRQ notifications or IPC requests.
 ///
 /// Uses a recv / reply_recv pattern:
-/// - On IRQ notification (badge != 0): process packets, run TCP timers,
-///   drain completion queue (callbacks to VFS), then recv again.
-/// - On IPC request (badge == 0): dispatch the request, fill reply, then
-///   reply_recv (atomically reply and wait for next event).
+/// - On notification (badge != 0): check for hardware IRQ and/or TX badge
+///   from netsrv, process accordingly, then recv again.
+/// - On IPC request (badge == 0): dispatch DRIVER_REGISTER, fill reply,
+///   then reply_recv (atomically reply and wait for next event).
 fn event_loop(device_ok: bool) -> ! {
     puts(b"[netdrv] Entering event loop\n");
 
@@ -670,7 +442,7 @@ fn event_loop(device_ok: bool) -> ! {
                 }
             }
         } else {
-            // No device present — idle loop with no hardware access
+            // No device present -- idle loop with no hardware access
             puts(b"[netdrv] No device, idling\n");
             loop {
                 let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
@@ -682,14 +454,13 @@ fn event_loop(device_ok: bool) -> ! {
     let mut msg = SaltyMsg::zeroed();
     let mut badge: u64 = 0;
 
-    // Set up receive slot for VFS callback EP (slot 83).
-    // VFS sends its badged EP via NET_REGISTER_VFS with extra_caps=1.
+    // Set receive slot for netsrv's notification cap during DRIVER_REGISTER
     // SAFETY: IPC context is valid.
     unsafe {
-        ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_VFS_CALLBACK_EP, 0);
+        ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_NETSRV_RX_NTFN, 0);
     }
 
-    // Initial recv — wait for first event
+    // Initial recv -- wait for first event
     // SAFETY: IPC context is valid; server EP was set up by procmgr.
     unsafe {
         ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge);
@@ -697,10 +468,16 @@ fn event_loop(device_ok: bool) -> ! {
 
     loop {
         if badge != 0 {
-            // Woken by bound notification (IRQ)
-            handle_irq();
-            net::tcp::process_timers();
-            drain_completion_queue();
+            // Woken by bound notification -- check for hardware IRQ
+            let isr = virtio::read_isr();
+            if isr != 0 {
+                drain_rx();
+                let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
+            }
+            // Check for TX notification from netsrv (badge bit 0x2)
+            if badge & TX_BADGE != 0 {
+                drain_tx_ring();
+            }
 
             // Wait for next event (no reply needed for notifications)
             msg = SaltyMsg::zeroed();
@@ -712,7 +489,12 @@ fn event_loop(device_ok: bool) -> ! {
         } else {
             // IPC request on server endpoint
             let mut reply = SaltyMsg::zeroed();
-            dispatch_ipc(&msg, &mut reply);
+            match msg.label {
+                DRIVER_REGISTER => handle_driver_register(&msg, &mut reply),
+                _ => {
+                    reply.label = SALTY_INVALID_OPERATION;
+                }
+            }
 
             // Reply to caller AND wait for next event atomically
             msg = SaltyMsg::zeroed();
@@ -731,9 +513,13 @@ fn event_loop(device_ok: bool) -> ! {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    puts(b"[netdrv] virtio-net Network Driver starting\n");
+    puts(b"[netdrv] virtio-net Hardware Driver starting\n");
 
     // Set IPC buffer
     let _ = invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
@@ -798,10 +584,8 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    // Print IP configuration
     if device_ok {
-        puts(b"[netdrv] IP: 10.0.2.15/24, GW: 10.0.2.2\n");
-        self_test_ping();
+        puts(b"[netdrv] virtio-net device ready\n");
     }
 
     // Register with nameserv and signal readiness

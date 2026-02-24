@@ -820,12 +820,12 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    // Register callback EP with netdrv for AF_INET async operations
+    signal_ready();
+
+    // Register callback EP with netsrv for AF_INET async operations
     unsafe {
         inet::inet_init();
     }
-
-    signal_ready();
 
     let mut msg = SaltyMsg::zeroed();
     let mut badge: u64 = 0;
@@ -840,12 +840,12 @@ pub extern "C" fn _start() -> ! {
         let mut reply = SaltyMsg::zeroed();
         let mut skip_reply = false;
 
-        if badge == consts::NETDRV_CALLBACK_BADGE {
-            // Async completion from netdrv (NET_COMPLETE)
+        if badge == consts::NETSRV_CALLBACK_BADGE {
+            // Async completion from netsrv (NET_COMPLETE)
             unsafe {
-                inet::handle_netdrv_callback(&raw const msg, &raw mut reply);
+                inet::handle_netsrv_callback(&raw const msg, &raw mut reply);
             }
-            // reply to netdrv to complete the callback IPC — do NOT skip reply
+            // reply to netsrv to complete the callback IPC — do NOT skip reply
         } else if msg.length == 0 && msg.label == 0 && badge != 0 {
             unsafe {
                 misc::handle_pty_notification(badge);

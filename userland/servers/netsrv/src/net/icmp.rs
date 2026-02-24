@@ -10,6 +10,21 @@ const ICMP_TYPE_ECHO_REPLY: u8 = 0;
 const ICMP_TYPE_ECHO_REQUEST: u8 = 8;
 const ICMP_HEADER_LEN: usize = 8;
 
+/// Flag set when an echo reply is received, used by self-test for early break.
+static mut ECHO_REPLY_RECEIVED: bool = false;
+
+/// Check if an echo reply has been received (for self-test early break).
+pub(crate) fn echo_reply_received() -> bool {
+    // SAFETY: Single-threaded server; read-only check.
+    unsafe { *(&raw const ECHO_REPLY_RECEIVED) }
+}
+
+/// Reset the echo reply received flag.
+pub(crate) fn reset_echo_reply_flag() {
+    // SAFETY: Single-threaded server; written once before self-test.
+    unsafe { *(&raw mut ECHO_REPLY_RECEIVED) = false; }
+}
+
 /// Handle an incoming ICMP packet.
 ///
 /// If it is an echo request for us, sends an echo reply with the same
@@ -28,15 +43,17 @@ pub(crate) fn handle(
     let _code = data[1];
 
     if icmp_type == ICMP_TYPE_ECHO_REQUEST {
-        puts(b"[netdrv] ICMP echo request received, sending reply\n");
+        puts(b"[netsrv] ICMP echo request received, sending reply\n");
         send_echo_reply(our_mac, our_ip, ip_hdr.src, data);
     } else if icmp_type == ICMP_TYPE_ECHO_REPLY {
         let seq = ((data[6] as u16) << 8) | (data[7] as u16);
         let mut lb = salty::serial::LineBuf::new();
-        lb.str(b"[netdrv] ICMP echo reply received seq=");
+        lb.str(b"[netsrv] ICMP echo reply received seq=");
         lb.dec(seq as u64);
         lb.putc(b'\n');
         lb.flush();
+        // SAFETY: Single-threaded server; set flag for self-test early break.
+        unsafe { *(&raw mut ECHO_REPLY_RECEIVED) = true; }
     }
 }
 
