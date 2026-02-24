@@ -1,22 +1,31 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! SaltyOS virtio-net Network Device Driver
+//! SaltyOS virtio-net Hardware-Only Network Device Driver
 //!
 //! Discovers a virtio-net PCI device via pcisrv, initializes the virtio
-//! transport (legacy PCI), sets up IRQ handling, and serves as the network
-//! driver. Responds to ARP and ICMP (ping) automatically.
+//! transport (legacy PCI), sets up IRQ handling, and forwards raw Ethernet
+//! frames between the hardware and netsrv via SHM ring buffers.
+//!
+//! netsrv owns the protocol stack (TCP/IP, ARP, ICMP, etc.). This driver
+//! only does hardware I/O and frame forwarding.
+//!
+//! Communication with netsrv:
+//!   - SHM ring buffers (128KB, 32 pages) for RX and TX frame exchange
+//!   - Notification signaling: netdrv signals netsrv when RX frames are
+//!     available; netsrv signals netdrv (via badged notification) when TX
+//!     frames are queued.
 //!
 //! Cap layout:
 //!   0  = self TCB
 //!   1  = self VSpace
 //!   2  = self CSpace
-//!   68 = server endpoint (pre-created service EP)
-//!   14 = readiness notification
-//!   64 = pcisrv endpoint
 //!   5  = nameserv endpoint
 //!   7  = mmsrv endpoint
-//!   80 = received BAR cap (IoPort or device untyped) from pcisrv
+//!   14 = readiness notification
+//!   64 = pcisrv endpoint
+//!   68 = server endpoint (pre-created service EP)
+//!   84 = netsrv's RX notification cap (received during DRIVER_REGISTER)
 //!   81 = IRQ handler cap (received from pcisrv via PCI_GET_CAPS extra cap #1)
-//!   82 = IRQ notification (retyped from untyped)
+//!   82 = IRQ notification (retyped from untyped, sent to netsrv via IPC)
 
 #![no_std]
 #![no_main]
@@ -24,14 +33,17 @@
 extern crate salty;
 
 mod virtio;
-mod net;
 
 use salty::consts::*;
-use salty::ipc;
 use salty::invoke;
+use salty::ipc;
 use salty::serial;
 use salty::serial::LineBuf;
 use salty::types::*;
+
+// ---------------------------------------------------------------------------
+// Capability slot constants
+// ---------------------------------------------------------------------------
 
 const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_CSPACE: u64 = 2;
@@ -41,10 +53,29 @@ const CAP_NAMESERV_EP: u64 = 5;
 const CAP_MMSRV_EP: u64 = 7;
 const CAP_IRQ_HANDLER: u64 = 81;
 const CAP_IRQ_NOTIFICATION: u64 = 82;
+const CAP_NETSRV_RX_NTFN: u64 = 84;
+
+// ---------------------------------------------------------------------------
+// SHM ring buffer constants
+// ---------------------------------------------------------------------------
+
+const SHM_VADDR: u64 = 0x0000_0000_6000_0000;
+const NET_SHM_ID: u64 = 0x4E455400;
+const TX_BADGE: u64 = 0x2;
+
+// ---------------------------------------------------------------------------
+// Driver state
+// ---------------------------------------------------------------------------
 
 static mut IRQ_ENABLED: bool = false;
+static mut SHM_BASE: u64 = 0;
+static mut NETSRV_RX_NTFN: u64 = 0;
 
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
+
+// ---------------------------------------------------------------------------
+// Utility functions
+// ---------------------------------------------------------------------------
 
 pub(crate) fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -86,6 +117,10 @@ fn register_nameserv() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// IRQ setup
+// ---------------------------------------------------------------------------
+
 /// Set up IRQ handling for the device.
 ///
 /// Uses the IRQ handler cap received from pcisrv (slot 81) rather than
@@ -112,11 +147,22 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
     msg.length = 2;
     let mut alloc_reply = SaltyMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_MMSRV_EP, &raw const msg, &raw mut alloc_reply) };
+    let err = unsafe {
+        ipc::call_ctx(
+            ipc_ctx(),
+            CAP_MMSRV_EP,
+            &raw const msg,
+            &raw mut alloc_reply,
+        )
+    };
     if err != 0 || alloc_reply.label != SALTY_OK {
         let mut lb = LineBuf::new();
         lb.str(b"[netdrv] Failed to allocate Notification via mmsrv: ");
-        lb.dec(if err != 0 { err as u64 } else { alloc_reply.label });
+        lb.dec(if err != 0 {
+            err as u64
+        } else {
+            alloc_reply.label
+        });
         lb.putc(b'\n');
         lb.flush();
         return false;
@@ -148,7 +194,9 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
     let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
 
     // SAFETY: Single-threaded init path; written once before event loop.
-    unsafe { *(&raw mut IRQ_ENABLED) = true; }
+    unsafe {
+        *(&raw mut IRQ_ENABLED) = true;
+    }
 
     {
         let mut lb = LineBuf::new();
@@ -160,97 +208,208 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
     true
 }
 
-/// Process all pending received packets.
+// ---------------------------------------------------------------------------
+// SHM ring buffer operations
+// ---------------------------------------------------------------------------
+
+/// Enqueue a received Ethernet frame into the SHM RX ring for netsrv.
+///
+/// Returns true if the frame was enqueued, false if the ring is full or SHM
+/// is not yet mapped.
+fn shm_rx_enqueue(frame: &[u8]) -> bool {
+    // SAFETY: SHM_BASE is set once during DRIVER_REGISTER before any enqueue
+    // calls. Single-threaded driver. All pointer arithmetic is within the
+    // mapped SHM region (header at offset 0, RX ring at offset 0x1000).
+    unsafe {
+        let base = *(&raw const SHM_BASE);
+        if base == 0 {
+            return false;
+        }
+        let hdr = base as *mut u32;
+        let rx_head = *hdr.add(0);
+        let rx_tail = core::ptr::read_volatile(hdr.add(1));
+        let slot_count = core::ptr::read_volatile(hdr.add(4)); // offset 0x10
+        let next = (rx_head + 1) % slot_count;
+        if next == rx_tail {
+            return false;
+        }
+
+        let slot_base = base + 0x1000 + (rx_head as u64) * 2048;
+        let len = core::cmp::min(frame.len(), 1998);
+        let len_ptr = slot_base as *mut u16;
+        *len_ptr = len as u16;
+        let data_ptr = (slot_base + 2) as *mut u8;
+        core::ptr::copy_nonoverlapping(frame.as_ptr(), data_ptr, len);
+
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        core::ptr::write_volatile(hdr.add(0), next);
+        true
+    }
+}
+
+/// Dequeue a TX frame from the SHM TX ring (queued by netsrv).
+///
+/// Returns the frame length if a frame was dequeued, None if the ring is
+/// empty or SHM is not yet mapped.
+fn shm_tx_dequeue(buf: &mut [u8; 2048]) -> Option<usize> {
+    // SAFETY: SHM_BASE is set once during DRIVER_REGISTER. Single-threaded
+    // driver. All pointer arithmetic is within the mapped SHM region (header
+    // at offset 0, TX ring at offset 0x11000).
+    unsafe {
+        let base = *(&raw const SHM_BASE);
+        if base == 0 {
+            return None;
+        }
+        let hdr = base as *mut u32;
+        let tx_head = core::ptr::read_volatile(hdr.add(2));
+        let tx_tail = *hdr.add(3);
+        if tx_head == tx_tail {
+            return None;
+        }
+
+        let slot_base = base + 0x11000 + (tx_tail as u64) * 2048;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let len = *(slot_base as *const u16) as usize;
+        let len = core::cmp::min(len, 1998);
+        let data = (slot_base + 2) as *const u8;
+        core::ptr::copy_nonoverlapping(data, buf.as_mut_ptr(), len);
+
+        let slot_count = core::ptr::read_volatile(hdr.add(5)); // offset 0x14
+        core::ptr::write_volatile(hdr.add(3), (tx_tail + 1) % slot_count);
+        Some(len)
+    }
+}
+
+/// Signal netsrv that RX frames are available in the SHM ring.
+fn signal_netsrv_rx() {
+    // SAFETY: NETSRV_RX_NTFN is set during DRIVER_REGISTER before any
+    // signal calls. Single-threaded driver.
+    let cap = unsafe { *(&raw const NETSRV_RX_NTFN) };
+    if cap != 0 {
+        let _ = salty::syscall::syscall(SYS_SIGNAL, cap, 1, 0, 0, 0, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RX/TX frame processing
+// ---------------------------------------------------------------------------
+
+/// Process all pending received packets from virtio and enqueue them into
+/// the SHM RX ring for netsrv.
 fn drain_rx() {
+    let mut any_enqueued = false;
     while let Some((buf_idx, len)) = virtio::rx_poll() {
         let data = virtio::rx_get_data(buf_idx, len);
         // Skip VirtioNetHdr (10 bytes) to get the Ethernet frame
         if len > virtio::VIRTIO_NET_HDR_SIZE {
             let pkt = &data[virtio::VIRTIO_NET_HDR_SIZE..];
-            process_packet(pkt);
+            if shm_rx_enqueue(pkt) {
+                any_enqueued = true;
+            }
         }
         virtio::rx_repost(buf_idx);
     }
+    if any_enqueued {
+        signal_netsrv_rx();
+    }
 }
 
-/// Handle an IRQ from the virtio device.
-fn handle_irq() {
-    let isr = virtio::read_isr();
-    if isr == 0 {
+/// Drain all pending TX frames from the SHM TX ring (queued by netsrv) and
+/// transmit them via virtio.
+fn drain_tx_ring() {
+    let mut buf = [0u8; 2048];
+    while let Some(len) = shm_tx_dequeue(&mut buf) {
+        virtio::tx_packet(&buf[..len]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DRIVER_REGISTER IPC handler
+// ---------------------------------------------------------------------------
+
+/// Handle the DRIVER_REGISTER IPC from netsrv.
+///
+/// netsrv sends DRIVER_REGISTER with:
+///   regs[0] = SHM ID (must match NET_SHM_ID)
+///   extra_caps[0] = netsrv's badged RX notification cap
+///
+/// On success, replies with:
+///   label = SALTY_OK
+///   regs[0] = MAC address low 4 bytes (network order)
+///   regs[1] = MAC address high 2 bytes (network order)
+///   regs[2] = link status (1 = up)
+///   extra_caps[0] = badged copy of our IRQ notification (badge=TX_BADGE)
+fn handle_driver_register(msg: &SaltyMsg, reply: &mut SaltyMsg) {
+    let shm_id = msg.regs[0];
+    if shm_id != NET_SHM_ID {
+        reply.label = SALTY_INVALID_ARGUMENT;
         return;
     }
-    drain_rx();
-    // Acknowledge IRQ to re-enable it
-    let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
-}
 
-/// Dispatch a received Ethernet frame through the protocol stack.
-fn process_packet(data: &[u8]) {
-    if let Some((eth_hdr, payload)) = net::ethernet::parse(data) {
-        match eth_hdr.ethertype {
-            net::ethernet::ETHERTYPE_ARP => {
-                net::arp::handle_packet(&mac_addr(), net::ipv4::OUR_IP, payload);
-            }
-            net::ethernet::ETHERTYPE_IPV4 => {
-                if let Some((ip_hdr, ip_payload)) = net::ipv4::parse(payload) {
-                    if ip_hdr.protocol == net::ipv4::PROTO_ICMP {
-                        net::icmp::handle(&mac_addr(), net::ipv4::OUR_IP, &ip_hdr, ip_payload);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Self-test: send ARP for gateway, then ping it.
-fn self_test_ping() {
-    // SAFETY: IRQ_ENABLED is set during init before this is called.
-    let irq_enabled = unsafe { *(&raw const IRQ_ENABLED) };
-
-    puts(b"[netdrv] Self-test: ARP request for 10.0.2.2\n");
-    net::arp::request(&mac_addr(), net::ipv4::OUR_IP, net::ipv4::GATEWAY_IP);
-
-    // Poll for ARP reply
-    for _ in 0..1_000_000u64 {
-        if net::arp::lookup(net::ipv4::GATEWAY_IP).is_some() {
-            break;
-        }
-        let isr = virtio::read_isr();
-        if isr != 0 {
-            drain_rx();
-            if irq_enabled {
-                let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
-            }
-        }
-        let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+    // Store netsrv's RX notification cap (received as extra_cap from the Call).
+    // The cap was placed in CAP_NETSRV_RX_NTFN by the receive slot setup.
+    // SAFETY: Single-threaded driver; written once during registration.
+    unsafe {
+        *(&raw mut NETSRV_RX_NTFN) = CAP_NETSRV_RX_NTFN;
     }
 
-    match net::arp::lookup(net::ipv4::GATEWAY_IP) {
-        Some(_mac) => {
-            puts(b"[netdrv] ARP reply received for gateway\n");
-            puts(b"[netdrv] Sending ICMP echo to 10.0.2.2 seq=1\n");
-            net::icmp::send_echo_request(&mac_addr(), net::ipv4::OUR_IP, net::ipv4::GATEWAY_IP, 1);
-
-            // Poll for ICMP reply
-            for _ in 0..1_000_000u64 {
-                let isr = virtio::read_isr();
-                if isr != 0 {
-                    drain_rx();
-                    if irq_enabled {
-                        let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
-                    }
-                }
-                let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-            }
-        }
-        None => {
-            puts(b"[netdrv] ARP timeout for gateway\n");
-        }
+    // Map the SHM into our address space via mmsrv
+    let ctx = ipc_ctx();
+    let mut map_msg = SaltyMsg::zeroed();
+    map_msg.label = MM_SHM_MAP;
+    map_msg.regs[0] = NET_SHM_ID;
+    map_msg.regs[1] = 0; // client_badge: 0 = map into caller (netdrv)
+    map_msg.regs[2] = SHM_VADDR;
+    map_msg.regs[3] = 0x3; // RW permissions
+    map_msg.length = 4;
+    let mut map_reply = SaltyMsg::zeroed();
+    // SAFETY: IPC context is valid; making RPC to mmsrv.
+    let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const map_msg, &raw mut map_reply) };
+    if err != 0 || map_reply.label != SALTY_OK {
+        puts(b"[netdrv] Failed to map SHM\n");
+        reply.label = SALTY_INVALID_OPERATION;
+        return;
     }
+    // SAFETY: Single-threaded driver; written once during registration.
+    unsafe {
+        *(&raw mut SHM_BASE) = SHM_VADDR;
+    }
+
+    // Send our IRQ notification cap (unbadged, retains GRANT right) as extra
+    // cap in reply.  netsrv will pass TX_BADGE via the `bits` argument of
+    // SYS_SIGNAL instead of relying on cap.badge.
+    // SAFETY: IPC context is valid; setting extra cap for reply.
+    unsafe {
+        ipc::set_send_cap_ctx(ctx, 0, CAP_IRQ_NOTIFICATION);
+    }
+
+    // Reply with MAC address
+    let mac = mac_addr();
+    let mac_lo = ((mac[0] as u32) << 24)
+        | ((mac[1] as u32) << 16)
+        | ((mac[2] as u32) << 8)
+        | (mac[3] as u32);
+    let mac_hi = ((mac[4] as u16) << 8) | (mac[5] as u16);
+    reply.label = SALTY_OK;
+    reply.regs[0] = mac_lo as u64;
+    reply.regs[1] = mac_hi as u64;
+    reply.regs[2] = 1; // link status: up
+    reply.length = 3;
+
+    puts(b"[netdrv] DRIVER_REGISTER complete, SHM mapped\n");
 }
+
+// ---------------------------------------------------------------------------
+// Event loop
+// ---------------------------------------------------------------------------
 
 /// Main event loop: wait for IRQ notifications or IPC requests.
+///
+/// Uses a recv / reply_recv pattern:
+/// - On notification (badge != 0): check for hardware IRQ and/or TX badge
+///   from netsrv, process accordingly, then recv again.
+/// - On IPC request (badge == 0): dispatch DRIVER_REGISTER, fill reply,
+///   then reply_recv (atomically reply and wait for next event).
 fn event_loop(device_ok: bool) -> ! {
     puts(b"[netdrv] Entering event loop\n");
 
@@ -269,7 +428,7 @@ fn event_loop(device_ok: bool) -> ! {
                 }
             }
         } else {
-            // No device present — idle loop with no hardware access
+            // No device present -- idle loop with no hardware access
             puts(b"[netdrv] No device, idling\n");
             loop {
                 let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
@@ -281,29 +440,72 @@ fn event_loop(device_ok: bool) -> ! {
     let mut msg = SaltyMsg::zeroed();
     let mut badge: u64 = 0;
 
-    // Initial recv
+    // Set receive slot for netsrv's notification cap during DRIVER_REGISTER
+    // SAFETY: IPC context is valid.
+    unsafe {
+        ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_NETSRV_RX_NTFN, 0);
+    }
+
+    // Initial recv -- wait for first event
     // SAFETY: IPC context is valid; server EP was set up by procmgr.
-    unsafe { ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge); }
+    unsafe {
+        ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge);
+    }
 
     loop {
         if badge != 0 {
-            // Woken by bound notification (IRQ)
-            handle_irq();
-        } else {
-            // IPC request on server endpoint -- not yet implemented
-        }
+            // Woken by bound notification -- check for hardware IRQ
+            let isr = virtio::read_isr();
+            if isr != 0 {
+                drain_rx();
+                let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
+            }
+            // Check for TX notification from netsrv (badge bit 0x2)
+            if badge & TX_BADGE != 0 {
+                drain_tx_ring();
+            }
 
-        // Wait for next event
-        msg = SaltyMsg::zeroed();
-        badge = 0;
-        // SAFETY: IPC context is valid.
-        unsafe { ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge); }
+            // Wait for next event (no reply needed for notifications)
+            msg = SaltyMsg::zeroed();
+            badge = 0;
+            // SAFETY: IPC context is valid.
+            unsafe {
+                ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge);
+            }
+        } else {
+            // IPC request on server endpoint
+            let mut reply = SaltyMsg::zeroed();
+            match msg.label {
+                DRIVER_REGISTER => handle_driver_register(&msg, &mut reply),
+                _ => {
+                    reply.label = SALTY_INVALID_OPERATION;
+                }
+            }
+
+            // Reply to caller AND wait for next event atomically
+            msg = SaltyMsg::zeroed();
+            badge = 0;
+            // SAFETY: IPC context is valid.
+            unsafe {
+                ipc::reply_recv_ctx(
+                    ctx,
+                    CAP_SERVER_EP,
+                    &raw const reply,
+                    &raw mut msg,
+                    &raw mut badge,
+                );
+            }
+        }
     }
 }
 
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    puts(b"[netdrv] virtio-net Network Driver starting\n");
+    puts(b"[netdrv] virtio-net Hardware Driver starting\n");
 
     // Set IPC buffer
     let _ = invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
@@ -368,10 +570,8 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    // Print IP configuration
     if device_ok {
-        puts(b"[netdrv] IP: 10.0.2.15/24, GW: 10.0.2.2\n");
-        self_test_ping();
+        puts(b"[netdrv] virtio-net device ready\n");
     }
 
     // Register with nameserv and signal readiness

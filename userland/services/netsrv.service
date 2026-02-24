@@ -1,0 +1,12 @@
+[Service]
+Name=netsrv
+Binary=netsrv
+Type=simple
+Restart=always
+
+[Dependencies]
+After=netdrv nameserv mmsrv
+Before=vfs
+
+[Capabilities]
+NeedEP=netdrv:64 nameserv:65

@@ -4,6 +4,8 @@
 use super::checksum;
 
 pub(crate) const PROTO_ICMP: u8 = 1;
+pub(crate) const PROTO_TCP: u8 = 6;
+pub(crate) const PROTO_UDP: u8 = 17;
 pub(crate) const IPV4_HEADER_LEN: usize = 20;
 
 /// Static IP configuration (QEMU user networking defaults).

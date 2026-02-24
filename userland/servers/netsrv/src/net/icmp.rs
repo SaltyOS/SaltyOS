@@ -3,13 +3,27 @@
 //!
 //! Handles ICMP echo request/reply (ping).
 
-use crate::virtio;
 use crate::puts;
-use super::{arp, checksum, ethernet, ipv4};
+use super::{checksum, ipv4};
 
 const ICMP_TYPE_ECHO_REPLY: u8 = 0;
 const ICMP_TYPE_ECHO_REQUEST: u8 = 8;
 const ICMP_HEADER_LEN: usize = 8;
+
+/// Flag set when an echo reply is received, used by self-test for early break.
+static mut ECHO_REPLY_RECEIVED: bool = false;
+
+/// Check if an echo reply has been received (for self-test early break).
+pub(crate) fn echo_reply_received() -> bool {
+    // SAFETY: Single-threaded server; read-only check.
+    unsafe { *(&raw const ECHO_REPLY_RECEIVED) }
+}
+
+/// Reset the echo reply received flag.
+pub(crate) fn reset_echo_reply_flag() {
+    // SAFETY: Single-threaded server; written once before self-test.
+    unsafe { *(&raw mut ECHO_REPLY_RECEIVED) = false; }
+}
 
 /// Handle an incoming ICMP packet.
 ///
@@ -29,21 +43,22 @@ pub(crate) fn handle(
     let _code = data[1];
 
     if icmp_type == ICMP_TYPE_ECHO_REQUEST {
-        puts(b"[netdrv] ICMP echo request received, sending reply\n");
+        puts(b"[netsrv] ICMP echo request received, sending reply\n");
         send_echo_reply(our_mac, our_ip, ip_hdr.src, data);
     } else if icmp_type == ICMP_TYPE_ECHO_REPLY {
         let seq = ((data[6] as u16) << 8) | (data[7] as u16);
         let mut lb = salty::serial::LineBuf::new();
-        lb.str(b"[netdrv] ICMP echo reply received seq=");
+        lb.str(b"[netsrv] ICMP echo reply received seq=");
         lb.dec(seq as u64);
         lb.putc(b'\n');
         lb.flush();
+        // SAFETY: Single-threaded server; set flag for self-test early break.
+        unsafe { *(&raw mut ECHO_REPLY_RECEIVED) = true; }
     }
 }
 
 /// Send an ICMP echo reply in response to the given echo request data.
 fn send_echo_reply(our_mac: &[u8; 6], our_ip: u32, dst_ip: u32, request_data: &[u8]) {
-    // Build ICMP reply: type=0, code=0, same id/seq/data
     let icmp_len = request_data.len();
     if icmp_len > 1500 {
         return;
@@ -67,41 +82,11 @@ fn send_echo_reply(our_mac: &[u8; 6], our_ip: u32, dst_ip: u32, request_data: &[
     icmp_buf[2] = (cksum >> 8) as u8;
     icmp_buf[3] = cksum as u8;
 
-    // Wrap in IPv4
-    let mut ip_buf = [0u8; 1520];
-    let ip_len = ipv4::build(our_ip, dst_ip, ipv4::PROTO_ICMP, &icmp_buf[..icmp_len], &mut ip_buf);
-    if ip_len == 0 {
-        return;
-    }
-
-    // Resolve destination MAC
-    let next_hop = ipv4::route(dst_ip);
-    let dst_mac = match arp::lookup(next_hop) {
-        Some(mac) => mac,
-        None => {
-            // No ARP entry; reply will be dropped
-            puts(b"[netdrv] ICMP reply: no ARP entry for next hop\n");
-            return;
-        }
-    };
-
-    // Wrap in Ethernet
-    let mut frame = [0u8; 1536];
-    let frame_len = ethernet::build(
-        dst_mac,
-        *our_mac,
-        ethernet::ETHERTYPE_IPV4,
-        &ip_buf[..ip_len],
-        &mut frame,
-    );
-    if frame_len > 0 {
-        virtio::tx_packet(&frame[..frame_len]);
-    }
+    super::send_ip_packet(our_mac, our_ip, dst_ip, ipv4::PROTO_ICMP, &icmp_buf[..icmp_len]);
 }
 
 /// Send an ICMP echo request (ping) to `dst_ip` with the given sequence number.
 pub(crate) fn send_echo_request(our_mac: &[u8; 6], our_ip: u32, dst_ip: u32, seq: u16) {
-    // Build ICMP echo request
     let mut icmp_buf = [0u8; 64];
     // Type: echo request
     icmp_buf[0] = ICMP_TYPE_ECHO_REQUEST;
@@ -117,8 +102,10 @@ pub(crate) fn send_echo_request(our_mac: &[u8; 6], our_ip: u32, dst_ip: u32, seq
     icmp_buf[6] = (seq >> 8) as u8;
     icmp_buf[7] = seq as u8;
     // Payload: 56 bytes of pattern data (total ICMP = 64 bytes)
-    for i in 0..56 {
+    let mut i = 0;
+    while i < 56 {
         icmp_buf[8 + i] = i as u8;
+        i += 1;
     }
 
     // Compute ICMP checksum
@@ -126,33 +113,5 @@ pub(crate) fn send_echo_request(our_mac: &[u8; 6], our_ip: u32, dst_ip: u32, seq
     icmp_buf[2] = (cksum >> 8) as u8;
     icmp_buf[3] = cksum as u8;
 
-    // Wrap in IPv4
-    let mut ip_buf = [0u8; 128];
-    let ip_len = ipv4::build(our_ip, dst_ip, ipv4::PROTO_ICMP, &icmp_buf[..64], &mut ip_buf);
-    if ip_len == 0 {
-        return;
-    }
-
-    // Resolve destination MAC via ARP
-    let next_hop = ipv4::route(dst_ip);
-    let dst_mac = match arp::lookup(next_hop) {
-        Some(mac) => mac,
-        None => {
-            puts(b"[netdrv] ICMP echo: no ARP entry for next hop\n");
-            return;
-        }
-    };
-
-    // Wrap in Ethernet
-    let mut frame = [0u8; 256];
-    let frame_len = ethernet::build(
-        dst_mac,
-        *our_mac,
-        ethernet::ETHERTYPE_IPV4,
-        &ip_buf[..ip_len],
-        &mut frame,
-    );
-    if frame_len > 0 {
-        virtio::tx_packet(&frame[..frame_len]);
-    }
+    super::send_ip_packet(our_mac, our_ip, dst_ip, ipv4::PROTO_ICMP, &icmp_buf[..64]);
 }

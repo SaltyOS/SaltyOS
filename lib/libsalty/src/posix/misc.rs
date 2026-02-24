@@ -89,7 +89,7 @@ pub unsafe fn posix_chdir(path: *const u8) -> i32 {
         let mut msg = SaltyMsg::zeroed();
         let mut reply = SaltyMsg::zeroed();
         msg.label = POSIX_VFS_CHDIR;
-        let path_len = pack_path(&raw mut msg, 0, path);
+        let path_len = pack_path(&raw mut msg, 0, path, 128);
         msg.length = 1 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
@@ -254,7 +254,7 @@ pub unsafe fn posix_shm_open(name: *const u8, flags: i32) -> i32 {
         let mut reply = SaltyMsg::zeroed();
         msg.label = POSIX_VFS_SHM_OPEN;
         msg.regs[0] = flags as u64;
-        let name_len = pack_path(&raw mut msg, 1, bare);
+        let name_len = pack_path(&raw mut msg, 1, bare, 128);
         msg.length = 2 + ((name_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(
@@ -286,7 +286,7 @@ pub unsafe fn posix_shm_unlink(name: *const u8) -> i32 {
         let mut msg = SaltyMsg::zeroed();
         let mut reply = SaltyMsg::zeroed();
         msg.label = POSIX_VFS_SHM_UNLINK;
-        let name_len = pack_path(&raw mut msg, 0, bare);
+        let name_len = pack_path(&raw mut msg, 0, bare, 128);
         msg.length = 1 + ((name_len as u64 + 7) / 8);
 
         let err = crate::ipc::call_ctx(

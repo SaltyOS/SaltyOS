@@ -6,7 +6,6 @@ Restart=always
 
 [Dependencies]
 After=pcisrv nameserv mmsrv
-Before=vfs
 
 [Capabilities]
 NeedEP=pcisrv:64

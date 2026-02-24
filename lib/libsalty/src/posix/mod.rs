@@ -61,6 +61,8 @@ pub(crate) fn salty_err_to_posix(label: u64) -> i32 {
         SALTY_INVALID_OPERATION => -1,         // EPERM
         SALTY_OUT_OF_RANGE => -34,             // ERANGE
         SALTY_CANCELLED => -125,               // ECANCELED
+        SALTY_CONN_REFUSED => -111,            // ECONNREFUSED
+        SALTY_TIMED_OUT => -110,               // ETIMEDOUT
         _ => -5,                               // EIO (generic)
     }
 }
@@ -69,10 +71,11 @@ pub(crate) fn salty_err_to_posix(label: u64) -> i32 {
 ///
 /// Writes the path length into `regs[offset]` and the path bytes (up to 64)
 /// into `regs[offset+1..]`. Returns the path length.
-pub(crate) unsafe fn pack_path(msg: *mut SaltyMsg, offset: usize, path: *const u8) -> u8 {
+pub(crate) unsafe fn pack_path(msg: *mut SaltyMsg, offset: usize, path: *const u8, max_len: usize) -> u8 {
     unsafe {
+        let limit = if max_len < 128 { max_len } else { 128 };
         let mut path_len: u8 = 0;
-        while *path.add(path_len as usize) != 0 && path_len < 128 {
+        while (path_len as usize) < limit && *path.add(path_len as usize) != 0 {
             path_len += 1;
         }
         (*msg).regs[offset] = path_len as u64;

@@ -13,6 +13,7 @@ mod at_ops;
 mod client;
 mod consts;
 mod fileops;
+mod inet;
 mod misc;
 mod mount;
 mod path;
@@ -845,6 +846,11 @@ pub extern "C" fn _start() -> ! {
 
     signal_ready();
 
+    // Register callback EP with netsrv for AF_INET async operations
+    unsafe {
+        inet::inet_init();
+    }
+
     let mut msg = SaltyMsg::zeroed();
     let mut badge: u64 = 0;
 
@@ -858,7 +864,13 @@ pub extern "C" fn _start() -> ! {
         let mut reply = SaltyMsg::zeroed();
         let mut skip_reply = false;
 
-        if msg.length == 0 && msg.label == 0 && badge != 0 {
+        if badge == consts::NETSRV_CALLBACK_BADGE {
+            // Async completion from netsrv (NET_COMPLETE)
+            unsafe {
+                inet::handle_netsrv_callback(&raw const msg, &raw mut reply);
+            }
+            // reply to netsrv to complete the callback IPC — do NOT skip reply
+        } else if msg.length == 0 && msg.label == 0 && badge != 0 {
             unsafe {
                 misc::handle_pty_notification(badge);
             }
@@ -878,6 +890,14 @@ pub extern "C" fn _start() -> ! {
                             && (*(*cli).fds.add(fd as usize)).active != 0
                         {
                             match (*(*cli).fds.add(fd as usize)).fd_type {
+                                FD_TYPE_INET_SOCKET => {
+                                    skip_reply = inet::handle_inet_read(
+                                        &raw const msg,
+                                        (*cli).fds.add(fd as usize),
+                                        &raw mut reply,
+                                        badge,
+                                    );
+                                }
                                 FD_TYPE_SOCKET => {
                                     skip_reply = socket::handle_socket_read(
                                         (*cli).fds.add(fd as usize),
@@ -913,8 +933,12 @@ pub extern "C" fn _start() -> ! {
                                     if *(&raw const VFS_SHM_ACTIVE) {
                                         // SHM bulk read path
                                         mount::mount_read_shm(
-                                            mount_idx, remote_ino, fde.offset, count,
-                                            0, &raw mut reply,
+                                            mount_idx,
+                                            remote_ino,
+                                            fde.offset,
+                                            count,
+                                            0,
+                                            &raw mut reply,
                                         );
                                         if reply.label == SALTY_OK {
                                             let bytes_read = reply.regs[0];
@@ -929,7 +953,10 @@ pub extern "C" fn _start() -> ! {
                                     } else {
                                         let capped = count.min(152);
                                         mount::mount_read_inline(
-                                            mount_idx, remote_ino, fde.offset, capped,
+                                            mount_idx,
+                                            remote_ino,
+                                            fde.offset,
+                                            capped,
                                             &raw mut reply,
                                         );
                                     }
@@ -955,6 +982,13 @@ pub extern "C" fn _start() -> ! {
                             && (*(*cli).fds.add(fd as usize)).active != 0
                         {
                             match (*(*cli).fds.add(fd as usize)).fd_type {
+                                FD_TYPE_INET_SOCKET => {
+                                    skip_reply = inet::handle_inet_write(
+                                        &raw const msg,
+                                        (*cli).fds.add(fd as usize),
+                                        &raw mut reply,
+                                    );
+                                }
                                 FD_TYPE_SOCKET => {
                                     skip_reply = socket::handle_socket_write(
                                         &raw const msg,
@@ -997,15 +1031,23 @@ pub extern "C" fn _start() -> ! {
                                                 *dst.add(j) = *src.add(j);
                                             }
                                             mount::mount_write_shm(
-                                                mount_idx, remote_ino, offset, safe_count,
-                                                0, &raw mut reply,
+                                                mount_idx,
+                                                remote_ino,
+                                                offset,
+                                                safe_count,
+                                                0,
+                                                &raw mut reply,
                                             );
                                         } else {
                                             let capped = count.min(136);
                                             let src = &msg.regs[2] as *const u64 as *const u8;
                                             mount::mount_write_inline(
-                                                mount_idx, remote_ino, offset,
-                                                src, capped, &raw mut reply,
+                                                mount_idx,
+                                                remote_ino,
+                                                offset,
+                                                src,
+                                                capped,
+                                                &raw mut reply,
                                             );
                                         }
                                         if reply.label == SALTY_OK {
@@ -1031,6 +1073,9 @@ pub extern "C" fn _start() -> ! {
                             && (*(*cli).fds.add(fd as usize)).active != 0
                         {
                             match (*(*cli).fds.add(fd as usize)).fd_type {
+                                FD_TYPE_INET_SOCKET => {
+                                    inet::close_inet_socket((*cli).fds.add(fd as usize));
+                                }
                                 FD_TYPE_SOCKET => {
                                     socket::close_socket((*cli).fds.add(fd as usize));
                                 }
@@ -1116,28 +1161,135 @@ pub extern "C" fn _start() -> ! {
                         skip_reply = socket::handle_socket(&raw const msg, &raw mut reply, badge);
                     }
                     VFS_BIND => {
-                        skip_reply = socket::handle_bind(&raw const msg, &raw mut reply, badge);
+                        // Check for AF_INET bind (regs[1] == AF_INET)
+                        if msg.regs[1] == salty::consts::AF_INET as u64 {
+                            skip_reply =
+                                inet::handle_inet_bind(&raw const msg, &raw mut reply, badge);
+                        } else {
+                            skip_reply = socket::handle_bind(&raw const msg, &raw mut reply, badge);
+                        }
                     }
                     VFS_LISTEN => {
-                        skip_reply = socket::handle_listen(&raw const msg, &raw mut reply, badge);
+                        let fd = msg.regs[0] as i32;
+                        let cli = client::get_client(badge);
+                        if !cli.is_null()
+                            && fd >= 0
+                            && fd < (*cli).fds_cap as i32
+                            && (*(*cli).fds.add(fd as usize)).active != 0
+                            && (*(*cli).fds.add(fd as usize)).fd_type == FD_TYPE_INET_SOCKET
+                        {
+                            skip_reply =
+                                inet::handle_inet_listen(&raw const msg, &raw mut reply, badge);
+                        } else {
+                            skip_reply =
+                                socket::handle_listen(&raw const msg, &raw mut reply, badge);
+                        }
                     }
                     VFS_ACCEPT => {
-                        skip_reply = socket::handle_accept(&raw const msg, &raw mut reply, badge);
+                        let fd = msg.regs[0] as i32;
+                        let cli = client::get_client(badge);
+                        if !cli.is_null()
+                            && fd >= 0
+                            && fd < (*cli).fds_cap as i32
+                            && (*(*cli).fds.add(fd as usize)).active != 0
+                            && (*(*cli).fds.add(fd as usize)).fd_type == FD_TYPE_INET_SOCKET
+                        {
+                            skip_reply =
+                                inet::handle_inet_accept(&raw const msg, &raw mut reply, badge);
+                        } else {
+                            skip_reply =
+                                socket::handle_accept(&raw const msg, &raw mut reply, badge);
+                        }
                     }
                     VFS_CONNECT => {
-                        skip_reply = socket::handle_connect(&raw const msg, &raw mut reply, badge);
+                        let fd = msg.regs[0] as i32;
+                        let cli = client::get_client(badge);
+                        if !cli.is_null()
+                            && fd >= 0
+                            && fd < (*cli).fds_cap as i32
+                            && (*(*cli).fds.add(fd as usize)).active != 0
+                            && (*(*cli).fds.add(fd as usize)).fd_type == FD_TYPE_INET_SOCKET
+                        {
+                            skip_reply =
+                                inet::handle_inet_connect(&raw const msg, &raw mut reply, badge);
+                        } else {
+                            skip_reply =
+                                socket::handle_connect(&raw const msg, &raw mut reply, badge);
+                        }
                     }
                     VFS_SENDMSG => {
-                        skip_reply = socket::handle_sendmsg(&raw const msg, &raw mut reply, badge);
+                        let fd = msg.regs[0] as i32;
+                        let cli = client::get_client(badge);
+                        if !cli.is_null()
+                            && fd >= 0
+                            && fd < (*cli).fds_cap as i32
+                            && (*(*cli).fds.add(fd as usize)).active != 0
+                            && (*(*cli).fds.add(fd as usize)).fd_type == FD_TYPE_INET_SOCKET
+                        {
+                            // Check if this is a sendto (has dst_ip/port)
+                            if msg.regs[3] != 0 || msg.regs[4] != 0 {
+                                skip_reply =
+                                    inet::handle_inet_sendto(&raw const msg, &raw mut reply, badge);
+                            } else {
+                                // Regular send on connected inet socket
+                                skip_reply = inet::handle_inet_write(
+                                    &raw const msg,
+                                    (*cli).fds.add(fd as usize),
+                                    &raw mut reply,
+                                );
+                            }
+                        } else {
+                            skip_reply =
+                                socket::handle_sendmsg(&raw const msg, &raw mut reply, badge);
+                        }
                     }
                     VFS_RECVMSG => {
-                        skip_reply = socket::handle_recvmsg(&raw const msg, &raw mut reply, badge);
+                        let fd = msg.regs[0] as i32;
+                        let cli = client::get_client(badge);
+                        if !cli.is_null()
+                            && fd >= 0
+                            && fd < (*cli).fds_cap as i32
+                            && (*(*cli).fds.add(fd as usize)).active != 0
+                            && (*(*cli).fds.add(fd as usize)).fd_type == FD_TYPE_INET_SOCKET
+                        {
+                            // Check regs[2]: 1 = recvfrom (wants address), 0 = recv
+                            if msg.regs[2] != 0 {
+                                skip_reply = inet::handle_inet_recvfrom(
+                                    &raw const msg,
+                                    &raw mut reply,
+                                    badge,
+                                );
+                            } else {
+                                skip_reply = inet::handle_inet_read(
+                                    &raw const msg,
+                                    (*cli).fds.add(fd as usize),
+                                    &raw mut reply,
+                                    badge,
+                                );
+                            }
+                        } else {
+                            skip_reply =
+                                socket::handle_recvmsg(&raw const msg, &raw mut reply, badge);
+                        }
                     }
                     VFS_SOCKPAIR => {
                         skip_reply = socket::handle_sockpair(&raw const msg, &raw mut reply, badge);
                     }
                     VFS_SHUTDOWN => {
-                        skip_reply = socket::handle_shutdown(&raw const msg, &raw mut reply, badge);
+                        let fd = msg.regs[0] as i32;
+                        let cli = client::get_client(badge);
+                        if !cli.is_null()
+                            && fd >= 0
+                            && fd < (*cli).fds_cap as i32
+                            && (*(*cli).fds.add(fd as usize)).active != 0
+                            && (*(*cli).fds.add(fd as usize)).fd_type == FD_TYPE_INET_SOCKET
+                        {
+                            skip_reply =
+                                inet::handle_inet_shutdown(&raw const msg, &raw mut reply, badge);
+                        } else {
+                            skip_reply =
+                                socket::handle_shutdown(&raw const msg, &raw mut reply, badge);
+                        }
                     }
                     VFS_PIPE => {
                         pipe::handle_pipe(&raw const msg, &raw mut reply, badge);
