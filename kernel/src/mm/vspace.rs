@@ -715,19 +715,43 @@ impl VSpace {
         self.cow_pool_phys
     }
 
+    /// Get the COW pool physical address under VSpace.lock.
+    ///
+    /// Use this from contexts that do not already hold the lock.
+    pub fn cow_pool_phys_locked(&self) -> PhysAddr {
+        let irq = unsafe { save_irq_disable() };
+        self.lock.lock();
+        let phys = self.cow_pool_phys;
+        self.lock.unlock();
+        unsafe { restore_irq(irq) };
+        phys
+    }
+
     /// Set the COW pool physical address.
+    ///
+    /// Acquires VSpace.lock to synchronize with the fault handler.
     pub fn set_cow_pool_phys(&mut self, phys: PhysAddr) {
+        let irq = unsafe { save_irq_disable() };
+        self.lock.lock();
         self.cow_pool_phys = phys;
+        self.lock.unlock();
+        unsafe { restore_irq(irq) };
     }
 
     /// Configure the COW notification ring and notification object.
+    ///
+    /// Acquires VSpace.lock to synchronize with the fault handler.
     pub fn set_cow_notif(
         &mut self,
         ring_phys: PhysAddr,
         ntfn: *mut crate::ipc::Notification,
     ) {
+        let irq = unsafe { save_irq_disable() };
+        self.lock.lock();
         self.cow_notif_phys = ring_phys;
         self.cow_notif_ntfn = ntfn;
+        self.lock.unlock();
+        unsafe { restore_irq(irq) };
     }
 
     /// Extract PML4 index from virtual address
@@ -1615,15 +1639,18 @@ impl VSpace {
             return Ok(false);
         }
 
-        // Pool not configured -- fall through to mmsrv IPC
-        if self.cow_pool_phys == 0 {
-            return Ok(false);
-        }
-
         let page_vaddr = fault_addr & !((PAGE_SIZE as u64) - 1);
 
         let irq = unsafe { save_irq_disable() };
         self.lock.lock();
+
+        // Pool not configured -- fall through to mmsrv IPC.
+        // Check inside VSpace.lock to synchronize with set_cow_pool_phys().
+        if self.cow_pool_phys == 0 {
+            self.lock.unlock();
+            unsafe { restore_irq(irq) };
+            return Ok(false);
+        }
 
         // Captured outside the lock critical section to avoid
         // lock ordering violation: signal() → enqueue() → scheduler.lock_state,

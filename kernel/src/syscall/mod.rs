@@ -2902,7 +2902,7 @@ fn syscall_vspace_replenish_cow_pool(
 
     unsafe {
         let vspace = &*(cap.object as *const VSpace);
-        let pool_phys = vspace.cow_pool_phys();
+        let pool_phys = vspace.cow_pool_phys_locked();
         if pool_phys == 0 {
             return SyscallResult::err(SyscallError::InvalidOperation);
         }

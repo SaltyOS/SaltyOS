@@ -1,6 +1,6 @@
 use crate::types::*;
 use crate::client::{find_client_by_badge, client_add_region, find_region_by_addr,
-                    alloc_cow_bitmap, clear_cow_bit};
+                    alloc_cow_bitmap, free_cow_bitmap, clear_cow_bit};
 use salty::consts::*;
 use salty::invoke;
 use salty::ipc;
@@ -750,10 +750,12 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const SaltyMsg, _caller_badge:
                         {
                             let need_words = ((page_count + 63) / 64) as u16;
                             if (*pr).cow_bitmap.is_null() || (*pr).cow_bitmap_words < need_words {
+                                // Return old bitmap to pool before allocating a new one
+                                if !(*pr).cow_bitmap.is_null() {
+                                    free_cow_bitmap(pr);
+                                }
                                 let (pbm_ptr, pbm_words) = alloc_cow_bitmap(page_count);
                                 if !pbm_ptr.is_null() {
-                                    // Old bitmap leaked (no munmap for self_mmap).
-                                    // Bounded: at most 1 page per region lifetime.
                                     (*pr).cow_bitmap = pbm_ptr;
                                     (*pr).cow_bitmap_words = pbm_words;
                                 }
