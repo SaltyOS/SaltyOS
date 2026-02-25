@@ -36,6 +36,7 @@ pub(crate) struct MmRegion {
     pub(crate) frame_cap_capacity: u16,
     pub(crate) cow_bitmap: *mut u64,     // 1 bit per page; set = COW-inherited, no frame cap
     pub(crate) cow_bitmap_words: u16,    // number of u64 words in bitmap
+    pub(crate) cow_inherited: bool,      // set during fork; immune to mprotect changes
 }
 
 impl MmRegion {
@@ -52,6 +53,7 @@ impl MmRegion {
             frame_cap_capacity: 0,
             cow_bitmap: core::ptr::null_mut(),
             cow_bitmap_words: 0,
+            cow_inherited: false,
         }
     }
 }

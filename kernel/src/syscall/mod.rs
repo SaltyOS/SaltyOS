@@ -2869,6 +2869,7 @@ fn syscall_vspace_set_cow_notif(
         let ring = phys_to_virt(ring_phys) as *mut CowNotifRing;
         (*ring).head.store(0, Ordering::Release);
         (*ring).tail.store(0, Ordering::Release);
+        (*ring).overflow.store(0, Ordering::Release);
 
         // Store in VSpace
         let vspace = &mut *(cap.object as *mut VSpace);
@@ -2930,6 +2931,15 @@ fn syscall_vspace_replenish_cow_pool(
         // SAFETY: pool_phys was validated during VSPACE_SET_COW_POOL.
         let pool = phys_to_virt(pool_phys) as *mut CowPool;
         let current_tail = (*pool).tail.load(Ordering::Acquire);
+
+        let current_head = (*pool).head.load(Ordering::Acquire);
+        let used = current_tail.wrapping_sub(current_head) as u64;
+        let available = 509u64.saturating_sub(used);
+        if count > available {
+            CAP_LOCK.unlock();
+            restore_irq(irq);
+            return SyscallResult::err(SyscallError::InvalidArgument);
+        }
 
         for i in 0..count as usize {
             let slot_idx = start_slot as usize + i;
@@ -3854,6 +3864,7 @@ fn syscall_error_from_vspace_error(err: VSpaceError) -> SyscallError {
         VSpaceError::AlreadyMapped => SyscallError::AlreadyExists,
         VSpaceError::NotMapped => SyscallError::NotFound,
         VSpaceError::OutOfMemory => SyscallError::OutOfMemory,
+        VSpaceError::NotCow => SyscallError::InvalidOperation,
     }
 }
 

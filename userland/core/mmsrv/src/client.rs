@@ -361,9 +361,11 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const SaltyMsg, _caller_badge: u
                             }
                         }
                     }
-                    free_cow_bitmap(r);
                     (*r).active = false;
                 }
+                // Free bitmap for ALL regions (active or inactive).
+                // Inactive regions from munmap may still have bitmaps.
+                free_cow_bitmap(r);
             }
         }
 

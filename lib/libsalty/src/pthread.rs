@@ -370,6 +370,14 @@ pub unsafe fn pthread_create(
             return -1;
         }
 
+        // 7b. Set fault handler: route VMFaults to mmsrv (same badged EP as parent)
+        let err = invoke::tcb_set_fault_handler(tcb_slot, CAP_MMSRV_EP);
+        if err != 0 {
+            serial::serial_puts(b"[PTHREAD] tcb_set_fault_handler failed\n");
+            rollback_create(tc, stack_addr, stack_size, true);
+            return -1;
+        }
+
         // 8. Map IPC buffer frame
         let ipc_buf_vaddr = IPC_BUF_NEXT.fetch_add(4096, Ordering::Relaxed);
         let err = invoke::vspace_map(

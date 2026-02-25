@@ -110,6 +110,15 @@ unsafe fn find_free_pool() -> *mut VSpacePool {
 /// Returns true on success.
 pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
     unsafe {
+        // Deduplicate: if a pool already exists for this VSpace (e.g. refork),
+        // reuse it. The existing pool entries are free frames, not bound to
+        // specific COW pages, so the normal drain/replenish cycle handles any
+        // stale state.
+        let existing = find_pool_by_vspace((*client).vspace_cap);
+        if !existing.is_null() && (*existing).active {
+            return true;
+        }
+
         let pool_slot = find_free_pool();
         if pool_slot.is_null() {
             super::puts(b"[MMSRV] pool: no free pool slots\n");
@@ -138,16 +147,12 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
             return false;
         }
 
-        // Allocate notification for kernel -> mmsrv signaling
-        let notif_cap = match salty::slot_alloc::slot_alloc() {
-            Some(s) => s,
-            None => {
-                invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
-                invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
-                return false;
-            }
-        };
-        if super::retype_any(OBJ_NOTIFICATION, 0, notif_cap) != 0 {
+        // Use the shared aggregation notification (bound to mmsrv's TCB).
+        // All pools share one notification — consumed by bound-notification
+        // wakeup in the server loop.
+        let notif_cap = super::cow_agg_ntfn();
+        if notif_cap == 0 {
+            super::puts(b"[MMSRV] pool: no aggregation notification\n");
             invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
             invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
             return false;
@@ -159,7 +164,6 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
         if pool_page.is_null() {
             invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
             invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, notif_cap);
             return false;
         }
 
@@ -168,7 +172,6 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
         if ring_page.is_null() {
             invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
             invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, notif_cap);
             return false;
         }
 
@@ -177,7 +180,6 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
         if slot_caps_page.is_null() {
             invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
             invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, notif_cap);
             return false;
         }
         let pool_slot_caps = slot_caps_page as *mut Cap;
@@ -190,14 +192,12 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
             None => {
                 invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
                 invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
-                invoke::cnode_delete(super::CAP_SELF_CSPACE, notif_cap);
                 return false;
             }
         };
         if super::retype_any(OBJ_CNODE, 7, temp_cnode) != 0 {
             invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
             invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, notif_cap);
             return false;
         }
 
@@ -231,33 +231,16 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
         if filled == 0 {
             invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
             invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, notif_cap);
             invoke::cnode_delete(super::CAP_SELF_CSPACE, temp_cnode);
             return false;
         }
 
         let vspace_cap = (*client).vspace_cap;
 
-        // Tell kernel about the pool
-        let err = invoke::vspace_set_cow_pool(vspace_cap, pool_frame, temp_cnode, filled as u64);
-        if err != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[MMSRV] pool: set_cow_pool failed err=");
-            lb.hex(err as u64);
-            lb.str(b"\n");
-            lb.flush();
-            // Clean up temp CNode contents
-            for i in 0..filled {
-                invoke::cnode_delete(temp_cnode, i as u64);
-            }
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, notif_cap);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, temp_cnode);
-            return false;
-        }
-
-        // Tell kernel about the notification ring
+        // Tell kernel about the notification ring FIRST. If this succeeds but
+        // pool setup fails below, the kernel has cow_notif_phys set but
+        // cow_pool_phys==0 — the fast-path's first check returns Ok(false),
+        // so the ring is never used. Harmless, and overwritten on next init.
         let err = invoke::vspace_set_cow_notif(vspace_cap, ring_frame, notif_cap);
         if err != 0 {
             let mut lb = LineBuf::new();
@@ -265,9 +248,28 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
             lb.hex(err as u64);
             lb.str(b"\n");
             lb.flush();
+            for i in 0..filled {
+                invoke::cnode_delete(temp_cnode, i as u64);
+            }
             invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
             invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, notif_cap);
+            invoke::cnode_delete(super::CAP_SELF_CSPACE, temp_cnode);
+            return false;
+        }
+
+        // Tell kernel about the pool (notif already set)
+        let err = invoke::vspace_set_cow_pool(vspace_cap, pool_frame, temp_cnode, filled as u64);
+        if err != 0 {
+            let mut lb = LineBuf::new();
+            lb.str(b"[MMSRV] pool: set_cow_pool failed err=");
+            lb.hex(err as u64);
+            lb.str(b"\n");
+            lb.flush();
+            for i in 0..filled {
+                invoke::cnode_delete(temp_cnode, i as u64);
+            }
+            invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
+            invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
             invoke::cnode_delete(super::CAP_SELF_CSPACE, temp_cnode);
             return false;
         }
@@ -276,7 +278,7 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
         (*pool_slot).vspace_cap = vspace_cap;
         (*pool_slot).pool_frame = pool_frame;
         (*pool_slot).ring_frame = ring_frame;
-        (*pool_slot).notif_cap = notif_cap;
+        (*pool_slot).notif_cap = 0; // shared notification — pool does not own it
         (*pool_slot).pool_page = pool_page;
         (*pool_slot).ring_page = ring_page;
         (*pool_slot).pool_slot_caps = pool_slot_caps;
@@ -305,11 +307,18 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
 /// Drain notification ring entries for a given client.
 /// Reads consumed-pool-entry records from the ring page, clears COW bits
 /// in the corresponding client regions, transfers Frame caps from
-/// pool_slot_caps to region.frame_caps, and returns the number of entries drained.
-pub(crate) unsafe fn drain_notifications(client: *mut MmClient, pool: *mut VSpacePool) -> usize {
+/// pool_slot_caps to region.frame_caps.
+///
+/// Returns `(drained_count, completed)`:
+/// - `drained_count`: number of entries successfully processed.
+/// - `completed`: `true` if all pending entries were consumed (head == tail),
+///   `false` if the loop broke early (e.g. OOM growing frame_caps).
+///   Callers should suppress replenish on partial drain to avoid overwriting
+///   preserved caps for entries that will be retried.
+pub(crate) unsafe fn drain_notifications(client: *mut MmClient, pool: *mut VSpacePool) -> (usize, bool) {
     unsafe {
         if !(*pool).active || (*pool).ring_page.is_null() {
-            return 0;
+            return (0, true);
         }
 
         // The ring page has the CowNotifRing layout:
@@ -326,7 +335,7 @@ pub(crate) unsafe fn drain_notifications(client: *mut MmClient, pool: *mut VSpac
         let tail = core::ptr::read_volatile(tail_ptr);
 
         if head == tail {
-            return 0;
+            return (0, true);
         }
 
         let mut drained: usize = 0;
@@ -340,55 +349,73 @@ pub(crate) unsafe fn drain_notifications(client: *mut MmClient, pool: *mut VSpac
 
             // Find the region containing this vaddr and clear its COW bit
             let region = find_region_by_addr(client, vaddr);
-            if !region.is_null() {
-                let page_idx = ((vaddr - (*region).base) / 4096) as usize;
-                clear_cow_bit(region, page_idx);
-
-                // Transfer the pool's Frame cap to region.frame_caps so that
-                // munmap/deregister can clean up pool-resolved pages.
+            if region.is_null() {
+                // Region gone (munmap/deregister) — delete orphaned pool cap
                 let pool_idx = entry.pool_idx as usize;
                 let slot_idx = pool_idx % POOL_ENTRY_COUNT;
                 if !(*pool).pool_slot_caps.is_null() {
                     let cap = *(*pool).pool_slot_caps.add(slot_idx);
                     if cap != 0 {
-                        // Grow frame_caps if needed
-                        if page_idx >= (*region).frame_cap_capacity as usize {
-                            let old_cap = (*region).frame_cap_capacity as usize;
-                            let required = page_idx + 1;
-                            let growth = if old_cap < 128 {
-                                if old_cap == 0 { 8 } else { old_cap }
-                            } else if old_cap < 1024 {
-                                old_cap / 2
-                            } else {
-                                256
-                            };
-                            let new_cap = core::cmp::max(required, old_cap + growth);
-                            let new_fcaps = super::grow_frame_cap_array(
-                                (*region).frame_caps,
-                                old_cap,
-                                new_cap,
-                            );
-                            if !new_fcaps.is_null() {
-                                (*region).frame_caps = new_fcaps;
-                                (*region).frame_cap_capacity = new_cap as u16;
-                            }
+                        invoke::cnode_delete(super::CAP_SELF_CSPACE, cap);
+                        *(*pool).pool_slot_caps.add(slot_idx) = 0;
+                    }
+                }
+                current_tail = current_tail.wrapping_add(1);
+                drained += 1;
+                continue;
+            }
+
+            let page_idx = ((vaddr - (*region).base) / 4096) as usize;
+            clear_cow_bit(region, page_idx);
+
+            // Transfer the pool's Frame cap to region.frame_caps so that
+            // munmap/deregister can clean up pool-resolved pages.
+            let pool_idx = entry.pool_idx as usize;
+            let slot_idx = pool_idx % POOL_ENTRY_COUNT;
+            if !(*pool).pool_slot_caps.is_null() {
+                let cap = *(*pool).pool_slot_caps.add(slot_idx);
+                if cap != 0 {
+                    // Grow frame_caps if needed
+                    if page_idx >= (*region).frame_cap_capacity as usize {
+                        let old_cap = (*region).frame_cap_capacity as usize;
+                        let required = page_idx + 1;
+                        let growth = if old_cap < 128 {
+                            if old_cap == 0 { 8 } else { old_cap }
+                        } else if old_cap < 1024 {
+                            old_cap / 2
+                        } else {
+                            256
+                        };
+                        let new_cap = core::cmp::max(required, old_cap + growth);
+                        let new_fcaps = super::grow_frame_cap_array(
+                            (*region).frame_caps,
+                            old_cap,
+                            new_cap,
+                        );
+                        if !new_fcaps.is_null() {
+                            (*region).frame_caps = new_fcaps;
+                            (*region).frame_cap_capacity = new_cap as u16;
+                        } else {
+                            // Growth failed — stop draining. Cap stays in pool_slot_caps;
+                            // tail is not advanced past this entry, so next drain retries.
+                            break;
                         }
+                    }
 
-                        if page_idx < (*region).frame_cap_capacity as usize
-                            && !(*region).frame_caps.is_null()
-                        {
-                            let old = *(*region).frame_caps.add(page_idx);
-                            if old != 0 {
-                                invoke::cnode_delete(super::CAP_SELF_CSPACE, old);
-                            }
-                            *(*region).frame_caps.add(page_idx) = cap;
-                            *(*pool).pool_slot_caps.add(slot_idx) = 0;
+                    if page_idx < (*region).frame_cap_capacity as usize
+                        && !(*region).frame_caps.is_null()
+                    {
+                        let old = *(*region).frame_caps.add(page_idx);
+                        if old != 0 {
+                            invoke::cnode_delete(super::CAP_SELF_CSPACE, old);
+                        }
+                        *(*region).frame_caps.add(page_idx) = cap;
+                        *(*pool).pool_slot_caps.add(slot_idx) = 0;
 
-                            // Update frame_count high water mark
-                            let needed = (page_idx + 1) as u16;
-                            if needed > (*region).frame_count {
-                                (*region).frame_count = needed;
-                            }
+                        // Update frame_count high water mark
+                        let needed = (page_idx + 1) as u16;
+                        if needed > (*region).frame_count {
+                            (*region).frame_count = needed;
                         }
                     }
                 }
@@ -402,7 +429,8 @@ pub(crate) unsafe fn drain_notifications(client: *mut MmClient, pool: *mut VSpac
         // SAFETY: tail_ptr is valid and mmsrv is the sole writer of tail.
         core::ptr::write_volatile(tail_ptr, current_tail);
 
-        drained
+        let completed = current_tail == head;
+        (drained, completed)
     }
 }
 
@@ -470,6 +498,10 @@ pub(crate) unsafe fn replenish_pool(client: *mut MmClient, pool: *mut VSpacePool
             // The kernel appends at current tail, so entry i lands at (tail + i) % 510.
             if !(*pool).pool_slot_caps.is_null() {
                 let ring_idx = (tail_raw.wrapping_add(i as u16) as usize) % POOL_ENTRY_COUNT;
+                let existing = *(*pool).pool_slot_caps.add(ring_idx);
+                if existing != 0 {
+                    invoke::cnode_delete(super::CAP_SELF_CSPACE, existing);
+                }
                 *(*pool).pool_slot_caps.add(ring_idx) = slot;
             }
             filled += 1;

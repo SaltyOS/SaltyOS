@@ -220,6 +220,11 @@ static mut RECV_SLOT_KEPT: bool = false;
 static mut PENDING_CLEANUP_SLOTS: [u64; 4] = [0; 4];
 static mut PENDING_CLEANUP_COUNT: usize = 0;
 
+/// Shared COW aggregation notification — bound to mmsrv's TCB.
+/// All per-VSpace pools share this notification so a single bound signal
+/// wakes mmsrv from Recv when any pool is consumed.
+static mut COW_AGG_NTFN: Cap = 0;
+
 // ---------------------------------------------------------------------------
 // SHM object tracking (growable, pointer-based)
 // ---------------------------------------------------------------------------
@@ -380,6 +385,10 @@ unsafe fn mark_recv_slot_kept() {
     }
 }
 
+pub(crate) fn cow_agg_ntfn() -> Cap {
+    unsafe { *(&raw const COW_AGG_NTFN) }
+}
+
 /// Drain COW notification rings for all active pools.
 ///
 /// For each active VSpace pool, reads the notification ring to learn which
@@ -401,8 +410,8 @@ unsafe fn drain_all_cow_pools() {
             if pool_ptr.is_null() {
                 continue;
             }
-            let drained = pool::drain_notifications(client, pool_ptr);
-            if drained > 0 {
+            let (drained, complete) = pool::drain_notifications(client, pool_ptr);
+            if drained > 0 && complete {
                 pool::replenish_pool(client, pool_ptr);
             }
         }
@@ -444,6 +453,28 @@ pub extern "C" fn _start() -> ! {
         } else {
             puts(b"[MMSRV] FATAL: slot pool not provided by RTLD/auxv\n");
             idle();
+        }
+    }
+
+    // Allocate shared COW aggregation notification and bind to our TCB.
+    // When the kernel fast-path consumes pool entries and signals, the
+    // bound notification wakes us from Recv without a real IPC message.
+    unsafe {
+        if let Some(ntfn_slot) = salty::slot_alloc::slot_alloc() {
+            if retype_any(OBJ_NOTIFICATION, 0, ntfn_slot) == 0 {
+                let err = invoke::tcb_bind_notification(CAP_SELF_TCB, ntfn_slot);
+                if err == 0 {
+                    *(&raw mut COW_AGG_NTFN) = ntfn_slot;
+                    puts(b"[MMSRV] COW aggregation notification bound\n");
+                } else {
+                    let mut lb = LineBuf::new();
+                    lb.str(b"[MMSRV] WARN: bind COW ntfn failed err=");
+                    lb.hex(err as u64);
+                    lb.str(b"\n");
+                    lb.flush();
+                    invoke::cnode_delete(CAP_SELF_CSPACE, ntfn_slot);
+                }
+            }
         }
     }
 
@@ -533,6 +564,24 @@ pub extern "C" fn _start() -> ! {
             drain_all_cow_pools();
         }
 
+        // Bound-notification wakeup: when the kernel signals a pool's
+        // notification, mmsrv wakes from Recv with label=0 and badge
+        // carrying the signal bits. Drain pools and re-enter recv
+        // (no caller to reply to).
+        if msg.label == 0 && badge != 0 {
+            unsafe {
+                drain_all_cow_pools();
+            }
+            let err = unsafe {
+                ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
+            };
+            if err != 0 {
+                puts(b"[MMSRV] recv after ntfn drain failed\n");
+                break;
+            }
+            continue;
+        }
+
         unsafe {
             match msg.label {
                 MM_REGISTER => client::handle_mm_register(&raw const msg, badge, &raw mut reply),
@@ -601,7 +650,14 @@ pub extern "C" fn _start() -> ! {
                         // Guard: only enter COW path if the page is actually
                         // COW-inherited. Non-COW write-to-present faults (e.g.
                         // mprotect(PROT_READ) violations) are access violations.
-                        if (error_code & 0x7) == 0x7 && client::is_cow_page(region, page_idx) {
+                        //
+                        // Implicit COW fallback: if the bitmap is missing
+                        // (OOM during fork) but the region is writable, the
+                        // fault MUST be COW — SaltyOS has no other mechanism
+                        // that downgrades writable PTEs to read-only.
+                        let bitmap_cow = client::is_cow_page(region, page_idx);
+                        let implicit_cow = !bitmap_cow && (*region).cow_inherited;
+                        if (error_code & 0x7) == 0x7 && (bitmap_cow || implicit_cow) {
                             // COW resolution path: allocate a new frame and
                             // let the kernel copy + replace the COW mapping.
                             let slot = match salty::slot_alloc::slot_alloc() {
@@ -627,9 +683,28 @@ pub extern "C" fn _start() -> ! {
                             );
 
                             if err == SALTY_ALREADY_EXISTS as i32 {
-                                // Race: another CPU already resolved this COW page
+                                // Race: another CPU already resolved this COW page.
+                                // Kernel confirmed PTE is writable (not COW).
+                                // Safe for both bitmap_cow and implicit_cow paths.
                                 invoke::cnode_delete(CAP_SELF_CSPACE, slot);
+                                if bitmap_cow {
+                                    client::clear_cow_bit(region, page_idx);
+                                }
                                 reply.label = SALTY_OK;
+                                break 'fault;
+                            }
+                            if err == SALTY_INVALID_OPERATION as i32 {
+                                // Kernel says page is present, not COW, not writable.
+                                // Genuine access violation (e.g. mprotect PROT_READ).
+                                invoke::cnode_delete(CAP_SELF_CSPACE, slot);
+                                let mut lb = LineBuf::new();
+                                lb.str(b"[MMSRV] access violation (not COW): badge=");
+                                lb.hex(badge);
+                                lb.str(b" addr=");
+                                lb.hex(fault_addr);
+                                lb.str(b"\n");
+                                lb.flush();
+                                skip_reply = true;
                                 break 'fault;
                             }
                             if err != 0 {

@@ -467,7 +467,24 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                 &raw mut mm_reply,
             );
             if err != 0 || mm_reply.label != super::SALTY_OK {
-                super::puts(b"[PROCMGR] FORK: mmsrv fork_regions failed\n");
+                super::puts(b"[PROCMGR] FORK: mmsrv fork_regions failed, aborting\n");
+                // Deregister child from mmsrv and abort fork
+                {
+                    let mut dereg = SaltyMsg::zeroed();
+                    let mut drep = SaltyMsg::zeroed();
+                    dereg.label = salty::consts::MM_DEREGISTER;
+                    dereg.length = 1;
+                    dereg.regs[0] = child_pid as u64;
+                    let _ = ipc::call_ctx(
+                        super::ipc_ctx(),
+                        super::CAP_MMSRV_EP,
+                        &raw const dereg,
+                        &raw mut drep,
+                    );
+                }
+                alloc.rollback();
+                reply.label = super::SALTY_OUT_OF_MEMORY;
+                return;
             }
         }
 

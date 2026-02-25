@@ -645,6 +645,10 @@ pub struct CowNotifRing {
     pub tail: AtomicU32,
     /// Notification entries
     pub entries: [CowNotifEntry; 510],
+    /// Set by kernel when notification ring is full and an entry was skipped.
+    /// mmsrv reads and clears this to trigger reconciliation.
+    pub overflow: AtomicU8,
+    _pad2: [u8; 7],
 }
 
 #[repr(C)]
@@ -1580,9 +1584,15 @@ impl VSpace {
                 return Err(VSpaceError::NotMapped);
             }
 
-            // Present but not COW -> already resolved (race with another CPU)
+            // Present but not COW — distinguish race from genuine RO
             if entry & ENTRY_COW == 0 {
-                return Err(VSpaceError::AlreadyMapped);
+                if entry & ENTRY_WRITABLE != 0 {
+                    // Race: another CPU already resolved this COW page
+                    return Err(VSpaceError::AlreadyMapped);
+                } else {
+                    // Not COW, genuinely read-only (e.g. mprotect PROT_READ)
+                    return Err(VSpaceError::NotCow);
+                }
             }
 
             let old_phys = entry & ENTRY_ADDR_MASK;
@@ -1646,7 +1656,10 @@ impl VSpace {
 
         // Pool not configured -- fall through to mmsrv IPC.
         // Check inside VSpace.lock to synchronize with set_cow_pool_phys().
-        if self.cow_pool_phys == 0 {
+        // Require both pool AND notif — if notif is missing, the kernel would
+        // consume pool entries without writing notifications, so mmsrv never
+        // learns about consumed frames.
+        if self.cow_pool_phys == 0 || self.cow_notif_phys == 0 {
             self.lock.unlock();
             unsafe { restore_irq(irq) };
             return Ok(false);
@@ -1674,6 +1687,20 @@ impl VSpace {
                 if head == tail {
                     // Pool empty -- fall through to mmsrv IPC
                     return Ok(false);
+                }
+
+                // Pre-check: notification ring must have space before we
+                // consume a pool entry. If full, fall back to mmsrv IPC
+                // which will drain the ring. VSpace.lock serializes, so
+                // the space check is still valid at write time.
+                if self.cow_notif_phys != 0 {
+                    // SAFETY: cow_notif_phys was set via validated Frame cap.
+                    let ring = phys_to_virt(self.cow_notif_phys) as *mut CowNotifRing;
+                    let ring_head = (*ring).head.load(Ordering::Relaxed);
+                    let ring_tail = (*ring).tail.load(Ordering::Acquire);
+                    if ring_head.wrapping_sub(ring_tail) >= 510 {
+                        return Ok(false);
+                    }
                 }
 
                 let idx = (head % 510) as usize;
@@ -1710,21 +1737,15 @@ impl VSpace {
                     // SAFETY: cow_notif_phys was set via validated Frame cap.
                     let ring = phys_to_virt(self.cow_notif_phys) as *mut CowNotifRing;
                     let ring_head = (*ring).head.load(Ordering::Relaxed);
-                    let ring_tail = (*ring).tail.load(Ordering::Acquire);
 
-                    // Ring-full check: if all 510 slots are occupied, skip the
-                    // ring write. COW resolution is still correct in the PTE;
-                    // mmsrv will discover the stale pool entry on next drain.
-                    let ring_used = ring_head.wrapping_sub(ring_tail);
-                    if ring_used < 510 {
-                        let ring_idx = (ring_head % 510) as usize;
-                        (*ring).entries[ring_idx] = CowNotifEntry {
-                            vaddr_page: (page_vaddr >> 12) as u32,
-                            pool_idx: head,
-                            _pad: 0,
-                        };
-                        (*ring).head.store(ring_head.wrapping_add(1), Ordering::Release);
-                    }
+                    // Ring space is guaranteed by the pre-check above.
+                    let ring_idx = (ring_head % 510) as usize;
+                    (*ring).entries[ring_idx] = CowNotifEntry {
+                        vaddr_page: (page_vaddr >> 12) as u32,
+                        pool_idx: head,
+                        _pad: 0,
+                    };
+                    (*ring).head.store(ring_head.wrapping_add(1), Ordering::Release);
 
                     // Capture notification pointer; signal after lock release.
                     if !self.cow_notif_ntfn.is_null() {
@@ -2402,6 +2423,7 @@ pub enum VSpaceError {
     AlreadyMapped,
     NotMapped,
     OutOfMemory,
+    NotCow,
 }
 
 impl core::fmt::Display for VSpaceError {
@@ -2411,6 +2433,7 @@ impl core::fmt::Display for VSpaceError {
             VSpaceError::AlreadyMapped => write!(f, "Page is already mapped"),
             VSpaceError::NotMapped => write!(f, "Page is not mapped"),
             VSpaceError::OutOfMemory => write!(f, "Out of memory for page table allocation"),
+            VSpaceError::NotCow => write!(f, "Page is not COW"),
         }
     }
 }

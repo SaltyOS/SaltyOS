@@ -432,8 +432,9 @@ pub(crate) unsafe fn handle_mm_munmap(msg: *const SaltyMsg, badge: u64, reply: *
                     }
                 }
             }
-            // If entire region unmapped, mark inactive
+            // If entire region unmapped, free bitmap and mark inactive
             if base == (*region).base && len >= (*region).length {
+                free_cow_bitmap(region);
                 (*region).active = false;
             }
         } else {
@@ -711,6 +712,61 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const SaltyMsg, _caller_badge:
             let ptr = super::self_mmap(pages);
             if !ptr.is_null() {
                 let child_regions = ptr as *mut MmRegion;
+                // Two-pass bitmap allocation ensures parent state is always
+                // consistent. The kernel already downgraded ALL parent PTEs
+                // during COW clone, so every active region MUST have a
+                // correctly-sized bitmap before we touch child state.
+
+                // --- Pass 1: Parent bitmaps (must complete before child work) ---
+                // Process ALL regions even on allocation failure so that
+                // every region's existing bitmap is at least re-marked.
+                // The kernel already downgraded ALL parent PTEs, so skipping
+                // a region would leave its bitmap stale and cause write faults
+                // to be misclassified.
+                let mut parent_bitmap_failed = false;
+                for ri in 0..parent_rc {
+                    let pr = parent_regions.add(ri);
+                    if !(*pr).active || (*pr).length == 0 {
+                        continue;
+                    }
+                    let page_count = ((*pr).length / 4096) as usize;
+                    let need_words = ((page_count + 63) / 64) as u16;
+                    if (*pr).cow_bitmap.is_null() || (*pr).cow_bitmap_words < need_words {
+                        let (pbm_ptr, pbm_words) = alloc_cow_bitmap(page_count);
+                        if pbm_ptr.is_null() {
+                            // Allocation failed — re-mark existing bitmap if
+                            // present. Track failure to report OOM after all
+                            // regions are processed.
+                            parent_bitmap_failed = true;
+                        } else {
+                            if !(*pr).cow_bitmap.is_null() {
+                                free_cow_bitmap(pr);
+                            }
+                            (*pr).cow_bitmap = pbm_ptr;
+                            (*pr).cow_bitmap_words = pbm_words;
+                        }
+                    }
+                    (*pr).cow_inherited = true;
+                    // Re-mark pages as COW within existing bitmap capacity.
+                    // On alloc failure, this ensures the existing bitmap is
+                    // at least partially correct rather than fully stale.
+                    if !(*pr).cow_bitmap.is_null() {
+                        for pi in 0..page_count {
+                            let word_idx = pi / 64;
+                            let bit_idx = pi % 64;
+                            if (word_idx as u16) < (*pr).cow_bitmap_words {
+                                // SAFETY: word_idx is bounds-checked above.
+                                *(*pr).cow_bitmap.add(word_idx) |= 1u64 << bit_idx;
+                            }
+                        }
+                    }
+                }
+                if parent_bitmap_failed {
+                    (*reply).label = SALTY_OUT_OF_MEMORY;
+                    return;
+                }
+
+                // --- Pass 2: Child regions + child bitmaps ---
                 for ri in 0..parent_rc {
                     let pr = parent_regions.add(ri);
                     let mut cr = MmRegion::zeroed();
@@ -721,65 +777,39 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const SaltyMsg, _caller_badge:
                     cr.active = (*pr).active;
                     // frame_caps left null -- inherited via kernel COW
 
-                    // Allocate COW bitmap for active child regions.
-                    // After fork, ALL pages in the region are COW-shared:
-                    // the kernel has already downgraded parent PTEs and
-                    // cloned them read-only into the child.
+                    cr.cow_inherited = cr.active && cr.length > 0;
                     if cr.active && cr.length > 0 {
                         let page_count = (cr.length / 4096) as usize;
                         let (bm_ptr, bm_words) = alloc_cow_bitmap(page_count);
-                        if !bm_ptr.is_null() {
-                            cr.cow_bitmap = bm_ptr;
-                            cr.cow_bitmap_words = bm_words;
-                            // Mark all pages as COW
-                            for pi in 0..page_count {
-                                let word_idx = pi / 64;
-                                let bit_idx = pi % 64;
-                                // SAFETY: word_idx < bm_words guaranteed by alloc_cow_bitmap sizing.
-                                *bm_ptr.add(word_idx) |= 1u64 << bit_idx;
+                        if bm_ptr.is_null() {
+                            // Clean up child bitmaps allocated so far
+                            for cri in 0..ri {
+                                free_cow_bitmap(child_regions.add(cri));
                             }
+                            (*reply).label = SALTY_OUT_OF_MEMORY;
+                            return;
                         }
-
-                        // Allocate/resize COW bitmap for the parent's region
-                        // so the parent knows its frame_caps[i] are stale
-                        // after a COW write fault.
-                        //
-                        // On re-fork: the bitmap may be too small if the
-                        // region grew, and ALL bits must be re-set since fork
-                        // downgrades all parent PTEs to read-only.
-                        {
-                            let need_words = ((page_count + 63) / 64) as u16;
-                            if (*pr).cow_bitmap.is_null() || (*pr).cow_bitmap_words < need_words {
-                                // Return old bitmap to pool before allocating a new one
-                                if !(*pr).cow_bitmap.is_null() {
-                                    free_cow_bitmap(pr);
-                                }
-                                let (pbm_ptr, pbm_words) = alloc_cow_bitmap(page_count);
-                                if !pbm_ptr.is_null() {
-                                    (*pr).cow_bitmap = pbm_ptr;
-                                    (*pr).cow_bitmap_words = pbm_words;
-                                }
-                            }
-                            // Re-mark ALL pages as COW — fork downgrades all
-                            // parent PTEs to read-only.
-                            if !(*pr).cow_bitmap.is_null() {
-                                for pi in 0..page_count {
-                                    let word_idx = pi / 64;
-                                    let bit_idx = pi % 64;
-                                    if (word_idx as u16) < (*pr).cow_bitmap_words {
-                                        // SAFETY: word_idx is bounds-checked above.
-                                        *(*pr).cow_bitmap.add(word_idx) |= 1u64 << bit_idx;
-                                    }
-                                }
-                            }
+                        cr.cow_bitmap = bm_ptr;
+                        cr.cow_bitmap_words = bm_words;
+                        // Mark all pages as COW
+                        for pi in 0..page_count {
+                            let word_idx = pi / 64;
+                            let bit_idx = pi % 64;
+                            // SAFETY: word_idx < bm_words guaranteed by alloc_cow_bitmap sizing.
+                            *bm_ptr.add(word_idx) |= 1u64 << bit_idx;
                         }
                     }
 
+                    // Write cr immediately so cleanup via
+                    // free_cow_bitmap(child_regions.add(cri)) covers this region.
                     *child_regions.add(ri) = cr;
                 }
                 (*child).regions = child_regions;
                 (*child).region_count = parent_rc;
                 (*child).region_cap = child_region_cap;
+            } else {
+                (*reply).label = SALTY_OUT_OF_MEMORY;
+                return;
             }
         }
 
