@@ -13,7 +13,7 @@ pub static SC1_NORMAL: [u8; 128] = {
     t[0x10] = b'q'; t[0x11] = b'w'; t[0x12] = b'e'; t[0x13] = b'r';
     t[0x14] = b't'; t[0x15] = b'y'; t[0x16] = b'u'; t[0x17] = b'i';
     t[0x18] = b'o'; t[0x19] = b'p'; t[0x1A] = b'['; t[0x1B] = b']';
-    t[0x1C] = b'\n'; // Enter
+    t[0x1C] = b'\r'; // Enter
     // 0x1D = Left Ctrl (modifier)
     t[0x1E] = b'a'; t[0x1F] = b's'; t[0x20] = b'd'; t[0x21] = b'f';
     t[0x22] = b'g'; t[0x23] = b'h'; t[0x24] = b'j'; t[0x25] = b'k';
@@ -50,7 +50,7 @@ pub static SC1_SHIFTED: [u8; 128] = {
     t[0x10] = b'Q'; t[0x11] = b'W'; t[0x12] = b'E'; t[0x13] = b'R';
     t[0x14] = b'T'; t[0x15] = b'Y'; t[0x16] = b'U'; t[0x17] = b'I';
     t[0x18] = b'O'; t[0x19] = b'P'; t[0x1A] = b'{'; t[0x1B] = b'}';
-    t[0x1C] = b'\n'; // Enter
+    t[0x1C] = b'\r'; // Enter
     t[0x1E] = b'A'; t[0x1F] = b'S'; t[0x20] = b'D'; t[0x21] = b'F';
     t[0x22] = b'G'; t[0x23] = b'H'; t[0x24] = b'J'; t[0x25] = b'K';
     t[0x26] = b'L'; t[0x27] = b':'; t[0x28] = b'"';
