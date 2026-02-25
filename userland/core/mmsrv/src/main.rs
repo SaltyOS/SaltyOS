@@ -38,6 +38,7 @@
 mod types;
 mod client;
 mod mmap;
+mod pool;
 mod shm;
 
 use salty::consts::*;
@@ -101,6 +102,30 @@ unsafe fn self_mmap(num_pages: usize) -> *mut u8 {
         *(&raw mut SELF_MMAP_NEXT) = base + num_pages as u64 * 4096;
         core::ptr::write_bytes(base as *mut u8, 0, num_pages * 4096);
         base as *mut u8
+    }
+}
+
+/// Map an existing Frame cap into mmsrv's own VSpace (no new frame allocation).
+/// Used for pool/ring pages where both mmsrv and the kernel must access the
+/// SAME physical frame. Does NOT zero the page — caller is responsible.
+///
+/// # Safety
+///
+/// `frame_cap` must be a valid Frame capability.
+unsafe fn self_map_frame(frame_cap: Cap) -> *mut u8 {
+    unsafe {
+        let va = *(&raw const SELF_MMAP_NEXT);
+        let err = invoke::vspace_map(
+            CAP_SELF_VSPACE,
+            frame_cap,
+            va,
+            VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+        );
+        if err != 0 {
+            return core::ptr::null_mut();
+        }
+        *(&raw mut SELF_MMAP_NEXT) = va + 4096;
+        va as *mut u8
     }
 }
 
@@ -355,6 +380,35 @@ unsafe fn mark_recv_slot_kept() {
     }
 }
 
+/// Drain COW notification rings for all active pools.
+///
+/// For each active VSpace pool, reads the notification ring to learn which
+/// pool entries were consumed by the kernel fast-path, clears COW bits in
+/// the corresponding regions, and replenishes the pool.
+unsafe fn drain_all_cow_pools() {
+    unsafe {
+        let clients_ptr = *(&raw const CLIENTS_PTR);
+        let clients_cap = *(&raw const CLIENTS_CAP);
+        if clients_ptr.is_null() {
+            return;
+        }
+        for ci in 0..clients_cap {
+            let client = clients_ptr.add(ci);
+            if !(*client).active {
+                continue;
+            }
+            let pool_ptr = pool::find_pool_by_vspace((*client).vspace_cap);
+            if pool_ptr.is_null() {
+                continue;
+            }
+            let drained = pool::drain_notifications(client, pool_ptr);
+            if drained > 0 {
+                pool::replenish_pool(client, pool_ptr);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -471,6 +525,14 @@ pub extern "C" fn _start() -> ! {
             *(&raw mut PENDING_CLEANUP_COUNT) = 0;
         }
 
+        // Phase 2: Drain COW notification rings for all active pools.
+        // When the kernel fast-path resolves a COW fault, it writes to
+        // the notification ring and signals. We drain on every loop
+        // iteration (lightweight check: head != tail).
+        unsafe {
+            drain_all_cow_pools();
+        }
+
         unsafe {
             match msg.label {
                 MM_REGISTER => client::handle_mm_register(&raw const msg, badge, &raw mut reply),
@@ -497,7 +559,7 @@ pub extern "C" fn _start() -> ! {
                 // reply_recv_ctx (or recv for unrecoverable faults) is always reached.
                 2 => {
                     let fault_addr = msg.regs[0];
-                    let _error_code = msg.regs[1];
+                    let error_code = msg.regs[1];
                     let _fault_rip = msg.regs[2];
                     let page_addr = fault_addr & !0xFFFu64;
 
@@ -531,15 +593,125 @@ pub extern "C" fn _start() -> ! {
                             break 'fault;
                         }
 
-                        // 3. Check if page already mapped (race / double fault / COW)
                         let page_idx = ((page_addr - (*region).base) / 4096) as usize;
+
+                        // 3. COW fault detection: write to present page
+                        // error_code bits: [0]=Present, [1]=Write, [2]=User
+                        // 0x7 = present + write + user = COW write fault
+                        // Guard: only enter COW path if the page is actually
+                        // COW-inherited. Non-COW write-to-present faults (e.g.
+                        // mprotect(PROT_READ) violations) are access violations.
+                        if (error_code & 0x7) == 0x7 && client::is_cow_page(region, page_idx) {
+                            // COW resolution path: allocate a new frame and
+                            // let the kernel copy + replace the COW mapping.
+                            let slot = match salty::slot_alloc::slot_alloc() {
+                                Some(s) => s,
+                                None => {
+                                    reply.label = SALTY_OUT_OF_MEMORY;
+                                    break 'fault;
+                                }
+                            };
+
+                            if retype_any(OBJ_FRAME, 0, slot) != 0 {
+                                reply.label = SALTY_OUT_OF_MEMORY;
+                                break 'fault;
+                            }
+
+                            let flags = prot_to_vspace_flags((*region).prot);
+
+                            let err = invoke::vspace_cow_resolve(
+                                (*client_ptr).vspace_cap,
+                                page_addr,
+                                slot,
+                                flags,
+                            );
+
+                            if err == SALTY_ALREADY_EXISTS as i32 {
+                                // Race: another CPU already resolved this COW page
+                                invoke::cnode_delete(CAP_SELF_CSPACE, slot);
+                                reply.label = SALTY_OK;
+                                break 'fault;
+                            }
+                            if err != 0 {
+                                invoke::cnode_delete(CAP_SELF_CSPACE, slot);
+                                reply.label = SALTY_BAD_ADDRESS;
+                                break 'fault;
+                            }
+
+                            // Success — ensure frame_caps array is large enough
+                            if page_idx >= (*region).frame_cap_capacity as usize {
+                                let old_cap = (*region).frame_cap_capacity as usize;
+                                let required = page_idx + 1;
+                                let growth = if old_cap < 128 {
+                                    if old_cap == 0 { 8 } else { old_cap }
+                                } else if old_cap < 1024 {
+                                    old_cap / 2
+                                } else {
+                                    256
+                                };
+                                let new_cap = core::cmp::max(required, old_cap + growth);
+                                let new_fcaps = grow_frame_cap_array(
+                                    (*region).frame_caps,
+                                    old_cap,
+                                    new_cap,
+                                );
+                                if new_fcaps.is_null() {
+                                    // Frame is already resolved in kernel; just
+                                    // lose tracking rather than fail the fault.
+                                    reply.label = SALTY_OK;
+                                    break 'fault;
+                                }
+                                (*region).frame_caps = new_fcaps;
+                                (*region).frame_cap_capacity = new_cap as u16;
+                            }
+
+                            // Replace stale frame cap if parent had one
+                            if !(*region).frame_caps.is_null() && page_idx < (*region).frame_cap_capacity as usize {
+                                let old_cap = *(*region).frame_caps.add(page_idx);
+                                if old_cap != 0 {
+                                    invoke::cnode_delete(CAP_SELF_CSPACE, old_cap);
+                                }
+                                *(*region).frame_caps.add(page_idx) = slot;
+                            }
+
+                            // Clear COW bit — this page now has its own frame
+                            client::clear_cow_bit(region, page_idx);
+
+                            // High-water-mark update: after fork, sparse COW
+                            // resolution at high page_idx must not leave
+                            // frame_count below the resolved index.
+                            let needed = (page_idx + 1) as u16;
+                            if needed > (*region).frame_count {
+                                (*region).frame_count = needed;
+                            }
+                            reply.label = SALTY_OK;
+                            break 'fault;
+                        }
+
+                        // Non-COW write to present page = access violation
+                        // (e.g. mprotect(PROT_READ) page). Leave faulting
+                        // thread permanently FaultBlocked.
+                        if (error_code & 0x7) == 0x7 {
+                            let mut lb = LineBuf::new();
+                            lb.str(b"[MMSRV] access violation: badge=");
+                            lb.hex(badge);
+                            lb.str(b" addr=");
+                            lb.hex(fault_addr);
+                            lb.str(b"\n");
+                            lb.flush();
+                            skip_reply = true;
+                            break 'fault;
+                        }
+
+                        // 4. Non-COW fault: demand-page path
+                        // Grow frame_caps array if needed
                         if page_idx >= (*region).frame_cap_capacity as usize {
                             // Index out of bounds — grow frame_caps array to fit
                             let old_cap = (*region).frame_cap_capacity as usize;
                             let required = page_idx + 1;
                             // Hybrid growth: small 2x, medium 1.5x, large +256
                             let growth = if old_cap < 128 {
-                                old_cap
+                                if old_cap == 0 { 8 } else { old_cap }
                             } else if old_cap < 1024 {
                                 old_cap / 2
                             } else {
@@ -558,13 +730,13 @@ pub extern "C" fn _start() -> ! {
                             (*region).frame_caps = new_fcaps;
                             (*region).frame_cap_capacity = new_cap as u16;
                         }
-                        if *(*region).frame_caps.add(page_idx) != 0 {
-                            // Already mapped (COW handled by kernel, or race)
+                        if !(*region).frame_caps.is_null() && *(*region).frame_caps.add(page_idx) != 0 {
+                            // Already mapped (race)
                             reply.label = SALTY_OK;
                             break 'fault;
                         }
 
-                        // 4. Allocate frame: slot_alloc + retype_any
+                        // 5. Allocate frame: slot_alloc + retype_any
                         let slot = match salty::slot_alloc::slot_alloc() {
                             Some(s) => s,
                             None => {
@@ -577,7 +749,7 @@ pub extern "C" fn _start() -> ! {
                             break 'fault;
                         }
 
-                        // 5. Map into client's VSpace
+                        // 6. Map into client's VSpace
                         let flags = prot_to_vspace_flags((*region).prot);
                         let err = invoke::vspace_map((*client_ptr).vspace_cap, slot, page_addr, flags);
                         if err != 0 {
@@ -586,11 +758,17 @@ pub extern "C" fn _start() -> ! {
                             break 'fault;
                         }
 
-                        // 6. Track frame cap
-                        *(*region).frame_caps.add(page_idx) = slot;
-                        (*region).frame_count += 1;
+                        // 7. Track frame cap
+                        if !(*region).frame_caps.is_null() {
+                            *(*region).frame_caps.add(page_idx) = slot;
+                        }
+                        // High-water-mark update
+                        let needed = (page_idx + 1) as u16;
+                        if needed > (*region).frame_count {
+                            (*region).frame_count = needed;
+                        }
 
-                        // 7. Reply OK — kernel resumes faulting thread
+                        // 8. Reply OK — kernel resumes faulting thread
                         reply.label = SALTY_OK;
                     } // end 'fault
                 }

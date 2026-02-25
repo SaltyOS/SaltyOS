@@ -275,16 +275,12 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
             let scheduler = crate::sched::scheduler::scheduler();
             let current = scheduler.current();
 
-            // Fast-path COW page fault handling in kernel.
+            // COW + demand paging + stack growth fault handling
             if f.vector == 14 && !current.is_null() && !(*current).vspace_root.is_null() {
                 let vspace = &mut *(*current).vspace_root;
-                // COW: PRESENT=1, write fault
-                if let Ok(true) = vspace.handle_cow_fault(f.cr2, f.error_code) {
-                    // If thread was concurrently suspended (TCB_SUSPEND from
-                    // another CPU) between faulting and completing the handler,
-                    // do not return to userspace — reschedule instead.
-                    // SCHED_IPC_LOCK is already held by the assembly exception
-                    // stub for user-mode exceptions. Just reschedule directly.
+                // Phase 2: Kernel fast-path COW with pre-allocated pool.
+                // Falls through to VMFault IPC (Phase 1 path) when pool is empty.
+                if let Ok(true) = vspace.handle_cow_fault_pooled(f.cr2, f.error_code) {
                     if (*current).state == crate::sched::thread::ThreadState::Inactive {
                         scheduler.reschedule();
                     }

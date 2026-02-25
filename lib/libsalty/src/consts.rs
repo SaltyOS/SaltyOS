@@ -74,7 +74,7 @@ pub const TCB_SET_FAULT_HANDLER: u64 = 0x4B;
 pub const TCB_COPY_FPU: u64 = 0x4C;
 pub const TCB_SET_TLS_BASE: u64 = 0x4D;
 
-/// VSpace invoke labels (0x50-0x5A): map, unmap, map_pt, walk, copy_page, map_device, clone_cow, map_device_range, protect, map_demand, map_demand_range.
+/// VSpace invoke labels (0x50-0x5E): map, unmap, map_pt, walk, copy_page, map_device, clone_cow, map_device_range, protect, map_demand, map_demand_range, cow_resolve, set_cow_pool, set_cow_notif, replenish_cow_pool.
 pub const VSPACE_MAP: u64 = 0x50;
 pub const VSPACE_UNMAP: u64 = 0x51;
 pub const VSPACE_MAP_PT: u64 = 0x52;
@@ -86,6 +86,10 @@ pub const VSPACE_MAP_DEVICE_RANGE: u64 = 0x57;
 pub const VSPACE_PROTECT: u64 = 0x58;
 pub const VSPACE_MAP_DEMAND: u64 = 0x59;
 pub const VSPACE_MAP_DEMAND_RANGE: u64 = 0x5A;
+pub const VSPACE_COW_RESOLVE: u64 = 0x5B;
+pub const VSPACE_SET_COW_POOL: u64 = 0x5C;
+pub const VSPACE_SET_COW_NOTIF: u64 = 0x5D;
+pub const VSPACE_REPLENISH_COW_POOL: u64 = 0x5E;
 
 /// IRQ control invoke label (0x60): acquire IRQ handler capability.
 pub const IRQ_CONTROL_GET: u64 = 0x60;
