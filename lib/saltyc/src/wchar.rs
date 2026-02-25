@@ -1,8 +1,8 @@
-//! Wide character / multibyte stubs (ASCII-only)
+//! Wide character / multibyte support (UTF-8)
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! Since SaltyOS uses an ASCII/UTF-8 locale, all multibyte functions treat
-//! each byte as a single character (`wchar_t = i32`, MB_CUR_MAX = 1).
+//! SaltyOS uses a UTF-8 locale. Multibyte functions implement full UTF-8
+//! encoding/decoding (`wchar_t = i32`, MB_CUR_MAX = 4).
 //! Wide string operations (`wcslen`, `wcscmp`, `wcscpy`, etc.) operate on
 //! 32-bit wchar_t arrays. Conversion functions (`wcstod`, `wcstoull`) narrow
 //! to byte strings and delegate to the narrow equivalents.
@@ -12,6 +12,48 @@ pub type WintT = u32;
 pub type MbstateT = u32;
 
 pub const WEOF: WintT = 0xFFFFFFFF;
+
+// ---------------------------------------------------------------------------
+// UTF-8 codec helpers
+// ---------------------------------------------------------------------------
+
+/// Returns the expected byte length of a UTF-8 sequence from its lead byte.
+/// Returns 0 for invalid lead bytes (continuation bytes 0x80-0xBF, 0xFE-0xFF).
+#[inline]
+fn utf8_char_len(lead: u8) -> usize {
+    if lead < 0x80 {
+        1
+    } else if lead < 0xC2 {
+        // 0x80-0xBF are continuation bytes, 0xC0-0xC1 are overlong 2-byte
+        0
+    } else if lead < 0xE0 {
+        2
+    } else if lead < 0xF0 {
+        3
+    } else if lead < 0xF5 {
+        // 0xF5-0xFF would produce codepoints > U+10FFFF
+        4
+    } else {
+        0
+    }
+}
+
+/// Returns true if `cp` is a valid Unicode scalar value (excludes surrogates).
+#[inline]
+fn is_valid_codepoint(cp: u32) -> bool {
+    cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF)
+}
+
+/// Returns true if the encoding is overlong for the given codepoint.
+#[inline]
+fn is_overlong(cp: u32, seq_len: usize) -> bool {
+    match seq_len {
+        2 => cp < 0x80,
+        3 => cp < 0x800,
+        4 => cp < 0x10000,
+        _ => false,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Multibyte <-> wide character conversions
@@ -31,17 +73,54 @@ pub unsafe extern "C" fn mbrtowc(
         if n == 0 {
             return usize::MAX - 1; // (size_t)-2 -- incomplete sequence
         }
-        let byte = *s;
-        if byte == 0 {
+        let lead = *s;
+        if lead == 0 {
             if !pwc.is_null() {
                 *pwc = 0;
             }
             return 0;
         }
-        if !pwc.is_null() {
-            *pwc = byte as WcharT;
+        // ASCII fast path
+        if lead < 0x80 {
+            if !pwc.is_null() {
+                *pwc = lead as WcharT;
+            }
+            return 1;
         }
-        1
+        let seq_len = utf8_char_len(lead);
+        if seq_len == 0 {
+            crate::errno::set_errno(crate::errno::EILSEQ);
+            return usize::MAX; // (size_t)-1
+        }
+        if n < seq_len {
+            return usize::MAX - 1; // (size_t)-2 -- incomplete
+        }
+        // Decode multi-byte sequence
+        let mut cp: u32 = match seq_len {
+            2 => (lead & 0x1F) as u32,
+            3 => (lead & 0x0F) as u32,
+            4 => (lead & 0x07) as u32,
+            _ => 0,
+        };
+        let mut i = 1;
+        while i < seq_len {
+            let cont = *s.add(i);
+            if cont & 0xC0 != 0x80 {
+                crate::errno::set_errno(crate::errno::EILSEQ);
+                return usize::MAX;
+            }
+            cp = (cp << 6) | (cont & 0x3F) as u32;
+            i += 1;
+        }
+        // Reject overlong encodings and invalid codepoints
+        if is_overlong(cp, seq_len) || !is_valid_codepoint(cp) {
+            crate::errno::set_errno(crate::errno::EILSEQ);
+            return usize::MAX;
+        }
+        if !pwc.is_null() {
+            *pwc = cp as WcharT;
+        }
+        seq_len
     }
 }
 
@@ -55,22 +134,65 @@ pub unsafe extern "C" fn wcrtomb(
         if s.is_null() {
             return 1;
         }
-        *s = wc as u8;
-        1
+        let cp = wc as u32;
+        if cp < 0x80 {
+            *s = cp as u8;
+            1
+        } else if cp < 0x800 {
+            *s = (0xC0 | (cp >> 6)) as u8;
+            *s.add(1) = (0x80 | (cp & 0x3F)) as u8;
+            2
+        } else if cp < 0x10000 {
+            if cp >= 0xD800 && cp <= 0xDFFF {
+                crate::errno::set_errno(crate::errno::EILSEQ);
+                return usize::MAX;
+            }
+            *s = (0xE0 | (cp >> 12)) as u8;
+            *s.add(1) = (0x80 | ((cp >> 6) & 0x3F)) as u8;
+            *s.add(2) = (0x80 | (cp & 0x3F)) as u8;
+            3
+        } else if cp <= 0x10FFFF {
+            *s = (0xF0 | (cp >> 18)) as u8;
+            *s.add(1) = (0x80 | ((cp >> 12) & 0x3F)) as u8;
+            *s.add(2) = (0x80 | ((cp >> 6) & 0x3F)) as u8;
+            *s.add(3) = (0x80 | (cp & 0x3F)) as u8;
+            4
+        } else {
+            crate::errno::set_errno(crate::errno::EILSEQ);
+            usize::MAX
+        }
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mblen(s: *const u8, _n: usize) -> i32 {
+pub unsafe extern "C" fn mblen(s: *const u8, n: usize) -> i32 {
     if s.is_null() {
         return 0;
     }
     unsafe {
-        if *s == 0 {
-            0
-        } else {
-            1
+        if n == 0 {
+            return -1;
         }
+        let lead = *s;
+        if lead == 0 {
+            return 0;
+        }
+        if lead < 0x80 {
+            return 1;
+        }
+        let seq_len = utf8_char_len(lead);
+        if seq_len == 0 || n < seq_len {
+            return -1;
+        }
+        // Validate continuation bytes
+        let mut i = 1;
+        while i < seq_len {
+            if *s.add(i) & 0xC0 != 0x80 {
+                return -1;
+            }
+            i += 1;
+        }
+        seq_len as i32
     }
 }
 
@@ -78,22 +200,18 @@ pub unsafe extern "C" fn mblen(s: *const u8, _n: usize) -> i32 {
 pub unsafe extern "C" fn mbtowc(
     pwc: *mut WcharT,
     s: *const u8,
-    _n: usize,
+    n: usize,
 ) -> i32 {
     if s.is_null() {
         return 0;
     }
     unsafe {
-        if *s == 0 {
-            if !pwc.is_null() {
-                *pwc = 0;
-            }
-            return 0;
+        let result = mbrtowc(pwc, s, n, core::ptr::null_mut());
+        if result == usize::MAX || result == usize::MAX - 1 {
+            -1
+        } else {
+            result as i32
         }
-        if !pwc.is_null() {
-            *pwc = *s as WcharT;
-        }
-        1
     }
 }
 
@@ -103,8 +221,12 @@ pub unsafe extern "C" fn wctomb(s: *mut u8, wc: WcharT) -> i32 {
         return 0;
     }
     unsafe {
-        *s = wc as u8;
-        1
+        let result = wcrtomb(s, wc, core::ptr::null_mut());
+        if result == usize::MAX {
+            -1
+        } else {
+            result as i32
+        }
     }
 }
 
@@ -133,11 +255,6 @@ pub extern "C" fn wctob(c: WintT) -> i32 {
 // ---------------------------------------------------------------------------
 // Wide character classification
 // ---------------------------------------------------------------------------
-
-#[inline]
-fn is_ascii(wc: WintT) -> bool {
-    wc <= 0x7f
-}
 
 #[inline]
 fn is_alpha_ascii(wc: WintT) -> bool {
@@ -192,17 +309,45 @@ pub extern "C" fn iswlower(wc: WintT) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn iswprint(wc: WintT) -> i32 {
-    if wc >= 0x20 && wc <= 0x7e { 1 } else { 0 }
+    // ASCII printable
+    if wc >= 0x20 && wc <= 0x7E {
+        return 1;
+    }
+    // C0 controls and DEL
+    if wc < 0x20 || wc == 0x7F {
+        return 0;
+    }
+    // C1 controls (0x80-0x9F)
+    if wc >= 0x80 && wc <= 0x9F {
+        return 0;
+    }
+    // Surrogates
+    if wc >= 0xD800 && wc <= 0xDFFF {
+        return 0;
+    }
+    // Noncharacters
+    if wc >= 0xFDD0 && wc <= 0xFDEF {
+        return 0;
+    }
+    if (wc & 0xFFFE) == 0xFFFE {
+        return 0;
+    }
+    // Everything else in the valid Unicode range is printable
+    if wc <= 0x10FFFF { 1 } else { 0 }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn iswcntrl(wc: WintT) -> i32 {
-    if (is_ascii(wc) && wc < 0x20) || wc == 0x7f { 1 } else { 0 }
+    if wc < 0x20 || wc == 0x7F || (wc >= 0x80 && wc <= 0x9F) {
+        1
+    } else {
+        0
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn iswgraph(wc: WintT) -> i32 {
-    if wc >= 0x21 && wc <= 0x7e { 1 } else { 0 }
+    if iswprint(wc) != 0 && wc != b' ' as u32 { 1 } else { 0 }
 }
 
 #[unsafe(no_mangle)]
@@ -352,15 +497,232 @@ pub extern "C" fn towctrans(wc: WintT, desc: u64) -> WintT {
     }
 }
 
+// ---------------------------------------------------------------------------
+// wcwidth — Unicode-aware character width
+// ---------------------------------------------------------------------------
+
+/// Returns true for zero-width characters (combining marks, format controls).
+#[inline]
+fn is_zero_width(wc: u32) -> bool {
+    // Soft hyphen
+    if wc == 0x00AD {
+        return true;
+    }
+    // Combining Diacritical Marks
+    if wc >= 0x0300 && wc <= 0x036F {
+        return true;
+    }
+    // Cyrillic combining
+    if wc >= 0x0483 && wc <= 0x0489 {
+        return true;
+    }
+    // Hebrew combining
+    if wc >= 0x0591 && wc <= 0x05BD {
+        return true;
+    }
+    if wc == 0x05BF || wc == 0x05C7 {
+        return true;
+    }
+    if wc >= 0x05C1 && wc <= 0x05C2 {
+        return true;
+    }
+    if wc >= 0x05C4 && wc <= 0x05C5 {
+        return true;
+    }
+    // Arabic format/combining
+    if wc >= 0x0600 && wc <= 0x0605 {
+        return true;
+    }
+    if wc >= 0x0610 && wc <= 0x061A {
+        return true;
+    }
+    if wc == 0x061C {
+        return true;
+    }
+    if wc >= 0x064B && wc <= 0x065F {
+        return true;
+    }
+    if wc == 0x0670 {
+        return true;
+    }
+    if wc >= 0x06D6 && wc <= 0x06DD {
+        return true;
+    }
+    if wc >= 0x06DF && wc <= 0x06E4 {
+        return true;
+    }
+    if wc >= 0x06E7 && wc <= 0x06E8 {
+        return true;
+    }
+    if wc >= 0x06EA && wc <= 0x06ED {
+        return true;
+    }
+    if wc == 0x070F {
+        return true;
+    }
+    if wc == 0x0711 {
+        return true;
+    }
+    if wc >= 0x0730 && wc <= 0x074A {
+        return true;
+    }
+    // Thaana / NKo combining
+    if wc >= 0x07A6 && wc <= 0x07B0 {
+        return true;
+    }
+    if wc >= 0x07EB && wc <= 0x07F3 {
+        return true;
+    }
+    // Devanagari and other Indic combining marks
+    if wc >= 0x0900 && wc <= 0x0902 {
+        return true;
+    }
+    if wc == 0x093A || wc == 0x093C {
+        return true;
+    }
+    if wc >= 0x0941 && wc <= 0x0948 {
+        return true;
+    }
+    if wc == 0x094D {
+        return true;
+    }
+    // Thai / Lao combining
+    if wc == 0x0E31 {
+        return true;
+    }
+    if wc >= 0x0E34 && wc <= 0x0E3A {
+        return true;
+    }
+    if wc >= 0x0E47 && wc <= 0x0E4E {
+        return true;
+    }
+    if wc == 0x0EB1 {
+        return true;
+    }
+    if wc >= 0x0EB4 && wc <= 0x0EBC {
+        return true;
+    }
+    if wc >= 0x0EC8 && wc <= 0x0ECE {
+        return true;
+    }
+    // Combining Diacritical Marks Extended
+    if wc >= 0x1AB0 && wc <= 0x1AFF {
+        return true;
+    }
+    // Combining Diacritical Marks Supplement
+    if wc >= 0x1DC0 && wc <= 0x1DFF {
+        return true;
+    }
+    // Combining Diacritical Marks for Symbols
+    if wc >= 0x20D0 && wc <= 0x20FF {
+        return true;
+    }
+    // Zero-width characters
+    if wc >= 0x200B && wc <= 0x200F {
+        return true;
+    }
+    // Bidi formatting
+    if wc >= 0x202A && wc <= 0x202E {
+        return true;
+    }
+    if wc >= 0x2060 && wc <= 0x206F {
+        return true;
+    }
+    // CJK combining marks
+    if wc >= 0x302A && wc <= 0x302F {
+        return true;
+    }
+    // Japanese combining (dakuten, handakuten)
+    if wc >= 0x3099 && wc <= 0x309A {
+        return true;
+    }
+    // Variation Selectors
+    if wc >= 0xFE00 && wc <= 0xFE0F {
+        return true;
+    }
+    // Combining Half Marks
+    if wc >= 0xFE20 && wc <= 0xFE2F {
+        return true;
+    }
+    // BOM / ZWNBSP
+    if wc == 0xFEFF {
+        return true;
+    }
+    // Tags block
+    if wc >= 0xE0001 && wc <= 0xE007F {
+        return true;
+    }
+    // Variation Selectors Supplement
+    if wc >= 0xE0100 && wc <= 0xE01EF {
+        return true;
+    }
+    false
+}
+
+/// Returns true for East Asian fullwidth/wide characters.
+#[inline]
+fn is_wide_char(wc: u32) -> bool {
+    // Hangul Jamo initial consonants
+    (wc >= 0x1100 && wc <= 0x115F)
+    // East Asian wide angle brackets
+    || wc == 0x2329 || wc == 0x232A
+    // CJK Radicals Supplement through CJK Symbols and Punctuation
+    || (wc >= 0x2E80 && wc <= 0x303E)
+    // Hiragana through Hangul Compatibility Jamo
+    || (wc >= 0x3041 && wc <= 0x33FF)
+    // CJK Unified Ideographs Extension A
+    || (wc >= 0x3400 && wc <= 0x4DBF)
+    // CJK Unified Ideographs through Yi Radicals
+    || (wc >= 0x4E00 && wc <= 0xA4CF)
+    // Hangul Syllables
+    || (wc >= 0xAC00 && wc <= 0xD7A3)
+    // CJK Compatibility Ideographs
+    || (wc >= 0xF900 && wc <= 0xFAFF)
+    // Vertical Forms
+    || (wc >= 0xFE10 && wc <= 0xFE19)
+    // CJK Compatibility Forms through Small Form Variants
+    || (wc >= 0xFE30 && wc <= 0xFE6F)
+    // Fullwidth Forms
+    || (wc >= 0xFF01 && wc <= 0xFF60)
+    || (wc >= 0xFFE0 && wc <= 0xFFE6)
+    // Emoji and Symbols (common wide ranges)
+    || (wc >= 0x1F300 && wc <= 0x1F9FF)
+    // CJK Unified Ideographs Extension B through Extension G+
+    || (wc >= 0x20000 && wc <= 0x3FFFF)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn wcwidth(wc: WcharT) -> i32 {
-    if wc < 32 {
-        0
-    } else if wc >= 32 && wc < 127 {
-        1
-    } else {
-        -1
+    let cp = wc as u32;
+    // NUL
+    if cp == 0 {
+        return 0;
     }
+    // C0 controls, DEL
+    if cp < 0x20 || cp == 0x7F {
+        return -1;
+    }
+    // C1 controls
+    if cp >= 0x80 && cp <= 0x9F {
+        return -1;
+    }
+    // Surrogates, noncharacters
+    if cp >= 0xD800 && cp <= 0xDFFF {
+        return -1;
+    }
+    if cp > 0x10FFFF {
+        return -1;
+    }
+    // Zero-width (combining marks, format characters)
+    if is_zero_width(cp) {
+        return 0;
+    }
+    // East Asian wide/fullwidth
+    if is_wide_char(cp) {
+        return 2;
+    }
+    // Everything else is single-width
+    1
 }
 
 // ---------------------------------------------------------------------------
@@ -591,30 +953,46 @@ pub unsafe extern "C" fn mbsrtowcs(
             return 0;
         }
 
-        let s = *src;
-        let mut i: usize = 0;
+        let mut s = *src;
+        let mut wc_count: usize = 0;
 
         if dst.is_null() {
-            // Just count characters
-            while *s.add(i) != 0 {
-                i += 1;
+            // Count mode: count wide characters
+            loop {
+                let mut wc: WcharT = 0;
+                let result = mbrtowc(&raw mut wc, s, 4, core::ptr::null_mut());
+                if result == 0 {
+                    break;
+                }
+                if result == usize::MAX || result == usize::MAX - 1 {
+                    crate::errno::set_errno(crate::errno::EILSEQ);
+                    return usize::MAX;
+                }
+                s = s.add(result);
+                wc_count += 1;
             }
-            return i;
+            return wc_count;
         }
 
-        while i < len {
-            let byte = *s.add(i);
-            if byte == 0 {
-                *dst.add(i) = 0;
+        while wc_count < len {
+            let mut wc: WcharT = 0;
+            let result = mbrtowc(&raw mut wc, s, 4, core::ptr::null_mut());
+            if result == 0 {
+                *dst.add(wc_count) = 0;
                 *src = core::ptr::null();
-                return i;
+                return wc_count;
             }
-            *dst.add(i) = byte as WcharT;
-            i += 1;
+            if result == usize::MAX || result == usize::MAX - 1 {
+                crate::errno::set_errno(crate::errno::EILSEQ);
+                return usize::MAX;
+            }
+            *dst.add(wc_count) = wc;
+            s = s.add(result);
+            wc_count += 1;
         }
 
-        *src = s.add(i);
-        i
+        *src = s;
+        wc_count
     }
 }
 
@@ -630,30 +1008,55 @@ pub unsafe extern "C" fn wcsrtombs(
             return 0;
         }
 
-        let s = *src;
-        let mut i: usize = 0;
+        let mut s = *src;
+        let mut byte_count: usize = 0;
 
         if dst.is_null() {
-            // Just count characters
-            while *s.add(i) != 0 {
+            // Count mode: count total bytes needed
+            loop {
+                let wc = *s;
+                if wc == 0 {
+                    break;
+                }
+                let mut buf: [u8; 4] = [0; 4];
+                let result = wcrtomb(buf.as_mut_ptr(), wc, core::ptr::null_mut());
+                if result == usize::MAX {
+                    return usize::MAX;
+                }
+                byte_count += result;
+                s = s.add(1);
+            }
+            return byte_count;
+        }
+
+        loop {
+            let wc = *s;
+            if wc == 0 {
+                if byte_count < len {
+                    *dst.add(byte_count) = 0;
+                }
+                *src = core::ptr::null();
+                return byte_count;
+            }
+            let mut buf: [u8; 4] = [0; 4];
+            let result = wcrtomb(buf.as_mut_ptr(), wc, core::ptr::null_mut());
+            if result == usize::MAX {
+                return usize::MAX;
+            }
+            if byte_count + result > len {
+                break;
+            }
+            let mut i = 0;
+            while i < result {
+                *dst.add(byte_count + i) = buf[i];
                 i += 1;
             }
-            return i;
+            byte_count += result;
+            s = s.add(1);
         }
 
-        while i < len {
-            let wc = *s.add(i);
-            if wc == 0 {
-                *dst.add(i) = 0;
-                *src = core::ptr::null();
-                return i;
-            }
-            *dst.add(i) = wc as u8;
-            i += 1;
-        }
-
-        *src = s.add(i);
-        i
+        *src = s;
+        byte_count
     }
 }
 
@@ -677,11 +1080,11 @@ pub extern "C" fn nl_langinfo(item: i32) -> *const u8 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __ctype_get_mb_cur_max() -> usize {
-    1
+    4
 }
 
 // ---------------------------------------------------------------------------
-// mbstowcs / mbrlen
+// mbstowcs / wcstombs / mbrlen
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
@@ -694,23 +1097,100 @@ pub unsafe extern "C" fn mbstowcs(
         if src.is_null() {
             return 0;
         }
-        let mut i: usize = 0;
+        let mut s = src;
+        let mut wc_count: usize = 0;
+
         if dst.is_null() {
-            while *src.add(i) != 0 {
+            loop {
+                let mut wc: WcharT = 0;
+                let result = mbrtowc(&raw mut wc, s, 4, core::ptr::null_mut());
+                if result == 0 {
+                    break;
+                }
+                if result == usize::MAX || result == usize::MAX - 1 {
+                    crate::errno::set_errno(crate::errno::EILSEQ);
+                    return usize::MAX;
+                }
+                s = s.add(result);
+                wc_count += 1;
+            }
+            return wc_count;
+        }
+
+        while wc_count < n {
+            let mut wc: WcharT = 0;
+            let result = mbrtowc(&raw mut wc, s, 4, core::ptr::null_mut());
+            if result == 0 {
+                *dst.add(wc_count) = 0;
+                return wc_count;
+            }
+            if result == usize::MAX || result == usize::MAX - 1 {
+                crate::errno::set_errno(crate::errno::EILSEQ);
+                return usize::MAX;
+            }
+            *dst.add(wc_count) = wc;
+            s = s.add(result);
+            wc_count += 1;
+        }
+        wc_count
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wcstombs(
+    dst: *mut u8,
+    src: *const WcharT,
+    n: usize,
+) -> usize {
+    unsafe {
+        if src.is_null() {
+            return 0;
+        }
+        let mut s = src;
+        let mut byte_count: usize = 0;
+
+        if dst.is_null() {
+            loop {
+                let wc = *s;
+                if wc == 0 {
+                    break;
+                }
+                let mut buf: [u8; 4] = [0; 4];
+                let result = wcrtomb(buf.as_mut_ptr(), wc, core::ptr::null_mut());
+                if result == usize::MAX {
+                    return usize::MAX;
+                }
+                byte_count += result;
+                s = s.add(1);
+            }
+            return byte_count;
+        }
+
+        loop {
+            let wc = *s;
+            if wc == 0 {
+                if byte_count < n {
+                    *dst.add(byte_count) = 0;
+                }
+                return byte_count;
+            }
+            let mut buf: [u8; 4] = [0; 4];
+            let result = wcrtomb(buf.as_mut_ptr(), wc, core::ptr::null_mut());
+            if result == usize::MAX {
+                return usize::MAX;
+            }
+            if byte_count + result > n {
+                break;
+            }
+            let mut i = 0;
+            while i < result {
+                *dst.add(byte_count + i) = buf[i];
                 i += 1;
             }
-            return i;
+            byte_count += result;
+            s = s.add(1);
         }
-        while i < n {
-            let byte = *src.add(i);
-            if byte == 0 {
-                *dst.add(i) = 0;
-                return i;
-            }
-            *dst.add(i) = byte as WcharT;
-            i += 1;
-        }
-        i
+        byte_count
     }
 }
 
@@ -718,14 +1198,9 @@ pub unsafe extern "C" fn mbstowcs(
 pub unsafe extern "C" fn mbrlen(
     s: *const u8,
     n: usize,
-    _ps: *mut MbstateT,
+    ps: *mut MbstateT,
 ) -> usize {
-    unsafe {
-        if s.is_null() || n == 0 {
-            return 0;
-        }
-        if *s == 0 { 0 } else { 1 }
-    }
+    unsafe { mbrtowc(core::ptr::null_mut(), s, n, ps) }
 }
 
 // ---------------------------------------------------------------------------
@@ -852,7 +1327,7 @@ pub unsafe extern "C" fn fwprintf(
 }
 
 // ---------------------------------------------------------------------------
-// Wide character I/O (C locale: wchar_t == byte)
+// Wide character I/O (UTF-8 encoding)
 // ---------------------------------------------------------------------------
 
 unsafe extern "C" {
@@ -863,7 +1338,39 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fgetwc(stream: *mut crate::stdio::FILE) -> WintT {
     let c = fgetc(stream);
-    if c < 0 { WEOF } else { c as WintT }
+    if c < 0 {
+        return WEOF;
+    }
+    let lead = c as u8;
+    // ASCII fast path
+    if lead < 0x80 {
+        return lead as WintT;
+    }
+    let seq_len = utf8_char_len(lead);
+    if seq_len == 0 {
+        crate::errno::set_errno(crate::errno::EILSEQ);
+        return WEOF;
+    }
+    let mut buf: [u8; 4] = [0; 4];
+    buf[0] = lead;
+    let mut i = 1;
+    while i < seq_len {
+        let next = fgetc(stream);
+        if next < 0 {
+            crate::errno::set_errno(crate::errno::EILSEQ);
+            return WEOF;
+        }
+        buf[i] = next as u8;
+        i += 1;
+    }
+    let mut wc: WcharT = 0;
+    unsafe {
+        let result = mbrtowc(&raw mut wc, buf.as_ptr(), seq_len, core::ptr::null_mut());
+        if result == usize::MAX || result == usize::MAX - 1 {
+            return WEOF;
+        }
+    }
+    wc as WintT
 }
 
 #[unsafe(no_mangle)]
@@ -871,12 +1378,20 @@ pub unsafe extern "C" fn fputwc(wc: WintT, stream: *mut crate::stdio::FILE) -> W
     if wc == WEOF {
         return WEOF;
     }
-    if wc > 0x7f {
-        crate::errno::set_errno(crate::errno::EILSEQ);
+    let mut buf: [u8; 4] = [0; 4];
+    let len = unsafe { wcrtomb(buf.as_mut_ptr(), wc as WcharT, core::ptr::null_mut()) };
+    if len == usize::MAX {
         return WEOF;
     }
-    let c = fputc(wc as i32, stream);
-    if c < 0 { WEOF } else { wc }
+    let mut i = 0;
+    while i < len {
+        let c = fputc(buf[i] as i32, stream);
+        if c < 0 {
+            return WEOF;
+        }
+        i += 1;
+    }
+    wc
 }
 
 #[unsafe(no_mangle)]

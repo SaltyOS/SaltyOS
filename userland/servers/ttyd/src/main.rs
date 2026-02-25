@@ -142,8 +142,8 @@ unsafe fn display_try_flush() {
                 would_block_retries = 0;
                 continue;
             }
-            if err == SALTY_WOULD_BLOCK as i32 && would_block_retries < 2 {
-                let _ = salty::syscall::syscall(salty::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+            if err == SALTY_WOULD_BLOCK as i32 && would_block_retries < 8 {
+                let _ = salty::syscall::syscall(salty::SYS_NANOSLEEP, 0, 500_000, 0, 0, 0, 0);
                 would_block_retries += 1;
                 continue;
             }
@@ -209,6 +209,40 @@ pub extern "C" fn _start() -> ! {
             idle();
         }
         salty::ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
+    }
+
+    // Query display server for actual framebuffer dimensions
+    unsafe {
+        let mut qmsg = SaltyMsg::zeroed();
+        let mut qreply = SaltyMsg::zeroed();
+        qmsg.label = DISPLAY_GET_INFO;
+        qmsg.length = 0;
+        let err = salty::ipc::call_ctx(
+            ipc_ctx(),
+            CAP_DISPLAY_EP,
+            &raw const qmsg,
+            &raw mut qreply,
+        );
+        if err == 0 && qreply.label == SALTY_OK {
+            let fb_width = qreply.regs[0] as u32;
+            let fb_height = qreply.regs[1] as u32;
+            // GLYPH_WIDTH=8, GLYPH_HEIGHT=16
+            let cols = fb_width / 8;
+            let rows = fb_height / 16;
+            if cols > 0 && rows > 0 {
+                *(&raw mut types::WINSIZE_COLS) = cols;
+                *(&raw mut types::WINSIZE_ROWS) = rows;
+                let mut lb = SerialLB::new();
+                lb.str(b"[TTYD] Display dimensions: ");
+                lb.dec(cols as u64);
+                lb.str(b"x");
+                lb.dec(rows as u64);
+                lb.str(b"\n");
+                lb.flush();
+            }
+        } else {
+            puts(b"[TTYD] WARN: display query failed, using 80x24\n");
+        }
     }
 
     // Activate PTY 0 (the console PTY)

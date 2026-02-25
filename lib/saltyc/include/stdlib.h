@@ -78,6 +78,9 @@ extern void *bsearch(const void *key, const void *base, size_t nmemb,
 extern char *mktemp(char *tmpl);
 extern char *mkdtemp(char *tmpl);
 extern char *realpath(const char *path, char *resolved_path);
+
+extern size_t mbstowcs(wchar_t *dst, const char *src, size_t n);
+extern size_t wcstombs(char *dst, const wchar_t *src, size_t n);
 extern int   system(const char *command);
 
 extern char **environ;

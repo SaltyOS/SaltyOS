@@ -5,6 +5,14 @@ use super::{pack_path, CAP_VFS_EP};
 use crate::consts::*;
 use crate::types::*;
 
+#[repr(C)]
+struct IoctlWinsize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+
 /// File control operations (F_GETFL, F_SETFL, F_DUPFD, etc.).
 /// Returns the result value on success, -1 on error.
 pub unsafe fn posix_fcntl(fd: i32, cmd: i32, arg: i64) -> i32 {
@@ -77,6 +85,30 @@ pub unsafe fn posix_ioctl(fd: i32, request: u64, arg: u64) -> i32 {
         }
         if reply.label != SALTY_OK {
             return super::salty_err_to_posix(reply.label);
+        }
+
+        match request {
+            TIOCGPGRP => {
+                if arg != 0 {
+                    let pgrp_p = arg as *mut i32;
+                    *pgrp_p = reply.regs[0] as i32;
+                    return 0;
+                }
+            }
+            TIOCGWINSZ => {
+                if arg != 0 {
+                    let rows = if reply.length >= 1 { reply.regs[0] } else { 0 };
+                    let cols = if reply.length >= 2 { reply.regs[1] } else { 0 };
+
+                    let ws = arg as *mut IoctlWinsize;
+                    (*ws).ws_row = rows as u16;
+                    (*ws).ws_col = cols as u16;
+                    (*ws).ws_xpixel = 0;
+                    (*ws).ws_ypixel = 0;
+                    return 0;
+                }
+            }
+            _ => {}
         }
         reply.regs[0] as i32
     }

@@ -26,6 +26,7 @@ extern FILE *stderr;
 #define FOPEN_MAX    16
 #define TMP_MAX      10000
 #define L_tmpnam     20
+#define P_tmpdir     "/tmp"
 
 extern FILE *fopen(const char *path, const char *mode);
 extern FILE *fdopen(int fd, const char *mode);

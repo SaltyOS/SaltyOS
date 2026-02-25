@@ -82,8 +82,8 @@ pub fn flush_line_to_ring(line: &mut InputLineBuf, ring: &mut RingBuf) {
 }
 
 /// Process a single input character through the line discipline for a PTY.
-/// After processing, if slave_ring transitions from empty to non-empty and
-/// VFS has a pending reader, signals VFS via notification.
+/// After processing, if slave_ring transitions from empty to non-empty,
+/// signals VFS via notification to wake pending readers and poll waiters.
 pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], echo_len: &mut usize) {
     unsafe {
         let pty = &mut *(&raw mut PTYS[pty_id]);
@@ -173,10 +173,8 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
             if ch == pty.termios.c_cc[VEOF] {
                 let was_empty = pty.slave_ring.is_empty();
                 flush_line_to_ring(&mut pty.line, &mut pty.slave_ring);
-                if was_empty && !pty.slave_ring.is_empty() && pty.vfs_pending {
-                    signal_vfs(pty_id);
-                } else if was_empty && pty.slave_ring.is_empty() && pty.vfs_pending {
-                    // EOF with empty line: signal VFS so it returns 0 bytes (EOF)
+                if was_empty {
+                    // Signal VFS for both data-ready and empty-line EOF.
                     signal_vfs(pty_id);
                 }
                 return;
@@ -191,7 +189,7 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
                 }
                 let was_empty = pty.slave_ring.is_empty();
                 flush_line_to_ring(&mut pty.line, &mut pty.slave_ring);
-                if was_empty && !pty.slave_ring.is_empty() && pty.vfs_pending {
+                if was_empty && !pty.slave_ring.is_empty() {
                     signal_vfs(pty_id);
                 }
                 return;
@@ -214,7 +212,7 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
             if pty.line.len >= LINE_BUF_SIZE {
                 let was_empty = pty.slave_ring.is_empty();
                 flush_line_to_ring(&mut pty.line, &mut pty.slave_ring);
-                if was_empty && !pty.slave_ring.is_empty() && pty.vfs_pending {
+                if was_empty && !pty.slave_ring.is_empty() {
                     signal_vfs(pty_id);
                 }
             }
@@ -226,7 +224,7 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
             }
             let was_empty = pty.slave_ring.is_empty();
             pty.slave_ring.push(ch);
-            if was_empty && pty.vfs_pending {
+            if was_empty {
                 signal_vfs(pty_id);
             }
         }

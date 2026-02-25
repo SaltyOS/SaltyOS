@@ -1,0 +1,81 @@
+[port]
+name = ncurses
+version = 6.5
+description = ncurses terminal UI library (wide-char build)
+homepage = https://invisible-island.net/ncurses/
+license = MIT
+
+[source]
+url = https://invisible-island.net/archives/ncurses/ncurses-${version}.tar.gz
+subdir = ncurses-${version}
+sha256 = 136d91bc269a9a5785e5f9e980bc76ab57428f604ce3e5a5a90cebc767971cc6
+
+[build]
+type = autotools
+configure =
+    -C
+    --without-ada
+    --without-cxx
+    --without-cxx-binding
+    --without-progs
+    --without-tests
+    --without-manpages
+    --without-debug
+    --without-profile
+    --without-dlsym
+    --disable-database
+    --disable-db-install
+    --disable-home-terminfo
+    --disable-termcap
+    --disable-stripping
+    --enable-widec
+    --enable-sigwinch
+    --enable-ext-colors
+    --without-shared
+    --with-normal
+    --with-fallbacks=xterm,xterm-256color,vt100,linux
+    --with-build-cc=cc
+    --with-build-cflags=
+    --with-build-ldflags=
+    --with-build-libs=
+
+[env]
+CFLAGS_FOR_BUILD =
+
+[autoconf_cache]
+ac_cv_header_termios_h = yes
+ac_cv_func_tcgetattr = yes
+ac_cv_func_tcsetpgrp = yes
+ac_cv_func_sigaction = yes
+ac_cv_func_sigvec = no
+ac_cv_func_poll = yes
+ac_cv_func_select = yes
+ac_cv_func_nanosleep = yes
+ac_cv_func_mbrtowc = yes
+ac_cv_func_wcrtomb = yes
+ac_cv_func_wcwidth = yes
+ac_cv_func_mmap_fixed_mapped = yes
+ac_cv_func_vsnprintf = yes
+ac_cv_func_vsscanf = yes
+ac_cv_func_setvbuf_reversed = no
+ac_cv_header_dlfcn_h = no
+ac_cv_header_locale_h = yes
+ac_cv_func_issetugid = no
+ac_cv_func_sched_yield = no
+ac_cv_func_tsearch = yes
+ac_cv_func_memccpy = no
+ac_cv_func_mkstemp = yes
+ac_cv_func_getegid = yes
+ac_cv_func_geteuid = yes
+ac_cv_func_putenv = yes
+ac_cv_func_setenv = yes
+ac_cv_func_strdup = yes
+ac_cv_func_tcgetpgrp = yes
+ac_cv_func_gettimeofday = yes
+cf_cv_link_funcs = link symlink
+cf_cv_posix_visible = no
+cf_cv_sys_time_select = yes
+cf_cv_func_nanosleep = yes
+
+[install]
+libncursesw.a = lib/libncursesw.a

@@ -84,7 +84,7 @@ const VSTOP: usize = 9;
 const VSUSP: usize = 10;
 
 static mut CONSOLE_TERMIOS: Termios = Termios::zeroed();
-const DISPLAY_TX_BUF_SIZE: usize = 4096;
+const DISPLAY_TX_BUF_SIZE: usize = 16384;
 const DISPLAY_TX_CHUNK_MAX: usize = 152;
 
 static mut DISPLAY_TX_BUF: [u8; DISPLAY_TX_BUF_SIZE] = [0; DISPLAY_TX_BUF_SIZE];
@@ -299,8 +299,8 @@ unsafe fn display_try_flush() {
                 would_block_retries = 0;
                 continue;
             }
-            if err == SALTY_WOULD_BLOCK as i32 && would_block_retries < 2 {
-                let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+            if err == SALTY_WOULD_BLOCK as i32 && would_block_retries < 8 {
+                let _ = salty::syscall::syscall(SYS_NANOSLEEP, 0, 500_000, 0, 0, 0, 0);
                 would_block_retries += 1;
                 continue;
             }
@@ -452,10 +452,12 @@ pub extern "C" fn _start() -> ! {
                 let status = invoke::ioport_in8(CAP_KBD_IOPORT, PS2_STATUS);
                 if (status & PS2_STATUS_OUTPUT_FULL) == 0 { break; }
                 let scancode = invoke::ioport_in8(CAP_KBD_IOPORT, PS2_DATA);
-                let c = kbd.translate(scancode);
-                if c != 0 && raw_len < 32 {
-                    raw_buf[raw_len] = c;
-                    raw_len += 1;
+                let key = kbd.translate(scancode);
+                for i in 0..key.len as usize {
+                    if raw_len < 32 {
+                        raw_buf[raw_len] = key.bytes[i];
+                        raw_len += 1;
+                    }
                 }
             }
             invoke::irq_handler_ack(CAP_KBD_IRQ);

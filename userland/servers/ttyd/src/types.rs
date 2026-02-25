@@ -17,7 +17,7 @@ pub const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 pub const RING_SIZE: usize = 4096;
 pub const LINE_BUF_SIZE: usize = 256;
 pub const MAX_PTYS: usize = 4;
-pub const DISPLAY_TX_BUF_SIZE: usize = 4096;
+pub const DISPLAY_TX_BUF_SIZE: usize = 16384;
 pub const DISPLAY_TX_CHUNK_MAX: usize = 152;
 
 // Local flags (c_lflag)
@@ -62,12 +62,9 @@ pub const POLLIN: i16 = 0x0001;
 pub const POLLOUT: i16 = 0x0004;
 pub const POLLHUP: i16 = 0x0010;
 
-// ioctl commands
-pub const TIOCGPGRP: u64 = 0x540F;
-pub const TIOCSPGRP: u64 = 0x5410;
-pub const TIOCSCTTY: u64 = 0x540E;
-pub const TIOCNOTTY: u64 = 0x5422;
-pub const TIOCGWINSZ: u64 = 0x5413;
+// Actual terminal dimensions (queried from display server at startup)
+pub static mut WINSIZE_ROWS: u32 = 24;
+pub static mut WINSIZE_COLS: u32 = 80;
 
 pub struct RingBuf {
     buf: [u8; RING_SIZE],

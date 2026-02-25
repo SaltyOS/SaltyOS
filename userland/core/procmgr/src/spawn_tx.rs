@@ -2359,7 +2359,7 @@ pub unsafe fn handle_spawn_tx(
         }
 
         // ---- Register with mmsrv (before ELF loading — mmsrv needs client registered) ----
-        let heap_base = plan.layout.code_end();
+        let heap_base = plan.layout.heap_base();
         let mmap_base = salty::layout::compute_mmap_base(&plan.layout, heap_base);
         {
             let mut mm_msg = SaltyMsg::zeroed();
@@ -2617,7 +2617,7 @@ pub unsafe fn handle_spawn_tx(
             let env_strs: [&[u8]; 4] = [
                 b"PATH=/bin:/usr/bin",
                 b"HOME=/",
-                b"TERM=dumb",
+                b"TERM=vt100",
                 b"SHELL=/bin/sh",
             ];
             for env in &env_strs {

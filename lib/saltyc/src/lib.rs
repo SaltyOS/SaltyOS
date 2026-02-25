@@ -49,6 +49,7 @@ pub mod select_impl;
 pub mod math_impl;
 pub mod misc_impl;
 pub mod pthread_impl;
+pub mod search_impl;
 pub mod compat;
 
 // Panic handler is provided by libsalty (our dependency)

@@ -75,7 +75,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         let new_envp: [*const u8; 7] = [
             b"PATH=/bin:/usr/bin\0".as_ptr(),
             b"HOME=/\0".as_ptr(),
-            b"TERM=dumb\0".as_ptr(),
+            b"TERM=vt100\0".as_ptr(),
             b"SHELL=/bin/sh\0".as_ptr(),
             b"PS1=$ \0".as_ptr(),
             b"TTY=/dev/pts/0\0".as_ptr(),
