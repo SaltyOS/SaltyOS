@@ -17,6 +17,7 @@ subdir('servers/console')
 subdir('servers/ttyd')
 subdir('servers/getty')
 subdir('servers/netsrv')
+subdir('servers/dnssrv')
 
 # Hardware drivers
 subdir('drivers/blkdrv')

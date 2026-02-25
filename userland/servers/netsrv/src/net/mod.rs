@@ -8,6 +8,7 @@ pub(crate) mod icmp;
 pub(crate) mod ipv4;
 pub(crate) mod tcp;
 pub(crate) mod udp;
+pub(crate) mod dns;
 
 /// Send an IPv4 packet through the network stack.
 ///

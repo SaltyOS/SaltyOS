@@ -466,3 +466,26 @@ impl EpollEvent {
         }
     }
 }
+
+/// DNS address info result (POSIX getaddrinfo equivalent).
+/// Returns a single result per call. No heap-allocated linked list since
+/// this is a `no_std` environment; callers resolve one address at a time.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DnsAddrInfo {
+    pub family: i32,
+    pub socktype: i32,
+    pub protocol: i32,
+    pub addr: SockAddrIn,
+}
+
+impl DnsAddrInfo {
+    pub const fn zeroed() -> Self {
+        DnsAddrInfo {
+            family: 0,
+            socktype: 0,
+            protocol: 0,
+            addr: SockAddrIn::zeroed(),
+        }
+    }
+}

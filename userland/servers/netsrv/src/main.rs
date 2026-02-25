@@ -409,7 +409,7 @@ fn process_packet(data: &[u8]) {
 }
 
 /// Process all pending received frames from the SHM RX ring.
-fn process_rx_from_shm() {
+pub(crate) fn process_rx_from_shm() {
     let mut frame_buf = [0u8; 2048];
     while let Some(len) = shm_rx_dequeue(&mut frame_buf) {
         process_packet(&frame_buf[..len]);
@@ -733,6 +733,54 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) {
             reply.regs[0] = revents as u64;
             reply.length = 1;
         }
+        NET_DNS_RESOLVE => {
+            let hostname_len = msg.regs[0] as usize;
+            if hostname_len == 0 || hostname_len > 120 {
+                reply.label = SALTY_INVALID_ARGUMENT;
+                return;
+            }
+            // SAFETY: Reading hostname bytes from IPC message register area.
+            // hostname_len is at most 120, which fits within regs[1..16].
+            let mut hostname = [0u8; 120];
+            unsafe {
+                let src = &msg.regs[1] as *const u64 as *const u8;
+                core::ptr::copy_nonoverlapping(src, hostname.as_mut_ptr(), hostname_len);
+            }
+            match net::dns::dns_resolve_sync(&hostname[..hostname_len]) {
+                Some(result) => {
+                    reply.label = SALTY_OK;
+                    reply.regs[0] = result.ip_count as u64;
+                    reply.regs[1] = result.ttl as u64;
+                    let mut i = 0;
+                    while i < result.ip_count as usize && i < 4 {
+                        reply.regs[2 + i] = result.ips[i] as u64;
+                        i += 1;
+                    }
+                    reply.length = 2 + result.ip_count as u64;
+                }
+                None => {
+                    reply.label = SALTY_NOT_FOUND;
+                }
+            }
+        }
+        NET_DNS_RESOLVE_PTR => {
+            let ip = msg.regs[0] as u32;
+            let mut hostname = [0u8; 256];
+            let len = net::dns::dns_resolve_ptr_sync(ip, &mut hostname);
+            if len > 0 {
+                reply.label = SALTY_OK;
+                reply.regs[0] = len as u64;
+                let copy_len = core::cmp::min(len, 152);
+                // SAFETY: Writing hostname bytes into reply register area.
+                unsafe {
+                    let dst = &raw mut reply.regs[1] as *mut u8;
+                    core::ptr::copy_nonoverlapping(hostname.as_ptr(), dst, copy_len);
+                }
+                reply.length = 1 + ((copy_len as u64 + 7) / 8);
+            } else {
+                reply.label = SALTY_NOT_FOUND;
+            }
+        }
         _ => {
             reply.label = SALTY_INVALID_OPERATION;
         }
@@ -978,6 +1026,9 @@ pub extern "C" fn _start() -> ! {
 
     // 5. Register with name service
     register_nameserv();
+
+    // 5b. Initialize DNS protocol engine
+    net::dns::init_dns_socket();
 
     // 6. Signal readiness to init
     signal_ready();
