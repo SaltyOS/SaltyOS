@@ -740,19 +740,34 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const SaltyMsg, _caller_badge:
                             }
                         }
 
-                        // Also allocate COW bitmap for the parent's region so
-                        // the parent knows its frame_caps[i] are stale after
-                        // a COW write fault.
-                        if (*pr).cow_bitmap.is_null() {
-                            let (pbm_ptr, pbm_words) = alloc_cow_bitmap(page_count);
-                            if !pbm_ptr.is_null() {
-                                (*pr).cow_bitmap = pbm_ptr;
-                                (*pr).cow_bitmap_words = pbm_words;
+                        // Allocate/resize COW bitmap for the parent's region
+                        // so the parent knows its frame_caps[i] are stale
+                        // after a COW write fault.
+                        //
+                        // On re-fork: the bitmap may be too small if the
+                        // region grew, and ALL bits must be re-set since fork
+                        // downgrades all parent PTEs to read-only.
+                        {
+                            let need_words = ((page_count + 63) / 64) as u16;
+                            if (*pr).cow_bitmap.is_null() || (*pr).cow_bitmap_words < need_words {
+                                let (pbm_ptr, pbm_words) = alloc_cow_bitmap(page_count);
+                                if !pbm_ptr.is_null() {
+                                    // Old bitmap leaked (no munmap for self_mmap).
+                                    // Bounded: at most 1 page per region lifetime.
+                                    (*pr).cow_bitmap = pbm_ptr;
+                                    (*pr).cow_bitmap_words = pbm_words;
+                                }
+                            }
+                            // Re-mark ALL pages as COW — fork downgrades all
+                            // parent PTEs to read-only.
+                            if !(*pr).cow_bitmap.is_null() {
                                 for pi in 0..page_count {
                                     let word_idx = pi / 64;
                                     let bit_idx = pi % 64;
-                                    // SAFETY: word_idx < pbm_words.
-                                    *pbm_ptr.add(word_idx) |= 1u64 << bit_idx;
+                                    if (word_idx as u16) < (*pr).cow_bitmap_words {
+                                        // SAFETY: word_idx is bounds-checked above.
+                                        *(*pr).cow_bitmap.add(word_idx) |= 1u64 << bit_idx;
+                                    }
                                 }
                             }
                         }

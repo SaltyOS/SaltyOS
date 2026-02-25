@@ -105,6 +105,30 @@ unsafe fn self_mmap(num_pages: usize) -> *mut u8 {
     }
 }
 
+/// Map an existing Frame cap into mmsrv's own VSpace (no new frame allocation).
+/// Used for pool/ring pages where both mmsrv and the kernel must access the
+/// SAME physical frame. Does NOT zero the page — caller is responsible.
+///
+/// # Safety
+///
+/// `frame_cap` must be a valid Frame capability.
+unsafe fn self_map_frame(frame_cap: Cap) -> *mut u8 {
+    unsafe {
+        let va = *(&raw const SELF_MMAP_NEXT);
+        let err = invoke::vspace_map(
+            CAP_SELF_VSPACE,
+            frame_cap,
+            va,
+            VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+        );
+        if err != 0 {
+            return core::ptr::null_mut();
+        }
+        *(&raw mut SELF_MMAP_NEXT) = va + 4096;
+        va as *mut u8
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Untyped source tracking
 // ---------------------------------------------------------------------------
@@ -574,7 +598,10 @@ pub extern "C" fn _start() -> ! {
                         // 3. COW fault detection: write to present page
                         // error_code bits: [0]=Present, [1]=Write, [2]=User
                         // 0x7 = present + write + user = COW write fault
-                        if (error_code & 0x7) == 0x7 {
+                        // Guard: only enter COW path if the page is actually
+                        // COW-inherited. Non-COW write-to-present faults (e.g.
+                        // mprotect(PROT_READ) violations) are access violations.
+                        if (error_code & 0x7) == 0x7 && client::is_cow_page(region, page_idx) {
                             // COW resolution path: allocate a new frame and
                             // let the kernel copy + replace the COW mapping.
                             let slot = match salty::slot_alloc::slot_alloc() {
@@ -650,8 +677,29 @@ pub extern "C" fn _start() -> ! {
                             // Clear COW bit — this page now has its own frame
                             client::clear_cow_bit(region, page_idx);
 
-                            (*region).frame_count += 1;
+                            // High-water-mark update: after fork, sparse COW
+                            // resolution at high page_idx must not leave
+                            // frame_count below the resolved index.
+                            let needed = (page_idx + 1) as u16;
+                            if needed > (*region).frame_count {
+                                (*region).frame_count = needed;
+                            }
                             reply.label = SALTY_OK;
+                            break 'fault;
+                        }
+
+                        // Non-COW write to present page = access violation
+                        // (e.g. mprotect(PROT_READ) page). Leave faulting
+                        // thread permanently FaultBlocked.
+                        if (error_code & 0x7) == 0x7 {
+                            let mut lb = LineBuf::new();
+                            lb.str(b"[MMSRV] access violation: badge=");
+                            lb.hex(badge);
+                            lb.str(b" addr=");
+                            lb.hex(fault_addr);
+                            lb.str(b"\n");
+                            lb.flush();
+                            skip_reply = true;
                             break 'fault;
                         }
 
@@ -714,7 +762,11 @@ pub extern "C" fn _start() -> ! {
                         if !(*region).frame_caps.is_null() {
                             *(*region).frame_caps.add(page_idx) = slot;
                         }
-                        (*region).frame_count += 1;
+                        // High-water-mark update
+                        let needed = (page_idx + 1) as u16;
+                        if needed > (*region).frame_count {
+                            (*region).frame_count = needed;
+                        }
 
                         // 8. Reply OK — kernel resumes faulting thread
                         reply.label = SALTY_OK;

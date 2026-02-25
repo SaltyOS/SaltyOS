@@ -307,6 +307,11 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const SaltyMsg, _caller_badge: u
             }
         }
 
+        // Tear down COW pool before deleting the VSpace cap
+        if vspace_cap != 0 {
+            crate::pool::teardown_pool(vspace_cap);
+        }
+
         // Clean up the VSpace cap we hold
         if vspace_cap != 0 {
             invoke::cnode_delete(super::CAP_SELF_CSPACE, vspace_cap);

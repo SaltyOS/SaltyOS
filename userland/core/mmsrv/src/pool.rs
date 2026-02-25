@@ -39,8 +39,10 @@ pub(crate) struct VSpacePool {
     pub(crate) pool_page: *mut u8,
     /// mmsrv-mapped pointer to the CowNotifRing page
     pub(crate) ring_page: *mut u8,
-    /// mmsrv-side tracking: pool slot -> frame cap (used for cleanup)
-    pub(crate) frame_caps: [Cap; POOL_INITIAL_FILL],
+    /// Per-pool-slot cap tracking: pool_slot_caps[idx % 510] holds the Frame
+    /// cap for the pool entry at that ring index. Used by drain_notifications
+    /// to transfer ownership to region.frame_caps and by teardown to clean up.
+    pub(crate) pool_slot_caps: *mut Cap,
     /// Number of entries currently in the pool
     pub(crate) fill_count: u16,
     /// Whether this pool is active
@@ -56,7 +58,7 @@ impl VSpacePool {
             notif_cap: 0,
             pool_page: core::ptr::null_mut(),
             ring_page: core::ptr::null_mut(),
-            frame_caps: [0; POOL_INITIAL_FILL],
+            pool_slot_caps: core::ptr::null_mut(),
             fill_count: 0,
             active: false,
         }
@@ -151,8 +153,9 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
             return false;
         }
 
-        // Map pool page into mmsrv's own VSpace
-        let pool_page = super::self_mmap(1);
+        // Map the pool Frame cap into mmsrv's own VSpace.
+        // Must map the SAME physical frame the kernel will use, not a fresh one.
+        let pool_page = super::self_map_frame(pool_frame);
         if pool_page.is_null() {
             invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
             invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
@@ -160,14 +163,24 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
             return false;
         }
 
-        // Map ring page into mmsrv's own VSpace
-        let ring_page = super::self_mmap(1);
+        // Map the ring Frame cap into mmsrv's own VSpace.
+        let ring_page = super::self_map_frame(ring_frame);
         if ring_page.is_null() {
             invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
             invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
             invoke::cnode_delete(super::CAP_SELF_CSPACE, notif_cap);
             return false;
         }
+
+        // Allocate pool_slot_caps tracking array (1 page = 512 u64 entries >= 510)
+        let slot_caps_page = super::self_mmap(1);
+        if slot_caps_page.is_null() {
+            invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
+            invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
+            invoke::cnode_delete(super::CAP_SELF_CSPACE, notif_cap);
+            return false;
+        }
+        let pool_slot_caps = slot_caps_page as *mut Cap;
 
         // Allocate a temporary CNode to hold the initial frame caps.
         // We need a CNode with at least POOL_INITIAL_FILL slots.
@@ -188,9 +201,10 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
             return false;
         }
 
-        // Retype POOL_INITIAL_FILL frame caps into the temp CNode
+        // Retype POOL_INITIAL_FILL frame caps and copy them into the temp CNode.
+        // Use cnode_copy so originals stay in mmsrv's CSpace (refcount=2).
+        // When the temp CNode is deleted, only the copies are dropped (refcount→1).
         let mut filled: usize = 0;
-        let mut frame_caps = [0u64; POOL_INITIAL_FILL];
         for i in 0..POOL_INITIAL_FILL {
             let slot = match salty::slot_alloc::slot_alloc() {
                 Some(s) => s,
@@ -199,16 +213,18 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
             if super::retype_any(OBJ_FRAME, 0, slot) != 0 {
                 break;
             }
-            // Move the frame cap into the temp CNode at slot i
-            let err = invoke::cnode_move(
-                temp_cnode, i as u64,
+            // Copy the frame cap into the temp CNode at slot i
+            let err = invoke::cnode_copy(
                 super::CAP_SELF_CSPACE, slot,
+                temp_cnode, i as u64,
+                0,
             );
             if err != 0 {
                 invoke::cnode_delete(super::CAP_SELF_CSPACE, slot);
                 break;
             }
-            frame_caps[i] = slot;
+            // Track in pool_slot_caps by ring index
+            *pool_slot_caps.add(i) = slot;
             filled += 1;
         }
 
@@ -263,11 +279,13 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
         (*pool_slot).notif_cap = notif_cap;
         (*pool_slot).pool_page = pool_page;
         (*pool_slot).ring_page = ring_page;
-        (*pool_slot).frame_caps = frame_caps;
+        (*pool_slot).pool_slot_caps = pool_slot_caps;
         (*pool_slot).fill_count = filled as u16;
         (*pool_slot).active = true;
 
-        // Clean up temp CNode (caps have been consumed by the kernel)
+        // Delete temp CNode. The kernel read phys_addrs from the copies;
+        // destroying the CNode drops the copies (refcount→1), originals
+        // in mmsrv's CSpace stay valid.
         invoke::cnode_delete(super::CAP_SELF_CSPACE, temp_cnode);
 
         {
@@ -286,7 +304,8 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
 
 /// Drain notification ring entries for a given client.
 /// Reads consumed-pool-entry records from the ring page, clears COW bits
-/// in the corresponding client regions, and returns the number of entries drained.
+/// in the corresponding client regions, transfers Frame caps from
+/// pool_slot_caps to region.frame_caps, and returns the number of entries drained.
 pub(crate) unsafe fn drain_notifications(client: *mut MmClient, pool: *mut VSpacePool) -> usize {
     unsafe {
         if !(*pool).active || (*pool).ring_page.is_null() {
@@ -324,6 +343,55 @@ pub(crate) unsafe fn drain_notifications(client: *mut MmClient, pool: *mut VSpac
             if !region.is_null() {
                 let page_idx = ((vaddr - (*region).base) / 4096) as usize;
                 clear_cow_bit(region, page_idx);
+
+                // Transfer the pool's Frame cap to region.frame_caps so that
+                // munmap/deregister can clean up pool-resolved pages.
+                let pool_idx = entry.pool_idx as usize;
+                let slot_idx = pool_idx % POOL_ENTRY_COUNT;
+                if !(*pool).pool_slot_caps.is_null() {
+                    let cap = *(*pool).pool_slot_caps.add(slot_idx);
+                    if cap != 0 {
+                        // Grow frame_caps if needed
+                        if page_idx >= (*region).frame_cap_capacity as usize {
+                            let old_cap = (*region).frame_cap_capacity as usize;
+                            let required = page_idx + 1;
+                            let growth = if old_cap < 128 {
+                                if old_cap == 0 { 8 } else { old_cap }
+                            } else if old_cap < 1024 {
+                                old_cap / 2
+                            } else {
+                                256
+                            };
+                            let new_cap = core::cmp::max(required, old_cap + growth);
+                            let new_fcaps = super::grow_frame_cap_array(
+                                (*region).frame_caps,
+                                old_cap,
+                                new_cap,
+                            );
+                            if !new_fcaps.is_null() {
+                                (*region).frame_caps = new_fcaps;
+                                (*region).frame_cap_capacity = new_cap as u16;
+                            }
+                        }
+
+                        if page_idx < (*region).frame_cap_capacity as usize
+                            && !(*region).frame_caps.is_null()
+                        {
+                            let old = *(*region).frame_caps.add(page_idx);
+                            if old != 0 {
+                                invoke::cnode_delete(super::CAP_SELF_CSPACE, old);
+                            }
+                            *(*region).frame_caps.add(page_idx) = cap;
+                            *(*pool).pool_slot_caps.add(slot_idx) = 0;
+
+                            // Update frame_count high water mark
+                            let needed = (page_idx + 1) as u16;
+                            if needed > (*region).frame_count {
+                                (*region).frame_count = needed;
+                            }
+                        }
+                    }
+                }
             }
 
             current_tail = current_tail.wrapping_add(1);
@@ -346,17 +414,21 @@ pub(crate) unsafe fn replenish_pool(client: *mut MmClient, pool: *mut VSpacePool
             return;
         }
 
-        // Read current pool head/tail to figure out how many entries are free
+        // Read current pool head/tail to figure out how many entries are free.
+        // head and tail are monotonic u16 values (mod 2^16), not bounded to
+        // 0..510. Use wrapping subtraction for correct occupancy.
         let pool_base = (*pool).pool_page;
         let head_ptr = pool_base as *const u16;
         let tail_ptr = pool_base.add(2) as *const u16;
 
         // SAFETY: pool_page points to a valid mapped page with CowPool layout.
-        let head = core::ptr::read_volatile(head_ptr) as usize;
-        let tail = core::ptr::read_volatile(tail_ptr) as usize;
+        let head_raw = core::ptr::read_volatile(head_ptr);
+        let tail_raw = core::ptr::read_volatile(tail_ptr);
 
-        // Available space in the ring
-        let used = if tail >= head { tail - head } else { POOL_ENTRY_COUNT - head + tail };
+        let used = tail_raw.wrapping_sub(head_raw) as usize;
+        if used >= POOL_ENTRY_COUNT {
+            return;
+        }
         let free = POOL_ENTRY_COUNT - used - 1; // -1 to avoid head==tail ambiguity
 
         if free == 0 {
@@ -384,10 +456,21 @@ pub(crate) unsafe fn replenish_pool(client: *mut MmClient, pool: *mut VSpacePool
             if super::retype_any(OBJ_FRAME, 0, slot) != 0 {
                 break;
             }
-            let err = invoke::cnode_move(temp_cnode, i as u64, super::CAP_SELF_CSPACE, slot);
+            // Copy into temp CNode; original stays in mmsrv's CSpace.
+            let err = invoke::cnode_copy(
+                super::CAP_SELF_CSPACE, slot,
+                temp_cnode, i as u64,
+                0,
+            );
             if err != 0 {
                 invoke::cnode_delete(super::CAP_SELF_CSPACE, slot);
                 break;
+            }
+            // Track in pool_slot_caps at the ring index this entry will occupy.
+            // The kernel appends at current tail, so entry i lands at (tail + i) % 510.
+            if !(*pool).pool_slot_caps.is_null() {
+                let ring_idx = (tail_raw.wrapping_add(i as u16) as usize) % POOL_ENTRY_COUNT;
+                *(*pool).pool_slot_caps.add(ring_idx) = slot;
             }
             filled += 1;
         }
@@ -401,13 +484,59 @@ pub(crate) unsafe fn replenish_pool(client: *mut MmClient, pool: *mut VSpacePool
                 lb.hex(err as u64);
                 lb.str(b"\n");
                 lb.flush();
-                // Clean up temp CNode contents on failure
+                // Clean up originals in mmsrv's CSpace on failure
+                for i in 0..filled {
+                    if !(*pool).pool_slot_caps.is_null() {
+                        let ring_idx = (tail_raw.wrapping_add(i as u16) as usize) % POOL_ENTRY_COUNT;
+                        let cap = *(*pool).pool_slot_caps.add(ring_idx);
+                        if cap != 0 {
+                            invoke::cnode_delete(super::CAP_SELF_CSPACE, cap);
+                            *(*pool).pool_slot_caps.add(ring_idx) = 0;
+                        }
+                    }
+                }
+                // Clean up temp CNode contents
                 for i in 0..filled {
                     invoke::cnode_delete(temp_cnode, i as u64);
                 }
             }
         }
 
+        // Delete temp CNode (drops copies, originals stay at refcount=1)
         invoke::cnode_delete(super::CAP_SELF_CSPACE, temp_cnode);
+    }
+}
+
+/// Tear down a VSpace pool, cleaning up all associated capabilities.
+/// Called from handle_mm_deregister before deleting the client's VSpace cap.
+pub(crate) unsafe fn teardown_pool(vspace_cap: Cap) {
+    unsafe {
+        let pool = find_pool_by_vspace(vspace_cap);
+        if pool.is_null() || !(*pool).active {
+            return;
+        }
+
+        // Delete unconsumed pool entry Frame caps
+        if !(*pool).pool_slot_caps.is_null() {
+            for i in 0..POOL_ENTRY_COUNT {
+                let cap = *(*pool).pool_slot_caps.add(i);
+                if cap != 0 {
+                    invoke::cnode_delete(super::CAP_SELF_CSPACE, cap);
+                }
+            }
+        }
+
+        // Delete pool infrastructure caps
+        if (*pool).pool_frame != 0 {
+            invoke::cnode_delete(super::CAP_SELF_CSPACE, (*pool).pool_frame);
+        }
+        if (*pool).ring_frame != 0 {
+            invoke::cnode_delete(super::CAP_SELF_CSPACE, (*pool).ring_frame);
+        }
+        if (*pool).notif_cap != 0 {
+            invoke::cnode_delete(super::CAP_SELF_CSPACE, (*pool).notif_cap);
+        }
+
+        *pool = VSpacePool::zeroed();
     }
 }

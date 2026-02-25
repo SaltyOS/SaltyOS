@@ -1625,6 +1625,11 @@ impl VSpace {
         let irq = unsafe { save_irq_disable() };
         self.lock.lock();
 
+        // Captured outside the lock critical section to avoid
+        // lock ordering violation: signal() → enqueue() → scheduler.lock_state,
+        // but VSpace.lock must nest INSIDE scheduler.lock_state.
+        let mut signal_ntfn: *mut crate::ipc::Notification = core::ptr::null_mut();
+
         let result = (|| {
             let entry = self.read_entry(page_vaddr, 1).ok_or(VSpaceError::NotMapped)?;
             if entry & ENTRY_PRESENT == 0 || entry & ENTRY_COW == 0 {
@@ -1678,18 +1683,25 @@ impl VSpace {
                     // SAFETY: cow_notif_phys was set via validated Frame cap.
                     let ring = phys_to_virt(self.cow_notif_phys) as *mut CowNotifRing;
                     let ring_head = (*ring).head.load(Ordering::Relaxed);
-                    let ring_idx = (ring_head % 510) as usize;
-                    (*ring).entries[ring_idx] = CowNotifEntry {
-                        vaddr_page: (page_vaddr >> 12) as u32,
-                        pool_idx: head,
-                        _pad: 0,
-                    };
-                    (*ring).head.store(ring_head.wrapping_add(1), Ordering::Release);
+                    let ring_tail = (*ring).tail.load(Ordering::Acquire);
 
-                    // Signal mmsrv notification
+                    // Ring-full check: if all 510 slots are occupied, skip the
+                    // ring write. COW resolution is still correct in the PTE;
+                    // mmsrv will discover the stale pool entry on next drain.
+                    let ring_used = ring_head.wrapping_sub(ring_tail);
+                    if ring_used < 510 {
+                        let ring_idx = (ring_head % 510) as usize;
+                        (*ring).entries[ring_idx] = CowNotifEntry {
+                            vaddr_page: (page_vaddr >> 12) as u32,
+                            pool_idx: head,
+                            _pad: 0,
+                        };
+                        (*ring).head.store(ring_head.wrapping_add(1), Ordering::Release);
+                    }
+
+                    // Capture notification pointer; signal after lock release.
                     if !self.cow_notif_ntfn.is_null() {
-                        // SAFETY: cow_notif_ntfn was set via validated Notification cap.
-                        (*self.cow_notif_ntfn).signal(1);
+                        signal_ntfn = self.cow_notif_ntfn;
                     }
                 }
             }
@@ -1698,6 +1710,18 @@ impl VSpace {
         })();
 
         self.lock.unlock();
+
+        // Signal mmsrv outside VSpace.lock to maintain lock ordering:
+        // signal() may acquire scheduler.lock_state which must not nest
+        // inside VSpace.lock.
+        if !signal_ntfn.is_null() {
+            if let Ok(true) = result {
+                // SAFETY: cow_notif_ntfn was set via validated Notification cap
+                // and remains valid for the lifetime of the VSpace.
+                unsafe { (*signal_ntfn).signal(1) };
+            }
+        }
+
         unsafe { restore_irq(irq) };
         result
     }
