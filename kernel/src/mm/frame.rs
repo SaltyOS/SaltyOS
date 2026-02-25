@@ -304,20 +304,6 @@ impl FrameAllocator {
         self.next_free = frame + 1;
     }
 
-    /// Query diagnostic state for a physical frame (bitmap free bit + refcounts).
-    ///
-    /// Returns `(is_free, map_refs, obj_refs, reclaimable)`.
-    pub fn query_debug(&self, addr: PhysAddr) -> (bool, u16, u16, u8) {
-        let frame = (addr as usize) / PAGE_SIZE;
-        if frame >= self.total {
-            return (true, 0, 0, 0);
-        }
-        let idx = frame / 64;
-        let bit = frame % 64;
-        let is_free = self.bitmap[idx] & (1u64 << bit) != 0;
-        (is_free, self.map_refs[frame], self.obj_refs[frame], self.reclaimable[frame])
-    }
-
     fn find_free_frame_in_range(&self, start: usize, end: usize) -> Option<usize> {
         if start >= end {
             return None;

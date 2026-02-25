@@ -302,22 +302,6 @@ pub fn remap_frame_bitmap() {
     crate::serial_puts("[MM] Frame bitmap remapped to direct physical map\n");
 }
 
-/// Query diagnostic state for a physical frame (SMP-safe).
-///
-/// Returns `(is_free, map_refs, obj_refs, reclaimable)`.
-pub fn query_frame_debug(addr: PhysAddr) -> (bool, u16, u16, u8) {
-    let irq_flag = unsafe { save_irq_disable() };
-    FRAME_LOCK.lock();
-    let result = unsafe {
-        match (*(&raw const FRAME_ALLOCATOR)).as_ref() {
-            Some(a) => a.query_debug(addr),
-            None => (true, 0, 0, 0),
-        }
-    };
-    FRAME_LOCK.unlock();
-    unsafe { restore_irq(irq_flag) };
-    result
-}
 
 /// Get the number of free physical frames (SMP-safe)
 pub fn free_frame_count() -> usize {
