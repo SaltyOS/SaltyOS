@@ -278,6 +278,42 @@ pub fn vspace_map_demand(vspace: Cap, vaddr: u64, flags: u64) -> i32 {
     invoke(vspace, VSPACE_MAP_DEMAND, vaddr, flags, 0, 0).error as i32
 }
 
+/// Resolve a COW fault using a caller-provided frame.
+///
+/// Called by mmsrv when a VMFault indicates a COW page (write to present page).
+/// The kernel copies the old page contents to `new_frame` and updates the PTE.
+///
+/// Returns SALTY_OK on success, SALTY_ALREADY_EXISTS if already resolved (race),
+/// SALTY_NOT_FOUND if page not present, SALTY_OUT_OF_MEMORY on failure.
+pub fn vspace_cow_resolve(vspace: Cap, vaddr: u64, new_frame: Cap, flags: u64) -> i32 {
+    invoke(vspace, VSPACE_COW_RESOLVE, vaddr, new_frame, flags, 0).error as i32
+}
+
+/// Configure a pre-allocated frame pool for kernel-side COW fast-path.
+///
+/// The kernel walks `src_cnode` slots 0..count-1, extracts physical addresses
+/// from each Frame cap, and writes them to the pool page. This avoids exposing
+/// physical addresses to userland.
+pub fn vspace_set_cow_pool(vspace: Cap, pool_frame: Cap, src_cnode: Cap, count: u64) -> i32 {
+    invoke(vspace, VSPACE_SET_COW_POOL, pool_frame, src_cnode, count, 0).error as i32
+}
+
+/// Configure the notification ring for COW fast-path feedback.
+///
+/// When the kernel consumes a pool entry, it writes to the ring page and
+/// signals the notification, allowing mmsrv to update tracking and replenish.
+pub fn vspace_set_cow_notif(vspace: Cap, ring_frame: Cap, notif: Cap) -> i32 {
+    invoke(vspace, VSPACE_SET_COW_NOTIF, ring_frame, notif, 0, 0).error as i32
+}
+
+/// Replenish consumed pool entries with new Frame caps.
+///
+/// The kernel walks `src_cnode` slots start_slot..start_slot+count, extracts
+/// physical addresses, and appends them to the pool page.
+pub fn vspace_replenish_cow_pool(vspace: Cap, src_cnode: Cap, start_slot: u64, count: u64) -> i32 {
+    invoke(vspace, VSPACE_REPLENISH_COW_POOL, src_cnode, start_slot, count, 0).error as i32
+}
+
 /// Install demand-page PTEs for a contiguous range.
 ///
 /// Returns (error, pages_mapped). On success error==0 and pages_mapped==count.

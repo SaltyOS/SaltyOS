@@ -5,7 +5,7 @@
 use super::{alloc_frame, phys_to_virt, PhysAddr, SpinLock, VirtAddr, PAGE_SIZE};
 use crate::arch::x86_64::paging::PageTable;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 /// Page table entry flag bits
 const ENTRY_PRESENT: u64 = 1 << 0;
@@ -616,6 +616,47 @@ fn irqs_disabled() -> bool {
     (rflags & (1 << 9)) == 0
 }
 
+/// Lock-free SPSC ring: mmsrv produces pre-allocated frames, kernel consumes during COW fast-path.
+/// Fits in a single 4K page.
+#[repr(C)]
+pub struct CowPool {
+    /// Next entry for kernel to consume
+    pub head: AtomicU16,
+    /// Entries filled up to here by mmsrv
+    pub tail: AtomicU16,
+    _pad: [u8; 4],
+    /// Pre-allocated frame physical addresses
+    pub entries: [CowPoolEntry; 510],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CowPoolEntry {
+    pub phys_addr: u64,
+}
+
+/// Kernel produces -> mmsrv consumes: records which pool entries were used and for what vaddr.
+/// Fits in a single 4K page.
+#[repr(C)]
+pub struct CowNotifRing {
+    /// Next entry for kernel to write
+    pub head: AtomicU32,
+    /// Next entry for mmsrv to read
+    pub tail: AtomicU32,
+    /// Notification entries
+    pub entries: [CowNotifEntry; 510],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CowNotifEntry {
+    /// Virtual address >> 12 (supports 44-bit address space)
+    pub vaddr_page: u32,
+    /// Which pool entry was consumed
+    pub pool_idx: u16,
+    _pad: u16,
+}
+
 /// Virtual address space (wraps page table root)
 #[repr(C)]
 pub struct VSpace {
@@ -629,6 +670,12 @@ pub struct VSpace {
     tracking: *mut VSpaceTracking,
     /// Per-VSpace lock for page table modifications (map/unmap/install_page_table)
     lock: SpinLock,
+    /// Physical address of CowPool page (0 = pool disabled)
+    cow_pool_phys: PhysAddr,
+    /// Physical address of CowNotifRing page
+    cow_notif_phys: PhysAddr,
+    /// Notification object to signal mmsrv after pool consumption
+    cow_notif_ntfn: *mut crate::ipc::Notification,
 }
 
 impl VSpace {
@@ -649,6 +696,9 @@ impl VSpace {
             root: pml4_addr,
             tracking,
             lock: SpinLock::new(),
+            cow_pool_phys: 0,
+            cow_notif_phys: 0,
+            cow_notif_ntfn: core::ptr::null_mut(),
         }
     }
 
@@ -658,6 +708,26 @@ impl VSpace {
 
     pub fn tracking(&self) -> &VSpaceTracking {
         unsafe { &*self.tracking }
+    }
+
+    /// Get the COW pool physical address (0 if not configured).
+    pub fn cow_pool_phys(&self) -> PhysAddr {
+        self.cow_pool_phys
+    }
+
+    /// Set the COW pool physical address.
+    pub fn set_cow_pool_phys(&mut self, phys: PhysAddr) {
+        self.cow_pool_phys = phys;
+    }
+
+    /// Configure the COW notification ring and notification object.
+    pub fn set_cow_notif(
+        &mut self,
+        ring_phys: PhysAddr,
+        ntfn: *mut crate::ipc::Notification,
+    ) {
+        self.cow_notif_phys = ring_phys;
+        self.cow_notif_ntfn = ntfn;
     }
 
     /// Extract PML4 index from virtual address
@@ -1447,6 +1517,182 @@ impl VSpace {
 
             super::retain_frame_mapping(new_phys);
             super::release_frame_mapping(old_phys);
+
+            Ok(true)
+        })();
+
+        self.lock.unlock();
+        unsafe { restore_irq(irq) };
+        result
+    }
+
+    /// Resolve a COW fault using a caller-provided physical frame.
+    ///
+    /// Called by mmsrv via VSPACE_COW_RESOLVE invoke. The physical frame
+    /// comes from a Frame capability (untyped-owned), so lifetime is
+    /// managed by the capability system, not the kernel frame allocator.
+    ///
+    /// Returns:
+    /// - `Ok(())` on success (COW resolved, old content copied to new_phys)
+    /// - `Err(NotMapped)` if page is not present
+    /// - `Err(AlreadyMapped)` if page is present but NOT COW (already resolved)
+    /// - `Err(OutOfMemory)` if write_entry fails
+    pub fn resolve_cow_with_frame(
+        &mut self,
+        vaddr: VirtAddr,
+        new_phys: PhysAddr,
+        _flags: PageFlags,
+    ) -> Result<(), VSpaceError> {
+        let page_vaddr = vaddr & !((PAGE_SIZE as u64) - 1);
+
+        let irq = unsafe { save_irq_disable() };
+        self.lock.lock();
+
+        let result = (|| {
+            let entry = self.read_entry(page_vaddr, 1).ok_or(VSpaceError::NotMapped)?;
+
+            // Not present -> NotMapped
+            if entry & ENTRY_PRESENT == 0 {
+                return Err(VSpaceError::NotMapped);
+            }
+
+            // Present but not COW -> already resolved (race with another CPU)
+            if entry & ENTRY_COW == 0 {
+                return Err(VSpaceError::AlreadyMapped);
+            }
+
+            let old_phys = entry & ENTRY_ADDR_MASK;
+
+            // Copy 4K page content from old to new frame
+            unsafe {
+                // SAFETY: Both physical addresses are valid page-aligned frames.
+                // old_phys is the existing mapped frame, new_phys comes from a
+                // validated Frame capability. phys_to_virt returns the direct-map
+                // virtual address for kernel access.
+                let src = phys_to_virt(old_phys) as *const u8;
+                let dst = phys_to_virt(new_phys) as *mut u8;
+                core::ptr::copy_nonoverlapping(src, dst, PAGE_SIZE);
+            }
+
+            // Build new PTE: set WRITABLE, clear COW, use new physical address
+            let mut new_flags = entry & !ENTRY_ADDR_MASK;
+            new_flags |= ENTRY_WRITABLE;
+            new_flags &= !ENTRY_COW;
+
+            if self.write_entry(page_vaddr, 1, new_phys | new_flags).is_err() {
+                return Err(VSpaceError::NotMapped);
+            }
+
+            // TLB invalidation BEFORE refcount changes
+            crate::arch::x86_64::paging::invlpg(page_vaddr);
+            self.tlb_shootdown(page_vaddr);
+
+            // Update frame mapping refcounts
+            super::retain_frame_mapping(new_phys);
+            super::release_frame_mapping(old_phys);
+
+            Ok(())
+        })();
+
+        self.lock.unlock();
+        unsafe { restore_irq(irq) };
+        result
+    }
+
+    /// Fast-path COW resolution using a pre-allocated frame pool.
+    ///
+    /// Returns:
+    /// - `Ok(true)` -- COW resolved via pool (fast path)
+    /// - `Ok(false)` -- pool not configured or empty (fall through to mmsrv IPC)
+    /// - `Err(...)` -- fault is not a COW fault
+    pub fn handle_cow_fault_pooled(
+        &mut self,
+        fault_addr: VirtAddr,
+        error_code: u64,
+    ) -> Result<bool, VSpaceError> {
+        // Must be a present + write + user page fault
+        if (error_code & 0x7) != 0x7 {
+            return Ok(false);
+        }
+
+        // Pool not configured -- fall through to mmsrv IPC
+        if self.cow_pool_phys == 0 {
+            return Ok(false);
+        }
+
+        let page_vaddr = fault_addr & !((PAGE_SIZE as u64) - 1);
+
+        let irq = unsafe { save_irq_disable() };
+        self.lock.lock();
+
+        let result = (|| {
+            let entry = self.read_entry(page_vaddr, 1).ok_or(VSpaceError::NotMapped)?;
+            if entry & ENTRY_PRESENT == 0 || entry & ENTRY_COW == 0 {
+                return Ok(false);
+            }
+
+            // Read pool state
+            unsafe {
+                // SAFETY: cow_pool_phys was set via validated Frame cap in VSPACE_SET_COW_POOL.
+                // The page remains valid for the lifetime of the VSpace.
+                let pool = phys_to_virt(self.cow_pool_phys) as *const CowPool;
+                let head = (*pool).head.load(Ordering::Acquire);
+                let tail = (*pool).tail.load(Ordering::Acquire);
+
+                if head == tail {
+                    // Pool empty -- fall through to mmsrv IPC
+                    return Ok(false);
+                }
+
+                let idx = (head % 510) as usize;
+                let new_phys = (*pool).entries[idx].phys_addr;
+
+                // Advance head (kernel is sole consumer, VSpace lock serializes)
+                // SAFETY: pool is valid and kernel is sole writer of head.
+                (*(pool as *mut CowPool)).head.store(head.wrapping_add(1), Ordering::Release);
+
+                let old_phys = entry & ENTRY_ADDR_MASK;
+
+                // SAFETY: Both frames are valid physical pages accessible via direct map.
+                let src = phys_to_virt(old_phys) as *const u8;
+                let dst = phys_to_virt(new_phys) as *mut u8;
+                core::ptr::copy_nonoverlapping(src, dst, PAGE_SIZE);
+
+                // Update PTE
+                let mut new_flags = entry & !ENTRY_ADDR_MASK;
+                new_flags |= ENTRY_WRITABLE;
+                new_flags &= !ENTRY_COW;
+
+                if self.write_entry(page_vaddr, 1, new_phys | new_flags).is_err() {
+                    return Err(VSpaceError::NotMapped);
+                }
+
+                crate::arch::x86_64::paging::invlpg(page_vaddr);
+                self.tlb_shootdown(page_vaddr);
+
+                super::retain_frame_mapping(new_phys);
+                super::release_frame_mapping(old_phys);
+
+                // Write notification ring entry
+                if self.cow_notif_phys != 0 {
+                    // SAFETY: cow_notif_phys was set via validated Frame cap.
+                    let ring = phys_to_virt(self.cow_notif_phys) as *mut CowNotifRing;
+                    let ring_head = (*ring).head.load(Ordering::Relaxed);
+                    let ring_idx = (ring_head % 510) as usize;
+                    (*ring).entries[ring_idx] = CowNotifEntry {
+                        vaddr_page: (page_vaddr >> 12) as u32,
+                        pool_idx: head,
+                        _pad: 0,
+                    };
+                    (*ring).head.store(ring_head.wrapping_add(1), Ordering::Release);
+
+                    // Signal mmsrv notification
+                    if !self.cow_notif_ntfn.is_null() {
+                        // SAFETY: cow_notif_ntfn was set via validated Notification cap.
+                        (*self.cow_notif_ntfn).signal(1);
+                    }
+                }
+            }
 
             Ok(true)
         })();

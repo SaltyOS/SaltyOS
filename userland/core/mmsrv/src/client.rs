@@ -110,6 +110,92 @@ pub(crate) unsafe fn find_region_by_addr(client: *mut MmClient, addr: u64) -> *m
     }
 }
 
+/// Check whether a specific page in a region is COW-inherited.
+pub(crate) fn is_cow_page(region: *const MmRegion, page_idx: usize) -> bool {
+    // SAFETY: region is a valid pointer from the client's region array.
+    unsafe {
+        let r = &*region;
+        if r.cow_bitmap.is_null() {
+            return false;
+        }
+        let word_idx = page_idx / 64;
+        let bit_idx = page_idx % 64;
+        if word_idx >= r.cow_bitmap_words as usize {
+            return false;
+        }
+        // SAFETY: word_idx is bounds-checked above.
+        (*r.cow_bitmap.add(word_idx) >> bit_idx) & 1 != 0
+    }
+}
+
+/// Mark a page as COW-inherited in the region's bitmap.
+pub(crate) fn set_cow_bit(region: *mut MmRegion, page_idx: usize) {
+    // SAFETY: region is a valid mutable pointer from the client's region array.
+    unsafe {
+        let r = &mut *region;
+        if r.cow_bitmap.is_null() {
+            return;
+        }
+        let word_idx = page_idx / 64;
+        let bit_idx = page_idx % 64;
+        if word_idx >= r.cow_bitmap_words as usize {
+            return;
+        }
+        // SAFETY: word_idx is bounds-checked above.
+        *r.cow_bitmap.add(word_idx) |= 1u64 << bit_idx;
+    }
+}
+
+/// Clear the COW bit for a page (after COW resolution or unmap).
+pub(crate) fn clear_cow_bit(region: *mut MmRegion, page_idx: usize) {
+    // SAFETY: region is a valid mutable pointer from the client's region array.
+    unsafe {
+        let r = &mut *region;
+        if r.cow_bitmap.is_null() {
+            return;
+        }
+        let word_idx = page_idx / 64;
+        let bit_idx = page_idx % 64;
+        if word_idx >= r.cow_bitmap_words as usize {
+            return;
+        }
+        // SAFETY: word_idx is bounds-checked above.
+        *r.cow_bitmap.add(word_idx) &= !(1u64 << bit_idx);
+    }
+}
+
+/// Allocate a COW bitmap for `page_count` pages.
+/// Returns (pointer, word_count) or (null, 0) on failure.
+pub(crate) fn alloc_cow_bitmap(page_count: usize) -> (*mut u64, u16) {
+    let word_count = (page_count + 63) / 64;
+    let byte_count = word_count * 8;
+    // Round up to page boundary for self_mmap
+    let alloc_pages = (byte_count + 4095) / 4096;
+    let alloc_pages = if alloc_pages == 0 { 1 } else { alloc_pages };
+
+    // SAFETY: self_mmap returns zero-initialized memory.
+    let ptr = unsafe { super::self_mmap(alloc_pages) };
+    if ptr.is_null() {
+        return (core::ptr::null_mut(), 0);
+    }
+    (ptr as *mut u64, word_count as u16)
+}
+
+/// Free a COW bitmap from a region (null the pointer).
+pub(crate) fn free_cow_bitmap(region: *mut MmRegion) {
+    // SAFETY: region is a valid mutable pointer.
+    unsafe {
+        let r = &mut *region;
+        if !r.cow_bitmap.is_null() {
+            // In this no_std environment without munmap for self_mmap,
+            // we just null the pointer. The memory is effectively leaked
+            // but bounded (one bitmap per region lifetime).
+            r.cow_bitmap = core::ptr::null_mut();
+            r.cow_bitmap_words = 0;
+        }
+    }
+}
+
 /// MM_REGISTER: init/procmgr registers a new client.
 ///   MR0 = client badge
 ///   MR1 = heap_base
@@ -215,6 +301,7 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const SaltyMsg, _caller_badge: u
                             }
                         }
                     }
+                    free_cow_bitmap(r);
                     (*r).active = false;
                 }
             }

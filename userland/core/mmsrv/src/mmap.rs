@@ -1,5 +1,6 @@
 use crate::types::*;
-use crate::client::{find_client_by_badge, client_add_region, find_region_by_addr};
+use crate::client::{find_client_by_badge, client_add_region, find_region_by_addr,
+                    alloc_cow_bitmap, clear_cow_bit};
 use salty::consts::*;
 use salty::invoke;
 use salty::ipc;
@@ -421,6 +422,8 @@ pub(crate) unsafe fn handle_mm_munmap(msg: *const SaltyMsg, badge: u64, reply: *
             for i in 0..num_pages {
                 let page_idx = region_start_page + i;
                 invoke::vspace_unmap(vspace_cap, base + i as u64 * 4096);
+                // Clear COW bit if set (page was kernel-managed, no cap to delete)
+                clear_cow_bit(region, page_idx);
                 if page_idx < (*region).frame_count as usize {
                     let fcap = *(*region).frame_caps.add(page_idx);
                     if fcap != 0 {
@@ -709,14 +712,52 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const SaltyMsg, _caller_badge:
             if !ptr.is_null() {
                 let child_regions = ptr as *mut MmRegion;
                 for ri in 0..parent_rc {
-                    let pr = &*parent_regions.add(ri);
+                    let pr = parent_regions.add(ri);
                     let mut cr = MmRegion::zeroed();
-                    cr.base = pr.base;
-                    cr.length = pr.length;
-                    cr.prot = pr.prot;
-                    cr.region_type = pr.region_type;
-                    cr.active = pr.active;
+                    cr.base = (*pr).base;
+                    cr.length = (*pr).length;
+                    cr.prot = (*pr).prot;
+                    cr.region_type = (*pr).region_type;
+                    cr.active = (*pr).active;
                     // frame_caps left null -- inherited via kernel COW
+
+                    // Allocate COW bitmap for active child regions.
+                    // After fork, ALL pages in the region are COW-shared:
+                    // the kernel has already downgraded parent PTEs and
+                    // cloned them read-only into the child.
+                    if cr.active && cr.length > 0 {
+                        let page_count = (cr.length / 4096) as usize;
+                        let (bm_ptr, bm_words) = alloc_cow_bitmap(page_count);
+                        if !bm_ptr.is_null() {
+                            cr.cow_bitmap = bm_ptr;
+                            cr.cow_bitmap_words = bm_words;
+                            // Mark all pages as COW
+                            for pi in 0..page_count {
+                                let word_idx = pi / 64;
+                                let bit_idx = pi % 64;
+                                // SAFETY: word_idx < bm_words guaranteed by alloc_cow_bitmap sizing.
+                                *bm_ptr.add(word_idx) |= 1u64 << bit_idx;
+                            }
+                        }
+
+                        // Also allocate COW bitmap for the parent's region so
+                        // the parent knows its frame_caps[i] are stale after
+                        // a COW write fault.
+                        if (*pr).cow_bitmap.is_null() {
+                            let (pbm_ptr, pbm_words) = alloc_cow_bitmap(page_count);
+                            if !pbm_ptr.is_null() {
+                                (*pr).cow_bitmap = pbm_ptr;
+                                (*pr).cow_bitmap_words = pbm_words;
+                                for pi in 0..page_count {
+                                    let word_idx = pi / 64;
+                                    let bit_idx = pi % 64;
+                                    // SAFETY: word_idx < pbm_words.
+                                    *pbm_ptr.add(word_idx) |= 1u64 << bit_idx;
+                                }
+                            }
+                        }
+                    }
+
                     *child_regions.add(ri) = cr;
                 }
                 (*child).regions = child_regions;
@@ -724,6 +765,11 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const SaltyMsg, _caller_badge:
                 (*child).region_cap = child_region_cap;
             }
         }
+
+        // Set up COW frame pools for fast-path resolution (Phase 2).
+        // Non-fatal: if pool setup fails, COW still works via mmsrv IPC.
+        crate::pool::init_pool(child);
+        crate::pool::init_pool(parent);
 
         {
             let mut lb = LineBuf::new();

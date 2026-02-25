@@ -8,9 +8,10 @@ pub mod fastpath;
 
 use crate::cap::{CapError, CapRights, Capability, CNode, FrameObject, IoPortRange, ObjectType, UntypedMemory};
 use crate::ipc::{Endpoint, Message, Notification};
-use crate::mm::{save_irq_disable, restore_irq, SCHED_IPC_LOCK, CAP_LOCK};
-use crate::mm::vspace::{PageFlags, VSpace, VSpaceError};
+use crate::mm::{phys_to_virt, save_irq_disable, restore_irq, SCHED_IPC_LOCK, CAP_LOCK};
+use crate::mm::vspace::{CowNotifRing, CowPool, PageFlags, VSpace, VSpaceError};
 use crate::sched::thread::{BlockedReason, SchedContext, Tcb, ThreadState};
+use core::sync::atomic::Ordering;
 /// System call numbers
 #[repr(u64)]
 pub enum Syscall {
@@ -1352,6 +1353,22 @@ fn syscall_invoke_inner(
             // VSPACE_MAP_DEMAND_RANGE: arg0 = virt_addr, arg1 = count, arg2 = flags_bits
             syscall_vspace_map_demand_range(&cap, arg0, arg1, arg2)
         }
+        (ObjectType::VSpace, 0x5B) => {
+            // VSPACE_COW_RESOLVE: arg0 = virt_addr, arg1 = frame_cap_ptr, arg2 = flags_bits
+            syscall_vspace_cow_resolve(&cap, arg0, arg1, arg2)
+        }
+        (ObjectType::VSpace, 0x5C) => {
+            // VSPACE_SET_COW_POOL: arg0 = pool_frame_cap_ptr, arg1 = src_cnode_cap_ptr, arg2 = count
+            syscall_vspace_set_cow_pool(&cap, arg0, arg1, arg2)
+        }
+        (ObjectType::VSpace, 0x5D) => {
+            // VSPACE_SET_COW_NOTIF: arg0 = ring_frame_cap_ptr, arg1 = notif_cap_ptr
+            syscall_vspace_set_cow_notif(&cap, arg0, arg1)
+        }
+        (ObjectType::VSpace, 0x5E) => {
+            // VSPACE_REPLENISH_COW_POOL: arg0 = src_cnode_cap_ptr, arg1 = start_slot, arg2 = count
+            syscall_vspace_replenish_cow_pool(&cap, arg0, arg1, arg2)
+        }
 
         // SchedContext operations
         (ObjectType::SchedContext, 0x30) => {
@@ -2667,6 +2684,281 @@ fn syscall_vspace_map_demand_range(
             Err(e) => SyscallResult::err(syscall_error_from_vspace_error(e)),
         }
     }
+}
+
+/// VSPACE_COW_RESOLVE: Resolve a COW fault using a provided frame
+///
+/// Called by mmsrv when a VMFault indicates a COW page.
+/// The frame capability provides the physical memory for the copy.
+///
+/// Args:
+/// - virt_addr: Virtual address of the COW page to resolve
+/// - frame_cap_ptr: Capability pointer to the new frame
+/// - flags_bits: Mapping flags (currently preserved from existing PTE)
+fn syscall_vspace_cow_resolve(
+    cap: &Capability,
+    virt_addr: u64,
+    frame_cap_ptr: u64,
+    flags_bits: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::MAP) {
+        return SyscallResult::err(e);
+    }
+
+    let frame_cap = match lookup_cap_locked(frame_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(&frame_cap, ObjectType::Frame, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        // SAFETY: cap.object was validated as VSpace type above.
+        // frame_cap.object was validated as Frame type above.
+        let frame = &*(frame_cap.object as *const FrameObject);
+        let vspace = &mut *(cap.object as *mut VSpace);
+
+        let flags = PageFlags {
+            writable: flags_bits & 1 != 0,
+            user: flags_bits & 2 != 0,
+            executable: flags_bits & 4 != 0,
+            cache_disable: flags_bits & 8 != 0,
+            write_through: flags_bits & 16 != 0,
+            cow: flags_bits & 32 != 0,
+        };
+
+        match vspace.resolve_cow_with_frame(virt_addr, frame.phys_addr, flags) {
+            Ok(()) => SyscallResult::ok(0),
+            Err(e) => SyscallResult::err(syscall_error_from_vspace_error(e)),
+        }
+    }
+}
+
+/// VSPACE_SET_COW_POOL: Initialize the COW frame pool for a VSpace.
+///
+/// Registers a pool page and pre-populates it with frame physical addresses
+/// from a CNode containing Frame capabilities.
+///
+/// Args:
+/// - pool_frame_cap_ptr: Capability pointer to the pool page (Frame)
+/// - src_cnode_cap_ptr: Capability pointer to CNode with Frame caps in slots 0..count-1
+/// - count: Number of initial frame entries
+fn syscall_vspace_set_cow_pool(
+    cap: &Capability,
+    pool_frame_cap_ptr: u64,
+    src_cnode_cap_ptr: u64,
+    count: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::MAP) {
+        return SyscallResult::err(e);
+    }
+
+    if count > 510 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    let pool_frame_cap = match lookup_cap_locked(pool_frame_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(&pool_frame_cap, ObjectType::Frame, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        // SAFETY: pool_frame_cap.object was validated as Frame type above.
+        let pool_frame = &*(pool_frame_cap.object as *const FrameObject);
+        let pool_phys = pool_frame.phys_addr;
+
+        // Walk CNode slots under CAP_LOCK to extract frame physical addresses
+        let irq = save_irq_disable();
+        CAP_LOCK.lock();
+
+        let src_cnode_cap = match lookup_capability(src_cnode_cap_ptr) {
+            Ok(c) => c,
+            Err(e) => {
+                CAP_LOCK.unlock();
+                restore_irq(irq);
+                return SyscallResult::err(e);
+            }
+        };
+        if let Err(e) = validate_capability(src_cnode_cap, ObjectType::CNode, CapRights::READ) {
+            CAP_LOCK.unlock();
+            restore_irq(irq);
+            return SyscallResult::err(e);
+        }
+
+        let src_cnode = &*(src_cnode_cap.object as *const CNode);
+
+        // SAFETY: pool_phys is a validated Frame physical address.
+        // phys_to_virt returns the direct-map kernel virtual address.
+        let pool = phys_to_virt(pool_phys) as *mut CowPool;
+
+        for i in 0..count as usize {
+            let frame_cap = match src_cnode.get(i) {
+                Some(c) => c,
+                None => {
+                    CAP_LOCK.unlock();
+                    restore_irq(irq);
+                    return SyscallResult::err(SyscallError::InvalidCapability);
+                }
+            };
+            if frame_cap.obj_type != ObjectType::Frame || frame_cap.object.is_null() {
+                CAP_LOCK.unlock();
+                restore_irq(irq);
+                return SyscallResult::err(SyscallError::InvalidCapability);
+            }
+            let frame_obj = &*(frame_cap.object as *const FrameObject);
+            (*pool).entries[i].phys_addr = frame_obj.phys_addr;
+        }
+
+        (*pool).head.store(0, Ordering::Release);
+        (*pool).tail.store(count as u16, Ordering::Release);
+
+        CAP_LOCK.unlock();
+        restore_irq(irq);
+
+        // Store pool phys in VSpace
+        let vspace = &mut *(cap.object as *mut VSpace);
+        vspace.set_cow_pool_phys(pool_phys);
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// VSPACE_SET_COW_NOTIF: Configure the COW notification ring and notification object.
+///
+/// Args:
+/// - ring_frame_cap_ptr: Capability pointer to the notification ring page (Frame)
+/// - notif_cap_ptr: Capability pointer to a Notification object
+fn syscall_vspace_set_cow_notif(
+    cap: &Capability,
+    ring_frame_cap_ptr: u64,
+    notif_cap_ptr: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::MAP) {
+        return SyscallResult::err(e);
+    }
+
+    let ring_frame_cap = match lookup_cap_locked(ring_frame_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(&ring_frame_cap, ObjectType::Frame, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    let notif_cap = match lookup_cap_locked(notif_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(&notif_cap, ObjectType::Notification, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        // SAFETY: ring_frame_cap.object was validated as Frame type above.
+        let ring_frame = &*(ring_frame_cap.object as *const FrameObject);
+        let ring_phys = ring_frame.phys_addr;
+
+        // SAFETY: notif_cap.object was validated as Notification type above.
+        let notif_ptr = notif_cap.object as *mut Notification;
+
+        // Initialize the ring
+        let ring = phys_to_virt(ring_phys) as *mut CowNotifRing;
+        (*ring).head.store(0, Ordering::Release);
+        (*ring).tail.store(0, Ordering::Release);
+
+        // Store in VSpace
+        let vspace = &mut *(cap.object as *mut VSpace);
+        vspace.set_cow_notif(ring_phys, notif_ptr);
+    }
+
+    SyscallResult::ok(0)
+}
+
+/// VSPACE_REPLENISH_COW_POOL: Add more pre-allocated frames to the COW pool.
+///
+/// Called by mmsrv after consuming notification ring entries to refill the pool.
+///
+/// Args:
+/// - src_cnode_cap_ptr: Capability pointer to CNode with Frame caps
+/// - start_slot: First slot index in the CNode
+/// - count: Number of frames to add
+fn syscall_vspace_replenish_cow_pool(
+    cap: &Capability,
+    src_cnode_cap_ptr: u64,
+    start_slot: u64,
+    count: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::MAP) {
+        return SyscallResult::err(e);
+    }
+
+    if count > 510 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    unsafe {
+        let vspace = &*(cap.object as *const VSpace);
+        let pool_phys = vspace.cow_pool_phys();
+        if pool_phys == 0 {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+
+        // Walk CNode slots under CAP_LOCK
+        let irq = save_irq_disable();
+        CAP_LOCK.lock();
+
+        let src_cnode_cap = match lookup_capability(src_cnode_cap_ptr) {
+            Ok(c) => c,
+            Err(e) => {
+                CAP_LOCK.unlock();
+                restore_irq(irq);
+                return SyscallResult::err(e);
+            }
+        };
+        if let Err(e) = validate_capability(src_cnode_cap, ObjectType::CNode, CapRights::READ) {
+            CAP_LOCK.unlock();
+            restore_irq(irq);
+            return SyscallResult::err(e);
+        }
+
+        let src_cnode = &*(src_cnode_cap.object as *const CNode);
+
+        // SAFETY: pool_phys was validated during VSPACE_SET_COW_POOL.
+        let pool = phys_to_virt(pool_phys) as *mut CowPool;
+        let current_tail = (*pool).tail.load(Ordering::Acquire);
+
+        for i in 0..count as usize {
+            let slot_idx = start_slot as usize + i;
+            let frame_cap = match src_cnode.get(slot_idx) {
+                Some(c) => c,
+                None => {
+                    CAP_LOCK.unlock();
+                    restore_irq(irq);
+                    return SyscallResult::err(SyscallError::InvalidCapability);
+                }
+            };
+            if frame_cap.obj_type != ObjectType::Frame || frame_cap.object.is_null() {
+                CAP_LOCK.unlock();
+                restore_irq(irq);
+                return SyscallResult::err(SyscallError::InvalidCapability);
+            }
+            let frame_obj = &*(frame_cap.object as *const FrameObject);
+            let pool_idx = (current_tail.wrapping_add(i as u16) % 510) as usize;
+            (*pool).entries[pool_idx].phys_addr = frame_obj.phys_addr;
+        }
+
+        // Advance tail by count
+        (*pool).tail.store(current_tail.wrapping_add(count as u16), Ordering::Release);
+
+        CAP_LOCK.unlock();
+        restore_irq(irq);
+    }
+
+    SyscallResult::ok(0)
 }
 
 /// IRQ_CONTROL_GET: Acquire an IRQ handler capability
