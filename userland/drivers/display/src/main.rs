@@ -113,6 +113,96 @@ struct DisplayState {
     osc_saw_esc: bool,
     // REP support
     last_printed_char: u8,
+    // Cell buffer for character-level storage (enables DECSCNM repaint)
+    cells: *mut Cell,
+    alt_cells: *mut Cell,
+}
+
+/// Per-cell storage for character-level terminal state.
+/// Enables full-screen repaint when DECSCNM (reverse video mode) toggles.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Cell {
+    ch: u8,
+    charset: u8, // 0=ASCII, 1=DEC Graphics
+    flags: u8,   // bit 0=bold, 1=reverse, 2=dim, 3=underline, 4=italic, 5=hidden, 6=strikethrough
+    _pad: u8,
+    fg: u32,
+    bg: u32,
+}
+
+impl Cell {
+    const fn blank(fg: u32, bg: u32) -> Self {
+        Cell { ch: b' ', charset: 0, flags: 0, _pad: 0, fg, bg }
+    }
+}
+
+fn cell_idx(state: &DisplayState, col: u32, row: u32) -> usize {
+    (row * state.max_cols + col) as usize
+}
+
+fn cell_put(state: &mut DisplayState, col: u32, row: u32, ch: u8) {
+    if col >= state.max_cols || row >= state.max_rows || state.cells.is_null() {
+        return;
+    }
+    let charset_id = if state.active_charset == 0 { state.g0_charset } else { state.g1_charset };
+    let flags = (state.bold as u8)
+        | ((state.reverse_video as u8) << 1)
+        | ((state.dim as u8) << 2)
+        | ((state.underline as u8) << 3)
+        | ((state.italic as u8) << 4)
+        | ((state.hidden as u8) << 5)
+        | ((state.strikethrough as u8) << 6);
+    let idx = cell_idx(state, col, row);
+    // SAFETY: cells buffer is allocated with max_cols * max_rows entries.
+    unsafe {
+        *state.cells.add(idx) = Cell { ch, charset: charset_id, flags, _pad: 0, fg: state.fg, bg: state.bg };
+    }
+}
+
+fn cell_clear(state: &mut DisplayState, col: u32, row: u32) {
+    if col >= state.max_cols || row >= state.max_rows || state.cells.is_null() {
+        return;
+    }
+    let bg = effective_bg(state);
+    let idx = cell_idx(state, col, row);
+    // SAFETY: cells buffer is allocated with max_cols * max_rows entries.
+    unsafe {
+        *state.cells.add(idx) = Cell::blank(state.fg, bg);
+    }
+}
+
+fn cell_clear_range(state: &mut DisplayState, col_start: u32, col_end: u32, row: u32) {
+    if state.cells.is_null() || row >= state.max_rows {
+        return;
+    }
+    let end = if col_end > state.max_cols { state.max_cols } else { col_end };
+    let bg = effective_bg(state);
+    for col in col_start..end {
+        let idx = cell_idx(state, col, row);
+        // SAFETY: cells buffer is allocated with max_cols * max_rows entries.
+        unsafe {
+            *state.cells.add(idx) = Cell::blank(state.fg, bg);
+        }
+    }
+}
+
+fn cell_clear_rows(state: &mut DisplayState, row_start: u32, row_end: u32) {
+    if state.cells.is_null() {
+        return;
+    }
+    let end = if row_end > state.max_rows { state.max_rows } else { row_end };
+    let bg = effective_bg(state);
+    let cols = state.max_cols;
+    for row in row_start..end {
+        for col in 0..cols {
+            let idx = cell_idx(state, col, row);
+            // SAFETY: cells buffer is allocated with max_cols * max_rows entries.
+            unsafe {
+                *state.cells.add(idx) = Cell::blank(state.fg, bg);
+            }
+        }
+    }
 }
 
 fn puts(s: &[u8]) {
@@ -163,13 +253,73 @@ fn invert_cursor_cell(state: &mut DisplayState, col: u32, row: u32) {
             let off = y_off + (px as usize + gx) * bpp_bytes;
             // SAFETY: Bounds checked above, shadow buffer is mapped.
             unsafe {
-                let dst = state.shadow.add(off) as *mut u32;
-                let val = core::ptr::read(dst);
-                core::ptr::write(dst, val ^ 0x00FF_FFFF);
+                let dst = state.shadow.add(off);
+                let val = read_pixel(dst, bpp_bytes);
+                write_pixel(dst, val ^ 0x00FF_FFFF, bpp_bytes);
             }
         }
     }
     mark_damage(state, py, py + gh);
+}
+
+/// Re-render every cell from the cell buffer into the shadow buffer.
+/// Called when DECSCNM toggles so that `effective_fg`/`effective_bg` pick up
+/// the new `screen_reverse` flag and every glyph gets redrawn with correct colors.
+fn repaint_all_cells(state: &mut DisplayState) {
+    if state.cells.is_null() {
+        return;
+    }
+    // Save current SGR/charset state
+    let saved_fg = state.fg;
+    let saved_bg = state.bg;
+    let saved_bold = state.bold;
+    let saved_reverse = state.reverse_video;
+    let saved_dim = state.dim;
+    let saved_underline = state.underline;
+    let saved_italic = state.italic;
+    let saved_hidden = state.hidden;
+    let saved_strikethrough = state.strikethrough;
+    let saved_active_charset = state.active_charset;
+    let saved_g0 = state.g0_charset;
+    let saved_g1 = state.g1_charset;
+
+    for row in 0..state.max_rows {
+        for col in 0..state.max_cols {
+            // SAFETY: cells buffer is allocated with max_cols * max_rows entries.
+            let cell = unsafe { *state.cells.add(cell_idx(state, col, row)) };
+
+            // Temporarily apply cell's stored attributes
+            state.fg = cell.fg;
+            state.bg = cell.bg;
+            state.bold = cell.flags & 0x01 != 0;
+            state.reverse_video = cell.flags & 0x02 != 0;
+            state.dim = cell.flags & 0x04 != 0;
+            state.underline = cell.flags & 0x08 != 0;
+            state.italic = cell.flags & 0x10 != 0;
+            state.hidden = cell.flags & 0x20 != 0;
+            state.strikethrough = cell.flags & 0x40 != 0;
+            state.g0_charset = cell.charset;
+            state.active_charset = 0;
+
+            render_glyph_pixels(state, cell.ch, col, row);
+        }
+    }
+
+    // Restore saved state
+    state.fg = saved_fg;
+    state.bg = saved_bg;
+    state.bold = saved_bold;
+    state.reverse_video = saved_reverse;
+    state.dim = saved_dim;
+    state.underline = saved_underline;
+    state.italic = saved_italic;
+    state.hidden = saved_hidden;
+    state.strikethrough = saved_strikethrough;
+    state.active_charset = saved_active_charset;
+    state.g0_charset = saved_g0;
+    state.g1_charset = saved_g1;
+
+    mark_damage(state, 0, state.height);
 }
 
 fn flush_damage(state: &mut DisplayState) {
@@ -227,6 +377,20 @@ unsafe fn write_pixel(dst: *mut u8, pixel: u32, bpp_bytes: usize) {
     }
 }
 
+#[inline(always)]
+unsafe fn read_pixel(src: *const u8, bpp_bytes: usize) -> u32 {
+    unsafe {
+        match bpp_bytes {
+            4 => core::ptr::read(src as *const u32),
+            3 => {
+                (*src as u32) | ((*src.add(1) as u32) << 8) | ((*src.add(2) as u32) << 16)
+            }
+            2 => core::ptr::read(src as *const u16) as u32,
+            _ => core::ptr::read(src as *const u32),
+        }
+    }
+}
+
 fn effective_fg(state: &DisplayState) -> u32 {
     if state.hidden {
         return effective_bg(state);
@@ -255,7 +419,9 @@ fn effective_bg(state: &DisplayState) -> u32 {
     }
 }
 
-fn draw_glyph(state: &mut DisplayState, c: u8, col: u32, row: u32) {
+/// Render a glyph's pixels into the shadow buffer without updating the cell buffer.
+/// Used by both `draw_glyph` (normal rendering) and `repaint_all_cells` (DECSCNM).
+fn render_glyph_pixels(state: &mut DisplayState, c: u8, col: u32, row: u32) {
     let gw = font::GLYPH_WIDTH;
     let gh = font::GLYPH_HEIGHT;
     let px = col * gw;
@@ -344,6 +510,11 @@ fn draw_glyph(state: &mut DisplayState, c: u8, col: u32, row: u32) {
     mark_damage(state, py, py + gh);
 }
 
+fn draw_glyph(state: &mut DisplayState, c: u8, col: u32, row: u32) {
+    render_glyph_pixels(state, c, col, row);
+    cell_put(state, col, row, c);
+}
+
 fn fill_rect(state: &mut DisplayState, x: u32, y: u32, w: u32, h: u32, color: u32) {
     let pitch = state.pitch as usize;
     let bpp_bytes = (state.bpp / 8) as usize;
@@ -388,9 +559,21 @@ fn scroll_up_region(state: &mut DisplayState, top: u32, bottom: u32) {
         );
     }
 
+    // Cell buffer: shift rows up
+    if !state.cells.is_null() {
+        let grid_cols = state.max_cols as usize;
+        // SAFETY: cells buffer is allocated with max_cols * max_rows entries.
+        unsafe {
+            let src = state.cells.add(((top + 1) as usize) * grid_cols);
+            let dst = state.cells.add((top as usize) * grid_cols);
+            core::ptr::copy(src, dst, ((rows - 1) as usize) * grid_cols);
+        }
+    }
+
     let last_row_y = (bottom - 1) * gh;
     let bg = effective_bg(state);
     fill_rect(state, 0, last_row_y, state.width, gh, bg);
+    cell_clear_range(state, 0, state.max_cols, bottom - 1);
 
     mark_damage(state, top * gh, bottom * gh);
 }
@@ -420,9 +603,21 @@ fn scroll_down_region(state: &mut DisplayState, top: u32, bottom: u32) {
         );
     }
 
+    // Cell buffer: shift rows down
+    if !state.cells.is_null() {
+        let grid_cols = state.max_cols as usize;
+        // SAFETY: cells buffer is allocated with max_cols * max_rows entries.
+        unsafe {
+            let src = state.cells.add((top as usize) * grid_cols);
+            let dst = state.cells.add(((top + 1) as usize) * grid_cols);
+            core::ptr::copy(src, dst, ((rows - 1) as usize) * grid_cols);
+        }
+    }
+
     let clear_y = top * gh;
     let bg = effective_bg(state);
     fill_rect(state, 0, clear_y, state.width, gh, bg);
+    cell_clear_range(state, 0, state.max_cols, top);
 
     mark_damage(state, top * gh, bottom * gh);
 }
@@ -447,11 +642,22 @@ fn insert_lines(state: &mut DisplayState, at_row: u32, count: u32) {
                 rows_to_move as usize * row_bytes,
             );
         }
+        // Cell buffer: shift rows down
+        if !state.cells.is_null() {
+            let grid_cols = state.max_cols as usize;
+            // SAFETY: cells buffer is allocated with max_cols * max_rows entries.
+            unsafe {
+                let src = state.cells.add((at_row as usize) * grid_cols);
+                let dst = state.cells.add(((at_row + count) as usize) * grid_cols);
+                core::ptr::copy(src, dst, (rows_to_move as usize) * grid_cols);
+            }
+        }
     }
     let bg = effective_bg(state);
     for r in at_row..at_row + count {
         let y = r * gh;
         fill_rect(state, 0, y, state.width, gh, bg);
+        cell_clear_range(state, 0, state.max_cols, r);
     }
     mark_damage(state, at_row * gh, max * gh);
 }
@@ -476,12 +682,23 @@ fn delete_lines(state: &mut DisplayState, at_row: u32, count: u32) {
                 rows_to_move as usize * row_bytes,
             );
         }
+        // Cell buffer: shift rows up
+        if !state.cells.is_null() {
+            let grid_cols = state.max_cols as usize;
+            // SAFETY: cells buffer is allocated with max_cols * max_rows entries.
+            unsafe {
+                let src = state.cells.add(((at_row + count) as usize) * grid_cols);
+                let dst = state.cells.add((at_row as usize) * grid_cols);
+                core::ptr::copy(src, dst, (rows_to_move as usize) * grid_cols);
+            }
+        }
     }
     let clear_start = max - count;
     let bg = effective_bg(state);
     for r in clear_start..max {
         let y = r * gh;
         fill_rect(state, 0, y, state.width, gh, bg);
+        cell_clear_range(state, 0, state.max_cols, r);
     }
     mark_damage(state, at_row * gh, max * gh);
 }
@@ -518,11 +735,21 @@ fn insert_chars(state: &mut DisplayState, count: u32) {
                 );
             }
         }
+        // Cell buffer: shift cells right
+        if !state.cells.is_null() {
+            // SAFETY: cells buffer is allocated with max_cols * max_rows entries.
+            unsafe {
+                let src = state.cells.add(cell_idx(state, col, row));
+                let dst = state.cells.add(cell_idx(state, col + count, row));
+                core::ptr::copy(src, dst, chars_to_move as usize);
+            }
+        }
     }
 
     let bg = effective_bg(state);
     let fill_x = col * gw;
     fill_rect(state, fill_x, py, count * gw, gh, bg);
+    cell_clear_range(state, col, col + count, row);
 }
 
 fn delete_chars(state: &mut DisplayState, count: u32) {
@@ -557,11 +784,21 @@ fn delete_chars(state: &mut DisplayState, count: u32) {
                 );
             }
         }
+        // Cell buffer: shift cells left
+        if !state.cells.is_null() {
+            // SAFETY: cells buffer is allocated with max_cols * max_rows entries.
+            unsafe {
+                let src = state.cells.add(cell_idx(state, col + count, row));
+                let dst = state.cells.add(cell_idx(state, col, row));
+                core::ptr::copy(src, dst, chars_to_move as usize);
+            }
+        }
     }
 
     let bg = effective_bg(state);
     let clear_start = (max_cols - count) * gw;
     fill_rect(state, clear_start, py, count * gw, gh, bg);
+    cell_clear_range(state, max_cols - count, max_cols, row);
 }
 
 fn erase_chars(state: &mut DisplayState, count: u32) {
@@ -578,6 +815,7 @@ fn erase_chars(state: &mut DisplayState, count: u32) {
     let px = col * gw;
     let py = row * gh;
     fill_rect(state, px, py, count * gw, gh, bg);
+    cell_clear_range(state, col, col + count, row);
 }
 
 fn switch_to_alt_screen(state: &mut DisplayState) {
@@ -605,6 +843,26 @@ fn switch_to_alt_screen(state: &mut DisplayState) {
         state.alt_shadow = ptr;
     }
 
+    // Lazy-allocate alt cell buffer
+    if !state.cells.is_null() && state.alt_cells.is_null() {
+        let grid = (state.max_cols * state.max_rows) as usize;
+        let cell_bytes = grid * core::mem::size_of::<Cell>();
+        let cell_len = ((cell_bytes as u64) + 4095) & !4095u64;
+        let ptr = unsafe {
+            salty::posix_mm::posix_mmap(
+                core::ptr::null_mut(),
+                cell_len,
+                0x3,  // PROT_READ | PROT_WRITE
+                0x22, // MAP_PRIVATE | MAP_ANONYMOUS
+                -1,
+                0,
+            )
+        };
+        if ptr != usize::MAX as *mut u8 && !ptr.is_null() {
+            state.alt_cells = ptr as *mut Cell;
+        }
+    }
+
     // Save primary state
     state.primary_col = state.text_col;
     state.primary_row = state.text_row;
@@ -622,6 +880,18 @@ fn switch_to_alt_screen(state: &mut DisplayState) {
     state.shadow = state.alt_shadow;
     state.alt_shadow = tmp;
 
+    // Swap cell buffers
+    if !state.cells.is_null() && !state.alt_cells.is_null() {
+        let grid = (state.max_cols * state.max_rows) as usize;
+        // SAFETY: Both cell buffers are allocated with the same size.
+        unsafe {
+            core::ptr::copy_nonoverlapping(state.cells, state.alt_cells, grid);
+        }
+        let tmp = state.cells;
+        state.cells = state.alt_cells;
+        state.alt_cells = tmp;
+    }
+
     state.alt_active = true;
 
     // Reset state for alt screen
@@ -635,6 +905,7 @@ fn switch_to_alt_screen(state: &mut DisplayState) {
     let h = state.height;
     let bg = effective_bg(state);
     fill_rect(state, 0, 0, w, h, bg);
+    cell_clear_rows(state, 0, state.max_rows);
     mark_damage(state, 0, h);
 }
 
@@ -643,12 +914,17 @@ fn switch_to_primary_screen(state: &mut DisplayState) {
         return;
     }
 
-    let fb_size = state.height as u64 * state.pitch as u64;
-
     // Swap back: alt_shadow currently holds primary content
     let tmp = state.shadow;
     state.shadow = state.alt_shadow;
     state.alt_shadow = tmp;
+
+    // Swap cell buffers back
+    if !state.cells.is_null() && !state.alt_cells.is_null() {
+        let tmp = state.cells;
+        state.cells = state.alt_cells;
+        state.alt_cells = tmp;
+    }
 
     state.alt_active = false;
 
@@ -1122,11 +1398,40 @@ pub extern "C" fn _start() -> ! {
         tab_stops: default_tabs,
         osc_saw_esc: false,
         last_printed_char: 0x20,
+        cells: core::ptr::null_mut(),
+        alt_cells: core::ptr::null_mut(),
     };
 
     // Disable kernel console so we own the framebuffer
     syscall(SYS_DEBUG_CONSOLE_CONTROL, 0, 0, 0, 0, 0, 0);
     puts(b"[DISPLAY] Kernel console disabled, display server owns FB\n");
+
+    // Allocate cell buffer for character-level storage
+    {
+        let grid = (state.max_cols * state.max_rows) as usize;
+        let cell_bytes = grid * core::mem::size_of::<Cell>();
+        let cell_len = ((cell_bytes as u64) + 4095) & !4095u64;
+        let ptr = unsafe {
+            salty::posix_mm::posix_mmap(
+                core::ptr::null_mut(),
+                cell_len,
+                0x3,  // PROT_READ | PROT_WRITE
+                0x22, // MAP_PRIVATE | MAP_ANONYMOUS
+                -1,
+                0,
+            )
+        };
+        if ptr != usize::MAX as *mut u8 && !ptr.is_null() {
+            state.cells = ptr as *mut Cell;
+            // Initialize all cells to space with default colors
+            for i in 0..grid {
+                // SAFETY: Just-allocated buffer, i < grid.
+                unsafe {
+                    *state.cells.add(i) = Cell::blank(fg_val, bg_val);
+                }
+            }
+        }
+    }
 
     // Clear screen to background color for a clean terminal
     let w = state.width;

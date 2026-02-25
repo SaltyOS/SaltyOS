@@ -8,7 +8,7 @@ license = MIT
 [source]
 url = https://invisible-island.net/archives/ncurses/ncurses-${version}.tar.gz
 subdir = ncurses-${version}
-sha256 = SKIP
+sha256 = 136d91bc269a9a5785e5f9e980bc76ab57428f604ce3e5a5a90cebc767971cc6
 
 [build]
 type = autotools

@@ -797,10 +797,8 @@ fn set_dec_mode(state: &mut DisplayState, mode: u16, enable: bool) {
         5 => {
             // DECSCNM — Reverse Screen
             state.screen_reverse = enable;
-            // Redraw entire screen with inverted colors
-            let w = state.width;
-            let h = state.height;
-            super::mark_damage(state, 0, h);
+            // Repaint all cells with updated effective colors
+            super::repaint_all_cells(state);
         }
         6 => {
             // DECOM — Origin Mode
@@ -851,11 +849,13 @@ fn erase_display(state: &mut DisplayState, mode: u16) {
             let row_py = state.text_row * gh;
             // Clear rest of current line
             super::fill_rect(state, col_px, row_py, w - col_px, gh, bg);
+            super::cell_clear_range(state, state.text_col, state.max_cols, state.text_row);
             // Clear all lines below
             let below_y = (state.text_row + 1) * gh;
             if below_y < state.height {
                 super::fill_rect(state, 0, below_y, w, state.height - below_y, bg);
             }
+            super::cell_clear_rows(state, state.text_row + 1, state.max_rows);
         }
         1 => {
             // Erase above: beginning of screen to cursor
@@ -864,13 +864,16 @@ fn erase_display(state: &mut DisplayState, mode: u16) {
             if row_py > 0 {
                 super::fill_rect(state, 0, 0, w, row_py, bg);
             }
+            super::cell_clear_rows(state, 0, state.text_row);
             // Clear current line up to and including cursor
             let end_px = (state.text_col + 1) * super::font::GLYPH_WIDTH;
             super::fill_rect(state, 0, row_py, end_px, gh, bg);
+            super::cell_clear_range(state, 0, state.text_col + 1, state.text_row);
         }
         2 => {
             // Erase entire display
             super::fill_rect(state, 0, 0, w, state.height, bg);
+            super::cell_clear_rows(state, 0, state.max_rows);
         }
         _ => {}
     }
@@ -881,21 +884,25 @@ fn erase_line(state: &mut DisplayState, mode: u16) {
     let gw = super::font::GLYPH_WIDTH;
     let bg = super::effective_bg(state);
     let row_py = state.text_row * gh;
+    let row = state.text_row;
 
     match mode {
         0 => {
             // Erase from cursor to end of line
             let col_px = state.text_col * gw;
             super::fill_rect(state, col_px, row_py, state.width - col_px, gh, bg);
+            super::cell_clear_range(state, state.text_col, state.max_cols, row);
         }
         1 => {
             // Erase from beginning of line to cursor
             let end_px = (state.text_col + 1) * gw;
             super::fill_rect(state, 0, row_py, end_px, gh, bg);
+            super::cell_clear_range(state, 0, state.text_col + 1, row);
         }
         2 => {
             // Erase entire line
             super::fill_rect(state, 0, row_py, state.width, gh, bg);
+            super::cell_clear_range(state, 0, state.max_cols, row);
         }
         _ => {}
     }
@@ -1138,4 +1145,5 @@ fn full_reset(state: &mut DisplayState) {
     let h = state.height;
     let bg = state.bg;
     super::fill_rect(state, 0, 0, w, h, bg);
+    super::cell_clear_rows(state, 0, state.max_rows);
 }
