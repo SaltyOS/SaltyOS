@@ -24,6 +24,13 @@ pub fn echo_push(buf: &mut [u8; 64], len: &mut usize, c: u8) {
     *len += 1;
 }
 
+/// Emit a destructive backspace for display output (`\b \b`).
+fn echo_backspace_erase(buf: &mut [u8; 64], len: &mut usize) {
+    echo_push(buf, len, 0x08);
+    echo_push(buf, len, b' ');
+    echo_push(buf, len, 0x08);
+}
+
 /// Write a byte slice with CR/LF translation via DebugPutStr syscall (serial output).
 pub fn serial_puts_opost(s: &[u8]) {
     let mut buf = [0u8; 80];
@@ -151,7 +158,7 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
                 if pty.line.pop() {
                     if (pty.termios.c_lflag & ECHOE) != 0 {
                         serial::serial_puts(b"\x08 \x08");
-                        echo_push(echo_buf, echo_len, 0x08);
+                        echo_backspace_erase(echo_buf, echo_len);
                     }
                 }
                 return;
@@ -162,7 +169,7 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
                 if (pty.termios.c_lflag & ECHOK) != 0 || (pty.termios.c_lflag & ECHOKE) != 0 {
                     for _ in 0..pty.line.len {
                         serial::serial_puts(b"\x08 \x08");
-                        echo_push(echo_buf, echo_len, 0x08);
+                        echo_backspace_erase(echo_buf, echo_len);
                     }
                 }
                 pty.line.clear();

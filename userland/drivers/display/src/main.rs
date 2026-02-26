@@ -969,7 +969,6 @@ fn terminal_putc(state: &mut DisplayState, c: u8) {
         state.pending_wrap = false;
         if state.text_col > 0 {
             state.text_col -= 1;
-            draw_glyph(state, b' ', state.text_col, state.text_row);
         }
         return;
     }

@@ -67,9 +67,9 @@ pub fn dispatch_irq(irq_num: usize) {
         return;
     }
 
-    // SAFETY: Called from interrupt context with interrupts disabled.
-    // IRQ_HANDLERS is only mutated under SCHED_IPC_LOCK which cannot
-    // be held during interrupt dispatch (EOI is sent before schedulable code).
+    // SAFETY: Called from external IRQ stubs with local interrupts disabled and
+    // SCHED_IPC_LOCK already held (`irq_stub_generic_*` in exceptions.S).
+    // Keep this lock-free here to avoid double-lock deadlock in interrupt context.
     unsafe {
         let mut cur = (*(&raw const IRQ_HANDLERS))[irq_num];
         while !cur.is_null() {
