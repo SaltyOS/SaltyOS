@@ -601,6 +601,13 @@ pub const NET_GETSOCKOPT: u64 = 0xAE;
 pub const NET_POLL_STATUS: u64 = 0xAF;
 pub const NET_REGISTER_VFS: u64 = 0xB0;
 pub const NET_COMPLETE: u64 = 0xB1;
+pub const NET_DNS_RESOLVE: u64 = 0xB2;
+pub const NET_DNS_RESOLVE_PTR: u64 = 0xB3;
+
+/// DNS service IPC labels (dnssrv client protocol).
+pub const DNS_RESOLVE: u64 = 1;
+pub const DNS_CACHE_FLUSH: u64 = 2;
+pub const DNS_REVERSE_LOOKUP: u64 = 3;
 
 /// Driver registration IPC labels (driver↔server protocol).
 pub const DRIVER_REGISTER: u64 = 0xC0;
@@ -609,6 +616,8 @@ pub const DRIVER_GET_INFO: u64 = 0xC1;
 /// Extended error codes for network operations.
 pub const SALTY_CONN_REFUSED: u64 = 21;
 pub const SALTY_TIMED_OUT: u64 = 22;
+pub const SALTY_DNS_NXDOMAIN: u64 = 23;
+pub const SALTY_DNS_SERVER_FAIL: u64 = 24;
 
 /// Async operation type codes (used in NET_COMPLETE callbacks).
 pub const INET_OP_CONNECT: u8 = 1;

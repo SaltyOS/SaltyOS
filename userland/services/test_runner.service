@@ -5,5 +5,8 @@ Type=simple
 Restart=no
 
 [Dependencies]
-After=procmgr vfs getty
+After=procmgr vfs getty dnssrv
 Before=
+
+[Capabilities]
+NeedEP=dnssrv:64

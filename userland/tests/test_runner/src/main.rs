@@ -22,6 +22,7 @@ mod test_terminal;
 mod test_epoll;
 mod test_pthread;
 mod test_saltyfs;
+mod test_dns;
 #[cfg(saltyc_sse2)]
 mod test_sse;
 
@@ -72,7 +73,7 @@ pub extern "C" fn _start() -> ! {
     puts(b"[TEST_RUNNER] SaltyOS Test Runner starting\n");
     signal_ready();
 
-    let base_tests: [(&[u8], fn() -> bool); 12] = [
+    let base_tests: [(&[u8], fn() -> bool); 13] = [
         (b"test_hello", test_hello::run),
         (b"test_fs", test_fs::run),
         (b"test_mmap", test_mmap::run),
@@ -85,6 +86,7 @@ pub extern "C" fn _start() -> ! {
         (b"test_epoll", test_epoll::run),
         (b"test_pthread", test_pthread::run),
         (b"test_saltyfs", test_saltyfs::run),
+        (b"test_dns", test_dns::run),
     ];
     #[cfg(saltyc_sse2)]
     let sse_tests: [(&[u8], fn() -> bool); 1] = [

@@ -31,6 +31,7 @@
 
 pub mod consts;
 pub mod cpio;
+pub mod dns;
 pub mod elf_dynamic;
 pub mod elf_loader;
 pub mod framebuffer;
@@ -784,4 +785,42 @@ pub extern "C" fn salty_pthread_detach(thread: pthread::PthreadT) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn salty_init_tls() {
     unsafe { tls::init_main_thread_tls() }
+}
+
+// ---------------------------------------------------------------------------
+// C ABI exports: DNS operations
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_dns_resolve(hostname: *const u8, hostname_len: usize) -> u32 {
+    if hostname.is_null() || hostname_len == 0 || hostname_len > 120 {
+        return 0;
+    }
+    // SAFETY: Caller guarantees hostname points to hostname_len valid bytes.
+    let slice = unsafe { core::slice::from_raw_parts(hostname, hostname_len) };
+    unsafe { dns::dns_resolve(slice) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_getaddrinfo(node: *const u8, result: *mut types::DnsAddrInfo) -> i32 {
+    unsafe { dns::posix_getaddrinfo(node, result) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_gethostbyname(name: *const u8) -> u32 {
+    unsafe { dns::posix_gethostbyname(name) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_dns_reverse_lookup(
+    ip: u32,
+    hostname_out: *mut u8,
+    hostname_max: usize,
+) -> usize {
+    unsafe { dns::dns_reverse_lookup(ip, hostname_out, hostname_max) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn salty_dns_cache_flush() {
+    unsafe { dns::dns_cache_flush() }
 }
