@@ -740,14 +740,14 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) {
                 return;
             }
             // SAFETY: Reading hostname bytes from IPC message register area.
-            // hostname_len is at most 120, which fits within regs[1..16].
+            // hostname_len is at most 120 bytes, which fits in regs[1..16] (15 x u64 = 120 bytes).
             let mut hostname = [0u8; 120];
             unsafe {
                 let src = &msg.regs[1] as *const u64 as *const u8;
                 core::ptr::copy_nonoverlapping(src, hostname.as_mut_ptr(), hostname_len);
             }
             match net::dns::dns_resolve_sync(&hostname[..hostname_len]) {
-                Some(result) => {
+                Ok(result) => {
                     reply.label = SALTY_OK;
                     reply.regs[0] = result.ip_count as u64;
                     reply.regs[1] = result.ttl as u64;
@@ -758,7 +758,13 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) {
                     }
                     reply.length = 2 + result.ip_count as u64;
                 }
-                None => {
+                Err(net::dns::DnsError::NxDomain) => {
+                    reply.label = SALTY_DNS_NXDOMAIN;
+                }
+                Err(net::dns::DnsError::ServerFail) => {
+                    reply.label = SALTY_DNS_SERVER_FAIL;
+                }
+                Err(_) => {
                     reply.label = SALTY_NOT_FOUND;
                 }
             }
@@ -766,19 +772,27 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) {
         NET_DNS_RESOLVE_PTR => {
             let ip = msg.regs[0] as u32;
             let mut hostname = [0u8; 256];
-            let len = net::dns::dns_resolve_ptr_sync(ip, &mut hostname);
-            if len > 0 {
-                reply.label = SALTY_OK;
-                reply.regs[0] = len as u64;
-                let copy_len = core::cmp::min(len, 152);
-                // SAFETY: Writing hostname bytes into reply register area.
-                unsafe {
-                    let dst = &raw mut reply.regs[1] as *mut u8;
-                    core::ptr::copy_nonoverlapping(hostname.as_ptr(), dst, copy_len);
+            match net::dns::dns_resolve_ptr_sync(ip, &mut hostname) {
+                Ok(len) => {
+                    reply.label = SALTY_OK;
+                    let copy_len = core::cmp::min(len, 152);
+                    reply.regs[0] = copy_len as u64;
+                    // SAFETY: Writing hostname bytes into reply register area.
+                    unsafe {
+                        let dst = &raw mut reply.regs[1] as *mut u8;
+                        core::ptr::copy_nonoverlapping(hostname.as_ptr(), dst, copy_len);
+                    }
+                    reply.length = 1 + ((copy_len as u64 + 7) / 8);
                 }
-                reply.length = 1 + ((copy_len as u64 + 7) / 8);
-            } else {
-                reply.label = SALTY_NOT_FOUND;
+                Err(net::dns::DnsError::NxDomain) => {
+                    reply.label = SALTY_DNS_NXDOMAIN;
+                }
+                Err(net::dns::DnsError::ServerFail) => {
+                    reply.label = SALTY_DNS_SERVER_FAIL;
+                }
+                Err(_) => {
+                    reply.label = SALTY_NOT_FOUND;
+                }
             }
         }
         _ => {

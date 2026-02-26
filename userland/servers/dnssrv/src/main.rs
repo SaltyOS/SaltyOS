@@ -143,9 +143,12 @@ fn cache_lookup(hostname: &[u8]) -> Option<(u8, [u32; MAX_CACHED_IPS])> {
             let entry = &(*cache)[i];
             if entry.active && entry.hostname_len as usize == hostname.len() {
                 if hostname_eq(&entry.hostname[..entry.hostname_len as usize], hostname) {
-                    let expiry_ns =
-                        entry.cached_at_ns + (entry.ttl_secs as u64) * 1_000_000_000;
+                    let ttl_ns = (entry.ttl_secs as u64).saturating_mul(1_000_000_000);
+                    let expiry_ns = entry.cached_at_ns.saturating_add(ttl_ns);
                     if now_ns < expiry_ns {
+                        // Update timestamp for LRU eviction
+                        let cache_mut = &raw mut DNS_CACHE;
+                        (*cache_mut)[i].cached_at_ns = now_ns;
                         return Some((entry.ip_count, entry.ips));
                     }
                     // Expired: mark inactive
@@ -173,13 +176,11 @@ fn cache_insert(hostname: &[u8], ips: &[u32], ip_count: u8, ttl: u32) {
 
         let mut target_idx = 0usize;
         let mut oldest_ns = u64::MAX;
-        let mut found_inactive = false;
 
         let mut i = 0;
         while i < DNS_CACHE_SIZE {
             if !(*cache)[i].active {
                 target_idx = i;
-                found_inactive = true;
                 break;
             }
             if (*cache)[i].cached_at_ns < oldest_ns {
@@ -188,7 +189,6 @@ fn cache_insert(hostname: &[u8], ips: &[u32], ip_count: u8, ttl: u32) {
             }
             i += 1;
         }
-        let _ = found_inactive;
 
         let entry = &mut (*cache)[target_idx];
         entry.active = true;
@@ -374,9 +374,9 @@ fn handle_reverse(msg: &SaltyMsg, reply: &mut SaltyMsg) {
     // Forward the PTR result back to the client
     let hostname_len = netsrv_reply.regs[0] as usize;
     reply.label = SALTY_OK;
-    reply.regs[0] = hostname_len as u64;
     if hostname_len > 0 {
         let copy_len = core::cmp::min(hostname_len, 152);
+        reply.regs[0] = copy_len as u64;
         // SAFETY: Copying hostname bytes from netsrv reply to client reply.
         unsafe {
             let src = &netsrv_reply.regs[1] as *const u64 as *const u8;

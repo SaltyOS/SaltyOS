@@ -25,13 +25,21 @@ const DNS_FLAG_QR: u16 = 0x8000;
 const DNS_FLAG_RD: u16 = 0x0100; // Recursion Desired
 
 static mut DNS_SOCKET_ID: i32 = -1;
-static mut DNS_TXN_COUNTER: u16 = 1;
 
 /// Result of a successful DNS A-record resolution.
 pub(crate) struct DnsResult {
     pub(crate) ip_count: u8,
     pub(crate) ips: [u32; MAX_DNS_RESULTS],
     pub(crate) ttl: u32,
+}
+
+/// DNS resolution error with RCODE distinction.
+#[derive(Clone, Copy)]
+pub(crate) enum DnsError {
+    NxDomain,
+    ServerFail,
+    Timeout,
+    Other,
 }
 
 /// Initialize the internal DNS UDP socket. Call once during netsrv startup.
@@ -60,6 +68,17 @@ fn clock_monotonic_ns() -> u64 {
     let r = salty::syscall::syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0);
     // error field holds seconds, value field holds nanoseconds
     (r.error * 1_000_000_000) + r.value
+}
+
+/// Generate a random transaction ID using the kernel RDRAND-backed GetRandom
+/// syscall, matching the pattern used by `tcp::generate_isn()`.
+fn generate_txn_id() -> u16 {
+    let mut buf = [0u8; 2];
+    // SAFETY: Passing valid stack buffer to GetRandom syscall.
+    let _ = unsafe {
+        salty::syscall::syscall(SYS_GETRANDOM, buf.as_mut_ptr() as u64, 2, 0, 0, 0, 0)
+    };
+    u16::from_ne_bytes(buf)
 }
 
 /// Encode a hostname into DNS wire format (length-prefixed labels).
@@ -324,8 +343,11 @@ fn decode_name(data: &[u8], mut offset: usize, out: &mut [u8; 256]) -> (usize, u
 
 /// Parse a DNS response and extract A records.
 ///
-/// Returns `Some(DnsResult)` with resolved IPs and minimum TTL on success.
-fn parse_response(data: &[u8], expected_txn_id: u16) -> Option<DnsResult> {
+/// Returns a 3-way outcome:
+/// - `None` — TXN mismatch or malformed packet (transient, keep polling)
+/// - `Some(Ok(DnsResult))` — successful resolution
+/// - `Some(Err(rcode))` — definitive DNS error (stop retrying)
+fn parse_response(data: &[u8], expected_txn_id: u16) -> Option<Result<DnsResult, u8>> {
     if data.len() < DNS_HEADER_LEN {
         return None;
     }
@@ -345,7 +367,7 @@ fn parse_response(data: &[u8], expected_txn_id: u16) -> Option<DnsResult> {
     // Check RCODE (bits 3:0 of byte 3)
     let rcode = data[3] & 0x0F;
     if rcode != 0 {
-        return None;
+        return Some(Err(rcode));
     }
 
     let qdcount = ((data[4] as u16) << 8) | (data[5] as u16);
@@ -438,13 +460,20 @@ fn parse_response(data: &[u8], expected_txn_id: u16) -> Option<DnsResult> {
         result.ttl = 300; // default 5 minutes
     }
 
-    Some(result)
+    Some(Ok(result))
 }
 
 /// Parse a DNS PTR response and extract the hostname.
 ///
-/// Returns `Some(len)` where `out[..len]` contains the PTR hostname.
-fn parse_ptr_response(data: &[u8], expected_txn_id: u16, out: &mut [u8; 256]) -> Option<usize> {
+/// Returns a 3-way outcome:
+/// - `None` — TXN mismatch or malformed packet (transient, keep polling)
+/// - `Some(Ok(len))` — `out[..len]` contains the PTR hostname
+/// - `Some(Err(rcode))` — definitive DNS error (stop retrying)
+fn parse_ptr_response(
+    data: &[u8],
+    expected_txn_id: u16,
+    out: &mut [u8; 256],
+) -> Option<Result<usize, u8>> {
     if data.len() < DNS_HEADER_LEN {
         return None;
     }
@@ -461,7 +490,7 @@ fn parse_ptr_response(data: &[u8], expected_txn_id: u16, out: &mut [u8; 256]) ->
 
     let rcode = data[3] & 0x0F;
     if rcode != 0 {
-        return None;
+        return Some(Err(rcode));
     }
 
     let qdcount = ((data[4] as u16) << 8) | (data[5] as u16);
@@ -513,7 +542,7 @@ fn parse_ptr_response(data: &[u8], expected_txn_id: u16, out: &mut [u8; 256]) ->
             // Decode the PTR target hostname
             let (name_len, _) = decode_name(data, offset, out);
             if name_len > 0 {
-                return Some(name_len);
+                return Some(Ok(name_len));
             }
         }
 
@@ -524,32 +553,35 @@ fn parse_ptr_response(data: &[u8], expected_txn_id: u16, out: &mut [u8; 256]) ->
     None
 }
 
+/// Map a raw DNS RCODE to a `DnsError`.
+fn rcode_to_error(rcode: u8) -> DnsError {
+    match rcode {
+        3 => DnsError::NxDomain,
+        2 => DnsError::ServerFail,
+        _ => DnsError::Other,
+    }
+}
+
 /// Synchronous DNS A-record resolution. Sends a query and waits for response.
 ///
 /// Called from netsrv's IPC dispatch when handling NET_DNS_RESOLVE.
 /// Blocks the netsrv event loop for up to ~9 seconds (3 attempts x 3s timeout).
-pub(crate) fn dns_resolve_sync(hostname: &[u8]) -> Option<DnsResult> {
+pub(crate) fn dns_resolve_sync(hostname: &[u8]) -> Result<DnsResult, DnsError> {
     // SAFETY: Single-threaded server; DNS_SOCKET_ID set during init.
     let socket_id = unsafe { *(&raw const DNS_SOCKET_ID) };
     if socket_id < 0 {
-        return None;
+        return Err(DnsError::Other);
     }
 
     let mut attempt = 0usize;
     while attempt <= DNS_MAX_RETRIES {
-        // Generate transaction ID
-        // SAFETY: Single-threaded server; monotonic counter.
-        let txn_id = unsafe {
-            let id = *(&raw const DNS_TXN_COUNTER);
-            *(&raw mut DNS_TXN_COUNTER) = id.wrapping_add(1);
-            id
-        };
+        let txn_id = generate_txn_id();
 
         // Build query
         let mut query_buf = [0u8; DNS_MAX_QUERY_LEN];
         let query_len = build_query(hostname, txn_id, &mut query_buf);
         if query_len == 0 {
-            return None;
+            return Err(DnsError::Other);
         }
 
         // Ensure ARP entry exists for the DNS server (via gateway)
@@ -574,13 +606,14 @@ pub(crate) fn dns_resolve_sync(hostname: &[u8]) -> Option<DnsResult> {
 
             // Check if our DNS socket received a response
             let mut resp_buf = [0u8; DNS_MAX_RESPONSE_LEN];
-            let (len, _src_ip, _src_port) =
+            let (len, src_ip, src_port) =
                 super::udp::udp_recvfrom(socket_id as u32, &mut resp_buf);
-            if len > 0 {
-                if let Some(result) = parse_response(&resp_buf[..len as usize], txn_id) {
-                    return Some(result);
+            if len > 0 && src_ip == DNS_SERVER_IP && src_port == DNS_PORT {
+                match parse_response(&resp_buf[..len as usize], txn_id) {
+                    Some(Ok(result)) => return Ok(result),
+                    Some(Err(rcode)) => return Err(rcode_to_error(rcode)),
+                    None => {}
                 }
-                // Response didn't match or was malformed; keep waiting
             }
 
             // Yield CPU briefly to avoid busy-spinning
@@ -590,32 +623,27 @@ pub(crate) fn dns_resolve_sync(hostname: &[u8]) -> Option<DnsResult> {
         attempt += 1;
     }
 
-    None
+    Err(DnsError::Timeout)
 }
 
 /// Synchronous DNS PTR resolution for reverse DNS.
 ///
-/// Returns the hostname length written into `out`, or 0 on failure.
-pub(crate) fn dns_resolve_ptr_sync(ip: u32, out: &mut [u8; 256]) -> usize {
+/// Returns the hostname length written into `out` on success.
+pub(crate) fn dns_resolve_ptr_sync(ip: u32, out: &mut [u8; 256]) -> Result<usize, DnsError> {
     // SAFETY: Single-threaded server; DNS_SOCKET_ID set during init.
     let socket_id = unsafe { *(&raw const DNS_SOCKET_ID) };
     if socket_id < 0 {
-        return 0;
+        return Err(DnsError::Other);
     }
 
     let mut attempt = 0usize;
     while attempt <= DNS_MAX_RETRIES {
-        // SAFETY: Single-threaded server; monotonic counter.
-        let txn_id = unsafe {
-            let id = *(&raw const DNS_TXN_COUNTER);
-            *(&raw mut DNS_TXN_COUNTER) = id.wrapping_add(1);
-            id
-        };
+        let txn_id = generate_txn_id();
 
         let mut query_buf = [0u8; DNS_MAX_QUERY_LEN];
         let query_len = build_ptr_query(ip, txn_id, &mut query_buf);
         if query_len == 0 {
-            return 0;
+            return Err(DnsError::Other);
         }
 
         let our_mac = crate::mac_addr();
@@ -634,12 +662,13 @@ pub(crate) fn dns_resolve_ptr_sync(ip: u32, out: &mut [u8; 256]) -> usize {
             crate::process_rx_from_shm();
 
             let mut resp_buf = [0u8; DNS_MAX_RESPONSE_LEN];
-            let (len, _src_ip, _src_port) =
+            let (len, src_ip, src_port) =
                 super::udp::udp_recvfrom(socket_id as u32, &mut resp_buf);
-            if len > 0 {
-                if let Some(name_len) = parse_ptr_response(&resp_buf[..len as usize], txn_id, out)
-                {
-                    return name_len;
+            if len > 0 && src_ip == DNS_SERVER_IP && src_port == DNS_PORT {
+                match parse_ptr_response(&resp_buf[..len as usize], txn_id, out) {
+                    Some(Ok(name_len)) => return Ok(name_len),
+                    Some(Err(rcode)) => return Err(rcode_to_error(rcode)),
+                    None => {}
                 }
             }
 
@@ -649,5 +678,5 @@ pub(crate) fn dns_resolve_ptr_sync(ip: u32, out: &mut [u8; 256]) -> usize {
         attempt += 1;
     }
 
-    0
+    Err(DnsError::Timeout)
 }
