@@ -3,7 +3,7 @@
 //!
 //! Builds RFC 1035 DNS queries (A and PTR records), sends them over a dedicated
 //! internal UDP socket to the QEMU DNS forwarder at 10.0.2.3:53, and parses
-//! responses including CNAME chasing.
+//! responses (CNAME resolution is delegated to the upstream recursive resolver).
 
 use salty::consts::*;
 
@@ -71,10 +71,17 @@ pub(crate) fn clock_monotonic_ns() -> u64 {
 fn generate_txn_id() -> u16 {
     let mut buf = [0u8; 2];
     // SAFETY: Passing valid stack buffer to GetRandom syscall.
-    let _ = unsafe {
+    let r = unsafe {
         salty::syscall::syscall(SYS_GETRANDOM, buf.as_mut_ptr() as u64, 2, 0, 0, 0, 0)
     };
-    u16::from_ne_bytes(buf)
+    let id = u16::from_ne_bytes(buf);
+    if r.error != 0 || id == 0 {
+        // Fallback: clock-based ID if RDRAND is unavailable or returned zero
+        let t = clock_monotonic_ns();
+        ((t >> 16) ^ t) as u16 | 1
+    } else {
+        id
+    }
 }
 
 /// Encode a hostname into DNS wire format (length-prefixed labels).
@@ -103,7 +110,7 @@ fn encode_hostname(hostname: &[u8], buf: &mut [u8]) -> usize {
                 return 0; // label too long
             }
             if label_len > 0 {
-                if out_pos + 1 + label_len >= buf.len() {
+                if out_pos + 1 + label_len > buf.len() {
                     return 0; // buffer overflow
                 }
                 buf[out_pos] = label_len as u8;
@@ -313,7 +320,7 @@ fn decode_name(data: &[u8], mut offset: usize, out: &mut [u8; 256]) -> (usize, u
 
         // Add dot separator (except before first label)
         if out_pos > 0 {
-            if out_pos >= 255 {
+            if out_pos >= 256 {
                 return (0, 0);
             }
             out[out_pos] = b'.';
@@ -323,7 +330,7 @@ fn decode_name(data: &[u8], mut offset: usize, out: &mut [u8; 256]) -> (usize, u
         // Copy label bytes
         let mut i = 0;
         while i < label_len {
-            if out_pos >= 255 {
+            if out_pos >= 256 {
                 return (0, 0);
             }
             out[out_pos] = data[offset + 1 + i];
@@ -661,6 +668,7 @@ fn push_completion(c: DnsCompletion) {
     unsafe {
         let count = *(&raw const COMPLETION_COUNT);
         if count >= MAX_PENDING_DNS {
+            crate::puts(b"[netsrv] DNS: completion queue full, dropping result\n");
             return;
         }
         (*(&raw mut COMPLETION_QUEUE))[count] = c;

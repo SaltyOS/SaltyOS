@@ -845,6 +845,11 @@ unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut SaltyMsg, badge: *mut u64) {
         if net::dns::has_pending() {
             let now = net::dns::clock_monotonic_ns();
             let deadline = net::dns::nearest_deadline_ns();
+            if deadline <= now {
+                // Deadline already passed; skip recv and process immediately
+                *badge = 1;
+                return;
+            }
             let timeout = deadline.saturating_sub(now).max(1_000_000); // min 1ms
             let r = salty::syscall::syscall(
                 SYS_RECV_TIMED,
