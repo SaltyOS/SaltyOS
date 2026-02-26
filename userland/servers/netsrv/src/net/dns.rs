@@ -27,6 +27,7 @@ const DNS_FLAG_RD: u16 = 0x0100; // Recursion Desired
 static mut DNS_SOCKET_ID: i32 = -1;
 
 /// Result of a successful DNS A-record resolution.
+#[derive(Clone, Copy)]
 pub(crate) struct DnsResult {
     pub(crate) ip_count: u8,
     pub(crate) ips: [u32; MAX_DNS_RESULTS],
@@ -49,13 +50,9 @@ pub(crate) fn init_dns_socket() {
         crate::puts(b"[netsrv] DNS: failed to allocate internal UDP socket\n");
         return;
     }
-    // Bind to ephemeral port for DNS queries
-    let bind_result = super::udp::udp_bind(id as u32, super::ipv4::OUR_IP, 0);
-    if bind_result < 0 {
-        // Binding to port 0 triggers ephemeral port allocation internally,
-        // but udp_bind requires a non-zero port. Just connect instead which
-        // will auto-bind an ephemeral port on first sendto.
-    }
+    // No explicit bind needed: leaving the UDP socket with local_port == 0
+    // lets udp_sendto auto-assign an ephemeral port on first use.
+    let _bind_result = super::udp::udp_bind(id as u32, super::ipv4::OUR_IP, 0);
     // SAFETY: Single-threaded init; DNS_SOCKET_ID written once before event loop.
     unsafe {
         *(&raw mut DNS_SOCKET_ID) = id;
@@ -64,10 +61,9 @@ pub(crate) fn init_dns_socket() {
 }
 
 /// Get monotonic time in nanoseconds.
-fn clock_monotonic_ns() -> u64 {
+pub(crate) fn clock_monotonic_ns() -> u64 {
     let r = salty::syscall::syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0);
-    // error field holds seconds, value field holds nanoseconds
-    (r.error * 1_000_000_000) + r.value
+    if r.error != 0 { 0 } else { r.value }
 }
 
 /// Generate a random transaction ID using the kernel RDRAND-backed GetRandom
@@ -562,121 +558,417 @@ fn rcode_to_error(rcode: u8) -> DnsError {
     }
 }
 
-/// Synchronous DNS A-record resolution. Sends a query and waits for response.
-///
-/// Called from netsrv's IPC dispatch when handling NET_DNS_RESOLVE.
-/// Blocks the netsrv event loop for up to ~9 seconds (3 attempts x 3s timeout).
-pub(crate) fn dns_resolve_sync(hostname: &[u8]) -> Result<DnsResult, DnsError> {
-    // SAFETY: Single-threaded server; DNS_SOCKET_ID set during init.
-    let socket_id = unsafe { *(&raw const DNS_SOCKET_ID) };
-    if socket_id < 0 {
-        return Err(DnsError::Other);
-    }
+// ---------------------------------------------------------------------------
+// Async DNS state machine
+// ---------------------------------------------------------------------------
 
-    let mut attempt = 0usize;
-    while attempt <= DNS_MAX_RETRIES {
-        let txn_id = generate_txn_id();
+const MAX_PENDING_DNS: usize = 4;
+const CAP_SELF_CSPACE: u64 = 2;
+pub(crate) const CAP_DNS_REPLY_BASE: u64 = 90; // Slots 90-93
 
-        // Build query
-        let mut query_buf = [0u8; DNS_MAX_QUERY_LEN];
-        let query_len = build_query(hostname, txn_id, &mut query_buf);
-        if query_len == 0 {
-            return Err(DnsError::Other);
-        }
-
-        // Ensure ARP entry exists for the DNS server (via gateway)
-        let our_mac = crate::mac_addr();
-        super::ensure_arp(&our_mac, super::ipv4::OUR_IP, DNS_SERVER_IP);
-
-        // Send query via internal UDP socket
-        super::udp::udp_sendto(socket_id as u32, &query_buf[..query_len], DNS_SERVER_IP, DNS_PORT);
-
-        // Poll for response with timeout
-        let start_ns = clock_monotonic_ns();
-        let deadline_ns = start_ns + DNS_TIMEOUT_NS;
-
-        loop {
-            let now_ns = clock_monotonic_ns();
-            if now_ns >= deadline_ns {
-                break; // timeout, try next attempt
-            }
-
-            // Process any pending packets from SHM (drives UDP rx buffering)
-            crate::process_rx_from_shm();
-
-            // Check if our DNS socket received a response
-            let mut resp_buf = [0u8; DNS_MAX_RESPONSE_LEN];
-            let (len, src_ip, src_port) =
-                super::udp::udp_recvfrom(socket_id as u32, &mut resp_buf);
-            if len > 0 && src_ip == DNS_SERVER_IP && src_port == DNS_PORT {
-                match parse_response(&resp_buf[..len as usize], txn_id) {
-                    Some(Ok(result)) => return Ok(result),
-                    Some(Err(rcode)) => return Err(rcode_to_error(rcode)),
-                    None => {}
-                }
-            }
-
-            // Yield CPU briefly to avoid busy-spinning
-            salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-        }
-
-        attempt += 1;
-    }
-
-    Err(DnsError::Timeout)
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum DnsQueryType {
+    A,
+    Ptr,
 }
 
-/// Synchronous DNS PTR resolution for reverse DNS.
-///
-/// Returns the hostname length written into `out` on success.
-pub(crate) fn dns_resolve_ptr_sync(ip: u32, out: &mut [u8; 256]) -> Result<usize, DnsError> {
+struct PendingDns {
+    active: bool,
+    query_type: DnsQueryType,
+    hostname: [u8; 120],
+    hostname_len: usize,
+    ptr_ip: u32,
+    txn_id: u16,
+    attempt: usize,
+    deadline_ns: u64,
+    reply_cap_slot: u64,
+}
+
+impl PendingDns {
+    const fn zeroed() -> Self {
+        PendingDns {
+            active: false,
+            query_type: DnsQueryType::A,
+            hostname: [0u8; 120],
+            hostname_len: 0,
+            ptr_ip: 0,
+            txn_id: 0,
+            attempt: 0,
+            deadline_ns: 0,
+            reply_cap_slot: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DnsCompletion {
+    pub(crate) reply_cap_slot: u64,
+    pub(crate) query_type: DnsQueryType,
+    pub(crate) success: bool,
+    pub(crate) dns_result: DnsResult,
+    pub(crate) error: DnsError,
+    pub(crate) ptr_hostname: [u8; 256],
+    pub(crate) ptr_hostname_len: usize,
+}
+
+impl DnsCompletion {
+    const fn zeroed() -> Self {
+        DnsCompletion {
+            reply_cap_slot: 0,
+            query_type: DnsQueryType::A,
+            success: false,
+            dns_result: DnsResult {
+                ip_count: 0,
+                ips: [0; MAX_DNS_RESULTS],
+                ttl: 0,
+            },
+            error: DnsError::Other,
+            ptr_hostname: [0u8; 256],
+            ptr_hostname_len: 0,
+        }
+    }
+}
+
+static mut PENDING: [PendingDns; MAX_PENDING_DNS] = {
+    const ZERO: PendingDns = PendingDns::zeroed();
+    [ZERO, ZERO, ZERO, ZERO]
+};
+
+static mut COMPLETION_QUEUE: [DnsCompletion; MAX_PENDING_DNS] = {
+    const ZERO: DnsCompletion = DnsCompletion::zeroed();
+    [ZERO, ZERO, ZERO, ZERO]
+};
+
+static mut COMPLETION_COUNT: usize = 0;
+
+fn find_free_slot() -> Option<usize> {
+    // SAFETY: Single-threaded server.
+    unsafe {
+        let pending = &raw const PENDING;
+        let mut i = 0;
+        while i < MAX_PENDING_DNS {
+            if !(*pending)[i].active {
+                return Some(i);
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+fn push_completion(c: DnsCompletion) {
+    // SAFETY: Single-threaded server.
+    unsafe {
+        let count = *(&raw const COMPLETION_COUNT);
+        if count >= MAX_PENDING_DNS {
+            return;
+        }
+        (*(&raw mut COMPLETION_QUEUE))[count] = c;
+        *(&raw mut COMPLETION_COUNT) = count + 1;
+    }
+}
+
+fn send_query_for_slot(slot: &PendingDns) {
     // SAFETY: Single-threaded server; DNS_SOCKET_ID set during init.
     let socket_id = unsafe { *(&raw const DNS_SOCKET_ID) };
     if socket_id < 0 {
-        return Err(DnsError::Other);
+        return;
     }
 
-    let mut attempt = 0usize;
-    while attempt <= DNS_MAX_RETRIES {
-        let txn_id = generate_txn_id();
-
-        let mut query_buf = [0u8; DNS_MAX_QUERY_LEN];
-        let query_len = build_ptr_query(ip, txn_id, &mut query_buf);
-        if query_len == 0 {
-            return Err(DnsError::Other);
-        }
-
+    let mut query_buf = [0u8; DNS_MAX_QUERY_LEN];
+    let query_len = match slot.query_type {
+        DnsQueryType::A => build_query(&slot.hostname[..slot.hostname_len], slot.txn_id, &mut query_buf),
+        DnsQueryType::Ptr => build_ptr_query(slot.ptr_ip, slot.txn_id, &mut query_buf),
+    };
+    if query_len > 0 {
         let our_mac = crate::mac_addr();
         super::ensure_arp(&our_mac, super::ipv4::OUR_IP, DNS_SERVER_IP);
         super::udp::udp_sendto(socket_id as u32, &query_buf[..query_len], DNS_SERVER_IP, DNS_PORT);
+    }
+}
 
-        let start_ns = clock_monotonic_ns();
-        let deadline_ns = start_ns + DNS_TIMEOUT_NS;
-
-        loop {
-            let now_ns = clock_monotonic_ns();
-            if now_ns >= deadline_ns {
-                break;
-            }
-
-            crate::process_rx_from_shm();
-
-            let mut resp_buf = [0u8; DNS_MAX_RESPONSE_LEN];
-            let (len, src_ip, src_port) =
-                super::udp::udp_recvfrom(socket_id as u32, &mut resp_buf);
-            if len > 0 && src_ip == DNS_SERVER_IP && src_port == DNS_PORT {
-                match parse_ptr_response(&resp_buf[..len as usize], txn_id, out) {
-                    Some(Ok(name_len)) => return Ok(name_len),
-                    Some(Err(rcode)) => return Err(rcode_to_error(rcode)),
-                    None => {}
-                }
-            }
-
-            salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-        }
-
-        attempt += 1;
+/// Begin an async A-record resolution. Saves the caller's reply cap and
+/// sends the first DNS query. Returns the reply cap slot on success, or
+/// None if the hostname is invalid or all pending slots are busy.
+pub(crate) fn start_resolve(hostname: &[u8]) -> Option<u64> {
+    let socket_id = unsafe { *(&raw const DNS_SOCKET_ID) };
+    if socket_id < 0 {
+        return None;
     }
 
-    Err(DnsError::Timeout)
+    // Validate: build the query to catch encoding errors early
+    let txn_id = generate_txn_id();
+    let mut query_buf = [0u8; DNS_MAX_QUERY_LEN];
+    let query_len = build_query(hostname, txn_id, &mut query_buf);
+    if query_len == 0 {
+        return None;
+    }
+
+    let slot_idx = find_free_slot()?;
+    let reply_cap_slot = CAP_DNS_REPLY_BASE + slot_idx as u64;
+
+    // Save the caller's reply cap into a CNode slot
+    let err = salty::invoke::cnode_save_caller(CAP_SELF_CSPACE, reply_cap_slot);
+    if err != 0 {
+        return None;
+    }
+
+    // Send the first query
+    let our_mac = crate::mac_addr();
+    super::ensure_arp(&our_mac, super::ipv4::OUR_IP, DNS_SERVER_IP);
+    super::udp::udp_sendto(socket_id as u32, &query_buf[..query_len], DNS_SERVER_IP, DNS_PORT);
+
+    let now = clock_monotonic_ns();
+
+    // SAFETY: Single-threaded server.
+    unsafe {
+        let slot = &mut (*(&raw mut PENDING))[slot_idx];
+        slot.active = true;
+        slot.query_type = DnsQueryType::A;
+        slot.hostname_len = hostname.len();
+        let mut i = 0;
+        while i < hostname.len() {
+            slot.hostname[i] = hostname[i];
+            i += 1;
+        }
+        slot.ptr_ip = 0;
+        slot.txn_id = txn_id;
+        slot.attempt = 0;
+        slot.deadline_ns = now + DNS_TIMEOUT_NS;
+        slot.reply_cap_slot = reply_cap_slot;
+    }
+
+    Some(reply_cap_slot)
+}
+
+/// Begin an async PTR resolution. Saves the caller's reply cap and
+/// sends the first DNS PTR query. Returns the reply cap slot on success,
+/// or None if all pending slots are busy.
+pub(crate) fn start_resolve_ptr(ip: u32) -> Option<u64> {
+    let socket_id = unsafe { *(&raw const DNS_SOCKET_ID) };
+    if socket_id < 0 {
+        return None;
+    }
+
+    let txn_id = generate_txn_id();
+    let mut query_buf = [0u8; DNS_MAX_QUERY_LEN];
+    let query_len = build_ptr_query(ip, txn_id, &mut query_buf);
+    if query_len == 0 {
+        return None;
+    }
+
+    let slot_idx = find_free_slot()?;
+    let reply_cap_slot = CAP_DNS_REPLY_BASE + slot_idx as u64;
+
+    let err = salty::invoke::cnode_save_caller(CAP_SELF_CSPACE, reply_cap_slot);
+    if err != 0 {
+        return None;
+    }
+
+    let our_mac = crate::mac_addr();
+    super::ensure_arp(&our_mac, super::ipv4::OUR_IP, DNS_SERVER_IP);
+    super::udp::udp_sendto(socket_id as u32, &query_buf[..query_len], DNS_SERVER_IP, DNS_PORT);
+
+    let now = clock_monotonic_ns();
+
+    // SAFETY: Single-threaded server.
+    unsafe {
+        let slot = &mut (*(&raw mut PENDING))[slot_idx];
+        slot.active = true;
+        slot.query_type = DnsQueryType::Ptr;
+        slot.hostname_len = 0;
+        slot.hostname = [0u8; 120];
+        slot.ptr_ip = ip;
+        slot.txn_id = txn_id;
+        slot.attempt = 0;
+        slot.deadline_ns = now + DNS_TIMEOUT_NS;
+        slot.reply_cap_slot = reply_cap_slot;
+    }
+
+    Some(reply_cap_slot)
+}
+
+/// Process pending DNS queries: drain the DNS UDP socket for responses,
+/// match them against pending requests, and handle retries/timeouts.
+///
+/// Must be called from the event loop on each notification wakeup.
+pub(crate) fn process_pending() {
+    let socket_id = unsafe { *(&raw const DNS_SOCKET_ID) };
+    if socket_id < 0 {
+        return;
+    }
+
+    // 1. Drain DNS socket for responses
+    loop {
+        let mut resp_buf = [0u8; DNS_MAX_RESPONSE_LEN];
+        let (len, src_ip, src_port) =
+            super::udp::udp_recvfrom(socket_id as u32, &mut resp_buf);
+        if len <= 0 {
+            break;
+        }
+        if src_ip != DNS_SERVER_IP || src_port != DNS_PORT {
+            continue;
+        }
+
+        // Try to match against pending requests
+        // SAFETY: Single-threaded server.
+        unsafe {
+            let pending = &raw mut PENDING;
+            let mut i = 0;
+            while i < MAX_PENDING_DNS {
+                if !(*pending)[i].active {
+                    i += 1;
+                    continue;
+                }
+
+                let txn_id = (*pending)[i].txn_id;
+                let matched = match (*pending)[i].query_type {
+                    DnsQueryType::A => {
+                        match parse_response(&resp_buf[..len as usize], txn_id) {
+                            Some(Ok(result)) => {
+                                push_completion(DnsCompletion {
+                                    reply_cap_slot: (*pending)[i].reply_cap_slot,
+                                    query_type: DnsQueryType::A,
+                                    success: true,
+                                    dns_result: result,
+                                    error: DnsError::Other,
+                                    ptr_hostname: [0; 256],
+                                    ptr_hostname_len: 0,
+                                });
+                                true
+                            }
+                            Some(Err(rcode)) => {
+                                push_completion(DnsCompletion {
+                                    reply_cap_slot: (*pending)[i].reply_cap_slot,
+                                    query_type: DnsQueryType::A,
+                                    success: false,
+                                    dns_result: DnsResult { ip_count: 0, ips: [0; MAX_DNS_RESULTS], ttl: 0 },
+                                    error: rcode_to_error(rcode),
+                                    ptr_hostname: [0; 256],
+                                    ptr_hostname_len: 0,
+                                });
+                                true
+                            }
+                            None => false,
+                        }
+                    }
+                    DnsQueryType::Ptr => {
+                        let mut ptr_hostname = [0u8; 256];
+                        match parse_ptr_response(&resp_buf[..len as usize], txn_id, &mut ptr_hostname) {
+                            Some(Ok(name_len)) => {
+                                push_completion(DnsCompletion {
+                                    reply_cap_slot: (*pending)[i].reply_cap_slot,
+                                    query_type: DnsQueryType::Ptr,
+                                    success: true,
+                                    dns_result: DnsResult { ip_count: 0, ips: [0; MAX_DNS_RESULTS], ttl: 0 },
+                                    error: DnsError::Other,
+                                    ptr_hostname,
+                                    ptr_hostname_len: name_len,
+                                });
+                                true
+                            }
+                            Some(Err(rcode)) => {
+                                push_completion(DnsCompletion {
+                                    reply_cap_slot: (*pending)[i].reply_cap_slot,
+                                    query_type: DnsQueryType::Ptr,
+                                    success: false,
+                                    dns_result: DnsResult { ip_count: 0, ips: [0; MAX_DNS_RESULTS], ttl: 0 },
+                                    error: rcode_to_error(rcode),
+                                    ptr_hostname: [0; 256],
+                                    ptr_hostname_len: 0,
+                                });
+                                true
+                            }
+                            None => false,
+                        }
+                    }
+                };
+
+                if matched {
+                    (*pending)[i].active = false;
+                    break; // This response matched, move to next packet
+                }
+                i += 1;
+            }
+        }
+    }
+
+    // 2. Check deadlines for remaining active slots
+    let now = clock_monotonic_ns();
+    // SAFETY: Single-threaded server.
+    unsafe {
+        let pending = &raw mut PENDING;
+        let mut i = 0;
+        while i < MAX_PENDING_DNS {
+            if (*pending)[i].active && now >= (*pending)[i].deadline_ns {
+                if (*pending)[i].attempt < DNS_MAX_RETRIES {
+                    // Retry with new txn_id
+                    (*pending)[i].attempt += 1;
+                    (*pending)[i].txn_id = generate_txn_id();
+                    (*pending)[i].deadline_ns = now + DNS_TIMEOUT_NS;
+                    send_query_for_slot(&(*pending)[i]);
+                } else {
+                    // All retries exhausted: timeout
+                    push_completion(DnsCompletion {
+                        reply_cap_slot: (*pending)[i].reply_cap_slot,
+                        query_type: (*pending)[i].query_type,
+                        success: false,
+                        dns_result: DnsResult { ip_count: 0, ips: [0; MAX_DNS_RESULTS], ttl: 0 },
+                        error: DnsError::Timeout,
+                        ptr_hostname: [0; 256],
+                        ptr_hostname_len: 0,
+                    });
+                    (*pending)[i].active = false;
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Returns true if any DNS queries are in flight.
+pub(crate) fn has_pending() -> bool {
+    // SAFETY: Single-threaded server.
+    unsafe {
+        let pending = &raw const PENDING;
+        let mut i = 0;
+        while i < MAX_PENDING_DNS {
+            if (*pending)[i].active {
+                return true;
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Returns the nearest deadline among all active pending DNS queries.
+/// Used by the event loop to calculate recv_timed timeout.
+pub(crate) fn nearest_deadline_ns() -> u64 {
+    let mut nearest = u64::MAX;
+    // SAFETY: Single-threaded server.
+    unsafe {
+        let pending = &raw const PENDING;
+        let mut i = 0;
+        while i < MAX_PENDING_DNS {
+            if (*pending)[i].active && (*pending)[i].deadline_ns < nearest {
+                nearest = (*pending)[i].deadline_ns;
+            }
+            i += 1;
+        }
+    }
+    nearest
+}
+
+/// Pop a completed DNS query from the completion queue.
+pub(crate) fn pop_completion() -> Option<DnsCompletion> {
+    // SAFETY: Single-threaded server.
+    unsafe {
+        let count = *(&raw const COMPLETION_COUNT);
+        if count == 0 {
+            return None;
+        }
+        *(&raw mut COMPLETION_COUNT) = count - 1;
+        Some((*(&raw const COMPLETION_QUEUE))[count - 1])
+    }
 }

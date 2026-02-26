@@ -93,7 +93,7 @@ pub unsafe fn posix_getaddrinfo(node: *const u8, result: *mut DnsAddrInfo) -> i3
         while *node.add(len) != 0 && len < 120 {
             len += 1;
         }
-        if len == 0 {
+        if len == 0 || len >= 120 {
             return -1;
         }
 
@@ -129,7 +129,7 @@ pub unsafe fn posix_gethostbyname(name: *const u8) -> u32 {
         while *name.add(len) != 0 && len < 120 {
             len += 1;
         }
-        if len == 0 {
+        if len == 0 || len >= 120 {
             return 0;
         }
         let hostname = core::slice::from_raw_parts(name, len);
@@ -168,7 +168,10 @@ pub unsafe fn dns_reverse_lookup(ip: u32, hostname_out: *mut u8, hostname_max: u
 
         let result_len = reply.regs[0] as usize;
         let copy_len = core::cmp::min(result_len, hostname_max);
-        if copy_len > 0 && !hostname_out.is_null() {
+        if copy_len > 0 {
+            if hostname_out.is_null() {
+                return 0;
+            }
             // SAFETY: Reading hostname bytes packed in reply registers.
             let src = &reply.regs[1] as *const u64 as *const u8;
             core::ptr::copy_nonoverlapping(src, hostname_out, copy_len);

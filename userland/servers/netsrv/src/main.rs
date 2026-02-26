@@ -48,6 +48,7 @@ const CAP_SERVER_EP: u64 = 68;
 const CAP_RX_NOTIFICATION: u64 = 80;
 const CAP_TX_NOTIFICATION: u64 = 82;
 const CAP_VFS_CALLBACK_EP: u64 = 83;
+const CAP_REPLY_TEMP: u64 = 89;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -502,7 +503,10 @@ fn check_self_test() {
 /// with the result; asynchronous operations (connect, recv, accept) return
 /// `SALTY_PENDING` and the TCP/UDP state machine will push a completion
 /// later (delivered to VFS via the callback endpoint).
-fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) {
+///
+/// Returns `true` if the reply is deferred (DNS async): the caller's reply
+/// cap has been saved and will be replied to later via `drain_dns_completions`.
+fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
     match msg.label {
         NET_REGISTER_VFS => {
             // VFS registers its badged callback EP as an extra cap.
@@ -737,66 +741,131 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) {
             let hostname_len = msg.regs[0] as usize;
             if hostname_len == 0 || hostname_len > 120 {
                 reply.label = SALTY_INVALID_ARGUMENT;
-                return;
+                return false;
             }
             // SAFETY: Reading hostname bytes from IPC message register area.
-            // hostname_len is at most 120 bytes, which fits in regs[1..16] (15 x u64 = 120 bytes).
+            // hostname_len is at most 120 bytes, which fits in regs[1..16] (indices 1..=15, i.e., 15 u64 registers = 120 bytes).
             let mut hostname = [0u8; 120];
             unsafe {
                 let src = &msg.regs[1] as *const u64 as *const u8;
                 core::ptr::copy_nonoverlapping(src, hostname.as_mut_ptr(), hostname_len);
             }
-            match net::dns::dns_resolve_sync(&hostname[..hostname_len]) {
-                Ok(result) => {
-                    reply.label = SALTY_OK;
-                    reply.regs[0] = result.ip_count as u64;
-                    reply.regs[1] = result.ttl as u64;
-                    let mut i = 0;
-                    while i < result.ip_count as usize && i < 4 {
-                        reply.regs[2 + i] = result.ips[i] as u64;
-                        i += 1;
-                    }
-                    reply.length = 2 + result.ip_count as u64;
-                }
-                Err(net::dns::DnsError::NxDomain) => {
-                    reply.label = SALTY_DNS_NXDOMAIN;
-                }
-                Err(net::dns::DnsError::ServerFail) => {
-                    reply.label = SALTY_DNS_SERVER_FAIL;
-                }
-                Err(_) => {
-                    reply.label = SALTY_NOT_FOUND;
+            match net::dns::start_resolve(&hostname[..hostname_len]) {
+                Some(_) => return true, // deferred
+                None => {
+                    reply.label = SALTY_OUT_OF_MEMORY;
                 }
             }
         }
         NET_DNS_RESOLVE_PTR => {
             let ip = msg.regs[0] as u32;
-            let mut hostname = [0u8; 256];
-            match net::dns::dns_resolve_ptr_sync(ip, &mut hostname) {
-                Ok(len) => {
-                    reply.label = SALTY_OK;
-                    let copy_len = core::cmp::min(len, 152);
-                    reply.regs[0] = copy_len as u64;
-                    // SAFETY: Writing hostname bytes into reply register area.
-                    unsafe {
-                        let dst = &raw mut reply.regs[1] as *mut u8;
-                        core::ptr::copy_nonoverlapping(hostname.as_ptr(), dst, copy_len);
-                    }
-                    reply.length = 1 + ((copy_len as u64 + 7) / 8);
-                }
-                Err(net::dns::DnsError::NxDomain) => {
-                    reply.label = SALTY_DNS_NXDOMAIN;
-                }
-                Err(net::dns::DnsError::ServerFail) => {
-                    reply.label = SALTY_DNS_SERVER_FAIL;
-                }
-                Err(_) => {
-                    reply.label = SALTY_NOT_FOUND;
+            match net::dns::start_resolve_ptr(ip) {
+                Some(_) => return true, // deferred
+                None => {
+                    reply.label = SALTY_OUT_OF_MEMORY;
                 }
             }
         }
         _ => {
             reply.label = SALTY_INVALID_OPERATION;
+        }
+    }
+    false
+}
+
+/// Map a DNS error to an IPC error label.
+fn dns_error_to_label(err: net::dns::DnsError) -> u64 {
+    match err {
+        net::dns::DnsError::NxDomain => SALTY_DNS_NXDOMAIN,
+        net::dns::DnsError::ServerFail => SALTY_DNS_SERVER_FAIL,
+        net::dns::DnsError::Timeout => SALTY_TIMED_OUT,
+        net::dns::DnsError::Other => SALTY_NOT_FOUND,
+    }
+}
+
+/// Drain completed async DNS queries and send deferred replies to saved
+/// caller caps.
+fn drain_dns_completions(ctx: *mut IpcContext) {
+    while let Some(c) = net::dns::pop_completion() {
+        let mut reply = SaltyMsg::zeroed();
+        match c.query_type {
+            net::dns::DnsQueryType::A => {
+                if c.success {
+                    reply.label = SALTY_OK;
+                    reply.regs[0] = c.dns_result.ip_count as u64;
+                    reply.regs[1] = c.dns_result.ttl as u64;
+                    let mut i = 0;
+                    while i < c.dns_result.ip_count as usize && i < 4 {
+                        reply.regs[2 + i] = c.dns_result.ips[i] as u64;
+                        i += 1;
+                    }
+                    reply.length = 2 + c.dns_result.ip_count as u64;
+                } else {
+                    reply.label = dns_error_to_label(c.error);
+                }
+            }
+            net::dns::DnsQueryType::Ptr => {
+                if c.success {
+                    reply.label = SALTY_OK;
+                    let copy_len = core::cmp::min(c.ptr_hostname_len, 152);
+                    reply.regs[0] = copy_len as u64;
+                    if copy_len > 0 {
+                        // SAFETY: Writing hostname bytes into reply register area.
+                        unsafe {
+                            let dst = &raw mut reply.regs[1] as *mut u8;
+                            core::ptr::copy_nonoverlapping(
+                                c.ptr_hostname.as_ptr(),
+                                dst,
+                                copy_len,
+                            );
+                        }
+                    }
+                    reply.length = 1 + ((copy_len as u64 + 7) / 8);
+                } else {
+                    reply.label = dns_error_to_label(c.error);
+                }
+            }
+        }
+        // SAFETY: IPC context is valid; reply cap slot was saved by start_resolve*.
+        unsafe {
+            ipc::send_ctx(ctx, c.reply_cap_slot, &raw const reply);
+        }
+    }
+}
+
+/// Receive the next event on the server EP, with a timeout if DNS queries
+/// are pending. On timeout, sets badge to 1 to trigger notification
+/// processing (which calls `dns::process_pending` to check deadlines).
+///
+/// # Safety
+///
+/// `ctx` must be a valid IPC context. `msg` and `badge` must be valid pointers.
+unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut SaltyMsg, badge: *mut u64) {
+    unsafe {
+        if net::dns::has_pending() {
+            let now = net::dns::clock_monotonic_ns();
+            let deadline = net::dns::nearest_deadline_ns();
+            let timeout = deadline.saturating_sub(now).max(1_000_000); // min 1ms
+            let r = salty::syscall::syscall(
+                SYS_RECV_TIMED,
+                CAP_SERVER_EP,
+                timeout,
+                0,
+                0,
+                0,
+                0,
+            );
+            if r.error == 0 {
+                *badge = r.value;
+                // Read message from IPC buffer (same as recv_ctx does)
+                let buf = (*ctx).ipc_buffer as *const SaltyMsg;
+                *msg = *buf;
+            } else {
+                // Timeout: trigger notification processing to check DNS deadlines
+                *badge = 1;
+            }
+        } else {
+            ipc::recv_ctx(ctx, CAP_SERVER_EP, msg, badge);
         }
     }
 }
@@ -969,32 +1038,52 @@ fn event_loop() -> ! {
             process_rx_from_shm();
             check_self_test();
             net::tcp::process_timers();
+            net::dns::process_pending();
             drain_completion_queue();
+            drain_dns_completions(ctx);
 
-            // Wait for next event (no reply needed for notifications)
+            // Wait for next event (with timeout if DNS queries are pending)
             msg = SaltyMsg::zeroed();
             badge = 0;
             // SAFETY: IPC context is valid.
             unsafe {
-                ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge);
+                do_recv(ctx, &raw mut msg, &raw mut badge);
             }
         } else {
             // IPC request on server endpoint
             let mut reply = SaltyMsg::zeroed();
-            dispatch_ipc(&msg, &mut reply);
+            let deferred = dispatch_ipc(&msg, &mut reply);
 
-            // Reply to caller AND wait for next event atomically
             msg = SaltyMsg::zeroed();
             badge = 0;
-            // SAFETY: IPC context is valid.
-            unsafe {
-                ipc::reply_recv_ctx(
-                    ctx,
-                    CAP_SERVER_EP,
-                    &raw const reply,
-                    &raw mut msg,
-                    &raw mut badge,
-                );
+
+            if deferred {
+                // DNS deferred: reply cap was saved; just wait for next event
+                // SAFETY: IPC context is valid.
+                unsafe {
+                    do_recv(ctx, &raw mut msg, &raw mut badge);
+                }
+            } else if net::dns::has_pending() {
+                // Non-deferred reply, but DNS is pending: split reply + recv
+                // so we can use a timed recv for DNS deadline tracking.
+                // SAFETY: IPC context is valid; reply cap saved then sent.
+                unsafe {
+                    let _ = invoke::cnode_save_caller(CAP_SELF_CSPACE, CAP_REPLY_TEMP);
+                    ipc::send_ctx(ctx, CAP_REPLY_TEMP, &raw const reply);
+                    do_recv(ctx, &raw mut msg, &raw mut badge);
+                }
+            } else {
+                // Normal path: reply + recv atomically
+                // SAFETY: IPC context is valid.
+                unsafe {
+                    ipc::reply_recv_ctx(
+                        ctx,
+                        CAP_SERVER_EP,
+                        &raw const reply,
+                        &raw mut msg,
+                        &raw mut badge,
+                    );
+                }
             }
         }
     }

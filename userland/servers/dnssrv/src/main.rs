@@ -101,7 +101,7 @@ fn signal_ready() {
 
 fn clock_monotonic_ns() -> u64 {
     let r = salty::syscall::syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0);
-    (r.error * 1_000_000_000) + r.value
+    if r.error != 0 { 0 } else { r.value }
 }
 
 fn hostname_eq(a: &[u8], b: &[u8]) -> bool {
@@ -367,7 +367,11 @@ fn handle_reverse(msg: &SaltyMsg, reply: &mut SaltyMsg) {
         )
     };
     if err != 0 || netsrv_reply.label != SALTY_OK {
-        reply.label = SALTY_NOT_FOUND;
+        reply.label = if netsrv_reply.label != 0 {
+            netsrv_reply.label
+        } else {
+            SALTY_NOT_FOUND
+        };
         return;
     }
 
