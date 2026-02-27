@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Per-client state management and file descriptor cleanup on exit.
 
-use salty::consts::*;
-use salty::ipc;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::ipc;
+use besalt::types::*;
 
 use crate::consts::*;
 use crate::path::resolve_path;
@@ -66,7 +66,7 @@ pub(crate) unsafe fn get_client(badge: u64) -> *mut ClientState {
     }
 }
 
-pub(crate) unsafe fn extract_path(msg: *const SaltyMsg, reg_offset: usize, path: *mut u8) -> u8 {
+pub(crate) unsafe fn extract_path(msg: *const BesaltMsg, reg_offset: usize, path: *mut u8) -> u8 {
     unsafe {
         let mut path_len = (*msg).regs[reg_offset] as u8;
         if (path_len as usize) > MAX_PATH_LEN {
@@ -127,8 +127,8 @@ pub(crate) unsafe fn send_client_exit_error(reply_slot: u64) {
         if reply_slot == 0 {
             return;
         }
-        let mut wake = SaltyMsg::zeroed();
-        wake.label = SALTY_INVALID_OPERATION;
+        let mut wake = BesaltMsg::zeroed();
+        wake.label = BESALT_INVALID_OPERATION;
         ipc::send_ctx(ipc_ctx(), reply_slot, &raw const wake);
     }
 }
@@ -291,8 +291,8 @@ pub(crate) unsafe fn cleanup_client_state(dead_badge: u64) {
         }
 
         // Notify ttyd to release any controlling terminal owned by this dead client.
-        let mut treq = SaltyMsg::zeroed();
-        let mut treply = SaltyMsg::zeroed();
+        let mut treq = BesaltMsg::zeroed();
+        let mut treply = BesaltMsg::zeroed();
         treq.label = TTYD_CLIENT_EXIT;
         treq.regs[0] = dead_badge;
         treq.length = 1;
@@ -302,10 +302,10 @@ pub(crate) unsafe fn cleanup_client_state(dead_badge: u64) {
     }
 }
 
-pub(crate) unsafe fn handle_client_exit(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
+pub(crate) unsafe fn handle_client_exit(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
     unsafe {
         let dead_badge = (*msg).regs[0];
         cleanup_client_state(dead_badge);
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }

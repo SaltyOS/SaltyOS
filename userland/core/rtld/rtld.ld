@@ -1,4 +1,4 @@
-/* SaltyOS runtime dynamic linker (ld-salty.so) linker script
+/* SaltyOS runtime dynamic linker (ld-besalt.so) linker script
  * SPDX-License-Identifier: GPL-2.0-only
  *
  * Produces a static PIE (ET_DYN with entry point, no interpreter).

@@ -10,7 +10,7 @@ This document provides a technical overview of the SaltyOS system architecture.
 │                         (shell, utilities, etc.)                            │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                           System Libraries                                   │
-│              (libsalty, POSIX libc, protocol libs)                          │
+│              (libbesalt, POSIX libc, protocol libs)                          │
 ├─────────────┬─────────────┬─────────────┬─────────────┬─────────────────────┤
 │    init     │   procmgr   │     vfs     │  nameserv   │      drivers        │
 │             │             │   saltyfs   │             │  (pci,nvme,usb)     │
@@ -349,7 +349,7 @@ Virtual Address (48-bit):
 graph TB
     subgraph Userspace
         APP[Application]
-        LIBSALTY[libsalty]
+        LIBSALTY[libbesalt]
         VFS[VFS Server]
         PROCMGR[Process Manager]
         DRIVER[Device Driver]
@@ -484,7 +484,7 @@ SaltyOS/
 │   └── services/                 # .service files for boot ordering
 │
 ├── lib/
-│   └── libsalty/                 # Userspace system library
+│   └── libbesalt/                 # Userspace system library
 │       └── src/ (consts.rs, cpio.rs, elf_dynamic.rs, elf_loader.rs,
 │                framebuffer.rs, invoke.rs, ipc.rs, layout.rs, lib.rs,
 │                posix/ (mod.rs, at.rs, file.rs, misc.rs, pipe.rs,

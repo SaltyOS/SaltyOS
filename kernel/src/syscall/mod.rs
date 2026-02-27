@@ -481,7 +481,7 @@ fn construct_message(
 
 /// Write received IPC message to current thread's IPC buffer
 ///
-/// Writes in `struct salty_msg` layout (matching userland overlay):
+/// Writes in `struct besalt_msg` layout (matching userland overlay):
 ///   msg[0] = label
 ///   msg[1] = length
 ///   msg[2..5] = regs[0..3]  (inline MRs)

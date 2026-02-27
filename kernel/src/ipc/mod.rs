@@ -45,14 +45,14 @@ impl Message {
 
 /// IPC Buffer layout (mapped into user VSpace, shared between kernel and user)
 ///
-/// The msg[] array is overlaid by userland as `struct salty_msg`:
+/// The msg[] array is overlaid by userland as `struct besalt_msg`:
 ///   msg[0] = label, msg[1] = length, msg[2..21] = regs[0..19]
 /// So 22 slots = 2 header + 20 message registers.
 ///
 /// Total size: 4096 bytes (one page)
 #[repr(C)]
 pub struct IpcBuffer {
-    /// salty_msg overlay: [label, length, regs[0..19]]
+    /// besalt_msg overlay: [label, length, regs[0..19]]
     pub msg: [u64; 22],         // 0x000: 176 bytes
     /// Badge received from sender
     pub badge: u64,             // 0x0B0: 8 bytes

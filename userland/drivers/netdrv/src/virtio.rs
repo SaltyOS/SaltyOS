@@ -4,11 +4,11 @@
 //! Manages two virtqueues: RX (queue 0) for receiving packets and TX (queue 1)
 //! for transmitting packets. DMA buffers are allocated via mmsrv.
 
-use salty::consts::*;
-use salty::ipc;
-use salty::invoke;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::ipc;
+use besalt::invoke;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 use crate::{ipc_ctx, puts};
 
@@ -244,13 +244,13 @@ fn vaddr_to_phys(vaddr: u64) -> u64 {
 /// Query pcisrv for virtio-net device.
 /// Returns (bus, dev, func, bar0_raw, bar0_full).
 pub(crate) fn find_virtio_net() -> Option<(u8, u8, u8, u32, u64)> {
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = PCI_FIND_DEVICE;
     msg.length = 2;
     msg.regs[0] = VIRTIO_VENDOR as u64;
     msg.regs[1] = VIRTIO_NET_DEVICE as u64;
 
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     // SAFETY: ipc_ctx() returns a valid pointer to our thread-local IPC context.
     let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
@@ -268,7 +268,7 @@ pub(crate) fn find_virtio_net() -> Option<(u8, u8, u8, u32, u64)> {
 /// Get BAR/IRQ info from pcisrv.
 /// Returns (bar_base, bar_bits, bar_size, irq, bar_is_io, has_irq_handler).
 pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u32, u8, bool, bool)> {
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = PCI_GET_CAPS;
     msg.length = 3;
     msg.regs[0] = bus as u64;
@@ -280,7 +280,7 @@ pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u
         ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_RECEIVED_BAR, 0);
     }
 
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     // SAFETY: ipc_ctx() returns a valid pointer.
     let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
@@ -349,14 +349,14 @@ pub(crate) fn init_virtio(bar0_raw: u32, bar_size: u32) -> bool {
 /// Allocate memory via mmsrv MM_MMAP.
 fn mmap_alloc(hint_vaddr: u64, num_pages: u64) -> Option<u64> {
     let ctx = ipc_ctx();
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = MM_MMAP;
     msg.length = 4;
     msg.regs[0] = hint_vaddr;
     msg.regs[1] = num_pages * 4096;
     msg.regs[2] = 0x3; // PROT_READ | PROT_WRITE
     msg.regs[3] = 0x22; // MAP_PRIVATE | MAP_ANONYMOUS
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     // SAFETY: ipc_ctx() is valid.
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {

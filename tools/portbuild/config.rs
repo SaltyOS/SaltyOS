@@ -12,8 +12,8 @@ pub struct BuildEnv {
     pub ranlib: String,
     pub strip: String,
     pub autotools_host: String,
-    pub salty_host: String,
-    pub salty_inc: PathBuf,
+    pub besalt_host: String,
+    pub besalt_inc: PathBuf,
     pub build_root: PathBuf,
     pub nproc: usize,
     pub verbose: bool,
@@ -27,14 +27,14 @@ impl BuildEnv {
             std::env::current_dir().unwrap().join(build_dir)
         };
 
-        // saltyc include path: <project_root>/lib/saltyc/include
+        // besaltc include path: <project_root>/lib/besalt/c/include
         // We derive project root from build_root (build_root is usually <project>/build)
         let project_root = build_root.parent().unwrap_or(&build_root);
-        let salty_inc = project_root.join("lib").join("saltyc").join("include");
+        let besalt_inc = project_root.join("lib").join("besalt").join("c").join("include");
 
-        // Paths to libsalty/libc build artifacts for linking
-        let libsalty_dir = build_root.join("lib").join("libsalty");
-        let saltyc_dir = build_root.join("lib").join("saltyc");
+        // Paths to libbesalt/libc build artifacts for linking
+        let libbesalt_dir = build_root.join("lib").join("besalt").join("lib");
+        let besaltc_dir = build_root.join("lib").join("besalt").join("c");
         let rust_dir = build_root.join("rust");
 
         // Resolve the SaltyOS clang: prefer SALTYOS_TOOLCHAIN_PREFIX env var,
@@ -73,10 +73,10 @@ impl BuildEnv {
         // -fPIC is implied by --target=x86_64-unknown-saltyos.
         let cflags = format!(
             "-nostdinc -fno-stack-protector \
-             -isystem {salty_inc} \
+             -isystem {besalt_inc} \
              -isystem {clang_res}/include \
              --target=x86_64-unknown-saltyos",
-            salty_inc = salty_inc.display(),
+            besalt_inc = besalt_inc.display(),
             clang_res = clang_resource_dir,
         );
 
@@ -85,18 +85,18 @@ impl BuildEnv {
         let ldflags = format!(
             "-nostdlib -nostartfiles \
              --target=x86_64-unknown-saltyos \
-             -L{saltyc} -L{libsalty} -L{rust}",
-            saltyc = saltyc_dir.display(),
-            libsalty = libsalty_dir.display(),
+             -L{besaltc} -L{libbesalt} -L{rust}",
+            besaltc = besaltc_dir.display(),
+            libbesalt = libbesalt_dir.display(),
             rust = rust_dir.display(),
         );
 
         // LIBS: objects and libraries (autotools appends after source)
         let libs = format!(
-            "{saltyc}/crt_start.o \
-             -lc -lsalty \
+            "{besaltc}/crt_start.o \
+             -lc -lbesalt \
              {rust}/core.o {rust}/compiler_builtins.o",
-            saltyc = saltyc_dir.display(),
+            besaltc = besaltc_dir.display(),
             rust = rust_dir.display(),
         );
 
@@ -111,8 +111,8 @@ impl BuildEnv {
             // Autotools' config.sub does not know "saltyos" yet. Use a canonical
             // host tuple for configure while keeping the real target in CC/CFLAGS.
             autotools_host: "x86_64-unknown-elf".to_string(),
-            salty_host: "x86_64-unknown-saltyos".to_string(),
-            salty_inc,
+            besalt_host: "x86_64-unknown-saltyos".to_string(),
+            besalt_inc,
             build_root,
             nproc: jobs,
             verbose,

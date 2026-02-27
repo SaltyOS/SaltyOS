@@ -17,13 +17,13 @@
 #![no_std]
 #![no_main]
 
-extern crate salty;
+extern crate besalt;
 
-use salty::consts::*;
-use salty::ipc;
-use salty::serial;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::ipc;
+use besalt::serial;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_CSPACE: u64 = 2;
@@ -62,11 +62,11 @@ fn puts(s: &[u8]) {
 }
 
 fn ipc_ctx() -> *mut IpcContext {
-    &raw mut salty::__salty_ipc_ctx
+    &raw mut besalt::__besalt_ipc_ctx
 }
 
 fn signal_ready() {
-    let _ = salty::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 fn name_equal(a: &[u8], alen: u8, b: &[u8], blen: u8) -> bool {
@@ -81,7 +81,7 @@ fn name_equal(a: &[u8], alen: u8, b: &[u8], blen: u8) -> bool {
     true
 }
 
-unsafe fn extract_name(msg: *const SaltyMsg, out: &mut [u8; MAX_NAME_LEN]) -> u8 {
+unsafe fn extract_name(msg: *const BesaltMsg, out: &mut [u8; MAX_NAME_LEN]) -> u8 {
     unsafe {
         let mut len = (*msg).regs[0] as u8;
         if (len as usize) > MAX_NAME_LEN {
@@ -95,14 +95,14 @@ unsafe fn extract_name(msg: *const SaltyMsg, out: &mut [u8; MAX_NAME_LEN]) -> u8
     }
 }
 
-unsafe fn handle_register(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
+unsafe fn handle_register(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
     unsafe {
         let mut name = [0u8; MAX_NAME_LEN];
         let name_len = extract_name(msg, &mut name);
 
         if name_len == 0 {
             puts(b"[NAMESERV] REGISTER: empty name\n");
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
@@ -116,14 +116,14 @@ unsafe fn handle_register(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
                 lb.bytes(&name[..name_len as usize]);
                 lb.str(b"'\n");
                 lb.flush();
-                (*reply).label = SALTY_ALREADY_EXISTS;
+                (*reply).label = BESALT_ALREADY_EXISTS;
                 return;
             }
         }
 
         if SERVICE_COUNT >= MAX_SERVICES {
             puts(b"[NAMESERV] REGISTER: table full\n");
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -146,17 +146,17 @@ unsafe fn handle_register(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
         lb.str(b"\n");
         lb.flush();
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
 
-unsafe fn handle_lookup(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
+unsafe fn handle_lookup(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
     unsafe {
         let mut name = [0u8; MAX_NAME_LEN];
         let name_len = extract_name(msg, &mut name);
 
         if name_len == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
@@ -165,7 +165,7 @@ unsafe fn handle_lookup(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
                 && name_equal(&SERVICES[i].name, SERVICES[i].name_len, &name, name_len)
             {
                 ipc::set_send_cap_ctx(ipc_ctx(), 0, SERVICES[i].ep_slot);
-                (*reply).label = SALTY_OK;
+                (*reply).label = BESALT_OK;
                 (*reply).length = 0;
                 return;
             }
@@ -176,7 +176,7 @@ unsafe fn handle_lookup(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
         lb.bytes(&name[..name_len as usize]);
         lb.str(b"'\n");
         lb.flush();
-        (*reply).label = SALTY_NOT_FOUND;
+        (*reply).label = BESALT_NOT_FOUND;
     }
 }
 
@@ -184,7 +184,7 @@ unsafe fn handle_lookup(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
 pub extern "C" fn _start() -> ! {
     puts(b"[NAMESERV] SaltyOS name server starting\n");
 
-    let err = salty::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
+    let err = besalt::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
     if err != 0 {
         let mut lb = LineBuf::new();
         lb.str(b"[NAMESERV] FAIL: set IPC buffer err=");
@@ -206,7 +206,7 @@ pub extern "C" fn _start() -> ! {
     signal_ready();
 
     // Initial recv
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     let mut badge: u64 = 0;
 
     let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
@@ -217,7 +217,7 @@ pub extern "C" fn _start() -> ! {
 
     // Server loop
     loop {
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
 
         unsafe {
             match msg.label {
@@ -229,7 +229,7 @@ pub extern "C" fn _start() -> ! {
                     lb.hex(msg.label);
                     lb.str(b"\n");
                     lb.flush();
-                    reply.label = SALTY_INVALID_OPERATION;
+                    reply.label = BESALT_INVALID_OPERATION;
                 }
             }
         }
@@ -268,6 +268,6 @@ pub extern "C" fn _start() -> ! {
 
 fn idle() -> ! {
     loop {
-        salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 }

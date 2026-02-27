@@ -1,7 +1,7 @@
 //! SaltyOS Process Manager
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! Panic handler provided by libsalty.so (dynamic linking).
+//! Panic handler provided by libbesalt.so (dynamic linking).
 
 #![no_std]
 #![no_main]
@@ -15,9 +15,9 @@ mod session;
 mod signal;
 mod spawn_tx;
 
-use salty::ipc;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::ipc;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 use proc_table::{
     find_by_badge, find_by_pid, init_proctab, proctab, proctab_cap, MAX_NAME_LEN, PROC_FREE,
@@ -70,7 +70,7 @@ const PM_LIST_PIDS: u64 = 27;
 const PM_GET_PROC_INFO: u64 = 28;
 const PM_RESUME: u64 = 29;
 const PM_UMASK: u64 = 30;
-const SALTY_PENDING: u64 = 0x80;
+const BESALT_PENDING: u64 = 0x80;
 
 const PM_SIGKILL: usize = 9;
 const PM_SIGCHLD: usize = 17;
@@ -80,7 +80,7 @@ const PM_SIGTSTP: usize = 20;
 const PM_SIGTTIN: usize = 21;
 const PM_SIGTTOU: usize = 22;
 
-use salty::layout::{self};
+use besalt::layout::{self};
 
 const CHILD_RTLD_FRAME_SLOT_START: u64 = 64;
 const PROCMGR_SCRATCH_VADDR: u64 = 0x0000_0000_0500_0000;
@@ -109,46 +109,46 @@ const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
 const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
-const AT_SALTY_VSPACE: u64 = 0x1001;
-const AT_SALTY_SCRATCH: u64 = 0x1002;
-const AT_SALTY_INITRD: u64 = 0x1003;
-const AT_SALTY_INITRD_SZ: u64 = 0x1004;
-const AT_SALTY_FRAME_SLOT: u64 = 0x1005;
-const AT_SALTY_SHARED_LIB_BASE: u64 = 0x1006;
-const AT_SALTY_SLOT_BASE: u64 = 0x1007;
-const AT_SALTY_SLOT_COUNT: u64 = 0x1008;
-const AT_SALTY_CSPACE_NTFN: u64 = 0x100A;
+const AT_BESALT_VSPACE: u64 = 0x1001;
+const AT_BESALT_SCRATCH: u64 = 0x1002;
+const AT_BESALT_INITRD: u64 = 0x1003;
+const AT_BESALT_INITRD_SZ: u64 = 0x1004;
+const AT_BESALT_FRAME_SLOT: u64 = 0x1005;
+const AT_BESALT_SHARED_LIB_BASE: u64 = 0x1006;
+const AT_BESALT_SLOT_BASE: u64 = 0x1007;
+const AT_BESALT_SLOT_COUNT: u64 = 0x1008;
+const AT_BESALT_CSPACE_NTFN: u64 = 0x100A;
 
 // ---- waitpid options ----
 const WNOHANG: u32 = 1;
 const WUNTRACED: u32 = 2;
 
 // ---- Shorthand re-exports ----
-const OBJ_TCB: u64 = salty::OBJ_TCB;
-const OBJ_VSPACE: u64 = salty::OBJ_VSPACE;
-const OBJ_CNODE: u64 = salty::OBJ_CNODE;
-const OBJ_SCHED_CONTEXT: u64 = salty::OBJ_SCHED_CONTEXT;
-const OBJ_NOTIFICATION: u64 = salty::OBJ_NOTIFICATION;
-const SALTY_OK: u64 = salty::SALTY_OK;
-const SALTY_OUT_OF_MEMORY: u64 = salty::SALTY_OUT_OF_MEMORY;
-const SALTY_NOT_FOUND: u64 = salty::SALTY_NOT_FOUND;
-const SALTY_INVALID_ARGUMENT: u64 = salty::SALTY_INVALID_ARGUMENT;
-const SALTY_INVALID_OPERATION: u64 = salty::SALTY_INVALID_OPERATION;
-const SALTY_WOULD_BLOCK: u64 = salty::SALTY_WOULD_BLOCK;
-const SALTY_BUSY: u64 = salty::SALTY_BUSY;
-const VSPACE_FLAG_WRITABLE: u64 = salty::VSPACE_FLAG_WRITABLE;
-const VSPACE_FLAG_USER: u64 = salty::VSPACE_FLAG_USER;
-const CAP_RIGHTS_ALL: u64 = salty::CAP_RIGHTS_ALL;
+const OBJ_TCB: u64 = besalt::OBJ_TCB;
+const OBJ_VSPACE: u64 = besalt::OBJ_VSPACE;
+const OBJ_CNODE: u64 = besalt::OBJ_CNODE;
+const OBJ_SCHED_CONTEXT: u64 = besalt::OBJ_SCHED_CONTEXT;
+const OBJ_NOTIFICATION: u64 = besalt::OBJ_NOTIFICATION;
+const BESALT_OK: u64 = besalt::BESALT_OK;
+const BESALT_OUT_OF_MEMORY: u64 = besalt::BESALT_OUT_OF_MEMORY;
+const BESALT_NOT_FOUND: u64 = besalt::BESALT_NOT_FOUND;
+const BESALT_INVALID_ARGUMENT: u64 = besalt::BESALT_INVALID_ARGUMENT;
+const BESALT_INVALID_OPERATION: u64 = besalt::BESALT_INVALID_OPERATION;
+const BESALT_WOULD_BLOCK: u64 = besalt::BESALT_WOULD_BLOCK;
+const BESALT_BUSY: u64 = besalt::BESALT_BUSY;
+const VSPACE_FLAG_WRITABLE: u64 = besalt::VSPACE_FLAG_WRITABLE;
+const VSPACE_FLAG_USER: u64 = besalt::VSPACE_FLAG_USER;
+const CAP_RIGHTS_ALL: u64 = besalt::CAP_RIGHTS_ALL;
 const INITRD_COPY_RIGHTS: u64 = (1 << 0) | (1 << 2) | (1 << 3);
 const UT_MIRROR_COUNT: Cap = 8;
-const INITRD_VADDR: u64 = salty::INITRD_VADDR;
-const BOOTINFO_VADDR: u64 = salty::BOOTINFO_VADDR;
-const BOOTINFO_MAGIC: u64 = salty::BOOTINFO_MAGIC;
+const INITRD_VADDR: u64 = besalt::INITRD_VADDR;
+const BOOTINFO_VADDR: u64 = besalt::BOOTINFO_VADDR;
+const BOOTINFO_MAGIC: u64 = besalt::BOOTINFO_MAGIC;
 
 // ---- CSpace expansion via bound notification ----
 const CHILD_CAP_CSPACE_NTFN: u64 = 10; // Minted notification for CSpace expansion signaling
-const CSPACE_EXPAND_BASE: u64 = salty::consts::CSPACE_EXPAND_BASE;
-const MAX_CSPACE_EXPANSIONS: usize = salty::consts::MAX_CSPACE_EXPANSIONS;
+const CSPACE_EXPAND_BASE: u64 = besalt::consts::CSPACE_EXPAND_BASE;
+const MAX_CSPACE_EXPANSIONS: usize = besalt::consts::MAX_CSPACE_EXPANSIONS;
 const CSPACE_EXPAND_BITS: u64 = 10; // 1024 slots per expansion sub-CNode
 
 /// Procmgr's bound notification cap (for receiving CSpace expansion signals).
@@ -176,14 +176,14 @@ fn read_boot_info_initrd_size() -> usize {
 // ===========================================================================
 
 fn puts(s: &[u8]) {
-    salty::serial::serial_puts(s);
+    besalt::serial::serial_puts(s);
 }
 fn ipc_ctx() -> *mut IpcContext {
-    &raw mut salty::__salty_ipc_ctx
+    &raw mut besalt::__besalt_ipc_ctx
 }
 
 fn signal_ready() {
-    let _ = salty::syscall::syscall(salty::SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = besalt::syscall::syscall(besalt::SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
@@ -213,7 +213,7 @@ fn strip_elf_suffix(name: &mut [u8], mut len: usize) -> usize {
 /// Extract process path/name from message regs and normalize by stripping
 /// an optional trailing ".elf" suffix.
 /// Returns the name buffer and its length.
-fn extract_name(msg: &SaltyMsg, name_reg_idx: usize) -> ([u8; MAX_NAME_LEN + 5], usize) {
+fn extract_name(msg: &BesaltMsg, name_reg_idx: usize) -> ([u8; MAX_NAME_LEN + 5], usize) {
     let mut name = [0u8; MAX_NAME_LEN + 5];
     let mut name_len = msg.regs[0] as usize;
     if name_len > MAX_NAME_LEN {
@@ -239,7 +239,7 @@ unsafe fn wait_for_child_ready(
     timeout_ns: u64,
 ) -> i32 {
     let start_ns = {
-        let now = salty::syscall::syscall(salty::SYS_CLOCK_GETTIME, 1, 0, 0, 0, 0, 0);
+        let now = besalt::syscall::syscall(besalt::SYS_CLOCK_GETTIME, 1, 0, 0, 0, 0, 0);
         if now.error == 0 {
             Some(now.value)
         } else {
@@ -249,18 +249,18 @@ unsafe fn wait_for_child_ready(
     let mut yields: usize = 0;
 
     loop {
-        let poll = salty::syscall::syscall(salty::SYS_POLL, ready_ntfn, 0, 0, 0, 0, 0);
+        let poll = besalt::syscall::syscall(besalt::SYS_POLL, ready_ntfn, 0, 0, 0, 0, 0);
         if poll.error == 0 {
             if (poll.value & READY_SIGNAL_BITS) != 0 {
                 return 0;
             }
-        } else if poll.error != SALTY_WOULD_BLOCK {
+        } else if poll.error != BESALT_WOULD_BLOCK {
             let mut lb = LineBuf::new();
             lb.str(b"[PROCMGR] ready poll failed err=");
             lb.hex(poll.error);
             lb.str(b"\n");
             lb.flush();
-            let _ = salty::invoke::tcb_suspend_retry(child_tcb, 4);
+            let _ = besalt::invoke::tcb_suspend_retry(child_tcb, 4);
             return -1;
         }
 
@@ -270,7 +270,7 @@ unsafe fn wait_for_child_ready(
         unsafe {
             let bound_ntfn = *(&raw const PM_BOUND_NTFN);
             if bound_ntfn != 0 {
-                let np = salty::syscall::syscall(salty::SYS_POLL, bound_ntfn, 0, 0, 0, 0, 0);
+                let np = besalt::syscall::syscall(besalt::SYS_POLL, bound_ntfn, 0, 0, 0, 0, 0);
                 if np.error == 0 && np.value != 0 {
                     let cs_bits = (np.value >> 16) & 0xFFFF;
                     if cs_bits != 0 {
@@ -281,7 +281,7 @@ unsafe fn wait_for_child_ready(
         }
 
         let timed_out = if let Some(start) = start_ns {
-            let now = salty::syscall::syscall(salty::SYS_CLOCK_GETTIME, 1, 0, 0, 0, 0, 0);
+            let now = besalt::syscall::syscall(besalt::SYS_CLOCK_GETTIME, 1, 0, 0, 0, 0, 0);
             if now.error == 0 {
                 now.value.saturating_sub(start) >= timeout_ns
             } else {
@@ -294,7 +294,7 @@ unsafe fn wait_for_child_ready(
             break;
         }
 
-        let _ = salty::syscall::syscall(salty::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        let _ = besalt::syscall::syscall(besalt::SYS_YIELD, 0, 0, 0, 0, 0, 0);
         yields += 1;
     }
 
@@ -303,7 +303,7 @@ unsafe fn wait_for_child_ready(
     lb.bytes(child_name);
     lb.str(b"\n");
     lb.flush();
-    let _ = salty::invoke::tcb_suspend_retry(child_tcb, 4);
+    let _ = besalt::invoke::tcb_suspend_retry(child_tcb, 4);
     -1
 }
 
@@ -311,29 +311,29 @@ unsafe fn wait_for_child_ready(
 // handle_getpid / handle_getppid
 // ===========================================================================
 
-unsafe fn handle_getpid(reply: &mut SaltyMsg, badge: u64) {
+unsafe fn handle_getpid(reply: &mut BesaltMsg, badge: u64) {
     let Some(idx) = find_by_badge(badge) else {
-        reply.label = SALTY_NOT_FOUND;
+        reply.label = BESALT_NOT_FOUND;
         return;
     };
-    reply.label = SALTY_OK;
+    reply.label = BESALT_OK;
     reply.length = 1;
     reply.regs[0] = unsafe { proctab(idx).pid as u64 };
 }
 
-unsafe fn handle_getppid(reply: &mut SaltyMsg, badge: u64) {
+unsafe fn handle_getppid(reply: &mut BesaltMsg, badge: u64) {
     let Some(idx) = find_by_badge(badge) else {
-        reply.label = SALTY_NOT_FOUND;
+        reply.label = BESALT_NOT_FOUND;
         return;
     };
-    reply.label = SALTY_OK;
+    reply.label = BESALT_OK;
     reply.length = 1;
     reply.regs[0] = unsafe { proctab(idx).ppid as u64 };
 }
 
 /// List all active PIDs.
 /// Reply: regs[0..18] = PIDs (up to 18), regs[19] = count.
-unsafe fn handle_list_pids(reply: &mut SaltyMsg) {
+unsafe fn handle_list_pids(reply: &mut BesaltMsg) {
     unsafe {
         let cap = proc_table::proctab_cap();
         let mut count: usize = 0;
@@ -345,7 +345,7 @@ unsafe fn handle_list_pids(reply: &mut SaltyMsg) {
             }
         }
         reply.regs[19] = count as u64;
-        reply.label = SALTY_OK;
+        reply.label = BESALT_OK;
         reply.length = 20;
     }
 }
@@ -354,11 +354,11 @@ unsafe fn handle_list_pids(reply: &mut SaltyMsg) {
 /// Request: regs[0] = pid
 /// Reply: regs[0]=pid, regs[1]=ppid, regs[2]=pgid, regs[3]=sid,
 ///        regs[4]=state, regs[5..9]=name(32B)
-unsafe fn handle_get_proc_info(msg: &SaltyMsg, reply: &mut SaltyMsg) {
+unsafe fn handle_get_proc_info(msg: &BesaltMsg, reply: &mut BesaltMsg) {
     unsafe {
         let pid = msg.regs[0] as u32;
         let Some(idx) = proc_table::find_by_pid(pid) else {
-            reply.label = SALTY_NOT_FOUND;
+            reply.label = BESALT_NOT_FOUND;
             return;
         };
         let p = &*proc_table::proctab(idx);
@@ -372,7 +372,7 @@ unsafe fn handle_get_proc_info(msg: &SaltyMsg, reply: &mut SaltyMsg) {
         for i in 0..32 {
             *dst.add(i) = p.name[i];
         }
-        reply.label = SALTY_OK;
+        reply.label = BESALT_OK;
         reply.length = 9;
     }
 }
@@ -381,16 +381,16 @@ unsafe fn handle_get_proc_info(msg: &SaltyMsg, reply: &mut SaltyMsg) {
 // handle_umask
 // ===========================================================================
 
-unsafe fn handle_umask(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
+unsafe fn handle_umask(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: u64) {
     let Some(idx) = find_by_badge(badge) else {
-        reply.label = SALTY_NOT_FOUND;
+        reply.label = BESALT_NOT_FOUND;
         return;
     };
     unsafe {
         let p = proctab(idx);
         let old = p.umask;
         p.umask = (msg.regs[0] as u32) & 0o777;
-        reply.label = SALTY_OK;
+        reply.label = BESALT_OK;
         reply.length = 1;
         reply.regs[0] = old as u64;
     }
@@ -406,7 +406,7 @@ pub extern "C" fn _start() -> ! {
 
     unsafe {
         // Set IPC buffer
-        let err = salty::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
+        let err = besalt::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
         if err != 0 {
             let mut lb = LineBuf::new();
             lb.str(b"[PROCMGR] FAIL: set IPC buffer err=");
@@ -415,11 +415,11 @@ pub extern "C" fn _start() -> ! {
             lb.flush();
             idle();
         }
-        salty::ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
+        besalt::ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
         puts(b"[PROCMGR] IPC buffer ready\n");
 
         // Initialize mmsrv client
-        salty::posix_mm::posix_mm_init(CAP_MMSRV_EP);
+        besalt::posix_mm::posix_mm_init(CAP_MMSRV_EP);
 
         // Initialize process table (allocates via mmsrv)
         init_proctab();
@@ -455,7 +455,7 @@ pub extern "C" fn _start() -> ! {
                     puts(b"[PROCMGR] WARN: retype notification failed\n");
                     alloc.free_single_slot(ntfn_slot);
                 } else {
-                    let err = salty::invoke::tcb_bind_notification(CAP_SELF_TCB, ntfn_slot);
+                    let err = besalt::invoke::tcb_bind_notification(CAP_SELF_TCB, ntfn_slot);
                     if err != 0 {
                         puts(b"[PROCMGR] WARN: bind notification failed\n");
                     } else {
@@ -472,10 +472,10 @@ pub extern "C" fn _start() -> ! {
 
         // Register with nameserv — blocks until nameserv Recv()s
         if CAP_NAMESERV_EP != 0 {
-            let mut reg_msg = SaltyMsg::zeroed();
-            let mut reg_reply = SaltyMsg::zeroed();
+            let mut reg_msg = BesaltMsg::zeroed();
+            let mut reg_reply = BesaltMsg::zeroed();
             let svc_name = b"procmgr";
-            reg_msg.label = salty::consts::POSIX_NS_REGISTER;
+            reg_msg.label = besalt::consts::POSIX_NS_REGISTER;
             reg_msg.regs[0] = svc_name.len() as u64;
             reg_msg.length = 1 + (svc_name.len() as u64 + 7) / 8;
             let dst = &raw mut reg_msg.regs[1] as *mut u8;
@@ -491,7 +491,7 @@ pub extern "C" fn _start() -> ! {
                 &raw const reg_msg,
                 &raw mut reg_reply,
             );
-            if err == 0 && reg_reply.label == SALTY_OK {
+            if err == 0 && reg_reply.label == BESALT_OK {
                 puts(b"[PROCMGR] registered with nameserv\n");
             } else {
                 puts(b"[PROCMGR] WARN: nameserv registration failed\n");
@@ -512,13 +512,13 @@ pub extern "C" fn _start() -> ! {
         }
 
         // Initial recv
-        let mut msg = SaltyMsg::zeroed();
+        let mut msg = BesaltMsg::zeroed();
         let mut badge: u64 = 0;
 
-        salty::invoke::cnode_delete(CAP_SELF_CSPACE, CAP_RECV_SCRATCH);
+        besalt::invoke::cnode_delete(CAP_SELF_CSPACE, CAP_RECV_SCRATCH);
         ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_RECV_SCRATCH, 0);
 
-        let err = salty::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge);
+        let err = besalt::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge);
         if err != 0 {
             puts(b"[PROCMGR] initial recv failed\n");
             idle();
@@ -526,7 +526,7 @@ pub extern "C" fn _start() -> ! {
 
         // Server loop
         loop {
-            let mut reply = SaltyMsg::zeroed();
+            let mut reply = BesaltMsg::zeroed();
             let mut skip_reply = false;
             // Bound notification delivery: label=0 and badge!=0 means the
             // kernel delivered a notification word instead of an IPC message.
@@ -593,18 +593,18 @@ pub extern "C" fn _start() -> ! {
                         lb.hex(msg.label);
                         lb.str(b"\n");
                         lb.flush();
-                        reply.label = SALTY_INVALID_OPERATION;
+                        reply.label = BESALT_INVALID_OPERATION;
                     }
                 }
             } // end else (notification vs IPC dispatch)
 
-            salty::invoke::cnode_delete(CAP_SELF_CSPACE, CAP_RECV_SCRATCH);
+            besalt::invoke::cnode_delete(CAP_SELF_CSPACE, CAP_RECV_SCRATCH);
             ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_RECV_SCRATCH, 0);
 
             let err = if skip_reply {
-                salty::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
+                besalt::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
             } else {
-                salty::ipc::reply_recv_ctx(
+                besalt::ipc::reply_recv_ctx(
                     ipc_ctx(),
                     CAP_SERVER_EP,
                     &raw const reply,
@@ -628,6 +628,6 @@ pub extern "C" fn _start() -> ! {
 
 fn idle() -> ! {
     loop {
-        salty::syscall::syscall(salty::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        besalt::syscall::syscall(besalt::SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 }

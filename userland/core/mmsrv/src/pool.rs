@@ -7,10 +7,10 @@
 
 use crate::client::{clear_cow_bit, find_region_by_addr};
 use crate::types::MmClient;
-use salty::consts::*;
-use salty::invoke;
-use salty::serial::LineBuf;
-use salty::types::Cap;
+use besalt::consts::*;
+use besalt::invoke;
+use besalt::serial::LineBuf;
+use besalt::types::Cap;
 
 const POOL_ENTRY_COUNT: usize = 510;
 const POOL_INITIAL_FILL: usize = 64;
@@ -126,7 +126,7 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
         }
 
         // Allocate pool page frame
-        let pool_frame = match salty::slot_alloc::slot_alloc() {
+        let pool_frame = match besalt::slot_alloc::slot_alloc() {
             Some(s) => s,
             None => return false,
         };
@@ -135,7 +135,7 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
         }
 
         // Allocate ring page frame
-        let ring_frame = match salty::slot_alloc::slot_alloc() {
+        let ring_frame = match besalt::slot_alloc::slot_alloc() {
             Some(s) => s,
             None => {
                 invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
@@ -187,7 +187,7 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
         // Allocate a temporary CNode to hold the initial frame caps.
         // We need a CNode with at least POOL_INITIAL_FILL slots.
         // CNode size_bits=7 gives 128 slots (>= 64).
-        let temp_cnode = match salty::slot_alloc::slot_alloc() {
+        let temp_cnode = match besalt::slot_alloc::slot_alloc() {
             Some(s) => s,
             None => {
                 invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
@@ -206,7 +206,7 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
         // When the temp CNode is deleted, only the copies are dropped (refcount→1).
         let mut filled: usize = 0;
         for i in 0..POOL_INITIAL_FILL {
-            let slot = match salty::slot_alloc::slot_alloc() {
+            let slot = match besalt::slot_alloc::slot_alloc() {
                 Some(s) => s,
                 None => break,
             };
@@ -467,7 +467,7 @@ pub(crate) unsafe fn replenish_pool(client: *mut MmClient, pool: *mut VSpacePool
         let replenish_count = core::cmp::min(free, POOL_INITIAL_FILL);
 
         // Allocate a temp CNode for the new frames (size_bits=7 -> 128 slots)
-        let temp_cnode = match salty::slot_alloc::slot_alloc() {
+        let temp_cnode = match besalt::slot_alloc::slot_alloc() {
             Some(s) => s,
             None => return,
         };
@@ -477,7 +477,7 @@ pub(crate) unsafe fn replenish_pool(client: *mut MmClient, pool: *mut VSpacePool
 
         let mut filled: usize = 0;
         for i in 0..replenish_count {
-            let slot = match salty::slot_alloc::slot_alloc() {
+            let slot = match besalt::slot_alloc::slot_alloc() {
                 Some(s) => s,
                 None => break,
             };

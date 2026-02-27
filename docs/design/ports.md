@@ -12,7 +12,7 @@ Key components:
 |-----------|----------|---------|
 | `.port` files | `ports/<name>/<name>.port` | Declarative port definitions |
 | `portbuild` | `tools/portbuild/` | Host-side build tool (Rust) |
-| `saltyc` | `lib/saltyc/` | C standard library (`libc.so`) |
+| `besaltc` | `lib/besaltc/` | C standard library (`libc.so`) |
 | Meson integration | `ports/meson.build` | Auto-discovery and build orchestration |
 
 ## Architecture
@@ -23,10 +23,10 @@ Key components:
 +-----------------------------------------------+
 |        Applications (bash, ls, cat...)         |
 +-----------------------------------------------+
-|  crt_start.o  |  libc.so (saltyc)             |
+|  crt_start.o  |  libc.so (besaltc)             |
 |   [_start]    |  [stdio, malloc, string, ...]  |
 +-----------------------------------------------+
-|           libsalty.so (Rust)                    |
+|           libbesalt.so (Rust)                    |
 |  [syscall wrappers, POSIX layer, IPC helpers]  |
 +-----------------------------------------------+
 |           SaltyOS Microkernel                  |
@@ -36,7 +36,7 @@ Key components:
 A C program links against:
 - `crt_start.o` — assembly entry point (`_start` -> `__libc_start_main`)
 - `libc.so` — C standard library (Rust + C implementation)
-- `libsalty.so` — system library with syscall wrappers
+- `libbesalt.so` — system library with syscall wrappers
 - `core.o` + `compiler_builtins.o` — Rust runtime support
 
 ### Build-Time Flow
@@ -215,7 +215,7 @@ Available in `[source].url`, `[source].subdir`, `[prepare]`, `[targets.cflags]`,
 | `${PORTDIR}` | Port directory (e.g., `ports/bash/`) |
 | `${BUILDDIR}` | Meson build root |
 | `${SALTY_HOST}` | Target triple (`x86_64-unknown-none`) |
-| `${SALTY_INC}` | Path to `lib/saltyc/include/` |
+| `${SALTY_INC}` | Path to `lib/besaltc/include/` |
 | `${NPROC}` | Number of parallel jobs |
 
 ## portbuild Tool
@@ -267,9 +267,9 @@ portbuild automatically configures the cross-compilation environment:
 | Variable | Value |
 |----------|-------|
 | `CC` | `clang` |
-| `CFLAGS` | `-ffreestanding -nostdlib -nostdinc -fno-stack-protector -mno-red-zone -fPIC -isystem <saltyc-include> -isystem <clang-resource-dir>/include --target=x86_64-unknown-none` |
-| `LDFLAGS` | `-nostdlib -nostartfiles -fuse-ld=lld --target=x86_64-unknown-none -L<saltyc> -L<libsalty> -L<rust> -Wl,--dynamic-linker,/lib/ld-salty.so` |
-| `LIBS` | `<saltyc>/crt_start.o -lc -lsalty <rust>/core.o <rust>/compiler_builtins.o` |
+| `CFLAGS` | `-ffreestanding -nostdlib -nostdinc -fno-stack-protector -mno-red-zone -fPIC -isystem <besaltc-include> -isystem <clang-resource-dir>/include --target=x86_64-unknown-none` |
+| `LDFLAGS` | `-nostdlib -nostartfiles -fuse-ld=lld --target=x86_64-unknown-none -L<besaltc> -L<libbesalt> -L<rust> -Wl,--dynamic-linker,/lib/ld-besalt.so` |
+| `LIBS` | `<besaltc>/crt_start.o -lc -lbesalt <rust>/core.o <rust>/compiler_builtins.o` |
 | `AR` | `llvm-ar` |
 | `RANLIB` | `llvm-ranlib` |
 | `STRIP` | `llvm-strip` |
@@ -300,14 +300,14 @@ ports/
     └── stage/
 ```
 
-## C Standard Library (saltyc)
+## C Standard Library (besaltc)
 
 Ports link against `libc.so`, SaltyOS's C standard library implemented primarily in Rust with some C/ASM components.
 
 ### Architecture
 
 ```
-lib/saltyc/
+lib/besaltc/
 ├── src/
 │   ├── lib.rs           # Crate root
 │   ├── crt.rs           # __libc_start_main (runtime init)
@@ -329,7 +329,7 @@ lib/saltyc/
 ├── cap_fileargs.c       # Capsicum fileargs wrapper
 ├── xo_stub.c            # libxo text-mode stubs
 ├── include/             # 72 POSIX/BSD headers
-├── saltyc.ld            # Shared library linker script
+├── besaltc.ld            # Shared library linker script
 └── meson.build          # Build configuration
 ```
 
@@ -350,7 +350,7 @@ lib/saltyc/
 
 ### Headers
 
-72 headers in `lib/saltyc/include/` provide the C API surface:
+72 headers in `lib/besaltc/include/` provide the C API surface:
 
 - **Standard C**: `stdio.h`, `stdlib.h`, `string.h`, `ctype.h`, `math.h`, `time.h`, `signal.h`, `setjmp.h`, `stddef.h`, `stdint.h`, `stdarg.h`, `stdbool.h`, `errno.h`, `assert.h`, `limits.h`, `inttypes.h`, `locale.h`
 - **POSIX**: `unistd.h`, `fcntl.h`, `dirent.h`, `sys/types.h`, `sys/stat.h`, `sys/mman.h`, `sys/socket.h`, `sys/un.h`, `sys/time.h`, `sys/wait.h`, `sys/select.h`, `sys/uio.h`, `sys/resource.h`, `poll.h`, `termios.h`, `sched.h`, `pwd.h`, `grp.h`, `glob.h`, `fnmatch.h`, `regex.h`
@@ -368,7 +368,7 @@ lib/saltyc/
    ```
    custom_target('port_bash',
      output: ['bash.elf'],
-     depends: [portbuild, libsalty_so, libc_so, crt_start_obj],
+     depends: [portbuild, libbesalt_so, libc_so, crt_start_obj],
      command: [portbuild, 'build', <port-dir>, '-o', '@OUTDIR@', '-b', <build-root>],
    )
    ```
@@ -464,4 +464,4 @@ just run
 ## References
 
 - [FreeBSD Ports Collection](https://docs.freebsd.org/en/books/porters-handbook/)
-- [POSIX Compatibility](posix.md) — saltyc POSIX API coverage
+- [POSIX Compatibility](posix.md) — besaltc POSIX API coverage

@@ -28,7 +28,7 @@
 #![no_std]
 #![no_main]
 
-extern crate salty;
+extern crate besalt;
 
 mod consts;
 mod types;
@@ -38,11 +38,11 @@ mod alloc;
 mod btree;
 mod handlers;
 
-use salty::consts::*;
-use salty::ipc;
-use salty::invoke;
-use salty::serial;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::ipc;
+use besalt::invoke;
+use besalt::serial;
+use besalt::types::*;
 
 use consts::*;
 use types::Superblock;
@@ -80,11 +80,11 @@ fn puts(s: &[u8]) {
 }
 
 fn ipc_ctx() -> *mut IpcContext {
-    &raw mut salty::__salty_ipc_ctx
+    &raw mut besalt::__besalt_ipc_ctx
 }
 
 fn signal_ready() {
-    let _ = salty::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 // ======================================================================
@@ -93,7 +93,7 @@ fn signal_ready() {
 
 fn register_nameserv() {
     let name = b"saltyfs";
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = POSIX_NS_REGISTER;
     msg.regs[0] = name.len() as u64;
     msg.length = 1 + (name.len() as u64 + 7) / 8;
@@ -103,9 +103,9 @@ fn register_nameserv() {
             *dst.add(i) = name[i];
         }
         ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != SALTY_OK {
+        if err != 0 || reply.label != BESALT_OK {
             puts(b"[saltyfs] nameserv registration failed\n");
         }
     }
@@ -119,7 +119,7 @@ fn server_loop() -> ! {
     puts(b"[saltyfs] Entering server loop\n");
 
     let ctx = ipc_ctx();
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     let mut badge: u64 = 0;
     unsafe { ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge); }
 
@@ -146,8 +146,8 @@ fn server_loop() -> ! {
             SALTYFS_READLINK => handlers::handle_readlink(&msg),
             SALTYFS_LINK => handlers::handle_link(&msg),
             _ => {
-                let mut r = SaltyMsg::zeroed();
-                r.label = SALTY_INVALID_OPERATION;
+                let mut r = BesaltMsg::zeroed();
+                r.label = BESALT_INVALID_OPERATION;
                 r
             }
         };
@@ -167,7 +167,7 @@ fn server_loop() -> ! {
             block::cache_flush_all();
         }
 
-        msg = SaltyMsg::zeroed();
+        msg = BesaltMsg::zeroed();
         badge = 0;
         unsafe {
             ipc::reply_recv_ctx(
@@ -208,7 +208,7 @@ pub extern "C" fn _start() -> ! {
         let sb_used = unsafe { (*(&raw const SB)).used_blocks };
         if actual_used != sb_used {
             {
-                let mut lb = salty::serial::LineBuf::new();
+                let mut lb = besalt::serial::LineBuf::new();
                 lb.str(b"[saltyfs] WARN: bitmap mismatch: sb.used_blocks=");
                 lb.dec(sb_used);
                 lb.str(b" actual=");

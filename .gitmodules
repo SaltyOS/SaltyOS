@@ -4,3 +4,7 @@
 [submodule "toolchain/rust"]
 	path = toolchain/rust
 	url = https://github.com/SaltyOS/rust.git
+[submodule "lib/besalt"]
+	path = lib/besalt
+	url = https://github.com/SaltyOS/besalt
+	branch = vNext

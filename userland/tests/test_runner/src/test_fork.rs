@@ -2,10 +2,10 @@
 //! Ported from userland/test_fork/main.c
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use salty::posix;
-use salty::serial;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::posix;
+use besalt::serial;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);

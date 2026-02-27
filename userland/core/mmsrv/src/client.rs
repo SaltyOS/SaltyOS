@@ -1,8 +1,8 @@
 use crate::types::*;
-use salty::consts::*;
-use salty::invoke;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::invoke;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 pub(crate) unsafe fn find_client_by_badge(badge: u64) -> *mut MmClient {
     unsafe {
@@ -262,7 +262,7 @@ pub(crate) fn free_cow_bitmap(region: *mut MmRegion) {
 ///   MR2 = mmap_base
 ///   MR3 = pid
 ///   + cap transfer: client's VSpace cap
-pub(crate) unsafe fn handle_mm_register(msg: *const SaltyMsg, _caller_badge: u64, reply: *mut SaltyMsg) {
+pub(crate) unsafe fn handle_mm_register(msg: *const BesaltMsg, _caller_badge: u64, reply: *mut BesaltMsg) {
     unsafe {
         let client_badge = (*msg).regs[0];
         let heap_base = (*msg).regs[1];
@@ -270,7 +270,7 @@ pub(crate) unsafe fn handle_mm_register(msg: *const SaltyMsg, _caller_badge: u64
         let pid = (*msg).regs[3] as u32;
 
         if client_badge == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
@@ -281,7 +281,7 @@ pub(crate) unsafe fn handle_mm_register(msg: *const SaltyMsg, _caller_badge: u64
             lb.hex(client_badge);
             lb.str(b"\n");
             lb.flush();
-            (*reply).label = SALTY_ALREADY_EXISTS;
+            (*reply).label = BESALT_ALREADY_EXISTS;
             return;
         }
 
@@ -289,7 +289,7 @@ pub(crate) unsafe fn handle_mm_register(msg: *const SaltyMsg, _caller_badge: u64
         let slot = find_free_client_slot();
         if slot.is_null() {
             super::puts(b"[MMSRV] REGISTER: client table full, grow failed\n");
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -327,18 +327,18 @@ pub(crate) unsafe fn handle_mm_register(msg: *const SaltyMsg, _caller_badge: u64
             lb.flush();
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
 
 /// MM_DEREGISTER: procmgr removes a client on exit.
 ///   MR0 = client badge
-pub(crate) unsafe fn handle_mm_deregister(msg: *const SaltyMsg, _caller_badge: u64, reply: *mut SaltyMsg) {
+pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: u64, reply: *mut BesaltMsg) {
     unsafe {
         let client_badge = (*msg).regs[0];
         let client = find_client_by_badge(client_badge);
         if client.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
 
@@ -393,14 +393,14 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const SaltyMsg, _caller_badge: u
             lb.flush();
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
 
 /// MM_GET_CLIENT_STATS: return memory stats for a client identified by PID.
 /// Request: regs[0] = pid
 /// Reply: regs[0]=heap_base, regs[1]=heap_current, regs[2]=region_count, regs[3]=total_pages
-pub(crate) unsafe fn handle_mm_get_client_stats(msg: *const SaltyMsg, _badge: u64, reply: *mut SaltyMsg) {
+pub(crate) unsafe fn handle_mm_get_client_stats(msg: *const BesaltMsg, _badge: u64, reply: *mut BesaltMsg) {
     unsafe {
         let pid = (*msg).regs[0] as u32;
         let ptr = *(&raw const super::CLIENTS_PTR);
@@ -420,14 +420,14 @@ pub(crate) unsafe fn handle_mm_get_client_stats(msg: *const SaltyMsg, _badge: u6
                     }
                 }
                 (*reply).regs[3] = total_pages;
-                (*reply).label = SALTY_OK;
+                (*reply).label = BESALT_OK;
                 (*reply).length = 4;
                 found = true;
                 break;
             }
         }
         if !found {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
         }
     }
 }

@@ -27,17 +27,17 @@
 #![no_std]
 #![no_main]
 
-extern crate salty;
+extern crate besalt;
 
 mod virtio;
 mod handlers;
 
-use salty::consts::*;
-use salty::ipc;
-use salty::invoke;
-use salty::serial;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::ipc;
+use besalt::invoke;
+use besalt::serial;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 const CAP_SELF_TCB: u64 = 0;
 const CAP_SERVER_EP: u64 = 68;
@@ -78,26 +78,26 @@ fn puts(s: &[u8]) {
 }
 
 fn ipc_ctx() -> *mut IpcContext {
-    &raw mut salty::__salty_ipc_ctx
+    &raw mut besalt::__besalt_ipc_ctx
 }
 
 fn signal_ready() {
-    let _ = salty::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 /// Create SHM for data transfer.
 fn setup_shm() -> bool {
     let ctx = ipc_ctx();
 
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = MM_SHM_CREATE;
     msg.length = 2;
     msg.regs[0] = BLK_SHM_ID;
     msg.regs[1] = BLK_SHM_PAGES;
 
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
-    if err != 0 || (reply.label != 0 && reply.label != SALTY_ALREADY_EXISTS) {
+    if err != 0 || (reply.label != 0 && reply.label != BESALT_ALREADY_EXISTS) {
         let mut lb = LineBuf::new();
         lb.str(b"[blkdrv] SHM create failed: ");
         lb.dec(if err != 0 { err as u64 } else { reply.label });
@@ -106,7 +106,7 @@ fn setup_shm() -> bool {
         return false;
     }
 
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = MM_SHM_MAP;
     msg.length = 4;
     msg.regs[0] = BLK_SHM_ID;
@@ -114,7 +114,7 @@ fn setup_shm() -> bool {
     msg.regs[2] = SHM_VADDR;
     msg.regs[3] = 0x3; // RW
 
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         let mut lb = LineBuf::new();
@@ -132,7 +132,7 @@ fn setup_shm() -> bool {
 /// Register with name service.
 fn register_nameserv() {
     let name = b"blkdrv";
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = POSIX_NS_REGISTER;
     msg.regs[0] = name.len() as u64;
     msg.length = 1 + (name.len() as u64 + 7) / 8;
@@ -142,9 +142,9 @@ fn register_nameserv() {
             *dst.add(i) = name[i];
         }
         ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != SALTY_OK {
+        if err != 0 || reply.label != BESALT_OK {
             puts(b"[blkdrv] nameserv registration failed\n");
         }
     }
@@ -155,7 +155,7 @@ fn server_loop() -> ! {
     puts(b"[blkdrv] Entering server loop\n");
 
     let ctx = ipc_ctx();
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     let mut badge: u64 = 0;
     unsafe { ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge); }
 
@@ -165,19 +165,19 @@ fn server_loop() -> ! {
             BLK_WRITE => handlers::handle_write(&msg),
             BLK_GET_INFO => handlers::handle_get_info(),
             BLK_FLUSH => {
-                let mut r = SaltyMsg::zeroed();
+                let mut r = BesaltMsg::zeroed();
                 r.label = 0;
                 r
             }
             BLK_GET_SHM_ID => handlers::handle_get_shm_id(),
             _ => {
-                let mut r = SaltyMsg::zeroed();
-                r.label = SALTY_INVALID_OPERATION;
+                let mut r = BesaltMsg::zeroed();
+                r.label = BESALT_INVALID_OPERATION;
                 r
             }
         };
 
-        msg = SaltyMsg::zeroed();
+        msg = BesaltMsg::zeroed();
         badge = 0;
         unsafe {
             ipc::reply_recv_ctx(

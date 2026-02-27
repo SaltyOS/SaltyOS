@@ -8,19 +8,19 @@
 #![no_std]
 #![no_main]
 
-extern crate salty;
+extern crate besalt;
 
 mod font;
 mod vt100;
 
-use salty::consts::*;
-use salty::framebuffer;
-use salty::invoke;
-use salty::ipc;
-use salty::serial;
-use salty::serial::LineBuf;
-use salty::syscall::syscall;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::framebuffer;
+use besalt::invoke;
+use besalt::ipc;
+use besalt::serial;
+use besalt::serial::LineBuf;
+use besalt::syscall::syscall;
+use besalt::types::*;
 
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 const FB_MAP_VADDR: u64 = 0x0000_0000_3000_0000;
@@ -216,7 +216,7 @@ fn idle() -> ! {
 }
 
 fn ipc_ctx() -> *mut IpcContext {
-    &raw mut salty::__salty_ipc_ctx
+    &raw mut besalt::__besalt_ipc_ctx
 }
 
 fn signal_ready() {
@@ -828,7 +828,7 @@ fn switch_to_alt_screen(state: &mut DisplayState) {
     // Lazy-allocate alt buffer
     if state.alt_shadow.is_null() {
         let ptr = unsafe {
-            salty::posix_mm::posix_mmap(
+            besalt::posix_mm::posix_mmap(
                 core::ptr::null_mut(),
                 (fb_size + 4095) & !4095u64,
                 0x3,  // PROT_READ | PROT_WRITE
@@ -849,7 +849,7 @@ fn switch_to_alt_screen(state: &mut DisplayState) {
         let cell_bytes = grid * core::mem::size_of::<Cell>();
         let cell_len = ((cell_bytes as u64) + 4095) & !4095u64;
         let ptr = unsafe {
-            salty::posix_mm::posix_mmap(
+            besalt::posix_mm::posix_mmap(
                 core::ptr::null_mut(),
                 cell_len,
                 0x3,  // PROT_READ | PROT_WRITE
@@ -1072,7 +1072,7 @@ fn map_framebuffer(fb: &framebuffer::FramebufferInfo) -> bool {
 fn alloc_shadow_buffer(fb_size: u64) -> *mut u8 {
     let len = (fb_size + 4095) & !4095u64;
     let ptr = unsafe {
-        salty::posix_mm::posix_mmap(
+        besalt::posix_mm::posix_mmap(
             core::ptr::null_mut(),
             len,
             0x3,  // PROT_READ | PROT_WRITE
@@ -1100,8 +1100,8 @@ fn alloc_shadow_buffer(fb_size: u64) -> *mut u8 {
 }
 
 fn register_with_nameserv() -> bool {
-    let mut reg_msg = SaltyMsg::zeroed();
-    let mut reg_reply = SaltyMsg::zeroed();
+    let mut reg_msg = BesaltMsg::zeroed();
+    let mut reg_reply = BesaltMsg::zeroed();
     let svc_name = b"display";
     reg_msg.label = POSIX_NS_REGISTER;
     reg_msg.regs[0] = svc_name.len() as u64;
@@ -1122,7 +1122,7 @@ fn register_with_nameserv() -> bool {
             &raw const reg_msg,
             &raw mut reg_reply,
         );
-        if err == 0 && reg_reply.label == SALTY_OK {
+        if err == 0 && reg_reply.label == BESALT_OK {
             puts(b"[DISPLAY] registered with nameserv\n");
             return true;
         }
@@ -1137,8 +1137,8 @@ fn register_with_nameserv() -> bool {
     }
 }
 
-fn handle_get_info(state: &DisplayState, reply: &mut SaltyMsg) {
-    reply.label = SALTY_OK;
+fn handle_get_info(state: &DisplayState, reply: &mut BesaltMsg) {
+    reply.label = BESALT_OK;
     reply.length = 6;
     reply.regs[0] = state.width as u64;
     reply.regs[1] = state.height as u64;
@@ -1151,7 +1151,7 @@ fn handle_get_info(state: &DisplayState, reply: &mut SaltyMsg) {
     reply.regs[5] = ((state.blue_pos as u64) << 24) | ((state.blue_size as u64) << 16);
 }
 
-fn handle_fill_rect(state: &mut DisplayState, msg: &SaltyMsg, reply: &mut SaltyMsg) {
+fn handle_fill_rect(state: &mut DisplayState, msg: &BesaltMsg, reply: &mut BesaltMsg) {
     if state.cursor_drawn {
         invert_cursor_cell(state, state.drawn_col, state.drawn_row);
         state.cursor_drawn = false;
@@ -1164,10 +1164,10 @@ fn handle_fill_rect(state: &mut DisplayState, msg: &SaltyMsg, reply: &mut SaltyM
     let color = msg.regs[4] as u32;
     fill_rect(state, x, y, w, h, color);
     flush_damage(state);
-    reply.label = SALTY_OK;
+    reply.label = BESALT_OK;
 }
 
-fn handle_write_text(state: &mut DisplayState, msg: &SaltyMsg, reply: &mut SaltyMsg) {
+fn handle_write_text(state: &mut DisplayState, msg: &BesaltMsg, reply: &mut BesaltMsg) {
     if state.cursor_drawn {
         invert_cursor_cell(state, state.drawn_col, state.drawn_row);
         state.cursor_drawn = false;
@@ -1207,10 +1207,10 @@ fn handle_write_text(state: &mut DisplayState, msg: &SaltyMsg, reply: &mut Salty
     state.bg = saved_bg;
     state.reverse_video = saved_rv;
     flush_damage(state);
-    reply.label = SALTY_OK;
+    reply.label = BESALT_OK;
 }
 
-fn handle_terminal_write(state: &mut DisplayState, msg: &SaltyMsg, reply: &mut SaltyMsg) {
+fn handle_terminal_write(state: &mut DisplayState, msg: &BesaltMsg, reply: &mut BesaltMsg) {
     if state.cursor_drawn {
         invert_cursor_cell(state, state.drawn_col, state.drawn_row);
         state.cursor_drawn = false;
@@ -1227,12 +1227,12 @@ fn handle_terminal_write(state: &mut DisplayState, msg: &SaltyMsg, reply: &mut S
     }
 
     flush_damage(state);
-    reply.label = SALTY_OK;
+    reply.label = BESALT_OK;
 }
 
-fn handle_present(state: &mut DisplayState, reply: &mut SaltyMsg) {
+fn handle_present(state: &mut DisplayState, reply: &mut BesaltMsg) {
     flush_damage(state);
-    reply.label = SALTY_OK;
+    reply.label = BESALT_OK;
 }
 
 #[unsafe(no_mangle)]
@@ -1247,11 +1247,11 @@ pub extern "C" fn _start() -> ! {
 
     // Initialize per-process slot allocator from RTLD-exported globals
     unsafe {
-        let base = *(&raw const salty::__salty_slot_base);
-        let count = *(&raw const salty::__salty_slot_count);
-        let cspace_ntfn = *(&raw const salty::__salty_cspace_ntfn);
+        let base = *(&raw const besalt::__besalt_slot_base);
+        let count = *(&raw const besalt::__besalt_slot_count);
+        let cspace_ntfn = *(&raw const besalt::__besalt_cspace_ntfn);
         if base != 0 {
-            salty::slot_alloc::slot_alloc_init(base, count, cspace_ntfn);
+            besalt::slot_alloc::slot_alloc_init(base, count, cspace_ntfn);
         } else {
             puts(b"[DISPLAY] FATAL: slot pool not provided by RTLD/auxv\n");
             signal_ready();
@@ -1285,7 +1285,7 @@ pub extern "C" fn _start() -> ! {
 
     // Initialize mmsrv client for posix_mmap
     unsafe {
-        salty::posix_mm::posix_mm_init(CAP_MMSRV_EP);
+        besalt::posix_mm::posix_mm_init(CAP_MMSRV_EP);
     }
 
     // Map framebuffer with write-combining (WRITE_THROUGH flag)
@@ -1411,7 +1411,7 @@ pub extern "C" fn _start() -> ! {
         let cell_bytes = grid * core::mem::size_of::<Cell>();
         let cell_len = ((cell_bytes as u64) + 4095) & !4095u64;
         let ptr = unsafe {
-            salty::posix_mm::posix_mmap(
+            besalt::posix_mm::posix_mmap(
                 core::ptr::null_mut(),
                 cell_len,
                 0x3,  // PROT_READ | PROT_WRITE
@@ -1447,7 +1447,7 @@ pub extern "C" fn _start() -> ! {
     puts(b"[DISPLAY] Ready, entering server loop\n");
 
     // IPC server loop
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     let mut badge: u64 = 0;
 
     let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
@@ -1461,7 +1461,7 @@ pub extern "C" fn _start() -> ! {
     }
 
     loop {
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
 
         match msg.label {
             DISPLAY_GET_INFO => {
@@ -1480,7 +1480,7 @@ pub extern "C" fn _start() -> ! {
                 handle_terminal_write(&mut state, &msg, &mut reply);
             }
             _ => {
-                reply.label = SALTY_INVALID_OPERATION;
+                reply.label = BESALT_INVALID_OPERATION;
             }
         }
 

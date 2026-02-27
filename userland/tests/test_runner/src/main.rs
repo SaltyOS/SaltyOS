@@ -8,7 +8,7 @@
 #![no_std]
 #![no_main]
 
-extern crate salty;
+extern crate besalt;
 
 mod test_hello;
 mod test_fs;
@@ -23,15 +23,15 @@ mod test_epoll;
 mod test_pthread;
 mod test_saltyfs;
 mod test_dns;
-#[cfg(saltyc_sse2)]
+#[cfg(besaltc_sse2)]
 mod test_sse;
 
-use salty::consts::*;
-use salty::ipc;
-use salty::posix;
-use salty::serial;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::ipc;
+use besalt::posix;
+use besalt::serial;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 // Standard child CSpace layout
 const CAP_SELF_TCB: u64 = 0;
@@ -43,27 +43,27 @@ fn puts(s: &[u8]) {
 }
 
 fn signal_ready() {
-    let _ = salty::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     // IPC buffer is pre-mapped by procmgr at 0x200000
-    salty::salty_tcb_set_ipc_buffer(CAP_SELF_TCB, 0x200000);
+    besalt::besalt_tcb_set_ipc_buffer(CAP_SELF_TCB, 0x200000);
     unsafe {
-        ipc::ipc_context_init(&raw mut salty::__salty_ipc_ctx, 0x200000 as *mut IpcBuffer);
+        ipc::ipc_context_init(&raw mut besalt::__besalt_ipc_ctx, 0x200000 as *mut IpcBuffer);
     }
 
     // Initialize main-thread TLS (required for pthreads)
-    unsafe { salty::tls::init_main_thread_tls() };
+    unsafe { besalt::tls::init_main_thread_tls() };
 
     // Initialize per-process slot allocator from RTLD-exported globals
     unsafe {
-        let base = *(&raw const salty::__salty_slot_base);
-        let count = *(&raw const salty::__salty_slot_count);
-        let cspace_ntfn = *(&raw const salty::__salty_cspace_ntfn);
+        let base = *(&raw const besalt::__besalt_slot_base);
+        let count = *(&raw const besalt::__besalt_slot_count);
+        let cspace_ntfn = *(&raw const besalt::__besalt_cspace_ntfn);
         if base != 0 {
-            salty::slot_alloc::slot_alloc_init(base, count, cspace_ntfn);
+            besalt::slot_alloc::slot_alloc_init(base, count, cspace_ntfn);
         } else {
             puts(b"[TEST_RUNNER] FATAL: slot pool not provided by RTLD/auxv\n");
             posix::posix_exit(1);
@@ -88,11 +88,11 @@ pub extern "C" fn _start() -> ! {
         (b"test_saltyfs", test_saltyfs::run),
         (b"test_dns", test_dns::run),
     ];
-    #[cfg(saltyc_sse2)]
+    #[cfg(besaltc_sse2)]
     let sse_tests: [(&[u8], fn() -> bool); 1] = [
         (b"test_sse", test_sse::run),
     ];
-    #[cfg(not(saltyc_sse2))]
+    #[cfg(not(besaltc_sse2))]
     let sse_tests: [(&[u8], fn() -> bool); 0] = [];
 
     let mut passed = 0u32;

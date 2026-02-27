@@ -1,22 +1,22 @@
-# libsalty Design Document
+# libbesalt Design Document
 
 ## 1. Overview
 
-libsalty is the system library for SaltyOS userland. It serves as the sole
+libbesalt is the system library for SaltyOS userland. It serves as the sole
 interface between user processes and the microkernel, wrapping every system
 call, IPC operation, and capability invocation behind a stable API. Written
 in Rust under `#![no_std]` with only the `core` library available, it
-compiles to a position-independent shared object (`libsalty.so`) that the
+compiles to a position-independent shared object (`libbesalt.so`) that the
 runtime dynamic linker (`rtld`) loads into every process.
 
-libsalty has a dual personality:
+libbesalt has a dual personality:
 
 - **Rust module API** -- Internal modules (`ipc`, `invoke`, `posix`,
   `posix_mm`, `signals`, `slot_alloc`, etc.) are used directly by Rust
   userland programs that link against the `.rmeta` at compile time.
 - **C ABI surface** -- Every public entry point is
-  `#[unsafe(no_mangle)] pub extern "C" fn salty_*`, making the shared
-  library callable from C code, the C standard library (`saltyc`), and
+  `#[unsafe(no_mangle)] pub extern "C" fn besalt_*`, making the shared
+  library callable from C code, the C standard library (`besaltc`), and
   the runtime linker.
 
 The library is approximately 3,500 lines of Rust plus 55 lines of assembly
@@ -29,7 +29,7 @@ outside the kernel.
 |------|-------|---------|
 | `lib.rs` | 635 | Module declarations, global state, C ABI exports, panic handler |
 | `consts.rs` | 471 | Syscall numbers, invoke labels, error codes, capability slots, POSIX constants |
-| `types.rs` | 419 | `#[repr(C)]` types: `SaltyMsg`, `IpcBuffer`, `IpcContext`, ELF types, POSIX types |
+| `types.rs` | 419 | `#[repr(C)]` types: `BesaltMsg`, `IpcBuffer`, `IpcContext`, ELF types, POSIX types |
 | `syscall.rs` | 37 | Single `syscall()` function with inline assembly |
 | `ipc.rs` | 233 | IPC operations: send, recv, call, reply_recv, nbsend, cap transfer |
 | `invoke.rs` | 267 | Capability invocation wrappers for all kernel object types |
@@ -57,17 +57,17 @@ and no hidden state beyond what is structurally necessary (the IPC
 buffer pointer and slot allocator state).
 
 **C ABI stability.** All public symbols use `extern "C"` with the
-`salty_` prefix. The `.so` exposes a flat namespace of C-callable
+`besalt_` prefix. The `.so` exposes a flat namespace of C-callable
 functions. Internal Rust modules can change freely as long as the
 C ABI surface remains stable.
 
-**POSIX delegation.** libsalty does not implement POSIX semantics itself.
+**POSIX delegation.** libbesalt does not implement POSIX semantics itself.
 File operations, socket management, and directory state are delegated to
-userspace servers (VFS, procmgr) via IPC. libsalty only handles message
+userspace servers (VFS, procmgr) via IPC. libbesalt only handles message
 packing and unpacking.
 
 **Capability-first.** Every resource access goes through capability slot
-numbers. There are no file descriptors at the libsalty level -- POSIX fd
+numbers. There are no file descriptors at the libbesalt level -- POSIX fd
 numbers are server-side abstractions managed by VFS.
 
 **Fail-safe defaults.** Functions return error codes rather than panicking.
@@ -81,12 +81,12 @@ yield loop. No `unwrap()` or `expect()` calls exist in the library.
 ```
  +------------------------------------------------------------------+
  |                        User Application                          |
- |  (Rust: uses salty::ipc, salty::invoke, salty::posix directly)    |
- |  (C:    calls salty_open(), salty_call(), salty_vspace_map()...)  |
+ |  (Rust: uses besalt::ipc, besalt::invoke, besalt::posix directly)    |
+ |  (C:    calls besalt_open(), besalt_call(), besalt_vspace_map()...)  |
  +----+----+----+----+----+----+----+----+----+----+----+----+------+
       |    |    |    |    |    |    |    |    |    |    |    |
  +----v----v----v----v----v----v----v----v----v----v----v----v------+
- | lib.rs  C ABI surface (salty_send, salty_open, salty_mmap, ...) |
+ | lib.rs  C ABI surface (besalt_send, besalt_open, besalt_mmap, ...) |
  +--------+----------+-----------+----------+----------+----------+
           |          |           |          |          |
   +-------v--+  +---v------+  +-v--------+ | +-------v--------+
@@ -144,7 +144,7 @@ All kernel interaction flows through a single function in `syscall.rs`:
 
 ```rust
 #[inline(always)]
-pub fn syscall(num: u64, a0..a5: u64) -> SaltyResult { error, value }
+pub fn syscall(num: u64, a0..a5: u64) -> BesaltResult { error, value }
 ```
 
 The inline assembly maps directly to the SaltyOS syscall ABI:
@@ -180,7 +180,7 @@ pub struct IpcContext {
 }
 ```
 
-The global instance `__salty_ipc_ctx` is initialized by the CRT/RTLD
+The global instance `__besalt_ipc_ctx` is initialized by the CRT/RTLD
 during process startup.
 
 ### IPC Buffer Layout
@@ -221,7 +221,7 @@ by `write_overflow_ctx()` before the syscall.
 
 On receive, the kernel writes the full message (label, length, all
 registers) into the IPC buffer. The receive-side functions read the
-message from the buffer and copy it to the caller's `SaltyMsg`.
+message from the buffer and copy it to the caller's `BesaltMsg`.
 
 ### Capability Transfer
 
@@ -263,9 +263,9 @@ nbsend_ctx(ctx, ep, &msg)
 
 **Signal/Wait (notifications):**
 ```
-salty_signal(ntfn, bits)  // OR bits into notification word
-salty_wait(ntfn)          // block until signaled, returns bitmap
-salty_poll(ntfn, &bits)   // non-blocking check
+besalt_signal(ntfn, bits)  // OR bits into notification word
+besalt_wait(ntfn)          // block until signaled, returns bitmap
+besalt_poll(ntfn, &bits)   // non-blocking check
 ```
 
 ## 6. Capability Invocations
@@ -274,7 +274,7 @@ The `invoke.rs` module provides typed wrappers for all kernel object
 operations. Each wrapper calls the central `invoke()` function:
 
 ```rust
-pub fn invoke(cap: Cap, label: u64, arg0..arg3: u64) -> SaltyResult {
+pub fn invoke(cap: Cap, label: u64, arg0..arg3: u64) -> BesaltResult {
     syscall(SYS_INVOKE, cap, label, arg0, arg1, arg2, arg3)
 }
 ```
@@ -374,7 +374,7 @@ Also has a `untyped_retype_depth()` variant for expanded CSpaces.
 
 ### Delegation Model
 
-libsalty does not implement POSIX semantics. It acts as a message-passing
+libbesalt does not implement POSIX semantics. It acts as a message-passing
 stub that translates POSIX calls into IPC messages to two userspace
 servers:
 
@@ -387,10 +387,10 @@ servers:
 
 Every POSIX function follows the same pattern:
 
-1. Construct a `SaltyMsg` with the appropriate label constant
+1. Construct a `BesaltMsg` with the appropriate label constant
 2. Pack arguments into `msg.regs[0..19]`
 3. Call `ipc::call_ctx()` (blocking RPC to the server)
-4. Check `reply.label == SALTY_OK`
+4. Check `reply.label == BESALT_OK`
 5. Unpack results from `reply.regs[]`
 
 ### Path Packing
@@ -474,7 +474,7 @@ endpoints, notifications, and other kernel objects.
 **Segment chain:** Slots are organized as a chain of up to 16 segments.
 Each segment is a contiguous range of CNode indices with a bump pointer.
 The initial segment is assigned by procmgr at spawn time and communicated
-via auxv entries (`AT_SALTY_SLOT_BASE`, `AT_SALTY_SLOT_COUNT`).
+via auxv entries (`AT_BESALT_SLOT_BASE`, `AT_BESALT_SLOT_COUNT`).
 
 **Async expansion protocol:** When all segments are exhausted:
 
@@ -537,12 +537,12 @@ failure with `stack_top == 0`.
 
 ### Library Build
 
-libsalty is compiled as a position-independent shared object:
+libbesalt is compiled as a position-independent shared object:
 
-1. Rust source compiles to `libsalty.o` + `libsalty.rmeta`
+1. Rust source compiles to `libbesalt.o` + `libbesalt.rmeta`
 2. `fork.S` assembles to `fork.o`
 3. All objects link with `core.o` and `compiler_builtins.o` into
-   `libsalty.so` using the `libsalty.ld` linker script
+   `libbesalt.so` using the `libbesalt.ld` linker script
 
 The linker script places sections at page-aligned boundaries with
 dynamic linking metadata (`.gnu.hash`, `.dynsym`, `.dynstr`,
@@ -550,15 +550,15 @@ dynamic linking metadata (`.gnu.hash`, `.dynsym`, `.dynstr`,
 
 ### Runtime Loader Integration
 
-The runtime dynamic linker (`rtld`) loads `libsalty.so` into every
+The runtime dynamic linker (`rtld`) loads `libbesalt.so` into every
 dynamically-linked process. RTLD:
 
-1. Finds `libsalty.so` in the shared library cache region
+1. Finds `libbesalt.so` in the shared library cache region
 2. Maps it into the child's address space
 3. Resolves relocations (R_X86_64_RELATIVE for PIE)
 4. Sets up the GOT and PLT entries
 
-Init is the exception: it is **statically linked** with `libsalty.o`
+Init is the exception: it is **statically linked** with `libbesalt.o`
 embedded directly, since it runs before `rtld` and VFS are available.
 
 ### ELF Loader
@@ -591,20 +591,20 @@ The `elf_dynamic.rs` module extracts dynamic linking metadata:
 
 ## 10. Global State
 
-All mutable global state in libsalty:
+All mutable global state in libbesalt:
 
 | Variable | Type | Module | Purpose |
 |----------|------|--------|---------|
-| `__salty_ipc_ctx` | `IpcContext` | `lib.rs` | IPC buffer pointer and cap transfer count |
+| `__besalt_ipc_ctx` | `IpcContext` | `lib.rs` | IPC buffer pointer and cap transfer count |
 | `__sig_handlers` | `[AtomicUsize; 32]` | `lib.rs` | Signal handler function pointers |
 | `__sig_initialized` | `AtomicI32` | `lib.rs` | One-shot signal subsystem init flag |
 | `__sig_blocked_mask` | `u32` | `lib.rs` | Bitmask of blocked signals |
 | `__sig_sa_mask` | `[u32; 32]` | `lib.rs` | Per-signal sa_mask values |
 | `__sig_sa_flags` | `[i32; 32]` | `lib.rs` | Per-signal sa_flags (SA_RESETHAND, etc.) |
-| `__salty_next_frame_slot` | `u64` (weak) | `lib.rs` | Legacy frame slot counter (overridden by slot_alloc) |
-| `__salty_slot_base` | `u64` (weak) | `lib.rs` | Slot allocator pool base (from auxv) |
-| `__salty_slot_count` | `u64` (weak) | `lib.rs` | Slot allocator pool size (from auxv) |
-| `__salty_expand_ep` | `u64` (weak) | `lib.rs` | Expansion notification cap (from auxv) |
+| `__besalt_next_frame_slot` | `u64` (weak) | `lib.rs` | Legacy frame slot counter (overridden by slot_alloc) |
+| `__besalt_slot_base` | `u64` (weak) | `lib.rs` | Slot allocator pool base (from auxv) |
+| `__besalt_slot_count` | `u64` (weak) | `lib.rs` | Slot allocator pool size (from auxv) |
+| `__besalt_expand_ep` | `u64` (weak) | `lib.rs` | Expansion notification cap (from auxv) |
 | `SLOT_ALLOC` | `SlotAllocState` | `slot_alloc.rs` | Segment chain and expansion state |
 | `UT_EXPAND_REQUESTED` | `bool` | `slot_alloc.rs` | Whether untyped expansion is in flight |
 | `EXTRA_UT_SLOTS` | `[Cap; 8]` | `slot_alloc.rs` | Dynamically-granted untyped caps |
@@ -618,7 +618,7 @@ Each process has its own address space with private copies of all
 statics. There is no shared mutable state between processes. Signal
 handlers run synchronously in the context of `posix_sigcheck()`, not
 asynchronously, so there are no reentrancy concerns. The weak linkage
-on `__salty_slot_*` and `__salty_expand_ep` allows RTLD or CRT to
+on `__besalt_slot_*` and `__besalt_expand_ep` allows RTLD or CRT to
 override these values before the library is used.
 
 ## 11. Build and Linking
@@ -633,26 +633,26 @@ override these values before the library is used.
         -C panic=abort -C opt-level=2
         -C code-model=small -C relocation-model=pic
         --extern core=<build>/libcore.rmeta
-        --emit=obj=libsalty.o,metadata=libsalty.rmeta
+        --emit=obj=libbesalt.o,metadata=libbesalt.rmeta
       |
-      +--- libsalty.rmeta (used by userland programs at compile time)
+      +--- libbesalt.rmeta (used by userland programs at compile time)
       |
       v
   fork.S --[clang -c]--> fork.o
       |
       v
   clang -shared -nostdlib -fPIC -fuse-ld=lld
-        -Wl,-soname,libsalty.so -Wl,--hash-style=gnu
-        -T libsalty.ld
-        libsalty.o fork.o core.o compiler_builtins.o
+        -Wl,-soname,libbesalt.so -Wl,--hash-style=gnu
+        -T libbesalt.ld
+        libbesalt.o fork.o core.o compiler_builtins.o
       |
       v
-  libsalty.so (packed into initrd by mkcpio.py)
+  libbesalt.so (packed into initrd by mkcpio.py)
 ```
 
 ### Linker Script
 
-The `libsalty.ld` script creates a shared object with:
+The `libbesalt.ld` script creates a shared object with:
 
 - Dynamic linking metadata at the start (`.gnu.hash`, `.dynsym`,
   `.dynstr`, `.rela.dyn`)
@@ -663,9 +663,9 @@ The `libsalty.ld` script creates a shared object with:
 
 ### Static vs Dynamic Linking
 
-- **Init:** Statically linked. `libsalty.o` is linked directly into the
+- **Init:** Statically linked. `libbesalt.o` is linked directly into the
   init binary because init runs before the runtime linker is available.
-- **All other programs:** Dynamically linked via `libsalty.so`. The
+- **All other programs:** Dynamically linked via `libbesalt.so`. The
   `.rmeta` file provides type information at compile time; the `.so`
   provides code at runtime.
 
@@ -681,5 +681,5 @@ The `libsalty.ld` script creates a shared object with:
 - [Capability System](capability.md) -- CNode structure, CDT, rights
   model
 - [POSIX Compatibility](posix.md) -- VFS and procmgr protocol design
-- [libsalty API Reference](../spec/libsalty-api.md) -- Complete function
+- [libbesalt API Reference](../spec/libbesalt-api.md) -- Complete function
   signatures and error codes

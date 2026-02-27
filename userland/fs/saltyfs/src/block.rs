@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Block I/O with caching and prefetching.
 
-use salty::consts::*;
-use salty::ipc;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::ipc;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 use crate::consts::*;
 use crate::crc::crc32c_superblock;
@@ -14,28 +14,28 @@ use crate::btree::btree_search;
 
 /// Read sectors from blkdrv into SHM at given offset.
 pub(crate) fn blk_read_sectors(start_sector: u64, count: u64, shm_offset: u64) -> bool {
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = BLK_READ;
     msg.length = 3;
     msg.regs[0] = start_sector;
     msg.regs[1] = count;
     msg.regs[2] = shm_offset;
 
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_BLKDRV_EP, &raw const msg, &raw mut reply) };
     err == 0 && reply.label == 0
 }
 
 /// Write sectors to blkdrv from SHM at given offset.
 pub(crate) fn blk_write_sectors(start_sector: u64, count: u64, shm_offset: u64) -> bool {
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = BLK_WRITE;
     msg.length = 3;
     msg.regs[0] = start_sector;
     msg.regs[1] = count;
     msg.regs[2] = shm_offset;
 
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_BLKDRV_EP, &raw const msg, &raw mut reply) };
     err == 0 && reply.label == 0
 }
@@ -153,7 +153,7 @@ fn scan_leaf_for_max_ino(leaf: *const u8) {
             let item = core::ptr::read_unaligned(
                 items_start.add(i * item_size) as *const BTreeItem,
             );
-            if item.key.item_type == SALTY_INODE_ITEM && item.key.object_id > max_ino {
+            if item.key.item_type == BESALT_INODE_ITEM && item.key.object_id > max_ino {
                 max_ino = item.key.object_id;
             }
         }
@@ -249,11 +249,11 @@ pub(crate) fn setup_blk_shm() -> bool {
     let ctx = ipc_ctx();
 
     // Get SHM ID from blkdrv
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = BLK_GET_SHM_ID;
     msg.length = 0;
 
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_BLKDRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         puts(b"[saltyfs] Failed to get SHM ID from blkdrv\n");
@@ -263,7 +263,7 @@ pub(crate) fn setup_blk_shm() -> bool {
     unsafe { *(&raw mut BLK_SHM_ID) = reply.regs[0]; }
 
     // Map the SHM into our address space
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = MM_SHM_MAP;
     msg.length = 4;
     msg.regs[0] = unsafe { *(&raw const BLK_SHM_ID) };
@@ -271,7 +271,7 @@ pub(crate) fn setup_blk_shm() -> bool {
     msg.regs[2] = SHM_VADDR;
     msg.regs[3] = 0x3; // RW
 
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         let mut lb = LineBuf::new();
@@ -291,20 +291,20 @@ pub(crate) fn setup_cache() -> bool {
     let ctx = ipc_ctx();
 
     // Allocate pages for block cache
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = MM_SHM_CREATE;
     msg.length = 2;
     msg.regs[0] = 0x53465343; // "SFSC" - saltyfs cache
     msg.regs[1] = CACHE_TOTAL_PAGES;
 
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
-    if err != 0 || (reply.label != 0 && reply.label != SALTY_ALREADY_EXISTS) {
+    if err != 0 || (reply.label != 0 && reply.label != BESALT_ALREADY_EXISTS) {
         puts(b"[saltyfs] Cache SHM create failed\n");
         return false;
     }
 
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = MM_SHM_MAP;
     msg.length = 4;
     msg.regs[0] = 0x53465343;
@@ -312,7 +312,7 @@ pub(crate) fn setup_cache() -> bool {
     msg.regs[2] = CACHE_VADDR;
     msg.regs[3] = 0x3; // RW
 
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         puts(b"[saltyfs] Cache SHM map failed\n");

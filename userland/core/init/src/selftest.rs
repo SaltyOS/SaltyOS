@@ -2,13 +2,13 @@
 //! Extracted from original init phases 1 & 2.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use salty::consts::*;
-use salty::invoke;
-use salty::ipc;
-use salty::serial;
-use salty::serial::LineBuf;
-use salty::syscall::syscall;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::invoke;
+use besalt::ipc;
+use besalt::serial;
+use besalt::serial::LineBuf;
+use besalt::syscall::syscall;
+use besalt::types::*;
 
 use super::{CAP_SELF_TCB, CAP_SELF_VSPACE, CAP_SELF_CSPACE};
 
@@ -45,7 +45,7 @@ unsafe extern "C" fn thread2_entry() {
         ipc::ipc_context_init(&raw mut THREAD2_IPC_CTX, IPC_BUF2_VADDR as *mut IpcBuffer);
         puts(b"[THREAD2] started, waiting on endpoint\n");
 
-        let mut msg = SaltyMsg::zeroed();
+        let mut msg = BesaltMsg::zeroed();
         let mut badge: u64 = 0;
 
         let err = ipc::recv_ctx(&raw mut THREAD2_IPC_CTX, CAP_TEST_EP, &raw mut msg, &raw mut badge);
@@ -66,7 +66,7 @@ unsafe extern "C" fn fault_handler_entry() {
         ipc::ipc_context_init(&raw mut FAULT_IPC_CTX, super::IPC_BUF_VADDR as *mut IpcBuffer);
         puts(b"[FAULT_HANDLER] started, waiting for fault\n");
 
-        let mut msg = SaltyMsg::zeroed();
+        let mut msg = BesaltMsg::zeroed();
         let mut badge: u64 = 0;
 
         let err = ipc::recv_ctx(&raw mut FAULT_IPC_CTX, CAP_FAULT_EP, &raw mut msg, &raw mut badge);
@@ -87,7 +87,7 @@ unsafe extern "C" fn fault_handler_entry() {
                 puts(b"[FAULT_HANDLER] page mapped OK\n");
             }
 
-            let reply = SaltyMsg::zeroed();
+            let reply = BesaltMsg::zeroed();
             ipc::reply_recv_ctx(
                 &raw mut FAULT_IPC_CTX,
                 CAP_FAULT_EP,
@@ -174,7 +174,7 @@ pub unsafe fn phase1_ipc_test(ut: Cap) -> i32 {
         syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
 
         puts(b"[INIT] Sending test message to endpoint\n");
-        let mut msg = SaltyMsg::zeroed();
+        let mut msg = BesaltMsg::zeroed();
         msg.label = TEST_IPC_LABEL;
         msg.length = 1;
         msg.regs[0] = 0xDEAD_BEEF;

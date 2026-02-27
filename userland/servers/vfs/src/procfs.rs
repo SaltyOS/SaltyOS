@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! /proc filesystem implementation.
 
-use salty::consts::*;
-use salty::ipc;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::ipc;
+use besalt::types::*;
 
 use crate::client::{get_client, get_client_noalloc};
 use crate::consts::*;
@@ -81,8 +81,8 @@ pub(crate) fn fmt_u64_hex(mut v: u64, buf: &mut [u8]) -> usize {
 /// Query procmgr for list of PIDs. Returns count (up to 19).
 unsafe fn proc_list_pids(pids: &mut [u32; 19]) -> usize {
     unsafe {
-        let mut msg = SaltyMsg::zeroed();
-        let mut reply = SaltyMsg::zeroed();
+        let mut msg = BesaltMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
         msg.label = POSIX_PM_LIST_PIDS;
         msg.length = 0;
         let err = ipc::call_ctx(
@@ -91,7 +91,7 @@ unsafe fn proc_list_pids(pids: &mut [u32; 19]) -> usize {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
+        if err != 0 || reply.label != BESALT_OK {
             return 0;
         }
         let count = reply.regs[19] as usize;
@@ -113,8 +113,8 @@ unsafe fn proc_get_info(
     name: &mut [u8; 32],
 ) -> bool {
     unsafe {
-        let mut msg = SaltyMsg::zeroed();
-        let mut reply = SaltyMsg::zeroed();
+        let mut msg = BesaltMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
         msg.label = POSIX_PM_GET_PROC_INFO;
         msg.length = 1;
         msg.regs[0] = pid as u64;
@@ -124,7 +124,7 @@ unsafe fn proc_get_info(
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
+        if err != 0 || reply.label != BESALT_OK {
             return false;
         }
         *ppid = reply.regs[1] as u32;
@@ -148,13 +148,13 @@ unsafe fn proc_get_mem_stats(
     total_pages: &mut u64,
 ) -> bool {
     unsafe {
-        let mut msg = SaltyMsg::zeroed();
-        let mut reply = SaltyMsg::zeroed();
+        let mut msg = BesaltMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
         msg.label = MM_GET_CLIENT_STATS;
         msg.length = 1;
         msg.regs[0] = pid as u64;
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_MMSRV_EP, &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != SALTY_OK {
+        if err != 0 || reply.label != BESALT_OK {
             return false;
         }
         *heap_base = reply.regs[0];
@@ -427,7 +427,7 @@ unsafe fn proc_gen_stat(pid: u32, buf: *mut u8, buf_size: usize) -> usize {
 pub(crate) unsafe fn handle_proc_open(
     path: *const u8,
     path_len: u8,
-    reply: *mut SaltyMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) -> bool {
     unsafe {
@@ -455,7 +455,7 @@ pub(crate) unsafe fn handle_proc_open(
         let (pid, file_offset) = if is_self_prefix && (rest_len == 4 || *rest.add(4) == b'/') {
             let cli = get_client_noalloc(badge);
             if cli.is_null() {
-                (*reply).label = SALTY_NOT_FOUND;
+                (*reply).label = BESALT_NOT_FOUND;
                 return true;
             }
             // Client badge encodes PID: badge = pid
@@ -480,7 +480,7 @@ pub(crate) unsafe fn handle_proc_open(
             }
             let (pid, ok) = parse_pid(&pid_buf[..pid_end as usize]);
             if !ok {
-                (*reply).label = SALTY_NOT_FOUND;
+                (*reply).label = BESALT_NOT_FOUND;
                 return true;
             }
             (pid, pid_end)
@@ -498,7 +498,7 @@ pub(crate) unsafe fn handle_proc_open(
             // /proc/<pid> — the directory itself; open as dir
             let inode = alloc_inode();
             if inode.is_null() {
-                (*reply).label = SALTY_OUT_OF_MEMORY;
+                (*reply).label = BESALT_OUT_OF_MEMORY;
                 return true;
             }
             (*inode).ftype = FTYPE_PROC_FILE;
@@ -510,7 +510,7 @@ pub(crate) unsafe fn handle_proc_open(
 
             let cli = get_client(badge);
             if cli.is_null() {
-                (*reply).label = SALTY_OUT_OF_MEMORY;
+                (*reply).label = BESALT_OUT_OF_MEMORY;
                 (*inode).active = 0;
                 return true;
             }
@@ -522,14 +522,14 @@ pub(crate) unsafe fn handle_proc_open(
                     (*(*cli).fds.add(fd)).offset = 0;
                     (*(*cli).fds.add(fd)).dir_cursor = 0;
                     inode_open((*inode).ino);
-                    (*reply).label = SALTY_OK;
+                    (*reply).label = BESALT_OK;
                     (*reply).length = 1;
                     (*reply).regs[0] = fd as u64;
                     return true;
                 }
             }
             (*inode).active = 0;
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return true;
         }
 
@@ -548,14 +548,14 @@ pub(crate) unsafe fn handle_proc_open(
         } else if file_name_len == 4 && mem_eq(file_name, b"maps".as_ptr(), 4) {
             PROC_FILE_MAPS
         } else {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return true;
         };
 
         // Allocate temporary inode for this proc file
         let inode = alloc_inode();
         if inode.is_null() {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return true;
         }
         (*inode).ftype = FTYPE_PROC_FILE;
@@ -567,7 +567,7 @@ pub(crate) unsafe fn handle_proc_open(
 
         let cli = get_client(badge);
         if cli.is_null() {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             (*inode).active = 0;
             return true;
         }
@@ -580,14 +580,14 @@ pub(crate) unsafe fn handle_proc_open(
                 (*(*cli).fds.add(fd)).dir_cursor = 0;
                 (*(*cli).fds.add(fd)).flags = 0; // O_RDONLY
                 inode_open((*inode).ino);
-                (*reply).label = SALTY_OK;
+                (*reply).label = BESALT_OK;
                 (*reply).length = 1;
                 (*reply).regs[0] = fd as u64;
                 return true;
             }
         }
         (*inode).active = 0;
-        (*reply).label = SALTY_OUT_OF_MEMORY;
+        (*reply).label = BESALT_OUT_OF_MEMORY;
         true
     }
 }
@@ -609,7 +609,7 @@ pub(crate) fn mem_eq(a: *const u8, b: *const u8, len: usize) -> bool {
 pub(crate) unsafe fn handle_proc_stat(
     path: *const u8,
     path_len: u8,
-    reply: *mut SaltyMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) -> bool {
     unsafe {
@@ -642,7 +642,7 @@ pub(crate) unsafe fn handle_proc_stat(
             }
             let (pid, ok) = parse_pid(&core::slice::from_raw_parts(rest, pid_end as usize));
             if !ok {
-                (*reply).label = SALTY_NOT_FOUND;
+                (*reply).label = BESALT_NOT_FOUND;
                 return true;
             }
             (pid, pid_end)
@@ -657,7 +657,7 @@ pub(crate) unsafe fn handle_proc_stat(
 
         if after_len == 0 {
             // /proc/<pid> — directory
-            (*reply).label = SALTY_OK;
+            (*reply).label = BESALT_OK;
             (*reply).length = 8;
             (*reply).regs[0] = pid as u64; // ino
             (*reply).regs[1] = (S_IFDIR_L | 0o555) as u64; // mode
@@ -681,12 +681,12 @@ pub(crate) unsafe fn handle_proc_stat(
             || (file_name_len == 4 && mem_eq(file_name, b"maps".as_ptr(), 4));
 
         if !is_known {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return true;
         }
 
         // Regular file stat
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 8;
         (*reply).regs[0] = 0; // ino (virtual)
         (*reply).regs[1] = (S_IFREG_L | 0o444) as u64; // mode
@@ -702,7 +702,7 @@ pub(crate) unsafe fn handle_proc_stat(
 
 /// Handle read for FTYPE_PROC_FILE inodes.
 /// Generates content on-the-fly from procmgr/mmsrv.
-pub(crate) unsafe fn handle_proc_read(inode: *const RamfsInode, offset: u64, reply: *mut SaltyMsg) {
+pub(crate) unsafe fn handle_proc_read(inode: *const RamfsInode, offset: u64, reply: *mut BesaltMsg) {
     unsafe {
         let pid = (*inode).size as u32;
         let proc_type = (*inode).dev_type;
@@ -805,7 +805,7 @@ pub(crate) unsafe fn handle_proc_read(inode: *const RamfsInode, offset: u64, rep
 
         if offset as usize >= content_len {
             // EOF
-            (*reply).label = SALTY_OK;
+            (*reply).label = BESALT_OK;
             (*reply).length = 1;
             (*reply).regs[0] = 0;
             return;
@@ -823,7 +823,7 @@ pub(crate) unsafe fn handle_proc_read(inode: *const RamfsInode, offset: u64, rep
         for i in 0..to_copy {
             *dst.add(i) = content[offset as usize + i];
         }
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 1 + ((to_copy as u64 + 7) / 8);
         (*reply).regs[0] = to_copy as u64;
     }
@@ -833,7 +833,7 @@ pub(crate) unsafe fn handle_proc_read(inode: *const RamfsInode, offset: u64, rep
 pub(crate) unsafe fn handle_proc_readdir(
     inode: *const RamfsInode,
     cursor: u32,
-    reply: *mut SaltyMsg,
+    reply: *mut BesaltMsg,
 ) {
     unsafe {
         if (*inode).dev_type == PROC_FILE_ROOT {
@@ -844,7 +844,7 @@ pub(crate) unsafe fn handle_proc_readdir(
             // cursor 0 = "self", then PIDs
             if cursor == 0 {
                 // Return "self" entry
-                (*reply).label = SALTY_OK;
+                (*reply).label = BESALT_OK;
                 (*reply).regs[0] = 4; // name_len = 4
                 (*reply).regs[1] = cursor as u64 + 1; // next cursor
                 (*reply).regs[2] = 0; // ino
@@ -861,7 +861,7 @@ pub(crate) unsafe fn handle_proc_readdir(
             let idx = (cursor - 1) as usize;
             if idx >= count {
                 // No more entries
-                (*reply).label = SALTY_OK;
+                (*reply).label = BESALT_OK;
                 (*reply).regs[0] = 0; // name_len = 0 → end
                 (*reply).length = 1;
                 return;
@@ -871,7 +871,7 @@ pub(crate) unsafe fn handle_proc_readdir(
             let mut name_buf = [0u8; 10];
             let name_len = fmt_u32(pids[idx], &mut name_buf);
 
-            (*reply).label = SALTY_OK;
+            (*reply).label = BESALT_OK;
             (*reply).regs[0] = name_len as u64;
             (*reply).regs[1] = cursor as u64 + 1;
             (*reply).regs[2] = pids[idx] as u64; // ino = pid
@@ -886,13 +886,13 @@ pub(crate) unsafe fn handle_proc_readdir(
             let entries: &[&[u8]] = &[b"status", b"stat", b"maps"];
             let cursor_idx = cursor as usize;
             if cursor_idx >= entries.len() {
-                (*reply).label = SALTY_OK;
+                (*reply).label = BESALT_OK;
                 (*reply).regs[0] = 0;
                 (*reply).length = 1;
                 return;
             }
             let entry = entries[cursor_idx];
-            (*reply).label = SALTY_OK;
+            (*reply).label = BESALT_OK;
             (*reply).regs[0] = entry.len() as u64;
             (*reply).regs[1] = cursor as u64 + 1;
             (*reply).regs[2] = 0; // ino
@@ -903,7 +903,7 @@ pub(crate) unsafe fn handle_proc_readdir(
             }
             (*reply).length = 5;
         } else {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
         }
     }
 }

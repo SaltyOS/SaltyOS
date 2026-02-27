@@ -3,11 +3,11 @@
 //! Tests are skipped gracefully if no data disk is present.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use salty::consts::*;
-use salty::posix;
-use salty::serial;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::posix;
+use besalt::serial;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -15,7 +15,7 @@ fn puts(s: &[u8]) {
 
 /// Check if /mnt/data is accessible (SaltyFS is mounted).
 fn saltyfs_available() -> bool {
-    let mut st = SaltyStat::zeroed();
+    let mut st = BesaltStat::zeroed();
     let ret = unsafe { posix::posix_stat(b"/mnt/data\0".as_ptr(), &raw mut st) };
     ret == 0
 }
@@ -31,7 +31,7 @@ pub fn run() -> bool {
     // Test 1: stat /mnt/data
     puts(b"[TEST_SALTYFS] Test 1: stat /mnt/data\n");
     {
-        let mut st = SaltyStat::zeroed();
+        let mut st = BesaltStat::zeroed();
         let ret = unsafe { posix::posix_stat(b"/mnt/data\0".as_ptr(), &raw mut st) };
         if ret != 0 {
             puts(b"[TEST_SALTYFS] FAIL: stat /mnt/data returned error\n");
@@ -50,14 +50,14 @@ pub fn run() -> bool {
         let ret = unsafe { posix::posix_mkdir(b"/mnt/data/testdir\0".as_ptr(), 0o755) };
         if ret != 0 {
             // On re-run the directory may already exist; treat that as success
-            let mut st2 = SaltyStat::zeroed();
+            let mut st2 = BesaltStat::zeroed();
             let sret = unsafe { posix::posix_stat(b"/mnt/data/testdir\0".as_ptr(), &raw mut st2) };
             if sret != 0 || (st2.st_mode & S_IFMT) != S_IFDIR {
                 puts(b"[TEST_SALTYFS] FAIL: mkdir /mnt/data/testdir failed\n");
                 return false;
             }
         }
-        let mut st = SaltyStat::zeroed();
+        let mut st = BesaltStat::zeroed();
         let ret = unsafe { posix::posix_stat(b"/mnt/data/testdir\0".as_ptr(), &raw mut st) };
         if ret != 0 {
             puts(b"[TEST_SALTYFS] FAIL: stat /mnt/data/testdir failed\n");
@@ -208,7 +208,7 @@ pub fn run() -> bool {
             return false;
         }
 
-        let mut dent = SaltyDirent::zeroed();
+        let mut dent = BesaltDirent::zeroed();
         let mut count = 0u32;
         while unsafe { posix::posix_readdir(dir_fd, &raw mut dent) } != 0 {
             count += 1;
@@ -267,7 +267,7 @@ pub fn run() -> bool {
             return false;
         }
 
-        let mut st = SaltyStat::zeroed();
+        let mut st = BesaltStat::zeroed();
         let ret = unsafe { posix::posix_fstat(fd, &raw mut st) };
         unsafe { posix::posix_close(fd) };
 
@@ -312,7 +312,7 @@ pub fn run() -> bool {
             return false;
         }
 
-        let mut st = SaltyStat::zeroed();
+        let mut st = BesaltStat::zeroed();
         let ret = unsafe { posix::posix_stat(path.as_ptr(), &raw mut st) };
         if ret != 0 || st.st_size != 8 {
             puts(b"[TEST_SALTYFS] FAIL: stat after truncate wrong size\n");
@@ -346,7 +346,7 @@ pub fn run() -> bool {
             return false;
         }
 
-        let mut st = SaltyStat::zeroed();
+        let mut st = BesaltStat::zeroed();
         let ret = unsafe { posix::posix_stat(new.as_ptr(), &raw mut st) };
         if ret != 0 {
             puts(b"[TEST_SALTYFS] FAIL: stat renamed file failed\n");
@@ -369,7 +369,7 @@ pub fn run() -> bool {
             puts(b"[TEST_SALTYFS] FAIL: unlink failed\n");
             return false;
         }
-        let mut st = SaltyStat::zeroed();
+        let mut st = BesaltStat::zeroed();
         let ret = unsafe { posix::posix_stat(path.as_ptr(), &raw mut st) };
         if ret == 0 {
             puts(b"[TEST_SALTYFS] FAIL: file still exists after unlink\n");
@@ -483,7 +483,7 @@ pub fn run() -> bool {
             return false;
         }
 
-        let mut st = SaltyStat::zeroed();
+        let mut st = BesaltStat::zeroed();
         let ret = unsafe { posix::posix_stat(b"/mnt/data/testdir\0".as_ptr(), &raw mut st) };
         if ret == 0 {
             puts(b"[TEST_SALTYFS] FAIL: testdir still exists after rmdir\n");

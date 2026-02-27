@@ -23,14 +23,14 @@
 #![no_std]
 #![no_main]
 
-extern crate salty;
+extern crate besalt;
 
-use salty::consts::*;
-use salty::ipc;
-use salty::invoke;
-use salty::serial;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::ipc;
+use besalt::invoke;
+use besalt::serial;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_CSPACE: u64 = 2;
@@ -94,11 +94,11 @@ fn puts(s: &[u8]) {
 }
 
 fn ipc_ctx() -> *mut IpcContext {
-    &raw mut salty::__salty_ipc_ctx
+    &raw mut besalt::__besalt_ipc_ctx
 }
 
 fn signal_ready() {
-    let _ = salty::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 /// Read 32 bits from PCI config space using mechanism 1 (IO ports 0xCF8/0xCFC).
@@ -312,7 +312,7 @@ fn find_device(vendor_id: u16, device_id: u16) -> Option<usize> {
 /// Register with name service.
 fn register_nameserv() {
     let name = b"pcisrv";
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = POSIX_NS_REGISTER;
     msg.regs[0] = name.len() as u64;
     msg.length = 1 + (name.len() as u64 + 7) / 8;
@@ -322,17 +322,17 @@ fn register_nameserv() {
             *dst.add(i) = name[i];
         }
         ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const msg, &raw mut reply);
     }
 }
 
 /// Handle PCI_FIND_DEVICE request.
-fn handle_find_device(msg: &SaltyMsg) -> SaltyMsg {
+fn handle_find_device(msg: &BesaltMsg) -> BesaltMsg {
     let vendor_id = msg.regs[0] as u16;
     let device_id = msg.regs[1] as u16;
 
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
 
     match find_device(vendor_id, device_id) {
         Some(idx) => {
@@ -349,7 +349,7 @@ fn handle_find_device(msg: &SaltyMsg) -> SaltyMsg {
             reply.regs[7] = d.bars[3] as u64;
         }
         None => {
-            reply.label = SALTY_NOT_FOUND;
+            reply.label = BESALT_NOT_FOUND;
             reply.length = 0;
         }
     }
@@ -357,12 +357,12 @@ fn handle_find_device(msg: &SaltyMsg) -> SaltyMsg {
 }
 
 /// Handle PCI_GET_CAPS request.
-fn handle_get_caps(msg: &SaltyMsg) -> SaltyMsg {
+fn handle_get_caps(msg: &BesaltMsg) -> BesaltMsg {
     let bus = msg.regs[0] as u8;
     let dev = msg.regs[1] as u8;
     let func = msg.regs[2] as u8;
 
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
 
     let count = unsafe { *(&raw const DEVICE_COUNT) };
     let mut found = None;
@@ -377,7 +377,7 @@ fn handle_get_caps(msg: &SaltyMsg) -> SaltyMsg {
     let idx = match found {
         Some(i) => i,
         None => {
-            reply.label = SALTY_NOT_FOUND;
+            reply.label = BESALT_NOT_FOUND;
             return reply;
         }
     };
@@ -432,9 +432,9 @@ fn handle_get_caps(msg: &SaltyMsg) -> SaltyMsg {
 }
 
 /// Handle PCI_LIST request.
-fn handle_list() -> SaltyMsg {
+fn handle_list() -> BesaltMsg {
     let count = unsafe { *(&raw const DEVICE_COUNT) };
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     reply.label = 0;
     reply.length = 1 + (count * 3).min(18) as u64;
     reply.regs[0] = count as u64;
@@ -464,7 +464,7 @@ fn server_loop() -> ! {
     puts(b"[pcisrv] Entering server loop\n");
 
     let ctx = ipc_ctx();
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     let mut badge: u64 = 0;
     unsafe { ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge); }
 
@@ -474,13 +474,13 @@ fn server_loop() -> ! {
             PCI_GET_CAPS => handle_get_caps(&msg),
             PCI_LIST => handle_list(),
             _ => {
-                let mut r = SaltyMsg::zeroed();
-                r.label = SALTY_INVALID_OPERATION;
+                let mut r = BesaltMsg::zeroed();
+                r.label = BESALT_INVALID_OPERATION;
                 r
             }
         };
 
-        msg = SaltyMsg::zeroed();
+        msg = BesaltMsg::zeroed();
         badge = 0;
         unsafe {
             ipc::reply_recv_ctx(

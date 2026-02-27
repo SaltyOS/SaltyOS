@@ -2,16 +2,16 @@
 //! Extracted from main.rs for separation of concerns.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use salty::ipc;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::ipc;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 use crate::proc_table::{
     alloc_proc, find_by_badge, proctab, proctab_cap, MAX_NAME_LEN, NEXT_PID, NSIG, PROC_RUNNING,
     SIG_DISP_CATCH, SIG_DISP_DFL,
 };
 
-pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: u64) {
     unsafe {
         let alloc = &mut *(&raw mut super::ALLOCATOR);
 
@@ -19,13 +19,13 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         let child_entry = msg.regs[1];
 
         if child_entry == 0 {
-            reply.label = super::SALTY_INVALID_ARGUMENT;
+            reply.label = super::BESALT_INVALID_ARGUMENT;
             return;
         }
 
         let Some(parent_idx) = find_by_badge(badge) else {
             super::puts(b"[PROCMGR] FORK from unknown badge\n");
-            reply.label = super::SALTY_NOT_FOUND;
+            reply.label = super::BESALT_NOT_FOUND;
             return;
         };
         let parent_pid = proctab(parent_idx).pid;
@@ -49,7 +49,7 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
 
         let Some(slot_idx) = alloc_proc() else {
             super::puts(b"[PROCMGR] FORK: process table full\n");
-            reply.label = super::SALTY_OUT_OF_MEMORY;
+            reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
         };
 
@@ -63,18 +63,18 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             let mut walk_start: u64 = 0;
             loop {
                 let err =
-                    salty::invoke::vspace_walk(parent_vs, walk_start, super::VSPACE_WALK_BATCH);
+                    besalt::invoke::vspace_walk(parent_vs, walk_start, super::VSPACE_WALK_BATCH);
                 if err != 0 {
                     break;
                 }
-                let Some((count, next_addr)) = salty::invoke::vspace_walk_result_header() else {
+                let Some((count, next_addr)) = besalt::invoke::vspace_walk_result_header() else {
                     break;
                 };
                 if count == 0 {
                     break;
                 }
                 for i in 0..count as usize {
-                    let Some((page_vaddr, _, _)) = salty::invoke::vspace_walk_result_entry(i)
+                    let Some((page_vaddr, _, _)) = besalt::invoke::vspace_walk_result_entry(i)
                     else {
                         break;
                     };
@@ -100,7 +100,7 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         let total_slots = 7 + page_count + 4;
         if !alloc.reserve(total_slots) {
             super::puts(b"[PROCMGR] FORK: slot reservation failed\n");
-            reply.label = super::SALTY_OUT_OF_MEMORY;
+            reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -112,7 +112,7 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                     Err(_) => {
                         super::puts($what);
                         alloc.rollback();
-                        reply.label = super::SALTY_OUT_OF_MEMORY;
+                        reply.label = super::BESALT_OUT_OF_MEMORY;
                         return;
                     }
                 }
@@ -125,7 +125,7 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                     Err(_) => {
                         super::puts($what);
                         alloc.rollback();
-                        reply.label = super::SALTY_OUT_OF_MEMORY;
+                        reply.label = super::BESALT_OUT_OF_MEMORY;
                         return;
                     }
                 }
@@ -151,11 +151,11 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         let mut child_entry_path: u64 = 0;
 
         loop {
-            let err = salty::invoke::vspace_walk(parent_vs, walk_start, super::VSPACE_WALK_BATCH);
+            let err = besalt::invoke::vspace_walk(parent_vs, walk_start, super::VSPACE_WALK_BATCH);
             if err != 0 {
                 break;
             }
-            let Some((count, next_addr)) = salty::invoke::vspace_walk_result_header() else {
+            let Some((count, next_addr)) = besalt::invoke::vspace_walk_result_header() else {
                 break;
             };
             if count == 0 {
@@ -163,7 +163,7 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             }
 
             for i in 0..count as usize {
-                let Some((page_vaddr, _, _)) = salty::invoke::vspace_walk_result_entry(i) else {
+                let Some((page_vaddr, _, _)) = besalt::invoke::vspace_walk_result_entry(i) else {
                     break;
                 };
                 if page_vaddr == parent_layout.ipc_buf.base {
@@ -178,7 +178,7 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                     continue;
                 }
 
-                let cerr = salty::invoke::vspace_clone_cow_page(
+                let cerr = besalt::invoke::vspace_clone_cow_page(
                     parent_vs, page_vaddr, child_vs, page_vaddr,
                 );
                 if cerr != 0 {
@@ -190,7 +190,7 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                     lb.str(b"\n");
                     lb.flush();
                     alloc.rollback();
-                    reply.label = super::SALTY_INVALID_OPERATION;
+                    reply.label = super::BESALT_INVALID_OPERATION;
                     return;
                 }
 
@@ -208,12 +208,12 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         if child_entry_path != 3 {
             super::puts(b"[PROCMGR] FORK: child entry page missing after COW clone\n");
             alloc.rollback();
-            reply.label = super::SALTY_INVALID_OPERATION;
+            reply.label = super::BESALT_INVALID_OPERATION;
             return;
         }
 
         // Mint mmsrv EP into child CNode slot 7 (badged with child pid)
-        let err = salty::invoke::cnode_mint(
+        let err = besalt::invoke::cnode_mint(
             super::CAP_SELF_CSPACE,
             super::CAP_MMSRV_EP_UNBADGED,
             child_cn,
@@ -223,14 +223,14 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         if err != 0 {
             super::puts(b"[PROCMGR] FORK: mint mmsrv EP failed\n");
             alloc.rollback();
-            reply.label = super::SALTY_OUT_OF_MEMORY;
+            reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
         }
 
         // Copy caps into child CNode
         macro_rules! copy_or_fail {
             ($src:expr, $dst:expr, $what:expr) => {
-                if salty::invoke::cnode_copy(
+                if besalt::invoke::cnode_copy(
                     super::CAP_SELF_CSPACE,
                     $src,
                     child_cn,
@@ -240,7 +240,7 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                 {
                     super::puts($what);
                     alloc.rollback();
-                    reply.label = super::SALTY_OUT_OF_MEMORY;
+                    reply.label = super::BESALT_OUT_OF_MEMORY;
                     return;
                 }
             };
@@ -261,7 +261,7 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             b"[PROCMGR] FORK: copy CNode cap failed\n"
         );
 
-        let err = salty::invoke::cnode_mint(
+        let err = besalt::invoke::cnode_mint(
             super::CAP_SELF_CSPACE,
             super::CAP_SERVER_EP,
             child_cn,
@@ -271,10 +271,10 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         if err != 0 {
             super::puts(b"[PROCMGR] FORK: mint server EP failed\n");
             alloc.rollback();
-            reply.label = super::SALTY_OUT_OF_MEMORY;
+            reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
         }
-        let err = salty::invoke::cnode_mint(
+        let err = besalt::invoke::cnode_mint(
             super::CAP_SELF_CSPACE,
             super::CAP_VFS_EP,
             child_cn,
@@ -284,17 +284,17 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         if err != 0 {
             super::puts(b"[PROCMGR] FORK: mint child VFS EP failed\n");
             alloc.rollback();
-            reply.label = super::SALTY_OUT_OF_MEMORY;
+            reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
         }
-        let _ = salty::invoke::cnode_copy(
+        let _ = besalt::invoke::cnode_copy(
             super::CAP_SELF_CSPACE,
             super::CAP_NAMESERV_EP,
             child_cn,
             super::CHILD_CAP_NAMESERV,
             super::CAP_RIGHTS_ALL,
         );
-        let _ = salty::invoke::cnode_copy(
+        let _ = besalt::invoke::cnode_copy(
             super::CAP_SELF_CSPACE,
             child_sig_ntfn,
             child_cn,
@@ -303,7 +303,7 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         );
         // Keep fork child cap layout aligned with spawn path so rtld/slot alloc
         // can use initrd device mapping and mirrored untyped sources.
-        let _ = salty::invoke::cnode_copy(
+        let _ = besalt::invoke::cnode_copy(
             super::CAP_SELF_CSPACE,
             super::CAP_INITRD_UNTYPED,
             child_cn,
@@ -316,7 +316,7 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         let pm_ntfn = *(&raw const super::PM_BOUND_NTFN);
         if pm_ntfn != 0 {
             let cs_badge = 1u64 << (16 + slot_idx);
-            let _ = salty::invoke::cnode_mint(
+            let _ = besalt::invoke::cnode_mint(
                 super::CAP_SELF_CSPACE,
                 pm_ntfn,
                 child_cn,
@@ -326,11 +326,11 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         }
 
         // Configure child TCB
-        let err = salty::invoke::tcb_set_space(child_tcb, child_cn, child_vs);
+        let err = besalt::invoke::tcb_set_space(child_tcb, child_cn, child_vs);
         if err != 0 {
             super::puts(b"[PROCMGR] FORK: set_space failed\n");
             alloc.rollback();
-            reply.label = super::SALTY_OUT_OF_MEMORY;
+            reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -340,11 +340,11 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                 Some(s) => s,
                 None => {
                     alloc.rollback();
-                    reply.label = super::SALTY_OUT_OF_MEMORY;
+                    reply.label = super::BESALT_OUT_OF_MEMORY;
                     return;
                 }
             };
-            let err = salty::invoke::cnode_mint(
+            let err = besalt::invoke::cnode_mint(
                 super::CAP_SELF_CSPACE,
                 super::CAP_MMSRV_EP_UNBADGED,
                 super::CAP_SELF_CSPACE,
@@ -352,25 +352,25 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                 child_pid as u64,
             );
             if err == 0 {
-                salty::invoke::tcb_set_fault_handler(child_tcb, temp_slot);
+                besalt::invoke::tcb_set_fault_handler(child_tcb, temp_slot);
             }
-            salty::invoke::cnode_delete(super::CAP_SELF_CSPACE, temp_slot);
+            besalt::invoke::cnode_delete(super::CAP_SELF_CSPACE, temp_slot);
             alloc.free_single_slot(temp_slot);
         }
 
-        let err = salty::invoke::tcb_configure(child_tcb, child_entry, parent_rsp, 0);
+        let err = besalt::invoke::tcb_configure(child_tcb, child_entry, parent_rsp, 0);
         if err != 0 {
             super::puts(b"[PROCMGR] FORK: configure failed\n");
             alloc.rollback();
-            reply.label = super::SALTY_OUT_OF_MEMORY;
+            reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
         }
         // Copy parent's FPU/SSE state to child (preserves XMM registers across fork)
-        let err = salty::invoke::tcb_copy_fpu(child_tcb, proctab(parent_idx).tcb_cap);
+        let err = besalt::invoke::tcb_copy_fpu(child_tcb, proctab(parent_idx).tcb_cap);
         if err != 0 {
             super::puts(b"[PROCMGR] FORK: copy FPU state failed\n");
             alloc.rollback();
-            reply.label = super::SALTY_OUT_OF_MEMORY;
+            reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
         }
         // Copy parent's TLS base to child TCB so FS_BASE is correct after
@@ -378,25 +378,25 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         // at the same virtual address, so it needs the same FS_BASE.
         let parent_tls_base = msg.regs[9];
         if parent_tls_base != 0 {
-            let err = salty::invoke::tcb_set_tls_base(child_tcb, parent_tls_base);
+            let err = besalt::invoke::tcb_set_tls_base(child_tcb, parent_tls_base);
             if err != 0 {
                 super::puts(b"[PROCMGR] FORK: set TLS base failed\n");
             }
         }
 
-        let err = salty::invoke::tcb_set_ipc_buffer(child_tcb, parent_layout.ipc_buf.base);
+        let err = besalt::invoke::tcb_set_ipc_buffer(child_tcb, parent_layout.ipc_buf.base);
         if err != 0 {
             super::puts(b"[PROCMGR] FORK: set IPC buf failed\n");
             alloc.rollback();
-            reply.label = super::SALTY_OUT_OF_MEMORY;
+            reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
         }
 
         // Clone FD table BEFORE resuming child
         {
-            let mut clone_msg = SaltyMsg::zeroed();
-            let mut clone_reply = SaltyMsg::zeroed();
-            clone_msg.label = salty::consts::POSIX_VFS_CLONE_FDS;
+            let mut clone_msg = BesaltMsg::zeroed();
+            let mut clone_reply = BesaltMsg::zeroed();
+            clone_msg.label = besalt::consts::POSIX_VFS_CLONE_FDS;
             clone_msg.length = 2;
             clone_msg.regs[0] = badge;
             clone_msg.regs[1] = child_pid as u64;
@@ -406,7 +406,7 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                 &raw const clone_msg,
                 &raw mut clone_reply,
             );
-            if err != 0 || clone_reply.label != super::SALTY_OK {
+            if err != 0 || clone_reply.label != super::BESALT_OK {
                 let mut lb = LineBuf::new();
                 lb.str(b"[PROCMGR] FORK: VFS clone_fds failed err=");
                 lb.hex(err as u64);
@@ -415,7 +415,7 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                 lb.str(b", aborting fork\n");
                 lb.flush();
                 alloc.rollback();
-                reply.label = super::SALTY_INVALID_OPERATION;
+                reply.label = super::BESALT_INVALID_OPERATION;
                 return;
             }
         }
@@ -423,10 +423,10 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         // Register child with mmsrv (VSpace cap transfer + initial state)
         {
             let fork_heap_base = parent_layout.elf_code.end();
-            let fork_mmap_base = salty::layout::compute_mmap_base(&parent_layout, fork_heap_base);
-            let mut mm_msg = SaltyMsg::zeroed();
-            let mut mm_reply = SaltyMsg::zeroed();
-            mm_msg.label = salty::consts::MM_REGISTER;
+            let fork_mmap_base = besalt::layout::compute_mmap_base(&parent_layout, fork_heap_base);
+            let mut mm_msg = BesaltMsg::zeroed();
+            let mut mm_reply = BesaltMsg::zeroed();
+            mm_msg.label = besalt::consts::MM_REGISTER;
             mm_msg.length = 4;
             mm_msg.regs[0] = child_pid as u64; // client badge
                                                // Seed with dynamic defaults; MM_FORK_REGIONS overwrites with exact runtime state.
@@ -440,23 +440,23 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                 &raw const mm_msg,
                 &raw mut mm_reply,
             );
-            if err != 0 || mm_reply.label != super::SALTY_OK {
+            if err != 0 || mm_reply.label != super::BESALT_OK {
                 let mut lb = LineBuf::new();
                 lb.str(b"[PROCMGR] FORK: mmsrv register failed err=");
                 lb.hex(err as u64);
                 lb.str(b"\n");
                 lb.flush();
                 alloc.rollback();
-                reply.label = super::SALTY_OUT_OF_MEMORY;
+                reply.label = super::BESALT_OUT_OF_MEMORY;
                 return;
             }
         }
 
         // Clone parent's memory state to child in mmsrv
         {
-            let mut mm_msg = SaltyMsg::zeroed();
-            let mut mm_reply = SaltyMsg::zeroed();
-            mm_msg.label = salty::consts::MM_FORK_REGIONS;
+            let mut mm_msg = BesaltMsg::zeroed();
+            let mut mm_reply = BesaltMsg::zeroed();
+            mm_msg.label = besalt::consts::MM_FORK_REGIONS;
             mm_msg.length = 2;
             mm_msg.regs[0] = badge; // parent badge
             mm_msg.regs[1] = child_pid as u64; // child badge
@@ -466,13 +466,13 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                 &raw const mm_msg,
                 &raw mut mm_reply,
             );
-            if err != 0 || mm_reply.label != super::SALTY_OK {
+            if err != 0 || mm_reply.label != super::BESALT_OK {
                 super::puts(b"[PROCMGR] FORK: mmsrv fork_regions failed, aborting\n");
                 // Deregister child from mmsrv and abort fork
                 {
-                    let mut dereg = SaltyMsg::zeroed();
-                    let mut drep = SaltyMsg::zeroed();
-                    dereg.label = salty::consts::MM_DEREGISTER;
+                    let mut dereg = BesaltMsg::zeroed();
+                    let mut drep = BesaltMsg::zeroed();
+                    dereg.label = besalt::consts::MM_DEREGISTER;
                     dereg.length = 1;
                     dereg.regs[0] = child_pid as u64;
                     let _ = ipc::call_ctx(
@@ -483,16 +483,16 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                     );
                 }
                 alloc.rollback();
-                reply.label = super::SALTY_OUT_OF_MEMORY;
+                reply.label = super::BESALT_OUT_OF_MEMORY;
                 return;
             }
         }
 
         // Map IPC buffer for child via mmsrv (zero-filled, child only)
         {
-            let mut mm_msg = SaltyMsg::zeroed();
-            let mut mm_reply = SaltyMsg::zeroed();
-            mm_msg.label = salty::consts::MM_MAP_BATCH;
+            let mut mm_msg = BesaltMsg::zeroed();
+            let mut mm_reply = BesaltMsg::zeroed();
+            mm_msg.label = besalt::consts::MM_MAP_BATCH;
             mm_msg.length = 4;
             mm_msg.regs[0] = child_pid as u64;
             mm_msg.regs[1] = parent_layout.ipc_buf.base;
@@ -504,13 +504,13 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                 &raw const mm_msg,
                 &raw mut mm_reply,
             );
-            if err != 0 || mm_reply.label != super::SALTY_OK || mm_reply.regs[0] != 1 {
+            if err != 0 || mm_reply.label != super::BESALT_OK || mm_reply.regs[0] != 1 {
                 super::puts(b"[PROCMGR] FORK: MM_MAP_BATCH ipc failed\n");
                 // Deregister child from mmsrv on failure
                 {
-                    let mut dereg = SaltyMsg::zeroed();
-                    let mut drep = SaltyMsg::zeroed();
-                    dereg.label = salty::consts::MM_DEREGISTER;
+                    let mut dereg = BesaltMsg::zeroed();
+                    let mut drep = BesaltMsg::zeroed();
+                    dereg.label = besalt::consts::MM_DEREGISTER;
                     dereg.length = 1;
                     dereg.regs[0] = child_pid as u64;
                     let _ = ipc::call_ctx(
@@ -521,28 +521,28 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                     );
                 }
                 alloc.rollback();
-                reply.label = super::SALTY_OUT_OF_MEMORY;
+                reply.label = super::BESALT_OUT_OF_MEMORY;
                 return;
             }
         }
 
         // Schedule the child
-        let err = salty::invoke::sc_configure(child_sc, 10000, 100000);
+        let err = besalt::invoke::sc_configure(child_sc, 10000, 100000);
         if err != 0 {
             alloc.rollback();
-            reply.label = super::SALTY_OUT_OF_MEMORY;
+            reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
         }
-        let err = salty::invoke::sc_bind(child_sc, child_tcb);
+        let err = besalt::invoke::sc_bind(child_sc, child_tcb);
         if err != 0 {
             alloc.rollback();
-            reply.label = super::SALTY_OUT_OF_MEMORY;
+            reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
         }
-        let err = salty::invoke::tcb_resume(child_tcb);
+        let err = besalt::invoke::tcb_resume(child_tcb);
         if err != 0 {
             alloc.rollback();
-            reply.label = super::SALTY_OUT_OF_MEMORY;
+            reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -583,18 +583,18 @@ pub(crate) unsafe fn handle_fork(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             lb.str(b" started\n");
             lb.flush();
         }
-        reply.label = super::SALTY_OK;
+        reply.label = super::BESALT_OK;
         reply.length = 1;
         reply.regs[0] = child_pid as u64;
     }
 }
 
-pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: u64) {
     unsafe {
         let alloc = &mut *(&raw mut super::ALLOCATOR);
 
         let Some(idx) = find_by_badge(badge) else {
-            reply.label = super::SALTY_NOT_FOUND;
+            reply.label = super::BESALT_NOT_FOUND;
             return;
         };
 
@@ -640,7 +640,7 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
 
         let mut elf_entry = CpioEntry::zeroed();
 
-        let mut found = salty::cpio::cpio_find_file(
+        let mut found = besalt::cpio::cpio_find_file(
             initrd,
             initrd_size,
             name.as_ptr(),
@@ -652,7 +652,7 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         if !found && name_len > 0 && name[0] == b'/' {
             base_off = 1;
             base_len = name_len - 1;
-            found = salty::cpio::cpio_find_file(
+            found = besalt::cpio::cpio_find_file(
                 initrd,
                 initrd_size,
                 (&name[base_off]) as *const u8,
@@ -670,7 +670,7 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             legacy[base_len + 1] = b'e';
             legacy[base_len + 2] = b'l';
             legacy[base_len + 3] = b'f';
-            found = salty::cpio::cpio_find_file(
+            found = besalt::cpio::cpio_find_file(
                 initrd,
                 initrd_size,
                 legacy.as_ptr(),
@@ -680,11 +680,11 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         }
         if !found {
             super::puts(b"[PROCMGR] EXEC: ELF not found\n");
-            reply.label = super::SALTY_NOT_FOUND;
+            reply.label = super::BESALT_NOT_FOUND;
             return;
         }
 
-        let is_dynamic = salty::elf_dynamic::elf_has_interp(elf_entry.data, elf_entry.data_len);
+        let is_dynamic = besalt::elf_dynamic::elf_has_interp(elf_entry.data, elf_entry.data_len);
         let proc_vs = proctab(idx).vspace_cap;
         let pid = proctab(idx).pid;
 
@@ -694,11 +694,11 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         // 2. Unmap existing user pages
         let mut walk_start: u64 = 0;
         loop {
-            let err = salty::invoke::vspace_walk(proc_vs, walk_start, super::VSPACE_WALK_BATCH);
+            let err = besalt::invoke::vspace_walk(proc_vs, walk_start, super::VSPACE_WALK_BATCH);
             if err != 0 {
                 break;
             }
-            let Some((count, next_addr)) = salty::invoke::vspace_walk_result_header() else {
+            let Some((count, next_addr)) = besalt::invoke::vspace_walk_result_header() else {
                 break;
             };
             if count == 0 {
@@ -706,11 +706,11 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             }
 
             for i in 0..count {
-                let Some((page_vaddr, _, _)) = salty::invoke::vspace_walk_result_entry(i as usize)
+                let Some((page_vaddr, _, _)) = besalt::invoke::vspace_walk_result_entry(i as usize)
                 else {
                     break;
                 };
-                salty::invoke::vspace_unmap(proc_vs, page_vaddr);
+                besalt::invoke::vspace_unmap(proc_vs, page_vaddr);
             }
 
             if next_addr == 0 {
@@ -728,7 +728,7 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                 super::CHILD_RTLD_FRAME_SLOT_START
             };
             let mut cnode_bits: u64 = 10;
-            let cinfo = salty::invoke::cnode_get_info(child_cn);
+            let cinfo = besalt::invoke::cnode_get_info(child_cn);
             if cinfo.error == 0 {
                 let ctx = &*super::ipc_ctx();
                 if !ctx.ipc_buffer.is_null() {
@@ -741,7 +741,7 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             }
             let cnode_total = 1u64 << cnode_bits;
             for slot in frame_floor..cnode_total {
-                salty::invoke::cnode_delete(child_cn, slot);
+                besalt::invoke::cnode_delete(child_cn, slot);
             }
         }
 
@@ -753,9 +753,9 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         if old_slot_count > off_fixed {
             for i in off_fixed..old_slot_count {
                 let slot = old_slot_base + i as u64;
-                let err = salty::invoke::cnode_revoke(super::CAP_SELF_CSPACE, slot);
+                let err = besalt::invoke::cnode_revoke(super::CAP_SELF_CSPACE, slot);
                 if err != 0 {
-                    salty::invoke::cnode_delete(super::CAP_SELF_CSPACE, slot);
+                    besalt::invoke::cnode_delete(super::CAP_SELF_CSPACE, slot);
                 }
             }
             alloc.free_slots(old_slot_base + off_fixed as u64, old_slot_count - off_fixed);
@@ -763,7 +763,7 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         }
 
         // 3. Compute layout
-        let elf_span = salty::elf_loader::elf_compute_load_span(elf_entry.data, elf_entry.data_len);
+        let elf_span = besalt::elf_loader::elf_compute_load_span(elf_entry.data, elf_entry.data_len);
         let rtld_span = if is_dynamic {
             super::spawn_tx::count_rtld_span_for_exec(
                 elf_entry.data,
@@ -775,9 +775,9 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             0
         };
         let needed = if is_dynamic {
-            salty::elf_dynamic::elf_get_needed(elf_entry.data, elf_entry.data_len)
+            besalt::elf_dynamic::elf_get_needed(elf_entry.data, elf_entry.data_len)
         } else {
-            salty::elf_dynamic::NeededLibs::new()
+            besalt::elf_dynamic::NeededLibs::new()
         };
         let shared_lib_cache_pages = super::spawn_tx::shared_lib_va_pages_for_needed(&needed);
         let lib_window_pages = if is_dynamic {
@@ -785,23 +785,23 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         } else {
             0
         };
-        let layout = salty::layout::compute_vm_layout_randomized(
+        let layout = besalt::layout::compute_vm_layout_randomized(
             elf_span,
             rtld_span,
             shared_lib_cache_pages,
             is_dynamic,
             lib_window_pages * 4096,
-            || salty::syscall::sys_getrandom(),
+            || besalt::syscall::sys_getrandom(),
         );
         if layout.stack_top == 0 {
             super::puts(b"[PROCMGR] EXEC: ELF too large for VA layout\n");
-            reply.label = super::SALTY_INVALID_ARGUMENT;
+            reply.label = super::BESALT_INVALID_ARGUMENT;
             return;
         }
 
         // 4. Re-register with mmsrv for the new exec image
         let heap_base = layout.heap_base();
-        let mmap_base = salty::layout::compute_mmap_base(&layout, heap_base);
+        let mmap_base = besalt::layout::compute_mmap_base(&layout, heap_base);
         super::spawn_tx::register_with_mmsrv(pid, proc_vs, heap_base, mmap_base);
 
         // 5. Load ELF via mmsrv
@@ -825,7 +825,7 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             lb.str(b"\n");
             lb.flush();
             super::spawn_tx::deregister_from_mmsrv(pid);
-            reply.label = super::SALTY_INVALID_ARGUMENT;
+            reply.label = super::BESALT_INVALID_ARGUMENT;
             return;
         }
 
@@ -848,7 +848,7 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                 Some(r) => rtld_result = r,
                 None => {
                     super::spawn_tx::deregister_from_mmsrv(pid);
-                    reply.label = super::SALTY_NOT_FOUND;
+                    reply.label = super::BESALT_NOT_FOUND;
                     return;
                 }
             }
@@ -866,14 +866,14 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             );
             if err != 0 {
                 super::spawn_tx::deregister_from_mmsrv(pid);
-                reply.label = super::SALTY_OUT_OF_MEMORY;
+                reply.label = super::BESALT_OUT_OF_MEMORY;
                 return;
             }
 
             let err = super::spawn_tx::exec_map_bootinfo_mmsrv(pid);
             if err != 0 {
                 super::spawn_tx::deregister_from_mmsrv(pid);
-                reply.label = super::SALTY_OUT_OF_MEMORY;
+                reply.label = super::BESALT_OUT_OF_MEMORY;
                 return;
             }
         }
@@ -882,7 +882,7 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         let err = super::spawn_tx::exec_map_ipc_buf_mmsrv(pid, layout.ipc_buf.base);
         if err != 0 {
             super::spawn_tx::deregister_from_mmsrv(pid);
-            reply.label = super::SALTY_OUT_OF_MEMORY;
+            reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -908,7 +908,7 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         );
         if err != 0 {
             super::spawn_tx::deregister_from_mmsrv(pid);
-            reply.label = super::SALTY_OUT_OF_MEMORY;
+            reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -918,7 +918,7 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
 
         if is_dynamic {
             let mut exec_cnode_bits: u64 = 10;
-            let cinfo = salty::invoke::cnode_get_info(proctab(idx).cnode_cap);
+            let cinfo = besalt::invoke::cnode_get_info(proctab(idx).cnode_cap);
             if cinfo.error == 0 {
                 let ctx = &*super::ipc_ctx();
                 if !ctx.ipc_buffer.is_null() {
@@ -960,7 +960,7 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                 Err(()) => {
                     super::spawn_tx::unmap_window_from_mmsrv(super::PROCMGR_SCRATCH_VADDR, 1);
                     super::spawn_tx::deregister_from_mmsrv(pid);
-                    reply.label = super::SALTY_OUT_OF_MEMORY;
+                    reply.label = super::BESALT_OUT_OF_MEMORY;
                     return;
                 }
             }
@@ -982,7 +982,7 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                 Err(()) => {
                     super::spawn_tx::unmap_window_from_mmsrv(super::PROCMGR_SCRATCH_VADDR, 1);
                     super::spawn_tx::deregister_from_mmsrv(pid);
-                    reply.label = super::SALTY_OUT_OF_MEMORY;
+                    reply.label = super::BESALT_OUT_OF_MEMORY;
                     return;
                 }
             }
@@ -992,11 +992,11 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         super::spawn_tx::unmap_window_from_mmsrv(super::PROCMGR_SCRATCH_VADDR, 1);
 
         // 11. Suspend and reconfigure
-        let susp_err = salty::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 16);
+        let susp_err = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 16);
         if susp_err != 0 {
             super::puts(b"[PROCMGR] EXEC: tcb_suspend failed\n");
             super::spawn_tx::deregister_from_mmsrv(pid);
-            reply.label = super::SALTY_BUSY;
+            reply.label = super::BESALT_BUSY;
             return;
         }
 
@@ -1007,20 +1007,20 @@ pub(crate) unsafe fn handle_exec(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             }
         }
 
-        let err = salty::invoke::tcb_configure(proctab(idx).tcb_cap, new_entry, new_rsp, 0);
+        let err = besalt::invoke::tcb_configure(proctab(idx).tcb_cap, new_entry, new_rsp, 0);
         if err != 0 {
             super::puts(b"[PROCMGR] EXEC: tcb_configure failed\n");
             super::spawn_tx::deregister_from_mmsrv(pid);
-            reply.label = super::SALTY_INVALID_ARGUMENT;
+            reply.label = super::BESALT_INVALID_ARGUMENT;
             return;
         }
-        salty::invoke::tcb_set_ipc_buffer(proctab(idx).tcb_cap, layout.ipc_buf.base);
+        besalt::invoke::tcb_set_ipc_buffer(proctab(idx).tcb_cap, layout.ipc_buf.base);
 
-        let err = salty::invoke::tcb_resume(proctab(idx).tcb_cap);
+        let err = besalt::invoke::tcb_resume(proctab(idx).tcb_cap);
         if err != 0 {
             super::puts(b"[PROCMGR] EXEC: resume failed\n");
             super::spawn_tx::deregister_from_mmsrv(pid);
-            reply.label = super::SALTY_INVALID_ARGUMENT;
+            reply.label = super::BESALT_INVALID_ARGUMENT;
             return;
         }
 

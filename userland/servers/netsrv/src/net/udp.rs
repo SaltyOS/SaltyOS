@@ -5,7 +5,7 @@
 //! default destination. Buffers incoming datagrams per-socket and supports
 //! async completion for pending recvfrom operations.
 
-use salty::consts::{INET_OP_RECVFROM, SALTY_INVALID_ARGUMENT, SALTY_OK};
+use besalt::consts::{INET_OP_RECVFROM, BESALT_INVALID_ARGUMENT, BESALT_OK};
 
 const MAX_UDP_SOCKETS: usize = 8;
 const UDP_RX_BUF_SIZE: usize = 4096;
@@ -208,13 +208,13 @@ pub(crate) fn udp_socket() -> i32 {
 pub(crate) fn udp_bind(conn_id: u32, ip: u32, port: u16) -> i32 {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return -(SALTY_INVALID_ARGUMENT as i32),
+        None => return -(BESALT_INVALID_ARGUMENT as i32),
     };
 
     // Check port not already bound by another socket
     if let Some(existing) = find_by_port(port) {
         if existing != idx {
-            return -(SALTY_INVALID_ARGUMENT as i32);
+            return -(BESALT_INVALID_ARGUMENT as i32);
         }
     }
 
@@ -231,7 +231,7 @@ pub(crate) fn udp_bind(conn_id: u32, ip: u32, port: u16) -> i32 {
 pub(crate) fn udp_connect(conn_id: u32, ip: u32, port: u16) -> i32 {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return -(SALTY_INVALID_ARGUMENT as i32),
+        None => return -(BESALT_INVALID_ARGUMENT as i32),
     };
 
     // SAFETY: Single-threaded driver; idx is valid.
@@ -254,7 +254,7 @@ pub(crate) fn udp_connect(conn_id: u32, ip: u32, port: u16) -> i32 {
 pub(crate) fn udp_sendto(conn_id: u32, data: &[u8], dst_ip: u32, dst_port: u16) -> i32 {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return -(SALTY_INVALID_ARGUMENT as i32),
+        None => return -(BESALT_INVALID_ARGUMENT as i32),
     };
 
     // SAFETY: Single-threaded driver; reading/writing socket state.
@@ -279,7 +279,7 @@ pub(crate) fn udp_sendto(conn_id: u32, data: &[u8], dst_ip: u32, dst_port: u16) 
     let udp_len = UDP_HEADER_LEN + data.len();
     if udp_len > 1480 {
         // MTU limit: 1500 ethernet - 20 IP header = 1480 max UDP (header + payload)
-        return -(SALTY_INVALID_ARGUMENT as i32);
+        return -(BESALT_INVALID_ARGUMENT as i32);
     }
 
     let mut udp_buf = [0u8; 1480]; // max UDP packet: 8 header + 1472 payload
@@ -328,7 +328,7 @@ pub(crate) fn udp_sendto(conn_id: u32, data: &[u8], dst_ip: u32, dst_port: u16) 
 pub(crate) fn udp_send(conn_id: u32, data: &[u8]) -> i32 {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return -(SALTY_INVALID_ARGUMENT as i32),
+        None => return -(BESALT_INVALID_ARGUMENT as i32),
     };
 
     // SAFETY: Single-threaded driver; reading socket state.
@@ -338,7 +338,7 @@ pub(crate) fn udp_send(conn_id: u32, data: &[u8]) -> i32 {
     };
 
     if rip == 0 || rport == 0 {
-        return -(SALTY_INVALID_ARGUMENT as i32);
+        return -(BESALT_INVALID_ARGUMENT as i32);
     }
 
     udp_sendto(conn_id, data, rip, rport)
@@ -398,7 +398,7 @@ pub(crate) fn udp_recv(conn_id: u32, buf: &mut [u8]) -> i32 {
 pub(crate) fn udp_close(conn_id: u32) -> i32 {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return -(SALTY_INVALID_ARGUMENT as i32),
+        None => return -(BESALT_INVALID_ARGUMENT as i32),
     };
 
     // SAFETY: Single-threaded driver; deactivating socket.
@@ -502,7 +502,7 @@ pub(crate) fn handle_datagram(ip_hdr: &super::ipv4::Ipv4Header, data: &[u8]) {
 
             let mut comp = Completion {
                 conn_id: sock.conn_id,
-                result: SALTY_OK,
+                result: BESALT_OK,
                 op_type: INET_OP_RECVFROM,
                 data: [0u8; 152],
                 data_len: copy_len,
@@ -587,7 +587,7 @@ pub(crate) fn set_pending_recv(conn_id: u32, max_len: u16) {
 
                 let mut comp = Completion {
                     conn_id: sock.conn_id,
-                    result: SALTY_OK,
+                    result: BESALT_OK,
                     op_type: INET_OP_RECVFROM,
                     data: [0u8; 152],
                     data_len: copy_len,

@@ -2,9 +2,9 @@
 //! Extracted from main.rs for separation of concerns.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use salty::ipc;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::ipc;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 use crate::proc_table::{
     alloc_proc, cleanup_proc_resources, find_by_badge, find_by_pid, proctab, proctab_cap,
@@ -12,7 +12,7 @@ use crate::proc_table::{
 };
 
 fn signal_ntfn(ntfn: Cap, bits: u64) {
-    salty::syscall::syscall(salty::SYS_SIGNAL, ntfn, bits, 0, 0, 0, 0);
+    besalt::syscall::syscall(besalt::SYS_SIGNAL, ntfn, bits, 0, 0, 0, 0);
 }
 
 /// Respawn a process by crafting a synthetic POSIX_PM_SPAWN message.
@@ -34,14 +34,14 @@ unsafe fn respawn_process(binary: &[u8; MAX_NAME_LEN]) {
         lb.flush();
 
         // Build synthetic spawn message
-        let mut msg = SaltyMsg::zeroed();
+        let mut msg = BesaltMsg::zeroed();
         msg.label = super::PM_SPAWN;
         let packed_name_words = (name_len as u64 + 7) / 8;
         msg.regs[0] = name_len as u64;
         // policy: SPAWN_READY_IMMEDIATE, no initrd, no display, default cnode
-        msg.regs[1] = salty::SPAWN_READY_IMMEDIATE;
+        msg.regs[1] = besalt::SPAWN_READY_IMMEDIATE;
         msg.regs[2] = 0; // timeout
-        msg.regs[3] = salty::SPAWN_FLAG_RESPAWN; // preserve respawn flag
+        msg.regs[3] = besalt::SPAWN_FLAG_RESPAWN; // preserve respawn flag
         msg.regs[4] = 0; // no spawn args
         msg.length = 5 + packed_name_words;
 
@@ -50,11 +50,11 @@ unsafe fn respawn_process(binary: &[u8; MAX_NAME_LEN]) {
             *dst.add(i) = binary[i];
         }
 
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
         let alloc = &mut *(&raw mut super::ALLOCATOR);
         super::spawn_tx::handle_spawn_tx(&msg, &mut reply, 0, alloc);
 
-        if reply.label == super::SALTY_OK {
+        if reply.label == super::BESALT_OK {
             let mut lb = LineBuf::new();
             lb.str(b"[PROCMGR] Respawned PID=");
             lb.hex(reply.regs[0]);
@@ -62,12 +62,12 @@ unsafe fn respawn_process(binary: &[u8; MAX_NAME_LEN]) {
             lb.flush();
         } else {
             // Retry once after a short delay
-            salty::serial::serial_puts(b"[PROCMGR] Respawn failed, retrying...\n");
-            salty::syscall::syscall(salty::SYS_NANOSLEEP, 100_000_000, 0, 0, 0, 0, 0);
-            let mut reply2 = SaltyMsg::zeroed();
+            besalt::serial::serial_puts(b"[PROCMGR] Respawn failed, retrying...\n");
+            besalt::syscall::syscall(besalt::SYS_NANOSLEEP, 100_000_000, 0, 0, 0, 0, 0);
+            let mut reply2 = BesaltMsg::zeroed();
             super::spawn_tx::handle_spawn_tx(&msg, &mut reply2, 0, alloc);
-            if reply2.label != super::SALTY_OK {
-                salty::serial::serial_puts(b"[PROCMGR] Respawn retry failed\n");
+            if reply2.label != super::BESALT_OK {
+                besalt::serial::serial_puts(b"[PROCMGR] Respawn retry failed\n");
             }
         }
     }
@@ -87,12 +87,12 @@ pub(crate) unsafe fn free_proc_alloc_slots(idx: usize) {
 
         // Free any outstanding waiter reply slots
         if proctab(idx).waiter_reply != 0 {
-            salty::invoke::cnode_delete(super::CAP_SELF_CSPACE, proctab(idx).waiter_reply);
+            besalt::invoke::cnode_delete(super::CAP_SELF_CSPACE, proctab(idx).waiter_reply);
             alloc.free_single_slot(proctab(idx).waiter_reply);
             proctab(idx).waiter_reply = 0;
         }
         if proctab(idx).any_waiter_reply != 0 {
-            salty::invoke::cnode_delete(super::CAP_SELF_CSPACE, proctab(idx).any_waiter_reply);
+            besalt::invoke::cnode_delete(super::CAP_SELF_CSPACE, proctab(idx).any_waiter_reply);
             alloc.free_single_slot(proctab(idx).any_waiter_reply);
             proctab(idx).any_waiter_reply = 0;
         }
@@ -106,7 +106,7 @@ pub(crate) unsafe fn free_proc_alloc_slots(idx: usize) {
     }
 }
 
-pub(crate) unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_exit(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: u64) {
     unsafe {
         let raw_code = msg.regs[0] as i32;
         let exit_code = raw_code << 8;
@@ -117,7 +117,7 @@ pub(crate) unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             lb.hex(badge);
             lb.str(b"\n");
             lb.flush();
-            reply.label = super::SALTY_NOT_FOUND;
+            reply.label = super::BESALT_NOT_FOUND;
             return;
         };
 
@@ -133,9 +133,9 @@ pub(crate) unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
 
         // Deregister from mmsrv if registered
         if proctab(idx).mmsrv_registered {
-            let mut mm_msg = SaltyMsg::zeroed();
-            let mut mm_reply = SaltyMsg::zeroed();
-            mm_msg.label = salty::consts::MM_DEREGISTER;
+            let mut mm_msg = BesaltMsg::zeroed();
+            let mut mm_reply = BesaltMsg::zeroed();
+            mm_msg.label = besalt::consts::MM_DEREGISTER;
             mm_msg.length = 1;
             mm_msg.regs[0] = badge;
             let _ = ipc::call_ctx(
@@ -148,8 +148,8 @@ pub(crate) unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
 
         // Ensure VFS tears down all per-client fd state/refcounts for this badge.
         // Use non-blocking send so PM_EXIT path cannot wedge waiting for VFS reply.
-        let mut vfs_msg = SaltyMsg::zeroed();
-        vfs_msg.label = salty::consts::POSIX_VFS_CLIENT_EXIT;
+        let mut vfs_msg = BesaltMsg::zeroed();
+        vfs_msg.label = besalt::consts::POSIX_VFS_CLIENT_EXIT;
         vfs_msg.length = 1;
         vfs_msg.regs[0] = badge;
         let mut vfs_err = 0i32;
@@ -160,7 +160,7 @@ pub(crate) unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                 vfs_sent = true;
                 break;
             }
-            salty::syscall::syscall(salty::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+            besalt::syscall::syscall(besalt::SYS_YIELD, 0, 0, 0, 0, 0, 0);
         }
         if !vfs_sent {
             let mut lb = LineBuf::new();
@@ -182,7 +182,7 @@ pub(crate) unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             saved_binary = proctab(idx).respawn_binary;
         }
 
-        let susp_err = salty::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 16);
+        let susp_err = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 16);
         if susp_err != 0 {
             let mut lb = LineBuf::new();
             lb.str(b"[PROCMGR] WARN: tcb_suspend failed in exit PID=");
@@ -212,15 +212,15 @@ pub(crate) unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                 lb.flush();
             }
 
-            let mut wake = SaltyMsg::zeroed();
-            wake.label = super::SALTY_OK;
+            let mut wake = BesaltMsg::zeroed();
+            wake.label = super::BESALT_OK;
             wake.length = 2;
             wake.regs[0] = exit_code as u64;
             wake.regs[1] = proctab(idx).pid as u64;
 
             let waiter_cap = proctab(idx).waiter_reply;
-            salty::ipc::send_ctx(super::ipc_ctx(), waiter_cap, &raw const wake);
-            salty::invoke::cnode_delete(super::CAP_SELF_CSPACE, waiter_cap);
+            besalt::ipc::send_ctx(super::ipc_ctx(), waiter_cap, &raw const wake);
+            besalt::invoke::cnode_delete(super::CAP_SELF_CSPACE, waiter_cap);
             (&mut *(&raw mut super::ALLOCATOR)).free_single_slot(waiter_cap);
             proctab(idx).waiter_reply = 0;
             proctab(idx).waiter_pid = 0;
@@ -246,15 +246,15 @@ pub(crate) unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                     lb.flush();
                 }
 
-                let mut wake = SaltyMsg::zeroed();
-                wake.label = super::SALTY_OK;
+                let mut wake = BesaltMsg::zeroed();
+                wake.label = super::BESALT_OK;
                 wake.length = 2;
                 wake.regs[0] = exit_code as u64;
                 wake.regs[1] = proctab(idx).pid as u64;
 
                 let waiter_cap = proctab(pi).any_waiter_reply;
-                salty::ipc::send_ctx(super::ipc_ctx(), waiter_cap, &raw const wake);
-                salty::invoke::cnode_delete(super::CAP_SELF_CSPACE, waiter_cap);
+                besalt::ipc::send_ctx(super::ipc_ctx(), waiter_cap, &raw const wake);
+                besalt::invoke::cnode_delete(super::CAP_SELF_CSPACE, waiter_cap);
                 (&mut *(&raw mut super::ALLOCATOR)).free_single_slot(waiter_cap);
                 proctab(pi).any_waiter_reply = 0;
                 proctab(pi).waiting_for_any = 0;
@@ -278,13 +278,13 @@ pub(crate) unsafe fn handle_exit(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
 }
 
 /// Returns true if caller is blocked (skip reply).
-pub(crate) unsafe fn handle_wait(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u64) -> bool {
+pub(crate) unsafe fn handle_wait(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: u64) -> bool {
     unsafe {
         let child_pid = msg.regs[0] as u32;
         let options = msg.regs[1] as u32;
 
         let Some(caller_idx) = find_by_badge(badge) else {
-            reply.label = super::SALTY_NOT_FOUND;
+            reply.label = super::BESALT_NOT_FOUND;
             return false;
         };
         let caller_pid = proctab(caller_idx).pid;
@@ -310,7 +310,7 @@ pub(crate) unsafe fn handle_wait(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
                 }
             }
             if let Some(zi) = zombie_idx {
-                reply.label = super::SALTY_OK;
+                reply.label = super::BESALT_OK;
                 reply.length = 2;
                 reply.regs[0] = proctab(zi).exit_code as u64;
                 reply.regs[1] = proctab(zi).pid as u64;
@@ -321,7 +321,7 @@ pub(crate) unsafe fn handle_wait(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
 
             if (options & super::WUNTRACED) != 0 {
                 if let Some(si) = stopped_idx {
-                    reply.label = super::SALTY_OK;
+                    reply.label = super::BESALT_OK;
                     reply.length = 2;
                     reply.regs[0] = proctab(si).stop_status as u64;
                     reply.regs[1] = proctab(si).pid as u64;
@@ -330,12 +330,12 @@ pub(crate) unsafe fn handle_wait(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             }
 
             if !has_living {
-                reply.label = super::SALTY_NOT_FOUND;
+                reply.label = super::BESALT_NOT_FOUND;
                 return false;
             }
 
             if (options & super::WNOHANG) != 0 {
-                reply.label = super::SALTY_OK;
+                reply.label = super::BESALT_OK;
                 reply.length = 2;
                 reply.regs[0] = 0;
                 reply.regs[1] = 0;
@@ -346,14 +346,14 @@ pub(crate) unsafe fn handle_wait(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             let reply_slot = match (&mut *(&raw mut super::ALLOCATOR)).alloc_single_slot() {
                 Some(s) => s,
                 None => {
-                    reply.label = super::SALTY_OUT_OF_MEMORY;
+                    reply.label = super::BESALT_OUT_OF_MEMORY;
                     return false;
                 }
             };
-            let err = salty::invoke::cnode_save_caller(super::CAP_SELF_CSPACE, reply_slot);
+            let err = besalt::invoke::cnode_save_caller(super::CAP_SELF_CSPACE, reply_slot);
             if err != 0 {
                 (&mut *(&raw mut super::ALLOCATOR)).free_single_slot(reply_slot);
-                reply.label = super::SALTY_OUT_OF_MEMORY;
+                reply.label = super::BESALT_OUT_OF_MEMORY;
                 return false;
             }
             proctab(caller_idx).any_waiter_reply = reply_slot;
@@ -370,16 +370,16 @@ pub(crate) unsafe fn handle_wait(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
 
         // waitpid(specific child)
         let Some(ci) = find_by_pid(child_pid) else {
-            reply.label = super::SALTY_NOT_FOUND;
+            reply.label = super::BESALT_NOT_FOUND;
             return false;
         };
         if proctab(ci).ppid != caller_pid {
-            reply.label = super::SALTY_NOT_FOUND;
+            reply.label = super::BESALT_NOT_FOUND;
             return false;
         }
 
         if proctab(ci).state == PROC_ZOMBIE {
-            reply.label = super::SALTY_OK;
+            reply.label = super::BESALT_OK;
             reply.length = 2;
             reply.regs[0] = proctab(ci).exit_code as u64;
             reply.regs[1] = proctab(ci).pid as u64;
@@ -389,7 +389,7 @@ pub(crate) unsafe fn handle_wait(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         }
 
         if (options & super::WUNTRACED) != 0 && proctab(ci).state == PROC_STOPPED {
-            reply.label = super::SALTY_OK;
+            reply.label = super::BESALT_OK;
             reply.length = 2;
             reply.regs[0] = proctab(ci).stop_status as u64;
             reply.regs[1] = proctab(ci).pid as u64;
@@ -397,7 +397,7 @@ pub(crate) unsafe fn handle_wait(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         }
 
         if (options & super::WNOHANG) != 0 {
-            reply.label = super::SALTY_OK;
+            reply.label = super::BESALT_OK;
             reply.length = 2;
             reply.regs[0] = 0;
             reply.regs[1] = 0;
@@ -408,11 +408,11 @@ pub(crate) unsafe fn handle_wait(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
         let reply_slot = match (&mut *(&raw mut super::ALLOCATOR)).alloc_single_slot() {
             Some(s) => s,
             None => {
-                reply.label = super::SALTY_OUT_OF_MEMORY;
+                reply.label = super::BESALT_OUT_OF_MEMORY;
                 return false;
             }
         };
-        let err = salty::invoke::cnode_save_caller(super::CAP_SELF_CSPACE, reply_slot);
+        let err = besalt::invoke::cnode_save_caller(super::CAP_SELF_CSPACE, reply_slot);
         if err != 0 {
             let mut lb = LineBuf::new();
             lb.str(b"[PROCMGR] save_caller failed for WAIT, err=");
@@ -420,7 +420,7 @@ pub(crate) unsafe fn handle_wait(msg: &SaltyMsg, reply: &mut SaltyMsg, badge: u6
             lb.str(b"\n");
             lb.flush();
             (&mut *(&raw mut super::ALLOCATOR)).free_single_slot(reply_slot);
-            reply.label = super::SALTY_OUT_OF_MEMORY;
+            reply.label = super::BESALT_OUT_OF_MEMORY;
             return false;
         }
         proctab(ci).waiter_reply = reply_slot;

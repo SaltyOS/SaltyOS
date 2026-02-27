@@ -1,7 +1,7 @@
 /* SaltyOS Runtime Dynamic Linker - Entry Point
  * SPDX-License-Identifier: GPL-2.0-only
  *
- * Entry point for ld-salty.so. Parses the initial stack (argc/argv/envp/auxv),
+ * Entry point for ld-besalt.so. Parses the initial stack (argc/argv/envp/auxv),
  * self-relocates, loads shared libraries from the CPIO initrd, applies
  * relocations, sets up PLT lazy binding, and jumps to the executable entry.
  */
@@ -11,12 +11,12 @@
 struct rtld_state g_rtld;
 
 /* Exported so applications can continue allocating frame slots after rtld */
-uint64_t __salty_next_frame_slot = 0;
+uint64_t __besalt_next_frame_slot = 0;
 
 /* Exported per-process slot pool info for slot_alloc */
-uint64_t __salty_slot_base = 0;
-uint64_t __salty_slot_count = 0;
-uint64_t __salty_cspace_ntfn = 0;
+uint64_t __besalt_slot_base = 0;
+uint64_t __besalt_slot_count = 0;
+uint64_t __besalt_cspace_ntfn = 0;
 
 void __attribute__((naked, noreturn)) _start(void) {
     __asm__ volatile(
@@ -90,16 +90,16 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         case AT_PHNUM:           at_phnum = p[1]; break;
         case AT_ENTRY:           at_entry = p[1]; break;
         case AT_BASE:            at_base = p[1]; break;
-        case AT_SALTY_UNTYPED:   g_rtld.untyped = p[1]; break;
-        case AT_SALTY_VSPACE:    g_rtld.vspace = p[1]; break;
-        case AT_SALTY_SCRATCH:   g_rtld.scratch_vaddr = p[1]; break;
-        case AT_SALTY_INITRD:    g_rtld.initrd_base = p[1]; break;
-        case AT_SALTY_INITRD_SZ: g_rtld.initrd_size = p[1]; break;
-        case AT_SALTY_FRAME_SLOT:g_rtld.next_frame_slot = p[1]; break;
-        case AT_SALTY_SHARED_LIB_BASE: g_rtld.shared_lib_base = p[1]; break;
-        case AT_SALTY_SLOT_BASE:  g_rtld.slot_base = p[1]; break;
-        case AT_SALTY_SLOT_COUNT: g_rtld.slot_count = p[1]; break;
-        case AT_SALTY_CSPACE_NTFN: g_rtld.cspace_ntfn = p[1]; break;
+        case AT_BESALT_UNTYPED:   g_rtld.untyped = p[1]; break;
+        case AT_BESALT_VSPACE:    g_rtld.vspace = p[1]; break;
+        case AT_BESALT_SCRATCH:   g_rtld.scratch_vaddr = p[1]; break;
+        case AT_BESALT_INITRD:    g_rtld.initrd_base = p[1]; break;
+        case AT_BESALT_INITRD_SZ: g_rtld.initrd_size = p[1]; break;
+        case AT_BESALT_FRAME_SLOT:g_rtld.next_frame_slot = p[1]; break;
+        case AT_BESALT_SHARED_LIB_BASE: g_rtld.shared_lib_base = p[1]; break;
+        case AT_BESALT_SLOT_BASE:  g_rtld.slot_base = p[1]; break;
+        case AT_BESALT_SLOT_COUNT: g_rtld.slot_count = p[1]; break;
+        case AT_BESALT_CSPACE_NTFN: g_rtld.cspace_ntfn = p[1]; break;
         }
     }
 
@@ -270,11 +270,11 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
     }
 
     /* 7. Export frame slot so user code can allocate after rtld.
-     * __salty_next_frame_slot references in user code resolve to libsalty,
+     * __besalt_next_frame_slot references in user code resolve to libbesalt,
      * so update that symbol explicitly if present. */
-    __salty_next_frame_slot = g_rtld.next_frame_slot;
+    __besalt_next_frame_slot = g_rtld.next_frame_slot;
     {
-        uint64_t slot_addr = resolve_symbol_addr(&g_rtld, "__salty_next_frame_slot");
+        uint64_t slot_addr = resolve_symbol_addr(&g_rtld, "__besalt_next_frame_slot");
         if (slot_addr != 0)
             *(volatile uint64_t *)slot_addr = g_rtld.next_frame_slot;
     }
@@ -298,21 +298,21 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         }
     }
 
-    __salty_slot_base = export_slot_base;
-    __salty_slot_count = export_slot_count;
+    __besalt_slot_base = export_slot_base;
+    __besalt_slot_count = export_slot_count;
     {
-        uint64_t base_addr = resolve_symbol_addr(&g_rtld, "__salty_slot_base");
+        uint64_t base_addr = resolve_symbol_addr(&g_rtld, "__besalt_slot_base");
         if (base_addr != 0)
             *(volatile uint64_t *)base_addr = export_slot_base;
-        uint64_t count_addr = resolve_symbol_addr(&g_rtld, "__salty_slot_count");
+        uint64_t count_addr = resolve_symbol_addr(&g_rtld, "__besalt_slot_count");
         if (count_addr != 0)
             *(volatile uint64_t *)count_addr = export_slot_count;
     }
 
     /* 7c. Export CSpace expansion notification cap for slot_alloc. */
-    __salty_cspace_ntfn = g_rtld.cspace_ntfn;
+    __besalt_cspace_ntfn = g_rtld.cspace_ntfn;
     {
-        uint64_t ntfn_addr = resolve_symbol_addr(&g_rtld, "__salty_cspace_ntfn");
+        uint64_t ntfn_addr = resolve_symbol_addr(&g_rtld, "__besalt_cspace_ntfn");
         if (ntfn_addr != 0)
             *(volatile uint64_t *)ntfn_addr = g_rtld.cspace_ntfn;
     }

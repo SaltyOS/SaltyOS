@@ -5,7 +5,7 @@
 //! internal UDP socket to the QEMU DNS forwarder at 10.0.2.3:53, and parses
 //! responses (CNAME resolution is delegated to the upstream recursive resolver).
 
-use salty::consts::*;
+use besalt::consts::*;
 
 const DNS_SERVER_IP: u32 = 0x0A00_0203; // 10.0.2.3 (QEMU DNS forwarder)
 const DNS_PORT: u16 = 53;
@@ -62,7 +62,7 @@ pub(crate) fn init_dns_socket() {
 
 /// Get monotonic time in nanoseconds.
 pub(crate) fn clock_monotonic_ns() -> u64 {
-    let r = salty::syscall::syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0);
+    let r = besalt::syscall::syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0);
     if r.error != 0 { 0 } else { r.value }
 }
 
@@ -72,7 +72,7 @@ fn generate_txn_id() -> u16 {
     let mut buf = [0u8; 2];
     // SAFETY: Passing valid stack buffer to GetRandom syscall.
     let r = unsafe {
-        salty::syscall::syscall(SYS_GETRANDOM, buf.as_mut_ptr() as u64, 2, 0, 0, 0, 0)
+        besalt::syscall::syscall(SYS_GETRANDOM, buf.as_mut_ptr() as u64, 2, 0, 0, 0, 0)
     };
     let id = u16::from_ne_bytes(buf);
     if r.error != 0 || id == 0 {
@@ -716,7 +716,7 @@ pub(crate) fn start_resolve(hostname: &[u8]) -> Option<u64> {
     let reply_cap_slot = CAP_DNS_REPLY_BASE + slot_idx as u64;
 
     // Save the caller's reply cap into a CNode slot
-    let err = salty::invoke::cnode_save_caller(CAP_SELF_CSPACE, reply_cap_slot);
+    let err = besalt::invoke::cnode_save_caller(CAP_SELF_CSPACE, reply_cap_slot);
     if err != 0 {
         return None;
     }
@@ -768,7 +768,7 @@ pub(crate) fn start_resolve_ptr(ip: u32) -> Option<u64> {
     let slot_idx = find_free_slot()?;
     let reply_cap_slot = CAP_DNS_REPLY_BASE + slot_idx as u64;
 
-    let err = salty::invoke::cnode_save_caller(CAP_SELF_CSPACE, reply_cap_slot);
+    let err = besalt::invoke::cnode_save_caller(CAP_SELF_CSPACE, reply_cap_slot);
     if err != 0 {
         return None;
     }

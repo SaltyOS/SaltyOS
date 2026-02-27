@@ -1,8 +1,8 @@
 //! Pipe and dup test suite
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use salty::posix;
-use salty::serial;
+use besalt::posix;
+use besalt::serial;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);

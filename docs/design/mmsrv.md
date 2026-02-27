@@ -78,7 +78,7 @@ Set by init in `spawn.rs`:
 
 ### Message Labels (0x80-0x90 Range)
 
-Defined in `lib/libsalty/src/consts.rs`:
+Defined in `lib/besalt/lib/src/consts.rs`:
 
 | Label | Name | Source | Purpose |
 |-------|------|--------|---------|
@@ -109,7 +109,7 @@ MR1 = heap_base (virtual address)
 MR2 = mmap_base (virtual address)
 MR3 = pid (process ID)
 + cap transfer: client's VSpace cap
-Reply: label = SALTY_OK
+Reply: label = BESALT_OK
 ```
 
 **MM_MMAP (client → mmsrv):**
@@ -119,14 +119,14 @@ MR1 = length (bytes)
 MR2 = prot (PROT_READ | PROT_WRITE | PROT_EXEC)
 MR3 = flags (MAP_PRIVATE | MAP_ANONYMOUS | MAP_LAZY)
 Badge identifies client
-Reply: label = SALTY_OK, MR0 = mapped_base
+Reply: label = BESALT_OK, MR0 = mapped_base
 ```
 
 **MM_BRK (client → mmsrv):**
 ```
 MR0 = new_break (absolute virtual address)
 Badge identifies client
-Reply: label = SALTY_OK, MR0 = new_break
+Reply: label = BESALT_OK, MR0 = new_break
 ```
 
 **MM_MAP_WINDOW (procmgr → mmsrv):**
@@ -137,7 +137,7 @@ MR2 = window_vaddr (where to map in caller)
 MR3 = num_pages
 MR4 = vspace_flags (for target mapping)
 + cap transfer: caller's VSpace cap
-Reply: label = SALTY_OK, MR0 = pages_mapped
+Reply: label = BESALT_OK, MR0 = pages_mapped
 ```
 
 **VMFault (kernel → mmsrv):**
@@ -147,7 +147,7 @@ MR0 = fault_addr
 MR1 = error_code
 MR2 = fault_rip
 Badge identifies faulting client
-Reply: label = SALTY_OK (resume) or error (kill process)
+Reply: label = BESALT_OK (resume) or error (kill process)
 ```
 
 ## 4. Internal Design
@@ -232,7 +232,7 @@ Scans untyped sources in round-robin order:
 1. Start at `UT_HINT` (last successful source)
 2. Try `untyped_retype()` on each source
 3. If successful, update hint and return
-4. If all sources exhausted, return `SALTY_OUT_OF_MEMORY`
+4. If all sources exhausted, return `BESALT_OUT_OF_MEMORY`
 
 **Sources:**
 - Slot 7: child untyped (primary)
@@ -269,7 +269,7 @@ Scans untyped sources in round-robin order:
 4. Receive VSpace cap into `CURRENT_RECV_SLOT`
 5. Initialize `MmClient` struct, set `vspace_cap = CURRENT_RECV_SLOT`
 6. Mark receive slot as kept (`RECV_SLOT_KEPT=true`)
-7. Reply with `SALTY_OK`
+7. Reply with `BESALT_OK`
 
 **Badge assignment:** procmgr chooses badge = PID (ensures uniqueness)
 
@@ -288,7 +288,7 @@ Scans untyped sources in round-robin order:
 3. Delete VSpace cap held in `vspace_cap`
 4. Mark client slot inactive
 5. Decrement `CLIENT_COUNT`
-6. Reply with `SALTY_OK`
+6. Reply with `BESALT_OK`
 
 **Cleanup scope:**
 - All frame caps tracked in regions are deleted (returned to untyped)
@@ -333,7 +333,7 @@ Scans untyped sources in round-robin order:
 - Allocate frame via `slot_alloc()` + `retype_any()`
 - Map frame via `vspace_map()`
 - Store slot in `frame_caps[page_idx]`, increment `frame_count`
-- Reply `SALTY_OK` → kernel resumes faulting thread
+- Reply `BESALT_OK` → kernel resumes faulting thread
 
 ### Heap Management (MM_BRK/SBRK)
 
@@ -439,7 +439,7 @@ Reply: MR0 = pages_mapped
 ```
 MR0 = parent_badge
 MR1 = child_badge
-Reply: SALTY_OK
+Reply: BESALT_OK
 ```
 
 **What's cloned:**
@@ -462,7 +462,7 @@ Reply: SALTY_OK
 ```
 MR0 = shm_id (hash of shm name)
 MR1 = num_pages
-Reply: SALTY_OK
+Reply: BESALT_OK
 ```
 
 **Algorithm:**
@@ -508,7 +508,7 @@ Reply: MR0 = actual_vaddr
 MR0 = shm_id
 MR1 = client_badge
 MR2 = vaddr
-Reply: SALTY_OK
+Reply: BESALT_OK
 ```
 
 **Algorithm:**
@@ -534,16 +534,16 @@ Badge = faulting client's badge
 
 **Delivery:** Thread blocks, kernel sends IPC to thread's fault endpoint (which is mmsrv's server EP, badged with client badge).
 
-**Resume:** Reply with `SALTY_OK` → kernel restores thread's register state and resumes execution.
+**Resume:** Reply with `BESALT_OK` → kernel restores thread's register state and resumes execution.
 
 ### VMFault Handler Algorithm
 
 1. **Identify client:** `find_client_by_badge(badge)`
    - Error if client not registered (orphaned fault)
 2. **Find region:** `find_region_by_addr(client, page_addr)`
-   - If no region: segfault (reply `SALTY_INVALID_ARGUMENT` → procmgr kills process)
+   - If no region: segfault (reply `BESALT_INVALID_ARGUMENT` → procmgr kills process)
 3. **Check allocation status:** `region.frame_caps[page_idx]`
-   - If `!= 0`: already allocated (COW/race), reply `SALTY_OK` (kernel retries, succeeds)
+   - If `!= 0`: already allocated (COW/race), reply `BESALT_OK` (kernel retries, succeeds)
    - If `== 0`: unallocated (lazy or COW breakage)
 4. **Allocate frame:**
    - `slot_alloc()` → get CNode slot
@@ -551,9 +551,9 @@ Badge = faulting client's badge
 5. **Map frame:**
    - Convert `region.prot` to vspace flags
    - `vspace_map(client.vspace_cap, slot, page_addr, flags)`
-   - If map fails: reply `SALTY_BAD_ADDRESS` (vspace_map error, not OOM)
+   - If map fails: reply `BESALT_BAD_ADDRESS` (vspace_map error, not OOM)
 6. **Track frame:** `region.frame_caps[page_idx] = slot`, increment `region.frame_count`
-7. **Resume:** Reply `SALTY_OK` → thread resumes at faulting instruction
+7. **Resume:** Reply `BESALT_OK` → thread resumes at faulting instruction
 
 ### Lazy Region Growth
 
@@ -576,13 +576,13 @@ Both use the same VMFault handler. The only difference is the initial state.
 **Problem:** rtld runs **before** mmsrv in the boot order (rtld is embedded in init, which is phase 0; mmsrv is phase 2).
 
 **Solution:** rtld uses direct untyped retype:
-- Receives `AT_SALTY_UNTYPED` via auxv
+- Receives `AT_BESALT_UNTYPED` via auxv
 - Directly calls `untyped_retype()` + `vspace_map()`
 - No IPC to mmsrv
 
 ### procmgr Shared Library Cache
 
-**Problem:** procmgr maintains a shared library cache (loads `libsalty.so`, `libc.so` once, maps into all children). This cache needs frames, but procmgr can't use mmsrv (circular dependency — mmsrv uses procmgr for process management).
+**Problem:** procmgr maintains a shared library cache (loads `libbesalt.so`, `libc.so` once, maps into all children). This cache needs frames, but procmgr can't use mmsrv (circular dependency — mmsrv uses procmgr for process management).
 
 **Solution:** procmgr also has its own child untyped capability:
 - Allocates cache frames directly via `untyped_retype()`
@@ -601,20 +601,20 @@ Once a process is spawned by procmgr:
 
 | Error Code | Value | Condition |
 |------------|-------|-----------|
-| `SALTY_OUT_OF_MEMORY` | 5 | `slot_alloc()` fails, `retype_any()` exhausts all untypeds, frame_caps array allocation fails |
-| `SALTY_BAD_ADDRESS` | 10 | `vspace_map()` fails (address conflict, invalid VSpace, PT allocation failure) |
-| `SALTY_INVALID_ARGUMENT` | 4 | Bad parameters (length=0, addr misaligned, segfault on unknown region) |
-| `SALTY_NOT_FOUND` | 6 | Client badge not registered, SHM ID not found |
-| `SALTY_ALREADY_EXISTS` | 8 | Duplicate client badge, duplicate SHM ID |
+| `BESALT_OUT_OF_MEMORY` | 5 | `slot_alloc()` fails, `retype_any()` exhausts all untypeds, frame_caps array allocation fails |
+| `BESALT_BAD_ADDRESS` | 10 | `vspace_map()` fails (address conflict, invalid VSpace, PT allocation failure) |
+| `BESALT_INVALID_ARGUMENT` | 4 | Bad parameters (length=0, addr misaligned, segfault on unknown region) |
+| `BESALT_NOT_FOUND` | 6 | Client badge not registered, SHM ID not found |
+| `BESALT_ALREADY_EXISTS` | 8 | Duplicate client badge, duplicate SHM ID |
 
-**Key distinction:** `SALTY_OUT_OF_MEMORY` means "ran out of capability resources" (slots or frames). `SALTY_BAD_ADDRESS` means "vspace_map rejected the request" (address conflict, page table issues, bad VSpace cap).
+**Key distinction:** `BESALT_OUT_OF_MEMORY` means "ran out of capability resources" (slots or frames). `BESALT_BAD_ADDRESS` means "vspace_map rejected the request" (address conflict, page table issues, bad VSpace cap).
 
 ### VMFault Error Handling
 
-- **SALTY_OK:** Frame allocated and mapped → resume thread
-- **SALTY_BAD_ADDRESS:** vspace_map failed (rare, indicates kernel state corruption) → procmgr should kill process
-- **SALTY_INVALID_ARGUMENT:** No region covers fault address (segfault) → procmgr delivers SIGSEGV
-- **SALTY_OUT_OF_MEMORY:** Frame allocation failed → procmgr should kill process (or swap to disk, if supported)
+- **BESALT_OK:** Frame allocated and mapped → resume thread
+- **BESALT_BAD_ADDRESS:** vspace_map failed (rare, indicates kernel state corruption) → procmgr should kill process
+- **BESALT_INVALID_ARGUMENT:** No region covers fault address (segfault) → procmgr delivers SIGSEGV
+- **BESALT_OUT_OF_MEMORY:** Frame allocation failed → procmgr should kill process (or swap to disk, if supported)
 
 ## 12. Performance Considerations
 
@@ -691,7 +691,7 @@ Planned: Debug IPC label to query server state:
 ## 15. Cross-References
 
 - **[POSIX Compatibility](posix.md)** — How `posix_mmap()`/`brk()`/`sbrk()` delegate to mmsrv
-- **[libsalty Design](libsalty.md)** — Slot allocator's use of mmsrv for frame allocation
+- **[libbesalt Design](libbesalt.md)** — Slot allocator's use of mmsrv for frame allocation
 - **[Process Manager](procmgr.md)** — Spawn/fork integration with MM_MAP_BATCH/MM_MAP_WINDOW/MM_FORK_REGIONS
 - **[VFS Design](vfs.md)** — SHM object lifecycle and mmap integration
 - **[Kernel Memory Management](memory.md)** — Untyped retype, VSpace mapping, COW implementation

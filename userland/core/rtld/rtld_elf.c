@@ -85,9 +85,9 @@ static uint64_t retype_frame_any(struct rtld_state *st, cap_t frame_slot) {
             st->untyped = ut;
             return 0;
         }
-        if (err != SALTY_INVALID_CAPABILITY
-            && err != SALTY_INVALID_OPERATION
-            && err != SALTY_NOT_FOUND) {
+        if (err != BESALT_INVALID_CAPABILITY
+            && err != BESALT_INVALID_OPERATION
+            && err != BESALT_NOT_FOUND) {
             best_err = err;
         }
     }

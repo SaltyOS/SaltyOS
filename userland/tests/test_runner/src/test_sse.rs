@@ -5,10 +5,10 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use salty::serial;
-use salty::serial::LineBuf;
-use salty::consts::*;
-use salty::posix;
+use besalt::serial;
+use besalt::serial::LineBuf;
+use besalt::consts::*;
+use besalt::posix;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -94,7 +94,7 @@ fn test_xmm_survives_fork() -> bool {
     // Parent: verify our XMM1 is still intact after child ran
     // Yield a few times to force context switches
     for _ in 0..3 {
-        let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
     let parent_read: u64;
@@ -258,14 +258,14 @@ fn test_xmm_no_fpu_threads() -> bool {
     if pid == 0 {
         // Child: yield several times without touching any XMM register
         for _ in 0..5 {
-            let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+            let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
         }
         unsafe { posix::posix_exit(0); }
     }
 
     // Parent: yield to let child run (interleave context switches)
     for _ in 0..5 {
-        let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
     let parent_read: u64;
@@ -333,7 +333,7 @@ fn test_xmm_heavy_context_switch() -> bool {
 
         // Yield many times to stress FPU switching
         for _ in 0..10 {
-            let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+            let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
         }
 
         let child_read: u64;
@@ -362,7 +362,7 @@ fn test_xmm_heavy_context_switch() -> bool {
 
     // Parent: yield many times, interleaving with child
     for _ in 0..10 {
-        let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
     let parent_read: u64;

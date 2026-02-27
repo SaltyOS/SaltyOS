@@ -18,13 +18,13 @@
 #![no_std]
 #![no_main]
 
-extern crate salty;
+extern crate besalt;
 
-use salty::consts::*;
-use salty::invoke;
-use salty::ipc;
-use salty::serial;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::invoke;
+use besalt::ipc;
+use besalt::serial;
+use besalt::types::*;
 
 // ---------------------------------------------------------------------------
 // Capability slot layout
@@ -92,15 +92,15 @@ fn puts(s: &[u8]) {
 }
 
 fn ipc_ctx() -> *mut IpcContext {
-    &raw mut salty::__salty_ipc_ctx
+    &raw mut besalt::__besalt_ipc_ctx
 }
 
 fn signal_ready() {
-    let _ = salty::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 fn clock_monotonic_ns() -> u64 {
-    let r = salty::syscall::syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0);
+    let r = besalt::syscall::syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0);
     if r.error != 0 { 0 } else { r.value }
 }
 
@@ -227,7 +227,7 @@ fn cache_flush() {
 
 fn register_nameserv() {
     let name = b"dnssrv";
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = POSIX_NS_REGISTER;
     msg.regs[0] = name.len() as u64;
     msg.length = 1 + (name.len() as u64 + 7) / 8;
@@ -240,14 +240,14 @@ fn register_nameserv() {
             i += 1;
         }
         ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
         let err = ipc::call_ctx(
             ipc_ctx(),
             CAP_NAMESERV_EP,
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
+        if err != 0 || reply.label != BESALT_OK {
             puts(b"[dnssrv] nameserv registration failed\n");
         } else {
             puts(b"[dnssrv] Registered with nameserv\n");
@@ -259,10 +259,10 @@ fn register_nameserv() {
 // IPC handlers
 // ---------------------------------------------------------------------------
 
-fn handle_resolve(msg: &SaltyMsg, reply: &mut SaltyMsg) {
+fn handle_resolve(msg: &BesaltMsg, reply: &mut BesaltMsg) {
     let hostname_len = msg.regs[0] as usize;
     if hostname_len == 0 || hostname_len > 120 {
-        reply.label = SALTY_INVALID_ARGUMENT;
+        reply.label = BESALT_INVALID_ARGUMENT;
         return;
     }
 
@@ -275,7 +275,7 @@ fn handle_resolve(msg: &SaltyMsg, reply: &mut SaltyMsg) {
 
     // 1. Check cache
     if let Some((ip_count, ips)) = cache_lookup(&hostname[..hostname_len]) {
-        reply.label = SALTY_OK;
+        reply.label = BESALT_OK;
         reply.regs[0] = ip_count as u64;
         reply.regs[1] = 0;
         let mut i = 0;
@@ -288,7 +288,7 @@ fn handle_resolve(msg: &SaltyMsg, reply: &mut SaltyMsg) {
     }
 
     // 2. Cache miss: forward to netsrv
-    let mut netsrv_msg = SaltyMsg::zeroed();
+    let mut netsrv_msg = BesaltMsg::zeroed();
     netsrv_msg.label = NET_DNS_RESOLVE;
     netsrv_msg.regs[0] = hostname_len as u64;
     // SAFETY: Writing hostname bytes into message register area for netsrv.
@@ -298,7 +298,7 @@ fn handle_resolve(msg: &SaltyMsg, reply: &mut SaltyMsg) {
     }
     netsrv_msg.length = 1 + ((hostname_len as u64 + 7) / 8);
 
-    let mut netsrv_reply = SaltyMsg::zeroed();
+    let mut netsrv_reply = BesaltMsg::zeroed();
     // SAFETY: IPC context valid; CAP_NETSRV_EP is the netsrv endpoint.
     let err = unsafe {
         ipc::call_ctx(
@@ -308,11 +308,11 @@ fn handle_resolve(msg: &SaltyMsg, reply: &mut SaltyMsg) {
             &raw mut netsrv_reply,
         )
     };
-    if err != 0 || netsrv_reply.label != SALTY_OK {
+    if err != 0 || netsrv_reply.label != BESALT_OK {
         reply.label = if netsrv_reply.label != 0 {
             netsrv_reply.label
         } else {
-            SALTY_NOT_FOUND
+            BESALT_NOT_FOUND
         };
         return;
     }
@@ -330,7 +330,7 @@ fn handle_resolve(msg: &SaltyMsg, reply: &mut SaltyMsg) {
     cache_insert(&hostname[..hostname_len], &ips, ip_count, ttl);
 
     // 4. Return to client
-    reply.label = SALTY_OK;
+    reply.label = BESALT_OK;
     reply.regs[0] = ip_count as u64;
     reply.regs[1] = ttl as u64;
     i = 0;
@@ -341,22 +341,22 @@ fn handle_resolve(msg: &SaltyMsg, reply: &mut SaltyMsg) {
     reply.length = 2 + ip_count as u64;
 }
 
-fn handle_cache_flush(reply: &mut SaltyMsg) {
+fn handle_cache_flush(reply: &mut BesaltMsg) {
     cache_flush();
     puts(b"[dnssrv] Cache flushed\n");
-    reply.label = SALTY_OK;
+    reply.label = BESALT_OK;
 }
 
-fn handle_reverse(msg: &SaltyMsg, reply: &mut SaltyMsg) {
+fn handle_reverse(msg: &BesaltMsg, reply: &mut BesaltMsg) {
     let ip = msg.regs[0] as u32;
 
     // Forward to netsrv via NET_DNS_RESOLVE_PTR
-    let mut netsrv_msg = SaltyMsg::zeroed();
+    let mut netsrv_msg = BesaltMsg::zeroed();
     netsrv_msg.label = NET_DNS_RESOLVE_PTR;
     netsrv_msg.regs[0] = ip as u64;
     netsrv_msg.length = 1;
 
-    let mut netsrv_reply = SaltyMsg::zeroed();
+    let mut netsrv_reply = BesaltMsg::zeroed();
     // SAFETY: IPC context valid; CAP_NETSRV_EP is the netsrv endpoint.
     let err = unsafe {
         ipc::call_ctx(
@@ -366,18 +366,18 @@ fn handle_reverse(msg: &SaltyMsg, reply: &mut SaltyMsg) {
             &raw mut netsrv_reply,
         )
     };
-    if err != 0 || netsrv_reply.label != SALTY_OK {
+    if err != 0 || netsrv_reply.label != BESALT_OK {
         reply.label = if netsrv_reply.label != 0 {
             netsrv_reply.label
         } else {
-            SALTY_NOT_FOUND
+            BESALT_NOT_FOUND
         };
         return;
     }
 
     // Forward the PTR result back to the client
     let hostname_len = netsrv_reply.regs[0] as usize;
-    reply.label = SALTY_OK;
+    reply.label = BESALT_OK;
     if hostname_len > 0 {
         let copy_len = core::cmp::min(hostname_len, 152);
         reply.regs[0] = copy_len as u64;
@@ -418,7 +418,7 @@ pub extern "C" fn _start() -> ! {
 
     // Main event loop: recv / reply_recv pattern
     let ctx = ipc_ctx();
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     let mut badge: u64 = 0;
 
     // SAFETY: IPC context valid; CAP_SERVER_EP is our service endpoint.
@@ -427,18 +427,18 @@ pub extern "C" fn _start() -> ! {
     }
 
     loop {
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
 
         match msg.label {
             DNS_RESOLVE => handle_resolve(&msg, &mut reply),
             DNS_CACHE_FLUSH => handle_cache_flush(&mut reply),
             DNS_REVERSE_LOOKUP => handle_reverse(&msg, &mut reply),
             _ => {
-                reply.label = SALTY_INVALID_OPERATION;
+                reply.label = BESALT_INVALID_OPERATION;
             }
         }
 
-        msg = SaltyMsg::zeroed();
+        msg = BesaltMsg::zeroed();
         badge = 0;
         // SAFETY: IPC context valid; reply_recv atomically replies + waits.
         unsafe {

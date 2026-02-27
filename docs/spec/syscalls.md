@@ -82,7 +82,7 @@ All IPC syscalls (Send, Recv, Call, ReplyRecv, NBSend) use a packed `msg_info` w
 | Reserved | 63:52 | Must be zero |
 
 ```c
-#define SALTY_MSGINFO(label, length, extra_caps) \
+#define BESALT_MSGINFO(label, length, extra_caps) \
     (((uint64_t)(label) << 12) | \
      ((uint64_t)(extra_caps) << 7) | \
      ((uint64_t)(length) & 0x7F))
@@ -1208,26 +1208,26 @@ MR0-MR3 are passed in CPU registers for the fastpath. MR4-MR19 overflow to the I
 
 ```c
 // Client side
-struct salty_msg msg = {
+struct besalt_msg msg = {
     .label = REQUEST_ADD,
     .length = 2,
     .regs = { 42, 0, 0, 0 },
 };
-salty_call(server_ep, &msg);
+besalt_call(server_ep, &msg);
 uint64_t result = msg.regs[0];
 
 // Server side
-struct salty_msg msg, reply;
+struct besalt_msg msg, reply;
 uint64_t badge;
-salty_recv(endpoint, &msg, &badge);
+besalt_recv(endpoint, &msg, &badge);
 
 for (;;) {
     uint64_t result = handle_request(msg.label, msg.regs[0]);
 
-    reply.label = SALTY_OK;
+    reply.label = BESALT_OK;
     reply.length = 1;
     reply.regs[0] = result;
 
-    salty_reply_recv(endpoint, &reply, &msg, &badge);
+    besalt_reply_recv(endpoint, &reply, &msg, &badge);
 }
 ```

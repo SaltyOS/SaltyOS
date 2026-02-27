@@ -16,17 +16,17 @@
 #![no_std]
 #![no_main]
 
-extern crate salty;
+extern crate besalt;
 
 mod types;
 mod input;
 mod handlers;
 
-use salty::consts::*;
-use salty::ipc;
-use salty::serial;
-use salty::serial::LineBuf as SerialLB;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::ipc;
+use besalt::serial;
+use besalt::serial::LineBuf as SerialLB;
+use besalt::types::*;
 
 use types::*;
 
@@ -54,11 +54,11 @@ fn puts(s: &[u8]) {
 }
 
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
-    &raw mut salty::__salty_ipc_ctx
+    &raw mut besalt::__besalt_ipc_ctx
 }
 
 fn signal_ready() {
-    let _ = salty::syscall::syscall(salty::SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = besalt::syscall::syscall(besalt::SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 /// Forward output bytes to the display server via nbsend (fire-and-forget).
@@ -127,7 +127,7 @@ unsafe fn display_try_flush() {
                 break;
             }
 
-            let mut msg = SaltyMsg::zeroed();
+            let mut msg = BesaltMsg::zeroed();
             msg.label = DISPLAY_TERMINAL_WRITE;
             msg.regs[0] = len as u64;
             msg.length = 1 + ((len as u64 + 7) / 8);
@@ -142,8 +142,8 @@ unsafe fn display_try_flush() {
                 would_block_retries = 0;
                 continue;
             }
-            if err == SALTY_WOULD_BLOCK as i32 && would_block_retries < 8 {
-                let _ = salty::syscall::syscall(salty::SYS_NANOSLEEP, 0, 500_000, 0, 0, 0, 0);
+            if err == BESALT_WOULD_BLOCK as i32 && would_block_retries < 8 {
+                let _ = besalt::syscall::syscall(besalt::SYS_NANOSLEEP, 0, 500_000, 0, 0, 0, 0);
                 would_block_retries += 1;
                 continue;
             }
@@ -159,8 +159,8 @@ unsafe fn display_try_flush() {
 // ======================================================================
 
 fn register_with_nameserv() -> bool {
-    let mut reg_msg = SaltyMsg::zeroed();
-    let mut reg_reply = SaltyMsg::zeroed();
+    let mut reg_msg = BesaltMsg::zeroed();
+    let mut reg_reply = BesaltMsg::zeroed();
     let svc_name = b"ttyd";
 
     reg_msg.label = POSIX_NS_REGISTER;
@@ -179,7 +179,7 @@ fn register_with_nameserv() -> bool {
             &raw const reg_msg,
             &raw mut reg_reply,
         );
-        if err == 0 && reg_reply.label == SALTY_OK {
+        if err == 0 && reg_reply.label == BESALT_OK {
             puts(b"[TTYD] registered with nameserv\n");
             return true;
         }
@@ -203,27 +203,27 @@ pub extern "C" fn _start() -> ! {
     puts(b"[TTYD] SaltyOS PTY driver starting\n");
 
     unsafe {
-        let err = salty::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
+        let err = besalt::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
         if err != 0 {
             puts(b"[TTYD] FAIL: tcb_set_ipc_buffer\n");
             idle();
         }
-        salty::ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
+        besalt::ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
     }
 
     // Query display server for actual framebuffer dimensions
     unsafe {
-        let mut qmsg = SaltyMsg::zeroed();
-        let mut qreply = SaltyMsg::zeroed();
+        let mut qmsg = BesaltMsg::zeroed();
+        let mut qreply = BesaltMsg::zeroed();
         qmsg.label = DISPLAY_GET_INFO;
         qmsg.length = 0;
-        let err = salty::ipc::call_ctx(
+        let err = besalt::ipc::call_ctx(
             ipc_ctx(),
             CAP_DISPLAY_EP,
             &raw const qmsg,
             &raw mut qreply,
         );
-        if err == 0 && qreply.label == SALTY_OK {
+        if err == 0 && qreply.label == BESALT_OK {
             let fb_width = qreply.regs[0] as u32;
             let fb_height = qreply.regs[1] as u32;
             // GLYPH_WIDTH=8, GLYPH_HEIGHT=16
@@ -258,11 +258,11 @@ pub extern "C" fn _start() -> ! {
     puts(b"[TTYD] Ready\n");
 
     // Main server loop
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     let mut badge = 0u64;
 
     let err = unsafe {
-        salty::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
+        besalt::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
     };
     if err != 0 {
         puts(b"[TTYD] initial recv failed\n");
@@ -272,7 +272,7 @@ pub extern "C" fn _start() -> ! {
     loop {
         unsafe { display_try_flush(); }
 
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
         let mut skip_reply = false;
 
         match msg.label {
@@ -317,7 +317,7 @@ pub extern "C" fn _start() -> ! {
                         }
                     }
                 }
-                reply.label = SALTY_OK;
+                reply.label = BESALT_OK;
                 reply.length = 0;
             }
             // Legacy labels (backward compat, redirect to PTY 0)
@@ -325,7 +325,7 @@ pub extern "C" fn _start() -> ! {
                 unsafe { handlers::handle_legacy(msg.label, &msg, &mut reply) };
             }
             _ => {
-                reply.label = SALTY_INVALID_OPERATION;
+                reply.label = BESALT_INVALID_OPERATION;
                 reply.length = 0;
             }
         }
@@ -333,7 +333,7 @@ pub extern "C" fn _start() -> ! {
         if skip_reply {
             // No reply expected (sender used send, not call) — just recv next
             let err = unsafe {
-                salty::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
+                besalt::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
             };
             if err != 0 {
                 puts(b"[TTYD] recv failed\n");
@@ -341,7 +341,7 @@ pub extern "C" fn _start() -> ! {
             }
         } else {
             let err = unsafe {
-                salty::ipc::reply_recv_ctx(
+                besalt::ipc::reply_recv_ctx(
                     ipc_ctx(),
                     CAP_SERVER_EP,
                     &raw const reply,
@@ -361,6 +361,6 @@ pub extern "C" fn _start() -> ! {
 
 fn idle() -> ! {
     loop {
-        salty::syscall::syscall(salty::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        besalt::syscall::syscall(besalt::SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 }

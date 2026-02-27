@@ -1,16 +1,16 @@
 //! Process spawning helpers
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use salty::consts::*;
-use salty::cpio;
-use salty::elf_dynamic;
-use salty::elf_loader;
-use salty::invoke;
-use salty::ipc;
-use salty::serial;
-use salty::serial::LineBuf;
-use salty::syscall;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::cpio;
+use besalt::elf_dynamic;
+use besalt::elf_loader;
+use besalt::invoke;
+use besalt::ipc;
+use besalt::serial;
+use besalt::serial::LineBuf;
+use besalt::syscall;
+use besalt::types::*;
 
 #[derive(Clone, Copy)]
 pub struct ExtraCapCopy {
@@ -241,7 +241,7 @@ unsafe fn wait_for_child_ready(
             if (poll.value & READY_SIGNAL_BITS) != 0 {
                 return 0;
             }
-        } else if poll.error != SALTY_WOULD_BLOCK {
+        } else if poll.error != BESALT_WOULD_BLOCK {
             let mut lb = LineBuf::new();
             lb.str(b"[INIT] ready poll failed err=");
             lb.hex(poll.error);
@@ -315,7 +315,7 @@ unsafe fn retype_from_any_untyped_with_source(
         first = start;
     }
 
-    let mut best_err = SALTY_OUT_OF_MEMORY as i32;
+    let mut best_err = BESALT_OUT_OF_MEMORY as i32;
 
     for ut in first..end {
         let err = invoke::untyped_retype(ut, new_type, size_bits, dest_slot);
@@ -326,9 +326,9 @@ unsafe fn retype_from_any_untyped_with_source(
             }
             return 0;
         }
-        if err != SALTY_INVALID_CAPABILITY as i32
-            && err != SALTY_INVALID_OPERATION as i32
-            && err != SALTY_NOT_FOUND as i32
+        if err != BESALT_INVALID_CAPABILITY as i32
+            && err != BESALT_INVALID_OPERATION as i32
+            && err != BESALT_NOT_FOUND as i32
         {
             best_err = err;
         }
@@ -342,9 +342,9 @@ unsafe fn retype_from_any_untyped_with_source(
             }
             return 0;
         }
-        if err != SALTY_INVALID_CAPABILITY as i32
-            && err != SALTY_INVALID_OPERATION as i32
-            && err != SALTY_NOT_FOUND as i32
+        if err != BESALT_INVALID_CAPABILITY as i32
+            && err != BESALT_INVALID_OPERATION as i32
+            && err != BESALT_NOT_FOUND as i32
         {
             best_err = err;
         }
@@ -368,7 +368,7 @@ unsafe fn retype_from_any_untyped_excluding(
         first = start;
     }
 
-    let mut best_err = SALTY_OUT_OF_MEMORY as i32;
+    let mut best_err = BESALT_OUT_OF_MEMORY as i32;
 
     for ut in first..end {
         if ut == exclude_ut {
@@ -382,9 +382,9 @@ unsafe fn retype_from_any_untyped_excluding(
             }
             return 0;
         }
-        if err != SALTY_INVALID_CAPABILITY as i32
-            && err != SALTY_INVALID_OPERATION as i32
-            && err != SALTY_NOT_FOUND as i32
+        if err != BESALT_INVALID_CAPABILITY as i32
+            && err != BESALT_INVALID_OPERATION as i32
+            && err != BESALT_NOT_FOUND as i32
         {
             best_err = err;
         }
@@ -401,9 +401,9 @@ unsafe fn retype_from_any_untyped_excluding(
             }
             return 0;
         }
-        if err != SALTY_INVALID_CAPABILITY as i32
-            && err != SALTY_INVALID_OPERATION as i32
-            && err != SALTY_NOT_FOUND as i32
+        if err != BESALT_INVALID_CAPABILITY as i32
+            && err != BESALT_INVALID_OPERATION as i32
+            && err != BESALT_NOT_FOUND as i32
         {
             best_err = err;
         }
@@ -419,7 +419,7 @@ unsafe fn allocate_child_untyped_budget(
     src_ut_out: *mut Cap,
 ) -> Result<u8, i32> {
     let mut bits = clamp_ut_bits(preferred_bits);
-    let mut last_err = SALTY_OUT_OF_MEMORY as i32;
+    let mut last_err = BESALT_OUT_OF_MEMORY as i32;
 
     while bits >= CHILD_UT_BITS_MIN {
         let mut err = unsafe {
@@ -459,7 +459,7 @@ unsafe fn allocate_child_untyped_budget(
 // ===========================================================================
 
 /// Pre-load shared library RO segments into permanent frame caps.
-/// Called once at init startup. Processes both libsalty.so and libc.so.
+/// Called once at init startup. Processes both libbesalt.so and libc.so.
 /// On failure, cache stays uninitialized and all spawns fall through
 /// to per-process RTLD allocation.
 pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
@@ -468,7 +468,7 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
         let initrd = super::INITRD_VADDR as *const u8;
         let initrd_size = super::INITRD_SIZE;
 
-        let libs: [&[u8]; 2] = [b"libsalty.so", b"libc.so"];
+        let libs: [&[u8]; 2] = [b"libbesalt.so", b"libc.so"];
 
         for lib_name in &libs {
             if cache.lib_count >= MAX_CACHED_LIBS {
@@ -476,7 +476,7 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
             }
 
             let mut entry = CpioEntry::zeroed();
-            if salty::cpio::cpio_find_file(
+            if besalt::cpio::cpio_find_file(
                 initrd, initrd_size, lib_name.as_ptr(), lib_name.len(), &raw mut entry,
             ) == 0
             {
@@ -497,7 +497,7 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
             {
                 continue;
             }
-            if ehdr.e_type != salty::ET_DYN {
+            if ehdr.e_type != besalt::ET_DYN {
                 continue;
             }
 
@@ -507,7 +507,7 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
             let mut max_seg_end: u64 = 0;
             for i in 0..ehdr.e_phnum as usize {
                 let ph = &*phdrs.add(i);
-                if ph.p_type == salty::PT_LOAD {
+                if ph.p_type == besalt::PT_LOAD {
                     if ph.p_vaddr < min_vaddr { min_vaddr = ph.p_vaddr; }
                     let se = (ph.p_vaddr + ph.p_memsz + 0xFFF) & !0xFFFu64;
                     if se > max_seg_end { max_seg_end = se; }
@@ -532,11 +532,11 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
             // Cache each page of each read-only PT_LOAD segment
             for i in 0..ehdr.e_phnum as usize {
                 let ph = &*phdrs.add(i);
-                if ph.p_type != salty::PT_LOAD {
+                if ph.p_type != besalt::PT_LOAD {
                     continue;
                 }
                 // Record RW segments as metadata (mapped per-child later)
-                if (ph.p_flags & salty::PF_W) != 0 {
+                if (ph.p_flags & besalt::PF_W) != 0 {
                     if (lib_entry.rw_seg_count as usize) < MAX_RW_SEGS {
                         let idx = lib_entry.rw_seg_count as usize;
                         // W^X: writable segments never get executable permission
@@ -559,7 +559,7 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
                 let seg_end = (seg_vaddr + ph.p_memsz + 0xFFF) & !0xFFFu64;
 
                 let mut flags = VSPACE_FLAG_USER;
-                if (ph.p_flags & salty::PF_X) != 0 {
+                if (ph.p_flags & besalt::PF_X) != 0 {
                     flags |= VSPACE_FLAG_EXECUTABLE;
                 }
 
@@ -663,7 +663,7 @@ unsafe fn map_shared_lib_to_child(
     child_vs: Cap,
     _child_cn: Cap,
     shared_lib_base_vaddr: u64,
-    needed: &salty::elf_dynamic::NeededLibs,
+    needed: &besalt::elf_dynamic::NeededLibs,
     root_ut: Cap,
 ) -> u64 {
     unsafe {
@@ -728,7 +728,7 @@ unsafe fn map_shared_lib_to_child(
                     let initrd_size = super::INITRD_SIZE;
                     let mut lib_entry = CpioEntry::zeroed();
                     let lib_name = &cl.name[..cl.name_len as usize];
-                    let lib_found = salty::cpio::cpio_find_file(
+                    let lib_found = besalt::cpio::cpio_find_file(
                         initrd, initrd_size,
                         lib_name.as_ptr(), lib_name.len(),
                         &raw mut lib_entry,
@@ -935,7 +935,7 @@ unsafe fn map_shared_lib_to_child(
 
 /// Return the total VA pages needed for the specified DT_NEEDED libraries.
 /// This accounts for full library spans (including RW segments) plus inter-lib gaps.
-pub fn shared_lib_va_pages_for_needed(needed: &salty::elf_dynamic::NeededLibs) -> usize {
+pub fn shared_lib_va_pages_for_needed(needed: &besalt::elf_dynamic::NeededLibs) -> usize {
     unsafe {
         let cache = &*(&raw const SHARED_LIB_CACHE);
         if !cache.initialized || needed.count == 0 {
@@ -1043,7 +1043,7 @@ pub unsafe fn spawn_server(
         let elf_span = elf_loader::elf_compute_load_span(entry.data, entry.data_len);
         let mut rtld_entry = CpioEntry::zeroed();
         let rtld_span = if is_dynamic {
-            let rtld_name = b"ld-salty.so";
+            let rtld_name = b"ld-besalt.so";
             if cpio::cpio_find_file(initrd, initrd_size, rtld_name.as_ptr(), rtld_name.len(), &raw mut rtld_entry) == 0 {
                 puts(b"[INIT] rtld not found in initrd\n");
                 return -1;
@@ -1057,17 +1057,17 @@ pub unsafe fn spawn_server(
         let needed = if is_dynamic {
             elf_dynamic::elf_get_needed(entry.data, entry.data_len)
         } else {
-            salty::elf_dynamic::NeededLibs::new()
+            besalt::elf_dynamic::NeededLibs::new()
         };
 
         let shared_lib_pages = shared_lib_va_pages_for_needed(&needed);
-        let layout = salty::layout::compute_vm_layout_randomized(
+        let layout = besalt::layout::compute_vm_layout_randomized(
             elf_span,
             rtld_span,
             shared_lib_pages,
             map_initrd || is_dynamic,
             initrd_size,
-            || salty::syscall::sys_getrandom(),
+            || besalt::syscall::sys_getrandom(),
         );
         if layout.stack_top == 0 {
             puts(b"[INIT] ELF too large for VA layout\n");
@@ -1569,7 +1569,7 @@ pub unsafe fn spawn_server(
                 return -1;
             }
 
-            // +2 for AT_SALTY_SLOT_BASE/COUNT, +1 for AT_SALTY_EXPAND_EP if procmgr available
+            // +2 for AT_BESALT_SLOT_BASE/COUNT, +1 for AT_BESALT_EXPAND_EP if procmgr available
             let has_expand_ep = procmgr_ep != 0;
             let base_count: u64 = if shared_lib_base != 0 { 16 } else { 15 };
             let auxv_count: u64 = if has_expand_ep { base_count + 1 } else { base_count };
@@ -1596,11 +1596,11 @@ pub unsafe fn spawn_server(
             w!(super::AT_ENTRY); w!(elf_result.entry);
             w!(super::AT_BASE); w!(rtld_result.base);
             w!(super::AT_PAGESZ); w!(4096);
-            w!(super::AT_SALTY_UNTYPED); w!(super::CAP_CHILD_UNTYPED_OFFSET);
-            w!(super::AT_SALTY_VSPACE); w!(1);
-            w!(super::AT_SALTY_SCRATCH); w!(layout.scratch.base);
-            w!(super::AT_SALTY_INITRD); w!(layout.initrd.base);
-            w!(super::AT_SALTY_INITRD_SZ); w!(initrd_size as u64);
+            w!(super::AT_BESALT_UNTYPED); w!(super::CAP_CHILD_UNTYPED_OFFSET);
+            w!(super::AT_BESALT_VSPACE); w!(1);
+            w!(super::AT_BESALT_SCRATCH); w!(layout.scratch.base);
+            w!(super::AT_BESALT_INITRD); w!(layout.initrd.base);
+            w!(super::AT_BESALT_INITRD_SZ); w!(initrd_size as u64);
             // Compute first free child CNode slot past extras and shared lib cache
             let frame_slot_start = {
                 let mut s = super::CHILD_RTLD_FRAME_SLOT_START;
@@ -1618,18 +1618,18 @@ pub unsafe fn spawn_server(
                 }
                 s
             };
-            w!(super::AT_SALTY_FRAME_SLOT); w!(frame_slot_start);
+            w!(super::AT_BESALT_FRAME_SLOT); w!(frame_slot_start);
             // Slot pool: from frame_slot_start to CNode end
             let effective_cnode_bits: u64 = if cnode_size_bits > 0 { cnode_size_bits } else { 10 };
             let cnode_total_slots: u64 = 1u64 << effective_cnode_bits;
             let slot_pool_count = cnode_total_slots.saturating_sub(frame_slot_start);
-            w!(super::AT_SALTY_SLOT_BASE); w!(frame_slot_start);
-            w!(super::AT_SALTY_SLOT_COUNT); w!(slot_pool_count);
+            w!(super::AT_BESALT_SLOT_BASE); w!(frame_slot_start);
+            w!(super::AT_BESALT_SLOT_COUNT); w!(slot_pool_count);
             if has_expand_ep {
-                w!(super::AT_SALTY_EXPAND_EP); w!(super::CAP_EXPAND_EP);
+                w!(super::AT_BESALT_EXPAND_EP); w!(super::CAP_EXPAND_EP);
             }
             if shared_lib_base != 0 {
-                w!(super::AT_SALTY_SHARED_LIB_BASE); w!(shared_lib_base);
+                w!(super::AT_BESALT_SHARED_LIB_BASE); w!(shared_lib_base);
             }
             w!(super::AT_NULL); w!(0);
             w!(0); // padding
@@ -1663,9 +1663,9 @@ pub unsafe fn spawn_server(
         // This guarantees posix_mmap()/brk() works immediately on service start.
         if mmsrv_ep != 0 {
             let heap_base = layout.elf_code.end();
-            let mmap_base = salty::layout::compute_mmap_base(&layout, heap_base);
-            let mut mm_msg = SaltyMsg::zeroed();
-            let mut mm_reply = SaltyMsg::zeroed();
+            let mmap_base = besalt::layout::compute_mmap_base(&layout, heap_base);
+            let mut mm_msg = BesaltMsg::zeroed();
+            let mut mm_reply = BesaltMsg::zeroed();
             mm_msg.label = MM_REGISTER;
             mm_msg.length = 4;
             mm_msg.regs[0] = spawn_badge;
@@ -1679,7 +1679,7 @@ pub unsafe fn spawn_server(
                 &raw const mm_msg,
                 &raw mut mm_reply,
             );
-            if mm_err != 0 || (mm_reply.label != SALTY_OK && mm_reply.label != SALTY_ALREADY_EXISTS) {
+            if mm_err != 0 || (mm_reply.label != BESALT_OK && mm_reply.label != BESALT_ALREADY_EXISTS) {
                 let mut lb = LineBuf::new();
                 lb.str(b"[INIT] WARN: MM_REGISTER ");
                 lb.bytes(label);
@@ -1698,8 +1698,8 @@ pub unsafe fn spawn_server(
 
         // Register init-spawned service with procmgr (badge + CNode)
         if procmgr_ep != 0 {
-            let mut reg_msg = SaltyMsg::zeroed();
-            let mut reg_reply = SaltyMsg::zeroed();
+            let mut reg_msg = BesaltMsg::zeroed();
+            let mut reg_reply = BesaltMsg::zeroed();
             reg_msg.label = POSIX_PM_REGISTER;
             reg_msg.length = 2;
             reg_msg.regs[0] = spawn_badge;
@@ -1709,7 +1709,7 @@ pub unsafe fn spawn_server(
                 super::ipc_ctx(), procmgr_ep,
                 &raw const reg_msg, &raw mut reg_reply,
             );
-            if reg_err != 0 || reg_reply.label != SALTY_OK {
+            if reg_err != 0 || reg_reply.label != BESALT_OK {
                 let mut lb = LineBuf::new();
                 lb.str(b"[INIT] WARN: PM_REGISTER ");
                 lb.bytes(label);
@@ -1780,7 +1780,7 @@ pub unsafe fn pm_spawn(
         if start_suspended {
             spawn_flags |= SPAWN_FLAG_START_SUSPENDED;
         }
-        let mut spawn_msg = SaltyMsg::zeroed();
+        let mut spawn_msg = BesaltMsg::zeroed();
         spawn_msg.label = POSIX_PM_SPAWN;
         let packed_name_words = ((len as u64) + 7) / 8;
         let args_len = def.spawn_args_len as u64;
@@ -1800,9 +1800,9 @@ pub unsafe fn pm_spawn(
             *args_dst.add(i) = def.spawn_args[i];
         }
 
-        let mut spawn_reply = SaltyMsg::zeroed();
+        let mut spawn_reply = BesaltMsg::zeroed();
         let err = ipc::call_ctx(super::ipc_ctx(), pm_ep, &raw const spawn_msg, &raw mut spawn_reply);
-        if err != 0 || spawn_reply.label != SALTY_OK {
+        if err != 0 || spawn_reply.label != BESALT_OK {
             return -1;
         }
 
@@ -1814,14 +1814,14 @@ pub unsafe fn pm_spawn(
 /// Uses PM_RESUME so boot sequencing is not coupled to signal semantics.
 pub unsafe fn pm_resume_child(pm_ep: Cap, pid: u32) -> i32 {
     unsafe {
-        let mut msg = SaltyMsg::zeroed();
+        let mut msg = BesaltMsg::zeroed();
         msg.label = POSIX_PM_RESUME;
         msg.length = 1;
         msg.regs[0] = pid as u64;
 
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
         let err = ipc::call_ctx(super::ipc_ctx(), pm_ep, &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != SALTY_OK {
+        if err != 0 || reply.label != BESALT_OK {
             -1
         } else {
             0
@@ -1833,16 +1833,16 @@ pub unsafe fn pm_resume_child(pm_ep: Cap, pid: u32) -> i32 {
 /// Uses PM_INJECT_CAP IPC to have procmgr copy the cap into the child.
 pub unsafe fn pm_inject_cap(pm_ep: Cap, pid: u32, dst_slot: u64, cap: Cap) -> i32 {
     unsafe {
-        let mut msg = SaltyMsg::zeroed();
+        let mut msg = BesaltMsg::zeroed();
         msg.label = POSIX_PM_INJECT_CAP;
         msg.length = 2;
         msg.regs[0] = pid as u64;
         msg.regs[1] = dst_slot;
         ipc::set_send_cap_ctx(super::ipc_ctx(), 0, cap);
 
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
         let err = ipc::call_ctx(super::ipc_ctx(), pm_ep, &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != SALTY_OK {
+        if err != 0 || reply.label != BESALT_OK {
             -1
         } else {
             0

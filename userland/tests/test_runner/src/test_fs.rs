@@ -2,11 +2,11 @@
 //! Ported from userland/fstest/main.c (12 tests)
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use salty::consts::*;
-use salty::posix;
-use salty::posix_mm;
-use salty::serial;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::posix;
+use besalt::posix_mm;
+use besalt::serial;
+use besalt::types::*;
 
 const CAP_MMSRV_EP: u64 = 7;
 
@@ -36,7 +36,7 @@ pub fn run() -> bool {
 
     // Test 1: stat /dev/console
     puts(b"[TEST_FS] Test 1: stat /dev/console\n");
-    let mut st = SaltyStat::zeroed();
+    let mut st = BesaltStat::zeroed();
     let ret = unsafe { posix::posix_stat(b"/dev/console\0".as_ptr(), &raw mut st) };
     if ret != 0 {
         puts(b"[TEST_FS] FAIL: stat /dev/console returned error\n");
@@ -69,7 +69,7 @@ pub fn run() -> bool {
         return false;
     }
 
-    let mut dent = SaltyDirent::zeroed();
+    let mut dent = BesaltDirent::zeroed();
     let mut file_count = 0;
     while unsafe { posix::posix_readdir(dir_fd, &raw mut dent) } != 0 {
         puts(b"[TEST_FS]   ");

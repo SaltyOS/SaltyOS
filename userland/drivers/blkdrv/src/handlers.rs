@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Block I/O request handlers and dispatch logic.
 
-use salty::consts::*;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 use crate::virtio::*;
 use crate::{puts, CAPACITY_SECTORS, VIRTIO_INITIALIZED, VQUEUE_BASE};
 use crate::{QUEUE_SIZE, AVAIL_IDX, LAST_USED_IDX, QUEUE_AVAIL_OFF, QUEUE_USED_OFF};
 use crate::{SHM_VADDR, SHM_SIZE, SECTOR_SIZE, BLK_SHM_ID};
 
-pub(crate) fn handle_read(msg: &SaltyMsg) -> SaltyMsg {
-    let mut reply = SaltyMsg::zeroed();
+pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
+    let mut reply = BesaltMsg::zeroed();
 
     if !unsafe { *(&raw const VIRTIO_INITIALIZED) } {
-        reply.label = SALTY_INVALID_OPERATION;
+        reply.label = BESALT_INVALID_OPERATION;
         return reply;
     }
 
@@ -27,7 +27,7 @@ pub(crate) fn handle_read(msg: &SaltyMsg) -> SaltyMsg {
     let byte_count = actual_count * 512;
 
     if shm_offset + byte_count > SHM_SIZE {
-        reply.label = SALTY_OUT_OF_RANGE;
+        reply.label = BESALT_OUT_OF_RANGE;
         return reply;
     }
 
@@ -41,7 +41,7 @@ pub(crate) fn handle_read(msg: &SaltyMsg) -> SaltyMsg {
         let data_vaddr = SHM_VADDR + shm_offset;
         let data_phys = vaddr_to_phys(data_vaddr);
         if data_phys == 0 {
-            reply.label = SALTY_BAD_ADDRESS;
+            reply.label = BESALT_BAD_ADDRESS;
             return reply;
         }
 
@@ -52,7 +52,7 @@ pub(crate) fn handle_read(msg: &SaltyMsg) -> SaltyMsg {
         (*hdr).sector = start_sector;
         let hdr_phys = vaddr_to_phys(hdr as u64);
         if hdr_phys == 0 {
-            reply.label = SALTY_BAD_ADDRESS;
+            reply.label = BESALT_BAD_ADDRESS;
             return reply;
         }
 
@@ -60,7 +60,7 @@ pub(crate) fn handle_read(msg: &SaltyMsg) -> SaltyMsg {
         *(&raw mut REQ_STATUS) = 0xFF;
         let status_phys = vaddr_to_phys(&raw const REQ_STATUS as u64);
         if status_phys == 0 {
-            reply.label = SALTY_BAD_ADDRESS;
+            reply.label = BESALT_BAD_ADDRESS;
             return reply;
         }
 
@@ -116,7 +116,7 @@ pub(crate) fn handle_read(msg: &SaltyMsg) -> SaltyMsg {
             spin_count += 1;
             if spin_count > 10_000_000 {
                 puts(b"[blkdrv] virtio read timeout\n");
-                reply.label = SALTY_BUSY;
+                reply.label = BESALT_BUSY;
                 return reply;
             }
         }
@@ -129,7 +129,7 @@ pub(crate) fn handle_read(msg: &SaltyMsg) -> SaltyMsg {
             lb.dec(status as u64);
             lb.putc(b'\n');
             lb.flush();
-            reply.label = SALTY_INVALID_OPERATION;
+            reply.label = BESALT_INVALID_OPERATION;
             return reply;
         }
     }
@@ -140,11 +140,11 @@ pub(crate) fn handle_read(msg: &SaltyMsg) -> SaltyMsg {
     reply
 }
 
-pub(crate) fn handle_write(msg: &SaltyMsg) -> SaltyMsg {
-    let mut reply = SaltyMsg::zeroed();
+pub(crate) fn handle_write(msg: &BesaltMsg) -> BesaltMsg {
+    let mut reply = BesaltMsg::zeroed();
 
     if !unsafe { *(&raw const VIRTIO_INITIALIZED) } {
-        reply.label = SALTY_INVALID_OPERATION;
+        reply.label = BESALT_INVALID_OPERATION;
         return reply;
     }
 
@@ -157,7 +157,7 @@ pub(crate) fn handle_write(msg: &SaltyMsg) -> SaltyMsg {
     let byte_count = actual_count * 512;
 
     if shm_offset + byte_count > SHM_SIZE {
-        reply.label = SALTY_OUT_OF_RANGE;
+        reply.label = BESALT_OUT_OF_RANGE;
         return reply;
     }
 
@@ -171,7 +171,7 @@ pub(crate) fn handle_write(msg: &SaltyMsg) -> SaltyMsg {
         let data_vaddr = SHM_VADDR + shm_offset;
         let data_phys = vaddr_to_phys(data_vaddr);
         if data_phys == 0 {
-            reply.label = SALTY_BAD_ADDRESS;
+            reply.label = BESALT_BAD_ADDRESS;
             return reply;
         }
 
@@ -182,7 +182,7 @@ pub(crate) fn handle_write(msg: &SaltyMsg) -> SaltyMsg {
         (*hdr).sector = start_sector;
         let hdr_phys = vaddr_to_phys(hdr as u64);
         if hdr_phys == 0 {
-            reply.label = SALTY_BAD_ADDRESS;
+            reply.label = BESALT_BAD_ADDRESS;
             return reply;
         }
 
@@ -190,7 +190,7 @@ pub(crate) fn handle_write(msg: &SaltyMsg) -> SaltyMsg {
         *(&raw mut REQ_STATUS) = 0xFF;
         let status_phys = vaddr_to_phys(&raw const REQ_STATUS as u64);
         if status_phys == 0 {
-            reply.label = SALTY_BAD_ADDRESS;
+            reply.label = BESALT_BAD_ADDRESS;
             return reply;
         }
 
@@ -240,7 +240,7 @@ pub(crate) fn handle_write(msg: &SaltyMsg) -> SaltyMsg {
             spin_count += 1;
             if spin_count > 10_000_000 {
                 puts(b"[blkdrv] virtio write timeout\n");
-                reply.label = SALTY_BUSY;
+                reply.label = BESALT_BUSY;
                 return reply;
             }
         }
@@ -253,7 +253,7 @@ pub(crate) fn handle_write(msg: &SaltyMsg) -> SaltyMsg {
             lb.dec(status as u64);
             lb.putc(b'\n');
             lb.flush();
-            reply.label = SALTY_INVALID_OPERATION;
+            reply.label = BESALT_INVALID_OPERATION;
             return reply;
         }
     }
@@ -264,8 +264,8 @@ pub(crate) fn handle_write(msg: &SaltyMsg) -> SaltyMsg {
     reply
 }
 
-pub(crate) fn handle_get_info() -> SaltyMsg {
-    let mut reply = SaltyMsg::zeroed();
+pub(crate) fn handle_get_info() -> BesaltMsg {
+    let mut reply = BesaltMsg::zeroed();
     reply.label = 0;
     reply.length = 2;
     reply.regs[0] = unsafe { *(&raw const CAPACITY_SECTORS) };
@@ -273,8 +273,8 @@ pub(crate) fn handle_get_info() -> SaltyMsg {
     reply
 }
 
-pub(crate) fn handle_get_shm_id() -> SaltyMsg {
-    let mut reply = SaltyMsg::zeroed();
+pub(crate) fn handle_get_shm_id() -> BesaltMsg {
+    let mut reply = BesaltMsg::zeroed();
     reply.label = 0;
     reply.length = 1;
     reply.regs[0] = BLK_SHM_ID;
