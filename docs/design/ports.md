@@ -12,7 +12,7 @@ Key components:
 |-----------|----------|---------|
 | `.port` files | `ports/<name>/<name>.port` | Declarative port definitions |
 | `portbuild` | `tools/portbuild/` | Host-side build tool (Rust) |
-| `besaltc` | `lib/besaltc/` | C standard library (`libc.so`) |
+| `besaltc` | `lib/besalt/c/` | C standard library (`libc.so`) |
 | Meson integration | `ports/meson.build` | Auto-discovery and build orchestration |
 
 ## Architecture
@@ -215,7 +215,7 @@ Available in `[source].url`, `[source].subdir`, `[prepare]`, `[targets.cflags]`,
 | `${PORTDIR}` | Port directory (e.g., `ports/bash/`) |
 | `${BUILDDIR}` | Meson build root |
 | `${SALTY_HOST}` | Target triple (`x86_64-unknown-none`) |
-| `${SALTY_INC}` | Path to `lib/besaltc/include/` |
+| `${SALTY_INC}` | Path to `lib/besalt/c/include/` |
 | `${NPROC}` | Number of parallel jobs |
 
 ## portbuild Tool
@@ -307,7 +307,7 @@ Ports link against `libc.so`, SaltyOS's C standard library implemented primarily
 ### Architecture
 
 ```
-lib/besaltc/
+lib/besalt/c/
 ├── src/
 │   ├── lib.rs           # Crate root
 │   ├── crt.rs           # __libc_start_main (runtime init)
@@ -350,7 +350,7 @@ lib/besaltc/
 
 ### Headers
 
-72 headers in `lib/besaltc/include/` provide the C API surface:
+72 headers in `lib/besalt/c/include/` provide the C API surface:
 
 - **Standard C**: `stdio.h`, `stdlib.h`, `string.h`, `ctype.h`, `math.h`, `time.h`, `signal.h`, `setjmp.h`, `stddef.h`, `stdint.h`, `stdarg.h`, `stdbool.h`, `errno.h`, `assert.h`, `limits.h`, `inttypes.h`, `locale.h`
 - **POSIX**: `unistd.h`, `fcntl.h`, `dirent.h`, `sys/types.h`, `sys/stat.h`, `sys/mman.h`, `sys/socket.h`, `sys/un.h`, `sys/time.h`, `sys/wait.h`, `sys/select.h`, `sys/uio.h`, `sys/resource.h`, `poll.h`, `termios.h`, `sched.h`, `pwd.h`, `grp.h`, `glob.h`, `fnmatch.h`, `regex.h`

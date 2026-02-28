@@ -7,7 +7,7 @@ Rust. All functions use C ABI (`extern "C"`) and are linked into executables via
 **Status key:** **F** = full implementation, **P** = partial (reduced functionality),
 **S** = stub (returns ENOSYS/-1/no-op).
 
-**Source:** `lib/besaltc/src/`
+**Source:** `lib/besalt/c/src/`
 
 ---
 
