@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 hello_link = meson.current_source_dir() / 'link.ld'
-libbesalt_build_dir = meson.project_build_root() / 'lib/besalt/lib'
-saltyc_build_dir = meson.project_build_root() / 'lib/besalt/c'
 
 # C source -> .elf (compile + link in one step)
 hello_elf = custom_target('hello_elf',
@@ -15,12 +13,12 @@ hello_elf = custom_target('hello_elf',
     '-nostdinc', '-nostdlib', '-nostartfiles', '-ffreestanding',
     '-fno-stack-protector',
     '-mno-red-zone',
-    '-I', saltyc_inc_dir,
+    '-I', besaltc_inc_dir,
     '-T', hello_link,
     '-L', libbesalt_build_dir,
-    '-L', saltyc_build_dir,
+    '-L', besaltc_build_dir,
     '-o', '@OUTPUT@',
-    saltyc_build_dir / 'crt_start.o',
+    besaltc_build_dir / 'crt_start.o',
     '@INPUT@',
     '-lbesalt', '-lc',
   ],

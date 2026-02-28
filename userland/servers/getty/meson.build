@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 getty_link = meson.current_source_dir() / 'link.ld'
-libbesalt_build_dir = meson.project_build_root() / 'lib/besalt/lib'
-saltyc_build_dir = meson.project_build_root() / 'lib/besalt/c'
 
 # Step 1: Rust -> .o
 getty_obj = custom_target('getty_obj',
@@ -34,9 +32,9 @@ getty_elf = custom_target('getty_elf',
     '-mno-red-zone',
     '-T', getty_link,
     '-L', libbesalt_build_dir,
-    '-L', saltyc_build_dir,
+    '-L', besaltc_build_dir,
     '-o', '@OUTPUT@',
-    saltyc_build_dir / 'crt_start.o',
+    besaltc_build_dir / 'crt_start.o',
     '@INPUT@',
     '-lbesalt', '-lc',
   ],
