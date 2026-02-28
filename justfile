@@ -1,6 +1,37 @@
 # SaltyOS Build Commands
 # SPDX-License-Identifier: GPL-2.0-only
 
+# Show available recipes
+help:
+    @echo "SaltyOS Build System"
+    @echo ""
+    @echo "== Quick Start (daily development) =="
+    @echo "  just setup          Configure the build (once)"
+    @echo "  just build          Build kernel + userland"
+    @echo "  just run            Build + run in QEMU"
+    @echo "  just rr             Quick rebuild + run"
+    @echo ""
+    @echo "== QEMU Options =="
+    @echo "  just run --smp 2    Run with 2 CPUs"
+    @echo "  just run --smp 4    Run with 4 CPUs"
+    @echo "  just run --uefi     Run with UEFI firmware"
+    @echo "  just run --debug    Run with interrupt logging"
+    @echo "  just run --gdb      Run with GDB server"
+    @echo "  just run --headless Run without GUI"
+    @echo ""
+    @echo "== Toolchain Bootstrap (one-time, in order) =="
+    @echo "  1. just toolchain-setup          Create directories"
+    @echo "  2. just toolchain-build-llvm     Build host Clang/LLD"
+    @echo "  3. just toolchain-build-rust     Build host rustc"
+    @echo "  just toolchain-doctor            Validate toolchain"
+    @echo ""
+    @echo "== Ports =="
+    @echo "  just port <name>    Build a port (bash, coreutils, ...)"
+    @echo ""
+    @echo "== Images =="
+    @echo "  just mkrootfs       Build rootfs.img from manifest"
+    @echo "  just mksaltyfs      Create test_data.img (manual)"
+
 # Default target architecture
 arch := "x86_64"
 
@@ -95,358 +126,14 @@ distclean:
 # Run & Debug
 # =============================================================================
 
-# Run in QEMU (x86_64)
-run: build
-    qemu-system-x86_64 \
-        -machine q35 \
-        -cpu qemu64 \
-        -m 512M \
-        -serial stdio \
-        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
-        -device ahci,id=ahci \
-        -device ide-hd,drive=disk,bus=ahci.0 \
-        -drive file=test_data.img,format=raw,if=none,id=datadisk \
-        -device virtio-blk-pci,drive=datadisk \
-        -netdev user,id=net0 \
-        -device virtio-net-pci,netdev=net0 \
-        -no-reboot \
-        -no-shutdown
-
-# Run in QEMU with extreme lowmem (4MB)
-run-4m: build
-    qemu-system-x86_64 \
-        -machine q35 \
-        -cpu qemu64 \
-        -m 4M \
-        -serial stdio \
-        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
-        -device ahci,id=ahci \
-        -device ide-hd,drive=disk,bus=ahci.0 \
-        -drive file=test_data.img,format=raw,if=none,id=datadisk \
-        -device virtio-blk-pci,drive=datadisk \
-        -netdev user,id=net0 \
-        -device virtio-net-pci,netdev=net0 \
-        -no-reboot \
-        -no-shutdown
-
-# Run in QEMU with lowmem (8MB)
-run-8m: build
-    qemu-system-x86_64 \
-        -machine q35 \
-        -cpu qemu64 \
-        -m 8M \
-        -serial stdio \
-        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
-        -device ahci,id=ahci \
-        -device ide-hd,drive=disk,bus=ahci.0 \
-        -drive file=test_data.img,format=raw,if=none,id=datadisk \
-        -device virtio-blk-pci,drive=datadisk \
-        -netdev user,id=net0 \
-        -device virtio-net-pci,netdev=net0 \
-        -no-reboot \
-        -no-shutdown
-
-# Run in QEMU with lowmem (16MB)
-run-16m: build
-    qemu-system-x86_64 \
-        -machine q35 \
-        -cpu qemu64 \
-        -m 16M \
-        -serial stdio \
-        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
-        -device ahci,id=ahci \
-        -device ide-hd,drive=disk,bus=ahci.0 \
-        -drive file=test_data.img,format=raw,if=none,id=datadisk \
-        -device virtio-blk-pci,drive=datadisk \
-        -netdev user,id=net0 \
-        -device virtio-net-pci,netdev=net0 \
-        -no-reboot \
-        -no-shutdown
-
-# Run in QEMU with SMP (2 CPUs)
-run-smp: build
-    qemu-system-x86_64 \
-        -machine q35 \
-        -cpu qemu64 \
-        -smp 2 \
-        -m 512M \
-        -serial stdio \
-        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
-        -device ahci,id=ahci \
-        -device ide-hd,drive=disk,bus=ahci.0 \
-        -drive file=test_data.img,format=raw,if=none,id=datadisk \
-        -device virtio-blk-pci,drive=datadisk \
-        -netdev user,id=net0 \
-        -device virtio-net-pci,netdev=net0 \
-        -no-reboot \
-        -no-shutdown
-
-# Run SMP headless with debug output
-run-smp-debug: build
-    qemu-system-x86_64 \
-        -machine q35 \
-        -cpu qemu64 \
-        -smp 2 \
-        -m 512M \
-        -serial stdio \
-        -display none \
-        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
-        -device ahci,id=ahci \
-        -device ide-hd,drive=disk,bus=ahci.0 \
-        -drive file=test_data.img,format=raw,if=none,id=datadisk \
-        -device virtio-blk-pci,drive=datadisk \
-        -netdev user,id=net0 \
-        -device virtio-net-pci,netdev=net0 \
-        -no-reboot \
-        -no-shutdown \
-        -d int,cpu_reset \
-        -D qemu.log
-
-# Run SMP with 4 CPUs
-run-smp4: build
-    qemu-system-x86_64 \
-        -machine q35 \
-        -cpu qemu64 \
-        -smp 4 \
-        -m 512M \
-        -serial stdio \
-        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
-        -device ahci,id=ahci \
-        -device ide-hd,drive=disk,bus=ahci.0 \
-        -drive file=test_data.img,format=raw,if=none,id=datadisk \
-        -device virtio-blk-pci,drive=datadisk \
-        -netdev user,id=net0 \
-        -device virtio-net-pci,netdev=net0 \
-        -no-reboot \
-        -no-shutdown
-
-# Run with debug output
-run-debug: build
-    qemu-system-x86_64 \
-        -machine q35 \
-        -cpu qemu64 \
-        -m 512M \
-        -serial stdio \
-        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
-        -device ahci,id=ahci \
-        -device ide-hd,drive=disk,bus=ahci.0 \
-        -drive file=test_data.img,format=raw,if=none,id=datadisk \
-        -device virtio-blk-pci,drive=datadisk \
-        -netdev user,id=net0 \
-        -device virtio-net-pci,netdev=net0 \
-        -no-reboot \
-        -no-shutdown \
-        -d int,cpu_reset \
-        -D qemu.log
-
-# Run with GDB server (wait for connection)
-run-gdb: build
-    qemu-system-x86_64 \
-        -machine q35 \
-        -cpu qemu64 \
-        -m 512M \
-        -serial stdio \
-        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
-        -device ahci,id=ahci \
-        -device ide-hd,drive=disk,bus=ahci.0 \
-        -drive file=test_data.img,format=raw,if=none,id=datadisk \
-        -device virtio-blk-pci,drive=datadisk \
-        -netdev user,id=net0 \
-        -device virtio-net-pci,netdev=net0 \
-        -no-reboot \
-        -no-shutdown \
-        -s -S
+# Run in QEMU (flags: --smp N, --mem SIZE, --debug, --headless, --gdb, --uefi)
+run *ARGS: build
+    bash tools/run-qemu.sh {{builddir}} {{ARGS}}
 
 # Connect GDB to running QEMU
 gdb:
     gdb -ex "target remote localhost:1234" \
         -ex "symbol-file {{builddir}}/kernel/kernel.elf"
-
-# Run with UEFI firmware
-run-uefi: image-uefi
-    bash -eu -c '\
-        ovmf_code="${OVMF_CODE:-}"; \
-        ovmf_vars="${OVMF_VARS:-}"; \
-        if [ -z "$ovmf_code" ]; then \
-            for cand in /usr/share/edk2-ovmf/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd; do \
-                if [ -f "$cand" ]; then ovmf_code="$cand"; break; fi; \
-            done; \
-        fi; \
-        if [ -z "$ovmf_vars" ]; then \
-            for cand in /usr/share/edk2-ovmf/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd; do \
-                if [ -f "$cand" ]; then ovmf_vars="$cand"; break; fi; \
-            done; \
-        fi; \
-        if [ -z "$ovmf_code" ]; then \
-            echo "OVMF firmware not found. Set OVMF_CODE (and optionally OVMF_VARS)." >&2; \
-            exit 1; \
-        fi; \
-        if [ -n "$ovmf_vars" ] && [ -f "$ovmf_vars" ]; then \
-            ovmf_vars_runtime="{{builddir}}/OVMF_VARS.fd"; \
-            if [ ! -f "$ovmf_vars_runtime" ]; then cp "$ovmf_vars" "$ovmf_vars_runtime"; fi; \
-            qemu-system-x86_64 \
-                -machine q35 \
-                -cpu qemu64 \
-                -m 512M \
-                -serial stdio \
-                -drive if=pflash,format=raw,readonly=on,file="$ovmf_code" \
-                -drive if=pflash,format=raw,file="$ovmf_vars_runtime" \
-                -drive file={{builddir}}/saltyos-uefi.img,format=raw \
-                -drive file=test_data.img,format=raw,if=none,id=datadisk \
-                -device virtio-blk-pci,drive=datadisk \
-                -netdev user,id=net0 \
-                -device virtio-net-pci,netdev=net0 \
-                -no-reboot \
-                -no-shutdown; \
-        else \
-            qemu-system-x86_64 \
-                -machine q35 \
-                -cpu qemu64 \
-                -m 512M \
-                -serial stdio \
-                -bios "$ovmf_code" \
-                -drive file={{builddir}}/saltyos-uefi.img,format=raw \
-                -drive file=test_data.img,format=raw,if=none,id=datadisk \
-                -device virtio-blk-pci,drive=datadisk \
-                -netdev user,id=net0 \
-                -device virtio-net-pci,netdev=net0 \
-                -no-reboot \
-                -no-shutdown; \
-        fi'
-
-# Run UEFI with debug output
-run-uefi-debug: image-uefi
-    bash -eu -c '\
-        ovmf_code="${OVMF_CODE:-}"; \
-        ovmf_vars="${OVMF_VARS:-}"; \
-        if [ -z "$ovmf_code" ]; then \
-            for cand in /usr/share/edk2-ovmf/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd; do \
-                if [ -f "$cand" ]; then ovmf_code="$cand"; break; fi; \
-            done; \
-        fi; \
-        if [ -z "$ovmf_vars" ]; then \
-            for cand in /usr/share/edk2-ovmf/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd; do \
-                if [ -f "$cand" ]; then ovmf_vars="$cand"; break; fi; \
-            done; \
-        fi; \
-        if [ -z "$ovmf_code" ]; then \
-            echo "OVMF firmware not found. Set OVMF_CODE (and optionally OVMF_VARS)." >&2; \
-            exit 1; \
-        fi; \
-        if [ -n "$ovmf_vars" ] && [ -f "$ovmf_vars" ]; then \
-            ovmf_vars_runtime="{{builddir}}/OVMF_VARS.fd"; \
-            if [ ! -f "$ovmf_vars_runtime" ]; then cp "$ovmf_vars" "$ovmf_vars_runtime"; fi; \
-            qemu-system-x86_64 \
-                -machine q35 \
-                -cpu qemu64 \
-                -m 512M \
-                -serial stdio \
-                -drive if=pflash,format=raw,readonly=on,file="$ovmf_code" \
-                -drive if=pflash,format=raw,file="$ovmf_vars_runtime" \
-                -drive file={{builddir}}/saltyos-uefi.img,format=raw \
-                -drive file=test_data.img,format=raw,if=none,id=datadisk \
-                -device virtio-blk-pci,drive=datadisk \
-                -netdev user,id=net0 \
-                -device virtio-net-pci,netdev=net0 \
-                -no-reboot \
-                -no-shutdown \
-                -d int,cpu_reset \
-                -D qemu.log; \
-        else \
-            qemu-system-x86_64 \
-                -machine q35 \
-                -cpu qemu64 \
-                -m 512M \
-                -serial stdio \
-                -bios "$ovmf_code" \
-                -drive file={{builddir}}/saltyos-uefi.img,format=raw \
-                -drive file=test_data.img,format=raw,if=none,id=datadisk \
-                -device virtio-blk-pci,drive=datadisk \
-                -netdev user,id=net0 \
-                -device virtio-net-pci,netdev=net0 \
-                -no-reboot \
-                -no-shutdown \
-                -d int,cpu_reset \
-                -D qemu.log; \
-        fi'
-
-# Run with debug output (headless, no GUI window)
-run-debug-headless: build
-    qemu-system-x86_64 \
-        -machine q35 \
-        -cpu qemu64 \
-        -m 512M \
-        -serial stdio \
-        -display none \
-        -drive file={{builddir}}/saltyos.img,format=raw,if=none,id=disk \
-        -device ahci,id=ahci \
-        -device ide-hd,drive=disk,bus=ahci.0 \
-        -drive file=test_data.img,format=raw,if=none,id=datadisk \
-        -device virtio-blk-pci,drive=datadisk \
-        -netdev user,id=net0 \
-        -device virtio-net-pci,netdev=net0 \
-        -no-reboot \
-        -no-shutdown \
-        -d int,cpu_reset \
-        -D qemu.log
-
-# Run UEFI with debug output (headless, no GUI window)
-run-uefi-debug-headless: image-uefi
-    bash -eu -c '\
-        ovmf_code="${OVMF_CODE:-}"; \
-        ovmf_vars="${OVMF_VARS:-}"; \
-        if [ -z "$ovmf_code" ]; then \
-            for cand in /usr/share/edk2-ovmf/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd; do \
-                if [ -f "$cand" ]; then ovmf_code="$cand"; break; fi; \
-            done; \
-        fi; \
-        if [ -z "$ovmf_vars" ]; then \
-            for cand in /usr/share/edk2-ovmf/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd; do \
-                if [ -f "$cand" ]; then ovmf_vars="$cand"; break; fi; \
-            done; \
-        fi; \
-        if [ -z "$ovmf_code" ]; then \
-            echo "OVMF firmware not found. Set OVMF_CODE (and optionally OVMF_VARS)." >&2; \
-            exit 1; \
-        fi; \
-        if [ -n "$ovmf_vars" ] && [ -f "$ovmf_vars" ]; then \
-            ovmf_vars_runtime="{{builddir}}/OVMF_VARS.fd"; \
-            if [ ! -f "$ovmf_vars_runtime" ]; then cp "$ovmf_vars" "$ovmf_vars_runtime"; fi; \
-            qemu-system-x86_64 \
-                -machine q35 \
-                -cpu qemu64 \
-                -m 512M \
-                -serial stdio \
-                -display none \
-                -drive if=pflash,format=raw,readonly=on,file="$ovmf_code" \
-                -drive if=pflash,format=raw,file="$ovmf_vars_runtime" \
-                -drive file={{builddir}}/saltyos-uefi.img,format=raw \
-                -drive file=test_data.img,format=raw,if=none,id=datadisk \
-                -device virtio-blk-pci,drive=datadisk \
-                -netdev user,id=net0 \
-                -device virtio-net-pci,netdev=net0 \
-                -no-reboot \
-                -no-shutdown \
-                -d int,cpu_reset \
-                -D qemu.log; \
-        else \
-            qemu-system-x86_64 \
-                -machine q35 \
-                -cpu qemu64 \
-                -m 512M \
-                -serial stdio \
-                -display none \
-                -bios "$ovmf_code" \
-                -drive file={{builddir}}/saltyos-uefi.img,format=raw \
-                -drive file=test_data.img,format=raw,if=none,id=datadisk \
-                -device virtio-blk-pci,drive=datadisk \
-                -netdev user,id=net0 \
-                -device virtio-net-pci,netdev=net0 \
-                -no-reboot \
-                -no-shutdown \
-                -d int,cpu_reset \
-                -D qemu.log; \
-        fi'
 
 # =============================================================================
 # Utilities
@@ -614,6 +301,11 @@ rr: build run
 # Generate SaltyFS test image
 mksaltyfs:
     python3 tools/mksaltyfs.py -o test_data.img -s 64M
+
+# Build rootfs image from manifest
+mkrootfs: build
+    tools/mkrootfs --output {{builddir}}/rootfs.img --size 256M \
+        --manifest images/rootfs.manifest -v
 
 # Create a new component skeleton
 new-component NAME:

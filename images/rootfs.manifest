@@ -1,0 +1,11 @@
+# SaltyOS rootfs image — non-initrd binaries
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Boot-critical services + .service files are in the initrd CPIO.
+# Non-critical binaries are loaded from rootfs via VFS fallback.
+
+/bin/display=build/userland/drivers/display/display
+/bin/ttyd=build/userland/servers/ttyd/ttyd
+/bin/getty=build/userland/servers/getty/getty
+/bin/test_runner=build/userland/tests/test_runner/test_runner
+/bin/hello=build/userland/tests/hello/hello

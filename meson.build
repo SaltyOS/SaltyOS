@@ -413,6 +413,32 @@ if build_userland and mkcpio.found()
 endif
 
 # =============================================================================
+# Rootfs Image Generation (optional — embed SaltyFS rootfs into disk image)
+# =============================================================================
+
+mkrootfs = find_program('tools/mkrootfs', required: false)
+mksaltyfs_script = files('tools/mksaltyfs.py')
+
+rootfs_inputs = []
+rootfs_args = []
+if mkrootfs.found() and build_userland
+  rootfs_manifest = files('images/rootfs.manifest')[0]
+  rootfs_image = custom_target('rootfs_image',
+    input: [display_elf, ttyd_elf, getty_elf, test_runner_elf, hello_elf],
+    depend_files: [files('tools/mkrootfs'), mksaltyfs_script, rootfs_manifest],
+    output: 'rootfs.img',
+    command: [mkrootfs,
+      '--output', '@OUTPUT@',
+      '--size', '256M',
+      '--manifest', rootfs_manifest,
+    ],
+    build_by_default: false,
+  )
+  rootfs_inputs = [rootfs_image]
+  rootfs_args = ['--rootfs', rootfs_image]
+endif
+
+# =============================================================================
 # Disk Image Generation
 # =============================================================================
 
@@ -424,7 +450,7 @@ if mkimage.found() and build_boot and build_kernel
 
   # BIOS disk image
   disk_image = custom_target('disk_image',
-    input: [mbr, stage2, stage3, kernel_boot] + initrd_inputs,
+    input: [mbr, stage2, stage3, kernel_boot] + initrd_inputs + rootfs_inputs,
     depend_files: mkimage_script,
     output: 'saltyos.img',
     command: [mkimage,
@@ -432,14 +458,14 @@ if mkimage.found() and build_boot and build_kernel
       '--kernel', kernel_boot.full_path(),
       '--output', '@OUTPUT@',
       '--size', '16',
-    ] + initrd_args,
+    ] + initrd_args + rootfs_args,
     build_by_default: true,
   )
 
   # UEFI disk image
   if arch == 'x86_64'
     uefi_image = custom_target('uefi_image',
-      input: [efi, stage2_efi, stage3_uefi, kernel_boot] + initrd_inputs,
+      input: [efi, stage2_efi, stage3_uefi, kernel_boot] + initrd_inputs + rootfs_inputs,
       depend_files: mkimage_script,
       output: 'saltyos-uefi.img',
       command: [mkimage,
@@ -448,7 +474,7 @@ if mkimage.found() and build_boot and build_kernel
         '--kernel', kernel_boot.full_path(),
         '--output', '@OUTPUT@',
         '--size', '64',
-      ] + initrd_args,
+      ] + initrd_args + rootfs_args,
       build_by_default: false,
     )
   endif

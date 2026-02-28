@@ -62,6 +62,13 @@ ESP_SIZE_SECTORS = 65536    # 32MB for ESP (enough for EFI files)
 
 # GPT partition type GUIDs
 EFI_SYSTEM_PARTITION_GUID = uuid.UUID('C12A7328-F81F-11D2-BA4B-00A0C93EC93B')
+LINUX_FILESYSTEM_GUID = uuid.UUID('0FC63DAF-8483-4772-8E79-3D69D8477DE4')
+
+# BIOS MBR partition type IDs
+MBR_PART_TYPE_LINUX_FS = 0x83
+
+# Rootfs partition placement (1 MiB alignment)
+ROOTFS_ALIGN_SECTORS = 2048
 
 
 def guid_to_bytes(guid: uuid.UUID) -> bytes:
@@ -129,6 +136,13 @@ def pad_to_sector_boundary(data: bytes) -> bytes:
     if remainder != 0:
         data += b'\x00' * (SECTOR_SIZE - remainder)
     return data
+
+
+def align_up(value: int, alignment: int) -> int:
+    """Round value up to the next multiple of alignment."""
+    if alignment <= 0:
+        raise ValueError(f"alignment must be > 0, got {alignment}")
+    return ((value + alignment - 1) // alignment) * alignment
 
 
 def create_manifest_extent(lba: int, sector_count: int) -> bytes:
@@ -297,6 +311,52 @@ def create_protective_mbr(total_sectors: int) -> bytes:
     return bytes(mbr)
 
 
+def patch_mbr_linux_partition(
+    mbr_data: bytes,
+    start_lba: int,
+    sector_count: int,
+    partition_index: int = 0,
+) -> bytes:
+    """Patch a classic MBR partition entry into an existing bootable MBR sector."""
+    if len(mbr_data) != SECTOR_SIZE:
+        raise ValueError(f"MBR must be exactly {SECTOR_SIZE} bytes, got {len(mbr_data)}")
+    if start_lba <= 0:
+        raise ValueError(f"Invalid partition start LBA: {start_lba}")
+    if sector_count <= 0:
+        raise ValueError(f"Invalid partition sector count: {sector_count}")
+    if start_lba > 0xFFFFFFFF or sector_count > 0xFFFFFFFF:
+        raise ValueError(
+            f"MBR partition exceeds 32-bit LBA limits: start={start_lba} sectors={sector_count}"
+        )
+    if not (0 <= partition_index < 4):
+        raise ValueError(f"Invalid MBR partition index: {partition_index}")
+
+    mbr = bytearray(mbr_data)
+    if mbr[0x1FE] != 0x55 or mbr[0x1FF] != 0xAA:
+        raise ValueError("MBR signature missing (0x55AA)")
+
+    part_table_off = 0x1BE
+    part_entry_size = 16
+
+    # Clear all partition entries so the image has a single authoritative rootfs partition.
+    mbr[part_table_off:part_table_off + 4 * part_entry_size] = b'\x00' * (4 * part_entry_size)
+
+    off = part_table_off + partition_index * part_entry_size
+    entry = bytearray(16)
+    entry[0] = 0x00  # non-bootable; boot is handled by custom MBR/stage2
+    entry[1:4] = b'\xFF\xFF\xFF'  # CHS (unused, set to max for LBA mode)
+    entry[4] = MBR_PART_TYPE_LINUX_FS
+    entry[5:8] = b'\xFF\xFF\xFF'
+    entry[8:12] = struct.pack('<I', start_lba)
+    entry[12:16] = struct.pack('<I', sector_count)
+    mbr[off:off + 16] = entry
+
+    # Preserve signature explicitly.
+    mbr[0x1FE] = 0x55
+    mbr[0x1FF] = 0xAA
+    return bytes(mbr)
+
+
 def create_gpt_header(
     disk_guid: uuid.UUID,
     total_sectors: int,
@@ -410,27 +470,57 @@ def create_efi_image(
     stage3_path: Path,
     kernel_path: Path,
     initrd_path: Path = None,
-    size_mb: int = 64
+    size_mb: int = 64,
+    rootfs_path: Path = None,
 ) -> None:
     """Create a UEFI bootable disk image with GPT and ESP."""
+    rootfs_path = Path(rootfs_path) if rootfs_path is not None else None
 
-    # Calculate disk geometry
-    total_sectors = size_mb * 1024 * 1024 // SECTOR_SIZE
+    # Calculate disk geometry and optional rootfs placement.
     esp_end_lba = ESP_START_LBA + ESP_SIZE_SECTORS - 1
+    rootfs_actual_size = 0
+    rootfs_sector_count = 0
+    rootfs_start_lba = 0
+    rootfs_end_lba = 0
+    if rootfs_path is not None:
+        rootfs_actual_size = os.path.getsize(rootfs_path)
+        rootfs_sector_count = (rootfs_actual_size + SECTOR_SIZE - 1) // SECTOR_SIZE
+        rootfs_start_lba = align_up(esp_end_lba + 1, ROOTFS_ALIGN_SECTORS)
+        rootfs_end_lba = rootfs_start_lba + rootfs_sector_count - 1
 
-    # Ensure disk is large enough
     min_sectors = esp_end_lba + GPT_ENTRIES_SECTORS + 2
-    if total_sectors < min_sectors:
-        print(f"Error: Disk too small. Need at least {min_sectors} sectors, have {total_sectors}")
-        sys.exit(1)
+    required_sectors = min_sectors
+    if rootfs_path is not None:
+        # Backup GPT entries + backup header must remain after the rootfs partition.
+        required_sectors = max(
+            required_sectors,
+            rootfs_start_lba + rootfs_sector_count + GPT_ENTRIES_SECTORS + 1,
+        )
+    requested_sectors = size_mb * 1024 * 1024 // SECTOR_SIZE
+    total_sectors = max(requested_sectors, required_sectors)
 
     print(f"Creating GPT UEFI disk image: {output}")
-    print(f"  Disk size: {size_mb}MB ({total_sectors} sectors)")
+    if total_sectors > requested_sectors:
+        grown_mb = (total_sectors * SECTOR_SIZE + (1024 * 1024 - 1)) // (1024 * 1024)
+        print(
+            f"  Expanding image from {size_mb}MB to {grown_mb}MB "
+            f"to fit embedded payloads"
+        )
+    print(
+        f"  Disk size: "
+        f"{(total_sectors * SECTOR_SIZE + (1024 * 1024 - 1)) // (1024 * 1024)}MB "
+        f"({total_sectors} sectors)"
+    )
     print(f"  Layout:")
     print(f"    LBA 0:           Protective MBR")
     print(f"    LBA 1:           GPT Header")
     print(f"    LBA 2-33:        GPT Partition Entries")
     print(f"    LBA {ESP_START_LBA}-{esp_end_lba}:  ESP (FAT32, {ESP_SIZE_SECTORS * SECTOR_SIZE // 1024 // 1024}MB)")
+    if rootfs_path is not None:
+        print(
+            f"    LBA {rootfs_start_lba}-{rootfs_end_lba}:  "
+            f"rootfs (SaltyFS payload, {rootfs_sector_count} sectors)"
+        )
     print(f"    LBA {total_sectors - GPT_ENTRIES_SECTORS - 1}-{total_sectors - 2}:  Backup GPT Entries")
     print(f"    LBA {total_sectors - 1}:        Backup GPT Header")
     print(f"  ESP contents:")
@@ -455,12 +545,17 @@ def create_efi_image(
             print(f"  Error: {file_path} not found")
             sys.exit(1)
         print(f"  {efi_path}: {file_path} ({os.path.getsize(file_path)} bytes)")
+    if rootfs_path is not None:
+        print(f"  rootfs payload: {rootfs_path} ({rootfs_actual_size} bytes)")
 
     # Generate GUIDs
     disk_guid = uuid.uuid4()
     esp_guid = uuid.uuid4()
+    rootfs_guid = uuid.uuid4() if rootfs_path is not None else None
     print(f"\n  Disk GUID: {disk_guid}")
     print(f"  ESP GUID:  {esp_guid}")
+    if rootfs_guid is not None:
+        print(f"  rootfs GUID: {rootfs_guid}")
 
     # Create partition entries
     print(f"\n  Creating GPT partition entries...")
@@ -476,114 +571,137 @@ def create_efi_image(
     )
     entries[0:GPT_ENTRY_SIZE] = esp_entry
 
+    if rootfs_path is not None:
+        rootfs_entry = create_gpt_partition_entry(
+            type_guid=LINUX_FILESYSTEM_GUID,
+            partition_guid=rootfs_guid,
+            start_lba=rootfs_start_lba,
+            end_lba=rootfs_end_lba,
+            name="SaltyOS rootfs",
+        )
+        entries[GPT_ENTRY_SIZE:2 * GPT_ENTRY_SIZE] = rootfs_entry
+
     entries_bytes = bytes(entries)
     entries_crc = crc32_bytes(entries_bytes)
 
-    # Create disk image
     print(f"  Creating disk image...")
-    image = bytearray(total_sectors * SECTOR_SIZE)
-
-    # Write protective MBR (LBA 0)
-    print(f"  Writing protective MBR...")
-    mbr = create_protective_mbr(total_sectors)
-    image[0:SECTOR_SIZE] = mbr
-
-    # Write primary GPT header (LBA 1)
-    print(f"  Writing primary GPT header...")
-    gpt_header = create_gpt_header(disk_guid, total_sectors, entries_crc, is_backup=False)
-    image[GPT_HEADER_LBA * SECTOR_SIZE:(GPT_HEADER_LBA + 1) * SECTOR_SIZE] = gpt_header
-
-    # Write primary GPT entries (LBA 2-33)
-    print(f"  Writing primary GPT entries...")
-    entries_start = GPT_ENTRIES_START_LBA * SECTOR_SIZE
-    entries_end = entries_start + len(entries_bytes)
-    image[entries_start:entries_end] = entries_bytes
-
-    # Write backup GPT entries (before backup header)
     backup_entries_lba = total_sectors - GPT_ENTRIES_SECTORS - 1
-    print(f"  Writing backup GPT entries at LBA {backup_entries_lba}...")
-    backup_entries_start = backup_entries_lba * SECTOR_SIZE
-    backup_entries_end = backup_entries_start + len(entries_bytes)
-    image[backup_entries_start:backup_entries_end] = entries_bytes
-
-    # Write backup GPT header (last sector)
     backup_header_lba = total_sectors - 1
-    print(f"  Writing backup GPT header at LBA {backup_header_lba}...")
-    backup_gpt_header = create_gpt_header(disk_guid, total_sectors, entries_crc, is_backup=True)
-    image[backup_header_lba * SECTOR_SIZE:(backup_header_lba + 1) * SECTOR_SIZE] = backup_gpt_header
+    with open(output, 'wb') as out_f:
+        out_f.truncate(total_sectors * SECTOR_SIZE)
 
-    # Create ESP as a temporary file
-    esp_img = output.with_suffix('.esp')
+        # Write protective MBR (LBA 0)
+        print(f"  Writing protective MBR...")
+        mbr = create_protective_mbr(total_sectors)
+        out_f.seek(0)
+        out_f.write(mbr)
 
-    try:
-        # Create empty ESP file
-        esp_size_bytes = ESP_SIZE_SECTORS * SECTOR_SIZE
-        print(f"  Creating ESP (FAT32, {esp_size_bytes // 1024 // 1024}MB)...")
-        with open(esp_img, 'wb') as f:
-            f.truncate(esp_size_bytes)
+        # Write primary GPT header (LBA 1)
+        print(f"  Writing primary GPT header...")
+        gpt_header = create_gpt_header(disk_guid, total_sectors, entries_crc, is_backup=False)
+        out_f.seek(GPT_HEADER_LBA * SECTOR_SIZE)
+        out_f.write(gpt_header)
 
-        # Format ESP as FAT32 (need larger size for FAT32, use FAT16 for 32MB)
-        fat_type = '16' if esp_size_bytes < 64 * 1024 * 1024 else '32'
-        subprocess.run([
-            'mkfs.vfat',
-            '-F', fat_type,
-            '-n', 'ESP',
-            str(esp_img)
-        ], check=True)
+        # Write primary GPT entries (LBA 2-33)
+        print(f"  Writing primary GPT entries...")
+        out_f.seek(GPT_ENTRIES_START_LBA * SECTOR_SIZE)
+        out_f.write(entries_bytes)
 
-        # Create directory structure and copy files
-        print(f"  Copying EFI files to ESP...")
+        # Write backup GPT entries (before backup header)
+        print(f"  Writing backup GPT entries at LBA {backup_entries_lba}...")
+        out_f.seek(backup_entries_lba * SECTOR_SIZE)
+        out_f.write(entries_bytes)
 
-        subprocess.run(['mmd', '-i', str(esp_img), '::/EFI'], check=True)
-        subprocess.run(['mmd', '-i', str(esp_img), '::/EFI/BOOT'], check=True)
-        subprocess.run(['mmd', '-i', str(esp_img), '::/EFI/SALTYOS'], check=True)
+        # Write backup GPT header (last sector)
+        print(f"  Writing backup GPT header at LBA {backup_header_lba}...")
+        backup_gpt_header = create_gpt_header(disk_guid, total_sectors, entries_crc, is_backup=True)
+        out_f.seek(backup_header_lba * SECTOR_SIZE)
+        out_f.write(backup_gpt_header)
 
-        subprocess.run([
-            'mcopy', '-i', str(esp_img),
-            str(stage1_efi_path), '::/EFI/BOOT/BOOTX64.EFI'
-        ], check=True)
+        # Create ESP as a temporary file
+        esp_img = output.with_suffix('.esp')
 
-        subprocess.run([
-            'mcopy', '-i', str(esp_img),
-            str(stage2_efi_path), '::/EFI/SALTYOS/stage2.efi'
-        ], check=True)
+        try:
+            # Create empty ESP file
+            esp_size_bytes = ESP_SIZE_SECTORS * SECTOR_SIZE
+            print(f"  Creating ESP (FAT32, {esp_size_bytes // 1024 // 1024}MB)...")
+            with open(esp_img, 'wb') as f:
+                f.truncate(esp_size_bytes)
 
-        subprocess.run([
-            'mcopy', '-i', str(esp_img),
-            str(stage3_path), '::/EFI/SALTYOS/stage3.bin'
-        ], check=True)
-
-        subprocess.run([
-            'mcopy', '-i', str(esp_img),
-            str(kernel_path), '::/EFI/SALTYOS/kernel.elf'
-        ], check=True)
-
-        # Copy initrd if provided
-        if initrd_path and initrd_path.exists():
-            print(f"  Copying initrd to ESP...")
+            # Format ESP as FAT32 (need larger size for FAT32, use FAT16 for 32MB)
+            fat_type = '16' if esp_size_bytes < 64 * 1024 * 1024 else '32'
             subprocess.run([
-                'mcopy', '-i', str(esp_img),
-                str(initrd_path), '::/EFI/SALTYOS/initrd.img'
+                'mkfs.vfat',
+                '-F', fat_type,
+                '-n', 'ESP',
+                str(esp_img)
             ], check=True)
 
-        # Read ESP and write to disk image at ESP_START_LBA
-        print(f"  Writing ESP to disk image at LBA {ESP_START_LBA}...")
-        with open(esp_img, 'rb') as f:
-            esp_data = f.read()
+            # Create directory structure and copy files
+            print(f"  Copying EFI files to ESP...")
 
-        esp_offset = ESP_START_LBA * SECTOR_SIZE
-        image[esp_offset:esp_offset + len(esp_data)] = esp_data
+            subprocess.run(['mmd', '-i', str(esp_img), '::/EFI'], check=True)
+            subprocess.run(['mmd', '-i', str(esp_img), '::/EFI/BOOT'], check=True)
+            subprocess.run(['mmd', '-i', str(esp_img), '::/EFI/SALTYOS'], check=True)
 
-    finally:
-        if esp_img.exists():
-            esp_img.unlink()
+            subprocess.run([
+                'mcopy', '-i', str(esp_img),
+                str(stage1_efi_path), '::/EFI/BOOT/BOOTX64.EFI'
+            ], check=True)
 
-    # Write image to file
-    print(f"  Writing final image...")
-    with open(output, 'wb') as f:
-        f.write(bytes(image))
+            subprocess.run([
+                'mcopy', '-i', str(esp_img),
+                str(stage2_efi_path), '::/EFI/SALTYOS/stage2.efi'
+            ], check=True)
 
-    print(f"\n  Created {output} ({size_mb}MB)")
+            subprocess.run([
+                'mcopy', '-i', str(esp_img),
+                str(stage3_path), '::/EFI/SALTYOS/stage3.bin'
+            ], check=True)
+
+            subprocess.run([
+                'mcopy', '-i', str(esp_img),
+                str(kernel_path), '::/EFI/SALTYOS/kernel.elf'
+            ], check=True)
+
+            # Copy initrd if provided
+            if initrd_path and initrd_path.exists():
+                print(f"  Copying initrd to ESP...")
+                subprocess.run([
+                    'mcopy', '-i', str(esp_img),
+                    str(initrd_path), '::/EFI/SALTYOS/initrd.img'
+                ], check=True)
+
+            # Stream ESP to disk image at ESP_START_LBA
+            print(f"  Writing ESP to disk image at LBA {ESP_START_LBA}...")
+            out_f.seek(ESP_START_LBA * SECTOR_SIZE)
+            with open(esp_img, 'rb') as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out_f.write(chunk)
+
+        finally:
+            if esp_img.exists():
+                esp_img.unlink()
+
+        if rootfs_path is not None:
+            print(f"  Writing rootfs payload to disk image at LBA {rootfs_start_lba}...")
+            out_f.seek(rootfs_start_lba * SECTOR_SIZE)
+            with open(rootfs_path, 'rb') as rf:
+                while True:
+                    chunk = rf.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out_f.write(chunk)
+            rootfs_padded_size = rootfs_sector_count * SECTOR_SIZE
+            pad_bytes = rootfs_padded_size - rootfs_actual_size
+            if pad_bytes:
+                out_f.write(b'\x00' * pad_bytes)
+
+    actual_mb = (total_sectors * SECTOR_SIZE + (1024 * 1024 - 1)) // (1024 * 1024)
+    print(f"\n  Created {output} ({actual_mb}MB)")
     print(f"\nTo test with QEMU (UEFI):")
     print(f"  qemu-system-x86_64 -bios /usr/share/OVMF/OVMF_CODE.fd \\")
     print(f"    -drive file={output},format=raw -serial stdio")
@@ -596,7 +714,8 @@ def create_disk_image(
     stage3_path: Path,
     kernel_path: Path,
     initrd_path: Path = None,
-    size_mb: int = 8
+    size_mb: int = 8,
+    rootfs_path: Path = None,
 ) -> None:
     """Create a bootable disk image with Boot Manifest."""
 
@@ -651,6 +770,12 @@ def create_disk_image(
         print(f"    Size: {initrd_actual_size} bytes ({initrd_sectors} sectors)")
         print(f"    LBA:  {initrd_lba}")
 
+    # Rootfs partition payload (optional)
+    rootfs_actual_size = 0
+    rootfs_sector_count = 0
+    rootfs_start_lba = 0
+    rootfs_path = Path(rootfs_path) if rootfs_path is not None else None
+
     # Create Boot Manifest
     print(f"  Creating Boot Manifest...")
     manifest_data = create_boot_manifest(
@@ -664,36 +789,79 @@ def create_disk_image(
     manifest_data = pad_to_sectors(manifest_data, MANIFEST_SECTORS)
     print(f"    Manifest size: {len(manifest_data)} bytes")
 
-    # Calculate total image size
-    total_sectors = size_mb * 1024 * 1024 // SECTOR_SIZE
-
-    # Validate that all components fit within the disk image
+    # Validate that all boot components fit and compute end-of-boot extent.
     last_used_sector = KERNEL_LBA + kernel_sectors
     if initrd_data:
         last_used_sector = initrd_lba + len(initrd_data) // SECTOR_SIZE
-    if last_used_sector > total_sectors:
-        raise ValueError(
-            f"Disk image too small: need {last_used_sector} sectors, "
-            f"but image has {total_sectors} sectors "
-            f"({size_mb}MB). Increase --size.")
+    required_sectors = last_used_sector
 
-    # Create image
-    image = bytearray(total_sectors * SECTOR_SIZE)
+    if rootfs_path is not None:
+        print(f"  Rootfs: {rootfs_path}")
+        rootfs_actual_size = os.path.getsize(rootfs_path)
+        rootfs_sector_count = (rootfs_actual_size + SECTOR_SIZE - 1) // SECTOR_SIZE
+        rootfs_start_lba = align_up(last_used_sector, ROOTFS_ALIGN_SECTORS)
+        rootfs_end_lba = rootfs_start_lba + rootfs_sector_count - 1
+        required_sectors = rootfs_start_lba + rootfs_sector_count
+        print(
+            f"    Size: {rootfs_actual_size} bytes ({rootfs_sector_count} sectors)"
+        )
+        print(
+            f"    Partition: type=0x{MBR_PART_TYPE_LINUX_FS:02x} "
+            f"LBA {rootfs_start_lba}-{rootfs_end_lba}"
+        )
+        mbr_data = patch_mbr_linux_partition(
+            mbr_data=mbr_data,
+            start_lba=rootfs_start_lba,
+            sector_count=rootfs_sector_count,
+        )
 
-    # Write components
-    image[MBR_LBA * SECTOR_SIZE : MBR_LBA * SECTOR_SIZE + len(mbr_data)] = mbr_data
-    image[MANIFEST_LBA * SECTOR_SIZE : MANIFEST_LBA * SECTOR_SIZE + len(manifest_data)] = manifest_data
-    image[STAGE2_LBA * SECTOR_SIZE : STAGE2_LBA * SECTOR_SIZE + len(stage2_data)] = stage2_data
-    image[STAGE3_LBA * SECTOR_SIZE : STAGE3_LBA * SECTOR_SIZE + len(stage3_data)] = stage3_data
-    image[KERNEL_LBA * SECTOR_SIZE : KERNEL_LBA * SECTOR_SIZE + len(kernel_data)] = kernel_data
+    # Calculate total image size (user size is treated as a minimum).
+    requested_sectors = size_mb * 1024 * 1024 // SECTOR_SIZE
+    total_sectors = requested_sectors
+    if required_sectors > total_sectors:
+        total_sectors = align_up(required_sectors, ROOTFS_ALIGN_SECTORS)
+        grown_mb = (total_sectors * SECTOR_SIZE + (1024 * 1024 - 1)) // (1024 * 1024)
+        print(
+            f"  Expanding image from {size_mb}MB to {grown_mb}MB "
+            f"to fit embedded payloads"
+        )
 
-    # Write initrd after kernel
-    if initrd_data:
-        image[initrd_lba * SECTOR_SIZE : initrd_lba * SECTOR_SIZE + len(initrd_data)] = initrd_data
+    # Create sparse image and write components directly to avoid large RAM usage.
+    with open(output, 'wb') as f:
+        f.truncate(total_sectors * SECTOR_SIZE)
 
-    # Write image to file
-    write_file(output, bytes(image))
-    print(f"\n  Created {output} ({size_mb}MB)")
+        # Write boot components
+        f.seek(MBR_LBA * SECTOR_SIZE)
+        f.write(mbr_data)
+        f.seek(MANIFEST_LBA * SECTOR_SIZE)
+        f.write(manifest_data)
+        f.seek(STAGE2_LBA * SECTOR_SIZE)
+        f.write(stage2_data)
+        f.seek(STAGE3_LBA * SECTOR_SIZE)
+        f.write(stage3_data)
+        f.seek(KERNEL_LBA * SECTOR_SIZE)
+        f.write(kernel_data)
+
+        if initrd_data:
+            f.seek(initrd_lba * SECTOR_SIZE)
+            f.write(initrd_data)
+
+        # Stream-copy rootfs payload into the rootfs partition region.
+        if rootfs_path is not None:
+            f.seek(rootfs_start_lba * SECTOR_SIZE)
+            with open(rootfs_path, 'rb') as rf:
+                while True:
+                    chunk = rf.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            rootfs_padded_size = rootfs_sector_count * SECTOR_SIZE
+            pad_bytes = rootfs_padded_size - rootfs_actual_size
+            if pad_bytes:
+                f.write(b'\x00' * pad_bytes)
+
+    actual_mb = (total_sectors * SECTOR_SIZE + (1024 * 1024 - 1)) // (1024 * 1024)
+    print(f"\n  Created {output} ({actual_mb}MB)")
     print(f"\nTo test with QEMU:")
     print(f"  qemu-system-x86_64 -drive format=raw,file={output} -serial stdio -nographic")
 
@@ -743,6 +911,12 @@ def main():
         default=None,
         help='Path to initrd CPIO archive (optional)'
     )
+    parser.add_argument(
+        '--rootfs',
+        type=Path,
+        default=None,
+        help='Embed raw rootfs image as a Linux filesystem partition'
+    )
 
     args = parser.parse_args()
 
@@ -759,6 +933,9 @@ def main():
             if not path.exists():
                 print(f"Error: {name} not found: {path}", file=sys.stderr)
                 sys.exit(1)
+        if args.rootfs is not None and not args.rootfs.exists():
+            print(f"Error: Rootfs image not found: {args.rootfs}", file=sys.stderr)
+            sys.exit(1)
 
         create_efi_image(
             output=args.output,
@@ -768,7 +945,8 @@ def main():
             stage3_path=stage3,
             kernel_path=kernel,
             initrd_path=args.initrd,
-            size_mb=args.size
+            size_mb=args.size,
+            rootfs_path=args.rootfs,
         )
     else:
         # BIOS mode (original)
@@ -783,6 +961,9 @@ def main():
             if not path.exists():
                 print(f"Error: {name} not found: {path}", file=sys.stderr)
                 sys.exit(1)
+        if args.rootfs is not None and not args.rootfs.exists():
+            print(f"Error: Rootfs image not found: {args.rootfs}", file=sys.stderr)
+            sys.exit(1)
 
         create_disk_image(
             output=args.output,
@@ -791,7 +972,8 @@ def main():
             stage3_path=stage3,
             kernel_path=kernel,
             initrd_path=args.initrd,
-            size_mb=args.size
+            size_mb=args.size,
+            rootfs_path=args.rootfs,
         )
 
 
