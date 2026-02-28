@@ -1,4 +1,4 @@
-//! SaltyOS SaltyFS Server (Read-Only MVP)
+//! SaltyOS SaltyFS Server
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
 //! Mounts a SaltyFS partition from blkdrv and serves file read/directory
@@ -145,6 +145,7 @@ fn server_loop() -> ! {
             SALTYFS_SYMLINK => handlers::handle_symlink(&msg),
             SALTYFS_READLINK => handlers::handle_readlink(&msg),
             SALTYFS_LINK => handlers::handle_link(&msg),
+            SALTYFS_GETPARENT => handlers::handle_getparent(&msg),
             _ => {
                 let mut r = BesaltMsg::zeroed();
                 r.label = BESALT_INVALID_OPERATION;

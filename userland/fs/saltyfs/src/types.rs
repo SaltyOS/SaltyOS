@@ -109,7 +109,7 @@ pub(crate) struct BTreePointer {
 /// Inode item (docs/design/saltyfs.md:162-183)
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub(crate) struct SaltyInode {
+pub(crate) struct BesaltInode {
     pub(crate) generation: u64,
     pub(crate) size: u64,
     pub(crate) blocks: u64,

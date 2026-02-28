@@ -8,7 +8,7 @@ use besalt::types::*;
 use crate::client::{extract_path, get_client};
 use crate::consts::*;
 use crate::fileops::normalize_path_for_client;
-use crate::mount::mount_truncate;
+use crate::mount::{mount_stat, mount_truncate, try_root_underlay};
 use crate::path::{resolve_parent, resolve_path};
 use crate::pipe::dup_fd_entry;
 use crate::poll::wake_poll_waiters;
@@ -711,12 +711,27 @@ pub(crate) unsafe fn handle_chdir(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
         // Validate that path exists and is a directory
         let inode = resolve_path(path_ptr, path_len);
         if inode.is_null() {
-            (*reply).label = BESALT_NOT_FOUND;
-            return;
-        }
-        if (*inode).ftype != FTYPE_DIRECTORY && (*inode).ftype != FTYPE_MOUNT_POINT {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
-            return;
+            // Root underlay fallback: validate path exists on disk and is a directory
+            if let Some((mi, rino)) = try_root_underlay(path_ptr, path_len) {
+                if let Some((_, _, _, _, is_dir)) = mount_stat(mi, rino) {
+                    if !is_dir {
+                        (*reply).label = BESALT_INVALID_ARGUMENT;
+                        return;
+                    }
+                } else {
+                    (*reply).label = BESALT_NOT_FOUND;
+                    return;
+                }
+            } else {
+                (*reply).label = BESALT_NOT_FOUND;
+                return;
+            }
+            // Path exists on underlay and is a directory — store cwd string below
+        } else {
+            if (*inode).ftype != FTYPE_DIRECTORY && (*inode).ftype != FTYPE_MOUNT_POINT {
+                (*reply).label = BESALT_INVALID_ARGUMENT;
+                return;
+            }
         }
 
         let cli = get_client(badge);

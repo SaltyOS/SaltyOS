@@ -1,10 +1,39 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Path resolution with symlink following and mount point detection.
 
+use besalt::consts::*;
+use besalt::types::*;
+
 use crate::client::get_client;
 use crate::consts::*;
+use crate::fileops::normalize_path_for_client;
 use crate::ramfs::{dir_find_entry, inode_by_ino};
 use crate::types::*;
+
+/// Check if a dirfd refers to a mount FD. Returns (mount_idx, dir_remote_ino) if so.
+pub(crate) unsafe fn resolve_at_mount(badge: u64, dirfd: i32) -> Option<(usize, u64)> {
+    unsafe {
+        if dirfd < 0 || dirfd == AT_FDCWD_VAL {
+            return None;
+        }
+        let cli = get_client(badge);
+        if cli.is_null() {
+            return None;
+        }
+        if dirfd >= (*cli).fds_cap as i32 {
+            return None;
+        }
+        let fde = &*(*cli).fds.add(dirfd as usize);
+        if fde.active == 0 {
+            return None;
+        }
+        if fde.fd_type == FD_TYPE_MOUNT {
+            Some((fde.dev_type as usize, fde.sock_id as u64))
+        } else {
+            None
+        }
+    }
+}
 
 /// Read the symlink target from an inode.
 /// For writable symlinks, target is in rw_data (symlink pool).
@@ -266,19 +295,46 @@ pub(crate) unsafe fn resolve_parent(
 /// Resolve a path starting from a given inode (for *at() semantics).
 /// Absolute paths always start from ROOT_INO regardless of start_ino.
 /// Empty path returns the start inode itself (for AT_EMPTY_PATH).
+/// Follows intermediate and final symlinks.
 pub(crate) unsafe fn resolve_path_from(
     start_ino: u32,
     path: *const u8,
     path_len: u8,
 ) -> *mut RamfsInode {
+    unsafe { resolve_path_from_inner(start_ino, path, path_len, true, 0) }
+}
+
+/// Like `resolve_path_from` but does not follow the final symlink component.
+pub(crate) unsafe fn resolve_path_from_nofollow(
+    start_ino: u32,
+    path: *const u8,
+    path_len: u8,
+) -> *mut RamfsInode {
+    unsafe { resolve_path_from_inner(start_ino, path, path_len, false, 0) }
+}
+
+/// Inner implementation of *at()-style path resolution with symlink support.
+/// `follow_final`: if true, follow symlink on the last component.
+/// `depth`: recursion depth for cycle detection (max 8).
+unsafe fn resolve_path_from_inner(
+    start_ino: u32,
+    path: *const u8,
+    path_len: u8,
+    follow_final: bool,
+    depth: u8,
+) -> *mut RamfsInode {
     unsafe {
+        if depth > 8 {
+            return core::ptr::null_mut();
+        }
+
         if path_len == 0 {
             return inode_by_ino(start_ino);
         }
 
         // Absolute path always from root
         if *path == b'/' {
-            return resolve_path(path, path_len);
+            return resolve_path_raw_inner(path, path_len, follow_final, depth);
         }
 
         // Relative path from start_ino
@@ -335,6 +391,68 @@ pub(crate) unsafe fn resolve_path_from(
             current = inode_by_ino((*de).ino);
             if current.is_null() {
                 return core::ptr::null_mut();
+            }
+
+            // Check if this component is a symlink
+            if (*current).ftype == FTYPE_SYMLINK {
+                let is_last = pos >= plen;
+                if is_last && !follow_final {
+                    return current;
+                }
+                let (target, target_len) = symlink_target(current);
+                if target.is_null() || target_len == 0 {
+                    return core::ptr::null_mut();
+                }
+                if pos >= plen {
+                    // Last component: resolve the symlink target.
+                    // Relative targets resolve from the symlink's parent directory.
+                    if *target == b'/' {
+                        return resolve_path_raw_inner(target, target_len, true, depth + 1);
+                    } else {
+                        return resolve_path_from_inner(
+                            (*inode_by_ino((*current).parent_ino)).ino,
+                            target,
+                            target_len,
+                            true,
+                            depth + 1,
+                        );
+                    }
+                }
+                // Intermediate component: concatenate target + remaining path
+                let remaining_len = plen - pos;
+                let total = target_len as usize + 1 + remaining_len;
+                if total > MAX_PATH_LEN {
+                    return core::ptr::null_mut();
+                }
+                let mut combined = [0u8; MAX_PATH_LEN];
+                for i in 0..target_len as usize {
+                    combined[i] = *target.add(i);
+                }
+                combined[target_len as usize] = b'/';
+                for i in 0..remaining_len {
+                    combined[target_len as usize + 1 + i] = *path.add(pos + i);
+                }
+                // Absolute symlink target: resolve from root
+                if *target == b'/' {
+                    return resolve_path_raw_inner(
+                        combined.as_ptr(),
+                        total as u8,
+                        follow_final,
+                        depth + 1,
+                    );
+                }
+                // Relative symlink target: resolve from symlink's parent
+                let parent = inode_by_ino((*current).parent_ino);
+                if parent.is_null() {
+                    return core::ptr::null_mut();
+                }
+                return resolve_path_from_inner(
+                    (*parent).ino,
+                    combined.as_ptr(),
+                    total as u8,
+                    follow_final,
+                    depth + 1,
+                );
             }
         }
 
@@ -424,7 +542,7 @@ pub(crate) unsafe fn resolve_at_start(
             }
             let inode = resolve_path((*cli).cwd.as_ptr(), cwd_len);
             if inode.is_null() {
-                return ROOT_INO;
+                return 0; // Signal to handler: cwd not in ramfs
             }
             return (*inode).ino;
         }
@@ -441,5 +559,68 @@ pub(crate) unsafe fn resolve_at_start(
             return 0;
         }
         (*(*cli).fds.add(dirfd as usize)).inode
+    }
+}
+
+/// Result of resolving a dirfd for an *at() operation.
+pub(crate) enum AtResolution {
+    /// dirfd refers to a ramfs inode (or absolute path -> ROOT_INO).
+    Ramfs { start_ino: u32 },
+    /// dirfd refers to a mount FD with the given mount index and remote dir inode.
+    MountFd { mount_idx: usize, dir_rino: u64 },
+    /// Resolution failed; reply error code has been set.
+    Error,
+}
+
+/// Common helper encapsulating the repeated dirfd resolution pattern
+/// used by all *at() handlers. On success returns either a Ramfs start_ino
+/// or a MountFd pair. On AT_FDCWD fallback, rewrites `path`/`path_len`
+/// to the normalized absolute path. On failure, sets reply error and returns
+/// Error.
+///
+/// # Safety
+/// `path` must point to a buffer of at least MAX_PATH_LEN bytes.
+/// `reply` must be a valid mutable pointer to a BesaltMsg.
+pub(crate) unsafe fn resolve_at_base(
+    badge: u64,
+    dirfd: i32,
+    path: *mut u8,
+    path_len: &mut u8,
+    reply: *mut BesaltMsg,
+) -> AtResolution {
+    unsafe {
+        let start_ino = resolve_at_start(badge, dirfd, path, *path_len);
+        if start_ino != 0 {
+            return AtResolution::Ramfs { start_ino };
+        }
+
+        // Check for mount FD
+        if let Some((mi, dir_rino)) = resolve_at_mount(badge, dirfd) {
+            return AtResolution::MountFd {
+                mount_idx: mi,
+                dir_rino,
+            };
+        }
+
+        // AT_FDCWD with underlay cwd: normalize to absolute, rewrite path in place
+        if dirfd == AT_FDCWD_VAL {
+            let mut norm_buf = [0u8; MAX_PATH_LEN];
+            if let Some((abs_ptr, abs_len)) =
+                normalize_path_for_client(badge, path, *path_len, norm_buf.as_mut_ptr())
+            {
+                for i in 0..abs_len as usize {
+                    *path.add(i) = *abs_ptr.add(i);
+                }
+                *path_len = abs_len;
+                return AtResolution::Ramfs {
+                    start_ino: ROOT_INO,
+                };
+            }
+            (*reply).label = BESALT_NOT_FOUND;
+            return AtResolution::Error;
+        }
+
+        (*reply).label = BESALT_INVALID_ARGUMENT;
+        AtResolution::Error
     }
 }

@@ -10,6 +10,7 @@
 extern crate besalt;
 
 mod at_ops;
+mod bulk;
 mod client;
 mod consts;
 mod fileops;
@@ -90,7 +91,7 @@ pub(crate) static mut PTY_PENDING_COUNT: [usize; MAX_PTYS] = [0; MAX_PTYS];
 pub(crate) static mut NEXT_REPLY_SLOT: u64 = CAP_REPLY_BASE;
 
 pub(crate) static mut MOUNTS: [MountEntry; MAX_MOUNTS] = [MountEntry::zeroed(); MAX_MOUNTS];
-pub(crate) static mut MOUNT_DATA_INO: u32 = 0;
+pub(crate) static mut ROOT_UNDERLAY_IDX: i32 = -1;
 pub(crate) static mut MOUNT_TRIED: u8 = 0;
 pub(crate) static mut VFS_SHM_ACTIVE: bool = false;
 
@@ -693,15 +694,6 @@ unsafe fn init_ramfs() {
         (*mnt_dir).parent_ino = (*root).ino;
         ramfs::dir_add_entry(root, b"mnt".as_ptr(), 3, (*mnt_dir).ino);
 
-        let mnt_data = ramfs::alloc_inode();
-        (*mnt_data).ftype = FTYPE_MOUNT_POINT;
-        (*mnt_data).mode = S_IFDIR_L | 0o555;
-        (*mnt_data).readonly = 1;
-        (*mnt_data).nlink = 2;
-        (*mnt_data).parent_ino = (*mnt_dir).ino;
-        ramfs::dir_add_entry(mnt_dir, b"data".as_ptr(), 4, (*mnt_data).ino);
-        MOUNT_DATA_INO = (*mnt_data).ino;
-
         let initrd_dir = ramfs::alloc_inode();
         (*initrd_dir).ftype = FTYPE_DIRECTORY;
         (*initrd_dir).mode = S_IFDIR_L | 0o555;
@@ -844,12 +836,14 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    signal_ready();
-
-    // Register callback EP with netsrv for AF_INET async operations
+    // Eagerly establish the root underlay mount (saltyfs/rootfs) during startup.
+    // Doing this outside request handling avoids nested nameserv+cap-transfer mount setup
+    // on the first /bin/* open path (e.g., procmgr VFS fallback loads).
     unsafe {
-        inet::inet_init();
+        mount::setup_saltyfs_mount();
     }
+
+    signal_ready();
 
     let mut msg = BesaltMsg::zeroed();
     let mut badge: u64 = 0;
@@ -1396,6 +1390,12 @@ pub extern "C" fn _start() -> ! {
                     }
                     VFS_PWRITE => {
                         fileops::handle_pwrite(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_BULK_SETUP => {
+                        bulk::handle_bulk_setup(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_BULK_READ => {
+                        bulk::handle_bulk_read(&raw const msg, &raw mut reply, badge);
                     }
                     _ => {
                         reply.label = BESALT_INVALID_OPERATION;

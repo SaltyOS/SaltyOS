@@ -48,6 +48,8 @@ impl PendingInetOp {
 
 static mut PENDING_INET: [PendingInetOp; MAX_PENDING_INET] =
     [PendingInetOp::zeroed(); MAX_PENDING_INET];
+static mut INET_CALLBACK_EP_MINTED: bool = false;
+static mut INET_CALLBACK_EP_REGISTERED: bool = false;
 
 unsafe fn alloc_pending(
     conn_id: u32,
@@ -92,25 +94,33 @@ unsafe fn find_pending(conn_id: u32, op_type: u8) -> Option<(u64, u64)> {
 // Initialization
 // ======================================================================
 
-/// Create badged EP and register with netsrv.
+/// Ensure VFS has registered its callback EP with netsrv.
 ///
-/// Called from VFS _start() before the event loop.
-pub(crate) unsafe fn inet_init() {
-    // SAFETY: Minting a badged copy of our server EP for netsrv callbacks.
+/// This is intentionally lazy so VFS startup does not block on netsrv/network
+/// availability (e.g. `--no-net` runs).
+unsafe fn ensure_inet_callback_registered() -> bool {
+    // SAFETY: Single-threaded VFS server initialization/dispatch.
     unsafe {
-        let err = invoke::cnode_mint(
-            CAP_SELF_CSPACE,
-            CAP_SERVER_EP,
-            CAP_SELF_CSPACE,
-            VFS_CAP_NETSRV_CALLBACK_EP,
-            NETSRV_CALLBACK_BADGE,
-        );
-        if err != 0 {
-            crate::puts(b"[VFS] inet: failed to mint callback EP\n");
-            return;
+        if *(&raw const INET_CALLBACK_EP_REGISTERED) {
+            return true;
         }
 
-        // Call netsrv with NET_REGISTER_VFS, transferring the badged EP
+        if !*(&raw const INET_CALLBACK_EP_MINTED) {
+            let err = invoke::cnode_mint(
+                CAP_SELF_CSPACE,
+                CAP_SERVER_EP,
+                CAP_SELF_CSPACE,
+                VFS_CAP_NETSRV_CALLBACK_EP,
+                NETSRV_CALLBACK_BADGE,
+            );
+            if err != 0 {
+                crate::puts(b"[VFS] inet: failed to mint callback EP\n");
+                return false;
+            }
+            *(&raw mut INET_CALLBACK_EP_MINTED) = true;
+        }
+
+        // Call netsrv with NET_REGISTER_VFS, transferring the badged EP.
         ipc::set_send_cap_ctx(ipc_ctx(), 0, VFS_CAP_NETSRV_CALLBACK_EP);
 
         let mut msg = BesaltMsg::zeroed();
@@ -120,9 +130,11 @@ pub(crate) unsafe fn inet_init() {
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const msg, &raw mut resp);
         if err != 0 || resp.label != BESALT_OK {
             crate::puts(b"[VFS] inet: failed to register with netsrv\n");
-        } else {
-            crate::puts(b"[VFS] inet: registered callback EP with netsrv\n");
+            return false;
         }
+
+        *(&raw mut INET_CALLBACK_EP_REGISTERED) = true;
+        true
     }
 }
 
@@ -139,6 +151,11 @@ pub(crate) unsafe fn handle_inet_socket(
 ) -> bool {
     // SAFETY: IPC context is valid; making synchronous RPC to netsrv.
     unsafe {
+        if !ensure_inet_callback_registered() {
+            (*reply).label = BESALT_INVALID_OPERATION;
+            return false;
+        }
+
         let mut req = BesaltMsg::zeroed();
         req.label = NET_SOCKET;
         req.regs[0] = sock_type as u64;
@@ -203,6 +220,11 @@ pub(crate) unsafe fn handle_inet_connect(
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
+        if !ensure_inet_callback_registered() {
+            (*reply).label = BESALT_INVALID_OPERATION;
+            return false;
+        }
+
         let fd = (*msg).regs[0] as i32;
         let ip = (*msg).regs[1] as u32;
         let port = (*msg).regs[2] as u16;
@@ -274,6 +296,11 @@ pub(crate) unsafe fn handle_inet_bind(
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
+        if !ensure_inet_callback_registered() {
+            (*reply).label = BESALT_INVALID_OPERATION;
+            return false;
+        }
+
         let fd = (*msg).regs[0] as i32;
         let ip = (*msg).regs[2] as u32;
         let port = (*msg).regs[3] as u16;
@@ -319,6 +346,11 @@ pub(crate) unsafe fn handle_inet_listen(
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
+        if !ensure_inet_callback_registered() {
+            (*reply).label = BESALT_INVALID_OPERATION;
+            return false;
+        }
+
         let fd = (*msg).regs[0] as i32;
         let backlog = (*msg).regs[1] as u8;
 
@@ -362,6 +394,11 @@ pub(crate) unsafe fn handle_inet_accept(
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
+        if !ensure_inet_callback_registered() {
+            (*reply).label = BESALT_INVALID_OPERATION;
+            return false;
+        }
+
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
         if cli.is_null()
@@ -446,6 +483,11 @@ pub(crate) unsafe fn handle_inet_write(
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
+        if !ensure_inet_callback_registered() {
+            (*reply).label = BESALT_INVALID_OPERATION;
+            return false;
+        }
+
         let conn_id = (*fde).sock_id;
         let count = (*msg).regs[1] as usize;
         let actual = if count > 144 { 144 } else { count };
@@ -486,6 +528,11 @@ pub(crate) unsafe fn handle_inet_read(
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
+        if !ensure_inet_callback_registered() {
+            (*reply).label = BESALT_INVALID_OPERATION;
+            return false;
+        }
+
         let conn_id = (*fde).sock_id;
         let max_len = (*msg).regs[1] as u16;
         let capped = if max_len > 152 { 152 } else { max_len };
@@ -553,6 +600,11 @@ pub(crate) unsafe fn handle_inet_sendto(
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
+        if !ensure_inet_callback_registered() {
+            (*reply).label = BESALT_INVALID_OPERATION;
+            return false;
+        }
+
         let fd = (*msg).regs[0] as i32;
         let data_len = (*msg).regs[1] as usize;
         let dst_ip = (*msg).regs[3] as u32;
@@ -609,6 +661,11 @@ pub(crate) unsafe fn handle_inet_recvfrom(
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
+        if !ensure_inet_callback_registered() {
+            (*reply).label = BESALT_INVALID_OPERATION;
+            return false;
+        }
+
         let fd = (*msg).regs[0] as i32;
         let max_len = (*msg).regs[1] as u16;
 
@@ -689,6 +746,11 @@ pub(crate) unsafe fn handle_inet_shutdown(
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
+        if !ensure_inet_callback_registered() {
+            (*reply).label = BESALT_INVALID_OPERATION;
+            return false;
+        }
+
         let fd = (*msg).regs[0] as i32;
         let how = (*msg).regs[1] as i32;
 

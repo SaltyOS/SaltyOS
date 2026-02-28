@@ -11,8 +11,8 @@ use crate::client::{
 use crate::consts::*;
 use crate::ipc_ctx;
 use crate::mount::{
-    find_mount_for_path, mount_create, mount_lookup, mount_mkdir, mount_rename, mount_rmdir,
-    mount_stat, mount_truncate, mount_unlink, parse_mount_path, split_mount_sub_path,
+    fill_mount_stat_reply, mount_create, mount_lookup, mount_mkdir, mount_rename, mount_rmdir,
+    mount_stat, mount_truncate, mount_unlink, split_mount_sub_path, try_root_underlay,
 };
 use crate::path::{resolve_parent, resolve_path};
 use crate::pipe::{alloc_pipe, find_pipe};
@@ -161,6 +161,62 @@ pub(crate) unsafe fn normalize_path_for_client(
     }
 }
 
+/// Open a remote mount inode: stat, handle O_TRUNC, allocate fd.
+/// Sets reply on return (BESALT_OK + fd, or an error code).
+pub(crate) unsafe fn open_mount_inode(
+    mount_idx: usize,
+    remote_ino: u64,
+    flags: u32,
+    reply: *mut BesaltMsg,
+    badge: u64,
+) {
+    unsafe {
+        let stat = mount_stat(mount_idx, remote_ino);
+        let (_size, _mode, _nlink, _mtime, is_dir) = match stat {
+            Some(s) => s,
+            None => {
+                (*reply).label = BESALT_NOT_FOUND;
+                return;
+            }
+        };
+
+        if !is_dir && (flags & O_TRUNC) != 0 && flags_allow_write(flags) {
+            let mut trunc_reply = BesaltMsg::zeroed();
+            mount_truncate(mount_idx, remote_ino, 0, &raw mut trunc_reply);
+            if trunc_reply.label != BESALT_OK {
+                (*reply).label = trunc_reply.label;
+                return;
+            }
+        }
+
+        let cli = get_client(badge);
+        if cli.is_null() {
+            (*reply).label = BESALT_OUT_OF_MEMORY;
+            return;
+        }
+        for fd in 0..(*cli).fds_cap as usize {
+            if (*(*cli).fds.add(fd)).active == 0 {
+                (*(*cli).fds.add(fd)).active = 1;
+                (*(*cli).fds.add(fd)).fd_type = FD_TYPE_MOUNT;
+                (*(*cli).fds.add(fd)).inode = 0;
+                (*(*cli).fds.add(fd)).offset = 0;
+                (*(*cli).fds.add(fd)).dir_cursor = 0;
+                (*(*cli).fds.add(fd)).sock_id = remote_ino as u32;
+                (*(*cli).fds.add(fd)).dev_type = mount_idx as u8;
+                (*(*cli).fds.add(fd)).flags = flags;
+                (*(*cli).fds.add(fd)).mount_batch_count = 0;
+                (*(*cli).fds.add(fd)).mount_batch_index = 0;
+                (*(*cli).fds.add(fd)).mount_batch_next_cursor = 0;
+                (*reply).label = BESALT_OK;
+                (*reply).length = 1;
+                (*reply).regs[0] = fd as u64;
+                return;
+            }
+        }
+        (*reply).label = BESALT_OUT_OF_MEMORY;
+    }
+}
+
 pub(crate) unsafe fn handle_open(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
@@ -180,7 +236,6 @@ pub(crate) unsafe fn handle_open(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
             (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         };
-        let path_slice = core::slice::from_raw_parts(path_ptr, path_len as usize);
 
         // /proc virtual paths — intercept before resolve
         if path_len >= 6
@@ -196,121 +251,19 @@ pub(crate) unsafe fn handle_open(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
             }
         }
 
-        // Mount point intercept: paths under /mnt/data/
-        if let Some(mount_idx) = find_mount_for_path(path_slice, path_len) {
-            let (_, sub_start, sub_len) = parse_mount_path(path_slice, path_len);
-            if sub_len > 0 {
-                // File within mount — lookup and open
-                let mut remote_ino = mount_lookup(mount_idx, path_ptr.add(sub_start), sub_len);
-                if remote_ino == 0 {
-                    if (flags & O_CREAT) == 0 {
-                        (*reply).label = BESALT_NOT_FOUND;
-                        return;
-                    }
-                    // O_CREAT: create the file via mount FS server
-                    let (p_start, p_len, l_start, l_len) =
-                        split_mount_sub_path(path_ptr.add(sub_start), sub_len);
-                    let parent_ino = if p_len == 0 {
-                        (*(&raw const crate::MOUNTS[mount_idx])).root_ino as u64
-                    } else {
-                        mount_lookup(mount_idx, path_ptr.add(sub_start + p_start), p_len)
-                    };
-                    if parent_ino == 0 {
-                        (*reply).label = BESALT_NOT_FOUND;
-                        return;
-                    }
-                    remote_ino = mount_create(
-                        mount_idx, parent_ino,
-                        path_ptr.add(sub_start + l_start), l_len, mode & 0o777,
-                    );
-                    if remote_ino == 0 {
-                        (*reply).label = BESALT_INVALID_OPERATION;
-                        return;
-                    }
-                }
+        let mut inode = resolve_path(path_ptr, path_len);
 
-                // Stat the remote inode for metadata
-                let stat = mount_stat(mount_idx, remote_ino);
-                let (_size, _mode, _nlink, _mtime, is_dir) = match stat {
-                    Some(s) => s,
-                    None => {
-                        (*reply).label = BESALT_NOT_FOUND;
-                        return;
-                    }
-                };
-
-                if is_dir {
-                    // Directory open: use handle_opendir-style logic
-                    let cli = get_client(badge);
-                    if cli.is_null() {
-                        (*reply).label = BESALT_OUT_OF_MEMORY;
-                        return;
-                    }
-                    for fd in 0..(*cli).fds_cap as usize {
-                        if (*(*cli).fds.add(fd)).active == 0 {
-                            (*(*cli).fds.add(fd)).active = 1;
-                            (*(*cli).fds.add(fd)).fd_type = FD_TYPE_MOUNT;
-                            (*(*cli).fds.add(fd)).inode = crate::MOUNT_DATA_INO;
-                            (*(*cli).fds.add(fd)).offset = 0;
-                            (*(*cli).fds.add(fd)).dir_cursor = 0;
-                            (*(*cli).fds.add(fd)).sock_id = remote_ino as u32;
-                            (*(*cli).fds.add(fd)).dev_type = mount_idx as u8;
-                            (*(*cli).fds.add(fd)).flags = flags;
-                            (*(*cli).fds.add(fd)).mount_batch_count = 0;
-                            (*(*cli).fds.add(fd)).mount_batch_index = 0;
-                            (*(*cli).fds.add(fd)).mount_batch_next_cursor = 0;
-                            (*reply).label = BESALT_OK;
-                            (*reply).length = 1;
-                            (*reply).regs[0] = fd as u64;
-                            return;
-                        }
-                    }
-                    (*reply).label = BESALT_OUT_OF_MEMORY;
+        // Root underlay fallback: try disk if ramfs miss
+        if inode.is_null() {
+            if let Some((mi, rino)) = try_root_underlay(path_ptr, path_len) {
+                if (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL) {
+                    (*reply).label = BESALT_ALREADY_EXISTS;
                     return;
                 }
-
-                // Regular file: allow both read and write
-                // Handle O_TRUNC
-                if (flags & O_TRUNC) != 0 && flags_allow_write(flags) {
-                    let mut trunc_reply = BesaltMsg::zeroed();
-                    mount_truncate(mount_idx, remote_ino, 0, &raw mut trunc_reply);
-                    if trunc_reply.label != BESALT_OK {
-                        (*reply).label = trunc_reply.label;
-                        return;
-                    }
-                }
-
-                let cli = get_client(badge);
-                if cli.is_null() {
-                    (*reply).label = BESALT_OUT_OF_MEMORY;
-                    return;
-                }
-                for fd in 0..(*cli).fds_cap as usize {
-                    if (*(*cli).fds.add(fd)).active == 0 {
-                        (*(*cli).fds.add(fd)).active = 1;
-                        (*(*cli).fds.add(fd)).fd_type = FD_TYPE_MOUNT;
-                        (*(*cli).fds.add(fd)).inode = crate::MOUNT_DATA_INO;
-                        (*(*cli).fds.add(fd)).offset = 0;
-                        (*(*cli).fds.add(fd)).dir_cursor = 0;
-                        (*(*cli).fds.add(fd)).sock_id = remote_ino as u32;
-                        (*(*cli).fds.add(fd)).dev_type = mount_idx as u8;
-                        (*(*cli).fds.add(fd)).flags = flags;
-                        (*(*cli).fds.add(fd)).mount_batch_count = 0;
-                        (*(*cli).fds.add(fd)).mount_batch_index = 0;
-                        (*(*cli).fds.add(fd)).mount_batch_next_cursor = 0;
-                        (*reply).label = BESALT_OK;
-                        (*reply).length = 1;
-                        (*reply).regs[0] = fd as u64;
-                        return;
-                    }
-                }
-                (*reply).label = BESALT_OUT_OF_MEMORY;
+                open_mount_inode(mi, rino, flags, reply, badge);
                 return;
             }
-            // Exact "/mnt/data" — falls through to resolve_path (it's a local dir)
         }
-
-        let mut inode = resolve_path(path_ptr, path_len);
 
         if inode.is_null() {
             if (flags & O_CREAT) == 0 {
@@ -337,6 +290,40 @@ pub(crate) unsafe fn handle_open(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
             }
 
             if inode.is_null() {
+                // Ramfs create failed (parent not in ramfs) — try underlay
+                let idx = *(&raw const crate::ROOT_UNDERLAY_IDX);
+                if idx >= 0 {
+                    let mi = idx as usize;
+                    let plen = path_len as usize;
+                    let mut off: usize = 0;
+                    while off < plen && *path_ptr.add(off) == b'/' {
+                        off += 1;
+                    }
+                    if off < plen {
+                        let sub_ptr = path_ptr.add(off);
+                        let sub_len = (plen - off) as u8;
+                        let (p_start, p_len, l_start, l_len) =
+                            split_mount_sub_path(sub_ptr, sub_len);
+                        let parent_ino = if p_len == 0 {
+                            (*(&raw const crate::MOUNTS[mi])).root_ino as u64
+                        } else {
+                            mount_lookup(mi, sub_ptr.add(p_start), p_len)
+                        };
+                        if parent_ino != 0 && l_len > 0 {
+                            let new_ino = mount_create(
+                                mi,
+                                parent_ino,
+                                sub_ptr.add(l_start),
+                                l_len,
+                                mode,
+                            );
+                            if new_ino != 0 {
+                                open_mount_inode(mi, new_ino, flags, reply, badge);
+                                return;
+                            }
+                        }
+                    }
+                }
                 (*reply).label = BESALT_NOT_FOUND;
                 return;
             }
@@ -1125,42 +1112,6 @@ pub(crate) unsafe fn handle_stat(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
             (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         };
-        let path_slice = core::slice::from_raw_parts(path_ptr, path_len as usize);
-
-        // Mount point intercept for stat
-        if let Some(mount_idx) = find_mount_for_path(path_slice, path_len) {
-            let (_, sub_start, sub_len) = parse_mount_path(path_slice, path_len);
-            if sub_len > 0 {
-                let remote_ino = mount_lookup(mount_idx, path_ptr.add(sub_start), sub_len);
-                if remote_ino == 0 {
-                    (*reply).label = BESALT_NOT_FOUND;
-                    return;
-                }
-                match mount_stat(mount_idx, remote_ino) {
-                    Some((size, mode, nlink, mtime, _)) => {
-                        (*reply).label = BESALT_OK;
-                        (*reply).length = 8;
-                        (*reply).regs[0] = remote_ino;
-                        (*reply).regs[1] = mode as u64;
-                        (*reply).regs[2] = nlink as u64;
-                        (*reply).regs[3] = size;
-                        (*reply).regs[4] = 0; // uid
-                        (*reply).regs[5] = 0; // gid
-                        (*reply).regs[6] = mtime;
-                        (*reply).regs[7] = if (mode & S_IFMT_L) == S_IFDIR_L {
-                            FTYPE_DIRECTORY as u64
-                        } else {
-                            FTYPE_REGULAR as u64
-                        };
-                    }
-                    None => {
-                        (*reply).label = BESALT_NOT_FOUND;
-                    }
-                }
-                return;
-            }
-            // Exact mount point — fall through to local resolve
-        }
 
         let inode = resolve_path(path_ptr, path_len);
         if inode.is_null() {
@@ -1174,6 +1125,13 @@ pub(crate) unsafe fn handle_stat(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
                 && *path_ptr.add(5) == b'/'
             {
                 if handle_proc_stat(path_ptr, path_len, reply, badge) {
+                    return;
+                }
+            }
+            // Root underlay fallback
+            if let Some((mi, rino)) = try_root_underlay(path_ptr, path_len) {
+                if let Some((size, mode, nlink, mtime, _)) = mount_stat(mi, rino) {
+                    fill_mount_stat_reply(reply, rino, size, mode, nlink, mtime);
                     return;
                 }
             }
@@ -1215,6 +1173,11 @@ pub(crate) unsafe fn handle_access(msg: *const BesaltMsg, reply: *mut BesaltMsg,
                     return;
                 }
             }
+            // Root underlay fallback
+            if try_root_underlay(path_ptr, path_len).is_some() {
+                (*reply).label = BESALT_OK;
+                return;
+            }
             (*reply).label = BESALT_NOT_FOUND;
             return;
         }
@@ -1238,37 +1201,33 @@ pub(crate) unsafe fn handle_unlink(msg: *const BesaltMsg, reply: *mut BesaltMsg,
             return;
         };
 
-        // Mount intercept
-        let path_slice = core::slice::from_raw_parts(path_ptr, path_len as usize);
-        if let Some(mount_idx) = find_mount_for_path(path_slice, path_len) {
-            let (_, sub_start, sub_len) = parse_mount_path(path_slice, path_len);
-            if sub_len > 0 {
-                let (p_start, p_len, l_start, l_len) =
-                    split_mount_sub_path(path_ptr.add(sub_start), sub_len);
-                let parent_ino = if p_len == 0 {
-                    (*(&raw const crate::MOUNTS[mount_idx])).root_ino as u64
-                } else {
-                    mount_lookup(mount_idx, path_ptr.add(sub_start + p_start), p_len)
-                };
-                if parent_ino == 0 {
-                    (*reply).label = BESALT_NOT_FOUND;
-                    return;
-                }
-                mount_unlink(
-                    mount_idx,
-                    parent_ino,
-                    path_ptr.add(sub_start + l_start),
-                    l_len,
-                    reply,
-                );
-                return;
-            }
-        }
-
         let mut child_name: *const u8 = core::ptr::null();
         let mut child_len: u8 = 0;
         let parent = resolve_parent(path_ptr, path_len, &mut child_name, &mut child_len);
         if parent.is_null() || (*parent).readonly != 0 {
+            // Root underlay fallback for unlink
+            let idx = *(&raw const crate::ROOT_UNDERLAY_IDX);
+            if idx >= 0 {
+                let mi = idx as usize;
+                let mut off: usize = 0;
+                let plen = path_len as usize;
+                while off < plen && *path_ptr.add(off) == b'/' { off += 1; }
+                if off < plen {
+                    let sub_ptr = path_ptr.add(off);
+                    let sub_len = (plen - off) as u8;
+                    let (p_start, p_len, l_start, l_len) =
+                        split_mount_sub_path(sub_ptr, sub_len);
+                    let parent_ino = if p_len == 0 {
+                        (*(&raw const crate::MOUNTS[mi])).root_ino as u64
+                    } else {
+                        mount_lookup(mi, sub_ptr.add(p_start), p_len)
+                    };
+                    if parent_ino != 0 {
+                        mount_unlink(mi, parent_ino, sub_ptr.add(l_start), l_len, reply);
+                        return;
+                    }
+                }
+            }
             (*reply).label = BESALT_INVALID_OPERATION;
             return;
         }
@@ -1334,65 +1293,47 @@ pub(crate) unsafe fn handle_rename(msg: *const BesaltMsg, reply: *mut BesaltMsg,
             return;
         };
 
-        // Mount intercept: both old and new must be in the same mount
-        let old_slice = core::slice::from_raw_parts(old_ptr, old_norm_len as usize);
-        let new_slice = core::slice::from_raw_parts(new_ptr, new_norm_len as usize);
-        let old_mount = find_mount_for_path(old_slice, old_norm_len);
-        let new_mount = find_mount_for_path(new_slice, new_norm_len);
-        match (old_mount, new_mount) {
-            (Some(oi), Some(ni)) if oi == ni => {
-                // Both paths in same mount — forward to FS server
-                let (_, old_sub_start, old_sub_len) = parse_mount_path(old_slice, old_norm_len);
-                let (_, new_sub_start, new_sub_len) = parse_mount_path(new_slice, new_norm_len);
-                if old_sub_len > 0 && new_sub_len > 0 {
-                    let (op_start, op_len, ol_start, ol_len) =
-                        split_mount_sub_path(old_ptr.add(old_sub_start), old_sub_len);
-                    let old_parent_ino = if op_len == 0 {
-                        (*(&raw const crate::MOUNTS[oi])).root_ino as u64
-                    } else {
-                        mount_lookup(oi, old_ptr.add(old_sub_start + op_start), op_len)
-                    };
-                    if old_parent_ino == 0 {
-                        (*reply).label = BESALT_NOT_FOUND;
-                        return;
-                    }
-                    let (np_start, np_len, nl_start, nl_len) =
-                        split_mount_sub_path(new_ptr.add(new_sub_start), new_sub_len);
-                    let new_parent_ino = if np_len == 0 {
-                        (*(&raw const crate::MOUNTS[oi])).root_ino as u64
-                    } else {
-                        mount_lookup(oi, new_ptr.add(new_sub_start + np_start), np_len)
-                    };
-                    if new_parent_ino == 0 {
-                        (*reply).label = BESALT_NOT_FOUND;
-                        return;
-                    }
-                    mount_rename(
-                        oi,
-                        old_parent_ino,
-                        old_ptr.add(old_sub_start + ol_start),
-                        ol_len,
-                        new_parent_ino,
-                        new_ptr.add(new_sub_start + nl_start),
-                        nl_len,
-                        reply,
-                    );
-                    return;
-                }
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                // Cross-mount rename not supported
-                (*reply).label = BESALT_INVALID_OPERATION;
-                return;
-            }
-            _ => {}
-        }
-
-        // Resolve old parent + child
+        // Root underlay fallback for rename — both paths must be on same mount
         let mut old_child: *const u8 = core::ptr::null();
         let mut old_child_len: u8 = 0;
         let old_parent = resolve_parent(old_ptr, old_norm_len, &mut old_child, &mut old_child_len);
         if old_parent.is_null() || (*old_parent).readonly != 0 {
+            let idx = *(&raw const crate::ROOT_UNDERLAY_IDX);
+            if idx >= 0 {
+                let mi = idx as usize;
+                let strip = |p: *const u8, l: u8| -> (*const u8, u8) {
+                    let mut o = 0usize;
+                    while o < l as usize && *p.add(o) == b'/' { o += 1; }
+                    (p.add(o), l.saturating_sub(o as u8))
+                };
+                let (old_sub, old_sl) = strip(old_ptr, old_norm_len);
+                let (new_sub, new_sl) = strip(new_ptr, new_norm_len);
+                if old_sl > 0 && new_sl > 0 {
+                    let (op_start, op_len, ol_start, ol_len) =
+                        split_mount_sub_path(old_sub, old_sl);
+                    let old_parent_ino = if op_len == 0 {
+                        (*(&raw const crate::MOUNTS[mi])).root_ino as u64
+                    } else {
+                        mount_lookup(mi, old_sub.add(op_start), op_len)
+                    };
+                    let (np_start, np_len, nl_start, nl_len) =
+                        split_mount_sub_path(new_sub, new_sl);
+                    let new_parent_ino = if np_len == 0 {
+                        (*(&raw const crate::MOUNTS[mi])).root_ino as u64
+                    } else {
+                        mount_lookup(mi, new_sub.add(np_start), np_len)
+                    };
+                    if old_parent_ino != 0 && new_parent_ino != 0 {
+                        mount_rename(
+                            mi,
+                            old_parent_ino, old_sub.add(ol_start), ol_len,
+                            new_parent_ino, new_sub.add(nl_start), nl_len,
+                            reply,
+                        );
+                        return;
+                    }
+                }
+            }
             (*reply).label = BESALT_INVALID_OPERATION;
             return;
         }
@@ -1450,35 +1391,6 @@ pub(crate) unsafe fn handle_mkdir(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
             return;
         };
 
-        // Mount intercept
-        let path_slice = core::slice::from_raw_parts(path_ptr, path_len as usize);
-        if let Some(mount_idx) = find_mount_for_path(path_slice, path_len) {
-            let (_, sub_start, sub_len) = parse_mount_path(path_slice, path_len);
-            if sub_len > 0 {
-                let (p_start, p_len, l_start, l_len) =
-                    split_mount_sub_path(path_ptr.add(sub_start), sub_len);
-                let parent_ino = if p_len == 0 {
-                    (*(&raw const crate::MOUNTS[mount_idx])).root_ino as u64
-                } else {
-                    mount_lookup(mount_idx, path_ptr.add(sub_start + p_start), p_len)
-                };
-                if parent_ino == 0 {
-                    (*reply).label = BESALT_NOT_FOUND;
-                    return;
-                }
-                let mode = (*msg).regs[0] as u32 & 0o777;
-                mount_mkdir(
-                    mount_idx,
-                    parent_ino,
-                    path_ptr.add(sub_start + l_start),
-                    l_len,
-                    mode,
-                    reply,
-                );
-                return;
-            }
-        }
-
         let existing = resolve_path(path_ptr, path_len);
         if !existing.is_null() {
             (*reply).label = BESALT_ALREADY_EXISTS;
@@ -1489,6 +1401,30 @@ pub(crate) unsafe fn handle_mkdir(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
         let mut child_len: u8 = 0;
         let parent = resolve_parent(path_ptr, path_len, &mut child_name, &mut child_len);
         if parent.is_null() || (*parent).ftype != FTYPE_DIRECTORY || (*parent).readonly != 0 {
+            // Root underlay fallback for mkdir
+            let idx = *(&raw const crate::ROOT_UNDERLAY_IDX);
+            if idx >= 0 {
+                let mi = idx as usize;
+                let mut off: usize = 0;
+                let plen = path_len as usize;
+                while off < plen && *path_ptr.add(off) == b'/' { off += 1; }
+                if off < plen {
+                    let sub_ptr = path_ptr.add(off);
+                    let sub_len = (plen - off) as u8;
+                    let (p_start, p_len, l_start, l_len) =
+                        split_mount_sub_path(sub_ptr, sub_len);
+                    let parent_ino = if p_len == 0 {
+                        (*(&raw const crate::MOUNTS[mi])).root_ino as u64
+                    } else {
+                        mount_lookup(mi, sub_ptr.add(p_start), p_len)
+                    };
+                    if parent_ino != 0 {
+                        let mode = (*msg).regs[0] as u32 & 0o777;
+                        mount_mkdir(mi, parent_ino, sub_ptr.add(l_start), l_len, mode, reply);
+                        return;
+                    }
+                }
+            }
             (*reply).label = BESALT_INVALID_OPERATION;
             return;
         }
@@ -1581,35 +1517,33 @@ pub(crate) unsafe fn handle_rmdir(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
             return;
         };
 
-        // Mount intercept
-        let path_slice = core::slice::from_raw_parts(path_ptr, path_len as usize);
-        if let Some(mount_idx) = find_mount_for_path(path_slice, path_len) {
-            let (_, sub_start, sub_len) = parse_mount_path(path_slice, path_len);
-            if sub_len > 0 {
-                let (p_start, p_len, l_start, l_len) =
-                    split_mount_sub_path(path_ptr.add(sub_start), sub_len);
-                let parent_ino = if p_len == 0 {
-                    (*(&raw const crate::MOUNTS[mount_idx])).root_ino as u64
-                } else {
-                    mount_lookup(mount_idx, path_ptr.add(sub_start + p_start), p_len)
-                };
-                if parent_ino == 0 {
-                    (*reply).label = BESALT_NOT_FOUND;
-                    return;
-                }
-                mount_rmdir(
-                    mount_idx,
-                    parent_ino,
-                    path_ptr.add(sub_start + l_start),
-                    l_len,
-                    reply,
-                );
-                return;
-            }
-        }
-
         let inode = resolve_path(path_ptr, path_len);
         if inode.is_null() || (*inode).ftype != FTYPE_DIRECTORY {
+            // Root underlay fallback for rmdir
+            if inode.is_null() {
+                let idx = *(&raw const crate::ROOT_UNDERLAY_IDX);
+                if idx >= 0 {
+                    let mi = idx as usize;
+                    let mut off: usize = 0;
+                    let plen = path_len as usize;
+                    while off < plen && *path_ptr.add(off) == b'/' { off += 1; }
+                    if off < plen {
+                        let sub_ptr = path_ptr.add(off);
+                        let sub_len = (plen - off) as u8;
+                        let (p_start, p_len, l_start, l_len) =
+                            split_mount_sub_path(sub_ptr, sub_len);
+                        let parent_ino = if p_len == 0 {
+                            (*(&raw const crate::MOUNTS[mi])).root_ino as u64
+                        } else {
+                            mount_lookup(mi, sub_ptr.add(p_start), p_len)
+                        };
+                        if parent_ino != 0 {
+                            mount_rmdir(mi, parent_ino, sub_ptr.add(l_start), l_len, reply);
+                            return;
+                        }
+                    }
+                }
+            }
             (*reply).label = BESALT_NOT_FOUND;
             return;
         }
@@ -1655,7 +1589,6 @@ pub(crate) unsafe fn handle_opendir(msg: *const BesaltMsg, reply: *mut BesaltMsg
             (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         };
-        let path_slice = core::slice::from_raw_parts(path_ptr, path_len as usize);
 
         // /proc sub-paths that don't resolve as real inodes
         if path_len >= 6
@@ -1671,48 +1604,22 @@ pub(crate) unsafe fn handle_opendir(msg: *const BesaltMsg, reply: *mut BesaltMsg
             }
         }
 
-        // Mount point intercept for opendir
-        if let Some(mount_idx) = find_mount_for_path(path_slice, path_len) {
-            let (_, sub_start, sub_len) = parse_mount_path(path_slice, path_len);
-            let remote_ino = if sub_len > 0 {
-                mount_lookup(mount_idx, path_ptr.add(sub_start), sub_len)
-            } else {
-                (*(&raw const crate::MOUNTS[mount_idx])).root_ino as u64
-            };
-            if remote_ino == 0 {
+        let inode = resolve_path(path_ptr, path_len);
+
+        // Root underlay fallback for opendir
+        if inode.is_null() {
+            if let Some((mi, rino)) = try_root_underlay(path_ptr, path_len) {
+                if let Some((_, _, _, _, is_dir)) = mount_stat(mi, rino) {
+                    if is_dir {
+                        open_mount_inode(mi, rino, 0, reply, badge);
+                        return;
+                    }
+                }
                 (*reply).label = BESALT_NOT_FOUND;
                 return;
             }
-
-            let cli = get_client(badge);
-            if cli.is_null() {
-                (*reply).label = BESALT_OUT_OF_MEMORY;
-                return;
-            }
-            for fd in 0..(*cli).fds_cap as usize {
-                if (*(*cli).fds.add(fd)).active == 0 {
-                    (*(*cli).fds.add(fd)).active = 1;
-                    (*(*cli).fds.add(fd)).fd_type = FD_TYPE_MOUNT;
-                    (*(*cli).fds.add(fd)).inode = crate::MOUNT_DATA_INO;
-                    (*(*cli).fds.add(fd)).offset = 0;
-                    (*(*cli).fds.add(fd)).dir_cursor = 0;
-                    (*(*cli).fds.add(fd)).sock_id = remote_ino as u32;
-                    (*(*cli).fds.add(fd)).dev_type = mount_idx as u8;
-                    (*(*cli).fds.add(fd)).flags = 0;
-                    (*(*cli).fds.add(fd)).mount_batch_count = 0;
-                    (*(*cli).fds.add(fd)).mount_batch_index = 0;
-                    (*(*cli).fds.add(fd)).mount_batch_next_cursor = 0;
-                    (*reply).label = BESALT_OK;
-                    (*reply).length = 1;
-                    (*reply).regs[0] = fd as u64;
-                    return;
-                }
-            }
-            (*reply).label = BESALT_OUT_OF_MEMORY;
-            return;
         }
 
-        let inode = resolve_path(path_ptr, path_len);
         let is_dir = if inode.is_null() {
             false
         } else if (*inode).ftype == FTYPE_DIRECTORY {
@@ -1861,6 +1768,22 @@ pub(crate) unsafe fn handle_readdir(msg: *const BesaltMsg, reply: *mut BesaltMsg
                 }
 
                 (*(*cli).fds.add(fd as usize)).dir_cursor = (i + 1) as u32;
+                return;
+            }
+        }
+
+        // Root directory: merge underlay entries after local ones
+        let ul_idx = *(&raw const crate::ROOT_UNDERLAY_IDX);
+        if (*dir).ino == crate::consts::ROOT_INO && ul_idx >= 0 {
+            let mi = ul_idx as usize;
+            let root_remote_ino = (*(&raw const crate::MOUNTS[mi])).root_ino as u64;
+            let fde = &mut *(*cli).fds.add(fd as usize);
+            // First entry into underlay readdir: reset mount cursor
+            if fde.mount_batch_count == 0 && fde.mount_batch_next_cursor == 0 {
+                fde.dir_cursor = 0;
+            }
+            crate::mount::mount_readdir(mi, fde as *mut FdEntry, root_remote_ino, reply);
+            if (*reply).regs[0] != 0 {
                 return;
             }
         }

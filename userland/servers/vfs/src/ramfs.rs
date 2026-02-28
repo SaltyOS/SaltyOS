@@ -801,16 +801,6 @@ pub(crate) unsafe fn init_ramfs() {
         (*mnt_dir).parent_ino = (*root).ino;
         dir_add_entry(root, b"mnt".as_ptr(), 3, (*mnt_dir).ino);
 
-        // Create /mnt/data as mount point directory
-        let mnt_data = alloc_inode();
-        (*mnt_data).ftype = FTYPE_MOUNT_POINT;
-        (*mnt_data).mode = S_IFDIR_L | 0o555;
-        (*mnt_data).readonly = 1;
-        (*mnt_data).nlink = 2;
-        (*mnt_data).parent_ino = (*mnt_dir).ino;
-        dir_add_entry(mnt_dir, b"data".as_ptr(), 4, (*mnt_data).ino);
-        crate::MOUNT_DATA_INO = (*mnt_data).ino;
-
         // Create /initrd directory
         let initrd_dir = alloc_inode();
         (*initrd_dir).ftype = FTYPE_DIRECTORY;
