@@ -499,14 +499,10 @@ toolchain-build-llvm:
       -DLLVM_ENABLE_PROJECTS="clang;lld" \
       -DLLVM_TARGETS_TO_BUILD="X86" \
       -DLLVM_INSTALL_UTILS=ON \
+      -DLLVM_ENABLE_RUNTIMES=compiler-rt \
       -DCMAKE_INSTALL_PREFIX="$SALTYOS_TOOLCHAIN_PREFIX"
     ninja -C "$SALTYOS_LLVM_BUILD_DIR" -j"$(nproc)"
     ninja -C "$SALTYOS_LLVM_BUILD_DIR" install
-    if [ ! -x "$SALTYOS_TOOLCHAIN_PREFIX/bin/FileCheck" ] && [ -x "$SALTYOS_LLVM_BUILD_DIR/bin/FileCheck" ]; then
-      ln -sf "$SALTYOS_LLVM_BUILD_DIR/bin/FileCheck" "$SALTYOS_TOOLCHAIN_PREFIX/bin/FileCheck"
-      echo "Linked FileCheck into prefix:"
-      echo "  $SALTYOS_TOOLCHAIN_PREFIX/bin/FileCheck -> $SALTYOS_LLVM_BUILD_DIR/bin/FileCheck"
-    fi
 
 # Build the patched Rust stage1 libraries/compiler using the local LLVM prefix
 toolchain-build-rust:
