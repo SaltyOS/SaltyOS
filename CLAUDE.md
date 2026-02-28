@@ -54,8 +54,8 @@ No `Cargo.toml` files — all Rust code is compiled via Meson with direct `rustc
 
 1. `rust/meson.build` — Builds `core` and `compiler_builtins` from `rust-src`
 2. `kernel/meson.build` — Compiles kernel Rust → `.o`, assembles `.S` files, links to `kernel.elf`
-3. `lib/libsalty/meson.build` — Builds libsalty (Rust → `.o` + `.rmeta`, plus `fork.S` → `.o`, links to `libsalty.so`)
-4. `userland/*/meson.build` — Each program compiled against libsalty `.rmeta`, linked with libsalty `.o` + `core.o`
+3. `lib/besalt/lib/meson.build` — Builds libbesalt (Rust → `.o` + `.rmeta`, plus `fork.S` → `.o`, links to `libbesalt.so`)
+4. `userland/*/meson.build` — Each program compiled against libbesalt `.rmeta`, linked with libbesalt `.o` + `core.o`
 5. `tools/mkcpio.py` — Packs all userland ELFs + `.service` files into `initrd.cpio`
 6. `tools/mkimage.py` — Creates bootable disk image with bootloader + kernel + initrd
 
@@ -66,20 +66,20 @@ No `Cargo.toml` files — all Rust code is compiled via Meson with direct `rustc
 -C code-model=small  -C relocation-model=pic
 ```
 
-**Userland rustc flags** (from `lib/libsalty/meson.build`):
+**Userland rustc flags** (from `lib/besalt/lib/meson.build`):
 ```
 --edition=2024  --target=x86_64-unknown-none
 -C panic=abort  -C opt-level=2
 -C code-model=small  -C relocation-model=pic
 ```
 
-**Init is statically linked** (embeds libsalty.o directly). Other userland programs use shared `libsalty.so` loaded by `rtld` (the runtime dynamic linker).
+**Init is statically linked** (embeds libbesalt.o directly). Other userland programs use shared `libbesalt.so` loaded by `rtld` (the runtime dynamic linker).
 
 ### Build Gotchas
 
 - **Clang is enforced.** The build fails with gcc. Do not suggest `cargo build`, `cargo test`, or create `Cargo.toml` files — this project does not use Cargo.
 - **Rust flags live in `meson.build`**, not `.cargo/config.toml`.
-- **Linker scripts:** `kernel/kernel.ld` (kernel), `lib/libsalty/libsalty.ld` (shared lib).
+- **Linker scripts:** `kernel/kernel.ld` (kernel), `lib/besalt/lib/libbesalt.ld` (shared lib).
 
 ## Code Patterns and Safety Rules
 
@@ -128,12 +128,12 @@ restore_irq(irq);
 
 - **Kernel error types:** `SyscallError`, `CapError`, `VSpaceError` — all enums with specific variants, not strings
 - **Map between error types explicitly** with dedicated functions (e.g., `syscall_error_from_cap_error()` in `syscall/mod.rs`). Do not add `impl From<X> for Y` — explicit mapping prevents accidental information loss.
-- **Userland error codes** in `lib/libsalty/src/consts.rs` (`SALTY_OK`, `SALTY_INVALID_CAPABILITY`, etc.) must match kernel `SyscallError` variants
+- **Userland error codes** in `lib/besalt/lib/src/consts.rs` (`BESALT_OK`, `BESALT_INVALID_CAPABILITY`, etc.) must match kernel `SyscallError` variants
 
 ### FFI Conventions
 
 - Kernel functions called from assembly: `#[unsafe(no_mangle)] pub extern "C" fn`
-- libsalty public exports: `#[unsafe(no_mangle)] pub extern "C" fn` with `salty_` prefix
+- libbesalt public exports: `#[unsafe(no_mangle)] pub extern "C" fn` with `besalt_` prefix
 - Shared structures: `#[repr(C)]` always
 - Constants shared between kernel and userland (syscall numbers, invoke labels, error codes) must be kept in sync manually — `consts.rs` is the userland source of truth
 
@@ -195,7 +195,7 @@ Syscall instruction: `syscall` (not `int 0x80`). Number in `rax`, args in `rdi, 
 
 **Message info encoding** (seL4-style): bits 6:0 = length (0-127 MRs), bits 11:7 = extra caps, bits 51:12 = label. MR0-MR3 in registers, MR4-MR19 via IPC buffer.
 
-**Invoke labels** (defined in `lib/libsalty/src/consts.rs`): CNode ops `0x10-0x18`, Untyped `0x20`, SchedContext `0x30-0x31`, TCB `0x40-0x4D`, VSpace `0x50-0x5A`, IRQ `0x60-0x64`, IoPort `0x70-0x77`.
+**Invoke labels** (defined in `lib/besalt/lib/src/consts.rs`): CNode ops `0x10-0x18`, Untyped `0x20`, SchedContext `0x30-0x31`, TCB `0x40-0x4D`, VSpace `0x50-0x5A`, IRQ `0x60-0x64`, IoPort `0x70-0x77`.
 
 ### Well-Known Capability Slots
 
@@ -217,7 +217,7 @@ Syscall instruction: `syscall` (not `int 0x80`). Number in `rax`, args in `rdi, 
 | 15 | CAP_PCI_IOPORT | PCI config space I/O port |
 | 16+ | CAP_UNTYPED_START | Untyped memory capabilities |
 
-**Userland child convention** (defined in `lib/libsalty/src/consts.rs`, set by procmgr):
+**Userland child convention** (defined in `lib/besalt/lib/src/consts.rs`, set by procmgr):
 
 | Slot | Name | Description |
 |------|------|-------------|
@@ -249,7 +249,7 @@ Domain-based layout with programs organized by function:
 | Program | Path | Role |
 |---------|------|------|
 | `init` | `core/init` | First process — service-based multi-phase bootstrap |
-| `rtld` | `core/rtld` | Runtime dynamic linker (loads libsalty.so) |
+| `rtld` | `core/rtld` | Runtime dynamic linker (loads libbesalt.so) |
 | `mmsrv` | `core/mmsrv` | Memory manager server (centralized frame allocation, VSpace mapping) |
 | `procmgr` | `core/procmgr` | Process manager (spawn/exit/waitpid) |
 | `nameserv` | `core/nameserv` | Name service (endpoint lookup) |
@@ -267,7 +267,7 @@ Domain-based layout with programs organized by function:
 
 All userland ELFs + service files are packed into a CPIO initrd (`tools/mkcpio.py`) embedded in the disk image.
 
-### libsalty (`lib/libsalty/`, Rust)
+### libbesalt (`lib/besalt/lib/`, Rust)
 
 Userspace system library providing syscall wrappers, IPC helpers, capability invocations, and POSIX compatibility.
 
@@ -330,16 +330,16 @@ Key modules:
 ### New Syscall
 
 1. Add variant to the `Syscall` enum and its `TryFrom<u64>` impl in `kernel/src/syscall/mod.rs`
-2. Add matching constant to `lib/libsalty/src/consts.rs`
+2. Add matching constant to `lib/besalt/lib/src/consts.rs`
 3. Add dispatch arm in `syscall_handle_rust()` in `kernel/src/syscall/mod.rs`
-4. Add raw syscall wrapper in `lib/libsalty/src/syscall.rs`
+4. Add raw syscall wrapper in `lib/besalt/lib/src/syscall.rs`
 5. Update `docs/spec/syscalls.md`
 
 ### New Capability Invocation
 
-1. Add invoke label constant to `lib/libsalty/src/consts.rs`
+1. Add invoke label constant to `lib/besalt/lib/src/consts.rs`
 2. Add dispatch arm in `handle_invoke()` in `kernel/src/syscall/mod.rs`
-3. Add wrapper function in `lib/libsalty/src/invoke.rs`
+3. Add wrapper function in `lib/besalt/lib/src/invoke.rs`
 4. Update `docs/spec/syscalls.md`
 
 ## Testing and Verification
@@ -365,7 +365,7 @@ Format: `<type>(<scope>): <subject>` (scope is optional for cross-cutting change
 
 **Types:** `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `perf`
 
-**Scopes:** `kernel`, `boot`, `ipc`, `sched`, `cap`, `mm`, `vspace`, `syscall`, `libsalty`, `init`, `procmgr`, `vfs`, `console`, `nameserv`, `test_runner`, `mmsrv`, `rtld`, `ttyd`, `getty`, `blkdrv`, `pcisrv`, `display`, `saltyfs`
+**Scopes:** `kernel`, `boot`, `ipc`, `sched`, `cap`, `mm`, `vspace`, `syscall`, `libbesalt`, `init`, `procmgr`, `vfs`, `console`, `nameserv`, `test_runner`, `mmsrv`, `rtld`, `ttyd`, `getty`, `blkdrv`, `pcisrv`, `display`, `saltyfs`
 
 Examples:
 ```

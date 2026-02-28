@@ -7,7 +7,7 @@
 #![no_std]
 #![no_main]
 
-extern crate salty;
+extern crate besalt;
 
 mod at_ops;
 mod client;
@@ -24,12 +24,12 @@ mod ramfs;
 mod socket;
 mod types;
 
-use salty::consts::*;
-use salty::cpio;
-use salty::ipc;
-use salty::serial;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::cpio;
+use besalt::ipc;
+use besalt::serial;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 use consts::*;
 use types::*;
@@ -245,7 +245,7 @@ pub(crate) unsafe fn vfs_grow_pool_with_min(
     };
     let new_pages = (new_bytes + 4095) / 4096;
     let new_ptr = unsafe {
-        salty::posix_mm::posix_mmap(
+        besalt::posix_mm::posix_mmap(
             core::ptr::null_mut(),
             (new_pages * 4096) as u64,
             0x3,
@@ -265,7 +265,7 @@ pub(crate) unsafe fn vfs_grow_pool_with_min(
     if !old_ptr.is_null() {
         let old_pages = (old_bytes + 4095) / 4096;
         unsafe {
-            salty::posix_mm::posix_munmap(old_ptr, (old_pages * 4096) as u64);
+            besalt::posix_mm::posix_munmap(old_ptr, (old_pages * 4096) as u64);
         }
     }
     unsafe {
@@ -290,7 +290,7 @@ pub(crate) unsafe fn vfs_alloc_array<T>(count: usize) -> *mut T {
             return core::ptr::null_mut();
         }
         let pages = (bytes + 4095) / 4096;
-        let ptr = salty::posix_mm::posix_mmap(
+        let ptr = besalt::posix_mm::posix_mmap(
             core::ptr::null_mut(),
             (pages * 4096) as u64,
             0x3,
@@ -334,7 +334,7 @@ pub(crate) unsafe fn vfs_grow_array_with_min<T: Copy>(
     let old_bytes = old_cap * core::mem::size_of::<T>();
     let old_pages = (old_bytes + 4095) / 4096;
     unsafe {
-        salty::posix_mm::posix_munmap(old_ptr as *mut u8, (old_pages * 4096) as u64);
+        besalt::posix_mm::posix_munmap(old_ptr as *mut u8, (old_pages * 4096) as u64);
     }
     (new_ptr, new_cap)
 }
@@ -355,7 +355,7 @@ unsafe fn init_dynamic_state_storage() -> i32 {
         };
         let pages = (bytes + 4095) / 4096;
         let ptr = unsafe {
-            salty::posix_mm::posix_mmap(
+            besalt::posix_mm::posix_mmap(
                 core::ptr::null_mut(),
                 (pages * 4096) as u64,
                 0x3,
@@ -377,7 +377,7 @@ unsafe fn init_dynamic_state_storage() -> i32 {
 
     unsafe {
         if alloc_pool(&raw mut INODES_PTR, &raw mut INODES_CAP, INITIAL_INODES) != 0 {
-            return SALTY_OUT_OF_MEMORY as i32;
+            return BESALT_OUT_OF_MEMORY as i32;
         }
         if alloc_pool(
             &raw mut WRITABLE_POOL_PTR,
@@ -385,11 +385,11 @@ unsafe fn init_dynamic_state_storage() -> i32 {
             INITIAL_WRITABLE,
         ) != 0
         {
-            return SALTY_OUT_OF_MEMORY as i32;
+            return BESALT_OUT_OF_MEMORY as i32;
         }
         let writable_used_bytes = INITIAL_WRITABLE;
         let writable_used_pages = (writable_used_bytes + 4095) / 4096;
-        let ptr = salty::posix_mm::posix_mmap(
+        let ptr = besalt::posix_mm::posix_mmap(
             core::ptr::null_mut(),
             (writable_used_pages * 4096) as u64,
             0x3,
@@ -398,14 +398,14 @@ unsafe fn init_dynamic_state_storage() -> i32 {
             0,
         );
         if ptr.is_null() || ptr == usize::MAX as *mut u8 {
-            return SALTY_OUT_OF_MEMORY as i32;
+            return BESALT_OUT_OF_MEMORY as i32;
         }
         core::ptr::write_bytes(ptr, 0, writable_used_pages * 4096);
         WRITABLE_USED_PTR = ptr;
 
         let next_bytes = INITIAL_WRITABLE * core::mem::size_of::<u32>();
         let next_pages = (next_bytes + 4095) / 4096;
-        let next_ptr = salty::posix_mm::posix_mmap(
+        let next_ptr = besalt::posix_mm::posix_mmap(
             core::ptr::null_mut(),
             (next_pages * 4096) as u64,
             0x3,
@@ -414,7 +414,7 @@ unsafe fn init_dynamic_state_storage() -> i32 {
             0,
         );
         if next_ptr.is_null() || next_ptr == usize::MAX as *mut u8 {
-            return SALTY_OUT_OF_MEMORY as i32;
+            return BESALT_OUT_OF_MEMORY as i32;
         }
         let next_arr = next_ptr as *mut u32;
         for i in 0..INITIAL_WRITABLE {
@@ -428,10 +428,10 @@ unsafe fn init_dynamic_state_storage() -> i32 {
             INITIAL_SYMLINKS,
         ) != 0
         {
-            return SALTY_OUT_OF_MEMORY as i32;
+            return BESALT_OUT_OF_MEMORY as i32;
         }
         let sym_used_pages = (INITIAL_SYMLINKS + 4095) / 4096;
-        let sym_used_ptr = salty::posix_mm::posix_mmap(
+        let sym_used_ptr = besalt::posix_mm::posix_mmap(
             core::ptr::null_mut(),
             (sym_used_pages * 4096) as u64,
             0x3,
@@ -440,16 +440,16 @@ unsafe fn init_dynamic_state_storage() -> i32 {
             0,
         );
         if sym_used_ptr.is_null() || sym_used_ptr == usize::MAX as *mut u8 {
-            return SALTY_OUT_OF_MEMORY as i32;
+            return BESALT_OUT_OF_MEMORY as i32;
         }
         core::ptr::write_bytes(sym_used_ptr, 0, sym_used_pages * 4096);
         SYMLINK_USED_PTR = sym_used_ptr;
 
         if alloc_pool(&raw mut CLIENTS_PTR, &raw mut CLIENTS_CAP, INITIAL_CLIENTS) != 0 {
-            return SALTY_OUT_OF_MEMORY as i32;
+            return BESALT_OUT_OF_MEMORY as i32;
         }
         if alloc_pool(&raw mut SOCKETS_PTR, &raw mut SOCKETS_CAP, INITIAL_SOCKETS) != 0 {
-            return SALTY_OUT_OF_MEMORY as i32;
+            return BESALT_OUT_OF_MEMORY as i32;
         }
         if alloc_pool(
             &raw mut POLL_WAITERS_PTR,
@@ -457,16 +457,16 @@ unsafe fn init_dynamic_state_storage() -> i32 {
             INITIAL_POLL_WAITERS,
         ) != 0
         {
-            return SALTY_OUT_OF_MEMORY as i32;
+            return BESALT_OUT_OF_MEMORY as i32;
         }
         if alloc_pool(&raw mut EPOLLS_PTR, &raw mut EPOLLS_CAP, INITIAL_EPOLLS) != 0 {
-            return SALTY_OUT_OF_MEMORY as i32;
+            return BESALT_OUT_OF_MEMORY as i32;
         }
         if alloc_pool(&raw mut SHM_DATA_PTR, &raw mut SHM_CAP, INITIAL_SHM) != 0 {
-            return SALTY_OUT_OF_MEMORY as i32;
+            return BESALT_OUT_OF_MEMORY as i32;
         }
         if alloc_pool(&raw mut PIPES_PTR, &raw mut PIPES_CAP, INITIAL_PIPES) != 0 {
-            return SALTY_OUT_OF_MEMORY as i32;
+            return BESALT_OUT_OF_MEMORY as i32;
         }
 
         let mut lb = LineBuf::new();
@@ -486,11 +486,11 @@ pub(crate) fn puts(s: &[u8]) {
 }
 
 fn signal_ready() {
-    let _ = salty::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
-    &raw mut salty::__salty_ipc_ctx
+    &raw mut besalt::__besalt_ipc_ctx
 }
 
 // ======================================================================
@@ -500,8 +500,8 @@ pub(crate) fn ipc_ctx() -> *mut IpcContext {
 pub(crate) unsafe fn urandom_init() {
     unsafe {
         // Primary: hardware RDRAND via kernel syscall
-        let r0 = salty::syscall::sys_getrandom();
-        let r1 = salty::syscall::sys_getrandom();
+        let r0 = besalt::syscall::sys_getrandom();
+        let r1 = besalt::syscall::sys_getrandom();
         if let (Some(s0), Some(s1)) = (r0, r1) {
             URANDOM_S0 = s0;
             URANDOM_S1 = s1;
@@ -514,7 +514,7 @@ pub(crate) unsafe fn urandom_init() {
 
         // Fallback: TSC + clock (original method)
         let mut ts = Timespec::zeroed();
-        salty::syscall::syscall(SYS_CLOCK_GETTIME, 0, &raw mut ts as u64, 0, 0, 0, 0);
+        besalt::syscall::syscall(SYS_CLOCK_GETTIME, 0, &raw mut ts as u64, 0, 0, 0, 0);
         let tsc_lo: u32;
         let tsc_hi: u32;
         core::arch::asm!("rdtsc", out("eax") tsc_lo, out("edx") tsc_hi);
@@ -536,7 +536,7 @@ pub(crate) unsafe fn urandom_next() -> u64 {
         URANDOM_COUNTER += 1;
         if URANDOM_COUNTER >= URANDOM_RESEED_INTERVAL {
             URANDOM_COUNTER = 0;
-            if let Some(fresh) = salty::syscall::sys_getrandom() {
+            if let Some(fresh) = besalt::syscall::sys_getrandom() {
                 URANDOM_S1 ^= fresh;
             }
         }
@@ -752,7 +752,7 @@ unsafe fn init_ramfs() {
 pub extern "C" fn _start() -> ! {
     puts(b"[VFS] SaltyOS VFS server starting\n");
 
-    let err = salty::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
+    let err = besalt::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
     if err != 0 {
         {
             let mut lb = LineBuf::new();
@@ -770,11 +770,11 @@ pub extern "C" fn _start() -> ! {
     puts(b"[VFS] IPC buffer ready\n");
 
     unsafe {
-        let base = *(&raw const salty::__salty_slot_base);
-        let count = *(&raw const salty::__salty_slot_count);
-        let cspace_ntfn = *(&raw const salty::__salty_cspace_ntfn);
+        let base = *(&raw const besalt::__besalt_slot_base);
+        let count = *(&raw const besalt::__besalt_slot_count);
+        let cspace_ntfn = *(&raw const besalt::__besalt_cspace_ntfn);
         if base != 0 {
-            salty::slot_alloc::slot_alloc_init(base, count, cspace_ntfn);
+            besalt::slot_alloc::slot_alloc_init(base, count, cspace_ntfn);
         } else {
             puts(b"[VFS] FATAL: slot pool not provided by RTLD/auxv\n");
             idle();
@@ -782,7 +782,7 @@ pub extern "C" fn _start() -> ! {
     }
 
     unsafe {
-        salty::posix_mm::posix_mm_init(VFS_CAP_MMSRV_EP);
+        besalt::posix_mm::posix_mm_init(VFS_CAP_MMSRV_EP);
     }
 
     unsafe {
@@ -806,8 +806,8 @@ pub extern "C" fn _start() -> ! {
     puts(b"[VFS] Filesystem ready\n");
 
     if VFS_CAP_NAMESERV_EP != 0 {
-        let mut reg_msg = SaltyMsg::zeroed();
-        let mut reg_reply = SaltyMsg::zeroed();
+        let mut reg_msg = BesaltMsg::zeroed();
+        let mut reg_reply = BesaltMsg::zeroed();
         let svc_name = b"vfs";
         reg_msg.label = POSIX_NS_REGISTER;
         reg_msg.regs[0] = svc_name.len() as u64;
@@ -827,7 +827,7 @@ pub extern "C" fn _start() -> ! {
                 &raw const reg_msg,
                 &raw mut reg_reply,
             );
-            if err == 0 && reg_reply.label == SALTY_OK {
+            if err == 0 && reg_reply.label == BESALT_OK {
                 puts(b"[VFS] registered with nameserv\n");
             } else {
                 puts(b"[VFS] WARN: nameserv registration failed\n");
@@ -836,7 +836,7 @@ pub extern "C" fn _start() -> ! {
     }
 
     {
-        let err = salty::invoke::tcb_bind_notification(CAP_SELF_TCB, VFS_CAP_PTY_NTFN);
+        let err = besalt::invoke::tcb_bind_notification(CAP_SELF_TCB, VFS_CAP_PTY_NTFN);
         if err == 0 {
             puts(b"[VFS] PTY notification bound to TCB\n");
         } else {
@@ -851,7 +851,7 @@ pub extern "C" fn _start() -> ! {
         inet::inet_init();
     }
 
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     let mut badge: u64 = 0;
 
     let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
@@ -861,7 +861,7 @@ pub extern "C" fn _start() -> ! {
     }
 
     loop {
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
         let mut skip_reply = false;
 
         if badge == consts::NETSRV_CALLBACK_BADGE {
@@ -940,7 +940,7 @@ pub extern "C" fn _start() -> ! {
                                             0,
                                             &raw mut reply,
                                         );
-                                        if reply.label == SALTY_OK {
+                                        if reply.label == BESALT_OK {
                                             let bytes_read = reply.regs[0];
                                             let copy_len = bytes_read.min(152);
                                             reply.length = 1 + (copy_len + 7) / 8;
@@ -960,7 +960,7 @@ pub extern "C" fn _start() -> ! {
                                             &raw mut reply,
                                         );
                                     }
-                                    if reply.label == SALTY_OK {
+                                    if reply.label == BESALT_OK {
                                         let bytes_read = reply.regs[0];
                                         fde.offset += bytes_read;
                                     }
@@ -1007,7 +1007,7 @@ pub extern "C" fn _start() -> ! {
                                 FD_TYPE_MOUNT => {
                                     let fde = &mut *(*cli).fds.add(fd as usize);
                                     if !client::flags_allow_write(fde.flags) {
-                                        reply.label = SALTY_INVALID_OPERATION;
+                                        reply.label = BESALT_INVALID_OPERATION;
                                     } else {
                                         let mount_idx = fde.dev_type as usize;
                                         let remote_ino = fde.sock_id as u64;
@@ -1050,7 +1050,7 @@ pub extern "C" fn _start() -> ! {
                                                 &raw mut reply,
                                             );
                                         }
-                                        if reply.label == SALTY_OK {
+                                        if reply.label == BESALT_OK {
                                             let written = reply.regs[0];
                                             fde.offset = offset + written;
                                         }
@@ -1162,7 +1162,7 @@ pub extern "C" fn _start() -> ! {
                     }
                     VFS_BIND => {
                         // Check for AF_INET bind (regs[1] == AF_INET)
-                        if msg.regs[1] == salty::consts::AF_INET as u64 {
+                        if msg.regs[1] == besalt::consts::AF_INET as u64 {
                             skip_reply =
                                 inet::handle_inet_bind(&raw const msg, &raw mut reply, badge);
                         } else {
@@ -1398,7 +1398,7 @@ pub extern "C" fn _start() -> ! {
                         fileops::handle_pwrite(&raw const msg, &raw mut reply, badge);
                     }
                     _ => {
-                        reply.label = SALTY_INVALID_OPERATION;
+                        reply.label = BESALT_INVALID_OPERATION;
                     }
                 }
             }
@@ -1434,6 +1434,6 @@ pub extern "C" fn _start() -> ! {
 
 fn idle() -> ! {
     loop {
-        salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 }

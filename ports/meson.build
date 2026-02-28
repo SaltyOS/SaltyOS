@@ -125,8 +125,8 @@ foreach pname : _ordered_ports
 
   _pt = custom_target('port_' + pname,
     output: _outputs,
-    depends: [portbuild, libsalty_so, libc_so, crt_start_obj] + _extra_deps,
-    depend_files: files(port_file) + saltyc_header_files,
+    depends: [portbuild, libbesalt_so, libc_so, crt_start_obj] + _extra_deps,
+    depend_files: files(port_file) + besaltc_header_files,
     command: [portbuild, 'build',
       meson.current_source_dir() / pname,
       '-o', '@OUTDIR@',

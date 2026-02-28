@@ -2,11 +2,11 @@
 //! Ported from userland/test_signal/main.c
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use salty::consts::*;
-use salty::posix;
-use salty::serial;
-use salty::signals;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::posix;
+use besalt::serial;
+use besalt::signals;
+use besalt::types::*;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -52,7 +52,7 @@ pub fn run() -> bool {
         return false;
     }
 
-    salty::salty_yield();
+    besalt::besalt_yield();
 
     let dispatched = unsafe { signals::posix_sigcheck() };
     if dispatched == 0 || unsafe { G_SIGUSR1_COUNT } == 0 {
@@ -74,7 +74,7 @@ pub fn run() -> bool {
         return false;
     }
 
-    salty::salty_yield();
+    besalt::besalt_yield();
     unsafe { signals::posix_sigcheck() };
     puts(b"[TEST_SIGNAL] Test 2: PASS\n");
 
@@ -88,12 +88,12 @@ pub fn run() -> bool {
 
     if child_pid == 0 {
         loop {
-            salty::salty_yield();
+            besalt::besalt_yield();
         }
     }
 
-    salty::salty_yield();
-    salty::salty_yield();
+    besalt::besalt_yield();
+    besalt::besalt_yield();
 
     if unsafe { posix::posix_kill(child_pid, SIGTERM) } != 0 {
         puts(b"[TEST_SIGNAL] FAIL: posix_kill child SIGTERM\n");
@@ -163,12 +163,12 @@ pub fn run() -> bool {
 
     if child6_pid == 0 {
         loop {
-            salty::salty_yield();
+            besalt::besalt_yield();
         }
     }
 
-    salty::salty_yield();
-    salty::salty_yield();
+    besalt::besalt_yield();
+    besalt::besalt_yield();
 
     if unsafe { posix::posix_kill(child6_pid, SIGTERM) } != 0 {
         puts(b"[TEST_SIGNAL] FAIL: posix_kill child6 SIGTERM\n");
@@ -209,12 +209,12 @@ pub fn run() -> bool {
 
     if child8_pid == 0 {
         loop {
-            salty::salty_yield();
+            besalt::besalt_yield();
         }
     }
 
-    salty::salty_yield();
-    salty::salty_yield();
+    besalt::besalt_yield();
+    besalt::besalt_yield();
 
     // Stop the child
     if unsafe { posix::posix_kill(child8_pid, SIGSTOP) } != 0 {
@@ -240,7 +240,7 @@ pub fn run() -> bool {
         return false;
     }
 
-    salty::salty_yield();
+    besalt::besalt_yield();
 
     // Kill the resumed child
     if unsafe { posix::posix_kill(child8_pid, SIGKILL) } != 0 {

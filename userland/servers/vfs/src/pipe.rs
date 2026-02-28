@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Pipe subsystem and file descriptor duplication (dup/dup2/dup3).
 
-use salty::consts::*;
-use salty::ipc;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::ipc;
+use besalt::types::*;
 
 use crate::client::{get_client, get_client_noalloc};
 use crate::consts::*;
@@ -204,8 +204,8 @@ pub(crate) unsafe fn close_pipe(fde: *mut FdEntry) {
             // No readers left — wake ALL blocked writers with EPIPE
             if (*pipe).read_refcount == 0 {
                 while let Some(w) = pipe_pop_write_waiter(pipe) {
-                    let mut wake = SaltyMsg::zeroed();
-                    wake.label = SALTY_INVALID_OPERATION; // EPIPE
+                    let mut wake = BesaltMsg::zeroed();
+                    wake.label = BESALT_INVALID_OPERATION; // EPIPE
                     ipc::send_ctx(ipc_ctx(), w.reply_slot, &raw const wake);
                 }
                 wake_poll_waiters_pipe(pipe, false, 0x008); // POLLERR on write end
@@ -215,8 +215,8 @@ pub(crate) unsafe fn close_pipe(fde: *mut FdEntry) {
             // No writers left — wake ALL blocked readers with EOF
             if (*pipe).write_refcount == 0 {
                 while let Some(w) = pipe_pop_recv_waiter(pipe) {
-                    let mut wake = SaltyMsg::zeroed();
-                    wake.label = SALTY_OK;
+                    let mut wake = BesaltMsg::zeroed();
+                    wake.label = BESALT_OK;
                     wake.length = 1;
                     wake.regs[0] = 0; // EOF
                     ipc::send_ctx(ipc_ctx(), w.reply_slot, &raw const wake);
@@ -252,8 +252,8 @@ pub(crate) unsafe fn wake_poll_waiters_pipe(
             }
 
             let mut ready_count: u64 = 0;
-            let mut wake_reply = SaltyMsg::zeroed();
-            wake_reply.label = SALTY_OK;
+            let mut wake_reply = BesaltMsg::zeroed();
+            wake_reply.label = BESALT_OK;
 
             for j in 0..POLL_WAITERS!()[i].nfds as usize {
                 let pfd = POLL_WAITERS!()[i].fds[j].0;
@@ -295,20 +295,20 @@ pub(crate) unsafe fn wake_poll_waiters_pipe(
 }
 
 /// handle_pipe: create a pipe pair, return read_fd and write_fd
-pub(crate) unsafe fn handle_pipe(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_pipe(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let flags = (*msg).regs[0] as u32;
 
         let pipe = alloc_pipe();
         if pipe.is_null() {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
         let cli = get_client(badge);
         if cli.is_null() {
             (*pipe).active = 0;
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -322,7 +322,7 @@ pub(crate) unsafe fn handle_pipe(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
         }
         if read_fd < 0 {
             (*pipe).active = 0;
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -336,7 +336,7 @@ pub(crate) unsafe fn handle_pipe(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
         }
         if write_fd < 0 {
             (*pipe).active = 0;
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -369,7 +369,7 @@ pub(crate) unsafe fn handle_pipe(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
             *(*cli).fd_flags.add(write_fd as usize) = 1;
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 2;
         (*reply).regs[0] = read_fd as u64;
         (*reply).regs[1] = write_fd as u64;
@@ -378,22 +378,22 @@ pub(crate) unsafe fn handle_pipe(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
 
 /// Handle read on a pipe fd
 pub(crate) unsafe fn handle_pipe_read(
-    msg: *const SaltyMsg,
+    msg: *const BesaltMsg,
     fde: *mut FdEntry,
-    reply: *mut SaltyMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) -> bool {
     unsafe {
         // Bug 6: Verify read-end access mode
         if ((*fde).flags & O_ACCMODE) != 0 {
             // Not O_RDONLY — reject read on write-end
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
 
         let pipe = find_pipe((*fde).pipe_id());
         if pipe.is_null() {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
@@ -410,15 +410,15 @@ pub(crate) unsafe fn handle_pipe_read(
             }
             let dst = &raw mut (*reply).regs[1] as *mut u8;
             let actual = pipe_buf_read(pipe, dst, count);
-            (*reply).label = SALTY_OK;
+            (*reply).label = BESALT_OK;
             (*reply).length = 1 + ((actual as u64 + 7) / 8);
             (*reply).regs[0] = actual as u64;
 
             // Bug 2+7: Wake blocked writer — write their saved data into buffer
             if let Some(w) = pipe_pop_write_waiter(pipe) {
                 let written = pipe_buf_write(pipe, w.data.as_ptr(), w.data_len);
-                let mut wake = SaltyMsg::zeroed();
-                wake.label = SALTY_OK;
+                let mut wake = BesaltMsg::zeroed();
+                wake.label = BESALT_OK;
                 wake.length = 1;
                 wake.regs[0] = written as u64;
                 ipc::send_ctx(ipc_ctx(), w.reply_slot, &raw const wake);
@@ -432,7 +432,7 @@ pub(crate) unsafe fn handle_pipe_read(
         // Buffer empty
         if (*pipe).write_refcount == 0 {
             // No writers — return EOF
-            (*reply).label = SALTY_OK;
+            (*reply).label = BESALT_OK;
             (*reply).length = 1;
             (*reply).regs[0] = 0;
             return false;
@@ -440,15 +440,15 @@ pub(crate) unsafe fn handle_pipe_read(
 
         // O_NONBLOCK: return EAGAIN instead of blocking
         if (*fde).flags & O_NONBLOCK != 0 {
-            (*reply).label = SALTY_WOULD_BLOCK;
+            (*reply).label = BESALT_WOULD_BLOCK;
             return false;
         }
 
         // Block reader — save caller (Bug 7: multi-waiter)
         let slot = alloc_reply_slot();
-        let err = salty::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
+        let err = besalt::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
         if err != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
         let req_len = if requested > 0 && requested < 152 {
@@ -458,7 +458,7 @@ pub(crate) unsafe fn handle_pipe_read(
         };
         if !pipe_push_recv_waiter(pipe, slot, badge, req_len) {
             // Waiter queue full — return EAGAIN
-            (*reply).label = SALTY_WOULD_BLOCK;
+            (*reply).label = BESALT_WOULD_BLOCK;
             return false;
         }
         true // deferred
@@ -467,28 +467,28 @@ pub(crate) unsafe fn handle_pipe_read(
 
 /// Handle write on a pipe fd
 pub(crate) unsafe fn handle_pipe_write(
-    msg: *const SaltyMsg,
+    msg: *const BesaltMsg,
     fde: *mut FdEntry,
-    reply: *mut SaltyMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) -> bool {
     unsafe {
         // Bug 6: Verify write-end access mode
         if ((*fde).flags & O_ACCMODE) != O_WRONLY {
             // Not O_WRONLY — reject write on read-end
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
 
         let pipe = find_pipe((*fde).pipe_id());
         if pipe.is_null() {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
         // No readers — EPIPE
         if (*pipe).read_refcount == 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
@@ -503,20 +503,20 @@ pub(crate) unsafe fn handle_pipe_write(
         if free == 0 {
             // O_NONBLOCK: return EAGAIN instead of blocking
             if (*fde).flags & O_NONBLOCK != 0 {
-                (*reply).label = SALTY_WOULD_BLOCK;
+                (*reply).label = BESALT_WOULD_BLOCK;
                 return false;
             }
 
             // Buffer full — block writer with saved data (Bug 2+7: multi-waiter)
             let slot = alloc_reply_slot();
-            let err = salty::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
+            let err = besalt::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
             if err != 0 {
-                (*reply).label = SALTY_INVALID_OPERATION;
+                (*reply).label = BESALT_INVALID_OPERATION;
                 return false;
             }
             if !pipe_push_write_waiter(pipe, slot, badge, src, actual_count as u16) {
                 // Waiter queue full — return EAGAIN
-                (*reply).label = SALTY_WOULD_BLOCK;
+                (*reply).label = BESALT_WOULD_BLOCK;
                 return false;
             }
             return true; // deferred
@@ -527,7 +527,7 @@ pub(crate) unsafe fn handle_pipe_write(
         // Bug 7: Wake blocked reader — pop from multi-waiter queue
         if written > 0 {
             if let Some(w) = pipe_pop_recv_waiter(pipe) {
-                let mut wake = SaltyMsg::zeroed();
+                let mut wake = BesaltMsg::zeroed();
                 let avail = pipe_buf_len(pipe);
                 let mut rcount = avail;
                 if w.requested_len > 0 && w.requested_len < rcount {
@@ -538,7 +538,7 @@ pub(crate) unsafe fn handle_pipe_write(
                 }
                 let dst = &raw mut wake.regs[1] as *mut u8;
                 let actual = pipe_buf_read(pipe, dst, rcount);
-                wake.label = SALTY_OK;
+                wake.label = BESALT_OK;
                 wake.length = 1 + ((actual as u64 + 7) / 8);
                 wake.regs[0] = actual as u64;
                 ipc::send_ctx(ipc_ctx(), w.reply_slot, &raw const wake);
@@ -550,14 +550,14 @@ pub(crate) unsafe fn handle_pipe_write(
             wake_poll_waiters_pipe(pipe, true, 0x001);
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 1;
         (*reply).regs[0] = written as u64;
         false
     }
 }
 
-pub(crate) unsafe fn handle_dup(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_dup(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let oldfd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
@@ -566,7 +566,7 @@ pub(crate) unsafe fn handle_dup(msg: *const SaltyMsg, reply: *mut SaltyMsg, badg
             || oldfd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(oldfd as usize)).active == 0
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
@@ -579,19 +579,19 @@ pub(crate) unsafe fn handle_dup(msg: *const SaltyMsg, reply: *mut SaltyMsg, badg
             }
         }
         if newfd < 0 {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
         dup_fd_entry(cli, oldfd, newfd);
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 1;
         (*reply).regs[0] = newfd as u64;
     }
 }
 
-pub(crate) unsafe fn handle_dup2(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_dup2(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let oldfd = (*msg).regs[0] as i32;
         let newfd = (*msg).regs[1] as i32;
@@ -603,12 +603,12 @@ pub(crate) unsafe fn handle_dup2(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
             || newfd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(oldfd as usize)).active == 0
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
         if oldfd == newfd {
-            (*reply).label = SALTY_OK;
+            (*reply).label = BESALT_OK;
             (*reply).length = 1;
             (*reply).regs[0] = newfd as u64;
             return;
@@ -629,13 +629,13 @@ pub(crate) unsafe fn handle_dup2(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
 
         dup_fd_entry(cli, oldfd, newfd);
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 1;
         (*reply).regs[0] = newfd as u64;
     }
 }
 
-pub(crate) unsafe fn handle_dup3(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_dup3(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let oldfd = (*msg).regs[0] as i32;
         let newfd = (*msg).regs[1] as i32;
@@ -648,13 +648,13 @@ pub(crate) unsafe fn handle_dup3(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
             || newfd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(oldfd as usize)).active == 0
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
         // dup3: oldfd == newfd is an error (unlike dup2)
         if oldfd == newfd {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
@@ -680,7 +680,7 @@ pub(crate) unsafe fn handle_dup3(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
             *(*cli).fd_flags.add(newfd as usize) = 0;
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 1;
         (*reply).regs[0] = newfd as u64;
     }
@@ -712,20 +712,20 @@ pub(crate) unsafe fn dup_fd_entry(cli: *mut ClientState, oldfd: i32, newfd: i32)
     }
 }
 
-pub(crate) unsafe fn handle_clone_fds(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
+pub(crate) unsafe fn handle_clone_fds(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
     unsafe {
         let parent_badge = (*msg).regs[0];
         let child_badge = (*msg).regs[1];
 
         let parent = get_client_noalloc(parent_badge);
         if parent.is_null() {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
         let child = get_client(child_badge);
         if child.is_null() {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -737,7 +737,7 @@ pub(crate) unsafe fn handle_clone_fds(msg: *const SaltyMsg, reply: *mut SaltyMsg
             let (new_flags, _) =
                 vfs_grow_array_with_min((*child).fd_flags, (*child).fds_cap as usize, required);
             if new_fds.is_null() || new_flags.is_null() {
-                (*reply).label = SALTY_OUT_OF_MEMORY;
+                (*reply).label = BESALT_OUT_OF_MEMORY;
                 return;
             }
             (*child).fds = new_fds;
@@ -786,6 +786,6 @@ pub(crate) unsafe fn handle_clone_fds(msg: *const SaltyMsg, reply: *mut SaltyMsg
             i += 1;
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }

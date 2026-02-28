@@ -96,7 +96,7 @@ pub fn syscall_futex(addr: u64, op: u64, val: u64, extra: u64) -> SyscallResult 
 
 /// FUTEX_WAIT: atomically check *addr == expected, then block.
 ///
-/// Returns 0 on successful wake, SALTY_WOULD_BLOCK (9) if *addr != expected.
+/// Returns 0 on successful wake, BESALT_WOULD_BLOCK (9) if *addr != expected.
 fn futex_wait(addr: u64, expected: u32) -> SyscallResult {
     unsafe {
         let irq = save_irq_disable();
@@ -161,8 +161,8 @@ fn futex_wait(addr: u64, expected: u32) -> SyscallResult {
 /// sleep queue (for timer-based wakeup). Whichever fires first removes the thread
 /// from both queues.
 ///
-/// Returns 0 on successful wake, SALTY_WOULD_BLOCK (9) if *addr != expected,
-/// SALTY_CANCELLED (12) on timeout.
+/// Returns 0 on successful wake, BESALT_WOULD_BLOCK (9) if *addr != expected,
+/// BESALT_CANCELLED (12) on timeout.
 fn futex_wait_timeout(addr: u64, expected: u32, timeout_ns: u64) -> SyscallResult {
     unsafe {
         let irq = save_irq_disable();

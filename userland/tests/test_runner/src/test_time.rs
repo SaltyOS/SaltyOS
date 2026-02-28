@@ -1,9 +1,9 @@
 //! Time API test suite
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use salty::posix;
-use salty::serial;
-use salty::types::Timespec;
+use besalt::posix;
+use besalt::serial;
+use besalt::types::Timespec;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -22,7 +22,7 @@ fn test_clock_monotonic() -> bool {
 
     // Yield a few times to advance clock
     for _ in 0..10 {
-        salty::syscall::syscall(salty::consts::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        besalt::syscall::syscall(besalt::consts::SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
     let ret = unsafe { posix::posix_clock_gettime(0, &raw mut ts2) };

@@ -1,11 +1,11 @@
 use crate::types::*;
 use crate::client::{find_client_by_badge, client_add_region, find_region_by_addr,
                     alloc_cow_bitmap, free_cow_bitmap, clear_cow_bit};
-use salty::consts::*;
-use salty::invoke;
-use salty::ipc;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::invoke;
+use besalt::ipc;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 unsafe fn register_tracked_region(
     client: *mut MmClient,
@@ -45,17 +45,17 @@ unsafe fn register_tracked_region(
 /// MM_BRK: client sets program break.
 ///   MR0 = new break address
 ///   Badge identifies the client.
-pub(crate) unsafe fn handle_mm_brk(msg: *const SaltyMsg, badge: u64, reply: *mut SaltyMsg) {
+pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mut BesaltMsg) {
     unsafe {
         let client = find_client_by_badge(badge);
         if client.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
 
         let new_brk = (*msg).regs[0];
         if new_brk < (*client).heap_base {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
@@ -81,12 +81,12 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const SaltyMsg, badge: u64, reply: *mut
         if heap_region.is_null() {
             heap_region = client_add_region(client);
             if heap_region.is_null() {
-                (*reply).label = SALTY_OUT_OF_MEMORY;
+                (*reply).label = BESALT_OUT_OF_MEMORY;
                 return;
             }
             let fcaps = super::alloc_frame_cap_array(HEAP_INITIAL_FRAME_CAP);
             if fcaps.is_null() {
-                (*reply).label = SALTY_OUT_OF_MEMORY;
+                (*reply).label = BESALT_OUT_OF_MEMORY;
                 return;
             }
             (*heap_region).base = (*client).heap_base;
@@ -115,7 +115,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const SaltyMsg, badge: u64, reply: *mut
                     new_fcap,
                 );
                 if new_ptr.is_null() {
-                    (*reply).label = SALTY_OUT_OF_MEMORY;
+                    (*reply).label = BESALT_OUT_OF_MEMORY;
                     return;
                 }
                 (*heap_region).frame_caps = new_ptr;
@@ -126,7 +126,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const SaltyMsg, badge: u64, reply: *mut
             let mut va = old_page;
             let mut page_idx = (*heap_region).frame_count as usize;
             while va < new_page {
-                let frame_slot = match salty::slot_alloc::slot_alloc() {
+                let frame_slot = match besalt::slot_alloc::slot_alloc() {
                     Some(s) => s,
                     None => {
                         let mut rva = old_page;
@@ -135,7 +135,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const SaltyMsg, badge: u64, reply: *mut
                             rva += 4096;
                         }
                         (*heap_region).frame_count = ((old_page - (*heap_region).base) / 4096) as u16;
-                        (*reply).label = SALTY_OUT_OF_MEMORY;
+                        (*reply).label = BESALT_OUT_OF_MEMORY;
                         return;
                     }
                 };
@@ -148,7 +148,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const SaltyMsg, badge: u64, reply: *mut
                         rva += 4096;
                     }
                     (*heap_region).frame_count = ((old_page - (*heap_region).base) / 4096) as u16;
-                    (*reply).label = SALTY_OUT_OF_MEMORY;
+                    (*reply).label = BESALT_OUT_OF_MEMORY;
                     return;
                 }
 
@@ -166,7 +166,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const SaltyMsg, badge: u64, reply: *mut
                         rva += 4096;
                     }
                     (*heap_region).frame_count = ((old_page - (*heap_region).base) / 4096) as u16;
-                    (*reply).label = SALTY_BAD_ADDRESS;
+                    (*reply).label = BESALT_BAD_ADDRESS;
                     return;
                 }
                 *(*heap_region).frame_caps.add(page_idx) = frame_slot;
@@ -197,7 +197,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const SaltyMsg, badge: u64, reply: *mut
         }
 
         (*client).heap_current = new_brk;
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 1;
         (*reply).regs[0] = new_brk;
     }
@@ -207,11 +207,11 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const SaltyMsg, badge: u64, reply: *mut
 ///   MR0 = increment (signed as u64)
 ///   Badge identifies the client.
 ///   Reply: MR0 = old break address
-pub(crate) unsafe fn handle_mm_sbrk(msg: *const SaltyMsg, badge: u64, reply: *mut SaltyMsg) {
+pub(crate) unsafe fn handle_mm_sbrk(msg: *const BesaltMsg, badge: u64, reply: *mut BesaltMsg) {
     unsafe {
         let client = find_client_by_badge(badge);
         if client.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
 
@@ -219,7 +219,7 @@ pub(crate) unsafe fn handle_mm_sbrk(msg: *const SaltyMsg, badge: u64, reply: *mu
         let old_break = (*client).heap_current;
 
         if increment == 0 {
-            (*reply).label = SALTY_OK;
+            (*reply).label = BESALT_OK;
             (*reply).length = 1;
             (*reply).regs[0] = old_break;
             return;
@@ -230,19 +230,19 @@ pub(crate) unsafe fn handle_mm_sbrk(msg: *const SaltyMsg, badge: u64, reply: *mu
         } else {
             let dec = (-increment) as u64;
             if dec > old_break - (*client).heap_base {
-                (*reply).label = SALTY_INVALID_ARGUMENT;
+                (*reply).label = BESALT_INVALID_ARGUMENT;
                 return;
             }
             old_break - dec
         };
 
         // Delegate to brk handler
-        let mut brk_msg = SaltyMsg::zeroed();
+        let mut brk_msg = BesaltMsg::zeroed();
         brk_msg.regs[0] = new_break;
         handle_mm_brk(&raw const brk_msg, badge, reply);
 
         // On success, return old break in MR0
-        if (*reply).label == SALTY_OK {
+        if (*reply).label == BESALT_OK {
             (*reply).regs[0] = old_break;
         }
     }
@@ -255,11 +255,11 @@ pub(crate) unsafe fn handle_mm_sbrk(msg: *const SaltyMsg, badge: u64, reply: *mu
 ///   MR3 = flags
 ///   Badge identifies the client.
 ///   Reply: MR0 = mapped base address
-pub(crate) unsafe fn handle_mm_mmap(msg: *const SaltyMsg, badge: u64, reply: *mut SaltyMsg) {
+pub(crate) unsafe fn handle_mm_mmap(msg: *const BesaltMsg, badge: u64, reply: *mut BesaltMsg) {
     unsafe {
         let client = find_client_by_badge(badge);
         if client.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
 
@@ -269,14 +269,14 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const SaltyMsg, badge: u64, reply: *mu
         let _flags = (*msg).regs[3] as i32;
 
         if length == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
         let len = match length.checked_add(4095) {
             Some(v) => v & !4095u64,
             None => {
-                (*reply).label = SALTY_INVALID_ARGUMENT;
+                (*reply).label = BESALT_INVALID_ARGUMENT;
                 return;
             }
         };
@@ -296,12 +296,12 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const SaltyMsg, badge: u64, reply: *mu
         // Create region to track frame caps
         let region = client_add_region(client);
         if region.is_null() {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
         let fcaps = super::alloc_frame_cap_array(num_pages);
         if fcaps.is_null() {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
         (*region).base = base;
@@ -332,11 +332,11 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const SaltyMsg, badge: u64, reply: *mu
             );
             if err != 0 || mapped == 0 {
                 (*region).active = false;
-                (*reply).label = SALTY_OUT_OF_MEMORY;
+                (*reply).label = BESALT_OUT_OF_MEMORY;
                 return;
             }
             (*client).mmap_next = base + len;
-            (*reply).label = SALTY_OK;
+            (*reply).label = BESALT_OK;
             (*reply).length = 1;
             (*reply).regs[0] = base;
             return;
@@ -344,14 +344,14 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const SaltyMsg, badge: u64, reply: *mu
 
         // Eager path: Allocate and map each page immediately
         for i in 0..num_pages {
-            let frame_slot = match salty::slot_alloc::slot_alloc() {
+            let frame_slot = match besalt::slot_alloc::slot_alloc() {
                 Some(s) => s,
                 None => {
                     for j in 0..i {
                         invoke::vspace_unmap(vspace_cap, base + j as u64 * 4096);
                     }
                     (*region).active = false;
-                    (*reply).label = SALTY_OUT_OF_MEMORY;
+                    (*reply).label = BESALT_OUT_OF_MEMORY;
                     return;
                 }
             };
@@ -362,7 +362,7 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const SaltyMsg, badge: u64, reply: *mu
                     invoke::vspace_unmap(vspace_cap, base + j as u64 * 4096);
                 }
                 (*region).active = false;
-                (*reply).label = SALTY_OUT_OF_MEMORY;
+                (*reply).label = BESALT_OUT_OF_MEMORY;
                 return;
             }
 
@@ -373,7 +373,7 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const SaltyMsg, badge: u64, reply: *mu
                     invoke::vspace_unmap(vspace_cap, base + j as u64 * 4096);
                 }
                 (*region).active = false;
-                (*reply).label = SALTY_BAD_ADDRESS;
+                (*reply).label = BESALT_BAD_ADDRESS;
                 return;
             }
 
@@ -383,7 +383,7 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const SaltyMsg, badge: u64, reply: *mu
 
         (*client).mmap_next = base + len;
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 1;
         (*reply).regs[0] = base;
     }
@@ -393,11 +393,11 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const SaltyMsg, badge: u64, reply: *mu
 ///   MR0 = base address
 ///   MR1 = length
 ///   Badge identifies the client.
-pub(crate) unsafe fn handle_mm_munmap(msg: *const SaltyMsg, badge: u64, reply: *mut SaltyMsg) {
+pub(crate) unsafe fn handle_mm_munmap(msg: *const BesaltMsg, badge: u64, reply: *mut BesaltMsg) {
     unsafe {
         let client = find_client_by_badge(badge);
         if client.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
 
@@ -408,7 +408,7 @@ pub(crate) unsafe fn handle_mm_munmap(msg: *const SaltyMsg, badge: u64, reply: *
         let len = match length.checked_add(4095) {
             Some(v) => v & !4095u64,
             None => {
-                (*reply).label = SALTY_INVALID_ARGUMENT;
+                (*reply).label = BESALT_INVALID_ARGUMENT;
                 return;
             }
         };
@@ -444,7 +444,7 @@ pub(crate) unsafe fn handle_mm_munmap(msg: *const SaltyMsg, badge: u64, reply: *
             }
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
 
@@ -455,11 +455,11 @@ pub(crate) unsafe fn handle_mm_munmap(msg: *const SaltyMsg, badge: u64, reply: *
 ///   Badge identifies the client.
 ///
 /// Uses per-page frame cap tracking: unmap each page and remap with new flags.
-pub(crate) unsafe fn handle_mm_mprotect(msg: *const SaltyMsg, badge: u64, reply: *mut SaltyMsg) {
+pub(crate) unsafe fn handle_mm_mprotect(msg: *const BesaltMsg, badge: u64, reply: *mut BesaltMsg) {
     unsafe {
         let client = find_client_by_badge(badge);
         if client.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
 
@@ -470,7 +470,7 @@ pub(crate) unsafe fn handle_mm_mprotect(msg: *const SaltyMsg, badge: u64, reply:
         let region = find_region_by_addr(client, addr);
         if region.is_null() || !(*region).active {
             // No region tracking for this address — accept silently
-            (*reply).label = SALTY_OK;
+            (*reply).label = BESALT_OK;
             return;
         }
 
@@ -486,7 +486,7 @@ pub(crate) unsafe fn handle_mm_mprotect(msg: *const SaltyMsg, badge: u64, reply:
         let len = match length.checked_add(4095) {
             Some(v) => v & !4095u64,
             None => {
-                (*reply).label = SALTY_INVALID_ARGUMENT;
+                (*reply).label = BESALT_INVALID_ARGUMENT;
                 return;
             }
         };
@@ -508,7 +508,7 @@ pub(crate) unsafe fn handle_mm_mprotect(msg: *const SaltyMsg, badge: u64, reply:
         }
 
         (*region).prot = prot;
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
 
@@ -520,7 +520,7 @@ pub(crate) unsafe fn handle_mm_mprotect(msg: *const SaltyMsg, badge: u64, reply:
 ///   MR4 = vspace flags for target mapping
 ///   + cap transfer: caller's VSpace cap
 ///   Reply: MR0 = pages_mapped
-pub(crate) unsafe fn handle_mm_map_window(msg: *const SaltyMsg, _caller_badge: u64, reply: *mut SaltyMsg) {
+pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: u64, reply: *mut BesaltMsg) {
     unsafe {
         let target_badge = (*msg).regs[0];
         let target_vaddr = (*msg).regs[1];
@@ -533,7 +533,7 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const SaltyMsg, _caller_badge: u
         let client = find_client_by_badge(target_badge);
         if client.is_null() {
             invoke::cnode_delete(super::CAP_SELF_CSPACE, caller_vspace_cap);
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
 
@@ -546,7 +546,7 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const SaltyMsg, _caller_badge: u
         let effective_pages = if num_pages > MAX_WINDOW_PAGES { MAX_WINDOW_PAGES } else { num_pages };
 
         for i in 0..effective_pages {
-            let frame_slot = match salty::slot_alloc::slot_alloc() {
+            let frame_slot = match besalt::slot_alloc::slot_alloc() {
                 Some(s) => s,
                 None => break,
             };
@@ -604,7 +604,7 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const SaltyMsg, _caller_badge: u
                     }
                 }
                 invoke::cnode_delete(super::CAP_SELF_CSPACE, caller_vspace_cap);
-                (*reply).label = SALTY_OUT_OF_MEMORY;
+                (*reply).label = BESALT_OUT_OF_MEMORY;
                 return;
             }
 
@@ -630,14 +630,14 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const SaltyMsg, _caller_badge: u
                     }
                 }
                 invoke::cnode_delete(super::CAP_SELF_CSPACE, caller_vspace_cap);
-                (*reply).label = SALTY_OUT_OF_MEMORY;
+                (*reply).label = BESALT_OUT_OF_MEMORY;
                 return;
             }
         }
 
         invoke::cnode_delete(super::CAP_SELF_CSPACE, caller_vspace_cap);
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 1;
         (*reply).regs[0] = mapped as u64;
     }
@@ -647,11 +647,11 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const SaltyMsg, _caller_badge: u
 ///   MR0 = window vaddr in caller
 ///   MR1 = num_pages
 ///   + cap transfer: caller's VSpace cap
-///   Reply: label = SALTY_OK
+///   Reply: label = BESALT_OK
 ///
 /// Frame caps stay in mmsrv's CSpace; target mapping persists after
 /// window removal.
-pub(crate) unsafe fn handle_mm_unmap_window(msg: *const SaltyMsg, _caller_badge: u64, reply: *mut SaltyMsg) {
+pub(crate) unsafe fn handle_mm_unmap_window(msg: *const BesaltMsg, _caller_badge: u64, reply: *mut BesaltMsg) {
     unsafe {
         let window_vaddr = (*msg).regs[0];
         let num_pages = (*msg).regs[1] as usize;
@@ -666,7 +666,7 @@ pub(crate) unsafe fn handle_mm_unmap_window(msg: *const SaltyMsg, _caller_badge:
         // Delete transient caller VSpace cap
         invoke::cnode_delete(super::CAP_SELF_CSPACE, caller_vspace_cap);
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
 
@@ -676,20 +676,20 @@ pub(crate) unsafe fn handle_mm_unmap_window(msg: *const SaltyMsg, _caller_badge:
 ///
 /// Copies parent's heap_base, heap_current, and mmap_next to the child
 /// client entry (which must already exist via MM_REGISTER).
-pub(crate) unsafe fn handle_mm_fork_regions(msg: *const SaltyMsg, _caller_badge: u64, reply: *mut SaltyMsg) {
+pub(crate) unsafe fn handle_mm_fork_regions(msg: *const BesaltMsg, _caller_badge: u64, reply: *mut BesaltMsg) {
     unsafe {
         let parent_badge = (*msg).regs[0];
         let child_badge = (*msg).regs[1];
 
         let parent = find_client_by_badge(parent_badge);
         if parent.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
 
         let child = find_client_by_badge(child_badge);
         if child.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
 
@@ -762,7 +762,7 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const SaltyMsg, _caller_badge:
                     }
                 }
                 if parent_bitmap_failed {
-                    (*reply).label = SALTY_OUT_OF_MEMORY;
+                    (*reply).label = BESALT_OUT_OF_MEMORY;
                     return;
                 }
 
@@ -786,7 +786,7 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const SaltyMsg, _caller_badge:
                             for cri in 0..ri {
                                 free_cow_bitmap(child_regions.add(cri));
                             }
-                            (*reply).label = SALTY_OUT_OF_MEMORY;
+                            (*reply).label = BESALT_OUT_OF_MEMORY;
                             return;
                         }
                         cr.cow_bitmap = bm_ptr;
@@ -808,7 +808,7 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const SaltyMsg, _caller_badge:
                 (*child).region_count = parent_rc;
                 (*child).region_cap = child_region_cap;
             } else {
-                (*reply).label = SALTY_OUT_OF_MEMORY;
+                (*reply).label = BESALT_OUT_OF_MEMORY;
                 return;
             }
         }
@@ -832,7 +832,7 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const SaltyMsg, _caller_badge:
             lb.flush();
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
 
@@ -842,31 +842,31 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const SaltyMsg, _caller_badge:
 /// the resulting caps should be placed. mmsrv retypes the objects into
 /// temporary slots, then transfers them back via IPC cap transfer.
 ///
-/// Reply: label = SALTY_OK with 3 caps transferred, or error.
+/// Reply: label = BESALT_OK with 3 caps transferred, or error.
 pub(crate) unsafe fn handle_mm_alloc_thread_objects(
-    _msg: *const SaltyMsg,
+    _msg: *const BesaltMsg,
     _caller_badge: u64,
-    reply: *mut SaltyMsg,
+    reply: *mut BesaltMsg,
 ) {
     unsafe {
         // Allocate 3 temp slots for the new objects
-        let tcb_slot = match salty::slot_alloc::slot_alloc() {
+        let tcb_slot = match besalt::slot_alloc::slot_alloc() {
             Some(s) => s,
-            None => { (*reply).label = SALTY_OUT_OF_MEMORY; return; }
+            None => { (*reply).label = BESALT_OUT_OF_MEMORY; return; }
         };
-        let sc_slot = match salty::slot_alloc::slot_alloc() {
+        let sc_slot = match besalt::slot_alloc::slot_alloc() {
             Some(s) => s,
-            None => { (*reply).label = SALTY_OUT_OF_MEMORY; return; }
+            None => { (*reply).label = BESALT_OUT_OF_MEMORY; return; }
         };
-        let frame_slot = match salty::slot_alloc::slot_alloc() {
+        let frame_slot = match besalt::slot_alloc::slot_alloc() {
             Some(s) => s,
-            None => { (*reply).label = SALTY_OUT_OF_MEMORY; return; }
+            None => { (*reply).label = BESALT_OUT_OF_MEMORY; return; }
         };
 
         // Retype: TCB (0 size_bits = default)
         let err = super::retype_any(OBJ_TCB, 0, tcb_slot);
         if err != 0 {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -875,7 +875,7 @@ pub(crate) unsafe fn handle_mm_alloc_thread_objects(
         if err != 0 {
             // Clean up TCB
             invoke::cnode_delete(super::CAP_SELF_CSPACE, tcb_slot);
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -884,7 +884,7 @@ pub(crate) unsafe fn handle_mm_alloc_thread_objects(
         if err != 0 {
             invoke::cnode_delete(super::CAP_SELF_CSPACE, tcb_slot);
             invoke::cnode_delete(super::CAP_SELF_CSPACE, sc_slot);
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -899,7 +899,7 @@ pub(crate) unsafe fn handle_mm_alloc_thread_objects(
         *(&raw mut super::PENDING_CLEANUP_SLOTS) = [tcb_slot, sc_slot, frame_slot, 0];
         *(&raw mut super::PENDING_CLEANUP_COUNT) = 3;
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 0;
     }
 }
@@ -907,24 +907,24 @@ pub(crate) unsafe fn handle_mm_alloc_thread_objects(
 /// MM_ALLOC_OBJECT: allocate a single kernel object of any type.
 ///
 /// Request: MR0 = obj_type, MR1 = size_bits, length = 2
-/// Reply: label = SALTY_OK with 1 cap transferred, or SALTY_OUT_OF_MEMORY.
+/// Reply: label = BESALT_OK with 1 cap transferred, or BESALT_OUT_OF_MEMORY.
 pub(crate) unsafe fn handle_mm_alloc_object(
-    msg: *const SaltyMsg,
+    msg: *const BesaltMsg,
     _caller_badge: u64,
-    reply: *mut SaltyMsg,
+    reply: *mut BesaltMsg,
 ) {
     unsafe {
         let obj_type = (*msg).regs[0];
         let size_bits = (*msg).regs[1];
 
-        let slot = match salty::slot_alloc::slot_alloc() {
+        let slot = match besalt::slot_alloc::slot_alloc() {
             Some(s) => s,
-            None => { (*reply).label = SALTY_OUT_OF_MEMORY; return; }
+            None => { (*reply).label = BESALT_OUT_OF_MEMORY; return; }
         };
 
         let err = super::retype_any(obj_type, size_bits, slot);
         if err != 0 {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -933,7 +933,7 @@ pub(crate) unsafe fn handle_mm_alloc_object(
         *(&raw mut super::PENDING_CLEANUP_SLOTS) = [slot, 0, 0, 0];
         *(&raw mut super::PENDING_CLEANUP_COUNT) = 1;
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 0;
     }
 }
@@ -944,7 +944,7 @@ pub(crate) unsafe fn handle_mm_alloc_object(
 ///   MR2 = num_pages
 ///   MR3 = vspace flags
 ///   Reply: MR0 = pages_mapped
-pub(crate) unsafe fn handle_mm_map_batch(msg: *const SaltyMsg, _caller_badge: u64, reply: *mut SaltyMsg) {
+pub(crate) unsafe fn handle_mm_map_batch(msg: *const BesaltMsg, _caller_badge: u64, reply: *mut BesaltMsg) {
     unsafe {
         let target_badge = (*msg).regs[0];
         let start_vaddr = (*msg).regs[1];
@@ -953,7 +953,7 @@ pub(crate) unsafe fn handle_mm_map_batch(msg: *const SaltyMsg, _caller_badge: u6
 
         let client = find_client_by_badge(target_badge);
         if client.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
 
@@ -961,7 +961,7 @@ pub(crate) unsafe fn handle_mm_map_batch(msg: *const SaltyMsg, _caller_badge: u6
         let mut mapped: usize = 0;
 
         if num_pages == 0 {
-            (*reply).label = SALTY_OK;
+            (*reply).label = BESALT_OK;
             (*reply).length = 1;
             (*reply).regs[0] = 0;
             return;
@@ -969,7 +969,7 @@ pub(crate) unsafe fn handle_mm_map_batch(msg: *const SaltyMsg, _caller_badge: u6
 
         let tracked_caps = super::alloc_frame_cap_array(num_pages);
         if tracked_caps.is_null() {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -978,7 +978,7 @@ pub(crate) unsafe fn handle_mm_map_batch(msg: *const SaltyMsg, _caller_badge: u6
         }
 
         for i in 0..num_pages {
-            let frame_slot = match salty::slot_alloc::slot_alloc() {
+            let frame_slot = match besalt::slot_alloc::slot_alloc() {
                 Some(s) => s,
                 None => break,
             };
@@ -1020,12 +1020,12 @@ pub(crate) unsafe fn handle_mm_map_batch(msg: *const SaltyMsg, _caller_badge: u6
                         *tracked_caps.add(i) = 0;
                     }
                 }
-                (*reply).label = SALTY_OUT_OF_MEMORY;
+                (*reply).label = BESALT_OUT_OF_MEMORY;
                 return;
             }
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 1;
         (*reply).regs[0] = mapped as u64;
     }

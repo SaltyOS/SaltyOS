@@ -59,7 +59,7 @@ The `x86_64-unknown-saltyos` target encodes OS-specific defaults so that every c
 | PIC/PIE | enabled |
 | Math errno | disabled |
 | Runtime lib | compiler-rt |
-| Dynamic linker | `/lib/ld-salty.so` |
+| Dynamic linker | `/lib/ld-besalt.so` |
 | Page size | 4096 |
 | Hash style | GNU |
 | Preprocessor | `__saltyos__`, `__SaltyOS__`, `__ELF__` |
@@ -174,8 +174,8 @@ echo | clang --target=x86_64-unknown-saltyos -E -dM - | grep -i salty
 
 # Driver defaults (ld.lld, -pie, dynamic linker)
 clang --target=x86_64-unknown-saltyos -### /dev/null 2>&1 \
-  | grep -oE '(ld\.lld|pie|ld-salty\.so)'
-# Expected: ld.lld, -pie, /lib/ld-salty.so
+  | grep -oE '(ld\.lld|pie|ld-besalt\.so)'
+# Expected: ld.lld, -pie, /lib/ld-besalt.so
 ```
 
 ## Step 4: Build and Install Rust (Stage 1)
@@ -302,7 +302,7 @@ When you pass `--target=x86_64-unknown-saltyos` to clang, these defaults are aut
 -fPIC                   (position-independent code)
 -fuse-ld=lld            (LLD linker)
 -pie                    (position-independent executable)
---dynamic-linker=/lib/ld-salty.so
+--dynamic-linker=/lib/ld-besalt.so
 -z max-page-size=4096
 --hash-style=gnu
 --build-id

@@ -15,21 +15,21 @@
 #![no_std]
 #![no_main]
 
-extern crate salty;
+extern crate besalt;
 
 mod ini;
 mod selftest;
 mod spawn;
 mod svc_mgr;
 
-use salty::consts::*;
-use salty::cpio;
-use salty::invoke;
-use salty::ipc;
-use salty::serial;
-use salty::serial::LineBuf;
-use salty::syscall::syscall;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::cpio;
+use besalt::invoke;
+use besalt::ipc;
+use besalt::serial;
+use besalt::serial::LineBuf;
+use besalt::syscall::syscall;
+use besalt::types::*;
 
 use spawn::ExtraCapCopy;
 
@@ -78,7 +78,7 @@ pub const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 const PM_WAIT_ANY_CHILD: u64 = u32::MAX as u64;
 
-pub const AT_SALTY_SHARED_LIB_BASE: u64 = 0x1006;
+pub const AT_BESALT_SHARED_LIB_BASE: u64 = 0x1006;
 
 // Keep init's transient frame/cap allocations above per-service child slots
 // while staying inside init CSpace (0..4095).
@@ -91,15 +91,15 @@ pub const AT_PHNUM: u64 = 5;
 pub const AT_PAGESZ: u64 = 6;
 pub const AT_BASE: u64 = 7;
 pub const AT_ENTRY: u64 = 9;
-pub const AT_SALTY_UNTYPED: u64 = 0x1000;
-pub const AT_SALTY_VSPACE: u64 = 0x1001;
-pub const AT_SALTY_SCRATCH: u64 = 0x1002;
-pub const AT_SALTY_INITRD: u64 = 0x1003;
-pub const AT_SALTY_INITRD_SZ: u64 = 0x1004;
-pub const AT_SALTY_FRAME_SLOT: u64 = 0x1005;
-pub const AT_SALTY_SLOT_BASE: u64 = 0x1007;
-pub const AT_SALTY_SLOT_COUNT: u64 = 0x1008;
-pub const AT_SALTY_EXPAND_EP: u64 = 0x1009;
+pub const AT_BESALT_UNTYPED: u64 = 0x1000;
+pub const AT_BESALT_VSPACE: u64 = 0x1001;
+pub const AT_BESALT_SCRATCH: u64 = 0x1002;
+pub const AT_BESALT_INITRD: u64 = 0x1003;
+pub const AT_BESALT_INITRD_SZ: u64 = 0x1004;
+pub const AT_BESALT_FRAME_SLOT: u64 = 0x1005;
+pub const AT_BESALT_SLOT_BASE: u64 = 0x1007;
+pub const AT_BESALT_SLOT_COUNT: u64 = 0x1008;
+pub const AT_BESALT_EXPAND_EP: u64 = 0x1009;
 pub const CAP_EXPAND_EP: u64 = 9;
 
 // ======================================================================
@@ -118,7 +118,7 @@ fn puts(s: &[u8]) {
 }
 
 pub fn ipc_ctx() -> *mut IpcContext {
-    &raw mut salty::__salty_ipc_ctx
+    &raw mut besalt::__besalt_ipc_ctx
 }
 
 pub unsafe extern "C" fn init_alloc_frame_slot(_opaque: *mut u8) -> Cap {
@@ -461,7 +461,7 @@ unsafe fn pre_create_endpoints(mgr: &mut svc_mgr::ServiceManager, ut: Cap) {
     puts(b"[INIT] Pre-creating service endpoints...\n");
     for i in 0..mgr.count {
         let ep_slot = EP_POOL_BASE + i as u64;
-        let err = invoke::untyped_retype(ut, salty::OBJ_ENDPOINT, 0, ep_slot);
+        let err = invoke::untyped_retype(ut, besalt::OBJ_ENDPOINT, 0, ep_slot);
         if err == 0 {
             mgr.services[i].pre_ep = ep_slot;
         } else {
@@ -726,15 +726,15 @@ fn find_service_by_pid(mgr: &svc_mgr::ServiceManager, pid: u32) -> i32 {
 /// Returns (exit_status, child_pid), or (0, 0) on error / no children.
 unsafe fn blocking_wait_child(pm_ep: Cap) -> (i32, u32) {
     unsafe {
-        let mut msg = SaltyMsg::zeroed();
+        let mut msg = BesaltMsg::zeroed();
         msg.label = POSIX_PM_WAIT;
         msg.length = 2;
         msg.regs[0] = PM_WAIT_ANY_CHILD;
         msg.regs[1] = 0; // blocking (no WNOHANG)
 
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), pm_ep, &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != SALTY_OK {
+        if err != 0 || reply.label != BESALT_OK {
             return (0, 0);
         }
 
@@ -797,15 +797,15 @@ unsafe fn handle_child_exit(
 unsafe fn drain_zombies(mgr: &mut svc_mgr::ServiceManager, pm_ep: Cap) {
     unsafe {
         loop {
-            let mut msg = SaltyMsg::zeroed();
+            let mut msg = BesaltMsg::zeroed();
             msg.label = POSIX_PM_WAIT;
             msg.length = 2;
             msg.regs[0] = PM_WAIT_ANY_CHILD;
             msg.regs[1] = WNOHANG;
 
-            let mut reply = SaltyMsg::zeroed();
+            let mut reply = BesaltMsg::zeroed();
             let err = ipc::call_ctx(ipc_ctx(), pm_ep, &raw const msg, &raw mut reply);
-            if err != 0 || reply.label != SALTY_OK {
+            if err != 0 || reply.label != BESALT_OK {
                 break;
             }
 

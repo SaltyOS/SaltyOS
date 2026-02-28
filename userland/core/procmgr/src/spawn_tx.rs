@@ -5,14 +5,14 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 use crate::alloc::Allocator;
 use crate::proc_table;
 
 fn puts(s: &[u8]) {
-    salty::serial::serial_puts(s);
+    besalt::serial::serial_puts(s);
 }
 
 // ---- Layout offsets within a reservation ----
@@ -30,24 +30,24 @@ pub(crate) const OFF_FIXED_END: usize = 8;
 // allocation is handled by mmsrv.
 
 // ---- Re-exports from parent ----
-const OBJ_TCB: u64 = salty::OBJ_TCB;
-const OBJ_VSPACE: u64 = salty::OBJ_VSPACE;
-const OBJ_CNODE: u64 = salty::OBJ_CNODE;
-const OBJ_SCHED_CONTEXT: u64 = salty::OBJ_SCHED_CONTEXT;
-const OBJ_FRAME: u64 = salty::OBJ_FRAME;
-const OBJ_NOTIFICATION: u64 = salty::OBJ_NOTIFICATION;
-const SALTY_OK: u64 = salty::SALTY_OK;
-const SALTY_OUT_OF_MEMORY: u64 = salty::SALTY_OUT_OF_MEMORY;
-const SALTY_NOT_FOUND: u64 = salty::SALTY_NOT_FOUND;
-const SALTY_BUSY: u64 = salty::SALTY_BUSY;
-const SALTY_INVALID_ARGUMENT: u64 = salty::SALTY_INVALID_ARGUMENT;
-const VSPACE_FLAG_WRITABLE: u64 = salty::VSPACE_FLAG_WRITABLE;
-const VSPACE_FLAG_USER: u64 = salty::VSPACE_FLAG_USER;
-const VSPACE_FLAG_EXECUTABLE: u64 = salty::VSPACE_FLAG_EXECUTABLE;
-const CAP_RIGHTS_ALL: u64 = salty::CAP_RIGHTS_ALL;
+const OBJ_TCB: u64 = besalt::OBJ_TCB;
+const OBJ_VSPACE: u64 = besalt::OBJ_VSPACE;
+const OBJ_CNODE: u64 = besalt::OBJ_CNODE;
+const OBJ_SCHED_CONTEXT: u64 = besalt::OBJ_SCHED_CONTEXT;
+const OBJ_FRAME: u64 = besalt::OBJ_FRAME;
+const OBJ_NOTIFICATION: u64 = besalt::OBJ_NOTIFICATION;
+const BESALT_OK: u64 = besalt::BESALT_OK;
+const BESALT_OUT_OF_MEMORY: u64 = besalt::BESALT_OUT_OF_MEMORY;
+const BESALT_NOT_FOUND: u64 = besalt::BESALT_NOT_FOUND;
+const BESALT_BUSY: u64 = besalt::BESALT_BUSY;
+const BESALT_INVALID_ARGUMENT: u64 = besalt::BESALT_INVALID_ARGUMENT;
+const VSPACE_FLAG_WRITABLE: u64 = besalt::VSPACE_FLAG_WRITABLE;
+const VSPACE_FLAG_USER: u64 = besalt::VSPACE_FLAG_USER;
+const VSPACE_FLAG_EXECUTABLE: u64 = besalt::VSPACE_FLAG_EXECUTABLE;
+const CAP_RIGHTS_ALL: u64 = besalt::CAP_RIGHTS_ALL;
 const INITRD_COPY_RIGHTS: u64 = (1 << 0) | (1 << 2) | (1 << 3);
 
-use salty::layout::{self, VmLayoutPlan};
+use besalt::layout::{self, VmLayoutPlan};
 
 const CHILD_RTLD_FRAME_SLOT_START: u64 = super::CHILD_RTLD_FRAME_SLOT_START;
 const PROCMGR_SCRATCH_VADDR: u64 = super::PROCMGR_SCRATCH_VADDR;
@@ -82,20 +82,20 @@ const AT_PHNUM: u64 = super::AT_PHNUM;
 const AT_PAGESZ: u64 = super::AT_PAGESZ;
 const AT_BASE: u64 = super::AT_BASE;
 const AT_ENTRY: u64 = super::AT_ENTRY;
-const AT_SALTY_VSPACE: u64 = super::AT_SALTY_VSPACE;
-const AT_SALTY_SCRATCH: u64 = super::AT_SALTY_SCRATCH;
-const AT_SALTY_INITRD: u64 = super::AT_SALTY_INITRD;
-const AT_SALTY_INITRD_SZ: u64 = super::AT_SALTY_INITRD_SZ;
-const AT_SALTY_FRAME_SLOT: u64 = super::AT_SALTY_FRAME_SLOT;
-const AT_SALTY_SHARED_LIB_BASE: u64 = super::AT_SALTY_SHARED_LIB_BASE;
-const AT_SALTY_SLOT_BASE: u64 = super::AT_SALTY_SLOT_BASE;
-const AT_SALTY_SLOT_COUNT: u64 = super::AT_SALTY_SLOT_COUNT;
-const AT_SALTY_CSPACE_NTFN: u64 = super::AT_SALTY_CSPACE_NTFN;
+const AT_BESALT_VSPACE: u64 = super::AT_BESALT_VSPACE;
+const AT_BESALT_SCRATCH: u64 = super::AT_BESALT_SCRATCH;
+const AT_BESALT_INITRD: u64 = super::AT_BESALT_INITRD;
+const AT_BESALT_INITRD_SZ: u64 = super::AT_BESALT_INITRD_SZ;
+const AT_BESALT_FRAME_SLOT: u64 = super::AT_BESALT_FRAME_SLOT;
+const AT_BESALT_SHARED_LIB_BASE: u64 = super::AT_BESALT_SHARED_LIB_BASE;
+const AT_BESALT_SLOT_BASE: u64 = super::AT_BESALT_SLOT_BASE;
+const AT_BESALT_SLOT_COUNT: u64 = super::AT_BESALT_SLOT_COUNT;
+const AT_BESALT_CSPACE_NTFN: u64 = super::AT_BESALT_CSPACE_NTFN;
 const CSPACE_EXPAND_BASE: u64 = super::CSPACE_EXPAND_BASE;
 const READY_TIMEOUT_NS_DEFAULT: u64 = super::READY_TIMEOUT_NS_DEFAULT;
-const SPAWN_FLAG_USE_PRE_EP: u64 = salty::SPAWN_FLAG_USE_PRE_EP;
-const SPAWN_FLAG_RESPAWN: u64 = salty::SPAWN_FLAG_RESPAWN;
-const SPAWN_FLAG_START_SUSPENDED: u64 = salty::SPAWN_FLAG_START_SUSPENDED;
+const SPAWN_FLAG_USE_PRE_EP: u64 = besalt::SPAWN_FLAG_USE_PRE_EP;
+const SPAWN_FLAG_RESPAWN: u64 = besalt::SPAWN_FLAG_RESPAWN;
+const SPAWN_FLAG_START_SUSPENDED: u64 = besalt::SPAWN_FLAG_START_SUSPENDED;
 
 // ===========================================================================
 // Shared library physical frame cache
@@ -245,10 +245,10 @@ unsafe fn count_rtld_span(
     initrd_size: usize,
 ) -> u64 {
     unsafe {
-        let mut rtld_name = b"ld-salty.so".as_ptr();
-        let mut rtld_name_len = 10usize;
+        let mut rtld_name = b"ld-besalt.so".as_ptr();
+        let mut rtld_name_len = 12usize;
 
-        let interp = salty::elf_dynamic::elf_get_interp(elf_data, elf_data_len);
+        let interp = besalt::elf_dynamic::elf_get_interp(elf_data, elf_data_len);
         if !interp.is_null() && *interp != 0 {
             let mut last = interp;
             let mut p = interp;
@@ -265,7 +265,7 @@ unsafe fn count_rtld_span(
         }
 
         let mut rtld_entry = CpioEntry::zeroed();
-        if salty::cpio::cpio_find_file(
+        if besalt::cpio::cpio_find_file(
             initrd,
             initrd_size,
             rtld_name,
@@ -276,7 +276,7 @@ unsafe fn count_rtld_span(
             return 5 * 4096; // fallback estimate
         }
 
-        let span = salty::elf_loader::elf_compute_load_span(rtld_entry.data, rtld_entry.data_len);
+        let span = besalt::elf_loader::elf_compute_load_span(rtld_entry.data, rtld_entry.data_len);
         if span == 0 {
             5 * 4096
         } else {
@@ -287,7 +287,7 @@ unsafe fn count_rtld_span(
 
 /// Return the total VA pages needed for the specified DT_NEEDED libraries.
 /// Accounts for full library spans (including RW segments) plus inter-lib gaps.
-pub(crate) fn shared_lib_va_pages_for_needed(needed: &salty::elf_dynamic::NeededLibs) -> usize {
+pub(crate) fn shared_lib_va_pages_for_needed(needed: &besalt::elf_dynamic::NeededLibs) -> usize {
     unsafe {
         let cache = &*(&raw const SHARED_LIB_CACHE);
         if !cache.initialized || needed.count == 0 {
@@ -356,7 +356,7 @@ pub(crate) unsafe fn compute_lib_window_pages(initrd: *const u8, initrd_size: us
 
         loop {
             let mut entry = CpioEntry::zeroed();
-            if salty::cpio::cpio_next(initrd, initrd_size, &raw mut offset, &raw mut entry) == 0 {
+            if besalt::cpio::cpio_next(initrd, initrd_size, &raw mut offset, &raw mut entry) == 0 {
                 break;
             }
             // Check if name ends with ".so"
@@ -408,7 +408,7 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
         }
 
         // Fallback: build cache ourselves by parsing ELF and allocating frames
-        let libs: [&[u8]; 2] = [b"libsalty.so", b"libc.so"];
+        let libs: [&[u8]; 2] = [b"libbesalt.so", b"libc.so"];
 
         for lib_name in &libs {
             if cache.lib_count >= MAX_CACHED_LIBS {
@@ -416,7 +416,7 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
             }
 
             let mut entry = CpioEntry::zeroed();
-            if salty::cpio::cpio_find_file(
+            if besalt::cpio::cpio_find_file(
                 initrd,
                 initrd_size,
                 lib_name.as_ptr(),
@@ -438,7 +438,7 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
             {
                 continue;
             }
-            if ehdr.e_type != salty::ET_DYN {
+            if ehdr.e_type != besalt::ET_DYN {
                 continue;
             }
 
@@ -447,7 +447,7 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
             let mut max_seg_end: u64 = 0;
             for i in 0..ehdr.e_phnum as usize {
                 let ph = &*phdrs.add(i);
-                if ph.p_type == salty::PT_LOAD {
+                if ph.p_type == besalt::PT_LOAD {
                     if ph.p_vaddr < min_vaddr {
                         min_vaddr = ph.p_vaddr;
                     }
@@ -478,12 +478,12 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
 
             for i in 0..ehdr.e_phnum as usize {
                 let ph = &*phdrs.add(i);
-                if ph.p_type != salty::PT_LOAD {
+                if ph.p_type != besalt::PT_LOAD {
                     continue;
                 }
 
                 // Record RW segments as metadata (mapped per-child later)
-                if (ph.p_flags & salty::PF_W) != 0 {
+                if (ph.p_flags & besalt::PF_W) != 0 {
                     if (lib_entry.rw_seg_count as usize) < MAX_RW_SEGS {
                         let idx = lib_entry.rw_seg_count as usize;
                         // W^X: writable segments never get executable permission
@@ -506,7 +506,7 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
                 let seg_end = (seg_vaddr + ph.p_memsz + 0xFFF) & !0xFFFu64;
 
                 let mut flags = VSPACE_FLAG_USER;
-                if (ph.p_flags & salty::PF_X) != 0 {
+                if (ph.p_flags & besalt::PF_X) != 0 {
                     flags |= VSPACE_FLAG_EXECUTABLE;
                 }
 
@@ -527,7 +527,7 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
                         break;
                     }
 
-                    let err = salty::invoke::vspace_map(
+                    let err = besalt::invoke::vspace_map(
                         CAP_SELF_VSPACE,
                         slot,
                         PROCMGR_SCRATCH_VADDR,
@@ -565,7 +565,7 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
                         }
                     }
 
-                    salty::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
+                    besalt::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
 
                     cache.pages[cache.page_count] = SharedPage {
                         vaddr_offset: page - min_vaddr,
@@ -611,7 +611,7 @@ unsafe fn try_inherit_shared_lib_cache(
         // Use vspace_map as a probe — if the cap exists and is a frame,
         // this will succeed (we immediately unmap).
         let probe_slot = CAP_SHARED_LIB_CACHE_BASE;
-        let probe_err = salty::invoke::vspace_map(
+        let probe_err = besalt::invoke::vspace_map(
             CAP_SELF_VSPACE,
             probe_slot,
             PROCMGR_SCRATCH_VADDR,
@@ -620,7 +620,7 @@ unsafe fn try_inherit_shared_lib_cache(
         if probe_err != 0 {
             return false;
         }
-        salty::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
+        besalt::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
 
         puts(b"[PROCMGR] inherited shared lib caps from init\n");
 
@@ -632,7 +632,7 @@ unsafe fn try_inherit_shared_lib_cache(
         }
 
         // Walk both libraries in the same order as init's cache builder.
-        let libs: [&[u8]; 2] = [b"libsalty.so", b"libc.so"];
+        let libs: [&[u8]; 2] = [b"libbesalt.so", b"libc.so"];
         let mut inherited_idx: usize = 0;
 
         for lib_name in &libs {
@@ -641,7 +641,7 @@ unsafe fn try_inherit_shared_lib_cache(
             }
 
             let mut entry = CpioEntry::zeroed();
-            if salty::cpio::cpio_find_file(
+            if besalt::cpio::cpio_find_file(
                 initrd,
                 initrd_size,
                 lib_name.as_ptr(),
@@ -663,7 +663,7 @@ unsafe fn try_inherit_shared_lib_cache(
             {
                 continue;
             }
-            if ehdr.e_type != salty::ET_DYN {
+            if ehdr.e_type != besalt::ET_DYN {
                 continue;
             }
 
@@ -672,7 +672,7 @@ unsafe fn try_inherit_shared_lib_cache(
             let mut max_seg_end: u64 = 0;
             for i in 0..ehdr.e_phnum as usize {
                 let ph = &*phdrs.add(i);
-                if ph.p_type == salty::PT_LOAD {
+                if ph.p_type == besalt::PT_LOAD {
                     if ph.p_vaddr < min_vaddr {
                         min_vaddr = ph.p_vaddr;
                     }
@@ -703,12 +703,12 @@ unsafe fn try_inherit_shared_lib_cache(
 
             for i in 0..ehdr.e_phnum as usize {
                 let ph = &*phdrs.add(i);
-                if ph.p_type != salty::PT_LOAD {
+                if ph.p_type != besalt::PT_LOAD {
                     continue;
                 }
 
                 // Record RW segments as metadata (mapped per-child later)
-                if (ph.p_flags & salty::PF_W) != 0 {
+                if (ph.p_flags & besalt::PF_W) != 0 {
                     if (lib_entry.rw_seg_count as usize) < MAX_RW_SEGS {
                         let idx = lib_entry.rw_seg_count as usize;
                         // W^X: writable segments never get executable permission
@@ -731,7 +731,7 @@ unsafe fn try_inherit_shared_lib_cache(
                 let seg_end = (seg_vaddr + ph.p_memsz + 0xFFF) & !0xFFFu64;
 
                 let mut flags = VSPACE_FLAG_USER;
-                if (ph.p_flags & salty::PF_X) != 0 {
+                if (ph.p_flags & besalt::PF_X) != 0 {
                     flags |= VSPACE_FLAG_EXECUTABLE;
                 }
 
@@ -787,7 +787,7 @@ unsafe fn try_inherit_shared_lib_cache(
 pub(crate) unsafe fn map_shared_lib_to_vspace(
     child_vs: Cap,
     shared_lib_base_vaddr: u64,
-    needed: &salty::elf_dynamic::NeededLibs,
+    needed: &besalt::elf_dynamic::NeededLibs,
     pid: u32,
 ) -> (u64, proc_table::ProcLibMap) {
     let empty = proc_table::ProcLibMap::zeroed();
@@ -840,7 +840,7 @@ pub(crate) unsafe fn map_shared_lib_to_vspace(
                     let page = &cache.pages[ps + pi];
                     let vaddr = running_base + page.vaddr_offset;
                     let err =
-                        salty::invoke::vspace_map(child_vs, page.frame_cap, vaddr, page.flags);
+                        besalt::invoke::vspace_map(child_vs, page.frame_cap, vaddr, page.flags);
                     if err != 0 {
                         let mut lb = LineBuf::new();
                         lb.str(b"[PROCMGR] shared lib map failed at ");
@@ -901,7 +901,7 @@ unsafe fn map_rw_segments(cl: &CachedLib, running_base: u64, pid: u32) -> bool {
         // Find this library in the initrd to get file data for .data copy
         let mut entry = CpioEntry::zeroed();
         let lib_name = &cl.name[..cl.name_len as usize];
-        if salty::cpio::cpio_find_file(
+        if besalt::cpio::cpio_find_file(
             initrd,
             initrd_size,
             lib_name.as_ptr(),
@@ -941,23 +941,23 @@ unsafe fn map_rw_segments(cl: &CachedLib, running_base: u64, pid: u32) -> bool {
         }
 
         // Single MM_MAP_WINDOW call for the merged range
-        let mut mm_msg = SaltyMsg::zeroed();
-        let mut mm_reply = SaltyMsg::zeroed();
-        mm_msg.label = salty::consts::MM_MAP_WINDOW;
+        let mut mm_msg = BesaltMsg::zeroed();
+        let mut mm_reply = BesaltMsg::zeroed();
+        mm_msg.label = besalt::consts::MM_MAP_WINDOW;
         mm_msg.length = 5;
         mm_msg.regs[0] = pid as u64;
         mm_msg.regs[1] = merged_start;
         mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
         mm_msg.regs[3] = merged_pages as u64;
         mm_msg.regs[4] = merged_flags;
-        salty::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-        let err = salty::ipc::call_ctx(
+        besalt::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
+        let err = besalt::ipc::call_ctx(
             super::ipc_ctx(),
             CAP_MMSRV_EP,
             &raw const mm_msg,
             &raw mut mm_reply,
         );
-        if err != 0 || mm_reply.label != SALTY_OK || mm_reply.regs[0] != merged_pages as u64 {
+        if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != merged_pages as u64 {
             let mut lb = LineBuf::new();
             lb.str(b"[PROCMGR] RW MAP_WINDOW failed err=");
             lb.hex(err as u64);
@@ -1049,7 +1049,7 @@ pub(crate) unsafe fn write_dynamic_stack(
 ) -> Result<u64, ()> {
     unsafe {
         if !pre_mapped {
-            let err = salty::invoke::vspace_map(
+            let err = besalt::invoke::vspace_map(
                 CAP_SELF_VSPACE,
                 stk_frame,
                 PROCMGR_SCRATCH_VADDR,
@@ -1064,7 +1064,7 @@ pub(crate) unsafe fn write_dynamic_stack(
         let mut phdr_vaddr: u64 = 0;
         let mut phent: u64 = 0;
         let mut phnum: u64 = 0;
-        if salty::elf_dynamic::elf_get_phdr_info(
+        if besalt::elf_dynamic::elf_get_phdr_info(
             elf_data,
             elf_data_len,
             elf_load_base,
@@ -1075,12 +1075,12 @@ pub(crate) unsafe fn write_dynamic_stack(
         {
             puts(b"[PROCMGR] dynamic phdr info extraction failed\n");
             if !pre_mapped {
-                salty::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
+                besalt::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
             }
             return Err(());
         }
 
-        // +2 for AT_SALTY_SLOT_BASE/COUNT, +1 for AT_SALTY_CSPACE_NTFN
+        // +2 for AT_BESALT_SLOT_BASE/COUNT, +1 for AT_BESALT_CSPACE_NTFN
         let auxv_entries: u64 = if shared_lib_base != 0 { 16 } else { 15 };
 
         // Compute slot pool for child: from frame_slot_start to CSPACE_EXPAND_BASE.
@@ -1117,7 +1117,7 @@ pub(crate) unsafe fn write_dynamic_stack(
         );
 
         if !pre_mapped {
-            salty::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
+            besalt::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
         }
         Ok(rsp)
     }
@@ -1137,7 +1137,7 @@ pub(crate) unsafe fn write_static_stack(
 ) -> Result<u64, ()> {
     unsafe {
         if !pre_mapped {
-            let err = salty::invoke::vspace_map(
+            let err = besalt::invoke::vspace_map(
                 CAP_SELF_VSPACE,
                 stk_frame,
                 PROCMGR_SCRATCH_VADDR,
@@ -1161,7 +1161,7 @@ pub(crate) unsafe fn write_static_stack(
         );
 
         if !pre_mapped {
-            salty::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
+            besalt::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
         }
         Ok(rsp)
     }
@@ -1304,24 +1304,24 @@ unsafe fn write_stack_with_args(
                 w(base);
                 w(AT_PAGESZ);
                 w(4096);
-                w(AT_SALTY_VSPACE);
+                w(AT_BESALT_VSPACE);
                 w(CHILD_CAP_VSPACE);
-                w(AT_SALTY_SCRATCH);
+                w(AT_BESALT_SCRATCH);
                 w(scratch_vaddr);
-                w(AT_SALTY_INITRD);
+                w(AT_BESALT_INITRD);
                 w(initrd_vaddr);
-                w(AT_SALTY_INITRD_SZ);
+                w(AT_BESALT_INITRD_SZ);
                 w(initrd_sz);
-                w(AT_SALTY_FRAME_SLOT);
+                w(AT_BESALT_FRAME_SLOT);
                 w(slot_base);
-                w(AT_SALTY_SLOT_BASE);
+                w(AT_BESALT_SLOT_BASE);
                 w(slot_base);
-                w(AT_SALTY_SLOT_COUNT);
+                w(AT_BESALT_SLOT_COUNT);
                 w(slot_count);
-                w(AT_SALTY_CSPACE_NTFN);
+                w(AT_BESALT_CSPACE_NTFN);
                 w(CHILD_CAP_CSPACE_NTFN);
                 if shared_lib != 0 {
-                    w(AT_SALTY_SHARED_LIB_BASE);
+                    w(AT_BESALT_SHARED_LIB_BASE);
                     w(shared_lib);
                 }
             }
@@ -1359,7 +1359,7 @@ pub(crate) unsafe fn exec_load_elf_mmsrv(
     result: *mut ElfLoadResult,
 ) -> i32 {
     unsafe {
-        use salty::consts::{
+        use besalt::consts::{
             ELFCLASS64, ELFDATA2LSB, ELF_BAD_ARCH, ELF_BAD_TYPE, ELF_MAP_FAILED, ELF_NOT_64BIT,
             ELF_NOT_ELF, ELF_NOT_LE, ELF_NO_LOAD, ELF_OUT_OF_MEMORY, ELF_TOO_SMALL, EM_X86_64,
             ET_DYN, ET_EXEC, MM_MAP_WINDOW, PF_W, PF_X, PT_LOAD,
@@ -1439,8 +1439,8 @@ pub(crate) unsafe fn exec_load_elf_mmsrv(
         }
 
         // Allocate all pages via MM_MAP_WINDOW (dual-mapped: child + procmgr scratch)
-        let mut mm_msg = SaltyMsg::zeroed();
-        let mut mm_reply = SaltyMsg::zeroed();
+        let mut mm_msg = BesaltMsg::zeroed();
+        let mut mm_reply = BesaltMsg::zeroed();
         mm_msg.label = MM_MAP_WINDOW;
         mm_msg.length = 5;
         mm_msg.regs[0] = pid as u64;
@@ -1448,14 +1448,14 @@ pub(crate) unsafe fn exec_load_elf_mmsrv(
         mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
         mm_msg.regs[3] = total_span_pages as u64;
         mm_msg.regs[4] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-        salty::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-        let err = salty::ipc::call_ctx(
+        besalt::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
+        let err = besalt::ipc::call_ctx(
             super::ipc_ctx(),
             CAP_MMSRV_EP,
             &raw const mm_msg,
             &raw mut mm_reply,
         );
-        if err != 0 || mm_reply.label != SALTY_OK || mm_reply.regs[0] != total_span_pages as u64 {
+        if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != total_span_pages as u64 {
             let mut lb = LineBuf::new();
             lb.str(b"[PROCMGR] exec ELF MM_MAP_WINDOW failed err=");
             lb.hex(err as u64);
@@ -1534,7 +1534,7 @@ pub(crate) unsafe fn exec_load_elf_mmsrv(
 
             let mut page = seg_start_page;
             while page < seg_end_page {
-                salty::invoke::vspace_protect(child_vspace, page, flags);
+                besalt::invoke::vspace_protect(child_vspace, page, flags);
                 page += 4096;
             }
         }
@@ -1567,7 +1567,7 @@ unsafe fn exec_apply_relocs(
     span_start: u64,
 ) {
     unsafe {
-        use salty::consts::{
+        use besalt::consts::{
             DT_NULL, DT_RELA, DT_RELAENT, DT_RELASZ, PT_DYNAMIC, PT_LOAD, R_X86_64_RELATIVE,
         };
 
@@ -1690,10 +1690,10 @@ pub(crate) unsafe fn exec_load_rtld_mmsrv(
     child_vspace: Cap,
 ) -> Option<ElfLoadResult> {
     unsafe {
-        let mut rtld_name = b"ld-salty.so".as_ptr();
-        let mut rtld_name_len = 10usize;
+        let mut rtld_name = b"ld-besalt.so".as_ptr();
+        let mut rtld_name_len = 12usize;
 
-        let interp = salty::elf_dynamic::elf_get_interp(elf_data, elf_data_len);
+        let interp = besalt::elf_dynamic::elf_get_interp(elf_data, elf_data_len);
         if !interp.is_null() && *interp != 0 {
             let mut last = interp;
             let mut p = interp;
@@ -1710,7 +1710,7 @@ pub(crate) unsafe fn exec_load_rtld_mmsrv(
         }
 
         let mut rtld_entry = CpioEntry::zeroed();
-        if salty::cpio::cpio_find_file(
+        if besalt::cpio::cpio_find_file(
             initrd,
             initrd_size,
             rtld_name,
@@ -1763,22 +1763,22 @@ pub(crate) unsafe fn exec_map_stack_mmsrv(
     unsafe {
         // Map lower stack pages (zero-filled, child only) via MM_MAP_BATCH
         if stack_pages > 1 {
-            let mut mm_msg = SaltyMsg::zeroed();
-            let mut mm_reply = SaltyMsg::zeroed();
-            mm_msg.label = salty::consts::MM_MAP_BATCH;
+            let mut mm_msg = BesaltMsg::zeroed();
+            let mut mm_reply = BesaltMsg::zeroed();
+            mm_msg.label = besalt::consts::MM_MAP_BATCH;
             mm_msg.length = 4;
             mm_msg.regs[0] = pid as u64;
             mm_msg.regs[1] = stack_base;
             mm_msg.regs[2] = (stack_pages - 1) as u64;
             mm_msg.regs[3] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-            let err = salty::ipc::call_ctx(
+            let err = besalt::ipc::call_ctx(
                 super::ipc_ctx(),
                 CAP_MMSRV_EP,
                 &raw const mm_msg,
                 &raw mut mm_reply,
             );
             if err != 0
-                || mm_reply.label != SALTY_OK
+                || mm_reply.label != BESALT_OK
                 || mm_reply.regs[0] != (stack_pages - 1) as u64
             {
                 puts(b"[PROCMGR] exec: MM_MAP_BATCH stack failed\n");
@@ -1787,23 +1787,23 @@ pub(crate) unsafe fn exec_map_stack_mmsrv(
         }
 
         // Map top stack page via MM_MAP_WINDOW (dual-mapped: child + procmgr scratch)
-        let mut mm_msg = SaltyMsg::zeroed();
-        let mut mm_reply = SaltyMsg::zeroed();
-        mm_msg.label = salty::consts::MM_MAP_WINDOW;
+        let mut mm_msg = BesaltMsg::zeroed();
+        let mut mm_reply = BesaltMsg::zeroed();
+        mm_msg.label = besalt::consts::MM_MAP_WINDOW;
         mm_msg.length = 5;
         mm_msg.regs[0] = pid as u64;
         mm_msg.regs[1] = stack_top - 4096;
         mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
         mm_msg.regs[3] = 1;
         mm_msg.regs[4] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-        salty::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-        let err = salty::ipc::call_ctx(
+        besalt::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
+        let err = besalt::ipc::call_ctx(
             super::ipc_ctx(),
             CAP_MMSRV_EP,
             &raw const mm_msg,
             &raw mut mm_reply,
         );
-        if err != 0 || mm_reply.label != SALTY_OK || mm_reply.regs[0] != 1 {
+        if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != 1 {
             puts(b"[PROCMGR] exec: MM_MAP_WINDOW stack top failed\n");
             return -1;
         }
@@ -1830,7 +1830,7 @@ pub(crate) unsafe fn exec_map_initrd_mmsrv(
         let mut mapped_device = true;
 
         for pg in 0..initrd_pages {
-            let err = salty::invoke::vspace_map_device(
+            let err = besalt::invoke::vspace_map_device(
                 proc_vs,
                 CAP_INITRD_UNTYPED,
                 (pg as u64) * 4096,
@@ -1839,7 +1839,7 @@ pub(crate) unsafe fn exec_map_initrd_mmsrv(
             );
             if err != 0 {
                 for mapped_pg in 0..pg {
-                    salty::invoke::vspace_unmap(proc_vs, initrd_base + mapped_pg as u64 * 4096);
+                    besalt::invoke::vspace_unmap(proc_vs, initrd_base + mapped_pg as u64 * 4096);
                 }
                 mapped_device = false;
                 break;
@@ -1852,23 +1852,23 @@ pub(crate) unsafe fn exec_map_initrd_mmsrv(
 
         // Copy fallback: allocate frames via mmsrv MM_MAP_WINDOW (one page at a time)
         for pg in 0..initrd_pages {
-            let mut mm_msg = SaltyMsg::zeroed();
-            let mut mm_reply = SaltyMsg::zeroed();
-            mm_msg.label = salty::consts::MM_MAP_WINDOW;
+            let mut mm_msg = BesaltMsg::zeroed();
+            let mut mm_reply = BesaltMsg::zeroed();
+            mm_msg.label = besalt::consts::MM_MAP_WINDOW;
             mm_msg.length = 5;
             mm_msg.regs[0] = pid as u64;
             mm_msg.regs[1] = initrd_base + pg as u64 * 4096;
             mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
             mm_msg.regs[3] = 1;
             mm_msg.regs[4] = VSPACE_FLAG_USER;
-            salty::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-            let err = salty::ipc::call_ctx(
+            besalt::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
+            let err = besalt::ipc::call_ctx(
                 super::ipc_ctx(),
                 CAP_MMSRV_EP,
                 &raw const mm_msg,
                 &raw mut mm_reply,
             );
-            if err != 0 || mm_reply.label != SALTY_OK || mm_reply.regs[0] != 1 {
+            if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != 1 {
                 puts(b"[PROCMGR] exec: initrd MM_MAP_WINDOW failed\n");
                 return -1;
             }
@@ -1898,23 +1898,23 @@ pub(crate) unsafe fn exec_map_initrd_mmsrv(
 /// Returns 0 on success.
 pub(crate) unsafe fn exec_map_bootinfo_mmsrv(pid: u32) -> i32 {
     unsafe {
-        let mut mm_msg = SaltyMsg::zeroed();
-        let mut mm_reply = SaltyMsg::zeroed();
-        mm_msg.label = salty::consts::MM_MAP_WINDOW;
+        let mut mm_msg = BesaltMsg::zeroed();
+        let mut mm_reply = BesaltMsg::zeroed();
+        mm_msg.label = besalt::consts::MM_MAP_WINDOW;
         mm_msg.length = 5;
         mm_msg.regs[0] = pid as u64;
         mm_msg.regs[1] = super::BOOTINFO_VADDR;
         mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
         mm_msg.regs[3] = 1;
         mm_msg.regs[4] = VSPACE_FLAG_USER;
-        salty::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-        let err = salty::ipc::call_ctx(
+        besalt::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
+        let err = besalt::ipc::call_ctx(
             super::ipc_ctx(),
             CAP_MMSRV_EP,
             &raw const mm_msg,
             &raw mut mm_reply,
         );
-        if err != 0 || mm_reply.label != SALTY_OK || mm_reply.regs[0] != 1 {
+        if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != 1 {
             puts(b"[PROCMGR] exec: bootinfo MM_MAP_WINDOW failed\n");
             return -1;
         }
@@ -1936,21 +1936,21 @@ pub(crate) unsafe fn exec_map_bootinfo_mmsrv(pid: u32) -> i32 {
 /// Returns 0 on success.
 pub(crate) unsafe fn exec_map_ipc_buf_mmsrv(pid: u32, ipc_buf_vaddr: u64) -> i32 {
     unsafe {
-        let mut mm_msg = SaltyMsg::zeroed();
-        let mut mm_reply = SaltyMsg::zeroed();
-        mm_msg.label = salty::consts::MM_MAP_BATCH;
+        let mut mm_msg = BesaltMsg::zeroed();
+        let mut mm_reply = BesaltMsg::zeroed();
+        mm_msg.label = besalt::consts::MM_MAP_BATCH;
         mm_msg.length = 4;
         mm_msg.regs[0] = pid as u64;
         mm_msg.regs[1] = ipc_buf_vaddr;
         mm_msg.regs[2] = 1;
         mm_msg.regs[3] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-        let err = salty::ipc::call_ctx(
+        let err = besalt::ipc::call_ctx(
             super::ipc_ctx(),
             CAP_MMSRV_EP,
             &raw const mm_msg,
             &raw mut mm_reply,
         );
-        if err != 0 || mm_reply.label != SALTY_OK || mm_reply.regs[0] != 1 {
+        if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != 1 {
             puts(b"[PROCMGR] exec: IPC buf MM_MAP_BATCH failed\n");
             return -1;
         }
@@ -1967,23 +1967,23 @@ pub(crate) unsafe fn exec_map_ipc_buf_mmsrv(pid: u32, ipc_buf_vaddr: u64) -> i32
 /// `heap_base` is the page-aligned end of the ELF load span (brk).
 /// `mmap_base` is derived from the process layout.
 pub(crate) fn register_with_mmsrv(pid: u32, vspace_cap: Cap, heap_base: u64, mmap_base: u64) {
-    let mut msg = SaltyMsg::zeroed();
-    let mut mm_reply = SaltyMsg::zeroed();
-    msg.label = salty::consts::MM_REGISTER;
+    let mut msg = BesaltMsg::zeroed();
+    let mut mm_reply = BesaltMsg::zeroed();
+    msg.label = besalt::consts::MM_REGISTER;
     msg.length = 4;
     msg.regs[0] = pid as u64; // client badge
     msg.regs[1] = heap_base;
     msg.regs[2] = mmap_base;
     msg.regs[3] = pid as u64; // pid
     unsafe {
-        salty::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, vspace_cap);
-        let err = salty::ipc::call_ctx(
+        besalt::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, vspace_cap);
+        let err = besalt::ipc::call_ctx(
             super::ipc_ctx(),
             CAP_MMSRV_EP,
             &raw const msg,
             &raw mut mm_reply,
         );
-        if err != 0 || mm_reply.label != SALTY_OK {
+        if err != 0 || mm_reply.label != BESALT_OK {
             let mut lb = LineBuf::new();
             lb.str(b"[PROCMGR] register_with_mmsrv failed pid=");
             lb.hex(pid as u64);
@@ -1997,13 +1997,13 @@ pub(crate) fn register_with_mmsrv(pid: u32, vspace_cap: Cap, heap_base: u64, mma
 
 /// Deregister a process from mmsrv on spawn failure.
 pub(crate) fn deregister_from_mmsrv(pid: u32) {
-    let mut msg = SaltyMsg::zeroed();
-    let mut mm_reply = SaltyMsg::zeroed();
-    msg.label = salty::consts::MM_DEREGISTER;
+    let mut msg = BesaltMsg::zeroed();
+    let mut mm_reply = BesaltMsg::zeroed();
+    msg.label = besalt::consts::MM_DEREGISTER;
     msg.length = 1;
     msg.regs[0] = pid as u64;
     let _ = unsafe {
-        salty::ipc::call_ctx(
+        besalt::ipc::call_ctx(
             super::ipc_ctx(),
             CAP_MMSRV_EP,
             &raw const msg,
@@ -2014,15 +2014,15 @@ pub(crate) fn deregister_from_mmsrv(pid: u32) {
 
 /// Unmap a write window from procmgr's VSpace via mmsrv.
 pub(crate) fn unmap_window_from_mmsrv(window_vaddr: u64, num_pages: u64) {
-    let mut msg = SaltyMsg::zeroed();
-    let mut mm_reply = SaltyMsg::zeroed();
-    msg.label = salty::consts::MM_UNMAP_WINDOW;
+    let mut msg = BesaltMsg::zeroed();
+    let mut mm_reply = BesaltMsg::zeroed();
+    msg.label = besalt::consts::MM_UNMAP_WINDOW;
     msg.length = 2;
     msg.regs[0] = window_vaddr;
     msg.regs[1] = num_pages;
     unsafe {
-        salty::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-        let _ = salty::ipc::call_ctx(
+        besalt::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
+        let _ = besalt::ipc::call_ctx(
             super::ipc_ctx(),
             CAP_MMSRV_EP,
             &raw const msg,
@@ -2038,8 +2038,8 @@ pub(crate) fn unmap_window_from_mmsrv(window_vaddr: u64, num_pages: u64) {
 /// Transactional spawn: preflight → reserve → realize → commit.
 /// On any failure, rolls back all allocated objects and slots.
 pub unsafe fn handle_spawn_tx(
-    msg: &SaltyMsg,
-    reply: &mut SaltyMsg,
+    msg: &BesaltMsg,
+    reply: &mut BesaltMsg,
     badge: u64,
     alloc: &mut Allocator,
 ) {
@@ -2061,10 +2061,10 @@ pub unsafe fn handle_spawn_tx(
         let args_reg_idx = name_reg_idx + name_words;
         let use_pre_ep = (spawn_flags & SPAWN_FLAG_USE_PRE_EP) != 0;
         let start_suspended = (spawn_flags & SPAWN_FLAG_START_SUSPENDED) != 0;
-        let readiness_mode = salty::spawn_policy_readiness(spawn_policy);
-        let policy_map_initrd = salty::spawn_policy_map_initrd(spawn_policy);
-        let policy_is_display = salty::spawn_policy_is_display(spawn_policy);
-        let policy_cnode_bits = salty::spawn_policy_cnode_bits(spawn_policy);
+        let readiness_mode = besalt::spawn_policy_readiness(spawn_policy);
+        let policy_map_initrd = besalt::spawn_policy_map_initrd(spawn_policy);
+        let policy_is_display = besalt::spawn_policy_is_display(spawn_policy);
+        let policy_cnode_bits = besalt::spawn_policy_cnode_bits(spawn_policy);
         let (name, name_len) = super::extract_name(msg, name_reg_idx);
         let is_display = policy_is_display || super::bytes_eq(&name[..name_len], b"display");
 
@@ -2081,7 +2081,7 @@ pub unsafe fn handle_spawn_tx(
 
         // Find ELF in initrd
         let mut elf_entry = CpioEntry::zeroed();
-        let mut found = salty::cpio::cpio_find_file(
+        let mut found = besalt::cpio::cpio_find_file(
             initrd,
             initrd_size,
             name.as_ptr(),
@@ -2097,7 +2097,7 @@ pub unsafe fn handle_spawn_tx(
             legacy[name_len + 1] = b'e';
             legacy[name_len + 2] = b'l';
             legacy[name_len + 3] = b'f';
-            found = salty::cpio::cpio_find_file(
+            found = besalt::cpio::cpio_find_file(
                 initrd,
                 initrd_size,
                 legacy.as_ptr(),
@@ -2107,11 +2107,11 @@ pub unsafe fn handle_spawn_tx(
         }
         if !found {
             puts(b"[PROCMGR] ELF not found in initrd\n");
-            reply.label = SALTY_NOT_FOUND;
+            reply.label = BESALT_NOT_FOUND;
             return;
         }
 
-        let is_dynamic = salty::elf_dynamic::elf_has_interp(elf_entry.data, elf_entry.data_len);
+        let is_dynamic = besalt::elf_dynamic::elf_has_interp(elf_entry.data, elf_entry.data_len);
         // ---- PREFLIGHT: Build SpawnPlan ----
         let do_map_initrd = is_dynamic || policy_map_initrd;
 
@@ -2121,7 +2121,7 @@ pub unsafe fn handle_spawn_tx(
             0
         };
 
-        let effective_timeout_ns = if readiness_mode == salty::SPAWN_READY_NOTIFY {
+        let effective_timeout_ns = if readiness_mode == besalt::SPAWN_READY_NOTIFY {
             compute_ready_timeout_ns(
                 requested_timeout_ns,
                 is_dynamic,
@@ -2133,7 +2133,7 @@ pub unsafe fn handle_spawn_tx(
         };
 
         // Compute spans for VM layout
-        let elf_span = salty::elf_loader::elf_compute_load_span(elf_entry.data, elf_entry.data_len);
+        let elf_span = besalt::elf_loader::elf_compute_load_span(elf_entry.data, elf_entry.data_len);
         let rtld_span = if is_dynamic {
             count_rtld_span(elf_entry.data, elf_entry.data_len, initrd, initrd_size)
         } else {
@@ -2142,9 +2142,9 @@ pub unsafe fn handle_spawn_tx(
 
         // Parse DT_NEEDED to determine which shared libs this ELF needs
         let needed = if is_dynamic {
-            salty::elf_dynamic::elf_get_needed(elf_entry.data, elf_entry.data_len)
+            besalt::elf_dynamic::elf_get_needed(elf_entry.data, elf_entry.data_len)
         } else {
-            salty::elf_dynamic::NeededLibs::new()
+            besalt::elf_dynamic::NeededLibs::new()
         };
 
         let shared_lib_cache_pages = shared_lib_va_pages_for_needed(&needed);
@@ -2155,12 +2155,12 @@ pub unsafe fn handle_spawn_tx(
             shared_lib_cache_pages,
             do_map_initrd,
             lib_window_pages * 4096,
-            || salty::syscall::sys_getrandom(),
+            || besalt::syscall::sys_getrandom(),
         );
 
         if layout.stack_top == 0 {
             puts(b"[PROCMGR] ELF too large for VA layout\n");
-            reply.label = SALTY_INVALID_ARGUMENT;
+            reply.label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
@@ -2187,7 +2187,7 @@ pub unsafe fn handle_spawn_tx(
 
         let Some(slot_idx) = proc_table::alloc_proc() else {
             puts(b"[PROCMGR] process table full\n");
-            reply.label = SALTY_OUT_OF_MEMORY;
+            reply.label = BESALT_OUT_OF_MEMORY;
             return;
         };
 
@@ -2197,7 +2197,7 @@ pub unsafe fn handle_spawn_tx(
         // ---- RESERVE ----
         if !alloc.reserve(plan.total_slots) {
             puts(b"[PROCMGR] slot reservation failed\n");
-            reply.label = SALTY_OUT_OF_MEMORY;
+            reply.label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -2217,7 +2217,7 @@ pub unsafe fn handle_spawn_tx(
                         lb.str(b"\n");
                         lb.flush();
                         alloc.rollback();
-                        reply.label = SALTY_OUT_OF_MEMORY;
+                        reply.label = BESALT_OUT_OF_MEMORY;
                         return;
                     }
                 }
@@ -2236,7 +2236,7 @@ pub unsafe fn handle_spawn_tx(
                         lb.str(b"\n");
                         lb.flush();
                         alloc.rollback();
-                        reply.label = SALTY_OUT_OF_MEMORY;
+                        reply.label = BESALT_OUT_OF_MEMORY;
                         return;
                     }
                 }
@@ -2256,14 +2256,14 @@ pub unsafe fn handle_spawn_tx(
         let child_sig_ntfn = realize!(OBJ_NOTIFICATION, 0, OFF_SIGNAL_NTFN, b"signal ntfn");
 
         let child_ready_ntfn;
-        if plan.readiness_mode == salty::SPAWN_READY_NOTIFY {
+        if plan.readiness_mode == besalt::SPAWN_READY_NOTIFY {
             child_ready_ntfn = realize!(OBJ_NOTIFICATION, 0, OFF_READY_NTFN, b"ready ntfn");
         } else {
             child_ready_ntfn = 0;
         }
 
         // ---- Mint mmsrv EP into child CNode slot 7 (badged with child pid) ----
-        let err = salty::invoke::cnode_mint(
+        let err = besalt::invoke::cnode_mint(
             CAP_SELF_CSPACE,
             CAP_MMSRV_EP_UNBADGED,
             child_cn,
@@ -2273,7 +2273,7 @@ pub unsafe fn handle_spawn_tx(
         if err != 0 {
             puts(b"[PROCMGR] mint mmsrv EP into child failed\n");
             alloc.rollback();
-            reply.label = SALTY_OUT_OF_MEMORY;
+            reply.label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -2284,14 +2284,14 @@ pub unsafe fn handle_spawn_tx(
             child_cn,
             child_sig_ntfn,
             child_ready_ntfn,
-            plan.readiness_mode == salty::SPAWN_READY_NOTIFY,
+            plan.readiness_mode == besalt::SPAWN_READY_NOTIFY,
             plan.is_display,
             pid,
             if use_pre_ep { CAP_RECV_SCRATCH } else { 0 },
         );
         if err != 0 {
             alloc.rollback();
-            reply.label = SALTY_OUT_OF_MEMORY;
+            reply.label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -2299,7 +2299,7 @@ pub unsafe fn handle_spawn_tx(
         let pm_ntfn = *(&raw const super::PM_BOUND_NTFN);
         if pm_ntfn != 0 {
             let cs_badge = 1u64 << (16 + slot_idx);
-            let err = salty::invoke::cnode_mint(
+            let err = besalt::invoke::cnode_mint(
                 CAP_SELF_CSPACE,
                 pm_ntfn,
                 child_cn,
@@ -2312,11 +2312,11 @@ pub unsafe fn handle_spawn_tx(
         }
 
         // ---- Configure TCB ----
-        let err = salty::invoke::tcb_set_space(child_tcb, child_cn, child_vs);
+        let err = besalt::invoke::tcb_set_space(child_tcb, child_cn, child_vs);
         if err != 0 {
             puts(b"[PROCMGR] TCB set_space failed\n");
             alloc.rollback();
-            reply.label = SALTY_OUT_OF_MEMORY;
+            reply.label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -2327,11 +2327,11 @@ pub unsafe fn handle_spawn_tx(
                 None => {
                     puts(b"[PROCMGR] SPAWN: fault EP slot alloc failed\n");
                     alloc.rollback();
-                    reply.label = SALTY_OUT_OF_MEMORY;
+                    reply.label = BESALT_OUT_OF_MEMORY;
                     return;
                 }
             };
-            let err = salty::invoke::cnode_mint(
+            let err = besalt::invoke::cnode_mint(
                 CAP_SELF_CSPACE,
                 CAP_MMSRV_EP_UNBADGED,
                 CAP_SELF_CSPACE,
@@ -2345,7 +2345,7 @@ pub unsafe fn handle_spawn_tx(
                 lb.str(b"\n");
                 lb.flush();
             } else {
-                let err2 = salty::invoke::tcb_set_fault_handler(child_tcb, temp_slot);
+                let err2 = besalt::invoke::tcb_set_fault_handler(child_tcb, temp_slot);
                 if err2 != 0 {
                     let mut lb = LineBuf::new();
                     lb.str(b"[PROCMGR] WARN: tcb_set_fault_handler failed err=");
@@ -2354,37 +2354,37 @@ pub unsafe fn handle_spawn_tx(
                     lb.flush();
                 }
             }
-            salty::invoke::cnode_delete(CAP_SELF_CSPACE, temp_slot);
+            besalt::invoke::cnode_delete(CAP_SELF_CSPACE, temp_slot);
             alloc.free_single_slot(temp_slot);
         }
 
         // ---- Register with mmsrv (before ELF loading — mmsrv needs client registered) ----
         let heap_base = plan.layout.heap_base();
-        let mmap_base = salty::layout::compute_mmap_base(&plan.layout, heap_base);
+        let mmap_base = besalt::layout::compute_mmap_base(&plan.layout, heap_base);
         {
-            let mut mm_msg = SaltyMsg::zeroed();
-            let mut mm_reply = SaltyMsg::zeroed();
-            mm_msg.label = salty::consts::MM_REGISTER;
+            let mut mm_msg = BesaltMsg::zeroed();
+            let mut mm_reply = BesaltMsg::zeroed();
+            mm_msg.label = besalt::consts::MM_REGISTER;
             mm_msg.length = 4;
             mm_msg.regs[0] = pid as u64; // client badge
             mm_msg.regs[1] = heap_base;
             mm_msg.regs[2] = mmap_base;
             mm_msg.regs[3] = pid as u64; // pid
-            salty::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, child_vs);
-            let err = salty::ipc::call_ctx(
+            besalt::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, child_vs);
+            let err = besalt::ipc::call_ctx(
                 super::ipc_ctx(),
                 CAP_MMSRV_EP,
                 &raw const mm_msg,
                 &raw mut mm_reply,
             );
-            if err != 0 || mm_reply.label != SALTY_OK {
+            if err != 0 || mm_reply.label != BESALT_OK {
                 let mut lb = LineBuf::new();
                 lb.str(b"[PROCMGR] SPAWN: mmsrv register failed err=");
                 lb.hex(err as u64);
                 lb.str(b"\n");
                 lb.flush();
                 alloc.rollback();
-                reply.label = SALTY_OUT_OF_MEMORY;
+                reply.label = BESALT_OUT_OF_MEMORY;
                 return;
             }
         }
@@ -2411,7 +2411,7 @@ pub unsafe fn handle_spawn_tx(
             lb.flush();
             deregister_from_mmsrv(pid);
             alloc.rollback();
-            reply.label = SALTY_INVALID_ARGUMENT;
+            reply.label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
@@ -2435,7 +2435,7 @@ pub unsafe fn handle_spawn_tx(
                 None => {
                     deregister_from_mmsrv(pid);
                     alloc.rollback();
-                    reply.label = SALTY_NOT_FOUND;
+                    reply.label = BESALT_NOT_FOUND;
                     return;
                 }
             }
@@ -2449,18 +2449,18 @@ pub unsafe fn handle_spawn_tx(
         };
 
         // ---- Schedule ----
-        let err = salty::invoke::sc_configure(child_sc, 10000, 100000);
+        let err = besalt::invoke::sc_configure(child_sc, 10000, 100000);
         if err != 0 {
             puts(b"[PROCMGR] SC configure failed\n");
             alloc.rollback();
-            reply.label = SALTY_OUT_OF_MEMORY;
+            reply.label = BESALT_OUT_OF_MEMORY;
             return;
         }
-        let err = salty::invoke::sc_bind(child_sc, child_tcb);
+        let err = besalt::invoke::sc_bind(child_sc, child_tcb);
         if err != 0 {
             puts(b"[PROCMGR] SC bind failed\n");
             alloc.rollback();
-            reply.label = SALTY_OUT_OF_MEMORY;
+            reply.label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -2477,13 +2477,13 @@ pub unsafe fn handle_spawn_tx(
             {
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
-                reply.label = SALTY_OUT_OF_MEMORY;
+                reply.label = BESALT_OUT_OF_MEMORY;
                 return;
             }
             if map_boot_info_to_child_tx(child_vs, pid) != 0 {
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
-                reply.label = SALTY_OUT_OF_MEMORY;
+                reply.label = BESALT_OUT_OF_MEMORY;
                 return;
             }
         }
@@ -2493,55 +2493,55 @@ pub unsafe fn handle_spawn_tx(
 
         // Map lower stack pages (zero-filled, child only) via MM_MAP_BATCH
         if stack_pages > 1 {
-            let mut mm_msg = SaltyMsg::zeroed();
-            let mut mm_reply = SaltyMsg::zeroed();
-            mm_msg.label = salty::consts::MM_MAP_BATCH;
+            let mut mm_msg = BesaltMsg::zeroed();
+            let mut mm_reply = BesaltMsg::zeroed();
+            mm_msg.label = besalt::consts::MM_MAP_BATCH;
             mm_msg.length = 4;
             mm_msg.regs[0] = pid as u64;
             mm_msg.regs[1] = plan.layout.stack.base;
             mm_msg.regs[2] = (stack_pages - 1) as u64;
             mm_msg.regs[3] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-            let err = salty::ipc::call_ctx(
+            let err = besalt::ipc::call_ctx(
                 super::ipc_ctx(),
                 CAP_MMSRV_EP,
                 &raw const mm_msg,
                 &raw mut mm_reply,
             );
             if err != 0
-                || mm_reply.label != SALTY_OK
+                || mm_reply.label != BESALT_OK
                 || mm_reply.regs[0] != (stack_pages - 1) as u64
             {
                 puts(b"[PROCMGR] SPAWN: MM_MAP_BATCH stack failed\n");
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
-                reply.label = SALTY_OUT_OF_MEMORY;
+                reply.label = BESALT_OUT_OF_MEMORY;
                 return;
             }
         }
 
         // Map top stack page via MM_MAP_WINDOW (dual-mapped: child + procmgr scratch)
         {
-            let mut mm_msg = SaltyMsg::zeroed();
-            let mut mm_reply = SaltyMsg::zeroed();
-            mm_msg.label = salty::consts::MM_MAP_WINDOW;
+            let mut mm_msg = BesaltMsg::zeroed();
+            let mut mm_reply = BesaltMsg::zeroed();
+            mm_msg.label = besalt::consts::MM_MAP_WINDOW;
             mm_msg.length = 5;
             mm_msg.regs[0] = pid as u64; // target badge
             mm_msg.regs[1] = plan.layout.stack_top - 4096; // child stack top page VA
             mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR; // procmgr write window
             mm_msg.regs[3] = 1; // 1 page
             mm_msg.regs[4] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-            salty::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-            let err = salty::ipc::call_ctx(
+            besalt::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
+            let err = besalt::ipc::call_ctx(
                 super::ipc_ctx(),
                 CAP_MMSRV_EP,
                 &raw const mm_msg,
                 &raw mut mm_reply,
             );
-            if err != 0 || mm_reply.label != SALTY_OK || mm_reply.regs[0] != 1 {
+            if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != 1 {
                 puts(b"[PROCMGR] SPAWN: MM_MAP_WINDOW stack top failed\n");
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
-                reply.label = SALTY_OUT_OF_MEMORY;
+                reply.label = BESALT_OUT_OF_MEMORY;
                 return;
             }
         }
@@ -2551,7 +2551,7 @@ pub unsafe fn handle_spawn_tx(
         let mut child_rsp = plan.layout.stack_top;
 
         if plan.is_dynamic {
-            // Pass library window size for AT_SALTY_INITRD_SZ
+            // Pass library window size for AT_BESALT_INITRD_SZ
             let initrd_window_size = plan.lib_window_pages * 4096;
 
             // Build argv/envp for the child process.
@@ -2666,7 +2666,7 @@ pub unsafe fn handle_spawn_tx(
                     unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, 1);
                     deregister_from_mmsrv(pid);
                     alloc.rollback();
-                    reply.label = SALTY_OUT_OF_MEMORY;
+                    reply.label = BESALT_OUT_OF_MEMORY;
                     return;
                 }
             }
@@ -2677,44 +2677,44 @@ pub unsafe fn handle_spawn_tx(
 
         // ---- Map IPC buffer via mmsrv (child only, zero-filled) ----
         {
-            let mut mm_msg = SaltyMsg::zeroed();
-            let mut mm_reply = SaltyMsg::zeroed();
-            mm_msg.label = salty::consts::MM_MAP_BATCH;
+            let mut mm_msg = BesaltMsg::zeroed();
+            let mut mm_reply = BesaltMsg::zeroed();
+            mm_msg.label = besalt::consts::MM_MAP_BATCH;
             mm_msg.length = 4;
             mm_msg.regs[0] = pid as u64;
             mm_msg.regs[1] = plan.layout.ipc_buf.base;
             mm_msg.regs[2] = 1; // 1 page
             mm_msg.regs[3] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-            let err = salty::ipc::call_ctx(
+            let err = besalt::ipc::call_ctx(
                 super::ipc_ctx(),
                 CAP_MMSRV_EP,
                 &raw const mm_msg,
                 &raw mut mm_reply,
             );
-            if err != 0 || mm_reply.label != SALTY_OK || mm_reply.regs[0] != 1 {
+            if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != 1 {
                 puts(b"[PROCMGR] SPAWN: MM_MAP_BATCH ipc failed\n");
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
-                reply.label = SALTY_OUT_OF_MEMORY;
+                reply.label = BESALT_OUT_OF_MEMORY;
                 return;
             }
         }
 
         // ---- Configure TCB with entry point and stack pointer ----
-        let err = salty::invoke::tcb_configure(child_tcb, child_entry_rip, child_rsp, 0);
+        let err = besalt::invoke::tcb_configure(child_tcb, child_entry_rip, child_rsp, 0);
         if err != 0 {
             puts(b"[PROCMGR] TCB configure failed\n");
             deregister_from_mmsrv(pid);
             alloc.rollback();
-            reply.label = SALTY_OUT_OF_MEMORY;
+            reply.label = BESALT_OUT_OF_MEMORY;
             return;
         }
-        let err = salty::invoke::tcb_set_ipc_buffer(child_tcb, plan.layout.ipc_buf.base);
+        let err = besalt::invoke::tcb_set_ipc_buffer(child_tcb, plan.layout.ipc_buf.base);
         if err != 0 {
             puts(b"[PROCMGR] set child IPC buffer failed\n");
             deregister_from_mmsrv(pid);
             alloc.rollback();
-            reply.label = SALTY_OUT_OF_MEMORY;
+            reply.label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -2732,17 +2732,17 @@ pub unsafe fn handle_spawn_tx(
 
         // ---- Start ----
         if !start_suspended {
-            let err = salty::invoke::tcb_resume(child_tcb);
+            let err = besalt::invoke::tcb_resume(child_tcb);
             if err != 0 {
                 puts(b"[PROCMGR] TCB resume failed\n");
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
-                reply.label = SALTY_OUT_OF_MEMORY;
+                reply.label = BESALT_OUT_OF_MEMORY;
                 return;
             }
         }
 
-        if !start_suspended && plan.readiness_mode == salty::SPAWN_READY_NOTIFY {
+        if !start_suspended && plan.readiness_mode == besalt::SPAWN_READY_NOTIFY {
             if super::wait_for_child_ready(
                 child_tcb,
                 child_ready_ntfn,
@@ -2756,7 +2756,7 @@ pub unsafe fn handle_spawn_tx(
                 proc_table::proctab(slot_idx).badge = 0;
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
-                reply.label = SALTY_BUSY;
+                reply.label = BESALT_BUSY;
                 return;
             }
         }
@@ -2845,7 +2845,7 @@ pub unsafe fn handle_spawn_tx(
         // Phase 4 integrity probe: verify initrd at offset 0x45A000 (PT[90] of PD[10])
         // after each spawn. Identifies which spawn corrupts the mapping.
         {
-            let probe_ptr = (salty::INITRD_VADDR + 0x45A000) as *const u8;
+            let probe_ptr = (besalt::INITRD_VADDR + 0x45A000) as *const u8;
             let probe_val = unsafe { core::ptr::read_volatile(probe_ptr) };
             let mut lb = LineBuf::new();
             lb.str(b"[PROCMGR] post-spawn probe PID=");
@@ -2855,7 +2855,7 @@ pub unsafe fn handle_spawn_tx(
             lb.str(b"\n");
             lb.flush();
         }
-        reply.label = SALTY_OK;
+        reply.label = BESALT_OK;
         reply.length = 1;
         reply.regs[0] = pid as u64;
     }
@@ -2884,7 +2884,7 @@ unsafe fn map_initrd_to_child_tx(
         let mut mapped_with_device = true;
 
         for pg in 0..map_pages {
-            let err = salty::invoke::vspace_map_device(
+            let err = besalt::invoke::vspace_map_device(
                 child_vs,
                 CAP_INITRD_UNTYPED,
                 (pg as u64) * 4096,
@@ -2900,7 +2900,7 @@ unsafe fn map_initrd_to_child_tx(
                 lb.str(b"\n");
                 lb.flush();
                 for mapped_pg in 0..pg {
-                    salty::invoke::vspace_unmap(
+                    besalt::invoke::vspace_unmap(
                         child_vs,
                         initrd_base_vaddr + mapped_pg as u64 * 4096,
                     );
@@ -2919,23 +2919,23 @@ unsafe fn map_initrd_to_child_tx(
         let copy_size = map_pages * 4096;
         for pg in 0..map_pages {
             // Dual-map: child gets RO at initrd_base + offset, procmgr gets RW at scratch
-            let mut mm_msg = SaltyMsg::zeroed();
-            let mut mm_reply = SaltyMsg::zeroed();
-            mm_msg.label = salty::consts::MM_MAP_WINDOW;
+            let mut mm_msg = BesaltMsg::zeroed();
+            let mut mm_reply = BesaltMsg::zeroed();
+            mm_msg.label = besalt::consts::MM_MAP_WINDOW;
             mm_msg.length = 5;
             mm_msg.regs[0] = pid as u64;
             mm_msg.regs[1] = initrd_base_vaddr + pg as u64 * 4096;
             mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
             mm_msg.regs[3] = 1;
             mm_msg.regs[4] = VSPACE_FLAG_USER; // child gets read-only
-            salty::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-            let err = salty::ipc::call_ctx(
+            besalt::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
+            let err = besalt::ipc::call_ctx(
                 super::ipc_ctx(),
                 CAP_MMSRV_EP,
                 &raw const mm_msg,
                 &raw mut mm_reply,
             );
-            if err != 0 || mm_reply.label != SALTY_OK || mm_reply.regs[0] != 1 {
+            if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != 1 {
                 puts(b"[PROCMGR] initrd MM_MAP_WINDOW failed\n");
                 return -1;
             }
@@ -2975,23 +2975,23 @@ unsafe fn map_initrd_to_child_tx(
 unsafe fn map_boot_info_to_child_tx(child_vs: Cap, pid: u32) -> i32 {
     unsafe {
         // Dual-map 1 page: child gets it at BOOTINFO_VADDR, procmgr at scratch
-        let mut mm_msg = SaltyMsg::zeroed();
-        let mut mm_reply = SaltyMsg::zeroed();
-        mm_msg.label = salty::consts::MM_MAP_WINDOW;
+        let mut mm_msg = BesaltMsg::zeroed();
+        let mut mm_reply = BesaltMsg::zeroed();
+        mm_msg.label = besalt::consts::MM_MAP_WINDOW;
         mm_msg.length = 5;
         mm_msg.regs[0] = pid as u64;
         mm_msg.regs[1] = super::BOOTINFO_VADDR;
         mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
         mm_msg.regs[3] = 1;
         mm_msg.regs[4] = VSPACE_FLAG_USER; // child gets read-only
-        salty::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-        let err = salty::ipc::call_ctx(
+        besalt::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
+        let err = besalt::ipc::call_ctx(
             super::ipc_ctx(),
             CAP_MMSRV_EP,
             &raw const mm_msg,
             &raw mut mm_reply,
         );
-        if err != 0 || mm_reply.label != SALTY_OK || mm_reply.regs[0] != 1 {
+        if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != 1 {
             puts(b"[PROCMGR] bootinfo MM_MAP_WINDOW failed\n");
             return -1;
         }
@@ -3023,7 +3023,7 @@ fn copy_child_caps_tx(
     pre_service_ep: Cap,
 ) -> i32 {
     let mut err;
-    err = salty::invoke::cnode_copy(
+    err = besalt::invoke::cnode_copy(
         CAP_SELF_CSPACE,
         child_tcb,
         child_cn,
@@ -3035,7 +3035,7 @@ fn copy_child_caps_tx(
         return err;
     }
 
-    err = salty::invoke::cnode_copy(
+    err = besalt::invoke::cnode_copy(
         CAP_SELF_CSPACE,
         child_vs,
         child_cn,
@@ -3047,7 +3047,7 @@ fn copy_child_caps_tx(
         return err;
     }
 
-    err = salty::invoke::cnode_copy(
+    err = besalt::invoke::cnode_copy(
         CAP_SELF_CSPACE,
         child_cn,
         child_cn,
@@ -3059,7 +3059,7 @@ fn copy_child_caps_tx(
         return err;
     }
 
-    err = salty::invoke::cnode_mint(
+    err = besalt::invoke::cnode_mint(
         CAP_SELF_CSPACE,
         CAP_SERVER_EP,
         child_cn,
@@ -3076,7 +3076,7 @@ fn copy_child_caps_tx(
     }
 
     if pre_service_ep != 0 {
-        err = salty::invoke::cnode_move(
+        err = besalt::invoke::cnode_move(
             child_cn,
             CHILD_CAP_SERVICE_EP,
             CAP_SELF_CSPACE,
@@ -3092,7 +3092,7 @@ fn copy_child_caps_tx(
         }
     }
 
-    err = salty::invoke::cnode_mint(
+    err = besalt::invoke::cnode_mint(
         CAP_SELF_CSPACE,
         CAP_VFS_EP,
         child_cn,
@@ -3101,7 +3101,7 @@ fn copy_child_caps_tx(
     );
     if err != 0 {
         puts(b"[PROCMGR] WARN: mint VFS EP failed, trying unbadged copy\n");
-        err = salty::invoke::cnode_copy(
+        err = besalt::invoke::cnode_copy(
             CAP_SELF_CSPACE,
             CAP_VFS_EP,
             child_cn,
@@ -3113,7 +3113,7 @@ fn copy_child_caps_tx(
         }
     }
 
-    err = salty::invoke::cnode_copy(
+    err = besalt::invoke::cnode_copy(
         CAP_SELF_CSPACE,
         CAP_NAMESERV_EP,
         child_cn,
@@ -3124,7 +3124,7 @@ fn copy_child_caps_tx(
         puts(b"[PROCMGR] WARN: copy Nameserv EP cap failed\n");
     }
 
-    err = salty::invoke::cnode_copy(
+    err = besalt::invoke::cnode_copy(
         CAP_SELF_CSPACE,
         child_sig_ntfn,
         child_cn,
@@ -3136,7 +3136,7 @@ fn copy_child_caps_tx(
     }
 
     if with_ready_ntfn {
-        err = salty::invoke::cnode_copy(
+        err = besalt::invoke::cnode_copy(
             CAP_SELF_CSPACE,
             child_ready_ntfn,
             child_cn,
@@ -3150,7 +3150,7 @@ fn copy_child_caps_tx(
     }
 
     if with_fb_untyped {
-        err = salty::invoke::cnode_copy(
+        err = besalt::invoke::cnode_copy(
             CAP_SELF_CSPACE,
             CAP_FB_UNTYPED,
             child_cn,
@@ -3163,7 +3163,7 @@ fn copy_child_caps_tx(
     }
 
     // Provide initrd device-untyped
-    err = salty::invoke::cnode_copy(
+    err = besalt::invoke::cnode_copy(
         CAP_SELF_CSPACE,
         CAP_INITRD_UNTYPED,
         child_cn,

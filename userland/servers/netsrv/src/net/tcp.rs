@@ -6,11 +6,11 @@
 
 use super::checksum;
 use super::ipv4::{self, Ipv4Header, PROTO_TCP};
-use salty::consts::{
-    INET_OP_ACCEPT, INET_OP_CONNECT, INET_OP_RECV, SALTY_CONN_REFUSED, SALTY_OK, SALTY_TIMED_OUT,
+use besalt::consts::{
+    INET_OP_ACCEPT, INET_OP_CONNECT, INET_OP_RECV, BESALT_CONN_REFUSED, BESALT_OK, BESALT_TIMED_OUT,
     SYS_CLOCK_GETTIME, SYS_GETRANDOM,
 };
-use salty::types::Timespec;
+use besalt::types::Timespec;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -324,7 +324,7 @@ fn now_ns() -> u64 {
     let mut ts = Timespec::zeroed();
     // SAFETY: Passing valid stack pointer for clock_gettime output.
     let _ =
-        unsafe { salty::syscall::syscall(SYS_CLOCK_GETTIME, 0, &raw mut ts as u64, 0, 0, 0, 0) };
+        unsafe { besalt::syscall::syscall(SYS_CLOCK_GETTIME, 0, &raw mut ts as u64, 0, 0, 0, 0) };
     ts.tv_sec * 1_000_000_000 + ts.tv_nsec
 }
 
@@ -332,7 +332,7 @@ fn generate_isn() -> u32 {
     let mut buf = [0u8; 4];
     // SAFETY: Passing valid stack buffer to GetRandom syscall.
     let _ =
-        unsafe { salty::syscall::syscall(SYS_GETRANDOM, buf.as_mut_ptr() as u64, 4, 0, 0, 0, 0) };
+        unsafe { besalt::syscall::syscall(SYS_GETRANDOM, buf.as_mut_ptr() as u64, 4, 0, 0, 0, 0) };
     let rnd = u32::from_ne_bytes(buf);
     let clock = (now_ns() / 4_000) as u32; // ~4us granularity
     rnd.wrapping_add(clock)
@@ -1331,7 +1331,7 @@ fn handle_syn_sent(idx: usize, ip_hdr: &Ipv4Header, hdr: &TcpHeader) {
                     tcb.pending_connect = false;
                     push_completion(Completion {
                         conn_id: tcb.conn_id,
-                        result: SALTY_CONN_REFUSED,
+                        result: BESALT_CONN_REFUSED,
                         op_type: INET_OP_CONNECT,
                         data: [0u8; 152],
                         data_len: 0,
@@ -1380,7 +1380,7 @@ fn handle_syn_sent(idx: usize, ip_hdr: &Ipv4Header, hdr: &TcpHeader) {
                 tcb.pending_connect = false;
                 push_completion(Completion {
                     conn_id: tcb.conn_id,
-                    result: SALTY_OK,
+                    result: BESALT_OK,
                     op_type: INET_OP_CONNECT,
                     data: [0u8; 152],
                     data_len: 0,
@@ -1418,7 +1418,7 @@ fn handle_syn_received(idx: usize, hdr: &TcpHeader) {
                 tcb.pending_accept = false;
                 push_completion(Completion {
                     conn_id: tcb.parent_conn_id,
-                    result: SALTY_CONN_REFUSED,
+                    result: BESALT_CONN_REFUSED,
                     op_type: INET_OP_ACCEPT,
                     data: [0u8; 152],
                     data_len: 0,
@@ -1451,7 +1451,7 @@ fn handle_syn_received(idx: usize, hdr: &TcpHeader) {
             tcb.pending_accept = false;
             push_completion(Completion {
                 conn_id: tcb.parent_conn_id,
-                result: SALTY_OK,
+                result: BESALT_OK,
                 op_type: INET_OP_ACCEPT,
                 data: [0u8; 152],
                 data_len: 0,
@@ -1470,7 +1470,7 @@ fn handle_established(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
 
         // RST
         if (hdr.flags & TCP_FLAG_RST) != 0 {
-            complete_pending_with_error(idx, SALTY_CONN_REFUSED);
+            complete_pending_with_error(idx, BESALT_CONN_REFUSED);
             reset_tcb(idx);
             return;
         }
@@ -1485,7 +1485,7 @@ fn handle_established(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
                 hdr.ack,
                 0,
             );
-            complete_pending_with_error(idx, SALTY_CONN_REFUSED);
+            complete_pending_with_error(idx, BESALT_CONN_REFUSED);
             reset_tcb(idx);
             return;
         }
@@ -1526,7 +1526,7 @@ fn handle_established(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
                 tcb.pending_recv = false;
                 push_completion(Completion {
                     conn_id: tcb.conn_id,
-                    result: SALTY_OK,
+                    result: BESALT_OK,
                     op_type: INET_OP_RECV,
                     data: [0u8; 152],
                     data_len: 0,
@@ -1806,7 +1806,7 @@ fn process_data(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
             let max = core::cmp::min(tcb.pending_recv_max as usize, 152);
             let mut comp = Completion {
                 conn_id: tcb.conn_id,
-                result: SALTY_OK,
+                result: BESALT_OK,
                 op_type: INET_OP_RECV,
                 data: [0u8; 152],
                 data_len: 0,
@@ -1942,7 +1942,7 @@ pub(crate) fn process_timers() {
                     tcb.snd_nxt,
                     tcb.rcv_nxt,
                 );
-                complete_pending_with_error(i, SALTY_TIMED_OUT);
+                complete_pending_with_error(i, BESALT_TIMED_OUT);
                 reset_tcb(i);
                 continue;
             }

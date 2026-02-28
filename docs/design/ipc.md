@@ -279,7 +279,7 @@ Two additional syscalls extend the basic Send/Recv with timeout support:
 
 When the timeout expires before a partner arrives, the blocked thread is removed
 from the endpoint's wait queue by the sleep queue timer and the syscall returns
-`SALTY_TIMEOUT`. This uses the same sleep queue infrastructure as `NanoSleep`
+`BESALT_CANCELLED`. This uses the same sleep queue infrastructure as `NanoSleep`
 (syscall 13), implemented in `sched/sleep_queue.rs`.
 
 Timed IPC prevents indefinite blocking in client-server interactions. A server
@@ -303,7 +303,7 @@ futex are in `ThreadState::BlockedOnFutex` and can be woken by any thread that
 calls FUTEX_WAKE on the same address.
 
 Futexes are the building block for userspace mutexes, condition variables,
-semaphores, and rwlocks in libsalty (see `lib/libsalty/src/sync/`).
+semaphores, and rwlocks in libbesalt (see `lib/besalt/lib/src/sync/`).
 
 ## IPC Wait Queue
 

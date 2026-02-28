@@ -2,8 +2,8 @@
 //! Extracted from main.rs for separation of concerns.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use salty::layout::VmLayoutPlan;
-use salty::types::Cap;
+use besalt::layout::VmLayoutPlan;
+use besalt::types::Cap;
 
 // ---- Process states ----
 pub const PROC_FREE: u8 = 0;
@@ -159,7 +159,7 @@ pub unsafe fn init_proctab() {
         let cap = INITIAL_CAPACITY;
         let size = cap * core::mem::size_of::<Process>();
         let pages = (size + 4095) / 4096;
-        let ptr = salty::posix_mm::posix_mmap(
+        let ptr = besalt::posix_mm::posix_mmap(
             core::ptr::null_mut(),
             (pages * 4096) as u64,
             0x3,  // PROT_READ | PROT_WRITE
@@ -168,7 +168,7 @@ pub unsafe fn init_proctab() {
             0,
         );
         if ptr.is_null() || ptr == usize::MAX as *mut u8 {
-            salty::serial::serial_puts(b"[PROCMGR] FATAL: proctab mmap failed\n");
+            besalt::serial::serial_puts(b"[PROCMGR] FATAL: proctab mmap failed\n");
             return;
         }
         PROCTAB_PTR = ptr as *mut Process;
@@ -207,7 +207,7 @@ unsafe fn grow_proctab() -> bool {
         let new_size = new_cap * core::mem::size_of::<Process>();
         let new_pages = (new_size + 4095) / 4096;
 
-        let new_raw = salty::posix_mm::posix_mmap(
+        let new_raw = besalt::posix_mm::posix_mmap(
             core::ptr::null_mut(),
             (new_pages * 4096) as u64,
             0x3,  // PROT_READ | PROT_WRITE
@@ -216,7 +216,7 @@ unsafe fn grow_proctab() -> bool {
             0,
         );
         if new_raw.is_null() || new_raw == usize::MAX as *mut u8 {
-            salty::serial::serial_puts(b"[PROCMGR] proctab grow failed\n");
+            besalt::serial::serial_puts(b"[PROCMGR] proctab grow failed\n");
             return false;
         }
 
@@ -236,13 +236,13 @@ unsafe fn grow_proctab() -> bool {
 
         // Unmap old region
         let old_pages = (old_size + 4095) / 4096;
-        salty::posix_mm::posix_munmap(PROCTAB_PTR as *mut u8, (old_pages * 4096) as u64);
+        besalt::posix_mm::posix_munmap(PROCTAB_PTR as *mut u8, (old_pages * 4096) as u64);
 
         PROCTAB_PTR = new_ptr;
         PROCTAB_CAP = new_cap;
 
         {
-            let mut lb = salty::serial::LineBuf::new();
+            let mut lb = besalt::serial::LineBuf::new();
             lb.str(b"[PROCMGR] proctab grown to ");
             lb.hex(new_cap as u64);
             lb.str(b" entries\n");
@@ -314,9 +314,9 @@ pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
         if child_cn != 0 {
             let child_cnode_slots = 1024u64;
             for i in 0..child_cnode_slots {
-                let err = salty::invoke::cnode_revoke(child_cn, i);
+                let err = besalt::invoke::cnode_revoke(child_cn, i);
                 if err != 0 {
-                    salty::invoke::cnode_delete(child_cn, i);
+                    besalt::invoke::cnode_delete(child_cn, i);
                 }
             }
         }
@@ -329,9 +329,9 @@ pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
             // New allocator path: clean up only the allocated range
             for i in 0..count {
                 let slot = base + i;
-                let err = salty::invoke::cnode_revoke(cap_self_cspace, slot);
+                let err = besalt::invoke::cnode_revoke(cap_self_cspace, slot);
                 if err != 0 {
-                    salty::invoke::cnode_delete(cap_self_cspace, slot);
+                    besalt::invoke::cnode_delete(cap_self_cspace, slot);
                 }
             }
         }

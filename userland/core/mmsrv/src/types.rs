@@ -1,4 +1,4 @@
-use salty::types::Cap;
+use besalt::types::Cap;
 
 pub(crate) const MAX_UT_SOURCES: usize = 12;
 

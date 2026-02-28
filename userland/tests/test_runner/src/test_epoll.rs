@@ -1,10 +1,10 @@
 //! Epoll tests
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use salty::consts::*;
-use salty::posix;
-use salty::serial;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::posix;
+use besalt::serial;
+use besalt::types::*;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Unix domain socket subsystem.
 
-use salty::consts::*;
-use salty::ipc;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::ipc;
+use besalt::types::*;
 
 use crate::client::{extract_path, get_client};
 use crate::consts::*;
@@ -132,26 +132,26 @@ pub(crate) unsafe fn alloc_reply_slot() -> u64 {
     }
 }
 
-pub(crate) unsafe fn handle_socket(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) -> bool {
+pub(crate) unsafe fn handle_socket(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) -> bool {
     unsafe {
         let domain = (*msg).regs[0] as i32;
         let sock_type = (*msg).regs[1] as i32;
 
         // AF_INET sockets are forwarded to the internet stack via crate::inet
-        if domain == salty::consts::AF_INET {
+        if domain == besalt::consts::AF_INET {
             return crate::inet::handle_inet_socket(msg, reply, badge, sock_type);
         }
 
         let sock = alloc_socket();
         if sock.is_null() {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return false;
         }
 
         let cli = get_client(badge);
         if cli.is_null() {
             (*sock).active = 0;
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return false;
         }
 
@@ -161,7 +161,7 @@ pub(crate) unsafe fn handle_socket(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
                 (*(*cli).fds.add(fd)).fd_type = FD_TYPE_SOCKET;
                 (*(*cli).fds.add(fd)).sock_id = (*sock).sock_id;
                 (*(*cli).fds.add(fd)).offset = 0;
-                (*reply).label = SALTY_OK;
+                (*reply).label = BESALT_OK;
                 (*reply).length = 1;
                 (*reply).regs[0] = fd as u64;
                 return false;
@@ -169,12 +169,12 @@ pub(crate) unsafe fn handle_socket(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
         }
 
         (*sock).active = 0;
-        (*reply).label = SALTY_OUT_OF_MEMORY;
+        (*reply).label = BESALT_OUT_OF_MEMORY;
         false
     }
 }
 
-pub(crate) unsafe fn handle_bind(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) -> bool {
+pub(crate) unsafe fn handle_bind(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) -> bool {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
@@ -184,13 +184,13 @@ pub(crate) unsafe fn handle_bind(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_SOCKET
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
 
         let sock = find_socket((*(*cli).fds.add(fd as usize)).sock_id);
         if sock.is_null() || (*sock).state != SOCK_UNBOUND {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
@@ -199,20 +199,20 @@ pub(crate) unsafe fn handle_bind(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
         let mut abs_path = [0u8; MAX_PATH_LEN];
         let raw_len = extract_path(msg, 1, path.as_mut_ptr());
         if raw_len == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
         let Some((path_ptr, path_len)) =
             normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
         else {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         };
 
         // Create a socket inode at this path
         let existing = resolve_path(path_ptr, path_len);
         if !existing.is_null() {
-            (*reply).label = SALTY_ALREADY_EXISTS;
+            (*reply).label = BESALT_ALREADY_EXISTS;
             return false;
         }
 
@@ -220,13 +220,13 @@ pub(crate) unsafe fn handle_bind(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
         let mut child_len: u8 = 0;
         let parent = resolve_parent(path_ptr, path_len, &mut child_name, &mut child_len);
         if parent.is_null() || (*parent).ftype != FTYPE_DIRECTORY || (*parent).readonly != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
         let inode = alloc_inode();
         if inode.is_null() {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return false;
         }
 
@@ -238,12 +238,12 @@ pub(crate) unsafe fn handle_bind(msg: *const SaltyMsg, reply: *mut SaltyMsg, bad
         (*sock).bound_ino = (*inode).ino;
         (*sock).state = SOCK_BOUND;
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         false
     }
 }
 
-pub(crate) unsafe fn handle_listen(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) -> bool {
+pub(crate) unsafe fn handle_listen(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) -> bool {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let backlog = (*msg).regs[1] as u8;
@@ -255,13 +255,13 @@ pub(crate) unsafe fn handle_listen(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_SOCKET
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
 
         let sock = find_socket((*(*cli).fds.add(fd as usize)).sock_id);
         if sock.is_null() || (*sock).state != SOCK_BOUND {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
@@ -271,12 +271,12 @@ pub(crate) unsafe fn handle_listen(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
         } else {
             backlog
         };
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         false
     }
 }
 
-pub(crate) unsafe fn handle_accept(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) -> bool {
+pub(crate) unsafe fn handle_accept(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) -> bool {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
@@ -286,13 +286,13 @@ pub(crate) unsafe fn handle_accept(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_SOCKET
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
 
         let listen_sock = find_socket((*(*cli).fds.add(fd as usize)).sock_id);
         if listen_sock.is_null() || (*listen_sock).state != SOCK_LISTENING {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
@@ -308,11 +308,11 @@ pub(crate) unsafe fn handle_accept(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
                 if srv_sock.is_null() {
                     // Wake blocked connect caller with error
                     if pend.reply_slot != 0 {
-                        let mut err_reply = SaltyMsg::zeroed();
-                        err_reply.label = SALTY_OUT_OF_MEMORY;
+                        let mut err_reply = BesaltMsg::zeroed();
+                        err_reply.label = BESALT_OUT_OF_MEMORY;
                         ipc::send_ctx(ipc_ctx(), pend.reply_slot, &raw const err_reply);
                     }
-                    (*reply).label = SALTY_OUT_OF_MEMORY;
+                    (*reply).label = BESALT_OUT_OF_MEMORY;
                     return false;
                 }
                 (*srv_sock).state = SOCK_CONNECTED;
@@ -323,11 +323,11 @@ pub(crate) unsafe fn handle_accept(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
                     (*srv_sock).active = 0;
                     // Wake blocked connect caller with error
                     if pend.reply_slot != 0 {
-                        let mut err_reply = SaltyMsg::zeroed();
-                        err_reply.label = SALTY_INVALID_OPERATION;
+                        let mut err_reply = BesaltMsg::zeroed();
+                        err_reply.label = BESALT_INVALID_OPERATION;
                         ipc::send_ctx(ipc_ctx(), pend.reply_slot, &raw const err_reply);
                     }
-                    (*reply).label = SALTY_INVALID_OPERATION;
+                    (*reply).label = BESALT_INVALID_OPERATION;
                     return false;
                 }
 
@@ -354,22 +354,22 @@ pub(crate) unsafe fn handle_accept(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
                     (*srv_sock).active = 0;
                     // Wake blocked connect caller with error
                     if pend.reply_slot != 0 {
-                        let mut err_reply = SaltyMsg::zeroed();
-                        err_reply.label = SALTY_OUT_OF_MEMORY;
+                        let mut err_reply = BesaltMsg::zeroed();
+                        err_reply.label = BESALT_OUT_OF_MEMORY;
                         ipc::send_ctx(ipc_ctx(), pend.reply_slot, &raw const err_reply);
                     }
-                    (*reply).label = SALTY_OUT_OF_MEMORY;
+                    (*reply).label = BESALT_OUT_OF_MEMORY;
                     return false;
                 }
 
                 // Wake the blocked connect() caller
                 if pend.reply_slot != 0 {
-                    let mut wake_reply = SaltyMsg::zeroed();
-                    wake_reply.label = SALTY_OK;
+                    let mut wake_reply = BesaltMsg::zeroed();
+                    wake_reply.label = BESALT_OK;
                     ipc::send_ctx(ipc_ctx(), pend.reply_slot, &raw const wake_reply);
                 }
 
-                (*reply).label = SALTY_OK;
+                (*reply).label = BESALT_OK;
                 (*reply).length = 1;
                 (*reply).regs[0] = new_fd as u64;
                 return false;
@@ -378,9 +378,9 @@ pub(crate) unsafe fn handle_accept(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
 
         // No pending connections — block accepter
         let slot = alloc_reply_slot();
-        let err = salty::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
+        let err = besalt::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
         if err != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
         (*listen_sock).accept_reply_slot = slot;
@@ -390,8 +390,8 @@ pub(crate) unsafe fn handle_accept(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
 }
 
 pub(crate) unsafe fn handle_connect(
-    msg: *const SaltyMsg,
-    reply: *mut SaltyMsg,
+    msg: *const BesaltMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) -> bool {
     unsafe {
@@ -403,13 +403,13 @@ pub(crate) unsafe fn handle_connect(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_SOCKET
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
 
         let cli_sock = find_socket((*(*cli).fds.add(fd as usize)).sock_id);
         if cli_sock.is_null() || (*cli_sock).state != SOCK_UNBOUND {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
@@ -418,18 +418,18 @@ pub(crate) unsafe fn handle_connect(
         let mut abs_path = [0u8; MAX_PATH_LEN];
         let raw_len = extract_path(msg, 1, path.as_mut_ptr());
         if raw_len == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
         let Some((path_ptr, path_len)) =
             normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
         else {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         };
         let inode = resolve_path(path_ptr, path_len);
         if inode.is_null() || (*inode).ftype != FTYPE_SOCKET {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return false;
         }
 
@@ -446,7 +446,7 @@ pub(crate) unsafe fn handle_connect(
         }
 
         if listen_sock.is_null() {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
@@ -454,7 +454,7 @@ pub(crate) unsafe fn handle_connect(
         if (*listen_sock).accept_reply_slot != 0 {
             let srv_sock = alloc_socket();
             if srv_sock.is_null() {
-                (*reply).label = SALTY_OUT_OF_MEMORY;
+                (*reply).label = BESALT_OUT_OF_MEMORY;
                 return false;
             }
             (*srv_sock).state = SOCK_CONNECTED;
@@ -481,8 +481,8 @@ pub(crate) unsafe fn handle_connect(
             }
 
             // Wake blocked accept() caller
-            let mut wake_reply = SaltyMsg::zeroed();
-            wake_reply.label = SALTY_OK;
+            let mut wake_reply = BesaltMsg::zeroed();
+            wake_reply.label = BESALT_OK;
             wake_reply.length = 1;
             wake_reply.regs[0] = if new_fd >= 0 { new_fd as u64 } else { u64::MAX };
             ipc::send_ctx(
@@ -493,20 +493,20 @@ pub(crate) unsafe fn handle_connect(
             (*listen_sock).accept_reply_slot = 0;
             (*listen_sock).accept_badge = 0;
 
-            (*reply).label = SALTY_OK;
+            (*reply).label = BESALT_OK;
             return false;
         }
 
         // No accepter waiting — queue as pending and block
         if (*listen_sock).pending_count >= (*listen_sock).backlog {
-            (*reply).label = SALTY_BUSY;
+            (*reply).label = BESALT_BUSY;
             return false;
         }
 
         let slot = alloc_reply_slot();
-        let err = salty::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
+        let err = besalt::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
         if err != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
@@ -528,8 +528,8 @@ pub(crate) unsafe fn handle_connect(
 }
 
 pub(crate) unsafe fn handle_shutdown(
-    msg: *const SaltyMsg,
-    reply: *mut SaltyMsg,
+    msg: *const BesaltMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) -> bool {
     unsafe {
@@ -543,13 +543,13 @@ pub(crate) unsafe fn handle_shutdown(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_SOCKET
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
 
         let sock = find_socket((*(*cli).fds.add(fd as usize)).sock_id);
         if sock.is_null() {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
 
@@ -565,8 +565,8 @@ pub(crate) unsafe fn handle_shutdown(
                     (*peer).peer_closed = 1;
                     // Wake blocked reader on peer
                     if (*peer).recv_reply_slot != 0 {
-                        let mut wake = SaltyMsg::zeroed();
-                        wake.label = SALTY_OK;
+                        let mut wake = BesaltMsg::zeroed();
+                        wake.label = BESALT_OK;
                         wake.length = 1;
                         wake.regs[0] = 0; // EOF
                         ipc::send_ctx(ipc_ctx(), (*peer).recv_reply_slot, &raw const wake);
@@ -578,20 +578,20 @@ pub(crate) unsafe fn handle_shutdown(
             }
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         false
     }
 }
 
 pub(crate) unsafe fn handle_sockpair(
-    _msg: *const SaltyMsg,
-    reply: *mut SaltyMsg,
+    _msg: *const BesaltMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) -> bool {
     unsafe {
         let cli = get_client(badge);
         if cli.is_null() {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return false;
         }
 
@@ -604,7 +604,7 @@ pub(crate) unsafe fn handle_sockpair(
             if !s2.is_null() {
                 (*s2).active = 0;
             }
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return false;
         }
 
@@ -640,11 +640,11 @@ pub(crate) unsafe fn handle_sockpair(
             if fd1 >= 0 {
                 (*(*cli).fds.add(fd1 as usize)).active = 0;
             }
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return false;
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 2;
         (*reply).regs[0] = fd1 as u64;
         (*reply).regs[1] = fd2 as u64;
@@ -655,18 +655,18 @@ pub(crate) unsafe fn handle_sockpair(
 /// Handle read on a socket fd
 pub(crate) unsafe fn handle_socket_read(
     fde: *mut FdEntry,
-    reply: *mut SaltyMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) -> bool {
     unsafe {
         let sock = find_socket((*fde).sock_id);
         if sock.is_null() || (*sock).state != SOCK_CONNECTED {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
         if (*sock).shut_rd != 0 {
-            (*reply).label = SALTY_OK;
+            (*reply).label = BESALT_OK;
             (*reply).length = 1;
             (*reply).regs[0] = 0;
             return false;
@@ -680,7 +680,7 @@ pub(crate) unsafe fn handle_socket_read(
             }
             let dst = &raw mut (*reply).regs[1] as *mut u8;
             let actual = sock_buf_read(sock, dst, count);
-            (*reply).label = SALTY_OK;
+            (*reply).label = BESALT_OK;
             (*reply).length = 1 + ((actual as u64 + 7) / 8);
             (*reply).regs[0] = actual as u64;
 
@@ -692,7 +692,7 @@ pub(crate) unsafe fn handle_socket_read(
         }
 
         if (*sock).peer_closed != 0 {
-            (*reply).label = SALTY_OK;
+            (*reply).label = BESALT_OK;
             (*reply).length = 1;
             (*reply).regs[0] = 0; // EOF
             return false;
@@ -700,9 +700,9 @@ pub(crate) unsafe fn handle_socket_read(
 
         // Block reader — save caller
         let slot = alloc_reply_slot();
-        let err = salty::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
+        let err = besalt::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
         if err != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
         (*sock).recv_reply_slot = slot;
@@ -713,20 +713,20 @@ pub(crate) unsafe fn handle_socket_read(
 
 /// Handle write on a socket fd
 pub(crate) unsafe fn handle_socket_write(
-    msg: *const SaltyMsg,
+    msg: *const BesaltMsg,
     fde: *mut FdEntry,
-    reply: *mut SaltyMsg,
+    reply: *mut BesaltMsg,
 ) -> bool {
     unsafe {
         let sock = find_socket((*fde).sock_id);
         if sock.is_null() || (*sock).state != SOCK_CONNECTED || (*sock).shut_wr != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
         let peer = find_socket((*sock).peer_sock_id);
         if peer.is_null() || (*peer).peer_closed != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
@@ -741,7 +741,7 @@ pub(crate) unsafe fn handle_socket_write(
 
         // Wake blocked reader on peer
         if written > 0 && (*peer).recv_reply_slot != 0 {
-            let mut wake = SaltyMsg::zeroed();
+            let mut wake = BesaltMsg::zeroed();
             let avail = sock_buf_len(peer);
             let mut rcount = avail;
             if rcount > 152 {
@@ -749,7 +749,7 @@ pub(crate) unsafe fn handle_socket_write(
             }
             let dst = &raw mut wake.regs[1] as *mut u8;
             let actual = sock_buf_read(peer, dst, rcount);
-            wake.label = SALTY_OK;
+            wake.label = BESALT_OK;
             wake.length = 1 + ((actual as u64 + 7) / 8);
             wake.regs[0] = actual as u64;
             ipc::send_ctx(ipc_ctx(), (*peer).recv_reply_slot, &raw const wake);
@@ -761,7 +761,7 @@ pub(crate) unsafe fn handle_socket_write(
             crate::poll::wake_poll_waiters((*peer).peer_badge, -1, 0x001); // POLLIN
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 1;
         (*reply).regs[0] = written as u64;
         false
@@ -789,8 +789,8 @@ pub(crate) unsafe fn close_socket(fde: *mut FdEntry) {
                 (*peer).peer_closed = 1;
                 // Wake blocked reader
                 if (*peer).recv_reply_slot != 0 {
-                    let mut wake = SaltyMsg::zeroed();
-                    wake.label = SALTY_OK;
+                    let mut wake = BesaltMsg::zeroed();
+                    wake.label = BESALT_OK;
                     wake.length = 1;
                     wake.regs[0] = 0;
                     ipc::send_ctx(ipc_ctx(), (*peer).recv_reply_slot, &raw const wake);
@@ -801,8 +801,8 @@ pub(crate) unsafe fn close_socket(fde: *mut FdEntry) {
 
         // Wake blocked accept() caller
         if (*sock).accept_reply_slot != 0 {
-            let mut wake = SaltyMsg::zeroed();
-            wake.label = SALTY_INVALID_OPERATION;
+            let mut wake = BesaltMsg::zeroed();
+            wake.label = BESALT_INVALID_OPERATION;
             ipc::send_ctx(ipc_ctx(), (*sock).accept_reply_slot, &raw const wake);
             (*sock).accept_reply_slot = 0;
         }
@@ -810,8 +810,8 @@ pub(crate) unsafe fn close_socket(fde: *mut FdEntry) {
         // Wake pending connect() callers
         for i in 0..(*sock).pending_cap as usize {
             if (*(*sock).pending.add(i)).active != 0 && (*(*sock).pending.add(i)).reply_slot != 0 {
-                let mut wake = SaltyMsg::zeroed();
-                wake.label = SALTY_INVALID_OPERATION;
+                let mut wake = BesaltMsg::zeroed();
+                wake.label = BESALT_INVALID_OPERATION;
                 ipc::send_ctx(
                     ipc_ctx(),
                     (*(*sock).pending.add(i)).reply_slot,
@@ -836,8 +836,8 @@ pub(crate) unsafe fn close_socket(fde: *mut FdEntry) {
 }
 
 pub(crate) unsafe fn handle_sendmsg(
-    msg: *const SaltyMsg,
-    reply: *mut SaltyMsg,
+    msg: *const BesaltMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) -> bool {
     unsafe {
@@ -852,19 +852,19 @@ pub(crate) unsafe fn handle_sendmsg(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_SOCKET
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
 
         let sock = find_socket((*(*cli).fds.add(fd as usize)).sock_id);
         if sock.is_null() || (*sock).state != SOCK_CONNECTED || (*sock).shut_wr != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
         let peer = find_socket((*sock).peer_sock_id);
         if peer.is_null() {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
@@ -891,7 +891,7 @@ pub(crate) unsafe fn handle_sendmsg(
 
         // Wake blocked reader on peer
         if written > 0 && (*peer).recv_reply_slot != 0 {
-            let mut wake = SaltyMsg::zeroed();
+            let mut wake = BesaltMsg::zeroed();
             let avail = sock_buf_len(peer);
             let mut rcount = avail;
             if rcount > 120 {
@@ -899,7 +899,7 @@ pub(crate) unsafe fn handle_sendmsg(
             }
             let dst = &raw mut wake.regs[2] as *mut u8;
             let actual = sock_buf_read(peer, dst, rcount);
-            wake.label = SALTY_OK;
+            wake.label = BESALT_OK;
             wake.regs[0] = actual as u64;
             wake.regs[1] = 0; // no caps in wake path
             wake.length = 2 + ((actual as u64 + 7) / 8);
@@ -907,7 +907,7 @@ pub(crate) unsafe fn handle_sendmsg(
             (*peer).recv_reply_slot = 0;
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 1;
         (*reply).regs[0] = written as u64;
         false
@@ -915,8 +915,8 @@ pub(crate) unsafe fn handle_sendmsg(
 }
 
 pub(crate) unsafe fn handle_recvmsg(
-    msg: *const SaltyMsg,
-    reply: *mut SaltyMsg,
+    msg: *const BesaltMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) -> bool {
     unsafe {
@@ -930,20 +930,20 @@ pub(crate) unsafe fn handle_recvmsg(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_SOCKET
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
 
         let sock = find_socket((*(*cli).fds.add(fd as usize)).sock_id);
         if sock.is_null() || (*sock).state != SOCK_CONNECTED {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
         let avail = sock_buf_len(sock);
         if avail == 0 && (*sock).pending_cap_count == 0 {
             if (*sock).peer_closed != 0 {
-                (*reply).label = SALTY_OK;
+                (*reply).label = BESALT_OK;
                 (*reply).length = 2;
                 (*reply).regs[0] = 0;
                 (*reply).regs[1] = 0;
@@ -952,9 +952,9 @@ pub(crate) unsafe fn handle_recvmsg(
 
             // Block
             let slot = alloc_reply_slot();
-            let err = salty::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
+            let err = besalt::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
             if err != 0 {
-                (*reply).label = SALTY_INVALID_OPERATION;
+                (*reply).label = BESALT_INVALID_OPERATION;
                 return false;
             }
             (*sock).recv_reply_slot = slot;
@@ -1010,7 +1010,7 @@ pub(crate) unsafe fn handle_recvmsg(
             (*sock).pending_cap_count = 0;
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).regs[0] = actual as u64;
         (*reply).regs[1] = new_fd_count as u64;
         (*reply).length = 2 + data_regs + ((new_fd_count as u64 * 4 + 7) / 8);

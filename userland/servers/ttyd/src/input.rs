@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Line discipline and input processing for PTY.
 
-use salty::consts::*;
-use salty::ipc;
-use salty::serial;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::ipc;
+use besalt::serial;
+use besalt::types::*;
 
 use crate::types::*;
 use crate::{ipc_ctx, display_write, PTYS};
@@ -59,7 +59,7 @@ pub fn serial_puts_opost(s: &[u8]) {
 /// Send signal to foreground process group via nbsend to procmgr (fire-and-forget).
 /// Uses POSIX_PM_KILL_PGID to target an explicit pgid.
 pub fn send_signal_pgid(pgid: u32, sig: i32) {
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = POSIX_PM_KILL_PGID;
     msg.length = 2;
     msg.regs[0] = pgid as u64;
@@ -72,8 +72,8 @@ pub fn send_signal_pgid(pgid: u32, sig: i32) {
 /// Signal VFS's bound notification to wake it for PTY data.
 /// Badge bits encode the PTY id.
 pub fn signal_vfs(pty_id: usize) {
-    let _r = salty::syscall::syscall(
-        salty::SYS_SIGNAL,
+    let _r = besalt::syscall::syscall(
+        besalt::SYS_SIGNAL,
         CAP_VFS_NTFN,
         1u64 << pty_id as u64,
         0, 0, 0, 0,
@@ -240,7 +240,7 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
 
 /// TTYD_INPUT_EVENT: raw bytes from console server.
 /// msg.regs[0] = byte_count, msg.regs[1..] = packed bytes.
-pub unsafe fn handle_input_event(msg: &SaltyMsg) {
+pub unsafe fn handle_input_event(msg: &BesaltMsg) {
     unsafe {
         let count = msg.regs[0] as usize;
         if count == 0 || count > 128 { return; }

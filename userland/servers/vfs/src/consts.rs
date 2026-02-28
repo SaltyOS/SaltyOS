@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! VFS protocol constants, file types, and configuration values.
 
-// Cap layout (VFS-specific — different from salty::consts well-known slots)
+// Cap layout (VFS-specific — different from besalt::consts well-known slots)
 pub(crate) const CAP_SELF_TCB: u64 = 0;
 pub(crate) const CAP_SELF_VSPACE: u64 = 1;
 pub(crate) const CAP_SELF_CSPACE: u64 = 2;
@@ -120,7 +120,7 @@ pub(crate) const PROC_FILE_MAPS: u8 = 3;
 pub(crate) const PROC_FILE_ROOT: u8 = 4; // /proc directory itself
 pub(crate) const PROC_FILE_PID_DIR: u8 = 5; // /proc/<pid> directory
 
-// Open flags — use salty::consts::O_* (POSIX u32)
+// Open flags — use besalt::consts::O_* (POSIX u32)
 
 // Inode mode flags
 pub(crate) const S_IFMT_L: u32 = 0o170000;
@@ -130,7 +130,7 @@ pub(crate) const S_IFREG_L: u32 = 0o100000;
 pub(crate) const S_IFSOCK_L: u32 = 0o140000;
 pub(crate) const S_IFLNK_L: u32 = 0o120000;
 
-// Device types — DEV_CONSOLE/DEV_NULL/DEV_ZERO from salty::consts
+// Device types — DEV_CONSOLE/DEV_NULL/DEV_ZERO from besalt::consts
 pub(crate) const DEV_FB0: u8 = 3;
 pub(crate) const DEV_PTY_SLAVE: u8 = 4;
 pub(crate) const DEV_URANDOM: u8 = 5;

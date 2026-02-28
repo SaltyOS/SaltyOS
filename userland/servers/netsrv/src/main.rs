@@ -22,16 +22,16 @@
 #![no_std]
 #![no_main]
 
-extern crate salty;
+extern crate besalt;
 
 mod net;
 
-use salty::consts::*;
-use salty::invoke;
-use salty::ipc;
-use salty::serial;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::invoke;
+use besalt::ipc;
+use besalt::serial;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 // ---------------------------------------------------------------------------
 // Capability slot layout
@@ -80,7 +80,7 @@ pub(crate) fn puts(s: &[u8]) {
 }
 
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
-    &raw mut salty::__salty_ipc_ctx
+    &raw mut besalt::__besalt_ipc_ctx
 }
 
 pub(crate) fn mac_addr() -> [u8; 6] {
@@ -89,7 +89,7 @@ pub(crate) fn mac_addr() -> [u8; 6] {
 }
 
 fn signal_ready() {
-    let _ = salty::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +136,7 @@ pub(crate) fn shm_tx_enqueue(frame: &[u8]) -> bool {
 /// We pass TX_BADGE via the `bits` argument so netdrv sees badge & 0x2 != 0
 /// in its event loop (kernel computes: notification.signal(cap.badge | bits)).
 pub(crate) fn signal_netdrv_tx() {
-    let _ = salty::syscall::syscall(SYS_SIGNAL, CAP_TX_NOTIFICATION, TX_BADGE, 0, 0, 0, 0);
+    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_TX_NOTIFICATION, TX_BADGE, 0, 0, 0, 0);
 }
 
 /// Read a frame from the SHM RX ring. Returns the frame length on success.
@@ -178,15 +178,15 @@ fn setup_shm() -> bool {
     let ctx = ipc_ctx();
 
     // Create SHM
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = MM_SHM_CREATE;
     msg.regs[0] = NET_SHM_ID;
     msg.regs[1] = NET_SHM_PAGES;
     msg.length = 2;
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
-    if err != 0 || (reply.label != SALTY_OK && reply.label != SALTY_ALREADY_EXISTS) {
+    if err != 0 || (reply.label != BESALT_OK && reply.label != BESALT_ALREADY_EXISTS) {
         let mut lb = LineBuf::new();
         lb.str(b"[netsrv] SHM create failed: ");
         lb.dec(if err != 0 { err as u64 } else { reply.label });
@@ -196,17 +196,17 @@ fn setup_shm() -> bool {
     }
 
     // Map SHM
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = MM_SHM_MAP;
     msg.regs[0] = NET_SHM_ID;
     msg.regs[1] = 0;
     msg.regs[2] = SHM_VADDR;
     msg.regs[3] = 0x3; // RW
     msg.length = 4;
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
-    if err != 0 || reply.label != SALTY_OK {
+    if err != 0 || reply.label != BESALT_OK {
         let mut lb = LineBuf::new();
         lb.str(b"[netsrv] SHM map failed: ");
         lb.dec(if err != 0 { err as u64 } else { reply.label });
@@ -244,15 +244,15 @@ fn setup_notification() -> bool {
     unsafe {
         ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_RX_NOTIFICATION, 0);
     }
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = MM_ALLOC_OBJECT;
     msg.regs[0] = OBJ_NOTIFICATION;
     msg.regs[1] = 0;
     msg.length = 2;
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
-    if err != 0 || reply.label != SALTY_OK {
+    if err != 0 || reply.label != BESALT_OK {
         let mut lb = LineBuf::new();
         lb.str(b"[netsrv] Failed to allocate notification: ");
         lb.dec(if err != 0 { err as u64 } else { reply.label });
@@ -294,14 +294,14 @@ fn driver_register() -> bool {
         ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_TX_NOTIFICATION, 0);
     }
 
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = DRIVER_REGISTER; // 0xC0
     msg.regs[0] = NET_SHM_ID;
     msg.length = 1;
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to netdrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_NETDRV_EP, &raw const msg, &raw mut reply) };
-    if err != 0 || reply.label != SALTY_OK {
+    if err != 0 || reply.label != BESALT_OK {
         let mut lb = LineBuf::new();
         lb.str(b"[netsrv] DRIVER_REGISTER failed: ");
         lb.dec(if err != 0 { err as u64 } else { reply.label });
@@ -346,7 +346,7 @@ fn driver_register() -> bool {
 
 fn register_nameserv() {
     let name = b"netsrv";
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = POSIX_NS_REGISTER;
     msg.regs[0] = name.len() as u64;
     msg.length = 1 + (name.len() as u64 + 7) / 8;
@@ -359,14 +359,14 @@ fn register_nameserv() {
             i += 1;
         }
         ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
         let err = ipc::call_ctx(
             ipc_ctx(),
             CAP_NAMESERV_EP,
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != SALTY_OK {
+        if err != 0 || reply.label != BESALT_OK {
             puts(b"[netsrv] nameserv registration failed\n");
         }
     }
@@ -501,12 +501,12 @@ fn check_self_test() {
 ///
 /// All operations return immediately: synchronous operations fill `reply`
 /// with the result; asynchronous operations (connect, recv, accept) return
-/// `SALTY_PENDING` and the TCP/UDP state machine will push a completion
+/// `BESALT_PENDING` and the TCP/UDP state machine will push a completion
 /// later (delivered to VFS via the callback endpoint).
 ///
 /// Returns `true` if the reply is deferred (DNS async): the caller's reply
 /// cap has been saved and will be replied to later via `drain_dns_completions`.
-fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
+fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
     match msg.label {
         NET_REGISTER_VFS => {
             // VFS registers its badged callback EP as an extra cap.
@@ -517,7 +517,7 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
                 *(&raw mut VFS_REGISTERED) = true;
             }
             puts(b"[netsrv] VFS callback EP registered\n");
-            reply.label = SALTY_OK;
+            reply.label = BESALT_OK;
         }
         NET_SOCKET => {
             let sock_type = msg.regs[0] as i32;
@@ -529,11 +529,11 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
                 -1
             };
             if id >= 0 {
-                reply.label = SALTY_OK;
+                reply.label = BESALT_OK;
                 reply.regs[0] = id as u64;
                 reply.length = 1;
             } else {
-                reply.label = SALTY_OUT_OF_MEMORY;
+                reply.label = BESALT_OUT_OF_MEMORY;
             }
         }
         NET_CONNECT => {
@@ -544,17 +544,17 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
                 // UDP connect: store default destination, always immediate
                 let result = net::udp::udp_connect(conn_id, ip, port);
                 reply.label = if result == 0 {
-                    SALTY_OK
+                    BESALT_OK
                 } else {
-                    SALTY_INVALID_ARGUMENT
+                    BESALT_INVALID_ARGUMENT
                 };
             } else {
                 // TCP connect: sends SYN, returns -1 (pending)
                 let result = net::tcp::tcp_connect(conn_id, ip, port);
                 if result == -1 {
-                    reply.label = SALTY_PENDING;
+                    reply.label = BESALT_PENDING;
                 } else {
-                    reply.label = SALTY_INVALID_ARGUMENT;
+                    reply.label = BESALT_INVALID_ARGUMENT;
                 }
             }
         }
@@ -568,9 +568,9 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
                 net::tcp::tcp_bind(conn_id, ip, port)
             };
             reply.label = if result == 0 {
-                SALTY_OK
+                BESALT_OK
             } else {
-                SALTY_INVALID_ARGUMENT
+                BESALT_INVALID_ARGUMENT
             };
         }
         NET_LISTEN => {
@@ -578,9 +578,9 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
             let backlog = msg.regs[1] as u8;
             let result = net::tcp::tcp_listen(conn_id, backlog);
             reply.label = if result == 0 {
-                SALTY_OK
+                BESALT_OK
             } else {
-                SALTY_INVALID_ARGUMENT
+                BESALT_INVALID_ARGUMENT
             };
         }
         NET_ACCEPT => {
@@ -589,18 +589,18 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
             if result == -1 {
                 // No pending connections -- tell VFS this is async
                 net::tcp::set_pending_accept(conn_id);
-                reply.label = SALTY_PENDING;
+                reply.label = BESALT_PENDING;
             } else if result > 0 {
                 // Connection already in backlog, completed immediately
                 let new_cid = result as u32;
                 let (ip, port) = net::tcp::tcp_getpeername(new_cid);
-                reply.label = SALTY_OK;
+                reply.label = BESALT_OK;
                 reply.regs[0] = new_cid as u64;
                 reply.regs[1] = ip as u64;
                 reply.regs[2] = port as u64;
                 reply.length = 3;
             } else {
-                reply.label = SALTY_INVALID_ARGUMENT;
+                reply.label = BESALT_INVALID_ARGUMENT;
             }
         }
         NET_SEND => {
@@ -617,7 +617,7 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
             } else {
                 net::tcp::tcp_send(conn_id, data)
             };
-            reply.label = SALTY_OK;
+            reply.label = BESALT_OK;
             reply.regs[0] = if sent >= 0 { sent as u64 } else { 0 };
             reply.length = 1;
         }
@@ -642,9 +642,9 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
                 } else {
                     net::tcp::set_pending_recv(conn_id, capped as u16);
                 }
-                reply.label = SALTY_PENDING;
+                reply.label = BESALT_PENDING;
             } else {
-                reply.label = SALTY_OK;
+                reply.label = BESALT_OK;
                 reply.regs[0] = result as u64;
                 reply.length = 1 + ((result as u64 + 7) / 8);
             }
@@ -661,7 +661,7 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
                 core::slice::from_raw_parts(data_ptr, actual)
             };
             let sent = net::udp::udp_sendto(conn_id, data, ip, port);
-            reply.label = SALTY_OK;
+            reply.label = BESALT_OK;
             reply.regs[0] = if sent >= 0 { sent as u64 } else { 0 };
             reply.length = 1;
         }
@@ -677,9 +677,9 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
             let (result, src_ip, src_port) = net::udp::udp_recvfrom(conn_id, buf);
             if result == -1 {
                 net::udp::set_pending_recv(conn_id, capped as u16);
-                reply.label = SALTY_PENDING;
+                reply.label = BESALT_PENDING;
             } else {
-                reply.label = SALTY_OK;
+                reply.label = BESALT_OK;
                 reply.regs[0] = result as u64;
                 reply.regs[1] = src_ip as u64;
                 reply.regs[2] = src_port as u64;
@@ -693,13 +693,13 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
             } else {
                 net::tcp::tcp_close(conn_id);
             }
-            reply.label = SALTY_OK;
+            reply.label = BESALT_OK;
         }
         NET_SHUTDOWN => {
             let conn_id = msg.regs[0] as u32;
             let how = msg.regs[1] as i32;
             net::tcp::tcp_shutdown(conn_id, how);
-            reply.label = SALTY_OK;
+            reply.label = BESALT_OK;
         }
         NET_GETSOCKNAME => {
             let conn_id = msg.regs[0] as u32;
@@ -708,7 +708,7 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
             } else {
                 net::tcp::tcp_getsockname(conn_id)
             };
-            reply.label = SALTY_OK;
+            reply.label = BESALT_OK;
             reply.regs[0] = ip as u64;
             reply.regs[1] = port as u64;
             reply.length = 2;
@@ -720,7 +720,7 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
             } else {
                 net::tcp::tcp_getpeername(conn_id)
             };
-            reply.label = SALTY_OK;
+            reply.label = BESALT_OK;
             reply.regs[0] = ip as u64;
             reply.regs[1] = port as u64;
             reply.length = 2;
@@ -733,14 +733,14 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
             } else {
                 net::tcp::tcp_poll_status(conn_id, events)
             };
-            reply.label = SALTY_OK;
+            reply.label = BESALT_OK;
             reply.regs[0] = revents as u64;
             reply.length = 1;
         }
         NET_DNS_RESOLVE => {
             let hostname_len = msg.regs[0] as usize;
             if hostname_len == 0 || hostname_len > 120 {
-                reply.label = SALTY_INVALID_ARGUMENT;
+                reply.label = BESALT_INVALID_ARGUMENT;
                 return false;
             }
             // SAFETY: Reading hostname bytes from IPC message register area.
@@ -753,7 +753,7 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
             match net::dns::start_resolve(&hostname[..hostname_len]) {
                 Some(_) => return true, // deferred
                 None => {
-                    reply.label = SALTY_OUT_OF_MEMORY;
+                    reply.label = BESALT_OUT_OF_MEMORY;
                 }
             }
         }
@@ -762,12 +762,12 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
             match net::dns::start_resolve_ptr(ip) {
                 Some(_) => return true, // deferred
                 None => {
-                    reply.label = SALTY_OUT_OF_MEMORY;
+                    reply.label = BESALT_OUT_OF_MEMORY;
                 }
             }
         }
         _ => {
-            reply.label = SALTY_INVALID_OPERATION;
+            reply.label = BESALT_INVALID_OPERATION;
         }
     }
     false
@@ -776,10 +776,10 @@ fn dispatch_ipc(msg: &SaltyMsg, reply: &mut SaltyMsg) -> bool {
 /// Map a DNS error to an IPC error label.
 fn dns_error_to_label(err: net::dns::DnsError) -> u64 {
     match err {
-        net::dns::DnsError::NxDomain => SALTY_DNS_NXDOMAIN,
-        net::dns::DnsError::ServerFail => SALTY_DNS_SERVER_FAIL,
-        net::dns::DnsError::Timeout => SALTY_TIMED_OUT,
-        net::dns::DnsError::Other => SALTY_NOT_FOUND,
+        net::dns::DnsError::NxDomain => BESALT_DNS_NXDOMAIN,
+        net::dns::DnsError::ServerFail => BESALT_DNS_SERVER_FAIL,
+        net::dns::DnsError::Timeout => BESALT_TIMED_OUT,
+        net::dns::DnsError::Other => BESALT_NOT_FOUND,
     }
 }
 
@@ -787,11 +787,11 @@ fn dns_error_to_label(err: net::dns::DnsError) -> u64 {
 /// caller caps.
 fn drain_dns_completions(ctx: *mut IpcContext) {
     while let Some(c) = net::dns::pop_completion() {
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
         match c.query_type {
             net::dns::DnsQueryType::A => {
                 if c.success {
-                    reply.label = SALTY_OK;
+                    reply.label = BESALT_OK;
                     reply.regs[0] = c.dns_result.ip_count as u64;
                     reply.regs[1] = c.dns_result.ttl as u64;
                     let mut i = 0;
@@ -806,7 +806,7 @@ fn drain_dns_completions(ctx: *mut IpcContext) {
             }
             net::dns::DnsQueryType::Ptr => {
                 if c.success {
-                    reply.label = SALTY_OK;
+                    reply.label = BESALT_OK;
                     let copy_len = core::cmp::min(c.ptr_hostname_len, 152);
                     reply.regs[0] = copy_len as u64;
                     if copy_len > 0 {
@@ -840,7 +840,7 @@ fn drain_dns_completions(ctx: *mut IpcContext) {
 /// # Safety
 ///
 /// `ctx` must be a valid IPC context. `msg` and `badge` must be valid pointers.
-unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut SaltyMsg, badge: *mut u64) {
+unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut BesaltMsg, badge: *mut u64) {
     unsafe {
         if net::dns::has_pending() {
             let now = net::dns::clock_monotonic_ns();
@@ -851,7 +851,7 @@ unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut SaltyMsg, badge: *mut u64) {
                 return;
             }
             let timeout = deadline.saturating_sub(now).max(1_000_000); // min 1ms
-            let r = salty::syscall::syscall(
+            let r = besalt::syscall::syscall(
                 SYS_RECV_TIMED,
                 CAP_SERVER_EP,
                 timeout,
@@ -863,7 +863,7 @@ unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut SaltyMsg, badge: *mut u64) {
             if r.error == 0 {
                 *badge = r.value;
                 // Read message from IPC buffer (same as recv_ctx does)
-                let buf = (*ctx).ipc_buffer as *const SaltyMsg;
+                let buf = (*ctx).ipc_buffer as *const BesaltMsg;
                 *msg = *buf;
             } else {
                 // Timeout: trigger notification processing to check DNS deadlines
@@ -885,7 +885,7 @@ unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut SaltyMsg, badge: *mut u64) {
 /// Message format sent to VFS:
 ///   label = NET_COMPLETE
 ///   regs[0] = conn_id (the connection this completion belongs to)
-///   regs[1] = result  (SALTY_OK, SALTY_CONN_REFUSED, etc.)
+///   regs[1] = result  (BESALT_OK, BESALT_CONN_REFUSED, etc.)
 ///   regs[2] = op_type (INET_OP_CONNECT, INET_OP_RECV, etc.)
 ///   regs[3] = data_len / extra_conn_id (depends on op_type)
 ///   regs[4] = extra_ip / data start
@@ -907,7 +907,7 @@ fn notify_vfs_completion(
         return;
     }
 
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = NET_COMPLETE;
     msg.regs[0] = conn_id as u64;
     msg.regs[1] = result;
@@ -962,7 +962,7 @@ fn notify_vfs_completion(
         }
     }
 
-    let mut resp = SaltyMsg::zeroed();
+    let mut resp = BesaltMsg::zeroed();
     // SAFETY: IPC context is valid; VFS callback EP is in slot 83.
     unsafe {
         ipc::call_ctx(
@@ -1021,7 +1021,7 @@ fn event_loop() -> ! {
     puts(b"[netsrv] Entering event loop\n");
 
     let ctx = ipc_ctx();
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     let mut badge: u64 = 0;
 
     // Set receive slot for VFS callback EP (slot 83).
@@ -1048,7 +1048,7 @@ fn event_loop() -> ! {
             drain_dns_completions(ctx);
 
             // Wait for next event (with timeout if DNS queries are pending)
-            msg = SaltyMsg::zeroed();
+            msg = BesaltMsg::zeroed();
             badge = 0;
             // SAFETY: IPC context is valid.
             unsafe {
@@ -1056,10 +1056,10 @@ fn event_loop() -> ! {
             }
         } else {
             // IPC request on server endpoint
-            let mut reply = SaltyMsg::zeroed();
+            let mut reply = BesaltMsg::zeroed();
             let deferred = dispatch_ipc(&msg, &mut reply);
 
-            msg = SaltyMsg::zeroed();
+            msg = BesaltMsg::zeroed();
             badge = 0;
 
             if deferred {
@@ -1147,6 +1147,6 @@ pub extern "C" fn _start() -> ! {
 
 fn idle() -> ! {
     loop {
-        let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 }

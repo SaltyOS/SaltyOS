@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! VirtIO block device transport layer.
 
-use salty::consts::*;
-use salty::ipc;
-use salty::invoke;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::ipc;
+use besalt::invoke;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 use crate::{ipc_ctx, puts};
 use crate::{CAPACITY_SECTORS, BAR0_IS_IO, PCI_IOPORT_CAP, VIRTIO_INITIALIZED, VQUEUE_BASE};
@@ -192,13 +192,13 @@ pub(crate) fn bar_write32(offset: u64, val: u32) {
 
 /// Query pcisrv for virtio-blk device.
 pub(crate) fn find_virtio_blk() -> Option<(u8, u8, u8, u32, u64)> {
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = PCI_FIND_DEVICE;
     msg.length = 2;
     msg.regs[0] = VIRTIO_VENDOR as u64;
     msg.regs[1] = VIRTIO_BLK_DEVICE as u64;
 
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
@@ -214,7 +214,7 @@ pub(crate) fn find_virtio_blk() -> Option<(u8, u8, u8, u32, u64)> {
 
 /// Get BAR/IRQ info from pcisrv. Returns (bar_base, bar_bits, bar_size, irq, bar_is_io).
 pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u32, u8, bool)> {
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = PCI_GET_CAPS;
     msg.length = 3;
     msg.regs[0] = bus as u64;
@@ -226,7 +226,7 @@ pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u
         ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_RECEIVED_IOPORT, 0);
     }
 
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
@@ -362,14 +362,14 @@ fn virtio_negotiate() -> bool {
     let vq_bytes = layout.total_bytes;
     let vq_pages = (vq_bytes + 4095) / 4096;
     let ctx = ipc_ctx();
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = MM_MMAP;
     msg.length = 4;
     msg.regs[0] = VQUEUE_HINT_VADDR;
     msg.regs[1] = vq_pages * 4096;
     msg.regs[2] = 0x3; // PROT_READ | PROT_WRITE
     msg.regs[3] = 0x22; // MAP_PRIVATE | MAP_ANONYMOUS
-    let mut reply = SaltyMsg::zeroed();
+    let mut reply = BesaltMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         puts(b"[blkdrv] Failed to allocate virtqueue memory\n");

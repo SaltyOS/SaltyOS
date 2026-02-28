@@ -509,7 +509,7 @@ initrd. Init is statically linked and is the first userspace process.
 // kernel/src/init.rs (simplified)
 
 /// Well-known capability slot assignments for the init task.
-/// These must match the constants in lib/libsalty/src/consts.rs.
+/// These must match the constants in lib/besalt/lib/src/consts.rs.
 const CAP_SELF_TCB: usize       = 0;
 const CAP_SELF_VSPACE: usize    = 1;
 const CAP_SELF_CSPACE: usize    = 2;
@@ -553,13 +553,13 @@ fn create_init_task(boot_info: &BootInfo) {
 
 CNode operations are performed via the Invoke syscall (number 9) with the
 CNode capability and an invoke label. Labels are defined in
-`lib/libsalty/src/consts.rs` (range `0x10`-`0x16`).
+`lib/besalt/lib/src/consts.rs` (range `0x10`-`0x16`).
 
 Arguments are passed in message registers (MR0-MR3 in CPU registers,
 MR4+ via IPC buffer).
 
 ```rust
-/// CNode invoke labels (from lib/libsalty/src/consts.rs)
+/// CNode invoke labels (from lib/besalt/lib/src/consts.rs)
 const CNODE_COPY:       u64 = 0x10;
 const CNODE_MINT:       u64 = 0x11;
 const CNODE_MOVE:       u64 = 0x12;
@@ -633,13 +633,13 @@ Memory is only accessible through:
 
 ## Example: Creating a Server
 
-This example shows the userland flow using libsalty invoke wrappers.
+This example shows the userland flow using libbesalt invoke wrappers.
 
 ```rust
-// In init process (using libsalty invoke wrappers)
+// In init process (using libbesalt invoke wrappers)
 
 // 1. Retype untyped memory to create an endpoint
-salty_untyped_retype(
+besalt_untyped_retype(
     untyped_cap,            // source untyped capability slot
     OBJ_ENDPOINT,           // ObjectType::Endpoint = 2
     0,                      // size_bits (unused for Endpoint)
@@ -649,7 +649,7 @@ salty_untyped_retype(
 );
 
 // 2. Mint a badged copy for clients (send-only)
-salty_cnode_mint(
+besalt_cnode_mint(
     CAP_SELF_CSPACE,        // dest CNode
     client_ep_slot,         // dest slot
     CAP_SELF_CSPACE,        // src CNode

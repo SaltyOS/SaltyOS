@@ -2,9 +2,9 @@
 //! Ported from userland/hello/main.c
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use salty::consts::*;
-use salty::posix;
-use salty::serial;
+use besalt::consts::*;
+use besalt::posix;
+use besalt::serial;
 
 pub fn run() -> bool {
     serial::serial_puts(b"[TEST_HELLO] starting\n");

@@ -2,8 +2,8 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use crate::ini::{ServiceDef, RestartPolicy};
-use salty::serial;
-use salty::serial::LineBuf;
+use besalt::serial;
+use besalt::serial::LineBuf;
 
 pub const MAX_SERVICES: usize = 16;
 const MAX_RESTARTS: u16 = 5;

@@ -8,14 +8,14 @@ SaltyOS follows the **microkernel POSIX model** pioneered by Minix3 and QNX:
 
 - The kernel provides only primitives: IPC, scheduling, memory management, capabilities
 - POSIX semantics are implemented entirely in **userspace servers**
-- **libsalty** (Rust) provides POSIX wrappers that translate calls to IPC messages
-- **saltyc** (C) provides a standard C library on top of libsalty
+- **libbesalt** (Rust) provides POSIX wrappers that translate calls to IPC messages
+- **besaltc** (C) provides a standard C library on top of libbesalt
 
 ```
 +-----------------------------------------------+
 |              Applications                      |
 +-----------------------------------------------+
-|    saltyc (C stdlib)  |  libsalty (Rust)       |
+|    besaltc (C stdlib)  |  libbesalt (Rust)       |
 |      [POSIX calls -> IPC + capabilities]       |
 +-----------------------------------------------+
 |  VFS  |  ProcMgr  |  Console  |  Drivers      |
@@ -36,19 +36,19 @@ SaltyOS follows the **microkernel POSIX model** pioneered by Minix3 and QNX:
 
 ## Architecture
 
-### Libraries: libsalty + saltyc
+### Libraries: libbesalt + besaltc
 
 SaltyOS uses a two-layer userspace library stack:
 
-- **libsalty** (`lib/libsalty/`, Rust): System library providing raw syscall wrappers, IPC helpers, capability invocations, and POSIX compatibility functions (`posix.rs`, `posix_mm.rs`, `signals.rs`). Compiled as `libsalty.so` (shared) and linked statically into `init`.
-- **saltyc** (`lib/saltyc/`, C): Standard C library built on top of libsalty, providing stdio, stdlib, string, malloc, unistd, signal, termios, dirent, regex, and more.
+- **libbesalt** (`lib/besalt/lib/`, Rust): System library providing raw syscall wrappers, IPC helpers, capability invocations, and POSIX compatibility functions (`posix.rs`, `posix_mm.rs`, `signals.rs`). Compiled as `libbesalt.so` (shared) and linked statically into `init`.
+- **besaltc** (`lib/besaltc/`, C): Standard C library built on top of libbesalt, providing stdio, stdlib, string, malloc, unistd, signal, termios, dirent, regex, and more.
 
 **How POSIX calls work**:
 ```rust
-// libsalty posix.rs — open() sends IPC to VFS server
+// libbesalt posix.rs — open() sends IPC to VFS server
 pub extern "C" fn open(path: *const u8, flags: i32, mode: u32) -> i32 {
     // Build IPC message with VFS_OPEN label
-    // salty_call(vfs_ep, &msg) → VFS server handles it
+    // besalt_call(vfs_ep, &msg) → VFS server handles it
 }
 ```
 
@@ -59,12 +59,12 @@ pub extern "C" fn open(path: *const u8, flags: i32, mode: u32) -> i32 {
 | **VFS** | open, read, write, close, stat, lseek, dup/dup3, pipe/pipe2, mkfifo, socket (AF_UNIX), poll, epoll, shm_open/shm_unlink, ftruncate |
 | **ProcMgr** | fork, exec, exit, wait, getpid, kill, signal delivery, process groups |
 | **Console** | Serial I/O, line discipline (ICANON/ECHO/ISIG), tcgetattr/tcsetattr, signal generation (Ctrl-C/Ctrl-\/Ctrl-Z) |
-| **libsalty** | mmap (anonymous), munmap, mprotect, brk/sbrk, sigaction, sigprocmask, select |
+| **libbesalt** | mmap (anonymous), munmap, mprotect, brk/sbrk, sigaction, sigprocmask, select |
 
 ### IPC Flow Example
 
 ```
-Application                  libsalty                    VFS Server
+Application                  libbesalt                    VFS Server
     |                           |                            |
     | open("/etc/hosts", O_RDONLY)                           |
     |-------------------------->|                            |
@@ -120,28 +120,28 @@ Application                  libsalty                    VFS Server
 **Unix Domain Sockets**:
 | Function | Status | Notes |
 |----------|--------|-------|
-| `socket(AF_UNIX, ...)` | Implemented | VFS server + libsalty posix.rs |
-| `bind`, `listen`, `accept` | Implemented | VFS server + libsalty posix.rs |
-| `connect` | Implemented | VFS server + libsalty posix.rs |
+| `socket(AF_UNIX, ...)` | Implemented | VFS server + libbesalt posix.rs |
+| `bind`, `listen`, `accept` | Implemented | VFS server + libbesalt posix.rs |
+| `connect` | Implemented | VFS server + libbesalt posix.rs |
 | `sendmsg`, `recvmsg` | Implemented | With fd passing support |
-| `socketpair` | Implemented | VFS server + libsalty posix.rs |
+| `socketpair` | Implemented | VFS server + libbesalt posix.rs |
 | `shutdown` | Implemented | SHUT_RD/SHUT_WR/SHUT_RDWR |
 | `SCM_RIGHTS` | Implemented | fd passing via sendmsg/recvmsg |
 
 **Event Multiplexing**:
 | Function | Status | Notes |
 |----------|--------|-------|
-| `poll` | Implemented | VFS server + libsalty posix.rs |
-| `select` | Implemented | Wrapper around poll in libsalty |
-| `epoll_create1`, `epoll_ctl`, `epoll_wait` | Implemented | VFS server + libsalty posix.rs |
+| `poll` | Implemented | VFS server + libbesalt posix.rs |
+| `select` | Implemented | Wrapper around poll in libbesalt |
+| `epoll_create1`, `epoll_ctl`, `epoll_wait` | Implemented | VFS server + libbesalt posix.rs |
 
 **POSIX Shared Memory**:
 | Function | Status | Notes |
 |----------|--------|-------|
-| `shm_open` | Implemented | VFS server + libsalty posix.rs |
-| `shm_unlink` | Implemented | VFS server + libsalty posix.rs |
+| `shm_open` | Implemented | VFS server + libbesalt posix.rs |
+| `shm_unlink` | Implemented | VFS server + libbesalt posix.rs |
 | `mmap` (shared) | Implemented | MAP_SHARED flag support |
-| `ftruncate` | Implemented | VFS server + libsalty posix.rs |
+| `ftruncate` | Implemented | VFS server + libbesalt posix.rs |
 
 **Signals**:
 | Function | Status | Notes |
@@ -149,7 +149,7 @@ Application                  libsalty                    VFS Server
 | `kill` | Implemented | Via ProcMgr IPC, pid==0 kills process group |
 | `signal` | Implemented | Notification-based delivery |
 | `sigaction` | Implemented | sa_mask, SA_RESETHAND, pending re-raise |
-| `sigprocmask` | Implemented | Syncs with libsalty globals |
+| `sigprocmask` | Implemented | Syncs with libbesalt globals |
 
 ### Pipes, FIFOs, and File Descriptors
 
@@ -322,7 +322,7 @@ Modern X11 (Xorg 1.15+) no longer requires:
 
 ```
 Phase 1: Core POSIX                              [DONE]
-├── libsalty (Rust) + saltyc (C stdlib)
+├── libbesalt (Rust) + besaltc (C stdlib)
 ├── VFS server (file I/O, ramfs, devfs)
 ├── ProcMgr (fork, exec, wait, kill)
 └── Signal delivery (notification-based)

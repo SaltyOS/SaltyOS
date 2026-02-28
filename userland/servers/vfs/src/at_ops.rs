@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! POSIX *at() family: openat, fstatat, unlinkat, renameat, and related operations.
 
-use salty::consts::*;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::types::*;
 
 use crate::client::{extract_path, flags_allow_write, get_client, get_client_noalloc};
 use crate::consts::*;
@@ -28,12 +28,12 @@ pub(crate) unsafe fn do_open(
     path_len: u8,
     flags: u32,
     mode: u32,
-    reply: *mut SaltyMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) {
     unsafe {
         if path_len == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
@@ -73,7 +73,7 @@ pub(crate) unsafe fn do_open(
                 let mut remote_ino = mount_lookup(mount_idx, check_ptr.add(sub_start), sub_len);
                 if remote_ino == 0 {
                     if (flags & O_CREAT) == 0 {
-                        (*reply).label = SALTY_NOT_FOUND;
+                        (*reply).label = BESALT_NOT_FOUND;
                         return;
                     }
                     let (p_start, p_len, l_start, l_len) =
@@ -84,7 +84,7 @@ pub(crate) unsafe fn do_open(
                         mount_lookup(mount_idx, check_ptr.add(sub_start + p_start), p_len)
                     };
                     if parent_ino == 0 {
-                        (*reply).label = SALTY_NOT_FOUND;
+                        (*reply).label = BESALT_NOT_FOUND;
                         return;
                     }
                     use crate::mount::mount_create;
@@ -93,14 +93,14 @@ pub(crate) unsafe fn do_open(
                         check_ptr.add(sub_start + l_start), l_len, mode & 0o777,
                     );
                     if remote_ino == 0 {
-                        (*reply).label = SALTY_INVALID_OPERATION;
+                        (*reply).label = BESALT_INVALID_OPERATION;
                         return;
                     }
                 }
                 // Open existing remote file
                 let cli = get_client(badge);
                 if cli.is_null() {
-                    (*reply).label = SALTY_OUT_OF_MEMORY;
+                    (*reply).label = BESALT_OUT_OF_MEMORY;
                     return;
                 }
                 for fd in 0..(*cli).fds_cap as usize {
@@ -116,13 +116,13 @@ pub(crate) unsafe fn do_open(
                         (*(*cli).fds.add(fd)).mount_batch_count = 0;
                         (*(*cli).fds.add(fd)).mount_batch_index = 0;
                         (*(*cli).fds.add(fd)).mount_batch_next_cursor = 0;
-                        (*reply).label = SALTY_OK;
+                        (*reply).label = BESALT_OK;
                         (*reply).length = 1;
                         (*reply).regs[0] = fd as u64;
                         return;
                     }
                 }
-                (*reply).label = SALTY_OUT_OF_MEMORY;
+                (*reply).label = BESALT_OUT_OF_MEMORY;
                 return;
             }
         }
@@ -131,7 +131,7 @@ pub(crate) unsafe fn do_open(
 
         if inode.is_null() {
             if (flags & O_CREAT) == 0 {
-                (*reply).label = SALTY_NOT_FOUND;
+                (*reply).label = BESALT_NOT_FOUND;
                 return;
             }
 
@@ -155,17 +155,17 @@ pub(crate) unsafe fn do_open(
             }
 
             if inode.is_null() {
-                (*reply).label = SALTY_NOT_FOUND;
+                (*reply).label = BESALT_NOT_FOUND;
                 return;
             }
         } else if (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL) {
-            (*reply).label = SALTY_ALREADY_EXISTS;
+            (*reply).label = BESALT_ALREADY_EXISTS;
             return;
         }
 
         if (*inode).ftype == FTYPE_DIRECTORY {
             if flags_allow_write(flags) || (flags & (O_TRUNC | O_APPEND)) != 0 {
-                (*reply).label = SALTY_INVALID_OPERATION;
+                (*reply).label = BESALT_INVALID_OPERATION;
                 return;
             }
         }
@@ -177,7 +177,7 @@ pub(crate) unsafe fn do_open(
                 if m.active != 0 && m.mount_ino == (*inode).ino {
                     let cli = get_client(badge);
                     if cli.is_null() {
-                        (*reply).label = SALTY_OUT_OF_MEMORY;
+                        (*reply).label = BESALT_OUT_OF_MEMORY;
                         return;
                     }
                     for fd in 0..(*cli).fds_cap as usize {
@@ -193,17 +193,17 @@ pub(crate) unsafe fn do_open(
                             (*(*cli).fds.add(fd)).mount_batch_count = 0;
                             (*(*cli).fds.add(fd)).mount_batch_index = 0;
                             (*(*cli).fds.add(fd)).mount_batch_next_cursor = 0;
-                            (*reply).label = SALTY_OK;
+                            (*reply).label = BESALT_OK;
                             (*reply).length = 1;
                             (*reply).regs[0] = fd as u64;
                             return;
                         }
                     }
-                    (*reply).label = SALTY_OUT_OF_MEMORY;
+                    (*reply).label = BESALT_OUT_OF_MEMORY;
                     return;
                 }
             }
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
 
@@ -211,7 +211,7 @@ pub(crate) unsafe fn do_open(
             if (*inode).readonly != 0
                 && (flags_allow_write(flags) || (flags & (O_TRUNC | O_APPEND)) != 0)
             {
-                (*reply).label = SALTY_INVALID_OPERATION;
+                (*reply).label = BESALT_INVALID_OPERATION;
                 return;
             }
             if (flags & O_TRUNC) != 0 && flags_allow_write(flags) {
@@ -224,7 +224,7 @@ pub(crate) unsafe fn do_open(
 
         let cli = get_client(badge);
         if cli.is_null() {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -249,7 +249,7 @@ pub(crate) unsafe fn do_open(
                     let pipe = find_pipe(pipe_id);
                     if pipe.is_null() {
                         (*(*cli).fds.add(fd)).active = 0;
-                        (*reply).label = SALTY_INVALID_OPERATION;
+                        (*reply).label = BESALT_INVALID_OPERATION;
                         return;
                     }
                     (*(*cli).fds.add(fd)).fd_type = FD_TYPE_PIPE;
@@ -269,20 +269,20 @@ pub(crate) unsafe fn do_open(
                 }
 
                 inode_open((*inode).ino);
-                (*reply).label = SALTY_OK;
+                (*reply).label = BESALT_OK;
                 (*reply).length = 1;
                 (*reply).regs[0] = fd as u64;
                 return;
             }
         }
 
-        (*reply).label = SALTY_OUT_OF_MEMORY;
+        (*reply).label = BESALT_OUT_OF_MEMORY;
     }
 }
 
 /// openat(dirfd, path, flags, mode)
 /// IPC: reg[0]=dirfd, reg[1]=open_flags, reg[2]=mode, reg[3..]=path(len+data)
-pub(crate) unsafe fn handle_openat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_openat(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let dirfd = (*msg).regs[0] as i32;
         let flags = (*msg).regs[1] as u32;
@@ -292,7 +292,7 @@ pub(crate) unsafe fn handle_openat(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
 
         let start_ino = resolve_at_start(badge, dirfd, path.as_ptr(), path_len);
         if start_ino == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
@@ -302,7 +302,7 @@ pub(crate) unsafe fn handle_openat(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
 
 /// fstatat(dirfd, path, statbuf, flags)
 /// IPC: reg[0]=dirfd, reg[1]=at_flags, reg[2..]=path(len+data)
-pub(crate) unsafe fn handle_fstatat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_fstatat(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let dirfd = (*msg).regs[0] as i32;
         let at_flags = (*msg).regs[1] as i32;
@@ -311,14 +311,14 @@ pub(crate) unsafe fn handle_fstatat(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
 
         let start_ino = resolve_at_start(badge, dirfd, path.as_ptr(), path_len);
         if start_ino == 0 && !((at_flags & AT_EMPTY_PATH_VAL) != 0 && path_len == 0) {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
         let inode = if path_len == 0 && (at_flags & AT_EMPTY_PATH_VAL) != 0 {
             // AT_EMPTY_PATH: stat the fd itself
             if dirfd < 0 {
-                (*reply).label = SALTY_INVALID_ARGUMENT;
+                (*reply).label = BESALT_INVALID_ARGUMENT;
                 return;
             }
             let cli = get_client(badge);
@@ -326,7 +326,7 @@ pub(crate) unsafe fn handle_fstatat(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
                 || dirfd >= (*cli).fds_cap as i32
                 || (*(*cli).fds.add(dirfd as usize)).active == 0
             {
-                (*reply).label = SALTY_INVALID_ARGUMENT;
+                (*reply).label = BESALT_INVALID_ARGUMENT;
                 return;
             }
             inode_by_ino((*(*cli).fds.add(dirfd as usize)).inode)
@@ -342,12 +342,12 @@ pub(crate) unsafe fn handle_fstatat(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
                     if sub_len > 0 {
                         let remote_ino = mount_lookup(mount_idx, norm_ptr.add(sub_start), sub_len);
                         if remote_ino == 0 {
-                            (*reply).label = SALTY_NOT_FOUND;
+                            (*reply).label = BESALT_NOT_FOUND;
                             return;
                         }
                         match mount_stat(mount_idx, remote_ino) {
                             Some((size, mode, nlink, mtime, _)) => {
-                                (*reply).label = SALTY_OK;
+                                (*reply).label = BESALT_OK;
                                 (*reply).length = 8;
                                 (*reply).regs[0] = remote_ino;
                                 (*reply).regs[1] = mode as u64;
@@ -363,7 +363,7 @@ pub(crate) unsafe fn handle_fstatat(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
                                 };
                             }
                             None => {
-                                (*reply).label = SALTY_NOT_FOUND;
+                                (*reply).label = BESALT_NOT_FOUND;
                             }
                         }
                         return;
@@ -387,7 +387,7 @@ pub(crate) unsafe fn handle_fstatat(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
                     return;
                 }
             }
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
         fill_stat_reply(reply, inode);
@@ -396,7 +396,7 @@ pub(crate) unsafe fn handle_fstatat(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
 
 /// unlinkat(dirfd, path, flags)
 /// IPC: reg[0]=dirfd, reg[1]=at_flags, reg[2..]=path(len+data)
-pub(crate) unsafe fn handle_unlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_unlinkat(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let dirfd = (*msg).regs[0] as i32;
         let at_flags = (*msg).regs[1] as i32;
@@ -405,7 +405,7 @@ pub(crate) unsafe fn handle_unlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg,
 
         let start_ino = resolve_at_start(badge, dirfd, path.as_ptr(), path_len);
         if start_ino == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
@@ -413,16 +413,16 @@ pub(crate) unsafe fn handle_unlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg,
             // AT_REMOVEDIR: act like rmdir
             let inode = resolve_path_from(start_ino, path.as_ptr(), path_len);
             if inode.is_null() || (*inode).ftype != FTYPE_DIRECTORY {
-                (*reply).label = SALTY_NOT_FOUND;
+                (*reply).label = BESALT_NOT_FOUND;
                 return;
             }
             if (*inode).readonly != 0 {
-                (*reply).label = SALTY_INVALID_OPERATION;
+                (*reply).label = BESALT_INVALID_OPERATION;
                 return;
             }
             for i in 0..(*inode).dirents_cap as usize {
                 if (*(*inode).dirents.add(i)).active != 0 {
-                    (*reply).label = SALTY_INVALID_OPERATION;
+                    (*reply).label = BESALT_INVALID_OPERATION;
                     return;
                 }
             }
@@ -439,7 +439,7 @@ pub(crate) unsafe fn handle_unlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg,
                 dir_remove_entry(parent, child_name, child_len);
             }
             (*inode).active = 0;
-            (*reply).label = SALTY_OK;
+            (*reply).label = BESALT_OK;
         } else {
             // Regular unlink
             let mut child_name: *const u8 = core::ptr::null();
@@ -452,17 +452,17 @@ pub(crate) unsafe fn handle_unlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg,
                 &mut child_len,
             );
             if parent.is_null() || (*parent).readonly != 0 {
-                (*reply).label = SALTY_INVALID_OPERATION;
+                (*reply).label = BESALT_INVALID_OPERATION;
                 return;
             }
             let de = dir_find_entry(parent, child_name, child_len);
             if de.is_null() {
-                (*reply).label = SALTY_NOT_FOUND;
+                (*reply).label = BESALT_NOT_FOUND;
                 return;
             }
             let inode = inode_by_ino((*de).ino);
             if inode.is_null() || (*inode).ftype == FTYPE_DIRECTORY {
-                (*reply).label = SALTY_INVALID_OPERATION;
+                (*reply).label = BESALT_INVALID_OPERATION;
                 return;
             }
             (*de).active = 0;
@@ -470,14 +470,14 @@ pub(crate) unsafe fn handle_unlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg,
             if (*inode).nlink == 0 && (*inode).open_count == 0 {
                 free_inode(inode);
             }
-            (*reply).label = SALTY_OK;
+            (*reply).label = BESALT_OK;
         }
     }
 }
 
 /// renameat(old_dirfd, old_path, new_dirfd, new_path)
 /// IPC: reg[0]=old_dirfd, reg[1]=new_dirfd, reg[2]=old_len, reg[3]=new_len, reg[4..]=paths
-pub(crate) unsafe fn handle_renameat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_renameat(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let old_dirfd = (*msg).regs[0] as i32;
         let new_dirfd = (*msg).regs[1] as i32;
@@ -504,7 +504,7 @@ pub(crate) unsafe fn handle_renameat(msg: *const SaltyMsg, reply: *mut SaltyMsg,
         let old_start = resolve_at_start(badge, old_dirfd, old_path.as_ptr(), old_len);
         let new_start = resolve_at_start(badge, new_dirfd, new_path.as_ptr(), new_len);
         if old_start == 0 || new_start == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
@@ -518,13 +518,13 @@ pub(crate) unsafe fn handle_renameat(msg: *const SaltyMsg, reply: *mut SaltyMsg,
             &mut old_child_len,
         );
         if old_parent.is_null() || (*old_parent).readonly != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return;
         }
 
         let de = dir_find_entry(old_parent, old_child, old_child_len);
         if de.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
         let ino = (*de).ino;
@@ -539,7 +539,7 @@ pub(crate) unsafe fn handle_renameat(msg: *const SaltyMsg, reply: *mut SaltyMsg,
             &mut new_child_len,
         );
         if new_parent.is_null() || (*new_parent).readonly != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return;
         }
 
@@ -558,13 +558,13 @@ pub(crate) unsafe fn handle_renameat(msg: *const SaltyMsg, reply: *mut SaltyMsg,
         }
 
         dir_add_entry(new_parent, new_child, new_child_len, ino);
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
 
 /// mkdirat(dirfd, path, mode)
 /// IPC: reg[0]=dirfd, reg[1]=mode, reg[2..]=path(len+data)
-pub(crate) unsafe fn handle_mkdirat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_mkdirat(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let dirfd = (*msg).regs[0] as i32;
         let mode = (*msg).regs[1] as u32;
@@ -573,13 +573,13 @@ pub(crate) unsafe fn handle_mkdirat(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
 
         let start_ino = resolve_at_start(badge, dirfd, path.as_ptr(), path_len);
         if start_ino == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
         let existing = resolve_path_from(start_ino, path.as_ptr(), path_len);
         if !existing.is_null() {
-            (*reply).label = SALTY_ALREADY_EXISTS;
+            (*reply).label = BESALT_ALREADY_EXISTS;
             return;
         }
 
@@ -593,13 +593,13 @@ pub(crate) unsafe fn handle_mkdirat(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
             &mut child_len,
         );
         if parent.is_null() || (*parent).ftype != FTYPE_DIRECTORY || (*parent).readonly != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return;
         }
 
         let dir = alloc_inode();
         if dir.is_null() {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -609,13 +609,13 @@ pub(crate) unsafe fn handle_mkdirat(msg: *const SaltyMsg, reply: *mut SaltyMsg, 
         (*dir).parent_ino = (*parent).ino;
 
         dir_add_entry(parent, child_name, child_len, (*dir).ino);
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
 
 /// faccessat(dirfd, path, mode, flags)
 /// IPC: reg[0]=dirfd, reg[1]=mode, reg[2]=at_flags, reg[3..]=path(len+data)
-pub(crate) unsafe fn handle_faccessat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_faccessat(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let dirfd = (*msg).regs[0] as i32;
         let mut path = [0u8; MAX_PATH_LEN];
@@ -623,23 +623,23 @@ pub(crate) unsafe fn handle_faccessat(msg: *const SaltyMsg, reply: *mut SaltyMsg
 
         let start_ino = resolve_at_start(badge, dirfd, path.as_ptr(), path_len);
         if start_ino == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
         let inode = resolve_path_from(start_ino, path.as_ptr(), path_len);
         if inode.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
 
 /// fchmodat(dirfd, path, mode, flags)
 /// IPC: reg[0]=dirfd, reg[1]=mode, reg[2]=at_flags, reg[3..]=path(len+data)
 /// Single-user OS — resolve path, verify exists, return OK.
-pub(crate) unsafe fn handle_fchmodat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_fchmodat(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let dirfd = (*msg).regs[0] as i32;
         let mut path = [0u8; MAX_PATH_LEN];
@@ -647,23 +647,23 @@ pub(crate) unsafe fn handle_fchmodat(msg: *const SaltyMsg, reply: *mut SaltyMsg,
 
         let start_ino = resolve_at_start(badge, dirfd, path.as_ptr(), path_len);
         if start_ino == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
         let inode = resolve_path_from(start_ino, path.as_ptr(), path_len);
         if inode.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
 
 /// fchownat(dirfd, path, uid, gid, flags)
 /// IPC: reg[0]=dirfd, reg[1]=uid, reg[2]=gid, reg[3]=at_flags, reg[4..]=path(len+data)
 /// Single-user OS — resolve path, verify exists, return OK.
-pub(crate) unsafe fn handle_fchownat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_fchownat(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let dirfd = (*msg).regs[0] as i32;
         let mut path = [0u8; MAX_PATH_LEN];
@@ -671,23 +671,23 @@ pub(crate) unsafe fn handle_fchownat(msg: *const SaltyMsg, reply: *mut SaltyMsg,
 
         let start_ino = resolve_at_start(badge, dirfd, path.as_ptr(), path_len);
         if start_ino == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
         let inode = resolve_path_from(start_ino, path.as_ptr(), path_len);
         if inode.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
 
 /// fchmod(fd, mode) — change mode on open fd
 /// IPC: reg[0]=fd, reg[1]=mode
 /// Single-user OS — verify fd exists, return OK.
-pub(crate) unsafe fn handle_fchmod(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_fchmod(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
@@ -696,17 +696,17 @@ pub(crate) unsafe fn handle_fchmod(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
             || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
 
 /// fchown(fd, uid, gid) — change owner on open fd
 /// IPC: reg[0]=fd, reg[1]=uid, reg[2]=gid
 /// Single-user OS — verify fd exists, return OK.
-pub(crate) unsafe fn handle_fchown(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_fchown(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
@@ -715,17 +715,17 @@ pub(crate) unsafe fn handle_fchown(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
             || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
 
 /// utimensat(dirfd, path, times, flags)
 /// IPC: reg[0]=dirfd, reg[1]=at_flags, reg[2]=atime_sec, reg[3]=atime_nsec,
 ///      reg[4]=mtime_sec, reg[5]=mtime_nsec, reg[6..]=path(len+data)
-pub(crate) unsafe fn handle_utimensat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_utimensat(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let dirfd = (*msg).regs[0] as i32;
         let at_flags = (*msg).regs[1] as i32;
@@ -739,7 +739,7 @@ pub(crate) unsafe fn handle_utimensat(msg: *const SaltyMsg, reply: *mut SaltyMsg
         let inode = if path_len == 0 && (at_flags & AT_EMPTY_PATH_VAL) != 0 {
             // Operate on dirfd itself
             if dirfd < 0 || dirfd == AT_FDCWD_VAL {
-                (*reply).label = SALTY_INVALID_ARGUMENT;
+                (*reply).label = BESALT_INVALID_ARGUMENT;
                 return;
             }
             let cli = get_client(badge);
@@ -747,14 +747,14 @@ pub(crate) unsafe fn handle_utimensat(msg: *const SaltyMsg, reply: *mut SaltyMsg
                 || dirfd >= (*cli).fds_cap as i32
                 || (*(*cli).fds.add(dirfd as usize)).active == 0
             {
-                (*reply).label = SALTY_INVALID_ARGUMENT;
+                (*reply).label = BESALT_INVALID_ARGUMENT;
                 return;
             }
             inode_by_ino((*(*cli).fds.add(dirfd as usize)).inode)
         } else {
             let start_ino = resolve_at_start(badge, dirfd, path.as_ptr(), path_len);
             if start_ino == 0 {
-                (*reply).label = SALTY_INVALID_ARGUMENT;
+                (*reply).label = BESALT_INVALID_ARGUMENT;
                 return;
             }
             // Normalize relative paths and check for mount points
@@ -765,7 +765,7 @@ pub(crate) unsafe fn handle_utimensat(msg: *const SaltyMsg, reply: *mut SaltyMsg
                 let norm_slice = core::slice::from_raw_parts(norm_ptr, norm_len as usize);
                 if let Some(_mount_idx) = find_mount_for_path(norm_slice, norm_len) {
                     // No SaltyFS utimensat support yet — return OK silently
-                    (*reply).label = SALTY_OK;
+                    (*reply).label = BESALT_OK;
                     return;
                 }
             }
@@ -773,7 +773,7 @@ pub(crate) unsafe fn handle_utimensat(msg: *const SaltyMsg, reply: *mut SaltyMsg
         };
 
         if inode.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
 
@@ -787,7 +787,7 @@ pub(crate) unsafe fn handle_utimensat(msg: *const SaltyMsg, reply: *mut SaltyMsg
             if mtime_nsec == UTIME_NOW_VAL {
                 // Get current monotonic time
                 let res =
-                    salty::syscall::syscall(salty::consts::SYS_CLOCK_GETTIME, 0, 0, 0, 0, 0, 0);
+                    besalt::syscall::syscall(besalt::consts::SYS_CLOCK_GETTIME, 0, 0, 0, 0, 0, 0);
                 let now_sec = res.value / 1_000_000_000;
                 (*inode).mtime = now_sec as u32;
             } else {
@@ -795,22 +795,22 @@ pub(crate) unsafe fn handle_utimensat(msg: *const SaltyMsg, reply: *mut SaltyMsg
             }
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
 
 /// linkat(olddirfd, oldpath, newdirfd, newpath, flags)
 /// IPC: regs[0]=old_len, regs[1..9]=oldpath(64B), regs[9]=new_len, regs[10..18]=newpath(64B)
-pub(crate) unsafe fn handle_linkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_linkat(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let old_len = (*msg).regs[0] as u8;
         if old_len == 0 || old_len as usize > 64 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
         let new_len = (*msg).regs[9] as u8;
         if new_len == 0 || new_len as usize > 64 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
@@ -831,7 +831,7 @@ pub(crate) unsafe fn handle_linkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
         // Build absolute paths for mount check
         let cli = get_client(badge);
         if cli.is_null() {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
@@ -847,7 +847,7 @@ pub(crate) unsafe fn handle_linkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
             }
             let total = cwd_len + 1 + old_len as usize;
             if total > MAX_PATH_LEN {
-                (*reply).label = SALTY_NOT_FOUND;
+                (*reply).label = BESALT_NOT_FOUND;
                 return;
             }
             for i in 0..cwd_len { abs_old[i] = (*cli).cwd[i]; }
@@ -870,7 +870,7 @@ pub(crate) unsafe fn handle_linkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
             }
             let total = cwd_len + 1 + new_len as usize;
             if total > MAX_PATH_LEN {
-                (*reply).label = SALTY_NOT_FOUND;
+                (*reply).label = BESALT_NOT_FOUND;
                 return;
             }
             for i in 0..cwd_len {
@@ -889,7 +889,7 @@ pub(crate) unsafe fn handle_linkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
         if old_mount.is_some() || new_mount.is_some() {
             if old_mount != new_mount {
                 // Cross-filesystem link not supported
-                (*reply).label = SALTY_INVALID_OPERATION;
+                (*reply).label = BESALT_INVALID_OPERATION;
                 return;
             }
             let mount_idx = old_mount.unwrap();
@@ -899,7 +899,7 @@ pub(crate) unsafe fn handle_linkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
             // Resolve old path to existing inode on SaltyFS
             let existing_ino = mount_lookup(mount_idx, abs_old.as_ptr().add(old_sub_start), old_sub_len);
             if existing_ino == 0 {
-                (*reply).label = SALTY_NOT_FOUND;
+                (*reply).label = BESALT_NOT_FOUND;
                 return;
             }
 
@@ -912,7 +912,7 @@ pub(crate) unsafe fn handle_linkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
                 mount_lookup(mount_idx, abs_new.as_ptr().add(new_sub_start + np_start), np_len)
             };
             if new_parent_ino == 0 {
-                (*reply).label = SALTY_NOT_FOUND;
+                (*reply).label = BESALT_NOT_FOUND;
                 return;
             }
 
@@ -931,13 +931,13 @@ pub(crate) unsafe fn handle_linkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
             resolve_path_raw(abs_old.as_ptr(), abs_old_len)
         };
         if target.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
 
         // Cannot hard-link directories
         if (*target).ftype == FTYPE_DIRECTORY {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return;
         }
 
@@ -951,37 +951,37 @@ pub(crate) unsafe fn handle_linkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, b
             &mut child_len,
         );
         if new_parent.is_null() || (*new_parent).readonly != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return;
         }
 
         // Check new name doesn't already exist
         let existing = dir_find_entry(new_parent, child_name, child_len);
         if !existing.is_null() {
-            (*reply).label = SALTY_ALREADY_EXISTS;
+            (*reply).label = BESALT_ALREADY_EXISTS;
             return;
         }
 
         // Add new directory entry pointing to the same inode
         if dir_add_entry(new_parent, child_name, child_len, (*target).ino) != 0 {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
         (*target).nlink += 1;
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
 
 /// symlinkat(target, newdirfd, linkpath)
 /// IPC: regs[0]=newdirfd, regs[1]=target_len, regs[2..10]=target(64B), regs[10]=link_len, regs[11..19]=link(64B)
-pub(crate) unsafe fn handle_symlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_symlinkat(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let newdirfd = (*msg).regs[0] as i32;
 
         let target_len = (*msg).regs[1] as u8;
         if target_len == 0 || target_len > 64 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
         let mut target = [0u8; MAX_PATH_LEN];
@@ -992,7 +992,7 @@ pub(crate) unsafe fn handle_symlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg
 
         let link_len = (*msg).regs[10] as u8;
         if link_len == 0 || link_len > 64 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
         let mut link_path = [0u8; MAX_PATH_LEN];
@@ -1010,14 +1010,14 @@ pub(crate) unsafe fn handle_symlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg
         } else {
             let cli = get_client(badge);
             if cli.is_null() {
-                (*reply).label = SALTY_INVALID_ARGUMENT;
+                (*reply).label = BESALT_INVALID_ARGUMENT;
                 return;
             }
             let mut cwd_len: usize = 0;
             while cwd_len < 128 && (*cli).cwd[cwd_len] != 0 { cwd_len += 1; }
             let total = cwd_len + 1 + link_len as usize;
             if total > MAX_PATH_LEN {
-                (*reply).label = SALTY_NOT_FOUND;
+                (*reply).label = BESALT_NOT_FOUND;
                 return;
             }
             for i in 0..cwd_len { abs_link[i] = (*cli).cwd[i]; }
@@ -1037,7 +1037,7 @@ pub(crate) unsafe fn handle_symlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg
                 mount_lookup(mount_idx, abs_link.as_ptr().add(sub_start + p_start), p_len)
             };
             if parent_ino == 0 {
-                (*reply).label = SALTY_NOT_FOUND;
+                (*reply).label = BESALT_NOT_FOUND;
                 return;
             }
             mount_symlink(
@@ -1052,7 +1052,7 @@ pub(crate) unsafe fn handle_symlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg
         // Resolve start inode for the link path using newdirfd
         let start_ino = resolve_at_start(badge, newdirfd, link_path.as_ptr(), link_len);
         if start_ino == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
@@ -1067,25 +1067,25 @@ pub(crate) unsafe fn handle_symlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg
             &mut child_len,
         );
         if parent.is_null() || (*parent).ftype != FTYPE_DIRECTORY || (*parent).readonly != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return;
         }
         if child_len == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
         // Check that target name doesn't already exist
         let existing = dir_find_entry(parent, child_name, child_len);
         if !existing.is_null() {
-            (*reply).label = SALTY_ALREADY_EXISTS;
+            (*reply).label = BESALT_ALREADY_EXISTS;
             return;
         }
 
         // Allocate symlink target in pool
         let sym_data = alloc_symlink_target(target.as_ptr(), target_len);
         if sym_data.is_null() {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -1093,7 +1093,7 @@ pub(crate) unsafe fn handle_symlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg
         let inode = alloc_inode();
         if inode.is_null() {
             free_symlink_target(sym_data);
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
@@ -1105,27 +1105,27 @@ pub(crate) unsafe fn handle_symlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg
         (*inode).parent_ino = (*parent).ino;
 
         dir_add_entry(parent, child_name, child_len, (*inode).ino);
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
 
 /// readlinkat(dirfd, path) -> target
 /// IPC in: regs[0]=path_len, regs[1..]=path
 /// IPC out: regs[0]=target_len, regs[1..]=target
-pub(crate) unsafe fn handle_readlinkat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_readlinkat(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
         let mut abs_path = [0u8; MAX_PATH_LEN];
         let raw_len = extract_path(msg, 0, path.as_mut_ptr());
 
         if raw_len == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
         let Some((path_ptr, path_len)) =
             normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
         else {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         };
 
@@ -1138,7 +1138,7 @@ pub(crate) unsafe fn handle_readlinkat(msg: *const SaltyMsg, reply: *mut SaltyMs
             );
             let remote_ino = mount_lookup(mount_idx, path_ptr.add(sub_start), sub_len);
             if remote_ino == 0 {
-                (*reply).label = SALTY_NOT_FOUND;
+                (*reply).label = BESALT_NOT_FOUND;
                 return;
             }
             mount_readlink(mount_idx, remote_ino, reply);
@@ -1147,22 +1147,22 @@ pub(crate) unsafe fn handle_readlinkat(msg: *const SaltyMsg, reply: *mut SaltyMs
 
         let inode = resolve_path_raw_nofollow(path_ptr, path_len);
         if inode.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
 
         if (*inode).ftype != FTYPE_SYMLINK {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return;
         }
 
         let (target, target_len) = symlink_target(inode);
         if target.is_null() || target_len == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).regs[0] = target_len as u64;
         (*reply).length = 1 + ((target_len as u64 + 7) / 8);
         let dst = &raw mut (*reply).regs[1] as *mut u8;
@@ -1173,19 +1173,19 @@ pub(crate) unsafe fn handle_readlinkat(msg: *const SaltyMsg, reply: *mut SaltyMs
 }
 
 /// lstat: stat without following final symlink
-pub(crate) unsafe fn handle_lstat(msg: *const SaltyMsg, reply: *mut SaltyMsg, badge: u64) {
+pub(crate) unsafe fn handle_lstat(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
         let mut abs_path = [0u8; MAX_PATH_LEN];
         let raw_len = extract_path(msg, 0, path.as_mut_ptr());
         if raw_len == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
         let Some((path_ptr, path_len)) =
             normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
         else {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         };
         let inode = resolve_path_raw_nofollow(path_ptr, path_len);
@@ -1203,7 +1203,7 @@ pub(crate) unsafe fn handle_lstat(msg: *const SaltyMsg, reply: *mut SaltyMsg, ba
                     return;
                 }
             }
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
         fill_stat_reply(reply, inode);

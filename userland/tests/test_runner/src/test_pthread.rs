@@ -1,11 +1,11 @@
 //! Pthreads test suite
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use salty::consts::*;
-use salty::pthread;
-use salty::serial;
-use salty::sync;
-use salty::tls;
+use besalt::consts::*;
+use besalt::pthread;
+use besalt::serial;
+use besalt::sync;
+use besalt::tls;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 fn puts(s: &[u8]) {
@@ -82,7 +82,7 @@ fn test_detach() -> bool {
 
     // Give the detached thread a chance to finish
     for _ in 0..100 {
-        salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
     // Join should fail on a detached thread
@@ -236,7 +236,7 @@ static CV_READY: AtomicU32 = AtomicU32::new(0);
 unsafe extern "C" fn thread_producer(_arg: *mut u8) -> *mut u8 {
     // Yield a few times to let consumer get set up
     for _ in 0..10 {
-        salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
     CV_MUTEX.lock();
@@ -316,7 +316,7 @@ fn test_condvar_broadcast() -> bool {
 
     // Let waiters block
     for _ in 0..50 {
-        salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
     BC_MUTEX.lock();
@@ -393,7 +393,7 @@ unsafe extern "C" fn thread_reader(_arg: *mut u8) -> *mut u8 {
     }
     // Hold the lock briefly
     for _ in 0..20 {
-        salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
     RW_READERS.fetch_sub(1, Ordering::Relaxed);
     RW_LOCK.read_unlock();
@@ -509,7 +509,7 @@ unsafe extern "C" fn thread_cancellable(_arg: *mut u8) -> *mut u8 {
 
     // Loop with cancellation points
     loop {
-        salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
         pthread::pthread_testcancel();
     }
 }
@@ -528,7 +528,7 @@ fn test_cancel() -> bool {
 
     // Let thread start
     for _ in 0..20 {
-        salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
     // Cancel it
@@ -540,7 +540,7 @@ fn test_cancel() -> bool {
 
     // Let cancellation take effect
     for _ in 0..50 {
-        salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
     let mut retval: *mut u8 = core::ptr::null_mut();
@@ -748,7 +748,7 @@ fn test_semaphore_producer_consumer() -> bool {
 
     // Let consumer block on wait
     for _ in 0..30 {
-        salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
     // Consumer should still be waiting

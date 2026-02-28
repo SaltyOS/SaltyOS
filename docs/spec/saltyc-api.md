@@ -1,13 +1,13 @@
-# saltyc API Reference
+# besaltc API Reference
 
 SaltyOS C Standard Library — POSIX and BSD-compatible C functions implemented in
 Rust. All functions use C ABI (`extern "C"`) and are linked into executables via
-`libsalty.so`.
+`libbesalt.so`.
 
 **Status key:** **F** = full implementation, **P** = partial (reduced functionality),
 **S** = stub (returns ENOSYS/-1/no-op).
 
-**Source:** `lib/saltyc/src/`
+**Source:** `lib/besalt/c/src/`
 
 ---
 
@@ -311,7 +311,7 @@ Defined constants (50+): `EPERM`(1), `ENOENT`(2), `ESRCH`(3), `EINTR`(4),
 
 Source: `unistd.rs`
 
-All file operations delegate to `libsalty` POSIX wrappers which communicate
+All file operations delegate to `libbesalt` POSIX wrappers which communicate
 with the VFS server via IPC.
 
 ### File I/O
@@ -457,20 +457,20 @@ Source: `unistd.rs`
 
 | Function | St | Notes |
 |---|---|---|
-| `mmap` | F | MAP_ANONYMOUS, MAP_SHARED, MAP_PRIVATE; pages allocated via libsalty posix_mmap |
-| `munmap` | F | Via libsalty posix_munmap |
+| `mmap` | F | MAP_ANONYMOUS, MAP_SHARED, MAP_PRIVATE; pages allocated via libbesalt posix_mmap |
+| `munmap` | F | Via libbesalt posix_munmap |
 
 Constants: `PROT_READ`(1), `PROT_WRITE`(2), `PROT_EXEC`(4), `PROT_NONE`(0),
 `MAP_SHARED`(1), `MAP_PRIVATE`(2), `MAP_ANONYMOUS`(0x20), `MAP_FIXED`(0x10),
 `MAP_FAILED`(-1 as pointer).
 
-`shm_open`/`shm_unlink` are in `libsalty` (not saltyc).
+`shm_open`/`shm_unlink` are in `libbesalt` (not besaltc).
 
 ---
 
 ## sys/socket.h
 
-Socket operations are in `libsalty` (`posix.rs`) rather than saltyc. The saltyc
+Socket operations are in `libbesalt` (`posix.rs`) rather than besaltc. The besaltc
 layer provides type definitions and constants used by ported programs.
 
 Constants: `AF_UNIX`(1), `AF_LOCAL`(1), `SOCK_STREAM`(1), `SOCK_DGRAM`(2),
@@ -480,7 +480,7 @@ Constants: `AF_UNIX`(1), `AF_LOCAL`(1), `SOCK_STREAM`(1), `SOCK_DGRAM`(2),
 Socket functions (`socket`, `bind`, `listen`, `accept`, `connect`, `send`,
 `recv`, `sendmsg`, `recvmsg`, `sendto`, `recvfrom`, `getsockopt`, `setsockopt`,
 `shutdown`, `socketpair`, `getpeername`, `getsockname`) are available through
-`libsalty::posix`.
+`libbesalt::posix`.
 
 ---
 
@@ -502,7 +502,7 @@ Source: `select_impl.rs`
 
 ## poll.h
 
-`poll` is available through `libsalty::posix::posix_poll`. The saltyc layer
+`poll` is available through `libbesalt::posix::posix_poll`. The besaltc layer
 provides the `select` wrapper (see above) which delegates to poll internally.
 
 Constants: `POLLIN`(1), `POLLOUT`(4), `POLLERR`(8), `POLLHUP`(16),
@@ -533,14 +533,14 @@ Encoding: bits 7:0 = signal (0 if exited normally), bits 15:8 = exit code.
 Source: `signal_impl.rs`
 
 Notification-based signal delivery. 32 signals maximum. Signal handlers are
-stored in shared `libsalty` globals and dispatched from a notification-polling
+stored in shared `libbesalt` globals and dispatched from a notification-polling
 trampoline.
 
 | Function | St | Notes |
 |---|---|---|
 | `signal` | F | Installs handler via `sigaction`; returns previous handler |
 | `sigaction` | F | Stores sa_handler/sa_mask/sa_flags; SA_SIGINFO not supported |
-| `sigprocmask` | F | SIG_BLOCK, SIG_UNBLOCK, SIG_SETMASK; modifies libsalty's mask |
+| `sigprocmask` | F | SIG_BLOCK, SIG_UNBLOCK, SIG_SETMASK; modifies libbesalt's mask |
 | `sigsuspend` | S | Returns -1 / EINTR |
 | `sigpending` | S | Returns 0 (empty set) |
 | `sigemptyset` | F | |
@@ -1241,19 +1241,19 @@ Source: `crt.rs`
 
 | Function | St | Notes |
 |---|---|---|
-| `__libc_start_main` | F | CRT entry point; parses auxv for AT_SALTY_* tags, initializes IPC context and memory manager, calls main |
+| `__libc_start_main` | F | CRT entry point; parses auxv for AT_BESALT_* tags, initializes IPC context and memory manager, calls main |
 
 Custom auxiliary vector tags (set by init/rtld):
-- `AT_SALTY_IPC_BUFFER` (0x1000) — IPC buffer address
-- `AT_SALTY_VFS_EP` (0x1001) — VFS endpoint cap slot
-- `AT_SALTY_PROCMGR_EP` (0x1002) — Process manager endpoint cap slot
-- `AT_SALTY_CONSOLE_EP` (0x1003) — Console endpoint cap slot
-- `AT_SALTY_CSPACE` (0x1004) — CSpace root cap slot
-- `AT_SALTY_SIGNAL_NTF` (0x1005) — Signal notification cap slot
-- `AT_SALTY_MM_UNTYPED` (0x1006) — Memory manager untyped cap
-- `AT_SALTY_MM_VSPACE` (0x1007) — Memory manager vspace cap
-- `AT_SALTY_MM_NEXT_FREE` (0x1008) — First free CNode slot
-- `AT_SALTY_MM_CNODE_BITS` (0x1009) — CNode size in bits
+- `AT_BESALT_IPC_BUFFER` (0x1000) — IPC buffer address
+- `AT_BESALT_VFS_EP` (0x1001) — VFS endpoint cap slot
+- `AT_BESALT_PROCMGR_EP` (0x1002) — Process manager endpoint cap slot
+- `AT_BESALT_CONSOLE_EP` (0x1003) — Console endpoint cap slot
+- `AT_BESALT_CSPACE` (0x1004) — CSpace root cap slot
+- `AT_BESALT_SIGNAL_NTF` (0x1005) — Signal notification cap slot
+- `AT_BESALT_MM_UNTYPED` (0x1006) — Memory manager untyped cap
+- `AT_BESALT_MM_VSPACE` (0x1007) — Memory manager vspace cap
+- `AT_BESALT_MM_NEXT_FREE` (0x1008) — First free CNode slot
+- `AT_BESALT_MM_CNODE_BITS` (0x1009) — CNode size in bits
 
 ---
 

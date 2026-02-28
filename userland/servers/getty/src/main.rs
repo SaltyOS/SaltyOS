@@ -12,14 +12,14 @@
 #![no_std]
 #![no_main]
 
-extern crate salty;
+extern crate besalt;
 
-use salty::posix::*;
+use besalt::posix::*;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     unsafe {
-        salty::serial::serial_puts(b"[getty] starting session setup\n");
+        besalt::serial::serial_puts(b"[getty] starting session setup\n");
 
         // 1. Close CRT-opened /dev/console fds
         posix_close(0);
@@ -29,13 +29,13 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         // 2. Create new session (sid=pid, pgid=pid)
         let sid = posix_setsid();
         if sid < 0 {
-            salty::serial::serial_puts(b"[getty] setsid failed\n");
+            besalt::serial::serial_puts(b"[getty] setsid failed\n");
         }
 
         // 3. Open PTY slave as fd 0
         let fd0 = posix_open(b"/dev/pts/0\0".as_ptr(), 2, 0); // O_RDWR
         if fd0 < 0 {
-            salty::serial::serial_puts(b"[getty] failed to open /dev/pts/0\n");
+            besalt::serial::serial_puts(b"[getty] failed to open /dev/pts/0\n");
             posix_exit(1);
         }
 
@@ -46,7 +46,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         // 5. Acquire controlling terminal
         let tio = posix_ioctl(fd0, 0x540E, 0); // TIOCSCTTY
         if tio < 0 {
-            salty::serial::serial_puts(b"[getty] TIOCSCTTY failed\n");
+            besalt::serial::serial_puts(b"[getty] TIOCSCTTY failed\n");
         }
 
         // 5b. Set foreground process group for the controlling tty.
@@ -60,11 +60,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         if fg_pgid != 0 {
             let pgrp = posix_ioctl(fd0, 0x5410, fg_pgid); // TIOCSPGRP
             if pgrp < 0 {
-                salty::serial::serial_puts(b"[getty] TIOCSPGRP failed\n");
+                besalt::serial::serial_puts(b"[getty] TIOCSPGRP failed\n");
             }
         }
 
-        salty::serial::serial_puts(b"[getty] session ready, exec bash\n");
+        besalt::serial::serial_puts(b"[getty] session ready, exec bash\n");
 
         // 6. Exec bash — replaces this process image
         let new_argv: [*const u8; 3] = [
@@ -89,7 +89,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         );
 
         // If exec fails
-        salty::serial::serial_puts(b"[getty] exec failed\n");
+        besalt::serial::serial_puts(b"[getty] exec failed\n");
         posix_exit(1);
     }
 }

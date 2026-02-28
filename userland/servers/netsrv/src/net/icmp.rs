@@ -47,7 +47,7 @@ pub(crate) fn handle(
         send_echo_reply(our_mac, our_ip, ip_hdr.src, data);
     } else if icmp_type == ICMP_TYPE_ECHO_REPLY {
         let seq = ((data[6] as u16) << 8) | (data[7] as u16);
-        let mut lb = salty::serial::LineBuf::new();
+        let mut lb = besalt::serial::LineBuf::new();
         lb.str(b"[netsrv] ICMP echo reply received seq=");
         lb.dec(seq as u64);
         lb.putc(b'\n');

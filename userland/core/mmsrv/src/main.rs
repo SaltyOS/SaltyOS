@@ -41,12 +41,12 @@ mod mmap;
 mod pool;
 mod shm;
 
-use salty::consts::*;
-use salty::invoke;
-use salty::ipc;
-use salty::serial;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::invoke;
+use besalt::ipc;
+use besalt::serial;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 use types::*;
 
@@ -82,7 +82,7 @@ unsafe fn self_mmap(num_pages: usize) -> *mut u8 {
     unsafe {
         let base = *(&raw const SELF_MMAP_NEXT);
         for i in 0..num_pages {
-            let slot = match salty::slot_alloc::slot_alloc() {
+            let slot = match besalt::slot_alloc::slot_alloc() {
                 Some(s) => s,
                 None => return core::ptr::null_mut(),
             };
@@ -241,11 +241,11 @@ fn puts(s: &[u8]) {
 }
 
 fn ipc_ctx() -> *mut IpcContext {
-    salty::tls::current_ipc_ctx()
+    besalt::tls::current_ipc_ctx()
 }
 
 fn signal_ready() {
-    let _ = salty::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 /// Retype an object from any available untyped source (round-robin scan).
@@ -253,7 +253,7 @@ unsafe fn retype_any(obj_type: u64, size_bits: u64, dest_slot: Cap) -> i32 {
     unsafe {
         let ut_count = *(&raw const UT_COUNT);
         if ut_count == 0 {
-            return SALTY_OUT_OF_MEMORY as i32;
+            return BESALT_OUT_OF_MEMORY as i32;
         }
 
         let start = {
@@ -287,7 +287,7 @@ unsafe fn retype_any(obj_type: u64, size_bits: u64, dest_slot: Cap) -> i32 {
             }
         }
 
-        SALTY_OUT_OF_MEMORY as i32
+        BESALT_OUT_OF_MEMORY as i32
     }
 }
 
@@ -337,7 +337,7 @@ unsafe fn init_untyped_pool() {
 unsafe fn register_with_nameserv() -> bool {
     unsafe {
         let name = b"mmsrv";
-        let mut msg = SaltyMsg::zeroed();
+        let mut msg = BesaltMsg::zeroed();
         msg.label = POSIX_NS_REGISTER;
         msg.length = 1 + ((name.len() + 7) / 8) as u64;
         msg.regs[0] = name.len() as u64;
@@ -349,9 +349,9 @@ unsafe fn register_with_nameserv() -> bool {
         // Send our server EP cap
         ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
 
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV, &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != SALTY_OK {
+        if err != 0 || reply.label != BESALT_OK {
             let mut lb = LineBuf::new();
             lb.str(b"[MMSRV] nameserv register failed err=");
             lb.hex(err as u64);
@@ -445,11 +445,11 @@ pub extern "C" fn _start() -> ! {
     // Initialize per-process slot allocator from RTLD-exported globals.
     // self_mmap() depends on slot_alloc for temporary frame-cap slots.
     unsafe {
-        let base = *(&raw const salty::__salty_slot_base);
-        let count = *(&raw const salty::__salty_slot_count);
-        let cspace_ntfn = *(&raw const salty::__salty_cspace_ntfn);
+        let base = *(&raw const besalt::__besalt_slot_base);
+        let count = *(&raw const besalt::__besalt_slot_count);
+        let cspace_ntfn = *(&raw const besalt::__besalt_cspace_ntfn);
         if base != 0 {
-            salty::slot_alloc::slot_alloc_init(base, count, cspace_ntfn);
+            besalt::slot_alloc::slot_alloc_init(base, count, cspace_ntfn);
         } else {
             puts(b"[MMSRV] FATAL: slot pool not provided by RTLD/auxv\n");
             idle();
@@ -460,7 +460,7 @@ pub extern "C" fn _start() -> ! {
     // When the kernel fast-path consumes pool entries and signals, the
     // bound notification wakes us from Recv without a real IPC message.
     unsafe {
-        if let Some(ntfn_slot) = salty::slot_alloc::slot_alloc() {
+        if let Some(ntfn_slot) = besalt::slot_alloc::slot_alloc() {
             if retype_any(OBJ_NOTIFICATION, 0, ntfn_slot) == 0 {
                 let err = invoke::tcb_bind_notification(CAP_SELF_TCB, ntfn_slot);
                 if err == 0 {
@@ -528,7 +528,7 @@ pub extern "C" fn _start() -> ! {
     puts(b"[MMSRV] ready\n");
 
     // Initial recv
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     let mut badge: u64 = 0;
 
     let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
@@ -539,7 +539,7 @@ pub extern "C" fn _start() -> ! {
 
     // Server loop
     loop {
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
         // Set to true for unrecoverable faults: use recv() instead of reply_recv()
         // so the faulting thread stays permanently blocked rather than re-faulting.
         let mut skip_reply = false;
@@ -621,7 +621,7 @@ pub extern "C" fn _start() -> ! {
                             lb.hex(badge);
                             lb.str(b"\n");
                             lb.flush();
-                            reply.label = SALTY_INVALID_OPERATION;
+                            reply.label = BESALT_INVALID_OPERATION;
                             break 'fault;
                         }
 
@@ -660,16 +660,16 @@ pub extern "C" fn _start() -> ! {
                         if (error_code & 0x7) == 0x7 && (bitmap_cow || implicit_cow) {
                             // COW resolution path: allocate a new frame and
                             // let the kernel copy + replace the COW mapping.
-                            let slot = match salty::slot_alloc::slot_alloc() {
+                            let slot = match besalt::slot_alloc::slot_alloc() {
                                 Some(s) => s,
                                 None => {
-                                    reply.label = SALTY_OUT_OF_MEMORY;
+                                    reply.label = BESALT_OUT_OF_MEMORY;
                                     break 'fault;
                                 }
                             };
 
                             if retype_any(OBJ_FRAME, 0, slot) != 0 {
-                                reply.label = SALTY_OUT_OF_MEMORY;
+                                reply.label = BESALT_OUT_OF_MEMORY;
                                 break 'fault;
                             }
 
@@ -682,7 +682,7 @@ pub extern "C" fn _start() -> ! {
                                 flags,
                             );
 
-                            if err == SALTY_ALREADY_EXISTS as i32 {
+                            if err == BESALT_ALREADY_EXISTS as i32 {
                                 // Race: another CPU already resolved this COW page.
                                 // Kernel confirmed PTE is writable (not COW).
                                 // Safe for both bitmap_cow and implicit_cow paths.
@@ -690,10 +690,10 @@ pub extern "C" fn _start() -> ! {
                                 if bitmap_cow {
                                     client::clear_cow_bit(region, page_idx);
                                 }
-                                reply.label = SALTY_OK;
+                                reply.label = BESALT_OK;
                                 break 'fault;
                             }
-                            if err == SALTY_INVALID_OPERATION as i32 {
+                            if err == BESALT_INVALID_OPERATION as i32 {
                                 // Kernel says page is present, not COW, not writable.
                                 // Genuine access violation (e.g. mprotect PROT_READ).
                                 invoke::cnode_delete(CAP_SELF_CSPACE, slot);
@@ -709,7 +709,7 @@ pub extern "C" fn _start() -> ! {
                             }
                             if err != 0 {
                                 invoke::cnode_delete(CAP_SELF_CSPACE, slot);
-                                reply.label = SALTY_BAD_ADDRESS;
+                                reply.label = BESALT_BAD_ADDRESS;
                                 break 'fault;
                             }
 
@@ -733,7 +733,7 @@ pub extern "C" fn _start() -> ! {
                                 if new_fcaps.is_null() {
                                     // Frame is already resolved in kernel; just
                                     // lose tracking rather than fail the fault.
-                                    reply.label = SALTY_OK;
+                                    reply.label = BESALT_OK;
                                     break 'fault;
                                 }
                                 (*region).frame_caps = new_fcaps;
@@ -759,7 +759,7 @@ pub extern "C" fn _start() -> ! {
                             if needed > (*region).frame_count {
                                 (*region).frame_count = needed;
                             }
-                            reply.label = SALTY_OK;
+                            reply.label = BESALT_OK;
                             break 'fault;
                         }
 
@@ -799,7 +799,7 @@ pub extern "C" fn _start() -> ! {
                                 new_cap,
                             );
                             if new_fcaps.is_null() {
-                                reply.label = SALTY_OUT_OF_MEMORY;
+                                reply.label = BESALT_OUT_OF_MEMORY;
                                 break 'fault;
                             }
                             (*region).frame_caps = new_fcaps;
@@ -807,20 +807,20 @@ pub extern "C" fn _start() -> ! {
                         }
                         if !(*region).frame_caps.is_null() && *(*region).frame_caps.add(page_idx) != 0 {
                             // Already mapped (race)
-                            reply.label = SALTY_OK;
+                            reply.label = BESALT_OK;
                             break 'fault;
                         }
 
                         // 5. Allocate frame: slot_alloc + retype_any
-                        let slot = match salty::slot_alloc::slot_alloc() {
+                        let slot = match besalt::slot_alloc::slot_alloc() {
                             Some(s) => s,
                             None => {
-                                reply.label = SALTY_OUT_OF_MEMORY;
+                                reply.label = BESALT_OUT_OF_MEMORY;
                                 break 'fault;
                             }
                         };
                         if retype_any(OBJ_FRAME, 0, slot) != 0 {
-                            reply.label = SALTY_OUT_OF_MEMORY;
+                            reply.label = BESALT_OUT_OF_MEMORY;
                             break 'fault;
                         }
 
@@ -829,7 +829,7 @@ pub extern "C" fn _start() -> ! {
                         let err = invoke::vspace_map((*client_ptr).vspace_cap, slot, page_addr, flags);
                         if err != 0 {
                             invoke::cnode_delete(CAP_SELF_CSPACE, slot);
-                            reply.label = SALTY_BAD_ADDRESS;
+                            reply.label = BESALT_BAD_ADDRESS;
                             break 'fault;
                         }
 
@@ -844,7 +844,7 @@ pub extern "C" fn _start() -> ! {
                         }
 
                         // 8. Reply OK — kernel resumes faulting thread
-                        reply.label = SALTY_OK;
+                        reply.label = BESALT_OK;
                     } // end 'fault
                 }
                 _ => {
@@ -855,7 +855,7 @@ pub extern "C" fn _start() -> ! {
                     lb.hex(badge);
                     lb.str(b"\n");
                     lb.flush();
-                    reply.label = SALTY_INVALID_OPERATION;
+                    reply.label = BESALT_INVALID_OPERATION;
                 }
             }
         }
@@ -918,6 +918,6 @@ pub extern "C" fn _start() -> ! {
 
 fn idle() -> ! {
     loop {
-        salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 }

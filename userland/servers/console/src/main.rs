@@ -10,15 +10,15 @@
 #![no_std]
 #![no_main]
 
-extern crate salty;
+extern crate besalt;
 
 mod kbd;
 
-use salty::consts::*;
-use salty::invoke;
-use salty::ipc;
-use salty::serial;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::invoke;
+use besalt::ipc;
+use besalt::serial;
+use besalt::types::*;
 
 use kbd::KbdState;
 
@@ -96,7 +96,7 @@ static mut DISPLAY_TX_TAIL: usize = 0;
 // ======================================================================
 
 fn ipc_ctx() -> *mut IpcContext {
-    &raw mut salty::__salty_ipc_ctx
+    &raw mut besalt::__besalt_ipc_ctx
 }
 
 unsafe fn init_console_termios() {
@@ -191,7 +191,7 @@ fn kbd_init() {
 }
 
 fn signal_ready() {
-    let _ = salty::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 /// Write a byte slice with CR/LF translation via DebugPutStr syscall.
@@ -284,7 +284,7 @@ unsafe fn display_try_flush() {
                 break;
             }
 
-            let mut msg = SaltyMsg::zeroed();
+            let mut msg = BesaltMsg::zeroed();
             msg.label = DISPLAY_TERMINAL_WRITE;
             msg.regs[0] = len as u64;
             msg.length = 1 + ((len as u64 + 7) / 8);
@@ -299,8 +299,8 @@ unsafe fn display_try_flush() {
                 would_block_retries = 0;
                 continue;
             }
-            if err == SALTY_WOULD_BLOCK as i32 && would_block_retries < 8 {
-                let _ = salty::syscall::syscall(SYS_NANOSLEEP, 0, 500_000, 0, 0, 0, 0);
+            if err == BESALT_WOULD_BLOCK as i32 && would_block_retries < 8 {
+                let _ = besalt::syscall::syscall(SYS_NANOSLEEP, 0, 500_000, 0, 0, 0, 0);
                 would_block_retries += 1;
                 continue;
             }
@@ -315,7 +315,7 @@ unsafe fn display_try_flush() {
 /// (ring buffer push + signal, no blocking IPC during input handling).
 fn forward_to_ttyd(raw: &[u8], raw_len: usize) {
     if raw_len == 0 { return; }
-    let mut fwd = SaltyMsg::zeroed();
+    let mut fwd = BesaltMsg::zeroed();
     fwd.label = TTYD_INPUT_EVENT;
     fwd.regs[0] = raw_len as u64;
     fwd.length = 1 + ((raw_len as u64 + 7) / 8);
@@ -328,7 +328,7 @@ fn forward_to_ttyd(raw: &[u8], raw_len: usize) {
     }
 }
 
-unsafe fn handle_write(msg: *const SaltyMsg) {
+unsafe fn handle_write(msg: *const BesaltMsg) {
     unsafe {
         let mut len = (*msg).regs[0];
         if len > 24 { len = 24; }
@@ -341,10 +341,10 @@ unsafe fn handle_write(msg: *const SaltyMsg) {
     }
 }
 
-unsafe fn handle_tcgetattr(reply: *mut SaltyMsg) {
+unsafe fn handle_tcgetattr(reply: *mut BesaltMsg) {
     unsafe {
         let t = &raw const CONSOLE_TERMIOS;
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 10;
         (*reply).regs[0] = (*t).c_iflag as u64;
         (*reply).regs[1] = (*t).c_oflag as u64;
@@ -359,12 +359,12 @@ unsafe fn handle_tcgetattr(reply: *mut SaltyMsg) {
     }
 }
 
-unsafe fn handle_tcsetattr(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
+unsafe fn handle_tcsetattr(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
     unsafe {
         // Expected layout from VFS:
         // regs[0]=fd regs[1]=action regs[2..7]=flags/speeds regs[8..11]=c_cc[32]
         if (*msg).length < 11 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
@@ -380,7 +380,7 @@ unsafe fn handle_tcsetattr(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
             (*t).c_cc[i] = *src.add(i);
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 0;
     }
 }
@@ -415,7 +415,7 @@ pub extern "C" fn _start() -> ! {
     signal_ready();
 
     let mut kbd = KbdState::new();
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     let mut badge: u64 = 0;
 
     // Initial recv
@@ -478,12 +478,12 @@ pub extern "C" fn _start() -> ! {
         }
 
         // IPC message
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
 
         match msg.label {
             CONSOLE_WRITE => {
                 unsafe { handle_write(&raw const msg) };
-                reply.label = SALTY_OK;
+                reply.label = BESALT_OK;
             }
             CONSOLE_TCGETATTR => {
                 unsafe { handle_tcgetattr(&raw mut reply) };
@@ -492,7 +492,7 @@ pub extern "C" fn _start() -> ! {
                 unsafe { handle_tcsetattr(&raw const msg, &raw mut reply) };
             }
             _ => {
-                reply.label = SALTY_INVALID_OPERATION;
+                reply.label = BESALT_INVALID_OPERATION;
             }
         }
 
@@ -516,6 +516,6 @@ pub extern "C" fn _start() -> ! {
 
 fn idle() -> ! {
     loop {
-        salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 }

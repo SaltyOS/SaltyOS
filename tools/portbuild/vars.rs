@@ -94,8 +94,8 @@ pub fn build_var_map(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Hash
     vars.insert("BUILDDIR".to_string(), env.build_root.to_string_lossy().to_string());
 
     // Cross-compile info
-    vars.insert("SALTY_HOST".to_string(), env.salty_host.clone());
-    vars.insert("SALTY_INC".to_string(), env.salty_inc.to_string_lossy().to_string());
+    vars.insert("BESALT_HOST".to_string(), env.besalt_host.clone());
+    vars.insert("BESALT_INC".to_string(), env.besalt_inc.to_string_lossy().to_string());
     vars.insert("NPROC".to_string(), env.nproc.to_string());
 
     vars

@@ -30,16 +30,16 @@
 #![no_std]
 #![no_main]
 
-extern crate salty;
+extern crate besalt;
 
 mod virtio;
 
-use salty::consts::*;
-use salty::invoke;
-use salty::ipc;
-use salty::serial;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::invoke;
+use besalt::ipc;
+use besalt::serial;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 // ---------------------------------------------------------------------------
 // Capability slot constants
@@ -82,11 +82,11 @@ pub(crate) fn puts(s: &[u8]) {
 }
 
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
-    &raw mut salty::__salty_ipc_ctx
+    &raw mut besalt::__besalt_ipc_ctx
 }
 
 fn signal_ready() {
-    let _ = salty::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 /// Get our MAC address from the virtio driver.
@@ -98,7 +98,7 @@ fn mac_addr() -> [u8; 6] {
 /// Register with name service as "netdrv".
 fn register_nameserv() {
     let name = b"netdrv";
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = POSIX_NS_REGISTER;
     msg.regs[0] = name.len() as u64;
     msg.length = 1 + (name.len() as u64 + 7) / 8;
@@ -109,9 +109,9 @@ fn register_nameserv() {
             *dst.add(i) = name[i];
         }
         ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
-        let mut reply = SaltyMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != SALTY_OK {
+        if err != 0 || reply.label != BESALT_OK {
             puts(b"[netdrv] nameserv registration failed\n");
         }
     }
@@ -140,12 +140,12 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
     unsafe {
         ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_IRQ_NOTIFICATION, 0);
     }
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     msg.label = MM_ALLOC_OBJECT;
     msg.regs[0] = OBJ_NOTIFICATION;
     msg.regs[1] = 0;
     msg.length = 2;
-    let mut alloc_reply = SaltyMsg::zeroed();
+    let mut alloc_reply = BesaltMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
     let err = unsafe {
         ipc::call_ctx(
@@ -155,7 +155,7 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
             &raw mut alloc_reply,
         )
     };
-    if err != 0 || alloc_reply.label != SALTY_OK {
+    if err != 0 || alloc_reply.label != BESALT_OK {
         let mut lb = LineBuf::new();
         lb.str(b"[netdrv] Failed to allocate Notification via mmsrv: ");
         lb.dec(if err != 0 {
@@ -286,7 +286,7 @@ fn signal_netsrv_rx() {
     // signal calls. Single-threaded driver.
     let cap = unsafe { *(&raw const NETSRV_RX_NTFN) };
     if cap != 0 {
-        let _ = salty::syscall::syscall(SYS_SIGNAL, cap, 1, 0, 0, 0, 0);
+        let _ = besalt::syscall::syscall(SYS_SIGNAL, cap, 1, 0, 0, 0, 0);
     }
 }
 
@@ -334,15 +334,15 @@ fn drain_tx_ring() {
 ///   extra_caps[0] = netsrv's badged RX notification cap
 ///
 /// On success, replies with:
-///   label = SALTY_OK
+///   label = BESALT_OK
 ///   regs[0] = MAC address low 4 bytes (network order)
 ///   regs[1] = MAC address high 2 bytes (network order)
 ///   regs[2] = link status (1 = up)
 ///   extra_caps[0] = badged copy of our IRQ notification (badge=TX_BADGE)
-fn handle_driver_register(msg: &SaltyMsg, reply: &mut SaltyMsg) {
+fn handle_driver_register(msg: &BesaltMsg, reply: &mut BesaltMsg) {
     let shm_id = msg.regs[0];
     if shm_id != NET_SHM_ID {
-        reply.label = SALTY_INVALID_ARGUMENT;
+        reply.label = BESALT_INVALID_ARGUMENT;
         return;
     }
 
@@ -355,19 +355,19 @@ fn handle_driver_register(msg: &SaltyMsg, reply: &mut SaltyMsg) {
 
     // Map the SHM into our address space via mmsrv
     let ctx = ipc_ctx();
-    let mut map_msg = SaltyMsg::zeroed();
+    let mut map_msg = BesaltMsg::zeroed();
     map_msg.label = MM_SHM_MAP;
     map_msg.regs[0] = NET_SHM_ID;
     map_msg.regs[1] = 0; // client_badge: 0 = map into caller (netdrv)
     map_msg.regs[2] = SHM_VADDR;
     map_msg.regs[3] = 0x3; // RW permissions
     map_msg.length = 4;
-    let mut map_reply = SaltyMsg::zeroed();
+    let mut map_reply = BesaltMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const map_msg, &raw mut map_reply) };
-    if err != 0 || map_reply.label != SALTY_OK {
+    if err != 0 || map_reply.label != BESALT_OK {
         puts(b"[netdrv] Failed to map SHM\n");
-        reply.label = SALTY_INVALID_OPERATION;
+        reply.label = BESALT_INVALID_OPERATION;
         return;
     }
     // SAFETY: Single-threaded driver; written once during registration.
@@ -390,7 +390,7 @@ fn handle_driver_register(msg: &SaltyMsg, reply: &mut SaltyMsg) {
         | ((mac[2] as u32) << 8)
         | (mac[3] as u32);
     let mac_hi = ((mac[4] as u16) << 8) | (mac[5] as u16);
-    reply.label = SALTY_OK;
+    reply.label = BESALT_OK;
     reply.regs[0] = mac_lo as u64;
     reply.regs[1] = mac_hi as u64;
     reply.regs[2] = 1; // link status: up
@@ -421,7 +421,7 @@ fn event_loop(device_ok: bool) -> ! {
             // Polling fallback: no IRQ, yield and poll ISR directly
             puts(b"[netdrv] No IRQ, using yield-based polling\n");
             loop {
-                let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+                let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
                 let isr = virtio::read_isr();
                 if isr != 0 {
                     drain_rx();
@@ -431,13 +431,13 @@ fn event_loop(device_ok: bool) -> ! {
             // No device present -- idle loop with no hardware access
             puts(b"[netdrv] No device, idling\n");
             loop {
-                let _ = salty::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+                let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
             }
         }
     }
 
     let ctx = ipc_ctx();
-    let mut msg = SaltyMsg::zeroed();
+    let mut msg = BesaltMsg::zeroed();
     let mut badge: u64 = 0;
 
     // Set receive slot for netsrv's notification cap during DRIVER_REGISTER
@@ -466,7 +466,7 @@ fn event_loop(device_ok: bool) -> ! {
             }
 
             // Wait for next event (no reply needed for notifications)
-            msg = SaltyMsg::zeroed();
+            msg = BesaltMsg::zeroed();
             badge = 0;
             // SAFETY: IPC context is valid.
             unsafe {
@@ -474,16 +474,16 @@ fn event_loop(device_ok: bool) -> ! {
             }
         } else {
             // IPC request on server endpoint
-            let mut reply = SaltyMsg::zeroed();
+            let mut reply = BesaltMsg::zeroed();
             match msg.label {
                 DRIVER_REGISTER => handle_driver_register(&msg, &mut reply),
                 _ => {
-                    reply.label = SALTY_INVALID_OPERATION;
+                    reply.label = BESALT_INVALID_OPERATION;
                 }
             }
 
             // Reply to caller AND wait for next event atomically
-            msg = SaltyMsg::zeroed();
+            msg = BesaltMsg::zeroed();
             badge = 0;
             // SAFETY: IPC context is valid.
             unsafe {

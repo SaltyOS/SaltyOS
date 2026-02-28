@@ -1,12 +1,12 @@
-# libsalty API Reference
+# libbesalt API Reference
 
-**Library:** `lib/libsalty/` (Rust, compiled to `libsalty.so`)
+**Library:** `lib/besalt/lib/` (Rust, compiled to `libbesalt.so`)
 **Edition:** Rust 2024
 **ABI:** All public functions use `extern "C"` for FFI compatibility.
 
 This document catalogs every public function, type, and constant exported by
-libsalty. Functions are available both as Rust module APIs (e.g.
-`libsalty::ipc::call_ctx`) and as C ABI symbols (e.g. `salty_call`) resolved
+libbesalt. Functions are available both as Rust module APIs (e.g.
+`libbesalt::ipc::call_ctx`) and as C ABI symbols (e.g. `besalt_call`) resolved
 by the runtime dynamic linker (`rtld`).
 
 ---
@@ -15,7 +15,7 @@ by the runtime dynamic linker (`rtld`).
 
 ### Naming
 
-- **C ABI exports** use the `salty_` prefix (e.g. `salty_send`, `salty_vspace_map`).
+- **C ABI exports** use the `besalt_` prefix (e.g. `besalt_send`, `besalt_vspace_map`).
 - **Rust module functions** use snake_case without prefix (e.g. `ipc::send_ctx`, `invoke::vspace_map`).
 - **POSIX wrappers** in the `posix` module use the `posix_` prefix (e.g. `posix_open`, `posix_fork`).
 
@@ -23,7 +23,7 @@ by the runtime dynamic linker (`rtld`).
 
 | Type | Meaning |
 |------|---------|
-| `SaltyResult` | Raw syscall return: `error` (0=success) + `value` (payload) |
+| `BesaltResult` | Raw syscall return: `error` (0=success) + `value` (payload) |
 | `i32` return | 0 on success, -1 on error (POSIX convention) |
 | `i64` return | Byte count on success, -1 on error (read/write) |
 | `Cap` (`u64`) | Capability slot index in the thread's CNode |
@@ -34,17 +34,17 @@ All error codes are defined in `consts.rs` and must match kernel `SyscallError` 
 
 | Constant | Value | Meaning |
 |----------|-------|---------|
-| `SALTY_OK` | 0 | Success |
-| `SALTY_INVALID_CAPABILITY` | 1 | Cap slot is empty or wrong type |
-| `SALTY_INVALID_OPERATION` | 2 | Label not valid for this cap type |
-| `SALTY_INSUFFICIENT_RIGHTS` | 3 | Cap lacks required rights |
-| `SALTY_INVALID_ARGUMENT` | 4 | Bad argument value |
-| `SALTY_OUT_OF_MEMORY` | 5 | Untyped exhausted or slab full |
-| `SALTY_NOT_FOUND` | 6 | Object not found |
-| `SALTY_BUSY` | 7 | Resource is busy |
-| `SALTY_ALREADY_EXISTS` | 8 | Object already exists |
-| `SALTY_WOULD_BLOCK` | 9 | Operation would block (non-blocking mode) |
-| `SALTY_PENDING` | 0x80 | Async operation in progress |
+| `BESALT_OK` | 0 | Success |
+| `BESALT_INVALID_CAPABILITY` | 1 | Cap slot is empty or wrong type |
+| `BESALT_INVALID_OPERATION` | 2 | Label not valid for this cap type |
+| `BESALT_INSUFFICIENT_RIGHTS` | 3 | Cap lacks required rights |
+| `BESALT_INVALID_ARGUMENT` | 4 | Bad argument value |
+| `BESALT_OUT_OF_MEMORY` | 5 | Untyped exhausted or slab full |
+| `BESALT_NOT_FOUND` | 6 | Object not found |
+| `BESALT_BUSY` | 7 | Resource is busy |
+| `BESALT_ALREADY_EXISTS` | 8 | Object already exists |
+| `BESALT_WOULD_BLOCK` | 9 | Operation would block (non-blocking mode) |
+| `BESALT_PENDING` | 0x80 | Async operation in progress |
 
 ---
 
@@ -55,8 +55,8 @@ All error codes are defined in `consts.rs` and must match kernel `SyscallError` 
 | Type | Repr | Description |
 |------|------|-------------|
 | `Cap` | `u64` | Capability slot index (type alias) |
-| `SaltyResult` | `#[repr(C)]` | `{ error: u64, value: u64 }` -- raw syscall return |
-| `SaltyMsg` | `#[repr(C)]` | `{ label: u64, length: u64, regs: [u64; 20] }` -- IPC message buffer |
+| `BesaltResult` | `#[repr(C)]` | `{ error: u64, value: u64 }` -- raw syscall return |
+| `BesaltMsg` | `#[repr(C)]` | `{ label: u64, length: u64, regs: [u64; 20] }` -- IPC message buffer |
 | `IpcBuffer` | `#[repr(C)]` | 4096-byte kernel-shared page: msg[22], badge, caps[4], receive_cnode/index/depth, reserved[478] |
 | `IpcContext` | `#[repr(C)]` | `{ ipc_buffer: *mut IpcBuffer, send_cap_count: i32 }` -- per-thread IPC state |
 
@@ -64,8 +64,8 @@ All error codes are defined in `consts.rs` and must match kernel `SyscallError` 
 
 | Type | Repr | Description |
 |------|------|-------------|
-| `SaltyStat` | `#[repr(C)]` | File stat: st_ino, st_mode, st_nlink, st_size, st_uid, st_gid, st_mtime, st_type |
-| `SaltyDirent` | `#[repr(C)]` | Directory entry: d_ino, d_type, d_namlen, d_name[62] |
+| `BesaltStat` | `#[repr(C)]` | File stat: st_ino, st_mode, st_nlink, st_size, st_uid, st_gid, st_mtime, st_type |
+| `BesaltDirent` | `#[repr(C)]` | Directory entry: d_ino, d_type, d_namlen, d_name[62] |
 | `PollFd` | `#[repr(C)]` | Poll descriptor: fd, events, revents |
 | `EpollEvent` | `#[repr(C)]` | Epoll event: events (u32), data (u64) |
 | `SockAddrUn` | `#[repr(C)]` | Unix socket address: sun_family (u16), sun_path[64] |
@@ -126,12 +126,12 @@ Set by the kernel for `init`; inherited by child processes.
 ### `syscall`
 
 ```rust
-pub fn syscall(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> SaltyResult
+pub fn syscall(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> BesaltResult
 ```
 
 Issue a raw syscall. `num` is the syscall number (`SYS_SEND`, `SYS_RECV`, etc.).
 Arguments map to registers: a0=RDI, a1=RSI, a2=RDX, a3=R10, a4=R8, a5=R9.
-Returns `SaltyResult { error, value }`.
+Returns `BesaltResult { error, value }`.
 
 **Syscall numbers:**
 
@@ -190,14 +190,14 @@ pub unsafe fn set_receive_slot_ctx(ctx: *mut IpcContext, cnode: Cap, index: u64,
 
 | Rust Function | C ABI Name | Signature |
 |---------------|------------|-----------|
-| `send_ctx` | `salty_send` | `(ep: Cap, msg: *const SaltyMsg) -> i32` |
-| `recv_ctx` | `salty_recv` | `(ep: Cap, msg: *mut SaltyMsg, badge: *mut u64) -> i32` |
-| `call_ctx` | `salty_call` | `(ep: Cap, msg: *const SaltyMsg, reply: *mut SaltyMsg) -> i32` |
-| `reply_recv_ctx` | `salty_reply_recv` | `(ep: Cap, reply: *const SaltyMsg, out_msg: *mut SaltyMsg, badge: *mut u64) -> i32` |
-| `nbsend_ctx` | `salty_nbsend` | `(ep: Cap, msg: *const SaltyMsg) -> i32` |
+| `send_ctx` | `besalt_send` | `(ep: Cap, msg: *const BesaltMsg) -> i32` |
+| `recv_ctx` | `besalt_recv` | `(ep: Cap, msg: *mut BesaltMsg, badge: *mut u64) -> i32` |
+| `call_ctx` | `besalt_call` | `(ep: Cap, msg: *const BesaltMsg, reply: *mut BesaltMsg) -> i32` |
+| `reply_recv_ctx` | `besalt_reply_recv` | `(ep: Cap, reply: *const BesaltMsg, out_msg: *mut BesaltMsg, badge: *mut u64) -> i32` |
+| `nbsend_ctx` | `besalt_nbsend` | `(ep: Cap, msg: *const BesaltMsg) -> i32` |
 
 All return 0 on success. The `_ctx` suffix indicates these take an explicit `IpcContext` pointer;
-the C ABI wrappers use the global `__salty_ipc_ctx`.
+the C ABI wrappers use the global `__besalt_ipc_ctx`.
 
 **`send_ctx`** -- Blocking send on endpoint `ep`. Transfers `msg` and any staged capabilities. Blocks until a receiver is ready.
 
@@ -213,9 +213,9 @@ the C ABI wrappers use the global `__salty_ipc_ctx`.
 
 | C ABI Name | Signature | Description |
 |------------|-----------|-------------|
-| `salty_signal` | `(ntfn: Cap, bits: u64) -> i32` | Signal notification (OR bits into word) |
-| `salty_wait` | `(ntfn: Cap) -> u64` | Wait on notification, returns signaled bits |
-| `salty_poll` | `(ntfn: Cap, bits: *mut u64) -> i32` | Non-blocking poll notification |
+| `besalt_signal` | `(ntfn: Cap, bits: u64) -> i32` | Signal notification (OR bits into word) |
+| `besalt_wait` | `(ntfn: Cap) -> u64` | Wait on notification, returns signaled bits |
+| `besalt_poll` | `(ntfn: Cap, bits: *mut u64) -> i32` | Non-blocking poll notification |
 
 ---
 
@@ -224,10 +224,10 @@ the C ABI wrappers use the global `__salty_ipc_ctx`.
 ### Raw Invoke
 
 ```rust
-pub fn invoke(cap: Cap, label: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> SaltyResult
+pub fn invoke(cap: Cap, label: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> BesaltResult
 ```
 
-**C ABI:** `salty_invoke(cap, label, arg0, arg1, arg2, arg3) -> SaltyResult`
+**C ABI:** `besalt_invoke(cap, label, arg0, arg1, arg2, arg3) -> BesaltResult`
 
 Generic capability invocation. Dispatches to kernel handler based on cap type and label.
 
@@ -235,15 +235,15 @@ Generic capability invocation. Dispatches to kernel handler based on cap type an
 
 | Rust Function | C ABI Name | Parameters | Returns |
 |---------------|------------|------------|---------|
-| `cnode_copy` | `salty_cnode_copy` | `src_cnode, src_slot, dest_cnode, dest_slot, rights` | `i32` |
-| `cnode_mint` | `salty_cnode_mint` | `src_cnode, src_slot, dest_cnode, dest_slot, badge` | `i32` |
-| `cnode_move` | `salty_cnode_move` | `dest_cnode, dest_slot, src_cnode, src_slot` | `i32` |
-| `cnode_mutate` | `salty_cnode_mutate` | `dest_cnode, dest_slot, src_cnode, src_slot, badge` | `i32` |
-| `cnode_save_caller` | `salty_cnode_save_caller` | `cnode, slot` | `i32` |
-| `cnode_delete` | `salty_cnode_delete` | `cnode, slot` | `i32` |
-| `cnode_revoke` | `salty_cnode_revoke` | `cnode, slot` | `i32` |
+| `cnode_copy` | `besalt_cnode_copy` | `src_cnode, src_slot, dest_cnode, dest_slot, rights` | `i32` |
+| `cnode_mint` | `besalt_cnode_mint` | `src_cnode, src_slot, dest_cnode, dest_slot, badge` | `i32` |
+| `cnode_move` | `besalt_cnode_move` | `dest_cnode, dest_slot, src_cnode, src_slot` | `i32` |
+| `cnode_mutate` | `besalt_cnode_mutate` | `dest_cnode, dest_slot, src_cnode, src_slot, badge` | `i32` |
+| `cnode_save_caller` | `besalt_cnode_save_caller` | `cnode, slot` | `i32` |
+| `cnode_delete` | `besalt_cnode_delete` | `cnode, slot` | `i32` |
+| `cnode_revoke` | `besalt_cnode_revoke` | `cnode, slot` | `i32` |
 | `cnode_set_guard` | -- | `cnode, guard, guard_bits` | `i32` |
-| `cnode_get_info` | -- | `cnode` | `SaltyResult` |
+| `cnode_get_info` | -- | `cnode` | `BesaltResult` |
 
 **Depth-aware variants** (for expanded CSpace hierarchy):
 
@@ -259,7 +259,7 @@ Invoke labels: `CNODE_COPY` (0x10), `CNODE_MINT` (0x11), `CNODE_MOVE` (0x12), `C
 
 | Rust Function | C ABI Name | Parameters | Returns |
 |---------------|------------|------------|---------|
-| `untyped_retype` | `salty_untyped_retype` | `untyped, new_type, size_bits, dest_slot` | `i32` |
+| `untyped_retype` | `besalt_untyped_retype` | `untyped, new_type, size_bits, dest_slot` | `i32` |
 | `untyped_retype_depth` | -- | `+ dest_depth` | `i32` |
 
 Invoke label: `UNTYPED_RETYPE` (0x20).
@@ -270,14 +270,14 @@ Object types: `OBJ_UNTYPED` (1), `OBJ_ENDPOINT` (2), `OBJ_NOTIFICATION` (3), `OB
 
 | Rust Function | C ABI Name | Parameters | Returns |
 |---------------|------------|------------|---------|
-| `tcb_configure` | `salty_tcb_configure` | `tcb, rip, rsp, ipc_buf` | `i32` |
-| `tcb_resume` | `salty_tcb_resume` | `tcb` | `i32` |
-| `tcb_suspend` | `salty_tcb_suspend` | `tcb` | `i32` |
-| `tcb_set_space` | `salty_tcb_set_space` | `tcb, cspace, vspace` | `i32` |
+| `tcb_configure` | `besalt_tcb_configure` | `tcb, rip, rsp, ipc_buf` | `i32` |
+| `tcb_resume` | `besalt_tcb_resume` | `tcb` | `i32` |
+| `tcb_suspend` | `besalt_tcb_suspend` | `tcb` | `i32` |
+| `tcb_set_space` | `besalt_tcb_set_space` | `tcb, cspace, vspace` | `i32` |
 | `tcb_set_space_with_depth` | -- | `tcb, cspace, vspace, depth` | `i32` |
-| `tcb_set_fault_handler` | `salty_tcb_set_fault_handler` | `tcb, fault_ep` | `i32` |
-| `tcb_set_ipc_buffer` | `salty_tcb_set_ipc_buffer` | `tcb, addr` | `i32` |
-| `tcb_write_registers` | `salty_tcb_write_registers` | `tcb, flags, rip, rsp` | `i32` |
+| `tcb_set_fault_handler` | `besalt_tcb_set_fault_handler` | `tcb, fault_ep` | `i32` |
+| `tcb_set_ipc_buffer` | `besalt_tcb_set_ipc_buffer` | `tcb, addr` | `i32` |
+| `tcb_write_registers` | `besalt_tcb_write_registers` | `tcb, flags, rip, rsp` | `i32` |
 | `tcb_bind_notification` | -- | `tcb, ntfn` | `i32` |
 
 Invoke labels: `TCB_CONFIGURE` (0x40), `TCB_RESUME` (0x41), `TCB_SUSPEND` (0x42), `TCB_SET_SPACE` (0x43), `TCB_WRITE_REGISTERS` (0x46), `TCB_SET_IPC_BUFFER` (0x48), `TCB_BIND_NOTIFICATION` (0x49), `TCB_SET_FAULT_HANDLER` (0x4B).
@@ -286,8 +286,8 @@ Invoke labels: `TCB_CONFIGURE` (0x40), `TCB_RESUME` (0x41), `TCB_SUSPEND` (0x42)
 
 | Rust Function | C ABI Name | Parameters | Returns |
 |---------------|------------|------------|---------|
-| `sc_configure` | `salty_sc_configure` | `sc, budget_us, period_us` | `i32` |
-| `sc_bind` | `salty_sc_bind` | `sc, tcb` | `i32` |
+| `sc_configure` | `besalt_sc_configure` | `sc, budget_us, period_us` | `i32` |
+| `sc_bind` | `besalt_sc_bind` | `sc, tcb` | `i32` |
 
 Invoke labels: `SC_CONFIGURE` (0x30), `SC_BIND` (0x31).
 
@@ -295,14 +295,14 @@ Invoke labels: `SC_CONFIGURE` (0x30), `SC_BIND` (0x31).
 
 | Rust Function | C ABI Name | Parameters | Returns |
 |---------------|------------|------------|---------|
-| `vspace_map` | `salty_vspace_map` | `vspace, frame, vaddr, flags` | `i32` |
-| `vspace_unmap` | `salty_vspace_unmap` | `vspace, vaddr` | `i32` |
-| `vspace_map_pt` | `salty_vspace_map_pt` | `vspace, frame, vaddr, level` | `i32` |
-| `vspace_walk` | `salty_vspace_walk` | `vspace, start_vaddr, max_entries` | `i32` |
-| `vspace_copy_page` | `salty_vspace_copy_page` | `src_vspace, src_vaddr, dst_frame` | `i32` |
+| `vspace_map` | `besalt_vspace_map` | `vspace, frame, vaddr, flags` | `i32` |
+| `vspace_unmap` | `besalt_vspace_unmap` | `vspace, vaddr` | `i32` |
+| `vspace_map_pt` | `besalt_vspace_map_pt` | `vspace, frame, vaddr, level` | `i32` |
+| `vspace_walk` | `besalt_vspace_walk` | `vspace, start_vaddr, max_entries` | `i32` |
+| `vspace_copy_page` | `besalt_vspace_copy_page` | `src_vspace, src_vaddr, dst_frame` | `i32` |
 | `vspace_map_device` | -- | `vspace, device_untyped, page_offset, vaddr, flags` | `i32` |
 | `vspace_map_device_range` | -- | `vspace, device_untyped, offset_start, vaddr_start, num_pages, flags` | `(i32, u64)` |
-| `vspace_clone_cow_page` | `salty_vspace_clone_cow_page` | `src_vspace, src_vaddr, dst_vspace, dst_vaddr` | `i32` |
+| `vspace_clone_cow_page` | `besalt_vspace_clone_cow_page` | `src_vspace, src_vaddr, dst_vspace, dst_vaddr` | `i32` |
 
 Invoke labels: `VSPACE_MAP` (0x50), `VSPACE_UNMAP` (0x51), `VSPACE_MAP_PT` (0x52), `VSPACE_WALK` (0x53), `VSPACE_COPY_PAGE` (0x54), `VSPACE_MAP_DEVICE` (0x55), `VSPACE_CLONE_COW_PAGE` (0x56), `VSPACE_MAP_DEVICE_RANGE` (0x57).
 
@@ -312,8 +312,8 @@ VSpace flags: `VSPACE_FLAG_WRITABLE` (1), `VSPACE_FLAG_USER` (2), `VSPACE_FLAG_E
 
 | Rust Function | C ABI Name | Parameters | Returns |
 |---------------|------------|------------|---------|
-| `irq_handler_ack` | `salty_irq_handler_ack` | `irq_handler` | `i32` |
-| `irq_handler_set_notification` | `salty_irq_handler_set_notification` | `irq_handler, ntfn` | `i32` |
+| `irq_handler_ack` | `besalt_irq_handler_ack` | `irq_handler` | `i32` |
+| `irq_handler_set_notification` | `besalt_irq_handler_set_notification` | `irq_handler, ntfn` | `i32` |
 
 Invoke labels: `IRQ_HANDLER_ACK` (0x61), `IRQ_HANDLER_SET_NOTIFICATION` (0x62).
 
@@ -341,13 +341,13 @@ All file I/O operations send IPC messages to the VFS server (`CAP_VFS_EP`).
 | `posix_write` | -- | `(fd: i32, buf: *const u8, count: u64) -> i64` | bytes written or -1 |
 | `posix_close` | -- | `(fd: i32) -> i32` | 0 or -1 |
 | `posix_lseek` | -- | `(fd: i32, offset: i64, whence: i32) -> i64` | new offset or -1 |
-| `posix_stat` | -- | `(path: *const u8, st: *mut SaltyStat) -> i32` | 0 or -1 |
-| `posix_lstat` | -- | `(path: *const u8, st: *mut SaltyStat) -> i32` | 0 or -1 |
-| `posix_fstat` | -- | `(fd: i32, st: *mut SaltyStat) -> i32` | 0 or -1 |
+| `posix_stat` | -- | `(path: *const u8, st: *mut BesaltStat) -> i32` | 0 or -1 |
+| `posix_lstat` | -- | `(path: *const u8, st: *mut BesaltStat) -> i32` | 0 or -1 |
+| `posix_fstat` | -- | `(fd: i32, st: *mut BesaltStat) -> i32` | 0 or -1 |
 | `posix_access` | -- | `(path: *const u8, mode: i32) -> i32` | 0 or -1 |
 | `posix_unlink` | -- | `(path: *const u8) -> i32` | 0 or -1 |
 | `posix_rename` | -- | `(old_path: *const u8, new_path: *const u8) -> i32` | 0 or -1 |
-| `posix_ftruncate` | `salty_ftruncate` | `(fd: i32, length: u64) -> i32` | 0 or -1 |
+| `posix_ftruncate` | `besalt_ftruncate` | `(fd: i32, length: u64) -> i32` | 0 or -1 |
 
 **Data transfer chunking:** `posix_read` transfers up to 152 bytes per IPC round-trip; `posix_write` transfers up to 144 bytes. Both loop until the full count is transferred or EOF/error.
 
@@ -366,7 +366,7 @@ Seek constants: `SEEK_SET` (0), `SEEK_CUR` (1), `SEEK_END` (2).
 | `posix_mkdir` | `(path: *const u8, mode: i32) -> i32` | 0 or -1 |
 | `posix_rmdir` | `(path: *const u8) -> i32` | 0 or -1 |
 | `posix_opendir` | `(path: *const u8) -> i32` | directory fd or -1 |
-| `posix_readdir` | `(dir_fd: i32, entry: *mut SaltyDirent) -> i32` | 1 if entry read, 0 at end |
+| `posix_readdir` | `(dir_fd: i32, entry: *mut BesaltDirent) -> i32` | 1 if entry read, 0 at end |
 | `posix_closedir` | `(dir_fd: i32) -> i32` | 0 or -1 (delegates to `posix_close`) |
 
 ---
@@ -401,19 +401,19 @@ All process operations send IPC messages to the process manager (`CAP_PROCMGR_EP
 
 | Rust Function | C ABI Name | Signature | Returns |
 |---------------|------------|-----------|---------|
-| `posix_setpgid` | `salty_setpgid` | `(pid: i32, pgid: i32) -> i32` | 0 or -1 |
-| `posix_getpgid` | `salty_getpgid` | `(pid: i32) -> i32` | pgid or -1 |
-| `posix_setsid` | `salty_setsid` | `() -> i32` | session ID or -1 |
+| `posix_setpgid` | `besalt_setpgid` | `(pid: i32, pgid: i32) -> i32` | 0 or -1 |
+| `posix_getpgid` | `besalt_getpgid` | `(pid: i32) -> i32` | pgid or -1 |
+| `posix_setsid` | `besalt_setsid` | `() -> i32` | session ID or -1 |
 
 ### User/Group ID
 
 | Rust Function | C ABI Name | Signature | Returns |
 |---------------|------------|-----------|---------|
-| `posix_getuid` | `salty_getuid` | `() -> i32` | UID |
-| `posix_geteuid` | `salty_geteuid` | `() -> i32` | effective UID |
-| `posix_getgid` | `salty_getgid` | `() -> i32` | GID |
-| `posix_getegid` | `salty_getegid` | `() -> i32` | effective GID |
-| `posix_getgroups` | `salty_getgroups` | `(size: i32, list: *mut i32) -> i32` | count or -1 |
+| `posix_getuid` | `besalt_getuid` | `() -> i32` | UID |
+| `posix_geteuid` | `besalt_geteuid` | `() -> i32` | effective UID |
+| `posix_getgid` | `besalt_getgid` | `() -> i32` | GID |
+| `posix_getegid` | `besalt_getegid` | `() -> i32` | effective GID |
+| `posix_getgroups` | `besalt_getgroups` | `(size: i32, list: *mut i32) -> i32` | count or -1 |
 
 ### Fork Implementation Detail
 
@@ -427,13 +427,13 @@ All socket operations are dispatched to the VFS server via IPC.
 
 | Rust Function | C ABI Name | Signature | Returns |
 |---------------|------------|-----------|---------|
-| `posix_socket` | `salty_socket` | `(domain: i32, sock_type: i32) -> i32` | fd or -1 |
-| `posix_bind` | `salty_bind` | `(fd: i32, path: *const u8) -> i32` | 0 or -1 |
-| `posix_listen` | `salty_listen` | `(fd: i32, backlog: i32) -> i32` | 0 or -1 |
-| `posix_accept` | `salty_accept` | `(fd: i32) -> i32` | connected fd or -1 |
-| `posix_connect` | `salty_connect` | `(fd: i32, path: *const u8) -> i32` | 0 or -1 |
-| `posix_shutdown` | `salty_shutdown` | `(fd: i32, how: i32) -> i32` | 0 or -1 |
-| `posix_socketpair` | `salty_socketpair` | `(fds: *mut i32) -> i32` | 0 or -1 |
+| `posix_socket` | `besalt_socket` | `(domain: i32, sock_type: i32) -> i32` | fd or -1 |
+| `posix_bind` | `besalt_bind` | `(fd: i32, path: *const u8) -> i32` | 0 or -1 |
+| `posix_listen` | `besalt_listen` | `(fd: i32, backlog: i32) -> i32` | 0 or -1 |
+| `posix_accept` | `besalt_accept` | `(fd: i32) -> i32` | connected fd or -1 |
+| `posix_connect` | `besalt_connect` | `(fd: i32, path: *const u8) -> i32` | 0 or -1 |
+| `posix_shutdown` | `besalt_shutdown` | `(fd: i32, how: i32) -> i32` | 0 or -1 |
+| `posix_socketpair` | `besalt_socketpair` | `(fds: *mut i32) -> i32` | 0 or -1 |
 | `posix_sendmsg` | -- | `(fd: i32, data: *const u8, data_len: u64, fds_to_send: *const i32, fd_count: u32) -> i64` | bytes sent or -1 |
 | `posix_recvmsg` | -- | `(fd: i32, data: *mut u8, data_len: u64, fds_out: *mut i32, fd_count: *mut u32) -> i64` | bytes received or -1 |
 
@@ -448,7 +448,7 @@ Socket constants: `AF_UNIX` (1), `SOCK_STREAM` (1), `SCM_RIGHTS` (1), `SHUT_RD` 
 ```rust
 pub unsafe fn posix_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32
 ```
-**C ABI:** `salty_posix_poll`
+**C ABI:** `besalt_posix_poll`
 
 Wait for events on up to 8 file descriptors. `timeout` in milliseconds (-1 = block). Returns count of ready fds or -1.
 
@@ -466,9 +466,9 @@ Converts fd_set bitmasks (single u64, max 64 fds) to poll array, calls `posix_po
 
 | Rust Function | C ABI Name | Signature | Returns |
 |---------------|------------|-----------|---------|
-| `posix_epoll_create` | `salty_epoll_create1` | `() -> i32` | epoll fd or -1 |
-| `posix_epoll_ctl` | `salty_epoll_ctl` | `(epfd: i32, op: i32, fd: i32, events: u32, data: u64) -> i32` | 0 or -1 |
-| `posix_epoll_wait` | `salty_epoll_wait` | `(epfd: i32, events: *mut EpollEvent, maxevents: i32, timeout: i32) -> i32` | count or -1 |
+| `posix_epoll_create` | `besalt_epoll_create1` | `() -> i32` | epoll fd or -1 |
+| `posix_epoll_ctl` | `besalt_epoll_ctl` | `(epfd: i32, op: i32, fd: i32, events: u32, data: u64) -> i32` | 0 or -1 |
+| `posix_epoll_wait` | `besalt_epoll_wait` | `(epfd: i32, events: *mut EpollEvent, maxevents: i32, timeout: i32) -> i32` | count or -1 |
 
 Epoll constants: `EPOLL_CTL_ADD` (1), `EPOLL_CTL_DEL` (2), `EPOLL_CTL_MOD` (3), `EPOLLIN` (0x001), `EPOLLOUT` (0x004), `EPOLLERR` (0x008), `EPOLLHUP` (0x010).
 
@@ -478,12 +478,12 @@ Epoll constants: `EPOLL_CTL_ADD` (1), `EPOLL_CTL_DEL` (2), `EPOLL_CTL_MOD` (3), 
 
 | Rust Function | C ABI Name | Signature | Returns |
 |---------------|------------|-----------|---------|
-| `posix_pipe` | `salty_pipe` | `(fds: *mut i32) -> i32` | 0 or -1 |
-| `posix_pipe2` | `salty_pipe2` | `(fds: *mut i32, flags: i32) -> i32` | 0 or -1 |
-| `posix_dup` | `salty_dup` | `(oldfd: i32) -> i32` | new fd or -1 |
-| `posix_dup2` | `salty_dup2` | `(oldfd: i32, newfd: i32) -> i32` | newfd or -1 |
-| `posix_dup3` | `salty_dup3` | `(oldfd: i32, newfd: i32, flags: i32) -> i32` | newfd or -1 |
-| `posix_mkfifo` | `salty_mkfifo` | `(path: *const u8, mode: u32) -> i32` | 0 or -1 |
+| `posix_pipe` | `besalt_pipe` | `(fds: *mut i32) -> i32` | 0 or -1 |
+| `posix_pipe2` | `besalt_pipe2` | `(fds: *mut i32, flags: i32) -> i32` | 0 or -1 |
+| `posix_dup` | `besalt_dup` | `(oldfd: i32) -> i32` | new fd or -1 |
+| `posix_dup2` | `besalt_dup2` | `(oldfd: i32, newfd: i32) -> i32` | newfd or -1 |
+| `posix_dup3` | `besalt_dup3` | `(oldfd: i32, newfd: i32, flags: i32) -> i32` | newfd or -1 |
+| `posix_mkfifo` | `besalt_mkfifo` | `(path: *const u8, mode: u32) -> i32` | 0 or -1 |
 
 ---
 
@@ -493,8 +493,8 @@ Epoll constants: `EPOLL_CTL_ADD` (1), `EPOLL_CTL_DEL` (2), `EPOLL_CTL_MOD` (3), 
 
 | Rust Function | C ABI Name | Signature | Returns |
 |---------------|------------|-----------|---------|
-| `posix_shm_open` | `salty_shm_open` | `(name: *const u8, flags: i32) -> i32` | shm fd or -1 |
-| `posix_shm_unlink` | `salty_shm_unlink` | `(name: *const u8) -> i32` | 0 or -1 |
+| `posix_shm_open` | `besalt_shm_open` | `(name: *const u8, flags: i32) -> i32` | shm fd or -1 |
+| `posix_shm_unlink` | `besalt_shm_unlink` | `(name: *const u8) -> i32` | 0 or -1 |
 
 Names follow POSIX convention: leading `/` is stripped before sending to VFS.
 
@@ -502,18 +502,18 @@ Names follow POSIX convention: leading `/` is stripped before sending to VFS.
 
 | Rust Function | C ABI Name | Signature | Returns |
 |---------------|------------|-----------|---------|
-| `posix_tcgetattr` | `salty_tcgetattr` | `(fd: i32, termios_p: *mut Termios) -> i32` | 0 or -1 |
-| `posix_tcsetattr` | `salty_tcsetattr` | `(fd: i32, action: i32, termios_p: *const Termios) -> i32` | 0 or -1 |
-| `posix_isatty` | `salty_isatty` | `(fd: i32) -> i32` | 1 if tty, 0 if not |
-| `posix_ioctl` | `salty_ioctl` | `(fd: i32, request: u64, arg: u64) -> i32` | result or -1 |
+| `posix_tcgetattr` | `besalt_tcgetattr` | `(fd: i32, termios_p: *mut Termios) -> i32` | 0 or -1 |
+| `posix_tcsetattr` | `besalt_tcsetattr` | `(fd: i32, action: i32, termios_p: *const Termios) -> i32` | 0 or -1 |
+| `posix_isatty` | `besalt_isatty` | `(fd: i32) -> i32` | 1 if tty, 0 if not |
+| `posix_ioctl` | `besalt_ioctl` | `(fd: i32, request: u64, arg: u64) -> i32` | result or -1 |
 
 ### File Control
 
 | Rust Function | C ABI Name | Signature | Returns |
 |---------------|------------|-----------|---------|
-| `posix_fcntl` | `salty_fcntl` | `(fd: i32, cmd: i32, arg: i64) -> i32` | result or -1 |
-| `posix_chdir` | `salty_chdir` | `(path: *const u8) -> i32` | 0 or -1 |
-| `posix_getcwd` | `salty_getcwd` | `(buf: *mut u8, size: u64) -> i32` | 0 or -1 |
+| `posix_fcntl` | `besalt_fcntl` | `(fd: i32, cmd: i32, arg: i64) -> i32` | result or -1 |
+| `posix_chdir` | `besalt_chdir` | `(path: *const u8) -> i32` | 0 or -1 |
+| `posix_getcwd` | `besalt_getcwd` | `(buf: *mut u8, size: u64) -> i32` | 0 or -1 |
 
 fcntl commands: `F_DUPFD` (0), `F_GETFD` (1), `F_SETFD` (2), `F_GETFL` (3), `F_SETFL` (4), `F_DUPFD_CLOEXEC` (1030).
 
@@ -521,11 +521,11 @@ fcntl commands: `F_DUPFD` (0), `F_GETFD` (1), `F_SETFD` (2), `F_GETFL` (3), `F_S
 
 | Rust Function | C ABI Name | Signature | Returns |
 |---------------|------------|-----------|---------|
-| `posix_clock_gettime` | `salty_clock_gettime` | `(clock_id: i32, ts: *mut Timespec) -> i32` | 0 or -1 |
-| `posix_gettimeofday` | `salty_gettimeofday` | `(tv: *mut Timeval) -> i32` | 0 or -1 |
-| `posix_nanosleep` | `salty_nanosleep` | `(req: *const Timespec, rem: *mut Timespec) -> i32` | 0 or -1 |
-| `posix_usleep` | `salty_usleep` | `(usec: u64) -> i32` | 0 or -1 |
-| `posix_sleep` | `salty_sleep` | `(seconds: u64) -> u64` | 0 or remaining seconds |
+| `posix_clock_gettime` | `besalt_clock_gettime` | `(clock_id: i32, ts: *mut Timespec) -> i32` | 0 or -1 |
+| `posix_gettimeofday` | `besalt_gettimeofday` | `(tv: *mut Timeval) -> i32` | 0 or -1 |
+| `posix_nanosleep` | `besalt_nanosleep` | `(req: *const Timespec, rem: *mut Timespec) -> i32` | 0 or -1 |
+| `posix_usleep` | `besalt_usleep` | `(usec: u64) -> i32` | 0 or -1 |
+| `posix_sleep` | `besalt_sleep` | `(seconds: u64) -> u64` | 0 or remaining seconds |
 
 Clock IDs: `CLOCK_MONOTONIC` (0), `CLOCK_REALTIME` (1).
 
@@ -659,7 +659,7 @@ When all CSpace segments are exhausted:
 1. NBSend `PM_EXPAND_CSPACE_ASYNC` to procmgr
 2. Call `PM_EXPAND_COLLECT` to get new segment base/count
 
-Auxv types: `AT_SALTY_SLOT_BASE` (0x1007), `AT_SALTY_SLOT_COUNT` (0x1008), `AT_SALTY_EXPAND_EP` (0x1009).
+Auxv types: `AT_BESALT_SLOT_BASE` (0x1007), `AT_BESALT_SLOT_COUNT` (0x1008), `AT_BESALT_EXPAND_EP` (0x1009).
 
 ---
 
@@ -767,8 +767,8 @@ CPIO header size: `CPIO_HEADER_SIZE` (110 bytes).
 | Function | C ABI Name | Signature | Description |
 |----------|------------|-----------|-------------|
 | `serial_putc` | -- | `(c: u8)` | Write single byte via `SYS_DEBUG_PUTCHAR` |
-| `serial_puts` | `salty_serial_puts` (via lib.rs) | `(s: &[u8])` | Write byte slice atomically (256 bytes/syscall via `SYS_DEBUG_PUTBUF`) |
-| `serial_hex` | `salty_serial_hex` (via lib.rs) | `(val: u64)` | Write "0x..." hex string atomically |
+| `serial_puts` | `besalt_serial_puts` (via lib.rs) | `(s: &[u8])` | Write byte slice atomically (256 bytes/syscall via `SYS_DEBUG_PUTBUF`) |
+| `serial_hex` | `besalt_serial_hex` (via lib.rs) | `(val: u64)` | Write "0x..." hex string atomically |
 | `serial_dec` | -- | `(val: u64)` | Write decimal number atomically |
 
 ### LineBuf
@@ -870,10 +870,10 @@ Readiness modes: `SPAWN_READY_IMMEDIATE` (0), `SPAWN_READY_NOTIFY` (1).
 
 | Symbol | Type | Description |
 |--------|------|-------------|
-| `__salty_ipc_ctx` | `IpcContext` | Per-process IPC context (buffer pointer + send-cap count) |
-| `__salty_next_frame_slot` | `u64` (weak) | Next CNode slot for frame allocation |
-| `__salty_slot_base` | `u64` (weak) | Slot pool base from auxv |
-| `__salty_slot_count` | `u64` (weak) | Slot pool size from auxv |
-| `__salty_expand_ep` | `u64` (weak) | Notification cap for UT expansion |
+| `__besalt_ipc_ctx` | `IpcContext` | Per-process IPC context (buffer pointer + send-cap count) |
+| `__besalt_next_frame_slot` | `u64` (weak) | Next CNode slot for frame allocation |
+| `__besalt_slot_base` | `u64` (weak) | Slot pool base from auxv |
+| `__besalt_slot_count` | `u64` (weak) | Slot pool size from auxv |
+| `__besalt_expand_ep` | `u64` (weak) | Notification cap for UT expansion |
 
 Weak symbols are overridden by `rtld` with per-process values from auxv entries.

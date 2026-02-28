@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 dnssrv_link = meson.current_source_dir() / 'link.ld'
-libsalty_build_dir = meson.project_build_root() / 'lib/libsalty'
+libbesalt_build_dir = meson.project_build_root() / 'lib/besalt/lib'
 
 # Step 1: Rust -> .o
 dnssrv_obj = custom_target('dnssrv_obj',
@@ -14,10 +14,10 @@ dnssrv_obj = custom_target('dnssrv_obj',
     '--emit=obj=@OUTPUT@,dep-info=@DEPFILE@',
     '--crate-name=dnssrv',
     '--crate-type=lib',
-    '--extern', 'salty=' + libsalty_build_dir / 'libsalty.rmeta',
+    '--extern', 'besalt=' + libbesalt_build_dir / 'libbesalt.rmeta',
     '@INPUT@',
   ],
-  depends: [core, compiler_builtins, libsalty_rust],
+  depends: [core, compiler_builtins, libbesalt_rust],
   build_by_default: true,
 )
 
@@ -25,7 +25,7 @@ dnssrv_obj = custom_target('dnssrv_obj',
 dnssrv_elf = custom_target('dnssrv_elf',
   input: [dnssrv_obj],
   output: 'dnssrv.elf',
-  depends: [libsalty_so, libc_so],
+  depends: [libbesalt_so, libc_so],
   command: [cc_cmd,
     '-nostdlib', '-nostartfiles', '-ffreestanding',
     '-fPIE', '-pie',
@@ -33,12 +33,12 @@ dnssrv_elf = custom_target('dnssrv_elf',
     '-mno-red-zone',
     '-fuse-ld=lld',
     '-T', dnssrv_link,
-    '-Wl,--dynamic-linker,/lib/ld-salty.so',
-    '-L', libsalty_build_dir,
-    '-L', meson.project_build_root() / 'lib/saltyc',
+    '-Wl,--dynamic-linker,/lib/ld-besalt.so',
+    '-L', libbesalt_build_dir,
+    '-L', meson.project_build_root() / 'lib/besalt/c',
     '-o', '@OUTPUT@',
     '@INPUT@',
-    '-lsalty', '-lc',
+    '-lbesalt', '-lc',
   ],
   build_by_default: true,
 )

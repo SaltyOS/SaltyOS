@@ -192,10 +192,10 @@ typedef uint64_t cap_t;
 #define CAP_UNTYPED_END     24
 
 /* Salty error codes used for fallback filtering */
-#define SALTY_INVALID_CAPABILITY  1
-#define SALTY_INVALID_OPERATION   2
-#define SALTY_OUT_OF_MEMORY       5
-#define SALTY_NOT_FOUND           6
+#define BESALT_INVALID_CAPABILITY  1
+#define BESALT_INVALID_OPERATION   2
+#define BESALT_OUT_OF_MEMORY       5
+#define BESALT_NOT_FOUND           6
 
 struct rtld_syscall_result {
     uint64_t error;
@@ -401,16 +401,16 @@ typedef struct {
 #define AT_ENTRY   9
 
 /* SaltyOS custom auxv types */
-#define AT_SALTY_UNTYPED     0x1000
-#define AT_SALTY_VSPACE      0x1001
-#define AT_SALTY_SCRATCH     0x1002
-#define AT_SALTY_INITRD      0x1003
-#define AT_SALTY_INITRD_SZ   0x1004
-#define AT_SALTY_FRAME_SLOT  0x1005
-#define AT_SALTY_SHARED_LIB_BASE  0x1006
-#define AT_SALTY_SLOT_BASE   0x1007
-#define AT_SALTY_SLOT_COUNT  0x1008
-#define AT_SALTY_CSPACE_NTFN 0x100A
+#define AT_BESALT_UNTYPED     0x1000
+#define AT_BESALT_VSPACE      0x1001
+#define AT_BESALT_SCRATCH     0x1002
+#define AT_BESALT_INITRD      0x1003
+#define AT_BESALT_INITRD_SZ   0x1004
+#define AT_BESALT_FRAME_SLOT  0x1005
+#define AT_BESALT_SHARED_LIB_BASE  0x1006
+#define AT_BESALT_SLOT_BASE   0x1007
+#define AT_BESALT_SLOT_COUNT  0x1008
+#define AT_BESALT_CSPACE_NTFN 0x100A
 
 /* ============================================================
  * CPIO parser (inline, self-contained)
@@ -559,11 +559,11 @@ struct rtld_state {
     /* Shared library pre-mapping (0 if not pre-mapped) */
     uint64_t shared_lib_base;
 
-    /* Per-process slot pool (from AT_SALTY_SLOT_BASE/COUNT) */
+    /* Per-process slot pool (from AT_BESALT_SLOT_BASE/COUNT) */
     uint64_t slot_base;
     uint64_t slot_count;
 
-    /* CSpace expansion notification cap (from AT_SALTY_CSPACE_NTFN) */
+    /* CSpace expansion notification cap (from AT_BESALT_CSPACE_NTFN) */
     uint64_t cspace_ntfn;
 };
 

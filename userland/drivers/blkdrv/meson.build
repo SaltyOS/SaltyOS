@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 blkdrv_link = meson.current_source_dir() / 'link.ld'
-libsalty_build_dir = meson.project_build_root() / 'lib/libsalty'
+libbesalt_build_dir = meson.project_build_root() / 'lib/besalt/lib'
 
 # Step 1: Rust -> .o
 blkdrv_obj = custom_target('blkdrv_obj',
@@ -14,10 +14,10 @@ blkdrv_obj = custom_target('blkdrv_obj',
     '--emit=obj=@OUTPUT@,dep-info=@DEPFILE@',
     '--crate-name=blkdrv',
     '--crate-type=lib',
-    '--extern', 'salty=' + libsalty_build_dir / 'libsalty.rmeta',
+    '--extern', 'besalt=' + libbesalt_build_dir / 'libbesalt.rmeta',
     '@INPUT@',
   ],
-  depends: [core, compiler_builtins, libsalty_rust],
+  depends: [core, compiler_builtins, libbesalt_rust],
   build_by_default: true,
 )
 
@@ -25,18 +25,18 @@ blkdrv_obj = custom_target('blkdrv_obj',
 blkdrv_elf = custom_target('blkdrv_elf',
   input: [blkdrv_obj],
   output: 'blkdrv.elf',
-  depends: [libsalty_so, libc_so],
+  depends: [libbesalt_so, libc_so],
   command: [cc_cmd,
     '--target=' + c_target,
     '-nostdlib', '-nostartfiles', '-ffreestanding',
     '-fno-stack-protector',
     '-mno-red-zone',
     '-T', blkdrv_link,
-    '-L', libsalty_build_dir,
-    '-L', meson.project_build_root() / 'lib/saltyc',
+    '-L', libbesalt_build_dir,
+    '-L', meson.project_build_root() / 'lib/besalt/c',
     '-o', '@OUTPUT@',
     '@INPUT@',
-    '-lsalty', '-lc',
+    '-lbesalt', '-lc',
   ],
   build_by_default: true,
 )

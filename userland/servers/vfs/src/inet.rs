@@ -7,10 +7,10 @@
 //! (connect, recv, accept) save the client's reply cap and return
 //! asynchronously via netsrv's badged callback EP.
 
-use salty::consts::*;
-use salty::invoke;
-use salty::ipc;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::invoke;
+use besalt::ipc;
+use besalt::types::*;
 
 use crate::client::get_client;
 use crate::consts::*;
@@ -113,12 +113,12 @@ pub(crate) unsafe fn inet_init() {
         // Call netsrv with NET_REGISTER_VFS, transferring the badged EP
         ipc::set_send_cap_ctx(ipc_ctx(), 0, VFS_CAP_NETSRV_CALLBACK_EP);
 
-        let mut msg = SaltyMsg::zeroed();
+        let mut msg = BesaltMsg::zeroed();
         msg.label = NET_REGISTER_VFS;
         msg.length = 0;
-        let mut resp = SaltyMsg::zeroed();
+        let mut resp = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const msg, &raw mut resp);
-        if err != 0 || resp.label != SALTY_OK {
+        if err != 0 || resp.label != BESALT_OK {
             crate::puts(b"[VFS] inet: failed to register with netsrv\n");
         } else {
             crate::puts(b"[VFS] inet: registered callback EP with netsrv\n");
@@ -132,22 +132,22 @@ pub(crate) unsafe fn inet_init() {
 
 /// Forward NET_SOCKET to netsrv, create FD_TYPE_INET_SOCKET fd.
 pub(crate) unsafe fn handle_inet_socket(
-    _msg: *const SaltyMsg,
-    reply: *mut SaltyMsg,
+    _msg: *const BesaltMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
     sock_type: i32,
 ) -> bool {
     // SAFETY: IPC context is valid; making synchronous RPC to netsrv.
     unsafe {
-        let mut req = SaltyMsg::zeroed();
+        let mut req = BesaltMsg::zeroed();
         req.label = NET_SOCKET;
         req.regs[0] = sock_type as u64;
         req.length = 1;
-        let mut resp = SaltyMsg::zeroed();
+        let mut resp = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
-        if err != 0 || resp.label != SALTY_OK {
+        if err != 0 || resp.label != BESALT_OK {
             (*reply).label = if err != 0 {
-                SALTY_INVALID_OPERATION
+                BESALT_INVALID_OPERATION
             } else {
                 resp.label
             };
@@ -157,7 +157,7 @@ pub(crate) unsafe fn handle_inet_socket(
 
         let cli = get_client(badge);
         if cli.is_null() {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return false;
         }
 
@@ -168,7 +168,7 @@ pub(crate) unsafe fn handle_inet_socket(
                 (*(*cli).fds.add(fd)).sock_id = conn_id;
                 (*(*cli).fds.add(fd)).offset = 0;
                 (*(*cli).fds.add(fd)).flags = 0;
-                (*reply).label = SALTY_OK;
+                (*reply).label = BESALT_OK;
                 (*reply).length = 1;
                 (*reply).regs[0] = fd as u64;
                 return false;
@@ -176,18 +176,18 @@ pub(crate) unsafe fn handle_inet_socket(
         }
 
         // No free fd — close the netsrv conn
-        let mut close_req = SaltyMsg::zeroed();
+        let mut close_req = BesaltMsg::zeroed();
         close_req.label = NET_CLOSE;
         close_req.regs[0] = conn_id as u64;
         close_req.length = 1;
-        let mut close_resp = SaltyMsg::zeroed();
+        let mut close_resp = BesaltMsg::zeroed();
         let _ = ipc::call_ctx(
             ipc_ctx(),
             VFS_CAP_NETSRV_EP,
             &raw const close_req,
             &raw mut close_resp,
         );
-        (*reply).label = SALTY_OUT_OF_MEMORY;
+        (*reply).label = BESALT_OUT_OF_MEMORY;
         false
     }
 }
@@ -197,8 +197,8 @@ pub(crate) unsafe fn handle_inet_socket(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_connect(
-    msg: *const SaltyMsg,
-    reply: *mut SaltyMsg,
+    msg: *const BesaltMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
@@ -214,7 +214,7 @@ pub(crate) unsafe fn handle_inet_connect(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_INET_SOCKET
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
 
@@ -224,38 +224,38 @@ pub(crate) unsafe fn handle_inet_connect(
         let client_slot = alloc_reply_slot();
         let err = invoke::cnode_save_caller(CAP_SELF_CSPACE, client_slot);
         if err != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
         // Call netsrv synchronously
-        let mut req = SaltyMsg::zeroed();
+        let mut req = BesaltMsg::zeroed();
         req.label = NET_CONNECT;
         req.regs[0] = conn_id as u64;
         req.regs[1] = ip as u64;
         req.regs[2] = port as u64;
         req.length = 3;
-        let mut resp = SaltyMsg::zeroed();
+        let mut resp = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
 
         if err != 0 {
-            let mut client_reply = SaltyMsg::zeroed();
-            client_reply.label = SALTY_INVALID_OPERATION;
+            let mut client_reply = BesaltMsg::zeroed();
+            client_reply.label = BESALT_INVALID_OPERATION;
             ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
             return true;
         }
 
-        if resp.label == SALTY_PENDING {
+        if resp.label == BESALT_PENDING {
             // TCP SYN sent, handshake pending — record and wait for callback
             if !alloc_pending(conn_id, INET_OP_CONNECT, client_slot, badge) {
-                let mut client_reply = SaltyMsg::zeroed();
-                client_reply.label = SALTY_OUT_OF_MEMORY;
+                let mut client_reply = BesaltMsg::zeroed();
+                client_reply.label = BESALT_OUT_OF_MEMORY;
                 ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
             }
             true // skip_reply
         } else {
             // Immediate result (UDP connect or error)
-            let mut client_reply = SaltyMsg::zeroed();
+            let mut client_reply = BesaltMsg::zeroed();
             client_reply.label = resp.label;
             ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
             true // skip_reply (already replied)
@@ -268,8 +268,8 @@ pub(crate) unsafe fn handle_inet_connect(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_bind(
-    msg: *const SaltyMsg,
-    reply: *mut SaltyMsg,
+    msg: *const BesaltMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
@@ -285,22 +285,22 @@ pub(crate) unsafe fn handle_inet_bind(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_INET_SOCKET
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
 
         let conn_id = (*(*cli).fds.add(fd as usize)).sock_id;
 
-        let mut req = SaltyMsg::zeroed();
+        let mut req = BesaltMsg::zeroed();
         req.label = NET_BIND;
         req.regs[0] = conn_id as u64;
         req.regs[1] = ip as u64;
         req.regs[2] = port as u64;
         req.length = 3;
-        let mut resp = SaltyMsg::zeroed();
+        let mut resp = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         (*reply).label = if err != 0 {
-            SALTY_INVALID_OPERATION
+            BESALT_INVALID_OPERATION
         } else {
             resp.label
         };
@@ -313,8 +313,8 @@ pub(crate) unsafe fn handle_inet_bind(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_listen(
-    msg: *const SaltyMsg,
-    reply: *mut SaltyMsg,
+    msg: *const BesaltMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
@@ -329,21 +329,21 @@ pub(crate) unsafe fn handle_inet_listen(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_INET_SOCKET
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
 
         let conn_id = (*(*cli).fds.add(fd as usize)).sock_id;
 
-        let mut req = SaltyMsg::zeroed();
+        let mut req = BesaltMsg::zeroed();
         req.label = NET_LISTEN;
         req.regs[0] = conn_id as u64;
         req.regs[1] = backlog as u64;
         req.length = 2;
-        let mut resp = SaltyMsg::zeroed();
+        let mut resp = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         (*reply).label = if err != 0 {
-            SALTY_INVALID_OPERATION
+            BESALT_INVALID_OPERATION
         } else {
             resp.label
         };
@@ -356,8 +356,8 @@ pub(crate) unsafe fn handle_inet_listen(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_accept(
-    msg: *const SaltyMsg,
-    reply: *mut SaltyMsg,
+    msg: *const BesaltMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
@@ -370,7 +370,7 @@ pub(crate) unsafe fn handle_inet_accept(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_INET_SOCKET
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
 
@@ -379,55 +379,55 @@ pub(crate) unsafe fn handle_inet_accept(
         let client_slot = alloc_reply_slot();
         let err = invoke::cnode_save_caller(CAP_SELF_CSPACE, client_slot);
         if err != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
-        let mut req = SaltyMsg::zeroed();
+        let mut req = BesaltMsg::zeroed();
         req.label = NET_ACCEPT;
         req.regs[0] = conn_id as u64;
         req.length = 1;
-        let mut resp = SaltyMsg::zeroed();
+        let mut resp = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
 
         if err != 0 {
-            let mut client_reply = SaltyMsg::zeroed();
-            client_reply.label = SALTY_INVALID_OPERATION;
+            let mut client_reply = BesaltMsg::zeroed();
+            client_reply.label = BESALT_INVALID_OPERATION;
             ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
             return true;
         }
 
-        if resp.label == SALTY_PENDING {
+        if resp.label == BESALT_PENDING {
             // No pending connections — wait for callback
             if !alloc_pending(conn_id, INET_OP_ACCEPT, client_slot, badge) {
-                let mut client_reply = SaltyMsg::zeroed();
-                client_reply.label = SALTY_OUT_OF_MEMORY;
+                let mut client_reply = BesaltMsg::zeroed();
+                client_reply.label = BESALT_OUT_OF_MEMORY;
                 ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
             }
             true
-        } else if resp.label == SALTY_OK {
+        } else if resp.label == BESALT_OK {
             // Connection already queued — allocate new fd
             let new_conn_id = resp.regs[0] as u32;
             let remote_ip = resp.regs[1] as u32;
             let remote_port = resp.regs[2] as u16;
 
-            let mut client_reply = SaltyMsg::zeroed();
+            let mut client_reply = BesaltMsg::zeroed();
             match alloc_inet_fd(badge, new_conn_id) {
                 Some(new_fd) => {
-                    client_reply.label = SALTY_OK;
+                    client_reply.label = BESALT_OK;
                     client_reply.regs[0] = new_fd as u64;
                     client_reply.regs[1] = remote_ip as u64;
                     client_reply.regs[2] = remote_port as u64;
                     client_reply.length = 3;
                 }
                 None => {
-                    client_reply.label = SALTY_OUT_OF_MEMORY;
+                    client_reply.label = BESALT_OUT_OF_MEMORY;
                 }
             }
             ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
             true
         } else {
-            let mut client_reply = SaltyMsg::zeroed();
+            let mut client_reply = BesaltMsg::zeroed();
             client_reply.label = resp.label;
             ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
             true
@@ -440,9 +440,9 @@ pub(crate) unsafe fn handle_inet_accept(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_write(
-    msg: *const SaltyMsg,
+    msg: *const BesaltMsg,
     fde: *mut FdEntry,
-    reply: *mut SaltyMsg,
+    reply: *mut BesaltMsg,
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
@@ -450,7 +450,7 @@ pub(crate) unsafe fn handle_inet_write(
         let count = (*msg).regs[1] as usize;
         let actual = if count > 144 { 144 } else { count };
 
-        let mut req = SaltyMsg::zeroed();
+        let mut req = BesaltMsg::zeroed();
         req.label = NET_SEND;
         req.regs[0] = conn_id as u64;
         req.regs[1] = actual as u64;
@@ -461,10 +461,10 @@ pub(crate) unsafe fn handle_inet_write(
         }
         req.length = 2 + ((actual as u64 + 7) / 8);
 
-        let mut resp = SaltyMsg::zeroed();
+        let mut resp = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         if err != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
         } else {
             (*reply).label = resp.label;
             (*reply).regs[0] = resp.regs[0];
@@ -479,9 +479,9 @@ pub(crate) unsafe fn handle_inet_write(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_read(
-    msg: *const SaltyMsg,
+    msg: *const BesaltMsg,
     fde: *mut FdEntry,
-    reply: *mut SaltyMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
@@ -494,36 +494,36 @@ pub(crate) unsafe fn handle_inet_read(
         let client_slot = alloc_reply_slot();
         let err = invoke::cnode_save_caller(CAP_SELF_CSPACE, client_slot);
         if err != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
-        let mut req = SaltyMsg::zeroed();
+        let mut req = BesaltMsg::zeroed();
         req.label = NET_RECV;
         req.regs[0] = conn_id as u64;
         req.regs[1] = capped as u64;
         req.length = 2;
-        let mut resp = SaltyMsg::zeroed();
+        let mut resp = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
 
         if err != 0 {
-            let mut client_reply = SaltyMsg::zeroed();
-            client_reply.label = SALTY_INVALID_OPERATION;
+            let mut client_reply = BesaltMsg::zeroed();
+            client_reply.label = BESALT_INVALID_OPERATION;
             ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
             return true;
         }
 
-        if resp.label == SALTY_PENDING {
+        if resp.label == BESALT_PENDING {
             // No data yet — record pending
             if !alloc_pending(conn_id, INET_OP_RECV, client_slot, badge) {
-                let mut client_reply = SaltyMsg::zeroed();
-                client_reply.label = SALTY_OUT_OF_MEMORY;
+                let mut client_reply = BesaltMsg::zeroed();
+                client_reply.label = BESALT_OUT_OF_MEMORY;
                 ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
             }
             true
         } else {
             // Data available immediately
-            let mut client_reply = SaltyMsg::zeroed();
+            let mut client_reply = BesaltMsg::zeroed();
             client_reply.label = resp.label;
             client_reply.regs[0] = resp.regs[0]; // byte count
             let data_len = resp.regs[0] as usize;
@@ -547,8 +547,8 @@ pub(crate) unsafe fn handle_inet_read(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_sendto(
-    msg: *const SaltyMsg,
-    reply: *mut SaltyMsg,
+    msg: *const BesaltMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
@@ -565,14 +565,14 @@ pub(crate) unsafe fn handle_inet_sendto(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_INET_SOCKET
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
 
         let conn_id = (*(*cli).fds.add(fd as usize)).sock_id;
         let actual = if data_len > 120 { 120 } else { data_len };
 
-        let mut req = SaltyMsg::zeroed();
+        let mut req = BesaltMsg::zeroed();
         req.label = NET_SENDTO;
         req.regs[0] = conn_id as u64;
         req.regs[1] = dst_ip as u64;
@@ -585,10 +585,10 @@ pub(crate) unsafe fn handle_inet_sendto(
         }
         req.length = 4 + ((actual as u64 + 7) / 8);
 
-        let mut resp = SaltyMsg::zeroed();
+        let mut resp = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         if err != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
         } else {
             (*reply).label = resp.label;
             (*reply).regs[0] = resp.regs[0]; // bytes sent
@@ -603,8 +603,8 @@ pub(crate) unsafe fn handle_inet_sendto(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_recvfrom(
-    msg: *const SaltyMsg,
-    reply: *mut SaltyMsg,
+    msg: *const BesaltMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
@@ -619,7 +619,7 @@ pub(crate) unsafe fn handle_inet_recvfrom(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_INET_SOCKET
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
 
@@ -629,35 +629,35 @@ pub(crate) unsafe fn handle_inet_recvfrom(
         let client_slot = alloc_reply_slot();
         let err = invoke::cnode_save_caller(CAP_SELF_CSPACE, client_slot);
         if err != 0 {
-            (*reply).label = SALTY_INVALID_OPERATION;
+            (*reply).label = BESALT_INVALID_OPERATION;
             return false;
         }
 
-        let mut req = SaltyMsg::zeroed();
+        let mut req = BesaltMsg::zeroed();
         req.label = NET_RECVFROM;
         req.regs[0] = conn_id as u64;
         req.regs[1] = capped as u64;
         req.length = 2;
-        let mut resp = SaltyMsg::zeroed();
+        let mut resp = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
 
         if err != 0 {
-            let mut client_reply = SaltyMsg::zeroed();
-            client_reply.label = SALTY_INVALID_OPERATION;
+            let mut client_reply = BesaltMsg::zeroed();
+            client_reply.label = BESALT_INVALID_OPERATION;
             ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
             return true;
         }
 
-        if resp.label == SALTY_PENDING {
+        if resp.label == BESALT_PENDING {
             if !alloc_pending(conn_id, INET_OP_RECVFROM, client_slot, badge) {
-                let mut client_reply = SaltyMsg::zeroed();
-                client_reply.label = SALTY_OUT_OF_MEMORY;
+                let mut client_reply = BesaltMsg::zeroed();
+                client_reply.label = BESALT_OUT_OF_MEMORY;
                 ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
             }
             true
         } else {
             // Data available
-            let mut client_reply = SaltyMsg::zeroed();
+            let mut client_reply = BesaltMsg::zeroed();
             client_reply.label = resp.label;
             client_reply.regs[0] = resp.regs[0]; // data_len
             client_reply.regs[1] = resp.regs[1]; // src_ip
@@ -683,8 +683,8 @@ pub(crate) unsafe fn handle_inet_recvfrom(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_shutdown(
-    msg: *const SaltyMsg,
-    reply: *mut SaltyMsg,
+    msg: *const BesaltMsg,
+    reply: *mut BesaltMsg,
     badge: u64,
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
@@ -699,21 +699,21 @@ pub(crate) unsafe fn handle_inet_shutdown(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_INET_SOCKET
         {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return false;
         }
 
         let conn_id = (*(*cli).fds.add(fd as usize)).sock_id;
 
-        let mut req = SaltyMsg::zeroed();
+        let mut req = BesaltMsg::zeroed();
         req.label = NET_SHUTDOWN;
         req.regs[0] = conn_id as u64;
         req.regs[1] = how as u64;
         req.length = 2;
-        let mut resp = SaltyMsg::zeroed();
+        let mut resp = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         (*reply).label = if err != 0 {
-            SALTY_INVALID_OPERATION
+            BESALT_INVALID_OPERATION
         } else {
             resp.label
         };
@@ -729,13 +729,13 @@ pub(crate) unsafe fn close_inet_socket(fde: *mut FdEntry) {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
         let conn_id = (*fde).sock_id;
-        let mut req = SaltyMsg::zeroed();
+        let mut req = BesaltMsg::zeroed();
         req.label = NET_CLOSE;
         req.regs[0] = conn_id as u64;
         req.length = 1;
-        let mut resp = SaltyMsg::zeroed();
+        let mut resp = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
-        if err != 0 || resp.label != SALTY_OK {
+        if err != 0 || resp.label != BESALT_OK {
             crate::puts(b"[VFS] inet: close_inet_socket failed\n");
         }
     }
@@ -773,7 +773,7 @@ unsafe fn alloc_inet_fd(badge: u64, conn_id: u32) -> Option<i32> {
 /// Handle async completion callback from netsrv.
 ///
 /// Called when VFS receives IPC with badge == NETSRV_CALLBACK_BADGE.
-pub(crate) unsafe fn handle_netsrv_callback(msg: *const SaltyMsg, reply: *mut SaltyMsg) {
+pub(crate) unsafe fn handle_netsrv_callback(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
         let conn_id = (*msg).regs[0] as u32;
@@ -781,7 +781,7 @@ pub(crate) unsafe fn handle_netsrv_callback(msg: *const SaltyMsg, reply: *mut Sa
         let op_type = (*msg).regs[2] as u8;
 
         if let Some((client_slot, client_badge)) = find_pending(conn_id, op_type) {
-            let mut client_reply = SaltyMsg::zeroed();
+            let mut client_reply = BesaltMsg::zeroed();
 
             match op_type {
                 INET_OP_CONNECT => {
@@ -789,7 +789,7 @@ pub(crate) unsafe fn handle_netsrv_callback(msg: *const SaltyMsg, reply: *mut Sa
                 }
                 INET_OP_RECV => {
                     client_reply.label = result;
-                    if result == SALTY_OK {
+                    if result == BESALT_OK {
                         let data_len = (*msg).regs[3] as usize;
                         // Cap to max bytes that fit in regs[4..20] (16 regs * 8 = 128)
                         let actual_len = if data_len > 128 { 128 } else { data_len };
@@ -809,7 +809,7 @@ pub(crate) unsafe fn handle_netsrv_callback(msg: *const SaltyMsg, reply: *mut Sa
                 }
                 INET_OP_RECVFROM => {
                     client_reply.label = result;
-                    if result == SALTY_OK {
+                    if result == BESALT_OK {
                         let data_len = (*msg).regs[3] as usize;
                         // Cap to max bytes that fit in regs[6..20] (14 regs * 8 = 112)
                         let actual_len = if data_len > 112 { 112 } else { data_len };
@@ -833,7 +833,7 @@ pub(crate) unsafe fn handle_netsrv_callback(msg: *const SaltyMsg, reply: *mut Sa
                 }
                 INET_OP_ACCEPT => {
                     client_reply.label = result;
-                    if result == SALTY_OK {
+                    if result == BESALT_OK {
                         let new_conn_id = (*msg).regs[3] as u32;
                         let remote_ip = (*msg).regs[4] as u32;
                         let remote_port = (*msg).regs[5] as u16;
@@ -846,13 +846,13 @@ pub(crate) unsafe fn handle_netsrv_callback(msg: *const SaltyMsg, reply: *mut Sa
                                 client_reply.length = 3;
                             }
                             None => {
-                                client_reply.label = SALTY_OUT_OF_MEMORY;
+                                client_reply.label = BESALT_OUT_OF_MEMORY;
                             }
                         }
                     }
                 }
                 _ => {
-                    client_reply.label = SALTY_INVALID_OPERATION;
+                    client_reply.label = BESALT_INVALID_OPERATION;
                 }
             }
 
@@ -860,6 +860,6 @@ pub(crate) unsafe fn handle_netsrv_callback(msg: *const SaltyMsg, reply: *mut Sa
         }
 
         // Reply OK to netsrv (completing the callback IPC)
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }

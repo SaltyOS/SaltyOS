@@ -1,9 +1,9 @@
 use crate::types::*;
 use crate::client::find_client_by_badge;
-use salty::consts::*;
-use salty::invoke;
-use salty::serial::LineBuf;
-use salty::types::*;
+use besalt::consts::*;
+use besalt::invoke;
+use besalt::serial::LineBuf;
+use besalt::types::*;
 
 pub(crate) unsafe fn find_shm_by_id(id: u64) -> *mut ShmObject {
     unsafe {
@@ -22,20 +22,20 @@ pub(crate) unsafe fn find_shm_by_id(id: u64) -> *mut ShmObject {
 /// MM_SHM_CREATE: allocate frames for a SHM object.
 ///   MR0 = shm_id
 ///   MR1 = num_pages
-///   Reply: label = SALTY_OK or error
-pub(crate) unsafe fn handle_mm_shm_create(msg: *const SaltyMsg, _caller_badge: u64, reply: *mut SaltyMsg) {
+///   Reply: label = BESALT_OK or error
+pub(crate) unsafe fn handle_mm_shm_create(msg: *const BesaltMsg, _caller_badge: u64, reply: *mut BesaltMsg) {
     unsafe {
         let shm_id = (*msg).regs[0];
         let num_pages = (*msg).regs[1] as usize;
 
         if num_pages == 0 {
-            (*reply).label = SALTY_INVALID_ARGUMENT;
+            (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
 
         // Check for duplicate
         if !find_shm_by_id(shm_id).is_null() {
-            (*reply).label = SALTY_ALREADY_EXISTS;
+            (*reply).label = BESALT_ALREADY_EXISTS;
             return;
         }
 
@@ -58,7 +58,7 @@ pub(crate) unsafe fn handle_mm_shm_create(msg: *const SaltyMsg, _caller_badge: u
             let new_pages = if new_pages == 0 { 1 } else { new_pages };
             let new_ptr = super::self_mmap(new_pages);
             if new_ptr.is_null() {
-                (*reply).label = SALTY_OUT_OF_MEMORY;
+                (*reply).label = BESALT_OUT_OF_MEMORY;
                 return;
             }
             let new_ptr = new_ptr as *mut ShmObject;
@@ -73,19 +73,19 @@ pub(crate) unsafe fn handle_mm_shm_create(msg: *const SaltyMsg, _caller_badge: u
         // Allocate frame_caps array
         let fcaps = super::alloc_frame_cap_array(num_pages);
         if fcaps.is_null() {
-            (*reply).label = SALTY_OUT_OF_MEMORY;
+            (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
         // Allocate frames
         for i in 0..num_pages {
-            let frame_slot = match salty::slot_alloc::slot_alloc() {
+            let frame_slot = match besalt::slot_alloc::slot_alloc() {
                 Some(s) => s,
                 None => {
                     for j in 0..i {
                         invoke::cnode_delete(super::CAP_SELF_CSPACE, *fcaps.add(j));
                     }
-                    (*reply).label = SALTY_OUT_OF_MEMORY;
+                    (*reply).label = BESALT_OUT_OF_MEMORY;
                     return;
                 }
             };
@@ -94,7 +94,7 @@ pub(crate) unsafe fn handle_mm_shm_create(msg: *const SaltyMsg, _caller_badge: u
                 for j in 0..i {
                     invoke::cnode_delete(super::CAP_SELF_CSPACE, *fcaps.add(j));
                 }
-                (*reply).label = SALTY_OUT_OF_MEMORY;
+                (*reply).label = BESALT_OUT_OF_MEMORY;
                 return;
             }
             *fcaps.add(i) = frame_slot;
@@ -118,7 +118,7 @@ pub(crate) unsafe fn handle_mm_shm_create(msg: *const SaltyMsg, _caller_badge: u
             lb.flush();
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
 
@@ -127,8 +127,8 @@ pub(crate) unsafe fn handle_mm_shm_create(msg: *const SaltyMsg, _caller_badge: u
 ///   MR1 = client badge
 ///   MR2 = vaddr
 ///   MR3 = prot (vspace flags)
-///   Reply: label = SALTY_OK, MR0 = mapped_base
-pub(crate) unsafe fn handle_mm_shm_map(msg: *const SaltyMsg, caller_badge: u64, reply: *mut SaltyMsg) {
+///   Reply: label = BESALT_OK, MR0 = mapped_base
+pub(crate) unsafe fn handle_mm_shm_map(msg: *const BesaltMsg, caller_badge: u64, reply: *mut BesaltMsg) {
     unsafe {
         let shm_id = (*msg).regs[0];
         let client_badge = if (*msg).regs[1] == 0 { caller_badge } else { (*msg).regs[1] };
@@ -137,13 +137,13 @@ pub(crate) unsafe fn handle_mm_shm_map(msg: *const SaltyMsg, caller_badge: u64, 
 
         let shm = find_shm_by_id(shm_id);
         if shm.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
 
         let client = find_client_by_badge(client_badge);
         if client.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
 
@@ -169,7 +169,7 @@ pub(crate) unsafe fn handle_mm_shm_map(msg: *const SaltyMsg, caller_badge: u64, 
                 for j in 0..i {
                     invoke::vspace_unmap(vspace_cap, actual_vaddr + j as u64 * 4096);
                 }
-                (*reply).label = SALTY_BAD_ADDRESS;
+                (*reply).label = BESALT_BAD_ADDRESS;
                 return;
             }
         }
@@ -179,7 +179,7 @@ pub(crate) unsafe fn handle_mm_shm_map(msg: *const SaltyMsg, caller_badge: u64, 
             (*client).mmap_next = actual_vaddr + page_count as u64 * 4096;
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
         (*reply).length = 1;
         (*reply).regs[0] = actual_vaddr;
     }
@@ -189,8 +189,8 @@ pub(crate) unsafe fn handle_mm_shm_map(msg: *const SaltyMsg, caller_badge: u64, 
 ///   MR0 = shm_id
 ///   MR1 = client badge
 ///   MR2 = vaddr (base address of the mapping)
-///   Reply: label = SALTY_OK
-pub(crate) unsafe fn handle_mm_shm_unmap(msg: *const SaltyMsg, caller_badge: u64, reply: *mut SaltyMsg) {
+///   Reply: label = BESALT_OK
+pub(crate) unsafe fn handle_mm_shm_unmap(msg: *const BesaltMsg, caller_badge: u64, reply: *mut BesaltMsg) {
     unsafe {
         let shm_id = (*msg).regs[0];
         let client_badge = if (*msg).regs[1] == 0 { caller_badge } else { (*msg).regs[1] };
@@ -198,13 +198,13 @@ pub(crate) unsafe fn handle_mm_shm_unmap(msg: *const SaltyMsg, caller_badge: u64
 
         let shm = find_shm_by_id(shm_id);
         if shm.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
 
         let client = find_client_by_badge(client_badge);
         if client.is_null() {
-            (*reply).label = SALTY_NOT_FOUND;
+            (*reply).label = BESALT_NOT_FOUND;
             return;
         }
 
@@ -216,6 +216,6 @@ pub(crate) unsafe fn handle_mm_shm_unmap(msg: *const SaltyMsg, caller_badge: u64
             }
         }
 
-        (*reply).label = SALTY_OK;
+        (*reply).label = BESALT_OK;
     }
 }
