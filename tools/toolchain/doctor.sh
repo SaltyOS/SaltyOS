@@ -128,4 +128,11 @@ if [[ -x "${SALTYOS_TOOLCHAIN_PREFIX}/bin/llvm-config" ]]; then
   fi
 fi
 
+if [[ -x "${SALTYOS_TOOLCHAIN_PREFIX}/bin/llvm-config" ]]; then
+  clang_version=$("${SALTYOS_TOOLCHAIN_PREFIX}/bin/llvm-config" --version 2>/dev/null \
+    | sed 's/\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/')
+  crt_builtins="${SALTYOS_TOOLCHAIN_PREFIX}/lib/clang/${clang_version}/lib/x86_64-unknown-saltyos/libclang_rt.builtins.a"
+  check_file "${crt_builtins}" "compiler-rt builtins (saltyos)"
+fi
+
 exit "${status}"

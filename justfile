@@ -500,6 +500,21 @@ toolchain-build-llvm:
       -DLLVM_TARGETS_TO_BUILD="X86" \
       -DLLVM_INSTALL_UTILS=ON \
       -DLLVM_ENABLE_RUNTIMES=compiler-rt \
+      -DLLVM_RUNTIME_TARGETS="default;x86_64-unknown-saltyos" \
+      -DRUNTIMES_x86_64-unknown-saltyos_CMAKE_C_FLAGS="-ffreestanding" \
+      -DRUNTIMES_x86_64-unknown-saltyos_CMAKE_CXX_FLAGS="-ffreestanding" \
+      -DRUNTIMES_x86_64-unknown-saltyos_CMAKE_C_COMPILER_FORCED=ON \
+      -DRUNTIMES_x86_64-unknown-saltyos_CMAKE_CXX_COMPILER_FORCED=ON \
+      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_BUILTINS=ON \
+      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_SANITIZERS=OFF \
+      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_XRAY=OFF \
+      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_LIBFUZZER=OFF \
+      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_PROFILE=OFF \
+      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_MEMPROF=OFF \
+      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_ORC=OFF \
+      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_GWP_ASAN=OFF \
+      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_CTX_PROFILE=OFF \
+      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILTINS_ENABLE_PIC=ON \
       -DCMAKE_INSTALL_PREFIX="$SALTYOS_TOOLCHAIN_PREFIX"
     ninja -C "$SALTYOS_LLVM_BUILD_DIR" -j"$(nproc)"
     ninja -C "$SALTYOS_LLVM_BUILD_DIR" install
