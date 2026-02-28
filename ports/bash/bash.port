@@ -78,6 +78,7 @@ bash_cv_tiocstat_in_ioctl = no
 bash_cv_fionread_in_ioctl = yes
 bash_cv_fnm_extmatch = no
 bash_cv_fnmatch_equiv_fallback = no
+ac_cv_header_sys_random_h = yes
 bash_cv_struct_dirent_has_d_ino = yes
 bash_cv_dirent_has_d_fileno = no
 bash_cv_dirent_has_d_namlen = yes
