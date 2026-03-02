@@ -27,6 +27,16 @@ pub(crate) unsafe fn handle_bulk_setup(
 ) {
     unsafe {
         let shm_id = (*msg).regs[0];
+        let client_pages = (*msg).regs[1];
+
+        // Reject clients that claim fewer pages than VFS needs for bulk I/O.
+        // VFS always writes up to CLIENT_BULK_SHM_PAGES pages per request;
+        // a smaller mapping would allow writes past the end of the client SHM.
+        if client_pages < CLIENT_BULK_SHM_PAGES {
+            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).length = 0;
+            return;
+        }
 
         // Map the client-created SHM into VFS via mmsrv (auto-place)
         let mut req = BesaltMsg::zeroed();

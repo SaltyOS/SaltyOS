@@ -43,6 +43,9 @@ static mut BULK_SHM_READY: bool = false;
 pub struct VfsLoadResult {
     pub data: *const u8,
     pub data_len: usize,
+    /// Page-aligned allocation size used for the scratch mmap.
+    /// Must be passed to cleanup_vfs_load to unmap exactly the right range.
+    pub alloc_size: u64,
 }
 
 /// Try to load an ELF binary from the VFS.
@@ -161,6 +164,7 @@ pub unsafe fn try_load_from_vfs(name: &[u8], name_len: usize) -> Option<VfsLoadR
         Some(VfsLoadResult {
             data: buf as *const u8,
             data_len: total_read,
+            alloc_size,
         })
     }
 }
@@ -347,14 +351,15 @@ unsafe fn vfs_open(path: &[u8], path_len: usize) -> Option<i32> {
         msg.regs[0] = 0o644; // mode (ignored for O_RDONLY)
         msg.regs[1] = O_RDONLY as u64; // flags
 
-        // Pack path: regs[2] = path_len, regs[3..] = path bytes as u64s
-        msg.regs[2] = path_len as u64;
+        // Pack path: regs[2] = bytes packed, regs[3..] = path bytes as u64s
+        // Reject paths longer than 128 bytes (IPC register capacity).
+        let max_path = if path_len > 128 { 128 } else { path_len };
+        msg.regs[2] = max_path as u64;
         // Zero regs[3..] before packing
         for i in 3..20 {
             msg.regs[i] = 0;
         }
         let dst = &raw mut msg.regs[3] as *mut u8;
-        let max_path = if path_len > 128 { 128 } else { path_len };
         for i in 0..max_path {
             *dst.add(i) = path[i];
         }
@@ -472,12 +477,15 @@ unsafe fn vfs_close(fd: i32) {
 
 /// Clean up VFS-loaded data by unmapping the scratch region.
 ///
+/// `alloc_size` must be the value from `VfsLoadResult::alloc_size` — the
+/// page-aligned size of the original mmap, which may differ from `data_len`
+/// if a short read occurred.
+///
 /// Must only be called after the ELF data has been fully processed
 /// (loaded into the child's address space).
-pub unsafe fn cleanup_vfs_load(data: *const u8, data_len: usize) {
+pub unsafe fn cleanup_vfs_load(data: *const u8, alloc_size: u64) {
     // SAFETY: Unmapping a region we previously mapped via posix_mmap.
     unsafe {
-        let alloc_size = ((data_len + 0xFFF) & !0xFFF) as u64;
         besalt::posix_mm::posix_munmap(data as *mut u8, alloc_size);
     }
 }

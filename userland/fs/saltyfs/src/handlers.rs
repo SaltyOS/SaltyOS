@@ -211,7 +211,7 @@ pub(crate) fn lookup_in_dir(dir_ino: u64, name: *const u8, name_len: u8) -> Opti
 }
 
 /// Get inode info for a given inode number.
-pub(crate) fn get_inode(ino: u64) -> Option<BesaltInode> {
+pub(crate) fn get_inode(ino: u64) -> Option<SaltyInodeItem> {
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
     let key = BTreeKey {
         object_id: ino,
@@ -221,10 +221,10 @@ pub(crate) fn get_inode(ino: u64) -> Option<BesaltInode> {
 
     match btree_find_item(root_tree, &key) {
         Some((data, size)) => {
-            if size < core::mem::size_of::<BesaltInode>() as u32 {
+            if size < core::mem::size_of::<SaltyInodeItem>() as u32 {
                 return None;
             }
-            Some(unsafe { *(data as *const BesaltInode) })
+            Some(unsafe { *(data as *const SaltyInodeItem) })
         }
         None => None,
     }
@@ -409,11 +409,11 @@ fn readdir_entries(
     reply.length = 1 + (out_idx as u64) * 6;
 }
 
-/// Serialize a BesaltInode to bytes.
-fn inode_to_bytes(inode: &BesaltInode) -> [u8; 128] {
+/// Serialize a SaltyInodeItem to bytes.
+fn inode_to_bytes(inode: &SaltyInodeItem) -> [u8; 128] {
     let mut buf = [0u8; 128];
     unsafe {
-        core::ptr::write_unaligned(buf.as_mut_ptr() as *mut BesaltInode, *inode);
+        core::ptr::write_unaligned(buf.as_mut_ptr() as *mut SaltyInodeItem, *inode);
     }
     buf
 }
@@ -421,7 +421,7 @@ fn inode_to_bytes(inode: &BesaltInode) -> [u8; 128] {
 /// Build inode bytes for a new file or directory.
 fn build_inode_bytes(size: u64, blocks: u64, nlink: u32, mode: u32) -> [u8; 128] {
     let ngen =unsafe { (*(&raw const SB)).generation + 1 };
-    let inode = BesaltInode {
+    let inode = SaltyInodeItem {
         generation: ngen,
         size,
         blocks,
@@ -984,7 +984,7 @@ fn write_regular_extents(
     offset: u64,
     count: u64,
     data_buf: &[u8; 136],
-    inode: &BesaltInode,
+    inode: &SaltyInodeItem,
     new_size: u64,
     bs: u64,
     reply: &mut BesaltMsg,

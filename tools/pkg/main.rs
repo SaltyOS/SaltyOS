@@ -45,6 +45,29 @@ struct RepoPkg {
     depends: Vec<String>,
 }
 
+fn validate_pkg_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("package name must not be empty".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '+' || c == '.')
+    {
+        return Err("package name contains invalid characters".to_string());
+    }
+    let mut components = Path::new(name).components();
+    match components.next() {
+        Some(Component::Normal(_)) => {}
+        _ => {
+            return Err("package name must be a single normal path component".to_string());
+        }
+    }
+    if components.next().is_some() {
+        return Err("package name must not contain path separators".to_string());
+    }
+    Ok(())
+}
+
 fn die(msg: impl AsRef<str>) -> ! {
     eprintln!("Error: {}", msg.as_ref());
     process::exit(1);
@@ -235,6 +258,8 @@ fn scan_repo(repo_dir: &Path, verbose: bool) -> Result<BTreeMap<String, RepoPkg>
         let kv = parse_kv_lines(&pkginfo_text);
         let pkgname = kv.get("pkgname").and_then(|v| v.first()).cloned()
             .ok_or_else(|| format!("{}: .PKGINFO missing pkgname", path.display()))?;
+        validate_pkg_name(&pkgname)
+            .map_err(|e| format!("{}: invalid pkgname '{}': {}", path.display(), pkgname, e))?;
         let pkgver = kv.get("pkgver").and_then(|v| v.first()).cloned()
             .ok_or_else(|| format!("{}: .PKGINFO missing pkgver", path.display()))?;
         let arch = kv.get("arch").and_then(|v| v.first()).cloned().unwrap_or_default();
@@ -447,6 +472,8 @@ fn extract_package_payload(pkg: &RepoPkg, root: &Path, verbose: bool) -> Result<
 }
 
 fn write_local_db(root: &Path, pkg: &RepoPkg, installed_payload: &[PathBuf]) -> Result<(), String> {
+    validate_pkg_name(&pkg.name)
+        .map_err(|e| format!("Invalid package name '{}': {}", pkg.name, e))?;
     let db_dir = root.join("var/lib/pkg/local").join(&pkg.name);
     fs::create_dir_all(&db_dir)
         .map_err(|e| format!("Cannot create local pkg DB dir {}: {}", db_dir.display(), e))?;

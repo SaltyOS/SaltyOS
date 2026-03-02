@@ -10,6 +10,11 @@ use crate::consts::*;
 use crate::types::*;
 use crate::{ipc_ctx, puts};
 
+/// Maximum size of the work buffer used during mount path traversal.
+/// Must accommodate a symlink target (up to 152 bytes) plus "/" plus the
+/// remaining path (up to MAX_PATH_LEN bytes), so 256 is a safe upper bound.
+const MOUNT_PATH_BUF_LEN: usize = 256;
+
 /// Ensure the root underlay mount is initialized. Returns Some(mount_idx) on success.
 unsafe fn ensure_root_underlay() -> Option<usize> {
     unsafe {
@@ -218,12 +223,12 @@ unsafe fn mount_lookup_from_inner(
         }
 
         // Working buffer holds the path being traversed (original + symlink expansions).
-        let mut work_buf = [0u8; 256];
+        let mut work_buf = [0u8; MOUNT_PATH_BUF_LEN];
         let mut work_len = sub_path_len as usize;
-        if work_len > 255 {
+        if work_len >= MOUNT_PATH_BUF_LEN {
             return 0;
         }
-        // SAFETY: work_len <= 255 < 256 = work_buf.len(); sub_path has sub_path_len valid bytes.
+        // SAFETY: work_len < MOUNT_PATH_BUF_LEN; sub_path has sub_path_len valid bytes.
         for i in 0..work_len {
             work_buf[i] = *sub_path.add(i);
         }
@@ -338,13 +343,13 @@ unsafe fn mount_lookup_from_inner(
                 } else {
                     tlen as usize
                 };
-                if new_len > 255 {
+                if new_len >= MOUNT_PATH_BUF_LEN {
                     return 0; // Expanded path too long
                 }
 
                 // Build the new work buffer in a temporary, then copy back
-                let mut new_buf = [0u8; 256];
-                // SAFETY: tlen <= 152, new_len <= 255 < 256 = new_buf.len().
+                let mut new_buf = [0u8; MOUNT_PATH_BUF_LEN];
+                // SAFETY: tlen <= 152, new_len < MOUNT_PATH_BUF_LEN.
                 for i in 0..tlen as usize {
                     new_buf[i] = target_buf[i];
                 }

@@ -148,7 +148,7 @@ unsafe fn resolve_path_raw_inner(
                 // Not last component: concatenate target + remaining path
                 let remaining_len = plen - pos;
                 let total = target_len as usize + 1 + remaining_len; // target + "/" + rest
-                if total > MAX_PATH_LEN {
+                if total >= MAX_PATH_LEN {
                     return core::ptr::null_mut();
                 }
                 let mut combined = [0u8; MAX_PATH_LEN];
@@ -421,7 +421,7 @@ unsafe fn resolve_path_from_inner(
                 // Intermediate component: concatenate target + remaining path
                 let remaining_len = plen - pos;
                 let total = target_len as usize + 1 + remaining_len;
-                if total > MAX_PATH_LEN {
+                if total >= MAX_PATH_LEN {
                     return core::ptr::null_mut();
                 }
                 let mut combined = [0u8; MAX_PATH_LEN];
