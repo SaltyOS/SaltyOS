@@ -202,6 +202,7 @@ toolchain-build-llvm:
       -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_GWP_ASAN=OFF \
       -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_CTX_PROFILE=OFF \
       -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILTINS_ENABLE_PIC=ON \
+      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BAREMETAL_BUILD=ON \
       -DCMAKE_INSTALL_PREFIX="$SALTYOS_TOOLCHAIN_PREFIX"
     ninja -C "$SALTYOS_LLVM_BUILD_DIR" -j"$(nproc)"
     ninja -C "$SALTYOS_LLVM_BUILD_DIR" install
