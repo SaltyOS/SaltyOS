@@ -14,6 +14,7 @@ mod proc_table;
 mod session;
 mod signal;
 mod spawn_tx;
+mod vfs_load;
 
 use besalt::ipc;
 use besalt::serial::LineBuf;
@@ -496,19 +497,6 @@ pub extern "C" fn _start() -> ! {
             } else {
                 puts(b"[PROCMGR] WARN: nameserv registration failed\n");
             }
-        }
-
-        // Phase 4 integrity probe: read from initrd offset 0x45A000
-        // (PT[90] of PD[10] — first zero seen in Phase 3).
-        // If this faults, corruption exists before any spawn requests.
-        {
-            let probe_ptr = (INITRD_VADDR + 0x45A000) as *const u8;
-            let probe_val = unsafe { core::ptr::read_volatile(probe_ptr) };
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] initrd probe @0x45A000 = 0x");
-            lb.hex(probe_val as u64);
-            lb.str(b"\n");
-            lb.flush();
         }
 
         // Initial recv

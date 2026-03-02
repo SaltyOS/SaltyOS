@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""
+SaltyOS Rootfs Image Generator
+SPDX-License-Identifier: GPL-2.0-only
+
+Creates a SaltyFS disk image from a manifest file.
+
+Usage:
+    python3 tools/mkrootfs --output build/rootfs.img --size 256M \
+        --manifest images/rootfs-base.manifest -v
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ManifestEntry = tuple[str, str, Path]
+
+
+def parse_size(s: str) -> str:
+    """Validate size string (pass through to mksaltyfs.py)."""
+    s = s.strip().upper()
+    multipliers = {'K', 'M', 'G'}
+    if s[-1] in multipliers:
+        try:
+            int(s[:-1])
+        except ValueError:
+            print(f"Error: invalid size '{s}'", file=sys.stderr)
+            sys.exit(1)
+    else:
+        try:
+            int(s)
+        except ValueError:
+            print(f"Error: invalid size '{s}'", file=sys.stderr)
+            sys.exit(1)
+    return s
+
+
+def load_manifest(manifest_path: Path, verbose: bool) -> list[ManifestEntry]:
+    """Load a manifest file, resolving @include directives.
+
+    Returns list of (dst_path, src_path, manifest_dir) tuples.
+    """
+    if not manifest_path.exists():
+        print(f"Error: manifest not found: {manifest_path}", file=sys.stderr)
+        sys.exit(1)
+
+    if verbose:
+        print(f"Loading manifest: {manifest_path}")
+
+    entries = []
+    manifest_dir = manifest_path.parent
+
+    with open(manifest_path, 'r') as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+
+            if not line or line.startswith('#'):
+                continue
+
+            if line.startswith('@include '):
+                include_name = line[len('@include '):].strip()
+                include_path = manifest_dir / include_name
+                entries.extend(load_manifest(include_path, verbose))
+                continue
+
+            if '=' not in line:
+                print(f"Error: {manifest_path}:{lineno}: "
+                      f"invalid entry (expected dst=src): {line}",
+                      file=sys.stderr)
+                sys.exit(1)
+
+            dst, src = line.split('=', 1)
+            dst = dst.strip()
+            src = src.strip()
+
+            if not dst or not src:
+                print(f"Error: {manifest_path}:{lineno}: "
+                      f"empty dst or src: {line}",
+                      file=sys.stderr)
+                sys.exit(1)
+
+            entries.append((dst, src, manifest_dir))
+
+    return entries
+
+
+def resolve_source_path(src: str, manifest_dir: Path, repo_root: Path) -> Path:
+    """Resolve source paths deterministically without depending on cwd.
+
+    Policy:
+      - absolute paths: use as-is
+      - './' or '../': resolve relative to the manifest that declared the entry
+      - otherwise: prefer repo-root-relative (current manifest convention),
+        then fall back to manifest-relative, then cwd-relative for compatibility
+    """
+    src_path = Path(src)
+    if src_path.is_absolute():
+        return src_path
+
+    candidates = []
+    if src.startswith('./') or src.startswith('../'):
+        candidates = [manifest_dir / src_path, repo_root / src_path, Path.cwd() / src_path]
+    else:
+        candidates = [repo_root / src_path, manifest_dir / src_path, Path.cwd() / src_path]
+
+    seen = set()
+    for cand in candidates:
+        cand_resolved = cand.resolve()
+        key = str(cand_resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        if cand_resolved.exists():
+            return cand_resolved
+
+    # Return the preferred path for error reporting.
+    return candidates[0].resolve()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Create SaltyOS rootfs disk image from manifest')
+    parser.add_argument('--output', '-o', required=True,
+                        help='Output disk image path')
+    parser.add_argument('--manifest', '-m', action='append', required=True,
+                        help='Manifest file (can specify multiple)')
+    parser.add_argument('--size', '-s', default='256M',
+                        help='Disk image size (default: 256M)')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                        help='Verbose output')
+
+    args = parser.parse_args()
+    size = parse_size(args.size)
+
+    # Load all manifests
+    entries: list[ManifestEntry] = []
+    for manifest in args.manifest:
+        entries.extend(load_manifest(Path(manifest), args.verbose))
+
+    if not entries:
+        print("Error: no entries found in manifest(s)", file=sys.stderr)
+        sys.exit(1)
+
+    # Resolve source paths and validate
+    resolved = []
+    total_size = 0
+    missing = []
+    script_dir = Path(__file__).resolve().parent
+    repo_root = script_dir.parent
+
+    for dst, src, manifest_dir in entries:
+        src_path = resolve_source_path(src, manifest_dir, repo_root)
+        if not src_path.exists():
+            missing.append((dst, src))
+            continue
+        if src_path.is_dir():
+            for child in sorted(src_path.rglob('*')):
+                if child.is_file():
+                    rel = child.relative_to(src_path)
+                    child_dst = dst.rstrip('/') + '/' + str(rel)
+                    file_size = child.stat().st_size
+                    total_size += file_size
+                    resolved.append((child_dst, str(child)))
+        else:
+            file_size = src_path.stat().st_size
+            total_size += file_size
+            resolved.append((dst, str(src_path)))
+
+    if missing:
+        print(f"Error: {len(missing)} source file(s) not found:",
+              file=sys.stderr)
+        for dst, src in missing:
+            print(f"  {dst} <- {src}", file=sys.stderr)
+        sys.exit(1)
+
+    # Build mksaltyfs.py command
+    mksaltyfs = script_dir / 'mksaltyfs.py'
+
+    cmd = ['python3', str(mksaltyfs),
+           '-o', args.output,
+           '-s', size,
+           '--label', 'rootfs']
+
+    for dst, src in resolved:
+        cmd.extend(['--add-file-from', dst, src])
+
+    if args.verbose:
+        print(f"\nBuilding rootfs image:")
+        print(f"  Output: {args.output}")
+        print(f"  Size:   {size}")
+        print(f"  Files:  {len(resolved)}")
+        print(f"  Data:   {total_size / 1024:.1f} KB")
+        print()
+        for dst, src in resolved:
+            sz = os.path.getsize(src)
+            print(f"  {dst} <- {src} ({sz} bytes)")
+        print()
+
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error: mksaltyfs.py failed with exit code {e.returncode}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    output_size = os.path.getsize(args.output)
+    print(f"Rootfs image: {args.output} "
+          f"({len(resolved)} files, {output_size} bytes)")
+
+
+if __name__ == '__main__':
+    main()

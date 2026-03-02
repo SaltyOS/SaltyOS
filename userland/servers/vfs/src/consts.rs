@@ -84,6 +84,11 @@ pub(crate) const VFS_FCHOWN: u64 = 60;
 pub(crate) const VFS_CLIENT_EXIT: u64 = 61;
 pub(crate) const VFS_PREAD: u64 = 62;
 pub(crate) const VFS_PWRITE: u64 = 63;
+pub(crate) const VFS_BULK_SETUP: u64 = 64;
+pub(crate) const VFS_BULK_READ: u64 = 65;
+
+/// Per-client bulk SHM size (256KB = 64 pages).
+pub(crate) const CLIENT_BULK_SHM_PAGES: u64 = 64;
 
 pub(crate) const TTYD_GET_FG_PGRP: u64 = 1;
 pub(crate) const TTYD_SET_FG_PGRP: u64 = 2;
@@ -98,6 +103,7 @@ pub(crate) const TTYD_PTY_POLL: u64 = 17;
 pub(crate) const TTYD_PTY_COLLECT: u64 = 19;
 
 pub(crate) const AT_FDCWD_VAL: i32 = -100;
+pub(crate) const AT_SYMLINK_NOFOLLOW_VAL: i32 = 0x100;
 pub(crate) const AT_REMOVEDIR_VAL: i32 = 0x200;
 pub(crate) const AT_EMPTY_PATH_VAL: i32 = 0x1000;
 

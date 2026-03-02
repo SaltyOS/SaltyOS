@@ -80,6 +80,54 @@ pub(crate) unsafe fn extract_path(msg: *const BesaltMsg, reg_offset: usize, path
     }
 }
 
+/// Extract two packed paths from an IPC message with bounds validation.
+/// `hdr_regs` = number of header registers before the two length fields.
+/// Lengths are at `regs[hdr_regs]` and `regs[hdr_regs+1]`.
+/// Path data starts at `regs[hdr_regs+2]`, old path first (8-byte aligned), then new path.
+/// Returns `Some((old_len, new_len))` on success, or sets `(*reply).label` and returns `None`.
+pub(crate) unsafe fn extract_dual_paths(
+    msg: *const BesaltMsg,
+    hdr_regs: usize,
+    old_path: *mut u8,
+    new_path: *mut u8,
+    reply: *mut BesaltMsg,
+) -> Option<(u8, u8)> {
+    unsafe {
+        let old_len = (*msg).regs[hdr_regs] as u8;
+        let new_len = (*msg).regs[hdr_regs + 1] as u8;
+        if old_len == 0 || new_len == 0 {
+            (*reply).label = BESALT_INVALID_ARGUMENT;
+            return None;
+        }
+        if (old_len as usize) > MAX_PATH_LEN || (new_len as usize) > MAX_PATH_LEN {
+            (*reply).label = BESALT_INVALID_ARGUMENT;
+            return None;
+        }
+        let data_start = hdr_regs + 2;
+        let old_regs = ((old_len as usize) + 7) / 8;
+        let new_regs = ((new_len as usize) + 7) / 8;
+        let required = data_start + old_regs + new_regs;
+        if required > 20 {
+            (*reply).label = BESALT_INVALID_ARGUMENT;
+            return None;
+        }
+        if required as u64 > (*msg).length {
+            (*reply).label = BESALT_INVALID_ARGUMENT;
+            return None;
+        }
+        // SAFETY: required <= 20 <= regs.len(), old_len <= MAX_PATH_LEN, buffers are caller-provided.
+        let old_raw = &(*msg).regs[data_start] as *const u64 as *const u8;
+        for i in 0..old_len as usize {
+            *old_path.add(i) = *old_raw.add(i);
+        }
+        let new_raw = &(*msg).regs[data_start + old_regs] as *const u64 as *const u8;
+        for i in 0..new_len as usize {
+            *new_path.add(i) = *new_raw.add(i);
+        }
+        Some((old_len, new_len))
+    }
+}
+
 pub(crate) fn flags_allow_read(flags: u32) -> bool {
     (flags & O_ACCMODE) != O_WRONLY
 }
@@ -297,6 +345,9 @@ pub(crate) unsafe fn cleanup_client_state(dead_badge: u64) {
         treq.regs[0] = dead_badge;
         treq.length = 1;
         let _ = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+
+        // Unmap per-client bulk SHM from VFS address space.
+        crate::bulk::cleanup_bulk_shm(cli);
 
         (*cli) = ClientState::zeroed();
     }

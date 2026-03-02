@@ -678,8 +678,20 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                 &raw mut elf_entry,
             ) != 0;
         }
+        // VFS fallback: try loading from disk-based rootfs
+        let mut vfs_loaded = false;
+        let mut vfs_alloc_size: u64 = 0;
         if !found {
-            super::puts(b"[PROCMGR] EXEC: ELF not found\n");
+            if let Some(vfs_result) = super::vfs_load::try_load_from_vfs(&name, name_len) {
+                elf_entry.data = vfs_result.data;
+                elf_entry.data_len = vfs_result.data_len;
+                vfs_alloc_size = vfs_result.alloc_size;
+                found = true;
+                vfs_loaded = true;
+            }
+        }
+        if !found {
+            super::puts(b"[PROCMGR] EXEC: ELF not found in initrd or VFS\n");
             reply.label = super::BESALT_NOT_FOUND;
             return;
         }
@@ -795,6 +807,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         );
         if layout.stack_top == 0 {
             super::puts(b"[PROCMGR] EXEC: ELF too large for VA layout\n");
+            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
             reply.label = super::BESALT_INVALID_ARGUMENT;
             return;
         }
@@ -824,6 +837,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             lb.hex(err as u64);
             lb.str(b"\n");
             lb.flush();
+            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
             super::spawn_tx::deregister_from_mmsrv(pid);
             reply.label = super::BESALT_INVALID_ARGUMENT;
             return;
@@ -847,13 +861,13 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             ) {
                 Some(r) => rtld_result = r,
                 None => {
+                    if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
                     super::spawn_tx::deregister_from_mmsrv(pid);
                     reply.label = super::BESALT_NOT_FOUND;
                     return;
                 }
             }
         }
-
         // 6. Map initrd and boot info for dynamic executables
         if is_dynamic {
             let initrd_window_size = lib_window_pages * 4096;
@@ -865,6 +879,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                 layout.initrd.base,
             );
             if err != 0 {
+                if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
                 super::spawn_tx::deregister_from_mmsrv(pid);
                 reply.label = super::BESALT_OUT_OF_MEMORY;
                 return;
@@ -872,6 +887,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
 
             let err = super::spawn_tx::exec_map_bootinfo_mmsrv(pid);
             if err != 0 {
+                if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
                 super::spawn_tx::deregister_from_mmsrv(pid);
                 reply.label = super::BESALT_OUT_OF_MEMORY;
                 return;
@@ -881,6 +897,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         // 7. Map IPC buffer via mmsrv
         let err = super::spawn_tx::exec_map_ipc_buf_mmsrv(pid, layout.ipc_buf.base);
         if err != 0 {
+            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
             super::spawn_tx::deregister_from_mmsrv(pid);
             reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
@@ -907,6 +924,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             layout.stack_top,
         );
         if err != 0 {
+            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
             super::spawn_tx::deregister_from_mmsrv(pid);
             reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
@@ -959,6 +977,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                 }
                 Err(()) => {
                     super::spawn_tx::unmap_window_from_mmsrv(super::PROCMGR_SCRATCH_VADDR, 1);
+                    if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
                     super::spawn_tx::deregister_from_mmsrv(pid);
                     reply.label = super::BESALT_OUT_OF_MEMORY;
                     return;
@@ -981,12 +1000,16 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                 }
                 Err(()) => {
                     super::spawn_tx::unmap_window_from_mmsrv(super::PROCMGR_SCRATCH_VADDR, 1);
+                    if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
                     super::spawn_tx::deregister_from_mmsrv(pid);
                     reply.label = super::BESALT_OUT_OF_MEMORY;
                     return;
                 }
             }
         }
+
+        // ELF scratch buffer no longer needed (all elf_entry.data users complete).
+        if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
 
         // Unmap the stack top write window
         super::spawn_tx::unmap_window_from_mmsrv(super::PROCMGR_SCRATCH_VADDR, 1);

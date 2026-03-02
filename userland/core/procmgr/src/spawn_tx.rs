@@ -2105,8 +2105,20 @@ pub unsafe fn handle_spawn_tx(
                 &raw mut elf_entry,
             ) != 0;
         }
+        // VFS fallback: try loading from disk-based rootfs
+        let mut vfs_loaded = false;
+        let mut vfs_alloc_size: u64 = 0;
         if !found {
-            puts(b"[PROCMGR] ELF not found in initrd\n");
+            if let Some(vfs_result) = super::vfs_load::try_load_from_vfs(&name, name_len) {
+                elf_entry.data = vfs_result.data;
+                elf_entry.data_len = vfs_result.data_len;
+                vfs_alloc_size = vfs_result.alloc_size;
+                found = true;
+                vfs_loaded = true;
+            }
+        }
+        if !found {
+            puts(b"[PROCMGR] ELF not found in initrd or VFS\n");
             reply.label = BESALT_NOT_FOUND;
             return;
         }
@@ -2160,6 +2172,7 @@ pub unsafe fn handle_spawn_tx(
 
         if layout.stack_top == 0 {
             puts(b"[PROCMGR] ELF too large for VA layout\n");
+            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
             reply.label = BESALT_INVALID_ARGUMENT;
             return;
         }
@@ -2187,6 +2200,7 @@ pub unsafe fn handle_spawn_tx(
 
         let Some(slot_idx) = proc_table::alloc_proc() else {
             puts(b"[PROCMGR] process table full\n");
+            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
             reply.label = BESALT_OUT_OF_MEMORY;
             return;
         };
@@ -2197,6 +2211,7 @@ pub unsafe fn handle_spawn_tx(
         // ---- RESERVE ----
         if !alloc.reserve(plan.total_slots) {
             puts(b"[PROCMGR] slot reservation failed\n");
+            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
             reply.label = BESALT_OUT_OF_MEMORY;
             return;
         }
@@ -2216,6 +2231,7 @@ pub unsafe fn handle_spawn_tx(
                         lb.hex(e as u64);
                         lb.str(b"\n");
                         lb.flush();
+                        if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
                         alloc.rollback();
                         reply.label = BESALT_OUT_OF_MEMORY;
                         return;
@@ -2235,6 +2251,7 @@ pub unsafe fn handle_spawn_tx(
                         lb.hex(e as u64);
                         lb.str(b"\n");
                         lb.flush();
+                        if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
                         alloc.rollback();
                         reply.label = BESALT_OUT_OF_MEMORY;
                         return;
@@ -2272,6 +2289,7 @@ pub unsafe fn handle_spawn_tx(
         );
         if err != 0 {
             puts(b"[PROCMGR] mint mmsrv EP into child failed\n");
+            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
             alloc.rollback();
             reply.label = BESALT_OUT_OF_MEMORY;
             return;
@@ -2290,6 +2308,7 @@ pub unsafe fn handle_spawn_tx(
             if use_pre_ep { CAP_RECV_SCRATCH } else { 0 },
         );
         if err != 0 {
+            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
             alloc.rollback();
             reply.label = BESALT_OUT_OF_MEMORY;
             return;
@@ -2315,6 +2334,7 @@ pub unsafe fn handle_spawn_tx(
         let err = besalt::invoke::tcb_set_space(child_tcb, child_cn, child_vs);
         if err != 0 {
             puts(b"[PROCMGR] TCB set_space failed\n");
+            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
             alloc.rollback();
             reply.label = BESALT_OUT_OF_MEMORY;
             return;
@@ -2326,6 +2346,7 @@ pub unsafe fn handle_spawn_tx(
                 Some(s) => s,
                 None => {
                     puts(b"[PROCMGR] SPAWN: fault EP slot alloc failed\n");
+                    if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
                     alloc.rollback();
                     reply.label = BESALT_OUT_OF_MEMORY;
                     return;
@@ -2383,6 +2404,7 @@ pub unsafe fn handle_spawn_tx(
                 lb.hex(err as u64);
                 lb.str(b"\n");
                 lb.flush();
+                if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
                 alloc.rollback();
                 reply.label = BESALT_OUT_OF_MEMORY;
                 return;
@@ -2409,6 +2431,7 @@ pub unsafe fn handle_spawn_tx(
             lb.hex(err as u64);
             lb.str(b"\n");
             lb.flush();
+            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
             deregister_from_mmsrv(pid);
             alloc.rollback();
             reply.label = BESALT_INVALID_ARGUMENT;
@@ -2433,6 +2456,7 @@ pub unsafe fn handle_spawn_tx(
             ) {
                 Some(r) => rtld_result = r,
                 None => {
+                    if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
                     deregister_from_mmsrv(pid);
                     alloc.rollback();
                     reply.label = BESALT_NOT_FOUND;
@@ -2440,7 +2464,6 @@ pub unsafe fn handle_spawn_tx(
                 }
             }
         }
-
         // ---- Map shared library frames if available ----
         let (shared_lib_base, shared_lib_map) = if plan.is_dynamic {
             map_shared_lib_to_vspace(child_vs, plan.layout.shared_libs.base, &needed, pid)
@@ -2452,6 +2475,7 @@ pub unsafe fn handle_spawn_tx(
         let err = besalt::invoke::sc_configure(child_sc, 10000, 100000);
         if err != 0 {
             puts(b"[PROCMGR] SC configure failed\n");
+            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
             alloc.rollback();
             reply.label = BESALT_OUT_OF_MEMORY;
             return;
@@ -2459,6 +2483,7 @@ pub unsafe fn handle_spawn_tx(
         let err = besalt::invoke::sc_bind(child_sc, child_tcb);
         if err != 0 {
             puts(b"[PROCMGR] SC bind failed\n");
+            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
             alloc.rollback();
             reply.label = BESALT_OUT_OF_MEMORY;
             return;
@@ -2475,12 +2500,14 @@ pub unsafe fn handle_spawn_tx(
                 plan.layout.initrd.base,
             ) != 0
             {
+                if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
                 reply.label = BESALT_OUT_OF_MEMORY;
                 return;
             }
             if map_boot_info_to_child_tx(child_vs, pid) != 0 {
+                if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
                 reply.label = BESALT_OUT_OF_MEMORY;
@@ -2512,6 +2539,7 @@ pub unsafe fn handle_spawn_tx(
                 || mm_reply.regs[0] != (stack_pages - 1) as u64
             {
                 puts(b"[PROCMGR] SPAWN: MM_MAP_BATCH stack failed\n");
+                if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
                 reply.label = BESALT_OUT_OF_MEMORY;
@@ -2539,6 +2567,7 @@ pub unsafe fn handle_spawn_tx(
             );
             if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != 1 {
                 puts(b"[PROCMGR] SPAWN: MM_MAP_WINDOW stack top failed\n");
+                if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
                 reply.label = BESALT_OUT_OF_MEMORY;
@@ -2664,6 +2693,7 @@ pub unsafe fn handle_spawn_tx(
                 Err(()) => {
                     // Unmap scratch window before rollback
                     unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, 1);
+                    if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
                     deregister_from_mmsrv(pid);
                     alloc.rollback();
                     reply.label = BESALT_OUT_OF_MEMORY;
@@ -2671,6 +2701,9 @@ pub unsafe fn handle_spawn_tx(
                 }
             }
         }
+
+        // ELF scratch buffer no longer needed (all elf_entry.data users complete).
+        if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
 
         // ---- Unmap procmgr's stack write window ----
         unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, 1);
@@ -2839,19 +2872,6 @@ pub unsafe fn handle_spawn_tx(
             let mut lb = LineBuf::new();
             lb.str(b"[PROCMGR] Process started PID=");
             lb.hex(pid as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
-        // Phase 4 integrity probe: verify initrd at offset 0x45A000 (PT[90] of PD[10])
-        // after each spawn. Identifies which spawn corrupts the mapping.
-        {
-            let probe_ptr = (besalt::INITRD_VADDR + 0x45A000) as *const u8;
-            let probe_val = unsafe { core::ptr::read_volatile(probe_ptr) };
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] post-spawn probe PID=");
-            lb.hex(pid as u64);
-            lb.str(b" initrd@0x45A000=0x");
-            lb.hex(probe_val as u64);
             lb.str(b"\n");
             lb.flush();
         }

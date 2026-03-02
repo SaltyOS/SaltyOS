@@ -79,15 +79,116 @@ fn find_dir_item_key(dir_ino: u64, name: *const u8, name_len: u8) -> Option<BTre
     found_key
 }
 
+/// Insert an INODE_REF item: key = (child_ino, BESALT_INODE_REF, parent_ino), data = name.
+/// Idempotent: returns true if the item already exists.
+fn inode_ref_insert(child_ino: u64, parent_ino: u64, name: &[u8]) -> bool {
+    let key = BTreeKey {
+        object_id: child_ino,
+        item_type: BESALT_INODE_REF,
+        offset: parent_ino,
+    };
+    let root_tree = unsafe { (*(&raw const SB)).root_tree };
+    if btree_find_item(root_tree, &key).is_some() {
+        return true; // already exists (idempotent)
+    }
+    btree_cow_insert(&key, name)
+}
+
+/// Delete an INODE_REF item for (child_ino, parent_ino).
+/// Idempotent: returns true if the item was already absent.
+/// Returns false only on B-tree structural errors (COW alloc/I/O failure).
+fn inode_ref_delete(child_ino: u64, parent_ino: u64) -> bool {
+    let key = BTreeKey {
+        object_id: child_ino,
+        item_type: BESALT_INODE_REF,
+        offset: parent_ino,
+    };
+    let root_tree = unsafe { (*(&raw const SB)).root_tree };
+    if btree_find_item(root_tree, &key).is_none() {
+        return true; // already absent — idempotent
+    }
+    btree_cow_delete(&key)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirEntryTxnError {
+    /// The composite operation failed and rollback succeeded (or no rollback was needed).
+    FailedClean,
+    /// The composite operation failed and rollback also failed; metadata may be inconsistent.
+    FailedDirty,
+}
+
+type DirEntryTxnResult = Result<(), DirEntryTxnError>;
+
+#[inline]
+fn dir_item_type_from_mode(mode: u32) -> u8 {
+    if (mode & 0o170000) == 0o040000 {
+        4 // directory
+    } else if (mode & 0o170000) == 0o120000 {
+        7 // symlink
+    } else {
+        1 // regular/other non-dir entries
+    }
+}
+
+/// Insert a directory entry and its reverse INODE_REF as a single logical update.
+/// Tries to rollback INODE_REF if DIR_ITEM insertion fails.
+fn dir_entry_insert_with_ref(parent_ino: u64, child_ino: u64, name: &[u8], dir_type: u8) -> DirEntryTxnResult {
+    if !inode_ref_insert(child_ino, parent_ino, name) {
+        return Err(DirEntryTxnError::FailedClean);
+    }
+
+    let mut dir_buf = [0u8; 256];
+    let dir_len = build_dir_item(child_ino, name, dir_type, &mut dir_buf);
+    if dir_item_insert(parent_ino, name, &dir_buf[..dir_len]) {
+        return Ok(());
+    }
+
+    if !inode_ref_delete(child_ino, parent_ino) {
+        puts(b"[saltyfs] CRIT: dir_entry_insert rollback (inode_ref_delete) failed\n");
+        return Err(DirEntryTxnError::FailedDirty);
+    }
+    Err(DirEntryTxnError::FailedClean)
+}
+
+/// Remove a directory entry and its reverse INODE_REF as a single logical update.
+/// Deletes INODE_REF first; if DIR_ITEM deletion fails, attempts to reinsert INODE_REF.
+fn dir_entry_remove_with_ref(parent_ino: u64, child_ino: u64, name: &[u8]) -> DirEntryTxnResult {
+    if !inode_ref_delete(child_ino, parent_ino) {
+        return Err(DirEntryTxnError::FailedClean);
+    }
+
+    let dir_key = match find_dir_item_key(parent_ino, name.as_ptr(), name.len() as u8) {
+        Some(k) => k,
+        None => {
+            if !inode_ref_insert(child_ino, parent_ino, name) {
+                puts(b"[saltyfs] CRIT: dir_entry_remove rollback (reinsert missing ref) failed\n");
+                return Err(DirEntryTxnError::FailedDirty);
+            }
+            return Err(DirEntryTxnError::FailedClean);
+        }
+    };
+
+    if btree_cow_delete(&dir_key) {
+        return Ok(());
+    }
+
+    if !inode_ref_insert(child_ino, parent_ino, name) {
+        puts(b"[saltyfs] CRIT: dir_entry_remove rollback (inode_ref_insert) failed\n");
+        return Err(DirEntryTxnError::FailedDirty);
+    }
+    Err(DirEntryTxnError::FailedClean)
+}
+
 /// Look up a directory entry by name within a directory inode.
 /// Uses cross-leaf B-tree iteration to handle directories spanning multiple leaves.
-pub(crate) fn lookup_in_dir(dir_ino: u64, name: *const u8, name_len: u8) -> Option<u64> {
+pub(crate) fn lookup_in_dir(dir_ino: u64, name: *const u8, name_len: u8) -> Option<(u64, u8)> {
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
-    let mut result: Option<u64> = None;
+    let mut result: Option<(u64, u8)> = None;
 
     btree_find_all_for_ino(root_tree, dir_ino, BESALT_DIR_ITEM, |_key, data_ptr, _size| {
         unsafe {
-            let (child_ino, entry_name_len, _dir_type) = parse_dir_item_header(data_ptr);
+            let (child_ino, entry_name_len, dir_type) = parse_dir_item_header(data_ptr);
             if entry_name_len as u8 == name_len {
                 let entry_name = data_ptr.add(DIR_ITEM_HEADER_SIZE);
                 let mut match_found = true;
@@ -98,7 +199,7 @@ pub(crate) fn lookup_in_dir(dir_ino: u64, name: *const u8, name_len: u8) -> Opti
                     }
                 }
                 if match_found {
-                    result = Some(child_ino);
+                    result = Some((child_ino, dir_type));
                     return false; // stop iteration
                 }
             }
@@ -110,7 +211,7 @@ pub(crate) fn lookup_in_dir(dir_ino: u64, name: *const u8, name_len: u8) -> Opti
 }
 
 /// Get inode info for a given inode number.
-pub(crate) fn get_inode(ino: u64) -> Option<SaltyInode> {
+pub(crate) fn get_inode(ino: u64) -> Option<SaltyInodeItem> {
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
     let key = BTreeKey {
         object_id: ino,
@@ -120,10 +221,10 @@ pub(crate) fn get_inode(ino: u64) -> Option<SaltyInode> {
 
     match btree_find_item(root_tree, &key) {
         Some((data, size)) => {
-            if size < core::mem::size_of::<SaltyInode>() as u32 {
+            if size < core::mem::size_of::<SaltyInodeItem>() as u32 {
                 return None;
             }
-            Some(unsafe { *(data as *const SaltyInode) })
+            Some(unsafe { *(data as *const SaltyInodeItem) })
         }
         None => None,
     }
@@ -308,11 +409,11 @@ fn readdir_entries(
     reply.length = 1 + (out_idx as u64) * 6;
 }
 
-/// Serialize a SaltyInode to bytes.
-fn inode_to_bytes(inode: &SaltyInode) -> [u8; 128] {
+/// Serialize a SaltyInodeItem to bytes.
+fn inode_to_bytes(inode: &SaltyInodeItem) -> [u8; 128] {
     let mut buf = [0u8; 128];
     unsafe {
-        core::ptr::write_unaligned(buf.as_mut_ptr() as *mut SaltyInode, *inode);
+        core::ptr::write_unaligned(buf.as_mut_ptr() as *mut SaltyInodeItem, *inode);
     }
     buf
 }
@@ -320,7 +421,7 @@ fn inode_to_bytes(inode: &SaltyInode) -> [u8; 128] {
 /// Build inode bytes for a new file or directory.
 fn build_inode_bytes(size: u64, blocks: u64, nlink: u32, mode: u32) -> [u8; 128] {
     let ngen =unsafe { (*(&raw const SB)).generation + 1 };
-    let inode = SaltyInode {
+    let inode = SaltyInodeItem {
         generation: ngen,
         size,
         blocks,
@@ -514,10 +615,11 @@ pub(crate) fn handle_lookup(msg: &BesaltMsg) -> BesaltMsg {
     }
 
     match lookup_in_dir(parent_ino, name_buf.as_ptr(), name_len) {
-        Some(child_ino) => {
+        Some((child_ino, dir_type)) => {
             reply.label = 0;
-            reply.length = 1;
+            reply.length = 2;
             reply.regs[0] = child_ino;
+            reply.regs[1] = dir_type as u64;
         }
         None => {
             reply.label = BESALT_NOT_FOUND;
@@ -719,12 +821,19 @@ pub(crate) fn handle_create(msg: &BesaltMsg) -> BesaltMsg {
         return reply;
     }
 
-    // Insert DIR_ITEM (with linear probing on hash collision)
-    let mut dir_buf = [0u8; 256];
-    let dir_len = build_dir_item(new_ino, &name_buf[..name_len as usize], 1, &mut dir_buf);
-    if !dir_item_insert(parent_ino, &name_buf[..name_len as usize], &dir_buf[..dir_len]) {
-        reply.label = BESALT_OUT_OF_MEMORY;
-        return reply;
+    match dir_entry_insert_with_ref(parent_ino, new_ino, &name_buf[..name_len as usize], 1) {
+        Ok(()) => {}
+        Err(DirEntryTxnError::FailedClean) => {
+            if !btree_cow_delete(&inode_key) {
+                puts(b"[saltyfs] WARN: create rollback inode delete failed\n");
+            }
+            reply.label = BESALT_OUT_OF_MEMORY;
+            return reply;
+        }
+        Err(DirEntryTxnError::FailedDirty) => {
+            reply.label = BESALT_OUT_OF_MEMORY;
+            return reply;
+        }
     }
 
     update_inode_mtime(parent_ino);
@@ -875,7 +984,7 @@ fn write_regular_extents(
     offset: u64,
     count: u64,
     data_buf: &[u8; 136],
-    inode: &SaltyInode,
+    inode: &SaltyInodeItem,
     new_size: u64,
     bs: u64,
     reply: &mut BesaltMsg,
@@ -1085,12 +1194,19 @@ pub(crate) fn handle_mkdir_fs(msg: &BesaltMsg) -> BesaltMsg {
         return reply;
     }
 
-    // Insert DIR_ITEM in parent (with linear probing on hash collision)
-    let mut dir_buf = [0u8; 256];
-    let dir_len = build_dir_item(new_ino, &name_buf[..name_len as usize], 4, &mut dir_buf); // type 4 = directory
-    if !dir_item_insert(parent_ino, &name_buf[..name_len as usize], &dir_buf[..dir_len]) {
-        reply.label = BESALT_OUT_OF_MEMORY;
-        return reply;
+    match dir_entry_insert_with_ref(parent_ino, new_ino, &name_buf[..name_len as usize], 4) {
+        Ok(()) => {}
+        Err(DirEntryTxnError::FailedClean) => {
+            if !btree_cow_delete(&inode_key) {
+                puts(b"[saltyfs] WARN: mkdir rollback inode delete failed\n");
+            }
+            reply.label = BESALT_OUT_OF_MEMORY;
+            return reply;
+        }
+        Err(DirEntryTxnError::FailedDirty) => {
+            reply.label = BESALT_OUT_OF_MEMORY;
+            return reply;
+        }
     }
 
     update_inode_mtime(parent_ino);
@@ -1125,7 +1241,7 @@ pub(crate) fn handle_unlink_fs(msg: &BesaltMsg) -> BesaltMsg {
     }
 
     let child_ino = match lookup_in_dir(parent_ino, name_buf.as_ptr(), name_len) {
-        Some(ino) => ino,
+        Some((ino, _)) => ino,
         None => {
             reply.label = BESALT_NOT_FOUND;
             return reply;
@@ -1146,17 +1262,12 @@ pub(crate) fn handle_unlink_fs(msg: &BesaltMsg) -> BesaltMsg {
         return reply;
     }
 
-    // Delete DIR_ITEM (find actual key by name to handle both ino-keyed and hash-keyed entries)
-    let dir_key = match find_dir_item_key(parent_ino, name_buf.as_ptr(), name_len) {
-        Some(k) => k,
-        None => {
-            reply.label = BESALT_NOT_FOUND;
+    match dir_entry_remove_with_ref(parent_ino, child_ino, &name_buf[..name_len as usize]) {
+        Ok(()) => {}
+        Err(DirEntryTxnError::FailedClean) | Err(DirEntryTxnError::FailedDirty) => {
+            reply.label = BESALT_OUT_OF_MEMORY;
             return reply;
         }
-    };
-    if !btree_cow_delete(&dir_key) {
-        reply.label = BESALT_OUT_OF_MEMORY;
-        return reply;
     }
 
     let new_nlink = inode.nlink.saturating_sub(1);
@@ -1220,7 +1331,7 @@ pub(crate) fn handle_rmdir_fs(msg: &BesaltMsg) -> BesaltMsg {
     }
 
     let child_ino = match lookup_in_dir(parent_ino, name_buf.as_ptr(), name_len) {
-        Some(ino) => ino,
+        Some((ino, _)) => ino,
         None => {
             reply.label = BESALT_NOT_FOUND;
             return reply;
@@ -1253,17 +1364,12 @@ pub(crate) fn handle_rmdir_fs(msg: &BesaltMsg) -> BesaltMsg {
         return reply;
     }
 
-    // Delete DIR_ITEM from parent (find actual key by name)
-    let dir_key = match find_dir_item_key(parent_ino, name_buf.as_ptr(), name_len) {
-        Some(k) => k,
-        None => {
-            reply.label = BESALT_NOT_FOUND;
+    match dir_entry_remove_with_ref(parent_ino, child_ino, &name_buf[..name_len as usize]) {
+        Ok(()) => {}
+        Err(DirEntryTxnError::FailedClean) | Err(DirEntryTxnError::FailedDirty) => {
+            reply.label = BESALT_OUT_OF_MEMORY;
             return reply;
         }
-    };
-    if !btree_cow_delete(&dir_key) {
-        reply.label = BESALT_OUT_OF_MEMORY;
-        return reply;
     }
 
     // Delete INODE_ITEM
@@ -1322,7 +1428,7 @@ pub(crate) fn handle_rename_fs(msg: &BesaltMsg) -> BesaltMsg {
 
     // Look up old entry
     let child_ino = match lookup_in_dir(old_parent, old_name.as_ptr(), old_name_len) {
-        Some(ino) => ino,
+        Some((ino, _)) => ino,
         None => {
             reply.label = BESALT_NOT_FOUND;
             return reply;
@@ -1330,22 +1436,18 @@ pub(crate) fn handle_rename_fs(msg: &BesaltMsg) -> BesaltMsg {
     };
 
     // If new name already exists, unlink it first (Bug #5: full cleanup)
-    if let Some(existing_ino) = lookup_in_dir(new_parent, new_name.as_ptr(), new_name_len) {
+    if let Some((existing_ino, _)) = lookup_in_dir(new_parent, new_name.as_ptr(), new_name_len) {
         // No-op rename: old and new point to the same entry
         if existing_ino == child_ino {
             reply.label = BESALT_OK;
             return reply;
         }
-        let existing_dir_key = match find_dir_item_key(new_parent, new_name.as_ptr(), new_name_len) {
-            Some(k) => k,
-            None => {
-                reply.label = BESALT_NOT_FOUND;
+        match dir_entry_remove_with_ref(new_parent, existing_ino, &new_name[..new_name_len as usize]) {
+            Ok(()) => {}
+            Err(DirEntryTxnError::FailedClean) | Err(DirEntryTxnError::FailedDirty) => {
+                reply.label = BESALT_OUT_OF_MEMORY;
                 return reply;
             }
-        };
-        if !btree_cow_delete(&existing_dir_key) {
-            reply.label = BESALT_OUT_OF_MEMORY;
-            return reply;
         }
 
         // Decrement nlink; if 0, clean up inode + extents
@@ -1380,33 +1482,26 @@ pub(crate) fn handle_rename_fs(msg: &BesaltMsg) -> BesaltMsg {
         }
     }
 
-    // Delete old DIR_ITEM (find actual key by name)
-    let old_dir_key = match find_dir_item_key(old_parent, old_name.as_ptr(), old_name_len) {
-        Some(k) => k,
-        None => {
-            reply.label = BESALT_NOT_FOUND;
+    match dir_entry_remove_with_ref(old_parent, child_ino, &old_name[..old_name_len as usize]) {
+        Ok(()) => {}
+        Err(DirEntryTxnError::FailedClean) | Err(DirEntryTxnError::FailedDirty) => {
+            reply.label = BESALT_OUT_OF_MEMORY;
             return reply;
         }
-    };
-    if !btree_cow_delete(&old_dir_key) {
-        reply.label = BESALT_OUT_OF_MEMORY;
-        return reply;
     }
 
     // Determine dir_type from inode
     let dir_type = match get_inode(child_ino) {
-        Some(inode) => {
-            if (inode.mode & 0o170000) == 0o040000 { 4u8 } else { 1u8 }
-        }
+        Some(inode) => dir_item_type_from_mode(inode.mode),
         None => 1u8,
     };
 
-    // Insert new DIR_ITEM (with linear probing on hash collision)
-    let mut dir_buf = [0u8; 256];
-    let dir_len = build_dir_item(child_ino, &new_name[..new_name_len as usize], dir_type, &mut dir_buf);
-    if !dir_item_insert(new_parent, &new_name[..new_name_len as usize], &dir_buf[..dir_len]) {
-        reply.label = BESALT_OUT_OF_MEMORY;
-        return reply;
+    match dir_entry_insert_with_ref(new_parent, child_ino, &new_name[..new_name_len as usize], dir_type) {
+        Ok(()) => {}
+        Err(DirEntryTxnError::FailedClean) | Err(DirEntryTxnError::FailedDirty) => {
+            reply.label = BESALT_OUT_OF_MEMORY;
+            return reply;
+        }
     }
 
     update_inode_mtime(old_parent);
@@ -1884,12 +1979,21 @@ pub(crate) fn handle_symlink(msg: &BesaltMsg) -> BesaltMsg {
         return reply;
     }
 
-    // Insert DIR_ITEM with type 7 (symlink), with linear probing on hash collision
-    let mut dir_buf = [0u8; 256];
-    let dir_len = build_dir_item(new_ino, &name_buf[..name_len], 7, &mut dir_buf);
-    if !dir_item_insert(parent_ino, &name_buf[..name_len], &dir_buf[..dir_len]) {
-        reply.label = BESALT_OUT_OF_MEMORY;
-        return reply;
+    match dir_entry_insert_with_ref(parent_ino, new_ino, &name_buf[..name_len], 7) {
+        Ok(()) => {}
+        Err(DirEntryTxnError::FailedClean) => {
+            delete_all_extents(new_ino);
+            bitmap_flush();
+            if !btree_cow_delete(&inode_key) {
+                puts(b"[saltyfs] WARN: symlink rollback inode delete failed\n");
+            }
+            reply.label = BESALT_OUT_OF_MEMORY;
+            return reply;
+        }
+        Err(DirEntryTxnError::FailedDirty) => {
+            reply.label = BESALT_OUT_OF_MEMORY;
+            return reply;
+        }
     }
 
     update_inode_mtime(parent_ino);
@@ -2030,13 +2134,13 @@ pub(crate) fn handle_link(msg: &BesaltMsg) -> BesaltMsg {
         return reply;
     }
 
-    // Insert DIR_ITEM (with linear probing on hash collision)
-    let dir_type: u8 = if inode.mode & 0o170000 == 0o120000 { 7 } else { 1 };
-    let mut dir_buf = [0u8; 256];
-    let dir_len = build_dir_item(existing_ino, &name_buf[..name_len], dir_type, &mut dir_buf);
-    if !dir_item_insert(new_parent, &name_buf[..name_len], &dir_buf[..dir_len]) {
-        reply.label = BESALT_OUT_OF_MEMORY;
-        return reply;
+    let dir_type: u8 = dir_item_type_from_mode(inode.mode);
+    match dir_entry_insert_with_ref(new_parent, existing_ino, &name_buf[..name_len], dir_type) {
+        Ok(()) => {}
+        Err(DirEntryTxnError::FailedClean) | Err(DirEntryTxnError::FailedDirty) => {
+            reply.label = BESALT_OUT_OF_MEMORY;
+            return reply;
+        }
     }
 
     // Increment nlink on existing inode
@@ -2049,6 +2153,9 @@ pub(crate) fn handle_link(msg: &BesaltMsg) -> BesaltMsg {
         offset: 0,
     };
     if !btree_cow_update(&inode_key, &inode_to_bytes(&updated_inode)) {
+        if dir_entry_remove_with_ref(new_parent, existing_ino, &name_buf[..name_len]).is_err() {
+            puts(b"[saltyfs] CRIT: link rollback (remove dir+ref) failed\n");
+        }
         reply.label = BESALT_OUT_OF_MEMORY;
         return reply;
     }
@@ -2058,5 +2165,33 @@ pub(crate) fn handle_link(msg: &BesaltMsg) -> BesaltMsg {
     reply.label = BESALT_OK;
     reply.length = 1;
     reply.regs[0] = existing_ino;
+    reply
+}
+
+/// Handle SALTYFS_GETPARENT: return the parent inode of a given child inode.
+/// Protocol: MR0 = child_ino → reply label = BESALT_OK, MR0 = parent_ino on success;
+/// label = BESALT_NOT_FOUND when no INODE_REF exists for the child (root or orphan).
+pub(crate) fn handle_getparent(msg: &BesaltMsg) -> BesaltMsg {
+    let mut reply = BesaltMsg::zeroed();
+    if !unsafe { *(&raw const MOUNTED) } {
+        reply.label = BESALT_INVALID_OPERATION;
+        return reply;
+    }
+    let child_ino = msg.regs[0];
+    let root_tree = unsafe { (*(&raw const SB)).root_tree };
+    let mut parent_ino: u64 = 0;
+    let mut found = false;
+    btree_find_all_for_ino(root_tree, child_ino, BESALT_INODE_REF, |key, _, _| {
+        parent_ino = key.offset; // offset = parent_ino stored when inserting INODE_REF
+        found = true;
+        false // stop after first match
+    });
+    if found {
+        reply.label = BESALT_OK;
+        reply.length = 1;
+        reply.regs[0] = parent_ino;
+    } else {
+        reply.label = BESALT_NOT_FOUND;
+    }
     reply
 }

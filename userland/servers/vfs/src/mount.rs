@@ -10,79 +10,250 @@ use crate::consts::*;
 use crate::types::*;
 use crate::{ipc_ctx, puts};
 
-pub(crate) fn parse_mount_path(path: &[u8], path_len: u8) -> (bool, usize, u8) {
-    const PREFIX: &[u8] = b"/mnt/data";
-    let plen = path_len as usize;
-    if plen < PREFIX.len() {
-        return (false, 0, 0);
-    }
-    for i in 0..PREFIX.len() {
-        if path[i] != PREFIX[i] {
-            return (false, 0, 0);
+/// Maximum size of the work buffer used during mount path traversal.
+/// Must accommodate a symlink target (up to 152 bytes) plus "/" plus the
+/// remaining path (up to MAX_PATH_LEN bytes), so 256 is a safe upper bound.
+const MOUNT_PATH_BUF_LEN: usize = 256;
+
+/// Ensure the root underlay mount is initialized. Returns Some(mount_idx) on success.
+unsafe fn ensure_root_underlay() -> Option<usize> {
+    unsafe {
+        let mut idx = *(&raw const crate::ROOT_UNDERLAY_IDX);
+        if idx < 0 {
+            if crate::MOUNT_TRIED < 3 {
+                setup_saltyfs_mount();
+            }
+            idx = *(&raw const crate::ROOT_UNDERLAY_IDX);
+            if idx < 0 {
+                return None;
+            }
         }
+        Some(idx as usize)
     }
-    if plen == PREFIX.len() {
-        return (true, plen, 0);
-    }
-    if path[PREFIX.len()] != b'/' {
-        return (false, 0, 0);
-    }
-    let sub_start = PREFIX.len() + 1;
-    let sub_len = plen - sub_start;
-    (true, sub_start, sub_len as u8)
 }
 
-pub(crate) unsafe fn find_mount_for_path(path: &[u8], path_len: u8) -> Option<usize> {
-    let (is_mount, _, _) = parse_mount_path(path, path_len);
-    if !is_mount {
-        return None;
-    }
+/// Try resolving a path against the root underlay mount (rootfs disk).
+/// Follows symlinks including the final component.
+/// Returns Some((mount_idx, remote_ino)) if found, None otherwise.
+pub(crate) unsafe fn try_root_underlay(
+    path_ptr: *const u8,
+    path_len: u8,
+) -> Option<(usize, u64)> {
     unsafe {
-        let mounts = &raw mut crate::MOUNTS;
-        let mnt_ino = crate::MOUNT_DATA_INO;
-        for i in 0..MAX_MOUNTS {
-            if (*mounts)[i].active != 0 && (*mounts)[i].mount_ino == mnt_ino {
-                return Some(i);
-            }
+        let mi = ensure_root_underlay()?;
+
+        // Strip leading '/' from path
+        let mut off: usize = 0;
+        let plen = path_len as usize;
+        while off < plen && *path_ptr.add(off) == b'/' {
+            off += 1;
         }
-        if crate::MOUNT_TRIED < 3 {
-            setup_saltyfs_mount();
-            for i in 0..MAX_MOUNTS {
-                if (*mounts)[i].active != 0 && (*mounts)[i].mount_ino == mnt_ino {
-                    return Some(i);
-                }
-            }
+        if off >= plen {
+            // Root path "/" — return the mount root inode
+            let root_ino = (*(&raw const crate::MOUNTS[mi])).root_ino as u64;
+            return Some((mi, root_ino));
+        }
+
+        let sub_ptr = path_ptr.add(off);
+        let sub_len = (plen - off) as u8;
+        let remote_ino = mount_lookup(mi, sub_ptr, sub_len);
+        if remote_ino != 0 {
+            Some((mi, remote_ino))
+        } else {
+            None
         }
     }
-    None
+}
+
+/// Like `try_root_underlay` but does NOT follow the final path component if it is a symlink.
+/// Use for readlinkat and lstat-style operations on the underlay mount.
+pub(crate) unsafe fn try_root_underlay_nofollow(
+    path_ptr: *const u8,
+    path_len: u8,
+) -> Option<(usize, u64)> {
+    unsafe {
+        let mi = ensure_root_underlay()?;
+
+        // Strip leading '/' from path
+        let mut off: usize = 0;
+        let plen = path_len as usize;
+        while off < plen && *path_ptr.add(off) == b'/' {
+            off += 1;
+        }
+        if off >= plen {
+            // Root path "/" — return the mount root inode
+            let root_ino = (*(&raw const crate::MOUNTS[mi])).root_ino as u64;
+            return Some((mi, root_ino));
+        }
+
+        let sub_ptr = path_ptr.add(off);
+        let sub_len = (plen - off) as u8;
+        let remote_ino = mount_lookup_nofollow(mi, sub_ptr, sub_len);
+        if remote_ino != 0 {
+            Some((mi, remote_ino))
+        } else {
+            None
+        }
+    }
+}
+
+/// Fill a stat reply from mount-resolved metadata.
+pub(crate) unsafe fn fill_mount_stat_reply(
+    reply: *mut BesaltMsg,
+    remote_ino: u64,
+    size: u64,
+    mode: u32,
+    nlink: u32,
+    mtime: u64,
+) {
+    unsafe {
+        (*reply).label = BESALT_OK;
+        (*reply).length = 8;
+        (*reply).regs[0] = remote_ino;
+        (*reply).regs[1] = mode as u64;
+        (*reply).regs[2] = nlink as u64;
+        (*reply).regs[3] = size;
+        (*reply).regs[4] = 0; // uid
+        (*reply).regs[5] = 0; // gid
+        (*reply).regs[6] = mtime;
+        (*reply).regs[7] = if (mode & S_IFMT_L) == S_IFDIR_L {
+            FTYPE_DIRECTORY as u64
+        } else if (mode & S_IFMT_L) == S_IFLNK_L {
+            FTYPE_SYMLINK as u64
+        } else {
+            FTYPE_REGULAR as u64
+        };
+    }
 }
 
 pub(crate) unsafe fn mount_lookup(mount_idx: usize, sub_path: *const u8, sub_path_len: u8) -> u64 {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
-        let mut current_ino = m.root_ino as u64;
+        mount_lookup_from(mount_idx, m.root_ino as u64, sub_path, sub_path_len)
+    }
+}
+
+/// Like `mount_lookup` but does not follow the final path component if it is a symlink.
+pub(crate) unsafe fn mount_lookup_nofollow(
+    mount_idx: usize,
+    sub_path: *const u8,
+    sub_path_len: u8,
+) -> u64 {
+    unsafe {
+        let mounts = &raw const crate::MOUNTS;
+        let m = &(*mounts)[mount_idx];
+        mount_lookup_from_nofollow(mount_idx, m.root_ino as u64, sub_path, sub_path_len)
+    }
+}
+
+/// Like `mount_lookup_from` but follows symlinks at every component including the final one.
+pub(crate) unsafe fn mount_lookup_from(
+    mount_idx: usize,
+    start_ino: u64,
+    sub_path: *const u8,
+    sub_path_len: u8,
+) -> u64 {
+    unsafe { mount_lookup_from_inner(mount_idx, start_ino, sub_path, sub_path_len, true) }
+}
+
+/// Like `mount_lookup_from` but does NOT follow the final path component if it is a symlink.
+/// Intermediate components are still followed. Use for readlinkat, lstat, and linkat nofollow.
+pub(crate) unsafe fn mount_lookup_from_nofollow(
+    mount_idx: usize,
+    start_ino: u64,
+    sub_path: *const u8,
+    sub_path_len: u8,
+) -> u64 {
+    unsafe { mount_lookup_from_inner(mount_idx, start_ino, sub_path, sub_path_len, false) }
+}
+
+/// Ask SaltyFS for the parent inode of a given inode.
+/// Returns the parent inode number on success (BESALT_OK).
+/// Returns 0 if the inode has no INODE_REF (BESALT_NOT_FOUND — root or orphan).
+/// Returns u64::MAX on IPC or structural errors (any other reply label).
+unsafe fn mount_getparent(mount_idx: usize, child_ino: u64) -> u64 {
+    unsafe {
+        let mounts = &raw const crate::MOUNTS;
+        let m = &(*mounts)[mount_idx];
+        let mut req = BesaltMsg::zeroed();
+        req.label = SALTYFS_GETPARENT;
+        req.regs[0] = child_ino;
+        req.length = 1;
+        let mut reply = BesaltMsg::zeroed();
+        ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut reply);
+        if reply.label == BESALT_OK {
+            reply.regs[0]
+        } else if reply.label == BESALT_NOT_FOUND {
+            0 // no parent ref (root or orphan)
+        } else {
+            u64::MAX // IPC/structural error
+        }
+    }
+}
+
+/// Core symlink-aware path traversal on a mounted SaltyFS filesystem.
+/// `follow_final` controls whether the last component is followed if it is a symlink.
+/// Returns the resolved inode number, or 0 on any error (not found, loop, path too long).
+unsafe fn mount_lookup_from_inner(
+    mount_idx: usize,
+    start_ino: u64,
+    sub_path: *const u8,
+    sub_path_len: u8,
+    follow_final: bool,
+) -> u64 {
+    unsafe {
+        let mounts = &raw const crate::MOUNTS;
+        let m = &(*mounts)[mount_idx];
 
         if sub_path_len == 0 {
-            return current_ino;
+            return start_ino;
         }
 
-        let mut pos: usize = 0;
-        let plen = sub_path_len as usize;
+        // Validate that start_ino is a directory when doing dirfd-relative traversal.
+        // Root inode is always a directory; skip the check for it.
+        if start_ino != (*m).root_ino as u64 {
+            if let Some((_size, _mode, _nlink, _mtime, is_dir)) =
+                mount_stat(mount_idx, start_ino)
+            {
+                if !is_dir {
+                    return 0;
+                }
+            }
+        }
 
-        while pos < plen {
-            while pos < plen && *sub_path.add(pos) == b'/' {
+        // Working buffer holds the path being traversed (original + symlink expansions).
+        let mut work_buf = [0u8; MOUNT_PATH_BUF_LEN];
+        let mut work_len = sub_path_len as usize;
+        if work_len >= MOUNT_PATH_BUF_LEN {
+            return 0;
+        }
+        // SAFETY: work_len < MOUNT_PATH_BUF_LEN; sub_path has sub_path_len valid bytes.
+        for i in 0..work_len {
+            work_buf[i] = *sub_path.add(i);
+        }
+
+        let mut current_ino = start_ino;
+        let mut depth: usize = 0; // Symlink nesting depth; cap at 9 expansions (depth > 8) to match ramfs
+        let mut pos: usize = 0;
+        let mut parent_stack = [0u64; 128];
+        let mut stack_depth: usize = 0;
+
+        while pos < work_len {
+            // Skip slashes
+            while pos < work_len && work_buf[pos] == b'/' {
                 pos += 1;
             }
-            if pos >= plen {
+            if pos >= work_len {
                 break;
             }
 
-            let start = pos;
-            while pos < plen && *sub_path.add(pos) != b'/' {
+            // Identify the next path component
+            let comp_start = pos;
+            while pos < work_len && work_buf[pos] != b'/' {
                 pos += 1;
             }
-            let comp_len = pos - start;
+            let comp_len = pos - comp_start;
             if comp_len == 0 {
                 continue;
             }
@@ -90,13 +261,48 @@ pub(crate) unsafe fn mount_lookup(mount_idx: usize, sub_path: *const u8, sub_pat
                 return 0;
             }
 
+            // Handle "." -- stay at current directory
+            if comp_len == 1 && work_buf[comp_start] == b'.' {
+                continue;
+            }
+            // Handle ".." -- move to parent
+            if comp_len == 2 && work_buf[comp_start] == b'.' && work_buf[comp_start + 1] == b'.' {
+                if stack_depth > 0 {
+                    stack_depth -= 1;
+                    current_ino = parent_stack[stack_depth];
+                } else if current_ino != (*m).root_ino as u64 {
+                    // Stack empty but not at mount root — ask SaltyFS for the actual parent.
+                    // This handles dirfd-relative paths where start_ino is not the mount root.
+                    let parent = mount_getparent(mount_idx, current_ino);
+                    if parent == u64::MAX || parent == 0 {
+                        // u64::MAX = IPC error; 0 = missing INODE_REF for non-root inode.
+                        // Both are errors — fail path resolution.
+                        return 0;
+                    }
+                    current_ino = parent;
+                }
+                // At mount root with empty stack: /.. == / (POSIX: stay at root)
+                continue;
+            }
+
+            // Determine if this is the final (last non-slash) component
+            let is_final = {
+                let mut ahead = pos;
+                while ahead < work_len && work_buf[ahead] == b'/' {
+                    ahead += 1;
+                }
+                ahead >= work_len
+            };
+
+            // Send SALTYFS_LOOKUP IPC — reply now includes dir_type in regs[1]
             let mut req = BesaltMsg::zeroed();
             req.label = SALTYFS_LOOKUP;
             req.regs[0] = current_ino;
             req.regs[1] = comp_len as u64;
+            // SAFETY: comp_len <= 144; regs[2] starts the 144-byte name region.
             let name_dst = &raw mut req.regs[2] as *mut u8;
             for i in 0..comp_len {
-                *name_dst.add(i) = *sub_path.add(start + i);
+                *name_dst.add(i) = work_buf[comp_start + i];
             }
             req.length = 2 + ((comp_len as u64) + 7) / 8;
 
@@ -106,7 +312,75 @@ pub(crate) unsafe fn mount_lookup(mount_idx: usize, sub_path: *const u8, sub_pat
             if reply.label != BESALT_OK {
                 return 0;
             }
-            current_ino = reply.regs[0];
+
+            let child_ino = reply.regs[0];
+            let dir_type = reply.regs[1] as u8;
+
+            if dir_type == FTYPE_SYMLINK {
+                // Symlink
+                if is_final && !follow_final {
+                    // Caller requested nofollow for the final component: return symlink inode.
+                    return child_ino;
+                }
+                if depth > 8 {
+                    return 0; // Too many levels of symlinks (ELOOP)
+                }
+                depth += 1;
+
+                // Read symlink target into a local buffer
+                let mut target_buf = [0u8; 152];
+                let tlen = mount_readlink_raw(mount_idx, child_ino, target_buf.as_mut_ptr(), 152);
+                if tlen == 0 {
+                    return 0;
+                }
+
+                // Remaining path = work_buf[pos..work_len] (bytes after the current component)
+                let remaining_len = work_len - pos;
+
+                // New work path = target + (if remaining: "/" + remaining)
+                let new_len = if remaining_len > 0 {
+                    tlen as usize + 1 + remaining_len
+                } else {
+                    tlen as usize
+                };
+                if new_len >= MOUNT_PATH_BUF_LEN {
+                    return 0; // Expanded path too long
+                }
+
+                // Build the new work buffer in a temporary, then copy back
+                let mut new_buf = [0u8; MOUNT_PATH_BUF_LEN];
+                // SAFETY: tlen <= 152, new_len < MOUNT_PATH_BUF_LEN.
+                for i in 0..tlen as usize {
+                    new_buf[i] = target_buf[i];
+                }
+                if remaining_len > 0 {
+                    new_buf[tlen as usize] = b'/';
+                    for i in 0..remaining_len {
+                        new_buf[tlen as usize + 1 + i] = work_buf[pos + i];
+                    }
+                }
+                for i in 0..new_len {
+                    work_buf[i] = new_buf[i];
+                }
+                work_len = new_len;
+                pos = 0;
+
+                // Absolute symlink: restart traversal from the mount root
+                if tlen > 0 && target_buf[0] == b'/' {
+                    current_ino = (*m).root_ino as u64;
+                    stack_depth = 0; // Reset parent tracking for absolute symlink
+                }
+                // Relative symlink: current_ino stays as the symlink's parent directory
+            } else {
+                // Push parent before descending (for ".." support)
+                if stack_depth < 128 {
+                    parent_stack[stack_depth] = current_ino;
+                    stack_depth += 1;
+                } else {
+                    return 0; // Path too deep
+                }
+                current_ino = child_ino;
+            }
         }
 
         current_ino
@@ -591,12 +865,6 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
     unsafe {
         crate::MOUNT_TRIED += 1;
 
-        let mnt_ino = crate::MOUNT_DATA_INO;
-        if mnt_ino == 0 {
-            puts(b"[VFS] No /mnt/data inode for mount\n");
-            return;
-        }
-
         let fs_slot = match besalt::slot_alloc::slot_alloc() {
             Some(s) => s,
             None => {
@@ -658,16 +926,17 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
         for i in 0..MAX_MOUNTS {
             if (*mounts)[i].active == 0 {
                 (*mounts)[i].active = 1;
-                (*mounts)[i].mount_ino = mnt_ino;
+                (*mounts)[i].mount_ino = 0;
                 (*mounts)[i].fs_cap = fs_slot;
                 (*mounts)[i].root_ino = root_ino;
+                *(&raw mut crate::ROOT_UNDERLAY_IDX) = i as i32;
                 break;
             }
         }
 
         {
             let mut lb = LineBuf::new();
-            lb.str(b"[VFS] Mounted saltyfs at /mnt/data root_ino=");
+            lb.str(b"[VFS] Mounted saltyfs as root underlay root_ino=");
             lb.hex(root_ino as u64);
             lb.str(b"\n");
             lb.flush();
@@ -777,6 +1046,46 @@ pub(crate) unsafe fn mount_symlink(
         if fs_reply.label == BESALT_OK {
             (*reply).regs[0] = fs_reply.regs[0]; // new_ino
         }
+    }
+}
+
+/// Read a symlink target into a raw buffer. Returns the number of bytes written (0 on failure).
+/// Unlike `mount_readlink`, this writes into a caller-provided byte buffer rather than an IPC reply.
+pub(crate) unsafe fn mount_readlink_raw(
+    mount_idx: usize,
+    remote_ino: u64,
+    buf: *mut u8,
+    buf_cap: usize,
+) -> u8 {
+    unsafe {
+        let mounts = &raw const crate::MOUNTS;
+        let m = &(*mounts)[mount_idx];
+        let mut req = BesaltMsg::zeroed();
+        req.label = SALTYFS_READLINK;
+        req.regs[0] = remote_ino;
+        req.length = 1;
+
+        let mut fs_reply = BesaltMsg::zeroed();
+        ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
+
+        if fs_reply.label != BESALT_OK {
+            return 0;
+        }
+        let target_len = fs_reply.regs[0] as usize;
+        if target_len == 0 {
+            return 0;
+        }
+        if target_len > buf_cap {
+            return 0; // Target too long for buffer — refuse to truncate
+        }
+        let copy = target_len;
+        // SAFETY: copy <= buf_cap (caller guarantees buf has at least buf_cap bytes);
+        // src is regs[1..], bounded to copy bytes from the IPC reply buffer.
+        let src = &fs_reply.regs[1] as *const u64 as *const u8;
+        for i in 0..copy {
+            *buf.add(i) = *src.add(i);
+        }
+        copy as u8
     }
 }
 

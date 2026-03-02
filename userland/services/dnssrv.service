@@ -5,8 +5,7 @@ Type=simple
 Restart=always
 
 [Dependencies]
-After=netsrv nameserv mmsrv
-Before=vfs
+After=netsrv nameserv mmsrv saltyfs vfs
 
 [Capabilities]
 NeedEP=netsrv:64 nameserv:65

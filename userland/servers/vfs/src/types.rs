@@ -135,6 +135,8 @@ pub(crate) struct ClientState {
     pub(crate) fds_cap: u16,
     pub(crate) cwd: [u8; 128],
     pub(crate) fd_flags: *mut u8,
+    pub(crate) bulk_shm_vaddr: u64,
+    pub(crate) bulk_shm_id: u64,
 }
 
 impl ClientState {
@@ -146,6 +148,8 @@ impl ClientState {
             fds_cap: 0,
             cwd: [0; 128],
             fd_flags: core::ptr::null_mut(),
+            bulk_shm_vaddr: 0,
+            bulk_shm_id: 0,
         }
     }
 }

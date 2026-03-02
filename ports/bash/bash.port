@@ -88,4 +88,4 @@ bash_cv_posix_signals = yes
 sed -i 's/^LIBS_FOR_BUILD = .*/LIBS_FOR_BUILD =/' ${SRCDIR}/support/Makefile.in
 
 [install]
-bash.elf = bash
+bin/bash = bash

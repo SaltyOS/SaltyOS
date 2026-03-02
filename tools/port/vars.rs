@@ -11,6 +11,14 @@ pub fn work_dir(port_dir: &Path) -> PathBuf {
     port_dir.join("work")
 }
 
+/// Shared distfiles directory: ports/distfiles/ (sibling to port dirs)
+pub fn distfiles_dir(port_dir: &Path) -> PathBuf {
+    port_dir
+        .parent()
+        .unwrap_or(port_dir)
+        .join("distfiles")
+}
+
 fn preferred_source_subdir(port: &PortConfig) -> String {
     let default = format!("{}-{}", port.name, port.version);
     if port.source_subdir.trim().is_empty() {
@@ -94,9 +102,19 @@ pub fn build_var_map(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Hash
     vars.insert("BUILDDIR".to_string(), env.build_root.to_string_lossy().to_string());
 
     // Cross-compile info
-    vars.insert("BESALT_HOST".to_string(), env.besalt_host.clone());
-    vars.insert("BESALT_INC".to_string(), env.besalt_inc.to_string_lossy().to_string());
+    vars.insert("SALTY_HOST".to_string(), env.salty_host.clone());
+    vars.insert("SALTY_INC".to_string(), env.salty_inc.to_string_lossy().to_string());
     vars.insert("NPROC".to_string(), env.nproc.to_string());
+
+    // Project and toolchain paths
+    let project_root = env.build_root.parent().unwrap_or(&env.build_root);
+    vars.insert("REPOROOT".to_string(), project_root.to_string_lossy().to_string());
+
+    let sysroot = env.build_root.join("sysroot");
+    vars.insert("SYSROOT".to_string(), sysroot.to_string_lossy().to_string());
+
+    vars.insert("CXX".to_string(), env.cxx.clone());
+    vars.insert("TOOLCHAIN_PREFIX".to_string(), env.toolchain_prefix.to_string_lossy().to_string());
 
     vars
 }
