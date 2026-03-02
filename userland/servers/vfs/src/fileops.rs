@@ -1733,62 +1733,80 @@ pub(crate) unsafe fn handle_readdir(msg: *const BesaltMsg, reply: *mut BesaltMsg
             return;
         }
 
-        let cursor = (*(*cli).fds.add(fd as usize)).dir_cursor;
-        for i in (cursor as usize)..(*dir).dirents_cap as usize {
-            if (*(*dir).dirents.add(i)).active != 0 {
-                let child = inode_by_ino((*(*dir).dirents.add(i)).ino);
-                let d_type: u8 = if !child.is_null() {
-                    match (*child).ftype {
-                        FTYPE_REGULAR => 8,     // DT_REG
-                        FTYPE_DIRECTORY => 4,   // DT_DIR
-                        FTYPE_CHAR_DEVICE => 2, // DT_CHR
-                        FTYPE_SYMLINK => 10,    // DT_LNK
-                        FTYPE_PROC_FILE => 4,   // DT_DIR (proc virtual dir)
-                        FTYPE_MOUNT_POINT => 4, // DT_DIR (mount point)
-                        _ => 0,
+        let fde = &mut *(*cli).fds.add(fd as usize);
+
+        // Step 1: iterate ramfs local entries
+        if fde.offset == 0 {
+            let cursor = fde.dir_cursor;
+            for i in (cursor as usize)..(*dir).dirents_cap as usize {
+                if (*(*dir).dirents.add(i)).active != 0 {
+                    let child = inode_by_ino((*(*dir).dirents.add(i)).ino);
+                    let d_type: u8 = if !child.is_null() {
+                        match (*child).ftype {
+                            FTYPE_REGULAR => 8,     // DT_REG
+                            FTYPE_DIRECTORY => 4,   // DT_DIR
+                            FTYPE_CHAR_DEVICE => 2, // DT_CHR
+                            FTYPE_SYMLINK => 10,    // DT_LNK
+                            FTYPE_PROC_FILE => 4,   // DT_DIR (proc virtual dir)
+                            FTYPE_MOUNT_POINT => 4, // DT_DIR (mount point)
+                            _ => 0,
+                        }
+                    } else {
+                        0
+                    };
+
+                    let name_len = (*(*dir).dirents.add(i)).name_len;
+                    (*reply).label = BESALT_OK;
+                    (*reply).length = 5 + ((name_len as u64 + 7) / 8);
+                    (*reply).regs[0] = name_len as u64;
+                    (*reply).regs[1] = 0; // reserved
+                    (*reply).regs[2] = (*(*dir).dirents.add(i)).ino as u64;
+                    (*reply).regs[3] = d_type as u64;
+
+                    for j in 4..20 {
+                        (*reply).regs[j] = 0;
                     }
-                } else {
-                    0
-                };
+                    let dst = &raw mut (*reply).regs[4] as *mut u8;
+                    for j in 0..name_len as usize {
+                        *dst.add(j) = (*(*dir).dirents.add(i)).name[j];
+                    }
 
-                let name_len = (*(*dir).dirents.add(i)).name_len;
-                (*reply).label = BESALT_OK;
-                (*reply).length = 5 + ((name_len as u64 + 7) / 8);
-                (*reply).regs[0] = name_len as u64;
-                (*reply).regs[1] = 0; // reserved
-                (*reply).regs[2] = (*(*dir).dirents.add(i)).ino as u64;
-                (*reply).regs[3] = d_type as u64;
-
-                for j in 4..20 {
-                    (*reply).regs[j] = 0;
+                    fde.dir_cursor = (i + 1) as u32;
+                    return;
                 }
-                let dst = &raw mut (*reply).regs[4] as *mut u8;
-                for j in 0..name_len as usize {
-                    *dst.add(j) = (*(*dir).dirents.add(i)).name[j];
-                }
-
-                (*(*cli).fds.add(fd as usize)).dir_cursor = (i + 1) as u32;
-                return;
             }
-        }
-
-        // Root directory: merge underlay entries after local ones
-        let ul_idx = *(&raw const crate::ROOT_UNDERLAY_IDX);
-        if (*dir).ino == crate::consts::ROOT_INO && ul_idx >= 0 {
-            let mi = ul_idx as usize;
-            let root_remote_ino = (*(&raw const crate::MOUNTS[mi])).root_ino as u64;
-            let fde = &mut *(*cli).fds.add(fd as usize);
-            // First entry into underlay readdir: reset mount cursor
-            if fde.mount_batch_count == 0 && fde.mount_batch_next_cursor == 0 {
+            // Ramfs exhausted — transition to underlay if applicable
+            let ul_idx = *(&raw const crate::ROOT_UNDERLAY_IDX);
+            if (*dir).ino == crate::consts::ROOT_INO && ul_idx >= 0 {
+                fde.offset = 1;
                 fde.dir_cursor = 0;
-            }
-            crate::mount::mount_readdir(mi, fde as *mut FdEntry, root_remote_ino, reply);
-            if (*reply).regs[0] != 0 {
+                fde.mount_batch_count = 0;
+                fde.mount_batch_index = 0;
+                fde.mount_batch_next_cursor = 0;
+                // fall through to underlay below
+            } else {
+                (*reply).label = BESALT_OK;
+                (*reply).length = 1;
+                (*reply).regs[0] = 0;
                 return;
             }
         }
 
-        // End of directory
+        // Step 2: iterate root underlay (SaltyFS) entries
+        if fde.offset == 1 {
+            let ul_idx = *(&raw const crate::ROOT_UNDERLAY_IDX);
+            if ul_idx >= 0 {
+                let mi = ul_idx as usize;
+                let root_remote_ino = (*(&raw const crate::MOUNTS[mi])).root_ino as u64;
+                crate::mount::mount_readdir(mi, fde as *mut FdEntry, root_remote_ino, reply);
+                if (*reply).regs[0] != 0 {
+                    return;
+                }
+            }
+            fde.offset = 2;
+        }
+
+        // Step 3 (or fallthrough): end of directory
         (*reply).label = BESALT_OK;
         (*reply).length = 1;
         (*reply).regs[0] = 0;
