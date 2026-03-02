@@ -8,14 +8,6 @@ use crate::config::BuildEnv;
 use crate::parser::PortConfig;
 use crate::vars;
 
-/// Shared distfiles directory: ports/distfiles/ (sibling to port dirs)
-fn distfiles_dir(port_dir: &Path) -> std::path::PathBuf {
-    port_dir
-        .parent()
-        .unwrap_or(port_dir)
-        .join("distfiles")
-}
-
 pub fn do_extract(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Result<(), String> {
     let var_map = vars::build_var_map(port, port_dir, env);
     let url = vars::substitute(&port.source_url, &var_map);
@@ -29,7 +21,7 @@ pub fn do_extract(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Result<
         .next()
         .ok_or_else(|| "Cannot determine filename from URL".to_string())?;
 
-    let distfile = distfiles_dir(port_dir).join(filename);
+    let distfile = vars::distfiles_dir(port_dir).join(filename);
     if !distfile.exists() {
         return Err(format!("Source file not found: {}", distfile.display()));
     }

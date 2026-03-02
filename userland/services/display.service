@@ -5,4 +5,4 @@ Type=notify
 Restart=no
 
 [Dependencies]
-After=console nameserv procmgr
+After=console nameserv procmgr saltyfs vfs

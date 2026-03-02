@@ -5,7 +5,7 @@ Type=simple
 Restart=always
 
 [Dependencies]
-After=pcisrv nameserv mmsrv
+After=pcisrv nameserv mmsrv saltyfs vfs
 
 [Capabilities]
 NeedEP=pcisrv:64

@@ -1,4 +1,4 @@
-//! portbuild — SaltyOS ports build tool
+//! port — SaltyOS ports build tool
 //! SPDX-License-Identifier: GPL-2.0-only
 
 mod parser;
@@ -14,10 +14,11 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 fn usage() {
-    eprintln!("Usage: portbuild <command> <port-dir> [options]");
+    eprintln!("Usage: port <command> <port-dir> [options]");
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  build   <port-dir>   Full build (all phases)");
+    eprintln!("  package <port-dir>   Package staged output into build/pkgrepo/");
     eprintln!("  fetch   <port-dir>   Download source only");
     eprintln!("  clean   <port-dir>   Remove work/ and stage/");
     eprintln!("  info    <port-dir>   Show parsed port config");
@@ -160,6 +161,10 @@ fn main() {
             println!("{}", port_config);
             process::exit(0);
         }
+        "package" => {
+            run_phase("package", || build::do_package(&port_config, &port_dir, &opts.output_dir, &build_env));
+            process::exit(0);
+        }
         "clean" => {
             let work_dir = port_dir.join("work");
             let stage_dir = port_dir.join("stage");
@@ -234,6 +239,7 @@ fn run_single_phase(
         "configure" => run_phase("configure", || build::do_configure(port, port_dir, env)),
         "build" => run_phase("build", || build::do_build(port, port_dir, env)),
         "stage" => run_phase("stage", || build::do_stage(port, port_dir, &opts.output_dir, env)),
+        "package" => run_phase("package", || build::do_package(port, port_dir, &opts.output_dir, env)),
         _ => {
             eprintln!("Unknown phase: {}", phase);
             process::exit(1);
@@ -309,6 +315,9 @@ fn run_all_phases(
 
     // stage (always run — writes manifest, fast)
     run_phase("stage", || build::do_stage(port, port_dir, &opts.output_dir, env));
+
+    // package (always run — emits build/pkgrepo/*.pkg.tar)
+    run_phase("package", || build::do_package(port, port_dir, &opts.output_dir, env));
 
     println!("=== Port {} {} built successfully ===", port.name, port.version);
 }

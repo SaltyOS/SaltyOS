@@ -186,10 +186,39 @@ if build_userland
   subdir('userland')
 endif
 
-# Ports system (host tool + port builds)
+# Port host tool — always built with userland (needed by `just port`)
 if build_userland
-  subdir('tools/portbuild')
+  subdir('tools/port')
+  subdir('tools/pkg')
+endif
+
+# Generate cross-compilation sysroot from build outputs.
+# Ports depend on this to find headers, libraries, and linker scripts.
+if build_userland
+  mksysroot_prog = find_program('tools/mksysroot')
+  sysroot_target = custom_target('sysroot',
+    output: 'sysroot.stamp',
+    depends: [core, compiler_builtins, libbesalt_so, libc_so, crt_start_obj, ld_besalt_so],
+    depend_files: besaltc_header_files + [files('userland/tests/hello/link.ld')],
+    command: [
+      mksysroot_prog,
+      '--build-dir', meson.project_build_root(),
+      '--output', meson.project_build_root() / 'sysroot',
+      '--clean', '-v',
+      '--stamp', '@OUTPUT@',
+    ],
+    build_by_default: false,
+  )
+endif
+
+# Ports metadata/targets are always defined with userland. Individual port
+# targets are only built by default when -Dbuild_ports=true, but rootfs/image
+# targets may depend on specific runtime ports (e.g. bash).
+if build_userland
   subdir('ports')
+endif
+if not is_variable('port_depends')
+  port_depends = []
 endif
 
 # =============================================================================
@@ -251,33 +280,52 @@ if build_userland and mkcpio.found()
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
-  initrd_display_elf = custom_target('initrd_display_elf',
+  # Non-boot-critical binaries: stripped for rootfs, NOT included in initrd.
+  stripped_display_elf = custom_target('stripped_display_elf',
     input: display_elf,
-    output: 'display.initrd.elf',
+    output: 'display.stripped.elf',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
-  initrd_ttyd_elf = custom_target('initrd_ttyd_elf',
+  stripped_ttyd_elf = custom_target('stripped_ttyd_elf',
     input: ttyd_elf,
-    output: 'ttyd.initrd.elf',
+    output: 'ttyd.stripped.elf',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
-  initrd_test_runner_elf = custom_target('initrd_test_runner_elf',
+  stripped_test_runner_elf = custom_target('stripped_test_runner_elf',
     input: test_runner_elf,
-    output: 'test_runner.initrd.elf',
+    output: 'test_runner.stripped.elf',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
-  initrd_hello_elf = custom_target('initrd_hello_elf',
+  stripped_hello_elf = custom_target('stripped_hello_elf',
     input: hello_elf,
-    output: 'hello.initrd.elf',
+    output: 'hello.stripped.elf',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
-  initrd_getty_elf = custom_target('initrd_getty_elf',
+  stripped_getty_elf = custom_target('stripped_getty_elf',
     input: getty_elf,
-    output: 'getty.initrd.elf',
+    output: 'getty.stripped.elf',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+  stripped_netdrv_elf = custom_target('stripped_netdrv_elf',
+    input: netdrv_elf,
+    output: 'netdrv.stripped.elf',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+  stripped_netsrv_elf = custom_target('stripped_netsrv_elf',
+    input: netsrv_elf,
+    output: 'netsrv.stripped.elf',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+  stripped_dnssrv_elf = custom_target('stripped_dnssrv_elf',
+    input: dnssrv_elf,
+    output: 'dnssrv.stripped.elf',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
@@ -305,24 +353,6 @@ if build_userland and mkcpio.found()
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
-  initrd_netdrv_elf = custom_target('initrd_netdrv_elf',
-    input: netdrv_elf,
-    output: 'netdrv.initrd.elf',
-    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
-    build_by_default: true,
-  )
-  initrd_netsrv_elf = custom_target('initrd_netsrv_elf',
-    input: netsrv_elf,
-    output: 'netsrv.initrd.elf',
-    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
-    build_by_default: true,
-  )
-  initrd_dnssrv_elf = custom_target('initrd_dnssrv_elf',
-    input: dnssrv_elf,
-    output: 'dnssrv.initrd.elf',
-    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
-    build_by_default: true,
-  )
 
   # Service definition files
   svc_console = files('userland/services/console.service')
@@ -343,67 +373,54 @@ if build_userland and mkcpio.found()
   svc_dnssrv = files('userland/services/dnssrv.service')
 
   # Shared libraries first for minimal library-window mapping.
-  # Port outputs are resolved via --manifest files generated by portbuild.
   mkcpio_script = files('tools/mkcpio.py')
+  # Boot-critical binaries only (non-critical moved to rootfs).
   initrd = custom_target('initrd',
     input: [initrd_rtld_so, initrd_libbesalt_so, initrd_libc_so,
             initrd_init_elf, initrd_console_elf, initrd_nameserv_elf,
-          initrd_procmgr_elf, initrd_vfs_elf, initrd_display_elf,
-          initrd_ttyd_elf, initrd_test_runner_elf, initrd_hello_elf,
-          initrd_getty_elf, initrd_mmsrv_elf,
-          initrd_pcisrv_elf, initrd_blkdrv_elf, initrd_saltyfs_elf,
-          initrd_netdrv_elf, initrd_netsrv_elf, initrd_dnssrv_elf,
+            initrd_procmgr_elf, initrd_vfs_elf, initrd_mmsrv_elf,
+            initrd_pcisrv_elf, initrd_blkdrv_elf, initrd_saltyfs_elf,
             svc_console, svc_nameserv, svc_mmsrv,
-          svc_vfs, svc_procmgr, svc_display,
-          svc_ttyd, svc_test_runner, svc_hello, svc_getty,
-          svc_pcisrv, svc_blkdrv, svc_saltyfs, svc_netdrv, svc_netsrv,
-          svc_dnssrv],
-    depends: port_depends,
+            svc_vfs, svc_procmgr, svc_display,
+            svc_ttyd, svc_test_runner, svc_hello, svc_getty,
+            svc_pcisrv, svc_blkdrv, svc_saltyfs, svc_netdrv, svc_netsrv,
+            svc_dnssrv],
     depend_files: mkcpio_script,
     output: 'initrd.cpio',
     command: [mkcpio,
       '--output', '@OUTPUT@',
-      '--port-dir', meson.project_build_root() / 'ports',
-      ] + port_manifest_args + [
+      ] + [
       # Shared libraries (inputs 0-2)
       'ld-besalt.so=@INPUT0@',
       'libbesalt.so=@INPUT1@',
       'libc.so=@INPUT2@',
-      # System services (inputs 3-19)
+      # Boot-critical services (inputs 3-11)
       'init=@INPUT3@',
       'console=@INPUT4@',
       'nameserv=@INPUT5@',
       'procmgr=@INPUT6@',
       'vfs=@INPUT7@',
-      'display=@INPUT8@',
-      'ttyd=@INPUT9@',
-      'test_runner=@INPUT10@',
-      'hello=@INPUT11@',
-      'getty=@INPUT12@',
-      'mmsrv=@INPUT13@',
-      'pcisrv=@INPUT14@',
-      'blkdrv=@INPUT15@',
-      'saltyfs=@INPUT16@',
-      'netdrv=@INPUT17@',
-      'netsrv=@INPUT18@',
-      'dnssrv=@INPUT19@',
-      # Service definitions (inputs 20-35)
-      'services/console.service=@INPUT20@',
-      'services/nameserv.service=@INPUT21@',
-      'services/mmsrv.service=@INPUT22@',
-      'services/vfs.service=@INPUT23@',
-      'services/procmgr.service=@INPUT24@',
-      'services/display.service=@INPUT25@',
-      'services/ttyd.service=@INPUT26@',
-      'services/test_runner.service=@INPUT27@',
-      'services/hello.service=@INPUT28@',
-      'services/getty.service=@INPUT29@',
-      'services/pcisrv.service=@INPUT30@',
-      'services/blkdrv.service=@INPUT31@',
-      'services/saltyfs.service=@INPUT32@',
-      'services/netdrv.service=@INPUT33@',
-      'services/netsrv.service=@INPUT34@',
-      'services/dnssrv.service=@INPUT35@',
+      'mmsrv=@INPUT8@',
+      'pcisrv=@INPUT9@',
+      'blkdrv=@INPUT10@',
+      'saltyfs=@INPUT11@',
+      # Service definitions (inputs 12-27)
+      'services/console.service=@INPUT12@',
+      'services/nameserv.service=@INPUT13@',
+      'services/mmsrv.service=@INPUT14@',
+      'services/vfs.service=@INPUT15@',
+      'services/procmgr.service=@INPUT16@',
+      'services/display.service=@INPUT17@',
+      'services/ttyd.service=@INPUT18@',
+      'services/test_runner.service=@INPUT19@',
+      'services/hello.service=@INPUT20@',
+      'services/getty.service=@INPUT21@',
+      'services/pcisrv.service=@INPUT22@',
+      'services/blkdrv.service=@INPUT23@',
+      'services/saltyfs.service=@INPUT24@',
+      'services/netdrv.service=@INPUT25@',
+      'services/netsrv.service=@INPUT26@',
+      'services/dnssrv.service=@INPUT27@',
     ],
     build_by_default: true,
   )
@@ -417,20 +434,57 @@ endif
 # =============================================================================
 
 mkrootfs = find_program('tools/mkrootfs', required: false)
+mkrootfs_script = files('tools/mkrootfs')
 mksaltyfs_script = files('tools/mksaltyfs.py')
+rootfs_manifest = files('images/rootfs.manifest')[0]
+rootfs_packages = files('images/rootfs.packages')[0]
 
 rootfs_inputs = []
 rootfs_args = []
 if mkrootfs.found() and build_userland
-  rootfs_manifest = files('images/rootfs.manifest')[0]
+  if not is_variable('pkg_tool')
+    error('rootfs package assembly requires pkg_tool target (tools/pkg)')
+  endif
+  rootfs_port_targets = []
+  foreach _line : fs.read(rootfs_packages).split('\n')
+    _pkg = _line.strip()
+    if _pkg == '' or _pkg.startswith('#')
+      continue
+    endif
+    _var = 'port_' + _pkg.underscorify()
+    if not is_variable(_var)
+      error('rootfs package list references unknown port: ' + _pkg)
+    endif
+    rootfs_port_targets += [get_variable(_var)]
+  endforeach
+
+  rootfs_ports_manifest = custom_target('rootfs_ports_manifest',
+    depends: rootfs_port_targets + [pkg_tool],
+    depend_files: [rootfs_packages],
+    output: 'rootfs-ports.manifest',
+    command: [pkg_tool,
+      'install',
+      '--repo', meson.project_build_root() / 'pkgrepo',
+      '--root', meson.project_build_root() / 'rootfs-pkgroot',
+      '--packages-file', rootfs_packages,
+      '--manifest-out', '@OUTPUT@',
+      '--clean-root',
+    ],
+    build_by_default: false,
+  )
+
   rootfs_image = custom_target('rootfs_image',
-    input: [display_elf, ttyd_elf, getty_elf, test_runner_elf, hello_elf],
-    depend_files: [files('tools/mkrootfs'), mksaltyfs_script, rootfs_manifest],
+    input: [stripped_display_elf, stripped_ttyd_elf, stripped_getty_elf,
+            stripped_test_runner_elf, stripped_hello_elf,
+            stripped_netdrv_elf, stripped_netsrv_elf, stripped_dnssrv_elf],
+    depends: [rootfs_ports_manifest],
+    depend_files: [mkrootfs_script, mksaltyfs_script, rootfs_manifest, rootfs_packages],
     output: 'rootfs.img',
     command: [mkrootfs,
       '--output', '@OUTPUT@',
-      '--size', '256M',
+      '--size', '512M',
       '--manifest', rootfs_manifest,
+      '--manifest', rootfs_ports_manifest,
     ],
     build_by_default: false,
   )

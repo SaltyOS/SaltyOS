@@ -8,14 +8,6 @@ use crate::config::BuildEnv;
 use crate::parser::PortConfig;
 use crate::vars;
 
-/// Shared distfiles directory: ports/distfiles/ (sibling to port dirs)
-fn distfiles_dir(port_dir: &Path) -> std::path::PathBuf {
-    port_dir
-        .parent()
-        .unwrap_or(port_dir)
-        .join("distfiles")
-}
-
 pub fn do_fetch(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Result<(), String> {
     let var_map = vars::build_var_map(port, port_dir, env);
     let url = vars::substitute(&port.source_url, &var_map);
@@ -24,7 +16,7 @@ pub fn do_fetch(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Result<()
         return Ok(()); // No source to fetch
     }
 
-    let distfiles = distfiles_dir(port_dir);
+    let distfiles = vars::distfiles_dir(port_dir);
     std::fs::create_dir_all(&distfiles)
         .map_err(|e| format!("Cannot create distfiles/: {}", e))?;
 
@@ -69,7 +61,7 @@ pub fn do_checksum(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Result
     let var_map = vars::build_var_map(port, port_dir, env);
     let url = vars::substitute(&port.source_url, &var_map);
 
-    let distfiles = distfiles_dir(port_dir);
+    let distfiles = vars::distfiles_dir(port_dir);
     let filename = url
         .rsplit('/')
         .next()

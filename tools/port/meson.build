@@ -1,13 +1,13 @@
-# portbuild — SaltyOS ports build tool
+# port — SaltyOS ports build tool
 # SPDX-License-Identifier: GPL-2.0-only
 #
 # Compiled as a native host tool (runs on developer machine, not SaltyOS).
 
-portbuild_src = files('main.rs')
+port_tool_src = files('main.rs')
 
-portbuild = custom_target('portbuild',
-  input: portbuild_src,
-  output: 'portbuild',
+port_tool = custom_target('port_tool',
+  input: port_tool_src,
+  output: 'port',
   depend_files: files(
     'parser.rs',
     'vars.rs',

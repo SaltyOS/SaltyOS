@@ -1,0 +1,27 @@
+[port]
+name = nasm
+version = 2.16.03
+description = Netwide Assembler
+homepage = https://www.nasm.us/
+license = BSD-2-Clause
+
+[source]
+url = https://www.nasm.us/pub/nasm/releasebuilds/${version}/nasm-${version}.tar.xz
+subdir = nasm-${version}
+sha256 = SKIP
+
+[build]
+type = autotools
+configure =
+    --without-man-pages
+
+[autoconf_cache]
+ac_cv_func_snprintf = yes
+ac_cv_func_vsnprintf = yes
+ac_cv_func_access = yes
+ac_cv_func_mempcpy = no
+ac_cv_func_strlcpy = yes
+ac_cv_func_strrchrnul = no
+
+[install]
+bin/nasm = nasm

@@ -5,4 +5,4 @@ Type=simple
 Restart=no
 
 [Dependencies]
-After=console procmgr vfs
+After=console procmgr vfs saltyfs

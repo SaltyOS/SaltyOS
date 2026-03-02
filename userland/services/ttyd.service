@@ -5,7 +5,7 @@ Type=notify
 Restart=always
 
 [Dependencies]
-After=console nameserv procmgr vfs
+After=console nameserv procmgr vfs saltyfs
 Before=getty
 
 [Capabilities]

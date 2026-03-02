@@ -5,7 +5,7 @@ Type=simple
 Restart=no
 
 [Dependencies]
-After=procmgr vfs getty dnssrv
+After=procmgr vfs getty dnssrv saltyfs
 Before=
 
 [Capabilities]

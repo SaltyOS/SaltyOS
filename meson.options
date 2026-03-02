@@ -24,6 +24,11 @@ option('build_userland',
   value: false,
   description: 'Build userland components')
 
+option('build_ports',
+  type: 'boolean',
+  value: false,
+  description: 'Build port packages (requires build_userland=true)')
+
 # Debug options
 option('debug_serial',
   type: 'boolean',

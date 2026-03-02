@@ -1,15 +1,81 @@
-//! Build phases: prepare, configure, build, stage
+//! Build phases: prepare, configure, build, stage, package
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::BuildEnv;
 use crate::parser::{BuildType, PortConfig};
 use crate::vars;
+
+fn validate_install_path(install_path: &str) -> Result<(), String> {
+    if install_path.is_empty() {
+        return Err("Install path is empty".to_string());
+    }
+
+    let path = Path::new(install_path);
+    if path.is_absolute() {
+        return Err(format!(
+            "Install path must be relative to package/rootfs, got absolute path: {}",
+            install_path
+        ));
+    }
+
+    for comp in path.components() {
+        match comp {
+            Component::Normal(_) => {}
+            Component::CurDir => {
+                return Err(format!(
+                    "Install path must not contain '.' segments: {}",
+                    install_path
+                ));
+            }
+            Component::ParentDir => {
+                return Err(format!(
+                    "Install path must not contain '..' segments: {}",
+                    install_path
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "Install path contains invalid root/prefix component: {}",
+                    install_path
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn package_arch(env: &BuildEnv) -> &str {
+    env.salty_host.split('-').next().unwrap_or(&env.salty_host)
+}
+
+fn sanitize_pkg_component(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '+' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Shell-quote a string if it contains characters that need quoting
+fn shell_quote(s: &str) -> String {
+    if s.contains(' ') || s.contains('\'') || s.contains('"') || s.contains('$') || s.contains('\\') {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    } else {
+        s.to_string()
+    }
+}
 
 /// Run a shell command in a given directory with env vars
 fn run_shell(
@@ -49,6 +115,7 @@ fn cross_env(
     let mut vars = HashMap::new();
 
     vars.insert("CC".to_string(), env.cc.clone());
+    vars.insert("CXX".to_string(), env.cxx.clone());
     vars.insert("CFLAGS".to_string(), env.cflags.clone());
     vars.insert("LDFLAGS".to_string(), env.ldflags.clone());
     vars.insert("LIBS".to_string(), env.libs.clone());
@@ -73,7 +140,7 @@ fn cross_env(
     // Support EXTRA_CFLAGS / EXTRA_LDFLAGS / EXTRA_LIBS: append to the
     // computed value instead of replacing it.  This lets port files add
     // flags (e.g. -std=gnu89) without duplicating the base cross-compile
-    // flags that portbuild computes from the project layout.
+    // flags that the port tool computes from the project layout.
     for (extra_key, base_key) in [
         ("EXTRA_CFLAGS", "CFLAGS"),
         ("EXTRA_LDFLAGS", "LDFLAGS"),
@@ -240,6 +307,7 @@ pub fn do_configure(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Resul
 
             let mut args = vec![
                 format!("-DCMAKE_C_COMPILER={}", env.cc),
+                format!("-DCMAKE_CXX_COMPILER={}", env.cxx),
                 format!("-DCMAKE_C_FLAGS={}", env.cflags),
                 format!("-DCMAKE_EXE_LINKER_FLAGS={}", env.ldflags),
                 "-DCMAKE_INSTALL_PREFIX=/usr".to_string(),
@@ -248,7 +316,8 @@ pub fn do_configure(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Resul
             let substituted_args = vars::substitute_list(&port.configure_args, &var_map);
             args.extend(substituted_args);
 
-            let cmd_str = format!("cmake {} ..", args.join(" "));
+            let quoted: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
+            let cmd_str = format!("cmake {} ..", quoted.join(" "));
             run_shell(&cmd_str, &build, &cross_vars, env.verbose)
         }
         BuildType::Make | BuildType::Custom | BuildType::Targets => {
@@ -355,17 +424,6 @@ pub fn do_build_targets(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> R
     Ok(())
 }
 
-/// Flatten an initrd path to an output filename: "bin/echo" -> "echo.elf"
-/// Preserves `.so` extensions for shared library outputs.
-fn flatten_to_elf(initrd_path: &str) -> String {
-    let base = initrd_path.rsplit('/').next().unwrap_or(initrd_path);
-    if base.ends_with(".elf") || base.ends_with(".so") || base.ends_with(".a") {
-        base.to_string()
-    } else {
-        format!("{}.elf", base)
-    }
-}
-
 pub fn do_stage(
     port: &PortConfig,
     port_dir: &Path,
@@ -382,14 +440,18 @@ pub fn do_stage(
     let stage_dir = port_dir.join("stage");
     fs::create_dir_all(&stage_dir)
         .map_err(|e| format!("Cannot create stage/: {}", e))?;
-    fs::create_dir_all(output_dir)
-        .map_err(|e| format!("Cannot create output dir: {}", e))?;
+
+    // Port-specific output directory: output_dir/<port_name>/
+    let port_out = output_dir.join(&port.name);
+    fs::create_dir_all(&port_out)
+        .map_err(|e| format!("Cannot create port output dir: {}", e))?;
 
     let mut manifest = String::new();
 
-    for (initrd_path_raw, artifact_ref) in &port.install_map {
-        let initrd_path = vars::substitute(initrd_path_raw, &var_map);
+    for (install_path_raw, artifact_ref) in &port.install_map {
+        let install_path = vars::substitute(install_path_raw, &var_map);
         let artifact = vars::substitute(artifact_ref, &var_map);
+        validate_install_path(&install_path)?;
 
         // Resolve source artifact based on build type
         let src_file = match port.build_type {
@@ -401,17 +463,25 @@ pub fn do_stage(
             return Err(format!("Install source not found: {}", src_file.display()));
         }
 
-        // Output name: flatten initrd_path to "name.elf"
-        let out_name = flatten_to_elf(&initrd_path);
-        let stage_target = stage_dir.join(&out_name);
-        let output_target = output_dir.join(&out_name);
+        // Preserve install path in output: port_out/<install_path>
+        let output_target = port_out.join(&install_path);
+        if let Some(parent) = output_target.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Cannot create output subdir: {}", e))?;
+        }
 
-        // Copy to stage
+        // Stage with same path structure
+        let stage_target = stage_dir.join(&install_path);
+        if let Some(parent) = stage_target.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Cannot create stage subdir: {}", e))?;
+        }
+
         fs::copy(&src_file, &stage_target)
             .map_err(|e| format!("Cannot copy to stage: {}", e))?;
 
         // Strip with llvm-strip (use --strip-debug for .a archives to preserve symbol tables)
-        let strip_flag = if out_name.ends_with(".a") {
+        let strip_flag = if install_path.ends_with(".a") {
             "--strip-debug"
         } else {
             "--strip-all"
@@ -425,7 +495,7 @@ pub fn do_stage(
         match strip_status {
             Ok(s) if s.success() => {
                 if env.verbose {
-                    println!("   {} -> {}", initrd_path, out_name);
+                    println!("   {} -> {}/{}", install_path, port.name, install_path);
                 }
             }
             _ => {
@@ -433,13 +503,13 @@ pub fn do_stage(
                 fs::copy(&stage_target, &output_target)
                     .map_err(|e| format!("Cannot copy to output: {}", e))?;
                 if env.verbose {
-                    println!("   {} -> {} (unstripped)", initrd_path, out_name);
+                    println!("   {} -> {}/{} (unstripped)", install_path, port.name, install_path);
                 }
             }
         }
 
-        // Manifest entry: initrd_path=out_name
-        let _ = writeln!(manifest, "{}={}", initrd_path, out_name);
+        // Manifest entry: install_path=port_name/install_path
+        let _ = writeln!(manifest, "{}={}/{}", install_path, port.name, install_path);
     }
 
     // Write manifest file
@@ -451,5 +521,216 @@ pub fn do_stage(
         println!("   Manifest: {}", manifest_path.display());
     }
 
+    Ok(())
+}
+
+pub fn do_package(
+    port: &PortConfig,
+    port_dir: &Path,
+    output_dir: &Path,
+    env: &BuildEnv,
+) -> Result<(), String> {
+    let port_out = output_dir.join(&port.name);
+    if !port_out.is_dir() {
+        return Err(format!(
+            "Port output directory not found (run stage/build first): {}",
+            port_out.display()
+        ));
+    }
+
+    let manifest_path = output_dir.join(format!("{}.manifest", port.name));
+    if !manifest_path.is_file() {
+        return Err(format!(
+            "Port manifest not found (run stage/build first): {}",
+            manifest_path.display()
+        ));
+    }
+
+    let mut port_manifest = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("Cannot read manifest {}: {}", manifest_path.display(), e))?;
+    let mut rel_files: Vec<PathBuf> = Vec::new();
+    let mut total_size: u64 = 0;
+    for (lineno, raw_line) in port_manifest.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (install_path_raw, output_ref) = line.split_once('=').ok_or_else(|| {
+            format!(
+                "Invalid manifest entry in {}:{}: expected dst=src, got '{}'",
+                manifest_path.display(),
+                lineno + 1,
+                line
+            )
+        })?;
+        let install_path = install_path_raw.trim();
+        validate_install_path(install_path)?;
+        let output_ref = output_ref.trim();
+        let expected_prefix = format!("{}/", port.name);
+        if !output_ref.starts_with(&expected_prefix) {
+            return Err(format!(
+                "Manifest {}:{} has unexpected source '{}'; expected prefix '{}'",
+                manifest_path.display(),
+                lineno + 1,
+                output_ref,
+                expected_prefix
+            ));
+        }
+        let payload_file = port_out.join(install_path);
+        let meta = fs::symlink_metadata(&payload_file).map_err(|e| {
+            format!(
+                "Packaged file listed in manifest not found: {} ({})",
+                payload_file.display(),
+                e
+            )
+        })?;
+        if !meta.is_file() {
+            return Err(format!(
+                "Unsupported packaged file type (only regular files supported): {}",
+                payload_file.display()
+            ));
+        }
+        total_size += meta.len();
+        rel_files.push(PathBuf::from(install_path));
+    }
+
+    if rel_files.is_empty() {
+        return Err(format!(
+            "No packaged files listed in {} for port {}",
+            manifest_path.display(),
+            port.name
+        ));
+    }
+
+    rel_files.sort();
+    for pair in rel_files.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(format!(
+                "Duplicate install path in manifest {}: {}",
+                manifest_path.display(),
+                pair[0].display()
+            ));
+        }
+    }
+
+    if !port_manifest.ends_with('\n') {
+        port_manifest.push('\n');
+    }
+
+    let arch = package_arch(env);
+    let pkg_basename = format!(
+        "{}-{}-{}.pkg.tar",
+        sanitize_pkg_component(&port.name),
+        sanitize_pkg_component(&port.version),
+        sanitize_pkg_component(arch),
+    );
+
+    let repo_root = output_dir
+        .parent()
+        .unwrap_or(output_dir)
+        .join("pkgrepo");
+    fs::create_dir_all(&repo_root)
+        .map_err(|e| format!("Cannot create package repo dir {}: {}", repo_root.display(), e))?;
+    let pkg_path = repo_root.join(pkg_basename);
+
+    let builddate = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut pkginfo = String::new();
+    let _ = writeln!(pkginfo, "pkgname = {}", port.name);
+    let _ = writeln!(pkginfo, "pkgver = {}", port.version);
+    let _ = writeln!(pkginfo, "arch = {}", arch);
+    let _ = writeln!(pkginfo, "builddate = {}", builddate);
+    let _ = writeln!(pkginfo, "packager = SaltyOS port");
+    let _ = writeln!(pkginfo, "size = {}", total_size);
+    let _ = writeln!(pkginfo, "filecount = {}", rel_files.len());
+    if !port.description.is_empty() {
+        let _ = writeln!(pkginfo, "pkgdesc = {}", port.description);
+    }
+    if !port.homepage.is_empty() {
+        let _ = writeln!(pkginfo, "url = {}", port.homepage);
+    }
+    if !port.license.is_empty() {
+        let _ = writeln!(pkginfo, "license = {}", port.license);
+    }
+    for dep in &port.depends_runtime {
+        if !dep.is_empty() {
+            let _ = writeln!(pkginfo, "depend = {}", dep);
+        }
+    }
+
+    let mut filelist = String::new();
+    for rel in &rel_files {
+        let path_str = rel.to_string_lossy();
+        let _ = writeln!(filelist, "{}", path_str);
+    }
+
+    let work_dir = port_dir.join("work");
+    fs::create_dir_all(&work_dir)
+        .map_err(|e| format!("Cannot create work dir {}: {}", work_dir.display(), e))?;
+    let pkg_root = work_dir.join(format!(
+        ".pkgroot-{}-{}",
+        sanitize_pkg_component(&port.name),
+        std::process::id()
+    ));
+    if pkg_root.exists() {
+        fs::remove_dir_all(&pkg_root)
+            .map_err(|e| format!("Cannot clean temp package dir {}: {}", pkg_root.display(), e))?;
+    }
+    fs::create_dir_all(&pkg_root)
+        .map_err(|e| format!("Cannot create temp package dir {}: {}", pkg_root.display(), e))?;
+
+    let pkginfo_path = pkg_root.join(".PKGINFO");
+    let files_path = pkg_root.join(".FILES");
+    let port_manifest_path = pkg_root.join(".SALTYPORT_MANIFEST");
+    fs::write(&pkginfo_path, pkginfo)
+        .map_err(|e| format!("Cannot write {}: {}", pkginfo_path.display(), e))?;
+    fs::write(&files_path, filelist)
+        .map_err(|e| format!("Cannot write {}: {}", files_path.display(), e))?;
+    fs::write(&port_manifest_path, port_manifest)
+        .map_err(|e| format!("Cannot write {}: {}", port_manifest_path.display(), e))?;
+
+    for rel in &rel_files {
+        let src_path = port_out.join(rel);
+        let dst_path = pkg_root.join(rel);
+        if let Some(parent) = dst_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Cannot create directory {}: {}", parent.display(), e))?;
+        }
+        fs::copy(&src_path, &dst_path)
+            .map_err(|e| format!("Cannot copy {} -> {}: {}", src_path.display(), dst_path.display(), e))?;
+    }
+
+    let tar_status = Command::new("tar")
+        .arg("-cf")
+        .arg(&pkg_path)
+        .arg("-C")
+        .arg(&pkg_root)
+        .arg(".")
+        .status()
+        .map_err(|e| format!("Failed to run tar: {}", e))?;
+
+    let cleanup_result = fs::remove_dir_all(&pkg_root);
+
+    if !tar_status.success() {
+        let _ = cleanup_result;
+        return Err(format!(
+            "tar failed while creating package {} (status {})",
+            pkg_path.display(),
+            tar_status
+        ));
+    }
+
+    if let Err(e) = cleanup_result {
+        return Err(format!(
+            "Package created but failed to clean temp dir {}: {}",
+            pkg_root.display(),
+            e
+        ));
+    }
+
+    println!("   Package: {}", pkg_path.display());
     Ok(())
 }
