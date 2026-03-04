@@ -19,11 +19,23 @@ help:
     @echo "  just run --gdb      Run with GDB server"
     @echo "  just run --headless Run without GUI"
     @echo ""
-    @echo "== Toolchain Bootstrap (one-time, in order) =="
-    @echo "  1. just toolchain-setup          Create directories"
-    @echo "  2. just toolchain-build-llvm     Build host Clang/LLD"
-    @echo "  3. just toolchain-build-rust     Build host rustc"
-    @echo "  just toolchain-doctor            Validate toolchain"
+    @echo "== Toolchain =="
+    @echo "  just tc setup                    Create directories"
+    @echo "  just tc build host llvm          Build host Clang/LLD (~30 min)"
+    @echo "  just tc build host rust          Build host rustc (~20 min)"
+    @echo "  just tc doctor                   Validate toolchain"
+    @echo "  just tc all                      Run all host steps in order"
+    @echo ""
+    @echo "== Cross-Compilation =="
+    @echo "  just sysroot                     Generate cross-compilation sysroot (includes libc++)"
+    @echo "  just cross-hello                 C smoke test"
+    @echo "  just cross-hello-cpp             C++ smoke test"
+    @echo ""
+    @echo "== Self-Hosting =="
+    @echo "  just tc build cross llvm         Cross-compile Clang/LLD for SaltyOS"
+    @echo "  just tc build cross rust         Cross-compile rustc for SaltyOS"
+    @echo "  just self-host                   Full cross-compile pipeline"
+    @echo "  just tc self-host                Same (without OS build dependency)"
     @echo ""
     @echo "== Ports =="
     @echo "  just port <name>    Build a port (bash, coreutils, ...)"
@@ -156,101 +168,38 @@ info:
 toolchain-env:
     bash tools/toolchain/env.sh --print
 
-# Validate that the active clang/rustc/llvm-config match the SaltyOS target setup
-toolchain-doctor:
-    bash tools/toolchain/doctor.sh
+# Unified toolchain entry point
+# Usage: just tc <command> [args...]
+#   just tc setup                     Create directories
+#   just tc build host llvm           Build host Clang/LLD
+#   just tc build host rust           Build host rustc
+#   just tc build cross llvm          Cross-compile Clang/LLD for SaltyOS
+#   just tc build cross rust          Cross-compile rustc for SaltyOS
+#   just tc sysroot                   Generate sysroot (includes libc++ when available)
+#   just tc doctor                    Validate toolchain
+#   just tc all                       setup → host llvm → host rust → doctor
+#   just tc self-host                 sysroot → cross llvm → cross rust
+tc CMD *ARGS:
+    SALTYOS_MESON_BUILDDIR={{builddir}} bash tools/toolchain/build.sh {{CMD}} {{ARGS}}
 
-# Create the recommended workspace-local toolchain layout directories
-toolchain-setup:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    source tools/toolchain/env.sh
-    mkdir -p "$SALTYOS_LLVM_BUILD_DIR" "$SALTYOS_RUST_BUILD_DIR" "$SALTYOS_TOOLCHAIN_PREFIX/bin"
-    echo "Initialized toolchain directories:"
-    echo "  LLVM build : $SALTYOS_LLVM_BUILD_DIR"
-    echo "  Rust build : $SALTYOS_RUST_BUILD_DIR"
-    echo "  Prefix     : $SALTYOS_TOOLCHAIN_PREFIX"
-    echo
-    echo "Next:"
-    echo "  just toolchain-build-llvm"
-    echo "  just toolchain-build-rust"
+# Generate cross-compilation sysroot (requires: just build)
+sysroot: build
+    @just tc sysroot
 
-# Configure, build, and install the patched LLVM/Clang/LLD into the local prefix
-toolchain-build-llvm:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    source tools/toolchain/env.sh
-    mkdir -p "$SALTYOS_LLVM_BUILD_DIR" "$SALTYOS_TOOLCHAIN_PREFIX"
-    cmake -S "$SALTYOS_LLVM_SRC_DIR/llvm" -B "$SALTYOS_LLVM_BUILD_DIR" -G Ninja \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DLLVM_ENABLE_PROJECTS="clang;lld" \
-      -DLLVM_TARGETS_TO_BUILD="X86" \
-      -DLLVM_INSTALL_UTILS=ON \
-      -DLLVM_ENABLE_RUNTIMES=compiler-rt \
-      -DLLVM_RUNTIME_TARGETS="default;x86_64-unknown-saltyos" \
-      -DRUNTIMES_x86_64-unknown-saltyos_CMAKE_C_FLAGS="-ffreestanding" \
-      -DRUNTIMES_x86_64-unknown-saltyos_CMAKE_CXX_FLAGS="-ffreestanding" \
-      -DRUNTIMES_x86_64-unknown-saltyos_CMAKE_C_COMPILER_FORCED=ON \
-      -DRUNTIMES_x86_64-unknown-saltyos_CMAKE_CXX_COMPILER_FORCED=ON \
-      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_BUILTINS=ON \
-      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_SANITIZERS=OFF \
-      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_XRAY=OFF \
-      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_LIBFUZZER=OFF \
-      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_PROFILE=OFF \
-      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_MEMPROF=OFF \
-      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_ORC=OFF \
-      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_GWP_ASAN=OFF \
-      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_CTX_PROFILE=OFF \
-      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILTINS_ENABLE_PIC=ON \
-      -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BAREMETAL_BUILD=ON \
-      -DCMAKE_INSTALL_PREFIX="$SALTYOS_TOOLCHAIN_PREFIX"
-    ninja -C "$SALTYOS_LLVM_BUILD_DIR" -j"$(nproc)"
-    ninja -C "$SALTYOS_LLVM_BUILD_DIR" install
+# Full cross-compile pipeline (requires: just sysroot)
+# libc++ is built by 'just build' when build_libcxx=auto|true and
+# toolchain/llvm-project is present, then installed into sysroot by 'just sysroot'.
+self-host: sysroot
+    @just tc build cross llvm
+    @just tc build cross rust
 
-# Build the patched Rust stage1 libraries/compiler using the local LLVM prefix
-toolchain-build-rust:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    source tools/toolchain/env.sh
-    mkdir -p "$SALTYOS_RUST_BUILD_DIR" "$SALTYOS_TOOLCHAIN_BUILD_ROOT" "$SALTYOS_TOOLCHAIN_PREFIX/bin"
-    llvm_config_path="$SALTYOS_TOOLCHAIN_PREFIX/bin/llvm-config"
-    if [ ! -x "$llvm_config_path" ]; then
-      echo "Missing llvm-config in prefix: $llvm_config_path" >&2
-      echo "Run 'just toolchain-build-llvm' first (or set SALTYOS_TOOLCHAIN_PREFIX to an existing install)." >&2
-      exit 1
-    fi
-    filecheck_path="$SALTYOS_TOOLCHAIN_PREFIX/bin/FileCheck"
-    if [ ! -x "$filecheck_path" ]; then
-      echo "Missing FileCheck in prefix: $filecheck_path" >&2
-      echo "Run 'just toolchain-build-llvm' first (it installs/links FileCheck into the prefix)." >&2
-      exit 1
-    fi
-    config_path="$SALTYOS_TOOLCHAIN_BUILD_ROOT/rust-bootstrap.toml"
-    {
-      echo '[build]'
-      echo 'target = ["x86_64-unknown-linux-gnu"]'
-      echo ''
-      echo '[install]'
-      echo "prefix = \"$SALTYOS_TOOLCHAIN_PREFIX\""
-      echo 'sysconfdir = "etc"'
-      echo ''
-      echo '[llvm]'
-      echo 'download-ci-llvm = false'
-      echo ''
-      echo '[rust]'
-      echo 'use-lld = true'
-      echo ''
-      echo '[target.x86_64-unknown-linux-gnu]'
-      echo "llvm-config = \"$llvm_config_path\""
-      echo "llvm-filecheck = \"$filecheck_path\""
-    } > "$config_path"
-    python3 "$SALTYOS_RUST_SRC_DIR/x.py" install \
-      --src "$SALTYOS_RUST_SRC_DIR" \
-      --build-dir "$SALTYOS_RUST_BUILD_DIR" \
-      --config "$config_path" \
-      --stage 1 \
-      compiler/rustc library/std src
-    echo "Installed stage1 rustc into prefix: $SALTYOS_TOOLCHAIN_PREFIX"
+# Cross-compile C smoke test against sysroot
+cross-hello: sysroot
+    bash tests/cross/build.sh {{builddir}}/sysroot
+
+# Cross-compile C++ smoke test against sysroot + libc++
+cross-hello-cpp: sysroot
+    bash tests/cross/build_cpp.sh {{builddir}}/sysroot
 
 # Format all source code
 fmt:
@@ -314,9 +263,27 @@ rr: build run
 mksaltyfs:
     python3 tools/mksaltyfs.py -o test_data.img -s 64M
 
-# Build rootfs image from manifest
-mkrootfs: build
-    tools/mkrootfs --output {{builddir}}/rootfs.img --size 256M \
+# Strip cross-compiled LLVM binaries for rootfs inclusion.
+# Run this once after a cross LLVM build, before `just build`.
+strip-llvm:
+    #!/usr/bin/env bash
+    set -e
+    STRIP=build-toolchain/prefix/bin/llvm-strip
+    SRC=build-toolchain/llvm-saltyos/bin
+    DST=build-toolchain/llvm-saltyos-stripped
+    mkdir -p "$DST/bin" "$DST/lib"
+    for f in clang-23 lld llvm-ar llvm-nm llvm-objcopy; do
+        echo "Stripping $f..."
+        cp "$SRC/$f" "$DST/bin/$f"
+        "$STRIP" "$DST/bin/$f"
+    done
+    cp build/lib/besalt/cpp/libc++.so "$DST/lib/libc++.so"
+    echo "Done. Stripped sizes:"
+    du -sh "$DST/bin/"* "$DST/lib/"*
+
+# Build rootfs image from manifest (strip-llvm must run before build).
+mkrootfs: strip-llvm build
+    tools/mkrootfs --output {{builddir}}/rootfs.img --size 512M \
         --manifest images/rootfs.manifest -v
 
 # Create a new component skeleton
