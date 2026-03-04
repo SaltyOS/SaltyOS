@@ -548,11 +548,25 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: 
         for i in 0..effective_pages {
             let frame_slot = match besalt::slot_alloc::slot_alloc() {
                 Some(s) => s,
-                None => break,
+                None => {
+                    let mut lb = LineBuf::new();
+                    lb.str(b"[MMSRV] MAP_WINDOW: slot_alloc failed at page ");
+                    lb.hex(i as u64);
+                    lb.str(b"\n");
+                    lb.flush();
+                    break;
+                }
             };
 
             let err = super::retype_any(OBJ_FRAME, 0, frame_slot);
             if err != 0 {
+                let mut lb = LineBuf::new();
+                lb.str(b"[MMSRV] MAP_WINDOW: retype failed err=");
+                lb.hex(err as u64);
+                lb.str(b" page=");
+                lb.hex(i as u64);
+                lb.str(b"\n");
+                lb.flush();
                 break;
             }
 
@@ -561,6 +575,13 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: 
                 target_vaddr + i as u64 * 4096, target_flags,
             );
             if err != 0 {
+                let mut lb = LineBuf::new();
+                lb.str(b"[MMSRV] MAP_WINDOW: target vspace_map err=");
+                lb.hex(err as u64);
+                lb.str(b" vaddr=");
+                lb.hex(target_vaddr + i as u64 * 4096);
+                lb.str(b"\n");
+                lb.flush();
                 invoke::cnode_delete(super::CAP_SELF_CSPACE, frame_slot);
                 break;
             }
@@ -571,6 +592,13 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: 
                 VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
             );
             if err != 0 {
+                let mut lb = LineBuf::new();
+                lb.str(b"[MMSRV] MAP_WINDOW: caller vspace_map err=");
+                lb.hex(err as u64);
+                lb.str(b" vaddr=");
+                lb.hex(window_vaddr + i as u64 * 4096);
+                lb.str(b"\n");
+                lb.flush();
                 invoke::vspace_unmap(target_vspace_cap, target_vaddr + i as u64 * 4096);
                 invoke::cnode_delete(super::CAP_SELF_CSPACE, frame_slot);
                 break;

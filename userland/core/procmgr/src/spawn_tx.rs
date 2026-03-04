@@ -101,7 +101,7 @@ const SPAWN_FLAG_START_SUSPENDED: u64 = besalt::SPAWN_FLAG_START_SUSPENDED;
 // Shared library physical frame cache
 // ===========================================================================
 
-const MAX_SHARED_LIB_PAGES: usize = 192;
+const MAX_SHARED_LIB_PAGES: usize = 576;
 const MAX_CACHED_LIBS: usize = 4;
 const MAX_LIB_NAME: usize = 24;
 
@@ -408,7 +408,7 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
         }
 
         // Fallback: build cache ourselves by parsing ELF and allocating frames
-        let libs: [&[u8]; 2] = [b"libbesalt.so", b"libc.so"];
+        let libs: [&[u8]; 3] = [b"libbesalt.so", b"libc.so", b"libc++.so"];
 
         for lib_name in &libs {
             if cache.lib_count >= MAX_CACHED_LIBS {
@@ -632,7 +632,7 @@ unsafe fn try_inherit_shared_lib_cache(
         }
 
         // Walk both libraries in the same order as init's cache builder.
-        let libs: [&[u8]; 2] = [b"libbesalt.so", b"libc.so"];
+        let libs: [&[u8]; 3] = [b"libbesalt.so", b"libc.so", b"libc++.so"];
         let mut inherited_idx: usize = 0;
 
         for lib_name in &libs {
@@ -1434,79 +1434,107 @@ pub(crate) unsafe fn exec_load_elf_mmsrv(
         let span_end = ((max_vaddr_end.wrapping_add(delta)) + 0xFFF) & !0xFFFu64;
         let total_span_pages = ((span_end - span_start) / 4096) as usize;
 
-        if total_span_pages == 0 || total_span_pages > 512 {
+        if total_span_pages == 0 {
             return ELF_OUT_OF_MEMORY;
         }
 
-        // Allocate all pages via MM_MAP_WINDOW (dual-mapped: child + procmgr scratch)
-        let mut mm_msg = BesaltMsg::zeroed();
-        let mut mm_reply = BesaltMsg::zeroed();
-        mm_msg.label = MM_MAP_WINDOW;
-        mm_msg.length = 5;
-        mm_msg.regs[0] = pid as u64;
-        mm_msg.regs[1] = span_start;
-        mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
-        mm_msg.regs[3] = total_span_pages as u64;
-        mm_msg.regs[4] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-        besalt::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-        let err = besalt::ipc::call_ctx(
-            super::ipc_ctx(),
-            CAP_MMSRV_EP,
-            &raw const mm_msg,
-            &raw mut mm_reply,
-        );
-        if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != total_span_pages as u64 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] exec ELF MM_MAP_WINDOW failed err=");
-            lb.hex(err as u64);
-            lb.str(b" mapped=");
-            lb.hex(mm_reply.regs[0]);
-            lb.str(b"/");
-            lb.hex(total_span_pages as u64);
-            lb.str(b"\n");
-            lb.flush();
-            return ELF_MAP_FAILED;
-        }
+        // Load the ELF span in 512-page chunks to stay within MM_MAP_WINDOW limit.
+        const CHUNK_PAGES: usize = 512;
+        let mut chunk_off: usize = 0;
+        while chunk_off < total_span_pages {
+            let chunk_count = if total_span_pages - chunk_off > CHUNK_PAGES {
+                CHUNK_PAGES
+            } else {
+                total_span_pages - chunk_off
+            };
+            let chunk_vaddr = span_start + (chunk_off as u64) * 4096;
+            let chunk_size = (chunk_count as u64) * 4096;
 
-        // Zero the entire write window
-        let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
-        for i in 0..total_span_pages * 4096 {
-            core::ptr::write_volatile(scratch.add(i), 0u8);
-        }
-
-        // Copy each PT_LOAD segment's file data into the window
-        for i in 0..phdr_count {
-            let off = phdr_base + i * phdr_size;
-            if off + core::mem::size_of::<Elf64Phdr>() > data_len {
-                break;
-            }
-            let phdr = &*(data.add(off) as *const Elf64Phdr);
-            if phdr.p_type != PT_LOAD {
-                continue;
+            // 1. Map window (dual-mapped: child + procmgr scratch)
+            let mut mm_msg = BesaltMsg::zeroed();
+            let mut mm_reply = BesaltMsg::zeroed();
+            mm_msg.label = MM_MAP_WINDOW;
+            mm_msg.length = 5;
+            mm_msg.regs[0] = pid as u64;
+            mm_msg.regs[1] = chunk_vaddr;
+            mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
+            mm_msg.regs[3] = chunk_count as u64;
+            mm_msg.regs[4] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
+            besalt::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
+            let err = besalt::ipc::call_ctx(
+                super::ipc_ctx(),
+                CAP_MMSRV_EP,
+                &raw const mm_msg,
+                &raw mut mm_reply,
+            );
+            if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != chunk_count as u64 {
+                let mut lb = LineBuf::new();
+                lb.str(b"[PROCMGR] exec ELF MM_MAP_WINDOW failed err=");
+                lb.hex(err as u64);
+                lb.str(b" label=");
+                lb.hex(mm_reply.label);
+                lb.str(b" mapped=");
+                lb.hex(mm_reply.regs[0]);
+                lb.str(b"/");
+                lb.hex(chunk_count as u64);
+                lb.str(b"\n");
+                lb.flush();
+                return ELF_MAP_FAILED;
             }
 
-            let seg_vaddr = phdr.p_vaddr.wrapping_add(delta);
-            let window_offset = (seg_vaddr - span_start) as usize;
-            let file_offset = phdr.p_offset as usize;
-            let file_size = phdr.p_filesz as usize;
+            // 2. Zero the window
+            let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
+            for i in 0..chunk_count * 4096 {
+                core::ptr::write_volatile(scratch.add(i), 0u8);
+            }
 
-            if file_size > 0 && file_offset + file_size <= data_len {
-                for k in 0..file_size {
-                    core::ptr::write_volatile(
-                        scratch.add(window_offset + k),
-                        *data.add(file_offset + k),
-                    );
+            // 3. Copy overlapping PT_LOAD segment data into the window
+            for seg_i in 0..phdr_count {
+                let off = phdr_base + seg_i * phdr_size;
+                if off + core::mem::size_of::<Elf64Phdr>() > data_len {
+                    break;
+                }
+                let phdr = &*(data.add(off) as *const Elf64Phdr);
+                if phdr.p_type != PT_LOAD {
+                    continue;
+                }
+
+                let seg_vaddr = phdr.p_vaddr.wrapping_add(delta);
+                let seg_file_end = seg_vaddr + phdr.p_filesz;
+                let chunk_end = chunk_vaddr + chunk_size;
+
+                if seg_vaddr >= chunk_end || seg_file_end <= chunk_vaddr {
+                    continue;
+                }
+
+                let copy_start = if seg_vaddr > chunk_vaddr { seg_vaddr } else { chunk_vaddr };
+                let copy_end = if seg_file_end < chunk_end { seg_file_end } else { chunk_end };
+                let file_off = phdr.p_offset as usize + (copy_start - seg_vaddr) as usize;
+                let win_off = (copy_start - chunk_vaddr) as usize;
+                let copy_len = (copy_end - copy_start) as usize;
+
+                if copy_len > 0 && file_off + copy_len <= data_len {
+                    for k in 0..copy_len {
+                        core::ptr::write_volatile(
+                            scratch.add(win_off + k),
+                            *data.add(file_off + k),
+                        );
+                    }
                 }
             }
-        }
 
-        // Apply R_X86_64_RELATIVE relocations for PIE binaries
-        if is_pie {
-            exec_apply_relocs(data, data_len, ehdr, delta, load_base, scratch, span_start);
-        }
+            // 4. Apply relocations targeting this chunk
+            if is_pie {
+                exec_apply_relocs_chunk(
+                    data, data_len, ehdr, delta, load_base,
+                    scratch, chunk_vaddr, chunk_size,
+                );
+            }
 
-        // Unmap write window
-        unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, total_span_pages as u64);
+            // 5. Unmap window
+            unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, chunk_count as u64);
+            chunk_off += chunk_count;
+        }
 
         // Tighten per-segment permissions (W^X enforcement)
         for i in 0..phdr_count {
@@ -1553,18 +1581,22 @@ pub(crate) unsafe fn exec_load_elf_mmsrv(
     }
 }
 
-/// Apply R_X86_64_RELATIVE relocations through a mapped write window.
+/// Apply R_X86_64_RELATIVE relocations through a mapped write window chunk.
+///
+/// Only applies relocations whose target address falls within
+/// `[chunk_vaddr, chunk_vaddr + chunk_size)`.
 ///
 /// # Safety
-/// `scratch` must point to a mapped region covering the ELF span.
-unsafe fn exec_apply_relocs(
+/// `scratch` must point to a mapped region covering the chunk.
+unsafe fn exec_apply_relocs_chunk(
     data: *const u8,
     data_len: usize,
     ehdr: &Elf64Ehdr,
     delta: u64,
     load_base: u64,
     scratch: *mut u8,
-    span_start: u64,
+    chunk_vaddr: u64,
+    chunk_size: u64,
 ) {
     unsafe {
         use besalt::consts::{
@@ -1664,8 +1696,8 @@ unsafe fn exec_apply_relocs(
                 let target_vaddr = rela.r_offset + delta;
                 let value = load_base.wrapping_add(rela.r_addend as u64);
 
-                if target_vaddr >= span_start {
-                    let window_off = (target_vaddr - span_start) as usize;
+                if target_vaddr >= chunk_vaddr && target_vaddr + 8 <= chunk_vaddr + chunk_size {
+                    let window_off = (target_vaddr - chunk_vaddr) as usize;
                     let ptr = scratch.add(window_off) as *mut u64;
                     core::ptr::write_volatile(ptr, value);
                 }

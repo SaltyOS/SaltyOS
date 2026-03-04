@@ -77,8 +77,9 @@ const CAP_UNTYPED_START: usize = 16;
 
 /// Initrd mapping virtual address (16 MB)
 const INITRD_VADDR: u64 = 0x0000_0100_0000;
-/// Boot info page virtual address (12 MB) -- read-only page with initrd info
-const BOOTINFO_VADDR: u64 = 0x0000_00C0_0000;
+/// Boot info page virtual address -- sits just below the IPC buffer (0x200000),
+/// clear of the ELF code region (0x210000+) so large binaries cannot collide.
+const BOOTINFO_VADDR: u64 = 0x0000_001F_F000;
 
 /// Maximum number of untyped regions to hand to init
 const MAX_INIT_UNTYPEDS: usize = 64;

@@ -123,7 +123,7 @@ pub unsafe fn try_load_from_vfs(name: &[u8], name_len: usize) -> Option<VfsLoadR
             core::ptr::null_mut(),
             alloc_size,
             PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_LAZY,
             -1,
             0,
         );
