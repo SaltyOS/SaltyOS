@@ -41,7 +41,7 @@ static mut NEXT_UT_HINT: Cap = CAP_UNTYPED_START;
 // Shared library physical frame cache
 // ===========================================================================
 
-const MAX_SHARED_LIB_PAGES: usize = 192;
+const MAX_SHARED_LIB_PAGES: usize = 576;
 const MAX_CACHED_LIBS: usize = 4;
 const MAX_LIB_NAME: usize = 24;
 const MAX_RW_SEGS: usize = 4;
@@ -468,7 +468,7 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
         let initrd = super::INITRD_VADDR as *const u8;
         let initrd_size = super::INITRD_SIZE;
 
-        let libs: [&[u8]; 2] = [b"libbesalt.so", b"libc.so"];
+        let libs: [&[u8]; 3] = [b"libbesalt.so", b"libc.so", b"libc++.so"];
 
         for lib_name in &libs {
             if cache.lib_count >= MAX_CACHED_LIBS {

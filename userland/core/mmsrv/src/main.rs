@@ -62,9 +62,9 @@ const CAP_NAMESERV: u64 = 64;
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 /// Receive slot pool: top of CSpace to avoid conflicts with slot_alloc.
-/// CNodeBits=14 → 16384 total slots. Reserve last 1024 for cap receives.
-const RECV_SLOT_BASE: Cap = 0x3C00; // 15360
-const RECV_SLOT_END: Cap = 0x4000; // 16384
+/// CNodeBits=16 → 65536 total slots. Reserve last 1024 for cap receives.
+const RECV_SLOT_BASE: Cap = 0xFC00; // 64512
+const RECV_SLOT_END: Cap = 0x10000; // 65536
 
 // ---------------------------------------------------------------------------
 // Self-mmap: internal memory allocation for mmsrv's own data structures.
@@ -448,6 +448,9 @@ pub extern "C" fn _start() -> ! {
         let base = *(&raw const besalt::__besalt_slot_base);
         let count = *(&raw const besalt::__besalt_slot_count);
         let cspace_ntfn = *(&raw const besalt::__besalt_cspace_ntfn);
+        // Clamp count so the bump allocator cannot reach the receive-slot pool.
+        let max_count = RECV_SLOT_BASE.saturating_sub(base);
+        let count = if count > max_count { max_count } else { count };
         if base != 0 {
             besalt::slot_alloc::slot_alloc_init(base, count, cspace_ntfn);
         } else {

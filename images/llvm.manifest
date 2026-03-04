@@ -1,0 +1,29 @@
+# LLVM/Clang toolchain for SaltyOS
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Stripped SaltyOS-native LLVM binaries.
+# Produced by: just strip-llvm
+#
+# clang/clang++ are the same binary (clang-23); each entry is a separate copy
+# because SaltyFS image creation does not support symlinks.
+
+# C/C++ compiler
+/usr/bin/clang-23=build-toolchain/llvm-saltyos-stripped/bin/clang-23
+/usr/bin/clang=build-toolchain/llvm-saltyos-stripped/bin/clang-23
+/usr/bin/clang++=build-toolchain/llvm-saltyos-stripped/bin/clang-23
+
+# Linker
+/usr/bin/lld=build-toolchain/llvm-saltyos-stripped/bin/lld
+/usr/bin/ld.lld=build-toolchain/llvm-saltyos-stripped/bin/lld
+
+# Archiver / ranlib
+/usr/bin/llvm-ar=build-toolchain/llvm-saltyos-stripped/bin/llvm-ar
+/usr/bin/llvm-ranlib=build-toolchain/llvm-saltyos-stripped/bin/llvm-ar
+
+# Utilities
+/usr/bin/llvm-nm=build-toolchain/llvm-saltyos-stripped/bin/llvm-nm
+/usr/bin/llvm-objcopy=build-toolchain/llvm-saltyos-stripped/bin/llvm-objcopy
+/usr/bin/llvm-strip=build-toolchain/llvm-saltyos-stripped/bin/llvm-objcopy
+
+# C++ runtime shared library (needed by all LLVM binaries at runtime)
+/lib/libc++.so=build-toolchain/llvm-saltyos-stripped/lib/libc++.so

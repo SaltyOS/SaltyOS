@@ -12,3 +12,5 @@
 /bin/netdrv=build/netdrv.stripped.elf
 /bin/netsrv=build/netsrv.stripped.elf
 /bin/dnssrv=build/dnssrv.stripped.elf
+
+@include llvm.manifest

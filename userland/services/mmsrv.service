@@ -4,7 +4,7 @@ Binary=mmsrv
 Type=simple
 Restart=always
 PreProcmgr=yes
-CNodeBits=14
+CNodeBits=16
 
 [Dependencies]
 After=console nameserv
