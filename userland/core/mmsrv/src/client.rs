@@ -357,7 +357,7 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: 
                         for fi in 0..(*r).frame_count as usize {
                             let fc = *fcaps.add(fi);
                             if fc != 0 {
-                                invoke::cnode_delete(super::CAP_SELF_CSPACE, fc);
+                                super::recycled_cnode_delete(fc);
                             }
                         }
                     }
@@ -376,7 +376,7 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: 
 
         // Clean up the VSpace cap we hold
         if vspace_cap != 0 {
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, vspace_cap);
+            super::recycled_cnode_delete(vspace_cap);
         }
 
         (*client).active = false;

@@ -126,7 +126,7 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
         }
 
         // Allocate pool page frame
-        let pool_frame = match besalt::slot_alloc::slot_alloc() {
+        let pool_frame = match super::recycled_slot_alloc() {
             Some(s) => s,
             None => return false,
         };
@@ -135,15 +135,15 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
         }
 
         // Allocate ring page frame
-        let ring_frame = match besalt::slot_alloc::slot_alloc() {
+        let ring_frame = match super::recycled_slot_alloc() {
             Some(s) => s,
             None => {
-                invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
+                super::recycled_cnode_delete(pool_frame);
                 return false;
             }
         };
         if super::retype_any(OBJ_FRAME, 0, ring_frame) != 0 {
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
+            super::recycled_cnode_delete(pool_frame);
             return false;
         }
 
@@ -153,8 +153,8 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
         let notif_cap = super::cow_agg_ntfn();
         if notif_cap == 0 {
             super::puts(b"[MMSRV] pool: no aggregation notification\n");
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
+            super::recycled_cnode_delete(pool_frame);
+            super::recycled_cnode_delete(ring_frame);
             return false;
         }
 
@@ -162,24 +162,24 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
         // Must map the SAME physical frame the kernel will use, not a fresh one.
         let pool_page = super::self_map_frame(pool_frame);
         if pool_page.is_null() {
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
+            super::recycled_cnode_delete(pool_frame);
+            super::recycled_cnode_delete(ring_frame);
             return false;
         }
 
         // Map the ring Frame cap into mmsrv's own VSpace.
         let ring_page = super::self_map_frame(ring_frame);
         if ring_page.is_null() {
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
+            super::recycled_cnode_delete(pool_frame);
+            super::recycled_cnode_delete(ring_frame);
             return false;
         }
 
         // Allocate pool_slot_caps tracking array (1 page = 512 u64 entries >= 510)
         let slot_caps_page = super::self_mmap(1);
         if slot_caps_page.is_null() {
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
+            super::recycled_cnode_delete(pool_frame);
+            super::recycled_cnode_delete(ring_frame);
             return false;
         }
         let pool_slot_caps = slot_caps_page as *mut Cap;
@@ -187,17 +187,17 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
         // Allocate a temporary CNode to hold the initial frame caps.
         // We need a CNode with at least POOL_INITIAL_FILL slots.
         // CNode size_bits=7 gives 128 slots (>= 64).
-        let temp_cnode = match besalt::slot_alloc::slot_alloc() {
+        let temp_cnode = match super::recycled_slot_alloc() {
             Some(s) => s,
             None => {
-                invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
-                invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
+                super::recycled_cnode_delete(pool_frame);
+                super::recycled_cnode_delete(ring_frame);
                 return false;
             }
         };
         if super::retype_any(OBJ_CNODE, 7, temp_cnode) != 0 {
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
+            super::recycled_cnode_delete(pool_frame);
+            super::recycled_cnode_delete(ring_frame);
             return false;
         }
 
@@ -206,7 +206,7 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
         // When the temp CNode is deleted, only the copies are dropped (refcount→1).
         let mut filled: usize = 0;
         for i in 0..POOL_INITIAL_FILL {
-            let slot = match besalt::slot_alloc::slot_alloc() {
+            let slot = match super::recycled_slot_alloc() {
                 Some(s) => s,
                 None => break,
             };
@@ -220,7 +220,7 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
                 0,
             );
             if err != 0 {
-                invoke::cnode_delete(super::CAP_SELF_CSPACE, slot);
+                super::recycled_cnode_delete(slot);
                 break;
             }
             // Track in pool_slot_caps by ring index
@@ -229,9 +229,9 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
         }
 
         if filled == 0 {
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, temp_cnode);
+            super::recycled_cnode_delete(pool_frame);
+            super::recycled_cnode_delete(ring_frame);
+            super::recycled_cnode_delete(temp_cnode);
             return false;
         }
 
@@ -251,9 +251,16 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
             for i in 0..filled {
                 invoke::cnode_delete(temp_cnode, i as u64);
             }
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, temp_cnode);
+            // Reclaim the per-slot frame caps tracked in pool_slot_caps
+            for i in 0..filled {
+                let cap = *pool_slot_caps.add(i);
+                if cap != 0 {
+                    super::recycled_cnode_delete(cap);
+                }
+            }
+            super::recycled_cnode_delete(pool_frame);
+            super::recycled_cnode_delete(ring_frame);
+            super::recycled_cnode_delete(temp_cnode);
             return false;
         }
 
@@ -268,9 +275,16 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
             for i in 0..filled {
                 invoke::cnode_delete(temp_cnode, i as u64);
             }
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, pool_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, ring_frame);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, temp_cnode);
+            // Reclaim the per-slot frame caps tracked in pool_slot_caps
+            for i in 0..filled {
+                let cap = *pool_slot_caps.add(i);
+                if cap != 0 {
+                    super::recycled_cnode_delete(cap);
+                }
+            }
+            super::recycled_cnode_delete(pool_frame);
+            super::recycled_cnode_delete(ring_frame);
+            super::recycled_cnode_delete(temp_cnode);
             return false;
         }
 
@@ -288,7 +302,7 @@ pub(crate) unsafe fn init_pool(client: *mut MmClient) -> bool {
         // Delete temp CNode. The kernel read phys_addrs from the copies;
         // destroying the CNode drops the copies (refcount→1), originals
         // in mmsrv's CSpace stay valid.
-        invoke::cnode_delete(super::CAP_SELF_CSPACE, temp_cnode);
+        super::recycled_cnode_delete(temp_cnode);
 
         {
             let mut lb = LineBuf::new();
@@ -356,7 +370,7 @@ pub(crate) unsafe fn drain_notifications(client: *mut MmClient, pool: *mut VSpac
                 if !(*pool).pool_slot_caps.is_null() {
                     let cap = *(*pool).pool_slot_caps.add(slot_idx);
                     if cap != 0 {
-                        invoke::cnode_delete(super::CAP_SELF_CSPACE, cap);
+                        super::recycled_cnode_delete(cap);
                         *(*pool).pool_slot_caps.add(slot_idx) = 0;
                     }
                 }
@@ -407,7 +421,7 @@ pub(crate) unsafe fn drain_notifications(client: *mut MmClient, pool: *mut VSpac
                     {
                         let old = *(*region).frame_caps.add(page_idx);
                         if old != 0 {
-                            invoke::cnode_delete(super::CAP_SELF_CSPACE, old);
+                            super::recycled_cnode_delete(old);
                         }
                         *(*region).frame_caps.add(page_idx) = cap;
                         *(*pool).pool_slot_caps.add(slot_idx) = 0;
@@ -467,7 +481,7 @@ pub(crate) unsafe fn replenish_pool(client: *mut MmClient, pool: *mut VSpacePool
         let replenish_count = core::cmp::min(free, POOL_INITIAL_FILL);
 
         // Allocate a temp CNode for the new frames (size_bits=7 -> 128 slots)
-        let temp_cnode = match besalt::slot_alloc::slot_alloc() {
+        let temp_cnode = match super::recycled_slot_alloc() {
             Some(s) => s,
             None => return,
         };
@@ -477,7 +491,7 @@ pub(crate) unsafe fn replenish_pool(client: *mut MmClient, pool: *mut VSpacePool
 
         let mut filled: usize = 0;
         for i in 0..replenish_count {
-            let slot = match besalt::slot_alloc::slot_alloc() {
+            let slot = match super::recycled_slot_alloc() {
                 Some(s) => s,
                 None => break,
             };
@@ -491,7 +505,7 @@ pub(crate) unsafe fn replenish_pool(client: *mut MmClient, pool: *mut VSpacePool
                 0,
             );
             if err != 0 {
-                invoke::cnode_delete(super::CAP_SELF_CSPACE, slot);
+                super::recycled_cnode_delete(slot);
                 break;
             }
             // Track in pool_slot_caps at the ring index this entry will occupy.
@@ -500,7 +514,7 @@ pub(crate) unsafe fn replenish_pool(client: *mut MmClient, pool: *mut VSpacePool
                 let ring_idx = (tail_raw.wrapping_add(i as u16) as usize) % POOL_ENTRY_COUNT;
                 let existing = *(*pool).pool_slot_caps.add(ring_idx);
                 if existing != 0 {
-                    invoke::cnode_delete(super::CAP_SELF_CSPACE, existing);
+                    super::recycled_cnode_delete(existing);
                 }
                 *(*pool).pool_slot_caps.add(ring_idx) = slot;
             }
@@ -522,7 +536,7 @@ pub(crate) unsafe fn replenish_pool(client: *mut MmClient, pool: *mut VSpacePool
                         let ring_idx = (tail_raw.wrapping_add(i as u16) as usize) % POOL_ENTRY_COUNT;
                         let cap = *(*pool).pool_slot_caps.add(ring_idx);
                         if cap != 0 {
-                            invoke::cnode_delete(super::CAP_SELF_CSPACE, cap);
+                            super::recycled_cnode_delete(cap);
                             *(*pool).pool_slot_caps.add(ring_idx) = 0;
                         }
                     }
@@ -535,7 +549,7 @@ pub(crate) unsafe fn replenish_pool(client: *mut MmClient, pool: *mut VSpacePool
         }
 
         // Delete temp CNode (drops copies, originals stay at refcount=1)
-        invoke::cnode_delete(super::CAP_SELF_CSPACE, temp_cnode);
+        super::recycled_cnode_delete(temp_cnode);
     }
 }
 
@@ -553,20 +567,20 @@ pub(crate) unsafe fn teardown_pool(vspace_cap: Cap) {
             for i in 0..POOL_ENTRY_COUNT {
                 let cap = *(*pool).pool_slot_caps.add(i);
                 if cap != 0 {
-                    invoke::cnode_delete(super::CAP_SELF_CSPACE, cap);
+                    super::recycled_cnode_delete(cap);
                 }
             }
         }
 
         // Delete pool infrastructure caps
         if (*pool).pool_frame != 0 {
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, (*pool).pool_frame);
+            super::recycled_cnode_delete((*pool).pool_frame);
         }
         if (*pool).ring_frame != 0 {
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, (*pool).ring_frame);
+            super::recycled_cnode_delete((*pool).ring_frame);
         }
         if (*pool).notif_cap != 0 {
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, (*pool).notif_cap);
+            super::recycled_cnode_delete((*pool).notif_cap);
         }
 
         *pool = VSpacePool::zeroed();

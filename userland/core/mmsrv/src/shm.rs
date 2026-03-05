@@ -79,11 +79,11 @@ pub(crate) unsafe fn handle_mm_shm_create(msg: *const BesaltMsg, _caller_badge: 
 
         // Allocate frames
         for i in 0..num_pages {
-            let frame_slot = match besalt::slot_alloc::slot_alloc() {
+            let frame_slot = match super::recycled_slot_alloc() {
                 Some(s) => s,
                 None => {
                     for j in 0..i {
-                        invoke::cnode_delete(super::CAP_SELF_CSPACE, *fcaps.add(j));
+                        super::recycled_cnode_delete(*fcaps.add(j));
                     }
                     (*reply).label = BESALT_OUT_OF_MEMORY;
                     return;
@@ -92,7 +92,7 @@ pub(crate) unsafe fn handle_mm_shm_create(msg: *const BesaltMsg, _caller_badge: 
             let err = super::retype_any(OBJ_FRAME, 0, frame_slot);
             if err != 0 {
                 for j in 0..i {
-                    invoke::cnode_delete(super::CAP_SELF_CSPACE, *fcaps.add(j));
+                    super::recycled_cnode_delete(*fcaps.add(j));
                 }
                 (*reply).label = BESALT_OUT_OF_MEMORY;
                 return;

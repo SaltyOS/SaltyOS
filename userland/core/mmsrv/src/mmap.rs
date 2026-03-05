@@ -126,7 +126,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mu
             let mut va = old_page;
             let mut page_idx = (*heap_region).frame_count as usize;
             while va < new_page {
-                let frame_slot = match besalt::slot_alloc::slot_alloc() {
+                let frame_slot = match super::recycled_slot_alloc() {
                     Some(s) => s,
                     None => {
                         let mut rva = old_page;
@@ -159,7 +159,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mu
                     VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
                 );
                 if err != 0 {
-                    invoke::cnode_delete(super::CAP_SELF_CSPACE, frame_slot);
+                    super::recycled_cnode_delete(frame_slot);
                     let mut rva = old_page;
                     while rva < va {
                         invoke::vspace_unmap(vspace_cap, rva);
@@ -187,7 +187,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mu
                 let fcap = *(*heap_region).frame_caps.add(idx);
                 invoke::vspace_unmap(vspace_cap, va);
                 if fcap != 0 {
-                    invoke::cnode_delete(super::CAP_SELF_CSPACE, fcap);
+                    super::recycled_cnode_delete(fcap);
                 }
                 va += 4096;
                 idx += 1;
@@ -344,7 +344,7 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const BesaltMsg, badge: u64, reply: *m
 
         // Eager path: Allocate and map each page immediately
         for i in 0..num_pages {
-            let frame_slot = match besalt::slot_alloc::slot_alloc() {
+            let frame_slot = match super::recycled_slot_alloc() {
                 Some(s) => s,
                 None => {
                     for j in 0..i {
@@ -368,7 +368,7 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const BesaltMsg, badge: u64, reply: *m
 
             let err = invoke::vspace_map(vspace_cap, frame_slot, base + i as u64 * 4096, map_flags);
             if err != 0 {
-                invoke::cnode_delete(super::CAP_SELF_CSPACE, frame_slot);
+                super::recycled_cnode_delete(frame_slot);
                 for j in 0..i {
                     invoke::vspace_unmap(vspace_cap, base + j as u64 * 4096);
                 }
@@ -427,7 +427,7 @@ pub(crate) unsafe fn handle_mm_munmap(msg: *const BesaltMsg, badge: u64, reply: 
                 if page_idx < (*region).frame_count as usize {
                     let fcap = *(*region).frame_caps.add(page_idx);
                     if fcap != 0 {
-                        invoke::cnode_delete(super::CAP_SELF_CSPACE, fcap);
+                        super::recycled_cnode_delete(fcap);
                         *(*region).frame_caps.add(page_idx) = 0;
                     }
                 }
@@ -546,7 +546,7 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: 
         let effective_pages = if num_pages > MAX_WINDOW_PAGES { MAX_WINDOW_PAGES } else { num_pages };
 
         for i in 0..effective_pages {
-            let frame_slot = match besalt::slot_alloc::slot_alloc() {
+            let frame_slot = match super::recycled_slot_alloc() {
                 Some(s) => s,
                 None => {
                     let mut lb = LineBuf::new();
@@ -582,7 +582,7 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: 
                 lb.hex(target_vaddr + i as u64 * 4096);
                 lb.str(b"\n");
                 lb.flush();
-                invoke::cnode_delete(super::CAP_SELF_CSPACE, frame_slot);
+                super::recycled_cnode_delete(frame_slot);
                 break;
             }
 
@@ -600,7 +600,7 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: 
                 lb.str(b"\n");
                 lb.flush();
                 invoke::vspace_unmap(target_vspace_cap, target_vaddr + i as u64 * 4096);
-                invoke::cnode_delete(super::CAP_SELF_CSPACE, frame_slot);
+                super::recycled_cnode_delete(frame_slot);
                 break;
             }
 
@@ -615,7 +615,7 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: 
                 invoke::vspace_unmap(target_vspace_cap, target_vaddr + i as u64 * 4096);
                 invoke::vspace_unmap(caller_vspace_cap, window_vaddr + i as u64 * 4096);
                 if frame_caps[i] != 0 {
-                    invoke::cnode_delete(super::CAP_SELF_CSPACE, frame_caps[i]);
+                    super::recycled_cnode_delete(frame_caps[i]);
                 }
             }
             mapped = 0;
@@ -628,7 +628,7 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: 
                     invoke::vspace_unmap(target_vspace_cap, target_vaddr + i as u64 * 4096);
                     invoke::vspace_unmap(caller_vspace_cap, window_vaddr + i as u64 * 4096);
                     if frame_caps[i] != 0 {
-                        invoke::cnode_delete(super::CAP_SELF_CSPACE, frame_caps[i]);
+                        super::recycled_cnode_delete(frame_caps[i]);
                     }
                 }
                 invoke::cnode_delete(super::CAP_SELF_CSPACE, caller_vspace_cap);
@@ -654,7 +654,7 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: 
                     invoke::vspace_unmap(caller_vspace_cap, window_vaddr + i as u64 * 4096);
                     let frame = *tracked_caps.add(i);
                     if frame != 0 {
-                        invoke::cnode_delete(super::CAP_SELF_CSPACE, frame);
+                        super::recycled_cnode_delete(frame);
                     }
                 }
                 invoke::cnode_delete(super::CAP_SELF_CSPACE, caller_vspace_cap);
@@ -878,15 +878,15 @@ pub(crate) unsafe fn handle_mm_alloc_thread_objects(
 ) {
     unsafe {
         // Allocate 3 temp slots for the new objects
-        let tcb_slot = match besalt::slot_alloc::slot_alloc() {
+        let tcb_slot = match super::recycled_slot_alloc() {
             Some(s) => s,
             None => { (*reply).label = BESALT_OUT_OF_MEMORY; return; }
         };
-        let sc_slot = match besalt::slot_alloc::slot_alloc() {
+        let sc_slot = match super::recycled_slot_alloc() {
             Some(s) => s,
             None => { (*reply).label = BESALT_OUT_OF_MEMORY; return; }
         };
-        let frame_slot = match besalt::slot_alloc::slot_alloc() {
+        let frame_slot = match super::recycled_slot_alloc() {
             Some(s) => s,
             None => { (*reply).label = BESALT_OUT_OF_MEMORY; return; }
         };
@@ -902,7 +902,7 @@ pub(crate) unsafe fn handle_mm_alloc_thread_objects(
         let err = super::retype_any(OBJ_SCHED_CONTEXT, 0, sc_slot);
         if err != 0 {
             // Clean up TCB
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, tcb_slot);
+            super::recycled_cnode_delete(tcb_slot);
             (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
@@ -910,8 +910,8 @@ pub(crate) unsafe fn handle_mm_alloc_thread_objects(
         // Retype: Frame (12 size_bits = 4K page for IPC buffer)
         let err = super::retype_any(OBJ_FRAME, 12, frame_slot);
         if err != 0 {
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, tcb_slot);
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, sc_slot);
+            super::recycled_cnode_delete(tcb_slot);
+            super::recycled_cnode_delete(sc_slot);
             (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
@@ -945,7 +945,7 @@ pub(crate) unsafe fn handle_mm_alloc_object(
         let obj_type = (*msg).regs[0];
         let size_bits = (*msg).regs[1];
 
-        let slot = match besalt::slot_alloc::slot_alloc() {
+        let slot = match super::recycled_slot_alloc() {
             Some(s) => s,
             None => { (*reply).label = BESALT_OUT_OF_MEMORY; return; }
         };
@@ -1006,7 +1006,7 @@ pub(crate) unsafe fn handle_mm_map_batch(msg: *const BesaltMsg, _caller_badge: u
         }
 
         for i in 0..num_pages {
-            let frame_slot = match besalt::slot_alloc::slot_alloc() {
+            let frame_slot = match super::recycled_slot_alloc() {
                 Some(s) => s,
                 None => break,
             };
@@ -1023,7 +1023,7 @@ pub(crate) unsafe fn handle_mm_map_batch(msg: *const BesaltMsg, _caller_badge: u
                 flags,
             );
             if err != 0 {
-                invoke::cnode_delete(super::CAP_SELF_CSPACE, frame_slot);
+                super::recycled_cnode_delete(frame_slot);
                 break;
             }
             *tracked_caps.add(i) = frame_slot;
@@ -1044,7 +1044,7 @@ pub(crate) unsafe fn handle_mm_map_batch(msg: *const BesaltMsg, _caller_badge: u
                     invoke::vspace_unmap(vspace_cap, start_vaddr + i as u64 * 4096);
                     let frame = *tracked_caps.add(i);
                     if frame != 0 {
-                        invoke::cnode_delete(super::CAP_SELF_CSPACE, frame);
+                        super::recycled_cnode_delete(frame);
                         *tracked_caps.add(i) = 0;
                     }
                 }

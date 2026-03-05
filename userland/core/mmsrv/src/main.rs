@@ -226,6 +226,16 @@ static mut PENDING_CLEANUP_COUNT: usize = 0;
 static mut COW_AGG_NTFN: Cap = 0;
 
 // ---------------------------------------------------------------------------
+// CNode slot recycling
+// ---------------------------------------------------------------------------
+
+/// Free-slot stack capacity. 32K entries × 4 bytes = 128KB.
+/// Handles worst-case deregister of a client with ~24K frame caps.
+const FREE_SLOT_CAP: usize = 32768;
+static mut FREE_SLOTS: [u32; FREE_SLOT_CAP] = [0u32; FREE_SLOT_CAP];
+static mut FREE_SLOT_COUNT: usize = 0;
+
+// ---------------------------------------------------------------------------
 // SHM object tracking (growable, pointer-based)
 // ---------------------------------------------------------------------------
 
@@ -389,6 +399,37 @@ pub(crate) fn cow_agg_ntfn() -> Cap {
     unsafe { *(&raw const COW_AGG_NTFN) }
 }
 
+/// Allocate a CNode slot, preferring recycled slots over the bump allocator.
+/// Never performs blocking IPC to procmgr — returns None instead of expanding
+/// the CSpace, preventing the procmgr→mmsrv→procmgr deadlock on slot exhaustion.
+pub(crate) fn recycled_slot_alloc() -> Option<u64> {
+    // SAFETY: mmsrv is single-threaded; no concurrent access to FREE_SLOTS.
+    unsafe {
+        let count = *(&raw const FREE_SLOT_COUNT);
+        if count > 0 {
+            let idx = count - 1;
+            let slot = *(&raw const FREE_SLOTS as *const u32).add(idx);
+            *(&raw mut FREE_SLOT_COUNT) = idx;
+            return Some(slot as u64);
+        }
+    }
+    besalt::slot_alloc::slot_alloc()
+}
+
+/// Delete a capability and return its CNode slot to the free pool for reuse.
+pub(crate) fn recycled_cnode_delete(slot: u64) {
+    invoke::cnode_delete(CAP_SELF_CSPACE, slot);
+    // SAFETY: mmsrv is single-threaded; no concurrent access to FREE_SLOTS.
+    unsafe {
+        let count = *(&raw const FREE_SLOT_COUNT);
+        if count < FREE_SLOT_CAP {
+            *(&raw mut FREE_SLOTS as *mut u32).add(count) = slot as u32;
+            *(&raw mut FREE_SLOT_COUNT) = count + 1;
+        }
+        // If pool is full, slot is permanently leaked (bounded degradation)
+    }
+}
+
 /// Drain COW notification rings for all active pools.
 ///
 /// For each active VSpace pool, reads the notification ring to learn which
@@ -463,7 +504,7 @@ pub extern "C" fn _start() -> ! {
     // When the kernel fast-path consumes pool entries and signals, the
     // bound notification wakes us from Recv without a real IPC message.
     unsafe {
-        if let Some(ntfn_slot) = besalt::slot_alloc::slot_alloc() {
+        if let Some(ntfn_slot) = recycled_slot_alloc() {
             if retype_any(OBJ_NOTIFICATION, 0, ntfn_slot) == 0 {
                 let err = invoke::tcb_bind_notification(CAP_SELF_TCB, ntfn_slot);
                 if err == 0 {
@@ -475,7 +516,7 @@ pub extern "C" fn _start() -> ! {
                     lb.hex(err as u64);
                     lb.str(b"\n");
                     lb.flush();
-                    invoke::cnode_delete(CAP_SELF_CSPACE, ntfn_slot);
+                    recycled_cnode_delete(ntfn_slot);
                 }
             }
         }
@@ -553,7 +594,7 @@ pub extern "C" fn _start() -> ! {
             for i in 0..count {
                 let slot = (*(&raw const PENDING_CLEANUP_SLOTS))[i];
                 if slot != 0 {
-                    invoke::cnode_delete(CAP_SELF_CSPACE, slot);
+                    recycled_cnode_delete(slot);
                 }
             }
             *(&raw mut PENDING_CLEANUP_COUNT) = 0;
@@ -663,7 +704,7 @@ pub extern "C" fn _start() -> ! {
                         if (error_code & 0x7) == 0x7 && (bitmap_cow || implicit_cow) {
                             // COW resolution path: allocate a new frame and
                             // let the kernel copy + replace the COW mapping.
-                            let slot = match besalt::slot_alloc::slot_alloc() {
+                            let slot = match recycled_slot_alloc() {
                                 Some(s) => s,
                                 None => {
                                     reply.label = BESALT_OUT_OF_MEMORY;
@@ -689,7 +730,7 @@ pub extern "C" fn _start() -> ! {
                                 // Race: another CPU already resolved this COW page.
                                 // Kernel confirmed PTE is writable (not COW).
                                 // Safe for both bitmap_cow and implicit_cow paths.
-                                invoke::cnode_delete(CAP_SELF_CSPACE, slot);
+                                recycled_cnode_delete(slot);
                                 if bitmap_cow {
                                     client::clear_cow_bit(region, page_idx);
                                 }
@@ -699,7 +740,7 @@ pub extern "C" fn _start() -> ! {
                             if err == BESALT_INVALID_OPERATION as i32 {
                                 // Kernel says page is present, not COW, not writable.
                                 // Genuine access violation (e.g. mprotect PROT_READ).
-                                invoke::cnode_delete(CAP_SELF_CSPACE, slot);
+                                recycled_cnode_delete(slot);
                                 let mut lb = LineBuf::new();
                                 lb.str(b"[MMSRV] access violation (not COW): badge=");
                                 lb.hex(badge);
@@ -711,7 +752,7 @@ pub extern "C" fn _start() -> ! {
                                 break 'fault;
                             }
                             if err != 0 {
-                                invoke::cnode_delete(CAP_SELF_CSPACE, slot);
+                                recycled_cnode_delete(slot);
                                 reply.label = BESALT_BAD_ADDRESS;
                                 break 'fault;
                             }
@@ -747,7 +788,7 @@ pub extern "C" fn _start() -> ! {
                             if !(*region).frame_caps.is_null() && page_idx < (*region).frame_cap_capacity as usize {
                                 let old_cap = *(*region).frame_caps.add(page_idx);
                                 if old_cap != 0 {
-                                    invoke::cnode_delete(CAP_SELF_CSPACE, old_cap);
+                                    recycled_cnode_delete(old_cap);
                                 }
                                 *(*region).frame_caps.add(page_idx) = slot;
                             }
@@ -814,8 +855,8 @@ pub extern "C" fn _start() -> ! {
                             break 'fault;
                         }
 
-                        // 5. Allocate frame: slot_alloc + retype_any
-                        let slot = match besalt::slot_alloc::slot_alloc() {
+                        // 5. Allocate frame: recycled_slot_alloc + retype_any
+                        let slot = match recycled_slot_alloc() {
                             Some(s) => s,
                             None => {
                                 reply.label = BESALT_OUT_OF_MEMORY;
@@ -831,7 +872,7 @@ pub extern "C" fn _start() -> ! {
                         let flags = prot_to_vspace_flags((*region).prot);
                         let err = invoke::vspace_map((*client_ptr).vspace_cap, slot, page_addr, flags);
                         if err != 0 {
-                            invoke::cnode_delete(CAP_SELF_CSPACE, slot);
+                            recycled_cnode_delete(slot);
                             reply.label = BESALT_BAD_ADDRESS;
                             break 'fault;
                         }
