@@ -918,6 +918,7 @@ pub(crate) unsafe fn handle_mm_alloc_object(
 
         let err = super::retype_any(obj_type, size_bits, slot);
         if err != 0 {
+            super::recycle_empty_slot(slot);
             (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
