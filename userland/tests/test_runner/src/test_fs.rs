@@ -102,7 +102,8 @@ pub fn run() -> bool {
     // Test 5: mkdir /tmp
     puts(b"[TEST_FS] Test 5: mkdir /tmp\n");
     let ret = unsafe { posix::posix_mkdir(b"/tmp\0".as_ptr(), 0o755) };
-    if ret != 0 {
+    if ret != 0 && ret != -17 {
+        // Accept EEXIST (-17): VFS may pre-create /tmp at boot
         puts(b"[TEST_FS] FAIL: mkdir /tmp returned error\n");
         return false;
     }
