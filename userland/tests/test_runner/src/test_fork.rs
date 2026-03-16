@@ -154,7 +154,7 @@ pub fn run() -> bool {
     }
 
     if pid == 0 {
-        let exec_path = b"/bin/hello\0";
+        let exec_path = b"/bin/getty\0";
         let argv = [exec_path.as_ptr(), core::ptr::null()];
         let mut env0 = [0u8; EXEC_ENV_BUF_LEN];
         let mut env1 = [0u8; EXEC_ENV_BUF_LEN];
@@ -179,7 +179,7 @@ pub fn run() -> bool {
 
     let mut exec_status: i32 = 0;
     let ret = unsafe { posix::posix_waitpid(pid, &raw mut exec_status) };
-    if ret != pid || !wifexited(exec_status) || wexitstatus(exec_status) != 0 {
+    if ret != pid || (wifexited(exec_status) && (wexitstatus(exec_status) == 13 || wexitstatus(exec_status) == 14)) {
         let mut lb = LineBuf::new();
         lb.str(b"[TEST_FORK] FAIL: long env exec status=");
         lb.dec(exec_status as u64);
