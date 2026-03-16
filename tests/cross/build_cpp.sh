@@ -4,7 +4,7 @@
 #
 # Usage: bash tests/cross/build_cpp.sh <sysroot-path>
 #
-# Requires: libc++.so in sysroot (just tc build host runtimes)
+# Requires: libc++.so in sysroot (just build && just strip-llvm)
 
 set -euo pipefail
 
@@ -20,7 +20,7 @@ fi
 
 if [ ! -d "$SYSROOT/usr/include/c++/v1" ]; then
     echo "Error: C++ headers not found in sysroot." >&2
-    echo "Run 'just tc build host runtimes' first." >&2
+    echo "Run 'just build && just strip-llvm' first." >&2
     exit 1
 fi
 
