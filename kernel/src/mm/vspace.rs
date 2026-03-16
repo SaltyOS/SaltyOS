@@ -1403,9 +1403,11 @@ impl VSpace {
 
     /// Change the protection flags on a contiguous range of already-mapped pages.
     ///
-    /// Acquires the VSpace lock once for the entire range. Issues `invlpg` per
-    /// page inside the lock, then performs a single TLB shootdown at the end.
-    /// Pages that are not mapped (or not yet present) are silently skipped.
+    /// Acquires the VSpace lock once for the entire range. After all PTEs are
+    /// updated, flushes TLB entries using the adaptive threshold strategy:
+    /// large ranges (>8 pages) get a full TLB flush, small ranges get per-page
+    /// `invlpg` + remote shootdown.  Pages that are not mapped (or not yet
+    /// present) are silently skipped.
     ///
     /// Returns the number of pages whose flags were successfully updated.
     pub fn protect_range(
@@ -1445,14 +1447,29 @@ impl VSpace {
             let phys = entry & ENTRY_ADDR_MASK;
             let new_entry = phys | Self::flags_to_entry_flags(flags);
             if self.write_entry(addr, 1, new_entry).is_ok() {
-                crate::arch::x86_64::paging::invlpg(addr);
                 protected += 1;
             }
         }
 
-        // Single TLB shootdown for the entire range after all PTEs are updated.
-        if protected > 0 {
-            self.tlb_shootdown(virt);
+        // Adaptive TLB flush: full flush for large ranges, per-page for small.
+        if protected > RANGE_TLB_GLOBAL_THRESHOLD {
+            if self.active_on_current_cpu() {
+                let cr3 = crate::arch::x86_64::paging::read_cr3();
+                unsafe {
+                    crate::arch::x86_64::paging::write_cr3(cr3);
+                }
+            }
+            self.tlb_shootdown_all();
+        } else if protected > 0 {
+            let do_local_flush = self.active_on_current_cpu();
+            let page_size = PAGE_SIZE as u64;
+            for i in 0..count {
+                let addr = virt + (i as u64) * page_size;
+                if do_local_flush {
+                    crate::arch::x86_64::paging::invlpg(addr);
+                }
+                self.tlb_shootdown(addr);
+            }
         }
 
         self.lock.unlock();
