@@ -79,6 +79,27 @@ static void apply_rela(struct rtld_state *st, struct link_map *map,
         break;
     }
 
+    case R_X86_64_DTPMOD64:
+        /* Module ID for __tls_get_addr (GD model). */
+        *target = map->tls_module_id;
+        break;
+
+    case R_X86_64_DTPOFF64: {
+        /* Offset within the module's TLS block (for __tls_get_addr).
+         * For STT_TLS symbols, st_value is the offset within the TLS segment. */
+        Elf64_Sym *sym = &map->symtab[sym_idx];
+        *target = sym->st_value + (uint64_t)r->r_addend;
+        break;
+    }
+
+    case R_X86_64_TPOFF64: {
+        /* Offset from thread pointer (Variant II: TLS data below TP).
+         * TP + offset = address of TLS variable. */
+        Elf64_Sym *sym = &map->symtab[sym_idx];
+        *target = (uint64_t)(map->tls_tpoff + (int64_t)sym->st_value + r->r_addend);
+        break;
+    }
+
     default:
         { struct rtld_linebuf lb; rtld_lb_init(&lb);
           rtld_lb_str(&lb, "[RTLD] WARN: unknown reloc type ");

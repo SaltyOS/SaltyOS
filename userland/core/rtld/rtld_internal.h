@@ -330,6 +330,7 @@ typedef struct {
 #define PT_DYNAMIC  2
 #define PT_INTERP   3
 #define PT_PHDR     6
+#define PT_TLS      7
 
 /* ELF permission flags */
 #define PF_X  0x1
@@ -362,6 +363,10 @@ typedef struct {
 #define DT_SYMBOLIC   16
 #define DT_REL        17
 #define DT_JMPREL     23
+#define DT_INIT_ARRAY   25
+#define DT_FINI_ARRAY   26
+#define DT_INIT_ARRAYSZ 27
+#define DT_FINI_ARRAYSZ 28
 #define DT_GNU_HASH   0x6ffffef5
 
 /* Relocation types */
@@ -370,6 +375,9 @@ typedef struct {
 #define R_X86_64_GLOB_DAT   6
 #define R_X86_64_JUMP_SLOT  7
 #define R_X86_64_RELATIVE   8
+#define R_X86_64_DTPMOD64   16
+#define R_X86_64_DTPOFF64   17
+#define R_X86_64_TPOFF64    18
 
 /* ELF macros */
 #define ELF64_R_TYPE(info) ((uint32_t)((info) & 0xFFFFFFFF))
@@ -385,6 +393,7 @@ typedef struct {
 #define STT_NOTYPE  0
 #define STT_OBJECT  1
 #define STT_FUNC    2
+#define STT_TLS     6
 
 #define SHN_UNDEF  0
 
@@ -527,7 +536,24 @@ struct link_map {
     Elf64_Rela *rela;       /* DT_RELA (non-PLT relocations) */
     uint64_t    rela_count;
     uint64_t    load_size;  /* Page-aligned total footprint in VA */
+    void       (*init_fn)(void);      /* DT_INIT function pointer */
+    void      (**init_array)(void);   /* DT_INIT_ARRAY base pointer */
+    uint64_t    init_array_count;     /* Number of init_array entries */
+    uint64_t    tls_template;   /* Runtime address of PT_TLS image */
+    uint64_t    tls_filesz;     /* Initialized bytes in PT_TLS */
+    uint64_t    tls_memsz;      /* Total PT_TLS size */
+    uint64_t    tls_align;      /* PT_TLS alignment */
+    int64_t     tls_tpoff;      /* Variant II module base relative to TP */
+    uint64_t    tls_module_id;  /* 1-based module ID for __tls_get_addr */
     struct link_map *next;
+};
+
+struct rtld_tls_module {
+    uint64_t module_id;
+    uint64_t template_addr;
+    uint64_t filesz;
+    uint64_t memsz;
+    int64_t  tpoff;
 };
 
 /* ============================================================
@@ -565,6 +591,17 @@ struct rtld_state {
 
     /* CSpace expansion notification cap (from AT_BESALT_CSPACE_NTFN) */
     uint64_t cspace_ntfn;
+
+    /* Combined static TLS layout (exe + loaded PT_TLS DSOs) */
+    uint64_t tls_memsz;
+    uint64_t tls_align;
+    uint64_t tls_module_count;
+
+    /* ELF TLS segment info (from exe's PT_TLS) */
+    uint64_t exe_tls_vaddr;     /* Runtime address of .tdata template */
+    uint64_t exe_tls_filesz;    /* Size of .tdata (initialized TLS data) */
+    uint64_t exe_tls_memsz;     /* Total TLS size (.tdata + .tbss) */
+    uint64_t exe_tls_align;     /* TLS alignment requirement */
 };
 
 extern struct rtld_state g_rtld;
