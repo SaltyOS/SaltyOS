@@ -272,7 +272,12 @@ strip-llvm:
     SRC=build-toolchain/llvm-saltyos/bin
     DST=build-toolchain/llvm-saltyos-stripped
     mkdir -p "$DST/bin" "$DST/lib"
-    for f in clang-23 lld llvm-ar llvm-nm llvm-objcopy; do
+    clang_bin="$(cd "$SRC" && ls clang-* 2>/dev/null | head -1)"
+    if [ -z "$clang_bin" ]; then
+        echo "Error: no clang-* binary found in $SRC" >&2
+        exit 1
+    fi
+    for f in "$clang_bin" lld llvm-ar llvm-nm llvm-objcopy; do
         echo "Stripping $f..."
         cp "$SRC/$f" "$DST/bin/$f"
         "$STRIP" "$DST/bin/$f"
