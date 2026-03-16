@@ -56,7 +56,7 @@ unsafe fn sig_stop_proc(idx: usize, sig: usize) {
     }
 }
 
-unsafe fn sig_terminate_proc(idx: usize, sig: usize) {
+pub(crate) unsafe fn terminate_proc(idx: usize, sig: usize) {
     unsafe {
         let exit_code = (sig & 0x7f) as i32;
 
@@ -179,7 +179,7 @@ unsafe fn deliver_signal_to(ti: usize, sig: usize) -> bool {
 
         // SIGKILL: always terminate
         if sig == super::PM_SIGKILL {
-            sig_terminate_proc(ti, sig);
+            terminate_proc(ti, sig);
             return true;
         }
 
@@ -227,7 +227,7 @@ unsafe fn deliver_signal_to(ti: usize, sig: usize) -> bool {
             if sig_default_is_stop(sig) {
                 sig_stop_proc(ti, sig);
             } else if sig_default_is_terminate(sig) {
-                sig_terminate_proc(ti, sig);
+                terminate_proc(ti, sig);
             }
             return true;
         }

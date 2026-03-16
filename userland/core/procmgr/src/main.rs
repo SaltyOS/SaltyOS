@@ -119,6 +119,7 @@ const AT_BESALT_SHARED_LIB_BASE: u64 = 0x1006;
 const AT_BESALT_SLOT_BASE: u64 = 0x1007;
 const AT_BESALT_SLOT_COUNT: u64 = 0x1008;
 const AT_BESALT_CSPACE_NTFN: u64 = 0x100A;
+const AT_BESALT_MM_EP: u64 = 0x100B;
 
 // ---- waitpid options ----
 const WNOHANG: u32 = 1;
@@ -133,10 +134,10 @@ const OBJ_NOTIFICATION: u64 = besalt::OBJ_NOTIFICATION;
 const BESALT_OK: u64 = besalt::BESALT_OK;
 const BESALT_OUT_OF_MEMORY: u64 = besalt::BESALT_OUT_OF_MEMORY;
 const BESALT_NOT_FOUND: u64 = besalt::BESALT_NOT_FOUND;
+const BESALT_OUT_OF_RANGE: u64 = besalt::BESALT_OUT_OF_RANGE;
 const BESALT_INVALID_ARGUMENT: u64 = besalt::BESALT_INVALID_ARGUMENT;
 const BESALT_INVALID_OPERATION: u64 = besalt::BESALT_INVALID_OPERATION;
 const BESALT_WOULD_BLOCK: u64 = besalt::BESALT_WOULD_BLOCK;
-const BESALT_BUSY: u64 = besalt::BESALT_BUSY;
 const VSPACE_FLAG_WRITABLE: u64 = besalt::VSPACE_FLAG_WRITABLE;
 const VSPACE_FLAG_USER: u64 = besalt::VSPACE_FLAG_USER;
 const CAP_RIGHTS_ALL: u64 = besalt::CAP_RIGHTS_ALL;
@@ -179,7 +180,7 @@ fn read_boot_info_initrd_size() -> usize {
 fn puts(s: &[u8]) {
     besalt::serial::serial_puts(s);
 }
-fn ipc_ctx() -> *mut IpcContext {
+pub(crate) fn ipc_ctx() -> *mut IpcContext {
     &raw mut besalt::__besalt_ipc_ctx
 }
 
@@ -451,9 +452,28 @@ pub extern "C" fn _start() -> ! {
                 }
             };
             if ntfn_slot != 0 {
-                let err = alloc.retype_any(OBJ_NOTIFICATION, 0, ntfn_slot);
-                if err != 0 {
-                    puts(b"[PROCMGR] WARN: retype notification failed\n");
+                // Request notification object from mmsrv (centralized allocator)
+                besalt::ipc::set_receive_slot_ctx(
+                    ipc_ctx(),
+                    CAP_SELF_CSPACE,
+                    ntfn_slot,
+                    0,
+                );
+                let mut mm_msg = besalt::types::BesaltMsg::zeroed();
+                let mut mm_reply = besalt::types::BesaltMsg::zeroed();
+                mm_msg.label = besalt::MM_ALLOC_OBJECT;
+                mm_msg.length = 2;
+                mm_msg.regs[0] = OBJ_NOTIFICATION;
+                mm_msg.regs[1] = 0;
+                let err = besalt::ipc::call_ctx(
+                    ipc_ctx(),
+                    CAP_MMSRV_EP,
+                    &raw const mm_msg,
+                    &raw mut mm_reply,
+                );
+                let alloc_ok = err == 0 && mm_reply.label == besalt::BESALT_OK;
+                if !alloc_ok {
+                    puts(b"[PROCMGR] WARN: alloc notification from mmsrv failed\n");
                     alloc.free_single_slot(ntfn_slot);
                 } else {
                     let err = besalt::invoke::tcb_bind_notification(CAP_SELF_TCB, ntfn_slot);
