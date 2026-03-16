@@ -345,7 +345,8 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: 
         let pid = (*client).pid;
         let vspace_cap = (*client).vspace_cap;
 
-        // Clean up all frame caps tracked in client regions
+        // Clean up all frame caps tracked in client regions — recycle into
+        // the frame pool for reuse instead of deleting (avoids untyped exhaustion).
         let region_count = (*client).region_count;
         let regions = (*client).regions;
         if !regions.is_null() {
@@ -353,13 +354,11 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: 
                 let r = regions.add(ri);
                 if (*r).active {
                     let fcaps = (*r).frame_caps;
-                    if !fcaps.is_null() {
-                        for fi in 0..(*r).frame_count as usize {
-                            let fc = *fcaps.add(fi);
-                            if fc != 0 {
-                                super::recycled_cnode_delete(fc);
-                            }
-                        }
+                    if !fcaps.is_null() && (*r).frame_count > 0 {
+                        super::frame_pool_push_batch(
+                            fcaps as *const Cap,
+                            (*r).frame_count as usize,
+                        );
                     }
                     (*r).active = false;
                 }
@@ -389,6 +388,15 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: 
             lb.hex(client_badge);
             lb.str(b" pid=");
             lb.hex(pid as u64);
+            let pool_count = *(&raw const super::FRAME_POOL_COUNT);
+            let recycled = *(&raw const super::FRAME_POOL_TOTAL_RECYCLED);
+            let reused = *(&raw const super::FRAME_POOL_TOTAL_REUSED);
+            lb.str(b" fpool=");
+            lb.hex(pool_count as u64);
+            lb.str(b"/");
+            lb.hex(recycled);
+            lb.str(b"/");
+            lb.hex(reused);
             lb.str(b"\n");
             lb.flush();
         }

@@ -5,6 +5,7 @@ Type=simple
 Restart=always
 PreProcmgr=yes
 CNodeBits=16
+Role=pager
 
 [Dependencies]
 After=console nameserv

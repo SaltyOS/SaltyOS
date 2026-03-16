@@ -236,6 +236,25 @@ static mut FREE_SLOTS: [u32; FREE_SLOT_CAP] = [0u32; FREE_SLOT_CAP];
 static mut FREE_SLOT_COUNT: usize = 0;
 
 // ---------------------------------------------------------------------------
+// Frame cap recycling pool
+// ---------------------------------------------------------------------------
+
+/// Frame pool capacity. 32K entries x 8 bytes = 256KB.
+/// Handles worst-case recycling of ~24K frame caps from a large binary cycle.
+const FRAME_POOL_CAP: usize = 32768;
+static mut FRAME_POOL: [u64; FRAME_POOL_CAP] = [0u64; FRAME_POOL_CAP];
+static mut FRAME_POOL_COUNT: usize = 0;
+
+/// Zeroing window: 8 pages for batch frame zeroing before pool push.
+/// Located just below SELF_MMAP_BASE to avoid VA conflicts.
+const ZERO_WINDOW_BASE: u64 = 0x1FFF_8000;
+const ZERO_WINDOW_PAGES: usize = 8;
+
+/// Statistics: total frames recycled into pool and reused from pool.
+static mut FRAME_POOL_TOTAL_RECYCLED: u64 = 0;
+static mut FRAME_POOL_TOTAL_REUSED: u64 = 0;
+
+// ---------------------------------------------------------------------------
 // SHM object tracking (growable, pointer-based)
 // ---------------------------------------------------------------------------
 
@@ -291,6 +310,34 @@ unsafe fn retype_any(obj_type: u64, size_bits: u64, dest_slot: Cap) -> i32 {
                 continue;
             }
             let err = invoke::untyped_retype(sources[i].cap, obj_type, size_bits, dest_slot);
+            if err == 0 {
+                *(&raw mut UT_HINT) = i;
+                return 0;
+            }
+        }
+
+        // All sources exhausted — log per-source diagnostics
+        let mut lb = LineBuf::new();
+        lb.str(b"[MMSRV] retype_any: all ");
+        lb.hex(ut_count as u64);
+        lb.str(b" sources failed, type=");
+        lb.hex(obj_type);
+        lb.str(b"\n");
+        lb.flush();
+        for i in 0..ut_count {
+            if !sources[i].active {
+                continue;
+            }
+            let err = invoke::untyped_retype(sources[i].cap, obj_type, size_bits, dest_slot);
+            let mut lb2 = LineBuf::new();
+            lb2.str(b"  src[");
+            lb2.hex(i as u64);
+            lb2.str(b"] cap=");
+            lb2.hex(sources[i].cap);
+            lb2.str(b" err=");
+            lb2.hex(err as u64);
+            lb2.str(b"\n");
+            lb2.flush();
             if err == 0 {
                 *(&raw mut UT_HINT) = i;
                 return 0;
@@ -417,8 +464,13 @@ pub(crate) fn recycled_slot_alloc() -> Option<u64> {
 }
 
 /// Delete a capability and return its CNode slot to the free pool for reuse.
+/// Only recycles the slot if cnode_delete succeeds — prevents recycling
+/// slots the kernel still considers occupied.
 pub(crate) fn recycled_cnode_delete(slot: u64) {
-    invoke::cnode_delete(CAP_SELF_CSPACE, slot);
+    let err = invoke::cnode_delete(CAP_SELF_CSPACE, slot);
+    if err != 0 {
+        return; // Slot still occupied in kernel; don't add to free pool
+    }
     // SAFETY: mmsrv is single-threaded; no concurrent access to FREE_SLOTS.
     unsafe {
         let count = *(&raw const FREE_SLOT_COUNT);
@@ -428,6 +480,138 @@ pub(crate) fn recycled_cnode_delete(slot: u64) {
         }
         // If pool is full, slot is permanently leaked (bounded degradation)
     }
+}
+
+/// Return an unused (empty) CNode slot to the free pool without calling
+/// cnode_delete. Used when retype fails and the slot was never populated.
+fn recycle_empty_slot(slot: u64) {
+    unsafe {
+        let count = *(&raw const FREE_SLOT_COUNT);
+        if count < FREE_SLOT_CAP {
+            *(&raw mut FREE_SLOTS as *mut u32).add(count) = slot as u32;
+            *(&raw mut FREE_SLOT_COUNT) = count + 1;
+        }
+    }
+}
+
+/// Push a frame cap into the recycling pool after zeroing it.
+/// Falls back to recycled_cnode_delete if pool is full or zeroing fails.
+pub(crate) fn frame_pool_push(frame_cap: Cap) {
+    unsafe {
+        let count = *(&raw const FRAME_POOL_COUNT);
+        if count >= FRAME_POOL_CAP {
+            recycled_cnode_delete(frame_cap);
+            return;
+        }
+        let va = ZERO_WINDOW_BASE;
+        let err = invoke::vspace_map(
+            CAP_SELF_VSPACE, frame_cap, va,
+            VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+        );
+        if err != 0 {
+            recycled_cnode_delete(frame_cap);
+            return;
+        }
+        core::ptr::write_bytes(va as *mut u8, 0, 4096);
+        invoke::vspace_unmap(CAP_SELF_VSPACE, va);
+        *(&raw mut FRAME_POOL as *mut u64).add(count) = frame_cap;
+        *(&raw mut FRAME_POOL_COUNT) = count + 1;
+        *(&raw mut FRAME_POOL_TOTAL_RECYCLED) += 1;
+    }
+}
+
+/// Pop a pre-zeroed frame cap from the recycling pool.
+pub(crate) fn frame_pool_pop() -> Option<Cap> {
+    unsafe {
+        let count = *(&raw const FRAME_POOL_COUNT);
+        if count == 0 {
+            return None;
+        }
+        let idx = count - 1;
+        let cap = *(&raw const FRAME_POOL as *const u64).add(idx);
+        *(&raw mut FRAME_POOL_COUNT) = idx;
+        *(&raw mut FRAME_POOL_TOTAL_REUSED) += 1;
+        Some(cap)
+    }
+}
+
+/// Batch push frame caps into the recycling pool with 8-page window zeroing.
+/// Null (0) entries in `caps` are skipped. Falls back to recycled_cnode_delete
+/// for caps that cannot be pooled (map failure or pool full).
+///
+/// # Safety
+///
+/// `caps` must point to a valid array of at least `count` Cap entries.
+pub(crate) unsafe fn frame_pool_push_batch(caps: *const Cap, count: usize) {
+    unsafe {
+        let mut i = 0;
+        while i < count {
+            let chunk = core::cmp::min(count - i, ZERO_WINDOW_PAGES);
+            let mut mapped_flags: [bool; 8] = [false; 8];
+
+            for j in 0..chunk {
+                let cap = *caps.add(i + j);
+                if cap == 0 {
+                    continue;
+                }
+                let va = ZERO_WINDOW_BASE + j as u64 * 4096;
+                let err = invoke::vspace_map(
+                    CAP_SELF_VSPACE, cap, va,
+                    VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+                );
+                if err != 0 {
+                    recycled_cnode_delete(cap);
+                    continue;
+                }
+                mapped_flags[j] = true;
+            }
+
+            // Zero only mapped pages — skip holes where cap was 0 or map failed
+            for j in 0..chunk {
+                if mapped_flags[j] {
+                    let va = ZERO_WINDOW_BASE + j as u64 * 4096;
+                    core::ptr::write_bytes(va as *mut u8, 0, 4096);
+                }
+            }
+
+            for j in 0..chunk {
+                let cap = *caps.add(i + j);
+                if cap == 0 || !mapped_flags[j] {
+                    continue;
+                }
+                let va = ZERO_WINDOW_BASE + j as u64 * 4096;
+                invoke::vspace_unmap(CAP_SELF_VSPACE, va);
+                let pool_count = *(&raw const FRAME_POOL_COUNT);
+                if pool_count < FRAME_POOL_CAP {
+                    *(&raw mut FRAME_POOL as *mut u64).add(pool_count) = cap;
+                    *(&raw mut FRAME_POOL_COUNT) = pool_count + 1;
+                    *(&raw mut FRAME_POOL_TOTAL_RECYCLED) += 1;
+                } else {
+                    recycled_cnode_delete(cap);
+                }
+            }
+
+            i += chunk;
+        }
+    }
+}
+
+/// Allocate a frame cap: tries the recycled frame pool first, then falls
+/// back to slot_alloc + retype_any. Returns the CNode slot holding a valid
+/// frame cap, or None on OOM.
+pub(crate) fn alloc_frame() -> Option<Cap> {
+    // Tier 1: recycled frame (already zeroed)
+    if let Some(cap) = frame_pool_pop() {
+        return Some(cap);
+    }
+    // Tier 2: fresh retype
+    let slot = recycled_slot_alloc()?;
+    // SAFETY: retype_any accesses static state; mmsrv is single-threaded.
+    if unsafe { retype_any(OBJ_FRAME, 0, slot) } != 0 {
+        recycle_empty_slot(slot);
+        return None;
+    }
+    Some(slot)
 }
 
 /// Drain COW notification rings for all active pools.
@@ -645,6 +829,7 @@ pub extern "C" fn _start() -> ! {
                 MM_SHM_UNMAP => shm::handle_mm_shm_unmap(&raw const msg, badge, &raw mut reply),
                 MM_GET_CLIENT_STATS => client::handle_mm_get_client_stats(&raw const msg, badge, &raw mut reply),
                 MM_ALLOC_OBJECT => mmap::handle_mm_alloc_object(&raw const msg, badge, &raw mut reply),
+                MM_REGISTER_SHARED_REGION => mmap::handle_mm_register_shared_region(&raw const msg, badge, &raw mut reply),
                 // VMFault: label=2 from kernel FaultType::VMFault.
                 // Badge identifies the faulting client. Replying resumes the faulting thread.
                 //
@@ -653,7 +838,7 @@ pub extern "C" fn _start() -> ! {
                 2 => {
                     let fault_addr = msg.regs[0];
                     let error_code = msg.regs[1];
-                    let _fault_rip = msg.regs[2];
+                    let fault_rip = msg.regs[2];
                     let page_addr = fault_addr & !0xFFFu64;
 
                     'fault: {
@@ -680,8 +865,50 @@ pub extern "C" fn _start() -> ! {
                             lb.hex(badge);
                             lb.str(b" addr=");
                             lb.hex(fault_addr);
-                            lb.str(b" (no region)\n");
+                            lb.str(b" (no region) rip=");
+                            lb.hex(fault_rip);
+                            let rc = (*client_ptr).region_count;
+                            lb.str(b" regions=");
+                            lb.hex(rc as u64);
+                            if rc > 0 {
+                                let regs = (*client_ptr).regions;
+                                let r0 = &*regs.add(0);
+                                lb.str(b" r0=[");
+                                lb.hex(r0.base);
+                                lb.str(b",");
+                                lb.hex(r0.base + r0.length);
+                                lb.str(b")");
+                                let rl = &*regs.add(rc - 1);
+                                lb.str(b" rN=[");
+                                lb.hex(rl.base);
+                                lb.str(b",");
+                                lb.hex(rl.base + rl.length);
+                                lb.str(b")");
+                            }
+                            lb.str(b" err=");
+                            lb.hex(error_code);
+                            lb.str(b"\n");
                             lb.flush();
+                            // Dump all regions for debugging
+                            if rc > 0 && rc <= 80 {
+                                let regs = (*client_ptr).regions;
+                                for ri in 0..rc {
+                                    let rd = &*regs.add(ri);
+                                    if rd.active {
+                                        let mut lb2 = LineBuf::new();
+                                        lb2.str(b"  r");
+                                        lb2.hex(ri as u64);
+                                        lb2.str(b"=[");
+                                        lb2.hex(rd.base);
+                                        lb2.str(b",");
+                                        lb2.hex(rd.base + rd.length);
+                                        lb2.str(b") t=");
+                                        lb2.hex(rd.region_type as u64);
+                                        lb2.str(b"\n");
+                                        lb2.flush();
+                                    }
+                                }
+                            }
                             skip_reply = true;
                             break 'fault;
                         }
@@ -704,6 +931,8 @@ pub extern "C" fn _start() -> ! {
                         if (error_code & 0x7) == 0x7 && (bitmap_cow || implicit_cow) {
                             // COW resolution path: allocate a new frame and
                             // let the kernel copy + replace the COW mapping.
+                            // Use fresh retype (not recycled pool) to avoid
+                            // issues with frame lifecycle during COW.
                             let slot = match recycled_slot_alloc() {
                                 Some(s) => s,
                                 None => {
@@ -855,7 +1084,7 @@ pub extern "C" fn _start() -> ! {
                             break 'fault;
                         }
 
-                        // 5. Allocate frame: recycled_slot_alloc + retype_any
+                        // 5. Allocate frame: fresh retype (not recycled pool)
                         let slot = match recycled_slot_alloc() {
                             Some(s) => s,
                             None => {

@@ -20,6 +20,7 @@ impl UntypedSource {
 pub(crate) const REGION_HEAP: u8 = 0;
 pub(crate) const REGION_MMAP: u8 = 1;
 pub(crate) const REGION_SPAWN: u8 = 2;
+pub(crate) const REGION_SHARED_RO: u8 = 3;
 pub(crate) const REGION_INITIAL_CAP: usize = 8;
 pub(crate) const HEAP_INITIAL_FRAME_CAP: usize = 64;
 
