@@ -100,6 +100,7 @@ pub const AT_BESALT_FRAME_SLOT: u64 = 0x1005;
 pub const AT_BESALT_SLOT_BASE: u64 = 0x1007;
 pub const AT_BESALT_SLOT_COUNT: u64 = 0x1008;
 pub const AT_BESALT_EXPAND_EP: u64 = 0x1009;
+pub const AT_BESALT_MM_EP: u64 = 0x100B;
 pub const CAP_EXPAND_EP: u64 = 9;
 
 // ======================================================================
@@ -545,7 +546,8 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
             // Build extras from [Capabilities] declarations
             let mut extras = [ExtraCapCopy { src: 0, dst: 0, badge: 0 }; 10];
             let mut n: usize = 0;
-            let mut mmsrv_ep_src: Cap = 0;
+            let mut pager_ep_src: Cap = 0;
+            let mut pager_child_slot: u64 = 0;
 
             for i in 0..cap_count as usize {
                 if n < extras.len() {
@@ -564,8 +566,14 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                 if provider_idx >= 0 && n < extras.len() {
                     let pre_ep = mgr.services[provider_idx as usize].pre_ep;
                     if pre_ep != 0 {
-                        if bytes_eq(svc_name, b"mmsrv") {
-                            mmsrv_ep_src = pre_ep;
+                        let provider_role = mgr.services[provider_idx as usize].def.role_bytes();
+                        if bytes_eq(provider_role, b"pager") {
+                            pager_ep_src = pre_ep;
+                            // Prefer the badged entry (client-call EP); unbadged
+                            // entries are for parent-side minting, not CRT use.
+                            if ep_needs[i].badged || pager_child_slot == 0 {
+                                pager_child_slot = ep_needs[i].dst_slot;
+                            }
                         }
                         extras[n] = ExtraCapCopy {
                             src: pre_ep,
@@ -577,7 +585,18 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                 }
             }
 
-            let ut_bits = compute_service_budget(total_usable, mgr.count, memory_kb, do_map_initrd);
+            let svc_role = mgr.services[svc_idx].def.role_bytes();
+            let mirror_untypeds = bytes_eq(svc_role, b"pager");
+            let ut_bits = if mirror_untypeds {
+                // Central pager gets half of available RAM as its exclusive pool
+                let half = total_usable / 2;
+                let mut bits = log2_floor(half);
+                if bits < 20 { bits = 20; }
+                if bits > 27 { bits = 27; }
+                bits
+            } else {
+                compute_service_budget(total_usable, mgr.count, memory_kb, do_map_initrd)
+            };
             let err = unsafe {
                 spawn::spawn_server(
                     ut,
@@ -591,9 +610,11 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                     do_map_initrd,
                     ready_timeout_ns,
                     svc_pre_ep,
-                    mmsrv_ep_src,
+                    pager_ep_src,
                     procmgr_raw_ep,
                     child_badge,
+                    mirror_untypeds,
+                    pager_child_slot,
                 )
             };
 
@@ -947,6 +968,24 @@ pub extern "C" fn _start() -> ! {
         lb.str(b" service cap slot(s) in reserved range [0..63]\n");
         lb.flush();
         idle();
+    }
+
+    // Validate exactly one service declares Role=pager
+    {
+        let mut pager_count = 0u32;
+        for i in 0..mgr.count {
+            if bytes_eq(mgr.services[i].def.role_bytes(), b"pager") {
+                pager_count += 1;
+            }
+        }
+        if pager_count != 1 {
+            let mut lb = LineBuf::new();
+            lb.str(b"[INIT] FATAL: exactly one service must declare Role=pager, found ");
+            lb.hex(pager_count as u64);
+            lb.str(b"\n");
+            lb.flush();
+            idle();
+        }
     }
 
     // Create shared PTY notification for VFS↔TTYD data-ready signalling
