@@ -1403,6 +1403,36 @@ pub fn ioapic_unmask(irq: u32) {
     }
 }
 
+/// Unmask an IOAPIC redirection entry for a PCI (level-triggered, active-low) IRQ.
+///
+/// Sets the entry to: fixed delivery, physical destination mode, level-triggered,
+/// active-low, unmasked, routed to BSP. Vector = irq + 32.
+///
+/// PCI INTx interrupts are level-triggered and active-low per the PCI specification.
+/// ISA interrupts should use `ioapic_unmask()` (edge-triggered, active-high) instead.
+///
+/// # Safety
+/// IOAPIC must be initialized (`init_ioapic` called first).
+pub fn ioapic_unmask_level(irq: u32) {
+    if !IOAPIC_READY.load(Ordering::Acquire) {
+        return;
+    }
+
+    let vector = irq + 32;
+    let bsp_apic_id = super::cpu::get_apic_id_for_cpu(0);
+    let reg_lo = 0x10 + 2 * irq;
+    let reg_hi = 0x10 + 2 * irq + 1;
+
+    unsafe {
+        // Low: vector, fixed delivery(0), physical dest(0),
+        // active-low(bit13=1), level-trigger(bit15=1), unmasked(bit16=0)
+        let lo = (vector & 0xFF) | (1 << 13) | (1 << 15);
+        ioapic_write(reg_lo, lo);
+        // High: destination APIC ID in bits [31:24]
+        ioapic_write(reg_hi, bsp_apic_id << 24);
+    }
+}
+
 /// Mask an IOAPIC redirection entry for the given IRQ.
 ///
 /// # Safety

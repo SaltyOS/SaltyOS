@@ -211,7 +211,7 @@ pub extern "C" fn _start() -> ! {
         besalt::ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
     }
 
-    // Query display server for actual framebuffer dimensions
+    // Query display server for actual framebuffer dimensions.
     unsafe {
         let mut qmsg = BesaltMsg::zeroed();
         let mut qreply = BesaltMsg::zeroed();

@@ -33,7 +33,7 @@ const VIRTIO_QUEUE_SIZE: u64 = 0x0C;
 const VIRTIO_QUEUE_SELECT: u64 = 0x0E;
 pub(crate) const VIRTIO_QUEUE_NOTIFY: u64 = 0x10;
 const VIRTIO_DEVICE_STATUS: u64 = 0x12;
-const VIRTIO_ISR_STATUS: u64 = 0x13;
+pub(crate) const VIRTIO_ISR_STATUS: u64 = 0x13;
 const VIRTIO_BLK_CAPACITY: u64 = 0x14;
 
 const VIRTIO_STATUS_ACK: u8 = 1;

@@ -26,6 +26,8 @@ pub struct IrqHandler {
     pub acknowledged: bool,
     /// Whether this handler is active (registered in the global table)
     pub active: bool,
+    /// Whether this IRQ uses level-triggered delivery (PCI) vs edge-triggered (ISA)
+    pub level_triggered: bool,
     /// Next handler in chain for the same IRQ (shared IRQ support)
     pub next: *mut IrqHandler,
 }
@@ -38,6 +40,7 @@ impl IrqHandler {
             notification: core::ptr::null_mut(),
             acknowledged: true,
             active: false,
+            level_triggered: false,
             next: core::ptr::null_mut(),
         }
     }
@@ -72,13 +75,23 @@ pub fn dispatch_irq(irq_num: usize) {
     // Keep this lock-free here to avoid double-lock deadlock in interrupt context.
     unsafe {
         let mut cur = (*(&raw const IRQ_HANDLERS))[irq_num];
+        let mut any_dispatched = false;
         while !cur.is_null() {
             let h = &mut *cur;
             if h.acknowledged && !h.notification.is_null() {
                 h.acknowledged = false;
                 (*h.notification).signal(1u64 << (irq_num % 64));
+                any_dispatched = true;
             }
             cur = h.next;
+        }
+        // Level-triggered safety: mask IRQ at IOAPIC if no handler was ready
+        // to accept delivery. This prevents an IRQ storm when the interrupt
+        // source stays asserted (e.g. shared PCI IRQ where one device never
+        // clears its ISR). The IRQ is re-enabled when a handler calls
+        // irq_handler_ack() via the IRQ_HANDLER_ACK invoke.
+        if !any_dispatched && has_handlers(irq_num) {
+            crate::arch::ioapic_mask(irq_num as u32);
         }
     }
 }

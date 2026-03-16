@@ -1,7 +1,7 @@
 [Service]
 Name=saltyfs
 Binary=saltyfs
-Type=simple
+Type=notify
 Restart=always
 
 [Dependencies]

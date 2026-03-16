@@ -65,6 +65,12 @@ pub struct Process {
     pub any_waiter_reply: Cap,
     pub waiting_for_any: u8,
     pub signal_ntfn: Cap,
+    /// Child readiness notification captured at spawn time for notify services.
+    pub ready_ntfn: Cap,
+    /// Whether PM_RESUME must wait for the child readiness notification once.
+    pub wait_ready_on_resume: bool,
+    /// Timeout used when waiting for the child's readiness signal after resume.
+    pub ready_timeout_ns: u64,
     pub sig_disposition: [u8; NSIG],
     pub stop_status: i32,
     pub pgid: u32,
@@ -118,6 +124,9 @@ impl Process {
             any_waiter_reply: 0,
             waiting_for_any: 0,
             signal_ntfn: 0,
+            ready_ntfn: 0,
+            wait_ready_on_resume: false,
+            ready_timeout_ns: 0,
             sig_disposition: [SIG_DISP_DFL; NSIG],
             stop_status: 0,
             pgid: 0,
@@ -352,6 +361,9 @@ pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
         p.any_waiter_reply = 0;
         p.waiting_for_any = 0;
         p.signal_ntfn = 0;
+        p.ready_ntfn = 0;
+        p.wait_ready_on_resume = false;
+        p.ready_timeout_ns = 0;
         p.stop_status = 0;
         p.pgid = 0;
         p.slot_base = 0;

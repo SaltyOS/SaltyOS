@@ -3319,6 +3319,14 @@ pub unsafe fn handle_spawn_tx(
         p.waiter_reply = 0;
         p.waiter_pid = 0;
         p.signal_ntfn = child_sig_ntfn;
+        p.ready_ntfn = if start_suspended { child_ready_ntfn } else { 0 };
+        p.wait_ready_on_resume =
+            start_suspended && plan.readiness_mode == besalt::SPAWN_READY_NOTIFY;
+        p.ready_timeout_ns = if start_suspended {
+            plan.ready_timeout_ns
+        } else {
+            0
+        };
         p.pgid = if let Some(ci) = caller_idx {
             proc_table::proctab(ci).pgid
         } else {

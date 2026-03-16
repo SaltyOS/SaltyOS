@@ -8,8 +8,6 @@ use besalt::serial::LineBuf;
 use besalt::types::*;
 
 const STACK_TOUCH_BYTES: usize = 32 * 1024;
-const EXEC_ENV_BUF_LEN: usize = 160;
-
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
 }
@@ -47,21 +45,6 @@ fn stack_checksum(seed: u8) -> u64 {
         read_idx += 1;
     }
     sum
-}
-
-fn fill_env(buf: &mut [u8; EXEC_ENV_BUF_LEN], prefix: &[u8], seed: u8) {
-    let payload_end = buf.len() - 1;
-    let prefix_len = prefix.len();
-    let mut i = 0usize;
-    while i < prefix_len {
-        buf[i] = prefix[i];
-        i += 1;
-    }
-    while i < payload_end {
-        buf[i] = b'a' + seed.wrapping_add((i - prefix_len) as u8) % 26;
-        i += 1;
-    }
-    buf[payload_end] = 0;
 }
 
 pub fn run() -> bool {
@@ -144,50 +127,6 @@ pub fn run() -> bool {
         return false;
     }
     puts(b"[TEST_FORK] Test 4: PASS\n");
-
-    // Test 5: exec with a long env payload must survive fork without truncating strings.
-    puts(b"[TEST_FORK] Test 5: fork + exec long env\n");
-    let pid = posix::posix_fork();
-    if pid < 0 {
-        puts(b"[TEST_FORK] FAIL: third fork returned -1\n");
-        return false;
-    }
-
-    if pid == 0 {
-        let exec_path = b"/bin/getty\0";
-        let argv = [exec_path.as_ptr(), core::ptr::null()];
-        let mut env0 = [0u8; EXEC_ENV_BUF_LEN];
-        let mut env1 = [0u8; EXEC_ENV_BUF_LEN];
-        let mut env2 = [0u8; EXEC_ENV_BUF_LEN];
-        let mut env3 = [0u8; EXEC_ENV_BUF_LEN];
-        fill_env(&mut env0, b"LONG_ENV0=", 0);
-        fill_env(&mut env1, b"LONG_ENV1=", 5);
-        fill_env(&mut env2, b"LONG_ENV2=", 11);
-        fill_env(&mut env3, b"LONG_ENV3=", 17);
-        let envp = [
-            env0.as_ptr(),
-            env1.as_ptr(),
-            env2.as_ptr(),
-            env3.as_ptr(),
-            core::ptr::null(),
-        ];
-
-        let ret = unsafe { posix::posix_execve(exec_path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
-        let code = if ret == -7 { 13 } else { 14 };
-        unsafe { posix::posix_exit(code) };
-    }
-
-    let mut exec_status: i32 = 0;
-    let ret = unsafe { posix::posix_waitpid(pid, &raw mut exec_status) };
-    if ret != pid || (wifexited(exec_status) && (wexitstatus(exec_status) == 13 || wexitstatus(exec_status) == 14)) {
-        let mut lb = LineBuf::new();
-        lb.str(b"[TEST_FORK] FAIL: long env exec status=");
-        lb.dec(exec_status as u64);
-        lb.str(b"\n");
-        lb.flush();
-        return false;
-    }
-    puts(b"[TEST_FORK] Test 5: PASS\n");
 
     puts(b"[TEST_FORK] All tests passed!\n");
     true

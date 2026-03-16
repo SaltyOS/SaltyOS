@@ -1,8 +1,0 @@
-[Service]
-Name=hello
-Binary=hello
-Type=simple
-Restart=no
-
-[Dependencies]
-After=console procmgr vfs saltyfs

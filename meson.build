@@ -363,7 +363,6 @@ if build_userland and mkcpio.found()
   svc_display = files('userland/services/display.service')
   svc_ttyd = files('userland/services/ttyd.service')
   svc_test_runner = files('userland/services/test_runner.service')
-  svc_hello = files('userland/services/hello.service')
   svc_getty = files('userland/services/getty.service')
   svc_pcisrv = files('userland/services/pcisrv.service')
   svc_blkdrv = files('userland/services/blkdrv.service')
@@ -383,7 +382,7 @@ if build_userland and mkcpio.found()
             initrd_pcisrv_elf, initrd_blkdrv_elf, initrd_saltyfs_elf,
             svc_console, svc_nameserv, svc_mmsrv,
             svc_vfs, svc_procmgr, svc_display,
-            svc_ttyd, svc_test_runner, svc_hello, svc_getty,
+            svc_ttyd, svc_test_runner, svc_getty,
             svc_pcisrv, svc_blkdrv, svc_saltyfs, svc_netdrv, svc_netsrv,
             svc_dnssrv],
     depend_files: mkcpio_script,
@@ -415,14 +414,13 @@ if build_userland and mkcpio.found()
       'services/display.service=@INPUT18@',
       'services/ttyd.service=@INPUT19@',
       'services/test_runner.service=@INPUT20@',
-      'services/hello.service=@INPUT21@',
-      'services/getty.service=@INPUT22@',
-      'services/pcisrv.service=@INPUT23@',
-      'services/blkdrv.service=@INPUT24@',
-      'services/saltyfs.service=@INPUT25@',
-      'services/netdrv.service=@INPUT26@',
-      'services/netsrv.service=@INPUT27@',
-      'services/dnssrv.service=@INPUT28@',
+      'services/getty.service=@INPUT21@',
+      'services/pcisrv.service=@INPUT22@',
+      'services/blkdrv.service=@INPUT23@',
+      'services/saltyfs.service=@INPUT24@',
+      'services/netdrv.service=@INPUT25@',
+      'services/netsrv.service=@INPUT26@',
+      'services/dnssrv.service=@INPUT27@',
     ],
     build_by_default: true,
   )

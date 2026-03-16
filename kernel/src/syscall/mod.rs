@@ -3063,6 +3063,9 @@ fn syscall_irq_control_get(
         };
 
         // Prepend to handler chain (shared IRQs: multiple handlers per IRQ)
+        // Dynamic IRQ handlers are created for PCI devices which use
+        // level-triggered, active-low interrupts per the PCI specification.
+        (*ptr).level_triggered = true;
         crate::ipc::irq::register_handler(irq_num as usize, ptr);
 
         SCHED_IPC_LOCK.unlock();
@@ -3070,8 +3073,8 @@ fn syscall_irq_control_get(
         ptr
     };
 
-    // Dynamically unmask the IOAPIC redirection entry for this IRQ
-    crate::arch::ioapic_unmask(irq_num as u32);
+    // Dynamically unmask the IOAPIC entry — PCI IRQs are level-triggered, active-low
+    crate::arch::ioapic_unmask_level(irq_num as u32);
 
     // Allocate a cap slot and set it up
     let slot = match crate::cap::alloc_slot() {
@@ -3139,8 +3142,18 @@ fn syscall_irq_handler_ack(cap: &Capability) -> SyscallResult {
         SCHED_IPC_LOCK.lock();
         let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
         irq_handler.acknowledged = true;
+        // Re-enable delivery at IOAPIC. dispatch_irq() masks the IRQ when
+        // no handler is ready to accept delivery; unmask it now that this
+        // handler has acknowledged and is ready for the next interrupt.
+        let irq_num = irq_handler.irq_num;
+        let level = irq_handler.level_triggered;
         SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
+        if level {
+            crate::arch::ioapic_unmask_level(irq_num);
+        } else {
+            crate::arch::ioapic_unmask(irq_num);
+        }
     }
 
     SyscallResult::ok(0)

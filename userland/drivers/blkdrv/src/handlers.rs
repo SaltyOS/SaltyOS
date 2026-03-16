@@ -121,6 +121,11 @@ pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
             }
         }
 
+        // Clear device ISR to deassert the shared IRQ line.
+        // Without this, the virtio-blk device keeps IRQ 11 asserted,
+        // interfering with other devices sharing the same IRQ (e.g. virtio-net).
+        let _ = bar_read8(VIRTIO_ISR_STATUS);
+
         // Check status
         let status = *(&raw const REQ_STATUS);
         if status != 0 {
@@ -244,6 +249,9 @@ pub(crate) fn handle_write(msg: &BesaltMsg) -> BesaltMsg {
                 return reply;
             }
         }
+
+        // Clear device ISR to deassert the shared IRQ line.
+        let _ = bar_read8(VIRTIO_ISR_STATUS);
 
         // Check status
         let status = *(&raw const REQ_STATUS);

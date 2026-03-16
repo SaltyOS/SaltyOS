@@ -391,6 +391,32 @@ pub(crate) unsafe fn handle_resume(msg: &BesaltMsg, reply: &mut BesaltMsg) {
 
         proctab(idx).state = PROC_RUNNING;
         proctab(idx).stop_status = 0;
+
+        if proctab(idx).wait_ready_on_resume {
+            let mut name_len = 0usize;
+            while name_len < proctab(idx).name.len() && proctab(idx).name[name_len] != 0 {
+                name_len += 1;
+            }
+
+            if super::wait_for_child_ready(
+                proctab(idx).tcb_cap,
+                proctab(idx).ready_ntfn,
+                &proctab(idx).name[..name_len],
+                proctab(idx).ready_timeout_ns,
+            ) != 0
+            {
+                let pid = proctab(idx).pid;
+                super::spawn_tx::deregister_from_mmsrv(pid);
+                free_proc_alloc_slots(idx);
+                cleanup_proc_resources(idx, super::CAP_SELF_CSPACE);
+                reply.label = besalt::BESALT_BUSY;
+                return;
+            }
+
+            proctab(idx).wait_ready_on_resume = false;
+            proctab(idx).ready_timeout_ns = 0;
+        }
+
         reply.label = super::BESALT_OK;
         reply.length = 0;
     }
