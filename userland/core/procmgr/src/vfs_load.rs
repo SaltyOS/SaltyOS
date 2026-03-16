@@ -811,6 +811,21 @@ unsafe fn inspect_streamed_vfs_elf(fd: i32, file_size: usize) -> Option<VfsStrea
             return None;
         }
 
+        // Compute phdr runtime VA: find the PT_LOAD that covers e_phoff
+        // and translate file offset → virtual address via that segment.
+        let mut phdr_runtime_vaddr = ehdr.e_phoff; // fallback for PIE compat
+        for i in 0..phnum {
+            if let Some(phdr) = stream_phdr_from_bytes(phdr_bytes, i, phentsz) {
+                if phdr.p_type == PT_LOAD
+                    && ehdr.e_phoff >= phdr.p_offset
+                    && ehdr.e_phoff < phdr.p_offset + phdr.p_filesz
+                {
+                    phdr_runtime_vaddr = phdr.p_vaddr + (ehdr.e_phoff - phdr.p_offset);
+                    break;
+                }
+            }
+        }
+
         let mut needed = besalt::elf_dynamic::NeededLibs::new();
         let mut rela_data: *const u8 = core::ptr::null();
         let mut rela_len = 0usize;
@@ -912,7 +927,7 @@ unsafe fn inspect_streamed_vfs_elf(fd: i32, file_size: usize) -> Option<VfsStrea
             needed,
             interp_name,
             interp_name_len,
-            phdr_vaddr: ehdr.e_phoff,
+            phdr_vaddr: phdr_runtime_vaddr,
             phent: ehdr.e_phentsize as u64,
             phnum: ehdr.e_phnum as u64,
             rela_data,
