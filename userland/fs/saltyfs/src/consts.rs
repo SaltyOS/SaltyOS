@@ -41,7 +41,7 @@ pub(crate) const EXTENT_REGULAR: u8 = 1;
 
 /// VFS-SaltyFS shared memory for bulk data transport
 pub(crate) const VFS_SHM_VADDR: u64 = 0x0000_0000_5200_0000;
-pub(crate) const VFS_SHM_PAGES: u64 = 64; // 256KB
+pub(crate) const VFS_SHM_PAGES: u64 = 256; // 1MB
 
 /// Bitmap block allocator
 pub(crate) const BITMAP_CACHE_SLOTS: usize = 4;
