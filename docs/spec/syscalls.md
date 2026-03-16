@@ -1195,7 +1195,7 @@ Offset  Size   Field
 0x0D8   8      receive_cnode — CNode cap for receiving caps
 0x0E0   8      receive_index — Starting slot index in receive CNode
 0x0E8   8      receive_depth — CNode depth for cap lookup
-0x0F0   3824   reserved[478] — Reserved for future use
+0x0F0   3824   reserved[478] — Extended payload area for slowpath IPC/invoke helpers
 ──────  ─────  ─────────────────
 Total:  4096   (one 4KB page)
 ```
