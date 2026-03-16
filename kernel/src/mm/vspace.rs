@@ -1401,6 +1401,66 @@ impl VSpace {
         result
     }
 
+    /// Change the protection flags on a contiguous range of already-mapped pages.
+    ///
+    /// Acquires the VSpace lock once for the entire range. Issues `invlpg` per
+    /// page inside the lock, then performs a single TLB shootdown at the end.
+    /// Pages that are not mapped (or not yet present) are silently skipped.
+    ///
+    /// Returns the number of pages whose flags were successfully updated.
+    pub fn protect_range(
+        &mut self,
+        virt: VirtAddr,
+        count: usize,
+        flags: PageFlags,
+    ) -> Result<usize, VSpaceError> {
+        if virt & (PAGE_SIZE as u64 - 1) != 0 {
+            return Err(VSpaceError::Alignment);
+        }
+
+        let irq = unsafe { save_irq_disable() };
+        self.lock.lock();
+
+        let mut protected = 0usize;
+        for i in 0..count {
+            let addr = virt + (i as u64) * PAGE_SIZE as u64;
+            let entry = match self.read_entry(addr, 1) {
+                Some(e) => e,
+                None => continue,
+            };
+
+            if entry & ENTRY_PRESENT == 0 && entry & ENTRY_DEMAND != 0 {
+                let entry_flags = Self::flags_to_entry_flags(flags);
+                let new_demand = (entry_flags & !ENTRY_PRESENT) | ENTRY_DEMAND;
+                if self.write_entry(addr, 1, new_demand).is_ok() {
+                    protected += 1;
+                }
+                continue;
+            }
+
+            if entry & ENTRY_PRESENT == 0 {
+                continue;
+            }
+
+            let phys = entry & ENTRY_ADDR_MASK;
+            let new_entry = phys | Self::flags_to_entry_flags(flags);
+            if self.write_entry(addr, 1, new_entry).is_ok() {
+                crate::arch::x86_64::paging::invlpg(addr);
+                protected += 1;
+            }
+        }
+
+        // Single TLB shootdown for the entire range after all PTEs are updated.
+        if protected > 0 {
+            self.tlb_shootdown(virt);
+        }
+
+        self.lock.unlock();
+        unsafe { restore_irq(irq) };
+
+        Ok(protected)
+    }
+
     /// Clone one source page into destination VSpace using COW semantics.
     ///
     /// - Read-only pages are shared directly.
@@ -1980,7 +2040,15 @@ impl VSpace {
             }
 
             // Allocate a zero-fill frame
-            let new_phys = alloc_frame().ok_or(VSpaceError::OutOfMemory)?;
+            let new_phys = match alloc_frame() {
+                Some(p) => p,
+                None => {
+                    crate::serial_puts_raw("[MM] demand fault OOM at vaddr=0x");
+                    crate::serial_hex_raw(page_vaddr);
+                    crate::serial_puts_raw("\n");
+                    return Err(VSpaceError::OutOfMemory);
+                }
+            };
             // SAFETY: phys_to_virt returns kernel-mapped address for the frame
             unsafe {
                 core::ptr::write_bytes(phys_to_virt(new_phys) as *mut u8, 0, PAGE_SIZE);

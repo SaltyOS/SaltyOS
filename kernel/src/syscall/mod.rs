@@ -1369,6 +1369,10 @@ fn syscall_invoke_inner(
             // VSPACE_REPLENISH_COW_POOL: arg0 = src_cnode_cap_ptr, arg1 = start_slot, arg2 = count
             syscall_vspace_replenish_cow_pool(&cap, arg0, arg1, arg2)
         }
+        (ObjectType::VSpace, 0x5F) => {
+            // VSPACE_PROTECT_RANGE: arg0 = virt_addr, arg1 = count, arg2 = flags_bits
+            syscall_vspace_protect_range(&cap, arg0, arg1, arg2)
+        }
 
         // SchedContext operations
         (ObjectType::SchedContext, 0x30) => {
@@ -2607,6 +2611,47 @@ fn syscall_vspace_protect(cap: &Capability, virt_addr: u64, flags_bits: u64) -> 
 
         match vspace.protect(virt_addr, flags) {
             Ok(()) => SyscallResult::ok(0),
+            Err(e) => SyscallResult::err(syscall_error_from_vspace_error(e)),
+        }
+    }
+}
+
+/// VSPACE_PROTECT_RANGE: Change protection flags on a contiguous range of pages.
+///
+/// Args:
+/// - virt_addr: Start virtual address (page-aligned)
+/// - count: Number of pages
+/// - flags_bits: New mapping flags (bit 0=writable, bit 1=user, bit 2=executable)
+///
+/// Returns number of pages successfully updated in value field.
+fn syscall_vspace_protect_range(
+    cap: &Capability,
+    virt_addr: u64,
+    count: u64,
+    flags_bits: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::MAP) {
+        return SyscallResult::err(e);
+    }
+
+    // W^X: writable + executable is not permitted
+    if (flags_bits & 1 != 0) && (flags_bits & 4 != 0) {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    unsafe {
+        let vspace = &mut *(cap.object as *mut VSpace);
+        let flags = PageFlags {
+            writable: flags_bits & 1 != 0,
+            user: flags_bits & 2 != 0,
+            executable: flags_bits & 4 != 0,
+            cache_disable: flags_bits & 8 != 0,
+            write_through: flags_bits & 16 != 0,
+            cow: flags_bits & 32 != 0,
+        };
+
+        match vspace.protect_range(virt_addr, count as usize, flags) {
+            Ok(protected) => SyscallResult::ok(protected as u64),
             Err(e) => SyscallResult::err(syscall_error_from_vspace_error(e)),
         }
     }
