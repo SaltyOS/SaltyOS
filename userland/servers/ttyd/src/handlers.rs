@@ -223,44 +223,13 @@ pub unsafe fn handle_pty_ioctl(msg: &BesaltMsg, reply: &mut BesaltMsg) {
 
         match cmd {
             TIOCGPGRP => {
-                // Clear stale fg_pgid from dead unowned sessions.
-                // When has_ctty is false, fg_pgid may linger from a previous
-                // auto-populate. Validate that the backing process is alive.
-                if !pty.has_ctty && pty.ctty_owner_badge == 0 && pty.fg_pgid != 0 {
-                    if procmgr_get_pgid_by_badge(pty.fg_pgid as u64).is_none() {
-                        pty.fg_pgid = 0;
-                    }
-                }
-
-                // If ctty owner is dead, reset ownership state
-                if pty.has_ctty && pty.ctty_owner_badge != 0
-                    && pty.ctty_owner_badge != caller_badge
-                {
-                    if !procmgr_get_pgid_by_badge(pty.ctty_owner_badge).is_some() {
-                        pty.has_ctty = false;
-                        pty.ctty_owner_badge = 0;
-                        pty.fg_pgid = 0;
-                    }
-                }
-
-                // Correct fg_pgid if caller owns ctty but pgid drifted
-                if pty.has_ctty && pty.ctty_owner_badge == caller_badge && pty.fg_pgid != 0 {
-                    if let Some(pgid) = procmgr_get_pgid_by_badge(caller_badge) {
-                        if pgid != 0 && pty.fg_pgid != pgid {
-                            pty.fg_pgid = pgid;
-                        }
-                    }
-                }
-
-                // Auto-populate fg_pgid from caller when unset
-                if pty.fg_pgid == 0 {
-                    if let Some(pgid) = procmgr_get_pgid_by_badge(caller_badge) {
-                        if pgid != 0 {
-                            pty.fg_pgid = pgid;
-                        }
-                    }
-                }
-
+                // Return cached fg_pgid directly. Do NOT call procmgr here —
+                // VFS→ttyd→procmgr creates a deadlock cycle when procmgr is
+                // blocked on VFS (e.g., during exec binary loading).
+                //
+                // Stale pgid cleanup is handled by:
+                // - TIOCSCTTY: resets dead owner on session takeover
+                // - TIOCSPGRP: caller sets fg_pgid authoritatively
                 reply.label = BESALT_OK;
                 reply.length = 1;
                 reply.regs[0] = pty.fg_pgid as u64;
