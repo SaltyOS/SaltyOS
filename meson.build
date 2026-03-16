@@ -199,7 +199,7 @@ if build_userland
   sysroot_target = custom_target('sysroot',
     output: 'sysroot.stamp',
     depends: [core, compiler_builtins, libbesalt_so, libc_so, crt_start_obj, ld_besalt_so],
-    depend_files: besaltc_header_files + [files('userland/tests/hello/link.ld')],
+    depend_files: besaltc_header_files + [files('lib/besalt/saltyos-pie.ld')],
     command: [
       mksysroot_prog,
       '--build-dir', meson.project_build_root(),
@@ -302,12 +302,6 @@ if build_userland and mkcpio.found()
   stripped_test_runner_elf = custom_target('stripped_test_runner_elf',
     input: test_runner_elf,
     output: 'test_runner.stripped.elf',
-    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
-    build_by_default: true,
-  )
-  stripped_hello_elf = custom_target('stripped_hello_elf',
-    input: hello_elf,
-    output: 'hello.stripped.elf',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
@@ -483,7 +477,7 @@ if mkrootfs.found() and build_userland
 
   rootfs_image = custom_target('rootfs_image',
     input: [stripped_display_elf, stripped_ttyd_elf, stripped_getty_elf,
-            stripped_test_runner_elf, stripped_hello_elf,
+            stripped_test_runner_elf,
             stripped_netdrv_elf, stripped_netsrv_elf, stripped_dnssrv_elf],
     depends: [rootfs_ports_manifest],
     depend_files: [mkrootfs_script, mksaltyfs_script, rootfs_manifest, rootfs_packages],

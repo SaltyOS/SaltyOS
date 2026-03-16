@@ -267,7 +267,7 @@ mksaltyfs:
 # Run this once after a cross LLVM build, before `just build`.
 strip-llvm:
     #!/usr/bin/env bash
-    set -e
+    set -euo pipefail
     STRIP=build-toolchain/prefix/bin/llvm-strip
     SRC=build-toolchain/llvm-saltyos/bin
     DST=build-toolchain/llvm-saltyos-stripped
@@ -278,6 +278,32 @@ strip-llvm:
         "$STRIP" "$DST/bin/$f"
     done
     cp build/lib/besalt/cpp/libc++.so "$DST/lib/libc++.so"
+    # Clang resource directory and SaltyOS compiler-rt builtins
+    echo "Copying clang resource directory..."
+    rm -rf "$DST/lib/clang"
+    cp -r build-toolchain/llvm-saltyos/lib/clang "$DST/lib/clang"
+    RT_DIR="$(find build-toolchain/llvm/lib/clang -type d -path '*/lib/x86_64-unknown-saltyos' -print -quit)"
+    if [ -z "$RT_DIR" ]; then
+        echo "Missing SaltyOS compiler-rt runtime directory in build-toolchain/llvm/lib/clang" >&2
+        exit 1
+    fi
+    RT_REL="${RT_DIR#build-toolchain/llvm/lib/clang/}"
+    rm -rf "$DST/lib/clang/$RT_REL"
+    mkdir -p "$(dirname "$DST/lib/clang/$RT_REL")"
+    cp -r "$RT_DIR" "$(dirname "$DST/lib/clang/$RT_REL")"
+    # CRT objects and linker script
+    echo "Copying development files..."
+    cp build/lib/besalt/c/crt_start.o "$DST/lib/crt_start.o"
+    cp build/rust/core.o "$DST/lib/core.o"
+    cp build/rust/compiler_builtins.o "$DST/lib/compiler_builtins.o"
+    cp lib/besalt/saltyos-pie.ld "$DST/lib/saltyos-pie.ld"
+    # Link-time libraries
+    cp build/lib/besalt/c/libc.so "$DST/lib/libc.so"
+    cp build/lib/besalt/lib/libbesalt.so "$DST/lib/libbesalt.so"
+    # Stub archives (-lm, -lpthread, etc.)
+    for stub in libm.a libpthread.a librt.a libdl.a libutil.a; do
+        printf '!<arch>\n' > "$DST/lib/$stub"
+    done
     echo "Done. Stripped sizes:"
     du -sh "$DST/bin/"* "$DST/lib/"*
 

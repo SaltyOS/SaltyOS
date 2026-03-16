@@ -27,3 +27,26 @@
 
 # C++ runtime shared library (needed by all LLVM binaries at runtime)
 /lib/libc++.so=build-toolchain/llvm-saltyos-stripped/lib/libc++.so
+
+# System C headers
+/usr/include/=lib/besalt/c/include/
+
+# Clang resource headers (stddef.h, stdarg.h, etc.)
+/usr/lib/clang/=build-toolchain/llvm-saltyos-stripped/lib/clang/
+
+# CRT and linker support
+/usr/lib/crt_start.o=build-toolchain/llvm-saltyos-stripped/lib/crt_start.o
+/usr/lib/core.o=build-toolchain/llvm-saltyos-stripped/lib/core.o
+/usr/lib/compiler_builtins.o=build-toolchain/llvm-saltyos-stripped/lib/compiler_builtins.o
+/usr/lib/saltyos-pie.ld=build-toolchain/llvm-saltyos-stripped/lib/saltyos-pie.ld
+
+# Link-time libraries
+/usr/lib/libc.so=build-toolchain/llvm-saltyos-stripped/lib/libc.so
+/usr/lib/libbesalt.so=build-toolchain/llvm-saltyos-stripped/lib/libbesalt.so
+
+# Stub archives
+/usr/lib/libm.a=build-toolchain/llvm-saltyos-stripped/lib/libm.a
+/usr/lib/libpthread.a=build-toolchain/llvm-saltyos-stripped/lib/libpthread.a
+/usr/lib/librt.a=build-toolchain/llvm-saltyos-stripped/lib/librt.a
+/usr/lib/libdl.a=build-toolchain/llvm-saltyos-stripped/lib/libdl.a
+/usr/lib/libutil.a=build-toolchain/llvm-saltyos-stripped/lib/libutil.a
