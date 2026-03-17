@@ -129,6 +129,8 @@ pub struct Tcb {
     pub last_cpu: u32,
     /// Whether this thread is currently in the ready queue (O(1) membership test)
     pub ready_queued: bool,
+    /// Which CPU's ready queue this thread is in (valid when ready_queued == true)
+    pub queued_cpu: u32,
     /// Next thread in queue
     pub next: *mut Tcb,
     /// Why this thread is blocked (valid when state == Blocked/Waiting)
@@ -283,6 +285,7 @@ impl Tcb {
             cpu_affinity: 0xFFFF_FFFF,
             last_cpu: 0xFFFF_FFFF,
             ready_queued: false,
+            queued_cpu: 0xFFFF_FFFF,
             next: core::ptr::null_mut(),
             blocked_reason: None,
             saved_caller_badge: 0,
@@ -323,6 +326,7 @@ impl Tcb {
             (*ptr).state = ThreadState::Inactive;
             (*ptr).cpu_affinity = 0xFFFF_FFFF;
             (*ptr).last_cpu = 0xFFFF_FFFF;
+            (*ptr).queued_cpu = 0xFFFF_FFFF;
         }
     }
 
@@ -335,6 +339,7 @@ impl Tcb {
     pub fn cleanup(&mut self) {
         self.state = ThreadState::Inactive;
         self.ready_queued = false;
+        self.queued_cpu = 0xFFFF_FFFF;
         self.blocked_reason = None;
         self.blocked_endpoint = core::ptr::null_mut();
         self.blocked_notification = core::ptr::null_mut();

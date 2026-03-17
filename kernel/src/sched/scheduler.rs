@@ -49,8 +49,8 @@ fn is_bootstrap_tcb(tcb: *mut Tcb) -> bool {
 
 /// EDF Scheduler
 pub struct Scheduler {
-    /// Ready queue head (sorted by deadline)
-    ready_head: *mut Tcb,
+    /// Per-CPU ready queue heads (each sorted by deadline)
+    ready_heads: [*mut Tcb; MAX_CPUS],
     /// Per-CPU currently running thread
     current: [*mut Tcb; MAX_CPUS],
     /// Per-CPU idle thread
@@ -80,7 +80,7 @@ pub struct Scheduler {
 impl Scheduler {
     pub const fn new() -> Self {
         Self {
-            ready_head: core::ptr::null_mut(),
+            ready_heads: [core::ptr::null_mut(); MAX_CPUS],
             current: [core::ptr::null_mut(); MAX_CPUS],
             idle: [core::ptr::null_mut(); MAX_CPUS],
             pending_enqueue: [core::ptr::null_mut(); MAX_CPUS],
@@ -147,10 +147,66 @@ impl Scheduler {
     }
 
     // ---------------------------------------------------------------
+    // Per-CPU queue helpers (caller must hold lock + IRQs disabled)
+    // ---------------------------------------------------------------
+
+    /// Select which CPU's ready queue a thread should be enqueued on.
+    ///
+    /// - Specific affinity: always that CPU
+    /// - Any-affinity: prefer last_cpu (cache affinity), fallback to current CPU
+    ///
+    /// Caller MUST hold the scheduler lock.
+    fn select_target_cpu(&self, tcb: *mut Tcb) -> usize {
+        unsafe {
+            let affinity = (*tcb).cpu_affinity;
+            if affinity != 0xFFFF_FFFF {
+                return affinity as usize;
+            }
+            let last = (*tcb).last_cpu as usize;
+            if last < self.online_cpus as usize {
+                return last;
+            }
+            crate::arch::current_cpu() as usize
+        }
+    }
+
+    /// Insert a thread into a specific CPU's ready queue, sorted by deadline.
+    ///
+    /// Sets `ready_queued` and `queued_cpu` on the TCB.
+    /// Does NOT send IPIs — caller handles that.
+    ///
+    /// Caller MUST hold the scheduler lock.
+    unsafe fn insert_sorted(&mut self, cpu: usize, tcb: *mut Tcb) {
+        unsafe {
+            (*tcb).ready_queued = true;
+            (*tcb).queued_cpu = cpu as u32;
+
+            if self.ready_heads[cpu].is_null()
+                || (*tcb).priority < (*self.ready_heads[cpu]).priority
+            {
+                (*tcb).next = self.ready_heads[cpu];
+                self.ready_heads[cpu] = tcb;
+            } else {
+                let mut current = self.ready_heads[cpu];
+                while !(*current).next.is_null()
+                    && (*(*current).next).priority <= (*tcb).priority
+                {
+                    current = (*current).next;
+                }
+                (*tcb).next = (*current).next;
+                (*current).next = tcb;
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Unlocked queue operations (caller must hold lock + IRQs disabled)
     // ---------------------------------------------------------------
 
     /// Add thread to ready queue (sorted by deadline) — unlocked variant.
+    ///
+    /// Routes the thread to the appropriate per-CPU queue based on affinity
+    /// and cache affinity hints.
     ///
     /// Caller MUST hold the scheduler lock.
     pub fn enqueue_unlocked(&mut self, tcb: *mut Tcb) {
@@ -185,55 +241,24 @@ impl Scheduler {
             }
 
             (*tcb).state = ThreadState::Ready;
-            (*tcb).ready_queued = true;
 
-            // Insert sorted by deadline (priority field stores deadline)
-            if self.ready_head.is_null() || (*tcb).priority < (*self.ready_head).priority {
-                (*tcb).next = self.ready_head;
-                self.ready_head = tcb;
-            } else {
-                let mut current = self.ready_head;
-                while !(*current).next.is_null() && (*(*current).next).priority <= (*tcb).priority {
-                    current = (*current).next;
-                }
-                (*tcb).next = (*current).next;
-                (*current).next = tcb;
-            }
+            // Route to the appropriate per-CPU queue
+            let target = self.select_target_cpu(tcb);
+            self.insert_sorted(target, tcb);
 
-            // Wake an idle CPU so it can pick up this thread.
+            // Wake the target CPU if it is idle and different from ours.
             // Skip IPI if the current CPU is idle — it will pick up the
             // thread in its own scheduling decision without cross-CPU overhead.
-            let affinity = (*tcb).cpu_affinity;
             let this_cpu = crate::arch::current_cpu() as usize;
-            let this_cpu_idle = !self.idle[this_cpu].is_null()
-                && self.current[this_cpu] == self.idle[this_cpu];
-
-            if !this_cpu_idle {
-                let online = self.online_cpus as usize;
-                if affinity != 0xFFFF_FFFF {
-                    // Specific affinity: IPI target if idle
-                    let target = affinity as usize;
-                    if target != this_cpu
-                        && target < online
-                        && !self.idle[target].is_null()
-                        && self.current[target] == self.idle[target]
-                    {
-                        crate::arch::send_ipi(
-                            target,
-                            crate::arch::IpiKind::Reschedule,
-                        );
-                    }
-                } else {
-                    // Any-CPU affinity: IPI one idle CPU so it picks up the thread
-                    for cpu in 0..online {
-                        if cpu != this_cpu
-                            && !self.idle[cpu].is_null()
-                            && self.current[cpu] == self.idle[cpu]
-                        {
-                            crate::arch::send_ipi(cpu, crate::arch::IpiKind::Reschedule);
-                            break;
-                        }
-                    }
+            if target != this_cpu
+                && target < self.online_cpus as usize
+                && !self.idle[target].is_null()
+                && self.current[target] == self.idle[target]
+            {
+                let this_cpu_idle = !self.idle[this_cpu].is_null()
+                    && self.current[this_cpu] == self.idle[this_cpu];
+                if !this_cpu_idle {
+                    crate::arch::send_ipi(target, crate::arch::IpiKind::Reschedule);
                 }
             }
         }
@@ -243,43 +268,27 @@ impl Scheduler {
     ///
     /// Caller MUST hold the scheduler lock.
     pub fn dequeue_unlocked(&mut self) -> Option<*mut Tcb> {
-        if self.ready_head.is_null() {
-            None
-        } else {
-            unsafe {
-                let tcb = self.ready_head;
-                self.ready_head = (*tcb).next;
-                (*tcb).next = core::ptr::null_mut();
-                (*tcb).ready_queued = false;
-                Some(tcb)
-            }
-        }
+        let cpu_id = crate::arch::current_cpu() as usize;
+        self.dequeue_for_cpu_unlocked(cpu_id)
     }
 
     /// Remove highest priority thread for a CPU — unlocked variant.
     ///
     /// Caller MUST hold the scheduler lock.
     pub fn dequeue_for_cpu_unlocked(&mut self, cpu_id: usize) -> Option<*mut Tcb> {
+        // O(1): simply pop the head of this CPU's queue.
+        // All threads in ready_heads[cpu] are compatible with cpu
+        // (either any-affinity or pinned to this CPU).
+        let head = self.ready_heads[cpu_id];
+        if head.is_null() {
+            return None;
+        }
         unsafe {
-            let mut prev: *mut Tcb = core::ptr::null_mut();
-            let mut current = self.ready_head;
-
-            while !current.is_null() {
-                let affinity = (*current).cpu_affinity;
-                if affinity == 0xFFFF_FFFF || affinity as usize == cpu_id {
-                    if prev.is_null() {
-                        self.ready_head = (*current).next;
-                    } else {
-                        (*prev).next = (*current).next;
-                    }
-                    (*current).next = core::ptr::null_mut();
-                    (*current).ready_queued = false;
-                    return Some(current);
-                }
-                prev = current;
-                current = (*current).next;
-            }
-            None
+            self.ready_heads[cpu_id] = (*head).next;
+            (*head).next = core::ptr::null_mut();
+            (*head).ready_queued = false;
+            (*head).queued_cpu = 0xFFFF_FFFF;
+            Some(head)
         }
     }
 
@@ -288,17 +297,26 @@ impl Scheduler {
     /// Caller MUST hold the scheduler lock.
     pub fn remove_from_ready_queue_unlocked(&mut self, tcb: *mut Tcb) -> bool {
         unsafe {
+            if !(*tcb).ready_queued {
+                return false;
+            }
+            let cpu = (*tcb).queued_cpu as usize;
+            if cpu >= MAX_CPUS {
+                return false;
+            }
+
             let mut prev: *mut Tcb = core::ptr::null_mut();
-            let mut current = self.ready_head;
+            let mut current = self.ready_heads[cpu];
             while !current.is_null() {
                 if current == tcb {
                     if prev.is_null() {
-                        self.ready_head = (*current).next;
+                        self.ready_heads[cpu] = (*current).next;
                     } else {
                         (*prev).next = (*current).next;
                     }
                     (*current).next = core::ptr::null_mut();
                     (*tcb).ready_queued = false;
+                    (*tcb).queued_cpu = 0xFFFF_FFFF;
                     return true;
                 }
                 prev = current;
@@ -371,6 +389,8 @@ impl Scheduler {
     /// Caller MUST hold the scheduler lock.
     fn schedule_unlocked(&mut self) -> *mut Tcb {
         let cpu_id = crate::arch::current_cpu() as usize;
+
+        // Try local queue first (O(1) pop — all threads are compatible)
         while let Some(tcb) = self.dequeue_for_cpu_unlocked(cpu_id) {
             unsafe {
                 if (*tcb).state != ThreadState::Ready
@@ -387,8 +407,64 @@ impl Scheduler {
             return tcb;
         }
 
-        // Return idle thread for this CPU
+        // Local queue empty — try work stealing from other CPUs.
+        // Only steal any-affinity threads (specific-affinity threads
+        // must remain on their pinned CPU's queue).
+        let online = self.online_cpus as usize;
+        for victim in 0..online {
+            if victim == cpu_id {
+                continue;
+            }
+            if let Some(tcb) = self.steal_from(victim) {
+                unsafe {
+                    (*tcb).state = ThreadState::Running;
+                    (*tcb).last_cpu = cpu_id as u32;
+                }
+                self.current[cpu_id] = tcb;
+                CURRENT_ON_CPU[cpu_id].store(tcb as usize, core::sync::atomic::Ordering::Release);
+                return tcb;
+            }
+        }
+
+        // No work anywhere — idle
         self.idle[cpu_id]
+    }
+
+    /// Steal one any-affinity thread from another CPU's ready queue.
+    ///
+    /// Scans the victim's queue for the first any-affinity thread that
+    /// is valid to schedule. Returns None if no stealable thread found.
+    ///
+    /// Caller MUST hold the scheduler lock.
+    fn steal_from(&mut self, victim: usize) -> Option<*mut Tcb> {
+        unsafe {
+            let mut prev: *mut Tcb = core::ptr::null_mut();
+            let mut current = self.ready_heads[victim];
+
+            while !current.is_null() {
+                let affinity = (*current).cpu_affinity;
+                // Only steal any-affinity threads
+                if affinity == 0xFFFF_FFFF
+                    && (*current).state == ThreadState::Ready
+                    && self.find_running_cpu(current).is_none()
+                    && !self.is_pending_on_any_cpu(current)
+                {
+                    // Remove from victim's queue
+                    if prev.is_null() {
+                        self.ready_heads[victim] = (*current).next;
+                    } else {
+                        (*prev).next = (*current).next;
+                    }
+                    (*current).next = core::ptr::null_mut();
+                    (*current).ready_queued = false;
+                    (*current).queued_cpu = 0xFFFF_FFFF;
+                    return Some(current);
+                }
+                prev = current;
+                current = (*current).next;
+            }
+            None
+        }
     }
 
     /// Current running thread (on calling CPU)
@@ -436,25 +512,18 @@ impl Scheduler {
         None
     }
 
-    /// Check if reschedule needed (preemption) on the calling CPU
+    /// Check if reschedule needed (preemption) on the calling CPU.
+    ///
+    /// O(1): the head of the local per-CPU queue is always the highest
+    /// priority compatible thread — just compare its deadline with current.
     pub fn needs_reschedule(&self) -> bool {
         let cpu_id = crate::arch::current_cpu() as usize;
         let current = self.current[cpu_id];
-        if self.ready_head.is_null() || current.is_null() {
+        let head = self.ready_heads[cpu_id];
+        if head.is_null() || current.is_null() {
             return false;
         }
-        unsafe {
-            // Walk the ready queue to find the first thread compatible with this CPU
-            let mut node = self.ready_head;
-            while !node.is_null() {
-                let affinity = (*node).cpu_affinity;
-                if affinity == 0xFFFF_FFFF || affinity as usize == cpu_id {
-                    return (*node).priority < (*current).priority;
-                }
-                node = (*node).next;
-            }
-            false
-        }
+        unsafe { (*head).priority < (*current).priority }
     }
 
     // ---------------------------------------------------------------
@@ -1133,39 +1202,30 @@ impl Scheduler {
         let this_cpu = crate::arch::current_cpu() as usize;
         let online = self.online_cpus as usize;
 
-        // Walk the ready queue: for each ready thread, check if any CPU
-        // is running a worse-priority (later deadline) thread that could
-        // be preempted.
-        unsafe {
-            let mut ready = self.ready_head;
-            while !ready.is_null() {
-                let ready_affinity = (*ready).cpu_affinity;
-                let ready_prio = (*ready).priority;
+        // O(online_cpus): for each remote CPU, check if its queue head
+        // can preempt the currently running thread on that CPU.
+        for cpu in 0..online {
+            if cpu == this_cpu {
+                continue; // this CPU handles its own preemption
+            }
 
-                for cpu in 0..online {
-                    if cpu == this_cpu {
-                        continue; // this CPU handles its own preemption
-                    }
-                    if ipi_mask & (1 << cpu) != 0 {
-                        continue; // already sending IPI to this CPU
-                    }
-                    // Check affinity compatibility
-                    if ready_affinity != 0xFFFF_FFFF && ready_affinity as usize != cpu {
-                        continue;
-                    }
-                    let running = self.current[cpu];
-                    if running.is_null() || running == self.idle[cpu] {
-                        // Idle CPU — it will pick up work from reschedule IPI
+            let head = self.ready_heads[cpu];
+            let running = self.current[cpu];
+
+            if running.is_null() || running == self.idle[cpu] {
+                // Idle CPU — if it has work queued, wake it
+                if !head.is_null() {
+                    ipi_mask |= 1 << cpu;
+                }
+                continue;
+            }
+
+            if !head.is_null() {
+                unsafe {
+                    if (*head).priority < (*running).priority {
                         ipi_mask |= 1 << cpu;
-                        break; // this ready thread will be picked up
-                    }
-                    if ready_prio < (*running).priority {
-                        // Ready thread has earlier deadline than running thread
-                        ipi_mask |= 1 << cpu;
-                        break;
                     }
                 }
-                ready = (*ready).next;
             }
         }
 
