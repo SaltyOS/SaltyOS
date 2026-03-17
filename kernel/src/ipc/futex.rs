@@ -144,11 +144,11 @@ fn futex_wait(addr: u64, expected: u32) -> SyscallResult {
             (*tail).futex_next = current;
         }
 
-        // Reschedule — releases SCHED_IPC_LOCK before switch, reacquires on resume
+        // Release SCHED_IPC_LOCK before reschedule (no lock held during switch)
+        SCHED_IPC_LOCK.unlock();
         scheduler().reschedule();
 
-        // After wakeup: SCHED_IPC_LOCK is held
-        SCHED_IPC_LOCK.unlock();
+        // After wakeup: no lock held
         restore_irq(irq);
 
         SyscallResult::ok(0)
@@ -220,12 +220,14 @@ fn futex_wait_timeout(addr: u64, expected: u32, timeout_ns: u64) -> SyscallResul
             (*tail).futex_next = current;
         }
 
+        // Release SCHED_IPC_LOCK before context switch (no lock during switch)
+        SCHED_IPC_LOCK.unlock();
+
         // Insert into sleep queue and context-switch (acquires scheduler lock internally)
         scheduler().block_current_futex_timed(wakeup_ns);
 
-        // After wakeup: SCHED_IPC_LOCK is held
+        // After wakeup: no global lock held
         let result = (*current).futex_wakeup_result;
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
 
         if result != 0 {

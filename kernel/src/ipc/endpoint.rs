@@ -2,7 +2,7 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use super::{block_current_thread, Message, WaitQueue};
+use super::{Message, WaitQueue};
 use crate::cap::{KernelObject, ObjectType};
 use crate::sched::thread::{BlockedReason, Tcb, ThreadState};
 
@@ -99,6 +99,11 @@ pub enum EndpointState {
 pub struct Endpoint {
     /// Kernel object header (must be first for refcount access)
     pub header: KernelObject,
+    /// Per-endpoint spinlock (Zircon-style per-object locking).
+    ///
+    /// Lock ordering: CAP_LOCK → endpoint.lock → sched.lock_cpu
+    /// Context switch and reschedule MUST happen OUTSIDE ep_lock.
+    lock: core::sync::atomic::AtomicU8,
     state: EndpointState,
     /// Queue of waiting senders
     send_queue: WaitQueue,
@@ -116,6 +121,7 @@ impl Endpoint {
     pub const fn new() -> Self {
         Self {
             header: KernelObject::new(ObjectType::Endpoint, 0),
+            lock: core::sync::atomic::AtomicU8::new(0),
             state: EndpointState::Idle,
             send_queue: WaitQueue::new(),
             recv_queue: WaitQueue::new(),
@@ -143,6 +149,33 @@ impl Endpoint {
     /// Get the current endpoint state
     pub fn state(&self) -> EndpointState {
         self.state
+    }
+
+    /// Acquire per-endpoint lock.
+    #[inline]
+    pub fn ep_lock(&self) {
+        use core::sync::atomic::Ordering;
+        if self.lock.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            return;
+        }
+        let mut backoff: u32 = 0;
+        loop {
+            for _ in 0..(1u32 << backoff.min(6)) {
+                core::hint::spin_loop();
+            }
+            if self.lock.load(Ordering::Relaxed) == 0
+                && self.lock.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
+            {
+                return;
+            }
+            if backoff < 6 { backoff += 1; }
+        }
+    }
+
+    /// Release per-endpoint lock.
+    #[inline]
+    pub fn ep_unlock(&self) {
+        self.lock.store(0, core::sync::atomic::Ordering::Release);
     }
 
     /// Push an async `NBSend` message into the endpoint-local ring buffer.
@@ -203,6 +236,7 @@ impl Endpoint {
     /// Send message (blocks until receiver ready)
     pub fn send(&mut self, msg: &Message, badge: u64) {
         unsafe {
+            self.ep_lock();
             let current = get_scheduler().current();
 
             match self.state {
@@ -216,40 +250,32 @@ impl Endpoint {
                             self.send_queue.push(current);
                             self.state = EndpointState::SendBlocked;
                             (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
-                            let reason = BlockedReason::SendBlocked { msg: *msg, badge };
-                            block_current_thread(current, reason);
+                            super::block_current_thread_no_switch(current, BlockedReason::SendBlocked { msg: *msg, badge });
+                            self.ep_unlock();
+                            get_scheduler().reschedule();
                             return;
                         }
                     };
 
-                    // Send/NBSend do NOT create a reply capability.
-                    // Only Call sets reply_tcb (see call() method).
-
-                    // Update endpoint state BEFORE transfer_message: cap transfer
-                    // may release SCHED_IPC_LOCK, so the endpoint must be consistent.
                     if self.recv_queue.is_empty() {
                         self.state = EndpointState::Idle;
                     }
 
-                    // If receiver was timed, remove from sleep queue
                     if matches!((*receiver).blocked_reason, Some(BlockedReason::RecvTimedBlocked)) {
                         crate::sched::sleep_queue::remove(receiver);
                         (*receiver).timer_wakeup_ns = 0;
                     }
 
-                    // Clear receiver's blocked markers BEFORE transfer_message:
-                    // transfer_message may release SCHED_IPC_LOCK for cap transfer,
-                    // during which notification.signal() could see stale RecvBlocked
-                    // state and double-enqueue the receiver.
                     (*receiver).blocked_reason = None;
                     (*receiver).blocked_endpoint = core::ptr::null_mut();
 
                     self.transfer_message(current, receiver, msg, badge);
 
-                    // Guard: if receiver was suspended during transfer_message's
-                    // SCHED_IPC_LOCK release window (cap transfer), don't resurrect.
                     if (*receiver).state != ThreadState::Inactive {
                         (*receiver).state = ThreadState::Ready;
+                    }
+                    self.ep_unlock();
+                    if (*receiver).state == ThreadState::Ready {
                         get_scheduler().enqueue(receiver);
                     }
                 }
@@ -258,9 +284,9 @@ impl Endpoint {
                     self.send_queue.push(current);
                     self.state = EndpointState::SendBlocked;
                     (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
-
-                    let reason = BlockedReason::SendBlocked { msg: *msg, badge };
-                    block_current_thread(current, reason);
+                    super::block_current_thread_no_switch(current, BlockedReason::SendBlocked { msg: *msg, badge });
+                    self.ep_unlock();
+                    get_scheduler().reschedule();
                 }
             }
         }
@@ -276,35 +302,36 @@ impl Endpoint {
     /// Returns `true` on success, `false` if message cannot be accepted.
     pub fn nbsend(&mut self, msg: &Message, badge: u64) -> bool {
         unsafe {
+            self.ep_lock();
             let current = get_scheduler().current();
 
-            match self.state {
+            let result = match self.state {
                 EndpointState::RecvBlocked => {
-                    // Receiver waiting: deliver immediately so caps (if any) can transfer.
                     if let Some(receiver) = self.recv_queue.pop() {
                         if self.recv_queue.is_empty() {
                             self.state = EndpointState::Idle;
                         }
 
-                        // If receiver was timed, remove from sleep queue
                         if matches!((*receiver).blocked_reason, Some(BlockedReason::RecvTimedBlocked)) {
                             crate::sched::sleep_queue::remove(receiver);
                             (*receiver).timer_wakeup_ns = 0;
                         }
 
-                        // Clear blocked markers before transfer_message (see send()).
                         (*receiver).blocked_reason = None;
                         (*receiver).blocked_endpoint = core::ptr::null_mut();
 
                         self.transfer_message(current, receiver, msg, badge);
 
-                        if (*receiver).state != ThreadState::Inactive {
+                        let wake = (*receiver).state != ThreadState::Inactive;
+                        if wake {
                             (*receiver).state = ThreadState::Ready;
+                        }
+                        self.ep_unlock();
+                        if wake {
                             get_scheduler().enqueue(receiver);
                         }
-                        true
+                        return true;
                     } else {
-                        // State inconsistency: recover and fall back to async queue.
                         self.state = EndpointState::Idle;
                         if msg.extra_caps != 0 {
                             false
@@ -314,56 +341,43 @@ impl Endpoint {
                     }
                 }
                 EndpointState::Idle | EndpointState::SendBlocked => {
-                    // No active receiver: only cap-less messages are queueable.
                     if msg.extra_caps != 0 {
                         false
                     } else {
                         self.enqueue_nbsend(msg, badge)
                     }
                 }
-            }
+            };
+            self.ep_unlock();
+            result
         }
     }
 
-    /// Receive message (blocks until sender ready)
-    pub fn recv(&mut self) -> (Message, u64) {
+    /// Receive phase (inner) — ep_lock MUST be held by caller.
+    ///
+    /// Returns `Some((msg, badge, wake_tcb))` on non-blocking path.
+    /// `wake_tcb` is a sender to enqueue (or null if kept blocked / no sender to wake).
+    /// Returns `None` if thread is now Blocked and needs reschedule after ep_unlock.
+    unsafe fn recv_inner(&mut self, current: *mut Tcb) -> Option<(Message, u64, *mut Tcb)> {
         unsafe {
-            let current = get_scheduler().current();
-
-            // Clear stale reply capability — if the server is calling recv()
-            // instead of reply_recv(), any previous reply_tcb is abandoned.
-            if !(*current).reply_tcb.is_null() {
-                crate::sched::pip::pip_undonate(current, (*current).reply_tcb);
-                (*current).reply_tcb = core::ptr::null_mut();
-                (*current).reply_can_grant = false;
-            }
-
-            Self::cache_receive_slot(current);
-
             match self.state {
                 EndpointState::SendBlocked => {
-                    // FASTPATH: Sender waiting - transfer immediately
                     let sender = match self.send_queue.pop() {
                         Some(s) => s,
                         None => {
-                            // State inconsistency — recover by blocking receiver
+                            // State inconsistency — block receiver
                             self.state = EndpointState::Idle;
                             self.recv_queue.push(current);
                             self.state = EndpointState::RecvBlocked;
                             (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
-                            block_current_thread(current, BlockedReason::RecvBlocked);
-                            let msg = (*current).saved_caller_msg;
-                            let badge = (*current).saved_caller_badge;
-                            return (msg, badge);
+                            super::block_current_thread_no_switch(current, BlockedReason::RecvBlocked);
+                            return None;
                         }
                     };
 
-                    // Extract message from sender's blocked reason and determine
-                    // whether sender should be kept blocked (fault/call) or woken
                     let (msg, badge, keep_blocked) = match (*sender).blocked_reason {
                         Some(BlockedReason::SendBlocked { msg, badge }) => (msg, badge, false),
                         Some(BlockedReason::SendTimedBlocked { msg, badge }) => {
-                            // Remove timed sender from sleep queue
                             crate::sched::sleep_queue::remove(sender);
                             (*sender).timer_wakeup_ns = 0;
                             (msg, badge, false)
@@ -373,8 +387,6 @@ impl Endpoint {
                         _ => (Message::empty(), 0, false),
                     };
 
-                    // Update endpoint state BEFORE transfer_message: cap transfer
-                    // may release SCHED_IPC_LOCK, so the endpoint must be consistent.
                     if self.send_queue.is_empty() {
                         self.state = EndpointState::Idle;
                     }
@@ -382,24 +394,13 @@ impl Endpoint {
                     self.transfer_message(sender, current, &msg, badge);
 
                     if keep_blocked {
-                        // Set reply capability ONLY for Call/Fault senders.
-                        // Regular Send senders are woken immediately below
-                        // and must not be referenced by reply_tcb.
                         (*current).reply_tcb = sender;
                         (*current).reply_can_grant = !matches!(
                             (*sender).blocked_reason,
                             Some(BlockedReason::FaultBlocked { .. })
                         );
-
-                        // Priority inheritance: boost server if caller has earlier deadline
                         crate::sched::pip::pip_donate(sender, current);
-
-                        // Fault/Call sender: keep blocked until reply (via reply_recv)
-                        // Clear endpoint ref since it's no longer in the queue
                         (*sender).blocked_endpoint = core::ptr::null_mut();
-
-                        // For call senders, transition to ReplyWait so reply_recv
-                        // can match it (same as fastpath call)
                         if matches!(
                             (*sender).blocked_reason,
                             Some(BlockedReason::CallSendBlocked { .. })
@@ -409,47 +410,68 @@ impl Endpoint {
                                 badge,
                             });
                         }
+                        Some((msg, badge, core::ptr::null_mut()))
                     } else {
-                        // Regular sender: wake immediately
                         (*sender).state = ThreadState::Ready;
                         (*sender).blocked_reason = None;
                         (*sender).blocked_endpoint = core::ptr::null_mut();
-                        get_scheduler().enqueue(sender);
+                        Some((msg, badge, sender))
                     }
-
-                    (msg, badge)
                 }
                 EndpointState::Idle | EndpointState::RecvBlocked => {
-                    // Drain queued async NBSend messages before blocking.
                     if let Some((msg, badge)) = self.dequeue_nbsend() {
-                        return (msg, badge);
+                        return Some((msg, badge, core::ptr::null_mut()));
                     }
 
-                    // SLOWPATH: No sender - check bound notification before blocking
-                    // If thread has a bound notification with pending bits, return
-                    // those immediately instead of blocking on the endpoint.
                     if !(*current).bound_notification.is_null() {
                         let ntfn = &mut *((*current).bound_notification
                             as *mut super::Notification);
                         let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
                         if bits != 0 {
-                            // Return notification bits as badge, empty message
-                            return (Message::empty(), bits);
+                            return Some((Message::empty(), bits, core::ptr::null_mut()));
                         }
                     }
 
                     self.recv_queue.push(current);
                     self.state = EndpointState::RecvBlocked;
                     (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
-
-                    block_current_thread(current, BlockedReason::RecvBlocked);
-
-                    // When we wake, message is in saved_caller_*
-                    let msg = (*current).saved_caller_msg;
-                    let badge = (*current).saved_caller_badge;
-                    (msg, badge)
+                    super::block_current_thread_no_switch(current, BlockedReason::RecvBlocked);
+                    None
                 }
             }
+        }
+    }
+
+    /// Receive message (blocks until sender ready)
+    pub fn recv(&mut self) -> (Message, u64) {
+        unsafe {
+            self.ep_lock();
+            let current = get_scheduler().current();
+
+            // Clear stale reply capability
+            if !(*current).reply_tcb.is_null() {
+                crate::sched::pip::pip_undonate(current, (*current).reply_tcb);
+                (*current).reply_tcb = core::ptr::null_mut();
+                (*current).reply_can_grant = false;
+            }
+
+            Self::cache_receive_slot(current);
+
+            if let Some((msg, badge, wake)) = self.recv_inner(current) {
+                self.ep_unlock();
+                if !wake.is_null() {
+                    get_scheduler().enqueue(wake);
+                }
+                return (msg, badge);
+            }
+
+            // Blocked — release lock, then reschedule
+            self.ep_unlock();
+            get_scheduler().reschedule();
+
+            let msg = (*current).saved_caller_msg;
+            let badge = (*current).saved_caller_badge;
+            (msg, badge)
         }
     }
 
@@ -460,82 +482,71 @@ impl Endpoint {
     /// replies before the caller enters the Blocked state.
     pub fn call(&mut self, msg: &Message, badge: u64) -> Message {
         unsafe {
+            self.ep_lock();
             let current = get_scheduler().current();
             Self::cache_receive_slot(current);
 
             match self.state {
                 EndpointState::RecvBlocked => {
-                    // FASTPATH: Receiver waiting - transfer immediately
                     let receiver = match self.recv_queue.pop() {
                         Some(r) => r,
                         None => {
-                            // State inconsistency — fall through to slowpath
                             self.state = EndpointState::Idle;
                             self.send_queue.push(current);
                             self.state = EndpointState::SendBlocked;
                             (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
-                            let reason = BlockedReason::CallSendBlocked { msg: *msg, badge };
-                            block_current_thread(current, reason);
+                            super::block_current_thread_no_switch(current, BlockedReason::CallSendBlocked { msg: *msg, badge });
+                            self.ep_unlock();
+                            get_scheduler().reschedule();
                             return (*current).saved_caller_msg;
                         }
                     };
 
-                    // Block caller BEFORE waking receiver to prevent race:
-                    // Without this, receiver could reply_recv() before caller
-                    // sets Blocked, overwriting Ready with Blocked forever.
+                    // Block caller BEFORE waking receiver
                     (*current).state = ThreadState::Blocked;
                     (*current).blocked_reason = Some(BlockedReason::ReplyWait {
                         msg: *msg,
                         badge,
                     });
 
-                    // Set up reply capability so receiver can reply to us
                     (*receiver).reply_tcb = current;
                     (*receiver).reply_can_grant = true;
-
-                    // Priority inheritance: boost server if caller has earlier deadline
                     crate::sched::pip::pip_donate(current, receiver);
 
-                    // Update endpoint state BEFORE transfer_message: cap transfer
-                    // may release SCHED_IPC_LOCK, so the endpoint must be consistent.
                     if self.recv_queue.is_empty() {
                         self.state = EndpointState::Idle;
                     }
 
-                    // If receiver was timed, remove from sleep queue
                     if matches!((*receiver).blocked_reason, Some(BlockedReason::RecvTimedBlocked)) {
                         crate::sched::sleep_queue::remove(receiver);
                         (*receiver).timer_wakeup_ns = 0;
                     }
 
-                    // Clear blocked markers before transfer_message (see send()).
                     (*receiver).blocked_reason = None;
                     (*receiver).blocked_endpoint = core::ptr::null_mut();
 
                     self.transfer_message(current, receiver, msg, badge);
 
-                    // Wake receiver (guard against suspension during cap transfer)
-                    if (*receiver).state != ThreadState::Inactive {
+                    let wake_receiver = (*receiver).state != ThreadState::Inactive;
+                    if wake_receiver {
                         (*receiver).state = ThreadState::Ready;
+                    }
+                    self.ep_unlock();
+                    if wake_receiver {
                         get_scheduler().enqueue(receiver);
                     }
 
-                    // Caller sleeps until reply_recv() wakes it
+                    // Caller blocked (ReplyWait) — reschedule with no lock held
                     get_scheduler().reschedule();
-
-                    // Woken by reply - message is in saved_caller_msg
                     (*current).saved_caller_msg
                 }
                 EndpointState::Idle | EndpointState::SendBlocked => {
-                    // SLOWPATH: No receiver - queue caller as CallSendBlocked
                     self.send_queue.push(current);
                     self.state = EndpointState::SendBlocked;
                     (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
-
-                    let reason = BlockedReason::CallSendBlocked { msg: *msg, badge };
-                    block_current_thread(current, reason);
-
-                    // Woken by reply_recv() - message is in saved_caller_msg
+                    super::block_current_thread_no_switch(current, BlockedReason::CallSendBlocked { msg: *msg, badge });
+                    self.ep_unlock();
+                    get_scheduler().reschedule();
                     (*current).saved_caller_msg
                 }
             }
@@ -545,10 +556,12 @@ impl Endpoint {
     /// Reply to saved caller and receive next message
     pub fn reply_recv(&mut self, reply: &Message) -> (Message, u64) {
         unsafe {
+            self.ep_lock();
             let current = get_scheduler().current();
 
-            // Reply to saved caller via reply capability
+            // ---- REPLY PHASE ----
             let caller = (*current).reply_tcb;
+            let mut wake_caller: *mut Tcb = core::ptr::null_mut();
 
             if !caller.is_null() {
                 let caller_replyable = (*caller).state == ThreadState::Blocked
@@ -558,11 +571,8 @@ impl Endpoint {
                     );
 
                 if caller_replyable {
-                    // Revert priority inheritance before reply
                     crate::sched::pip::pip_undonate(current, caller);
 
-                    // Transfer reply message to caller's TCB.
-                    // Fault replies cannot grant capabilities.
                     if (*current).reply_can_grant {
                         self.transfer_message(current, caller, reply, 0);
                     } else {
@@ -572,25 +582,41 @@ impl Endpoint {
                         self.transfer_message(current, caller, &no_grant_reply, 0);
                     }
 
-                    // Clear caller's blocked reason
                     (*caller).blocked_reason = None;
-
-                    // Wake the caller
                     (*caller).state = ThreadState::Ready;
-                    get_scheduler().enqueue(caller);
+                    wake_caller = caller;
                 }
 
-                // Clear reply capability (one-shot). This also drops stale reply
-                // caps left behind by paths like exec() that intentionally do not
-                // send a reply before replacing/resuming the caller.
                 (*current).reply_tcb = core::ptr::null_mut();
                 (*current).reply_can_grant = false;
             }
-            // If caller is null, there's no one to reply to - just proceed to recv
-        }
 
-        // Now receive next request
-        self.recv()
+            // ---- RECV PHASE ----
+            Self::cache_receive_slot(current);
+
+            if let Some((msg, badge, wake_sender)) = self.recv_inner(current) {
+                self.ep_unlock();
+                // Wake caller and/or sender outside lock
+                if !wake_caller.is_null() {
+                    get_scheduler().enqueue(wake_caller);
+                }
+                if !wake_sender.is_null() {
+                    get_scheduler().enqueue(wake_sender);
+                }
+                return (msg, badge);
+            }
+
+            // Blocked — release lock, wake caller, reschedule
+            self.ep_unlock();
+            if !wake_caller.is_null() {
+                get_scheduler().enqueue(wake_caller);
+            }
+            get_scheduler().reschedule();
+
+            let msg = (*current).saved_caller_msg;
+            let badge = (*current).saved_caller_badge;
+            (msg, badge)
+        }
     }
 
     /// Transfer message from sender to receiver
@@ -622,11 +648,11 @@ impl Endpoint {
                     return;
                 }
 
-                // Release SCHED_IPC_LOCK before acquiring CAP_LOCK to maintain
-                // lock ordering: CAP_LOCK → SCHED_IPC_LOCK (never the reverse).
+                // Release endpoint lock before acquiring CAP_LOCK to maintain
+                // lock ordering: CAP_LOCK → endpoint.lock (never the reverse).
                 // Safe: receiver already dequeued, message data copied, IF=0 (no
                 // timer on this CPU), only CSpace slot copying remains.
-                crate::mm::SCHED_IPC_LOCK.unlock();
+                self.ep_unlock();
                 crate::mm::CAP_LOCK.lock();
                 for i in 0..cap_count as u64 {
                     let src_slot_idx = msg.caps[i as usize];
@@ -669,7 +695,7 @@ impl Endpoint {
                     );
                 }
                 crate::mm::CAP_LOCK.unlock();
-                crate::mm::SCHED_IPC_LOCK.lock();
+                self.ep_lock();
             }
         }
     }
@@ -683,18 +709,13 @@ impl Endpoint {
     /// Slowpath: no handler → queue faulting thread as sender
     pub fn deliver_fault(&mut self, faulting_tcb: *mut Tcb, msg: &Message) {
         unsafe {
-            // Guard: if the thread was suspended (Inactive) between faulting
-            // and acquiring SCHED_IPC_LOCK, do not deliver the fault.
-            // This prevents zombie process revival on SMP — TCB_SUSPEND sets
-            // Inactive under SCHED_IPC_LOCK, so this check is race-free.
+            self.ep_lock();
+
             if (*faulting_tcb).state == ThreadState::Inactive {
+                self.ep_unlock();
                 return;
             }
 
-            // Set faulting thread state BEFORE fastpath/slowpath branch.
-            // This ensures both paths have correct state — previously the
-            // slowpath left blocked_reason as None, causing recv() to
-            // deliver an empty message and immediately wake the faulter.
             (*faulting_tcb).state = ThreadState::Blocked;
             (*faulting_tcb).blocked_reason = Some(BlockedReason::FaultBlocked {
                 msg: *msg,
@@ -703,47 +724,44 @@ impl Endpoint {
 
             match self.state {
                 EndpointState::RecvBlocked => {
-                    // Fastpath: handler already waiting
                     let receiver = match self.recv_queue.pop() {
                         Some(r) => r,
                         None => {
-                            // State inconsistency — fall through to slowpath
                             self.state = EndpointState::Idle;
                             self.send_queue.push(faulting_tcb);
                             self.state = EndpointState::SendBlocked;
                             (*faulting_tcb).blocked_endpoint = self as *mut Endpoint as *mut u8;
+                            self.ep_unlock();
                             return;
                         }
                     };
 
-                    // Set reply cap so handler can reply to resume faulting thread
                     (*receiver).reply_tcb = faulting_tcb;
                     (*receiver).reply_can_grant = false;
 
-                    // Update endpoint state BEFORE transfer_message: cap transfer
-                    // may release SCHED_IPC_LOCK, so the endpoint must be consistent.
                     if self.recv_queue.is_empty() {
                         self.state = EndpointState::Idle;
                     }
 
-                    // Clear blocked markers before transfer_message (see send()).
                     (*receiver).blocked_reason = None;
                     (*receiver).blocked_endpoint = core::ptr::null_mut();
 
-                    // Transfer fault message to handler (badge identifies faulting client)
                     self.transfer_message(faulting_tcb, receiver, msg, (*faulting_tcb).fault_handler_badge);
 
-                    // Wake handler (guard against suspension during cap transfer)
-                    if (*receiver).state != ThreadState::Inactive {
+                    let wake = (*receiver).state != ThreadState::Inactive;
+                    if wake {
                         (*receiver).state = ThreadState::Ready;
+                    }
+                    self.ep_unlock();
+                    if wake {
                         get_scheduler().enqueue(receiver);
                     }
                 }
                 _ => {
-                    // Slowpath: no handler waiting — queue faulting thread as sender
                     self.send_queue.push(faulting_tcb);
                     self.state = EndpointState::SendBlocked;
                     (*faulting_tcb).blocked_endpoint = self as *mut Endpoint as *mut u8;
+                    self.ep_unlock();
                 }
             }
         }
@@ -816,16 +834,15 @@ impl Endpoint {
     /// Uses dual-queue pattern: thread is in both endpoint send queue and sleep queue.
     pub fn send_timeout(&mut self, msg: &Message, badge: u64, timeout_ns: u64) -> u64 {
         unsafe {
+            self.ep_lock();
             let current = get_scheduler().current();
 
             match self.state {
                 EndpointState::RecvBlocked => {
-                    // FASTPATH: Receiver waiting - transfer immediately
                     let receiver = match self.recv_queue.pop() {
                         Some(r) => r,
                         None => {
                             self.state = EndpointState::Idle;
-                            // Fall through to slowpath below
                             return self.send_timeout_slowpath(current, msg, badge, timeout_ns);
                         }
                     };
@@ -834,7 +851,6 @@ impl Endpoint {
                         self.state = EndpointState::Idle;
                     }
 
-                    // If receiver was timed, remove from sleep queue
                     if matches!((*receiver).blocked_reason, Some(BlockedReason::RecvTimedBlocked)) {
                         crate::sched::sleep_queue::remove(receiver);
                         (*receiver).timer_wakeup_ns = 0;
@@ -845,8 +861,12 @@ impl Endpoint {
 
                     self.transfer_message(current, receiver, msg, badge);
 
-                    if (*receiver).state != ThreadState::Inactive {
+                    let wake = (*receiver).state != ThreadState::Inactive;
+                    if wake {
                         (*receiver).state = ThreadState::Ready;
+                    }
+                    self.ep_unlock();
+                    if wake {
                         get_scheduler().enqueue(receiver);
                     }
                     0 // success
@@ -859,6 +879,7 @@ impl Endpoint {
     }
 
     /// Slowpath for send_timeout: block sender in dual queue.
+    /// ep_lock MUST be held on entry; released before reschedule.
     unsafe fn send_timeout_slowpath(
         &mut self,
         current: *mut Tcb,
@@ -877,12 +898,12 @@ impl Endpoint {
             (*current).state = ThreadState::Blocked;
             (*current).futex_wakeup_result = 0;
 
-            // Insert into sleep queue for timeout wakeup
+            self.ep_unlock();
+
             let now_ns = crate::arch::now_ns();
             let wakeup_ns = now_ns.saturating_add(timeout_ns);
             get_scheduler().block_current_futex_timed(wakeup_ns);
 
-            // When we resume: check if we timed out
             (*current).futex_wakeup_result
         }
     }
@@ -893,9 +914,9 @@ impl Endpoint {
     /// `SyscallError::Cancelled` (12) on timeout.
     pub fn recv_timeout(&mut self, timeout_ns: u64) -> (Message, u64, u64) {
         unsafe {
+            self.ep_lock();
             let current = get_scheduler().current();
 
-            // Clear stale reply capability (same rationale as recv()).
             if !(*current).reply_tcb.is_null() {
                 crate::sched::pip::pip_undonate(current, (*current).reply_tcb);
                 (*current).reply_tcb = core::ptr::null_mut();
@@ -906,7 +927,6 @@ impl Endpoint {
 
             match self.state {
                 EndpointState::SendBlocked => {
-                    // FASTPATH: Sender waiting - transfer immediately
                     let sender = match self.send_queue.pop() {
                         Some(s) => s,
                         None => {
@@ -918,7 +938,6 @@ impl Endpoint {
                     let (msg, badge, keep_blocked) = match (*sender).blocked_reason {
                         Some(BlockedReason::SendBlocked { msg, badge }) => (msg, badge, false),
                         Some(BlockedReason::SendTimedBlocked { msg, badge }) => {
-                            // Remove timed sender from sleep queue
                             crate::sched::sleep_queue::remove(sender);
                             (*sender).timer_wakeup_ns = 0;
                             (msg, badge, false)
@@ -940,10 +959,7 @@ impl Endpoint {
                             (*sender).blocked_reason,
                             Some(BlockedReason::FaultBlocked { .. })
                         );
-
-                        // Priority inheritance: boost server if caller has earlier deadline
                         crate::sched::pip::pip_donate(sender, current);
-
                         (*sender).blocked_endpoint = core::ptr::null_mut();
                         if matches!(
                             (*sender).blocked_reason,
@@ -954,27 +970,29 @@ impl Endpoint {
                                 badge,
                             });
                         }
+                        self.ep_unlock();
                     } else {
                         (*sender).state = ThreadState::Ready;
                         (*sender).blocked_reason = None;
                         (*sender).blocked_endpoint = core::ptr::null_mut();
+                        self.ep_unlock();
                         get_scheduler().enqueue(sender);
                     }
 
-                    (msg, badge, 0) // success
+                    (msg, badge, 0)
                 }
                 EndpointState::Idle | EndpointState::RecvBlocked => {
-                    // Drain queued async NBSend messages before blocking
                     if let Some((msg, badge)) = self.dequeue_nbsend() {
+                        self.ep_unlock();
                         return (msg, badge, 0);
                     }
 
-                    // Check bound notification
                     if !(*current).bound_notification.is_null() {
                         let ntfn = &mut *((*current).bound_notification
                             as *mut super::Notification);
                         let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
                         if bits != 0 {
+                            self.ep_unlock();
                             return (Message::empty(), bits, 0);
                         }
                     }
@@ -986,6 +1004,7 @@ impl Endpoint {
     }
 
     /// Slowpath for recv_timeout: block receiver in dual queue.
+    /// ep_lock MUST be held on entry; released before reschedule.
     unsafe fn recv_timeout_slowpath(
         &mut self,
         current: *mut Tcb,
@@ -999,18 +1018,16 @@ impl Endpoint {
             (*current).state = ThreadState::Blocked;
             (*current).futex_wakeup_result = 0;
 
-            // Insert into sleep queue for timeout wakeup
+            self.ep_unlock();
+
             let now_ns = crate::arch::now_ns();
             let wakeup_ns = now_ns.saturating_add(timeout_ns);
             get_scheduler().block_current_futex_timed(wakeup_ns);
 
-            // When we resume: check result
             let result = (*current).futex_wakeup_result;
             if result != 0 {
-                // Timed out — return empty message
                 (Message::empty(), 0, result)
             } else {
-                // Woken by sender — message is in saved_caller_*
                 let msg = (*current).saved_caller_msg;
                 let badge = (*current).saved_caller_badge;
                 (msg, badge, 0)
@@ -1024,9 +1041,9 @@ impl Endpoint {
     /// Called from destroy_object() with CAP_LOCK held and IRQs disabled.
     /// Acquires SCHED_IPC_LOCK to safely manipulate IPC queues and TCB state.
     pub fn cleanup(&mut self) {
-        // Lock ordering: CAP_LOCK (held by caller) → SCHED_IPC_LOCK — correct.
+        // Lock ordering: CAP_LOCK (held by caller) → endpoint.lock — correct.
         // IRQs are already disabled from the CAP_LOCK acquisition path.
-        crate::mm::SCHED_IPC_LOCK.lock();
+        self.ep_lock();
 
         unsafe {
             // Wake all blocked senders
@@ -1061,6 +1078,6 @@ impl Endpoint {
             self.nbsend_count = 0;
         }
 
-        crate::mm::SCHED_IPC_LOCK.unlock();
+        self.ep_unlock();
     }
 }

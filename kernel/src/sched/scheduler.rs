@@ -817,13 +817,12 @@ impl Scheduler {
     // ---------------------------------------------------------------
 
     /// Ensure the outgoing thread is represented in the deferred slot before
-    /// releasing SCHED_IPC_LOCK and switching away.
+    /// switching away.
     ///
     /// This closes the race where another CPU wakes a thread (Blocked->Ready)
     /// before `context_switch` has saved the outgoing kernel continuation.
     ///
     /// # Preconditions
-    /// - SCHED_IPC_LOCK is held by the caller.
     /// - Scheduler lock is NOT held.
     unsafe fn track_outgoing_before_switch(&mut self, old_tcb: *mut Tcb) {
         if old_tcb.is_null() {
@@ -944,9 +943,6 @@ impl Scheduler {
             // Save outgoing thread's TLS base (FS_BASE MSR)
             (*old_tcb).tls_base = crate::arch::read_fs_base();
 
-            // Release SCHED_IPC_LOCK before context switch (IF=0, no interrupts possible)
-            crate::mm::SCHED_IPC_LOCK.unlock();
-
             // Save outgoing thread's FPU state if it owns the hardware registers.
             // This ensures the TCB buffer is up-to-date before the thread can be
             // migrated to another CPU (where flush_if_owner would miss it).
@@ -963,12 +959,10 @@ impl Scheduler {
             crate::arch::set_per_cpu_canary((*new_tcb).stack_canary);
 
             // Pure register save/restore — no shared state accessed.
+            // No global lock held during switch (IRQs disabled is sufficient).
             let old_ctx = &mut (*old_tcb).context as *mut _;
             let new_ctx = &(*new_tcb).context as *const _;
             crate::arch::context_switch(old_ctx, new_ctx);
-
-            // Reacquire SCHED_IPC_LOCK after resume
-            crate::mm::SCHED_IPC_LOCK.lock();
 
             // Process deferred enqueue now that context is saved.
             self.lock();
@@ -997,8 +991,8 @@ impl Scheduler {
     /// preserving a lighter-weight target-preparation path.
     ///
     /// # Preconditions
-    /// - `SCHED_IPC_LOCK` MUST be held.
-    /// - Scheduler lock MUST NOT be held.
+    /// - Scheduler lock (`lock_state`) MUST NOT be held.
+    /// - No IPC/endpoint locks should be held (release before calling).
     /// - `set_current(new_tcb)` and thread state transitions were already done.
     /// - Local IRQs MUST remain disabled across the switch; restore them only
     ///   after the resumed continuation returns from this call.
@@ -1013,9 +1007,8 @@ impl Scheduler {
     /// Perform the actual context switch (VSpace, kernel stack, registers).
     ///
     /// # Preconditions
-    /// - SCHED_IPC_LOCK MUST be held: this function releases it before switching
-    ///   and reacquires it on resume. Callers without it cause a lock leak.
     /// - Scheduler lock (`lock_state`) MUST NOT be held.
+    /// - No IPC/endpoint locks should be held (release before calling).
     /// - Local IRQs MUST remain disabled across the switch; restore them only
     ///   after the resumed continuation returns from this call.
     unsafe fn do_context_switch(&mut self, old_tcb: *mut Tcb, new_tcb: *mut Tcb) {
@@ -1031,12 +1024,12 @@ impl Scheduler {
     // Timer tick (acquires lock internally)
     // ---------------------------------------------------------------
 
-    /// Perform a context switch with proper SCHED_IPC_LOCK protocol.
+    /// Perform a context switch from timer/IPI path.
     ///
-    /// Releases per-CPU scheduler lock, acquires SCHED_IPC_LOCK for the
-    /// switch protocol, then releases it after resume. Caller must hold
-    /// the per-CPU scheduler lock on entry and must NOT hold SCHED_IPC_LOCK.
-    unsafe fn context_switch_with_ipc_lock(
+    /// Releases per-CPU scheduler lock, performs the context switch (no
+    /// global lock needed — Zircon-style), then restores IRQ state.
+    /// Caller must hold the per-CPU scheduler lock on entry.
+    unsafe fn context_switch_local(
         &mut self,
         old_tcb: *mut Tcb,
         new_tcb: *mut Tcb,
@@ -1044,20 +1037,14 @@ impl Scheduler {
     ) {
         unsafe {
             self.unlock();
-            crate::mm::SCHED_IPC_LOCK.lock();
             self.do_context_switch(old_tcb, new_tcb);
-            // After resume: SCHED_IPC_LOCK is held (reacquired by switch_common)
-            crate::mm::SCHED_IPC_LOCK.unlock();
             crate::mm::restore_irq(irq_flag);
         }
     }
 
     /// Handle timer tick — called from interrupt context.
     ///
-    /// SCHED_IPC_LOCK is NOT held on entry (assembly stub does not acquire it).
-    /// Only acquires SCHED_IPC_LOCK when:
-    /// - Expired sleepers need endpoint/futex queue manipulation
-    /// - A context switch is needed (switch_common protocol)
+    /// No global lock needed — operates entirely with per-CPU scheduler lock.
     pub fn timer_tick(&mut self) {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
         self.lock();
@@ -1066,19 +1053,11 @@ impl Scheduler {
         // fresh thread whose entry point never returned through do_context_switch.
         self.process_pending_enqueue();
 
-        // Wake expired sleepers. check_wakeups may modify endpoint/futex queues,
-        // which requires SCHED_IPC_LOCK. Peek first (no lock) to avoid the
-        // global lock on the common path where no sleepers have expired.
+        // Wake expired sleepers (endpoint/futex queue removal will use
+        // per-endpoint locks once those are added; for now the per-CPU
+        // scheduler lock serializes local wakeups).
         let now_ns = crate::arch::now_ns();
-        if unsafe { crate::sched::sleep_queue::peek_expired(now_ns) } {
-            // Release per-CPU lock first (lock ordering: SCHED_IPC_LOCK → per-CPU)
-            self.unlock();
-            crate::mm::SCHED_IPC_LOCK.lock();
-            self.lock();
-            unsafe { crate::sched::sleep_queue::check_wakeups(now_ns); }
-            crate::mm::SCHED_IPC_LOCK.unlock();
-            // Continue with only per-CPU lock held
-        }
+        unsafe { crate::sched::sleep_queue::check_wakeups(now_ns); }
 
         unsafe {
             let cpu_id = crate::arch::current_cpu() as usize;
@@ -1100,7 +1079,7 @@ impl Scheduler {
                 let new_tcb = self.schedule_unlocked();
                 if current != new_tcb {
                     self.set_current(new_tcb);
-                    self.context_switch_with_ipc_lock(current, new_tcb, irq_flag);
+                    self.context_switch_local(current, new_tcb, irq_flag);
                     return;
                 }
                 self.unlock();
@@ -1122,7 +1101,7 @@ impl Scheduler {
                     let new_tcb = self.schedule_unlocked();
                     if current != new_tcb {
                         self.set_current(new_tcb);
-                        self.context_switch_with_ipc_lock(current, new_tcb, irq_flag);
+                        self.context_switch_local(current, new_tcb, irq_flag);
                         return;
                     }
                 } else {
@@ -1135,7 +1114,7 @@ impl Scheduler {
                         (*current).state = ThreadState::Running;
                     } else if current != new_tcb {
                         self.set_current(new_tcb);
-                        self.context_switch_with_ipc_lock(current, new_tcb, irq_flag);
+                        self.context_switch_local(current, new_tcb, irq_flag);
                         return;
                     }
                 }
@@ -1154,7 +1133,7 @@ impl Scheduler {
                     (*current).state = ThreadState::Running;
                 } else if current != new_tcb {
                     self.set_current(new_tcb);
-                    self.context_switch_with_ipc_lock(current, new_tcb, irq_flag);
+                    self.context_switch_local(current, new_tcb, irq_flag);
                     return;
                 }
             }
@@ -1194,8 +1173,7 @@ impl Scheduler {
 
     /// Handle reschedule IPI — checks ready queue for work on this CPU.
     ///
-    /// SCHED_IPC_LOCK is NOT held on entry (assembly stub does not acquire it).
-    /// Only acquires SCHED_IPC_LOCK when a context switch is needed.
+    /// No global lock needed — operates entirely with per-CPU scheduler lock.
     pub fn handle_reschedule_ipi(&mut self) {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
         self.lock();
@@ -1228,7 +1206,7 @@ impl Scheduler {
                 (*current).state = ThreadState::Running;
             } else if current != new_tcb {
                 self.set_current(new_tcb);
-                self.context_switch_with_ipc_lock(current, new_tcb, irq_flag);
+                self.context_switch_local(current, new_tcb, irq_flag);
                 return;
             }
         }
@@ -1324,9 +1302,9 @@ impl Scheduler {
 
     /// Perform a context switch to the next thread.
     ///
-    /// # Preconditions
-    /// - SCHED_IPC_LOCK MUST be held by the caller. do_context_switch releases
-    ///   it before switching and reacquires on resume.
+    /// No global lock required — uses only per-CPU scheduler locks.
+    /// Callers must NOT hold any IPC/endpoint lock across this call
+    /// (release before calling, reacquire after if needed).
     ///
     /// Acquires the scheduler lock internally for the scheduling decision.
     pub fn reschedule(&mut self) {
@@ -1376,8 +1354,7 @@ impl Scheduler {
     /// the current thread is NOT inserted into the ready queue until
     /// `context_switch` has saved its registers.
     ///
-    /// # Preconditions
-    /// - SCHED_IPC_LOCK MUST be held by the caller.
+    /// No global lock required — uses only per-CPU scheduler locks.
     pub fn yield_current(&mut self) {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
         self.lock();
@@ -1469,12 +1446,9 @@ impl Scheduler {
 
     /// Block current thread on VSpace teardown (MAY switch, manages IRQ state internally)
     ///
-    /// CRITICAL: This function may call do_context_switch() which releases/reacquires
-    /// SCHED_IPC_LOCK. The function manages both SCHED_IPC_LOCK and scheduler lock internally.
-    /// Do NOT wrap with with_lock().
+    /// Uses only per-CPU scheduler lock — no SCHED_IPC_LOCK needed.
     pub fn block_current_on_vspace(&mut self, tracking: &crate::mm::VSpaceTracking) {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
-        crate::mm::SCHED_IPC_LOCK.lock();
         self.lock();
 
         unsafe {
@@ -1484,7 +1458,6 @@ impl Scheduler {
             // Fast path: check if already inactive
             if !tracking.is_active() {
                 self.unlock();
-                crate::mm::SCHED_IPC_LOCK.unlock();
                 crate::mm::restore_irq(irq_flag);
                 return;
             }
@@ -1509,13 +1482,9 @@ impl Scheduler {
 
             if old_tcb != new_tcb {
                 self.set_current(new_tcb);
-                // do_context_switch releases SCHED_IPC_LOCK before switch,
-                // reacquires on resume
                 self.do_context_switch(old_tcb, new_tcb);
             }
 
-            // After resume: SCHED_IPC_LOCK is held (reacquired by do_context_switch)
-            crate::mm::SCHED_IPC_LOCK.unlock();
             crate::mm::restore_irq(irq_flag);
         }
     }
@@ -1576,9 +1545,8 @@ impl Scheduler {
     /// queue and performs a context switch.
     ///
     /// # Preconditions
-    /// - SCHED_IPC_LOCK MUST be held by the caller (released before switch,
-    ///   reacquired on resume).
     /// - Thread state and futex fields already configured by caller.
+    /// - No IPC/endpoint locks should be held across this call.
     pub fn block_current_futex_timed(&mut self, wakeup_ns: u64) {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
         self.lock();
@@ -1602,8 +1570,6 @@ impl Scheduler {
                 self.track_pending_switch_out(cpu_id, old_tcb);
                 self.set_current(new_tcb);
                 self.unlock();
-                // SAFETY: SCHED_IPC_LOCK is held; do_context_switch releases
-                // before switch and reacquires on resume.
                 self.do_context_switch(old_tcb, new_tcb);
                 crate::mm::restore_irq(irq_flag);
                 return;

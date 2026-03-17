@@ -377,10 +377,8 @@ pub extern "C" fn kmain(raw_boot_info: *const u8) -> ! {
     init::bootstrap(boot_info);
 
     // Dispatch the init task (context_switch to it).
-    // SCHED_IPC_LOCK must be held: do_context_switch releases/reacquires it.
-    mm::SCHED_IPC_LOCK.lock();
+    // No global lock needed — reschedule uses per-CPU scheduler lock only.
     sched::scheduler::scheduler().reschedule();
-    mm::SCHED_IPC_LOCK.unlock();
 
     // Fallback (should never reach here once init task is dispatched)
     loop {

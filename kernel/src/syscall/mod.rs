@@ -571,13 +571,11 @@ fn syscall_send(
             Err(e) => return SyscallResult::err(e),
         }
 
-        // Phase 2: IPC under SCHED_IPC_LOCK
+        // Phase 2: IPC under per-endpoint lock (managed inside method)
         unsafe {
             let irq = save_irq_disable();
-            SCHED_IPC_LOCK.lock();
             let endpoint = &mut *(cap.object as *mut Endpoint);
             endpoint.send(&msg, cap.badge);
-            SCHED_IPC_LOCK.unlock();
             restore_irq(irq);
         }
         return SyscallResult::ok(0);
@@ -653,11 +651,9 @@ fn syscall_recv(cap_ptr: u64) -> SyscallResult {
     // Phase 2: IPC under SCHED_IPC_LOCK
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let endpoint = &mut *(cap.object as *mut Endpoint);
         let (msg, badge) = endpoint.recv();
         write_msg_to_ipc_buffer(&msg, badge);
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
         SyscallResult::ok(badge)
     }
@@ -687,11 +683,9 @@ fn syscall_call(
     // Phase 2: IPC under SCHED_IPC_LOCK
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let endpoint = &mut *(cap.object as *mut Endpoint);
         let reply_msg = endpoint.call(&msg, cap.badge);
         write_msg_to_ipc_buffer(&reply_msg, 0);
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
     }
 
@@ -722,11 +716,9 @@ fn syscall_reply_recv(
     // Phase 2: IPC under SCHED_IPC_LOCK
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let endpoint = &mut *(cap.object as *mut Endpoint);
         let (msg, badge) = endpoint.reply_recv(&reply);
         write_msg_to_ipc_buffer(&msg, badge);
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
         SyscallResult::ok(badge)
     }
@@ -753,17 +745,15 @@ fn syscall_nbsend(
 
     let msg = construct_message(msg_info, mr0, mr1, mr2, mr3);
 
-    // Phase 2: IPC under SCHED_IPC_LOCK
+    // Phase 2: IPC under per-endpoint lock (managed inside method)
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let endpoint = &mut *(cap.object as *mut Endpoint);
         let result = if endpoint.nbsend(&msg, cap.badge) {
             SyscallResult::ok(0)
         } else {
             SyscallResult::err(SyscallError::WouldBlock)
         };
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
         result
     }
@@ -781,13 +771,11 @@ fn syscall_signal(cap_ptr: u64, bits: u64) -> SyscallResult {
         Err(e) => return SyscallResult::err(e),
     }
 
-    // Phase 2: Signal under SCHED_IPC_LOCK (may wake threads)
+    // Phase 2: Signal under per-notification lock (managed inside method)
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let notification = &mut *(cap.object as *mut Notification);
         notification.signal(cap.badge | bits);
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
     }
 
@@ -806,13 +794,11 @@ fn syscall_wait(cap_ptr: u64) -> SyscallResult {
         Err(e) => return SyscallResult::err(e),
     }
 
-    // Phase 2: Wait under SCHED_IPC_LOCK (may block/context-switch)
+    // Phase 2: Wait under per-notification lock (managed inside method)
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let notification = &mut *(cap.object as *mut Notification);
         let bits = notification.wait();
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
         SyscallResult::ok(bits)
     }
@@ -1828,13 +1814,14 @@ fn syscall_tcb_suspend(cap: &Capability) -> SyscallResult {
                 scheduler.unlock();
                 match target_cpu {
                     Some(cpu) if cpu == this_cpu => {
-                        // Self-suspend or same-CPU: reschedule locally
+                        // Self-suspend or same-CPU: release lock, then reschedule
+                        SCHED_IPC_LOCK.unlock();
                         scheduler.reschedule();
+                        restore_irq(irq);
+                        return SyscallResult::ok(0);
                     }
                     Some(cpu) => {
-                        // Cross-CPU: synchronous suspend. Release SCHED_IPC_LOCK
-                        // before spinning — the IPI handler on the target CPU
-                        // acquires it (irq_stub_sched_ipc → handle_reschedule_ipi).
+                        // Cross-CPU: synchronous suspend.
                         let target_tcb_ptr = tcb as *mut Tcb as usize;
                         SCHED_IPC_LOCK.unlock();
                         restore_irq(irq);
@@ -4012,16 +3999,8 @@ pub fn handle(
         Syscall::Wait => syscall_wait(cap_ptr),
         Syscall::Poll => syscall_poll(cap_ptr),
         Syscall::Yield => {
-            // Yield under SCHED_IPC_LOCK using deferred enqueue.
-            // The current thread is NOT placed in the ready queue until
-            // context_switch has saved its registers (prevents SMP race).
-            unsafe {
-                let irq = save_irq_disable();
-                SCHED_IPC_LOCK.lock();
-                crate::sched::scheduler::scheduler().yield_current();
-                SCHED_IPC_LOCK.unlock();
-                restore_irq(irq);
-            }
+            // Yield using per-CPU scheduler lock only (no global lock).
+            crate::sched::yield_now();
             SyscallResult::ok(0)
         }
         Syscall::Invoke => syscall_invoke(cap_ptr, msg_info, mr0, mr1, mr2, mr3),
@@ -4083,12 +4062,10 @@ pub fn handle(
         }
         Syscall::ClockGetTime => syscall_clock_gettime(cap_ptr),
         Syscall::NanoSleep => {
-            // NanoSleep under SCHED_IPC_LOCK (block_current_sleeping may context-switch)
+            // NanoSleep — block_current_sleeping uses per-CPU scheduler lock only
             unsafe {
                 let irq = save_irq_disable();
-                SCHED_IPC_LOCK.lock();
                 let result = syscall_nanosleep(cap_ptr, msg_info);
-                SCHED_IPC_LOCK.unlock();
                 restore_irq(irq);
                 result
             }
@@ -4195,10 +4172,8 @@ pub fn handle(
 
             unsafe {
                 let irq = save_irq_disable();
-                SCHED_IPC_LOCK.lock();
                 let endpoint = &mut *(cap.object as *mut Endpoint);
                 let result = endpoint.send_timeout(&msg, cap.badge, timeout_ns);
-                SCHED_IPC_LOCK.unlock();
                 restore_irq(irq);
 
                 if result == 0 {
@@ -4227,13 +4202,11 @@ pub fn handle(
 
             unsafe {
                 let irq = save_irq_disable();
-                SCHED_IPC_LOCK.lock();
                 let endpoint = &mut *(cap.object as *mut Endpoint);
                 let (msg, badge, result) = endpoint.recv_timeout(timeout_ns);
                 if result == 0 {
                     write_msg_to_ipc_buffer(&msg, badge);
                 }
-                SCHED_IPC_LOCK.unlock();
                 restore_irq(irq);
 
                 if result == 0 {

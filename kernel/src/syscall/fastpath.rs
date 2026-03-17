@@ -9,8 +9,8 @@
 
 use crate::cap::{CapRights, ObjectType};
 use crate::ipc::{EndpointState, Endpoint, Message};
-use crate::mm::{save_irq_disable, restore_irq, CAP_LOCK, SCHED_IPC_LOCK};
-use crate::sched::thread::{BlockedReason, ThreadState};
+use crate::mm::{save_irq_disable, restore_irq, CAP_LOCK};
+use crate::sched::thread::{BlockedReason, Tcb, ThreadState};
 
 use super::{lookup_capability, validate_endpoint_cap, msg_info, write_msg_to_ipc_buffer};
 
@@ -98,46 +98,39 @@ pub unsafe extern "C" fn fastpath_call_rust(
     let badge = cap.badge;
 
     unsafe {
-        // Acquire SCHED_IPC_LOCK for IPC + scheduler operations
+        // Per-endpoint lock for IPC queue operations (Zircon-style).
+        // No SCHED_IPC_LOCK needed — context switch uses no global lock.
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
-
         let endpoint = &mut *endpoint_ptr;
+        endpoint.ep_lock();
 
-        // Must be RecvBlocked (receiver waiting)
         if endpoint.state() != EndpointState::RecvBlocked {
-            SCHED_IPC_LOCK.unlock();
+            endpoint.ep_unlock();
             restore_irq(irq);
             return FastpathResult::slowpath();
         }
 
-        // Pop receiver from recv queue
         let receiver = match endpoint.fastpath_pop_recv() {
             Some(r) => r,
             None => {
-                SCHED_IPC_LOCK.unlock();
+                endpoint.ep_unlock();
                 restore_irq(irq);
                 return FastpathResult::slowpath();
             }
         };
 
-        // Same-CPU check: direct fastpath switch is only safe when the
-        // receiver last ran on THIS CPU and its deferred-switch slot is also
-        // local. Otherwise a different CPU can later flush a stale pending
-        // slot and re-enqueue the same TCB.
         let this_cpu = crate::arch::current_cpu() as usize;
         let recv_affinity = (*receiver).cpu_affinity;
         if recv_affinity != 0xFFFF_FFFF && recv_affinity != this_cpu as u32 {
             endpoint.fastpath_push_recv(receiver);
-            SCHED_IPC_LOCK.unlock();
+            endpoint.ep_unlock();
             restore_irq(irq);
             return FastpathResult::slowpath();
         }
 
-        // Receiver must have valid VSpace and kernel stack
         if (*receiver).vspace_root.is_null() || (*receiver).kernel_stack_top == 0 {
             endpoint.fastpath_push_recv(receiver);
-            SCHED_IPC_LOCK.unlock();
+            endpoint.ep_unlock();
             restore_irq(irq);
             return FastpathResult::slowpath();
         }
@@ -146,7 +139,7 @@ pub unsafe extern "C" fn fastpath_call_rust(
         let current = sched.current();
         if current.is_null() {
             endpoint.fastpath_push_recv(receiver);
-            SCHED_IPC_LOCK.unlock();
+            endpoint.ep_unlock();
             restore_irq(irq);
             return FastpathResult::slowpath();
         }
@@ -156,15 +149,13 @@ pub unsafe extern "C" fn fastpath_call_rust(
         sched.unlock();
         if (*receiver).last_cpu != this_cpu as u32 || receiver_pending_cpu != Some(this_cpu) {
             endpoint.fastpath_push_recv(receiver);
-            SCHED_IPC_LOCK.unlock();
+            endpoint.ep_unlock();
             restore_irq(irq);
             return FastpathResult::slowpath();
         }
 
-        // Cache caller's receive-slot config (needed if server replies with caps)
         Endpoint::cache_receive_slot(current);
 
-        // Build message directly (no allocation, inline registers only)
         let label = msg_info::get_label(msg_info);
         let mut msg = Message::empty();
         msg.label = label;
@@ -174,22 +165,13 @@ pub unsafe extern "C" fn fastpath_call_rust(
         if length > 2 { msg.regs[2] = mr2; }
         if length > 3 { msg.regs[3] = mr3; }
 
-        // Block caller BEFORE waking receiver (same as slowpath call())
         (*current).state = ThreadState::Blocked;
-        (*current).blocked_reason = Some(BlockedReason::ReplyWait {
-            msg,
-            badge,
-        });
+        (*current).blocked_reason = Some(BlockedReason::ReplyWait { msg, badge });
 
-        // Set reply capability so receiver can reply to us
         (*receiver).reply_tcb = current;
         (*receiver).reply_can_grant = true;
 
-        // Priority inheritance: boost server if caller has earlier deadline.
-        // Fastpath only handles non-transitive case; if receiver is itself
-        // donating to someone, bail to slowpath for transitive propagation.
         if !(*receiver).pip_donating_to.is_null() {
-            // Transitive PIP — undo and bail to slowpath
             (*receiver).reply_tcb = core::ptr::null_mut();
             (*receiver).reply_can_grant = false;
             (*current).state = ThreadState::Running;
@@ -198,44 +180,39 @@ pub unsafe extern "C" fn fastpath_call_rust(
             if endpoint.state() == EndpointState::Idle {
                 endpoint.fastpath_set_state(EndpointState::RecvBlocked);
             }
-            SCHED_IPC_LOCK.unlock();
+            endpoint.ep_unlock();
             restore_irq(irq);
             return FastpathResult::slowpath();
         }
         crate::sched::pip::pip_donate(current, receiver);
 
-        // Transfer message to receiver's TCB (no cap transfer on fastpath)
         (*receiver).saved_caller_msg = msg;
         (*receiver).saved_caller_badge = badge;
 
-        // Wake receiver
         (*receiver).state = ThreadState::Ready;
+        (*receiver).blocked_reason = None;
         (*receiver).blocked_endpoint = core::ptr::null_mut();
 
-        // Update endpoint state
         if endpoint.fastpath_recv_queue_empty() {
             endpoint.fastpath_set_state(EndpointState::Idle);
         }
 
-        // Direct switch setup: publish receiver as current under scheduler lock.
         sched.lock();
         sched.set_current(receiver);
         (*receiver).state = ThreadState::Running;
         (*receiver).last_cpu = this_cpu as u32;
         sched.unlock();
 
-        // Use the scheduler's shared switch machinery (with a fastpath-specific
-        // target-prepare step) instead of a hand-rolled switch subset.
+        // Release endpoint lock before context switch (no lock held during switch)
+        endpoint.ep_unlock();
+
         sched.do_context_switch_fastpath(current, receiver);
 
         // --- Caller has been woken by reply ---
-        // At this point, current thread IS the original caller again.
-        // The reply message was placed in saved_caller_msg by reply_recv.
         let reply_msg = (*current).saved_caller_msg;
         let reply_badge = (*current).saved_caller_badge;
         write_msg_to_ipc_buffer(&reply_msg, reply_badge);
 
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
 
         FastpathResult::ok(0)
@@ -301,38 +278,36 @@ pub unsafe extern "C" fn fastpath_reply_recv_rust(
     let _badge = cap.badge;
 
     unsafe {
-        // Acquire SCHED_IPC_LOCK for IPC + scheduler operations
+        // Per-endpoint lock only — NO global lock needed (Zircon-style).
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
-
         let endpoint = &mut *endpoint_ptr;
+        endpoint.ep_lock();
+
         let sched = crate::sched::scheduler::scheduler();
         let current = sched.current();
         if current.is_null() {
-            SCHED_IPC_LOCK.unlock();
+            endpoint.ep_unlock();
             restore_irq(irq);
             return FastpathResult::slowpath();
         }
 
         // ---- REPLY PHASE ----
         let caller = (*current).reply_tcb;
+        let mut wake_caller: *mut Tcb = core::ptr::null_mut();
 
         if !caller.is_null() {
-            // Only fastpath if caller is in ReplyWait (not FaultBlocked)
             let is_reply_wait = matches!(
                 (*caller).blocked_reason,
                 Some(BlockedReason::ReplyWait { .. })
             );
             if !is_reply_wait {
-                SCHED_IPC_LOCK.unlock();
+                endpoint.ep_unlock();
                 restore_irq(irq);
                 return FastpathResult::slowpath();
             }
 
-            // Revert priority inheritance before reply
             crate::sched::pip::pip_undonate(current, caller);
 
-            // Build reply message inline
             let reply_label = msg_info::get_label(msg_info);
             let mut reply_msg = Message::empty();
             reply_msg.label = reply_label;
@@ -342,29 +317,25 @@ pub unsafe extern "C" fn fastpath_reply_recv_rust(
             if length > 2 { reply_msg.regs[2] = mr2; }
             if length > 3 { reply_msg.regs[3] = mr3; }
 
-            // Write reply to caller's TCB
             (*caller).saved_caller_msg = reply_msg;
             (*caller).saved_caller_badge = 0;
-
-            // Wake caller (hold scheduler lock for ready queue mutation)
             (*caller).blocked_reason = None;
             (*caller).state = ThreadState::Ready;
-            sched.lock();
-            sched.enqueue_unlocked(caller);
-            sched.unlock();
+            wake_caller = caller;
 
-            // Clear one-shot reply capability
             (*current).reply_tcb = core::ptr::null_mut();
             (*current).reply_can_grant = false;
         }
-        // If caller is null, no one to reply to — proceed to recv phase
 
         // ---- RECV PHASE ----
-        // Must have a sender waiting (SendBlocked).
-        // If no senders, bail to slowpath which checks bound notification
-        // bits before blocking (combined IPC wait).
         if endpoint.state() != EndpointState::SendBlocked {
-            SCHED_IPC_LOCK.unlock();
+            endpoint.ep_unlock();
+            // Wake caller outside lock if needed
+            if !wake_caller.is_null() {
+                sched.lock();
+                sched.enqueue_unlocked(wake_caller);
+                sched.unlock();
+            }
             restore_irq(irq);
             return FastpathResult::slowpath();
         }
@@ -372,62 +343,79 @@ pub unsafe extern "C" fn fastpath_reply_recv_rust(
         let sender = match endpoint.fastpath_pop_send() {
             Some(s) => s,
             None => {
-                SCHED_IPC_LOCK.unlock();
+                endpoint.ep_unlock();
+                if !wake_caller.is_null() {
+                    sched.lock();
+                    sched.enqueue_unlocked(wake_caller);
+                    sched.unlock();
+                }
                 restore_irq(irq);
                 return FastpathResult::slowpath();
             }
         };
 
-        // Extract message from sender's blocked reason
         let (msg, badge, keep_blocked) = match (*sender).blocked_reason {
             Some(BlockedReason::SendBlocked { msg, badge }) => (msg, badge, false),
             Some(BlockedReason::CallSendBlocked { msg, badge }) => (msg, badge, true),
             _ => {
-                // Fault or unexpected — bail to slowpath
                 endpoint.fastpath_push_send(sender);
-                SCHED_IPC_LOCK.unlock();
+                endpoint.ep_unlock();
+                if !wake_caller.is_null() {
+                    sched.lock();
+                    sched.enqueue_unlocked(wake_caller);
+                    sched.unlock();
+                }
                 restore_irq(irq);
                 return FastpathResult::slowpath();
             }
         };
 
-        // Fastpath only handles short messages with no cap transfer
         if msg.extra_caps != 0 || msg.length > 4 {
             endpoint.fastpath_push_send(sender);
-            SCHED_IPC_LOCK.unlock();
+            endpoint.ep_unlock();
+            if !wake_caller.is_null() {
+                sched.lock();
+                sched.enqueue_unlocked(wake_caller);
+                sched.unlock();
+            }
             restore_irq(irq);
             return FastpathResult::slowpath();
         }
 
-        // Write received message to server's TCB and IPC buffer
         (*current).saved_caller_msg = msg;
         (*current).saved_caller_badge = badge;
         write_msg_to_ipc_buffer(&msg, badge);
 
         if keep_blocked {
-            // Call sender: set reply cap and keep blocked until reply
             (*current).reply_tcb = sender;
             (*current).reply_can_grant = true;
-            // Priority inheritance: boost server if caller has earlier deadline
             crate::sched::pip::pip_donate(sender, current);
             (*sender).blocked_endpoint = core::ptr::null_mut();
             (*sender).blocked_reason = Some(BlockedReason::ReplyWait { msg, badge });
         } else {
-            // Regular sender: wake immediately
             (*sender).state = ThreadState::Ready;
             (*sender).blocked_reason = None;
             (*sender).blocked_endpoint = core::ptr::null_mut();
+        }
+
+        if endpoint.fastpath_send_queue_empty() {
+            endpoint.fastpath_set_state(EndpointState::Idle);
+        }
+
+        endpoint.ep_unlock();
+
+        // Wake caller and/or sender outside lock
+        if !wake_caller.is_null() {
+            sched.lock();
+            sched.enqueue_unlocked(wake_caller);
+            sched.unlock();
+        }
+        if !keep_blocked {
             sched.lock();
             sched.enqueue_unlocked(sender);
             sched.unlock();
         }
 
-        // Update endpoint state
-        if endpoint.fastpath_send_queue_empty() {
-            endpoint.fastpath_set_state(EndpointState::Idle);
-        }
-
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
 
         // No context switch — server stays running
