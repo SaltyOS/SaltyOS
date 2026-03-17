@@ -49,20 +49,46 @@ impl SpinLock {
 
     #[inline]
     pub fn lock(&self) {
-        let mut _spins: u32 = 0;
-        while self
+        // Fast path: uncontended acquire
+        if self
             .locked
             .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
+            .is_ok()
         {
-            while self.locked.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+
+        // Slow path: bounded exponential backoff to reduce cache-line thrashing
+        let mut backoff: u32 = 0;
+        #[cfg(debug_assertions)]
+        let mut _total_spins: u32 = 0;
+        loop {
+            // Spin with exponential backoff (cap at 64 PAUSE iterations)
+            let spins = 1u32 << backoff.min(6);
+            for _ in 0..spins {
                 core::hint::spin_loop();
-                _spins += 1;
-                #[cfg(debug_assertions)]
-                if _spins > 10_000_000 {
+            }
+            #[cfg(debug_assertions)]
+            {
+                _total_spins += spins;
+                if _total_spins > 10_000_000 {
                     crate::serial_puts_raw("[SPINLOCK] possible deadlock detected\n");
-                    _spins = 0;
+                    _total_spins = 0;
                 }
+            }
+
+            // Try acquire after backoff
+            if self.locked.load(Ordering::Relaxed) == 0
+                && self
+                    .locked
+                    .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return;
+            }
+
+            if backoff < 6 {
+                backoff += 1;
             }
         }
     }

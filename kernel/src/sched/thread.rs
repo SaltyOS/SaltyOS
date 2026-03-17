@@ -127,6 +127,8 @@ pub struct Tcb {
     pub cpu_affinity: u32,
     /// Last CPU this thread ran on (cache affinity hint for load balancer)
     pub last_cpu: u32,
+    /// Whether this thread is currently in the ready queue (O(1) membership test)
+    pub ready_queued: bool,
     /// Next thread in queue
     pub next: *mut Tcb,
     /// Why this thread is blocked (valid when state == Blocked/Waiting)
@@ -280,6 +282,7 @@ impl Tcb {
             sched_context: core::ptr::null_mut(),
             cpu_affinity: 0xFFFF_FFFF,
             last_cpu: 0xFFFF_FFFF,
+            ready_queued: false,
             next: core::ptr::null_mut(),
             blocked_reason: None,
             saved_caller_badge: 0,
@@ -331,6 +334,7 @@ impl Tcb {
     /// However, this DOES wake any caller waiting for a reply via reply_tcb.
     pub fn cleanup(&mut self) {
         self.state = ThreadState::Inactive;
+        self.ready_queued = false;
         self.blocked_reason = None;
         self.blocked_endpoint = core::ptr::null_mut();
         self.blocked_notification = core::ptr::null_mut();

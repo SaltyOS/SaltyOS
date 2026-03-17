@@ -97,20 +97,45 @@ impl Scheduler {
     /// Take scheduler lock
     pub(crate) fn lock(&self) {
         use core::sync::atomic::Ordering;
-        let mut _spins: u32 = 0;
-        while self
+
+        // Fast path: uncontended acquire
+        if self
             .lock_state
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
+            .is_ok()
         {
-            while self.lock_state.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+
+        // Slow path: bounded exponential backoff to reduce cache-line thrashing
+        let mut backoff: u32 = 0;
+        #[cfg(debug_assertions)]
+        let mut _total_spins: u32 = 0;
+        loop {
+            let spins = 1u32 << backoff.min(6);
+            for _ in 0..spins {
                 core::hint::spin_loop();
-                _spins += 1;
-                #[cfg(debug_assertions)]
-                if _spins > 10_000_000 {
+            }
+            #[cfg(debug_assertions)]
+            {
+                _total_spins += spins;
+                if _total_spins > 10_000_000 {
                     crate::serial_puts("[SCHED SPINLOCK] possible deadlock detected\n");
-                    _spins = 0;
+                    _total_spins = 0;
                 }
+            }
+
+            if self.lock_state.load(Ordering::Relaxed) == 0
+                && self
+                    .lock_state
+                    .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return;
+            }
+
+            if backoff < 6 {
+                backoff += 1;
             }
         }
     }
@@ -145,7 +170,8 @@ impl Scheduler {
                 return;
             }
 
-            if self.is_ready_queued_unlocked(tcb) {
+            // O(1) check via flag instead of O(N) queue walk
+            if (*tcb).ready_queued {
                 (*tcb).state = ThreadState::Ready;
                 return;
             }
@@ -159,6 +185,7 @@ impl Scheduler {
             }
 
             (*tcb).state = ThreadState::Ready;
+            (*tcb).ready_queued = true;
 
             // Insert sorted by deadline (priority field stores deadline)
             if self.ready_head.is_null() || (*tcb).priority < (*self.ready_head).priority {
@@ -173,32 +200,39 @@ impl Scheduler {
                 (*current).next = tcb;
             }
 
-            // Wake an idle CPU so it can pick up this thread
+            // Wake an idle CPU so it can pick up this thread.
+            // Skip IPI if the current CPU is idle — it will pick up the
+            // thread in its own scheduling decision without cross-CPU overhead.
             let affinity = (*tcb).cpu_affinity;
             let this_cpu = crate::arch::current_cpu() as usize;
+            let this_cpu_idle = !self.idle[this_cpu].is_null()
+                && self.current[this_cpu] == self.idle[this_cpu];
 
-            if affinity != 0xFFFF_FFFF {
-                // Specific affinity: IPI target if idle
-                let target = affinity as usize;
-                if target != this_cpu
-                    && target < MAX_CPUS
-                    && !self.idle[target].is_null()
-                    && self.current[target] == self.idle[target]
-                {
-                    crate::arch::send_ipi(
-                        target,
-                        crate::arch::IpiKind::Reschedule,
-                    );
-                }
-            } else {
-                // Any-CPU affinity: IPI one idle CPU so it picks up the thread
-                for cpu in 0..MAX_CPUS {
-                    if cpu != this_cpu
-                        && !self.idle[cpu].is_null()
-                        && self.current[cpu] == self.idle[cpu]
+            if !this_cpu_idle {
+                let online = self.online_cpus as usize;
+                if affinity != 0xFFFF_FFFF {
+                    // Specific affinity: IPI target if idle
+                    let target = affinity as usize;
+                    if target != this_cpu
+                        && target < online
+                        && !self.idle[target].is_null()
+                        && self.current[target] == self.idle[target]
                     {
-                        crate::arch::send_ipi(cpu, crate::arch::IpiKind::Reschedule);
-                        break;
+                        crate::arch::send_ipi(
+                            target,
+                            crate::arch::IpiKind::Reschedule,
+                        );
+                    }
+                } else {
+                    // Any-CPU affinity: IPI one idle CPU so it picks up the thread
+                    for cpu in 0..online {
+                        if cpu != this_cpu
+                            && !self.idle[cpu].is_null()
+                            && self.current[cpu] == self.idle[cpu]
+                        {
+                            crate::arch::send_ipi(cpu, crate::arch::IpiKind::Reschedule);
+                            break;
+                        }
                     }
                 }
             }
@@ -216,6 +250,7 @@ impl Scheduler {
                 let tcb = self.ready_head;
                 self.ready_head = (*tcb).next;
                 (*tcb).next = core::ptr::null_mut();
+                (*tcb).ready_queued = false;
                 Some(tcb)
             }
         }
@@ -238,6 +273,7 @@ impl Scheduler {
                         (*prev).next = (*current).next;
                     }
                     (*current).next = core::ptr::null_mut();
+                    (*current).ready_queued = false;
                     return Some(current);
                 }
                 prev = current;
@@ -262,6 +298,7 @@ impl Scheduler {
                         (*prev).next = (*current).next;
                     }
                     (*current).next = core::ptr::null_mut();
+                    (*tcb).ready_queued = false;
                     return true;
                 }
                 prev = current;
@@ -273,18 +310,10 @@ impl Scheduler {
 
     /// Check whether a TCB is already present in the ready queue.
     ///
+    /// O(1) via `ready_queued` flag instead of O(N) queue walk.
     /// Caller MUST hold the scheduler lock.
     fn is_ready_queued_unlocked(&self, tcb: *mut Tcb) -> bool {
-        unsafe {
-            let mut current = self.ready_head;
-            while !current.is_null() {
-                if current == tcb {
-                    return true;
-                }
-                current = (*current).next;
-            }
-            false
-        }
+        unsafe { (*tcb).ready_queued }
     }
 
     // ---------------------------------------------------------------
@@ -388,10 +417,18 @@ impl Scheduler {
 
     /// Find which CPU a thread is running on by scanning current[].
     ///
+    /// Checks `last_cpu` hint first for O(1) fast path, then falls back
+    /// to scanning only online CPUs.
     /// Returns `None` if the thread is not the current thread on any CPU.
     /// Caller MUST hold the scheduler lock.
     pub fn find_running_cpu(&self, tcb: *mut Tcb) -> Option<usize> {
-        for cpu in 0..MAX_CPUS {
+        // Fast path: check last_cpu hint first
+        let last = unsafe { (*tcb).last_cpu } as usize;
+        let online = self.online_cpus as usize;
+        if last < online && self.current[last] == tcb {
+            return Some(last);
+        }
+        for cpu in 0..online {
             if self.current[cpu] == tcb {
                 return Some(cpu);
             }
@@ -613,7 +650,8 @@ impl Scheduler {
     ///
     /// Caller MUST hold the scheduler lock.
     pub(crate) fn pending_cpu_for(&self, tcb: *mut Tcb) -> Option<usize> {
-        for cpu in 0..MAX_CPUS {
+        let online = self.online_cpus as usize;
+        for cpu in 0..online {
             if self.pending_enqueue[cpu] == tcb {
                 return Some(cpu);
             }
@@ -986,7 +1024,8 @@ impl Scheduler {
 
         // Send rebalance IPIs AFTER releasing lock to prevent deadlock
         if rebalance_ipi_mask != 0 {
-            for cpu in 0..MAX_CPUS {
+            let online = self.online_cpus as usize;
+            for cpu in 0..online {
                 if rebalance_ipi_mask & (1 << cpu) != 0 {
                     unsafe {
                         crate::arch::send_ipi(cpu, crate::arch::IpiKind::Reschedule);
