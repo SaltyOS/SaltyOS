@@ -261,9 +261,9 @@ irq_stub_\name:
 .size irq_stub_\name, . - irq_stub_\name
 .endm
 
-irq_stub_sched_ipc timer
+irq_stub_nobkl timer
 irq_stub_nobkl ipi_vspace_teardown
-irq_stub_sched_ipc ipi_reschedule
+irq_stub_nobkl ipi_reschedule
 irq_stub_nobkl ipi_tlb_shootdown
 irq_stub_nobkl ipi_tlb_shootdown_all
 

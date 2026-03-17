@@ -1031,10 +1031,33 @@ impl Scheduler {
     // Timer tick (acquires lock internally)
     // ---------------------------------------------------------------
 
+    /// Perform a context switch with proper SCHED_IPC_LOCK protocol.
+    ///
+    /// Releases per-CPU scheduler lock, acquires SCHED_IPC_LOCK for the
+    /// switch protocol, then releases it after resume. Caller must hold
+    /// the per-CPU scheduler lock on entry and must NOT hold SCHED_IPC_LOCK.
+    unsafe fn context_switch_with_ipc_lock(
+        &mut self,
+        old_tcb: *mut Tcb,
+        new_tcb: *mut Tcb,
+        irq_flag: u64,
+    ) {
+        unsafe {
+            self.unlock();
+            crate::mm::SCHED_IPC_LOCK.lock();
+            self.do_context_switch(old_tcb, new_tcb);
+            // After resume: SCHED_IPC_LOCK is held (reacquired by switch_common)
+            crate::mm::SCHED_IPC_LOCK.unlock();
+            crate::mm::restore_irq(irq_flag);
+        }
+    }
+
     /// Handle timer tick — called from interrupt context.
     ///
-    /// Acquires the scheduler lock, performs budget accounting, and if a
-    /// context switch is needed, releases the lock before switching.
+    /// SCHED_IPC_LOCK is NOT held on entry (assembly stub does not acquire it).
+    /// Only acquires SCHED_IPC_LOCK when:
+    /// - Expired sleepers need endpoint/futex queue manipulation
+    /// - A context switch is needed (switch_common protocol)
     pub fn timer_tick(&mut self) {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
         self.lock();
@@ -1043,9 +1066,19 @@ impl Scheduler {
         // fresh thread whose entry point never returned through do_context_switch.
         self.process_pending_enqueue();
 
-        // Wake expired sleepers
+        // Wake expired sleepers. check_wakeups may modify endpoint/futex queues,
+        // which requires SCHED_IPC_LOCK. Peek first (no lock) to avoid the
+        // global lock on the common path where no sleepers have expired.
         let now_ns = crate::arch::now_ns();
-        unsafe { crate::sched::sleep_queue::check_wakeups(now_ns); }
+        if unsafe { crate::sched::sleep_queue::peek_expired(now_ns) } {
+            // Release per-CPU lock first (lock ordering: SCHED_IPC_LOCK → per-CPU)
+            self.unlock();
+            crate::mm::SCHED_IPC_LOCK.lock();
+            self.lock();
+            unsafe { crate::sched::sleep_queue::check_wakeups(now_ns); }
+            crate::mm::SCHED_IPC_LOCK.unlock();
+            // Continue with only per-CPU lock held
+        }
 
         unsafe {
             let cpu_id = crate::arch::current_cpu() as usize;
@@ -1067,9 +1100,7 @@ impl Scheduler {
                 let new_tcb = self.schedule_unlocked();
                 if current != new_tcb {
                     self.set_current(new_tcb);
-                    self.unlock();
-                    self.do_context_switch(current, new_tcb);
-                    crate::mm::restore_irq(irq_flag);
+                    self.context_switch_with_ipc_lock(current, new_tcb, irq_flag);
                     return;
                 }
                 self.unlock();
@@ -1091,9 +1122,7 @@ impl Scheduler {
                     let new_tcb = self.schedule_unlocked();
                     if current != new_tcb {
                         self.set_current(new_tcb);
-                        self.unlock();
-                        self.do_context_switch(current, new_tcb);
-                        crate::mm::restore_irq(irq_flag);
+                        self.context_switch_with_ipc_lock(current, new_tcb, irq_flag);
                         return;
                     }
                 } else {
@@ -1106,9 +1135,7 @@ impl Scheduler {
                         (*current).state = ThreadState::Running;
                     } else if current != new_tcb {
                         self.set_current(new_tcb);
-                        self.unlock();
-                        self.do_context_switch(current, new_tcb);
-                        crate::mm::restore_irq(irq_flag);
+                        self.context_switch_with_ipc_lock(current, new_tcb, irq_flag);
                         return;
                     }
                 }
@@ -1127,9 +1154,7 @@ impl Scheduler {
                     (*current).state = ThreadState::Running;
                 } else if current != new_tcb {
                     self.set_current(new_tcb);
-                    self.unlock();
-                    self.do_context_switch(current, new_tcb);
-                    crate::mm::restore_irq(irq_flag);
+                    self.context_switch_with_ipc_lock(current, new_tcb, irq_flag);
                     return;
                 }
             }
@@ -1169,8 +1194,8 @@ impl Scheduler {
 
     /// Handle reschedule IPI — checks ready queue for work on this CPU.
     ///
-    /// Unlike timer_tick(), this does not require a sched_context, so it
-    /// works correctly when the current thread is the idle thread.
+    /// SCHED_IPC_LOCK is NOT held on entry (assembly stub does not acquire it).
+    /// Only acquires SCHED_IPC_LOCK when a context switch is needed.
     pub fn handle_reschedule_ipi(&mut self) {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
         self.lock();
@@ -1203,9 +1228,7 @@ impl Scheduler {
                 (*current).state = ThreadState::Running;
             } else if current != new_tcb {
                 self.set_current(new_tcb);
-                self.unlock();
-                self.do_context_switch(current, new_tcb);
-                crate::mm::restore_irq(irq_flag);
+                self.context_switch_with_ipc_lock(current, new_tcb, irq_flag);
                 return;
             }
         }

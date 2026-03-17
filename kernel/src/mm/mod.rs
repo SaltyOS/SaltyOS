@@ -108,8 +108,8 @@ impl SpinLock {
 /// Nesting patterns:
 ///   - Slowpath syscalls: CAP_LOCK (cap lookup) → release → SCHED_IPC_LOCK (IPC)
 ///   - IPC cap transfer (transfer_message): releases SCHED_IPC_LOCK → CAP_LOCK (slot copy) → releases CAP_LOCK → re-acquires SCHED_IPC_LOCK
-///   - Fastpath: CAP_LOCK (cap copy-to-stack) → release → SCHED_IPC_LOCK → scheduler.lock_state
-///   - Timer/IPI: SCHED_IPC_LOCK (assembly stub) → scheduler.lock_state
+///   - Fastpath: CAP_LOCK (cap copy-to-stack) → release → SCHED_IPC_LOCK → per-CPU scheduler lock
+///   - Timer/IPI: per-CPU scheduler lock only (SCHED_IPC_LOCK acquired only for context switch or sleep wakeup)
 ///   - do_context_switch: releases SCHED_IPC_LOCK before switch, reacquires on resume
 pub static SCHED_IPC_LOCK: SpinLock = SpinLock::new();
 

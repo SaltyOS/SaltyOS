@@ -66,11 +66,26 @@ pub unsafe fn remove(tcb: *mut Tcb) -> bool {
     }
 }
 
+/// Peek whether the sleep queue head has expired (no lock needed).
+///
+/// Returns true if there is at least one sleeper whose wakeup time has passed.
+/// This is a read-only check used by timer_tick to decide whether to acquire
+/// SCHED_IPC_LOCK for the heavier check_wakeups processing.
+///
+/// # Safety
+/// Caller must have IRQs disabled (pins to current CPU).
+pub unsafe fn peek_expired(now_ns: u64) -> bool {
+    unsafe {
+        let head = *(&raw const HEAD);
+        !head.is_null() && (*head).timer_wakeup_ns <= now_ns
+    }
+}
+
 /// Check for expired sleepers and wake them.
 /// Returns the number of threads woken.
 ///
 /// # Safety
-/// Caller must hold the scheduler lock.
+/// Caller must hold the scheduler lock and SCHED_IPC_LOCK (for endpoint/futex removal).
 pub unsafe fn check_wakeups(now_ns: u64) -> usize {
     unsafe {
         let head_ptr = &raw mut HEAD;
