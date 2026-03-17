@@ -18,6 +18,14 @@ uint64_t __besalt_slot_base = 0;
 uint64_t __besalt_slot_count = 0;
 uint64_t __besalt_cspace_ntfn = 0;
 
+/* Exported ELF TLS info so libbesalt can set up the TLS data area */
+uint64_t __besalt_tls_template = 0;  /* Runtime address of .tdata template */
+uint64_t __besalt_tls_filesz = 0;    /* Size of .tdata (initialized data) */
+uint64_t __besalt_tls_memsz = 0;     /* Total static TLS block size */
+uint64_t __besalt_tls_align = 1;     /* Maximum static TLS alignment */
+uint64_t __besalt_tls_module_count = 0;
+struct rtld_tls_module __besalt_tls_modules[RTLD_MAX_OBJECTS];
+
 void __attribute__((naked, noreturn)) _start(void) {
     __asm__ volatile(
         "mov %%rsp, %%rdi\n"
@@ -62,6 +70,76 @@ static Elf64_Dyn *find_dynamic(uint64_t base) {
             return (Elf64_Dyn *)(base + phdrs[i].p_vaddr);
     }
     return NULL;
+}
+
+static void finalize_static_tls_layout(struct rtld_state *st) {
+    uint64_t total = 0;
+    uint64_t max_align = 1;
+    uint64_t module_id = 1;
+
+    for (struct link_map *map = st->head; map; map = map->next) {
+        map->tls_module_id = 0;
+        map->tls_tpoff = 0;
+        if (map->tls_memsz == 0)
+            continue;
+
+        uint64_t align = map->tls_align ? map->tls_align : 1;
+        uint64_t next_total = total + map->tls_memsz;
+        if (align > 1)
+            next_total = (next_total + align - 1) & ~(align - 1);
+        total = next_total;
+        if (align > max_align)
+            max_align = align;
+
+        map->tls_module_id = module_id++;
+        map->tls_tpoff = -(int64_t)total;
+    }
+
+    st->tls_memsz = total;
+    st->tls_align = max_align;
+    st->tls_module_count = module_id - 1;
+}
+
+static void export_static_tls_layout(struct rtld_state *st) {
+    __besalt_tls_template = st->exe_tls_vaddr;
+    __besalt_tls_filesz = st->exe_tls_filesz;
+    __besalt_tls_memsz = st->tls_memsz;
+    __besalt_tls_align = st->tls_align;
+    __besalt_tls_module_count = st->tls_module_count;
+    rtld_memset(__besalt_tls_modules, 0, sizeof(__besalt_tls_modules));
+
+    uint64_t tls_index = 0;
+    for (struct link_map *map = st->head; map && tls_index < RTLD_MAX_OBJECTS; map = map->next) {
+        if (map->tls_module_id == 0)
+            continue;
+
+        __besalt_tls_modules[tls_index].module_id = map->tls_module_id;
+        __besalt_tls_modules[tls_index].template_addr = map->tls_template;
+        __besalt_tls_modules[tls_index].filesz = map->tls_filesz;
+        __besalt_tls_modules[tls_index].memsz = map->tls_memsz;
+        __besalt_tls_modules[tls_index].tpoff = map->tls_tpoff;
+        tls_index++;
+    }
+
+    uint64_t tmpl_addr = resolve_symbol_addr(&g_rtld, "__besalt_tls_template");
+    if (tmpl_addr != 0)
+        *(volatile uint64_t *)tmpl_addr = __besalt_tls_template;
+    uint64_t fsz_addr = resolve_symbol_addr(&g_rtld, "__besalt_tls_filesz");
+    if (fsz_addr != 0)
+        *(volatile uint64_t *)fsz_addr = __besalt_tls_filesz;
+    uint64_t msz_addr = resolve_symbol_addr(&g_rtld, "__besalt_tls_memsz");
+    if (msz_addr != 0)
+        *(volatile uint64_t *)msz_addr = __besalt_tls_memsz;
+    uint64_t align_addr = resolve_symbol_addr(&g_rtld, "__besalt_tls_align");
+    if (align_addr != 0)
+        *(volatile uint64_t *)align_addr = __besalt_tls_align;
+    uint64_t count_addr = resolve_symbol_addr(&g_rtld, "__besalt_tls_module_count");
+    if (count_addr != 0)
+        *(volatile uint64_t *)count_addr = __besalt_tls_module_count;
+    uint64_t mods_addr = resolve_symbol_addr(&g_rtld, "__besalt_tls_modules");
+    if (mods_addr != 0)
+        rtld_memcpy((void *)(uintptr_t)mods_addr, __besalt_tls_modules,
+                    sizeof(__besalt_tls_modules));
 }
 
 void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
@@ -147,6 +225,13 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
             exe_phdr_vaddr = ph->p_vaddr;
             have_phdr = 1;
         }
+        if (ph->p_type == PT_TLS) {
+            g_rtld.exe_tls_filesz = ph->p_filesz;
+            g_rtld.exe_tls_memsz  = ph->p_memsz;
+            g_rtld.exe_tls_align  = ph->p_align ? ph->p_align : 1;
+            /* vaddr needs load delta applied — done below */
+            g_rtld.exe_tls_vaddr  = ph->p_vaddr;
+        }
     }
 
     /* Compute load delta: AT_PHDR is the actual runtime address of the phdrs,
@@ -177,6 +262,10 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
     exe_base = exe_min_vaddr + exe_load_delta;
     g_rtld.exe_phdr = at_phdr;
 
+    /* Apply delta to TLS template address */
+    if (g_rtld.exe_tls_memsz > 0)
+        g_rtld.exe_tls_vaddr += exe_load_delta;
+
     /* Create link_map for executable */
     struct link_map *exe_map = &g_rtld.objects[0];
     exe_map->name = "executable";
@@ -186,6 +275,10 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
     if (exe_dyn) {
         parse_dynamic(exe_map, exe_dyn, exe_base);
     }
+    exe_map->tls_template = g_rtld.exe_tls_vaddr;
+    exe_map->tls_filesz = g_rtld.exe_tls_filesz;
+    exe_map->tls_memsz = g_rtld.exe_tls_memsz;
+    exe_map->tls_align = g_rtld.exe_tls_align ? g_rtld.exe_tls_align : 1;
 
     /* 4. Load shared libraries: walk exe's DT_NEEDED entries */
     uint64_t lib_load_addr;
@@ -243,6 +336,8 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
             }
         }
     }
+
+    finalize_static_tls_layout(&g_rtld);
 
     /* 5. Process relocations for all loaded objects (libs first, then exe) */
     for (int i = g_rtld.nobjects - 1; i >= 0; i--) {
@@ -315,6 +410,23 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         uint64_t ntfn_addr = resolve_symbol_addr(&g_rtld, "__besalt_cspace_ntfn");
         if (ntfn_addr != 0)
             *(volatile uint64_t *)ntfn_addr = g_rtld.cspace_ntfn;
+    }
+
+    /* 7d. Export combined static TLS layout for libbesalt. */
+    export_static_tls_layout(&g_rtld);
+
+    /* 7e. Call shared library constructors (DT_INIT + DT_INIT_ARRAY).
+     * Skip index 0 (the executable) -- its .init_array is called by the CRT.
+     * Forward order matches dependency order for flat DT_NEEDED loading.
+     */
+    for (int i = 1; i < g_rtld.nobjects; i++) {
+        struct link_map *map = &g_rtld.objects[i];
+        if (map->init_fn)
+            map->init_fn();
+        for (uint64_t j = 0; j < map->init_array_count; j++) {
+            if (map->init_array[j])
+                map->init_array[j]();
+        }
     }
 
     /* 8. Jump to executable entry point.

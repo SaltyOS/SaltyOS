@@ -199,7 +199,7 @@ if build_userland
   sysroot_target = custom_target('sysroot',
     output: 'sysroot.stamp',
     depends: [core, compiler_builtins, libbesalt_so, libc_so, crt_start_obj, ld_besalt_so],
-    depend_files: besaltc_header_files + [files('userland/tests/hello/link.ld')],
+    depend_files: besaltc_header_files + [files('lib/besalt/saltyos-pie.ld')],
     command: [
       mksysroot_prog,
       '--build-dir', meson.project_build_root(),
@@ -262,6 +262,12 @@ if build_userland and mkcpio.found()
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
+  initrd_libcxx_so = custom_target('initrd_libcxx_so',
+    input: libcxx_so,
+    output: 'libc++.initrd.so',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
   initrd_nameserv_elf = custom_target('initrd_nameserv_elf',
     input: nameserv_elf,
     output: 'nameserv.initrd.elf',
@@ -296,12 +302,6 @@ if build_userland and mkcpio.found()
   stripped_test_runner_elf = custom_target('stripped_test_runner_elf',
     input: test_runner_elf,
     output: 'test_runner.stripped.elf',
-    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
-    build_by_default: true,
-  )
-  stripped_hello_elf = custom_target('stripped_hello_elf',
-    input: hello_elf,
-    output: 'hello.stripped.elf',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
@@ -363,7 +363,6 @@ if build_userland and mkcpio.found()
   svc_display = files('userland/services/display.service')
   svc_ttyd = files('userland/services/ttyd.service')
   svc_test_runner = files('userland/services/test_runner.service')
-  svc_hello = files('userland/services/hello.service')
   svc_getty = files('userland/services/getty.service')
   svc_pcisrv = files('userland/services/pcisrv.service')
   svc_blkdrv = files('userland/services/blkdrv.service')
@@ -377,12 +376,13 @@ if build_userland and mkcpio.found()
   # Boot-critical binaries only (non-critical moved to rootfs).
   initrd = custom_target('initrd',
     input: [initrd_rtld_so, initrd_libbesalt_so, initrd_libc_so,
+            initrd_libcxx_so,
             initrd_init_elf, initrd_console_elf, initrd_nameserv_elf,
             initrd_procmgr_elf, initrd_vfs_elf, initrd_mmsrv_elf,
             initrd_pcisrv_elf, initrd_blkdrv_elf, initrd_saltyfs_elf,
             svc_console, svc_nameserv, svc_mmsrv,
             svc_vfs, svc_procmgr, svc_display,
-            svc_ttyd, svc_test_runner, svc_hello, svc_getty,
+            svc_ttyd, svc_test_runner, svc_getty,
             svc_pcisrv, svc_blkdrv, svc_saltyfs, svc_netdrv, svc_netsrv,
             svc_dnssrv],
     depend_files: mkcpio_script,
@@ -390,30 +390,30 @@ if build_userland and mkcpio.found()
     command: [mkcpio,
       '--output', '@OUTPUT@',
       ] + [
-      # Shared libraries (inputs 0-2)
+      # Shared libraries (inputs 0-3)
       'ld-besalt.so=@INPUT0@',
       'libbesalt.so=@INPUT1@',
       'libc.so=@INPUT2@',
-      # Boot-critical services (inputs 3-11)
-      'init=@INPUT3@',
-      'console=@INPUT4@',
-      'nameserv=@INPUT5@',
-      'procmgr=@INPUT6@',
-      'vfs=@INPUT7@',
-      'mmsrv=@INPUT8@',
-      'pcisrv=@INPUT9@',
-      'blkdrv=@INPUT10@',
-      'saltyfs=@INPUT11@',
-      # Service definitions (inputs 12-27)
-      'services/console.service=@INPUT12@',
-      'services/nameserv.service=@INPUT13@',
-      'services/mmsrv.service=@INPUT14@',
-      'services/vfs.service=@INPUT15@',
-      'services/procmgr.service=@INPUT16@',
-      'services/display.service=@INPUT17@',
-      'services/ttyd.service=@INPUT18@',
-      'services/test_runner.service=@INPUT19@',
-      'services/hello.service=@INPUT20@',
+      'libc++.so=@INPUT3@',
+      # Boot-critical services (inputs 4-12)
+      'init=@INPUT4@',
+      'console=@INPUT5@',
+      'nameserv=@INPUT6@',
+      'procmgr=@INPUT7@',
+      'vfs=@INPUT8@',
+      'mmsrv=@INPUT9@',
+      'pcisrv=@INPUT10@',
+      'blkdrv=@INPUT11@',
+      'saltyfs=@INPUT12@',
+      # Service definitions (inputs 13-28)
+      'services/console.service=@INPUT13@',
+      'services/nameserv.service=@INPUT14@',
+      'services/mmsrv.service=@INPUT15@',
+      'services/vfs.service=@INPUT16@',
+      'services/procmgr.service=@INPUT17@',
+      'services/display.service=@INPUT18@',
+      'services/ttyd.service=@INPUT19@',
+      'services/test_runner.service=@INPUT20@',
       'services/getty.service=@INPUT21@',
       'services/pcisrv.service=@INPUT22@',
       'services/blkdrv.service=@INPUT23@',
@@ -475,7 +475,7 @@ if mkrootfs.found() and build_userland
 
   rootfs_image = custom_target('rootfs_image',
     input: [stripped_display_elf, stripped_ttyd_elf, stripped_getty_elf,
-            stripped_test_runner_elf, stripped_hello_elf,
+            stripped_test_runner_elf,
             stripped_netdrv_elf, stripped_netsrv_elf, stripped_dnssrv_elf],
     depends: [rootfs_ports_manifest],
     depend_files: [mkrootfs_script, mksaltyfs_script, rootfs_manifest, rootfs_packages],

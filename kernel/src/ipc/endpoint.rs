@@ -13,6 +13,75 @@ use crate::sched::scheduler::scheduler as get_scheduler;
 /// Only messages without capability transfer are enqueued. Messages with
 /// extra caps still require an active receiver for immediate transfer.
 const NBSEND_QUEUE_DEPTH: usize = 64;
+const POSIX_PM_EXEC_LABEL: u64 = 6;
+const IPC_BUFFER_RESERVED_BYTES: usize = core::mem::size_of::<[u64; 478]>();
+
+fn exec_payload_len(msg: &Message) -> Option<usize> {
+    if msg.label != POSIX_PM_EXEC_LABEL {
+        return None;
+    }
+
+    let path_len = msg.regs[0] as usize;
+    if path_len > 64 {
+        return None;
+    }
+
+    let path_regs = 1 + ((path_len + 7) / 8);
+    let len_reg = path_regs + 1;
+    if len_reg >= msg.length || len_reg >= msg.regs.len() {
+        return None;
+    }
+
+    let payload_len = msg.regs[len_reg] as usize;
+    if payload_len > IPC_BUFFER_RESERVED_BYTES {
+        return None;
+    }
+    Some(payload_len)
+}
+
+unsafe fn resolve_ipc_buffer_ptr(tcb: *mut Tcb) -> Option<*mut super::IpcBuffer> {
+    unsafe {
+        if tcb.is_null() {
+            return None;
+        }
+
+        let ipc_buffer = (*tcb).ipc_buffer;
+        if ipc_buffer == 0 || (ipc_buffer & 0xFFF) != 0 || (*tcb).vspace_root.is_null() {
+            return None;
+        }
+
+        let vspace = &*(*tcb).vspace_root;
+        let phys = vspace.resolve_page(ipc_buffer)?;
+        Some(crate::mm::phys_to_virt(phys) as *mut super::IpcBuffer)
+    }
+}
+
+unsafe fn transfer_exec_payload(sender: *mut Tcb, receiver: *mut Tcb, msg: &Message) {
+    unsafe {
+        if msg.label != POSIX_PM_EXEC_LABEL {
+            return;
+        }
+
+        let Some(receiver_buf) = resolve_ipc_buffer_ptr(receiver) else {
+            return;
+        };
+        let dst = (*receiver_buf).reserved.as_mut_ptr() as *mut u8;
+        core::ptr::write_bytes(dst, 0, IPC_BUFFER_RESERVED_BYTES);
+
+        let Some(payload_len) = exec_payload_len(msg) else {
+            return;
+        };
+        if payload_len == 0 {
+            return;
+        }
+
+        let Some(sender_buf) = resolve_ipc_buffer_ptr(sender) else {
+            return;
+        };
+        let src = (*sender_buf).reserved.as_ptr() as *const u8;
+        core::ptr::copy(src, dst, payload_len);
+    }
+}
 
 /// Endpoint state
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -260,6 +329,15 @@ impl Endpoint {
     pub fn recv(&mut self) -> (Message, u64) {
         unsafe {
             let current = get_scheduler().current();
+
+            // Clear stale reply capability — if the server is calling recv()
+            // instead of reply_recv(), any previous reply_tcb is abandoned.
+            if !(*current).reply_tcb.is_null() {
+                crate::sched::pip::pip_undonate(current, (*current).reply_tcb);
+                (*current).reply_tcb = core::ptr::null_mut();
+                (*current).reply_can_grant = false;
+            }
+
             Self::cache_receive_slot(current);
 
             match self.state {
@@ -531,6 +609,7 @@ impl Endpoint {
             // Copy message and badge to receiver's TCB
             (*receiver).saved_caller_msg = *msg;
             (*receiver).saved_caller_badge = badge;
+            transfer_exec_payload(sender, receiver, msg);
 
             // Check for capability transfer via IPC buffer.
             // Use msg.extra_caps (from sender's msg_info) to bound the loop.
@@ -815,6 +894,14 @@ impl Endpoint {
     pub fn recv_timeout(&mut self, timeout_ns: u64) -> (Message, u64, u64) {
         unsafe {
             let current = get_scheduler().current();
+
+            // Clear stale reply capability (same rationale as recv()).
+            if !(*current).reply_tcb.is_null() {
+                crate::sched::pip::pip_undonate(current, (*current).reply_tcb);
+                (*current).reply_tcb = core::ptr::null_mut();
+                (*current).reply_can_grant = false;
+            }
+
             Endpoint::cache_receive_slot(current);
 
             match self.state {

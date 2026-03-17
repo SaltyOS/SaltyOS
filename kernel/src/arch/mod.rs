@@ -19,7 +19,7 @@ pub use x86_64::{get_ticks, now_ns, send_ipi, set_tlb_shootdown_addr, IpiKind};
 
 // Re-export IOAPIC dynamic IRQ routing
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::{ioapic_unmask, ioapic_mask};
+pub use x86_64::{ioapic_unmask, ioapic_unmask_level, ioapic_mask};
 
 // Re-export FPU sub-module (lazy switching, context switch hooks)
 #[cfg(target_arch = "x86_64")]

@@ -702,6 +702,13 @@ unsafe fn init_ramfs() {
         (*initrd_dir).parent_ino = (*root).ino;
         ramfs::dir_add_entry(root, b"initrd".as_ptr(), 6, (*initrd_dir).ino);
 
+        let tmp_dir = ramfs::alloc_inode();
+        (*tmp_dir).ftype = FTYPE_DIRECTORY;
+        (*tmp_dir).mode = S_IFDIR_L | 0o1777;
+        (*tmp_dir).nlink = 2;
+        (*tmp_dir).parent_ino = (*root).ino;
+        ramfs::dir_add_entry(root, b"tmp".as_ptr(), 3, (*tmp_dir).ino);
+
         let initrd = INITRD_VADDR as *const u8;
         let initrd_size = ramfs::read_boot_info_initrd_size();
 

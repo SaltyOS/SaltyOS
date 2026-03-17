@@ -16,7 +16,7 @@ pub mod paging;
 mod pit;
 pub mod smap;
 
-pub use apic::{send_ipi, set_tlb_shootdown_addr, IpiKind, ioapic_unmask, ioapic_mask};
+pub use apic::{send_ipi, set_tlb_shootdown_addr, IpiKind, ioapic_unmask, ioapic_unmask_level, ioapic_mask};
 pub use cpu::{current_cpu, set_kernel_stack, next_invoke_seq, current_invoke_seq, read_fs_base, write_fs_base, generate_stack_canary, set_per_cpu_canary, MAX_CPUS};
 pub use gdt::set_tss_rsp0;
 
@@ -118,6 +118,10 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // Must happen after paging::init() creates the direct map and before
     // the identity map (PML4[0]) is removed.
     crate::mm::remap_frame_bitmap();
+
+    // Phase 2: allocate per-frame tracking arrays now that the direct map
+    // covers all physical memory. These arrays can live anywhere in RAM.
+    crate::mm::init_per_frame_arrays();
 
     // Initialize PIT (for calibration and fallback)
     pit::init();

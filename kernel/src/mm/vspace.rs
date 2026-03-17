@@ -1401,6 +1401,83 @@ impl VSpace {
         result
     }
 
+    /// Change the protection flags on a contiguous range of already-mapped pages.
+    ///
+    /// Acquires the VSpace lock once for the entire range. After all PTEs are
+    /// updated, flushes TLB entries using the adaptive threshold strategy:
+    /// large ranges (>8 pages) get a full TLB flush, small ranges get per-page
+    /// `invlpg` + remote shootdown.  Pages that are not mapped (or not yet
+    /// present) are silently skipped.
+    ///
+    /// Returns the number of pages whose flags were successfully updated.
+    pub fn protect_range(
+        &mut self,
+        virt: VirtAddr,
+        count: usize,
+        flags: PageFlags,
+    ) -> Result<usize, VSpaceError> {
+        if virt & (PAGE_SIZE as u64 - 1) != 0 {
+            return Err(VSpaceError::Alignment);
+        }
+
+        let irq = unsafe { save_irq_disable() };
+        self.lock.lock();
+
+        let mut protected = 0usize;
+        for i in 0..count {
+            let addr = virt + (i as u64) * PAGE_SIZE as u64;
+            let entry = match self.read_entry(addr, 1) {
+                Some(e) => e,
+                None => continue,
+            };
+
+            if entry & ENTRY_PRESENT == 0 && entry & ENTRY_DEMAND != 0 {
+                let entry_flags = Self::flags_to_entry_flags(flags);
+                let new_demand = (entry_flags & !ENTRY_PRESENT) | ENTRY_DEMAND;
+                if self.write_entry(addr, 1, new_demand).is_ok() {
+                    protected += 1;
+                }
+                continue;
+            }
+
+            if entry & ENTRY_PRESENT == 0 {
+                continue;
+            }
+
+            let phys = entry & ENTRY_ADDR_MASK;
+            let new_entry = phys | Self::flags_to_entry_flags(flags);
+            if self.write_entry(addr, 1, new_entry).is_ok() {
+                protected += 1;
+            }
+        }
+
+        // Adaptive TLB flush: full flush for large ranges, per-page for small.
+        if protected > RANGE_TLB_GLOBAL_THRESHOLD {
+            if self.active_on_current_cpu() {
+                let cr3 = crate::arch::x86_64::paging::read_cr3();
+                unsafe {
+                    crate::arch::x86_64::paging::write_cr3(cr3);
+                }
+            }
+            self.tlb_shootdown_all();
+        } else if protected > 0 {
+            let do_local_flush = self.active_on_current_cpu();
+            let page_size = PAGE_SIZE as u64;
+            for i in 0..count {
+                let addr = virt + (i as u64) * page_size;
+                if do_local_flush {
+                    crate::arch::x86_64::paging::invlpg(addr);
+                }
+                self.tlb_shootdown(addr);
+            }
+        }
+
+        self.lock.unlock();
+        unsafe { restore_irq(irq) };
+
+        Ok(protected)
+    }
+
     /// Clone one source page into destination VSpace using COW semantics.
     ///
     /// - Read-only pages are shared directly.
@@ -1980,7 +2057,15 @@ impl VSpace {
             }
 
             // Allocate a zero-fill frame
-            let new_phys = alloc_frame().ok_or(VSpaceError::OutOfMemory)?;
+            let new_phys = match alloc_frame() {
+                Some(p) => p,
+                None => {
+                    crate::serial_puts_raw("[MM] demand fault OOM at vaddr=0x");
+                    crate::serial_hex_raw(page_vaddr);
+                    crate::serial_puts_raw("\n");
+                    return Err(VSpaceError::OutOfMemory);
+                }
+            };
             // SAFETY: phys_to_virt returns kernel-mapped address for the frame
             unsafe {
                 core::ptr::write_bytes(phys_to_virt(new_phys) as *mut u8, 0, PAGE_SIZE);

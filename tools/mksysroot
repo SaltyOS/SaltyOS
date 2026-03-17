@@ -30,6 +30,7 @@ REQUIRED_BUILD_FILES = [
 OPTIONAL_BUILD_FILES = [
     ("libbesalt.rmeta", "lib/besalt/lib/libbesalt.rmeta"),
     ("besaltc.rmeta",   "lib/besalt/c/besaltc.rmeta"),
+    ("libc++.so",       "lib/besalt/cpp/libc++.so"),
 ]
 
 
@@ -81,7 +82,11 @@ def main():
     output_dir = args.output.resolve()
 
     header_src = repo_root / "lib" / "besalt" / "c" / "include"
-    pie_linker_script = repo_root / "userland" / "tests" / "hello" / "link.ld"
+    pie_linker_script = repo_root / "lib" / "besalt" / "saltyos-pie.ld"
+    cxx_inc_src = repo_root / "toolchain" / "llvm-project" / "libcxx" / "include"
+    cxxabi_inc_src = repo_root / "toolchain" / "llvm-project" / "libcxxabi" / "include"
+    cxx_config_site = repo_root / "lib" / "besalt" / "cpp" / "__config_site"
+    cxx_assertion_handler = repo_root / "lib" / "besalt" / "cpp" / "__assertion_handler"
 
     # Validate sources exist
     if not build_dir.is_dir():
@@ -106,12 +111,31 @@ def main():
     copied = 0
     warnings = 0
 
-    # Copy headers (preserve directory structure)
+    # Copy C headers (preserve directory structure)
     if args.verbose:
-        print(f"Copying headers from {header_src}")
+        print(f"Copying C headers from {header_src}")
     shutil.copytree(header_src, include_dir, dirs_exist_ok=True)
     header_count = sum(1 for _ in include_dir.rglob("*.h"))
     copied += header_count
+
+    # Copy C++ headers (libcxx + libcxxabi) into usr/include/c++/v1/ when available
+    cxx_inc_dst = output_dir / "usr" / "include" / "c++" / "v1"
+    if cxx_inc_src.is_dir():
+        if args.verbose:
+            print(f"Copying C++ headers from {cxx_inc_src}")
+        shutil.copytree(cxx_inc_src, cxx_inc_dst, dirs_exist_ok=True)
+        if cxxabi_inc_src.is_dir():
+            shutil.copytree(cxxabi_inc_src, cxx_inc_dst, dirs_exist_ok=True)
+        if cxx_config_site.exists():
+            copy_file(cxx_config_site, cxx_inc_dst / "__config_site", args.verbose)
+        if cxx_assertion_handler.exists():
+            copy_file(cxx_assertion_handler, cxx_inc_dst / "__assertion_handler", args.verbose)
+        cxx_header_count = sum(1 for _ in cxx_inc_dst.rglob("*") if _.is_file())
+        copied += cxx_header_count
+        if args.verbose:
+            print(f"  {cxx_header_count} C++ headers installed to {cxx_inc_dst}")
+    elif args.verbose:
+        print(f"  Skipping C++ headers (toolchain/llvm-project not found)")
 
     # Copy required build files
     for dest_name, src_rel in REQUIRED_BUILD_FILES:
@@ -143,6 +167,20 @@ def main():
         else:
             print(f"Warning: optional file not found, skipping: {src}")
             warnings += 1
+
+    # Create empty stub archives (musl-libc pattern).
+    # SaltyOS folds math, pthread, rt, dl, and util into libc.so.
+    # Build systems that unconditionally pass -lm/-lpthread/-lrt/-ldl/-lutil
+    # need these files to exist; the linker finds them, sees no objects, and
+    # is satisfied — actual symbols come from libc.so already on the link line.
+    stub_libs = ["libm.a", "libpthread.a", "librt.a", "libdl.a", "libutil.a"]
+    for name in stub_libs:
+        path = lib_dir / name
+        with open(path, "wb") as f:
+            f.write(b"!<arch>\n")
+        if args.verbose:
+            print(f"Created stub archive: {path}")
+        copied += 1
 
     # Summary
     print(

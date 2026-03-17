@@ -75,6 +75,9 @@ pub struct ServiceDef {
     pub spawn_args: [u8; MAX_SPAWN_ARGS_BYTES],
     pub spawn_args_len: u8,
     pub spawn_argc: u8,
+    /// Service role declaration (e.g. "pager" for the memory manager).
+    pub role: [u8; 16],
+    pub role_len: u8,
 }
 
 impl ServiceDef {
@@ -104,6 +107,8 @@ impl ServiceDef {
             spawn_args: [0; MAX_SPAWN_ARGS_BYTES],
             spawn_args_len: 0,
             spawn_argc: 0,
+            role: [0; 16],
+            role_len: 0,
         }
     }
 
@@ -129,6 +134,10 @@ impl ServiceDef {
             len += 1;
         }
         &self.before[idx][..len]
+    }
+
+    pub fn role_bytes(&self) -> &[u8] {
+        &self.role[..self.role_len as usize]
     }
 }
 
@@ -569,6 +578,8 @@ pub fn parse_service(data: &[u8], out: &mut ServiceDef) -> bool {
                                 let (args_len, argc) = parse_spawn_args(value, &mut out.spawn_args);
                                 out.spawn_args_len = args_len;
                                 out.spawn_argc = argc;
+                            } else if bytes_eq_ci(key, b"Role") {
+                                out.role_len = copy_to_buf(value, &mut out.role);
                             } else if bytes_eq_ci(key, b"Restart") {
                                 if bytes_eq_ci(value, b"no") {
                                     out.restart = RestartPolicy::No;

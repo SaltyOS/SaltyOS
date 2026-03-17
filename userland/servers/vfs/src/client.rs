@@ -340,11 +340,10 @@ pub(crate) unsafe fn cleanup_client_state(dead_badge: u64) {
 
         // Notify ttyd to release any controlling terminal owned by this dead client.
         let mut treq = BesaltMsg::zeroed();
-        let mut treply = BesaltMsg::zeroed();
         treq.label = TTYD_CLIENT_EXIT;
         treq.regs[0] = dead_badge;
         treq.length = 1;
-        let _ = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
+        let _ = ipc::nbsend_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq);
 
         // Unmap per-client bulk SHM from VFS address space.
         crate::bulk::cleanup_bulk_shm(cli);

@@ -181,12 +181,53 @@ fn dir_entry_remove_with_ref(parent_ino: u64, child_ino: u64, name: &[u8]) -> Di
 }
 
 /// Look up a directory entry by name within a directory inode.
-/// Uses cross-leaf B-tree iteration to handle directories spanning multiple leaves.
+/// Uses direct hash-based B-tree lookup with linear probing for collisions,
+/// matching the insertion strategy in `dir_item_insert`.
+/// Falls back to full scan for old-style entries (offset != fnv1a_hash).
 pub(crate) fn lookup_in_dir(dir_ino: u64, name: *const u8, name_len: u8) -> Option<(u64, u8)> {
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
-    let mut result: Option<(u64, u8)> = None;
 
+    // Build a slice for hashing
+    let name_slice = unsafe { core::slice::from_raw_parts(name, name_len as usize) };
+    let base_hash = fnv1a_hash(name_slice);
+
+    // Direct hash lookup with linear probing (matches dir_item_insert)
+    let mut key = BTreeKey {
+        object_id: dir_ino,
+        item_type: BESALT_DIR_ITEM,
+        offset: base_hash,
+    };
+    for _ in 0..16 {
+        if let Some((data_ptr, _size)) = btree_find_item(root_tree, &key) {
+            // SAFETY: data_ptr points to a valid DIR_ITEM within a mapped B-tree leaf.
+            unsafe {
+                let (child_ino, entry_name_len, dir_type) = parse_dir_item_header(data_ptr);
+                if entry_name_len == name_len as u16 {
+                    let entry_name = data_ptr.add(DIR_ITEM_HEADER_SIZE);
+                    let mut matched = true;
+                    for j in 0..name_len as usize {
+                        if *entry_name.add(j) != *name.add(j) {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if matched {
+                        return Some((child_ino, dir_type));
+                    }
+                }
+            }
+        } else {
+            break; // No entry at this offset — no more probing needed
+        }
+        key.offset = key.offset.wrapping_add(1);
+    }
+
+    // Fallback: full scan for old-style entries where offset is the child inode
+    // number rather than fnv1a_hash(name). This covers images created before the
+    // hash-based keying was introduced.
+    let mut result: Option<(u64, u8)> = None;
     btree_find_all_for_ino(root_tree, dir_ino, BESALT_DIR_ITEM, |_key, data_ptr, _size| {
+        // SAFETY: data_ptr points to a valid DIR_ITEM within a mapped B-tree leaf.
         unsafe {
             let (child_ino, entry_name_len, dir_type) = parse_dir_item_header(data_ptr);
             if entry_name_len as u8 == name_len {

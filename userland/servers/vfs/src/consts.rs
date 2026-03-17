@@ -87,8 +87,8 @@ pub(crate) const VFS_PWRITE: u64 = 63;
 pub(crate) const VFS_BULK_SETUP: u64 = 64;
 pub(crate) const VFS_BULK_READ: u64 = 65;
 
-/// Per-client bulk SHM size (256KB = 64 pages).
-pub(crate) const CLIENT_BULK_SHM_PAGES: u64 = 64;
+/// Per-client bulk SHM size (1MB = 256 pages).
+pub(crate) const CLIENT_BULK_SHM_PAGES: u64 = 256;
 
 pub(crate) const TTYD_GET_FG_PGRP: u64 = 1;
 pub(crate) const TTYD_SET_FG_PGRP: u64 = 2;
@@ -207,7 +207,7 @@ pub(crate) const MAX_MOUNTS: usize = 4;
 
 /// VFS-SaltyFS shared memory for bulk data transport
 pub(crate) const VFS_SALTYFS_SHM_VADDR: u64 = 0x0000_0000_5000_0000;
-pub(crate) const VFS_SALTYFS_SHM_PAGES: u64 = 64; // 256KB
+pub(crate) const VFS_SALTYFS_SHM_PAGES: u64 = 256; // 1MB
 pub(crate) const VFS_SALTYFS_SHM_ID: u64 = 0x56534653; // "VSFS"
 
 // PTY pending reader queue for deferred terminal reads

@@ -30,4 +30,3 @@ subdir('fs/saltyfs')
 
 # Tests and demos
 subdir('tests/test_runner')
-subdir('tests/hello')

@@ -6,4 +6,4 @@ Restart=always
 
 [Dependencies]
 After=console nameserv procmgr vfs ttyd saltyfs
-Before=test_runner hello
+Before=test_runner

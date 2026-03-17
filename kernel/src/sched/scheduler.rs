@@ -141,6 +141,15 @@ impl Scheduler {
                 return;
             }
 
+            if self.find_running_cpu(tcb).is_some() {
+                return;
+            }
+
+            if self.is_ready_queued_unlocked(tcb) {
+                (*tcb).state = ThreadState::Ready;
+                return;
+            }
+
             // If the thread is still waiting for its outgoing context to be
             // saved on some CPU, defer actual queue insertion until that CPU
             // flushes its pending slot.
@@ -262,6 +271,22 @@ impl Scheduler {
         }
     }
 
+    /// Check whether a TCB is already present in the ready queue.
+    ///
+    /// Caller MUST hold the scheduler lock.
+    fn is_ready_queued_unlocked(&self, tcb: *mut Tcb) -> bool {
+        unsafe {
+            let mut current = self.ready_head;
+            while !current.is_null() {
+                if current == tcb {
+                    return true;
+                }
+                current = (*current).next;
+            }
+            false
+        }
+    }
+
     // ---------------------------------------------------------------
     // Locking wrapper methods (for external callers without lock held)
     // ---------------------------------------------------------------
@@ -317,18 +342,24 @@ impl Scheduler {
     /// Caller MUST hold the scheduler lock.
     fn schedule_unlocked(&mut self) -> *mut Tcb {
         let cpu_id = crate::arch::current_cpu() as usize;
-        if let Some(tcb) = self.dequeue_for_cpu_unlocked(cpu_id) {
+        while let Some(tcb) = self.dequeue_for_cpu_unlocked(cpu_id) {
             unsafe {
+                if (*tcb).state != ThreadState::Ready
+                    || self.find_running_cpu(tcb).is_some()
+                    || self.is_pending_on_any_cpu(tcb)
+                {
+                    continue;
+                }
                 (*tcb).state = ThreadState::Running;
                 (*tcb).last_cpu = cpu_id as u32;
             }
             self.current[cpu_id] = tcb;
             CURRENT_ON_CPU[cpu_id].store(tcb as usize, core::sync::atomic::Ordering::Release);
-            tcb
-        } else {
-            // Return idle thread for this CPU
-            self.idle[cpu_id]
+            return tcb;
         }
+
+        // Return idle thread for this CPU
+        self.idle[cpu_id]
     }
 
     /// Current running thread (on calling CPU)
@@ -575,12 +606,19 @@ impl Scheduler {
     ///
     /// Caller MUST hold the scheduler lock.
     fn is_pending_on_any_cpu(&self, tcb: *mut Tcb) -> bool {
+        self.pending_cpu_for(tcb).is_some()
+    }
+
+    /// Return the CPU whose deferred-switch slot currently references `tcb`.
+    ///
+    /// Caller MUST hold the scheduler lock.
+    pub(crate) fn pending_cpu_for(&self, tcb: *mut Tcb) -> Option<usize> {
         for cpu in 0..MAX_CPUS {
             if self.pending_enqueue[cpu] == tcb {
-                return true;
+                return Some(cpu);
             }
         }
-        false
+        None
     }
 
     /// Process deferred enqueue after context switch.
@@ -724,6 +762,9 @@ impl Scheduler {
     ///
     /// This is the delicate portion that must remain consistent across normal
     /// scheduler switches and IPC fastpath direct switches.
+    ///
+    /// Callers must enter with local IRQs disabled and only restore them from
+    /// the resumed continuation after this function returns.
     unsafe fn switch_common(&mut self, old_tcb: *mut Tcb, new_tcb: *mut Tcb) {
         unsafe {
             let cpu_id = checked_cpu_id("switch_common");
@@ -789,6 +830,8 @@ impl Scheduler {
     /// - `SCHED_IPC_LOCK` MUST be held.
     /// - Scheduler lock MUST NOT be held.
     /// - `set_current(new_tcb)` and thread state transitions were already done.
+    /// - Local IRQs MUST remain disabled across the switch; restore them only
+    ///   after the resumed continuation returns from this call.
     pub(crate) unsafe fn do_context_switch_fastpath(&mut self, old_tcb: *mut Tcb, new_tcb: *mut Tcb) {
         unsafe {
             self.track_outgoing_before_switch(old_tcb);
@@ -803,6 +846,8 @@ impl Scheduler {
     /// - SCHED_IPC_LOCK MUST be held: this function releases it before switching
     ///   and reacquires it on resume. Callers without it cause a lock leak.
     /// - Scheduler lock (`lock_state`) MUST NOT be held.
+    /// - Local IRQs MUST remain disabled across the switch; restore them only
+    ///   after the resumed continuation returns from this call.
     unsafe fn do_context_switch(&mut self, old_tcb: *mut Tcb, new_tcb: *mut Tcb) {
         unsafe {
             self.track_outgoing_before_switch(old_tcb);
@@ -853,8 +898,8 @@ impl Scheduler {
                 if current != new_tcb {
                     self.set_current(new_tcb);
                     self.unlock();
-                    crate::mm::restore_irq(irq_flag);
                     self.do_context_switch(current, new_tcb);
+                    crate::mm::restore_irq(irq_flag);
                     return;
                 }
                 self.unlock();
@@ -877,8 +922,8 @@ impl Scheduler {
                     if current != new_tcb {
                         self.set_current(new_tcb);
                         self.unlock();
-                        crate::mm::restore_irq(irq_flag);
                         self.do_context_switch(current, new_tcb);
+                        crate::mm::restore_irq(irq_flag);
                         return;
                     }
                 } else {
@@ -892,8 +937,8 @@ impl Scheduler {
                     } else if current != new_tcb {
                         self.set_current(new_tcb);
                         self.unlock();
-                        crate::mm::restore_irq(irq_flag);
                         self.do_context_switch(current, new_tcb);
+                        crate::mm::restore_irq(irq_flag);
                         return;
                     }
                 }
@@ -913,8 +958,8 @@ impl Scheduler {
                 } else if current != new_tcb {
                     self.set_current(new_tcb);
                     self.unlock();
-                    crate::mm::restore_irq(irq_flag);
                     self.do_context_switch(current, new_tcb);
+                    crate::mm::restore_irq(irq_flag);
                     return;
                 }
             }
@@ -988,8 +1033,8 @@ impl Scheduler {
             } else if current != new_tcb {
                 self.set_current(new_tcb);
                 self.unlock();
-                crate::mm::restore_irq(irq_flag);
                 self.do_context_switch(current, new_tcb);
+                crate::mm::restore_irq(irq_flag);
                 return;
             }
         }
@@ -1131,9 +1176,8 @@ impl Scheduler {
 
             // Release lock before context switch
             self.unlock();
-            crate::mm::restore_irq(irq_flag);
-
             self.do_context_switch(old_tcb, new_tcb);
+            crate::mm::restore_irq(irq_flag);
         }
     }
 
@@ -1174,8 +1218,8 @@ impl Scheduler {
             } else if current != new_tcb {
                 self.set_current(new_tcb);
                 self.unlock();
-                crate::mm::restore_irq(irq_flag);
                 self.do_context_switch(current, new_tcb);
+                crate::mm::restore_irq(irq_flag);
                 return;
             }
         }
@@ -1325,8 +1369,8 @@ impl Scheduler {
                 self.track_pending_switch_out(cpu_id, old_tcb);
                 self.set_current(new_tcb);
                 self.unlock();
-                crate::mm::restore_irq(irq_flag);
                 self.do_context_switch(old_tcb, new_tcb);
+                crate::mm::restore_irq(irq_flag);
                 return;
             }
         }
@@ -1373,10 +1417,10 @@ impl Scheduler {
                 self.track_pending_switch_out(cpu_id, old_tcb);
                 self.set_current(new_tcb);
                 self.unlock();
-                crate::mm::restore_irq(irq_flag);
                 // SAFETY: SCHED_IPC_LOCK is held; do_context_switch releases
                 // before switch and reacquires on resume.
                 self.do_context_switch(old_tcb, new_tcb);
+                crate::mm::restore_irq(irq_flag);
                 return;
             }
         }

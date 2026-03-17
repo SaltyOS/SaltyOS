@@ -20,6 +20,15 @@ void parse_dynamic(struct link_map *map, Elf64_Dyn *dyn, uint64_t base) {
     map->pltgot = NULL;
     map->rela = NULL;
     map->rela_count = 0;
+    map->tls_template = 0;
+    map->tls_filesz = 0;
+    map->tls_memsz = 0;
+    map->tls_align = 1;
+    map->tls_tpoff = 0;
+    map->tls_module_id = 0;
+    map->init_fn = NULL;
+    map->init_array = NULL;
+    map->init_array_count = 0;
 
     for (int i = 0; dyn[i].d_tag != DT_NULL; i++) {
         switch (dyn[i].d_tag) {
@@ -53,6 +62,15 @@ void parse_dynamic(struct link_map *map, Elf64_Dyn *dyn, uint64_t base) {
             break;
         case DT_RELASZ:
             map->rela_count = dyn[i].d_val / sizeof(Elf64_Rela);
+            break;
+        case DT_INIT:
+            map->init_fn = (void (*)(void))(base + dyn[i].d_val);
+            break;
+        case DT_INIT_ARRAY:
+            map->init_array = (void (**)(void))(base + dyn[i].d_val);
+            break;
+        case DT_INIT_ARRAYSZ:
+            map->init_array_count = dyn[i].d_val / sizeof(void (*)(void));
             break;
         }
     }
@@ -214,12 +232,22 @@ int load_shared_library(struct rtld_state *st, const char *name,
 
     /* Find minimum vaddr across PT_LOAD segments */
     uint64_t min_vaddr = UINT64_MAX;
+    uint64_t tls_template = 0;
+    uint64_t tls_filesz = 0;
+    uint64_t tls_memsz = 0;
+    uint64_t tls_align = 1;
     Elf64_Phdr *phdrs = (Elf64_Phdr *)(cpio.data + ehdr->e_phoff);
 
     for (int i = 0; i < ehdr->e_phnum; i++) {
         Elf64_Phdr *ph = &phdrs[i];
         if (ph->p_type == PT_LOAD && ph->p_vaddr < min_vaddr)
             min_vaddr = ph->p_vaddr;
+        if (ph->p_type == PT_TLS) {
+            tls_template = ph->p_vaddr;
+            tls_filesz = ph->p_filesz;
+            tls_memsz = ph->p_memsz;
+            tls_align = ph->p_align ? ph->p_align : 1;
+        }
     }
 
     uint64_t base = load_addr;
@@ -242,16 +270,8 @@ int load_shared_library(struct rtld_state *st, const char *name,
         uint64_t seg_end = rtld_page_align_up(seg_vaddr + ph->p_memsz);
         uint64_t flags = rtld_elf_to_vspace_flags(ph->p_flags);
 
-        /* Segment already mapped by procmgr — record pages as device-managed */
+        /* Segment already mapped by procmgr — no per-page tracking needed */
         if (is_premapped) {
-            for (uint64_t page = seg_start; page < seg_end; page += PAGE_SIZE) {
-                if (page_count >= RTLD_MAX_LIB_PAGES) return -6;
-                pages[page_count].vaddr = page;
-                pages[page_count].frame_slot = 0;
-                pages[page_count].flags = flags;
-                pages[page_count].is_device = 1;
-                page_count++;
-            }
             continue;
         }
 
@@ -399,6 +419,12 @@ int load_shared_library(struct rtld_state *st, const char *name,
         parse_dynamic(map, lib_dyn, base);
     else
         map->base = base;
+    if (tls_memsz != 0) {
+        map->tls_template = tls_template + delta;
+        map->tls_filesz = tls_filesz;
+        map->tls_memsz = tls_memsz;
+        map->tls_align = tls_align;
+    }
 
     /* Append to linked list */
     struct link_map *tail = st->head;

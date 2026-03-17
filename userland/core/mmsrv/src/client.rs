@@ -171,7 +171,7 @@ pub(crate) fn clear_cow_bit(region: *mut MmRegion, page_idx: usize) {
 #[derive(Clone, Copy)]
 struct BitmapFreeEntry {
     ptr: *mut u64,
-    alloc_pages: u16,
+    alloc_pages: u32,
 }
 
 const BITMAP_POOL_MAX: usize = 32;
@@ -188,7 +188,7 @@ static mut BITMAP_POOL_COUNT: usize = 0;
 ///
 /// Checks the free-list pool first for a suitably-sized entry;
 /// falls through to self_mmap if none available.
-pub(crate) fn alloc_cow_bitmap(page_count: usize) -> (*mut u64, u16) {
+pub(crate) fn alloc_cow_bitmap(page_count: usize) -> (*mut u64, u32) {
     let word_count = (page_count + 63) / 64;
     let byte_count = word_count * 8;
     let alloc_pages = (byte_count + 4095) / 4096;
@@ -199,7 +199,7 @@ pub(crate) fn alloc_cow_bitmap(page_count: usize) -> (*mut u64, u16) {
         let count = *(&raw const BITMAP_POOL_COUNT);
         let pool = &raw mut BITMAP_POOL;
         for i in 0..count {
-            if (*pool)[i].alloc_pages >= alloc_pages as u16 {
+            if (*pool)[i].alloc_pages >= alloc_pages as u32 {
                 let entry = (*pool)[i];
                 // Swap-remove: move last entry into this slot
                 let last = count - 1;
@@ -210,7 +210,7 @@ pub(crate) fn alloc_cow_bitmap(page_count: usize) -> (*mut u64, u16) {
                 // Zero the reused memory
                 // SAFETY: entry.ptr is a valid allocation of entry.alloc_pages pages.
                 core::ptr::write_bytes(entry.ptr as *mut u8, 0, (entry.alloc_pages as usize) * 4096);
-                return (entry.ptr, word_count as u16);
+                return (entry.ptr, word_count as u32);
             }
         }
     }
@@ -221,7 +221,7 @@ pub(crate) fn alloc_cow_bitmap(page_count: usize) -> (*mut u64, u16) {
     if ptr.is_null() {
         return (core::ptr::null_mut(), 0);
     }
-    (ptr as *mut u64, word_count as u16)
+    (ptr as *mut u64, word_count as u32)
 }
 
 /// Free a COW bitmap from a region, returning the pages to the free-list pool.
@@ -249,7 +249,7 @@ pub(crate) fn free_cow_bitmap(region: *mut MmRegion) {
         if count < BITMAP_POOL_MAX {
             (*(&raw mut BITMAP_POOL))[count] = BitmapFreeEntry {
                 ptr,
-                alloc_pages: alloc_pages as u16,
+                alloc_pages: alloc_pages as u32,
             };
             *(&raw mut BITMAP_POOL_COUNT) = count + 1;
         }
@@ -345,7 +345,8 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: 
         let pid = (*client).pid;
         let vspace_cap = (*client).vspace_cap;
 
-        // Clean up all frame caps tracked in client regions
+        // Clean up all frame caps tracked in client regions — recycle into
+        // the frame pool for reuse instead of deleting (avoids untyped exhaustion).
         let region_count = (*client).region_count;
         let regions = (*client).regions;
         if !regions.is_null() {
@@ -353,13 +354,11 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: 
                 let r = regions.add(ri);
                 if (*r).active {
                     let fcaps = (*r).frame_caps;
-                    if !fcaps.is_null() {
-                        for fi in 0..(*r).frame_count as usize {
-                            let fc = *fcaps.add(fi);
-                            if fc != 0 {
-                                invoke::cnode_delete(super::CAP_SELF_CSPACE, fc);
-                            }
-                        }
+                    if !fcaps.is_null() && (*r).frame_count > 0 {
+                        super::frame_pool_push_batch(
+                            fcaps as *const Cap,
+                            (*r).frame_count as usize,
+                        );
                     }
                     (*r).active = false;
                 }
@@ -376,7 +375,7 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: 
 
         // Clean up the VSpace cap we hold
         if vspace_cap != 0 {
-            invoke::cnode_delete(super::CAP_SELF_CSPACE, vspace_cap);
+            super::recycled_cnode_delete(vspace_cap);
         }
 
         (*client).active = false;
@@ -389,6 +388,15 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: 
             lb.hex(client_badge);
             lb.str(b" pid=");
             lb.hex(pid as u64);
+            let pool_count = *(&raw const super::FRAME_POOL_COUNT);
+            let recycled = *(&raw const super::FRAME_POOL_TOTAL_RECYCLED);
+            let reused = *(&raw const super::FRAME_POOL_TOTAL_REUSED);
+            lb.str(b" fpool=");
+            lb.hex(pool_count as u64);
+            lb.str(b"/");
+            lb.hex(recycled);
+            lb.str(b"/");
+            lb.hex(reused);
             lb.str(b"\n");
             lb.flush();
         }

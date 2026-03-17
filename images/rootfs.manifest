@@ -8,7 +8,8 @@
 /bin/ttyd=build/ttyd.stripped.elf
 /bin/getty=build/getty.stripped.elf
 /bin/test_runner=build/test_runner.stripped.elf
-/bin/hello=build/hello.stripped.elf
 /bin/netdrv=build/netdrv.stripped.elf
 /bin/netsrv=build/netsrv.stripped.elf
 /bin/dnssrv=build/dnssrv.stripped.elf
+
+@include llvm.manifest

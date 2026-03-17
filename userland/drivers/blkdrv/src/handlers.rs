@@ -37,6 +37,16 @@ pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
         let avail_off = *(&raw const QUEUE_AVAIL_OFF);
         let used_off = *(&raw const QUEUE_USED_OFF);
 
+        // Drain any stale completions from previously timed-out requests.
+        // After a timeout, LAST_USED_IDX may lag behind the actual used.idx
+        // because the device completed the request after we gave up polling.
+        let used_base = (vq_base + used_off) as *const u16;
+        let cur_used = core::ptr::read_volatile(used_base.add(1));
+        if cur_used != *(&raw const LAST_USED_IDX) {
+            *(&raw mut LAST_USED_IDX) = cur_used;
+            let _ = bar_read8(VIRTIO_ISR_STATUS);
+        }
+
         // Get physical addresses for DMA
         let data_vaddr = SHM_VADDR + shm_offset;
         let data_phys = vaddr_to_phys(data_vaddr);
@@ -114,12 +124,18 @@ pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
                 break;
             }
             spin_count += 1;
-            if spin_count > 10_000_000 {
+            if spin_count > 100_000_000 {
                 puts(b"[blkdrv] virtio read timeout\n");
+                let _ = bar_read8(VIRTIO_ISR_STATUS);
                 reply.label = BESALT_BUSY;
                 return reply;
             }
         }
+
+        // Clear device ISR to deassert the shared IRQ line.
+        // Without this, the virtio-blk device keeps IRQ 11 asserted,
+        // interfering with other devices sharing the same IRQ (e.g. virtio-net).
+        let _ = bar_read8(VIRTIO_ISR_STATUS);
 
         // Check status
         let status = *(&raw const REQ_STATUS);
@@ -166,6 +182,14 @@ pub(crate) fn handle_write(msg: &BesaltMsg) -> BesaltMsg {
         let vq_base = *(&raw const VQUEUE_BASE);
         let avail_off = *(&raw const QUEUE_AVAIL_OFF);
         let used_off = *(&raw const QUEUE_USED_OFF);
+
+        // Drain any stale completions from previously timed-out requests.
+        let used_base = (vq_base + used_off) as *const u16;
+        let cur_used = core::ptr::read_volatile(used_base.add(1));
+        if cur_used != *(&raw const LAST_USED_IDX) {
+            *(&raw mut LAST_USED_IDX) = cur_used;
+            let _ = bar_read8(VIRTIO_ISR_STATUS);
+        }
 
         // Get physical addresses for DMA
         let data_vaddr = SHM_VADDR + shm_offset;
@@ -238,12 +262,16 @@ pub(crate) fn handle_write(msg: &BesaltMsg) -> BesaltMsg {
                 break;
             }
             spin_count += 1;
-            if spin_count > 10_000_000 {
+            if spin_count > 100_000_000 {
                 puts(b"[blkdrv] virtio write timeout\n");
+                let _ = bar_read8(VIRTIO_ISR_STATUS);
                 reply.label = BESALT_BUSY;
                 return reply;
             }
         }
+
+        // Clear device ISR to deassert the shared IRQ line.
+        let _ = bar_read8(VIRTIO_ISR_STATUS);
 
         // Check status
         let status = *(&raw const REQ_STATUS);

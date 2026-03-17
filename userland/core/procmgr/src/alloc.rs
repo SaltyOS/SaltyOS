@@ -17,7 +17,7 @@ const SLOT_POOL_SIZE: usize = 3840;
 const BITMAP_WORDS: usize = 60;
 
 /// Maximum untyped sources we track
-const MAX_UT_SOURCES: usize = 12;
+const MAX_UT_SOURCES: usize = 18;
 /// Maximum objects tracked explicitly per reservation.
 /// Rollback also sweeps the full reserved slot range, so tracking is best-effort.
 const MAX_RESERVE_OBJECTS: usize = 128;
@@ -470,6 +470,67 @@ impl Allocator {
         Ok(slot)
     }
 
+    /// Realize a kernel object at the next reservation offset by requesting
+    /// it from mmsrv via MM_ALLOC_OBJECT IPC (auto-incrementing offset variant).
+    pub fn realize_via_mmsrv_next(
+        &mut self,
+        mmsrv_ep: Cap,
+        obj_type: u64,
+        size_bits: u64,
+    ) -> Result<Cap, i32> {
+        if !self.reservation.active {
+            return Err(besalt::BESALT_INVALID_OPERATION as i32);
+        }
+        if self.reservation.next_offset >= self.reservation.slot_count {
+            return Err(besalt::BESALT_OUT_OF_MEMORY as i32);
+        }
+
+        let offset = self.reservation.next_offset;
+        self.reservation.next_offset += 1;
+        let slot = self.reservation_slot(offset);
+
+        // SAFETY: ipc_ctx() returns procmgr's valid IPC context; slot is a
+        // valid reservation slot in our CSpace.
+        unsafe {
+            besalt::ipc::set_receive_slot_ctx(
+                crate::ipc_ctx(),
+                self.cap_self_cspace,
+                slot,
+                0,
+            );
+        }
+
+        let mut msg = besalt::types::BesaltMsg::zeroed();
+        let mut reply = besalt::types::BesaltMsg::zeroed();
+        msg.label = besalt::MM_ALLOC_OBJECT;
+        msg.length = 2;
+        msg.regs[0] = obj_type;
+        msg.regs[1] = size_bits;
+        // SAFETY: ipc_ctx() is valid; msg/reply are stack-local.
+        let err = unsafe {
+            besalt::ipc::call_ctx(
+                crate::ipc_ctx(),
+                mmsrv_ep,
+                &raw const msg,
+                &raw mut reply,
+            )
+        };
+        if err != 0 || reply.label != besalt::BESALT_OK {
+            return Err(besalt::BESALT_OUT_OF_MEMORY as i32);
+        }
+
+        if self.reservation.object_count < MAX_RESERVE_OBJECTS {
+            let obj_idx = self.reservation.object_count;
+            self.reservation.objects[obj_idx] = ReservedObject {
+                slot,
+                committed: true,
+            };
+            self.reservation.object_count += 1;
+        }
+
+        Ok(slot)
+    }
+
     /// Realize a core kernel object into a specific offset within the reservation,
     /// preferring the primary untyped source.
     pub fn realize_core_object_at(
@@ -591,6 +652,72 @@ impl Allocator {
         }
 
         // Update next_offset if needed
+        if offset >= self.reservation.next_offset {
+            self.reservation.next_offset = offset + 1;
+        }
+
+        if self.reservation.object_count < MAX_RESERVE_OBJECTS {
+            let obj_idx = self.reservation.object_count;
+            self.reservation.objects[obj_idx] = ReservedObject {
+                slot,
+                committed: true,
+            };
+            self.reservation.object_count += 1;
+        }
+
+        Ok(slot)
+    }
+
+    /// Realize a kernel object at a specific reservation offset by requesting
+    /// it from mmsrv via MM_ALLOC_OBJECT IPC, rather than direct untyped retype.
+    /// The cap is received at the reservation slot via IPC cap transfer.
+    pub fn realize_via_mmsrv(
+        &mut self,
+        mmsrv_ep: Cap,
+        obj_type: u64,
+        size_bits: u64,
+        offset: usize,
+    ) -> Result<Cap, i32> {
+        if !self.reservation.active {
+            return Err(besalt::BESALT_INVALID_OPERATION as i32);
+        }
+        if offset >= self.reservation.slot_count {
+            return Err(besalt::BESALT_OUT_OF_MEMORY as i32);
+        }
+
+        let slot = self.reservation_slot(offset);
+
+        // Configure receive slot for incoming cap transfer from mmsrv
+        // SAFETY: ipc_ctx() returns procmgr's valid IPC context; slot is a
+        // valid reservation slot in our CSpace.
+        unsafe {
+            besalt::ipc::set_receive_slot_ctx(
+                crate::ipc_ctx(),
+                self.cap_self_cspace,
+                slot,
+                0,
+            );
+        }
+
+        let mut msg = besalt::types::BesaltMsg::zeroed();
+        let mut reply = besalt::types::BesaltMsg::zeroed();
+        msg.label = besalt::MM_ALLOC_OBJECT;
+        msg.length = 2;
+        msg.regs[0] = obj_type;
+        msg.regs[1] = size_bits;
+        // SAFETY: ipc_ctx() is valid; msg/reply are stack-local.
+        let err = unsafe {
+            besalt::ipc::call_ctx(
+                crate::ipc_ctx(),
+                mmsrv_ep,
+                &raw const msg,
+                &raw mut reply,
+            )
+        };
+        if err != 0 || reply.label != besalt::BESALT_OK {
+            return Err(besalt::BESALT_OUT_OF_MEMORY as i32);
+        }
+
         if offset >= self.reservation.next_offset {
             self.reservation.next_offset = offset + 1;
         }

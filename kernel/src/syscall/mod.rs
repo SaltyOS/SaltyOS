@@ -1369,6 +1369,10 @@ fn syscall_invoke_inner(
             // VSPACE_REPLENISH_COW_POOL: arg0 = src_cnode_cap_ptr, arg1 = start_slot, arg2 = count
             syscall_vspace_replenish_cow_pool(&cap, arg0, arg1, arg2)
         }
+        (ObjectType::VSpace, 0x5F) => {
+            // VSPACE_PROTECT_RANGE: arg0 = virt_addr, arg1 = count, arg2 = flags_bits
+            syscall_vspace_protect_range(&cap, arg0, arg1, arg2)
+        }
 
         // SchedContext operations
         (ObjectType::SchedContext, 0x30) => {
@@ -1659,8 +1663,13 @@ fn syscall_tcb_configure(
         return SyscallResult::err(e);
     }
 
-    // alloc_frame has its own MM_LOCK — do BEFORE acquiring SCHED_IPC_LOCK
-    let kstack_phys = match crate::mm::alloc_frame() {
+    // Allocate kernel stack (4 contiguous pages = 16 KiB).
+    // A single page (4 KiB) overflows on deep syscall paths (IPC fastpath
+    // with context switching, VSpace operations, capability chains).
+    const KSTACK_PAGES: usize = 4;
+
+    // alloc_contiguous_frames has its own MM_LOCK — do BEFORE acquiring SCHED_IPC_LOCK
+    let kstack_phys = match crate::mm::alloc_contiguous_frames(KSTACK_PAGES) {
         Some(f) => f,
         None => return SyscallResult::err(SyscallError::OutOfMemory),
     };
@@ -1680,8 +1689,8 @@ fn syscall_tcb_configure(
         }
 
         let kstack_virt = crate::mm::phys_to_virt(kstack_phys);
-        let kstack_top = kstack_virt + crate::mm::PAGE_SIZE as u64;
-        core::ptr::write_bytes(kstack_virt as *mut u8, 0, crate::mm::PAGE_SIZE);
+        let kstack_top = kstack_virt + (KSTACK_PAGES * crate::mm::PAGE_SIZE) as u64;
+        core::ptr::write_bytes(kstack_virt as *mut u8, 0, KSTACK_PAGES * crate::mm::PAGE_SIZE);
         tcb.kernel_stack_top = kstack_top;
         tcb.stack_canary = crate::arch::generate_stack_canary();
 
@@ -2612,6 +2621,47 @@ fn syscall_vspace_protect(cap: &Capability, virt_addr: u64, flags_bits: u64) -> 
     }
 }
 
+/// VSPACE_PROTECT_RANGE: Change protection flags on a contiguous range of pages.
+///
+/// Args:
+/// - virt_addr: Start virtual address (page-aligned)
+/// - count: Number of pages
+/// - flags_bits: New mapping flags (bit 0=writable, bit 1=user, bit 2=executable)
+///
+/// Returns number of pages successfully updated in value field.
+fn syscall_vspace_protect_range(
+    cap: &Capability,
+    virt_addr: u64,
+    count: u64,
+    flags_bits: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::MAP) {
+        return SyscallResult::err(e);
+    }
+
+    // W^X: writable + executable is not permitted
+    if (flags_bits & 1 != 0) && (flags_bits & 4 != 0) {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    unsafe {
+        let vspace = &mut *(cap.object as *mut VSpace);
+        let flags = PageFlags {
+            writable: flags_bits & 1 != 0,
+            user: flags_bits & 2 != 0,
+            executable: flags_bits & 4 != 0,
+            cache_disable: flags_bits & 8 != 0,
+            write_through: flags_bits & 16 != 0,
+            cow: flags_bits & 32 != 0,
+        };
+
+        match vspace.protect_range(virt_addr, count as usize, flags) {
+            Ok(protected) => SyscallResult::ok(protected as u64),
+            Err(e) => SyscallResult::err(syscall_error_from_vspace_error(e)),
+        }
+    }
+}
+
 /// VSPACE_MAP_DEMAND: Install demand-page PTE at a single virtual address.
 ///
 /// Args:
@@ -3018,6 +3068,9 @@ fn syscall_irq_control_get(
         };
 
         // Prepend to handler chain (shared IRQs: multiple handlers per IRQ)
+        // Dynamic IRQ handlers are created for PCI devices which use
+        // level-triggered, active-low interrupts per the PCI specification.
+        (*ptr).level_triggered = true;
         crate::ipc::irq::register_handler(irq_num as usize, ptr);
 
         SCHED_IPC_LOCK.unlock();
@@ -3025,8 +3078,8 @@ fn syscall_irq_control_get(
         ptr
     };
 
-    // Dynamically unmask the IOAPIC redirection entry for this IRQ
-    crate::arch::ioapic_unmask(irq_num as u32);
+    // Dynamically unmask the IOAPIC entry — PCI IRQs are level-triggered, active-low
+    crate::arch::ioapic_unmask_level(irq_num as u32);
 
     // Allocate a cap slot and set it up
     let slot = match crate::cap::alloc_slot() {
@@ -3094,8 +3147,18 @@ fn syscall_irq_handler_ack(cap: &Capability) -> SyscallResult {
         SCHED_IPC_LOCK.lock();
         let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
         irq_handler.acknowledged = true;
+        // Re-enable delivery at IOAPIC. dispatch_irq() masks the IRQ when
+        // no handler is ready to accept delivery; unmask it now that this
+        // handler has acknowledged and is ready for the next interrupt.
+        let irq_num = irq_handler.irq_num;
+        let level = irq_handler.level_triggered;
         SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
+        if level {
+            crate::arch::ioapic_unmask_level(irq_num);
+        } else {
+            crate::arch::ioapic_unmask(irq_num);
+        }
     }
 
     SyscallResult::ok(0)

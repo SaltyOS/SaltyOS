@@ -28,7 +28,7 @@ pub struct UntypedMemory {
     pub size_bits: u8,
 
     /// Watermark - next offset to allocate from
-    pub watermark: u32,
+    pub watermark: u64,
 
     /// Whether this is device memory (non-cacheable)
     pub is_device: bool,
@@ -52,7 +52,7 @@ impl UntypedMemory {
 
     /// Get available bytes
     pub fn available(&self) -> usize {
-        self.size_bytes() - (self.watermark as usize)
+        self.size_bytes().saturating_sub(self.watermark as usize)
     }
 
     /// Check if untyped has children
@@ -493,10 +493,10 @@ impl UntypedMemory {
                 .checked_add(align - 1)
                 .ok_or(CapError::InsufficientMemory)?;
             let aligned = (rounded / align) * align;
-            if aligned > self.size_bytes() || aligned > u32::MAX as usize {
+            if aligned > self.size_bytes() {
                 return Err(CapError::InsufficientMemory);
             }
-            self.watermark = aligned as u32;
+            self.watermark = aligned as u64;
 
             // Re-check after alignment
             if self.available() < total_size {
@@ -550,7 +550,7 @@ impl UntypedMemory {
         }
 
         // Update watermark
-        self.watermark += total_size as u32;
+        self.watermark += total_size as u64;
 
         Ok(())
     }

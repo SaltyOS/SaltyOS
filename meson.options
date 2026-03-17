@@ -60,3 +60,10 @@ option('kernel_stack_size',
   max: 65536,
   value: 16384,
   description: 'Kernel stack size per thread (bytes)')
+
+# C++ runtime library
+option('build_libcxx',
+  type: 'combo',
+  choices: ['auto', 'true', 'false'],
+  value: 'auto',
+  description: 'Build libc++.so from toolchain/llvm-project sources (auto=detect, true=require, false=skip)')

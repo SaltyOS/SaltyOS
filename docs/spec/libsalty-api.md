@@ -57,7 +57,7 @@ All error codes are defined in `consts.rs` and must match kernel `SyscallError` 
 | `Cap` | `u64` | Capability slot index (type alias) |
 | `BesaltResult` | `#[repr(C)]` | `{ error: u64, value: u64 }` -- raw syscall return |
 | `BesaltMsg` | `#[repr(C)]` | `{ label: u64, length: u64, regs: [u64; 20] }` -- IPC message buffer |
-| `IpcBuffer` | `#[repr(C)]` | 4096-byte kernel-shared page: msg[22], badge, caps[4], receive_cnode/index/depth, reserved[478] |
+| `IpcBuffer` | `#[repr(C)]` | 4096-byte kernel-shared page: msg[22], badge, caps[4], receive_cnode/index/depth, reserved[478] extended payload words |
 | `IpcContext` | `#[repr(C)]` | `{ ipc_buffer: *mut IpcBuffer, send_cap_count: i32 }` -- per-thread IPC state |
 
 ### POSIX Types
@@ -386,6 +386,8 @@ All process operations send IPC messages to the process manager (`CAP_PROCMGR_EP
 | `posix_execve` | -- | `(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> i32` | 0 or -1 |
 | `posix_kill` | -- | `(pid: i32, sig: i32) -> i32` | 0 or -1 |
 
+`posix_execve` packs the path and argc/envc metadata into message registers and stages argv/envp string bytes in `IpcBuffer.reserved[]`. Oversized argument/environment payloads fail with `E2BIG` instead of being silently truncated.
+
 **Wait status macros** (in `types.rs`):
 
 | Function | Signature | Description |
@@ -701,7 +703,7 @@ Compute a dynamic VA layout given actual ELF/RTLD sizes. Returns a plan with `st
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `CHILD_STACK_PAGES` | 4 | Stack pages per child (16K) |
+| `CHILD_STACK_PAGES` | 32 | Stack pages per child (128 KiB) |
 
 Default VA regions: IPC buffer at 0x200000, ELF code at 0x210000, stack at 0x3F8000 (or 0x7F8000 in window 2), initrd at 0x1000000.
 

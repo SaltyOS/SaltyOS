@@ -15,6 +15,58 @@ fn puts(s: &[u8]) {
     besalt::serial::serial_puts(s);
 }
 
+/// Zero `len` bytes at `ptr` using u64-wide volatile writes for bulk throughput,
+/// with byte-granular head/tail for alignment.
+///
+/// # Safety
+/// `ptr..ptr+len` must be valid, writable, and non-overlapping with any live reference.
+unsafe fn volatile_zero(ptr: *mut u8, len: usize) {
+    unsafe {
+        let align_off = ptr.align_offset(8).min(len);
+        for i in 0..align_off {
+            core::ptr::write_volatile(ptr.add(i), 0u8);
+        }
+        let remaining = len - align_off;
+        let qwords = remaining / 8;
+        let p64 = ptr.add(align_off) as *mut u64;
+        for i in 0..qwords {
+            core::ptr::write_volatile(p64.add(i), 0u64);
+        }
+        let tail_start = align_off + qwords * 8;
+        for i in tail_start..len {
+            core::ptr::write_volatile(ptr.add(i), 0u8);
+        }
+    }
+}
+
+/// Copy `len` bytes from `src` to `dst` using u64-wide volatile writes,
+/// with byte-granular head/tail for alignment.
+///
+/// # Safety
+/// `dst..dst+len` and `src..src+len` must be valid and non-overlapping.
+unsafe fn volatile_copy(dst: *mut u8, src: *const u8, len: usize) {
+    unsafe {
+        let align_off = dst.align_offset(8).min(len);
+        for i in 0..align_off {
+            core::ptr::write_volatile(dst.add(i), *src.add(i));
+        }
+        let remaining = len - align_off;
+        let qwords = remaining / 8;
+        if qwords > 0 {
+            let d64 = dst.add(align_off) as *mut u64;
+            let s8 = src.add(align_off);
+            for i in 0..qwords {
+                let val = core::ptr::read_unaligned(s8.add(i * 8) as *const u64);
+                core::ptr::write_volatile(d64.add(i), val);
+            }
+        }
+        let tail_start = align_off + qwords * 8;
+        for i in tail_start..len {
+            core::ptr::write_volatile(dst.add(i), *src.add(i));
+        }
+    }
+}
+
 // ---- Layout offsets within a reservation ----
 // These are sequential offsets, NOT absolute cap slots.
 const OFF_TCB: usize = 0;
@@ -40,6 +92,7 @@ const BESALT_OK: u64 = besalt::BESALT_OK;
 const BESALT_OUT_OF_MEMORY: u64 = besalt::BESALT_OUT_OF_MEMORY;
 const BESALT_NOT_FOUND: u64 = besalt::BESALT_NOT_FOUND;
 const BESALT_BUSY: u64 = besalt::BESALT_BUSY;
+const BESALT_OUT_OF_RANGE: u64 = besalt::BESALT_OUT_OF_RANGE;
 const BESALT_INVALID_ARGUMENT: u64 = besalt::BESALT_INVALID_ARGUMENT;
 const VSPACE_FLAG_WRITABLE: u64 = besalt::VSPACE_FLAG_WRITABLE;
 const VSPACE_FLAG_USER: u64 = besalt::VSPACE_FLAG_USER;
@@ -91,9 +144,19 @@ const AT_BESALT_SHARED_LIB_BASE: u64 = super::AT_BESALT_SHARED_LIB_BASE;
 const AT_BESALT_SLOT_BASE: u64 = super::AT_BESALT_SLOT_BASE;
 const AT_BESALT_SLOT_COUNT: u64 = super::AT_BESALT_SLOT_COUNT;
 const AT_BESALT_CSPACE_NTFN: u64 = super::AT_BESALT_CSPACE_NTFN;
+const AT_BESALT_MM_EP: u64 = super::AT_BESALT_MM_EP;
 const CSPACE_EXPAND_BASE: u64 = super::CSPACE_EXPAND_BASE;
 const READY_TIMEOUT_NS_DEFAULT: u64 = super::READY_TIMEOUT_NS_DEFAULT;
 const SPAWN_FLAG_USE_PRE_EP: u64 = besalt::SPAWN_FLAG_USE_PRE_EP;
+
+const MAX_STACK_STRINGS: usize = 128;
+
+#[derive(Clone, Copy)]
+pub(crate) enum StackBuildError {
+    OutOfMemory,
+    InvalidArgument,
+    TooLarge,
+}
 const SPAWN_FLAG_RESPAWN: u64 = besalt::SPAWN_FLAG_RESPAWN;
 const SPAWN_FLAG_START_SUSPENDED: u64 = besalt::SPAWN_FLAG_START_SUSPENDED;
 
@@ -101,7 +164,7 @@ const SPAWN_FLAG_START_SUSPENDED: u64 = besalt::SPAWN_FLAG_START_SUSPENDED;
 // Shared library physical frame cache
 // ===========================================================================
 
-const MAX_SHARED_LIB_PAGES: usize = 192;
+const MAX_SHARED_LIB_PAGES: usize = 576;
 const MAX_CACHED_LIBS: usize = 4;
 const MAX_LIB_NAME: usize = 24;
 
@@ -285,6 +348,34 @@ unsafe fn count_rtld_span(
     }
 }
 
+pub(crate) unsafe fn count_rtld_span_by_name(
+    rtld_name: *const u8,
+    rtld_name_len: usize,
+    initrd: *const u8,
+    initrd_size: usize,
+) -> u64 {
+    unsafe {
+        let mut rtld_entry = CpioEntry::zeroed();
+        if besalt::cpio::cpio_find_file(
+            initrd,
+            initrd_size,
+            rtld_name,
+            rtld_name_len,
+            &raw mut rtld_entry,
+        ) == 0
+        {
+            return 5 * 4096;
+        }
+
+        let span = besalt::elf_loader::elf_compute_load_span(rtld_entry.data, rtld_entry.data_len);
+        if span == 0 {
+            5 * 4096
+        } else {
+            span
+        }
+    }
+}
+
 /// Return the total VA pages needed for the specified DT_NEEDED libraries.
 /// Accounts for full library spans (including RW segments) plus inter-lib gaps.
 pub(crate) fn shared_lib_va_pages_for_needed(needed: &besalt::elf_dynamic::NeededLibs) -> usize {
@@ -408,7 +499,7 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
         }
 
         // Fallback: build cache ourselves by parsing ELF and allocating frames
-        let libs: [&[u8]; 2] = [b"libbesalt.so", b"libc.so"];
+        let libs: [&[u8]; 3] = [b"libbesalt.so", b"libc.so", b"libc++.so"];
 
         for lib_name in &libs {
             if cache.lib_count >= MAX_CACHED_LIBS {
@@ -538,9 +629,7 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
                     }
 
                     let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
-                    for j in 0..4096usize {
-                        core::ptr::write_volatile(scratch.add(j), 0);
-                    }
+                    unsafe { volatile_zero(scratch, 4096) };
 
                     let file_start = seg_vaddr;
                     let file_end = seg_vaddr + ph.p_filesz;
@@ -559,9 +648,7 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
                         if data_offset + copy_len <= entry.data_len {
                             let src = entry.data.add(data_offset);
                             let dst = scratch.add(page_offset);
-                            for j in 0..copy_len {
-                                core::ptr::write_volatile(dst.add(j), *src.add(j));
-                            }
+                            unsafe { volatile_copy(dst, src, copy_len) };
                         }
                     }
 
@@ -632,7 +719,7 @@ unsafe fn try_inherit_shared_lib_cache(
         }
 
         // Walk both libraries in the same order as init's cache builder.
-        let libs: [&[u8]; 2] = [b"libbesalt.so", b"libc.so"];
+        let libs: [&[u8]; 3] = [b"libbesalt.so", b"libc.so", b"libc++.so"];
         let mut inherited_idx: usize = 0;
 
         for lib_name in &libs {
@@ -858,6 +945,27 @@ pub(crate) unsafe fn map_shared_lib_to_vspace(
                     return (0, empty);
                 }
 
+                // Register the full library span as a shared region so that
+                // MM_FORK_REGIONS can clone it and mmsrv can handle COW faults
+                // after fork. RO cache pages bypass mmsrv allocation but still
+                // need region tracking for fork correctness.
+                let lib_pages = cl.lib_span / 4096;
+                if lib_pages > 0 {
+                    let mut sr_msg = BesaltMsg::zeroed();
+                    let mut sr_reply = BesaltMsg::zeroed();
+                    sr_msg.label = besalt::consts::MM_REGISTER_SHARED_REGION;
+                    sr_msg.length = 3;
+                    sr_msg.regs[0] = pid as u64;
+                    sr_msg.regs[1] = running_base;
+                    sr_msg.regs[2] = lib_pages;
+                    let _ = besalt::ipc::call_ctx(
+                        super::ipc_ctx(),
+                        CAP_MMSRV_EP,
+                        &raw const sr_msg,
+                        &raw mut sr_reply,
+                    );
+                }
+
                 running_base += cl.lib_span + 4096; // advance past this lib + gap
                 found = true;
                 break;
@@ -970,9 +1078,7 @@ unsafe fn map_rw_segments(cl: &CachedLib, running_base: u64, pid: u32) -> bool {
 
         // Zero the entire merged window
         let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
-        for j in 0..merged_pages * 4096 {
-            core::ptr::write_volatile(scratch.add(j), 0u8);
-        }
+        unsafe { volatile_zero(scratch, merged_pages * 4096) };
 
         // Copy file data from each segment at its correct offset
         for si in 0..cl.rw_seg_count as usize {
@@ -992,9 +1098,7 @@ unsafe fn map_rw_segments(cl: &CachedLib, running_base: u64, pid: u32) -> bool {
             if file_off + copy_len <= entry.data_len {
                 let src = entry.data.add(file_off);
                 let dst = scratch.add(window_off);
-                for j in 0..copy_len {
-                    core::ptr::write_volatile(dst.add(j), *src.add(j));
-                }
+                unsafe { volatile_copy(dst, src, copy_len) };
             }
         }
 
@@ -1028,8 +1132,9 @@ unsafe fn strlen(s: *const u8) -> usize {
 /// packed contiguously). When argc==0 and str_len==0, the stack gets argc=0 with
 /// no argv/envp pointers (backward-compatible spawn path).
 pub(crate) unsafe fn write_dynamic_stack(
-    elf_data: *const u8,
-    elf_data_len: usize,
+    phdr_vaddr: u64,
+    phent: u64,
+    phnum: u64,
     stk_frame: Cap,
     elf_result: &ElfLoadResult,
     rtld_result: &ElfLoadResult,
@@ -1039,14 +1144,13 @@ pub(crate) unsafe fn write_dynamic_stack(
     envc: u32,
     str_data: &[u8],
     str_len: usize,
-    elf_load_base: u64,
     scratch_vaddr: u64,
     initrd_vaddr: u64,
     stack_top: u64,
     _cnode_bits: u64,
     slot_pool_floor: u64,
     pre_mapped: bool,
-) -> Result<u64, ()> {
+) -> Result<u64, StackBuildError> {
     unsafe {
         if !pre_mapped {
             let err = besalt::invoke::vspace_map(
@@ -1057,31 +1161,20 @@ pub(crate) unsafe fn write_dynamic_stack(
             );
             if err != 0 {
                 puts(b"[PROCMGR] dynamic stack scratch map failed\n");
-                return Err(());
+                return Err(StackBuildError::OutOfMemory);
             }
         }
 
-        let mut phdr_vaddr: u64 = 0;
-        let mut phent: u64 = 0;
-        let mut phnum: u64 = 0;
-        if besalt::elf_dynamic::elf_get_phdr_info(
-            elf_data,
-            elf_data_len,
-            elf_load_base,
-            &raw mut phdr_vaddr,
-            &raw mut phent,
-            &raw mut phnum,
-        ) != 0
-        {
+        if phdr_vaddr == 0 || phent == 0 || phnum == 0 {
             puts(b"[PROCMGR] dynamic phdr info extraction failed\n");
             if !pre_mapped {
                 besalt::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
             }
-            return Err(());
+            return Err(StackBuildError::InvalidArgument);
         }
 
-        // +2 for AT_BESALT_SLOT_BASE/COUNT, +1 for AT_BESALT_CSPACE_NTFN
-        let auxv_entries: u64 = if shared_lib_base != 0 { 16 } else { 15 };
+        // +2 for AT_BESALT_SLOT_BASE/COUNT, +1 for AT_BESALT_CSPACE_NTFN, +1 for AT_BESALT_MM_EP
+        let auxv_entries: u64 = if shared_lib_base != 0 { 17 } else { 16 };
 
         // Compute slot pool for child: from frame_slot_start to CSPACE_EXPAND_BASE.
         // Slots [CSPACE_EXPAND_BASE..CSPACE_EXPAND_BASE+8) are reserved for
@@ -1094,7 +1187,7 @@ pub(crate) unsafe fn write_dynamic_stack(
         let slot_pool_count = CSPACE_EXPAND_BASE.saturating_sub(slot_pool_base);
 
         // Build the stack using the helper, which handles argv/envp layout
-        let rsp = write_stack_with_args(
+        let rsp = match write_stack_with_args(
             argc,
             envc,
             str_data,
@@ -1114,7 +1207,15 @@ pub(crate) unsafe fn write_dynamic_stack(
             scratch_vaddr,
             initrd_vaddr,
             stack_top,
-        );
+        ) {
+            Ok(rsp) => rsp,
+            Err(err) => {
+                if !pre_mapped {
+                    besalt::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
+                }
+                return Err(err);
+            }
+        };
 
         if !pre_mapped {
             besalt::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
@@ -1134,7 +1235,7 @@ pub(crate) unsafe fn write_static_stack(
     initrd_vaddr: u64,
     stack_top: u64,
     pre_mapped: bool,
-) -> Result<u64, ()> {
+) -> Result<u64, StackBuildError> {
     unsafe {
         if !pre_mapped {
             let err = besalt::invoke::vspace_map(
@@ -1145,11 +1246,11 @@ pub(crate) unsafe fn write_static_stack(
             );
             if err != 0 {
                 puts(b"[PROCMGR] static stack scratch map failed\n");
-                return Err(());
+                return Err(StackBuildError::OutOfMemory);
             }
         }
 
-        let rsp = write_stack_with_args(
+        let rsp = match write_stack_with_args(
             argc,
             envc,
             str_data,
@@ -1158,7 +1259,15 @@ pub(crate) unsafe fn write_static_stack(
             scratch_vaddr,
             initrd_vaddr,
             stack_top,
-        );
+        ) {
+            Ok(rsp) => rsp,
+            Err(err) => {
+                if !pre_mapped {
+                    besalt::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
+                }
+                return Err(err);
+            }
+        };
 
         if !pre_mapped {
             besalt::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
@@ -1190,51 +1299,71 @@ unsafe fn write_stack_with_args(
     scratch_vaddr: u64,
     initrd_vaddr: u64,
     stack_top: u64,
-) -> u64 {
+) -> Result<u64, StackBuildError> {
     unsafe {
+        if str_len > str_data.len() || str_len > 4096 {
+            return Err(StackBuildError::TooLarge);
+        }
+        if argc as usize > MAX_STACK_STRINGS || envc as usize > MAX_STACK_STRINGS {
+            return Err(StackBuildError::TooLarge);
+        }
+
         let page_base = PROCMGR_SCRATCH_VADDR as *mut u8;
         // The child sees this page at the top of its stack
-        let child_page_base = stack_top - 4096;
+        let Some(child_page_base) = stack_top.checked_sub(4096) else {
+            return Err(StackBuildError::InvalidArgument);
+        };
 
         // 1. Copy string data to the top of the page
-        let str_area_start = 4096 - str_len;
+        let Some(str_area_start) = 4096usize.checked_sub(str_len) else {
+            return Err(StackBuildError::TooLarge);
+        };
         for i in 0..str_len {
             core::ptr::write_volatile(page_base.add(str_area_start + i), str_data[i]);
         }
 
         // 2. Build pointer arrays for argv and envp by scanning the string data
         // to find individual null-terminated strings.
-        let mut argv_ptrs = [0u64; 64];
-        let mut envp_ptrs = [0u64; 64];
+        let mut argv_ptrs = [0u64; MAX_STACK_STRINGS];
+        let mut envp_ptrs = [0u64; MAX_STACK_STRINGS];
         let mut arg_idx: u32 = 0;
         let mut env_idx: u32 = 0;
         let mut pos = 0usize;
 
         // Parse argv strings
-        while arg_idx < argc && pos < str_len {
-            let str_child_addr = child_page_base + str_area_start as u64 + pos as u64;
-            argv_ptrs[arg_idx as usize] = str_child_addr;
-            arg_idx += 1;
-            // Skip to end of this null-terminated string
+        while arg_idx < argc {
+            if pos >= str_len {
+                return Err(StackBuildError::InvalidArgument);
+            }
+            let str_start = pos;
             while pos < str_len && str_data[pos] != 0 {
                 pos += 1;
             }
-            if pos < str_len {
-                pos += 1; // skip null terminator
+            if pos >= str_len {
+                return Err(StackBuildError::InvalidArgument);
             }
+            let str_child_addr = child_page_base + str_area_start as u64 + str_start as u64;
+            argv_ptrs[arg_idx as usize] = str_child_addr;
+            arg_idx += 1;
+            pos += 1; // skip null terminator
         }
 
         // Parse envp strings
-        while env_idx < envc && pos < str_len {
-            let str_child_addr = child_page_base + str_area_start as u64 + pos as u64;
-            envp_ptrs[env_idx as usize] = str_child_addr;
-            env_idx += 1;
+        while env_idx < envc {
+            if pos >= str_len {
+                return Err(StackBuildError::InvalidArgument);
+            }
+            let str_start = pos;
             while pos < str_len && str_data[pos] != 0 {
                 pos += 1;
             }
-            if pos < str_len {
-                pos += 1;
+            if pos >= str_len {
+                return Err(StackBuildError::InvalidArgument);
             }
+            let str_child_addr = child_page_base + str_area_start as u64 + str_start as u64;
+            envp_ptrs[env_idx as usize] = str_child_addr;
+            env_idx += 1;
+            pos += 1;
         }
 
         // 3. Calculate the metadata size (argc + argv ptrs + NULL + envp ptrs + NULL + auxv)
@@ -1251,10 +1380,12 @@ unsafe fn write_stack_with_args(
         // Process-entry ABI: argc at [RSP], with RSP % 16 == 8.
         // Place metadata at an 8-byte-biased 16-byte boundary.
         let metadata_end = str_area_start;
-        let mut metadata_start = (metadata_end - metadata_bytes) & !0xF;
-        if metadata_start >= 8 {
-            metadata_start -= 8;
-        }
+        let Some(metadata_floor) = metadata_end.checked_sub(metadata_bytes) else {
+            return Err(StackBuildError::TooLarge);
+        };
+        let Some(metadata_start) = (metadata_floor & !0xF).checked_sub(8) else {
+            return Err(StackBuildError::TooLarge);
+        };
 
         let stack_u64 = (PROCMGR_SCRATCH_VADDR + metadata_start as u64) as *mut u64;
         let mut wi: usize = 0;
@@ -1320,6 +1451,8 @@ unsafe fn write_stack_with_args(
                 w(slot_count);
                 w(AT_BESALT_CSPACE_NTFN);
                 w(CHILD_CAP_CSPACE_NTFN);
+                w(AT_BESALT_MM_EP);
+                w(CHILD_CAP_MMSRV_EP);
                 if shared_lib != 0 {
                     w(AT_BESALT_SHARED_LIB_BASE);
                     w(shared_lib);
@@ -1331,7 +1464,7 @@ unsafe fn write_stack_with_args(
         w(0);
 
         // RSP in child address space
-        child_page_base + metadata_start as u64
+        Ok(child_page_base + metadata_start as u64)
     }
 }
 
@@ -1434,79 +1567,100 @@ pub(crate) unsafe fn exec_load_elf_mmsrv(
         let span_end = ((max_vaddr_end.wrapping_add(delta)) + 0xFFF) & !0xFFFu64;
         let total_span_pages = ((span_end - span_start) / 4096) as usize;
 
-        if total_span_pages == 0 || total_span_pages > 512 {
+        if total_span_pages == 0 {
             return ELF_OUT_OF_MEMORY;
         }
 
-        // Allocate all pages via MM_MAP_WINDOW (dual-mapped: child + procmgr scratch)
-        let mut mm_msg = BesaltMsg::zeroed();
-        let mut mm_reply = BesaltMsg::zeroed();
-        mm_msg.label = MM_MAP_WINDOW;
-        mm_msg.length = 5;
-        mm_msg.regs[0] = pid as u64;
-        mm_msg.regs[1] = span_start;
-        mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
-        mm_msg.regs[3] = total_span_pages as u64;
-        mm_msg.regs[4] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-        besalt::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-        let err = besalt::ipc::call_ctx(
-            super::ipc_ctx(),
-            CAP_MMSRV_EP,
-            &raw const mm_msg,
-            &raw mut mm_reply,
-        );
-        if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != total_span_pages as u64 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] exec ELF MM_MAP_WINDOW failed err=");
-            lb.hex(err as u64);
-            lb.str(b" mapped=");
-            lb.hex(mm_reply.regs[0]);
-            lb.str(b"/");
-            lb.hex(total_span_pages as u64);
-            lb.str(b"\n");
-            lb.flush();
-            return ELF_MAP_FAILED;
-        }
+        // Load the ELF span in 512-page chunks to stay within MM_MAP_WINDOW limit.
+        const CHUNK_PAGES: usize = 512;
+        let mut chunk_off: usize = 0;
+        while chunk_off < total_span_pages {
+            let chunk_count = if total_span_pages - chunk_off > CHUNK_PAGES {
+                CHUNK_PAGES
+            } else {
+                total_span_pages - chunk_off
+            };
+            let chunk_vaddr = span_start + (chunk_off as u64) * 4096;
+            let chunk_size = (chunk_count as u64) * 4096;
 
-        // Zero the entire write window
-        let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
-        for i in 0..total_span_pages * 4096 {
-            core::ptr::write_volatile(scratch.add(i), 0u8);
-        }
-
-        // Copy each PT_LOAD segment's file data into the window
-        for i in 0..phdr_count {
-            let off = phdr_base + i * phdr_size;
-            if off + core::mem::size_of::<Elf64Phdr>() > data_len {
-                break;
-            }
-            let phdr = &*(data.add(off) as *const Elf64Phdr);
-            if phdr.p_type != PT_LOAD {
-                continue;
+            // 1. Map window (dual-mapped: child + procmgr scratch)
+            let mut mm_msg = BesaltMsg::zeroed();
+            let mut mm_reply = BesaltMsg::zeroed();
+            mm_msg.label = MM_MAP_WINDOW;
+            mm_msg.length = 5;
+            mm_msg.regs[0] = pid as u64;
+            mm_msg.regs[1] = chunk_vaddr;
+            mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
+            mm_msg.regs[3] = chunk_count as u64;
+            mm_msg.regs[4] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
+            besalt::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
+            let err = besalt::ipc::call_ctx(
+                super::ipc_ctx(),
+                CAP_MMSRV_EP,
+                &raw const mm_msg,
+                &raw mut mm_reply,
+            );
+            if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != chunk_count as u64 {
+                let mut lb = LineBuf::new();
+                lb.str(b"[PROCMGR] exec ELF MM_MAP_WINDOW failed err=");
+                lb.hex(err as u64);
+                lb.str(b" label=");
+                lb.hex(mm_reply.label);
+                lb.str(b" mapped=");
+                lb.hex(mm_reply.regs[0]);
+                lb.str(b"/");
+                lb.hex(chunk_count as u64);
+                lb.str(b"\n");
+                lb.flush();
+                return ELF_MAP_FAILED;
             }
 
-            let seg_vaddr = phdr.p_vaddr.wrapping_add(delta);
-            let window_offset = (seg_vaddr - span_start) as usize;
-            let file_offset = phdr.p_offset as usize;
-            let file_size = phdr.p_filesz as usize;
+            // 2. Zero the window
+            let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
+            unsafe { volatile_zero(scratch, chunk_count * 4096) };
 
-            if file_size > 0 && file_offset + file_size <= data_len {
-                for k in 0..file_size {
-                    core::ptr::write_volatile(
-                        scratch.add(window_offset + k),
-                        *data.add(file_offset + k),
-                    );
+            // 3. Copy overlapping PT_LOAD segment data into the window
+            for seg_i in 0..phdr_count {
+                let off = phdr_base + seg_i * phdr_size;
+                if off + core::mem::size_of::<Elf64Phdr>() > data_len {
+                    break;
+                }
+                let phdr = &*(data.add(off) as *const Elf64Phdr);
+                if phdr.p_type != PT_LOAD {
+                    continue;
+                }
+
+                let seg_vaddr = phdr.p_vaddr.wrapping_add(delta);
+                let seg_file_end = seg_vaddr + phdr.p_filesz;
+                let chunk_end = chunk_vaddr + chunk_size;
+
+                if seg_vaddr >= chunk_end || seg_file_end <= chunk_vaddr {
+                    continue;
+                }
+
+                let copy_start = if seg_vaddr > chunk_vaddr { seg_vaddr } else { chunk_vaddr };
+                let copy_end = if seg_file_end < chunk_end { seg_file_end } else { chunk_end };
+                let file_off = phdr.p_offset as usize + (copy_start - seg_vaddr) as usize;
+                let win_off = (copy_start - chunk_vaddr) as usize;
+                let copy_len = (copy_end - copy_start) as usize;
+
+                if copy_len > 0 && file_off + copy_len <= data_len {
+                    unsafe { volatile_copy(scratch.add(win_off), data.add(file_off), copy_len) };
                 }
             }
-        }
 
-        // Apply R_X86_64_RELATIVE relocations for PIE binaries
-        if is_pie {
-            exec_apply_relocs(data, data_len, ehdr, delta, load_base, scratch, span_start);
-        }
+            // 4. Apply relocations targeting this chunk
+            if is_pie {
+                exec_apply_relocs_chunk(
+                    data, data_len, ehdr, delta, load_base,
+                    scratch, chunk_vaddr, chunk_size,
+                );
+            }
 
-        // Unmap write window
-        unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, total_span_pages as u64);
+            // 5. Unmap window
+            unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, chunk_count as u64);
+            chunk_off += chunk_count;
+        }
 
         // Tighten per-segment permissions (W^X enforcement)
         for i in 0..phdr_count {
@@ -1532,11 +1686,8 @@ pub(crate) unsafe fn exec_load_elf_mmsrv(
                 flags |= VSPACE_FLAG_EXECUTABLE;
             }
 
-            let mut page = seg_start_page;
-            while page < seg_end_page {
-                besalt::invoke::vspace_protect(child_vspace, page, flags);
-                page += 4096;
-            }
+            let page_count = ((seg_end_page - seg_start_page) / 4096) as u64;
+            besalt::invoke::vspace_protect_range(child_vspace, seg_start_page, page_count, flags);
         }
 
         let brk = span_end;
@@ -1553,18 +1704,22 @@ pub(crate) unsafe fn exec_load_elf_mmsrv(
     }
 }
 
-/// Apply R_X86_64_RELATIVE relocations through a mapped write window.
+/// Apply R_X86_64_RELATIVE relocations through a mapped write window chunk.
+///
+/// Only applies relocations whose target address falls within
+/// `[chunk_vaddr, chunk_vaddr + chunk_size)`.
 ///
 /// # Safety
-/// `scratch` must point to a mapped region covering the ELF span.
-unsafe fn exec_apply_relocs(
+/// `scratch` must point to a mapped region covering the chunk.
+unsafe fn exec_apply_relocs_chunk(
     data: *const u8,
     data_len: usize,
     ehdr: &Elf64Ehdr,
     delta: u64,
     load_base: u64,
     scratch: *mut u8,
-    span_start: u64,
+    chunk_vaddr: u64,
+    chunk_size: u64,
 ) {
     unsafe {
         use besalt::consts::{
@@ -1664,13 +1819,270 @@ unsafe fn exec_apply_relocs(
                 let target_vaddr = rela.r_offset + delta;
                 let value = load_base.wrapping_add(rela.r_addend as u64);
 
-                if target_vaddr >= span_start {
-                    let window_off = (target_vaddr - span_start) as usize;
+                if target_vaddr >= chunk_vaddr && target_vaddr + 8 <= chunk_vaddr + chunk_size {
+                    let window_off = (target_vaddr - chunk_vaddr) as usize;
                     let ptr = scratch.add(window_off) as *mut u64;
                     core::ptr::write_volatile(ptr, value);
                 }
             }
         }
+    }
+}
+
+unsafe fn exec_apply_relocs_chunk_cached(
+    rela_data: *const u8,
+    rela_len: usize,
+    rela_ent: usize,
+    delta: u64,
+    load_base: u64,
+    scratch: *mut u8,
+    chunk_vaddr: u64,
+    chunk_size: u64,
+) {
+    unsafe {
+        if rela_data.is_null() || rela_len == 0 || rela_ent < core::mem::size_of::<Elf64Rela>() {
+            return;
+        }
+
+        let rela_count = rela_len / rela_ent;
+        for i in 0..rela_count {
+            let entry_off = i * rela_ent;
+            if entry_off + core::mem::size_of::<Elf64Rela>() > rela_len {
+                break;
+            }
+            let rela = &*(rela_data.add(entry_off) as *const Elf64Rela);
+            let reloc_type = (rela.r_info & 0xFFFF_FFFF) as u32;
+            if reloc_type != besalt::R_X86_64_RELATIVE {
+                continue;
+            }
+
+            let target_vaddr = rela.r_offset + delta;
+            if target_vaddr < chunk_vaddr || target_vaddr + 8 > chunk_vaddr + chunk_size {
+                continue;
+            }
+
+            let value = load_base.wrapping_add(rela.r_addend as u64);
+            let window_off = (target_vaddr - chunk_vaddr) as usize;
+            let ptr = scratch.add(window_off) as *mut u64;
+            core::ptr::write_volatile(ptr, value);
+        }
+    }
+}
+
+pub(crate) unsafe fn exec_load_elf_vfs_mmsrv(
+    vfs: &super::vfs_load::VfsStreamExec,
+    load_base: u64,
+    pid: u32,
+    child_vspace: Cap,
+    result: *mut ElfLoadResult,
+) -> i32 {
+    unsafe {
+        use besalt::consts::{
+            ELFCLASS64, ELFDATA2LSB, ELF_BAD_ARCH, ELF_BAD_TYPE, ELF_MAP_FAILED, ELF_NOT_64BIT,
+            ELF_NOT_ELF, ELF_NOT_LE, ELF_NO_LOAD, ELF_OUT_OF_MEMORY, ELF_TOO_SMALL, EM_X86_64,
+            ET_DYN, ET_EXEC, MM_MAP_WINDOW, PF_W, PF_X, PT_LOAD,
+        };
+
+        let fd = vfs.fd;
+        let data_len = vfs.file_size;
+        if data_len < core::mem::size_of::<Elf64Ehdr>() {
+            return ELF_TOO_SMALL;
+        }
+
+        let mut ehdr = core::mem::MaybeUninit::<Elf64Ehdr>::uninit();
+        if !super::vfs_load::vfs_read_exact_at(
+            fd,
+            ehdr.as_mut_ptr() as *mut u8,
+            core::mem::size_of::<Elf64Ehdr>(),
+            0,
+        ) {
+            return ELF_TOO_SMALL;
+        }
+        let ehdr = ehdr.assume_init();
+
+        if ehdr.e_ident[0] != 0x7F
+            || ehdr.e_ident[1] != b'E'
+            || ehdr.e_ident[2] != b'L'
+            || ehdr.e_ident[3] != b'F'
+        {
+            return ELF_NOT_ELF;
+        }
+        if ehdr.e_ident[4] != ELFCLASS64 {
+            return ELF_NOT_64BIT;
+        }
+        if ehdr.e_ident[5] != ELFDATA2LSB {
+            return ELF_NOT_LE;
+        }
+        if ehdr.e_type != ET_EXEC && ehdr.e_type != ET_DYN {
+            return ELF_BAD_TYPE;
+        }
+        if ehdr.e_machine != EM_X86_64 {
+            return ELF_BAD_ARCH;
+        }
+
+        let phdr_count = ehdr.e_phnum as usize;
+        let phdr_size = ehdr.e_phentsize as usize;
+        let phdr_bytes_len = phdr_count.saturating_mul(phdr_size);
+        if phdr_count == 0 || phdr_bytes_len == 0 || phdr_bytes_len > 4096 {
+            return ELF_NO_LOAD;
+        }
+
+        let mut phdr_bytes = [0u8; 4096];
+        if !super::vfs_load::vfs_read_exact_at(fd, phdr_bytes.as_mut_ptr(), phdr_bytes_len, ehdr.e_phoff as usize) {
+            return ELF_NO_LOAD;
+        }
+
+        let is_pie = ehdr.e_type == ET_DYN;
+        let mut min_vaddr: u64 = u64::MAX;
+        let mut max_vaddr_end: u64 = 0;
+        let mut has_load = false;
+
+        for i in 0..phdr_count {
+            let off = i * phdr_size;
+            if off + core::mem::size_of::<Elf64Phdr>() > phdr_bytes_len {
+                break;
+            }
+            let phdr = &*(phdr_bytes.as_ptr().add(off) as *const Elf64Phdr);
+            if phdr.p_type == PT_LOAD {
+                has_load = true;
+                if phdr.p_vaddr < min_vaddr {
+                    min_vaddr = phdr.p_vaddr;
+                }
+                let end = phdr.p_vaddr + phdr.p_memsz;
+                if end > max_vaddr_end {
+                    max_vaddr_end = end;
+                }
+            }
+        }
+
+        if !has_load || min_vaddr == u64::MAX {
+            return ELF_NO_LOAD;
+        }
+
+        let delta = if is_pie {
+            load_base.wrapping_sub(min_vaddr)
+        } else {
+            0
+        };
+        let span_start = (min_vaddr.wrapping_add(delta)) & !0xFFFu64;
+        let span_end = ((max_vaddr_end.wrapping_add(delta)) + 0xFFF) & !0xFFFu64;
+        let total_span_pages = ((span_end - span_start) / 4096) as usize;
+        if total_span_pages == 0 {
+            return ELF_OUT_OF_MEMORY;
+        }
+
+        const CHUNK_PAGES: usize = 512;
+        let mut chunk_off = 0usize;
+        while chunk_off < total_span_pages {
+            let chunk_count = core::cmp::min(total_span_pages - chunk_off, CHUNK_PAGES);
+            let chunk_vaddr = span_start + (chunk_off as u64) * 4096;
+            let chunk_size = (chunk_count as u64) * 4096;
+
+            let mut mm_msg = BesaltMsg::zeroed();
+            let mut mm_reply = BesaltMsg::zeroed();
+            mm_msg.label = MM_MAP_WINDOW;
+            mm_msg.length = 5;
+            mm_msg.regs[0] = pid as u64;
+            mm_msg.regs[1] = chunk_vaddr;
+            mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
+            mm_msg.regs[3] = chunk_count as u64;
+            mm_msg.regs[4] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
+            besalt::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
+            let err = besalt::ipc::call_ctx(
+                super::ipc_ctx(),
+                CAP_MMSRV_EP,
+                &raw const mm_msg,
+                &raw mut mm_reply,
+            );
+            if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != chunk_count as u64 {
+                return ELF_MAP_FAILED;
+            }
+
+            let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
+            volatile_zero(scratch, chunk_count * 4096);
+
+            for seg_i in 0..phdr_count {
+                let off = seg_i * phdr_size;
+                if off + core::mem::size_of::<Elf64Phdr>() > phdr_bytes_len {
+                    break;
+                }
+                let phdr = &*(phdr_bytes.as_ptr().add(off) as *const Elf64Phdr);
+                if phdr.p_type != PT_LOAD {
+                    continue;
+                }
+
+                let seg_vaddr = phdr.p_vaddr.wrapping_add(delta);
+                let seg_file_end = seg_vaddr + phdr.p_filesz;
+                let chunk_end = chunk_vaddr + chunk_size;
+                if seg_vaddr >= chunk_end || seg_file_end <= chunk_vaddr {
+                    continue;
+                }
+
+                let copy_start = if seg_vaddr > chunk_vaddr { seg_vaddr } else { chunk_vaddr };
+                let copy_end = if seg_file_end < chunk_end { seg_file_end } else { chunk_end };
+                let file_off = phdr.p_offset as usize + (copy_start - seg_vaddr) as usize;
+                let win_off = (copy_start - chunk_vaddr) as usize;
+                let copy_len = (copy_end - copy_start) as usize;
+
+                if copy_len > 0 && file_off + copy_len <= data_len {
+                    if !super::vfs_load::vfs_read_exact_at(fd, scratch.add(win_off), copy_len, file_off) {
+                        unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, chunk_count as u64);
+                        return ELF_MAP_FAILED;
+                    }
+                }
+            }
+
+            if is_pie {
+                exec_apply_relocs_chunk_cached(
+                    vfs.rela_data,
+                    vfs.rela_len,
+                    vfs.rela_ent,
+                    delta,
+                    load_base,
+                    scratch,
+                    chunk_vaddr,
+                    chunk_size,
+                );
+            }
+
+            unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, chunk_count as u64);
+            chunk_off += chunk_count;
+        }
+
+        for i in 0..phdr_count {
+            let off = i * phdr_size;
+            if off + core::mem::size_of::<Elf64Phdr>() > phdr_bytes_len {
+                break;
+            }
+            let phdr = &*(phdr_bytes.as_ptr().add(off) as *const Elf64Phdr);
+            if phdr.p_type != PT_LOAD {
+                continue;
+            }
+
+            let seg_vaddr = phdr.p_vaddr.wrapping_add(delta);
+            let seg_start_page = seg_vaddr & !0xFFFu64;
+            let seg_end = seg_vaddr + phdr.p_memsz;
+            let seg_end_page = (seg_end + 0xFFF) & !0xFFFu64;
+
+            let mut flags: u64 = VSPACE_FLAG_USER;
+            if phdr.p_flags & PF_W != 0 {
+                flags |= VSPACE_FLAG_WRITABLE;
+            } else if phdr.p_flags & PF_X != 0 {
+                flags |= VSPACE_FLAG_EXECUTABLE;
+            }
+
+            let page_count = ((seg_end_page - seg_start_page) / 4096) as u64;
+            besalt::invoke::vspace_protect_range(child_vspace, seg_start_page, page_count, flags);
+        }
+
+        (*result).entry = if is_pie {
+            ehdr.e_entry.wrapping_add(delta)
+        } else {
+            ehdr.e_entry
+        };
+        (*result).base = load_base;
+        (*result).brk = span_end;
+        0
     }
 }
 
@@ -1709,6 +2121,28 @@ pub(crate) unsafe fn exec_load_rtld_mmsrv(
             }
         }
 
+        exec_load_rtld_mmsrv_by_name(
+            rtld_name,
+            rtld_name_len,
+            initrd,
+            initrd_size,
+            rtld_load_base,
+            pid,
+            child_vspace,
+        )
+    }
+}
+
+pub(crate) unsafe fn exec_load_rtld_mmsrv_by_name(
+    rtld_name: *const u8,
+    rtld_name_len: usize,
+    initrd: *const u8,
+    initrd_size: usize,
+    rtld_load_base: u64,
+    pid: u32,
+    child_vspace: Cap,
+) -> Option<ElfLoadResult> {
+    unsafe {
         let mut rtld_entry = CpioEntry::zeroed();
         if besalt::cpio::cpio_find_file(
             initrd,
@@ -2105,16 +2539,18 @@ pub unsafe fn handle_spawn_tx(
                 &raw mut elf_entry,
             ) != 0;
         }
-        // VFS fallback: try loading from disk-based rootfs
-        let mut vfs_loaded = false;
-        let mut vfs_alloc_size: u64 = 0;
+        // VFS fallback: stream large ELFs instead of buffering the whole file.
+        let mut vfs_source = super::vfs_load::VfsExecSource::none();
         if !found {
-            if let Some(vfs_result) = super::vfs_load::try_load_from_vfs(&name, name_len) {
-                elf_entry.data = vfs_result.data;
-                elf_entry.data_len = vfs_result.data_len;
-                vfs_alloc_size = vfs_result.alloc_size;
+            if let Some(source) =
+                super::vfs_load::try_open_exec_source_from_vfs_for_badge(&name, name_len, badge)
+            {
+                if let Some((data, data_len)) = source.buffered_data() {
+                    elf_entry.data = data;
+                    elf_entry.data_len = data_len;
+                }
                 found = true;
-                vfs_loaded = true;
+                vfs_source = source;
             }
         }
         if !found {
@@ -2123,7 +2559,12 @@ pub unsafe fn handle_spawn_tx(
             return;
         }
 
-        let is_dynamic = besalt::elf_dynamic::elf_has_interp(elf_entry.data, elf_entry.data_len);
+        let vfs_stream = vfs_source.streamed();
+        let is_dynamic = if let Some(vfs) = vfs_stream {
+            vfs.is_dynamic
+        } else {
+            besalt::elf_dynamic::elf_has_interp(elf_entry.data, elf_entry.data_len)
+        };
         // ---- PREFLIGHT: Build SpawnPlan ----
         let do_map_initrd = is_dynamic || policy_map_initrd;
 
@@ -2137,7 +2578,7 @@ pub unsafe fn handle_spawn_tx(
             compute_ready_timeout_ns(
                 requested_timeout_ns,
                 is_dynamic,
-                elf_entry.data_len,
+                if let Some(vfs) = vfs_stream { vfs.file_size } else { elf_entry.data_len },
                 lib_window_pages,
             )
         } else {
@@ -2145,21 +2586,39 @@ pub unsafe fn handle_spawn_tx(
         };
 
         // Compute spans for VM layout
-        let elf_span = besalt::elf_loader::elf_compute_load_span(elf_entry.data, elf_entry.data_len);
+        let elf_span = if let Some(vfs) = vfs_stream {
+            vfs.elf_span
+        } else {
+            besalt::elf_loader::elf_compute_load_span(elf_entry.data, elf_entry.data_len)
+        };
         let rtld_span = if is_dynamic {
-            count_rtld_span(elf_entry.data, elf_entry.data_len, initrd, initrd_size)
+            if let Some(vfs) = vfs_stream {
+                count_rtld_span_by_name(
+                    vfs.interp_name.as_ptr(),
+                    vfs.interp_name_len,
+                    initrd,
+                    initrd_size,
+                )
+            } else {
+                count_rtld_span(elf_entry.data, elf_entry.data_len, initrd, initrd_size)
+            }
         } else {
             0
         };
 
         // Parse DT_NEEDED to determine which shared libs this ELF needs
-        let needed = if is_dynamic {
+        let needed_owned = if is_dynamic && vfs_stream.is_none() {
             besalt::elf_dynamic::elf_get_needed(elf_entry.data, elf_entry.data_len)
         } else {
             besalt::elf_dynamic::NeededLibs::new()
         };
+        let needed = if let Some(vfs) = vfs_stream {
+            &vfs.needed
+        } else {
+            &needed_owned
+        };
 
-        let shared_lib_cache_pages = shared_lib_va_pages_for_needed(&needed);
+        let shared_lib_cache_pages = shared_lib_va_pages_for_needed(needed);
 
         let layout = layout::compute_vm_layout_randomized(
             elf_span,
@@ -2172,7 +2631,7 @@ pub unsafe fn handle_spawn_tx(
 
         if layout.stack_top == 0 {
             puts(b"[PROCMGR] ELF too large for VA layout\n");
-            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+            super::vfs_load::cleanup_exec_source(&mut vfs_source);
             reply.label = BESALT_INVALID_ARGUMENT;
             return;
         }
@@ -2200,7 +2659,7 @@ pub unsafe fn handle_spawn_tx(
 
         let Some(slot_idx) = proc_table::alloc_proc() else {
             puts(b"[PROCMGR] process table full\n");
-            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+            super::vfs_load::cleanup_exec_source(&mut vfs_source);
             reply.label = BESALT_OUT_OF_MEMORY;
             return;
         };
@@ -2211,47 +2670,27 @@ pub unsafe fn handle_spawn_tx(
         // ---- RESERVE ----
         if !alloc.reserve(plan.total_slots) {
             puts(b"[PROCMGR] slot reservation failed\n");
-            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+            super::vfs_load::cleanup_exec_source(&mut vfs_source);
             reply.label = BESALT_OUT_OF_MEMORY;
             return;
         }
 
-        // ---- REALIZE fixed objects ----
-        // Core objects (TCB/VSpace/CNode/SC) prefer primary untyped to reduce
-        // fragmentation; non-core objects (Notification) use any source.
-        macro_rules! realize_core {
+        // ---- REALIZE fixed objects via mmsrv ----
+        // All kernel objects are allocated by mmsrv (centralized untyped owner)
+        // and received via IPC cap transfer into procmgr's reservation slots.
+        macro_rules! realize_mm {
             ($ty:expr, $sz:expr, $off:expr, $what:expr) => {
-                match alloc.realize_core_object_at($ty, $sz, $off) {
+                match alloc.realize_via_mmsrv(CAP_MMSRV_EP, $ty, $sz, $off) {
                     Ok(s) => s,
                     Err(e) => {
                         let mut lb = LineBuf::new();
-                        lb.str(b"[PROCMGR] retype ");
+                        lb.str(b"[PROCMGR] alloc ");
                         lb.bytes($what);
                         lb.str(b" failed err=");
                         lb.hex(e as u64);
                         lb.str(b"\n");
                         lb.flush();
-                        if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
-                        alloc.rollback();
-                        reply.label = BESALT_OUT_OF_MEMORY;
-                        return;
-                    }
-                }
-            };
-        }
-        macro_rules! realize {
-            ($ty:expr, $sz:expr, $off:expr, $what:expr) => {
-                match alloc.realize_object_at($ty, $sz, $off) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let mut lb = LineBuf::new();
-                        lb.str(b"[PROCMGR] retype ");
-                        lb.bytes($what);
-                        lb.str(b" failed err=");
-                        lb.hex(e as u64);
-                        lb.str(b"\n");
-                        lb.flush();
-                        if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+                        super::vfs_load::cleanup_exec_source(&mut vfs_source);
                         alloc.rollback();
                         reply.label = BESALT_OUT_OF_MEMORY;
                         return;
@@ -2260,21 +2699,21 @@ pub unsafe fn handle_spawn_tx(
             };
         }
 
-        let child_tcb = realize_core!(OBJ_TCB, 0, OFF_TCB, b"TCB");
-        let child_vs = realize_core!(OBJ_VSPACE, 0, OFF_VSPACE, b"VSpace");
+        let child_tcb = realize_mm!(OBJ_TCB, 0, OFF_TCB, b"TCB");
+        let child_vs = realize_mm!(OBJ_VSPACE, 0, OFF_VSPACE, b"VSpace");
         let cn_size_bits = if policy_cnode_bits > 0 {
             policy_cnode_bits as u64
         } else {
             0
         };
-        let child_cn = realize_core!(OBJ_CNODE, cn_size_bits, OFF_CNODE, b"CNode");
-        let child_sc = realize_core!(OBJ_SCHED_CONTEXT, 0, OFF_SC, b"SC");
+        let child_cn = realize_mm!(OBJ_CNODE, cn_size_bits, OFF_CNODE, b"CNode");
+        let child_sc = realize_mm!(OBJ_SCHED_CONTEXT, 0, OFF_SC, b"SC");
         // OFF_STACK_FR and OFF_IPC_FR slots left unused — frames allocated by mmsrv
-        let child_sig_ntfn = realize!(OBJ_NOTIFICATION, 0, OFF_SIGNAL_NTFN, b"signal ntfn");
+        let child_sig_ntfn = realize_mm!(OBJ_NOTIFICATION, 0, OFF_SIGNAL_NTFN, b"signal ntfn");
 
         let child_ready_ntfn;
         if plan.readiness_mode == besalt::SPAWN_READY_NOTIFY {
-            child_ready_ntfn = realize!(OBJ_NOTIFICATION, 0, OFF_READY_NTFN, b"ready ntfn");
+            child_ready_ntfn = realize_mm!(OBJ_NOTIFICATION, 0, OFF_READY_NTFN, b"ready ntfn");
         } else {
             child_ready_ntfn = 0;
         }
@@ -2289,7 +2728,7 @@ pub unsafe fn handle_spawn_tx(
         );
         if err != 0 {
             puts(b"[PROCMGR] mint mmsrv EP into child failed\n");
-            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+            super::vfs_load::cleanup_exec_source(&mut vfs_source);
             alloc.rollback();
             reply.label = BESALT_OUT_OF_MEMORY;
             return;
@@ -2308,7 +2747,7 @@ pub unsafe fn handle_spawn_tx(
             if use_pre_ep { CAP_RECV_SCRATCH } else { 0 },
         );
         if err != 0 {
-            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+            super::vfs_load::cleanup_exec_source(&mut vfs_source);
             alloc.rollback();
             reply.label = BESALT_OUT_OF_MEMORY;
             return;
@@ -2334,7 +2773,7 @@ pub unsafe fn handle_spawn_tx(
         let err = besalt::invoke::tcb_set_space(child_tcb, child_cn, child_vs);
         if err != 0 {
             puts(b"[PROCMGR] TCB set_space failed\n");
-            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+            super::vfs_load::cleanup_exec_source(&mut vfs_source);
             alloc.rollback();
             reply.label = BESALT_OUT_OF_MEMORY;
             return;
@@ -2346,7 +2785,7 @@ pub unsafe fn handle_spawn_tx(
                 Some(s) => s,
                 None => {
                     puts(b"[PROCMGR] SPAWN: fault EP slot alloc failed\n");
-                    if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+                    super::vfs_load::cleanup_exec_source(&mut vfs_source);
                     alloc.rollback();
                     reply.label = BESALT_OUT_OF_MEMORY;
                     return;
@@ -2404,7 +2843,7 @@ pub unsafe fn handle_spawn_tx(
                 lb.hex(err as u64);
                 lb.str(b"\n");
                 lb.flush();
-                if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+                super::vfs_load::cleanup_exec_source(&mut vfs_source);
                 alloc.rollback();
                 reply.label = BESALT_OUT_OF_MEMORY;
                 return;
@@ -2417,21 +2856,31 @@ pub unsafe fn handle_spawn_tx(
             base: 0,
             brk: 0,
         };
-        let err = exec_load_elf_mmsrv(
-            elf_entry.data,
-            elf_entry.data_len,
-            plan.layout.elf_code.base,
-            pid,
-            child_vs,
-            &raw mut elf_result,
-        );
+        let err = if let Some(vfs) = vfs_stream {
+            exec_load_elf_vfs_mmsrv(
+                vfs,
+                plan.layout.elf_code.base,
+                pid,
+                child_vs,
+                &raw mut elf_result,
+            )
+        } else {
+            exec_load_elf_mmsrv(
+                elf_entry.data,
+                elf_entry.data_len,
+                plan.layout.elf_code.base,
+                pid,
+                child_vs,
+                &raw mut elf_result,
+            )
+        };
         if err != 0 {
             let mut lb = LineBuf::new();
             lb.str(b"[PROCMGR] SPAWN: ELF load failed err=");
             lb.hex(err as u64);
             lb.str(b"\n");
             lb.flush();
-            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+            super::vfs_load::cleanup_exec_source(&mut vfs_source);
             deregister_from_mmsrv(pid);
             alloc.rollback();
             reply.label = BESALT_INVALID_ARGUMENT;
@@ -2445,18 +2894,31 @@ pub unsafe fn handle_spawn_tx(
             brk: 0,
         };
         if plan.is_dynamic {
-            match exec_load_rtld_mmsrv(
-                elf_entry.data,
-                elf_entry.data_len,
-                initrd,
-                initrd_size,
-                plan.layout.rtld.base,
-                pid,
-                child_vs,
-            ) {
+            let rtld_load = if let Some(vfs) = vfs_stream {
+                exec_load_rtld_mmsrv_by_name(
+                    vfs.interp_name.as_ptr(),
+                    vfs.interp_name_len,
+                    initrd,
+                    initrd_size,
+                    plan.layout.rtld.base,
+                    pid,
+                    child_vs,
+                )
+            } else {
+                exec_load_rtld_mmsrv(
+                    elf_entry.data,
+                    elf_entry.data_len,
+                    initrd,
+                    initrd_size,
+                    plan.layout.rtld.base,
+                    pid,
+                    child_vs,
+                )
+            };
+            match rtld_load {
                 Some(r) => rtld_result = r,
                 None => {
-                    if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+                    super::vfs_load::cleanup_exec_source(&mut vfs_source);
                     deregister_from_mmsrv(pid);
                     alloc.rollback();
                     reply.label = BESALT_NOT_FOUND;
@@ -2466,7 +2928,7 @@ pub unsafe fn handle_spawn_tx(
         }
         // ---- Map shared library frames if available ----
         let (shared_lib_base, shared_lib_map) = if plan.is_dynamic {
-            map_shared_lib_to_vspace(child_vs, plan.layout.shared_libs.base, &needed, pid)
+            map_shared_lib_to_vspace(child_vs, plan.layout.shared_libs.base, needed, pid)
         } else {
             (0, proc_table::ProcLibMap::zeroed())
         };
@@ -2475,7 +2937,7 @@ pub unsafe fn handle_spawn_tx(
         let err = besalt::invoke::sc_configure(child_sc, 10000, 100000);
         if err != 0 {
             puts(b"[PROCMGR] SC configure failed\n");
-            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+            super::vfs_load::cleanup_exec_source(&mut vfs_source);
             alloc.rollback();
             reply.label = BESALT_OUT_OF_MEMORY;
             return;
@@ -2483,7 +2945,7 @@ pub unsafe fn handle_spawn_tx(
         let err = besalt::invoke::sc_bind(child_sc, child_tcb);
         if err != 0 {
             puts(b"[PROCMGR] SC bind failed\n");
-            if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+            super::vfs_load::cleanup_exec_source(&mut vfs_source);
             alloc.rollback();
             reply.label = BESALT_OUT_OF_MEMORY;
             return;
@@ -2500,14 +2962,14 @@ pub unsafe fn handle_spawn_tx(
                 plan.layout.initrd.base,
             ) != 0
             {
-                if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+                super::vfs_load::cleanup_exec_source(&mut vfs_source);
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
                 reply.label = BESALT_OUT_OF_MEMORY;
                 return;
             }
             if map_boot_info_to_child_tx(child_vs, pid) != 0 {
-                if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+                super::vfs_load::cleanup_exec_source(&mut vfs_source);
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
                 reply.label = BESALT_OUT_OF_MEMORY;
@@ -2539,7 +3001,7 @@ pub unsafe fn handle_spawn_tx(
                 || mm_reply.regs[0] != (stack_pages - 1) as u64
             {
                 puts(b"[PROCMGR] SPAWN: MM_MAP_BATCH stack failed\n");
-                if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+                super::vfs_load::cleanup_exec_source(&mut vfs_source);
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
                 reply.label = BESALT_OUT_OF_MEMORY;
@@ -2567,7 +3029,7 @@ pub unsafe fn handle_spawn_tx(
             );
             if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != 1 {
                 puts(b"[PROCMGR] SPAWN: MM_MAP_WINDOW stack top failed\n");
-                if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+                super::vfs_load::cleanup_exec_source(&mut vfs_source);
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
                 reply.label = BESALT_OUT_OF_MEMORY;
@@ -2578,6 +3040,34 @@ pub unsafe fn handle_spawn_tx(
         // ---- Write stack data (pre-mapped at PROCMGR_SCRATCH_VADDR) ----
         let mut child_entry_rip = elf_result.entry;
         let mut child_rsp = plan.layout.stack_top;
+        let (phdr_vaddr, phent, phnum) = if let Some(vfs) = vfs_stream {
+            (
+                plan.layout.elf_code.base + vfs.phdr_vaddr,
+                vfs.phent,
+                vfs.phnum,
+            )
+        } else {
+            let mut phdr_vaddr = 0u64;
+            let mut phent = 0u64;
+            let mut phnum = 0u64;
+            if besalt::elf_dynamic::elf_get_phdr_info(
+                elf_entry.data,
+                elf_entry.data_len,
+                plan.layout.elf_code.base,
+                &raw mut phdr_vaddr,
+                &raw mut phent,
+                &raw mut phnum,
+            ) != 0
+            {
+                unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, 1);
+                super::vfs_load::cleanup_exec_source(&mut vfs_source);
+                deregister_from_mmsrv(pid);
+                alloc.rollback();
+                reply.label = BESALT_INVALID_ARGUMENT;
+                return;
+            }
+            (phdr_vaddr, phent, phnum)
+        };
 
         if plan.is_dynamic {
             // Pass library window size for AT_BESALT_INITRD_SZ
@@ -2663,8 +3153,9 @@ pub unsafe fn handle_spawn_tx(
             }
 
             match write_dynamic_stack(
-                elf_entry.data,
-                elf_entry.data_len,
+                phdr_vaddr,
+                phent,
+                phnum,
                 0, // stk_frame unused in pre_mapped mode
                 &elf_result,
                 &rtld_result,
@@ -2674,7 +3165,6 @@ pub unsafe fn handle_spawn_tx(
                 4,
                 &str_buf,
                 str_pos,
-                plan.layout.elf_code.base,
                 plan.layout.scratch.base,
                 plan.layout.initrd.base,
                 plan.layout.stack_top,
@@ -2690,20 +3180,24 @@ pub unsafe fn handle_spawn_tx(
                     child_rsp = rsp;
                     child_entry_rip = rtld_result.entry;
                 }
-                Err(()) => {
+                Err(err) => {
                     // Unmap scratch window before rollback
                     unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, 1);
-                    if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+                    super::vfs_load::cleanup_exec_source(&mut vfs_source);
                     deregister_from_mmsrv(pid);
                     alloc.rollback();
-                    reply.label = BESALT_OUT_OF_MEMORY;
+                    reply.label = match err {
+                        StackBuildError::OutOfMemory => BESALT_OUT_OF_MEMORY,
+                        StackBuildError::InvalidArgument => BESALT_INVALID_ARGUMENT,
+                        StackBuildError::TooLarge => BESALT_OUT_OF_RANGE,
+                    };
                     return;
                 }
             }
         }
 
         // ELF scratch buffer no longer needed (all elf_entry.data users complete).
-        if vfs_loaded { super::vfs_load::cleanup_vfs_load(elf_entry.data, vfs_alloc_size); }
+        super::vfs_load::cleanup_exec_source(&mut vfs_source);
 
         // ---- Unmap procmgr's stack write window ----
         unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, 1);
@@ -2825,6 +3319,14 @@ pub unsafe fn handle_spawn_tx(
         p.waiter_reply = 0;
         p.waiter_pid = 0;
         p.signal_ntfn = child_sig_ntfn;
+        p.ready_ntfn = if start_suspended { child_ready_ntfn } else { 0 };
+        p.wait_ready_on_resume =
+            start_suspended && plan.readiness_mode == besalt::SPAWN_READY_NOTIFY;
+        p.ready_timeout_ns = if start_suspended {
+            plan.ready_timeout_ns
+        } else {
+            0
+        };
         p.pgid = if let Some(ci) = caller_idx {
             proc_table::proctab(ci).pgid
         } else {

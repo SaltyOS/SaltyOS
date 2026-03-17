@@ -197,19 +197,18 @@ pub(crate) unsafe fn cleanup_bulk_shm(cli: *mut ClientState) {
             return;
         }
 
-        // Unmap from VFS address space
+        // Unmap from VFS address space (non-blocking: avoid deadlock with mmsrv
+        // during client exit while VFS is already on the mmsrv call stack)
         let mut req = BesaltMsg::zeroed();
-        let mut mm_reply = BesaltMsg::zeroed();
         req.label = MM_SHM_UNMAP;
         req.regs[0] = (*cli).bulk_shm_id;
         req.regs[1] = 0; // VFS's own badge
         req.regs[2] = (*cli).bulk_shm_vaddr;
         req.length = 3;
-        ipc::call_ctx(
+        ipc::nbsend_ctx(
             crate::ipc_ctx(),
             VFS_CAP_MMSRV_EP,
             &raw const req,
-            &raw mut mm_reply,
         );
 
         (*cli).bulk_shm_vaddr = 0;

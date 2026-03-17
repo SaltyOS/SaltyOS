@@ -462,6 +462,9 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
         crate::serial_puts_raw("  R13: "); crate::serial_hex_raw(f.r13);
         crate::serial_puts_raw("  R14: "); crate::serial_hex_raw(f.r14);
         crate::serial_puts_raw("  R15: "); crate::serial_hex_raw(f.r15); crate::serial_putc_hw(b'\n');
+
+
+
     }
 
     // User-mode fault without handler: terminate thread and reschedule

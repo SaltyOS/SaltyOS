@@ -2,29 +2,11 @@
 //! IPC request handlers for PTY operations.
 
 use besalt::consts::*;
-use besalt::ipc;
 use besalt::serial;
 use besalt::types::*;
 
 use crate::types::*;
-use crate::{ipc_ctx, PTYS};
-
-fn procmgr_get_pgid_by_badge(badge: u64) -> Option<u32> {
-    unsafe {
-        let mut msg = BesaltMsg::zeroed();
-        let mut reply = BesaltMsg::zeroed();
-        msg.label = POSIX_PM_GETPGID_BADGE;
-        msg.length = 1;
-        msg.regs[0] = badge;
-
-        let err = ipc::call_ctx(ipc_ctx(), CAP_PROCMGR_EP, &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != BESALT_OK || reply.length < 1 {
-            return None;
-        }
-
-        Some(reply.regs[0] as u32)
-    }
-}
+use crate::PTYS;
 
 /// TTYD_PTY_READ: try-read from slave side (called by VFS).
 /// msg.regs[0] = pty_id, msg.regs[1] = max_count
@@ -223,44 +205,13 @@ pub unsafe fn handle_pty_ioctl(msg: &BesaltMsg, reply: &mut BesaltMsg) {
 
         match cmd {
             TIOCGPGRP => {
-                // Clear stale fg_pgid from dead unowned sessions.
-                // When has_ctty is false, fg_pgid may linger from a previous
-                // auto-populate. Validate that the backing process is alive.
-                if !pty.has_ctty && pty.ctty_owner_badge == 0 && pty.fg_pgid != 0 {
-                    if procmgr_get_pgid_by_badge(pty.fg_pgid as u64).is_none() {
-                        pty.fg_pgid = 0;
-                    }
-                }
-
-                // If ctty owner is dead, reset ownership state
-                if pty.has_ctty && pty.ctty_owner_badge != 0
-                    && pty.ctty_owner_badge != caller_badge
-                {
-                    if !procmgr_get_pgid_by_badge(pty.ctty_owner_badge).is_some() {
-                        pty.has_ctty = false;
-                        pty.ctty_owner_badge = 0;
-                        pty.fg_pgid = 0;
-                    }
-                }
-
-                // Correct fg_pgid if caller owns ctty but pgid drifted
-                if pty.has_ctty && pty.ctty_owner_badge == caller_badge && pty.fg_pgid != 0 {
-                    if let Some(pgid) = procmgr_get_pgid_by_badge(caller_badge) {
-                        if pgid != 0 && pty.fg_pgid != pgid {
-                            pty.fg_pgid = pgid;
-                        }
-                    }
-                }
-
-                // Auto-populate fg_pgid from caller when unset
-                if pty.fg_pgid == 0 {
-                    if let Some(pgid) = procmgr_get_pgid_by_badge(caller_badge) {
-                        if pgid != 0 {
-                            pty.fg_pgid = pgid;
-                        }
-                    }
-                }
-
+                // Return cached fg_pgid directly. Do NOT call procmgr here —
+                // VFS→ttyd→procmgr creates a deadlock cycle when procmgr is
+                // blocked on VFS (e.g., during exec binary loading).
+                //
+                // Stale pgid cleanup is handled by:
+                // - TIOCSCTTY: resets dead owner on session takeover
+                // - TIOCSPGRP: caller sets fg_pgid authoritatively
                 reply.label = BESALT_OK;
                 reply.length = 1;
                 reply.regs[0] = pty.fg_pgid as u64;
@@ -275,23 +226,19 @@ pub unsafe fn handle_pty_ioctl(msg: &BesaltMsg, reply: &mut BesaltMsg) {
                 }
             }
             TIOCSCTTY => {
+                // Do NOT call procmgr here — VFS→ttyd→procmgr creates a
+                // deadlock cycle when procmgr is blocked on VFS (e.g., during
+                // spawn binary loading on SMP). Assume dead owner and allow
+                // takeover; use caller_badge as pgid fallback.
                 if pty.has_ctty && pty.ctty_owner_badge != caller_badge {
-                    let old_alive =
-                        procmgr_get_pgid_by_badge(pty.ctty_owner_badge).is_some();
-                    if old_alive {
-                        reply.label = BESALT_BUSY;
-                        return;
-                    }
-                    // Old owner is dead -- reset and allow takeover
+                    // Old owner assumed dead — allow takeover without procmgr check
                     pty.fg_pgid = 0;
                 }
                 let newly_acquired = !pty.has_ctty || pty.fg_pgid == 0;
                 pty.has_ctty = true;
                 pty.ctty_owner_badge = caller_badge;
                 if newly_acquired {
-                    if let Some(pgid) = procmgr_get_pgid_by_badge(caller_badge) {
-                        pty.fg_pgid = pgid;
-                    } else if caller_badge != 0 && caller_badge <= u32::MAX as u64 {
+                    if caller_badge != 0 && caller_badge <= u32::MAX as u64 {
                         pty.fg_pgid = caller_badge as u32;
                     }
                 }
@@ -389,13 +336,8 @@ pub unsafe fn handle_legacy(label: u64, msg: &BesaltMsg, reply: &mut BesaltMsg) 
             let caller_badge = msg.regs[0];
             unsafe {
                 let pty = &mut *(&raw mut PTYS[0]);
+                // Do NOT call procmgr — same deadlock risk as TIOCSCTTY above.
                 if pty.has_ctty && pty.ctty_owner_badge != caller_badge {
-                    let old_alive =
-                        procmgr_get_pgid_by_badge(pty.ctty_owner_badge).is_some();
-                    if old_alive {
-                        reply.label = BESALT_BUSY;
-                        return;
-                    }
                     pty.fg_pgid = 0;
                 }
                 pty.has_ctty = true;

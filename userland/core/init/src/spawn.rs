@@ -30,7 +30,7 @@ use super::{CAP_SELF_VSPACE, CAP_SELF_CSPACE, CAP_INITRD_UNTYPED, CAP_UNTYPED_ST
 
 const INIT_UT_SCAN_END_FALLBACK: Cap = 200;
 const CHILD_UT_BITS_MIN: u8 = 12;
-const UT_MIRROR_COUNT: Cap = 8;
+const UT_MIRROR_COUNT: Cap = 16;
 const INITRD_COPY_RIGHTS: u64 = (1 << 0) | (1 << 2) | (1 << 3); // READ|EXECUTE|GRANT
 const READY_SIGNAL_BITS: u64 = 1;
 const READY_TIMEOUT_NS: u64 = 10_000_000_000; // 10s default
@@ -41,7 +41,7 @@ static mut NEXT_UT_HINT: Cap = CAP_UNTYPED_START;
 // Shared library physical frame cache
 // ===========================================================================
 
-const MAX_SHARED_LIB_PAGES: usize = 192;
+const MAX_SHARED_LIB_PAGES: usize = 576;
 const MAX_CACHED_LIBS: usize = 4;
 const MAX_LIB_NAME: usize = 24;
 const MAX_RW_SEGS: usize = 4;
@@ -157,7 +157,7 @@ fn clamp_ut_bits(bits: u8) -> u8 {
     out
 }
 
-fn compute_spawn_memory_budget(is_dynamic: bool, requested_bits: u8) -> SpawnMemoryBudget {
+fn compute_spawn_memory_budget(is_dynamic: bool, requested_bits: u8, is_pager: bool) -> SpawnMemoryBudget {
     let runtime_bits = clamp_ut_bits(requested_bits);
 
     if !is_dynamic {
@@ -168,25 +168,23 @@ fn compute_spawn_memory_budget(is_dynamic: bool, requested_bits: u8) -> SpawnMem
         };
     }
 
-    // Dynamic services get a bounded dedicated boot/load pool so main ELF load
-    // does not over-reserve under lowmem. Runtime growth comes from mirrored
-    // parent untyped caps as fallback.
-    let mut boot_load_bits = runtime_bits;
-    if boot_load_bits > 17 {
-        boot_load_bits = 17;
-    }
-    if boot_load_bits < 15 {
-        boot_load_bits = 15;
-    }
-
-    let runtime_mirror_slots = if runtime_bits >= 20 {
-        8
-    } else if runtime_bits >= 18 {
-        8
-    } else if runtime_bits >= 16 {
-        6
+    // The central pager (mmsrv) gets its full budget as the boot-load pool —
+    // it owns the untyped pool exclusively and needs the entire allocation
+    // for frame management.  Other dynamic services get a bounded boot/load
+    // pool; runtime growth comes from mmsrv via IPC.
+    let mut boot_load_bits = if is_pager {
+        runtime_bits
     } else {
-        5
+        let mut b = runtime_bits;
+        if b > 17 { b = 17; }
+        if b < 15 { b = 15; }
+        b
+    };
+
+    let runtime_mirror_slots = if is_pager {
+        UT_MIRROR_COUNT
+    } else {
+        0
     };
 
     SpawnMemoryBudget {
@@ -468,7 +466,7 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
         let initrd = super::INITRD_VADDR as *const u8;
         let initrd_size = super::INITRD_SIZE;
 
-        let libs: [&[u8]; 2] = [b"libbesalt.so", b"libc.so"];
+        let libs: [&[u8]; 3] = [b"libbesalt.so", b"libc.so", b"libc++.so"];
 
         for lib_name in &libs {
             if cache.lib_count >= MAX_CACHED_LIBS {
@@ -1004,6 +1002,8 @@ pub unsafe fn spawn_server(
     mmsrv_ep: Cap,
     procmgr_ep: Cap,
     spawn_badge: u64,
+    mirror_untypeds: bool,
+    pager_child_slot: u64,
 ) -> i32 {
     { let mut lb = LineBuf::new(); lb.str(b"[INIT] Spawning "); lb.bytes(label); lb.str(b" ("); lb.bytes(elf_name); lb.str(b")\n"); lb.flush(); }
 
@@ -1074,7 +1074,7 @@ pub unsafe fn spawn_server(
             return -1;
         }
 
-        let budget = compute_spawn_memory_budget(is_dynamic, child_ut_bits);
+        let budget = compute_spawn_memory_budget(is_dynamic, child_ut_bits, mirror_untypeds);
         let effective_ready_timeout_ns = compute_ready_timeout_ns(
             ready_timeout_ns,
             is_dynamic,
@@ -1416,9 +1416,10 @@ pub unsafe fn spawn_server(
             return -1;
         }
 
-        if is_dynamic {
-            // Mirror a few parent root-untyped caps into the child so rtld can
-            // fall back when the dedicated child untyped is exhausted.
+        if is_dynamic && mirror_untypeds {
+            // Mirror parent root-untyped caps into the child. Only the memory
+            // server (mmsrv) receives these — other services use mmsrv for all
+            // frame allocation, keeping untyped ownership centralized.
             let mirror_slots = if budget.runtime_mirror_slots > UT_MIRROR_COUNT {
                 UT_MIRROR_COUNT
             } else {
@@ -1569,10 +1570,14 @@ pub unsafe fn spawn_server(
                 return -1;
             }
 
-            // +2 for AT_BESALT_SLOT_BASE/COUNT, +1 for AT_BESALT_EXPAND_EP if procmgr available
+            // +2 for AT_BESALT_SLOT_BASE/COUNT, +1 for AT_BESALT_EXPAND_EP if procmgr available,
+            // +1 for AT_BESALT_MM_EP if pager EP is available for this child.
             let has_expand_ep = procmgr_ep != 0;
+            let has_mm_ep = mmsrv_ep != 0 && pager_child_slot != 0;
             let base_count: u64 = if shared_lib_base != 0 { 16 } else { 15 };
-            let auxv_count: u64 = if has_expand_ep { base_count + 1 } else { base_count };
+            let auxv_count: u64 = base_count
+                + if has_expand_ep { 1 } else { 0 }
+                + if has_mm_ep { 1 } else { 0 };
             let srv_stack_frame_size: u64 = 3 * 8 + auxv_count * 2 * 8 + 8;
             // Process-entry ABI: argc at [RSP], with RSP % 16 == 8.
             let stack_rsp_bias: u64 = 8;
@@ -1627,6 +1632,12 @@ pub unsafe fn spawn_server(
             w!(super::AT_BESALT_SLOT_COUNT); w!(slot_pool_count);
             if has_expand_ep {
                 w!(super::AT_BESALT_EXPAND_EP); w!(super::CAP_EXPAND_EP);
+            }
+            // Emit pager EP slot so the CRT can discover it from auxv.
+            // Invariant: a pre-procmgr service using the C CRT must declare
+            // NeedEP=<pager>:<slot>[:badge] to receive this tag.
+            if has_mm_ep {
+                w!(super::AT_BESALT_MM_EP); w!(pager_child_slot);
             }
             if shared_lib_base != 0 {
                 w!(super::AT_BESALT_SHARED_LIB_BASE); w!(shared_lib_base);

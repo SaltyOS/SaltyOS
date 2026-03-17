@@ -1,6 +1,6 @@
 use besalt::types::Cap;
 
-pub(crate) const MAX_UT_SOURCES: usize = 12;
+pub(crate) const MAX_UT_SOURCES: usize = 32;
 
 #[derive(Clone, Copy)]
 pub(crate) struct UntypedSource {
@@ -20,6 +20,7 @@ impl UntypedSource {
 pub(crate) const REGION_HEAP: u8 = 0;
 pub(crate) const REGION_MMAP: u8 = 1;
 pub(crate) const REGION_SPAWN: u8 = 2;
+pub(crate) const REGION_SHARED_RO: u8 = 3;
 pub(crate) const REGION_INITIAL_CAP: usize = 8;
 pub(crate) const HEAP_INITIAL_FRAME_CAP: usize = 64;
 
@@ -32,10 +33,10 @@ pub(crate) struct MmRegion {
     pub(crate) active: bool,
     pub(crate) lazy: bool,
     pub(crate) frame_caps: *mut Cap,
-    pub(crate) frame_count: u16,
-    pub(crate) frame_cap_capacity: u16,
+    pub(crate) frame_count: u32,
+    pub(crate) frame_cap_capacity: u32,
     pub(crate) cow_bitmap: *mut u64,     // 1 bit per page; set = COW-inherited, no frame cap
-    pub(crate) cow_bitmap_words: u16,    // number of u64 words in bitmap
+    pub(crate) cow_bitmap_words: u32,    // number of u64 words in bitmap
     pub(crate) cow_inherited: bool,      // set during fork; immune to mprotect changes
 }
 
@@ -94,9 +95,9 @@ impl MmClient {
 pub(crate) struct ShmObject {
     pub(crate) id: u64,
     pub(crate) active: bool,
-    pub(crate) page_count: u16,
+    pub(crate) page_count: u32,
     pub(crate) frame_caps: *mut Cap,
-    pub(crate) frame_cap_capacity: u16,
+    pub(crate) frame_cap_capacity: u32,
 }
 
 impl ShmObject {
