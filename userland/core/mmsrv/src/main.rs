@@ -229,20 +229,18 @@ static mut COW_AGG_NTFN: Cap = 0;
 // CNode slot recycling
 // ---------------------------------------------------------------------------
 
-/// Free-slot stack capacity. 32K entries × 4 bytes = 128KB.
-/// Handles worst-case deregister of a client with ~24K frame caps.
-const FREE_SLOT_CAP: usize = 32768;
-static mut FREE_SLOTS: [u32; FREE_SLOT_CAP] = [0u32; FREE_SLOT_CAP];
+/// Free-slot stack: dynamically allocated based on system memory.
+static mut FREE_SLOTS_PTR: *mut u32 = core::ptr::null_mut();
+static mut FREE_SLOTS_CAP: usize = 0;
 static mut FREE_SLOT_COUNT: usize = 0;
 
 // ---------------------------------------------------------------------------
 // Frame cap recycling pool
 // ---------------------------------------------------------------------------
 
-/// Frame pool capacity. 32K entries x 8 bytes = 256KB.
-/// Handles worst-case recycling of ~24K frame caps from a large binary cycle.
-const FRAME_POOL_CAP: usize = 32768;
-static mut FRAME_POOL: [u64; FRAME_POOL_CAP] = [0u64; FRAME_POOL_CAP];
+/// Frame pool: dynamically allocated based on system memory.
+static mut FRAME_POOL_PTR: *mut u64 = core::ptr::null_mut();
+static mut FRAME_POOL_CAP: usize = 0;
 static mut FRAME_POOL_COUNT: usize = 0;
 
 /// Zeroing window: 8 pages for batch frame zeroing before pool push.
@@ -253,6 +251,64 @@ const ZERO_WINDOW_PAGES: usize = 8;
 /// Statistics: total frames recycled into pool and reused from pool.
 static mut FRAME_POOL_TOTAL_RECYCLED: u64 = 0;
 static mut FRAME_POOL_TOTAL_REUSED: u64 = 0;
+
+/// Initialize dynamically-sized FREE_SLOTS and FRAME_POOL arrays.
+/// Size is based on total_usable_bytes from the bootinfo page (mapped at
+/// 0x1FF000 by init). Formula: total_mb * 64, clamped to [4096, 131072].
+///
+/// # Safety
+///
+/// Must be called after self_mmap is functional (slot allocator initialized,
+/// untyped pool available).
+unsafe fn init_dynamic_pools() {
+    unsafe {
+        // SAFETY: bootinfo page is mapped at 0x1FF000 by init; offset 56
+        // contains total_usable_bytes (u64).
+        let bootinfo_ptr = 0x1FF000u64 as *const u8;
+        let total_usable = (bootinfo_ptr.add(56) as *const u64).read();
+        let total_mb = (total_usable / (1024 * 1024)) as usize;
+
+        let cap = if total_mb * 64 < 4096 {
+            4096
+        } else if total_mb * 64 > 131072 {
+            131072
+        } else {
+            total_mb * 64
+        };
+
+        // Allocate FREE_SLOTS array (cap * 4 bytes)
+        let slot_bytes = cap * core::mem::size_of::<u32>();
+        let slot_pages = (slot_bytes + 4095) / 4096;
+        let slot_ptr = self_mmap(slot_pages);
+        if !slot_ptr.is_null() {
+            *(&raw mut FREE_SLOTS_PTR) = slot_ptr as *mut u32;
+            *(&raw mut FREE_SLOTS_CAP) = cap;
+        } else {
+            puts(b"[MMSRV] WARN: FREE_SLOTS alloc failed, using fallback\n");
+        }
+
+        // Allocate FRAME_POOL array (cap * 8 bytes)
+        let pool_bytes = cap * core::mem::size_of::<u64>();
+        let pool_pages = (pool_bytes + 4095) / 4096;
+        let pool_ptr = self_mmap(pool_pages);
+        if !pool_ptr.is_null() {
+            *(&raw mut FRAME_POOL_PTR) = pool_ptr as *mut u64;
+            *(&raw mut FRAME_POOL_CAP) = cap;
+        } else {
+            puts(b"[MMSRV] WARN: FRAME_POOL alloc failed, using fallback\n");
+        }
+
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[MMSRV] dynamic pools: cap=");
+            lb.hex(cap as u64);
+            lb.str(b" (");
+            lb.hex(total_mb as u64);
+            lb.str(b" MB RAM)\n");
+            lb.flush();
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SHM object tracking (growable, pointer-based)
@@ -275,6 +331,117 @@ fn ipc_ctx() -> *mut IpcContext {
 
 fn signal_ready() {
     let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Lazy procmgr EP acquisition (for sub-untyped provisioning)
+// ---------------------------------------------------------------------------
+
+/// Cached procmgr endpoint cap (resolved lazily via nameserv lookup).
+static mut PROCMGR_EP: Cap = 0;
+
+/// Look up the procmgr endpoint via nameserv and cache it.
+/// Returns the cap slot, or 0 on failure.
+unsafe fn resolve_procmgr_ep() -> Cap {
+    unsafe {
+        let cached = *(&raw const PROCMGR_EP);
+        if cached != 0 {
+            return cached;
+        }
+
+        // Allocate a slot to receive the procmgr EP
+        let ep_slot = match recycled_slot_alloc() {
+            Some(s) => s,
+            None => return 0,
+        };
+
+        // Configure receive slot for the EP transfer from nameserv
+        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, ep_slot, 0);
+
+        // Build POSIX_NS_LOOKUP request for "procmgr"
+        let name = b"procmgr";
+        let mut msg = BesaltMsg::zeroed();
+        msg.label = POSIX_NS_LOOKUP;
+        msg.regs[0] = name.len() as u64;
+        msg.length = 1 + (name.len() as u64 + 7) / 8;
+        // SAFETY: regs array has 20 entries; we write 7 bytes at regs[1]
+        // (offset 8 bytes into &regs[1]). 7 < 8*19 so this is in bounds.
+        let dst = &raw mut msg.regs[1] as *mut u8;
+        for i in 0..name.len() {
+            core::ptr::write(dst.add(i), name[i]);
+        }
+
+        let mut reply = BesaltMsg::zeroed();
+        let err = ipc::call_ctx(
+            ipc_ctx(),
+            CAP_NAMESERV,
+            &raw const msg,
+            &raw mut reply,
+        );
+
+        if err != 0 || reply.label != BESALT_OK {
+            recycle_empty_slot(ep_slot);
+            puts(b"[MMSRV] procmgr lookup via nameserv failed\n");
+            return 0;
+        }
+
+        *(&raw mut PROCMGR_EP) = ep_slot;
+        puts(b"[MMSRV] Resolved procmgr EP via nameserv\n");
+        ep_slot
+    }
+}
+
+/// Request a sub-untyped from procmgr when all local UT sources are
+/// exhausted.  Returns the cap slot of the newly received sub-untyped,
+/// or 0 on failure.
+unsafe fn request_untyped_from_procmgr(size_bits: u64) -> Cap {
+    unsafe {
+        let procmgr_ep = resolve_procmgr_ep();
+        if procmgr_ep == 0 {
+            return 0;
+        }
+
+        // Allocate a receive slot for the incoming cap transfer
+        let recv_slot = match recycled_slot_alloc() {
+            Some(s) => s,
+            None => return 0,
+        };
+
+        // Configure receive slot for incoming cap transfer
+        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, recv_slot, 0);
+
+        // Build request message
+        let mut msg = BesaltMsg::zeroed();
+        msg.label = POSIX_PM_REQUEST_UNTYPED;
+        msg.length = 1;
+        msg.regs[0] = size_bits;
+
+        // Send request and wait for reply
+        let mut reply = BesaltMsg::zeroed();
+        let err = ipc::call_ctx(
+            ipc_ctx(),
+            procmgr_ep,
+            &raw const msg,
+            &raw mut reply,
+        );
+
+        if err != 0 || reply.label != BESALT_OK {
+            // Failed — recycle the slot
+            recycle_empty_slot(recv_slot);
+            return 0;
+        }
+
+        // The sub-untyped cap should now be at recv_slot
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[MMSRV] Received sub-untyped from procmgr at slot ");
+            lb.hex(recv_slot);
+            lb.str(b"\n");
+            lb.flush();
+        }
+
+        recv_slot
+    }
 }
 
 /// Retype an object from any available untyped source (round-robin scan).
@@ -344,6 +511,27 @@ unsafe fn retype_any(obj_type: u64, size_bits: u64, dest_slot: Cap) -> i32 {
             }
         }
 
+        // All local sources exhausted — request a sub-untyped from procmgr
+        let new_cap = request_untyped_from_procmgr(28); // Request 256 MB sub-untyped
+        if new_cap != 0 {
+            let count = *(&raw const UT_COUNT);
+            if count < MAX_UT_SOURCES {
+                let sources_ptr = &raw mut UT_SOURCES;
+                (*sources_ptr)[count] = UntypedSource {
+                    cap: new_cap,
+                    active: true,
+                };
+                *(&raw mut UT_COUNT) = count + 1;
+                *(&raw mut UT_HINT) = count;
+
+                // Retry with the new source
+                let err = invoke::untyped_retype(new_cap, obj_type, size_bits, dest_slot);
+                if err == 0 {
+                    return 0;
+                }
+            }
+        }
+
         BESALT_OUT_OF_MEMORY as i32
     }
 }
@@ -362,7 +550,7 @@ unsafe fn init_untyped_pool() {
         count += 1;
 
         // Mirrored parent untyped caps at slots 16+
-        for slot in CAP_UNTYPED_START..CAP_UNTYPED_START + 8 {
+        for slot in CAP_UNTYPED_START..CAP_UNTYPED_START + 16 {
             if count >= MAX_UT_SOURCES {
                 break;
             }
@@ -454,10 +642,14 @@ pub(crate) fn recycled_slot_alloc() -> Option<u64> {
     unsafe {
         let count = *(&raw const FREE_SLOT_COUNT);
         if count > 0 {
-            let idx = count - 1;
-            let slot = *(&raw const FREE_SLOTS as *const u32).add(idx);
-            *(&raw mut FREE_SLOT_COUNT) = idx;
-            return Some(slot as u64);
+            let ptr = *(&raw const FREE_SLOTS_PTR);
+            if !ptr.is_null() {
+                let idx = count - 1;
+                // SAFETY: idx < count <= FREE_SLOTS_CAP, ptr is valid.
+                let slot = *ptr.add(idx);
+                *(&raw mut FREE_SLOT_COUNT) = idx;
+                return Some(slot as u64);
+            }
         }
     }
     besalt::slot_alloc::slot_alloc()
@@ -474,11 +666,14 @@ pub(crate) fn recycled_cnode_delete(slot: u64) {
     // SAFETY: mmsrv is single-threaded; no concurrent access to FREE_SLOTS.
     unsafe {
         let count = *(&raw const FREE_SLOT_COUNT);
-        if count < FREE_SLOT_CAP {
-            *(&raw mut FREE_SLOTS as *mut u32).add(count) = slot as u32;
+        let cap = *(&raw const FREE_SLOTS_CAP);
+        let ptr = *(&raw const FREE_SLOTS_PTR);
+        if count < cap && !ptr.is_null() {
+            // SAFETY: count < cap, ptr is a valid allocation of cap entries.
+            *ptr.add(count) = slot as u32;
             *(&raw mut FREE_SLOT_COUNT) = count + 1;
         }
-        // If pool is full, slot is permanently leaked (bounded degradation)
+        // If pool is full or not initialized, slot is permanently leaked (bounded degradation)
     }
 }
 
@@ -487,8 +682,11 @@ pub(crate) fn recycled_cnode_delete(slot: u64) {
 fn recycle_empty_slot(slot: u64) {
     unsafe {
         let count = *(&raw const FREE_SLOT_COUNT);
-        if count < FREE_SLOT_CAP {
-            *(&raw mut FREE_SLOTS as *mut u32).add(count) = slot as u32;
+        let cap = *(&raw const FREE_SLOTS_CAP);
+        let ptr = *(&raw const FREE_SLOTS_PTR);
+        if count < cap && !ptr.is_null() {
+            // SAFETY: count < cap, ptr is a valid allocation of cap entries.
+            *ptr.add(count) = slot as u32;
             *(&raw mut FREE_SLOT_COUNT) = count + 1;
         }
     }
@@ -499,7 +697,9 @@ fn recycle_empty_slot(slot: u64) {
 pub(crate) fn frame_pool_push(frame_cap: Cap) {
     unsafe {
         let count = *(&raw const FRAME_POOL_COUNT);
-        if count >= FRAME_POOL_CAP {
+        let cap = *(&raw const FRAME_POOL_CAP);
+        let ptr = *(&raw const FRAME_POOL_PTR);
+        if count >= cap || ptr.is_null() {
             recycled_cnode_delete(frame_cap);
             return;
         }
@@ -514,7 +714,8 @@ pub(crate) fn frame_pool_push(frame_cap: Cap) {
         }
         core::ptr::write_bytes(va as *mut u8, 0, 4096);
         invoke::vspace_unmap(CAP_SELF_VSPACE, va);
-        *(&raw mut FRAME_POOL as *mut u64).add(count) = frame_cap;
+        // SAFETY: count < cap, ptr is a valid allocation of cap entries.
+        *ptr.add(count) = frame_cap;
         *(&raw mut FRAME_POOL_COUNT) = count + 1;
         *(&raw mut FRAME_POOL_TOTAL_RECYCLED) += 1;
     }
@@ -527,8 +728,13 @@ pub(crate) fn frame_pool_pop() -> Option<Cap> {
         if count == 0 {
             return None;
         }
+        let ptr = *(&raw const FRAME_POOL_PTR);
+        if ptr.is_null() {
+            return None;
+        }
         let idx = count - 1;
-        let cap = *(&raw const FRAME_POOL as *const u64).add(idx);
+        // SAFETY: idx < count <= FRAME_POOL_CAP, ptr is valid.
+        let cap = *ptr.add(idx);
         *(&raw mut FRAME_POOL_COUNT) = idx;
         *(&raw mut FRAME_POOL_TOTAL_REUSED) += 1;
         Some(cap)
@@ -582,8 +788,11 @@ pub(crate) unsafe fn frame_pool_push_batch(caps: *const Cap, count: usize) {
                 let va = ZERO_WINDOW_BASE + j as u64 * 4096;
                 invoke::vspace_unmap(CAP_SELF_VSPACE, va);
                 let pool_count = *(&raw const FRAME_POOL_COUNT);
-                if pool_count < FRAME_POOL_CAP {
-                    *(&raw mut FRAME_POOL as *mut u64).add(pool_count) = cap;
+                let pool_cap = *(&raw const FRAME_POOL_CAP);
+                let pool_ptr = *(&raw const FRAME_POOL_PTR);
+                if pool_count < pool_cap && !pool_ptr.is_null() {
+                    // SAFETY: pool_count < pool_cap, pool_ptr is valid.
+                    *pool_ptr.add(pool_count) = cap;
                     *(&raw mut FRAME_POOL_COUNT) = pool_count + 1;
                     *(&raw mut FRAME_POOL_TOTAL_RECYCLED) += 1;
                 } else {
@@ -709,6 +918,11 @@ pub extern "C" fn _start() -> ! {
     // Initialize untyped pool
     unsafe {
         init_untyped_pool();
+    }
+
+    // Initialize dynamically-sized free-slot and frame pools
+    unsafe {
+        init_dynamic_pools();
     }
 
     // Initialize growable client table
@@ -1010,7 +1224,7 @@ pub extern "C" fn _start() -> ! {
                                     break 'fault;
                                 }
                                 (*region).frame_caps = new_fcaps;
-                                (*region).frame_cap_capacity = new_cap as u16;
+                                (*region).frame_cap_capacity = new_cap as u32;
                             }
 
                             // Replace stale frame cap if parent had one
@@ -1028,7 +1242,7 @@ pub extern "C" fn _start() -> ! {
                             // High-water-mark update: after fork, sparse COW
                             // resolution at high page_idx must not leave
                             // frame_count below the resolved index.
-                            let needed = (page_idx + 1) as u16;
+                            let needed = (page_idx + 1) as u32;
                             if needed > (*region).frame_count {
                                 (*region).frame_count = needed;
                             }
@@ -1076,7 +1290,7 @@ pub extern "C" fn _start() -> ! {
                                 break 'fault;
                             }
                             (*region).frame_caps = new_fcaps;
-                            (*region).frame_cap_capacity = new_cap as u16;
+                            (*region).frame_cap_capacity = new_cap as u32;
                         }
                         if !(*region).frame_caps.is_null() && *(*region).frame_caps.add(page_idx) != 0 {
                             // Already mapped (race)
@@ -1111,7 +1325,7 @@ pub extern "C" fn _start() -> ! {
                             *(*region).frame_caps.add(page_idx) = slot;
                         }
                         // High-water-mark update
-                        let needed = (page_idx + 1) as u16;
+                        let needed = (page_idx + 1) as u32;
                         if needed > (*region).frame_count {
                             (*region).frame_count = needed;
                         }

@@ -75,6 +75,9 @@ core::arch::global_asm!(
     ".global usermode_trampoline",
     ".type usermode_trampoline, @function",
     "usermode_trampoline:",
+    // Enter usermode with IRQs suppressed until iretq installs user RFLAGS.
+    // This avoids taking an interrupt on a half-built ring-3 frame.
+    "cli",
     "mov cr3, r14",            // switch to user page tables
     "push 0x1B",               // SS
     "push r13",                // user RSP

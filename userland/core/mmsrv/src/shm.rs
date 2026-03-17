@@ -95,9 +95,9 @@ pub(crate) unsafe fn handle_mm_shm_create(msg: *const BesaltMsg, _caller_badge: 
         *free_slot = ShmObject {
             id: shm_id,
             active: true,
-            page_count: num_pages as u16,
+            page_count: num_pages as u32,
             frame_caps: fcaps,
-            frame_cap_capacity: num_pages as u16,
+            frame_cap_capacity: num_pages as u32,
         };
 
         {

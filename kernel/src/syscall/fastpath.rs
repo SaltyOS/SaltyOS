@@ -121,10 +121,13 @@ pub unsafe extern "C" fn fastpath_call_rust(
             }
         };
 
-        // Same-CPU check: receiver must not have cross-CPU affinity
-        let this_cpu = crate::arch::current_cpu() as u32;
+        // Same-CPU check: direct fastpath switch is only safe when the
+        // receiver last ran on THIS CPU and its deferred-switch slot is also
+        // local. Otherwise a different CPU can later flush a stale pending
+        // slot and re-enqueue the same TCB.
+        let this_cpu = crate::arch::current_cpu() as usize;
         let recv_affinity = (*receiver).cpu_affinity;
-        if recv_affinity != 0xFFFF_FFFF && recv_affinity != this_cpu {
+        if recv_affinity != 0xFFFF_FFFF && recv_affinity != this_cpu as u32 {
             endpoint.fastpath_push_recv(receiver);
             SCHED_IPC_LOCK.unlock();
             restore_irq(irq);
@@ -142,6 +145,16 @@ pub unsafe extern "C" fn fastpath_call_rust(
         let sched = crate::sched::scheduler::scheduler();
         let current = sched.current();
         if current.is_null() {
+            endpoint.fastpath_push_recv(receiver);
+            SCHED_IPC_LOCK.unlock();
+            restore_irq(irq);
+            return FastpathResult::slowpath();
+        }
+
+        sched.lock();
+        let receiver_pending_cpu = sched.pending_cpu_for(receiver);
+        sched.unlock();
+        if (*receiver).last_cpu != this_cpu as u32 || receiver_pending_cpu != Some(this_cpu) {
             endpoint.fastpath_push_recv(receiver);
             SCHED_IPC_LOCK.unlock();
             restore_irq(irq);
@@ -208,6 +221,7 @@ pub unsafe extern "C" fn fastpath_call_rust(
         sched.lock();
         sched.set_current(receiver);
         (*receiver).state = ThreadState::Running;
+        (*receiver).last_cpu = this_cpu as u32;
         sched.unlock();
 
         // Use the scheduler's shared switch machinery (with a fastpath-specific

@@ -1663,8 +1663,13 @@ fn syscall_tcb_configure(
         return SyscallResult::err(e);
     }
 
-    // alloc_frame has its own MM_LOCK — do BEFORE acquiring SCHED_IPC_LOCK
-    let kstack_phys = match crate::mm::alloc_frame() {
+    // Allocate kernel stack (4 contiguous pages = 16 KiB).
+    // A single page (4 KiB) overflows on deep syscall paths (IPC fastpath
+    // with context switching, VSpace operations, capability chains).
+    const KSTACK_PAGES: usize = 4;
+
+    // alloc_contiguous_frames has its own MM_LOCK — do BEFORE acquiring SCHED_IPC_LOCK
+    let kstack_phys = match crate::mm::alloc_contiguous_frames(KSTACK_PAGES) {
         Some(f) => f,
         None => return SyscallResult::err(SyscallError::OutOfMemory),
     };
@@ -1684,8 +1689,8 @@ fn syscall_tcb_configure(
         }
 
         let kstack_virt = crate::mm::phys_to_virt(kstack_phys);
-        let kstack_top = kstack_virt + crate::mm::PAGE_SIZE as u64;
-        core::ptr::write_bytes(kstack_virt as *mut u8, 0, crate::mm::PAGE_SIZE);
+        let kstack_top = kstack_virt + (KSTACK_PAGES * crate::mm::PAGE_SIZE) as u64;
+        core::ptr::write_bytes(kstack_virt as *mut u8, 0, KSTACK_PAGES * crate::mm::PAGE_SIZE);
         tcb.kernel_stack_top = kstack_top;
         tcb.stack_canary = crate::arch::generate_stack_canary();
 

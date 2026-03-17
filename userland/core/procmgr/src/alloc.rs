@@ -17,7 +17,7 @@ const SLOT_POOL_SIZE: usize = 3840;
 const BITMAP_WORDS: usize = 60;
 
 /// Maximum untyped sources we track
-const MAX_UT_SOURCES: usize = 12;
+const MAX_UT_SOURCES: usize = 18;
 /// Maximum objects tracked explicitly per reservation.
 /// Rollback also sweeps the full reserved slot range, so tracking is best-effort.
 const MAX_RESERVE_OBJECTS: usize = 128;

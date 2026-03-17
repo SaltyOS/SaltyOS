@@ -302,6 +302,37 @@ pub fn remap_frame_bitmap() {
     crate::serial_puts("[MM] Frame bitmap remapped to direct physical map\n");
 }
 
+/// Initialize per-frame tracking arrays (Phase 2).
+/// Must be called after paging::init() and remap_frame_bitmap().
+pub fn init_per_frame_arrays() {
+    let irq_flag = unsafe { save_irq_disable() };
+    FRAME_LOCK.lock();
+    // SAFETY: Called once during single-CPU boot, direct map available
+    unsafe {
+        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
+            allocator.init_per_frame_arrays();
+        }
+    }
+    FRAME_LOCK.unlock();
+    unsafe { restore_irq(irq_flag) };
+}
+
+/// Get the maximum physical address tracked by the frame allocator.
+pub fn max_phys() -> u64 {
+    // SAFETY: Reading from FRAME_ALLOCATOR; no lock needed for this read-only
+    // query during single-threaded boot, but we take the lock for correctness.
+    let irq_flag = unsafe { save_irq_disable() };
+    FRAME_LOCK.lock();
+    let result = unsafe {
+        match (*(&raw const FRAME_ALLOCATOR)).as_ref() {
+            Some(allocator) => allocator.max_phys(),
+            None => 0,
+        }
+    };
+    FRAME_LOCK.unlock();
+    unsafe { restore_irq(irq_flag) };
+    result
+}
 
 /// Get the number of free physical frames (SMP-safe)
 pub fn free_frame_count() -> usize {

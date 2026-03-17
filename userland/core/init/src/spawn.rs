@@ -30,7 +30,7 @@ use super::{CAP_SELF_VSPACE, CAP_SELF_CSPACE, CAP_INITRD_UNTYPED, CAP_UNTYPED_ST
 
 const INIT_UT_SCAN_END_FALLBACK: Cap = 200;
 const CHILD_UT_BITS_MIN: u8 = 12;
-const UT_MIRROR_COUNT: Cap = 8;
+const UT_MIRROR_COUNT: Cap = 16;
 const INITRD_COPY_RIGHTS: u64 = (1 << 0) | (1 << 2) | (1 << 3); // READ|EXECUTE|GRANT
 const READY_SIGNAL_BITS: u64 = 1;
 const READY_TIMEOUT_NS: u64 = 10_000_000_000; // 10s default
@@ -182,7 +182,7 @@ fn compute_spawn_memory_budget(is_dynamic: bool, requested_bits: u8, is_pager: b
     };
 
     let runtime_mirror_slots = if is_pager {
-        8
+        UT_MIRROR_COUNT
     } else {
         0
     };

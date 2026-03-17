@@ -405,7 +405,7 @@ pub(crate) unsafe fn drain_notifications(client: *mut MmClient, pool: *mut VSpac
                         );
                         if !new_fcaps.is_null() {
                             (*region).frame_caps = new_fcaps;
-                            (*region).frame_cap_capacity = new_cap as u16;
+                            (*region).frame_cap_capacity = new_cap as u32;
                         } else {
                             // Growth failed — stop draining. Cap stays in pool_slot_caps;
                             // tail is not advanced past this entry, so next drain retries.
@@ -424,7 +424,7 @@ pub(crate) unsafe fn drain_notifications(client: *mut MmClient, pool: *mut VSpac
                         *(*pool).pool_slot_caps.add(slot_idx) = 0;
 
                         // Update frame_count high water mark
-                        let needed = (page_idx + 1) as u16;
+                        let needed = (page_idx + 1) as u32;
                         if needed > (*region).frame_count {
                             (*region).frame_count = needed;
                         }

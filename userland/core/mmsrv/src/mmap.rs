@@ -20,7 +20,7 @@ unsafe fn register_tracked_region(
         if page_count == 0 || frame_caps.is_null() {
             return false;
         }
-        if page_count > u16::MAX as usize || frame_count > u16::MAX as usize {
+        if page_count > u32::MAX as usize || frame_count > u32::MAX as usize {
             return false;
         }
 
@@ -36,8 +36,8 @@ unsafe fn register_tracked_region(
         (*region).active = true;
         (*region).lazy = false;
         (*region).frame_caps = frame_caps;
-        (*region).frame_count = frame_count as u16;
-        (*region).frame_cap_capacity = page_count as u16;
+        (*region).frame_count = frame_count as u32;
+        (*region).frame_cap_capacity = page_count as u32;
         true
     }
 }
@@ -96,7 +96,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mu
             (*heap_region).active = true;
             (*heap_region).frame_caps = fcaps;
             (*heap_region).frame_count = 0;
-            (*heap_region).frame_cap_capacity = HEAP_INITIAL_FRAME_CAP as u16;
+            (*heap_region).frame_cap_capacity = HEAP_INITIAL_FRAME_CAP as u32;
         }
 
         if new_page > old_page {
@@ -119,7 +119,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mu
                     return;
                 }
                 (*heap_region).frame_caps = new_ptr;
-                (*heap_region).frame_cap_capacity = new_fcap as u16;
+                (*heap_region).frame_cap_capacity = new_fcap as u32;
             }
 
             // Grow: allocate and map new pages
@@ -134,7 +134,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mu
                             invoke::vspace_unmap(vspace_cap, rva);
                             rva += 4096;
                         }
-                        (*heap_region).frame_count = ((old_page - (*heap_region).base) / 4096) as u16;
+                        (*heap_region).frame_count = ((old_page - (*heap_region).base) / 4096) as u32;
                         (*reply).label = BESALT_OUT_OF_MEMORY;
                         return;
                     }
@@ -153,7 +153,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mu
                         invoke::vspace_unmap(vspace_cap, rva);
                         rva += 4096;
                     }
-                    (*heap_region).frame_count = ((old_page - (*heap_region).base) / 4096) as u16;
+                    (*heap_region).frame_count = ((old_page - (*heap_region).base) / 4096) as u32;
                     (*reply).label = BESALT_BAD_ADDRESS;
                     return;
                 }
@@ -161,7 +161,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mu
                 page_idx += 1;
                 va += 4096;
             }
-            (*heap_region).frame_count = page_idx as u16;
+            (*heap_region).frame_count = page_idx as u32;
             (*heap_region).length = new_page - (*heap_region).base;
         } else if new_page < old_page {
             // Shrink: unmap freed pages and clean up frame caps
@@ -180,7 +180,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mu
                 va += 4096;
                 idx += 1;
             }
-            (*heap_region).frame_count = new_count as u16;
+            (*heap_region).frame_count = new_count as u32;
             (*heap_region).length = new_page - (*heap_region).base;
         }
 
@@ -299,7 +299,7 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const BesaltMsg, badge: u64, reply: *m
         (*region).active = true;
         (*region).frame_caps = fcaps;
         (*region).frame_count = 0;
-        (*region).frame_cap_capacity = num_pages as u16;
+        (*region).frame_cap_capacity = num_pages as u32;
 
         // Check for MAP_LAZY flag
         let is_lazy = (_flags & MAP_LAZY) != 0;
@@ -356,7 +356,7 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const BesaltMsg, badge: u64, reply: *m
             }
 
             *fcaps.add(i) = frame_slot;
-            (*region).frame_count = (i + 1) as u16;
+            (*region).frame_count = (i + 1) as u32;
         }
 
         (*client).mmap_next = base + len;
@@ -724,7 +724,7 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const BesaltMsg, _caller_badge
                         continue;
                     }
                     let page_count = ((*pr).length / 4096) as usize;
-                    let need_words = ((page_count + 63) / 64) as u16;
+                    let need_words = ((page_count + 63) / 64) as u32;
                     if (*pr).cow_bitmap.is_null() || (*pr).cow_bitmap_words < need_words {
                         let (pbm_ptr, pbm_words) = alloc_cow_bitmap(page_count);
                         if pbm_ptr.is_null() {
@@ -748,7 +748,7 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const BesaltMsg, _caller_badge
                         for pi in 0..page_count {
                             let word_idx = pi / 64;
                             let bit_idx = pi % 64;
-                            if (word_idx as u16) < (*pr).cow_bitmap_words {
+                            if (word_idx as u32) < (*pr).cow_bitmap_words {
                                 // SAFETY: word_idx is bounds-checked above.
                                 *(*pr).cow_bitmap.add(word_idx) |= 1u64 << bit_idx;
                             }

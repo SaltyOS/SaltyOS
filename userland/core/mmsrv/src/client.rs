@@ -171,7 +171,7 @@ pub(crate) fn clear_cow_bit(region: *mut MmRegion, page_idx: usize) {
 #[derive(Clone, Copy)]
 struct BitmapFreeEntry {
     ptr: *mut u64,
-    alloc_pages: u16,
+    alloc_pages: u32,
 }
 
 const BITMAP_POOL_MAX: usize = 32;
@@ -188,7 +188,7 @@ static mut BITMAP_POOL_COUNT: usize = 0;
 ///
 /// Checks the free-list pool first for a suitably-sized entry;
 /// falls through to self_mmap if none available.
-pub(crate) fn alloc_cow_bitmap(page_count: usize) -> (*mut u64, u16) {
+pub(crate) fn alloc_cow_bitmap(page_count: usize) -> (*mut u64, u32) {
     let word_count = (page_count + 63) / 64;
     let byte_count = word_count * 8;
     let alloc_pages = (byte_count + 4095) / 4096;
@@ -199,7 +199,7 @@ pub(crate) fn alloc_cow_bitmap(page_count: usize) -> (*mut u64, u16) {
         let count = *(&raw const BITMAP_POOL_COUNT);
         let pool = &raw mut BITMAP_POOL;
         for i in 0..count {
-            if (*pool)[i].alloc_pages >= alloc_pages as u16 {
+            if (*pool)[i].alloc_pages >= alloc_pages as u32 {
                 let entry = (*pool)[i];
                 // Swap-remove: move last entry into this slot
                 let last = count - 1;
@@ -210,7 +210,7 @@ pub(crate) fn alloc_cow_bitmap(page_count: usize) -> (*mut u64, u16) {
                 // Zero the reused memory
                 // SAFETY: entry.ptr is a valid allocation of entry.alloc_pages pages.
                 core::ptr::write_bytes(entry.ptr as *mut u8, 0, (entry.alloc_pages as usize) * 4096);
-                return (entry.ptr, word_count as u16);
+                return (entry.ptr, word_count as u32);
             }
         }
     }
@@ -221,7 +221,7 @@ pub(crate) fn alloc_cow_bitmap(page_count: usize) -> (*mut u64, u16) {
     if ptr.is_null() {
         return (core::ptr::null_mut(), 0);
     }
-    (ptr as *mut u64, word_count as u16)
+    (ptr as *mut u64, word_count as u32)
 }
 
 /// Free a COW bitmap from a region, returning the pages to the free-list pool.
@@ -249,7 +249,7 @@ pub(crate) fn free_cow_bitmap(region: *mut MmRegion) {
         if count < BITMAP_POOL_MAX {
             (*(&raw mut BITMAP_POOL))[count] = BitmapFreeEntry {
                 ptr,
-                alloc_pages: alloc_pages as u16,
+                alloc_pages: alloc_pages as u32,
             };
             *(&raw mut BITMAP_POOL_COUNT) = count + 1;
         }

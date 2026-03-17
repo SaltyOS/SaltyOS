@@ -71,6 +71,7 @@ const PM_LIST_PIDS: u64 = 27;
 const PM_GET_PROC_INFO: u64 = 28;
 const PM_RESUME: u64 = 29;
 const PM_UMASK: u64 = 30;
+const PM_REQUEST_UNTYPED: u64 = 31;
 const BESALT_PENDING: u64 = 0x80;
 
 const PM_SIGKILL: usize = 9;
@@ -127,6 +128,7 @@ const WUNTRACED: u32 = 2;
 
 // ---- Shorthand re-exports ----
 const OBJ_TCB: u64 = besalt::OBJ_TCB;
+const OBJ_UNTYPED: u64 = besalt::OBJ_UNTYPED;
 const OBJ_VSPACE: u64 = besalt::OBJ_VSPACE;
 const OBJ_CNODE: u64 = besalt::OBJ_CNODE;
 const OBJ_SCHED_CONTEXT: u64 = besalt::OBJ_SCHED_CONTEXT;
@@ -142,7 +144,7 @@ const VSPACE_FLAG_WRITABLE: u64 = besalt::VSPACE_FLAG_WRITABLE;
 const VSPACE_FLAG_USER: u64 = besalt::VSPACE_FLAG_USER;
 const CAP_RIGHTS_ALL: u64 = besalt::CAP_RIGHTS_ALL;
 const INITRD_COPY_RIGHTS: u64 = (1 << 0) | (1 << 2) | (1 << 3);
-const UT_MIRROR_COUNT: Cap = 8;
+const UT_MIRROR_COUNT: Cap = 16;
 const INITRD_VADDR: u64 = besalt::INITRD_VADDR;
 const BOOTINFO_VADDR: u64 = besalt::BOOTINFO_VADDR;
 const BOOTINFO_MAGIC: u64 = besalt::BOOTINFO_MAGIC;
@@ -399,6 +401,74 @@ unsafe fn handle_umask(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: u64) {
 }
 
 // ===========================================================================
+// handle_request_untyped
+// ===========================================================================
+
+/// PM_REQUEST_UNTYPED: mmsrv requests a sub-untyped when its sources are
+/// exhausted.
+///   msg.regs[0] = desired sub-untyped size_bits (e.g. 28 = 256 MB)
+/// Reply sends the sub-untyped cap via extra_caps (1 cap transferred).
+unsafe fn handle_request_untyped(
+    msg: &BesaltMsg,
+    reply: &mut BesaltMsg,
+    allocator: &mut alloc::Allocator,
+) {
+    unsafe {
+        let requested_bits = msg.regs[0];
+        // Clamp size_bits: minimum 20 (1 MB), maximum 30 (1 GB)
+        let size_bits = if requested_bits < 20 {
+            20
+        } else if requested_bits > 30 {
+            30
+        } else {
+            requested_bits
+        };
+
+        // Allocate a temporary slot for the sub-untyped
+        let temp_slot = match allocator.alloc_single_slot() {
+            Some(s) => s,
+            None => {
+                reply.label = BESALT_OUT_OF_MEMORY;
+                return;
+            }
+        };
+
+        // Try the requested size first, then fall back to smaller sizes
+        let mut actual_bits = size_bits;
+        let mut success = false;
+        while actual_bits >= 20 {
+            let err = allocator.retype_any(OBJ_UNTYPED, actual_bits, temp_slot);
+            if err == 0 {
+                success = true;
+                break;
+            }
+            actual_bits -= 1;
+        }
+
+        if !success {
+            allocator.free_single_slot(temp_slot);
+            reply.label = BESALT_OUT_OF_MEMORY;
+            return;
+        }
+
+        // Stage the sub-untyped cap for transfer via IPC extra_caps
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, temp_slot);
+
+        reply.label = BESALT_OK;
+        reply.length = 1;
+        reply.regs[0] = actual_bits;
+
+        {
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] Provisioned sub-untyped 2^");
+            lb.hex(actual_bits);
+            lb.str(b" to mmsrv\n");
+            lb.flush();
+        }
+    }
+}
+
+// ===========================================================================
 // Entry point
 // ===========================================================================
 
@@ -595,6 +665,7 @@ pub extern "C" fn _start() -> ! {
                     PM_LIST_PIDS => handle_list_pids(&mut reply),
                     PM_GET_PROC_INFO => handle_get_proc_info(&msg, &mut reply),
                     PM_UMASK => handle_umask(&msg, &mut reply, badge),
+                    PM_REQUEST_UNTYPED => handle_request_untyped(&msg, &mut reply, &mut *(&raw mut ALLOCATOR)),
                     _ => {
                         let mut lb = LineBuf::new();
                         lb.str(b"[PROCMGR] unknown label=");

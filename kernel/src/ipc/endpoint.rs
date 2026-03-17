@@ -329,6 +329,15 @@ impl Endpoint {
     pub fn recv(&mut self) -> (Message, u64) {
         unsafe {
             let current = get_scheduler().current();
+
+            // Clear stale reply capability — if the server is calling recv()
+            // instead of reply_recv(), any previous reply_tcb is abandoned.
+            if !(*current).reply_tcb.is_null() {
+                crate::sched::pip::pip_undonate(current, (*current).reply_tcb);
+                (*current).reply_tcb = core::ptr::null_mut();
+                (*current).reply_can_grant = false;
+            }
+
             Self::cache_receive_slot(current);
 
             match self.state {
@@ -885,6 +894,14 @@ impl Endpoint {
     pub fn recv_timeout(&mut self, timeout_ns: u64) -> (Message, u64, u64) {
         unsafe {
             let current = get_scheduler().current();
+
+            // Clear stale reply capability (same rationale as recv()).
+            if !(*current).reply_tcb.is_null() {
+                crate::sched::pip::pip_undonate(current, (*current).reply_tcb);
+                (*current).reply_tcb = core::ptr::null_mut();
+                (*current).reply_can_grant = false;
+            }
+
             Endpoint::cache_receive_slot(current);
 
             match self.state {

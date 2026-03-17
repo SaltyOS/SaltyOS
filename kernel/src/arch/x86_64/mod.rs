@@ -119,6 +119,10 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // the identity map (PML4[0]) is removed.
     crate::mm::remap_frame_bitmap();
 
+    // Phase 2: allocate per-frame tracking arrays now that the direct map
+    // covers all physical memory. These arrays can live anywhere in RAM.
+    crate::mm::init_per_frame_arrays();
+
     // Initialize PIT (for calibration and fallback)
     pit::init();
 

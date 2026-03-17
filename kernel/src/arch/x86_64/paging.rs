@@ -4,9 +4,8 @@
 
 use crate::mm::{alloc_frame, PAGE_SIZE, PHYS_MAP_OFFSET};
 
-/// Direct physical mapping size (4GB for now)
-/// Covers APIC at 0xFEE00000 and other MMIO regions
-const DIRECT_MAP_SIZE: usize = 4 * 1024 * 1024 * 1024;
+/// Maximum direct physical mapping size (512 GB cap)
+const MAX_DIRECT_MAP_SIZE: usize = 512 * 1024 * 1024 * 1024;
 
 /// Page table entry flags
 #[repr(u64)]
@@ -75,8 +74,9 @@ pub fn invlpg(addr: u64) {
 
 /// Initialize direct physical mapping
 ///
-/// Maps physical memory [0..DIRECT_MAP_SIZE] to virtual address space
-/// starting at PHYS_MAP_OFFSET using 2MB huge pages.
+/// Maps physical memory [0..direct_map_size] to virtual address space
+/// starting at PHYS_MAP_OFFSET using 2MB huge pages. The size is derived
+/// from `max_phys`, rounded up to 2MB and capped at 512 GB.
 ///
 /// # Safety
 /// Must be called after frame allocator is initialized.
@@ -86,7 +86,26 @@ pub fn invlpg(addr: u64) {
 /// Uses identity mapping (physical = virtual) for page table access during
 /// initialization, as PHYS_MAP_OFFSET doesn't exist yet. The bootloader
 /// provides identity mapping for low memory regions.
-unsafe fn init_direct_map() {
+unsafe fn init_direct_map(max_phys: u64) {
+    // Round max_phys up to 2MB boundary, cap at MAX_DIRECT_MAP_SIZE
+    let huge_page_size: usize = 2 * 1024 * 1024;
+    let direct_map_size = core::cmp::min(
+        ((max_phys as usize + (huge_page_size - 1)) / huge_page_size) * huge_page_size,
+        MAX_DIRECT_MAP_SIZE,
+    );
+    if direct_map_size == 0 {
+        return;
+    }
+
+    {
+        let s = crate::SerialGuard::acquire();
+        s.puts("[PAGING] Direct map size: ");
+        s.hex(direct_map_size as u64);
+        s.puts(" (max_phys=");
+        s.hex(max_phys);
+        s.puts(")\n");
+    }
+
     let cr0_orig: u64;
     unsafe {
         core::arch::asm!("mov {}, cr0", out(reg) cr0_orig, options(nomem, nostack));
@@ -129,9 +148,7 @@ unsafe fn init_direct_map() {
     let pdpt_virt = pdpt_phys as *mut PageTable;
     let pdpt = unsafe { &mut *pdpt_virt };
 
-    // 2MB huge page size
-    let huge_page_size = 2 * 1024 * 1024;
-    let num_huge_pages = DIRECT_MAP_SIZE / huge_page_size;
+    let num_huge_pages = direct_map_size / huge_page_size;
     let entries_per_pd = 512;
     let num_pds = (num_huge_pages + entries_per_pd - 1) / entries_per_pd;
 
@@ -166,8 +183,8 @@ unsafe fn init_direct_map() {
         for pd_entry_idx in 0..entries_per_pd {
             let phys_addr = ((pd_idx * entries_per_pd + pd_entry_idx) * huge_page_size) as u64;
 
-            // Don't map beyond DIRECT_MAP_SIZE
-            if phys_addr >= DIRECT_MAP_SIZE as u64 {
+            // Don't map beyond direct_map_size
+            if phys_addr >= direct_map_size as u64 {
                 break;
             }
 
@@ -233,10 +250,11 @@ pub fn init() {
         init_pat();
     }
 
-    // Set up direct physical mapping
+    // Set up direct physical mapping sized to actual RAM
+    let max_phys = crate::mm::max_phys();
     // SAFETY: Single-threaded boot context, frame allocator initialized
     unsafe {
-        init_direct_map();
+        init_direct_map(max_phys);
     }
 
     // Initialize kernel VSpace tracking (needed before any VSpace::new() calls)
