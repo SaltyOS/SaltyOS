@@ -1039,7 +1039,7 @@ impl Endpoint {
     ///
     /// Wake all blocked threads with error.
     /// Called from destroy_object() with CAP_LOCK held and IRQs disabled.
-    /// Acquires SCHED_IPC_LOCK to safely manipulate IPC queues and TCB state.
+    /// Acquires per-object lock to safely manipulate IPC queues and TCB state.
     pub fn cleanup(&mut self) {
         // Lock ordering: CAP_LOCK (held by caller) → endpoint.lock — correct.
         // IRQs are already disabled from the CAP_LOCK acquisition path.

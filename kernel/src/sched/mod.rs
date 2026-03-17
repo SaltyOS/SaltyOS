@@ -32,9 +32,6 @@ const IDLE_STACK_SIZE: usize = PAGE_SIZE;
 /// that have reached quiescent state.
 extern "C" fn idle_thread() -> ! {
     loop {
-        // sched_ipc_lock does cli + acquire SCHED_IPC_LOCK
-        crate::sched_ipc_lock();
-
         // CRITICAL: Periodically process pending deactivates
         // with_lock acquires scheduler lock internally and calls kernel_exit_epilogue
         scheduler().with_lock(|_| {});
@@ -44,9 +41,6 @@ extern "C" fn idle_thread() -> ! {
             crate::mm::process_deferred_free();
         }
 
-        crate::sched_ipc_unlock();
-
-        // IF was cleared by sched_ipc_lock's cli; re-enable before halt
         arch::sti();
         arch::halt();
     }

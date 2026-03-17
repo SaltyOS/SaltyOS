@@ -1446,7 +1446,7 @@ impl Scheduler {
 
     /// Block current thread on VSpace teardown (MAY switch, manages IRQ state internally)
     ///
-    /// Uses only per-CPU scheduler lock — no SCHED_IPC_LOCK needed.
+    /// Uses only per-CPU scheduler lock — no per-object lock needed.
     pub fn block_current_on_vspace(&mut self, tracking: &crate::mm::VSpaceTracking) {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
         self.lock();

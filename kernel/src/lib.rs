@@ -26,28 +26,13 @@ pub use bootinfo::{FramebufferInfo, MemoryKind, MemoryMapEntry, ParsedBootInfo};
 
 use core::panic::PanicInfo;
 
-/// Acquire SCHED_IPC_LOCK. Does `cli` first to prevent same-CPU deadlock.
-/// Called from assembly (timer/reschedule/exception stubs).
-#[unsafe(no_mangle)]
-pub extern "C" fn sched_ipc_lock() {
-    unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
-    mm::SCHED_IPC_LOCK.lock();
-}
-
-/// Release SCHED_IPC_LOCK. Does NOT re-enable interrupts.
-/// Called from assembly (timer/reschedule/exception stubs).
-#[unsafe(no_mangle)]
-pub extern "C" fn sched_ipc_unlock() {
-    mm::SCHED_IPC_LOCK.unlock();
-}
-
 /// Serial port (COM1) for debug output
 const SERIAL_PORT: u16 = 0x3F8;
 
 /// Leaf-level spinlock protecting all COM1 serial output.
 ///
 /// Lock ordering (outermost → innermost):
-///   CAP_LOCK → SCHED_IPC_LOCK → scheduler.lock_state → VSpace.lock → MM_LOCK → SERIAL_LOCK
+///   CAP_LOCK → endpoint.lock / ntfn.lock / tcb.lock / sc.lock → sched.lock_cpu → VSpace.lock → FRAME_LOCK → SERIAL_LOCK
 pub(crate) static SERIAL_LOCK: mm::SpinLock = mm::SpinLock::new();
 
 // ---------------------------------------------------------------------------

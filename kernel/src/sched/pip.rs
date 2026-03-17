@@ -7,7 +7,7 @@
 //! reply capability), so donation is always 0 or 1. Transitive chains are
 //! bounded to MAX_PIP_DEPTH to prevent unbounded traversal.
 //!
-//! All PIP operations MUST be called with SCHED_IPC_LOCK held.
+//! All PIP operations MUST be called with per-object lock (endpoint or TCB) held.
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
@@ -24,7 +24,7 @@ pub const MAX_PIP_DEPTH: u8 = 8;
 ///
 /// # Safety
 /// - Both pointers must be valid TCBs.
-/// - SCHED_IPC_LOCK must be held by the caller.
+/// - per-object lock (endpoint or TCB) must be held by the caller.
 pub unsafe fn pip_donate(donor: *mut Tcb, holder: *mut Tcb) {
     unsafe {
         if donor.is_null() || holder.is_null() {
@@ -76,7 +76,7 @@ pub unsafe fn pip_donate(donor: *mut Tcb, holder: *mut Tcb) {
 ///
 /// # Safety
 /// - Both pointers must be valid TCBs.
-/// - SCHED_IPC_LOCK must be held by the caller.
+/// - per-object lock (endpoint or TCB) must be held by the caller.
 pub unsafe fn pip_undonate(holder: *mut Tcb, caller: *mut Tcb) {
     unsafe {
         if holder.is_null() || caller.is_null() {
@@ -111,7 +111,7 @@ pub unsafe fn pip_undonate(holder: *mut Tcb, caller: *mut Tcb) {
 ///
 /// # Safety
 /// - `tcb` must be a valid TCB pointer.
-/// - SCHED_IPC_LOCK should be held or thread must be inactive.
+/// - per-object lock (endpoint or TCB) should be held or thread must be inactive.
 pub unsafe fn pip_cleanup(tcb: *mut Tcb) {
     unsafe {
         if tcb.is_null() {

@@ -4,12 +4,16 @@
 //! Used by pthread mutex, condvar, and other synchronization primitives.
 //!
 //! The futex hash table maps (VSpace*, vaddr) pairs to intrusive TCB wait
-//! queues. Protected by SCHED_IPC_LOCK (no separate lock needed since all
-//! futex operations also interact with the scheduler).
+//! queues. Protected by FUTEX_LOCK (dedicated lock for futex hash table,
+//! separate from the global lock to reduce contention).
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use crate::mm::{save_irq_disable, restore_irq, VSpace, SCHED_IPC_LOCK};
+use crate::mm::{save_irq_disable, restore_irq, SpinLock, VSpace};
+
+/// Dedicated lock protecting the futex hash table.
+/// Dedicated lock for the futex hash table (per-subsystem locking).
+static FUTEX_LOCK: SpinLock = SpinLock::new();
 use crate::sched::scheduler::scheduler;
 use crate::sched::thread::{BlockedReason, Tcb, ThreadState};
 use crate::syscall::{SyscallError, SyscallResult};
@@ -20,7 +24,7 @@ const FUTEX_HASH_BUCKETS: usize = 64;
 /// Futex hash table: each bucket is the head of an intrusive singly-linked
 /// list of TCBs blocked on futex_wait. Keyed by (VSpace*, vaddr).
 ///
-/// Protected by SCHED_IPC_LOCK — all callers must hold it.
+/// Protected by FUTEX_LOCK — all callers must hold it.
 static mut FUTEX_TABLE: [*mut Tcb; FUTEX_HASH_BUCKETS] = [core::ptr::null_mut(); FUTEX_HASH_BUCKETS];
 
 /// Hash function for (vspace, vaddr) → bucket index.
@@ -36,7 +40,7 @@ fn futex_hash(vspace: *mut VSpace, vaddr: u64) -> usize {
 /// Remove a specific TCB from the futex wait table.
 ///
 /// Called from TCB_SUSPEND and TCB_RESUME (Blocked path).
-/// Caller must hold SCHED_IPC_LOCK.
+/// Caller must hold FUTEX_LOCK.
 pub unsafe fn futex_remove_thread(tcb: *mut Tcb) {
     unsafe {
         if (*tcb).futex_addr == 0 {
@@ -100,11 +104,11 @@ pub fn syscall_futex(addr: u64, op: u64, val: u64, extra: u64) -> SyscallResult 
 fn futex_wait(addr: u64, expected: u32) -> SyscallResult {
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
+        FUTEX_LOCK.lock();
 
         let current = scheduler().current();
         if current.is_null() || (*current).vspace_root.is_null() {
-            SCHED_IPC_LOCK.unlock();
+            FUTEX_LOCK.unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::InvalidArgument);
         }
@@ -117,7 +121,7 @@ fn futex_wait(addr: u64, expected: u32) -> SyscallResult {
             core::ptr::read_volatile(addr as *const u32)
         };
         if user_word != expected {
-            SCHED_IPC_LOCK.unlock();
+            FUTEX_LOCK.unlock();
             restore_irq(irq);
             // EAGAIN equivalent — value changed before we could block
             return SyscallResult::err(SyscallError::WouldBlock);
@@ -144,8 +148,8 @@ fn futex_wait(addr: u64, expected: u32) -> SyscallResult {
             (*tail).futex_next = current;
         }
 
-        // Release SCHED_IPC_LOCK before reschedule (no lock held during switch)
-        SCHED_IPC_LOCK.unlock();
+        // Release FUTEX_LOCK before reschedule (no lock held during switch)
+        FUTEX_LOCK.unlock();
         scheduler().reschedule();
 
         // After wakeup: no lock held
@@ -166,11 +170,11 @@ fn futex_wait(addr: u64, expected: u32) -> SyscallResult {
 fn futex_wait_timeout(addr: u64, expected: u32, timeout_ns: u64) -> SyscallResult {
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
+        FUTEX_LOCK.lock();
 
         let current = scheduler().current();
         if current.is_null() || (*current).vspace_root.is_null() {
-            SCHED_IPC_LOCK.unlock();
+            FUTEX_LOCK.unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::InvalidArgument);
         }
@@ -182,7 +186,7 @@ fn futex_wait_timeout(addr: u64, expected: u32, timeout_ns: u64) -> SyscallResul
             core::ptr::read_volatile(addr as *const u32)
         };
         if user_word != expected {
-            SCHED_IPC_LOCK.unlock();
+            FUTEX_LOCK.unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::WouldBlock);
         }
@@ -193,7 +197,7 @@ fn futex_wait_timeout(addr: u64, expected: u32, timeout_ns: u64) -> SyscallResul
 
         // Check for already-expired timeout
         if timeout_ns == 0 {
-            SCHED_IPC_LOCK.unlock();
+            FUTEX_LOCK.unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::Cancelled);
         }
@@ -220,8 +224,8 @@ fn futex_wait_timeout(addr: u64, expected: u32, timeout_ns: u64) -> SyscallResul
             (*tail).futex_next = current;
         }
 
-        // Release SCHED_IPC_LOCK before context switch (no lock during switch)
-        SCHED_IPC_LOCK.unlock();
+        // Release FUTEX_LOCK before context switch (no lock during switch)
+        FUTEX_LOCK.unlock();
 
         // Insert into sleep queue and context-switch (acquires scheduler lock internally)
         scheduler().block_current_futex_timed(wakeup_ns);
@@ -244,11 +248,11 @@ fn futex_wait_timeout(addr: u64, expected: u32, timeout_ns: u64) -> SyscallResul
 fn futex_wake(addr: u64, count: u32) -> SyscallResult {
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
+        FUTEX_LOCK.lock();
 
         let current = scheduler().current();
         if current.is_null() || (*current).vspace_root.is_null() {
-            SCHED_IPC_LOCK.unlock();
+            FUTEX_LOCK.unlock();
             restore_irq(irq);
             return SyscallResult::ok(0);
         }
@@ -305,7 +309,7 @@ fn futex_wake(addr: u64, count: u32) -> SyscallResult {
             }
         }
 
-        SCHED_IPC_LOCK.unlock();
+        FUTEX_LOCK.unlock();
         restore_irq(irq);
 
         SyscallResult::ok(woken as u64)

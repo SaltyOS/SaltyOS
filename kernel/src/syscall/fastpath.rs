@@ -76,7 +76,7 @@ pub unsafe extern "C" fn fastpath_call_rust(
     }
 
     // Locked cap lookup: copy to stack under CAP_LOCK to prevent torn reads.
-    // CAP_LOCK is released BEFORE SCHED_IPC_LOCK is acquired (no ordering change).
+    // CAP_LOCK is released BEFORE per-object lock is acquired (no ordering change).
     let irq_cap = unsafe { save_irq_disable() };
     CAP_LOCK.lock();
     let cap_result = lookup_capability(cap_ptr).map(|c| *c);
@@ -99,7 +99,7 @@ pub unsafe extern "C" fn fastpath_call_rust(
 
     unsafe {
         // Per-endpoint lock for IPC queue operations (Zircon-style).
-        // No SCHED_IPC_LOCK needed — context switch uses no global lock.
+        // No per-object lock needed — context switch uses no global lock.
         let irq = save_irq_disable();
         let endpoint = &mut *endpoint_ptr;
         endpoint.ep_lock();

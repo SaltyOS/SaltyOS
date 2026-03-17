@@ -91,6 +91,8 @@ pub enum BlockedReason {
 pub struct Tcb {
     /// Kernel object header (must be first for refcount access)
     pub header: KernelObject,
+    /// Per-TCB spin lock state (0 = unlocked, 1 = locked)
+    pub tcb_lock_state: core::sync::atomic::AtomicU8,
     /// Thread state
     pub state: ThreadState,
     /// Priority (for EDF: effective deadline, may be boosted by PIP)
@@ -248,6 +250,8 @@ impl ThreadContext {
 pub struct SchedContext {
     /// Kernel object header (must be first for refcount access)
     pub header: KernelObject,
+    /// Per-SC spin lock state (0 = unlocked, 1 = locked)
+    pub sc_lock_state: core::sync::atomic::AtomicU8,
     /// Budget per period (time units)
     pub budget: u64,
     /// Remaining budget
@@ -263,9 +267,31 @@ pub struct SchedContext {
 }
 
 impl Tcb {
+    #[inline]
+    pub fn tcb_lock(&self) {
+        use core::sync::atomic::Ordering;
+        if self.tcb_lock_state.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            return;
+        }
+        let mut backoff: u32 = 0;
+        loop {
+            for _ in 0..(1u32 << backoff.min(6)) { core::hint::spin_loop(); }
+            if self.tcb_lock_state.load(Ordering::Relaxed) == 0
+                && self.tcb_lock_state.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
+            { return; }
+            if backoff < 6 { backoff += 1; }
+        }
+    }
+
+    #[inline]
+    pub fn tcb_unlock(&self) {
+        self.tcb_lock_state.store(0, core::sync::atomic::Ordering::Release);
+    }
+
     pub const fn new() -> Self {
         Self {
             header: KernelObject::new(ObjectType::Tcb, 0),
+            tcb_lock_state: core::sync::atomic::AtomicU8::new(0),
             state: ThreadState::Inactive,
             priority: 0,
             base_priority: 0,
@@ -396,9 +422,31 @@ impl Tcb {
 }
 
 impl SchedContext {
+    #[inline]
+    pub fn sc_lock(&self) {
+        use core::sync::atomic::Ordering;
+        if self.sc_lock_state.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            return;
+        }
+        let mut backoff: u32 = 0;
+        loop {
+            for _ in 0..(1u32 << backoff.min(6)) { core::hint::spin_loop(); }
+            if self.sc_lock_state.load(Ordering::Relaxed) == 0
+                && self.sc_lock_state.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
+            { return; }
+            if backoff < 6 { backoff += 1; }
+        }
+    }
+
+    #[inline]
+    pub fn sc_unlock(&self) {
+        self.sc_lock_state.store(0, core::sync::atomic::Ordering::Release);
+    }
+
     pub const fn new() -> Self {
         Self {
             header: KernelObject::new(ObjectType::SchedContext, 0),
+            sc_lock_state: core::sync::atomic::AtomicU8::new(0),
             budget: 0,
             remaining: 0,
             period: 0,
