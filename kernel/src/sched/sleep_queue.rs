@@ -3,17 +3,26 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
 //! Sorted singly-linked list by timer_wakeup_ns.
-//! All operations run with scheduler lock held.
+//! Protected by a dedicated SLEEP_LOCK for SMP safety.
 
+use crate::mm::SpinLock;
 use crate::sched::thread::{BlockedReason, Tcb, ThreadState};
+
+/// Dedicated lock protecting the global sleep queue.
+/// Required because timer ticks on multiple CPUs can call
+/// insert/remove/check_wakeups concurrently.
+static SLEEP_LOCK: SpinLock = SpinLock::new();
 
 static mut HEAD: *mut Tcb = core::ptr::null_mut();
 
 /// Insert TCB into sleep queue, sorted by wakeup time (ascending).
 ///
+/// Acquires SLEEP_LOCK internally.
+///
 /// # Safety
-/// Caller must hold the scheduler lock.
+/// Caller must have IRQs disabled.
 pub unsafe fn insert(tcb: *mut Tcb) {
+    SLEEP_LOCK.lock();
     unsafe {
         let wakeup = (*tcb).timer_wakeup_ns;
 
@@ -21,6 +30,7 @@ pub unsafe fn insert(tcb: *mut Tcb) {
         if (*head_ptr).is_null() || wakeup < (**head_ptr).timer_wakeup_ns {
             (*tcb).sleep_next = *head_ptr;
             *head_ptr = tcb;
+            SLEEP_LOCK.unlock();
             return;
         }
 
@@ -33,60 +43,68 @@ pub unsafe fn insert(tcb: *mut Tcb) {
         (*tcb).sleep_next = (*current).sleep_next;
         (*current).sleep_next = tcb;
     }
+    SLEEP_LOCK.unlock();
 }
 
 /// Remove a specific TCB from the sleep queue.
 /// Returns true if found and removed.
 ///
+/// Acquires SLEEP_LOCK internally.
+///
 /// # Safety
-/// Caller must hold the scheduler lock.
+/// Caller must have IRQs disabled.
 pub unsafe fn remove(tcb: *mut Tcb) -> bool {
-    unsafe {
+    SLEEP_LOCK.lock();
+    let result = unsafe {
         let head_ptr = &raw mut HEAD;
         if (*head_ptr).is_null() {
-            return false;
-        }
-
-        if *head_ptr == tcb {
+            false
+        } else if *head_ptr == tcb {
             *head_ptr = (*tcb).sleep_next;
             (*tcb).sleep_next = core::ptr::null_mut();
-            return true;
-        }
-
-        let mut current = *head_ptr;
-        while !(*current).sleep_next.is_null() {
-            if (*current).sleep_next == tcb {
-                (*current).sleep_next = (*tcb).sleep_next;
-                (*tcb).sleep_next = core::ptr::null_mut();
-                return true;
+            true
+        } else {
+            let mut current = *head_ptr;
+            let mut found = false;
+            while !(*current).sleep_next.is_null() {
+                if (*current).sleep_next == tcb {
+                    (*current).sleep_next = (*tcb).sleep_next;
+                    (*tcb).sleep_next = core::ptr::null_mut();
+                    found = true;
+                    break;
+                }
+                current = (*current).sleep_next;
             }
-            current = (*current).sleep_next;
+            found
         }
-        false
-    }
+    };
+    SLEEP_LOCK.unlock();
+    result
 }
 
-/// Peek whether the sleep queue head has expired (no lock needed).
-///
-/// Returns true if there is at least one sleeper whose wakeup time has passed.
-/// This is a read-only check used by timer_tick to decide whether
-/// the heavier check_wakeups processing is needed.
+/// Peek whether the sleep queue head has expired.
 ///
 /// # Safety
-/// Caller must have IRQs disabled (pins to current CPU).
+/// Caller must have IRQs disabled.
 pub unsafe fn peek_expired(now_ns: u64) -> bool {
-    unsafe {
+    SLEEP_LOCK.lock();
+    let result = unsafe {
         let head = *(&raw const HEAD);
         !head.is_null() && (*head).timer_wakeup_ns <= now_ns
-    }
+    };
+    SLEEP_LOCK.unlock();
+    result
 }
 
 /// Check for expired sleepers and wake them.
 /// Returns the number of threads woken.
 ///
+/// Acquires SLEEP_LOCK, ep_lock, FUTEX_LOCK as needed.
+///
 /// # Safety
-/// Caller must hold the per-CPU scheduler lock.
+/// Caller must have IRQs disabled.
 pub unsafe fn check_wakeups(now_ns: u64) -> usize {
+    SLEEP_LOCK.lock();
     unsafe {
         let head_ptr = &raw mut HEAD;
         let mut count = 0usize;
@@ -97,22 +115,23 @@ pub unsafe fn check_wakeups(now_ns: u64) -> usize {
             (*tcb).sleep_next = core::ptr::null_mut();
             (*tcb).timer_wakeup_ns = 0;
 
-            // If this thread was doing a futex timed wait, remove it from
-            // the futex hash table and mark timeout result
+            // Futex timed wait: remove from futex hash table under FUTEX_LOCK
             if matches!((*tcb).blocked_reason, Some(BlockedReason::FutexTimedBlocked)) {
+                // SLEEP_LOCK is held; FUTEX_LOCK acquisition is safe (no ordering conflict)
                 crate::ipc::futex::futex_remove_thread(tcb);
                 (*tcb).futex_wakeup_result = 12; // SyscallError::Cancelled = timeout
             }
 
-            // If this thread was doing a timed IPC send/recv, remove it from
-            // the endpoint's wait queue and mark timeout result
+            // Timed IPC: remove from endpoint queue under ep_lock
             if matches!(
                 (*tcb).blocked_reason,
                 Some(BlockedReason::SendTimedBlocked { .. }) | Some(BlockedReason::RecvTimedBlocked)
             ) {
                 let ep = (*tcb).blocked_endpoint as *mut crate::ipc::Endpoint;
                 if !ep.is_null() {
+                    (*ep).ep_lock();
                     (*ep).remove_from_queue(tcb);
+                    (*ep).ep_unlock();
                     (*tcb).blocked_endpoint = core::ptr::null_mut();
                 }
                 (*tcb).futex_wakeup_result = 12; // SyscallError::Cancelled = timeout
@@ -124,6 +143,7 @@ pub unsafe fn check_wakeups(now_ns: u64) -> usize {
             count += 1;
         }
 
+        SLEEP_LOCK.unlock();
         count
     }
 }

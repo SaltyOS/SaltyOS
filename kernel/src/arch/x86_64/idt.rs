@@ -288,7 +288,7 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
                 }
                 // Demand paging: PRESENT=0, DEMAND bit set in PTE
                 if let Ok(true) = vspace.handle_demand_fault(f.cr2, f.error_code) {
-                    // per-object lock is already held by the assembly exception
+                    // No global lock held on exception entry; per-object locks
                     // stub for user-mode exceptions. Just reschedule directly.
                     if (*current).state == crate::sched::thread::ThreadState::Inactive {
                         scheduler.reschedule();
@@ -303,7 +303,7 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
                     (*current).user_stack_top,
                     (*current).user_stack_min,
                 ) {
-                    // per-object lock is already held by the assembly exception
+                    // No global lock held on exception entry; per-object locks
                     // stub for user-mode exceptions. Just reschedule directly.
                     if (*current).state == crate::sched::thread::ThreadState::Inactive {
                         scheduler.reschedule();

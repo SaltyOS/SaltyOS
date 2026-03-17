@@ -1743,8 +1743,8 @@ impl VSpace {
         }
 
         // Captured outside the lock critical section to avoid
-        // lock ordering violation: signal() → enqueue() → scheduler.lock_state,
-        // but VSpace.lock must nest INSIDE scheduler.lock_state.
+        // lock ordering violation: signal() → enqueue() → sched.lock_cpu,
+        // but VSpace.lock must nest INSIDE sched.lock_cpu.
         let mut signal_ntfn: *mut crate::ipc::Notification = core::ptr::null_mut();
 
         let result = (|| {
@@ -1837,7 +1837,7 @@ impl VSpace {
         self.lock.unlock();
 
         // Signal mmsrv outside VSpace.lock to maintain lock ordering:
-        // signal() may acquire scheduler.lock_state which must not nest
+        // signal() may acquire sched.lock_cpu which must not nest
         // inside VSpace.lock.
         if !signal_ntfn.is_null() {
             if let Ok(true) = result {

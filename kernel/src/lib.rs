@@ -32,7 +32,7 @@ const SERIAL_PORT: u16 = 0x3F8;
 /// Leaf-level spinlock protecting all COM1 serial output.
 ///
 /// Lock ordering (outermost → innermost):
-///   CAP_LOCK → endpoint.lock / ntfn.lock / tcb.lock / sc.lock → sched.lock_cpu → VSpace.lock → FRAME_LOCK → SERIAL_LOCK
+///   CAP_LOCK → endpoint.lock / ntfn.lock / tcb.lock / sc.lock → SLEEP_LOCK / FUTEX_LOCK / IRQ_LOCK → sched.lock_cpu → VSpace.lock → FRAME_LOCK → SERIAL_LOCK
 pub(crate) static SERIAL_LOCK: mm::SpinLock = mm::SpinLock::new();
 
 // ---------------------------------------------------------------------------

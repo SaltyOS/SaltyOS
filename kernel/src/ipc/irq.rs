@@ -7,6 +7,7 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use crate::cap::{KernelObject, ObjectType};
 use crate::mm::SpinLock;
 use super::Notification;
@@ -27,10 +28,12 @@ pub struct IrqHandler {
     pub header: KernelObject,
     /// Hardware IRQ number
     pub irq_num: u32,
-    /// Bound notification (signals userspace when IRQ fires)
-    pub notification: *mut Notification,
-    /// Whether the IRQ has been acknowledged by userspace
-    pub acknowledged: bool,
+    /// Bound notification (signals userspace when IRQ fires).
+    /// Atomic for SMP safety: dispatch_irq reads on IRQ CPU, syscalls write on other CPUs.
+    pub notification: AtomicPtr<Notification>,
+    /// Whether the IRQ has been acknowledged by userspace.
+    /// Atomic for SMP safety: dispatch_irq clears, syscall ack sets.
+    pub acknowledged: AtomicBool,
     /// Whether this handler is active (registered in the global table)
     pub active: bool,
     /// Whether this IRQ uses level-triggered delivery (PCI) vs edge-triggered (ISA)
@@ -44,8 +47,8 @@ impl IrqHandler {
         Self {
             header: KernelObject::new(ObjectType::IrqHandler, 0),
             irq_num,
-            notification: core::ptr::null_mut(),
-            acknowledged: true,
+            notification: AtomicPtr::new(core::ptr::null_mut()),
+            acknowledged: AtomicBool::new(true),
             active: false,
             level_triggered: false,
             next: core::ptr::null_mut(),
@@ -58,7 +61,7 @@ impl IrqHandler {
             unregister_handler(self as *mut IrqHandler);
             self.active = false;
         }
-        self.notification = core::ptr::null_mut();
+        self.notification.store(core::ptr::null_mut(), Ordering::Release);
     }
 }
 
@@ -82,9 +85,10 @@ pub fn dispatch_irq(irq_num: usize) {
         let mut any_dispatched = false;
         while !cur.is_null() {
             let h = &mut *cur;
-            if h.acknowledged && !h.notification.is_null() {
-                h.acknowledged = false;
-                (*h.notification).signal(1u64 << (irq_num % 64));
+            let ntfn = h.notification.load(Ordering::Acquire);
+            if h.acknowledged.load(Ordering::Acquire) && !ntfn.is_null() {
+                h.acknowledged.store(false, Ordering::Release);
+                (*ntfn).signal(1u64 << (irq_num % 64));
                 any_dispatched = true;
             }
             cur = h.next;
@@ -151,7 +155,7 @@ pub fn has_active_notification(irq_num: usize) -> bool {
         let mut cur = (*(&raw const IRQ_HANDLERS))[irq_num];
         let mut found = false;
         while !cur.is_null() {
-            if !(*cur).notification.is_null() {
+            if !(*cur).notification.load(Ordering::Acquire).is_null() {
                 found = true;
                 break;
             }

@@ -144,13 +144,18 @@ impl Notification {
         }
     }
 
-    /// Remove a specific TCB from the waiting slot
+    /// Remove a specific TCB from the waiting slot.
+    /// Acquires ntfn_lock internally for SMP safety.
     pub fn remove_waiter(&mut self, tcb: *mut Tcb) -> bool {
-        if self.waiting == tcb {
+        self.ntfn_lock();
+        let removed = if self.waiting == tcb {
             self.waiting = core::ptr::null_mut();
-            return true;
-        }
-        false
+            true
+        } else {
+            false
+        };
+        self.ntfn_unlock();
+        removed
     }
 
     /// Cleanup when notification is destroyed

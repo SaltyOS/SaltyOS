@@ -2163,7 +2163,9 @@ fn syscall_tcb_bind_notification(cap: &Capability, ntfn_cap_ptr: u64) -> Syscall
         }
 
         let ntfn = &mut *(ntfn_cap.object as *mut crate::ipc::Notification);
+        ntfn.ntfn_lock();
         if !ntfn.bound_tcb.is_null() {
+            ntfn.ntfn_unlock();
             tcb.tcb_unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::Busy);
@@ -2171,6 +2173,7 @@ fn syscall_tcb_bind_notification(cap: &Capability, ntfn_cap_ptr: u64) -> Syscall
 
         tcb.bound_notification = ntfn_cap.object as *mut u8;
         ntfn.bound_tcb = tcb as *mut Tcb;
+        ntfn.ntfn_unlock();
         tcb.tcb_unlock();
         restore_irq(irq);
     }
@@ -2196,7 +2199,9 @@ fn syscall_tcb_unbind_notification(cap: &Capability) -> SyscallResult {
         }
 
         let ntfn = &mut *(tcb.bound_notification as *mut crate::ipc::Notification);
+        ntfn.ntfn_lock();
         ntfn.bound_tcb = core::ptr::null_mut();
+        ntfn.ntfn_unlock();
         tcb.bound_notification = core::ptr::null_mut();
         tcb.tcb_unlock();
         restore_irq(irq);
@@ -3129,7 +3134,7 @@ fn syscall_irq_handler_ack(cap: &Capability) -> SyscallResult {
     unsafe {
         let irq = save_irq_disable();
         let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
-        irq_handler.acknowledged = true;
+        irq_handler.acknowledged.store(true, core::sync::atomic::Ordering::Release);
         // Re-enable delivery at IOAPIC. dispatch_irq() masks the IRQ when
         // no handler is ready to accept delivery; unmask it now that this
         // handler has acknowledged and is ready for the next interrupt.
@@ -3171,7 +3176,7 @@ fn syscall_irq_handler_set_notification(
     unsafe {
         let irq = save_irq_disable();
         let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
-        irq_handler.notification = ntfn_cap.object as *mut Notification;
+        irq_handler.notification.store(ntfn_cap.object as *mut Notification, core::sync::atomic::Ordering::Release);
         restore_irq(irq);
     }
 
@@ -3194,7 +3199,7 @@ fn syscall_irq_handler_clear(cap: &Capability) -> SyscallResult {
         let irq = save_irq_disable();
         let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
         irq_num = irq_handler.irq_num;
-        irq_handler.notification = core::ptr::null_mut();
+        irq_handler.notification.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
         // Only mask if no other handler on this IRQ has a notification
         should_mask = !crate::ipc::irq::has_active_notification(irq_num as usize);
         restore_irq(irq);

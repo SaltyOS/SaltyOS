@@ -991,7 +991,7 @@ impl Scheduler {
     /// preserving a lighter-weight target-preparation path.
     ///
     /// # Preconditions
-    /// - Scheduler lock (`lock_state`) MUST NOT be held.
+    /// - Scheduler lock (`lock_states` / per-CPU lock) MUST NOT be held.
     /// - No IPC/endpoint locks should be held (release before calling).
     /// - `set_current(new_tcb)` and thread state transitions were already done.
     /// - Local IRQs MUST remain disabled across the switch; restore them only
@@ -1007,7 +1007,7 @@ impl Scheduler {
     /// Perform the actual context switch (VSpace, kernel stack, registers).
     ///
     /// # Preconditions
-    /// - Scheduler lock (`lock_state`) MUST NOT be held.
+    /// - Scheduler lock (`lock_states` / per-CPU lock) MUST NOT be held.
     /// - No IPC/endpoint locks should be held (release before calling).
     /// - Local IRQs MUST remain disabled across the switch; restore them only
     ///   after the resumed continuation returns from this call.
