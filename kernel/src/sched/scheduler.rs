@@ -61,8 +61,8 @@ pub struct Scheduler {
     /// its registers. Prevents the double-schedule race where another CPU
     /// dequeues and switches to a thread before its context is saved.
     pending_enqueue: [*mut Tcb; MAX_CPUS],
-    /// Lock state (simple test-and-set spinlock)
-    lock_state: core::sync::atomic::AtomicU8,
+    /// Per-CPU lock states (each protects that CPU's ready queue and per-CPU state)
+    lock_states: [core::sync::atomic::AtomicU8; MAX_CPUS],
     /// Per-CPU context switch count
     pub context_switches: [u64; MAX_CPUS],
     /// Per-CPU timer tick count
@@ -84,7 +84,7 @@ impl Scheduler {
             current: [core::ptr::null_mut(); MAX_CPUS],
             idle: [core::ptr::null_mut(); MAX_CPUS],
             pending_enqueue: [core::ptr::null_mut(); MAX_CPUS],
-            lock_state: core::sync::atomic::AtomicU8::new(0),
+            lock_states: [const { core::sync::atomic::AtomicU8::new(0) }; MAX_CPUS],
             context_switches: [0; MAX_CPUS],
             timer_ticks: [0; MAX_CPUS],
             idle_ticks: [0; MAX_CPUS],
@@ -94,13 +94,12 @@ impl Scheduler {
         }
     }
 
-    /// Take scheduler lock
-    pub(crate) fn lock(&self) {
+    /// Lock a specific CPU's scheduler queue.
+    pub(crate) fn lock_cpu(&self, cpu: usize) {
         use core::sync::atomic::Ordering;
 
         // Fast path: uncontended acquire
-        if self
-            .lock_state
+        if self.lock_states[cpu]
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
@@ -125,9 +124,8 @@ impl Scheduler {
                 }
             }
 
-            if self.lock_state.load(Ordering::Relaxed) == 0
-                && self
-                    .lock_state
+            if self.lock_states[cpu].load(Ordering::Relaxed) == 0
+                && self.lock_states[cpu]
                     .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
                     .is_ok()
             {
@@ -140,10 +138,20 @@ impl Scheduler {
         }
     }
 
-    /// Release scheduler lock
-    pub(crate) fn unlock(&self) {
-        self.lock_state
+    /// Unlock a specific CPU's scheduler queue.
+    pub(crate) fn unlock_cpu(&self, cpu: usize) {
+        self.lock_states[cpu]
             .store(0, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Take the local CPU's scheduler lock.
+    pub(crate) fn lock(&self) {
+        self.lock_cpu(crate::arch::current_cpu() as usize);
+    }
+
+    /// Release the local CPU's scheduler lock.
+    pub(crate) fn unlock(&self) {
+        self.unlock_cpu(crate::arch::current_cpu() as usize);
     }
 
     // ---------------------------------------------------------------
@@ -244,12 +252,28 @@ impl Scheduler {
 
             // Route to the appropriate per-CPU queue
             let target = self.select_target_cpu(tcb);
-            self.insert_sorted(target, tcb);
+            let this_cpu = crate::arch::current_cpu() as usize;
+
+            if target == this_cpu {
+                // Local enqueue — caller already holds local lock
+                self.insert_sorted(target, tcb);
+            } else if target > this_cpu {
+                // Lock ordering OK: hold lower (local), acquire higher (target)
+                self.lock_cpu(target);
+                self.insert_sorted(target, tcb);
+                self.unlock_cpu(target);
+            } else {
+                // target < local: release local, lock target, insert, unlock target, relock local
+                self.unlock_cpu(this_cpu);
+                self.lock_cpu(target);
+                self.insert_sorted(target, tcb);
+                self.unlock_cpu(target);
+                self.lock_cpu(this_cpu);
+            }
 
             // Wake the target CPU if it is idle and different from ours.
             // Skip IPI if the current CPU is idle — it will pick up the
             // thread in its own scheduling decision without cross-CPU overhead.
-            let this_cpu = crate::arch::current_cpu() as usize;
             if target != this_cpu
                 && target < self.online_cpus as usize
                 && !self.idle[target].is_null()
@@ -363,21 +387,55 @@ impl Scheduler {
     /// Remove highest priority thread for a CPU with IRQ-safe locking.
     pub fn dequeue_for_cpu(&mut self, cpu_id: usize) -> Option<*mut Tcb> {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
-        self.lock();
+        self.lock_cpu(cpu_id);
         let result = self.dequeue_for_cpu_unlocked(cpu_id);
-        self.unlock();
+        self.unlock_cpu(cpu_id);
         unsafe { crate::mm::restore_irq(irq_flag) };
         result
     }
 
     /// Remove a specific thread from the ready queue with IRQ-safe locking.
+    ///
+    /// Locks the CPU queue where the thread is queued (via `queued_cpu`).
     pub fn remove_from_ready_queue(&mut self, tcb: *mut Tcb) -> bool {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
-        self.lock();
-        let result = self.remove_from_ready_queue_unlocked(tcb);
-        self.unlock();
-        unsafe { crate::mm::restore_irq(irq_flag) };
-        result
+        unsafe {
+            if !(*tcb).ready_queued {
+                crate::mm::restore_irq(irq_flag);
+                return false;
+            }
+            let cpu = (*tcb).queued_cpu as usize;
+            if cpu >= MAX_CPUS {
+                crate::mm::restore_irq(irq_flag);
+                return false;
+            }
+            self.lock_cpu(cpu);
+            let result = self.remove_from_ready_queue_unlocked(tcb);
+            self.unlock_cpu(cpu);
+            crate::mm::restore_irq(irq_flag);
+            result
+        }
+    }
+
+    /// Re-sort a thread in the ready queue after priority change (PIP).
+    ///
+    /// Acquires the appropriate per-CPU lock internally.
+    /// Safe to call without holding any scheduler lock.
+    pub fn resort_ready_thread(&mut self, tcb: *mut Tcb) {
+        unsafe {
+            if !(*tcb).ready_queued {
+                return;
+            }
+            let cpu = (*tcb).queued_cpu as usize;
+            if cpu >= MAX_CPUS {
+                return;
+            }
+            self.lock_cpu(cpu);
+            if self.remove_from_ready_queue_unlocked(tcb) {
+                self.insert_sorted(cpu, tcb);
+            }
+            self.unlock_cpu(cpu);
+        }
     }
 
     // ---------------------------------------------------------------
@@ -408,14 +466,20 @@ impl Scheduler {
         }
 
         // Local queue empty — try work stealing from other CPUs.
-        // Only steal any-affinity threads (specific-affinity threads
-        // must remain on their pinned CPU's queue).
+        // Release local lock during steal to avoid lock ordering issues.
+        // Per-CPU state (current, pending_enqueue) is only modified by
+        // the local CPU with IRQs disabled, so brief release is safe.
+        self.unlock_cpu(cpu_id);
+
         let online = self.online_cpus as usize;
         for victim in 0..online {
             if victim == cpu_id {
                 continue;
             }
-            if let Some(tcb) = self.steal_from(victim) {
+            self.lock_cpu(victim);
+            if let Some(tcb) = self.steal_from_unlocked(victim) {
+                self.unlock_cpu(victim);
+                self.lock_cpu(cpu_id);
                 unsafe {
                     (*tcb).state = ThreadState::Running;
                     (*tcb).last_cpu = cpu_id as u32;
@@ -424,30 +488,29 @@ impl Scheduler {
                 CURRENT_ON_CPU[cpu_id].store(tcb as usize, core::sync::atomic::Ordering::Release);
                 return tcb;
             }
+            self.unlock_cpu(victim);
         }
 
-        // No work anywhere — idle
+        // No work anywhere — reacquire local lock and return idle
+        self.lock_cpu(cpu_id);
         self.idle[cpu_id]
     }
 
-    /// Steal one any-affinity thread from another CPU's ready queue.
+    /// Steal one any-affinity thread from a victim CPU's ready queue.
     ///
-    /// Scans the victim's queue for the first any-affinity thread that
-    /// is valid to schedule. Returns None if no stealable thread found.
+    /// Only steals any-affinity threads (specific-affinity threads must
+    /// remain on their pinned CPU's queue).
     ///
-    /// Caller MUST hold the scheduler lock.
-    fn steal_from(&mut self, victim: usize) -> Option<*mut Tcb> {
+    /// Caller MUST hold the victim CPU's lock.
+    fn steal_from_unlocked(&mut self, victim: usize) -> Option<*mut Tcb> {
         unsafe {
             let mut prev: *mut Tcb = core::ptr::null_mut();
             let mut current = self.ready_heads[victim];
 
             while !current.is_null() {
                 let affinity = (*current).cpu_affinity;
-                // Only steal any-affinity threads
                 if affinity == 0xFFFF_FFFF
                     && (*current).state == ThreadState::Ready
-                    && self.find_running_cpu(current).is_none()
-                    && !self.is_pending_on_any_cpu(current)
                 {
                     // Remove from victim's queue
                     if prev.is_null() {

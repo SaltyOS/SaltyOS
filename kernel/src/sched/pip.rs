@@ -57,10 +57,7 @@ pub unsafe fn pip_donate(donor: *mut Tcb, holder: *mut Tcb) {
 
             // If the boosted thread is in the ready queue, re-sort it
             if (*current).state == ThreadState::Ready {
-                let sched = crate::sched::scheduler::scheduler();
-                if sched.remove_from_ready_queue_unlocked(current) {
-                    sched.enqueue_unlocked(current);
-                }
+                crate::sched::scheduler::scheduler().resort_ready_thread(current);
             }
 
             // Follow the chain: if this thread is itself donating to someone
@@ -101,10 +98,7 @@ pub unsafe fn pip_undonate(holder: *mut Tcb, caller: *mut Tcb) {
 
             // If in ready queue, re-sort with restored priority
             if (*holder).state == ThreadState::Ready {
-                let sched = crate::sched::scheduler::scheduler();
-                if sched.remove_from_ready_queue_unlocked(holder) {
-                    sched.enqueue_unlocked(holder);
-                }
+                crate::sched::scheduler::scheduler().resort_ready_thread(holder);
             }
         }
     }
