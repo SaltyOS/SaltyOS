@@ -9,6 +9,10 @@ use crate::sched::thread::{BlockedReason, Tcb, ThreadState};
 
 use crate::sched::scheduler::scheduler as get_scheduler;
 
+/// Per-CPU saved IRQ flags for ntfn_lock/ntfn_unlock.
+/// Same pattern as EP_IRQ_FLAGS — prevents timer tick deadlock.
+static mut NTFN_IRQ_FLAGS: [u64; crate::arch::MAX_CPUS] = [0; crate::arch::MAX_CPUS];
+
 /// Notification object for async signaling
 #[repr(C)]
 pub struct Notification {
@@ -35,9 +39,13 @@ impl Notification {
         }
     }
 
-    /// Acquire per-notification lock.
+    /// Acquire per-notification lock with IRQ disable.
     #[inline]
     pub fn ntfn_lock(&self) {
+        let irq = unsafe { crate::mm::save_irq_disable() };
+        let cpu = crate::arch::current_cpu() as usize;
+        unsafe { *(&raw mut NTFN_IRQ_FLAGS[cpu]) = irq; }
+
         if self.lock.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
             return;
         }
@@ -55,13 +63,21 @@ impl Notification {
         }
     }
 
-    /// Release per-notification lock.
+    /// Release per-notification lock and restore IRQs.
     #[inline]
     pub fn ntfn_unlock(&self) {
         self.lock.store(0, Ordering::Release);
+        let cpu = crate::arch::current_cpu() as usize;
+        let irq = unsafe { *(&raw const NTFN_IRQ_FLAGS[cpu]) };
+        unsafe { crate::mm::restore_irq(irq); }
     }
 
-    /// Signal notification (set bits) - never blocks
+    /// Signal notification (set bits) - never blocks.
+    ///
+    /// Lock ordering: releases ntfn_lock before acquiring ep_lock to avoid
+    /// ntfn_lock → ep_lock nesting (normal IPC acquires ep_lock first).
+    /// The bound_tcb state is re-validated after reacquiring ep_lock to
+    /// handle the TOCTOU window.
     pub fn signal(&mut self, bits: u64) {
         unsafe {
             self.ntfn_lock();
@@ -79,29 +95,55 @@ impl Notification {
                 get_scheduler().enqueue(waiter);
             } else if !self.bound_tcb.is_null() {
                 let tcb = self.bound_tcb;
-                if (*tcb).state == ThreadState::Blocked
-                    && matches!((*tcb).blocked_reason, Some(BlockedReason::RecvBlocked))
-                {
-                    // Remove from endpoint recv queue (need endpoint lock)
-                    let ep_ptr = (*tcb).blocked_endpoint;
-                    if !ep_ptr.is_null() {
-                        let ep = &mut *(ep_ptr as *mut super::Endpoint);
-                        ep.ep_lock();
-                        ep.remove_from_queue(tcb);
-                        ep.ep_unlock();
-                    }
-
-                    let all_bits = self.bits.swap(0, Ordering::SeqCst);
-                    (*tcb).saved_caller_badge = all_bits;
-                    (*tcb).saved_caller_msg = super::Message::empty();
-                    (*tcb).blocked_reason = None;
-                    (*tcb).blocked_endpoint = core::ptr::null_mut();
-                    (*tcb).state = ThreadState::Ready;
+                let ep_ptr = (*tcb).blocked_endpoint;
+                if ep_ptr.is_null() {
                     self.ntfn_unlock();
-                    get_scheduler().enqueue(tcb);
-                } else {
-                    self.ntfn_unlock();
+                    return;
                 }
+
+                // Snapshot and consume bits under ntfn_lock, then release
+                // before acquiring ep_lock to prevent lock ordering inversion.
+                let all_bits = self.bits.swap(0, Ordering::SeqCst);
+                self.ntfn_unlock();
+
+                let ep = &mut *(ep_ptr as *mut super::Endpoint);
+                ep.ep_lock();
+
+                // Re-validate: TCB state may have changed while no locks
+                // were held (timeout, another signal, or IPC completion).
+                let wake_recv = (*tcb).state == ThreadState::Blocked
+                    && (*tcb).blocked_endpoint == ep_ptr
+                    && matches!(
+                        (*tcb).blocked_reason,
+                        Some(BlockedReason::RecvBlocked) | Some(BlockedReason::RecvTimedBlocked)
+                    );
+
+                if !wake_recv {
+                    ep.ep_unlock();
+                    // Restore bits so they aren't lost — a future poll/wait
+                    // or another signal() call will pick them up.
+                    self.bits.fetch_or(all_bits, Ordering::SeqCst);
+                    return;
+                }
+
+                let timed = matches!((*tcb).blocked_reason, Some(BlockedReason::RecvTimedBlocked));
+                ep.remove_from_queue(tcb);
+
+                (*tcb).saved_caller_badge = all_bits;
+                (*tcb).saved_caller_msg = super::Message::empty();
+                (*tcb).blocked_endpoint = core::ptr::null_mut();
+
+                ep.ep_unlock();
+
+                if timed {
+                    crate::sched::sleep_queue::remove(tcb);
+                    (*tcb).timer_wakeup_ns = 0;
+                    (*tcb).futex_wakeup_result = 0;
+                }
+
+                (*tcb).blocked_reason = None;
+                (*tcb).state = ThreadState::Ready;
+                get_scheduler().enqueue(tcb);
             } else {
                 self.ntfn_unlock();
             }

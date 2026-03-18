@@ -12,7 +12,15 @@ use crate::sched::scheduler::scheduler as get_scheduler;
 ///
 /// Only messages without capability transfer are enqueued. Messages with
 /// extra caps still require an active receiver for immediate transfer.
-const NBSEND_QUEUE_DEPTH: usize = 64;
+const NBSEND_QUEUE_DEPTH: usize = 128;
+
+/// Per-CPU saved IRQ flags for ep_lock/ep_unlock.
+///
+/// ep_lock disables IRQs to prevent same-CPU deadlock when timer tick
+/// handlers acquire ep_lock (e.g., check_wakeups removing timed-IPC
+/// threads from endpoints). ep_lock is never nested, so one slot per
+/// CPU suffices.
+static mut EP_IRQ_FLAGS: [u64; crate::arch::MAX_CPUS] = [0; crate::arch::MAX_CPUS];
 const POSIX_PM_EXEC_LABEL: u64 = 6;
 const IPC_BUFFER_RESERVED_BYTES: usize = core::mem::size_of::<[u64; 478]>();
 
@@ -151,10 +159,19 @@ impl Endpoint {
         self.state
     }
 
-    /// Acquire per-endpoint lock.
+    /// Acquire per-endpoint lock with IRQ disable.
+    ///
+    /// Disables local IRQs before acquiring the spinlock to prevent same-CPU
+    /// deadlock: timer tick → check_wakeups → ep_lock would deadlock if a
+    /// syscall on the same CPU already holds this endpoint's lock.
     #[inline]
     pub fn ep_lock(&self) {
         use core::sync::atomic::Ordering;
+        // SAFETY: save/restore IRQ flags around spinlock, stored per-CPU.
+        let irq = unsafe { crate::mm::save_irq_disable() };
+        let cpu = crate::arch::current_cpu() as usize;
+        unsafe { *(&raw mut EP_IRQ_FLAGS[cpu]) = irq; }
+
         if self.lock.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
             return;
         }
@@ -172,10 +189,14 @@ impl Endpoint {
         }
     }
 
-    /// Release per-endpoint lock.
+    /// Release per-endpoint lock and restore IRQs.
     #[inline]
     pub fn ep_unlock(&self) {
         self.lock.store(0, core::sync::atomic::Ordering::Release);
+        let cpu = crate::arch::current_cpu() as usize;
+        // SAFETY: restoring IRQ flags saved by the matching ep_lock call.
+        let irq = unsafe { *(&raw const EP_IRQ_FLAGS[cpu]) };
+        unsafe { crate::mm::restore_irq(irq); }
     }
 
     /// Push an async `NBSend` message into the endpoint-local ring buffer.
@@ -218,18 +239,21 @@ impl Endpoint {
             if tcb.is_null() {
                 return;
             }
-            let buf = (*tcb).ipc_buffer;
-            if buf == 0 {
-                (*tcb).ipc_receive_cnode = 0;
-                (*tcb).ipc_receive_index = 0;
-                (*tcb).ipc_receive_depth = 0;
-                return;
+            match resolve_ipc_buffer_ptr(tcb) {
+                Some(ipc_buf) => {
+                    // SAFETY: resolve_ipc_buffer_ptr validated alignment,
+                    // VSpace mapping, and returned a kernel-virtual address
+                    // (phys_to_virt), so no SMAP guard needed.
+                    (*tcb).ipc_receive_cnode = (*ipc_buf).receive_cnode;
+                    (*tcb).ipc_receive_index = (*ipc_buf).receive_index;
+                    (*tcb).ipc_receive_depth = (*ipc_buf).receive_depth;
+                }
+                None => {
+                    (*tcb).ipc_receive_cnode = 0;
+                    (*tcb).ipc_receive_index = 0;
+                    (*tcb).ipc_receive_depth = 0;
+                }
             }
-
-            let ipc_buf = buf as *const super::IpcBuffer;
-            (*tcb).ipc_receive_cnode = (*ipc_buf).receive_cnode;
-            (*tcb).ipc_receive_index = (*ipc_buf).receive_index;
-            (*tcb).ipc_receive_depth = (*ipc_buf).receive_depth;
         }
     }
 
@@ -436,6 +460,20 @@ impl Endpoint {
                     self.state = EndpointState::RecvBlocked;
                     (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
                     super::block_current_thread_no_switch(current, BlockedReason::RecvBlocked);
+
+                    if !(*current).bound_notification.is_null() {
+                        let ntfn = &mut *((*current).bound_notification
+                            as *mut super::Notification);
+                        let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
+                        if bits != 0 {
+                            self.remove_from_queue(current);
+                            (*current).blocked_endpoint = core::ptr::null_mut();
+                            (*current).blocked_reason = None;
+                            (*current).state = ThreadState::Running;
+                            return Some((Message::empty(), bits, core::ptr::null_mut()));
+                        }
+                    }
+
                     None
                 }
             }
@@ -1017,6 +1055,20 @@ impl Endpoint {
             (*current).blocked_reason = Some(BlockedReason::RecvTimedBlocked);
             (*current).state = ThreadState::Blocked;
             (*current).futex_wakeup_result = 0;
+
+            if !(*current).bound_notification.is_null() {
+                let ntfn = &mut *((*current).bound_notification
+                    as *mut super::Notification);
+                let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
+                if bits != 0 {
+                    self.remove_from_queue(current);
+                    (*current).blocked_endpoint = core::ptr::null_mut();
+                    (*current).blocked_reason = None;
+                    (*current).state = ThreadState::Running;
+                    self.ep_unlock();
+                    return (Message::empty(), bits, 0);
+                }
+            }
 
             self.ep_unlock();
 
