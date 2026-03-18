@@ -2,6 +2,8 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
 use crate::cap::{KernelObject, ObjectType};
 use crate::cap::CNode;
 use crate::mm::VSpace;
@@ -86,6 +88,9 @@ pub enum BlockedReason {
     RecvTimedBlocked,
 }
 
+/// Sentinel value meaning no CPU currently owns the thread's live register state.
+pub const RUN_OWNER_NONE: u8 = u8::MAX;
+
 /// Thread Control Block
 #[repr(C)]
 pub struct Tcb {
@@ -129,6 +134,12 @@ pub struct Tcb {
     pub cpu_affinity: u32,
     /// Last CPU this thread ran on (cache affinity hint for load balancer)
     pub last_cpu: u32,
+    /// CPU that still owns this thread's live register state.
+    ///
+    /// A thread may already be Blocked and present in an IPC wait queue while
+    /// the old CPU is still unwinding toward `context_switch`. Fastpath cross-CPU
+    /// handoff is only safe once this field becomes `RUN_OWNER_NONE`.
+    pub run_owner_cpu: AtomicU8,
     /// Whether this thread is currently in the ready queue (O(1) membership test)
     pub ready_queued: bool,
     /// Which CPU's ready queue this thread is in (valid when ready_queued == true)
@@ -285,13 +296,33 @@ impl Tcb {
 
     #[inline]
     pub fn tcb_unlock(&self) {
-        self.tcb_lock_state.store(0, core::sync::atomic::Ordering::Release);
+        self.tcb_lock_state.store(0, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn run_owner(&self) -> Option<usize> {
+        let owner = self.run_owner_cpu.load(Ordering::Acquire);
+        if owner == RUN_OWNER_NONE {
+            None
+        } else {
+            Some(owner as usize)
+        }
+    }
+
+    #[inline]
+    pub fn set_run_owner_cpu(&self, cpu_id: usize) {
+        self.run_owner_cpu.store(cpu_id as u8, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn clear_run_owner_cpu(&self) {
+        self.run_owner_cpu.store(RUN_OWNER_NONE, Ordering::Release);
     }
 
     pub const fn new() -> Self {
         Self {
             header: KernelObject::new(ObjectType::Tcb, 0),
-            tcb_lock_state: core::sync::atomic::AtomicU8::new(0),
+            tcb_lock_state: AtomicU8::new(0),
             state: ThreadState::Inactive,
             priority: 0,
             base_priority: 0,
@@ -310,6 +341,7 @@ impl Tcb {
             sched_context: core::ptr::null_mut(),
             cpu_affinity: 0xFFFF_FFFF,
             last_cpu: 0xFFFF_FFFF,
+            run_owner_cpu: AtomicU8::new(RUN_OWNER_NONE),
             ready_queued: false,
             queued_cpu: 0xFFFF_FFFF,
             next: core::ptr::null_mut(),
@@ -352,6 +384,7 @@ impl Tcb {
             (*ptr).state = ThreadState::Inactive;
             (*ptr).cpu_affinity = 0xFFFF_FFFF;
             (*ptr).last_cpu = 0xFFFF_FFFF;
+            (*ptr).run_owner_cpu = AtomicU8::new(RUN_OWNER_NONE);
             (*ptr).queued_cpu = 0xFFFF_FFFF;
         }
     }
@@ -366,6 +399,7 @@ impl Tcb {
         self.state = ThreadState::Inactive;
         self.ready_queued = false;
         self.queued_cpu = 0xFFFF_FFFF;
+        self.clear_run_owner_cpu();
         self.blocked_reason = None;
         self.blocked_endpoint = core::ptr::null_mut();
         self.blocked_notification = core::ptr::null_mut();
