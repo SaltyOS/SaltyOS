@@ -275,7 +275,7 @@ Object types: `OBJ_UNTYPED` (1), `OBJ_ENDPOINT` (2), `OBJ_NOTIFICATION` (3), `OB
 | `tcb_suspend` | `besalt_tcb_suspend` | `tcb` | `i32` |
 | `tcb_set_space` | `besalt_tcb_set_space` | `tcb, cspace, vspace` | `i32` |
 | `tcb_set_space_with_depth` | -- | `tcb, cspace, vspace, depth` | `i32` |
-| `tcb_set_fault_handler` | `besalt_tcb_set_fault_handler` | `tcb, fault_ep` | `i32` |
+| `tcb_set_fault_handler` | `besalt_tcb_set_fault_handler` | `tcb, fault_ep` (`0` clears) | `i32` |
 | `tcb_set_ipc_buffer` | `besalt_tcb_set_ipc_buffer` | `tcb, addr` | `i32` |
 | `tcb_write_registers` | `besalt_tcb_write_registers` | `tcb, flags, rip, rsp` | `i32` |
 | `tcb_bind_notification` | -- | `tcb, ntfn` | `i32` |
