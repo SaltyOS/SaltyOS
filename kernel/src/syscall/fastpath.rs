@@ -37,8 +37,23 @@ impl FastpathResult {
 }
 
 #[inline(always)]
-unsafe fn fastpath_waiter_is_unowned(tcb: *mut Tcb) -> bool {
-    unsafe { !tcb.is_null() && (*tcb).run_owner().is_none() }
+fn fastpath_waiter_is_local_stable(tcb: *mut Tcb, this_cpu: usize) -> bool {
+    unsafe {
+        if tcb.is_null() || (*tcb).run_owner().is_some() || (*tcb).ready_queued {
+            return false;
+        }
+        if (*tcb).queued_cpu != 0xFFFF_FFFF {
+            return false;
+        }
+
+        let affinity = (*tcb).cpu_affinity;
+        if affinity != 0xFFFF_FFFF {
+            return affinity == this_cpu as u32;
+        }
+
+        let last_cpu = (*tcb).last_cpu;
+        last_cpu == 0xFFFF_FFFF || last_cpu == this_cpu as u32
+    }
 }
 
 /// Fastpath for Call syscall (syscall number 2).
@@ -96,6 +111,7 @@ pub unsafe extern "C" fn fastpath_call_rust(
 
     let endpoint_ptr = cap.object as *mut Endpoint;
     let badge = cap.badge;
+    let this_cpu = crate::arch::current_cpu() as usize;
 
     unsafe {
         // Per-endpoint lock for IPC queue operations (Zircon-style).
@@ -119,16 +135,7 @@ pub unsafe extern "C" fn fastpath_call_rust(
             }
         };
 
-        if !fastpath_waiter_is_unowned(receiver) {
-            endpoint.fastpath_push_recv(receiver);
-            endpoint.ep_unlock();
-            restore_irq(irq);
-            return FastpathResult::slowpath();
-        }
-
-        let this_cpu = crate::arch::current_cpu() as usize;
-        let recv_affinity = (*receiver).cpu_affinity;
-        if recv_affinity != 0xFFFF_FFFF && recv_affinity != this_cpu as u32 {
+        if !fastpath_waiter_is_local_stable(receiver, this_cpu) {
             endpoint.fastpath_push_recv(receiver);
             endpoint.ep_unlock();
             restore_irq(irq);
@@ -272,6 +279,7 @@ pub unsafe extern "C" fn fastpath_reply_recv_rust(
 
     let endpoint_ptr = cap.object as *mut Endpoint;
     let _badge = cap.badge;
+    let this_cpu = crate::arch::current_cpu() as usize;
 
     unsafe {
         // Per-endpoint lock only — NO global lock needed (Zircon-style).
@@ -292,6 +300,11 @@ pub unsafe extern "C" fn fastpath_reply_recv_rust(
         let mut wake_caller: *mut Tcb = core::ptr::null_mut();
 
         if !caller.is_null() {
+            if !fastpath_waiter_is_local_stable(caller, this_cpu) {
+                endpoint.ep_unlock();
+                restore_irq(irq);
+                return FastpathResult::slowpath();
+            }
             let is_reply_wait = matches!(
                 (*caller).blocked_reason,
                 Some(BlockedReason::ReplyWait { .. })
@@ -350,7 +363,7 @@ pub unsafe extern "C" fn fastpath_reply_recv_rust(
             }
         };
 
-        if !fastpath_waiter_is_unowned(sender) {
+        if !fastpath_waiter_is_local_stable(sender, this_cpu) {
             endpoint.fastpath_push_send(sender);
             endpoint.ep_unlock();
             if !wake_caller.is_null() {

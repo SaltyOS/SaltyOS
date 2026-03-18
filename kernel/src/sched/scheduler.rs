@@ -239,6 +239,13 @@ impl Scheduler {
                 // context has actually been saved.
                 if (*tcb).state != ThreadState::Running {
                     self.set_pending_enqueue(running_cpu, tcb);
+                    // If another CPU is still in the blocked thread's kernel
+                    // path, it may not reach schedule()/process_pending_enqueue()
+                    // until its next interrupt. Nudge it now so the wake is
+                    // observed promptly instead of waiting for unrelated IRQs.
+                    if running_cpu != cpu_id && running_cpu < self.online_cpus as usize {
+                        crate::arch::send_ipi(running_cpu, crate::arch::IpiKind::Reschedule);
+                    }
                 }
                 return;
             }
@@ -255,6 +262,11 @@ impl Scheduler {
             // context_switch and will see state=Ready via x86_64 cache
             // coherence (LOCK XCHG in swap is a full barrier).
             if self.is_pending_on_any_cpu(tcb) {
+                if let Some(pending_cpu) = self.pending_cpu_for(tcb) {
+                    if pending_cpu != cpu_id && pending_cpu < self.online_cpus as usize {
+                        crate::arch::send_ipi(pending_cpu, crate::arch::IpiKind::Reschedule);
+                    }
+                }
                 (*tcb).state = ThreadState::Ready;
                 return;
             }
@@ -299,8 +311,14 @@ impl Scheduler {
                     // Target is idle — always wake
                     true
                 } else if !target_current.is_null() {
-                    // Preempt if enqueued thread has earlier deadline
-                    (*tcb).priority < (*target_current).priority
+                    // If the target CPU is still in a blocked/switch-out path,
+                    // it needs an explicit nudge to flush pending work.
+                    if (*target_current).state != ThreadState::Running {
+                        true
+                    } else {
+                        // Preempt if enqueued thread has earlier deadline
+                        (*tcb).priority < (*target_current).priority
+                    }
                 } else {
                     false
                 };
