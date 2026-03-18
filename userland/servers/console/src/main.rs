@@ -220,13 +220,26 @@ fn console_puts(s: &[u8]) {
 }
 
 /// Forward output to the display server.
-/// Uses a queued nbsend fast path and blocking flush fallback to preserve
-/// terminal stream ordering under display backpressure.
+/// Uses a queued nbsend fast path and a true blocking send fallback to
+/// preserve terminal stream ordering under display backpressure.
 fn display_write(data: &[u8]) {
     if data.is_empty() { return; }
     unsafe {
         display_tx_enqueue(data);
         display_try_flush();
+        if !display_tx_is_empty() {
+            let _ = display_flush_blocking_one();
+        }
+    }
+}
+
+unsafe fn display_flush_blocking_all() {
+    unsafe {
+        while !display_tx_is_empty() {
+            if !display_flush_blocking_one() {
+                break;
+            }
+        }
     }
 }
 
@@ -257,13 +270,13 @@ unsafe fn display_tx_enqueue(data: &[u8]) {
             if display_tx_is_full() {
                 display_try_flush();
                 if display_tx_is_full() && !display_flush_blocking_one() {
-                    break;
+                    return;
                 }
             }
 
             let free = display_tx_free();
             if free == 0 {
-                break;
+                continue;
             }
 
             let count = core::cmp::min(free, data.len() - offset);
@@ -313,7 +326,7 @@ unsafe fn display_flush_blocking_one() -> bool {
             *dst.add(i) = *b;
         }
 
-        let err = ipc::nbsend_ctx(ipc_ctx(), CAP_DISPLAY_EP, &raw const msg);
+        let err = ipc::send_ctx(ipc_ctx(), CAP_DISPLAY_EP, &raw const msg);
         if err == 0 {
             display_tx_consume(len);
             true
@@ -356,24 +369,32 @@ unsafe fn display_try_flush() {
     }
 }
 
-/// Forward raw input bytes to ttyd via non-blocking send (TTYD_INPUT_EVENT).
-/// Non-blocking to prevent console from stalling on TTYD backpressure,
-/// which would block IRQ draining and cause input hangs.
+/// Forward raw input bytes to ttyd in bounded chunks.
+/// Uses nbsend first, then applies blocking backpressure if ttyd is saturated.
 fn forward_to_ttyd(raw: &[u8], raw_len: usize) {
     if raw_len == 0 { return; }
-    let mut fwd = BesaltMsg::zeroed();
-    fwd.label = TTYD_INPUT_EVENT;
-    fwd.regs[0] = raw_len as u64;
-    fwd.length = 1 + ((raw_len as u64 + 7) / 8);
-    let dst = &raw mut fwd.regs[1] as *mut u8;
-    unsafe {
-        for i in 0..raw_len {
-            *dst.add(i) = raw[i];
+    let mut offset = 0usize;
+    while offset < raw_len {
+        let chunk_len = core::cmp::min(raw_len - offset, 128);
+        let mut fwd = BesaltMsg::zeroed();
+        fwd.label = TTYD_INPUT_EVENT;
+        fwd.regs[0] = chunk_len as u64;
+        fwd.length = 1 + ((chunk_len as u64 + 7) / 8);
+        let dst = &raw mut fwd.regs[1] as *mut u8;
+        unsafe {
+            for i in 0..chunk_len {
+                *dst.add(i) = raw[offset + i];
+            }
+            let mut err = ipc::nbsend_ctx(ipc_ctx(), CAP_TTYD_EP, &raw const fwd);
+            if err != 0 {
+                err = ipc::send_ctx(ipc_ctx(), CAP_TTYD_EP, &raw const fwd);
+            }
+            if err != 0 {
+                serial::serial_puts(b"[CONSOLE] FAIL: ttyd input send failed\n");
+                return;
+            }
         }
-        let err = ipc::nbsend_ctx(ipc_ctx(), CAP_TTYD_EP, &raw const fwd);
-        if err != 0 {
-            serial::serial_puts(b"[CONSOLE] WARN: ttyd input dropped\n");
-        }
+        offset += chunk_len;
     }
 }
 
@@ -387,6 +408,7 @@ unsafe fn handle_write(msg: *const BesaltMsg) {
         );
         console_puts(data);
         display_write(data);
+        display_flush_blocking_all();
     }
 }
 
