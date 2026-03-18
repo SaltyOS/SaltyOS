@@ -2,7 +2,7 @@
 //! IPC request handlers for PTY operations.
 
 use besalt::consts::*;
-use besalt::serial;
+
 use besalt::types::*;
 
 use crate::types::*;
@@ -118,16 +118,16 @@ pub unsafe fn handle_pty_write(msg: &BesaltMsg, reply: &mut BesaltMsg) {
                     buf_len += 1;
                 }
             }
-            serial::serial_puts(&buf[..buf_len]);
             crate::display_write(&buf[..buf_len]);
+            crate::serial_write_queued(&buf[..buf_len]);
         } else {
             // No OPOST: raw output
             let mut buf = [0u8; 152];
             for i in 0..count {
                 buf[i] = *src.add(i);
             }
-            serial::serial_puts(&buf[..count]);
             crate::display_write(&buf[..count]);
+            crate::serial_write_queued(&buf[..count]);
         }
 
         reply.label = BESALT_OK;

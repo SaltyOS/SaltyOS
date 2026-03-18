@@ -850,7 +850,7 @@ unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut BesaltMsg, badge: *mut u64) {
                 *badge = 1;
                 return;
             }
-            let timeout = deadline.saturating_sub(now).max(1_000_000); // min 1ms
+            let timeout = deadline.saturating_sub(now).max(100_000); // min 100us
             let r = besalt::syscall::syscall(
                 SYS_RECV_TIMED,
                 CAP_SERVER_EP,

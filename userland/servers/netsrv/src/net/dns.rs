@@ -689,8 +689,15 @@ fn send_query_for_slot(slot: &PendingDns) {
         DnsQueryType::Ptr => build_ptr_query(slot.ptr_ip, slot.txn_id, &mut query_buf),
     };
     if query_len > 0 {
-        let our_mac = crate::mac_addr();
-        super::ensure_arp(&our_mac, super::ipv4::OUR_IP, DNS_SERVER_IP);
+        let next_hop = super::ipv4::route(DNS_SERVER_IP);
+        if super::arp::lookup(next_hop).is_none() {
+            // ARP entry missing — send request and skip this attempt.
+            // The retry timer will re-invoke send_query_for_slot after
+            // the ARP reply has been processed by the event loop.
+            let our_mac = crate::mac_addr();
+            super::arp::request(&our_mac, super::ipv4::OUR_IP, next_hop);
+            return;
+        }
         super::udp::udp_sendto(socket_id as u32, &query_buf[..query_len], DNS_SERVER_IP, DNS_PORT);
     }
 }

@@ -11,7 +11,7 @@
 //!
 //! Output flow:
 //!   bash write → VFS → TTYD_PTY_WRITE → OPOST processing →
-//!   serial (DebugPutStr) + display (nbsend)
+//!   serial (DebugPutStr) + display (queued IPC with blocking fallback)
 
 #![no_std]
 #![no_main]
@@ -39,11 +39,21 @@ pub(crate) static mut PTYS: [PtyInstance; MAX_PTYS] = {
     [INIT; MAX_PTYS]
 };
 
-// Non-blocking display TX queue. Keeps ttyd responsive even if display EP
-// is temporarily back-pressured.
+// Display TX queue. Fast path is non-blocking; under sustained backpressure
+// we fall back to blocking flushes rather than dropping bytes and corrupting
+// the terminal escape stream.
 static mut DISPLAY_TX_BUF: [u8; DISPLAY_TX_BUF_SIZE] = [0; DISPLAY_TX_BUF_SIZE];
 static mut DISPLAY_TX_HEAD: usize = 0;
 static mut DISPLAY_TX_TAIL: usize = 0;
+
+// Serial TX queue. Decouples UART busy-wait from the event loop — data is
+// enqueued here and drained in small chunks (SERIAL_TX_DRAIN_MAX bytes per
+// loop iteration) so TTYD remains responsive during large writes.
+const SERIAL_TX_BUF_SIZE: usize = 4096;
+const SERIAL_TX_DRAIN_MAX: usize = 64;
+static mut SERIAL_TX_BUF: [u8; SERIAL_TX_BUF_SIZE] = [0; SERIAL_TX_BUF_SIZE];
+static mut SERIAL_TX_HEAD: usize = 0;
+static mut SERIAL_TX_TAIL: usize = 0;
 
 // ======================================================================
 // Helper functions
@@ -61,7 +71,9 @@ fn signal_ready() {
     let _ = besalt::syscall::syscall(besalt::SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
-/// Forward output bytes to the display server via nbsend (fire-and-forget).
+/// Forward output bytes to the display server.
+/// Uses a queued nbsend fast path and blocking flush fallback to preserve
+/// terminal stream ordering under display backpressure.
 pub(crate) fn display_write(data: &[u8]) {
     if data.is_empty() { return; }
     unsafe {
@@ -80,15 +92,38 @@ unsafe fn display_tx_is_full() -> bool {
     unsafe { ((DISPLAY_TX_HEAD + 1) % DISPLAY_TX_BUF_SIZE) == DISPLAY_TX_TAIL }
 }
 
+#[inline(always)]
+unsafe fn display_tx_len() -> usize {
+    unsafe { (DISPLAY_TX_HEAD + DISPLAY_TX_BUF_SIZE - DISPLAY_TX_TAIL) % DISPLAY_TX_BUF_SIZE }
+}
+
+#[inline(always)]
+unsafe fn display_tx_free() -> usize {
+    unsafe { DISPLAY_TX_BUF_SIZE - 1 - display_tx_len() }
+}
+
 unsafe fn display_tx_enqueue(data: &[u8]) {
     unsafe {
-        for &b in data {
+        let mut offset = 0usize;
+        while offset < data.len() {
             if display_tx_is_full() {
-                // Drop oldest byte to keep forward progress without blocking.
-                DISPLAY_TX_TAIL = (DISPLAY_TX_TAIL + 1) % DISPLAY_TX_BUF_SIZE;
+                display_try_flush();
+                if display_tx_is_full() && !display_flush_blocking_one() {
+                    break;
+                }
             }
-            DISPLAY_TX_BUF[DISPLAY_TX_HEAD] = b;
-            DISPLAY_TX_HEAD = (DISPLAY_TX_HEAD + 1) % DISPLAY_TX_BUF_SIZE;
+
+            let free = display_tx_free();
+            if free == 0 {
+                break;
+            }
+
+            let count = core::cmp::min(free, data.len() - offset);
+            for i in 0..count {
+                DISPLAY_TX_BUF[DISPLAY_TX_HEAD] = data[offset + i];
+                DISPLAY_TX_HEAD = (DISPLAY_TX_HEAD + 1) % DISPLAY_TX_BUF_SIZE;
+            }
+            offset += count;
         }
     }
 }
@@ -113,10 +148,36 @@ unsafe fn display_tx_consume(n: usize) {
     }
 }
 
+unsafe fn display_flush_blocking_one() -> bool {
+    unsafe {
+        let mut chunk = [0u8; DISPLAY_TX_CHUNK_MAX];
+        let len = display_tx_peek_chunk(&mut chunk);
+        if len == 0 {
+            return true;
+        }
+
+        let mut msg = BesaltMsg::zeroed();
+        msg.label = DISPLAY_TERMINAL_WRITE;
+        msg.regs[0] = len as u64;
+        msg.length = 1 + ((len as u64 + 7) / 8);
+        let dst = &raw mut msg.regs[1] as *mut u8;
+        for (i, b) in chunk[..len].iter().enumerate() {
+            *dst.add(i) = *b;
+        }
+
+        let err = ipc::nbsend_ctx(ipc_ctx(), CAP_DISPLAY_EP, &raw const msg);
+        if err == 0 {
+            display_tx_consume(len);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 unsafe fn display_try_flush() {
     unsafe {
         let mut chunk = [0u8; DISPLAY_TX_CHUNK_MAX];
-        let mut would_block_retries = 0usize;
         loop {
             if display_tx_is_empty() {
                 break;
@@ -139,17 +200,58 @@ unsafe fn display_try_flush() {
             let err = ipc::nbsend_ctx(ipc_ctx(), CAP_DISPLAY_EP, &raw const msg);
             if err == 0 {
                 display_tx_consume(len);
-                would_block_retries = 0;
                 continue;
             }
-            if err == BESALT_WOULD_BLOCK as i32 && would_block_retries < 8 {
-                let _ = besalt::syscall::syscall(besalt::SYS_NANOSLEEP, 0, 500_000, 0, 0, 0, 0);
-                would_block_retries += 1;
-                continue;
-            }
-            // Back-pressured or temporarily unavailable: keep queued and retry
-            // on next event loop turn.
+            // Backpressure — keep queued, try again next event loop turn.
             break;
+        }
+    }
+}
+
+// ======================================================================
+// Serial TX ring buffer helpers
+// ======================================================================
+
+/// Queue bytes for deferred serial output.
+pub(crate) fn serial_write_queued(data: &[u8]) {
+    unsafe {
+        for &b in data {
+            let next = (SERIAL_TX_HEAD + 1) % SERIAL_TX_BUF_SIZE;
+            if next == SERIAL_TX_TAIL {
+                // Buffer full — drain synchronously to avoid dropping bytes
+                serial_try_flush();
+                let next2 = (SERIAL_TX_HEAD + 1) % SERIAL_TX_BUF_SIZE;
+                if next2 == SERIAL_TX_TAIL {
+                    // Still full after flush — write directly as fallback
+                    serial::serial_puts(&data[..]);
+                    return;
+                }
+            }
+            SERIAL_TX_BUF[SERIAL_TX_HEAD] = b;
+            SERIAL_TX_HEAD = (SERIAL_TX_HEAD + 1) % SERIAL_TX_BUF_SIZE;
+        }
+    }
+}
+
+/// Drain up to SERIAL_TX_DRAIN_MAX bytes from the serial TX queue.
+/// Called once per event loop iteration to keep TTYD responsive.
+unsafe fn serial_try_flush() {
+    unsafe {
+        if SERIAL_TX_HEAD == SERIAL_TX_TAIL {
+            return;
+        }
+
+        let mut buf = [0u8; SERIAL_TX_DRAIN_MAX];
+        let mut n = 0usize;
+        let mut idx = SERIAL_TX_TAIL;
+        while idx != SERIAL_TX_HEAD && n < SERIAL_TX_DRAIN_MAX {
+            buf[n] = SERIAL_TX_BUF[idx];
+            idx = (idx + 1) % SERIAL_TX_BUF_SIZE;
+            n += 1;
+        }
+        if n > 0 {
+            serial::serial_puts(&buf[..n]);
+            SERIAL_TX_TAIL = (SERIAL_TX_TAIL + n) % SERIAL_TX_BUF_SIZE;
         }
     }
 }
@@ -271,6 +373,7 @@ pub extern "C" fn _start() -> ! {
 
     loop {
         unsafe { display_try_flush(); }
+        unsafe { serial_try_flush(); }
 
         let mut reply = BesaltMsg::zeroed();
         let mut skip_reply = false;
@@ -290,6 +393,7 @@ pub extern "C" fn _start() -> ! {
             }
             TTYD_PTY_WRITE => {
                 unsafe { handlers::handle_pty_write(&msg, &mut reply) };
+                unsafe { display_try_flush(); }
             }
             TTYD_PTY_TCGETATTR => {
                 unsafe { handlers::handle_pty_tcgetattr(&msg, &mut reply) };
