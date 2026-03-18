@@ -36,6 +36,11 @@ impl FastpathResult {
     }
 }
 
+#[inline(always)]
+unsafe fn fastpath_waiter_is_unowned(tcb: *mut Tcb) -> bool {
+    unsafe { !tcb.is_null() && (*tcb).run_owner().is_none() }
+}
+
 /// Fastpath for Call syscall (syscall number 2).
 ///
 /// Conditions for fastpath (bail to slowpath if ANY fails):
@@ -43,7 +48,7 @@ impl FastpathResult {
 /// - length <= 4
 /// - Valid Endpoint cap with CALL right
 /// - Receiver is waiting (RecvBlocked)
-/// - Same CPU (no cross-CPU IPI needed)
+/// - Receiver has fully switched out on its previous CPU
 /// - Valid VSpace and kernel stack on receiver
 ///
 /// # Register mapping at call site (from assembly):
@@ -67,13 +72,8 @@ pub unsafe extern "C" fn fastpath_call_rust(
         return FastpathResult::slowpath();
     }
 
-    // Bail if process uses multi-level CNode tree (fastpath only supports flat mode)
-    unsafe {
-        let current_tcb = crate::sched::scheduler::scheduler().current();
-        if !current_tcb.is_null() && (*current_tcb).cspace_depth != 0 {
-            return FastpathResult::slowpath();
-        }
-    }
+    // lookup_capability() handles both flat (depth==0) and multi-level
+    // (depth!=0) CSpaces — no need to bail on cspace_depth here.
 
     // Locked cap lookup: copy to stack under CAP_LOCK to prevent torn reads.
     // CAP_LOCK is released BEFORE per-object lock is acquired (no ordering change).
@@ -119,6 +119,13 @@ pub unsafe extern "C" fn fastpath_call_rust(
             }
         };
 
+        if !fastpath_waiter_is_unowned(receiver) {
+            endpoint.fastpath_push_recv(receiver);
+            endpoint.ep_unlock();
+            restore_irq(irq);
+            return FastpathResult::slowpath();
+        }
+
         let this_cpu = crate::arch::current_cpu() as usize;
         let recv_affinity = (*receiver).cpu_affinity;
         if recv_affinity != 0xFFFF_FFFF && recv_affinity != this_cpu as u32 {
@@ -144,15 +151,9 @@ pub unsafe extern "C" fn fastpath_call_rust(
             return FastpathResult::slowpath();
         }
 
-        sched.lock();
-        let receiver_pending_cpu = sched.pending_cpu_for(receiver);
-        sched.unlock();
-        if (*receiver).last_cpu != this_cpu as u32 || receiver_pending_cpu != Some(this_cpu) {
-            endpoint.fastpath_push_recv(receiver);
-            endpoint.ep_unlock();
-            restore_irq(irq);
-            return FastpathResult::slowpath();
-        }
+        // Cross-CPU steal is safe once the waiter is unowned: the previous CPU
+        // has already saved its context and dropped run ownership, so we can
+        // install it as current here without racing another core's switch-out.
 
         Endpoint::cache_receive_slot(current);
 
@@ -248,13 +249,8 @@ pub unsafe extern "C" fn fastpath_reply_recv_rust(
         return FastpathResult::slowpath();
     }
 
-    // Bail if process uses multi-level CNode tree (fastpath only supports flat mode)
-    unsafe {
-        let current_tcb = crate::sched::scheduler::scheduler().current();
-        if !current_tcb.is_null() && (*current_tcb).cspace_depth != 0 {
-            return FastpathResult::slowpath();
-        }
-    }
+    // lookup_capability() handles both flat (depth==0) and multi-level
+    // (depth!=0) CSpaces — no need to bail on cspace_depth here.
 
     // Locked cap lookup: copy to stack under CAP_LOCK to prevent torn reads.
     let irq_cap = unsafe { save_irq_disable() };
@@ -353,6 +349,18 @@ pub unsafe extern "C" fn fastpath_reply_recv_rust(
                 return FastpathResult::slowpath();
             }
         };
+
+        if !fastpath_waiter_is_unowned(sender) {
+            endpoint.fastpath_push_send(sender);
+            endpoint.ep_unlock();
+            if !wake_caller.is_null() {
+                sched.lock();
+                sched.enqueue_unlocked(wake_caller);
+                sched.unlock();
+            }
+            restore_irq(irq);
+            return FastpathResult::slowpath();
+        }
 
         let (msg, badge, keep_blocked) = match (*sender).blocked_reason {
             Some(BlockedReason::SendBlocked { msg, badge }) => (msg, badge, false),

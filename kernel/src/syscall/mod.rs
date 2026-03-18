@@ -1723,6 +1723,59 @@ fn syscall_tcb_configure(
     SyscallResult::ok(0)
 }
 
+/// Detach a blocked thread from auxiliary wait queues before changing its run state.
+///
+/// This intentionally avoids holding the scheduler lock while acquiring
+/// endpoint/notification/futex/sleep-queue locks. Wake paths take those
+/// subsystem locks first and only enqueue afterwards, so suspend/resume must
+/// follow the same order to avoid lock inversion on SMP.
+unsafe fn detach_thread_wait_queues(tcb: *mut Tcb) {
+    unsafe {
+        let blocked_reason = (*tcb).blocked_reason;
+
+        if matches!(
+            blocked_reason,
+            Some(BlockedReason::TimerBlocked)
+                | Some(BlockedReason::FutexTimedBlocked)
+                | Some(BlockedReason::SendTimedBlocked { .. })
+                | Some(BlockedReason::RecvTimedBlocked)
+        ) {
+            crate::sched::sleep_queue::remove(tcb);
+            (*tcb).timer_wakeup_ns = 0;
+        }
+
+        if !(*tcb).blocked_endpoint.is_null() {
+            let ep = &mut *((*tcb).blocked_endpoint as *mut crate::ipc::Endpoint);
+            ep.ep_lock();
+            ep.remove_from_queue(tcb);
+            ep.ep_unlock();
+            (*tcb).blocked_endpoint = core::ptr::null_mut();
+        }
+
+        if !(*tcb).blocked_notification.is_null() {
+            let ntfn = &mut *((*tcb).blocked_notification as *mut crate::ipc::Notification);
+            ntfn.remove_waiter(tcb);
+            (*tcb).blocked_notification = core::ptr::null_mut();
+        }
+
+        if matches!(
+            blocked_reason,
+            Some(BlockedReason::FutexBlocked) | Some(BlockedReason::FutexTimedBlocked)
+        ) {
+            crate::ipc::futex::futex_remove_thread(tcb);
+        }
+
+        if matches!(
+            blocked_reason,
+            Some(BlockedReason::FutexTimedBlocked)
+                | Some(BlockedReason::SendTimedBlocked { .. })
+                | Some(BlockedReason::RecvTimedBlocked)
+        ) {
+            (*tcb).futex_wakeup_result = 0;
+        }
+    }
+}
+
 /// TCB_RESUME: Make a thread runnable
 fn syscall_tcb_resume(cap: &Capability) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::RESUME) {
@@ -1744,42 +1797,13 @@ fn syscall_tcb_resume(cap: &Capability) -> SyscallResult {
             }
             ThreadState::Blocked => {
                 let scheduler = crate::sched::scheduler::scheduler();
-                scheduler.with_lock(|sched| {
-                    if matches!(tcb.blocked_reason, Some(BlockedReason::TimerBlocked)) {
-                        crate::sched::sleep_queue::remove(tcb as *mut Tcb);
-                        tcb.timer_wakeup_ns = 0;
-                    }
-                    if !tcb.blocked_endpoint.is_null() {
-                        let ep = &mut *(tcb.blocked_endpoint as *mut crate::ipc::Endpoint);
-                        ep.ep_lock();
-                        ep.remove_from_queue(tcb as *mut Tcb);
-                        ep.ep_unlock();
-                        tcb.blocked_endpoint = core::ptr::null_mut();
-                    }
-                    if !tcb.blocked_notification.is_null() {
-                        let ntfn = &mut *(tcb.blocked_notification as *mut crate::ipc::Notification);
-                        ntfn.remove_waiter(tcb as *mut Tcb);
-                        tcb.blocked_notification = core::ptr::null_mut();
-                    }
-                    if matches!(tcb.blocked_reason, Some(BlockedReason::FutexBlocked)) {
-                        crate::ipc::futex::futex_remove_thread(tcb as *mut Tcb);
-                    }
-                    if matches!(tcb.blocked_reason, Some(BlockedReason::FutexTimedBlocked)) {
-                        crate::ipc::futex::futex_remove_thread(tcb as *mut Tcb);
-                        crate::sched::sleep_queue::remove(tcb as *mut Tcb);
-                        tcb.timer_wakeup_ns = 0;
-                        tcb.futex_wakeup_result = 0;
-                    }
-                    tcb.blocked_reason = None;
-                    sched.enqueue_unlocked(tcb as *mut Tcb);
-                });
+                detach_thread_wait_queues(tcb as *mut Tcb);
+                tcb.blocked_reason = None;
+                scheduler.enqueue(tcb as *mut Tcb);
             }
             ThreadState::Waiting => {
-                if !tcb.blocked_notification.is_null() {
-                    let ntfn = &mut *(tcb.blocked_notification as *mut crate::ipc::Notification);
-                    ntfn.remove_waiter(tcb as *mut Tcb);
-                    tcb.blocked_notification = core::ptr::null_mut();
-                }
+                detach_thread_wait_queues(tcb as *mut Tcb);
+                tcb.blocked_reason = None;
                 let scheduler = crate::sched::scheduler::scheduler();
                 scheduler.enqueue(tcb as *mut Tcb);
             }
@@ -1841,59 +1865,47 @@ fn syscall_tcb_suspend(cap: &Capability) -> SyscallResult {
                                 return SyscallResult::err(SyscallError::Busy);
                             }
                         }
+                        let irq = save_irq_disable();
+                        tcb.tcb_lock();
+                        scheduler.cancel_pending_enqueue(tcb as *mut Tcb);
+                        scheduler.remove_from_ready_queue(tcb as *mut Tcb);
+                        detach_thread_wait_queues(tcb as *mut Tcb);
+                        tcb.tcb_unlock();
+                        restore_irq(irq);
                         return SyscallResult::ok(0);
                     }
                     None => {
-                        // Thread already descheduled (raced with yield/block)
+                        // Thread already descheduled (raced with yield/block).
+                        // Fall through to common inactive cleanup below.
                     }
                 }
+
+                scheduler.cancel_pending_enqueue(tcb as *mut Tcb);
+                scheduler.remove_from_ready_queue(tcb as *mut Tcb);
+                detach_thread_wait_queues(tcb as *mut Tcb);
             }
             ThreadState::Ready => {
+                scheduler.cancel_pending_enqueue(tcb as *mut Tcb);
                 scheduler.remove_from_ready_queue(tcb as *mut Tcb);
                 tcb.state = ThreadState::Inactive;
             }
             ThreadState::Blocked => {
-                scheduler.with_lock(|_sched| {
-                    if matches!(tcb.blocked_reason, Some(BlockedReason::TimerBlocked)) {
-                        crate::sched::sleep_queue::remove(tcb as *mut Tcb);
-                        tcb.timer_wakeup_ns = 0;
-                    }
-                    if !tcb.blocked_endpoint.is_null() {
-                        let ep = &mut *(tcb.blocked_endpoint as *mut crate::ipc::Endpoint);
-                        ep.ep_lock();
-                        ep.remove_from_queue(tcb as *mut Tcb);
-                        ep.ep_unlock();
-                        tcb.blocked_endpoint = core::ptr::null_mut();
-                    }
-                    if !tcb.blocked_notification.is_null() {
-                        let ntfn = &mut *(tcb.blocked_notification as *mut crate::ipc::Notification);
-                        ntfn.remove_waiter(tcb as *mut Tcb);
-                        tcb.blocked_notification = core::ptr::null_mut();
-                    }
-                    if matches!(tcb.blocked_reason, Some(BlockedReason::FutexBlocked)) {
-                        crate::ipc::futex::futex_remove_thread(tcb as *mut Tcb);
-                    }
-                    if matches!(tcb.blocked_reason, Some(BlockedReason::FutexTimedBlocked)) {
-                        crate::ipc::futex::futex_remove_thread(tcb as *mut Tcb);
-                        crate::sched::sleep_queue::remove(tcb as *mut Tcb);
-                        tcb.timer_wakeup_ns = 0;
-                        tcb.futex_wakeup_result = 0;
-                    }
-                    tcb.state = ThreadState::Inactive;
-                    tcb.blocked_reason = None;
-                    tcb.reply_tcb = core::ptr::null_mut();
-                    tcb.reply_can_grant = false;
-                    tcb.saved_caller_msg = crate::ipc::Message::empty();
-                    tcb.saved_caller_badge = 0;
-                });
+                scheduler.cancel_pending_enqueue(tcb as *mut Tcb);
+                detach_thread_wait_queues(tcb as *mut Tcb);
+                scheduler.remove_from_ready_queue(tcb as *mut Tcb);
+                tcb.state = ThreadState::Inactive;
+                tcb.blocked_reason = None;
+                tcb.reply_tcb = core::ptr::null_mut();
+                tcb.reply_can_grant = false;
+                tcb.saved_caller_msg = crate::ipc::Message::empty();
+                tcb.saved_caller_badge = 0;
             }
             ThreadState::Waiting => {
-                if !tcb.blocked_notification.is_null() {
-                    let ntfn = &mut *(tcb.blocked_notification as *mut crate::ipc::Notification);
-                    ntfn.remove_waiter(tcb as *mut Tcb);
-                    tcb.blocked_notification = core::ptr::null_mut();
-                }
+                scheduler.cancel_pending_enqueue(tcb as *mut Tcb);
+                detach_thread_wait_queues(tcb as *mut Tcb);
+                scheduler.remove_from_ready_queue(tcb as *mut Tcb);
                 tcb.state = ThreadState::Inactive;
+                tcb.blocked_reason = None;
             }
             ThreadState::Inactive => {}
         }
@@ -2227,22 +2239,34 @@ fn syscall_tcb_set_fault_handler(
         return SyscallResult::err(e);
     }
 
-    // Sub-lookup under CAP_LOCK
-    let ep_cap = match lookup_cap_locked(fault_ep_cap_ptr) {
-        Ok(c) => c,
-        Err(e) => return SyscallResult::err(e),
+    let fault_handler = if fault_ep_cap_ptr == 0 {
+        None
+    } else {
+        let ep_cap = match lookup_cap_locked(fault_ep_cap_ptr) {
+            Ok(c) => c,
+            Err(e) => return SyscallResult::err(e),
+        };
+        if let Err(e) = validate_capability(&ep_cap, ObjectType::Endpoint, CapRights::SEND) {
+            return SyscallResult::err(e);
+        }
+        Some((ep_cap.object as *mut u8, ep_cap.badge))
     };
-    if let Err(e) = validate_capability(&ep_cap, ObjectType::Endpoint, CapRights::SEND) {
-        return SyscallResult::err(e);
-    }
 
     // TCB mutation under per-TCB lock
     unsafe {
         let irq = save_irq_disable();
         let tcb = &mut *(cap.object as *mut Tcb);
         tcb.tcb_lock();
-        tcb.fault_handler = ep_cap.object as *mut u8;
-        tcb.fault_handler_badge = ep_cap.badge;
+        match fault_handler {
+            Some((handler, badge)) => {
+                tcb.fault_handler = handler;
+                tcb.fault_handler_badge = badge;
+            }
+            None => {
+                tcb.fault_handler = core::ptr::null_mut();
+                tcb.fault_handler_badge = 0;
+            }
+        }
         tcb.tcb_unlock();
         restore_irq(irq);
     }
@@ -4048,12 +4072,21 @@ pub fn handle(
                     kbuf[i] = unsafe { core::ptr::read_volatile(user_ptr.add(i)) };
                 }
             }
-            // SAFETY: save/restore IRQ flags around spinlock
-            let irq = unsafe { save_irq_disable() };
-            crate::SERIAL_LOCK.lock();
-            crate::serial_write_hw(&kbuf[..len]);
-            crate::SERIAL_LOCK.unlock();
-            unsafe { restore_irq(irq) };
+            // Write in 32-byte chunks, re-enabling IRQs between chunks.
+            // This caps IRQ-disabled time to ~2.8ms per chunk (at 115200 baud)
+            // instead of ~22ms for a full 256-byte buffer, allowing timer ticks
+            // and IPIs to interleave with serial output.
+            let mut off = 0;
+            while off < len {
+                let end = if off + 32 < len { off + 32 } else { len };
+                // SAFETY: save/restore IRQ flags around spinlock
+                let irq = unsafe { save_irq_disable() };
+                crate::SERIAL_LOCK.lock();
+                crate::serial_write_hw(&kbuf[off..end]);
+                crate::SERIAL_LOCK.unlock();
+                unsafe { restore_irq(irq) };
+                off = end;
+            }
             SyscallResult::ok(0)
         }
         Syscall::ClockGetTime => syscall_clock_gettime(cap_ptr),
