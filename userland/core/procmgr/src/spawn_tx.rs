@@ -2429,6 +2429,23 @@ pub(crate) fn register_with_mmsrv(pid: u32, vspace_cap: Cap, heap_base: u64, mma
     }
 }
 
+pub(crate) fn clear_fault_handler(tcb_cap: Cap, pid: u32) {
+    if tcb_cap == 0 {
+        return;
+    }
+
+    let err = besalt::invoke::tcb_set_fault_handler(tcb_cap, 0);
+    if err != 0 {
+        let mut lb = LineBuf::new();
+        lb.str(b"[PROCMGR] WARN: clear fault handler failed pid=");
+        lb.hex(pid as u64);
+        lb.str(b" err=");
+        lb.hex(err as u64);
+        lb.str(b"\n");
+        lb.flush();
+    }
+}
+
 /// Deregister a process from mmsrv on spawn failure.
 pub(crate) fn deregister_from_mmsrv(pid: u32) {
     let mut msg = BesaltMsg::zeroed();
@@ -3281,6 +3298,7 @@ pub unsafe fn handle_spawn_tx(
                 proc_table::proctab(slot_idx).cnode_cap = 0;
                 proc_table::proctab(slot_idx).pid = 0;
                 proc_table::proctab(slot_idx).badge = 0;
+                clear_fault_handler(child_tcb, pid);
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
                 reply.label = BESALT_BUSY;

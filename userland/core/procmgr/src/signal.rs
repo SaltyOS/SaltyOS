@@ -40,7 +40,8 @@ unsafe fn sig_stop_proc(idx: usize, sig: usize) {
             return;
         }
 
-        besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 16);
+        let _ = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 64);
+        besalt::syscall::syscall(besalt::SYS_YIELD, 0, 0, 0, 0, 0, 0);
         proctab(idx).state = PROC_STOPPED;
         proctab(idx).stop_status = ((sig as i32) << 8) | 0x7f;
 
@@ -70,22 +71,29 @@ pub(crate) unsafe fn terminate_proc(idx: usize, sig: usize) {
             lb.flush();
         }
 
-        let susp_err = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 16);
+        let susp_err = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 64);
         if susp_err != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] WARN: tcb_suspend failed in terminate PID=");
-            lb.hex(proctab(idx).pid as u64);
-            lb.str(b"\n");
-            lb.flush();
+            // Last resort: nanosleep to let the target CPU's IRQ window
+            // open (ep_lock/ntfn_lock hold IRQs off, delaying IPI delivery).
+            besalt::syscall::syscall(besalt::SYS_NANOSLEEP, 2_000_000, 0, 0, 0, 0, 0);
+            let _ = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 64);
         }
+        // Yield to ensure the target CPU has fully completed the context
+        // switch and all memory operations from the stopped thread are
+        // visible before we free its resources.
+        besalt::syscall::syscall(besalt::SYS_YIELD, 0, 0, 0, 0, 0, 0);
 
         // Deregister from mmsrv so it stops processing faults for this process
         if proctab(idx).mmsrv_registered {
+            let tcb_cap = proctab(idx).tcb_cap;
+            let pid = proctab(idx).pid;
+            let badge = proctab(idx).badge;
+            super::spawn_tx::clear_fault_handler(tcb_cap, pid);
             let mut mm_msg = BesaltMsg::zeroed();
             let mut mm_reply = BesaltMsg::zeroed();
             mm_msg.label = besalt::consts::MM_DEREGISTER;
             mm_msg.length = 1;
-            mm_msg.regs[0] = proctab(idx).badge;
+            mm_msg.regs[0] = badge;
             let _ = besalt::ipc::call_ctx(
                 super::ipc_ctx(),
                 super::CAP_MMSRV_EP,
@@ -406,6 +414,8 @@ pub(crate) unsafe fn handle_resume(msg: &BesaltMsg, reply: &mut BesaltMsg) {
             ) != 0
             {
                 let pid = proctab(idx).pid;
+                let tcb_cap = proctab(idx).tcb_cap;
+                super::spawn_tx::clear_fault_handler(tcb_cap, pid);
                 super::spawn_tx::deregister_from_mmsrv(pid);
                 free_proc_alloc_slots(idx);
                 cleanup_proc_resources(idx, super::CAP_SELF_CSPACE);
