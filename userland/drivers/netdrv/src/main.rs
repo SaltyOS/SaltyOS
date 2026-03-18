@@ -214,8 +214,8 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
 
 /// Enqueue a received Ethernet frame into the SHM RX ring for netsrv.
 ///
-/// Returns true if the frame was enqueued, false if the ring is full or SHM
-/// is not yet mapped.
+/// Applies sender-side backpressure when the shared ring is full so frames are
+/// not silently dropped under SMP burst load.
 fn shm_rx_enqueue(frame: &[u8]) -> bool {
     // SAFETY: SHM_BASE is set once during DRIVER_REGISTER before any enqueue
     // calls. Single-threaded driver. All pointer arithmetic is within the
@@ -226,24 +226,31 @@ fn shm_rx_enqueue(frame: &[u8]) -> bool {
             return false;
         }
         let hdr = base as *mut u32;
-        let rx_head = *hdr.add(0);
-        let rx_tail = core::ptr::read_volatile(hdr.add(1));
-        let slot_count = core::ptr::read_volatile(hdr.add(4)); // offset 0x10
-        let next = (rx_head + 1) % slot_count;
-        if next == rx_tail {
-            return false;
-        }
-
-        let slot_base = base + 0x1000 + (rx_head as u64) * 2048;
         let len = core::cmp::min(frame.len(), 1998);
-        let len_ptr = slot_base as *mut u16;
-        *len_ptr = len as u16;
-        let data_ptr = (slot_base + 2) as *mut u8;
-        core::ptr::copy_nonoverlapping(frame.as_ptr(), data_ptr, len);
+        loop {
+            let rx_head = *hdr.add(0);
+            let rx_tail = core::ptr::read_volatile(hdr.add(1));
+            let slot_count = core::ptr::read_volatile(hdr.add(4)); // offset 0x10
+            if slot_count == 0 {
+                return false;
+            }
+            let next = (rx_head + 1) % slot_count;
+            if next == rx_tail {
+                signal_netsrv_rx();
+                let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+                continue;
+            }
 
-        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-        core::ptr::write_volatile(hdr.add(0), next);
-        true
+            let slot_base = base + 0x1000 + (rx_head as u64) * 2048;
+            let len_ptr = slot_base as *mut u16;
+            *len_ptr = len as u16;
+            let data_ptr = (slot_base + 2) as *mut u8;
+            core::ptr::copy_nonoverlapping(frame.as_ptr(), data_ptr, len);
+
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            core::ptr::write_volatile(hdr.add(0), next);
+            return true;
+        }
     }
 }
 
