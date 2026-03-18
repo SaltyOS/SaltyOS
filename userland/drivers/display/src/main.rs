@@ -24,6 +24,9 @@ use besalt::types::*;
 
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 const FB_MAP_VADDR: u64 = 0x0000_0000_3000_0000;
+const MAX_DAMAGE_SCANLINES: usize = 8192;
+const DAMAGE_WORD_BITS: usize = 64;
+const DAMAGE_WORDS: usize = MAX_DAMAGE_SCANLINES / DAMAGE_WORD_BITS;
 
 // slot 3 is kept as procmgr EP for slot_alloc expansion; display service EP is separate.
 const CAP_SELF_TCB: u64 = 0;
@@ -76,6 +79,7 @@ struct DisplayState {
     csi_parser: vt100::CsiParser,
     damage_min_y: u32,
     damage_max_y: u32,
+    damage_rows: [u64; DAMAGE_WORDS],
     // Alternate screen buffer
     alt_shadow: *mut u8,
     alt_active: bool,
@@ -251,11 +255,25 @@ fn pack_color(r: u8, g: u8, b: u8, rp: u8, gp: u8, bp: u8) -> u32 {
 }
 
 fn mark_damage(state: &mut DisplayState, y_start: u32, y_end: u32) {
-    if y_start < state.damage_min_y {
-        state.damage_min_y = y_start;
+    let start = if y_start > state.height { state.height } else { y_start };
+    let end = if y_end > state.height { state.height } else { y_end };
+    if start >= end {
+        return;
     }
-    if y_end > state.damage_max_y {
-        state.damage_max_y = y_end;
+    if start < state.damage_min_y {
+        state.damage_min_y = start;
+    }
+    if end > state.damage_max_y {
+        state.damage_max_y = end;
+    }
+
+    let mut row = start as usize;
+    let end_row = end as usize;
+    while row < end_row && row < MAX_DAMAGE_SCANLINES {
+        let word = row / DAMAGE_WORD_BITS;
+        let bit = row % DAMAGE_WORD_BITS;
+        state.damage_rows[word] |= 1u64 << bit;
+        row += 1;
     }
 }
 
@@ -369,16 +387,46 @@ fn flush_damage(state: &mut DisplayState) {
     } else {
         state.damage_max_y
     };
-    let start_offset = min_y as usize * state.pitch as usize;
-    let end_offset = max_y as usize * state.pitch as usize;
-    let len = end_offset - start_offset;
-    // SAFETY: Both shadow and vram are mapped with sufficient size.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            state.shadow.add(start_offset),
-            state.vram.add(start_offset),
-            len,
-        );
+    let pitch = state.pitch as usize;
+    let mut row = min_y as usize;
+    let max_row = max_y as usize;
+    while row < max_row && row < MAX_DAMAGE_SCANLINES {
+        let word = row / DAMAGE_WORD_BITS;
+        let bit = row % DAMAGE_WORD_BITS;
+        if (state.damage_rows[word] & (1u64 << bit)) == 0 {
+            row += 1;
+            continue;
+        }
+
+        let run_start = row;
+        row += 1;
+        while row < max_row && row < MAX_DAMAGE_SCANLINES {
+            let word = row / DAMAGE_WORD_BITS;
+            let bit = row % DAMAGE_WORD_BITS;
+            if (state.damage_rows[word] & (1u64 << bit)) == 0 {
+                break;
+            }
+            row += 1;
+        }
+
+        let start_offset = run_start * pitch;
+        let len = (row - run_start) * pitch;
+        // SAFETY: Both shadow and vram are mapped with sufficient size.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                state.shadow.add(start_offset),
+                state.vram.add(start_offset),
+                len,
+            );
+        }
+    }
+
+    let mut clear_row = min_y as usize;
+    while clear_row < max_row && clear_row < MAX_DAMAGE_SCANLINES {
+        let word = clear_row / DAMAGE_WORD_BITS;
+        let bit = clear_row % DAMAGE_WORD_BITS;
+        state.damage_rows[word] &= !(1u64 << bit);
+        clear_row += 1;
     }
     state.damage_min_y = state.height;
     state.damage_max_y = 0;
@@ -1389,6 +1437,7 @@ pub extern "C" fn _start() -> ! {
         csi_parser: vt100::CsiParser::new(),
         damage_min_y: fb.height,
         damage_max_y: 0,
+        damage_rows: [0; DAMAGE_WORDS],
         alt_shadow: core::ptr::null_mut(),
         alt_active: false,
         primary_col: 0,
@@ -1484,6 +1533,7 @@ pub extern "C" fn _start() -> ! {
         if msg.label == DISPLAY_TERMINAL_WRITE {
             loop {
                 handle_terminal_write(&mut state, &msg);
+                flush_damage(&mut state);
 
                 let timed_err = unsafe {
                     recv_timed_ctx(
