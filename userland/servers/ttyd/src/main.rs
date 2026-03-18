@@ -40,8 +40,8 @@ pub(crate) static mut PTYS: [PtyInstance; MAX_PTYS] = {
 };
 
 // Display TX queue. Fast path is non-blocking; under sustained backpressure
-// we fall back to blocking flushes rather than dropping bytes and corrupting
-// the terminal escape stream.
+// we apply real sender-side backpressure rather than dropping bytes and
+// corrupting the terminal escape stream.
 static mut DISPLAY_TX_BUF: [u8; DISPLAY_TX_BUF_SIZE] = [0; DISPLAY_TX_BUF_SIZE];
 static mut DISPLAY_TX_HEAD: usize = 0;
 static mut DISPLAY_TX_TAIL: usize = 0;
@@ -72,13 +72,26 @@ fn signal_ready() {
 }
 
 /// Forward output bytes to the display server.
-/// Uses a queued nbsend fast path and blocking flush fallback to preserve
-/// terminal stream ordering under display backpressure.
+/// Uses a queued nbsend fast path and a true blocking send fallback to
+/// preserve terminal stream ordering under display backpressure.
 pub(crate) fn display_write(data: &[u8]) {
     if data.is_empty() { return; }
     unsafe {
         display_tx_enqueue(data);
         display_try_flush();
+        if !display_tx_is_empty() {
+            let _ = display_flush_blocking_one();
+        }
+    }
+}
+
+pub(crate) unsafe fn display_flush_blocking_all() {
+    unsafe {
+        while !display_tx_is_empty() {
+            if !display_flush_blocking_one() {
+                break;
+            }
+        }
     }
 }
 
@@ -109,13 +122,13 @@ unsafe fn display_tx_enqueue(data: &[u8]) {
             if display_tx_is_full() {
                 display_try_flush();
                 if display_tx_is_full() && !display_flush_blocking_one() {
-                    break;
+                    return;
                 }
             }
 
             let free = display_tx_free();
             if free == 0 {
-                break;
+                continue;
             }
 
             let count = core::cmp::min(free, data.len() - offset);
@@ -165,7 +178,7 @@ unsafe fn display_flush_blocking_one() -> bool {
             *dst.add(i) = *b;
         }
 
-        let err = ipc::nbsend_ctx(ipc_ctx(), CAP_DISPLAY_EP, &raw const msg);
+        let err = ipc::send_ctx(ipc_ctx(), CAP_DISPLAY_EP, &raw const msg);
         if err == 0 {
             display_tx_consume(len);
             true
@@ -393,7 +406,7 @@ pub extern "C" fn _start() -> ! {
             }
             TTYD_PTY_WRITE => {
                 unsafe { handlers::handle_pty_write(&msg, &mut reply) };
-                unsafe { display_try_flush(); }
+                unsafe { display_flush_blocking_all(); }
             }
             TTYD_PTY_TCGETATTR => {
                 unsafe { handlers::handle_pty_tcgetattr(&msg, &mut reply) };

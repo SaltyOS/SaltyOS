@@ -14,7 +14,7 @@ pub const CAP_SERVER_EP: u64 = 68;
 pub const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 // Buffer sizes and limits
-pub const RING_SIZE: usize = 4096;
+pub const RING_SIZE: usize = 16384;
 pub const LINE_BUF_SIZE: usize = 256;
 pub const MAX_PTYS: usize = 4;
 pub const DISPLAY_TX_BUF_SIZE: usize = 16384;
@@ -165,6 +165,8 @@ pub struct PtyInstance {
     pub active: bool,
     // Slave-side input ring (data from keyboard -> line disc -> here -> bash reads)
     pub slave_ring: RingBuf,
+    // Overflow ring used when the primary slave ring is temporarily full.
+    pub spill_ring: RingBuf,
     // Canonical mode line accumulator
     pub line: InputLineBuf,
     // Per-PTY termios
@@ -185,6 +187,7 @@ impl PtyInstance {
         PtyInstance {
             active: false,
             slave_ring: RingBuf::new(),
+            spill_ring: RingBuf::new(),
             line: InputLineBuf::new(),
             termios: PtyTermios::default(),
             has_ctty: false,
