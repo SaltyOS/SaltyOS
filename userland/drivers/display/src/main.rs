@@ -33,6 +33,7 @@ const CAP_MMSRV_EP: u64 = 7;
 const CAP_FB_UNTYPED: u64 = 13;   // Standard well-known slot (consts::CAP_FB_UNTYPED)
 const CAP_READINESS_NTFN: u64 = 14;
 const CAP_SERVER_EP: u64 = 68;    // Pre-created display service EP (injected by procmgr)
+const TERMINAL_BATCH_TIMEOUT_NS: u64 = 1_000_000;
 
 struct DisplayState {
     vram: *mut u8,
@@ -217,6 +218,28 @@ fn idle() -> ! {
 
 fn ipc_ctx() -> *mut IpcContext {
     &raw mut besalt::__besalt_ipc_ctx
+}
+
+unsafe fn recv_timed_ctx(
+    ctx: *mut IpcContext,
+    ep: Cap,
+    timeout_ns: u64,
+    msg: *mut BesaltMsg,
+    badge: *mut u64,
+) -> i32 {
+    let r = syscall(SYS_RECV_TIMED, ep, timeout_ns, 0, 0, 0, 0);
+    if r.error == 0 {
+        unsafe {
+            if !badge.is_null() {
+                *badge = r.value;
+            }
+            if !msg.is_null() && !ctx.is_null() && !(*ctx).ipc_buffer.is_null() {
+                let buf = (*ctx).ipc_buffer as *const BesaltMsg;
+                *msg = *buf;
+            }
+        }
+    }
+    r.error as i32
 }
 
 fn signal_ready() {
@@ -1210,7 +1233,7 @@ fn handle_write_text(state: &mut DisplayState, msg: &BesaltMsg, reply: &mut Besa
     reply.label = BESALT_OK;
 }
 
-fn handle_terminal_write(state: &mut DisplayState, msg: &BesaltMsg, reply: &mut BesaltMsg) {
+fn handle_terminal_write(state: &mut DisplayState, msg: &BesaltMsg) {
     if state.cursor_drawn {
         invert_cursor_cell(state, state.drawn_col, state.drawn_row);
         state.cursor_drawn = false;
@@ -1225,9 +1248,6 @@ fn handle_terminal_write(state: &mut DisplayState, msg: &BesaltMsg, reply: &mut 
         let c = unsafe { *text_ptr.add(i) };
         vt100::process_byte(state, c);
     }
-
-    flush_damage(state);
-    reply.label = BESALT_OK;
 }
 
 fn handle_present(state: &mut DisplayState, reply: &mut BesaltMsg) {
@@ -1461,6 +1481,45 @@ pub extern "C" fn _start() -> ! {
     }
 
     loop {
+        if msg.label == DISPLAY_TERMINAL_WRITE {
+            loop {
+                handle_terminal_write(&mut state, &msg);
+
+                let timed_err = unsafe {
+                    recv_timed_ctx(
+                        ipc_ctx(),
+                        CAP_SERVER_EP,
+                        TERMINAL_BATCH_TIMEOUT_NS,
+                        &raw mut msg,
+                        &raw mut badge,
+                    )
+                };
+
+                if timed_err != 0 {
+                    flush_damage(&mut state);
+                    let err = unsafe {
+                        ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
+                    };
+                    if err != 0 {
+                        let mut lb = LineBuf::new();
+                        lb.str(b"[DISPLAY] recv failed err=");
+                        lb.hex(err as u64);
+                        lb.str(b"\n");
+                        lb.flush();
+                        break;
+                    }
+                    break;
+                }
+
+                if msg.label != DISPLAY_TERMINAL_WRITE {
+                    flush_damage(&mut state);
+                    break;
+                }
+            }
+
+            continue;
+        }
+
         let mut reply = BesaltMsg::zeroed();
 
         match msg.label {
@@ -1477,7 +1536,9 @@ pub extern "C" fn _start() -> ! {
                 handle_write_text(&mut state, &msg, &mut reply);
             }
             DISPLAY_TERMINAL_WRITE => {
-                handle_terminal_write(&mut state, &msg, &mut reply);
+                handle_terminal_write(&mut state, &msg);
+                flush_damage(&mut state);
+                reply.label = BESALT_OK;
             }
             _ => {
                 reply.label = BESALT_INVALID_OPERATION;
