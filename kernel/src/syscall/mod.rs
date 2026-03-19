@@ -3157,9 +3157,9 @@ fn syscall_irq_handler_ack(cap: &Capability) -> SyscallResult {
         let irq = save_irq_disable();
         let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
         irq_handler.acknowledged.store(true, core::sync::atomic::Ordering::Release);
-        // Re-enable delivery at IOAPIC. dispatch_irq() masks the IRQ when
-        // no handler is ready to accept delivery; unmask it now that this
-        // handler has acknowledged and is ready for the next interrupt.
+        // Re-enable delivery at IOAPIC. dispatch_irq() only masks
+        // level-triggered IRQs when no handler is ready to accept delivery;
+        // edge-triggered ISA IRQs stay unmasked to avoid losing edges.
         let irq_num = irq_handler.irq_num;
         let level = irq_handler.level_triggered;
         restore_irq(irq);

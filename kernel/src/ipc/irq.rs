@@ -83,8 +83,12 @@ pub fn dispatch_irq(irq_num: usize) {
     unsafe {
         let mut cur = (*(&raw const IRQ_HANDLERS))[irq_num];
         let mut any_dispatched = false;
+        let mut any_level_triggered = false;
         while !cur.is_null() {
             let h = &mut *cur;
+            if h.level_triggered {
+                any_level_triggered = true;
+            }
             let ntfn = h.notification.load(Ordering::Acquire);
             if h.acknowledged.load(Ordering::Acquire) && !ntfn.is_null() {
                 h.acknowledged.store(false, Ordering::Release);
@@ -93,7 +97,7 @@ pub fn dispatch_irq(irq_num: usize) {
             }
             cur = h.next;
         }
-        if !any_dispatched && has_handlers_locked(irq_num) {
+        if !any_dispatched && any_level_triggered {
             crate::arch::ioapic_mask(irq_num as u32);
         }
     }
