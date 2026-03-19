@@ -1753,9 +1753,7 @@ unsafe fn detach_thread_wait_queues(tcb: *mut Tcb) {
         }
 
         if !(*tcb).blocked_notification.is_null() {
-            let ntfn = &mut *((*tcb).blocked_notification as *mut crate::ipc::Notification);
-            ntfn.remove_waiter(tcb);
-            (*tcb).blocked_notification = core::ptr::null_mut();
+            crate::ipc::Notification::clear_tcb_wait_registration(tcb);
         }
 
         if matches!(

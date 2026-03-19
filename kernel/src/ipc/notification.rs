@@ -72,6 +72,28 @@ impl Notification {
         unsafe { crate::mm::restore_irq(irq); }
     }
 
+    /// Clear a TCB's notification wait registration under the notification's
+    /// own lock. This is only needed for plain notification waiters that use
+    /// `waiting`/`blocked_notification`.
+    pub unsafe fn clear_tcb_wait_registration(tcb: *mut Tcb) {
+        unsafe {
+            let ntfn_ptr = (*tcb).blocked_notification as *mut Notification;
+            if ntfn_ptr.is_null() {
+                return;
+            }
+
+            let ntfn = &mut *ntfn_ptr;
+            ntfn.ntfn_lock();
+            if ntfn.waiting == tcb {
+                ntfn.waiting = core::ptr::null_mut();
+            }
+            if (*tcb).blocked_notification == ntfn_ptr as *mut u8 {
+                (*tcb).blocked_notification = core::ptr::null_mut();
+            }
+            ntfn.ntfn_unlock();
+        }
+    }
+
     /// Signal notification (set bits) - never blocks.
     ///
     /// Lock ordering: releases ntfn_lock before acquiring ep_lock to avoid
@@ -97,13 +119,15 @@ impl Notification {
                 let tcb = self.bound_tcb;
                 let ep_ptr = (*tcb).blocked_endpoint;
                 if ep_ptr.is_null() {
+                    // TCB not blocked on endpoint — bits stay in ntfn for the
+                    // next recv pre-check to pick up.
                     self.ntfn_unlock();
                     return;
                 }
 
-                // Snapshot and consume bits under ntfn_lock, then release
-                // before acquiring ep_lock to prevent lock ordering inversion.
-                let all_bits = self.bits.swap(0, Ordering::SeqCst);
+                // Release ntfn_lock before acquiring ep_lock to prevent
+                // lock ordering inversion. Bits remain in ntfn — recv
+                // will consume them under ntfn_lock on resume.
                 self.ntfn_unlock();
 
                 let ep = &mut *(ep_ptr as *mut super::Endpoint);
@@ -113,6 +137,7 @@ impl Notification {
                 // were held (timeout, another signal, or IPC completion).
                 let wake_recv = (*tcb).state == ThreadState::Blocked
                     && (*tcb).blocked_endpoint == ep_ptr
+                    && (*tcb).bound_notification == self as *mut Notification as *mut u8
                     && matches!(
                         (*tcb).blocked_reason,
                         Some(BlockedReason::RecvBlocked) | Some(BlockedReason::RecvTimedBlocked)
@@ -120,17 +145,18 @@ impl Notification {
 
                 if !wake_recv {
                     ep.ep_unlock();
-                    // Restore bits so they aren't lost — a future poll/wait
-                    // or another signal() call will pick them up.
-                    self.bits.fetch_or(all_bits, Ordering::SeqCst);
+                    // Bits are still in ntfn (never consumed) — no restore needed.
                     return;
                 }
 
                 let timed = matches!((*tcb).blocked_reason, Some(BlockedReason::RecvTimedBlocked));
                 ep.remove_from_queue(tcb);
 
-                (*tcb).saved_caller_badge = all_bits;
-                (*tcb).saved_caller_msg = super::Message::empty();
+                // Mark TCB as woken by notification — recv resume path
+                // will consume bits from ntfn under ntfn_lock.
+                (*tcb).woken_by_notification = true;
+                (*tcb).blocked_reason = None;
+                (*tcb).state = ThreadState::Ready;
                 (*tcb).blocked_endpoint = core::ptr::null_mut();
 
                 ep.ep_unlock();
@@ -141,8 +167,6 @@ impl Notification {
                     (*tcb).futex_wakeup_result = 0;
                 }
 
-                (*tcb).blocked_reason = None;
-                (*tcb).state = ThreadState::Ready;
                 get_scheduler().enqueue(tcb);
             } else {
                 self.ntfn_unlock();

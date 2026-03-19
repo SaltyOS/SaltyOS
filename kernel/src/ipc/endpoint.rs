@@ -450,7 +450,9 @@ impl Endpoint {
                     if !(*current).bound_notification.is_null() {
                         let ntfn = &mut *((*current).bound_notification
                             as *mut super::Notification);
+                        ntfn.ntfn_lock();
                         let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
+                        ntfn.ntfn_unlock();
                         if bits != 0 {
                             return Some((Message::empty(), bits, core::ptr::null_mut()));
                         }
@@ -459,16 +461,19 @@ impl Endpoint {
                     self.recv_queue.push(current);
                     self.state = EndpointState::RecvBlocked;
                     (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
+                    (*current).woken_by_notification = false;
                     super::block_current_thread_no_switch(current, BlockedReason::RecvBlocked);
 
                     if !(*current).bound_notification.is_null() {
                         let ntfn = &mut *((*current).bound_notification
                             as *mut super::Notification);
+                        ntfn.ntfn_lock();
                         let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
+                        ntfn.ntfn_unlock();
                         if bits != 0 {
                             self.remove_from_queue(current);
-                            (*current).blocked_endpoint = core::ptr::null_mut();
                             (*current).blocked_reason = None;
+                            (*current).blocked_endpoint = core::ptr::null_mut();
                             (*current).state = ThreadState::Running;
                             return Some((Message::empty(), bits, core::ptr::null_mut()));
                         }
@@ -507,9 +512,20 @@ impl Endpoint {
             self.ep_unlock();
             get_scheduler().reschedule();
 
-            let msg = (*current).saved_caller_msg;
-            let badge = (*current).saved_caller_badge;
-            (msg, badge)
+            // Check wake source: notification (consume bits) or IPC (saved msg)
+            if (*current).woken_by_notification {
+                (*current).woken_by_notification = false;
+                let ntfn = &mut *((*current).bound_notification
+                    as *mut super::Notification);
+                ntfn.ntfn_lock();
+                let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
+                ntfn.ntfn_unlock();
+                (super::Message::empty(), bits)
+            } else {
+                let msg = (*current).saved_caller_msg;
+                let badge = (*current).saved_caller_badge;
+                (msg, badge)
+            }
         }
     }
 
@@ -651,8 +667,18 @@ impl Endpoint {
             }
             get_scheduler().reschedule();
 
-            let msg = (*current).saved_caller_msg;
-            let badge = (*current).saved_caller_badge;
+            // Check wake source: notification or IPC
+            let (msg, badge) = if (*current).woken_by_notification {
+                (*current).woken_by_notification = false;
+                let ntfn = &mut *((*current).bound_notification
+                    as *mut super::Notification);
+                ntfn.ntfn_lock();
+                let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
+                ntfn.ntfn_unlock();
+                (super::Message::empty(), bits)
+            } else {
+                ((*current).saved_caller_msg, (*current).saved_caller_badge)
+            };
             (msg, badge)
         }
     }
@@ -1028,7 +1054,9 @@ impl Endpoint {
                     if !(*current).bound_notification.is_null() {
                         let ntfn = &mut *((*current).bound_notification
                             as *mut super::Notification);
+                        ntfn.ntfn_lock();
                         let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
+                        ntfn.ntfn_unlock();
                         if bits != 0 {
                             self.ep_unlock();
                             return (Message::empty(), bits, 0);
@@ -1055,15 +1083,18 @@ impl Endpoint {
             (*current).blocked_reason = Some(BlockedReason::RecvTimedBlocked);
             (*current).state = ThreadState::Blocked;
             (*current).futex_wakeup_result = 0;
+            (*current).woken_by_notification = false;
 
             if !(*current).bound_notification.is_null() {
                 let ntfn = &mut *((*current).bound_notification
                     as *mut super::Notification);
+                ntfn.ntfn_lock();
                 let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
+                ntfn.ntfn_unlock();
                 if bits != 0 {
                     self.remove_from_queue(current);
-                    (*current).blocked_endpoint = core::ptr::null_mut();
                     (*current).blocked_reason = None;
+                    (*current).blocked_endpoint = core::ptr::null_mut();
                     (*current).state = ThreadState::Running;
                     self.ep_unlock();
                     return (Message::empty(), bits, 0);
@@ -1076,13 +1107,23 @@ impl Endpoint {
             let wakeup_ns = now_ns.saturating_add(timeout_ns);
             get_scheduler().block_current_futex_timed(wakeup_ns);
 
-            let result = (*current).futex_wakeup_result;
-            if result != 0 {
-                (Message::empty(), 0, result)
+            if (*current).woken_by_notification {
+                (*current).woken_by_notification = false;
+                let ntfn = &mut *((*current).bound_notification
+                    as *mut super::Notification);
+                ntfn.ntfn_lock();
+                let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
+                ntfn.ntfn_unlock();
+                (Message::empty(), bits, 0)
             } else {
-                let msg = (*current).saved_caller_msg;
-                let badge = (*current).saved_caller_badge;
-                (msg, badge, 0)
+                let result = (*current).futex_wakeup_result;
+                if result != 0 {
+                    (Message::empty(), 0, result)
+                } else {
+                    let msg = (*current).saved_caller_msg;
+                    let badge = (*current).saved_caller_badge;
+                    (msg, badge, 0)
+                }
             }
         }
     }

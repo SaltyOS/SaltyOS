@@ -144,6 +144,10 @@ pub struct Tcb {
     pub ready_queued: bool,
     /// Which CPU's ready queue this thread is in (valid when ready_queued == true)
     pub queued_cpu: u32,
+    /// Set by Notification::signal() when waking a bound TCB via endpoint.
+    /// recv()/reply_recv()/recv_timeout() checks this on resume to consume
+    /// notification bits under ntfn_lock instead of reading saved_caller_*.
+    pub woken_by_notification: bool,
     /// Next thread in queue
     pub next: *mut Tcb,
     /// Why this thread is blocked (valid when state == Blocked/Waiting)
@@ -344,6 +348,7 @@ impl Tcb {
             run_owner_cpu: AtomicU8::new(RUN_OWNER_NONE),
             ready_queued: false,
             queued_cpu: 0xFFFF_FFFF,
+            woken_by_notification: false,
             next: core::ptr::null_mut(),
             blocked_reason: None,
             saved_caller_badge: 0,
@@ -399,6 +404,7 @@ impl Tcb {
         self.state = ThreadState::Inactive;
         self.ready_queued = false;
         self.queued_cpu = 0xFFFF_FFFF;
+        self.woken_by_notification = false;
         self.clear_run_owner_cpu();
         self.blocked_reason = None;
         self.blocked_endpoint = core::ptr::null_mut();
