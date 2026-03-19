@@ -78,8 +78,10 @@ pub fn dispatch_irq(irq_num: usize) {
         return;
     }
 
+    // SAFETY: IRQs are already disabled by hardware interrupt entry.
+    // We still save/restore for consistency with other IRQ_LOCK callers.
+    let irq_flag = unsafe { crate::mm::save_irq_disable() };
     IRQ_LOCK.lock();
-    // SAFETY: IRQ_LOCK held; single-writer access to IRQ_HANDLERS.
     unsafe {
         let mut cur = (*(&raw const IRQ_HANDLERS))[irq_num];
         let mut any_dispatched = false;
@@ -102,16 +104,18 @@ pub fn dispatch_irq(irq_num: usize) {
         }
     }
     IRQ_LOCK.unlock();
+    unsafe { crate::mm::restore_irq(irq_flag) };
 }
 
 /// Register an IRQ handler by prepending it to the chain for its IRQ.
 ///
-/// Acquires IRQ_LOCK internally.
+/// Acquires IRQ_LOCK internally (IRQ-safe).
 pub fn register_handler(irq_num: usize, handler: *mut IrqHandler) -> bool {
     if irq_num >= MAX_IRQS {
         return false;
     }
 
+    let irq_flag = unsafe { crate::mm::save_irq_disable() };
     IRQ_LOCK.lock();
     // SAFETY: IRQ_LOCK held; single-writer access to IRQ_HANDLERS.
     unsafe {
@@ -121,20 +125,23 @@ pub fn register_handler(irq_num: usize, handler: *mut IrqHandler) -> bool {
         (*(&raw mut IRQ_HANDLERS))[irq_num] = handler;
     }
     IRQ_LOCK.unlock();
+    unsafe { crate::mm::restore_irq(irq_flag) };
     true
 }
 
 /// Check whether any handler is registered for this IRQ.
 ///
-/// Acquires IRQ_LOCK internally.
+/// Acquires IRQ_LOCK internally (IRQ-safe).
 pub fn has_handlers(irq_num: usize) -> bool {
     if irq_num >= MAX_IRQS {
         return false;
     }
+    let irq_flag = unsafe { crate::mm::save_irq_disable() };
     IRQ_LOCK.lock();
     // SAFETY: IRQ_LOCK held.
     let result = unsafe { !(*(&raw const IRQ_HANDLERS))[irq_num].is_null() };
     IRQ_LOCK.unlock();
+    unsafe { crate::mm::restore_irq(irq_flag) };
     result
 }
 
@@ -148,11 +155,12 @@ fn has_handlers_locked(irq_num: usize) -> bool {
 
 /// Check whether any handler in the chain has a bound notification.
 ///
-/// Acquires IRQ_LOCK internally.
+/// Acquires IRQ_LOCK internally (IRQ-safe).
 pub fn has_active_notification(irq_num: usize) -> bool {
     if irq_num >= MAX_IRQS {
         return false;
     }
+    let irq_flag = unsafe { crate::mm::save_irq_disable() };
     IRQ_LOCK.lock();
     // SAFETY: IRQ_LOCK held.
     let result = unsafe {
@@ -168,22 +176,25 @@ pub fn has_active_notification(irq_num: usize) -> bool {
         found
     };
     IRQ_LOCK.unlock();
+    unsafe { crate::mm::restore_irq(irq_flag) };
     result
 }
 
 /// Remove a specific handler from its IRQ chain.
 ///
-/// Acquires IRQ_LOCK internally.
+/// Acquires IRQ_LOCK internally (IRQ-safe).
 pub fn unregister_handler(handler: *mut IrqHandler) {
     if handler.is_null() {
         return;
     }
+    let irq_flag = unsafe { crate::mm::save_irq_disable() };
     IRQ_LOCK.lock();
     // SAFETY: IRQ_LOCK held; single-writer access to IRQ_HANDLERS.
     unsafe {
         let irq_num = (*handler).irq_num as usize;
         if irq_num >= MAX_IRQS {
             IRQ_LOCK.unlock();
+            crate::mm::restore_irq(irq_flag);
             return;
         }
         (*handler).active = false;
@@ -203,4 +214,5 @@ pub fn unregister_handler(handler: *mut IrqHandler) {
         (*handler).next = core::ptr::null_mut();
     }
     IRQ_LOCK.unlock();
+    unsafe { crate::mm::restore_irq(irq_flag) };
 }

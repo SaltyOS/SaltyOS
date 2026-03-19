@@ -1512,20 +1512,23 @@ fn syscall_sc_bind(cap: &Capability, tcb_cap_ptr: u64) -> SyscallResult {
         return SyscallResult::err(e);
     }
 
-    // Operation under per-SC lock
+    // Operation under per-SC lock + per-TCB lock (lock order: sc_lock → tcb_lock)
     unsafe {
         let irq = save_irq_disable();
         let sc = &mut *(cap.object as *mut SchedContext);
         sc.sc_lock();
         let tcb = &mut *(tcb_cap.object as *mut Tcb);
+        tcb.tcb_lock();
 
         if !sc.bound_tcb.is_null() {
+            tcb.tcb_unlock();
             sc.sc_unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
 
         if !tcb.sched_context.is_null() {
+            tcb.tcb_unlock();
             sc.sc_unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::InvalidOperation);
@@ -1541,6 +1544,7 @@ fn syscall_sc_bind(cap: &Capability, tcb_cap_ptr: u64) -> SyscallResult {
             scheduler.remove_from_ready_queue(tcb as *mut Tcb);
             scheduler.enqueue(tcb as *mut Tcb);
         }
+        tcb.tcb_unlock();
         sc.sc_unlock();
         restore_irq(irq);
     }
@@ -1601,20 +1605,34 @@ fn syscall_sc_yield_to(cap: &Capability, target_sc_cap_ptr: u64) -> SyscallResul
         return SyscallResult::err(e);
     }
 
-    // Operation under per-SC lock (scheduler manipulation + context switch)
+    // Operation under both SC locks (address-ordered to avoid ABBA deadlock)
     unsafe {
         let irq = save_irq_disable();
         let current_sc = &mut *(cap.object as *mut SchedContext);
-        current_sc.sc_lock();
         let target_sc = &mut *(target_cap.object as *mut SchedContext);
+
+        // Lock in pointer-address order to prevent ABBA deadlock
+        let current_ptr = current_sc as *mut SchedContext as usize;
+        let target_ptr = target_sc as *mut SchedContext as usize;
+        if current_ptr < target_ptr {
+            current_sc.sc_lock();
+            target_sc.sc_lock();
+        } else if current_ptr > target_ptr {
+            target_sc.sc_lock();
+            current_sc.sc_lock();
+        } else {
+            // Same SC — just lock once
+            current_sc.sc_lock();
+        }
 
         target_sc.remaining += current_sc.remaining;
         current_sc.remaining = 0;
 
+        if current_ptr != target_ptr {
+            target_sc.sc_unlock();
+        }
+
         let scheduler = crate::sched::scheduler::scheduler();
-        // Use deferred enqueue to avoid SMP double-schedule race:
-        // do not place the running TCB into ready queue before its context
-        // has been saved by context_switch.
         current_sc.sc_unlock();
         scheduler.yield_current();
         restore_irq(irq);

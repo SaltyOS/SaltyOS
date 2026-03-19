@@ -348,8 +348,8 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
     }
 
     // No fault handler — diagnostic dump
-    // For user-mode: per-object lock is held (assembly acquired it)
-    // For kernel-mode: per-object lock is NOT held (assembly skipped it)
+    // No lock is held on exception entry; assembly stubs do not acquire locks.
+    // reschedule() acquires per-CPU scheduler lock internally if needed.
     // Use raw serial — this is a crash path, another CPU may hold SERIAL_LOCK
     {
         crate::serial_puts_raw("\n*** EXCEPTION: ");
@@ -471,9 +471,9 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
     // instead of halting the CPU permanently.
     if (f.cs & 3) != 0 {
         unsafe {
-            // per-object lock is held (assembly acquired it for user-mode exceptions).
-            // reschedule() expects it held; do_context_switch releases before switch
-            // and reacquires on resume in the new thread.
+            // No lock is held on exception entry; assembly stubs do not acquire locks.
+            // reschedule() acquires per-CPU scheduler lock internally and manages
+            // lock lifecycle around context_switch.
             let scheduler = crate::sched::scheduler::scheduler();
             let current = scheduler.current();
             if !current.is_null() {
