@@ -1662,6 +1662,8 @@ impl Scheduler {
     /// - Thread state and futex fields already configured by caller.
     /// - No IPC/endpoint locks should be held across this call.
     pub fn block_current_futex_timed(&mut self, wakeup_ns: u64) {
+        use core::sync::atomic::Ordering;
+
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
         self.lock();
 
@@ -1669,6 +1671,37 @@ impl Scheduler {
             let cpu_id = crate::arch::current_cpu() as usize;
             let current = self.current[cpu_id];
             if current.is_null() {
+                self.unlock();
+                crate::mm::restore_irq(irq_flag);
+                return;
+            }
+
+            let still_timed_blocked = match (*current).blocked_reason {
+                Some(BlockedReason::FutexTimedBlocked) => {
+                    (*current).state == ThreadState::Blocked
+                        && !(*current).futex_vspace.is_null()
+                }
+                Some(BlockedReason::SendTimedBlocked { .. })
+                | Some(BlockedReason::RecvTimedBlocked) => {
+                    (*current).state == ThreadState::Blocked
+                        && !(*current).blocked_endpoint.is_null()
+                }
+                _ => false,
+            };
+
+            if !still_timed_blocked {
+                // A wake may have raced in after the caller dropped its
+                // futex/endpoint lock but before we could publish the sleep
+                // queue entry. In that case this thread never actually blocked.
+                let _ = self.pending_enqueue[cpu_id].compare_exchange(
+                    current,
+                    core::ptr::null_mut(),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+                if (*current).state != ThreadState::Inactive {
+                    (*current).state = ThreadState::Running;
+                }
                 self.unlock();
                 crate::mm::restore_irq(irq_flag);
                 return;

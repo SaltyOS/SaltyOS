@@ -185,7 +185,8 @@ pub unsafe fn check_wakeups(now_ns: u64) -> usize {
                     if matches!(
                         (*tcb).blocked_reason,
                         Some(BlockedReason::SendTimedBlocked { .. }) | Some(BlockedReason::RecvTimedBlocked)
-                    ) {
+                    ) && (*tcb).blocked_endpoint == ep as *mut u8
+                    {
                         (*ep).remove_from_queue(tcb);
                         (*ep).ep_unlock();
                         (*tcb).blocked_endpoint = core::ptr::null_mut();
