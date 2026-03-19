@@ -31,11 +31,15 @@ const DAMAGE_WORDS: usize = MAX_DAMAGE_SCANLINES / DAMAGE_WORD_BITS;
 // slot 3 is kept as procmgr EP for slot_alloc expansion; display service EP is separate.
 const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_VSPACE: u64 = 1;
+const CAP_SELF_CSPACE: u64 = 2;
 const CAP_NAMESERV_EP: u64 = 5;   // Standard well-known slot (consts::CAP_NAMESERV_EP)
 const CAP_MMSRV_EP: u64 = 7;
 const CAP_FB_UNTYPED: u64 = 13;   // Standard well-known slot (consts::CAP_FB_UNTYPED)
 const CAP_READINESS_NTFN: u64 = 14;
+const CAP_RING_NTFN: u64 = 69;   // Terminal ring notification (received from ttyd)
 const CAP_SERVER_EP: u64 = 68;    // Pre-created display service EP (injected by procmgr)
+const TERM_RING_VADDR: u64 = 0x0000_0000_0060_0000;
+const TERM_RING_HDR_SIZE: usize = 16;
 const TERMINAL_BATCH_TIMEOUT_NS: u64 = 1_000_000;
 
 struct DisplayState {
@@ -80,6 +84,9 @@ struct DisplayState {
     damage_min_y: u32,
     damage_max_y: u32,
     damage_rows: [u64; DAMAGE_WORDS],
+    // SHM ring buffer for terminal data from ttyd
+    term_ring_base: *mut u8,
+    term_ring_active: bool,
     // Alternate screen buffer
     alt_shadow: *mut u8,
     alt_active: bool,
@@ -1281,6 +1288,90 @@ fn handle_write_text(state: &mut DisplayState, msg: &BesaltMsg, reply: &mut Besa
     reply.label = BESALT_OK;
 }
 
+/// Drain all available bytes from the SHM terminal ring and process through VT100.
+fn drain_terminal_ring(state: &mut DisplayState) {
+    if state.term_ring_base.is_null() { return; }
+    // Undraw cursor before processing (same as handle_terminal_write)
+    if state.cursor_drawn {
+        invert_cursor_cell(state, state.drawn_col, state.drawn_row);
+        state.cursor_drawn = false;
+    }
+    let base = state.term_ring_base;
+    // SAFETY: SHM is mapped and ring header is at base.
+    unsafe {
+        let ring_size = core::ptr::read_volatile(base.add(8) as *const u32) as usize;
+        if ring_size == 0 { return; }
+        let mut buf = [0u8; 256];
+        loop {
+            let head = core::ptr::read_volatile(base as *const u32) as usize;
+            let tail = core::ptr::read_volatile(base.add(4) as *const u32) as usize;
+            let available = (head + ring_size - tail) % ring_size;
+            if available == 0 { break; }
+            let count = core::cmp::min(available, buf.len());
+            let dp = base.add(TERM_RING_HDR_SIZE);
+            let mut i = 0usize;
+            while i < count {
+                buf[i] = core::ptr::read_volatile(dp.add((tail + i) % ring_size));
+                i += 1;
+            }
+            // SAFETY: tail update is visible after data reads (x86 TSO).
+            core::ptr::write_volatile(
+                base.add(4) as *mut u32,
+                ((tail + count) % ring_size) as u32,
+            );
+            for i in 0..count {
+                vt100::process_byte(state, buf[i]);
+            }
+        }
+    }
+}
+
+/// Handle DISPLAY_SETUP_RING: bind notification, map SHM ring buffer.
+fn handle_setup_ring(state: &mut DisplayState, msg: &BesaltMsg, reply: &mut BesaltMsg) {
+    let shm_id = msg.regs[0];
+
+    // Notification cap was transferred via extra_caps into CAP_RING_NTFN.
+    // Bind it to our TCB so signals wake us from recv.
+    let bind_err = invoke::tcb_bind_notification(CAP_SELF_TCB, CAP_RING_NTFN);
+    if bind_err != 0 {
+        let mut lb = LineBuf::new();
+        lb.str(b"[DISPLAY] ring: bind notification failed err=");
+        lb.dec(bind_err as u64);
+        lb.str(b"\n");
+        lb.flush();
+        reply.label = BESALT_INVALID_OPERATION;
+        return;
+    }
+
+    // Map SHM (RW — we need to update the tail pointer).
+    let mut map_msg = BesaltMsg::zeroed();
+    map_msg.label = MM_SHM_MAP;
+    map_msg.regs[0] = shm_id;
+    map_msg.regs[1] = 0; // map into self
+    map_msg.regs[2] = TERM_RING_VADDR;
+    map_msg.regs[3] = 0x3; // RW
+    map_msg.length = 4;
+    let mut map_reply = BesaltMsg::zeroed();
+    // SAFETY: IPC context is valid; nested call to mmsrv during handler.
+    let map_err = unsafe {
+        ipc::call_ctx(ipc_ctx(), CAP_MMSRV_EP, &raw const map_msg, &raw mut map_reply)
+    };
+    if map_err != 0 || map_reply.label != BESALT_OK {
+        let mut lb = LineBuf::new();
+        lb.str(b"[DISPLAY] ring: SHM map failed err=");
+        lb.dec(if map_err != 0 { map_err as u64 } else { map_reply.label });
+        lb.str(b"\n");
+        lb.flush();
+        reply.label = BESALT_INVALID_OPERATION;
+        return;
+    }
+
+    state.term_ring_base = TERM_RING_VADDR as *mut u8;
+    state.term_ring_active = true;
+    reply.label = BESALT_OK;
+    puts(b"[DISPLAY] Terminal ring buffer active\n");
+}
+
 fn handle_terminal_write(state: &mut DisplayState, msg: &BesaltMsg) {
     if state.cursor_drawn {
         invert_cursor_cell(state, state.drawn_col, state.drawn_row);
@@ -1438,6 +1529,8 @@ pub extern "C" fn _start() -> ! {
         damage_min_y: fb.height,
         damage_max_y: 0,
         damage_rows: [0; DAMAGE_WORDS],
+        term_ring_base: core::ptr::null_mut(),
+        term_ring_active: false,
         alt_shadow: core::ptr::null_mut(),
         alt_active: false,
         primary_col: 0,
@@ -1519,6 +1612,13 @@ pub extern "C" fn _start() -> ! {
     let mut msg = BesaltMsg::zeroed();
     let mut badge: u64 = 0;
 
+    // Pre-configure receive slot for DISPLAY_SETUP_RING cap transfer.
+    // When ttyd sends the ring notification cap, it lands at CAP_RING_NTFN.
+    // SAFETY: IPC context is valid.
+    unsafe {
+        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_RING_NTFN, 0);
+    }
+
     let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
     if err != 0 {
         let mut lb = LineBuf::new();
@@ -1530,10 +1630,26 @@ pub extern "C" fn _start() -> ! {
     }
 
     loop {
+        // SHM ring notification: ttyd wrote terminal data to shared memory.
+        // Drain the ring, process VT100 bytes, flush damage, then recv next.
+        if badge != 0 && msg.label == 0 && msg.length == 0 {
+            if state.term_ring_active {
+                drain_terminal_ring(&mut state);
+                flush_damage(&mut state);
+            }
+            let err = unsafe {
+                ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
+            };
+            if err != 0 {
+                puts(b"[DISPLAY] recv failed after ring drain\n");
+                break;
+            }
+            continue;
+        }
+
         if msg.label == DISPLAY_TERMINAL_WRITE {
             loop {
                 handle_terminal_write(&mut state, &msg);
-                flush_damage(&mut state);
 
                 let timed_err = unsafe {
                     recv_timed_ctx(
@@ -1589,6 +1705,9 @@ pub extern "C" fn _start() -> ! {
                 handle_terminal_write(&mut state, &msg);
                 flush_damage(&mut state);
                 reply.label = BESALT_OK;
+            }
+            DISPLAY_SETUP_RING => {
+                handle_setup_ring(&mut state, &msg, &mut reply);
             }
             _ => {
                 reply.label = BESALT_INVALID_OPERATION;
