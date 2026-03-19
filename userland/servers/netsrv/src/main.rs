@@ -96,7 +96,10 @@ fn signal_ready() {
 // SHM ring buffer access
 // ---------------------------------------------------------------------------
 
-/// Write a frame to the SHM TX ring. Returns true on success.
+/// Write a frame to the SHM TX ring.
+///
+/// Applies sender-side backpressure when the shared ring is full so packets
+/// are not silently dropped under SMP burst load.
 pub(crate) fn shm_tx_enqueue(frame: &[u8]) -> bool {
     // SAFETY: SHM_BASE is set during init; single-threaded.
     unsafe {
@@ -105,28 +108,32 @@ pub(crate) fn shm_tx_enqueue(frame: &[u8]) -> bool {
             return false;
         }
         let hdr = base as *mut u32;
-        let tx_head = *hdr.add(2); // offset 0x08
-        let tx_tail = core::ptr::read_volatile(hdr.add(3)); // offset 0x0C, netdrv writes this
-        let slot_count = core::ptr::read_volatile(hdr.add(5)); // offset 0x14
-        if slot_count == 0 {
-            return false;
-        }
-        let next = (tx_head + 1) % slot_count;
-        if next == tx_tail {
-            return false; // ring full
-        }
-
-        let slot_base = base + 0x11000 + (tx_head as u64) * 2048;
         let len = core::cmp::min(frame.len(), 1998);
-        let len_ptr = slot_base as *mut u16;
-        *len_ptr = len as u16;
-        let data_ptr = (slot_base + 2) as *mut u8;
-        core::ptr::copy_nonoverlapping(frame.as_ptr(), data_ptr, len);
+        loop {
+            let tx_head = *hdr.add(2); // offset 0x08
+            let tx_tail = core::ptr::read_volatile(hdr.add(3)); // offset 0x0C, netdrv writes this
+            let slot_count = core::ptr::read_volatile(hdr.add(5)); // offset 0x14
+            if slot_count == 0 {
+                return false;
+            }
+            let next = (tx_head + 1) % slot_count;
+            if next == tx_tail {
+                signal_netdrv_tx();
+                let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+                continue;
+            }
 
-        // Store fence: ensure frame data is visible before updating head
-        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-        core::ptr::write_volatile(hdr.add(2), next);
-        true
+            let slot_base = base + 0x11000 + (tx_head as u64) * 2048;
+            let len_ptr = slot_base as *mut u16;
+            *len_ptr = len as u16;
+            let data_ptr = (slot_base + 2) as *mut u8;
+            core::ptr::copy_nonoverlapping(frame.as_ptr(), data_ptr, len);
+
+            // Store fence: ensure frame data is visible before updating head
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            core::ptr::write_volatile(hdr.add(2), next);
+            return true;
+        }
     }
 }
 
@@ -850,7 +857,7 @@ unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut BesaltMsg, badge: *mut u64) {
                 *badge = 1;
                 return;
             }
-            let timeout = deadline.saturating_sub(now).max(1_000_000); // min 1ms
+            let timeout = deadline.saturating_sub(now).max(100_000); // min 100us
             let r = besalt::syscall::syscall(
                 SYS_RECV_TIMED,
                 CAP_SERVER_EP,

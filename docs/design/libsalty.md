@@ -320,7 +320,7 @@ Also has a `untyped_retype_depth()` variant for expanded CSpaces.
 | `TCB_WRITE_REGISTERS` (0x46) | `tcb_write_registers()` | Write thread register state |
 | `TCB_SET_IPC_BUFFER` (0x48) | `tcb_set_ipc_buffer()` | Set IPC buffer address |
 | `TCB_BIND_NOTIFICATION` (0x49) | `tcb_bind_notification()` | Bind notification for combined wait |
-| `TCB_SET_FAULT_HANDLER` (0x4B) | `tcb_set_fault_handler()` | Set fault endpoint |
+| `TCB_SET_FAULT_HANDLER` (0x4B) | `tcb_set_fault_handler()` | Set or clear fault endpoint |
 | `TCB_COPY_FPU` (0x4C) | `tcb_copy_fpu()` | Copy FPU state between threads |
 | `TCB_SET_TLS_BASE` (0x4D) | `tcb_set_tls_base()` | Set thread-local storage base address |
 

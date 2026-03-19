@@ -8,9 +8,9 @@
 use besalt::consts::{INET_OP_RECVFROM, BESALT_INVALID_ARGUMENT, BESALT_OK};
 
 const MAX_UDP_SOCKETS: usize = 8;
-const UDP_RX_BUF_SIZE: usize = 4096;
-const MAX_UDP_RX_ENTRIES: usize = 8;
-const MAX_COMPLETIONS: usize = 8;
+const UDP_RX_BUF_SIZE: usize = 16384;
+const MAX_UDP_RX_ENTRIES: usize = 32;
+const MAX_COMPLETIONS: usize = 64;
 const UDP_HEADER_LEN: usize = 8;
 
 #[derive(Clone, Copy)]
@@ -95,8 +95,7 @@ static mut UDP_SOCKETS: [UdpSocket; MAX_UDP_SOCKETS] = [
 static mut NEXT_UDP_CONN_ID: u32 = 1000;
 static mut NEXT_EPHEMERAL_PORT: u16 = 49152;
 
-static mut COMPLETIONS: [Option<Completion>; MAX_COMPLETIONS] =
-    [None, None, None, None, None, None, None, None];
+static mut COMPLETIONS: [Option<Completion>; MAX_COMPLETIONS] = [const { None }; MAX_COMPLETIONS];
 static mut COMP_HEAD: usize = 0;
 static mut COMP_TAIL: usize = 0;
 

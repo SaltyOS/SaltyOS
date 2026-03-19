@@ -2,10 +2,11 @@
 //! IPC request handlers for PTY operations.
 
 use besalt::consts::*;
-use besalt::serial;
+
 use besalt::types::*;
 
 use crate::types::*;
+use crate::input::{pty_has_readable_data, refill_slave_ring, signal_vfs_if_readable};
 use crate::PTYS;
 
 /// TTYD_PTY_READ: try-read from slave side (called by VFS).
@@ -22,6 +23,7 @@ pub unsafe fn handle_pty_read(msg: &BesaltMsg, reply: &mut BesaltMsg) {
         }
 
         let pty = &mut *(&raw mut PTYS[pty_id]);
+        refill_slave_ring(pty);
         let available = pty.slave_ring.len();
 
         if available > 0 {
@@ -36,7 +38,9 @@ pub unsafe fn handle_pty_read(msg: &BesaltMsg, reply: &mut BesaltMsg) {
                     *dst.add(i) = c;
                 }
             }
+            refill_slave_ring(pty);
             pty.vfs_pending = false;
+            signal_vfs_if_readable(pty_id, pty);
         } else {
             // No data -- return WOULD_BLOCK, mark VFS as pending
             reply.label = BESALT_OK;
@@ -60,6 +64,7 @@ pub unsafe fn handle_pty_collect(msg: &BesaltMsg, reply: &mut BesaltMsg) {
         }
 
         let pty = &mut *(&raw mut PTYS[pty_id]);
+        refill_slave_ring(pty);
         let available = pty.slave_ring.len();
         let count = if available < max_count { available } else { max_count };
         let count = if count > 152 { 152 } else { count };
@@ -74,7 +79,9 @@ pub unsafe fn handle_pty_collect(msg: &BesaltMsg, reply: &mut BesaltMsg) {
                 *dst.add(i) = c;
             }
         }
+        refill_slave_ring(pty);
         pty.vfs_pending = false;
+        signal_vfs_if_readable(pty_id, pty);
     }
 }
 
@@ -118,18 +125,17 @@ pub unsafe fn handle_pty_write(msg: &BesaltMsg, reply: &mut BesaltMsg) {
                     buf_len += 1;
                 }
             }
-            serial::serial_puts(&buf[..buf_len]);
             crate::display_write(&buf[..buf_len]);
+            crate::serial_write_queued(&buf[..buf_len]);
         } else {
             // No OPOST: raw output
             let mut buf = [0u8; 152];
             for i in 0..count {
                 buf[i] = *src.add(i);
             }
-            serial::serial_puts(&buf[..count]);
             crate::display_write(&buf[..count]);
+            crate::serial_write_queued(&buf[..count]);
         }
-
         reply.label = BESALT_OK;
         reply.regs[0] = count as u64;
         reply.length = 1;
@@ -283,10 +289,11 @@ pub unsafe fn handle_pty_poll(msg: &BesaltMsg, reply: &mut BesaltMsg) {
             return;
         }
 
-        let pty = &*(&raw const PTYS[pty_id]);
+        let pty = &mut *(&raw mut PTYS[pty_id]);
+        refill_slave_ring(pty);
         let mut rev: u32 = 0;
 
-        if (events & POLLIN as u32) != 0 && !pty.slave_ring.is_empty() {
+        if (events & POLLIN as u32) != 0 && pty_has_readable_data(pty) {
             rev |= POLLIN as u32;
         }
         if (events & POLLOUT as u32) != 0 {

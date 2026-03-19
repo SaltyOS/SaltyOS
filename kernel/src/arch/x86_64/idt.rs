@@ -288,7 +288,7 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
                 }
                 // Demand paging: PRESENT=0, DEMAND bit set in PTE
                 if let Ok(true) = vspace.handle_demand_fault(f.cr2, f.error_code) {
-                    // SCHED_IPC_LOCK is already held by the assembly exception
+                    // No global lock held on exception entry; per-object locks
                     // stub for user-mode exceptions. Just reschedule directly.
                     if (*current).state == crate::sched::thread::ThreadState::Inactive {
                         scheduler.reschedule();
@@ -303,7 +303,7 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
                     (*current).user_stack_top,
                     (*current).user_stack_min,
                 ) {
-                    // SCHED_IPC_LOCK is already held by the assembly exception
+                    // No global lock held on exception entry; per-object locks
                     // stub for user-mode exceptions. Just reschedule directly.
                     if (*current).state == crate::sched::thread::ThreadState::Inactive {
                         scheduler.reschedule();
@@ -348,8 +348,8 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
     }
 
     // No fault handler — diagnostic dump
-    // For user-mode: SCHED_IPC_LOCK is held (assembly acquired it)
-    // For kernel-mode: SCHED_IPC_LOCK is NOT held (assembly skipped it)
+    // No lock is held on exception entry; assembly stubs do not acquire locks.
+    // reschedule() acquires per-CPU scheduler lock internally if needed.
     // Use raw serial — this is a crash path, another CPU may hold SERIAL_LOCK
     {
         crate::serial_puts_raw("\n*** EXCEPTION: ");
@@ -471,9 +471,9 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
     // instead of halting the CPU permanently.
     if (f.cs & 3) != 0 {
         unsafe {
-            // SCHED_IPC_LOCK is held (assembly acquired it for user-mode exceptions).
-            // reschedule() expects it held; do_context_switch releases before switch
-            // and reacquires on resume in the new thread.
+            // No lock is held on exception entry; assembly stubs do not acquire locks.
+            // reschedule() acquires per-CPU scheduler lock internally and manages
+            // lock lifecycle around context_switch.
             let scheduler = crate::sched::scheduler::scheduler();
             let current = scheduler.current();
             if !current.is_null() {
@@ -481,14 +481,13 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
                 crate::serial_puts_raw("[FAULT] Thread terminated, rescheduling\n");
                 // reschedule picks next runnable thread and context-switches.
                 // The dead thread never resumes, so the assembly epilogue
-                // (sched_ipc_unlock + iretq) for THIS frame is never reached.
-                // That is correct: do_context_switch releases SCHED_IPC_LOCK
+                // The iretq for THIS frame is never reached.
+                // That is correct: do_context_switch releases per-object lock
                 // before switching, and the new thread resumes normally.
                 scheduler.reschedule();
                 // Not reached — this thread is Inactive and won't be scheduled
             }
-            // Fallback: no current thread (shouldn't happen), release lock and halt
-            crate::sched_ipc_unlock();
+            // Fallback: no current thread (shouldn't happen), halt
         }
     }
 

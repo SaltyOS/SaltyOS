@@ -7,11 +7,19 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use crate::cap::{KernelObject, ObjectType};
+use crate::mm::SpinLock;
 use super::Notification;
 
 /// Maximum number of hardware IRQs
 pub const MAX_IRQS: usize = 256;
+
+/// Dedicated lock protecting the IRQ_HANDLERS table.
+///
+/// Required because dispatch_irq() runs in interrupt context on any CPU
+/// while register/unregister run from syscall context.
+static IRQ_LOCK: SpinLock = SpinLock::new();
 
 /// IRQ Handler kernel object
 #[repr(C)]
@@ -20,10 +28,12 @@ pub struct IrqHandler {
     pub header: KernelObject,
     /// Hardware IRQ number
     pub irq_num: u32,
-    /// Bound notification (signals userspace when IRQ fires)
-    pub notification: *mut Notification,
-    /// Whether the IRQ has been acknowledged by userspace
-    pub acknowledged: bool,
+    /// Bound notification (signals userspace when IRQ fires).
+    /// Atomic for SMP safety: dispatch_irq reads on IRQ CPU, syscalls write on other CPUs.
+    pub notification: AtomicPtr<Notification>,
+    /// Whether the IRQ has been acknowledged by userspace.
+    /// Atomic for SMP safety: dispatch_irq clears, syscall ack sets.
+    pub acknowledged: AtomicBool,
     /// Whether this handler is active (registered in the global table)
     pub active: bool,
     /// Whether this IRQ uses level-triggered delivery (PCI) vs edge-triggered (ISA)
@@ -37,8 +47,8 @@ impl IrqHandler {
         Self {
             header: KernelObject::new(ObjectType::IrqHandler, 0),
             irq_num,
-            notification: core::ptr::null_mut(),
-            acknowledged: true,
+            notification: AtomicPtr::new(core::ptr::null_mut()),
+            acknowledged: AtomicBool::new(true),
             active: false,
             level_triggered: false,
             next: core::ptr::null_mut(),
@@ -48,12 +58,10 @@ impl IrqHandler {
     /// Cleanup when IRQ handler is destroyed
     pub fn cleanup(&mut self) {
         if self.active {
-            // SAFETY: self is a valid IrqHandler pointer; unregister_handler
-            // removes it from the per-IRQ chain.
             unregister_handler(self as *mut IrqHandler);
             self.active = false;
         }
-        self.notification = core::ptr::null_mut();
+        self.notification.store(core::ptr::null_mut(), Ordering::Release);
     }
 }
 
@@ -64,112 +72,137 @@ static mut IRQ_HANDLERS: [*mut IrqHandler; MAX_IRQS] = [core::ptr::null_mut(); M
 ///
 /// Called from the interrupt handler when a hardware IRQ fires.
 /// Walks the handler chain for the given IRQ and signals every
-/// acknowledged handler's notification.
+/// acknowledged handler's notification. Acquires IRQ_LOCK internally.
 pub fn dispatch_irq(irq_num: usize) {
     if irq_num >= MAX_IRQS {
         return;
     }
 
-    // SAFETY: Called from external IRQ stubs with local interrupts disabled and
-    // SCHED_IPC_LOCK already held (`irq_stub_generic_*` in exceptions.S).
-    // Keep this lock-free here to avoid double-lock deadlock in interrupt context.
+    // SAFETY: IRQs are already disabled by hardware interrupt entry.
+    // We still save/restore for consistency with other IRQ_LOCK callers.
+    let irq_flag = unsafe { crate::mm::save_irq_disable() };
+    IRQ_LOCK.lock();
     unsafe {
         let mut cur = (*(&raw const IRQ_HANDLERS))[irq_num];
         let mut any_dispatched = false;
+        let mut any_level_triggered = false;
         while !cur.is_null() {
             let h = &mut *cur;
-            if h.acknowledged && !h.notification.is_null() {
-                h.acknowledged = false;
-                (*h.notification).signal(1u64 << (irq_num % 64));
+            if h.level_triggered {
+                any_level_triggered = true;
+            }
+            let ntfn = h.notification.load(Ordering::Acquire);
+            if h.acknowledged.load(Ordering::Acquire) && !ntfn.is_null() {
+                h.acknowledged.store(false, Ordering::Release);
+                (*ntfn).signal(1u64 << (irq_num % 64));
                 any_dispatched = true;
             }
             cur = h.next;
         }
-        // Level-triggered safety: mask IRQ at IOAPIC if no handler was ready
-        // to accept delivery. This prevents an IRQ storm when the interrupt
-        // source stays asserted (e.g. shared PCI IRQ where one device never
-        // clears its ISR). The IRQ is re-enabled when a handler calls
-        // irq_handler_ack() via the IRQ_HANDLER_ACK invoke.
-        if !any_dispatched && has_handlers(irq_num) {
+        if !any_dispatched && any_level_triggered {
             crate::arch::ioapic_mask(irq_num as u32);
         }
     }
+    IRQ_LOCK.unlock();
+    unsafe { crate::mm::restore_irq(irq_flag) };
 }
 
 /// Register an IRQ handler by prepending it to the chain for its IRQ.
 ///
-/// Always succeeds for valid IRQ numbers (shared IRQs are allowed).
-/// Caller must hold SCHED_IPC_LOCK.
+/// Acquires IRQ_LOCK internally (IRQ-safe).
 pub fn register_handler(irq_num: usize, handler: *mut IrqHandler) -> bool {
     if irq_num >= MAX_IRQS {
         return false;
     }
 
-    // SAFETY: Caller holds SCHED_IPC_LOCK; single-writer access to IRQ_HANDLERS.
+    let irq_flag = unsafe { crate::mm::save_irq_disable() };
+    IRQ_LOCK.lock();
+    // SAFETY: IRQ_LOCK held; single-writer access to IRQ_HANDLERS.
     unsafe {
         let head = (*(&raw const IRQ_HANDLERS))[irq_num];
         (*handler).next = head;
         (*handler).active = true;
         (*(&raw mut IRQ_HANDLERS))[irq_num] = handler;
-        true
     }
+    IRQ_LOCK.unlock();
+    unsafe { crate::mm::restore_irq(irq_flag) };
+    true
 }
 
 /// Check whether any handler is registered for this IRQ.
 ///
-/// Caller must hold SCHED_IPC_LOCK.
+/// Acquires IRQ_LOCK internally (IRQ-safe).
 pub fn has_handlers(irq_num: usize) -> bool {
     if irq_num >= MAX_IRQS {
         return false;
     }
-    // SAFETY: Single-threaded access guarded by SCHED_IPC_LOCK at call site.
+    let irq_flag = unsafe { crate::mm::save_irq_disable() };
+    IRQ_LOCK.lock();
+    // SAFETY: IRQ_LOCK held.
+    let result = unsafe { !(*(&raw const IRQ_HANDLERS))[irq_num].is_null() };
+    IRQ_LOCK.unlock();
+    unsafe { crate::mm::restore_irq(irq_flag) };
+    result
+}
+
+/// Check whether any handler is registered (lock already held).
+fn has_handlers_locked(irq_num: usize) -> bool {
+    if irq_num >= MAX_IRQS {
+        return false;
+    }
     unsafe { !(*(&raw const IRQ_HANDLERS))[irq_num].is_null() }
 }
 
 /// Check whether any handler in the chain has a bound notification.
 ///
-/// Used to decide whether to mask the IOAPIC when a handler's notification
-/// is cleared — only mask if no other handler still has an active notification.
-///
-/// Caller must hold SCHED_IPC_LOCK.
+/// Acquires IRQ_LOCK internally (IRQ-safe).
 pub fn has_active_notification(irq_num: usize) -> bool {
     if irq_num >= MAX_IRQS {
         return false;
     }
-    // SAFETY: Caller holds SCHED_IPC_LOCK.
-    unsafe {
+    let irq_flag = unsafe { crate::mm::save_irq_disable() };
+    IRQ_LOCK.lock();
+    // SAFETY: IRQ_LOCK held.
+    let result = unsafe {
         let mut cur = (*(&raw const IRQ_HANDLERS))[irq_num];
+        let mut found = false;
         while !cur.is_null() {
-            if !(*cur).notification.is_null() {
-                return true;
+            if !(*cur).notification.load(Ordering::Acquire).is_null() {
+                found = true;
+                break;
             }
             cur = (*cur).next;
         }
-        false
-    }
+        found
+    };
+    IRQ_LOCK.unlock();
+    unsafe { crate::mm::restore_irq(irq_flag) };
+    result
 }
 
 /// Remove a specific handler from its IRQ chain.
 ///
-/// Caller must hold SCHED_IPC_LOCK.
+/// Acquires IRQ_LOCK internally (IRQ-safe).
 pub fn unregister_handler(handler: *mut IrqHandler) {
     if handler.is_null() {
         return;
     }
-    // SAFETY: Caller holds SCHED_IPC_LOCK; single-writer access to IRQ_HANDLERS.
+    let irq_flag = unsafe { crate::mm::save_irq_disable() };
+    IRQ_LOCK.lock();
+    // SAFETY: IRQ_LOCK held; single-writer access to IRQ_HANDLERS.
     unsafe {
         let irq_num = (*handler).irq_num as usize;
         if irq_num >= MAX_IRQS {
+            IRQ_LOCK.unlock();
+            crate::mm::restore_irq(irq_flag);
             return;
         }
         (*handler).active = false;
 
         let head = (*(&raw const IRQ_HANDLERS))[irq_num];
         if head == handler {
-            // Removing head of chain
             (*(&raw mut IRQ_HANDLERS))[irq_num] = (*handler).next;
         } else {
-            // Walk chain to find predecessor
             let mut prev = head;
             while !prev.is_null() && (*prev).next != handler {
                 prev = (*prev).next;
@@ -180,4 +213,6 @@ pub fn unregister_handler(handler: *mut IrqHandler) {
         }
         (*handler).next = core::ptr::null_mut();
     }
+    IRQ_LOCK.unlock();
+    unsafe { crate::mm::restore_irq(irq_flag) };
 }

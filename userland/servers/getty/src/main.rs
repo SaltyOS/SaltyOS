@@ -32,10 +32,18 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             besalt::serial::serial_puts(b"[getty] setsid failed\n");
         }
 
-        // 3. Open PTY slave as fd 0
-        let fd0 = posix_open(b"/dev/pts/0\0".as_ptr(), 2, 0); // O_RDWR
+        // 3. Open PTY slave as fd 0 — retry with backoff if TTYD/VFS not ready
+        let mut fd0 = -1i32;
+        let mut delay_ns: u64 = 100_000_000; // 100ms
+        for _attempt in 0..5u32 {
+            fd0 = posix_open(b"/dev/pts/0\0".as_ptr(), 2, 0); // O_RDWR
+            if fd0 >= 0 { break; }
+            besalt::serial::serial_puts(b"[getty] /dev/pts/0 open failed, retrying\n");
+            besalt::syscall::syscall(besalt::SYS_NANOSLEEP, 0, delay_ns, 0, 0, 0, 0);
+            delay_ns *= 2;
+        }
         if fd0 < 0 {
-            besalt::serial::serial_puts(b"[getty] failed to open /dev/pts/0\n");
+            besalt::serial::serial_puts(b"[getty] /dev/pts/0 open failed after retries\n");
             posix_exit(1);
         }
 

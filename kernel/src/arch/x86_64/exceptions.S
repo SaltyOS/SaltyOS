@@ -124,22 +124,12 @@ exception_common:
     // 184 mod 16 = 8, so we need to subtract 8 to align.
     sub $8, %rsp
 
-    // SCHED_IPC_LOCK for user-mode exceptions only (kernel-mode exceptions skip
-    // to avoid deadlock if exception occurs while lock is held).
-    // CS is at RSP + 8 (alignment) + 120 (15 GPRs) + 8 (cr2) + 8 (vec) + 8 (err) + 8 (RIP) = RSP + 160
-    testb $3, 160(%rsp)
-    jz .Lno_exc_lock
-    call sched_ipc_lock
-.Lno_exc_lock:
+    // No global lock for exceptions — per-endpoint locks and per-CPU scheduler
+    // locks handle synchronization (Zircon-style per-object locking).
 
     // Pass pointer to ExceptionFrame (above alignment padding)
     lea 8(%rsp), %rdi
     call exception_handler_rust
-
-    testb $3, 160(%rsp)
-    jz .Lno_exc_lock_ret
-    call sched_ipc_unlock
-.Lno_exc_lock_ret:
 
     add $8, %rsp
 
@@ -178,50 +168,7 @@ exception_common:
 // On IRQ entry, the CPU pushes: SS, RSP, RFLAGS, CS, RIP
 // No error code, no vector. CS is at RSP+8.
 
-// IRQ stub WITH SCHED_IPC_LOCK
-.macro irq_stub_sched_ipc name
-.global irq_stub_\name
-.type irq_stub_\name, @function
-irq_stub_\name:
-    // Check if from user mode
-    testb $3, 8(%rsp)
-    jz 1f
-    swapgs
-1:
-    // Save caller-saved registers
-    push %rax
-    push %rcx
-    push %rdx
-    push %rsi
-    push %rdi
-    push %r8
-    push %r9
-    push %r10
-    push %r11
-    // 9 pushes + 5 CPU pushes = 112 bytes, 16-byte aligned
-    call sched_ipc_lock
-    call irq_handler_\name
-    call sched_ipc_unlock
-    // Restore caller-saved registers
-    pop %r11
-    pop %r10
-    pop %r9
-    pop %r8
-    pop %rdi
-    pop %rsi
-    pop %rdx
-    pop %rcx
-    pop %rax
-    // Check if returning to user mode
-    testb $3, 8(%rsp)
-    jz 2f
-    swapgs
-2:
-    iretq
-.size irq_stub_\name, . - irq_stub_\name
-.endm
-
-// IRQ stub WITHOUT BKL (for VSpaceTeardown: per-CPU + atomics only)
+// IRQ stub: no global lock, handlers manage their own per-object locks
 .macro irq_stub_nobkl name
 .global irq_stub_\name
 .type irq_stub_\name, @function
@@ -261,9 +208,9 @@ irq_stub_\name:
 .size irq_stub_\name, . - irq_stub_\name
 .endm
 
-irq_stub_sched_ipc timer
+irq_stub_nobkl timer
 irq_stub_nobkl ipi_vspace_teardown
-irq_stub_sched_ipc ipi_reschedule
+irq_stub_nobkl ipi_reschedule
 irq_stub_nobkl ipi_tlb_shootdown
 irq_stub_nobkl ipi_tlb_shootdown_all
 
@@ -292,11 +239,10 @@ irq_stub_generic_\vector:
     push %r10
     push %r11
     // 9 pushes + 5 CPU pushes = 112 bytes, 16-byte aligned
-    call sched_ipc_lock
+    // No global lock — IRQ handlers use per-object locks internally
     // Pass vector number as argument
     mov $\vector, %edi
     call irq_handler_generic
-    call sched_ipc_unlock
     // Restore caller-saved registers
     pop %r11
     pop %r10

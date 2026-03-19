@@ -219,12 +219,27 @@ fn console_puts(s: &[u8]) {
     }
 }
 
-/// Forward output to the display server via buffered non-blocking nbsend.
+/// Forward output to the display server.
+/// Uses a queued nbsend fast path and a true blocking send fallback to
+/// preserve terminal stream ordering under display backpressure.
 fn display_write(data: &[u8]) {
     if data.is_empty() { return; }
     unsafe {
         display_tx_enqueue(data);
         display_try_flush();
+        if !display_tx_is_empty() {
+            let _ = display_flush_blocking_one();
+        }
+    }
+}
+
+unsafe fn display_flush_blocking_all() {
+    unsafe {
+        while !display_tx_is_empty() {
+            if !display_flush_blocking_one() {
+                break;
+            }
+        }
     }
 }
 
@@ -238,14 +253,38 @@ unsafe fn display_tx_is_full() -> bool {
     unsafe { ((DISPLAY_TX_HEAD + 1) % DISPLAY_TX_BUF_SIZE) == DISPLAY_TX_TAIL }
 }
 
+#[inline(always)]
+unsafe fn display_tx_len() -> usize {
+    unsafe { (DISPLAY_TX_HEAD + DISPLAY_TX_BUF_SIZE - DISPLAY_TX_TAIL) % DISPLAY_TX_BUF_SIZE }
+}
+
+#[inline(always)]
+unsafe fn display_tx_free() -> usize {
+    unsafe { DISPLAY_TX_BUF_SIZE - 1 - display_tx_len() }
+}
+
 unsafe fn display_tx_enqueue(data: &[u8]) {
     unsafe {
-        for &b in data {
+        let mut offset = 0usize;
+        while offset < data.len() {
             if display_tx_is_full() {
-                DISPLAY_TX_TAIL = (DISPLAY_TX_TAIL + 1) % DISPLAY_TX_BUF_SIZE;
+                display_try_flush();
+                if display_tx_is_full() && !display_flush_blocking_one() {
+                    return;
+                }
             }
-            DISPLAY_TX_BUF[DISPLAY_TX_HEAD] = b;
-            DISPLAY_TX_HEAD = (DISPLAY_TX_HEAD + 1) % DISPLAY_TX_BUF_SIZE;
+
+            let free = display_tx_free();
+            if free == 0 {
+                continue;
+            }
+
+            let count = core::cmp::min(free, data.len() - offset);
+            for i in 0..count {
+                DISPLAY_TX_BUF[DISPLAY_TX_HEAD] = data[offset + i];
+                DISPLAY_TX_HEAD = (DISPLAY_TX_HEAD + 1) % DISPLAY_TX_BUF_SIZE;
+            }
+            offset += count;
         }
     }
 }
@@ -270,10 +309,36 @@ unsafe fn display_tx_consume(n: usize) {
     }
 }
 
+unsafe fn display_flush_blocking_one() -> bool {
+    unsafe {
+        let mut chunk = [0u8; DISPLAY_TX_CHUNK_MAX];
+        let len = display_tx_peek_chunk(&mut chunk);
+        if len == 0 {
+            return true;
+        }
+
+        let mut msg = BesaltMsg::zeroed();
+        msg.label = DISPLAY_TERMINAL_WRITE;
+        msg.regs[0] = len as u64;
+        msg.length = 1 + ((len as u64 + 7) / 8);
+        let dst = &raw mut msg.regs[1] as *mut u8;
+        for (i, b) in chunk[..len].iter().enumerate() {
+            *dst.add(i) = *b;
+        }
+
+        let err = ipc::send_ctx(ipc_ctx(), CAP_DISPLAY_EP, &raw const msg);
+        if err == 0 {
+            display_tx_consume(len);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 unsafe fn display_try_flush() {
     unsafe {
         let mut chunk = [0u8; DISPLAY_TX_CHUNK_MAX];
-        let mut would_block_retries = 0usize;
         loop {
             if display_tx_is_empty() {
                 break;
@@ -296,35 +361,40 @@ unsafe fn display_try_flush() {
             let err = ipc::nbsend_ctx(ipc_ctx(), CAP_DISPLAY_EP, &raw const msg);
             if err == 0 {
                 display_tx_consume(len);
-                would_block_retries = 0;
                 continue;
             }
-            if err == BESALT_WOULD_BLOCK as i32 && would_block_retries < 8 {
-                let _ = besalt::syscall::syscall(SYS_NANOSLEEP, 0, 500_000, 0, 0, 0, 0);
-                would_block_retries += 1;
-                continue;
-            }
-            // Keep queued on backpressure/unavailable endpoint.
+            // Backpressure — keep queued, try again next iteration.
             break;
         }
     }
 }
 
-/// Forward raw input bytes to ttyd via blocking send (TTYD_INPUT_EVENT).
-/// Blocking send is safe because ttyd processes input events quickly
-/// (ring buffer push + signal, no blocking IPC during input handling).
+/// Forward raw input bytes to ttyd in bounded chunks.
+/// Uses nbsend first, then applies blocking backpressure if ttyd is saturated.
 fn forward_to_ttyd(raw: &[u8], raw_len: usize) {
     if raw_len == 0 { return; }
-    let mut fwd = BesaltMsg::zeroed();
-    fwd.label = TTYD_INPUT_EVENT;
-    fwd.regs[0] = raw_len as u64;
-    fwd.length = 1 + ((raw_len as u64 + 7) / 8);
-    let dst = &raw mut fwd.regs[1] as *mut u8;
-    unsafe {
-        for i in 0..raw_len {
-            *dst.add(i) = raw[i];
+    let mut offset = 0usize;
+    while offset < raw_len {
+        let chunk_len = core::cmp::min(raw_len - offset, 128);
+        let mut fwd = BesaltMsg::zeroed();
+        fwd.label = TTYD_INPUT_EVENT;
+        fwd.regs[0] = chunk_len as u64;
+        fwd.length = 1 + ((chunk_len as u64 + 7) / 8);
+        let dst = &raw mut fwd.regs[1] as *mut u8;
+        unsafe {
+            for i in 0..chunk_len {
+                *dst.add(i) = raw[offset + i];
+            }
+            let mut err = ipc::nbsend_ctx(ipc_ctx(), CAP_TTYD_EP, &raw const fwd);
+            if err != 0 {
+                err = ipc::send_ctx(ipc_ctx(), CAP_TTYD_EP, &raw const fwd);
+            }
+            if err != 0 {
+                serial::serial_puts(b"[CONSOLE] FAIL: ttyd input send failed\n");
+                return;
+            }
         }
-        ipc::send_ctx(ipc_ctx(), CAP_TTYD_EP, &raw const fwd);
+        offset += chunk_len;
     }
 }
 
@@ -338,6 +408,7 @@ unsafe fn handle_write(msg: *const BesaltMsg) {
         );
         console_puts(data);
         display_write(data);
+        display_flush_blocking_all();
     }
 }
 
@@ -432,7 +503,7 @@ pub extern "C" fn _start() -> ! {
         // Regular IPC may carry a non-zero badge (sender badge).
         if badge != 0 && msg.label == 0 && msg.length == 0 {
             // Notification: drain COM1 and PS/2 input, forward to ttyd.
-            let mut raw_buf = [0u8; 32];
+            let mut raw_buf = [0u8; 256];
             let mut raw_len = 0;
 
             // COM1 input
@@ -440,7 +511,7 @@ pub extern "C" fn _start() -> ! {
                 let lsr = invoke::ioport_in8(CAP_IOPORT, COM1_LSR);
                 if (lsr & LSR_DR) == 0 { break; }
                 let c = invoke::ioport_in8(CAP_IOPORT, COM1_RBR);
-                if raw_len < 32 {
+                if raw_len < 256 {
                     raw_buf[raw_len] = c;
                     raw_len += 1;
                 }
@@ -454,7 +525,7 @@ pub extern "C" fn _start() -> ! {
                 let scancode = invoke::ioport_in8(CAP_KBD_IOPORT, PS2_DATA);
                 let key = kbd.translate(scancode);
                 for i in 0..key.len as usize {
-                    if raw_len < 32 {
+                    if raw_len < 256 {
                         raw_buf[raw_len] = key.bytes[i];
                         raw_len += 1;
                     }

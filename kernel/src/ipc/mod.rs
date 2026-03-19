@@ -145,8 +145,24 @@ pub unsafe fn block_current_thread(tcb: *mut Tcb, reason: BlockedReason) {
         (*tcb).state = ThreadState::Blocked;
     }
 
-    // Do NOT enqueue - thread is in endpoint/notification queue, not ready queue
+    // Do NOT enqueue - thread is in endpoint/notification queue, not ready queue.
+    // Caller must release any IPC/endpoint lock BEFORE calling reschedule.
     get_scheduler().reschedule();
+}
+
+/// Block current thread WITHOUT calling reschedule.
+///
+/// Sets state to Blocked and blocked_reason. The caller is responsible
+/// for releasing any held locks and calling reschedule() separately.
+/// This is the Zircon-style pattern: lock → modify state → unlock → reschedule.
+///
+/// # Safety
+/// Must be called with interrupts disabled.
+pub unsafe fn block_current_thread_no_switch(tcb: *mut Tcb, reason: BlockedReason) {
+    unsafe {
+        (*tcb).blocked_reason = Some(reason);
+        (*tcb).state = ThreadState::Blocked;
+    }
 }
 
 /// Wake a blocked thread

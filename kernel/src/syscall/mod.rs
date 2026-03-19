@@ -8,7 +8,7 @@ pub mod fastpath;
 
 use crate::cap::{CapError, CapRights, Capability, CNode, FrameObject, IoPortRange, ObjectType, UntypedMemory};
 use crate::ipc::{Endpoint, Message, Notification};
-use crate::mm::{phys_to_virt, save_irq_disable, restore_irq, SCHED_IPC_LOCK, CAP_LOCK};
+use crate::mm::{phys_to_virt, save_irq_disable, restore_irq, CAP_LOCK};
 use crate::mm::vspace::{CowNotifRing, CowPool, PageFlags, VSpace, VSpaceError};
 use crate::sched::thread::{BlockedReason, SchedContext, Tcb, ThreadState};
 use core::sync::atomic::Ordering;
@@ -571,13 +571,11 @@ fn syscall_send(
             Err(e) => return SyscallResult::err(e),
         }
 
-        // Phase 2: IPC under SCHED_IPC_LOCK
+        // Phase 2: IPC under per-endpoint lock (managed inside method)
         unsafe {
             let irq = save_irq_disable();
-            SCHED_IPC_LOCK.lock();
             let endpoint = &mut *(cap.object as *mut Endpoint);
             endpoint.send(&msg, cap.badge);
-            SCHED_IPC_LOCK.unlock();
             restore_irq(irq);
         }
         return SyscallResult::ok(0);
@@ -597,16 +595,17 @@ fn syscall_send(
             reply_msg.extra_caps = 0;
             reply_msg.caps = [0; 4];
 
-            // Phase 2: Wake caller under SCHED_IPC_LOCK
+            // Phase 2: Wake caller under per-TCB lock
             let irq = save_irq_disable();
-            SCHED_IPC_LOCK.lock();
+            let caller_tcb = &*caller;
+            caller_tcb.tcb_lock();
 
             let blocked_for_reply = matches!(
                 (*caller).blocked_reason,
                 Some(BlockedReason::ReplyWait { .. }) | Some(BlockedReason::FaultBlocked { .. })
             );
             if !blocked_for_reply || (*caller).state != ThreadState::Blocked {
-                SCHED_IPC_LOCK.unlock();
+                caller_tcb.tcb_unlock();
                 restore_irq(irq);
                 return SyscallResult::err(SyscallError::InvalidOperation);
             }
@@ -618,7 +617,7 @@ fn syscall_send(
 
             crate::sched::scheduler::scheduler().enqueue(caller);
 
-            SCHED_IPC_LOCK.unlock();
+            caller_tcb.tcb_unlock();
             restore_irq(irq);
 
             // Phase 3: Delete one-shot reply cap under CAP_LOCK
@@ -650,14 +649,12 @@ fn syscall_recv(cap_ptr: u64) -> SyscallResult {
         Err(e) => return SyscallResult::err(e),
     }
 
-    // Phase 2: IPC under SCHED_IPC_LOCK
+    // Phase 2: IPC under per-endpoint lock (managed inside method)
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let endpoint = &mut *(cap.object as *mut Endpoint);
         let (msg, badge) = endpoint.recv();
         write_msg_to_ipc_buffer(&msg, badge);
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
         SyscallResult::ok(badge)
     }
@@ -684,14 +681,12 @@ fn syscall_call(
 
     let msg = construct_message(msg_info, mr0, mr1, mr2, mr3);
 
-    // Phase 2: IPC under SCHED_IPC_LOCK
+    // Phase 2: IPC under per-endpoint lock (managed inside method)
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let endpoint = &mut *(cap.object as *mut Endpoint);
         let reply_msg = endpoint.call(&msg, cap.badge);
         write_msg_to_ipc_buffer(&reply_msg, 0);
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
     }
 
@@ -719,14 +714,12 @@ fn syscall_reply_recv(
 
     let reply = construct_message(msg_info, mr0, mr1, mr2, mr3);
 
-    // Phase 2: IPC under SCHED_IPC_LOCK
+    // Phase 2: IPC under per-endpoint lock (managed inside method)
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let endpoint = &mut *(cap.object as *mut Endpoint);
         let (msg, badge) = endpoint.reply_recv(&reply);
         write_msg_to_ipc_buffer(&msg, badge);
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
         SyscallResult::ok(badge)
     }
@@ -753,17 +746,15 @@ fn syscall_nbsend(
 
     let msg = construct_message(msg_info, mr0, mr1, mr2, mr3);
 
-    // Phase 2: IPC under SCHED_IPC_LOCK
+    // Phase 2: IPC under per-endpoint lock (managed inside method)
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let endpoint = &mut *(cap.object as *mut Endpoint);
         let result = if endpoint.nbsend(&msg, cap.badge) {
             SyscallResult::ok(0)
         } else {
             SyscallResult::err(SyscallError::WouldBlock)
         };
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
         result
     }
@@ -781,13 +772,11 @@ fn syscall_signal(cap_ptr: u64, bits: u64) -> SyscallResult {
         Err(e) => return SyscallResult::err(e),
     }
 
-    // Phase 2: Signal under SCHED_IPC_LOCK (may wake threads)
+    // Phase 2: Signal under per-notification lock (managed inside method)
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let notification = &mut *(cap.object as *mut Notification);
         notification.signal(cap.badge | bits);
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
     }
 
@@ -806,13 +795,11 @@ fn syscall_wait(cap_ptr: u64) -> SyscallResult {
         Err(e) => return SyscallResult::err(e),
     }
 
-    // Phase 2: Wait under SCHED_IPC_LOCK (may block/context-switch)
+    // Phase 2: Wait under per-notification lock (managed inside method)
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let notification = &mut *(cap.object as *mut Notification);
         let bits = notification.wait();
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
         SyscallResult::ok(bits)
     }
@@ -830,7 +817,7 @@ fn syscall_poll(cap_ptr: u64) -> SyscallResult {
         Err(e) => return SyscallResult::err(e),
     }
 
-    // Phase 2: Poll is atomic swap — no SCHED_IPC_LOCK needed
+    // Phase 2: Poll is atomic swap — no lock needed
     unsafe {
         let notification = &mut *(cap.object as *mut Notification);
         match notification.poll() {
@@ -852,16 +839,16 @@ fn syscall_set_invoke_depths(depth0: u64, depth1: u64) -> SyscallResult {
 
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let current_tcb = crate::sched::scheduler::scheduler().current();
         if current_tcb.is_null() {
-            SCHED_IPC_LOCK.unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
+        let tcb = &*current_tcb;
+        tcb.tcb_lock();
         (*current_tcb).invoke_depth0 = depth0 as u8;
         (*current_tcb).invoke_depth1 = depth1 as u8;
-        SCHED_IPC_LOCK.unlock();
+        tcb.tcb_unlock();
         restore_irq(irq);
     }
 
@@ -1485,11 +1472,11 @@ fn syscall_sc_configure(cap: &Capability, budget_us: u64, period_us: u64) -> Sys
         return SyscallResult::err(SyscallError::InvalidArgument);
     }
 
-    // Operation under SCHED_IPC_LOCK (SC state mutation)
+    // Operation under per-SC lock (SC state mutation)
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let sc = &mut *(cap.object as *mut SchedContext);
+        sc.sc_lock();
         sc.budget = budget_ticks;
         sc.period = period_ticks;
         sc.remaining = budget_ticks;
@@ -1500,7 +1487,7 @@ fn syscall_sc_configure(cap: &Capability, budget_us: u64, period_us: u64) -> Sys
         } else {
             sc.deadline = u64::MAX;
         }
-        SCHED_IPC_LOCK.unlock();
+        sc.sc_unlock();
         restore_irq(irq);
     }
 
@@ -1525,21 +1512,24 @@ fn syscall_sc_bind(cap: &Capability, tcb_cap_ptr: u64) -> SyscallResult {
         return SyscallResult::err(e);
     }
 
-    // Operation under SCHED_IPC_LOCK
+    // Operation under per-SC lock + per-TCB lock (lock order: sc_lock → tcb_lock)
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let sc = &mut *(cap.object as *mut SchedContext);
+        sc.sc_lock();
         let tcb = &mut *(tcb_cap.object as *mut Tcb);
+        tcb.tcb_lock();
 
         if !sc.bound_tcb.is_null() {
-            SCHED_IPC_LOCK.unlock();
+            tcb.tcb_unlock();
+            sc.sc_unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
 
         if !tcb.sched_context.is_null() {
-            SCHED_IPC_LOCK.unlock();
+            tcb.tcb_unlock();
+            sc.sc_unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
@@ -1554,7 +1544,8 @@ fn syscall_sc_bind(cap: &Capability, tcb_cap_ptr: u64) -> SyscallResult {
             scheduler.remove_from_ready_queue(tcb as *mut Tcb);
             scheduler.enqueue(tcb as *mut Tcb);
         }
-        SCHED_IPC_LOCK.unlock();
+        tcb.tcb_unlock();
+        sc.sc_unlock();
         restore_irq(irq);
     }
 
@@ -1567,14 +1558,14 @@ fn syscall_sc_unbind(cap: &Capability) -> SyscallResult {
         return SyscallResult::err(e);
     }
 
-    // Operation under SCHED_IPC_LOCK
+    // Operation under per-SC lock
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let sc = &mut *(cap.object as *mut SchedContext);
+        sc.sc_lock();
 
         if sc.bound_tcb.is_null() {
-            SCHED_IPC_LOCK.unlock();
+            sc.sc_unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
@@ -1582,14 +1573,14 @@ fn syscall_sc_unbind(cap: &Capability) -> SyscallResult {
         let tcb = &mut *sc.bound_tcb;
 
         if tcb.state == ThreadState::Running || tcb.state == ThreadState::Ready {
-            SCHED_IPC_LOCK.unlock();
+            sc.sc_unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
 
         tcb.sched_context = core::ptr::null_mut();
         sc.bound_tcb = core::ptr::null_mut();
-        SCHED_IPC_LOCK.unlock();
+        sc.sc_unlock();
         restore_irq(irq);
     }
 
@@ -1614,22 +1605,36 @@ fn syscall_sc_yield_to(cap: &Capability, target_sc_cap_ptr: u64) -> SyscallResul
         return SyscallResult::err(e);
     }
 
-    // Operation under SCHED_IPC_LOCK (scheduler manipulation + context switch)
+    // Operation under both SC locks (address-ordered to avoid ABBA deadlock)
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let current_sc = &mut *(cap.object as *mut SchedContext);
         let target_sc = &mut *(target_cap.object as *mut SchedContext);
+
+        // Lock in pointer-address order to prevent ABBA deadlock
+        let current_ptr = current_sc as *mut SchedContext as usize;
+        let target_ptr = target_sc as *mut SchedContext as usize;
+        if current_ptr < target_ptr {
+            current_sc.sc_lock();
+            target_sc.sc_lock();
+        } else if current_ptr > target_ptr {
+            target_sc.sc_lock();
+            current_sc.sc_lock();
+        } else {
+            // Same SC — just lock once
+            current_sc.sc_lock();
+        }
 
         target_sc.remaining += current_sc.remaining;
         current_sc.remaining = 0;
 
+        if current_ptr != target_ptr {
+            target_sc.sc_unlock();
+        }
+
         let scheduler = crate::sched::scheduler::scheduler();
-        // Use deferred enqueue to avoid SMP double-schedule race:
-        // do not place the running TCB into ready queue before its context
-        // has been saved by context_switch.
+        current_sc.sc_unlock();
         scheduler.yield_current();
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
     }
 
@@ -1668,22 +1673,22 @@ fn syscall_tcb_configure(
     // with context switching, VSpace operations, capability chains).
     const KSTACK_PAGES: usize = 4;
 
-    // alloc_contiguous_frames has its own MM_LOCK — do BEFORE acquiring SCHED_IPC_LOCK
+    // alloc_contiguous_frames has its own MM_LOCK — do BEFORE acquiring per-TCB lock
     let kstack_phys = match crate::mm::alloc_contiguous_frames(KSTACK_PAGES) {
         Some(f) => f,
         None => return SyscallResult::err(SyscallError::OutOfMemory),
     };
 
-    // TCB mutation under SCHED_IPC_LOCK
+    // TCB mutation under per-TCB lock
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let tcb = &mut *(cap.object as *mut Tcb);
+        tcb.tcb_lock();
 
         // Only allow configuring threads that are Inactive.
         // Configuring a Running/Ready/Blocked thread would corrupt its context.
         if tcb.state != ThreadState::Inactive {
-            SCHED_IPC_LOCK.unlock();
+            tcb.tcb_unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::Busy);
         }
@@ -1696,7 +1701,7 @@ fn syscall_tcb_configure(
 
         if !tcb.vspace_root.is_null() {
             let vspace = &*tcb.vspace_root;
-            SCHED_IPC_LOCK.unlock();
+            tcb.tcb_unlock();
             restore_irq(irq);
 
             // Allocate trampoline stack outside lock
@@ -1706,7 +1711,7 @@ fn syscall_tcb_configure(
             };
 
             let irq = save_irq_disable();
-            SCHED_IPC_LOCK.lock();
+            tcb.tcb_lock();
             let tramp_stack_virt = crate::mm::phys_to_virt(tramp_stack_phys);
             let tramp_stack_top = tramp_stack_virt + crate::mm::PAGE_SIZE as u64;
             core::ptr::write_bytes(tramp_stack_virt as *mut u8, 0, crate::mm::PAGE_SIZE);
@@ -1724,10 +1729,10 @@ fn syscall_tcb_configure(
             // Reset FPU state for fresh execution (exec replaces the process image)
             tcb.fpu_initialized = false;
             tcb.fpu_state = crate::sched::thread::XSaveArea::zeroed();
-            SCHED_IPC_LOCK.unlock();
+            tcb.tcb_unlock();
             restore_irq(irq);
         } else {
-            SCHED_IPC_LOCK.unlock();
+            tcb.tcb_unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
@@ -1736,17 +1741,68 @@ fn syscall_tcb_configure(
     SyscallResult::ok(0)
 }
 
+/// Detach a blocked thread from auxiliary wait queues before changing its run state.
+///
+/// This intentionally avoids holding the scheduler lock while acquiring
+/// endpoint/notification/futex/sleep-queue locks. Wake paths take those
+/// subsystem locks first and only enqueue afterwards, so suspend/resume must
+/// follow the same order to avoid lock inversion on SMP.
+unsafe fn detach_thread_wait_queues(tcb: *mut Tcb) {
+    unsafe {
+        let blocked_reason = (*tcb).blocked_reason;
+
+        if matches!(
+            blocked_reason,
+            Some(BlockedReason::TimerBlocked)
+                | Some(BlockedReason::FutexTimedBlocked)
+                | Some(BlockedReason::SendTimedBlocked { .. })
+                | Some(BlockedReason::RecvTimedBlocked)
+        ) {
+            crate::sched::sleep_queue::remove(tcb);
+            (*tcb).timer_wakeup_ns = 0;
+        }
+
+        if !(*tcb).blocked_endpoint.is_null() {
+            let ep = &mut *((*tcb).blocked_endpoint as *mut crate::ipc::Endpoint);
+            ep.ep_lock();
+            ep.remove_from_queue(tcb);
+            ep.ep_unlock();
+            (*tcb).blocked_endpoint = core::ptr::null_mut();
+        }
+
+        if !(*tcb).blocked_notification.is_null() {
+            crate::ipc::Notification::clear_tcb_wait_registration(tcb);
+        }
+
+        if matches!(
+            blocked_reason,
+            Some(BlockedReason::FutexBlocked) | Some(BlockedReason::FutexTimedBlocked)
+        ) {
+            crate::ipc::futex::futex_remove_thread(tcb);
+        }
+
+        if matches!(
+            blocked_reason,
+            Some(BlockedReason::FutexTimedBlocked)
+                | Some(BlockedReason::SendTimedBlocked { .. })
+                | Some(BlockedReason::RecvTimedBlocked)
+        ) {
+            (*tcb).futex_wakeup_result = 0;
+        }
+    }
+}
+
 /// TCB_RESUME: Make a thread runnable
 fn syscall_tcb_resume(cap: &Capability) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::RESUME) {
         return SyscallResult::err(e);
     }
 
-    // Operation under SCHED_IPC_LOCK (TCB state transitions + scheduler)
+    // Operation under per-TCB lock (TCB state transitions + scheduler)
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let tcb = &mut *(cap.object as *mut Tcb);
+        tcb.tcb_lock();
         match tcb.state {
             ThreadState::Running | ThreadState::Ready => {
                 // Already runnable, no-op
@@ -1757,45 +1813,18 @@ fn syscall_tcb_resume(cap: &Capability) -> SyscallResult {
             }
             ThreadState::Blocked => {
                 let scheduler = crate::sched::scheduler::scheduler();
-                scheduler.with_lock(|sched| {
-                    if matches!(tcb.blocked_reason, Some(BlockedReason::TimerBlocked)) {
-                        crate::sched::sleep_queue::remove(tcb as *mut Tcb);
-                        tcb.timer_wakeup_ns = 0;
-                    }
-                    if !tcb.blocked_endpoint.is_null() {
-                        let ep = &mut *(tcb.blocked_endpoint as *mut crate::ipc::Endpoint);
-                        ep.remove_from_queue(tcb as *mut Tcb);
-                        tcb.blocked_endpoint = core::ptr::null_mut();
-                    }
-                    if !tcb.blocked_notification.is_null() {
-                        let ntfn = &mut *(tcb.blocked_notification as *mut crate::ipc::Notification);
-                        ntfn.remove_waiter(tcb as *mut Tcb);
-                        tcb.blocked_notification = core::ptr::null_mut();
-                    }
-                    if matches!(tcb.blocked_reason, Some(BlockedReason::FutexBlocked)) {
-                        crate::ipc::futex::futex_remove_thread(tcb as *mut Tcb);
-                    }
-                    if matches!(tcb.blocked_reason, Some(BlockedReason::FutexTimedBlocked)) {
-                        crate::ipc::futex::futex_remove_thread(tcb as *mut Tcb);
-                        crate::sched::sleep_queue::remove(tcb as *mut Tcb);
-                        tcb.timer_wakeup_ns = 0;
-                        tcb.futex_wakeup_result = 0;
-                    }
-                    tcb.blocked_reason = None;
-                    sched.enqueue_unlocked(tcb as *mut Tcb);
-                });
+                detach_thread_wait_queues(tcb as *mut Tcb);
+                tcb.blocked_reason = None;
+                scheduler.enqueue(tcb as *mut Tcb);
             }
             ThreadState::Waiting => {
-                if !tcb.blocked_notification.is_null() {
-                    let ntfn = &mut *(tcb.blocked_notification as *mut crate::ipc::Notification);
-                    ntfn.remove_waiter(tcb as *mut Tcb);
-                    tcb.blocked_notification = core::ptr::null_mut();
-                }
+                detach_thread_wait_queues(tcb as *mut Tcb);
+                tcb.blocked_reason = None;
                 let scheduler = crate::sched::scheduler::scheduler();
                 scheduler.enqueue(tcb as *mut Tcb);
             }
         }
-        SCHED_IPC_LOCK.unlock();
+        tcb.tcb_unlock();
         restore_irq(irq);
     }
 
@@ -1808,11 +1837,11 @@ fn syscall_tcb_suspend(cap: &Capability) -> SyscallResult {
         return SyscallResult::err(e);
     }
 
-    // Operation under SCHED_IPC_LOCK (TCB state transitions + scheduler)
+    // Operation under per-TCB lock (TCB state transitions + scheduler)
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let tcb = &mut *(cap.object as *mut Tcb);
+        tcb.tcb_lock();
         let scheduler = crate::sched::scheduler::scheduler();
 
         // Clean up PIP state before suspension
@@ -1828,15 +1857,16 @@ fn syscall_tcb_suspend(cap: &Capability) -> SyscallResult {
                 scheduler.unlock();
                 match target_cpu {
                     Some(cpu) if cpu == this_cpu => {
-                        // Self-suspend or same-CPU: reschedule locally
+                        // Self-suspend: release lock, then reschedule
+                        tcb.tcb_unlock();
                         scheduler.reschedule();
+                        restore_irq(irq);
+                        return SyscallResult::ok(0);
                     }
                     Some(cpu) => {
-                        // Cross-CPU: synchronous suspend. Release SCHED_IPC_LOCK
-                        // before spinning — the IPI handler on the target CPU
-                        // acquires it (irq_stub_sched_ipc → handle_reschedule_ipi).
+                        // Cross-CPU: synchronous suspend.
                         let target_tcb_ptr = tcb as *mut Tcb as usize;
-                        SCHED_IPC_LOCK.unlock();
+                        tcb.tcb_unlock();
                         restore_irq(irq);
                         // SAFETY: cpu is a valid CPU index from current[] scan
                         crate::arch::send_ipi(cpu, crate::arch::IpiKind::Reschedule);
@@ -1851,61 +1881,51 @@ fn syscall_tcb_suspend(cap: &Capability) -> SyscallResult {
                                 return SyscallResult::err(SyscallError::Busy);
                             }
                         }
+                        let irq = save_irq_disable();
+                        tcb.tcb_lock();
+                        scheduler.cancel_pending_enqueue(tcb as *mut Tcb);
+                        scheduler.remove_from_ready_queue(tcb as *mut Tcb);
+                        detach_thread_wait_queues(tcb as *mut Tcb);
+                        tcb.tcb_unlock();
+                        restore_irq(irq);
                         return SyscallResult::ok(0);
                     }
                     None => {
-                        // Thread already descheduled (raced with yield/block)
+                        // Thread already descheduled (raced with yield/block).
+                        // Fall through to common inactive cleanup below.
                     }
                 }
+
+                scheduler.cancel_pending_enqueue(tcb as *mut Tcb);
+                scheduler.remove_from_ready_queue(tcb as *mut Tcb);
+                detach_thread_wait_queues(tcb as *mut Tcb);
             }
             ThreadState::Ready => {
+                scheduler.cancel_pending_enqueue(tcb as *mut Tcb);
                 scheduler.remove_from_ready_queue(tcb as *mut Tcb);
                 tcb.state = ThreadState::Inactive;
             }
             ThreadState::Blocked => {
-                scheduler.with_lock(|_sched| {
-                    if matches!(tcb.blocked_reason, Some(BlockedReason::TimerBlocked)) {
-                        crate::sched::sleep_queue::remove(tcb as *mut Tcb);
-                        tcb.timer_wakeup_ns = 0;
-                    }
-                    if !tcb.blocked_endpoint.is_null() {
-                        let ep = &mut *(tcb.blocked_endpoint as *mut crate::ipc::Endpoint);
-                        ep.remove_from_queue(tcb as *mut Tcb);
-                        tcb.blocked_endpoint = core::ptr::null_mut();
-                    }
-                    if !tcb.blocked_notification.is_null() {
-                        let ntfn = &mut *(tcb.blocked_notification as *mut crate::ipc::Notification);
-                        ntfn.remove_waiter(tcb as *mut Tcb);
-                        tcb.blocked_notification = core::ptr::null_mut();
-                    }
-                    if matches!(tcb.blocked_reason, Some(BlockedReason::FutexBlocked)) {
-                        crate::ipc::futex::futex_remove_thread(tcb as *mut Tcb);
-                    }
-                    if matches!(tcb.blocked_reason, Some(BlockedReason::FutexTimedBlocked)) {
-                        crate::ipc::futex::futex_remove_thread(tcb as *mut Tcb);
-                        crate::sched::sleep_queue::remove(tcb as *mut Tcb);
-                        tcb.timer_wakeup_ns = 0;
-                        tcb.futex_wakeup_result = 0;
-                    }
-                    tcb.state = ThreadState::Inactive;
-                    tcb.blocked_reason = None;
-                    tcb.reply_tcb = core::ptr::null_mut();
-                    tcb.reply_can_grant = false;
-                    tcb.saved_caller_msg = crate::ipc::Message::empty();
-                    tcb.saved_caller_badge = 0;
-                });
+                scheduler.cancel_pending_enqueue(tcb as *mut Tcb);
+                detach_thread_wait_queues(tcb as *mut Tcb);
+                scheduler.remove_from_ready_queue(tcb as *mut Tcb);
+                tcb.state = ThreadState::Inactive;
+                tcb.blocked_reason = None;
+                tcb.reply_tcb = core::ptr::null_mut();
+                tcb.reply_can_grant = false;
+                tcb.saved_caller_msg = crate::ipc::Message::empty();
+                tcb.saved_caller_badge = 0;
             }
             ThreadState::Waiting => {
-                if !tcb.blocked_notification.is_null() {
-                    let ntfn = &mut *(tcb.blocked_notification as *mut crate::ipc::Notification);
-                    ntfn.remove_waiter(tcb as *mut Tcb);
-                    tcb.blocked_notification = core::ptr::null_mut();
-                }
+                scheduler.cancel_pending_enqueue(tcb as *mut Tcb);
+                detach_thread_wait_queues(tcb as *mut Tcb);
+                scheduler.remove_from_ready_queue(tcb as *mut Tcb);
                 tcb.state = ThreadState::Inactive;
+                tcb.blocked_reason = None;
             }
             ThreadState::Inactive => {}
         }
-        SCHED_IPC_LOCK.unlock();
+        tcb.tcb_unlock();
         restore_irq(irq);
     }
 
@@ -1950,15 +1970,15 @@ fn syscall_tcb_set_space(
         return SyscallResult::err(SyscallError::InvalidArgument);
     }
 
-    // TCB mutation under SCHED_IPC_LOCK
+    // TCB mutation under per-TCB lock
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let tcb = &mut *(cap.object as *mut Tcb);
+        tcb.tcb_lock();
         tcb.cspace_root = cspace_cap.object as *mut CNode;
         tcb.vspace_root = vspace_cap.object as *mut VSpace;
         tcb.cspace_depth = cspace_depth as u8;
-        SCHED_IPC_LOCK.unlock();
+        tcb.tcb_unlock();
         restore_irq(irq);
     }
 
@@ -1979,11 +1999,11 @@ fn syscall_tcb_set_affinity(cap: &Capability, cpu_id: u64) -> SyscallResult {
         return SyscallResult::err(SyscallError::InvalidArgument);
     }
 
-    // TCB mutation under SCHED_IPC_LOCK
+    // TCB mutation under per-TCB lock
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let tcb = &mut *(cap.object as *mut Tcb);
+        tcb.tcb_lock();
         tcb.cpu_affinity = affinity;
 
         // If thread is in ready queue, re-enqueue with new affinity
@@ -1992,7 +2012,7 @@ fn syscall_tcb_set_affinity(cap: &Capability, cpu_id: u64) -> SyscallResult {
             scheduler.remove_from_ready_queue(tcb as *mut Tcb);
             scheduler.enqueue(tcb as *mut Tcb);
         }
-        SCHED_IPC_LOCK.unlock();
+        tcb.tcb_unlock();
         restore_irq(irq);
     }
 
@@ -2010,17 +2030,17 @@ fn syscall_tcb_read_registers(cap: &Capability, _flags: u64) -> SyscallResult {
         return SyscallResult::err(e);
     }
 
-    // TCB read under SCHED_IPC_LOCK
+    // TCB read under per-TCB lock
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let tcb = &*(cap.object as *const Tcb);
+        tcb.tcb_lock();
         let result = if tcb.state != ThreadState::Inactive {
             SyscallResult::err(SyscallError::Busy)
         } else {
             SyscallResult::ok(tcb.context.rip)
         };
-        SCHED_IPC_LOCK.unlock();
+        tcb.tcb_unlock();
         restore_irq(irq);
         result
     }
@@ -2042,16 +2062,16 @@ fn syscall_tcb_write_registers(
         return SyscallResult::err(e);
     }
 
-    // TCB mutation under SCHED_IPC_LOCK
+    // TCB mutation under per-TCB lock
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let tcb = &mut *(cap.object as *mut Tcb);
+        tcb.tcb_lock();
         // The saved `context` for Ready/Blocked/Waiting threads is often a
         // kernel continuation (e.g. switch_common resume point), not user RIP/RSP.
         // Allowing writes in those states can corrupt kernel return paths.
         if tcb.state != ThreadState::Inactive {
-            SCHED_IPC_LOCK.unlock();
+            tcb.tcb_unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::Busy);
         }
@@ -2063,7 +2083,7 @@ fn syscall_tcb_write_registers(
             let scheduler = crate::sched::scheduler::scheduler();
             scheduler.enqueue(tcb as *mut Tcb);
         }
-        SCHED_IPC_LOCK.unlock();
+        tcb.tcb_unlock();
         restore_irq(irq);
     }
 
@@ -2079,11 +2099,11 @@ fn syscall_tcb_set_priority(cap: &Capability, priority: u64) -> SyscallResult {
         return SyscallResult::err(e);
     }
 
-    // TCB mutation + scheduler under SCHED_IPC_LOCK
+    // TCB mutation + scheduler under per-TCB lock
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let tcb = &mut *(cap.object as *mut Tcb);
+        tcb.tcb_lock();
         tcb.base_priority = priority;
         tcb.priority = priority;
 
@@ -2092,7 +2112,7 @@ fn syscall_tcb_set_priority(cap: &Capability, priority: u64) -> SyscallResult {
             scheduler.remove_from_ready_queue(tcb as *mut Tcb);
             scheduler.enqueue(tcb as *mut Tcb);
         }
-        SCHED_IPC_LOCK.unlock();
+        tcb.tcb_unlock();
         restore_irq(irq);
     }
 
@@ -2128,13 +2148,13 @@ fn syscall_tcb_set_ipc_buffer(cap: &Capability, addr: u64) -> SyscallResult {
         return SyscallResult::err(e);
     }
 
-    // TCB mutation under SCHED_IPC_LOCK
+    // TCB mutation under per-TCB lock
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let tcb = &mut *(cap.object as *mut Tcb);
+        tcb.tcb_lock();
         tcb.ipc_buffer = addr;
-        SCHED_IPC_LOCK.unlock();
+        tcb.tcb_unlock();
         restore_irq(irq);
     }
 
@@ -2159,27 +2179,30 @@ fn syscall_tcb_bind_notification(cap: &Capability, ntfn_cap_ptr: u64) -> Syscall
         return SyscallResult::err(e);
     }
 
-    // TCB + notification mutation under SCHED_IPC_LOCK
+    // TCB + notification mutation under per-TCB lock
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let tcb = &mut *(cap.object as *mut Tcb);
+        tcb.tcb_lock();
         if !tcb.bound_notification.is_null() {
-            SCHED_IPC_LOCK.unlock();
+            tcb.tcb_unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::Busy);
         }
 
         let ntfn = &mut *(ntfn_cap.object as *mut crate::ipc::Notification);
+        ntfn.ntfn_lock();
         if !ntfn.bound_tcb.is_null() {
-            SCHED_IPC_LOCK.unlock();
+            ntfn.ntfn_unlock();
+            tcb.tcb_unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::Busy);
         }
 
         tcb.bound_notification = ntfn_cap.object as *mut u8;
         ntfn.bound_tcb = tcb as *mut Tcb;
-        SCHED_IPC_LOCK.unlock();
+        ntfn.ntfn_unlock();
+        tcb.tcb_unlock();
         restore_irq(irq);
     }
 
@@ -2192,21 +2215,23 @@ fn syscall_tcb_unbind_notification(cap: &Capability) -> SyscallResult {
         return SyscallResult::err(e);
     }
 
-    // TCB + notification mutation under SCHED_IPC_LOCK
+    // TCB + notification mutation under per-TCB lock
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let tcb = &mut *(cap.object as *mut Tcb);
+        tcb.tcb_lock();
         if tcb.bound_notification.is_null() {
-            SCHED_IPC_LOCK.unlock();
+            tcb.tcb_unlock();
             restore_irq(irq);
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
 
         let ntfn = &mut *(tcb.bound_notification as *mut crate::ipc::Notification);
+        ntfn.ntfn_lock();
         ntfn.bound_tcb = core::ptr::null_mut();
+        ntfn.ntfn_unlock();
         tcb.bound_notification = core::ptr::null_mut();
-        SCHED_IPC_LOCK.unlock();
+        tcb.tcb_unlock();
         restore_irq(irq);
     }
 
@@ -2230,23 +2255,35 @@ fn syscall_tcb_set_fault_handler(
         return SyscallResult::err(e);
     }
 
-    // Sub-lookup under CAP_LOCK
-    let ep_cap = match lookup_cap_locked(fault_ep_cap_ptr) {
-        Ok(c) => c,
-        Err(e) => return SyscallResult::err(e),
+    let fault_handler = if fault_ep_cap_ptr == 0 {
+        None
+    } else {
+        let ep_cap = match lookup_cap_locked(fault_ep_cap_ptr) {
+            Ok(c) => c,
+            Err(e) => return SyscallResult::err(e),
+        };
+        if let Err(e) = validate_capability(&ep_cap, ObjectType::Endpoint, CapRights::SEND) {
+            return SyscallResult::err(e);
+        }
+        Some((ep_cap.object as *mut u8, ep_cap.badge))
     };
-    if let Err(e) = validate_capability(&ep_cap, ObjectType::Endpoint, CapRights::SEND) {
-        return SyscallResult::err(e);
-    }
 
-    // TCB mutation under SCHED_IPC_LOCK
+    // TCB mutation under per-TCB lock
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let tcb = &mut *(cap.object as *mut Tcb);
-        tcb.fault_handler = ep_cap.object as *mut u8;
-        tcb.fault_handler_badge = ep_cap.badge;
-        SCHED_IPC_LOCK.unlock();
+        tcb.tcb_lock();
+        match fault_handler {
+            Some((handler, badge)) => {
+                tcb.fault_handler = handler;
+                tcb.fault_handler_badge = badge;
+            }
+            None => {
+                tcb.fault_handler = core::ptr::null_mut();
+                tcb.fault_handler_badge = 0;
+            }
+        }
+        tcb.tcb_unlock();
         restore_irq(irq);
     }
 
@@ -2319,9 +2356,8 @@ fn syscall_tcb_set_tls_base(
 
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
-
         let tcb = cap.object as *mut Tcb;
+        (*tcb).tcb_lock();
         let current = crate::sched::scheduler::scheduler().current();
 
         if tcb == current {
@@ -2333,7 +2369,7 @@ fn syscall_tcb_set_tls_base(
             // would overwrite our write with read_fs_base() when that CPU
             // context-switches away from the target thread.
             if (*tcb).state == ThreadState::Running {
-                SCHED_IPC_LOCK.unlock();
+                (*tcb).tcb_unlock();
                 restore_irq(irq);
                 return SyscallResult::err(SyscallError::InvalidOperation);
             }
@@ -2341,7 +2377,7 @@ fn syscall_tcb_set_tls_base(
             (*tcb).tls_base = tls_base;
         }
 
-        SCHED_IPC_LOCK.unlock();
+        (*tcb).tcb_unlock();
         restore_irq(irq);
     }
 
@@ -2354,13 +2390,13 @@ fn syscall_sc_consumed(cap: &Capability) -> SyscallResult {
         return SyscallResult::err(e);
     }
 
-    // SC read under SCHED_IPC_LOCK
+    // SC read under per-SC lock
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let sc = &*(cap.object as *const SchedContext);
+        sc.sc_lock();
         let result = SyscallResult::ok(sc.consumed);
-        SCHED_IPC_LOCK.unlock();
+        sc.sc_unlock();
         restore_irq(irq);
         result
     }
@@ -3051,17 +3087,15 @@ fn syscall_irq_control_get(
         return SyscallResult::err(e);
     }
 
-    // Allocate + register under a single SCHED_IPC_LOCK hold to prevent SMP races.
+    // Allocate + register under IRQ_LOCK (managed by irq.rs) to prevent SMP races.
     // Shared IRQs are allowed: multiple handlers can coexist on the same IRQ line.
     let handler_ptr = unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
 
-        // Allocate from pool while still under lock
+        // Allocate from pool
         let ptr = match crate::init::alloc_dynamic_irq_handler(irq_num as u32) {
             Some(p) => p,
             None => {
-                SCHED_IPC_LOCK.unlock();
                 restore_irq(irq);
                 return SyscallResult::err(SyscallError::OutOfMemory);
             }
@@ -3073,7 +3107,6 @@ fn syscall_irq_control_get(
         (*ptr).level_triggered = true;
         crate::ipc::irq::register_handler(irq_num as usize, ptr);
 
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
         ptr
     };
@@ -3088,11 +3121,9 @@ fn syscall_irq_control_get(
             // Rollback: unregister handler
             unsafe {
                 let irq = save_irq_disable();
-                SCHED_IPC_LOCK.lock();
                 crate::ipc::irq::unregister_handler(handler_ptr);
                 // Only mask IOAPIC if no other handler remains on this IRQ
                 let should_mask = !crate::ipc::irq::has_handlers(irq_num as usize);
-                SCHED_IPC_LOCK.unlock();
                 restore_irq(irq);
                 if should_mask {
                     crate::arch::ioapic_mask(irq_num as u32);
@@ -3116,10 +3147,8 @@ fn syscall_irq_control_get(
             // Rollback: free slot, unregister handler
             crate::cap::free_slot(slot);
             let irq = save_irq_disable();
-            SCHED_IPC_LOCK.lock();
             crate::ipc::irq::unregister_handler(handler_ptr);
             let should_mask = !crate::ipc::irq::has_handlers(irq_num as usize);
-            SCHED_IPC_LOCK.unlock();
             restore_irq(irq);
             if should_mask {
                 crate::arch::ioapic_mask(irq_num as u32);
@@ -3141,18 +3170,16 @@ fn syscall_irq_handler_ack(cap: &Capability) -> SyscallResult {
         return SyscallResult::err(e);
     }
 
-    // IRQ handler mutation under SCHED_IPC_LOCK
+    // IRQ handler mutation (IRQ_LOCK managed by irq.rs)
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
-        irq_handler.acknowledged = true;
-        // Re-enable delivery at IOAPIC. dispatch_irq() masks the IRQ when
-        // no handler is ready to accept delivery; unmask it now that this
-        // handler has acknowledged and is ready for the next interrupt.
+        irq_handler.acknowledged.store(true, core::sync::atomic::Ordering::Release);
+        // Re-enable delivery at IOAPIC. dispatch_irq() only masks
+        // level-triggered IRQs when no handler is ready to accept delivery;
+        // edge-triggered ISA IRQs stay unmasked to avoid losing edges.
         let irq_num = irq_handler.irq_num;
         let level = irq_handler.level_triggered;
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
         if level {
             crate::arch::ioapic_unmask_level(irq_num);
@@ -3185,13 +3212,11 @@ fn syscall_irq_handler_set_notification(
         return SyscallResult::err(e);
     }
 
-    // IRQ handler mutation under SCHED_IPC_LOCK
+    // IRQ handler mutation (IRQ_LOCK managed by irq.rs)
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
-        irq_handler.notification = ntfn_cap.object as *mut Notification;
-        SCHED_IPC_LOCK.unlock();
+        irq_handler.notification.store(ntfn_cap.object as *mut Notification, core::sync::atomic::Ordering::Release);
         restore_irq(irq);
     }
 
@@ -3207,18 +3232,16 @@ fn syscall_irq_handler_clear(cap: &Capability) -> SyscallResult {
         return SyscallResult::err(e);
     }
 
-    // IRQ handler mutation under SCHED_IPC_LOCK
+    // IRQ handler mutation (IRQ_LOCK managed by irq.rs)
     let irq_num;
     let should_mask;
     unsafe {
         let irq = save_irq_disable();
-        SCHED_IPC_LOCK.lock();
         let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
         irq_num = irq_handler.irq_num;
-        irq_handler.notification = core::ptr::null_mut();
+        irq_handler.notification.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
         // Only mask if no other handler on this IRQ has a notification
         should_mask = !crate::ipc::irq::has_active_notification(irq_num as usize);
-        SCHED_IPC_LOCK.unlock();
         restore_irq(irq);
     }
 
@@ -4012,16 +4035,8 @@ pub fn handle(
         Syscall::Wait => syscall_wait(cap_ptr),
         Syscall::Poll => syscall_poll(cap_ptr),
         Syscall::Yield => {
-            // Yield under SCHED_IPC_LOCK using deferred enqueue.
-            // The current thread is NOT placed in the ready queue until
-            // context_switch has saved its registers (prevents SMP race).
-            unsafe {
-                let irq = save_irq_disable();
-                SCHED_IPC_LOCK.lock();
-                crate::sched::scheduler::scheduler().yield_current();
-                SCHED_IPC_LOCK.unlock();
-                restore_irq(irq);
-            }
+            // Yield using per-CPU scheduler lock only (no global lock).
+            crate::sched::yield_now();
             SyscallResult::ok(0)
         }
         Syscall::Invoke => syscall_invoke(cap_ptr, msg_info, mr0, mr1, mr2, mr3),
@@ -4073,22 +4088,29 @@ pub fn handle(
                     kbuf[i] = unsafe { core::ptr::read_volatile(user_ptr.add(i)) };
                 }
             }
-            // SAFETY: save/restore IRQ flags around spinlock
-            let irq = unsafe { save_irq_disable() };
-            crate::SERIAL_LOCK.lock();
-            crate::serial_write_hw(&kbuf[..len]);
-            crate::SERIAL_LOCK.unlock();
-            unsafe { restore_irq(irq) };
+            // Write in 32-byte chunks, re-enabling IRQs between chunks.
+            // This caps IRQ-disabled time to ~2.8ms per chunk (at 115200 baud)
+            // instead of ~22ms for a full 256-byte buffer, allowing timer ticks
+            // and IPIs to interleave with serial output.
+            let mut off = 0;
+            while off < len {
+                let end = if off + 32 < len { off + 32 } else { len };
+                // SAFETY: save/restore IRQ flags around spinlock
+                let irq = unsafe { save_irq_disable() };
+                crate::SERIAL_LOCK.lock();
+                crate::serial_write_hw(&kbuf[off..end]);
+                crate::SERIAL_LOCK.unlock();
+                unsafe { restore_irq(irq) };
+                off = end;
+            }
             SyscallResult::ok(0)
         }
         Syscall::ClockGetTime => syscall_clock_gettime(cap_ptr),
         Syscall::NanoSleep => {
-            // NanoSleep under SCHED_IPC_LOCK (block_current_sleeping may context-switch)
+            // NanoSleep — block_current_sleeping uses per-CPU scheduler lock only
             unsafe {
                 let irq = save_irq_disable();
-                SCHED_IPC_LOCK.lock();
                 let result = syscall_nanosleep(cap_ptr, msg_info);
-                SCHED_IPC_LOCK.unlock();
                 restore_irq(irq);
                 result
             }
@@ -4103,10 +4125,9 @@ pub fn handle(
             SyscallResult::ok(0)
         }
         Syscall::DebugDumpState => {
-            // Read scheduler state under SCHED_IPC_LOCK
+            // Read scheduler state (debug only, no lock needed)
             unsafe {
                 let irq = save_irq_disable();
-                SCHED_IPC_LOCK.lock();
                 let scheduler = crate::sched::scheduler::scheduler();
                 let current = scheduler.current();
                 if !current.is_null() {
@@ -4151,7 +4172,6 @@ pub fn handle(
                     s.putc(b'\n');
                     drop(s);
                 }
-                SCHED_IPC_LOCK.unlock();
                 restore_irq(irq);
             }
             SyscallResult::ok(0)
@@ -4195,10 +4215,8 @@ pub fn handle(
 
             unsafe {
                 let irq = save_irq_disable();
-                SCHED_IPC_LOCK.lock();
                 let endpoint = &mut *(cap.object as *mut Endpoint);
                 let result = endpoint.send_timeout(&msg, cap.badge, timeout_ns);
-                SCHED_IPC_LOCK.unlock();
                 restore_irq(irq);
 
                 if result == 0 {
@@ -4227,13 +4245,11 @@ pub fn handle(
 
             unsafe {
                 let irq = save_irq_disable();
-                SCHED_IPC_LOCK.lock();
                 let endpoint = &mut *(cap.object as *mut Endpoint);
                 let (msg, badge, result) = endpoint.recv_timeout(timeout_ns);
                 if result == 0 {
                     write_msg_to_ipc_buffer(&msg, badge);
                 }
-                SCHED_IPC_LOCK.unlock();
                 restore_irq(irq);
 
                 if result == 0 {

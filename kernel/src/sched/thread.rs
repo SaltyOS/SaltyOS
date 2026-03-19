@@ -2,6 +2,8 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
 use crate::cap::{KernelObject, ObjectType};
 use crate::cap::CNode;
 use crate::mm::VSpace;
@@ -86,11 +88,16 @@ pub enum BlockedReason {
     RecvTimedBlocked,
 }
 
+/// Sentinel value meaning no CPU currently owns the thread's live register state.
+pub const RUN_OWNER_NONE: u8 = u8::MAX;
+
 /// Thread Control Block
 #[repr(C)]
 pub struct Tcb {
     /// Kernel object header (must be first for refcount access)
     pub header: KernelObject,
+    /// Per-TCB spin lock state (0 = unlocked, 1 = locked)
+    pub tcb_lock_state: core::sync::atomic::AtomicU8,
     /// Thread state
     pub state: ThreadState,
     /// Priority (for EDF: effective deadline, may be boosted by PIP)
@@ -127,6 +134,20 @@ pub struct Tcb {
     pub cpu_affinity: u32,
     /// Last CPU this thread ran on (cache affinity hint for load balancer)
     pub last_cpu: u32,
+    /// CPU that still owns this thread's live register state.
+    ///
+    /// A thread may already be Blocked and present in an IPC wait queue while
+    /// the old CPU is still unwinding toward `context_switch`. Fastpath cross-CPU
+    /// handoff is only safe once this field becomes `RUN_OWNER_NONE`.
+    pub run_owner_cpu: AtomicU8,
+    /// Whether this thread is currently in the ready queue (O(1) membership test)
+    pub ready_queued: bool,
+    /// Which CPU's ready queue this thread is in (valid when ready_queued == true)
+    pub queued_cpu: u32,
+    /// Set by Notification::signal() when waking a bound TCB via endpoint.
+    /// recv()/reply_recv()/recv_timeout() checks this on resume to consume
+    /// notification bits under ntfn_lock instead of reading saved_caller_*.
+    pub woken_by_notification: bool,
     /// Next thread in queue
     pub next: *mut Tcb,
     /// Why this thread is blocked (valid when state == Blocked/Waiting)
@@ -244,6 +265,8 @@ impl ThreadContext {
 pub struct SchedContext {
     /// Kernel object header (must be first for refcount access)
     pub header: KernelObject,
+    /// Per-SC spin lock state (0 = unlocked, 1 = locked)
+    pub sc_lock_state: core::sync::atomic::AtomicU8,
     /// Budget per period (time units)
     pub budget: u64,
     /// Remaining budget
@@ -259,9 +282,51 @@ pub struct SchedContext {
 }
 
 impl Tcb {
+    #[inline]
+    pub fn tcb_lock(&self) {
+        use core::sync::atomic::Ordering;
+        if self.tcb_lock_state.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            return;
+        }
+        let mut backoff: u32 = 0;
+        loop {
+            for _ in 0..(1u32 << backoff.min(6)) { core::hint::spin_loop(); }
+            if self.tcb_lock_state.load(Ordering::Relaxed) == 0
+                && self.tcb_lock_state.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
+            { return; }
+            if backoff < 6 { backoff += 1; }
+        }
+    }
+
+    #[inline]
+    pub fn tcb_unlock(&self) {
+        self.tcb_lock_state.store(0, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn run_owner(&self) -> Option<usize> {
+        let owner = self.run_owner_cpu.load(Ordering::Acquire);
+        if owner == RUN_OWNER_NONE {
+            None
+        } else {
+            Some(owner as usize)
+        }
+    }
+
+    #[inline]
+    pub fn set_run_owner_cpu(&self, cpu_id: usize) {
+        self.run_owner_cpu.store(cpu_id as u8, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn clear_run_owner_cpu(&self) {
+        self.run_owner_cpu.store(RUN_OWNER_NONE, Ordering::Release);
+    }
+
     pub const fn new() -> Self {
         Self {
             header: KernelObject::new(ObjectType::Tcb, 0),
+            tcb_lock_state: AtomicU8::new(0),
             state: ThreadState::Inactive,
             priority: 0,
             base_priority: 0,
@@ -280,6 +345,10 @@ impl Tcb {
             sched_context: core::ptr::null_mut(),
             cpu_affinity: 0xFFFF_FFFF,
             last_cpu: 0xFFFF_FFFF,
+            run_owner_cpu: AtomicU8::new(RUN_OWNER_NONE),
+            ready_queued: false,
+            queued_cpu: 0xFFFF_FFFF,
+            woken_by_notification: false,
             next: core::ptr::null_mut(),
             blocked_reason: None,
             saved_caller_badge: 0,
@@ -320,6 +389,8 @@ impl Tcb {
             (*ptr).state = ThreadState::Inactive;
             (*ptr).cpu_affinity = 0xFFFF_FFFF;
             (*ptr).last_cpu = 0xFFFF_FFFF;
+            (*ptr).run_owner_cpu = AtomicU8::new(RUN_OWNER_NONE);
+            (*ptr).queued_cpu = 0xFFFF_FFFF;
         }
     }
 
@@ -331,6 +402,10 @@ impl Tcb {
     /// However, this DOES wake any caller waiting for a reply via reply_tcb.
     pub fn cleanup(&mut self) {
         self.state = ThreadState::Inactive;
+        self.ready_queued = false;
+        self.queued_cpu = 0xFFFF_FFFF;
+        self.woken_by_notification = false;
+        self.clear_run_owner_cpu();
         self.blocked_reason = None;
         self.blocked_endpoint = core::ptr::null_mut();
         self.blocked_notification = core::ptr::null_mut();
@@ -387,9 +462,31 @@ impl Tcb {
 }
 
 impl SchedContext {
+    #[inline]
+    pub fn sc_lock(&self) {
+        use core::sync::atomic::Ordering;
+        if self.sc_lock_state.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            return;
+        }
+        let mut backoff: u32 = 0;
+        loop {
+            for _ in 0..(1u32 << backoff.min(6)) { core::hint::spin_loop(); }
+            if self.sc_lock_state.load(Ordering::Relaxed) == 0
+                && self.sc_lock_state.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
+            { return; }
+            if backoff < 6 { backoff += 1; }
+        }
+    }
+
+    #[inline]
+    pub fn sc_unlock(&self) {
+        self.sc_lock_state.store(0, core::sync::atomic::Ordering::Release);
+    }
+
     pub const fn new() -> Self {
         Self {
             header: KernelObject::new(ObjectType::SchedContext, 0),
+            sc_lock_state: core::sync::atomic::AtomicU8::new(0),
             budget: 0,
             remaining: 0,
             period: 0,

@@ -49,20 +49,46 @@ impl SpinLock {
 
     #[inline]
     pub fn lock(&self) {
-        let mut _spins: u32 = 0;
-        while self
+        // Fast path: uncontended acquire
+        if self
             .locked
             .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
+            .is_ok()
         {
-            while self.locked.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+
+        // Slow path: bounded exponential backoff to reduce cache-line thrashing
+        let mut backoff: u32 = 0;
+        #[cfg(debug_assertions)]
+        let mut _total_spins: u32 = 0;
+        loop {
+            // Spin with exponential backoff (cap at 64 PAUSE iterations)
+            let spins = 1u32 << backoff.min(6);
+            for _ in 0..spins {
                 core::hint::spin_loop();
-                _spins += 1;
-                #[cfg(debug_assertions)]
-                if _spins > 10_000_000 {
+            }
+            #[cfg(debug_assertions)]
+            {
+                _total_spins += spins;
+                if _total_spins > 10_000_000 {
                     crate::serial_puts_raw("[SPINLOCK] possible deadlock detected\n");
-                    _spins = 0;
+                    _total_spins = 0;
                 }
+            }
+
+            // Try acquire after backoff
+            if self.locked.load(Ordering::Relaxed) == 0
+                && self
+                    .locked
+                    .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return;
+            }
+
+            if backoff < 6 {
+                backoff += 1;
             }
         }
     }
@@ -73,24 +99,14 @@ impl SpinLock {
     }
 }
 
-/// Subsystem lock: protects scheduler queues, endpoint/notification state,
-/// TCB state transitions, sleep queue, VSpace waiter queues.
-///
-/// Lock ordering (outermost → innermost):
-///   CAP_LOCK → SCHED_IPC_LOCK → scheduler.lock_state → VSpace.lock → MM_LOCK (FRAME_LOCK) → SERIAL_LOCK
-///
-/// Nesting patterns:
-///   - Slowpath syscalls: CAP_LOCK (cap lookup) → release → SCHED_IPC_LOCK (IPC)
-///   - IPC cap transfer (transfer_message): releases SCHED_IPC_LOCK → CAP_LOCK (slot copy) → releases CAP_LOCK → re-acquires SCHED_IPC_LOCK
-///   - Fastpath: CAP_LOCK (cap copy-to-stack) → release → SCHED_IPC_LOCK → scheduler.lock_state
-///   - Timer/IPI: SCHED_IPC_LOCK (assembly stub) → scheduler.lock_state
-///   - do_context_switch: releases SCHED_IPC_LOCK before switch, reacquires on resume
-pub static SCHED_IPC_LOCK: SpinLock = SpinLock::new();
-
 /// Subsystem lock: protects capability slot array, CDT operations, CNode ops,
 /// untyped child tracking, and capability lookup.
 ///
-/// Lock ordering: CAP_LOCK → SCHED_IPC_LOCK → scheduler.lock_state → VSpace.lock → MM_LOCK → SERIAL_LOCK
+/// Lock ordering (outermost → innermost):
+///   CAP_LOCK → endpoint.lock / ntfn.lock / tcb.lock / sc.lock → SLEEP_LOCK / FUTEX_LOCK / IRQ_LOCK → sched.lock_cpu → VSpace.lock → FRAME_LOCK → SERIAL_LOCK
+///
+/// Subsystem locks (SLEEP_LOCK, FUTEX_LOCK, IRQ_LOCK) are independent of each other
+/// and of per-object locks. They protect their own global data structures.
 pub static CAP_LOCK: SpinLock = SpinLock::new();
 
 /// Global frame allocator

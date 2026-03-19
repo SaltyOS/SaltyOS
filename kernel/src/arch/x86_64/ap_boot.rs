@@ -105,10 +105,8 @@ pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
     super::sti();
 
     loop {
-        // sched_ipc_lock does cli + acquire SCHED_IPC_LOCK
-        crate::sched_ipc_lock();
+        // Process pending deactivates under per-CPU scheduler lock
         crate::sched::scheduler::scheduler().with_lock(|_| {});
-        crate::sched_ipc_unlock();
 
         super::sti();
         super::halt();

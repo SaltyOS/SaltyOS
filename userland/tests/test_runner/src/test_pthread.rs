@@ -21,7 +21,7 @@ unsafe extern "C" fn thread_return_42(arg: *mut u8) -> *mut u8 {
 }
 
 fn test_create_join() -> bool {
-    let mut handle: pthread::PthreadT = core::ptr::null_mut();
+    let mut handle: pthread::PthreadT = 0;
     let ret = unsafe {
         pthread::pthread_create(
             &raw mut handle,
@@ -60,7 +60,7 @@ unsafe extern "C" fn thread_noop(_arg: *mut u8) -> *mut u8 {
 }
 
 fn test_detach() -> bool {
-    let mut handle: pthread::PthreadT = core::ptr::null_mut();
+    let mut handle: pthread::PthreadT = 0;
     let ret = unsafe {
         pthread::pthread_create(
             &raw mut handle,
@@ -115,8 +115,8 @@ unsafe extern "C" fn thread_increment(_arg: *mut u8) -> *mut u8 {
 fn test_mutex_normal() -> bool {
     COUNTER.store(0, Ordering::Relaxed);
 
-    let mut t1: pthread::PthreadT = core::ptr::null_mut();
-    let mut t2: pthread::PthreadT = core::ptr::null_mut();
+    let mut t1: pthread::PthreadT = 0;
+    let mut t2: pthread::PthreadT = 0;
 
     let ret = unsafe {
         pthread::pthread_create(&raw mut t1, core::ptr::null(), thread_increment, core::ptr::null_mut())
@@ -250,7 +250,7 @@ unsafe extern "C" fn thread_producer(_arg: *mut u8) -> *mut u8 {
 fn test_condvar_signal() -> bool {
     CV_READY.store(0, Ordering::Relaxed);
 
-    let mut producer: pthread::PthreadT = core::ptr::null_mut();
+    let mut producer: pthread::PthreadT = 0;
     let ret = unsafe {
         pthread::pthread_create(&raw mut producer, core::ptr::null(), thread_producer, core::ptr::null_mut())
     };
@@ -304,9 +304,9 @@ fn test_condvar_broadcast() -> bool {
     BC_FLAG.store(0, Ordering::Relaxed);
     BC_WOKEN.store(0, Ordering::Relaxed);
 
-    let mut t1: pthread::PthreadT = core::ptr::null_mut();
-    let mut t2: pthread::PthreadT = core::ptr::null_mut();
-    let mut t3: pthread::PthreadT = core::ptr::null_mut();
+    let mut t1: pthread::PthreadT = 0;
+    let mut t2: pthread::PthreadT = 0;
+    let mut t3: pthread::PthreadT = 0;
 
     unsafe {
         pthread::pthread_create(&raw mut t1, core::ptr::null(), thread_bc_waiter, core::ptr::null_mut());
@@ -404,7 +404,7 @@ fn test_rwlock() -> bool {
     RW_READERS.store(0, Ordering::Relaxed);
     RW_MAX_CONCURRENT.store(0, Ordering::Relaxed);
 
-    let mut handles: [pthread::PthreadT; 3] = [core::ptr::null_mut(); 3];
+    let mut handles: [pthread::PthreadT; 3] = [0; 3];
 
     for i in 0..3 {
         let ret = unsafe {
@@ -448,8 +448,8 @@ fn test_barrier() -> bool {
     BARRIER_PHASE1.store(0, Ordering::Relaxed);
     BARRIER_PHASE2.store(0, Ordering::Relaxed);
 
-    let mut t1: pthread::PthreadT = core::ptr::null_mut();
-    let mut t2: pthread::PthreadT = core::ptr::null_mut();
+    let mut t1: pthread::PthreadT = 0;
+    let mut t2: pthread::PthreadT = 0;
 
     unsafe {
         pthread::pthread_create(&raw mut t1, core::ptr::null(), thread_barrier_worker, core::ptr::null_mut());
@@ -517,7 +517,7 @@ unsafe extern "C" fn thread_cancellable(_arg: *mut u8) -> *mut u8 {
 fn test_cancel() -> bool {
     CANCEL_CLEANUP_RAN.store(0, Ordering::Relaxed);
 
-    let mut handle: pthread::PthreadT = core::ptr::null_mut();
+    let mut handle: pthread::PthreadT = 0;
     let ret = unsafe {
         pthread::pthread_create(&raw mut handle, core::ptr::null(), thread_cancellable, core::ptr::null_mut())
     };
@@ -589,7 +589,7 @@ fn test_attr_stacksize() -> bool {
 
     let attr = pthread::PthreadAttr::new(256 * 1024, 0);
 
-    let mut handle: pthread::PthreadT = core::ptr::null_mut();
+    let mut handle: pthread::PthreadT = 0;
     let ret = unsafe {
         pthread::pthread_create(
             &raw mut handle,
@@ -737,7 +737,7 @@ unsafe extern "C" fn thread_sem_consumer(_arg: *mut u8) -> *mut u8 {
 fn test_semaphore_producer_consumer() -> bool {
     SEM_RESULT.store(0, Ordering::Relaxed);
 
-    let mut consumer: pthread::PthreadT = core::ptr::null_mut();
+    let mut consumer: pthread::PthreadT = 0;
     let ret = unsafe {
         pthread::pthread_create(&raw mut consumer, core::ptr::null(), thread_sem_consumer, core::ptr::null_mut())
     };

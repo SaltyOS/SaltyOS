@@ -26,28 +26,13 @@ pub use bootinfo::{FramebufferInfo, MemoryKind, MemoryMapEntry, ParsedBootInfo};
 
 use core::panic::PanicInfo;
 
-/// Acquire SCHED_IPC_LOCK. Does `cli` first to prevent same-CPU deadlock.
-/// Called from assembly (timer/reschedule/exception stubs).
-#[unsafe(no_mangle)]
-pub extern "C" fn sched_ipc_lock() {
-    unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
-    mm::SCHED_IPC_LOCK.lock();
-}
-
-/// Release SCHED_IPC_LOCK. Does NOT re-enable interrupts.
-/// Called from assembly (timer/reschedule/exception stubs).
-#[unsafe(no_mangle)]
-pub extern "C" fn sched_ipc_unlock() {
-    mm::SCHED_IPC_LOCK.unlock();
-}
-
 /// Serial port (COM1) for debug output
 const SERIAL_PORT: u16 = 0x3F8;
 
 /// Leaf-level spinlock protecting all COM1 serial output.
 ///
 /// Lock ordering (outermost → innermost):
-///   CAP_LOCK → SCHED_IPC_LOCK → scheduler.lock_state → VSpace.lock → MM_LOCK → SERIAL_LOCK
+///   CAP_LOCK → endpoint.lock / ntfn.lock / tcb.lock / sc.lock → SLEEP_LOCK / FUTEX_LOCK / IRQ_LOCK → sched.lock_cpu → VSpace.lock → FRAME_LOCK → SERIAL_LOCK
 pub(crate) static SERIAL_LOCK: mm::SpinLock = mm::SpinLock::new();
 
 // ---------------------------------------------------------------------------
@@ -377,10 +362,8 @@ pub extern "C" fn kmain(raw_boot_info: *const u8) -> ! {
     init::bootstrap(boot_info);
 
     // Dispatch the init task (context_switch to it).
-    // SCHED_IPC_LOCK must be held: do_context_switch releases/reacquires it.
-    mm::SCHED_IPC_LOCK.lock();
+    // No global lock needed — reschedule uses per-CPU scheduler lock only.
     sched::scheduler::scheduler().reschedule();
-    mm::SCHED_IPC_LOCK.unlock();
 
     // Fallback (should never reach here once init task is dispatched)
     loop {

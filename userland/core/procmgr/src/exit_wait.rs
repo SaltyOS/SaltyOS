@@ -133,6 +133,9 @@ pub(crate) unsafe fn handle_exit(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
 
         // Deregister from mmsrv if registered
         if proctab(idx).mmsrv_registered {
+            let tcb_cap = proctab(idx).tcb_cap;
+            let pid = proctab(idx).pid;
+            super::spawn_tx::clear_fault_handler(tcb_cap, pid);
             let mut mm_msg = BesaltMsg::zeroed();
             let mut mm_reply = BesaltMsg::zeroed();
             mm_msg.label = besalt::consts::MM_DEREGISTER;
@@ -182,14 +185,12 @@ pub(crate) unsafe fn handle_exit(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             saved_binary = proctab(idx).respawn_binary;
         }
 
-        let susp_err = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 16);
+        let susp_err = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 64);
         if susp_err != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] WARN: tcb_suspend failed in exit PID=");
-            lb.hex(proctab(idx).pid as u64);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::syscall::syscall(besalt::SYS_NANOSLEEP, 2_000_000, 0, 0, 0, 0, 0);
+            let _ = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 64);
         }
+        besalt::syscall::syscall(besalt::SYS_YIELD, 0, 0, 0, 0, 0, 0);
 
         // Deliver SIGCHLD to parent
         let ppid = proctab(idx).ppid;

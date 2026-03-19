@@ -32,9 +32,6 @@ const IDLE_STACK_SIZE: usize = PAGE_SIZE;
 /// that have reached quiescent state.
 extern "C" fn idle_thread() -> ! {
     loop {
-        // sched_ipc_lock does cli + acquire SCHED_IPC_LOCK
-        crate::sched_ipc_lock();
-
         // CRITICAL: Periodically process pending deactivates
         // with_lock acquires scheduler lock internally and calls kernel_exit_epilogue
         scheduler().with_lock(|_| {});
@@ -44,9 +41,6 @@ extern "C" fn idle_thread() -> ! {
             crate::mm::process_deferred_free();
         }
 
-        crate::sched_ipc_unlock();
-
-        // IF was cleared by sched_ipc_lock's cli; re-enable before halt
         arch::sti();
         arch::halt();
     }
@@ -196,15 +190,9 @@ unsafe fn allocate_idle_stack() -> u64 {
 /// Called by a thread to voluntarily give up the CPU.
 /// Uses deferred enqueue — the thread is NOT placed in the ready queue
 /// until context_switch has saved its registers (prevents SMP race).
-/// SCHED_IPC_LOCK is held across yield (do_context_switch releases/reacquires it).
+/// No global lock needed — yield_current uses only per-CPU scheduler lock.
 pub fn yield_now() {
-    unsafe {
-        let irq = crate::mm::save_irq_disable();
-        crate::mm::SCHED_IPC_LOCK.lock();
-        scheduler().yield_current();
-        crate::mm::SCHED_IPC_LOCK.unlock();
-        crate::mm::restore_irq(irq);
-    }
+    scheduler().yield_current();
 }
 
 /// Get current thread

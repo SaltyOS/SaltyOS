@@ -5,7 +5,7 @@
 use super::thread::{BlockedReason, Tcb, ThreadState};
 use crate::arch::MAX_CPUS;
 use crate::cap::ObjectType;
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicPtr, AtomicUsize};
 
 unsafe extern "C" {
     static _text_start: u8;
@@ -49,8 +49,8 @@ fn is_bootstrap_tcb(tcb: *mut Tcb) -> bool {
 
 /// EDF Scheduler
 pub struct Scheduler {
-    /// Ready queue head (sorted by deadline)
-    ready_head: *mut Tcb,
+    /// Per-CPU ready queue heads (each sorted by deadline)
+    ready_heads: [*mut Tcb; MAX_CPUS],
     /// Per-CPU currently running thread
     current: [*mut Tcb; MAX_CPUS],
     /// Per-CPU idle thread
@@ -60,9 +60,9 @@ pub struct Scheduler {
     /// Holds a thread that should be enqueued AFTER `context_switch` saves
     /// its registers. Prevents the double-schedule race where another CPU
     /// dequeues and switches to a thread before its context is saved.
-    pending_enqueue: [*mut Tcb; MAX_CPUS],
-    /// Lock state (simple test-and-set spinlock)
-    lock_state: core::sync::atomic::AtomicU8,
+    pending_enqueue: [AtomicPtr<Tcb>; MAX_CPUS],
+    /// Per-CPU lock states (each protects that CPU's ready queue and per-CPU state)
+    lock_states: [core::sync::atomic::AtomicU8; MAX_CPUS],
     /// Per-CPU context switch count
     pub context_switches: [u64; MAX_CPUS],
     /// Per-CPU timer tick count
@@ -80,11 +80,11 @@ pub struct Scheduler {
 impl Scheduler {
     pub const fn new() -> Self {
         Self {
-            ready_head: core::ptr::null_mut(),
+            ready_heads: [core::ptr::null_mut(); MAX_CPUS],
             current: [core::ptr::null_mut(); MAX_CPUS],
             idle: [core::ptr::null_mut(); MAX_CPUS],
-            pending_enqueue: [core::ptr::null_mut(); MAX_CPUS],
-            lock_state: core::sync::atomic::AtomicU8::new(0),
+            pending_enqueue: [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS],
+            lock_states: [const { core::sync::atomic::AtomicU8::new(0) }; MAX_CPUS],
             context_switches: [0; MAX_CPUS],
             timer_ticks: [0; MAX_CPUS],
             idle_ticks: [0; MAX_CPUS],
@@ -94,31 +94,117 @@ impl Scheduler {
         }
     }
 
-    /// Take scheduler lock
-    pub(crate) fn lock(&self) {
+    /// Lock a specific CPU's scheduler queue.
+    pub(crate) fn lock_cpu(&self, cpu: usize) {
         use core::sync::atomic::Ordering;
-        let mut _spins: u32 = 0;
-        while self
-            .lock_state
+
+        // Fast path: uncontended acquire
+        if self.lock_states[cpu]
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
+            .is_ok()
         {
-            while self.lock_state.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+
+        // Slow path: bounded exponential backoff to reduce cache-line thrashing
+        let mut backoff: u32 = 0;
+        #[cfg(debug_assertions)]
+        let mut _total_spins: u32 = 0;
+        loop {
+            let spins = 1u32 << backoff.min(6);
+            for _ in 0..spins {
                 core::hint::spin_loop();
-                _spins += 1;
-                #[cfg(debug_assertions)]
-                if _spins > 10_000_000 {
+            }
+            #[cfg(debug_assertions)]
+            {
+                _total_spins += spins;
+                if _total_spins > 10_000_000 {
                     crate::serial_puts("[SCHED SPINLOCK] possible deadlock detected\n");
-                    _spins = 0;
+                    _total_spins = 0;
                 }
+            }
+
+            if self.lock_states[cpu].load(Ordering::Relaxed) == 0
+                && self.lock_states[cpu]
+                    .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return;
+            }
+
+            if backoff < 6 {
+                backoff += 1;
             }
         }
     }
 
-    /// Release scheduler lock
-    pub(crate) fn unlock(&self) {
-        self.lock_state
+    /// Unlock a specific CPU's scheduler queue.
+    pub(crate) fn unlock_cpu(&self, cpu: usize) {
+        self.lock_states[cpu]
             .store(0, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Take the local CPU's scheduler lock.
+    pub(crate) fn lock(&self) {
+        self.lock_cpu(crate::arch::current_cpu() as usize);
+    }
+
+    /// Release the local CPU's scheduler lock.
+    pub(crate) fn unlock(&self) {
+        self.unlock_cpu(crate::arch::current_cpu() as usize);
+    }
+
+    // ---------------------------------------------------------------
+    // Per-CPU queue helpers (caller must hold lock + IRQs disabled)
+    // ---------------------------------------------------------------
+
+    /// Select which CPU's ready queue a thread should be enqueued on.
+    ///
+    /// - Specific affinity: always that CPU
+    /// - Any-affinity: prefer last_cpu (cache affinity), fallback to current CPU
+    ///
+    /// Caller MUST hold the scheduler lock.
+    fn select_target_cpu(&self, tcb: *mut Tcb) -> usize {
+        unsafe {
+            let affinity = (*tcb).cpu_affinity;
+            if affinity != 0xFFFF_FFFF {
+                return affinity as usize;
+            }
+            let last = (*tcb).last_cpu as usize;
+            if last < self.online_cpus as usize {
+                return last;
+            }
+            crate::arch::current_cpu() as usize
+        }
+    }
+
+    /// Insert a thread into a specific CPU's ready queue, sorted by deadline.
+    ///
+    /// Sets `ready_queued` and `queued_cpu` on the TCB.
+    /// Does NOT send IPIs — caller handles that.
+    ///
+    /// Caller MUST hold the scheduler lock.
+    unsafe fn insert_sorted(&mut self, cpu: usize, tcb: *mut Tcb) {
+        unsafe {
+            (*tcb).ready_queued = true;
+            (*tcb).queued_cpu = cpu as u32;
+
+            if self.ready_heads[cpu].is_null()
+                || (*tcb).priority < (*self.ready_heads[cpu]).priority
+            {
+                (*tcb).next = self.ready_heads[cpu];
+                self.ready_heads[cpu] = tcb;
+            } else {
+                let mut current = self.ready_heads[cpu];
+                while !(*current).next.is_null()
+                    && (*(*current).next).priority <= (*tcb).priority
+                {
+                    current = (*current).next;
+                }
+                (*tcb).next = (*current).next;
+                (*current).next = tcb;
+            }
+        }
     }
 
     // ---------------------------------------------------------------
@@ -126,6 +212,9 @@ impl Scheduler {
     // ---------------------------------------------------------------
 
     /// Add thread to ready queue (sorted by deadline) — unlocked variant.
+    ///
+    /// Routes the thread to the appropriate per-CPU queue based on affinity
+    /// and cache affinity hints.
     ///
     /// Caller MUST hold the scheduler lock.
     pub fn enqueue_unlocked(&mut self, tcb: *mut Tcb) {
@@ -141,65 +230,100 @@ impl Scheduler {
                 return;
             }
 
-            if self.find_running_cpu(tcb).is_some() {
+            if let Some(running_cpu) = self.find_running_cpu(tcb) {
+                // A wake can race with the blocked thread's switch-out window:
+                // the thread is still the architectural `current[cpu]`, but it
+                // has already transitioned away from Running and must not be
+                // dropped on the floor. Route it into that CPU's deferred slot
+                // so `process_pending_enqueue()` publishes it after the outgoing
+                // context has actually been saved.
+                if (*tcb).state != ThreadState::Running {
+                    self.set_pending_enqueue(running_cpu, tcb);
+                    // If another CPU is still in the blocked thread's kernel
+                    // path, it may not reach schedule()/process_pending_enqueue()
+                    // until its next interrupt. Nudge it now so the wake is
+                    // observed promptly instead of waiting for unrelated IRQs.
+                    if running_cpu != cpu_id && running_cpu < self.online_cpus as usize {
+                        crate::arch::send_ipi(running_cpu, crate::arch::IpiKind::Reschedule);
+                    }
+                }
                 return;
             }
 
-            if self.is_ready_queued_unlocked(tcb) {
+            // O(1) check via flag instead of O(N) queue walk
+            if (*tcb).ready_queued {
                 (*tcb).state = ThreadState::Ready;
                 return;
             }
 
             // If the thread is still waiting for its outgoing context to be
             // saved on some CPU, defer actual queue insertion until that CPU
-            // flushes its pending slot.
+            // flushes its pending slot.  process_pending_enqueue runs after
+            // context_switch and will see state=Ready via x86_64 cache
+            // coherence (LOCK XCHG in swap is a full barrier).
             if self.is_pending_on_any_cpu(tcb) {
+                if let Some(pending_cpu) = self.pending_cpu_for(tcb) {
+                    if pending_cpu != cpu_id && pending_cpu < self.online_cpus as usize {
+                        crate::arch::send_ipi(pending_cpu, crate::arch::IpiKind::Reschedule);
+                    }
+                }
                 (*tcb).state = ThreadState::Ready;
                 return;
             }
 
             (*tcb).state = ThreadState::Ready;
 
-            // Insert sorted by deadline (priority field stores deadline)
-            if self.ready_head.is_null() || (*tcb).priority < (*self.ready_head).priority {
-                (*tcb).next = self.ready_head;
-                self.ready_head = tcb;
-            } else {
-                let mut current = self.ready_head;
-                while !(*current).next.is_null() && (*(*current).next).priority <= (*tcb).priority {
-                    current = (*current).next;
-                }
-                (*tcb).next = (*current).next;
-                (*current).next = tcb;
-            }
-
-            // Wake an idle CPU so it can pick up this thread
-            let affinity = (*tcb).cpu_affinity;
+            // Route to the appropriate per-CPU queue
+            let target = self.select_target_cpu(tcb);
             let this_cpu = crate::arch::current_cpu() as usize;
 
-            if affinity != 0xFFFF_FFFF {
-                // Specific affinity: IPI target if idle
-                let target = affinity as usize;
-                if target != this_cpu
-                    && target < MAX_CPUS
-                    && !self.idle[target].is_null()
-                    && self.current[target] == self.idle[target]
-                {
-                    crate::arch::send_ipi(
-                        target,
-                        crate::arch::IpiKind::Reschedule,
-                    );
-                }
+            if target == this_cpu {
+                // Local enqueue — caller already holds local lock
+                self.insert_sorted(target, tcb);
+            } else if target > this_cpu {
+                // Lock ordering OK: hold lower (local), acquire higher (target)
+                self.lock_cpu(target);
+                self.insert_sorted(target, tcb);
+                self.unlock_cpu(target);
             } else {
-                // Any-CPU affinity: IPI one idle CPU so it picks up the thread
-                for cpu in 0..MAX_CPUS {
-                    if cpu != this_cpu
-                        && !self.idle[cpu].is_null()
-                        && self.current[cpu] == self.idle[cpu]
-                    {
-                        crate::arch::send_ipi(cpu, crate::arch::IpiKind::Reschedule);
-                        break;
+                // target < local: release local, lock target, insert, unlock target, relock local
+                self.unlock_cpu(this_cpu);
+                self.lock_cpu(target);
+                self.insert_sorted(target, tcb);
+                self.unlock_cpu(target);
+                self.lock_cpu(this_cpu);
+            }
+
+            // Send IPI to the target CPU if the enqueued thread can preempt
+            // whatever is running there. Covers both idle targets and targets
+            // running a lower-priority thread, ensuring EDF guarantees on SMP.
+            //
+            // The current[target] read is best-effort (no target lock held).
+            // Stale reads cause either a spurious IPI (harmless — handler
+            // finds nothing to preempt) or a missed IPI (timer tick catches
+            // it within ~1ms; periodic rebalance also compensates).
+            if target != this_cpu
+                && target < self.online_cpus as usize
+                && !self.idle[target].is_null()
+            {
+                let target_current = self.current[target];
+                let should_ipi = if target_current == self.idle[target] {
+                    // Target is idle — always wake
+                    true
+                } else if !target_current.is_null() {
+                    // If the target CPU is still in a blocked/switch-out path,
+                    // it needs an explicit nudge to flush pending work.
+                    if (*target_current).state != ThreadState::Running {
+                        true
+                    } else {
+                        // Preempt if enqueued thread has earlier deadline
+                        (*tcb).priority < (*target_current).priority
                     }
+                } else {
+                    false
+                };
+                if should_ipi {
+                    crate::arch::send_ipi(target, crate::arch::IpiKind::Reschedule);
                 }
             }
         }
@@ -209,41 +333,27 @@ impl Scheduler {
     ///
     /// Caller MUST hold the scheduler lock.
     pub fn dequeue_unlocked(&mut self) -> Option<*mut Tcb> {
-        if self.ready_head.is_null() {
-            None
-        } else {
-            unsafe {
-                let tcb = self.ready_head;
-                self.ready_head = (*tcb).next;
-                (*tcb).next = core::ptr::null_mut();
-                Some(tcb)
-            }
-        }
+        let cpu_id = crate::arch::current_cpu() as usize;
+        self.dequeue_for_cpu_unlocked(cpu_id)
     }
 
     /// Remove highest priority thread for a CPU — unlocked variant.
     ///
     /// Caller MUST hold the scheduler lock.
     pub fn dequeue_for_cpu_unlocked(&mut self, cpu_id: usize) -> Option<*mut Tcb> {
+        // O(1): simply pop the head of this CPU's queue.
+        // All threads in ready_heads[cpu] are compatible with cpu
+        // (either any-affinity or pinned to this CPU).
+        let head = self.ready_heads[cpu_id];
+        if head.is_null() {
+            return None;
+        }
         unsafe {
-            let mut prev: *mut Tcb = core::ptr::null_mut();
-            let mut current = self.ready_head;
-
-            while !current.is_null() {
-                let affinity = (*current).cpu_affinity;
-                if affinity == 0xFFFF_FFFF || affinity as usize == cpu_id {
-                    if prev.is_null() {
-                        self.ready_head = (*current).next;
-                    } else {
-                        (*prev).next = (*current).next;
-                    }
-                    (*current).next = core::ptr::null_mut();
-                    return Some(current);
-                }
-                prev = current;
-                current = (*current).next;
-            }
-            None
+            self.ready_heads[cpu_id] = (*head).next;
+            (*head).next = core::ptr::null_mut();
+            (*head).ready_queued = false;
+            (*head).queued_cpu = 0xFFFF_FFFF;
+            Some(head)
         }
     }
 
@@ -252,16 +362,26 @@ impl Scheduler {
     /// Caller MUST hold the scheduler lock.
     pub fn remove_from_ready_queue_unlocked(&mut self, tcb: *mut Tcb) -> bool {
         unsafe {
+            if !(*tcb).ready_queued {
+                return false;
+            }
+            let cpu = (*tcb).queued_cpu as usize;
+            if cpu >= MAX_CPUS {
+                return false;
+            }
+
             let mut prev: *mut Tcb = core::ptr::null_mut();
-            let mut current = self.ready_head;
+            let mut current = self.ready_heads[cpu];
             while !current.is_null() {
                 if current == tcb {
                     if prev.is_null() {
-                        self.ready_head = (*current).next;
+                        self.ready_heads[cpu] = (*current).next;
                     } else {
                         (*prev).next = (*current).next;
                     }
                     (*current).next = core::ptr::null_mut();
+                    (*tcb).ready_queued = false;
+                    (*tcb).queued_cpu = 0xFFFF_FFFF;
                     return true;
                 }
                 prev = current;
@@ -273,18 +393,10 @@ impl Scheduler {
 
     /// Check whether a TCB is already present in the ready queue.
     ///
+    /// O(1) via `ready_queued` flag instead of O(N) queue walk.
     /// Caller MUST hold the scheduler lock.
     fn is_ready_queued_unlocked(&self, tcb: *mut Tcb) -> bool {
-        unsafe {
-            let mut current = self.ready_head;
-            while !current.is_null() {
-                if current == tcb {
-                    return true;
-                }
-                current = (*current).next;
-            }
-            false
-        }
+        unsafe { (*tcb).ready_queued }
     }
 
     // ---------------------------------------------------------------
@@ -316,21 +428,55 @@ impl Scheduler {
     /// Remove highest priority thread for a CPU with IRQ-safe locking.
     pub fn dequeue_for_cpu(&mut self, cpu_id: usize) -> Option<*mut Tcb> {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
-        self.lock();
+        self.lock_cpu(cpu_id);
         let result = self.dequeue_for_cpu_unlocked(cpu_id);
-        self.unlock();
+        self.unlock_cpu(cpu_id);
         unsafe { crate::mm::restore_irq(irq_flag) };
         result
     }
 
     /// Remove a specific thread from the ready queue with IRQ-safe locking.
+    ///
+    /// Locks the CPU queue where the thread is queued (via `queued_cpu`).
     pub fn remove_from_ready_queue(&mut self, tcb: *mut Tcb) -> bool {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
-        self.lock();
-        let result = self.remove_from_ready_queue_unlocked(tcb);
-        self.unlock();
-        unsafe { crate::mm::restore_irq(irq_flag) };
-        result
+        unsafe {
+            if !(*tcb).ready_queued {
+                crate::mm::restore_irq(irq_flag);
+                return false;
+            }
+            let cpu = (*tcb).queued_cpu as usize;
+            if cpu >= MAX_CPUS {
+                crate::mm::restore_irq(irq_flag);
+                return false;
+            }
+            self.lock_cpu(cpu);
+            let result = self.remove_from_ready_queue_unlocked(tcb);
+            self.unlock_cpu(cpu);
+            crate::mm::restore_irq(irq_flag);
+            result
+        }
+    }
+
+    /// Re-sort a thread in the ready queue after priority change (PIP).
+    ///
+    /// Acquires the appropriate per-CPU lock internally.
+    /// Safe to call without holding any scheduler lock.
+    pub fn resort_ready_thread(&mut self, tcb: *mut Tcb) {
+        unsafe {
+            if !(*tcb).ready_queued {
+                return;
+            }
+            let cpu = (*tcb).queued_cpu as usize;
+            if cpu >= MAX_CPUS {
+                return;
+            }
+            self.lock_cpu(cpu);
+            if self.remove_from_ready_queue_unlocked(tcb) {
+                self.insert_sorted(cpu, tcb);
+            }
+            self.unlock_cpu(cpu);
+        }
     }
 
     // ---------------------------------------------------------------
@@ -342,6 +488,8 @@ impl Scheduler {
     /// Caller MUST hold the scheduler lock.
     fn schedule_unlocked(&mut self) -> *mut Tcb {
         let cpu_id = crate::arch::current_cpu() as usize;
+
+        // Try local queue first (O(1) pop — all threads are compatible)
         while let Some(tcb) = self.dequeue_for_cpu_unlocked(cpu_id) {
             unsafe {
                 if (*tcb).state != ThreadState::Ready
@@ -352,14 +500,77 @@ impl Scheduler {
                 }
                 (*tcb).state = ThreadState::Running;
                 (*tcb).last_cpu = cpu_id as u32;
+                (*tcb).set_run_owner_cpu(cpu_id);
             }
             self.current[cpu_id] = tcb;
             CURRENT_ON_CPU[cpu_id].store(tcb as usize, core::sync::atomic::Ordering::Release);
             return tcb;
         }
 
-        // Return idle thread for this CPU
+        // Local queue empty — try work stealing from other CPUs.
+        // Release local lock during steal to avoid lock ordering issues.
+        // Per-CPU state (current, pending_enqueue) is only modified by
+        // the local CPU with IRQs disabled, so brief release is safe.
+        self.unlock_cpu(cpu_id);
+
+        let online = self.online_cpus as usize;
+        for victim in 0..online {
+            if victim == cpu_id {
+                continue;
+            }
+            self.lock_cpu(victim);
+            if let Some(tcb) = self.steal_from_unlocked(victim) {
+                self.unlock_cpu(victim);
+                self.lock_cpu(cpu_id);
+                unsafe {
+                    (*tcb).state = ThreadState::Running;
+                    (*tcb).last_cpu = cpu_id as u32;
+                    (*tcb).set_run_owner_cpu(cpu_id);
+                }
+                self.current[cpu_id] = tcb;
+                CURRENT_ON_CPU[cpu_id].store(tcb as usize, core::sync::atomic::Ordering::Release);
+                return tcb;
+            }
+            self.unlock_cpu(victim);
+        }
+
+        // No work anywhere — reacquire local lock and return idle
+        self.lock_cpu(cpu_id);
         self.idle[cpu_id]
+    }
+
+    /// Steal one any-affinity thread from a victim CPU's ready queue.
+    ///
+    /// Only steals any-affinity threads (specific-affinity threads must
+    /// remain on their pinned CPU's queue).
+    ///
+    /// Caller MUST hold the victim CPU's lock.
+    fn steal_from_unlocked(&mut self, victim: usize) -> Option<*mut Tcb> {
+        unsafe {
+            let mut prev: *mut Tcb = core::ptr::null_mut();
+            let mut current = self.ready_heads[victim];
+
+            while !current.is_null() {
+                let affinity = (*current).cpu_affinity;
+                if affinity == 0xFFFF_FFFF
+                    && (*current).state == ThreadState::Ready
+                {
+                    // Remove from victim's queue
+                    if prev.is_null() {
+                        self.ready_heads[victim] = (*current).next;
+                    } else {
+                        (*prev).next = (*current).next;
+                    }
+                    (*current).next = core::ptr::null_mut();
+                    (*current).ready_queued = false;
+                    (*current).queued_cpu = 0xFFFF_FFFF;
+                    return Some(current);
+                }
+                prev = current;
+                current = (*current).next;
+            }
+            None
+        }
     }
 
     /// Current running thread (on calling CPU)
@@ -372,6 +583,11 @@ impl Scheduler {
     pub fn set_current(&mut self, tcb: *mut Tcb) {
         let cpu_id = crate::arch::current_cpu() as usize;
         self.current[cpu_id] = tcb;
+        unsafe {
+            if !tcb.is_null() {
+                (*tcb).set_run_owner_cpu(cpu_id);
+            }
+        }
         CURRENT_ON_CPU[cpu_id].store(tcb as usize, core::sync::atomic::Ordering::Release);
     }
 
@@ -388,10 +604,29 @@ impl Scheduler {
 
     /// Find which CPU a thread is running on by scanning current[].
     ///
+    /// Checks `last_cpu` hint first for O(1) fast path, then falls back
+    /// to scanning only online CPUs.
     /// Returns `None` if the thread is not the current thread on any CPU.
     /// Caller MUST hold the scheduler lock.
     pub fn find_running_cpu(&self, tcb: *mut Tcb) -> Option<usize> {
-        for cpu in 0..MAX_CPUS {
+        if tcb.is_null() {
+            return None;
+        }
+
+        if let Some(owner) = unsafe { (*tcb).run_owner() } {
+            let online = self.online_cpus as usize;
+            if owner < online && self.current[owner] == tcb {
+                return Some(owner);
+            }
+        }
+
+        // Fast path: check last_cpu hint first
+        let last = unsafe { (*tcb).last_cpu } as usize;
+        let online = self.online_cpus as usize;
+        if last < online && self.current[last] == tcb {
+            return Some(last);
+        }
+        for cpu in 0..online {
             if self.current[cpu] == tcb {
                 return Some(cpu);
             }
@@ -399,25 +634,18 @@ impl Scheduler {
         None
     }
 
-    /// Check if reschedule needed (preemption) on the calling CPU
+    /// Check if reschedule needed (preemption) on the calling CPU.
+    ///
+    /// O(1): the head of the local per-CPU queue is always the highest
+    /// priority compatible thread — just compare its deadline with current.
     pub fn needs_reschedule(&self) -> bool {
         let cpu_id = crate::arch::current_cpu() as usize;
         let current = self.current[cpu_id];
-        if self.ready_head.is_null() || current.is_null() {
+        let head = self.ready_heads[cpu_id];
+        if head.is_null() || current.is_null() {
             return false;
         }
-        unsafe {
-            // Walk the ready queue to find the first thread compatible with this CPU
-            let mut node = self.ready_head;
-            while !node.is_null() {
-                let affinity = (*node).cpu_affinity;
-                if affinity == 0xFFFF_FFFF || affinity as usize == cpu_id {
-                    return (*node).priority < (*current).priority;
-                }
-                node = (*node).next;
-            }
-            false
-        }
+        unsafe { (*head).priority < (*current).priority }
     }
 
     // ---------------------------------------------------------------
@@ -519,6 +747,8 @@ impl Scheduler {
     ///
     /// Caller MUST hold the scheduler lock.
     fn set_pending_enqueue(&mut self, cpu_id: usize, tcb: *mut Tcb) {
+        use core::sync::atomic::Ordering;
+
         if cpu_id >= MAX_CPUS {
             panic!(
                 "[SCHED] set_pending_enqueue: invalid cpu_id={} (max={})",
@@ -532,33 +762,35 @@ impl Scheduler {
             }
             return;
         }
-        // Flush any stale pending before overwriting (safety net for
-        // switches to fresh threads that skip process_pending_enqueue).
-        let old = self.pending_enqueue[cpu_id];
-        if old == tcb {
-            unsafe {
-                self.validate_tcb_ptr(tcb, "set_pending_enqueue same slot", cpu_id);
-                (*tcb).state = ThreadState::Ready;
+
+        unsafe {
+            self.validate_tcb_ptr(tcb, "set_pending_enqueue new slot", cpu_id);
+            // Cross-CPU TCB_SUSPEND/terminate may already have marked this
+            // thread Inactive while the local CPU is still unwinding toward a
+            // switch point. Never overwrite Inactive back to Ready here.
+            if (*tcb).state == ThreadState::Inactive {
+                return;
             }
-            return;
+            (*tcb).state = ThreadState::Ready;
         }
-        if !old.is_null() {
-            // Clear first so enqueue_unlocked() doesn't see the stale slot and
-            // suppress queue insertion.
-            self.pending_enqueue[cpu_id] = core::ptr::null_mut();
+
+        // Atomic swap: safely exchange with whatever the target CPU has
+        // pending. This avoids the read-then-write race where the local
+        // CPU's process_pending_enqueue could clear the slot between our
+        // read and write.
+        let old = self.pending_enqueue[cpu_id].swap(tcb, Ordering::AcqRel);
+
+        if !old.is_null() && old != tcb {
             unsafe {
-                self.validate_tcb_ptr(old, "set_pending_enqueue stale slot", cpu_id);
+                self.validate_tcb_ptr(old, "set_pending_enqueue displaced", cpu_id);
+                // The displaced thread was waiting for deferred enqueue.
+                // Enqueue it directly now — its context has been saved
+                // (it was pending, meaning it already switched out).
                 if (*old).state == ThreadState::Ready {
                     self.enqueue_unlocked(old);
                 }
             }
         }
-
-        unsafe {
-            self.validate_tcb_ptr(tcb, "set_pending_enqueue new slot", cpu_id);
-            (*tcb).state = ThreadState::Ready;
-        }
-        self.pending_enqueue[cpu_id] = tcb;
     }
 
     /// Track an outgoing thread in a non-Ready state (typically Blocked).
@@ -584,10 +816,8 @@ impl Scheduler {
             return;
         }
 
-        let old = self.pending_enqueue[cpu_id];
+        let old = self.pending_enqueue[cpu_id].swap(tcb, core::sync::atomic::Ordering::AcqRel);
         if !old.is_null() && old != tcb {
-            // Clear first so enqueue_unlocked() doesn't suppress stale flush.
-            self.pending_enqueue[cpu_id] = core::ptr::null_mut();
             unsafe {
                 self.validate_tcb_ptr(old, "track_pending_switch_out stale slot", cpu_id);
                 if (*old).state == ThreadState::Ready {
@@ -599,7 +829,6 @@ impl Scheduler {
         unsafe {
             self.validate_tcb_ptr(tcb, "track_pending_switch_out", cpu_id);
         }
-        self.pending_enqueue[cpu_id] = tcb;
     }
 
     /// Returns true if a thread is present in any deferred-switch slot.
@@ -613,12 +842,38 @@ impl Scheduler {
     ///
     /// Caller MUST hold the scheduler lock.
     pub(crate) fn pending_cpu_for(&self, tcb: *mut Tcb) -> Option<usize> {
-        for cpu in 0..MAX_CPUS {
-            if self.pending_enqueue[cpu] == tcb {
+        let online = self.online_cpus as usize;
+        for cpu in 0..online {
+            if self.pending_enqueue[cpu].load(core::sync::atomic::Ordering::Acquire) == tcb {
                 return Some(cpu);
             }
         }
         None
+    }
+
+    /// Remove a thread from any deferred enqueue slot on any CPU.
+    ///
+    /// This is used by cross-CPU suspend/terminate after the target has been
+    /// forced off-CPU. The thread may still be parked in a pending slot if the
+    /// local CPU was unwinding through yield/preemption when suspend landed.
+    pub fn cancel_pending_enqueue(&mut self, tcb: *mut Tcb) {
+        use core::sync::atomic::Ordering;
+
+        let irq_flag = unsafe { crate::mm::save_irq_disable() };
+        self.lock();
+
+        let online = self.online_cpus as usize;
+        for cpu in 0..online {
+            let _ = self.pending_enqueue[cpu].compare_exchange(
+                tcb,
+                core::ptr::null_mut(),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
+
+        self.unlock();
+        unsafe { crate::mm::restore_irq(irq_flag) };
     }
 
     /// Process deferred enqueue after context switch.
@@ -629,12 +884,16 @@ impl Scheduler {
     ///
     /// Caller MUST hold the scheduler lock.
     fn process_pending_enqueue(&mut self) {
+        use core::sync::atomic::Ordering;
+
         let cpu_id = checked_cpu_id("process_pending_enqueue");
-        let tcb = self.pending_enqueue[cpu_id];
+        // Atomic swap: take ownership of the slot so a concurrent
+        // set_pending_enqueue on another CPU cannot race with our read.
+        let tcb = self.pending_enqueue[cpu_id].swap(core::ptr::null_mut(), Ordering::AcqRel);
         if !tcb.is_null() {
-            self.pending_enqueue[cpu_id] = core::ptr::null_mut();
             unsafe {
                 self.validate_tcb_ptr(tcb, "process_pending_enqueue", cpu_id);
+                (*tcb).clear_run_owner_cpu();
                 if (*tcb).state == ThreadState::Ready {
                     self.enqueue_unlocked(tcb);
                 }
@@ -647,13 +906,12 @@ impl Scheduler {
     // ---------------------------------------------------------------
 
     /// Ensure the outgoing thread is represented in the deferred slot before
-    /// releasing SCHED_IPC_LOCK and switching away.
+    /// switching away.
     ///
     /// This closes the race where another CPU wakes a thread (Blocked->Ready)
     /// before `context_switch` has saved the outgoing kernel continuation.
     ///
     /// # Preconditions
-    /// - SCHED_IPC_LOCK is held by the caller.
     /// - Scheduler lock is NOT held.
     unsafe fn track_outgoing_before_switch(&mut self, old_tcb: *mut Tcb) {
         if old_tcb.is_null() {
@@ -774,9 +1032,6 @@ impl Scheduler {
             // Save outgoing thread's TLS base (FS_BASE MSR)
             (*old_tcb).tls_base = crate::arch::read_fs_base();
 
-            // Release SCHED_IPC_LOCK before context switch (IF=0, no interrupts possible)
-            crate::mm::SCHED_IPC_LOCK.unlock();
-
             // Save outgoing thread's FPU state if it owns the hardware registers.
             // This ensures the TCB buffer is up-to-date before the thread can be
             // migrated to another CPU (where flush_if_owner would miss it).
@@ -793,12 +1048,10 @@ impl Scheduler {
             crate::arch::set_per_cpu_canary((*new_tcb).stack_canary);
 
             // Pure register save/restore — no shared state accessed.
+            // No global lock held during switch (IRQs disabled is sufficient).
             let old_ctx = &mut (*old_tcb).context as *mut _;
             let new_ctx = &(*new_tcb).context as *const _;
             crate::arch::context_switch(old_ctx, new_ctx);
-
-            // Reacquire SCHED_IPC_LOCK after resume
-            crate::mm::SCHED_IPC_LOCK.lock();
 
             // Process deferred enqueue now that context is saved.
             self.lock();
@@ -827,8 +1080,8 @@ impl Scheduler {
     /// preserving a lighter-weight target-preparation path.
     ///
     /// # Preconditions
-    /// - `SCHED_IPC_LOCK` MUST be held.
-    /// - Scheduler lock MUST NOT be held.
+    /// - Scheduler lock (`lock_states` / per-CPU lock) MUST NOT be held.
+    /// - No IPC/endpoint locks should be held (release before calling).
     /// - `set_current(new_tcb)` and thread state transitions were already done.
     /// - Local IRQs MUST remain disabled across the switch; restore them only
     ///   after the resumed continuation returns from this call.
@@ -843,9 +1096,8 @@ impl Scheduler {
     /// Perform the actual context switch (VSpace, kernel stack, registers).
     ///
     /// # Preconditions
-    /// - SCHED_IPC_LOCK MUST be held: this function releases it before switching
-    ///   and reacquires it on resume. Callers without it cause a lock leak.
-    /// - Scheduler lock (`lock_state`) MUST NOT be held.
+    /// - Scheduler lock (`lock_states` / per-CPU lock) MUST NOT be held.
+    /// - No IPC/endpoint locks should be held (release before calling).
     /// - Local IRQs MUST remain disabled across the switch; restore them only
     ///   after the resumed continuation returns from this call.
     unsafe fn do_context_switch(&mut self, old_tcb: *mut Tcb, new_tcb: *mut Tcb) {
@@ -861,21 +1113,42 @@ impl Scheduler {
     // Timer tick (acquires lock internally)
     // ---------------------------------------------------------------
 
+    /// Perform a context switch from timer/IPI path.
+    ///
+    /// Releases per-CPU scheduler lock, performs the context switch (no
+    /// global lock needed — Zircon-style), then restores IRQ state.
+    /// Caller must hold the per-CPU scheduler lock on entry.
+    unsafe fn context_switch_local(
+        &mut self,
+        old_tcb: *mut Tcb,
+        new_tcb: *mut Tcb,
+        irq_flag: u64,
+    ) {
+        unsafe {
+            self.unlock();
+            self.do_context_switch(old_tcb, new_tcb);
+            crate::mm::restore_irq(irq_flag);
+        }
+    }
+
     /// Handle timer tick — called from interrupt context.
     ///
-    /// Acquires the scheduler lock, performs budget accounting, and if a
-    /// context switch is needed, releases the lock before switching.
+    /// Uses a lock-free next-deadline hint to skip the sleep-queue slowpath on
+    /// most ticks, and only acquires the per-CPU scheduler lock after wakeup
+    /// processing has finished.
     pub fn timer_tick(&mut self) {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
+        let now_ns = crate::arch::now_ns();
+
+        if unsafe { crate::sched::sleep_queue::peek_expired(now_ns) } {
+            unsafe { crate::sched::sleep_queue::check_wakeups(now_ns); }
+        }
+
         self.lock();
 
         // Flush any deferred enqueue left over from a previous switch to a
         // fresh thread whose entry point never returned through do_context_switch.
         self.process_pending_enqueue();
-
-        // Wake expired sleepers
-        let now_ns = crate::arch::now_ns();
-        unsafe { crate::sched::sleep_queue::check_wakeups(now_ns); }
 
         unsafe {
             let cpu_id = crate::arch::current_cpu() as usize;
@@ -897,9 +1170,7 @@ impl Scheduler {
                 let new_tcb = self.schedule_unlocked();
                 if current != new_tcb {
                     self.set_current(new_tcb);
-                    self.unlock();
-                    self.do_context_switch(current, new_tcb);
-                    crate::mm::restore_irq(irq_flag);
+                    self.context_switch_local(current, new_tcb, irq_flag);
                     return;
                 }
                 self.unlock();
@@ -921,24 +1192,28 @@ impl Scheduler {
                     let new_tcb = self.schedule_unlocked();
                     if current != new_tcb {
                         self.set_current(new_tcb);
-                        self.unlock();
-                        self.do_context_switch(current, new_tcb);
-                        crate::mm::restore_irq(irq_flag);
+                        self.context_switch_local(current, new_tcb, irq_flag);
                         return;
                     }
                 } else {
                     self.replenish_budget_unlocked(current);
                     self.set_pending_enqueue(cpu_id, current);
                     let new_tcb = self.schedule_unlocked();
-                    if new_tcb == self.idle[cpu_id] && !self.pending_enqueue[cpu_id].is_null() {
+                    if new_tcb == self.idle[cpu_id]
+                        && self.pending_enqueue[cpu_id]
+                            .compare_exchange(
+                                current,
+                                core::ptr::null_mut(),
+                                core::sync::atomic::Ordering::AcqRel,
+                                core::sync::atomic::Ordering::Relaxed,
+                            )
+                            .is_ok()
+                    {
                         // No real thread available — cancel pending, keep current
-                        self.pending_enqueue[cpu_id] = core::ptr::null_mut();
                         (*current).state = ThreadState::Running;
                     } else if current != new_tcb {
                         self.set_current(new_tcb);
-                        self.unlock();
-                        self.do_context_switch(current, new_tcb);
-                        crate::mm::restore_irq(irq_flag);
+                        self.context_switch_local(current, new_tcb, irq_flag);
                         return;
                     }
                 }
@@ -951,15 +1226,21 @@ impl Scheduler {
                     self.set_pending_enqueue(cpu_id, current);
                 }
                 let new_tcb = self.schedule_unlocked();
-                if new_tcb == self.idle[cpu_id] && !self.pending_enqueue[cpu_id].is_null() {
+                if new_tcb == self.idle[cpu_id]
+                    && self.pending_enqueue[cpu_id]
+                        .compare_exchange(
+                            current,
+                            core::ptr::null_mut(),
+                            core::sync::atomic::Ordering::AcqRel,
+                            core::sync::atomic::Ordering::Relaxed,
+                        )
+                        .is_ok()
+                {
                     // No real thread available — cancel pending, keep current
-                    self.pending_enqueue[cpu_id] = core::ptr::null_mut();
                     (*current).state = ThreadState::Running;
                 } else if current != new_tcb {
                     self.set_current(new_tcb);
-                    self.unlock();
-                    self.do_context_switch(current, new_tcb);
-                    crate::mm::restore_irq(irq_flag);
+                    self.context_switch_local(current, new_tcb, irq_flag);
                     return;
                 }
             }
@@ -986,7 +1267,8 @@ impl Scheduler {
 
         // Send rebalance IPIs AFTER releasing lock to prevent deadlock
         if rebalance_ipi_mask != 0 {
-            for cpu in 0..MAX_CPUS {
+            let online = self.online_cpus as usize;
+            for cpu in 0..online {
                 if rebalance_ipi_mask & (1 << cpu) != 0 {
                     unsafe {
                         crate::arch::send_ipi(cpu, crate::arch::IpiKind::Reschedule);
@@ -998,8 +1280,7 @@ impl Scheduler {
 
     /// Handle reschedule IPI — checks ready queue for work on this CPU.
     ///
-    /// Unlike timer_tick(), this does not require a sched_context, so it
-    /// works correctly when the current thread is the idle thread.
+    /// No global lock needed — operates entirely with per-CPU scheduler lock.
     pub fn handle_reschedule_ipi(&mut self) {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
         self.lock();
@@ -1026,15 +1307,21 @@ impl Scheduler {
             }
 
             let new_tcb = self.schedule_unlocked();
-            if new_tcb == self.idle[cpu_id] && !self.pending_enqueue[cpu_id].is_null() {
+            if new_tcb == self.idle[cpu_id]
+                && self.pending_enqueue[cpu_id]
+                    .compare_exchange(
+                        current,
+                        core::ptr::null_mut(),
+                        core::sync::atomic::Ordering::AcqRel,
+                        core::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
                 // No real thread available — cancel pending, keep current
-                self.pending_enqueue[cpu_id] = core::ptr::null_mut();
                 (*current).state = ThreadState::Running;
             } else if current != new_tcb {
                 self.set_current(new_tcb);
-                self.unlock();
-                self.do_context_switch(current, new_tcb);
-                crate::mm::restore_irq(irq_flag);
+                self.context_switch_local(current, new_tcb, irq_flag);
                 return;
             }
         }
@@ -1094,39 +1381,30 @@ impl Scheduler {
         let this_cpu = crate::arch::current_cpu() as usize;
         let online = self.online_cpus as usize;
 
-        // Walk the ready queue: for each ready thread, check if any CPU
-        // is running a worse-priority (later deadline) thread that could
-        // be preempted.
-        unsafe {
-            let mut ready = self.ready_head;
-            while !ready.is_null() {
-                let ready_affinity = (*ready).cpu_affinity;
-                let ready_prio = (*ready).priority;
+        // O(online_cpus): for each remote CPU, check if its queue head
+        // can preempt the currently running thread on that CPU.
+        for cpu in 0..online {
+            if cpu == this_cpu {
+                continue; // this CPU handles its own preemption
+            }
 
-                for cpu in 0..online {
-                    if cpu == this_cpu {
-                        continue; // this CPU handles its own preemption
-                    }
-                    if ipi_mask & (1 << cpu) != 0 {
-                        continue; // already sending IPI to this CPU
-                    }
-                    // Check affinity compatibility
-                    if ready_affinity != 0xFFFF_FFFF && ready_affinity as usize != cpu {
-                        continue;
-                    }
-                    let running = self.current[cpu];
-                    if running.is_null() || running == self.idle[cpu] {
-                        // Idle CPU — it will pick up work from reschedule IPI
+            let head = self.ready_heads[cpu];
+            let running = self.current[cpu];
+
+            if running.is_null() || running == self.idle[cpu] {
+                // Idle CPU — if it has work queued, wake it
+                if !head.is_null() {
+                    ipi_mask |= 1 << cpu;
+                }
+                continue;
+            }
+
+            if !head.is_null() {
+                unsafe {
+                    if (*head).priority < (*running).priority {
                         ipi_mask |= 1 << cpu;
-                        break; // this ready thread will be picked up
-                    }
-                    if ready_prio < (*running).priority {
-                        // Ready thread has earlier deadline than running thread
-                        ipi_mask |= 1 << cpu;
-                        break;
                     }
                 }
-                ready = (*ready).next;
             }
         }
 
@@ -1139,9 +1417,9 @@ impl Scheduler {
 
     /// Perform a context switch to the next thread.
     ///
-    /// # Preconditions
-    /// - SCHED_IPC_LOCK MUST be held by the caller. do_context_switch releases
-    ///   it before switching and reacquires on resume.
+    /// No global lock required — uses only per-CPU scheduler locks.
+    /// Callers must NOT hold any IPC/endpoint lock across this call
+    /// (release before calling, reacquire after if needed).
     ///
     /// Acquires the scheduler lock internally for the scheduling decision.
     pub fn reschedule(&mut self) {
@@ -1191,8 +1469,7 @@ impl Scheduler {
     /// the current thread is NOT inserted into the ready queue until
     /// `context_switch` has saved its registers.
     ///
-    /// # Preconditions
-    /// - SCHED_IPC_LOCK MUST be held by the caller.
+    /// No global lock required — uses only per-CPU scheduler locks.
     pub fn yield_current(&mut self) {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
         self.lock();
@@ -1211,9 +1488,9 @@ impl Scheduler {
             }
 
             let new_tcb = self.schedule_unlocked();
-            if new_tcb == self.idle[cpu_id] && !self.pending_enqueue[cpu_id].is_null() {
+            if new_tcb == self.idle[cpu_id] && !self.pending_enqueue[cpu_id].load(core::sync::atomic::Ordering::Acquire).is_null() {
                 // No real thread available — cancel pending, keep current
-                self.pending_enqueue[cpu_id] = core::ptr::null_mut();
+                self.pending_enqueue[cpu_id].store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
                 (*current).state = ThreadState::Running;
             } else if current != new_tcb {
                 self.set_current(new_tcb);
@@ -1284,12 +1561,9 @@ impl Scheduler {
 
     /// Block current thread on VSpace teardown (MAY switch, manages IRQ state internally)
     ///
-    /// CRITICAL: This function may call do_context_switch() which releases/reacquires
-    /// SCHED_IPC_LOCK. The function manages both SCHED_IPC_LOCK and scheduler lock internally.
-    /// Do NOT wrap with with_lock().
+    /// Uses only per-CPU scheduler lock — no per-object lock needed.
     pub fn block_current_on_vspace(&mut self, tracking: &crate::mm::VSpaceTracking) {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
-        crate::mm::SCHED_IPC_LOCK.lock();
         self.lock();
 
         unsafe {
@@ -1299,7 +1573,6 @@ impl Scheduler {
             // Fast path: check if already inactive
             if !tracking.is_active() {
                 self.unlock();
-                crate::mm::SCHED_IPC_LOCK.unlock();
                 crate::mm::restore_irq(irq_flag);
                 return;
             }
@@ -1324,13 +1597,9 @@ impl Scheduler {
 
             if old_tcb != new_tcb {
                 self.set_current(new_tcb);
-                // do_context_switch releases SCHED_IPC_LOCK before switch,
-                // reacquires on resume
                 self.do_context_switch(old_tcb, new_tcb);
             }
 
-            // After resume: SCHED_IPC_LOCK is held (reacquired by do_context_switch)
-            crate::mm::SCHED_IPC_LOCK.unlock();
             crate::mm::restore_irq(irq_flag);
         }
     }
@@ -1343,7 +1612,6 @@ impl Scheduler {
     ///
     /// Acquires the scheduler lock, sets up timer state, inserts into
     /// the sleep queue, and performs context switch if needed.
-    /// This ensures sleep_queue::insert() is called with lock held.
     pub fn block_current_sleeping(&mut self, wakeup_ns: u64) {
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
         self.lock();
@@ -1391,10 +1659,11 @@ impl Scheduler {
     /// queue and performs a context switch.
     ///
     /// # Preconditions
-    /// - SCHED_IPC_LOCK MUST be held by the caller (released before switch,
-    ///   reacquired on resume).
     /// - Thread state and futex fields already configured by caller.
+    /// - No IPC/endpoint locks should be held across this call.
     pub fn block_current_futex_timed(&mut self, wakeup_ns: u64) {
+        use core::sync::atomic::Ordering;
+
         let irq_flag = unsafe { crate::mm::save_irq_disable() };
         self.lock();
 
@@ -1402,6 +1671,37 @@ impl Scheduler {
             let cpu_id = crate::arch::current_cpu() as usize;
             let current = self.current[cpu_id];
             if current.is_null() {
+                self.unlock();
+                crate::mm::restore_irq(irq_flag);
+                return;
+            }
+
+            let still_timed_blocked = match (*current).blocked_reason {
+                Some(BlockedReason::FutexTimedBlocked) => {
+                    (*current).state == ThreadState::Blocked
+                        && !(*current).futex_vspace.is_null()
+                }
+                Some(BlockedReason::SendTimedBlocked { .. })
+                | Some(BlockedReason::RecvTimedBlocked) => {
+                    (*current).state == ThreadState::Blocked
+                        && !(*current).blocked_endpoint.is_null()
+                }
+                _ => false,
+            };
+
+            if !still_timed_blocked {
+                // A wake may have raced in after the caller dropped its
+                // futex/endpoint lock but before we could publish the sleep
+                // queue entry. In that case this thread never actually blocked.
+                let _ = self.pending_enqueue[cpu_id].compare_exchange(
+                    current,
+                    core::ptr::null_mut(),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+                if (*current).state != ThreadState::Inactive {
+                    (*current).state = ThreadState::Running;
+                }
                 self.unlock();
                 crate::mm::restore_irq(irq_flag);
                 return;
@@ -1417,8 +1717,6 @@ impl Scheduler {
                 self.track_pending_switch_out(cpu_id, old_tcb);
                 self.set_current(new_tcb);
                 self.unlock();
-                // SAFETY: SCHED_IPC_LOCK is held; do_context_switch releases
-                // before switch and reacquires on resume.
                 self.do_context_switch(old_tcb, new_tcb);
                 crate::mm::restore_irq(irq_flag);
                 return;

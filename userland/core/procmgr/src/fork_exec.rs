@@ -1042,12 +1042,17 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         super::spawn_tx::unmap_window_from_mmsrv(super::PROCMGR_SCRATCH_VADDR, 1);
 
         // 11. Suspend and reconfigure
-        let susp_err = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 16);
+        let susp_err = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 64);
         if susp_err != 0 {
-            super::puts(b"[PROCMGR] EXEC: tcb_suspend failed\n");
-            abort_destroyed_exec(idx, reply, &mut vfs_source);
-            return;
+            besalt::syscall::syscall(besalt::SYS_NANOSLEEP, 2_000_000, 0, 0, 0, 0, 0);
+            let err2 = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 64);
+            if err2 != 0 {
+                super::puts(b"[PROCMGR] EXEC: tcb_suspend failed\n");
+                abort_destroyed_exec(idx, reply, &mut vfs_source);
+                return;
+            }
         }
+        besalt::syscall::syscall(besalt::SYS_YIELD, 0, 0, 0, 0, 0, 0);
 
         // POSIX: exec resets caught signals to SIG_DFL
         for i in 0..NSIG {

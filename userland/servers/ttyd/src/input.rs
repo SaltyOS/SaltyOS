@@ -3,15 +3,14 @@
 
 use besalt::consts::*;
 use besalt::ipc;
-use besalt::serial;
 use besalt::types::*;
 
 use crate::types::*;
-use crate::{ipc_ctx, display_write, PTYS};
+use crate::{ipc_ctx, display_write, serial_write_queued, PTYS};
 
 /// Echo a control character as ^X to serial.
 pub fn echo_ctrl_serial(c: u8) {
-    serial::serial_puts(&[b'^', c + 0x40]);
+    serial_write_queued(&[b'^', c + 0x40]);
 }
 
 /// Push a byte to the display echo buffer, flushing if full.
@@ -31,7 +30,7 @@ fn echo_backspace_erase(buf: &mut [u8; 64], len: &mut usize) {
     echo_push(buf, len, 0x08);
 }
 
-/// Write a byte slice with CR/LF translation via DebugPutStr syscall (serial output).
+/// Write a byte slice with CR/LF translation to serial (queued).
 pub fn serial_puts_opost(s: &[u8]) {
     let mut buf = [0u8; 80];
     let mut buf_len = 0;
@@ -40,19 +39,19 @@ pub fn serial_puts_opost(s: &[u8]) {
             buf[buf_len] = b'\r';
             buf_len += 1;
             if buf_len >= buf.len() {
-                serial::serial_puts(&buf[..buf_len]);
+                serial_write_queued(&buf[..buf_len]);
                 buf_len = 0;
             }
         }
         buf[buf_len] = c;
         buf_len += 1;
         if buf_len >= buf.len() {
-            serial::serial_puts(&buf[..buf_len]);
+            serial_write_queued(&buf[..buf_len]);
             buf_len = 0;
         }
     }
     if buf_len > 0 {
-        serial::serial_puts(&buf[..buf_len]);
+        serial_write_queued(&buf[..buf_len]);
     }
 }
 
@@ -80,17 +79,54 @@ pub fn signal_vfs(pty_id: usize) {
     );
 }
 
-/// Flush line buffer contents into the slave ring.
-pub fn flush_line_to_ring(line: &mut InputLineBuf, ring: &mut RingBuf) {
-    for i in 0..line.len {
-        ring.push(line.buf[i]);
+pub(crate) fn pty_has_readable_data(pty: &PtyInstance) -> bool {
+    !pty.slave_ring.is_empty() || !pty.spill_ring.is_empty()
+}
+
+pub(crate) fn signal_vfs_if_readable(pty_id: usize, pty: &PtyInstance) {
+    if pty_has_readable_data(pty) {
+        signal_vfs(pty_id);
     }
-    line.clear();
+}
+
+pub(crate) fn refill_slave_ring(pty: &mut PtyInstance) {
+    while !pty.slave_ring.is_full() {
+        let Some(byte) = pty.spill_ring.pop() else { break };
+        if !pty.slave_ring.push(byte) {
+            break;
+        }
+    }
+}
+
+fn push_slave_byte(pty_id: usize, pty: &mut PtyInstance, byte: u8) {
+    if pty.slave_ring.push(byte) {
+        return;
+    }
+    if pty.spill_ring.push(byte) {
+        signal_vfs(pty_id);
+        return;
+    }
+    serial_write_queued(b"[TTYD] WARN: input queues full, input dropped\n");
+}
+
+/// Flush line buffer contents into the slave ring.
+pub fn flush_line_to_ring(pty_id: usize, pty: &mut PtyInstance) {
+    let line_len = pty.line.len;
+    let mut buf = [0u8; LINE_BUF_SIZE];
+    let mut i = 0usize;
+    while i < line_len {
+        buf[i] = pty.line.buf[i];
+        i += 1;
+    }
+    for byte in &buf[..line_len] {
+        push_slave_byte(pty_id, pty, *byte);
+    }
+    pty.line.clear();
 }
 
 /// Process a single input character through the line discipline for a PTY.
-/// After processing, if slave_ring transitions from empty to non-empty,
-/// signals VFS via notification to wake pending readers and poll waiters.
+/// Readability notifications are emitted at line-delivery boundaries and once
+/// again after each input batch so VFS sees buffered data as level-triggered.
 pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], echo_len: &mut usize) {
     unsafe {
         let pty = &mut *(&raw mut PTYS[pty_id]);
@@ -104,7 +140,7 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
             if ch == pty.termios.c_cc[VINTR] {
                 if (pty.termios.c_lflag & ECHOCTL) != 0 {
                     echo_ctrl_serial(ch);
-                    serial::serial_puts(b"\r\n");
+                    serial_write_queued(b"\r\n");
                     echo_push(echo_buf, echo_len, b'^');
                     echo_push(echo_buf, echo_len, ch + 0x40);
                     echo_push(echo_buf, echo_len, b'\n');
@@ -118,7 +154,7 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
             if ch == pty.termios.c_cc[VQUIT] {
                 if (pty.termios.c_lflag & ECHOCTL) != 0 {
                     echo_ctrl_serial(ch);
-                    serial::serial_puts(b"\r\n");
+                    serial_write_queued(b"\r\n");
                     echo_push(echo_buf, echo_len, b'^');
                     echo_push(echo_buf, echo_len, ch + 0x40);
                     echo_push(echo_buf, echo_len, b'\n');
@@ -132,7 +168,7 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
             if ch == pty.termios.c_cc[VSUSP] {
                 if (pty.termios.c_lflag & ECHOCTL) != 0 {
                     echo_ctrl_serial(ch);
-                    serial::serial_puts(b"\r\n");
+                    serial_write_queued(b"\r\n");
                     echo_push(echo_buf, echo_len, b'^');
                     echo_push(echo_buf, echo_len, ch + 0x40);
                     echo_push(echo_buf, echo_len, b'\n');
@@ -157,7 +193,7 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
             if ch == pty.termios.c_cc[VERASE] || ch == 0x08 {
                 if pty.line.pop() {
                     if (pty.termios.c_lflag & ECHOE) != 0 {
-                        serial::serial_puts(b"\x08 \x08");
+                        serial_write_queued(b"\x08 \x08");
                         echo_backspace_erase(echo_buf, echo_len);
                     }
                 }
@@ -168,7 +204,7 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
             if ch == pty.termios.c_cc[VKILL] {
                 if (pty.termios.c_lflag & ECHOK) != 0 || (pty.termios.c_lflag & ECHOKE) != 0 {
                     for _ in 0..pty.line.len {
-                        serial::serial_puts(b"\x08 \x08");
+                        serial_write_queued(b"\x08 \x08");
                         echo_backspace_erase(echo_buf, echo_len);
                     }
                 }
@@ -178,12 +214,8 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
 
             // EOF (Ctrl-D)
             if ch == pty.termios.c_cc[VEOF] {
-                let was_empty = pty.slave_ring.is_empty();
-                flush_line_to_ring(&mut pty.line, &mut pty.slave_ring);
-                if was_empty {
-                    // Signal VFS for both data-ready and empty-line EOF.
-                    signal_vfs(pty_id);
-                }
+                flush_line_to_ring(pty_id, pty);
+                signal_vfs_if_readable(pty_id, pty);
                 return;
             }
 
@@ -191,14 +223,11 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
             if ch == b'\n' {
                 pty.line.push(b'\n');
                 if do_echo || (pty.termios.c_lflag & ECHONL) != 0 {
-                    serial::serial_puts(b"\r\n");
+                    serial_write_queued(b"\r\n");
                     echo_push(echo_buf, echo_len, b'\n');
                 }
-                let was_empty = pty.slave_ring.is_empty();
-                flush_line_to_ring(&mut pty.line, &mut pty.slave_ring);
-                if was_empty && !pty.slave_ring.is_empty() {
-                    signal_vfs(pty_id);
-                }
+                flush_line_to_ring(pty_id, pty);
+                signal_vfs_if_readable(pty_id, pty);
                 return;
             }
 
@@ -210,30 +239,23 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
                         echo_push(echo_buf, echo_len, b'^');
                         echo_push(echo_buf, echo_len, ch + 0x40);
                     } else {
-                        serial::serial_puts(&[ch]);
+                        serial_write_queued(&[ch]);
                         echo_push(echo_buf, echo_len, ch);
                     }
                 }
             }
             // Flush if line buffer is full
             if pty.line.len >= LINE_BUF_SIZE {
-                let was_empty = pty.slave_ring.is_empty();
-                flush_line_to_ring(&mut pty.line, &mut pty.slave_ring);
-                if was_empty && !pty.slave_ring.is_empty() {
-                    signal_vfs(pty_id);
-                }
+                flush_line_to_ring(pty_id, pty);
+                signal_vfs_if_readable(pty_id, pty);
             }
         } else {
             // === RAW MODE ===
             if do_echo {
-                serial::serial_puts(&[ch]);
+                serial_write_queued(&[ch]);
                 echo_push(echo_buf, echo_len, ch);
             }
-            let was_empty = pty.slave_ring.is_empty();
-            pty.slave_ring.push(ch);
-            if was_empty {
-                signal_vfs(pty_id);
-            }
+            push_slave_byte(pty_id, pty, ch);
         }
     }
 }
@@ -254,6 +276,9 @@ pub unsafe fn handle_input_event(msg: &BesaltMsg) {
             let c = *src.add(i);
             process_input_char(0, c, &mut echo_buf, &mut echo_len);
         }
+
+        let pty = &*(&raw const PTYS[0]);
+        signal_vfs_if_readable(0, pty);
 
         if echo_len > 0 {
             display_write(&echo_buf[..echo_len]);
