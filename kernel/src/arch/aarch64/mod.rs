@@ -243,17 +243,31 @@ pub unsafe extern "C" fn usermode_trampoline() {
 }
 
 /// Initialize architecture-specific subsystems
+///
+/// Init order:
+/// 1. PL011 UART (serial output)
+/// 2. Memory management (frame allocator)
+/// 3. Paging (direct physical map)
+/// 4. Frame bitmap remap + per-frame arrays
 pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // Initialize PL011 UART for serial output
     pl011::init();
 
-    // Initialize GIC (stub for Phase 1)
-    // gic::init();
-
-    // Initialize paging (stub for Phase 1)
+    // Initialize memory management (frame allocator needed by paging::init())
     if let Some(info) = boot_info {
-        let _ = info; // TODO: Phase 2 — frame allocator + page tables
+        crate::mm::init(info);
     }
+
+    // Initialize paging (direct physical map)
+    paging::init();
+
+    // Switch frame bitmap pointer from identity map (TTBR0) to direct
+    // physical map (TTBR1). Must happen after paging::init() creates the
+    // direct map and before TTBR0 identity map is cleared.
+    crate::mm::remap_frame_bitmap();
+
+    // Allocate per-frame tracking arrays now that direct map covers all RAM.
+    crate::mm::init_per_frame_arrays();
 
     crate::serial_puts("[ARCH] AArch64 subsystems initialized\n");
 }
@@ -263,9 +277,9 @@ pub fn init_smp(_boot_info: Option<&crate::ParsedBootInfo>) {
     // TODO: Phase 4 — PSCI CPU_ON
 }
 
-/// Remove bootloader identity mapping (stub for Phase 1)
+/// Remove bootloader identity mapping (L0[0] via TTBR0).
 pub fn clear_boot_identity_map() {
-    // TODO: Phase 2 — clear TTBR0 identity map
+    paging::clear_boot_identity_map();
 }
 
 /// Start timer interrupts (stub for Phase 1)
