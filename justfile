@@ -84,6 +84,10 @@ _setup-impl suffix arch:
         exit 1
       fi
     fi
+    # Custom-built clang needs the macOS SDK path to pass Meson's sanity check
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      export SDKROOT="${SDKROOT:-$(xcrun --show-sdk-path)}"
+    fi
     mkdir -p "$dir"
     {
       printf '[binaries]\n'
@@ -120,6 +124,8 @@ reconfigure *ARGS:
 
 # Build all components
 build:
+    #!/usr/bin/env bash
+    source tools/toolchain/env.sh
     meson compile -C {{builddir}}
 
 # Build with verbose output

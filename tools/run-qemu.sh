@@ -81,7 +81,9 @@ if $UEFI; then
             /usr/share/edk2-ovmf/OVMF_CODE.fd \
             /usr/share/OVMF/OVMF_CODE_4M.fd \
             /usr/share/ovmf/OVMF.fd \
-            /usr/share/qemu/OVMF.fd; do
+            /usr/share/qemu/OVMF.fd \
+            /opt/homebrew/share/qemu/edk2-x86_64-code.fd \
+            /usr/local/share/qemu/edk2-x86_64-code.fd; do
             [[ -f "$cand" ]] && { ovmf_code="$cand"; break; }
         done
     fi
@@ -89,7 +91,9 @@ if $UEFI; then
         for cand in \
             /usr/share/edk2-ovmf/OVMF_VARS.fd \
             /usr/share/OVMF/OVMF_VARS_4M.fd \
-            /usr/share/OVMF/OVMF_VARS.fd; do
+            /usr/share/OVMF/OVMF_VARS.fd \
+            /opt/homebrew/share/qemu/edk2-i386-vars.fd \
+            /usr/local/share/qemu/edk2-i386-vars.fd; do
             [[ -f "$cand" ]] && { ovmf_vars="$cand"; break; }
         done
     fi
