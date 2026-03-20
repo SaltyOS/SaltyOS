@@ -11,9 +11,11 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use crate::cap::{
-    alloc_slot, get_cap_mut, CNode, CapRef, CapRights, IoPortRange, KernelObject, ObjectType,
+    alloc_slot, get_cap_mut, CNode, CapRef, CapRights, KernelObject, ObjectType,
     UntypedMemory,
 };
+#[cfg(target_arch = "x86_64")]
+use crate::cap::IoPortRange;
 use crate::ipc::{IrqHandler, Notification};
 use crate::mm::vspace::PageFlags;
 use crate::mm::{
@@ -62,8 +64,10 @@ const INIT_STACK_TOP: u64 = INIT_STACK_VADDR + INIT_STACK_SIZE;
 const CAP_SELF_TCB: usize = 0;
 const CAP_SELF_VSPACE: usize = 1;
 const CAP_SELF_CSPACE: usize = 2;
-/// PS/2 keyboard capabilities
+/// PS/2 keyboard capabilities (x86 only)
+#[cfg(target_arch = "x86_64")]
 const CAP_KBD_IOPORT: usize = 6;
+#[cfg(target_arch = "x86_64")]
 const CAP_KBD_IRQ: usize = 7;
 /// COM1 serial port capabilities
 const CAP_COM1_IOPORT: usize = 8;
@@ -117,18 +121,36 @@ static mut INIT_UNTYPEDS: [UntypedMemory; MAX_INIT_UNTYPEDS] = {
     [EMPTY; MAX_INIT_UNTYPEDS]
 };
 
-/// COM1 serial port objects (static, never freed)
+/// COM1 serial port IoPort (x86 only — aarch64 uses PL011 device untyped)
+#[cfg(target_arch = "x86_64")]
 static mut INIT_COM1_IOPORT: IoPortRange = IoPortRange::new(0x3F8, 8);
+/// COM1 IRQ handler (IRQ 4 on x86, INTID 33 on aarch64)
+#[cfg(target_arch = "x86_64")]
 static mut INIT_COM1_IRQ: IrqHandler = IrqHandler::new(4);
+#[cfg(target_arch = "x86_64")]
 static mut INIT_COM1_NOTIFICATION: Notification = Notification::new();
 
-/// PS/2 keyboard objects (static, never freed)
+/// PL011 UART IRQ handler (INTID 33 = SPI 1 on QEMU virt)
+#[cfg(target_arch = "aarch64")]
+static mut INIT_PL011_IRQ: IrqHandler = IrqHandler::new(33);
+/// PL011 UART notification (for IRQ delivery)
+#[cfg(target_arch = "aarch64")]
+static mut INIT_PL011_NOTIFICATION: Notification = Notification::new();
+/// PL011 UART device untyped (phys 0x0900_0000, 4 KiB)
+#[cfg(target_arch = "aarch64")]
+static mut INIT_PL011_UNTYPED: UntypedMemory = UntypedMemory::new(0x0900_0000, 12, true);
+
+/// PS/2 keyboard objects (x86 only — no PS/2 on aarch64)
+#[cfg(target_arch = "x86_64")]
 static mut INIT_KBD_IOPORT: IoPortRange = IoPortRange::new(0x60, 5); // ports 0x60-0x64
+#[cfg(target_arch = "x86_64")]
 static mut INIT_KBD_IRQ: IrqHandler = IrqHandler::new(1);           // IRQ1
 
 /// PCI config space I/O port (0xCF8..0xCFF, 8 ports for CONFIG_ADDRESS + CONFIG_DATA)
+#[cfg(target_arch = "x86_64")]
 static mut INIT_PCI_IOPORT: IoPortRange = IoPortRange::new(0xCF8, 8);
 /// PCI config space IoPort well-known slot index
+#[cfg(target_arch = "x86_64")]
 const CAP_PCI_IOPORT: usize = 15;
 
 /// IrqControl capability (IrqHandler with CONFIGURE rights, for dynamic IoPort creation)
@@ -164,13 +186,16 @@ static mut DYNAMIC_IRQ_HANDLER_POOL: [IrqHandler; MAX_DYNAMIC_IRQ_HANDLERS] = {
 static mut DYNAMIC_IRQ_HANDLER_NEXT: usize = 0;
 
 /// Maximum number of dynamically-created IoPort ranges (for PCI I/O BAR provisioning)
+#[cfg(target_arch = "x86_64")]
 const MAX_DYNAMIC_IOPORTS: usize = 8;
 /// Pool of IoPort range objects for runtime provisioning
+#[cfg(target_arch = "x86_64")]
 static mut DYNAMIC_IOPORT_POOL: [IoPortRange; MAX_DYNAMIC_IOPORTS] = {
     const EMPTY: IoPortRange = IoPortRange::new(0, 0);
     [EMPTY; MAX_DYNAMIC_IOPORTS]
 };
 /// Next free index in the dynamic IoPort pool
+#[cfg(target_arch = "x86_64")]
 static mut DYNAMIC_IOPORT_NEXT: usize = 0;
 /// Exact byte limit (page-aligned) for initrd map_device exposure
 static mut INITRD_DEVICE_LIMIT_BYTES: u64 = 0;
@@ -361,53 +386,100 @@ fn setup_init_cspace(boot_info: Option<&ParsedBootInfo>) {
             ObjectType::CNode,
         );
 
-        // Slot 8: COM1 IoPort capability (ports 0x3F8..0x3FF)
-        insert_static_cap(
-            cnode,
-            CAP_COM1_IOPORT,
-            &raw mut INIT_COM1_IOPORT as *mut crate::cap::KernelObject,
-            ObjectType::IoPort,
-        );
-
-        // Slot 9: COM1 IRQ handler capability (IRQ 4)
+        // --- x86_64: I/O port capabilities ---
+        #[cfg(target_arch = "x86_64")]
         {
-            let irq_ptr = &raw mut INIT_COM1_IRQ;
+            // Slot 8: COM1 IoPort capability (ports 0x3F8..0x3FF)
             insert_static_cap(
                 cnode,
-                CAP_COM1_IRQ,
-                irq_ptr as *mut crate::cap::KernelObject,
-                ObjectType::IrqHandler,
+                CAP_COM1_IOPORT,
+                &raw mut INIT_COM1_IOPORT as *mut crate::cap::KernelObject,
+                ObjectType::IoPort,
             );
-            // Register in global IRQ table so hardware IRQ4 dispatches to it
-            crate::ipc::irq::register_handler(4, irq_ptr);
+
+            // Slot 9: COM1 IRQ handler capability (IRQ 4)
+            {
+                let irq_ptr = &raw mut INIT_COM1_IRQ;
+                insert_static_cap(
+                    cnode,
+                    CAP_COM1_IRQ,
+                    irq_ptr as *mut crate::cap::KernelObject,
+                    ObjectType::IrqHandler,
+                );
+                // Register in global IRQ table so hardware IRQ4 dispatches to it
+                crate::ipc::irq::register_handler(4, irq_ptr);
+            }
+
+            // Slot 10: COM1 notification (for IRQ delivery)
+            insert_static_cap(
+                cnode,
+                CAP_COM1_NOTIFICATION,
+                &raw mut INIT_COM1_NOTIFICATION as *mut crate::cap::KernelObject,
+                ObjectType::Notification,
+            );
+
+            // Slot 6: PS/2 Keyboard IoPort (ports 0x60-0x64)
+            insert_static_cap(
+                cnode,
+                CAP_KBD_IOPORT,
+                &raw mut INIT_KBD_IOPORT as *mut crate::cap::KernelObject,
+                ObjectType::IoPort,
+            );
+
+            // Slot 7: PS/2 Keyboard IRQ handler (IRQ1)
+            {
+                let irq_ptr = &raw mut INIT_KBD_IRQ;
+                insert_static_cap(
+                    cnode,
+                    CAP_KBD_IRQ,
+                    irq_ptr as *mut crate::cap::KernelObject,
+                    ObjectType::IrqHandler,
+                );
+                crate::ipc::irq::register_handler(1, irq_ptr);
+            }
+
+            // Slot 15: PCI config space IoPort (0xCF8..0xCFF, 8 ports)
+            insert_static_cap(
+                cnode,
+                CAP_PCI_IOPORT,
+                &raw mut INIT_PCI_IOPORT as *mut crate::cap::KernelObject,
+                ObjectType::IoPort,
+            );
         }
 
-        // Slot 10: COM1 notification (for IRQ delivery)
-        insert_static_cap(
-            cnode,
-            CAP_COM1_NOTIFICATION,
-            &raw mut INIT_COM1_NOTIFICATION as *mut crate::cap::KernelObject,
-            ObjectType::Notification,
-        );
-
-        // Slot 6: PS/2 Keyboard IoPort (ports 0x60-0x64)
-        insert_static_cap(
-            cnode,
-            CAP_KBD_IOPORT,
-            &raw mut INIT_KBD_IOPORT as *mut crate::cap::KernelObject,
-            ObjectType::IoPort,
-        );
-
-        // Slot 7: PS/2 Keyboard IRQ handler (IRQ1)
+        // --- aarch64: MMIO device untypeds ---
+        #[cfg(target_arch = "aarch64")]
         {
-            let irq_ptr = &raw mut INIT_KBD_IRQ;
+            // Slot 8: PL011 UART device untyped (phys 0x0900_0000, 4 KiB)
+            // Reuses CAP_COM1_IOPORT slot — on aarch64 device MMIO is accessed
+            // via device untypeds + frame mapping instead of I/O ports.
             insert_static_cap(
                 cnode,
-                CAP_KBD_IRQ,
-                irq_ptr as *mut crate::cap::KernelObject,
-                ObjectType::IrqHandler,
+                CAP_COM1_IOPORT,
+                &raw mut INIT_PL011_UNTYPED as *mut crate::cap::KernelObject,
+                ObjectType::Untyped,
             );
-            crate::ipc::irq::register_handler(1, irq_ptr);
+
+            // Slot 9: PL011 UART IRQ handler (INTID 33 = SPI 1)
+            {
+                let irq_ptr = &raw mut INIT_PL011_IRQ;
+                insert_static_cap(
+                    cnode,
+                    CAP_COM1_IRQ,
+                    irq_ptr as *mut crate::cap::KernelObject,
+                    ObjectType::IrqHandler,
+                );
+                // Register in global IRQ table so GIC INTID 33 dispatches to it
+                crate::ipc::irq::register_handler(33, irq_ptr);
+            }
+
+            // Slot 10: PL011 notification (for IRQ delivery)
+            insert_static_cap(
+                cnode,
+                CAP_COM1_NOTIFICATION,
+                &raw mut INIT_PL011_NOTIFICATION as *mut crate::cap::KernelObject,
+                ObjectType::Notification,
+            );
         }
 
         // Slot 11: IrqControl (IrqHandler with ALL rights, for dynamic IoPort/DeviceUntyped creation)
@@ -416,14 +488,6 @@ fn setup_init_cspace(boot_info: Option<&ParsedBootInfo>) {
             CAP_IRQ_CONTROL,
             &raw mut INIT_IRQ_CONTROL as *mut crate::cap::KernelObject,
             ObjectType::IrqHandler,
-        );
-
-        // Slot 15: PCI config space IoPort (0xCF8..0xCFF, 8 ports)
-        insert_static_cap(
-            cnode,
-            CAP_PCI_IOPORT,
-            &raw mut INIT_PCI_IOPORT as *mut crate::cap::KernelObject,
-            ObjectType::IoPort,
         );
 
         // Slot 12: Initrd pseudo-device untyped for map_device-based sharing
@@ -560,6 +624,7 @@ pub fn alloc_device_untyped(phys_addr: u64, size_bits: u8) -> Option<*mut Untype
 /// Allocate an IoPort range from the static pool for runtime provisioning.
 ///
 /// Returns a pointer to the initialized IoPortRange, or None if pool is full.
+#[cfg(target_arch = "x86_64")]
 pub fn alloc_dynamic_ioport(base_port: u16, num_ports: u16) -> Option<*mut IoPortRange> {
     unsafe {
         let idx = DYNAMIC_IOPORT_NEXT;

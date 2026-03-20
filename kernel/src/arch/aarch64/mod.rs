@@ -318,17 +318,9 @@ pub fn start_timer() {
     timer::start();
 }
 
-/// ACPI S5 shutdown (stub — uses PSCI SYSTEM_OFF)
+/// Shut down the system via PSCI SYSTEM_OFF.
 pub fn shutdown() -> ! {
-    // PSCI SYSTEM_OFF (SMC #0, function_id = 0x84000008)
-    // SAFETY: PSCI SYSTEM_OFF does not return
-    unsafe {
-        core::arch::asm!(
-            "mov x0, #0x84000008",
-            "smc #0",
-            options(noreturn, nomem, nostack),
-        );
-    }
+    psci::system_off();
 }
 
 // CPUID-equivalent module: reports RNDR (hardware RNG) availability
