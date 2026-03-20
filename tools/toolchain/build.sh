@@ -39,6 +39,48 @@ die() {
   exit 1
 }
 
+_nproc() {
+  nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4
+}
+
+_prepend_env_path() {
+  local var_name="$1"
+  local dir="$2"
+  local current="${!var_name-}"
+
+  [[ -d "$dir" ]] || return 0
+  case ":$current:" in
+    *":$dir:"*) ;;
+    *) export "$var_name=$dir${current:+:$current}" ;;
+  esac
+}
+
+_configure_external_llvm_env() {
+  local llvm_config_path="$1"
+  local system_libs zstd_prefix
+
+  [[ "$(uname -s)" == "Darwin" ]] || return 0
+  [[ -x "$llvm_config_path" ]] || return 0
+
+  system_libs="$("$llvm_config_path" --link-static --system-libs 2>/dev/null || true)"
+  [[ "$system_libs" == *"-lzstd"* ]] || return 0
+
+  if command -v brew >/dev/null 2>&1; then
+    zstd_prefix="$(brew --prefix zstd 2>/dev/null || true)"
+  fi
+  if [[ -z "$zstd_prefix" ]]; then
+    for zstd_prefix in /opt/homebrew/opt/zstd /usr/local/opt/zstd; do
+      [[ -d "$zstd_prefix" ]] && break
+    done
+  fi
+
+  [[ -n "$zstd_prefix" && -d "$zstd_prefix/lib" ]] || die \
+    "llvm-config reports -lzstd but no usable zstd prefix was found. Install zstd with Homebrew or set LIBRARY_PATH manually."
+
+  _prepend_env_path LIBRARY_PATH "$zstd_prefix/lib"
+  echo "Using external LLVM zstd library path: $zstd_prefix/lib"
+}
+
 usage() {
   cat >&2 <<'EOF'
 Usage: bash tools/toolchain/build.sh <command> [args...]
@@ -93,31 +135,28 @@ cmd_setup() {
 cmd_build_host_llvm() {
   mkdir -p "$SALTYOS_LLVM_BUILD_DIR" "$SALTYOS_TOOLCHAIN_PREFIX"
 
+  local llvm_targets="X86"
+  local saltyos_builtins_cache="$SALTYOS_REPO_ROOT/tools/toolchain/cmake/saltyos-builtins-target-cache.cmake"
+  local cmake_extra_args=()
+  case "$(uname -m)" in
+    arm64|aarch64) llvm_targets="AArch64;X86" ;;
+  esac
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    cmake_extra_args+=(-DCMAKE_OSX_SYSROOT="$(xcrun --show-sdk-path)")
+  fi
+
   cmake -S "$SALTYOS_LLVM_SRC_DIR/llvm" -B "$SALTYOS_LLVM_BUILD_DIR" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLVM_ENABLE_PROJECTS="clang;lld" \
-    -DLLVM_TARGETS_TO_BUILD="X86" \
+    -DLLVM_TARGETS_TO_BUILD="$llvm_targets" \
     -DLLVM_INSTALL_UTILS=ON \
+    -C "$saltyos_builtins_cache" \
     -DLLVM_ENABLE_RUNTIMES=compiler-rt \
-    -DLLVM_RUNTIME_TARGETS="default;x86_64-unknown-saltyos" \
-    -DRUNTIMES_x86_64-unknown-saltyos_CMAKE_C_FLAGS="-ffreestanding" \
-    -DRUNTIMES_x86_64-unknown-saltyos_CMAKE_CXX_FLAGS="-ffreestanding" \
-    -DRUNTIMES_x86_64-unknown-saltyos_CMAKE_C_COMPILER_FORCED=ON \
-    -DRUNTIMES_x86_64-unknown-saltyos_CMAKE_CXX_COMPILER_FORCED=ON \
-    -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_BUILTINS=ON \
-    -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_SANITIZERS=OFF \
-    -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_XRAY=OFF \
-    -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_LIBFUZZER=OFF \
-    -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_PROFILE=OFF \
-    -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_MEMPROF=OFF \
-    -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_ORC=OFF \
-    -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_GWP_ASAN=OFF \
-    -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILD_CTX_PROFILE=OFF \
-    -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BUILTINS_ENABLE_PIC=ON \
-    -DRUNTIMES_x86_64-unknown-saltyos_COMPILER_RT_BAREMETAL_BUILD=ON \
-    -DCMAKE_INSTALL_PREFIX="$SALTYOS_TOOLCHAIN_PREFIX"
+    -DLLVM_BUILTIN_TARGETS="default;x86_64-unknown-saltyos" \
+    -DCMAKE_INSTALL_PREFIX="$SALTYOS_TOOLCHAIN_PREFIX" \
+    "${cmake_extra_args[@]}"
 
-  ninja -C "$SALTYOS_LLVM_BUILD_DIR" -j"$(nproc)"
+  ninja -C "$SALTYOS_LLVM_BUILD_DIR" -j"$(_nproc)"
   ninja -C "$SALTYOS_LLVM_BUILD_DIR" install
 }
 
@@ -146,7 +185,7 @@ Run 'just tc build host llvm' first (it installs/links FileCheck into the prefix
   local config_path="$SALTYOS_TOOLCHAIN_BUILD_ROOT/rust-bootstrap.toml"
   {
     echo '[build]'
-    echo 'target = ["x86_64-unknown-linux-gnu"]'
+    echo "target = [\"${SALTYOS_HOST_TRIPLE}\"]"
     echo ''
     echo '[install]'
     echo "prefix = \"$SALTYOS_TOOLCHAIN_PREFIX\""
@@ -158,10 +197,12 @@ Run 'just tc build host llvm' first (it installs/links FileCheck into the prefix
     echo '[rust]'
     echo 'use-lld = true'
     echo ''
-    echo '[target.x86_64-unknown-linux-gnu]'
+    echo "[target.${SALTYOS_HOST_TRIPLE}]"
     echo "llvm-config = \"$llvm_config_path\""
     echo "llvm-filecheck = \"$filecheck_path\""
   } > "$config_path"
+
+  _configure_external_llvm_env "$llvm_config_path"
 
   python3 "$SALTYOS_RUST_SRC_DIR/x.py" install \
     --src "$SALTYOS_RUST_SRC_DIR" \
@@ -238,6 +279,7 @@ Run 'just tc build host llvm' first."
     -DCMAKE_RANLIB="$SALTYOS_TOOLCHAIN_PREFIX/bin/llvm-ranlib" \
     -DCMAKE_C_COMPILER_TARGET=x86_64-unknown-saltyos \
     -DCMAKE_CXX_COMPILER_TARGET=x86_64-unknown-saltyos \
+    -DCMAKE_ASM_COMPILER_TARGET=x86_64-unknown-saltyos \
     -DCMAKE_SYSROOT="$SYSROOT" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$install_prefix" \
@@ -267,6 +309,7 @@ Run 'just tc build host llvm' first."
     -DLLVM_TABLEGEN="$llvm_tblgen" \
     -DCLANG_TABLEGEN="$clang_tblgen" \
     \
+    -DCMAKE_ASM_FLAGS="--target=x86_64-unknown-saltyos --sysroot=$SYSROOT" \
     -DCMAKE_C_FLAGS="--target=x86_64-unknown-saltyos --sysroot=$SYSROOT" \
     -DCMAKE_CXX_FLAGS="--target=x86_64-unknown-saltyos --sysroot=$SYSROOT -fno-exceptions -fno-rtti -nostdinc++ -I$SYSROOT/usr/include/c++/v1" \
     -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -nostdlib -nostartfiles -L$SYSROOT/usr/lib $SYSROOT/usr/lib/crt_start.o -lc++ -lc -lbesalt $SYSROOT/usr/lib/core.o $SYSROOT/usr/lib/compiler_builtins.o -T $SYSROOT/usr/lib/saltyos-pie.ld -z max-page-size=4096" \
@@ -276,12 +319,12 @@ Run 'just tc build host llvm' first."
     -DHAVE_CXX_ATOMICS_WITHOUT_LIB=ON \
     -DHAVE_CXX_ATOMICS64_WITHOUT_LIB=ON
 
-  ninja -C "$build_root" -j"$(nproc)"
+  ninja -C "$build_root" -j"$(_nproc)"
 
   echo
   echo "LLVM/Clang/LLD cross-compiled for SaltyOS successfully."
   echo "  Binaries: $build_root/bin/"
-  echo "  Verify: readelf -d $build_root/bin/clang | grep NEEDED"
+  echo "  Verify: llvm-readelf -d $build_root/bin/clang | grep NEEDED"
   echo "  Expected: libc++.so, libc.so, libbesalt.so"
 }
 
@@ -301,6 +344,12 @@ Run 'just sysroot' first."
 Run 'just tc build host llvm' first."
   fi
 
+  local filecheck_path="$SALTYOS_TOOLCHAIN_PREFIX/bin/FileCheck"
+  if [ ! -x "$filecheck_path" ]; then
+    die "FileCheck not found at $filecheck_path
+Run 'just tc build host llvm' first."
+  fi
+
   local build_root="$SALTYOS_TOOLCHAIN_BUILD_ROOT/rust-saltyos"
   mkdir -p "$build_root"
 
@@ -314,8 +363,8 @@ Run 'just tc build host llvm' first."
   local config_path="$build_root/config.toml"
   cat > "$config_path" << EOF
 [build]
-host = ["x86_64-unknown-linux-gnu"]
-target = ["x86_64-unknown-saltyos"]
+host = ["${SALTYOS_HOST_TRIPLE}"]
+target = ["${SALTYOS_HOST_TRIPLE}", "x86_64-unknown-saltyos"]
 docs = false
 extended = false
 
@@ -329,8 +378,9 @@ download-ci-llvm = false
 [rust]
 use-lld = true
 
-[target.x86_64-unknown-linux-gnu]
+[target.${SALTYOS_HOST_TRIPLE}]
 llvm-config = "$llvm_config"
+llvm-filecheck = "$filecheck_path"
 
 [target.x86_64-unknown-saltyos]
 cc = "$SALTYOS_TOOLCHAIN_PREFIX/bin/clang"
@@ -342,6 +392,8 @@ EOF
   echo "Generated config: $config_path"
   echo
   echo "Building stage 1 rustc for x86_64-unknown-saltyos..."
+
+  _configure_external_llvm_env "$llvm_config"
 
   python3 "$SALTYOS_RUST_SRC_DIR/x.py" build \
     --src "$SALTYOS_RUST_SRC_DIR" \
@@ -365,13 +417,14 @@ cmd_doctor() {
 
   local legacy_llvm_clang="${SALTYOS_LLVM_SRC_DIR}/build/bin/clang"
   local legacy_llvm_config="${SALTYOS_LLVM_SRC_DIR}/build/bin/llvm-config"
-  local legacy_rust_stage1="${SALTYOS_RUST_SRC_DIR}/build/x86_64-unknown-linux-gnu/stage1/bin/rustc"
+  local legacy_rust_stage1="${SALTYOS_RUST_SRC_DIR}/build/${SALTYOS_HOST_TRIPLE}/stage1/bin/rustc"
 
   echo "SaltyOS toolchain doctor"
   echo "  Repo root         : ${SALTYOS_REPO_ROOT}"
   echo "  Toolchain src root: ${SALTYOS_TOOLCHAIN_SRC_ROOT}"
   echo "  Toolchain build   : ${SALTYOS_TOOLCHAIN_BUILD_ROOT}"
   echo "  Prefix            : ${SALTYOS_TOOLCHAIN_PREFIX}"
+  echo "  Host triple       : ${SALTYOS_HOST_TRIPLE}"
   echo
 
   _check_file "${SALTYOS_LLVM_SRC_DIR}" "LLVM source tree"
