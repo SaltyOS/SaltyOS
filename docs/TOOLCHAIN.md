@@ -49,6 +49,8 @@ just toolchain-doctor
 just toolchain-setup
 ```
 
+`tools/toolchain/env.sh` now auto-detects and exports `SALTYOS_HOST_TRIPLE` from the active host (`uname -s` + `uname -m`). Typical values are `x86_64-unknown-linux-gnu`, `x86_64-apple-darwin`, and `aarch64-apple-darwin`. When writing manual `x.py` configs below, use `${SALTYOS_HOST_TRIPLE}` instead of hardcoding a Linux host triple.
+
 ## Overview
 
 The `x86_64-unknown-saltyos` target encodes OS-specific defaults so that every compilation does not need many repeated flags. The target provides:
@@ -139,17 +141,23 @@ Manual steps (equivalent):
 
 ```bash
 source tools/toolchain/env.sh
+HOST_JOBS="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)"
 
 cmake -S "$SALTYOS_LLVM_SRC_DIR/llvm" -B "$SALTYOS_LLVM_BUILD_DIR" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_ENABLE_PROJECTS="clang;lld" \
   -DLLVM_TARGETS_TO_BUILD="X86" \
   -DLLVM_INSTALL_UTILS=ON \
+  -C "$SALTYOS_REPO_ROOT/tools/toolchain/cmake/saltyos-builtins-target-cache.cmake" \
+  -DLLVM_ENABLE_RUNTIMES=compiler-rt \
+  -DLLVM_BUILTIN_TARGETS="default;x86_64-unknown-saltyos" \
   -DCMAKE_INSTALL_PREFIX="$SALTYOS_TOOLCHAIN_PREFIX"
 
-ninja -C "$SALTYOS_LLVM_BUILD_DIR" -j"$(nproc)"
+ninja -C "$SALTYOS_LLVM_BUILD_DIR" -j"$HOST_JOBS"
 ninja -C "$SALTYOS_LLVM_BUILD_DIR" install
 ```
+
+SaltyOS now uses a dedicated compiler-rt builtins cache at `tools/toolchain/cmake/saltyos-builtins-target-cache.cmake` so the host LLVM build also bootstraps `x86_64-unknown-saltyos` builtins without relying on legacy `LLVM_RUNTIME_TARGETS` wiring.
 
 ### Build options
 
@@ -158,6 +166,9 @@ ninja -C "$SALTYOS_LLVM_BUILD_DIR" install
 | `-DCMAKE_BUILD_TYPE=Release` | Optimized build (recommended) |
 | `-DCMAKE_BUILD_TYPE=RelWithDebInfo` | Optimized + debug symbols |
 | `-DLLVM_TARGETS_TO_BUILD="X86"` | Only x86 backend (faster build) |
+| `-C tools/toolchain/cmake/saltyos-builtins-target-cache.cmake` | Load the SaltyOS compiler-rt builtins cache |
+| `-DLLVM_ENABLE_RUNTIMES=compiler-rt` | Build compiler-rt alongside LLVM |
+| `-DLLVM_BUILTIN_TARGETS="default;x86_64-unknown-saltyos"` | Build compiler-rt builtins for the SaltyOS target |
 | `-DLLVM_USE_LINKER=lld` | Use LLD to link LLVM itself (faster) |
 | `-DLLVM_PARALLEL_LINK_JOBS=2` | Limit link parallelism (saves RAM) |
 
@@ -180,7 +191,7 @@ clang --target=x86_64-unknown-saltyos -### /dev/null 2>&1 \
 
 ## Step 4: Build and Install Rust (Stage 1)
 
-Rust bootstrap needs the patched LLVM via `llvm-config`, and the key belongs under the host target table (`[target.x86_64-unknown-linux-gnu]`), not under `[llvm]`.
+Rust bootstrap needs the patched LLVM via `llvm-config`, and the key belongs under the detected host target table (`[target.${SALTYOS_HOST_TRIPLE}]` after sourcing `env.sh`), not under `[llvm]`.
 
 Recommended shortcut:
 
@@ -196,7 +207,7 @@ source tools/toolchain/env.sh
 mkdir -p "$SALTYOS_TOOLCHAIN_BUILD_ROOT"
 cat > "$SALTYOS_TOOLCHAIN_BUILD_ROOT/rust-bootstrap.toml" <<EOF
 [build]
-target = ["x86_64-unknown-linux-gnu"]
+target = ["${SALTYOS_HOST_TRIPLE}"]
 
 [install]
 prefix = "${SALTYOS_TOOLCHAIN_PREFIX}"
@@ -208,7 +219,7 @@ download-ci-llvm = false
 [rust]
 use-lld = true
 
-[target.x86_64-unknown-linux-gnu]
+[target.${SALTYOS_HOST_TRIPLE}]
 llvm-config = "${SALTYOS_TOOLCHAIN_PREFIX}/bin/llvm-config"
 llvm-filecheck = "${SALTYOS_TOOLCHAIN_PREFIX}/bin/FileCheck"
 EOF
@@ -226,6 +237,7 @@ Notes:
 - `x.py install` copies the stage1 compiler, standard libraries, and rust-src into the prefix — no symlinks needed.
 - `x.py` may download the stage0 toolchain on first use (network access required).
 - Using `--build-dir "$SALTYOS_RUST_BUILD_DIR"` avoids placing Rust build artifacts under `toolchain/rust/build/`.
+- On macOS, if `llvm-config --link-static --system-libs` reports `-lzstd`, export `LIBRARY_PATH="$(brew --prefix zstd)/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"` before running `x.py` manually. `tools/toolchain/build.sh` now does this automatically when it detects a Homebrew `zstd`.
 
 ### Verify
 
@@ -329,7 +341,8 @@ git add toolchain/llvm-project toolchain/rust
 git commit --no-gpg-sign -m "chore(toolchain): update llvm and rust submodules"
 
 source tools/toolchain/env.sh
-ninja -C "$SALTYOS_LLVM_BUILD_DIR" -j"$(nproc)"
+HOST_JOBS="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)"
+ninja -C "$SALTYOS_LLVM_BUILD_DIR" -j"$HOST_JOBS"
 ninja -C "$SALTYOS_LLVM_BUILD_DIR" install
 python3 "$SALTYOS_RUST_SRC_DIR/x.py" install \
   --src "$SALTYOS_RUST_SRC_DIR" \
@@ -357,12 +370,21 @@ cmake -S "$SALTYOS_LLVM_SRC_DIR/llvm" -B "$SALTYOS_LLVM_BUILD_DIR" -G Ninja \
 
 Each LLD link of a large LLVM library can use 4–8 GB of RAM.
 
+### `nproc: command not found`
+
+macOS and some minimal userlands do not ship GNU `nproc`. Use a portable job-count helper instead:
+
+```bash
+HOST_JOBS="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)"
+ninja -C "$SALTYOS_LLVM_BUILD_DIR" -j"$HOST_JOBS"
+```
+
 ### Rust build fails with "LLVM version mismatch"
 
 Ensure `config.toml` uses:
 
 - `[llvm] download-ci-llvm = false`
-- `[target.x86_64-unknown-linux-gnu] llvm-config = ".../bin/llvm-config"`
+- `[target.${SALTYOS_HOST_TRIPLE}] llvm-config = ".../bin/llvm-config"`
 
 Also verify `llvm-config` points to the patched LLVM in your active prefix.
 
@@ -372,6 +394,17 @@ Rust bootstrap sanity checks require `FileCheck` when using an external LLVM.
 
 - `just toolchain-build-llvm` now configures `-DLLVM_INSTALL_UTILS=ON`
 - It also links `FileCheck` into the prefix if LLVM did not install it
+
+### Rust bootstrap on macOS fails to link `-lzstd`
+
+This usually means your external LLVM was linked against Homebrew `zstd`, but `x.py` cannot see that library path.
+
+```bash
+brew install zstd
+export LIBRARY_PATH="$(brew --prefix zstd)/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+```
+
+`tools/toolchain/build.sh build host rust` now probes `llvm-config --link-static --system-libs` and prepends the Homebrew `zstd` library directory automatically when needed.
 
 ## See Also
 
