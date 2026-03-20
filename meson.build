@@ -134,7 +134,7 @@ c_efi_args = c_freestanding_args + [
 
 # Stage3 flags (loaded at 0x10000, small code model sufficient)
 c_stage3_args = c_freestanding_args + [
-  '-m64',
+  '--target=x86_64-unknown-none-elf',
   '-mcmodel=small',
 ]
 

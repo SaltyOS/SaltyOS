@@ -18,6 +18,8 @@ all_asm_files = run_command(
 
 kernel_crate_root = files('src/lib.rs')
 kernel_ld = meson.current_source_dir() / 'kernel.ld'
+kernel_link_target = '--target=x86_64-unknown-none-elf'
+kernel_ld_lld = find_program('ld.lld', required: true)
 
 # Paths to Rust build outputs (for -L search path)
 rust_build_dir = meson.project_build_root() / 'rust'
@@ -31,7 +33,7 @@ if all_asm_files != ''
       'asm_' + asm_file.underscorify(),
       input: files(asm_file),
       output: asm_file.underscorify() + '.o',
-      command: [cc_cmd, '-c', '@INPUT@', '-o', '@OUTPUT@'],
+      command: [cc_cmd, kernel_link_target, '-c', '@INPUT@', '-o', '@OUTPUT@'],
       build_by_default: true,
     )
     asm_objs += asm_obj
@@ -80,13 +82,13 @@ kernel = custom_target('kernel',
   input: [kernel_obj, core_kernel_obj, compiler_builtins_kernel_obj] + asm_objs,
   output: 'kernel.elf',
   command: [
-    cc_cmd,
+    kernel_ld_lld,
+    '-m', 'elf_x86_64',
     '-nostdlib',
-    '-fuse-ld=lld',
-    '-Wl,--pie',
-    '-Wl,--no-dynamic-linker',
-    '-Wl,-n',
-    '-Wl,-T,' + kernel_ld,
+    '-pie',
+    '--no-dynamic-linker',
+    '-n',
+    '-T', kernel_ld,
     '-o', '@OUTPUT@',
     '@INPUT@',
   ],
@@ -99,14 +101,14 @@ kernel_boot = custom_target('kernel_boot',
   input: [kernel_obj, core_kernel_obj, compiler_builtins_kernel_obj] + asm_objs,
   output: 'kernel.boot.elf',
   command: [
-    cc_cmd,
+    kernel_ld_lld,
+    '-m', 'elf_x86_64',
     '-nostdlib',
-    '-fuse-ld=lld',
-    '-Wl,--pie',
-    '-Wl,--no-dynamic-linker',
-    '-Wl,-n',
-    '-Wl,-S',
-    '-Wl,-T,' + kernel_ld,
+    '-pie',
+    '--no-dynamic-linker',
+    '-n',
+    '-S',
+    '-T', kernel_ld,
     '-o', '@OUTPUT@',
     '@INPUT@',
   ],

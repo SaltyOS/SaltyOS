@@ -101,7 +101,7 @@ stage2_c_src = files(
 )
 
 stage2_c_args = c_freestanding_args + [
-  '-m32',
+  '--target=i686-unknown-none-elf',
   '-march=i686',
   '-I' + meson.current_source_dir(),
 ]
@@ -232,7 +232,7 @@ stage3_c_src = files(
 
 # Stage 3 is 32-bit code
 stage3_c_args = c_freestanding_args + [
-  '-m32',
+  '--target=i686-unknown-none-elf',
   '-march=i686',
   '-I' + meson.current_source_dir(),
 ]
