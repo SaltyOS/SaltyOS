@@ -3,7 +3,10 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 pub mod boot;
+pub mod context;
 pub mod cpu;
+pub mod exceptions;
+pub mod fpu;
 pub mod pl011;
 pub mod paging;
 pub mod pan;
@@ -222,36 +225,58 @@ pub fn ioapic_unmask_level(_irq: u32, _cpu: u8) {}
 /// IOAPIC mask (not applicable on aarch64)
 pub fn ioapic_mask(_irq: u32) {}
 
-/// Context switch between threads (stub for Phase 1)
+/// Context switch between threads.
+///
+/// Delegates to the `context` module which saves callee-saved registers
+/// on the old thread's stack and restores from the new thread's stack.
 ///
 /// # Safety
-/// Both pointers must be valid stack pointers.
-pub unsafe extern "C" fn context_switch(_old_sp: *mut u64, _new_sp: u64) {
-    // TODO: Phase 3 — save/restore callee-saved x19-x28, x29, x30, SP
+/// Both pointers must point to valid, initialized `ThreadContext` structures.
+pub unsafe fn context_switch(
+    old_context: *mut crate::sched::thread::ThreadContext,
+    new_context: *const crate::sched::thread::ThreadContext,
+) {
+    // SAFETY: Caller guarantees both pointers are valid ThreadContext.
+    unsafe { context::context_switch(old_context, new_context); }
 }
 
-/// Trampoline to enter usermode (stub for Phase 1)
+/// Trampoline to enter usermode for newly created threads.
+///
+/// Delegates to the `context` module which reads the thread's saved
+/// ELR_EL1, SP_EL0, SPSR_EL1 from the TCB, loads TTBR0, zeroes all
+/// GPRs, and executes `eret` to enter EL0.
 ///
 /// # Safety
-/// All parameters must be valid addresses.
-pub unsafe extern "C" fn usermode_trampoline() {
-    // TODO: Phase 3 — set ELR_EL1, SPSR_EL1, SP_EL0, eret
-    loop {
-        // SAFETY: WFI is safe
-        unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
-    }
+/// Must only be used as the initial entry point for a newly scheduled thread.
+pub unsafe extern "C" fn usermode_trampoline() -> ! {
+    // SAFETY: Caller guarantees this is a newly scheduled thread with
+    // valid TCB fields.
+    unsafe { context::usermode_trampoline(); }
 }
 
 /// Initialize architecture-specific subsystems
 ///
 /// Init order:
 /// 1. PL011 UART (serial output)
-/// 2. Memory management (frame allocator)
-/// 3. Paging (direct physical map)
-/// 4. Frame bitmap remap + per-frame arrays
+/// 2. Exception vector table (VBAR_EL1)
+/// 3. GICv3 (distributor + BSP redistributor + CPU interface)
+/// 4. Generic Timer (configure, but do not start yet)
+/// 5. Memory management (frame allocator)
+/// 6. Paging (direct physical map)
+/// 7. GIC MMIO remap to direct map
+/// 8. Frame bitmap remap + per-frame arrays
 pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // Initialize PL011 UART for serial output
     pl011::init();
+
+    // Install exception vector table (must be early so any faults are caught)
+    exceptions::init();
+
+    // Initialize GICv3 (uses identity-mapped MMIO during early boot)
+    gic::init();
+
+    // Configure the generic timer (reads frequency, does not start ticking)
+    timer::init();
 
     // Initialize memory management (frame allocator needed by paging::init())
     if let Some(info) = boot_info {
@@ -261,6 +286,9 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // Initialize paging (direct physical map)
     paging::init();
 
+    // Remap GIC MMIO from identity-map to direct-map addresses
+    gic::remap_to_direct_map();
+
     // Switch frame bitmap pointer from identity map (TTBR0) to direct
     // physical map (TTBR1). Must happen after paging::init() creates the
     // direct map and before TTBR0 identity map is cleared.
@@ -268,6 +296,9 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
 
     // Allocate per-frame tracking arrays now that direct map covers all RAM.
     crate::mm::init_per_frame_arrays();
+
+    // Initialize FPU lazy switching (trap NEON/FP access from EL0)
+    fpu::init();
 
     crate::serial_puts("[ARCH] AArch64 subsystems initialized\n");
 }
@@ -282,9 +313,9 @@ pub fn clear_boot_identity_map() {
     paging::clear_boot_identity_map();
 }
 
-/// Start timer interrupts (stub for Phase 1)
+/// Start periodic timer interrupts (10 ms tick via PPI 30).
 pub fn start_timer() {
-    // TODO: Phase 3 — ARM Generic Timer
+    timer::start();
 }
 
 /// ACPI S5 shutdown (stub — uses PSCI SYSTEM_OFF)
@@ -300,34 +331,78 @@ pub fn shutdown() -> ! {
     }
 }
 
-// FPU module (stub for Phase 1)
-pub mod fpu {
-    pub fn init() {}
-    pub fn save(_thread: &crate::sched::thread::Tcb) {}
-    pub fn restore(_thread: &crate::sched::thread::Tcb) {}
-    pub fn handle_trap() {}
-}
-
-// CPUID-equivalent module (stub for Phase 1)
+// CPUID-equivalent module: reports RNDR (hardware RNG) availability
 pub mod cpuid {
-    pub fn has_rdrand() -> bool { false }
-    pub fn has_rdseed() -> bool { false }
+    /// Check if RNDR instruction is available (ARMv8.5-RNG).
+    ///
+    /// Reads ID_AA64ISAR0_EL1.RNDR (bits 63:60); value >= 1 means supported.
+    pub fn has_rdrand() -> bool {
+        let isar0: u64;
+        // SAFETY: Reading ID_AA64ISAR0_EL1 is always safe from EL1.
+        unsafe {
+            core::arch::asm!("mrs {}, ID_AA64ISAR0_EL1", out(reg) isar0, options(nomem, nostack));
+        }
+        ((isar0 >> 60) & 0xF) >= 1
+    }
+
+    /// RNDR serves the same purpose as both RDRAND and RDSEED on x86.
+    pub fn has_rdseed() -> bool {
+        has_rdrand()
+    }
 }
 
-// SMAP-equivalent module (PAN on aarch64)
+// SMAP-equivalent module: Privileged Access Never (PAN) on aarch64
 pub mod smap {
-    pub fn init() {}
+    /// Initialize PAN if supported by the processor.
+    ///
+    /// Checks ID_AA64MMFR1_EL1.PAN (bits 23:20) and clears SCTLR_EL1.SPAN
+    /// so that PAN is automatically set on exception entry from EL0.
+    pub fn init() {
+        let mmfr1: u64;
+        // SAFETY: Reading ID_AA64MMFR1_EL1 is always safe from EL1.
+        unsafe {
+            core::arch::asm!("mrs {}, ID_AA64MMFR1_EL1", out(reg) mmfr1, options(nomem, nostack));
+        }
+        if ((mmfr1 >> 20) & 0xF) >= 1 {
+            // PAN is supported — clear SPAN so PAN is auto-set on exception entry
+            let mut sctlr: u64;
+            // SAFETY: Reading SCTLR_EL1 is safe from EL1.
+            unsafe {
+                core::arch::asm!("mrs {}, SCTLR_EL1", out(reg) sctlr, options(nomem, nostack));
+            }
+            sctlr &= !(1u64 << 23); // Clear SPAN (bit 23)
+            // SAFETY: Writing SCTLR_EL1 to enable PAN auto-set is safe.
+            // ISB ensures the change takes effect before subsequent instructions.
+            unsafe {
+                core::arch::asm!("msr SCTLR_EL1, {}", in(reg) sctlr, options(nomem, nostack));
+                core::arch::asm!("isb", options(nomem, nostack));
+            }
+        }
+    }
 
+    /// RAII guard that temporarily disables PAN to allow kernel access
+    /// to user memory. PAN is re-enabled when the guard is dropped.
     pub struct UserAccessGuard;
+
     impl UserAccessGuard {
+        /// Clear PAN to allow user memory access from EL1.
         pub fn new() -> Self {
-            // TODO: Phase 2 — clear PAN bit
+            // SAFETY: Clearing PAN temporarily allows EL1 to access
+            // user-mapped pages. The guard's Drop impl will re-enable PAN.
+            unsafe {
+                core::arch::asm!("msr PAN, #0", options(nomem, nostack));
+            }
             UserAccessGuard
         }
     }
+
     impl Drop for UserAccessGuard {
         fn drop(&mut self) {
-            // TODO: Phase 2 — set PAN bit
+            // SAFETY: Setting PAN blocks EL1 access to user-mapped pages,
+            // restoring the default protection.
+            unsafe {
+                core::arch::asm!("msr PAN, #1", options(nomem, nostack));
+            }
         }
     }
 }
