@@ -2,7 +2,7 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use crate::mm::{alloc_frame, PAGE_SIZE, PHYS_MAP_OFFSET};
+use crate::mm::{alloc_frame, phys_to_virt, mark_frame_kernel_runtime, mark_frame_pt_owned, PAGE_SIZE, PHYS_MAP_OFFSET};
 
 /// Maximum direct physical mapping size (512 GB cap)
 const MAX_DIRECT_MAP_SIZE: usize = 512 * 1024 * 1024 * 1024;
@@ -21,6 +21,9 @@ pub enum PageFlags {
     Global = 1 << 8,
     NoExecute = 1 << 63,
 }
+
+/// Mask for the physical-address portion of a page-table entry.
+const ENTRY_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 /// Page table (512 entries, 4KB aligned)
 #[repr(C, align(4096))]
@@ -70,6 +73,118 @@ pub fn invlpg(addr: u64) {
     unsafe {
         core::arch::asm!("invlpg [{}]", in(reg) addr, options(nostack));
     }
+}
+
+/// Ensure that a non-leaf page table exists at `index` and return its physical address.
+///
+/// # Safety
+/// - `table` must point to a valid page table in the active kernel address space.
+/// - Must be called only when creating kernel-global mappings during boot or while
+///   otherwise serialized against concurrent page-table modification.
+unsafe fn ensure_next_table(
+    table: &mut PageTable,
+    index: usize,
+    context: &'static str,
+) -> u64 {
+    let entry = table.entry(index);
+    if entry & PageFlags::Present as u64 != 0 {
+        if entry & PageFlags::HugePage as u64 != 0 {
+            panic!("kernel 4K mapping collided with huge page");
+        }
+        return entry & ENTRY_ADDR_MASK;
+    }
+
+    let frame = alloc_frame().expect(context);
+    mark_frame_pt_owned(frame);
+    mark_frame_kernel_runtime(frame);
+
+    // SAFETY: `frame` is a freshly allocated page-table frame reachable through
+    // the existing direct map, and zeroing it initializes all entries to empty.
+    unsafe {
+        core::ptr::write_bytes(phys_to_virt(frame) as *mut u8, 0, PAGE_SIZE);
+    }
+
+    table.set_entry(
+        index,
+        frame | (PageFlags::Present as u64) | (PageFlags::Writable as u64),
+    );
+    frame
+}
+
+/// Map one 4KB MMIO page into the higher-half physmap slot with uncached attributes.
+///
+/// The direct map only covers usable RAM. Device MMIO pages that live above
+/// `max_phys` are installed sparsely on demand at the same virtual address shape
+/// (`PHYS_MAP_OFFSET + phys`) so existing physmap-based callers can safely access
+/// them without assuming the whole MMIO hole is RAM-backed.
+///
+/// Returns the virtual address corresponding to `phys`.
+///
+/// # Safety
+/// - Must be called after `init_direct_map()` has established access to page tables
+///   via `phys_to_virt()`.
+/// - The caller must ensure the requested physical page is valid MMIO and that
+///   mapping it writable and uncached is appropriate for the device.
+pub unsafe fn map_mmio_page(phys: u64) -> u64 {
+    let page_mask = PAGE_SIZE as u64 - 1;
+    let phys_page = phys & !page_mask;
+    let virt_page = PHYS_MAP_OFFSET + phys_page;
+
+    let cr3 = read_cr3();
+    // SAFETY: CR3 points at the active kernel PML4, which is reachable via the
+    // already-established direct map.
+    let pml4 = unsafe { &mut *(phys_to_virt(cr3) as *mut PageTable) };
+
+    let pdpt_phys = unsafe {
+        ensure_next_table(
+            pml4,
+            ((virt_page >> 39) & 0x1FF) as usize,
+            "Failed to allocate PDPT for kernel MMIO mapping",
+        )
+    };
+    // SAFETY: `pdpt_phys` is a present page-table frame returned by ensure_next_table.
+    let pdpt = unsafe { &mut *(phys_to_virt(pdpt_phys) as *mut PageTable) };
+
+    let pd_phys = unsafe {
+        ensure_next_table(
+            pdpt,
+            ((virt_page >> 30) & 0x1FF) as usize,
+            "Failed to allocate PD for kernel MMIO mapping",
+        )
+    };
+    // SAFETY: `pd_phys` is a present page-table frame returned by ensure_next_table.
+    let pd = unsafe { &mut *(phys_to_virt(pd_phys) as *mut PageTable) };
+
+    let pt_phys = unsafe {
+        ensure_next_table(
+            pd,
+            ((virt_page >> 21) & 0x1FF) as usize,
+            "Failed to allocate PT for kernel MMIO mapping",
+        )
+    };
+    // SAFETY: `pt_phys` is a present page-table frame returned by ensure_next_table.
+    let pt = unsafe { &mut *(phys_to_virt(pt_phys) as *mut PageTable) };
+
+    let pte_idx = ((virt_page >> 12) & 0x1FF) as usize;
+    let current = pt.entry(pte_idx);
+    if current & PageFlags::Present as u64 != 0 {
+        let current_phys = current & ENTRY_ADDR_MASK;
+        if current_phys != phys_page {
+            panic!("kernel MMIO mapping collided with existing page");
+        }
+    }
+
+    // PCD=1, PWT=1 selects PAT3, which remains UC after init_pat().
+    let entry = phys_page
+        | (PageFlags::Present as u64)
+        | (PageFlags::Writable as u64)
+        | (PageFlags::WriteThrough as u64)
+        | (PageFlags::CacheDisable as u64)
+        | (PageFlags::NoExecute as u64);
+    pt.set_entry(pte_idx, entry);
+    invlpg(virt_page);
+
+    virt_page + (phys & page_mask)
 }
 
 /// Initialize direct physical mapping
@@ -141,7 +256,7 @@ unsafe fn init_direct_map(max_phys: u64) {
 
         pdpt_frame
     } else {
-        pml4e & 0x000F_FFFF_FFFF_F000
+        pml4e & ENTRY_ADDR_MASK
     };
 
     // Use identity mapping for PDPT access during init
@@ -172,7 +287,7 @@ unsafe fn init_direct_map(max_phys: u64) {
 
             pd_frame
         } else {
-            pdpte & 0x000F_FFFF_FFFF_F000
+            pdpte & ENTRY_ADDR_MASK
         };
 
         // Use identity mapping for PD access during init

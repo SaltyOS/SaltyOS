@@ -12,8 +12,9 @@
 //! # Memory Mapped I/O
 //!
 //! The LAPIC is accessed via MMIO at a fixed physical address.
-//! We map it into the kernel's virtual address space using the
-//! direct physical mapping.
+//! It lives above usable RAM on typical PCs, so the kernel installs
+//! sparse uncached mappings for the APIC pages inside the higher-half
+//! physmap slot before touching the registers.
 
 use super::outb;
 use crate::mm::PHYS_MAP_OFFSET;
@@ -241,9 +242,10 @@ unsafe fn enable_apic() {
 ///
 /// # Safety
 /// Must be called after paging is initialized.
-/// Assumes direct physical mapping is available.
+/// Assumes the higher-half physmap slot is available for sparse MMIO mappings.
 unsafe fn map_lapic() {
-    LAPIC_VIRTUAL_BASE.store(LAPIC_BASE + PHYS_MAP_OFFSET, Ordering::Release);
+    let virt = unsafe { super::paging::map_mmio_page(LAPIC_BASE) };
+    LAPIC_VIRTUAL_BASE.store(virt, Ordering::Release);
 }
 
 /// Read from LAPIC register
@@ -1307,7 +1309,7 @@ unsafe fn ioapic_write(reg: u32, val: u32) {
 /// Initialize the I/O APIC and configure redirection entries for
 /// ISA IRQs that the kernel needs (IRQ1 = keyboard, IRQ4 = COM1).
 ///
-/// Maps the IOAPIC MMIO region using the direct physical mapping,
+/// Maps the IOAPIC MMIO region as sparse uncached MMIO,
 /// masks all redirection entries, then unmasks IRQ1 and IRQ4 routed
 /// to the BSP's Local APIC.
 ///
@@ -1315,8 +1317,9 @@ unsafe fn ioapic_write(reg: u32, val: u32) {
 /// * `ioapic_phys` - Physical address of the IOAPIC (from MADT)
 /// * `bsp_apic_id` - APIC ID of the BSP (destination for routed IRQs)
 pub fn init_ioapic(ioapic_phys: u32, bsp_apic_id: u8) {
-    // Map IOAPIC MMIO via the direct physical mapping (same approach as LAPIC)
-    let virt = ioapic_phys as u64 + PHYS_MAP_OFFSET;
+    // SAFETY: IOAPIC physical address comes from ACPI MADT and must be mapped
+    // as kernel MMIO before any register access.
+    let virt = unsafe { super::paging::map_mmio_page(ioapic_phys as u64) };
     IOAPIC_BASE.store(virt, Ordering::Release);
 
     {
