@@ -97,9 +97,7 @@ impl BuildEnv {
             ar: "llvm-ar".to_string(),
             ranlib: "llvm-ranlib".to_string(),
             strip: "llvm-strip".to_string(),
-            // Autotools' config.sub does not know "saltyos" yet. Use a canonical
-            // host tuple for configure while keeping the real target in CC/CFLAGS.
-            autotools_host: "x86_64-unknown-elf".to_string(),
+            autotools_host: "x86_64-unknown-saltyos".to_string(),
             salty_host: "x86_64-unknown-saltyos".to_string(),
             salty_inc,
             sysroot_dir,

@@ -16,7 +16,6 @@ configure =
     -C
     --enable-tiny
     --disable-nls
-    --disable-utf8
     --disable-browser
     --disable-color
     --disable-comment
@@ -41,14 +40,14 @@ build = ncurses
 
 [env]
 CFLAGS_FOR_BUILD =
-NCURSES_CFLAGS =
-NCURSES_LIBS = -lncursesw
+NCURSESW_CFLAGS = -I${PORTDIR}/../ncurses/work/ncurses-6.5/include
+NCURSESW_LIBS = -L${PORTDIR}/../ncurses/stage -lncursesw
 EXTRA_CFLAGS = -I${PORTDIR}/../ncurses/work/ncurses-6.5/include -Wno-implicit-function-declaration
 EXTRA_LDFLAGS = -L${PORTDIR}/../ncurses/stage
 EXTRA_LIBS = -lncursesw
 
 [autoconf_cache]
-ac_cv_lib_ncursesw_initscr = yes
+ac_cv_lib_ncursesw_wget_wch = yes
 ac_cv_func_use_default_colors = yes
 ac_cv_func_set_escdelay = yes
 ac_cv_func_key_defined = yes
@@ -56,11 +55,18 @@ ac_cv_header_ncursesw_ncurses_h = no
 ac_cv_header_ncurses_h = yes
 
 [prepare]
+sed_in_place() {
+  if [ "$(uname -s)" = Darwin ]; then
+    sed -i.bak -e "$1" "$2" && rm -f "$2.bak"
+  else
+    sed -i -e "$1" "$2"
+  fi
+}
 # Remove sys/vt.h dependency (SaltyOS has no virtual terminal ioctls)
-sed -i '/sys\/vt\.h/d' ${SRCDIR}/src/nano.c || true
-sed -i 's/VT_GETSTATE/DISABLED_VT_GETSTATE/g' ${SRCDIR}/src/nano.c || true
+sed_in_place '/sys\/vt\.h/d' ${SRCDIR}/src/nano.c || true
+sed_in_place 's/VT_GETSTATE/DISABLED_VT_GETSTATE/g' ${SRCDIR}/src/nano.c || true
 # Replace mkstemps() with mkstemp() if present
-sed -i 's/mkstemps(tempfile_name, strlen(extension))/mkstemp(tempfile_name)/g' ${SRCDIR}/src/files.c || true
+sed_in_place 's/mkstemps(tempfile_name, strlen(extension))/mkstemp(tempfile_name)/g' ${SRCDIR}/src/files.c || true
 
 [install]
 bin/nano = src/nano

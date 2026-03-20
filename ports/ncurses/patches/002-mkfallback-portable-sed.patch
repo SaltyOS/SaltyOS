@@ -1,0 +1,13 @@
+--- a/ncurses/tinfo/MKfallback.sh
++++ b/ncurses/tinfo/MKfallback.sh
+@@ -96,7 +96,10 @@ if [ "$*" ]
+ 	do
+ 		echo "/* $x */"
+-		"$infocmp_path" -E "$x" | sed -e 's/\<short\>/NCURSES_INT2/g'
++		# BSD sed does not support GNU \</\> word-boundary escapes, so use
++		# the concrete pattern emitted by infocmp -E for numeric arrays.
++		"$infocmp_path" -E "$x" \
++			| sed -e 's/^static short /static NCURSES_INT2 /'
+ 	done
+ 
+ 	cat <<EOF

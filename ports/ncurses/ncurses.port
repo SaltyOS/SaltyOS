@@ -34,6 +34,8 @@ configure =
     --without-shared
     --with-normal
     --with-fallbacks=xterm,xterm-256color,vt100,linux
+    --with-tic-path=${SRCDIR}/host-tools/tic
+    --with-infocmp-path=${SRCDIR}/host-tools/infocmp
     --with-build-cc=cc
     --with-build-cflags=
     --with-build-ldflags=
@@ -41,6 +43,27 @@ configure =
 
 [env]
 CFLAGS_FOR_BUILD =
+
+[prepare]
+mkdir -p ${SRCDIR}/host-tools
+tic_path="$(command -v tic || true)"
+infocmp_path="$(command -v infocmp || true)"
+if [ "$(uname -s)" = Darwin ]; then
+  host_ncurses_prefix=
+  if command -v brew >/dev/null 2>&1; then
+    host_ncurses_prefix="$(brew --prefix ncurses 2>/dev/null || true)"
+  fi
+  for prefix in "$host_ncurses_prefix" /opt/homebrew/opt/ncurses /usr/local/opt/ncurses; do
+    if [ -n "$prefix" ] && [ -x "$prefix/bin/tic" ] && [ -x "$prefix/bin/infocmp" ]; then
+      tic_path="$prefix/bin/tic"
+      infocmp_path="$prefix/bin/infocmp"
+      break
+    fi
+  done
+fi
+[ -n "$tic_path" ] && [ -n "$infocmp_path" ] || { echo "missing host tic/infocmp" >&2; exit 1; }
+ln -sf "$tic_path" "${SRCDIR}/host-tools/tic"
+ln -sf "$infocmp_path" "${SRCDIR}/host-tools/infocmp"
 
 [autoconf_cache]
 ac_cv_header_termios_h = yes
