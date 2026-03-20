@@ -394,7 +394,7 @@ unsafe fn init_vspace_metadata(
         core::ptr::write_bytes(pml4_virt, 0, PAGE_SIZE / 8);
 
         // Copy kernel higher-half entries so kernel remains mapped.
-        let kernel_cr3 = crate::arch::x86_64::paging::read_cr3();
+        let kernel_cr3 = crate::arch::paging::read_cr3();
         let kernel_pml4 = mm::phys_to_virt(kernel_cr3) as *const u64;
         for i in 256..512 {
             pml4_virt.add(i).write(kernel_pml4.add(i).read());

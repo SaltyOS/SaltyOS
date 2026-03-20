@@ -47,8 +47,8 @@ help:
 # Default target architecture
 arch := "x86_64"
 
-# Build directory
-builddir := "build"
+# Build directory (arch-qualified)
+builddir := "build-" + arch
 
 # =============================================================================
 # Setup & Configuration
@@ -56,10 +56,10 @@ builddir := "build"
 
 # Internal: shared setup implementation
 [private]
-_setup-impl suffix arch:
+_setup-impl arch:
     #!/usr/bin/env bash
     set -euo pipefail
-    dir="{{builddir}}{{suffix}}"
+    dir="build-{{arch}}"
     source tools/toolchain/env.sh
     if [ -z "${CC:-}" ]; then
       cc_path="$SALTYOS_TOOLCHAIN_PREFIX/bin/clang"
@@ -106,13 +106,7 @@ _setup-impl suffix arch:
       -Dbuild_userland=true
 
 # Configure the build (run once)
-setup: (_setup-impl "" arch)
-
-# Configure for x86_64
-setup-x86_64: (_setup-impl "-x86_64" "x86_64")
-
-# Configure for aarch64
-setup-aarch64: (_setup-impl "-aarch64" "aarch64")
+setup: (_setup-impl arch)
 
 # Reconfigure with new options
 reconfigure *ARGS:
@@ -136,9 +130,9 @@ build-verbose:
 clean:
     meson compile -C {{builddir}} --clean
 
-# Full clean (remove build directory)
+# Full clean (remove meson build directories, preserve build-toolchain)
 distclean:
-    rm -rf {{builddir}} {{builddir}}-x86_64 {{builddir}}-aarch64
+    rm -rf build-x86_64 build-aarch64
 
 # =============================================================================
 # Run & Debug
@@ -146,7 +140,7 @@ distclean:
 
 # Run in QEMU (flags: --smp N, --mem SIZE, --debug, --headless, --gdb, --uefi)
 run *ARGS: build
-    bash tools/run-qemu.sh {{builddir}} {{ARGS}}
+    bash tools/run-qemu.sh {{builddir}} --arch {{arch}} {{ARGS}}
 
 # Connect GDB to running QEMU
 gdb:
@@ -186,7 +180,7 @@ toolchain-env:
 #   just tc all                       setup → host llvm → host rust → doctor
 #   just tc self-host                 sysroot → cross llvm → cross rust
 tc CMD *ARGS:
-    SALTYOS_MESON_BUILDDIR={{builddir}} bash tools/toolchain/build.sh {{CMD}} {{ARGS}}
+    SALTYOS_MESON_BUILDDIR={{builddir}} SALTYOS_ARCH={{arch}} bash tools/toolchain/build.sh {{CMD}} {{ARGS}}
 
 # Generate cross-compilation sysroot (requires: just build)
 sysroot: build
@@ -288,7 +282,7 @@ strip-llvm:
         cp "$SRC/$f" "$DST/bin/$f"
         "$STRIP" "$DST/bin/$f"
     done
-    cp build/lib/besalt/cpp/libc++.so "$DST/lib/libc++.so"
+    cp {{builddir}}/lib/besalt/cpp/libc++.so "$DST/lib/libc++.so"
     # Clang resource directory and SaltyOS compiler-rt builtins
     echo "Copying clang resource directory..."
     rm -rf "$DST/lib/clang"
@@ -304,13 +298,13 @@ strip-llvm:
     cp -r "$RT_DIR" "$(dirname "$DST/lib/clang/$RT_REL")"
     # CRT objects and linker script
     echo "Copying development files..."
-    cp build/lib/besalt/c/crt_start.o "$DST/lib/crt_start.o"
-    cp build/rust/core.o "$DST/lib/core.o"
-    cp build/rust/compiler_builtins.o "$DST/lib/compiler_builtins.o"
+    cp {{builddir}}/lib/besalt/c/crt_start.o "$DST/lib/crt_start.o"
+    cp {{builddir}}/rust/core.o "$DST/lib/core.o"
+    cp {{builddir}}/rust/compiler_builtins.o "$DST/lib/compiler_builtins.o"
     cp lib/besalt/saltyos-pie.ld "$DST/lib/saltyos-pie.ld"
     # Link-time libraries
-    cp build/lib/besalt/c/libc.so "$DST/lib/libc.so"
-    cp build/lib/besalt/lib/libbesalt.so "$DST/lib/libbesalt.so"
+    cp {{builddir}}/lib/besalt/c/libc.so "$DST/lib/libc.so"
+    cp {{builddir}}/lib/besalt/lib/libbesalt.so "$DST/lib/libbesalt.so"
     # Stub archives (-lm, -lpthread, etc.)
     for stub in libm.a libpthread.a librt.a libdl.a libutil.a; do
         printf '!<arch>\n' > "$DST/lib/$stub"

@@ -26,3 +26,24 @@ foreach(type SHARED MODULE EXE)
 endforeach()
 
 set(BUILTINS_x86_64-unknown-saltyos_COMPILER_RT_BUILTINS_ENABLE_PIC ON CACHE BOOL "")
+
+# --- aarch64-unknown-saltyos builtins ---
+set(BUILTINS_aarch64-unknown-saltyos_CMAKE_SYSTEM_NAME SaltyOS CACHE STRING "")
+set(BUILTINS_aarch64-unknown-saltyos_CMAKE_SYSTEM_PROCESSOR aarch64 CACHE STRING "")
+set(BUILTINS_aarch64-unknown-saltyos_CMAKE_MODULE_PATH "${_saltyos_cmake_module_path}" CACHE STRING "")
+set(BUILTINS_aarch64-unknown-saltyos_CMAKE_BUILD_TYPE Release CACHE STRING "")
+set(BUILTINS_aarch64-unknown-saltyos_COMPILER_RT_BAREMETAL_BUILD ON CACHE BOOL "")
+
+foreach(lang C CXX ASM)
+  set(BUILTINS_aarch64-unknown-saltyos_CMAKE_${lang}_FLAGS
+    "--target=aarch64-unknown-saltyos -ffreestanding"
+    CACHE STRING "")
+endforeach()
+
+foreach(type SHARED MODULE EXE)
+  set(BUILTINS_aarch64-unknown-saltyos_CMAKE_${type}_LINKER_FLAGS
+    "-fuse-ld=lld"
+    CACHE STRING "")
+endforeach()
+
+set(BUILTINS_aarch64-unknown-saltyos_COMPILER_RT_BUILTINS_ENABLE_PIC ON CACHE BOOL "")

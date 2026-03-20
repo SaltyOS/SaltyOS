@@ -128,8 +128,7 @@ impl FrameAllocator {
         if !found {
             crate::serial_puts_raw("[FRAME] FATAL: no usable region for bitmap\n");
             loop {
-                // SAFETY: hlt is safe
-                unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+                crate::arch::halt();
             }
         }
 
@@ -665,8 +664,7 @@ impl FrameAllocator {
             None => {
                 crate::serial_puts_raw("[FRAME] FATAL: Phase 2 map_refs alloc failed\n");
                 loop {
-                    // SAFETY: hlt is safe
-                    unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+                    crate::arch::halt();
                 }
             }
         };
@@ -683,8 +681,7 @@ impl FrameAllocator {
             None => {
                 crate::serial_puts_raw("[FRAME] FATAL: Phase 2 obj_refs alloc failed\n");
                 loop {
-                    // SAFETY: hlt is safe
-                    unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+                    crate::arch::halt();
                 }
             }
         };
@@ -701,8 +698,7 @@ impl FrameAllocator {
             None => {
                 crate::serial_puts_raw("[FRAME] FATAL: Phase 2 reclaimable alloc failed\n");
                 loop {
-                    // SAFETY: hlt is safe
-                    unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+                    crate::arch::halt();
                 }
             }
         };
@@ -719,8 +715,7 @@ impl FrameAllocator {
             None => {
                 crate::serial_puts_raw("[FRAME] FATAL: Phase 2 pt_owned alloc failed\n");
                 loop {
-                    // SAFETY: hlt is safe
-                    unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+                    crate::arch::halt();
                 }
             }
         };
@@ -737,8 +732,7 @@ impl FrameAllocator {
             None => {
                 crate::serial_puts_raw("[FRAME] FATAL: Phase 2 kernel_rt alloc failed\n");
                 loop {
-                    // SAFETY: hlt is safe
-                    unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+                    crate::arch::halt();
                 }
             }
         };

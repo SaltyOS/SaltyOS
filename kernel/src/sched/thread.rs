@@ -10,16 +10,31 @@ use crate::mm::VSpace;
 
 /// XSAVE state area for FPU/SSE context
 ///
-/// Must be 64-byte aligned for XSAVE instruction requirements.
+/// FPU/SIMD save area.
+///
+/// x86_64: 64-byte aligned for XSAVE instruction requirements.
 /// Size covers x87 (512) + XSAVE header (64) + AVX (256) = 832 bytes.
+///
+/// aarch64: 16-byte aligned for NEON register save/restore.
+/// Size covers 32 x Q registers (512) + FPCR (4) + FPSR (4) = 528 bytes, rounded up.
+#[cfg(target_arch = "x86_64")]
 #[repr(C, align(64))]
 pub struct XSaveArea {
     pub data: [u8; 832],
 }
 
+#[cfg(target_arch = "aarch64")]
+#[repr(C, align(16))]
+pub struct XSaveArea {
+    pub data: [u8; 528],
+}
+
 impl XSaveArea {
     pub const fn zeroed() -> Self {
-        Self { data: [0u8; 832] }
+        #[cfg(target_arch = "x86_64")]
+        { Self { data: [0u8; 832] } }
+        #[cfg(target_arch = "aarch64")]
+        { Self { data: [0u8; 528] } }
     }
 }
 
@@ -204,7 +219,8 @@ pub struct Tcb {
     pub futex_wakeup_result: u64,
 }
 
-/// Saved thread context
+/// Saved thread context (x86_64)
+#[cfg(target_arch = "x86_64")]
 #[repr(C)]
 pub struct ThreadContext {
     // General purpose registers
@@ -233,6 +249,21 @@ pub struct ThreadContext {
     pub ss: u64,
 }
 
+/// Saved thread context (aarch64)
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+pub struct ThreadContext {
+    /// General purpose registers x0-x30
+    pub x: [u64; 31],
+    /// Stack pointer (SP_EL0)
+    pub sp: u64,
+    /// Exception link register (return address)
+    pub elr_el1: u64,
+    /// Saved program status register
+    pub spsr_el1: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
 impl ThreadContext {
     pub const fn empty() -> Self {
         Self {
@@ -256,6 +287,18 @@ impl ThreadContext {
             rflags: 0,
             cs: 0,
             ss: 0,
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl ThreadContext {
+    pub const fn empty() -> Self {
+        Self {
+            x: [0u64; 31],
+            sp: 0,
+            elr_el1: 0,
+            spsr_el1: 0,
         }
     }
 }

@@ -27,6 +27,7 @@ pub use bootinfo::{FramebufferInfo, MemoryKind, MemoryMapEntry, ParsedBootInfo};
 use core::panic::PanicInfo;
 
 /// Serial port (COM1) for debug output
+#[cfg(target_arch = "x86_64")]
 const SERIAL_PORT: u16 = 0x3F8;
 
 /// Leaf-level spinlock protecting all COM1 serial output.
@@ -39,29 +40,45 @@ pub(crate) static SERIAL_LOCK: mm::SpinLock = mm::SpinLock::new();
 // Raw serial output (no lock) — for panic/deadlock/crash paths only
 // ---------------------------------------------------------------------------
 
-/// Write a single byte to COM1 hardware. No locking.
+/// Write a single byte to the serial hardware. No locking.
 /// Also mirrors output to the framebuffer console (if initialized).
 #[inline]
 pub(crate) fn serial_putc_hw(c: u8) {
-    // SAFETY: COM1 is a standard x86 serial port
-    unsafe {
-        while (arch::inb(SERIAL_PORT + 5) & 0x20) == 0 {}
-        arch::outb(SERIAL_PORT, c);
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: COM1 is a standard x86 serial port
+        unsafe {
+            while (arch::inb(SERIAL_PORT + 5) & 0x20) == 0 {}
+            arch::outb(SERIAL_PORT, c);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        arch::aarch64::pl011::putc(c);
     }
     console::putc(c);
 }
 
-/// Write a byte slice to COM1 hardware and mirror it to framebuffer.
+/// Write a byte slice to serial hardware and mirror it to framebuffer.
 #[inline]
 pub(crate) fn serial_write_hw(buf: &[u8]) {
     if buf.is_empty() {
         return;
     }
-    for &c in buf {
-        // SAFETY: COM1 is a standard x86 serial port
-        unsafe {
-            while (arch::inb(SERIAL_PORT + 5) & 0x20) == 0 {}
-            arch::outb(SERIAL_PORT, c);
+    #[cfg(target_arch = "x86_64")]
+    {
+        for &c in buf {
+            // SAFETY: COM1 is a standard x86 serial port
+            unsafe {
+                while (arch::inb(SERIAL_PORT + 5) & 0x20) == 0 {}
+                arch::outb(SERIAL_PORT, c);
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        for &c in buf {
+            arch::aarch64::pl011::putc(c);
         }
     }
     console::write(buf);

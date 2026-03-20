@@ -79,21 +79,31 @@ if build_kernel or build_userland
 endif
 
 # =============================================================================
-# Architecture Configuration
+# Architecture Configuration (single source of truth)
 # =============================================================================
 
 if arch == 'x86_64'
-  rust_target = 'x86_64-unknown-saltyos'
-  c_target = 'x86_64-unknown-saltyos'
-  efi_target = 'x86_64-unknown-uefi'
-  rust_kernel_target = meson.project_source_root() / 'kernel/x86_64-saltyos.json'
+  rust_target            = 'x86_64-unknown-saltyos'
+  c_target               = 'x86_64-unknown-saltyos'
+  efi_target             = 'x86_64-unknown-uefi'
+  rust_kernel_target     = meson.project_source_root() / 'kernel/x86_64-saltyos.json'
   rust_kernel_target_needs_unstable = true
+  kernel_link_emulation  = 'elf_x86_64'
+  asm_target             = 'x86_64-unknown-none-elf'
+  c_kernel_extra_args    = ['-mcmodel=kernel', '-mno-sse', '-mno-mmx', '-mno-sse2', '-mno-3dnow', '-mno-avx']
+  build_bios_boot        = true
+  efi_binary_name        = 'BOOTX64.EFI'
 elif arch == 'aarch64'
-  rust_target = 'aarch64-unknown-none'
-  c_target = 'aarch64-unknown-none'
-  efi_target = 'aarch64-unknown-uefi'
-  rust_kernel_target = rust_target
-  rust_kernel_target_needs_unstable = false
+  rust_target            = 'aarch64-unknown-saltyos'
+  c_target               = 'aarch64-unknown-saltyos'
+  efi_target             = 'aarch64-unknown-uefi'
+  rust_kernel_target     = meson.project_source_root() / 'kernel/aarch64-saltyos.json'
+  rust_kernel_target_needs_unstable = true
+  kernel_link_emulation  = 'aarch64elf'
+  asm_target             = 'aarch64-unknown-none-elf'
+  c_kernel_extra_args    = ['-mgeneral-regs-only']
+  build_bios_boot        = false
+  efi_binary_name        = 'BOOTAA64.EFI'
 else
   error('Unsupported architecture: ' + arch)
 endif
@@ -134,23 +144,12 @@ c_efi_args = c_freestanding_args + [
 
 # Stage3 flags (loaded at 0x10000, small code model sufficient)
 c_stage3_args = c_freestanding_args + [
-  '--target=x86_64-unknown-none-elf',
+  '--target=' + asm_target,
   '-mcmodel=small',
 ]
 
 # Kernel flags (higher half)
-if arch == 'x86_64'
-  c_kernel_args = c_freestanding_args + [
-    '-mcmodel=kernel',
-    '-mno-sse',
-    '-mno-mmx',
-    '-mno-sse2',
-    '-mno-3dnow',
-    '-mno-avx',
-  ]
-else
-  c_kernel_args = c_freestanding_args
-endif
+c_kernel_args = c_freestanding_args + c_kernel_extra_args
 
 # Rust flags (x86_64 kernel uses JSON spec for soft-float/kernel code model)
 rust_kernel_args = [
@@ -473,16 +472,36 @@ if mkrootfs.found() and build_userland
     build_by_default: false,
   )
 
-  rootfs_image = custom_target('rootfs_image',
+  # Generate a build-dir-aware manifest for non-initrd binaries so that
+  # rootfs.manifest does not hardcode the Meson build directory name.
+  rootfs_binaries_manifest = custom_target('rootfs_binaries_manifest',
     input: [stripped_display_elf, stripped_ttyd_elf, stripped_getty_elf,
             stripped_test_runner_elf,
             stripped_netdrv_elf, stripped_netsrv_elf, stripped_dnssrv_elf],
-    depends: [rootfs_ports_manifest],
+    output: 'rootfs-binaries.manifest',
+    command: [find_program('python3'), '-c',
+      'import sys; f=open(sys.argv[1],"w"); [f.write(e+chr(10)) for e in sys.argv[2:]]',
+      '@OUTPUT@',
+      '/bin/display=@INPUT0@',
+      '/bin/ttyd=@INPUT1@',
+      '/bin/getty=@INPUT2@',
+      '/bin/test_runner=@INPUT3@',
+      '/bin/netdrv=@INPUT4@',
+      '/bin/netsrv=@INPUT5@',
+      '/bin/dnssrv=@INPUT6@',
+    ],
+    build_by_default: false,
+  )
+
+  rootfs_image = custom_target('rootfs_image',
+    input: [],
+    depends: [rootfs_binaries_manifest, rootfs_ports_manifest],
     depend_files: [mkrootfs_script, mksaltyfs_script, rootfs_manifest, rootfs_packages],
     output: 'rootfs.img',
     command: [mkrootfs,
       '--output', '@OUTPUT@',
       '--size', '512M',
+      '--manifest', rootfs_binaries_manifest,
       '--manifest', rootfs_manifest,
       '--manifest', rootfs_ports_manifest,
     ],
@@ -502,19 +521,21 @@ mkimage_script = files('tools/mkimage.py')
 
 if mkimage.found() and build_boot and build_kernel
 
-  # BIOS disk image
-  disk_image = custom_target('disk_image',
-    input: [mbr, stage2, stage3, kernel_boot] + initrd_inputs + rootfs_inputs,
-    depend_files: mkimage_script,
-    output: 'saltyos.img',
-    command: [mkimage,
-      '--build-dir', meson.project_build_root(),
-      '--kernel', kernel_boot.full_path(),
-      '--output', '@OUTPUT@',
-      '--size', '16',
-    ] + initrd_args + rootfs_args,
-    build_by_default: true,
-  )
+  # BIOS disk image (x86_64 only)
+  if build_bios_boot
+    disk_image = custom_target('disk_image',
+      input: [mbr, stage2, stage3, kernel_boot] + initrd_inputs + rootfs_inputs,
+      depend_files: mkimage_script,
+      output: 'saltyos.img',
+      command: [mkimage,
+        '--build-dir', meson.project_build_root(),
+        '--kernel', kernel_boot.full_path(),
+        '--output', '@OUTPUT@',
+        '--size', '16',
+      ] + initrd_args + rootfs_args,
+      build_by_default: true,
+    )
+  endif
 
   # UEFI disk image
   if arch == 'x86_64'
@@ -542,6 +563,7 @@ endif
 summary({
   'Architecture': arch,
   'Bootloader': build_boot,
+  'BIOS Boot': build_bios_boot,
   'Kernel': build_kernel,
   'Userland': build_userland,
 }, section: 'Build')
@@ -556,4 +578,7 @@ summary({
   'Rust Target': rust_target,
   'Rust Lib Src': build_kernel ? rust_lib_src : 'N/A',
   'EFI Target': efi_target,
+  'EFI Binary': efi_binary_name,
+  'ASM Target': asm_target,
+  'Kernel Link Emulation': kernel_link_emulation,
 }, section: 'Targets')

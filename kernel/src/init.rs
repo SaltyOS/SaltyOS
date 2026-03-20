@@ -32,7 +32,7 @@ macro_rules! boot_fatal {
         crate::serial_puts($msg);
         crate::serial_puts("\n");
         loop {
-            unsafe { core::arch::asm!("hlt") }
+            crate::arch::halt()
         }
     }};
 }
@@ -187,7 +187,7 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
     crate::serial_puts("[INIT] Creating user VSpace\n");
 
     // Read current (kernel) CR3 for copying higher-half entries
-    let kernel_cr3 = crate::arch::x86_64::paging::read_cr3();
+    let kernel_cr3 = crate::arch::paging::read_cr3();
 
     // Allocate PML4 for user VSpace
     let pml4_phys = boot_unwrap!(alloc_frame(), "PML4 alloc failed");
@@ -266,15 +266,27 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
         let tcb = &raw mut INIT_TCB;
         let sc = &raw mut INIT_SCHED_CTX;
 
-        // The trampoline function is entered via context_switch's `ret`.
-        // It reads r12/r13/r14 and performs iretq to ring 3.
-        (*tcb).context.rip = crate::arch::usermode_trampoline as *const () as u64;
-        (*tcb).context.rsp = tramp_stack_top;
-        (*tcb).context.r12 = user_rip;            // User RIP
-        (*tcb).context.r13 = user_stack_top;       // User RSP
-        (*tcb).context.r14 = vspace_root;          // User CR3
-        (*tcb).context.r15 = 0x0202;               // User RFLAGS: IF=1, IOPL=0
-        (*tcb).context.rflags = 0x202;             // Kernel RFLAGS for context_switch
+        // Configure thread context for initial dispatch via context_switch.
+        #[cfg(target_arch = "x86_64")]
+        {
+            // The trampoline function is entered via context_switch's `ret`.
+            // It reads r12/r13/r14 and performs iretq to ring 3.
+            (*tcb).context.rip = crate::arch::usermode_trampoline as *const () as u64;
+            (*tcb).context.rsp = tramp_stack_top;
+            (*tcb).context.r12 = user_rip;            // User RIP
+            (*tcb).context.r13 = user_stack_top;       // User RSP
+            (*tcb).context.r14 = vspace_root;          // User CR3
+            (*tcb).context.r15 = 0x0202;               // User RFLAGS: IF=1, IOPL=0
+            (*tcb).context.rflags = 0x202;             // Kernel RFLAGS for context_switch
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // On aarch64, the trampoline sets ELR_EL1/SPSR_EL1/SP_EL0 and erets.
+            (*tcb).context.elr_el1 = user_rip;
+            (*tcb).context.sp = user_stack_top;
+            (*tcb).context.spsr_el1 = 0x0;            // EL0t with IRQs unmasked
+            // x0 will hold the argument (if any) when entering usermode
+        }
 
         // SchedContext: 10ms budget, 100ms period
         (*sc).budget = 10;

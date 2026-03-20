@@ -1716,13 +1716,23 @@ fn syscall_tcb_configure(
             let tramp_stack_top = tramp_stack_virt + crate::mm::PAGE_SIZE as u64;
             core::ptr::write_bytes(tramp_stack_virt as *mut u8, 0, crate::mm::PAGE_SIZE);
 
-            tcb.context.rip = crate::arch::usermode_trampoline as *const () as u64;
-            tcb.context.rsp = tramp_stack_top;
-            tcb.context.r12 = entry_rip;
-            tcb.context.r13 = entry_rsp;
-            tcb.context.r14 = vspace.root();
-            tcb.context.r15 = 0x0202;
-            tcb.context.rflags = 0x202;
+            #[cfg(target_arch = "x86_64")]
+            {
+                tcb.context.rip = crate::arch::usermode_trampoline as *const () as u64;
+                tcb.context.rsp = tramp_stack_top;
+                tcb.context.r12 = entry_rip;
+                tcb.context.r13 = entry_rsp;
+                tcb.context.r14 = vspace.root();
+                tcb.context.r15 = 0x0202;
+                tcb.context.rflags = 0x202;
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                let _ = tramp_stack_top;
+                tcb.context.elr_el1 = entry_rip;
+                tcb.context.sp = entry_rsp;
+                tcb.context.spsr_el1 = 0x0;
+            }
             tcb.ipc_buffer = ipc_buffer;
             tcb.user_stack_top = entry_rsp;
             tcb.user_stack_min = entry_rsp.saturating_sub(USER_STACK_GROW_LIMIT);
@@ -2038,7 +2048,10 @@ fn syscall_tcb_read_registers(cap: &Capability, _flags: u64) -> SyscallResult {
         let result = if tcb.state != ThreadState::Inactive {
             SyscallResult::err(SyscallError::Busy)
         } else {
-            SyscallResult::ok(tcb.context.rip)
+            #[cfg(target_arch = "x86_64")]
+            { SyscallResult::ok(tcb.context.rip) }
+            #[cfg(target_arch = "aarch64")]
+            { SyscallResult::ok(tcb.context.elr_el1) }
         };
         tcb.tcb_unlock();
         restore_irq(irq);
@@ -2076,8 +2089,10 @@ fn syscall_tcb_write_registers(
             return SyscallResult::err(SyscallError::Busy);
         }
 
-        tcb.context.rip = rip;
-        tcb.context.rsp = rsp;
+        #[cfg(target_arch = "x86_64")]
+        { tcb.context.rip = rip; tcb.context.rsp = rsp; }
+        #[cfg(target_arch = "aarch64")]
+        { tcb.context.elr_el1 = rip; tcb.context.sp = rsp; }
 
         if flags & 1 != 0 && tcb.state == ThreadState::Inactive {
             let scheduler = crate::sched::scheduler::scheduler();
@@ -3398,10 +3413,8 @@ fn syscall_ioport_create(
     SyscallResult::ok(0)
 }
 
-/// IOPORT_IN8: Read a byte from an I/O port
-///
-/// Args:
-/// - offset: Port offset within the IoPort range
+/// IOPORT_IN8: Read a byte from an I/O port (x86_64 only)
+#[cfg(target_arch = "x86_64")]
 fn syscall_ioport_in8(cap: &Capability, offset: u64) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::READ) {
         return SyscallResult::err(e);
@@ -3422,11 +3435,8 @@ fn syscall_ioport_in8(cap: &Capability, offset: u64) -> SyscallResult {
     }
 }
 
-/// IOPORT_OUT8: Write a byte to an I/O port
-///
-/// Args:
-/// - offset: Port offset within the IoPort range
-/// - value: Byte value to write
+/// IOPORT_OUT8: Write a byte to an I/O port (x86_64 only)
+#[cfg(target_arch = "x86_64")]
 fn syscall_ioport_out8(cap: &Capability, offset: u64, value: u64) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::WRITE) {
         return SyscallResult::err(e);
@@ -3447,10 +3457,8 @@ fn syscall_ioport_out8(cap: &Capability, offset: u64, value: u64) -> SyscallResu
     SyscallResult::ok(0)
 }
 
-/// IOPORT_IN16: Read a 16-bit word from an I/O port
-///
-/// Args:
-/// - offset: Port offset within the IoPort range
+/// IOPORT_IN16: Read a 16-bit word from an I/O port (x86_64 only)
+#[cfg(target_arch = "x86_64")]
 fn syscall_ioport_in16(cap: &Capability, offset: u64) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::READ) {
         return SyscallResult::err(e);
@@ -3471,11 +3479,8 @@ fn syscall_ioport_in16(cap: &Capability, offset: u64) -> SyscallResult {
     }
 }
 
-/// IOPORT_OUT16: Write a 16-bit word to an I/O port
-///
-/// Args:
-/// - offset: Port offset within the IoPort range
-/// - value: 16-bit value to write
+/// IOPORT_OUT16: Write a 16-bit word to an I/O port (x86_64 only)
+#[cfg(target_arch = "x86_64")]
 fn syscall_ioport_out16(cap: &Capability, offset: u64, value: u64) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::WRITE) {
         return SyscallResult::err(e);
@@ -3496,10 +3501,8 @@ fn syscall_ioport_out16(cap: &Capability, offset: u64, value: u64) -> SyscallRes
     SyscallResult::ok(0)
 }
 
-/// IOPORT_IN32: Read a 32-bit dword from an I/O port
-///
-/// Args:
-/// - offset: Port offset within the IoPort range
+/// IOPORT_IN32: Read a 32-bit dword from an I/O port (x86_64 only)
+#[cfg(target_arch = "x86_64")]
 fn syscall_ioport_in32(cap: &Capability, offset: u64) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::READ) {
         return SyscallResult::err(e);
@@ -3520,11 +3523,8 @@ fn syscall_ioport_in32(cap: &Capability, offset: u64) -> SyscallResult {
     }
 }
 
-/// IOPORT_OUT32: Write a 32-bit dword to an I/O port
-///
-/// Args:
-/// - offset: Port offset within the IoPort range
-/// - value: 32-bit value to write
+/// IOPORT_OUT32: Write a 32-bit dword to an I/O port (x86_64 only)
+#[cfg(target_arch = "x86_64")]
 fn syscall_ioport_out32(cap: &Capability, offset: u64, value: u64) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::WRITE) {
         return SyscallResult::err(e);
@@ -3543,6 +3543,32 @@ fn syscall_ioport_out32(cap: &Capability, offset: u64, value: u64) -> SyscallRes
     }
 
     SyscallResult::ok(0)
+}
+
+/// IoPort I/O stubs for aarch64 (I/O ports do not exist on aarch64)
+#[cfg(target_arch = "aarch64")]
+fn syscall_ioport_in8(_cap: &Capability, _offset: u64) -> SyscallResult {
+    SyscallResult::err(SyscallError::InvalidArgument)
+}
+#[cfg(target_arch = "aarch64")]
+fn syscall_ioport_out8(_cap: &Capability, _offset: u64, _value: u64) -> SyscallResult {
+    SyscallResult::err(SyscallError::InvalidArgument)
+}
+#[cfg(target_arch = "aarch64")]
+fn syscall_ioport_in16(_cap: &Capability, _offset: u64) -> SyscallResult {
+    SyscallResult::err(SyscallError::InvalidArgument)
+}
+#[cfg(target_arch = "aarch64")]
+fn syscall_ioport_out16(_cap: &Capability, _offset: u64, _value: u64) -> SyscallResult {
+    SyscallResult::err(SyscallError::InvalidArgument)
+}
+#[cfg(target_arch = "aarch64")]
+fn syscall_ioport_in32(_cap: &Capability, _offset: u64) -> SyscallResult {
+    SyscallResult::err(SyscallError::InvalidArgument)
+}
+#[cfg(target_arch = "aarch64")]
+fn syscall_ioport_out32(_cap: &Capability, _offset: u64, _value: u64) -> SyscallResult {
+    SyscallResult::err(SyscallError::InvalidArgument)
 }
 
 /// IOPORT_CONFIGURE: Set base port and port count on a freshly retyped IoPort
@@ -4134,22 +4160,34 @@ pub fn handle(
                     let tcb = &*current;
                     let s = crate::SerialGuard::acquire();
                     s.puts("[DEBUG] TCB state dump:\n");
-                    s.puts("  RIP=");
-                    s.hex(tcb.context.rip);
-                    s.puts(" RSP=");
-                    s.hex(tcb.context.rsp);
-                    s.puts("\n  RAX=");
-                    s.hex(tcb.context.rax);
-                    s.puts(" RBX=");
-                    s.hex(tcb.context.rbx);
-                    s.puts("\n  RCX=");
-                    s.hex(tcb.context.rcx);
-                    s.puts(" RDX=");
-                    s.hex(tcb.context.rdx);
-                    s.puts("\n  RSI=");
-                    s.hex(tcb.context.rsi);
-                    s.puts(" RDI=");
-                    s.hex(tcb.context.rdi);
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        s.puts("  RIP=");
+                        s.hex(tcb.context.rip);
+                        s.puts(" RSP=");
+                        s.hex(tcb.context.rsp);
+                        s.puts("\n  RAX=");
+                        s.hex(tcb.context.rax);
+                        s.puts(" RBX=");
+                        s.hex(tcb.context.rbx);
+                        s.puts("\n  RCX=");
+                        s.hex(tcb.context.rcx);
+                        s.puts(" RDX=");
+                        s.hex(tcb.context.rdx);
+                        s.puts("\n  RSI=");
+                        s.hex(tcb.context.rsi);
+                        s.puts(" RDI=");
+                        s.hex(tcb.context.rdi);
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        s.puts("  ELR=");
+                        s.hex(tcb.context.elr_el1);
+                        s.puts(" SP=");
+                        s.hex(tcb.context.sp);
+                        s.puts(" SPSR=");
+                        s.hex(tcb.context.spsr_el1);
+                    }
                     s.putc(b'\n');
                     drop(s);
                 }

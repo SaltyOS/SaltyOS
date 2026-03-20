@@ -17,8 +17,8 @@ all_asm_files = run_command(
 ).stdout().strip()
 
 kernel_crate_root = files('src/lib.rs')
-kernel_ld = meson.current_source_dir() / 'kernel.ld'
-kernel_link_target = '--target=x86_64-unknown-none-elf'
+kernel_ld = meson.current_source_dir() / 'arch' / arch + '.ld'
+kernel_link_target = '--target=' + asm_target
 kernel_ld_lld = find_program('ld.lld', required: true)
 
 # Paths to Rust build outputs (for -L search path)
@@ -83,7 +83,7 @@ kernel = custom_target('kernel',
   output: 'kernel.elf',
   command: [
     kernel_ld_lld,
-    '-m', 'elf_x86_64',
+    '-m', kernel_link_emulation,
     '-nostdlib',
     '-pie',
     '--no-dynamic-linker',
@@ -102,7 +102,7 @@ kernel_boot = custom_target('kernel_boot',
   output: 'kernel.boot.elf',
   command: [
     kernel_ld_lld,
-    '-m', 'elf_x86_64',
+    '-m', kernel_link_emulation,
     '-nostdlib',
     '-pie',
     '--no-dynamic-linker',

@@ -135,12 +135,9 @@ cmd_setup() {
 cmd_build_host_llvm() {
   mkdir -p "$SALTYOS_LLVM_BUILD_DIR" "$SALTYOS_TOOLCHAIN_PREFIX"
 
-  local llvm_targets="X86"
+  local llvm_targets="AArch64;X86"
   local saltyos_builtins_cache="$SALTYOS_REPO_ROOT/tools/toolchain/cmake/saltyos-builtins-target-cache.cmake"
   local cmake_extra_args=()
-  case "$(uname -m)" in
-    arm64|aarch64) llvm_targets="AArch64;X86" ;;
-  esac
   if [[ "$(uname -s)" == "Darwin" ]]; then
     cmake_extra_args+=(-DCMAKE_OSX_SYSROOT="$(xcrun --show-sdk-path)")
   fi
@@ -152,7 +149,7 @@ cmd_build_host_llvm() {
     -DLLVM_INSTALL_UTILS=ON \
     -C "$saltyos_builtins_cache" \
     -DLLVM_ENABLE_RUNTIMES=compiler-rt \
-    -DLLVM_BUILTIN_TARGETS="default;x86_64-unknown-saltyos" \
+    -DLLVM_BUILTIN_TARGETS="default;x86_64-unknown-saltyos;aarch64-unknown-saltyos" \
     -DCMAKE_INSTALL_PREFIX="$SALTYOS_TOOLCHAIN_PREFIX" \
     "${cmake_extra_args[@]}"
 
@@ -364,7 +361,7 @@ Run 'just tc build host llvm' first."
   cat > "$config_path" << EOF
 [build]
 host = ["${SALTYOS_HOST_TRIPLE}"]
-target = ["${SALTYOS_HOST_TRIPLE}", "x86_64-unknown-saltyos"]
+target = ["${SALTYOS_HOST_TRIPLE}", "x86_64-unknown-saltyos", "aarch64-unknown-saltyos"]
 docs = false
 extended = false
 
@@ -485,6 +482,15 @@ cmd_doctor() {
     else
       _fail "clang failed to compile with --target=x86_64-unknown-saltyos"
     fi
+
+    if "${SALTYOS_TOOLCHAIN_PREFIX}/bin/clang" --target=aarch64-unknown-saltyos -### -c -x c /dev/null \
+        >"${tmp}" 2>&1; then
+      if grep -q "aarch64-unknown-saltyos" "${tmp}"; then
+        _ok "clang recognizes target aarch64-unknown-saltyos"
+      else
+        _warn "clang invocation succeeded but aarch64-unknown-saltyos not visible in -### output"
+      fi
+    fi
   fi
 
   if [[ -n "${rustc_bin}" ]]; then
@@ -492,6 +498,12 @@ cmd_doctor() {
       _ok "rustc exposes target x86_64-unknown-saltyos"
     else
       _fail "rustc does not list x86_64-unknown-saltyos"
+    fi
+
+    if "${rustc_bin}" --print target-list 2>/dev/null | grep -qx "aarch64-unknown-saltyos"; then
+      _ok "rustc exposes target aarch64-unknown-saltyos"
+    else
+      _warn "rustc does not list aarch64-unknown-saltyos (may need rebuild)"
     fi
   fi
 
@@ -509,6 +521,13 @@ cmd_doctor() {
       | sed 's/\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/')
     local crt_builtins="${SALTYOS_TOOLCHAIN_PREFIX}/lib/clang/${clang_version}/lib/x86_64-unknown-saltyos/libclang_rt.builtins.a"
     _check_file "${crt_builtins}" "compiler-rt builtins (saltyos)"
+
+    local crt_builtins_aarch64="${SALTYOS_TOOLCHAIN_PREFIX}/lib/clang/${clang_version}/lib/aarch64-unknown-saltyos/libclang_rt.builtins.a"
+    if [[ -f "${crt_builtins_aarch64}" ]]; then
+      _ok "compiler-rt builtins (saltyos aarch64): ${crt_builtins_aarch64}"
+    else
+      _warn "compiler-rt builtins (saltyos aarch64) not found: ${crt_builtins_aarch64}"
+    fi
   fi
 
   exit "${_doctor_status}"

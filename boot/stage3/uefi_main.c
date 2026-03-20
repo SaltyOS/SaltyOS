@@ -353,6 +353,18 @@ void stage3_entry_64(struct Stage2Info *info)
     paging_load_cr3(pml4);
 
     /* Jump to kernel */
+#if defined(__aarch64__)
+    __asm__ volatile(
+        "mov sp, %0\n\t"
+        "mov x0, %1\n\t"
+        "br  %2\n\t"
+        :
+        : "r"((uint64_t)(stack_addr + KERNEL_STACK_SIZE)),
+          "r"((uint64_t)(uintptr_t)bootinfo),
+          "r"(load_result.entry)
+        : "memory"
+    );
+#else
     __asm__ volatile(
         "mov %0, %%rsp\n\t"
         "xor %%rbp, %%rbp\n\t"
@@ -364,6 +376,7 @@ void stage3_entry_64(struct Stage2Info *info)
           "r"(load_result.entry)
         : "memory"
     );
+#endif
 
     stage3_panic("Returned from kernel");
 }

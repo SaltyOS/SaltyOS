@@ -3,7 +3,7 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use super::{alloc_frame, phys_to_virt, PhysAddr, SpinLock, VirtAddr, PAGE_SIZE};
-use crate::arch::x86_64::paging::PageTable;
+use crate::arch::paging::PageTable;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
@@ -603,17 +603,30 @@ pub fn process_deferred_free() {
 /// Check if IRQs are disabled
 #[inline]
 fn irqs_disabled() -> bool {
-    let rflags: u64;
-    unsafe {
-        core::arch::asm!(
-            "pushfq; pop {}",
-            out(reg) rflags,
-            // pushfq/pop touches the current stack, so this asm must not use
-            // `nostack` (and it does access memory via the stack).
-            options(preserves_flags)
-        );
+    #[cfg(target_arch = "x86_64")]
+    {
+        let rflags: u64;
+        unsafe {
+            core::arch::asm!(
+                "pushfq; pop {}",
+                out(reg) rflags,
+                // pushfq/pop touches the current stack, so this asm must not use
+                // `nostack` (and it does access memory via the stack).
+                options(preserves_flags)
+            );
+        }
+        (rflags & (1 << 9)) == 0
     }
-    (rflags & (1 << 9)) == 0
+    #[cfg(target_arch = "aarch64")]
+    {
+        let daif: u64;
+        // SAFETY: Reading DAIF is always safe
+        unsafe {
+            core::arch::asm!("mrs {}, DAIF", out(reg) daif, options(nomem, nostack));
+        }
+        // DAIF bit 7 (I) = 1 means IRQ is masked (disabled)
+        (daif & (1 << 7)) != 0
+    }
 }
 
 /// Lock-free SPSC ring: mmsrv produces pre-allocated frames, kernel consumes during COW fast-path.
@@ -1131,7 +1144,7 @@ impl VSpace {
             super::retain_frame_mapping(phys);
 
             // Local TLB flush
-            crate::arch::x86_64::paging::invlpg(virt);
+            crate::arch::paging::invlpg(virt);
 
             // Remote TLB shootdown
             self.tlb_shootdown(virt);
@@ -1199,9 +1212,9 @@ impl VSpace {
 
         if mapped > RANGE_TLB_GLOBAL_THRESHOLD {
             if self.active_on_current_cpu() {
-                let cr3 = crate::arch::x86_64::paging::read_cr3();
+                let cr3 = crate::arch::paging::read_cr3();
                 unsafe {
-                    crate::arch::x86_64::paging::write_cr3(cr3);
+                    crate::arch::paging::write_cr3(cr3);
                 }
             }
             self.tlb_shootdown_all();
@@ -1210,7 +1223,7 @@ impl VSpace {
             let mut flush_virt = virt_start;
             for i in 0..mapped {
                 if do_local_flush {
-                    crate::arch::x86_64::paging::invlpg(flush_virt);
+                    crate::arch::paging::invlpg(flush_virt);
                 }
                 self.tlb_shootdown(flush_virt);
                 if i + 1 < mapped {
@@ -1343,7 +1356,7 @@ impl VSpace {
             // TLB invalidation BEFORE refcount release: remote CPUs may still
             // cache the stale entry. Flush first so no CPU can access the frame
             // via stale TLB after we drop the mapping reference.
-            crate::arch::x86_64::paging::invlpg(virt);
+            crate::arch::paging::invlpg(virt);
             self.tlb_shootdown(virt);
 
             super::release_frame_mapping(phys);
@@ -1390,7 +1403,7 @@ impl VSpace {
             // TLB invalidation inside lock scope to prevent race where another
             // CPU modifies the PTE between our unlock and shootdown, causing
             // the newer mapping to be incorrectly flushed.
-            crate::arch::x86_64::paging::invlpg(virt);
+            crate::arch::paging::invlpg(virt);
             self.tlb_shootdown(virt);
             Ok(())
         })();
@@ -1454,9 +1467,9 @@ impl VSpace {
         // Adaptive TLB flush: full flush for large ranges, per-page for small.
         if protected > RANGE_TLB_GLOBAL_THRESHOLD {
             if self.active_on_current_cpu() {
-                let cr3 = crate::arch::x86_64::paging::read_cr3();
+                let cr3 = crate::arch::paging::read_cr3();
                 unsafe {
-                    crate::arch::x86_64::paging::write_cr3(cr3);
+                    crate::arch::paging::write_cr3(cr3);
                 }
             }
             self.tlb_shootdown_all();
@@ -1466,7 +1479,7 @@ impl VSpace {
             for i in 0..count {
                 let addr = virt + (i as u64) * page_size;
                 if do_local_flush {
-                    crate::arch::x86_64::paging::invlpg(addr);
+                    crate::arch::paging::invlpg(addr);
                 }
                 self.tlb_shootdown(addr);
             }
@@ -1533,7 +1546,7 @@ impl VSpace {
             if src_entry & ENTRY_WRITABLE != 0 {
                 shared_flags = (shared_flags & !ENTRY_WRITABLE) | ENTRY_COW;
                 self.write_entry(src_vaddr, 1, phys | shared_flags)?;
-                crate::arch::x86_64::paging::invlpg(src_vaddr);
+                crate::arch::paging::invlpg(src_vaddr);
                 self.tlb_shootdown(src_vaddr);
             }
 
@@ -1547,7 +1560,7 @@ impl VSpace {
 
             dst.write_entry(dst_vaddr, 1, phys | shared_flags)?;
             super::retain_frame_mapping(phys);
-            crate::arch::x86_64::paging::invlpg(dst_vaddr);
+            crate::arch::paging::invlpg(dst_vaddr);
             dst.tlb_shootdown(dst_vaddr);
 
             Ok(())
@@ -1617,7 +1630,7 @@ impl VSpace {
 
             // TLB invalidation BEFORE refcount release: remote CPUs may still
             // cache the stale read-only entry pointing to old_phys.
-            crate::arch::x86_64::paging::invlpg(page_vaddr);
+            crate::arch::paging::invlpg(page_vaddr);
             self.tlb_shootdown(page_vaddr);
 
             super::retain_frame_mapping(new_phys);
@@ -1695,7 +1708,7 @@ impl VSpace {
             }
 
             // TLB invalidation BEFORE refcount changes
-            crate::arch::x86_64::paging::invlpg(page_vaddr);
+            crate::arch::paging::invlpg(page_vaddr);
             self.tlb_shootdown(page_vaddr);
 
             // Update frame mapping refcounts
@@ -1803,7 +1816,7 @@ impl VSpace {
                     return Err(VSpaceError::NotMapped);
                 }
 
-                crate::arch::x86_64::paging::invlpg(page_vaddr);
+                crate::arch::paging::invlpg(page_vaddr);
                 self.tlb_shootdown(page_vaddr);
 
                 super::retain_frame_mapping(new_phys);
@@ -1923,7 +1936,7 @@ impl VSpace {
             }
 
             super::retain_frame_mapping(new_phys);
-            crate::arch::x86_64::paging::invlpg(page_vaddr);
+            crate::arch::paging::invlpg(page_vaddr);
             self.tlb_shootdown(page_vaddr);
             Ok(true)
         })();
@@ -2081,7 +2094,7 @@ impl VSpace {
             }
 
             super::retain_frame_mapping(new_phys);
-            crate::arch::x86_64::paging::invlpg(page_vaddr);
+            crate::arch::paging::invlpg(page_vaddr);
             self.tlb_shootdown(page_vaddr);
 
             Ok(true)
@@ -2115,7 +2128,7 @@ impl VSpace {
 
         // Load CR3
         unsafe {
-            crate::arch::x86_64::paging::write_cr3(self.root);
+            crate::arch::paging::write_cr3(self.root);
         }
 
         // Compiler fence to prevent reordering
@@ -2189,7 +2202,7 @@ impl VSpace {
             let kernel_root = kernel_vspace_root();
 
             unsafe {
-                crate::arch::x86_64::paging::write_cr3(kernel_root);
+                crate::arch::paging::write_cr3(kernel_root);
             }
 
             // Compiler fence to prevent reordering
@@ -2526,6 +2539,7 @@ impl core::fmt::Display for VSpaceError {
 /// Save interrupt flag and disable IRQs
 #[inline(always)]
 pub unsafe fn save_irq_disable() -> u64 {
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         let mut rflags: u64;
         core::arch::asm!(
@@ -2538,14 +2552,28 @@ pub unsafe fn save_irq_disable() -> u64 {
         core::arch::asm!("cli", options(nomem, nostack));
         rflags
     }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // SAFETY: Save DAIF and mask IRQ (bit 7 = IRQ mask)
+        let daif: u64;
+        core::arch::asm!("mrs {}, DAIF", out(reg) daif, options(nomem, nostack));
+        core::arch::asm!("msr DAIFSet, #0x2", options(nomem, nostack));
+        daif
+    }
 }
 
 /// Restore interrupt flag
 #[inline(always)]
-pub unsafe fn restore_irq(rflags: u64) {
+pub unsafe fn restore_irq(saved: u64) {
+    #[cfg(target_arch = "x86_64")]
     unsafe {
-        if rflags & (1 << 9) != 0 {
+        if saved & (1 << 9) != 0 {
             core::arch::asm!("sti", options(nomem, nostack));
         }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // SAFETY: Restore saved DAIF value
+        core::arch::asm!("msr DAIF, {}", in(reg) saved, options(nomem, nostack));
     }
 }

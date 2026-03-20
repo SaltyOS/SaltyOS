@@ -5,7 +5,7 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use crate::arch::x86_64::paging::{read_cr3, write_cr3, PageFlags, PageTable};
+use crate::arch::paging::{read_cr3, write_cr3, PageFlags, PageTable};
 use crate::mm::{alloc_frame, phys_to_virt, PAGE_SIZE};
 use crate::FramebufferInfo;
 

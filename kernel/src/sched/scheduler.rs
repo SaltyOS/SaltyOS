@@ -702,8 +702,10 @@ impl Scheduler {
         unsafe {
             self.validate_tcb_ptr(new_tcb, "switch target", cpu_id);
 
-            let rip = (*new_tcb).context.rip;
-            let rsp = (*new_tcb).context.rsp;
+            #[cfg(target_arch = "x86_64")]
+            let (rip, rsp) = ((*new_tcb).context.rip, (*new_tcb).context.rsp);
+            #[cfg(target_arch = "aarch64")]
+            let (rip, rsp) = ((*new_tcb).context.elr_el1, (*new_tcb).context.sp);
             let kstack = (*new_tcb).kernel_stack_top;
             let text_start = core::ptr::addr_of!(_text_start) as u64;
             let text_end = core::ptr::addr_of!(_text_end) as u64;

@@ -97,12 +97,21 @@ pub fn init() {
 
     // Initialize thread context
     unsafe {
-        (*idle_tcb).context.rip = idle_thread as *const () as u64;
-        (*idle_tcb).context.rsp = stack_top;
+        #[cfg(target_arch = "x86_64")]
+        {
+            (*idle_tcb).context.rip = idle_thread as *const () as u64;
+            (*idle_tcb).context.rsp = stack_top;
+            (*idle_tcb).context.rflags = 0x202;
+            (*idle_tcb).context.cs = 0x08;
+            (*idle_tcb).context.ss = 0x10;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            (*idle_tcb).context.elr_el1 = idle_thread as *const () as u64;
+            (*idle_tcb).context.sp = stack_top;
+            (*idle_tcb).context.spsr_el1 = 0x305;
+        }
         (*idle_tcb).kernel_stack_top = stack_top;
-        (*idle_tcb).context.rflags = 0x202; // Interrupts enabled
-        (*idle_tcb).context.cs = 0x08; // Kernel code segment
-        (*idle_tcb).context.ss = 0x10; // Kernel data segment
     }
 
     // Set bootstrap as current thread (not idle!)
@@ -136,12 +145,21 @@ pub fn init_cpu(cpu_id: usize) {
     let stack_top = idle_stack + IDLE_STACK_SIZE as u64;
 
     unsafe {
-        (*idle_tcb).context.rip = idle_thread as *const () as u64;
-        (*idle_tcb).context.rsp = stack_top;
+        #[cfg(target_arch = "x86_64")]
+        {
+            (*idle_tcb).context.rip = idle_thread as *const () as u64;
+            (*idle_tcb).context.rsp = stack_top;
+            (*idle_tcb).context.rflags = 0x202;
+            (*idle_tcb).context.cs = 0x08;
+            (*idle_tcb).context.ss = 0x10;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            (*idle_tcb).context.elr_el1 = idle_thread as *const () as u64;
+            (*idle_tcb).context.sp = stack_top;
+            (*idle_tcb).context.spsr_el1 = 0x305;
+        }
         (*idle_tcb).kernel_stack_top = stack_top;
-        (*idle_tcb).context.rflags = 0x202; // Interrupts enabled
-        (*idle_tcb).context.cs = 0x08; // Kernel code segment
-        (*idle_tcb).context.ss = 0x10; // Kernel data segment
     }
 
     scheduler().set_idle(cpu_id, idle_tcb);
