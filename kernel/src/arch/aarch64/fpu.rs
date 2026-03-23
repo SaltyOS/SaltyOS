@@ -5,7 +5,7 @@
 //! needs to be saved/restored when switching between userspace threads.
 //!
 //! Strategy:
-//! - CPACR_EL1.FPEN = 0b00 after every context switch (trap on FP access)
+//! - CPACR_EL1.FPEN = 0b01 after every context switch (trap EL0, allow EL1)
 //! - First NEON/FP instruction in usermode triggers ESR EC=0x07 exception
 //! - Exception handler saves previous owner's state, restores current
 //!   thread's state, and sets FPEN = 0b11
@@ -29,10 +29,11 @@ static mut FPU_OWNER: [*mut Tcb; super::MAX_CPUS] = [core::ptr::null_mut(); supe
 // CPACR_EL1 FPEN control
 // ---------------------------------------------------------------------------
 
-/// Disable FPU/NEON access (trap on next use).
+/// Trap EL0 FPU/NEON access while keeping EL1 available.
 ///
-/// Sets CPACR_EL1.FPEN (bits 21:20) to 0b00, causing any FP/NEON
-/// instruction from EL0 to generate a synchronous exception (EC=0x07).
+/// Sets CPACR_EL1.FPEN (bits 21:20) to 0b01, causing FP/NEON
+/// instructions from EL0 to trap while still permitting EL1 code to use
+/// compiler-emitted AdvSIMD instructions in routines like `memset`.
 #[inline]
 fn disable_fpu() {
     let mut cpacr: u64;
@@ -41,7 +42,9 @@ fn disable_fpu() {
         core::arch::asm!("mrs {}, CPACR_EL1", out(reg) cpacr, options(nomem, nostack));
     }
     cpacr &= !(3u64 << 20);
-    // SAFETY: Writing CPACR_EL1 to restrict EL0 FP access is safe.
+    cpacr |= 1u64 << 20;
+    // SAFETY: Writing CPACR_EL1 to trap EL0 FP access while leaving EL1
+    // available is safe.
     // ISB ensures the change takes effect before the next instruction.
     unsafe {
         core::arch::asm!("msr CPACR_EL1, {}", in(reg) cpacr, options(nomem, nostack));
@@ -159,7 +162,7 @@ fn restore(tcb: &Tcb) {
 
 /// Initialize FPU lazy switching on the current CPU.
 ///
-/// Disables FPU access so the first NEON/FP instruction from EL0
+/// Traps EL0 FPU access so the first NEON/FP instruction from EL0
 /// triggers a trap (EC=0x07) for lazy context switching.
 pub fn init() {
     disable_fpu();
@@ -168,7 +171,7 @@ pub fn init() {
 /// Disable FPU access, arming the lazy-switch trap.
 ///
 /// Called on every context switch (analogous to x86_64 `set_ts()`).
-/// The next FP/NEON instruction will generate an EC=0x07 trap.
+/// The next EL0 FP/NEON instruction will generate an EC=0x07 trap.
 pub fn set_ts() {
     disable_fpu();
 }
@@ -248,7 +251,7 @@ pub fn disown_if_current(tcb_ptr: *mut u8) {
 /// Handle FPU/NEON access trap (ESR EC=0x07).
 ///
 /// Called from the exception handler when a usermode thread executes a
-/// NEON/FP instruction while CPACR_EL1.FPEN=0b00. Saves the previous
+/// NEON/FP instruction while CPACR_EL1.FPEN=0b01. Saves the previous
 /// owner's state, restores the current thread's state (or initializes
 /// default state on first use), and enables FPU access.
 pub fn handle_trap() {

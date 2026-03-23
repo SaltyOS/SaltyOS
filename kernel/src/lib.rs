@@ -8,6 +8,7 @@
 #![no_main]
 #![allow(dead_code)]
 
+mod acpi;
 mod arch;
 mod bootinfo;
 mod builtins;
@@ -24,6 +25,7 @@ mod syscall;
 
 pub use bootinfo::{FramebufferInfo, MemoryKind, MemoryMapEntry, ParsedBootInfo};
 
+use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 
 /// Serial port (COM1) for debug output
@@ -267,6 +269,15 @@ impl Drop for SerialGuard {
     }
 }
 
+struct PanicSerialWriter;
+
+impl Write for PanicSerialWriter {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        serial_puts_raw(s);
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Compile-time-gated kernel log macros
 // ---------------------------------------------------------------------------
@@ -406,11 +417,9 @@ fn panic(info: &PanicInfo) -> ! {
         serial_putc_hw(b'\n');
     }
 
-    if let Some(msg) = info.message().as_str() {
-        serial_puts_raw("  Message: ");
-        serial_puts_raw(msg);
-        serial_putc_hw(b'\n');
-    }
+    serial_puts_raw("  Message: ");
+    let mut writer = PanicSerialWriter;
+    let _ = writer.write_fmt(format_args!("{}\n", info.message()));
 
     loop {
         arch::halt();

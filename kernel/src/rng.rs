@@ -43,22 +43,27 @@ pub fn rdrand64() -> Option<u64> {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        // Try RNDR (ARMv8.5-RNG)
-        for _ in 0..MAX_RETRIES {
-            let val: u64;
-            let ok: u64;
-            // SAFETY: mrs RNDR may fail; NZCV flags indicate success
-            unsafe {
-                core::arch::asm!(
-                    "mrs {val}, S3_3_C2_C4_0",
-                    "cset {ok}, ne",
-                    val = out(reg) val,
-                    ok = out(reg) ok,
-                    options(nomem, nostack),
-                );
-            }
-            if ok != 0 {
-                return Some(val);
+        // FEAT_RNG is optional. If it is absent, touching RNDR itself
+        // faults, so gate the instruction on the architectural ID bit.
+        if crate::arch::cpuid::has_rdrand() {
+            for _ in 0..MAX_RETRIES {
+                let val: u64;
+                let ok: u64;
+                // SAFETY: FEAT_RNG support has been verified above, so
+                // RNDR is a valid system register access here. NZCV flags
+                // indicate whether fresh entropy was returned.
+                unsafe {
+                    core::arch::asm!(
+                        "mrs {val}, S3_3_C2_C4_0",
+                        "cset {ok}, ne",
+                        val = out(reg) val,
+                        ok = out(reg) ok,
+                        options(nomem, nostack),
+                    );
+                }
+                if ok != 0 {
+                    return Some(val);
+                }
             }
         }
         // Fallback: CNTPCT_EL0 (weak entropy, but better than nothing)

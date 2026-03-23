@@ -2,7 +2,7 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use crate::mm::{alloc_frame, phys_to_virt, mark_frame_kernel_runtime, mark_frame_pt_owned, PAGE_SIZE, PHYS_MAP_OFFSET};
+use crate::mm::{pmm_alloc, frame::FrameOwner, frame::KernelMetaKind, phys_to_virt, PAGE_SIZE, PHYS_MAP_OFFSET};
 
 /// Maximum direct physical mapping size (512 GB cap)
 const MAX_DIRECT_MAP_SIZE: usize = 512 * 1024 * 1024 * 1024;
@@ -94,9 +94,7 @@ unsafe fn ensure_next_table(
         return entry & ENTRY_ADDR_MASK;
     }
 
-    let frame = alloc_frame().expect(context);
-    mark_frame_pt_owned(frame);
-    mark_frame_kernel_runtime(frame);
+    let frame = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect(context);
 
     // SAFETY: `frame` is a freshly allocated page-table frame reachable through
     // the existing direct map, and zeroing it initializes all entries to empty.
@@ -242,7 +240,7 @@ unsafe fn init_direct_map(max_phys: u64) {
     let pml4e = pml4.entry(pml4_idx);
     let pdpt_phys = if pml4e & PageFlags::Present as u64 == 0 {
         // Allocate new PDPT
-        let pdpt_frame = alloc_frame().expect("Failed to allocate PDPT for direct map");
+        let pdpt_frame = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect("Failed to allocate PDPT for direct map");
         // Use identity mapping for access during init
         let pdpt_virt = pdpt_frame as *mut u8;
 
@@ -273,7 +271,7 @@ unsafe fn init_direct_map(max_phys: u64) {
 
         let pd_phys = if pdpte & PageFlags::Present as u64 == 0 {
             // Allocate new PD
-            let pd_frame = alloc_frame().expect("Failed to allocate PD for direct map");
+            let pd_frame = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect("Failed to allocate PD for direct map");
             // Use identity mapping for access during init
             let pd_virt = pd_frame as *mut u8;
 

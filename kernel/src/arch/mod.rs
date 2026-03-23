@@ -65,6 +65,10 @@ pub use x86_64::smap;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::smap;
 
+// Re-export PCI I/O port emulation (aarch64: MMIO-mapped PCI I/O window)
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::{pci_io_read8, pci_io_write8, pci_io_read16, pci_io_write16, pci_io_read32, pci_io_write32};
+
 /// Initialize architecture-specific subsystems
 pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     #[cfg(target_arch = "x86_64")]

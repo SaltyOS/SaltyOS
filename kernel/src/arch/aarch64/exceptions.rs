@@ -40,10 +40,14 @@ const EC_SVC_AARCH64: u64 = 0x15;
 const EC_IABT_LOWER: u64 = 0x20;
 /// Instruction abort from the current Exception Level.
 const EC_IABT_CURRENT: u64 = 0x21;
+/// PC alignment fault.
+const EC_PCALIGN: u64 = 0x22;
 /// Data abort from a lower Exception Level.
 const EC_DABT_LOWER: u64 = 0x24;
 /// Data abort from the current Exception Level.
 const EC_DABT_CURRENT: u64 = 0x25;
+/// SP alignment fault.
+const EC_SPALIGN: u64 = 0x26;
 /// Access to SVE, Advanced SIMD, or floating-point (trapped).
 const EC_FP_TRAP: u64 = 0x07;
 
@@ -221,6 +225,62 @@ extern "C" fn el1_sync_handler(frame: *const ExceptionFrame) {
             }
             // SAFETY: frame was set up by SAVE_REGS and is valid.
             let elr = unsafe { (*frame).elr_el1 };
+
+            // Check if this is a write permission fault on a user VA.
+            // This happens when the kernel writes to a COW page (e.g. IPC
+            // buffer after fork). Resolve the COW fault so the faulting
+            // instruction can be retried via ERET.
+            let dfsc = esr & 0x3F;
+            let is_write = esr & (1 << 6) != 0;
+            let is_permission_fault = dfsc >= 0x0D && dfsc <= 0x0F;
+            let is_user_va = far < 0x0001_0000_0000_0000;
+
+            if is_user_va && is_permission_fault && is_write {
+                let fault = crate::mm::PageFaultInfo {
+                    present: true,
+                    write: true,
+                    // Treat as user-page fault: FAR is a user VA in the
+                    // current thread's VSpace, handle_cow_fault gates on this.
+                    user: true,
+                };
+                let handled = unsafe {
+                    let scheduler = crate::sched::scheduler::scheduler();
+                    let current = scheduler.current();
+                    if !current.is_null() && !(*current).vspace_root.is_null() {
+                        let vspace = &mut *(*current).vspace_root;
+                        vspace.handle_cow_fault_pooled(far, &fault).unwrap_or(false)
+                            || vspace.handle_cow_fault(far, &fault).unwrap_or(false)
+                    } else {
+                        false
+                    }
+                };
+                if handled {
+                    return;
+                }
+                // SMP race: another CPU may have already resolved the COW.
+                // Re-read the PTE — if now writable, flush TLB and retry.
+                let resolved_race = unsafe {
+                    let scheduler = crate::sched::scheduler::scheduler();
+                    let current = scheduler.current();
+                    if !current.is_null() && !(*current).vspace_root.is_null() {
+                        let vspace = &*(*current).vspace_root;
+                        if let Some(entry) = vspace.read_entry(far, 1) {
+                            let writable = entry & crate::mm::vspace::ENTRY_WRITABLE != 0;
+                            let cow = entry & crate::mm::vspace::ENTRY_COW != 0;
+                            writable && !cow
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if resolved_race {
+                    crate::arch::paging::invlpg(far);
+                    return;
+                }
+            }
+
             panic!(
                 "EL1 data abort: FAR={:#018x} ESR={:#010x} ELR={:#018x}",
                 far, esr, elr,
@@ -239,6 +299,11 @@ extern "C" fn el1_sync_handler(frame: *const ExceptionFrame) {
                 "EL1 instruction abort: FAR={:#018x} ESR={:#010x} ELR={:#018x}",
                 far, esr, elr,
             );
+        }
+        EC_FP_TRAP => {
+            // EL1 hit a trapped FP/SIMD instruction.
+            let elr = unsafe { (*frame).elr_el1 };
+            panic!("EL1 FP/ASIMD trap: ESR={:#010x} ELR={:#018x}", esr, elr);
         }
         _ => {
             // SAFETY: frame was set up by SAVE_REGS and is valid.
@@ -276,9 +341,72 @@ extern "C" fn el1_irq_handler(_frame: *const ExceptionFrame) {
             // Spurious interrupt — no EOI needed.
         }
         _ => {
-            // SPI or other interrupt — EOI and log.
+            // SPI or other peripheral interrupt — dispatch to registered
+            // IRQ handlers (e.g. PCI devices), then EOI.
+            crate::ipc::irq::dispatch_irq(intid as usize);
             super::gic::eoi(intid);
         }
+    }
+}
+
+/// Block on a userspace fault handler when configured, otherwise retire the
+/// current thread so the exception does not immediately recur forever.
+fn finish_el0_fault(msg: &crate::ipc::Message) {
+    unsafe {
+        let scheduler = crate::sched::scheduler::scheduler();
+        let current = scheduler.current();
+
+        if !current.is_null() && !(*current).fault_handler.is_null() {
+            let fault_ep = &mut *((*current).fault_handler as *mut crate::ipc::Endpoint);
+            fault_ep.deliver_fault(current, msg);
+            scheduler.reschedule();
+            return;
+        } else if !current.is_null() {
+            (*current).state = crate::sched::thread::ThreadState::Inactive;
+            (*current).blocked_reason = None;
+            (*current).blocked_endpoint = core::ptr::null_mut();
+            (*current).blocked_notification = core::ptr::null_mut();
+            (*current).reply_tcb = core::ptr::null_mut();
+        }
+
+        scheduler.reschedule();
+    }
+
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+fn log_el0_sync_state(
+    prefix: &'static str,
+    frame: *const ExceptionFrame,
+    ec: Option<u64>,
+    esr: u64,
+    far: Option<u64>,
+) {
+    crate::serial_puts(prefix);
+    unsafe {
+        let f = &*frame;
+        let s = crate::SerialGuard::acquire();
+        if let Some(ec) = ec {
+            s.puts(" EC=");
+            s.hex(ec);
+        }
+        if let Some(far) = far {
+            s.puts(" FAR=");
+            s.hex(far);
+        }
+        s.puts(" ESR=");
+        s.hex(esr);
+        s.puts(" ELR=");
+        s.hex(f.elr_el1);
+        s.puts(" SP_EL0=");
+        s.hex(f.sp_el0);
+        s.puts(" X29=");
+        s.hex(f.regs[29]);
+        s.puts(" X30=");
+        s.hex(f.regs[30]);
+        s.puts("\n");
     }
 }
 
@@ -324,25 +452,73 @@ extern "C" fn el0_sync_handler(frame: *mut ExceptionFrame) {
             }
         }
         EC_DABT_LOWER => {
-            // Data abort from EL0 (user page fault).
+            // Data abort from EL0 (user page fault or device access error).
             let far: u64;
             // SAFETY: Reading FAR_EL1 is always safe from EL1.
             unsafe {
                 core::arch::asm!("mrs {}, FAR_EL1", out(reg) far, options(nomem, nostack));
             }
-            // SAFETY: frame was set up by SAVE_REGS and is valid.
-            let elr = unsafe { (*frame).elr_el1 };
-            // TODO: dispatch to VSpace fault handler for COW / demand paging
-            crate::serial_puts("[EXCEPTION] EL0 data abort: FAR=");
-            {
-                let s = crate::SerialGuard::acquire();
-                s.hex(far);
-                s.puts(" ESR=");
-                s.hex(esr);
-                s.puts(" ELR=");
-                s.hex(elr);
-                s.puts("\n");
+
+            let dfsc = esr & 0x3F;
+
+            // Synchronous External Abort from device MMIO read (e.g., PCI
+            // ECAM probe to non-existent device). Fixup the load instruction
+            // to return all-ones, mimicking x86 PCI behavior.
+            if dfsc == DFSC_SYNC_EXTERNAL_ABORT {
+                if try_fixup_device_load(frame) {
+                    return;
+                }
             }
+
+            // Kernel fast-path fault handling: COW, demand paging, stack growth.
+            // Construct arch-neutral PageFaultInfo from AArch64 ESR_EL1:
+            //   - Translation Fault (DFSC 0x04..0x07): page not present
+            //   - Permission Fault (DFSC 0x0D..0x0F): page present, wrong perms
+            //   - WnR (bit 6): write access
+            //   - Always user mode (EL0 data abort)
+            let fault = crate::mm::PageFaultInfo {
+                present: dfsc >= 0x0D && dfsc <= 0x0F,
+                write: esr & (1 << 6) != 0,
+                user: true,
+            };
+            let handled = unsafe {
+                let scheduler = crate::sched::scheduler::scheduler();
+                let current = scheduler.current();
+                if !current.is_null() && !(*current).vspace_root.is_null() {
+                    let vspace = &mut *(*current).vspace_root;
+
+                    let resolved =
+                        vspace.handle_cow_fault_pooled(far, &fault).unwrap_or(false)
+                        || vspace.handle_cow_fault(far, &fault).unwrap_or(false)
+                        || vspace.handle_demand_fault(far, &fault).unwrap_or(false)
+                        || vspace.handle_stack_growth_fault(
+                            far,
+                            &fault,
+                            (*frame).sp_el0,
+                            (*current).user_stack_top,
+                            (*current).user_stack_min,
+                        ).unwrap_or(false);
+
+                    if resolved
+                        && (*current).state
+                            == crate::sched::thread::ThreadState::Inactive
+                    {
+                        scheduler.reschedule();
+                    }
+                    resolved
+                } else {
+                    false
+                }
+            };
+            if handled {
+                return;
+            }
+
+            // Fast-path didn't resolve — fall through to IPC fault delivery.
+            log_el0_sync_state("[EXCEPTION] EL0 data abort:", frame, None, esr, Some(far));
+            let elr = unsafe { (*frame).elr_el1 };
+            let ipc_ec = fault.to_ipc_error_code(false);
+            finish_el0_fault(&crate::ipc::vm_fault_message(far, ipc_ec, elr, false));
         }
         EC_IABT_LOWER => {
             // Instruction abort from EL0.
@@ -351,37 +527,67 @@ extern "C" fn el0_sync_handler(frame: *mut ExceptionFrame) {
             unsafe {
                 core::arch::asm!("mrs {}, FAR_EL1", out(reg) far, options(nomem, nostack));
             }
-            // SAFETY: frame was set up by SAVE_REGS and is valid.
-            let elr = unsafe { (*frame).elr_el1 };
-            // TODO: deliver SIGSEGV or kill faulting thread
-            crate::serial_puts("[EXCEPTION] EL0 instruction abort: FAR=");
-            {
-                let s = crate::SerialGuard::acquire();
-                s.hex(far);
-                s.puts(" ESR=");
-                s.hex(esr);
-                s.puts(" ELR=");
-                s.hex(elr);
-                s.puts("\n");
+
+            let ifsc = esr & 0x3F;
+
+            // Kernel fast-path fault handling (mirrors data abort path).
+            // Instruction fetches are never writes; no stack growth check
+            // needed since instruction faults don't hit the stack guard page.
+            let fault = crate::mm::PageFaultInfo {
+                present: ifsc >= 0x0D && ifsc <= 0x0F,
+                write: false,
+                user: true,
+            };
+            let handled = unsafe {
+                let scheduler = crate::sched::scheduler::scheduler();
+                let current = scheduler.current();
+                if !current.is_null() && !(*current).vspace_root.is_null() {
+                    let vspace = &mut *(*current).vspace_root;
+
+                    let resolved =
+                        vspace.handle_cow_fault_pooled(far, &fault).unwrap_or(false)
+                        || vspace.handle_cow_fault(far, &fault).unwrap_or(false)
+                        || vspace.handle_demand_fault(far, &fault).unwrap_or(false);
+
+                    if resolved
+                        && (*current).state
+                            == crate::sched::thread::ThreadState::Inactive
+                    {
+                        scheduler.reschedule();
+                    }
+                    resolved
+                } else {
+                    false
+                }
+            };
+            if handled {
+                return;
             }
+
+            // Fast-path didn't resolve — fall through to IPC fault delivery.
+            log_el0_sync_state("[EXCEPTION] EL0 instruction abort:", frame, None, esr, Some(far));
+            let elr = unsafe { (*frame).elr_el1 };
+            let ipc_ec = fault.to_ipc_error_code(true);
+            finish_el0_fault(&crate::ipc::vm_fault_message(far, ipc_ec, elr, true));
+        }
+        EC_PCALIGN => {
+            log_el0_sync_state("[EXCEPTION] EL0 PC alignment fault:", frame, Some(ec), esr, None);
+            let f = unsafe { &*frame };
+            finish_el0_fault(&crate::ipc::user_exception_message(ec, esr, f.elr_el1, f.sp_el0));
+        }
+        EC_SPALIGN => {
+            log_el0_sync_state("[EXCEPTION] EL0 SP alignment fault:", frame, Some(ec), esr, None);
+            let f = unsafe { &*frame };
+            finish_el0_fault(&crate::ipc::user_exception_message(ec, esr, f.elr_el1, f.sp_el0));
         }
         EC_FP_TRAP => {
             // FPU/NEON access trap — lazy context switching.
             super::fpu::handle_trap();
         }
         _ => {
-            // SAFETY: frame was set up by SAVE_REGS and is valid.
-            let elr = unsafe { (*frame).elr_el1 };
-            crate::serial_puts("[EXCEPTION] Unknown EL0 sync: EC=");
-            {
-                let s = crate::SerialGuard::acquire();
-                s.hex(ec);
-                s.puts(" ESR=");
-                s.hex(esr);
-                s.puts(" ELR=");
-                s.hex(elr);
-                s.puts("\n");
-            }
+            log_el0_sync_state("[EXCEPTION] Unknown EL0 sync:", frame, Some(ec), esr, None);
+            let f = unsafe { &*frame };
+            finish_el0_fault(&crate::ipc::user_exception_message(ec, esr, f.elr_el1, f.sp_el0));
         }
     }
 }
@@ -421,4 +627,83 @@ pub fn init() {
             options(nomem, nostack),
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Synchronous External Abort fixup
+// ---------------------------------------------------------------------------
+
+/// DFSC value: Synchronous External Abort, not on translation table walk.
+const DFSC_SYNC_EXTERNAL_ABORT: u64 = 0x10;
+
+
+/// Attempt to fixup a Synchronous External Abort from EL0.
+///
+/// When a user-mode load from device-mapped memory triggers an external
+/// abort (e.g., PCI ECAM probe to a non-existent device), this function
+/// decodes the faulting instruction and writes all-ones to the destination
+/// register — mimicking the x86 PCI convention of returning 0xFFFF_FFFF
+/// for non-existent devices.
+///
+/// Returns `true` if the fixup succeeded and ELR was advanced past the
+/// faulting instruction. Returns `false` if the instruction could not be
+/// decoded, in which case the caller should fall through to fault delivery.
+fn try_fixup_device_load(frame: *mut ExceptionFrame) -> bool {
+    // SAFETY: frame was set up by SAVE_REGS and is a valid mutable pointer.
+    let f = unsafe { &mut *frame };
+    let elr = f.elr_el1;
+
+    // Read the faulting instruction from user text via the current TTBR0
+    // mapping. ELR_EL1 holds the user VA of the faulting instruction.
+    // SAFETY: The user page tables are still active (we haven't switched
+    // TTBR0 during exception entry). The instruction page must be mapped
+    // readable if the CPU fetched and executed it.
+    let instr = unsafe { core::ptr::read_volatile(elr as *const u32) };
+
+    // --- LDR (immediate, unsigned offset) ---
+    // Encoding: size(2) | 111 | V(1) | 01 | opc(2) | imm12(12) | Rn(5) | Rt(5)
+    // LDR Wt: size=10, V=0, opc=01 → top 10 bits = 10_111_0_01_01 = 0x2E5
+    // LDR Xt: size=11, V=0, opc=01 → top 10 bits = 11_111_0_01_01 = 0x3E5
+    let top10 = instr >> 22;
+    if top10 == 0x2E5 || top10 == 0x3E5 {
+        let rt = (instr & 0x1F) as usize;
+        let is_64 = top10 == 0x3E5;
+        if rt < 31 {
+            f.regs[rt] = if is_64 { u64::MAX } else { 0xFFFF_FFFF };
+        }
+        // XZR (rt=31) is the zero register — no writeback needed.
+        f.elr_el1 = elr.wrapping_add(4);
+        return true;
+    }
+
+    // --- LDUR (unscaled immediate) ---
+    // Encoding: size(2) | 111000 | opc(2) | 0 | imm9(9) | 00 | Rn(5) | Rt(5)
+    // LDUR Wt: size=10, opc=01 → top 11 bits = 10_111000_01_0 = 0x5C2
+    // LDUR Xt: size=11, opc=01 → top 11 bits = 11_111000_01_0 = 0x7C2
+    let top11 = instr >> 21;
+    if (top11 == 0x5C2 || top11 == 0x7C2) && ((instr >> 10) & 3) == 0 {
+        let rt = (instr & 0x1F) as usize;
+        let is_64 = top11 == 0x7C2;
+        if rt < 31 {
+            f.regs[rt] = if is_64 { u64::MAX } else { 0xFFFF_FFFF };
+        }
+        f.elr_el1 = elr.wrapping_add(4);
+        return true;
+    }
+
+    // --- LDR (register) ---
+    // Encoding: size(2) | 111000 | opc(2) | 1 | Rm(5) | option(3) | S(1) | 10 | Rn(5) | Rt(5)
+    // LDR Wt: size=10, opc=01 → top 11 bits = 10_111000_01_1 = 0x5C3
+    // LDR Xt: size=11, opc=01 → top 11 bits = 11_111000_01_1 = 0x7C3
+    if (top11 == 0x5C3 || top11 == 0x7C3) && ((instr >> 10) & 3) == 2 {
+        let rt = (instr & 0x1F) as usize;
+        let is_64 = top11 == 0x7C3;
+        if rt < 31 {
+            f.regs[rt] = if is_64 { u64::MAX } else { 0xFFFF_FFFF };
+        }
+        f.elr_el1 = elr.wrapping_add(4);
+        return true;
+    }
+
+    false
 }

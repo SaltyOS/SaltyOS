@@ -14,7 +14,7 @@ pub use thread::Tcb;
 
 use crate::arch;
 use crate::arch::MAX_CPUS;
-use crate::mm::{alloc_frame, phys_to_virt, PAGE_SIZE};
+use crate::mm::{pmm_alloc, frame::FrameOwner, frame::KernelMetaKind, phys_to_virt, PAGE_SIZE};
 
 /// Idle thread stack size
 const IDLE_STACK_SIZE: usize = PAGE_SIZE;
@@ -107,9 +107,11 @@ pub fn init() {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            (*idle_tcb).context.elr_el1 = idle_thread as *const () as u64;
-            (*idle_tcb).context.sp = stack_top;
-            (*idle_tcb).context.spsr_el1 = 0x305;
+            crate::arch::aarch64::context::init_kernel_thread_context(
+                &mut (*idle_tcb).context,
+                stack_top,
+                idle_thread as *const () as u64,
+            );
         }
         (*idle_tcb).kernel_stack_top = stack_top;
     }
@@ -155,9 +157,11 @@ pub fn init_cpu(cpu_id: usize) {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            (*idle_tcb).context.elr_el1 = idle_thread as *const () as u64;
-            (*idle_tcb).context.sp = stack_top;
-            (*idle_tcb).context.spsr_el1 = 0x305;
+            crate::arch::aarch64::context::init_kernel_thread_context(
+                &mut (*idle_tcb).context,
+                stack_top,
+                idle_thread as *const () as u64,
+            );
         }
         (*idle_tcb).kernel_stack_top = stack_top;
     }
@@ -183,7 +187,7 @@ unsafe fn allocate_idle_tcb(cpu_id: usize) -> *mut Tcb {
 ///
 /// Allocates a physical frame and returns its virtual address.
 unsafe fn allocate_idle_stack() -> u64 {
-    let phys = match alloc_frame() {
+    let phys = match pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::KernelStack }) {
         Some(p) => p,
         None => {
             // Halt on allocation failure - no memory available

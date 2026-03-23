@@ -2,6 +2,8 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 pub mod boot;
 pub mod context;
 pub mod cpu;
@@ -144,21 +146,26 @@ pub fn write_fs_base(val: u64) {
 
 /// Generate a stack canary value
 pub fn generate_stack_canary() -> u64 {
-    // Try RNDR (ARMv8.5-RNG) first, fall back to CNTPCT_EL0
-    let val: u64;
-    let ok: u64;
-    // SAFETY: mrs RNDR may fail with NZCV flags set
-    unsafe {
-        core::arch::asm!(
-            "mrs {val}, S3_3_C2_C4_0",  // RNDR
-            "cset {ok}, ne",
-            val = out(reg) val,
-            ok = out(reg) ok,
-            options(nomem, nostack),
-        );
-    }
-    if ok != 0 {
-        return val;
+    // Try RNDR (ARMv8.5-RNG) first when advertised by the CPU. On
+    // systems without FEAT_RNG, executing RNDR itself raises an
+    // undefined-instruction exception instead of returning failure.
+    if cpuid::has_rdrand() {
+        let val: u64;
+        let ok: u64;
+        // SAFETY: FEAT_RNG support has been checked above, so RNDR is a
+        // valid system register access here. NZCV flags report success.
+        unsafe {
+            core::arch::asm!(
+                "mrs {val}, S3_3_C2_C4_0",  // RNDR
+                "cset {ok}, ne",
+                val = out(reg) val,
+                ok = out(reg) ok,
+                options(nomem, nostack),
+            );
+        }
+        if ok != 0 {
+            return val;
+        }
     }
     // Fallback: CNTPCT_EL0 (not cryptographically random, but usable)
     let fallback: u64;
@@ -174,12 +181,13 @@ pub fn set_per_cpu_canary(_canary: u64) {
     // TODO: Phase 3 — store in TPIDR_EL1
 }
 
-/// IPI kind enumeration
+/// IPI kind enumeration (must match x86_64 variants)
 #[derive(Debug, Clone, Copy)]
 pub enum IpiKind {
-    Reschedule,
-    TlbShootdown,
-    Halt,
+    VSpaceTeardown = 0,
+    Reschedule = 1,
+    TlbShootdown = 8,
+    TlbShootdownAll = 9,
 }
 
 /// Get timer tick count (CNTPCT_EL0)
@@ -213,17 +221,115 @@ pub fn send_ipi(_target_cpu: usize, _kind: IpiKind) {
     // TODO: Phase 4 — GICv3 SGI
 }
 
-/// Set TLB shootdown address (stub for Phase 1)
-pub fn set_tlb_shootdown_addr(_addr: usize) {
-    // TODO: Phase 4 — SMP TLB shootdown
+/// Set TLB shootdown address (stub — SMP not yet implemented)
+pub fn set_tlb_shootdown_addr(_cpu_id: usize, _addr: u64) {
+    // TODO: SMP TLB shootdown via GICv3 SGI
 }
 
-/// IOAPIC unmask (not applicable on aarch64)
-pub fn ioapic_unmask(_irq: u32, _cpu: u8) {}
-/// IOAPIC unmask level-triggered (not applicable on aarch64)
-pub fn ioapic_unmask_level(_irq: u32, _cpu: u8) {}
-/// IOAPIC mask (not applicable on aarch64)
-pub fn ioapic_mask(_irq: u32) {}
+/// Enable a GIC interrupt (equivalent of IOAPIC unmask on x86_64).
+pub fn ioapic_unmask(irq: u32) {
+    gic::enable_irq(irq);
+}
+/// Enable a GIC interrupt (level-triggered — same as edge on GIC).
+pub fn ioapic_unmask_level(irq: u32) {
+    gic::enable_irq(irq);
+}
+/// Disable a GIC interrupt (equivalent of IOAPIC mask on x86_64).
+pub fn ioapic_mask(irq: u32) {
+    gic::disable_irq(irq);
+}
+
+// ---------------------------------------------------------------------------
+// PCI I/O port emulation via MMIO (QEMU virt PCI I/O window)
+// ---------------------------------------------------------------------------
+
+/// QEMU virt PCI I/O window physical address (64 KB).
+const PCI_IO_PHYS_BASE: u64 = 0x3eff_0000;
+/// Number of 4 KB pages in the PCI I/O window.
+const PCI_IO_PAGES: u64 = 16;
+
+/// Virtual base of the mapped PCI I/O window (set during pci_io_init).
+static mut PCI_IO_VIRT_BASE: u64 = 0;
+
+/// Map the PCI I/O window into kernel virtual memory during boot.
+fn pci_io_init() {
+    let mut virt = 0u64;
+    for i in 0..PCI_IO_PAGES {
+        // SAFETY: Boot-time single-threaded, paging::init() has run.
+        let v = unsafe { paging::map_mmio_page(PCI_IO_PHYS_BASE + i * 4096) };
+        if i == 0 {
+            virt = v;
+        }
+    }
+    // SAFETY: Single-threaded boot context, no concurrent access.
+    unsafe { *(&raw mut PCI_IO_VIRT_BASE) = virt; }
+}
+
+/// Read 8 bits from PCI I/O port `port`.
+///
+/// # Safety
+/// Caller must ensure `port` is within the mapped I/O window.
+#[inline]
+pub unsafe fn pci_io_read8(port: u16) -> u8 {
+    let addr = unsafe { *(&raw const PCI_IO_VIRT_BASE) } + port as u64;
+    // SAFETY: Address is within mapped PCI I/O window, volatile for device semantics.
+    unsafe { core::ptr::read_volatile(addr as *const u8) }
+}
+
+/// Write 8 bits to PCI I/O port `port`.
+///
+/// # Safety
+/// Caller must ensure `port` is within the mapped I/O window.
+#[inline]
+pub unsafe fn pci_io_write8(port: u16, val: u8) {
+    let addr = unsafe { *(&raw const PCI_IO_VIRT_BASE) } + port as u64;
+    // SAFETY: Address is within mapped PCI I/O window, volatile for device semantics.
+    unsafe { core::ptr::write_volatile(addr as *mut u8, val); }
+}
+
+/// Read 16 bits from PCI I/O port `port`.
+///
+/// # Safety
+/// Caller must ensure `port` is within the mapped I/O window.
+#[inline]
+pub unsafe fn pci_io_read16(port: u16) -> u16 {
+    let addr = unsafe { *(&raw const PCI_IO_VIRT_BASE) } + port as u64;
+    // SAFETY: Address is within mapped PCI I/O window, volatile for device semantics.
+    unsafe { core::ptr::read_volatile(addr as *const u16) }
+}
+
+/// Write 16 bits to PCI I/O port `port`.
+///
+/// # Safety
+/// Caller must ensure `port` is within the mapped I/O window.
+#[inline]
+pub unsafe fn pci_io_write16(port: u16, val: u16) {
+    let addr = unsafe { *(&raw const PCI_IO_VIRT_BASE) } + port as u64;
+    // SAFETY: Address is within mapped PCI I/O window, volatile for device semantics.
+    unsafe { core::ptr::write_volatile(addr as *mut u16, val); }
+}
+
+/// Read 32 bits from PCI I/O port `port`.
+///
+/// # Safety
+/// Caller must ensure `port` is within the mapped I/O window.
+#[inline]
+pub unsafe fn pci_io_read32(port: u16) -> u32 {
+    let addr = unsafe { *(&raw const PCI_IO_VIRT_BASE) } + port as u64;
+    // SAFETY: Address is within mapped PCI I/O window, volatile for device semantics.
+    unsafe { core::ptr::read_volatile(addr as *const u32) }
+}
+
+/// Write 32 bits to PCI I/O port `port`.
+///
+/// # Safety
+/// Caller must ensure `port` is within the mapped I/O window.
+#[inline]
+pub unsafe fn pci_io_write32(port: u16, val: u32) {
+    let addr = unsafe { *(&raw const PCI_IO_VIRT_BASE) } + port as u64;
+    // SAFETY: Address is within mapped PCI I/O window, volatile for device semantics.
+    unsafe { core::ptr::write_volatile(addr as *mut u32, val); }
+}
 
 /// Context switch between threads.
 ///
@@ -259,11 +365,11 @@ pub unsafe extern "C" fn usermode_trampoline() -> ! {
 /// Init order:
 /// 1. PL011 UART (serial output)
 /// 2. Exception vector table (VBAR_EL1)
-/// 3. GICv3 (distributor + BSP redistributor + CPU interface)
-/// 4. Generic Timer (configure, but do not start yet)
-/// 5. Memory management (frame allocator)
-/// 6. Paging (direct physical map)
-/// 7. GIC MMIO remap to direct map
+/// 3. Memory management (frame allocator)
+/// 4. Paging (direct physical map + sparse MMIO windows)
+/// 5. UART/GIC MMIO remap to higher-half kernel addresses
+/// 6. GICv3 (distributor + BSP redistributor + CPU interface)
+/// 7. Generic Timer (configure, but do not start yet)
 /// 8. Frame bitmap remap + per-frame arrays
 pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // Initialize PL011 UART for serial output
@@ -271,12 +377,6 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
 
     // Install exception vector table (must be early so any faults are caught)
     exceptions::init();
-
-    // Initialize GICv3 (uses identity-mapped MMIO during early boot)
-    gic::init();
-
-    // Configure the generic timer (reads frequency, does not start ticking)
-    timer::init();
 
     // Initialize memory management (frame allocator needed by paging::init())
     if let Some(info) = boot_info {
@@ -286,8 +386,18 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // Initialize paging (direct physical map)
     paging::init();
 
-    // Remap GIC MMIO from identity-map to direct-map addresses
+    // Remap always-on MMIO from boot identity addresses to kernel mappings.
+    pl011::remap_to_direct_map();
     gic::remap_to_direct_map();
+
+    // Map QEMU virt PCI I/O window so IoPort operations can use MMIO.
+    pci_io_init();
+
+    // Initialize GICv3 after higher-half MMIO mappings exist.
+    gic::init();
+
+    // Configure the generic timer (reads frequency, does not start ticking)
+    timer::init();
 
     // Switch frame bitmap pointer from identity map (TTBR0) to direct
     // physical map (TTBR1). Must happen after paging::init() creates the
@@ -296,6 +406,9 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
 
     // Allocate per-frame tracking arrays now that direct map covers all RAM.
     crate::mm::init_per_frame_arrays();
+
+    // Enable PAN runtime tracking before the first EL0 transition.
+    smap::init();
 
     // Initialize FPU lazy switching (trap NEON/FP access from EL0)
     fpu::init();
@@ -345,6 +458,11 @@ pub mod cpuid {
 
 // SMAP-equivalent module: Privileged Access Never (PAN) on aarch64
 pub mod smap {
+    use super::{AtomicBool, Ordering};
+
+    /// True once FEAT_PAN has been detected and enabled for runtime use.
+    static PAN_ACTIVE: AtomicBool = AtomicBool::new(false);
+
     /// Initialize PAN if supported by the processor.
     ///
     /// Checks ID_AA64MMFR1_EL1.PAN (bits 23:20) and clears SCTLR_EL1.SPAN
@@ -369,6 +487,9 @@ pub mod smap {
                 core::arch::asm!("msr SCTLR_EL1, {}", in(reg) sctlr, options(nomem, nostack));
                 core::arch::asm!("isb", options(nomem, nostack));
             }
+            PAN_ACTIVE.store(true, Ordering::Release);
+        } else {
+            PAN_ACTIVE.store(false, Ordering::Release);
         }
     }
 
@@ -381,8 +502,11 @@ pub mod smap {
         pub fn new() -> Self {
             // SAFETY: Clearing PAN temporarily allows EL1 to access
             // user-mapped pages. The guard's Drop impl will re-enable PAN.
-            unsafe {
-                core::arch::asm!("msr PAN, #0", options(nomem, nostack));
+            if PAN_ACTIVE.load(Ordering::Acquire) {
+                unsafe {
+                    // Clear PAN: MSR PAN, #0 → encoding 0xD500409F
+                    core::arch::asm!(".inst 0xD500409F", options(nomem, nostack));
+                }
             }
             UserAccessGuard
         }
@@ -392,8 +516,11 @@ pub mod smap {
         fn drop(&mut self) {
             // SAFETY: Setting PAN blocks EL1 access to user-mapped pages,
             // restoring the default protection.
-            unsafe {
-                core::arch::asm!("msr PAN, #1", options(nomem, nostack));
+            if PAN_ACTIVE.load(Ordering::Acquire) {
+                unsafe {
+                    // Set PAN: MSR PAN, #1 → encoding 0xD500419F
+                    core::arch::asm!(".inst 0xD500419F", options(nomem, nostack));
+                }
             }
         }
     }

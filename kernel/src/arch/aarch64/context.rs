@@ -55,6 +55,68 @@ unsafe extern "C" {
     fn aarch64_context_switch(old_sp: *mut u64, new_sp: u64);
 }
 
+/// Size of the callee-saved register frame used by `aarch64_context_switch`.
+pub const SWITCH_FRAME_SIZE: u64 = 96;
+const SWITCH_FRAME_LR_OFFSET: u64 = 88;
+
+#[inline]
+unsafe fn init_switch_frame(frame_base: u64, resume_pc: u64) {
+    let frame = frame_base as *mut u8;
+    // SAFETY: Caller guarantees `[frame_base, frame_base + SWITCH_FRAME_SIZE)`
+    // is writable kernel stack memory for this thread.
+    unsafe {
+        core::ptr::write_bytes(frame, 0, SWITCH_FRAME_SIZE as usize);
+        *((frame_base + SWITCH_FRAME_LR_OFFSET) as *mut u64) = resume_pc;
+    }
+}
+
+/// Initialize a kernel thread so the first context switch resumes at `entry`.
+///
+/// `kernel_stack_top` must point one byte past a writable kernel stack.
+pub unsafe fn init_kernel_thread_context(
+    context: &mut ThreadContext,
+    kernel_stack_top: u64,
+    entry: u64,
+) {
+    let frame_base = kernel_stack_top - SWITCH_FRAME_SIZE;
+    // SAFETY: Caller provides a valid writable kernel stack for the new thread.
+    unsafe {
+        init_switch_frame(frame_base, entry);
+    }
+    *context = ThreadContext::empty();
+    context.sp = frame_base;
+    context.elr_el1 = entry;
+}
+
+/// Initialize a fresh user thread for first dispatch through the trampoline.
+///
+/// `kernel_stack_top` becomes the EL1 stack after the switch frame is popped.
+pub unsafe fn init_user_thread_context(
+    context: &mut ThreadContext,
+    kernel_stack_top: u64,
+    user_entry: u64,
+    user_sp: u64,
+    spsr: u64,
+) {
+    let frame_base = kernel_stack_top - SWITCH_FRAME_SIZE;
+    // SAFETY: Caller provides a valid writable kernel stack for the new thread.
+    unsafe {
+        init_switch_frame(frame_base, usermode_trampoline as usize as u64);
+    }
+    *context = ThreadContext::empty();
+    context.sp = frame_base;
+    context.elr_el1 = user_entry;
+    context.spsr_el1 = spsr;
+    context.x[19] = user_sp;
+}
+
+/// Return the kernel PC that `context_switch` will `ret` to for this context.
+pub unsafe fn resume_pc(context: &ThreadContext) -> u64 {
+    // SAFETY: `context.sp` always points at the saved switch frame for an
+    // inactive/ready thread.
+    unsafe { *((context.sp + SWITCH_FRAME_LR_OFFSET) as *const u64) }
+}
+
 /// Perform a context switch between two threads.
 ///
 /// Saves callee-saved registers and SP into `old_context.sp`, restores from
@@ -116,18 +178,21 @@ pub unsafe extern "C" fn usermode_trampoline() -> ! {
         let user_sp = tcb.context.x[19];  // User SP_EL0 (stored in x19 slot)
         let spsr = tcb.context.spsr_el1;
 
-        // Load user page table if a VSpace is configured
+        // Load user page table if a VSpace is configured.
+        // On AArch64, TTBR0_EL1 must include the ASID in bits [63:48].
+        // prepare_switch_target_full() already called switch_to() which set
+        // the correct TTBR0 with ASID, but the trampoline must also set it
+        // so that threads created after boot (e.g. fork children) get the
+        // correct mapping.  Using root() alone would overwrite the ASID to 0,
+        // causing stale TLB hits from ASID 0 (init task) that map the
+        // child's virtual addresses to wrong physical pages.
         if !tcb.vspace_root.is_null() {
             let vspace = &*tcb.vspace_root;
-            let ttbr0 = vspace.root();
-            // SAFETY: Writing TTBR0_EL1 switches the EL0 page table.
-            // ISB ensures the TLB sees the new translation before eret.
-            core::arch::asm!(
-                "msr TTBR0_EL1, {ttbr0}",
-                "isb",
-                ttbr0 = in(reg) ttbr0,
-                options(nomem, nostack),
-            );
+            let ttbr0 = vspace.ensure_asid() | vspace.root();
+            // SAFETY: The scheduler has already selected this thread's VSpace.
+            // Reuse the common helper so first-entry trampolines get the same
+            // TLB semantics as normal AArch64 VSpace switches.
+            crate::arch::paging::write_cr3(ttbr0);
         }
 
         // SAFETY: Setting ELR_EL1, SPSR_EL1, and SP_EL0 configures the

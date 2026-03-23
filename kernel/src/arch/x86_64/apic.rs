@@ -894,7 +894,7 @@ pub unsafe fn start_aps(cpu_descriptors: &[super::acpi::CpuDescriptor], cpu_coun
             const STACK_PAGES: usize = 4;
             const STACK_SIZE: u64 = STACK_PAGES as u64 * 4096;
 
-            let stack_phys = crate::mm::alloc_contiguous_frames(STACK_PAGES)
+            let stack_phys = crate::mm::pmm_alloc_contiguous(STACK_PAGES)
                 .expect("[SMP] Failed to allocate AP kernel stack");
             let stack_top = crate::mm::phys_to_virt(stack_phys) + STACK_SIZE;
 

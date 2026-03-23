@@ -24,6 +24,9 @@ const GICR_PHYS_BASE: u64 = 0x080A_0000;
 /// Size of one redistributor region (RD_base + SGI_base).
 const GICR_STRIDE: u64 = 0x2_0000; // 128 KB
 
+/// GICD registers touched during boot fit in the first 4 KB page.
+const GICD_MMIO_SIZE: u64 = 0x1000;
+
 // ---------------------------------------------------------------------------
 // GICD register offsets
 // ---------------------------------------------------------------------------
@@ -260,15 +263,18 @@ fn gicr_base(cpu_id: usize) -> u64 {
 ///
 /// Must be called once during single-threaded boot.
 pub fn init() {
-    // Resolve virtual addresses.  During early boot (before paging::init),
-    // the identity map makes phys == virt.  We store the addresses for
-    // later use; after the direct map is up we will update them.
+    // If the paging path has not remapped the GIC yet, fall back to the
+    // boot-time identity mapping.
     //
-    // SAFETY: Single-threaded boot context.  These statics are written
-    // exactly once and only read afterwards.
+    // SAFETY: Single-threaded boot context. These statics are initialized once
+    // before use and only updated during early boot remap.
     unsafe {
-        ptr::write_volatile(ptr::addr_of_mut!(GICD_BASE), GICD_PHYS_BASE);
-        ptr::write_volatile(ptr::addr_of_mut!(GICR_BASE_START), GICR_PHYS_BASE);
+        if ptr::read_volatile(ptr::addr_of!(GICD_BASE)) == 0 {
+            ptr::write_volatile(ptr::addr_of_mut!(GICD_BASE), GICD_PHYS_BASE);
+        }
+        if ptr::read_volatile(ptr::addr_of!(GICR_BASE_START)) == 0 {
+            ptr::write_volatile(ptr::addr_of_mut!(GICR_BASE_START), GICR_PHYS_BASE);
+        }
     }
 
     let gicd = gicd_base();
@@ -449,6 +455,32 @@ pub fn enable_irq(intid: u32) {
     }
 }
 
+/// Disable a specific interrupt by INTID.
+///
+/// For SGIs/PPIs (0-31), writes to the redistributor ICENABLER0.
+/// For SPIs (32-1019), writes to the distributor ICENABLER.
+pub fn disable_irq(intid: u32) {
+    let reg_index = (intid / 32) as u64;
+    let bit = 1u32 << (intid % 32);
+
+    if intid < 32 {
+        // SGI/PPI — use the current CPU's redistributor.
+        let cpu_id = super::current_cpu();
+        let gicr = gicr_base(cpu_id);
+        // SAFETY: GICR MMIO is mapped.
+        unsafe {
+            mmio_write32(gicr + GICR_SGI_BASE_OFFSET + 0x0180, bit);
+        }
+    } else {
+        // SPI — use the distributor.
+        let gicd = gicd_base();
+        // SAFETY: GICD MMIO is mapped.
+        unsafe {
+            mmio_write32(gicd + GICD_ICENABLER + reg_index * 4, bit);
+        }
+    }
+}
+
 /// Send a Software Generated Interrupt (SGI) to a target CPU.
 ///
 /// Uses ICC_SGI1R_EL1 with the target affinity and INTID.
@@ -477,6 +509,22 @@ pub fn send_sgi(target_cpu: usize, intid: u32) {
 ///
 /// Must be called after `paging::init()` establishes the direct map.
 pub fn remap_to_direct_map() {
+    let mut offset = 0;
+    while offset < GICD_MMIO_SIZE {
+        unsafe {
+            super::paging::map_mmio_page(GICD_PHYS_BASE + offset);
+        }
+        offset += crate::mm::PAGE_SIZE as u64;
+    }
+
+    offset = 0;
+    while offset < GICR_STRIDE {
+        unsafe {
+            super::paging::map_mmio_page(GICR_PHYS_BASE + offset);
+        }
+        offset += crate::mm::PAGE_SIZE as u64;
+    }
+
     let gicd_virt = crate::mm::phys_to_virt(GICD_PHYS_BASE);
     let gicr_virt = crate::mm::phys_to_virt(GICR_PHYS_BASE);
 

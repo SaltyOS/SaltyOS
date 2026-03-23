@@ -140,12 +140,12 @@ pub unsafe fn init_slots(num_slots: usize) {
     let bitmap_pages = (bitmap_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
 
     // Allocate physical frames for SLOTS array
-    let slots_phys = mm::alloc_contiguous_frames(slots_pages)
+    let slots_phys = mm::pmm_alloc_contiguous(slots_pages)
         .expect("[CAP] SLOTS allocation failed");
     let slots_virt = mm::phys_to_virt(slots_phys) as *mut CapSlotStorage;
 
     // Allocate physical frames for bitmap
-    let bitmap_phys = mm::alloc_contiguous_frames(bitmap_pages)
+    let bitmap_phys = mm::pmm_alloc_contiguous(bitmap_pages)
         .expect("[CAP] SLOT_BITMAP allocation failed");
     let bitmap_virt = mm::phys_to_virt(bitmap_phys) as *mut u64;
 

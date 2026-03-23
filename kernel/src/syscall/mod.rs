@@ -1214,12 +1214,19 @@ fn syscall_invoke_inner(
                 let current = scheduler.current();
                 if !current.is_null() {
                     let buf = (*current).ipc_buffer;
-                    if buf != 0 {
-                        let ipc_buf = buf as *mut crate::ipc::IpcBuffer;
-                        (*ipc_buf).msg[0] = guard;
-                        (*ipc_buf).msg[1] = guard_bits;
-                        (*ipc_buf).msg[2] = size_bits;
-                        (*ipc_buf).msg[3] = num_slots;
+                    if buf != 0
+                        && validate_ipc_buffer_addr(buf).is_ok()
+                        && !(*current).vspace_root.is_null()
+                    {
+                        let vs = &*(*current).vspace_root;
+                        if vs.resolve_page(buf).is_some() {
+                            let _guard = crate::arch::smap::UserAccessGuard::new();
+                            let ipc_buf = buf as *mut crate::ipc::IpcBuffer;
+                            (*ipc_buf).msg[0] = guard;
+                            (*ipc_buf).msg[1] = guard_bits;
+                            (*ipc_buf).msg[2] = size_bits;
+                            (*ipc_buf).msg[3] = num_slots;
+                        }
                     }
                 }
                 SyscallResult::ok(0)
@@ -1360,6 +1367,25 @@ fn syscall_invoke_inner(
             // VSPACE_PROTECT_RANGE: arg0 = virt_addr, arg1 = count, arg2 = flags_bits
             syscall_vspace_protect_range(&cap, arg0, arg1, arg2)
         }
+        (ObjectType::VSpace, 0x97) => {
+            // VSPACE_MAP_MO: arg0 = mo_cap_ptr, arg1 = vaddr, arg2 = mo_offset, arg3 = count_and_flags
+            syscall_vspace_map_mo(&cap, arg0, arg1, arg2, arg3)
+        }
+        (ObjectType::VSpace, 0x98) => {
+            // VSPACE_UNMAP_MO: arg0 = vaddr, arg1 = count
+            syscall_vspace_unmap_mo(&cap, arg0, arg1)
+        }
+        (ObjectType::VSpace, 0x99) => {
+            // VSPACE_SHARE_RO_PAGE: arg0 = src_vaddr,
+            //   arg1 = dst_vspace_cap_ptr, arg2 = dst_vaddr
+            syscall_vspace_share_ro_page(&cap, arg0, arg1, arg2)
+        }
+        (ObjectType::VSpace, 0x9A) => {
+            // VSPACE_FORK_RANGE: cap = parent VSpace
+            // arg0 = child_vspace_cap, arg1 = child_mo_cap,
+            // arg2 = va_start, arg3 = (page_count<<32)|mo_offset
+            syscall_vspace_fork_range(&cap, arg0, arg1, arg2, arg3)
+        }
 
         // SchedContext operations
         (ObjectType::SchedContext, 0x30) => {
@@ -1439,6 +1465,36 @@ fn syscall_invoke_inner(
         (ObjectType::IoPort, 0x76) => {
             // IOPORT_CONFIGURE: arg0 = base_port, arg1 = num_ports
             syscall_ioport_configure(&cap, arg0, arg1)
+        }
+
+        // MemoryObject operations
+        (ObjectType::MemoryObject, 0x90) => {
+            // MO_COMMIT: arg0 = offset, arg1 = count
+            syscall_mo_commit(&cap, arg0, arg1)
+        }
+        (ObjectType::MemoryObject, 0x91) => {
+            // MO_DECOMMIT: arg0 = offset, arg1 = count
+            syscall_mo_decommit(&cap, arg0, arg1)
+        }
+        (ObjectType::MemoryObject, 0x92) => {
+            // MO_GET_SIZE
+            syscall_mo_get_size(&cap)
+        }
+        (ObjectType::MemoryObject, 0x93) => {
+            // MO_CLONE: arg0 = dest_slot, arg1 = flags
+            syscall_mo_clone(&cap, arg0, arg1)
+        }
+        (ObjectType::MemoryObject, 0x94) => {
+            // MO_RESIZE: arg0 = new_page_count
+            syscall_mo_resize(&cap, arg0)
+        }
+        (ObjectType::MemoryObject, 0x95) => {
+            // MO_READ: arg0 = offset, arg1 = count
+            syscall_mo_read(&cap, arg0, arg1)
+        }
+        (ObjectType::MemoryObject, 0x96) => {
+            // MO_WRITE: arg0 = offset, arg1 = count
+            syscall_mo_write(&cap, arg0, arg1)
         }
 
         _ => SyscallResult::err(SyscallError::InvalidOperation),
@@ -1673,8 +1729,8 @@ fn syscall_tcb_configure(
     // with context switching, VSpace operations, capability chains).
     const KSTACK_PAGES: usize = 4;
 
-    // alloc_contiguous_frames has its own MM_LOCK — do BEFORE acquiring per-TCB lock
-    let kstack_phys = match crate::mm::alloc_contiguous_frames(KSTACK_PAGES) {
+    // pmm_alloc_contiguous has its own MM_LOCK — do BEFORE acquiring per-TCB lock
+    let kstack_phys = match crate::mm::pmm_alloc_contiguous(KSTACK_PAGES) {
         Some(f) => f,
         None => return SyscallResult::err(SyscallError::OutOfMemory),
     };
@@ -1700,24 +1756,30 @@ fn syscall_tcb_configure(
         tcb.stack_canary = crate::arch::generate_stack_canary();
 
         if !tcb.vspace_root.is_null() {
-            let vspace = &*tcb.vspace_root;
+            #[cfg(target_arch = "x86_64")]
+            let vspace_root = tcb.vspace_root;
             tcb.tcb_unlock();
             restore_irq(irq);
 
-            // Allocate trampoline stack outside lock
-            let tramp_stack_phys = match crate::mm::alloc_frame() {
-                Some(f) => f,
-                None => return SyscallResult::err(SyscallError::OutOfMemory),
+            #[cfg(target_arch = "x86_64")]
+            let tramp_stack_top = {
+                // Allocate trampoline stack outside lock
+                let tramp_stack_phys = match crate::mm::pmm_alloc(&crate::mm::frame::FrameOwner::KernelPrivate { subkind: crate::mm::frame::KernelMetaKind::KernelStack }) {
+                    Some(f) => f,
+                    None => return SyscallResult::err(SyscallError::OutOfMemory),
+                };
+                let tramp_stack_virt = crate::mm::phys_to_virt(tramp_stack_phys);
+                let tramp_stack_top = tramp_stack_virt + crate::mm::PAGE_SIZE as u64;
+                core::ptr::write_bytes(tramp_stack_virt as *mut u8, 0, crate::mm::PAGE_SIZE);
+                tramp_stack_top
             };
 
             let irq = save_irq_disable();
             tcb.tcb_lock();
-            let tramp_stack_virt = crate::mm::phys_to_virt(tramp_stack_phys);
-            let tramp_stack_top = tramp_stack_virt + crate::mm::PAGE_SIZE as u64;
-            core::ptr::write_bytes(tramp_stack_virt as *mut u8, 0, crate::mm::PAGE_SIZE);
 
             #[cfg(target_arch = "x86_64")]
             {
+                let vspace = &*vspace_root;
                 tcb.context.rip = crate::arch::usermode_trampoline as *const () as u64;
                 tcb.context.rsp = tramp_stack_top;
                 tcb.context.r12 = entry_rip;
@@ -1728,10 +1790,13 @@ fn syscall_tcb_configure(
             }
             #[cfg(target_arch = "aarch64")]
             {
-                let _ = tramp_stack_top;
-                tcb.context.elr_el1 = entry_rip;
-                tcb.context.sp = entry_rsp;
-                tcb.context.spsr_el1 = 0x0;
+                crate::arch::aarch64::context::init_user_thread_context(
+                    &mut tcb.context,
+                    kstack_top,
+                    entry_rip,
+                    entry_rsp,
+                    0x0,
+                );
             }
             tcb.ipc_buffer = ipc_buffer;
             tcb.user_stack_top = entry_rsp;
@@ -2092,7 +2157,19 @@ fn syscall_tcb_write_registers(
         #[cfg(target_arch = "x86_64")]
         { tcb.context.rip = rip; tcb.context.rsp = rsp; }
         #[cfg(target_arch = "aarch64")]
-        { tcb.context.elr_el1 = rip; tcb.context.sp = rsp; }
+        {
+            if !tcb.vspace_root.is_null() {
+                tcb.context.elr_el1 = rip;
+                tcb.context.x[19] = rsp;
+                tcb.context.spsr_el1 = 0x0;
+            } else {
+                crate::arch::aarch64::context::init_kernel_thread_context(
+                    &mut tcb.context,
+                    rsp,
+                    rip,
+                );
+            }
+        }
 
         if flags & 1 != 0 && tcb.state == ThreadState::Inactive {
             let scheduler = crate::sched::scheduler::scheduler();
@@ -2345,7 +2422,7 @@ fn syscall_tcb_copy_fpu(
             core::ptr::copy_nonoverlapping(
                 (*src_tcb).fpu_state.data.as_ptr(),
                 (*dest_tcb).fpu_state.data.as_mut_ptr(),
-                832,
+                (*src_tcb).fpu_state.data.len(),
             );
         }
         (*dest_tcb).fpu_initialized = (*src_tcb).fpu_initialized;
@@ -2462,6 +2539,7 @@ fn syscall_untyped_retype(
         8 => ObjectType::IrqHandler,
         9 => ObjectType::IoPort,
         10 => ObjectType::SchedContext,
+        11 => ObjectType::MemoryObject,
         _ => return SyscallResult::err(SyscallError::InvalidArgument),
     };
 
@@ -3126,8 +3204,11 @@ fn syscall_irq_control_get(
         ptr
     };
 
-    // Dynamically unmask the IOAPIC entry — PCI IRQs are level-triggered, active-low
-    crate::arch::ioapic_unmask_level(irq_num as u32);
+    // Do NOT unmask here — the IRQ stays masked until the driver binds a
+    // notification and calls irq_handler_ack.  Unmasking immediately would
+    // cause an IRQ storm for level-triggered PCI interrupts that are already
+    // asserted (e.g. virtio ISR pending).  irq_handler_ack() calls
+    // ioapic_unmask_level() when the driver is ready to receive.
 
     // Allocate a cap slot and set it up
     let slot = match crate::cap::alloc_slot() {
@@ -3351,6 +3432,7 @@ fn syscall_device_untyped_create(
 /// - num_ports: Number of consecutive ports
 /// - dest_cnode_cap: Capability pointer to destination CNode
 /// - dest_slot: Slot index in destination CNode
+#[cfg(target_arch = "x86_64")]
 fn syscall_ioport_create(
     cap: &Capability,
     base_port: u64,
@@ -3364,6 +3446,69 @@ fn syscall_ioport_create(
     }
 
     // Validate args
+    if base_port > 0xFFFF || num_ports == 0 || num_ports > 0xFFFF {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+    if base_port + num_ports > 0x10000 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    // Look up destination CNode
+    let dest_cap = match lookup_cap_locked(dest_cnode_cap) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(&dest_cap, ObjectType::CNode, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    // Allocate from the dynamic IoPort pool
+    let iop_ptr = match crate::init::alloc_dynamic_ioport(base_port as u16, num_ports as u16) {
+        Some(ptr) => ptr,
+        None => return SyscallResult::err(SyscallError::OutOfMemory),
+    };
+
+    // Allocate a cap slot and set it up
+    let slot = match crate::cap::alloc_slot() {
+        Some(s) => s,
+        None => return SyscallResult::err(SyscallError::OutOfMemory),
+    };
+    let new_cap = crate::cap::get_cap_mut(slot);
+    new_cap.object = iop_ptr as *mut crate::cap::KernelObject;
+    new_cap.obj_type = ObjectType::IoPort;
+    new_cap.rights = crate::cap::CapRights::ALL;
+    new_cap.depth = 0;
+    new_cap.badge = 0;
+
+    // Insert into destination CNode
+    unsafe {
+        let dest_cnode = &mut *(dest_cap.object as *mut CNode);
+        if let Err(e) = dest_cnode.insert_ref(dest_slot as usize, crate::cap::CapRef { slot }) {
+            let syscall_err = match e {
+                CapError::InvalidSlot => SyscallError::OutOfRange,
+                _ => SyscallError::AlreadyExists,
+            };
+            return SyscallResult::err(syscall_err);
+        }
+    }
+
+    SyscallResult::ok(0)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn syscall_ioport_create(
+    cap: &Capability,
+    base_port: u64,
+    num_ports: u64,
+    dest_cnode_cap: u64,
+    dest_slot: u64,
+) -> SyscallResult {
+    // Require IrqHandler type with CONFIGURE rights (acts as IrqControl)
+    if let Err(e) = validate_capability(cap, ObjectType::IrqHandler, CapRights::CONFIGURE) {
+        return SyscallResult::err(e);
+    }
+
+    // Validate args (same 64 KB port space as x86, mapped to PCI I/O window MMIO)
     if base_port > 0xFFFF || num_ports == 0 || num_ports > 0xFFFF {
         return SyscallResult::err(SyscallError::InvalidArgument);
     }
@@ -3545,30 +3690,120 @@ fn syscall_ioport_out32(cap: &Capability, offset: u64, value: u64) -> SyscallRes
     SyscallResult::ok(0)
 }
 
-/// IoPort I/O stubs for aarch64 (I/O ports do not exist on aarch64)
+/// IoPort I/O for aarch64 — PCI I/O ports emulated via MMIO window.
 #[cfg(target_arch = "aarch64")]
-fn syscall_ioport_in8(_cap: &Capability, _offset: u64) -> SyscallResult {
-    SyscallResult::err(SyscallError::InvalidArgument)
+fn syscall_ioport_in8(cap: &Capability, offset: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+    unsafe {
+        let ioport = &*(cap.object as *const IoPortRange);
+        if offset >= ioport.num_ports as u64 {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+        let port = match ioport.base_port.checked_add(offset as u16) {
+            Some(p) => p,
+            None => return SyscallResult::err(SyscallError::OutOfRange),
+        };
+        // SAFETY: Port is validated within IoPort range; MMIO window is mapped during boot.
+        let val = unsafe { crate::arch::pci_io_read8(port) };
+        SyscallResult::ok(val as u64)
+    }
 }
 #[cfg(target_arch = "aarch64")]
-fn syscall_ioport_out8(_cap: &Capability, _offset: u64, _value: u64) -> SyscallResult {
-    SyscallResult::err(SyscallError::InvalidArgument)
+fn syscall_ioport_out8(cap: &Capability, offset: u64, value: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+    unsafe {
+        let ioport = &*(cap.object as *const IoPortRange);
+        if offset >= ioport.num_ports as u64 {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+        let port = match ioport.base_port.checked_add(offset as u16) {
+            Some(p) => p,
+            None => return SyscallResult::err(SyscallError::OutOfRange),
+        };
+        // SAFETY: Port is validated within IoPort range; MMIO window is mapped during boot.
+        unsafe { crate::arch::pci_io_write8(port, value as u8) };
+    }
+    SyscallResult::ok(0)
 }
 #[cfg(target_arch = "aarch64")]
-fn syscall_ioport_in16(_cap: &Capability, _offset: u64) -> SyscallResult {
-    SyscallResult::err(SyscallError::InvalidArgument)
+fn syscall_ioport_in16(cap: &Capability, offset: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+    unsafe {
+        let ioport = &*(cap.object as *const IoPortRange);
+        if offset + 1 >= ioport.num_ports as u64 {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+        let port = match ioport.base_port.checked_add(offset as u16) {
+            Some(p) => p,
+            None => return SyscallResult::err(SyscallError::OutOfRange),
+        };
+        // SAFETY: Port is validated within IoPort range; MMIO window is mapped during boot.
+        let val = unsafe { crate::arch::pci_io_read16(port) };
+        SyscallResult::ok(val as u64)
+    }
 }
 #[cfg(target_arch = "aarch64")]
-fn syscall_ioport_out16(_cap: &Capability, _offset: u64, _value: u64) -> SyscallResult {
-    SyscallResult::err(SyscallError::InvalidArgument)
+fn syscall_ioport_out16(cap: &Capability, offset: u64, value: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+    unsafe {
+        let ioport = &*(cap.object as *const IoPortRange);
+        if offset + 1 >= ioport.num_ports as u64 {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+        let port = match ioport.base_port.checked_add(offset as u16) {
+            Some(p) => p,
+            None => return SyscallResult::err(SyscallError::OutOfRange),
+        };
+        // SAFETY: Port is validated within IoPort range; MMIO window is mapped during boot.
+        unsafe { crate::arch::pci_io_write16(port, value as u16) };
+    }
+    SyscallResult::ok(0)
 }
 #[cfg(target_arch = "aarch64")]
-fn syscall_ioport_in32(_cap: &Capability, _offset: u64) -> SyscallResult {
-    SyscallResult::err(SyscallError::InvalidArgument)
+fn syscall_ioport_in32(cap: &Capability, offset: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+    unsafe {
+        let ioport = &*(cap.object as *const IoPortRange);
+        if offset + 3 >= ioport.num_ports as u64 {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+        let port = match ioport.base_port.checked_add(offset as u16) {
+            Some(p) => p,
+            None => return SyscallResult::err(SyscallError::OutOfRange),
+        };
+        // SAFETY: Port is validated within IoPort range; MMIO window is mapped during boot.
+        let val = unsafe { crate::arch::pci_io_read32(port) };
+        SyscallResult::ok(val as u64)
+    }
 }
 #[cfg(target_arch = "aarch64")]
-fn syscall_ioport_out32(_cap: &Capability, _offset: u64, _value: u64) -> SyscallResult {
-    SyscallResult::err(SyscallError::InvalidArgument)
+fn syscall_ioport_out32(cap: &Capability, offset: u64, value: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::IoPort, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+    unsafe {
+        let ioport = &*(cap.object as *const IoPortRange);
+        if offset + 3 >= ioport.num_ports as u64 {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+        let port = match ioport.base_port.checked_add(offset as u16) {
+            Some(p) => p,
+            None => return SyscallResult::err(SyscallError::OutOfRange),
+        };
+        // SAFETY: Port is validated within IoPort range; MMIO window is mapped during boot.
+        unsafe { crate::arch::pci_io_write32(port, value as u32) };
+    }
+    SyscallResult::ok(0)
 }
 
 /// IOPORT_CONFIGURE: Set base port and port count on a freshly retyped IoPort
@@ -3791,6 +4026,45 @@ fn syscall_vspace_clone_cow_page(
     }
 }
 
+/// VSPACE_SHARE_RO_PAGE: Share a read-only page from src to dst VSpace.
+///
+/// Copies the PTE if it is present and read-only. Returns an error for
+/// writable or absent pages — the source VSpace is **never modified**.
+/// This is used during fork for non-MO regions (e.g. shared library RO
+/// pages) where we want to share the physical frame without COW-marking
+/// the parent.
+fn syscall_vspace_share_ro_page(
+    cap: &Capability,
+    src_vaddr: u64,
+    dst_vspace_cap_ptr: u64,
+    dst_vaddr: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+    if src_vaddr & 0xFFF != 0 || dst_vaddr & 0xFFF != 0 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    let dst_cap = match lookup_cap_locked(dst_vspace_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(&dst_cap, ObjectType::VSpace, CapRights::MAP) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        // SAFETY: Both VSpace pointers validated above.
+        let src_vs = &mut *(cap.object as *mut VSpace);
+        let dst_vs = &mut *(dst_cap.object as *mut VSpace);
+        match src_vs.share_ro_page_to(src_vaddr, dst_vs, dst_vaddr) {
+            Ok(()) => SyscallResult::ok(0),
+            Err(e) => SyscallResult::err(syscall_error_from_vspace_error(e)),
+        }
+    }
+}
+
 /// VSPACE_MAP_DEVICE: Map a single 4K page from a device untyped region.
 ///
 /// Args:
@@ -3977,6 +4251,7 @@ fn syscall_error_from_vspace_error(err: VSpaceError) -> SyscallError {
         VSpaceError::NotMapped => SyscallError::NotFound,
         VSpaceError::OutOfMemory => SyscallError::OutOfMemory,
         VSpaceError::NotCow => SyscallError::InvalidOperation,
+        VSpaceError::InvalidArgument => SyscallError::InvalidArgument,
     }
 }
 
@@ -4297,6 +4572,700 @@ pub fn handle(
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MemoryObject invoke implementations
+// ---------------------------------------------------------------------------
+
+/// MO_COMMIT: Allocate physical frames for pages [offset..offset+count]
+fn syscall_mo_commit(cap: &Capability, offset: u64, count: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::MemoryObject, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        // SAFETY: cap.object validated as MemoryObject above.
+        let mo = &mut *(cap.object as *mut crate::cap::memory_object::MemoryObject);
+        let start = offset as usize;
+        let cnt = count as usize;
+
+        if start + cnt > mo.page_count as usize {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+
+        let mo_ptr = cap.object as *mut crate::cap::memory_object::MemoryObject;
+        let mut alloc = crate::mm::node_alloc::PmmNodeAllocator {
+            owner: crate::mm::frame::FrameOwner::MoMeta {
+                mo: mo_ptr,
+                subkind: crate::mm::frame::MoMetaKind::Radix,
+            },
+            use_reserve: false,
+        };
+
+        let mut committed = 0u64;
+        for i in 0..cnt {
+            let page_idx = start + i;
+            if mo.resolve_page(page_idx).is_some() {
+                committed += 1;
+                continue;
+            }
+
+            let owner = crate::mm::frame::FrameOwner::MoData {
+                mo: mo_ptr,
+                page_idx: page_idx as u32,
+            };
+            let phys = match crate::mm::pmm_alloc(&owner) {
+                Some(p) => p,
+                None => break,
+            };
+
+            let frame_ptr = crate::mm::phys_to_virt(phys) as *mut u8;
+            core::ptr::write_bytes(frame_ptr, 0, crate::mm::PAGE_SIZE);
+
+            if !mo.commit_page(page_idx, phys, &mut alloc) {
+                crate::mm::pmm_free(phys, &owner);
+                break;
+            }
+            committed += 1;
+        }
+
+        SyscallResult::ok(committed)
+    }
+}
+
+/// MO_DECOMMIT: Release physical frames for pages [offset..offset+count]
+///
+/// Frees locally-committed pages and clears their entries. Pages in the
+/// hidden node chain (shared with COW siblings) are NOT freed — they are
+/// owned by the node and released when all referencing MOs are destroyed.
+fn syscall_mo_decommit(cap: &Capability, offset: u64, count: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::MemoryObject, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        // SAFETY: cap.object validated as MemoryObject above.
+        let mo = &mut *(cap.object as *mut crate::cap::memory_object::MemoryObject);
+        let start = offset as usize;
+        let cnt = count as usize;
+
+        if start.checked_add(cnt).is_none() || start + cnt > mo.page_count as usize {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+
+        let mut decommitted = 0u64;
+        for i in 0..cnt {
+            let page_idx = start + i;
+            let phys = mo.pages.get(page_idx);
+            if phys != 0 {
+                crate::mm::pmm_free(phys, &crate::mm::frame::FrameOwner::MoData {
+                    mo: cap.object as *mut crate::cap::memory_object::MemoryObject,
+                    page_idx: page_idx as u32,
+                });
+                mo.pages.remove(page_idx);
+                decommitted += 1;
+            }
+        }
+
+        SyscallResult::ok(decommitted)
+    }
+}
+
+/// MO_GET_SIZE: Return the page count of the memory object
+fn syscall_mo_get_size(cap: &Capability) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::MemoryObject, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+    // SAFETY: cap.object was validated as ObjectType::MemoryObject above and is non-null.
+    unsafe {
+        let mo = &*(cap.object as *const crate::cap::memory_object::MemoryObject);
+        SyscallResult::ok(mo.page_count as u64)
+    }
+}
+
+/// MO_CLONE: Create a COW snapshot clone into dest_slot.
+///
+/// Creates a CowChild MemoryObject with an empty radix tree and a
+/// cow_parent CapSlot referencing the parent. The parent's pages are
+/// NOT moved — the child resolves pages by walking the cow_parent chain.
+/// The parent's ref_count is incremented to prevent premature destruction.
+fn syscall_mo_clone(cap: &Capability, dest_slot: u64, _flags: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::MemoryObject, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let parent_mo = &*(cap.object as *const crate::cap::memory_object::MemoryObject);
+
+        // Allocate space for child MO struct (radix tree nodes allocated lazily)
+        let child_size = crate::cap::memory_object::MemoryObject::required_bytes(parent_mo.page_count);
+        let child_pages = (child_size + crate::mm::PAGE_SIZE - 1) / crate::mm::PAGE_SIZE;
+        let child_phys = match crate::mm::pmm_alloc_contiguous(child_pages) {
+            Some(p) => p,
+            None => return SyscallResult::err(SyscallError::OutOfMemory),
+        };
+
+        let child_base = crate::mm::phys_to_virt(child_phys) as *mut u8;
+        core::ptr::write_bytes(child_base, 0, child_pages * crate::mm::PAGE_SIZE);
+        let child_mo_ptr = child_base as *mut crate::cap::memory_object::MemoryObject;
+
+        // Allocate a cap slot for the parent reference (cow_parent)
+        let parent_ref_slot = match crate::cap::alloc_slot() {
+            Some(s) => s,
+            None => return SyscallResult::err(SyscallError::OutOfMemory),
+        };
+
+        // Copy parent cap into the parent_ref_slot to pin the parent
+        let parent_ref_cap = crate::cap::get_cap_mut(parent_ref_slot);
+        parent_ref_cap.object = cap.object;
+        parent_ref_cap.obj_type = ObjectType::MemoryObject;
+        parent_ref_cap.rights = CapRights::READ;
+        parent_ref_cap.depth = 0;
+        parent_ref_cap.badge = 0;
+        // Increment parent's refcount
+        let parent_header = &mut *(cap.object as *mut crate::cap::KernelObject);
+        parent_header.ref_count.fetch_add(1, core::sync::atomic::Ordering::Acquire);
+
+        // Initialize child MO
+        core::ptr::write(child_mo_ptr, crate::cap::memory_object::MemoryObject::new(
+            child_phys, parent_mo.page_count,
+        ));
+        (*child_mo_ptr).kind = crate::cap::memory_object::MoKind::CowChild;
+        (*child_mo_ptr).cow_parent = parent_ref_slot as u64;
+
+        // Add child to parent's intrusive child list
+        let parent_mo_mut = &mut *(cap.object as *mut crate::cap::memory_object::MemoryObject);
+        (*child_mo_ptr).next_sibling = parent_mo_mut.first_child;
+        parent_mo_mut.first_child = child_mo_ptr;
+
+        // Allocate a cap slot for the child MO
+        let child_cap_slot = match crate::cap::alloc_slot() {
+            Some(s) => s,
+            None => {
+                crate::cap::free_slot(parent_ref_slot);
+                return SyscallResult::err(SyscallError::OutOfMemory);
+            }
+        };
+
+        let child_cap = crate::cap::get_cap_mut(child_cap_slot);
+        child_cap.object = child_mo_ptr as *mut crate::cap::KernelObject;
+        child_cap.obj_type = ObjectType::MemoryObject;
+        child_cap.rights = CapRights::ALL;
+        child_cap.depth = 0;
+        child_cap.badge = 0;
+
+        // Install into caller's CNode at dest_slot
+        let scheduler = crate::sched::scheduler::scheduler();
+        let current = scheduler.current();
+        if current.is_null() || (*current).cspace_root.is_null() {
+            crate::cap::free_slot(child_cap_slot);
+            crate::cap::free_slot(parent_ref_slot);
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+        let cnode = &mut *(*current).cspace_root;
+        if let Err(e) = cnode.insert_ref(
+            dest_slot as usize,
+            crate::cap::cnode::CapRef { slot: child_cap_slot },
+        ) {
+            crate::cap::free_slot(child_cap_slot);
+            crate::cap::free_slot(parent_ref_slot);
+            return SyscallResult::err(match e {
+                _ => SyscallError::InvalidArgument,
+            });
+        }
+
+        SyscallResult::ok(0)
+    }
+}
+
+/// MO_RESIZE: Resize the memory object to new_page_count pages.
+///
+/// **Shrink**: decommits pages beyond new count via radix tree removal.
+/// **Grow**: just updates page_count. Radix tree grows lazily on commit.
+fn syscall_mo_resize(cap: &Capability, new_page_count: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::MemoryObject, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    let new_pc = new_page_count as usize;
+    if new_pc == 0 || new_pc > u32::MAX as usize {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    unsafe {
+        let mo = &mut *(cap.object as *mut crate::cap::memory_object::MemoryObject);
+        let old_pc = mo.page_count as usize;
+
+        if new_pc == old_pc {
+            return SyscallResult::ok(0);
+        }
+
+        if new_pc < old_pc {
+            // Shrink: free pages beyond new_pc
+            for i in new_pc..old_pc {
+                let phys = mo.pages.get(i);
+                if phys != 0 {
+                    crate::mm::pmm_free(phys, &crate::mm::frame::FrameOwner::MoData {
+                        mo: cap.object as *mut crate::cap::memory_object::MemoryObject,
+                        page_idx: i as u32,
+                    });
+                    mo.pages.remove(i);
+                }
+            }
+            mo.page_count = new_pc as u32;
+            return SyscallResult::ok(0);
+        }
+
+        // Grow: radix tree grows lazily on insert, just update count
+        mo.page_count = new_pc as u32;
+        SyscallResult::ok(0)
+    }
+}
+
+/// MO_READ: Read bytes from MO committed pages into the caller's IPC buffer.
+///
+/// Args:
+/// - offset: byte offset within the MO
+/// - count: number of bytes to read
+///
+/// Copies data from MO's physical pages (via direct map) into the
+/// current thread's IPC buffer at offset 0. No VSpace mapping needed.
+fn syscall_mo_read(cap: &Capability, offset: u64, count: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::MemoryObject, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    let byte_count = count as usize;
+    if byte_count == 0 {
+        return SyscallResult::ok(0);
+    }
+
+    unsafe {
+        let mo = &*(cap.object as *const crate::cap::memory_object::MemoryObject);
+        let scheduler = crate::sched::scheduler::scheduler();
+        let current = scheduler.current();
+        if current.is_null() || (*current).ipc_buffer == 0 {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+        let ipc_buf = (*current).ipc_buffer as *mut u8;
+
+        let mut bytes_read = 0usize;
+        let mut src_off = offset as usize;
+
+        while bytes_read < byte_count {
+            let page_idx = src_off / crate::mm::PAGE_SIZE;
+            let page_off = src_off % crate::mm::PAGE_SIZE;
+            let chunk = core::cmp::min(
+                crate::mm::PAGE_SIZE - page_off,
+                byte_count - bytes_read,
+            );
+
+            let phys = match mo.resolve_page(page_idx) {
+                Some(p) => p,
+                None => break, // Uncommitted page — stop
+            };
+
+            let src = (crate::mm::phys_to_virt(phys) as *const u8).add(page_off);
+            let dst = ipc_buf.add(bytes_read);
+            core::ptr::copy_nonoverlapping(src, dst, chunk);
+
+            bytes_read += chunk;
+            src_off += chunk;
+        }
+
+        SyscallResult::ok(bytes_read as u64)
+    }
+}
+
+/// MO_WRITE: Write bytes from the caller's IPC buffer into MO committed pages.
+///
+/// Args:
+/// - offset: byte offset within the MO
+/// - count: number of bytes to write
+///
+/// Copies data from the current thread's IPC buffer into MO's physical
+/// pages via direct map. Pages must already be committed.
+fn syscall_mo_write(cap: &Capability, offset: u64, count: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::MemoryObject, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    let byte_count = count as usize;
+    if byte_count == 0 {
+        return SyscallResult::ok(0);
+    }
+
+    unsafe {
+        let mo = &*(cap.object as *const crate::cap::memory_object::MemoryObject);
+        let scheduler = crate::sched::scheduler::scheduler();
+        let current = scheduler.current();
+        if current.is_null() || (*current).ipc_buffer == 0 {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+        let ipc_buf = (*current).ipc_buffer as *const u8;
+
+        let mut bytes_written = 0usize;
+        let mut dst_off = offset as usize;
+
+        while bytes_written < byte_count {
+            let page_idx = dst_off / crate::mm::PAGE_SIZE;
+            let page_off = dst_off % crate::mm::PAGE_SIZE;
+            let chunk = core::cmp::min(
+                crate::mm::PAGE_SIZE - page_off,
+                byte_count - bytes_written,
+            );
+
+            let phys = match mo.resolve_page(page_idx) {
+                Some(p) => p,
+                None => break, // Uncommitted — stop
+            };
+
+            let src = ipc_buf.add(bytes_written);
+            let dst = (crate::mm::phys_to_virt(phys) as *mut u8).add(page_off);
+            core::ptr::copy_nonoverlapping(src, dst, chunk);
+
+            bytes_written += chunk;
+            dst_off += chunk;
+        }
+
+        SyscallResult::ok(bytes_written as u64)
+    }
+}
+
+/// VSPACE_MAP_MO: Map a range of MemoryObject pages into a VSpace.
+///
+/// Args:
+/// - mo_cap_ptr: Capability pointer to the MemoryObject
+/// - vaddr: Starting virtual address (page-aligned)
+/// - mo_offset: Page offset within the MO
+/// - count_and_flags: (count << 32) | flags  (flags: bit0=W, bit1=U, bit2=X)
+/// VSPACE_FORK_RANGE: Fork pages from parent VSpace to child VSpace.
+///
+/// For each present page in the parent:
+/// - Read actual PTE flags (preserves EXECUTABLE, USER, etc.)
+/// - If writable: set COW + clear WRITABLE in parent PTE, TLB flush
+/// - Copy the (now COW) PTE into the child VSpace
+/// - Register page in child MO's radix tree
+/// - Update child Maple tree and map_count
+///
+/// This is the MO-aware replacement for vspace_clone_cow_page.
+fn syscall_vspace_fork_range(
+    parent_cap: &Capability,
+    child_vs_cap_ptr: u64,
+    child_mo_cap_ptr: u64,
+    va_start: u64,
+    count_and_offset: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(parent_cap, ObjectType::VSpace, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    let child_vs_cap = match lookup_cap_locked(child_vs_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(&child_vs_cap, ObjectType::VSpace, CapRights::MAP) {
+        return SyscallResult::err(e);
+    }
+
+    let child_mo_cap = match lookup_cap_locked(child_mo_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(&child_mo_cap, ObjectType::MemoryObject, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    let page_count = (count_and_offset >> 32) as usize;
+    let mo_offset = (count_and_offset & 0xFFFF_FFFF) as usize;
+
+    if va_start & 0xFFF != 0 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    unsafe {
+        let parent_vs = &mut *(parent_cap.object as *mut VSpace);
+        let child_vs = &mut *(child_vs_cap.object as *mut VSpace);
+        let child_mo = child_mo_cap.object as *mut crate::cap::memory_object::MemoryObject;
+
+        let forked = parent_vs.fork_range(child_vs, va_start, page_count);
+
+        if forked > 0 && !child_vs.tracking.is_null() {
+            let t = &mut *child_vs.tracking;
+            let mut tree_alloc = crate::mm::node_alloc::PmmNodeAllocator {
+                owner: crate::mm::frame::FrameOwner::KernelPrivate {
+                    subkind: crate::mm::frame::KernelMetaKind::MapleNode,
+                },
+                use_reserve: false,
+            };
+
+            let irq = save_irq_disable();
+            parent_vs.lock.lock();
+            let first_pte = parent_vs.read_entry(va_start, 1).unwrap_or(0);
+            parent_vs.lock.unlock();
+            restore_irq(irq);
+
+            let ff = VSpace::entry_flags_to_page_flags(first_pte);
+            let mut perms: u8 = 0;
+            if ff.writable || ff.cow { perms |= 0x01; }
+            if ff.user { perms |= 0x02; }
+            if ff.executable { perms |= 0x04; }
+
+            let _ = t.mappings.insert(
+                va_start,
+                crate::mm::vspace::VmArea {
+                    mo: child_mo,
+                    mo_offset: mo_offset as u32,
+                    page_count: forked as u32,
+                    perms,
+                    _pad: [0; 7],
+                },
+                &mut tree_alloc,
+            );
+        }
+
+        if forked > 0 {
+            (*child_mo).reverse_maps.add(crate::cap::memory_object::ReverseMapEntry {
+                vspace: child_vs as *mut VSpace,
+                va_start,
+                page_count: forked as u32,
+                mo_offset: mo_offset as u32,
+                perms: 0,
+                _pad: [0; 7],
+            });
+        }
+
+        SyscallResult::ok(forked as u64)
+    }
+}
+
+fn syscall_vspace_map_mo(
+    cap: &Capability,
+    mo_cap_ptr: u64,
+    vaddr: u64,
+    mo_offset: u64,
+    count_and_flags: u64,
+) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::MAP) {
+        return SyscallResult::err(e);
+    }
+    if vaddr & 0xFFF != 0 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    let mo_cap = match lookup_cap_locked(mo_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(&mo_cap, ObjectType::MemoryObject, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    let count = (count_and_flags >> 32) as usize;
+    let flags_bits = count_and_flags & 0xFFFF_FFFF;
+
+    // W^X
+    if (flags_bits & 1 != 0) && (flags_bits & 4 != 0) {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    unsafe {
+        // SAFETY: Both caps validated above. Use raw pointer for MO to
+        // avoid aliasing UB (we need both read and write access).
+        let mo_ptr = mo_cap.object as *mut crate::cap::memory_object::MemoryObject;
+        let vspace = &mut *(cap.object as *mut VSpace);
+
+        let flags = PageFlags {
+            writable: flags_bits & 1 != 0,
+            user: flags_bits & 2 != 0,
+            executable: flags_bits & 4 != 0,
+            cache_disable: flags_bits & 8 != 0,
+            write_through: flags_bits & 16 != 0,
+            cow: false,
+        };
+
+        let offset = mo_offset as usize;
+        if count > 0 && offset + count > (*mo_ptr).page_count as usize {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+
+        let is_cloned = (*mo_ptr).cow_parent != 0;
+        let mut alloc = crate::mm::node_alloc::PmmNodeAllocator {
+            owner: crate::mm::frame::FrameOwner::MoMeta {
+                mo: mo_ptr,
+                subkind: crate::mm::frame::MoMetaKind::Radix,
+            },
+            use_reserve: false,
+        };
+
+        let mut mapped = 0u64;
+        for i in 0..count {
+            let page_vaddr = vaddr + (i as u64 * crate::mm::PAGE_SIZE as u64);
+
+            if let Some((mut phys, depth)) = (*mo_ptr).resolve_page_depth(offset + i) {
+                let page_idx = offset + i;
+
+                // Eager flatten: if resolved from a deep ancestor chain,
+                // copy the page locally so subsequent accesses are O(1).
+                if depth > crate::cap::memory_object::COW_FLATTEN_THRESHOLD {
+                    let flatten_owner = crate::mm::frame::FrameOwner::MoData {
+                        mo: mo_ptr,
+                        page_idx: page_idx as u32,
+                    };
+                    if let Some(new_phys) = crate::mm::pmm_alloc(&flatten_owner) {
+                        let src = crate::mm::phys_to_virt(phys) as *const u8;
+                        let dst = crate::mm::phys_to_virt(new_phys) as *mut u8;
+                        core::ptr::copy_nonoverlapping(src, dst, crate::mm::PAGE_SIZE);
+                        (*mo_ptr).commit_page(page_idx, new_phys, &mut alloc);
+                        phys = new_phys;
+                    }
+                }
+
+                // COW mapping: if page is from parent chain and writable
+                // requested, map as read-only + COW.
+                let from_parent = depth > 0 && !(*mo_ptr).is_local_committed(page_idx);
+                let effective = if is_cloned && flags.writable && from_parent {
+                    PageFlags { writable: false, cow: true, ..flags }
+                } else {
+                    flags
+                };
+
+                match vspace.map(page_vaddr, phys, effective) {
+                    Ok(()) => {
+                        // Only tag PMM owner for locally committed pages
+                        // (depth == 0). Shared COW pages (depth > 0) are
+                        // owned by the ancestor MO — don't overwrite.
+                        if depth == 0 {
+                            crate::mm::pmm_set_owner(
+                                phys,
+                                &crate::mm::frame::FrameOwner::MoData {
+                                    mo: mo_cap.object
+                                        as *mut crate::cap::memory_object::MemoryObject,
+                                    page_idx: page_idx as u32,
+                                },
+                            );
+                        }
+                        mapped += 1;
+                    }
+                    Err(_) => break,
+                }
+            } else {
+                // Uncommitted page → demand PTE
+                match vspace.map_demand(page_vaddr, flags) {
+                    Ok(()) => mapped += 1,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        if mapped > 0 {
+            // Register reverse map on MO
+            (*mo_ptr).reverse_maps.add(crate::cap::memory_object::ReverseMapEntry {
+                vspace: cap.object as *mut VSpace,
+                va_start: vaddr,
+                page_count: mapped as u32,
+                mo_offset: offset as u32,
+                perms: (flags_bits & 0xFF) as u8,
+                _pad: [0; 7],
+            });
+
+            // Insert VmArea into VSpace Maple tree
+            if !vspace.tracking.is_null() {
+                let t = &mut *vspace.tracking;
+                let mut tree_alloc = crate::mm::node_alloc::PmmNodeAllocator {
+                    owner: crate::mm::frame::FrameOwner::KernelPrivate {
+                        subkind: crate::mm::frame::KernelMetaKind::MapleNode,
+                    },
+                    use_reserve: false,
+                };
+                let _ = t.mappings.insert(
+                    vaddr,
+                    crate::mm::vspace::VmArea {
+                        mo: mo_cap.object as *mut crate::cap::memory_object::MemoryObject,
+                        mo_offset: offset as u32,
+                        page_count: mapped as u32,
+                        perms: (flags_bits & 0xFF) as u8,
+                        _pad: [0; 7],
+                    },
+                    &mut tree_alloc,
+                );
+            }
+
+            // Update per-frame map_count
+            for i in 0..mapped as usize {
+                if let Some(phys) = (*mo_ptr).resolve_page(offset + i) {
+                    crate::mm::pmm_retain_mapping(phys);
+                }
+            }
+        }
+
+        SyscallResult::ok(mapped)
+    }
+}
+
+/// VSPACE_UNMAP_MO: Unmap memory object pages from a VSpace
+fn syscall_vspace_unmap_mo(cap: &Capability, vaddr: u64, count: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::UNMAP) {
+        return SyscallResult::err(e);
+    }
+    if vaddr & 0xFFF != 0 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    let cnt = count as usize;
+    unsafe {
+        let vspace = &mut *(cap.object as *mut VSpace);
+        let vspace_ptr = cap.object as *mut VSpace;
+
+        // 1. Look up VmArea in Maple tree BEFORE removal to get the MO pointer
+        let mut mo_ptr: *mut crate::cap::memory_object::MemoryObject = core::ptr::null_mut();
+        if !vspace.tracking.is_null() {
+            let t = &*vspace.tracking;
+            if let Some((_start, val)) = t.mappings.lookup(vaddr) {
+                if !val.mo.is_null() {
+                    mo_ptr = val.mo;
+                }
+            }
+        }
+
+        // 2. Unmap pages from page table + decrement map_count
+        let irq = save_irq_disable();
+        vspace.lock.lock();
+        for i in 0..cnt {
+            let page_vaddr = vaddr + (i as u64 * crate::mm::PAGE_SIZE as u64);
+            if let Some(entry) = vspace.read_entry(page_vaddr, 1) {
+                if entry & crate::mm::vspace::ENTRY_PRESENT != 0 {
+                    let phys = entry & crate::mm::vspace::ENTRY_ADDR_MASK;
+                    let _ = vspace.write_entry(page_vaddr, 1, 0);
+                    crate::arch::paging::invlpg(page_vaddr);
+                    vspace.tlb_shootdown(page_vaddr);
+                    crate::mm::pmm_release_mapping(phys);
+                }
+            }
+        }
+        vspace.lock.unlock();
+        restore_irq(irq);
+
+        // 3. Remove VmArea from Maple tree
+        if !vspace.tracking.is_null() {
+            let t = &mut *vspace.tracking;
+            let mut tree_alloc = crate::mm::node_alloc::PmmNodeAllocator {
+                owner: crate::mm::frame::FrameOwner::KernelPrivate {
+                    subkind: crate::mm::frame::KernelMetaKind::MapleNode,
+                },
+                use_reserve: false,
+            };
+            t.mappings.remove(vaddr, &mut tree_alloc);
+        }
+
+        // 4. Remove reverse map from MO
+        if !mo_ptr.is_null() {
+            (*mo_ptr).reverse_maps.remove(vspace_ptr, vaddr);
+        }
+
+        SyscallResult::ok(cnt as u64)
     }
 }
 

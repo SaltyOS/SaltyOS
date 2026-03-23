@@ -12,9 +12,22 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use crate::mm::{
-    alloc_frame, mark_frame_kernel_runtime, mark_frame_pt_owned, phys_to_virt, PAGE_SIZE,
+    pmm_alloc, frame::FrameOwner, frame::KernelMetaKind, phys_to_virt, PAGE_SIZE,
     PHYS_MAP_OFFSET,
 };
+
+/// Dedicated TTBR1 root used for kernel higher-half mappings.
+static mut KERNEL_ROOT_EARLY: u64 = 0;
+
+#[inline]
+fn kernel_root() -> u64 {
+    let registered = crate::mm::vspace::kernel_vspace_root();
+    if registered != 0 {
+        return registered;
+    }
+    // SAFETY: Early boot writes this once before any concurrent access.
+    unsafe { KERNEL_ROOT_EARLY }
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -22,6 +35,9 @@ use crate::mm::{
 
 /// Maximum direct physical mapping size (512 GB cap)
 const MAX_DIRECT_MAP_SIZE: usize = 512 * 1024 * 1024 * 1024;
+
+/// QEMU virt guest RAM starts at 1 GB on aarch64.
+const QEMU_VIRT_RAM_BASE: u64 = 0x4000_0000;
 
 /// MAIR_EL1 value:
 ///   Index 0 = 0x00 (Device-nGnRnE)
@@ -152,6 +168,16 @@ fn encode_pte(logical: u64) -> u64 {
         hw |= HW_SW_DEMAND;
     }
 
+    // When not present (Valid=0), preserve access-control flags directly in
+    // their logical bit positions. The hardware ignores all bits when Valid=0,
+    // and these positions (1, 2, 63) don't collide with the page-aligned
+    // physical address stored in bits [47:12]. This allows decode_pte to
+    // recover WRITABLE/USER/NX so demand-fault resolution produces correct
+    // permissions.
+    if logical & LOGICAL_PRESENT == 0 {
+        hw |= logical & (LOGICAL_WRITABLE | LOGICAL_USER | LOGICAL_NO_EXECUTE);
+    }
+
     hw
 }
 
@@ -205,6 +231,10 @@ fn decode_pte(hw: u64) -> u64 {
         if hw & HW_UXN != 0 {
             logical |= LOGICAL_NO_EXECUTE;
         }
+    } else {
+        // Not present — recover access flags stored in logical bit positions
+        // by encode_pte (hardware ignores all bits when Valid=0).
+        logical |= hw & (LOGICAL_WRITABLE | LOGICAL_USER | LOGICAL_NO_EXECUTE);
     }
 
     // Software-available bits.
@@ -295,14 +325,37 @@ pub fn read_cr3() -> u64 {
     val
 }
 
-/// Write the page table root (TTBR0_EL1) and issue an ISB.
-///
-/// # Safety
-/// `value` must point to a valid, 4 KB-aligned page table hierarchy.
-pub unsafe fn write_cr3(value: u64) {
-    // SAFETY: Caller guarantees value is a valid page table address.
+#[inline]
+unsafe fn write_ttbr1(root: u64) {
+    // SAFETY: Caller guarantees `root` is a valid top-level page table root.
     unsafe {
         core::arch::asm!(
+            "msr TTBR1_EL1, {}",
+            "isb",
+            in(reg) root,
+            options(nostack),
+        );
+    }
+}
+
+/// Write the page table root (TTBR0_EL1) with an embedded ASID.
+///
+/// The caller must encode the ASID in bits [63:48] of `value`.  Because each
+/// VSpace carries a distinct ASID, the hardware TLB naturally partitions
+/// entries per address-space — no full TLB flush is needed on a plain switch.
+///
+/// # Safety
+/// `value` must encode a valid, 4 KB-aligned page table address in bits [47:0]
+/// and a valid ASID in bits [63:48].
+pub unsafe fn write_cr3(value: u64) {
+    // SAFETY: Caller guarantees value is a valid TTBR0 encoding.
+    // DSB ISH before the TTBR write ensures all prior PTE stores (e.g. from
+    // COW clone) are visible to the page walker before it consults the new
+    // page tables.  Without this barrier the walker may see stale zero
+    // entries in freshly-allocated child page tables after fork.
+    unsafe {
+        core::arch::asm!(
+            "dsb ish",
             "msr TTBR0_EL1, {}",
             "isb",
             in(reg) value,
@@ -311,18 +364,56 @@ pub unsafe fn write_cr3(value: u64) {
     }
 }
 
-/// Invalidate the TLB entry for a single virtual address (inner-shareable).
+/// Invalidate the TLB entry for a single virtual address with the
+/// ASID of the currently loaded TTBR0 (inner-shareable).
+///
+/// Uses `TLBI VAE1IS` which targets a specific ASID, avoiding
+/// collateral invalidation of other VSpaces that map the same VA.
 pub fn invlpg(virt: u64) {
-    // SAFETY: TLBI is always safe from EL1. The VA operand is shifted
-    // right by 12 per the ARMv8 TLBI encoding.
     unsafe {
-        let va_shifted = virt >> 12;
+        // Read current TTBR0 to get the active ASID
+        let ttbr0: u64;
+        core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0, options(nomem, nostack));
+        let asid = (ttbr0 >> 48) & 0xFFFF;
+        // TLBI VAE1IS: bits [63:48] = ASID, bits [43:0] = VA >> 12
+        let operand = (asid << 48) | (virt >> 12);
         core::arch::asm!(
             "tlbi vae1is, {}",
             "dsb ish",
             "isb",
+            in(reg) operand,
+            options(nostack),
+        );
+    }
+}
+
+/// Invalidate the TLB entry for a single virtual address with a
+/// specific ASID (inner-shareable).
+pub fn invlpg_asid(virt: u64, asid: u16) {
+    unsafe {
+        let operand = ((asid as u64) << 48) | (virt >> 12);
+        core::arch::asm!(
+            "tlbi vae1is, {}",
+            "dsb ish",
+            "isb",
+            in(reg) operand,
+            options(nostack),
+        );
+    }
+}
+
+/// Invalidate the TLB entry for a single virtual address across ALL
+/// ASIDs (inner-shareable). Use only when the ASID is unknown or when
+/// invalidating kernel mappings.
+pub fn invlpg_all_asid(virt: u64) {
+    unsafe {
+        let va_shifted = virt >> 12;
+        core::arch::asm!(
+            "tlbi vaae1is, {}",
+            "dsb ish",
+            "isb",
             in(reg) va_shifted,
-            options(nomem, nostack),
+            options(nostack),
         );
     }
 }
@@ -335,8 +426,105 @@ pub fn flush_tlb_all() {
             "tlbi vmalle1is",
             "dsb ish",
             "isb",
-            options(nomem, nostack),
+            options(nostack),
         );
+    }
+}
+
+/// Flush all TLB entries matching a specific ASID (inner-shareable).
+pub fn flush_asid(asid: u16) {
+    // SAFETY: TLBI is always safe from EL1. The ASID operand occupies
+    // bits [63:48] of the register passed to TLBI ASIDE1IS.
+    unsafe {
+        let val = (asid as u64) << 48;
+        core::arch::asm!(
+            "tlbi aside1is, {}",
+            "dsb ish",
+            "isb",
+            in(reg) val,
+            options(nostack),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ASID allocator
+// ---------------------------------------------------------------------------
+
+/// 8-bit ASID space: 256 IDs. ASID 0 is reserved (kernel / no-ASID), so
+/// the usable range is 1..=255.
+const ASID_COUNT: usize = 256;
+
+/// Bitmap: 256 bits = 4 × u64.
+static mut ASID_BITMAP: [u64; ASID_COUNT / 64] = [0; ASID_COUNT / 64];
+
+/// Generation counter — bumped when the ASID space is exhausted and recycled.
+pub static mut ASID_GENERATION: u64 = 1;
+
+/// Allocate a fresh ASID.  Returns `(asid, generation)`.
+///
+/// If the bitmap is full, bumps the generation, flushes the entire TLB,
+/// resets the bitmap, and retries.
+///
+/// # Safety
+/// Must be called with IRQs disabled or from a context where concurrent
+/// ASID operations cannot race (e.g., VSpace creation under lock).
+///
+/// **SMP note:** The current implementation protects the bitmap only with
+/// IRQ disable, which is sufficient while aarch64 is single-core only.
+/// When SMP support is added, a spinlock around `ASID_BITMAP` and
+/// `ASID_GENERATION` must be introduced to prevent concurrent allocation
+/// races across CPUs.
+pub unsafe fn asid_alloc() -> (u16, u64) {
+    unsafe {
+        let bmp = &raw mut ASID_BITMAP;
+        let words = ASID_COUNT / 64;
+        loop {
+            for word_idx in 0..words {
+                let wp = (*bmp).as_mut_ptr().add(word_idx);
+                let word = *wp;
+                if word == u64::MAX {
+                    continue;
+                }
+                let bit = (!word).trailing_zeros() as usize;
+                let asid = word_idx * 64 + bit;
+                if asid == 0 {
+                    *(*bmp).as_mut_ptr() |= 1;
+                    continue;
+                }
+                if asid >= ASID_COUNT {
+                    break;
+                }
+                *wp |= 1u64 << bit;
+                return (asid as u16, *(&raw const ASID_GENERATION));
+            }
+
+            // Bitmap full — recycle: bump generation, flush all TLB, reset.
+            *(&raw mut ASID_GENERATION) += 1;
+            flush_tlb_all();
+            for i in 0..words {
+                *(*bmp).as_mut_ptr().add(i) = 0;
+            }
+            // Reserve ASID 0
+            *(*bmp).as_mut_ptr() |= 1;
+        }
+    }
+}
+
+/// Release an ASID back to the pool and flush its TLB entries.
+///
+/// # Safety
+/// Must be called with IRQs disabled or under appropriate lock.
+pub unsafe fn asid_free(asid: u16) {
+    if asid == 0 || asid as usize >= ASID_COUNT {
+        return;
+    }
+    unsafe {
+        let bmp = &raw mut ASID_BITMAP;
+        let word_idx = asid as usize / 64;
+        let bit = asid as usize % 64;
+        *(*bmp).as_mut_ptr().add(word_idx) &= !(1u64 << bit);
+        flush_asid(asid);
     }
 }
 
@@ -358,15 +546,28 @@ pub fn init() {
         );
     }
 
-    // Step 2: Build the direct physical map sized to actual RAM.
+    // Step 2: Split the shared Stage 3 root into a dedicated TTBR1 kernel
+    // root. In the boot root, L0 indices mean different things for TTBR0 and
+    // TTBR1: for example index 0 is the boot identity map in TTBR0 but the
+    // kernel text region in TTBR1. Teardown of the boot alias therefore
+    // requires independent roots.
+    let boot_root = read_cr3();
+    let kernel_root = unsafe { clone_kernel_root(boot_root) };
+    // SAFETY: `kernel_root` is a valid L0 root cloned from the active boot tables.
+    unsafe {
+        write_ttbr1(kernel_root);
+        KERNEL_ROOT_EARLY = kernel_root;
+    }
+
+    // Step 3: Build the direct physical map sized to actual RAM in TTBR1.
     let max_phys = crate::mm::max_phys();
     // SAFETY: Single-threaded boot context, frame allocator initialized.
     unsafe {
-        init_direct_map(max_phys);
+        init_direct_map(kernel_root, max_phys);
     }
 
-    // Step 3: Register kernel VSpace tracking (needed before any VSpace::new()).
-    crate::mm::vspace::init_kernel_vspace(read_cr3());
+    // Step 4: Register kernel VSpace tracking (needed before any VSpace::new()).
+    crate::mm::vspace::init_kernel_vspace(kernel_root);
 }
 
 // ---------------------------------------------------------------------------
@@ -382,28 +583,29 @@ pub fn init() {
 /// # Safety
 /// Must be called after the frame allocator is initialized.
 /// Must only be called once during boot.
-unsafe fn init_direct_map(max_phys: u64) {
+unsafe fn init_direct_map(kernel_root: u64, max_phys: u64) {
     let huge_page_size: usize = 2 * 1024 * 1024;
-    let direct_map_size = core::cmp::min(
+    let direct_map_end = core::cmp::min(
         ((max_phys as usize + (huge_page_size - 1)) / huge_page_size) * huge_page_size,
         MAX_DIRECT_MAP_SIZE,
-    );
-    if direct_map_size == 0 {
+    ) as u64;
+    if direct_map_end <= QEMU_VIRT_RAM_BASE {
         return;
     }
 
     {
         let s = crate::SerialGuard::acquire();
-        s.puts("[PAGING] Direct map size: ");
-        s.hex(direct_map_size as u64);
+        s.puts("[PAGING] Direct map range: ");
+        s.hex(QEMU_VIRT_RAM_BASE);
+        s.puts("..");
+        s.hex(direct_map_end);
         s.puts(" (max_phys=");
         s.hex(max_phys);
         s.puts(")\n");
     }
 
-    let cr3 = read_cr3();
     // Use identity mapping (bootloader maps low memory phys==virt via TTBR0).
-    let l0_virt = cr3 as *mut u64;
+    let l0_virt = kernel_root as *mut u64;
 
     // L0 index for PHYS_MAP_OFFSET (0xFFFF_8000_0000_0000).
     // (0xFFFF_8000_0000_0000 >> 39) & 0x1FF = 256
@@ -414,7 +616,7 @@ unsafe fn init_direct_map(max_phys: u64) {
     // SAFETY: l0_virt points to the bootloader L0 table via identity map.
     let l0e = unsafe { core::ptr::read_volatile(l0_virt.add(l0_idx)) };
     let l1_phys = if l0e & HW_VALID == 0 {
-        let frame = alloc_frame().expect("Failed to allocate L1 table for direct map");
+        let frame = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect("Failed to allocate L1 table for direct map");
         // SAFETY: frame is a freshly allocated page reachable via identity map.
         unsafe {
             core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE);
@@ -434,25 +636,23 @@ unsafe fn init_direct_map(max_phys: u64) {
 
     // --- L1 → L2 tables, filled with 2 MB block descriptors ---
 
-    let num_huge_pages = direct_map_size / huge_page_size;
-    let entries_per_l2 = 512usize;
-    let num_l2_tables = (num_huge_pages + entries_per_l2 - 1) / entries_per_l2;
+    let mut phys_addr = QEMU_VIRT_RAM_BASE;
+    while phys_addr < direct_map_end {
+        let virt_addr = PHYS_MAP_OFFSET + phys_addr;
+        let l1_idx = ((virt_addr >> 30) & 0x1FF) as usize;
 
-    for l2_idx in 0..num_l2_tables {
         // SAFETY: l1_virt points to an L1 table via identity map.
-        let l1e = unsafe { core::ptr::read_volatile(l1_virt.add(l2_idx)) };
-
+        let l1e = unsafe { core::ptr::read_volatile(l1_virt.add(l1_idx)) };
         let l2_phys = if l1e & HW_VALID == 0 {
-            let frame = alloc_frame().expect("Failed to allocate L2 table for direct map");
+            let frame = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect("Failed to allocate L2 table for direct map");
             // SAFETY: Freshly allocated, identity-mapped.
             unsafe {
                 core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE);
             }
-            // L1 table descriptor.
             let desc = frame | HW_VALID | HW_TABLE_OR_PAGE;
             // SAFETY: Writing to L1 entry via identity map.
             unsafe {
-                core::ptr::write_volatile(l1_virt.add(l2_idx), desc);
+                core::ptr::write_volatile(l1_virt.add(l1_idx), desc);
             }
             frame
         } else {
@@ -460,28 +660,26 @@ unsafe fn init_direct_map(max_phys: u64) {
         };
 
         let l2_virt = l2_phys as *mut u64;
-
-        // Fill L2 with 2 MB block descriptors.
-        for entry_idx in 0..entries_per_l2 {
-            let phys_addr = ((l2_idx * entries_per_l2 + entry_idx) * huge_page_size) as u64;
-            if phys_addr >= direct_map_size as u64 {
+        while phys_addr < direct_map_end {
+            let virt_addr = PHYS_MAP_OFFSET + phys_addr;
+            if ((virt_addr >> 30) & 0x1FF) as usize != l1_idx {
                 break;
             }
 
-            // Block descriptor: bits[1:0] = 0b01 (Valid, not Table)
-            // AttrIdx = 2 (Normal-WB), SH = Inner Shareable, AF = 1
-            // AP = RW (AP[2]=0), UXN = 1 (no execute from direct map)
+            let entry_idx = ((virt_addr >> 21) & 0x1FF) as usize;
             let desc = phys_addr
-                | HW_VALID              // bit 0 (block: 0b01)
-                | HW_AF                 // bit 10
-                | HW_SH_IS             // bits 9:8
-                | (MAIR_IDX_NORMAL_WB << HW_ATTRINDX_SHIFT) // bits 4:2
-                | HW_UXN;              // bit 54
+                | HW_VALID
+                | HW_AF
+                | HW_SH_IS
+                | (MAIR_IDX_NORMAL_WB << HW_ATTRINDX_SHIFT)
+                | HW_UXN;
 
             // SAFETY: Writing to L2 entry via identity map.
             unsafe {
                 core::ptr::write_volatile(l2_virt.add(entry_idx), desc);
             }
+
+            phys_addr += huge_page_size as u64;
         }
     }
 
@@ -516,9 +714,7 @@ unsafe fn ensure_next_table(table: &mut PageTable, index: usize, context: &'stat
         return raw & HW_ADDR_MASK;
     }
 
-    let frame = alloc_frame().expect(context);
-    mark_frame_pt_owned(frame);
-    mark_frame_kernel_runtime(frame);
+    let frame = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect(context);
 
     // SAFETY: `frame` is a freshly allocated page-table frame reachable via
     // the direct map. Zeroing initializes all entries to empty.
@@ -558,10 +754,13 @@ pub unsafe fn map_mmio_page(phys: u64) -> u64 {
     let phys_page = phys & !page_mask;
     let virt_page = PHYS_MAP_OFFSET + phys_page;
 
-    let cr3 = read_cr3();
-    // SAFETY: CR3 points at the active kernel L0 table, reachable via the
-    // already-established direct map.
-    let l0 = unsafe { &mut *(phys_to_virt(cr3) as *mut PageTable) };
+    let kernel_root = kernel_root();
+    if kernel_root == 0 {
+        panic!("kernel MMIO mapping requested before kernel TTBR1 root was registered");
+    }
+    // SAFETY: kernel_root points at the dedicated kernel L0 table, reachable
+    // via the already-established direct map.
+    let l0 = unsafe { &mut *(phys_to_virt(kernel_root) as *mut PageTable) };
 
     // L0 → L1
     let l1_phys = unsafe {
@@ -631,11 +830,11 @@ pub unsafe fn map_mmio_page(phys: u64) -> u64 {
 // clear_boot_identity_map()
 // ---------------------------------------------------------------------------
 
-/// Clear the bootloader identity mapping (L0[0]).
+/// Clear the bootloader identity mapping from the TTBR0 boot root.
 ///
-/// Must be called AFTER all APs have booted. On aarch64 the AP trampoline
-/// executes in low physical memory via TTBR0. Once all APs are in
-/// higher-half kernel code, L0[0] can be safely cleared.
+/// Must be called AFTER all APs have booted. The kernel higher-half now lives
+/// in a dedicated TTBR1 root, so removing TTBR0.L0[0] only drops the low boot
+/// alias without tearing down kernel text/data mappings.
 pub fn clear_boot_identity_map() {
     let cr3 = read_cr3();
     // SAFETY: cr3 → L0 table via the direct map.
@@ -648,4 +847,21 @@ pub fn clear_boot_identity_map() {
 
     // Flush to drop any stale identity-mapped TLB entries.
     flush_tlb_all();
+}
+
+unsafe fn clone_kernel_root(boot_root: u64) -> u64 {
+    let kernel_root = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect("Failed to allocate TTBR1 kernel root");
+
+    // The boot root is still identity-mapped via TTBR0 at this point.
+    let src = boot_root as *const u64;
+    let dst = kernel_root as *mut u64;
+    for i in 0..512 {
+        // SAFETY: both roots are valid 4 KiB L0 tables reachable via the
+        // boot identity mapping during early boot.
+        unsafe {
+            core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i)));
+        }
+    }
+
+    kernel_root
 }

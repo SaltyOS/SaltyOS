@@ -8,6 +8,186 @@
 use super::{PhysAddr, PAGE_SIZE};
 use crate::bootinfo::{MemoryKind, ParsedBootInfo};
 
+// ---------------------------------------------------------------------------
+// FrameOwner — semantic type for PMM ownership tracking
+// ---------------------------------------------------------------------------
+
+/// Sub-kind for MO-internal metadata pages.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MoMetaKind {
+    Radix = 0,
+    Rmap = 1,
+}
+
+/// Sub-kind for kernel-private pages.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KernelMetaKind {
+    PageTable = 0,
+    KernelStack = 1,
+    MapleNode = 2,
+    General = 3,
+}
+
+/// Semantic ownership of a physical frame. Used in PMM APIs for
+/// type-safe allocation, deallocation, and transfer.
+#[derive(Clone, Copy, Debug)]
+pub enum FrameOwner {
+    Free,
+    /// User-visible data page owned by an MO.
+    MoData {
+        mo: *mut crate::cap::memory_object::MemoryObject,
+        page_idx: u32,
+    },
+    /// MO-internal metadata page (radix tree node, reverse map overflow).
+    MoMeta {
+        mo: *mut crate::cap::memory_object::MemoryObject,
+        subkind: MoMetaKind,
+    },
+    /// Kernel-private page (page tables, kernel stacks, Maple tree nodes).
+    KernelPrivate {
+        subkind: KernelMetaKind,
+    },
+    /// File-backed page cache entry (future).
+    PageCache,
+    /// Reserved pool for fault-path metadata allocation.
+    EmergencyReserve,
+}
+
+// ---------------------------------------------------------------------------
+// FrameMeta — packed per-frame storage (16 bytes)
+// ---------------------------------------------------------------------------
+
+/// Owner tag discriminant (matches FrameOwner variants).
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OwnerTag {
+    Free = 0,
+    MoData = 1,
+    MoMeta = 2,
+    KernelPrivate = 3,
+    PageCache = 4,
+    EmergencyReserve = 5,
+}
+
+/// FrameMeta flags (bit field).
+pub const FRAME_FLAG_DIRTY: u8 = 1 << 0;
+pub const FRAME_FLAG_REFERENCED: u8 = 1 << 1;
+pub const FRAME_FLAG_PINNED: u8 = 1 << 2;
+
+/// Packed per-frame metadata. Stored in a contiguous array indexed by
+/// frame number. Provides O(1) reverse lookup from phys addr to owner.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FrameMeta {
+    pub owner_tag: OwnerTag,
+    pub subkind: u8,
+    pub map_count: u8,
+    pub flags: u8,
+    pub page_idx: u32,
+    pub owner_ptr: u64,
+}
+
+impl FrameMeta {
+    pub const EMPTY: Self = Self {
+        owner_tag: OwnerTag::Free,
+        subkind: 0,
+        map_count: 0,
+        flags: 0,
+        page_idx: 0,
+        owner_ptr: 0,
+    };
+
+    /// Convert packed storage to semantic FrameOwner.
+    pub fn to_owner(&self) -> FrameOwner {
+        match self.owner_tag {
+            OwnerTag::Free => FrameOwner::Free,
+            OwnerTag::MoData => FrameOwner::MoData {
+                mo: self.owner_ptr as *mut crate::cap::memory_object::MemoryObject,
+                page_idx: self.page_idx,
+            },
+            OwnerTag::MoMeta => FrameOwner::MoMeta {
+                mo: self.owner_ptr as *mut crate::cap::memory_object::MemoryObject,
+                subkind: if self.subkind == 1 { MoMetaKind::Rmap } else { MoMetaKind::Radix },
+            },
+            OwnerTag::KernelPrivate => FrameOwner::KernelPrivate {
+                subkind: match self.subkind {
+                    0 => KernelMetaKind::PageTable,
+                    1 => KernelMetaKind::KernelStack,
+                    2 => KernelMetaKind::MapleNode,
+                    _ => KernelMetaKind::General,
+                },
+            },
+            OwnerTag::PageCache => FrameOwner::PageCache,
+            OwnerTag::EmergencyReserve => FrameOwner::EmergencyReserve,
+        }
+    }
+
+    /// Set owner from semantic FrameOwner.
+    pub fn set_owner(&mut self, owner: &FrameOwner) {
+        match owner {
+            FrameOwner::Free => {
+                self.owner_tag = OwnerTag::Free;
+                self.subkind = 0;
+                self.page_idx = 0;
+                self.owner_ptr = 0;
+            }
+            FrameOwner::MoData { mo, page_idx } => {
+                self.owner_tag = OwnerTag::MoData;
+                self.subkind = 0;
+                self.page_idx = *page_idx;
+                self.owner_ptr = *mo as u64;
+            }
+            FrameOwner::MoMeta { mo, subkind } => {
+                self.owner_tag = OwnerTag::MoMeta;
+                self.subkind = *subkind as u8;
+                self.page_idx = 0;
+                self.owner_ptr = *mo as u64;
+            }
+            FrameOwner::KernelPrivate { subkind } => {
+                self.owner_tag = OwnerTag::KernelPrivate;
+                self.subkind = *subkind as u8;
+                self.page_idx = 0;
+                self.owner_ptr = 0;
+            }
+            FrameOwner::PageCache => {
+                self.owner_tag = OwnerTag::PageCache;
+                self.subkind = 0;
+                self.page_idx = 0;
+                self.owner_ptr = 0;
+            }
+            FrameOwner::EmergencyReserve => {
+                self.owner_tag = OwnerTag::EmergencyReserve;
+                self.subkind = 0;
+                self.page_idx = 0;
+                self.owner_ptr = 0;
+            }
+        }
+        // map_count and flags are NOT reset — they track VSpace state
+    }
+
+    /// Check if the current owner matches the expected owner for
+    /// panic-on-mismatch verification in free/transfer.
+    pub fn matches_owner(&self, expected: &FrameOwner) -> bool {
+        match (self.owner_tag, expected) {
+            (OwnerTag::Free, FrameOwner::Free) => true,
+            (OwnerTag::MoData, FrameOwner::MoData { mo, page_idx }) => {
+                self.owner_ptr == *mo as u64 && self.page_idx == *page_idx
+            }
+            (OwnerTag::MoMeta, FrameOwner::MoMeta { mo, subkind }) => {
+                self.owner_ptr == *mo as u64 && self.subkind == *subkind as u8
+            }
+            (OwnerTag::KernelPrivate, FrameOwner::KernelPrivate { subkind }) => {
+                self.subkind == *subkind as u8
+            }
+            (OwnerTag::PageCache, FrameOwner::PageCache) => true,
+            (OwnerTag::EmergencyReserve, FrameOwner::EmergencyReserve) => true,
+            _ => false,
+        }
+    }
+}
+
 /// Tracks bitmap physical location for identity→direct map pointer swap.
 struct BitmapState {
     /// Physical address of the bitmap allocation
@@ -25,6 +205,20 @@ static mut BITMAP_STATE: BitmapState = BitmapState {
     frame_count: 0,
 };
 
+#[cfg(target_arch = "aarch64")]
+const EARLY_BITMAP_WINDOW_BASE: u64 = 0x4000_0000;
+#[cfg(target_arch = "aarch64")]
+const EARLY_BITMAP_WINDOW_LIMIT: u64 = 0x8000_0000;
+
+#[cfg(not(target_arch = "aarch64"))]
+const EARLY_BITMAP_WINDOW_BASE: u64 = 0x10_0000;
+#[cfg(not(target_arch = "aarch64"))]
+const EARLY_BITMAP_WINDOW_LIMIT: u64 = 0x4000_0000;
+
+/// Default emergency reserve size (pages). Used by fault-path
+/// NodeAllocator when main pool is nearly exhausted.
+const EMERGENCY_RESERVE_SIZE: usize = 32;
+
 /// Frame allocator using bitmap
 pub struct FrameAllocator {
     /// Bitmap of free frames (1 = free, 0 = used)
@@ -35,26 +229,23 @@ pub struct FrameAllocator {
     total: usize,
     /// Free frames count
     free: usize,
-    /// Per-frame mapping refcounts (PTE mappings)
-    map_refs: &'static mut [u16],
-    /// Per-frame object refcounts (FrameObject ownership)
-    obj_refs: &'static mut [u16],
-    /// Per-frame reclaimability flag (1 = allocator-owned/reclaimable)
-    reclaimable: &'static mut [u8],
-    /// Per-frame page-table ownership flag (1 = used as page table, never reclaim)
-    pt_owned: &'static mut [u8],
-    /// Per-frame kernel-runtime flag (1 = allocated for kernel use, reject untyped exposure)
-    kernel_rt: &'static mut [u8],
+    /// Per-frame metadata (ownership, map_count, flags) — 16 bytes each.
+    meta: &'static mut [FrameMeta],
+    /// Emergency reserve pool: pre-allocated frame PhysAddrs.
+    /// Used only by fault-path NodeAllocator when main pool is low.
+    reserve: [u64; EMERGENCY_RESERVE_SIZE],
+    reserve_count: usize,
 }
 
 impl FrameAllocator {
     /// Create a new frame allocator from boot info.
     ///
     /// Dynamically allocates the bitmap from the first usable memory region
-    /// below 1GB (accessible via bootloader identity mapping). The bitmap
-    /// is initially accessed via identity mapping (phys==virt); after
-    /// `paging::init()`, call `remap_bitmap()` to switch to the direct
-    /// physical map.
+    /// inside the early boot identity-mapped window. On x86_64 this is the
+    /// traditional low-memory area below 1GB; on aarch64 QEMU virt this is
+    /// the guest RAM window starting at 0x4000_0000. The bitmap is initially
+    /// accessed via the bootloader's identity mapping; after `paging::init()`,
+    /// call `remap_bitmap()` to switch to the direct physical map.
     pub fn new(boot_info: &ParsedBootInfo) -> Self {
         let entries = &boot_info.memory_map[..boot_info.memory_map_len];
 
@@ -83,17 +274,11 @@ impl FrameAllocator {
             if entry.kind != MemoryKind::Usable {
                 continue;
             }
-            // Must be below 1GB for identity map access
-            if entry.base >= 0x4000_0000 {
+            let region_start = core::cmp::max(entry.base, EARLY_BITMAP_WINDOW_BASE);
+            let region_end = core::cmp::min(entry.base + entry.length, EARLY_BITMAP_WINDOW_LIMIT);
+            if region_start >= region_end {
                 continue;
             }
-            // Skip first 1MB (BIOS/legacy area)
-            let region_start = if entry.base < 0x10_0000 {
-                0x10_0000u64
-            } else {
-                entry.base
-            };
-            let region_end = core::cmp::min(entry.base + entry.length, 0x4000_0000);
             let needed = (bitmap_pages * PAGE_SIZE) as u64;
 
             let mut candidate = (region_start + (PAGE_SIZE as u64) - 1) & !((PAGE_SIZE as u64) - 1);
@@ -145,17 +330,9 @@ impl FrameAllocator {
         let bitmap: &'static mut [u64] =
             unsafe { core::slice::from_raw_parts_mut(bitmap_ptr, word_count) };
 
-        // Per-frame arrays start as empty slices; populated in Phase 2
-        // SAFETY: Zero-length slices from NonNull::dangling() are valid
-        let map_refs: &'static mut [u16] =
-            unsafe { core::slice::from_raw_parts_mut(core::ptr::NonNull::dangling().as_ptr(), 0) };
-        let obj_refs: &'static mut [u16] =
-            unsafe { core::slice::from_raw_parts_mut(core::ptr::NonNull::dangling().as_ptr(), 0) };
-        let reclaimable: &'static mut [u8] =
-            unsafe { core::slice::from_raw_parts_mut(core::ptr::NonNull::dangling().as_ptr(), 0) };
-        let pt_owned: &'static mut [u8] =
-            unsafe { core::slice::from_raw_parts_mut(core::ptr::NonNull::dangling().as_ptr(), 0) };
-        let kernel_rt: &'static mut [u8] =
+        // Per-frame meta array starts empty; populated in Phase 2
+        // SAFETY: Zero-length slice from NonNull::dangling() is valid
+        let meta: &'static mut [FrameMeta] =
             unsafe { core::slice::from_raw_parts_mut(core::ptr::NonNull::dangling().as_ptr(), 0) };
 
         // Save state for remap
@@ -172,11 +349,9 @@ impl FrameAllocator {
             next_free: 0,
             total: 0,
             free: 0,
-            map_refs,
-            obj_refs,
-            reclaimable,
-            pt_owned,
-            kernel_rt,
+            meta,
+            reserve: [0u64; EMERGENCY_RESERVE_SIZE],
+            reserve_count: 0,
         };
 
         // First pass: mark usable memory regions as free
@@ -270,24 +445,14 @@ impl FrameAllocator {
 
     #[inline]
     fn tracking_ready(&self, frame: usize) -> bool {
-        frame < self.map_refs.len()
-            && frame < self.obj_refs.len()
-            && frame < self.reclaimable.len()
-            && frame < self.pt_owned.len()
-            && frame < self.kernel_rt.len()
+        frame < self.meta.len()
     }
 
     #[inline]
-    fn reset_frame_tracking(&mut self, frame: usize, reclaimable: u8) {
-        if !self.tracking_ready(frame) {
-            return;
+    fn reset_frame_tracking(&mut self, frame: usize) {
+        if self.tracking_ready(frame) {
+            self.meta[frame] = FrameMeta::EMPTY;
         }
-
-        self.map_refs[frame] = 0;
-        self.obj_refs[frame] = 0;
-        self.reclaimable[frame] = reclaimable;
-        self.pt_owned[frame] = 0;
-        self.kernel_rt[frame] = 0;
     }
 
     #[inline]
@@ -295,7 +460,7 @@ impl FrameAllocator {
         let idx = frame / 64;
         let bit = frame % 64;
         self.bitmap[idx] &= !(1u64 << bit);
-        self.reset_frame_tracking(frame, 1);
+        self.reset_frame_tracking(frame);
         self.free -= 1;
         self.next_free = frame + 1;
     }
@@ -415,31 +580,6 @@ impl FrameAllocator {
         None
     }
 
-    pub fn free(&mut self, addr: PhysAddr) {
-        let frame = (addr as usize) / PAGE_SIZE;
-        if frame < self.total {
-            let idx = frame / 64;
-            let bit = frame % 64;
-
-            // Guard against double-free: if the bit is already set (frame already
-            // free), skip the free. This prevents bitmap corruption when VSpace
-            // cleanup incorrectly tries to free untyped-owned pages, or from actual
-            // double-free bugs. Frame allocator uses 1=free, 0=used convention.
-            if self.bitmap[idx] & (1u64 << bit) != 0 {
-                #[cfg(debug_assertions)]
-                crate::println!("[FRAME] WARNING: attempted to free already-free frame at {:#x}", addr);
-                return;
-            }
-
-            self.bitmap[idx] |= 1u64 << bit;
-            self.reset_frame_tracking(frame, 0);
-
-            self.free += 1;
-            if frame < self.next_free {
-                self.next_free = frame;
-            }
-        }
-    }
 
     /// Allocate `count` contiguous physical frames.
     /// Returns the physical address of the first frame, or None if unavailable.
@@ -461,7 +601,7 @@ impl FrameAllocator {
             let jidx = j / 64;
             let jbit = j % 64;
             self.bitmap[jidx] &= !(1u64 << jbit);
-            self.reset_frame_tracking(j, 1);
+            self.reset_frame_tracking(j);
         }
         self.free -= count;
         self.next_free = run_start + count;
@@ -482,22 +622,91 @@ impl FrameAllocator {
         }
     }
 
-    fn try_release_frame(&mut self, frame: usize) {
+    // -----------------------------------------------------------------------
+    // FrameMeta-based ownership API
+    // -----------------------------------------------------------------------
+
+    /// Set a frame's owner. Called after bitmap allocation.
+    pub fn set_owner(&mut self, addr: PhysAddr, owner: &FrameOwner) {
+        if let Some(frame) = self.frame_index(addr) {
+            if self.tracking_ready(frame) {
+                self.meta[frame].set_owner(owner);
+            }
+        }
+    }
+
+    /// Reverse lookup: get the owner metadata for a physical address. O(1).
+    pub fn lookup(&self, addr: PhysAddr) -> Option<&FrameMeta> {
+        let frame = self.frame_index(addr)?;
+        if self.tracking_ready(frame) {
+            Some(&self.meta[frame])
+        } else {
+            None
+        }
+    }
+
+    /// Free a frame with ownership verification. Panics on tag mismatch.
+    pub fn free_owned(&mut self, addr: PhysAddr, expected: &FrameOwner) {
+        if let Some(frame) = self.frame_index(addr) {
+            if self.tracking_ready(frame) && !self.meta[frame].matches_owner(expected) {
+                // Ownership mismatch — likely double-free or use-after-free
+                let s = crate::SerialGuard::acquire();
+                s.puts("[FRAME] PANIC: free_owned mismatch at ");
+                s.hex(addr);
+                s.puts(" expected_tag=");
+                s.dec(match expected {
+                    FrameOwner::Free => 0,
+                    FrameOwner::MoData { .. } => 1,
+                    FrameOwner::MoMeta { .. } => 2,
+                    FrameOwner::KernelPrivate { .. } => 3,
+                    FrameOwner::PageCache => 4,
+                    FrameOwner::EmergencyReserve => 5,
+                });
+                s.puts(" actual_tag=");
+                s.dec(self.meta[frame].owner_tag as u64);
+                s.puts("\n");
+                drop(s);
+                panic!("PMM free_owned: ownership mismatch");
+            }
+            self.free_internal(frame);
+        }
+    }
+
+    /// Transfer ownership between non-Free states. Panics on tag mismatch.
+    pub fn transfer(&mut self, addr: PhysAddr, old: &FrameOwner, new: &FrameOwner) {
+        if let Some(frame) = self.frame_index(addr) {
+            if self.tracking_ready(frame) {
+                if !self.meta[frame].matches_owner(old) {
+                    panic!("PMM transfer: old owner mismatch");
+                }
+                self.meta[frame].set_owner(new);
+            }
+        }
+    }
+
+    /// Increment map_count when a PTE is installed for this frame.
+    pub fn retain_mapping_ref(&mut self, addr: PhysAddr) {
+        if let Some(frame) = self.frame_index(addr) {
+            if self.tracking_ready(frame) {
+                self.meta[frame].map_count = self.meta[frame].map_count.saturating_add(1);
+            }
+        }
+    }
+
+    /// Decrement map_count when a PTE is removed for this frame.
+    pub fn release_mapping_ref(&mut self, addr: PhysAddr) {
+        if let Some(frame) = self.frame_index(addr) {
+            if self.tracking_ready(frame) {
+                if self.meta[frame].map_count > 0 {
+                    self.meta[frame].map_count -= 1;
+                }
+            }
+        }
+    }
+
+    /// Internal: actually return a frame to the free pool.
+    fn free_internal(&mut self, frame: usize) {
         if frame >= self.total {
-            return;
-        }
-        if !self.tracking_ready(frame) {
-            return;
-        }
-        if self.reclaimable[frame] == 0 {
-            return;
-        }
-        // Page-table frames are never reclaimed via refcount — only via explicit
-        // VSpace teardown which calls clear_pt_owned() first.
-        if self.pt_owned[frame] != 0 {
-            return;
-        }
-        if self.map_refs[frame] != 0 || self.obj_refs[frame] != 0 {
             return;
         }
         let idx = frame / 64;
@@ -505,126 +714,11 @@ impl FrameAllocator {
         if self.bitmap[idx] & (1u64 << bit) == 0 {
             self.bitmap[idx] |= 1u64 << bit;
             self.free += 1;
-            self.reclaimable[frame] = 0;
-            // Clear kernel-runtime flag when frame is returned to free pool
-            self.kernel_rt[frame] = 0;
+            if self.tracking_ready(frame) {
+                self.meta[frame] = FrameMeta::EMPTY;
+            }
             if frame < self.next_free {
                 self.next_free = frame;
-            }
-        }
-    }
-
-    /// Mark a frame as used for page tables (prevents refcount-driven reclamation).
-    pub fn mark_pt_owned(&mut self, addr: PhysAddr) {
-        if let Some(frame) = self.frame_index(addr) {
-            if frame < self.pt_owned.len() {
-                self.pt_owned[frame] = 1;
-            }
-        }
-    }
-
-    /// Clear the page-table ownership flag (called during VSpace teardown before release).
-    pub fn clear_pt_owned(&mut self, addr: PhysAddr) {
-        if let Some(frame) = self.frame_index(addr) {
-            if frame < self.pt_owned.len() {
-                self.pt_owned[frame] = 0;
-            }
-        }
-    }
-
-    /// Mark a frame as allocated for kernel runtime use (debug: reject untyped exposure).
-    pub fn mark_kernel_runtime(&mut self, addr: PhysAddr) {
-        if let Some(frame) = self.frame_index(addr) {
-            if frame < self.kernel_rt.len() {
-                self.kernel_rt[frame] = 1;
-            }
-        }
-    }
-
-    /// Clear the kernel-runtime flag (called during VSpace teardown alongside clear_pt_owned).
-    pub fn clear_kernel_runtime(&mut self, addr: PhysAddr) {
-        if let Some(frame) = self.frame_index(addr) {
-            if frame < self.kernel_rt.len() {
-                self.kernel_rt[frame] = 0;
-            }
-        }
-    }
-
-    pub fn retain_mapping_ref(&mut self, addr: PhysAddr) {
-        if let Some(frame) = self.frame_index(addr) {
-            if !self.tracking_ready(frame) {
-                return;
-            }
-            if self.reclaimable[frame] == 0 {
-                return;
-            }
-            self.map_refs[frame] = self.map_refs[frame].saturating_add(1);
-        }
-    }
-
-    pub fn release_mapping_ref(&mut self, addr: PhysAddr) {
-        if let Some(frame) = self.frame_index(addr) {
-            if !self.tracking_ready(frame) {
-                return;
-            }
-            if self.reclaimable[frame] == 0 {
-                return;
-            }
-            if self.map_refs[frame] == 0 {
-                // Underflow: caller released more than it retained.
-                #[cfg(debug_assertions)]
-                {
-                    crate::serial_puts("[FRAME] WARNING: release_mapping_ref underflow at ");
-                    crate::serial_hex(addr);
-                    crate::serial_puts("\n");
-                }
-                return;
-            }
-            self.map_refs[frame] -= 1;
-            self.try_release_frame(frame);
-        }
-    }
-
-    pub fn retain_object_ref(&mut self, addr: PhysAddr, size_bits: u8) {
-        let bits = if size_bits < 12 { 12 } else { size_bits };
-        let pages = 1usize << (bits as usize - 12);
-        let base = (addr as usize) / PAGE_SIZE;
-        for i in 0..pages {
-            let frame = base + i;
-            if frame < self.total && self.tracking_ready(frame) {
-                #[cfg(debug_assertions)]
-                if self.kernel_rt[frame] != 0 {
-                    let frame_addr = (frame * PAGE_SIZE) as PhysAddr;
-                    crate::serial_puts("[FRAME] BUG: retain_object_ref on kernel-runtime frame ");
-                    crate::serial_hex(frame_addr);
-                    crate::serial_puts("\n");
-                }
-                self.reclaimable[frame] = 1;
-                self.obj_refs[frame] = self.obj_refs[frame].saturating_add(1);
-            }
-        }
-    }
-
-    pub fn release_object_ref(&mut self, addr: PhysAddr, size_bits: u8) {
-        let bits = if size_bits < 12 { 12 } else { size_bits };
-        let pages = 1usize << (bits as usize - 12);
-        let base = (addr as usize) / PAGE_SIZE;
-        for i in 0..pages {
-            let frame = base + i;
-            if frame < self.total && self.tracking_ready(frame) {
-                if self.obj_refs[frame] == 0 {
-                    // Underflow: caller released more than it retained.
-                    #[cfg(debug_assertions)]
-                    {
-                        let frame_addr = (frame * PAGE_SIZE) as PhysAddr;
-                        crate::serial_puts("[FRAME] WARNING: release_object_ref underflow at ");
-                        crate::serial_hex(frame_addr);
-                        crate::serial_puts("\n");
-                    }
-                    continue;
-                }
-                self.obj_refs[frame] -= 1;
-                self.try_release_frame(frame);
             }
         }
     }
@@ -645,6 +739,41 @@ impl FrameAllocator {
         self.bitmap = unsafe { core::slice::from_raw_parts_mut(new_virt, state.word_count) };
     }
 
+    // -----------------------------------------------------------------------
+    // Emergency reserve pool
+    // -----------------------------------------------------------------------
+
+    /// Allocate from the emergency reserve. Only for fault-path
+    /// NodeAllocator when the main pool is critically low.
+    pub fn alloc_reserve(&mut self) -> Option<PhysAddr> {
+        if self.reserve_count == 0 {
+            return None;
+        }
+        self.reserve_count -= 1;
+        let phys = self.reserve[self.reserve_count];
+        self.reserve[self.reserve_count] = 0;
+        Some(phys)
+    }
+
+    /// Replenish the reserve pool from the main free pool.
+    /// Called during idle or after mmsrv handles OOM.
+    pub fn replenish_reserve(&mut self, count: usize) {
+        let target = core::cmp::min(self.reserve_count + count, EMERGENCY_RESERVE_SIZE);
+        while self.reserve_count < target {
+            if let Some(phys) = self.alloc() {
+                self.reserve[self.reserve_count] = phys;
+                self.reserve_count += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Current reserve level.
+    pub fn reserve_level(&self) -> usize {
+        self.reserve_count
+    }
+
     /// Phase 2: Allocate per-frame tracking arrays after direct map is established.
     ///
     /// # Safety
@@ -656,99 +785,37 @@ impl FrameAllocator {
             return;
         }
 
-        // Allocate per-frame map_refs (u16 per frame)
-        let map_ref_bytes = frame_count * core::mem::size_of::<u16>();
-        let map_ref_pages = (map_ref_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-        let map_ref_phys = match self.alloc_contiguous(map_ref_pages) {
+        // Allocate unified FrameMeta array (16 bytes per frame)
+        let meta_bytes = frame_count * core::mem::size_of::<FrameMeta>();
+        let meta_pages = (meta_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+        let meta_phys = match self.alloc_contiguous(meta_pages) {
             Some(addr) => addr,
             None => {
-                crate::serial_puts_raw("[FRAME] FATAL: Phase 2 map_refs alloc failed\n");
+                crate::serial_puts_raw("[FRAME] FATAL: Phase 2 FrameMeta alloc failed\n");
                 loop {
                     crate::arch::halt();
                 }
             }
         };
-        let map_ref_virt = super::phys_to_virt(map_ref_phys) as *mut u16;
-        // SAFETY: Freshly allocated memory via direct map
-        unsafe { core::ptr::write_bytes(map_ref_virt, 0, frame_count); }
-        self.map_refs = unsafe { core::slice::from_raw_parts_mut(map_ref_virt, frame_count) };
+        let meta_virt = super::phys_to_virt(meta_phys) as *mut FrameMeta;
+        // SAFETY: Freshly allocated contiguous memory via direct map
+        unsafe {
+            core::ptr::write_bytes(meta_virt, 0, frame_count);
+        }
+        self.meta = unsafe { core::slice::from_raw_parts_mut(meta_virt, frame_count) };
 
-        // Allocate per-frame obj_refs (u16 per frame)
-        let obj_ref_bytes = frame_count * core::mem::size_of::<u16>();
-        let obj_ref_pages = (obj_ref_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-        let obj_ref_phys = match self.alloc_contiguous(obj_ref_pages) {
-            Some(addr) => addr,
-            None => {
-                crate::serial_puts_raw("[FRAME] FATAL: Phase 2 obj_refs alloc failed\n");
-                loop {
-                    crate::arch::halt();
-                }
-            }
-        };
-        let obj_ref_virt = super::phys_to_virt(obj_ref_phys) as *mut u16;
-        // SAFETY: Freshly allocated memory via direct map
-        unsafe { core::ptr::write_bytes(obj_ref_virt, 0, frame_count); }
-        self.obj_refs = unsafe { core::slice::from_raw_parts_mut(obj_ref_virt, frame_count) };
+        // Replenish emergency reserve after meta array is ready
+        self.replenish_reserve(EMERGENCY_RESERVE_SIZE);
 
-        // Allocate per-frame reclaimable flags (u8 per frame)
-        let reclaimable_bytes = frame_count * core::mem::size_of::<u8>();
-        let reclaimable_pages = (reclaimable_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-        let reclaimable_phys = match self.alloc_contiguous(reclaimable_pages) {
-            Some(addr) => addr,
-            None => {
-                crate::serial_puts_raw("[FRAME] FATAL: Phase 2 reclaimable alloc failed\n");
-                loop {
-                    crate::arch::halt();
-                }
-            }
-        };
-        let reclaimable_virt = super::phys_to_virt(reclaimable_phys) as *mut u8;
-        // SAFETY: Freshly allocated memory via direct map
-        unsafe { core::ptr::write_bytes(reclaimable_virt, 0, frame_count); }
-        self.reclaimable = unsafe { core::slice::from_raw_parts_mut(reclaimable_virt, frame_count) };
-
-        // Allocate per-frame pt_owned flags (u8 per frame)
-        let pt_owned_bytes = frame_count * core::mem::size_of::<u8>();
-        let pt_owned_pages = (pt_owned_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-        let pt_owned_phys = match self.alloc_contiguous(pt_owned_pages) {
-            Some(addr) => addr,
-            None => {
-                crate::serial_puts_raw("[FRAME] FATAL: Phase 2 pt_owned alloc failed\n");
-                loop {
-                    crate::arch::halt();
-                }
-            }
-        };
-        let pt_owned_virt = super::phys_to_virt(pt_owned_phys) as *mut u8;
-        // SAFETY: Freshly allocated memory via direct map
-        unsafe { core::ptr::write_bytes(pt_owned_virt, 0, frame_count); }
-        self.pt_owned = unsafe { core::slice::from_raw_parts_mut(pt_owned_virt, frame_count) };
-
-        // Allocate per-frame kernel_rt flags (u8 per frame)
-        let kernel_rt_bytes = frame_count * core::mem::size_of::<u8>();
-        let kernel_rt_pages = (kernel_rt_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-        let kernel_rt_phys = match self.alloc_contiguous(kernel_rt_pages) {
-            Some(addr) => addr,
-            None => {
-                crate::serial_puts_raw("[FRAME] FATAL: Phase 2 kernel_rt alloc failed\n");
-                loop {
-                    crate::arch::halt();
-                }
-            }
-        };
-        let kernel_rt_virt = super::phys_to_virt(kernel_rt_phys) as *mut u8;
-        // SAFETY: Freshly allocated memory via direct map
-        unsafe { core::ptr::write_bytes(kernel_rt_virt, 0, frame_count); }
-        self.kernel_rt = unsafe { core::slice::from_raw_parts_mut(kernel_rt_virt, frame_count) };
-
-        let total_pages = map_ref_pages + obj_ref_pages + reclaimable_pages + pt_owned_pages + kernel_rt_pages;
         {
             let s = crate::SerialGuard::acquire();
             s.puts("[FRAME] Phase 2: per-frame arrays allocated (");
             s.dec(frame_count as u64);
             s.puts(" frames, ");
-            s.dec(total_pages as u64);
-            s.puts(" pages)\n");
+            s.dec(meta_pages as u64);
+            s.puts(" pages, reserve=");
+            s.dec(self.reserve_count as u64);
+            s.puts(")\n");
         }
     }
 

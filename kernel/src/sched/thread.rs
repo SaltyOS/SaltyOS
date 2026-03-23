@@ -255,7 +255,11 @@ pub struct ThreadContext {
 pub struct ThreadContext {
     /// General purpose registers x0-x30
     pub x: [u64; 31],
-    /// Stack pointer (SP_EL0)
+    /// Saved EL1 stack pointer / context-switch anchor.
+    ///
+    /// For inactive/ready threads this points at the saved callee-saved
+    /// register frame consumed by `aarch64_context_switch`. It is not the
+    /// user-mode SP; first user dispatch stores SP_EL0 in `x[19]`.
     pub sp: u64,
     /// Exception link register (return address)
     pub elr_el1: u64,

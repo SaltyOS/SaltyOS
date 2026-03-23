@@ -7,6 +7,7 @@
 mod cdt;
 pub(crate) mod cnode;
 pub mod ioport;
+pub mod memory_object;
 mod object;
 mod refcount;
 mod slot;
@@ -290,7 +291,7 @@ impl Capability {
 /// Dynamically allocates slot and metadata arrays proportional to available
 /// physical memory. Must be called after `paging::init()` (direct map available).
 pub fn init() {
-    let free = crate::mm::free_frame_count();
+    let free = crate::mm::pmm_free_count();
     // Slot demand is dominated by fixed boot costs (~240 shared-lib cache +
     // copies, ~50/service × 6 services, ~30/fork) rather than RAM size.
     // Floor of 768 covers the standard 6-service boot + test forks.

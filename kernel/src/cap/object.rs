@@ -19,6 +19,7 @@ pub enum ObjectType {
     IrqHandler = 8,
     IoPort = 9,
     SchedContext = 10,
+    MemoryObject = 11,
 }
 
 /// Base kernel object header with inline reference count

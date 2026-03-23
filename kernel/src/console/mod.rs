@@ -17,7 +17,7 @@
 mod fb;
 mod font;
 
-use crate::mm::{alloc_contiguous_frames, free_frame_count, phys_to_virt, PAGE_SIZE};
+use crate::mm::{pmm_alloc_contiguous, pmm_free_count, phys_to_virt, PAGE_SIZE};
 use crate::FramebufferInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -121,7 +121,7 @@ fn pack_color(r: u8, g: u8, b: u8, red_pos: u8, green_pos: u8, blue_pos: u8) -> 
 /// (requires memmove on scroll, but still avoids rendering to VRAM directly).
 fn alloc_shadow(visible_size: usize) -> (*mut u8, usize, bool) {
     let pages_2x = (visible_size * 2 + PAGE_SIZE - 1) / PAGE_SIZE;
-    if let Some(phys) = alloc_contiguous_frames(pages_2x) {
+    if let Some(phys) = pmm_alloc_contiguous(pages_2x) {
         let ptr = phys_to_virt(phys) as *mut u8;
         // SAFETY: Contiguous physical frames mapped via direct physical map.
         unsafe { core::ptr::write_bytes(ptr, 0, pages_2x * PAGE_SIZE) };
@@ -130,7 +130,7 @@ fn alloc_shadow(visible_size: usize) -> (*mut u8, usize, bool) {
 
     // Fallback: 1x visible size (no ring, memmove on scroll)
     let pages_1x = (visible_size + PAGE_SIZE - 1) / PAGE_SIZE;
-    if let Some(phys) = alloc_contiguous_frames(pages_1x) {
+    if let Some(phys) = pmm_alloc_contiguous(pages_1x) {
         let ptr = phys_to_virt(phys) as *mut u8;
         // SAFETY: Contiguous physical frames mapped via direct physical map.
         unsafe { core::ptr::write_bytes(ptr, 0, pages_1x * PAGE_SIZE) };
@@ -178,7 +178,7 @@ pub fn init(fb_info: &FramebufferInfo) {
 
     let visible_size = fb_info.height as usize * fb_info.pitch as usize;
     let visible_pages = (visible_size + PAGE_SIZE - 1) / PAGE_SIZE;
-    let free = free_frame_count();
+    let free = pmm_free_count();
 
     // If shadow would consume >= 1/3 of free frames, skip it to preserve
     // memory for userland (display server, procmgr, etc.).

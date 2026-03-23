@@ -1,7 +1,8 @@
 //! ELF64 Loader
 //!
 //! Loads PIE (ET_DYN) and static (ET_EXEC) ELF64 binaries into a user VSpace.
-//! Supports R_X86_64_RELATIVE relocations for position-independent executables.
+//! Supports architecture-relative RELA relocations for position-independent
+//! executables.
 //!
 //! Ported from boot/stage3/elf.c + elf.h, adapted for kernel-side page-at-a-time
 //! VSpace mapping instead of flat memcpy.
@@ -9,7 +10,7 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use crate::mm::vspace::{PageFlags, VSpace};
-use crate::mm::{alloc_frame, phys_to_virt, PAGE_SIZE};
+use crate::mm::{pmm_alloc, frame::FrameOwner, frame::KernelMetaKind, phys_to_virt, PAGE_SIZE};
 
 // ELF64 header
 #[repr(C)]
@@ -68,6 +69,7 @@ const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 const EM_X86_64: u16 = 62;
+const EM_AARCH64: u16 = 183;
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 const PF_X: u32 = 1;
@@ -78,6 +80,12 @@ const DT_RELA: i64 = 7;
 const DT_RELASZ: i64 = 8;
 const DT_RELAENT: i64 = 9;
 const R_X86_64_RELATIVE: u32 = 8;
+const R_AARCH64_RELATIVE: u32 = 1027;
+
+#[cfg(target_arch = "x86_64")]
+const ELF_RELATIVE_RELOC: u32 = R_X86_64_RELATIVE;
+#[cfg(target_arch = "aarch64")]
+const ELF_RELATIVE_RELOC: u32 = R_AARCH64_RELATIVE;
 
 /// ELF load errors
 #[derive(Debug)]
@@ -145,7 +153,7 @@ fn read_struct<T: Copy>(data: &[u8], offset: usize) -> Option<T> {
 /// For ET_EXEC: loads at fixed addresses from program headers.
 ///
 /// Each page of each PT_LOAD segment gets:
-///   1. alloc_frame()
+///   1. pmm_alloc(KernelPrivate)
 ///   2. copy data (or zero for BSS) into phys_to_virt(frame)
 ///   3. vspace.map(page_vaddr, frame, flags)
 pub fn load_elf(
@@ -174,7 +182,12 @@ pub fn load_elf(
     if ehdr.e_type != ET_EXEC && ehdr.e_type != ET_DYN {
         return Err(ElfError::BadType);
     }
+    #[cfg(target_arch = "x86_64")]
     if ehdr.e_machine != EM_X86_64 {
+        return Err(ElfError::BadArch);
+    }
+    #[cfg(target_arch = "aarch64")]
+    if ehdr.e_machine != EM_AARCH64 {
         return Err(ElfError::BadArch);
     }
 
@@ -241,7 +254,7 @@ pub fn load_elf(
                 phys
             } else {
                 // Allocate new physical frame
-                let phys = alloc_frame().ok_or(ElfError::OutOfMemory)?;
+                let phys = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::General }).ok_or(ElfError::OutOfMemory)?;
                 let ptr = phys_to_virt(phys) as *mut u8;
                 unsafe {
                     core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
@@ -416,8 +429,9 @@ fn apply_relocations(
         let rela = read_struct::<Elf64Rela>(data, entry_off).ok_or(ElfError::RelocFailed)?;
         let reloc_type = (rela.r_info & 0xFFFF_FFFF) as u32;
 
-        if reloc_type == R_X86_64_RELATIVE {
-            // R_X86_64_RELATIVE: *target = B + A, where B = delta (slide)
+        if reloc_type == ELF_RELATIVE_RELOC {
+            // Relative relocations write the relocated virtual address
+            // directly into the target slot: *target = base + addend.
             let target_vaddr = rela.r_offset.wrapping_add(delta);
             let value = delta.wrapping_add(rela.r_addend as u64);
 
@@ -434,7 +448,7 @@ fn apply_relocations(
                 }
             }
         }
-        // Ignore other relocation types (R_X86_64_NONE, etc.)
+        // Ignore other relocation types (NONE, ABS64, etc.)
     }
 
     Ok(())

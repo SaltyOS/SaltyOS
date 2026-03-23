@@ -10,7 +10,7 @@
 use core::ptr;
 
 /// PL011 base address on QEMU virt machine
-const PL011_BASE: usize = 0x0900_0000;
+pub const PL011_PHYS_BASE: u64 = 0x0900_0000;
 
 /// PL011 register offsets
 const UARTDR: usize = 0x000;   // Data Register
@@ -23,7 +23,7 @@ const FR_TXFF: u32 = 1 << 5;   // Transmit FIFO full
 const FR_RXFE: u32 = 1 << 4;   // Receive FIFO empty
 
 /// Base address (may be updated after paging init to use direct map)
-static mut UART_BASE: usize = PL011_BASE;
+static mut UART_BASE: usize = PL011_PHYS_BASE as usize;
 
 /// Read a PL011 register
 #[inline(always)]
@@ -61,6 +61,12 @@ pub fn init() {
 pub fn set_base(new_base: usize) {
     // SAFETY: Called once during paging init, single-threaded at that point
     unsafe { core::ptr::addr_of_mut!(UART_BASE).write_volatile(new_base); }
+}
+
+/// Remap the UART into the kernel MMIO window after paging comes up.
+pub fn remap_to_direct_map() {
+    let virt = unsafe { super::paging::map_mmio_page(PL011_PHYS_BASE) };
+    set_base(virt as usize);
 }
 
 /// Write a single byte to the UART
