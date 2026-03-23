@@ -13,6 +13,9 @@
 #include "../../../common/print.h"
 #include "../../config.h"
 
+#define AARCH64_QEMU_VIRT_RAM_BASE    0x40000000ULL
+#define AARCH64_BOOT_IDENTITY_LIMIT   0x80000000ULL
+
 /* Page table allocator */
 static uint64_t next_page_table = 0;
 static uint64_t page_table_limit = 0;
@@ -80,7 +83,7 @@ int paging_map_region(uint64_t root_table, uint64_t virt, uint64_t phys,
     uint64_t offset;
     for (offset = 0; offset < size; offset += PAGING_PAGE_2M) {
         if (map_2m_block(root_table, virt + offset, phys + offset, flags) != 0) {
-            serial_puts("paging_map_region: failed to map 2MB block\n");
+            print_str("paging_map_region: failed to map 2MB block\n");
             return -1;
         }
     }
@@ -126,9 +129,15 @@ uint64_t paging_init_dynamic(uint64_t pt_pool_base, uint64_t pt_pool_size,
     /* Flags for kernel mapping: RWX for simplicity during boot */
     uint64_t kern_flags = PTE_SH_IS | PTE_ATTR_IDX(MAIR_IDX_NORMAL_WB) | PTE_AP_RW_EL1;
 
-    /* Identity map first 1GB (for boot continuation) using 2MB blocks */
+    /*
+     * Identity map the QEMU virt RAM window used by the aarch64 UEFI path.
+     * Guest RAM starts at 0x40000000, so low x86-style identity mappings do
+     * not cover the Stage 3 image or the BootAlloc-owned buffers.
+     */
     uint64_t addr;
-    for (addr = 0; addr < 0x40000000ULL; addr += PAGING_PAGE_2M) {
+    for (addr = AARCH64_QEMU_VIRT_RAM_BASE;
+         addr < AARCH64_BOOT_IDENTITY_LIMIT;
+         addr += PAGING_PAGE_2M) {
         if (map_2m_block(l0, addr, addr, kern_flags) != 0)
             return 0;
     }

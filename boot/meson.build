@@ -27,53 +27,51 @@ if build_bios_boot
 endif
 
 # =============================================================================
-# Stage 1: UEFI
+# Stage 1: UEFI (all architectures — UEFI APIs are arch-neutral)
 # =============================================================================
 
-if arch == 'x86_64'
-  # UEFI compilation flags: clang --target=x86_64-unknown-uefi produces COFF objects
-  # directly, with MS ABI calling convention. No ELF->PE conversion needed.
-  uefi_c_args = c_efi_args + [
-    '-I' + meson.current_source_dir(),
-  ]
+# UEFI compilation flags: clang --target=<arch>-unknown-uefi produces COFF objects
+# directly, with the appropriate calling convention. No ELF->PE conversion needed.
+uefi_c_args = c_efi_args + [
+  '-I' + meson.current_source_dir(),
+]
 
-  # Common UEFI print utility
-  uefi_common_src = files(
-    'common/efi/print.c',
-  )
+# Common UEFI print utility
+uefi_common_src = files(
+  'common/efi/print.c',
+)
 
-  # Stage 1 UEFI source
-  stage1_uefi_c_src = files(
-    'stage1/arch/x86/uefi/entry.c',
-  ) + uefi_common_src
+# Stage 1 UEFI source (same entry.c works for both x86_64 and aarch64)
+stage1_uefi_c_src = files(
+  'stage1/arch/x86/uefi/entry.c',
+) + uefi_common_src
 
-  # Compile Stage 1 UEFI C files (produces COFF .obj)
-  stage1_uefi_c_objs = []
-  foreach src : stage1_uefi_c_src
-    src_name = fs.name(src)
-    obj_name = src_name.replace('.c', '.obj')
-    stage1_uefi_c_objs += custom_target('stage1_uefi_' + obj_name,
-      input: src,
-      output: 'stage1_uefi_' + obj_name,
-      command: cc_cmd + uefi_c_args + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
-      build_by_default: true,
-    )
-  endforeach
-
-  # Link Stage 1 UEFI as PE/COFF EFI application directly via lld-link
-  efi = custom_target('efi',
-    input: stage1_uefi_c_objs,
-    output: efi_binary_name,
-    command: [lld_link,
-              '-subsystem:efi_application',
-              '-nodefaultlib',
-              '-dll',
-              '-entry:efi_main',
-              '-out:@OUTPUT@',
-              '@INPUT@'],
+# Compile Stage 1 UEFI C files (produces COFF .obj)
+stage1_uefi_c_objs = []
+foreach src : stage1_uefi_c_src
+  src_name = fs.name(src)
+  obj_name = src_name.replace('.c', '.obj')
+  stage1_uefi_c_objs += custom_target('stage1_uefi_' + obj_name,
+    input: src,
+    output: 'stage1_uefi_' + obj_name,
+    command: cc_cmd + uefi_c_args + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
-endif
+endforeach
+
+# Link Stage 1 UEFI as PE/COFF EFI application directly via lld-link
+efi = custom_target('efi',
+  input: stage1_uefi_c_objs,
+  output: efi_binary_name,
+  command: [lld_link,
+            '-subsystem:efi_application',
+            '-nodefaultlib',
+            '-dll',
+            '-entry:efi_main',
+            '-out:@OUTPUT@',
+            '@INPUT@'],
+  build_by_default: true,
+)
 
 # =============================================================================
 # Stage 2: BIOS x86 (32-bit protected mode with BTX/V86)
@@ -147,42 +145,40 @@ if build_bios_boot
 endif
 
 # =============================================================================
-# Stage 2: UEFI (x86_64)
+# Stage 2: UEFI (all architectures — same C code, different UEFI target)
 # =============================================================================
 
-if arch == 'x86_64'
-  # Stage 2 UEFI source
-  stage2_uefi_c_src = files(
-    'stage2/arch/x86/uefi/main.c',
-  ) + uefi_common_src
+# Stage 2 UEFI source
+stage2_uefi_c_src = files(
+  'stage2/arch/x86/uefi/main.c',
+) + uefi_common_src
 
-  # Compile Stage 2 UEFI C files (produces COFF .obj)
-  stage2_uefi_c_objs = []
-  foreach src : stage2_uefi_c_src
-    src_name = fs.name(src)
-    obj_name = src_name.replace('.c', '.obj')
-    stage2_uefi_c_objs += custom_target('stage2_uefi_' + obj_name,
-      input: src,
-      output: 'stage2_uefi_' + obj_name,
-      command: cc_cmd + uefi_c_args + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
-      build_by_default: true,
-    )
-  endforeach
-
-  # Link Stage 2 UEFI as PE/COFF EFI application directly via lld-link
-  stage2_efi = custom_target('stage2_efi',
-    input: stage2_uefi_c_objs,
-    output: 'stage2.efi',
-    command: [lld_link,
-              '-subsystem:efi_application',
-              '-nodefaultlib',
-              '-dll',
-              '-entry:efi_main',
-              '-out:@OUTPUT@',
-              '@INPUT@'],
+# Compile Stage 2 UEFI C files (produces COFF .obj)
+stage2_uefi_c_objs = []
+foreach src : stage2_uefi_c_src
+  src_name = fs.name(src)
+  obj_name = src_name.replace('.c', '.obj')
+  stage2_uefi_c_objs += custom_target('stage2_uefi_' + obj_name,
+    input: src,
+    output: 'stage2_uefi_' + obj_name,
+    command: cc_cmd + uefi_c_args + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
-endif
+endforeach
+
+# Link Stage 2 UEFI as PE/COFF EFI application directly via lld-link
+stage2_efi = custom_target('stage2_efi',
+  input: stage2_uefi_c_objs,
+  output: 'stage2.efi',
+  command: [lld_link,
+            '-subsystem:efi_application',
+            '-nodefaultlib',
+            '-dll',
+            '-entry:efi_main',
+            '-out:@OUTPUT@',
+            '@INPUT@'],
+  build_by_default: true,
+)
 
 # =============================================================================
 # Stage 3: Kernel Loader (32-bit BIOS, transitions to 64-bit at end)
@@ -284,8 +280,8 @@ endif
 # Stage 3: UEFI Kernel Loader (64-bit, loaded by UEFI Stage 2)
 # =============================================================================
 
+# Architecture-specific entry assembly and paging
 if arch == 'x86_64'
-  # Stage 3 UEFI entry assembly (64-bit entry point)
   stage3_uefi_entry_asm = custom_target('stage3_uefi_entry_asm',
     input: 'stage3/arch/x86/uefi/entry_uefi.asm',
     output: 'stage3_uefi_entry.o',
@@ -294,63 +290,71 @@ if arch == 'x86_64'
               '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
-
-  # Stage 3 UEFI C sources (subset - no BTX, disk, fs, mode_switch)
-  stage3_uefi_c_src = files(
-    'stage3/main.c',
-    'stage3/uefi_main.c',
-    'stage3/boot_alloc.c',
-    'stage3/elf.c',
-    'stage3/arch/x86/paging.c',
-    'stage3/handoff.c',
-  )
-
-  # Stage 3 UEFI common sources (string, print, fb - no udiv64 needed for 64-bit)
-  stage3_uefi_common_src = files(
-    'common/string.c',
-    'common/print.c',
-    'common/fb_console.c',
-    'common/font_8x16.c',
-  )
-
-  stage3_uefi_c_args = c_stage3_args + [
-    '-DSTAGE3_UEFI',
-    '-I' + meson.current_source_dir(),
-  ]
-
+  stage3_paging_src = files('stage3/arch/x86/paging.c')
   stage3_uefi_ld_script = meson.current_source_dir() / 'stage3/arch/x86/uefi/stage3.ld'
-
-  # Compile Stage 3 UEFI C files
-  stage3_uefi_c_objs = []
-  foreach src : stage3_uefi_c_src + stage3_uefi_common_src
-    src_name = fs.name(src)
-    obj_name = src_name.replace('.c', '.o')
-    stage3_uefi_c_objs += custom_target('stage3_uefi_' + obj_name,
-      input: src,
-      output: 'stage3_uefi_' + obj_name,
-      command: cc_cmd + stage3_uefi_c_args + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
-      build_by_default: true,
-    )
-  endforeach
-
-  # Link Stage 3 UEFI ELF (64-bit)
-  stage3_uefi_elf = custom_target('stage3_uefi_elf',
-    input: [stage3_uefi_entry_asm] + stage3_uefi_c_objs,
-    output: 'stage3_uefi.elf',
-    command: ['ld.lld', '-m', kernel_link_emulation, '-nostdlib', '-static',
-              '-T', stage3_uefi_ld_script,
-              '-o', '@OUTPUT@', '@INPUT@'],
+elif arch == 'aarch64'
+  stage3_uefi_entry_asm = custom_target('stage3_uefi_entry_asm',
+    input: 'stage3/arch/aarch64/uefi/entry_uefi.S',
+    output: 'stage3_uefi_entry.o',
+    command: [cc_cmd, '--target=' + asm_target, '-c', '@INPUT@', '-o', '@OUTPUT@'],
     build_by_default: true,
   )
-
-  # Convert to binary
-  stage3_uefi = custom_target('stage3_uefi',
-    input: stage3_uefi_elf,
-    output: 'stage3_uefi.bin',
-    command: [objcopy, '-O', 'binary', '@INPUT@', '@OUTPUT@'],
-    build_by_default: true,
-  )
+  stage3_paging_src = files('stage3/arch/aarch64/paging.c')
+  stage3_uefi_ld_script = meson.current_source_dir() / 'stage3/arch/aarch64/uefi/stage3.ld'
 endif
+
+# Stage 3 UEFI C sources (shared across architectures)
+stage3_uefi_c_src = files(
+  'stage3/main.c',
+  'stage3/uefi_main.c',
+  'stage3/boot_alloc.c',
+  'stage3/elf.c',
+  'stage3/handoff.c',
+) + stage3_paging_src
+
+# Stage 3 UEFI common sources (string, print, fb - no udiv64 needed for 64-bit)
+stage3_uefi_common_src = files(
+  'common/string.c',
+  'common/print.c',
+  'common/fb_console.c',
+  'common/font_8x16.c',
+)
+
+stage3_uefi_c_args = c_stage3_args + [
+  '-DSTAGE3_UEFI',
+  '-I' + meson.current_source_dir(),
+]
+
+# Compile Stage 3 UEFI C files
+stage3_uefi_c_objs = []
+foreach src : stage3_uefi_c_src + stage3_uefi_common_src
+  src_name = fs.name(src)
+  obj_name = src_name.replace('.c', '.o')
+  stage3_uefi_c_objs += custom_target('stage3_uefi_' + obj_name,
+    input: src,
+    output: 'stage3_uefi_' + obj_name,
+    command: cc_cmd + stage3_uefi_c_args + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+endforeach
+
+# Link Stage 3 UEFI ELF (64-bit)
+stage3_uefi_elf = custom_target('stage3_uefi_elf',
+  input: [stage3_uefi_entry_asm] + stage3_uefi_c_objs,
+  output: 'stage3_uefi.elf',
+  command: ['ld.lld', '-m', kernel_link_emulation, '-nostdlib', '-static',
+            '-T', stage3_uefi_ld_script,
+            '-o', '@OUTPUT@', '@INPUT@'],
+  build_by_default: true,
+)
+
+# Convert to binary
+stage3_uefi = custom_target('stage3_uefi',
+  input: stage3_uefi_elf,
+  output: 'stage3_uefi.bin',
+  command: [objcopy, '-O', 'binary', '@INPUT@', '@OUTPUT@'],
+  build_by_default: true,
+)
 
 # =============================================================================
 # Summary
@@ -364,11 +368,9 @@ if build_bios_boot
     'Stage 3': stage3.full_path(),
   }
 endif
-if arch == 'x86_64'
-  boot_summary += {
-    'Stage 3 (UEFI)': stage3_uefi.full_path(),
-    efi_binary_name: efi.full_path(),
-    'Stage 2 (UEFI)': stage2_efi.full_path(),
-  }
-endif
+boot_summary += {
+  'Stage 3 (UEFI)': stage3_uefi.full_path(),
+  efi_binary_name: efi.full_path(),
+  'Stage 2 (UEFI)': stage2_efi.full_path(),
+}
 summary(boot_summary, section: 'Bootloader')

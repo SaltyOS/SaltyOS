@@ -17,8 +17,8 @@ _stage3_entry:
     add     x1, x1, :lo12:_stage3_stack_top
     mov     sp, x1
 
-    /* Call uefi_stage3_main(stage2_info) */
-    bl      uefi_stage3_main
+    /* Call stage3_entry_64(stage2_info) */
+    bl      stage3_entry_64
 
     /* Should not return */
 1:

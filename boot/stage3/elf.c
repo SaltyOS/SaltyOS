@@ -34,7 +34,7 @@ int elf_validate(const struct Elf64_Ehdr *ehdr)
         return ELF_ERR_NOT_DYN;
 
     /* Check machine type */
-    if (ehdr->e_machine != EM_X86_64)
+    if (ehdr->e_machine != ELF_EXPECTED_MACHINE)
         return ELF_ERR_BAD_ARCH;
 
     return ELF_OK;
@@ -265,16 +265,16 @@ static int elf_apply_rela(uint64_t rela_addr, uint64_t rela_size,
         uint64_t *target = (uint64_t *)(uintptr_t)(rela[i].r_offset + delta_phys);
 
         switch (type) {
-        case R_X86_64_RELATIVE:
+        case ELF_RELOC_RELATIVE:
             /* *target = virt_base + addend (kernel sees virtual addresses) */
             *target = virt_base + rela[i].r_addend;
             break;
 
-        case R_X86_64_64:
+        case ELF_RELOC_ABS64:
             /* For PIE without external symbols, this shouldn't happen */
             break;
 
-        case R_X86_64_NONE:
+        case ELF_RELOC_NONE:
             break;
 
         default:

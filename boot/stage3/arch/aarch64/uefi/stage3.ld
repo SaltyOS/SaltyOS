@@ -7,7 +7,8 @@ ENTRY(_stage3_entry)
 
 SECTIONS
 {
-    . = 0x10000;
+    /* Must match UEFI_STAGE3_LOAD_ADDR in Stage 2. */
+    . = 0x40200000;
 
     .text : {
         *(.text.boot)
@@ -27,7 +28,7 @@ SECTIONS
     .dynamic : { *(.dynamic) }
     .rela.dyn : { *(.rela.dyn) *(.rela.plt) }
 
-    .bss ALIGN(4K) : {
+    .bss ALIGN(0x10000) : {
         *(.bss .bss.*)
         *(COMMON)
     }
