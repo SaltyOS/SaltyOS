@@ -377,6 +377,18 @@ pub fn has_rdseed() -> bool {
     has_bit(GLOBAL_BITS.load(Ordering::Acquire), FEAT_RDSEED)
 }
 
+/// Architecture-neutral alias for hardware RNG availability.
+#[inline]
+pub fn has_hw_rng() -> bool {
+    has_rdrand()
+}
+
+/// Architecture-neutral alias for hardware RNG seed availability.
+#[inline]
+pub fn has_hw_seed() -> bool {
+    has_rdseed()
+}
+
 /// Check if SSE is supported on a specific CPU.
 #[inline]
 pub fn has_sse_on(cpu_id: usize) -> bool {

@@ -149,7 +149,7 @@ pub fn generate_stack_canary() -> u64 {
     // Try RNDR (ARMv8.5-RNG) first when advertised by the CPU. On
     // systems without FEAT_RNG, executing RNDR itself raises an
     // undefined-instruction exception instead of returning failure.
-    if cpuid::has_rdrand() {
+    if cpuid::has_hw_rng() {
         let val: u64;
         let ok: u64;
         // SAFETY: FEAT_RNG support has been checked above, so RNDR is a
@@ -637,12 +637,12 @@ pub fn shutdown() -> ! {
     psci::system_off();
 }
 
-// CPUID-equivalent module: reports RNDR (hardware RNG) availability
+// CPUID-equivalent module: reports hardware RNG availability
 pub mod cpuid {
-    /// Check if RNDR instruction is available (ARMv8.5-RNG).
+    /// Check if RNDR instruction is available (ARMv8.5 FEAT_RNG).
     ///
     /// Reads ID_AA64ISAR0_EL1.RNDR (bits 63:60); value >= 1 means supported.
-    pub fn has_rdrand() -> bool {
+    pub fn has_hw_rng() -> bool {
         let isar0: u64;
         // SAFETY: Reading ID_AA64ISAR0_EL1 is always safe from EL1.
         unsafe {
@@ -652,8 +652,8 @@ pub mod cpuid {
     }
 
     /// RNDR serves the same purpose as both RDRAND and RDSEED on x86.
-    pub fn has_rdseed() -> bool {
-        has_rdrand()
+    pub fn has_hw_seed() -> bool {
+        has_hw_rng()
     }
 }
 

@@ -10,15 +10,14 @@ const MAX_RETRIES: u32 = 10;
 
 /// Generate a 64-bit random value using hardware RNG.
 ///
-/// On x86_64, uses RDRAND. On aarch64, uses RNDR (ARMv8.5-RNG) with
-/// CNTPCT_EL0 fallback.
+/// On x86_64, uses RDRAND. On aarch64, uses RNDR (ARMv8.5 FEAT_RNG).
 ///
 /// Returns `None` if the CPU does not support the hardware RNG or if all
-/// retries fail (x86_64 only — aarch64 always returns `Some` via fallback).
+/// retries fail.
 pub fn rdrand64() -> Option<u64> {
     #[cfg(target_arch = "x86_64")]
     {
-        if !crate::arch::cpuid::has_rdrand() {
+        if !crate::arch::cpuid::has_hw_rng() {
             return None;
         }
         for _ in 0..MAX_RETRIES {
@@ -45,34 +44,29 @@ pub fn rdrand64() -> Option<u64> {
     {
         // FEAT_RNG is optional. If it is absent, touching RNDR itself
         // faults, so gate the instruction on the architectural ID bit.
-        if crate::arch::cpuid::has_rdrand() {
-            for _ in 0..MAX_RETRIES {
-                let val: u64;
-                let ok: u64;
-                // SAFETY: FEAT_RNG support has been verified above, so
-                // RNDR is a valid system register access here. NZCV flags
-                // indicate whether fresh entropy was returned.
-                unsafe {
-                    core::arch::asm!(
-                        "mrs {val}, S3_3_C2_C4_0",
-                        "cset {ok}, ne",
-                        val = out(reg) val,
-                        ok = out(reg) ok,
-                        options(nomem, nostack),
-                    );
-                }
-                if ok != 0 {
-                    return Some(val);
-                }
+        if !crate::arch::cpuid::has_hw_rng() {
+            return None;
+        }
+        for _ in 0..MAX_RETRIES {
+            let val: u64;
+            let ok: u64;
+            // SAFETY: FEAT_RNG support has been verified above, so
+            // RNDR is a valid system register access here. NZCV flags
+            // indicate whether fresh entropy was returned.
+            unsafe {
+                core::arch::asm!(
+                    "mrs {val}, S3_3_C2_C4_0",
+                    "cset {ok}, ne",
+                    val = out(reg) val,
+                    ok = out(reg) ok,
+                    options(nomem, nostack),
+                );
+            }
+            if ok != 0 {
+                return Some(val);
             }
         }
-        // Fallback: CNTPCT_EL0 (weak entropy, but better than nothing)
-        let val: u64;
-        // SAFETY: CNTPCT_EL0 read is always safe
-        unsafe {
-            core::arch::asm!("mrs {}, CNTPCT_EL0", out(reg) val, options(nomem, nostack));
-        }
-        Some(val)
+        None
     }
 }
 
@@ -83,7 +77,7 @@ pub fn rdrand64() -> Option<u64> {
 pub fn rdseed64() -> Option<u64> {
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::arch::cpuid::has_rdseed() {
+        if crate::arch::cpuid::has_hw_seed() {
             for _ in 0..MAX_RETRIES {
                 let val: u64;
                 let ok: u8;
