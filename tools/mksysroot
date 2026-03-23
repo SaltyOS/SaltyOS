@@ -82,7 +82,13 @@ def main():
     output_dir = args.output.resolve()
 
     header_src = repo_root / "lib" / "besalt" / "c" / "include"
-    pie_linker_script = repo_root / "lib" / "besalt" / "saltyos-pie.ld"
+    # Detect arch from build directory name
+    _dir_name = build_dir.name
+    _arch = "aarch64" if "aarch64" in _dir_name else "x86_64"
+    pie_linker_script = repo_root / "lib" / "besalt" / "arch" / _arch / "saltyos-pie.ld"
+    if not pie_linker_script.exists():
+        # Fallback to non-arch-split location
+        pie_linker_script = repo_root / "lib" / "besalt" / "saltyos-pie.ld"
     cxx_inc_src = repo_root / "toolchain" / "llvm-project" / "libcxx" / "include"
     cxxabi_inc_src = repo_root / "toolchain" / "llvm-project" / "libcxxabi" / "include"
     cxx_config_site = repo_root / "lib" / "besalt" / "cpp" / "__config_site"

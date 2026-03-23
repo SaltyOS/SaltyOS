@@ -13,9 +13,10 @@
 #   build cross llvm         Cross-compile Clang/LLD for SaltyOS
 #   build cross rust         Cross-compile rustc for SaltyOS
 #   sysroot                  Generate cross-compilation sysroot (includes libc++ via Meson)
+#   package                  Package cross-compiled toolchain for rootfs
 #   doctor                   Validate toolchain
 #   all                      setup → host llvm → host rust → doctor
-#   self-host                sysroot → cross llvm → cross rust
+#   self-host                sysroot → cross llvm → cross rust → package
 
 set -euo pipefail
 
@@ -92,9 +93,10 @@ Commands:
   build cross llvm         Cross-compile Clang/LLD for SaltyOS
   build cross rust         Cross-compile rustc for SaltyOS
   sysroot                  Generate cross-compilation sysroot (includes libc++ via Meson)
+  package                  Package cross-compiled toolchain for rootfs
   doctor                   Validate toolchain
   all                      Run: setup → host llvm → host rust → doctor
-  self-host                Run: sysroot → cross llvm → cross rust
+  self-host                Run: sysroot → cross llvm → cross rust → package
 EOF
   exit 1
 }
@@ -235,6 +237,8 @@ Run 'just setup && just build' first."
 # =============================================================================
 
 cmd_build_cross_llvm() {
+  : "${SALTYOS_ARCH:=x86_64}"
+
   if [ ! -d "$SYSROOT/usr/lib" ]; then
     die "sysroot not found at $SYSROOT
 Run 'just sysroot' first."
@@ -245,7 +249,15 @@ Run 'just sysroot' first."
 Run 'just sysroot' first (requires build_libcxx=auto|true and toolchain/llvm-project present)."
   fi
 
-  local build_root="$SALTYOS_TOOLCHAIN_BUILD_ROOT/llvm-saltyos"
+  local target_triple="${SALTYOS_ARCH}-unknown-saltyos"
+  local llvm_targets
+  case "$SALTYOS_ARCH" in
+    x86_64)  llvm_targets="X86" ;;
+    aarch64) llvm_targets="AArch64" ;;
+    *)       die "Unsupported architecture: $SALTYOS_ARCH" ;;
+  esac
+
+  local build_root="$SALTYOS_TOOLCHAIN_BUILD_ROOT/llvm-saltyos-${SALTYOS_ARCH}"
   local install_prefix="/usr"
 
   # Prefer installed tablegen; fall back to build-dir binaries
@@ -257,9 +269,11 @@ Run 'just sysroot' first (requires build_libcxx=auto|true and toolchain/llvm-pro
   [ -x "$llvm_tblgen" ] || die "llvm-tblgen not found.
 Run 'just tc build host llvm' first."
 
-  echo "Cross-compiling LLVM/Clang/LLD for SaltyOS..."
+  echo "Cross-compiling LLVM/Clang/LLD for SaltyOS (${SALTYOS_ARCH})..."
   echo "  Source:       $SALTYOS_LLVM_SRC_DIR"
   echo "  Build:        $build_root"
+  echo "  Target:       $target_triple"
+  echo "  LLVM targets: $llvm_targets"
   echo "  Sysroot:      $SYSROOT"
   echo "  Toolchain:    $SALTYOS_TOOLCHAIN_PREFIX"
   echo "  llvm-tblgen:  $llvm_tblgen"
@@ -274,9 +288,9 @@ Run 'just tc build host llvm' first."
     -DCMAKE_CXX_COMPILER="$SALTYOS_TOOLCHAIN_PREFIX/bin/clang++" \
     -DCMAKE_AR="$SALTYOS_TOOLCHAIN_PREFIX/bin/llvm-ar" \
     -DCMAKE_RANLIB="$SALTYOS_TOOLCHAIN_PREFIX/bin/llvm-ranlib" \
-    -DCMAKE_C_COMPILER_TARGET=x86_64-unknown-saltyos \
-    -DCMAKE_CXX_COMPILER_TARGET=x86_64-unknown-saltyos \
-    -DCMAKE_ASM_COMPILER_TARGET=x86_64-unknown-saltyos \
+    -DCMAKE_C_COMPILER_TARGET="$target_triple" \
+    -DCMAKE_CXX_COMPILER_TARGET="$target_triple" \
+    -DCMAKE_ASM_COMPILER_TARGET="$target_triple" \
     -DCMAKE_SYSROOT="$SYSROOT" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$install_prefix" \
@@ -285,9 +299,9 @@ Run 'just tc build host llvm' first."
     -DCMAKE_MODULE_PATH="$SALTYOS_REPO_ROOT/tools/cmake" \
     \
     -DLLVM_ENABLE_PROJECTS="clang;lld" \
-    -DLLVM_TARGETS_TO_BUILD="X86" \
-    -DLLVM_HOST_TRIPLE=x86_64-unknown-saltyos \
-    -DLLVM_DEFAULT_TARGET_TRIPLE=x86_64-unknown-saltyos \
+    -DLLVM_TARGETS_TO_BUILD="$llvm_targets" \
+    -DLLVM_HOST_TRIPLE="$target_triple" \
+    -DLLVM_DEFAULT_TARGET_TRIPLE="$target_triple" \
     \
     -DLLVM_ENABLE_EH=OFF \
     -DLLVM_ENABLE_RTTI=OFF \
@@ -306,9 +320,9 @@ Run 'just tc build host llvm' first."
     -DLLVM_TABLEGEN="$llvm_tblgen" \
     -DCLANG_TABLEGEN="$clang_tblgen" \
     \
-    -DCMAKE_ASM_FLAGS="--target=x86_64-unknown-saltyos --sysroot=$SYSROOT" \
-    -DCMAKE_C_FLAGS="--target=x86_64-unknown-saltyos --sysroot=$SYSROOT" \
-    -DCMAKE_CXX_FLAGS="--target=x86_64-unknown-saltyos --sysroot=$SYSROOT -fno-exceptions -fno-rtti -nostdinc++ -I$SYSROOT/usr/include/c++/v1" \
+    -DCMAKE_ASM_FLAGS="--target=$target_triple --sysroot=$SYSROOT" \
+    -DCMAKE_C_FLAGS="--target=$target_triple --sysroot=$SYSROOT" \
+    -DCMAKE_CXX_FLAGS="--target=$target_triple --sysroot=$SYSROOT -fno-exceptions -fno-rtti -nostdinc++ -I$SYSROOT/usr/include/c++/v1" \
     -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -nostdlib -nostartfiles -L$SYSROOT/usr/lib $SYSROOT/usr/lib/crt_start.o -lc++ -lc -lbesalt $SYSROOT/usr/lib/core.o $SYSROOT/usr/lib/compiler_builtins.o -T $SYSROOT/usr/lib/saltyos-pie.ld -z max-page-size=4096" \
     -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -nostdlib -nostartfiles -L$SYSROOT/usr/lib -lc++ -lc -lbesalt -z max-page-size=4096" \
     -DCMAKE_MODULE_LINKER_FLAGS="-fuse-ld=lld -nostdlib -nostartfiles -L$SYSROOT/usr/lib -lc++ -lc -lbesalt -z max-page-size=4096" \
@@ -319,7 +333,7 @@ Run 'just tc build host llvm' first."
   ninja -C "$build_root" -j"$(_nproc)"
 
   echo
-  echo "LLVM/Clang/LLD cross-compiled for SaltyOS successfully."
+  echo "LLVM/Clang/LLD cross-compiled for SaltyOS ($SALTYOS_ARCH) successfully."
   echo "  Binaries: $build_root/bin/"
   echo "  Verify: llvm-readelf -d $build_root/bin/clang | grep NEEDED"
   echo "  Expected: libc++.so, libc.so, libbesalt.so"
@@ -330,6 +344,8 @@ Run 'just tc build host llvm' first."
 # =============================================================================
 
 cmd_build_cross_rust() {
+  : "${SALTYOS_ARCH:=x86_64}"
+
   if [ ! -d "$SYSROOT/usr/lib" ]; then
     die "sysroot not found at $SYSROOT
 Run 'just sysroot' first."
@@ -347,12 +363,14 @@ Run 'just tc build host llvm' first."
 Run 'just tc build host llvm' first."
   fi
 
-  local build_root="$SALTYOS_TOOLCHAIN_BUILD_ROOT/rust-saltyos"
+  local target_triple="${SALTYOS_ARCH}-unknown-saltyos"
+  local build_root="$SALTYOS_TOOLCHAIN_BUILD_ROOT/rust-saltyos-${SALTYOS_ARCH}"
   mkdir -p "$build_root"
 
-  echo "Cross-compiling rustc for SaltyOS..."
+  echo "Cross-compiling rustc for SaltyOS (${SALTYOS_ARCH})..."
   echo "  Rust source:  $SALTYOS_RUST_SRC_DIR"
   echo "  Build:        $build_root"
+  echo "  Target:       $target_triple"
   echo "  Sysroot:      $SYSROOT"
   echo "  llvm-config:  $llvm_config"
 
@@ -361,7 +379,7 @@ Run 'just tc build host llvm' first."
   cat > "$config_path" << EOF
 [build]
 host = ["${SALTYOS_HOST_TRIPLE}"]
-target = ["${SALTYOS_HOST_TRIPLE}", "x86_64-unknown-saltyos", "aarch64-unknown-saltyos"]
+target = ["${SALTYOS_HOST_TRIPLE}", "${target_triple}"]
 docs = false
 extended = false
 
@@ -379,7 +397,7 @@ use-lld = true
 llvm-config = "$llvm_config"
 llvm-filecheck = "$filecheck_path"
 
-[target.x86_64-unknown-saltyos]
+[target.${target_triple}]
 cc = "$SALTYOS_TOOLCHAIN_PREFIX/bin/clang"
 cxx = "$SALTYOS_TOOLCHAIN_PREFIX/bin/clang++"
 linker = "$SALTYOS_TOOLCHAIN_PREFIX/bin/clang"
@@ -388,7 +406,7 @@ EOF
 
   echo "Generated config: $config_path"
   echo
-  echo "Building stage 1 rustc for x86_64-unknown-saltyos..."
+  echo "Building stage 1 rustc for ${target_triple}..."
 
   _configure_external_llvm_env "$llvm_config"
 
@@ -397,11 +415,11 @@ EOF
     --build-dir "$build_root" \
     --config "$config_path" \
     --stage 1 \
-    --target x86_64-unknown-saltyos \
+    --target "$target_triple" \
     compiler/rustc library/std
 
   echo
-  echo "rustc cross-compiled for SaltyOS successfully."
+  echo "rustc cross-compiled for SaltyOS ($SALTYOS_ARCH) successfully."
   echo "  Build dir: $build_root"
 }
 
@@ -534,6 +552,130 @@ cmd_doctor() {
 }
 
 # =============================================================================
+# cmd_package — Package cross-compiled toolchain for rootfs inclusion
+# =============================================================================
+
+cmd_package() {
+  : "${SALTYOS_ARCH:=x86_64}"
+
+  local strip="$SALTYOS_TOOLCHAIN_PREFIX/bin/llvm-strip"
+  local cross_build="$SALTYOS_TOOLCHAIN_BUILD_ROOT/llvm-saltyos-${SALTYOS_ARCH}"
+  # Fallback to legacy path for existing x86_64 builds
+  if [[ ! -d "$cross_build" && -d "$SALTYOS_TOOLCHAIN_BUILD_ROOT/llvm-saltyos" ]]; then
+    cross_build="$SALTYOS_TOOLCHAIN_BUILD_ROOT/llvm-saltyos"
+  fi
+  local src="$cross_build/bin"
+  local dst="$SALTYOS_TOOLCHAIN_BUILD_ROOT/llvm-${SALTYOS_ARCH}-stripped"
+  local builddir="$SALTYOS_REPO_ROOT/$SALTYOS_MESON_BUILDDIR"
+  local target_triple="${SALTYOS_ARCH}-unknown-saltyos"
+
+  [[ -x "$strip" ]] || die "llvm-strip not found: $strip
+Run 'just tc build host llvm' first."
+  [[ -d "$src" ]] || die "Cross-compiled LLVM not found: $src
+Run 'just arch=${SALTYOS_ARCH} tc build cross llvm' first."
+
+  echo "Packaging cross-compiled toolchain for ${SALTYOS_ARCH}..."
+  echo "  Source:  $src"
+  echo "  Output:  $dst"
+  echo "  Build:   $builddir"
+
+  mkdir -p "$dst/bin" "$dst/lib"
+
+  # Strip LLVM binaries
+  local clang_bin
+  clang_bin="$(cd "$src" && ls clang-* 2>/dev/null | head -1)"
+  [[ -n "$clang_bin" ]] || die "No clang-* binary found in $src"
+
+  for f in "$clang_bin" lld llvm-ar llvm-nm llvm-objcopy; do
+    echo "Stripping $f..."
+    cp "$src/$f" "$dst/bin/$f"
+    "$strip" "$dst/bin/$f"
+  done
+
+  # C++ runtime
+  cp "$builddir/lib/besalt/cpp/libc++.so" "$dst/lib/libc++.so"
+
+  # Clang resource directory and compiler-rt builtins
+  echo "Copying clang resource directory..."
+  rm -rf "$dst/lib/clang"
+  cp -r "$cross_build/lib/clang" "$dst/lib/clang"
+
+  local rt_dir
+  rt_dir="$(find "$SALTYOS_TOOLCHAIN_BUILD_ROOT/llvm/lib/clang" \
+    -type d -path "*/lib/${target_triple}" -print -quit)"
+  if [[ -z "$rt_dir" ]]; then
+    echo "warning: compiler-rt runtime directory for ${target_triple} not found" >&2
+  else
+    local rt_rel="${rt_dir#"$SALTYOS_TOOLCHAIN_BUILD_ROOT"/llvm/lib/clang/}"
+    rm -rf "$dst/lib/clang/$rt_rel"
+    mkdir -p "$(dirname "$dst/lib/clang/$rt_rel")"
+    cp -r "$rt_dir" "$(dirname "$dst/lib/clang/$rt_rel")"
+  fi
+
+  # CRT objects and linker script
+  echo "Copying development files..."
+  cp "$builddir/lib/besalt/c/crt_start.o" "$dst/lib/crt_start.o"
+  cp "$builddir/rust/core.o" "$dst/lib/core.o"
+  cp "$builddir/rust/compiler_builtins.o" "$dst/lib/compiler_builtins.o"
+  cp "$SALTYOS_REPO_ROOT/lib/besalt/saltyos-pie.ld" "$dst/lib/saltyos-pie.ld"
+
+  # Link-time libraries
+  cp "$builddir/lib/besalt/c/libc.so" "$dst/lib/libc.so"
+  cp "$builddir/lib/besalt/lib/libbesalt.so" "$dst/lib/libbesalt.so"
+
+  # Stub archives
+  for stub in libm.a libpthread.a librt.a libdl.a libutil.a; do
+    printf '!<arch>\n' > "$dst/lib/$stub"
+  done
+
+  echo "Done. Stripped sizes:"
+  du -sh "$dst/bin/"* "$dst/lib/"*
+
+  # Generate rootfs manifest for meson to pick up
+  echo "Generating rootfs manifest..."
+  cat > "$dst/rootfs.manifest" << MANIFEST
+# Auto-generated by 'just tc package' for ${SALTYOS_ARCH}
+# C/C++ compiler
+/usr/bin/${clang_bin}=./bin/${clang_bin}
+/usr/bin/clang=./bin/${clang_bin}
+/usr/bin/clang++=./bin/${clang_bin}
+# Linker
+/usr/bin/lld=./bin/lld
+/usr/bin/ld.lld=./bin/lld
+# Archiver / ranlib
+/usr/bin/llvm-ar=./bin/llvm-ar
+/usr/bin/llvm-ranlib=./bin/llvm-ar
+# Utilities
+/usr/bin/llvm-nm=./bin/llvm-nm
+/usr/bin/llvm-objcopy=./bin/llvm-objcopy
+/usr/bin/llvm-strip=./bin/llvm-objcopy
+# C++ runtime
+/lib/libc++.so=./lib/libc++.so
+# System C headers
+/usr/include/=${SALTYOS_REPO_ROOT}/lib/besalt/c/include/
+# Clang resource headers
+/usr/lib/clang/=./lib/clang/
+# CRT and linker support
+/usr/lib/crt_start.o=./lib/crt_start.o
+/usr/lib/core.o=./lib/core.o
+/usr/lib/compiler_builtins.o=./lib/compiler_builtins.o
+/usr/lib/saltyos-pie.ld=./lib/saltyos-pie.ld
+# Link-time libraries
+/usr/lib/libc.so=./lib/libc.so
+/usr/lib/libbesalt.so=./lib/libbesalt.so
+# Stub archives
+/usr/lib/libm.a=./lib/libm.a
+/usr/lib/libpthread.a=./lib/libpthread.a
+/usr/lib/librt.a=./lib/librt.a
+/usr/lib/libdl.a=./lib/libdl.a
+/usr/lib/libutil.a=./lib/libutil.a
+MANIFEST
+  echo "Manifest: $dst/rootfs.manifest"
+  echo
+  echo "Run 'just distclean && just setup && just build' to include in rootfs."
+}
+
+# =============================================================================
 # cmd_all / cmd_self_host
 # =============================================================================
 
@@ -550,6 +692,7 @@ cmd_self_host() {
   cmd_sysroot
   cmd_build_cross_llvm
   cmd_build_cross_rust
+  cmd_package
 }
 
 # =============================================================================
@@ -576,6 +719,7 @@ case "${1:-help}" in
   setup)     cmd_setup ;;
   build)     cmd_build "${@:2}" ;;
   sysroot)   cmd_sysroot ;;
+  package)   cmd_package ;;
   doctor)    cmd_doctor ;;
   all)       cmd_all ;;
   self-host) cmd_self_host ;;

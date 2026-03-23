@@ -99,6 +99,7 @@ foreach pname : _ordered_ports
       meson.current_source_dir() / pname,
       '-o', '@OUTDIR@',
       '-b', meson.project_build_root()],
+    env: {'SALTYOS_ARCH': arch},
     console: true,
     build_always_stale: true,
     build_by_default: get_option('build_ports'),

@@ -31,7 +31,7 @@ pub struct StampManager {
 
 impl StampManager {
     pub fn new(port_dir: &Path) -> Self {
-        let stamp_dir = port_dir.join("work").join(".stamps");
+        let stamp_dir = vars::work_dir(port_dir).join(".stamps");
         StampManager { stamp_dir }
     }
 

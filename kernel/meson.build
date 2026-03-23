@@ -9,9 +9,10 @@
 #   compiler_builtins_kernel_obj, compiler_builtins_kernel_rmeta
 # =============================================================================
 
-# Find all assembly source files
+# Find assembly source files, excluding the other architecture's directory
+exclude_arch = arch == 'x86_64' ? 'aarch64' : 'x86_64'
 all_asm_files = run_command(
-  'find', 'src', '-name', '*.S',
+  'find', 'src', '-name', '*.S', '-not', '-path', '*/arch/' + exclude_arch + '/*',
   capture: true,
   check: true
 ).stdout().strip()

@@ -35,13 +35,14 @@ help:
     @echo "  just tc build cross llvm         Cross-compile Clang/LLD for SaltyOS"
     @echo "  just tc build cross rust         Cross-compile rustc for SaltyOS"
     @echo "  just self-host                   Full cross-compile pipeline"
+    @echo "  just tc package                  Package cross-compiled toolchain for rootfs"
     @echo "  just tc self-host                Same (without OS build dependency)"
     @echo ""
     @echo "== Ports =="
     @echo "  just port <name>    Build a port (bash, coreutils, ...)"
     @echo ""
     @echo "== Images =="
-    @echo "  just mkrootfs       Build rootfs.img from manifest"
+    @echo "  just mkrootfs       Build rootfs.img (binaries + optional LLVM/ports)"
     @echo "  just mksaltyfs      Create test_data.img (manual)"
 
 # Default target architecture
@@ -103,7 +104,8 @@ _setup-impl arch:
       -Darch={{arch}} \
       -Dbuild_boot=true \
       -Dbuild_kernel=true \
-      -Dbuild_userland=true
+      -Dbuild_userland=true \
+      -Dbuild_ports=true
 
 # Configure the build (run once)
 setup: (_setup-impl arch)
@@ -192,6 +194,7 @@ sysroot: build
 self-host: sysroot
     @just tc build cross llvm
     @just tc build cross rust
+    @just tc package
 
 # Cross-compile C smoke test against sysroot
 cross-hello: sysroot
@@ -232,21 +235,29 @@ port NAME: build
     #!/usr/bin/env bash
     set -euo pipefail
     source tools/toolchain/env.sh
-    {{builddir}}/tools/portbuild/portbuild build ports/{{NAME}} -o {{builddir}}/ports -b {{builddir}} -v
+    SALTYOS_ARCH={{arch}} {{builddir}}/tools/port/port build ports/{{NAME}} -o {{builddir}}/ports -b {{builddir}} -v
 
 # Fetch all port sources
 fetch-ports:
-    {{builddir}}/tools/portbuild/portbuild fetch ports/bash -b {{builddir}}
-    {{builddir}}/tools/portbuild/portbuild fetch ports/coreutils -b {{builddir}}
+    {{builddir}}/tools/port/port fetch ports/bash -b {{builddir}}
+    {{builddir}}/tools/port/port fetch ports/coreutils -b {{builddir}}
 
-# Clean port build artifacts
+# Clean port build artifacts (all ports, all architectures)
 clean-ports:
-    {{builddir}}/tools/portbuild/portbuild clean ports/bash
-    {{builddir}}/tools/portbuild/portbuild clean ports/coreutils
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for d in ports/*/; do
+        [ -f "$d/$(basename "$d").port" ] || continue
+        for w in "$d"work-*/; do
+            [ -d "$w" ] && rm -rf "$w" && echo "Removed $w"
+        done
+        [ -d "${d}stage" ] && rm -rf "${d}stage" && echo "Removed ${d}stage"
+    done
+    echo "All port work directories cleaned."
 
 # Show port info
 port-info NAME:
-    {{builddir}}/tools/portbuild/portbuild info ports/{{NAME}}
+    {{builddir}}/tools/port/port info ports/{{NAME}}
 
 # =============================================================================
 # Development Helpers
@@ -263,59 +274,11 @@ rr: build run
 mksaltyfs:
     python3 tools/mksaltyfs.py -o test_data.img -s 64M
 
-# Strip cross-compiled LLVM binaries for rootfs inclusion.
-# Run this once after a cross LLVM build, before `just build`.
-strip-llvm:
+# Build rootfs image (binaries always; LLVM after `just tc package`; ports if build_ports=true)
+mkrootfs: build
     #!/usr/bin/env bash
-    set -euo pipefail
-    STRIP=build-toolchain/prefix/bin/llvm-strip
-    SRC=build-toolchain/llvm-saltyos/bin
-    DST=build-toolchain/llvm-saltyos-stripped
-    mkdir -p "$DST/bin" "$DST/lib"
-    clang_bin="$(cd "$SRC" && ls clang-* 2>/dev/null | head -1)"
-    if [ -z "$clang_bin" ]; then
-        echo "Error: no clang-* binary found in $SRC" >&2
-        exit 1
-    fi
-    for f in "$clang_bin" lld llvm-ar llvm-nm llvm-objcopy; do
-        echo "Stripping $f..."
-        cp "$SRC/$f" "$DST/bin/$f"
-        "$STRIP" "$DST/bin/$f"
-    done
-    cp {{builddir}}/lib/besalt/cpp/libc++.so "$DST/lib/libc++.so"
-    # Clang resource directory and SaltyOS compiler-rt builtins
-    echo "Copying clang resource directory..."
-    rm -rf "$DST/lib/clang"
-    cp -r build-toolchain/llvm-saltyos/lib/clang "$DST/lib/clang"
-    RT_DIR="$(find build-toolchain/llvm/lib/clang -type d -path '*/lib/x86_64-unknown-saltyos' -print -quit)"
-    if [ -z "$RT_DIR" ]; then
-        echo "Missing SaltyOS compiler-rt runtime directory in build-toolchain/llvm/lib/clang" >&2
-        exit 1
-    fi
-    RT_REL="${RT_DIR#build-toolchain/llvm/lib/clang/}"
-    rm -rf "$DST/lib/clang/$RT_REL"
-    mkdir -p "$(dirname "$DST/lib/clang/$RT_REL")"
-    cp -r "$RT_DIR" "$(dirname "$DST/lib/clang/$RT_REL")"
-    # CRT objects and linker script
-    echo "Copying development files..."
-    cp {{builddir}}/lib/besalt/c/crt_start.o "$DST/lib/crt_start.o"
-    cp {{builddir}}/rust/core.o "$DST/lib/core.o"
-    cp {{builddir}}/rust/compiler_builtins.o "$DST/lib/compiler_builtins.o"
-    cp lib/besalt/saltyos-pie.ld "$DST/lib/saltyos-pie.ld"
-    # Link-time libraries
-    cp {{builddir}}/lib/besalt/c/libc.so "$DST/lib/libc.so"
-    cp {{builddir}}/lib/besalt/lib/libbesalt.so "$DST/lib/libbesalt.so"
-    # Stub archives (-lm, -lpthread, etc.)
-    for stub in libm.a libpthread.a librt.a libdl.a libutil.a; do
-        printf '!<arch>\n' > "$DST/lib/$stub"
-    done
-    echo "Done. Stripped sizes:"
-    du -sh "$DST/bin/"* "$DST/lib/"*
-
-# Build rootfs image from manifest (strip-llvm must run before build).
-mkrootfs: strip-llvm build
-    tools/mkrootfs --output {{builddir}}/rootfs.img --size 512M \
-        --manifest images/rootfs.manifest -v
+    source tools/toolchain/env.sh
+    meson compile -C {{builddir}} rootfs_image
 
 # Create a new component skeleton
 new-component NAME:

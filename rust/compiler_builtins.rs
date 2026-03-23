@@ -1,8 +1,8 @@
 //! Compiler builtins for freestanding environment
 //!
 //! Provides software floating-point intrinsics (IEEE 754) using pure integer
-//! math for `x86_64-unknown-none` targets where SSE is disabled. Also stubs
-//! out i128/u128 intrinsics that are not needed.
+//! math for freestanding targets, plus the subset of i128/u128 helpers the
+//! kernel and userland need without depending on a host runtime.
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
@@ -12,31 +12,400 @@
 #![compiler_builtins]
 #![no_builtins]
 
-macro_rules! define_panicking_intrinsics(
-    ($reason: tt, { $($ident: ident, )* }) => {
-        $(
-            #[doc(hidden)]
-            #[unsafe(export_name = stringify!($ident))]
-            pub extern "C" fn $ident() {
-                panic!($reason);
-            }
-        )*
+use core::cmp::Ordering;
+
+// ---------------------------------------------------------------------------
+// Integer helper types
+// ---------------------------------------------------------------------------
+
+#[cfg(target_endian = "little")]
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct U128Words {
+    lo: u64,
+    hi: u64,
+}
+
+#[cfg(target_endian = "big")]
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct U128Words {
+    hi: u64,
+    lo: u64,
+}
+
+#[repr(C)]
+union U128Repr {
+    value: u128,
+    words: U128Words,
+}
+
+impl U128Words {
+    const ZERO: Self = Self { lo: 0, hi: 0 };
+    const ONE: Self = Self { lo: 1, hi: 0 };
+    const I128_MAX: Self = Self {
+        lo: u64::MAX,
+        hi: 0x7fff_ffff_ffff_ffff,
+    };
+    const I128_MIN_ABS: Self = Self {
+        lo: 0,
+        hi: 0x8000_0000_0000_0000,
+    };
+
+    #[inline(always)]
+    fn is_zero(self) -> bool {
+        self.lo == 0 && self.hi == 0
     }
-);
 
-define_panicking_intrinsics!("`i128` should not be used", {
-    __ashrti3,
-    __muloti4,
-    __multi3,
-});
+    #[inline(always)]
+    fn is_negative(self) -> bool {
+        (self.hi >> 63) != 0
+    }
 
-define_panicking_intrinsics!("`u128` should not be used", {
-    __ashlti3,
-    __lshrti3,
-    __udivmodti4,
-    __udivti3,
-    __umodti3,
-});
+    #[inline(always)]
+    fn cmp_unsigned(self, other: Self) -> Ordering {
+        match self.hi.cmp(&other.hi) {
+            Ordering::Equal => self.lo.cmp(&other.lo),
+            ord => ord,
+        }
+    }
+
+    #[inline(always)]
+    fn bit(self, bit: u32) -> u64 {
+        if bit < 64 {
+            (self.lo >> bit) & 1
+        } else {
+            (self.hi >> (bit - 64)) & 1
+        }
+    }
+
+    #[inline(always)]
+    fn set_bit(&mut self, bit: u32) {
+        if bit < 64 {
+            self.lo |= 1u64 << bit;
+        } else {
+            self.hi |= 1u64 << (bit - 64);
+        }
+    }
+
+    #[inline(always)]
+    fn shl1(self) -> Self {
+        Self {
+            lo: self.lo << 1,
+            hi: (self.hi << 1) | (self.lo >> 63),
+        }
+    }
+
+    #[inline(always)]
+    fn not(self) -> Self {
+        Self {
+            lo: !self.lo,
+            hi: !self.hi,
+        }
+    }
+
+    #[inline(always)]
+    fn wrapping_add(self, other: Self) -> Self {
+        let (lo, carry) = self.lo.overflowing_add(other.lo);
+        Self {
+            lo,
+            hi: self.hi.wrapping_add(other.hi).wrapping_add(carry as u64),
+        }
+    }
+
+    #[inline(always)]
+    fn wrapping_sub(self, other: Self) -> Self {
+        let (lo, borrow) = self.lo.overflowing_sub(other.lo);
+        Self {
+            lo,
+            hi: self.hi.wrapping_sub(other.hi).wrapping_sub(borrow as u64),
+        }
+    }
+
+    #[inline(always)]
+    fn wrapping_neg(self) -> Self {
+        self.not().wrapping_add(Self::ONE)
+    }
+}
+
+#[inline(always)]
+fn u128_to_words(value: u128) -> U128Words {
+    unsafe { U128Repr { value }.words }
+}
+
+#[inline(always)]
+fn i128_to_words(value: i128) -> U128Words {
+    u128_to_words(value as u128)
+}
+
+#[inline(always)]
+fn words_to_u128(words: U128Words) -> u128 {
+    unsafe { U128Repr { words }.value }
+}
+
+#[inline(always)]
+fn words_to_i128(words: U128Words) -> i128 {
+    words_to_u128(words) as i128
+}
+
+#[inline(always)]
+fn shl_words(value: U128Words, shift: u32) -> U128Words {
+    match shift {
+        0 => value,
+        1..=63 => U128Words {
+            lo: value.lo << shift,
+            hi: (value.hi << shift) | (value.lo >> (64 - shift)),
+        },
+        64..=127 => U128Words {
+            lo: 0,
+            hi: value.lo << (shift - 64),
+        },
+        _ => U128Words::ZERO,
+    }
+}
+
+#[inline(always)]
+fn lshr_words(value: U128Words, shift: u32) -> U128Words {
+    match shift {
+        0 => value,
+        1..=63 => U128Words {
+            lo: (value.lo >> shift) | (value.hi << (64 - shift)),
+            hi: value.hi >> shift,
+        },
+        64..=127 => U128Words {
+            lo: value.hi >> (shift - 64),
+            hi: 0,
+        },
+        _ => U128Words::ZERO,
+    }
+}
+
+#[inline(always)]
+fn ashr_words(value: U128Words, shift: u32) -> U128Words {
+    let fill = if value.is_negative() { u64::MAX } else { 0 };
+    match shift {
+        0 => value,
+        1..=63 => U128Words {
+            lo: (value.lo >> shift) | (value.hi << (64 - shift)),
+            hi: ((value.hi as i64) >> shift) as u64,
+        },
+        64..=127 => U128Words {
+            lo: ((value.hi as i64) >> (shift - 64)) as u64,
+            hi: fill,
+        },
+        _ => U128Words { lo: fill, hi: fill },
+    }
+}
+
+#[inline(always)]
+fn mul_u64_wide(a: u64, b: u64) -> U128Words {
+    const LOWER_MASK: u64 = 0xffff_ffff;
+
+    let mut lo = (a & LOWER_MASK).wrapping_mul(b & LOWER_MASK);
+    let mut t = lo >> 32;
+    lo &= LOWER_MASK;
+
+    t = t
+        .wrapping_add((a >> 32).wrapping_mul(b & LOWER_MASK));
+    lo = lo.wrapping_add((t & LOWER_MASK) << 32);
+    let mut hi = t >> 32;
+
+    t = lo >> 32;
+    lo &= LOWER_MASK;
+    t = t
+        .wrapping_add((b >> 32).wrapping_mul(a & LOWER_MASK));
+    lo = lo.wrapping_add((t & LOWER_MASK) << 32);
+    hi = hi
+        .wrapping_add(t >> 32)
+        .wrapping_add((a >> 32).wrapping_mul(b >> 32));
+
+    U128Words { lo, hi }
+}
+
+#[inline(always)]
+fn mul_words(a: U128Words, b: U128Words) -> U128Words {
+    let product = mul_u64_wide(a.lo, b.lo);
+    U128Words {
+        lo: product.lo,
+        hi: product
+            .hi
+            .wrapping_add(a.hi.wrapping_mul(b.lo))
+            .wrapping_add(a.lo.wrapping_mul(b.hi)),
+    }
+}
+
+#[inline(always)]
+fn udivmod_words(numerator: U128Words, divisor: U128Words) -> (U128Words, U128Words) {
+    if divisor.is_zero() {
+        panic!("128-bit division by zero");
+    }
+    if numerator.cmp_unsigned(divisor) == Ordering::Less {
+        return (U128Words::ZERO, numerator);
+    }
+
+    let mut quotient = U128Words::ZERO;
+    let mut remainder = U128Words::ZERO;
+    let mut bit = 128u32;
+
+    while bit != 0 {
+        bit -= 1;
+        remainder = remainder.shl1();
+        remainder.lo |= numerator.bit(bit);
+        if remainder.cmp_unsigned(divisor) != Ordering::Less {
+            remainder = remainder.wrapping_sub(divisor);
+            quotient.set_bit(bit);
+        }
+    }
+
+    (quotient, remainder)
+}
+
+#[inline(always)]
+fn abs_i128_words(value: i128) -> U128Words {
+    let bits = i128_to_words(value);
+    if bits.is_negative() {
+        bits.wrapping_neg()
+    } else {
+        bits
+    }
+}
+
+#[inline(always)]
+fn signed_mul_overflow(a: i128, b: i128) -> (i128, bool) {
+    let a_neg = a < 0;
+    let b_neg = b < 0;
+    let result_neg = a_neg ^ b_neg;
+    let a_abs = abs_i128_words(a);
+    let b_abs = abs_i128_words(b);
+    let product = mul_words(a_abs, b_abs);
+
+    let overflow = if a_abs.is_zero() || b_abs.is_zero() {
+        false
+    } else {
+        let limit = if result_neg {
+            U128Words::I128_MIN_ABS
+        } else {
+            U128Words::I128_MAX
+        };
+        let (max_factor, _) = udivmod_words(limit, a_abs);
+        b_abs.cmp_unsigned(max_factor) == Ordering::Greater
+    };
+
+    let signed = if result_neg {
+        product.wrapping_neg()
+    } else {
+        product
+    };
+    (words_to_i128(signed), overflow)
+}
+
+// ---------------------------------------------------------------------------
+// i128/u128 intrinsics
+// ---------------------------------------------------------------------------
+
+#[unsafe(export_name = "__ashlti3")]
+pub extern "C" fn __ashlti3(a: u128, b: u32) -> u128 {
+    words_to_u128(shl_words(u128_to_words(a), b))
+}
+
+#[unsafe(export_name = "__lshrti3")]
+pub extern "C" fn __lshrti3(a: u128, b: u32) -> u128 {
+    words_to_u128(lshr_words(u128_to_words(a), b))
+}
+
+#[unsafe(export_name = "__ashrti3")]
+pub extern "C" fn __ashrti3(a: i128, b: u32) -> i128 {
+    words_to_i128(ashr_words(i128_to_words(a), b))
+}
+
+#[unsafe(export_name = "__multi3")]
+pub extern "C" fn __multi3(a: i128, b: i128) -> i128 {
+    words_to_i128(mul_words(i128_to_words(a), i128_to_words(b)))
+}
+
+#[unsafe(export_name = "__muloti4")]
+pub extern "C" fn __muloti4(a: i128, b: i128, overflow: &mut i32) -> i128 {
+    let (result, did_overflow) = signed_mul_overflow(a, b);
+    *overflow = did_overflow as i32;
+    result
+}
+
+#[unsafe(export_name = "__udivmodti4")]
+pub extern "C" fn __udivmodti4(n: u128, d: u128, rem: *mut u128) -> u128 {
+    let (quotient, remainder) = udivmod_words(u128_to_words(n), u128_to_words(d));
+    if !rem.is_null() {
+        // SAFETY: `rem` comes from the compiler builtin ABI. When non-null it
+        // points to writable storage for the remainder result.
+        unsafe {
+            *rem = words_to_u128(remainder);
+        }
+    }
+    words_to_u128(quotient)
+}
+
+#[unsafe(export_name = "__udivti3")]
+pub extern "C" fn __udivti3(n: u128, d: u128) -> u128 {
+    __udivmodti4(n, d, core::ptr::null_mut())
+}
+
+#[unsafe(export_name = "__umodti3")]
+pub extern "C" fn __umodti3(n: u128, d: u128) -> u128 {
+    let mut rem = 0u128;
+    __udivmodti4(n, d, &mut rem);
+    rem
+}
+
+#[unsafe(export_name = "__divmodti4")]
+pub extern "C" fn __divmodti4(a: i128, b: i128, rem: *mut i128) -> i128 {
+    let a_neg = a < 0;
+    let b_neg = b < 0;
+    let (quotient, remainder) = udivmod_words(abs_i128_words(a), abs_i128_words(b));
+
+    if !rem.is_null() {
+        let signed_remainder = words_to_i128(if a_neg {
+            remainder.wrapping_neg()
+        } else {
+            remainder
+        });
+        // SAFETY: `rem` follows the compiler builtin ABI and, when non-null,
+        // points to writable storage for the remainder output.
+        unsafe {
+            *rem = signed_remainder;
+        }
+    }
+
+    words_to_i128(if a_neg != b_neg {
+        quotient.wrapping_neg()
+    } else {
+        quotient
+    })
+}
+
+#[unsafe(export_name = "__divti3")]
+pub extern "C" fn __divti3(a: i128, b: i128) -> i128 {
+    let a_neg = a < 0;
+    let b_neg = b < 0;
+    let quotient = __udivti3(words_to_u128(abs_i128_words(a)), words_to_u128(abs_i128_words(b)));
+    let quotient = u128_to_words(quotient);
+    words_to_i128(if a_neg != b_neg {
+        quotient.wrapping_neg()
+    } else {
+        quotient
+    })
+}
+
+#[unsafe(export_name = "__modti3")]
+pub extern "C" fn __modti3(a: i128, b: i128) -> i128 {
+    let remainder = u128_to_words(__umodti3(
+        words_to_u128(abs_i128_words(a)),
+        words_to_u128(abs_i128_words(b)),
+    ));
+    words_to_i128(if a < 0 {
+        remainder.wrapping_neg()
+    } else {
+        remainder
+    })
+}
 
 // ---------------------------------------------------------------------------
 // IEEE 754 double-precision (f64) soft-float intrinsics

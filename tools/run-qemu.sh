@@ -11,6 +11,7 @@
 #   --gdb             Start GDB server (-s -S)
 #   --uefi            Boot with OVMF/AAVMF UEFI firmware
 #   --no-net          Skip virtio-net attachment
+#   --legacy-virtio   Force legacy (transitional) virtio devices
 #   --disk FILE       Override boot disk path
 #   --extra-disk FILE Attach an additional virtio-blk disk (repeatable)
 set -euo pipefail
@@ -34,6 +35,7 @@ GDB=false
 UEFI=false
 NO_DATA=false
 NO_NET=false
+LEGACY_VIRTIO=false
 DISK=""
 EXTRA_DISKS=()
 
@@ -48,6 +50,7 @@ while [[ $# -gt 0 ]]; do
         --uefi)     UEFI=true;   shift ;;
         --no-data)  NO_DATA=true; shift ;; # Deprecated no-op (kept for compatibility)
         --no-net)   NO_NET=true;  shift ;;
+        --legacy-virtio) LEGACY_VIRTIO=true; shift ;;
         --disk)     DISK="${2:?--disk requires a value}"; shift 2 ;;
         --extra-disk) EXTRA_DISKS+=("${2:?--extra-disk requires a value}"); shift 2 ;;
         *)          die "unknown option: $1" ;;
@@ -85,14 +88,25 @@ case "$ARCH" in
         MACHINE=q35
         CPU=qemu64
         BLK_DEVICE="virtio-blk-pci"
-        NET_DEVICE="virtio-net-pci"
+        if $LEGACY_VIRTIO; then
+            NET_DEVICE="virtio-net-pci"
+        else
+            NET_DEVICE="virtio-net-pci,disable-legacy=on"
+        fi
+        EXTRA_DEVICES=""
         ;;
     aarch64)
         QEMU=qemu-system-aarch64
         MACHINE="virt,gic-version=3"
         CPU=cortex-a72
-        BLK_DEVICE="virtio-blk-device"
-        NET_DEVICE="virtio-net-device"
+        if $LEGACY_VIRTIO; then
+            BLK_DEVICE="virtio-blk-pci"
+            NET_DEVICE="virtio-net-pci"
+        else
+            BLK_DEVICE="virtio-blk-pci,disable-legacy=on"
+            NET_DEVICE="virtio-net-pci,disable-legacy=on"
+        fi
+        EXTRA_DEVICES="-device ramfb"
         ;;
     *)
         die "unsupported architecture: $ARCH"
@@ -109,6 +123,7 @@ CMD=($QEMU
 )
 
 [[ -n "$SMP" ]] && CMD+=(-smp "$SMP")
+[[ -n "$EXTRA_DEVICES" ]] && CMD+=($EXTRA_DEVICES)
 
 # --- Boot disk ---
 if $UEFI; then

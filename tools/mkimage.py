@@ -524,7 +524,8 @@ def create_efi_image(
     print(f"    LBA {total_sectors - GPT_ENTRIES_SECTORS - 1}-{total_sectors - 2}:  Backup GPT Entries")
     print(f"    LBA {total_sectors - 1}:        Backup GPT Header")
     print(f"  ESP contents:")
-    print(f"    EFI/BOOT/BOOTX64.EFI")
+    efi_boot_name = stage1_efi_path.name  # BOOTX64.EFI or BOOTAA64.EFI
+    print(f"    EFI/BOOT/{efi_boot_name}")
     print(f"    EFI/SALTYOS/stage2.efi")
     print(f"    EFI/SALTYOS/stage3.bin")
     print(f"    EFI/SALTYOS/kernel.elf")
@@ -534,7 +535,7 @@ def create_efi_image(
 
     # Validate EFI files exist
     efi_files = {
-        'EFI/BOOT/BOOTX64.EFI': stage1_efi_path,
+        f'EFI/BOOT/{efi_boot_name}': stage1_efi_path,
         'EFI/SALTYOS/stage2.efi': stage2_efi_path,
         'EFI/SALTYOS/stage3.bin': stage3_path,
         'EFI/SALTYOS/kernel.elf': kernel_path,
@@ -646,7 +647,7 @@ def create_efi_image(
 
             subprocess.run([
                 'mcopy', '-i', str(esp_img),
-                str(stage1_efi_path), '::/EFI/BOOT/BOOTX64.EFI'
+                str(stage1_efi_path), f'::/EFI/BOOT/{stage1_efi_path.name}'
             ], check=True)
 
             subprocess.run([
@@ -922,7 +923,8 @@ def main():
 
     if args.efi:
         # UEFI mode
-        stage1_efi = args.build_dir / 'boot' / 'BOOTX64.EFI'
+        efi_name = 'BOOTAA64.EFI' if args.arch == 'aarch64' else 'BOOTX64.EFI'
+        stage1_efi = args.build_dir / 'boot' / efi_name
         stage2_efi = args.build_dir / 'boot' / 'stage2.efi'
         stage3 = args.build_dir / 'boot' / 'stage3_uefi.bin'
         kernel = args.kernel if args.kernel is not None else args.build_dir / 'kernel' / 'kernel.elf'

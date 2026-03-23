@@ -96,7 +96,7 @@ if arch == 'x86_64'
 elif arch == 'aarch64'
   rust_target            = 'aarch64-unknown-saltyos'
   c_target               = 'aarch64-unknown-saltyos'
-  efi_target             = 'aarch64-unknown-uefi'
+  efi_target             = 'aarch64-unknown-windows'
   rust_kernel_target     = meson.project_source_root() / 'kernel/aarch64-saltyos.json'
   rust_kernel_target_needs_unstable = true
   kernel_link_emulation  = 'aarch64elf'
@@ -127,13 +127,14 @@ endif
 c_freestanding_args = [
   '-ffreestanding',
   '-fno-builtin',
-  '-fcf-protection=none',
   '-fno-stack-protector',
   '-fno-pic',
   '-fno-pie',
-  '-mno-red-zone',
   '-nostdlib',
 ]
+if arch == 'x86_64'
+  c_freestanding_args += ['-fcf-protection=none', '-mno-red-zone']
+endif
 
 # EFI-specific flags (PE/COFF via clang UEFI target)
 c_efi_args = c_freestanding_args + [
@@ -185,11 +186,9 @@ if build_userland
   subdir('userland')
 endif
 
-# Port host tool — always built with userland (needed by `just port`)
-if build_userland
-  subdir('tools/port')
-  subdir('tools/pkg')
-endif
+# Port host tools — always built (needed by `just port`, `just clean-ports`)
+subdir('tools/port')
+subdir('tools/pkg')
 
 # Generate cross-compilation sysroot from build outputs.
 # Ports depend on this to find headers, libraries, and linker scripts.
@@ -430,50 +429,21 @@ endif
 
 # =============================================================================
 # Rootfs Image Generation (optional — embed SaltyFS rootfs into disk image)
+#
+# Three independent layers, each optional:
+#   1. Binaries  (always)  — non-initrd userland ELFs
+#   2. Toolchain (optional) — cross-compiled LLVM, present after `just tc package`
+#   3. Ports     (optional) — bash, coreutils, etc., present when build_ports=true
 # =============================================================================
 
 mkrootfs = find_program('tools/mkrootfs', required: false)
 mkrootfs_script = files('tools/mkrootfs')
 mksaltyfs_script = files('tools/mksaltyfs.py')
-rootfs_manifest = files('images/rootfs.manifest')[0]
-rootfs_packages = files('images/rootfs.packages')[0]
 
 rootfs_inputs = []
 rootfs_args = []
 if mkrootfs.found() and build_userland
-  if not is_variable('pkg_tool')
-    error('rootfs package assembly requires pkg_tool target (tools/pkg)')
-  endif
-  rootfs_port_targets = []
-  foreach _line : fs.read(rootfs_packages).split('\n')
-    _pkg = _line.strip()
-    if _pkg == '' or _pkg.startswith('#')
-      continue
-    endif
-    _var = 'port_' + _pkg.underscorify()
-    if not is_variable(_var)
-      error('rootfs package list references unknown port: ' + _pkg)
-    endif
-    rootfs_port_targets += [get_variable(_var)]
-  endforeach
-
-  rootfs_ports_manifest = custom_target('rootfs_ports_manifest',
-    depends: rootfs_port_targets + [pkg_tool],
-    depend_files: [rootfs_packages],
-    output: 'rootfs-ports.manifest',
-    command: [pkg_tool,
-      'install',
-      '--repo', meson.project_build_root() / 'pkgrepo',
-      '--root', meson.project_build_root() / 'rootfs-pkgroot',
-      '--packages-file', rootfs_packages,
-      '--manifest-out', '@OUTPUT@',
-      '--clean-root',
-    ],
-    build_by_default: false,
-  )
-
-  # Generate a build-dir-aware manifest for non-initrd binaries so that
-  # rootfs.manifest does not hardcode the Meson build directory name.
+  # Layer 1 (always): non-initrd userland binaries
   rootfs_binaries_manifest = custom_target('rootfs_binaries_manifest',
     input: [stripped_display_elf, stripped_ttyd_elf, stripped_getty_elf,
             stripped_test_runner_elf,
@@ -493,18 +463,60 @@ if mkrootfs.found() and build_userland
     build_by_default: false,
   )
 
+  _rootfs_cmd = [mkrootfs, '--output', '@OUTPUT@', '--size', '512M',
+                 '--manifest', rootfs_binaries_manifest]
+  _rootfs_deps = [rootfs_binaries_manifest]
+  _rootfs_dep_files = [mkrootfs_script, mksaltyfs_script]
+
+  # Layer 2 (optional): LLVM toolchain — present after `just tc package`
+  _llvm_stripped_dir = 'build-toolchain' / 'llvm-' + arch + '-stripped'
+  _llvm_manifest = meson.project_source_root() / _llvm_stripped_dir / 'rootfs.manifest'
+  if fs.is_file(_llvm_manifest)
+    message('Rootfs: including LLVM toolchain from ' + _llvm_stripped_dir)
+    _rootfs_cmd += ['--manifest', _llvm_manifest]
+  endif
+
+  # Layer 3 (optional): ports — only when build_ports=true
+  if get_option('build_ports') and is_variable('pkg_tool')
+    rootfs_packages = files('images/rootfs.packages')[0]
+    rootfs_port_targets = []
+    foreach _line : fs.read(rootfs_packages).split('\n')
+      _pkg = _line.strip()
+      if _pkg == '' or _pkg.startswith('#')
+        continue
+      endif
+      _var = 'port_' + _pkg.underscorify()
+      if is_variable(_var)
+        rootfs_port_targets += [get_variable(_var)]
+      else
+        warning('rootfs package list references unknown port: ' + _pkg)
+      endif
+    endforeach
+
+    rootfs_ports_manifest = custom_target('rootfs_ports_manifest',
+      depends: rootfs_port_targets + [pkg_tool],
+      depend_files: [rootfs_packages],
+      output: 'rootfs-ports.manifest',
+      command: [pkg_tool,
+        'install',
+        '--repo', meson.project_build_root() / 'pkgrepo',
+        '--root', meson.project_build_root() / 'rootfs-pkgroot',
+        '--packages-file', rootfs_packages,
+        '--manifest-out', '@OUTPUT@',
+        '--clean-root',
+      ],
+      build_by_default: false,
+    )
+    _rootfs_cmd += ['--manifest', rootfs_ports_manifest]
+    _rootfs_deps += [rootfs_ports_manifest]
+  endif
+
   rootfs_image = custom_target('rootfs_image',
     input: [],
-    depends: [rootfs_binaries_manifest, rootfs_ports_manifest],
-    depend_files: [mkrootfs_script, mksaltyfs_script, rootfs_manifest, rootfs_packages],
+    depends: _rootfs_deps,
+    depend_files: _rootfs_dep_files,
     output: 'rootfs.img',
-    command: [mkrootfs,
-      '--output', '@OUTPUT@',
-      '--size', '512M',
-      '--manifest', rootfs_binaries_manifest,
-      '--manifest', rootfs_manifest,
-      '--manifest', rootfs_ports_manifest,
-    ],
+    command: _rootfs_cmd,
     build_by_default: false,
   )
   rootfs_inputs = [rootfs_image]
@@ -537,22 +549,21 @@ if mkimage.found() and build_boot and build_kernel
     )
   endif
 
-  # UEFI disk image
-  if arch == 'x86_64'
-    uefi_image = custom_target('uefi_image',
-      input: [efi, stage2_efi, stage3_uefi, kernel_boot] + initrd_inputs + rootfs_inputs,
-      depend_files: mkimage_script,
-      output: 'saltyos-uefi.img',
-      command: [mkimage,
-        '--efi',
-        '--build-dir', meson.project_build_root(),
-        '--kernel', kernel_boot.full_path(),
-        '--output', '@OUTPUT@',
-        '--size', '64',
-      ] + initrd_args + rootfs_args,
-      build_by_default: false,
-    )
-  endif
+  # UEFI disk image (all architectures)
+  uefi_image = custom_target('uefi_image',
+    input: [efi, stage2_efi, stage3_uefi, kernel_boot] + initrd_inputs + rootfs_inputs,
+    depend_files: mkimage_script,
+    output: 'saltyos-uefi.img',
+    command: [mkimage,
+      '--efi',
+      '--arch', arch,
+      '--build-dir', meson.project_build_root(),
+      '--kernel', kernel_boot.full_path(),
+      '--output', '@OUTPUT@',
+      '--size', '64',
+    ] + initrd_args + rootfs_args,
+    build_by_default: not build_bios_boot,
+  )
 
 endif
 
