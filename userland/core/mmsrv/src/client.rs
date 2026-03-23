@@ -255,7 +255,7 @@ pub(crate) unsafe fn handle_mm_get_client_stats(msg: *const BesaltMsg, _badge: u
                 for r in 0..(*c).region_count {
                     let region = (*c).regions.add(r);
                     if (*region).active {
-                        total_pages += (*region).length / 4096;
+                        total_pages += ((*region).length + 4095) / 4096;
                     }
                 }
                 (*reply).regs[3] = total_pages;

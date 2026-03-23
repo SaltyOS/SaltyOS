@@ -18,7 +18,7 @@ EXTRA_CFLAGS = -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initia
 
 [targets.cflags]
 -I${SRCDIR} -I${SRCDIR}/include -I${SRCDIR}/lib/libc/include
--I${SRCDIR}/sys -I${SRCDIR}/sys/${MACHINE_INCLUDE} -I${SRCDIR}/sys/x86/include
+-I${SRCDIR}/sys -I${SRCDIR}/sys/${MACHINE_INCLUDE}
 -I${SRCDIR}/contrib -include sys/cdefs.h
 
 [targets]
