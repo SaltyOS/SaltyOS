@@ -101,11 +101,14 @@ pub fn irq_setup() {
     invoke::irq_handler_set_notification(CAP_IRQ, CAP_NTFN);
     invoke::tcb_bind_notification(CAP_SELF_TCB, CAP_NTFN);
 
-    // Enable RX interrupt (RXIM = bit 4)
+    // Enable RX interrupt (RXIM = bit 4) and receive timeout (RTIM = bit 6).
+    // RTIM fires when the RX FIFO has data below the trigger level after a
+    // timeout (~32 bit periods), ensuring single-character input is delivered
+    // promptly even when the FIFO trigger threshold is > 1.
     // SAFETY: UART_BASE is initialized by serial_init() which must be called first.
     unsafe {
         let imsc = mmio_read32(UARTIMSC);
-        mmio_write32(UARTIMSC, imsc | (1 << 4));
+        mmio_write32(UARTIMSC, imsc | (1 << 4) | (1 << 6));
     }
 
     // Prime IRQ delivery: the first ack enables INTID 33 in the GIC

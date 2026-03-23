@@ -443,6 +443,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             }
         }
 
+        // Flush queued serial echo BEFORE blocking on IPC, otherwise
+        // characters echoed during input processing stay buffered until
+        // the next event arrives — causing a visible one-character delay.
+        unsafe { serial_try_flush(); }
+
         if skip_reply {
             let err = unsafe {
                 besalt::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
