@@ -13,6 +13,22 @@
 
 use crate::cap::object::{KernelObject, ObjectType};
 use crate::mm::radix_tree::RadixTree;
+use crate::mm::SpinLock;
+
+// ---------------------------------------------------------------------------
+// Physical address tag bits (stored in radix tree leaf entries)
+// ---------------------------------------------------------------------------
+
+/// Bit 0: page is backed by an untyped source (not PMM).
+pub const PHYS_TAG_UNTYPED: u64 = 1;
+
+/// Bit 1: commit in-progress sentinel. A BUSY entry means a thread has
+/// reserved this slot and is allocating a frame outside the commit_lock.
+pub const PHYS_TAG_BUSY: u64 = 2;
+
+/// Mask covering all tag bits (bits [11:0]). Physical addresses are always
+/// page-aligned so the low 12 bits are available for tags.
+pub const PHYS_TAG_MASK: u64 = 0xFFF;
 
 // ---------------------------------------------------------------------------
 // MoKind
@@ -35,11 +51,11 @@ pub enum MoKind {
 #[derive(Clone, Copy)]
 pub struct ReverseMapEntry {
     pub vspace: *mut crate::mm::vspace::VSpace, // 8
-    pub va_start: u64,                           // 8
-    pub page_count: u32,                         // 4
-    pub mo_offset: u32,                          // 4
-    pub perms: u8,                               // 1
-    pub _pad: [u8; 7],                              // 7 (explicit, matches repr(C) alignment to 32)
+    pub va_start: u64,                          // 8
+    pub page_count: u32,                        // 4
+    pub mo_offset: u32,                         // 4
+    pub perms: u8,                              // 1
+    pub _pad: [u8; 7],                          // 7 (explicit, matches repr(C) alignment to 32)
 }
 // Total: 32 bytes. Overflow page: (4096 - 8) / 32 = 127 entries.
 const _: () = assert!(core::mem::size_of::<ReverseMapEntry>() == 32);
@@ -108,7 +124,9 @@ impl ReverseMaps {
     /// # Safety
     /// `page_ptr` must point to a zeroed PMM page.
     pub unsafe fn add_overflow_page(&mut self, page_ptr: *mut ReverseMapPage) {
-        unsafe { (*page_ptr).next = self.overflow; }
+        unsafe {
+            (*page_ptr).next = self.overflow;
+        }
         self.overflow = page_ptr;
     }
 
@@ -187,6 +205,9 @@ pub struct MemoryObject {
     pub next_sibling: *mut MemoryObject,
     /// Physical address of the untyped carve holding this struct.
     pub untyped_phys: u64,
+    /// Protects MO state during commit/decommit: radix leaf reads/writes,
+    /// page state transitions. Lock ordering: commit_lock → ut.alloc_lock.
+    pub commit_lock: SpinLock,
 }
 
 impl MemoryObject {
@@ -201,6 +222,7 @@ impl MemoryObject {
             first_child: core::ptr::null_mut(),
             next_sibling: core::ptr::null_mut(),
             untyped_phys: _phys,
+            commit_lock: SpinLock::new(),
         }
     }
 
@@ -225,9 +247,16 @@ impl MemoryObject {
             return None;
         }
 
-        let phys = self.pages.get(index);
-        if phys != 0 {
-            return Some((phys, 0));
+        let entry = self.pages.get(index);
+        if entry != 0 {
+            // BUSY sentinel means commit in-progress — treat as uncommitted.
+            if entry & PHYS_TAG_BUSY != 0 {
+                return None;
+            }
+            let phys = entry & !PHYS_TAG_MASK;
+            if phys != 0 {
+                return Some((phys, 0));
+            }
         }
 
         if self.cow_parent == 0 {
@@ -245,7 +274,15 @@ impl MemoryObject {
             let parent = unsafe { &*parent_mo };
             let p = parent.pages.get(index);
             if p != 0 {
-                return Some((p, depth));
+                if p & PHYS_TAG_BUSY != 0 {
+                    // Parent page is mid-commit — skip.
+                    parent_slot = parent.cow_parent;
+                    continue;
+                }
+                let phys = p & !PHYS_TAG_MASK;
+                if phys != 0 {
+                    return Some((phys, depth));
+                }
             }
             parent_slot = parent.cow_parent;
         }
@@ -259,8 +296,10 @@ impl MemoryObject {
     }
 
     /// Check if a page is locally committed (exists in own radix tree).
+    /// Returns false for BUSY entries (commit in-progress).
     pub fn is_local_committed(&self, index: usize) -> bool {
-        self.pages.get(index) != 0
+        let entry = self.pages.get(index);
+        entry != 0 && (entry & PHYS_TAG_BUSY == 0)
     }
 
     /// Commit a page: insert phys into the radix tree at `index`.
@@ -293,7 +332,6 @@ impl MemoryObject {
         // SAFETY: same preconditions as commit_page.
         unsafe { self.commit_page(index, new_phys, alloc) }
     }
-
 
     // -----------------------------------------------------------------------
     // COW parent resolution
@@ -376,17 +414,73 @@ impl MemoryObject {
             });
         }
 
-        // 2. Free all pages in the radix tree
+        // 2. Free all pages in the radix tree.
+        // Pages tagged with PHYS_TAG_UNTYPED are returned to the source
+        // untyped's free list. PMM-backed pages go through pmm_free.
+        // BUSY entries are skipped (should not exist at destroy time since
+        // refcount==0 means no concurrent commit).
         let self_ptr = self as *mut MemoryObject;
+
+        // Batch-collect untyped-backed pages to avoid holding commit_lock
+        // while acquiring ut.alloc_lock (lock ordering).
+        // Use a fixed-size on-stack batch buffer. 128 entries = 1KB stack.
+        const BATCH_SIZE: usize = 128;
+        let mut ut_batch: [u64; BATCH_SIZE] = [0; BATCH_SIZE];
+        let mut ut_batch_len: usize = 0;
+
         unsafe {
-            self.pages.for_each(|idx, phys| {
-                if phys != 0 {
-                    crate::mm::pmm_free(phys, &crate::mm::frame::FrameOwner::MoData {
-                        mo: self_ptr,
-                        page_idx: idx as u32,
-                    });
+            self.pages.for_each(|idx, entry| {
+                if entry == 0 || entry & PHYS_TAG_BUSY != 0 {
+                    return;
+                }
+                let phys = entry & !PHYS_TAG_MASK;
+                if phys == 0 {
+                    return;
+                }
+                if entry & PHYS_TAG_UNTYPED != 0 {
+                    if ut_batch_len < BATCH_SIZE {
+                        ut_batch[ut_batch_len] = phys;
+                        ut_batch_len += 1;
+                    } else {
+                        // Flush batch when full
+                        for b in 0..BATCH_SIZE {
+                            let p = ut_batch[b];
+                            let ut = crate::init::find_untyped_for_phys(p);
+                            if !ut.is_null() {
+                                (*ut).alloc_lock.lock();
+                                *(crate::mm::phys_to_virt(p) as *mut u64) = (*ut).free_list_head;
+                                (*ut).free_list_head = p;
+                                (*ut).free_list_count += 1;
+                                (*ut).alloc_lock.unlock();
+                            }
+                        }
+                        ut_batch_len = 0;
+                        ut_batch[ut_batch_len] = phys;
+                        ut_batch_len += 1;
+                    }
+                } else {
+                    crate::mm::pmm_free(
+                        phys,
+                        &crate::mm::frame::FrameOwner::MoData {
+                            mo: self_ptr,
+                            page_idx: idx as u32,
+                        },
+                    );
                 }
             });
+
+            // Flush remaining batch
+            for b in 0..ut_batch_len {
+                let p = ut_batch[b];
+                let ut = crate::init::find_untyped_for_phys(p);
+                if !ut.is_null() {
+                    (*ut).alloc_lock.lock();
+                    *(crate::mm::phys_to_virt(p) as *mut u64) = (*ut).free_list_head;
+                    (*ut).free_list_head = p;
+                    (*ut).free_list_count += 1;
+                    (*ut).alloc_lock.unlock();
+                }
+            }
         }
 
         // 3. Free radix tree nodes
@@ -397,17 +491,22 @@ impl MemoryObject {
             },
             use_reserve: false,
         };
-        unsafe { self.pages.destroy(&mut tree_alloc); }
+        unsafe {
+            self.pages.destroy(&mut tree_alloc);
+        }
 
         // 4. Free overflow rmap pages
         let mut rmap_page = self.reverse_maps.overflow;
         while !rmap_page.is_null() {
             let next = unsafe { (*rmap_page).next };
             let phys = crate::mm::virt_to_phys(rmap_page as u64);
-            crate::mm::pmm_free(phys, &crate::mm::frame::FrameOwner::MoMeta {
-                mo: self_ptr,
-                subkind: crate::mm::frame::MoMetaKind::Rmap,
-            });
+            crate::mm::pmm_free(
+                phys,
+                &crate::mm::frame::FrameOwner::MoMeta {
+                    mo: self_ptr,
+                    subkind: crate::mm::frame::MoMetaKind::Rmap,
+                },
+            );
             rmap_page = next;
         }
         self.reverse_maps.overflow = core::ptr::null_mut();
@@ -424,7 +523,10 @@ impl MemoryObject {
                     Self::remove_from_child_list(parent_mo, self as *mut MemoryObject);
 
                     // Decrement parent ref_count
-                    let old_rc = parent_mo.header.ref_count.fetch_sub(1, core::sync::atomic::Ordering::Release);
+                    let old_rc = parent_mo
+                        .header
+                        .ref_count
+                        .fetch_sub(1, core::sync::atomic::Ordering::Release);
 
                     // Last reference gone — cascade parent destruction.
                     // This handles the case where mmsrv already deleted

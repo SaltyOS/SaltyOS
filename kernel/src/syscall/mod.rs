@@ -6,10 +6,12 @@
 
 pub mod fastpath;
 
-use crate::cap::{CapError, CapRights, Capability, CNode, FrameObject, IoPortRange, ObjectType, UntypedMemory};
+use crate::cap::{
+    CNode, CapError, CapRights, Capability, FrameObject, IoPortRange, ObjectType, UntypedMemory,
+};
 use crate::ipc::{Endpoint, Message, Notification};
-use crate::mm::{phys_to_virt, save_irq_disable, restore_irq, CAP_LOCK};
 use crate::mm::vspace::{CowNotifRing, CowPool, PageFlags, VSpace, VSpaceError};
+use crate::mm::{phys_to_virt, restore_irq, save_irq_disable, CAP_LOCK};
 use crate::sched::thread::{BlockedReason, SchedContext, Tcb, ThreadState};
 use core::sync::atomic::Ordering;
 /// System call numbers
@@ -280,8 +282,12 @@ fn lookup_expanded_for_slot(
                 let sub_cnode = unsafe { &*(cap.object as *const CNode) };
                 if sub_cnode.header.size_bits as usize == sub_bits {
                     let total_depth = (root_bits + sub_bits) as u8;
-                    return crate::cap::cnode::resolve_address_for_slot(cspace, cap_ptr, total_depth)
-                        .map_err(|_| SyscallError::InvalidCapability);
+                    return crate::cap::cnode::resolve_address_for_slot(
+                        cspace,
+                        cap_ptr,
+                        total_depth,
+                    )
+                    .map_err(|_| SyscallError::InvalidCapability);
                 }
             }
         }
@@ -429,13 +435,7 @@ fn validate_notification_cap(
 /// Arguments:
 /// - msg_info: Message info word (label + length + extra_caps, packed)
 /// - mr0-mr3: Message registers (inline fastpath)
-fn construct_message(
-    msg_info: u64,
-    mr0: u64,
-    mr1: u64,
-    mr2: u64,
-    mr3: u64,
-) -> Message {
+fn construct_message(msg_info: u64, mr0: u64, mr1: u64, mr2: u64, mr3: u64) -> Message {
     let label = msg_info::get_label(msg_info);
     let length = msg_info::get_length(msg_info).min(20);
     let extra_caps = msg_info::get_extra_caps(msg_info).min(4);
@@ -443,10 +443,18 @@ fn construct_message(
     let mut caps = [0u64; 4];
 
     // Copy inline registers based on length (max 4 in registers)
-    if length > 0 { regs[0] = mr0; }
-    if length > 1 { regs[1] = mr1; }
-    if length > 2 { regs[2] = mr2; }
-    if length > 3 { regs[3] = mr3; }
+    if length > 0 {
+        regs[0] = mr0;
+    }
+    if length > 1 {
+        regs[1] = mr1;
+    }
+    if length > 2 {
+        regs[2] = mr2;
+    }
+    if length > 3 {
+        regs[3] = mr3;
+    }
 
     // Pull overflow MRs and cap transfer slots from the sender's IPC buffer
     // while the sender is current (its VSpace is active in CR3).
@@ -476,7 +484,13 @@ fn construct_message(
         }
     }
 
-    Message { label, length, extra_caps, regs, caps }
+    Message {
+        label,
+        length,
+        extra_caps,
+        regs,
+        caps,
+    }
 }
 
 /// Write received IPC message to current thread's IPC buffer
@@ -492,9 +506,13 @@ pub(crate) unsafe fn write_msg_to_ipc_buffer(msg: &Message, badge: u64) {
     unsafe {
         let scheduler = crate::sched::scheduler::scheduler();
         let current = scheduler.current();
-        if current.is_null() { return; }
+        if current.is_null() {
+            return;
+        }
         let buf = (*current).ipc_buffer;
-        if buf == 0 { return; }
+        if buf == 0 {
+            return;
+        }
 
         // Defensive guard: user processes can set IPC buffer addresses, and
         // mappings may disappear after exec/fork bugs. Never fault the kernel
@@ -540,7 +558,11 @@ pub(crate) unsafe fn write_msg_to_ipc_buffer(msg: &Message, badge: u64) {
         }
 
         // Clear unused slots from end of message to end of regs area
-        let first_clear = if reg_count <= 4 { 2 + reg_count } else { 6 + (reg_count - 4) };
+        let first_clear = if reg_count <= 4 {
+            2 + reg_count
+        } else {
+            6 + (reg_count - 4)
+        };
         for i in first_clear.min(22)..22 {
             (*ipc_buf).msg[i] = 0;
         }
@@ -909,7 +931,9 @@ fn syscall_invoke_inner(
                 let current_tcb = crate::sched::scheduler::scheduler().current();
                 let (src_depth, dest_depth) = if !current_tcb.is_null() {
                     read_invoke_depths(current_tcb)
-                } else { (0, 0) };
+                } else {
+                    (0, 0)
+                };
                 let dest_cnode_cap = match lookup_capability(arg1) {
                     Ok(c) => c,
                     Err(e) => {
@@ -918,7 +942,9 @@ fn syscall_invoke_inner(
                         return SyscallResult::err(e);
                     }
                 };
-                if let Err(e) = validate_capability(dest_cnode_cap, ObjectType::CNode, CapRights::WRITE) {
+                if let Err(e) =
+                    validate_capability(dest_cnode_cap, ObjectType::CNode, CapRights::WRITE)
+                {
                     CAP_LOCK.unlock();
                     restore_irq(irq);
                     return SyscallResult::err(e);
@@ -928,16 +954,25 @@ fn syscall_invoke_inner(
                 let dest_root = &*(dest_cnode_cap.object as *const CNode);
                 let (src_leaf, src_idx) = match resolve_invoke_slot(src_root, arg0, src_depth) {
                     Ok(v) => v,
-                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                    Err(e) => {
+                        CAP_LOCK.unlock();
+                        restore_irq(irq);
+                        return SyscallResult::err(e);
+                    }
                 };
                 let (dest_leaf, dest_idx) = match resolve_invoke_slot(dest_root, arg2, dest_depth) {
                     Ok(v) => v,
-                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                    Err(e) => {
+                        CAP_LOCK.unlock();
+                        restore_irq(irq);
+                        return SyscallResult::err(e);
+                    }
                 };
-                let result = match (&mut *dest_leaf).copy_slot(dest_idx, &*src_leaf, src_idx, rights) {
-                    Ok(()) => SyscallResult::ok(0),
-                    Err(e) => SyscallResult::err(syscall_error_from_cap_error(e)),
-                };
+                let result =
+                    match (&mut *dest_leaf).copy_slot(dest_idx, &*src_leaf, src_idx, rights) {
+                        Ok(()) => SyscallResult::ok(0),
+                        Err(e) => SyscallResult::err(syscall_error_from_cap_error(e)),
+                    };
                 CAP_LOCK.unlock();
                 restore_irq(irq);
                 result
@@ -954,7 +989,9 @@ fn syscall_invoke_inner(
                 let current_tcb = crate::sched::scheduler::scheduler().current();
                 let (src_depth, dest_depth) = if !current_tcb.is_null() {
                     read_invoke_depths(current_tcb)
-                } else { (0, 0) };
+                } else {
+                    (0, 0)
+                };
                 let dest_cnode_cap = match lookup_capability(arg1) {
                     Ok(c) => c,
                     Err(e) => {
@@ -963,7 +1000,9 @@ fn syscall_invoke_inner(
                         return SyscallResult::err(e);
                     }
                 };
-                if let Err(e) = validate_capability(dest_cnode_cap, ObjectType::CNode, CapRights::WRITE) {
+                if let Err(e) =
+                    validate_capability(dest_cnode_cap, ObjectType::CNode, CapRights::WRITE)
+                {
                     CAP_LOCK.unlock();
                     restore_irq(irq);
                     return SyscallResult::err(e);
@@ -973,13 +1012,23 @@ fn syscall_invoke_inner(
                 let dest_root = &*(dest_cnode_cap.object as *const CNode);
                 let (src_leaf, src_idx) = match resolve_invoke_slot(src_root, arg0, src_depth) {
                     Ok(v) => v,
-                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                    Err(e) => {
+                        CAP_LOCK.unlock();
+                        restore_irq(irq);
+                        return SyscallResult::err(e);
+                    }
                 };
                 let (dest_leaf, dest_idx) = match resolve_invoke_slot(dest_root, arg2, dest_depth) {
                     Ok(v) => v,
-                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                    Err(e) => {
+                        CAP_LOCK.unlock();
+                        restore_irq(irq);
+                        return SyscallResult::err(e);
+                    }
                 };
-                let result = match (&mut *dest_leaf).mint_slot(dest_idx, &*src_leaf, src_idx, arg3, rights) {
+                let result = match (&mut *dest_leaf)
+                    .mint_slot(dest_idx, &*src_leaf, src_idx, arg3, rights)
+                {
                     Ok(()) => SyscallResult::ok(0),
                     Err(e) => SyscallResult::err(syscall_error_from_cap_error(e)),
                 };
@@ -998,7 +1047,9 @@ fn syscall_invoke_inner(
                 let current_tcb = crate::sched::scheduler::scheduler().current();
                 let (dest_depth, src_depth) = if !current_tcb.is_null() {
                     read_invoke_depths(current_tcb)
-                } else { (0, 0) };
+                } else {
+                    (0, 0)
+                };
                 let src_cnode_cap = match lookup_capability(arg1) {
                     Ok(c) => c,
                     Err(e) => {
@@ -1007,7 +1058,9 @@ fn syscall_invoke_inner(
                         return SyscallResult::err(e);
                     }
                 };
-                if let Err(e) = validate_capability(src_cnode_cap, ObjectType::CNode, CapRights::WRITE) {
+                if let Err(e) =
+                    validate_capability(src_cnode_cap, ObjectType::CNode, CapRights::WRITE)
+                {
                     CAP_LOCK.unlock();
                     restore_irq(irq);
                     return SyscallResult::err(e);
@@ -1016,11 +1069,19 @@ fn syscall_invoke_inner(
                 let src_root = &*(src_cnode_cap.object as *const CNode);
                 let (dest_leaf, dest_idx) = match resolve_invoke_slot(dest_root, arg0, dest_depth) {
                     Ok(v) => v,
-                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                    Err(e) => {
+                        CAP_LOCK.unlock();
+                        restore_irq(irq);
+                        return SyscallResult::err(e);
+                    }
                 };
                 let (src_leaf, src_idx) = match resolve_invoke_slot(src_root, arg2, src_depth) {
                     Ok(v) => v,
-                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                    Err(e) => {
+                        CAP_LOCK.unlock();
+                        restore_irq(irq);
+                        return SyscallResult::err(e);
+                    }
                 };
                 let result = match (&mut *dest_leaf).move_slot(dest_idx, &mut *src_leaf, src_idx) {
                     Ok(()) => SyscallResult::ok(0),
@@ -1042,7 +1103,9 @@ fn syscall_invoke_inner(
                 let current_tcb = crate::sched::scheduler::scheduler().current();
                 let (dest_depth, src_depth) = if !current_tcb.is_null() {
                     read_invoke_depths(current_tcb)
-                } else { (0, 0) };
+                } else {
+                    (0, 0)
+                };
                 let src_cnode_cap = match lookup_capability(arg1) {
                     Ok(c) => c,
                     Err(e) => {
@@ -1051,7 +1114,9 @@ fn syscall_invoke_inner(
                         return SyscallResult::err(e);
                     }
                 };
-                if let Err(e) = validate_capability(src_cnode_cap, ObjectType::CNode, CapRights::WRITE) {
+                if let Err(e) =
+                    validate_capability(src_cnode_cap, ObjectType::CNode, CapRights::WRITE)
+                {
                     CAP_LOCK.unlock();
                     restore_irq(irq);
                     return SyscallResult::err(e);
@@ -1060,16 +1125,25 @@ fn syscall_invoke_inner(
                 let src_root = &*(src_cnode_cap.object as *const CNode);
                 let (dest_leaf, dest_idx) = match resolve_invoke_slot(dest_root, arg0, dest_depth) {
                     Ok(v) => v,
-                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                    Err(e) => {
+                        CAP_LOCK.unlock();
+                        restore_irq(irq);
+                        return SyscallResult::err(e);
+                    }
                 };
                 let (src_leaf, src_idx) = match resolve_invoke_slot(src_root, arg2, src_depth) {
                     Ok(v) => v,
-                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                    Err(e) => {
+                        CAP_LOCK.unlock();
+                        restore_irq(irq);
+                        return SyscallResult::err(e);
+                    }
                 };
-                let result = match (&mut *dest_leaf).mutate_slot(dest_idx, &mut *src_leaf, src_idx, arg3) {
-                    Ok(()) => SyscallResult::ok(0),
-                    Err(e) => SyscallResult::err(syscall_error_from_cap_error(e)),
-                };
+                let result =
+                    match (&mut *dest_leaf).mutate_slot(dest_idx, &mut *src_leaf, src_idx, arg3) {
+                        Ok(()) => SyscallResult::ok(0),
+                        Err(e) => SyscallResult::err(syscall_error_from_cap_error(e)),
+                    };
                 CAP_LOCK.unlock();
                 restore_irq(irq);
                 result
@@ -1087,11 +1161,17 @@ fn syscall_invoke_inner(
                 let current_tcb = crate::sched::scheduler::scheduler().current();
                 let (depth, _) = if !current_tcb.is_null() {
                     read_invoke_depths(current_tcb)
-                } else { (0, 0) };
+                } else {
+                    (0, 0)
+                };
                 let cnode_root = &*(cap.object as *const CNode);
                 let (leaf, idx) = match resolve_invoke_slot(cnode_root, arg0, depth) {
                     Ok(v) => v,
-                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                    Err(e) => {
+                        CAP_LOCK.unlock();
+                        restore_irq(irq);
+                        return SyscallResult::err(e);
+                    }
                 };
                 let result = match (&mut *leaf).delete(idx) {
                     Ok(()) => SyscallResult::ok(0),
@@ -1114,11 +1194,17 @@ fn syscall_invoke_inner(
                 let current_tcb = crate::sched::scheduler::scheduler().current();
                 let (depth, _) = if !current_tcb.is_null() {
                     read_invoke_depths(current_tcb)
-                } else { (0, 0) };
+                } else {
+                    (0, 0)
+                };
                 let cnode_root = &*(cap.object as *const CNode);
                 let (leaf, idx) = match resolve_invoke_slot(cnode_root, arg0, depth) {
                     Ok(v) => v,
-                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                    Err(e) => {
+                        CAP_LOCK.unlock();
+                        restore_irq(irq);
+                        return SyscallResult::err(e);
+                    }
                 };
                 let result = match (&mut *leaf).revoke(idx) {
                     Ok(()) => SyscallResult::ok(0),
@@ -1149,7 +1235,11 @@ fn syscall_invoke_inner(
                 let cnode_root = &*(cap.object as *const CNode);
                 let (leaf, idx) = match resolve_invoke_slot(cnode_root, arg0, depth) {
                     Ok(v) => v,
-                    Err(e) => { CAP_LOCK.unlock(); restore_irq(irq); return SyscallResult::err(e); }
+                    Err(e) => {
+                        CAP_LOCK.unlock();
+                        restore_irq(irq);
+                        return SyscallResult::err(e);
+                    }
                 };
                 let result = match (&mut *leaf).save_caller(idx, current_tcb) {
                     Ok(()) => SyscallResult::ok(0),
@@ -1472,8 +1562,8 @@ fn syscall_invoke_inner(
 
         // MemoryObject operations
         (ObjectType::MemoryObject, 0x90) => {
-            // MO_COMMIT: arg0 = offset, arg1 = count
-            syscall_mo_commit(&cap, arg0, arg1)
+            // MO_COMMIT: arg0 = offset, arg1 = count, arg2 = ut_cap_ptr (0 = PMM)
+            syscall_mo_commit(&cap, arg0, arg1, arg2)
         }
         (ObjectType::MemoryObject, 0x91) => {
             // MO_DECOMMIT: arg0 = offset, arg1 = count
@@ -1754,7 +1844,11 @@ fn syscall_tcb_configure(
 
         let kstack_virt = crate::mm::phys_to_virt(kstack_phys);
         let kstack_top = kstack_virt + (KSTACK_PAGES * crate::mm::PAGE_SIZE) as u64;
-        core::ptr::write_bytes(kstack_virt as *mut u8, 0, KSTACK_PAGES * crate::mm::PAGE_SIZE);
+        core::ptr::write_bytes(
+            kstack_virt as *mut u8,
+            0,
+            KSTACK_PAGES * crate::mm::PAGE_SIZE,
+        );
         tcb.kernel_stack_top = kstack_top;
         tcb.stack_canary = crate::arch::generate_stack_canary();
 
@@ -1767,10 +1861,13 @@ fn syscall_tcb_configure(
             #[cfg(target_arch = "x86_64")]
             let tramp_stack_top = {
                 // Allocate trampoline stack outside lock
-                let tramp_stack_phys = match crate::mm::pmm_alloc(&crate::mm::frame::FrameOwner::KernelPrivate { subkind: crate::mm::frame::KernelMetaKind::KernelStack }) {
-                    Some(f) => f,
-                    None => return SyscallResult::err(SyscallError::OutOfMemory),
-                };
+                let tramp_stack_phys =
+                    match crate::mm::pmm_alloc(&crate::mm::frame::FrameOwner::KernelPrivate {
+                        subkind: crate::mm::frame::KernelMetaKind::KernelStack,
+                    }) {
+                        Some(f) => f,
+                        None => return SyscallResult::err(SyscallError::OutOfMemory),
+                    };
                 let tramp_stack_virt = crate::mm::phys_to_virt(tramp_stack_phys);
                 let tramp_stack_top = tramp_stack_virt + crate::mm::PAGE_SIZE as u64;
                 core::ptr::write_bytes(tramp_stack_virt as *mut u8, 0, crate::mm::PAGE_SIZE);
@@ -2117,9 +2214,13 @@ fn syscall_tcb_read_registers(cap: &Capability, _flags: u64) -> SyscallResult {
             SyscallResult::err(SyscallError::Busy)
         } else {
             #[cfg(target_arch = "x86_64")]
-            { SyscallResult::ok(tcb.context.rip) }
+            {
+                SyscallResult::ok(tcb.context.rip)
+            }
             #[cfg(target_arch = "aarch64")]
-            { SyscallResult::ok(tcb.context.elr_el1) }
+            {
+                SyscallResult::ok(tcb.context.elr_el1)
+            }
         };
         tcb.tcb_unlock();
         restore_irq(irq);
@@ -2133,12 +2234,7 @@ fn syscall_tcb_read_registers(cap: &Capability, _flags: u64) -> SyscallResult {
 /// - flags: bit 0 = resume after write
 /// - rip: New instruction pointer
 /// - rsp: New stack pointer
-fn syscall_tcb_write_registers(
-    cap: &Capability,
-    flags: u64,
-    rip: u64,
-    rsp: u64,
-) -> SyscallResult {
+fn syscall_tcb_write_registers(cap: &Capability, flags: u64, rip: u64, rsp: u64) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::WRITE) {
         return SyscallResult::err(e);
     }
@@ -2158,7 +2254,10 @@ fn syscall_tcb_write_registers(
         }
 
         #[cfg(target_arch = "x86_64")]
-        { tcb.context.rip = rip; tcb.context.rsp = rsp; }
+        {
+            tcb.context.rip = rip;
+            tcb.context.rsp = rsp;
+        }
         #[cfg(target_arch = "aarch64")]
         {
             if !tcb.vspace_root.is_null() {
@@ -2342,10 +2441,7 @@ fn syscall_tcb_unbind_notification(cap: &Capability) -> SyscallResult {
 ///
 /// Args:
 /// - fault_ep_cap_ptr: Capability pointer to an Endpoint (SEND right required)
-fn syscall_tcb_set_fault_handler(
-    cap: &Capability,
-    fault_ep_cap_ptr: u64,
-) -> SyscallResult {
+fn syscall_tcb_set_fault_handler(cap: &Capability, fault_ep_cap_ptr: u64) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::CONFIGURE) {
         return SyscallResult::err(e);
     }
@@ -2391,10 +2487,7 @@ fn syscall_tcb_set_fault_handler(
 /// Args:
 /// - dest_cap: destination (child) TCB capability
 /// - src_cap_ptr: slot index of source (parent) TCB capability
-fn syscall_tcb_copy_fpu(
-    dest_cap: &Capability,
-    src_cap_ptr: u64,
-) -> SyscallResult {
+fn syscall_tcb_copy_fpu(dest_cap: &Capability, src_cap_ptr: u64) -> SyscallResult {
     if let Err(e) = validate_capability(dest_cap, ObjectType::Tcb, CapRights::WRITE) {
         return SyscallResult::err(e);
     }
@@ -2436,10 +2529,7 @@ fn syscall_tcb_copy_fpu(
 
 /// TCB_SET_TLS_BASE: Set the FS_BASE (TLS pointer) for a thread.
 /// If the target is the current thread, also writes IA32_FS_BASE immediately.
-fn syscall_tcb_set_tls_base(
-    cap: &Capability,
-    tls_base: u64,
-) -> SyscallResult {
+fn syscall_tcb_set_tls_base(cap: &Capability, tls_base: u64) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::WRITE) {
         return SyscallResult::err(e);
     }
@@ -3144,7 +3234,9 @@ fn syscall_vspace_replenish_cow_pool(
         }
 
         // Advance tail by count
-        (*pool).tail.store(current_tail.wrapping_add(count as u16), Ordering::Release);
+        (*pool)
+            .tail
+            .store(current_tail.wrapping_add(count as u16), Ordering::Release);
 
         CAP_LOCK.unlock();
         restore_irq(irq);
@@ -3273,7 +3365,9 @@ fn syscall_irq_handler_ack(cap: &Capability) -> SyscallResult {
     unsafe {
         let irq = save_irq_disable();
         let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
-        irq_handler.acknowledged.store(true, core::sync::atomic::Ordering::Release);
+        irq_handler
+            .acknowledged
+            .store(true, core::sync::atomic::Ordering::Release);
         // Re-enable delivery at IOAPIC. dispatch_irq() only masks
         // level-triggered IRQs when no handler is ready to accept delivery;
         // edge-triggered ISA IRQs stay unmasked to avoid losing edges.
@@ -3294,10 +3388,7 @@ fn syscall_irq_handler_ack(cap: &Capability) -> SyscallResult {
 ///
 /// Args:
 /// - ntfn_cap_ptr: Capability pointer to a Notification
-fn syscall_irq_handler_set_notification(
-    cap: &Capability,
-    ntfn_cap_ptr: u64,
-) -> SyscallResult {
+fn syscall_irq_handler_set_notification(cap: &Capability, ntfn_cap_ptr: u64) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::IrqHandler, CapRights::CONFIGURE) {
         return SyscallResult::err(e);
     }
@@ -3315,7 +3406,10 @@ fn syscall_irq_handler_set_notification(
     unsafe {
         let irq = save_irq_disable();
         let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
-        irq_handler.notification.store(ntfn_cap.object as *mut Notification, core::sync::atomic::Ordering::Release);
+        irq_handler.notification.store(
+            ntfn_cap.object as *mut Notification,
+            core::sync::atomic::Ordering::Release,
+        );
         restore_irq(irq);
     }
 
@@ -3338,7 +3432,9 @@ fn syscall_irq_handler_clear(cap: &Capability) -> SyscallResult {
         let irq = save_irq_disable();
         let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
         irq_num = irq_handler.irq_num;
-        irq_handler.notification.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
+        irq_handler
+            .notification
+            .store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
         // Only mask if no other handler on this IRQ has a notification
         should_mask = !crate::ipc::irq::has_active_notification(irq_num as usize);
         restore_irq(irq);
@@ -3891,11 +3987,7 @@ fn syscall_vspace_map_pt(
 ///   msg[0] = count (number of entries)
 ///   msg[1] = next_vaddr (0 if done)
 ///   words[30..] = (vaddr, phys, flags) tuples, 3 u64s each
-fn syscall_vspace_walk(
-    cap: &Capability,
-    start_vaddr: u64,
-    max_entries: u64,
-) -> SyscallResult {
+fn syscall_vspace_walk(cap: &Capability, start_vaddr: u64, max_entries: u64) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::READ) {
         return SyscallResult::err(e);
     }
@@ -3926,8 +4018,7 @@ fn syscall_vspace_walk(
         if buf == 0 {
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
-        if (*current).vspace_root.is_null()
-            || !(&mut *(*current).vspace_root).ensure_writable(buf)
+        if (*current).vspace_root.is_null() || !(&mut *(*current).vspace_root).ensure_writable(buf)
         {
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
@@ -3940,9 +4031,9 @@ fn syscall_vspace_walk(
         *ipc_words.add(ipc_words_total - 1) = WALK_MAGIC;
         for i in 0..count {
             let out = EXT_ENTRY_BASE_WORD + i * 3;
-            *ipc_words.add(out) = entries[i].0;         // vaddr
-            *ipc_words.add(out + 1) = entries[i].1;     // phys
-            *ipc_words.add(out + 2) = entries[i].2;     // flags
+            *ipc_words.add(out) = entries[i].0; // vaddr
+            *ipc_words.add(out + 1) = entries[i].1; // phys
+            *ipc_words.add(out + 2) = entries[i].2; // flags
         }
     }
 
@@ -4295,7 +4386,9 @@ fn syscall_nanosleep(seconds: u64, nanoseconds: u64) -> SyscallResult {
     if nanoseconds >= 1_000_000_000 {
         return SyscallResult::err(SyscallError::InvalidArgument);
     }
-    let duration_ns = seconds.saturating_mul(1_000_000_000).saturating_add(nanoseconds);
+    let duration_ns = seconds
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nanoseconds);
     if duration_ns == 0 {
         return SyscallResult::ok(0);
     }
@@ -4368,9 +4461,7 @@ pub fn handle(
             }
             let regs = [msg_info, mr0, mr1, mr2, mr3];
             // SAFETY: reinterpreting register array as bytes; all 40 bytes are valid
-            let data = unsafe {
-                core::slice::from_raw_parts(regs.as_ptr() as *const u8, 40)
-            };
+            let data = unsafe { core::slice::from_raw_parts(regs.as_ptr() as *const u8, 40) };
             // SAFETY: save/restore IRQ flags around spinlock
             let irq = unsafe { save_irq_disable() };
             crate::SERIAL_LOCK.lock();
@@ -4587,68 +4678,15 @@ pub fn handle(
 // MemoryObject invoke implementations
 // ---------------------------------------------------------------------------
 
-/// MO_COMMIT: Allocate physical frames for pages [offset..offset+count]
-fn syscall_mo_commit(cap: &Capability, offset: u64, count: u64) -> SyscallResult {
-    if let Err(e) = validate_capability(cap, ObjectType::MemoryObject, CapRights::WRITE) {
-        return SyscallResult::err(e);
-    }
-
-    unsafe {
-        // SAFETY: cap.object validated as MemoryObject above.
-        let mo = &mut *(cap.object as *mut crate::cap::memory_object::MemoryObject);
-        let start = offset as usize;
-        let cnt = count as usize;
-
-        if start + cnt > mo.page_count as usize {
-            return SyscallResult::err(SyscallError::OutOfRange);
-        }
-
-        let mo_ptr = cap.object as *mut crate::cap::memory_object::MemoryObject;
-        let mut alloc = crate::mm::node_alloc::PmmNodeAllocator {
-            owner: crate::mm::frame::FrameOwner::MoMeta {
-                mo: mo_ptr,
-                subkind: crate::mm::frame::MoMetaKind::Radix,
-            },
-            use_reserve: false,
-        };
-
-        let mut committed = 0u64;
-        for i in 0..cnt {
-            let page_idx = start + i;
-            if mo.resolve_page(page_idx).is_some() {
-                committed += 1;
-                continue;
-            }
-
-            let owner = crate::mm::frame::FrameOwner::MoData {
-                mo: mo_ptr,
-                page_idx: page_idx as u32,
-            };
-            let phys = match crate::mm::pmm_alloc(&owner) {
-                Some(p) => p,
-                None => break,
-            };
-
-            let frame_ptr = crate::mm::phys_to_virt(phys) as *mut u8;
-            core::ptr::write_bytes(frame_ptr, 0, crate::mm::PAGE_SIZE);
-
-            if !mo.commit_page(page_idx, phys, &mut alloc) {
-                crate::mm::pmm_free(phys, &owner);
-                break;
-            }
-            committed += 1;
-        }
-
-        SyscallResult::ok(committed)
-    }
-}
-
-/// MO_DECOMMIT: Release physical frames for pages [offset..offset+count]
+/// MO_COMMIT: Allocate physical frames for pages [offset..offset+count].
 ///
-/// Frees locally-committed pages and clears their entries. Pages in the
-/// hidden node chain (shared with COW siblings) are NOT freed — they are
-/// owned by the node and released when all referencing MOs are destroyed.
-fn syscall_mo_decommit(cap: &Capability, offset: u64, count: u64) -> SyscallResult {
+/// When `ut_cap_ptr == 0`, frames are allocated from the PMM (existing path).
+/// When `ut_cap_ptr != 0`, frames are allocated from the specified untyped
+/// source's watermark or free list. Untyped-backed pages are tagged with
+/// `PHYS_TAG_UNTYPED` so decommit/destroy can return them to the source.
+fn syscall_mo_commit(cap: &Capability, offset: u64, count: u64, ut_cap_ptr: u64) -> SyscallResult {
+    use crate::cap::memory_object::{PHYS_TAG_BUSY, PHYS_TAG_MASK, PHYS_TAG_UNTYPED};
+
     if let Err(e) = validate_capability(cap, ObjectType::MemoryObject, CapRights::WRITE) {
         return SyscallResult::err(e);
     }
@@ -4663,18 +4701,220 @@ fn syscall_mo_decommit(cap: &Capability, offset: u64, count: u64) -> SyscallResu
             return SyscallResult::err(SyscallError::OutOfRange);
         }
 
+        let mo_ptr = cap.object as *mut crate::cap::memory_object::MemoryObject;
+        let mut alloc = crate::mm::node_alloc::PmmNodeAllocator {
+            owner: crate::mm::frame::FrameOwner::MoMeta {
+                mo: mo_ptr,
+                subkind: crate::mm::frame::MoMetaKind::Radix,
+            },
+            use_reserve: false,
+        };
+
+        if ut_cap_ptr == 0 {
+            // ---------------------------------------------------------------
+            // PMM path (existing behavior + commit_lock)
+            // ---------------------------------------------------------------
+            let mut committed = 0u64;
+            for i in 0..cnt {
+                let page_idx = start + i;
+
+                mo.commit_lock.lock();
+                let already =
+                    mo.is_local_committed(page_idx) || mo.resolve_page(page_idx).is_some();
+                mo.commit_lock.unlock();
+
+                if already {
+                    committed += 1;
+                    continue;
+                }
+
+                let owner = crate::mm::frame::FrameOwner::MoData {
+                    mo: mo_ptr,
+                    page_idx: page_idx as u32,
+                };
+                let phys = match crate::mm::pmm_alloc(&owner) {
+                    Some(p) => p,
+                    None => break,
+                };
+
+                let frame_ptr = crate::mm::phys_to_virt(phys) as *mut u8;
+                core::ptr::write_bytes(frame_ptr, 0, crate::mm::PAGE_SIZE);
+
+                mo.commit_lock.lock();
+                if !mo.commit_page(page_idx, phys, &mut alloc) {
+                    mo.commit_lock.unlock();
+                    crate::mm::pmm_free(phys, &owner);
+                    break;
+                }
+                mo.commit_lock.unlock();
+                committed += 1;
+            }
+
+            SyscallResult::ok(committed)
+        } else {
+            // ---------------------------------------------------------------
+            // Untyped path: allocate frames from the specified untyped source
+            // ---------------------------------------------------------------
+
+            // Look up the untyped capability
+            let ut_cap = match lookup_cap_locked(ut_cap_ptr) {
+                Ok(c) => c,
+                Err(e) => return SyscallResult::err(e),
+            };
+            if ut_cap.obj_type != ObjectType::Untyped {
+                return SyscallResult::err(SyscallError::InvalidCapability);
+            }
+            let ut = &mut *(ut_cap.object as *mut crate::cap::UntypedMemory);
+            if ut.is_device {
+                return SyscallResult::err(SyscallError::InvalidCapability);
+            }
+
+            let mut committed = 0u64;
+            for i in 0..cnt {
+                let page_idx = start + i;
+
+                // Step 1: Reserve slot under commit_lock
+                mo.commit_lock.lock();
+                let reserve = mo.pages.reserve_slot(page_idx, PHYS_TAG_BUSY, &mut alloc);
+                mo.commit_lock.unlock();
+
+                match reserve {
+                    Ok(false) => {
+                        // Already committed or BUSY — count as success
+                        committed += 1;
+                        continue;
+                    }
+                    Err(()) => {
+                        // Radix node allocation failed
+                        break;
+                    }
+                    Ok(true) => {
+                        // BUSY sentinel placed — proceed to allocate frame
+                    }
+                }
+
+                // Step 2: Allocate a frame from the untyped source
+                ut.alloc_lock.lock();
+
+                let phys = if ut.free_list_head != 0 {
+                    // Pop from free list
+                    let p = ut.free_list_head;
+                    let next = *(crate::mm::phys_to_virt(p) as *const u64);
+                    ut.free_list_head = next;
+                    ut.free_list_count -= 1;
+                    ut.alloc_lock.unlock();
+                    p
+                } else {
+                    // Watermark bump: align to PAGE_SIZE and carve
+                    let page_size = crate::mm::PAGE_SIZE as u64;
+                    let aligned = (ut.watermark + page_size - 1) & !(page_size - 1);
+                    let ut_size = ut.size_bytes() as u64;
+                    if aligned + page_size > ut_size {
+                        ut.alloc_lock.unlock();
+                        // No space — clear BUSY sentinel
+                        mo.commit_lock.lock();
+                        mo.pages.remove(page_idx);
+                        mo.commit_lock.unlock();
+                        break;
+                    }
+                    let p = ut.phys_addr + aligned;
+                    ut.watermark = aligned + page_size;
+                    ut.alloc_lock.unlock();
+                    p
+                };
+
+                // Step 3: Zero the page (outside all locks)
+                let frame_ptr = crate::mm::phys_to_virt(phys) as *mut u8;
+                core::ptr::write_bytes(frame_ptr, 0, crate::mm::PAGE_SIZE);
+
+                // Step 4: Write final entry (overwrite BUSY with phys | UNTYPED tag)
+                mo.commit_lock.lock();
+                // insert() overwrites the BUSY sentinel directly — no remove needed.
+                // Path already exists from reserve_slot, so no new node allocation.
+                if !mo.commit_page(page_idx, phys | PHYS_TAG_UNTYPED, &mut alloc) {
+                    mo.commit_lock.unlock();
+                    // Return frame to untyped free list
+                    ut.alloc_lock.lock();
+                    *(crate::mm::phys_to_virt(phys) as *mut u64) = ut.free_list_head;
+                    ut.free_list_head = phys;
+                    ut.free_list_count += 1;
+                    ut.alloc_lock.unlock();
+                    break;
+                }
+                mo.commit_lock.unlock();
+                committed += 1;
+            }
+
+            SyscallResult::ok(committed)
+        }
+    }
+}
+
+/// MO_DECOMMIT: Release physical frames for pages [offset..offset+count]
+///
+/// Frees locally-committed pages and clears their entries. Pages in the
+/// hidden node chain (shared with COW siblings) are NOT freed — they are
+/// owned by the node and released when all referencing MOs are destroyed.
+///
+/// Pages tagged with PHYS_TAG_UNTYPED are returned to the source untyped's
+/// free list instead of pmm_free.
+fn syscall_mo_decommit(cap: &Capability, offset: u64, count: u64) -> SyscallResult {
+    use crate::cap::memory_object::{PHYS_TAG_BUSY, PHYS_TAG_MASK, PHYS_TAG_UNTYPED};
+
+    if let Err(e) = validate_capability(cap, ObjectType::MemoryObject, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        // SAFETY: cap.object validated as MemoryObject above.
+        let mo = &mut *(cap.object as *mut crate::cap::memory_object::MemoryObject);
+        let start = offset as usize;
+        let cnt = count as usize;
+
+        if start.checked_add(cnt).is_none() || start + cnt > mo.page_count as usize {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+
+        let mo_ptr = cap.object as *mut crate::cap::memory_object::MemoryObject;
+
         let mut decommitted = 0u64;
         for i in 0..cnt {
             let page_idx = start + i;
-            let phys = mo.pages.get(page_idx);
-            if phys != 0 {
-                crate::mm::pmm_free(phys, &crate::mm::frame::FrameOwner::MoData {
-                    mo: cap.object as *mut crate::cap::memory_object::MemoryObject,
-                    page_idx: page_idx as u32,
-                });
-                mo.pages.remove(page_idx);
-                decommitted += 1;
+
+            mo.commit_lock.lock();
+            let entry = mo.pages.get(page_idx);
+            if entry == 0 || entry & PHYS_TAG_BUSY != 0 {
+                mo.commit_lock.unlock();
+                continue;
             }
+            let phys = entry & !PHYS_TAG_MASK;
+            mo.pages.remove(page_idx);
+            mo.commit_lock.unlock();
+
+            if phys == 0 {
+                continue;
+            }
+
+            if entry & PHYS_TAG_UNTYPED != 0 {
+                // Return to source untyped's free list
+                let ut = crate::init::find_untyped_for_phys(phys);
+                if !ut.is_null() {
+                    (*ut).alloc_lock.lock();
+                    *(crate::mm::phys_to_virt(phys) as *mut u64) = (*ut).free_list_head;
+                    (*ut).free_list_head = phys;
+                    (*ut).free_list_count += 1;
+                    (*ut).alloc_lock.unlock();
+                }
+            } else {
+                crate::mm::pmm_free(
+                    phys,
+                    &crate::mm::frame::FrameOwner::MoData {
+                        mo: mo_ptr,
+                        page_idx: page_idx as u32,
+                    },
+                );
+            }
+            decommitted += 1;
         }
 
         SyscallResult::ok(decommitted)
@@ -4708,7 +4948,8 @@ fn syscall_mo_clone(cap: &Capability, dest_slot: u64, _flags: u64) -> SyscallRes
         let parent_mo = &*(cap.object as *const crate::cap::memory_object::MemoryObject);
 
         // Allocate space for child MO struct (radix tree nodes allocated lazily)
-        let child_size = crate::cap::memory_object::MemoryObject::required_bytes(parent_mo.page_count);
+        let child_size =
+            crate::cap::memory_object::MemoryObject::required_bytes(parent_mo.page_count);
         let child_pages = (child_size + crate::mm::PAGE_SIZE - 1) / crate::mm::PAGE_SIZE;
         let child_phys = match crate::mm::pmm_alloc_contiguous(child_pages) {
             Some(p) => p,
@@ -4734,12 +4975,15 @@ fn syscall_mo_clone(cap: &Capability, dest_slot: u64, _flags: u64) -> SyscallRes
         parent_ref_cap.badge = 0;
         // Increment parent's refcount
         let parent_header = &mut *(cap.object as *mut crate::cap::KernelObject);
-        parent_header.ref_count.fetch_add(1, core::sync::atomic::Ordering::Acquire);
+        parent_header
+            .ref_count
+            .fetch_add(1, core::sync::atomic::Ordering::Acquire);
 
         // Initialize child MO
-        core::ptr::write(child_mo_ptr, crate::cap::memory_object::MemoryObject::new(
-            child_phys, parent_mo.page_count,
-        ));
+        core::ptr::write(
+            child_mo_ptr,
+            crate::cap::memory_object::MemoryObject::new(child_phys, parent_mo.page_count),
+        );
         (*child_mo_ptr).kind = crate::cap::memory_object::MoKind::CowChild;
         (*child_mo_ptr).cow_parent = parent_ref_slot as u64;
 
@@ -4775,7 +5019,9 @@ fn syscall_mo_clone(cap: &Capability, dest_slot: u64, _flags: u64) -> SyscallRes
         let cnode = &mut *(*current).cspace_root;
         if let Err(e) = cnode.insert_ref(
             dest_slot as usize,
-            crate::cap::cnode::CapRef { slot: child_cap_slot },
+            crate::cap::cnode::CapRef {
+                slot: child_cap_slot,
+            },
         ) {
             crate::cap::free_slot(child_cap_slot);
             crate::cap::free_slot(parent_ref_slot);
@@ -4812,14 +5058,35 @@ fn syscall_mo_resize(cap: &Capability, new_page_count: u64) -> SyscallResult {
 
         if new_pc < old_pc {
             // Shrink: free pages beyond new_pc
+            use crate::cap::memory_object::{PHYS_TAG_BUSY, PHYS_TAG_MASK, PHYS_TAG_UNTYPED};
+            let mo_ptr = cap.object as *mut crate::cap::memory_object::MemoryObject;
             for i in new_pc..old_pc {
-                let phys = mo.pages.get(i);
-                if phys != 0 {
-                    crate::mm::pmm_free(phys, &crate::mm::frame::FrameOwner::MoData {
-                        mo: cap.object as *mut crate::cap::memory_object::MemoryObject,
-                        page_idx: i as u32,
-                    });
-                    mo.pages.remove(i);
+                let entry = mo.pages.get(i);
+                if entry == 0 || entry & PHYS_TAG_BUSY != 0 {
+                    continue;
+                }
+                let phys = entry & !PHYS_TAG_MASK;
+                mo.pages.remove(i);
+                if phys == 0 {
+                    continue;
+                }
+                if entry & PHYS_TAG_UNTYPED != 0 {
+                    let ut = crate::init::find_untyped_for_phys(phys);
+                    if !ut.is_null() {
+                        (*ut).alloc_lock.lock();
+                        *(crate::mm::phys_to_virt(phys) as *mut u64) = (*ut).free_list_head;
+                        (*ut).free_list_head = phys;
+                        (*ut).free_list_count += 1;
+                        (*ut).alloc_lock.unlock();
+                    }
+                } else {
+                    crate::mm::pmm_free(
+                        phys,
+                        &crate::mm::frame::FrameOwner::MoData {
+                            mo: mo_ptr,
+                            page_idx: i as u32,
+                        },
+                    );
                 }
             }
             mo.page_count = new_pc as u32;
@@ -4871,10 +5138,7 @@ fn syscall_mo_read(cap: &Capability, offset: u64, count: u64) -> SyscallResult {
         while bytes_read < byte_count {
             let page_idx = src_off / crate::mm::PAGE_SIZE;
             let page_off = src_off % crate::mm::PAGE_SIZE;
-            let chunk = core::cmp::min(
-                crate::mm::PAGE_SIZE - page_off,
-                byte_count - bytes_read,
-            );
+            let chunk = core::cmp::min(crate::mm::PAGE_SIZE - page_off, byte_count - bytes_read);
 
             let phys = match mo.resolve_page(page_idx) {
                 Some(p) => p,
@@ -4926,10 +5190,7 @@ fn syscall_mo_write(cap: &Capability, offset: u64, count: u64) -> SyscallResult 
         while bytes_written < byte_count {
             let page_idx = dst_off / crate::mm::PAGE_SIZE;
             let page_off = dst_off % crate::mm::PAGE_SIZE;
-            let chunk = core::cmp::min(
-                crate::mm::PAGE_SIZE - page_off,
-                byte_count - bytes_written,
-            );
+            let chunk = core::cmp::min(crate::mm::PAGE_SIZE - page_off, byte_count - bytes_written);
 
             let phys = match mo.resolve_page(page_idx) {
                 Some(p) => p,
@@ -5023,9 +5284,15 @@ fn syscall_vspace_fork_range(
 
             let ff = VSpace::entry_flags_to_page_flags(first_pte);
             let mut perms: u8 = 0;
-            if ff.writable || ff.cow { perms |= 0x01; }
-            if ff.user { perms |= 0x02; }
-            if ff.executable { perms |= 0x04; }
+            if ff.writable || ff.cow {
+                perms |= 0x01;
+            }
+            if ff.user {
+                perms |= 0x02;
+            }
+            if ff.executable {
+                perms |= 0x04;
+            }
 
             let _ = t.mappings.insert(
                 va_start,
@@ -5041,14 +5308,16 @@ fn syscall_vspace_fork_range(
         }
 
         if forked > 0 {
-            (*child_mo).reverse_maps.add(crate::cap::memory_object::ReverseMapEntry {
-                vspace: child_vs as *mut VSpace,
-                va_start,
-                page_count: forked as u32,
-                mo_offset: mo_offset as u32,
-                perms: 0,
-                _pad: [0; 7],
-            });
+            (*child_mo)
+                .reverse_maps
+                .add(crate::cap::memory_object::ReverseMapEntry {
+                    vspace: child_vs as *mut VSpace,
+                    va_start,
+                    page_count: forked as u32,
+                    mo_offset: mo_offset as u32,
+                    perms: 0,
+                    _pad: [0; 7],
+                });
         }
 
         SyscallResult::ok(forked as u64)
@@ -5141,7 +5410,11 @@ fn syscall_vspace_map_mo(
                 // requested, map as read-only + COW.
                 let from_parent = depth > 0 && !(*mo_ptr).is_local_committed(page_idx);
                 let effective = if is_cloned && flags.writable && from_parent {
-                    PageFlags { writable: false, cow: true, ..flags }
+                    PageFlags {
+                        writable: false,
+                        cow: true,
+                        ..flags
+                    }
                 } else {
                     flags
                 };
@@ -5176,14 +5449,16 @@ fn syscall_vspace_map_mo(
 
         if mapped > 0 {
             // Register reverse map on MO
-            (*mo_ptr).reverse_maps.add(crate::cap::memory_object::ReverseMapEntry {
-                vspace: cap.object as *mut VSpace,
-                va_start: vaddr,
-                page_count: mapped as u32,
-                mo_offset: offset as u32,
-                perms: (flags_bits & 0xFF) as u8,
-                _pad: [0; 7],
-            });
+            (*mo_ptr)
+                .reverse_maps
+                .add(crate::cap::memory_object::ReverseMapEntry {
+                    vspace: cap.object as *mut VSpace,
+                    va_start: vaddr,
+                    page_count: mapped as u32,
+                    mo_offset: offset as u32,
+                    perms: (flags_bits & 0xFF) as u8,
+                    _pad: [0; 7],
+                });
 
             // Insert VmArea into VSpace Maple tree
             if !vspace.tracking.is_null() {

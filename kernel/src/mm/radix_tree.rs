@@ -63,11 +63,7 @@ impl RadixTree {
     ///
     /// # Safety
     /// Caller must ensure `alloc` is valid and the tree is not concurrently modified.
-    unsafe fn grow_depth<A: NodeAllocator>(
-        &mut self,
-        target_depth: u32,
-        alloc: &mut A,
-    ) -> bool {
+    unsafe fn grow_depth<A: NodeAllocator>(&mut self, target_depth: u32, alloc: &mut A) -> bool {
         while self.depth < target_depth {
             let new_root = alloc.alloc_node() as *mut u64;
             if new_root.is_null() {
@@ -149,6 +145,86 @@ impl RadixTree {
             *node.add(leaf_idx) = value;
         }
         true
+    }
+
+    /// Reserve a slot at `page_idx` by writing a BUSY sentinel.
+    ///
+    /// Ensures the path to the leaf exists (allocating intermediate nodes
+    /// as needed), then atomically checks whether the leaf is empty and
+    /// writes `busy_sentinel` if so.
+    ///
+    /// Returns:
+    /// - `Ok(true)`:  slot was empty, now contains `busy_sentinel`.
+    /// - `Ok(false)`: slot already has a value (committed or BUSY) — skip.
+    /// - `Err(())`:   intermediate node allocation failed.
+    ///
+    /// # Safety
+    /// `alloc` must be valid. Caller must hold an appropriate lock
+    /// (e.g., `mo.commit_lock`) to prevent concurrent modification.
+    pub unsafe fn reserve_slot<A: NodeAllocator>(
+        &mut self,
+        page_idx: usize,
+        busy_sentinel: u64,
+        alloc: &mut A,
+    ) -> Result<bool, ()> {
+        if page_idx >= MAX_INDEX {
+            return Err(());
+        }
+        let needed = Self::depth_for_index(page_idx);
+
+        // Grow tree if needed
+        if needed > self.depth {
+            // SAFETY: alloc is valid, caller holds lock.
+            if !unsafe { self.grow_depth(needed, alloc) } {
+                return Err(());
+            }
+        }
+
+        // Ensure root exists
+        if self.root.is_null() {
+            let node = alloc.alloc_node() as *mut u64;
+            if node.is_null() {
+                return Err(());
+            }
+            self.root = node;
+            self.depth = needed;
+        }
+
+        // Walk down, creating intermediate nodes as needed
+        let mut node = self.root;
+        for level in (2..=self.depth).rev() {
+            let idx = Self::level_index(page_idx, level);
+            // SAFETY: node is a valid page-aligned array of 512 u64 entries.
+            let entry = unsafe { *node.add(idx) };
+            if entry == 0 {
+                let child = alloc.alloc_node() as *mut u64;
+                if child.is_null() {
+                    return Err(());
+                }
+                // SAFETY: node[idx] is within bounds.
+                unsafe {
+                    *node.add(idx) = child as u64;
+                }
+                node = child;
+            } else {
+                node = entry as *mut u64;
+            }
+        }
+
+        // Check leaf: if non-zero, already committed or BUSY
+        let leaf_idx = Self::level_index(page_idx, 1);
+        // SAFETY: node is a valid leaf node, leaf_idx < 512.
+        let existing = unsafe { *node.add(leaf_idx) };
+        if existing != 0 {
+            return Ok(false);
+        }
+
+        // Write BUSY sentinel
+        // SAFETY: leaf slot is empty, we hold the lock.
+        unsafe {
+            *node.add(leaf_idx) = busy_sentinel;
+        }
+        Ok(true)
     }
 
     /// Look up the value at `page_idx`. Returns 0 if not present.

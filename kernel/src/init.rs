@@ -10,20 +10,18 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use crate::cap::{
-    alloc_slot, get_cap_mut, CNode, CapRef, CapRights, KernelObject, ObjectType,
-    UntypedMemory,
-};
+use crate::bootinfo::MemoryKind;
 use crate::cap::IoPortRange;
+use crate::cap::{
+    alloc_slot, get_cap_mut, CNode, CapRef, CapRights, KernelObject, ObjectType, UntypedMemory,
+};
 use crate::ipc::{IrqHandler, Notification};
 use crate::mm::vspace::PageFlags;
 use crate::mm::{
-    pmm_alloc, pmm_alloc_contiguous, pmm_set_owner, pmm_free_count,
-    frame::FrameOwner, frame::KernelMetaKind,
-    phys_to_virt, VSpace, PAGE_SIZE,
+    frame::FrameOwner, frame::KernelMetaKind, phys_to_virt, pmm_alloc, pmm_alloc_contiguous,
+    pmm_free_count, pmm_set_owner, VSpace, PAGE_SIZE,
 };
 use crate::sched::thread::{SchedContext, Tcb};
-use crate::bootinfo::MemoryKind;
 use crate::ParsedBootInfo;
 use core::mem::MaybeUninit;
 
@@ -121,6 +119,8 @@ static mut INIT_UNTYPEDS: [UntypedMemory; MAX_INIT_UNTYPEDS] = {
     const EMPTY: UntypedMemory = UntypedMemory::new(0, 0, false);
     [EMPTY; MAX_INIT_UNTYPEDS]
 };
+/// Number of init untyped regions actually created (set by create_untyped_caps).
+static mut INIT_UNTYPED_COUNT: usize = 0;
 
 /// COM1 serial port IoPort (x86 only — aarch64 uses PL011 device untyped)
 #[cfg(target_arch = "x86_64")]
@@ -148,7 +148,7 @@ static mut INIT_ECAM_UNTYPED: UntypedMemory = UntypedMemory::new(0x3f00_0000, 24
 #[cfg(target_arch = "x86_64")]
 static mut INIT_KBD_IOPORT: IoPortRange = IoPortRange::new(0x60, 5); // ports 0x60-0x64
 #[cfg(target_arch = "x86_64")]
-static mut INIT_KBD_IRQ: IrqHandler = IrqHandler::new(1);           // IRQ1
+static mut INIT_KBD_IRQ: IrqHandler = IrqHandler::new(1); // IRQ1
 
 /// PCI config space I/O port (0xCF8..0xCFF, 8 ports for CONFIG_ADDRESS + CONFIG_DATA)
 #[cfg(target_arch = "x86_64")]
@@ -212,7 +212,12 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
     crate::serial_puts("[INIT] Creating user VSpace\n");
 
     // Allocate PML4 for user VSpace
-    let pml4_phys = boot_unwrap!(pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::General }), "PML4 alloc failed");
+    let pml4_phys = boot_unwrap!(
+        pmm_alloc(&FrameOwner::KernelPrivate {
+            subkind: KernelMetaKind::General
+        }),
+        "PML4 alloc failed"
+    );
     let pml4_virt = phys_to_virt(pml4_phys) as *mut u64;
 
     // Zero the PML4
@@ -260,7 +265,12 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
     #[cfg(target_arch = "x86_64")]
     let tramp_stack_top = {
         // Allocate a kernel stack for the trampoline (used by context_switch → iretq)
-        let tramp_stack_phys = boot_unwrap!(pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::General }), "trampoline stack alloc failed");
+        let tramp_stack_phys = boot_unwrap!(
+            pmm_alloc(&FrameOwner::KernelPrivate {
+                subkind: KernelMetaKind::General
+            }),
+            "trampoline stack alloc failed"
+        );
         let tramp_stack_virt = phys_to_virt(tramp_stack_phys);
         let tramp_stack_top = tramp_stack_virt + PAGE_SIZE as u64;
         unsafe {
@@ -272,7 +282,10 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
     // Allocate per-thread kernel stack for syscall entry (4 pages = 16 KiB).
     // A single page (4 KiB) overflows on deep syscall paths.
     const KSTACK_PAGES: usize = 4;
-    let kstack_phys = boot_unwrap!(pmm_alloc_contiguous(KSTACK_PAGES), "kernel stack alloc failed");
+    let kstack_phys = boot_unwrap!(
+        pmm_alloc_contiguous(KSTACK_PAGES),
+        "kernel stack alloc failed"
+    );
     let kstack_virt = phys_to_virt(kstack_phys);
     let kstack_top = kstack_virt + (KSTACK_PAGES * PAGE_SIZE) as u64;
     unsafe {
@@ -304,11 +317,11 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
             // It reads r12/r13/r14 and performs iretq to ring 3.
             (*tcb).context.rip = crate::arch::usermode_trampoline as *const () as u64;
             (*tcb).context.rsp = tramp_stack_top;
-            (*tcb).context.r12 = user_rip;            // User RIP
-            (*tcb).context.r13 = user_stack_top;       // User RSP
-            (*tcb).context.r14 = vspace_root;          // User CR3
-            (*tcb).context.r15 = 0x0202;               // User RFLAGS: IF=1, IOPL=0
-            (*tcb).context.rflags = 0x202;             // Kernel RFLAGS for context_switch
+            (*tcb).context.r12 = user_rip; // User RIP
+            (*tcb).context.r13 = user_stack_top; // User RSP
+            (*tcb).context.r14 = vspace_root; // User CR3
+            (*tcb).context.r15 = 0x0202; // User RFLAGS: IF=1, IOPL=0
+            (*tcb).context.rflags = 0x202; // Kernel RFLAGS for context_switch
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -480,7 +493,9 @@ fn setup_init_cspace(boot_info: Option<&ParsedBootInfo>) {
             // interrupt storm that starves the console server.
             {
                 let irq_ptr = &raw mut INIT_PL011_IRQ;
-                unsafe { (*irq_ptr).level_triggered = true; }
+                unsafe {
+                    (*irq_ptr).level_triggered = true;
+                }
                 insert_static_cap(
                     cnode,
                     CAP_COM1_IRQ,
@@ -531,12 +546,13 @@ fn setup_init_cspace(boot_info: Option<&ParsedBootInfo>) {
         // Slot 12: Initrd pseudo-device untyped for map_device-based sharing
         if let Some(info) = boot_info {
             if info.initrd_addr != 0 && info.initrd_size != 0 {
-                let size_bits = ceil_log2(core::cmp::max(PAGE_SIZE as u64, info.initrd_size as u64));
+                let size_bits =
+                    ceil_log2(core::cmp::max(PAGE_SIZE as u64, info.initrd_size as u64));
                 let initrd_ut = &raw mut INIT_INITRD_UNTYPED;
                 (*initrd_ut) = UntypedMemory::new(info.initrd_addr, size_bits, true);
-                INITRD_DEVICE_LIMIT_BYTES =
-                    ((info.initrd_size as u64 + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64)
-                        * PAGE_SIZE as u64;
+                INITRD_DEVICE_LIMIT_BYTES = ((info.initrd_size as u64 + PAGE_SIZE as u64 - 1)
+                    / PAGE_SIZE as u64)
+                    * PAGE_SIZE as u64;
                 INITRD_DEVICE_UT_PTR = initrd_ut as *const UntypedMemory;
 
                 insert_static_cap_with_rights(
@@ -703,6 +719,30 @@ pub fn fb_device_limit_for(obj: *const UntypedMemory) -> Option<u64> {
     }
 }
 
+/// Find the init untyped that contains `phys`.
+///
+/// Searches the static `INIT_UNTYPEDS` array for a region whose
+/// `[phys_addr, phys_addr + size_bytes)` range covers `phys`.
+/// Returns a raw pointer to the UntypedMemory, or null if not found.
+///
+/// # Safety
+/// The returned pointer is valid for the system lifetime (static storage).
+/// Caller must acquire `ut.alloc_lock` before mutating allocator state.
+pub fn find_untyped_for_phys(phys: u64) -> *mut UntypedMemory {
+    unsafe {
+        let count = *(&raw const INIT_UNTYPED_COUNT);
+        for i in 0..count {
+            let ut = &raw mut INIT_UNTYPEDS[i];
+            let base = (*ut).phys_addr;
+            let size = (*ut).size_bytes() as u64;
+            if phys >= base && phys < base + size {
+                return ut;
+            }
+        }
+    }
+    core::ptr::null_mut()
+}
+
 /// Create untyped memory capabilities from boot info memory map
 unsafe fn create_untyped_caps(cnode: &mut CNode, _info: &ParsedBootInfo) {
     // Allocate backing memory from the frame allocator so untyped regions
@@ -733,7 +773,11 @@ unsafe fn create_untyped_caps(cnode: &mut CNode, _info: &ParsedBootInfo) {
     // At lowmem, start from 1MB instead of 256MB to avoid wasting
     // iteration and to produce multiple smaller regions for flexibility.
     let start_bits = if free_frames <= LOWMEM_THRESHOLD_FRAMES {
-        if MAX_SIZE_BITS > 20 { 20 } else { MAX_SIZE_BITS }
+        if MAX_SIZE_BITS > 20 {
+            20
+        } else {
+            MAX_SIZE_BITS
+        }
     } else {
         MAX_SIZE_BITS
     };
@@ -760,15 +804,20 @@ unsafe fn create_untyped_caps(cnode: &mut CNode, _info: &ParsedBootInfo) {
             // Tag each allocated frame so pmm_free can verify ownership.
             for i in 0..frame_count {
                 let addr = base + (i * PAGE_SIZE) as u64;
-                pmm_set_owner(addr, &FrameOwner::KernelPrivate {
-                    subkind: KernelMetaKind::General,
-                });
+                pmm_set_owner(
+                    addr,
+                    &FrameOwner::KernelPrivate {
+                        subkind: KernelMetaKind::General,
+                    },
+                );
             }
             free_frames = free_frames.saturating_sub(frame_count);
 
             // Initialize the UntypedMemory object in static storage
             let ut = unsafe { &raw mut INIT_UNTYPEDS[ut_index] };
-            unsafe { (*ut) = UntypedMemory::new(base, size_bits, false); }
+            unsafe {
+                (*ut) = UntypedMemory::new(base, size_bits, false);
+            }
 
             // Allocate a global cap slot and populate it
             let slot = boot_unwrap!(alloc_slot(), "untyped cap slot alloc failed");
@@ -803,9 +852,13 @@ unsafe fn create_untyped_caps(cnode: &mut CNode, _info: &ParsedBootInfo) {
 
     // Low-memory fallback: ensure init gets at least one small untyped.
     if ut_index == 0 && free_frames > LOWMEM_ABS_RESERVE_FRAMES {
-        if let Some(base) = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::General }) {
+        if let Some(base) = pmm_alloc(&FrameOwner::KernelPrivate {
+            subkind: KernelMetaKind::General,
+        }) {
             let ut = unsafe { &raw mut INIT_UNTYPEDS[ut_index] };
-            unsafe { (*ut) = UntypedMemory::new(base, MIN_SIZE_BITS, false); }
+            unsafe {
+                (*ut) = UntypedMemory::new(base, MIN_SIZE_BITS, false);
+            }
 
             let slot = boot_unwrap!(alloc_slot(), "fallback untyped cap slot alloc failed");
             let cap = get_cap_mut(slot);
@@ -831,6 +884,12 @@ unsafe fn create_untyped_caps(cnode: &mut CNode, _info: &ParsedBootInfo) {
 
     if ut_index == 0 {
         crate::serial_puts("[INIT] WARNING: no contiguous untyped region available\n");
+    }
+
+    // Store the count for find_untyped_for_phys
+    // SAFETY: Single-threaded init, no concurrent access yet.
+    unsafe {
+        *(&raw mut INIT_UNTYPED_COUNT) = ut_index;
     }
 
     {
@@ -902,7 +961,12 @@ fn load_from_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) -> (u64, u64) {
 
     // Allocate and map a multi-page user stack
     for pg in 0..INIT_STACK_PAGES {
-        let stack_phys = boot_unwrap!(pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::General }), "stack alloc failed");
+        let stack_phys = boot_unwrap!(
+            pmm_alloc(&FrameOwner::KernelPrivate {
+                subkind: KernelMetaKind::General
+            }),
+            "stack alloc failed"
+        );
         unsafe {
             core::ptr::write_bytes(phys_to_virt(stack_phys) as *mut u8, 0, PAGE_SIZE);
         }
@@ -954,7 +1018,12 @@ fn map_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) {
             phys
         } else {
             // Fallback path for non-page-aligned bootloader initrd.
-            let frame_phys = boot_unwrap!(pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::General }), "initrd frame alloc failed");
+            let frame_phys = boot_unwrap!(
+                pmm_alloc(&FrameOwner::KernelPrivate {
+                    subkind: KernelMetaKind::General
+                }),
+                "initrd frame alloc failed"
+            );
             let frame_virt = phys_to_virt(frame_phys) as *mut u8;
             let src = phys_to_virt(phys) as *const u8;
             let copy_len = if (i + 1) * PAGE_SIZE > initrd_size {
@@ -1012,7 +1081,12 @@ fn map_bootinfo(vspace: &mut VSpace, boot_info: Option<&ParsedBootInfo>) {
         Some(info) => bootinfo_total_usable_bytes(info),
         None => 0,
     };
-    let frame_phys = boot_unwrap!(pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::General }), "bootinfo frame alloc failed");
+    let frame_phys = boot_unwrap!(
+        pmm_alloc(&FrameOwner::KernelPrivate {
+            subkind: KernelMetaKind::General
+        }),
+        "bootinfo frame alloc failed"
+    );
     let frame_virt = phys_to_virt(frame_phys) as *mut u8;
     unsafe {
         core::ptr::write_bytes(frame_virt, 0, PAGE_SIZE);

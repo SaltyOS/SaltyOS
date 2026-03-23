@@ -32,6 +32,17 @@ pub struct UntypedMemory {
 
     /// Whether this is device memory (non-cacheable)
     pub is_device: bool,
+
+    /// Protects allocator state (free_list, watermark) for MO_COMMIT
+    /// frame allocation. Lock ordering: mo.commit_lock → alloc_lock.
+    pub alloc_lock: mm::SpinLock,
+
+    /// Head of intrusive free list for reclaimed pages (phys addr, 0 = empty).
+    /// Each free page stores the next pointer at its virtual address.
+    pub free_list_head: u64,
+
+    /// Number of pages on the free list.
+    pub free_list_count: u32,
 }
 
 impl UntypedMemory {
@@ -42,6 +53,9 @@ impl UntypedMemory {
             size_bits,
             watermark: 0,
             is_device,
+            alloc_lock: mm::SpinLock::new(),
+            free_list_head: 0,
+            free_list_count: 0,
         }
     }
 
@@ -117,12 +131,12 @@ pub unsafe fn init_metadata(num_slots: usize) {
     let untyped_bytes = num_slots * core::mem::size_of::<MaybeUninit<UntypedMemory>>();
     let untyped_pages = (untyped_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
 
-    let frame_phys = mm::pmm_alloc_contiguous(frame_pages)
-        .expect("[CAP] FRAME_METADATA allocation failed");
-    let vspace_phys = mm::pmm_alloc_contiguous(vspace_pages)
-        .expect("[CAP] VSPACE_METADATA allocation failed");
-    let untyped_phys = mm::pmm_alloc_contiguous(untyped_pages)
-        .expect("[CAP] UNTYPED_METADATA allocation failed");
+    let frame_phys =
+        mm::pmm_alloc_contiguous(frame_pages).expect("[CAP] FRAME_METADATA allocation failed");
+    let vspace_phys =
+        mm::pmm_alloc_contiguous(vspace_pages).expect("[CAP] VSPACE_METADATA allocation failed");
+    let untyped_phys =
+        mm::pmm_alloc_contiguous(untyped_pages).expect("[CAP] UNTYPED_METADATA allocation failed");
 
     // SAFETY: Single-threaded init, direct map available
     unsafe {
@@ -272,7 +286,11 @@ fn object_size(obj_type: ObjectType, size_bits: u8) -> Result<usize, CapError> {
         ObjectType::IoPort => Ok(core::mem::size_of::<crate::cap::IoPortRange>()),
         ObjectType::SchedContext => Ok(core::mem::size_of::<crate::sched::thread::SchedContext>()),
         ObjectType::MemoryObject => {
-            let page_count = if size_bits == 0 { 1usize } else { 1usize << (size_bits as usize) };
+            let page_count = if size_bits == 0 {
+                1usize
+            } else {
+                1usize << (size_bits as usize)
+            };
             let total = crate::cap::memory_object::MemoryObject::required_bytes(page_count as u32);
             let aligned = (total + 4095) & !4095;
             Ok(aligned)
@@ -321,9 +339,7 @@ unsafe fn init_object(
                 Ok(tcb as *mut KernelObject)
             }
 
-            ObjectType::VSpace => {
-                Err(CapError::InvalidOperation)
-            }
+            ObjectType::VSpace => Err(CapError::InvalidOperation),
 
             ObjectType::SchedContext => {
                 let sc = virt_addr as *mut crate::sched::thread::SchedContext;
@@ -377,7 +393,11 @@ unsafe fn init_frame_metadata(
     }
     // Frame ownership managed by PMM FrameOwner tags, no separate refcount needed.
     // SAFETY: METADATA_STATE is initialized before any retype operations
-    let frame_ptr = unsafe { (*(&raw const METADATA_STATE)).frame_ptr.add(cap_slot as usize) };
+    let frame_ptr = unsafe {
+        (*(&raw const METADATA_STATE))
+            .frame_ptr
+            .add(cap_slot as usize)
+    };
     let frame_ptr = unsafe { (*frame_ptr).as_mut_ptr() };
     unsafe {
         frame_ptr.write(FrameObject::new(phys_addr, actual_bits));
@@ -415,7 +435,9 @@ unsafe fn init_vspace_metadata(
         core::ptr::write(tracking_ptr, crate::mm::VSpaceTracking::new(pml4_phys));
 
         // SAFETY: METADATA_STATE is initialized before any retype operations
-        let vspace_ptr = (*(&raw const METADATA_STATE)).vspace_ptr.add(cap_slot as usize);
+        let vspace_ptr = (*(&raw const METADATA_STATE))
+            .vspace_ptr
+            .add(cap_slot as usize);
         let vspace_ptr = (*vspace_ptr).as_mut_ptr();
         vspace_ptr.write(crate::mm::VSpace::new(pml4_phys, tracking_ptr));
         vspace_ptr as *mut crate::cap::object::KernelObject
@@ -433,7 +455,11 @@ unsafe fn init_untyped_metadata(
     is_device: bool,
 ) -> *mut crate::cap::object::KernelObject {
     // SAFETY: METADATA_STATE is initialized before any retype operations
-    let untyped_ptr = unsafe { (*(&raw const METADATA_STATE)).untyped_ptr.add(cap_slot as usize) };
+    let untyped_ptr = unsafe {
+        (*(&raw const METADATA_STATE))
+            .untyped_ptr
+            .add(cap_slot as usize)
+    };
     let untyped_ptr = unsafe { (*untyped_ptr).as_mut_ptr() };
     unsafe {
         untyped_ptr.write(UntypedMemory::new(phys_addr, size_bits, is_device));
@@ -456,9 +482,7 @@ impl UntypedMemory {
         dest_offset: usize,
     ) -> Result<(), CapError> {
         // Device memory can only be retyped into Frame or Untyped (no zeroing)
-        if self.is_device
-            && !matches!(new_type, ObjectType::Frame | ObjectType::Untyped)
-        {
+        if self.is_device && !matches!(new_type, ObjectType::Frame | ObjectType::Untyped) {
             return Err(CapError::InvalidOperation);
         }
 
@@ -525,19 +549,30 @@ impl UntypedMemory {
             // Initialize object
             let object = unsafe {
                 match new_type {
-                    ObjectType::Frame => init_frame_metadata(cap_slot, obj_addr, size_bits, !self.is_device),
+                    ObjectType::Frame => {
+                        init_frame_metadata(cap_slot, obj_addr, size_bits, !self.is_device)
+                    }
                     ObjectType::VSpace => init_vspace_metadata(cap_slot, obj_addr),
-                    ObjectType::Untyped => init_untyped_metadata(cap_slot, obj_addr, size_bits, self.is_device),
+                    ObjectType::Untyped => {
+                        init_untyped_metadata(cap_slot, obj_addr, size_bits, self.is_device)
+                    }
                     ObjectType::MemoryObject => {
-                        let page_count = if size_bits == 0 { 1u32 } else { 1u32 << (size_bits as u32) };
+                        let page_count = if size_bits == 0 {
+                            1u32
+                        } else {
+                            1u32 << (size_bits as u32)
+                        };
                         // SAFETY: obj_addr points to a zeroed untyped region of obj_size bytes.
                         let mo_virt = mm::phys_to_virt(obj_addr) as *mut u8;
                         core::ptr::write_bytes(mo_virt, 0, obj_size);
                         let mo_ptr = mo_virt as *mut crate::cap::memory_object::MemoryObject;
                         // SAFETY: Region is zeroed and large enough for MemoryObject + arrays.
-                        core::ptr::write(mo_ptr, crate::cap::memory_object::MemoryObject::new(obj_addr, page_count));
+                        core::ptr::write(
+                            mo_ptr,
+                            crate::cap::memory_object::MemoryObject::new(obj_addr, page_count),
+                        );
                         mo_virt as *mut crate::cap::object::KernelObject
-                    },
+                    }
                     _ => match init_object(new_type, obj_addr, size_bits) {
                         Ok(obj) => obj,
                         Err(e) => {
