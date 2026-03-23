@@ -2,21 +2,25 @@
 
 ## Philosophy
 
-> PMM is the **permanent owner** of all physical frames. MO **borrows**
-> frames from PMM and gives them meaning for userspace. VSpace is an
-> **observer** that temporarily views MO's loans.
+> **PMM** manages kernel-internal metadata pages. **Untyped** is the
+> primary source of user data pages. MO **borrows** frames from either
+> pool and gives them meaning for userspace. VSpace is an **observer**
+> that temporarily views MO's pages.
 
 SaltyOS memory management combines seL4-style capability authority with
 Zircon-style virtual memory objects:
 
-- **PMM**: Sole owner and allocator of all physical frames. Every frame
-  carries an owner tag (`FrameOwner`) for accountability.
-- **Untyped**: Raw physical memory, the source of kernel objects (seL4).
-  Never used for data pages — only for TCB, CNode, VSpace, Endpoint,
-  MemoryObject structs, and capability metadata.
-- **MemoryObject (MO)**: Borrows frames from PMM and gives them meaning
-  for userspace. Tracks pages via 4-level radix tree. Maintains reverse
-  mappings to every VSpace that observes its pages.
+- **PMM**: Kernel-internal frame allocator. Provides page table pages,
+  radix tree nodes, maple tree nodes, kernel stacks, and other kernel
+  metadata. ~1/8 of physical RAM. Not for user data.
+- **Untyped**: Raw physical memory, the source of kernel objects (seL4)
+  **and MO data pages**. ~7/8 of physical RAM. `MO_COMMIT` with a
+  non-zero `ut_cap` carves page-sized frames directly from the untyped's
+  watermark. Decommitted frames go to a per-untyped free list for reuse.
+- **MemoryObject (MO)**: Borrows frames from untyped (preferred) or PMM
+  (fallback) and gives them meaning for userspace. Tracks pages via
+  4-level radix tree with per-page backing tags (bit 0 = untyped-backed).
+  Maintains reverse mappings to every VSpace that observes its pages.
 - **VSpace**: Observes MO pages through mappings. Owns nothing. Uses a
   Maple tree to track virtual address regions.
 
@@ -526,29 +530,69 @@ No `PMM::transfer` occurs during COW resolution. The parent's frame A
 stays with the parent. The child gets a new frame D from PMM. This is
 a pure allocation, not a transfer.
 
-### PMM integration
+### Frame allocation: dual-source model
 
-When MO commits a page:
+MO data pages come from **untyped** (primary) or **PMM** (fallback).
+The caller provides a `ut_cap` argument to `MO_COMMIT`:
+
+- `ut_cap != 0`: Carve page-sized frames from the untyped watermark
+  (or its free list). Radix tree entry tagged with `PHYS_TAG_UNTYPED`
+  (bit 0). Per-untyped `alloc_lock` protects watermark and free list.
+- `ut_cap == 0`: Allocate from PMM bitmap (fallback/legacy path).
+  No tag bit set.
+
+Per-page commit sequence (untyped path):
 ```
-pmm.alloc(FrameOwner::MoData { mo: self_ptr, page_idx }) → phys
-mo.pages.insert(page_idx, phys)
+mo.commit_lock.lock()
+  reserve_slot(page_idx, BUSY)  ← path + empty check + sentinel, atomic
+mo.commit_lock.unlock()
+ut.alloc_lock.lock()
+  pop free_list or bump watermark → phys
+ut.alloc_lock.unlock()
+zero page                         ← outside all locks
+mo.commit_lock.lock()
+  radix leaf = phys | PHYS_TAG_UNTYPED
+mo.commit_lock.unlock()
+```
+
+Lock ordering: `mo.commit_lock` → `ut.alloc_lock` (never reversed).
+
+When MO decommits a page:
+```
+mo.commit_lock.lock()
+  entry = mo.pages.get(page_idx)
+  mo.pages.remove(page_idx)
+mo.commit_lock.unlock()
+if entry & PHYS_TAG_UNTYPED:
+  ut.alloc_lock → push to source untyped free list
+else:
+  pmm_free(phys)
 ```
 
 When MO is destroyed:
 ```
-for each page in mo.pages:
+mo.commit_lock.lock()
+  for each page in mo.pages:
     for each rmap in mo.reverse_maps:
-        unmap PTE, TLB shootdown
-    pmm.free(phys, FrameOwner::MoData { mo: self_ptr, page_idx })
+      unmap PTE, TLB shootdown
+    if PHYS_TAG_UNTYPED: batch collect
+    else: pmm_free(phys)
+mo.commit_lock.unlock()
+for each batched untyped page:
+  ut.alloc_lock → push to source free list
 for each metadata page (radix nodes, rmap overflow):
-    pmm.free(phys, FrameOwner::MoMeta { mo: self_ptr, kind })
+  pmm.free(phys, FrameOwner::MoMeta { mo, kind })
 ```
+
+Untyped frame reclaim: `find_untyped_for_phys(phys)` searches the
+init-created untyped list by physical range. Design invariant: untyped
+source ranges are disjoint and never split.
 
 ### Invoke labels
 
 | Label | Value | Operation |
 |-------|-------|-----------|
-| MO_COMMIT | 0x90 | Allocate physical frames for page range |
+| MO_COMMIT | 0x90 | Allocate frames for page range (arg2=ut_cap, 0=PMM) |
 | MO_DECOMMIT | 0x91 | Release physical frames |
 | MO_GET_SIZE | 0x92 | Return page count |
 | MO_CLONE | 0x93 | Create COW snapshot clone |
