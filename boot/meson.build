@@ -51,10 +51,12 @@ stage1_uefi_c_objs = []
 foreach src : stage1_uefi_c_src
   src_name = fs.name(src)
   obj_name = src_name.replace('.c', '.obj')
+  dep_name = 'stage1_uefi_' + src_name.replace('.c', '.d')
   stage1_uefi_c_objs += custom_target('stage1_uefi_' + obj_name,
     input: src,
     output: 'stage1_uefi_' + obj_name,
-    command: cc_cmd + uefi_c_args + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
+    depfile: dep_name,
+    command: cc_cmd + uefi_c_args + ['-MMD', '-MF', '@DEPFILE@', '-c', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
 endforeach
@@ -114,10 +116,12 @@ if build_bios_boot
   foreach src : stage2_c_src + boot_common_src
     src_name = fs.name(src)
     obj_name = src_name.replace('.c', '.o')
+    dep_name = 'stage2_' + src_name.replace('.c', '.d')
     stage2_c_objs += custom_target('stage2_' + obj_name,
       input: src,
       output: 'stage2_' + obj_name,
-      command: cc_cmd + stage2_c_args + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
+      depfile: dep_name,
+      command: cc_cmd + stage2_c_args + ['-MMD', '-MF', '@DEPFILE@', '-c', '-o', '@OUTPUT@', '@INPUT@'],
       build_by_default: true,
     )
   endforeach
@@ -158,10 +162,12 @@ stage2_uefi_c_objs = []
 foreach src : stage2_uefi_c_src
   src_name = fs.name(src)
   obj_name = src_name.replace('.c', '.obj')
+  dep_name = 'stage2_uefi_' + src_name.replace('.c', '.d')
   stage2_uefi_c_objs += custom_target('stage2_uefi_' + obj_name,
     input: src,
     output: 'stage2_uefi_' + obj_name,
-    command: cc_cmd + uefi_c_args + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
+    depfile: dep_name,
+    command: cc_cmd + uefi_c_args + ['-MMD', '-MF', '@DEPFILE@', '-c', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
 endforeach
@@ -249,10 +255,12 @@ if build_bios_boot
   foreach src : stage3_c_src + stage3_v86_src + boot_common_src
     src_name = fs.name(src)
     obj_name = src_name.replace('.c', '.o')
+    dep_name = 'stage3_' + src_name.replace('.c', '.d')
     stage3_c_objs += custom_target('stage3_' + obj_name,
       input: src,
       output: 'stage3_' + obj_name,
-      command: cc_cmd + stage3_c_args + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
+      depfile: dep_name,
+      command: cc_cmd + stage3_c_args + ['-MMD', '-MF', '@DEPFILE@', '-c', '-o', '@OUTPUT@', '@INPUT@'],
       build_by_default: true,
     )
   endforeach
@@ -330,10 +338,12 @@ stage3_uefi_c_objs = []
 foreach src : stage3_uefi_c_src + stage3_uefi_common_src
   src_name = fs.name(src)
   obj_name = src_name.replace('.c', '.o')
+  dep_name = 'stage3_uefi_' + src_name.replace('.c', '.d')
   stage3_uefi_c_objs += custom_target('stage3_uefi_' + obj_name,
     input: src,
     output: 'stage3_uefi_' + obj_name,
-    command: cc_cmd + stage3_uefi_c_args + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
+    depfile: dep_name,
+    command: cc_cmd + stage3_uefi_c_args + ['-MMD', '-MF', '@DEPFILE@', '-c', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
 endforeach

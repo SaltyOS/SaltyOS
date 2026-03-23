@@ -18,7 +18,7 @@ use crate::cap::IoPortRange;
 use crate::ipc::{IrqHandler, Notification};
 use crate::mm::vspace::PageFlags;
 use crate::mm::{
-    pmm_alloc, pmm_alloc_contiguous, pmm_free_count,
+    pmm_alloc, pmm_alloc_contiguous, pmm_set_owner, pmm_free_count,
     frame::FrameOwner, frame::KernelMetaKind,
     phys_to_virt, VSpace, PAGE_SIZE,
 };
@@ -757,6 +757,13 @@ unsafe fn create_untyped_caps(cnode: &mut CNode, _info: &ParsedBootInfo) {
             let Some(base) = pmm_alloc_contiguous(frame_count) else {
                 break;
             };
+            // Tag each allocated frame so pmm_free can verify ownership.
+            for i in 0..frame_count {
+                let addr = base + (i * PAGE_SIZE) as u64;
+                pmm_set_owner(addr, &FrameOwner::KernelPrivate {
+                    subkind: KernelMetaKind::General,
+                });
+            }
             free_frames = free_frames.saturating_sub(frame_count);
 
             // Initialize the UntypedMemory object in static storage

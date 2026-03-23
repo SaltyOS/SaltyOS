@@ -19,6 +19,9 @@ const ENTRIES_PER_NODE: usize = PAGE_SIZE / 8; // 512
 const BITS_PER_LEVEL: u32 = 9;
 const MAX_LEVELS: u32 = 4;
 
+/// Maximum page index representable in a MAX_LEVELS-deep tree.
+const MAX_INDEX: usize = 1usize << (MAX_LEVELS as usize * BITS_PER_LEVEL as usize);
+
 /// Root of a radix tree.
 #[repr(C)]
 pub struct RadixTree {
@@ -95,6 +98,9 @@ impl RadixTree {
         value: u64,
         alloc: &mut A,
     ) -> bool {
+        if page_idx >= MAX_INDEX {
+            return false;
+        }
         let needed = Self::depth_for_index(page_idx);
 
         // Grow tree if needed

@@ -128,4 +128,4 @@ _saltyos_toolchain_main() {
   esac
 }
 
-_saltyos_toolchain_main "${@-}"
+_saltyos_toolchain_main "$@"

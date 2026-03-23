@@ -30,6 +30,8 @@ struct rtld_syscall_result {
 #include "arch/x86_64/rtld_syscall.h"
 #elif defined(__aarch64__)
 #include "arch/aarch64/rtld_syscall.h"
+#else
+#error "Unsupported architecture: rtld requires __x86_64__ or __aarch64__"
 #endif
 
 /* Architecture-specific relocation types */
@@ -37,6 +39,8 @@ struct rtld_syscall_result {
 #include "arch/x86_64/rtld_reloc_types.h"
 #elif defined(__aarch64__)
 #include "arch/aarch64/rtld_reloc_types.h"
+#else
+#error "Unsupported architecture: rtld requires __x86_64__ or __aarch64__"
 #endif
 
 static inline void rtld_putc(char c) {

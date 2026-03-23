@@ -14,7 +14,6 @@
 #include "../../config.h"
 
 #define AARCH64_QEMU_VIRT_RAM_BASE    0x40000000ULL
-#define AARCH64_BOOT_IDENTITY_LIMIT   0x80000000ULL
 
 /* Page table allocator */
 static uint64_t next_page_table = 0;
@@ -117,7 +116,8 @@ void paging_load_cr3(uint64_t root_table)
 }
 
 uint64_t paging_init_dynamic(uint64_t pt_pool_base, uint64_t pt_pool_size,
-                              uint64_t kernel_phys, uint64_t kernel_size)
+                              uint64_t kernel_phys, uint64_t kernel_size,
+                              uint64_t identity_end)
 {
     next_page_table = pt_pool_base;
     page_table_limit = pt_pool_base + pt_pool_size;
@@ -130,13 +130,19 @@ uint64_t paging_init_dynamic(uint64_t pt_pool_base, uint64_t pt_pool_size,
     uint64_t kern_flags = PTE_SH_IS | PTE_ATTR_IDX(MAIR_IDX_NORMAL_WB) | PTE_AP_RW_EL1;
 
     /*
-     * Identity map the QEMU virt RAM window used by the aarch64 UEFI path.
-     * Guest RAM starts at 0x40000000, so low x86-style identity mappings do
-     * not cover the Stage 3 image or the BootAlloc-owned buffers.
+     * Identity map [QEMU_VIRT_RAM_BASE, identity_end) so the kernel can
+     * access all boot allocations. Guest RAM starts at 0x40000000 on the
+     * QEMU virt platform, so the map begins there.
      */
+    uint64_t id_limit = identity_end;
+    if (id_limit < AARCH64_QEMU_VIRT_RAM_BASE + PAGING_PAGE_2M)
+        id_limit = AARCH64_QEMU_VIRT_RAM_BASE + PAGING_PAGE_2M;
+    /* Round up to 2 MB */
+    id_limit = (id_limit + PAGING_PAGE_2M - 1) & ~(PAGING_PAGE_2M - 1);
+
     uint64_t addr;
     for (addr = AARCH64_QEMU_VIRT_RAM_BASE;
-         addr < AARCH64_BOOT_IDENTITY_LIMIT;
+         addr < id_limit;
          addr += PAGING_PAGE_2M) {
         if (map_2m_block(l0, addr, addr, kern_flags) != 0)
             return 0;

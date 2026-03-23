@@ -77,6 +77,10 @@ pub fn invlpg(addr: u64) {
 
 /// Ensure that a non-leaf page table exists at `index` and return its physical address.
 ///
+/// If the entry contains a 2MB huge page, splits it into 512 × 4KB pages
+/// so that individual pages can be remapped (e.g. for MMIO with uncached
+/// attributes). The split preserves existing attributes on all 512 entries.
+///
 /// # Safety
 /// - `table` must point to a valid page table in the active kernel address space.
 /// - Must be called only when creating kernel-global mappings during boot or while
@@ -89,7 +93,8 @@ unsafe fn ensure_next_table(
     let entry = table.entry(index);
     if entry & PageFlags::Present as u64 != 0 {
         if entry & PageFlags::HugePage as u64 != 0 {
-            panic!("kernel 4K mapping collided with huge page");
+            // Split 2MB huge page into a page table with 512 × 4KB entries.
+            return unsafe { split_huge_page(table, index, entry, context) };
         }
         return entry & ENTRY_ADDR_MASK;
     }
@@ -107,6 +112,44 @@ unsafe fn ensure_next_table(
         frame | (PageFlags::Present as u64) | (PageFlags::Writable as u64),
     );
     frame
+}
+
+/// Split a 2MB huge page into 512 × 4KB page table entries.
+///
+/// Allocates a new page table, fills it with 4KB entries that reproduce
+/// the same physical mapping and attributes as the original huge page,
+/// then replaces the PD entry with the new PT pointer.
+///
+/// # Safety
+/// Same requirements as `ensure_next_table`.
+unsafe fn split_huge_page(
+    table: &mut PageTable,
+    index: usize,
+    huge_entry: u64,
+    context: &'static str,
+) -> u64 {
+    let pt_frame = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect(context);
+
+    // SAFETY: pt_frame is freshly allocated and reachable via direct map.
+    let pt = unsafe { &mut *(phys_to_virt(pt_frame) as *mut PageTable) };
+
+    // Base physical address of the 2MB region.
+    let base_phys = huge_entry & ENTRY_ADDR_MASK;
+    // Carry forward all attribute bits except HugePage and the address.
+    let attrs = (huge_entry & !ENTRY_ADDR_MASK) & !(PageFlags::HugePage as u64);
+
+    for i in 0..512 {
+        let page_phys = base_phys + (i as u64) * PAGE_SIZE as u64;
+        pt.set_entry(i, page_phys | attrs);
+    }
+
+    // Replace the huge page entry with a pointer to the new PT.
+    table.set_entry(
+        index,
+        pt_frame | (PageFlags::Present as u64) | (PageFlags::Writable as u64),
+    );
+
+    pt_frame
 }
 
 /// Map one 4KB MMIO page into the higher-half physmap slot with uncached attributes.

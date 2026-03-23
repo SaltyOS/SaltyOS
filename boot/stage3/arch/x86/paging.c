@@ -81,37 +81,62 @@ static uint64_t read_pte(uintptr_t addr)
  * The allocator (next_page_table / page_table_limit) must be configured.
  */
 static uint64_t paging_setup_maps(uintptr_t pml4,
-                                   uint64_t kernel_phys, uint64_t kernel_size)
+                                   uint64_t kernel_phys, uint64_t kernel_size,
+                                   uint64_t identity_end)
 {
     /*
      * Set up page tables for:
-     * - Identity map for first 1GB (using 2MB pages)
+     * - Identity map for [0, identity_end) (using 2MB pages)
      * - Higher-half kernel mapping at KERNEL_VIRT_BASE (0xFFFFFFFF80000000)
      *
      * IMPORTANT: Identity map and higher-half map use SEPARATE
      * page table structures to avoid aliasing.
      */
 
-    /* === Identity Map: PML4[0] → id_pdpt → id_pd === */
+    /* === Identity Map: PML4[0] → id_pdpt → id_pd[0..N] ===
+     *
+     * Map enough physical memory so the kernel can access all boot
+     * allocations (kernel ELF, initrd, BootInfo, PT pool) before it
+     * sets up its own direct physical map.
+     *
+     * identity_end is rounded up to 1 GB granularity (one PD per GB).
+     */
+    uint64_t id_end = identity_end;
+    if (id_end < PAGING_SIZE_1G)
+        id_end = PAGING_SIZE_1G;
+    /* Round up to 1 GB boundary */
+    uint32_t num_gbs = (uint32_t)((id_end + PAGING_SIZE_1G - 1) / PAGING_SIZE_1G);
+    /* Cap at 512 GB (PDPT capacity) */
+    if (num_gbs > 512)
+        num_gbs = 512;
+
     uintptr_t id_pdpt = alloc_page_table();
-    uintptr_t id_pd = alloc_page_table();
-    if (id_pdpt == 0 || id_pd == 0) {
-        print_line("Paging: Failed to allocate identity map tables");
+    if (id_pdpt == 0) {
+        print_line("Paging: Failed to allocate identity PDPT");
         return 0;
     }
 
     write_pte(pml4, (uint64_t)id_pdpt | PAGE_RW);
-    write_pte(id_pdpt, (uint64_t)id_pd | PAGE_RW);
 
-    /* Identity map first 1GB using 2MB pages */
     uint64_t phys = 0;
-    for (int i = 0; i < 512; i++) {
-        write_pte(id_pd + i * 8, phys | PAGE_RW | PAGE_HUGE);
-        phys += PAGING_SIZE_2M;
+    for (uint32_t gb = 0; gb < num_gbs; gb++) {
+        uintptr_t id_pd = alloc_page_table();
+        if (id_pd == 0) {
+            print_line("Paging: Failed to allocate identity PD");
+            return 0;
+        }
+        write_pte(id_pdpt + gb * 8, (uint64_t)id_pd | PAGE_RW);
+
+        for (int i = 0; i < 512; i++) {
+            write_pte(id_pd + i * 8, phys | PAGE_RW | PAGE_HUGE);
+            phys += PAGING_SIZE_2M;
+        }
     }
 
 #if CONFIG_DEBUG
-    print_str("Paging: Created identity map for first 1GB\n");
+    print_str("Paging: Identity map ");
+    print_dec(num_gbs);
+    print_str(" GB\n");
 #endif
 
     /* === Higher-Half: PML4[511] → hh_pdpt → hh_pd === */
@@ -146,7 +171,8 @@ static uint64_t paging_setup_maps(uintptr_t pml4,
 }
 
 uint64_t paging_init_dynamic(uint64_t pt_pool_base, uint64_t pt_pool_size,
-                              uint64_t kernel_phys, uint64_t kernel_size)
+                              uint64_t kernel_phys, uint64_t kernel_size,
+                              uint64_t identity_end)
 {
     /* Use the provided pool as PML4 + allocator source */
     uintptr_t pml4 = (uintptr_t)pt_pool_base;
@@ -166,7 +192,7 @@ uint64_t paging_init_dynamic(uint64_t pt_pool_base, uint64_t pt_pool_size,
     /* Clear PML4 */
     memset((void *)pml4, 0, 4096);
 
-    return paging_setup_maps(pml4, kernel_phys, kernel_size);
+    return paging_setup_maps(pml4, kernel_phys, kernel_size, identity_end);
 }
 
 int paging_map_region(uint64_t pml4_addr, uint64_t virt, uint64_t phys,

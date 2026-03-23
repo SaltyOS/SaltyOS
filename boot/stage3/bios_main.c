@@ -425,7 +425,8 @@ void stage3_entry(struct Stage2Info *info)
     print_line("Setting up page tables...");
     uint64_t pml4 = paging_init_dynamic(pt_pool, PT_POOL_SIZE,
                                          g_ctx.kernel_phys_base,
-                                         g_ctx.kernel_size);
+                                         g_ctx.kernel_size,
+                                         PAGING_PAGE_1G);
     if (pml4 == 0) {
         stage3_panic("Failed to set up page tables");
     }

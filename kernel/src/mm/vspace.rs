@@ -970,6 +970,45 @@ impl VSpace {
         Some(pte & ENTRY_ADDR_MASK)
     }
 
+    /// Check if the PTE at `vaddr` is present and writable (not COW).
+    /// Returns `true` if the page can be safely written by the kernel.
+    pub fn is_page_writable(&self, vaddr: VirtAddr) -> bool {
+        if let Some(pte) = self.read_entry(vaddr, 1) {
+            pte & ENTRY_PRESENT != 0
+                && pte & ENTRY_WRITABLE != 0
+                && pte & ENTRY_COW == 0
+        } else {
+            false
+        }
+    }
+
+    /// Ensure page exists and is writable, resolving COW if necessary.
+    ///
+    /// Returns `true` if the page is writable after the call.
+    /// Intended for kernel writes to user pages (e.g. IPC buffer).
+    pub fn ensure_writable(&mut self, vaddr: VirtAddr) -> bool {
+        let pte = match self.read_entry(vaddr, 1) {
+            Some(e) => e,
+            None => return false,
+        };
+        if pte & ENTRY_PRESENT == 0 {
+            return false;
+        }
+        if pte & ENTRY_WRITABLE != 0 && pte & ENTRY_COW == 0 {
+            return true;
+        }
+        // Page is COW — synthesize a write fault to resolve it.
+        let fault = super::PageFaultInfo {
+            present: true,
+            write: true,
+            user: true,
+        };
+        match self.handle_cow_fault(vaddr, &fault) {
+            Ok(true) => true,
+            _ => false,
+        }
+    }
+
     /// Ensure page table exists at specified level, creating if needed
     /// level: 1=PT, 2=PD, 3=PDPT
     /// Returns physical address of the page table

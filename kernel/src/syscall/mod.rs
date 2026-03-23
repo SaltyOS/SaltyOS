@@ -506,8 +506,11 @@ pub(crate) unsafe fn write_msg_to_ipc_buffer(msg: &Message, badge: u64) {
         if (*current).vspace_root.is_null() {
             return;
         }
-        let vspace = &*(*current).vspace_root;
-        if vspace.resolve_page(buf).is_none() {
+        let vspace = &mut *(*current).vspace_root;
+        // Ensure the IPC buffer page is present AND writable. After fork,
+        // the page may be COW (read-only), which would cause a kernel #PF
+        // on the write below. ensure_writable resolves COW if needed.
+        if !vspace.ensure_writable(buf) {
             (*current).ipc_buffer = 0;
             return;
         }
@@ -1218,8 +1221,8 @@ fn syscall_invoke_inner(
                         && validate_ipc_buffer_addr(buf).is_ok()
                         && !(*current).vspace_root.is_null()
                     {
-                        let vs = &*(*current).vspace_root;
-                        if vs.resolve_page(buf).is_some() {
+                        let vs = &mut *(*current).vspace_root;
+                        if vs.ensure_writable(buf) {
                             let _guard = crate::arch::uaccess::UserAccessGuard::new();
                             let ipc_buf = buf as *mut crate::ipc::IpcBuffer;
                             (*ipc_buf).msg[0] = guard;
@@ -3923,6 +3926,11 @@ fn syscall_vspace_walk(
         if buf == 0 {
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
+        if (*current).vspace_root.is_null()
+            || !(&mut *(*current).vspace_root).ensure_writable(buf)
+        {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
         let ipc_buf = buf as *mut crate::ipc::IpcBuffer;
         let ipc_words = ipc_buf as *mut u64;
 
@@ -4849,7 +4857,13 @@ fn syscall_mo_read(cap: &Capability, offset: u64, count: u64) -> SyscallResult {
         if current.is_null() || (*current).ipc_buffer == 0 {
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
-        let ipc_buf = (*current).ipc_buffer as *mut u8;
+        let buf_addr = (*current).ipc_buffer;
+        if (*current).vspace_root.is_null()
+            || !(&mut *(*current).vspace_root).ensure_writable(buf_addr)
+        {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+        let ipc_buf = buf_addr as *mut u8;
 
         let mut bytes_read = 0usize;
         let mut src_off = offset as usize;

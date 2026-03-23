@@ -657,7 +657,9 @@ fn try_fixup_device_load(frame: *mut ExceptionFrame) -> bool {
     // mapping. ELR_EL1 holds the user VA of the faulting instruction.
     // SAFETY: The user page tables are still active (we haven't switched
     // TTBR0 during exception entry). The instruction page must be mapped
-    // readable if the CPU fetched and executed it.
+    // readable if the CPU fetched and executed it. PAN must be temporarily
+    // cleared to allow EL1 access to the user-mapped page.
+    let _guard = crate::arch::uaccess::UserAccessGuard::new();
     let instr = unsafe { core::ptr::read_volatile(elr as *const u32) };
 
     // --- LDR (immediate, unsigned offset) ---

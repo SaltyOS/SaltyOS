@@ -10,7 +10,7 @@ use crate::parser::PortConfig;
 /// Work directory for port builds, qualified by target architecture.
 ///
 /// Uses `SALTYOS_ARCH` env var or falls back to build dir name detection.
-/// x86_64 uses `work/` (backward compatible), others use `work-{arch}/`.
+/// Uses `work-{arch}/` format for all architectures (e.g. `work-x86_64/`).
 pub fn work_dir(port_dir: &Path) -> PathBuf {
     let arch = detect_arch();
     port_dir.join(format!("work-{}", arch))

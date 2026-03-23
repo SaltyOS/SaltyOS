@@ -72,11 +72,17 @@ void paging_load_cr3(uint64_t root_table);
  * @param pt_pool_size: Size of pool in bytes
  * @param kernel_phys: Physical address where kernel is loaded
  * @param kernel_size: Size of kernel in bytes
+ * @param identity_end: Identity map covers [0, identity_end), rounded up
+ *                       to 1 GB. The caller must ensure this covers all
+ *                       boot allocations (kernel, initrd, BootInfo, PT pool)
+ *                       so the kernel can access them before setting up its
+ *                       own direct physical map.
  *
  * Returns: Physical address of root page table, or 0 on failure
  */
 uint64_t paging_init_dynamic(uint64_t pt_pool_base, uint64_t pt_pool_size,
-                              uint64_t kernel_phys, uint64_t kernel_size);
+                              uint64_t kernel_phys, uint64_t kernel_size,
+                              uint64_t identity_end);
 
 /*
  * Get the kernel virtual base address

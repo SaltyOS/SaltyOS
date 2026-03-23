@@ -331,9 +331,20 @@ void stage3_entry_64(struct Stage2Info *info)
      * - Set up page tables and jump to kernel
      */
 
+    /* Compute the highest physical address used by boot allocations
+     * so the identity map covers everything the kernel needs to access
+     * before it sets up its own direct physical map. */
+    uint64_t boot_max_addr = 0;
+    for (uint32_t i = 0; i < ba.record_count; i++) {
+        uint64_t end = ba.records[i].phys_addr + ba.records[i].size;
+        if (end > boot_max_addr)
+            boot_max_addr = end;
+    }
+
     /* Set up page tables using dynamically allocated pool */
     uint64_t pml4 = paging_init_dynamic(pt_pool_base, PT_POOL_PAGES * 4096,
-                                         load_result.phys_base, load_result.mem_size);
+                                         load_result.phys_base, load_result.mem_size,
+                                         boot_max_addr);
     if (pml4 == 0) {
         stage3_panic("Failed to set up page tables");
     }
