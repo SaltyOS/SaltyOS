@@ -1,4 +1,4 @@
-//! SMAP (Supervisor Mode Access Prevention) support
+//! User memory access control — SMAP (Supervisor Mode Access Prevention) on x86_64.
 //!
 //! When SMAP is enabled (CR4.SMAP=1), any kernel-mode access to a user-mode
 //! page causes a #PF unless EFLAGS.AC is temporarily set via `stac`.

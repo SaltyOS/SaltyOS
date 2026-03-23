@@ -71,7 +71,7 @@ unsafe fn configure_fpu_hardware() {
         // SMAP: prevent kernel from accessing user-mode pages unless EFLAGS.AC=1 (CR4 bit 21)
         if super::cpuid::has_smap() {
             cr4 |= 1 << 21;
-            super::smap::enable_smap_runtime();
+            super::uaccess::enable_smap_runtime();
         }
         core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack));
 

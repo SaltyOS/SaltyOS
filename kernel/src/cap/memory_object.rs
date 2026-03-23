@@ -42,6 +42,7 @@ pub struct ReverseMapEntry {
     pub _pad: [u8; 7],                              // 7 (explicit, matches repr(C) alignment to 32)
 }
 // Total: 32 bytes. Overflow page: (4096 - 8) / 32 = 127 entries.
+const _: () = assert!(core::mem::size_of::<ReverseMapEntry>() == 32);
 
 impl ReverseMapEntry {
     pub const EMPTY: Self = Self {
@@ -300,12 +301,26 @@ impl MemoryObject {
 
     /// Dereference a cow_parent CapSlot to get the parent MO pointer.
     /// Returns null if the slot is invalid.
+    ///
+    /// Called without CAP_LOCK from resolve_page_depth() during fault
+    /// handling. This is safe because:
+    ///
+    /// 1. `cow_parent` is a dedicated cap slot set during MO_CLONE and
+    ///    freed only when this child MO is destroyed. While the child
+    ///    exists, the slot is stable.
+    /// 2. The parent MO's refcount is incremented at clone time. Even if
+    ///    all other capabilities to the parent are deleted, the parent
+    ///    object remains live (refcount > 0) until this child is destroyed.
+    /// 3. Kernel objects are never freed — they are carved from untyped
+    ///    memory and the backing memory persists for the system lifetime.
+    ///    The pointer in the cap slot therefore remains valid for reads.
+    /// 4. `get_cap()` reads a single aligned `Cap` struct from the slot
+    ///    array, which is a word-aligned load (atomic on aarch64/x86_64).
     fn deref_cow_parent(cap_slot: u64) -> *const MemoryObject {
         if cap_slot == 0 {
             return core::ptr::null();
         }
-        // SAFETY: cow_parent is a valid cap slot set during MO_CLONE.
-        // The cap system keeps the parent alive.
+        // SAFETY: See function-level safety documentation above.
         unsafe {
             let cap = crate::cap::get_cap(cap_slot as u32);
             if cap.obj_type != ObjectType::MemoryObject {
@@ -319,10 +334,21 @@ impl MemoryObject {
     // Destroy
     // -----------------------------------------------------------------------
 
-    /// Release all resources.
+    /// Release all resources: unmap from all VSpaces, free pages, detach
+    /// from COW parent.
     ///
     /// # Safety
-    /// Must be called when the last capability is deleted. No concurrent access.
+    /// Must be called when refcount reaches 0, guaranteeing exclusive
+    /// access — no other CPU holds a reference to this MO.
+    ///
+    /// ## Lock ordering
+    /// This function acquires `VSpace.lock` per reverse-map entry to
+    /// perform unmapping. It is called from `release_object()` after
+    /// `CAP_LOCK` has been released, so no outer locks are held. This
+    /// is consistent with the lock ordering hierarchy in `mm/mod.rs`.
+    ///
+    /// The radix tree traversal (`pages.for_each`) is safe because
+    /// refcount==0 guarantees no concurrent commit/resolve operations.
     pub unsafe fn destroy(&mut self) {
         // 1. Walk reverse maps: unmap all PTEs in all observing VSpaces
         unsafe {

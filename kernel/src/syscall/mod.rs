@@ -459,7 +459,7 @@ fn construct_message(
                 if buf != 0 {
                     let ipc_buf = buf as *const crate::ipc::IpcBuffer;
                     // SMAP: temporarily allow user memory access
-                    let _guard = crate::arch::smap::UserAccessGuard::new();
+                    let _guard = crate::arch::uaccess::UserAccessGuard::new();
 
                     if length > 4 {
                         let overflow = (length - 4).min(16);
@@ -514,7 +514,7 @@ pub(crate) unsafe fn write_msg_to_ipc_buffer(msg: &Message, badge: u64) {
 
         let ipc_buf = buf as *mut crate::ipc::IpcBuffer;
         // SMAP: temporarily allow user memory access for IPC buffer write
-        let _guard = crate::arch::smap::UserAccessGuard::new();
+        let _guard = crate::arch::uaccess::UserAccessGuard::new();
 
         // Write header: label and length
         (*ipc_buf).msg[0] = msg.label;
@@ -1220,7 +1220,7 @@ fn syscall_invoke_inner(
                     {
                         let vs = &*(*current).vspace_root;
                         if vs.resolve_page(buf).is_some() {
-                            let _guard = crate::arch::smap::UserAccessGuard::new();
+                            let _guard = crate::arch::uaccess::UserAccessGuard::new();
                             let ipc_buf = buf as *mut crate::ipc::IpcBuffer;
                             (*ipc_buf).msg[0] = guard;
                             (*ipc_buf).msg[1] = guard_bits;
@@ -4382,7 +4382,7 @@ pub fn handle(
             let mut kbuf = [0u8; 256];
             {
                 // SMAP: temporarily allow user memory access
-                let _guard = crate::arch::smap::UserAccessGuard::new();
+                let _guard = crate::arch::uaccess::UserAccessGuard::new();
                 for i in 0..len {
                     // SAFETY: pointer validated above to be in user space range;
                     // user pages are accessible via the active VSpace page tables

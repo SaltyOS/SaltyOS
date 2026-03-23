@@ -32,6 +32,12 @@ pub enum KernelMetaKind {
 
 /// Semantic ownership of a physical frame. Used in PMM APIs for
 /// type-safe allocation, deallocation, and transfer.
+///
+/// The `mo` pointer in `MoData` and `MoMeta` variants is safe to store
+/// as a raw pointer because kernel objects are never freed — they are
+/// carved from untyped memory and the backing memory persists for the
+/// system lifetime. Even when a MemoryObject is logically destroyed
+/// (last capability deleted), the struct memory is not reclaimed.
 #[derive(Clone, Copy, Debug)]
 pub enum FrameOwner {
     Free,

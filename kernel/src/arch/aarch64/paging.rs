@@ -13,7 +13,7 @@
 
 use crate::mm::{
     pmm_alloc, frame::FrameOwner, frame::KernelMetaKind, phys_to_virt, PAGE_SIZE,
-    PHYS_MAP_OFFSET,
+    PHYS_MAP_OFFSET, SpinLock,
 };
 
 /// Dedicated TTBR1 root used for kernel higher-half mappings.
@@ -461,25 +461,29 @@ static mut ASID_BITMAP: [u64; ASID_COUNT / 64] = [0; ASID_COUNT / 64];
 /// Generation counter — bumped when the ASID space is exhausted and recycled.
 pub static mut ASID_GENERATION: u64 = 1;
 
+/// Spinlock protecting `ASID_BITMAP` and `ASID_GENERATION` for SMP safety.
+///
+/// Lock ordering: nests after `sched.lock_cpu`, before `FRAME_LOCK`.
+/// Callers must hold this lock for the duration of any ASID allocation,
+/// free, or generation recycle operation.
+static ASID_LOCK: SpinLock = SpinLock::new();
+
 /// Allocate a fresh ASID.  Returns `(asid, generation)`.
 ///
-/// If the bitmap is full, bumps the generation, flushes the entire TLB,
-/// resets the bitmap, and retries.
+/// If the bitmap is full, flushes the entire TLB, resets the bitmap,
+/// bumps the generation counter, and retries.
 ///
 /// # Safety
-/// Must be called with IRQs disabled or from a context where concurrent
-/// ASID operations cannot race (e.g., VSpace creation under lock).
-///
-/// **SMP note:** The current implementation protects the bitmap only with
-/// IRQ disable, which is sufficient while aarch64 is single-core only.
-/// When SMP support is added, a spinlock around `ASID_BITMAP` and
-/// `ASID_GENERATION` must be introduced to prevent concurrent allocation
-/// races across CPUs.
+/// Must be called with IRQs disabled.
 pub unsafe fn asid_alloc() -> (u16, u64) {
-    unsafe {
+    ASID_LOCK.lock();
+    // SAFETY: ASID_LOCK serializes all access to ASID_BITMAP and
+    // ASID_GENERATION across CPUs. IRQ disable (caller obligation)
+    // prevents re-entrant allocation on the same CPU.
+    let result = unsafe {
         let bmp = &raw mut ASID_BITMAP;
         let words = ASID_COUNT / 64;
-        loop {
+        'alloc: loop {
             for word_idx in 0..words {
                 let wp = (*bmp).as_mut_ptr().add(word_idx);
                 let word = *wp;
@@ -496,29 +500,36 @@ pub unsafe fn asid_alloc() -> (u16, u64) {
                     break;
                 }
                 *wp |= 1u64 << bit;
-                return (asid as u16, *(&raw const ASID_GENERATION));
+                break 'alloc (asid as u16, *(&raw const ASID_GENERATION));
             }
 
-            // Bitmap full — recycle: bump generation, flush all TLB, reset.
-            *(&raw mut ASID_GENERATION) += 1;
+            // Bitmap full — recycle.
+            // Order: flush TLB first so stale entries for old-generation ASIDs
+            // are gone, reset the bitmap, then bump generation. This ensures no
+            // CPU observes the new generation until the bitmap is clean.
             flush_tlb_all();
             for i in 0..words {
                 *(*bmp).as_mut_ptr().add(i) = 0;
             }
             // Reserve ASID 0
             *(*bmp).as_mut_ptr() |= 1;
+            *(&raw mut ASID_GENERATION) += 1;
         }
-    }
+    };
+    ASID_LOCK.unlock();
+    result
 }
 
 /// Release an ASID back to the pool and flush its TLB entries.
 ///
 /// # Safety
-/// Must be called with IRQs disabled or under appropriate lock.
+/// Must be called with IRQs disabled.
 pub unsafe fn asid_free(asid: u16) {
     if asid == 0 || asid as usize >= ASID_COUNT {
         return;
     }
+    ASID_LOCK.lock();
+    // SAFETY: ASID_LOCK serializes bitmap access across CPUs.
     unsafe {
         let bmp = &raw mut ASID_BITMAP;
         let word_idx = asid as usize / 64;
@@ -526,6 +537,7 @@ pub unsafe fn asid_free(asid: u16) {
         *(*bmp).as_mut_ptr().add(word_idx) &= !(1u64 << bit);
         flush_asid(asid);
     }
+    ASID_LOCK.unlock();
 }
 
 // ---------------------------------------------------------------------------
@@ -584,6 +596,10 @@ pub fn init() {
 /// Must be called after the frame allocator is initialized.
 /// Must only be called once during boot.
 unsafe fn init_direct_map(kernel_root: u64, max_phys: u64) {
+    // Use 2 MB block descriptors (Level 2) for the direct physical map.
+    // 2 MB blocks are universally supported on ARMv8-A, whereas 1 GB blocks
+    // (Level 1) require FEAT_LPA and specific TGran4 support. This also
+    // matches the x86_64 port's use of 2 MB large pages.
     let huge_page_size: usize = 2 * 1024 * 1024;
     let direct_map_end = core::cmp::min(
         ((max_phys as usize + (huge_page_size - 1)) / huge_page_size) * huge_page_size,

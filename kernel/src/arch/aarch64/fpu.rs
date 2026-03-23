@@ -4,6 +4,13 @@
 //! The kernel is compiled without NEON/FP support, so FPU state only
 //! needs to be saved/restored when switching between userspace threads.
 //!
+//! The kernel target spec (`aarch64-saltyos.json`) disables NEON/FP via
+//! `-neon,-fp-armv8` features, and C code uses `-mgeneral-regs-only`,
+//! preventing the compiler from emitting AdvSIMD/FP instructions in
+//! kernel code. This ensures the lazy switching strategy is correct:
+//! kernel code never touches Q registers outside explicit save/restore
+//! in this module.
+//!
 //! Strategy:
 //! - CPACR_EL1.FPEN = 0b01 after every context switch (trap EL0, allow EL1)
 //! - First NEON/FP instruction in usermode triggers ESR EC=0x07 exception
@@ -184,7 +191,16 @@ pub fn set_ts() {
 /// migrated to another CPU.
 ///
 /// # Safety
-/// `tcb_ptr` must be a valid pointer to a Tcb.
+/// `tcb_ptr` must be a valid pointer to a Tcb. Must be called with
+/// IRQs disabled from the context switch path.
+///
+/// The read-then-null of `FPU_OWNER[cpu]` is not a race because:
+/// 1. IRQ disable prevents preemption on this CPU, so no other code
+///    on this CPU can interleave with the read→save→null sequence.
+/// 2. Other CPUs only access their own `FPU_OWNER[their_cpu]` index,
+///    never ours.
+/// 3. The outgoing thread cannot be scheduled on another CPU until
+///    `switch_to()` completes and releases the scheduler lock.
 pub unsafe fn save_on_switch(tcb_ptr: *mut u8) {
     let cpu = super::current_cpu();
     // SAFETY: Accessing FPU_OWNER with interrupts disabled (context

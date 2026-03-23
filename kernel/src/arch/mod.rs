@@ -58,12 +58,12 @@ pub use x86_64::cpuid;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::cpuid;
 
-// Re-export SMAP sub-module (stac/clac, UserAccessGuard)
+// Re-export user memory access control (SMAP on x86_64, PAN on aarch64)
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::smap;
+pub use x86_64::uaccess;
 
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::smap;
+pub use aarch64::uaccess;
 
 // Re-export PCI I/O port emulation (aarch64: MMIO-mapped PCI I/O window)
 #[cfg(target_arch = "aarch64")]

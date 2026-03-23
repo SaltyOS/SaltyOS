@@ -203,7 +203,13 @@ impl RadixTree {
     /// Iterate all non-zero entries. Calls `f(page_idx, value)` for each.
     ///
     /// # Safety
-    /// Tree must not be concurrently modified.
+    /// Tree must not be concurrently modified during iteration.
+    ///
+    /// Calling contexts that satisfy this contract:
+    /// - `MemoryObject::destroy()` — refcount==0 guarantees no concurrent
+    ///   accessor can commit or resolve pages in this tree.
+    /// - `resolve_page_depth()` — called under `VSpace.lock`, which
+    ///   serializes page table walks and page commits for that VSpace.
     pub unsafe fn for_each<F: FnMut(usize, u64)>(&self, mut f: F) {
         if self.root.is_null() || self.depth == 0 {
             return;

@@ -460,6 +460,13 @@ impl<V: Copy + 'static> MapleTree<V> {
         }
     }
 
+    /// Attempt to rebalance an underfull leaf after removal.
+    ///
+    /// Tries four strategies: steal from right sibling, steal from left,
+    /// merge with right, merge with left. If none succeeds (e.g., leaf
+    /// is the only child of its parent), the leaf remains underfull.
+    /// This is structurally valid but may degrade lookup from O(log n)
+    /// toward O(n) for the affected range — rare in VMA workloads.
     unsafe fn rebalance_leaf<A: NodeAllocator>(&mut self, leaf: *mut u8, alloc: &mut A) {
         unsafe {
             let count = hdr(leaf).count as usize;

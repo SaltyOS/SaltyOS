@@ -11,7 +11,6 @@ pub mod exceptions;
 pub mod fpu;
 pub mod pl011;
 pub mod paging;
-pub mod pan;
 pub mod gic;
 pub mod timer;
 pub mod psci;
@@ -408,7 +407,7 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     crate::mm::init_per_frame_arrays();
 
     // Enable PAN runtime tracking before the first EL0 transition.
-    smap::init();
+    uaccess::init();
 
     // Initialize FPU lazy switching (trap NEON/FP access from EL0)
     fpu::init();
@@ -456,8 +455,13 @@ pub mod cpuid {
     }
 }
 
-// SMAP-equivalent module: Privileged Access Never (PAN) on aarch64
-pub mod smap {
+/// User memory access control — Privileged Access Never (PAN) on aarch64.
+///
+/// When FEAT_PAN is supported, the processor traps EL1 accesses to
+/// user-mapped pages (Stage 1, EL0-accessible). This module detects
+/// PAN support at boot, configures auto-PAN-set on exception entry
+/// (SCTLR_EL1.SPAN=0), and provides an RAII guard for temporary access.
+pub mod uaccess {
     use super::{AtomicBool, Ordering};
 
     /// True once FEAT_PAN has been detected and enabled for runtime use.

@@ -14,7 +14,7 @@ mod gdt;
 mod idt;
 pub mod paging;
 mod pit;
-pub mod smap;
+pub mod uaccess;
 
 pub use apic::{send_ipi, set_tlb_shootdown_addr, IpiKind, ioapic_unmask, ioapic_unmask_level, ioapic_mask};
 pub use cpu::{current_cpu, set_kernel_stack, next_invoke_seq, current_invoke_seq, read_fs_base, write_fs_base, generate_stack_canary, set_per_cpu_canary, MAX_CPUS};
