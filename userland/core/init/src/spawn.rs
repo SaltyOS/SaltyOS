@@ -468,15 +468,19 @@ unsafe fn allocate_child_untyped_budget(
 pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
     unsafe {
         let cache = &mut *(&raw mut SHARED_LIB_CACHE);
+        *cache = SharedLibCache::new();
         let initrd = super::INITRD_VADDR as *const u8;
         let initrd_size = super::INITRD_SIZE;
 
         let libs: [&[u8]; 3] = [b"libbesalt.so", b"libc.so", b"libc++.so"];
 
+        let mut cache_ok = true;
         for lib_name in &libs {
             if cache.lib_count >= MAX_CACHED_LIBS {
                 break;
             }
+
+            let mut lib_failed = false;
 
             let mut entry = CpioEntry::zeroed();
             if besalt::cpio::cpio_find_file(
@@ -569,7 +573,7 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
                 let mut page = seg_start;
                 while page < seg_end {
                     if cache.page_count >= MAX_SHARED_LIB_PAGES {
-                        puts(b"[INIT] shared lib cache: too many pages\n");
+                        lib_failed = true;
                         break;
                     }
 
@@ -582,11 +586,7 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
                         err = retype_from_any_untyped(OBJ_FRAME, 0, frame_slot);
                     }
                     if err != 0 {
-                        let mut lb = LineBuf::new();
-                        lb.str(b"[INIT] shared lib cache: frame retype failed err=");
-                        lb.hex(err as u64);
-                        lb.str(b"\n");
-                        lb.flush();
+                        lib_failed = true;
                         break;
                     }
 
@@ -596,7 +596,7 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
                         VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
                     );
                     if err != 0 {
-                        puts(b"[INIT] shared lib cache: scratch map failed\n");
+                        lib_failed = true;
                         break;
                     }
 
@@ -638,6 +638,15 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
                     cache.page_count += 1;
                     page += 4096;
                 }
+
+                if lib_failed {
+                    break;
+                }
+            }
+
+            if lib_failed {
+                cache_ok = false;
+                break;
             }
 
             // Finalize CachedLib entry
@@ -645,6 +654,11 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
             lib_entry.page_count = (cache.page_count as u16) - page_start;
             cache.libs[li] = lib_entry;
             cache.lib_count += 1;
+        }
+
+        if !cache_ok {
+            *cache = SharedLibCache::new();
+            return;
         }
 
         if cache.page_count > 0 {

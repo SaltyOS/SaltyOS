@@ -783,7 +783,19 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
         }
 
         if cache.page_count > 0 {
-            cache.initialized = true;
+            let mut valid = true;
+            for i in 0..cache.lib_count {
+                let cl = &cache.libs[i];
+                if cl.page_count > 0 && cl.ro_mo_cap == 0 {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                cache.initialized = true;
+            } else {
+                *cache = SharedLibCache::new();
+            }
         }
 
         {
