@@ -343,8 +343,7 @@ extern "C" fn el1_irq_handler(_frame: *const ExceptionFrame) {
             // Spurious interrupt — no EOI needed.
         }
         _ => {
-            // SPI or other peripheral interrupt — dispatch to registered
-            // IRQ handlers (e.g. PCI devices), then EOI.
+            // SPI or other peripheral interrupt
             crate::ipc::irq::dispatch_irq(intid as usize);
             super::gic::eoi(intid);
         }
@@ -482,12 +481,38 @@ extern "C" fn el0_sync_handler(frame: *mut ExceptionFrame) {
             //   x1-x5 = arg0-arg4
             // SAFETY: frame was set up by SAVE_REGS and is a valid pointer
             // to a fully-initialized ExceptionFrame on the kernel stack.
-            // syscall_handle_rust is unsafe because it performs privileged
-            // kernel operations based on the syscall number.
+            // syscall_handle_rust and the fastpath functions are unsafe
+            // because they perform privileged kernel operations.
             unsafe {
                 let f = &*frame;
+                let syscall_num = f.regs[8];
+
+                // IPC fastpath: Call (2) and ReplyRecv (3).
+                // Mirrors x86_64 syscall.S fastpath dispatch. The AAPCS64
+                // calling convention matches the register layout exactly
+                // (x0-x5 → first 6 arguments), so no remapping is needed.
+                if syscall_num == 2 || syscall_num == 3 {
+                    let fp_result = if syscall_num == 2 {
+                        crate::syscall::fastpath::fastpath_call_rust(
+                            f.regs[0], f.regs[1], f.regs[2],
+                            f.regs[3], f.regs[4], f.regs[5],
+                        )
+                    } else {
+                        crate::syscall::fastpath::fastpath_reply_recv_rust(
+                            f.regs[0], f.regs[1], f.regs[2],
+                            f.regs[3], f.regs[4], f.regs[5],
+                        )
+                    };
+                    if fp_result.status != 0 {
+                        (*frame).regs[0] = 0;              // x0 = no error
+                        (*frame).regs[1] = fp_result.value; // x1 = return value
+                        return;
+                    }
+                }
+
+                // Slowpath: full syscall dispatch.
                 let result = crate::syscall::syscall_handle_rust(
-                    f.regs[8],  // syscall number (x8)
+                    syscall_num,
                     f.regs[0],  // cap_ptr (x0)
                     f.regs[1],  // arg0 (x1)
                     f.regs[2],  // arg1 (x2)

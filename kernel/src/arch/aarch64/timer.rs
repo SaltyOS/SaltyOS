@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! ARM Generic Timer driver.
 //!
-//! Uses the EL1 Physical Timer (CNTP) to generate periodic 10 ms interrupts
+//! Uses the EL1 Physical Timer (CNTP) to generate periodic 1 ms interrupts
 //! via PPI 30 (INTID 30) on the GICv3.
 //!
 //! ## Registers used
@@ -16,8 +16,8 @@ use core::ptr;
 /// Physical timer PPI interrupt ID.
 const TIMER_PPI_INTID: u32 = 30;
 
-/// Timer tick interval: 10 ms (100 Hz).
-const TICK_HZ: u64 = 100;
+/// Timer tick interval: 1 ms (1000 Hz).
+const TICK_HZ: u64 = 1000;
 
 /// Cached counter frequency (set once during `init()`).
 static mut COUNTER_FREQ: u64 = 0;
@@ -89,7 +89,7 @@ pub fn init() {
 
 /// Start periodic timer interrupts.
 ///
-/// Arms the countdown with a 10 ms interval, enables the timer (IMASK
+/// Arms the countdown with a 1 ms interval, enables the timer (IMASK
 /// cleared), and enables PPI 30 in the GIC redistributor.
 pub fn start() {
     let freq = get_frequency();
@@ -108,7 +108,7 @@ pub fn start() {
     // Enable PPI 30 in the GIC so the interrupt is delivered.
     super::gic::enable_irq(TIMER_PPI_INTID);
 
-    crate::serial_puts("[TIMER] Started (10 ms tick)\n");
+    crate::serial_puts("[TIMER] Started (1 ms tick)\n");
 }
 
 /// Return the cached counter frequency.

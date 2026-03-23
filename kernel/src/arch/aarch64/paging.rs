@@ -376,7 +376,9 @@ pub fn invlpg(virt: u64) {
         core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0, options(nomem, nostack));
         let asid = (ttbr0 >> 48) & 0xFFFF;
         // TLBI VAE1IS: bits [63:48] = ASID, bits [43:0] = VA >> 12
-        let operand = (asid << 48) | (virt >> 12);
+        // Mask VA to 44 bits to prevent kernel addresses (0xFFFF_xxxx...)
+        // from overflowing into the ASID field.
+        let operand = (asid << 48) | ((virt >> 12) & 0x0000_0FFF_FFFF_FFFF);
         core::arch::asm!(
             "tlbi vae1is, {}",
             "dsb ish",
@@ -391,7 +393,7 @@ pub fn invlpg(virt: u64) {
 /// specific ASID (inner-shareable).
 pub fn invlpg_asid(virt: u64, asid: u16) {
     unsafe {
-        let operand = ((asid as u64) << 48) | (virt >> 12);
+        let operand = ((asid as u64) << 48) | ((virt >> 12) & 0x0000_0FFF_FFFF_FFFF);
         core::arch::asm!(
             "tlbi vae1is, {}",
             "dsb ish",
@@ -407,7 +409,7 @@ pub fn invlpg_asid(virt: u64, asid: u16) {
 /// invalidating kernel mappings.
 pub fn invlpg_all_asid(virt: u64) {
     unsafe {
-        let va_shifted = virt >> 12;
+        let va_shifted = (virt >> 12) & 0x0000_0FFF_FFFF_FFFF;
         core::arch::asm!(
             "tlbi vaae1is, {}",
             "dsb ish",
@@ -636,6 +638,9 @@ unsafe fn init_direct_map(kernel_root: u64, max_phys: u64) {
         // SAFETY: frame is a freshly allocated page reachable via identity map.
         unsafe {
             core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE);
+            // DSB ensures zeroing is globally visible before the page walker
+            // can follow the parent descriptor into this table.
+            core::arch::asm!("dsb ishst", options(nostack));
         }
         // L0 table descriptor: valid + table (0b11) + AF
         let desc = frame | HW_VALID | HW_TABLE_OR_PAGE;
@@ -664,6 +669,9 @@ unsafe fn init_direct_map(kernel_root: u64, max_phys: u64) {
             // SAFETY: Freshly allocated, identity-mapped.
             unsafe {
                 core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE);
+                // DSB ensures zeroing is globally visible before the page walker
+                // can follow the parent descriptor into this table.
+                core::arch::asm!("dsb ishst", options(nostack));
             }
             let desc = frame | HW_VALID | HW_TABLE_OR_PAGE;
             // SAFETY: Writing to L1 entry via identity map.
@@ -736,6 +744,9 @@ unsafe fn ensure_next_table(table: &mut PageTable, index: usize, context: &'stat
     // the direct map. Zeroing initializes all entries to empty.
     unsafe {
         core::ptr::write_bytes(phys_to_virt(frame) as *mut u8, 0, PAGE_SIZE);
+        // DSB ensures zeroing is globally visible before the page walker
+        // can follow the parent descriptor into this table.
+        core::arch::asm!("dsb ishst", options(nostack));
     }
 
     // Write a table descriptor: Valid + Table (0b11).
@@ -837,7 +848,9 @@ pub unsafe fn map_mmio_page(phys: u64) -> u64 {
     unsafe {
         core::ptr::write_volatile(&mut l3.entries[pte_idx], desc);
     }
-    invlpg(virt_page);
+    // Kernel MMIO lives in TTBR1 (higher half) — use the all-ASID TLBI
+    // variant since TTBR0's ASID is irrelevant for kernel mappings.
+    invlpg_all_asid(virt_page);
 
     virt_page + (phys & page_mask)
 }
