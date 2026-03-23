@@ -2,8 +2,9 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+pub mod ap_boot;
 pub mod boot;
 pub mod context;
 pub mod cpu;
@@ -105,19 +106,19 @@ pub fn current_cpu() -> usize {
     (mpidr & 0xFF) as usize
 }
 
-/// Next invocation sequence number (stub — returns 0 for Phase 1)
+/// Next invocation sequence number for the current CPU.
 pub fn next_invoke_seq() -> u64 {
-    0
+    cpu::next_invoke_seq()
 }
 
-/// Current invocation sequence number (stub — returns 0 for Phase 1)
+/// Current invocation sequence number for the current CPU.
 pub fn current_invoke_seq() -> u64 {
-    0
+    cpu::current_invoke_seq()
 }
 
-/// Set kernel stack for current CPU (stub for Phase 1)
-pub fn set_kernel_stack(_stack_top: u64) {
-    // TODO: Phase 3 — set SP_EL1 or TPIDR_EL1-based kernel stack
+/// Set kernel stack for current CPU (via TPIDR_EL1 per-CPU data).
+pub fn set_kernel_stack(stack_top: u64) {
+    cpu::set_kernel_stack(stack_top);
 }
 
 /// Set TSS RSP0 equivalent (stub for Phase 1, no TSS on aarch64)
@@ -175,9 +176,9 @@ pub fn generate_stack_canary() -> u64 {
     fallback
 }
 
-/// Set per-CPU stack canary (stub for Phase 1)
-pub fn set_per_cpu_canary(_canary: u64) {
-    // TODO: Phase 3 — store in TPIDR_EL1
+/// Set per-CPU stack canary (via TPIDR_EL1 per-CPU data).
+pub fn set_per_cpu_canary(canary: u64) {
+    cpu::set_per_cpu_canary(canary);
 }
 
 /// IPI kind enumeration (must match x86_64 variants)
@@ -215,14 +216,52 @@ pub fn now_ns() -> u64 {
     ((ticks as u128 * 1_000_000_000u128) / freq as u128) as u64
 }
 
-/// Send IPI to another CPU (stub for Phase 1)
-pub fn send_ipi(_target_cpu: usize, _kind: IpiKind) {
-    // TODO: Phase 4 — GICv3 SGI
+// ---------------------------------------------------------------------------
+// IPI via GICv3 SGI
+// ---------------------------------------------------------------------------
+
+/// SGI INTID allocation for IPI kinds.
+const SGI_RESCHEDULE: u32 = 0;
+const SGI_TLB_SHOOTDOWN: u32 = 1;
+const SGI_TLB_SHOOTDOWN_ALL: u32 = 2;
+const SGI_VSPACE_TEARDOWN: u32 = 3;
+
+/// Send an IPI to another CPU via GICv3 Software Generated Interrupt.
+pub fn send_ipi(target_cpu: usize, kind: IpiKind) {
+    let intid = match kind {
+        IpiKind::Reschedule => SGI_RESCHEDULE,
+        IpiKind::TlbShootdown => SGI_TLB_SHOOTDOWN,
+        IpiKind::TlbShootdownAll => SGI_TLB_SHOOTDOWN_ALL,
+        IpiKind::VSpaceTeardown => SGI_VSPACE_TEARDOWN,
+    };
+    gic::send_sgi(target_cpu, intid);
 }
 
-/// Set TLB shootdown address (stub — SMP not yet implemented)
-pub fn set_tlb_shootdown_addr(_cpu_id: usize, _addr: u64) {
-    // TODO: SMP TLB shootdown via GICv3 SGI
+// ---------------------------------------------------------------------------
+// TLB shootdown infrastructure
+// ---------------------------------------------------------------------------
+
+/// Per-CPU TLB shootdown target address.
+static TLB_SHOOTDOWN_ADDR: [AtomicU64; MAX_CPUS] =
+    [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Set the TLB shootdown address for a remote CPU.
+///
+/// The remote CPU's IPI handler reads this address and invalidates the
+/// corresponding TLB entry.
+pub fn set_tlb_shootdown_addr(cpu_id: usize, addr: u64) {
+    if cpu_id < MAX_CPUS {
+        TLB_SHOOTDOWN_ADDR[cpu_id].store(addr, Ordering::Release);
+    }
+}
+
+/// Read and clear the TLB shootdown address for the current CPU.
+pub fn take_tlb_shootdown_addr(cpu_id: usize) -> u64 {
+    if cpu_id < MAX_CPUS {
+        TLB_SHOOTDOWN_ADDR[cpu_id].swap(0, Ordering::AcqRel)
+    } else {
+        0
+    }
 }
 
 /// Enable a GIC interrupt (equivalent of IOAPIC unmask on x86_64).
@@ -377,6 +416,10 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // Install exception vector table (must be early so any faults are caught)
     exceptions::init();
 
+    // Initialize BSP per-CPU data (TPIDR_EL1). Must be early so per-CPU
+    // field accessors work for the rest of boot.
+    cpu::init_bsp();
+
     // Initialize memory management (frame allocator needed by paging::init())
     if let Some(info) = boot_info {
         crate::mm::init(info);
@@ -415,9 +458,168 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     crate::serial_puts("[ARCH] AArch64 subsystems initialized\n");
 }
 
-/// Initialize SMP (stub for Phase 1)
-pub fn init_smp(_boot_info: Option<&crate::ParsedBootInfo>) {
-    // TODO: Phase 4 — PSCI CPU_ON
+/// Initialize SMP — bring up Application Processors via PSCI CPU_ON.
+///
+/// For each possible AP (cpu_id 1..MAX_CPUS):
+///   1. Allocates a per-CPU kernel stack
+///   2. Writes the AP mailbox with system register values from the BSP
+///   3. Calls PSCI CPU_ON to start the AP at the trampoline physical address
+///   4. Waits for the AP to signal ready
+///
+/// Stops probing when PSCI returns an error (non-existent CPU).
+pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
+    let info = match boot_info {
+        Some(i) => i,
+        None => {
+            crate::serial_puts("[SMP] No boot info, skipping SMP init\n");
+            return;
+        }
+    };
+
+    // Compute AP trampoline physical address.
+    // The kernel is linked at VA 0 but loaded at kernel_phys_base and
+    // relocated to kernel_virt_base. Symbol addresses are in the virtual
+    // address space, so we convert back to physical.
+    unsafe extern "C" {
+        static _ap_trampoline_start: u8;
+    }
+    let trampoline_virt = core::ptr::addr_of!(_ap_trampoline_start) as u64;
+    let trampoline_phys = if info.kernel_virt_base != 0 {
+        trampoline_virt - info.kernel_virt_base + info.kernel_phys_base
+    } else {
+        // Identity-mapped: virt == phys
+        trampoline_virt
+    };
+
+    {
+        let s = crate::SerialGuard::acquire();
+        s.puts("[SMP] Trampoline phys=");
+        s.hex(trampoline_phys);
+        s.puts(" virt=");
+        s.hex(trampoline_virt);
+        s.putc(b'\n');
+    }
+
+    // Read BSP system register values for the AP mailbox.
+    let mair = paging::read_mair();
+    let tcr = paging::read_tcr();
+    let sctlr = paging::read_sctlr();
+    let ttbr0 = paging::read_cr3();    // Identity map root
+    let ttbr1 = paging::read_ttbr1();  // Kernel root
+    let entry_virt = ap_boot::ap_entry as *const () as u64;
+
+    // Map GICR MMIO pages for all potential APs before starting them.
+    gic::remap_ap_gicr(MAX_CPUS);
+
+    let mut ap_count = 0u32;
+
+    for cpu_id in 1..MAX_CPUS {
+        // Allocate per-CPU kernel stack (16 KB = 4 pages).
+        const STACK_PAGES: usize = 4;
+        const STACK_SIZE: u64 = STACK_PAGES as u64 * 4096;
+
+        let stack_phys = match crate::mm::pmm_alloc_contiguous(STACK_PAGES) {
+            Some(p) => p,
+            None => {
+                crate::serial_puts("[SMP] Failed to allocate AP kernel stack\n");
+                break;
+            }
+        };
+        let stack_top = crate::mm::phys_to_virt(stack_phys) + STACK_SIZE;
+
+        // Clear synchronization flags for this AP.
+        cpu::clear_ap_claimed(cpu_id);
+        ap_boot::clear_ap_ready(cpu_id);
+
+        // Write the AP mailbox. Only one AP is started at a time.
+        // SAFETY: Single writer (BSP), single reader (the AP being started).
+        // The DSB SY below ensures the writes are visible before CPU_ON.
+        unsafe {
+            let mb = &raw mut boot::AP_MAILBOX;
+            (*mb).stack_top = stack_top;
+            (*mb).mair = mair;
+            (*mb).tcr = tcr;
+            (*mb).sctlr = sctlr;
+            (*mb).ttbr0 = ttbr0;
+            (*mb).ttbr1 = ttbr1;
+            (*mb).entry_virt = entry_virt;
+        }
+
+        // Clean the mailbox cache lines to Point of Coherency (PoC).
+        // The AP starts with MMU off, reading from physical memory directly.
+        // Without cache clean, the AP may see stale (zero) data because
+        // the BSP's writes sit in the L1/L2 cache.
+        // SAFETY: DC CIVAC and DSB are always safe from EL1.
+        unsafe {
+            let mb_addr = &raw const boot::AP_MAILBOX as u64;
+            let mb_size = core::mem::size_of::<boot::ApMailbox>() as u64;
+            let mut addr = mb_addr;
+            while addr < mb_addr + mb_size {
+                core::arch::asm!(
+                    "dc civac, {0}",
+                    in(reg) addr,
+                    options(nostack),
+                );
+                addr += 64; // Cache line size
+            }
+            core::arch::asm!("dsb sy", "isb", options(nomem, nostack));
+        }
+
+        {
+            let s = crate::SerialGuard::acquire();
+            s.puts("[SMP] Starting AP cpu_id=");
+            s.dec(cpu_id as u64);
+            s.putc(b'\n');
+        }
+
+        // Start the AP via PSCI CPU_ON.
+        // target_cpu = MPIDR affinity value; on QEMU virt, Aff0 = cpu_id.
+        let result = psci::cpu_on(cpu_id as u64, trampoline_phys, cpu_id as u64);
+        if result == psci::PSCI_ALREADY_ON {
+            // CPU already running (shouldn't happen), skip.
+            continue;
+        }
+        if result != psci::PSCI_SUCCESS {
+            // CPU doesn't exist or PSCI error — stop probing.
+            {
+                let s = crate::SerialGuard::acquire();
+                s.puts("[SMP] PSCI CPU_ON failed for cpu_id=");
+                s.dec(cpu_id as u64);
+                s.puts(" error=");
+                s.puts(psci::error_name(result));
+                s.putc(b'\n');
+            }
+            break;
+        }
+
+        // Wait for AP to signal ready (spin with timeout).
+        // Approximate timeout: ~500ms (500_000 iterations of a short spin).
+        let mut timeout = 500_000u32;
+        while !ap_boot::is_ap_ready(cpu_id) {
+            if timeout == 0 {
+                let s = crate::SerialGuard::acquire();
+                s.puts("[SMP] AP cpu_id=");
+                s.dec(cpu_id as u64);
+                s.puts(" timeout waiting for ready\n");
+                break;
+            }
+            for _ in 0..100 {
+                core::hint::spin_loop();
+            }
+            timeout -= 1;
+        }
+
+        if ap_boot::is_ap_ready(cpu_id) {
+            ap_count += 1;
+        }
+    }
+
+    {
+        let s = crate::SerialGuard::acquire();
+        s.puts("[SMP] ");
+        s.dec(ap_count as u64);
+        s.puts(" AP(s) online\n");
+    }
 }
 
 /// Remove bootloader identity mapping (L0[0] via TTBR0).

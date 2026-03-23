@@ -334,8 +334,10 @@ extern "C" fn el1_irq_handler(_frame: *const ExceptionFrame) {
         }
         0..=INTID_SGI_MAX => {
             // Software Generated Interrupt (IPI).
+            // EOI before dispatch — the handler may context-switch (reschedule)
+            // and we must not block further SGI delivery on this CPU.
             super::gic::eoi(intid);
-            // TODO: dispatch IPI based on intid (reschedule, TLB shootdown, etc.)
+            dispatch_sgi(intid);
         }
         INTID_SPURIOUS => {
             // Spurious interrupt — no EOI needed.
@@ -347,6 +349,54 @@ extern "C" fn el1_irq_handler(_frame: *const ExceptionFrame) {
             super::gic::eoi(intid);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// SGI (IPI) dispatch
+// ---------------------------------------------------------------------------
+
+/// Dispatch a Software Generated Interrupt based on its INTID.
+///
+/// SGI allocation (must match `mod.rs` constants):
+///   0 = Reschedule
+///   1 = TLB shootdown (single page)
+///   2 = TLB shootdown all
+///   3 = VSpace teardown
+fn dispatch_sgi(intid: u32) {
+    match intid {
+        super::SGI_RESCHEDULE => {
+            crate::sched::handle_reschedule_ipi();
+        }
+        super::SGI_TLB_SHOOTDOWN => {
+            let cpu_id = super::current_cpu();
+            let addr = super::take_tlb_shootdown_addr(cpu_id);
+            if addr != 0 {
+                super::paging::invlpg(addr);
+            }
+        }
+        super::SGI_TLB_SHOOTDOWN_ALL => {
+            super::paging::flush_tlb_all();
+        }
+        super::SGI_VSPACE_TEARDOWN => {
+            handle_vspace_teardown_ipi();
+        }
+        _ => {
+            // Other SGIs unused.
+        }
+    }
+}
+
+/// Handle VSpace teardown IPI.
+///
+/// When a VSpace is being destroyed, all CPUs that have it loaded in
+/// TTBR0 must switch away before the page tables can be freed.
+/// This handler checks if the current CPU has the target VSpace loaded
+/// and if so, processes the pending deactivation.
+fn handle_vspace_teardown_ipi() {
+    // Trigger the scheduler's pending-deactivate check for this CPU.
+    // The scheduler's `with_lock` calls `kernel_exit_epilogue` which
+    // processes pending VSpace deactivates.
+    crate::sched::scheduler::scheduler().with_lock(|_| {});
 }
 
 /// Block on a userspace fault handler when configured, otherwise retire the

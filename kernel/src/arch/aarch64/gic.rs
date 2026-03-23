@@ -504,6 +504,29 @@ pub fn send_sgi(target_cpu: usize, intid: u32) {
     icc_sgi1r_write(sgi_val);
 }
 
+/// Map GICR MMIO pages for application processors.
+///
+/// Each CPU has a 128 KB redistributor region. The BSP's GICR (CPU 0) is
+/// mapped during `remap_to_direct_map()`.  This function maps the remaining
+/// GICR regions for CPUs 1..`cpu_count`.
+///
+/// Must be called after `paging::init()` and before starting any APs.
+pub fn remap_ap_gicr(cpu_count: usize) {
+    for cpu_id in 1..cpu_count {
+        let base = GICR_PHYS_BASE + (cpu_id as u64) * GICR_STRIDE;
+        let mut offset = 0u64;
+        while offset < GICR_STRIDE {
+            // SAFETY: Boot context; paging::init() has run and the direct
+            // map covers all physical RAM. map_mmio_page creates a 4 KB
+            // mapping in the kernel page tables.
+            unsafe {
+                super::paging::map_mmio_page(base + offset);
+            }
+            offset += crate::mm::PAGE_SIZE as u64;
+        }
+    }
+}
+
 /// Remap GIC MMIO bases from identity-mapped physical addresses to their
 /// virtual equivalents in the direct physical map.
 ///

@@ -865,6 +865,50 @@ pub fn clear_boot_identity_map() {
     flush_tlb_all();
 }
 
+// ---------------------------------------------------------------------------
+// System register read helpers (needed by init_smp for AP mailbox)
+// ---------------------------------------------------------------------------
+
+/// Read TTBR1_EL1 (kernel page table root).
+pub fn read_ttbr1() -> u64 {
+    let val: u64;
+    // SAFETY: Reading TTBR1_EL1 is always safe from EL1.
+    unsafe {
+        core::arch::asm!("mrs {}, TTBR1_EL1", out(reg) val, options(nomem, nostack));
+    }
+    val
+}
+
+/// Read MAIR_EL1 (Memory Attribute Indirection Register).
+pub fn read_mair() -> u64 {
+    let val: u64;
+    // SAFETY: Reading MAIR_EL1 is always safe from EL1.
+    unsafe {
+        core::arch::asm!("mrs {}, MAIR_EL1", out(reg) val, options(nomem, nostack));
+    }
+    val
+}
+
+/// Read TCR_EL1 (Translation Control Register).
+pub fn read_tcr() -> u64 {
+    let val: u64;
+    // SAFETY: Reading TCR_EL1 is always safe from EL1.
+    unsafe {
+        core::arch::asm!("mrs {}, TCR_EL1", out(reg) val, options(nomem, nostack));
+    }
+    val
+}
+
+/// Read SCTLR_EL1 (System Control Register).
+pub fn read_sctlr() -> u64 {
+    let val: u64;
+    // SAFETY: Reading SCTLR_EL1 is always safe from EL1.
+    unsafe {
+        core::arch::asm!("mrs {}, SCTLR_EL1", out(reg) val, options(nomem, nostack));
+    }
+    val
+}
+
 unsafe fn clone_kernel_root(boot_root: u64) -> u64 {
     let kernel_root = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect("Failed to allocate TTBR1 kernel root");
 
