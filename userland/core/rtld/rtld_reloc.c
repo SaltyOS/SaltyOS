@@ -48,6 +48,28 @@ static uint64_t resolve_by_index(struct rtld_state *st, struct link_map *map,
     return 0;
 }
 
+static void fatal_unresolved_reloc(struct link_map *map, uint32_t sym_idx,
+                                   const char *reloc_name) {
+    const char *name = "<invalid>";
+    if (map->symtab && map->strtab
+        && (map->symtab_count == 0 || sym_idx < map->symtab_count)) {
+        Elf64_Sym *sym = &map->symtab[sym_idx];
+        if (map->strtab_size == 0 || sym->st_name < map->strtab_size) {
+            name = map->strtab + sym->st_name;
+        }
+    }
+
+    struct rtld_linebuf lb;
+    rtld_lb_init(&lb);
+    rtld_lb_str(&lb, "[RTLD] FATAL: unresolved ");
+    rtld_lb_str(&lb, reloc_name);
+    rtld_lb_str(&lb, " symbol: ");
+    rtld_lb_str(&lb, name);
+    rtld_lb_str(&lb, "\n");
+    rtld_lb_flush(&lb);
+    rtld_exit(127);
+}
+
 /* Apply a single relocation */
 static void apply_rela(struct rtld_state *st, struct link_map *map,
                         Elf64_Rela *r) {
@@ -67,6 +89,14 @@ static void apply_rela(struct rtld_state *st, struct link_map *map,
     case R_ABS64: {
         /* S + A: symbol value + addend */
         uint64_t sym_addr = resolve_by_index(st, map, sym_idx);
+        if (sym_addr == 0) {
+            if (map->symtab_count == 0 || sym_idx < map->symtab_count) {
+                Elf64_Sym *sym = &map->symtab[sym_idx];
+                if (ELF64_ST_BIND(sym->st_info) != STB_WEAK) {
+                    fatal_unresolved_reloc(map, sym_idx, "R_ABS64");
+                }
+            }
+        }
         *target = sym_addr + (uint64_t)r->r_addend;
         break;
     }
@@ -74,6 +104,14 @@ static void apply_rela(struct rtld_state *st, struct link_map *map,
     case R_GLOB_DAT: {
         /* S: symbol value */
         uint64_t sym_addr = resolve_by_index(st, map, sym_idx);
+        if (sym_addr == 0) {
+            if (map->symtab_count == 0 || sym_idx < map->symtab_count) {
+                Elf64_Sym *sym = &map->symtab[sym_idx];
+                if (ELF64_ST_BIND(sym->st_info) != STB_WEAK) {
+                    fatal_unresolved_reloc(map, sym_idx, "R_GLOB_DAT");
+                }
+            }
+        }
         *target = sym_addr;
         break;
     }
@@ -81,6 +119,14 @@ static void apply_rela(struct rtld_state *st, struct link_map *map,
     case R_JUMP_SLOT: {
         /* For eager binding: resolve now */
         uint64_t sym_addr = resolve_by_index(st, map, sym_idx);
+        if (sym_addr == 0) {
+            if (map->symtab_count == 0 || sym_idx < map->symtab_count) {
+                Elf64_Sym *sym = &map->symtab[sym_idx];
+                if (ELF64_ST_BIND(sym->st_info) != STB_WEAK) {
+                    fatal_unresolved_reloc(map, sym_idx, "R_JUMP_SLOT");
+                }
+            }
+        }
         *target = sym_addr;
         break;
     }

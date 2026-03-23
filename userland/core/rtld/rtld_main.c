@@ -443,5 +443,10 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
      *   - RSP % 16 == 8 at entry
      * Startup code for both C and Rust relies on this contract.
      */
+#if defined(__aarch64__)
+    /* Ensure all prior stores (GOT patches, PLT binding, TLS exports) are
+     * globally visible before jumping to the executable entry point. */
+    __asm__ volatile("dsb ish\n" "isb\n" : : : "memory");
+#endif
     rtld_jump_entry_arch((uint64_t)(uintptr_t)sp, (void *)(uintptr_t)g_rtld.exe_entry);
 }
