@@ -303,6 +303,11 @@ pub fn load_elf(
                 }
             }
 
+            // Clean D-cache to PoU after writing code/data to this page via
+            // the kernel direct-map VA (no-op on x86_64; required on aarch64
+            // so that subsequent I-cache invalidation sees the written bytes).
+            crate::arch::paging::flush_dcache_pou_page(frame_ptr as u64);
+
             page_vaddr += PAGE_SIZE as u64;
         }
     }
@@ -311,6 +316,10 @@ pub fn load_elf(
     if is_pie {
         apply_relocations(data, delta, vspace)?;
     }
+
+    // Invalidate I-cache after all segment writes and relocations (no-op on
+    // x86_64; required on aarch64 where I/D caches are not coherent).
+    crate::arch::paging::flush_icache_all();
 
     let entry = ehdr.e_entry.wrapping_add(delta);
 

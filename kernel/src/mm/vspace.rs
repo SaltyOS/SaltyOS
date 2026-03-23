@@ -1308,6 +1308,16 @@ impl VSpace {
             // Remote TLB shootdown
             self.tlb_shootdown(virt);
 
+            // Executable mapping requires I-cache coherence (no-op on x86_64).
+            // Clean D-cache to PoU first so the I-cache refill path sees data
+            // written via any VA (e.g. RTLD scratch mappings).
+            if flags.executable {
+                crate::arch::paging::flush_dcache_pou_page(
+                    phys_to_virt(phys) as u64,
+                );
+                crate::arch::paging::flush_icache_all();
+            }
+
             Ok(())
         })();
 
@@ -1658,6 +1668,25 @@ impl VSpace {
             }
         }
 
+        // Pages transitioning to executable need D-cache clean + I-cache
+        // invalidation (no-op on x86_64; required on aarch64 where I/D
+        // caches are split).
+        if flags.executable && protected > 0 {
+            let page_size = PAGE_SIZE as u64;
+            for i in 0..count {
+                let addr = virt + (i as u64) * page_size;
+                if let Some(entry) = self.read_entry(addr, 1) {
+                    if entry & ENTRY_PRESENT != 0 {
+                        let phys = entry & ENTRY_ADDR_MASK;
+                        crate::arch::paging::flush_dcache_pou_page(
+                            phys_to_virt(phys) as u64,
+                        );
+                    }
+                }
+            }
+            crate::arch::paging::flush_icache_all();
+        }
+
         self.lock.unlock();
         unsafe { restore_irq(irq) };
 
@@ -1991,6 +2020,15 @@ impl VSpace {
             crate::arch::paging::invlpg(page_vaddr);
             self.tlb_shootdown(page_vaddr);
 
+            // If the resolved page is executable, ensure I-cache coherence
+            // (the copied data went to D-cache via the kernel direct-map VA).
+            if new_flags & ENTRY_NO_EXECUTE == 0 {
+                crate::arch::paging::flush_dcache_pou_page(
+                    phys_to_virt(new_phys) as u64,
+                );
+                crate::arch::paging::flush_icache_all();
+            }
+
             super::pmm_retain_mapping(new_phys);
             super::pmm_release_mapping(old_phys);
 
@@ -2216,6 +2254,14 @@ impl VSpace {
 
                 crate::arch::paging::invlpg(page_vaddr);
                 self.tlb_shootdown(page_vaddr);
+
+                // If resolved page is executable, ensure I-cache coherence.
+                if new_flags & ENTRY_NO_EXECUTE == 0 {
+                    crate::arch::paging::flush_dcache_pou_page(
+                        phys_to_virt(new_phys) as u64,
+                    );
+                    crate::arch::paging::flush_icache_all();
+                }
 
                 super::pmm_retain_mapping(new_phys);
                 super::pmm_release_mapping(old_phys);
@@ -2597,6 +2643,14 @@ impl VSpace {
             super::pmm_retain_mapping(new_phys);
             crate::arch::paging::invlpg(page_vaddr);
             self.tlb_shootdown(page_vaddr);
+
+            // Demand-faulted executable page: ensure I-cache coherence.
+            if new_entry & ENTRY_NO_EXECUTE == 0 {
+                crate::arch::paging::flush_dcache_pou_page(
+                    phys_to_virt(new_phys) as u64,
+                );
+                crate::arch::paging::flush_icache_all();
+            }
 
             Ok(true)
         })();

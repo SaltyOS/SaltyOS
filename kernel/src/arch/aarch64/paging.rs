@@ -449,6 +449,46 @@ pub fn flush_asid(asid: u16) {
     }
 }
 
+/// Invalidate the entire instruction cache across all CPUs in the
+/// inner-shareable domain.
+///
+/// Must be called after writing code to memory (ELF loading, relocation
+/// patching, page protection changes to executable). AArch64 has split
+/// I-cache/D-cache — stores go to D-cache only; without explicit I-cache
+/// invalidation the CPU (or QEMU's TCG) may execute stale bytes.
+pub fn flush_icache_all() {
+    // SAFETY: IC IALLUIS is always safe from EL1. It broadcasts I-cache
+    // invalidation to all CPUs in the inner-shareable domain.
+    unsafe {
+        core::arch::asm!(
+            "dsb ish",
+            "ic ialluis",
+            "dsb ish",
+            "isb",
+            options(nostack),
+        );
+    }
+}
+
+/// Clean D-cache to Point of Unification for a 4 KiB page at kernel VA.
+///
+/// Call before [`flush_icache_all`] when code was written to a physical frame
+/// via the kernel direct-physical-map VA. Cleaning to PoU ensures the data
+/// is visible to the I-cache refill path on hardware with non-unified caches.
+pub fn flush_dcache_pou_page(kva: u64) {
+    // SAFETY: DC CVAU is always safe from EL1. It cleans the cache line
+    // containing the virtual address to the Point of Unification.
+    unsafe {
+        let mut addr = kva;
+        let end = kva + 4096;
+        while addr < end {
+            core::arch::asm!("dc cvau, {}", in(reg) addr, options(nostack));
+            addr += 64; // ARMv8 minimum cache line size
+        }
+        core::arch::asm!("dsb ish", options(nostack));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ASID allocator
 // ---------------------------------------------------------------------------

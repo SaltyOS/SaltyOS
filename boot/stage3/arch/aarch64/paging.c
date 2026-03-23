@@ -111,6 +111,7 @@ void paging_load_cr3(uint64_t root_table)
     sctlr |= (1ULL << 0);  /* M bit: enable MMU */
     sctlr |= (1ULL << 2);  /* C bit: data cache enable */
     sctlr |= (1ULL << 12); /* I bit: instruction cache enable */
+    sctlr |= (1ULL << 26); /* UCI: allow EL0 IC IVAU / DC CVAU instructions */
     sctlr &= ~(1ULL << 1); /* A bit: disable alignment checking */
     write_sctlr_el1(sctlr);
 }

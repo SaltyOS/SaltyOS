@@ -75,6 +75,18 @@ pub fn invlpg(addr: u64) {
     }
 }
 
+/// No-op on x86_64 — instruction and data caches are coherent.
+///
+/// On aarch64 this broadcasts `IC IALLUIS` to invalidate the I-cache
+/// across all CPUs. Provided here so shared code can call
+/// `crate::arch::paging::flush_icache_all()` unconditionally.
+#[inline(always)]
+pub fn flush_icache_all() {}
+
+/// No-op on x86_64 — see [`flush_icache_all`].
+#[inline(always)]
+pub fn flush_dcache_pou_page(_kva: u64) {}
+
 /// Ensure that a non-leaf page table exists at `index` and return its physical address.
 ///
 /// If the entry contains a 2MB huge page, splits it into 512 × 4KB pages
