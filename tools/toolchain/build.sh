@@ -323,9 +323,9 @@ Run 'just tc build host llvm' first."
     -DCMAKE_ASM_FLAGS="--target=$target_triple --sysroot=$SYSROOT" \
     -DCMAKE_C_FLAGS="--target=$target_triple --sysroot=$SYSROOT" \
     -DCMAKE_CXX_FLAGS="--target=$target_triple --sysroot=$SYSROOT -fno-exceptions -fno-rtti -nostdinc++ -I$SYSROOT/usr/include/c++/v1" \
-    -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -nostdlib -nostartfiles -L$SYSROOT/usr/lib $SYSROOT/usr/lib/crt_start.o -lc++ -lc -lbesalt $SYSROOT/usr/lib/core.o $SYSROOT/usr/lib/compiler_builtins.o -T $SYSROOT/usr/lib/saltyos-pie.ld -z max-page-size=4096" \
-    -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -nostdlib -nostartfiles -L$SYSROOT/usr/lib -lc++ -lc -lbesalt -z max-page-size=4096" \
-    -DCMAKE_MODULE_LINKER_FLAGS="-fuse-ld=lld -nostdlib -nostartfiles -L$SYSROOT/usr/lib -lc++ -lc -lbesalt -z max-page-size=4096" \
+    -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
+    -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld" \
+    -DCMAKE_MODULE_LINKER_FLAGS="-fuse-ld=lld" \
     \
     -DHAVE_CXX_ATOMICS_WITHOUT_LIB=ON \
     -DHAVE_CXX_ATOMICS64_WITHOUT_LIB=ON

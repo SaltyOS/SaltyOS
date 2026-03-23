@@ -212,15 +212,15 @@ tc CMD *ARGS:
 
 # Generate cross-compilation sysroot (requires: just build)
 sysroot: build
-    @just tc sysroot
+    @just arch={{arch}} tc sysroot
 
 # Full cross-compile pipeline (requires: just sysroot)
 # libc++ is built by 'just build' when build_libcxx=auto|true and
 # toolchain/llvm-project is present, then installed into sysroot by 'just sysroot'.
 self-host: sysroot
-    @just tc build cross llvm
-    @just tc build cross rust
-    @just tc package
+    @just arch={{arch}} tc build cross llvm
+    @just arch={{arch}} tc build cross rust
+    @just arch={{arch}} tc package
 
 # Cross-compile C smoke test against sysroot
 cross-hello: sysroot

@@ -1438,3 +1438,190 @@ pub extern "C" fn __fixunsdfdi(a: u64) -> u64 {
     let shift = F64_FRAC_BITS as i32 - unbiased;
     if shift > 0 { sig >> shift } else { sig << (-shift) }
 }
+
+// ---------------------------------------------------------------------------
+// f128 (quad precision) intrinsics — needed on aarch64 where long double is
+// IEEE 754 binary128 (1 sign + 15 exponent + 112 fraction bits).
+// ---------------------------------------------------------------------------
+
+const F128_SIGN_BIT: u128 = 1u128 << 127;
+const F128_EXP_BITS: u32 = 15;
+const F128_FRAC_BITS: u32 = 112;
+const F128_EXP_MASK: u128 = ((1u128 << F128_EXP_BITS) - 1) << F128_FRAC_BITS;
+const F128_FRAC_MASK: u128 = (1u128 << F128_FRAC_BITS) - 1;
+const F128_IMPLICIT_BIT: u128 = 1u128 << F128_FRAC_BITS;
+const F128_EXP_BIAS: i32 = 16383;
+
+#[inline(always)]
+fn f128_sign(a: u128) -> u128 {
+    a >> 127
+}
+
+#[inline(always)]
+fn f128_exp(a: u128) -> i32 {
+    ((a >> F128_FRAC_BITS) & ((1u128 << F128_EXP_BITS) - 1)) as i32
+}
+
+#[inline(always)]
+fn f128_frac(a: u128) -> u128 {
+    a & F128_FRAC_MASK
+}
+
+#[inline(always)]
+fn f128_is_nan(a: u128) -> bool {
+    (a & F128_EXP_MASK) == F128_EXP_MASK && (a & F128_FRAC_MASK) != 0
+}
+
+/// Compare two f128 values. Returns -1, 0, or 1.
+/// `nan_result` is returned if either operand is NaN.
+fn cmp_f128(a: u128, b: u128, nan_result: i32) -> i32 {
+    if f128_is_nan(a) || f128_is_nan(b) {
+        return nan_result;
+    }
+
+    let a_sign = f128_sign(a);
+    let b_sign = f128_sign(b);
+
+    // Both zero (positive or negative)
+    if (a & !F128_SIGN_BIT) == 0 && (b & !F128_SIGN_BIT) == 0 {
+        return 0;
+    }
+
+    // Different signs
+    if a_sign != b_sign {
+        return if a_sign != 0 { -1 } else { 1 };
+    }
+
+    // Same sign — compare magnitudes
+    let a_mag = a & !F128_SIGN_BIT;
+    let b_mag = b & !F128_SIGN_BIT;
+
+    if a_mag == b_mag {
+        return 0;
+    }
+
+    if a_sign != 0 {
+        if a_mag > b_mag { -1 } else { 1 }
+    } else {
+        if a_mag > b_mag { 1 } else { -1 }
+    }
+}
+
+/// __lttf2: f128 less-than comparison (returns negative if a < b)
+#[unsafe(export_name = "__lttf2")]
+pub extern "C" fn __lttf2(a: u128, b: u128) -> i32 {
+    cmp_f128(a, b, 1) // NaN → not less than
+}
+
+/// __letf2: f128 less-than-or-equal comparison
+#[unsafe(export_name = "__letf2")]
+pub extern "C" fn __letf2(a: u128, b: u128) -> i32 {
+    cmp_f128(a, b, 1)
+}
+
+/// __gttf2: f128 greater-than comparison
+#[unsafe(export_name = "__gttf2")]
+pub extern "C" fn __gttf2(a: u128, b: u128) -> i32 {
+    cmp_f128(a, b, -1)
+}
+
+/// __getf2: f128 greater-than-or-equal comparison
+#[unsafe(export_name = "__getf2")]
+pub extern "C" fn __getf2(a: u128, b: u128) -> i32 {
+    cmp_f128(a, b, -1)
+}
+
+/// __eqtf2: f128 equality comparison
+#[unsafe(export_name = "__eqtf2")]
+pub extern "C" fn __eqtf2(a: u128, b: u128) -> i32 {
+    cmp_f128(a, b, 1)
+}
+
+/// __netf2: f128 inequality comparison
+#[unsafe(export_name = "__netf2")]
+pub extern "C" fn __netf2(a: u128, b: u128) -> i32 {
+    cmp_f128(a, b, 1)
+}
+
+/// __unordtf2: f128 unordered comparison (returns nonzero if either is NaN)
+#[unsafe(export_name = "__unordtf2")]
+pub extern "C" fn __unordtf2(a: u128, b: u128) -> i32 {
+    if f128_is_nan(a) || f128_is_nan(b) { 1 } else { 0 }
+}
+
+/// __trunctfdf2: f128 → f64
+#[unsafe(export_name = "__trunctfdf2")]
+pub extern "C" fn __trunctfdf2(a: u128) -> u64 {
+    let sign = ((a >> 127) as u64) << 63;
+    let exp = f128_exp(a);
+    let frac = f128_frac(a);
+
+    // NaN
+    if exp == 0x7FFF && frac != 0 {
+        return sign | 0x7FF8_0000_0000_0000; // quiet NaN
+    }
+
+    // Infinity
+    if exp == 0x7FFF {
+        return sign | 0x7FF0_0000_0000_0000;
+    }
+
+    // Zero
+    if exp == 0 && frac == 0 {
+        return sign;
+    }
+
+    // Get full significand with implicit bit
+    let mut sig = frac;
+    let mut src_exp = exp;
+    if exp != 0 {
+        sig |= F128_IMPLICIT_BIT;
+    } else {
+        // Subnormal f128 — normalize
+        let shift = sig.leading_zeros() - (128 - F128_FRAC_BITS - 1);
+        sig <<= shift;
+        src_exp = 1 - shift as i32;
+    }
+
+    // Rebias exponent: f128 bias 16383, f64 bias 1023
+    let new_exp = src_exp - F128_EXP_BIAS + F64_EXP_BIAS as i32;
+
+    // sig has 113 bits (implicit + 112 fraction). f64 needs 53 bits (implicit + 52).
+    // Shift right by 60 with rounding.
+    let shift = (F128_FRAC_BITS - F64_FRAC_BITS as u32) as u128;
+    let dropped = sig & ((1u128 << shift) - 1);
+    let halfway = 1u128 << (shift - 1);
+    let mut f64_sig = (sig >> shift) as u64;
+
+    // Round to nearest, ties to even
+    if dropped > halfway || (dropped == halfway && (f64_sig & 1) != 0) {
+        f64_sig += 1;
+    }
+
+    let mut result_exp = new_exp;
+
+    // Handle carry from rounding
+    if f64_sig >= (1u64 << (F64_FRAC_BITS as u32 + 1)) {
+        f64_sig >>= 1;
+        result_exp += 1;
+    }
+
+    // Overflow → infinity
+    if result_exp >= 0x7FF {
+        return sign | 0x7FF0_0000_0000_0000;
+    }
+
+    // Underflow → subnormal or zero
+    if result_exp <= 0 {
+        let s = 1 - result_exp;
+        if s >= 53 {
+            return sign;
+        }
+        f64_sig >>= s;
+        return sign | f64_sig;
+    }
+
+    // Remove implicit bit
+    f64_sig &= F64_FRAC_MASK;
+    sign | ((result_exp as u64) << F64_FRAC_BITS as u32) | f64_sig
+}
