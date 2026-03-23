@@ -7,6 +7,12 @@
 
 #include "rtld_internal.h"
 
+#ifdef R_TLSDESC
+/* Static TLS descriptor resolver (assembly, preserves all regs except x0).
+ * Dynamic TLS (dlopen) is not supported — all modules use static TLS. */
+extern uint64_t _tlsdesc_static_resolver(void);
+#endif
+
 /* Resolve a symbol by index from a given object's symtab */
 static uint64_t resolve_by_index(struct rtld_state *st, struct link_map *map,
                                   uint32_t sym_idx) {
@@ -99,6 +105,17 @@ static void apply_rela(struct rtld_state *st, struct link_map *map,
         *target = (uint64_t)(map->tls_tpoff + (int64_t)sym->st_value + r->r_addend);
         break;
     }
+
+#ifdef R_TLSDESC
+    case R_TLSDESC: {
+        /* GOT descriptor {resolver, tp_offset} for TLSDESC access sequence. */
+        Elf64_Sym *sym = &map->symtab[sym_idx];
+        int64_t tpoff = map->tls_tpoff + (int64_t)sym->st_value + r->r_addend;
+        target[0] = (uint64_t)_tlsdesc_static_resolver;
+        target[1] = (uint64_t)tpoff;
+        break;
+    }
+#endif
 
     default:
         { struct rtld_linebuf lb; rtld_lb_init(&lb);

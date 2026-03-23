@@ -12,5 +12,6 @@
 #define R_DTPMOD64   1028     /* R_AARCH64_TLS_DTPMOD */
 #define R_DTPOFF64   1029     /* R_AARCH64_TLS_DTPREL */
 #define R_TPOFF64    1030     /* R_AARCH64_TLS_TPREL */
+#define R_TLSDESC    1031     /* R_AARCH64_TLSDESC */
 
 #endif

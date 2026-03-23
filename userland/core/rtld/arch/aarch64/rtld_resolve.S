@@ -68,3 +68,18 @@ _dl_runtime_resolve:
     br      x16
 
 .size _dl_runtime_resolve, . - _dl_runtime_resolve
+
+/* TLSDESC static resolver for statically-allocated TLS.
+ *
+ * On entry:  x0 = address of the 2-word descriptor {resolver, arg}
+ * On return: x0 = TP-relative offset of the TLS variable
+ * All other registers (x1-x30, NZCV, d0-d31) must be preserved.
+ */
+.globl _tlsdesc_static_resolver
+.type _tlsdesc_static_resolver, @function
+
+_tlsdesc_static_resolver:
+    ldr     x0, [x0, #8]
+    ret
+
+.size _tlsdesc_static_resolver, . - _tlsdesc_static_resolver
