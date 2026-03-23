@@ -487,7 +487,7 @@ unsafe fn abort_destroyed_exec(
         lb.flush();
 
         super::vfs_load::cleanup_exec_source(vfs_source);
-        super::signal::terminate_proc(idx, super::PM_SIGKILL);
+        let _ = super::signal::terminate_proc(idx, super::PM_SIGKILL);
         reply.label = 0;
     }
 }

@@ -57,7 +57,7 @@ unsafe fn sig_stop_proc(idx: usize, sig: usize) {
     }
 }
 
-pub(crate) unsafe fn terminate_proc(idx: usize, sig: usize) {
+pub(crate) unsafe fn terminate_proc(idx: usize, sig: usize) -> bool {
     unsafe {
         let exit_code = (sig & 0x7f) as i32;
 
@@ -71,12 +71,26 @@ pub(crate) unsafe fn terminate_proc(idx: usize, sig: usize) {
             lb.flush();
         }
 
-        let susp_err = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 64);
+        let mut susp_err = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 64);
         if susp_err != 0 {
             // Last resort: nanosleep to let the target CPU's IRQ window
             // open (ep_lock/ntfn_lock hold IRQs off, delaying IPI delivery).
             besalt::syscall::syscall(besalt::SYS_NANOSLEEP, 2_000_000, 0, 0, 0, 0, 0);
-            let _ = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 64);
+            susp_err = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 64);
+        }
+
+        // Never tear down process resources unless the target TCB is known
+        // suspended; otherwise a still-running thread can execute from freed
+        // mappings and fault nondeterministically.
+        if susp_err != 0 {
+            let mut lb = LineBuf::new();
+            lb.str(b"[PROCMGR] terminate: suspend failed PID=");
+            lb.hex(proctab(idx).pid as u64);
+            lb.str(b" err=");
+            lb.hex(susp_err as u64);
+            lb.str(b"\n");
+            lb.flush();
+            return false;
         }
         // Yield to ensure the target CPU has fully completed the context
         // switch and all memory operations from the stopped thread are
@@ -152,7 +166,7 @@ pub(crate) unsafe fn terminate_proc(idx: usize, sig: usize) {
             proctab(idx).waiter_pid = 0;
             free_proc_alloc_slots(idx);
             cleanup_proc_resources(idx, super::CAP_SELF_CSPACE);
-            return;
+            return true;
         }
 
         // Wake any-child waiter on parent
@@ -174,6 +188,8 @@ pub(crate) unsafe fn terminate_proc(idx: usize, sig: usize) {
                 cleanup_proc_resources(idx, super::CAP_SELF_CSPACE);
             }
         }
+
+        true
     }
 }
 
@@ -187,8 +203,7 @@ unsafe fn deliver_signal_to(ti: usize, sig: usize) -> bool {
 
         // SIGKILL: always terminate
         if sig == super::PM_SIGKILL {
-            terminate_proc(ti, sig);
-            return true;
+            return terminate_proc(ti, sig);
         }
 
         // SIGSTOP: always stop
@@ -235,7 +250,7 @@ unsafe fn deliver_signal_to(ti: usize, sig: usize) -> bool {
             if sig_default_is_stop(sig) {
                 sig_stop_proc(ti, sig);
             } else if sig_default_is_terminate(sig) {
-                terminate_proc(ti, sig);
+                return terminate_proc(ti, sig);
             }
             return true;
         }
@@ -287,7 +302,7 @@ pub(crate) unsafe fn handle_kill(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         };
 
         if !deliver_signal_to(ti, sig) {
-            reply.label = super::BESALT_NOT_FOUND;
+            reply.label = besalt::BESALT_BUSY;
             return;
         }
 
