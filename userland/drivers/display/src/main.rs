@@ -22,7 +22,6 @@ use besalt::serial::LineBuf;
 use besalt::syscall::syscall;
 use besalt::types::*;
 
-const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 const FB_MAP_VADDR: u64 = 0x0000_0000_3000_0000;
 const MAX_DAMAGE_SCANLINES: usize = 8192;
 const DAMAGE_WORD_BITS: usize = 64;
@@ -1395,28 +1394,8 @@ fn handle_present(state: &mut DisplayState, reply: &mut BesaltMsg) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     puts(b"[DISPLAY] Display server starting\n");
-
-    // Set up IPC buffer
-    unsafe {
-        invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
-        ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
-    }
-
-    // Initialize per-process slot allocator from RTLD-exported globals
-    unsafe {
-        let base = *(&raw const besalt::__besalt_slot_base);
-        let count = *(&raw const besalt::__besalt_slot_count);
-        let cspace_ntfn = *(&raw const besalt::__besalt_cspace_ntfn);
-        if base != 0 {
-            besalt::slot_alloc::slot_alloc_init(base, count, cspace_ntfn);
-        } else {
-            puts(b"[DISPLAY] FATAL: slot pool not provided by RTLD/auxv\n");
-            signal_ready();
-            idle();
-        }
-    }
 
     // Read framebuffer info from boot info page
     let fb = match unsafe { framebuffer::read_framebuffer_info() } {
@@ -1440,11 +1419,6 @@ pub extern "C" fn _start() -> ! {
         lb.dec(fb.pitch as u64);
         lb.str(b"\n");
         lb.flush();
-    }
-
-    // Initialize mmsrv client for posix_mmap
-    unsafe {
-        besalt::posix_mm::posix_mm_init(CAP_MMSRV_EP);
     }
 
     // Map framebuffer with write-combining (WRITE_THROUGH flag)

@@ -39,6 +39,7 @@ const VIRTIO_BLK_CAPACITY: u64 = 0x14;
 const VIRTIO_STATUS_ACK: u8 = 1;
 const VIRTIO_STATUS_DRIVER: u8 = 2;
 const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
+const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
 // Ring feature bits (virtio 1.0+ legacy transport feature map)
 const VIRTIO_RING_F_INDIRECT_DESC: u32 = 1 << 28;
 const VIRTIO_RING_F_EVENT_IDX: u32 = 1 << 29;
@@ -397,6 +398,14 @@ fn virtio_negotiate() -> bool {
 
     // Set queue address (legacy: PFN = phys / 4096)
     bar_write32(VIRTIO_QUEUE_ADDR, (vq_phys / 4096) as u32);
+
+    // blkdrv completes requests synchronously by polling used.idx, so device
+    // interrupts on queue completions are pure shared-IRQ noise.
+    unsafe {
+        let avail_base = (vq_base + layout.avail_off) as *mut u16;
+        core::ptr::write_volatile(avail_base, VIRTQ_AVAIL_F_NO_INTERRUPT);
+    }
+    puts(b"[blkdrv] Queue interrupts suppressed (polling mode)\n");
 
     // Now set DRIVER_OK
     bar_write8(

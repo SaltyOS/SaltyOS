@@ -21,7 +21,6 @@
 extern crate besalt;
 
 use besalt::consts::*;
-use besalt::invoke;
 use besalt::ipc;
 use besalt::serial;
 use besalt::types::*;
@@ -30,7 +29,6 @@ use besalt::types::*;
 // Capability slot layout
 // ---------------------------------------------------------------------------
 
-const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_CSPACE: u64 = 2;
 const CAP_NAMESERV_EP: u64 = 5;
 const CAP_MMSRV_EP: u64 = 7;
@@ -38,8 +36,6 @@ const CAP_READINESS_NTFN: u64 = 14;
 const CAP_NETSRV_EP: u64 = 64;
 const CAP_NAMESERV_EP2: u64 = 65;
 const CAP_SERVER_EP: u64 = 68;
-
-const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 // ---------------------------------------------------------------------------
 // DNS cache
@@ -398,15 +394,8 @@ fn handle_reverse(msg: &BesaltMsg, reply: &mut BesaltMsg) {
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     puts(b"[dnssrv] DNS Resolver Service starting\n");
-
-    // Set IPC buffer
-    let _ = invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
-    // SAFETY: Setting up IPC buffer pointer for this thread.
-    unsafe {
-        (*ipc_ctx()).ipc_buffer = IPC_BUF_VADDR as *mut IpcBuffer;
-    }
 
     // Register with name service
     register_nameserv();

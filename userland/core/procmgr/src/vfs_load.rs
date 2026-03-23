@@ -355,7 +355,10 @@ unsafe fn read_open_vfs_file_to_buffer(fd: i32, file_size: usize) -> Option<VfsL
             core::ptr::null_mut(),
             alloc_size,
             PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS | MAP_LAZY,
+            // These scratch buffers are populated immediately after mmap.
+            // Avoid demand-paged mappings here so the first store into the
+            // ELF header lands deterministically before validation.
+            MAP_PRIVATE | MAP_ANONYMOUS,
             -1,
             0,
         );
@@ -740,7 +743,12 @@ unsafe fn inspect_streamed_vfs_elf(fd: i32, file_size: usize) -> Option<VfsStrea
         {
             return None;
         }
+        #[cfg(target_arch = "x86_64")]
         if ehdr.e_machine != EM_X86_64 {
+            return None;
+        }
+        #[cfg(target_arch = "aarch64")]
+        if ehdr.e_machine != EM_AARCH64 {
             return None;
         }
 
@@ -902,7 +910,7 @@ unsafe fn inspect_streamed_vfs_elf(fd: i32, file_size: usize) -> Option<VfsStrea
                     core::ptr::null_mut(),
                     rela_alloc_size,
                     PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_LAZY,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
                     -1,
                     0,
                 );

@@ -1,7 +1,7 @@
 # SaltyOS Process Manager Build (Rust)
 # SPDX-License-Identifier: GPL-2.0-only
 
-procmgr_link = meson.current_source_dir() / 'link.ld'
+procmgr_link = meson.current_source_dir() / 'arch' / arch / 'link.ld'
 libbesalt_build_dir = meson.project_build_root() / 'lib/besalt/lib'
 
 # Step 1: Rust -> .o
@@ -25,16 +25,16 @@ procmgr_obj = custom_target('procmgr_obj',
 procmgr_elf = custom_target('procmgr_elf',
   input: [procmgr_obj],
   output: 'procmgr.elf',
-  depends: [libbesalt_so, libc_so],
+  depends: [libbesalt_so, libc_so, crt_start_obj],
   command: [cc_cmd,
     '--target=' + c_target,
     '-nostdlib', '-nostartfiles', '-ffreestanding',
     '-fno-stack-protector',
-    '-mno-red-zone',
     '-T', procmgr_link,
     '-L', libbesalt_build_dir,
-    '-L', meson.project_build_root() / 'lib/besalt/c',
+    '-L', besaltc_build_dir,
     '-o', '@OUTPUT@',
+    besaltc_build_dir / 'crt_start.o',
     '@INPUT@',
     '-lbesalt', '-lc',
   ],

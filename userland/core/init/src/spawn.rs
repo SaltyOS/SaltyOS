@@ -37,6 +37,11 @@ const READY_TIMEOUT_NS: u64 = 10_000_000_000; // 10s default
 const READY_WAIT_YIELDS_FALLBACK: usize = 200_000;
 static mut NEXT_UT_HINT: Cap = CAP_UNTYPED_START;
 
+#[cfg(target_arch = "aarch64")]
+const STACK_ENTRY_BIAS: u64 = 0;
+#[cfg(target_arch = "x86_64")]
+const STACK_ENTRY_BIAS: u64 = 8;
+
 // ===========================================================================
 // Shared library physical frame cache
 // ===========================================================================
@@ -1579,8 +1584,8 @@ pub unsafe fn spawn_server(
                 + if has_expand_ep { 1 } else { 0 }
                 + if has_mm_ep { 1 } else { 0 };
             let srv_stack_frame_size: u64 = 3 * 8 + auxv_count * 2 * 8 + 8;
-            // Process-entry ABI: argc at [RSP], with RSP % 16 == 8.
-            let stack_rsp_bias: u64 = 8;
+            // argc lives at [SP], but the required entry bias differs by arch.
+            let stack_rsp_bias: u64 = STACK_ENTRY_BIAS;
             let stack_base =
                 (SCRATCH_VADDR + 4096 - srv_stack_frame_size - stack_rsp_bias) as *mut u64;
 

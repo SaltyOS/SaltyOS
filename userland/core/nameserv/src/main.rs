@@ -25,11 +25,9 @@ use besalt::serial;
 use besalt::serial::LineBuf;
 use besalt::types::*;
 
-const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_CSPACE: u64 = 2;
 const CAP_SERVER_EP: u64 = 3;
 const CAP_READINESS_NTFN: u64 = 14;
-const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 const CAP_SERVICE_BASE: u64 = 32;
 const MAX_SERVICES: usize = 32;
@@ -181,23 +179,8 @@ unsafe fn handle_lookup(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     puts(b"[NAMESERV] SaltyOS name server starting\n");
-
-    let err = besalt::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
-    if err != 0 {
-        let mut lb = LineBuf::new();
-        lb.str(b"[NAMESERV] FAIL: set IPC buffer err=");
-        lb.hex(err as u64);
-        lb.str(b"\n");
-        lb.flush();
-        idle();
-    }
-    unsafe {
-        ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
-    }
-
-    puts(b"[NAMESERV] IPC buffer ready\n");
 
     // Set up receive slot for cap transfers
     unsafe {

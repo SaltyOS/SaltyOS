@@ -1,7 +1,8 @@
 //! SaltyOS Console Server — Input Source + Output Sink
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! Handles hardware I/O for COM1 serial and PS/2 keyboard.
+//! Handles hardware I/O for serial (COM1 on x86_64, PL011 on aarch64)
+//! and PS/2 keyboard (x86_64 only).
 //! Forwards raw input bytes to ttyd via TTYD_INPUT_EVENT.
 //! Handles CONSOLE_WRITE for direct serial + display output.
 //!
@@ -12,48 +13,27 @@
 
 extern crate besalt;
 
+#[cfg(target_arch = "x86_64")]
+#[path = "arch/x86_64.rs"]
+mod arch;
+#[cfg(target_arch = "aarch64")]
+#[path = "arch/aarch64.rs"]
+mod arch;
+
+#[cfg(target_arch = "x86_64")]
 mod kbd;
 
 use besalt::consts::*;
-use besalt::invoke;
 use besalt::ipc;
 use besalt::serial;
 use besalt::types::*;
 
-use kbd::KbdState;
-
-const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
-
-// Cap layout (set up by init for the console server)
-const CAP_SELF_TCB: u64 = 0;
+// Cap layout (architecture-neutral slots)
 const CAP_SELF_CSPACE: u64 = 2;
 const CAP_SERVER_EP: u64 = 3;
 const CAP_READINESS_NTFN: u64 = 14;
-const CAP_IOPORT: u64 = 64;     // COM1 IoPort (CopyCap 8:64)
-const CAP_IRQ: u64 = 65;        // COM1 IRQ handler (CopyCap 9:65)
-const CAP_NTFN: u64 = 66;       // COM1+PS/2 IRQ notification (CopyCap 10:66)
 const CAP_TTYD_EP: u64 = 67;    // TTYD endpoint (NeedEP ttyd:67)
 const CAP_DISPLAY_EP: u64 = 68; // Display EP (NeedEP display:68)
-const CAP_KBD_IOPORT: u64 = 69; // PS/2 Keyboard IoPort (CopyCap 6:69)
-const CAP_KBD_IRQ: u64 = 70;    // PS/2 Keyboard IRQ handler (CopyCap 7:70)
-
-// PS/2 controller register offsets (relative to base port 0x60)
-const PS2_DATA: u64 = 0;    // offset 0 = port 0x60
-const PS2_STATUS: u64 = 4;  // offset 4 = port 0x64
-const PS2_STATUS_OUTPUT_FULL: u8 = 1;
-
-// COM1 register offsets
-const COM1_RBR: u64 = 0;
-const COM1_IER: u64 = 1;
-const COM1_FCR: u64 = 2;
-const COM1_LCR: u64 = 3;
-const COM1_MCR: u64 = 4;
-const COM1_LSR: u64 = 5;
-const COM1_DLL: u64 = 0;
-const COM1_DLH: u64 = 1;
-
-// LSR bits
-const LSR_DR: u8 = 1 << 0;
 
 // termios flag defaults (match ttyd canonical defaults)
 const ISIG: u32 = 0o000001;
@@ -120,74 +100,6 @@ unsafe fn init_console_termios() {
         (*t).c_cc[VSTOP] = 19;
         (*t).c_cc[VSUSP] = 26;
     }
-}
-
-/// Initialize COM1 hardware registers via IoPort cap
-fn com1_init() {
-    invoke::ioport_out8(CAP_IOPORT, COM1_IER, 0x00);
-    invoke::ioport_out8(CAP_IOPORT, COM1_LCR, 0x80);
-    invoke::ioport_out8(CAP_IOPORT, COM1_DLL, 0x01);
-    invoke::ioport_out8(CAP_IOPORT, COM1_DLH, 0x00);
-    invoke::ioport_out8(CAP_IOPORT, COM1_LCR, 0x03);
-    invoke::ioport_out8(CAP_IOPORT, COM1_FCR, 0xC7);
-    invoke::ioport_out8(CAP_IOPORT, COM1_MCR, 0x0B);
-    // Enable Received Data Available interrupt
-    invoke::ioport_out8(CAP_IOPORT, COM1_IER, 0x01);
-}
-
-/// Initialize PS/2 keyboard controller via IoPort capability.
-fn kbd_init() {
-    // Disable both ports
-    invoke::ioport_out8(CAP_KBD_IOPORT, PS2_STATUS, 0xAD);
-    invoke::ioport_out8(CAP_KBD_IOPORT, PS2_STATUS, 0xA7);
-
-    // Flush output buffer
-    for _ in 0..16 {
-        let status = invoke::ioport_in8(CAP_KBD_IOPORT, PS2_STATUS);
-        if (status & PS2_STATUS_OUTPUT_FULL) == 0 { break; }
-        let _ = invoke::ioport_in8(CAP_KBD_IOPORT, PS2_DATA);
-    }
-
-    // Read controller configuration byte (command 0x20)
-    invoke::ioport_out8(CAP_KBD_IOPORT, PS2_STATUS, 0x20);
-    for _ in 0..1000 {
-        let status = invoke::ioport_in8(CAP_KBD_IOPORT, PS2_STATUS);
-        if (status & PS2_STATUS_OUTPUT_FULL) != 0 { break; }
-    }
-    let mut config = invoke::ioport_in8(CAP_KBD_IOPORT, PS2_DATA);
-
-    // Enable IRQ1 (bit 0) and scancode translation (bit 6)
-    config |= 1;
-    config |= 1 << 6;
-
-    // Write configuration back (command 0x60)
-    invoke::ioport_out8(CAP_KBD_IOPORT, PS2_STATUS, 0x60);
-    invoke::ioport_out8(CAP_KBD_IOPORT, PS2_DATA, config);
-
-    // Enable port 1
-    invoke::ioport_out8(CAP_KBD_IOPORT, PS2_STATUS, 0xAE);
-
-    // Reset keyboard (send 0xFF)
-    invoke::ioport_out8(CAP_KBD_IOPORT, PS2_DATA, 0xFF);
-    for _ in 0..10000 {
-        let status = invoke::ioport_in8(CAP_KBD_IOPORT, PS2_STATUS);
-        if (status & PS2_STATUS_OUTPUT_FULL) != 0 {
-            let byte = invoke::ioport_in8(CAP_KBD_IOPORT, PS2_DATA);
-            if byte == 0xAA { break; }
-        }
-    }
-
-    // Enable scanning (send 0xF4)
-    invoke::ioport_out8(CAP_KBD_IOPORT, PS2_DATA, 0xF4);
-    for _ in 0..1000 {
-        let status = invoke::ioport_in8(CAP_KBD_IOPORT, PS2_STATUS);
-        if (status & PS2_STATUS_OUTPUT_FULL) != 0 {
-            let _ = invoke::ioport_in8(CAP_KBD_IOPORT, PS2_DATA);
-            break;
-        }
-    }
-
-    serial::serial_puts(b"[CONSOLE] PS/2 keyboard initialized\n");
 }
 
 fn signal_ready() {
@@ -461,31 +373,16 @@ unsafe fn handle_tcsetattr(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
 // ======================================================================
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
-    com1_init();
+pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
+    arch::serial_init();
     serial::serial_puts(b"[CONSOLE] SaltyOS console server ready\n");
 
     unsafe {
-        invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
-        ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
         init_console_termios();
-
-        // Set up COM1 IRQ notification
-        invoke::irq_handler_set_notification(CAP_IRQ, CAP_NTFN);
-
-        // Set up PS/2 keyboard notification BEFORE init — kbd_init() generates
-        // IRQ1 from keyboard ACK/self-test responses
-        invoke::irq_handler_set_notification(CAP_KBD_IRQ, CAP_NTFN);
-        kbd_init();
-        // Clear any unacknowledged IRQ1 from kbd_init responses
-        invoke::irq_handler_ack(CAP_KBD_IRQ);
-
-        // Bind notification to TCB for combined wait
-        invoke::tcb_bind_notification(CAP_SELF_TCB, CAP_NTFN);
     }
+    arch::irq_setup();
     signal_ready();
 
-    let mut kbd = KbdState::new();
     let mut msg = BesaltMsg::zeroed();
     let mut badge: u64 = 0;
 
@@ -502,36 +399,10 @@ pub extern "C" fn _start() -> ! {
         // Bound notifications have label=0 and length=0.
         // Regular IPC may carry a non-zero badge (sender badge).
         if badge != 0 && msg.label == 0 && msg.length == 0 {
-            // Notification: drain COM1 and PS/2 input, forward to ttyd.
+            // Notification: drain hardware input, forward to ttyd.
             let mut raw_buf = [0u8; 256];
-            let mut raw_len = 0;
-
-            // COM1 input
-            loop {
-                let lsr = invoke::ioport_in8(CAP_IOPORT, COM1_LSR);
-                if (lsr & LSR_DR) == 0 { break; }
-                let c = invoke::ioport_in8(CAP_IOPORT, COM1_RBR);
-                if raw_len < 256 {
-                    raw_buf[raw_len] = c;
-                    raw_len += 1;
-                }
-            }
-            invoke::irq_handler_ack(CAP_IRQ);
-
-            // PS/2 keyboard input
-            loop {
-                let status = invoke::ioport_in8(CAP_KBD_IOPORT, PS2_STATUS);
-                if (status & PS2_STATUS_OUTPUT_FULL) == 0 { break; }
-                let scancode = invoke::ioport_in8(CAP_KBD_IOPORT, PS2_DATA);
-                let key = kbd.translate(scancode);
-                for i in 0..key.len as usize {
-                    if raw_len < 256 {
-                        raw_buf[raw_len] = key.bytes[i];
-                        raw_len += 1;
-                    }
-                }
-            }
-            invoke::irq_handler_ack(CAP_KBD_IRQ);
+            let raw_len = arch::drain_input(&mut raw_buf);
+            arch::ack_irqs();
 
             // Forward raw bytes to ttyd
             forward_to_ttyd(&raw_buf, raw_len);

@@ -40,7 +40,6 @@ mod handlers;
 
 use besalt::consts::*;
 use besalt::ipc;
-use besalt::invoke;
 use besalt::serial;
 use besalt::types::*;
 
@@ -179,13 +178,8 @@ fn server_loop() -> ! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     puts(b"[saltyfs] SaltyFS Server starting\n");
-
-    let _ = invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
-    unsafe {
-        (*ipc_ctx()).ipc_buffer = IPC_BUF_VADDR as *mut IpcBuffer;
-    }
 
     // Set up SHM from blkdrv
     if !block::setup_blk_shm() {

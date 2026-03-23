@@ -1,7 +1,7 @@
 # SaltyOS Init Process Build (Rust, statically linked)
 # SPDX-License-Identifier: GPL-2.0-only
 
-init_link = meson.current_source_dir() / 'link.ld'
+init_link = meson.current_source_dir() / 'arch' / arch / 'link.ld'
 
 # Step 1: Rust -> .o
 init_obj = custom_target('init_obj',
@@ -23,7 +23,7 @@ init_obj = custom_target('init_obj',
 # Step 2: .o + libbesalt.o + fork.o + core.o + compiler_builtins.o + string.c -> init.elf (static)
 init_elf = custom_target('init_elf',
   input: [init_obj, libbesalt_obj, fork_obj, core_obj, compiler_builtins_obj,
-          meson.project_source_root() / 'lib/besalt/c/string.c'],
+          meson.project_source_root() / 'lib/besalt/c/src/string.c'],
   output: 'init.elf',
   command: [cc_cmd,
     '--target=' + c_target,
@@ -31,7 +31,6 @@ init_elf = custom_target('init_elf',
     '-shared',
     '-fno-plt', '-Wl,-Bsymbolic',
     '-fno-stack-protector',
-    '-mno-red-zone',
     '-T', init_link,
     '-o', '@OUTPUT@',
     '@INPUT@',
@@ -42,7 +41,7 @@ init_elf = custom_target('init_elf',
 # Step 3: stripped init ELF for boot image/initrd (keep init.elf for debugging)
 init_boot_elf = custom_target('init_boot_elf',
   input: [init_obj, libbesalt_obj, fork_obj, core_obj, compiler_builtins_obj,
-          meson.project_source_root() / 'lib/besalt/c/string.c'],
+          meson.project_source_root() / 'lib/besalt/c/src/string.c'],
   output: 'init.boot.elf',
   command: [cc_cmd,
     '--target=' + c_target,
@@ -50,7 +49,6 @@ init_boot_elf = custom_target('init_boot_elf',
     '-shared',
     '-fno-plt', '-Wl,-Bsymbolic',
     '-fno-stack-protector',
-    '-mno-red-zone',
     '-Wl,-S',
     '-T', init_link,
     '-o', '@OUTPUT@',

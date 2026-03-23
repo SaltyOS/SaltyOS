@@ -22,7 +22,6 @@ pub(crate) const REGION_MMAP: u8 = 1;
 pub(crate) const REGION_SPAWN: u8 = 2;
 pub(crate) const REGION_SHARED_RO: u8 = 3;
 pub(crate) const REGION_INITIAL_CAP: usize = 8;
-pub(crate) const HEAP_INITIAL_FRAME_CAP: usize = 64;
 
 #[derive(Clone, Copy)]
 pub(crate) struct MmRegion {
@@ -32,12 +31,11 @@ pub(crate) struct MmRegion {
     pub(crate) region_type: u8,
     pub(crate) active: bool,
     pub(crate) lazy: bool,
-    pub(crate) frame_caps: *mut Cap,
-    pub(crate) frame_count: u32,
-    pub(crate) frame_cap_capacity: u32,
-    pub(crate) cow_bitmap: *mut u64,     // 1 bit per page; set = COW-inherited, no frame cap
-    pub(crate) cow_bitmap_words: u32,    // number of u64 words in bitmap
-    pub(crate) cow_inherited: bool,      // set during fork; immune to mprotect changes
+    pub(crate) mo_cap: Cap,
+    /// Page offset within the MO for this region's base address.
+    /// Used for per-segment shared lib mappings where multiple regions
+    /// share one MO at different offsets.
+    pub(crate) mo_offset: u32,
 }
 
 impl MmRegion {
@@ -49,12 +47,8 @@ impl MmRegion {
             region_type: 0,
             active: false,
             lazy: false,
-            frame_caps: core::ptr::null_mut(),
-            frame_count: 0,
-            frame_cap_capacity: 0,
-            cow_bitmap: core::ptr::null_mut(),
-            cow_bitmap_words: 0,
-            cow_inherited: false,
+            mo_cap: 0,
+            mo_offset: 0,
         }
     }
 }

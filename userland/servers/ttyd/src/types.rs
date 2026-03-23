@@ -2,7 +2,6 @@
 //! PTY data structures: ring buffers, termios settings, and PTY instances.
 
 // Capability layout
-pub const CAP_SELF_TCB: u64 = 0;
 pub const CAP_SELF_CSPACE: u64 = 2;
 pub const CAP_PROCMGR_EP: u64 = 3;
 pub const CAP_NAMESERV_EP: u64 = 5;
@@ -12,8 +11,6 @@ pub const CAP_DISPLAY_EP: u64 = 65;
 pub const CAP_VFS_NTFN: u64 = 66;
 pub const CAP_SERVER_EP: u64 = 68;
 pub const CAP_DISPLAY_RING_NTFN: u64 = 69;
-
-pub const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 // Buffer sizes and limits
 pub const RING_SIZE: usize = 16384;

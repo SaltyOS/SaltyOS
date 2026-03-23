@@ -1,8 +1,8 @@
 /* SaltyOS Runtime Dynamic Linker - Relocation Processing
  * SPDX-License-Identifier: GPL-2.0-only
  *
- * Handles R_X86_64_RELATIVE, R_X86_64_64, R_X86_64_GLOB_DAT,
- * and R_X86_64_JUMP_SLOT relocations.
+ * Handles R_RELATIVE, R_ABS64, R_GLOB_DAT,
+ * and R_JUMP_SLOT relocations.
  */
 
 #include "rtld_internal.h"
@@ -50,41 +50,41 @@ static void apply_rela(struct rtld_state *st, struct link_map *map,
     uint32_t sym_idx = ELF64_R_SYM(r->r_info);
 
     switch (type) {
-    case R_X86_64_NONE:
+    case R_NONE:
         break;
 
-    case R_X86_64_RELATIVE:
+    case R_RELATIVE:
         /* B + A: base address + addend */
         *target = map->base + (uint64_t)r->r_addend;
         break;
 
-    case R_X86_64_64: {
+    case R_ABS64: {
         /* S + A: symbol value + addend */
         uint64_t sym_addr = resolve_by_index(st, map, sym_idx);
         *target = sym_addr + (uint64_t)r->r_addend;
         break;
     }
 
-    case R_X86_64_GLOB_DAT: {
+    case R_GLOB_DAT: {
         /* S: symbol value */
         uint64_t sym_addr = resolve_by_index(st, map, sym_idx);
         *target = sym_addr;
         break;
     }
 
-    case R_X86_64_JUMP_SLOT: {
+    case R_JUMP_SLOT: {
         /* For eager binding: resolve now */
         uint64_t sym_addr = resolve_by_index(st, map, sym_idx);
         *target = sym_addr;
         break;
     }
 
-    case R_X86_64_DTPMOD64:
+    case R_DTPMOD64:
         /* Module ID for __tls_get_addr (GD model). */
         *target = map->tls_module_id;
         break;
 
-    case R_X86_64_DTPOFF64: {
+    case R_DTPOFF64: {
         /* Offset within the module's TLS block (for __tls_get_addr).
          * For STT_TLS symbols, st_value is the offset within the TLS segment. */
         Elf64_Sym *sym = &map->symtab[sym_idx];
@@ -92,7 +92,7 @@ static void apply_rela(struct rtld_state *st, struct link_map *map,
         break;
     }
 
-    case R_X86_64_TPOFF64: {
+    case R_TPOFF64: {
         /* Offset from thread pointer (Variant II: TLS data below TP).
          * TP + offset = address of TLS variable. */
         Elf64_Sym *sym = &map->symtab[sym_idx];

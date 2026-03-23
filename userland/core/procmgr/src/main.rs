@@ -37,7 +37,6 @@ const CAP_INITRD_UNTYPED: Cap = 12;
 const CAP_RECV_SCRATCH: Cap = 15; // Scratch slot for receiving transferred caps
 const CAP_UNTYPED_START: Cap = 16;
 
-const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 const VSPACE_WALK_BATCH: u64 = 48;
 
 // ---- Protocol labels ----
@@ -473,28 +472,13 @@ unsafe fn handle_request_untyped(
 // ===========================================================================
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     puts(b"[PROCMGR] SaltyOS process manager starting\n");
 
     unsafe {
-        // Set IPC buffer
-        let err = besalt::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
-        if err != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] FAIL: set IPC buffer err=");
-            lb.hex(err as u64);
-            lb.str(b"\n");
-            lb.flush();
-            idle();
-        }
-        besalt::ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
-        puts(b"[PROCMGR] IPC buffer ready\n");
-
-        // Initialize mmsrv client
-        besalt::posix_mm::posix_mm_init(CAP_MMSRV_EP);
-
         // Initialize process table (allocates via mmsrv)
         init_proctab();
+        puts(b"[PROCMGR] process table ready\n");
 
         // Initialize the centralized allocator
         (*(&raw mut ALLOCATOR)).init(
@@ -503,6 +487,7 @@ pub extern "C" fn _start() -> ! {
             CAP_UNTYPED_START,
             UT_MIRROR_COUNT as usize,
         );
+        puts(b"[PROCMGR] allocator ready\n");
 
         // Pre-load shared library RO pages into frame cache.
         // Must happen before any allocator use — init copies shared lib caps
@@ -702,7 +687,7 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    idle();
+    1
 }
 
 fn idle() -> ! {

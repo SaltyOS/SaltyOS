@@ -33,6 +33,7 @@
 extern crate besalt;
 
 mod virtio;
+mod virtio_modern;
 
 use besalt::consts::*;
 use besalt::invoke;
@@ -54,6 +55,7 @@ const CAP_MMSRV_EP: u64 = 7;
 const CAP_IRQ_HANDLER: u64 = 81;
 const CAP_IRQ_NOTIFICATION: u64 = 82;
 const CAP_NETSRV_RX_NTFN: u64 = 84;
+const CAP_REPLY_TEMP: u64 = 85;
 
 // ---------------------------------------------------------------------------
 // SHM ring buffer constants
@@ -62,16 +64,17 @@ const CAP_NETSRV_RX_NTFN: u64 = 84;
 const SHM_VADDR: u64 = 0x0000_0000_6000_0000;
 const NET_SHM_ID: u64 = 0x4E455400;
 const TX_BADGE: u64 = 0x2;
+const POLL_TIMEOUT_NS: u64 = 10_000_000;
 
 // ---------------------------------------------------------------------------
 // Driver state
 // ---------------------------------------------------------------------------
 
 static mut IRQ_ENABLED: bool = false;
+static mut IRQ_BADGE_BITS: u64 = 0;
+pub(crate) static mut USING_MODERN_TRANSPORT: bool = false;
 static mut SHM_BASE: u64 = 0;
 static mut NETSRV_RX_NTFN: u64 = 0;
-
-const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 // ---------------------------------------------------------------------------
 // Utility functions
@@ -83,6 +86,11 @@ pub(crate) fn puts(s: &[u8]) {
 
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
     &raw mut besalt::__besalt_ipc_ctx
+}
+
+fn irq_badge_bits() -> u64 {
+    // SAFETY: Written during IRQ setup before event loop starts.
+    unsafe { *(&raw const IRQ_BADGE_BITS) }
 }
 
 fn signal_ready() {
@@ -196,6 +204,7 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
     // SAFETY: Single-threaded init path; written once before event loop.
     unsafe {
         *(&raw mut IRQ_ENABLED) = true;
+        *(&raw mut IRQ_BADGE_BITS) = 1u64 << ((irq_line as u64) & 63);
     }
 
     {
@@ -258,7 +267,7 @@ fn shm_rx_enqueue(frame: &[u8]) -> bool {
 ///
 /// Returns the frame length if a frame was dequeued, None if the ring is
 /// empty or SHM is not yet mapped.
-fn shm_tx_dequeue(buf: &mut [u8; 2048]) -> Option<usize> {
+fn shm_tx_peek(buf: &mut [u8; 2048]) -> Option<usize> {
     // SAFETY: SHM_BASE is set once during DRIVER_REGISTER. Single-threaded
     // driver. All pointer arithmetic is within the mapped SHM region (header
     // at offset 0, TX ring at offset 0x11000).
@@ -281,9 +290,26 @@ fn shm_tx_dequeue(buf: &mut [u8; 2048]) -> Option<usize> {
         let data = (slot_base + 2) as *const u8;
         core::ptr::copy_nonoverlapping(data, buf.as_mut_ptr(), len);
 
-        let slot_count = core::ptr::read_volatile(hdr.add(5)); // offset 0x14
-        core::ptr::write_volatile(hdr.add(3), (tx_tail + 1) % slot_count);
         Some(len)
+    }
+}
+
+/// Consume one TX frame from the SHM TX ring after a successful transmit.
+fn shm_tx_consume() {
+    // SAFETY: SHM_BASE is set once during DRIVER_REGISTER. Single-threaded
+    // driver. All pointer arithmetic is within the mapped SHM region.
+    unsafe {
+        let base = *(&raw const SHM_BASE);
+        if base == 0 {
+            return;
+        }
+        let hdr = base as *mut u32;
+        let tx_tail = *hdr.add(3);
+        let slot_count = core::ptr::read_volatile(hdr.add(5)); // offset 0x14
+        if slot_count == 0 {
+            return;
+        }
+        core::ptr::write_volatile(hdr.add(3), (tx_tail + 1) % slot_count);
     }
 }
 
@@ -303,13 +329,16 @@ fn signal_netsrv_rx() {
 
 /// Process all pending received packets from virtio and enqueue them into
 /// the SHM RX ring for netsrv.
-fn drain_rx() {
+fn drain_rx() -> bool {
+    let mut any_polled = false;
     let mut any_enqueued = false;
     while let Some((buf_idx, len)) = virtio::rx_poll() {
+        any_polled = true;
         let data = virtio::rx_get_data(buf_idx, len);
-        // Skip VirtioNetHdr (10 bytes) to get the Ethernet frame
-        if len > virtio::VIRTIO_NET_HDR_SIZE {
-            let pkt = &data[virtio::VIRTIO_NET_HDR_SIZE..];
+        // Skip VirtioNetHdr to get the Ethernet frame
+        let hdr_sz = virtio::net_hdr_size();
+        if len > hdr_sz {
+            let pkt = &data[hdr_sz..];
             if shm_rx_enqueue(pkt) {
                 any_enqueued = true;
             }
@@ -319,14 +348,37 @@ fn drain_rx() {
     if any_enqueued {
         signal_netsrv_rx();
     }
+    any_polled
 }
 
 /// Drain all pending TX frames from the SHM TX ring (queued by netsrv) and
 /// transmit them via virtio.
 fn drain_tx_ring() {
     let mut buf = [0u8; 2048];
-    while let Some(len) = shm_tx_dequeue(&mut buf) {
-        virtio::tx_packet(&buf[..len]);
+    while let Some(len) = shm_tx_peek(&mut buf) {
+        let ok = virtio::tx_packet(&buf[..len]);
+        if !ok {
+            break;
+        }
+        shm_tx_consume();
+    }
+}
+
+/// Service the device data path from either an interrupt wakeup or a timed poll.
+///
+/// `ack_notification` should be true when we woke due to a notification badge.
+/// This keeps shared IRQ handlers re-armed even when the notification was
+/// triggered by another device on the same line.
+fn poll_device_once(irq_enabled: bool, badge: u64) {
+    let ack_notification = badge != 0;
+    let rx_progress = drain_rx();
+    let isr = virtio::read_isr();
+    let needs_ack = irq_enabled && (((badge & irq_badge_bits()) != 0) || isr != 0);
+
+    drain_tx_ring();
+
+    if needs_ack {
+        let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
     }
 }
 
@@ -403,7 +455,13 @@ fn handle_driver_register(msg: &BesaltMsg, reply: &mut BesaltMsg) {
     reply.regs[2] = 1; // link status: up
     reply.length = 3;
 
-    puts(b"[netdrv] DRIVER_REGISTER complete, SHM mapped\n");
+    let mut lb = LineBuf::new();
+    lb.str(b"[netdrv] DRIVER_REGISTER complete, SHM mapped rx_ntfn_cap=");
+    lb.dec(CAP_NETSRV_RX_NTFN);
+    lb.str(b" tx_ntfn_cap=");
+    lb.dec(CAP_IRQ_NOTIFICATION);
+    lb.putc(b'\n');
+    lb.flush();
 }
 
 // ---------------------------------------------------------------------------
@@ -422,30 +480,18 @@ fn event_loop(device_ok: bool) -> ! {
 
     // SAFETY: IRQ_ENABLED is set during init before event loop starts.
     let irq_enabled = unsafe { *(&raw const IRQ_ENABLED) };
+    let use_timed_poll = device_ok;
 
-    if !irq_enabled {
-        if device_ok {
-            // Polling fallback: no IRQ, yield and poll ISR directly
-            puts(b"[netdrv] No IRQ, using yield-based polling\n");
-            loop {
-                let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-                let isr = virtio::read_isr();
-                if isr != 0 {
-                    drain_rx();
-                }
-            }
-        } else {
-            // No device present -- idle loop with no hardware access
-            puts(b"[netdrv] No device, idling\n");
-            loop {
-                let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-            }
-        }
+    if device_ok && !irq_enabled {
+        puts(b"[netdrv] No IRQ, using timed-recv polling\n");
+    } else if !device_ok {
+        puts(b"[netdrv] No device, serving IPC only\n");
     }
 
     let ctx = ipc_ctx();
     let mut msg = BesaltMsg::zeroed();
     let mut badge: u64 = 0;
+    let mut have_event = false;
 
     // Set receive slot for netsrv's notification cap during DRIVER_REGISTER
     // SAFETY: IPC context is valid.
@@ -453,31 +499,37 @@ fn event_loop(device_ok: bool) -> ! {
         ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_NETSRV_RX_NTFN, 0);
     }
 
-    // Initial recv -- wait for first event
-    // SAFETY: IPC context is valid; server EP was set up by procmgr.
-    unsafe {
-        ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge);
-    }
-
     loop {
-        if badge != 0 {
-            // Woken by bound notification -- check for hardware IRQ
-            let isr = virtio::read_isr();
-            if isr != 0 {
-                drain_rx();
-                let _ = invoke::irq_handler_ack(CAP_IRQ_HANDLER);
-            }
-            // Check for TX notification from netsrv (badge bit 0x2)
-            if badge & TX_BADGE != 0 {
-                drain_tx_ring();
-            }
-
-            // Wait for next event (no reply needed for notifications)
+        if !have_event {
             msg = BesaltMsg::zeroed();
             badge = 0;
-            // SAFETY: IPC context is valid.
-            unsafe {
-                ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge);
+
+            if use_timed_poll {
+                let err = unsafe {
+                    ipc::recv_timed_ctx(
+                        ctx,
+                        CAP_SERVER_EP,
+                        POLL_TIMEOUT_NS,
+                        &raw mut msg,
+                        &raw mut badge,
+                    )
+                };
+                if err != 0 {
+                    poll_device_once(irq_enabled, 0);
+                    continue;
+                }
+            } else {
+                // SAFETY: IPC context is valid; server EP was set up by procmgr.
+                unsafe {
+                    ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge);
+                }
+            }
+        }
+        have_event = false;
+
+        if badge != 0 {
+            if device_ok {
+                poll_device_once(irq_enabled, badge);
             }
         } else {
             // IPC request on server endpoint
@@ -489,18 +541,45 @@ fn event_loop(device_ok: bool) -> ! {
                 }
             }
 
-            // Reply to caller AND wait for next event atomically
-            msg = BesaltMsg::zeroed();
-            badge = 0;
-            // SAFETY: IPC context is valid.
-            unsafe {
-                ipc::reply_recv_ctx(
-                    ctx,
-                    CAP_SERVER_EP,
-                    &raw const reply,
-                    &raw mut msg,
-                    &raw mut badge,
-                );
+            let reply_has_caps = unsafe { !ctx.is_null() && (*ctx).send_cap_count > 0 };
+
+            if use_timed_poll && !reply_has_caps {
+                let save_err = invoke::cnode_save_caller(CAP_SELF_CSPACE, CAP_REPLY_TEMP);
+                if save_err == 0 {
+                    let _ = unsafe { ipc::send_ctx(ctx, CAP_REPLY_TEMP, &raw const reply) };
+                } else {
+                    // Fall back to reply_recv if we cannot split reply + timed recv.
+                    msg = BesaltMsg::zeroed();
+                    badge = 0;
+                    // SAFETY: IPC context is valid.
+                    unsafe {
+                        ipc::reply_recv_ctx(
+                            ctx,
+                            CAP_SERVER_EP,
+                            &raw const reply,
+                            &raw mut msg,
+                            &raw mut badge,
+                        );
+                    }
+                    have_event = true;
+                }
+            } else {
+                if use_timed_poll && reply_has_caps {
+                    puts(b"[netdrv] reply carries caps, using reply_recv path\n");
+                }
+                msg = BesaltMsg::zeroed();
+                badge = 0;
+                // SAFETY: IPC context is valid.
+                unsafe {
+                    ipc::reply_recv_ctx(
+                        ctx,
+                        CAP_SERVER_EP,
+                        &raw const reply,
+                        &raw mut msg,
+                        &raw mut badge,
+                    );
+                }
+                have_event = true;
             }
         }
     }
@@ -511,60 +590,79 @@ fn event_loop(device_ok: bool) -> ! {
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     puts(b"[netdrv] virtio-net Hardware Driver starting\n");
-
-    // Set IPC buffer
-    let _ = invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
-    // SAFETY: Setting up IPC buffer pointer for this thread.
-    unsafe {
-        (*ipc_ctx()).ipc_buffer = IPC_BUF_VADDR as *mut IpcBuffer;
-    }
 
     // Discover and initialize virtio-net device
     let mut irq_line: u8 = 0;
     let mut has_irq_handler = false;
     let mut device_ok = false;
 
-    match virtio::find_virtio_net() {
-        Some((bus, dev, func, bar0, _bar0_full)) => {
-            {
-                let mut lb = LineBuf::new();
-                lb.str(b"[netdrv] Found virtio-net at ");
-                lb.dec(bus as u64);
-                lb.putc(b':');
-                lb.dec(dev as u64);
-                lb.str(b" BAR0=");
-                lb.hex(bar0 as u64);
-                lb.putc(b'\n');
-                lb.flush();
-            }
-
+    // Try modern virtio (device ID 0x1041) first
+    if let Some((bus, dev, func)) = virtio_modern::find_virtio_net_modern() {
+        puts(b"[netdrv] Found modern virtio-net device\n");
+        if virtio_modern::init_virtio_modern(bus, dev, func) {
+            // USING_MODERN_TRANSPORT already set inside init_virtio_modern
+            device_ok = true;
+            // Get IRQ handler cap from pcisrv (resolves PCI INTx → GIC SPI on aarch64)
             match virtio::get_device_caps(bus, dev, func) {
-                Some((_bar_phys, _bar_bits, bar_size, irq, _bar_is_io, has_irq)) => {
+                Some((_bar_phys, _bar_bits, _bar_size, irq, _bar_is_io, has_irq)) => {
                     irq_line = irq;
                     has_irq_handler = has_irq;
-                    {
-                        let mut lb = LineBuf::new();
-                        lb.str(b"[netdrv] IRQ=");
-                        lb.dec(irq as u64);
-                        lb.putc(b'\n');
-                        lb.flush();
-                    }
-
-                    if virtio::init_virtio(bar0, bar_size) {
-                        device_ok = true;
-                    } else {
-                        puts(b"[netdrv] Failed to init virtio transport\n");
-                    }
                 }
-                None => {
-                    puts(b"[netdrv] Failed to get PCI caps from pcisrv\n");
-                }
+                None => {}
             }
         }
-        None => {
-            puts(b"[netdrv] No virtio-net device found\n");
+    }
+
+    // Fall back to legacy virtio (device ID 0x1000)
+    if !device_ok {
+        match virtio::find_virtio_net() {
+            Some((bus, dev, func, bar0, _bar0_full)) => {
+                {
+                    let mut lb = LineBuf::new();
+                    lb.str(b"[netdrv] Found virtio-net at ");
+                    lb.dec(bus as u64);
+                    lb.putc(b':');
+                    lb.dec(dev as u64);
+                    lb.str(b" BAR0=");
+                    lb.hex(bar0 as u64);
+                    lb.putc(b'\n');
+                    lb.flush();
+                }
+
+                match virtio::get_device_caps(bus, dev, func) {
+                    Some((_bar_phys, _bar_bits, bar_size, irq, _bar_is_io, has_irq)) => {
+                        irq_line = irq;
+                        has_irq_handler = has_irq;
+                        {
+                            let mut lb = LineBuf::new();
+                            lb.str(b"[netdrv] IRQ=");
+                            lb.dec(irq as u64);
+                            lb.putc(b'\n');
+                            lb.flush();
+                        }
+
+                        // Transitional device (0x1000): try modern transport
+                        // first. Handles QEMU's disable-legacy=on where the
+                        // device has modern PCI capabilities but legacy I/O
+                        // is non-functional.
+                        if virtio_modern::init_virtio_modern(bus, dev, func) {
+                            device_ok = true;
+                        } else if virtio::init_virtio(bar0, bar_size) {
+                            device_ok = true;
+                        } else {
+                            puts(b"[netdrv] Failed to init virtio transport\n");
+                        }
+                    }
+                    None => {
+                        puts(b"[netdrv] Failed to get PCI caps from pcisrv\n");
+                    }
+                }
+            }
+            None => {
+                puts(b"[netdrv] No virtio-net device found\n");
+            }
         }
     }
 

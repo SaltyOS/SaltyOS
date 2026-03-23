@@ -19,15 +19,28 @@
 #define SYS_DEBUG_PUTCHAR  10
 #define SYS_DEBUG_PUTBUF   15
 
+/* Syscall result — must be defined before arch headers */
+struct rtld_syscall_result {
+    uint64_t error;
+    uint64_t value;
+};
+
+/* Architecture-specific syscall primitives */
+#if defined(__x86_64__)
+#include "arch/x86_64/rtld_syscall.h"
+#elif defined(__aarch64__)
+#include "arch/aarch64/rtld_syscall.h"
+#endif
+
+/* Architecture-specific relocation types */
+#if defined(__x86_64__)
+#include "arch/x86_64/rtld_reloc_types.h"
+#elif defined(__aarch64__)
+#include "arch/aarch64/rtld_reloc_types.h"
+#endif
+
 static inline void rtld_putc(char c) {
-    register uint64_t r10 __asm__("r10") = 0;
-    register uint64_t r8  __asm__("r8")  = 0;
-    register uint64_t r9  __asm__("r9")  = 0;
-    __asm__ volatile("syscall"
-        : : "a"((uint64_t)SYS_DEBUG_PUTCHAR), "D"((uint64_t)(unsigned char)c),
-            "S"((uint64_t)0), "d"((uint64_t)0),
-            "r"(r10), "r"(r8), "r"(r9)
-        : "rcx", "r11", "memory");
+    rtld_putc_arch(c);
 }
 
 /* Write a string atomically via DebugPutBuf (pointer + length, up to 256 bytes).
@@ -41,16 +54,7 @@ static inline void rtld_puts(const char *s) {
     while (off < len) {
         size_t chunk = len - off;
         if (chunk > 256) chunk = 256;
-
-        register uint64_t r10 __asm__("r10") = 0;
-        register uint64_t r8  __asm__("r8")  = 0;
-        register uint64_t r9  __asm__("r9")  = 0;
-        __asm__ volatile("syscall"
-            : : "a"((uint64_t)SYS_DEBUG_PUTBUF),
-                "D"((uint64_t)(uintptr_t)(s + off)),
-                "S"((uint64_t)chunk), "d"((uint64_t)0),
-                "r"(r10), "r"(r8), "r"(r9)
-            : "rcx", "r11", "memory");
+        rtld_putbuf_arch(s + off, chunk);
         off += chunk;
     }
 }
@@ -197,25 +201,11 @@ typedef uint64_t cap_t;
 #define BESALT_OUT_OF_MEMORY       5
 #define BESALT_NOT_FOUND           6
 
-struct rtld_syscall_result {
-    uint64_t error;
-    uint64_t value;
-};
-
 static inline struct rtld_syscall_result rtld_syscall(
     uint64_t syscall_num, uint64_t a0, uint64_t a1,
     uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5
 ) {
-    struct rtld_syscall_result result;
-    register uint64_t r10 __asm__("r10") = a3;
-    register uint64_t r8  __asm__("r8")  = a4;
-    register uint64_t r9  __asm__("r9")  = a5;
-    __asm__ volatile("syscall"
-        : "=a"(result.error), "=d"(result.value)
-        : "a"(syscall_num), "D"(a0), "S"(a1), "d"(a2),
-          "r"(r10), "r"(r8), "r"(r9)
-        : "rcx", "r11", "memory");
-    return result;
+    return rtld_syscall_arch(syscall_num, a0, a1, a2, a3, a4, a5);
 }
 
 static inline uint64_t rtld_invoke(cap_t cap, uint64_t label,
@@ -342,7 +332,14 @@ typedef struct {
 #define ET_DYN   3
 
 /* ELF machine */
-#define EM_X86_64  62
+#define EM_X86_64   62
+#define EM_AARCH64  183
+
+#if defined(__x86_64__)
+#define EM_NATIVE  EM_X86_64
+#elif defined(__aarch64__)
+#define EM_NATIVE  EM_AARCH64
+#endif
 
 /* Dynamic tags */
 #define DT_NULL       0
@@ -369,15 +366,7 @@ typedef struct {
 #define DT_FINI_ARRAYSZ 28
 #define DT_GNU_HASH   0x6ffffef5
 
-/* Relocation types */
-#define R_X86_64_NONE       0
-#define R_X86_64_64         1
-#define R_X86_64_GLOB_DAT   6
-#define R_X86_64_JUMP_SLOT  7
-#define R_X86_64_RELATIVE   8
-#define R_X86_64_DTPMOD64   16
-#define R_X86_64_DTPOFF64   17
-#define R_X86_64_TPOFF64    18
+/* Relocation types — defined in arch/{x86_64,aarch64}/rtld_reloc_types.h */
 
 /* ELF macros */
 #define ELF64_R_TYPE(info) ((uint32_t)((info) & 0xFFFFFFFF))
