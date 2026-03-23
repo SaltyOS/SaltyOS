@@ -209,6 +209,97 @@ fn vspace_flags_to_prot(flags: u64) -> u8 {
     prot
 }
 
+/// Commit `count` pages starting at `offset` in a MemoryObject, trying each
+/// available untyped source (round-robin from UT_HINT). If an untyped is
+/// partially exhausted, continues with the next untyped for the remaining
+/// pages. Falls back to PMM (ut_cap=0) as a last resort.
+///
+/// Returns `(error, total_committed)`.
+///
+/// # Safety
+///
+/// Must be called from the mmsrv main loop (single-threaded access to statics).
+unsafe fn commit_mo_pages(mo_cap: Cap, offset: u64, count: u64) -> (i32, u64) {
+    unsafe {
+        let ut_count = *(&raw const UT_COUNT);
+        if ut_count == 0 {
+            // No untyped sources — fall back to PMM directly
+            return invoke::mo_commit(mo_cap, offset, count, 0);
+        }
+
+        let start = {
+            let h = *(&raw const UT_HINT);
+            if h < ut_count { h } else { 0 }
+        };
+
+        let sources = &*(&raw const UT_SOURCES);
+        let mut remaining = count;
+        let mut cur_offset = offset;
+        let mut total_committed: u64 = 0;
+
+        // First pass: from hint to end
+        for i in start..ut_count {
+            if remaining == 0 {
+                break;
+            }
+            if !sources[i].active {
+                continue;
+            }
+            let (err, committed) = invoke::mo_commit(mo_cap, cur_offset, remaining, sources[i].cap);
+            if committed > 0 {
+                total_committed += committed;
+                cur_offset += committed;
+                remaining -= committed;
+                *(&raw mut UT_HINT) = i;
+            }
+            if err != 0 && committed == 0 {
+                continue;
+            }
+            if remaining == 0 {
+                return (0, total_committed);
+            }
+        }
+
+        // Second pass: wrap around (0..start)
+        for i in 0..start {
+            if remaining == 0 {
+                break;
+            }
+            if !sources[i].active {
+                continue;
+            }
+            let (err, committed) = invoke::mo_commit(mo_cap, cur_offset, remaining, sources[i].cap);
+            if committed > 0 {
+                total_committed += committed;
+                cur_offset += committed;
+                remaining -= committed;
+                *(&raw mut UT_HINT) = i;
+            }
+            if err != 0 && committed == 0 {
+                continue;
+            }
+            if remaining == 0 {
+                return (0, total_committed);
+            }
+        }
+
+        if remaining == 0 {
+            return (0, total_committed);
+        }
+
+        // Final fallback: PMM (ut_cap=0)
+        let (err, committed) = invoke::mo_commit(mo_cap, cur_offset, remaining, 0);
+        total_committed += committed;
+        remaining -= committed;
+
+        if remaining == 0 {
+            (0, total_committed)
+        } else {
+            (err, total_committed)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Client tracking (growable, pointer-based)
 // ---------------------------------------------------------------------------
@@ -1023,12 +1114,12 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                         let page_offset = page_addr - (*region).base;
                         let mo_page_idx = (*region).mo_offset as u64 + page_offset / 4096;
                         let flags = prot_to_vspace_flags((*region).prot);
-                        let err = invoke::mo_commit(
+                        let (err, committed) = commit_mo_pages(
                             (*region).mo_cap,
                             mo_page_idx,
                             1,
                         );
-                        if err != 0 {
+                        if err != 0 || committed != 1 {
                             let mut lb = LineBuf::new();
                             lb.str(b"[MMSRV] VMFault: mo_commit failed badge=");
                             lb.hex(badge);

@@ -440,6 +440,90 @@ impl Allocator {
         best_err
     }
 
+    /// Commit `count` pages in a MemoryObject, trying each untyped source
+    /// (round-robin from `ut_hint`). On partial exhaustion of one source,
+    /// continues with the next. Falls back to PMM (ut_cap=0) as last resort.
+    ///
+    /// Returns `(error, total_committed)`.
+    pub fn commit_mo_pages(&mut self, mo_cap: Cap, offset: u64, count: u64) -> (i32, u64) {
+        if self.ut_count == 0 {
+            return besalt::invoke::mo_commit(mo_cap, offset, count, 0);
+        }
+
+        let start = if self.ut_hint < self.ut_count {
+            self.ut_hint
+        } else {
+            0
+        };
+
+        let mut remaining = count;
+        let mut cur_offset = offset;
+        let mut total_committed: u64 = 0;
+
+        // First pass: from hint to end
+        for i in start..self.ut_count {
+            if remaining == 0 {
+                break;
+            }
+            if !self.ut_sources[i].active {
+                continue;
+            }
+            let (err, committed) =
+                besalt::invoke::mo_commit(mo_cap, cur_offset, remaining, self.ut_sources[i].cap);
+            if committed > 0 {
+                total_committed += committed;
+                cur_offset += committed;
+                remaining -= committed;
+                self.ut_hint = i;
+            }
+            if err != 0 && committed == 0 {
+                continue;
+            }
+            if remaining == 0 {
+                return (0, total_committed);
+            }
+        }
+
+        // Second pass: wrap around (0..start)
+        for i in 0..start {
+            if remaining == 0 {
+                break;
+            }
+            if !self.ut_sources[i].active {
+                continue;
+            }
+            let (err, committed) =
+                besalt::invoke::mo_commit(mo_cap, cur_offset, remaining, self.ut_sources[i].cap);
+            if committed > 0 {
+                total_committed += committed;
+                cur_offset += committed;
+                remaining -= committed;
+                self.ut_hint = i;
+            }
+            if err != 0 && committed == 0 {
+                continue;
+            }
+            if remaining == 0 {
+                return (0, total_committed);
+            }
+        }
+
+        if remaining == 0 {
+            return (0, total_committed);
+        }
+
+        // Final fallback: PMM (ut_cap=0)
+        let (err, committed) = besalt::invoke::mo_commit(mo_cap, cur_offset, remaining, 0);
+        total_committed += committed;
+        remaining -= committed;
+
+        if remaining == 0 {
+            (0, total_committed)
+        } else {
+            (err, total_committed)
+        }
+    }
+
     /// Realize a core kernel object (TCB/VSpace/CNode/SchedContext) into the
     /// next available reservation slot, preferring the primary untyped source.
     pub fn realize_core_object(&mut self, obj_type: u64, size_bits: u64) -> Result<Cap, i32> {

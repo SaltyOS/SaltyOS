@@ -706,9 +706,9 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
                 }
             }
 
-            // Commit all RO pages
-            let err = besalt::invoke::mo_commit(mo_slot, 0, ro_page_count as u64);
-            if err != 0 {
+            // Commit all RO pages (try untyped sources, then PMM fallback)
+            let (err, committed) = alloc.commit_mo_pages(mo_slot, 0, ro_page_count as u64);
+            if err != 0 || committed != ro_page_count as u64 {
                 alloc.free_single_slot(mo_slot);
                 continue;
             }

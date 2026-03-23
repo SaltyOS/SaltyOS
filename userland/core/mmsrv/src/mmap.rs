@@ -95,8 +95,8 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mu
             }
 
             // Commit new pages
-            let err = invoke::mo_commit(mo_cap, existing_pages as u64, grow_pages as u64);
-            if err != 0 {
+            let (err, committed) = super::commit_mo_pages(mo_cap, existing_pages as u64, grow_pages as u64);
+            if err != 0 || committed != grow_pages as u64 {
                 (*reply).label = BESALT_OUT_OF_MEMORY;
                 return;
             }
@@ -270,8 +270,8 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const BesaltMsg, badge: u64, reply: *m
         }
 
         // Eager: commit all pages and map into client VSpace
-        let err = invoke::mo_commit(mo_cap, 0, num_pages as u64);
-        if err != 0 {
+        let (err, committed) = super::commit_mo_pages(mo_cap, 0, num_pages as u64);
+        if err != 0 || committed != num_pages as u64 {
             (*region).active = false;
             (*region).mo_cap = 0;
             super::recycled_cnode_delete(mo_cap);
@@ -534,7 +534,8 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: 
                     return;
                 }
                 // Commit pages
-                if invoke::mo_commit(mo, 0, num_pages as u64) != 0 {
+                let (commit_err, committed) = super::commit_mo_pages(mo, 0, num_pages as u64);
+                if commit_err != 0 || committed != num_pages as u64 {
                     super::recycled_cnode_delete(mo);
                     invoke::cnode_delete(super::CAP_SELF_CSPACE, caller_vspace_cap);
                     (*reply).label = BESALT_OUT_OF_MEMORY;
@@ -951,8 +952,8 @@ pub(crate) unsafe fn handle_mm_map_batch(msg: *const BesaltMsg, _caller_badge: u
         }
 
         // Commit all pages (kernel allocates physical frames)
-        let err = invoke::mo_commit(mo_cap, 0, num_pages as u64);
-        if err != 0 {
+        let (err, committed) = super::commit_mo_pages(mo_cap, 0, num_pages as u64);
+        if err != 0 || committed != num_pages as u64 {
             super::recycled_cnode_delete(mo_cap);
             (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
