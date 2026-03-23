@@ -4,7 +4,8 @@ A Unix-like microkernel operating system written in Rust, with a custom 3-stage 
 
 ## Overview
 
-SaltyOS is a capability-based microkernel designed with security and modularity as primary goals. It draws inspiration from seL4, L4, and Minix3, implementing a minimal trusted computing base with most system services running in userspace.
+SaltyOS is a capability-based microkernel designed with security and modularity as primary goals. It draws inspiration from seL4, L4, Minix3,
+and Fuchsia, implementing a minimal trusted computing base with most system services running in userspace.
 
 ### Key Features
 
@@ -246,6 +247,7 @@ See [LICENSE.md](LICENSE.md) for the full license text.
 SaltyOS draws inspiration from:
 
 - [seL4](https://sel4.systems/) - Capability system, IPC design
+- [Fuchsia](https://fuchsia.dev/) - MemoryObject design
 - [L4 family](https://en.wikipedia.org/wiki/L4_microkernel_family) - Microkernel principles
 - [Minix3](https://www.minix3.org/) - Userspace drivers
 - [Redox OS](https://www.redox-os.org/) - Rust OS development
