@@ -149,7 +149,7 @@ exception_vectors:
     .balign 128
     b       .                   // FIQ (unused)
     .balign 128
-    b       .                   // SError (TODO: handle)
+    b       el1_serror          // SError
 
     // ---- Group 2: Lower EL using AArch64 (user exceptions) ----
     .balign 128
@@ -159,7 +159,7 @@ exception_vectors:
     .balign 128
     b       .                   // FIQ (unused)
     .balign 128
-    b       .                   // SError (TODO: handle)
+    b       el0_serror          // SError
 
     // ---- Group 3: Lower EL using AArch32 (not supported) ----
     .balign 128
@@ -195,6 +195,18 @@ el0_irq:
     SAVE_REGS
     mov     x0, sp
     bl      el0_irq_handler
+    RESTORE_REGS
+
+el1_serror:
+    SAVE_REGS
+    mov     x0, sp
+    bl      el1_serror_handler
+    RESTORE_REGS
+
+el0_serror:
+    SAVE_REGS
+    mov     x0, sp
+    bl      el0_serror_handler
     RESTORE_REGS
 "#,
 );
@@ -678,6 +690,79 @@ extern "C" fn el0_sync_handler(frame: *mut ExceptionFrame) {
 #[unsafe(no_mangle)]
 extern "C" fn el0_irq_handler(frame: *const ExceptionFrame) {
     el1_irq_handler(frame);
+}
+
+/// Handle SError taken from EL1 (kernel context).
+///
+/// SErrors are asynchronous external aborts (e.g. uncorrectable bus errors,
+/// ECC failures, or MMIO faults that arrive asynchronously). These indicate
+/// unrecoverable hardware-level corruption so we dump state and panic.
+#[unsafe(no_mangle)]
+extern "C" fn el1_serror_handler(frame: *const ExceptionFrame) {
+    let esr: u64;
+    // SAFETY: Reading ESR_EL1 is always safe from EL1.
+    unsafe {
+        core::arch::asm!("mrs {}, ESR_EL1", out(reg) esr, options(nomem, nostack));
+    }
+    let f = unsafe { &*frame };
+    let iss = esr & 0x01FF_FFFF;
+    let dfsc = iss & 0x3F;
+    crate::serial_puts("[SERROR] SError from EL1\n");
+    dump_serror_state(f, esr);
+    panic!(
+        "SError (EL1): ESR={:#010x} ISS={:#09x} DFSC={:#04x} ELR={:#018x}",
+        esr, iss, dfsc, f.elr_el1,
+    );
+}
+
+/// Handle SError taken from EL0 (user context).
+///
+/// An asynchronous external abort while running user code. Dump state and
+/// retire the faulting thread via the fault handler path so the rest of
+/// the system can continue.
+#[unsafe(no_mangle)]
+extern "C" fn el0_serror_handler(frame: *const ExceptionFrame) {
+    let esr: u64;
+    // SAFETY: Reading ESR_EL1 is always safe from EL1.
+    unsafe {
+        core::arch::asm!("mrs {}, ESR_EL1", out(reg) esr, options(nomem, nostack));
+    }
+    let f = unsafe { &*frame };
+    let iss = esr & 0x01FF_FFFF;
+    let dfsc = iss & 0x3F;
+    crate::serial_puts("[SERROR] SError from EL0\n");
+    dump_serror_state(f, esr);
+    finish_el0_fault(&crate::ipc::user_exception_message(
+        0x2F, // EC for SError (synthetic — real EC field is zero for SError)
+        esr,
+        f.elr_el1,
+        f.sp_el0,
+    ));
+}
+
+/// Dump register state for SError diagnostics.
+fn dump_serror_state(f: &ExceptionFrame, esr: u64) {
+    unsafe {
+        let s = crate::SerialGuard::acquire();
+        s.puts("  ESR=");
+        s.hex(esr);
+        s.puts(" ELR=");
+        s.hex(f.elr_el1);
+        s.puts(" SPSR=");
+        s.hex(f.spsr_el1);
+        s.puts(" SP_EL0=");
+        s.hex(f.sp_el0);
+        s.puts("\n");
+        s.puts("  x0=");
+        s.hex(f.regs[0]);
+        s.puts(" x1=");
+        s.hex(f.regs[1]);
+        s.puts(" x29=");
+        s.hex(f.regs[29]);
+        s.puts(" x30=");
+        s.hex(f.regs[30]);
+        s.puts("\n");
+    }
 }
 
 // ---------------------------------------------------------------------------
