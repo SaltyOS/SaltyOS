@@ -14,14 +14,34 @@ unsafe extern "C" {
 
 #[inline]
 fn is_canonical_addr(addr: u64) -> bool {
-    let sign = (addr >> 47) & 1;
-    let upper = addr >> 48;
-    if sign == 0 { upper == 0 } else { upper == 0xFFFF }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // With the current 48-bit AArch64 split, kernel addresses live in the
+        // upper region selected by TTBR1 and carry a 0xFFFF top half. This
+        // includes both the kernel image at 0xFFFF_0000_... and the direct map
+        // at 0xFFFF_8000_....
+        return (addr >> 48) == 0xFFFF;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let sign = (addr >> 47) & 1;
+        let upper = addr >> 48;
+        return if sign == 0 { upper == 0 } else { upper == 0xFFFF };
+    }
 }
 
 #[inline]
 fn is_kernel_addr(addr: u64) -> bool {
-    is_canonical_addr(addr) && addr >= crate::mm::PHYS_MAP_OFFSET
+    #[cfg(target_arch = "aarch64")]
+    {
+        is_canonical_addr(addr)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_canonical_addr(addr) && addr >= crate::mm::PHYS_MAP_OFFSET
+    }
 }
 
 #[inline]
@@ -702,8 +722,13 @@ impl Scheduler {
         unsafe {
             self.validate_tcb_ptr(new_tcb, "switch target", cpu_id);
 
-            let rip = (*new_tcb).context.rip;
-            let rsp = (*new_tcb).context.rsp;
+            #[cfg(target_arch = "x86_64")]
+            let (resume_pc, stack_ptr) = ((*new_tcb).context.rip, (*new_tcb).context.rsp);
+            #[cfg(target_arch = "aarch64")]
+            let (resume_pc, stack_ptr) = (
+                crate::arch::aarch64::context::resume_pc(&(*new_tcb).context),
+                (*new_tcb).context.sp,
+            );
             let kstack = (*new_tcb).kernel_stack_top;
             let text_start = core::ptr::addr_of!(_text_start) as u64;
             let text_end = core::ptr::addr_of!(_text_end) as u64;
@@ -715,18 +740,18 @@ impl Scheduler {
                 );
             }
 
-            if rip < text_start || rip >= text_end {
+            if resume_pc < text_start || resume_pc >= text_end {
                 panic!(
-                    "[SCHED] switch target: RIP out of kernel .text rip=0x{:x} text=[0x{:x},0x{:x}) tcb=0x{:x} cpu={}",
-                    rip, text_start, text_end, new_tcb as u64, cpu_id
+                    "[SCHED] switch target: resume_pc out of kernel .text pc=0x{:x} text=[0x{:x},0x{:x}) tcb=0x{:x} cpu={}",
+                    resume_pc, text_start, text_end, new_tcb as u64, cpu_id
                 );
             }
-            if !is_kernel_addr(rsp) || (rsp & 0xF) != 0 {
+            if !is_kernel_addr(stack_ptr) || (stack_ptr & 0xF) != 0 {
                 panic!(
-                    "[SCHED] switch target: bad RSP=0x{:x} (kernel={} align16={}) tcb=0x{:x} cpu={}",
-                    rsp,
-                    is_kernel_addr(rsp),
-                    (rsp & 0xF) == 0,
+                    "[SCHED] switch target: bad stack_ptr=0x{:x} (kernel={} align16={}) tcb=0x{:x} cpu={}",
+                    stack_ptr,
+                    is_kernel_addr(stack_ptr),
+                    (stack_ptr & 0xF) == 0,
                     new_tcb as u64,
                     cpu_id
                 );
@@ -1165,6 +1190,16 @@ impl Scheduler {
 
             let sched_ctx = (*current).sched_context;
             if sched_ctx.is_null() {
+                // The bootstrap thread runs early kernel init before the first
+                // real task exists. A timer tick must not switch it to idle or
+                // the boot path is lost forever before `init::bootstrap()`
+                // enqueues the first user thread.
+                if is_bootstrap_tcb(current) {
+                    self.unlock();
+                    crate::mm::restore_irq(irq_flag);
+                    return;
+                }
+
                 // Idle thread — count idle tick and check if woken thread should preempt
                 self.idle_ticks[cpu_id] += 1;
                 let new_tcb = self.schedule_unlocked();

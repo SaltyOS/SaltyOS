@@ -1,7 +1,7 @@
 # SaltyOS Getty Build (Rust)
 # SPDX-License-Identifier: GPL-2.0-only
 
-getty_link = meson.current_source_dir() / 'link.ld'
+getty_link = meson.current_source_dir() / 'arch' / arch / 'link.ld'
 
 # Step 1: Rust -> .o
 getty_obj = custom_target('getty_obj',
@@ -29,7 +29,6 @@ getty_elf = custom_target('getty_elf',
     '--target=' + c_target,
     '-nostdlib', '-nostartfiles', '-ffreestanding',
     '-fno-stack-protector',
-    '-mno-red-zone',
     '-T', getty_link,
     '-L', libbesalt_build_dir,
     '-L', besaltc_build_dir,

@@ -11,6 +11,7 @@ const DNS_SERVER_IP: u32 = 0x0A00_0203; // 10.0.2.3 (QEMU DNS forwarder)
 const DNS_PORT: u16 = 53;
 const MAX_DNS_RESULTS: usize = 4;
 const DNS_TIMEOUT_NS: u64 = 3_000_000_000; // 3 seconds per attempt
+const ARP_RETRY_NS: u64 = 200_000_000; // 200ms — short retry when waiting for ARP
 const DNS_MAX_RETRIES: usize = 2; // total 3 attempts
 const DNS_MAX_QUERY_LEN: usize = 288; // 12 header + 256 max qname + 4 qtype/qclass + padding
 const DNS_MAX_RESPONSE_LEN: usize = 512; // RFC 1035 UDP limit
@@ -676,11 +677,13 @@ fn push_completion(c: DnsCompletion) {
     }
 }
 
-fn send_query_for_slot(slot: &PendingDns) {
+/// Send the DNS query for a pending slot. Returns true if the UDP packet
+/// was actually sent, false if blocked on ARP resolution.
+fn send_query_for_slot(slot: &PendingDns) -> bool {
     // SAFETY: Single-threaded server; DNS_SOCKET_ID set during init.
     let socket_id = unsafe { *(&raw const DNS_SOCKET_ID) };
     if socket_id < 0 {
-        return;
+        return false;
     }
 
     let mut query_buf = [0u8; DNS_MAX_QUERY_LEN];
@@ -691,15 +694,15 @@ fn send_query_for_slot(slot: &PendingDns) {
     if query_len > 0 {
         let next_hop = super::ipv4::route(DNS_SERVER_IP);
         if super::arp::lookup(next_hop).is_none() {
-            // ARP entry missing — send request and skip this attempt.
-            // The retry timer will re-invoke send_query_for_slot after
-            // the ARP reply has been processed by the event loop.
+            // ARP entry missing — send request; caller will use a short
+            // retry deadline instead of the full DNS_TIMEOUT_NS.
             let our_mac = crate::mac_addr();
             super::arp::request(&our_mac, super::ipv4::OUR_IP, next_hop);
-            return;
+            return false;
         }
         super::udp::udp_sendto(socket_id as u32, &query_buf[..query_len], DNS_SERVER_IP, DNS_PORT);
     }
+    true
 }
 
 /// Begin an async A-record resolution. Saves the caller's reply cap and
@@ -728,11 +731,6 @@ pub(crate) fn start_resolve(hostname: &[u8]) -> Option<u64> {
         return None;
     }
 
-    // Send the first query
-    let our_mac = crate::mac_addr();
-    super::ensure_arp(&our_mac, super::ipv4::OUR_IP, DNS_SERVER_IP);
-    super::udp::udp_sendto(socket_id as u32, &query_buf[..query_len], DNS_SERVER_IP, DNS_PORT);
-
     let now = clock_monotonic_ns();
 
     // SAFETY: Single-threaded server.
@@ -749,8 +747,11 @@ pub(crate) fn start_resolve(hostname: &[u8]) -> Option<u64> {
         slot.ptr_ip = 0;
         slot.txn_id = txn_id;
         slot.attempt = 0;
-        slot.deadline_ns = now + DNS_TIMEOUT_NS;
         slot.reply_cap_slot = reply_cap_slot;
+
+        // Send the first query; use short deadline if blocked on ARP
+        let sent = send_query_for_slot(slot);
+        slot.deadline_ns = now + if sent { DNS_TIMEOUT_NS } else { ARP_RETRY_NS };
     }
 
     Some(reply_cap_slot)
@@ -780,10 +781,6 @@ pub(crate) fn start_resolve_ptr(ip: u32) -> Option<u64> {
         return None;
     }
 
-    let our_mac = crate::mac_addr();
-    super::ensure_arp(&our_mac, super::ipv4::OUR_IP, DNS_SERVER_IP);
-    super::udp::udp_sendto(socket_id as u32, &query_buf[..query_len], DNS_SERVER_IP, DNS_PORT);
-
     let now = clock_monotonic_ns();
 
     // SAFETY: Single-threaded server.
@@ -796,11 +793,34 @@ pub(crate) fn start_resolve_ptr(ip: u32) -> Option<u64> {
         slot.ptr_ip = ip;
         slot.txn_id = txn_id;
         slot.attempt = 0;
-        slot.deadline_ns = now + DNS_TIMEOUT_NS;
         slot.reply_cap_slot = reply_cap_slot;
+
+        let sent = send_query_for_slot(slot);
+        slot.deadline_ns = now + if sent { DNS_TIMEOUT_NS } else { ARP_RETRY_NS };
     }
 
     Some(reply_cap_slot)
+}
+
+/// Called when the ARP cache is updated. Immediately sends any pending
+/// DNS queries that were blocked waiting for ARP resolution.
+pub(crate) fn flush_arp_waiters() {
+    // SAFETY: Single-threaded server.
+    unsafe {
+        let pending = &raw mut PENDING;
+        let now = clock_monotonic_ns();
+        let mut i = 0;
+        while i < MAX_PENDING_DNS {
+            if (*pending)[i].active {
+                let sent = send_query_for_slot(&(*pending)[i]);
+                if sent {
+                    // Query went out — set a real DNS timeout from now
+                    (*pending)[i].deadline_ns = now + DNS_TIMEOUT_NS;
+                }
+            }
+            i += 1;
+        }
+    }
 }
 
 /// Process pending DNS queries: drain the DNS UDP socket for responses,
@@ -917,11 +937,16 @@ pub(crate) fn process_pending() {
         while i < MAX_PENDING_DNS {
             if (*pending)[i].active && now >= (*pending)[i].deadline_ns {
                 if (*pending)[i].attempt < DNS_MAX_RETRIES {
-                    // Retry with new txn_id
-                    (*pending)[i].attempt += 1;
-                    (*pending)[i].txn_id = generate_txn_id();
-                    (*pending)[i].deadline_ns = now + DNS_TIMEOUT_NS;
-                    send_query_for_slot(&(*pending)[i]);
+                    let sent = send_query_for_slot(&(*pending)[i]);
+                    if sent {
+                        // Query actually went out — count as a real attempt
+                        (*pending)[i].attempt += 1;
+                        (*pending)[i].txn_id = generate_txn_id();
+                        (*pending)[i].deadline_ns = now + DNS_TIMEOUT_NS;
+                    } else {
+                        // Blocked on ARP — short retry, don't burn an attempt
+                        (*pending)[i].deadline_ns = now + ARP_RETRY_NS;
+                    }
                 } else {
                     // All retries exhausted: timeout
                     push_completion(DnsCompletion {

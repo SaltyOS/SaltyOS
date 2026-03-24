@@ -117,6 +117,10 @@ fn cross_env(
     vars.insert("CC".to_string(), env.cc.clone());
     vars.insert("CXX".to_string(), env.cxx.clone());
     vars.insert("CFLAGS".to_string(), env.cflags.clone());
+    // Autotools preprocessor probes often run $CPP directly without
+    // appending $CFLAGS, so bake target/sysroot flags into CPP/CXXCPP.
+    vars.insert("CPP".to_string(), format!("{} {} -E", env.cc, env.cflags));
+    vars.insert("CXXCPP".to_string(), format!("{} {} -E", env.cxx, env.cflags));
     vars.insert("LDFLAGS".to_string(), env.ldflags.clone());
     vars.insert("LIBS".to_string(), env.libs.clone());
     vars.insert("AR".to_string(), env.ar.clone());

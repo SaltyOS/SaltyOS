@@ -87,64 +87,12 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             b"[PROCMGR] FORK: signal ntfn alloc failed\n"
         );
 
-        // Walk parent VSpace again and copy pages
-        let mut walk_start: u64 = 0;
-        let child_entry_page = child_entry & !0xFFFu64;
-        let mut child_entry_path: u64 = 0;
-
-        loop {
-            let err = besalt::invoke::vspace_walk(parent_vs, walk_start, super::VSPACE_WALK_BATCH);
-            if err != 0 {
-                break;
-            }
-            let Some((count, next_addr)) = besalt::invoke::vspace_walk_result_header() else {
-                break;
-            };
-            if count == 0 {
-                break;
-            }
-
-            for i in 0..count as usize {
-                let Some((page_vaddr, _, _)) = besalt::invoke::vspace_walk_result_entry(i) else {
-                    break;
-                };
-                if page_vaddr == parent_layout.ipc_buf.base {
-                    continue;
-                }
-
-                let cerr = besalt::invoke::vspace_clone_cow_page(
-                    parent_vs, page_vaddr, child_vs, page_vaddr,
-                );
-                if cerr != 0 {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[PROCMGR] FORK: clone_cow failed at ");
-                    lb.hex(page_vaddr);
-                    lb.str(b" err=");
-                    lb.hex(cerr as u64);
-                    lb.str(b"\n");
-                    lb.flush();
-                    alloc.rollback();
-                    reply.label = super::BESALT_INVALID_OPERATION;
-                    return;
-                }
-
-                if page_vaddr == child_entry_page {
-                    child_entry_path = 3; // COW clone
-                }
-            }
-
-            if next_addr == 0 {
-                break;
-            }
-            walk_start = next_addr;
-        }
-
-        if child_entry_path != 3 {
-            super::puts(b"[PROCMGR] FORK: child entry page missing after COW clone\n");
-            alloc.rollback();
-            reply.label = super::BESALT_INVALID_OPERATION;
-            return;
-        }
+        // Per-page COW cloning is now handled by mmsrv via MM_FORK_REGIONS.
+        // mmsrv uses MO_CLONE for MemoryObject-backed regions, which creates
+        // a hidden page node that safely shares physical pages between parent
+        // and child without the cap-refcount/frame-lifetime mismatch.
+        // For legacy (non-MO) regions, mmsrv falls back to per-page
+        // vspace_clone_cow_page internally.
 
         // Mint mmsrv EP into child CNode slot 7 (badged with child pid)
         let err = besalt::invoke::cnode_mint(
@@ -539,7 +487,7 @@ unsafe fn abort_destroyed_exec(
         lb.flush();
 
         super::vfs_load::cleanup_exec_source(vfs_source);
-        super::signal::terminate_proc(idx, super::PM_SIGKILL);
+        let _ = super::signal::terminate_proc(idx, super::PM_SIGKILL);
         reply.label = 0;
     }
 }

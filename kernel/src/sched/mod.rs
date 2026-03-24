@@ -14,7 +14,7 @@ pub use thread::Tcb;
 
 use crate::arch;
 use crate::arch::MAX_CPUS;
-use crate::mm::{alloc_frame, phys_to_virt, PAGE_SIZE};
+use crate::mm::{pmm_alloc, frame::FrameOwner, frame::KernelMetaKind, phys_to_virt, PAGE_SIZE};
 
 /// Idle thread stack size
 const IDLE_STACK_SIZE: usize = PAGE_SIZE;
@@ -97,12 +97,23 @@ pub fn init() {
 
     // Initialize thread context
     unsafe {
-        (*idle_tcb).context.rip = idle_thread as *const () as u64;
-        (*idle_tcb).context.rsp = stack_top;
+        #[cfg(target_arch = "x86_64")]
+        {
+            (*idle_tcb).context.rip = idle_thread as *const () as u64;
+            (*idle_tcb).context.rsp = stack_top;
+            (*idle_tcb).context.rflags = 0x202;
+            (*idle_tcb).context.cs = 0x08;
+            (*idle_tcb).context.ss = 0x10;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::arch::aarch64::context::init_kernel_thread_context(
+                &mut (*idle_tcb).context,
+                stack_top,
+                idle_thread as *const () as u64,
+            );
+        }
         (*idle_tcb).kernel_stack_top = stack_top;
-        (*idle_tcb).context.rflags = 0x202; // Interrupts enabled
-        (*idle_tcb).context.cs = 0x08; // Kernel code segment
-        (*idle_tcb).context.ss = 0x10; // Kernel data segment
     }
 
     // Set bootstrap as current thread (not idle!)
@@ -136,12 +147,23 @@ pub fn init_cpu(cpu_id: usize) {
     let stack_top = idle_stack + IDLE_STACK_SIZE as u64;
 
     unsafe {
-        (*idle_tcb).context.rip = idle_thread as *const () as u64;
-        (*idle_tcb).context.rsp = stack_top;
+        #[cfg(target_arch = "x86_64")]
+        {
+            (*idle_tcb).context.rip = idle_thread as *const () as u64;
+            (*idle_tcb).context.rsp = stack_top;
+            (*idle_tcb).context.rflags = 0x202;
+            (*idle_tcb).context.cs = 0x08;
+            (*idle_tcb).context.ss = 0x10;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::arch::aarch64::context::init_kernel_thread_context(
+                &mut (*idle_tcb).context,
+                stack_top,
+                idle_thread as *const () as u64,
+            );
+        }
         (*idle_tcb).kernel_stack_top = stack_top;
-        (*idle_tcb).context.rflags = 0x202; // Interrupts enabled
-        (*idle_tcb).context.cs = 0x08; // Kernel code segment
-        (*idle_tcb).context.ss = 0x10; // Kernel data segment
     }
 
     scheduler().set_idle(cpu_id, idle_tcb);
@@ -165,7 +187,7 @@ unsafe fn allocate_idle_tcb(cpu_id: usize) -> *mut Tcb {
 ///
 /// Allocates a physical frame and returns its virtual address.
 unsafe fn allocate_idle_stack() -> u64 {
-    let phys = match alloc_frame() {
+    let phys = match pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::KernelStack }) {
         Some(p) => p,
         None => {
             // Halt on allocation failure - no memory available

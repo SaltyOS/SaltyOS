@@ -9,6 +9,7 @@
 
 static uint32_t print_targets = 0;
 
+#if defined(__x86_64__) || defined(__i386__)
 /* x86 I/O port operations */
 static inline void outb(uint16_t port, uint8_t value)
 {
@@ -21,10 +22,25 @@ static inline uint8_t inb(uint16_t port)
     __asm__ volatile("inb %1, %0" : "=a"(value) : "Nd"(port));
     return value;
 }
+#elif defined(__aarch64__)
+/* PL011 UART at QEMU virt base */
+#define PL011_BASE  0x09000000UL
+#define PL011_DR    (*(volatile uint32_t *)(PL011_BASE + 0x000))
+#define PL011_FR    (*(volatile uint32_t *)(PL011_BASE + 0x018))
+#define PL011_FR_TXFF  (1 << 5)
+
+static inline void outb(uint16_t port, uint8_t value) { (void)port; (void)value; }
+static inline uint8_t inb(uint16_t port) { (void)port; return 0; }
+#endif
 
 /* Serial port implementation */
 void serial_init(void)
 {
+#if defined(__aarch64__)
+    /* PL011 is initialized by UEFI firmware on QEMU virt */
+    return;
+#endif
+#if defined(__x86_64__) || defined(__i386__)
     /* Disable interrupts */
     outb(COM1_PORT + 1, 0x00);
 
@@ -53,18 +69,27 @@ void serial_init(void)
 
     /* Set normal operation mode */
     outb(COM1_PORT + 4, 0x0F);
+#endif /* x86 */
 }
 
+#if defined(__x86_64__) || defined(__i386__)
 static int serial_is_transmit_empty(void)
 {
     return inb(COM1_PORT + 5) & 0x20;
 }
+#endif
 
 void serial_putc(char c)
 {
+#if defined(__x86_64__) || defined(__i386__)
     while (!serial_is_transmit_empty())
         ;
     outb(COM1_PORT, c);
+#elif defined(__aarch64__)
+    while (PL011_FR & PL011_FR_TXFF)
+        ;
+    PL011_DR = (uint32_t)(unsigned char)c;
+#endif
 }
 
 /* VGA text mode implementation */

@@ -516,10 +516,18 @@ pub(crate) unsafe fn urandom_init() {
         // Fallback: TSC + clock (original method)
         let mut ts = Timespec::zeroed();
         besalt::syscall::syscall(SYS_CLOCK_GETTIME, 0, &raw mut ts as u64, 0, 0, 0, 0);
-        let tsc_lo: u32;
-        let tsc_hi: u32;
-        core::arch::asm!("rdtsc", out("eax") tsc_lo, out("edx") tsc_hi);
-        let tsc: u64 = (tsc_hi as u64) << 32 | tsc_lo as u64;
+        let tsc: u64;
+        #[cfg(target_arch = "x86_64")]
+        {
+            let tsc_lo: u32;
+            let tsc_hi: u32;
+            core::arch::asm!("rdtsc", out("eax") tsc_lo, out("edx") tsc_hi);
+            tsc = (tsc_hi as u64) << 32 | tsc_lo as u64;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) tsc);
+        }
         URANDOM_S0 = ts.tv_nsec ^ tsc;
         URANDOM_S1 = ts
             .tv_sec
@@ -748,41 +756,8 @@ unsafe fn init_ramfs() {
 // ======================================================================
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     puts(b"[VFS] SaltyOS VFS server starting\n");
-
-    let err = besalt::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
-    if err != 0 {
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS] FAIL: set IPC buffer err=");
-            lb.hex(err as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
-        idle();
-    }
-    unsafe {
-        ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
-    }
-
-    puts(b"[VFS] IPC buffer ready\n");
-
-    unsafe {
-        let base = *(&raw const besalt::__besalt_slot_base);
-        let count = *(&raw const besalt::__besalt_slot_count);
-        let cspace_ntfn = *(&raw const besalt::__besalt_cspace_ntfn);
-        if base != 0 {
-            besalt::slot_alloc::slot_alloc_init(base, count, cspace_ntfn);
-        } else {
-            puts(b"[VFS] FATAL: slot pool not provided by RTLD/auxv\n");
-            idle();
-        }
-    }
-
-    unsafe {
-        besalt::posix_mm::posix_mm_init(VFS_CAP_MMSRV_EP);
-    }
 
     unsafe {
         let derr = init_dynamic_state_storage();

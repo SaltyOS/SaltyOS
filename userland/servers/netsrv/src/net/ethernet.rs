@@ -4,6 +4,7 @@
 pub(crate) const ETHERTYPE_ARP: u16 = 0x0806;
 pub(crate) const ETHERTYPE_IPV4: u16 = 0x0800;
 pub(crate) const ETH_HEADER_LEN: usize = 14;
+pub(crate) const ETH_MIN_FRAME_LEN: usize = 60; // Excludes the on-wire FCS
 pub(crate) const BROADCAST_MAC: [u8; 6] = [0xFF; 6];
 
 pub(crate) struct EthHeader {
@@ -40,7 +41,8 @@ pub(crate) fn build(
     payload: &[u8],
     buf: &mut [u8],
 ) -> usize {
-    let total = ETH_HEADER_LEN + payload.len();
+    let payload_len = core::cmp::max(payload.len(), ETH_MIN_FRAME_LEN - ETH_HEADER_LEN);
+    let total = ETH_HEADER_LEN + payload_len;
     if buf.len() < total {
         return 0;
     }
@@ -49,7 +51,10 @@ pub(crate) fn build(
     buf[6..12].copy_from_slice(&src);
     buf[12] = (ethertype >> 8) as u8;
     buf[13] = ethertype as u8;
-    buf[ETH_HEADER_LEN..total].copy_from_slice(payload);
+    buf[ETH_HEADER_LEN..ETH_HEADER_LEN + payload.len()].copy_from_slice(payload);
+    if payload_len > payload.len() {
+        buf[ETH_HEADER_LEN + payload.len()..total].fill(0);
+    }
 
     total
 }

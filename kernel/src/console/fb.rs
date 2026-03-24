@@ -5,8 +5,12 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use crate::arch::x86_64::paging::{read_cr3, write_cr3, PageFlags, PageTable};
-use crate::mm::{alloc_frame, phys_to_virt, PAGE_SIZE};
+use crate::arch::paging::{PageFlags, PageTable};
+#[cfg(target_arch = "aarch64")]
+use crate::arch::paging::flush_tlb_all;
+#[cfg(target_arch = "x86_64")]
+use crate::arch::paging::write_cr3;
+use crate::mm::{pmm_alloc, frame::FrameOwner, frame::KernelMetaKind, phys_to_virt, PAGE_SIZE};
 use crate::FramebufferInfo;
 
 /// Kernel VA for framebuffer mapping (PML4[257])
@@ -30,14 +34,17 @@ pub unsafe fn map_framebuffer(fb_info: &FramebufferInfo) -> Option<*mut u8> {
     let fb_size = fb_info.height as u64 * fb_info.pitch as u64;
     let num_pages = ((fb_size + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64) as usize;
 
-    let cr3 = read_cr3();
-    let pml4 = unsafe { &mut *(phys_to_virt(cr3) as *mut PageTable) };
+    let kernel_root = crate::mm::vspace::kernel_vspace_root();
+    if kernel_root == 0 {
+        return None;
+    }
+    let pml4 = unsafe { &mut *(phys_to_virt(kernel_root) as *mut PageTable) };
 
     // PML4 index 257 for 0xFFFF_8080_0000_0000
     let pml4_idx = ((FB_KERNEL_VA >> 39) & 0x1FF) as usize;
 
     // Allocate and install PDPT at PML4[257]
-    let pdpt_phys = alloc_frame()?;
+    let pdpt_phys = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable })?;
     unsafe {
         core::ptr::write_bytes(phys_to_virt(pdpt_phys) as *mut u8, 0, PAGE_SIZE);
     }
@@ -47,7 +54,7 @@ pub unsafe fn map_framebuffer(fb_info: &FramebufferInfo) -> Option<*mut u8> {
     let pdpt = unsafe { &mut *(phys_to_virt(pdpt_phys) as *mut PageTable) };
 
     // PDPT index 0 (we only need the first GB entry)
-    let pd_phys = alloc_frame()?;
+    let pd_phys = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable })?;
     unsafe {
         core::ptr::write_bytes(phys_to_virt(pd_phys) as *mut u8, 0, PAGE_SIZE);
     }
@@ -69,7 +76,7 @@ pub unsafe fn map_framebuffer(fb_info: &FramebufferInfo) -> Option<*mut u8> {
 
     let mut pages_mapped = 0;
     for pt_idx in 0..num_pts {
-        let pt_phys = alloc_frame()?;
+        let pt_phys = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable })?;
         unsafe {
             core::ptr::write_bytes(phys_to_virt(pt_phys) as *mut u8, 0, PAGE_SIZE);
         }
@@ -87,10 +94,13 @@ pub unsafe fn map_framebuffer(fb_info: &FramebufferInfo) -> Option<*mut u8> {
         }
     }
 
-    // Flush TLB
+    #[cfg(target_arch = "x86_64")]
     unsafe {
-        write_cr3(cr3);
+        write_cr3(kernel_root);
     }
+
+    #[cfg(target_arch = "aarch64")]
+    flush_tlb_all();
 
     Some(FB_KERNEL_VA as *mut u8)
 }

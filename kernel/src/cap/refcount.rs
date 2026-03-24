@@ -72,16 +72,35 @@ unsafe fn destroy_object(obj: *mut KernelObject, obj_type: ObjectType) {
             }
 
             ObjectType::Untyped => {
-                // Untyped memory freed back to frame allocator
                 let untyped = &mut *(obj as *mut super::untyped::UntypedMemory);
                 let size_bytes = untyped.size_bytes();
-                crate::mm::free_frames(untyped.phys_addr, size_bytes);
+                let num_frames = (size_bytes + crate::mm::PAGE_SIZE - 1) / crate::mm::PAGE_SIZE;
+                for i in 0..num_frames {
+                    let addr = untyped.phys_addr + (i * crate::mm::PAGE_SIZE) as u64;
+                    crate::mm::pmm_free(addr, &crate::mm::frame::FrameOwner::KernelPrivate {
+                        subkind: crate::mm::frame::KernelMetaKind::General,
+                    });
+                }
             }
 
             ObjectType::Frame => {
-                // Frame object ownership is released independently of mappings.
+                // Frame objects are being phased out in favor of MO.
+                // Free the underlying frame(s) back to PMM.
                 let frame = &mut *(obj as *mut super::untyped::FrameObject);
-                crate::mm::release_frame_object(frame.phys_addr, frame.size_bits);
+                let bits = if frame.size_bits < 12 { 12 } else { frame.size_bits };
+                let pages = 1usize << (bits as usize - 12);
+                for i in 0..pages {
+                    let addr = frame.phys_addr + (i * crate::mm::PAGE_SIZE) as u64;
+                    crate::mm::pmm_free(addr, &crate::mm::frame::FrameOwner::KernelPrivate {
+                        subkind: crate::mm::frame::KernelMetaKind::General,
+                    });
+                }
+            }
+
+            ObjectType::MemoryObject => {
+                // SAFETY: obj was validated as MemoryObject type above.
+                let mo = &mut *(obj as *mut super::memory_object::MemoryObject);
+                mo.destroy();
             }
 
             ObjectType::CNode => {

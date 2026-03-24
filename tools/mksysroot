@@ -42,6 +42,7 @@ def copy_file(src, dst, verbose):
         print(f"  {src} -> {dst}")
 
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Collect SaltyOS build outputs into a cross-compilation sysroot"

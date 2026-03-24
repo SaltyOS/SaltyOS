@@ -67,12 +67,19 @@ impl BuildEnv {
             }
         };
 
+        // Detect target architecture from SALTYOS_ARCH env or build dir name.
+        let arch = std::env::var("SALTYOS_ARCH").unwrap_or_else(|_| {
+            let dir_name = build_dir.file_name().unwrap_or_default().to_string_lossy();
+            if dir_name.contains("aarch64") { "aarch64".to_string() }
+            else { "x86_64".to_string() }
+        });
+        let target_triple = format!("{arch}-unknown-saltyos");
+
         // CFLAGS: the driver auto-injects system includes from the sysroot.
         // -fno-builtin omitted: autotools needs builtin recognition for function checks.
-        // -fPIC is implied by --target=x86_64-unknown-saltyos.
         let cflags = format!(
             "-fno-stack-protector \
-             --target=x86_64-unknown-saltyos \
+             --target={target_triple} \
              --sysroot={sysroot}",
             sysroot = sysroot_dir.display(),
         );
@@ -80,7 +87,7 @@ impl BuildEnv {
         // LDFLAGS: the driver auto-injects crt_start.o, -lc, -lbesalt, core.o,
         // compiler_builtins.o, and the PIE linker script from the sysroot.
         let ldflags = format!(
-            "--target=x86_64-unknown-saltyos \
+            "--target={target_triple} \
              --sysroot={sysroot}",
             sysroot = sysroot_dir.display(),
         );
@@ -97,10 +104,8 @@ impl BuildEnv {
             ar: "llvm-ar".to_string(),
             ranlib: "llvm-ranlib".to_string(),
             strip: "llvm-strip".to_string(),
-            // Autotools' config.sub does not know "saltyos" yet. Use a canonical
-            // host tuple for configure while keeping the real target in CC/CFLAGS.
-            autotools_host: "x86_64-unknown-elf".to_string(),
-            salty_host: "x86_64-unknown-saltyos".to_string(),
+            autotools_host: target_triple.clone(),
+            salty_host: target_triple,
             salty_inc,
             sysroot_dir,
             toolchain_prefix,

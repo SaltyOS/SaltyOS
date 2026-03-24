@@ -1,739 +1,872 @@
 # Memory Management Design
 
-This document describes the memory management subsystem of SaltyOS.
+## Philosophy
 
-## Overview
+> **PMM** manages kernel-internal metadata pages. **Untyped** is the
+> primary source of user data pages. MO **borrows** frames from either
+> pool and gives them meaning for userspace. VSpace is an **observer**
+> that temporarily views MO's pages.
 
-SaltyOS memory management follows the capability-based model:
+SaltyOS memory management combines seL4-style capability authority with
+Zircon-style virtual memory objects:
 
-- **Untyped Memory**: Raw physical memory, the source of all objects
-- **Frames**: 4KB physical pages that can be mapped
-- **VSpace**: Virtual address space (page table hierarchy, including intermediate levels PML4/PDPT/PD/PT on x86_64)
+- **PMM**: Kernel-internal frame allocator. Provides page table pages,
+  radix tree nodes, maple tree nodes, kernel stacks, and other kernel
+  metadata. ~1/8 of physical RAM. Not for user data.
+- **Untyped**: Raw physical memory, the source of kernel objects (seL4)
+  **and MO data pages**. ~7/8 of physical RAM. `MO_COMMIT` with a
+  non-zero `ut_cap` carves page-sized frames directly from the untyped's
+  watermark. Decommitted frames go to a per-untyped free list for reuse.
+- **MemoryObject (MO)**: Borrows frames from untyped (preferred) or PMM
+  (fallback) and gives them meaning for userspace. Tracks pages via
+  4-level radix tree with per-page backing tags (bit 0 = untyped-backed).
+  Maintains reverse mappings to every VSpace that observes its pages.
+- **VSpace**: Observes MO pages through mappings. Owns nothing. Uses a
+  Maple tree to track virtual address regions.
 
-Page tables are managed internally by VSpace operations -- there is no separate `PageTable` kernel object type. All memory access requires appropriate capabilities.
+### Invariants
 
-## Physical Memory Management
+These three statements must hold at all times. Code that violates any of
+them must not be merged.
 
-Physical frame allocation uses a bitmap-based PMM (`mm/frame.rs`), not a buddy
-allocator or slab allocator. Each bit represents one 4KB frame. The bitmap is
-a fixed-size static array sized for the maximum supported physical memory.
+> 1. Every physical frame has exactly one `FrameOwner` at all times.
+> 2. Every change to a frame's owner state must occur through PMM APIs (`alloc`, `free`, or `transfer`).
+> 3. Userspace never observes raw frames — only MO capabilities.
 
-### Memory Map from Bootloader
+---
+
+## Layer Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│                  Userspace                      │
+│  mmsrv · procmgr · application processes        │
+├──────────────── capability boundary ────────────┤
+│                                                 │
+│   VSpace          MemoryObject       Untyped    │
+│   (observer)      (page manager)     (objects)  │
+│       │                │                 │      │
+│       │    reverse     │    loan/return  │      │
+│       └── maps ────────┤                 │      │
+│                        │                 │      │
+│   ┌────────────────────┴─────────────────┘      │
+│   │              PMM                            │
+│   │     (sole physical frame owner)             │
+│   │     FrameOwner tags · bitmap allocator      │
+│   └─────────────────────────────────────────────┤
+│                                                 │
+│            NodeAllocator trait                  │
+│   (generic page-granular allocator interface)   │
+│   PMM implements it; test harness can inject    │
+│   a static bump allocator instead               │
+└─────────────────────────────────────────────────┘
+```
+
+---
+
+## PMM Layer (`mm/frame.rs`)
+
+Physical frame allocation and deallocation. The only entry point for
+obtaining and releasing physical pages in the entire kernel.
+
+### FrameOwner
+
+Every 4KB frame has a metadata entry tracking its current owner:
+
+**Semantic type** — used in PMM APIs for type-safe ownership transfer:
 
 ```rust
-/// Memory region types
-#[repr(u32)]
-pub enum MemoryType {
-    Usable = 1,
-    Reserved = 2,
-    AcpiReclaimable = 3,
-    AcpiNvs = 4,
-    BadMemory = 5,
-    Bootloader = 1000,
-    Kernel = 1001,
-    Framebuffer = 1002,
+enum FrameOwner {
+    Free,
+    /// User-visible data page owned by an MO.
+    MoData { mo: *mut MemoryObject, page_idx: u32 },
+    /// MO-internal metadata page (radix tree node, reverse map overflow).
+    MoMeta { mo: *mut MemoryObject, subkind: MoMetaKind },
+    /// Kernel-private page (page tables, kernel stacks, Maple tree nodes).
+    KernelPrivate { subkind: KernelMetaKind },
+    /// File-backed page cache entry (future).
+    PageCache,
+    /// Reserved pool — never reclaimed except under catastrophic OOM.
+    EmergencyReserve,
 }
 
-/// Memory region descriptor
+enum MoMetaKind { Radix = 0, Rmap = 1 }
+enum KernelMetaKind { PageTable = 0, KernelStack = 1, MapleNode = 2 }
+```
+
+**Storage representation** — packed into a fixed-size per-frame array
+for cache efficiency. The PMM provides `FrameMeta::to_owner()` and
+`FrameMeta::set_owner()` to convert between the two representations:
+
+```rust
 #[repr(C)]
-pub struct MemoryRegion {
-    pub base: PhysAddr,
-    pub size: usize,
-    pub mem_type: MemoryType,
+struct FrameMeta {
+    owner_tag: u8,       // FrameOwner discriminant
+    subkind: u8,         // MoMetaKind or KernelMetaKind (0 if N/A)
+    map_count: u8,       // number of VSpaces mapping this frame (Layer 2 rmap)
+    flags: u8,           // DIRTY | REFERENCED | PINNED
+    page_idx: u32,       // valid when owner_tag == MoData
+    owner_ptr: u64,      // *mut MemoryObject (MoData/MoMeta), 0 otherwise
 }
-
-/// Boot memory map
-pub struct MemoryMap {
-    pub regions: &'static [MemoryRegion],
-}
+// 16 bytes per frame
+// 512 MB RAM → 131K frames × 16 = 2 MB metadata
 ```
 
-### Untyped Memory
-
-Untyped memory is the root of all kernel objects:
+### Allocation API
 
 ```rust
-/// Untyped memory region
-pub struct Untyped {
-    /// Physical base address
-    base: PhysAddr,
-    
-    /// Size in bytes (always power of 2)
-    size: usize,
-    
-    /// Current allocation watermark
-    watermark: usize,
-    
-    /// Is this device memory (uncacheable)?
-    is_device: bool,
-    
-    /// Children tracked via Capability Derivation Tree (CDT)
-    /// -- no Vec/heap; parent-child links are embedded in capabilities
-}
+impl Pmm {
+    /// Allocate a frame with mandatory ownership declaration.
+    /// Returns `None` if the free pool (and emergency reserve) is exhausted.
+    fn alloc(&mut self, owner: FrameOwner) -> Option<PhysAddr>;
 
-impl Untyped {
-    /// Remaining free bytes
-    pub fn free_bytes(&self) -> usize {
-        self.size - self.watermark
-    }
-    
-    /// Retype to create a kernel object.
-    /// Called via Untyped_Retype invocation (label 0x20).
-    /// The new object is initialized in-place at the watermark offset.
-    /// The caller provides a destination CNode slot; the kernel writes
-    /// a capability for the new object into that slot.
-    pub fn retype(
-        &mut self,
-        object_type: CapType,
-        size_bits: u8,
-        dest_cnode: *mut CNode,
-        dest_index: usize,
-        dest_depth: u8,
-    ) -> Result<(), MemError> {
-        let obj_size = object_size(object_type, size_bits);
+    /// Free a frame. Panics if `expected_owner` does not match the
+    /// current tag — catches double-free and use-after-free.
+    fn free(&mut self, addr: PhysAddr, expected_owner: FrameOwner);
 
-        // Alignment check
-        let aligned_watermark = align_up(self.watermark, obj_size);
+    /// Transfer ownership between non-Free states (e.g., MoData → MoData
+    /// when migrating a page between MOs). Panics on tag mismatch.
+    /// Free ↔ allocated transitions use `alloc`/`free` instead.
+    fn transfer(&mut self, addr: PhysAddr, old: FrameOwner, new: FrameOwner);
 
-        if aligned_watermark + obj_size > self.size {
-            return Err(MemError::InsufficientMemory);
-        }
-
-        let phys = self.base + aligned_watermark;
-        // SAFETY: phys points to zeroed memory within the untyped region
-        let obj_ptr = create_object_at(object_type, phys, size_bits)?;
-
-        // Install capability into destination CNode slot
-        install_cap(dest_cnode, dest_index, dest_depth, object_type, obj_ptr)?;
-
-        self.watermark = aligned_watermark + obj_size;
-        Ok(())
-    }
+    /// Reverse lookup: given a physical address, return the owner.
+    /// O(1) via per-frame metadata array. Used by COW fast-path.
+    fn lookup(&self, addr: PhysAddr) -> &FrameMeta;
 }
 ```
 
-### Object Sizes
+---
+
+## NodeAllocator Trait (`mm/node_alloc.rs`)
+
+Generic page-granular allocator interface used by Maple tree and radix
+tree. Decouples data structure code from the PMM, enabling:
+
+- Kernel: inject PMM as the allocator
+- Tests: inject a static bump allocator (host `cargo test` without PMM)
 
 ```rust
-/// Get size of a kernel object type
-pub fn object_size(obj_type: CapType, size_bits: u8) -> usize {
-    match obj_type {
-        CapType::Endpoint => size_of::<Endpoint>(),
-        CapType::Notification => size_of::<Notification>(),
-        CapType::Tcb => size_of::<Tcb>(),
-        CapType::SchedContext => size_of::<SchedContext>(),
-        
-        // Variable-size objects
-        CapType::CNode => size_of::<Capability>() * (1 << size_bits),
-        CapType::Untyped => 1 << size_bits,
-        
-        // Page-sized objects (no separate PageTable type;
-        // intermediate page tables are managed by VSpace internally)
-        CapType::Frame => PAGE_SIZE,
-        CapType::VSpace => PAGE_SIZE,  // Top-level page table (+ VSpaceTracking at phys+4096)
-        
-        _ => 0,
-    }
-}
+/// Page-granular node allocator.
+/// All allocations are exactly one page (4096 bytes).
+pub trait NodeAllocator {
+    /// Allocate a zeroed page. Returns null on failure.
+    fn alloc_node(&mut self) -> *mut u8;
 
-pub const PAGE_SIZE: usize = 4096;
-pub const PAGE_BITS: usize = 12;
+    /// Free a previously allocated page.
+    /// # Safety
+    /// `ptr` must have been returned by `alloc_node` and not yet freed.
+    unsafe fn free_node(&mut self, ptr: *mut u8);
+}
 ```
 
-## Frames
-
-A Frame represents a 4KB physical page. Frames are standalone kernel objects
-created via `Untyped_Retype` with `object_type = Frame`. The `FrameObject`
-struct (defined in `cap/untyped.rs`) tracks the physical address and size:
+### Kernel implementation
 
 ```rust
-/// Single frame object (for Frame capabilities)
-/// Defined in kernel/src/cap/untyped.rs
-#[repr(C)]
-pub struct FrameObject {
-    /// Kernel object header (must be first for refcount access)
-    pub header: KernelObject,
-    pub phys_addr: PhysAddr,
-    pub size_bits: u8,
+struct PmmNodeAllocator {
+    owner: FrameOwner,  // caller specifies: KernelPrivate or MoMeta{...}
+}
+
+impl NodeAllocator for PmmNodeAllocator {
+    fn alloc_node(&mut self) -> *mut u8 {
+        let phys = pmm().alloc(self.owner)?;
+        phys_to_virt(phys) as *mut u8
+    }
+
+    unsafe fn free_node(&mut self, ptr: *mut u8) {
+        let phys = virt_to_phys(ptr as u64);
+        pmm().free(phys, self.owner);
+    }
 }
 ```
 
-The kernel's bitmap-based physical memory manager (`mm/frame.rs`) tracks
-which 4KB physical frames are allocated using a bitmap (one bit per frame).
-Frame capabilities point to the `FrameObject` and carry rights inline in
-the capability metadata.
+### Reserve policy for fault paths
 
-### Frame Sizes
+The COW fast-path and demand fault paths may need to allocate radix tree
+nodes or Maple tree nodes during fault resolution. If PMM is nearly
+exhausted, this creates a deadlock: resolving a fault requires a metadata
+page, but no pages are available.
 
-| Size | x86_64 Name | Size Bits |
-|------|-------------|-----------|
-| 4 KB | Page | 12 |
-| 2 MB | Large Page | 21 |
-| 1 GB | Huge Page | 30 |
-
-## Virtual Address Spaces
-
-### VSpace Structure
+**Solution**: PMM maintains an **emergency node reserve** — a small pool
+of pre-allocated pages (tagged `EmergencyReserve`) that are only
+available to `NodeAllocator` during fault handling. The reserve size is
+configurable (default: 32 pages = 128 KB).
 
 ```rust
-/// Virtual address space
-pub struct VSpace {
-    /// Root page table physical address
-    root: PhysAddr,
-    
-    /// Architecture-specific data
-    arch: ArchVSpace,
-    
-    /// ASID (Address Space ID) for TLB
-    asid: u16,
-}
+impl Pmm {
+    /// Allocate from the emergency reserve. Only callable from
+    /// fault handling context (checked via flag on current TCB).
+    fn alloc_reserve(&mut self) -> Option<PhysAddr>;
 
-/// x86_64-specific VSpace data
-pub struct ArchVSpace {
-    /// PML4 table (level 4)
-    pml4: PageTable,
+    /// Replenish the reserve pool from free frames.
+    /// Called periodically by mmsrv or during idle.
+    fn replenish_reserve(&mut self, count: usize);
 }
 ```
 
-### Page Table Entries (kernel-internal)
+When the reserve is depleted, the fault falls through to mmsrv via
+VMFault IPC. mmsrv can then trigger OOM handling (kill a process,
+flush page cache, etc.) and retry.
+```
 
-Page tables are not exposed as a separate kernel object type. They are managed
-internally by VSpace operations (MAP_PT allocates from an untyped frame and
-installs it in the page table hierarchy). The kernel accesses page table entries
-as raw 512-entry arrays via the physical-to-virtual direct map:
+---
+
+## MemoryObject Layer (`cap/memory_object.rs`)
+
+A MemoryObject (MO) is a capability-exposed kernel object that borrows
+physical frames from PMM and provides page-level operations to userspace.
+
+### Structure
 
 ```rust
-/// A page table is a 4KB-aligned array of 512 entries,
-/// accessed via phys_to_virt() on the physical address.
-/// (No standalone PageTable struct -- just raw pointer access.)
-
-/// Page table entry
-#[repr(transparent)]
-pub struct PageTableEntry(u64);
-
-impl PageTableEntry {
-    // Flags
-    pub const PRESENT: u64 = 1 << 0;
-    pub const WRITABLE: u64 = 1 << 1;
-    pub const USER: u64 = 1 << 2;
-    pub const WRITE_THROUGH: u64 = 1 << 3;
-    pub const CACHE_DISABLE: u64 = 1 << 4;
-    pub const ACCESSED: u64 = 1 << 5;
-    pub const DIRTY: u64 = 1 << 6;
-    pub const HUGE_PAGE: u64 = 1 << 7;
-    pub const GLOBAL: u64 = 1 << 8;
-    pub const NO_EXECUTE: u64 = 1 << 63;
-    
-    pub fn new(phys: PhysAddr, flags: u64) -> Self {
-        Self((phys.as_u64() & 0x000F_FFFF_FFFF_F000) | flags)
-    }
-    
-    pub fn phys_addr(&self) -> PhysAddr {
-        PhysAddr::new(self.0 & 0x000F_FFFF_FFFF_F000)
-    }
-    
-    pub fn is_present(&self) -> bool {
-        self.0 & Self::PRESENT != 0
-    }
+struct MemoryObject {
+    header: KernelObject,        // capability refcount (seL4)
+    kind: MoKind,
+    page_count: u32,             // logical page slots (u32 for TB-scale)
+    pages: RadixTreeRoot,        // 4-level radix tree of PhysAddr
+    reverse_maps: ReverseMaps,   // which VSpaces map this MO
+    cow_parent: CapSlot,         // capability slot referencing parent MO (0 = none)
+    first_child: *mut MemoryObject,  // head of intrusive child linked list
+    next_sibling: *mut MemoryObject, // next child of same parent
 }
 ```
 
-### Page Table Hierarchy (x86_64)
+`cow_parent` is a **capability slot**, not a raw pointer. The capability
+system manages the parent MO's refcount: creating a CowChild inserts a
+cap into `cow_parent`, incrementing `parent.header.ref_count`. Destroying
+the child deletes this cap, decrementing the refcount. This ensures the
+parent cannot be freed while any child holds a reference.
 
-```
-Virtual Address (48-bit canonical):
-┌────────────────────────────────────────────────────────────────┐
-│ Sign │  PML4  │  PDPT  │   PD   │   PT   │     Offset         │
-│ Ext  │  [47:  │  [38:  │  [29:  │  [20:  │     [11:0]         │
-│[63:48]│  39]  │  30]   │  21]   │  12]   │                    │
-│ 16bit│  9bit │  9bit  │  9bit  │  9bit  │     12bit          │
-└────────────────────────────────────────────────────────────────┘
-
-Page Table Walk:
-    CR3 ──► PML4 ──► PDPT ──► PD ──► PT ──► Physical Frame
-            [9bit]   [9bit]  [9bit] [9bit]
-```
-
-## Address Translation
-
-### Manual Page Walk
+To dereference the parent for page resolution, the kernel reads the cap
+at `cow_parent` and follows `cap.object` to get `*mut MemoryObject`.
+This is O(1) and safe — the cap guarantees the parent is alive.
 
 ```rust
-impl VSpace {
-    /// Translate virtual address to physical
-    pub fn translate(&self, vaddr: VirtAddr) -> Option<PhysAddr> {
-        let pml4_idx = (vaddr.as_u64() >> 39) & 0x1FF;
-        let pdpt_idx = (vaddr.as_u64() >> 30) & 0x1FF;
-        let pd_idx = (vaddr.as_u64() >> 21) & 0x1FF;
-        let pt_idx = (vaddr.as_u64() >> 12) & 0x1FF;
-        let offset = vaddr.as_u64() & 0xFFF;
-        
-        // Walk PML4
-        let pml4 = self.read_page_table(self.root);
-        let pml4e = pml4.entries[pml4_idx as usize];
-        if !pml4e.is_present() {
-            return None;
-        }
-        
-        // Walk PDPT
-        let pdpt = self.read_page_table(pml4e.phys_addr());
-        let pdpte = pdpt.entries[pdpt_idx as usize];
-        if !pdpte.is_present() {
-            return None;
-        }
-        if pdpte.is_huge() {
-            // 1GB page
-            let base = pdpte.phys_addr().as_u64() & !((1 << 30) - 1);
-            let page_offset = vaddr.as_u64() & ((1 << 30) - 1);
-            return Some(PhysAddr::new(base + page_offset));
-        }
-        
-        // Walk PD
-        let pd = self.read_page_table(pdpte.phys_addr());
-        let pde = pd.entries[pd_idx as usize];
-        if !pde.is_present() {
-            return None;
-        }
-        if pde.is_huge() {
-            // 2MB page
-            let base = pde.phys_addr().as_u64() & !((1 << 21) - 1);
-            let page_offset = vaddr.as_u64() & ((1 << 21) - 1);
-            return Some(PhysAddr::new(base + page_offset));
-        }
-        
-        // Walk PT
-        let pt = self.read_page_table(pde.phys_addr());
-        let pte = pt.entries[pt_idx as usize];
-        if !pte.is_present() {
-            return None;
-        }
-        
-        Some(PhysAddr::new(pte.phys_addr().as_u64() + offset))
-    }
+enum MoKind {
+    /// Anonymous memory (mmap, brk, stack)
+    Anon,
+    /// COW snapshot child (created by MO_CLONE).
+    /// cow_parent is valid and refcounted.
+    CowChild,
+    /// File-backed memory (future: page cache integration)
+    FileBacked,
+    /// Shared memory region (future: POSIX shm, cross-process IPC buffers)
+    Shm,
 }
 ```
 
-## Mapping Operations
+### Page storage: 4-level radix tree
 
-### Map Frame to VSpace
+Pages are stored in a radix tree with the same structure as hardware
+page tables. Each node is a page (512 × 8-byte entries), allocated from
+PMM via `NodeAllocator` with `FrameOwner::MoMeta { mo, kind: Radix }` tag.
+
+```
+page_idx bits: [35:27] [26:18] [17:9] [8:0]
+                 L4      L3     L2     L1
+
+Level 4 root → 512 entries → Level 3 → ... → Level 1 → PhysAddr
+
+Capacity: 512^4 × 4KB = 256 TB per MO
+Depth for common cases:
+  ≤ 512 pages (2 MB):    1 level  (1 node = 4 KB overhead)
+  ≤ 256K pages (1 GB):   2 levels (up to 513 nodes)
+  ≤ 128M pages (512 GB): 3 levels
+  > 128M pages:          4 levels
+```
+
+Nodes are allocated lazily — empty subtrees have null pointers.
+Radix tree nodes are allocated via `NodeAllocator`, which uses PMM
+with `FrameOwner::MoMeta { mo, kind: Radix }` tag. This separates
+metadata overhead from user-visible data pages in accounting.
+
+### Reverse mappings
+
+Every MO tracks which VSpaces map its pages, enabling:
+- Page reclaim (unmap from all VSpaces before freeing)
+- MO destruction (invalidate all PTEs, TLB shootdown)
 
 ```rust
-/// Map a frame into a virtual address space
-pub fn map_frame(
-    vspace: &mut VSpace,
-    vaddr: VirtAddr,
-    frame: &Frame,
-    rights: MapRights,
-) -> Result<(), MemError> {
-    // Check alignment
-    if !vaddr.is_aligned(PAGE_SIZE) {
-        return Err(MemError::InvalidAlignment);
-    }
-    
-    // Check address is in user space
-    if !is_user_address(vaddr) {
-        return Err(MemError::InvalidAddress);
-    }
-    
-    // Build page table entry flags
-    let mut flags = PageTableEntry::PRESENT | PageTableEntry::USER;
-    if rights.contains(MapRights::WRITE) {
-        flags |= PageTableEntry::WRITABLE;
-    }
-    if !rights.contains(MapRights::EXECUTE) {
-        flags |= PageTableEntry::NO_EXECUTE;
-    }
-    if frame.is_device {
-        flags |= PageTableEntry::CACHE_DISABLE;
-    }
-    
-    // Ensure page table hierarchy exists
-    ensure_page_tables(vspace, vaddr)?;
-    
-    // Set the mapping
-    let pt = get_page_table(vspace, vaddr, 1)?;  // Level 1 = PT
-    let pt_idx = (vaddr.as_u64() >> 12) & 0x1FF;
-    
-    if pt.entries[pt_idx as usize].is_present() {
-        return Err(MemError::AlreadyMapped);
-    }
-    
-    pt.entries[pt_idx as usize] = PageTableEntry::new(frame.phys, flags);
-    
-    // Flush TLB for this address
-    arch::flush_tlb_page(vaddr);
-    
-    // Mapping is tracked in VSpaceTracking (embedded in the VSpace's
-    // untyped allocation at vspace_phys + 4096), not in the frame itself.
+struct ReverseMaps {
+    inline: [ReverseMapEntry; 8],  // covers common case (1-2 VSpaces)
+    inline_count: u8,
+    overflow: *mut ReverseMapPage, // PMM page chain for > 8 entries
+}
 
-    Ok(())
+struct ReverseMapEntry {
+    vspace: *mut VSpace,     // 8
+    va_start: u64,           // 8
+    page_count: u32,         // 4
+    mo_offset: u32,          // 4
+    perms: u8,               // 1
+    _pad: [u8; 7],           // 7 (align to 8-byte boundary)
+}
+// 32 bytes per entry
+
+struct ReverseMapPage {
+    entries: [ReverseMapEntry; 127], // 127 × 32 = 4064 bytes
+    next: *mut ReverseMapPage,       // 8 bytes → 4072 total, 24 bytes padding
 }
 ```
 
-### Unmap
+Overflow pages are allocated from PMM with `FrameOwner::MoMeta { mo, kind: Rmap }`
+tag, belonging to the MO that owns the reverse map.
+
+### Two-layer reverse map architecture
+
+Reverse maps operate at two granularities. Both layers coexist — the
+region layer handles bulk operations; the page layer handles reclaim
+and dirty tracking.
+
+**Layer 1 — Region rmap** (described above)
+
+Stored in `ReverseMaps` on the MO. Each entry covers a contiguous VA
+range. Used for:
+- MO destruction (unmap all regions, TLB shootdown)
+- Fork bookkeeping (clone region list)
+- `VSPACE_MAP_MO` / `VSPACE_UNMAP_MO` (add/remove entries)
+
+Cost: O(regions) per MO. Typically 1-8 entries.
+
+**Layer 2 — Page-level rmap via FrameMeta**
+
+Each physical frame tracks how many VSpaces map it via a counter in
+`FrameMeta`. This enables O(1) reclaimability checks without walking
+region rmaps.
+
+This reuses the same `FrameMeta` layout defined in the PMM section
+(fields: `owner_tag`, `subkind`, `map_count`, `flags`, `page_idx`,
+`owner_ptr` — 16 bytes per frame).
+
+`map_count` is a **reclaimability hint**, not a precise reverse mapping
+list. It tells you whether a frame is mapped anywhere (and thus whether
+eviction requires PTE walks), but not which specific VSpaces or VAs hold
+the mappings. For that, walk the MO's Layer 1 region rmaps.
+
+`map_count` is maintained by the kernel:
+- Incremented when `vspace.map()` installs a PTE for this phys addr
+- Decremented when `vspace.unmap()` removes a PTE
+- COW resolution: old frame's map_count decremented, new frame starts at 1
+
+`flags` bits:
+- `DIRTY` (bit 0): set when PTE dirty bit is harvested during page scan.
+  Cleared by writeback (future FileBacked path).
+- `REFERENCED` (bit 1): set when PTE accessed bit is harvested. Used by
+  clock/LRU reclaim algorithms.
+- `PINNED` (bit 2): frame cannot be reclaimed (e.g., DMA in progress).
+
+**Reclaim decision** (O(1)):
+```
+if frame_meta.map_count == 0 && frame_meta.owner_tag == MoData:
+    → page is committed in MO but not mapped anywhere
+    → immediately reclaimable (decommit from MO, return to PMM)
+
+if frame_meta.map_count > 0 && !frame_meta.flags.PINNED:
+    → page is mapped, but can be evicted:
+    → walk region rmaps to find and unmap all PTEs
+    → then decommit from MO
+```
+
+**Actual unmap** (when reclaim needs to evict a mapped page):
+```
+1. PMM::lookup(phys) → FrameMeta { owner: MoData, mo_ptr, page_idx }
+2. mo.reverse_maps → iterate region entries
+3. For each region where page_idx is in [mo_offset, mo_offset + page_count):
+   vaddr = region.va_start + (page_idx - region.mo_offset) * PAGE_SIZE
+   vspace.unmap(vaddr)
+   TLB shootdown
+4. frame_meta.map_count should now be 0
+5. mo.pages.remove(page_idx)
+6. PMM::free(phys, MoData { mo, page_idx })
+```
+
+This is O(regions) per page — acceptable because reclaim is infrequent
+and most MOs have 1-3 region mappings.
+
+**Per-MO dirty bitmap** (optional, for FileBacked writeback):
+
+When `MoKind::FileBacked` is implemented, the MO gains a dirty bitmap
+(one bit per page, allocated from PMM as `MoMeta`). The kernel
+periodically harvests PTE dirty bits via the region rmap layer:
+
+```
+for each region rmap entry:
+    for page_idx in mo_offset .. mo_offset + page_count:
+        vaddr = va_start + (page_idx - mo_offset) * PAGE_SIZE
+        if vspace.harvest_dirty_bit(vaddr):
+            mo.dirty_bitmap.set(page_idx)
+            frame_meta[phys].flags |= DIRTY
+```
+
+This avoids per-page rmap chains while providing page-precise dirty
+tracking. The cost is one PTE walk per dirty scan, amortized by batching.
+
+### COW clone
+
+`MO_CLONE` creates a snapshot child. The parent MO is **pinned** by the
+child's capability reference — the child holds a cap-refcounted link to
+the parent, preventing use-after-free if the parent process exits.
+
+#### Ancestor lifetime rule
+
+`cow_parent` is not a raw pointer. It is a **capability-refcounted
+reference**: creating a CowChild increments the parent MO's
+`KernelObject::ref_count`. The parent MO cannot be destroyed while any
+child references it. This extends transitively: a grandchild pins the
+child, which pins the parent.
+
+When the last capability to a CowChild is deleted, the capability
+system's drop path triggers MO destruction:
+
+1. Free locally committed pages (walk `child.pages` radix tree,
+   return each frame to PMM)
+2. Remove self from parent's `first_child` linked list
+3. Delete the `cow_parent` CapSlot — this decrements the parent MO's
+   `ref_count` via the standard capability deletion path
+4. If the parent's ref_count reaches 0, the capability system
+   triggers the parent's destruction in turn (same path, recursive)
+
+Destruction is always driven by **capability deletion**, never by
+manual `destroy()` calls. The `cow_parent` CapSlot is the sole
+reference keeping the parent alive. When it is deleted, the
+capability system decides whether the parent survives (other caps
+exist) or is destroyed (last cap gone).
+
+This ensures the ancestor chain is always valid without explicit
+flattening.
+
+#### Chain depth management
+
+Page resolution walks the `cow_parent` chain, so deep fork trees
+(e.g., `bash | bash | bash | ...`) create O(depth) lookup cost.
+Two mechanisms bound this:
+
+**Lazy collapse**: When a CowChild is destroyed and its parent's
+`ref_count` drops to 1 (exactly one sibling remains), the parent is
+a CowChild, and the parent has no locally committed pages, the
+remaining sibling is re-pointed directly to the grandparent.
+
+The `first_child` / `next_sibling` intrusive linked list on each MO
+tracks which children reference it:
+
+```
+MO_CLONE:
+  child.next_sibling = parent.first_child
+  parent.first_child = child
+
+Destroy (self is a CowChild being destroyed):
+  1. Remove self from parent.first_child linked list
+  2. Decrement parent.ref_count
+
+  3. Check collapse conditions:
+     parent.ref_count == 1
+     AND parent.kind == CowChild
+     AND parent.pages has no local commits
+
+  4. If all true:
+     remaining = parent.first_child       // the one surviving sibling
+     old_cap = remaining.cow_parent       // save before overwrite
+     remaining.cow_parent = parent.cow_parent  // transfer grandparent cap
+     parent.cow_parent = 0                // prevent parent.destroy from
+                                          // decrementing grandparent ref
+     free_slot(old_cap)                   // release old cap (pointed to parent)
+     parent.first_child = null
+     parent.destroy()                     // frees empty radix + rmap overflow
+```
+
+Ref_count changes:
+- Grandparent: unchanged (parent's CapSlot transferred to remaining child)
+- Parent: reaches 0, destroyed
+- Remaining child: now directly references grandparent, chain shortened by 1
+
+**Eager flatten on resolve**: During page resolution, if the chain
+depth exceeds a threshold (default: 8), the resolved page is copied
+into the requesting MO as a local page. This amortizes deep chains —
+each page is flattened at most once, and subsequent accesses are O(1).
+
+```
+resolve_page(page_idx):
+    depth = 0
+    mo = self
+    while mo.pages.get(page_idx).is_none():
+        mo = deref_cap(mo.cow_parent)
+        depth += 1
+    phys = mo.pages.get(page_idx)
+    if depth > COW_FLATTEN_THRESHOLD:
+        new_phys = pmm.alloc(MoData { self, page_idx })
+        memcpy(phys → new_phys)
+        self.pages.insert(page_idx, new_phys)
+        return new_phys
+    return phys
+```
+
+This keeps worst-case resolution bounded regardless of fork depth.
+
+#### Clone flow
+
+```
+Before:  parent.pages = radix{0:A, 1:B, 2:C}
+         parent.kind = Anon
+
+After:   parent.pages = radix{0:A, 1:B, 2:C}  (unchanged, parent retains ownership)
+         child.pages = radix{}                  (empty)
+         child.kind = CowChild
+         child.cow_parent = &parent             (refcounted)
+         parent.header.ref_count += 1           (pinned by child)
+
+Page resolution for child:
+  1. Check child.pages radix tree
+  2. If empty: walk cow_parent chain upward
+  3. Return shared PhysAddr (mapped read-only + COW in VSpace)
+
+Write to child page 0 (COW fault):
+  1. PMM::alloc(MoData{child, 0}) → new frame D
+  2. memcpy(A → D)
+  3. child.pages.insert(0, D)
+  4. PTE updated: D | WRITABLE, COW bit cleared
+  5. Frame A is unchanged — still owned by parent as MoData{parent, 0}
+```
+
+No `PMM::transfer` occurs during COW resolution. The parent's frame A
+stays with the parent. The child gets a new frame D from PMM. This is
+a pure allocation, not a transfer.
+
+### Frame allocation: dual-source model
+
+MO data pages come from **untyped** (primary) or **PMM** (fallback).
+The caller provides a `ut_cap` argument to `MO_COMMIT`:
+
+- `ut_cap != 0`: Carve page-sized frames from the untyped watermark
+  (or its free list). Radix tree entry tagged with `PHYS_TAG_UNTYPED`
+  (bit 0). Per-untyped `alloc_lock` protects watermark and free list.
+- `ut_cap == 0`: Allocate from PMM bitmap (fallback/legacy path).
+  No tag bit set.
+
+Per-page commit sequence (untyped path):
+```
+mo.commit_lock.lock()
+  reserve_slot(page_idx, BUSY)  ← path + empty check + sentinel, atomic
+mo.commit_lock.unlock()
+ut.alloc_lock.lock()
+  pop free_list or bump watermark → phys
+ut.alloc_lock.unlock()
+zero page                         ← outside all locks
+mo.commit_lock.lock()
+  radix leaf = phys | PHYS_TAG_UNTYPED
+mo.commit_lock.unlock()
+```
+
+Lock ordering: `mo.commit_lock` → `ut.alloc_lock` (never reversed).
+
+When MO decommits a page:
+```
+mo.commit_lock.lock()
+  entry = mo.pages.get(page_idx)
+  mo.pages.remove(page_idx)
+mo.commit_lock.unlock()
+if entry & PHYS_TAG_UNTYPED:
+  ut.alloc_lock → push to source untyped free list
+else:
+  pmm_free(phys)
+```
+
+When MO is destroyed:
+```
+mo.commit_lock.lock()
+  for each page in mo.pages:
+    for each rmap in mo.reverse_maps:
+      unmap PTE, TLB shootdown
+    if PHYS_TAG_UNTYPED: batch collect
+    else: pmm_free(phys)
+mo.commit_lock.unlock()
+for each batched untyped page:
+  ut.alloc_lock → push to source free list
+for each metadata page (radix nodes, rmap overflow):
+  pmm.free(phys, FrameOwner::MoMeta { mo, kind })
+```
+
+Untyped frame reclaim: `find_untyped_for_phys(phys)` searches the
+init-created untyped list by physical range. Design invariant: untyped
+source ranges are disjoint and never split.
+
+### Invoke labels
+
+| Label | Value | Operation |
+|-------|-------|-----------|
+| MO_COMMIT | 0x90 | Allocate frames for page range (arg2=ut_cap, 0=PMM) |
+| MO_DECOMMIT | 0x91 | Release physical frames |
+| MO_GET_SIZE | 0x92 | Return page count |
+| MO_CLONE | 0x93 | Create COW snapshot clone |
+| MO_RESIZE | 0x94 | Resize page count |
+| VSPACE_MAP_MO | 0x97 | Map MO range into VSpace |
+| VSPACE_UNMAP_MO | 0x98 | Unmap MO range from VSpace |
+
+---
+
+## VSpace Layer (`mm/vspace.rs`)
+
+VSpace is the observer layer. It owns nothing — it borrows views of MO
+pages and presents them to hardware page tables.
+
+### Structure
 
 ```rust
-/// Unmap a page from a virtual address space
-pub fn unmap(
-    vspace: &mut VSpace,
-    vaddr: VirtAddr,
-) -> Result<(), MemError> {
-    let pt = get_page_table(vspace, vaddr, 1)?;
-    let pt_idx = (vaddr.as_u64() >> 12) & 0x1FF;
-    
-    if !pt.entries[pt_idx as usize].is_present() {
-        return Err(MemError::NotMapped);
-    }
-    
-    // Clear the entry
-    pt.entries[pt_idx as usize] = PageTableEntry(0);
-    
-    // Flush TLB
-    arch::flush_tlb_page(vaddr);
-    
-    Ok(())
+struct VSpace {
+    header: KernelObject,
+    root: PhysAddr,              // PML4/TTBR0 physical address
+    tracking: *mut VSpaceTracking,
+    lock: SpinLock,
+    // COW pool fields (existing)
+}
+
+struct VSpaceTracking {
+    // ... existing fields (state, active_count, ASID, etc.) ...
+    mappings: MapleTree<VmArea>,  // VAddr → VmArea
 }
 ```
 
-### Page Table Allocation
+### VmArea
+
+Defined in `vspace.rs`, not in the maple tree module. The maple tree
+is a generic data structure (`MapleTree<V: Copy>`) that knows nothing
+about VmArea.
 
 ```rust
-/// Ensure page tables exist for a virtual address
-fn ensure_page_tables(
-    vspace: &mut VSpace,
-    vaddr: VirtAddr,
-) -> Result<(), MemError> {
-    // For each level (4 down to 2), ensure table exists
-    for level in (2..=4).rev() {
-        if !has_page_table(vspace, vaddr, level) {
-            // Need to allocate a page table
-            // This requires an Untyped retype in the calling code
-            return Err(MemError::MissingPageTable { level });
-        }
-    }
-    Ok(())
+// vspace.rs
+struct VmArea {
+    mo: *mut MemoryObject,    // raw pointer, refcounted via capability
+    mo_offset: u32,           // page offset within MO for this region's start
+    page_count: u32,          // number of pages in this region
+    perms: u8,                // RWX permissions
 }
 ```
 
-## Kernel Object Allocation (seL4-style)
+`VmArea` does not own the MO. The MO's lifetime is managed by the
+capability system. When a VmArea is created, it registers itself in
+the MO's `reverse_maps`. When dropped, it deregisters.
 
-SaltyOS follows the seL4 model: **all kernel objects are carved from untyped memory
-via the `retype` operation**. There is no kernel heap, slab allocator, or dynamic
-memory pool. This provides several properties:
+### Maple tree for mappings
 
-1. **Deterministic allocation** — no hidden OOM inside the kernel
-2. **Authority tracking** — every object has an untyped parent in the Capability
-   Derivation Tree (CDT), enabling revocation
-3. **No kernel-internal fragmentation** — userspace controls memory layout
+VmAreas are stored in a `MapleTree<VmArea>`:
 
-### Retype Flow
+- **Keys**: VA start addresses (u64)
+- **Values**: `V` (generic, `VmArea` in this case)
+- **Nodes**: allocated from PMM via `NodeAllocator` with
+  `FrameOwner::KernelPrivate` tag
+- **Properties**: cache-friendly B-tree variant, O(log n) lookup/insert/delete,
+  range queries, no self-balancing overhead of red-black trees
+- **Generic**: `MapleTree<V: Copy>` — leaf slot count is computed at
+  compile time from `size_of::<V>()`. Internal nodes are V-independent.
+
+```rust
+// maple_tree.rs
+struct MapleTree<V: Copy> {
+    root: *mut u8,
+    entry_count: usize,
+    _phantom: PhantomData<V>,
+}
+
+// Leaf: header(16) + N * (pivot(8) + V) where N = (4096 - 16) / (8 + size_of::<V>())
+// Internal: header(16) + N * pivot(8) + (N+1) * child(8), V-independent
+```
+
+### COW fast-path
+
+When a COW write fault occurs, the kernel resolves it entirely in
+the fast-path without IPC to mmsrv:
 
 ```
-Untyped capability (user) ──retype──► Typed object (kernel creates in-place)
-                                      │
-                                      ├─ TCB
-                                      ├─ CNode
-                                      ├─ Endpoint
-                                      ├─ Notification
-                                      ├─ VSpace (+ VSpaceTracking at phys+4096)
-                                      ├─ Frame (min size_bits=12, 4KB)
-                                      └─ SchedContext
+1. Fault at vaddr → read PTE → old_phys
+2. PMM::lookup(old_phys) → FrameMeta { tag: MoData, mo_ptr, page_idx }
+3. Conditions for fast-path (ALL must be true):
+   a. source MO page is present in radix tree
+   b. PMM has free frames (or emergency reserve available)
+   c. (future: process quota not exceeded)
+4. PMM::alloc(MoData { mo: child_mo, page_idx }) → new_phys
+5. memcpy(old_phys → new_phys)
+6. child_mo.pages.insert(page_idx, new_phys)  // cow_resolve_page
+7. PTE: new_phys | WRITABLE, clear COW bit
+8. TLB flush
 ```
 
-Each object is initialized at the untyped's watermark offset. The watermark
-advances monotonically — objects are never freed back to the untyped. To
-reclaim memory, the entire untyped must be revoked (which destroys all derived
-capabilities and objects).
+If any condition fails, the fault falls through to mmsrv via VMFault
+IPC. The kernel handles only the obvious mechanical case — policy
+decisions (quota enforcement, OOM handling) belong in mmsrv.
 
-### VSpaceTracking
+---
 
-When a VSpace object is retyped, an additional 4KB `VSpaceTracking` structure is
-placed immediately after the page table root (at `vspace_phys + 4096`). This
-structure tracks per-page metadata (COW refcounts, mapping state) and is embedded
-in the untyped allocation rather than using a separate slab.
+## Untyped Memory
 
-### Centralized Memory Server (mmsrv)
+Untyped memory creates kernel **objects**, never data pages:
 
-In userspace, `mmsrv` is the centralized pager that owns the root untyped
-capabilities and serves frame allocation requests from all processes:
+| Object | Created from Untyped |
+|--------|---------------------|
+| TCB | Yes |
+| CNode | Yes |
+| VSpace | Yes (PML4 + VSpaceTracking) |
+| Endpoint | Yes |
+| Notification | Yes |
+| SchedContext | Yes |
+| MemoryObject struct | Yes (header + radix root) |
+| IrqHandler | Yes |
+| IoPort | Yes |
 
-- **MM_REGISTER/DEREGISTER** — register/deregister a client process
-- **MM_MAP_BATCH** — allocate N frames and map into a client's VSpace
-- **MM_MAP_WINDOW** — dual-map frames into both target and caller VSpaces
-  (write window pattern for stack/boot-info initialization)
-- **MM_UNMAP_WINDOW** — remove caller's write window, target mapping persists
-- **MM_BRK / MM_MMAP / MM_MUNMAP** — POSIX-style heap and mmap
-- **MM_FORK_REGIONS** — COW-clone a parent's VSpace regions for fork
+Data pages (stack, heap, mmap, shared libs) are always PMM frames
+loaned to MemoryObjects. This boundary must not blur — if it does,
+memory accounting splits into two systems and invariant 1 breaks.
 
-## Kernel Address Space
+---
 
-### Layout
+## Page Fault Handling
+
+All user-visible pages are MO pages. Every fault path must identify
+the backing MO, commit the page into that MO's radix tree, and
+maintain reverse maps and map_count. No path may bypass MO and put
+a raw PMM frame directly into a PTE.
+
+### Fast-path (kernel-internal)
+
+For faults that the kernel can resolve without IPC:
+
+**1. COW fault** (present + write + user + COW bit set):
+
+See COW fast-path section above. PMM lookup → find MO → alloc new
+frame as `MoData{child_mo, page_idx}` → memcpy → cow_resolve_page
+→ PTE update → map_count update.
+
+**2. Demand fault** (present=0 + demand bit set in PTE):
+
+A demand PTE was installed by `VSPACE_MAP_MO` for an uncommitted MO
+page. The kernel resolves it by committing the page into the MO:
+
+```
+1. Fault at vaddr → read demand PTE → extract flags
+2. Lookup VmArea in VSpaceTracking Maple tree → (MO*, mo_offset)
+3. page_idx = mo_offset + (vaddr - vma.va_start) / PAGE_SIZE
+4. PMM::alloc(MoData { mo, page_idx }) → phys
+5. Zero-fill phys
+6. mo.pages.insert(page_idx, phys)  // commit into radix tree
+7. PTE: phys | flags (from demand PTE), clear demand bit, set present
+8. pmm_retain_mapping(phys)  // increment map_count
+9. TLB flush
+```
+
+If PMM alloc fails, the fault falls through to mmsrv.
+
+**3. Stack growth** (fault near user SP, below current stack mapping):
+
+The kernel extends the stack MO and VMA:
+
+```
+1. Fault at vaddr → check: vaddr >= user_stack_min
+                          && vaddr < user_stack_top
+                          && vaddr < current stack VMA base
+2. Lookup stack VmArea in Maple tree
+3. Compute new_base = vaddr & ~0xFFF (page-align down)
+4. growth_pages = (old_vma.va_start - new_base) / PAGE_SIZE
+5. mo.page_count += growth_pages  // extend MO capacity
+6. For each new page (bottom-up):
+   a. PMM::alloc(MoData { mo, new_page_idx }) → phys
+   b. Zero-fill phys
+   c. mo.pages.insert(new_page_idx, phys)
+   d. vspace.map(new_vaddr, phys, USER_RW)
+   e. pmm_retain_mapping(phys)
+7. Update VmArea in Maple tree: va_start = new_base,
+   page_count += growth_pages, mo_offset adjusted
+8. Update MO reverse_maps entry for this VSpace
+```
+
+If PMM alloc fails at any step, the fault falls through to mmsrv.
+
+### Slow-path (mmsrv IPC)
+
+Everything else is delivered to the thread's fault handler (mmsrv)
+via VMFault IPC:
+
+- MO page not yet committed (no demand PTE, VmArea exists) →
+  mmsrv calls `MO_COMMIT` + `VSPACE_MAP_MO`
+- No VmArea covers fault address → segfault (mmsrv does not reply,
+  thread stays FaultBlocked)
+- PMM exhausted in fast-path → mmsrv decides (OOM kill, cache flush)
+- Policy decisions (quota enforcement) → mmsrv decides
+
+---
+
+## `no_std` Boundary
+
+The kernel is `#![no_std]` with `core::` only. No `alloc` crate.
+
+| `std`/`alloc` type | Kernel replacement | Source |
+|--------------------|--------------------|--------|
+| `Vec<T>` | Inline array + PMM page chaining | PMM |
+| `BTreeMap<K,V>` | `MapleTree<V>` (NodeAllocator) | PMM |
+| `Arc<T>` | Capability refcount | Capability system |
+| `Box<T>` (kernel object) | Untyped retype (TCB, CNode, MO struct, etc.) | Untyped |
+| `Box<T>` (page/node) | PMM raw pointer + explicit free | PMM / NodeAllocator |
+| `HashMap<K,V>` | Radix tree | PMM (NodeAllocator) |
+
+---
+
+## Memory Map (unchanged)
 
 ```
 ┌─────────────────────────────────────────┐ 0xFFFFFFFFFFFFFFFF
 │           Kernel Reserved               │
-├─────────────────────────────────────────┤ 0xFFFFFFFFFFE00000
-│           Kernel Stack                  │
 ├─────────────────────────────────────────┤ 0xFFFFFFFF80000000
 │           Kernel Text/Data/BSS          │
-│           (Loaded by bootloader)        │
-├─────────────────────────────────────────┤ 0xFFFFFFFF00000000
-│           Kernel Object Space            │
-│           (Untyped retype region)       │
-├─────────────────────────────────────────┤ 0xFFFFFFFE00000000
-│           Device MMIO                   │
 ├─────────────────────────────────────────┤ 0xFFFF800000000000
 │           Direct Physical Map           │
-│     (All physical memory mapped)        │
-├─────────────────────────────────────────┤ 0xFFFF000000000000
-│                                         │
-│           Non-canonical hole            │
-│                                         │
 ├─────────────────────────────────────────┤ 0x0000800000000000
-│                                         │
+│           Non-canonical hole            │
+├─────────────────────────────────────────┤ 0x0000000000000000
 │           User Space                    │
-│                                         │
-└─────────────────────────────────────────┘ 0x0000000000000000
+└─────────────────────────────────────────┘
 ```
 
-### Physical Memory Access
-
-```rust
-/// Convert physical address to virtual (via direct map)
-#[inline]
-pub fn phys_to_virt(phys: PhysAddr) -> VirtAddr {
-    VirtAddr::new(phys.as_u64() + PHYS_MAP_OFFSET)
-}
-
-/// Convert virtual address back to physical
-#[inline]
-pub fn virt_to_phys(virt: VirtAddr) -> PhysAddr {
-    debug_assert!(virt.as_u64() >= PHYS_MAP_OFFSET);
-    PhysAddr::new(virt.as_u64() - PHYS_MAP_OFFSET)
-}
-
-const PHYS_MAP_OFFSET: u64 = 0xFFFF_8000_0000_0000;
-```
-
-## Page Fault Handling
-
-### Kernel Page Faults
-
-```rust
-/// Handle page fault in kernel context
-fn handle_kernel_page_fault(addr: VirtAddr, error: u64) -> ! {
-    panic!(
-        "Kernel page fault at {:#x}\n\
-         Error code: {:#x}\n\
-         Present: {}\n\
-         Write: {}\n\
-         User: {}\n\
-         Reserved: {}\n\
-         Instruction fetch: {}",
-        addr.as_u64(),
-        error,
-        error & 1 != 0,
-        error & 2 != 0,
-        error & 4 != 0,
-        error & 8 != 0,
-        error & 16 != 0,
-    );
-}
-```
-
-### User Page Faults
-
-User page faults are delivered to the thread's fault handler via IPC:
-
-```rust
-/// Handle page fault in user context
-fn handle_user_page_fault(
-    tcb: &mut Tcb,
-    addr: VirtAddr,
-    error: u64,
-) {
-    // Check if thread has a fault handler
-    if let Some(fault_ep) = &tcb.fault_handler {
-        // Build fault message
-        let msg = FaultMessage {
-            fault_type: FaultType::VMFault,
-            address: addr.as_u64(),
-            fault_flags: error,
-            instruction_pointer: tcb.context.rip,
-        };
-        
-        // Send fault IPC
-        send_fault_ipc(tcb, fault_ep, msg);
-    } else {
-        // No fault handler - terminate thread
-        kprintln!(
-            "Thread {} killed: page fault at {:#x}",
-            tcb.id,
-            addr.as_u64()
-        );
-        tcb.state = ThreadState::Suspended;
-    }
-}
-```
+---
 
 ## VSpace Page Flags
 
-Flags passed in the `rights`/`flags` argument of VSpace mapping operations:
-
 | Bit | Value | Name | Description |
 |-----|-------|------|-------------|
-| 0 | 0x01 | VSPACE_FLAG_WRITABLE | Page is writable |
-| 1 | 0x02 | VSPACE_FLAG_USER | Page is accessible from user mode |
-| 2 | 0x04 | VSPACE_FLAG_EXECUTABLE | Page is executable (NX bit cleared) |
-| 3 | 0x08 | VSPACE_FLAG_CACHE_DISABLE | Disable caching (for device memory) |
-| 4 | 0x10 | VSPACE_FLAG_WRITE_THROUGH | Write-through caching |
-| 5 | 0x20 | VSPACE_FLAG_COW | Copy-on-write semantics |
+| 0 | 0x01 | WRITABLE | Page is writable |
+| 1 | 0x02 | USER | Accessible from user mode |
+| 2 | 0x04 | EXECUTABLE | NX bit cleared |
+| 3 | 0x08 | CACHE_DISABLE | For device memory |
+| 4 | 0x10 | WRITE_THROUGH | Write-through caching |
+| 5 | 0x20 | COW | Copy-on-write (PTE bit 9) |
 
-## VSpace Operations via Syscalls
+---
 
-All VSpace operations are invoked via `Invoke` (syscall 9) on a VSpace capability. The label determines the operation:
+## mmsrv Integration
 
-| Label | Name | Description |
-|-------|------|-------------|
-| 0x50 | VSPACE_MAP | Map a frame into the VSpace |
-| 0x51 | VSPACE_UNMAP | Unmap a page from the VSpace |
-| 0x52 | VSPACE_MAP_PT | Map an intermediate page table |
-| 0x53 | VSPACE_WALK | Walk page tables, return mapping info for an address |
-| 0x54 | VSPACE_COPY_PAGE | Copy page content between VSpaces |
-| 0x55 | VSPACE_MAP_DEVICE | Map device memory (uncacheable) |
-| 0x56 | VSPACE_CLONE_COW_PAGE | Clone a page with COW semantics |
-| 0x57 | VSPACE_MAP_DEVICE_RANGE | Batch device mapping (multiple contiguous pages) |
-| 0x58 | VSPACE_PROTECT | Change page protection flags on an existing mapping |
-| 0x59 | VSPACE_MAP_DEMAND | Map a demand-paged region (page fault triggers allocation) |
-| 0x5A | VSPACE_MAP_DEMAND_RANGE | Batch demand-page mapping |
+mmsrv is the userspace memory server. It owns root untyped capabilities
+and serves memory requests from all processes.
+
+With MO-everywhere, mmsrv's role simplifies:
+
+- **Allocation** (mmap, brk, spawn): Retype `OBJ_MEMORY_OBJECT` from
+  untyped, `MO_COMMIT` pages, `VSPACE_MAP_MO` into client
+- **Fork**: `MO_CLONE` per unique MO (dedup table prevents double-clone
+  when multiple regions share one MO), then register child regions
+- **VMFault**: `MO_COMMIT` + `VSPACE_MAP_MO` for demand faults.
+  COW write faults are handled by kernel fast-path (never reach mmsrv)
+- **Cleanup**: Delete MO cap → MO destruction → reverse map traversal →
+  PTE invalidation → PMM frame return
+
+### Region tracking (`MmRegion`)
+
+Each mmsrv client has a list of `MmRegion` entries:
 
 ```rust
-/// VSpace capability invocation dispatch
-fn invoke_vspace(
-    tcb: &mut Tcb,
-    cap: &Capability,
-    label: u64,
-    msg: &IpcMessage,
-) -> InvokeResult {
-    // SAFETY: cap.object points to a VSpace allocated via untyped retype
-    let vspace = unsafe { &mut *(cap.object as *mut VSpace) };
-
-    match label {
-        // Map a frame into the VSpace
-        VSPACE_MAP => {
-            let frame_cap = msg.get_cap(0);
-            let vaddr = VirtAddr::new(msg.get_word(0));
-            let flags = msg.get_word(1) as u32;
-            vspace_map(vspace, frame_cap, vaddr, flags)
-        }
-
-        // Unmap a page
-        VSPACE_UNMAP => {
-            let vaddr = VirtAddr::new(msg.get_word(0));
-            vspace_unmap(vspace, vaddr)
-        }
-
-        // Map an intermediate page table at a given level
-        VSPACE_MAP_PT => {
-            let pt_cap = msg.get_cap(0);
-            let vaddr = VirtAddr::new(msg.get_word(0));
-            let level = msg.get_word(1) as u8;
-            vspace_map_pt(vspace, pt_cap, vaddr, level)
-        }
-
-        // Walk page tables, return physical address and flags
-        VSPACE_WALK => {
-            let vaddr = VirtAddr::new(msg.get_word(0));
-            vspace_walk(vspace, vaddr)
-        }
-
-        // Copy page content between VSpaces
-        VSPACE_COPY_PAGE => {
-            let src_vaddr = VirtAddr::new(msg.get_word(0));
-            let dst_vspace_cap = msg.get_cap(0);
-            let dst_vaddr = VirtAddr::new(msg.get_word(1));
-            vspace_copy_page(vspace, src_vaddr, dst_vspace_cap, dst_vaddr)
-        }
-
-        // Map device memory (uncacheable)
-        VSPACE_MAP_DEVICE => {
-            let phys = PhysAddr::new(msg.get_word(0));
-            let vaddr = VirtAddr::new(msg.get_word(1));
-            let flags = msg.get_word(2) as u32;
-            vspace_map_device(vspace, phys, vaddr, flags)
-        }
-
-        // Clone a page with COW semantics
-        VSPACE_CLONE_COW_PAGE => {
-            let src_vaddr = VirtAddr::new(msg.get_word(0));
-            let dst_vspace_cap = msg.get_cap(0);
-            let dst_vaddr = VirtAddr::new(msg.get_word(1));
-            vspace_clone_cow_page(vspace, src_vaddr, dst_vspace_cap, dst_vaddr)
-        }
-
-        // Batch device mapping (multiple contiguous pages)
-        VSPACE_MAP_DEVICE_RANGE => {
-            let phys = PhysAddr::new(msg.get_word(0));
-            let vaddr = VirtAddr::new(msg.get_word(1));
-            let num_pages = msg.get_word(2) as usize;
-            let flags = msg.get_word(3) as u32;
-            vspace_map_device_range(vspace, phys, vaddr, num_pages, flags)
-        }
-
-        // Change page protection flags
-        VSPACE_PROTECT => {
-            let vaddr = VirtAddr::new(msg.get_word(0));
-            let new_flags = msg.get_word(1) as u32;
-            vspace_protect(vspace, vaddr, new_flags)
-        }
-
-        // Map a demand-paged region (page fault triggers allocation)
-        VSPACE_MAP_DEMAND => {
-            let vaddr = VirtAddr::new(msg.get_word(0));
-            let flags = msg.get_word(1) as u32;
-            vspace_map_demand(vspace, vaddr, flags)
-        }
-
-        // Batch demand-page mapping
-        VSPACE_MAP_DEMAND_RANGE => {
-            let vaddr = VirtAddr::new(msg.get_word(0));
-            let num_pages = msg.get_word(1) as usize;
-            let flags = msg.get_word(2) as u32;
-            vspace_map_demand_range(vspace, vaddr, num_pages, flags)
-        }
-
-        _ => InvokeResult::Error(SyscallError::InvalidOperation),
-    }
+struct MmRegion {
+    base: u64,
+    length: u64,
+    prot: u8,
+    region_type: u8,
+    mo_cap: Cap,        // always non-zero (MO-everywhere)
+    mo_offset: u32,     // page offset within MO for this region
+    active: bool,
 }
 ```
 
-## Memory Safety Properties
-
-### Isolation Guarantees
-
-1. **VSpace Isolation**: Each task has its own VSpace, preventing unauthorized access
-2. **Capability Mediation**: All memory access requires Frame/VSpace capabilities
-3. **No Direct Physical Access**: Userspace cannot access physical memory without mapping
-4. **SMEP/SMAP**: CPU features prevent kernel from executing user code or accessing user memory without explicit request
-
-### Revocation
-
-When a Frame capability is revoked:
-1. All mappings of that Frame are removed
-2. TLB is flushed on all CPUs
-3. Any threads accessing that memory will fault
-
-Revocation walks the Capability Derivation Tree (CDT) to find all
-derived capabilities. For each mapping tracked in VSpaceTracking, the
-kernel unmaps the page and flushes the TLB:
-
-```rust
-fn revoke_frame(cap: &Capability) {
-    // Walk CDT children of this frame capability
-    // For each derived mapping, unmap from the target VSpace
-    // (VSpaceTracking at vspace_phys + 4096 records per-page metadata)
-
-    // Flush TLB on all CPUs via IPI
-    arch::flush_tlb_all();
-}
-```
+All regions are MO-backed. There is no legacy non-MO path.

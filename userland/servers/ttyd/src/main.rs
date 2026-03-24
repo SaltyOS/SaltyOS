@@ -315,17 +315,8 @@ fn register_with_nameserv() -> bool {
 // ======================================================================
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     puts(b"[TTYD] SaltyOS PTY driver starting\n");
-
-    unsafe {
-        let err = besalt::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
-        if err != 0 {
-            puts(b"[TTYD] FAIL: tcb_set_ipc_buffer\n");
-            idle();
-        }
-        besalt::ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
-    }
 
     // Query display server for actual framebuffer dimensions.
     unsafe {
@@ -451,6 +442,11 @@ pub extern "C" fn _start() -> ! {
                 reply.length = 0;
             }
         }
+
+        // Flush queued serial echo BEFORE blocking on IPC, otherwise
+        // characters echoed during input processing stay buffered until
+        // the next event arrives — causing a visible one-character delay.
+        unsafe { serial_try_flush(); }
 
         if skip_reply {
             let err = unsafe {

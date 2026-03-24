@@ -1,8 +1,12 @@
 //! SaltyOS PCI Enumeration Server
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! Scans PCI bus 0 via I/O port config space (0xCF8/0xCFC), builds a
-//! device registry, and distributes BAR/IRQ capabilities to drivers.
+//! Scans PCI bus 0, builds a device registry, and distributes BAR/IRQ
+//! capabilities to drivers.
+//!
+//! Architecture-specific config space access is in arch/ modules:
+//!   - x86_64: I/O port mechanism 1 (ports 0xCF8/0xCFC)
+//!   - aarch64: ECAM memory-mapped access (QEMU virt ECAM at 0x4010_0000)
 //!
 //! IPC protocol:
 //!   Label 1 = PCI_FIND_DEVICE: MR0=vendor_id, MR1=device_id
@@ -10,6 +14,9 @@
 //!   Label 2 = PCI_GET_CAPS: MR0=bus, MR1=dev, MR2=func
 //!       -> MR0=bar_phys, MR1=bar_size_bits, MR2=bar_size, MR3=irq
 //!   Label 3 = PCI_LIST: -> MR0=count, then (vendor|device, class, bar0) tuples
+//!   Label 4 = PCI_READ_CONFIG32: MR0=bus, MR1=dev, MR2=func, MR3=offset -> MR0=value
+//!   Label 5 = PCI_GET_BAR_CAP: MR0=bus, MR1=dev, MR2=func, MR3=bar_idx
+//!       -> MR0=bar_phys, MR1=bar_size, MR2=bar_is_io, extra_cap #0
 //!
 //! Cap layout (set by init service file):
 //!   0  = self TCB
@@ -17,13 +24,20 @@
 //!   2  = self CSpace
 //!   3  = server endpoint
 //!   14 = readiness notification
-//!   64 = PCI config space IoPort (0xCF8, 8 ports) -- CopyCap from init slot 15
+//!   64 = PCI config space cap (IoPort on x86_64, ECAM device untyped on aarch64)
 //!   65 = name service endpoint
 
 #![no_std]
 #![no_main]
 
 extern crate besalt;
+
+#[cfg(target_arch = "x86_64")]
+#[path = "arch/x86_64.rs"]
+mod arch;
+#[cfg(target_arch = "aarch64")]
+#[path = "arch/aarch64.rs"]
+mod arch;
 
 use besalt::consts::*;
 use besalt::ipc;
@@ -32,15 +46,11 @@ use besalt::serial;
 use besalt::serial::LineBuf;
 use besalt::types::*;
 
-const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_CSPACE: u64 = 2;
 const CAP_SERVER_EP: u64 = 3;
 const CAP_READINESS_NTFN: u64 = 14;
-const CAP_PCI_IOPORT: u64 = 64;
 const CAP_NAMESERV_EP: u64 = 65;
 const CAP_IRQ_CONTROL: u64 = 66;
-
-const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 const MAX_PCI_DEVICES: usize = 64;
 
@@ -58,6 +68,8 @@ struct PciDevice {
     subsys_id: u32,
     irq_line: u8,
     bars: [u32; 6],
+    /// Combined 64-bit physical addresses (handles 64-bit BARs)
+    bar_phys: [u64; 6],
     bar_sizes: [u32; 6],
     ioport_slots: [u64; 6],
     devut_slots: [u64; 6],
@@ -77,6 +89,7 @@ impl PciDevice {
             subsys_id: 0,
             irq_line: 0,
             bars: [0; 6],
+            bar_phys: [0; 6],
             bar_sizes: [0; 6],
             ioport_slots: [0; 6],
             devut_slots: [0; 6],
@@ -101,35 +114,13 @@ fn signal_ready() {
     let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
-/// Read 32 bits from PCI config space using mechanism 1 (IO ports 0xCF8/0xCFC).
-fn pci_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
-    let addr: u32 = (1u32 << 31)
-        | ((bus as u32) << 16)
-        | ((dev as u32) << 11)
-        | ((func as u32) << 8)
-        | ((offset as u32) & 0xFC);
-    invoke::ioport_out32(CAP_PCI_IOPORT, 0, addr);
-    invoke::ioport_in32(CAP_PCI_IOPORT, 4)
-}
-
-/// Write 32 bits to PCI config space.
-fn pci_write32(bus: u8, dev: u8, func: u8, offset: u8, value: u32) {
-    let addr: u32 = (1u32 << 31)
-        | ((bus as u32) << 16)
-        | ((dev as u32) << 11)
-        | ((func as u32) << 8)
-        | ((offset as u32) & 0xFC);
-    invoke::ioport_out32(CAP_PCI_IOPORT, 0, addr);
-    invoke::ioport_out32(CAP_PCI_IOPORT, 4, value);
-}
-
 /// Probe one PCI BAR size by writing all 1s and reading back.
 fn probe_bar_size(bus: u8, dev: u8, func: u8, bar_idx: u8) -> u32 {
     let offset = 0x10 + bar_idx * 4;
-    let original = pci_read32(bus, dev, func, offset);
-    pci_write32(bus, dev, func, offset, 0xFFFF_FFFF);
-    let mask = pci_read32(bus, dev, func, offset);
-    pci_write32(bus, dev, func, offset, original);
+    let original = arch::pci_read32(bus, dev, func, offset);
+    arch::pci_write32(bus, dev, func, offset, 0xFFFF_FFFF);
+    let mask = arch::pci_read32(bus, dev, func, offset);
+    arch::pci_write32(bus, dev, func, offset, original);
 
     if mask == 0 || mask == 0xFFFF_FFFF {
         return 0;
@@ -146,20 +137,20 @@ fn scan_bus() {
 
     let mut count = 0usize;
     for dev in 0u8..32 {
-        let vendor_device = pci_read32(0, dev, 0, 0);
+        let vendor_device = arch::pci_read32(0, dev, 0, 0);
         let vendor_id = (vendor_device & 0xFFFF) as u16;
         if vendor_id == 0xFFFF || vendor_id == 0 {
             continue;
         }
 
         // Check multi-function bit: header type (offset 0x0E) bit 7
-        let hdr_type_reg = pci_read32(0, dev, 0, 0x0C);
+        let hdr_type_reg = arch::pci_read32(0, dev, 0, 0x0C);
         let hdr_type = (hdr_type_reg >> 16) as u8;
         let func_limit = if (hdr_type & 0x80) != 0 { 8u8 } else { 1u8 };
 
         for func in 0u8..func_limit {
             if func > 0 {
-                let vd = pci_read32(0, dev, func, 0);
+                let vd = arch::pci_read32(0, dev, func, 0);
                 let vid = (vd & 0xFFFF) as u16;
                 if vid == 0xFFFF || vid == 0 {
                     continue;
@@ -170,16 +161,16 @@ fn scan_bus() {
                 break;
             }
 
-            let vd = pci_read32(0, dev, func, 0);
+            let vd = arch::pci_read32(0, dev, func, 0);
             let vid = (vd & 0xFFFF) as u16;
             let did = ((vd >> 16) & 0xFFFF) as u16;
 
-            let class_rev = pci_read32(0, dev, func, 0x08);
+            let class_rev = arch::pci_read32(0, dev, func, 0x08);
             let class_code = class_rev >> 8;
 
-            let subsys = pci_read32(0, dev, func, 0x2C);
+            let subsys = arch::pci_read32(0, dev, func, 0x2C);
 
-            let irq_reg = pci_read32(0, dev, func, 0x3C);
+            let irq_reg = arch::pci_read32(0, dev, func, 0x3C);
             let irq_line = (irq_reg & 0xFF) as u8;
 
             unsafe {
@@ -194,10 +185,43 @@ fn scan_bus() {
                 entry.irq_line = irq_line;
                 entry.active = true;
 
+                // Read all BARs (raw 32-bit values)
                 for bar_idx in 0u8..6 {
                     let offset = 0x10 + bar_idx * 4;
-                    entry.bars[bar_idx as usize] = pci_read32(0, dev, func, offset);
+                    entry.bars[bar_idx as usize] = arch::pci_read32(0, dev, func, offset);
                     entry.bar_sizes[bar_idx as usize] = probe_bar_size(0, dev, func, bar_idx);
+                }
+
+                // Compute 64-bit physical addresses, handling 64-bit BARs
+                {
+                    let mut bar_idx = 0u8;
+                    while bar_idx < 6 {
+                        let bar_raw = entry.bars[bar_idx as usize];
+                        if bar_raw == 0 && entry.bar_sizes[bar_idx as usize] == 0 {
+                            bar_idx += 1;
+                            continue;
+                        }
+                        let is_io = (bar_raw & 1) != 0;
+                        if is_io {
+                            entry.bar_phys[bar_idx as usize] = (bar_raw & !3u32) as u64;
+                            bar_idx += 1;
+                        } else {
+                            let bar_type = (bar_raw >> 1) & 3;
+                            let lo = (bar_raw & !0xFu32) as u64;
+                            if bar_type == 2 && bar_idx < 5 {
+                                // 64-bit BAR: combine with next register
+                                let hi = entry.bars[(bar_idx + 1) as usize] as u64;
+                                entry.bar_phys[bar_idx as usize] = lo | (hi << 32);
+                                // Mark next BAR as consumed (part of 64-bit pair)
+                                entry.bar_phys[(bar_idx + 1) as usize] = 0;
+                                bar_idx += 2;
+                            } else {
+                                // 32-bit MMIO BAR
+                                entry.bar_phys[bar_idx as usize] = lo;
+                                bar_idx += 1;
+                            }
+                        }
+                    }
                 }
 
                 // Create IoPort caps for I/O space BARs
@@ -205,7 +229,7 @@ fn scan_bus() {
                     let bar_raw = entry.bars[bar_idx as usize];
                     let bar_size = entry.bar_sizes[bar_idx as usize];
                     if bar_raw != 0 && bar_size != 0 && (bar_raw & 1) != 0 {
-                        let base_port = (bar_raw & !3u32) as u64;
+                        let base_port = entry.bar_phys[bar_idx as usize];
                         let num_ports = bar_size as u64;
                         let slot = *(&raw const NEXT_CAP_SLOT);
                         *(&raw mut NEXT_CAP_SLOT) = slot + 1;
@@ -219,12 +243,12 @@ fn scan_bus() {
                     }
                 }
 
-                // Create device untyped caps for MMIO BARs
+                // Create device untyped caps for MMIO BARs (using 64-bit phys)
                 for bar_idx in 0u8..6 {
                     let bar_raw = entry.bars[bar_idx as usize];
                     let bar_size = entry.bar_sizes[bar_idx as usize];
-                    if bar_raw != 0 && bar_size != 0 && (bar_raw & 1) == 0 {
-                        let phys = (bar_raw & !0xFu32) as u64;
+                    let phys = entry.bar_phys[bar_idx as usize];
+                    if phys != 0 && bar_size != 0 && (bar_raw & 1) == 0 {
                         let size_bits = ceil_log2(bar_size as u64);
                         let slot = *(&raw const NEXT_CAP_SLOT);
                         *(&raw mut NEXT_CAP_SLOT) = slot + 1;
@@ -238,12 +262,14 @@ fn scan_bus() {
                     }
                 }
 
-                // Create IRQ handler cap for devices with valid IRQ lines
-                if irq_line != 0 && irq_line != 0xFF {
+                // Create IRQ handler cap for devices with valid IRQ
+                let effective_irq = arch::resolve_pci_irq(dev, func, irq_line);
+                if effective_irq != 0 && effective_irq != 0xFF {
+                    entry.irq_line = effective_irq;
                     let slot = *(&raw const NEXT_CAP_SLOT);
                     *(&raw mut NEXT_CAP_SLOT) = slot + 1;
                     let err = invoke::irq_control_get(
-                        CAP_IRQ_CONTROL, irq_line as u64,
+                        CAP_IRQ_CONTROL, effective_irq as u64,
                         CAP_SELF_CSPACE, slot,
                     );
                     if err == 0 {
@@ -251,7 +277,7 @@ fn scan_bus() {
                     } else {
                         let mut lb = LineBuf::new();
                         lb.str(b"[pcisrv] irq_control_get IRQ ");
-                        lb.dec(irq_line as u64);
+                        lb.dec(effective_irq as u64);
                         lb.str(b" failed: ");
                         lb.dec(err as u64);
                         lb.putc(b'\n');
@@ -310,7 +336,8 @@ fn find_device(vendor_id: u16, device_id: u16) -> Option<usize> {
 }
 
 /// Register with name service.
-fn register_nameserv() {
+fn register_nameserv() -> bool {
+    puts(b"[pcisrv] Registering with nameserv\n");
     let name = b"pcisrv";
     let mut msg = BesaltMsg::zeroed();
     msg.label = POSIX_NS_REGISTER;
@@ -323,8 +350,20 @@ fn register_nameserv() {
         }
         ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
         let mut reply = BesaltMsg::zeroed();
-        ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const msg, &raw mut reply);
+        let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const msg, &raw mut reply);
+        if err != 0 || reply.label != BESALT_OK {
+            let mut lb = LineBuf::new();
+            lb.str(b"[pcisrv] nameserv register failed err=");
+            lb.hex(err as u64);
+            lb.str(b" label=");
+            lb.hex(reply.label);
+            lb.str(b"\n");
+            lb.flush();
+            return false;
+        }
     }
+    puts(b"[pcisrv] registered with nameserv\n");
+    true
 }
 
 /// Handle PCI_FIND_DEVICE request.
@@ -357,6 +396,15 @@ fn handle_find_device(msg: &BesaltMsg) -> BesaltMsg {
 }
 
 /// Handle PCI_GET_CAPS request.
+/// Enable PCI Memory Space + Bus Master for the given device.
+/// Idempotent — skips the write if both bits are already set.
+fn ensure_bus_master(bus: u8, dev: u8, func: u8) {
+    let cmd = arch::pci_read32(bus, dev, func, 0x04) & 0xFFFF;
+    if cmd & 0x6 != 0x6 {
+        arch::pci_write32(bus, dev, func, 0x04, (cmd | 0x6) as u32);
+    }
+}
+
 fn handle_get_caps(msg: &BesaltMsg) -> BesaltMsg {
     let bus = msg.regs[0] as u8;
     let dev = msg.regs[1] as u8;
@@ -384,20 +432,21 @@ fn handle_get_caps(msg: &BesaltMsg) -> BesaltMsg {
 
     let d = unsafe { &*(&raw const DEVICES[idx]) };
 
+    ensure_bus_master(bus, dev, func);
+
     let bar0 = d.bars[0];
     let bar0_size = d.bar_sizes[0];
+    let bar0_phys = d.bar_phys[0];
     let bar0_is_io = bar0 != 0 && bar0_size != 0 && (bar0 & 1) != 0;
-    if bar0 != 0 && bar0_size != 0 && !bar0_is_io {
-        // MMIO BAR
-        let phys = (bar0 & !0xFu32) as u64;
+    if bar0_phys != 0 && bar0_size != 0 && !bar0_is_io {
+        // MMIO BAR (using 64-bit physical address)
         let size_bits = ceil_log2(bar0_size as u64);
-        reply.regs[0] = phys;
+        reply.regs[0] = bar0_phys;
         reply.regs[1] = size_bits as u64;
         reply.regs[2] = bar0_size as u64;
     } else if bar0_is_io {
         // I/O space BAR
-        let base_port = (bar0 & !3u32) as u64;
-        reply.regs[0] = base_port;
+        reply.regs[0] = bar0_phys;
         reply.regs[1] = 0;
         reply.regs[2] = bar0_size as u64;
     }
@@ -459,6 +508,106 @@ fn ceil_log2(n: u64) -> u8 {
     64 - (n - 1).leading_zeros() as u8
 }
 
+/// PCI_GET_BAR_CAP: Get device untyped (or IoPort) cap for a specific BAR.
+/// Request: MR0=bus, MR1=dev, MR2=func, MR3=bar_idx
+/// Reply: MR0=bar_phys, MR1=bar_size, MR2=bar_is_io + extra_cap #0
+fn handle_get_bar_cap(msg: &BesaltMsg) -> BesaltMsg {
+    let mut reply = BesaltMsg::zeroed();
+    if msg.length < 4 {
+        reply.label = BESALT_INVALID_ARGUMENT;
+        return reply;
+    }
+    let bus = msg.regs[0] as u8;
+    let dev = msg.regs[1] as u8;
+    let func = msg.regs[2] as u8;
+    let bar_idx = msg.regs[3] as usize;
+
+    if bar_idx >= 6 {
+        reply.label = BESALT_INVALID_ARGUMENT;
+        return reply;
+    }
+
+    let count = unsafe { *(&raw const DEVICE_COUNT) };
+    let mut found = None;
+    for i in 0..count {
+        let d = unsafe { &*(&raw const DEVICES[i]) };
+        if d.active && d.bus == bus && d.dev == dev && d.func == func {
+            found = Some(i);
+            break;
+        }
+    }
+
+    let idx = match found {
+        Some(i) => i,
+        None => {
+            reply.label = BESALT_NOT_FOUND;
+            return reply;
+        }
+    };
+
+    let d = unsafe { &*(&raw const DEVICES[idx]) };
+
+    ensure_bus_master(bus, dev, func);
+
+    let bar_raw = d.bars[bar_idx];
+    let bar_size = d.bar_sizes[bar_idx];
+    let phys = d.bar_phys[bar_idx];
+
+    if phys == 0 && bar_size == 0 {
+        reply.label = BESALT_NOT_FOUND;
+        return reply;
+    }
+
+    let is_io = (bar_raw & 1) != 0;
+
+    reply.label = 0;
+    reply.length = 3;
+    reply.regs[0] = phys;
+    reply.regs[1] = bar_size as u64;
+    reply.regs[2] = if is_io { 1 } else { 0 };
+
+    // Transfer the appropriate cap
+    if is_io && d.ioport_slots[bar_idx] != 0 {
+        unsafe { ipc::set_send_cap_ctx(ipc_ctx(), 0, d.ioport_slots[bar_idx]); }
+    } else if !is_io && d.devut_slots[bar_idx] != 0 {
+        unsafe { ipc::set_send_cap_ctx(ipc_ctx(), 0, d.devut_slots[bar_idx]); }
+    }
+
+    reply
+}
+
+/// PCI_READ_CONFIG32: Read a 32-bit word from PCI config space.
+fn handle_read_config32(msg: &BesaltMsg) -> BesaltMsg {
+    let mut reply = BesaltMsg::zeroed();
+    if msg.length < 4 {
+        reply.label = BESALT_INVALID_ARGUMENT;
+        return reply;
+    }
+    let bus = msg.regs[0] as u8;
+    let dev = msg.regs[1] as u8;
+    let func = msg.regs[2] as u8;
+    let offset = msg.regs[3] as u8;
+    reply.regs[0] = arch::pci_read32(bus, dev, func, offset) as u64;
+    reply.length = 1;
+    reply
+}
+
+/// PCI_WRITE_CONFIG32: Write a 32-bit word to PCI config space.
+fn handle_write_config32(msg: &BesaltMsg) -> BesaltMsg {
+    let mut reply = BesaltMsg::zeroed();
+    if msg.length < 5 {
+        reply.label = BESALT_INVALID_ARGUMENT;
+        return reply;
+    }
+    let bus = msg.regs[0] as u8;
+    let dev = msg.regs[1] as u8;
+    let func = msg.regs[2] as u8;
+    let offset = msg.regs[3] as u8;
+    let value = msg.regs[4] as u32;
+    arch::pci_write32(bus, dev, func, offset, value);
+    reply
+}
+
 /// Server main loop.
 fn server_loop() -> ! {
     puts(b"[pcisrv] Entering server loop\n");
@@ -473,6 +622,9 @@ fn server_loop() -> ! {
             PCI_FIND_DEVICE => handle_find_device(&msg),
             PCI_GET_CAPS => handle_get_caps(&msg),
             PCI_LIST => handle_list(),
+            PCI_READ_CONFIG32 => handle_read_config32(&msg),
+            PCI_WRITE_CONFIG32 => handle_write_config32(&msg),
+            PCI_GET_BAR_CAP => handle_get_bar_cap(&msg),
             _ => {
                 let mut r = BesaltMsg::zeroed();
                 r.label = BESALT_INVALID_OPERATION;
@@ -491,16 +643,20 @@ fn server_loop() -> ! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     puts(b"[pcisrv] PCI Enumeration Server starting\n");
 
-    let _ = invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
-    unsafe {
-        (*ipc_ctx()).ipc_buffer = IPC_BUF_VADDR as *mut IpcBuffer;
-    }
-
+    arch::pci_init();
     scan_bus();
-    register_nameserv();
+    if !register_nameserv() {
+        idle();
+    }
     signal_ready();
     server_loop()
+}
+
+fn idle() -> ! {
+    loop {
+        let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+    }
 }

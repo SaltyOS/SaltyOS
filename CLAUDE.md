@@ -16,26 +16,23 @@ SaltyOS is a capability-based microkernel OS inspired by seL4, written in Rust (
 - **Rust nightly** with `rust-src` component (for `core` library cross-compilation) — edition 2024
 - **Clang** (enforced — gcc will not work; Meson checks `cc.get_id() == 'clang'`)
 - **NASM**, **Meson >= 1.1**, **Ninja**
-- **QEMU** (qemu-system-x86_64) for testing
-- **OVMF** (edk2-ovmf) for UEFI testing
+- **QEMU** (qemu-system-x86_64 / qemu-system-aarch64) for testing
+- **OVMF** / **AAVMF** for UEFI testing
 
 ## Build Commands
 
 ```bash
-just setup                  # Configure build (run once)
+just setup                  # Configure build (run once, defaults to x86_64)
 just build                  # Build all components
 just run                    # Build + run in QEMU (BIOS, single CPU)
-just run-smp                # Run with 2 CPUs
-just run-smp4               # Run with 4 CPUs
-just run-uefi               # Run with UEFI firmware
+just run --smp 2            # Run with 2 CPUs
+just run --smp 4            # Run with 4 CPUs
+just run --uefi             # Run with UEFI firmware
+just run --gdb              # QEMU with GDB server (-s -S)
+just run --debug            # Run with interrupt/reset logging (qemu.log)
+just run --headless         # Headless (serial only, no GUI)
 just rr                     # Quick rebuild + run
 just distclean              # Remove all build dirs (needed before re-setup)
-
-# Debugging
-just run-gdb                # QEMU with GDB server (-s -S)
-just gdb                    # Connect GDB to running QEMU
-just run-debug              # Run with interrupt/reset logging (qemu.log)
-just run-debug-headless     # Headless debug (no GUI)
 
 # Code quality
 just fmt                    # Format Rust (rustfmt) and C (clang-format)
@@ -46,7 +43,26 @@ just reconfigure -Dkernel_log_level=debug
 just reconfigure -Ddebug_symbols=true
 ```
 
-Build options: `arch` (x86_64), `build_boot`/`build_kernel`/`build_userland` (bool), `kernel_log_level` (error/warn/info/debug/trace), `max_cpus` (16), `kernel_stack_size` (16384).
+Flags can be combined: `just run --smp 4 --uefi --headless --debug`.
+
+### Multi-Architecture Builds
+
+The `arch` variable (default: `x86_64`) controls the target for **all** just recipes. Build directories are arch-qualified (`build-x86_64`, `build-aarch64`).
+
+```bash
+# The arch= prefix applies to any recipe: setup, build, run, tc, port, sysroot, etc.
+just arch=aarch64 setup     # Configure aarch64 build
+just arch=aarch64 build     # Build for aarch64
+just arch=aarch64 run       # Run in QEMU (aarch64 forces UEFI)
+just arch=aarch64 tc build host llvm   # Build host LLVM targeting aarch64
+just arch=aarch64 port bash            # Build bash port for aarch64
+```
+
+aarch64 is **UEFI-only** (no BIOS bootloader). QEMU uses `virt,gic-version=3` machine with Cortex-A72 CPU.
+
+### Build Options
+
+`arch` (x86_64 | aarch64), `build_boot`/`build_kernel`/`build_userland`/`build_ports` (bool), `kernel_log_level` (error/warn/info/debug/trace), `max_cpus` (1–256, default 16), `kernel_stack_size` (4096–65536, default 16384), `build_libcxx` (auto/true/false).
 
 ## Build System Details
 
@@ -55,23 +71,20 @@ No `Cargo.toml` files — all Rust code is compiled via Meson with direct `rustc
 1. `rust/meson.build` — Builds `core` and `compiler_builtins` from `rust-src`
 2. `kernel/meson.build` — Compiles kernel Rust → `.o`, assembles `.S` files, links to `kernel.elf`
 3. `lib/besalt/lib/meson.build` — Builds libbesalt (Rust → `.o` + `.rmeta`, plus `fork.S` → `.o`, links to `libbesalt.so`)
-4. `userland/*/meson.build` — Each program compiled against libbesalt `.rmeta`, linked with libbesalt `.o` + `core.o`
-5. `tools/mkcpio.py` — Packs all userland ELFs + `.service` files into `initrd.cpio`
-6. `tools/mkimage.py` — Creates bootable disk image with bootloader + kernel + initrd
+4. `lib/besalt/c/meson.build` — Builds saltyc (C stdlib → `libc.so`)
+5. `lib/besalt/cpp/meson.build` — Builds libc++ (optional, from `toolchain/llvm-project`)
+6. `userland/*/meson.build` — Each program compiled against libbesalt `.rmeta`, linked with libbesalt `.o` + `core.o`
+7. `tools/mkcpio.py` — Packs all userland ELFs + `.service` files into `initrd.cpio`
+8. `tools/mkimage.py` — Creates bootable disk image with bootloader + kernel + initrd
 
-**Kernel rustc flags** (actual, from `kernel/meson.build`):
+**Kernel rustc flags** (from `kernel/meson.build`):
 ```
---edition=2024  --target=x86_64-unknown-none
+--edition=2024  --target=<arch-specific-target-json>
 -C panic=abort  -C opt-level=2  -C debuginfo=2
 -C code-model=small  -C relocation-model=pic
 ```
 
-**Userland rustc flags** (from `lib/besalt/lib/meson.build`):
-```
---edition=2024  --target=x86_64-unknown-none
--C panic=abort  -C opt-level=2
--C code-model=small  -C relocation-model=pic
-```
+**Userland** uses built-in rustc targets (`x86_64-unknown-saltyos`, `aarch64-unknown-saltyos`) — these require the patched stage1 rustc from the custom toolchain. The kernel uses custom JSON target specs (`kernel/x86_64-saltyos.json`, `kernel/aarch64-saltyos.json`).
 
 **Init is statically linked** (embeds libbesalt.o directly). Other userland programs use shared `libbesalt.so` loaded by `rtld` (the runtime dynamic linker).
 
@@ -79,7 +92,54 @@ No `Cargo.toml` files — all Rust code is compiled via Meson with direct `rustc
 
 - **Clang is enforced.** The build fails with gcc. Do not suggest `cargo build`, `cargo test`, or create `Cargo.toml` files — this project does not use Cargo.
 - **Rust flags live in `meson.build`**, not `.cargo/config.toml`.
-- **Linker scripts:** `kernel/kernel.ld` (kernel), `lib/besalt/lib/libbesalt.ld` (shared lib).
+- **Linker scripts are per-architecture:** e.g., `kernel/arch/x86_64.ld` and `kernel/arch/aarch64.ld`; similarly each userland program has `arch/x86_64/link.ld` and `arch/aarch64/link.ld`.
+- **Meson file discovery runs at setup time** — the `find` in `kernel/meson.build` auto-discovers `.rs` files only during `meson setup`. After adding new source files: `just distclean && just setup && just build`.
+
+## Custom Toolchain
+
+SaltyOS builds a patched LLVM/Clang/LLD and rustc that know the `x86_64-unknown-saltyos` and `aarch64-unknown-saltyos` targets. Source lives in git submodules under `toolchain/llvm-project/` and `toolchain/rust/`.
+
+```bash
+just tc setup                    # Create directories
+just tc build host llvm          # Build host Clang/LLD (~30 min)
+just tc build host rust          # Build host rustc (~20 min)
+just tc doctor                   # Validate toolchain
+just tc all                      # setup → host llvm → host rust → doctor
+
+# Cross-compilation for self-hosting (arch= applies here too)
+just sysroot                     # Generate cross-compilation sysroot
+just tc build cross llvm         # Cross-compile Clang/LLD for SaltyOS
+just tc build cross rust         # Cross-compile rustc for SaltyOS
+just tc package                  # Package cross-compiled toolchain for rootfs
+just self-host                   # Full pipeline: sysroot → cross llvm → cross rust → package
+
+# aarch64 example
+just arch=aarch64 tc all         # Build host toolchain targeting aarch64
+just arch=aarch64 self-host      # Cross-compile toolchain for aarch64 SaltyOS
+```
+
+Environment setup: `eval "$(just toolchain-env)"` or `source tools/toolchain/env.sh`.
+
+## Ports System
+
+Third-party software is built via declarative `.port` files in `ports/`. Available ports: **bash**, **freebsd-utils**, **nano**, **nasm**, **ncurses**.
+
+```bash
+just port bash              # Build a port (fetch, configure, make, install)
+just fetch-ports            # Download all port sources
+just port-info bash         # Show parsed port config
+```
+
+Port format is INI-style with `[port]`, `[source]`, `[build]`, `[env]`, `[install]`, `[depends]` sections. The port build tool is in `tools/port/` (Rust). Ports are optional (`-Dbuild_ports=true`).
+
+## Rootfs and Images
+
+```bash
+just image                  # Create BIOS disk image
+just image-uefi             # Create UEFI disk image
+just mkrootfs               # Build rootfs.img (binaries + optional LLVM/ports)
+just mksaltyfs              # Generate SaltyFS test image
+```
 
 ## Code Patterns and Safety Rules
 
@@ -110,11 +170,11 @@ restore_irq(irq);
 ### Kernel Safety Constraints
 
 - **`#![no_std]` with only `core`** — no `alloc` crate, no heap allocation
-- **No floating point in kernel** — target `x86_64-unknown-none` with `-mno-sse -mno-mmx -mno-avx`
+- **No floating point in kernel** — x86_64: `-mno-sse -mno-mmx -mno-avx`; aarch64: `-mgeneral-regs-only`
 - **No kernel heap or slab** — all kernel objects are carved from untyped memory via `retype`. Objects are never freed (owned by untyped memory parent). Pointers to kernel objects remain valid for the lifetime of the system.
 - **Never `.unwrap()` or `.expect()`** in kernel hot paths — use `match` or `if let`
-- **EOI before schedulable code** — context switch can happen inside `timer_tick()`. Always send `eoi()` before calling any function that might trigger a context switch, or the APIC blocks all further timer interrupts.
-- **Per-thread state on kernel stack, not per-CPU globals** — per-CPU `%gs:16` (saved_rsp) is shared state that gets overwritten by other threads' syscalls. Save user RSP on the per-thread kernel stack instead.
+- **EOI before schedulable code** — context switch can happen inside `timer_tick()`. Always send `eoi()` before calling any function that might trigger a context switch, or the interrupt controller blocks all further timer interrupts.
+- **Per-thread state on kernel stack, not per-CPU globals** — on x86_64, per-CPU `%gs:16` (saved_rsp) is shared state that gets overwritten by other threads' syscalls. Save user RSP on the per-thread kernel stack instead.
 
 ### Unsafe Code Conventions
 
@@ -151,6 +211,7 @@ restore_irq(irq);
 | `init.rs` | Init task bootstrap, CSpace setup |
 | `rng.rs` | RDRAND-based random number generator |
 | `arch/x86_64/` | GDT, IDT, APIC, ACPI, paging, SMP, CPUID, FPU, PIT, SMAP/SMEP |
+| `arch/aarch64/` | GICv3, PSCI, generic timer, paging (TTBR0/TTBR1), FPU/NEON, PL011 UART |
 | `cap/` | CNode, Untyped retype, CDT, IoPort caps, refcounting |
 | `console/` | Kernel console output (serial + framebuffer) |
 | `ipc/` | Endpoints, Notifications, Futex, IRQ routing, IPC queue |
@@ -158,14 +219,23 @@ restore_irq(irq);
 | `sched/` | EDF scheduler, TCB, PIP, sleep queue, context switch |
 | `syscall/` | 23 syscalls, capability invocation dispatch, IPC fastpath |
 
-**Key assembly files** in `kernel/src/arch/x86_64/`:
+**Key x86_64 assembly files** in `kernel/src/arch/x86_64/`:
 - `syscall.S` — Syscall entry/exit via `syscall`/`sysretq`. User RSP is saved on the **per-thread kernel stack** (not per-CPU `%gs:16`) to prevent RSP corruption during context switches. IPC fastpath dispatch happens here (checks RAX==2 for Call, RAX==3 for ReplyRecv before slowpath).
 - `exceptions.S` — IDT exception handlers
 - `ap_tramp.S` — SMP application processor trampoline (real→long mode)
 
+**Key aarch64 details** in `kernel/src/arch/aarch64/`:
+- SMP via PSCI `CPU_ON` (HVC call), AP mailbox structure for stack/register handoff
+- GICv3: distributor (GICD), redistributor (GICR), CPU interface via system registers (ICC)
+- Generic timer: EL1 physical timer (CNTP) with PPI 30, 10ms tick
+- FPU: NEON Q0-Q31 (512 bytes) lazy context switch via CPACR_EL1 trapping
+- PL011 UART for early console output
+
 ### Syscall ABI
 
-Syscall instruction: `syscall` (not `int 0x80`). Number in `rax`, args in `rdi, rsi, rdx, r10, r8, r9`. Returns error in `rax`, value in `rdx`.
+Syscall instruction: `syscall` on x86_64 (not `int 0x80`). On aarch64: `svc #0`.
+
+x86_64: Number in `rax`, args in `rdi, rsi, rdx, r10, r8, r9`. Returns error in `rax`, value in `rdx`.
 
 | # | Name | Description |
 |---|------|-------------|
@@ -235,10 +305,10 @@ Syscall instruction: `syscall` (not `int 0x80`). Number in `rax`, args in `rdi, 
 
 ### Bootloader (C/ASM, `boot/`)
 
-3-stage bootloader supporting BIOS and UEFI:
+3-stage bootloader supporting BIOS (x86_64 only) and UEFI (both architectures):
 1. **Stage 1**: MBR (512 bytes) or UEFI PE/COFF entry
-2. **Stage 2**: Protected/long mode setup
-3. **Stage 3**: Mounts SaltyFS/FAT32, loads kernel.elf + initrd.cpio, builds TLV-encoded BootInfo, jumps to kernel with BootInfo pointer in RDI
+2. **Stage 2**: Protected/long mode setup (x86_64 BIOS) or identity map setup (aarch64 UEFI)
+3. **Stage 3**: Mounts SaltyFS/FAT32, loads kernel.elf + initrd.cpio, builds TLV-encoded BootInfo, jumps to kernel with BootInfo pointer in RDI (x86_64) or x0 (aarch64)
 
 Include paths are relative to `boot/` root (Meson `-I` flag). Files in `stage3/arch/x86/bios/` use `../../../../common/` to reach `boot/common/`.
 
@@ -267,28 +337,36 @@ Domain-based layout with programs organized by function:
 
 All userland ELFs + service files are packed into a CPIO initrd (`tools/mkcpio.py`) embedded in the disk image.
 
-### libbesalt (`lib/besalt/lib/`, Rust)
+**Architecture-specific code** in userland programs lives in `src/arch/x86_64.rs` and `src/arch/aarch64.rs` modules (e.g., `pcisrv` has PCI ECAM mapping for aarch64 vs I/O port access for x86_64).
 
-Userspace system library providing syscall wrappers, IPC helpers, capability invocations, and POSIX compatibility.
+### Libraries (`lib/besalt/`)
 
-Key modules:
+Three sub-libraries under `lib/besalt/`:
+
+**libbesalt** (`lib/besalt/lib/`, Rust) — Userspace system library:
 - `consts.rs` — Syscall numbers, invoke labels, error codes, object types, well-known cap slots, POSIX constants
 - `types.rs` — Message struct, PollFd, SockAddrUn, signal types
 - `syscall.rs` — Raw syscall wrappers (inline asm)
 - `ipc.rs` — IPC wrappers (call, send, recv, reply_recv)
 - `invoke.rs` — Capability invocation helpers (CNode/Untyped/TCB/VSpace/IRQ/IoPort ops)
-- `posix/` — POSIX compatibility directory with submodules: `at`, `file`, `misc`, `pipe`, `poll`, `proc`, `socket`
+- `posix/` — POSIX compatibility: `at`, `file`, `misc`, `pipe`, `poll`, `proc`, `socket`
 - `posix_mm.rs` — POSIX memory management (mmap, shm)
 - `signals.rs` — POSIX signal delivery via notifications
 - `cpio.rs` / `elf_loader.rs` / `elf_dynamic.rs` — CPIO parsing, ELF loading, dynamic linking support
-- `framebuffer.rs` — Framebuffer access
-- `layout.rs` — Memory layout definitions
-- `serial.rs` — Serial port I/O
-- `slot_alloc.rs` — Capability slot allocator
-- `pthread.rs` — POSIX threads support
 - `sync.rs` — Synchronization primitives (Mutex, RWLock, Semaphore)
-- `tls.rs` — Thread-local storage
-- `fork.S` — Fork assembly stub
+- `pthread.rs` — POSIX threads support
+- `fork.S` — Fork assembly stub (arch-specific: `arch/x86_64/fork.S`, `arch/aarch64/fork.S`)
+
+**saltyc** (`lib/besalt/c/`, C) — C standard library:
+- POSIX stdio, stdlib, string, unistd, signal, time, termios, dirent, regex
+- BSD compatibility (fts, getopt, termcap, pwd, grp)
+- Delegates to userspace servers (VFS, procmgr) via libbesalt IPC
+- Built as `libc.so`
+
+**libc++** (`lib/besalt/cpp/`, C++) — Optional C++ runtime:
+- libcxx + libcxxabi from `toolchain/llvm-project` sources
+- `-fno-exceptions -fno-rtti`
+- Built as `libc++.so` (auto-detected when llvm-project submodule is present)
 
 ## Rust 2024 Edition
 
@@ -305,7 +383,7 @@ Key modules:
 - **Fat capabilities**: 32 bytes with inline metadata (object ptr, rights, type, depth, badge, parent ptr)
 - **CNode sizing**: 4-16 bits (16 to 65,536 slots)
 - **EDF scheduler**: Per-CPU ready queues, IPI-driven reschedule for affinity changes
-- **SMP**: ACPI MADT discovery, AP trampoline, per-CPU GDT/TSS/APIC, IPI messaging
+- **SMP**: x86_64 uses ACPI MADT + AP trampoline; aarch64 uses PSCI CPU_ON + mailbox handoff
 - **Frame minimum**: size_bits=12 enforced (4K pages) to prevent misaligned objects
 - **IPC fastpath**: Assembly-dispatched fast path for Call (syscall 2) and ReplyRecv (syscall 3) — bails to slowpath for extra_caps>0, length>4, no waiting partner, cross-CPU, or fault-blocked
 - **Bound notifications**: Bidirectional TCB↔Notification link; signals wake RecvBlocked threads
@@ -320,12 +398,13 @@ Key modules:
 
 ### New Userland Program
 
-1. Create `userland/<name>/src/main.rs` with `#![no_std]` and `#![no_main]`
-2. Create `userland/<name>/meson.build` (copy pattern from an existing program like `userland/test_runner/meson.build`)
-3. Create `userland/services/<name>.service` with `[Service]` and `[Dependencies]` sections
-4. Add `subdir('<name>')` to `userland/meson.build`
-5. Add the ELF and service file entries to the manifest in `tools/mkcpio.py`
-6. Run `just distclean && just setup && just build`
+1. Create `userland/<domain>/<name>/src/main.rs` with `#![no_std]` and `#![no_main]`
+2. Create arch-specific linker scripts: `userland/<domain>/<name>/arch/x86_64/link.ld` and `arch/aarch64/link.ld`
+3. Create `userland/<domain>/<name>/meson.build` (copy pattern from an existing program like `userland/tests/test_runner/meson.build`)
+4. Create `userland/services/<name>.service` with `[Service]` and `[Dependencies]` sections
+5. Add `subdir('<domain>/<name>')` to `userland/meson.build`
+6. Add the ELF and service file entries to the manifest in `tools/mkcpio.py`
+7. Run `just distclean && just setup && just build`
 
 ### New Syscall
 
@@ -349,9 +428,9 @@ No formal unit test framework. Testing is done via QEMU boot and serial output o
 ```bash
 just build                      # Must succeed before any commit
 just run                        # Quick smoke test — watch serial for KERNEL PANIC
-just run-smp                    # SMP test — race conditions only show with >1 CPU
-just run-smp4                   # Stress test with 4 CPUs
-just run-debug-headless         # CI-like testing (serial only, logs to qemu.log)
+just run --smp 2                # SMP test — race conditions only show with >1 CPU
+just run --smp 4                # Stress test with 4 CPUs
+just run --headless --debug     # CI-like testing (serial only, logs to qemu.log)
 just fmt-check                  # Check kernel Rust formatting
 ```
 
@@ -365,13 +444,14 @@ Format: `<type>(<scope>): <subject>` (scope is optional for cross-cutting change
 
 **Types:** `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `perf`
 
-**Scopes:** `kernel`, `boot`, `ipc`, `sched`, `cap`, `mm`, `vspace`, `syscall`, `libbesalt`, `init`, `procmgr`, `vfs`, `console`, `nameserv`, `test_runner`, `mmsrv`, `rtld`, `ttyd`, `getty`, `blkdrv`, `pcisrv`, `display`, `saltyfs`
+**Scopes:** `kernel`, `boot`, `ipc`, `sched`, `cap`, `mm`, `vspace`, `syscall`, `libbesalt`, `saltyc`, `init`, `procmgr`, `vfs`, `console`, `nameserv`, `test_runner`, `mmsrv`, `rtld`, `ttyd`, `getty`, `blkdrv`, `pcisrv`, `display`, `saltyfs`
 
 Examples:
 ```
 feat(ipc): add notification polling with timeout
 fix(sched): send EOI before timer_tick to prevent APIC lockup
 feat: implement POSIX Phase 2 — sockets, poll, shm, fd passing
+feat(kernel): aarch64 SMP support — PSCI AP bringup, GICv3 IPI, per-CPU data
 docs: update design docs for bound notification
 ```
 
@@ -379,7 +459,7 @@ docs: update design docs for bound notification
 
 - [ ] `just build` succeeds with no new warnings
 - [ ] `just run` boots to test_runner output without panics
-- [ ] `just run-smp` does not deadlock or corrupt state
+- [ ] `just run --smp 2` does not deadlock or corrupt state
 - [ ] `just fmt-check` passes
 - [ ] Constants in sync: any new syscall/invoke label/error code in both kernel and `consts.rs`
 - [ ] Design docs updated if architectural changes were made

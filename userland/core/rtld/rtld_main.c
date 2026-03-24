@@ -27,14 +27,22 @@ uint64_t __besalt_tls_module_count = 0;
 struct rtld_tls_module __besalt_tls_modules[RTLD_MAX_OBJECTS];
 
 void __attribute__((naked, noreturn)) _start(void) {
+#if defined(__x86_64__)
     __asm__ volatile(
         "mov %%rsp, %%rdi\n"
         "call rtld_main\n"
         : : : "memory"
     );
+#elif defined(__aarch64__)
+    __asm__ volatile(
+        "mov x0, sp\n"
+        "bl rtld_main\n"
+        : : : "memory"
+    );
+#endif
 }
 
-/* Self-relocate the rtld's own R_X86_64_RELATIVE entries.
+/* Self-relocate the rtld's own R_RELATIVE entries.
  * Called before any global data can be accessed reliably.
  */
 static void self_relocate(uint64_t base, Elf64_Dyn *dyn) {
@@ -54,7 +62,7 @@ static void self_relocate(uint64_t base, Elf64_Dyn *dyn) {
     uint64_t count = rela_size / sizeof(Elf64_Rela);
     for (uint64_t i = 0; i < count; i++) {
         uint32_t type = ELF64_R_TYPE(rela[i].r_info);
-        if (type == R_X86_64_RELATIVE) {
+        if (type == R_RELATIVE) {
             uint64_t *target = (uint64_t *)(base + rela[i].r_offset);
             *target = base + (uint64_t)rela[i].r_addend;
         }
@@ -183,7 +191,7 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
 
     /* 2. Self-relocate.
      * at_base is the load address of the rtld itself.
-     * Find our own PT_DYNAMIC and apply R_X86_64_RELATIVE.
+     * Find our own PT_DYNAMIC and apply R_RELATIVE.
      */
     g_rtld.rtld_base = at_base;
     if (at_base != 0) {
@@ -435,12 +443,10 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
      *   - RSP % 16 == 8 at entry
      * Startup code for both C and Rust relies on this contract.
      */
-    __asm__ volatile(
-        "mov %0, %%rsp\n"
-        "xor %%rbp, %%rbp\n"
-        "jmp *%1\n"
-        : : "r"(sp), "r"((void *)(uintptr_t)g_rtld.exe_entry)
-        : "memory"
-    );
-    __builtin_unreachable();
+#if defined(__aarch64__)
+    /* Ensure all prior stores (GOT patches, PLT binding, TLS exports) are
+     * globally visible before jumping to the executable entry point. */
+    __asm__ volatile("dsb ish\n" "isb\n" : : : "memory");
+#endif
+    rtld_jump_entry_arch((uint64_t)(uintptr_t)sp, (void *)(uintptr_t)g_rtld.exe_entry);
 }

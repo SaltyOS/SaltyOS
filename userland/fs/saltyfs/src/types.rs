@@ -145,6 +145,16 @@ pub(crate) struct ExtentData {
     pub(crate) num_bytes: u64,
 }
 
+#[inline]
+pub(crate) unsafe fn read_inode_item(data_ptr: *const u8) -> SaltyInodeItem {
+    unsafe { core::ptr::read_unaligned(data_ptr as *const SaltyInodeItem) }
+}
+
+#[inline]
+pub(crate) unsafe fn read_extent_data(data_ptr: *const u8) -> ExtentData {
+    unsafe { core::ptr::read_unaligned(data_ptr as *const ExtentData) }
+}
+
 /// Directory item header is tightly packed on disk:
 ///   child_ino: u64, name_len: u16, dir_type: u8, pad: u8
 /// Name bytes follow immediately after this 12-byte header.

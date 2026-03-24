@@ -265,7 +265,7 @@ pub(crate) fn get_inode(ino: u64) -> Option<SaltyInodeItem> {
             if size < core::mem::size_of::<SaltyInodeItem>() as u32 {
                 return None;
             }
-            Some(unsafe { *(data as *const SaltyInodeItem) })
+            Some(unsafe { read_inode_item(data) })
         }
         None => None,
     }
@@ -301,7 +301,7 @@ fn read_file_data(ino: u64, file_offset: u64, count: u64, dest_base: u64) -> u64
             return false;
         }
 
-        let extent = unsafe { &*(data_ptr as *const ExtentData) };
+        let extent = unsafe { read_extent_data(data_ptr) };
         let extent_file_offset = key.offset;
 
         if extent.extent_type == EXTENT_INLINE {
@@ -560,7 +560,7 @@ fn delete_all_extents(ino: u64) {
 
         btree_find_all_for_ino(root_tree, ino, BESALT_EXTENT_DATA, |key, data_ptr, _size| {
             if count < 128 {
-                let ext = unsafe { &*(data_ptr as *const ExtentData) };
+                let ext = unsafe { read_extent_data(data_ptr) };
                 offsets[count] = key.offset;
                 types[count] = ext.extent_type;
                 disk_addrs[count] = ext.disk_bytenr;
@@ -950,7 +950,7 @@ pub(crate) fn handle_write_inline(msg: &BesaltMsg) -> BesaltMsg {
 
         if let Some((ext_ptr, ext_size)) = btree_find_item(root_tree, &extent_key) {
             had_extent = true;
-            let ext = unsafe { &*(ext_ptr as *const ExtentData) };
+            let ext = unsafe { read_extent_data(ext_ptr) };
             if ext.extent_type == EXTENT_INLINE {
                 let ext_hdr_size = core::mem::size_of::<ExtentData>();
                 let inline_len = (ext_size as usize).saturating_sub(ext_hdr_size);
@@ -1041,7 +1041,7 @@ fn write_regular_extents(
     };
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
     if let Some((ext_ptr, ext_size)) = btree_find_item(root_tree, &inline_key) {
-        let ext = unsafe { &*(ext_ptr as *const ExtentData) };
+        let ext = unsafe { read_extent_data(ext_ptr) };
         if ext.extent_type == EXTENT_INLINE {
             let inline_len = (ext_size as usize).saturating_sub(ext_hdr_size);
             let promo_block = match alloc_block() {
@@ -1101,7 +1101,7 @@ fn write_regular_extents(
 
         if let Some((ext_ptr, _)) = existing {
             had_extent = true;
-            let ext = unsafe { &*(ext_ptr as *const ExtentData) };
+            let ext = unsafe { read_extent_data(ext_ptr) };
             if ext.extent_type == EXTENT_REGULAR && ext.disk_bytenr != 0 {
                 old_data_block = ext.disk_bytenr / bs;
                 let existing_data = read_block(old_data_block);
@@ -1602,7 +1602,7 @@ pub(crate) fn handle_truncate_fs(msg: &BesaltMsg) -> BesaltMsg {
     };
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
     if let Some((ext_ptr, ext_size)) = btree_find_item(root_tree, &ext_key_0) {
-        let ext = unsafe { &*(ext_ptr as *const ExtentData) };
+        let ext = unsafe { read_extent_data(ext_ptr) };
         if ext.extent_type == EXTENT_INLINE {
             if new_size == 0 {
                 if !btree_cow_delete(&ext_key_0) {
@@ -1648,7 +1648,7 @@ pub(crate) fn handle_truncate_fs(msg: &BesaltMsg) -> BesaltMsg {
         let mut ext_count = 0usize;
 
         btree_find_all_for_ino(root_tree, ino, BESALT_EXTENT_DATA, |key, data_ptr, _size| {
-            let ext = unsafe { &*(data_ptr as *const ExtentData) };
+            let ext = unsafe { read_extent_data(data_ptr) };
             if ext.extent_type == EXTENT_REGULAR && key.offset >= new_size {
                 if ext_count < 128 {
                     ext_offsets[ext_count] = key.offset;
@@ -1781,7 +1781,7 @@ pub(crate) fn handle_write_shm(msg: &BesaltMsg) -> BesaltMsg {
     };
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
     if let Some((ext_ptr, ext_size)) = btree_find_item(root_tree, &inline_key) {
-        let ext = unsafe { &*(ext_ptr as *const ExtentData) };
+        let ext = unsafe { read_extent_data(ext_ptr) };
         if ext.extent_type == EXTENT_INLINE {
             let inline_len = (ext_size as usize).saturating_sub(ext_hdr_size);
             let promo_block = match alloc_block() {
@@ -1840,7 +1840,7 @@ pub(crate) fn handle_write_shm(msg: &BesaltMsg) -> BesaltMsg {
 
         if let Some((ext_ptr, _)) = existing {
             had_extent = true;
-            let ext = unsafe { &*(ext_ptr as *const ExtentData) };
+            let ext = unsafe { read_extent_data(ext_ptr) };
             if ext.extent_type == EXTENT_REGULAR && ext.disk_bytenr != 0 {
                 old_data_block = ext.disk_bytenr / bs;
                 let existing_data = read_block(old_data_block);

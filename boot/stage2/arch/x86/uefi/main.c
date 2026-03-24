@@ -40,8 +40,22 @@ static EFI_HANDLE gImageHandle;
 /* Stage2Info to pass to Stage 3 */
 static struct Stage2Info g_stage2_info;
 
-/* Stage 3 load address */
-#define UEFI_STAGE3_LOAD_ADDR    0x100000    /* 1MB */
+/*
+ * Stage 3 load address.
+ *
+ * x86_64 keeps the historical 1MB UEFI load address.
+ * QEMU's aarch64 virt machine exposes RAM starting at 0x40000000, so the
+ * ARM loader must live in that window rather than in x86-style low memory.
+ */
+#if defined(__aarch64__)
+#define STAGE2_ARCH              ARCH_AARCH64
+#define UEFI_STAGE3_LOAD_ADDR    0x40200000ULL
+#else
+#define STAGE2_ARCH              ARCH_X86_64
+#define UEFI_STAGE3_LOAD_ADDR    0x00100000ULL
+#define UEFI_STAGE3_STACK_BASE   0x170000ULL
+#define UEFI_STAGE3_STACK_PAGES  16
+#endif
 
 /* Convenience wrappers using the shared print utilities */
 #define Print(s)             efi_print(s)
@@ -61,6 +75,28 @@ static int GuidCompare(EFI_GUID *g1, EFI_GUID *g2)
             return p1[i] - p2[i];
     }
     return 0;
+}
+
+static void ZeroBuffer(void *buffer, UINTN size)
+{
+    uint8_t *bytes = (uint8_t *)buffer;
+    for (UINTN i = 0; i < size; i++)
+        bytes[i] = 0;
+}
+
+static EFI_STATUS ReserveStage3Stack(void)
+{
+#if defined(__aarch64__)
+    /*
+     * aarch64 Stage 3 uses its own BSS stack in entry_uefi.S and does not
+     * need a fixed low-memory reservation.
+     */
+    return EFI_SUCCESS;
+#else
+    uint64_t stack_addr = UEFI_STAGE3_STACK_BASE;
+    return gBS->AllocatePages(AllocateAddress, EfiLoaderData,
+                               UEFI_STAGE3_STACK_PAGES, &stack_addr);
+#endif
 }
 
 /*
@@ -261,6 +297,8 @@ static EFI_STATUS LoadFileAllocated(CHAR16 *Path, uint64_t LoadAddr,
         return status;
     }
 
+    ZeroBuffer((void *)(uintptr_t)LoadAddr, NumPages * EFI_PAGE_SIZE);
+
     /* Read file */
     status = File->Read(File, &Size, (void *)LoadAddr);
 
@@ -307,7 +345,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
     g_stage2_info.magic = STAGE2_MAGIC;
     g_stage2_info.version = STAGE2_VERSION;
-    g_stage2_info.arch = ARCH_X86_64;
+    g_stage2_info.arch = STAGE2_ARCH;
     g_stage2_info.boot_mode = BOOT_MODE_UEFI;
     g_stage2_info.boot_drive = 0;
     g_stage2_info.flags = STAGE2_FLAG_LONG_MODE | STAGE2_FLAG_PAGING_ENABLED;
@@ -351,22 +389,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     /* Get framebuffer info */
     GetFramebufferInfo();
 
-    /*
-     * Reserve stack region for Stage 3 entry assembly.
-     * entry_uefi.asm sets RSP = 0x180000 (stack grows down), so we need
-     * to ensure 0x170000-0x180000 (64KB) is not used by Boot Services.
-     */
-    {
-        #define UEFI_STAGE3_STACK_BASE  0x170000  /* 64KB below 1.5MB */
-        #define UEFI_STAGE3_STACK_PAGES 16        /* 64KB = 16 * 4KB pages */
-
-        uint64_t stack_addr = UEFI_STAGE3_STACK_BASE;
-        status = gBS->AllocatePages(AllocateAddress, EfiLoaderData,
-                                     UEFI_STAGE3_STACK_PAGES, &stack_addr);
-        if (EFI_ERROR(status)) {
-            PrintError(L"AllocatePages(Stage3 stack)", status);
-            return status;
-        }
+    status = ReserveStage3Stack();
+    if (EFI_ERROR(status)) {
+        PrintError(L"AllocatePages(Stage3 stack)", status);
+        return status;
     }
 
     /* Load Stage 3 at fixed address using AllocatePages */
@@ -400,6 +426,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
     /* Should never return */
     for (;;) {
+#if defined(__x86_64__) || defined(__i386__)
         __asm__ volatile("cli; hlt");
+#elif defined(__aarch64__)
+        __asm__ volatile("msr DAIFSet, #0xF; wfi");
+#endif
     }
 }

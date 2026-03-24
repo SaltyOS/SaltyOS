@@ -4,15 +4,18 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-mod frame;
+pub mod frame;
 pub mod vspace;
+pub mod node_alloc;
+pub mod radix_tree;
+pub mod maple_tree;
 
 pub use frame::FrameAllocator;
 pub use vspace::{
     advance_quiescent_gen, current_vspace_tracking, kernel_vspace_root, kernel_vspace_tracking,
     process_deferred_free, restore_irq, save_irq_disable, set_current_vspace_tracking,
     set_online_cpu_count, set_pending_deactivate, take_pending_deactivate, DeactivateResult,
-    VSpace, VSpaceTracking,
+    PageFaultInfo, VSpace, VSpaceTracking,
 };
 
 use crate::ParsedBootInfo;
@@ -103,7 +106,12 @@ impl SpinLock {
 /// untyped child tracking, and capability lookup.
 ///
 /// Lock ordering (outermost → innermost):
-///   CAP_LOCK → endpoint.lock / ntfn.lock / tcb.lock / sc.lock → SLEEP_LOCK / FUTEX_LOCK / IRQ_LOCK → sched.lock_cpu → VSpace.lock → FRAME_LOCK → SERIAL_LOCK
+///   CAP_LOCK → endpoint.lock / ntfn.lock / tcb.lock / sc.lock → SLEEP_LOCK / FUTEX_LOCK / IRQ_LOCK → sched.lock_cpu → VSpace.lock → ASID_LOCK → FRAME_LOCK → SERIAL_LOCK
+///
+/// MemoryObject::destroy() runs after refcount reaches 0 (no concurrent
+/// accessors). It acquires VSpace.lock per reverse-map entry without
+/// holding CAP_LOCK (released before release_object), which is safe
+/// because no outer locks are held at that point.
 ///
 /// Subsystem locks (SLEEP_LOCK, FUTEX_LOCK, IRQ_LOCK) are independent of each other
 /// and of per-object locks. They protect their own global data structures.
@@ -123,18 +131,33 @@ pub fn init(boot_info: &ParsedBootInfo) {
     }
 }
 
-/// Allocate a physical frame (SMP-safe)
-pub fn alloc_frame() -> Option<PhysAddr> {
+// ---------------------------------------------------------------------------
+// PMM public API (SMP-safe)
+// ---------------------------------------------------------------------------
+
+/// Allocate a physical frame with mandatory ownership declaration.
+pub fn pmm_alloc(owner: &frame::FrameOwner) -> Option<PhysAddr> {
     let irq_flag = unsafe { save_irq_disable() };
     FRAME_LOCK.lock();
-    let result = unsafe { (*(&raw mut FRAME_ALLOCATOR)).as_mut()?.alloc() };
+    let result = unsafe {
+        if let Some(a) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
+            if let Some(phys) = a.alloc() {
+                a.set_owner(phys, owner);
+                Some(phys)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
     FRAME_LOCK.unlock();
     unsafe { restore_irq(irq_flag) };
     result
 }
 
-/// Allocate contiguous physical frames (SMP-safe)
-pub fn alloc_contiguous_frames(count: usize) -> Option<PhysAddr> {
+/// Allocate contiguous physical frames. Caller must tag each frame via `pmm_set_owner`.
+pub fn pmm_alloc_contiguous(count: usize) -> Option<PhysAddr> {
     let irq_flag = unsafe { save_irq_disable() };
     FRAME_LOCK.lock();
     let result = unsafe { (*(&raw mut FRAME_ALLOCATOR)).as_mut()?.alloc_contiguous(count) };
@@ -143,131 +166,148 @@ pub fn alloc_contiguous_frames(count: usize) -> Option<PhysAddr> {
     result
 }
 
-/// Free a physical frame (SMP-safe)
-pub fn free_frame(addr: PhysAddr) {
+/// Free a physical frame with ownership verification. Panics on mismatch.
+pub fn pmm_free(addr: PhysAddr, expected: &frame::FrameOwner) {
     let irq_flag = unsafe { save_irq_disable() };
     FRAME_LOCK.lock();
     unsafe {
-        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
-            allocator.free(addr);
+        if let Some(a) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
+            a.free_owned(addr, expected);
         }
     }
     FRAME_LOCK.unlock();
     unsafe { restore_irq(irq_flag) };
 }
 
-/// Retain one mapping reference for a physical page (SMP-safe).
-pub fn retain_frame_mapping(addr: PhysAddr) {
+/// Set/change the owner tag on an already-allocated frame.
+/// Used after `pmm_alloc_contiguous` or when re-tagging during COW.
+pub fn pmm_set_owner(addr: PhysAddr, owner: &frame::FrameOwner) {
     let irq_flag = unsafe { save_irq_disable() };
     FRAME_LOCK.lock();
     unsafe {
-        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
-            allocator.retain_mapping_ref(addr);
+        if let Some(a) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
+            a.set_owner(addr, owner);
         }
     }
     FRAME_LOCK.unlock();
     unsafe { restore_irq(irq_flag) };
 }
 
-/// Release one mapping reference for a physical page (SMP-safe).
-pub fn release_frame_mapping(addr: PhysAddr) {
+/// Transfer ownership between non-Free states. Panics on old tag mismatch.
+pub fn pmm_transfer(addr: PhysAddr, old: &frame::FrameOwner, new: &frame::FrameOwner) {
     let irq_flag = unsafe { save_irq_disable() };
     FRAME_LOCK.lock();
     unsafe {
-        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
-            allocator.release_mapping_ref(addr);
+        if let Some(a) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
+            a.transfer(addr, old, new);
         }
     }
     FRAME_LOCK.unlock();
     unsafe { restore_irq(irq_flag) };
 }
 
-/// Retain frame-object ownership references for a frame range (SMP-safe).
-pub fn retain_frame_object(addr: PhysAddr, size_bits: u8) {
+/// Reverse lookup: get owner metadata for a physical address. O(1).
+pub fn pmm_lookup(addr: PhysAddr) -> Option<frame::FrameMeta> {
+    let irq_flag = unsafe { save_irq_disable() };
+    FRAME_LOCK.lock();
+    let result = unsafe {
+        (*(&raw mut FRAME_ALLOCATOR))
+            .as_ref()
+            .and_then(|a| a.lookup(addr).copied())
+    };
+    FRAME_LOCK.unlock();
+    unsafe { restore_irq(irq_flag) };
+    result
+}
+
+/// Increment map_count when a PTE is installed for this phys frame.
+pub fn pmm_retain_mapping(addr: PhysAddr) {
     let irq_flag = unsafe { save_irq_disable() };
     FRAME_LOCK.lock();
     unsafe {
-        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
-            allocator.retain_object_ref(addr, size_bits);
+        if let Some(a) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
+            a.retain_mapping_ref(addr);
         }
     }
     FRAME_LOCK.unlock();
     unsafe { restore_irq(irq_flag) };
 }
 
-/// Release frame-object ownership references for a frame range (SMP-safe).
-pub fn release_frame_object(addr: PhysAddr, size_bits: u8) {
+/// Decrement map_count when a PTE is removed.
+pub fn pmm_release_mapping(addr: PhysAddr) {
     let irq_flag = unsafe { save_irq_disable() };
     FRAME_LOCK.lock();
     unsafe {
-        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
-            allocator.release_object_ref(addr, size_bits);
+        if let Some(a) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
+            a.release_mapping_ref(addr);
         }
     }
     FRAME_LOCK.unlock();
     unsafe { restore_irq(irq_flag) };
 }
 
-/// Mark a frame as used for page tables — prevents refcount-driven reclamation (SMP-safe).
-pub fn mark_frame_pt_owned(addr: PhysAddr) {
+/// Allocate from the emergency reserve (fault-path only).
+/// Allocate from the emergency reserve. Only callable during fault handling.
+/// Panics if called outside a fault context (checked via current TCB state).
+pub fn pmm_alloc_reserve() -> Option<PhysAddr> {
+    // Verify fault context: current thread must be in FaultBlocked or
+    // we must be inside an exception handler (IRQs disabled + on kernel stack).
+    // In practice, this is called from the COW fast-path inside exception
+    // handlers where IRQs are already disabled. The check is that we're
+    // not in normal syscall context.
+    #[cfg(debug_assertions)]
+    {
+        let scheduler = unsafe { crate::sched::scheduler::scheduler() };
+        let current = scheduler.current();
+        if !current.is_null() {
+            // If the thread is Running (not in fault handler), this is misuse.
+            // Fault handlers set state to FaultBlocked before IPC, but the
+            // kernel fast-path runs before that transition. We check that
+            // IRQs are disabled as a proxy for "we're in exception context."
+            if !vspace::irqs_disabled() {
+                panic!("pmm_alloc_reserve called outside fault context");
+            }
+        }
+    }
+
+    let irq_flag = unsafe { save_irq_disable() };
+    FRAME_LOCK.lock();
+    let result = unsafe {
+        (*(&raw mut FRAME_ALLOCATOR))
+            .as_mut()
+            .and_then(|a| a.alloc_reserve())
+    };
+    FRAME_LOCK.unlock();
+    unsafe { restore_irq(irq_flag) };
+    result
+}
+
+/// Replenish the emergency reserve pool (up to `count` frames).
+pub fn pmm_replenish_reserve(count: usize) {
     let irq_flag = unsafe { save_irq_disable() };
     FRAME_LOCK.lock();
     unsafe {
-        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
-            allocator.mark_pt_owned(addr);
+        if let Some(a) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
+            a.replenish_reserve(count);
         }
     }
     FRAME_LOCK.unlock();
     unsafe { restore_irq(irq_flag) };
 }
 
-/// Clear the page-table ownership flag for a frame (SMP-safe).
-/// Call this before release_frame_mapping() during VSpace teardown.
-pub fn clear_frame_pt_owned(addr: PhysAddr) {
+/// Get free frame count.
+pub fn pmm_free_count() -> usize {
     let irq_flag = unsafe { save_irq_disable() };
     FRAME_LOCK.lock();
-    unsafe {
-        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
-            allocator.clear_pt_owned(addr);
-        }
-    }
+    let result = unsafe {
+        (*(&raw mut FRAME_ALLOCATOR))
+            .as_ref()
+            .map(|a| a.free_count())
+            .unwrap_or(0)
+    };
     FRAME_LOCK.unlock();
     unsafe { restore_irq(irq_flag) };
-}
-
-/// Mark a frame as allocated for kernel runtime use (SMP-safe).
-pub fn mark_frame_kernel_runtime(addr: PhysAddr) {
-    let irq_flag = unsafe { save_irq_disable() };
-    FRAME_LOCK.lock();
-    unsafe {
-        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
-            allocator.mark_kernel_runtime(addr);
-        }
-    }
-    FRAME_LOCK.unlock();
-    unsafe { restore_irq(irq_flag) };
-}
-
-/// Clear the kernel-runtime flag for a frame (SMP-safe).
-/// Call before release_frame_mapping() for kernel-runtime frames during teardown.
-pub fn clear_frame_kernel_runtime(addr: PhysAddr) {
-    let irq_flag = unsafe { save_irq_disable() };
-    FRAME_LOCK.lock();
-    unsafe {
-        if let Some(allocator) = (*(&raw mut FRAME_ALLOCATOR)).as_mut() {
-            allocator.clear_kernel_runtime(addr);
-        }
-    }
-    FRAME_LOCK.unlock();
-    unsafe { restore_irq(irq_flag) };
-}
-
-/// Free multiple contiguous frames
-pub fn free_frames(addr: PhysAddr, size_bytes: usize) {
-    let num_frames = (size_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-    for i in 0..num_frames {
-        free_frame(addr + (i * PAGE_SIZE) as u64);
-    }
+    result
 }
 
 /// Align value up to alignment boundary
@@ -350,17 +390,3 @@ pub fn max_phys() -> u64 {
     result
 }
 
-/// Get the number of free physical frames (SMP-safe)
-pub fn free_frame_count() -> usize {
-    let irq_flag = unsafe { save_irq_disable() };
-    FRAME_LOCK.lock();
-    let count = unsafe {
-        match (*(&raw mut FRAME_ALLOCATOR)).as_ref() {
-            Some(allocator) => allocator.free_count(),
-            None => 0,
-        }
-    };
-    FRAME_LOCK.unlock();
-    unsafe { restore_irq(irq_flag) };
-    count
-}

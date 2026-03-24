@@ -72,6 +72,23 @@
 #define R_X86_64_64         1
 #define R_X86_64_RELATIVE   8
 
+/* aarch64 relocation types */
+#define R_AARCH64_NONE      0
+#define R_AARCH64_ABS64     257
+#define R_AARCH64_RELATIVE  1027
+
+#if defined(__aarch64__)
+#define ELF_EXPECTED_MACHINE  EM_AARCH64
+#define ELF_RELOC_NONE        R_AARCH64_NONE
+#define ELF_RELOC_ABS64       R_AARCH64_ABS64
+#define ELF_RELOC_RELATIVE    R_AARCH64_RELATIVE
+#else
+#define ELF_EXPECTED_MACHINE  EM_X86_64
+#define ELF_RELOC_NONE        R_X86_64_NONE
+#define ELF_RELOC_ABS64       R_X86_64_64
+#define ELF_RELOC_RELATIVE    R_X86_64_RELATIVE
+#endif
+
 /* ELF64 header */
 struct Elf64_Ehdr {
     uint8_t  e_ident[16];   /* ELF identification */

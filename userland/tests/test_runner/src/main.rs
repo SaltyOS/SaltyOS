@@ -23,19 +23,16 @@ mod test_epoll;
 mod test_pthread;
 mod test_saltyfs;
 mod test_dns;
-#[cfg(besaltc_sse2)]
+#[cfg(target_arch = "x86_64")]
 mod test_sse;
+#[cfg(target_arch = "aarch64")]
+mod test_neon;
 
 use besalt::consts::*;
-use besalt::ipc;
 use besalt::posix;
 use besalt::serial;
 use besalt::serial::LineBuf;
-use besalt::types::*;
 
-// Standard child CSpace layout
-const CAP_SELF_TCB: u64 = 0;
-const CAP_MMSRV_EP: u64 = 7;
 const CAP_READINESS_NTFN: u64 = 14;
 
 fn puts(s: &[u8]) {
@@ -47,29 +44,7 @@ fn signal_ready() {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
-    // IPC buffer is pre-mapped by procmgr at 0x200000
-    besalt::besalt_tcb_set_ipc_buffer(CAP_SELF_TCB, 0x200000);
-    unsafe {
-        ipc::ipc_context_init(&raw mut besalt::__besalt_ipc_ctx, 0x200000 as *mut IpcBuffer);
-    }
-
-    // Initialize main-thread TLS (required for pthreads)
-    unsafe { besalt::tls::init_main_thread_tls() };
-
-    // Initialize per-process slot allocator from RTLD-exported globals
-    unsafe {
-        let base = *(&raw const besalt::__besalt_slot_base);
-        let count = *(&raw const besalt::__besalt_slot_count);
-        let cspace_ntfn = *(&raw const besalt::__besalt_cspace_ntfn);
-        if base != 0 {
-            besalt::slot_alloc::slot_alloc_init(base, count, cspace_ntfn);
-        } else {
-            puts(b"[TEST_RUNNER] FATAL: slot pool not provided by RTLD/auxv\n");
-            posix::posix_exit(1);
-        }
-    }
-
+pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     puts(b"[TEST_RUNNER] SaltyOS Test Runner starting\n");
     signal_ready();
 
@@ -88,12 +63,16 @@ pub extern "C" fn _start() -> ! {
         (b"test_saltyfs", test_saltyfs::run),
         (b"test_dns", test_dns::run),
     ];
-    #[cfg(besaltc_sse2)]
-    let sse_tests: [(&[u8], fn() -> bool); 1] = [
+    #[cfg(target_arch = "x86_64")]
+    let arch_tests: [(&[u8], fn() -> bool); 1] = [
         (b"test_sse", test_sse::run),
     ];
-    #[cfg(not(besaltc_sse2))]
-    let sse_tests: [(&[u8], fn() -> bool); 0] = [];
+    #[cfg(target_arch = "aarch64")]
+    let arch_tests: [(&[u8], fn() -> bool); 1] = [
+        (b"test_neon", test_neon::run),
+    ];
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let arch_tests: [(&[u8], fn() -> bool); 0] = [];
 
     let mut passed = 0u32;
     let mut failed = 0u32;
@@ -117,7 +96,7 @@ pub extern "C" fn _start() -> ! {
     }
 
     run_suite(&base_tests, &mut passed, &mut failed);
-    run_suite(&sse_tests, &mut passed, &mut failed);
+    run_suite(&arch_tests, &mut passed, &mut failed);
 
     { let mut lb = LineBuf::new(); lb.str(b"[TEST_RUNNER] Results: "); lb.dec(passed as u64); lb.str(b" passed, "); lb.dec(failed as u64); lb.str(b" failed\n"); lb.flush(); }
 

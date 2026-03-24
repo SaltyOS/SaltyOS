@@ -14,7 +14,7 @@ mod gdt;
 mod idt;
 pub mod paging;
 mod pit;
-pub mod smap;
+pub mod uaccess;
 
 pub use apic::{send_ipi, set_tlb_shootdown_addr, IpiKind, ioapic_unmask, ioapic_unmask_level, ioapic_mask};
 pub use cpu::{current_cpu, set_kernel_stack, next_invoke_seq, current_invoke_seq, read_fs_base, write_fs_base, generate_stack_canary, set_per_cpu_canary, MAX_CPUS};
@@ -308,7 +308,9 @@ pub fn shutdown() -> ! {
 /// The double fault handler (vector 8) gets its own stack via IST1 so it can
 /// run even if the kernel stack is corrupted or overflowed.
 fn init_exception_stacks() {
-    let stack_phys = crate::mm::alloc_frame().expect("IST stack allocation failed");
+    let stack_phys = crate::mm::pmm_alloc(&crate::mm::frame::FrameOwner::KernelPrivate {
+        subkind: crate::mm::frame::KernelMetaKind::KernelStack,
+    }).expect("IST stack allocation failed");
     let stack_virt = crate::mm::phys_to_virt(stack_phys);
     let stack_top = stack_virt + 4096;
 
@@ -347,7 +349,7 @@ pub fn init_syscalls() {
         const STACK_PAGES: usize = 4;
         const STACK_SIZE: u64 = STACK_PAGES as u64 * 4096;
 
-        let stack_bottom_phys = match crate::mm::alloc_contiguous_frames(STACK_PAGES) {
+        let stack_bottom_phys = match crate::mm::pmm_alloc_contiguous(STACK_PAGES) {
             Some(addr) => addr,
             None => {
                 crate::serial_puts("[SYSCALL] Failed to allocate contiguous kernel stack!\n");

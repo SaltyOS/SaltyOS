@@ -87,6 +87,9 @@ pub(crate) fn handle_packet(our_mac: &[u8; 6], our_ip: u32, data: &[u8]) {
     // Always learn from the sender
     arp_table_insert(spa, sha);
 
+    // ARP cache updated — flush any DNS queries waiting for this MAC
+    super::dns::flush_arp_waiters();
+
     if op == ARP_OP_REQUEST && tpa == our_ip {
         // Send ARP reply
         send_reply(our_mac, our_ip, &sha, spa);

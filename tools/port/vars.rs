@@ -7,8 +7,27 @@ use std::path::{Path, PathBuf};
 use crate::config::BuildEnv;
 use crate::parser::PortConfig;
 
+/// Work directory for port builds, qualified by target architecture.
+///
+/// Uses `SALTYOS_ARCH` env var or falls back to build dir name detection.
+/// Uses `work-{arch}/` format for all architectures (e.g. `work-x86_64/`).
 pub fn work_dir(port_dir: &Path) -> PathBuf {
-    port_dir.join("work")
+    let arch = detect_arch();
+    port_dir.join(format!("work-{}", arch))
+}
+
+fn detect_arch() -> String {
+    if let Ok(a) = std::env::var("SALTYOS_ARCH") {
+        return a;
+    }
+    // Infer from -b <build_dir> argument name
+    let args: Vec<String> = std::env::args().collect();
+    for i in 0..args.len().saturating_sub(1) {
+        if args[i] == "-b" && args[i + 1].contains("aarch64") {
+            return "aarch64".to_string();
+        }
+    }
+    "x86_64".to_string()
 }
 
 /// Shared distfiles directory: ports/distfiles/ (sibling to port dirs)
@@ -105,6 +124,22 @@ pub fn build_var_map(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Hash
     vars.insert("SALTY_HOST".to_string(), env.salty_host.clone());
     vars.insert("SALTY_INC".to_string(), env.salty_inc.to_string_lossy().to_string());
     vars.insert("NPROC".to_string(), env.nproc.to_string());
+
+    // Architecture info — derived from the target triple (e.g. "x86_64-unknown-saltyos")
+    let arch = env.salty_host.split('-').next().unwrap_or("x86_64").to_string();
+    // FreeBSD machine dir name: x86_64 → amd64, aarch64 → arm64
+    let freebsd_machine = match arch.as_str() {
+        "x86_64" => "amd64".to_string(),
+        "aarch64" => "arm64".to_string(),
+        other => other.to_string(),
+    };
+    vars.insert("ARCH".to_string(), arch.clone());
+    vars.insert("MACHINE".to_string(), freebsd_machine.clone());
+    vars.insert("MACHINE_INCLUDE".to_string(), format!("{}/include", freebsd_machine));
+
+    // Arch-qualified work directory name (e.g. "work-x86_64", "work-aarch64")
+    // Allows .port files to reference dependency work dirs: ${PORTDIR}/../dep/${ARCH_WORK}/...
+    vars.insert("ARCH_WORK".to_string(), format!("work-{}", arch));
 
     // Project and toolchain paths
     let project_root = env.build_root.parent().unwrap_or(&env.build_root);

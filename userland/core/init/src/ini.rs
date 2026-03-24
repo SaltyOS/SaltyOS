@@ -183,6 +183,35 @@ fn bytes_eq_ci(a: &[u8], b: &[u8]) -> bool {
     true
 }
 
+fn key_matches_current_arch(key: &[u8], base: &[u8]) -> bool {
+    if bytes_eq_ci(key, base) {
+        return true;
+    }
+    if key.len() <= base.len() + 1 {
+        return false;
+    }
+    if key[base.len()] != b'.' || !bytes_eq_ci(&key[..base.len()], base) {
+        return false;
+    }
+    arch_suffix_matches(&key[base.len() + 1..])
+}
+
+fn arch_suffix_matches(suffix: &[u8]) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        bytes_eq_ci(suffix, b"aarch64")
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        bytes_eq_ci(suffix, b"x86_64")
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = suffix;
+        false
+    }
+}
+
 fn copy_to_buf(src: &[u8], dst: &mut [u8]) -> u8 {
     let len = if src.len() < dst.len() { src.len() } else { dst.len() };
     for i in 0..len {
@@ -552,35 +581,35 @@ pub fn parse_service(data: &[u8], out: &mut ServiceDef) -> bool {
 
                     match section {
                         Section::Service => {
-                            if bytes_eq_ci(key, b"Name") {
+                            if key_matches_current_arch(key, b"Name") {
                                 out.name_len = copy_to_buf(value, &mut out.name);
-                            } else if bytes_eq_ci(key, b"Binary") {
+                            } else if key_matches_current_arch(key, b"Binary") {
                                 out.binary_len = copy_to_buf(value, &mut out.binary);
-                            } else if bytes_eq_ci(key, b"Type") {
+                            } else if key_matches_current_arch(key, b"Type") {
                                 if bytes_eq_ci(value, b"simple") {
                                     out.svc_type = ServiceType::Simple;
                                 } else if bytes_eq_ci(value, b"notify") {
                                     out.svc_type = ServiceType::Notify;
                                 }
-                            } else if bytes_eq_ci(key, b"MemoryKB") {
+                            } else if key_matches_current_arch(key, b"MemoryKB") {
                                 out.memory_kb = parse_decimal_u16(value);
-                            } else if bytes_eq_ci(key, b"TimeoutStartSec")
-                                || bytes_eq_ci(key, b"TimeoutSec")
+                            } else if key_matches_current_arch(key, b"TimeoutStartSec")
+                                || key_matches_current_arch(key, b"TimeoutSec")
                             {
                                 out.timeout_start_ns = parse_duration_ns(value);
-                            } else if bytes_eq_ci(key, b"CNodeBits") {
+                            } else if key_matches_current_arch(key, b"CNodeBits") {
                                 out.cnode_bits = parse_decimal_u16(value) as u8;
-                            } else if bytes_eq_ci(key, b"MapInitrd") {
+                            } else if key_matches_current_arch(key, b"MapInitrd") {
                                 out.map_initrd = bytes_eq_ci(value, b"yes");
-                            } else if bytes_eq_ci(key, b"PreProcmgr") {
+                            } else if key_matches_current_arch(key, b"PreProcmgr") {
                                 out.pre_procmgr = bytes_eq_ci(value, b"yes");
-                            } else if bytes_eq_ci(key, b"Args") {
+                            } else if key_matches_current_arch(key, b"Args") {
                                 let (args_len, argc) = parse_spawn_args(value, &mut out.spawn_args);
                                 out.spawn_args_len = args_len;
                                 out.spawn_argc = argc;
-                            } else if bytes_eq_ci(key, b"Role") {
+                            } else if key_matches_current_arch(key, b"Role") {
                                 out.role_len = copy_to_buf(value, &mut out.role);
-                            } else if bytes_eq_ci(key, b"Restart") {
+                            } else if key_matches_current_arch(key, b"Restart") {
                                 if bytes_eq_ci(value, b"no") {
                                     out.restart = RestartPolicy::No;
                                 } else if bytes_eq_ci(value, b"always") {
@@ -591,20 +620,20 @@ pub fn parse_service(data: &[u8], out: &mut ServiceDef) -> bool {
                             }
                         }
                         Section::Dependencies => {
-                            if bytes_eq_ci(key, b"After") {
+                            if key_matches_current_arch(key, b"After") {
                                 out.after_count = parse_dep_list(value, &mut out.after);
-                            } else if bytes_eq_ci(key, b"Before") {
+                            } else if key_matches_current_arch(key, b"Before") {
                                 out.before_count = parse_dep_list(value, &mut out.before);
-                            } else if bytes_eq_ci(key, b"Requires") {
+                            } else if key_matches_current_arch(key, b"Requires") {
                                 out.ep_need_count = parse_ep_needs(value, &mut out.ep_needs);
                             }
                         }
                         Section::Capabilities => {
-                            if bytes_eq_ci(key, b"CopyCap") {
+                            if key_matches_current_arch(key, b"CopyCap") {
                                 out.cap_count = parse_cap_copies(value, &mut out.caps);
-                            } else if bytes_eq_ci(key, b"NeedEP") {
+                            } else if key_matches_current_arch(key, b"NeedEP") {
                                 out.ep_need_count = parse_ep_needs(value, &mut out.ep_needs);
-                            } else if bytes_eq_ci(key, b"InjectEP") {
+                            } else if key_matches_current_arch(key, b"InjectEP") {
                                 out.ep_inject_count = parse_ep_injects(value, &mut out.ep_injects);
                             }
                         }

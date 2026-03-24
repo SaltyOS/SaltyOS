@@ -16,6 +16,23 @@ _saltyos_toolchain_script_dir() {
   cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P
 }
 
+_saltyos_detect_host_triple() {
+  local _os _arch
+  _os="$(uname -s)"
+  _arch="$(uname -m)"
+  case "$_os" in
+    Linux)  _os="unknown-linux-gnu" ;;
+    Darwin) _os="apple-darwin" ;;
+    *)      _os="unknown" ;;
+  esac
+  case "$_arch" in
+    x86_64)        _arch="x86_64" ;;
+    aarch64|arm64) _arch="aarch64" ;;
+    *)             ;;
+  esac
+  printf '%s-%s' "$_arch" "$_os"
+}
+
 _saltyos_toolchain_init() {
   local script_dir repo_root prefix_bin
   script_dir="$(_saltyos_toolchain_script_dir)"
@@ -29,7 +46,8 @@ _saltyos_toolchain_init() {
   : "${SALTYOS_LLVM_BUILD_DIR:=${SALTYOS_TOOLCHAIN_BUILD_ROOT}/llvm}"
   : "${SALTYOS_RUST_BUILD_DIR:=${SALTYOS_TOOLCHAIN_BUILD_ROOT}/rust}"
   : "${SALTYOS_TOOLCHAIN_PREFIX:=${SALTYOS_TOOLCHAIN_BUILD_ROOT}/prefix}"
-  : "${SALTYOS_RUST_STAGE1_RUSTC:=${SALTYOS_RUST_BUILD_DIR}/x86_64-unknown-linux-gnu/stage1/bin/rustc}"
+  : "${SALTYOS_HOST_TRIPLE:=$(_saltyos_detect_host_triple)}"
+  : "${SALTYOS_RUST_STAGE1_RUSTC:=${SALTYOS_RUST_BUILD_DIR}/${SALTYOS_HOST_TRIPLE}/stage1/bin/rustc}"
 
   prefix_bin="${SALTYOS_TOOLCHAIN_PREFIX}/bin"
   case ":${PATH-}:" in
@@ -46,6 +64,7 @@ _saltyos_toolchain_init() {
   export SALTYOS_LLVM_BUILD_DIR
   export SALTYOS_RUST_BUILD_DIR
   export SALTYOS_TOOLCHAIN_PREFIX
+  export SALTYOS_HOST_TRIPLE
   export SALTYOS_RUST_STAGE1_RUSTC
 }
 
@@ -58,6 +77,7 @@ _saltyos_toolchain_print_exports() {
   printf 'export %s=%q\n' "SALTYOS_LLVM_BUILD_DIR" "${SALTYOS_LLVM_BUILD_DIR}"
   printf 'export %s=%q\n' "SALTYOS_RUST_BUILD_DIR" "${SALTYOS_RUST_BUILD_DIR}"
   printf 'export %s=%q\n' "SALTYOS_TOOLCHAIN_PREFIX" "${SALTYOS_TOOLCHAIN_PREFIX}"
+  printf 'export %s=%q\n' "SALTYOS_HOST_TRIPLE" "${SALTYOS_HOST_TRIPLE}"
   printf 'export %s=%q\n' "SALTYOS_RUST_STAGE1_RUSTC" "${SALTYOS_RUST_STAGE1_RUSTC}"
   printf 'export PATH=%q\n' "${PATH}"
 }
@@ -73,6 +93,7 @@ SaltyOS toolchain layout
   LLVM build dir     : ${SALTYOS_LLVM_BUILD_DIR}
   Rust build dir     : ${SALTYOS_RUST_BUILD_DIR}
   Prefix             : ${SALTYOS_TOOLCHAIN_PREFIX}
+  Host triple        : ${SALTYOS_HOST_TRIPLE}
   Stage1 rustc       : ${SALTYOS_RUST_STAGE1_RUSTC}
 
 Usage
@@ -107,4 +128,4 @@ _saltyos_toolchain_main() {
   esac
 }
 
-_saltyos_toolchain_main "${@}"
+_saltyos_toolchain_main "$@"

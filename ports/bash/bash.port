@@ -39,6 +39,13 @@ CFLAGS_FOR_BUILD = -std=gnu89
 EXTRA_CFLAGS = -std=gnu89
 
 [autoconf_cache]
+ac_cv_type_mode_t = yes
+ac_cv_type_off_t = yes
+ac_cv_type_pid_t = yes
+ac_cv_type_uid_t = yes
+ac_cv_type_gid_t = yes
+ac_cv_type_ssize_t = yes
+ac_cv_type_time_t = yes
 ac_cv_func_mmap_fixed_mapped = yes
 ac_cv_func_strcoll_works = yes
 ac_cv_func_working_mktime = yes
@@ -85,7 +92,7 @@ bash_cv_dirent_has_d_namlen = yes
 bash_cv_posix_signals = yes
 
 [prepare]
-sed -i 's/^LIBS_FOR_BUILD = .*/LIBS_FOR_BUILD =/' ${SRCDIR}/support/Makefile.in
+sed -i.bak 's/^LIBS_FOR_BUILD = .*/LIBS_FOR_BUILD =/' ${SRCDIR}/support/Makefile.in && rm -f ${SRCDIR}/support/Makefile.in.bak
 
 [install]
 bin/bash = bash

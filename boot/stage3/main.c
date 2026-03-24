@@ -23,6 +23,10 @@ NORETURN void stage3_panic(const char *msg)
 
     /* Halt */
     for (;;) {
+#if defined(__x86_64__) || defined(__i386__)
         __asm__ volatile("cli; hlt");
+#elif defined(__aarch64__)
+        __asm__ volatile("msr DAIFSet, #0xF; wfi");
+#endif
     }
 }

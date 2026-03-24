@@ -41,7 +41,11 @@ struct BootInfoHeader *handoff_build_bootinfo(
     bootinfo_builder_init(&builder, buffer, buffer_size);
 
     /* Set architecture */
+#if defined(__aarch64__)
+    builder.hdr->arch = ARCH_AARCH64;
+#else
     builder.hdr->arch = ARCH_X86_64;
+#endif
 
     /* Set flags */
     if (stage2_info->boot_mode == BOOT_MODE_UEFI)

@@ -1,0 +1,9 @@
+--- a/config.sub
++++ b/config.sub
+@@ -1769,7 +1769,7 @@
+ 	     | midnightbsd* | amdhsa* | unleashed* | emscripten* | wasi* \
+ 	     | nsk* | powerunix* | genode* | zvmoe* | qnx* | emx* | zephyr* \
+-	     | fiwix* | mlibc* | cos* | mbr* | ironclad* )
++	     | fiwix* | mlibc* | cos* | mbr* | ironclad* | saltyos* )
+ 		;;
+ 	# This one is extra strict with allowed versions

@@ -6,49 +6,76 @@ help:
     @echo "SaltyOS Build System"
     @echo ""
     @echo "== Quick Start (daily development) =="
-    @echo "  just setup          Configure the build (once)"
-    @echo "  just build          Build kernel + userland"
-    @echo "  just run            Build + run in QEMU"
-    @echo "  just rr             Quick rebuild + run"
+    @echo "  just setup              Configure the build (once, default: x86_64)"
+    @echo "  just build              Build kernel + userland"
+    @echo "  just run                Build + run in QEMU"
+    @echo "  just rr                 Quick rebuild + run"
     @echo ""
-    @echo "== QEMU Options =="
-    @echo "  just run --smp 2    Run with 2 CPUs"
-    @echo "  just run --smp 4    Run with 4 CPUs"
-    @echo "  just run --uefi     Run with UEFI firmware"
-    @echo "  just run --debug    Run with interrupt logging"
-    @echo "  just run --gdb      Run with GDB server"
-    @echo "  just run --headless Run without GUI"
+    @echo "== Multi-Architecture (arch= prefix works with any recipe) =="
+    @echo "  just arch=aarch64 setup   Configure aarch64 build"
+    @echo "  just arch=aarch64 build   Build for aarch64"
+    @echo "  just arch=aarch64 run     Run aarch64 in QEMU (UEFI only)"
     @echo ""
-    @echo "== Toolchain =="
+    @echo "== QEMU Options (combinable) =="
+    @echo "  just run --smp 2        Run with 2 CPUs"
+    @echo "  just run --smp 4        Run with 4 CPUs"
+    @echo "  just run --uefi         Run with UEFI firmware"
+    @echo "  just run --debug        Run with interrupt logging (qemu.log)"
+    @echo "  just run --gdb          Run with GDB server (-s -S)"
+    @echo "  just run --headless     Run without GUI (serial only)"
+    @echo "  just run --mem 1G       Set memory size"
+    @echo "  just run --extra-disk F Attach additional virtio-blk disk"
+    @echo ""
+    @echo "== Debugging =="
+    @echo "  just gdb                Connect GDB to running QEMU"
+    @echo "  just reconfigure -Dkernel_log_level=debug"
+    @echo ""
+    @echo "== Code Quality =="
+    @echo "  just fmt                Format Rust + C source"
+    @echo "  just fmt-check          Check Rust formatting"
+    @echo ""
+    @echo "== Toolchain (use arch= to target aarch64, e.g. just arch=aarch64 tc all) =="
     @echo "  just tc setup                    Create directories"
     @echo "  just tc build host llvm          Build host Clang/LLD (~30 min)"
     @echo "  just tc build host rust          Build host rustc (~20 min)"
     @echo "  just tc doctor                   Validate toolchain"
     @echo "  just tc all                      Run all host steps in order"
     @echo ""
-    @echo "== Cross-Compilation =="
+    @echo "== Cross-Compilation (use arch= to target aarch64) =="
     @echo "  just sysroot                     Generate cross-compilation sysroot (includes libc++)"
     @echo "  just cross-hello                 C smoke test"
     @echo "  just cross-hello-cpp             C++ smoke test"
     @echo ""
-    @echo "== Self-Hosting =="
+    @echo "== Self-Hosting (use arch= to target aarch64) =="
     @echo "  just tc build cross llvm         Cross-compile Clang/LLD for SaltyOS"
     @echo "  just tc build cross rust         Cross-compile rustc for SaltyOS"
     @echo "  just self-host                   Full cross-compile pipeline"
+    @echo "  just tc package                  Package cross-compiled toolchain for rootfs"
     @echo "  just tc self-host                Same (without OS build dependency)"
     @echo ""
     @echo "== Ports =="
-    @echo "  just port <name>    Build a port (bash, coreutils, ...)"
+    @echo "  just port <name>        Build a port (bash, coreutils, ...)"
+    @echo "  just fetch-ports        Download all port sources"
+    @echo "  just port-info <name>   Show port configuration"
+    @echo "  just clean-ports        Remove port build artifacts"
     @echo ""
     @echo "== Images =="
-    @echo "  just mkrootfs       Build rootfs.img from manifest"
-    @echo "  just mksaltyfs      Create test_data.img (manual)"
+    @echo "  just image              Create BIOS disk image"
+    @echo "  just image-uefi         Create UEFI disk image"
+    @echo "  just mkrootfs           Build rootfs.img (binaries + optional LLVM/ports)"
+    @echo "  just mksaltyfs          Create test_data.img (manual)"
+    @echo ""
+    @echo "== Misc =="
+    @echo "  just info               Show build configuration"
+    @echo "  just loc                Show source line counts"
+    @echo "  just watch              Watch for changes + rebuild"
+    @echo "  just distclean          Remove all build dirs"
 
 # Default target architecture
 arch := "x86_64"
 
-# Build directory
-builddir := "build"
+# Build directory (arch-qualified)
+builddir := "build-" + arch
 
 # =============================================================================
 # Setup & Configuration
@@ -56,10 +83,10 @@ builddir := "build"
 
 # Internal: shared setup implementation
 [private]
-_setup-impl suffix arch:
+_setup-impl arch:
     #!/usr/bin/env bash
     set -euo pipefail
-    dir="{{builddir}}{{suffix}}"
+    dir="build-{{arch}}"
     source tools/toolchain/env.sh
     if [ -z "${CC:-}" ]; then
       cc_path="$SALTYOS_TOOLCHAIN_PREFIX/bin/clang"
@@ -84,6 +111,10 @@ _setup-impl suffix arch:
         exit 1
       fi
     fi
+    # Custom-built clang needs the macOS SDK path to pass Meson's sanity check
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      export SDKROOT="${SDKROOT:-$(xcrun --show-sdk-path)}"
+    fi
     mkdir -p "$dir"
     {
       printf '[binaries]\n'
@@ -99,16 +130,11 @@ _setup-impl suffix arch:
       -Darch={{arch}} \
       -Dbuild_boot=true \
       -Dbuild_kernel=true \
-      -Dbuild_userland=true
+      -Dbuild_userland=true \
+      -Dbuild_ports=true
 
 # Configure the build (run once)
-setup: (_setup-impl "" arch)
-
-# Configure for x86_64
-setup-x86_64: (_setup-impl "-x86_64" "x86_64")
-
-# Configure for aarch64
-setup-aarch64: (_setup-impl "-aarch64" "aarch64")
+setup: (_setup-impl arch)
 
 # Reconfigure with new options
 reconfigure *ARGS:
@@ -120,6 +146,8 @@ reconfigure *ARGS:
 
 # Build all components
 build:
+    #!/usr/bin/env bash
+    source tools/toolchain/env.sh
     meson compile -C {{builddir}}
 
 # Build with verbose output
@@ -130,9 +158,9 @@ build-verbose:
 clean:
     meson compile -C {{builddir}} --clean
 
-# Full clean (remove build directory)
+# Full clean (remove meson build directories, preserve build-toolchain)
 distclean:
-    rm -rf {{builddir}} {{builddir}}-x86_64 {{builddir}}-aarch64
+    rm -rf build-x86_64 build-aarch64
 
 # =============================================================================
 # Run & Debug
@@ -140,7 +168,7 @@ distclean:
 
 # Run in QEMU (flags: --smp N, --mem SIZE, --debug, --headless, --gdb, --uefi)
 run *ARGS: build
-    bash tools/run-qemu.sh {{builddir}} {{ARGS}}
+    bash tools/run-qemu.sh {{builddir}} --arch {{arch}} {{ARGS}}
 
 # Connect GDB to running QEMU
 gdb:
@@ -180,18 +208,19 @@ toolchain-env:
 #   just tc all                       setup → host llvm → host rust → doctor
 #   just tc self-host                 sysroot → cross llvm → cross rust
 tc CMD *ARGS:
-    SALTYOS_MESON_BUILDDIR={{builddir}} bash tools/toolchain/build.sh {{CMD}} {{ARGS}}
+    SALTYOS_MESON_BUILDDIR={{builddir}} SALTYOS_ARCH={{arch}} bash tools/toolchain/build.sh {{CMD}} {{ARGS}}
 
 # Generate cross-compilation sysroot (requires: just build)
 sysroot: build
-    @just tc sysroot
+    @just arch={{arch}} tc sysroot
 
 # Full cross-compile pipeline (requires: just sysroot)
 # libc++ is built by 'just build' when build_libcxx=auto|true and
 # toolchain/llvm-project is present, then installed into sysroot by 'just sysroot'.
 self-host: sysroot
-    @just tc build cross llvm
-    @just tc build cross rust
+    @just arch={{arch}} tc build cross llvm
+    @just arch={{arch}} tc build cross rust
+    @just arch={{arch}} tc package
 
 # Cross-compile C smoke test against sysroot
 cross-hello: sysroot
@@ -232,21 +261,29 @@ port NAME: build
     #!/usr/bin/env bash
     set -euo pipefail
     source tools/toolchain/env.sh
-    {{builddir}}/tools/portbuild/portbuild build ports/{{NAME}} -o {{builddir}}/ports -b {{builddir}} -v
+    SALTYOS_ARCH={{arch}} {{builddir}}/tools/port/port build ports/{{NAME}} -o {{builddir}}/ports -b {{builddir}} -v
 
 # Fetch all port sources
 fetch-ports:
-    {{builddir}}/tools/portbuild/portbuild fetch ports/bash -b {{builddir}}
-    {{builddir}}/tools/portbuild/portbuild fetch ports/coreutils -b {{builddir}}
+    {{builddir}}/tools/port/port fetch ports/bash -b {{builddir}}
+    {{builddir}}/tools/port/port fetch ports/coreutils -b {{builddir}}
 
-# Clean port build artifacts
+# Clean port build artifacts (all ports, all architectures)
 clean-ports:
-    {{builddir}}/tools/portbuild/portbuild clean ports/bash
-    {{builddir}}/tools/portbuild/portbuild clean ports/coreutils
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for d in ports/*/; do
+        [ -f "$d/$(basename "$d").port" ] || continue
+        for w in "$d"work-*/; do
+            [ -d "$w" ] && rm -rf "$w" && echo "Removed $w"
+        done
+        [ -d "${d}stage" ] && rm -rf "${d}stage" && echo "Removed ${d}stage"
+    done
+    echo "All port work directories cleaned."
 
 # Show port info
 port-info NAME:
-    {{builddir}}/tools/portbuild/portbuild info ports/{{NAME}}
+    {{builddir}}/tools/port/port info ports/{{NAME}}
 
 # =============================================================================
 # Development Helpers
@@ -263,59 +300,11 @@ rr: build run
 mksaltyfs:
     python3 tools/mksaltyfs.py -o test_data.img -s 64M
 
-# Strip cross-compiled LLVM binaries for rootfs inclusion.
-# Run this once after a cross LLVM build, before `just build`.
-strip-llvm:
+# Build rootfs image (binaries always; LLVM after `just tc package`; ports if build_ports=true)
+mkrootfs: build
     #!/usr/bin/env bash
-    set -euo pipefail
-    STRIP=build-toolchain/prefix/bin/llvm-strip
-    SRC=build-toolchain/llvm-saltyos/bin
-    DST=build-toolchain/llvm-saltyos-stripped
-    mkdir -p "$DST/bin" "$DST/lib"
-    clang_bin="$(cd "$SRC" && ls clang-* 2>/dev/null | head -1)"
-    if [ -z "$clang_bin" ]; then
-        echo "Error: no clang-* binary found in $SRC" >&2
-        exit 1
-    fi
-    for f in "$clang_bin" lld llvm-ar llvm-nm llvm-objcopy; do
-        echo "Stripping $f..."
-        cp "$SRC/$f" "$DST/bin/$f"
-        "$STRIP" "$DST/bin/$f"
-    done
-    cp build/lib/besalt/cpp/libc++.so "$DST/lib/libc++.so"
-    # Clang resource directory and SaltyOS compiler-rt builtins
-    echo "Copying clang resource directory..."
-    rm -rf "$DST/lib/clang"
-    cp -r build-toolchain/llvm-saltyos/lib/clang "$DST/lib/clang"
-    RT_DIR="$(find build-toolchain/llvm/lib/clang -type d -path '*/lib/x86_64-unknown-saltyos' -print -quit)"
-    if [ -z "$RT_DIR" ]; then
-        echo "Missing SaltyOS compiler-rt runtime directory in build-toolchain/llvm/lib/clang" >&2
-        exit 1
-    fi
-    RT_REL="${RT_DIR#build-toolchain/llvm/lib/clang/}"
-    rm -rf "$DST/lib/clang/$RT_REL"
-    mkdir -p "$(dirname "$DST/lib/clang/$RT_REL")"
-    cp -r "$RT_DIR" "$(dirname "$DST/lib/clang/$RT_REL")"
-    # CRT objects and linker script
-    echo "Copying development files..."
-    cp build/lib/besalt/c/crt_start.o "$DST/lib/crt_start.o"
-    cp build/rust/core.o "$DST/lib/core.o"
-    cp build/rust/compiler_builtins.o "$DST/lib/compiler_builtins.o"
-    cp lib/besalt/saltyos-pie.ld "$DST/lib/saltyos-pie.ld"
-    # Link-time libraries
-    cp build/lib/besalt/c/libc.so "$DST/lib/libc.so"
-    cp build/lib/besalt/lib/libbesalt.so "$DST/lib/libbesalt.so"
-    # Stub archives (-lm, -lpthread, etc.)
-    for stub in libm.a libpthread.a librt.a libdl.a libutil.a; do
-        printf '!<arch>\n' > "$DST/lib/$stub"
-    done
-    echo "Done. Stripped sizes:"
-    du -sh "$DST/bin/"* "$DST/lib/"*
-
-# Build rootfs image from manifest (strip-llvm must run before build).
-mkrootfs: strip-llvm build
-    tools/mkrootfs --output {{builddir}}/rootfs.img --size 512M \
-        --manifest images/rootfs.manifest -v
+    source tools/toolchain/env.sh
+    meson compile -C {{builddir}} rootfs_image
 
 # Create a new component skeleton
 new-component NAME:

@@ -8,9 +8,9 @@ rtld_sources = files(
     'rtld_elf.c',
     'rtld_symbol.c',
     'rtld_reloc.c',
-    'rtld_resolve.S',
+    'arch' / arch / 'rtld_resolve.S',
 )
-rtld_link_script = meson.current_source_dir() / 'rtld.ld'
+rtld_link_script = meson.current_source_dir() / 'arch' / arch / 'rtld.ld'
 
 ld_besalt_so = custom_target('ld_besalt_so',
     input: rtld_sources,
@@ -20,7 +20,6 @@ ld_besalt_so = custom_target('ld_besalt_so',
         '-nostdlib', '-nostartfiles', '-ffreestanding',
         '-fno-plt', '-Wl,-Bsymbolic',
         '-fno-stack-protector',
-        '-mno-red-zone',
         '-I', meson.current_source_dir(),
         '-T', rtld_link_script,
         '-Wl,-soname,ld-besalt.so',

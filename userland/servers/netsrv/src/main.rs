@@ -54,7 +54,6 @@ const CAP_REPLY_TEMP: u64 = 89;
 // Constants
 // ---------------------------------------------------------------------------
 
-const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 const SHM_VADDR: u64 = 0x0000_0000_6000_0000;
 const NET_SHM_ID: u64 = 0x4E455400; // "NET\0"
 const NET_SHM_PAGES: u64 = 32;
@@ -308,6 +307,13 @@ fn driver_register() -> bool {
     let mut reply = BesaltMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to netdrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_NETDRV_EP, &raw const msg, &raw mut reply) };
+    let mut reg_lb = LineBuf::new();
+    reg_lb.str(b"[netsrv] DRIVER_REGISTER call result=");
+    reg_lb.dec(err as u64);
+    reg_lb.str(b" label=");
+    reg_lb.dec(reply.label);
+    reg_lb.putc(b'\n');
+    reg_lb.flush();
     if err != 0 || reply.label != BESALT_OK {
         let mut lb = LineBuf::new();
         lb.str(b"[netsrv] DRIVER_REGISTER failed: ");
@@ -1106,15 +1112,8 @@ fn event_loop() -> ! {
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     puts(b"[netsrv] Network Stack Server starting\n");
-
-    // Set IPC buffer
-    let _ = invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
-    // SAFETY: Setting up IPC buffer pointer for this thread.
-    unsafe {
-        (*ipc_ctx()).ipc_buffer = IPC_BUF_VADDR as *mut IpcBuffer;
-    }
 
     // 1. Allocate and map SHM
     if !setup_shm() {

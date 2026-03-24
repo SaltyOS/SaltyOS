@@ -1,11 +1,18 @@
-//! ACPI MADT Parser for SMP CPU Discovery
+//! x86_64 ACPI support: MADT parsing (SMP CPU discovery) and FADT (shutdown).
 //!
-//! Parses the RSDP → XSDT/RSDT → MADT chain to discover Application Processors.
+//! Uses the shared `crate::acpi` module for RSDP/XSDT/RSDT table walking.
+//! This file contains x86-specific ACPI code: BIOS RSDP scanning, MADT
+//! LAPIC/IOAPIC parsing, and FADT power management.
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use super::cpu::MAX_CPUS;
+use crate::acpi::{self, SdtHeader};
 use crate::mm::PHYS_MAP_OFFSET;
+
+// ---------------------------------------------------------------------------
+// MADT types (x86-specific: Local APIC / I/O APIC)
+// ---------------------------------------------------------------------------
 
 /// CPU descriptor discovered from ACPI MADT
 #[derive(Clone, Copy)]
@@ -42,40 +49,6 @@ pub struct MadtInfo {
     pub cpu_count: usize,
     pub io_apic_addr: u32,
     pub io_apic_gsi_base: u32,
-}
-
-/// RSDP (Root System Description Pointer) v1
-#[repr(C, packed)]
-struct Rsdp {
-    signature: [u8; 8],  // "RSD PTR "
-    checksum: u8,
-    oem_id: [u8; 6],
-    revision: u8,
-    rsdt_address: u32,
-}
-
-/// RSDP v2 (XSDP) extends RSDP with 64-bit XSDT pointer
-#[repr(C, packed)]
-struct Rsdp2 {
-    rsdp: Rsdp,
-    length: u32,
-    xsdt_address: u64,
-    extended_checksum: u8,
-    reserved: [u8; 3],
-}
-
-/// ACPI SDT header (common to all tables)
-#[repr(C, packed)]
-struct SdtHeader {
-    signature: [u8; 4],
-    length: u32,
-    revision: u8,
-    checksum: u8,
-    oem_id: [u8; 6],
-    oem_table_id: [u8; 8],
-    oem_revision: u32,
-    creator_id: u32,
-    creator_revision: u32,
 }
 
 /// MADT (Multiple APIC Description Table) header
@@ -120,21 +93,9 @@ const MADT_TYPE_IO_APIC: u8 = 1;
 const LAPIC_FLAG_ENABLED: u32 = 1 << 0;
 const LAPIC_FLAG_ONLINE_CAPABLE: u32 = 1 << 1;
 
-/// Validate an ACPI table checksum
-///
-/// All bytes in the structure must sum to zero (mod 256).
-unsafe fn validate_checksum(ptr: *const u8, len: usize) -> bool {
-    let mut sum: u8 = 0;
-    for i in 0..len {
-        sum = sum.wrapping_add(unsafe { *ptr.add(i) });
-    }
-    sum == 0
-}
-
-/// Convert a physical address to a virtual pointer using the direct mapping
-fn phys_to_ptr<T>(phys: u64) -> *const T {
-    (phys + PHYS_MAP_OFFSET) as *const T
-}
+// ---------------------------------------------------------------------------
+// BIOS RSDP scanning (x86-specific fallback)
+// ---------------------------------------------------------------------------
 
 /// Scan for RSDP in standard BIOS locations
 ///
@@ -148,7 +109,7 @@ pub unsafe fn scan_for_rsdp() -> u64 {
         crate::serial_puts("[ACPI] Scanning for RSDP...\n");
 
         // Search EBDA (address stored at BDA 0x040E, segment value)
-        let ebda_segment_ptr = phys_to_ptr::<u16>(0x040E);
+        let ebda_segment_ptr = acpi::phys_to_ptr::<u16>(0x040E);
         let ebda_segment = core::ptr::read_unaligned(ebda_segment_ptr);
         let ebda_base = (ebda_segment as u64) << 4;
 
@@ -180,7 +141,7 @@ pub unsafe fn scan_for_rsdp() -> u64 {
 ///
 /// Scans on 16-byte boundaries as required by the ACPI spec.
 unsafe fn scan_region_for_rsdp(base_phys: u64, length: usize) -> Option<u64> {
-    let base_ptr: *const u8 = phys_to_ptr(base_phys);
+    let base_ptr: *const u8 = acpi::phys_to_ptr(base_phys);
 
     let mut offset = 0;
     while offset + 20 <= length {
@@ -189,7 +150,7 @@ unsafe fn scan_region_for_rsdp(base_phys: u64, length: usize) -> Option<u64> {
 
         if sig == b"RSD PTR " {
             // Validate checksum (first 20 bytes for RSDP v1)
-            if unsafe { validate_checksum(ptr, 20) } {
+            if unsafe { acpi::validate_checksum(ptr, 20) } {
                 return Some(base_phys + offset as u64);
             }
         }
@@ -199,6 +160,10 @@ unsafe fn scan_region_for_rsdp(base_phys: u64, length: usize) -> Option<u64> {
 
     None
 }
+
+// ---------------------------------------------------------------------------
+// MADT parsing
+// ---------------------------------------------------------------------------
 
 /// Parse the ACPI MADT to discover CPUs
 ///
@@ -217,38 +182,7 @@ pub unsafe fn parse_madt(rsdp_phys: u64) -> Option<MadtInfo> {
         s.putc(b'\n');
     }
 
-    // Read RSDP
-    let rsdp_ptr: *const Rsdp = phys_to_ptr(rsdp_phys);
-    let rsdp = unsafe { &*rsdp_ptr };
-
-    // Validate RSDP signature
-    if &rsdp.signature != b"RSD PTR " {
-        crate::serial_puts("[ACPI] Invalid RSDP signature\n");
-        return None;
-    }
-
-    // Validate RSDP v1 checksum (first 20 bytes)
-    if !unsafe { validate_checksum(rsdp_ptr as *const u8, 20) } {
-        crate::serial_puts("[ACPI] RSDP checksum failed\n");
-        return None;
-    }
-
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[ACPI] RSDP valid, revision=");
-        s.dec(rsdp.revision as u64);
-        s.putc(b'\n');
-    }
-
-    // Find MADT via XSDT (revision >= 2) or RSDT (revision 0)
-    let madt_phys = if rsdp.revision >= 2 {
-        let rsdp2 = unsafe { &*(rsdp_ptr as *const Rsdp2) };
-        unsafe { find_madt_in_xsdt(rsdp2.xsdt_address) }
-    } else {
-        unsafe { find_madt_in_rsdt(rsdp.rsdt_address as u64) }
-    };
-
-    let madt_phys = match madt_phys {
+    let madt_phys = match unsafe { acpi::find_table(rsdp_phys, b"APIC") } {
         Some(addr) => addr,
         None => {
             crate::serial_puts("[ACPI] MADT not found\n");
@@ -267,69 +201,9 @@ pub unsafe fn parse_madt(rsdp_phys: u64) -> Option<MadtInfo> {
     unsafe { parse_madt_entries(madt_phys) }
 }
 
-/// Search XSDT (64-bit pointers) for the MADT table
-unsafe fn find_madt_in_xsdt(xsdt_phys: u64) -> Option<u64> {
-    let xsdt_ptr: *const SdtHeader = phys_to_ptr(xsdt_phys);
-    let xsdt = unsafe { &*xsdt_ptr };
-
-    let header_size = core::mem::size_of::<SdtHeader>();
-    let entry_count = (xsdt.length as usize - header_size) / 8;
-
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[ACPI] XSDT has ");
-        s.dec(entry_count as u64);
-        s.puts(" entries\n");
-    }
-
-    let entries_ptr = unsafe { (xsdt_ptr as *const u8).add(header_size) as *const u64 };
-
-    for i in 0..entry_count {
-        let table_phys = unsafe { core::ptr::read_unaligned(entries_ptr.add(i)) };
-        let table_hdr: *const SdtHeader = phys_to_ptr(table_phys);
-        let sig = unsafe { (*table_hdr).signature };
-
-        if &sig == b"APIC" {
-            return Some(table_phys);
-        }
-    }
-
-    None
-}
-
-/// Search RSDT (32-bit pointers) for the MADT table
-unsafe fn find_madt_in_rsdt(rsdt_phys: u64) -> Option<u64> {
-    let rsdt_ptr: *const SdtHeader = phys_to_ptr(rsdt_phys);
-    let rsdt = unsafe { &*rsdt_ptr };
-
-    let header_size = core::mem::size_of::<SdtHeader>();
-    let entry_count = (rsdt.length as usize - header_size) / 4;
-
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[ACPI] RSDT has ");
-        s.dec(entry_count as u64);
-        s.puts(" entries\n");
-    }
-
-    let entries_ptr = unsafe { (rsdt_ptr as *const u8).add(header_size) as *const u32 };
-
-    for i in 0..entry_count {
-        let table_phys = unsafe { core::ptr::read_unaligned(entries_ptr.add(i)) } as u64;
-        let table_hdr: *const SdtHeader = phys_to_ptr(table_phys);
-        let sig = unsafe { (*table_hdr).signature };
-
-        if &sig == b"APIC" {
-            return Some(table_phys);
-        }
-    }
-
-    None
-}
-
 /// Parse MADT entries to extract CPU and I/O APIC information
 unsafe fn parse_madt_entries(madt_phys: u64) -> Option<MadtInfo> {
-    let madt_ptr: *const MadtHeader = phys_to_ptr(madt_phys);
+    let madt_ptr: *const MadtHeader = acpi::phys_to_ptr(madt_phys);
     let madt = unsafe { &*madt_ptr };
 
     let total_length = madt.header.length as usize;
@@ -432,6 +306,10 @@ unsafe fn parse_madt_entries(madt_phys: u64) -> Option<MadtInfo> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FADT parsing (x86-specific: PM1a/PM1b ports for ACPI shutdown)
+// ---------------------------------------------------------------------------
+
 /// ACPI power management info extracted from FADT
 pub struct AcpiPowerInfo {
     /// PM1a Control Block I/O port
@@ -472,46 +350,6 @@ struct Fadt {
     pm1b_cnt_blk: u32,          // 68
 }
 
-/// Search XSDT (64-bit pointers) for the FADT table (signature "FACP")
-unsafe fn find_fadt_in_xsdt(xsdt_phys: u64) -> Option<u64> {
-    let xsdt_ptr: *const SdtHeader = phys_to_ptr(xsdt_phys);
-    let xsdt = unsafe { &*xsdt_ptr };
-
-    let header_size = core::mem::size_of::<SdtHeader>();
-    let entry_count = (xsdt.length as usize - header_size) / 8;
-    let entries_ptr = unsafe { (xsdt_ptr as *const u8).add(header_size) as *const u64 };
-
-    for i in 0..entry_count {
-        let table_phys = unsafe { core::ptr::read_unaligned(entries_ptr.add(i)) };
-        let table_hdr: *const SdtHeader = phys_to_ptr(table_phys);
-        let sig = unsafe { (*table_hdr).signature };
-        if &sig == b"FACP" {
-            return Some(table_phys);
-        }
-    }
-    None
-}
-
-/// Search RSDT (32-bit pointers) for the FADT table (signature "FACP")
-unsafe fn find_fadt_in_rsdt(rsdt_phys: u64) -> Option<u64> {
-    let rsdt_ptr: *const SdtHeader = phys_to_ptr(rsdt_phys);
-    let rsdt = unsafe { &*rsdt_ptr };
-
-    let header_size = core::mem::size_of::<SdtHeader>();
-    let entry_count = (rsdt.length as usize - header_size) / 4;
-    let entries_ptr = unsafe { (rsdt_ptr as *const u8).add(header_size) as *const u32 };
-
-    for i in 0..entry_count {
-        let table_phys = unsafe { core::ptr::read_unaligned(entries_ptr.add(i)) } as u64;
-        let table_hdr: *const SdtHeader = phys_to_ptr(table_phys);
-        let sig = unsafe { (*table_hdr).signature };
-        if &sig == b"FACP" {
-            return Some(table_phys);
-        }
-    }
-    None
-}
-
 /// Parse the FADT to extract PM1a/PM1b control block ports for shutdown.
 ///
 /// # Safety
@@ -521,21 +359,7 @@ pub unsafe fn parse_fadt(rsdp_phys: u64) {
         return;
     }
 
-    let rsdp_ptr: *const Rsdp = phys_to_ptr(rsdp_phys);
-    let rsdp = unsafe { &*rsdp_ptr };
-
-    if &rsdp.signature != b"RSD PTR " {
-        return;
-    }
-
-    let fadt_phys = if rsdp.revision >= 2 {
-        let rsdp2 = unsafe { &*(rsdp_ptr as *const Rsdp2) };
-        unsafe { find_fadt_in_xsdt(rsdp2.xsdt_address) }
-    } else {
-        unsafe { find_fadt_in_rsdt(rsdp.rsdt_address as u64) }
-    };
-
-    let fadt_phys = match fadt_phys {
+    let fadt_phys = match unsafe { acpi::find_table(rsdp_phys, b"FACP") } {
         Some(addr) => addr,
         None => {
             crate::serial_puts("[ACPI] FADT not found\n");
@@ -543,7 +367,7 @@ pub unsafe fn parse_fadt(rsdp_phys: u64) {
         }
     };
 
-    let fadt_ptr: *const Fadt = phys_to_ptr(fadt_phys);
+    let fadt_ptr: *const Fadt = acpi::phys_to_ptr(fadt_phys);
     let fadt = unsafe { &*fadt_ptr };
 
     // Validate minimum length
@@ -578,6 +402,10 @@ pub fn get_power_info() -> &'static AcpiPowerInfo {
     // SAFETY: ACPI_POWER is only written during boot (single-threaded).
     unsafe { &*(&raw const ACPI_POWER) }
 }
+
+// ---------------------------------------------------------------------------
+// x86-specific helpers
+// ---------------------------------------------------------------------------
 
 /// Read the BSP's Local APIC ID from the APIC ID register
 unsafe fn read_bsp_apic_id() -> u8 {

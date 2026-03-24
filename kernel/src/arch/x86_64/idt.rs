@@ -276,39 +276,45 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
             let current = scheduler.current();
 
             // COW + demand paging + stack growth fault handling
-            if f.vector == 14 && !current.is_null() && !(*current).vspace_root.is_null() {
-                let vspace = &mut *(*current).vspace_root;
-                // Phase 2: Kernel fast-path COW with pre-allocated pool.
-                // Falls through to VMFault IPC (Phase 1 path) when pool is empty.
-                if let Ok(true) = vspace.handle_cow_fault_pooled(f.cr2, f.error_code) {
-                    if (*current).state == crate::sched::thread::ThreadState::Inactive {
-                        scheduler.reschedule();
+            // Construct arch-neutral PageFaultInfo from x86 PF error_code.
+            // Hoisted so it is available for both the fast-path AND the
+            // IPC fallthrough (to_ipc_error_code).
+            let pf_fault = if f.vector == 14 {
+                Some(crate::mm::PageFaultInfo {
+                    present: f.error_code & 1 != 0,
+                    write: f.error_code & 2 != 0,
+                    user: f.error_code & 4 != 0,
+                })
+            } else {
+                None
+            };
+
+            if let Some(ref fault) = pf_fault {
+                if !current.is_null() && !(*current).vspace_root.is_null() {
+                    let vspace = &mut *(*current).vspace_root;
+                    // Phase 2: Kernel fast-path COW with pre-allocated pool.
+                    // Falls through to VMFault IPC (Phase 1 path) when pool is empty.
+                    if let Ok(true) = vspace.handle_cow_fault_pooled(f.cr2, fault) {
+                        if (*current).state == crate::sched::thread::ThreadState::Inactive {
+                            scheduler.reschedule();
+                        }
+                        return;
                     }
-                    return;
-                }
-                // Demand paging: PRESENT=0, DEMAND bit set in PTE
-                if let Ok(true) = vspace.handle_demand_fault(f.cr2, f.error_code) {
-                    // No global lock held on exception entry; per-object locks
-                    // stub for user-mode exceptions. Just reschedule directly.
-                    if (*current).state == crate::sched::thread::ThreadState::Inactive {
-                        scheduler.reschedule();
+                    // Non-pooled COW fallback: kernel frame allocator
+                    if let Ok(true) = vspace.handle_cow_fault(f.cr2, fault) {
+                        if (*current).state == crate::sched::thread::ThreadState::Inactive {
+                            scheduler.reschedule();
+                        }
+                        return;
                     }
-                    return;
-                }
-                // Stack growth: PRESENT=0, address near stack pointer
-                if let Ok(true) = vspace.handle_stack_growth_fault(
-                    f.cr2,
-                    f.error_code,
-                    f.rsp,
-                    (*current).user_stack_top,
-                    (*current).user_stack_min,
-                ) {
-                    // No global lock held on exception entry; per-object locks
-                    // stub for user-mode exceptions. Just reschedule directly.
-                    if (*current).state == crate::sched::thread::ThreadState::Inactive {
-                        scheduler.reschedule();
-                    }
-                    return;
+                    // Demand paging and stack growth are handled by mmsrv
+                    // via VMFault IPC. The kernel fast-paths
+                    // (handle_demand_fault / handle_stack_growth_fault)
+                    // use pmm_alloc which can return frames inside
+                    // untyped blocks; a later retype from that untyped
+                    // zeroes the frame, destroying live user data.
+                    // Delegating to mmsrv avoids the conflict because
+                    // mmsrv allocates exclusively via retype.
                 }
             }
 
@@ -316,13 +322,16 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
                 let fault_ep = &mut *((*current).fault_handler
                     as *mut crate::ipc::Endpoint);
 
-                // Build fault message
-                let msg = if f.vector == 14 {
+                // Build fault message using arch-neutral PageFaultInfo
+                // for VMFaults, raw error_code for other exceptions.
+                let msg = if let Some(ref fault) = pf_fault {
+                    let is_instr = f.error_code & 16 != 0;
+                    let ipc_ec = fault.to_ipc_error_code(is_instr);
                     crate::ipc::vm_fault_message(
                         f.cr2,
-                        f.error_code,
+                        ipc_ec,
                         f.rip,
-                        f.error_code & 16 != 0,
+                        is_instr,
                     )
                 } else {
                     crate::ipc::user_exception_message(

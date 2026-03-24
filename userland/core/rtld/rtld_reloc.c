@@ -1,11 +1,17 @@
 /* SaltyOS Runtime Dynamic Linker - Relocation Processing
  * SPDX-License-Identifier: GPL-2.0-only
  *
- * Handles R_X86_64_RELATIVE, R_X86_64_64, R_X86_64_GLOB_DAT,
- * and R_X86_64_JUMP_SLOT relocations.
+ * Handles R_RELATIVE, R_ABS64, R_GLOB_DAT,
+ * and R_JUMP_SLOT relocations.
  */
 
 #include "rtld_internal.h"
+
+#ifdef R_TLSDESC
+/* Static TLS descriptor resolver (assembly, preserves all regs except x0).
+ * Dynamic TLS (dlopen) is not supported — all modules use static TLS. */
+extern uint64_t _tlsdesc_static_resolver(void);
+#endif
 
 /* Resolve a symbol by index from a given object's symtab */
 static uint64_t resolve_by_index(struct rtld_state *st, struct link_map *map,
@@ -42,6 +48,28 @@ static uint64_t resolve_by_index(struct rtld_state *st, struct link_map *map,
     return 0;
 }
 
+static void fatal_unresolved_reloc(struct link_map *map, uint32_t sym_idx,
+                                   const char *reloc_name) {
+    const char *name = "<invalid>";
+    if (map->symtab && map->strtab
+        && (map->symtab_count == 0 || sym_idx < map->symtab_count)) {
+        Elf64_Sym *sym = &map->symtab[sym_idx];
+        if (map->strtab_size == 0 || sym->st_name < map->strtab_size) {
+            name = map->strtab + sym->st_name;
+        }
+    }
+
+    struct rtld_linebuf lb;
+    rtld_lb_init(&lb);
+    rtld_lb_str(&lb, "[RTLD] FATAL: unresolved ");
+    rtld_lb_str(&lb, reloc_name);
+    rtld_lb_str(&lb, " symbol: ");
+    rtld_lb_str(&lb, name);
+    rtld_lb_str(&lb, "\n");
+    rtld_lb_flush(&lb);
+    rtld_exit(127);
+}
+
 /* Apply a single relocation */
 static void apply_rela(struct rtld_state *st, struct link_map *map,
                         Elf64_Rela *r) {
@@ -50,41 +78,65 @@ static void apply_rela(struct rtld_state *st, struct link_map *map,
     uint32_t sym_idx = ELF64_R_SYM(r->r_info);
 
     switch (type) {
-    case R_X86_64_NONE:
+    case R_NONE:
         break;
 
-    case R_X86_64_RELATIVE:
+    case R_RELATIVE:
         /* B + A: base address + addend */
         *target = map->base + (uint64_t)r->r_addend;
         break;
 
-    case R_X86_64_64: {
+    case R_ABS64: {
         /* S + A: symbol value + addend */
         uint64_t sym_addr = resolve_by_index(st, map, sym_idx);
+        if (sym_addr == 0) {
+            if (map->symtab_count == 0 || sym_idx < map->symtab_count) {
+                Elf64_Sym *sym = &map->symtab[sym_idx];
+                if (ELF64_ST_BIND(sym->st_info) != STB_WEAK) {
+                    fatal_unresolved_reloc(map, sym_idx, "R_ABS64");
+                }
+            }
+        }
         *target = sym_addr + (uint64_t)r->r_addend;
         break;
     }
 
-    case R_X86_64_GLOB_DAT: {
+    case R_GLOB_DAT: {
         /* S: symbol value */
         uint64_t sym_addr = resolve_by_index(st, map, sym_idx);
+        if (sym_addr == 0) {
+            if (map->symtab_count == 0 || sym_idx < map->symtab_count) {
+                Elf64_Sym *sym = &map->symtab[sym_idx];
+                if (ELF64_ST_BIND(sym->st_info) != STB_WEAK) {
+                    fatal_unresolved_reloc(map, sym_idx, "R_GLOB_DAT");
+                }
+            }
+        }
         *target = sym_addr;
         break;
     }
 
-    case R_X86_64_JUMP_SLOT: {
+    case R_JUMP_SLOT: {
         /* For eager binding: resolve now */
         uint64_t sym_addr = resolve_by_index(st, map, sym_idx);
+        if (sym_addr == 0) {
+            if (map->symtab_count == 0 || sym_idx < map->symtab_count) {
+                Elf64_Sym *sym = &map->symtab[sym_idx];
+                if (ELF64_ST_BIND(sym->st_info) != STB_WEAK) {
+                    fatal_unresolved_reloc(map, sym_idx, "R_JUMP_SLOT");
+                }
+            }
+        }
         *target = sym_addr;
         break;
     }
 
-    case R_X86_64_DTPMOD64:
+    case R_DTPMOD64:
         /* Module ID for __tls_get_addr (GD model). */
         *target = map->tls_module_id;
         break;
 
-    case R_X86_64_DTPOFF64: {
+    case R_DTPOFF64: {
         /* Offset within the module's TLS block (for __tls_get_addr).
          * For STT_TLS symbols, st_value is the offset within the TLS segment. */
         Elf64_Sym *sym = &map->symtab[sym_idx];
@@ -92,13 +144,24 @@ static void apply_rela(struct rtld_state *st, struct link_map *map,
         break;
     }
 
-    case R_X86_64_TPOFF64: {
+    case R_TPOFF64: {
         /* Offset from thread pointer (Variant II: TLS data below TP).
          * TP + offset = address of TLS variable. */
         Elf64_Sym *sym = &map->symtab[sym_idx];
         *target = (uint64_t)(map->tls_tpoff + (int64_t)sym->st_value + r->r_addend);
         break;
     }
+
+#ifdef R_TLSDESC
+    case R_TLSDESC: {
+        /* GOT descriptor {resolver, tp_offset} for TLSDESC access sequence. */
+        Elf64_Sym *sym = &map->symtab[sym_idx];
+        int64_t tpoff = map->tls_tpoff + (int64_t)sym->st_value + r->r_addend;
+        target[0] = (uint64_t)_tlsdesc_static_resolver;
+        target[1] = (uint64_t)tpoff;
+        break;
+    }
+#endif
 
     default:
         { struct rtld_linebuf lb; rtld_lb_init(&lb);

@@ -2,7 +2,7 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use crate::mm::{alloc_frame, phys_to_virt, mark_frame_kernel_runtime, mark_frame_pt_owned, PAGE_SIZE, PHYS_MAP_OFFSET};
+use crate::mm::{pmm_alloc, frame::FrameOwner, frame::KernelMetaKind, phys_to_virt, PAGE_SIZE, PHYS_MAP_OFFSET};
 
 /// Maximum direct physical mapping size (512 GB cap)
 const MAX_DIRECT_MAP_SIZE: usize = 512 * 1024 * 1024 * 1024;
@@ -75,7 +75,23 @@ pub fn invlpg(addr: u64) {
     }
 }
 
+/// No-op on x86_64 — instruction and data caches are coherent.
+///
+/// On aarch64 this broadcasts `IC IALLUIS` to invalidate the I-cache
+/// across all CPUs. Provided here so shared code can call
+/// `crate::arch::paging::flush_icache_all()` unconditionally.
+#[inline(always)]
+pub fn flush_icache_all() {}
+
+/// No-op on x86_64 — see [`flush_icache_all`].
+#[inline(always)]
+pub fn flush_dcache_pou_page(_kva: u64) {}
+
 /// Ensure that a non-leaf page table exists at `index` and return its physical address.
+///
+/// If the entry contains a 2MB huge page, splits it into 512 × 4KB pages
+/// so that individual pages can be remapped (e.g. for MMIO with uncached
+/// attributes). The split preserves existing attributes on all 512 entries.
 ///
 /// # Safety
 /// - `table` must point to a valid page table in the active kernel address space.
@@ -89,14 +105,13 @@ unsafe fn ensure_next_table(
     let entry = table.entry(index);
     if entry & PageFlags::Present as u64 != 0 {
         if entry & PageFlags::HugePage as u64 != 0 {
-            panic!("kernel 4K mapping collided with huge page");
+            // Split 2MB huge page into a page table with 512 × 4KB entries.
+            return unsafe { split_huge_page(table, index, entry, context) };
         }
         return entry & ENTRY_ADDR_MASK;
     }
 
-    let frame = alloc_frame().expect(context);
-    mark_frame_pt_owned(frame);
-    mark_frame_kernel_runtime(frame);
+    let frame = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect(context);
 
     // SAFETY: `frame` is a freshly allocated page-table frame reachable through
     // the existing direct map, and zeroing it initializes all entries to empty.
@@ -109,6 +124,44 @@ unsafe fn ensure_next_table(
         frame | (PageFlags::Present as u64) | (PageFlags::Writable as u64),
     );
     frame
+}
+
+/// Split a 2MB huge page into 512 × 4KB page table entries.
+///
+/// Allocates a new page table, fills it with 4KB entries that reproduce
+/// the same physical mapping and attributes as the original huge page,
+/// then replaces the PD entry with the new PT pointer.
+///
+/// # Safety
+/// Same requirements as `ensure_next_table`.
+unsafe fn split_huge_page(
+    table: &mut PageTable,
+    index: usize,
+    huge_entry: u64,
+    context: &'static str,
+) -> u64 {
+    let pt_frame = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect(context);
+
+    // SAFETY: pt_frame is freshly allocated and reachable via direct map.
+    let pt = unsafe { &mut *(phys_to_virt(pt_frame) as *mut PageTable) };
+
+    // Base physical address of the 2MB region.
+    let base_phys = huge_entry & ENTRY_ADDR_MASK;
+    // Carry forward all attribute bits except HugePage and the address.
+    let attrs = (huge_entry & !ENTRY_ADDR_MASK) & !(PageFlags::HugePage as u64);
+
+    for i in 0..512 {
+        let page_phys = base_phys + (i as u64) * PAGE_SIZE as u64;
+        pt.set_entry(i, page_phys | attrs);
+    }
+
+    // Replace the huge page entry with a pointer to the new PT.
+    table.set_entry(
+        index,
+        pt_frame | (PageFlags::Present as u64) | (PageFlags::Writable as u64),
+    );
+
+    pt_frame
 }
 
 /// Map one 4KB MMIO page into the higher-half physmap slot with uncached attributes.
@@ -242,7 +295,7 @@ unsafe fn init_direct_map(max_phys: u64) {
     let pml4e = pml4.entry(pml4_idx);
     let pdpt_phys = if pml4e & PageFlags::Present as u64 == 0 {
         // Allocate new PDPT
-        let pdpt_frame = alloc_frame().expect("Failed to allocate PDPT for direct map");
+        let pdpt_frame = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect("Failed to allocate PDPT for direct map");
         // Use identity mapping for access during init
         let pdpt_virt = pdpt_frame as *mut u8;
 
@@ -273,7 +326,7 @@ unsafe fn init_direct_map(max_phys: u64) {
 
         let pd_phys = if pdpte & PageFlags::Present as u64 == 0 {
             // Allocate new PD
-            let pd_frame = alloc_frame().expect("Failed to allocate PD for direct map");
+            let pd_frame = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect("Failed to allocate PD for direct map");
             // Use identity mapping for access during init
             let pd_virt = pd_frame as *mut u8;
 

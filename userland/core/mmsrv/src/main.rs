@@ -129,6 +129,35 @@ unsafe fn self_map_frame(frame_cap: Cap) -> *mut u8 {
     }
 }
 
+/// Create a MemoryObject with at least `min_pages` capacity.
+///
+/// Returns `(mo_cap, actual_page_count)` on success, or `(0, 0)` on failure.
+/// The actual page count is the next power-of-two >= `min_pages`.
+///
+/// # Safety
+/// Must be called from the mmsrv main loop (single-threaded access to statics).
+unsafe fn create_mo(min_pages: usize) -> (Cap, usize) {
+    unsafe {
+        if min_pages == 0 {
+            return (0, 0);
+        }
+        let mut sb: u64 = 0;
+        while (1u64 << sb) < min_pages as u64 {
+            sb += 1;
+        }
+        let actual = 1usize << sb;
+        let slot = match recycled_slot_alloc() {
+            Some(s) => s,
+            None => return (0, 0),
+        };
+        if retype_any(OBJ_MEMORY_OBJECT, sb, slot) != 0 {
+            recycle_empty_slot(slot);
+            return (0, 0);
+        }
+        (slot, actual)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Untyped source tracking
 // ---------------------------------------------------------------------------
@@ -141,8 +170,21 @@ static mut UT_COUNT: usize = 0;
 static mut UT_HINT: usize = 0;
 
 // ---------------------------------------------------------------------------
-// Per-page region tracking helpers
+// Helpers
 // ---------------------------------------------------------------------------
+
+/// Allocate a Cap array of `cap` entries via self_mmap (used by SHM).
+unsafe fn alloc_frame_cap_array(cap: usize) -> *mut Cap {
+    unsafe {
+        let bytes = cap * core::mem::size_of::<Cap>();
+        let pages = (bytes + 4095) / 4096;
+        let ptr = self_mmap(pages);
+        if ptr.is_null() {
+            return core::ptr::null_mut();
+        }
+        ptr as *mut Cap
+    }
+}
 
 /// Convert POSIX prot flags to VSpace flags.
 fn prot_to_vspace_flags(prot: u8) -> u64 {
@@ -167,36 +209,94 @@ fn vspace_flags_to_prot(flags: u64) -> u8 {
     prot
 }
 
-/// Allocate a frame_caps array of `cap` entries via self_mmap.
-unsafe fn alloc_frame_cap_array(cap: usize) -> *mut Cap {
+/// Commit `count` pages starting at `offset` in a MemoryObject, trying each
+/// available untyped source (round-robin from UT_HINT). If an untyped is
+/// partially exhausted, continues with the next untyped for the remaining
+/// pages. Falls back to PMM (ut_cap=0) as a last resort.
+///
+/// Returns `(error, total_committed)`.
+///
+/// # Safety
+///
+/// Must be called from the mmsrv main loop (single-threaded access to statics).
+unsafe fn commit_mo_pages(mo_cap: Cap, offset: u64, count: u64) -> (i32, u64) {
     unsafe {
-        let bytes = cap * core::mem::size_of::<Cap>();
-        let pages = (bytes + 4095) / 4096;
-        let ptr = self_mmap(pages);
-        if ptr.is_null() {
-            return core::ptr::null_mut();
+        let ut_count = *(&raw const UT_COUNT);
+        if ut_count == 0 {
+            // No untyped sources — fall back to PMM directly
+            return invoke::mo_commit(mo_cap, offset, count, 0);
         }
-        ptr as *mut Cap
-    }
-}
 
-/// Grow a frame_caps array: allocate new, copy old, return new pointer.
-unsafe fn grow_frame_cap_array(
-    old: *mut Cap,
-    old_count: usize,
-    new_cap: usize,
-) -> *mut Cap {
-    unsafe {
-        let new_ptr = alloc_frame_cap_array(new_cap);
-        if new_ptr.is_null() {
-            return core::ptr::null_mut();
-        }
-        if !old.is_null() && old_count > 0 {
-            for i in 0..old_count {
-                *new_ptr.add(i) = *old.add(i);
+        let start = {
+            let h = *(&raw const UT_HINT);
+            if h < ut_count { h } else { 0 }
+        };
+
+        let sources = &*(&raw const UT_SOURCES);
+        let mut remaining = count;
+        let mut cur_offset = offset;
+        let mut total_committed: u64 = 0;
+
+        // First pass: from hint to end
+        for i in start..ut_count {
+            if remaining == 0 {
+                break;
+            }
+            if !sources[i].active {
+                continue;
+            }
+            let (err, committed) = invoke::mo_commit(mo_cap, cur_offset, remaining, sources[i].cap);
+            if committed > 0 {
+                total_committed += committed;
+                cur_offset += committed;
+                remaining -= committed;
+                *(&raw mut UT_HINT) = i;
+            }
+            if err != 0 && committed == 0 {
+                continue;
+            }
+            if remaining == 0 {
+                return (0, total_committed);
             }
         }
-        new_ptr
+
+        // Second pass: wrap around (0..start)
+        for i in 0..start {
+            if remaining == 0 {
+                break;
+            }
+            if !sources[i].active {
+                continue;
+            }
+            let (err, committed) = invoke::mo_commit(mo_cap, cur_offset, remaining, sources[i].cap);
+            if committed > 0 {
+                total_committed += committed;
+                cur_offset += committed;
+                remaining -= committed;
+                *(&raw mut UT_HINT) = i;
+            }
+            if err != 0 && committed == 0 {
+                continue;
+            }
+            if remaining == 0 {
+                return (0, total_committed);
+            }
+        }
+
+        if remaining == 0 {
+            return (0, total_committed);
+        }
+
+        // Final fallback: PMM (ut_cap=0)
+        let (err, committed) = invoke::mo_commit(mo_cap, cur_offset, remaining, 0);
+        total_committed += committed;
+        remaining -= committed;
+
+        if remaining == 0 {
+            (0, total_committed)
+        } else {
+            (err, total_committed)
+        }
     }
 }
 
@@ -220,11 +320,6 @@ static mut RECV_SLOT_KEPT: bool = false;
 static mut PENDING_CLEANUP_SLOTS: [u64; 4] = [0; 4];
 static mut PENDING_CLEANUP_COUNT: usize = 0;
 
-/// Shared COW aggregation notification — bound to mmsrv's TCB.
-/// All per-VSpace pools share this notification so a single bound signal
-/// wakes mmsrv from Recv when any pool is consumed.
-static mut COW_AGG_NTFN: Cap = 0;
-
 // ---------------------------------------------------------------------------
 // CNode slot recycling
 // ---------------------------------------------------------------------------
@@ -243,10 +338,9 @@ static mut FRAME_POOL_PTR: *mut u64 = core::ptr::null_mut();
 static mut FRAME_POOL_CAP: usize = 0;
 static mut FRAME_POOL_COUNT: usize = 0;
 
-/// Zeroing window: 8 pages for batch frame zeroing before pool push.
+/// Zeroing window: used by frame_pool_push for zeroing before pool push.
 /// Located just below SELF_MMAP_BASE to avoid VA conflicts.
 const ZERO_WINDOW_BASE: u64 = 0x1FFF_8000;
-const ZERO_WINDOW_PAGES: usize = 8;
 
 /// Statistics: total frames recycled into pool and reused from pool.
 static mut FRAME_POOL_TOTAL_RECYCLED: u64 = 0;
@@ -630,10 +724,6 @@ unsafe fn mark_recv_slot_kept() {
     }
 }
 
-pub(crate) fn cow_agg_ntfn() -> Cap {
-    unsafe { *(&raw const COW_AGG_NTFN) }
-}
-
 /// Allocate a CNode slot, preferring recycled slots over the bump allocator.
 /// Never performs blocking IPC to procmgr — returns None instead of expanding
 /// the CSpace, preventing the procmgr→mmsrv→procmgr deadlock on slot exhaustion.
@@ -741,70 +831,6 @@ pub(crate) fn frame_pool_pop() -> Option<Cap> {
     }
 }
 
-/// Batch push frame caps into the recycling pool with 8-page window zeroing.
-/// Null (0) entries in `caps` are skipped. Falls back to recycled_cnode_delete
-/// for caps that cannot be pooled (map failure or pool full).
-///
-/// # Safety
-///
-/// `caps` must point to a valid array of at least `count` Cap entries.
-pub(crate) unsafe fn frame_pool_push_batch(caps: *const Cap, count: usize) {
-    unsafe {
-        let mut i = 0;
-        while i < count {
-            let chunk = core::cmp::min(count - i, ZERO_WINDOW_PAGES);
-            let mut mapped_flags: [bool; 8] = [false; 8];
-
-            for j in 0..chunk {
-                let cap = *caps.add(i + j);
-                if cap == 0 {
-                    continue;
-                }
-                let va = ZERO_WINDOW_BASE + j as u64 * 4096;
-                let err = invoke::vspace_map(
-                    CAP_SELF_VSPACE, cap, va,
-                    VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
-                );
-                if err != 0 {
-                    recycled_cnode_delete(cap);
-                    continue;
-                }
-                mapped_flags[j] = true;
-            }
-
-            // Zero only mapped pages — skip holes where cap was 0 or map failed
-            for j in 0..chunk {
-                if mapped_flags[j] {
-                    let va = ZERO_WINDOW_BASE + j as u64 * 4096;
-                    core::ptr::write_bytes(va as *mut u8, 0, 4096);
-                }
-            }
-
-            for j in 0..chunk {
-                let cap = *caps.add(i + j);
-                if cap == 0 || !mapped_flags[j] {
-                    continue;
-                }
-                let va = ZERO_WINDOW_BASE + j as u64 * 4096;
-                invoke::vspace_unmap(CAP_SELF_VSPACE, va);
-                let pool_count = *(&raw const FRAME_POOL_COUNT);
-                let pool_cap = *(&raw const FRAME_POOL_CAP);
-                let pool_ptr = *(&raw const FRAME_POOL_PTR);
-                if pool_count < pool_cap && !pool_ptr.is_null() {
-                    // SAFETY: pool_count < pool_cap, pool_ptr is valid.
-                    *pool_ptr.add(pool_count) = cap;
-                    *(&raw mut FRAME_POOL_COUNT) = pool_count + 1;
-                    *(&raw mut FRAME_POOL_TOTAL_RECYCLED) += 1;
-                } else {
-                    recycled_cnode_delete(cap);
-                }
-            }
-
-            i += chunk;
-        }
-    }
-}
-
 /// Allocate a frame cap: tries the recycled frame pool first, then falls
 /// back to slot_alloc + retype_any. Returns the CNode slot holding a valid
 /// frame cap, or None on OOM.
@@ -823,41 +849,12 @@ pub(crate) fn alloc_frame() -> Option<Cap> {
     Some(slot)
 }
 
-/// Drain COW notification rings for all active pools.
-///
-/// For each active VSpace pool, reads the notification ring to learn which
-/// pool entries were consumed by the kernel fast-path, clears COW bits in
-/// the corresponding regions, and replenishes the pool.
-unsafe fn drain_all_cow_pools() {
-    unsafe {
-        let clients_ptr = *(&raw const CLIENTS_PTR);
-        let clients_cap = *(&raw const CLIENTS_CAP);
-        if clients_ptr.is_null() {
-            return;
-        }
-        for ci in 0..clients_cap {
-            let client = clients_ptr.add(ci);
-            if !(*client).active {
-                continue;
-            }
-            let pool_ptr = pool::find_pool_by_vspace((*client).vspace_cap);
-            if pool_ptr.is_null() {
-                continue;
-            }
-            let (drained, complete) = pool::drain_notifications(client, pool_ptr);
-            if drained > 0 && complete {
-                pool::replenish_pool(client, pool_ptr);
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     puts(b"[MMSRV] SaltyOS memory server starting\n");
 
     // Set up IPC buffer
@@ -890,28 +887,6 @@ pub extern "C" fn _start() -> ! {
         } else {
             puts(b"[MMSRV] FATAL: slot pool not provided by RTLD/auxv\n");
             idle();
-        }
-    }
-
-    // Allocate shared COW aggregation notification and bind to our TCB.
-    // When the kernel fast-path consumes pool entries and signals, the
-    // bound notification wakes us from Recv without a real IPC message.
-    unsafe {
-        if let Some(ntfn_slot) = recycled_slot_alloc() {
-            if retype_any(OBJ_NOTIFICATION, 0, ntfn_slot) == 0 {
-                let err = invoke::tcb_bind_notification(CAP_SELF_TCB, ntfn_slot);
-                if err == 0 {
-                    *(&raw mut COW_AGG_NTFN) = ntfn_slot;
-                    puts(b"[MMSRV] COW aggregation notification bound\n");
-                } else {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[MMSRV] WARN: bind COW ntfn failed err=");
-                    lb.hex(err as u64);
-                    lb.str(b"\n");
-                    lb.flush();
-                    recycled_cnode_delete(ntfn_slot);
-                }
-            }
         }
     }
 
@@ -998,32 +973,6 @@ pub extern "C" fn _start() -> ! {
             *(&raw mut PENDING_CLEANUP_COUNT) = 0;
         }
 
-        // Phase 2: Drain COW notification rings for all active pools.
-        // When the kernel fast-path resolves a COW fault, it writes to
-        // the notification ring and signals. We drain on every loop
-        // iteration (lightweight check: head != tail).
-        unsafe {
-            drain_all_cow_pools();
-        }
-
-        // Bound-notification wakeup: when the kernel signals a pool's
-        // notification, mmsrv wakes from Recv with label=0 and badge
-        // carrying the signal bits. Drain pools and re-enter recv
-        // (no caller to reply to).
-        if msg.label == 0 && badge != 0 {
-            unsafe {
-                drain_all_cow_pools();
-            }
-            let err = unsafe {
-                ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
-            };
-            if err != 0 {
-                puts(b"[MMSRV] recv after ntfn drain failed\n");
-                break;
-            }
-            continue;
-        }
-
         unsafe {
             match msg.label {
                 MM_REGISTER => client::handle_mm_register(&raw const msg, badge, &raw mut reply),
@@ -1054,6 +1003,7 @@ pub extern "C" fn _start() -> ! {
                     let error_code = msg.regs[1];
                     let fault_rip = msg.regs[2];
                     let page_addr = fault_addr & !0xFFFu64;
+
 
                     'fault: {
                         // 1. Find client by badge
@@ -1127,132 +1077,13 @@ pub extern "C" fn _start() -> ! {
                             break 'fault;
                         }
 
-                        let page_idx = ((page_addr - (*region).base) / 4096) as usize;
-
-                        // 3. COW fault detection: write to present page
+                        // 3. Write to present page = access violation
+                        // (e.g. mprotect(PROT_READ) page). With MO-based COW,
+                        // the kernel resolves COW faults internally. If a
+                        // write fault on a present page reaches mmsrv, it is
+                        // a genuine access violation.
                         // error_code bits: [0]=Present, [1]=Write, [2]=User
-                        // 0x7 = present + write + user = COW write fault
-                        // Guard: only enter COW path if the page is actually
-                        // COW-inherited. Non-COW write-to-present faults (e.g.
-                        // mprotect(PROT_READ) violations) are access violations.
-                        //
-                        // Implicit COW fallback: if the bitmap is missing
-                        // (OOM during fork) but the region is writable, the
-                        // fault MUST be COW — SaltyOS has no other mechanism
-                        // that downgrades writable PTEs to read-only.
-                        let bitmap_cow = client::is_cow_page(region, page_idx);
-                        let implicit_cow = !bitmap_cow && (*region).cow_inherited;
-                        if (error_code & 0x7) == 0x7 && (bitmap_cow || implicit_cow) {
-                            // COW resolution path: allocate a new frame and
-                            // let the kernel copy + replace the COW mapping.
-                            // Use fresh retype (not recycled pool) to avoid
-                            // issues with frame lifecycle during COW.
-                            let slot = match recycled_slot_alloc() {
-                                Some(s) => s,
-                                None => {
-                                    reply.label = BESALT_OUT_OF_MEMORY;
-                                    break 'fault;
-                                }
-                            };
-
-                            if retype_any(OBJ_FRAME, 0, slot) != 0 {
-                                reply.label = BESALT_OUT_OF_MEMORY;
-                                break 'fault;
-                            }
-
-                            let flags = prot_to_vspace_flags((*region).prot);
-
-                            let err = invoke::vspace_cow_resolve(
-                                (*client_ptr).vspace_cap,
-                                page_addr,
-                                slot,
-                                flags,
-                            );
-
-                            if err == BESALT_ALREADY_EXISTS as i32 {
-                                // Race: another CPU already resolved this COW page.
-                                // Kernel confirmed PTE is writable (not COW).
-                                // Safe for both bitmap_cow and implicit_cow paths.
-                                recycled_cnode_delete(slot);
-                                if bitmap_cow {
-                                    client::clear_cow_bit(region, page_idx);
-                                }
-                                reply.label = BESALT_OK;
-                                break 'fault;
-                            }
-                            if err == BESALT_INVALID_OPERATION as i32 {
-                                // Kernel says page is present, not COW, not writable.
-                                // Genuine access violation (e.g. mprotect PROT_READ).
-                                recycled_cnode_delete(slot);
-                                let mut lb = LineBuf::new();
-                                lb.str(b"[MMSRV] access violation (not COW): badge=");
-                                lb.hex(badge);
-                                lb.str(b" addr=");
-                                lb.hex(fault_addr);
-                                lb.str(b"\n");
-                                lb.flush();
-                                skip_reply = true;
-                                break 'fault;
-                            }
-                            if err != 0 {
-                                recycled_cnode_delete(slot);
-                                reply.label = BESALT_BAD_ADDRESS;
-                                break 'fault;
-                            }
-
-                            // Success — ensure frame_caps array is large enough
-                            if page_idx >= (*region).frame_cap_capacity as usize {
-                                let old_cap = (*region).frame_cap_capacity as usize;
-                                let required = page_idx + 1;
-                                let growth = if old_cap < 128 {
-                                    if old_cap == 0 { 8 } else { old_cap }
-                                } else if old_cap < 1024 {
-                                    old_cap / 2
-                                } else {
-                                    256
-                                };
-                                let new_cap = core::cmp::max(required, old_cap + growth);
-                                let new_fcaps = grow_frame_cap_array(
-                                    (*region).frame_caps,
-                                    old_cap,
-                                    new_cap,
-                                );
-                                if new_fcaps.is_null() {
-                                    // Frame is already resolved in kernel; just
-                                    // lose tracking rather than fail the fault.
-                                    reply.label = BESALT_OK;
-                                    break 'fault;
-                                }
-                                (*region).frame_caps = new_fcaps;
-                                (*region).frame_cap_capacity = new_cap as u32;
-                            }
-
-                            // Replace stale frame cap if parent had one
-                            if !(*region).frame_caps.is_null() && page_idx < (*region).frame_cap_capacity as usize {
-                                let old_cap = *(*region).frame_caps.add(page_idx);
-                                if old_cap != 0 {
-                                    recycled_cnode_delete(old_cap);
-                                }
-                                *(*region).frame_caps.add(page_idx) = slot;
-                            }
-
-                            // Clear COW bit — this page now has its own frame
-                            client::clear_cow_bit(region, page_idx);
-
-                            // High-water-mark update: after fork, sparse COW
-                            // resolution at high page_idx must not leave
-                            // frame_count below the resolved index.
-                            let needed = (page_idx + 1) as u32;
-                            if needed > (*region).frame_count {
-                                (*region).frame_count = needed;
-                            }
-                            reply.label = BESALT_OK;
-                            break 'fault;
-                        }
-
-                        // Non-COW write to present page = access violation
-                        // (e.g. mprotect(PROT_READ) page). Leave faulting
-                        // thread permanently FaultBlocked.
+                        // 0x7 = present + write + user
                         if (error_code & 0x7) == 0x7 {
                             let mut lb = LineBuf::new();
                             lb.str(b"[MMSRV] access violation: badge=");
@@ -1265,72 +1096,55 @@ pub extern "C" fn _start() -> ! {
                             break 'fault;
                         }
 
-                        // 4. Non-COW fault: demand-page path
-                        // Grow frame_caps array if needed
-                        if page_idx >= (*region).frame_cap_capacity as usize {
-                            // Index out of bounds — grow frame_caps array to fit
-                            let old_cap = (*region).frame_cap_capacity as usize;
-                            let required = page_idx + 1;
-                            // Hybrid growth: small 2x, medium 1.5x, large +256
-                            let growth = if old_cap < 128 {
-                                if old_cap == 0 { 8 } else { old_cap }
-                            } else if old_cap < 1024 {
-                                old_cap / 2
-                            } else {
-                                256
-                            };
-                            let new_cap = core::cmp::max(required, old_cap + growth);
-                            let new_fcaps = grow_frame_cap_array(
-                                (*region).frame_caps,
-                                old_cap,
-                                new_cap,
-                            );
-                            if new_fcaps.is_null() {
-                                reply.label = BESALT_OUT_OF_MEMORY;
-                                break 'fault;
-                            }
-                            (*region).frame_caps = new_fcaps;
-                            (*region).frame_cap_capacity = new_cap as u32;
-                        }
-                        if !(*region).frame_caps.is_null() && *(*region).frame_caps.add(page_idx) != 0 {
-                            // Already mapped (race)
-                            reply.label = BESALT_OK;
+                        // 4. Demand-page path: all regions are MO-backed.
+                        // Commit the page via mo_commit, then map into VSpace.
+                        if (*region).mo_cap == 0 {
+                            // No MO — region is corrupted or legacy. Segfault.
+                            let mut lb = LineBuf::new();
+                            lb.str(b"[MMSRV] VMFault: region has no MO badge=");
+                            lb.hex(badge);
+                            lb.str(b" addr=");
+                            lb.hex(fault_addr);
+                            lb.str(b"\n");
+                            lb.flush();
+                            skip_reply = true;
                             break 'fault;
                         }
 
-                        // 5. Allocate frame: fresh retype (not recycled pool)
-                        let slot = match recycled_slot_alloc() {
-                            Some(s) => s,
-                            None => {
-                                reply.label = BESALT_OUT_OF_MEMORY;
-                                break 'fault;
-                            }
-                        };
-                        if retype_any(OBJ_FRAME, 0, slot) != 0 {
+                        let page_offset = page_addr - (*region).base;
+                        let mo_page_idx = (*region).mo_offset as u64 + page_offset / 4096;
+                        let flags = prot_to_vspace_flags((*region).prot);
+                        let (err, committed) = commit_mo_pages(
+                            (*region).mo_cap,
+                            mo_page_idx,
+                            1,
+                        );
+                        if err != 0 || committed != 1 {
+                            let mut lb = LineBuf::new();
+                            lb.str(b"[MMSRV] VMFault: mo_commit failed badge=");
+                            lb.hex(badge);
+                            lb.str(b" addr=");
+                            lb.hex(fault_addr);
+                            lb.str(b" err=");
+                            lb.hex(err as u64);
+                            lb.str(b"\n");
+                            lb.flush();
                             reply.label = BESALT_OUT_OF_MEMORY;
                             break 'fault;
                         }
 
-                        // 6. Map into client's VSpace
-                        let flags = prot_to_vspace_flags((*region).prot);
-                        let err = invoke::vspace_map((*client_ptr).vspace_cap, slot, page_addr, flags);
-                        if err != 0 {
-                            recycled_cnode_delete(slot);
-                            reply.label = BESALT_BAD_ADDRESS;
-                            break 'fault;
-                        }
+                        // Map committed page into client's VSpace
+                        let count_and_flags = (1u64 << 32) | flags;
+                        let _ = invoke::vspace_map_mo(
+                            (*client_ptr).vspace_cap,
+                            (*region).mo_cap,
+                            page_addr,
+                            mo_page_idx,
+                            count_and_flags,
+                        );
+                        // AlreadyMapped is OK (page was already present
+                        // from the spawn-time vspace_map_mo).
 
-                        // 7. Track frame cap
-                        if !(*region).frame_caps.is_null() {
-                            *(*region).frame_caps.add(page_idx) = slot;
-                        }
-                        // High-water-mark update
-                        let needed = (page_idx + 1) as u32;
-                        if needed > (*region).frame_count {
-                            (*region).frame_count = needed;
-                        }
-
-                        // 8. Reply OK — kernel resumes faulting thread
                         reply.label = BESALT_OK;
                     } // end 'fault
                 }
@@ -1342,7 +1156,15 @@ pub extern "C" fn _start() -> ! {
                     lb.hex(badge);
                     lb.str(b"\n");
                     lb.flush();
-                    reply.label = BESALT_INVALID_OPERATION;
+                    // Fault labels (CapFault=1, UnknownSyscall=3, UserException=4)
+                    // are unrecoverable — skip reply so the thread stays FaultBlocked
+                    // instead of resuming and re-faulting in a tight loop.
+                    // Regular IPC labels (MM_* = 0x80+) get an error reply.
+                    if msg.label <= 4 {
+                        skip_reply = true;
+                    } else {
+                        reply.label = BESALT_INVALID_OPERATION;
+                    }
                 }
             }
         }
@@ -1400,7 +1222,7 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    idle();
+    idle()
 }
 
 fn idle() -> ! {

@@ -18,7 +18,7 @@ EXTRA_CFLAGS = -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initia
 
 [targets.cflags]
 -I${SRCDIR} -I${SRCDIR}/include -I${SRCDIR}/lib/libc/include
--I${SRCDIR}/sys -I${SRCDIR}/sys/amd64/include -I${SRCDIR}/sys/x86/include
+-I${SRCDIR}/sys -I${SRCDIR}/sys/${MACHINE_INCLUDE}
 -I${SRCDIR}/contrib -include sys/cdefs.h
 
 [targets]
@@ -59,7 +59,7 @@ date     = bin/date/date.c bin/date/vary.c :: -Ibin/date
 find     = usr.bin/find/find.c usr.bin/find/function.c usr.bin/find/ls.c usr.bin/find/main.c usr.bin/find/misc.c usr.bin/find/operator.c usr.bin/find/option.c :: -Iusr.bin/find
 
 [prepare]
-ln -sfn amd64/include ${SRCDIR}/sys/machine
+ln -sfn ${MACHINE}/include ${SRCDIR}/sys/machine
 ln -sfn sys/x86/include ${SRCDIR}/x86
 
 [install]

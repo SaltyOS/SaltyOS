@@ -1,55 +1,33 @@
-//! Kernel hardware random number generator (RDRAND / RDSEED)
+//! Kernel hardware random number generator (RDRAND / RDSEED / RNDR)
 //!
 //! Provides kernel-internal entropy sourced from the CPU's hardware RNG.
 //! Used for ASLR, stack canary seeds, and the SYS_GETRANDOM syscall.
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-/// Maximum retry count for RDRAND/RDSEED (Intel recommendation: 10).
+/// Maximum retry count for RDRAND/RDSEED/RNDR (Intel recommendation: 10).
 const MAX_RETRIES: u32 = 10;
 
-/// Generate a 64-bit random value using RDRAND.
+/// Generate a 64-bit random value using hardware RNG.
 ///
-/// Returns `None` if the CPU does not support RDRAND or if all retries fail.
+/// On x86_64, uses RDRAND. On aarch64, uses RNDR (ARMv8.5 FEAT_RNG).
+///
+/// Returns `None` if the CPU does not support the hardware RNG or if all
+/// retries fail.
 pub fn rdrand64() -> Option<u64> {
-    if !crate::arch::cpuid::has_rdrand() {
-        return None;
-    }
-    for _ in 0..MAX_RETRIES {
-        let val: u64;
-        let ok: u8;
-        // SAFETY: CPUID check above guarantees RDRAND is supported.
-        // The CF flag indicates success (1) or underflow (0).
-        unsafe {
-            core::arch::asm!(
-                "rdrand {val}",
-                "setc {ok}",
-                val = out(reg) val,
-                ok = out(reg_byte) ok,
-                options(nomem, nostack),
-            );
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !crate::arch::cpuid::has_hw_rng() {
+            return None;
         }
-        if ok != 0 {
-            return Some(val);
-        }
-    }
-    None
-}
-
-/// Generate a 64-bit seed value using RDSEED, falling back to RDRAND.
-///
-/// RDSEED provides conditioned entropy from the hardware RNG's seed source,
-/// which is higher quality than RDRAND for seeding other PRNGs. If RDSEED
-/// is unavailable or exhausted, falls back to RDRAND.
-pub fn rdseed64() -> Option<u64> {
-    if crate::arch::cpuid::has_rdseed() {
         for _ in 0..MAX_RETRIES {
             let val: u64;
             let ok: u8;
-            // SAFETY: CPUID check above guarantees RDSEED is supported.
+            // SAFETY: CPUID check above guarantees RDRAND is supported.
+            // The CF flag indicates success (1) or underflow (0).
             unsafe {
                 core::arch::asm!(
-                    "rdseed {val}",
+                    "rdrand {val}",
                     "setc {ok}",
                     val = out(reg) val,
                     ok = out(reg_byte) ok,
@@ -60,9 +38,72 @@ pub fn rdseed64() -> Option<u64> {
                 return Some(val);
             }
         }
+        None
     }
-    // Fallback to RDRAND
-    rdrand64()
+    #[cfg(target_arch = "aarch64")]
+    {
+        // FEAT_RNG is optional. If it is absent, touching RNDR itself
+        // faults, so gate the instruction on the architectural ID bit.
+        if !crate::arch::cpuid::has_hw_rng() {
+            return None;
+        }
+        for _ in 0..MAX_RETRIES {
+            let val: u64;
+            let ok: u64;
+            // SAFETY: FEAT_RNG support has been verified above, so
+            // RNDR is a valid system register access here. NZCV flags
+            // indicate whether fresh entropy was returned.
+            unsafe {
+                core::arch::asm!(
+                    "mrs {val}, S3_3_C2_C4_0",
+                    "cset {ok}, ne",
+                    val = out(reg) val,
+                    ok = out(reg) ok,
+                    options(nomem, nostack),
+                );
+            }
+            if ok != 0 {
+                return Some(val);
+            }
+        }
+        None
+    }
+}
+
+/// Generate a 64-bit seed value using hardware RNG.
+///
+/// On x86_64, uses RDSEED (falling back to RDRAND). On aarch64, delegates
+/// to `rdrand64()` since there is no separate seed instruction.
+pub fn rdseed64() -> Option<u64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::arch::cpuid::has_hw_seed() {
+            for _ in 0..MAX_RETRIES {
+                let val: u64;
+                let ok: u8;
+                // SAFETY: CPUID check above guarantees RDSEED is supported.
+                unsafe {
+                    core::arch::asm!(
+                        "rdseed {val}",
+                        "setc {ok}",
+                        val = out(reg) val,
+                        ok = out(reg_byte) ok,
+                        options(nomem, nostack),
+                    );
+                }
+                if ok != 0 {
+                    return Some(val);
+                }
+            }
+        }
+        // Fallback to RDRAND
+        rdrand64()
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // aarch64 RNDR is the only hardware RNG; no separate seed instruction
+        rdrand64()
+    }
 }
 
 /// Generate a random u64 in the range [0, max).

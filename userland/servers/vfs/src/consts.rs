@@ -18,7 +18,6 @@ pub(crate) const VFS_CAP_PROCMGR_EP: u64 = 70; // NeedEP procmgr:70
 pub(crate) const VFS_CAP_NETSRV_EP: u64 = 71; // NeedEP netsrv:71
 pub(crate) const VFS_CAP_NETSRV_CALLBACK_EP: u64 = 72; // badged copy of server EP for netsrv callbacks
 pub(crate) const NETSRV_CALLBACK_BADGE: u64 = 0x4E37D;
-pub(crate) const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 // VFS protocol labels
 pub(crate) const VFS_OPEN: u64 = 1;

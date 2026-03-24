@@ -42,6 +42,7 @@ const VIRTIO_STATUS_DRIVER: u8 = 2;
 const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
 
 /// Feature bits
+const VIRTIO_F_ANY_LAYOUT: u32 = 1 << 27;
 const VIRTIO_NET_F_MAC: u32 = 1 << 5;
 const VIRTIO_RING_F_EVENT_IDX: u32 = 1 << 29;
 
@@ -64,7 +65,19 @@ pub(crate) struct VirtioNetHdr {
     pub(crate) csum_offset: u16,
 }
 
-pub(crate) const VIRTIO_NET_HDR_SIZE: usize = 10;
+/// Runtime net header size: 12 with VIRTIO_F_VERSION_1, 10 for legacy.
+static mut NET_HDR_SIZE_VAL: usize = 10;
+
+pub(crate) fn net_hdr_size() -> usize {
+    unsafe { *(&raw const NET_HDR_SIZE_VAL) }
+}
+
+pub(crate) fn set_net_hdr_size(sz: usize) {
+    unsafe { *(&raw mut NET_HDR_SIZE_VAL) = sz; }
+}
+
+/// Legacy constant used only for non-flex descriptor split.
+const VIRTIO_NET_HDR_SIZE_LEGACY: usize = 10;
 
 /// Virtio descriptor table entry
 #[repr(C)]
@@ -75,6 +88,7 @@ struct VirtqDesc {
     next: u16,
 }
 
+const VRING_DESC_F_NEXT: u16 = 1;
 const VRING_DESC_F_WRITE: u16 = 2;
 
 /// DMA buffer configuration
@@ -86,30 +100,31 @@ const BUF_SIZE: usize = 2048;
 pub(crate) static mut MAC_ADDR: [u8; 6] = [0; 6];
 static mut BAR0_IS_IO: bool = false;
 static mut PCI_IOPORT_CAP: u64 = 0;
-static mut VIRTIO_INITIALIZED: bool = false;
+pub(crate) static mut VIRTIO_INITIALIZED: bool = false;
 
 // RX queue state (queue 0)
-static mut RX_QUEUE_SIZE: u16 = 0;
-static mut RX_QUEUE_BASE: u64 = 0;
-static mut RX_AVAIL_OFF: u64 = 0;
-static mut RX_USED_OFF: u64 = 0;
+pub(crate) static mut RX_QUEUE_SIZE: u16 = 0;
+pub(crate) static mut RX_QUEUE_BASE: u64 = 0;
+pub(crate) static mut RX_AVAIL_OFF: u64 = 0;
+pub(crate) static mut RX_USED_OFF: u64 = 0;
 static mut RX_AVAIL_IDX: u16 = 0;
 static mut RX_LAST_USED_IDX: u16 = 0;
 
 // TX queue state (queue 1)
-static mut TX_QUEUE_SIZE: u16 = 0;
-static mut TX_QUEUE_BASE: u64 = 0;
-static mut TX_AVAIL_OFF: u64 = 0;
-static mut TX_USED_OFF: u64 = 0;
+pub(crate) static mut TX_QUEUE_SIZE: u16 = 0;
+pub(crate) static mut TX_QUEUE_BASE: u64 = 0;
+pub(crate) static mut TX_AVAIL_OFF: u64 = 0;
+pub(crate) static mut TX_USED_OFF: u64 = 0;
 static mut TX_AVAIL_IDX: u16 = 0;
 static mut TX_LAST_USED_IDX: u16 = 0;
-static mut TX_INFLIGHT_LIMIT: usize = TX_BUF_COUNT;
+pub(crate) static mut TX_INFLIGHT_LIMIT: usize = TX_BUF_COUNT;
 
 // DMA buffer pools
 static mut RX_BUF_BASE: u64 = 0;
 static mut TX_BUF_BASE: u64 = 0;
 static mut RX_BUF_PHYS: [u64; RX_BUF_COUNT] = [0; RX_BUF_COUNT];
 static mut TX_BUF_PHYS: [u64; TX_BUF_COUNT] = [0; TX_BUF_COUNT];
+pub(crate) static mut USE_FLEX_LAYOUT: bool = false;
 
 // --- Virtqueue layout ---
 
@@ -223,7 +238,7 @@ fn bar_write32(offset: u64, val: u32) {
 }
 
 /// Compute physical address via vspace_walk for a given virtual address.
-fn vaddr_to_phys(vaddr: u64) -> u64 {
+pub(crate) fn vaddr_to_phys(vaddr: u64) -> u64 {
     let err = invoke::vspace_walk(CAP_SELF_VSPACE, vaddr, 1);
     if err != 0 {
         let mut lb = LineBuf::new();
@@ -403,11 +418,19 @@ fn virtio_negotiate() -> bool {
     bar_write8(VIRTIO_DEVICE_STATUS, VIRTIO_STATUS_ACK);
     bar_write8(VIRTIO_DEVICE_STATUS, VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER);
 
-    // Feature negotiation: only request MAC feature
+    // Transitional virtio-net requires ANY_LAYOUT to accept flexible
+    // header+payload framing for both TX and RX buffers.
     let dev_features = bar_read32(VIRTIO_DEV_FEATURES);
     let mut negotiated: u32 = 0;
     if (dev_features & VIRTIO_NET_F_MAC) != 0 {
         negotiated |= VIRTIO_NET_F_MAC;
+    }
+    let flex_layout = (dev_features & VIRTIO_F_ANY_LAYOUT) != 0;
+    if flex_layout {
+        negotiated |= VIRTIO_F_ANY_LAYOUT;
+        puts(b"[netdrv] Negotiated VIRTIO_F_ANY_LAYOUT\n");
+    } else {
+        puts(b"[netdrv] WARN: device did not offer VIRTIO_F_ANY_LAYOUT\n");
     }
     bar_write32(VIRTIO_GUEST_FEATURES, negotiated);
 
@@ -479,7 +502,19 @@ fn virtio_negotiate() -> bool {
         *(&raw mut TX_AVAIL_OFF) = tx_avail;
         *(&raw mut TX_USED_OFF) = tx_used;
         *(&raw mut TX_AVAIL_IDX) = 0;
-        *(&raw mut TX_INFLIGHT_LIMIT) = core::cmp::min(TX_BUF_COUNT, tx_qsz as usize);
+        *(&raw mut TX_LAST_USED_IDX) = 0;
+        *(&raw mut USE_FLEX_LAYOUT) = flex_layout;
+        *(&raw mut TX_INFLIGHT_LIMIT) = if flex_layout {
+            core::cmp::min(TX_BUF_COUNT, tx_qsz as usize)
+        } else {
+            core::cmp::min(TX_BUF_COUNT, (tx_qsz as usize) / 2)
+        };
+    }
+
+    if flex_layout {
+        puts(b"[netdrv] RX/TX using combined buffer layout\n");
+    } else {
+        puts(b"[netdrv] RX/TX using strict header+payload chain layout\n");
     }
 
     // Allocate DMA buffer pools
@@ -505,7 +540,7 @@ fn virtio_negotiate() -> bool {
 }
 
 /// Allocate DMA buffer memory for RX and TX pools.
-fn alloc_dma_buffers() -> bool {
+pub(crate) fn alloc_dma_buffers() -> bool {
     let rx_total_bytes = (RX_BUF_COUNT * BUF_SIZE) as u64;
     let rx_pages = (rx_total_bytes + 4095) / 4096;
     let tx_total_bytes = (TX_BUF_COUNT * BUF_SIZE) as u64;
@@ -563,8 +598,13 @@ fn alloc_dma_buffers() -> bool {
     true
 }
 
+fn use_flex_layout() -> bool {
+    // SAFETY: Written during transport init before runtime packet I/O starts.
+    unsafe { *(&raw const USE_FLEX_LAYOUT) }
+}
+
 /// Pre-fill the RX ring with receive buffers.
-fn prefill_rx_ring() {
+pub(crate) fn prefill_rx_ring() {
     // SAFETY: Single-threaded init; queue state set up above.
     unsafe {
         let qsz = *(&raw const RX_QUEUE_SIZE) as usize;
@@ -572,20 +612,41 @@ fn prefill_rx_ring() {
         let avail_off = *(&raw const RX_AVAIL_OFF);
         let rx_phys = &*(&raw const RX_BUF_PHYS);
 
-        // Only fill up to min(RX_BUF_COUNT, queue_size)
-        let fill_count = core::cmp::min(RX_BUF_COUNT, qsz);
+        let flex_layout = use_flex_layout();
+        let fill_count = if flex_layout {
+            core::cmp::min(RX_BUF_COUNT, qsz)
+        } else {
+            core::cmp::min(RX_BUF_COUNT, qsz / 2)
+        };
 
         for i in 0..fill_count {
-            // Write descriptor: addr, len, flags=WRITE (device writes to it), next=0
-            let desc_ptr = (base + (i * 16) as u64) as *mut VirtqDesc;
-            (*desc_ptr).addr = rx_phys[i];
-            (*desc_ptr).len = BUF_SIZE as u32;
-            (*desc_ptr).flags = VRING_DESC_F_WRITE;
-            (*desc_ptr).next = 0;
+            let desc_head = if flex_layout { i } else { i * 2 };
+            let desc_hdr_ptr = (base + (desc_head * 16) as u64) as *mut VirtqDesc;
+            if flex_layout {
+                (*desc_hdr_ptr).addr = rx_phys[i];
+                (*desc_hdr_ptr).len = BUF_SIZE as u32;
+                (*desc_hdr_ptr).flags = VRING_DESC_F_WRITE;
+                (*desc_hdr_ptr).next = 0;
+            } else {
+                let desc_data = desc_head + 1;
+
+                // Header descriptor (device-writable)
+                (*desc_hdr_ptr).addr = rx_phys[i];
+                (*desc_hdr_ptr).len = VIRTIO_NET_HDR_SIZE_LEGACY as u32;
+                (*desc_hdr_ptr).flags = VRING_DESC_F_WRITE | VRING_DESC_F_NEXT;
+                (*desc_hdr_ptr).next = desc_data as u16;
+
+                // Payload descriptor (device-writable)
+                let desc_data_ptr = (base + (desc_data * 16) as u64) as *mut VirtqDesc;
+                (*desc_data_ptr).addr = rx_phys[i] + VIRTIO_NET_HDR_SIZE_LEGACY as u64;
+                (*desc_data_ptr).len = (BUF_SIZE - VIRTIO_NET_HDR_SIZE_LEGACY) as u32;
+                (*desc_data_ptr).flags = VRING_DESC_F_WRITE;
+                (*desc_data_ptr).next = 0;
+            }
 
             // Write available ring entry
             let avail_ring = (base + avail_off + 4 + (i * 2) as u64) as *mut u16;
-            *avail_ring = i as u16;
+            *avail_ring = desc_head as u16;
         }
 
         // Ensure descriptor writes are visible before updating avail index
@@ -600,15 +661,37 @@ fn prefill_rx_ring() {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
         // Notify device about RX queue (queue 0)
-        bar_write16(VIRTIO_QUEUE_NOTIFY, 0);
+        transport_notify_rx();
     }
 }
 
 // --- Runtime operations ---
 
-/// Read the ISR status register (clears on read).
+/// Read the ISR status register (transport-aware).
 pub(crate) fn read_isr() -> u8 {
-    bar_read8(VIRTIO_ISR_STATUS)
+    if unsafe { *(&raw const crate::USING_MODERN_TRANSPORT) } {
+        crate::virtio_modern::modern_isr_read()
+    } else {
+        bar_read8(VIRTIO_ISR_STATUS)
+    }
+}
+
+/// Notify RX queue (transport-aware).
+pub(crate) fn transport_notify_rx() {
+    if unsafe { *(&raw const crate::USING_MODERN_TRANSPORT) } {
+        crate::virtio_modern::modern_notify_rx();
+    } else {
+        bar_write16(VIRTIO_QUEUE_NOTIFY, 0);
+    }
+}
+
+/// Notify TX queue (transport-aware).
+pub(crate) fn transport_notify_tx() {
+    if unsafe { *(&raw const crate::USING_MODERN_TRANSPORT) } {
+        crate::virtio_modern::modern_notify_tx();
+    } else {
+        bar_write16(VIRTIO_QUEUE_NOTIFY, 1);
+    }
 }
 
 /// Reclaim completed TX buffers by updating our local used index.
@@ -627,7 +710,8 @@ fn tx_reclaim() {
 /// Prepends a zeroed VirtioNetHdr and submits the buffer to the TX ring.
 /// Returns false if the packet is too large or all TX buffers are in-flight.
 pub(crate) fn tx_packet(data: &[u8]) -> bool {
-    let total_len = VIRTIO_NET_HDR_SIZE + data.len();
+    let hdr_sz = net_hdr_size();
+    let total_len = hdr_sz + data.len();
     if total_len > BUF_SIZE {
         return false;
     }
@@ -661,25 +745,46 @@ pub(crate) fn tx_packet(data: &[u8]) -> bool {
         let buf_ptr = buf_vaddr as *mut u8;
 
         // Zero the VirtioNetHdr
-        core::ptr::write_bytes(buf_ptr, 0, VIRTIO_NET_HDR_SIZE);
+        core::ptr::write_bytes(buf_ptr, 0, hdr_sz);
         // Copy packet data
         for i in 0..data.len() {
-            *buf_ptr.add(VIRTIO_NET_HDR_SIZE + i) = data[i];
+            *buf_ptr.add(hdr_sz + i) = data[i];
         }
 
-        // Write descriptor
+        let flex_layout = use_flex_layout();
+        let desc_head = if flex_layout {
+            (avail_idx as usize) % qsz
+        } else {
+            ((avail_idx as usize) * 2) % qsz
+        };
+
+        // Write descriptor chain
         let base = *(&raw const TX_QUEUE_BASE);
-        let desc_idx = (avail_idx as usize) % qsz;
-        let desc_ptr = (base + (desc_idx * 16) as u64) as *mut VirtqDesc;
-        (*desc_ptr).addr = tx_phys[buf_idx];
-        (*desc_ptr).len = total_len as u32;
-        (*desc_ptr).flags = 0; // Device reads from this buffer
-        (*desc_ptr).next = 0;
+        let desc_hdr_ptr = (base + (desc_head * 16) as u64) as *mut VirtqDesc;
+        if flex_layout {
+            (*desc_hdr_ptr).addr = tx_phys[buf_idx];
+            (*desc_hdr_ptr).len = total_len as u32;
+            (*desc_hdr_ptr).flags = 0;
+            (*desc_hdr_ptr).next = 0;
+        } else {
+            let desc_data = (desc_head + 1) % qsz;
+            (*desc_hdr_ptr).addr = tx_phys[buf_idx];
+            (*desc_hdr_ptr).len = VIRTIO_NET_HDR_SIZE_LEGACY as u32;
+            (*desc_hdr_ptr).flags = VRING_DESC_F_NEXT;
+            (*desc_hdr_ptr).next = desc_data as u16;
+
+            let desc_data_ptr = (base + (desc_data * 16) as u64) as *mut VirtqDesc;
+            (*desc_data_ptr).addr = tx_phys[buf_idx] + VIRTIO_NET_HDR_SIZE_LEGACY as u64;
+            (*desc_data_ptr).len = data.len() as u32;
+            (*desc_data_ptr).flags = 0;
+            (*desc_data_ptr).next = 0;
+        }
 
         // Add to available ring
         let avail_off = *(&raw const TX_AVAIL_OFF);
-        let ring_entry = (base + avail_off + 4 + (desc_idx * 2) as u64) as *mut u16;
-        *ring_entry = desc_idx as u16;
+        let ring_entry =
+            (base + avail_off + 4 + (((avail_idx as usize) % qsz) * 2) as u64) as *mut u16;
+        *ring_entry = desc_head as u16;
 
         // Memory barrier (compiler fence)
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -690,8 +795,13 @@ pub(crate) fn tx_packet(data: &[u8]) -> bool {
         *avail_idx_ptr = new_avail;
         *(&raw mut TX_AVAIL_IDX) = new_avail;
 
+        // Publish the new avail index before ringing the device doorbell.
+        // Without this barrier the device can observe the notify before the
+        // updated ring state, dropping the transmit on both x86_64 and aarch64.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
         // Notify device (TX queue = queue 1)
-        bar_write16(VIRTIO_QUEUE_NOTIFY, 1);
+        transport_notify_tx();
     }
 
     true
@@ -721,21 +831,33 @@ pub(crate) fn rx_poll() -> Option<(usize, usize)> {
         let desc_id = used_entry.read_volatile() as usize;
         let byte_len = used_entry.add(1).read_volatile() as usize;
 
-        // Validate descriptor index from device
+        let flex_layout = use_flex_layout();
         if desc_id >= qsz {
+            return None;
+        }
+
+        let buf_idx = if flex_layout {
+            desc_id
+        } else {
+            if (desc_id & 1) != 0 {
+                return None;
+            }
+            desc_id / 2
+        };
+        if buf_idx >= RX_BUF_COUNT {
             return None;
         }
 
         *(&raw mut RX_LAST_USED_IDX) = last_used.wrapping_add(1);
 
-        Some((desc_id, byte_len))
+        Some((buf_idx, byte_len))
     }
 }
 
 /// Get a slice to the received packet data for the given buffer index.
 ///
 /// The returned slice includes the VirtioNetHdr prefix. Callers should skip
-/// the first `VIRTIO_NET_HDR_SIZE` bytes for the actual Ethernet frame.
+/// the first `VIRTIO_NET_HDR_SIZE_LEGACY` bytes for the actual Ethernet frame.
 ///
 /// Callers must process the returned data before calling `rx_repost()` for
 /// the same `buf_idx`, as reposting makes the buffer writable by the device.
@@ -767,16 +889,33 @@ pub(crate) fn rx_repost(buf_idx: usize) {
         let rx_phys = &*(&raw const RX_BUF_PHYS);
         let avail_idx = *(&raw const RX_AVAIL_IDX);
 
-        // Re-initialize the descriptor
-        let desc_ptr = (base + (buf_idx * 16) as u64) as *mut VirtqDesc;
-        (*desc_ptr).addr = rx_phys[buf_idx];
-        (*desc_ptr).len = BUF_SIZE as u32;
-        (*desc_ptr).flags = VRING_DESC_F_WRITE;
-        (*desc_ptr).next = 0;
+        let flex_layout = use_flex_layout();
+        let desc_head = if flex_layout { buf_idx } else { buf_idx * 2 };
+
+        // Re-initialize the descriptor chain
+        let desc_hdr_ptr = (base + (desc_head * 16) as u64) as *mut VirtqDesc;
+        if flex_layout {
+            (*desc_hdr_ptr).addr = rx_phys[buf_idx];
+            (*desc_hdr_ptr).len = BUF_SIZE as u32;
+            (*desc_hdr_ptr).flags = VRING_DESC_F_WRITE;
+            (*desc_hdr_ptr).next = 0;
+        } else {
+            let desc_data = desc_head + 1;
+            (*desc_hdr_ptr).addr = rx_phys[buf_idx];
+            (*desc_hdr_ptr).len = VIRTIO_NET_HDR_SIZE_LEGACY as u32;
+            (*desc_hdr_ptr).flags = VRING_DESC_F_WRITE | VRING_DESC_F_NEXT;
+            (*desc_hdr_ptr).next = desc_data as u16;
+
+            let desc_data_ptr = (base + (desc_data * 16) as u64) as *mut VirtqDesc;
+            (*desc_data_ptr).addr = rx_phys[buf_idx] + VIRTIO_NET_HDR_SIZE_LEGACY as u64;
+            (*desc_data_ptr).len = (BUF_SIZE - VIRTIO_NET_HDR_SIZE_LEGACY) as u32;
+            (*desc_data_ptr).flags = VRING_DESC_F_WRITE;
+            (*desc_data_ptr).next = 0;
+        }
 
         // Add to available ring
         let ring_entry = (base + avail_off + 4 + ((avail_idx as usize % qsz) * 2) as u64) as *mut u16;
-        *ring_entry = buf_idx as u16;
+        *ring_entry = desc_head as u16;
 
         // Memory barrier
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -787,7 +926,11 @@ pub(crate) fn rx_repost(buf_idx: usize) {
         *avail_idx_ptr = new_avail;
         *(&raw mut RX_AVAIL_IDX) = new_avail;
 
+        // Ensure the reposted descriptor and avail index are visible before
+        // notifying the device that more RX buffers are available.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
         // Notify device (RX queue = queue 0)
-        bar_write16(VIRTIO_QUEUE_NOTIFY, 0);
+        transport_notify_rx();
     }
 }

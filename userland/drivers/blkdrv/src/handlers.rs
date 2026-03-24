@@ -6,9 +6,33 @@ use besalt::serial::LineBuf;
 use besalt::types::*;
 
 use crate::virtio::*;
-use crate::{puts, CAPACITY_SECTORS, VIRTIO_INITIALIZED, VQUEUE_BASE};
+use crate::{puts, CAPACITY_SECTORS, VIRTIO_INITIALIZED, USING_MODERN_TRANSPORT, VQUEUE_BASE};
 use crate::{QUEUE_SIZE, AVAIL_IDX, LAST_USED_IDX, QUEUE_AVAIL_OFF, QUEUE_USED_OFF};
 use crate::{SHM_VADDR, SHM_SIZE, SECTOR_SIZE, BLK_SHM_ID};
+
+/// Read ISR status (transport-aware).
+fn read_isr() -> u8 {
+    if unsafe { *(&raw const USING_MODERN_TRANSPORT) } {
+        crate::virtio_modern::modern_isr_read()
+    } else {
+        bar_read8(VIRTIO_ISR_STATUS)
+    }
+}
+
+pub(crate) fn clear_pending_irq() {
+    if unsafe { *(&raw const VIRTIO_INITIALIZED) } {
+        let _ = read_isr();
+    }
+}
+
+/// Notify queue 0 (transport-aware).
+fn transport_notify_queue() {
+    if unsafe { *(&raw const USING_MODERN_TRANSPORT) } {
+        crate::virtio_modern::modern_notify_queue();
+    } else {
+        bar_write16(VIRTIO_QUEUE_NOTIFY, 0);
+    }
+}
 
 pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
     let mut reply = BesaltMsg::zeroed();
@@ -25,6 +49,11 @@ pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
     // Limit to 8 sectors (4KB) per request
     let actual_count = if count > 8 { 8 } else { count };
     let byte_count = actual_count * 512;
+
+    if actual_count == 0 {
+        reply.label = BESALT_INVALID_ARGUMENT;
+        return reply;
+    }
 
     if shm_offset + byte_count > SHM_SIZE {
         reply.label = BESALT_OUT_OF_RANGE;
@@ -44,7 +73,7 @@ pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
         let cur_used = core::ptr::read_volatile(used_base.add(1));
         if cur_used != *(&raw const LAST_USED_IDX) {
             *(&raw mut LAST_USED_IDX) = cur_used;
-            let _ = bar_read8(VIRTIO_ISR_STATUS);
+            let _ = read_isr();
         }
 
         // Get physical addresses for DMA
@@ -109,7 +138,7 @@ pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
         *(&raw mut AVAIL_IDX) = avail_idx.wrapping_add(1);
 
         // Kick the device
-        bar_write16(VIRTIO_QUEUE_NOTIFY, 0);
+        transport_notify_queue();
 
         // Poll for completion
         let used_base = (vq_base + used_off) as *const u16;
@@ -126,16 +155,19 @@ pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
             spin_count += 1;
             if spin_count > 100_000_000 {
                 puts(b"[blkdrv] virtio read timeout\n");
-                let _ = bar_read8(VIRTIO_ISR_STATUS);
+                let _ = read_isr();
                 reply.label = BESALT_BUSY;
                 return reply;
             }
         }
 
+        // Ensure DMA-written data is visible before reading status/data.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+
         // Clear device ISR to deassert the shared IRQ line.
         // Without this, the virtio-blk device keeps IRQ 11 asserted,
         // interfering with other devices sharing the same IRQ (e.g. virtio-net).
-        let _ = bar_read8(VIRTIO_ISR_STATUS);
+        let _ = read_isr();
 
         // Check status
         let status = *(&raw const REQ_STATUS);
@@ -172,6 +204,11 @@ pub(crate) fn handle_write(msg: &BesaltMsg) -> BesaltMsg {
     let actual_count = if count > 8 { 8 } else { count };
     let byte_count = actual_count * 512;
 
+    if actual_count == 0 {
+        reply.label = BESALT_INVALID_ARGUMENT;
+        return reply;
+    }
+
     if shm_offset + byte_count > SHM_SIZE {
         reply.label = BESALT_OUT_OF_RANGE;
         return reply;
@@ -188,7 +225,7 @@ pub(crate) fn handle_write(msg: &BesaltMsg) -> BesaltMsg {
         let cur_used = core::ptr::read_volatile(used_base.add(1));
         if cur_used != *(&raw const LAST_USED_IDX) {
             *(&raw mut LAST_USED_IDX) = cur_used;
-            let _ = bar_read8(VIRTIO_ISR_STATUS);
+            let _ = read_isr();
         }
 
         // Get physical addresses for DMA
@@ -249,7 +286,7 @@ pub(crate) fn handle_write(msg: &BesaltMsg) -> BesaltMsg {
         *(&raw mut AVAIL_IDX) = avail_idx.wrapping_add(1);
 
         // Kick the device
-        bar_write16(VIRTIO_QUEUE_NOTIFY, 0);
+        transport_notify_queue();
 
         // Poll for completion
         let used_base = (vq_base + used_off) as *const u16;
@@ -264,14 +301,17 @@ pub(crate) fn handle_write(msg: &BesaltMsg) -> BesaltMsg {
             spin_count += 1;
             if spin_count > 100_000_000 {
                 puts(b"[blkdrv] virtio write timeout\n");
-                let _ = bar_read8(VIRTIO_ISR_STATUS);
+                let _ = read_isr();
                 reply.label = BESALT_BUSY;
                 return reply;
             }
         }
 
+        // Ensure DMA-written data is visible before reading status/data.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+
         // Clear device ISR to deassert the shared IRQ line.
-        let _ = bar_read8(VIRTIO_ISR_STATUS);
+        let _ = read_isr();
 
         // Check status
         let status = *(&raw const REQ_STATUS);

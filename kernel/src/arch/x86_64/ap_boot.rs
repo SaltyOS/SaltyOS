@@ -120,7 +120,7 @@ fn init_ap_syscalls(cpu_id: usize) {
         const STACK_PAGES: usize = 4;
         const STACK_SIZE: u64 = STACK_PAGES as u64 * 4096;
 
-        let stack_phys = crate::mm::alloc_contiguous_frames(STACK_PAGES)
+        let stack_phys = crate::mm::pmm_alloc_contiguous(STACK_PAGES)
             .expect("[AP] Failed to allocate syscall kernel stack");
         let stack_top = crate::mm::phys_to_virt(stack_phys) + STACK_SIZE;
 
@@ -193,7 +193,9 @@ fn init_ap_syscalls(cpu_id: usize) {
 
 /// Allocate IST stacks for critical exceptions on this AP
 fn init_ap_exception_stacks(cpu_id: usize) {
-    let stack_phys = crate::mm::alloc_frame().expect("[AP] IST stack allocation failed");
+    let stack_phys = crate::mm::pmm_alloc(&crate::mm::frame::FrameOwner::KernelPrivate {
+        subkind: crate::mm::frame::KernelMetaKind::KernelStack,
+    }).expect("[AP] IST stack allocation failed");
     let stack_virt = crate::mm::phys_to_virt(stack_phys);
     let stack_top = stack_virt + 4096;
 

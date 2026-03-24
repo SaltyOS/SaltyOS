@@ -1,6 +1,5 @@
 use crate::types::*;
 use besalt::consts::*;
-use besalt::invoke;
 use besalt::serial::LineBuf;
 use besalt::types::*;
 
@@ -110,152 +109,6 @@ pub(crate) unsafe fn find_region_by_addr(client: *mut MmClient, addr: u64) -> *m
     }
 }
 
-/// Check whether a specific page in a region is COW-inherited.
-pub(crate) fn is_cow_page(region: *const MmRegion, page_idx: usize) -> bool {
-    // SAFETY: region is a valid pointer from the client's region array.
-    unsafe {
-        let r = &*region;
-        if r.cow_bitmap.is_null() {
-            return false;
-        }
-        let word_idx = page_idx / 64;
-        let bit_idx = page_idx % 64;
-        if word_idx >= r.cow_bitmap_words as usize {
-            return false;
-        }
-        // SAFETY: word_idx is bounds-checked above.
-        (*r.cow_bitmap.add(word_idx) >> bit_idx) & 1 != 0
-    }
-}
-
-/// Mark a page as COW-inherited in the region's bitmap.
-pub(crate) fn set_cow_bit(region: *mut MmRegion, page_idx: usize) {
-    // SAFETY: region is a valid mutable pointer from the client's region array.
-    unsafe {
-        let r = &mut *region;
-        if r.cow_bitmap.is_null() {
-            return;
-        }
-        let word_idx = page_idx / 64;
-        let bit_idx = page_idx % 64;
-        if word_idx >= r.cow_bitmap_words as usize {
-            return;
-        }
-        // SAFETY: word_idx is bounds-checked above.
-        *r.cow_bitmap.add(word_idx) |= 1u64 << bit_idx;
-    }
-}
-
-/// Clear the COW bit for a page (after COW resolution or unmap).
-pub(crate) fn clear_cow_bit(region: *mut MmRegion, page_idx: usize) {
-    // SAFETY: region is a valid mutable pointer from the client's region array.
-    unsafe {
-        let r = &mut *region;
-        if r.cow_bitmap.is_null() {
-            return;
-        }
-        let word_idx = page_idx / 64;
-        let bit_idx = page_idx % 64;
-        if word_idx >= r.cow_bitmap_words as usize {
-            return;
-        }
-        // SAFETY: word_idx is bounds-checked above.
-        *r.cow_bitmap.add(word_idx) &= !(1u64 << bit_idx);
-    }
-}
-
-// -- Bitmap free-list pool --
-// Reuses freed bitmap pages instead of leaking them via self_mmap.
-// mmsrv is single-threaded so no synchronization is needed.
-
-#[derive(Clone, Copy)]
-struct BitmapFreeEntry {
-    ptr: *mut u64,
-    alloc_pages: u32,
-}
-
-const BITMAP_POOL_MAX: usize = 32;
-
-static mut BITMAP_POOL: [BitmapFreeEntry; BITMAP_POOL_MAX] = [BitmapFreeEntry {
-    ptr: core::ptr::null_mut(),
-    alloc_pages: 0,
-}; BITMAP_POOL_MAX];
-
-static mut BITMAP_POOL_COUNT: usize = 0;
-
-/// Allocate a COW bitmap for `page_count` pages.
-/// Returns (pointer, word_count) or (null, 0) on failure.
-///
-/// Checks the free-list pool first for a suitably-sized entry;
-/// falls through to self_mmap if none available.
-pub(crate) fn alloc_cow_bitmap(page_count: usize) -> (*mut u64, u32) {
-    let word_count = (page_count + 63) / 64;
-    let byte_count = word_count * 8;
-    let alloc_pages = (byte_count + 4095) / 4096;
-    let alloc_pages = if alloc_pages == 0 { 1 } else { alloc_pages };
-
-    // SAFETY: mmsrv is single-threaded; no concurrent access to BITMAP_POOL.
-    unsafe {
-        let count = *(&raw const BITMAP_POOL_COUNT);
-        let pool = &raw mut BITMAP_POOL;
-        for i in 0..count {
-            if (*pool)[i].alloc_pages >= alloc_pages as u32 {
-                let entry = (*pool)[i];
-                // Swap-remove: move last entry into this slot
-                let last = count - 1;
-                if i != last {
-                    (*pool)[i] = (*pool)[last];
-                }
-                *(&raw mut BITMAP_POOL_COUNT) = last;
-                // Zero the reused memory
-                // SAFETY: entry.ptr is a valid allocation of entry.alloc_pages pages.
-                core::ptr::write_bytes(entry.ptr as *mut u8, 0, (entry.alloc_pages as usize) * 4096);
-                return (entry.ptr, word_count as u32);
-            }
-        }
-    }
-
-    // No suitable entry in pool — allocate fresh via self_mmap
-    // SAFETY: self_mmap returns zero-initialized memory.
-    let ptr = unsafe { super::self_mmap(alloc_pages) };
-    if ptr.is_null() {
-        return (core::ptr::null_mut(), 0);
-    }
-    (ptr as *mut u64, word_count as u32)
-}
-
-/// Free a COW bitmap from a region, returning the pages to the free-list pool.
-pub(crate) fn free_cow_bitmap(region: *mut MmRegion) {
-    // SAFETY: region is a valid mutable pointer.
-    unsafe {
-        let r = &mut *region;
-        if r.cow_bitmap.is_null() {
-            return;
-        }
-
-        let ptr = r.cow_bitmap;
-        let words = r.cow_bitmap_words as usize;
-        r.cow_bitmap = core::ptr::null_mut();
-        r.cow_bitmap_words = 0;
-
-        // Compute alloc_pages to match what alloc_cow_bitmap would have used
-        let byte_count = words * 8;
-        let alloc_pages = (byte_count + 4095) / 4096;
-        let alloc_pages = if alloc_pages == 0 { 1 } else { alloc_pages };
-
-        // Return to pool if space available; otherwise leak (bounded by BITMAP_POOL_MAX)
-        // SAFETY: mmsrv is single-threaded; no concurrent access to BITMAP_POOL.
-        let count = *(&raw const BITMAP_POOL_COUNT);
-        if count < BITMAP_POOL_MAX {
-            (*(&raw mut BITMAP_POOL))[count] = BitmapFreeEntry {
-                ptr,
-                alloc_pages: alloc_pages as u32,
-            };
-            *(&raw mut BITMAP_POOL_COUNT) = count + 1;
-        }
-    }
-}
-
 /// MM_REGISTER: init/procmgr registers a new client.
 ///   MR0 = client badge
 ///   MR1 = heap_base
@@ -345,32 +198,19 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: 
         let pid = (*client).pid;
         let vspace_cap = (*client).vspace_cap;
 
-        // Clean up all frame caps tracked in client regions — recycle into
-        // the frame pool for reuse instead of deleting (avoids untyped exhaustion).
+        // Clean up MO caps in client regions
         let region_count = (*client).region_count;
         let regions = (*client).regions;
         if !regions.is_null() {
             for ri in 0..region_count {
                 let r = regions.add(ri);
                 if (*r).active {
-                    let fcaps = (*r).frame_caps;
-                    if !fcaps.is_null() && (*r).frame_count > 0 {
-                        super::frame_pool_push_batch(
-                            fcaps as *const Cap,
-                            (*r).frame_count as usize,
-                        );
+                    if (*r).mo_cap != 0 {
+                        super::recycled_cnode_delete((*r).mo_cap);
                     }
                     (*r).active = false;
                 }
-                // Free bitmap for ALL regions (active or inactive).
-                // Inactive regions from munmap may still have bitmaps.
-                free_cow_bitmap(r);
             }
-        }
-
-        // Tear down COW pool before deleting the VSpace cap
-        if vspace_cap != 0 {
-            crate::pool::teardown_pool(vspace_cap);
         }
 
         // Clean up the VSpace cap we hold
@@ -388,15 +228,6 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: 
             lb.hex(client_badge);
             lb.str(b" pid=");
             lb.hex(pid as u64);
-            let pool_count = *(&raw const super::FRAME_POOL_COUNT);
-            let recycled = *(&raw const super::FRAME_POOL_TOTAL_RECYCLED);
-            let reused = *(&raw const super::FRAME_POOL_TOTAL_REUSED);
-            lb.str(b" fpool=");
-            lb.hex(pool_count as u64);
-            lb.str(b"/");
-            lb.hex(recycled);
-            lb.str(b"/");
-            lb.hex(reused);
             lb.str(b"\n");
             lb.flush();
         }
@@ -424,7 +255,7 @@ pub(crate) unsafe fn handle_mm_get_client_stats(msg: *const BesaltMsg, _badge: u
                 for r in 0..(*c).region_count {
                     let region = (*c).regions.add(r);
                     if (*region).active {
-                        total_pages += (*region).frame_count as u64;
+                        total_pages += ((*region).length + 4095) / 4096;
                     }
                 }
                 (*reply).regs[3] = total_pages;

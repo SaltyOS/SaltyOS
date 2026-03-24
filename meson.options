@@ -4,7 +4,7 @@
 # Target architecture
 option('arch',
   type: 'combo',
-  choices: ['x86_64'],
+  choices: ['x86_64', 'aarch64'],
   value: 'x86_64',
   description: 'Target CPU architecture')
 

@@ -155,7 +155,7 @@ fn futex_wait(addr: u64, expected: u32) -> SyscallResult {
         // so we can read the user address directly while in kernel mode.
         // SMAP: temporarily allow user memory access for the futex word read.
         let user_word = {
-            let _guard = crate::arch::smap::UserAccessGuard::new();
+            let _guard = crate::arch::uaccess::UserAccessGuard::new();
             core::ptr::read_volatile(addr as *const u32)
         };
         if user_word != expected {
@@ -212,7 +212,7 @@ fn futex_wait_timeout(addr: u64, expected: u32, timeout_ns: u64) -> SyscallResul
         // Read the user futex word
         // SMAP: temporarily allow user memory access for the futex word read.
         let user_word = {
-            let _guard = crate::arch::smap::UserAccessGuard::new();
+            let _guard = crate::arch::uaccess::UserAccessGuard::new();
             core::ptr::read_volatile(addr as *const u32)
         };
         if user_word != expected {
