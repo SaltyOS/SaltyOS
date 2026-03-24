@@ -309,6 +309,9 @@ fn shm_tx_consume() {
         if slot_count == 0 {
             return;
         }
+        // Release: frame consumption must complete before the tail update
+        // that publishes free space to the producer (ARM weak ordering).
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         core::ptr::write_volatile(hdr.add(3), (tx_tail + 1) % slot_count);
     }
 }

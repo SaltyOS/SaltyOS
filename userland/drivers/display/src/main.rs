@@ -1303,6 +1303,9 @@ fn drain_terminal_ring(state: &mut DisplayState) {
         let mut buf = [0u8; 256];
         loop {
             let head = core::ptr::read_volatile(base as *const u32) as usize;
+            // Acquire: observe producer's data writes before reading ring contents.
+            // Required on ARM (weak ordering); x86 TSO provides this implicitly.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
             let tail = core::ptr::read_volatile(base.add(4) as *const u32) as usize;
             let available = (head + ring_size - tail) % ring_size;
             if available == 0 { break; }
@@ -1313,7 +1316,9 @@ fn drain_terminal_ring(state: &mut DisplayState) {
                 buf[i] = core::ptr::read_volatile(dp.add((tail + i) % ring_size));
                 i += 1;
             }
-            // SAFETY: tail update is visible after data reads (x86 TSO).
+            // Release: all data reads above complete before the tail update
+            // that publishes free space to the producer.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
             core::ptr::write_volatile(
                 base.add(4) as *mut u32,
                 ((tail + count) % ring_size) as u32,

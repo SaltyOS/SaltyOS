@@ -171,6 +171,9 @@ fn shm_rx_dequeue(buf: &mut [u8; 2048]) -> Option<usize> {
         if slot_count == 0 {
             return None;
         }
+        // Release: data reads above must complete before the tail update
+        // that publishes free space to the producer (ARM weak ordering).
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         core::ptr::write_volatile(hdr.add(1), (rx_tail + 1) % slot_count);
         Some(len)
     }

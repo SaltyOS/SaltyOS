@@ -90,6 +90,8 @@ unsafe fn term_ring_push(base: *mut u8, ring_size: usize, data: &[u8]) -> usize 
     unsafe {
         let head = core::ptr::read_volatile(base as *const u32) as usize;
         let tail = core::ptr::read_volatile(base.add(4) as *const u32) as usize;
+        // Acquire: observe consumer's tail update before computing free space.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let used = (head + ring_size - tail) % ring_size;
         let free = ring_size - 1 - used;
         let count = core::cmp::min(free, data.len());
@@ -101,7 +103,10 @@ unsafe fn term_ring_push(base: *mut u8, ring_size: usize, data: &[u8]) -> usize 
             core::ptr::write_volatile(dp.add((head + i) % ring_size), data[i]);
             i += 1;
         }
-        // SAFETY: head update is visible after data writes (x86 TSO).
+        // Release: all data writes above are visible before the head update
+        // that publishes them to the consumer. Required on ARM (weak ordering);
+        // x86 TSO provides this implicitly.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         core::ptr::write_volatile(base as *mut u32, ((head + count) % ring_size) as u32);
         count
     }
