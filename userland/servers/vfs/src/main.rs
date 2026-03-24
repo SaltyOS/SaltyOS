@@ -526,7 +526,7 @@ pub(crate) unsafe fn urandom_init() {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            core::arch::asm!("mrs {}, CNTPCT_EL0", out(reg) tsc);
+            core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) tsc);
         }
         URANDOM_S0 = ts.tv_nsec ^ tsc;
         URANDOM_S1 = ts

@@ -97,6 +97,17 @@ pub fn start() {
         return;
     }
 
+    // Per-CPU: allow EL0 to read CNTVCT_EL0 (virtual counter).
+    // CNTKCTL_EL1 is banked per CPU, so this must run on each core.
+    // SAFETY: Writing CNTKCTL_EL1 is safe from EL1.
+    unsafe {
+        let mut cntkctl: u64;
+        core::arch::asm!("mrs {}, CNTKCTL_EL1", out(reg) cntkctl, options(nomem, nostack));
+        cntkctl |= 1 << 1; // EL0VCTEN
+        cntkctl &= !(1 << 0); // clear EL0PCTEN
+        core::arch::asm!("msr CNTKCTL_EL1, {}", in(reg) cntkctl, options(nomem, nostack));
+    }
+
     let tval = freq / TICK_HZ;
 
     // Set the countdown value.
