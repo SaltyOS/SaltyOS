@@ -343,9 +343,13 @@ extern "C" fn el1_irq_handler(_frame: *const ExceptionFrame) {
             // Spurious interrupt — no EOI needed.
         }
         _ => {
-            // SPI or other peripheral interrupt
-            crate::ipc::irq::dispatch_irq(intid as usize);
+            // SPI or other peripheral interrupt.
+            // EOI before dispatch — consistent with timer (line 332) and SGI
+            // (line 339). For level-triggered SPIs the line stays asserted
+            // after EOI, but dispatch_irq runs with IRQs disabled so the
+            // re-trigger is deferred until after the handler completes.
             super::gic::eoi(intid);
+            crate::ipc::irq::dispatch_irq(intid as usize);
         }
     }
 }

@@ -448,9 +448,12 @@ pub fn enable_irq(intid: u32) {
     } else {
         // SPI — use the distributor.
         let gicd = gicd_base();
-        // SAFETY: GICD MMIO is mapped.
+        // SAFETY: GICD MMIO is mapped. ISB ensures the ISENABLER write
+        // is observable before any subsequent instruction that might
+        // depend on the interrupt being enabled.
         unsafe {
             mmio_write32(gicd + GICD_ISENABLER + reg_index * 4, bit);
+            core::arch::asm!("isb", options(nomem, nostack));
         }
     }
 }
@@ -459,6 +462,11 @@ pub fn enable_irq(intid: u32) {
 ///
 /// For SGIs/PPIs (0-31), writes to the redistributor ICENABLER0.
 /// For SPIs (32-1019), writes to the distributor ICENABLER.
+///
+/// For SPIs, polls GICD_CTLR.RWP after the ICENABLER write to guarantee
+/// the disable has propagated through the GIC before returning. Without
+/// this, a subsequent ISENABLER write on another CPU can race with the
+/// pending disable, leaving the interrupt permanently masked (IHI 0069).
 pub fn disable_irq(intid: u32) {
     let reg_index = (intid / 32) as u64;
     let bit = 1u32 << (intid % 32);
@@ -474,9 +482,14 @@ pub fn disable_irq(intid: u32) {
     } else {
         // SPI — use the distributor.
         let gicd = gicd_base();
-        // SAFETY: GICD MMIO is mapped.
+        // SAFETY: GICD MMIO is mapped. RWP poll ensures the disable
+        // completes before returning, preventing a cross-CPU race where
+        // a concurrent enable_irq on another CPU is swallowed.
         unsafe {
             mmio_write32(gicd + GICD_ICENABLER + reg_index * 4, bit);
+            while mmio_read32(gicd + GICD_CTLR) & (1 << 31) != 0 {
+                core::hint::spin_loop();
+            }
         }
     }
 }
