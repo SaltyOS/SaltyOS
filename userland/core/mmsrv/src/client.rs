@@ -198,13 +198,49 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: 
         let pid = (*client).pid;
         let vspace_cap = (*client).vspace_cap;
 
-        // Clean up MO caps in client regions
+        // Tear down tracked mappings before releasing MO/VSpace caps.
+        // Exec reuses the same VSpace object, so dropping only the metadata
+        // leaves stale VmArea state behind in the kernel and can misattribute
+        // later COW faults to the wrong backing MO.
         let region_count = (*client).region_count;
         let regions = (*client).regions;
         if !regions.is_null() {
             for ri in 0..region_count {
                 let r = regions.add(ri);
                 if (*r).active {
+                    if vspace_cap != 0 && (*r).length != 0 {
+                        if (*r).mo_cap != 0 {
+                            let page_count = (*r).length / 4096;
+                            if page_count != 0 {
+                                let err = besalt::invoke::vspace_unmap_mo(
+                                    vspace_cap,
+                                    (*r).base,
+                                    page_count,
+                                );
+                                if err != 0 {
+                                    let mut lb = LineBuf::new();
+                                    lb.str(b"[MMSRV] DEREGISTER: unmap_mo failed badge=");
+                                    lb.hex(client_badge);
+                                    lb.str(b" base=");
+                                    lb.hex((*r).base);
+                                    lb.str(b" pages=");
+                                    lb.hex(page_count);
+                                    lb.str(b" err=");
+                                    lb.hex(err as u64);
+                                    lb.str(b"\n");
+                                    lb.flush();
+                                }
+                            }
+                        } else {
+                            let page_count = (*r).length / 4096;
+                            for page in 0..page_count {
+                                let _ = besalt::invoke::vspace_unmap(
+                                    vspace_cap,
+                                    (*r).base + page * 4096,
+                                );
+                            }
+                        }
+                    }
                     if (*r).mo_cap != 0 {
                         super::recycled_cnode_delete((*r).mo_cap);
                     }
