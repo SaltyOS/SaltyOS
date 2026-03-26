@@ -1,0 +1,12 @@
+--- a/ncurses/tinfo/MKfallback.sh
++++ b/ncurses/tinfo/MKfallback.sh
+@@ -69,7 +69,8 @@
+ 	TERMINFO_DIRS=$TERMINFO:$terminfo_dir
+ 	export TERMINFO_DIRS
+
+-	"$tic_path" -x "$terminfo_src" >&2
++	# tic may fail on entries unsupported by the host version; ignore errors
++	"$tic_path" -x "$terminfo_src" >&2 || true
+ else
+ 	tmp_info=
+ fi
