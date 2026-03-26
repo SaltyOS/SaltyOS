@@ -302,7 +302,9 @@ fn forward_to_ttyd(raw: &[u8], raw_len: usize) {
                 err = ipc::send_ctx(ipc_ctx(), CAP_TTYD_EP, &raw const fwd);
             }
             if err != 0 {
-                serial::serial_puts(b"[CONSOLE] FAIL: ttyd input send failed\n");
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[CONSOLE] FAIL: ttyd input send failed\n");
+                });
                 return;
             }
         }
@@ -375,7 +377,9 @@ unsafe fn handle_tcsetattr(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     arch::serial_init();
-    serial::serial_puts(b"[CONSOLE] SaltyOS console server ready\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[CONSOLE] SaltyOS console server ready\n");
+    });
 
     unsafe {
         init_console_termios();
@@ -389,7 +393,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     // Initial recv
     let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
     if err != 0 {
-        serial::serial_puts(b"[CONSOLE] initial recv failed\n");
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[CONSOLE] initial recv failed\n");
+        });
         idle();
     }
 
@@ -413,7 +419,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
             };
             if err != 0 {
-                serial::serial_puts(b"[CONSOLE] recv failed after IRQ\n");
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[CONSOLE] recv failed after IRQ\n");
+                });
                 break;
             }
             continue;
@@ -448,7 +456,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             )
         };
         if err != 0 {
-            serial::serial_puts(b"[CONSOLE] reply_recv failed\n");
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[CONSOLE] reply_recv failed\n");
+            });
             break;
         }
     }

@@ -26,8 +26,6 @@ use besalt::consts::*;
 use besalt::cpio;
 use besalt::invoke;
 use besalt::ipc;
-use besalt::serial;
-use besalt::serial::LineBuf;
 use besalt::syscall::syscall;
 use besalt::types::*;
 
@@ -114,10 +112,6 @@ static mut INITRD_SIZE: usize = 0;
 // Helpers
 // ======================================================================
 
-fn puts(s: &[u8]) {
-    serial::serial_puts(s);
-}
-
 pub fn ipc_ctx() -> *mut IpcContext {
     &raw mut besalt::__besalt_ipc_ctx
 }
@@ -169,37 +163,37 @@ fn validate_service_caps(mgr: &svc_mgr::ServiceManager) -> u32 {
         let name = def.name_bytes();
         for c in 0..def.cap_count as usize {
             if def.caps[c].dst_slot < MIN_SVC_SLOT {
-                let mut lb = LineBuf::new();
-                lb.str(b"[INIT] ERROR: ");
-                lb.bytes(name);
-                lb.str(b" CopyCap dst=");
-                lb.hex(def.caps[c].dst_slot);
-                lb.str(b" < 64 (reserved)\n");
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[INIT] ERROR: ");
+                    _lb.bytes(name);
+                    _lb.str(b" CopyCap dst=");
+                    _lb.hex(def.caps[c].dst_slot);
+                    _lb.str(b" < 64 (reserved)\n");
+                });
                 errors += 1;
             }
         }
         for c in 0..def.ep_need_count as usize {
             if def.ep_needs[c].dst_slot < MIN_SVC_SLOT {
-                let mut lb = LineBuf::new();
-                lb.str(b"[INIT] ERROR: ");
-                lb.bytes(name);
-                lb.str(b" NeedEP dst=");
-                lb.hex(def.ep_needs[c].dst_slot);
-                lb.str(b" < 64 (reserved)\n");
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[INIT] ERROR: ");
+                    _lb.bytes(name);
+                    _lb.str(b" NeedEP dst=");
+                    _lb.hex(def.ep_needs[c].dst_slot);
+                    _lb.str(b" < 64 (reserved)\n");
+                });
                 errors += 1;
             }
         }
         for c in 0..def.ep_inject_count as usize {
             if def.ep_injects[c].target_slot < MIN_SVC_SLOT {
-                let mut lb = LineBuf::new();
-                lb.str(b"[INIT] ERROR: ");
-                lb.bytes(name);
-                lb.str(b" InjectEP target=");
-                lb.hex(def.ep_injects[c].target_slot);
-                lb.str(b" < 64 (reserved)\n");
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[INIT] ERROR: ");
+                    _lb.bytes(name);
+                    _lb.str(b" InjectEP target=");
+                    _lb.hex(def.ep_injects[c].target_slot);
+                    _lb.str(b" < 64 (reserved)\n");
+                });
                 errors += 1;
             }
         }
@@ -214,7 +208,7 @@ unsafe fn read_boot_info() -> (u64, usize) {
         let page = BOOTINFO_VADDR as *const u64;
         let magic = core::ptr::read_volatile(page);
         if magic != BOOTINFO_MAGIC {
-            puts(b"[INIT] WARN: boot info magic mismatch\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[INIT] WARN: boot info magic mismatch\n"); });
             return (INITRD_VADDR, 0);
         }
         let vaddr = core::ptr::read_volatile(page.add(1));
@@ -244,7 +238,7 @@ unsafe fn init_bootinfo_snapshot_frame(ut: Cap) -> bool {
     unsafe {
         let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, CAP_BOOTINFO_SNAPSHOT_FRAME);
         if err != 0 {
-            puts(b"[INIT] FAIL: bootinfo snapshot frame retype\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[INIT] FAIL: bootinfo snapshot frame retype\n"); });
             return false;
         }
 
@@ -255,7 +249,7 @@ unsafe fn init_bootinfo_snapshot_frame(ut: Cap) -> bool {
             VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
         );
         if err != 0 {
-            puts(b"[INIT] FAIL: bootinfo snapshot scratch map\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[INIT] FAIL: bootinfo snapshot scratch map\n"); });
             return false;
         }
 
@@ -346,13 +340,13 @@ unsafe fn inject_caps_and_resume(
                         ep_needs[i].dst_slot, provider_ep,
                     );
                     if r != 0 {
-                        let mut lb = LineBuf::new();
-                        lb.str(b"[INIT] WARN: inject NeedEP ");
-                        lb.bytes(svc_name);
-                        lb.str(b" slot=");
-                        lb.hex(ep_needs[i].dst_slot);
-                        lb.str(b" failed\n");
-                        lb.flush();
+                        besalt::uerror!(|_lb| {
+                            _lb.str(b"[INIT] WARN: inject NeedEP ");
+                            _lb.bytes(svc_name);
+                            _lb.str(b" slot=");
+                            _lb.hex(ep_needs[i].dst_slot);
+                            _lb.str(b" failed\n");
+                        });
                     }
                 }
             }
@@ -368,23 +362,23 @@ unsafe fn inject_caps_and_resume(
                 caps[i].dst_slot, caps[i].src_slot,
             );
             if r != 0 {
-                let mut lb = LineBuf::new();
-                lb.str(b"[INIT] WARN: inject CopyCap src=");
-                lb.hex(caps[i].src_slot);
-                lb.str(b" dst=");
-                lb.hex(caps[i].dst_slot);
-                lb.str(b" failed\n");
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[INIT] WARN: inject CopyCap src=");
+                    _lb.hex(caps[i].src_slot);
+                    _lb.str(b" dst=");
+                    _lb.hex(caps[i].dst_slot);
+                    _lb.str(b" failed\n");
+                });
             }
         }
 
         // Child was spawned suspended; resume only after all cap injections.
         if spawn::pm_resume_child(procmgr_ep, pid) != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[INIT] Failed to resume ");
-            lb.bytes(name);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[INIT] Failed to resume ");
+                _lb.bytes(name);
+                _lb.str(b"\n");
+            });
             return false;
         }
         true
@@ -396,7 +390,7 @@ unsafe fn inject_caps_and_resume(
 // ======================================================================
 
 unsafe fn load_service_defs(mgr: &mut svc_mgr::ServiceManager) {
-    puts(b"[INIT] Loading service definitions...\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[INIT] Loading service definitions...\n"); });
 
     unsafe {
         let initrd = INITRD_VADDR as *const u8;
@@ -413,19 +407,19 @@ unsafe fn load_service_defs(mgr: &mut svc_mgr::ServiceManager) {
                 continue;
             }
 
-            { let mut lb = LineBuf::new(); lb.str(b"[INIT] Found service file: "); lb.bytes(name); lb.str(b"\n"); lb.flush(); }
+            besalt::udebug!(|_lb| { _lb.str(b"[INIT] Found service file: "); _lb.bytes(name); _lb.str(b"\n"); });
 
             let data = core::slice::from_raw_parts(entry.data, entry.data_len);
             let mut def = ini::ServiceDef::zeroed();
             if ini::parse_service(data, &mut def) {
-                { let mut lb = LineBuf::new(); lb.str(b"[INIT] Parsed service: "); lb.bytes(def.name_bytes()); lb.str(b" binary="); lb.bytes(def.binary_bytes()); lb.str(b"\n"); lb.flush(); }
+                besalt::udebug!(|_lb| { _lb.str(b"[INIT] Parsed service: "); _lb.bytes(def.name_bytes()); _lb.str(b" binary="); _lb.bytes(def.binary_bytes()); _lb.str(b"\n"); });
                 mgr.add_service(&def);
             } else {
-                puts(b"[INIT] WARN: failed to parse service file\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[INIT] WARN: failed to parse service file\n"); });
             }
         }
 
-        { let mut lb = LineBuf::new(); lb.str(b"[INIT] Found "); lb.hex(mgr.count as u64); lb.str(b" services\n"); lb.flush(); }
+        besalt::uinfo!(|_lb| { _lb.str(b"[INIT] Found "); _lb.hex(mgr.count as u64); _lb.str(b" services\n"); });
     }
 }
 
@@ -459,22 +453,22 @@ fn ends_with(haystack: &[u8], suffix: &[u8]) -> bool {
 // ======================================================================
 
 unsafe fn pre_create_endpoints(mgr: &mut svc_mgr::ServiceManager, ut: Cap) {
-    puts(b"[INIT] Pre-creating service endpoints...\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[INIT] Pre-creating service endpoints...\n"); });
     for i in 0..mgr.count {
         let ep_slot = EP_POOL_BASE + i as u64;
         let err = invoke::untyped_retype(ut, besalt::OBJ_ENDPOINT, 0, ep_slot);
         if err == 0 {
             mgr.services[i].pre_ep = ep_slot;
         } else {
-            let mut lb = LineBuf::new();
-            lb.str(b"[INIT] WARN: pre-create EP for ");
-            lb.bytes(mgr.services[i].def.name_bytes());
-            lb.str(b" slot=");
-            lb.hex(ep_slot);
-            lb.str(b" err=");
-            lb.hex(err as u64);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[INIT] WARN: pre-create EP for ");
+                _lb.bytes(mgr.services[i].def.name_bytes());
+                _lb.str(b" slot=");
+                _lb.hex(ep_slot);
+                _lb.str(b" err=");
+                _lb.hex(err as u64);
+                _lb.str(b"\n");
+            });
         }
     }
 }
@@ -498,12 +492,12 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
         let svc_idx = mgr.boot_order[order_idx] as usize;
 
         if mgr.services[svc_idx].state == svc_mgr::ServiceState::Failed {
-            { let mut lb = LineBuf::new(); lb.str(b"[INIT] Skipping failed service: "); lb.bytes(mgr.services[svc_idx].def.name_bytes()); lb.str(b"\n"); lb.flush(); }
+            besalt::udebug!(|_lb| { _lb.str(b"[INIT] Skipping failed service: "); _lb.bytes(mgr.services[svc_idx].def.name_bytes()); _lb.str(b"\n"); });
             continue;
         }
 
         if !mgr.deps_satisfied(svc_idx) {
-            { let mut lb = LineBuf::new(); lb.str(b"[INIT] Dependencies not met for "); lb.bytes(mgr.services[svc_idx].def.name_bytes()); lb.str(b", marking Failed\n"); lb.flush(); }
+            besalt::uerror!(|_lb| { _lb.str(b"[INIT] Dependencies not met for "); _lb.bytes(mgr.services[svc_idx].def.name_bytes()); _lb.str(b", marking Failed\n"); });
             mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
             continue;
         }
@@ -640,23 +634,23 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                         CAP_RIGHTS_ALL,
                     );
                     if err == 0 {
-                        let mut lb = LineBuf::new();
-                        lb.str(b"[INIT] Injected EP into ");
-                        lb.bytes(tgt_name);
-                        lb.str(b" slot ");
-                        lb.hex(ep_injects[i].target_slot);
-                        lb.str(b"\n");
-                        lb.flush();
+                        besalt::udebug!(|_lb| {
+                            _lb.str(b"[INIT] Injected EP into ");
+                            _lb.bytes(tgt_name);
+                            _lb.str(b" slot ");
+                            _lb.hex(ep_injects[i].target_slot);
+                            _lb.str(b"\n");
+                        });
                     } else {
-                        let mut lb = LineBuf::new();
-                        lb.str(b"[INIT] ERROR: InjectEP into ");
-                        lb.bytes(tgt_name);
-                        lb.str(b" slot ");
-                        lb.hex(ep_injects[i].target_slot);
-                        lb.str(b" failed err=");
-                        lb.hex(err as u64);
-                        lb.str(b"\n");
-                        lb.flush();
+                        besalt::uerror!(|_lb| {
+                            _lb.str(b"[INIT] ERROR: InjectEP into ");
+                            _lb.bytes(tgt_name);
+                            _lb.str(b" slot ");
+                            _lb.hex(ep_injects[i].target_slot);
+                            _lb.str(b" failed err=");
+                            _lb.hex(err as u64);
+                            _lb.str(b"\n");
+                        });
                     }
                 }
             }
@@ -671,10 +665,10 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                     let merr = invoke::cnode_mint(CAP_SELF_CSPACE, ep, CAP_SELF_CSPACE, pm_badged_slot, 1);
                     if merr == 0 {
                         procmgr_ep = pm_badged_slot;
-                        puts(b"[INIT] Minted badged PM EP (badge=1)\n");
+                        besalt::udebug!(|_lb| { _lb.str(b"[INIT] Minted badged PM EP (badge=1)\n"); });
                     } else {
                         procmgr_ep = ep;
-                        puts(b"[INIT] WARN: mint badged PM EP failed\n");
+                        besalt::uerror!(|_lb| { _lb.str(b"[INIT] WARN: mint badged PM EP failed\n"); });
                     }
                 }
             }
@@ -686,7 +680,7 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
         } else {
             // Post-procmgr: spawn via procmgr IPC
             if procmgr_ep == 0 {
-                { let mut lb = LineBuf::new(); lb.str(b"[INIT] Cannot spawn "); lb.bytes(name); lb.str(b" - procmgr not available\n"); lb.flush(); }
+                besalt::uerror!(|_lb| { _lb.str(b"[INIT] Cannot spawn "); _lb.bytes(name); _lb.str(b" - procmgr not available\n"); });
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
                 continue;
             }
@@ -708,7 +702,7 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                 )
             };
             if pid < 0 {
-                { let mut lb = LineBuf::new(); lb.str(b"[INIT] Failed to spawn "); lb.bytes(name); lb.str(b" via procmgr\n"); lb.flush(); }
+                besalt::uerror!(|_lb| { _lb.str(b"[INIT] Failed to spawn "); _lb.bytes(name); _lb.str(b" via procmgr\n"); });
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
                 continue;
             }
@@ -772,11 +766,11 @@ unsafe fn handle_child_exit(
     child_pid: u32,
     exit_status: i32,
 ) {
-    { let mut lb = LineBuf::new(); lb.str(b"[INIT] Child exited: pid="); lb.hex(child_pid as u64); lb.str(b" status="); lb.hex(exit_status as u64); lb.str(b"\n"); lb.flush(); }
+    besalt::uinfo!(|_lb| { _lb.str(b"[INIT] Child exited: pid="); _lb.hex(child_pid as u64); _lb.str(b" status="); _lb.hex(exit_status as u64); _lb.str(b"\n"); });
 
     let idx = find_service_by_pid(mgr, child_pid);
     if idx < 0 {
-        puts(b"[INIT] Unknown child pid, ignoring\n");
+        besalt::udebug!(|_lb| { _lb.str(b"[INIT] Unknown child pid, ignoring\n"); });
         return;
     }
 
@@ -802,7 +796,7 @@ unsafe fn handle_child_exit(
             let pre_ep = mgr.services[svc_idx].pre_ep;
             let new_pid = spawn::pm_spawn(pm_ep, spawn_name, &mgr.services[svc_idx].def, pre_ep, true);
             if new_pid < 0 {
-                puts(b"[INIT] Failed to restart service\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[INIT] Failed to restart service\n"); });
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
             } else if !inject_caps_and_resume(mgr, svc_idx, pm_ep, new_pid as u32) {
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
@@ -871,15 +865,15 @@ unsafe fn service_monitor(mgr: &mut svc_mgr::ServiceManager, pm_ep: Cap) -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    puts(b"[INIT] SaltyOS init process starting\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[INIT] SaltyOS init process starting\n"); });
 
     let ut: Cap = select_init_work_untyped();
-    { let mut lb = LineBuf::new(); lb.str(b"[INIT] Bootstrap untyped slot="); lb.hex(ut); lb.str(b"\n"); lb.flush(); }
+    besalt::udebug!(|_lb| { _lb.str(b"[INIT] Bootstrap untyped slot="); _lb.hex(ut); _lb.str(b"\n"); });
 
     // Set up IPC buffer for init
     let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, CAP_IPC_BUF_FRAME);
     if err != 0 {
-        puts(b"[INIT] FAIL: IPC buf frame retype\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[INIT] FAIL: IPC buf frame retype\n"); });
         idle();
     }
     let err = invoke::vspace_map(
@@ -889,26 +883,26 @@ pub extern "C" fn _start() -> ! {
         VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
     );
     if err != 0 {
-        let mut lb = LineBuf::new();
-        lb.str(b"[INIT] FAIL: IPC buf map err=");
-        lb.hex(err as u64);
-        lb.str(b"\n");
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[INIT] FAIL: IPC buf map err=");
+            _lb.hex(err as u64);
+            _lb.str(b"\n");
+        });
         idle();
     }
     invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
     unsafe {
         ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
     }
-    { let mut lb = LineBuf::new(); lb.str(b"[INIT] IPC buffer mapped at "); lb.hex(IPC_BUF_VADDR); lb.str(b"\n"); lb.flush(); }
+    besalt::udebug!(|_lb| { _lb.str(b"[INIT] IPC buffer mapped at "); _lb.hex(IPC_BUF_VADDR); _lb.str(b"\n"); });
 
     // Read initrd size from kernel boot info page (once, at startup)
     let (_, initrd_size) = unsafe { read_boot_info() };
     unsafe { INITRD_SIZE = initrd_size; }
-    { let mut lb = LineBuf::new(); lb.str(b"[INIT] Initrd size from boot info: "); lb.hex(initrd_size as u64); lb.str(b" bytes\n"); lb.flush(); }
+    besalt::udebug!(|_lb| { _lb.str(b"[INIT] Initrd size from boot info: "); _lb.hex(initrd_size as u64); _lb.str(b" bytes\n"); });
 
     let total_usable = unsafe { read_total_usable_bytes() };
-    { let mut lb = LineBuf::new(); lb.str(b"[INIT] Total usable RAM: "); lb.hex(total_usable); lb.str(b" bytes\n"); lb.flush(); }
+    besalt::uinfo!(|_lb| { _lb.str(b"[INIT] Total usable RAM: "); _lb.hex(total_usable); _lb.str(b" bytes\n"); });
 
     if unsafe { !init_bootinfo_snapshot_frame(ut) } {
         idle();
@@ -924,7 +918,7 @@ pub extern "C" fn _start() -> ! {
     };
 
     if run_selftest {
-        puts(b"[INIT] Self-test mode enabled\n");
+        besalt::uinfo!(|_lb| { _lb.str(b"[INIT] Self-test mode enabled\n"); });
 
         if unsafe { selftest::phase1_ipc_test(ut) } != 0 {
             idle();
@@ -943,7 +937,7 @@ pub extern "C" fn _start() -> ! {
     unsafe { load_service_defs(mgr) };
 
     if mgr.count == 0 {
-        puts(b"[INIT] No service definitions found in initrd\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[INIT] No service definitions found in initrd\n"); });
         idle();
     }
 
@@ -955,18 +949,18 @@ pub extern "C" fn _start() -> ! {
     mgr.build_deps();
     let sort_ok = mgr.topological_sort();
     if !sort_ok {
-        puts(b"[INIT] WARNING: dependency cycle detected, some services may not start\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[INIT] WARNING: dependency cycle detected, some services may not start\n"); });
     }
     mgr.log_boot_order();
 
     // Validate service-declared cap slots are in the safe range (>= 64)
     let cap_errors = validate_service_caps(&mgr);
     if cap_errors > 0 {
-        let mut lb = LineBuf::new();
-        lb.str(b"[INIT] FATAL: ");
-        lb.hex(cap_errors as u64);
-        lb.str(b" service cap slot(s) in reserved range [0..63]\n");
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[INIT] FATAL: ");
+            _lb.hex(cap_errors as u64);
+            _lb.str(b" service cap slot(s) in reserved range [0..63]\n");
+        });
         idle();
     }
 
@@ -979,11 +973,11 @@ pub extern "C" fn _start() -> ! {
             }
         }
         if pager_count != 1 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[INIT] FATAL: exactly one service must declare Role=pager, found ");
-            lb.hex(pager_count as u64);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[INIT] FATAL: exactly one service must declare Role=pager, found ");
+                _lb.hex(pager_count as u64);
+                _lb.str(b"\n");
+            });
             idle();
         }
     }
@@ -992,13 +986,13 @@ pub extern "C" fn _start() -> ! {
     {
         let err = invoke::untyped_retype(ut, OBJ_NOTIFICATION, 0, CAP_PTY_NTFN);
         if err != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[INIT] WARN: PTY notification retype failed err=");
-            lb.hex(err as u64);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[INIT] WARN: PTY notification retype failed err=");
+                _lb.hex(err as u64);
+                _lb.str(b"\n");
+            });
         } else {
-            puts(b"[INIT] PTY notification created at slot 14\n");
+            besalt::udebug!(|_lb| { _lb.str(b"[INIT] PTY notification created at slot 14\n"); });
         }
     }
 
@@ -1009,6 +1003,6 @@ pub extern "C" fn _start() -> ! {
     let pm_ep = unsafe { boot_services(mgr, ut, total_usable) };
 
     // Service monitor loop
-    puts(b"[INIT] Entering service monitor loop\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[INIT] Entering service monitor loop\n"); });
     unsafe { service_monitor(mgr, pm_ep) };
 }

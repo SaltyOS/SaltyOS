@@ -7,8 +7,6 @@ use besalt::elf_dynamic;
 use besalt::elf_loader;
 use besalt::invoke;
 use besalt::ipc;
-use besalt::serial;
-use besalt::serial::LineBuf;
 use besalt::syscall;
 use besalt::types::*;
 
@@ -19,10 +17,6 @@ pub struct ExtraCapCopy {
     /// Optional badge to apply when copying endpoint capabilities.
     /// 0 means plain cnode_copy; non-zero uses cnode_mint.
     pub badge: u64,
-}
-
-fn puts(s: &[u8]) {
-    serial::serial_puts(s);
 }
 
 // Import from parent module
@@ -245,11 +239,11 @@ unsafe fn wait_for_child_ready(
                 return 0;
             }
         } else if poll.error != BESALT_WOULD_BLOCK {
-            let mut lb = LineBuf::new();
-            lb.str(b"[INIT] ready poll failed err=");
-            lb.hex(poll.error);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[INIT] ready poll failed err=");
+                _lb.hex(poll.error);
+                _lb.str(b"\n");
+            });
             let _ = invoke::tcb_suspend_retry(child_tcb, 4);
             return -1;
         }
@@ -272,11 +266,11 @@ unsafe fn wait_for_child_ready(
         yields += 1;
     }
 
-    let mut lb = LineBuf::new();
-    lb.str(b"[INIT] ");
-    lb.bytes(label);
-    lb.str(b" ready timeout\n");
-    lb.flush();
+    besalt::uerror!(|_lb| {
+        _lb.str(b"[INIT] ");
+        _lb.bytes(label);
+        _lb.str(b" ready timeout\n");
+    });
     let _ = invoke::tcb_suspend_retry(child_tcb, 4);
     -1
 }
@@ -487,11 +481,11 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
                 initrd, initrd_size, lib_name.as_ptr(), lib_name.len(), &raw mut entry,
             ) == 0
             {
-                let mut lb = LineBuf::new();
-                lb.str(b"[INIT] shared lib cache: ");
-                lb.bytes(lib_name);
-                lb.str(b" not found, skipping\n");
-                lb.flush();
+                besalt::udebug!(|_lb| {
+                    _lb.str(b"[INIT] shared lib cache: ");
+                    _lb.bytes(lib_name);
+                    _lb.str(b" not found, skipping\n");
+                });
                 continue;
             }
 
@@ -663,11 +657,11 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
 
         if cache.page_count > 0 {
             cache.initialized = true;
-            let mut lb = LineBuf::new();
-            lb.str(b"[INIT] shared lib cache: ");
-            lb.hex(cache.page_count as u64);
-            lb.str(b" RO pages cached\n");
-            lb.flush();
+            besalt::uinfo!(|_lb| {
+                _lb.str(b"[INIT] shared lib cache: ");
+                _lb.hex(cache.page_count as u64);
+                _lb.str(b" RO pages cached\n");
+            });
         }
     }
 }
@@ -726,13 +720,13 @@ unsafe fn map_shared_lib_to_child(
                     let vaddr = running_base + page.vaddr_offset;
                     let err = invoke::vspace_map(child_vs, page.frame_cap, vaddr, page.flags);
                     if err != 0 {
-                        let mut lb = LineBuf::new();
-                        lb.str(b"[INIT] shared lib map failed at ");
-                        lb.hex(vaddr);
-                        lb.str(b" err=");
-                        lb.hex(err as u64);
-                        lb.str(b"\n");
-                        lb.flush();
+                        besalt::uerror!(|_lb| {
+                            _lb.str(b"[INIT] shared lib map failed at ");
+                            _lb.hex(vaddr);
+                            _lb.str(b" err=");
+                            _lb.hex(err as u64);
+                            _lb.str(b"\n");
+                        });
                         return 0;
                     }
                     total_mapped += 1;
@@ -789,7 +783,7 @@ unsafe fn map_shared_lib_to_child(
                                         VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
                                     );
                                     if err != 0 {
-                                        puts(b"[INIT] RW overlap scratch map failed\n");
+                                        besalt::uerror!(|_lb| { _lb.str(b"[INIT] RW overlap scratch map failed\n"); });
                                         return 0;
                                     }
 
@@ -838,11 +832,11 @@ unsafe fn map_shared_lib_to_child(
                                 err = retype_from_any_untyped(OBJ_FRAME, 0, frame_slot);
                             }
                             if err != 0 {
-                                let mut lb = LineBuf::new();
-                                lb.str(b"[INIT] RW frame retype failed err=");
-                                lb.hex(err as u64);
-                                lb.str(b"\n");
-                                lb.flush();
+                                besalt::uerror!(|_lb| {
+                                    _lb.str(b"[INIT] RW frame retype failed err=");
+                                    _lb.hex(err as u64);
+                                    _lb.str(b"\n");
+                                });
                                 return 0;
                             }
 
@@ -851,7 +845,7 @@ unsafe fn map_shared_lib_to_child(
                                 VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
                             );
                             if err != 0 {
-                                puts(b"[INIT] RW scratch map failed\n");
+                                besalt::uerror!(|_lb| { _lb.str(b"[INIT] RW scratch map failed\n"); });
                                 return 0;
                             }
 
@@ -904,13 +898,13 @@ unsafe fn map_shared_lib_to_child(
                                 child_vs, frame_slot, page, rw.flags,
                             );
                             if err != 0 {
-                                let mut lb = LineBuf::new();
-                                lb.str(b"[INIT] RW child map failed at ");
-                                lb.hex(page);
-                                lb.str(b" err=");
-                                lb.hex(err as u64);
-                                lb.str(b"\n");
-                                lb.flush();
+                                besalt::uerror!(|_lb| {
+                                    _lb.str(b"[INIT] RW child map failed at ");
+                                    _lb.hex(page);
+                                    _lb.str(b" err=");
+                                    _lb.hex(err as u64);
+                                    _lb.str(b"\n");
+                                });
                                 return 0;
                             }
 
@@ -934,11 +928,11 @@ unsafe fn map_shared_lib_to_child(
 
             if !found {
                 // Library not in cache — RTLD will load it from initrd
-                let mut lb = LineBuf::new();
-                lb.str(b"[INIT] shared lib cache miss: ");
-                lb.bytes(name);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::udebug!(|_lb| {
+                    _lb.str(b"[INIT] shared lib cache miss: ");
+                    _lb.bytes(name);
+                    _lb.str(b"\n");
+                });
             }
         }
 
@@ -1024,7 +1018,7 @@ pub unsafe fn spawn_server(
     mirror_untypeds: bool,
     pager_child_slot: u64,
 ) -> i32 {
-    { let mut lb = LineBuf::new(); lb.str(b"[INIT] Spawning "); lb.bytes(label); lb.str(b" ("); lb.bytes(elf_name); lb.str(b")\n"); lb.flush(); }
+    besalt::uinfo!(|_lb| { _lb.str(b"[INIT] Spawning "); _lb.bytes(label); _lb.str(b" ("); _lb.bytes(elf_name); _lb.str(b")\n"); });
 
     unsafe {
         let initrd = super::INITRD_VADDR as *const u8;
@@ -1052,7 +1046,7 @@ pub unsafe fn spawn_server(
             ) != 0;
         }
         if !found {
-            { let mut lb = LineBuf::new(); lb.str(b"[INIT] "); lb.bytes(elf_name); lb.str(b" not found in initrd\n"); lb.flush(); }
+            besalt::uerror!(|_lb| { _lb.str(b"[INIT] "); _lb.bytes(elf_name); _lb.str(b" not found in initrd\n"); });
             return -1;
         }
 
@@ -1064,7 +1058,7 @@ pub unsafe fn spawn_server(
         let rtld_span = if is_dynamic {
             let rtld_name = b"ld-besalt.so";
             if cpio::cpio_find_file(initrd, initrd_size, rtld_name.as_ptr(), rtld_name.len(), &raw mut rtld_entry) == 0 {
-                puts(b"[INIT] rtld not found in initrd\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[INIT] rtld not found in initrd\n"); });
                 return -1;
             }
             elf_loader::elf_compute_load_span(rtld_entry.data, rtld_entry.data_len)
@@ -1089,7 +1083,7 @@ pub unsafe fn spawn_server(
             || besalt::syscall::sys_getrandom(),
         );
         if layout.stack_top == 0 {
-            puts(b"[INIT] ELF too large for VA layout\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[INIT] ELF too large for VA layout\n"); });
             return -1;
         }
 
@@ -1127,11 +1121,11 @@ pub unsafe fn spawn_server(
                 err = invoke::untyped_retype(loader_ut, OBJ_CNODE, cnode_size_bits, child_cn);
             }
             if err != 0 {
-                let mut lb = LineBuf::new();
-                lb.str(b"[INIT] retype CNode (large) failed err=");
-                lb.hex(err as u64);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[INIT] retype CNode (large) failed err=");
+                    _lb.hex(err as u64);
+                    _lb.str(b"\n");
+                });
                 return -1;
             }
         }
@@ -1143,13 +1137,13 @@ pub unsafe fn spawn_server(
                     err = retype_from_any_untyped($obj, 0, $slot);
                 }
                 if err != 0 {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[INIT] retype ");
-                    lb.bytes($name);
-                    lb.str(b" failed err=");
-                    lb.hex(err as u64);
-                    lb.str(b"\n");
-                    lb.flush();
+                    besalt::uerror!(|_lb| {
+                        _lb.str(b"[INIT] retype ");
+                        _lb.bytes($name);
+                        _lb.str(b" failed err=");
+                        _lb.hex(err as u64);
+                        _lb.str(b"\n");
+                    });
                     return -1;
                 }
             };
@@ -1170,7 +1164,7 @@ pub unsafe fn spawn_server(
                 CAP_RIGHTS_ALL,
             );
             if err != 0 {
-                puts(b"[INIT] copy pre-EP failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[INIT] copy pre-EP failed\n"); });
                 return -1;
             }
         } else {
@@ -1186,20 +1180,20 @@ pub unsafe fn spawn_server(
         ) {
             Ok(bits) => bits,
             Err(err) => {
-                let mut lb = LineBuf::new();
-                lb.str(b"[INIT] sub-untyped retype failed err=");
-                lb.hex(err as u64);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[INIT] sub-untyped retype failed err=");
+                    _lb.hex(err as u64);
+                    _lb.str(b"\n");
+                });
                 return -1;
             }
         };
         if granted_bits != budget.boot_load_bits {
-            let mut lb = LineBuf::new();
-            lb.str(b"[INIT] sub-untyped downshifted to 2^");
-            lb.hex(granted_bits as u64);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::udebug!(|_lb| {
+                _lb.str(b"[INIT] sub-untyped downshifted to 2^");
+                _lb.hex(granted_bits as u64);
+                _lb.str(b"\n");
+            });
         }
 
         let mut loader_ctx = ElfLoaderCtx {
@@ -1223,7 +1217,7 @@ pub unsafe fn spawn_server(
             &raw mut elf_result,
         );
         if err != 0 {
-            { let mut lb = LineBuf::new(); lb.str(b"[INIT] ELF load failed err="); lb.hex(err as u64); lb.str(b"\n"); lb.flush(); }
+            besalt::uerror!(|_lb| { _lb.str(b"[INIT] ELF load failed err="); _lb.hex(err as u64); _lb.str(b"\n"); });
             return -1;
         }
 
@@ -1239,7 +1233,7 @@ pub unsafe fn spawn_server(
                 &raw mut rtld_result,
             );
             if err != 0 {
-                puts(b"[INIT] rtld ELF load failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[INIT] rtld ELF load failed\n"); });
                 return -1;
             }
 
@@ -1260,7 +1254,7 @@ pub unsafe fn spawn_server(
                     err = retype_from_any_untyped(OBJ_FRAME, 0, frame_slot);
                 }
                 if err != 0 {
-                    puts(b"[INIT] stack frame retype failed\n");
+                    besalt::uerror!(|_lb| { _lb.str(b"[INIT] stack frame retype failed\n"); });
                     return -1;
                 }
             }
@@ -1272,7 +1266,7 @@ pub unsafe fn spawn_server(
                 VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
             );
             if err != 0 {
-                puts(b"[INIT] stack map failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[INIT] stack map failed\n"); });
                 return -1;
             }
         }
@@ -1285,7 +1279,7 @@ pub unsafe fn spawn_server(
             VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
         );
         if err != 0 {
-            puts(b"[INIT] IPC buf map failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[INIT] IPC buf map failed\n"); });
             return -1;
         }
 
@@ -1303,13 +1297,13 @@ pub unsafe fn spawn_server(
                     VSPACE_FLAG_USER,
                 );
                 if err != 0 {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[INIT] initrd device map failed pg=");
-                    lb.hex(pg as u64);
-                    lb.str(b" err=");
-                    lb.hex(err as u64);
-                    lb.str(b"\n");
-                    lb.flush();
+                    besalt::udebug!(|_lb| {
+                        _lb.str(b"[INIT] initrd device map failed pg=");
+                        _lb.hex(pg as u64);
+                        _lb.str(b" err=");
+                        _lb.hex(err as u64);
+                        _lb.str(b"\n");
+                    });
                     for mapped_pg in 0..pg {
                         invoke::vspace_unmap(
                             child_vs,
@@ -1322,13 +1316,13 @@ pub unsafe fn spawn_server(
             }
 
             if mapped_with_device {
-                let mut lb = LineBuf::new();
-                lb.str(b"[INIT] initrd device-mapped: ");
-                lb.dec(initrd_pages as u64);
-                lb.str(b" pages at ");
-                lb.hex(layout.initrd.base);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::udebug!(|_lb| {
+                    _lb.str(b"[INIT] initrd device-mapped: ");
+                    _lb.dec(initrd_pages as u64);
+                    _lb.str(b" pages at ");
+                    _lb.hex(layout.initrd.base);
+                    _lb.str(b"\n");
+                });
             }
 
             if !mapped_with_device {
@@ -1339,7 +1333,7 @@ pub unsafe fn spawn_server(
                         err = retype_from_any_untyped(OBJ_FRAME, 0, fr_slot);
                     }
                     if err != 0 {
-                        puts(b"[INIT] initrd frame retype failed\n");
+                        besalt::uerror!(|_lb| { _lb.str(b"[INIT] initrd frame retype failed\n"); });
                         return -1;
                     }
 
@@ -1350,7 +1344,7 @@ pub unsafe fn spawn_server(
                         VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
                     );
                     if err != 0 {
-                        puts(b"[INIT] initrd scratch map failed\n");
+                        besalt::uerror!(|_lb| { _lb.str(b"[INIT] initrd scratch map failed\n"); });
                         return -1;
                     }
 
@@ -1376,17 +1370,17 @@ pub unsafe fn spawn_server(
                         VSPACE_FLAG_USER,
                     );
                     if err != 0 {
-                        puts(b"[INIT] initrd child map failed\n");
+                        besalt::uerror!(|_lb| { _lb.str(b"[INIT] initrd child map failed\n"); });
                         return -1;
                     }
                 }
-                let mut lb = LineBuf::new();
-                lb.str(b"[INIT] initrd copy-mapped: ");
-                lb.dec(initrd_pages as u64);
-                lb.str(b" pages at ");
-                lb.hex(layout.initrd.base);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::udebug!(|_lb| {
+                    _lb.str(b"[INIT] initrd copy-mapped: ");
+                    _lb.dec(initrd_pages as u64);
+                    _lb.str(b" pages at ");
+                    _lb.hex(layout.initrd.base);
+                    _lb.str(b"\n");
+                });
             }
             // Map init's persistent bootinfo snapshot page into child.
             let err = invoke::vspace_map(
@@ -1396,7 +1390,7 @@ pub unsafe fn spawn_server(
                 VSPACE_FLAG_USER,
             );
             if err != 0 {
-                puts(b"[INIT] bootinfo child map failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[INIT] bootinfo child map failed\n"); });
                 return -1;
             }
         }
@@ -1408,12 +1402,12 @@ pub unsafe fn spawn_server(
             };
         }
 
-        if copy_cap!(child_tcb, 0) != 0 { puts(b"[INIT] copy TCB failed\n"); return -1; }
-        if copy_cap!(child_vs, 1) != 0 { puts(b"[INIT] copy VSpace failed\n"); return -1; }
-        if copy_cap!(child_cn, 2) != 0 { puts(b"[INIT] copy CNode failed\n"); return -1; }
-        if copy_cap!(child_ep, 3) != 0 { puts(b"[INIT] copy EP failed\n"); return -1; }
+        if copy_cap!(child_tcb, 0) != 0 { besalt::uerror!(|_lb| { _lb.str(b"[INIT] copy TCB failed\n"); }); return -1; }
+        if copy_cap!(child_vs, 1) != 0 { besalt::uerror!(|_lb| { _lb.str(b"[INIT] copy VSpace failed\n"); }); return -1; }
+        if copy_cap!(child_cn, 2) != 0 { besalt::uerror!(|_lb| { _lb.str(b"[INIT] copy CNode failed\n"); }); return -1; }
+        if copy_cap!(child_ep, 3) != 0 { besalt::uerror!(|_lb| { _lb.str(b"[INIT] copy EP failed\n"); }); return -1; }
         if copy_cap!(child_ready_ntfn, CAP_READINESS_NTFN) != 0 {
-            puts(b"[INIT] copy ready ntfn failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[INIT] copy ready ntfn failed\n"); });
             return -1;
         }
         if is_dynamic {
@@ -1425,13 +1419,13 @@ pub unsafe fn spawn_server(
                 INITRD_COPY_RIGHTS,
             );
             if derr != 0 {
-                puts(b"[INIT] WARN: copy initrd untyped failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[INIT] WARN: copy initrd untyped failed\n"); });
             }
         }
 
         let err = copy_cap!(sub_ut_slot, 7);
         if err != 0 {
-            puts(b"[INIT] copy child Untyped failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[INIT] copy child Untyped failed\n"); });
             return -1;
         }
 
@@ -1462,13 +1456,13 @@ pub unsafe fn spawn_server(
                 }
             }
             if mirrored == 0 {
-                puts(b"[INIT] WARN: no untyped mirrors copied for rtld fallback\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[INIT] WARN: no untyped mirrors copied for rtld fallback\n"); });
             } else if mirrored < mirror_slots {
-                let mut lb = LineBuf::new();
-                lb.str(b"[INIT] rtld untyped mirrors copied=");
-                lb.hex(mirrored);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::udebug!(|_lb| {
+                    _lb.str(b"[INIT] rtld untyped mirrors copied=");
+                    _lb.hex(mirrored);
+                    _lb.str(b"\n");
+                });
             }
         }
 
@@ -1491,15 +1485,15 @@ pub unsafe fn spawn_server(
                 copy_cap!(extra.src, extra.dst)
             };
             if err != 0 {
-                let mut lb = LineBuf::new();
-                lb.str(b"[INIT] ERROR: cap copy failed src=");
-                lb.hex(extra.src);
-                lb.str(b" dst=");
-                lb.hex(extra.dst);
-                lb.str(b" err=");
-                lb.hex(err as u64);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[INIT] ERROR: cap copy failed src=");
+                    _lb.hex(extra.src);
+                    _lb.str(b" dst=");
+                    _lb.hex(extra.dst);
+                    _lb.str(b" err=");
+                    _lb.hex(err as u64);
+                    _lb.str(b"\n");
+                });
                 return -1;
             }
         }
@@ -1512,7 +1506,7 @@ pub unsafe fn spawn_server(
                 spawn_badge,
             );
             if err != 0 {
-                puts(b"[INIT] WARN: mint expand EP failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[INIT] WARN: mint expand EP failed\n"); });
             }
         }
 
@@ -1522,7 +1516,7 @@ pub unsafe fn spawn_server(
 
         // Configure TCB
         let err = invoke::tcb_set_space(child_tcb, child_cn, child_vs);
-        if err != 0 { puts(b"[INIT] TCB set_space failed\n"); return -1; }
+        if err != 0 { besalt::uerror!(|_lb| { _lb.str(b"[INIT] TCB set_space failed\n"); }); return -1; }
 
         // Set fault handler so VMFaults route to mmsrv for demand paging
         if mmsrv_ep != 0 {
@@ -1535,18 +1529,18 @@ pub unsafe fn spawn_server(
             if err == 0 {
                 let err2 = invoke::tcb_set_fault_handler(child_tcb, fault_ep_slot);
                 if err2 != 0 {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[INIT] WARN: tcb_set_fault_handler failed err=");
-                    lb.hex(err2 as u64);
-                    lb.str(b"\n");
-                    lb.flush();
+                    besalt::uerror!(|_lb| {
+                        _lb.str(b"[INIT] WARN: tcb_set_fault_handler failed err=");
+                        _lb.hex(err2 as u64);
+                        _lb.str(b"\n");
+                    });
                 }
             } else {
-                let mut lb = LineBuf::new();
-                lb.str(b"[INIT] WARN: fault EP mint failed err=");
-                lb.hex(err as u64);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[INIT] WARN: fault EP mint failed err=");
+                    _lb.hex(err as u64);
+                    _lb.str(b"\n");
+                });
             }
         }
 
@@ -1569,7 +1563,7 @@ pub unsafe fn spawn_server(
                 VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
             );
             if err != 0 {
-                puts(b"[INIT] dynamic stack scratch map failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[INIT] dynamic stack scratch map failed\n"); });
                 return -1;
             }
 
@@ -1584,7 +1578,7 @@ pub unsafe fn spawn_server(
                 &raw mut phent,
                 &raw mut phnum,
             ) != 0 {
-                puts(b"[INIT] dynamic phdr info extraction failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[INIT] dynamic phdr info extraction failed\n"); });
                 invoke::vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
                 return -1;
             }
@@ -1673,21 +1667,21 @@ pub unsafe fn spawn_server(
 
         let err = invoke::tcb_configure(child_tcb, child_entry, child_rsp, 0);
         if err != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[INIT] TCB configure failed err=");
-            lb.hex(err as u64);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[INIT] TCB configure failed err=");
+                _lb.hex(err as u64);
+                _lb.str(b"\n");
+            });
             return -1;
         }
 
         invoke::tcb_set_ipc_buffer(child_tcb, layout.ipc_buf.base);
 
         let err = invoke::sc_configure(child_sc, 10000, 100000);
-        if err != 0 { puts(b"[INIT] SC configure failed\n"); return -1; }
+        if err != 0 { besalt::uerror!(|_lb| { _lb.str(b"[INIT] SC configure failed\n"); }); return -1; }
 
         let err = invoke::sc_bind(child_sc, child_tcb);
-        if err != 0 { puts(b"[INIT] SC bind failed\n"); return -1; }
+        if err != 0 { besalt::uerror!(|_lb| { _lb.str(b"[INIT] SC bind failed\n"); }); return -1; }
 
         // Register pre-procmgr child with mmsrv before first user instruction.
         // This guarantees posix_mmap()/brk() works immediately on service start.
@@ -1710,21 +1704,21 @@ pub unsafe fn spawn_server(
                 &raw mut mm_reply,
             );
             if mm_err != 0 || (mm_reply.label != BESALT_OK && mm_reply.label != BESALT_ALREADY_EXISTS) {
-                let mut lb = LineBuf::new();
-                lb.str(b"[INIT] WARN: MM_REGISTER ");
-                lb.bytes(label);
-                lb.str(b" failed err=");
-                lb.hex(mm_err as u64);
-                lb.str(b" label=");
-                lb.hex(mm_reply.label);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[INIT] WARN: MM_REGISTER ");
+                    _lb.bytes(label);
+                    _lb.str(b" failed err=");
+                    _lb.hex(mm_err as u64);
+                    _lb.str(b" label=");
+                    _lb.hex(mm_reply.label);
+                    _lb.str(b"\n");
+                });
                 return -1;
             }
         }
 
         let err = invoke::tcb_resume(child_tcb);
-        if err != 0 { puts(b"[INIT] TCB resume failed\n"); return -1; }
+        if err != 0 { besalt::uerror!(|_lb| { _lb.str(b"[INIT] TCB resume failed\n"); }); return -1; }
 
         // Register init-spawned service with procmgr (badge + CNode)
         if procmgr_ep != 0 {
@@ -1740,15 +1734,15 @@ pub unsafe fn spawn_server(
                 &raw const reg_msg, &raw mut reg_reply,
             );
             if reg_err != 0 || reg_reply.label != BESALT_OK {
-                let mut lb = LineBuf::new();
-                lb.str(b"[INIT] WARN: PM_REGISTER ");
-                lb.bytes(label);
-                lb.str(b" failed err=");
-                lb.hex(reg_err as u64);
-                lb.str(b" label=");
-                lb.hex(reg_reply.label);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[INIT] WARN: PM_REGISTER ");
+                    _lb.bytes(label);
+                    _lb.str(b" failed err=");
+                    _lb.hex(reg_err as u64);
+                    _lb.str(b" label=");
+                    _lb.hex(reg_reply.label);
+                    _lb.str(b"\n");
+                });
             }
         }
 
@@ -1761,7 +1755,7 @@ pub unsafe fn spawn_server(
             return -1;
         }
 
-        { let mut lb = LineBuf::new(); lb.str(b"[INIT] "); lb.bytes(label); lb.str(b" ready\n"); lb.flush(); }
+        besalt::uinfo!(|_lb| { _lb.str(b"[INIT] "); _lb.bytes(label); _lb.str(b" ready\n"); });
         0
     }
 }

@@ -7,10 +7,9 @@
 use besalt::consts::*;
 use besalt::ipc;
 use besalt::invoke;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
-use crate::{ipc_ctx, puts};
+use crate::ipc_ctx;
 
 const CAP_SELF_VSPACE: u64 = 1;
 const CAP_SELF_CSPACE: u64 = 2;
@@ -233,7 +232,7 @@ fn scan_virtio_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioModernLayout> {
     }
 
     if common_bar == 0xFF || notify_bar == 0xFF || device_bar == 0xFF {
-        puts(b"[netdrv] Missing required virtio PCI capabilities\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Missing required virtio PCI capabilities\n"); });
         return None;
     }
 
@@ -245,11 +244,11 @@ fn scan_virtio_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioModernLayout> {
         let vaddr = unsafe { *(&raw const BAR_VADDRS[b as usize]) };
         if vaddr == 0 {
             if map_bar(bus, dev, func, b).is_none() {
-                let mut lb = LineBuf::new();
-                lb.str(b"[netdrv] Failed to map BAR ");
-                lb.dec(b as u64);
-                lb.putc(b'\n');
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[netdrv] Failed to map BAR ");
+                    _lb.dec(b as u64);
+                    _lb.putc(b'\n');
+                });
                 return None;
             }
         }
@@ -338,14 +337,14 @@ fn align_up(value: u64, align: u64) -> u64 {
 /// Sets up the same global state as `virtio::init_virtio` so the legacy
 /// RX/TX ring code in virtio.rs can be reused.
 pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
-    puts(b"[netdrv] Probing modern virtio transport\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[netdrv] Probing modern virtio transport\n"); });
 
     let layout = match scan_virtio_caps(bus, dev, func) {
         Some(l) => l,
         None => return false,
     };
 
-    puts(b"[netdrv] Modern virtio caps discovered\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[netdrv] Modern virtio caps discovered\n"); });
 
     // Reset
     layout.common_write8(CC_DEVICE_STATUS, 0);
@@ -381,7 +380,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
     );
     let status = layout.common_read8(CC_DEVICE_STATUS);
     if (status & VIRTIO_STATUS_FEATURES_OK) == 0 {
-        puts(b"[netdrv] Device did not accept features\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Device did not accept features\n"); });
         return false;
     }
 
@@ -393,23 +392,23 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         }
         unsafe { *(&raw mut crate::virtio::MAC_ADDR) = mac; }
 
-        let mut lb = LineBuf::new();
-        lb.str(b"[netdrv] MAC: ");
-        for i in 0..6 {
-            if i > 0 { lb.putc(b':'); }
-            let hi = b"0123456789abcdef"[(mac[i] >> 4) as usize];
-            let lo = b"0123456789abcdef"[(mac[i] & 0xF) as usize];
-            lb.putc(hi);
-            lb.putc(lo);
-        }
-        lb.putc(b'\n');
-        lb.flush();
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[netdrv] MAC: ");
+            for i in 0..6 {
+                if i > 0 { _lb.putc(b':'); }
+                let hi = b"0123456789abcdef"[(mac[i] >> 4) as usize];
+                let lo = b"0123456789abcdef"[(mac[i] & 0xF) as usize];
+                _lb.putc(hi);
+                _lb.putc(lo);
+            }
+            _lb.putc(b'\n');
+        });
     }
 
     // Set up RX queue (queue 0) and TX queue (queue 1)
     let num_queues = layout.common_read16(CC_NUM_QUEUES);
     if num_queues < 2 {
-        puts(b"[netdrv] Device has fewer than 2 queues\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Device has fewer than 2 queues\n"); });
         return false;
     }
 
@@ -420,11 +419,11 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         layout.common_write16(CC_QUEUE_SELECT, qi);
         let qsize = layout.common_read16(CC_QUEUE_SIZE);
         if qsize == 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[netdrv] Queue ");
-            lb.dec(qi as u64);
-            lb.str(b" unavailable\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[netdrv] Queue ");
+                _lb.dec(qi as u64);
+                _lb.str(b" unavailable\n");
+            });
             return false;
         }
 
@@ -450,7 +449,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         let mut reply = BesaltMsg::zeroed();
         let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
         if err != 0 || reply.label != 0 {
-            puts(b"[netdrv] Failed to allocate virtqueue memory\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to allocate virtqueue memory\n"); });
             return false;
         }
         let vq_base = reply.regs[0];
@@ -468,7 +467,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         let avail_phys = crate::virtio::vaddr_to_phys(vq_base + avail_off);
         let used_phys = crate::virtio::vaddr_to_phys(vq_base + used_off);
         if desc_phys == 0 || avail_phys == 0 || used_phys == 0 {
-            puts(b"[netdrv] Failed to get virtqueue phys addr\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to get virtqueue phys addr\n"); });
             return false;
         }
 
@@ -504,20 +503,18 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
             }
         }
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[netdrv] Queue ");
-            lb.dec(qi as u64);
-            lb.str(b" size: ");
-            lb.dec(qsize as u64);
-            lb.putc(b'\n');
-            lb.flush();
-        }
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[netdrv] Queue ");
+            _lb.dec(qi as u64);
+            _lb.str(b" size: ");
+            _lb.dec(qsize as u64);
+            _lb.putc(b'\n');
+        });
     }
 
     // Allocate DMA buffers (reuse legacy allocation logic)
     if !crate::virtio::alloc_dma_buffers() {
-        puts(b"[netdrv] Failed to allocate DMA buffers\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to allocate DMA buffers\n"); });
         return false;
     }
 
@@ -549,7 +546,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         *(&raw mut crate::virtio::VIRTIO_INITIALIZED) = true;
     }
 
-    puts(b"[netdrv] Modern virtio-net initialized OK\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[netdrv] Modern virtio-net initialized OK\n"); });
     true
 }
 

@@ -5,7 +5,6 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::serial::LineBuf;
 use besalt::types::Cap;
 
 // ---- Pool layout ----
@@ -252,13 +251,11 @@ impl Allocator {
             self.ut_count += 1;
         }
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] Allocator: ");
-            lb.hex(self.ut_count as u64);
-            lb.str(b" untyped sources\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] Allocator: ");
+            _lb.hex(self.ut_count as u64);
+            _lb.str(b" untyped sources\n");
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -361,21 +358,19 @@ impl Allocator {
             best_err = err;
         }
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] retype_any: all ");
-            lb.hex(self.ut_count as u64);
-            lb.str(b" sources failed, best_err=");
-            lb.hex(best_err as u64);
-            lb.str(b" dest=");
-            lb.hex(dest_slot);
-            lb.str(b" type=");
-            lb.hex(obj_type);
-            lb.str(b" bits=");
-            lb.hex(size_bits);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[PROCMGR] retype_any: all ");
+            _lb.hex(self.ut_count as u64);
+            _lb.str(b" sources failed, best_err=");
+            _lb.hex(best_err as u64);
+            _lb.str(b" dest=");
+            _lb.hex(dest_slot);
+            _lb.str(b" type=");
+            _lb.hex(obj_type);
+            _lb.str(b" bits=");
+            _lb.hex(size_bits);
+            _lb.str(b"\n");
+        });
         best_err
     }
 
@@ -422,21 +417,19 @@ impl Allocator {
             best_err = err;
         }
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] retype_core_object: all ");
-            lb.hex(self.ut_count as u64);
-            lb.str(b" sources failed, best_err=");
-            lb.hex(best_err as u64);
-            lb.str(b" dest=");
-            lb.hex(dest_slot);
-            lb.str(b" type=");
-            lb.hex(obj_type);
-            lb.str(b" bits=");
-            lb.hex(size_bits);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[PROCMGR] retype_core_object: all ");
+            _lb.hex(self.ut_count as u64);
+            _lb.str(b" sources failed, best_err=");
+            _lb.hex(best_err as u64);
+            _lb.str(b" dest=");
+            _lb.hex(dest_slot);
+            _lb.str(b" type=");
+            _lb.hex(obj_type);
+            _lb.str(b" bits=");
+            _lb.hex(size_bits);
+            _lb.str(b"\n");
+        });
         best_err
     }
 

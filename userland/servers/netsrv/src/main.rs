@@ -30,7 +30,6 @@ use besalt::consts::*;
 use besalt::invoke;
 use besalt::ipc;
 use besalt::serial;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 // ---------------------------------------------------------------------------
@@ -196,11 +195,11 @@ fn setup_shm() -> bool {
     // SAFETY: IPC context is valid; making RPC to mmsrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || (reply.label != BESALT_OK && reply.label != BESALT_ALREADY_EXISTS) {
-        let mut lb = LineBuf::new();
-        lb.str(b"[netsrv] SHM create failed: ");
-        lb.dec(if err != 0 { err as u64 } else { reply.label });
-        lb.putc(b'\n');
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[netsrv] SHM create failed: ");
+            _lb.dec(if err != 0 { err as u64 } else { reply.label });
+            _lb.putc(b'\n');
+        });
         return false;
     }
 
@@ -216,11 +215,11 @@ fn setup_shm() -> bool {
     // SAFETY: IPC context is valid; making RPC to mmsrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != BESALT_OK {
-        let mut lb = LineBuf::new();
-        lb.str(b"[netsrv] SHM map failed: ");
-        lb.dec(if err != 0 { err as u64 } else { reply.label });
-        lb.putc(b'\n');
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[netsrv] SHM map failed: ");
+            _lb.dec(if err != 0 { err as u64 } else { reply.label });
+            _lb.putc(b'\n');
+        });
         return false;
     }
 
@@ -237,7 +236,9 @@ fn setup_shm() -> bool {
         *hdr.add(5) = 32; // tx_slot_count
     }
 
-    puts(b"[netsrv] SHM allocated and mapped\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[netsrv] SHM allocated and mapped\n");
+    });
     true
 }
 
@@ -262,26 +263,28 @@ fn setup_notification() -> bool {
     // SAFETY: IPC context is valid; making RPC to mmsrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != BESALT_OK {
-        let mut lb = LineBuf::new();
-        lb.str(b"[netsrv] Failed to allocate notification: ");
-        lb.dec(if err != 0 { err as u64 } else { reply.label });
-        lb.putc(b'\n');
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[netsrv] Failed to allocate notification: ");
+            _lb.dec(if err != 0 { err as u64 } else { reply.label });
+            _lb.putc(b'\n');
+        });
         return false;
     }
 
     // Bind notification to our TCB
     let err = invoke::tcb_bind_notification(CAP_SELF_TCB, CAP_RX_NOTIFICATION);
     if err != 0 {
-        let mut lb = LineBuf::new();
-        lb.str(b"[netsrv] Failed to bind notification to TCB: ");
-        lb.dec(err as u64);
-        lb.putc(b'\n');
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[netsrv] Failed to bind notification to TCB: ");
+            _lb.dec(err as u64);
+            _lb.putc(b'\n');
+        });
         return false;
     }
 
-    puts(b"[netsrv] Notification allocated and bound\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[netsrv] Notification allocated and bound\n");
+    });
     true
 }
 
@@ -310,19 +313,19 @@ fn driver_register() -> bool {
     let mut reply = BesaltMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to netdrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_NETDRV_EP, &raw const msg, &raw mut reply) };
-    let mut reg_lb = LineBuf::new();
-    reg_lb.str(b"[netsrv] DRIVER_REGISTER call result=");
-    reg_lb.dec(err as u64);
-    reg_lb.str(b" label=");
-    reg_lb.dec(reply.label);
-    reg_lb.putc(b'\n');
-    reg_lb.flush();
+    besalt::udebug!(|_lb| {
+        _lb.str(b"[netsrv] DRIVER_REGISTER call result=");
+        _lb.dec(err as u64);
+        _lb.str(b" label=");
+        _lb.dec(reply.label);
+        _lb.putc(b'\n');
+    });
     if err != 0 || reply.label != BESALT_OK {
-        let mut lb = LineBuf::new();
-        lb.str(b"[netsrv] DRIVER_REGISTER failed: ");
-        lb.dec(if err != 0 { err as u64 } else { reply.label });
-        lb.putc(b'\n');
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[netsrv] DRIVER_REGISTER failed: ");
+            _lb.dec(if err != 0 { err as u64 } else { reply.label });
+            _lb.putc(b'\n');
+        });
         return false;
     }
 
@@ -340,19 +343,19 @@ fn driver_register() -> bool {
         (*mac)[5] = mac_hi as u8;
     }
 
-    let mut lb = LineBuf::new();
-    lb.str(b"[netsrv] Registered with netdrv, MAC=");
-    let mac = mac_addr();
-    let mut i = 0;
-    while i < 6 {
-        lb.hex(mac[i] as u64);
-        if i < 5 {
-            lb.putc(b':');
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[netsrv] Registered with netdrv, MAC=");
+        let mac = mac_addr();
+        let mut i = 0;
+        while i < 6 {
+            _lb.hex(mac[i] as u64);
+            if i < 5 {
+                _lb.putc(b':');
+            }
+            i += 1;
         }
-        i += 1;
-    }
-    lb.putc(b'\n');
-    lb.flush();
+        _lb.putc(b'\n');
+    });
     true
 }
 
@@ -383,7 +386,9 @@ fn register_nameserv() {
             &raw mut reply,
         );
         if err != 0 || reply.label != BESALT_OK {
-            puts(b"[netsrv] nameserv registration failed\n");
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[netsrv] nameserv registration failed\n");
+            });
         }
     }
 }
@@ -456,8 +461,12 @@ fn check_self_test() {
     match phase {
         0 => {
             if net::arp::lookup(net::ipv4::GATEWAY_IP).is_some() {
-                puts(b"[netsrv] ARP reply received for gateway\n");
-                puts(b"[netsrv] Sending ICMP echo to 10.0.2.2 seq=1\n");
+                besalt::udebug!(|_lb| {
+                    _lb.str(b"[netsrv] ARP reply received for gateway\n");
+                });
+                besalt::udebug!(|_lb| {
+                    _lb.str(b"[netsrv] Sending ICMP echo to 10.0.2.2 seq=1\n");
+                });
                 net::icmp::reset_echo_reply_flag();
                 net::icmp::send_echo_request(
                     &mac_addr(),
@@ -476,7 +485,9 @@ fn check_self_test() {
                     *(&raw mut SELF_TEST_TICKS) = ticks + 1;
                 }
                 if ticks + 1 >= 200 {
-                    puts(b"[netsrv] ARP timeout for gateway\n");
+                    besalt::uwarn!(|_lb| {
+                        _lb.str(b"[netsrv] ARP timeout for gateway\n");
+                    });
                     // SAFETY: Single-threaded server.
                     unsafe {
                         *(&raw mut SELF_TEST_PHASE) = 2;
@@ -486,7 +497,9 @@ fn check_self_test() {
         }
         1 => {
             if net::icmp::echo_reply_received() {
-                puts(b"[netsrv] ICMP echo reply received\n");
+                besalt::udebug!(|_lb| {
+                    _lb.str(b"[netsrv] ICMP echo reply received\n");
+                });
                 // SAFETY: Single-threaded server.
                 unsafe {
                     *(&raw mut SELF_TEST_PHASE) = 2;
@@ -497,7 +510,9 @@ fn check_self_test() {
                     *(&raw mut SELF_TEST_TICKS) = ticks + 1;
                 }
                 if ticks + 1 >= 200 {
-                    puts(b"[netsrv] ICMP echo reply timeout\n");
+                    besalt::uwarn!(|_lb| {
+                        _lb.str(b"[netsrv] ICMP echo reply timeout\n");
+                    });
                     // SAFETY: Single-threaded server.
                     unsafe {
                         *(&raw mut SELF_TEST_PHASE) = 2;
@@ -532,7 +547,9 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
             unsafe {
                 *(&raw mut VFS_REGISTERED) = true;
             }
-            puts(b"[netsrv] VFS callback EP registered\n");
+            besalt::uinfo!(|_lb| {
+                _lb.str(b"[netsrv] VFS callback EP registered\n");
+            });
             reply.label = BESALT_OK;
         }
         NET_SOCKET => {
@@ -1034,7 +1051,9 @@ fn drain_completion_queue() {
 /// - On IPC request (badge == 0): dispatch the request, fill reply, then
 ///   reply_recv (atomically reply and wait for next event).
 fn event_loop() -> ! {
-    puts(b"[netsrv] Entering event loop\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[netsrv] Entering event loop\n");
+    });
 
     let ctx = ipc_ctx();
     let mut msg = BesaltMsg::zeroed();
@@ -1116,29 +1135,41 @@ fn event_loop() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    puts(b"[netsrv] Network Stack Server starting\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[netsrv] Network Stack Server starting\n");
+    });
 
     // 1. Allocate and map SHM
     if !setup_shm() {
-        puts(b"[netsrv] SHM setup failed, halting\n");
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[netsrv] SHM setup failed, halting\n");
+        });
         idle();
     }
 
     // 2. Setup notification (allocate, bind to TCB, mint badged copy)
     if !setup_notification() {
-        puts(b"[netsrv] Notification setup failed, halting\n");
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[netsrv] Notification setup failed, halting\n");
+        });
         idle();
     }
 
     // 3. Register with netdrv (DRIVER_REGISTER: exchange SHM ID, caps, get MAC)
     if !driver_register() {
-        puts(b"[netsrv] Driver register failed, halting\n");
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[netsrv] Driver register failed, halting\n");
+        });
         idle();
     }
 
     // 4. Fire-and-forget ARP request for self-test (checked in event loop)
-    puts(b"[netsrv] IP: 10.0.2.15/24, GW: 10.0.2.2\n");
-    puts(b"[netsrv] Self-test: ARP request for 10.0.2.2\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[netsrv] IP: 10.0.2.15/24, GW: 10.0.2.2\n");
+    });
+    besalt::udebug!(|_lb| {
+        _lb.str(b"[netsrv] Self-test: ARP request for 10.0.2.2\n");
+    });
     net::arp::request(&mac_addr(), net::ipv4::OUR_IP, net::ipv4::GATEWAY_IP);
 
     // 5. Register with name service

@@ -3,7 +3,6 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use besalt::ipc;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 use crate::proc_table::{
@@ -27,11 +26,11 @@ unsafe fn respawn_process(binary: &[u8; MAX_NAME_LEN]) {
             return;
         }
 
-        let mut lb = LineBuf::new();
-        lb.str(b"[PROCMGR] Respawning: ");
-        lb.bytes(&binary[..name_len]);
-        lb.str(b"\n");
-        lb.flush();
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] Respawning: ");
+            _lb.bytes(&binary[..name_len]);
+            _lb.str(b"\n");
+        });
 
         // Build synthetic spawn message
         let mut msg = BesaltMsg::zeroed();
@@ -55,19 +54,23 @@ unsafe fn respawn_process(binary: &[u8; MAX_NAME_LEN]) {
         super::spawn_tx::handle_spawn_tx(&msg, &mut reply, 0, alloc);
 
         if reply.label == super::BESALT_OK {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] Respawned PID=");
-            lb.hex(reply.regs[0]);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::udebug!(|_lb| {
+                _lb.str(b"[PROCMGR] Respawned PID=");
+                _lb.hex(reply.regs[0]);
+                _lb.str(b"\n");
+            });
         } else {
             // Retry once after a short delay
-            besalt::serial::serial_puts(b"[PROCMGR] Respawn failed, retrying...\n");
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] Respawn failed, retrying...\n");
+            });
             besalt::syscall::syscall(besalt::SYS_NANOSLEEP, 100_000_000, 0, 0, 0, 0, 0);
             let mut reply2 = BesaltMsg::zeroed();
             super::spawn_tx::handle_spawn_tx(&msg, &mut reply2, 0, alloc);
             if reply2.label != super::BESALT_OK {
-                besalt::serial::serial_puts(b"[PROCMGR] Respawn retry failed\n");
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] Respawn retry failed\n");
+                });
             }
         }
     }
@@ -112,24 +115,22 @@ pub(crate) unsafe fn handle_exit(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         let exit_code = raw_code << 8;
 
         let Some(idx) = find_by_badge(badge) else {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] EXIT from unknown badge=");
-            lb.hex(badge);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] EXIT from unknown badge=");
+                _lb.hex(badge);
+                _lb.str(b"\n");
+            });
             reply.label = super::BESALT_NOT_FOUND;
             return;
         };
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] EXIT PID=");
-            lb.hex(proctab(idx).pid as u64);
-            lb.str(b" code=");
-            lb.hex(exit_code as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] EXIT PID=");
+            _lb.hex(proctab(idx).pid as u64);
+            _lb.str(b" code=");
+            _lb.hex(exit_code as u64);
+            _lb.str(b"\n");
+        });
 
         // Deregister from mmsrv if registered
         if proctab(idx).mmsrv_registered {
@@ -166,13 +167,13 @@ pub(crate) unsafe fn handle_exit(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             besalt::syscall::syscall(besalt::SYS_YIELD, 0, 0, 0, 0, 0, 0);
         }
         if !vfs_sent {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] EXIT: VFS client-exit sync failed err=");
-            lb.hex(vfs_err as u64);
-            lb.str(b" badge=");
-            lb.hex(badge);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] EXIT: VFS client-exit sync failed err=");
+                _lb.hex(vfs_err as u64);
+                _lb.str(b" badge=");
+                _lb.hex(badge);
+                _lb.str(b"\n");
+            });
         }
 
         proctab(idx).state = PROC_ZOMBIE;
@@ -205,13 +206,11 @@ pub(crate) unsafe fn handle_exit(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
 
         // Wake specific-child waiter
         if proctab(idx).waiter_reply != 0 {
-            {
-                let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR] Waking waiter for PID=");
-                lb.hex(proctab(idx).pid as u64);
-                lb.str(b"\n");
-                lb.flush();
-            }
+            besalt::udebug!(|_lb| {
+                _lb.str(b"[PROCMGR] Waking waiter for PID=");
+                _lb.hex(proctab(idx).pid as u64);
+                _lb.str(b"\n");
+            });
 
             let mut wake = BesaltMsg::zeroed();
             wake.label = super::BESALT_OK;
@@ -237,15 +236,13 @@ pub(crate) unsafe fn handle_exit(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         let mut reaped = false;
         if let Some(pi) = find_by_pid(ppid) {
             if proctab(pi).waiting_for_any != 0 {
-                {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[PROCMGR] Waking any-waiter parent PID=");
-                    lb.hex(proctab(pi).pid as u64);
-                    lb.str(b" for child PID=");
-                    lb.hex(proctab(idx).pid as u64);
-                    lb.str(b"\n");
-                    lb.flush();
-                }
+                besalt::udebug!(|_lb| {
+                    _lb.str(b"[PROCMGR] Waking any-waiter parent PID=");
+                    _lb.hex(proctab(pi).pid as u64);
+                    _lb.str(b" for child PID=");
+                    _lb.hex(proctab(idx).pid as u64);
+                    _lb.str(b"\n");
+                });
 
                 let mut wake = BesaltMsg::zeroed();
                 wake.label = super::BESALT_OK;
@@ -359,13 +356,11 @@ pub(crate) unsafe fn handle_wait(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             }
             proctab(caller_idx).any_waiter_reply = reply_slot;
             proctab(caller_idx).waiting_for_any = 1;
-            {
-                let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR] WAIT(-1) blocking parent PID=");
-                lb.hex(caller_pid as u64);
-                lb.str(b"\n");
-                lb.flush();
-            }
+            besalt::udebug!(|_lb| {
+                _lb.str(b"[PROCMGR] WAIT(-1) blocking parent PID=");
+                _lb.hex(caller_pid as u64);
+                _lb.str(b"\n");
+            });
             return true;
         }
 
@@ -415,24 +410,22 @@ pub(crate) unsafe fn handle_wait(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         };
         let err = besalt::invoke::cnode_save_caller(super::CAP_SELF_CSPACE, reply_slot);
         if err != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] save_caller failed for WAIT, err=");
-            lb.hex(err as u64);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] save_caller failed for WAIT, err=");
+                _lb.hex(err as u64);
+                _lb.str(b"\n");
+            });
             (&mut *(&raw mut super::ALLOCATOR)).free_single_slot(reply_slot);
             reply.label = super::BESALT_OUT_OF_MEMORY;
             return false;
         }
         proctab(ci).waiter_reply = reply_slot;
         proctab(ci).waiter_pid = caller_pid;
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] WAIT blocking for PID=");
-            lb.hex(child_pid as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] WAIT blocking for PID=");
+            _lb.hex(child_pid as u64);
+            _lb.str(b"\n");
+        });
         true
     }
 }

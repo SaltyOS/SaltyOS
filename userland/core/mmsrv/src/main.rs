@@ -44,8 +44,6 @@ mod shm;
 use besalt::consts::*;
 use besalt::invoke;
 use besalt::ipc;
-use besalt::serial;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 use types::*;
@@ -378,7 +376,9 @@ unsafe fn init_dynamic_pools() {
             *(&raw mut FREE_SLOTS_PTR) = slot_ptr as *mut u32;
             *(&raw mut FREE_SLOTS_CAP) = cap;
         } else {
-            puts(b"[MMSRV] WARN: FREE_SLOTS alloc failed, using fallback\n");
+            besalt::uwarn!(|_lb| {
+                _lb.str(b"[MMSRV] WARN: FREE_SLOTS alloc failed, using fallback\n");
+            });
         }
 
         // Allocate FRAME_POOL array (cap * 8 bytes)
@@ -389,18 +389,18 @@ unsafe fn init_dynamic_pools() {
             *(&raw mut FRAME_POOL_PTR) = pool_ptr as *mut u64;
             *(&raw mut FRAME_POOL_CAP) = cap;
         } else {
-            puts(b"[MMSRV] WARN: FRAME_POOL alloc failed, using fallback\n");
+            besalt::uwarn!(|_lb| {
+                _lb.str(b"[MMSRV] WARN: FRAME_POOL alloc failed, using fallback\n");
+            });
         }
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[MMSRV] dynamic pools: cap=");
-            lb.hex(cap as u64);
-            lb.str(b" (");
-            lb.hex(total_mb as u64);
-            lb.str(b" MB RAM)\n");
-            lb.flush();
-        }
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[MMSRV] dynamic pools: cap=");
+            _lb.hex(cap as u64);
+            _lb.str(b" (");
+            _lb.hex(total_mb as u64);
+            _lb.str(b" MB RAM)\n");
+        });
     }
 }
 
@@ -414,10 +414,6 @@ static mut SHM_CAP: usize = 0;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn puts(s: &[u8]) {
-    serial::serial_puts(s);
-}
 
 fn ipc_ctx() -> *mut IpcContext {
     besalt::tls::current_ipc_ctx()
@@ -475,12 +471,16 @@ unsafe fn resolve_procmgr_ep() -> Cap {
 
         if err != 0 || reply.label != BESALT_OK {
             recycle_empty_slot(ep_slot);
-            puts(b"[MMSRV] procmgr lookup via nameserv failed\n");
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[MMSRV] procmgr lookup via nameserv failed\n");
+            });
             return 0;
         }
 
         *(&raw mut PROCMGR_EP) = ep_slot;
-        puts(b"[MMSRV] Resolved procmgr EP via nameserv\n");
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[MMSRV] Resolved procmgr EP via nameserv\n");
+        });
         ep_slot
     }
 }
@@ -526,13 +526,11 @@ unsafe fn request_untyped_from_procmgr(size_bits: u64) -> Cap {
         }
 
         // The sub-untyped cap should now be at recv_slot
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[MMSRV] Received sub-untyped from procmgr at slot ");
-            lb.hex(recv_slot);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[MMSRV] Received sub-untyped from procmgr at slot ");
+            _lb.hex(recv_slot);
+            _lb.str(b"\n");
+        });
 
         recv_slot
     }
@@ -578,27 +576,27 @@ unsafe fn retype_any(obj_type: u64, size_bits: u64, dest_slot: Cap) -> i32 {
         }
 
         // All sources exhausted — log per-source diagnostics
-        let mut lb = LineBuf::new();
-        lb.str(b"[MMSRV] retype_any: all ");
-        lb.hex(ut_count as u64);
-        lb.str(b" sources failed, type=");
-        lb.hex(obj_type);
-        lb.str(b"\n");
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[MMSRV] retype_any: all ");
+            _lb.hex(ut_count as u64);
+            _lb.str(b" sources failed, type=");
+            _lb.hex(obj_type);
+            _lb.str(b"\n");
+        });
         for i in 0..ut_count {
             if !sources[i].active {
                 continue;
             }
             let err = invoke::untyped_retype(sources[i].cap, obj_type, size_bits, dest_slot);
-            let mut lb2 = LineBuf::new();
-            lb2.str(b"  src[");
-            lb2.hex(i as u64);
-            lb2.str(b"] cap=");
-            lb2.hex(sources[i].cap);
-            lb2.str(b" err=");
-            lb2.hex(err as u64);
-            lb2.str(b"\n");
-            lb2.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"  src[");
+                _lb.hex(i as u64);
+                _lb.str(b"] cap=");
+                _lb.hex(sources[i].cap);
+                _lb.str(b" err=");
+                _lb.hex(err as u64);
+                _lb.str(b"\n");
+            });
             if err == 0 {
                 *(&raw mut UT_HINT) = i;
                 return 0;
@@ -661,11 +659,11 @@ unsafe fn init_untyped_pool() {
         *(&raw mut UT_COUNT) = count;
         *(&raw mut UT_HINT) = 0;
 
-        let mut lb = LineBuf::new();
-        lb.str(b"[MMSRV] untyped pool: ");
-        lb.hex(count as u64);
-        lb.str(b" sources\n");
-        lb.flush();
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[MMSRV] untyped pool: ");
+            _lb.hex(count as u64);
+            _lb.str(b" sources\n");
+        });
     }
 }
 
@@ -691,13 +689,13 @@ unsafe fn register_with_nameserv() -> bool {
         let mut reply = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV, &raw const msg, &raw mut reply);
         if err != 0 || reply.label != BESALT_OK {
-            let mut lb = LineBuf::new();
-            lb.str(b"[MMSRV] nameserv register failed err=");
-            lb.hex(err as u64);
-            lb.str(b" label=");
-            lb.hex(reply.label);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[MMSRV] nameserv register failed err=");
+                _lb.hex(err as u64);
+                _lb.str(b" label=");
+                _lb.hex(reply.label);
+                _lb.str(b"\n");
+            });
             return false;
         }
         true
@@ -855,23 +853,27 @@ pub(crate) fn alloc_frame() -> Option<Cap> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    puts(b"[MMSRV] SaltyOS memory server starting\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[MMSRV] SaltyOS memory server starting\n");
+    });
 
     // Set up IPC buffer
     let err = invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
     if err != 0 {
-        let mut lb = LineBuf::new();
-        lb.str(b"[MMSRV] FAIL: set IPC buffer err=");
-        lb.hex(err as u64);
-        lb.str(b"\n");
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[MMSRV] FAIL: set IPC buffer err=");
+            _lb.hex(err as u64);
+            _lb.str(b"\n");
+        });
         idle();
     }
     unsafe {
         ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
     }
 
-    puts(b"[MMSRV] IPC buffer ready\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[MMSRV] IPC buffer ready\n");
+    });
 
     // Initialize per-process slot allocator from RTLD-exported globals.
     // self_mmap() depends on slot_alloc for temporary frame-cap slots.
@@ -885,7 +887,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         if base != 0 {
             besalt::slot_alloc::slot_alloc_init(base, count, cspace_ntfn);
         } else {
-            puts(b"[MMSRV] FATAL: slot pool not provided by RTLD/auxv\n");
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[MMSRV] FATAL: slot pool not provided by RTLD/auxv\n");
+            });
             idle();
         }
     }
@@ -904,7 +908,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     unsafe {
         let ptr = self_mmap(1);
         if ptr.is_null() {
-            puts(b"[MMSRV] FATAL: client table alloc failed\n");
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[MMSRV] FATAL: client table alloc failed\n");
+            });
             idle();
         }
         *(&raw mut CLIENTS_PTR) = ptr as *mut MmClient;
@@ -915,7 +921,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     unsafe {
         let ptr = self_mmap(1);
         if ptr.is_null() {
-            puts(b"[MMSRV] FATAL: SHM table alloc failed\n");
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[MMSRV] FATAL: SHM table alloc failed\n");
+            });
             idle();
         }
         *(&raw mut SHM_PTR) = ptr as *mut ShmObject;
@@ -926,7 +934,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     unsafe {
         let slot = alloc_recv_slot();
         if slot == 0 {
-            puts(b"[MMSRV] FATAL: no receive slots\n");
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[MMSRV] FATAL: no receive slots\n");
+            });
             idle();
         }
         *(&raw mut CURRENT_RECV_SLOT) = slot;
@@ -935,14 +945,20 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // Register with nameserv
     if !unsafe { register_with_nameserv() } {
-        puts(b"[MMSRV] FATAL: nameserv registration failed\n");
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[MMSRV] FATAL: nameserv registration failed\n");
+        });
         idle();
     }
-    puts(b"[MMSRV] registered with nameserv\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[MMSRV] registered with nameserv\n");
+    });
 
     // Signal readiness to init
     signal_ready();
-    puts(b"[MMSRV] ready\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[MMSRV] ready\n");
+    });
 
     // Initial recv
     let mut msg = BesaltMsg::zeroed();
@@ -950,7 +966,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
     if err != 0 {
-        puts(b"[MMSRV] initial recv failed\n");
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[MMSRV] initial recv failed\n");
+        });
         idle();
     }
 
@@ -1002,6 +1020,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     let fault_addr = msg.regs[0];
                     let error_code = msg.regs[1];
                     let fault_rip = msg.regs[2];
+                    let is_instruction_fault = msg.regs[3] != 0;
                     let page_addr = fault_addr & !0xFFFu64;
 
 
@@ -1009,11 +1028,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                         // 1. Find client by badge
                         let client_ptr = client::find_client_by_badge(badge);
                         if client_ptr.is_null() {
-                            let mut lb = LineBuf::new();
-                            lb.str(b"[MMSRV] VMFault: unknown client badge=");
-                            lb.hex(badge);
-                            lb.str(b"\n");
-                            lb.flush();
+                            besalt::uerror!(|_lb| {
+                                _lb.str(b"[MMSRV] VMFault: unknown client badge=");
+                                _lb.hex(badge);
+                                _lb.str(b"\n");
+                            });
                             reply.label = BESALT_INVALID_OPERATION;
                             break 'fault;
                         }
@@ -1024,52 +1043,52 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                             // No region covers this address — segfault.
                             // Don't reply: leave the faulting thread permanently
                             // FaultBlocked instead of re-faulting in a tight loop.
-                            let mut lb = LineBuf::new();
-                            lb.str(b"[MMSRV] Segfault: badge=");
-                            lb.hex(badge);
-                            lb.str(b" addr=");
-                            lb.hex(fault_addr);
-                            lb.str(b" (no region) rip=");
-                            lb.hex(fault_rip);
                             let rc = (*client_ptr).region_count;
-                            lb.str(b" regions=");
-                            lb.hex(rc as u64);
-                            if rc > 0 {
-                                let regs = (*client_ptr).regions;
-                                let r0 = &*regs.add(0);
-                                lb.str(b" r0=[");
-                                lb.hex(r0.base);
-                                lb.str(b",");
-                                lb.hex(r0.base + r0.length);
-                                lb.str(b")");
-                                let rl = &*regs.add(rc - 1);
-                                lb.str(b" rN=[");
-                                lb.hex(rl.base);
-                                lb.str(b",");
-                                lb.hex(rl.base + rl.length);
-                                lb.str(b")");
-                            }
-                            lb.str(b" err=");
-                            lb.hex(error_code);
-                            lb.str(b"\n");
-                            lb.flush();
+                            besalt::uerror!(|_lb| {
+                                _lb.str(b"[MMSRV] Segfault: badge=");
+                                _lb.hex(badge);
+                                _lb.str(b" addr=");
+                                _lb.hex(fault_addr);
+                                _lb.str(b" (no region) rip=");
+                                _lb.hex(fault_rip);
+                                _lb.str(b" regions=");
+                                _lb.hex(rc as u64);
+                                if rc > 0 {
+                                    let regs = (*client_ptr).regions;
+                                    let r0 = &*regs.add(0);
+                                    _lb.str(b" r0=[");
+                                    _lb.hex(r0.base);
+                                    _lb.str(b",");
+                                    _lb.hex(r0.base + r0.length);
+                                    _lb.str(b")");
+                                    let rl = &*regs.add(rc - 1);
+                                    _lb.str(b" rN=[");
+                                    _lb.hex(rl.base);
+                                    _lb.str(b",");
+                                    _lb.hex(rl.base + rl.length);
+                                    _lb.str(b")");
+                                }
+                                _lb.str(b" err=");
+                                _lb.hex(error_code);
+                                _lb.str(b"\n");
+                            });
                             // Dump all regions for debugging
                             if rc > 0 && rc <= 80 {
                                 let regs = (*client_ptr).regions;
                                 for ri in 0..rc {
                                     let rd = &*regs.add(ri);
                                     if rd.active {
-                                        let mut lb2 = LineBuf::new();
-                                        lb2.str(b"  r");
-                                        lb2.hex(ri as u64);
-                                        lb2.str(b"=[");
-                                        lb2.hex(rd.base);
-                                        lb2.str(b",");
-                                        lb2.hex(rd.base + rd.length);
-                                        lb2.str(b") t=");
-                                        lb2.hex(rd.region_type as u64);
-                                        lb2.str(b"\n");
-                                        lb2.flush();
+                                        besalt::uerror!(|_lb| {
+                                            _lb.str(b"  r");
+                                            _lb.hex(ri as u64);
+                                            _lb.str(b"=[");
+                                            _lb.hex(rd.base);
+                                            _lb.str(b",");
+                                            _lb.hex(rd.base + rd.length);
+                                            _lb.str(b") t=");
+                                            _lb.hex(rd.region_type as u64);
+                                            _lb.str(b"\n");
+                                        });
                                     }
                                 }
                             }
@@ -1077,21 +1096,45 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                             break 'fault;
                         }
 
-                        // 3. Write to present page = access violation
-                        // (e.g. mprotect(PROT_READ) page). With MO-based COW,
-                        // the kernel resolves COW faults internally. If a
-                        // write fault on a present page reaches mmsrv, it is
-                        // a genuine access violation.
-                        // error_code bits: [0]=Present, [1]=Write, [2]=User
-                        // 0x7 = present + write + user
-                        if (error_code & 0x7) == 0x7 {
-                            let mut lb = LineBuf::new();
-                            lb.str(b"[MMSRV] access violation: badge=");
-                            lb.hex(badge);
-                            lb.str(b" addr=");
-                            lb.hex(fault_addr);
-                            lb.str(b"\n");
-                            lb.flush();
+                        // 3. Protection fault on a present page.
+                        // These are not demand faults. They indicate an access
+                        // to an already-mapped page with insufficient rights.
+                        // VMFault IPC error bits are arch-neutral:
+                        // [0]=present [1]=write [2]=user, while instruction
+                        // faults are reported separately in MR3.
+                        if (error_code & 0x1) != 0 {
+                            let write_fault = (error_code & 0x2) != 0;
+                            besalt::uerror!(|_lb| {
+                                _lb.str(b"[MMSRV] protection fault: badge=");
+                                _lb.hex(badge);
+                                _lb.str(b" kind=");
+                                if is_instruction_fault {
+                                    _lb.str(b"exec");
+                                } else if write_fault {
+                                    _lb.str(b"write");
+                                } else {
+                                    _lb.str(b"read");
+                                }
+                                _lb.str(b" addr=");
+                                _lb.hex(fault_addr);
+                                _lb.str(b" rip=");
+                                _lb.hex(fault_rip);
+                                _lb.str(b" err=");
+                                _lb.hex(error_code);
+                                _lb.str(b" region=[");
+                                _lb.hex((*region).base);
+                                _lb.str(b",");
+                                _lb.hex((*region).base + (*region).length);
+                                _lb.str(b") prot=");
+                                _lb.hex((*region).prot as u64);
+                                _lb.str(b" type=");
+                                _lb.hex((*region).region_type as u64);
+                                _lb.str(b" mo=");
+                                _lb.hex((*region).mo_cap);
+                                _lb.str(b" mo_off=");
+                                _lb.hex((*region).mo_offset as u64);
+                                _lb.str(b"\n");
+                            });
                             skip_reply = true;
                             break 'fault;
                         }
@@ -1100,13 +1143,13 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                         // Commit the page via mo_commit, then map into VSpace.
                         if (*region).mo_cap == 0 {
                             // No MO — region is corrupted or legacy. Segfault.
-                            let mut lb = LineBuf::new();
-                            lb.str(b"[MMSRV] VMFault: region has no MO badge=");
-                            lb.hex(badge);
-                            lb.str(b" addr=");
-                            lb.hex(fault_addr);
-                            lb.str(b"\n");
-                            lb.flush();
+                            besalt::uerror!(|_lb| {
+                                _lb.str(b"[MMSRV] VMFault: region has no MO badge=");
+                                _lb.hex(badge);
+                                _lb.str(b" addr=");
+                                _lb.hex(fault_addr);
+                                _lb.str(b"\n");
+                            });
                             skip_reply = true;
                             break 'fault;
                         }
@@ -1120,15 +1163,15 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                             1,
                         );
                         if err != 0 || committed != 1 {
-                            let mut lb = LineBuf::new();
-                            lb.str(b"[MMSRV] VMFault: mo_commit failed badge=");
-                            lb.hex(badge);
-                            lb.str(b" addr=");
-                            lb.hex(fault_addr);
-                            lb.str(b" err=");
-                            lb.hex(err as u64);
-                            lb.str(b"\n");
-                            lb.flush();
+                            besalt::uerror!(|_lb| {
+                                _lb.str(b"[MMSRV] VMFault: mo_commit failed badge=");
+                                _lb.hex(badge);
+                                _lb.str(b" addr=");
+                                _lb.hex(fault_addr);
+                                _lb.str(b" err=");
+                                _lb.hex(err as u64);
+                                _lb.str(b"\n");
+                            });
                             reply.label = BESALT_OUT_OF_MEMORY;
                             break 'fault;
                         }
@@ -1149,13 +1192,13 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     } // end 'fault
                 }
                 _ => {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[MMSRV] unknown label=");
-                    lb.hex(msg.label);
-                    lb.str(b" badge=");
-                    lb.hex(badge);
-                    lb.str(b"\n");
-                    lb.flush();
+                    besalt::uwarn!(|_lb| {
+                        _lb.str(b"[MMSRV] unknown label=");
+                        _lb.hex(msg.label);
+                        _lb.str(b" badge=");
+                        _lb.hex(badge);
+                        _lb.str(b"\n");
+                    });
                     // Fault labels (CapFault=1, UnknownSyscall=3, UserException=4)
                     // are unrecoverable — skip reply so the thread stays FaultBlocked
                     // instead of resuming and re-faulting in a tight loop.
@@ -1194,11 +1237,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
             };
             if err != 0 {
-                let mut lb = LineBuf::new();
-                lb.str(b"[MMSRV] recv failed err=");
-                lb.hex(err as u64);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[MMSRV] recv failed err=");
+                    _lb.hex(err as u64);
+                    _lb.str(b"\n");
+                });
                 break;
             }
         } else {
@@ -1212,11 +1255,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 )
             };
             if err != 0 {
-                let mut lb = LineBuf::new();
-                lb.str(b"[MMSRV] reply_recv failed err=");
-                lb.hex(err as u64);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[MMSRV] reply_recv failed err=");
+                    _lb.hex(err as u64);
+                    _lb.str(b"\n");
+                });
                 break;
             }
         }

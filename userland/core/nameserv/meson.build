@@ -4,13 +4,19 @@
 nameserv_link = meson.current_source_dir() / 'arch' / arch / 'link.ld'
 libbesalt_build_dir = meson.project_build_root() / 'lib/besalt/lib'
 
+# Per-program debug override
+_prog_rust_args = rust_userland_args
+if 'nameserv' in userland_debug_list
+  _prog_rust_args = _prog_rust_args + ['--cfg', 'ulog_debug']
+endif
+
 # Step 1: Rust -> .o
 nameserv_obj = custom_target('nameserv_obj',
   input: files('src/main.rs'),
   output: 'nameserv.o',
   depfile: 'nameserv.d',
   command: [rustc,
-    rust_userland_args,
+    _prog_rust_args,
     '--emit=obj=@OUTPUT@,dep-info=@DEPFILE@',
     '--crate-name=nameserv',
     '--crate-type=lib',

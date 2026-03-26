@@ -40,7 +40,6 @@ mod handlers;
 
 use besalt::consts::*;
 use besalt::ipc;
-use besalt::serial;
 use besalt::types::*;
 
 use consts::*;
@@ -74,10 +73,6 @@ static mut ALLOC_HINT: u64 = 0;
 /// VFS-SaltyFS shared memory state
 static mut VFS_SHM_MAPPED: bool = false;
 
-fn puts(s: &[u8]) {
-    serial::serial_puts(s);
-}
-
 fn ipc_ctx() -> *mut IpcContext {
     &raw mut besalt::__besalt_ipc_ctx
 }
@@ -105,7 +100,7 @@ fn register_nameserv() {
         let mut reply = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const msg, &raw mut reply);
         if err != 0 || reply.label != BESALT_OK {
-            puts(b"[saltyfs] nameserv registration failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] nameserv registration failed\n"); });
         }
     }
 }
@@ -115,7 +110,7 @@ fn register_nameserv() {
 // ======================================================================
 
 fn server_loop() -> ! {
-    puts(b"[saltyfs] Entering server loop\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[saltyfs] Entering server loop\n"); });
 
     let ctx = ipc_ctx();
     let mut msg = BesaltMsg::zeroed();
@@ -179,21 +174,21 @@ fn server_loop() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    puts(b"[saltyfs] SaltyFS Server starting\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[saltyfs] SaltyFS Server starting\n"); });
 
     // Set up SHM from blkdrv
     if !block::setup_blk_shm() {
-        puts(b"[saltyfs] Failed to set up blkdrv SHM -- cannot operate\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] Failed to set up blkdrv SHM -- cannot operate\n"); });
     }
 
     // Set up block cache
     if !block::setup_cache() {
-        puts(b"[saltyfs] Failed to set up block cache\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] Failed to set up block cache\n"); });
     }
 
     // Auto-mount on startup
     if !block::read_superblock() {
-        puts(b"[saltyfs] No SaltyFS partition found -- running without mount\n");
+        besalt::uwarn!(|_lb| { _lb.str(b"[saltyfs] No SaltyFS partition found -- running without mount\n"); });
     } else {
         unsafe { *(&raw mut MOUNTED) = true; }
         alloc::init_bitmap();
@@ -202,15 +197,13 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         let actual_used = alloc::count_used_blocks();
         let sb_used = unsafe { (*(&raw const SB)).used_blocks };
         if actual_used != sb_used {
-            {
-                let mut lb = besalt::serial::LineBuf::new();
-                lb.str(b"[saltyfs] WARN: bitmap mismatch: sb.used_blocks=");
-                lb.dec(sb_used);
-                lb.str(b" actual=");
-                lb.dec(actual_used);
-                lb.str(b" (correcting)\n");
-                lb.flush();
-            }
+            besalt::uwarn!(|_lb| {
+                _lb.str(b"[saltyfs] WARN: bitmap mismatch: sb.used_blocks=");
+                _lb.dec(sb_used);
+                _lb.str(b" actual=");
+                _lb.dec(actual_used);
+                _lb.str(b" (correcting)\n");
+            });
             unsafe { (*(&raw mut SB)).used_blocks = actual_used; }
             block::write_superblock();
         }

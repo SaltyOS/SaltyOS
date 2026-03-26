@@ -38,8 +38,6 @@ mod virtio_modern;
 use besalt::consts::*;
 use besalt::invoke;
 use besalt::ipc;
-use besalt::serial;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 // ---------------------------------------------------------------------------
@@ -80,10 +78,6 @@ static mut NETSRV_RX_NTFN: u64 = 0;
 // Utility functions
 // ---------------------------------------------------------------------------
 
-pub(crate) fn puts(s: &[u8]) {
-    serial::serial_puts(s);
-}
-
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
     &raw mut besalt::__besalt_ipc_ctx
 }
@@ -120,7 +114,9 @@ fn register_nameserv() {
         let mut reply = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const msg, &raw mut reply);
         if err != 0 || reply.label != BESALT_OK {
-            puts(b"[netdrv] nameserv registration failed\n");
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[netdrv] nameserv registration failed\n");
+            });
         }
     }
 }
@@ -139,7 +135,9 @@ fn register_nameserv() {
 /// 3. Bind notification to our TCB for Recv wakeup
 fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
     if !has_irq_handler {
-        puts(b"[netdrv] No IRQ handler cap from pcisrv, skipping IRQ setup\n");
+        besalt::uwarn!(|_lb| {
+            _lb.str(b"[netdrv] No IRQ handler cap from pcisrv, skipping IRQ setup\n");
+        });
         return false;
     }
 
@@ -164,37 +162,37 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
         )
     };
     if err != 0 || alloc_reply.label != BESALT_OK {
-        let mut lb = LineBuf::new();
-        lb.str(b"[netdrv] Failed to allocate Notification via mmsrv: ");
-        lb.dec(if err != 0 {
-            err as u64
-        } else {
-            alloc_reply.label
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[netdrv] Failed to allocate Notification via mmsrv: ");
+            _lb.dec(if err != 0 {
+                err as u64
+            } else {
+                alloc_reply.label
+            });
+            _lb.putc(b'\n');
         });
-        lb.putc(b'\n');
-        lb.flush();
         return false;
     }
 
     // Step 2: Bind IRQ handler to notification
     let err = invoke::irq_handler_set_notification(CAP_IRQ_HANDLER, CAP_IRQ_NOTIFICATION);
     if err != 0 {
-        let mut lb = LineBuf::new();
-        lb.str(b"[netdrv] Failed to bind IRQ to notification: ");
-        lb.dec(err as u64);
-        lb.putc(b'\n');
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[netdrv] Failed to bind IRQ to notification: ");
+            _lb.dec(err as u64);
+            _lb.putc(b'\n');
+        });
         return false;
     }
 
     // Step 3: Bind notification to our TCB for Recv wakeup
     let err = invoke::tcb_bind_notification(CAP_SELF_TCB, CAP_IRQ_NOTIFICATION);
     if err != 0 {
-        let mut lb = LineBuf::new();
-        lb.str(b"[netdrv] Failed to bind notification to TCB: ");
-        lb.dec(err as u64);
-        lb.putc(b'\n');
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[netdrv] Failed to bind notification to TCB: ");
+            _lb.dec(err as u64);
+            _lb.putc(b'\n');
+        });
         return false;
     }
 
@@ -207,13 +205,11 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
         *(&raw mut IRQ_BADGE_BITS) = 1u64 << ((irq_line as u64) & 63);
     }
 
-    {
-        let mut lb = LineBuf::new();
-        lb.str(b"[netdrv] IRQ ");
-        lb.dec(irq_line as u64);
-        lb.str(b" handler configured\n");
-        lb.flush();
-    }
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[netdrv] IRQ ");
+        _lb.dec(irq_line as u64);
+        _lb.str(b" handler configured\n");
+    });
     true
 }
 
@@ -428,7 +424,9 @@ fn handle_driver_register(msg: &BesaltMsg, reply: &mut BesaltMsg) {
     // SAFETY: IPC context is valid; making RPC to mmsrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const map_msg, &raw mut map_reply) };
     if err != 0 || map_reply.label != BESALT_OK {
-        puts(b"[netdrv] Failed to map SHM\n");
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[netdrv] Failed to map SHM\n");
+        });
         reply.label = BESALT_INVALID_OPERATION;
         return;
     }
@@ -458,13 +456,13 @@ fn handle_driver_register(msg: &BesaltMsg, reply: &mut BesaltMsg) {
     reply.regs[2] = 1; // link status: up
     reply.length = 3;
 
-    let mut lb = LineBuf::new();
-    lb.str(b"[netdrv] DRIVER_REGISTER complete, SHM mapped rx_ntfn_cap=");
-    lb.dec(CAP_NETSRV_RX_NTFN);
-    lb.str(b" tx_ntfn_cap=");
-    lb.dec(CAP_IRQ_NOTIFICATION);
-    lb.putc(b'\n');
-    lb.flush();
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[netdrv] DRIVER_REGISTER complete, SHM mapped rx_ntfn_cap=");
+        _lb.dec(CAP_NETSRV_RX_NTFN);
+        _lb.str(b" tx_ntfn_cap=");
+        _lb.dec(CAP_IRQ_NOTIFICATION);
+        _lb.putc(b'\n');
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -479,16 +477,22 @@ fn handle_driver_register(msg: &BesaltMsg, reply: &mut BesaltMsg) {
 /// - On IPC request (badge == 0): dispatch DRIVER_REGISTER, fill reply,
 ///   then reply_recv (atomically reply and wait for next event).
 fn event_loop(device_ok: bool) -> ! {
-    puts(b"[netdrv] Entering event loop\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[netdrv] Entering event loop\n");
+    });
 
     // SAFETY: IRQ_ENABLED is set during init before event loop starts.
     let irq_enabled = unsafe { *(&raw const IRQ_ENABLED) };
     let use_timed_poll = device_ok;
 
     if device_ok && !irq_enabled {
-        puts(b"[netdrv] No IRQ, using timed-recv polling\n");
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[netdrv] No IRQ, using timed-recv polling\n");
+        });
     } else if !device_ok {
-        puts(b"[netdrv] No device, serving IPC only\n");
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[netdrv] No device, serving IPC only\n");
+        });
     }
 
     let ctx = ipc_ctx();
@@ -568,7 +572,9 @@ fn event_loop(device_ok: bool) -> ! {
                 }
             } else {
                 if use_timed_poll && reply_has_caps {
-                    puts(b"[netdrv] reply carries caps, using reply_recv path\n");
+                    besalt::udebug!(|_lb| {
+                        _lb.str(b"[netdrv] reply carries caps, using reply_recv path\n");
+                    });
                 }
                 msg = BesaltMsg::zeroed();
                 badge = 0;
@@ -594,7 +600,9 @@ fn event_loop(device_ok: bool) -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    puts(b"[netdrv] virtio-net Hardware Driver starting\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[netdrv] virtio-net Hardware Driver starting\n");
+    });
 
     // Discover and initialize virtio-net device
     let mut irq_line: u8 = 0;
@@ -603,7 +611,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // Try modern virtio (device ID 0x1041) first
     if let Some((bus, dev, func)) = virtio_modern::find_virtio_net_modern() {
-        puts(b"[netdrv] Found modern virtio-net device\n");
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[netdrv] Found modern virtio-net device\n");
+        });
         if virtio_modern::init_virtio_modern(bus, dev, func) {
             // USING_MODERN_TRANSPORT already set inside init_virtio_modern
             device_ok = true;
@@ -622,29 +632,25 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     if !device_ok {
         match virtio::find_virtio_net() {
             Some((bus, dev, func, bar0, _bar0_full)) => {
-                {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[netdrv] Found virtio-net at ");
-                    lb.dec(bus as u64);
-                    lb.putc(b':');
-                    lb.dec(dev as u64);
-                    lb.str(b" BAR0=");
-                    lb.hex(bar0 as u64);
-                    lb.putc(b'\n');
-                    lb.flush();
-                }
+                besalt::uinfo!(|_lb| {
+                    _lb.str(b"[netdrv] Found virtio-net at ");
+                    _lb.dec(bus as u64);
+                    _lb.putc(b':');
+                    _lb.dec(dev as u64);
+                    _lb.str(b" BAR0=");
+                    _lb.hex(bar0 as u64);
+                    _lb.putc(b'\n');
+                });
 
                 match virtio::get_device_caps(bus, dev, func) {
                     Some((_bar_phys, _bar_bits, bar_size, irq, _bar_is_io, has_irq)) => {
                         irq_line = irq;
                         has_irq_handler = has_irq;
-                        {
-                            let mut lb = LineBuf::new();
-                            lb.str(b"[netdrv] IRQ=");
-                            lb.dec(irq as u64);
-                            lb.putc(b'\n');
-                            lb.flush();
-                        }
+                        besalt::uinfo!(|_lb| {
+                            _lb.str(b"[netdrv] IRQ=");
+                            _lb.dec(irq as u64);
+                            _lb.putc(b'\n');
+                        });
 
                         // Transitional device (0x1000): try modern transport
                         // first. Handles QEMU's disable-legacy=on where the
@@ -655,16 +661,22 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                         } else if virtio::init_virtio(bar0, bar_size) {
                             device_ok = true;
                         } else {
-                            puts(b"[netdrv] Failed to init virtio transport\n");
+                            besalt::uerror!(|_lb| {
+                                _lb.str(b"[netdrv] Failed to init virtio transport\n");
+                            });
                         }
                     }
                     None => {
-                        puts(b"[netdrv] Failed to get PCI caps from pcisrv\n");
+                        besalt::uerror!(|_lb| {
+                            _lb.str(b"[netdrv] Failed to get PCI caps from pcisrv\n");
+                        });
                     }
                 }
             }
             None => {
-                puts(b"[netdrv] No virtio-net device found\n");
+                besalt::uwarn!(|_lb| {
+                    _lb.str(b"[netdrv] No virtio-net device found\n");
+                });
             }
         }
     }
@@ -672,14 +684,20 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     // Set up IRQ handling
     if device_ok && irq_line > 0 {
         if setup_irq(irq_line, has_irq_handler) {
-            puts(b"[netdrv] IRQ handling enabled\n");
+            besalt::uinfo!(|_lb| {
+                _lb.str(b"[netdrv] IRQ handling enabled\n");
+            });
         } else {
-            puts(b"[netdrv] IRQ setup failed, using polling mode\n");
+            besalt::uwarn!(|_lb| {
+                _lb.str(b"[netdrv] IRQ setup failed, using polling mode\n");
+            });
         }
     }
 
     if device_ok {
-        puts(b"[netdrv] virtio-net device ready\n");
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[netdrv] virtio-net device ready\n");
+        });
     }
 
     // Register with nameserv and signal readiness

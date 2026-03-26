@@ -2,11 +2,10 @@
 //! Block I/O request handlers and dispatch logic.
 
 use besalt::consts::*;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 use crate::virtio::*;
-use crate::{puts, CAPACITY_SECTORS, VIRTIO_INITIALIZED, USING_MODERN_TRANSPORT, VQUEUE_BASE};
+use crate::{CAPACITY_SECTORS, VIRTIO_INITIALIZED, USING_MODERN_TRANSPORT, VQUEUE_BASE};
 use crate::{QUEUE_SIZE, AVAIL_IDX, LAST_USED_IDX, QUEUE_AVAIL_OFF, QUEUE_USED_OFF};
 use crate::{SHM_VADDR, SHM_SIZE, SECTOR_SIZE, BLK_SHM_ID};
 
@@ -154,7 +153,7 @@ pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
             }
             spin_count += 1;
             if spin_count > 100_000_000 {
-                puts(b"[blkdrv] virtio read timeout\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] virtio read timeout\n"); });
                 let _ = read_isr();
                 reply.label = BESALT_BUSY;
                 return reply;
@@ -172,11 +171,11 @@ pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
         // Check status
         let status = *(&raw const REQ_STATUS);
         if status != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[blkdrv] read error status=");
-            lb.dec(status as u64);
-            lb.putc(b'\n');
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[blkdrv] read error status=");
+                _lb.dec(status as u64);
+                _lb.putc(b'\n');
+            });
             reply.label = BESALT_INVALID_OPERATION;
             return reply;
         }
@@ -300,7 +299,7 @@ pub(crate) fn handle_write(msg: &BesaltMsg) -> BesaltMsg {
             }
             spin_count += 1;
             if spin_count > 100_000_000 {
-                puts(b"[blkdrv] virtio write timeout\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] virtio write timeout\n"); });
                 let _ = read_isr();
                 reply.label = BESALT_BUSY;
                 return reply;
@@ -316,11 +315,11 @@ pub(crate) fn handle_write(msg: &BesaltMsg) -> BesaltMsg {
         // Check status
         let status = *(&raw const REQ_STATUS);
         if status != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[blkdrv] write error status=");
-            lb.dec(status as u64);
-            lb.putc(b'\n');
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[blkdrv] write error status=");
+                _lb.dec(status as u64);
+                _lb.putc(b'\n');
+            });
             reply.label = BESALT_INVALID_OPERATION;
             return reply;
         }

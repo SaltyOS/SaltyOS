@@ -4,13 +4,19 @@
 netsrv_link = meson.current_source_dir() / 'arch' / arch / 'link.ld'
 libbesalt_build_dir = meson.project_build_root() / 'lib/besalt/lib'
 
+# Per-program debug override
+_prog_rust_args = rust_userland_args
+if 'netsrv' in userland_debug_list
+  _prog_rust_args = _prog_rust_args + ['--cfg', 'ulog_debug']
+endif
+
 # Step 1: Rust -> .o
 netsrv_obj = custom_target('netsrv_obj',
   input: files('src/main.rs'),
   output: 'netsrv.o',
   depfile: 'netsrv.d',
   command: [rustc,
-    rust_userland_args,
+    _prog_rust_args,
     '--emit=obj=@OUTPUT@,dep-info=@DEPFILE@',
     '--crate-name=netsrv',
     '--crate-type=lib',

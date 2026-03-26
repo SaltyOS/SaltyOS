@@ -3,7 +3,6 @@ use crate::client::{find_client_by_badge, client_add_region, find_region_by_addr
 use besalt::consts::*;
 use besalt::invoke;
 use besalt::ipc;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 /// MM_BRK: client sets program break via MemoryObject.
@@ -625,14 +624,10 @@ pub(crate) unsafe fn handle_mm_unmap_window(msg: *const BesaltMsg, _caller_badge
 /// Copies parent's heap_base, heap_current, and mmap_next to the child
 /// client entry (which must already exist via MM_REGISTER).
 ///
-/// MO-backed regions use MO clone for COW — the kernel handles COW
-/// resolution internally via the MemoryObject hidden node.
-///
-/// Non-MO regions (e.g. REGION_SHARED_RO for shared library RO pages)
-/// are shared via `vspace_share_ro_page`, which copies only read-only
-/// PTEs from parent to child. Writable pages within the region span
-/// (e.g. shared lib .data mapped by MO) are silently skipped — the
-/// source VSpace is never modified.
+/// MO-backed writable/private regions use MO clone for COW.
+/// Shared library RO regions (`REGION_SHARED_RO`) must stay attached to the
+/// original shared MO and be mapped read-only into the child; sending them
+/// through the COW clone path risks mutating global shared-lib cache state.
 pub(crate) unsafe fn handle_mm_fork_regions(msg: *const BesaltMsg, _caller_badge: u64, reply: *mut BesaltMsg) {
     unsafe {
         let parent_badge = (*msg).regs[0];
@@ -702,7 +697,9 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const BesaltMsg, _caller_badge
                         }
 
                         if found_child_mo != 0 {
-                            // Already cloned — cnode_copy to a new slot
+                            // Already cloned/copied for another region —
+                            // cnode_copy to a new slot so region cleanup can
+                            // drop references independently.
                             let copy_slot = match super::recycled_slot_alloc() {
                                 Some(s) => s,
                                 None => {
@@ -726,7 +723,7 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const BesaltMsg, _caller_badge
                             }
                             cr.mo_cap = copy_slot;
                         } else {
-                            // First time seeing this MO — clone it
+                            // First time seeing this MO.
                             let child_mo_slot = match super::recycled_slot_alloc() {
                                 Some(s) => s,
                                 None => {
@@ -735,7 +732,17 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const BesaltMsg, _caller_badge
                                     continue;
                                 }
                             };
-                            let err = invoke::mo_clone(parent_mo, child_mo_slot, 0);
+                            let err = if cr.region_type == crate::types::REGION_SHARED_RO {
+                                invoke::cnode_copy(
+                                    super::CAP_SELF_CSPACE,
+                                    parent_mo,
+                                    super::CAP_SELF_CSPACE,
+                                    child_mo_slot,
+                                    besalt::consts::CAP_RIGHTS_ALL,
+                                )
+                            } else {
+                                invoke::mo_clone(parent_mo, child_mo_slot, 0)
+                            };
                             if err != 0 {
                                 super::recycled_cnode_delete(child_mo_slot);
                                 mo_clone_failed = true;
@@ -752,31 +759,41 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const BesaltMsg, _caller_badge
                         }
                     }
 
-                    // Map the cloned MO's pages into the child's VSpace.
-                    // Fork pages from parent to child using kernel
-                    // VSPACE_FORK_RANGE. This reads actual parent PTEs
-                    // (preserving EXECUTABLE etc.), write-protects writable
-                    // parent pages with COW, and copies PTEs to child.
+                    // Map the region into the child's VSpace.
+                    // Shared RO regions reuse the original MO directly and
+                    // must not enter the COW fork path.
                     if cr.mo_cap != 0 && cr.active && cr.length > 0 {
-                        let parent_vs = (*parent).vspace_cap;
                         let child_vs = (*child).vspace_cap;
                         let page_count = cr.length / 4096;
-                        let (_err, _forked) = invoke::vspace_fork_range(
-                            parent_vs,
-                            child_vs,
-                            cr.mo_cap,
-                            cr.base,
-                            page_count,
-                            cr.mo_offset as u64,
-                        );
+                        if cr.region_type == crate::types::REGION_SHARED_RO {
+                            let count_and_flags = (page_count << 32)
+                                | super::prot_to_vspace_flags(cr.prot);
+                            let _ = invoke::vspace_map_mo(
+                                child_vs,
+                                cr.mo_cap,
+                                cr.base,
+                                cr.mo_offset as u64,
+                                count_and_flags,
+                            );
+                        } else {
+                            let parent_vs = (*parent).vspace_cap;
+                            let (_err, _forked) = invoke::vspace_fork_range(
+                                parent_vs,
+                                child_vs,
+                                cr.mo_cap,
+                                cr.base,
+                                page_count,
+                                cr.mo_offset as u64,
+                            );
+                        }
                     }
 
                     *child_regions.add(ri) = cr;
                 }
                 if mo_clone_failed {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[MMSRV] fork: mo_clone failed for some regions\n");
-                    lb.flush();
+                    besalt::uerror!(|_lb| {
+                        _lb.str(b"[MMSRV] fork: mo_clone failed for some regions\n");
+                    });
                 }
                 (*child).regions = child_regions;
                 (*child).region_count = parent_rc;
@@ -791,19 +808,17 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const BesaltMsg, _caller_badge
         crate::pool::init_pool(child);
         crate::pool::init_pool(parent);
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[MMSRV] fork-regions parent=");
-            lb.hex(parent_badge);
-            lb.str(b" child=");
-            lb.hex(child_badge);
-            lb.str(b" heap=");
-            lb.hex((*parent).heap_current);
-            lb.str(b" mmap=");
-            lb.hex((*parent).mmap_next);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[MMSRV] fork-regions parent=");
+            _lb.hex(parent_badge);
+            _lb.str(b" child=");
+            _lb.hex(child_badge);
+            _lb.str(b" heap=");
+            _lb.hex((*parent).heap_current);
+            _lb.str(b" mmap=");
+            _lb.hex((*parent).mmap_next);
+            _lb.str(b"\n");
+        });
 
         (*reply).label = BESALT_OK;
     }
@@ -1003,6 +1018,7 @@ pub(crate) unsafe fn handle_mm_map_batch(msg: *const BesaltMsg, _caller_badge: u
 ///   MR2 = page count
 ///   MR3 = has_mo (1 if MO cap is transferred via extra cap)
 ///   MR4 = mo_offset (page offset within MO for this segment)
+///   MR5 = VSpace flags for this segment
 pub(crate) unsafe fn handle_mm_register_shared_region(
     msg: *const BesaltMsg,
     _caller_badge: u64,
@@ -1014,6 +1030,7 @@ pub(crate) unsafe fn handle_mm_register_shared_region(
         let page_count = (*msg).regs[2] as usize;
         let has_mo = (*msg).regs[3] != 0;
         let mo_offset = (*msg).regs[4] as u32;
+        let flags = (*msg).regs[5];
 
         let client = find_client_by_badge(target_badge);
         if client.is_null() {
@@ -1047,7 +1064,7 @@ pub(crate) unsafe fn handle_mm_register_shared_region(
 
         (*region).base = base;
         (*region).length = page_count as u64 * 4096;
-        (*region).prot = (besalt::consts::PROT_READ | besalt::consts::PROT_EXEC) as u8;
+        (*region).prot = super::vspace_flags_to_prot(flags);
         (*region).region_type = crate::types::REGION_SHARED_RO;
         (*region).active = true;
         (*region).mo_cap = mo_cap;

@@ -3,13 +3,19 @@
 
 init_link = meson.current_source_dir() / 'arch' / arch / 'link.ld'
 
+# Per-program debug override
+_prog_rust_args = rust_userland_args
+if 'init' in userland_debug_list
+  _prog_rust_args = _prog_rust_args + ['--cfg', 'ulog_debug']
+endif
+
 # Step 1: Rust -> .o
 init_obj = custom_target('init_obj',
   input: files('src/main.rs'),
   output: 'init.o',
   depfile: 'init.d',
   command: [rustc,
-    rust_userland_args,
+    _prog_rust_args,
     '--emit=obj=@OUTPUT@,dep-info=@DEPFILE@',
     '--crate-name=init',
     '--crate-type=lib',

@@ -4,13 +4,19 @@
 procmgr_link = meson.current_source_dir() / 'arch' / arch / 'link.ld'
 libbesalt_build_dir = meson.project_build_root() / 'lib/besalt/lib'
 
+# Per-program debug override
+_prog_rust_args = rust_userland_args
+if 'procmgr' in userland_debug_list
+  _prog_rust_args = _prog_rust_args + ['--cfg', 'ulog_debug']
+endif
+
 # Step 1: Rust -> .o
 procmgr_obj = custom_target('procmgr_obj',
   input: files('src/main.rs'),
   output: 'procmgr.o',
   depfile: 'procmgr.d',
   command: [rustc,
-    rust_userland_args,
+    _prog_rust_args,
     '--emit=obj=@OUTPUT@,dep-info=@DEPFILE@',
     '--crate-name=procmgr',
     '--crate-type=lib',

@@ -177,7 +177,9 @@ pub unsafe fn init_proctab() {
             0,
         );
         if ptr.is_null() || ptr == usize::MAX as *mut u8 {
-            besalt::serial::serial_puts(b"[PROCMGR] FATAL: proctab mmap failed\n");
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] FATAL: proctab mmap failed\n");
+            });
             return;
         }
         PROCTAB_PTR = ptr as *mut Process;
@@ -225,7 +227,9 @@ unsafe fn grow_proctab() -> bool {
             0,
         );
         if new_raw.is_null() || new_raw == usize::MAX as *mut u8 {
-            besalt::serial::serial_puts(b"[PROCMGR] proctab grow failed\n");
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] proctab grow failed\n");
+            });
             return false;
         }
 
@@ -250,13 +254,11 @@ unsafe fn grow_proctab() -> bool {
         PROCTAB_PTR = new_ptr;
         PROCTAB_CAP = new_cap;
 
-        {
-            let mut lb = besalt::serial::LineBuf::new();
-            lb.str(b"[PROCMGR] proctab grown to ");
-            lb.hex(new_cap as u64);
-            lb.str(b" entries\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] proctab grown to ");
+            _lb.hex(new_cap as u64);
+            _lb.str(b" entries\n");
+        });
 
         true
     }

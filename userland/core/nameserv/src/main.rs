@@ -21,8 +21,6 @@ extern crate besalt;
 
 use besalt::consts::*;
 use besalt::ipc;
-use besalt::serial;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 const CAP_SELF_CSPACE: u64 = 2;
@@ -54,10 +52,6 @@ impl ServiceEntry {
 
 static mut SERVICES: [ServiceEntry; MAX_SERVICES] = [ServiceEntry::zeroed(); MAX_SERVICES];
 static mut SERVICE_COUNT: usize = 0;
-
-fn puts(s: &[u8]) {
-    serial::serial_puts(s);
-}
 
 fn ipc_ctx() -> *mut IpcContext {
     &raw mut besalt::__besalt_ipc_ctx
@@ -99,7 +93,9 @@ unsafe fn handle_register(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
         let name_len = extract_name(msg, &mut name);
 
         if name_len == 0 {
-            puts(b"[NAMESERV] REGISTER: empty name\n");
+            besalt::uwarn!(|_lb| {
+                _lb.str(b"[NAMESERV] REGISTER: empty name\n");
+            });
             (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
         }
@@ -109,18 +105,20 @@ unsafe fn handle_register(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
             if SERVICES[i].active != 0
                 && name_equal(&SERVICES[i].name, SERVICES[i].name_len, &name, name_len)
             {
-                let mut lb = LineBuf::new();
-                lb.str(b"[NAMESERV] REGISTER: duplicate name '");
-                lb.bytes(&name[..name_len as usize]);
-                lb.str(b"'\n");
-                lb.flush();
+                besalt::uwarn!(|_lb| {
+                    _lb.str(b"[NAMESERV] REGISTER: duplicate name '");
+                    _lb.bytes(&name[..name_len as usize]);
+                    _lb.str(b"'\n");
+                });
                 (*reply).label = BESALT_ALREADY_EXISTS;
                 return;
             }
         }
 
         if SERVICE_COUNT >= MAX_SERVICES {
-            puts(b"[NAMESERV] REGISTER: table full\n");
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[NAMESERV] REGISTER: table full\n");
+            });
             (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
@@ -136,13 +134,13 @@ unsafe fn handle_register(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
         entry.active = 1;
         SERVICE_COUNT += 1;
 
-        let mut lb = LineBuf::new();
-        lb.str(b"[NAMESERV] registered '");
-        lb.bytes(&name[..name_len as usize]);
-        lb.str(b"' at slot ");
-        lb.hex(ep_slot);
-        lb.str(b"\n");
-        lb.flush();
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[NAMESERV] registered '");
+            _lb.bytes(&name[..name_len as usize]);
+            _lb.str(b"' at slot ");
+            _lb.hex(ep_slot);
+            _lb.str(b"\n");
+        });
 
         (*reply).label = BESALT_OK;
     }
@@ -169,18 +167,20 @@ unsafe fn handle_lookup(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
             }
         }
 
-        let mut lb = LineBuf::new();
-        lb.str(b"[NAMESERV] LOOKUP: not found '");
-        lb.bytes(&name[..name_len as usize]);
-        lb.str(b"'\n");
-        lb.flush();
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[NAMESERV] LOOKUP: not found '");
+            _lb.bytes(&name[..name_len as usize]);
+            _lb.str(b"'\n");
+        });
         (*reply).label = BESALT_NOT_FOUND;
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    puts(b"[NAMESERV] SaltyOS name server starting\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[NAMESERV] SaltyOS name server starting\n");
+    });
 
     // Set up receive slot for cap transfers
     unsafe {
@@ -194,7 +194,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
     if err != 0 {
-        puts(b"[NAMESERV] initial recv failed\n");
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[NAMESERV] initial recv failed\n");
+        });
         idle();
     }
 
@@ -207,11 +209,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 POSIX_NS_REGISTER => handle_register(&raw const msg, &raw mut reply),
                 POSIX_NS_LOOKUP => handle_lookup(&raw const msg, &raw mut reply),
                 _ => {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[NAMESERV] unknown label=");
-                    lb.hex(msg.label);
-                    lb.str(b"\n");
-                    lb.flush();
+                    besalt::uerror!(|_lb| {
+                        _lb.str(b"[NAMESERV] unknown label=");
+                        _lb.hex(msg.label);
+                        _lb.str(b"\n");
+                    });
                     reply.label = BESALT_INVALID_OPERATION;
                 }
             }
@@ -237,11 +239,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             )
         };
         if err != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[NAMESERV] reply_recv failed err=");
-            lb.hex(err as u64);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[NAMESERV] reply_recv failed err=");
+                _lb.hex(err as u64);
+                _lb.str(b"\n");
+            });
             break;
         }
     }

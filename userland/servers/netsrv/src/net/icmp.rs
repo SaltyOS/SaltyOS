@@ -3,7 +3,6 @@
 //!
 //! Handles ICMP echo request/reply (ping).
 
-use crate::puts;
 use super::{checksum, ipv4};
 
 const ICMP_TYPE_ECHO_REPLY: u8 = 0;
@@ -43,15 +42,17 @@ pub(crate) fn handle(
     let _code = data[1];
 
     if icmp_type == ICMP_TYPE_ECHO_REQUEST {
-        puts(b"[netsrv] ICMP echo request received, sending reply\n");
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[netsrv] ICMP echo request received, sending reply\n");
+        });
         send_echo_reply(our_mac, our_ip, ip_hdr.src, data);
     } else if icmp_type == ICMP_TYPE_ECHO_REPLY {
         let seq = ((data[6] as u16) << 8) | (data[7] as u16);
-        let mut lb = besalt::serial::LineBuf::new();
-        lb.str(b"[netsrv] ICMP echo reply received seq=");
-        lb.dec(seq as u64);
-        lb.putc(b'\n');
-        lb.flush();
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[netsrv] ICMP echo reply received seq=");
+            _lb.dec(seq as u64);
+            _lb.putc(b'\n');
+        });
         // SAFETY: Single-threaded server; set flag for self-test early break.
         unsafe { *(&raw mut ECHO_REPLY_RECEIVED) = true; }
     }

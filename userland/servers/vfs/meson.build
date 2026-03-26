@@ -4,13 +4,19 @@
 vfs_link = meson.current_source_dir() / 'arch' / arch / 'link.ld'
 libbesalt_build_dir = meson.project_build_root() / 'lib/besalt/lib'
 
+# Per-program debug override
+_prog_rust_args = rust_userland_args
+if 'vfs' in userland_debug_list
+  _prog_rust_args = _prog_rust_args + ['--cfg', 'ulog_debug']
+endif
+
 # Step 1: Rust -> .o
 vfs_obj = custom_target('vfs_obj',
   input: files('src/main.rs'),
   output: 'vfs.o',
   depfile: 'vfs.d',
   command: [rustc,
-    rust_userland_args,
+    _prog_rust_args,
     '--emit=obj=@OUTPUT@,dep-info=@DEPFILE@',
     '--crate-name=vfs',
     '--crate-type=lib',

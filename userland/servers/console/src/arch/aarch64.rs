@@ -3,8 +3,6 @@
 
 use besalt::consts::*;
 use besalt::invoke;
-use besalt::serial;
-use besalt::serial::LineBuf;
 
 // Cap layout (set up by init for the console server)
 const CAP_SELF_TCB: u64 = 0;
@@ -66,11 +64,11 @@ pub fn serial_init() {
     let flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER | VSPACE_FLAG_CACHE_DISABLE;
     let err = invoke::vspace_map_device(CAP_SELF_VSPACE, CAP_UART_DEVUT, 0, UART_MMIO_VADDR, flags);
     if err != 0 {
-        let mut lb = LineBuf::new();
-        lb.str(b"[CONSOLE] FAIL: PL011 device map failed err=");
-        lb.hex(err as u64);
-        lb.str(b"\n");
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[CONSOLE] FAIL: PL011 device map failed err=");
+            _lb.hex(err as u64);
+            _lb.str(b"\n");
+        });
         unsafe {
             *&raw mut UART_READY = false;
             *&raw mut UART_BASE = core::ptr::null_mut();
@@ -85,7 +83,9 @@ pub fn serial_init() {
         *&raw mut UART_READY = true;
     }
 
-    serial::serial_puts(b"[CONSOLE] PL011 UART mapped\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[CONSOLE] PL011 UART mapped\n");
+    });
 }
 
 /// Set up UART IRQ notification and enable PL011 RX interrupt.
@@ -93,7 +93,9 @@ pub fn irq_setup() {
     // If MMIO mapping is unavailable, keep the service alive in output-only mode.
     unsafe {
         if !*(&raw const UART_READY) {
-            serial::serial_puts(b"[CONSOLE] UART input disabled\n");
+            besalt::uwarn!(|_lb| {
+                _lb.str(b"[CONSOLE] UART input disabled\n");
+            });
             return;
         }
     }

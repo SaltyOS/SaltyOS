@@ -3,13 +3,12 @@
 
 use besalt::consts::*;
 use besalt::ipc;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 use crate::consts::*;
 use crate::crc::crc32c_superblock;
 use crate::types::*;
-use crate::{ipc_ctx, puts, SB, BLOCK_SIZE, BLK_SHM_ID, CACHE_BLOCK_NR, CACHE_AGE, CACHE_TICK, CACHE_DIRTY, NEXT_INO};
+use crate::{ipc_ctx, SB, BLOCK_SIZE, BLK_SHM_ID, CACHE_BLOCK_NR, CACHE_AGE, CACHE_TICK, CACHE_DIRTY, NEXT_INO};
 use crate::btree::btree_search;
 
 /// Filesystem block number 0 is read from this disk LBA offset.
@@ -668,7 +667,7 @@ pub(crate) fn setup_blk_shm() -> bool {
     let mut reply = BesaltMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_BLKDRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
-        puts(b"[saltyfs] Failed to get SHM ID from blkdrv\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] Failed to get SHM ID from blkdrv\n"); });
         return false;
     }
 
@@ -686,15 +685,15 @@ pub(crate) fn setup_blk_shm() -> bool {
     let mut reply = BesaltMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
-        let mut lb = LineBuf::new();
-        lb.str(b"[saltyfs] SHM map failed: ");
-        lb.dec(if err != 0 { err as u64 } else { reply.label });
-        lb.putc(b'\n');
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[saltyfs] SHM map failed: ");
+            _lb.dec(if err != 0 { err as u64 } else { reply.label });
+            _lb.putc(b'\n');
+        });
         return false;
     }
 
-    puts(b"[saltyfs] SHM mapped from blkdrv\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[saltyfs] SHM mapped from blkdrv\n"); });
     true
 }
 
@@ -712,7 +711,7 @@ pub(crate) fn setup_cache() -> bool {
     let mut reply = BesaltMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || (reply.label != 0 && reply.label != BESALT_ALREADY_EXISTS) {
-        puts(b"[saltyfs] Cache SHM create failed\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] Cache SHM create failed\n"); });
         return false;
     }
 
@@ -727,11 +726,11 @@ pub(crate) fn setup_cache() -> bool {
     let mut reply = BesaltMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
-        puts(b"[saltyfs] Cache SHM map failed\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] Cache SHM map failed\n"); });
         return false;
     }
 
-    puts(b"[saltyfs] Block cache allocated\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[saltyfs] Block cache allocated\n"); });
     true
 }
 
@@ -754,7 +753,7 @@ pub(crate) fn read_superblock() -> bool {
     } else if let Some((lba, sb)) = scan_mbr_for_saltyfs_partition() {
         (lba, sb)
     } else {
-        puts(b"[saltyfs] Failed to find SaltyFS superblock (raw/GPT/MBR)\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] Failed to find SaltyFS superblock (raw/GPT/MBR)\n"); });
         return false;
     };
 
@@ -763,23 +762,21 @@ pub(crate) fn read_superblock() -> bool {
         *(&raw mut SB) = probed_sb;
         *(&raw mut BLOCK_SIZE) = (*(&raw const SB)).block_size;
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[saltyfs] Mounted: part_lba=");
-            lb.dec(*(&raw const PARTITION_BASE_LBA));
-            lb.str(b" blocks=");
-            lb.dec((*(&raw const SB)).total_blocks);
-            lb.str(b" used=");
-            lb.dec((*(&raw const SB)).used_blocks);
-            lb.str(b" bs=");
-            lb.dec((*(&raw const SB)).block_size);
-            lb.str(b" root_tree=");
-            lb.dec((*(&raw const SB)).root_tree);
-            lb.str(b" root_ino=");
-            lb.dec((*(&raw const SB)).root_inode);
-            lb.putc(b'\n');
-            lb.flush();
-        }
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[saltyfs] Mounted: part_lba=");
+            _lb.dec(*(&raw const PARTITION_BASE_LBA));
+            _lb.str(b" blocks=");
+            _lb.dec((*(&raw const SB)).total_blocks);
+            _lb.str(b" used=");
+            _lb.dec((*(&raw const SB)).used_blocks);
+            _lb.str(b" bs=");
+            _lb.dec((*(&raw const SB)).block_size);
+            _lb.str(b" root_tree=");
+            _lb.dec((*(&raw const SB)).root_tree);
+            _lb.str(b" root_ino=");
+            _lb.dec((*(&raw const SB)).root_inode);
+            _lb.putc(b'\n');
+        });
     }
 
     true

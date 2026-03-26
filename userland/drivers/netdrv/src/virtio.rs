@@ -10,7 +10,7 @@ use besalt::invoke;
 use besalt::serial::LineBuf;
 use besalt::types::*;
 
-use crate::{ipc_ctx, puts};
+use crate::ipc_ctx;
 
 const CAP_SELF_VSPACE: u64 = 1;
 const CAP_SELF_CSPACE: u64 = 2;
@@ -241,11 +241,11 @@ fn bar_write32(offset: u64, val: u32) {
 pub(crate) fn vaddr_to_phys(vaddr: u64) -> u64 {
     let err = invoke::vspace_walk(CAP_SELF_VSPACE, vaddr, 1);
     if err != 0 {
-        let mut lb = LineBuf::new();
-        lb.str(b"[netdrv] vspace_walk failed: ");
-        lb.dec(err as u64);
-        lb.putc(b'\n');
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[netdrv] vspace_walk failed: ");
+            _lb.dec(err as u64);
+            _lb.putc(b'\n');
+        });
         return 0;
     }
     match invoke::vspace_walk_result_entry(0) {
@@ -322,7 +322,7 @@ pub(crate) fn init_virtio(bar0_raw: u32, bar_size: u32) -> bool {
     // SAFETY: Single-threaded init path.
     unsafe {
         if bar0_raw == 0 {
-            puts(b"[netdrv] Invalid BAR0 (0)\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Invalid BAR0 (0)\n"); });
             return false;
         }
         *(&raw mut BAR0_IS_IO) = (bar0_raw & 1) != 0;
@@ -330,17 +330,17 @@ pub(crate) fn init_virtio(bar0_raw: u32, bar_size: u32) -> bool {
         if *(&raw const BAR0_IS_IO) {
             let cap = *(&raw const PCI_IOPORT_CAP);
             if cap == 0 {
-                puts(b"[netdrv] BAR0 is I/O space -- no IoPort cap\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[netdrv] BAR0 is I/O space -- no IoPort cap\n"); });
                 return false;
             }
-            puts(b"[netdrv] BAR0 is I/O space -- using IoPort cap\n");
+            besalt::uinfo!(|_lb| { _lb.str(b"[netdrv] BAR0 is I/O space -- using IoPort cap\n"); });
             return virtio_negotiate();
         }
 
         // MMIO BAR: map device untyped into our VSpace
         let num_pages = ((bar_size as u64) + 4095) / 4096;
         if num_pages == 0 {
-            puts(b"[netdrv] Invalid MMIO BAR size\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Invalid MMIO BAR size\n"); });
             return false;
         }
         let (err, _mapped) = invoke::vspace_map_device_range(
@@ -352,11 +352,11 @@ pub(crate) fn init_virtio(bar0_raw: u32, bar_size: u32) -> bool {
             0x3, // RW
         );
         if err != 0 {
-            puts(b"[netdrv] MMIO BAR mapping failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[netdrv] MMIO BAR mapping failed\n"); });
             bar_write8(VIRTIO_DEVICE_STATUS, 0);
             return false;
         }
-        puts(b"[netdrv] BAR0 MMIO mapped\n");
+        besalt::uinfo!(|_lb| { _lb.str(b"[netdrv] BAR0 MMIO mapped\n"); });
         virtio_negotiate()
     }
 }
@@ -401,7 +401,7 @@ fn setup_queue(queue_idx: u16, hint_vaddr: u64) -> Option<(u64, u64, u64, u16)> 
     // Get physical address
     let vq_phys = vaddr_to_phys(vq_base);
     if vq_phys == 0 {
-        puts(b"[netdrv] Failed to get virtqueue phys addr\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to get virtqueue phys addr\n"); });
         return None;
     }
 
@@ -428,9 +428,9 @@ fn virtio_negotiate() -> bool {
     let flex_layout = (dev_features & VIRTIO_F_ANY_LAYOUT) != 0;
     if flex_layout {
         negotiated |= VIRTIO_F_ANY_LAYOUT;
-        puts(b"[netdrv] Negotiated VIRTIO_F_ANY_LAYOUT\n");
+        besalt::uinfo!(|_lb| { _lb.str(b"[netdrv] Negotiated VIRTIO_F_ANY_LAYOUT\n"); });
     } else {
-        puts(b"[netdrv] WARN: device did not offer VIRTIO_F_ANY_LAYOUT\n");
+        besalt::uwarn!(|_lb| { _lb.str(b"[netdrv] WARN: device did not offer VIRTIO_F_ANY_LAYOUT\n"); });
     }
     bar_write32(VIRTIO_GUEST_FEATURES, negotiated);
 
@@ -441,51 +441,47 @@ fn virtio_negotiate() -> bool {
         for i in 0..6 {
             mac[i] = bar_read8(VIRTIO_NET_MAC_OFFSET + i as u64);
         }
-        let mut lb = LineBuf::new();
-        lb.str(b"[netdrv] MAC: ");
-        for i in 0..6 {
-            if i > 0 {
-                lb.putc(b':');
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[netdrv] MAC: ");
+            for i in 0..6 {
+                if i > 0 {
+                    _lb.putc(b':');
+                }
+                format_hex_byte(&mut _lb, mac[i]);
             }
-            format_hex_byte(&mut lb, mac[i]);
-        }
-        lb.putc(b'\n');
-        lb.flush();
+            _lb.putc(b'\n');
+        });
     }
 
     // Set up RX queue (queue 0)
     let (rx_base, rx_avail, rx_used, rx_qsz) = match setup_queue(0, RX_VQUEUE_HINT) {
         Some(v) => v,
         None => {
-            puts(b"[netdrv] Failed to set up RX queue\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to set up RX queue\n"); });
             bar_write8(VIRTIO_DEVICE_STATUS, 0);
             return false;
         }
     };
-    {
-        let mut lb = LineBuf::new();
-        lb.str(b"[netdrv] RX queue size: ");
-        lb.dec(rx_qsz as u64);
-        lb.putc(b'\n');
-        lb.flush();
-    }
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[netdrv] RX queue size: ");
+        _lb.dec(rx_qsz as u64);
+        _lb.putc(b'\n');
+    });
 
     // Set up TX queue (queue 1)
     let (tx_base, tx_avail, tx_used, tx_qsz) = match setup_queue(1, TX_VQUEUE_HINT) {
         Some(v) => v,
         None => {
-            puts(b"[netdrv] Failed to set up TX queue\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to set up TX queue\n"); });
             bar_write8(VIRTIO_DEVICE_STATUS, 0);
             return false;
         }
     };
-    {
-        let mut lb = LineBuf::new();
-        lb.str(b"[netdrv] TX queue size: ");
-        lb.dec(tx_qsz as u64);
-        lb.putc(b'\n');
-        lb.flush();
-    }
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[netdrv] TX queue size: ");
+        _lb.dec(tx_qsz as u64);
+        _lb.putc(b'\n');
+    });
 
     // Store queue state
     // SAFETY: Single-threaded init path.
@@ -512,14 +508,14 @@ fn virtio_negotiate() -> bool {
     }
 
     if flex_layout {
-        puts(b"[netdrv] RX/TX using combined buffer layout\n");
+        besalt::uinfo!(|_lb| { _lb.str(b"[netdrv] RX/TX using combined buffer layout\n"); });
     } else {
-        puts(b"[netdrv] RX/TX using strict header+payload chain layout\n");
+        besalt::uinfo!(|_lb| { _lb.str(b"[netdrv] RX/TX using strict header+payload chain layout\n"); });
     }
 
     // Allocate DMA buffer pools
     if !alloc_dma_buffers() {
-        puts(b"[netdrv] Failed to allocate DMA buffers\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to allocate DMA buffers\n"); });
         bar_write8(VIRTIO_DEVICE_STATUS, 0);
         return false;
     }
@@ -535,7 +531,7 @@ fn virtio_negotiate() -> bool {
 
     // SAFETY: Single-threaded init.
     unsafe { *(&raw mut VIRTIO_INITIALIZED) = true; }
-    puts(b"[netdrv] virtio-net initialized OK\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[netdrv] virtio-net initialized OK\n"); });
     true
 }
 
@@ -549,14 +545,14 @@ pub(crate) fn alloc_dma_buffers() -> bool {
     let rx_base = match mmap_alloc(DMA_BUF_HINT, rx_pages) {
         Some(v) => v,
         None => {
-            puts(b"[netdrv] Failed to alloc RX DMA buffers\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to alloc RX DMA buffers\n"); });
             return false;
         }
     };
     let tx_base = match mmap_alloc(DMA_BUF_HINT + rx_pages * 4096, tx_pages) {
         Some(v) => v,
         None => {
-            puts(b"[netdrv] Failed to alloc TX DMA buffers\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to alloc TX DMA buffers\n"); });
             return false;
         }
     };
@@ -579,7 +575,7 @@ pub(crate) fn alloc_dma_buffers() -> bool {
             let vaddr = rx_base + (i * BUF_SIZE) as u64;
             rx_phys[i] = vaddr_to_phys(vaddr);
             if rx_phys[i] == 0 {
-                puts(b"[netdrv] Failed to get RX buf phys addr\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to get RX buf phys addr\n"); });
                 return false;
             }
         }
@@ -589,7 +585,7 @@ pub(crate) fn alloc_dma_buffers() -> bool {
             let vaddr = tx_base + (i * BUF_SIZE) as u64;
             tx_phys[i] = vaddr_to_phys(vaddr);
             if tx_phys[i] == 0 {
-                puts(b"[netdrv] Failed to get TX buf phys addr\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to get TX buf phys addr\n"); });
                 return false;
             }
         }

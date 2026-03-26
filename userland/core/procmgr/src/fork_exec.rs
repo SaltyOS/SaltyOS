@@ -3,7 +3,6 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use besalt::ipc;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 use crate::proc_table::{
@@ -24,7 +23,7 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         }
 
         let Some(parent_idx) = find_by_badge(badge) else {
-            super::puts(b"[PROCMGR] FORK from unknown badge\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK from unknown badge\n"); });
             reply.label = super::BESALT_NOT_FOUND;
             return;
         };
@@ -34,16 +33,14 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         let _parent_shared_base = proctab(parent_idx).shared_lib_base;
         let parent_lib_map = proctab(parent_idx).lib_map;
         let parent_layout = proctab(parent_idx).layout;
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] FORK from PID=");
-            lb.hex(parent_pid as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] FORK from PID=");
+            _lb.hex(parent_pid as u64);
+            _lb.str(b"\n");
+        });
 
         let Some(slot_idx) = alloc_proc() else {
-            super::puts(b"[PROCMGR] FORK: process table full\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: process table full\n"); });
             reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
         };
@@ -54,7 +51,7 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         // Reserve slots for fixed kernel objects (TCB, VSpace, CNode, SC, Notification) + margin.
         let total_slots = 8;
         if !alloc.reserve(total_slots) {
-            super::puts(b"[PROCMGR] FORK: slot reservation failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: slot reservation failed\n"); });
             reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
         }
@@ -65,7 +62,7 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                 match alloc.realize_via_mmsrv_next(super::CAP_MMSRV_EP, $ty, 0) {
                     Ok(s) => s,
                     Err(_) => {
-                        super::puts($what);
+                        besalt::uerror!(|_lb| { _lb.str($what); });
                         alloc.rollback();
                         reply.label = super::BESALT_OUT_OF_MEMORY;
                         return;
@@ -103,7 +100,7 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             child_pid as u64,
         );
         if err != 0 {
-            super::puts(b"[PROCMGR] FORK: mint mmsrv EP failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: mint mmsrv EP failed\n"); });
             alloc.rollback();
             reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
@@ -120,7 +117,7 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                     super::CAP_RIGHTS_ALL,
                 ) != 0
                 {
-                    super::puts($what);
+                    besalt::uerror!(|_lb| { _lb.str($what); });
                     alloc.rollback();
                     reply.label = super::BESALT_OUT_OF_MEMORY;
                     return;
@@ -151,7 +148,7 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             child_pid as u64,
         );
         if err != 0 {
-            super::puts(b"[PROCMGR] FORK: mint server EP failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: mint server EP failed\n"); });
             alloc.rollback();
             reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
@@ -164,7 +161,7 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             child_pid as u64,
         );
         if err != 0 {
-            super::puts(b"[PROCMGR] FORK: mint child VFS EP failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: mint child VFS EP failed\n"); });
             alloc.rollback();
             reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
@@ -210,7 +207,7 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         // Configure child TCB
         let err = besalt::invoke::tcb_set_space(child_tcb, child_cn, child_vs);
         if err != 0 {
-            super::puts(b"[PROCMGR] FORK: set_space failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: set_space failed\n"); });
             alloc.rollback();
             reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
@@ -242,7 +239,7 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
 
         let err = besalt::invoke::tcb_configure(child_tcb, child_entry, parent_rsp, 0);
         if err != 0 {
-            super::puts(b"[PROCMGR] FORK: configure failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: configure failed\n"); });
             alloc.rollback();
             reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
@@ -250,7 +247,7 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         // Copy parent's FPU/SSE state to child (preserves XMM registers across fork)
         let err = besalt::invoke::tcb_copy_fpu(child_tcb, proctab(parent_idx).tcb_cap);
         if err != 0 {
-            super::puts(b"[PROCMGR] FORK: copy FPU state failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: copy FPU state failed\n"); });
             alloc.rollback();
             reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
@@ -262,13 +259,13 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         if parent_tls_base != 0 {
             let err = besalt::invoke::tcb_set_tls_base(child_tcb, parent_tls_base);
             if err != 0 {
-                super::puts(b"[PROCMGR] FORK: set TLS base failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: set TLS base failed\n"); });
             }
         }
 
         let err = besalt::invoke::tcb_set_ipc_buffer(child_tcb, parent_layout.ipc_buf.base);
         if err != 0 {
-            super::puts(b"[PROCMGR] FORK: set IPC buf failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: set IPC buf failed\n"); });
             alloc.rollback();
             reply.label = super::BESALT_OUT_OF_MEMORY;
             return;
@@ -289,13 +286,13 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                 &raw mut clone_reply,
             );
             if err != 0 || clone_reply.label != super::BESALT_OK {
-                let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR] FORK: VFS clone_fds failed err=");
-                lb.hex(err as u64);
-                lb.str(b" reply=");
-                lb.hex(clone_reply.label);
-                lb.str(b", aborting fork\n");
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] FORK: VFS clone_fds failed err=");
+                    _lb.hex(err as u64);
+                    _lb.str(b" reply=");
+                    _lb.hex(clone_reply.label);
+                    _lb.str(b", aborting fork\n");
+                });
                 alloc.rollback();
                 reply.label = super::BESALT_INVALID_OPERATION;
                 return;
@@ -323,11 +320,11 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                 &raw mut mm_reply,
             );
             if err != 0 || mm_reply.label != super::BESALT_OK {
-                let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR] FORK: mmsrv register failed err=");
-                lb.hex(err as u64);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] FORK: mmsrv register failed err=");
+                    _lb.hex(err as u64);
+                    _lb.str(b"\n");
+                });
                 alloc.rollback();
                 reply.label = super::BESALT_OUT_OF_MEMORY;
                 return;
@@ -349,7 +346,7 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                 &raw mut mm_reply,
             );
             if err != 0 || mm_reply.label != super::BESALT_OK {
-                super::puts(b"[PROCMGR] FORK: mmsrv fork_regions failed, aborting\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: mmsrv fork_regions failed, aborting\n"); });
                 // Deregister child from mmsrv and abort fork
                 {
                     let mut dereg = BesaltMsg::zeroed();
@@ -387,7 +384,7 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                 &raw mut mm_reply,
             );
             if err != 0 || mm_reply.label != super::BESALT_OK || mm_reply.regs[0] != 1 {
-                super::puts(b"[PROCMGR] FORK: MM_MAP_BATCH ipc failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: MM_MAP_BATCH ipc failed\n"); });
                 // Deregister child from mmsrv on failure
                 {
                     let mut dereg = BesaltMsg::zeroed();
@@ -461,13 +458,11 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         }
         p.umask = proctab(parent_idx).umask;
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] FORK: child PID=");
-            lb.hex(child_pid as u64);
-            lb.str(b" started\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] FORK: child PID=");
+            _lb.hex(child_pid as u64);
+            _lb.str(b" started\n");
+        });
         reply.label = super::BESALT_OK;
         reply.length = 1;
         reply.regs[0] = child_pid as u64;
@@ -480,11 +475,11 @@ unsafe fn abort_destroyed_exec(
     vfs_source: &mut super::vfs_load::VfsExecSource,
 ) {
     unsafe {
-        let mut lb = LineBuf::new();
-        lb.str(b"[PROCMGR] EXEC: terminating PID=");
-        lb.hex(proctab(idx).pid as u64);
-        lb.str(b" after destructive failure\n");
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[PROCMGR] EXEC: terminating PID=");
+            _lb.hex(proctab(idx).pid as u64);
+            _lb.str(b" after destructive failure\n");
+        });
 
         super::vfs_load::cleanup_exec_source(vfs_source);
         let _ = super::signal::terminate_proc(idx, super::PM_SIGKILL);
@@ -540,19 +535,17 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             }
         }
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] EXEC PID=");
-            lb.hex(proctab(idx).pid as u64);
-            lb.str(b" -> '");
-            lb.bytes(&name[..name_len]);
-            lb.str(b"' argc=");
-            lb.hex(argc as u64);
-            lb.str(b" envc=");
-            lb.hex(envc as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] EXEC PID=");
+            _lb.hex(proctab(idx).pid as u64);
+            _lb.str(b" -> '");
+            _lb.bytes(&name[..name_len]);
+            _lb.str(b"' argc=");
+            _lb.hex(argc as u64);
+            _lb.str(b" envc=");
+            _lb.hex(envc as u64);
+            _lb.str(b"\n");
+        });
         let initrd = super::INITRD_VADDR as *const u8;
         let initrd_size = super::read_boot_info_initrd_size();
 
@@ -612,7 +605,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             }
         }
         if !found {
-            super::puts(b"[PROCMGR] EXEC: ELF not found in initrd or VFS\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] EXEC: ELF not found in initrd or VFS\n"); });
             reply.label = super::BESALT_NOT_FOUND;
             return;
         }
@@ -750,7 +743,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             || besalt::syscall::sys_getrandom(),
         );
         if layout.stack_top == 0 {
-            super::puts(b"[PROCMGR] EXEC: ELF too large for VA layout\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] EXEC: ELF too large for VA layout\n"); });
             abort_destroyed_exec(idx, reply, &mut vfs_source);
             return;
         }
@@ -785,11 +778,11 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             )
         };
         if err != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] EXEC: ELF load failed err=");
-            lb.hex(err as u64);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] EXEC: ELF load failed err=");
+                _lb.hex(err as u64);
+                _lb.str(b"\n");
+            });
             abort_destroyed_exec(idx, reply, &mut vfs_source);
             return;
         }
@@ -995,7 +988,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             besalt::syscall::syscall(besalt::SYS_NANOSLEEP, 2_000_000, 0, 0, 0, 0, 0);
             let err2 = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 64);
             if err2 != 0 {
-                super::puts(b"[PROCMGR] EXEC: tcb_suspend failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] EXEC: tcb_suspend failed\n"); });
                 abort_destroyed_exec(idx, reply, &mut vfs_source);
                 return;
             }
@@ -1011,13 +1004,13 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
 
         let err = besalt::invoke::tcb_configure(proctab(idx).tcb_cap, new_entry, new_rsp, 0);
         if err != 0 {
-            super::puts(b"[PROCMGR] EXEC: tcb_configure failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] EXEC: tcb_configure failed\n"); });
             abort_destroyed_exec(idx, reply, &mut vfs_source);
             return;
         }
         let err = besalt::invoke::tcb_set_tls_base(proctab(idx).tcb_cap, 0);
         if err != 0 {
-            super::puts(b"[PROCMGR] EXEC: clear TLS base failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] EXEC: clear TLS base failed\n"); });
             abort_destroyed_exec(idx, reply, &mut vfs_source);
             return;
         }
@@ -1025,7 +1018,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
 
         let err = besalt::invoke::tcb_resume(proctab(idx).tcb_cap);
         if err != 0 {
-            super::puts(b"[PROCMGR] EXEC: resume failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] EXEC: resume failed\n"); });
             abort_destroyed_exec(idx, reply, &mut vfs_source);
             return;
         }
@@ -1045,15 +1038,13 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             }
         }
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] EXEC: PID=");
-            lb.hex(proctab(idx).pid as u64);
-            lb.str(b" -> entry=");
-            lb.hex(new_entry);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] EXEC: PID=");
+            _lb.hex(proctab(idx).pid as u64);
+            _lb.str(b" -> entry=");
+            _lb.hex(new_entry);
+            _lb.str(b"\n");
+        });
 
         // Don't reply -- process image replaced and resumed.
     }

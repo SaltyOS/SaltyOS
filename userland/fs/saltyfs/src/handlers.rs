@@ -8,7 +8,6 @@
 //! - 64 bytes (MR12..MR19): symlink target, rename new name
 
 use besalt::consts::*;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 use crate::alloc::{alloc_block, free_block, bitmap_flush};
@@ -16,7 +15,7 @@ use crate::block::{read_block, write_block, read_superblock};
 use crate::btree::{btree_find_item, btree_find_all_for_ino, btree_cow_insert, btree_cow_delete, btree_cow_update};
 use crate::consts::*;
 use crate::types::*;
-use crate::{puts, SB, BLOCK_SIZE, MOUNTED, NEXT_INO};
+use crate::{SB, BLOCK_SIZE, MOUNTED, NEXT_INO};
 
 /// FNV-1a hash for generating DIR_ITEM key offsets from entry names.
 /// Used for hardlink entries where reusing the target inode number
@@ -145,7 +144,7 @@ fn dir_entry_insert_with_ref(parent_ino: u64, child_ino: u64, name: &[u8], dir_t
     }
 
     if !inode_ref_delete(child_ino, parent_ino) {
-        puts(b"[saltyfs] CRIT: dir_entry_insert rollback (inode_ref_delete) failed\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] CRIT: dir_entry_insert rollback (inode_ref_delete) failed\n"); });
         return Err(DirEntryTxnError::FailedDirty);
     }
     Err(DirEntryTxnError::FailedClean)
@@ -162,7 +161,7 @@ fn dir_entry_remove_with_ref(parent_ino: u64, child_ino: u64, name: &[u8]) -> Di
         Some(k) => k,
         None => {
             if !inode_ref_insert(child_ino, parent_ino, name) {
-                puts(b"[saltyfs] CRIT: dir_entry_remove rollback (reinsert missing ref) failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] CRIT: dir_entry_remove rollback (reinsert missing ref) failed\n"); });
                 return Err(DirEntryTxnError::FailedDirty);
             }
             return Err(DirEntryTxnError::FailedClean);
@@ -174,7 +173,7 @@ fn dir_entry_remove_with_ref(parent_ino: u64, child_ino: u64, name: &[u8]) -> Di
     }
 
     if !inode_ref_insert(child_ino, parent_ino, name) {
-        puts(b"[saltyfs] CRIT: dir_entry_remove rollback (inode_ref_insert) failed\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] CRIT: dir_entry_remove rollback (inode_ref_insert) failed\n"); });
         return Err(DirEntryTxnError::FailedDirty);
     }
     Err(DirEntryTxnError::FailedClean)
@@ -588,7 +587,7 @@ fn delete_all_extents(ino: u64) {
                 offset: offsets[i],
             };
             if !btree_cow_delete(&ext_key) {
-                puts(b"[saltyfs] WARN: extent delete failed during cleanup\n");
+                besalt::uwarn!(|_lb| { _lb.str(b"[saltyfs] WARN: extent delete failed during cleanup\n"); });
             }
         }
     }
@@ -866,7 +865,7 @@ pub(crate) fn handle_create(msg: &BesaltMsg) -> BesaltMsg {
         Ok(()) => {}
         Err(DirEntryTxnError::FailedClean) => {
             if !btree_cow_delete(&inode_key) {
-                puts(b"[saltyfs] WARN: create rollback inode delete failed\n");
+                besalt::uwarn!(|_lb| { _lb.str(b"[saltyfs] WARN: create rollback inode delete failed\n"); });
             }
             reply.label = BESALT_OUT_OF_MEMORY;
             return reply;
@@ -879,15 +878,13 @@ pub(crate) fn handle_create(msg: &BesaltMsg) -> BesaltMsg {
 
     update_inode_mtime(parent_ino);
 
-    {
-        let mut lb = LineBuf::new();
-        lb.str(b"[saltyfs] CREATE ino=");
-        lb.dec(new_ino);
-        lb.str(b" parent=");
-        lb.dec(parent_ino);
-        lb.putc(b'\n');
-        lb.flush();
-    }
+    besalt::udebug!(|_lb| {
+        _lb.str(b"[saltyfs] CREATE ino=");
+        _lb.dec(new_ino);
+        _lb.str(b" parent=");
+        _lb.dec(parent_ino);
+        _lb.putc(b'\n');
+    });
 
     reply.label = BESALT_OK;
     reply.length = 1;
@@ -1239,7 +1236,7 @@ pub(crate) fn handle_mkdir_fs(msg: &BesaltMsg) -> BesaltMsg {
         Ok(()) => {}
         Err(DirEntryTxnError::FailedClean) => {
             if !btree_cow_delete(&inode_key) {
-                puts(b"[saltyfs] WARN: mkdir rollback inode delete failed\n");
+                besalt::uwarn!(|_lb| { _lb.str(b"[saltyfs] WARN: mkdir rollback inode delete failed\n"); });
             }
             reply.label = BESALT_OUT_OF_MEMORY;
             return reply;
@@ -1505,7 +1502,7 @@ pub(crate) fn handle_rename_fs(msg: &BesaltMsg) -> BesaltMsg {
                     offset: 0,
                 };
                 if !btree_cow_delete(&inode_key) {
-                    puts(b"[saltyfs] rename: warning: orphan inode (delete failed)\n");
+                    besalt::uwarn!(|_lb| { _lb.str(b"[saltyfs] rename: warning: orphan inode (delete failed)\n"); });
                 }
             } else {
                 // nlink > 0: just update inode
@@ -1517,7 +1514,7 @@ pub(crate) fn handle_rename_fs(msg: &BesaltMsg) -> BesaltMsg {
                     offset: 0,
                 };
                 if !btree_cow_update(&inode_key, &inode_to_bytes(&updated)) {
-                    puts(b"[saltyfs] rename: warning: nlink update failed\n");
+                    besalt::uwarn!(|_lb| { _lb.str(b"[saltyfs] rename: warning: nlink update failed\n"); });
                 }
             }
         }
@@ -1717,13 +1714,13 @@ pub(crate) fn handle_shm_setup(msg: &BesaltMsg) -> BesaltMsg {
         besalt::ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const mm_msg, &raw mut mm_reply)
     };
     if err != 0 || mm_reply.label != 0 {
-        puts(b"[saltyfs] VFS SHM map failed\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] VFS SHM map failed\n"); });
         reply.label = BESALT_INVALID_OPERATION;
         return reply;
     }
 
     unsafe { *(&raw mut crate::VFS_SHM_MAPPED) = true; }
-    puts(b"[saltyfs] VFS SHM mapped for bulk transport\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[saltyfs] VFS SHM mapped for bulk transport\n"); });
 
     reply.label = BESALT_OK;
     reply
@@ -2026,7 +2023,7 @@ pub(crate) fn handle_symlink(msg: &BesaltMsg) -> BesaltMsg {
             delete_all_extents(new_ino);
             bitmap_flush();
             if !btree_cow_delete(&inode_key) {
-                puts(b"[saltyfs] WARN: symlink rollback inode delete failed\n");
+                besalt::uwarn!(|_lb| { _lb.str(b"[saltyfs] WARN: symlink rollback inode delete failed\n"); });
             }
             reply.label = BESALT_OUT_OF_MEMORY;
             return reply;
@@ -2195,7 +2192,7 @@ pub(crate) fn handle_link(msg: &BesaltMsg) -> BesaltMsg {
     };
     if !btree_cow_update(&inode_key, &inode_to_bytes(&updated_inode)) {
         if dir_entry_remove_with_ref(new_parent, existing_ino, &name_buf[..name_len]).is_err() {
-            puts(b"[saltyfs] CRIT: link rollback (remove dir+ref) failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] CRIT: link rollback (remove dir+ref) failed\n"); });
         }
         reply.label = BESALT_OUT_OF_MEMORY;
         return reply;

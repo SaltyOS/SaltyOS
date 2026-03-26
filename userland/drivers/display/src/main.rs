@@ -17,8 +17,6 @@ use besalt::consts::*;
 use besalt::framebuffer;
 use besalt::invoke;
 use besalt::ipc;
-use besalt::serial;
-use besalt::serial::LineBuf;
 use besalt::syscall::syscall;
 use besalt::types::*;
 
@@ -214,10 +212,6 @@ fn cell_clear_rows(state: &mut DisplayState, row_start: u32, row_end: u32) {
             }
         }
     }
-}
-
-fn puts(s: &[u8]) {
-    serial::serial_puts(s);
 }
 
 fn idle() -> ! {
@@ -1121,27 +1115,25 @@ fn map_framebuffer(fb: &framebuffer::FramebufferInfo) -> bool {
     );
 
     if err != 0 || mapped != num_pages {
-        let mut lb = LineBuf::new();
-        lb.str(b"[DISPLAY] FB batch map failed: err=");
-        lb.hex(err as u64);
-        lb.str(b" mapped=");
-        lb.hex(mapped);
-        lb.str(b"/");
-        lb.hex(num_pages);
-        lb.str(b"\n");
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[DISPLAY] FB batch map failed: err=");
+            _lb.hex(err as u64);
+            _lb.str(b" mapped=");
+            _lb.hex(mapped);
+            _lb.str(b"/");
+            _lb.hex(num_pages);
+            _lb.str(b"\n");
+        });
         return false;
     }
 
-    {
-        let mut lb = LineBuf::new();
-        lb.str(b"[DISPLAY] Mapped ");
-        lb.hex(num_pages);
-        lb.str(b" FB pages at ");
-        lb.hex(FB_MAP_VADDR);
-        lb.str(b" (WC)\n");
-        lb.flush();
-    }
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[DISPLAY] Mapped ");
+        _lb.hex(num_pages);
+        _lb.str(b" FB pages at ");
+        _lb.hex(FB_MAP_VADDR);
+        _lb.str(b" (WC)\n");
+    });
 
     true
 }
@@ -1159,19 +1151,19 @@ fn alloc_shadow_buffer(fb_size: u64) -> *mut u8 {
         )
     };
     if ptr == usize::MAX as *mut u8 || ptr.is_null() {
-        serial::serial_puts(b"[DISPLAY] Shadow buffer posix_mmap failed\n");
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[DISPLAY] Shadow buffer posix_mmap failed\n");
+        });
         return core::ptr::null_mut();
     }
 
-    {
-        let mut lb = LineBuf::new();
-        lb.str(b"[DISPLAY] Shadow buffer: ");
-        lb.hex(len / 4096);
-        lb.str(b" pages at ");
-        lb.hex(ptr as u64);
-        lb.str(b"\n");
-        lb.flush();
-    }
+    besalt::udebug!(|_lb| {
+        _lb.str(b"[DISPLAY] Shadow buffer: ");
+        _lb.hex(len / 4096);
+        _lb.str(b" pages at ");
+        _lb.hex(ptr as u64);
+        _lb.str(b"\n");
+    });
 
     ptr
 }
@@ -1200,16 +1192,18 @@ fn register_with_nameserv() -> bool {
             &raw mut reg_reply,
         );
         if err == 0 && reg_reply.label == BESALT_OK {
-            puts(b"[DISPLAY] registered with nameserv\n");
+            besalt::uinfo!(|_lb| {
+                _lb.str(b"[DISPLAY] registered with nameserv\n");
+            });
             return true;
         }
-        let mut lb = LineBuf::new();
-        lb.str(b"[DISPLAY] nameserv register failed: err=");
-        lb.hex(err as u64);
-        lb.str(b" label=");
-        lb.hex(reg_reply.label);
-        lb.str(b"\n");
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[DISPLAY] nameserv register failed: err=");
+            _lb.hex(err as u64);
+            _lb.str(b" label=");
+            _lb.hex(reg_reply.label);
+            _lb.str(b"\n");
+        });
         false
     }
 }
@@ -1338,11 +1332,11 @@ fn handle_setup_ring(state: &mut DisplayState, msg: &BesaltMsg, reply: &mut Besa
     // Bind it to our TCB so signals wake us from recv.
     let bind_err = invoke::tcb_bind_notification(CAP_SELF_TCB, CAP_RING_NTFN);
     if bind_err != 0 {
-        let mut lb = LineBuf::new();
-        lb.str(b"[DISPLAY] ring: bind notification failed err=");
-        lb.dec(bind_err as u64);
-        lb.str(b"\n");
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[DISPLAY] ring: bind notification failed err=");
+            _lb.dec(bind_err as u64);
+            _lb.str(b"\n");
+        });
         reply.label = BESALT_INVALID_OPERATION;
         return;
     }
@@ -1361,11 +1355,11 @@ fn handle_setup_ring(state: &mut DisplayState, msg: &BesaltMsg, reply: &mut Besa
         ipc::call_ctx(ipc_ctx(), CAP_MMSRV_EP, &raw const map_msg, &raw mut map_reply)
     };
     if map_err != 0 || map_reply.label != BESALT_OK {
-        let mut lb = LineBuf::new();
-        lb.str(b"[DISPLAY] ring: SHM map failed err=");
-        lb.dec(if map_err != 0 { map_err as u64 } else { map_reply.label });
-        lb.str(b"\n");
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[DISPLAY] ring: SHM map failed err=");
+            _lb.dec(if map_err != 0 { map_err as u64 } else { map_reply.label });
+            _lb.str(b"\n");
+        });
         reply.label = BESALT_INVALID_OPERATION;
         return;
     }
@@ -1373,7 +1367,9 @@ fn handle_setup_ring(state: &mut DisplayState, msg: &BesaltMsg, reply: &mut Besa
     state.term_ring_base = TERM_RING_VADDR as *mut u8;
     state.term_ring_active = true;
     reply.label = BESALT_OK;
-    puts(b"[DISPLAY] Terminal ring buffer active\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[DISPLAY] Terminal ring buffer active\n");
+    });
 }
 
 fn handle_terminal_write(state: &mut DisplayState, msg: &BesaltMsg) {
@@ -1400,35 +1396,39 @@ fn handle_present(state: &mut DisplayState, reply: &mut BesaltMsg) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    puts(b"[DISPLAY] Display server starting\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[DISPLAY] Display server starting\n");
+    });
 
     // Read framebuffer info from boot info page
     let fb = match unsafe { framebuffer::read_framebuffer_info() } {
         Some(fb) => fb,
         None => {
-            puts(b"[DISPLAY] No framebuffer detected\n");
+            besalt::uwarn!(|_lb| {
+                _lb.str(b"[DISPLAY] No framebuffer detected\n");
+            });
             signal_ready();
             idle();
         }
     };
 
-    {
-        let mut lb = LineBuf::new();
-        lb.str(b"[DISPLAY] FB: ");
-        lb.dec(fb.width as u64);
-        lb.str(b"x");
-        lb.dec(fb.height as u64);
-        lb.str(b" bpp=");
-        lb.dec(fb.bpp as u64);
-        lb.str(b" pitch=");
-        lb.dec(fb.pitch as u64);
-        lb.str(b"\n");
-        lb.flush();
-    }
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[DISPLAY] FB: ");
+        _lb.dec(fb.width as u64);
+        _lb.str(b"x");
+        _lb.dec(fb.height as u64);
+        _lb.str(b" bpp=");
+        _lb.dec(fb.bpp as u64);
+        _lb.str(b" pitch=");
+        _lb.dec(fb.pitch as u64);
+        _lb.str(b"\n");
+    });
 
     // Map framebuffer with write-combining (WRITE_THROUGH flag)
     if !map_framebuffer(&fb) {
-        puts(b"[DISPLAY] Failed to map framebuffer\n");
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[DISPLAY] Failed to map framebuffer\n");
+        });
         signal_ready();
         idle();
     }
@@ -1437,7 +1437,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     let fb_size = fb.height as u64 * fb.pitch as u64;
     let shadow_ptr = alloc_shadow_buffer(fb_size);
     if shadow_ptr.is_null() {
-        puts(b"[DISPLAY] Failed to allocate shadow buffer\n");
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[DISPLAY] Failed to allocate shadow buffer\n");
+        });
         signal_ready();
         idle();
     }
@@ -1544,7 +1546,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // Disable kernel console so we own the framebuffer
     syscall(SYS_DEBUG_CONSOLE_CONTROL, 0, 0, 0, 0, 0, 0);
-    puts(b"[DISPLAY] Kernel console disabled, display server owns FB\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[DISPLAY] Kernel console disabled, display server owns FB\n");
+    });
 
     // Allocate cell buffer for character-level storage
     {
@@ -1585,7 +1589,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // Signal readiness
     signal_ready();
-    puts(b"[DISPLAY] Ready, entering server loop\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[DISPLAY] Ready, entering server loop\n");
+    });
 
     // IPC server loop
     let mut msg = BesaltMsg::zeroed();
@@ -1600,11 +1606,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
     if err != 0 {
-        let mut lb = LineBuf::new();
-        lb.str(b"[DISPLAY] initial recv failed err=");
-        lb.hex(err as u64);
-        lb.str(b"\n");
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[DISPLAY] initial recv failed err=");
+            _lb.hex(err as u64);
+            _lb.str(b"\n");
+        });
         idle();
     }
 
@@ -1620,7 +1626,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
             };
             if err != 0 {
-                puts(b"[DISPLAY] recv failed after ring drain\n");
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[DISPLAY] recv failed after ring drain\n");
+                });
                 break;
             }
             continue;
@@ -1646,11 +1654,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                         ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
                     };
                     if err != 0 {
-                        let mut lb = LineBuf::new();
-                        lb.str(b"[DISPLAY] recv failed err=");
-                        lb.hex(err as u64);
-                        lb.str(b"\n");
-                        lb.flush();
+                        besalt::uerror!(|_lb| {
+                            _lb.str(b"[DISPLAY] recv failed err=");
+                            _lb.hex(err as u64);
+                            _lb.str(b"\n");
+                        });
                         break;
                     }
                     break;
@@ -1703,11 +1711,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             )
         };
         if err != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[DISPLAY] reply_recv failed err=");
-            lb.hex(err as u64);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[DISPLAY] reply_recv failed err=");
+                _lb.hex(err as u64);
+                _lb.str(b"\n");
+            });
             break;
         }
     }

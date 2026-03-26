@@ -42,8 +42,6 @@ mod arch;
 use besalt::consts::*;
 use besalt::ipc;
 use besalt::invoke;
-use besalt::serial;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 const CAP_SELF_CSPACE: u64 = 2;
@@ -102,10 +100,6 @@ impl PciDevice {
 static mut DEVICES: [PciDevice; MAX_PCI_DEVICES] = [PciDevice::zeroed(); MAX_PCI_DEVICES];
 static mut DEVICE_COUNT: usize = 0;
 
-fn puts(s: &[u8]) {
-    serial::serial_puts(s);
-}
-
 fn ipc_ctx() -> *mut IpcContext {
     &raw mut besalt::__besalt_ipc_ctx
 }
@@ -133,7 +127,7 @@ fn probe_bar_size(bus: u8, dev: u8, func: u8, bar_idx: u8) -> u32 {
 
 /// Scan PCI bus 0, devices 0-31, all functions (multi-function aware).
 fn scan_bus() {
-    puts(b"[pcisrv] Scanning PCI bus 0...\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[pcisrv] Scanning PCI bus 0...\n"); });
 
     let mut count = 0usize;
     for dev in 0u8..32 {
@@ -275,34 +269,32 @@ fn scan_bus() {
                     if err == 0 {
                         entry.irq_handler_slot = slot;
                     } else {
-                        let mut lb = LineBuf::new();
-                        lb.str(b"[pcisrv] irq_control_get IRQ ");
-                        lb.dec(effective_irq as u64);
-                        lb.str(b" failed: ");
-                        lb.dec(err as u64);
-                        lb.putc(b'\n');
-                        lb.flush();
+                        besalt::uwarn!(|_lb| {
+                            _lb.str(b"[pcisrv] irq_control_get IRQ ");
+                            _lb.dec(effective_irq as u64);
+                            _lb.str(b" failed: ");
+                            _lb.dec(err as u64);
+                            _lb.putc(b'\n');
+                        });
                     }
                 }
             }
 
-            {
-                let mut lb = LineBuf::new();
-                lb.str(b"[pcisrv]   ");
-                lb.hex(vid as u64);
-                lb.putc(b':');
-                lb.hex(did as u64);
-                lb.str(b" class=");
-                lb.hex(class_code as u64);
-                lb.str(b" fn=");
-                lb.dec(func as u64);
-                lb.str(b" irq=");
-                lb.dec(irq_line as u64);
-                lb.str(b" bar0=");
-                lb.hex(unsafe { (*(&raw const DEVICES[count])).bars[0] } as u64);
-                lb.putc(b'\n');
-                lb.flush();
-            }
+            besalt::udebug!(|_lb| {
+                _lb.str(b"[pcisrv]   ");
+                _lb.hex(vid as u64);
+                _lb.putc(b':');
+                _lb.hex(did as u64);
+                _lb.str(b" class=");
+                _lb.hex(class_code as u64);
+                _lb.str(b" fn=");
+                _lb.dec(func as u64);
+                _lb.str(b" irq=");
+                _lb.dec(irq_line as u64);
+                _lb.str(b" bar0=");
+                _lb.hex(unsafe { (*(&raw const DEVICES[count])).bars[0] } as u64);
+                _lb.putc(b'\n');
+            });
 
             count += 1;
         }
@@ -314,13 +306,11 @@ fn scan_bus() {
 
     unsafe { *(&raw mut DEVICE_COUNT) = count; }
 
-    {
-        let mut lb = LineBuf::new();
-        lb.str(b"[pcisrv] Found ");
-        lb.dec(count as u64);
-        lb.str(b" PCI device(s)\n");
-        lb.flush();
-    }
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[pcisrv] Found ");
+        _lb.dec(count as u64);
+        _lb.str(b" PCI device(s)\n");
+    });
 }
 
 /// Find a device by vendor/device ID. Returns index or None.
@@ -337,7 +327,7 @@ fn find_device(vendor_id: u16, device_id: u16) -> Option<usize> {
 
 /// Register with name service.
 fn register_nameserv() -> bool {
-    puts(b"[pcisrv] Registering with nameserv\n");
+    besalt::udebug!(|_lb| { _lb.str(b"[pcisrv] Registering with nameserv\n"); });
     let name = b"pcisrv";
     let mut msg = BesaltMsg::zeroed();
     msg.label = POSIX_NS_REGISTER;
@@ -352,17 +342,17 @@ fn register_nameserv() -> bool {
         let mut reply = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const msg, &raw mut reply);
         if err != 0 || reply.label != BESALT_OK {
-            let mut lb = LineBuf::new();
-            lb.str(b"[pcisrv] nameserv register failed err=");
-            lb.hex(err as u64);
-            lb.str(b" label=");
-            lb.hex(reply.label);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[pcisrv] nameserv register failed err=");
+                _lb.hex(err as u64);
+                _lb.str(b" label=");
+                _lb.hex(reply.label);
+                _lb.str(b"\n");
+            });
             return false;
         }
     }
-    puts(b"[pcisrv] registered with nameserv\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[pcisrv] registered with nameserv\n"); });
     true
 }
 
@@ -610,7 +600,7 @@ fn handle_write_config32(msg: &BesaltMsg) -> BesaltMsg {
 
 /// Server main loop.
 fn server_loop() -> ! {
-    puts(b"[pcisrv] Entering server loop\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[pcisrv] Entering server loop\n"); });
 
     let ctx = ipc_ctx();
     let mut msg = BesaltMsg::zeroed();
@@ -644,7 +634,7 @@ fn server_loop() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    puts(b"[pcisrv] PCI Enumeration Server starting\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[pcisrv] PCI Enumeration Server starting\n"); });
 
     arch::pci_init();
     scan_bus();

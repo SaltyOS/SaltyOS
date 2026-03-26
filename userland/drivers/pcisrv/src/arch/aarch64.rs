@@ -8,8 +8,6 @@
 
 use besalt::consts::*;
 use besalt::invoke;
-use besalt::serial;
-use besalt::serial::LineBuf;
 
 /// ECAM device untyped cap slot (received via CopyCap from init slot 15).
 const CAP_ECAM_DEVUT: u64 = 64;
@@ -44,13 +42,13 @@ pub fn pci_init() {
     );
 
     if err != 0 || mapped != num_pages {
-        let mut lb = LineBuf::new();
-        lb.str(b"[pcisrv] ECAM map failed err=");
-        lb.hex(err as u64);
-        lb.str(b" mapped=");
-        lb.hex(mapped);
-        lb.str(b"\n");
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[pcisrv] ECAM map failed err=");
+            _lb.hex(err as u64);
+            _lb.str(b" mapped=");
+            _lb.hex(mapped);
+            _lb.str(b"\n");
+        });
         unsafe {
             *(&raw mut ECAM_BASE) = 0;
             *(&raw mut ECAM_READY) = false;

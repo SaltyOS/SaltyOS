@@ -29,7 +29,6 @@ use besalt::consts::*;
 use besalt::cpio;
 use besalt::ipc;
 use besalt::serial;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 use consts::*;
@@ -470,9 +469,9 @@ unsafe fn init_dynamic_state_storage() -> i32 {
             return BESALT_OUT_OF_MEMORY as i32;
         }
 
-        let mut lb = LineBuf::new();
-        lb.str(b"[VFS] Growable pools initialized: inodes=128 clients=16 sockets=32 pipes=16\n");
-        lb.flush();
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[VFS] Growable pools initialized: inodes=128 clients=16 sockets=32 pipes=16\n");
+        });
 
         0
     }
@@ -720,13 +719,11 @@ unsafe fn init_ramfs() {
         let initrd = INITRD_VADDR as *const u8;
         let initrd_size = ramfs::read_boot_info_initrd_size();
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS] Initrd size: ");
-            lb.hex(initrd_size as u64);
-            lb.str(b" bytes\n");
-            lb.flush();
-        }
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[VFS] Initrd size: ");
+            _lb.hex(initrd_size as u64);
+            _lb.str(b" bytes\n");
+        });
 
         let mut offset: usize = 0;
         let mut entry = CpioEntryExt::zeroed();
@@ -741,13 +738,11 @@ unsafe fn init_ramfs() {
             }
         }
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS] Mounted ");
-            lb.hex(file_count as u64);
-            lb.str(b" initrd files\n");
-            lb.flush();
-        }
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[VFS] Mounted ");
+            _lb.hex(file_count as u64);
+            _lb.str(b" initrd files\n");
+        });
     }
 }
 
@@ -757,16 +752,18 @@ unsafe fn init_ramfs() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    puts(b"[VFS] SaltyOS VFS server starting\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[VFS] SaltyOS VFS server starting\n");
+    });
 
     unsafe {
         let derr = init_dynamic_state_storage();
         if derr != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS] FAIL: state storage init err=");
-            lb.hex(derr as u64);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[VFS] FAIL: state storage init err=");
+                _lb.hex(derr as u64);
+                _lb.str(b"\n");
+            });
             idle();
         }
     }
@@ -777,7 +774,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         init_fb_info();
     }
 
-    puts(b"[VFS] Filesystem ready\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[VFS] Filesystem ready\n");
+    });
 
     if VFS_CAP_NAMESERV_EP != 0 {
         let mut reg_msg = BesaltMsg::zeroed();
@@ -802,9 +801,13 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 &raw mut reg_reply,
             );
             if err == 0 && reg_reply.label == BESALT_OK {
-                puts(b"[VFS] registered with nameserv\n");
+                besalt::uinfo!(|_lb| {
+                    _lb.str(b"[VFS] registered with nameserv\n");
+                });
             } else {
-                puts(b"[VFS] WARN: nameserv registration failed\n");
+                besalt::uwarn!(|_lb| {
+                    _lb.str(b"[VFS] WARN: nameserv registration failed\n");
+                });
             }
         }
     }
@@ -812,9 +815,13 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     {
         let err = besalt::invoke::tcb_bind_notification(CAP_SELF_TCB, VFS_CAP_PTY_NTFN);
         if err == 0 {
-            puts(b"[VFS] PTY notification bound to TCB\n");
+            besalt::uinfo!(|_lb| {
+                _lb.str(b"[VFS] PTY notification bound to TCB\n");
+            });
         } else {
-            puts(b"[VFS] WARN: PTY notification bind failed\n");
+            besalt::uwarn!(|_lb| {
+                _lb.str(b"[VFS] WARN: PTY notification bind failed\n");
+            });
         }
     }
 
@@ -832,7 +839,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
     if err != 0 {
-        puts(b"[VFS] initial recv failed\n");
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[VFS] initial recv failed\n");
+        });
         idle();
     }
 
@@ -1400,13 +1409,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             }
         };
         if err != 0 {
-            {
-                let mut lb = LineBuf::new();
-                lb.str(b"[VFS] reply_recv failed err=");
-                lb.hex(err as u64);
-                lb.str(b"\n");
-                lb.flush();
-            }
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[VFS] reply_recv failed err=");
+                _lb.hex(err as u64);
+                _lb.str(b"\n");
+            });
             break;
         }
     }

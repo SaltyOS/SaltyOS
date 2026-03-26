@@ -2,7 +2,6 @@ use crate::types::*;
 use crate::client::find_client_by_badge;
 use besalt::consts::*;
 use besalt::invoke;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 pub(crate) unsafe fn find_shm_by_id(id: u64) -> *mut ShmObject {
@@ -100,15 +99,13 @@ pub(crate) unsafe fn handle_mm_shm_create(msg: *const BesaltMsg, _caller_badge: 
             frame_cap_capacity: num_pages as u32,
         };
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[MMSRV] SHM create id=");
-            lb.hex(shm_id);
-            lb.str(b" pages=");
-            lb.hex(num_pages as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[MMSRV] SHM create id=");
+            _lb.hex(shm_id);
+            _lb.str(b" pages=");
+            _lb.hex(num_pages as u64);
+            _lb.str(b"\n");
+        });
 
         (*reply).label = BESALT_OK;
     }

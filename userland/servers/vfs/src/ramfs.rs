@@ -3,13 +3,12 @@
 
 use besalt::consts::*;
 use besalt::cpio;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 use crate::consts::*;
 use crate::types::*;
 use crate::{
-    max_inodes, max_writable, puts, str_equal_raw, vfs_alloc_array, vfs_grow_array, vfs_grow_pool,
+    max_inodes, max_writable, str_equal_raw, vfs_alloc_array, vfs_grow_array, vfs_grow_pool,
     INODES, WRITABLE_POOL, WRITABLE_USED,
 };
 
@@ -814,13 +813,11 @@ pub(crate) unsafe fn init_ramfs() {
         let initrd = INITRD_VADDR as *const u8;
         let initrd_size = read_boot_info_initrd_size();
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS] Initrd size: ");
-            lb.hex(initrd_size as u64);
-            lb.str(b" bytes\n");
-            lb.flush();
-        }
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[VFS] Initrd size: ");
+            _lb.hex(initrd_size as u64);
+            _lb.str(b" bytes\n");
+        });
 
         let mut offset: usize = 0;
         let mut entry = CpioEntryExt::zeroed();
@@ -836,12 +833,10 @@ pub(crate) unsafe fn init_ramfs() {
             }
         }
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS] Mounted ");
-            lb.hex(file_count as u64);
-            lb.str(b" initrd files\n");
-            lb.flush();
-        }
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[VFS] Mounted ");
+            _lb.hex(file_count as u64);
+            _lb.str(b" initrd files\n");
+        });
     }
 }

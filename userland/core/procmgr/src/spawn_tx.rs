@@ -5,15 +5,10 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 use crate::alloc::Allocator;
 use crate::proc_table;
-
-fn puts(s: &[u8]) {
-    besalt::serial::serial_puts(s);
-}
 
 /// Zero `len` bytes at `ptr` using u64-wide volatile writes for bulk throughput,
 /// with byte-granular head/tail for alignment.
@@ -198,11 +193,13 @@ struct RoSegInfo {
     mo_page_start: u16,
     /// Number of pages in this segment.
     page_count: u16,
+    /// VSpace flags for this RO segment (USER | optional EXECUTABLE).
+    flags: u64,
 }
 
 impl RoSegInfo {
     const fn zeroed() -> Self {
-        RoSegInfo { vaddr_offset: 0, mo_page_start: 0, page_count: 0 }
+        RoSegInfo { vaddr_offset: 0, mo_page_start: 0, page_count: 0, flags: 0 }
     }
 }
 
@@ -649,6 +646,11 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
                 let seg_end = (ph.p_vaddr + ph.p_memsz + 0xFFF) & !0xFFFu64;
                 let seg_pages = ((seg_end - seg_start) / 4096) as usize;
                 let vaddr_offset = seg_start - min_vaddr_aligned;
+                let seg_flags = if (ph.p_flags & besalt::PF_X) != 0 {
+                    VSPACE_FLAG_USER | VSPACE_FLAG_EXECUTABLE
+                } else {
+                    VSPACE_FLAG_USER
+                };
                 if vaddr_offset < ro_base_offset { ro_base_offset = vaddr_offset; }
 
                 if (lib_entry.ro_seg_count as usize) < MAX_RO_SEGS {
@@ -657,6 +659,7 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
                         vaddr_offset,
                         mo_page_start: ro_page_count as u16,
                         page_count: seg_pages as u16,
+                        flags: seg_flags,
                     };
                     lib_entry.ro_seg_count += 1;
                 }
@@ -665,6 +668,24 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
 
                 if (ph.p_flags & besalt::PF_X) != 0 {
                     ro_flags |= VSPACE_FLAG_EXECUTABLE;
+                }
+            }
+
+            // --- Pass 1.5: detect and resolve RO/RW boundary page overlaps ---
+            for ri in 0..lib_entry.ro_seg_count as usize {
+                let ro_end = lib_entry.ro_segs[ri].vaddr_offset
+                    + (lib_entry.ro_segs[ri].page_count as u64) * 4096;
+                for wi in 0..lib_entry.rw_seg_count as usize {
+                    let rw_start = lib_entry.rw_segs[wi].vaddr_offset;
+                    if ro_end > rw_start
+                        && lib_entry.ro_segs[ri].vaddr_offset < rw_start
+                    {
+                        let overlap = ((ro_end - rw_start) / 4096) as u16;
+                        if overlap > 0 && overlap <= lib_entry.ro_segs[ri].page_count {
+                            lib_entry.ro_segs[ri].page_count -= overlap;
+                            ro_page_count -= overlap as usize;
+                        }
+                    }
                 }
             }
 
@@ -798,13 +819,11 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
             }
         }
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] shared lib cache: ");
-            lb.hex(cache.page_count as u64);
-            lb.str(b" RO pages (MO-backed)\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] shared lib cache: ");
+            _lb.hex(cache.page_count as u64);
+            _lb.str(b" RO pages (MO-backed)\n");
+        });
     }
 }
 
@@ -835,7 +854,7 @@ unsafe fn try_inherit_shared_lib_cache(
         }
         besalt::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
 
-        puts(b"[PROCMGR] inherited shared lib caps from init\n");
+        besalt::uinfo!(|_lb| { _lb.str(b"[PROCMGR] inherited shared lib caps from init\n"); });
 
         // Reserve the entire inherited shared-lib slot namespace in allocator
         // so transactional reservations never overlap these pre-existing caps.
@@ -978,11 +997,11 @@ unsafe fn try_inherit_shared_lib_cache(
 
         if cache.page_count > 0 {
             cache.initialized = true;
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] shared lib cache: ");
-            lb.hex(cache.page_count as u64);
-            lb.str(b" RO pages (inherited)\n");
-            lb.flush();
+            besalt::udebug!(|_lb| {
+                _lb.str(b"[PROCMGR] shared lib cache: ");
+                _lb.hex(cache.page_count as u64);
+                _lb.str(b" RO pages (inherited)\n");
+            });
             return true;
         }
 
@@ -1058,7 +1077,7 @@ pub(crate) unsafe fn map_shared_lib_to_vspace(
                         let seg = &cl.ro_segs[si];
                         let seg_vaddr = running_base + seg.vaddr_offset;
                         let count_and_flags =
-                            ((seg.page_count as u64) << 32) | cl.ro_flags;
+                            ((seg.page_count as u64) << 32) | seg.flags;
                         let err = besalt::invoke::vspace_map_mo(
                             child_vs,
                             cl.ro_mo_cap,
@@ -1067,13 +1086,13 @@ pub(crate) unsafe fn map_shared_lib_to_vspace(
                             count_and_flags,
                         );
                         if err != 0 {
-                            let mut lb = LineBuf::new();
-                            lb.str(b"[PROCMGR] shared lib MO map failed seg=");
-                            lb.hex(si as u64);
-                            lb.str(b" err=");
-                            lb.hex(err as u64);
-                            lb.str(b"\n");
-                            lb.flush();
+                            besalt::uerror!(|_lb| {
+                                _lb.str(b"[PROCMGR] shared lib MO map failed seg=");
+                                _lb.hex(si as u64);
+                                _lb.str(b" err=");
+                                _lb.hex(err as u64);
+                                _lb.str(b"\n");
+                            });
                             return (0, empty);
                         }
                     }
@@ -1085,13 +1104,13 @@ pub(crate) unsafe fn map_shared_lib_to_vspace(
                         let err =
                             besalt::invoke::vspace_map(child_vs, page.frame_cap, vaddr, page.flags);
                         if err != 0 {
-                            let mut lb = LineBuf::new();
-                            lb.str(b"[PROCMGR] shared lib map failed at ");
-                            lb.hex(vaddr);
-                            lb.str(b" err=");
-                            lb.hex(err as u64);
-                            lb.str(b"\n");
-                            lb.flush();
+                            besalt::uerror!(|_lb| {
+                                _lb.str(b"[PROCMGR] shared lib map failed at ");
+                                _lb.hex(vaddr);
+                                _lb.str(b" err=");
+                                _lb.hex(err as u64);
+                                _lb.str(b"\n");
+                            });
                             return (0, empty);
                         }
                     }
@@ -1110,12 +1129,13 @@ pub(crate) unsafe fn map_shared_lib_to_vspace(
                     let mut sr_msg = BesaltMsg::zeroed();
                     let mut sr_reply = BesaltMsg::zeroed();
                     sr_msg.label = besalt::consts::MM_REGISTER_SHARED_REGION;
-                    sr_msg.length = 5;
+                    sr_msg.length = 6;
                     sr_msg.regs[0] = pid as u64;
                     sr_msg.regs[1] = running_base + seg.vaddr_offset;
                     sr_msg.regs[2] = seg.page_count as u64;
                     sr_msg.regs[3] = if cl.ro_mo_cap != 0 { 1 } else { 0 };
                     sr_msg.regs[4] = seg.mo_page_start as u64; // mo_offset
+                    sr_msg.regs[5] = seg.flags;
 
                     if cl.ro_mo_cap != 0 {
                         // Transfer MO cap on every segment call.
@@ -1141,11 +1161,11 @@ pub(crate) unsafe fn map_shared_lib_to_vspace(
             }
 
             if !found {
-                let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR] shared lib cache miss: ");
-                lb.bytes(name);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::udebug!(|_lb| {
+                    _lb.str(b"[PROCMGR] shared lib cache miss: ");
+                    _lb.bytes(name);
+                    _lb.str(b"\n");
+                });
             }
         }
 
@@ -1186,7 +1206,7 @@ unsafe fn map_rw_segments(cl: &CachedLib, running_base: u64, pid: u32) -> bool {
             &raw mut entry,
         ) == 0
         {
-            puts(b"[PROCMGR] RW map: lib not found in initrd\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] RW map: lib not found in initrd\n"); });
             return false;
         }
 
@@ -1235,13 +1255,13 @@ unsafe fn map_rw_segments(cl: &CachedLib, running_base: u64, pid: u32) -> bool {
             &raw mut mm_reply,
         );
         if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != merged_pages as u64 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] RW MAP_WINDOW failed err=");
-            lb.hex(err as u64);
-            lb.str(b" mapped=");
-            lb.hex(mm_reply.regs[0]);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] RW MAP_WINDOW failed err=");
+                _lb.hex(err as u64);
+                _lb.str(b" mapped=");
+                _lb.hex(mm_reply.regs[0]);
+                _lb.str(b"\n");
+            });
             return false;
         }
 
@@ -1268,6 +1288,35 @@ unsafe fn map_rw_segments(cl: &CachedLib, running_base: u64, pid: u32) -> bool {
                 let src = entry.data.add(file_off);
                 let dst = scratch.add(window_off);
                 unsafe { volatile_copy(dst, src, copy_len) };
+            }
+        }
+
+        // Copy RO tail data for boundary pages trimmed from the RO MO.
+        if entry.data_len >= core::mem::size_of::<Elf64Ehdr>() {
+            let ehdr = &*(entry.data as *const Elf64Ehdr);
+            let elf_phdrs = entry.data.add(ehdr.e_phoff as usize) as *const Elf64Phdr;
+            let merged_vaddr_start = merged_start - running_base;
+            let merged_vaddr_end = merged_vaddr_start + (merged_pages as u64) * 4096;
+            for pi in 0..ehdr.e_phnum as usize {
+                let ph = &*elf_phdrs.add(pi);
+                if ph.p_type != besalt::PT_LOAD || (ph.p_flags & besalt::PF_W) != 0 {
+                    continue;
+                }
+                let seg_file_end = ph.p_vaddr + ph.p_filesz;
+                if seg_file_end <= merged_vaddr_start || (ph.p_vaddr & !0xFFFu64) >= merged_vaddr_end {
+                    continue;
+                }
+                let overlap_start = if ph.p_vaddr > merged_vaddr_start { ph.p_vaddr } else { merged_vaddr_start };
+                let overlap_end = if seg_file_end < merged_vaddr_end { seg_file_end } else { merged_vaddr_end };
+                if overlap_start >= overlap_end { continue; }
+                let file_off = (overlap_start - ph.p_vaddr + ph.p_offset) as usize;
+                let window_off = (overlap_start - merged_vaddr_start) as usize;
+                let copy_len = (overlap_end - overlap_start) as usize;
+                if file_off + copy_len <= entry.data_len {
+                    let src = entry.data.add(file_off);
+                    let dst = scratch.add(window_off);
+                    unsafe { volatile_copy(dst, src, copy_len) };
+                }
             }
         }
 
@@ -1329,13 +1378,13 @@ pub(crate) unsafe fn write_dynamic_stack(
                 VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
             );
             if err != 0 {
-                puts(b"[PROCMGR] dynamic stack scratch map failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] dynamic stack scratch map failed\n"); });
                 return Err(StackBuildError::OutOfMemory);
             }
         }
 
         if phdr_vaddr == 0 || phent == 0 || phnum == 0 {
-            puts(b"[PROCMGR] dynamic phdr info extraction failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] dynamic phdr info extraction failed\n"); });
             if !pre_mapped {
                 besalt::invoke::vspace_unmap(CAP_SELF_VSPACE, PROCMGR_SCRATCH_VADDR);
             }
@@ -1414,7 +1463,7 @@ pub(crate) unsafe fn write_static_stack(
                 VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
             );
             if err != 0 {
-                puts(b"[PROCMGR] static stack scratch map failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] static stack scratch map failed\n"); });
                 return Err(StackBuildError::OutOfMemory);
             }
         }
@@ -1776,17 +1825,17 @@ pub(crate) unsafe fn exec_load_elf_mmsrv(
                 &raw mut mm_reply,
             );
             if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != chunk_count as u64 {
-                let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR] exec ELF MM_MAP_WINDOW failed err=");
-                lb.hex(err as u64);
-                lb.str(b" label=");
-                lb.hex(mm_reply.label);
-                lb.str(b" mapped=");
-                lb.hex(mm_reply.regs[0]);
-                lb.str(b"/");
-                lb.hex(chunk_count as u64);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] exec ELF MM_MAP_WINDOW failed err=");
+                    _lb.hex(err as u64);
+                    _lb.str(b" label=");
+                    _lb.hex(mm_reply.label);
+                    _lb.str(b" mapped=");
+                    _lb.hex(mm_reply.regs[0]);
+                    _lb.str(b"/");
+                    _lb.hex(chunk_count as u64);
+                    _lb.str(b"\n");
+                });
                 return ELF_MAP_FAILED;
             }
 
@@ -2341,7 +2390,7 @@ pub(crate) unsafe fn exec_load_rtld_mmsrv_by_name(
             &raw mut rtld_entry,
         ) == 0
         {
-            puts(b"[PROCMGR] exec: rtld not found in initrd\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] exec: rtld not found in initrd\n"); });
             return None;
         }
 
@@ -2359,11 +2408,11 @@ pub(crate) unsafe fn exec_load_rtld_mmsrv_by_name(
             &raw mut rtld_result,
         );
         if err != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] exec: rtld load failed err=");
-            lb.hex(err as u64);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] exec: rtld load failed err=");
+                _lb.hex(err as u64);
+                _lb.str(b"\n");
+            });
             return None;
         }
         Some(rtld_result)
@@ -2404,7 +2453,7 @@ pub(crate) unsafe fn exec_map_stack_mmsrv(
                 || mm_reply.label != BESALT_OK
                 || mm_reply.regs[0] != stack_pages as u64
             {
-                puts(b"[PROCMGR] exec: MM_MAP_BATCH stack failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] exec: MM_MAP_BATCH stack failed\n"); });
                 return -1;
             }
         }
@@ -2427,7 +2476,7 @@ pub(crate) unsafe fn exec_map_stack_mmsrv(
             &raw mut mm_reply,
         );
         if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != 1 {
-            puts(b"[PROCMGR] exec: MM_MAP_WINDOW stack top failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] exec: MM_MAP_WINDOW stack top failed\n"); });
             return -1;
         }
 
@@ -2492,7 +2541,7 @@ pub(crate) unsafe fn exec_map_initrd_mmsrv(
                 &raw mut mm_reply,
             );
             if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != 1 {
-                puts(b"[PROCMGR] exec: initrd MM_MAP_WINDOW failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] exec: initrd MM_MAP_WINDOW failed\n"); });
                 return -1;
             }
 
@@ -2538,7 +2587,7 @@ pub(crate) unsafe fn exec_map_bootinfo_mmsrv(pid: u32) -> i32 {
             &raw mut mm_reply,
         );
         if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != 1 {
-            puts(b"[PROCMGR] exec: bootinfo MM_MAP_WINDOW failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] exec: bootinfo MM_MAP_WINDOW failed\n"); });
             return -1;
         }
 
@@ -2574,7 +2623,7 @@ pub(crate) unsafe fn exec_map_ipc_buf_mmsrv(pid: u32, ipc_buf_vaddr: u64) -> i32
             &raw mut mm_reply,
         );
         if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != 1 {
-            puts(b"[PROCMGR] exec: IPC buf MM_MAP_BATCH failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] exec: IPC buf MM_MAP_BATCH failed\n"); });
             return -1;
         }
         0
@@ -2607,13 +2656,13 @@ pub(crate) fn register_with_mmsrv(pid: u32, vspace_cap: Cap, heap_base: u64, mma
             &raw mut mm_reply,
         );
         if err != 0 || mm_reply.label != BESALT_OK {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] register_with_mmsrv failed pid=");
-            lb.hex(pid as u64);
-            lb.str(b" err=");
-            lb.hex(err as u64);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] register_with_mmsrv failed pid=");
+                _lb.hex(pid as u64);
+                _lb.str(b" err=");
+                _lb.hex(err as u64);
+                _lb.str(b"\n");
+            });
         }
     }
 }
@@ -2625,13 +2674,13 @@ pub(crate) fn clear_fault_handler(tcb_cap: Cap, pid: u32) {
 
     let err = besalt::invoke::tcb_set_fault_handler(tcb_cap, 0);
     if err != 0 {
-        let mut lb = LineBuf::new();
-        lb.str(b"[PROCMGR] WARN: clear fault handler failed pid=");
-        lb.hex(pid as u64);
-        lb.str(b" err=");
-        lb.hex(err as u64);
-        lb.str(b"\n");
-        lb.flush();
+        besalt::uwarn!(|_lb| {
+            _lb.str(b"[PROCMGR] WARN: clear fault handler failed pid=");
+            _lb.hex(pid as u64);
+            _lb.str(b" err=");
+            _lb.hex(err as u64);
+            _lb.str(b"\n");
+        });
     }
 }
 
@@ -2708,13 +2757,11 @@ pub unsafe fn handle_spawn_tx(
         let (name, name_len) = super::extract_name(msg, name_reg_idx);
         let is_display = policy_is_display || super::bytes_eq(&name[..name_len], b"display");
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] SPAWN: '");
-            lb.bytes(&name[..name_len]);
-            lb.str(b"'\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] SPAWN: '");
+            _lb.bytes(&name[..name_len]);
+            _lb.str(b"'\n");
+        });
 
         let initrd = super::INITRD_VADDR as *const u8;
         let initrd_size = super::read_boot_info_initrd_size();
@@ -2760,7 +2807,7 @@ pub unsafe fn handle_spawn_tx(
             }
         }
         if !found {
-            puts(b"[PROCMGR] ELF not found in initrd or VFS\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] ELF not found in initrd or VFS\n"); });
             reply.label = BESALT_NOT_FOUND;
             return;
         }
@@ -2836,7 +2883,7 @@ pub unsafe fn handle_spawn_tx(
         );
 
         if layout.stack_top == 0 {
-            puts(b"[PROCMGR] ELF too large for VA layout\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] ELF too large for VA layout\n"); });
             super::vfs_load::cleanup_exec_source(&mut vfs_source);
             reply.label = BESALT_INVALID_ARGUMENT;
             return;
@@ -2864,7 +2911,7 @@ pub unsafe fn handle_spawn_tx(
         }
 
         let Some(slot_idx) = proc_table::alloc_proc() else {
-            puts(b"[PROCMGR] process table full\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] process table full\n"); });
             super::vfs_load::cleanup_exec_source(&mut vfs_source);
             reply.label = BESALT_OUT_OF_MEMORY;
             return;
@@ -2875,7 +2922,7 @@ pub unsafe fn handle_spawn_tx(
 
         // ---- RESERVE ----
         if !alloc.reserve(plan.total_slots) {
-            puts(b"[PROCMGR] slot reservation failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] slot reservation failed\n"); });
             super::vfs_load::cleanup_exec_source(&mut vfs_source);
             reply.label = BESALT_OUT_OF_MEMORY;
             return;
@@ -2889,13 +2936,13 @@ pub unsafe fn handle_spawn_tx(
                 match alloc.realize_via_mmsrv(CAP_MMSRV_EP, $ty, $sz, $off) {
                     Ok(s) => s,
                     Err(e) => {
-                        let mut lb = LineBuf::new();
-                        lb.str(b"[PROCMGR] alloc ");
-                        lb.bytes($what);
-                        lb.str(b" failed err=");
-                        lb.hex(e as u64);
-                        lb.str(b"\n");
-                        lb.flush();
+                        besalt::uerror!(|_lb| {
+                            _lb.str(b"[PROCMGR] alloc ");
+                            _lb.bytes($what);
+                            _lb.str(b" failed err=");
+                            _lb.hex(e as u64);
+                            _lb.str(b"\n");
+                        });
                         super::vfs_load::cleanup_exec_source(&mut vfs_source);
                         alloc.rollback();
                         reply.label = BESALT_OUT_OF_MEMORY;
@@ -2933,7 +2980,7 @@ pub unsafe fn handle_spawn_tx(
             pid as u64,
         );
         if err != 0 {
-            puts(b"[PROCMGR] mint mmsrv EP into child failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] mint mmsrv EP into child failed\n"); });
             super::vfs_load::cleanup_exec_source(&mut vfs_source);
             alloc.rollback();
             reply.label = BESALT_OUT_OF_MEMORY;
@@ -2971,14 +3018,14 @@ pub unsafe fn handle_spawn_tx(
                 cs_badge,
             );
             if err != 0 {
-                puts(b"[PROCMGR] WARN: mint cspace ntfn cap failed\n");
+                besalt::uwarn!(|_lb| { _lb.str(b"[PROCMGR] WARN: mint cspace ntfn cap failed\n"); });
             }
         }
 
         // ---- Configure TCB ----
         let err = besalt::invoke::tcb_set_space(child_tcb, child_cn, child_vs);
         if err != 0 {
-            puts(b"[PROCMGR] TCB set_space failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] TCB set_space failed\n"); });
             super::vfs_load::cleanup_exec_source(&mut vfs_source);
             alloc.rollback();
             reply.label = BESALT_OUT_OF_MEMORY;
@@ -2990,7 +3037,7 @@ pub unsafe fn handle_spawn_tx(
             let temp_slot = match alloc.alloc_single_slot() {
                 Some(s) => s,
                 None => {
-                    puts(b"[PROCMGR] SPAWN: fault EP slot alloc failed\n");
+                    besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] SPAWN: fault EP slot alloc failed\n"); });
                     super::vfs_load::cleanup_exec_source(&mut vfs_source);
                     alloc.rollback();
                     reply.label = BESALT_OUT_OF_MEMORY;
@@ -3005,19 +3052,19 @@ pub unsafe fn handle_spawn_tx(
                 pid as u64,
             );
             if err != 0 {
-                let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR] WARN: fault EP mint failed err=");
-                lb.hex(err as u64);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::uwarn!(|_lb| {
+                    _lb.str(b"[PROCMGR] WARN: fault EP mint failed err=");
+                    _lb.hex(err as u64);
+                    _lb.str(b"\n");
+                });
             } else {
                 let err2 = besalt::invoke::tcb_set_fault_handler(child_tcb, temp_slot);
                 if err2 != 0 {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[PROCMGR] WARN: tcb_set_fault_handler failed err=");
-                    lb.hex(err2 as u64);
-                    lb.str(b"\n");
-                    lb.flush();
+                    besalt::uwarn!(|_lb| {
+                        _lb.str(b"[PROCMGR] WARN: tcb_set_fault_handler failed err=");
+                        _lb.hex(err2 as u64);
+                        _lb.str(b"\n");
+                    });
                 }
             }
             besalt::invoke::cnode_delete(CAP_SELF_CSPACE, temp_slot);
@@ -3044,11 +3091,11 @@ pub unsafe fn handle_spawn_tx(
                 &raw mut mm_reply,
             );
             if err != 0 || mm_reply.label != BESALT_OK {
-                let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR] SPAWN: mmsrv register failed err=");
-                lb.hex(err as u64);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] SPAWN: mmsrv register failed err=");
+                    _lb.hex(err as u64);
+                    _lb.str(b"\n");
+                });
                 super::vfs_load::cleanup_exec_source(&mut vfs_source);
                 alloc.rollback();
                 reply.label = BESALT_OUT_OF_MEMORY;
@@ -3081,11 +3128,11 @@ pub unsafe fn handle_spawn_tx(
             )
         };
         if err != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] SPAWN: ELF load failed err=");
-            lb.hex(err as u64);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] SPAWN: ELF load failed err=");
+                _lb.hex(err as u64);
+                _lb.str(b"\n");
+            });
             super::vfs_load::cleanup_exec_source(&mut vfs_source);
             deregister_from_mmsrv(pid);
             alloc.rollback();
@@ -3142,7 +3189,7 @@ pub unsafe fn handle_spawn_tx(
         // ---- Schedule ----
         let err = besalt::invoke::sc_configure(child_sc, 10000, 100000);
         if err != 0 {
-            puts(b"[PROCMGR] SC configure failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] SC configure failed\n"); });
             super::vfs_load::cleanup_exec_source(&mut vfs_source);
             alloc.rollback();
             reply.label = BESALT_OUT_OF_MEMORY;
@@ -3150,7 +3197,7 @@ pub unsafe fn handle_spawn_tx(
         }
         let err = besalt::invoke::sc_bind(child_sc, child_tcb);
         if err != 0 {
-            puts(b"[PROCMGR] SC bind failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] SC bind failed\n"); });
             super::vfs_load::cleanup_exec_source(&mut vfs_source);
             alloc.rollback();
             reply.label = BESALT_OUT_OF_MEMORY;
@@ -3206,7 +3253,7 @@ pub unsafe fn handle_spawn_tx(
                 || mm_reply.label != BESALT_OK
                 || mm_reply.regs[0] != stack_pages as u64
             {
-                puts(b"[PROCMGR] SPAWN: MM_MAP_BATCH stack failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] SPAWN: MM_MAP_BATCH stack failed\n"); });
                 super::vfs_load::cleanup_exec_source(&mut vfs_source);
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
@@ -3234,7 +3281,7 @@ pub unsafe fn handle_spawn_tx(
                 &raw mut mm_reply,
             );
             if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != 1 {
-                puts(b"[PROCMGR] SPAWN: MM_MAP_WINDOW stack top failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] SPAWN: MM_MAP_WINDOW stack top failed\n"); });
                 super::vfs_load::cleanup_exec_source(&mut vfs_source);
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
@@ -3425,7 +3472,7 @@ pub unsafe fn handle_spawn_tx(
                 &raw mut mm_reply,
             );
             if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != 1 {
-                puts(b"[PROCMGR] SPAWN: MM_MAP_BATCH ipc failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] SPAWN: MM_MAP_BATCH ipc failed\n"); });
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
                 reply.label = BESALT_OUT_OF_MEMORY;
@@ -3436,7 +3483,7 @@ pub unsafe fn handle_spawn_tx(
         // ---- Configure TCB with entry point and stack pointer ----
         let err = besalt::invoke::tcb_configure(child_tcb, child_entry_rip, child_rsp, 0);
         if err != 0 {
-            puts(b"[PROCMGR] TCB configure failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] TCB configure failed\n"); });
             deregister_from_mmsrv(pid);
             alloc.rollback();
             reply.label = BESALT_OUT_OF_MEMORY;
@@ -3444,7 +3491,7 @@ pub unsafe fn handle_spawn_tx(
         }
         let err = besalt::invoke::tcb_set_ipc_buffer(child_tcb, plan.layout.ipc_buf.base);
         if err != 0 {
-            puts(b"[PROCMGR] set child IPC buffer failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] set child IPC buffer failed\n"); });
             deregister_from_mmsrv(pid);
             alloc.rollback();
             reply.label = BESALT_OUT_OF_MEMORY;
@@ -3467,7 +3514,7 @@ pub unsafe fn handle_spawn_tx(
         if !start_suspended {
             let err = besalt::invoke::tcb_resume(child_tcb);
             if err != 0 {
-                puts(b"[PROCMGR] TCB resume failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] TCB resume failed\n"); });
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
                 reply.label = BESALT_OUT_OF_MEMORY;
@@ -3577,13 +3624,11 @@ pub unsafe fn handle_spawn_tx(
             }
         }
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] Process started PID=");
-            lb.hex(pid as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] Process started PID=");
+            _lb.hex(pid as u64);
+            _lb.str(b"\n");
+        });
         reply.label = BESALT_OK;
         reply.length = 1;
         reply.regs[0] = pid as u64;
@@ -3621,13 +3666,13 @@ unsafe fn map_initrd_to_child_tx(
                 VSPACE_FLAG_USER,
             );
             if err != 0 {
-                let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR] initrd device map failed pg=");
-                lb.hex(pg as u64);
-                lb.str(b" err=");
-                lb.hex(err as u64);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] initrd device map failed pg=");
+                    _lb.hex(pg as u64);
+                    _lb.str(b" err=");
+                    _lb.hex(err as u64);
+                    _lb.str(b"\n");
+                });
                 for mapped_pg in 0..pg {
                     besalt::invoke::vspace_unmap(
                         child_vs,
@@ -3665,7 +3710,7 @@ unsafe fn map_initrd_to_child_tx(
                 &raw mut mm_reply,
             );
             if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != 1 {
-                puts(b"[PROCMGR] initrd MM_MAP_WINDOW failed\n");
+                besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] initrd MM_MAP_WINDOW failed\n"); });
                 return -1;
             }
 
@@ -3721,7 +3766,7 @@ unsafe fn map_boot_info_to_child_tx(child_vs: Cap, pid: u32) -> i32 {
             &raw mut mm_reply,
         );
         if err != 0 || mm_reply.label != BESALT_OK || mm_reply.regs[0] != 1 {
-            puts(b"[PROCMGR] bootinfo MM_MAP_WINDOW failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] bootinfo MM_MAP_WINDOW failed\n"); });
             return -1;
         }
 
@@ -3760,7 +3805,7 @@ fn copy_child_caps_tx(
         CAP_RIGHTS_ALL,
     );
     if err != 0 {
-        puts(b"[PROCMGR] copy TCB cap failed\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] copy TCB cap failed\n"); });
         return err;
     }
 
@@ -3772,7 +3817,7 @@ fn copy_child_caps_tx(
         CAP_RIGHTS_ALL,
     );
     if err != 0 {
-        puts(b"[PROCMGR] copy VSpace cap failed\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] copy VSpace cap failed\n"); });
         return err;
     }
 
@@ -3784,7 +3829,7 @@ fn copy_child_caps_tx(
         CAP_RIGHTS_ALL,
     );
     if err != 0 {
-        puts(b"[PROCMGR] copy CNode cap failed\n");
+        besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] copy CNode cap failed\n"); });
         return err;
     }
 
@@ -3796,11 +3841,11 @@ fn copy_child_caps_tx(
         pid as u64,
     );
     if err != 0 {
-        let mut lb = LineBuf::new();
-        lb.str(b"[PROCMGR] mint EP cap failed err=");
-        lb.hex(err as u64);
-        lb.str(b"\n");
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[PROCMGR] mint EP cap failed err=");
+            _lb.hex(err as u64);
+            _lb.str(b"\n");
+        });
         return err;
     }
 
@@ -3812,11 +3857,11 @@ fn copy_child_caps_tx(
             pre_service_ep,
         );
         if err != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] copy pre-service EP failed err=");
-            lb.hex(err as u64);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] copy pre-service EP failed err=");
+                _lb.hex(err as u64);
+                _lb.str(b"\n");
+            });
             return err;
         }
     }
@@ -3829,7 +3874,7 @@ fn copy_child_caps_tx(
         pid as u64,
     );
     if err != 0 {
-        puts(b"[PROCMGR] WARN: mint VFS EP failed, trying unbadged copy\n");
+        besalt::uwarn!(|_lb| { _lb.str(b"[PROCMGR] WARN: mint VFS EP failed, trying unbadged copy\n"); });
         err = besalt::invoke::cnode_copy(
             CAP_SELF_CSPACE,
             CAP_VFS_EP,
@@ -3838,7 +3883,7 @@ fn copy_child_caps_tx(
             CAP_RIGHTS_ALL,
         );
         if err != 0 {
-            puts(b"[PROCMGR] WARN: copy VFS EP cap failed\n");
+            besalt::uwarn!(|_lb| { _lb.str(b"[PROCMGR] WARN: copy VFS EP cap failed\n"); });
         }
     }
 
@@ -3850,7 +3895,7 @@ fn copy_child_caps_tx(
         CAP_RIGHTS_ALL,
     );
     if err != 0 {
-        puts(b"[PROCMGR] WARN: copy Nameserv EP cap failed\n");
+        besalt::uwarn!(|_lb| { _lb.str(b"[PROCMGR] WARN: copy Nameserv EP cap failed\n"); });
     }
 
     err = besalt::invoke::cnode_copy(
@@ -3861,7 +3906,7 @@ fn copy_child_caps_tx(
         CAP_RIGHTS_ALL,
     );
     if err != 0 {
-        puts(b"[PROCMGR] WARN: copy signal ntfn cap failed\n");
+        besalt::uwarn!(|_lb| { _lb.str(b"[PROCMGR] WARN: copy signal ntfn cap failed\n"); });
     }
 
     if with_ready_ntfn {
@@ -3873,7 +3918,7 @@ fn copy_child_caps_tx(
             CAP_RIGHTS_ALL,
         );
         if err != 0 {
-            puts(b"[PROCMGR] copy readiness ntfn cap failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] copy readiness ntfn cap failed\n"); });
             return err;
         }
     }
@@ -3887,7 +3932,7 @@ fn copy_child_caps_tx(
             CAP_RIGHTS_ALL,
         );
         if err != 0 {
-            puts(b"[PROCMGR] WARN: copy framebuffer untyped cap failed\n");
+            besalt::uwarn!(|_lb| { _lb.str(b"[PROCMGR] WARN: copy framebuffer untyped cap failed\n"); });
         }
     }
 
@@ -3900,7 +3945,7 @@ fn copy_child_caps_tx(
         INITRD_COPY_RIGHTS,
     );
     if err != 0 {
-        puts(b"[PROCMGR] WARN: copy initrd untyped cap failed\n");
+        besalt::uwarn!(|_lb| { _lb.str(b"[PROCMGR] WARN: copy initrd untyped cap failed\n"); });
     }
 
     // Note: root untypeds are no longer mirrored to children.

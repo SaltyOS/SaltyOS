@@ -2,7 +2,6 @@
 //! x86_64 console hardware — COM1 serial and PS/2 keyboard I/O via IoPort caps.
 
 use besalt::invoke;
-use besalt::serial;
 
 use crate::kbd::KbdState;
 
@@ -156,5 +155,7 @@ fn kbd_init() {
         }
     }
 
-    serial::serial_puts(b"[CONSOLE] PS/2 keyboard initialized\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[CONSOLE] PS/2 keyboard initialized\n");
+    });
 }

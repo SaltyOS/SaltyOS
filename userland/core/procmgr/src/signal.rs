@@ -2,7 +2,6 @@
 //! Extracted from main.rs for separation of concerns.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 use crate::exit_wait::free_proc_alloc_slots;
@@ -61,15 +60,13 @@ pub(crate) unsafe fn terminate_proc(idx: usize, sig: usize) -> bool {
     unsafe {
         let exit_code = (sig & 0x7f) as i32;
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] SIGKILL/terminate PID=");
-            lb.hex(proctab(idx).pid as u64);
-            lb.str(b" sig=");
-            lb.hex(sig as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] SIGKILL/terminate PID=");
+            _lb.hex(proctab(idx).pid as u64);
+            _lb.str(b" sig=");
+            _lb.hex(sig as u64);
+            _lb.str(b"\n");
+        });
 
         let mut susp_err = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 64);
         if susp_err != 0 {
@@ -83,13 +80,13 @@ pub(crate) unsafe fn terminate_proc(idx: usize, sig: usize) -> bool {
         // suspended; otherwise a still-running thread can execute from freed
         // mappings and fault nondeterministically.
         if susp_err != 0 {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] terminate: suspend failed PID=");
-            lb.hex(proctab(idx).pid as u64);
-            lb.str(b" err=");
-            lb.hex(susp_err as u64);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] terminate: suspend failed PID=");
+                _lb.hex(proctab(idx).pid as u64);
+                _lb.str(b" err=");
+                _lb.hex(susp_err as u64);
+                _lb.str(b"\n");
+            });
             return false;
         }
         // Yield to ensure the target CPU has fully completed the context

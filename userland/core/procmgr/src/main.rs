@@ -17,7 +17,6 @@ mod spawn_tx;
 mod vfs_load;
 
 use besalt::ipc;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 use proc_table::{
@@ -178,9 +177,6 @@ fn read_boot_info_initrd_size() -> usize {
 // Helpers
 // ===========================================================================
 
-fn puts(s: &[u8]) {
-    besalt::serial::serial_puts(s);
-}
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
     &raw mut besalt::__besalt_ipc_ctx
 }
@@ -258,11 +254,11 @@ unsafe fn wait_for_child_ready(
                 return 0;
             }
         } else if poll.error != BESALT_WOULD_BLOCK {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] ready poll failed err=");
-            lb.hex(poll.error);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] ready poll failed err=");
+                _lb.hex(poll.error);
+                _lb.str(b"\n");
+            });
             let _ = besalt::invoke::tcb_suspend_retry(child_tcb, 4);
             return -1;
         }
@@ -301,11 +297,11 @@ unsafe fn wait_for_child_ready(
         yields += 1;
     }
 
-    let mut lb = LineBuf::new();
-    lb.str(b"[PROCMGR] child ready timeout: ");
-    lb.bytes(child_name);
-    lb.str(b"\n");
-    lb.flush();
+    besalt::uerror!(|_lb| {
+        _lb.str(b"[PROCMGR] child ready timeout: ");
+        _lb.bytes(child_name);
+        _lb.str(b"\n");
+    });
     let _ = besalt::invoke::tcb_suspend_retry(child_tcb, 4);
     -1
 }
@@ -457,13 +453,11 @@ unsafe fn handle_request_untyped(
         reply.length = 1;
         reply.regs[0] = actual_bits;
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] Provisioned sub-untyped 2^");
-            lb.hex(actual_bits);
-            lb.str(b" to mmsrv\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] Provisioned sub-untyped 2^");
+            _lb.hex(actual_bits);
+            _lb.str(b" to mmsrv\n");
+        });
     }
 }
 
@@ -473,12 +467,16 @@ unsafe fn handle_request_untyped(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    puts(b"[PROCMGR] SaltyOS process manager starting\n");
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[PROCMGR] SaltyOS process manager starting\n");
+    });
 
     unsafe {
         // Initialize process table (allocates via mmsrv)
         init_proctab();
-        puts(b"[PROCMGR] process table ready\n");
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[PROCMGR] process table ready\n");
+        });
 
         // Initialize the centralized allocator
         (*(&raw mut ALLOCATOR)).init(
@@ -487,7 +485,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             CAP_UNTYPED_START,
             UT_MIRROR_COUNT as usize,
         );
-        puts(b"[PROCMGR] allocator ready\n");
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[PROCMGR] allocator ready\n");
+        });
 
         // Pre-load shared library RO pages into frame cache.
         // Must happen before any allocator use — init copies shared lib caps
@@ -502,7 +502,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             let ntfn_slot = match alloc.alloc_single_slot() {
                 Some(s) => s,
                 None => {
-                    puts(b"[PROCMGR] WARN: could not alloc slot for bound ntfn\n");
+                    besalt::uwarn!(|_lb| {
+                        _lb.str(b"[PROCMGR] WARN: could not alloc slot for bound ntfn\n");
+                    });
                     0
                 }
             };
@@ -528,15 +530,21 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 );
                 let alloc_ok = err == 0 && mm_reply.label == besalt::BESALT_OK;
                 if !alloc_ok {
-                    puts(b"[PROCMGR] WARN: alloc notification from mmsrv failed\n");
+                    besalt::uwarn!(|_lb| {
+                        _lb.str(b"[PROCMGR] WARN: alloc notification from mmsrv failed\n");
+                    });
                     alloc.free_single_slot(ntfn_slot);
                 } else {
                     let err = besalt::invoke::tcb_bind_notification(CAP_SELF_TCB, ntfn_slot);
                     if err != 0 {
-                        puts(b"[PROCMGR] WARN: bind notification failed\n");
+                        besalt::uwarn!(|_lb| {
+                            _lb.str(b"[PROCMGR] WARN: bind notification failed\n");
+                        });
                     } else {
                         *(&raw mut PM_BOUND_NTFN) = ntfn_slot;
-                        puts(b"[PROCMGR] bound notification ready for CSpace expansion\n");
+                        besalt::uinfo!(|_lb| {
+                            _lb.str(b"[PROCMGR] bound notification ready for CSpace expansion\n");
+                        });
                     }
                 }
             }
@@ -568,9 +576,13 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 &raw mut reg_reply,
             );
             if err == 0 && reg_reply.label == BESALT_OK {
-                puts(b"[PROCMGR] registered with nameserv\n");
+                besalt::uinfo!(|_lb| {
+                    _lb.str(b"[PROCMGR] registered with nameserv\n");
+                });
             } else {
-                puts(b"[PROCMGR] WARN: nameserv registration failed\n");
+                besalt::uwarn!(|_lb| {
+                    _lb.str(b"[PROCMGR] WARN: nameserv registration failed\n");
+                });
             }
         }
 
@@ -583,7 +595,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
         let err = besalt::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge);
         if err != 0 {
-            puts(b"[PROCMGR] initial recv failed\n");
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] initial recv failed\n");
+            });
             idle();
         }
 
@@ -652,11 +666,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     PM_UMASK => handle_umask(&msg, &mut reply, badge),
                     PM_REQUEST_UNTYPED => handle_request_untyped(&msg, &mut reply, &mut *(&raw mut ALLOCATOR)),
                     _ => {
-                        let mut lb = LineBuf::new();
-                        lb.str(b"[PROCMGR] unknown label=");
-                        lb.hex(msg.label);
-                        lb.str(b"\n");
-                        lb.flush();
+                        besalt::uerror!(|_lb| {
+                            _lb.str(b"[PROCMGR] unknown label=");
+                            _lb.hex(msg.label);
+                            _lb.str(b"\n");
+                        });
                         reply.label = BESALT_INVALID_OPERATION;
                     }
                 }
@@ -677,11 +691,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 )
             };
             if err != 0 {
-                let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR] reply_recv failed err=");
-                lb.hex(err as u64);
-                lb.str(b"\n");
-                lb.flush();
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] reply_recv failed err=");
+                    _lb.hex(err as u64);
+                    _lb.str(b"\n");
+                });
                 break;
             }
         }

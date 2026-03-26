@@ -14,7 +14,6 @@
 
 use besalt::consts::*;
 use besalt::ipc;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 const CAP_VFS_EP: Cap = super::CAP_VFS_EP;
@@ -363,9 +362,9 @@ unsafe fn read_open_vfs_file_to_buffer(fd: i32, file_size: usize) -> Option<VfsL
             0,
         );
         if buf as usize == usize::MAX {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] VFS: scratch mmap failed\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] VFS: scratch mmap failed\n");
+            });
             return None;
         }
 
@@ -383,13 +382,11 @@ unsafe fn read_open_vfs_file_to_buffer(fd: i32, file_size: usize) -> Option<VfsL
             return None;
         }
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] VFS: loaded ");
-            lb.hex(total_read as u64);
-            lb.str(b" bytes\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] VFS: loaded ");
+            _lb.hex(total_read as u64);
+            _lb.str(b" bytes\n");
+        });
 
         Some(VfsLoadResult {
             data: buf as *const u8,
@@ -419,13 +416,11 @@ pub unsafe fn try_load_from_vfs_for_badge(
         let mut path_buf = [0u8; 256];
         let path_len = build_vfs_path(name, name_len, client_badge, &mut path_buf)?;
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] VFS load: ");
-            lb.bytes(&path_buf[..path_len]);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] VFS load: ");
+            _lb.bytes(&path_buf[..path_len]);
+            _lb.str(b"\n");
+        });
 
         let fd = vfs_open(&path_buf, path_len)?;
 
@@ -439,11 +434,11 @@ pub unsafe fn try_load_from_vfs_for_badge(
         };
 
         if file_size == 0 || file_size > MAX_VFS_FILE_SIZE {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] VFS: bad file size ");
-            lb.hex(file_size as u64);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] VFS: bad file size ");
+                _lb.hex(file_size as u64);
+                _lb.str(b"\n");
+            });
             vfs_close(fd);
             return None;
         }
@@ -517,7 +512,9 @@ unsafe fn ensure_bulk_shm() -> bool {
         }
 
         *(&raw mut BULK_SHM_READY) = true;
-        super::puts(b"[PROCMGR] VFS: SHM bulk setup OK\n");
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] VFS: SHM bulk setup OK\n");
+        });
         true
     }
 }
@@ -602,11 +599,11 @@ unsafe fn vfs_legacy_read_all(
             let got = match vfs_read(fd, buf.add(total_read), chunk) {
                 Some(n) => n,
                 None => {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[PROCMGR] VFS: read failed at offset ");
-                    lb.hex(total_read as u64);
-                    lb.str(b"\n");
-                    lb.flush();
+                    besalt::uerror!(|_lb| {
+                        _lb.str(b"[PROCMGR] VFS: read failed at offset ");
+                        _lb.hex(total_read as u64);
+                        _lb.str(b"\n");
+                    });
                     vfs_close(fd);
                     besalt::posix_mm::posix_munmap(buf, alloc_size);
                     return None;
@@ -959,13 +956,11 @@ pub unsafe fn try_open_exec_source_from_vfs_for_badge(
         let mut path_buf = [0u8; 256];
         let path_len = build_vfs_path(name, name_len, client_badge, &mut path_buf)?;
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] VFS load: ");
-            lb.bytes(&path_buf[..path_len]);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] VFS load: ");
+            _lb.bytes(&path_buf[..path_len]);
+            _lb.str(b"\n");
+        });
 
         let fd = vfs_open(&path_buf, path_len)?;
         let file_size = match vfs_fstat(fd) {
@@ -977,11 +972,11 @@ pub unsafe fn try_open_exec_source_from_vfs_for_badge(
         };
 
         if file_size == 0 || file_size > MAX_VFS_FILE_SIZE {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] VFS: bad file size ");
-            lb.hex(file_size as u64);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] VFS: bad file size ");
+                _lb.hex(file_size as u64);
+                _lb.str(b"\n");
+            });
             vfs_close(fd);
             return None;
         }

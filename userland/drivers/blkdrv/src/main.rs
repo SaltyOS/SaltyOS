@@ -35,8 +35,6 @@ mod handlers;
 
 use besalt::consts::*;
 use besalt::ipc;
-use besalt::serial;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 const CAP_SERVER_EP: u64 = 68;
@@ -71,10 +69,6 @@ static mut QUEUE_AVAIL_OFF: u64 = 0;
 static mut QUEUE_USED_OFF: u64 = 0;
 static mut QUEUE_EVENT_IDX: bool = false;
 
-fn puts(s: &[u8]) {
-    serial::serial_puts(s);
-}
-
 fn ipc_ctx() -> *mut IpcContext {
     &raw mut besalt::__besalt_ipc_ctx
 }
@@ -96,11 +90,11 @@ fn setup_shm() -> bool {
     let mut reply = BesaltMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || (reply.label != 0 && reply.label != BESALT_ALREADY_EXISTS) {
-        let mut lb = LineBuf::new();
-        lb.str(b"[blkdrv] SHM create failed: ");
-        lb.dec(if err != 0 { err as u64 } else { reply.label });
-        lb.putc(b'\n');
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[blkdrv] SHM create failed: ");
+            _lb.dec(if err != 0 { err as u64 } else { reply.label });
+            _lb.putc(b'\n');
+        });
         return false;
     }
 
@@ -115,15 +109,15 @@ fn setup_shm() -> bool {
     let mut reply = BesaltMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
-        let mut lb = LineBuf::new();
-        lb.str(b"[blkdrv] SHM map failed: ");
-        lb.dec(if err != 0 { err as u64 } else { reply.label });
-        lb.putc(b'\n');
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[blkdrv] SHM map failed: ");
+            _lb.dec(if err != 0 { err as u64 } else { reply.label });
+            _lb.putc(b'\n');
+        });
         return false;
     }
 
-    puts(b"[blkdrv] SHM region mapped\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[blkdrv] SHM region mapped\n"); });
     true
 }
 
@@ -143,14 +137,14 @@ fn register_nameserv() {
         let mut reply = BesaltMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const msg, &raw mut reply);
         if err != 0 || reply.label != BESALT_OK {
-            puts(b"[blkdrv] nameserv registration failed\n");
+            besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] nameserv registration failed\n"); });
         }
     }
 }
 
 /// Server main loop.
 fn server_loop() -> ! {
-    puts(b"[blkdrv] Entering server loop\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[blkdrv] Entering server loop\n"); });
 
     let ctx = ipc_ctx();
     let mut msg = BesaltMsg::zeroed();
@@ -187,12 +181,12 @@ fn server_loop() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    puts(b"[blkdrv] virtio-blk Block Device Driver starting\n");
+    besalt::uinfo!(|_lb| { _lb.str(b"[blkdrv] virtio-blk Block Device Driver starting\n"); });
 
     // Try modern virtio (device ID 0x1042) first
     let mut initialized = false;
     if let Some((bus, dev, func)) = virtio_modern::find_virtio_blk_modern() {
-        puts(b"[blkdrv] Found modern virtio-blk device\n");
+        besalt::uinfo!(|_lb| { _lb.str(b"[blkdrv] Found modern virtio-blk device\n"); });
         if virtio_modern::init_virtio_modern(bus, dev, func) {
             unsafe { *(&raw mut USING_MODERN_TRANSPORT) = true; }
             initialized = true;
@@ -203,31 +197,27 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     if !initialized {
         match virtio::find_virtio_blk() {
             Some((bus, dev, func, bar0, _bar0_full)) => {
-                {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[blkdrv] Found virtio-blk at ");
-                    lb.dec(bus as u64);
-                    lb.putc(b':');
-                    lb.dec(dev as u64);
-                    lb.str(b" BAR0=");
-                    lb.hex(bar0 as u64);
-                    lb.putc(b'\n');
-                    lb.flush();
-                }
+                besalt::uinfo!(|_lb| {
+                    _lb.str(b"[blkdrv] Found virtio-blk at ");
+                    _lb.dec(bus as u64);
+                    _lb.putc(b':');
+                    _lb.dec(dev as u64);
+                    _lb.str(b" BAR0=");
+                    _lb.hex(bar0 as u64);
+                    _lb.putc(b'\n');
+                });
 
                 let Some((_bar_phys, _bar_bits, bar_size, irq, _bar_is_io)) = virtio::get_device_caps(bus, dev, func) else {
-                    puts(b"[blkdrv] Failed to get PCI caps from pcisrv\n");
+                    besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] Failed to get PCI caps from pcisrv\n"); });
                     register_nameserv();
                     signal_ready();
                     server_loop()
                 };
-                {
-                    let mut lb = LineBuf::new();
-                    lb.str(b"[blkdrv] IRQ=");
-                    lb.dec(irq as u64);
-                    lb.putc(b'\n');
-                    lb.flush();
-                }
+                besalt::uinfo!(|_lb| {
+                    _lb.str(b"[blkdrv] IRQ=");
+                    _lb.dec(irq as u64);
+                    _lb.putc(b'\n');
+                });
 
                 // Transitional device (0x1001): try modern transport first.
                 // Modern transport handles non-contiguous virtqueue memory
@@ -236,20 +226,20 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     unsafe { *(&raw mut USING_MODERN_TRANSPORT) = true; }
                     handlers::clear_pending_irq();
                 } else if !virtio::init_virtio(bar0, bar_size) {
-                    puts(b"[blkdrv] Failed to init virtio transport\n");
-                    puts(b"[blkdrv] Running in stub mode -- no actual I/O\n");
+                    besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] Failed to init virtio transport\n"); });
+                    besalt::uwarn!(|_lb| { _lb.str(b"[blkdrv] Running in stub mode -- no actual I/O\n"); });
                 } else {
                     handlers::clear_pending_irq();
                 }
             }
             None => {
-                puts(b"[blkdrv] No virtio-blk device found -- running in stub mode\n");
+                besalt::uwarn!(|_lb| { _lb.str(b"[blkdrv] No virtio-blk device found -- running in stub mode\n"); });
             }
         }
     }
 
     if !setup_shm() {
-        puts(b"[blkdrv] SHM setup failed -- continuing without SHM\n");
+        besalt::uwarn!(|_lb| { _lb.str(b"[blkdrv] SHM setup failed -- continuing without SHM\n"); });
     }
 
     register_nameserv();

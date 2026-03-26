@@ -3,12 +3,11 @@
 
 use besalt::consts::*;
 use besalt::ipc;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 use crate::consts::*;
 use crate::types::*;
-use crate::{ipc_ctx, puts};
+use crate::ipc_ctx;
 
 /// Maximum size of the work buffer used during mount path traversal.
 /// Must accommodate a symlink target (up to 152 bytes) plus "/" plus the
@@ -868,7 +867,9 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
         let fs_slot = match besalt::slot_alloc::slot_alloc() {
             Some(s) => s,
             None => {
-                puts(b"[VFS] saltyfs: no slot available\n");
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[VFS] saltyfs: no slot available\n");
+                });
                 return;
             }
         };
@@ -894,11 +895,15 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
         );
 
         if err != 0 || ns_reply.label != BESALT_OK {
-            puts(b"[VFS] saltyfs not found in nameserv (ok if no data disk)\n");
+            besalt::udebug!(|_lb| {
+                _lb.str(b"[VFS] saltyfs not found in nameserv (ok if no data disk)\n");
+            });
             return;
         }
 
-        puts(b"[VFS] Found saltyfs endpoint via nameserv\n");
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[VFS] Found saltyfs endpoint via nameserv\n");
+        });
 
         let mut mnt_req = BesaltMsg::zeroed();
         mnt_req.label = SALTYFS_MOUNT;
@@ -908,15 +913,13 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
         let merr = ipc::call_ctx(ipc_ctx(), fs_slot, &raw const mnt_req, &raw mut mnt_reply);
 
         if merr != 0 || (mnt_reply.label != BESALT_OK && mnt_reply.label != BESALT_ALREADY_EXISTS) {
-            {
-                let mut lb = LineBuf::new();
-                lb.str(b"[VFS] saltyfs mount failed err=");
-                lb.hex(merr as u64);
-                lb.str(b" label=");
-                lb.hex(mnt_reply.label);
-                lb.str(b"\n");
-                lb.flush();
-            }
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[VFS] saltyfs mount failed err=");
+                _lb.hex(merr as u64);
+                _lb.str(b" label=");
+                _lb.hex(mnt_reply.label);
+                _lb.str(b"\n");
+            });
             return;
         }
 
@@ -934,13 +937,11 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
             }
         }
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[VFS] Mounted saltyfs as root underlay root_ino=");
-            lb.hex(root_ino as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::uinfo!(|_lb| {
+            _lb.str(b"[VFS] Mounted saltyfs as root underlay root_ino=");
+            _lb.hex(root_ino as u64);
+            _lb.str(b"\n");
+        });
 
         // Set up VFS-SaltyFS SHM for bulk data transport
         let mut shm_create = BesaltMsg::zeroed();
@@ -955,7 +956,9 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
             &raw const shm_create, &raw mut shm_reply,
         );
         if serr != 0 || (shm_reply.label != 0 && shm_reply.label != BESALT_ALREADY_EXISTS) {
-            puts(b"[VFS] saltyfs SHM create failed (non-fatal)\n");
+            besalt::uwarn!(|_lb| {
+                _lb.str(b"[VFS] saltyfs SHM create failed (non-fatal)\n");
+            });
         } else {
             // Map SHM into VFS address space
             let mut shm_map = BesaltMsg::zeroed();
@@ -972,7 +975,9 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
                 &raw const shm_map, &raw mut map_reply,
             );
             if merr2 != 0 || map_reply.label != 0 {
-                puts(b"[VFS] saltyfs SHM map failed (non-fatal)\n");
+                besalt::uwarn!(|_lb| {
+                    _lb.str(b"[VFS] saltyfs SHM map failed (non-fatal)\n");
+                });
             } else {
                 // Send SHM ID to SaltyFS so it can map the same region
                 let mut setup_msg = BesaltMsg::zeroed();
@@ -986,10 +991,14 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
                     &raw const setup_msg, &raw mut setup_reply,
                 );
                 if serr2 == 0 && setup_reply.label == BESALT_OK {
-                    puts(b"[VFS] saltyfs SHM transport established\n");
+                    besalt::uinfo!(|_lb| {
+                        _lb.str(b"[VFS] saltyfs SHM transport established\n");
+                    });
                     *(&raw mut crate::VFS_SHM_ACTIVE) = true;
                 } else {
-                    puts(b"[VFS] saltyfs SHM setup failed (non-fatal)\n");
+                    besalt::uwarn!(|_lb| {
+                        _lb.str(b"[VFS] saltyfs SHM setup failed (non-fatal)\n");
+                    });
                     // Cleanup: unmap VFS SHM since SaltyFS didn't establish transport
                     let mut shm_unmap = BesaltMsg::zeroed();
                     shm_unmap.label = MM_SHM_UNMAP;

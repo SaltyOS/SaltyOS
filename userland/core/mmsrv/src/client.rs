@@ -1,6 +1,5 @@
 use crate::types::*;
 use besalt::consts::*;
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 pub(crate) unsafe fn find_client_by_badge(badge: u64) -> *mut MmClient {
@@ -45,13 +44,11 @@ pub(crate) unsafe fn find_free_client_slot() -> *mut MmClient {
         let free = new_ptr.add(cap);
         *(&raw mut super::CLIENTS_PTR) = new_ptr;
         *(&raw mut super::CLIENTS_CAP) = new_cap;
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[MMSRV] clients grown to ");
-            lb.hex(new_cap as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[MMSRV] clients grown to ");
+            _lb.hex(new_cap as u64);
+            _lb.str(b"\n");
+        });
         free
     }
 }
@@ -129,11 +126,11 @@ pub(crate) unsafe fn handle_mm_register(msg: *const BesaltMsg, _caller_badge: u6
 
         // Check for duplicate
         if !find_client_by_badge(client_badge).is_null() {
-            let mut lb = LineBuf::new();
-            lb.str(b"[MMSRV] REGISTER: duplicate badge=");
-            lb.hex(client_badge);
-            lb.str(b"\n");
-            lb.flush();
+            besalt::uwarn!(|_lb| {
+                _lb.str(b"[MMSRV] REGISTER: duplicate badge=");
+                _lb.hex(client_badge);
+                _lb.str(b"\n");
+            });
             (*reply).label = BESALT_ALREADY_EXISTS;
             return;
         }
@@ -141,7 +138,9 @@ pub(crate) unsafe fn handle_mm_register(msg: *const BesaltMsg, _caller_badge: u6
         // Find free slot in client table (grows if needed)
         let slot = find_free_client_slot();
         if slot.is_null() {
-            super::puts(b"[MMSRV] REGISTER: client table full, grow failed\n");
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[MMSRV] REGISTER: client table full, grow failed\n");
+            });
             (*reply).label = BESALT_OUT_OF_MEMORY;
             return;
         }
@@ -166,19 +165,17 @@ pub(crate) unsafe fn handle_mm_register(msg: *const BesaltMsg, _caller_badge: u6
         // This handler permanently keeps the VSpace cap
         super::mark_recv_slot_kept();
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[MMSRV] registered client badge=");
-            lb.hex(client_badge);
-            lb.str(b" pid=");
-            lb.hex(pid as u64);
-            lb.str(b" heap=");
-            lb.hex(heap_base);
-            lb.str(b" mmap=");
-            lb.hex(mmap_base);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[MMSRV] registered client badge=");
+            _lb.hex(client_badge);
+            _lb.str(b" pid=");
+            _lb.hex(pid as u64);
+            _lb.str(b" heap=");
+            _lb.hex(heap_base);
+            _lb.str(b" mmap=");
+            _lb.hex(mmap_base);
+            _lb.str(b"\n");
+        });
 
         (*reply).label = BESALT_OK;
     }
@@ -218,17 +215,17 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: 
                                     page_count,
                                 );
                                 if err != 0 {
-                                    let mut lb = LineBuf::new();
-                                    lb.str(b"[MMSRV] DEREGISTER: unmap_mo failed badge=");
-                                    lb.hex(client_badge);
-                                    lb.str(b" base=");
-                                    lb.hex((*r).base);
-                                    lb.str(b" pages=");
-                                    lb.hex(page_count);
-                                    lb.str(b" err=");
-                                    lb.hex(err as u64);
-                                    lb.str(b"\n");
-                                    lb.flush();
+                                    besalt::uerror!(|_lb| {
+                                        _lb.str(b"[MMSRV] DEREGISTER: unmap_mo failed badge=");
+                                        _lb.hex(client_badge);
+                                        _lb.str(b" base=");
+                                        _lb.hex((*r).base);
+                                        _lb.str(b" pages=");
+                                        _lb.hex(page_count);
+                                        _lb.str(b" err=");
+                                        _lb.hex(err as u64);
+                                        _lb.str(b"\n");
+                                    });
                                 }
                             }
                         } else {
@@ -258,15 +255,13 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: 
         (*client).badge = 0;
         *(&raw mut super::CLIENT_COUNT) -= 1;
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[MMSRV] deregistered client badge=");
-            lb.hex(client_badge);
-            lb.str(b" pid=");
-            lb.hex(pid as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[MMSRV] deregistered client badge=");
+            _lb.hex(client_badge);
+            _lb.str(b" pid=");
+            _lb.hex(pid as u64);
+            _lb.str(b"\n");
+        });
 
         (*reply).label = BESALT_OK;
     }

@@ -2,7 +2,6 @@
 //! Extracted from main.rs for separation of concerns.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::serial::LineBuf;
 use besalt::types::*;
 
 use crate::proc_table::{alloc_proc, find_by_badge, proctab, proctab_cap, NEXT_PID, PROC_RUNNING};
@@ -83,11 +82,11 @@ pub(crate) unsafe fn handle_expand_cspace(msg: &BesaltMsg, reply: &mut BesaltMsg
     // Address encoding: (root_idx << sub_bits) | sub_idx.
     let err = besalt::invoke::cnode_set_guard(temp_slot, 0, 0);
     if err != 0 {
-        let mut lb = LineBuf::new();
-        lb.str(b"[PROCMGR] set_guard failed err=");
-        lb.hex(err as u64);
-        lb.str(b"\n");
-        lb.flush();
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[PROCMGR] set_guard failed err=");
+            _lb.hex(err as u64);
+            _lb.str(b"\n");
+        });
         besalt::invoke::cnode_delete(super::CAP_SELF_CSPACE, temp_slot);
         unsafe { (&mut *(&raw mut super::ALLOCATOR)).free_single_slot(temp_slot) };
         reply.label = super::BESALT_INVALID_OPERATION;
@@ -301,17 +300,15 @@ pub(crate) unsafe fn handle_cspace_expand_ntfn(bits: u64) {
 
             proctab(i).cspace_expand_count += 1;
 
-            {
-                let mut lb = LineBuf::new();
-                lb.str(b"[PROCMGR] cspace-expand: granted ");
-                lb.hex(1u64 << super::CSPACE_EXPAND_BITS);
-                lb.str(b" slots to idx=");
-                lb.hex(i as u64);
-                lb.str(b" root_slot=");
-                lb.hex(dest_child_slot);
-                lb.str(b"\n");
-                lb.flush();
-            }
+            besalt::udebug!(|_lb| {
+                _lb.str(b"[PROCMGR] cspace-expand: granted ");
+                _lb.hex(1u64 << super::CSPACE_EXPAND_BITS);
+                _lb.str(b" slots to idx=");
+                _lb.hex(i as u64);
+                _lb.str(b" root_slot=");
+                _lb.hex(dest_child_slot);
+                _lb.str(b"\n");
+            });
         }
     }
 }
@@ -386,15 +383,13 @@ pub(crate) unsafe fn handle_register(msg: &BesaltMsg, reply: &mut BesaltMsg, _ba
             );
         }
 
-        {
-            let mut lb = LineBuf::new();
-            lb.str(b"[PROCMGR] PM_REGISTER badge=");
-            lb.hex(reg_badge);
-            lb.str(b" pid=");
-            lb.hex(proctab(ci).pid as u64);
-            lb.str(b"\n");
-            lb.flush();
-        }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] PM_REGISTER badge=");
+            _lb.hex(reg_badge);
+            _lb.str(b" pid=");
+            _lb.hex(proctab(ci).pid as u64);
+            _lb.str(b"\n");
+        });
 
         reply.label = super::BESALT_OK;
         reply.length = 1;
