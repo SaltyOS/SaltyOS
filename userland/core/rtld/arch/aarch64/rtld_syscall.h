@@ -62,17 +62,4 @@ static inline void __attribute__((naked, noreturn)) rtld_start_arch(void) {
     );
 }
 
-/* Jump to executable entry point */
-static inline void __attribute__((noreturn)) rtld_jump_entry_arch(uint64_t sp, void *entry) {
-    __asm__ volatile(
-        "mov sp, %0\n"
-        "mov x29, xzr\n"
-        "mov x30, xzr\n"
-        "br %1\n"
-        : : "r"(sp), "r"(entry)
-        : "memory"
-    );
-    __builtin_unreachable();
-}
-
 #endif

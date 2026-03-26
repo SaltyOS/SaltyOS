@@ -258,7 +258,7 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         if (exe_ehdr->e_ident[0] == 0x7F && exe_ehdr->e_ident[1] == 'E' &&
             exe_ehdr->e_ident[2] == 'L'  && exe_ehdr->e_ident[3] == 'F') {
             exe_load_delta = at_phdr - exe_ehdr->e_phoff;
-            rtld_puts("[RTLD] PT_PHDR missing, computed delta from ELF header\n");
+            rtld_dbg_puts("[RTLD] PT_PHDR missing, computed delta from ELF header\n");
         } else {
             rtld_puts("[RTLD] WARN: no PT_PHDR and ELF header not found\n");
         }
@@ -334,6 +334,18 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
                     rtld_lb_str(&lb, "\n");
                     rtld_lb_flush(&lb);
                     rtld_exit(127);
+                }
+
+                /* Debug: log successful library load */
+                {
+                    struct rtld_linebuf dlb;
+                    rtld_dbg_lb_init(&dlb);
+                    rtld_dbg_lb_str(&dlb, "[RTLD] loaded ");
+                    rtld_dbg_lb_str(&dlb, lib_name);
+                    rtld_dbg_lb_str(&dlb, " at ");
+                    rtld_dbg_lb_hex(&dlb, lib_load_addr);
+                    rtld_dbg_lb_str(&dlb, "\n");
+                    rtld_dbg_lb_flush(&dlb);
                 }
 
                 /* Advance load address by actual library footprint + 1-page gap */
@@ -443,10 +455,5 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
      *   - RSP % 16 == 8 at entry
      * Startup code for both C and Rust relies on this contract.
      */
-#if defined(__aarch64__)
-    /* Ensure all prior stores (GOT patches, PLT binding, TLS exports) are
-     * globally visible before jumping to the executable entry point. */
-    __asm__ volatile("dsb ish\n" "isb\n" : : : "memory");
-#endif
-    rtld_jump_entry_arch((uint64_t)(uintptr_t)sp, (void *)(uintptr_t)g_rtld.exe_entry);
+    rtld_jump_entry((uint64_t)(uintptr_t)sp, (void *)(uintptr_t)g_rtld.exe_entry);
 }

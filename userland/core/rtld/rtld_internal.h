@@ -88,6 +88,22 @@ static inline void rtld_hex(uint64_t val) {
     rtld_puts(buf);
 }
 
+/* Conditional debug output — compiled out unless -DRTLD_DEBUG is passed.
+ * Error/fatal messages always use the unconditional rtld_puts/rtld_lb_* directly. */
+#ifdef RTLD_DEBUG
+  #define rtld_dbg_puts(s) rtld_puts(s)
+  #define rtld_dbg_lb_init(lb) rtld_lb_init(lb)
+  #define rtld_dbg_lb_str(lb, s) rtld_lb_str(lb, s)
+  #define rtld_dbg_lb_hex(lb, v) rtld_lb_hex(lb, v)
+  #define rtld_dbg_lb_flush(lb) rtld_lb_flush(lb)
+#else
+  #define rtld_dbg_puts(s) ((void)0)
+  #define rtld_dbg_lb_init(lb) ((void)0)
+  #define rtld_dbg_lb_str(lb, s) ((void)0)
+  #define rtld_dbg_lb_hex(lb, v) ((void)0)
+  #define rtld_dbg_lb_flush(lb) ((void)0)
+#endif
+
 /* Line buffer for compound output (build a full line, flush atomically) */
 struct rtld_linebuf {
     char buf[128];
@@ -613,6 +629,7 @@ uint64_t _dl_fixup(struct link_map *map, uint64_t reloc_index);
 
 /* Defined in rtld_resolve.S */
 extern void _dl_runtime_resolve(void);
+extern void __attribute__((noreturn)) rtld_jump_entry(uint64_t sp, void *entry);
 
 /* Page alignment helpers */
 static inline uint64_t rtld_page_align_down(uint64_t v) {

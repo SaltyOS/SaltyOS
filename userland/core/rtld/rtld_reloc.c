@@ -205,9 +205,9 @@ uint64_t _dl_fixup(struct link_map *map, uint64_t reloc_index) {
     Elf64_Sym *sym = &map->symtab[sym_idx];
     const char *name = map->strtab + sym->st_name;
 
-    { struct rtld_linebuf lb; rtld_lb_init(&lb);
-      rtld_lb_str(&lb, "[RTLD] Lazy resolve: ");
-      rtld_lb_str(&lb, name); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
+    { struct rtld_linebuf lb; rtld_dbg_lb_init(&lb);
+      rtld_dbg_lb_str(&lb, "[RTLD] Lazy resolve: ");
+      rtld_dbg_lb_str(&lb, name); rtld_dbg_lb_str(&lb, "\n"); rtld_dbg_lb_flush(&lb); }
 
     uint64_t addr = resolve_symbol_addr(&g_rtld, name);
 

@@ -83,3 +83,21 @@ _tlsdesc_static_resolver:
     ret
 
 .size _tlsdesc_static_resolver, . - _tlsdesc_static_resolver
+
+/*
+ * rtld_jump_entry - transfer control to the executable entry point.
+ *
+ * Arguments: x0 = sp, x1 = entry.  Does not return.
+ */
+.globl rtld_jump_entry
+.type rtld_jump_entry, @function
+
+rtld_jump_entry:
+    dsb     ish
+    isb
+    mov     sp, x0
+    mov     x29, xzr
+    mov     x30, xzr
+    br      x1
+
+.size rtld_jump_entry, . - rtld_jump_entry
