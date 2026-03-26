@@ -158,8 +158,10 @@ rust_kernel_args = [
   '--target=' + rust_kernel_target,
   '-C', 'panic=abort',
   '-C', 'opt-level=2',
-  '-C', 'debuginfo=2',
 ]
+if get_option('debug_symbols')
+  rust_kernel_args += ['-C', 'debuginfo=2']
+endif
 if rust_kernel_target_needs_unstable
   rust_kernel_args += ['-Z', 'unstable-options']
 endif

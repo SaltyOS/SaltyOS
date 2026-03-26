@@ -56,6 +56,22 @@ else  # 'error' or unrecognized
   rust_log_cfgs = []
 endif
 
+# Global serial output kill switch. When debug_serial=false, all locked serial
+# output and debug syscalls become no-ops. Panic/crash raw output is unaffected.
+if not get_option('debug_serial')
+  rust_log_cfgs += ['--cfg', 'no_serial_output']
+endif
+
+# Per-module debug flags. When kernel_debug_modules='mm,ipc', generate
+# --cfg klog_mod_mm --cfg klog_mod_ipc so that kdebug!(mm, ...) compiles
+# in even when the global kernel_log_level is below 'debug'.
+kernel_debug_mods = get_option('kernel_debug_modules')
+if kernel_debug_mods != ''
+  foreach mod : kernel_debug_mods.split(',')
+    rust_log_cfgs += ['--cfg', 'klog_mod_' + mod.strip()]
+  endforeach
+endif
+
 # Step 1: Compile Rust kernel to object file
 # Uses custom-built core library instead of sysroot
 kernel_obj = custom_target('kernel_obj',

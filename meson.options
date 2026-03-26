@@ -47,6 +47,22 @@ option('kernel_log_level',
   value: 'info',
   description: 'Kernel log verbosity level')
 
+option('userland_log_level',
+  type: 'combo',
+  choices: ['error', 'warn', 'info', 'debug', 'trace'],
+  value: 'info',
+  description: 'Userland log verbosity level')
+
+option('kernel_debug_modules',
+  type: 'string',
+  value: '',
+  description: 'Comma-separated kernel modules to enable debug logging (e.g., mm,ipc,init,arch,cap,sched,syscall,console)')
+
+option('userland_debug_programs',
+  type: 'string',
+  value: '',
+  description: 'Comma-separated userland programs to enable debug logging (e.g., procmgr,mmsrv,vfs)')
+
 option('max_cpus',
   type: 'integer',
   min: 1,
