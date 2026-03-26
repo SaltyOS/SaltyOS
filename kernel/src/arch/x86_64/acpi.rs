@@ -9,6 +9,7 @@
 use super::cpu::MAX_CPUS;
 use crate::acpi::{self, SdtHeader};
 use crate::mm::PHYS_MAP_OFFSET;
+use crate::{kdebug, kinfo};
 
 // ---------------------------------------------------------------------------
 // MADT types (x86-specific: Local APIC / I/O APIC)
@@ -115,20 +116,22 @@ pub unsafe fn scan_for_rsdp() -> u64 {
 
         if ebda_base >= 0x80000 && ebda_base < 0xA0000 {
             if let Some(addr) = scan_region_for_rsdp(ebda_base, 1024) {
-                let s = crate::SerialGuard::acquire();
-                s.puts("[ACPI] Found RSDP in EBDA at ");
-                s.hex(addr);
-                s.putc(b'\n');
+                crate::kdebug!(arch, |_g| {
+                    _g.puts("[ACPI] Found RSDP in EBDA at ");
+                    _g.hex(addr);
+                    _g.putc(b'\n');
+                });
                 return addr;
             }
         }
 
         // Search main BIOS area: 0xE0000 - 0xFFFFF
         if let Some(addr) = scan_region_for_rsdp(0xE0000, 0x20000) {
-            let s = crate::SerialGuard::acquire();
-            s.puts("[ACPI] Found RSDP in BIOS area at ");
-            s.hex(addr);
-            s.putc(b'\n');
+            crate::kdebug!(arch, |_g| {
+                _g.puts("[ACPI] Found RSDP in BIOS area at ");
+                _g.hex(addr);
+                _g.putc(b'\n');
+            });
             return addr;
         }
 
@@ -175,12 +178,11 @@ pub unsafe fn parse_madt(rsdp_phys: u64) -> Option<MadtInfo> {
         return None;
     }
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[ACPI] RSDP at phys ");
-        s.hex(rsdp_phys);
-        s.putc(b'\n');
-    }
+    crate::kdebug!(arch, |_g| {
+        _g.puts("[ACPI] RSDP at phys ");
+        _g.hex(rsdp_phys);
+        _g.putc(b'\n');
+    });
 
     let madt_phys = match unsafe { acpi::find_table(rsdp_phys, b"APIC") } {
         Some(addr) => addr,
@@ -190,12 +192,11 @@ pub unsafe fn parse_madt(rsdp_phys: u64) -> Option<MadtInfo> {
         }
     };
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[ACPI] MADT at phys ");
-        s.hex(madt_phys);
-        s.putc(b'\n');
-    }
+    crate::kdebug!(arch, |_g| {
+        _g.puts("[ACPI] MADT at phys ");
+        _g.hex(madt_phys);
+        _g.putc(b'\n');
+    });
 
     // Parse MADT entries
     unsafe { parse_madt_entries(madt_phys) }
@@ -221,12 +222,11 @@ unsafe fn parse_madt_entries(madt_phys: u64) -> Option<MadtInfo> {
     // Read BSP's APIC ID from the LAPIC ID register to identify which CPU is BSP
     let bsp_apic_id = unsafe { read_bsp_apic_id() };
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[ACPI] BSP APIC ID: ");
-        s.dec(bsp_apic_id as u64);
-        s.putc(b'\n');
-    }
+    crate::kdebug!(arch, |_g| {
+        _g.puts("[ACPI] BSP APIC ID: ");
+        _g.dec(bsp_apic_id as u64);
+        _g.putc(b'\n');
+    });
 
     let mut offset = entries_start;
     while offset + 2 <= total_length {
@@ -254,15 +254,14 @@ unsafe fn parse_madt_entries(madt_phys: u64) -> Option<MadtInfo> {
                         };
                         info.cpu_count += 1;
 
-                        {
-                            let s = crate::SerialGuard::acquire();
-                            s.puts("[ACPI]   CPU ");
-                            s.dec(lapic.processor_id as u64);
-                            s.puts(" APIC_ID=");
-                            s.dec(lapic.apic_id as u64);
-                            if is_bsp { s.puts(" (BSP)"); }
-                            s.putc(b'\n');
-                        }
+                        crate::kdebug!(arch, |_g| {
+                            _g.puts("[ACPI]   CPU ");
+                            _g.dec(lapic.processor_id as u64);
+                            _g.puts(" APIC_ID=");
+                            _g.dec(lapic.apic_id as u64);
+                            if is_bsp { _g.puts(" (BSP)"); }
+                            _g.putc(b'\n');
+                        });
                     }
                 }
             }
@@ -272,16 +271,15 @@ unsafe fn parse_madt_entries(madt_phys: u64) -> Option<MadtInfo> {
                     info.io_apic_addr = io_apic.address;
                     info.io_apic_gsi_base = io_apic.gsi_base;
 
-                    {
-                        let s = crate::SerialGuard::acquire();
-                        s.puts("[ACPI]   I/O APIC id=");
-                        s.dec(io_apic.id as u64);
-                        s.puts(" addr=");
-                        s.hex(io_apic.address as u64);
-                        s.puts(" gsi_base=");
-                        s.dec(io_apic.gsi_base as u64);
-                        s.putc(b'\n');
-                    }
+                    crate::kdebug!(arch, |_g| {
+                        _g.puts("[ACPI]   I/O APIC id=");
+                        _g.dec(io_apic.id as u64);
+                        _g.puts(" addr=");
+                        _g.hex(io_apic.address as u64);
+                        _g.puts(" gsi_base=");
+                        _g.dec(io_apic.gsi_base as u64);
+                        _g.putc(b'\n');
+                    });
                 }
             }
             _ => {
@@ -292,12 +290,11 @@ unsafe fn parse_madt_entries(madt_phys: u64) -> Option<MadtInfo> {
         offset += entry_len;
     }
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[ACPI] Found ");
-        s.dec(info.cpu_count as u64);
-        s.puts(" CPU(s)\n");
-    }
+    crate::kinfo!(|_g| {
+        _g.puts("[ACPI] Found ");
+        _g.dec(info.cpu_count as u64);
+        _g.puts(" CPU(s)\n");
+    });
 
     if info.cpu_count > 0 {
         Some(info)
@@ -387,14 +384,13 @@ pub unsafe fn parse_fadt(rsdp_phys: u64) {
         ACPI_POWER.valid = pm1a != 0;
     }
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[ACPI] FADT parsed: PM1a_CNT=");
-        s.hex(pm1a as u64);
-        s.puts(" PM1b_CNT=");
-        s.hex(pm1b as u64);
-        s.putc(b'\n');
-    }
+    crate::kdebug!(arch, |_g| {
+        _g.puts("[ACPI] FADT parsed: PM1a_CNT=");
+        _g.hex(pm1a as u64);
+        _g.puts(" PM1b_CNT=");
+        _g.hex(pm1b as u64);
+        _g.putc(b'\n');
+    });
 }
 
 /// Get the parsed ACPI power management info.

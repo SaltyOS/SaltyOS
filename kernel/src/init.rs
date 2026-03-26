@@ -209,7 +209,9 @@ static mut FB_DEVICE_UT_PTR: *const UntypedMemory = core::ptr::null();
 
 /// Bootstrap the first user-mode init task
 pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
-    crate::serial_puts("[INIT] Creating user VSpace\n");
+    crate::kinfo!(|_g| {
+        _g.puts("[INIT] Creating user VSpace\n");
+    });
 
     // Allocate PML4 for user VSpace
     let pml4_phys = boot_unwrap!(
@@ -294,7 +296,9 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
 
     let vspace_root = vspace.root();
 
-    crate::serial_puts("[INIT] VSpace created, configuring TCB\n");
+    crate::kinfo!(|_g| {
+        _g.puts("[INIT] VSpace created, configuring TCB\n");
+    });
 
     // Store VSpace in static so it isn't dropped
     unsafe {
@@ -363,12 +367,11 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
         crate::sched::scheduler::scheduler().enqueue(tcb);
     }
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[INIT] Init task enqueued, entering user mode at ");
-        s.hex(user_rip);
-        s.putc(b'\n');
-    }
+    crate::kinfo!(|_g| {
+        _g.puts("[INIT] Init task enqueued, entering user mode at ");
+        _g.hex(user_rip);
+        _g.putc(b'\n');
+    });
 }
 
 /// Compute ceil(log2(n)), returning the smallest k such that 2^k >= n.
@@ -381,7 +384,9 @@ fn ceil_log2(n: u64) -> u8 {
 
 /// Set up init task's CSpace with well-known capabilities
 fn setup_init_cspace(boot_info: Option<&ParsedBootInfo>) {
-    crate::serial_puts("[INIT] Setting up CSpace\n");
+    crate::kinfo!(|_g| {
+        _g.puts("[INIT] Setting up CSpace\n");
+    });
 
     unsafe {
         let cnode = &mut *(&raw mut INIT_CNODE_STORAGE as *mut CNode);
@@ -563,14 +568,13 @@ fn setup_init_cspace(boot_info: Option<&ParsedBootInfo>) {
                     CapRights::READ | CapRights::EXECUTE | CapRights::GRANT,
                 );
 
-                {
-                    let s = crate::SerialGuard::acquire();
-                    s.puts("[INIT] Initrd: device untyped phys=");
-                    s.hex(info.initrd_addr);
-                    s.puts(" size=2^");
-                    s.dec(size_bits as u64);
-                    s.putc(b'\n');
-                }
+                crate::kdebug!(init, |_g| {
+                    _g.puts("[INIT] Initrd: device untyped phys=");
+                    _g.hex(info.initrd_addr);
+                    _g.puts(" size=2^");
+                    _g.dec(size_bits as u64);
+                    _g.putc(b'\n');
+                });
             }
         }
 
@@ -595,14 +599,13 @@ fn setup_init_cspace(boot_info: Option<&ParsedBootInfo>) {
                     ObjectType::Untyped,
                 );
 
-                {
-                    let s = crate::SerialGuard::acquire();
-                    s.puts("[INIT] Framebuffer: device untyped phys=");
-                    s.hex(fb.addr);
-                    s.puts(" size=2^");
-                    s.dec(size_bits as u64);
-                    s.putc(b'\n');
-                }
+                crate::kdebug!(init, |_g| {
+                    _g.puts("[INIT] Framebuffer: device untyped phys=");
+                    _g.hex(fb.addr);
+                    _g.puts(" size=2^");
+                    _g.dec(size_bits as u64);
+                    _g.putc(b'\n');
+                });
             }
         }
 
@@ -612,7 +615,9 @@ fn setup_init_cspace(boot_info: Option<&ParsedBootInfo>) {
         }
     }
 
-    crate::serial_puts("[INIT] CSpace setup complete\n");
+    crate::kinfo!(|_g| {
+        _g.puts("[INIT] CSpace setup complete\n");
+    });
 }
 
 /// Insert a capability for a statically-allocated kernel object into a CNode
@@ -761,14 +766,13 @@ unsafe fn create_untyped_caps(cnode: &mut CNode, _info: &ParsedBootInfo) {
         core::cmp::max(NORMAL_MIN_KERNEL_RESERVE_FRAMES, free_frames / 8)
     };
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[INIT] Untyped reserve frames: ");
-        s.dec(reserve_frames as u64);
-        s.puts(" (free=");
-        s.dec(free_frames as u64);
-        s.puts(")\n");
-    }
+    crate::kdebug!(init, |_g| {
+        _g.puts("[INIT] Untyped reserve frames: ");
+        _g.dec(reserve_frames as u64);
+        _g.puts(" (free=");
+        _g.dec(free_frames as u64);
+        _g.puts(")\n");
+    });
 
     // At lowmem, start from 1MB instead of 256MB to avoid wasting
     // iteration and to produce multiple smaller regions for flexibility.
@@ -833,18 +837,17 @@ unsafe fn create_untyped_caps(cnode: &mut CNode, _info: &ParsedBootInfo) {
                 .insert_ref(cnode_slot, CapRef { slot })
                 .unwrap_or_else(|_| boot_fatal!("untyped CNode insert failed"));
 
-            {
-                let s = crate::SerialGuard::acquire();
-                s.puts("[INIT]   Untyped ");
-                s.dec(ut_index as u64);
-                s.puts(": phys=");
-                s.hex(base);
-                s.puts(" size=");
-                s.hex(1u64 << size_bits);
-                s.puts(" (2^");
-                s.dec(size_bits as u64);
-                s.puts(")\n");
-            }
+            crate::kdebug!(init, |_g| {
+                _g.puts("[INIT]   Untyped ");
+                _g.dec(ut_index as u64);
+                _g.puts(": phys=");
+                _g.hex(base);
+                _g.puts(" size=");
+                _g.hex(1u64 << size_bits);
+                _g.puts(" (2^");
+                _g.dec(size_bits as u64);
+                _g.puts(")\n");
+            });
 
             ut_index += 1;
         }
@@ -872,18 +875,19 @@ unsafe fn create_untyped_caps(cnode: &mut CNode, _info: &ParsedBootInfo) {
                 .insert_ref(CAP_UNTYPED_START + ut_index, CapRef { slot })
                 .unwrap_or_else(|_| boot_fatal!("fallback untyped CNode insert failed"));
 
-            {
-                let s = crate::SerialGuard::acquire();
-                s.puts("[INIT]   Untyped fallback: phys=");
-                s.hex(base);
-                s.puts(" size=0x1000\n");
-            }
+            crate::kdebug!(init, |_g| {
+                _g.puts("[INIT]   Untyped fallback: phys=");
+                _g.hex(base);
+                _g.puts(" size=0x1000\n");
+            });
             ut_index += 1;
         }
     }
 
     if ut_index == 0 {
-        crate::serial_puts("[INIT] WARNING: no contiguous untyped region available\n");
+        crate::kerror!(|_g| {
+            _g.puts("[INIT] WARNING: no contiguous untyped region available\n");
+        });
     }
 
     // Store the count for find_untyped_for_phys
@@ -892,17 +896,18 @@ unsafe fn create_untyped_caps(cnode: &mut CNode, _info: &ParsedBootInfo) {
         *(&raw mut INIT_UNTYPED_COUNT) = ut_index;
     }
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[INIT] Created ");
-        s.dec(ut_index as u64);
-        s.puts(" untyped capabilities\n");
-    }
+    crate::kinfo!(|_g| {
+        _g.puts("[INIT] Created ");
+        _g.dec(ut_index as u64);
+        _g.puts(" untyped capabilities\n");
+    });
 }
 
 /// Load init from CPIO initrd using the kernel ELF loader
 fn load_from_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) -> (u64, u64) {
-    crate::serial_puts("[INIT] Parsing CPIO initrd\n");
+    crate::kinfo!(|_g| {
+        _g.puts("[INIT] Parsing CPIO initrd\n");
+    });
 
     let initrd = unsafe {
         core::slice::from_raw_parts(
@@ -915,49 +920,51 @@ fn load_from_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) -> (u64, u64) {
         .or_else(|| crate::cpio::find_file(initrd, "init.elf"));
     let elf_data = match elf_entry {
         Some(entry) => {
-            {
-                let s = crate::SerialGuard::acquire();
-                s.puts("[INIT] Found init in initrd (");
-                s.dec(entry.data.len() as u64);
-                s.puts(" bytes)\n");
-            }
+            crate::kinfo!(|_g| {
+                _g.puts("[INIT] Found init in initrd (");
+                _g.dec(entry.data.len() as u64);
+                _g.puts(" bytes)\n");
+            });
             entry.data
         }
         None => boot_fatal!("init not found in initrd"),
     };
 
-    crate::serial_puts("[INIT] Loading ELF from initrd\n");
+    crate::kinfo!(|_g| {
+        _g.puts("[INIT] Loading ELF from initrd\n");
+    });
     let result = match crate::elf::load_elf(elf_data, vspace, INIT_CODE_VADDR) {
         Ok(r) => r,
         Err(e) => {
-            crate::serial_puts("[INIT] FATAL: ELF load failed: ");
-            match e {
-                crate::elf::ElfError::NotElf => crate::serial_puts("not ELF"),
-                crate::elf::ElfError::Not64Bit => crate::serial_puts("not 64-bit"),
-                crate::elf::ElfError::NotLittleEndian => crate::serial_puts("not LE"),
-                crate::elf::ElfError::BadType => crate::serial_puts("bad type"),
-                crate::elf::ElfError::BadArch => crate::serial_puts("bad arch"),
-                crate::elf::ElfError::NoLoadSegment => crate::serial_puts("no LOAD"),
-                crate::elf::ElfError::RelocFailed => crate::serial_puts("reloc failed"),
-                crate::elf::ElfError::OutOfMemory => crate::serial_puts("OOM"),
-                crate::elf::ElfError::TooSmall => crate::serial_puts("too small"),
-                crate::elf::ElfError::MapFailed => crate::serial_puts("map failed"),
-            }
-            crate::serial_puts("\n");
+            crate::kerror!(|_g| {
+                _g.puts("[INIT] FATAL: ELF load failed: ");
+                match e {
+                    crate::elf::ElfError::NotElf => _g.puts("not ELF"),
+                    crate::elf::ElfError::Not64Bit => _g.puts("not 64-bit"),
+                    crate::elf::ElfError::NotLittleEndian => _g.puts("not LE"),
+                    crate::elf::ElfError::BadType => _g.puts("bad type"),
+                    crate::elf::ElfError::BadArch => _g.puts("bad arch"),
+                    crate::elf::ElfError::NoLoadSegment => _g.puts("no LOAD"),
+                    crate::elf::ElfError::RelocFailed => _g.puts("reloc failed"),
+                    crate::elf::ElfError::OutOfMemory => _g.puts("OOM"),
+                    crate::elf::ElfError::TooSmall => _g.puts("too small"),
+                    crate::elf::ElfError::MapFailed => _g.puts("map failed"),
+                }
+                _g.puts("\n");
+            });
             boot_fatal!("init ELF load failed");
         }
     };
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[INIT] ELF loaded: entry=");
-        s.hex(result.entry);
-        s.puts(" base=");
-        s.hex(result.base);
-        s.puts(" brk=");
-        s.hex(result.brk);
-        s.putc(b'\n');
-    }
+    crate::kinfo!(|_g| {
+        _g.puts("[INIT] ELF loaded: entry=");
+        _g.hex(result.entry);
+        _g.puts(" base=");
+        _g.hex(result.base);
+        _g.puts(" brk=");
+        _g.hex(result.brk);
+        _g.putc(b'\n');
+    });
 
     // Allocate and map a multi-page user stack
     for pg in 0..INIT_STACK_PAGES {
@@ -991,24 +998,23 @@ fn map_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) {
     let num_pages = (initrd_size + PAGE_SIZE - 1) / PAGE_SIZE;
     let direct_map_ok = (initrd_phys & (PAGE_SIZE as u64 - 1)) == 0;
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[INIT] Mapping initrd: phys=");
-        s.hex(initrd_phys);
-        s.puts(" size=");
-        s.dec(initrd_size as u64);
-        s.puts(" pages=");
-        s.dec(num_pages as u64);
-        s.puts(" -> vaddr=");
-        s.hex(INITRD_VADDR);
-        s.puts(" mode=");
+    crate::kdebug!(init, |_g| {
+        _g.puts("[INIT] Mapping initrd: phys=");
+        _g.hex(initrd_phys);
+        _g.puts(" size=");
+        _g.dec(initrd_size as u64);
+        _g.puts(" pages=");
+        _g.dec(num_pages as u64);
+        _g.puts(" -> vaddr=");
+        _g.hex(INITRD_VADDR);
+        _g.puts(" mode=");
         if direct_map_ok {
-            s.puts("direct");
+            _g.puts("direct");
         } else {
-            s.puts("copy");
+            _g.puts("copy");
         }
-        s.putc(b'\n');
-    }
+        _g.putc(b'\n');
+    });
 
     for i in 0..num_pages {
         let phys = initrd_phys + (i * PAGE_SIZE) as u64;
@@ -1050,7 +1056,9 @@ fn map_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) {
         INITRD_USER_SIZE = initrd_size as u64;
     }
 
-    crate::serial_puts("[INIT] Initrd mapped OK\n");
+    crate::kinfo!(|_g| {
+        _g.puts("[INIT] Initrd mapped OK\n");
+    });
 }
 
 /// Initrd location in user VSpace (set by map_initrd, read by userspace)
@@ -1122,12 +1130,11 @@ fn map_bootinfo(vspace: &mut VSpace, boot_info: Option<&ParsedBootInfo>) {
         .map(BOOTINFO_VADDR, frame_phys, PageFlags::USER_RO)
         .unwrap_or_else(|_| boot_fatal!("bootinfo map failed"));
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[INIT] Boot info page mapped at ");
-        s.hex(BOOTINFO_VADDR);
-        s.putc(b'\n');
-    }
+    crate::kinfo!(|_g| {
+        _g.puts("[INIT] Boot info page mapped at ");
+        _g.hex(BOOTINFO_VADDR);
+        _g.putc(b'\n');
+    });
 }
 
 fn bootinfo_total_usable_bytes(info: &ParsedBootInfo) -> u64 {

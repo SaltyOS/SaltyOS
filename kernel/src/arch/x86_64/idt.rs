@@ -3,6 +3,7 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use core::mem::size_of;
+use crate::kdebug;
 
 /// IDT entry (16 bytes)
 #[repr(C, packed)]
@@ -510,18 +511,13 @@ pub unsafe extern "C" fn exception_handler_rust(frame: *const ExceptionFrame) {
 pub fn init() {
     // SAFETY: Single-threaded initialization, IDT is properly structured
     unsafe {
-        crate::serial_puts("\n[IDT] Starting init\n");
-
-        // Print IDT address
-        {
-            let s = crate::SerialGuard::acquire();
-            s.puts("[IDT] IDT addr: ");
-            s.hex((&raw const IDT) as u64);
-            s.putc(b'\n');
-        }
-
-        // Set up exception handlers (vectors 0-31) using assembly stubs
-        crate::serial_puts("[IDT] Setting exception handlers (0-31)\n");
+        crate::kdebug!(arch, |_g| {
+            _g.puts("\n[IDT] Starting init\n");
+            _g.puts("[IDT] IDT addr: ");
+            _g.hex((&raw const IDT) as u64);
+            _g.putc(b'\n');
+            _g.puts("[IDT] Setting exception handlers (0-31)\n");
+        });
 
         let stubs: [u64; 32] = [
             exception_stub_0 as *const () as u64,
@@ -571,17 +567,16 @@ pub fn init() {
             }
         }
 
-        crate::serial_puts("[IDT] Exception handlers set\n");
-
-        // Set up IRQ handlers (vectors 32+) using assembly stubs with swapgs
-        crate::serial_puts("[IDT] Setting IRQ handlers\n");
+        crate::kdebug!(arch, |_g| {
+            _g.puts("[IDT] Exception handlers set\n");
+            _g.puts("[IDT] Setting IRQ handlers\n");
+        });
         idt.entries[32].set_handler(irq_stub_timer as *const () as u64);
-        {
-            let s = crate::SerialGuard::acquire();
-            s.puts("[IDT]   timer handler: ");
-            s.hex(irq_stub_timer as *const () as u64);
-            s.putc(b'\n');
-        }
+        crate::kdebug!(arch, |_g| {
+            _g.puts("[IDT]   timer handler: ");
+            _g.hex(irq_stub_timer as *const () as u64);
+            _g.putc(b'\n');
+        });
 
         // Vector 40: IPI VSpace Teardown
         idt.entries[40].set_handler(irq_stub_ipi_vspace_teardown as *const () as u64);
@@ -591,7 +586,9 @@ pub fn init() {
         idt.entries[48].set_handler(irq_stub_ipi_tlb_shootdown as *const () as u64);
         // Vector 49: IPI full TLB Shootdown
         idt.entries[49].set_handler(irq_stub_ipi_tlb_shootdown_all as *const () as u64);
-        crate::serial_puts("[IDT] IPI handlers set (vectors 40-41, 48-49)\n");
+        crate::kdebug!(arch, |_g| {
+            _g.puts("[IDT] IPI handlers set (vectors 40-41, 48-49)\n");
+        });
 
         // Generic external IRQ handlers (vectors 33-39, 42-47)
         idt.entries[33].set_handler(irq_stub_generic_33 as *const () as u64);
@@ -607,26 +604,25 @@ pub fn init() {
         idt.entries[45].set_handler(irq_stub_generic_45 as *const () as u64);
         idt.entries[46].set_handler(irq_stub_generic_46 as *const () as u64);
         idt.entries[47].set_handler(irq_stub_generic_47 as *const () as u64);
-        crate::serial_puts("[IDT] External IRQ handlers set (vectors 33-47)\n");
-
-        // Prepare IDT pointer
-        crate::serial_puts("[IDT] Preparing IDT pointer\n");
+        crate::kdebug!(arch, |_g| {
+            _g.puts("[IDT] External IRQ handlers set (vectors 33-47)\n");
+            _g.puts("[IDT] Preparing IDT pointer\n");
+        });
         let idt_ptr = IdtPtr {
             limit: (size_of::<Idt>() - 1) as u16,
             base: (&raw const IDT) as u64,
         };
 
-        {
-            let s = crate::SerialGuard::acquire();
-            s.puts("[IDT]   limit: ");
-            s.hex(idt_ptr.limit as u64);
-            s.puts("\n[IDT]   base: ");
-            s.hex(idt_ptr.base);
-            s.putc(b'\n');
-        }
+        crate::kdebug!(arch, |_g| {
+            _g.puts("[IDT]   limit: ");
+            _g.hex(idt_ptr.limit as u64);
+            _g.puts("\n[IDT]   base: ");
+            _g.hex(idt_ptr.base);
+            _g.putc(b'\n');
+        });
 
         // Load IDT
-        crate::serial_puts("[IDT] Calling lidt\n");
+        crate::kdebug!(arch, |_g| { _g.puts("[IDT] Calling lidt\n"); });
         core::arch::asm!(
             "lidt [{}]",
             in(reg) &idt_ptr,
@@ -634,39 +630,37 @@ pub fn init() {
         );
 
         // Verify with sidt
-        crate::serial_puts("[IDT] Verifying with sidt...\n");
+        crate::kdebug!(arch, |_g| { _g.puts("[IDT] Verifying with sidt...\n"); });
         let mut idt_read_back: IdtPtr = IdtPtr { limit: 0, base: 0 };
         core::arch::asm!(
             "sidt [{}]",
             in(reg) &mut idt_read_back,
             options(nostack)
         );
-        {
-            let s = crate::SerialGuard::acquire();
-            s.puts("[IDT] sidt result: limit=");
-            s.hex(idt_read_back.limit as u64);
-            s.puts(" base=");
-            s.hex(idt_read_back.base);
-            s.putc(b'\n');
-        }
+        crate::kdebug!(arch, |_g| {
+            _g.puts("[IDT] sidt result: limit=");
+            _g.hex(idt_read_back.limit as u64);
+            _g.puts(" base=");
+            _g.hex(idt_read_back.base);
+            _g.putc(b'\n');
+        });
 
         // Verify struct sizes
-        {
-            let s = crate::SerialGuard::acquire();
-            s.puts("[IDT] Struct sizes:\n");
-            s.puts("  size_of::<IdtEntry>() = ");
-            s.hex(size_of::<IdtEntry>() as u64);
-            s.puts("\n  size_of::<IdtPtr>() = ");
-            s.hex(size_of::<IdtPtr>() as u64);
-            s.puts("\n  size_of::<Idt>() = ");
-            s.hex(size_of::<Idt>() as u64);
-            s.putc(b'\n');
-        }
+        crate::kdebug!(arch, |_g| {
+            _g.puts("[IDT] Struct sizes:\n");
+            _g.puts("  size_of::<IdtEntry>() = ");
+            _g.hex(size_of::<IdtEntry>() as u64);
+            _g.puts("\n  size_of::<IdtPtr>() = ");
+            _g.hex(size_of::<IdtPtr>() as u64);
+            _g.puts("\n  size_of::<Idt>() = ");
+            _g.hex(size_of::<Idt>() as u64);
+            _g.putc(b'\n');
+        });
 
         assert!(size_of::<IdtEntry>() == 16, "IdtEntry must be 16 bytes!");
         assert!(size_of::<IdtPtr>() == 10, "IdtPtr must be 10 bytes (packed)!");
 
-        crate::serial_puts("[IDT] IDT loaded and verified successfully\n");
+        crate::kdebug!(arch, |_g| { _g.puts("[IDT] IDT loaded and verified successfully\n"); });
     }
 }
 

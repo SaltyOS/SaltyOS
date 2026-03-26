@@ -5,6 +5,8 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+use crate::{kdebug, kinfo};
+
 /// AP entry point called from trampoline assembly
 ///
 /// This function is called with:
@@ -38,12 +40,11 @@ pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
         }
     }
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[AP] Entry cpu_id=");
-        s.dec(cpu_id as u64);
-        s.putc(b'\n');
-    }
+    crate::kinfo!(|_g| {
+        _g.puts("[AP] Entry cpu_id=");
+        _g.dec(cpu_id as u64);
+        _g.putc(b'\n');
+    });
 
     // 1. Seed per-CPU metadata for this AP
     unsafe {
@@ -55,14 +56,14 @@ pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
     unsafe {
         super::gdt::load_per_cpu(cpu_id);
     }
-    crate::serial_puts("[AP] GDT/TSS loaded\n");
+    crate::kdebug!(arch, |_g| { _g.puts("[AP] GDT/TSS loaded\n"); });
 
     // 3. Re-install GS base after segment reload in load_per_cpu()
     super::cpu::write_gs_base_for_cpu(cpu_id);
 
     // 4. Load IDT (shared with BSP - IDT is global)
     super::idt::load();
-    crate::serial_puts("[AP] IDT loaded\n");
+    crate::kdebug!(arch, |_g| { _g.puts("[AP] IDT loaded\n"); });
 
     // 4.5 Register this AP's CPUID features into the global intersection.
     // Must run before feature-dependent init (APIC/FPU).
@@ -70,11 +71,11 @@ pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
 
     // 5. Initialize SYSCALL MSRs for this CPU
     init_ap_syscalls(cpu_id);
-    crate::serial_puts("[AP] SYSCALL MSRs configured\n");
+    crate::kdebug!(arch, |_g| { _g.puts("[AP] SYSCALL MSRs configured\n"); });
 
     // 6. Initialize Local APIC for this AP (timer + SVR)
     super::apic::init_ap();
-    crate::serial_puts("[AP] Local APIC initialized\n");
+    crate::kdebug!(arch, |_g| { _g.puts("[AP] Local APIC initialized\n"); });
 
     // 6.5. Initialize FPU/SSE hardware on this AP
     super::fpu::init_ap();
@@ -84,19 +85,18 @@ pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
 
     // 7. Allocate IST stack for double fault on this CPU
     init_ap_exception_stacks(cpu_id);
-    crate::serial_puts("[AP] IST stacks allocated\n");
+    crate::kdebug!(arch, |_g| { _g.puts("[AP] IST stacks allocated\n"); });
 
     // 8. Initialize scheduler for this CPU (creates idle thread)
     crate::sched::init_cpu(cpu_id);
-    crate::serial_puts("[AP] Scheduler initialized\n");
+    crate::kdebug!(arch, |_g| { _g.puts("[AP] Scheduler initialized\n"); });
 
     // 9. Emit AP online log before signaling ready to reduce serial interleaving
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[AP] CPU ");
-        s.dec(cpu_id as u64);
-        s.puts(" online\n");
-    }
+    crate::kinfo!(|_g| {
+        _g.puts("[AP] CPU ");
+        _g.dec(cpu_id as u64);
+        _g.puts(" online\n");
+    });
 
     // 10. Signal that this AP is ready
     super::apic::signal_ap_ready(cpu_id);

@@ -2,6 +2,8 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+use crate::kdebug;
+
 /// IA32_FS_BASE MSR address
 const IA32_FS_BASE_MSR: u32 = 0xC000_0100;
 /// IA32_GS_BASE MSR address
@@ -68,19 +70,18 @@ static mut CPU_APIC_IDS: [u32; MAX_CPUS] = [0; MAX_CPUS];
 /// Initialize per-CPU data for the BSP (Boot Processor)
 pub fn init_bsp() {
     unsafe {
-        crate::serial_puts("\n[CPU] init_bsp() called\n");
+        crate::kdebug!(arch, |_g| { _g.puts("\n[CPU] init_bsp() called\n"); });
 
         PER_CPU_DATA[0].cpu_id = 0;
 
         // Seed per-CPU stack canary from hardware RNG (RDSEED/RDRAND)
         PER_CPU_DATA[0].stack_canary = generate_stack_canary();
 
-        {
-            let s = crate::SerialGuard::acquire();
-            s.puts("[CPU] PER_CPU_DATA addr: ");
-            s.hex((&raw const PER_CPU_DATA) as u64);
-            s.puts("\n[CPU] Setting GS base\n");
-        }
+        crate::kdebug!(arch, |_g| {
+            _g.puts("[CPU] PER_CPU_DATA addr: ");
+            _g.hex((&raw const PER_CPU_DATA) as u64);
+            _g.puts("\n[CPU] Setting GS base\n");
+        });
 
         // Keep kernel GS pointing at PerCpuData. User GS starts at 0 and is
         // swapped in/out by swapgs on user<->kernel transitions.
@@ -88,7 +89,7 @@ pub fn init_bsp() {
         write_gs_base_msr(per_cpu_base);
         write_kernel_gs_base_msr(0);
 
-        crate::serial_puts("[CPU] GS base set successfully\n");
+        crate::kdebug!(arch, |_g| { _g.puts("[CPU] GS base set successfully\n"); });
     }
 }
 

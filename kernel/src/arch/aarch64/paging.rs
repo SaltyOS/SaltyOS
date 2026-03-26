@@ -651,16 +651,15 @@ unsafe fn init_direct_map(kernel_root: u64, max_phys: u64) {
         return;
     }
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[PAGING] Direct map range: ");
-        s.hex(QEMU_VIRT_RAM_BASE);
-        s.puts("..");
-        s.hex(direct_map_end);
-        s.puts(" (max_phys=");
-        s.hex(max_phys);
-        s.puts(")\n");
-    }
+    crate::kdebug!(arch, |_g| {
+        _g.puts("[PAGING] Direct map range: ");
+        _g.hex(QEMU_VIRT_RAM_BASE);
+        _g.puts("..");
+        _g.hex(direct_map_end);
+        _g.puts(" (max_phys=");
+        _g.hex(max_phys);
+        _g.puts(")\n");
+    });
 
     // Use identity mapping (bootloader maps low memory phys==virt via TTBR0).
     let l0_virt = kernel_root as *mut u64;

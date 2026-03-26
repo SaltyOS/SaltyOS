@@ -46,12 +46,11 @@ pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
         }
     }
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[AP] Entry cpu_id=");
-        s.dec(cpu_id as u64);
-        s.putc(b'\n');
-    }
+    crate::kinfo!(|_g| {
+        _g.puts("[AP] Entry cpu_id=");
+        _g.dec(cpu_id as u64);
+        _g.putc(b'\n');
+    });
 
     // 1. Initialize per-CPU data (sets TPIDR_EL1 for this AP).
     super::cpu::init_ap(cpu_id as u32);
@@ -87,12 +86,11 @@ pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
     crate::sched::init_cpu(cpu_id);
 
     // 10. Emit AP online log before signaling ready to reduce interleaving.
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[AP] CPU ");
-        s.dec(cpu_id as u64);
-        s.puts(" online\n");
-    }
+    crate::kinfo!(|_g| {
+        _g.puts("[AP] CPU ");
+        _g.dec(cpu_id as u64);
+        _g.puts(" online\n");
+    });
 
     // 11. Signal BSP that this AP is ready.
     signal_ap_ready(cpu_id);

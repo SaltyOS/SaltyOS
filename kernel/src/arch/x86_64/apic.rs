@@ -18,6 +18,7 @@
 
 use super::outb;
 use crate::mm::PHYS_MAP_OFFSET;
+use crate::{kdebug, kinfo};
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicBool, Ordering};
 
 /// Local APIC base address (physical)
@@ -373,33 +374,32 @@ unsafe fn init_timer() {
             PER_CPU_TSC_BOOT[0].store(0, Ordering::Release);
         }
 
-        {
-            let s = crate::SerialGuard::acquire();
-            s.puts("[TIMER] APIC ticks/ms=");
-            s.dec(calibrated_ticks as u64);
-            s.puts(" fallback=");
-            s.dec(used_fallback as u64);
-            s.puts(" tsc_per_us=");
-            s.dec(tsc_per_us as u64);
-            s.puts(" inv_tsc=");
-            s.dec(has_invariant_tsc as u64);
-            s.puts(" source=");
+        crate::kinfo!(|_g| {
+            _g.puts("[TIMER] APIC ticks/ms=");
+            _g.dec(calibrated_ticks as u64);
+            _g.puts(" fallback=");
+            _g.dec(used_fallback as u64);
+            _g.puts(" tsc_per_us=");
+            _g.dec(tsc_per_us as u64);
+            _g.puts(" inv_tsc=");
+            _g.dec(has_invariant_tsc as u64);
+            _g.puts(" source=");
             if tsc_clock_enabled {
-                s.puts("tsc");
+                _g.puts("tsc");
             } else {
-                s.puts("tick");
+                _g.puts("tick");
             }
-            s.putc(b'\n');
+            _g.putc(b'\n');
 
             if used_fallback {
-                s.puts("[WARN] APIC timer calibration fell back to default ticks/ms\n");
+                _g.puts("[WARN] APIC timer calibration fell back to default ticks/ms\n");
             }
             if tsc_per_us == 0 {
-                s.puts("[WARN] TSC calibration unavailable; using tick clocksource\n");
+                _g.puts("[WARN] TSC calibration unavailable; using tick clocksource\n");
             } else if !has_invariant_tsc {
-                s.puts("[WARN] Non-invariant TSC detected; disabling TSC clocksource\n");
+                _g.puts("[WARN] Non-invariant TSC detected; disabling TSC clocksource\n");
             }
-        }
+        });
 
         // Set timer divide configuration (divide by 16)
         lapic_write(LAPIC_TIMER_DIVIDE, TIMER_DIVIDE_16);
@@ -1322,28 +1322,26 @@ pub fn init_ioapic(ioapic_phys: u32, bsp_apic_id: u8) {
     let virt = unsafe { super::paging::map_mmio_page(ioapic_phys as u64) };
     IOAPIC_BASE.store(virt, Ordering::Release);
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[IOAPIC] phys=");
-        s.hex(ioapic_phys as u64);
-        s.puts(" virt=");
-        s.hex(virt);
-        s.putc(b'\n');
-    }
+    crate::kdebug!(arch, |_g| {
+        _g.puts("[IOAPIC] phys=");
+        _g.hex(ioapic_phys as u64);
+        _g.puts(" virt=");
+        _g.hex(virt);
+        _g.putc(b'\n');
+    });
 
     unsafe {
         // Read version register to get max redirection entries
         let ver = ioapic_read(IOAPIC_REG_VER);
         let max_entry = ((ver >> 16) & 0xFF) as u32;
 
-        {
-            let s = crate::SerialGuard::acquire();
-            s.puts("[IOAPIC] version=");
-            s.hex(ver as u64);
-            s.puts(" max_entry=");
-            s.dec(max_entry as u64);
-            s.putc(b'\n');
-        }
+        crate::kdebug!(arch, |_g| {
+            _g.puts("[IOAPIC] version=");
+            _g.hex(ver as u64);
+            _g.puts(" max_entry=");
+            _g.dec(max_entry as u64);
+            _g.putc(b'\n');
+        });
 
         // Mask all redirection entries first
         for i in 0..=max_entry {
@@ -1372,12 +1370,11 @@ pub fn init_ioapic(ioapic_phys: u32, bsp_apic_id: u8) {
 
     IOAPIC_READY.store(true, Ordering::Release);
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[IOAPIC] IRQ1 (keyboard) → vec 33, IRQ4 (COM1) → vec 36, dest APIC ");
-        s.dec(bsp_apic_id as u64);
-        s.putc(b'\n');
-    }
+    crate::kinfo!(|_g| {
+        _g.puts("[IOAPIC] IRQ1 (keyboard) → vec 33, IRQ4 (COM1) → vec 36, dest APIC ");
+        _g.dec(bsp_apic_id as u64);
+        _g.putc(b'\n');
+    });
 }
 
 /// Dynamically unmask an IOAPIC redirection entry for the given IRQ.

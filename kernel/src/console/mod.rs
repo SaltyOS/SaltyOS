@@ -267,24 +267,23 @@ pub fn init(fb_info: &FramebufferInfo) {
 
     CONSOLE_READY.store(true, Ordering::Release);
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[CONSOLE] Framebuffer console initialized: ");
-        s.dec(fb_info.width as u64);
-        s.puts("x");
-        s.dec(fb_info.height as u64);
-        s.puts(" (");
-        s.dec(max_cols as u64);
-        s.puts("x");
-        s.dec(max_rows as u64);
+    crate::kinfo!(|_g| {
+        _g.puts("[CONSOLE] Framebuffer console initialized: ");
+        _g.dec(fb_info.width as u64);
+        _g.puts("x");
+        _g.dec(fb_info.height as u64);
+        _g.puts(" (");
+        _g.dec(max_cols as u64);
+        _g.puts("x");
+        _g.dec(max_rows as u64);
         if text_mode {
-            s.puts(" chars, text-mode)\n");
+            _g.puts(" chars, text-mode)\n");
         } else if has_ring {
-            s.puts(" chars, ring shadow)\n");
+            _g.puts(" chars, ring shadow)\n");
         } else {
-            s.puts(" chars, linear shadow)\n");
+            _g.puts(" chars, linear shadow)\n");
         }
-    }
+    });
 }
 
 /// Disable framebuffer console output (display server takes over).

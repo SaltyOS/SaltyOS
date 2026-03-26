@@ -8,6 +8,7 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use core::sync::atomic::{AtomicU32, Ordering};
+use crate::{kdebug, kerror};
 
 const FEAT_SSE: u32 = 1 << 0;
 const FEAT_SSE2: u32 = 1 << 1;
@@ -174,30 +175,31 @@ fn read_local_features() -> CpuFeatures {
 }
 
 fn log_snapshot(cpu_id: usize, f: CpuFeatures) {
-    let s = crate::SerialGuard::acquire();
-    s.puts("[CPUID] CPU");
-    s.dec(cpu_id as u64);
-    s.puts(" SSE=");
-    s.dec(has_bit(f.bits, FEAT_SSE) as u64);
-    s.puts(" SSE2=");
-    s.dec(has_bit(f.bits, FEAT_SSE2) as u64);
-    s.puts(" FXSR=");
-    s.dec(has_bit(f.bits, FEAT_FXSR) as u64);
-    s.puts(" XSAVE=");
-    s.dec(has_bit(f.bits, FEAT_XSAVE) as u64);
-    s.puts(" INV_TSC=");
-    s.dec(has_bit(f.bits, FEAT_INVARIANT_TSC) as u64);
-    s.puts(" SMEP=");
-    s.dec(has_bit(f.bits, FEAT_SMEP) as u64);
-    s.puts(" SMAP=");
-    s.dec(has_bit(f.bits, FEAT_SMAP) as u64);
-    s.puts(" RDRAND=");
-    s.dec(has_bit(f.bits, FEAT_RDRAND) as u64);
-    s.puts(" RDSEED=");
-    s.dec(has_bit(f.bits, FEAT_RDSEED) as u64);
-    s.puts(" area_size=");
-    s.dec(f.xsave_area_size as u64);
-    s.putc(b'\n');
+    crate::kdebug!(arch, |_g| {
+        _g.puts("[CPUID] CPU");
+        _g.dec(cpu_id as u64);
+        _g.puts(" SSE=");
+        _g.dec(has_bit(f.bits, FEAT_SSE) as u64);
+        _g.puts(" SSE2=");
+        _g.dec(has_bit(f.bits, FEAT_SSE2) as u64);
+        _g.puts(" FXSR=");
+        _g.dec(has_bit(f.bits, FEAT_FXSR) as u64);
+        _g.puts(" XSAVE=");
+        _g.dec(has_bit(f.bits, FEAT_XSAVE) as u64);
+        _g.puts(" INV_TSC=");
+        _g.dec(has_bit(f.bits, FEAT_INVARIANT_TSC) as u64);
+        _g.puts(" SMEP=");
+        _g.dec(has_bit(f.bits, FEAT_SMEP) as u64);
+        _g.puts(" SMAP=");
+        _g.dec(has_bit(f.bits, FEAT_SMAP) as u64);
+        _g.puts(" RDRAND=");
+        _g.dec(has_bit(f.bits, FEAT_RDRAND) as u64);
+        _g.puts(" RDSEED=");
+        _g.dec(has_bit(f.bits, FEAT_RDSEED) as u64);
+        _g.puts(" area_size=");
+        _g.dec(f.xsave_area_size as u64);
+        _g.putc(b'\n');
+    });
 }
 
 fn log_global_downgrade(cpu_id: usize, old_bits: u32, new_bits: u32) {
@@ -206,38 +208,39 @@ fn log_global_downgrade(cpu_id: usize, old_bits: u32, new_bits: u32) {
         return;
     }
 
-    let s = crate::SerialGuard::acquire();
-    s.puts("[CPUID] Global feature downgrade by CPU");
-    s.dec(cpu_id as u64);
-    s.puts(":");
-    if has_bit(dropped, FEAT_SSE) {
-        s.puts(" SSE");
-    }
-    if has_bit(dropped, FEAT_SSE2) {
-        s.puts(" SSE2");
-    }
-    if has_bit(dropped, FEAT_FXSR) {
-        s.puts(" FXSR");
-    }
-    if has_bit(dropped, FEAT_XSAVE) {
-        s.puts(" XSAVE");
-    }
-    if has_bit(dropped, FEAT_INVARIANT_TSC) {
-        s.puts(" INV_TSC");
-    }
-    if has_bit(dropped, FEAT_SMEP) {
-        s.puts(" SMEP");
-    }
-    if has_bit(dropped, FEAT_SMAP) {
-        s.puts(" SMAP");
-    }
-    if has_bit(dropped, FEAT_RDRAND) {
-        s.puts(" RDRAND");
-    }
-    if has_bit(dropped, FEAT_RDSEED) {
-        s.puts(" RDSEED");
-    }
-    s.putc(b'\n');
+    crate::kdebug!(arch, |_g| {
+        _g.puts("[CPUID] Global feature downgrade by CPU");
+        _g.dec(cpu_id as u64);
+        _g.puts(":");
+        if has_bit(dropped, FEAT_SSE) {
+            _g.puts(" SSE");
+        }
+        if has_bit(dropped, FEAT_SSE2) {
+            _g.puts(" SSE2");
+        }
+        if has_bit(dropped, FEAT_FXSR) {
+            _g.puts(" FXSR");
+        }
+        if has_bit(dropped, FEAT_XSAVE) {
+            _g.puts(" XSAVE");
+        }
+        if has_bit(dropped, FEAT_INVARIANT_TSC) {
+            _g.puts(" INV_TSC");
+        }
+        if has_bit(dropped, FEAT_SMEP) {
+            _g.puts(" SMEP");
+        }
+        if has_bit(dropped, FEAT_SMAP) {
+            _g.puts(" SMAP");
+        }
+        if has_bit(dropped, FEAT_RDRAND) {
+            _g.puts(" RDRAND");
+        }
+        if has_bit(dropped, FEAT_RDSEED) {
+            _g.puts(" RDSEED");
+        }
+        _g.putc(b'\n');
+    });
 }
 
 fn validate_required_features(cpu_id: usize, bits: u32) {
@@ -246,21 +249,21 @@ fn validate_required_features(cpu_id: usize, bits: u32) {
         return;
     }
 
-    let s = crate::SerialGuard::acquire();
-    s.puts("*** FATAL: CPU");
-    s.dec(cpu_id as u64);
-    s.puts(" missing required CPUID feature(s):");
-    if has_bit(missing, FEAT_SSE) {
-        s.puts(" SSE");
-    }
-    if has_bit(missing, FEAT_SSE2) {
-        s.puts(" SSE2");
-    }
-    if has_bit(missing, FEAT_FXSR) {
-        s.puts(" FXSR");
-    }
-    s.putc(b'\n');
-    drop(s);
+    crate::kerror!(|_g| {
+        _g.puts("*** FATAL: CPU");
+        _g.dec(cpu_id as u64);
+        _g.puts(" missing required CPUID feature(s):");
+        if has_bit(missing, FEAT_SSE) {
+            _g.puts(" SSE");
+        }
+        if has_bit(missing, FEAT_SSE2) {
+            _g.puts(" SSE2");
+        }
+        if has_bit(missing, FEAT_FXSR) {
+            _g.puts(" FXSR");
+        }
+        _g.putc(b'\n');
+    });
 
     panic!("Required CPUID features are not consistent across CPUs");
 }

@@ -299,14 +299,13 @@ pub fn init() {
     const MIN_CAP_SLOTS: usize = 768;
     let num_slots = (free / 4).clamp(MIN_CAP_SLOTS, 131_072);
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[CAP] Dynamic slot count: ");
-        s.dec(num_slots as u64);
-        s.puts(" (");
-        s.dec(free as u64);
-        s.puts(" free frames)\n");
-    }
+    crate::kinfo!(|_g| {
+        _g.puts("[CAP] Dynamic slot count: ");
+        _g.dec(num_slots as u64);
+        _g.puts(" (");
+        _g.dec(free as u64);
+        _g.puts(" free frames)\n");
+    });
 
     // SAFETY: Called once during single-threaded boot, direct map available
     unsafe {

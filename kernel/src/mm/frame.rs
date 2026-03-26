@@ -378,18 +378,17 @@ impl FrameAllocator {
         // Mark bitmap pages themselves as used
         allocator.mark_region_used(bitmap_phys, (bitmap_pages * PAGE_SIZE) as u64);
 
-        {
-            let s = crate::SerialGuard::acquire();
-            s.puts("[FRAME] Phase 1 bitmap: ");
-            s.dec(max_frames as u64);
-            s.puts(" frames, ");
-            s.dec(bitmap_pages as u64);
-            s.puts(" bitmap pages at ");
-            s.hex(bitmap_phys);
-            s.puts(", free=");
-            s.dec(allocator.free as u64);
-            s.putc(b'\n');
-        }
+        crate::kinfo!(|_g| {
+            _g.puts("[FRAME] Phase 1 bitmap: ");
+            _g.dec(max_frames as u64);
+            _g.puts(" frames, ");
+            _g.dec(bitmap_pages as u64);
+            _g.puts(" bitmap pages at ");
+            _g.hex(bitmap_phys);
+            _g.puts(", free=");
+            _g.dec(allocator.free as u64);
+            _g.putc(b'\n');
+        });
 
         allocator
     }
@@ -656,22 +655,22 @@ impl FrameAllocator {
         if let Some(frame) = self.frame_index(addr) {
             if self.tracking_ready(frame) && !self.meta[frame].matches_owner(expected) {
                 // Ownership mismatch — likely double-free or use-after-free
-                let s = crate::SerialGuard::acquire();
-                s.puts("[FRAME] PANIC: free_owned mismatch at ");
-                s.hex(addr);
-                s.puts(" expected_tag=");
-                s.dec(match expected {
-                    FrameOwner::Free => 0,
-                    FrameOwner::MoData { .. } => 1,
-                    FrameOwner::MoMeta { .. } => 2,
-                    FrameOwner::KernelPrivate { .. } => 3,
-                    FrameOwner::PageCache => 4,
-                    FrameOwner::EmergencyReserve => 5,
+                crate::kerror!(|_g| {
+                    _g.puts("[FRAME] PANIC: free_owned mismatch at ");
+                    _g.hex(addr);
+                    _g.puts(" expected_tag=");
+                    _g.dec(match expected {
+                        FrameOwner::Free => 0,
+                        FrameOwner::MoData { .. } => 1,
+                        FrameOwner::MoMeta { .. } => 2,
+                        FrameOwner::KernelPrivate { .. } => 3,
+                        FrameOwner::PageCache => 4,
+                        FrameOwner::EmergencyReserve => 5,
+                    });
+                    _g.puts(" actual_tag=");
+                    _g.dec(self.meta[frame].owner_tag as u64);
+                    _g.puts("\n");
                 });
-                s.puts(" actual_tag=");
-                s.dec(self.meta[frame].owner_tag as u64);
-                s.puts("\n");
-                drop(s);
                 panic!("PMM free_owned: ownership mismatch");
             }
             self.free_internal(frame);
@@ -813,16 +812,15 @@ impl FrameAllocator {
         // Replenish emergency reserve after meta array is ready
         self.replenish_reserve(EMERGENCY_RESERVE_SIZE);
 
-        {
-            let s = crate::SerialGuard::acquire();
-            s.puts("[FRAME] Phase 2: per-frame arrays allocated (");
-            s.dec(frame_count as u64);
-            s.puts(" frames, ");
-            s.dec(meta_pages as u64);
-            s.puts(" pages, reserve=");
-            s.dec(self.reserve_count as u64);
-            s.puts(")\n");
-        }
+        crate::kinfo!(|_g| {
+            _g.puts("[FRAME] Phase 2: per-frame arrays allocated (");
+            _g.dec(frame_count as u64);
+            _g.puts(" frames, ");
+            _g.dec(meta_pages as u64);
+            _g.puts(" pages, reserve=");
+            _g.dec(self.reserve_count as u64);
+            _g.puts(")\n");
+        });
     }
 
     /// Get the maximum physical address tracked by the frame allocator.

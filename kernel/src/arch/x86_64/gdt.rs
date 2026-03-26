@@ -4,6 +4,7 @@
 
 use core::mem::size_of;
 use super::cpu::MAX_CPUS;
+use crate::kdebug;
 
 /// GDT entry
 #[repr(C, packed)]
@@ -334,19 +335,18 @@ pub fn init() {
         };
 
         // DEBUG: Print what we're about to load
-        {
-            let s = crate::SerialGuard::acquire();
-            s.puts("\n[GDT] Before lgdt:\n");
-            s.puts("  base: ");
-            s.hex(gdt_ptr.base);
-            s.puts("\n  limit: ");
-            s.hex(gdt_ptr.limit as u64);
-            s.puts("\n  GDT addr: ");
-            s.hex((&raw const GDT) as u64);
-            s.puts("\n  TSS addr: ");
-            s.hex((&raw const TSS) as u64);
-            s.putc(b'\n');
-        }
+        crate::kdebug!(arch, |_g| {
+            _g.puts("\n[GDT] Before lgdt:\n");
+            _g.puts("  base: ");
+            _g.hex(gdt_ptr.base);
+            _g.puts("\n  limit: ");
+            _g.hex(gdt_ptr.limit as u64);
+            _g.puts("\n  GDT addr: ");
+            _g.hex((&raw const GDT) as u64);
+            _g.puts("\n  TSS addr: ");
+            _g.hex((&raw const TSS) as u64);
+            _g.putc(b'\n');
+        });
 
         core::arch::asm!(
             "lgdt [{}]",
@@ -365,19 +365,18 @@ pub fn init() {
         read_back_base = gdt_ptr.base;
         read_back_limit = gdt_ptr.limit;
 
-        {
-            let s = crate::SerialGuard::acquire();
-            s.puts("[GDT] After lgdt (read back):\n");
-            s.puts("  base: ");
-            s.hex(read_back_base);
-            s.puts("\n  limit: ");
-            s.hex(read_back_limit as u64);
-            s.putc(b'\n');
-        }
+        crate::kdebug!(arch, |_g| {
+            _g.puts("[GDT] After lgdt (read back):\n");
+            _g.puts("  base: ");
+            _g.hex(read_back_base);
+            _g.puts("\n  limit: ");
+            _g.hex(read_back_limit as u64);
+            _g.putc(b'\n');
+        });
 
         // Reload segment registers (including CS via far return)
         reload_segments();
-        crate::serial_puts("[GDT] Segments reloaded successfully\n");
+        crate::kdebug!(arch, |_g| { _g.puts("[GDT] Segments reloaded successfully\n"); });
 
         // Load TSS (must be AFTER GDT is loaded and segments are reloaded)
         // TSS selector is 0x28 (5th GDT entry, first is null)
@@ -386,7 +385,7 @@ pub fn init() {
             in(reg) 0x28u16,
             options(nostack)
         );
-        crate::serial_puts("[GDT] TSS loaded successfully\n");
+        crate::kdebug!(arch, |_g| { _g.puts("[GDT] TSS loaded successfully\n"); });
     }
 }
 

@@ -79,12 +79,11 @@ pub fn init() {
     // Disable the timer while we configure.
     write_cntp_ctl(0);
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[TIMER] Counter frequency: ");
-        s.hex(freq);
-        s.puts(" Hz\n");
-    }
+    crate::kinfo!(|_g| {
+        _g.puts("[TIMER] Counter frequency: ");
+        _g.hex(freq);
+        _g.puts(" Hz\n");
+    });
 }
 
 /// Start periodic timer interrupts.

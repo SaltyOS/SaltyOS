@@ -135,6 +135,8 @@ pub(crate) fn serial_dec_raw(mut val: u64) {
 
 /// Write a single byte to COM1 under SERIAL_LOCK.
 pub(crate) fn serial_putc(c: u8) {
+    #[cfg(no_serial_output)]
+    { let _ = c; return; }
     // SAFETY: save/restore IRQ flags around spinlock to prevent deadlock
     let irq = unsafe { mm::save_irq_disable() };
     SERIAL_LOCK.lock();
@@ -146,6 +148,8 @@ pub(crate) fn serial_putc(c: u8) {
 
 /// Write a string to COM1 under SERIAL_LOCK.
 pub(crate) fn serial_puts(s: &str) {
+    #[cfg(no_serial_output)]
+    { let _ = s; return; }
     // SAFETY: save/restore IRQ flags around spinlock to prevent deadlock
     let irq = unsafe { mm::save_irq_disable() };
     SERIAL_LOCK.lock();
@@ -156,6 +160,8 @@ pub(crate) fn serial_puts(s: &str) {
 
 /// Write a hexadecimal number to COM1 under SERIAL_LOCK.
 pub(crate) fn serial_hex(val: u64) {
+    #[cfg(no_serial_output)]
+    { let _ = val; return; }
     // SAFETY: save/restore IRQ flags around spinlock to prevent deadlock
     let irq = unsafe { mm::save_irq_disable() };
     SERIAL_LOCK.lock();
@@ -166,6 +172,8 @@ pub(crate) fn serial_hex(val: u64) {
 
 /// Write a decimal number to COM1 under SERIAL_LOCK.
 pub(crate) fn serial_dec(val: u64) {
+    #[cfg(no_serial_output)]
+    { let _ = val; return; }
     // SAFETY: save/restore IRQ flags around spinlock to prevent deadlock
     let irq = unsafe { mm::save_irq_disable() };
     SERIAL_LOCK.lock();
@@ -235,37 +243,61 @@ pub(crate) struct SerialGuard {
 
 impl SerialGuard {
     pub fn acquire() -> Self {
-        // SAFETY: save IRQ flags and disable interrupts to prevent deadlock
-        let irq = unsafe { mm::save_irq_disable() };
-        SERIAL_LOCK.lock();
-        Self { irq }
+        #[cfg(no_serial_output)]
+        { return Self { irq: 0 }; }
+
+        #[cfg(not(no_serial_output))]
+        {
+            // SAFETY: save IRQ flags and disable interrupts to prevent deadlock
+            let irq = unsafe { mm::save_irq_disable() };
+            SERIAL_LOCK.lock();
+            Self { irq }
+        }
     }
 
     pub fn puts(&self, s: &str) {
+        #[cfg(no_serial_output)]
+        { let _ = s; return; }
+        #[cfg(not(no_serial_output))]
         serial_write_hw(s.as_bytes());
     }
 
     pub fn hex(&self, val: u64) {
+        #[cfg(no_serial_output)]
+        { let _ = val; return; }
+        #[cfg(not(no_serial_output))]
         serial_hex_impl(val);
     }
 
     pub fn dec(&self, val: u64) {
+        #[cfg(no_serial_output)]
+        { let _ = val; return; }
+        #[cfg(not(no_serial_output))]
         serial_dec_impl(val);
     }
 
     pub fn putc(&self, c: u8) {
+        #[cfg(no_serial_output)]
+        { let _ = c; return; }
+        #[cfg(not(no_serial_output))]
         serial_putc_hw(c);
     }
 }
 
 impl Drop for SerialGuard {
     fn drop(&mut self) {
-        // Flush all pending console output accumulated during this guard's scope
-        // into a single VRAM update, before releasing the lock.
-        console::flush_pending();
-        SERIAL_LOCK.unlock();
-        // SAFETY: restoring previously saved IRQ flags
-        unsafe { mm::restore_irq(self.irq) };
+        #[cfg(no_serial_output)]
+        return;
+
+        #[cfg(not(no_serial_output))]
+        {
+            // Flush all pending console output accumulated during this guard's scope
+            // into a single VRAM update, before releasing the lock.
+            console::flush_pending();
+            SERIAL_LOCK.unlock();
+            // SAFETY: restoring previously saved IRQ flags
+            unsafe { mm::restore_irq(self.irq) };
+        }
     }
 }
 
@@ -298,31 +330,97 @@ impl Write for PanicSerialWriter {
 /// ```
 #[allow(unused_macros)]
 macro_rules! ktrace {
-    ($body:block) => {
+    // Module-tagged: enabled by global trace OR per-module flag
+    (mm, |$g:ident| { $($body:tt)* }) => { #[cfg(any(klog_trace, klog_mod_mm))] { let $g = $crate::SerialGuard::acquire(); $($body)* } };
+    (ipc, |$g:ident| { $($body:tt)* }) => { #[cfg(any(klog_trace, klog_mod_ipc))] { let $g = $crate::SerialGuard::acquire(); $($body)* } };
+    (sched, |$g:ident| { $($body:tt)* }) => { #[cfg(any(klog_trace, klog_mod_sched))] { let $g = $crate::SerialGuard::acquire(); $($body)* } };
+    (cap, |$g:ident| { $($body:tt)* }) => { #[cfg(any(klog_trace, klog_mod_cap))] { let $g = $crate::SerialGuard::acquire(); $($body)* } };
+    (syscall, |$g:ident| { $($body:tt)* }) => { #[cfg(any(klog_trace, klog_mod_syscall))] { let $g = $crate::SerialGuard::acquire(); $($body)* } };
+    (init, |$g:ident| { $($body:tt)* }) => { #[cfg(any(klog_trace, klog_mod_init))] { let $g = $crate::SerialGuard::acquire(); $($body)* } };
+    (arch, |$g:ident| { $($body:tt)* }) => { #[cfg(any(klog_trace, klog_mod_arch))] { let $g = $crate::SerialGuard::acquire(); $($body)* } };
+    (console, |$g:ident| { $($body:tt)* }) => { #[cfg(any(klog_trace, klog_mod_console))] { let $g = $crate::SerialGuard::acquire(); $($body)* } };
+    // Untagged fallback: global trace level only
+    (|$g:ident| { $($body:tt)* }) => {
         #[cfg(klog_trace)]
         {
-            let _g = $crate::SerialGuard::acquire();
-            $body
+            let $g = $crate::SerialGuard::acquire();
+            $($body)*
         }
     };
 }
 
-/// Debug-level log. Compiled out unless `klog_debug` (or `klog_trace`) cfg is set.
+/// Debug-level log. Compiled out unless `klog_debug` cfg is set,
+/// or the module-specific flag is set (e.g., `klog_mod_mm`).
+///
+/// Usage: `crate::kdebug!(mm, |_g| { _g.puts("detail\n"); });`
+/// Or without tag: `crate::kdebug!(|_g| { _g.puts("detail\n"); });`
+#[allow(unused_macros)]
+macro_rules! kdebug {
+    // Module-tagged: enabled by global debug OR per-module flag
+    (mm, |$g:ident| { $($body:tt)* }) => { #[cfg(any(klog_debug, klog_mod_mm))] { let $g = $crate::SerialGuard::acquire(); $($body)* } };
+    (ipc, |$g:ident| { $($body:tt)* }) => { #[cfg(any(klog_debug, klog_mod_ipc))] { let $g = $crate::SerialGuard::acquire(); $($body)* } };
+    (sched, |$g:ident| { $($body:tt)* }) => { #[cfg(any(klog_debug, klog_mod_sched))] { let $g = $crate::SerialGuard::acquire(); $($body)* } };
+    (cap, |$g:ident| { $($body:tt)* }) => { #[cfg(any(klog_debug, klog_mod_cap))] { let $g = $crate::SerialGuard::acquire(); $($body)* } };
+    (syscall, |$g:ident| { $($body:tt)* }) => { #[cfg(any(klog_debug, klog_mod_syscall))] { let $g = $crate::SerialGuard::acquire(); $($body)* } };
+    (init, |$g:ident| { $($body:tt)* }) => { #[cfg(any(klog_debug, klog_mod_init))] { let $g = $crate::SerialGuard::acquire(); $($body)* } };
+    (arch, |$g:ident| { $($body:tt)* }) => { #[cfg(any(klog_debug, klog_mod_arch))] { let $g = $crate::SerialGuard::acquire(); $($body)* } };
+    (console, |$g:ident| { $($body:tt)* }) => { #[cfg(any(klog_debug, klog_mod_console))] { let $g = $crate::SerialGuard::acquire(); $($body)* } };
+    // Untagged fallback: global debug level only
+    (|$g:ident| { $($body:tt)* }) => {
+        #[cfg(klog_debug)]
+        {
+            let $g = $crate::SerialGuard::acquire();
+            $($body)*
+        }
+    };
+}
+
+/// Info-level log. Compiled out unless `klog_info` cfg is set (default at `info` level).
 ///
 /// Same usage as `ktrace!`.
 #[allow(unused_macros)]
-macro_rules! kdebug {
-    ($body:block) => {
-        #[cfg(klog_debug)]
+macro_rules! kinfo {
+    (|$g:ident| { $($body:tt)* }) => {
+        #[cfg(klog_info)]
         {
-            let _g = $crate::SerialGuard::acquire();
-            $body
+            let $g = $crate::SerialGuard::acquire();
+            $($body)*
+        }
+    };
+}
+
+/// Warning-level log. Compiled out unless `klog_warn` cfg is set.
+///
+/// Same usage as `ktrace!`.
+#[allow(unused_macros)]
+macro_rules! kwarn {
+    (|$g:ident| { $($body:tt)* }) => {
+        #[cfg(klog_warn)]
+        {
+            let $g = $crate::SerialGuard::acquire();
+            $($body)*
+        }
+    };
+}
+
+/// Error-level log. Always unconditional — errors must never be silenced.
+///
+/// Same usage as `ktrace!`.
+#[allow(unused_macros)]
+macro_rules! kerror {
+    (|$g:ident| { $($body:tt)* }) => {
+        {
+            let $g = $crate::SerialGuard::acquire();
+            $($body)*
         }
     };
 }
 
 pub(crate) use ktrace;
 pub(crate) use kdebug;
+pub(crate) use kinfo;
+pub(crate) use kwarn;
+pub(crate) use kerror;
 
 /// Kernel entry point (called from bootloader)
 ///
@@ -336,25 +434,27 @@ pub extern "C" fn kmain(raw_boot_info: *const u8) -> ! {
     // Note: raw output OK here — single CPU, before SMP init
     serial_puts_raw("[ENTRY] ");
     serial_puts_raw("\nSaltyOS Kernel loaded\n");
-    {
-        let s = SerialGuard::acquire();
-        s.puts("[KMAIN] Entry addr: ");
-        s.hex(kmain as *const () as u64);
-        s.puts("\n[KMAIN] Boot info ptr: ");
-        s.hex(raw_boot_info as u64);
-        s.puts("\n");
-    }
+    crate::kinfo!(|_g| {
+        _g.puts("[KMAIN] Entry addr: ");
+        _g.hex(kmain as *const () as u64);
+        _g.puts("\n[KMAIN] Boot info ptr: ");
+        _g.hex(raw_boot_info as u64);
+        _g.puts("\n");
+    });
 
     // Parse TLV-encoded BootInfo from bootloader
     let boot_info = unsafe { bootinfo::parse(raw_boot_info) };
 
     if let Some(info) = boot_info {
-        let s = SerialGuard::acquire();
-        s.puts("[KMAIN] BootInfo parsed: ");
-        s.dec(info.memory_map_len as u64);
-        s.puts(" memory map entries\n");
+        crate::kinfo!(|_g| {
+            _g.puts("[KMAIN] BootInfo parsed: ");
+            _g.dec(info.memory_map_len as u64);
+            _g.puts(" memory map entries\n");
+        });
     } else {
-        serial_puts("[KMAIN] WARNING: Failed to parse BootInfo!\n");
+        crate::kwarn!(|_g| {
+            _g.puts("[KMAIN] WARNING: Failed to parse BootInfo!\n");
+        });
     }
 
     // Initialize architecture-specific subsystems

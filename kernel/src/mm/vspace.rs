@@ -1050,7 +1050,7 @@ impl VSpace {
                 super::pmm_set_owner(new_frame, &super::frame::FrameOwner::KernelPrivate {
                     subkind: super::frame::KernelMetaKind::PageTable,
                 });
-                crate::ktrace!({
+                crate::ktrace!(mm, |_g| {
                     _g.puts("[PT_ALLOC] seq=");
                     _g.hex(crate::arch::current_invoke_seq());
                     _g.puts(" vaddr=");

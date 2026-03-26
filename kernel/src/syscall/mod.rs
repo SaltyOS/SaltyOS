@@ -891,7 +891,7 @@ fn syscall_invoke(
 ) -> SyscallResult {
     // Stamp this invocation with a per-CPU monotonic sequence number for tracing.
     let seq = crate::arch::next_invoke_seq();
-    crate::kdebug!({
+    crate::kdebug!(syscall, |_g| {
         _g.puts("[INVOKE] seq=");
         _g.hex(seq);
         _g.puts(" cap=");
@@ -2603,7 +2603,7 @@ fn syscall_untyped_retype(
     dest_offset: u64,
 ) -> SyscallResult {
     let retype_seq = crate::arch::current_invoke_seq();
-    crate::kdebug!({
+    crate::kdebug!(syscall, |_g| {
         _g.puts("[RETYPE] seq=");
         _g.hex(retype_seq);
         _g.puts(" cap=");

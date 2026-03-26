@@ -13,6 +13,7 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use crate::sched::thread::{Tcb, XSaveArea};
+use crate::{kdebug, kerror};
 use super::cpu;
 
 /// Initialize FPU hardware on the BSP (Boot Strap Processor).
@@ -24,7 +25,7 @@ pub fn init_bsp() {
     unsafe {
         configure_fpu_hardware();
     }
-    crate::serial_puts("[FPU] BSP FPU hardware configured\n");
+    crate::kdebug!(arch, |_g| { _g.puts("[FPU] BSP FPU hardware configured\n"); });
 }
 
 /// Initialize FPU hardware on an AP (Application Processor).
@@ -97,11 +98,11 @@ unsafe fn configure_fpu_hardware() {
         // before it silently corrupts adjacent TCB fields.
         let needed = super::cpuid::xsave_area_size();
         if needed > 832 {
-            let s = crate::SerialGuard::acquire();
-            s.puts("*** FATAL: XSAVE area size (");
-            s.dec(needed as u64);
-            s.puts(") exceeds TCB buffer (832) ***\n");
-            drop(s);
+            crate::kerror!(|_g| {
+                _g.puts("*** FATAL: XSAVE area size (");
+                _g.dec(needed as u64);
+                _g.puts(") exceeds TCB buffer (832) ***\n");
+            });
             loop { super::halt(); }
         }
     }

@@ -491,14 +491,13 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
         trampoline_virt
     };
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[SMP] Trampoline phys=");
-        s.hex(trampoline_phys);
-        s.puts(" virt=");
-        s.hex(trampoline_virt);
-        s.putc(b'\n');
-    }
+    crate::kdebug!(arch, |_g| {
+        _g.puts("[SMP] Trampoline phys=");
+        _g.hex(trampoline_phys);
+        _g.puts(" virt=");
+        _g.hex(trampoline_virt);
+        _g.putc(b'\n');
+    });
 
     // Read BSP system register values for the AP mailbox.
     let mair = paging::read_mair();
@@ -565,12 +564,11 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
             core::arch::asm!("dsb sy", "isb", options(nomem, nostack));
         }
 
-        {
-            let s = crate::SerialGuard::acquire();
-            s.puts("[SMP] Starting AP cpu_id=");
-            s.dec(cpu_id as u64);
-            s.putc(b'\n');
-        }
+        crate::kdebug!(arch, |_g| {
+            _g.puts("[SMP] Starting AP cpu_id=");
+            _g.dec(cpu_id as u64);
+            _g.putc(b'\n');
+        });
 
         // Start the AP via PSCI CPU_ON.
         // target_cpu = MPIDR affinity value; on QEMU virt, Aff0 = cpu_id.
@@ -581,14 +579,13 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
         }
         if result != psci::PSCI_SUCCESS {
             // CPU doesn't exist or PSCI error — stop probing.
-            {
-                let s = crate::SerialGuard::acquire();
-                s.puts("[SMP] PSCI CPU_ON failed for cpu_id=");
-                s.dec(cpu_id as u64);
-                s.puts(" error=");
-                s.puts(psci::error_name(result));
-                s.putc(b'\n');
-            }
+            crate::kerror!(|_g| {
+                _g.puts("[SMP] PSCI CPU_ON failed for cpu_id=");
+                _g.dec(cpu_id as u64);
+                _g.puts(" error=");
+                _g.puts(psci::error_name(result));
+                _g.putc(b'\n');
+            });
             break;
         }
 
@@ -597,10 +594,11 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
         let mut timeout = 500_000u32;
         while !ap_boot::is_ap_ready(cpu_id) {
             if timeout == 0 {
-                let s = crate::SerialGuard::acquire();
-                s.puts("[SMP] AP cpu_id=");
-                s.dec(cpu_id as u64);
-                s.puts(" timeout waiting for ready\n");
+                crate::kdebug!(arch, |_g| {
+                    _g.puts("[SMP] AP cpu_id=");
+                    _g.dec(cpu_id as u64);
+                    _g.puts(" timeout waiting for ready\n");
+                });
                 break;
             }
             for _ in 0..100 {
@@ -614,12 +612,11 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
         }
     }
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[SMP] ");
-        s.dec(ap_count as u64);
-        s.puts(" AP(s) online\n");
-    }
+    crate::kinfo!(|_g| {
+        _g.puts("[SMP] ");
+        _g.dec(ap_count as u64);
+        _g.puts(" AP(s) online\n");
+    });
 }
 
 /// Remove bootloader identity mapping (L0[0] via TTBR0).

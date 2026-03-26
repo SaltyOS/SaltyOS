@@ -2,6 +2,7 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+use crate::kdebug;
 use crate::mm::{pmm_alloc, frame::FrameOwner, frame::KernelMetaKind, phys_to_virt, PAGE_SIZE, PHYS_MAP_OFFSET};
 
 /// Maximum direct physical mapping size (512 GB cap)
@@ -265,14 +266,13 @@ unsafe fn init_direct_map(max_phys: u64) {
         return;
     }
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[PAGING] Direct map size: ");
-        s.hex(direct_map_size as u64);
-        s.puts(" (max_phys=");
-        s.hex(max_phys);
-        s.puts(")\n");
-    }
+    crate::kdebug!(arch, |_g| {
+        _g.puts("[PAGING] Direct map size: ");
+        _g.hex(direct_map_size as u64);
+        _g.puts(" (max_phys=");
+        _g.hex(max_phys);
+        _g.puts(")\n");
+    });
 
     let cr0_orig: u64;
     unsafe {

@@ -20,6 +20,7 @@ pub use apic::{send_ipi, set_tlb_shootdown_addr, IpiKind, ioapic_unmask, ioapic_
 pub use cpu::{current_cpu, set_kernel_stack, next_invoke_seq, current_invoke_seq, read_fs_base, write_fs_base, generate_stack_canary, set_per_cpu_canary, MAX_CPUS};
 pub use gdt::set_tss_rsp0;
 
+use crate::kdebug;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// True = APIC mode, False = PIC+PIT fallback
@@ -64,7 +65,7 @@ pub use context::{context_switch, usermode_trampoline};
 ///
 /// Timer is started later via start_timer() after scheduler is ready.
 pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
-    crate::serial_puts("\n[ARCH] init() called\n");
+    crate::kdebug!(arch, |_g| { _g.puts("\n[ARCH] init() called\n"); });
 
     // Initialize GDT (required before IDT)
     gdt::init();
@@ -73,7 +74,7 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // MUST be after gdt::init() because reload_segments() clobbers GS base
     cpu::init_bsp();
 
-    crate::serial_puts("[ARCH] About to call idt::init()\n");
+    crate::kdebug!(arch, |_g| { _g.puts("[ARCH] About to call idt::init()\n"); });
 
     // Initialize IDT BEFORE APIC timer starts
     // This prevents triple fault when timer fires
@@ -89,10 +90,10 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
         // Initialize PIC with remapped vectors (IRQ0→vector 32)
         // All IRQs masked; start_timer() will unmask IRQ0
         pit::init_pic_mode();
-        crate::serial_puts("[ARCH] No APIC, using PIC+PIT fallback\n");
+        crate::kdebug!(arch, |_g| { _g.puts("[ARCH] No APIC, using PIC+PIT fallback\n"); });
     }
 
-    crate::serial_puts("[ARCH] idt::init() returned successfully\n");
+    crate::kdebug!(arch, |_g| { _g.puts("[ARCH] idt::init() returned successfully\n"); });
 
     // Detect CPU features (SSE, XSAVE, etc.) — needed by FPU init
     cpuid::init();
@@ -319,12 +320,11 @@ fn init_exception_stacks() {
     }
     idt::set_double_fault_ist(1);
 
-    {
-        let s = crate::SerialGuard::acquire();
-        s.puts("[ARCH] Double fault IST1 stack: ");
-        s.hex(stack_top);
-        s.putc(b'\n');
-    }
+    crate::kdebug!(arch, |_g| {
+        _g.puts("[ARCH] Double fault IST1 stack: ");
+        _g.hex(stack_top);
+        _g.putc(b'\n');
+    });
 }
 
 // External assembly entry point
@@ -343,7 +343,7 @@ unsafe extern "C" {
 /// Also allocates and sets up kernel stacks for syscall handling.
 pub fn init_syscalls() {
     unsafe {
-        crate::serial_puts("\n[SYSCALL] Initializing syscall MSRs\n");
+        crate::kdebug!(arch, |_g| { _g.puts("\n[SYSCALL] Initializing syscall MSRs\n"); });
 
         // Allocate kernel stack for syscall (16KB = 4 contiguous pages of 4KB each)
         const STACK_PAGES: usize = 4;
@@ -366,12 +366,11 @@ pub fn init_syscalls() {
         // Set TSS rsp0 (for interrupt entry from user mode)
         gdt::set_tss_rsp0(stack_top);
 
-        {
-            let s = crate::SerialGuard::acquire();
-            s.puts("[SYSCALL] Kernel stack: ");
-            s.hex(stack_top);
-            s.putc(b'\n');
-        }
+        crate::kdebug!(arch, |_g| {
+            _g.puts("[SYSCALL] Kernel stack: ");
+            _g.hex(stack_top);
+            _g.putc(b'\n');
+        });
 
         // STAR MSR format:
         // [63:48] = sysret base selector
@@ -440,14 +439,13 @@ pub fn init_syscalls() {
             options(nostack)
         );
 
-        {
-            let s = crate::SerialGuard::acquire();
-            s.puts("[SYSCALL] MSRs configured successfully\n");
-            s.puts("[SYSCALL]   STAR=");
-            s.hex(star);
-            s.puts("\n[SYSCALL]   LSTAR=");
-            s.hex(lstar);
-            s.putc(b'\n');
-        }
+        crate::kdebug!(arch, |_g| {
+            _g.puts("[SYSCALL] MSRs configured successfully\n");
+            _g.puts("[SYSCALL]   STAR=");
+            _g.hex(star);
+            _g.puts("\n[SYSCALL]   LSTAR=");
+            _g.hex(lstar);
+            _g.putc(b'\n');
+        });
     }
 }

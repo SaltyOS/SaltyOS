@@ -372,7 +372,7 @@ unsafe fn init_frame_metadata(
     zero_fill: bool,
 ) -> *mut crate::cap::object::KernelObject {
     let actual_bits = if size_bits < 12 { 12 } else { size_bits };
-    crate::ktrace!({
+    crate::ktrace!(cap, |_g| {
         _g.puts("[FRAME_META] seq=");
         _g.hex(crate::arch::current_invoke_seq());
         _g.puts(" phys=");
