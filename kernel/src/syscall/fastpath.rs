@@ -197,6 +197,11 @@ pub unsafe extern "C" fn fastpath_call_rust(
         (*receiver).saved_caller_msg = msg;
         (*receiver).saved_caller_badge = badge;
 
+        if matches!((*receiver).blocked_reason, Some(BlockedReason::RecvTimedBlocked)) {
+            crate::sched::sleep_queue::remove(receiver);
+            (*receiver).timer_wakeup_ns = 0;
+        }
+
         (*receiver).state = ThreadState::Ready;
         (*receiver).blocked_reason = None;
         (*receiver).blocked_endpoint = core::ptr::null_mut();
