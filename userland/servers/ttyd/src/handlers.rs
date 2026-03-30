@@ -223,7 +223,12 @@ pub unsafe fn handle_pty_ioctl(msg: &BesaltMsg, reply: &mut BesaltMsg) {
                 reply.regs[0] = pty.fg_pgid as u64;
             }
             TIOCSPGRP => {
-                if pty.has_ctty && pty.ctty_owner_badge == caller_badge {
+                // The controlling tty is usually acquired by getty before exec.
+                // Once the shell resets its process group, later tcsetpgrp()
+                // calls come from a different process badge. We do not yet
+                // track full session membership here, so accept foreground-pgrp
+                // updates for any process on the controlling tty.
+                if pty.has_ctty {
                     pty.fg_pgid = arg as u32;
                     reply.label = BESALT_OK;
                     reply.length = 0;
@@ -236,13 +241,13 @@ pub unsafe fn handle_pty_ioctl(msg: &BesaltMsg, reply: &mut BesaltMsg) {
                 // deadlock cycle when procmgr is blocked on VFS (e.g., during
                 // spawn binary loading on SMP). Assume dead owner and allow
                 // takeover; use caller_badge as pgid fallback.
-                if pty.has_ctty && pty.ctty_owner_badge != caller_badge {
+                if pty.has_ctty && pty.ctty_session_id != caller_badge {
                     // Old owner assumed dead — allow takeover without procmgr check
                     pty.fg_pgid = 0;
                 }
                 let newly_acquired = !pty.has_ctty || pty.fg_pgid == 0;
                 pty.has_ctty = true;
-                pty.ctty_owner_badge = caller_badge;
+                pty.ctty_session_id = caller_badge;
                 if newly_acquired {
                     if caller_badge != 0 && caller_badge <= u32::MAX as u64 {
                         pty.fg_pgid = caller_badge as u32;
@@ -252,9 +257,9 @@ pub unsafe fn handle_pty_ioctl(msg: &BesaltMsg, reply: &mut BesaltMsg) {
                 reply.length = 0;
             }
             TIOCNOTTY => {
-                if pty.has_ctty && pty.ctty_owner_badge == caller_badge {
+                if pty.has_ctty {
                     pty.has_ctty = false;
-                    pty.ctty_owner_badge = 0;
+                    pty.ctty_session_id = 0;
                     pty.fg_pgid = 0;
                     reply.label = BESALT_OK;
                     reply.length = 0;
@@ -313,10 +318,9 @@ pub unsafe fn handle_pty_poll(msg: &BesaltMsg, reply: &mut BesaltMsg) {
 pub unsafe fn handle_legacy(label: u64, msg: &BesaltMsg, reply: &mut BesaltMsg) {
     match label {
         TTYD_GET_FG_PGRP => {
-            let caller_badge = msg.regs[0];
             unsafe {
                 let pty = &*(&raw const PTYS[0]);
-                if !pty.has_ctty || pty.ctty_owner_badge != caller_badge {
+                if !pty.has_ctty {
                     reply.label = BESALT_INVALID_OPERATION;
                     return;
                 }
@@ -326,11 +330,10 @@ pub unsafe fn handle_legacy(label: u64, msg: &BesaltMsg, reply: &mut BesaltMsg) 
             }
         }
         TTYD_SET_FG_PGRP => {
-            let caller_badge = msg.regs[0];
             let requested = msg.regs[1] as u32;
             unsafe {
                 let pty = &mut *(&raw mut PTYS[0]);
-                if !pty.has_ctty || pty.ctty_owner_badge != caller_badge {
+                if !pty.has_ctty {
                     reply.label = BESALT_INVALID_OPERATION;
                     return;
                 }
@@ -344,11 +347,11 @@ pub unsafe fn handle_legacy(label: u64, msg: &BesaltMsg, reply: &mut BesaltMsg) 
             unsafe {
                 let pty = &mut *(&raw mut PTYS[0]);
                 // Do NOT call procmgr — same deadlock risk as TIOCSCTTY above.
-                if pty.has_ctty && pty.ctty_owner_badge != caller_badge {
+                if pty.has_ctty && pty.ctty_session_id != caller_badge {
                     pty.fg_pgid = 0;
                 }
                 pty.has_ctty = true;
-                pty.ctty_owner_badge = caller_badge;
+                pty.ctty_session_id = caller_badge;
                 reply.label = BESALT_OK;
                 reply.length = 0;
             }
@@ -357,12 +360,12 @@ pub unsafe fn handle_legacy(label: u64, msg: &BesaltMsg, reply: &mut BesaltMsg) 
             let caller_badge = msg.regs[0];
             unsafe {
                 let pty = &mut *(&raw mut PTYS[0]);
-                if !pty.has_ctty || pty.ctty_owner_badge != caller_badge {
+                if !pty.has_ctty || pty.ctty_session_id != caller_badge {
                     reply.label = BESALT_INVALID_OPERATION;
                     return;
                 }
                 pty.has_ctty = false;
-                pty.ctty_owner_badge = 0;
+                pty.ctty_session_id = 0;
                 pty.fg_pgid = 0;
                 reply.label = BESALT_OK;
                 reply.length = 0;

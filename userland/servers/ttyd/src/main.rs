@@ -67,7 +67,7 @@ fn puts(s: &[u8]) {
 }
 
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
-    &raw mut besalt::__besalt_ipc_ctx
+    besalt::tls::current_ipc_ctx()
 }
 
 fn signal_ready() {
@@ -426,11 +426,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 unsafe {
                     for i in 0..MAX_PTYS {
                         let pty = &mut *(&raw mut PTYS[i]);
-                        if pty.has_ctty && pty.ctty_owner_badge == dead_badge {
+                        if pty.has_ctty && pty.ctty_session_id == dead_badge {
                             pty.has_ctty = false;
-                            pty.ctty_owner_badge = 0;
-                            pty.fg_pgid = 0;
-                        } else if pty.fg_pgid == dead_badge as u32 {
+                            pty.ctty_session_id = 0;
                             pty.fg_pgid = 0;
                         }
                     }
