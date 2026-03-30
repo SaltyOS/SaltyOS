@@ -2,12 +2,11 @@
 //! DNS protocol engine for netsrv.
 //!
 //! Builds RFC 1035 DNS queries (A and PTR records), sends them over a dedicated
-//! internal UDP socket to the QEMU DNS forwarder at 10.0.2.3:53, and parses
+//! internal UDP socket to the runtime-configured recursive resolver, and parses
 //! responses (CNAME resolution is delegated to the upstream recursive resolver).
 
 use besalt::consts::*;
 
-const DNS_SERVER_IP: u32 = 0x0A00_0203; // 10.0.2.3 (QEMU DNS forwarder)
 const DNS_PORT: u16 = 53;
 const MAX_DNS_RESULTS: usize = 4;
 const DNS_TIMEOUT_NS: u64 = 3_000_000_000; // 3 seconds per attempt
@@ -46,14 +45,14 @@ pub(crate) enum DnsError {
 
 /// Initialize the internal DNS UDP socket. Call once during netsrv startup.
 pub(crate) fn init_dns_socket() {
-    let id = super::udp::udp_socket();
+    let id = super::socket::udp::udp_socket();
     if id < 0 {
         crate::puts(b"[netsrv] DNS: failed to allocate internal UDP socket\n");
         return;
     }
     // No explicit bind needed: leaving the UDP socket with local_port == 0
     // lets udp_sendto auto-assign an ephemeral port on first use.
-    let _bind_result = super::udp::udp_bind(id as u32, super::ipv4::OUR_IP, 0);
+    let _bind_result = super::socket::udp::udp_bind(id as u32, super::proto::ipv4::our_ip(), 0);
     // SAFETY: Single-threaded init; DNS_SOCKET_ID written once before event loop.
     unsafe {
         *(&raw mut DNS_SOCKET_ID) = id;
@@ -692,15 +691,19 @@ fn send_query_for_slot(slot: &PendingDns) -> bool {
         DnsQueryType::Ptr => build_ptr_query(slot.ptr_ip, slot.txn_id, &mut query_buf),
     };
     if query_len > 0 {
-        let next_hop = super::ipv4::route(DNS_SERVER_IP);
-        if super::arp::lookup(next_hop).is_none() {
+        let dns_server = super::config::dns_server();
+        if dns_server == 0 {
+            return false;
+        }
+        let next_hop = super::proto::ipv4::route(dns_server);
+        if super::proto::arp::lookup(next_hop).is_none() {
             // ARP entry missing — send request; caller will use a short
             // retry deadline instead of the full DNS_TIMEOUT_NS.
             let our_mac = crate::mac_addr();
-            super::arp::request(&our_mac, super::ipv4::OUR_IP, next_hop);
+            super::proto::arp::request(&our_mac, super::proto::ipv4::our_ip(), next_hop);
             return false;
         }
-        super::udp::udp_sendto(socket_id as u32, &query_buf[..query_len], DNS_SERVER_IP, DNS_PORT);
+        super::socket::udp::udp_sendto(socket_id as u32, &query_buf[..query_len], dns_server, DNS_PORT);
     }
     true
 }
@@ -724,6 +727,15 @@ pub(crate) fn start_resolve(hostname: &[u8]) -> Option<u64> {
 
     let slot_idx = find_free_slot()?;
     let reply_cap_slot = CAP_DNS_REPLY_BASE + slot_idx as u64;
+    besalt::udebug!(|_lb| {
+        _lb.str(b"[netsrv] DNS start A slot=");
+        _lb.dec(slot_idx as u64);
+        _lb.str(b" host_len=");
+        _lb.dec(hostname.len() as u64);
+        _lb.str(b" txn=");
+        _lb.hex(txn_id as u64);
+        _lb.putc(b'\n');
+    });
 
     // Save the caller's reply cap into a CNode slot
     let err = besalt::invoke::cnode_save_caller(CAP_SELF_CSPACE, reply_cap_slot);
@@ -836,14 +848,23 @@ pub(crate) fn process_pending() {
     // 1. Drain DNS socket for responses
     loop {
         let mut resp_buf = [0u8; DNS_MAX_RESPONSE_LEN];
-        let (len, src_ip, src_port) =
-            super::udp::udp_recvfrom(socket_id as u32, &mut resp_buf);
+        let (len, src_ip, src_port, _) =
+            super::socket::udp::udp_recvfrom(socket_id as u32, &mut resp_buf, false);
         if len <= 0 {
             break;
         }
-        if src_ip != DNS_SERVER_IP || src_port != DNS_PORT {
+        if src_ip != super::config::dns_server() || src_port != DNS_PORT {
             continue;
         }
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[netsrv] DNS recv len=");
+            _lb.dec(len as u64);
+            _lb.str(b" src=0x");
+            _lb.hex(src_ip as u64);
+            _lb.str(b" port=");
+            _lb.dec(src_port as u64);
+            _lb.putc(b'\n');
+        });
 
         // Try to match against pending requests
         // SAFETY: Single-threaded server.
@@ -861,6 +882,15 @@ pub(crate) fn process_pending() {
                     DnsQueryType::A => {
                         match parse_response(&resp_buf[..len as usize], txn_id) {
                             Some(Ok(result)) => {
+                                besalt::udebug!(|_lb| {
+                                    _lb.str(b"[netsrv] DNS match A slot=");
+                                    _lb.dec(i as u64);
+                                    _lb.str(b" txn=");
+                                    _lb.hex(txn_id as u64);
+                                    _lb.str(b" count=");
+                                    _lb.dec(result.ip_count as u64);
+                                    _lb.putc(b'\n');
+                                });
                                 push_completion(DnsCompletion {
                                     reply_cap_slot: (*pending)[i].reply_cap_slot,
                                     query_type: DnsQueryType::A,
@@ -873,6 +903,15 @@ pub(crate) fn process_pending() {
                                 true
                             }
                             Some(Err(rcode)) => {
+                                besalt::udebug!(|_lb| {
+                                    _lb.str(b"[netsrv] DNS error A slot=");
+                                    _lb.dec(i as u64);
+                                    _lb.str(b" txn=");
+                                    _lb.hex(txn_id as u64);
+                                    _lb.str(b" rcode=");
+                                    _lb.dec(rcode as u64);
+                                    _lb.putc(b'\n');
+                                });
                                 push_completion(DnsCompletion {
                                     reply_cap_slot: (*pending)[i].reply_cap_slot,
                                     query_type: DnsQueryType::A,
@@ -935,34 +974,48 @@ pub(crate) fn process_pending() {
         let pending = &raw mut PENDING;
         let mut i = 0;
         while i < MAX_PENDING_DNS {
-            if (*pending)[i].active && now >= (*pending)[i].deadline_ns {
-                if (*pending)[i].attempt < DNS_MAX_RETRIES {
-                    let sent = send_query_for_slot(&(*pending)[i]);
-                    if sent {
-                        // Query actually went out — count as a real attempt
-                        (*pending)[i].attempt += 1;
-                        (*pending)[i].txn_id = generate_txn_id();
-                        (*pending)[i].deadline_ns = now + DNS_TIMEOUT_NS;
-                    } else {
-                        // Blocked on ARP — short retry, don't burn an attempt
-                        (*pending)[i].deadline_ns = now + ARP_RETRY_NS;
-                    }
-                } else {
-                    // All retries exhausted: timeout
-                    push_completion(DnsCompletion {
-                        reply_cap_slot: (*pending)[i].reply_cap_slot,
-                        query_type: (*pending)[i].query_type,
-                        success: false,
-                        dns_result: DnsResult { ip_count: 0, ips: [0; MAX_DNS_RESULTS], ttl: 0 },
-                        error: DnsError::Timeout,
-                        ptr_hostname: [0; 256],
-                        ptr_hostname_len: 0,
+                if (*pending)[i].active && now >= (*pending)[i].deadline_ns {
+                    besalt::udebug!(|_lb| {
+                        _lb.str(b"[netsrv] DNS deadline slot=");
+                        _lb.dec(i as u64);
+                        _lb.str(b" attempt=");
+                        _lb.dec((*pending)[i].attempt as u64);
+                        _lb.str(b" type=");
+                        _lb.dec((*pending)[i].query_type as u64);
+                        _lb.putc(b'\n');
                     });
-                    (*pending)[i].active = false;
+                    if (*pending)[i].attempt < DNS_MAX_RETRIES {
+                        // Retransmit the same logical query with the same
+                        // transaction ID. Rotating txn_id per retry makes a
+                        // slightly-late response from an earlier attempt look
+                        // unrelated, which turns normal UDP delay into a
+                        // spurious hang/timeout that disappears when logging
+                        // perturbs scheduling.
+                        let sent = send_query_for_slot(&(*pending)[i]);
+                        if sent {
+                            // Query actually went out — count as a real attempt
+                            (*pending)[i].attempt += 1;
+                            (*pending)[i].deadline_ns = now + DNS_TIMEOUT_NS;
+                        } else {
+                            // Blocked on ARP — short retry, don't burn an attempt
+                            (*pending)[i].deadline_ns = now + ARP_RETRY_NS;
+                        }
+                    } else {
+                        // All retries exhausted: timeout
+                        push_completion(DnsCompletion {
+                            reply_cap_slot: (*pending)[i].reply_cap_slot,
+                            query_type: (*pending)[i].query_type,
+                            success: false,
+                            dns_result: DnsResult { ip_count: 0, ips: [0; MAX_DNS_RESULTS], ttl: 0 },
+                            error: DnsError::Timeout,
+                            ptr_hostname: [0; 256],
+                            ptr_hostname_len: 0,
+                        });
+                        (*pending)[i].active = false;
+                    }
                 }
+                i += 1;
             }
-            i += 1;
-        }
     }
 }
 

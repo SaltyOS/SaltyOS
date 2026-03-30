@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! IPv4 packet parsing and construction.
 
-use super::checksum;
+use crate::net::checksum;
 
 pub(crate) const PROTO_ICMP: u8 = 1;
 pub(crate) const PROTO_TCP: u8 = 6;
 pub(crate) const PROTO_UDP: u8 = 17;
 pub(crate) const IPV4_HEADER_LEN: usize = 20;
-
-/// Static IP configuration (QEMU user networking defaults).
-pub(crate) const OUR_IP: u32 = 0x0A00_020F;    // 10.0.2.15
-pub(crate) const GATEWAY_IP: u32 = 0x0A00_0202; // 10.0.2.2
-pub(crate) const SUBNET_MASK: u32 = 0xFFFF_FF00; // 255.255.255.0
 
 /// Monotonically increasing IP identification counter.
 static mut IP_ID: u16 = 1;
@@ -80,7 +75,14 @@ pub(crate) fn parse(data: &[u8]) -> Option<(Ipv4Header, &[u8])> {
 /// Build an IPv4 packet into `buf`. Returns total bytes written (header + payload).
 ///
 /// Computes the IP header checksum automatically.
-pub(crate) fn build(src: u32, dst: u32, protocol: u8, payload: &[u8], buf: &mut [u8]) -> usize {
+pub(crate) fn build_with_ttl(
+    src: u32,
+    dst: u32,
+    protocol: u8,
+    ttl: u8,
+    payload: &[u8],
+    buf: &mut [u8],
+) -> usize {
     let total_len = IPV4_HEADER_LEN + payload.len();
     if buf.len() < total_len {
         return 0;
@@ -107,7 +109,7 @@ pub(crate) fn build(src: u32, dst: u32, protocol: u8, payload: &[u8], buf: &mut 
     buf[6] = 0x40;
     buf[7] = 0;
     // TTL
-    buf[8] = 64;
+    buf[8] = ttl;
     // Protocol
     buf[9] = protocol;
     // Checksum (zeroed for calculation)
@@ -135,12 +137,28 @@ pub(crate) fn build(src: u32, dst: u32, protocol: u8, payload: &[u8], buf: &mut 
     total_len
 }
 
+pub(crate) fn build(src: u32, dst: u32, protocol: u8, payload: &[u8], buf: &mut [u8]) -> usize {
+    build_with_ttl(src, dst, protocol, 64, payload, buf)
+}
+
 /// Route a destination IP: if on the same subnet, return dst directly;
 /// otherwise return the gateway IP.
 pub(crate) fn route(dst: u32) -> u32 {
-    if (dst & SUBNET_MASK) == (OUR_IP & SUBNET_MASK) {
-        dst
-    } else {
-        GATEWAY_IP
-    }
+    crate::net::config::route(dst)
+}
+
+pub(crate) fn our_ip() -> u32 {
+    crate::net::config::our_ip()
+}
+
+pub(crate) fn gateway_ip() -> u32 {
+    crate::net::config::gateway_ip()
+}
+
+pub(crate) fn subnet_mask() -> u32 {
+    crate::net::config::subnet_mask()
+}
+
+pub(crate) fn is_broadcast(dst: u32) -> bool {
+    crate::net::config::is_broadcast(dst)
 }

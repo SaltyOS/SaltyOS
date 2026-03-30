@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! TCP (Transmission Control Protocol) implementation.
+//! TCP socket management — connection pools, state machine, rx/tx buffering,
+//! retransmission, and async completion queue.
 //!
-//! Provides a connection-oriented, reliable byte-stream protocol over IPv4.
-//! Implements the TCP state machine per RFC 793 with retransmission support.
+//! Stateless header parsing and construction live in `crate::net::proto::tcp`.
+//! This module owns all stateful per-connection logic (TCBs, timers, the
+//! completion ring, and the public socket API).
 
-use super::checksum;
-use super::ipv4::{self, Ipv4Header, PROTO_TCP};
+use crate::net::checksum;
+use crate::net::proto::ipv4::{self, Ipv4Header, PROTO_TCP};
+use crate::net::proto::tcp as tcp_proto;
+use crate::net::socket::options::{self, SocketOptions};
 use besalt::consts::{
-    INET_OP_ACCEPT, INET_OP_CONNECT, INET_OP_RECV, BESALT_CONN_REFUSED, BESALT_OK, BESALT_TIMED_OUT,
+    BESALT_CONN_REFUSED, BESALT_INVALID_ARGUMENT, BESALT_NOT_CONNECTED, BESALT_OK,
+    BESALT_TIMED_OUT, INET_OP_ACCEPT, INET_OP_CONNECT, INET_OP_RECV, SOCK_STREAM,
     SYS_CLOCK_GETTIME, SYS_GETRANDOM,
 };
 use besalt::types::Timespec;
@@ -21,7 +26,6 @@ const TCP_RX_BUF_SIZE: usize = 8192;
 const TCP_TX_BUF_SIZE: usize = 8192;
 const MAX_LISTEN_BACKLOG: usize = 16;
 const MAX_COMPLETIONS: usize = 64;
-const TCP_HEADER_LEN: usize = 20;
 const MAX_RETRIES: u32 = 5;
 const INITIAL_RTO_MS: u64 = 1000;
 const MAX_RTO_MS: u64 = 64000;
@@ -29,12 +33,6 @@ const TIME_WAIT_NS: u64 = 60_000_000_000; // 60 seconds (simplified 2*MSL)
 const DEFAULT_MSS: u16 = 1460;
 const DEFAULT_WINDOW: u16 = 8192;
 const NS_PER_MS: u64 = 1_000_000;
-
-pub(crate) const TCP_FLAG_FIN: u8 = 0x01;
-pub(crate) const TCP_FLAG_SYN: u8 = 0x02;
-pub(crate) const TCP_FLAG_RST: u8 = 0x04;
-pub(crate) const TCP_FLAG_PSH: u8 = 0x08;
-pub(crate) const TCP_FLAG_ACK: u8 = 0x10;
 
 // ---------------------------------------------------------------------------
 // State
@@ -133,6 +131,7 @@ struct TcpControlBlock {
     active: bool,
     state: TcpState,
     local_ip: u32,
+    dynamic_local_ip: bool,
     local_port: u16,
     remote_ip: u32,
     remote_port: u16,
@@ -170,6 +169,7 @@ struct TcpControlBlock {
 
     // Connection identifier
     conn_id: u32,
+    opts: SocketOptions,
     // For accepted connections: the listen socket's conn_id
     parent_conn_id: u32,
 
@@ -185,6 +185,7 @@ static mut TCBS: [TcpControlBlock; MAX_TCP_CONNS] = {
         active: false,
         state: TcpState::Closed,
         local_ip: 0,
+        dynamic_local_ip: false,
         local_port: 0,
         remote_ip: 0,
         remote_port: 0,
@@ -226,6 +227,7 @@ static mut TCBS: [TcpControlBlock; MAX_TCP_CONNS] = {
         backlog_count: 0,
         max_backlog: 0,
         conn_id: 0,
+        opts: SocketOptions::new(TCP_TX_BUF_SIZE as u32, TCP_RX_BUF_SIZE as u32),
         parent_conn_id: 0,
         timewait_deadline_ns: 0,
         fin_seq: 0,
@@ -446,6 +448,7 @@ fn reset_tcb(idx: usize) {
         tcb.active = false;
         tcb.state = TcpState::Closed;
         tcb.local_ip = 0;
+        tcb.dynamic_local_ip = false;
         tcb.local_port = 0;
         tcb.remote_ip = 0;
         tcb.remote_port = 0;
@@ -469,9 +472,36 @@ fn reset_tcb(idx: usize) {
         tcb.backlog_count = 0;
         tcb.max_backlog = 0;
         tcb.conn_id = 0;
+        tcb.opts = SocketOptions::new(TCP_TX_BUF_SIZE as u32, TCP_RX_BUF_SIZE as u32);
         tcb.parent_conn_id = 0;
         tcb.timewait_deadline_ns = 0;
         tcb.fin_seq = 0;
+    }
+}
+
+fn close_tcb_preserve_socket(idx: usize, err: u64) {
+    // SAFETY: Single-threaded driver.
+    unsafe {
+        let tcb = &mut (*(&raw mut TCBS))[idx];
+        let conn_id = tcb.conn_id;
+        let opts = tcb.opts;
+        let local_ip = tcb.local_ip;
+        let dynamic_local_ip = tcb.dynamic_local_ip;
+        let local_port = tcb.local_port;
+
+        reset_tcb(idx);
+
+        let tcb = &mut (*(&raw mut TCBS))[idx];
+        tcb.active = true;
+        tcb.state = TcpState::Closed;
+        tcb.conn_id = conn_id;
+        tcb.local_ip = local_ip;
+        tcb.dynamic_local_ip = dynamic_local_ip;
+        tcb.local_port = local_port;
+        tcb.rcv_wnd = DEFAULT_WINDOW;
+        tcb.mss = DEFAULT_MSS;
+        tcb.opts = opts;
+        tcb.opts.last_error = err;
     }
 }
 
@@ -479,64 +509,12 @@ fn reset_tcb(idx: usize) {
 // Packet building / sending
 // ---------------------------------------------------------------------------
 
-fn build_tcp_header(
-    src_port: u16,
-    dst_port: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
-    window: u16,
-    payload: &[u8],
-    buf: &mut [u8],
-) -> usize {
-    let total = TCP_HEADER_LEN + payload.len();
-    if buf.len() < total {
-        return 0;
-    }
-
-    // Source port
-    buf[0] = (src_port >> 8) as u8;
-    buf[1] = src_port as u8;
-    // Dest port
-    buf[2] = (dst_port >> 8) as u8;
-    buf[3] = dst_port as u8;
-    // Sequence number
-    buf[4] = (seq >> 24) as u8;
-    buf[5] = (seq >> 16) as u8;
-    buf[6] = (seq >> 8) as u8;
-    buf[7] = seq as u8;
-    // Ack number
-    buf[8] = (ack >> 24) as u8;
-    buf[9] = (ack >> 16) as u8;
-    buf[10] = (ack >> 8) as u8;
-    buf[11] = ack as u8;
-    // Data offset (5 words = 20 bytes) | reserved
-    buf[12] = 0x50;
-    // Flags
-    buf[13] = flags;
-    // Window
-    buf[14] = (window >> 8) as u8;
-    buf[15] = window as u8;
-    // Checksum (zeroed, computed after)
-    buf[16] = 0;
-    buf[17] = 0;
-    // Urgent pointer
-    buf[18] = 0;
-    buf[19] = 0;
-
-    // Copy payload
-    if !payload.is_empty() {
-        buf[TCP_HEADER_LEN..total].copy_from_slice(payload);
-    }
-
-    total
-}
-
 fn send_tcp_segment(
     src_ip: u32,
     dst_ip: u32,
     src_port: u16,
     dst_port: u16,
+    ttl: u8,
     seq: u32,
     ack: u32,
     flags: u8,
@@ -544,7 +522,7 @@ fn send_tcp_segment(
     payload: &[u8],
 ) {
     let mut seg_buf = [0u8; 1480];
-    let seg_len = build_tcp_header(
+    let seg_len = tcp_proto::build(
         src_port,
         dst_port,
         seq,
@@ -564,8 +542,8 @@ fn send_tcp_segment(
     seg_buf[17] = cksum as u8;
 
     let mac = crate::mac_addr();
-    super::ensure_arp(&mac, src_ip, dst_ip);
-    super::send_ip_packet(&mac, src_ip, dst_ip, PROTO_TCP, &seg_buf[..seg_len]);
+    crate::net::ensure_arp(&mac, src_ip, dst_ip);
+    crate::net::send_ip_packet_with_ttl(&mac, src_ip, dst_ip, PROTO_TCP, ttl, &seg_buf[..seg_len]);
 }
 
 fn send_rst(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, seq: u32, ack: u32) {
@@ -574,9 +552,10 @@ fn send_rst(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, seq: u32, ac
         dst_ip,
         src_port,
         dst_port,
+        options::DEFAULT_IP_TTL,
         seq,
         ack,
-        TCP_FLAG_RST | TCP_FLAG_ACK,
+        tcp_proto::TCP_FLAG_RST | tcp_proto::TCP_FLAG_ACK,
         0,
         &[],
     );
@@ -598,71 +577,6 @@ fn cancel_retx_timer(idx: usize) {
         tcb.retx_count = 0;
         tcb.rto_ms = INITIAL_RTO_MS;
     }
-}
-
-// ---------------------------------------------------------------------------
-// TCP segment parsing
-// ---------------------------------------------------------------------------
-
-struct TcpHeader {
-    src_port: u16,
-    dst_port: u16,
-    seq: u32,
-    ack: u32,
-    data_offset: u8,
-    flags: u8,
-    window: u16,
-}
-
-fn parse_tcp_header(data: &[u8]) -> Option<(TcpHeader, &[u8])> {
-    if data.len() < TCP_HEADER_LEN {
-        return None;
-    }
-
-    let src_port = ((data[0] as u16) << 8) | (data[1] as u16);
-    let dst_port = ((data[2] as u16) << 8) | (data[3] as u16);
-    let seq = ((data[4] as u32) << 24)
-        | ((data[5] as u32) << 16)
-        | ((data[6] as u32) << 8)
-        | (data[7] as u32);
-    let ack = ((data[8] as u32) << 24)
-        | ((data[9] as u32) << 16)
-        | ((data[10] as u32) << 8)
-        | (data[11] as u32);
-    let data_offset = (data[12] >> 4) * 4;
-    let flags = data[13];
-    let window = ((data[14] as u16) << 8) | (data[15] as u16);
-
-    if (data_offset as usize) < TCP_HEADER_LEN || data.len() < data_offset as usize {
-        return None;
-    }
-
-    let payload = &data[data_offset as usize..];
-
-    Some((
-        TcpHeader {
-            src_port,
-            dst_port,
-            seq,
-            ack,
-            data_offset,
-            flags,
-            window,
-        },
-        payload,
-    ))
-}
-
-// ---------------------------------------------------------------------------
-// Sequence number arithmetic
-// ---------------------------------------------------------------------------
-
-fn seq_le(a: u32, b: u32) -> bool {
-    (a.wrapping_sub(b) as i32) <= 0
-}
-
-fn seq_gt(a: u32, b: u32) -> bool {
-    (a.wrapping_sub(b) as i32) > 0
 }
 
 // ---------------------------------------------------------------------------
@@ -698,7 +612,8 @@ pub(crate) fn tcp_bind(conn_id: u32, ip: u32, port: u16) -> i32 {
         if tcb.state != TcpState::Closed {
             return -1;
         }
-        tcb.local_ip = if ip == 0 { ipv4::OUR_IP } else { ip };
+        tcb.dynamic_local_ip = ip == 0;
+        tcb.local_ip = if ip == 0 { ipv4::our_ip() } else { ip };
         tcb.local_port = port;
     }
     0
@@ -765,6 +680,7 @@ pub(crate) fn tcp_accept(conn_id: u32) -> i32 {
             new_tcb.conn_id = new_cid;
             new_tcb.parent_conn_id = listen_cid;
             new_tcb.local_ip = listen_tcb.local_ip;
+            new_tcb.dynamic_local_ip = listen_tcb.dynamic_local_ip;
             new_tcb.local_port = listen_tcb.local_port;
             new_tcb.remote_ip = pending.remote_ip;
             new_tcb.remote_port = pending.remote_port;
@@ -775,6 +691,7 @@ pub(crate) fn tcp_accept(conn_id: u32) -> i32 {
             new_tcb.snd_una = pending.iss;
             new_tcb.rcv_wnd = DEFAULT_WINDOW;
             new_tcb.mss = DEFAULT_MSS;
+            new_tcb.opts = listen_tcb.opts;
             new_tcb.pending_accept = true;
 
             // SYN-ACK was already sent; wait for client's ACK to complete
@@ -804,8 +721,10 @@ pub(crate) fn tcp_connect(conn_id: u32, ip: u32, port: u16) -> i32 {
             }
         }
         if tcb.local_ip == 0 {
-            tcb.local_ip = ipv4::OUR_IP;
+            tcb.local_ip = ipv4::our_ip();
+            tcb.dynamic_local_ip = true;
         }
+        tcb.opts.last_error = 0;
         tcb.remote_ip = ip;
         tcb.remote_port = port;
         tcb.iss = generate_isn();
@@ -820,9 +739,10 @@ pub(crate) fn tcp_connect(conn_id: u32, ip: u32, port: u16) -> i32 {
             tcb.remote_ip,
             tcb.local_port,
             tcb.remote_port,
+            tcb.opts.ip_ttl,
             tcb.iss,
             0,
-            TCP_FLAG_SYN,
+            tcp_proto::TCP_FLAG_SYN,
             tcb.rcv_wnd,
             &[],
         );
@@ -874,9 +794,10 @@ fn flush_tx(idx: usize) {
             tcb.remote_ip,
             tcb.local_port,
             tcb.remote_port,
+            tcb.opts.ip_ttl,
             tcb.snd_nxt,
             tcb.rcv_nxt,
-            TCP_FLAG_ACK | TCP_FLAG_PSH,
+            tcp_proto::TCP_FLAG_ACK | tcp_proto::TCP_FLAG_PSH,
             tcb.rcv_wnd,
             &payload[..n],
         );
@@ -941,13 +862,14 @@ pub(crate) fn tcp_close(conn_id: u32) -> i32 {
                 // Send FIN
                 tcb.fin_seq = tcb.snd_nxt;
                 send_tcp_segment(
-                    tcb.local_ip,
-                    tcb.remote_ip,
-                    tcb.local_port,
-                    tcb.remote_port,
-                    tcb.snd_nxt,
-                    tcb.rcv_nxt,
-                    TCP_FLAG_FIN | TCP_FLAG_ACK,
+                tcb.local_ip,
+                tcb.remote_ip,
+                tcb.local_port,
+                tcb.remote_port,
+                tcb.opts.ip_ttl,
+                tcb.snd_nxt,
+                tcb.rcv_nxt,
+                tcp_proto::TCP_FLAG_FIN | tcp_proto::TCP_FLAG_ACK,
                     tcb.rcv_wnd,
                     &[],
                 );
@@ -960,13 +882,14 @@ pub(crate) fn tcp_close(conn_id: u32) -> i32 {
                 // Send FIN
                 tcb.fin_seq = tcb.snd_nxt;
                 send_tcp_segment(
-                    tcb.local_ip,
-                    tcb.remote_ip,
-                    tcb.local_port,
-                    tcb.remote_port,
-                    tcb.snd_nxt,
-                    tcb.rcv_nxt,
-                    TCP_FLAG_FIN | TCP_FLAG_ACK,
+                tcb.local_ip,
+                tcb.remote_ip,
+                tcb.local_port,
+                tcb.remote_port,
+                tcb.opts.ip_ttl,
+                tcb.snd_nxt,
+                tcb.rcv_nxt,
+                tcp_proto::TCP_FLAG_FIN | tcp_proto::TCP_FLAG_ACK,
                     tcb.rcv_wnd,
                     &[],
                 );
@@ -1017,15 +940,52 @@ pub(crate) fn tcp_getsockname(conn_id: u32) -> (u32, u16) {
     }
 }
 
-pub(crate) fn tcp_getpeername(conn_id: u32) -> (u32, u16) {
+pub(crate) fn tcp_getpeername(conn_id: u32) -> Result<(u32, u16), u64> {
     let idx = match find_tcb_by_conn_id(conn_id) {
         Some(i) => i,
-        None => return (0, 0),
+        None => return Err(BESALT_INVALID_ARGUMENT),
     };
     // SAFETY: Single-threaded driver.
     unsafe {
         let tcb = &(*(&raw const TCBS))[idx];
-        (tcb.remote_ip, tcb.remote_port)
+        if tcb.remote_ip == 0 || tcb.remote_port == 0 {
+            return Err(BESALT_NOT_CONNECTED);
+        }
+        Ok((tcb.remote_ip, tcb.remote_port))
+    }
+}
+
+pub(crate) fn tcp_setsockopt(
+    conn_id: u32,
+    level: i32,
+    optname: i32,
+    optval: u64,
+    optlen: u32,
+) -> u64 {
+    let idx = match find_tcb_by_conn_id(conn_id) {
+        Some(i) => i,
+        None => return BESALT_INVALID_ARGUMENT,
+    };
+    unsafe {
+        let tcb = &mut (*(&raw mut TCBS))[idx];
+        options::set_option(&mut tcb.opts, SOCK_STREAM, level, optname, optval, optlen)
+    }
+}
+
+pub(crate) fn tcp_getsockopt(conn_id: u32, level: i32, optname: i32) -> Result<(u64, u32), u64> {
+    let idx = match find_tcb_by_conn_id(conn_id) {
+        Some(i) => i,
+        None => return Err(BESALT_INVALID_ARGUMENT),
+    };
+    unsafe {
+        let tcb = &mut (*(&raw mut TCBS))[idx];
+        options::get_option(
+            &mut tcb.opts,
+            SOCK_STREAM,
+            besalt::consts::IPPROTO_TCP,
+            level,
+            optname,
+        )
     }
 }
 
@@ -1045,6 +1005,10 @@ pub(crate) fn tcp_poll_status(conn_id: u32, events: u16) -> u16 {
     unsafe {
         let tcb = &(*(&raw const TCBS))[idx];
         let mut rev: u16 = 0;
+
+        if tcb.opts.last_error != 0 {
+            rev |= 0x008; // POLLERR
+        }
 
         match tcb.state {
             TcpState::Established => {
@@ -1109,6 +1073,84 @@ pub(crate) fn set_pending_accept(conn_id: u32) {
     }
 }
 
+pub(crate) fn handle_local_ip_change(new_ip: u32) {
+    // SAFETY: Single-threaded driver; mutating TCBs in-place.
+    unsafe {
+        let tcbs = &raw mut TCBS;
+        for i in 0..MAX_TCP_CONNS {
+            let tcb = &mut (*tcbs)[i];
+            if !tcb.active || !tcb.dynamic_local_ip {
+                continue;
+            }
+
+            match tcb.state {
+                TcpState::Closed => {
+                    tcb.local_ip = new_ip;
+                }
+                TcpState::Listen => {
+                    tcb.local_ip = new_ip;
+                    tcb.backlog_count = 0;
+                }
+                TcpState::SynSent
+                | TcpState::SynReceived
+                | TcpState::Established
+                | TcpState::FinWait1
+                | TcpState::FinWait2
+                | TcpState::CloseWait
+                | TcpState::Closing
+                | TcpState::LastAck
+                | TcpState::TimeWait => {
+                    complete_pending_with_error(i, BESALT_TIMED_OUT);
+                    if tcb.pending_connect || tcb.state == TcpState::SynSent {
+                        close_tcb_preserve_socket(i, BESALT_TIMED_OUT);
+                    } else {
+                        reset_tcb(i);
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn handle_local_ip_loss() {
+    // SAFETY: Single-threaded driver; mutating TCBs in-place.
+    unsafe {
+        let tcbs = &raw mut TCBS;
+        for i in 0..MAX_TCP_CONNS {
+            let tcb = &mut (*tcbs)[i];
+            if !tcb.active || !tcb.dynamic_local_ip {
+                continue;
+            }
+
+            match tcb.state {
+                TcpState::Closed => {
+                    tcb.local_ip = 0;
+                }
+                TcpState::Listen => {
+                    tcb.local_ip = 0;
+                    tcb.backlog_count = 0;
+                }
+                TcpState::SynSent
+                | TcpState::SynReceived
+                | TcpState::Established
+                | TcpState::FinWait1
+                | TcpState::FinWait2
+                | TcpState::CloseWait
+                | TcpState::Closing
+                | TcpState::LastAck
+                | TcpState::TimeWait => {
+                    complete_pending_with_error(i, BESALT_TIMED_OUT);
+                    if tcb.pending_connect || tcb.state == TcpState::SynSent {
+                        close_tcb_preserve_socket(i, BESALT_TIMED_OUT);
+                    } else {
+                        reset_tcb(i);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Incoming segment processing
 // ---------------------------------------------------------------------------
@@ -1120,7 +1162,7 @@ pub(crate) fn handle_segment(ip_hdr: &Ipv4Header, data: &[u8]) {
         return;
     }
 
-    let (hdr, payload) = match parse_tcp_header(data) {
+    let (hdr, payload) = match tcp_proto::parse(data) {
         Some(v) => v,
         None => return,
     };
@@ -1140,8 +1182,8 @@ pub(crate) fn handle_segment(ip_hdr: &Ipv4Header, data: &[u8]) {
     }
 
     // No matching TCB and not RST: send RST
-    if (hdr.flags & TCP_FLAG_RST) == 0 {
-        if (hdr.flags & TCP_FLAG_ACK) != 0 {
+    if (hdr.flags & tcp_proto::TCP_FLAG_RST) == 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_ACK) != 0 {
             send_rst(
                 ip_hdr.dst,
                 ip_hdr.src,
@@ -1151,7 +1193,7 @@ pub(crate) fn handle_segment(ip_hdr: &Ipv4Header, data: &[u8]) {
                 0,
             );
         } else {
-            let ack_num = hdr.seq.wrapping_add(segment_len(&hdr, payload));
+            let ack_num = hdr.seq.wrapping_add(tcp_proto::segment_len(&hdr, payload));
             send_rst(
                 ip_hdr.dst,
                 ip_hdr.src,
@@ -1164,18 +1206,7 @@ pub(crate) fn handle_segment(ip_hdr: &Ipv4Header, data: &[u8]) {
     }
 }
 
-fn segment_len(hdr: &TcpHeader, payload: &[u8]) -> u32 {
-    let mut len = payload.len() as u32;
-    if (hdr.flags & TCP_FLAG_SYN) != 0 {
-        len += 1;
-    }
-    if (hdr.flags & TCP_FLAG_FIN) != 0 {
-        len += 1;
-    }
-    len
-}
-
-fn dispatch_segment(idx: usize, ip_hdr: &Ipv4Header, hdr: &TcpHeader, payload: &[u8]) {
+fn dispatch_segment(idx: usize, ip_hdr: &Ipv4Header, hdr: &tcp_proto::TcpHeader, payload: &[u8]) {
     // SAFETY: Single-threaded driver. We read state to dispatch.
     let state = unsafe { (*(&raw const TCBS))[idx].state };
 
@@ -1198,13 +1229,13 @@ fn dispatch_segment(idx: usize, ip_hdr: &Ipv4Header, hdr: &TcpHeader, payload: &
 // State handlers
 // ---------------------------------------------------------------------------
 
-fn handle_listen(idx: usize, ip_hdr: &Ipv4Header, hdr: &TcpHeader) {
+fn handle_listen(idx: usize, ip_hdr: &Ipv4Header, hdr: &tcp_proto::TcpHeader) {
     // RST on listen: ignore
-    if (hdr.flags & TCP_FLAG_RST) != 0 {
+    if (hdr.flags & tcp_proto::TCP_FLAG_RST) != 0 {
         return;
     }
     // ACK on listen: RST
-    if (hdr.flags & TCP_FLAG_ACK) != 0 {
+    if (hdr.flags & tcp_proto::TCP_FLAG_ACK) != 0 {
         send_rst(
             ip_hdr.dst,
             ip_hdr.src,
@@ -1216,7 +1247,7 @@ fn handle_listen(idx: usize, ip_hdr: &Ipv4Header, hdr: &TcpHeader) {
         return;
     }
     // SYN on listen: process
-    if (hdr.flags & TCP_FLAG_SYN) == 0 {
+    if (hdr.flags & tcp_proto::TCP_FLAG_SYN) == 0 {
         return;
     }
 
@@ -1240,6 +1271,7 @@ fn handle_listen(idx: usize, ip_hdr: &Ipv4Header, hdr: &TcpHeader) {
             new_tcb.conn_id = new_cid;
             new_tcb.parent_conn_id = listen_cid;
             new_tcb.local_ip = tcb.local_ip;
+            new_tcb.dynamic_local_ip = tcb.dynamic_local_ip;
             new_tcb.local_port = tcb.local_port;
             new_tcb.remote_ip = ip_hdr.src;
             new_tcb.remote_port = hdr.src_port;
@@ -1251,6 +1283,7 @@ fn handle_listen(idx: usize, ip_hdr: &Ipv4Header, hdr: &TcpHeader) {
             new_tcb.snd_wnd = hdr.window;
             new_tcb.rcv_wnd = DEFAULT_WINDOW;
             new_tcb.mss = DEFAULT_MSS;
+            new_tcb.opts = tcb.opts;
             new_tcb.pending_accept = true;
 
             // Send SYN-ACK
@@ -1259,9 +1292,10 @@ fn handle_listen(idx: usize, ip_hdr: &Ipv4Header, hdr: &TcpHeader) {
                 new_tcb.remote_ip,
                 new_tcb.local_port,
                 new_tcb.remote_port,
+                new_tcb.opts.ip_ttl,
                 iss,
                 new_tcb.rcv_nxt,
-                TCP_FLAG_SYN | TCP_FLAG_ACK,
+                tcp_proto::TCP_FLAG_SYN | tcp_proto::TCP_FLAG_ACK,
                 new_tcb.rcv_wnd,
                 &[],
             );
@@ -1292,24 +1326,25 @@ fn handle_listen(idx: usize, ip_hdr: &Ipv4Header, hdr: &TcpHeader) {
             ip_hdr.src,
             tcb.local_port,
             hdr.src_port,
+            tcb.opts.ip_ttl,
             iss,
             hdr.seq.wrapping_add(1),
-            TCP_FLAG_SYN | TCP_FLAG_ACK,
+            tcp_proto::TCP_FLAG_SYN | tcp_proto::TCP_FLAG_ACK,
             tcb.rcv_wnd,
             &[],
         );
     }
 }
 
-fn handle_syn_sent(idx: usize, ip_hdr: &Ipv4Header, hdr: &TcpHeader) {
+fn handle_syn_sent(idx: usize, ip_hdr: &Ipv4Header, hdr: &tcp_proto::TcpHeader) {
     // SAFETY: Single-threaded driver.
     unsafe {
         let tcb = &mut (*(&raw mut TCBS))[idx];
 
         // Check ACK validity
-        if (hdr.flags & TCP_FLAG_ACK) != 0 {
-            if seq_le(hdr.ack, tcb.iss) || seq_gt(hdr.ack, tcb.snd_nxt) {
-                if (hdr.flags & TCP_FLAG_RST) == 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_ACK) != 0 {
+            if tcp_proto::seq_le(hdr.ack, tcb.iss) || tcp_proto::seq_gt(hdr.ack, tcb.snd_nxt) {
+                if (hdr.flags & tcp_proto::TCP_FLAG_RST) == 0 {
                     send_rst(
                         ip_hdr.dst,
                         ip_hdr.src,
@@ -1324,8 +1359,8 @@ fn handle_syn_sent(idx: usize, ip_hdr: &Ipv4Header, hdr: &TcpHeader) {
         }
 
         // RST
-        if (hdr.flags & TCP_FLAG_RST) != 0 {
-            if (hdr.flags & TCP_FLAG_ACK) != 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_RST) != 0 {
+            if (hdr.flags & tcp_proto::TCP_FLAG_ACK) != 0 {
                 // Connection refused
                 if tcb.pending_connect {
                     tcb.pending_connect = false;
@@ -1340,13 +1375,13 @@ fn handle_syn_sent(idx: usize, ip_hdr: &Ipv4Header, hdr: &TcpHeader) {
                         extra_port: 0,
                     });
                 }
-                reset_tcb(idx);
+                close_tcb_preserve_socket(idx, BESALT_CONN_REFUSED);
             }
             return;
         }
 
         // SYN
-        if (hdr.flags & TCP_FLAG_SYN) == 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_SYN) == 0 {
             return;
         }
 
@@ -1354,11 +1389,11 @@ fn handle_syn_sent(idx: usize, ip_hdr: &Ipv4Header, hdr: &TcpHeader) {
         tcb.rcv_nxt = hdr.seq.wrapping_add(1);
         tcb.snd_wnd = hdr.window;
 
-        if (hdr.flags & TCP_FLAG_ACK) != 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_ACK) != 0 {
             tcb.snd_una = hdr.ack;
         }
 
-        if seq_gt(tcb.snd_una, tcb.iss) {
+        if tcp_proto::seq_gt(tcb.snd_una, tcb.iss) {
             // SYN has been ACKed -> Established
             tcb.state = TcpState::Established;
             cancel_retx_timer(idx);
@@ -1369,15 +1404,17 @@ fn handle_syn_sent(idx: usize, ip_hdr: &Ipv4Header, hdr: &TcpHeader) {
                 tcb.remote_ip,
                 tcb.local_port,
                 tcb.remote_port,
+                tcb.opts.ip_ttl,
                 tcb.snd_nxt,
                 tcb.rcv_nxt,
-                TCP_FLAG_ACK,
+                tcp_proto::TCP_FLAG_ACK,
                 tcb.rcv_wnd,
                 &[],
             );
 
             if tcb.pending_connect {
                 tcb.pending_connect = false;
+                tcb.opts.last_error = 0;
                 push_completion(Completion {
                     conn_id: tcb.conn_id,
                     result: BESALT_OK,
@@ -1397,9 +1434,10 @@ fn handle_syn_sent(idx: usize, ip_hdr: &Ipv4Header, hdr: &TcpHeader) {
                 tcb.remote_ip,
                 tcb.local_port,
                 tcb.remote_port,
+                tcb.opts.ip_ttl,
                 tcb.iss,
                 tcb.rcv_nxt,
-                TCP_FLAG_SYN | TCP_FLAG_ACK,
+                tcp_proto::TCP_FLAG_SYN | tcp_proto::TCP_FLAG_ACK,
                 tcb.rcv_wnd,
                 &[],
             );
@@ -1407,13 +1445,13 @@ fn handle_syn_sent(idx: usize, ip_hdr: &Ipv4Header, hdr: &TcpHeader) {
     }
 }
 
-fn handle_syn_received(idx: usize, hdr: &TcpHeader) {
+fn handle_syn_received(idx: usize, hdr: &tcp_proto::TcpHeader) {
     // SAFETY: Single-threaded driver.
     unsafe {
         let tcb = &mut (*(&raw mut TCBS))[idx];
 
         // RST
-        if (hdr.flags & TCP_FLAG_RST) != 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_RST) != 0 {
             if tcb.pending_accept {
                 tcb.pending_accept = false;
                 push_completion(Completion {
@@ -1432,12 +1470,12 @@ fn handle_syn_received(idx: usize, hdr: &TcpHeader) {
         }
 
         // ACK
-        if (hdr.flags & TCP_FLAG_ACK) == 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_ACK) == 0 {
             return;
         }
 
         // Validate ACK
-        if !seq_le(tcb.snd_una, hdr.ack) || !seq_le(hdr.ack, tcb.snd_nxt) {
+        if !tcp_proto::seq_le(tcb.snd_una, hdr.ack) || !tcp_proto::seq_le(hdr.ack, tcb.snd_nxt) {
             return;
         }
 
@@ -1463,20 +1501,20 @@ fn handle_syn_received(idx: usize, hdr: &TcpHeader) {
     }
 }
 
-fn handle_established(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
+fn handle_established(idx: usize, hdr: &tcp_proto::TcpHeader, payload: &[u8]) {
     // SAFETY: Single-threaded driver.
     unsafe {
         let tcb = &mut (*(&raw mut TCBS))[idx];
 
         // RST
-        if (hdr.flags & TCP_FLAG_RST) != 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_RST) != 0 {
             complete_pending_with_error(idx, BESALT_CONN_REFUSED);
             reset_tcb(idx);
             return;
         }
 
         // SYN in established is invalid
-        if (hdr.flags & TCP_FLAG_SYN) != 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_SYN) != 0 {
             send_rst(
                 tcb.local_ip,
                 tcb.remote_ip,
@@ -1491,7 +1529,7 @@ fn handle_established(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
         }
 
         // Must have ACK
-        if (hdr.flags & TCP_FLAG_ACK) == 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_ACK) == 0 {
             return;
         }
 
@@ -1504,7 +1542,7 @@ fn handle_established(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
         }
 
         // FIN
-        if (hdr.flags & TCP_FLAG_FIN) != 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_FIN) != 0 {
             tcb.rcv_nxt = hdr.seq.wrapping_add(payload.len() as u32).wrapping_add(1);
             tcb.state = TcpState::CloseWait;
 
@@ -1514,9 +1552,10 @@ fn handle_established(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
                 tcb.remote_ip,
                 tcb.local_port,
                 tcb.remote_port,
+                tcb.opts.ip_ttl,
                 tcb.snd_nxt,
                 tcb.rcv_nxt,
-                TCP_FLAG_ACK,
+                tcp_proto::TCP_FLAG_ACK,
                 tcb.rcv_wnd,
                 &[],
             );
@@ -1539,17 +1578,17 @@ fn handle_established(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
     }
 }
 
-fn handle_fin_wait1(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
+fn handle_fin_wait1(idx: usize, hdr: &tcp_proto::TcpHeader, payload: &[u8]) {
     // SAFETY: Single-threaded driver.
     unsafe {
         let tcb = &mut (*(&raw mut TCBS))[idx];
 
-        if (hdr.flags & TCP_FLAG_RST) != 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_RST) != 0 {
             reset_tcb(idx);
             return;
         }
 
-        if (hdr.flags & TCP_FLAG_ACK) == 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_ACK) == 0 {
             return;
         }
 
@@ -1561,9 +1600,9 @@ fn handle_fin_wait1(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
         }
 
         let tcb = &mut (*(&raw mut TCBS))[idx];
-        let fin_acked = seq_gt(hdr.ack, tcb.fin_seq);
+        let fin_acked = tcp_proto::seq_gt(hdr.ack, tcb.fin_seq);
 
-        if (hdr.flags & TCP_FLAG_FIN) != 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_FIN) != 0 {
             tcb.rcv_nxt = hdr.seq.wrapping_add(payload.len() as u32).wrapping_add(1);
             if fin_acked {
                 // FIN + ACK of our FIN: go to TimeWait
@@ -1580,9 +1619,10 @@ fn handle_fin_wait1(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
                 tcb.remote_ip,
                 tcb.local_port,
                 tcb.remote_port,
+                tcb.opts.ip_ttl,
                 tcb.snd_nxt,
                 tcb.rcv_nxt,
-                TCP_FLAG_ACK,
+                tcp_proto::TCP_FLAG_ACK,
                 tcb.rcv_wnd,
                 &[],
             );
@@ -1594,17 +1634,17 @@ fn handle_fin_wait1(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
     }
 }
 
-fn handle_fin_wait2(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
+fn handle_fin_wait2(idx: usize, hdr: &tcp_proto::TcpHeader, payload: &[u8]) {
     // SAFETY: Single-threaded driver.
     unsafe {
         let tcb = &mut (*(&raw mut TCBS))[idx];
 
-        if (hdr.flags & TCP_FLAG_RST) != 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_RST) != 0 {
             reset_tcb(idx);
             return;
         }
 
-        if (hdr.flags & TCP_FLAG_ACK) != 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_ACK) != 0 {
             process_ack(idx, hdr);
         }
 
@@ -1613,7 +1653,7 @@ fn handle_fin_wait2(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
         }
 
         let tcb = &mut (*(&raw mut TCBS))[idx];
-        if (hdr.flags & TCP_FLAG_FIN) != 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_FIN) != 0 {
             tcb.rcv_nxt = hdr.seq.wrapping_add(payload.len() as u32).wrapping_add(1);
             tcb.state = TcpState::TimeWait;
             tcb.timewait_deadline_ns = now_ns() + TIME_WAIT_NS;
@@ -1624,9 +1664,10 @@ fn handle_fin_wait2(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
                 tcb.remote_ip,
                 tcb.local_port,
                 tcb.remote_port,
+                tcb.opts.ip_ttl,
                 tcb.snd_nxt,
                 tcb.rcv_nxt,
-                TCP_FLAG_ACK,
+                tcp_proto::TCP_FLAG_ACK,
                 tcb.rcv_wnd,
                 &[],
             );
@@ -1634,17 +1675,17 @@ fn handle_fin_wait2(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
     }
 }
 
-fn handle_close_wait(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
+fn handle_close_wait(idx: usize, hdr: &tcp_proto::TcpHeader, payload: &[u8]) {
     // SAFETY: Single-threaded driver.
     unsafe {
         let tcb = &(*(&raw const TCBS))[idx];
 
-        if (hdr.flags & TCP_FLAG_RST) != 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_RST) != 0 {
             reset_tcb(idx);
             return;
         }
 
-        if (hdr.flags & TCP_FLAG_ACK) != 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_ACK) != 0 {
             process_ack(idx, hdr);
         }
 
@@ -1654,17 +1695,17 @@ fn handle_close_wait(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
     }
 }
 
-fn handle_closing(idx: usize, hdr: &TcpHeader) {
+fn handle_closing(idx: usize, hdr: &tcp_proto::TcpHeader) {
     // SAFETY: Single-threaded driver.
     unsafe {
         let tcb = &mut (*(&raw mut TCBS))[idx];
 
-        if (hdr.flags & TCP_FLAG_RST) != 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_RST) != 0 {
             reset_tcb(idx);
             return;
         }
 
-        if (hdr.flags & TCP_FLAG_ACK) != 0 && seq_gt(hdr.ack, tcb.fin_seq) {
+        if (hdr.flags & tcp_proto::TCP_FLAG_ACK) != 0 && tcp_proto::seq_gt(hdr.ack, tcb.fin_seq) {
             tcb.state = TcpState::TimeWait;
             tcb.timewait_deadline_ns = now_ns() + TIME_WAIT_NS;
             cancel_retx_timer(idx);
@@ -1672,34 +1713,34 @@ fn handle_closing(idx: usize, hdr: &TcpHeader) {
     }
 }
 
-fn handle_last_ack(idx: usize, hdr: &TcpHeader) {
+fn handle_last_ack(idx: usize, hdr: &tcp_proto::TcpHeader) {
     // SAFETY: Single-threaded driver.
     unsafe {
         let tcb = &(*(&raw const TCBS))[idx];
 
-        if (hdr.flags & TCP_FLAG_RST) != 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_RST) != 0 {
             reset_tcb(idx);
             return;
         }
 
-        if (hdr.flags & TCP_FLAG_ACK) != 0 && seq_gt(hdr.ack, tcb.fin_seq) {
+        if (hdr.flags & tcp_proto::TCP_FLAG_ACK) != 0 && tcp_proto::seq_gt(hdr.ack, tcb.fin_seq) {
             reset_tcb(idx);
         }
     }
 }
 
-fn handle_time_wait(idx: usize, hdr: &TcpHeader) {
+fn handle_time_wait(idx: usize, hdr: &tcp_proto::TcpHeader) {
     // SAFETY: Single-threaded driver.
     unsafe {
         let tcb = &mut (*(&raw mut TCBS))[idx];
 
-        if (hdr.flags & TCP_FLAG_RST) != 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_RST) != 0 {
             reset_tcb(idx);
             return;
         }
 
         // Restart 2MSL timer on any valid segment
-        if (hdr.flags & TCP_FLAG_FIN) != 0 {
+        if (hdr.flags & tcp_proto::TCP_FLAG_FIN) != 0 {
             tcb.timewait_deadline_ns = now_ns() + TIME_WAIT_NS;
             // Re-ACK the FIN
             send_tcp_segment(
@@ -1707,9 +1748,10 @@ fn handle_time_wait(idx: usize, hdr: &TcpHeader) {
                 tcb.remote_ip,
                 tcb.local_port,
                 tcb.remote_port,
+                tcb.opts.ip_ttl,
                 tcb.snd_nxt,
                 tcb.rcv_nxt,
-                TCP_FLAG_ACK,
+                tcp_proto::TCP_FLAG_ACK,
                 0,
                 &[],
             );
@@ -1721,17 +1763,17 @@ fn handle_time_wait(idx: usize, hdr: &TcpHeader) {
 // Common segment processing helpers
 // ---------------------------------------------------------------------------
 
-fn process_ack(idx: usize, hdr: &TcpHeader) {
+fn process_ack(idx: usize, hdr: &tcp_proto::TcpHeader) {
     // SAFETY: Single-threaded driver.
     unsafe {
         let tcb = &mut (*(&raw mut TCBS))[idx];
 
-        if seq_gt(hdr.ack, tcb.snd_nxt) {
+        if tcp_proto::seq_gt(hdr.ack, tcb.snd_nxt) {
             // ACK for data we haven't sent: ignore (could send ACK back)
             return;
         }
 
-        if seq_gt(hdr.ack, tcb.snd_una) {
+        if tcp_proto::seq_gt(hdr.ack, tcb.snd_una) {
             // New data acknowledged
             let acked = hdr.ack.wrapping_sub(tcb.snd_una) as usize;
             tcb.snd_una = hdr.ack;
@@ -1758,7 +1800,7 @@ fn process_ack(idx: usize, hdr: &TcpHeader) {
     }
 }
 
-fn process_data(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
+fn process_data(idx: usize, hdr: &tcp_proto::TcpHeader, payload: &[u8]) {
     // SAFETY: Single-threaded driver.
     unsafe {
         let tcb = &mut (*(&raw mut TCBS))[idx];
@@ -1771,15 +1813,17 @@ fn process_data(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
                 tcb.remote_ip,
                 tcb.local_port,
                 tcb.remote_port,
+                tcb.opts.ip_ttl,
                 tcb.snd_nxt,
                 tcb.rcv_nxt,
-                TCP_FLAG_ACK,
+                tcp_proto::TCP_FLAG_ACK,
                 tcb.rcv_wnd,
                 &[],
             );
             return;
         }
 
+        let was_empty = tcb.rx_buf.len == 0;
         let written = tcb.rx_buf.write(payload);
         tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(written as u32);
         // TCP window field is 16 bits (max 65535). Our rx_buf capacity is
@@ -1789,13 +1833,14 @@ fn process_data(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
 
         // Send ACK
         send_tcp_segment(
-            tcb.local_ip,
-            tcb.remote_ip,
-            tcb.local_port,
-            tcb.remote_port,
-            tcb.snd_nxt,
-            tcb.rcv_nxt,
-            TCP_FLAG_ACK,
+                tcb.local_ip,
+                tcb.remote_ip,
+                tcb.local_port,
+                tcb.remote_port,
+                tcb.opts.ip_ttl,
+                tcb.snd_nxt,
+                tcb.rcv_nxt,
+                tcp_proto::TCP_FLAG_ACK,
             tcb.rcv_wnd,
             &[],
         );
@@ -1821,6 +1866,17 @@ fn process_data(idx: usize, hdr: &TcpHeader, payload: &[u8]) {
             // 7323) is not implemented.
             tcb.rcv_wnd = tcb.rx_buf.available() as u16;
             push_completion(comp);
+        } else if was_empty && written > 0 {
+            push_completion(Completion {
+                conn_id: tcb.conn_id,
+                result: BESALT_OK,
+                op_type: INET_OP_RECV,
+                data: [0u8; 152],
+                data_len: 0,
+                extra_conn_id: 0,
+                extra_ip: 0,
+                extra_port: 0,
+            });
         }
     }
 }
@@ -1829,6 +1885,7 @@ fn complete_pending_with_error(idx: usize, err_code: u64) {
     // SAFETY: Single-threaded driver.
     unsafe {
         let tcb = &mut (*(&raw mut TCBS))[idx];
+        tcb.opts.last_error = err_code;
         if tcb.pending_connect {
             tcb.pending_connect = false;
             push_completion(Completion {
@@ -1943,7 +2000,11 @@ pub(crate) fn process_timers() {
                     tcb.rcv_nxt,
                 );
                 complete_pending_with_error(i, BESALT_TIMED_OUT);
-                reset_tcb(i);
+                if tcb.pending_connect || tcb.state == TcpState::SynSent {
+                    close_tcb_preserve_socket(i, BESALT_TIMED_OUT);
+                } else {
+                    reset_tcb(i);
+                }
                 continue;
             }
 
@@ -1959,9 +2020,10 @@ pub(crate) fn process_timers() {
                         tcb.remote_ip,
                         tcb.local_port,
                         tcb.remote_port,
+                        tcb.opts.ip_ttl,
                         tcb.iss,
                         0,
-                        TCP_FLAG_SYN,
+                        tcp_proto::TCP_FLAG_SYN,
                         tcb.rcv_wnd,
                         &[],
                     );
@@ -1973,9 +2035,10 @@ pub(crate) fn process_timers() {
                         tcb.remote_ip,
                         tcb.local_port,
                         tcb.remote_port,
+                        tcb.opts.ip_ttl,
                         tcb.iss,
                         tcb.rcv_nxt,
-                        TCP_FLAG_SYN | TCP_FLAG_ACK,
+                        tcp_proto::TCP_FLAG_SYN | tcp_proto::TCP_FLAG_ACK,
                         tcb.rcv_wnd,
                         &[],
                     );
@@ -1996,9 +2059,10 @@ pub(crate) fn process_timers() {
                             tcb.remote_ip,
                             tcb.local_port,
                             tcb.remote_port,
+                            tcb.opts.ip_ttl,
                             tcb.snd_nxt,
                             tcb.rcv_nxt,
-                            TCP_FLAG_ACK | TCP_FLAG_PSH,
+                            tcp_proto::TCP_FLAG_ACK | tcp_proto::TCP_FLAG_PSH,
                             tcb.rcv_wnd,
                             &payload[..n],
                         );
@@ -2012,9 +2076,10 @@ pub(crate) fn process_timers() {
                         tcb.remote_ip,
                         tcb.local_port,
                         tcb.remote_port,
+                        tcb.opts.ip_ttl,
                         tcb.fin_seq,
                         tcb.rcv_nxt,
-                        TCP_FLAG_FIN | TCP_FLAG_ACK,
+                        tcp_proto::TCP_FLAG_FIN | tcp_proto::TCP_FLAG_ACK,
                         tcb.rcv_wnd,
                         &[],
                     );

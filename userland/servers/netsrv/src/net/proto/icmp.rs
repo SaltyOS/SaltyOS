@@ -1,16 +1,28 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! ICMP (Internet Control Message Protocol) implementation.
+//! ICMP (Internet Control Message Protocol) — stateless packet handling.
 //!
-//! Handles ICMP echo request/reply (ping).
+//! Handles ICMP echo request/reply (ping). Raw socket delivery is done
+//! separately by `socket::raw_ipv4::deliver()` at the dispatch level.
 
-use super::{checksum, ipv4};
+use crate::net::checksum;
+use super::ipv4;
 
-const ICMP_TYPE_ECHO_REPLY: u8 = 0;
-const ICMP_TYPE_ECHO_REQUEST: u8 = 8;
-const ICMP_HEADER_LEN: usize = 8;
+pub(crate) const ICMP_TYPE_ECHO_REPLY: u8 = 0;
+pub(crate) const ICMP_TYPE_ECHO_REQUEST: u8 = 8;
+pub(crate) const ICMP_HEADER_LEN: usize = 8;
 
 /// Flag set when an echo reply is received, used by self-test for early break.
 static mut ECHO_REPLY_RECEIVED: bool = false;
+
+fn log_ipv4(lb: &mut besalt::serial::LineBuf, ip: u32) {
+    lb.dec(((ip >> 24) & 0xFF) as u64);
+    lb.putc(b'.');
+    lb.dec(((ip >> 16) & 0xFF) as u64);
+    lb.putc(b'.');
+    lb.dec(((ip >> 8) & 0xFF) as u64);
+    lb.putc(b'.');
+    lb.dec((ip & 0xFF) as u64);
+}
 
 /// Check if an echo reply has been received (for self-test early break).
 pub(crate) fn echo_reply_received() -> bool {
@@ -24,10 +36,11 @@ pub(crate) fn reset_echo_reply_flag() {
     unsafe { *(&raw mut ECHO_REPLY_RECEIVED) = false; }
 }
 
-/// Handle an incoming ICMP packet.
+/// Handle an incoming ICMP packet (kernel-like behavior).
 ///
-/// If it is an echo request for us, sends an echo reply with the same
-/// identifier, sequence number, and data payload.
+/// Responds to echo requests and sets the self-test flag on echo replies.
+/// Does NOT deliver to raw sockets — that is done by the caller before
+/// invoking this function.
 pub(crate) fn handle(
     our_mac: &[u8; 6],
     our_ip: u32,
@@ -39,18 +52,44 @@ pub(crate) fn handle(
     }
 
     let icmp_type = data[0];
-    let _code = data[1];
+    let ident = if data.len() >= 6 {
+        ((data[4] as u16) << 8) | (data[5] as u16)
+    } else {
+        0
+    };
+    let seq = if data.len() >= 8 {
+        ((data[6] as u16) << 8) | (data[7] as u16)
+    } else {
+        0
+    };
 
     if icmp_type == ICMP_TYPE_ECHO_REQUEST {
         besalt::udebug!(|_lb| {
-            _lb.str(b"[netsrv] ICMP echo request received, sending reply\n");
+            _lb.str(b"[netsrv] ICMP echo request src=");
+            log_ipv4(&mut _lb, ip_hdr.src);
+            _lb.str(b" dst=");
+            log_ipv4(&mut _lb, ip_hdr.dst);
+            _lb.str(b" ident=");
+            _lb.dec(ident as u64);
+            _lb.str(b" seq=");
+            _lb.dec(seq as u64);
+            _lb.str(b" len=");
+            _lb.dec(data.len() as u64);
+            _lb.putc(b'\n');
         });
         send_echo_reply(our_mac, our_ip, ip_hdr.src, data);
     } else if icmp_type == ICMP_TYPE_ECHO_REPLY {
-        let seq = ((data[6] as u16) << 8) | (data[7] as u16);
         besalt::udebug!(|_lb| {
-            _lb.str(b"[netsrv] ICMP echo reply received seq=");
+            _lb.str(b"[netsrv] ICMP echo reply src=");
+            log_ipv4(&mut _lb, ip_hdr.src);
+            _lb.str(b" dst=");
+            log_ipv4(&mut _lb, ip_hdr.dst);
+            _lb.str(b" ident=");
+            _lb.dec(ident as u64);
+            _lb.str(b" seq=");
             _lb.dec(seq as u64);
+            _lb.str(b" len=");
+            _lb.dec(data.len() as u64);
             _lb.putc(b'\n');
         });
         // SAFETY: Single-threaded server; set flag for self-test early break.
@@ -83,7 +122,29 @@ fn send_echo_reply(our_mac: &[u8; 6], our_ip: u32, dst_ip: u32, request_data: &[
     icmp_buf[2] = (cksum >> 8) as u8;
     icmp_buf[3] = cksum as u8;
 
-    super::send_ip_packet(our_mac, our_ip, dst_ip, ipv4::PROTO_ICMP, &icmp_buf[..icmp_len]);
+    let ident = if icmp_len >= 6 {
+        ((icmp_buf[4] as u16) << 8) | (icmp_buf[5] as u16)
+    } else {
+        0
+    };
+    let seq = if icmp_len >= 8 {
+        ((icmp_buf[6] as u16) << 8) | (icmp_buf[7] as u16)
+    } else {
+        0
+    };
+    besalt::udebug!(|_lb| {
+        _lb.str(b"[netsrv] ICMP echo reply send dst=");
+        log_ipv4(&mut _lb, dst_ip);
+        _lb.str(b" ident=");
+        _lb.dec(ident as u64);
+        _lb.str(b" seq=");
+        _lb.dec(seq as u64);
+        _lb.str(b" len=");
+        _lb.dec(icmp_len as u64);
+        _lb.putc(b'\n');
+    });
+
+    crate::net::send_ip_packet(our_mac, our_ip, dst_ip, ipv4::PROTO_ICMP, &icmp_buf[..icmp_len]);
 }
 
 /// Send an ICMP echo request (ping) to `dst_ip` with the given sequence number.
@@ -114,5 +175,5 @@ pub(crate) fn send_echo_request(our_mac: &[u8; 6], our_ip: u32, dst_ip: u32, seq
     icmp_buf[2] = (cksum >> 8) as u8;
     icmp_buf[3] = cksum as u8;
 
-    super::send_ip_packet(our_mac, our_ip, dst_ip, ipv4::PROTO_ICMP, &icmp_buf[..64]);
+    crate::net::send_ip_packet(our_mac, our_ip, dst_ip, ipv4::PROTO_ICMP, &icmp_buf[..64]);
 }
