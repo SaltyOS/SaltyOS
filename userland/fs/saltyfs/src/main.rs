@@ -28,7 +28,8 @@
 #![no_std]
 #![no_main]
 
-extern crate besalt;
+extern crate trona;
+extern crate trona_posix;
 
 mod consts;
 mod types;
@@ -38,9 +39,9 @@ mod alloc;
 mod btree;
 mod handlers;
 
-use besalt::consts::*;
-use besalt::ipc;
-use besalt::types::*;
+use trona::consts::*;
+use trona::ipc;
+use trona::types::*;
 
 use consts::*;
 use types::Superblock;
@@ -74,11 +75,11 @@ static mut ALLOC_HINT: u64 = 0;
 static mut VFS_SHM_MAPPED: bool = false;
 
 fn ipc_ctx() -> *mut IpcContext {
-    besalt::tls::current_ipc_ctx()
+    trona_posix::tls::current_ipc_ctx()
 }
 
 fn signal_ready() {
-    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 // ======================================================================
@@ -87,7 +88,7 @@ fn signal_ready() {
 
 fn register_nameserv() {
     let name = b"saltyfs";
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = POSIX_NS_REGISTER;
     msg.regs[0] = name.len() as u64;
     msg.length = 1 + (name.len() as u64 + 7) / 8;
@@ -97,10 +98,10 @@ fn register_nameserv() {
             *dst.add(i) = name[i];
         }
         ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != BESALT_OK {
-            besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] nameserv registration failed\n"); });
+        if err != 0 || reply.label != TRONA_OK {
+            trona::uerror!(|_lb| { _lb.str(b"[saltyfs] nameserv registration failed\n"); });
         }
     }
 }
@@ -110,10 +111,10 @@ fn register_nameserv() {
 // ======================================================================
 
 fn server_loop() -> ! {
-    besalt::uinfo!(|_lb| { _lb.str(b"[saltyfs] Entering server loop\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[saltyfs] Entering server loop\n"); });
 
     let ctx = ipc_ctx();
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     let mut badge: u64 = 0;
     unsafe { ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge); }
 
@@ -141,8 +142,8 @@ fn server_loop() -> ! {
             SALTYFS_LINK => handlers::handle_link(&msg),
             SALTYFS_GETPARENT => handlers::handle_getparent(&msg),
             _ => {
-                let mut r = BesaltMsg::zeroed();
-                r.label = BESALT_INVALID_OPERATION;
+                let mut r = TronaMsg::zeroed();
+                r.label = TRONA_INVALID_OPERATION;
                 r
             }
         };
@@ -162,7 +163,7 @@ fn server_loop() -> ! {
             block::cache_flush_all();
         }
 
-        msg = BesaltMsg::zeroed();
+        msg = TronaMsg::zeroed();
         badge = 0;
         unsafe {
             ipc::reply_recv_ctx(
@@ -174,21 +175,21 @@ fn server_loop() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    besalt::uinfo!(|_lb| { _lb.str(b"[saltyfs] SaltyFS Server starting\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[saltyfs] SaltyFS Server starting\n"); });
 
     // Set up SHM from blkdrv
     if !block::setup_blk_shm() {
-        besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] Failed to set up blkdrv SHM -- cannot operate\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[saltyfs] Failed to set up blkdrv SHM -- cannot operate\n"); });
     }
 
     // Set up block cache
     if !block::setup_cache() {
-        besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] Failed to set up block cache\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[saltyfs] Failed to set up block cache\n"); });
     }
 
     // Auto-mount on startup
     if !block::read_superblock() {
-        besalt::uwarn!(|_lb| { _lb.str(b"[saltyfs] No SaltyFS partition found -- running without mount\n"); });
+        trona::uwarn!(|_lb| { _lb.str(b"[saltyfs] No SaltyFS partition found -- running without mount\n"); });
     } else {
         unsafe { *(&raw mut MOUNTED) = true; }
         alloc::init_bitmap();
@@ -197,7 +198,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         let actual_used = alloc::count_used_blocks();
         let sb_used = unsafe { (*(&raw const SB)).used_blocks };
         if actual_used != sb_used {
-            besalt::uwarn!(|_lb| {
+            trona::uwarn!(|_lb| {
                 _lb.str(b"[saltyfs] WARN: bitmap mismatch: sb.used_blocks=");
                 _lb.dec(sb_used);
                 _lb.str(b" actual=");

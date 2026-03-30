@@ -8,8 +8,8 @@
 //! Stateless header parsing and construction live in `crate::net::proto::udp`;
 //! this module handles the stateful socket layer.
 
-use besalt::consts::{
-    BESALT_INVALID_ARGUMENT, BESALT_NOT_CONNECTED, BESALT_NO_BUFS, BESALT_OK, INET_OP_RECV,
+use trona::consts::{
+    TRONA_INVALID_ARGUMENT, TRONA_NOT_CONNECTED, TRONA_NO_BUFS, TRONA_OK, INET_OP_RECV,
     INET_OP_RECVFROM, SOCK_DGRAM,
 };
 
@@ -123,7 +123,7 @@ static mut COMPLETIONS: [Option<Completion>; MAX_COMPLETIONS] = [const { None };
 static mut COMP_HEAD: usize = 0;
 static mut COMP_TAIL: usize = 0;
 
-fn log_ipv4(lb: &mut besalt::serial::LineBuf, ip: u32) {
+fn log_ipv4(lb: &mut trona::serial::LineBuf, ip: u32) {
     lb.dec(((ip >> 24) & 0xFF) as u64);
     lb.putc(b'.');
     lb.dec(((ip >> 16) & 0xFF) as u64);
@@ -241,13 +241,13 @@ pub(crate) fn udp_socket() -> i32 {
 pub(crate) fn udp_bind(conn_id: u32, ip: u32, port: u16) -> i32 {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return -(BESALT_INVALID_ARGUMENT as i32),
+        None => return -(TRONA_INVALID_ARGUMENT as i32),
     };
 
     // Check port not already bound by another socket
     if let Some(existing) = find_by_port(port) {
         if existing != idx {
-            return -(BESALT_INVALID_ARGUMENT as i32);
+            return -(TRONA_INVALID_ARGUMENT as i32);
         }
     }
 
@@ -266,7 +266,7 @@ pub(crate) fn udp_bind(conn_id: u32, ip: u32, port: u16) -> i32 {
 pub(crate) fn udp_connect(conn_id: u32, ip: u32, port: u16) -> i32 {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return -(BESALT_INVALID_ARGUMENT as i32),
+        None => return -(TRONA_INVALID_ARGUMENT as i32),
     };
 
     // SAFETY: Single-threaded driver; idx is valid.
@@ -290,7 +290,7 @@ pub(crate) fn udp_connect(conn_id: u32, ip: u32, port: u16) -> i32 {
 pub(crate) fn udp_sendto(conn_id: u32, data: &[u8], dst_ip: u32, dst_port: u16) -> i32 {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return -(BESALT_INVALID_ARGUMENT as i32),
+        None => return -(TRONA_INVALID_ARGUMENT as i32),
     };
 
     // SAFETY: Single-threaded driver; reading/writing socket state.
@@ -320,14 +320,14 @@ pub(crate) fn udp_sendto(conn_id: u32, data: &[u8], dst_ip: u32, dst_port: u16) 
     // Check MTU limit: 1500 ethernet - 20 IP header = 1480 max UDP (header + payload)
     let udp_len = udp_proto::UDP_HEADER_LEN + data.len();
     if udp_len > 1480 {
-        return -(BESALT_INVALID_ARGUMENT as i32);
+        return -(TRONA_INVALID_ARGUMENT as i32);
     }
 
     // Build UDP packet using protocol helper
     let mut udp_buf = [0u8; 1480];
     let written = udp_proto::build(local_port, dst_port, data, src_ip, dst_ip, &mut udp_buf);
     if written == 0 {
-        return -(BESALT_INVALID_ARGUMENT as i32);
+        return -(TRONA_INVALID_ARGUMENT as i32);
     }
     let our_mac = crate::mac_addr();
     let ttl = unsafe {
@@ -339,7 +339,7 @@ pub(crate) fn udp_sendto(conn_id: u32, data: &[u8], dst_ip: u32, dst_port: u16) 
         (*sockets)[idx].opts.broadcast
     };
     if crate::net::config::is_broadcast(dst_ip) && !allow_broadcast {
-        return -(BESALT_INVALID_ARGUMENT as i32);
+        return -(TRONA_INVALID_ARGUMENT as i32);
     }
     if crate::net::send_ip_packet_with_ttl(
         &our_mac,
@@ -351,7 +351,7 @@ pub(crate) fn udp_sendto(conn_id: u32, data: &[u8], dst_ip: u32, dst_port: u16) 
     ) {
         data.len() as i32
     } else {
-        -(BESALT_NO_BUFS as i32)
+        -(TRONA_NO_BUFS as i32)
     }
 }
 
@@ -359,7 +359,7 @@ pub(crate) fn udp_sendto(conn_id: u32, data: &[u8], dst_ip: u32, dst_port: u16) 
 pub(crate) fn udp_send(conn_id: u32, data: &[u8]) -> i32 {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return -(BESALT_INVALID_ARGUMENT as i32),
+        None => return -(TRONA_INVALID_ARGUMENT as i32),
     };
 
     // SAFETY: Single-threaded driver; reading socket state.
@@ -369,7 +369,7 @@ pub(crate) fn udp_send(conn_id: u32, data: &[u8]) -> i32 {
     };
 
     if rip == 0 || rport == 0 {
-        return -(BESALT_INVALID_ARGUMENT as i32);
+        return -(TRONA_INVALID_ARGUMENT as i32);
     }
 
     udp_sendto(conn_id, data, rip, rport)
@@ -434,7 +434,7 @@ pub(crate) fn udp_recv(conn_id: u32, buf: &mut [u8]) -> i32 {
 pub(crate) fn udp_close(conn_id: u32) -> i32 {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return -(BESALT_INVALID_ARGUMENT as i32),
+        None => return -(TRONA_INVALID_ARGUMENT as i32),
     };
 
     // SAFETY: Single-threaded driver; deactivating socket.
@@ -478,7 +478,7 @@ pub(crate) fn handle_local_ip_loss() {
 pub(crate) fn udp_set_keep_zero_source_ip(conn_id: u32, keep_zero_source_ip: bool) -> i32 {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return -(BESALT_INVALID_ARGUMENT as i32),
+        None => return -(TRONA_INVALID_ARGUMENT as i32),
     };
 
     // SAFETY: Single-threaded driver; mutating socket state in-place.
@@ -507,7 +507,7 @@ pub(crate) fn udp_getsockname(conn_id: u32) -> (u32, u16) {
 pub(crate) fn udp_getpeername(conn_id: u32) -> Result<(u32, u16), u64> {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return Err(BESALT_INVALID_ARGUMENT),
+        None => return Err(TRONA_INVALID_ARGUMENT),
     };
 
     // SAFETY: Single-threaded driver; reading socket state.
@@ -516,7 +516,7 @@ pub(crate) fn udp_getpeername(conn_id: u32) -> Result<(u32, u16), u64> {
         let remote_ip = (*sockets)[idx].remote_ip;
         let remote_port = (*sockets)[idx].remote_port;
         if remote_ip == 0 || remote_port == 0 {
-            return Err(BESALT_NOT_CONNECTED);
+            return Err(TRONA_NOT_CONNECTED);
         }
         Ok((remote_ip, remote_port))
     }
@@ -531,7 +531,7 @@ pub(crate) fn udp_setsockopt(
 ) -> u64 {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return BESALT_INVALID_ARGUMENT,
+        None => return TRONA_INVALID_ARGUMENT,
     };
     unsafe {
         let sockets = &raw mut UDP_SOCKETS;
@@ -549,14 +549,14 @@ pub(crate) fn udp_setsockopt(
 pub(crate) fn udp_getsockopt(conn_id: u32, level: i32, optname: i32) -> Result<(u64, u32), u64> {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return Err(BESALT_INVALID_ARGUMENT),
+        None => return Err(TRONA_INVALID_ARGUMENT),
     };
     unsafe {
         let sockets = &raw mut UDP_SOCKETS;
         options::get_option(
             &mut (*sockets)[idx].opts,
             SOCK_DGRAM,
-            besalt::consts::IPPROTO_UDP,
+            trona::consts::IPPROTO_UDP,
             level,
             optname,
         )
@@ -599,7 +599,7 @@ pub(crate) fn handle_datagram(ip_hdr: &ipv4::Ipv4Header, data: &[u8]) {
             unsafe {
                 if *(&raw const LOGGED_UDP_DROPS) < 8 {
                     *(&raw mut LOGGED_UDP_DROPS) += 1;
-                    besalt::udebug!(|_lb| {
+                    trona::udebug!(|_lb| {
                         _lb.str(b"[netsrv] UDP parse failed len=");
                         _lb.dec(data.len() as u64);
                         _lb.putc(b'\n');
@@ -615,7 +615,7 @@ pub(crate) fn handle_datagram(ip_hdr: &ipv4::Ipv4Header, data: &[u8]) {
     unsafe {
         if *(&raw const LOGGED_UDP_FRAMES) < 8 {
             *(&raw mut LOGGED_UDP_FRAMES) += 1;
-            besalt::udebug!(|_lb| {
+            trona::udebug!(|_lb| {
                 _lb.str(b"[netsrv] UDP datagram src=");
                 log_ipv4(&mut _lb, src_ip);
                 _lb.putc(b':');
@@ -638,7 +638,7 @@ pub(crate) fn handle_datagram(ip_hdr: &ipv4::Ipv4Header, data: &[u8]) {
             unsafe {
                 if *(&raw const LOGGED_UDP_DROPS) < 8 {
                     *(&raw mut LOGGED_UDP_DROPS) += 1;
-                    besalt::udebug!(|_lb| {
+                    trona::udebug!(|_lb| {
                         _lb.str(b"[netsrv] UDP drop no socket dst_port=");
                         _lb.dec(dst_port as u64);
                         _lb.str(b" src=");
@@ -661,7 +661,7 @@ pub(crate) fn handle_datagram(ip_hdr: &ipv4::Ipv4Header, data: &[u8]) {
         // If a recv is pending, deliver directly via completion
         if sock.pending_recv {
             let op_type = sock.pending_recv_op_type;
-            let want_timestamp = (sock.pending_recv_flags & besalt::consts::INET_RECVMSG_WANT_TIMESTAMP) != 0;
+            let want_timestamp = (sock.pending_recv_flags & trona::consts::INET_RECVMSG_WANT_TIMESTAMP) != 0;
             sock.pending_recv = false;
             let max_len = sock.pending_recv_max_len as usize;
             let copy_len = core::cmp::min(payload.len(), max_len);
@@ -669,7 +669,7 @@ pub(crate) fn handle_datagram(ip_hdr: &ipv4::Ipv4Header, data: &[u8]) {
 
             let mut comp = Completion {
                 conn_id: sock.conn_id,
-                result: BESALT_OK,
+                result: TRONA_OK,
                 op_type,
                 data: [0u8; 152],
                 data_len: copy_len,
@@ -739,7 +739,7 @@ pub(crate) fn handle_datagram(ip_hdr: &ipv4::Ipv4Header, data: &[u8]) {
         if was_empty {
             push_completion(Completion {
                 conn_id: sock.conn_id,
-                result: BESALT_OK,
+                result: TRONA_OK,
                 op_type: INET_OP_RECV,
                 data: [0u8; 152],
                 data_len: 0,
@@ -776,7 +776,7 @@ pub(crate) fn set_pending_recv(conn_id: u32, max_len: u16) {
 
                 let mut comp = Completion {
                     conn_id: sock.conn_id,
-                    result: BESALT_OK,
+                    result: TRONA_OK,
                     op_type: INET_OP_RECV,
                     data: [0u8; 152],
                     data_len: copy_len,
@@ -829,14 +829,14 @@ pub(crate) fn set_pending_recvfrom(conn_id: u32, max_len: u16, flags: u32) {
 
                 let mut comp = Completion {
                     conn_id: sock.conn_id,
-                    result: BESALT_OK,
+                    result: TRONA_OK,
                     op_type: INET_OP_RECVFROM,
                     data: [0u8; 152],
                     data_len: copy_len,
                     extra_conn_id: 0,
                     extra_ip: entry.src_ip,
                     extra_port: entry.src_port,
-                    timestamp_ns: if (flags & besalt::consts::INET_RECVMSG_WANT_TIMESTAMP) != 0 {
+                    timestamp_ns: if (flags & trona::consts::INET_RECVMSG_WANT_TIMESTAMP) != 0 {
                         entry.timestamp_ns
                     } else {
                         options::TIMESTAMP_NONE_NS

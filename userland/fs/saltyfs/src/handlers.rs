@@ -7,8 +7,8 @@
 //! - 72 bytes (MR3..MR11): symlink link name (old name in rename)
 //! - 64 bytes (MR12..MR19): symlink target, rename new name
 
-use besalt::consts::*;
-use besalt::types::*;
+use trona::consts::*;
+use trona::types::*;
 
 use crate::alloc::{alloc_block, free_block, bitmap_flush};
 use crate::block::{read_block, write_block, read_superblock};
@@ -34,7 +34,7 @@ fn fnv1a_hash(name: &[u8]) -> u64 {
 fn dir_item_insert(parent_ino: u64, name: &[u8], dir_buf: &[u8]) -> bool {
     let mut key = BTreeKey {
         object_id: parent_ino,
-        item_type: BESALT_DIR_ITEM,
+        item_type: TRONA_DIR_ITEM,
         offset: fnv1a_hash(name),
     };
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
@@ -54,7 +54,7 @@ fn find_dir_item_key(dir_ino: u64, name: *const u8, name_len: u8) -> Option<BTre
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
     let mut found_key: Option<BTreeKey> = None;
 
-    btree_find_all_for_ino(root_tree, dir_ino, BESALT_DIR_ITEM, |key, data_ptr, _size| {
+    btree_find_all_for_ino(root_tree, dir_ino, TRONA_DIR_ITEM, |key, data_ptr, _size| {
         unsafe {
             let (_, entry_name_len, _) = parse_dir_item_header(data_ptr);
             if entry_name_len as u8 == name_len {
@@ -78,12 +78,12 @@ fn find_dir_item_key(dir_ino: u64, name: *const u8, name_len: u8) -> Option<BTre
     found_key
 }
 
-/// Insert an INODE_REF item: key = (child_ino, BESALT_INODE_REF, parent_ino), data = name.
+/// Insert an INODE_REF item: key = (child_ino, TRONA_INODE_REF, parent_ino), data = name.
 /// Idempotent: returns true if the item already exists.
 fn inode_ref_insert(child_ino: u64, parent_ino: u64, name: &[u8]) -> bool {
     let key = BTreeKey {
         object_id: child_ino,
-        item_type: BESALT_INODE_REF,
+        item_type: TRONA_INODE_REF,
         offset: parent_ino,
     };
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
@@ -99,7 +99,7 @@ fn inode_ref_insert(child_ino: u64, parent_ino: u64, name: &[u8]) -> bool {
 fn inode_ref_delete(child_ino: u64, parent_ino: u64) -> bool {
     let key = BTreeKey {
         object_id: child_ino,
-        item_type: BESALT_INODE_REF,
+        item_type: TRONA_INODE_REF,
         offset: parent_ino,
     };
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
@@ -144,7 +144,7 @@ fn dir_entry_insert_with_ref(parent_ino: u64, child_ino: u64, name: &[u8], dir_t
     }
 
     if !inode_ref_delete(child_ino, parent_ino) {
-        besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] CRIT: dir_entry_insert rollback (inode_ref_delete) failed\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[saltyfs] CRIT: dir_entry_insert rollback (inode_ref_delete) failed\n"); });
         return Err(DirEntryTxnError::FailedDirty);
     }
     Err(DirEntryTxnError::FailedClean)
@@ -161,7 +161,7 @@ fn dir_entry_remove_with_ref(parent_ino: u64, child_ino: u64, name: &[u8]) -> Di
         Some(k) => k,
         None => {
             if !inode_ref_insert(child_ino, parent_ino, name) {
-                besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] CRIT: dir_entry_remove rollback (reinsert missing ref) failed\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[saltyfs] CRIT: dir_entry_remove rollback (reinsert missing ref) failed\n"); });
                 return Err(DirEntryTxnError::FailedDirty);
             }
             return Err(DirEntryTxnError::FailedClean);
@@ -173,7 +173,7 @@ fn dir_entry_remove_with_ref(parent_ino: u64, child_ino: u64, name: &[u8]) -> Di
     }
 
     if !inode_ref_insert(child_ino, parent_ino, name) {
-        besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] CRIT: dir_entry_remove rollback (inode_ref_insert) failed\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[saltyfs] CRIT: dir_entry_remove rollback (inode_ref_insert) failed\n"); });
         return Err(DirEntryTxnError::FailedDirty);
     }
     Err(DirEntryTxnError::FailedClean)
@@ -193,7 +193,7 @@ pub(crate) fn lookup_in_dir(dir_ino: u64, name: *const u8, name_len: u8) -> Opti
     // Direct hash lookup with linear probing (matches dir_item_insert)
     let mut key = BTreeKey {
         object_id: dir_ino,
-        item_type: BESALT_DIR_ITEM,
+        item_type: TRONA_DIR_ITEM,
         offset: base_hash,
     };
     for _ in 0..16 {
@@ -225,7 +225,7 @@ pub(crate) fn lookup_in_dir(dir_ino: u64, name: *const u8, name_len: u8) -> Opti
     // number rather than fnv1a_hash(name). This covers images created before the
     // hash-based keying was introduced.
     let mut result: Option<(u64, u8)> = None;
-    btree_find_all_for_ino(root_tree, dir_ino, BESALT_DIR_ITEM, |_key, data_ptr, _size| {
+    btree_find_all_for_ino(root_tree, dir_ino, TRONA_DIR_ITEM, |_key, data_ptr, _size| {
         // SAFETY: data_ptr points to a valid DIR_ITEM within a mapped B-tree leaf.
         unsafe {
             let (child_ino, entry_name_len, dir_type) = parse_dir_item_header(data_ptr);
@@ -255,7 +255,7 @@ pub(crate) fn get_inode(ino: u64) -> Option<SaltyInodeItem> {
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
     let key = BTreeKey {
         object_id: ino,
-        item_type: BESALT_INODE_ITEM,
+        item_type: TRONA_INODE_ITEM,
         offset: 0,
     };
 
@@ -295,7 +295,7 @@ fn read_file_data(ino: u64, file_offset: u64, count: u64, dest_base: u64) -> u64
     let read_end = file_offset + actual_count;
     let mut bytes_read = 0u64;
 
-    btree_find_all_for_ino(root_tree, ino, BESALT_EXTENT_DATA, |key, data_ptr, item_size| {
+    btree_find_all_for_ino(root_tree, ino, TRONA_EXTENT_DATA, |key, data_ptr, item_size| {
         if bytes_read >= actual_count {
             return false;
         }
@@ -390,7 +390,7 @@ fn read_file_data(ino: u64, file_offset: u64, count: u64, dest_base: u64) -> u64
 fn readdir_entries(
     dir_ino: u64,
     cursor: u64,
-    reply: &mut BesaltMsg,
+    reply: &mut TronaMsg,
 ) {
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
 
@@ -400,7 +400,7 @@ fn readdir_entries(
 
     // MR0 = next_cursor, then repeated groups of 6:
     // (ino, type, name_0, name_1, name_2, name_3) — 32-byte names, 3 entries max
-    btree_find_all_for_ino(root_tree, dir_ino, BESALT_DIR_ITEM, |_key, data_ptr, _size| {
+    btree_find_all_for_ino(root_tree, dir_ino, TRONA_DIR_ITEM, |_key, data_ptr, _size| {
         if entry_idx < cursor {
             entry_idx += 1;
             return true;
@@ -557,7 +557,7 @@ fn delete_all_extents(ino: u64) {
         let mut disk_sizes = [0u64; 128];
         let mut count = 0usize;
 
-        btree_find_all_for_ino(root_tree, ino, BESALT_EXTENT_DATA, |key, data_ptr, _size| {
+        btree_find_all_for_ino(root_tree, ino, TRONA_EXTENT_DATA, |key, data_ptr, _size| {
             if count < 128 {
                 let ext = unsafe { read_extent_data(data_ptr) };
                 offsets[count] = key.offset;
@@ -583,11 +583,11 @@ fn delete_all_extents(ino: u64) {
             }
             let ext_key = BTreeKey {
                 object_id: ino,
-                item_type: BESALT_EXTENT_DATA,
+                item_type: TRONA_EXTENT_DATA,
                 offset: offsets[i],
             };
             if !btree_cow_delete(&ext_key) {
-                besalt::uwarn!(|_lb| { _lb.str(b"[saltyfs] WARN: extent delete failed during cleanup\n"); });
+                trona::uwarn!(|_lb| { _lb.str(b"[saltyfs] WARN: extent delete failed during cleanup\n"); });
             }
         }
     }
@@ -600,7 +600,7 @@ fn update_inode_mtime(ino: u64) -> bool {
         inode.mtime = unsafe { (*(&raw const SB)).generation + 1 };
         let inode_key = BTreeKey {
             object_id: ino,
-            item_type: BESALT_INODE_ITEM,
+            item_type: TRONA_INODE_ITEM,
             offset: 0,
         };
         return btree_cow_update(&inode_key, &inode_to_bytes(&inode));
@@ -608,18 +608,18 @@ fn update_inode_mtime(ino: u64) -> bool {
     true
 }
 
-pub(crate) fn handle_mount() -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_mount() -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
 
     if unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_ALREADY_EXISTS;
+        reply.label = TRONA_ALREADY_EXISTS;
         reply.length = 1;
         reply.regs[0] = unsafe { (*(&raw const SB)).root_inode };
         return reply;
     }
 
     if !read_superblock() {
-        reply.label = BESALT_NOT_FOUND;
+        reply.label = TRONA_NOT_FOUND;
         return reply;
     }
 
@@ -630,11 +630,11 @@ pub(crate) fn handle_mount() -> BesaltMsg {
     reply
 }
 
-pub(crate) fn handle_lookup(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_lookup(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
 
     if !unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
@@ -642,7 +642,7 @@ pub(crate) fn handle_lookup(msg: &BesaltMsg) -> BesaltMsg {
     // Name packed in MR1..MR19 (up to 144 bytes)
     let name_len = msg.regs[1] as u8;
     if name_len == 0 || name_len > 144 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
@@ -662,17 +662,17 @@ pub(crate) fn handle_lookup(msg: &BesaltMsg) -> BesaltMsg {
             reply.regs[1] = dir_type as u64;
         }
         None => {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
         }
     }
     reply
 }
 
-pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_read(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
 
     if !unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
@@ -688,7 +688,7 @@ pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
         SHM_SIZE
     };
     if shm_offset >= shm_size || count > shm_size - shm_offset {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
@@ -705,11 +705,11 @@ pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
     reply
 }
 
-pub(crate) fn handle_readdir(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_readdir(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
 
     if !unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
@@ -720,11 +720,11 @@ pub(crate) fn handle_readdir(msg: &BesaltMsg) -> BesaltMsg {
     reply
 }
 
-pub(crate) fn handle_stat(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_stat(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
 
     if !unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
@@ -742,17 +742,17 @@ pub(crate) fn handle_stat(msg: &BesaltMsg) -> BesaltMsg {
             reply.regs[5] = inode.blocks;
         }
         None => {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
         }
     }
     reply
 }
 
-pub(crate) fn handle_getinfo() -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_getinfo() -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
 
     if !unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
@@ -778,11 +778,11 @@ pub(crate) fn handle_getinfo() -> BesaltMsg {
 
 /// Handle SALTYFS_READ_INLINE: read up to 152 bytes and return data in IPC registers.
 /// Uses SHM offset 0 as scratch space, then copies into the reply.
-pub(crate) fn handle_read_inline(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_read_inline(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
 
     if !unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
@@ -814,10 +814,10 @@ pub(crate) fn handle_read_inline(msg: &BesaltMsg) -> BesaltMsg {
 }
 
 /// Handle SALTYFS_CREATE: create a new regular file.
-pub(crate) fn handle_create(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_create(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
     if !unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
@@ -825,7 +825,7 @@ pub(crate) fn handle_create(msg: &BesaltMsg) -> BesaltMsg {
     let mode = msg.regs[1] as u32;
     let name_len = msg.regs[2] as u8;
     if name_len == 0 || name_len > 136 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
@@ -839,7 +839,7 @@ pub(crate) fn handle_create(msg: &BesaltMsg) -> BesaltMsg {
 
     // Check if already exists
     if lookup_in_dir(parent_ino, name_buf.as_ptr(), name_len).is_some() {
-        reply.label = BESALT_ALREADY_EXISTS;
+        reply.label = TRONA_ALREADY_EXISTS;
         return reply;
     }
 
@@ -853,11 +853,11 @@ pub(crate) fn handle_create(msg: &BesaltMsg) -> BesaltMsg {
     let inode_data = build_inode_bytes(0, 0, 1, mode | 0o100000); // S_IFREG
     let inode_key = BTreeKey {
         object_id: new_ino,
-        item_type: BESALT_INODE_ITEM,
+        item_type: TRONA_INODE_ITEM,
         offset: 0,
     };
     if !btree_cow_insert(&inode_key, &inode_data) {
-        reply.label = BESALT_OUT_OF_MEMORY;
+        reply.label = TRONA_OUT_OF_MEMORY;
         return reply;
     }
 
@@ -865,20 +865,20 @@ pub(crate) fn handle_create(msg: &BesaltMsg) -> BesaltMsg {
         Ok(()) => {}
         Err(DirEntryTxnError::FailedClean) => {
             if !btree_cow_delete(&inode_key) {
-                besalt::uwarn!(|_lb| { _lb.str(b"[saltyfs] WARN: create rollback inode delete failed\n"); });
+                trona::uwarn!(|_lb| { _lb.str(b"[saltyfs] WARN: create rollback inode delete failed\n"); });
             }
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return reply;
         }
         Err(DirEntryTxnError::FailedDirty) => {
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return reply;
         }
     }
 
     update_inode_mtime(parent_ino);
 
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(b"[saltyfs] CREATE ino=");
         _lb.dec(new_ino);
         _lb.str(b" parent=");
@@ -886,7 +886,7 @@ pub(crate) fn handle_create(msg: &BesaltMsg) -> BesaltMsg {
         _lb.putc(b'\n');
     });
 
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
     reply.length = 1;
     reply.regs[0] = new_ino;
     reply
@@ -894,11 +894,11 @@ pub(crate) fn handle_create(msg: &BesaltMsg) -> BesaltMsg {
 
 /// Handle SALTYFS_WRITE_INLINE: write up to 136 bytes of data at any offset.
 /// Supports multi-block files: each 4KB block gets its own EXTENT_DATA item
-/// keyed at (ino, BESALT_EXTENT_DATA, block_aligned_offset).
-pub(crate) fn handle_write_inline(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+/// keyed at (ino, TRONA_EXTENT_DATA, block_aligned_offset).
+pub(crate) fn handle_write_inline(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
     if !unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
@@ -920,7 +920,7 @@ pub(crate) fn handle_write_inline(msg: &BesaltMsg) -> BesaltMsg {
     let inode = match get_inode(ino) {
         Some(i) => i,
         None => {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
             return reply;
         }
     };
@@ -937,7 +937,7 @@ pub(crate) fn handle_write_inline(msg: &BesaltMsg) -> BesaltMsg {
     if new_size <= 208 && offset < 208 {
         let extent_key = BTreeKey {
             object_id: ino,
-            item_type: BESALT_EXTENT_DATA,
+            item_type: TRONA_EXTENT_DATA,
             offset: 0,
         };
 
@@ -985,7 +985,7 @@ pub(crate) fn handle_write_inline(msg: &BesaltMsg) -> BesaltMsg {
             btree_cow_insert(&extent_key, &extent_buf[..ext_total])
         };
         if !ok {
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return reply;
         }
     } else {
@@ -1001,15 +1001,15 @@ pub(crate) fn handle_write_inline(msg: &BesaltMsg) -> BesaltMsg {
     updated_inode.mtime = unsafe { (*(&raw const SB)).generation + 1 };
     let inode_key = BTreeKey {
         object_id: ino,
-        item_type: BESALT_INODE_ITEM,
+        item_type: TRONA_INODE_ITEM,
         offset: 0,
     };
     if !btree_cow_update(&inode_key, &inode_to_bytes(&updated_inode)) {
-        reply.label = BESALT_OUT_OF_MEMORY;
+        reply.label = TRONA_OUT_OF_MEMORY;
         return reply;
     }
 
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
     reply.length = 1;
     reply.regs[0] = count;
     reply
@@ -1025,15 +1025,15 @@ fn write_regular_extents(
     inode: &SaltyInodeItem,
     new_size: u64,
     bs: u64,
-    reply: &mut BesaltMsg,
-) -> BesaltMsg {
+    reply: &mut TronaMsg,
+) -> TronaMsg {
     let ext_hdr_size = core::mem::size_of::<ExtentData>();
 
     // Check for inline→regular promotion: if there's an inline extent at offset 0,
     // convert it to a regular extent first.
     let inline_key = BTreeKey {
         object_id: ino,
-        item_type: BESALT_EXTENT_DATA,
+        item_type: TRONA_EXTENT_DATA,
         offset: 0,
     };
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
@@ -1044,7 +1044,7 @@ fn write_regular_extents(
             let promo_block = match alloc_block() {
                 Some(b) => b,
                 None => {
-                    reply.label = BESALT_OUT_OF_MEMORY;
+                    reply.label = TRONA_OUT_OF_MEMORY;
                     return *reply;
                 }
             };
@@ -1057,20 +1057,20 @@ fn write_regular_extents(
             }
             if !write_block(promo_block, promo_buf.as_ptr()) {
                 free_block(promo_block);
-                reply.label = BESALT_OUT_OF_MEMORY;
+                reply.label = TRONA_OUT_OF_MEMORY;
                 return *reply;
             }
             // Delete inline extent, insert regular at offset 0
             if !btree_cow_delete(&inline_key) {
                 free_block(promo_block);
-                reply.label = BESALT_OUT_OF_MEMORY;
+                reply.label = TRONA_OUT_OF_MEMORY;
                 return *reply;
             }
             let mut ext_buf = [0u8; 304];
             build_extent_regular(&mut ext_buf, bs, promo_block * bs, bs, 0, bs);
             if !btree_cow_insert(&inline_key, &ext_buf[..ext_hdr_size]) {
                 free_block(promo_block);
-                reply.label = BESALT_OUT_OF_MEMORY;
+                reply.label = TRONA_OUT_OF_MEMORY;
                 return *reply;
             }
             bitmap_flush();
@@ -1085,7 +1085,7 @@ fn write_regular_extents(
     while block_off < write_end {
         let extent_key = BTreeKey {
             object_id: ino,
-            item_type: BESALT_EXTENT_DATA,
+            item_type: TRONA_EXTENT_DATA,
             offset: block_off,
         };
 
@@ -1131,13 +1131,13 @@ fn write_regular_extents(
         let data_block = match alloc_block() {
             Some(b) => b,
             None => {
-                reply.label = BESALT_OUT_OF_MEMORY;
+                reply.label = TRONA_OUT_OF_MEMORY;
                 return *reply;
             }
         };
         if !write_block(data_block, block_buf.as_ptr()) {
             free_block(data_block);
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return *reply;
         }
 
@@ -1151,7 +1151,7 @@ fn write_regular_extents(
         };
         if !ok {
             free_block(data_block);
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return *reply;
         }
 
@@ -1171,25 +1171,25 @@ fn write_regular_extents(
     updated_inode.mtime = unsafe { (*(&raw const SB)).generation + 1 };
     let inode_key = BTreeKey {
         object_id: ino,
-        item_type: BESALT_INODE_ITEM,
+        item_type: TRONA_INODE_ITEM,
         offset: 0,
     };
     if !btree_cow_update(&inode_key, &inode_to_bytes(&updated_inode)) {
-        reply.label = BESALT_OUT_OF_MEMORY;
+        reply.label = TRONA_OUT_OF_MEMORY;
         return *reply;
     }
 
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
     reply.length = 1;
     reply.regs[0] = count;
     *reply
 }
 
 /// Handle SALTYFS_MKDIR: create a new directory.
-pub(crate) fn handle_mkdir_fs(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_mkdir_fs(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
     if !unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
@@ -1197,7 +1197,7 @@ pub(crate) fn handle_mkdir_fs(msg: &BesaltMsg) -> BesaltMsg {
     let mode = msg.regs[1] as u32;
     let name_len = msg.regs[2] as u8;
     if name_len == 0 || name_len > 136 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
@@ -1210,7 +1210,7 @@ pub(crate) fn handle_mkdir_fs(msg: &BesaltMsg) -> BesaltMsg {
     }
 
     if lookup_in_dir(parent_ino, name_buf.as_ptr(), name_len).is_some() {
-        reply.label = BESALT_ALREADY_EXISTS;
+        reply.label = TRONA_ALREADY_EXISTS;
         return reply;
     }
 
@@ -1224,11 +1224,11 @@ pub(crate) fn handle_mkdir_fs(msg: &BesaltMsg) -> BesaltMsg {
     let inode_data = build_inode_bytes(0, 0, 2, mode | 0o040000);
     let inode_key = BTreeKey {
         object_id: new_ino,
-        item_type: BESALT_INODE_ITEM,
+        item_type: TRONA_INODE_ITEM,
         offset: 0,
     };
     if !btree_cow_insert(&inode_key, &inode_data) {
-        reply.label = BESALT_OUT_OF_MEMORY;
+        reply.label = TRONA_OUT_OF_MEMORY;
         return reply;
     }
 
@@ -1236,37 +1236,37 @@ pub(crate) fn handle_mkdir_fs(msg: &BesaltMsg) -> BesaltMsg {
         Ok(()) => {}
         Err(DirEntryTxnError::FailedClean) => {
             if !btree_cow_delete(&inode_key) {
-                besalt::uwarn!(|_lb| { _lb.str(b"[saltyfs] WARN: mkdir rollback inode delete failed\n"); });
+                trona::uwarn!(|_lb| { _lb.str(b"[saltyfs] WARN: mkdir rollback inode delete failed\n"); });
             }
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return reply;
         }
         Err(DirEntryTxnError::FailedDirty) => {
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return reply;
         }
     }
 
     update_inode_mtime(parent_ino);
 
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
     reply.length = 1;
     reply.regs[0] = new_ino;
     reply
 }
 
 /// Handle SALTYFS_UNLINK: remove a file.
-pub(crate) fn handle_unlink_fs(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_unlink_fs(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
     if !unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
     let parent_ino = msg.regs[0];
     let name_len = msg.regs[1] as u8;
     if name_len == 0 || name_len > 144 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
@@ -1281,7 +1281,7 @@ pub(crate) fn handle_unlink_fs(msg: &BesaltMsg) -> BesaltMsg {
     let child_ino = match lookup_in_dir(parent_ino, name_buf.as_ptr(), name_len) {
         Some((ino, _)) => ino,
         None => {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
             return reply;
         }
     };
@@ -1289,21 +1289,21 @@ pub(crate) fn handle_unlink_fs(msg: &BesaltMsg) -> BesaltMsg {
     let inode = match get_inode(child_ino) {
         Some(i) => i,
         None => {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
             return reply;
         }
     };
 
     // Don't unlink directories (use rmdir)
     if (inode.mode & 0o170000) == 0o040000 {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
     match dir_entry_remove_with_ref(parent_ino, child_ino, &name_buf[..name_len as usize]) {
         Ok(()) => {}
         Err(DirEntryTxnError::FailedClean) | Err(DirEntryTxnError::FailedDirty) => {
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return reply;
         }
     }
@@ -1317,11 +1317,11 @@ pub(crate) fn handle_unlink_fs(msg: &BesaltMsg) -> BesaltMsg {
         // Delete INODE_ITEM
         let inode_key = BTreeKey {
             object_id: child_ino,
-            item_type: BESALT_INODE_ITEM,
+            item_type: TRONA_INODE_ITEM,
             offset: 0,
         };
         if !btree_cow_delete(&inode_key) {
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return reply;
         }
     } else {
@@ -1330,33 +1330,33 @@ pub(crate) fn handle_unlink_fs(msg: &BesaltMsg) -> BesaltMsg {
         updated.nlink = new_nlink;
         let inode_key = BTreeKey {
             object_id: child_ino,
-            item_type: BESALT_INODE_ITEM,
+            item_type: TRONA_INODE_ITEM,
             offset: 0,
         };
         if !btree_cow_update(&inode_key, &inode_to_bytes(&updated)) {
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return reply;
         }
     }
 
     update_inode_mtime(parent_ino);
 
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
     reply
 }
 
 /// Handle SALTYFS_RMDIR: remove an empty directory.
-pub(crate) fn handle_rmdir_fs(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_rmdir_fs(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
     if !unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
     let parent_ino = msg.regs[0];
     let name_len = msg.regs[1] as u8;
     if name_len == 0 || name_len > 144 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
@@ -1371,7 +1371,7 @@ pub(crate) fn handle_rmdir_fs(msg: &BesaltMsg) -> BesaltMsg {
     let child_ino = match lookup_in_dir(parent_ino, name_buf.as_ptr(), name_len) {
         Some((ino, _)) => ino,
         None => {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
             return reply;
         }
     };
@@ -1379,33 +1379,33 @@ pub(crate) fn handle_rmdir_fs(msg: &BesaltMsg) -> BesaltMsg {
     let inode = match get_inode(child_ino) {
         Some(i) => i,
         None => {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
             return reply;
         }
     };
 
     // Must be a directory
     if (inode.mode & 0o170000) != 0o040000 {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
     // Check if directory is empty (cross-leaf iteration)
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
     let mut has_entries = false;
-    btree_find_all_for_ino(root_tree, child_ino, BESALT_DIR_ITEM, |_, _, _| {
+    btree_find_all_for_ino(root_tree, child_ino, TRONA_DIR_ITEM, |_, _, _| {
         has_entries = true;
         false // stop on first entry found
     });
     if has_entries {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
     match dir_entry_remove_with_ref(parent_ino, child_ino, &name_buf[..name_len as usize]) {
         Ok(()) => {}
         Err(DirEntryTxnError::FailedClean) | Err(DirEntryTxnError::FailedDirty) => {
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return reply;
         }
     }
@@ -1413,25 +1413,25 @@ pub(crate) fn handle_rmdir_fs(msg: &BesaltMsg) -> BesaltMsg {
     // Delete INODE_ITEM
     let inode_key = BTreeKey {
         object_id: child_ino,
-        item_type: BESALT_INODE_ITEM,
+        item_type: TRONA_INODE_ITEM,
         offset: 0,
     };
     if !btree_cow_delete(&inode_key) {
-        reply.label = BESALT_OUT_OF_MEMORY;
+        reply.label = TRONA_OUT_OF_MEMORY;
         return reply;
     }
 
     update_inode_mtime(parent_ino);
 
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
     reply
 }
 
 /// Handle SALTYFS_RENAME: move/rename a file or directory.
-pub(crate) fn handle_rename_fs(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_rename_fs(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
     if !unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
@@ -1440,11 +1440,11 @@ pub(crate) fn handle_rename_fs(msg: &BesaltMsg) -> BesaltMsg {
     let new_parent = msg.regs[2];
     let new_name_len = msg.regs[3] as u8;
     if old_name_len == 0 || old_name_len > 64 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
     if new_name_len == 0 || new_name_len > 64 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
@@ -1468,7 +1468,7 @@ pub(crate) fn handle_rename_fs(msg: &BesaltMsg) -> BesaltMsg {
     let child_ino = match lookup_in_dir(old_parent, old_name.as_ptr(), old_name_len) {
         Some((ino, _)) => ino,
         None => {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
             return reply;
         }
     };
@@ -1477,13 +1477,13 @@ pub(crate) fn handle_rename_fs(msg: &BesaltMsg) -> BesaltMsg {
     if let Some((existing_ino, _)) = lookup_in_dir(new_parent, new_name.as_ptr(), new_name_len) {
         // No-op rename: old and new point to the same entry
         if existing_ino == child_ino {
-            reply.label = BESALT_OK;
+            reply.label = TRONA_OK;
             return reply;
         }
         match dir_entry_remove_with_ref(new_parent, existing_ino, &new_name[..new_name_len as usize]) {
             Ok(()) => {}
             Err(DirEntryTxnError::FailedClean) | Err(DirEntryTxnError::FailedDirty) => {
-                reply.label = BESALT_OUT_OF_MEMORY;
+                reply.label = TRONA_OUT_OF_MEMORY;
                 return reply;
             }
         }
@@ -1498,11 +1498,11 @@ pub(crate) fn handle_rename_fs(msg: &BesaltMsg) -> BesaltMsg {
                 // Delete INODE_ITEM
                 let inode_key = BTreeKey {
                     object_id: existing_ino,
-                    item_type: BESALT_INODE_ITEM,
+                    item_type: TRONA_INODE_ITEM,
                     offset: 0,
                 };
                 if !btree_cow_delete(&inode_key) {
-                    besalt::uwarn!(|_lb| { _lb.str(b"[saltyfs] rename: warning: orphan inode (delete failed)\n"); });
+                    trona::uwarn!(|_lb| { _lb.str(b"[saltyfs] rename: warning: orphan inode (delete failed)\n"); });
                 }
             } else {
                 // nlink > 0: just update inode
@@ -1510,11 +1510,11 @@ pub(crate) fn handle_rename_fs(msg: &BesaltMsg) -> BesaltMsg {
                 updated.nlink = new_nlink;
                 let inode_key = BTreeKey {
                     object_id: existing_ino,
-                    item_type: BESALT_INODE_ITEM,
+                    item_type: TRONA_INODE_ITEM,
                     offset: 0,
                 };
                 if !btree_cow_update(&inode_key, &inode_to_bytes(&updated)) {
-                    besalt::uwarn!(|_lb| { _lb.str(b"[saltyfs] rename: warning: nlink update failed\n"); });
+                    trona::uwarn!(|_lb| { _lb.str(b"[saltyfs] rename: warning: nlink update failed\n"); });
                 }
             }
         }
@@ -1523,7 +1523,7 @@ pub(crate) fn handle_rename_fs(msg: &BesaltMsg) -> BesaltMsg {
     match dir_entry_remove_with_ref(old_parent, child_ino, &old_name[..old_name_len as usize]) {
         Ok(()) => {}
         Err(DirEntryTxnError::FailedClean) | Err(DirEntryTxnError::FailedDirty) => {
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return reply;
         }
     }
@@ -1537,7 +1537,7 @@ pub(crate) fn handle_rename_fs(msg: &BesaltMsg) -> BesaltMsg {
     match dir_entry_insert_with_ref(new_parent, child_ino, &new_name[..new_name_len as usize], dir_type) {
         Ok(()) => {}
         Err(DirEntryTxnError::FailedClean) | Err(DirEntryTxnError::FailedDirty) => {
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return reply;
         }
     }
@@ -1547,16 +1547,16 @@ pub(crate) fn handle_rename_fs(msg: &BesaltMsg) -> BesaltMsg {
         update_inode_mtime(new_parent);
     }
 
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
     reply
 }
 
 /// Handle SALTYFS_TRUNCATE: change file size.
 /// Supports multi-block files: deletes extent items beyond new_size.
-pub(crate) fn handle_truncate_fs(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_truncate_fs(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
     if !unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
@@ -1567,14 +1567,14 @@ pub(crate) fn handle_truncate_fs(msg: &BesaltMsg) -> BesaltMsg {
     let inode = match get_inode(ino) {
         Some(i) => i,
         None => {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
             return reply;
         }
     };
 
     let inode_key = BTreeKey {
         object_id: ino,
-        item_type: BESALT_INODE_ITEM,
+        item_type: TRONA_INODE_ITEM,
         offset: 0,
     };
 
@@ -1584,17 +1584,17 @@ pub(crate) fn handle_truncate_fs(msg: &BesaltMsg) -> BesaltMsg {
         updated.size = new_size;
         updated.mtime = unsafe { (*(&raw const SB)).generation + 1 };
         if !btree_cow_update(&inode_key, &inode_to_bytes(&updated)) {
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return reply;
         }
-        reply.label = BESALT_OK;
+        reply.label = TRONA_OK;
         return reply;
     }
 
     // Handle inline extent at offset 0 if present (one-time, not batched)
     let ext_key_0 = BTreeKey {
         object_id: ino,
-        item_type: BESALT_EXTENT_DATA,
+        item_type: TRONA_EXTENT_DATA,
         offset: 0,
     };
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
@@ -1603,7 +1603,7 @@ pub(crate) fn handle_truncate_fs(msg: &BesaltMsg) -> BesaltMsg {
         if ext.extent_type == EXTENT_INLINE {
             if new_size == 0 {
                 if !btree_cow_delete(&ext_key_0) {
-                    reply.label = BESALT_OUT_OF_MEMORY;
+                    reply.label = TRONA_OUT_OF_MEMORY;
                     return reply;
                 }
             } else {
@@ -1617,7 +1617,7 @@ pub(crate) fn handle_truncate_fs(msg: &BesaltMsg) -> BesaltMsg {
                     }
                 }
                 if !btree_cow_delete(&ext_key_0) {
-                    reply.label = BESALT_OUT_OF_MEMORY;
+                    reply.label = TRONA_OUT_OF_MEMORY;
                     return reply;
                 }
                 let ext_hdr_size2 = core::mem::size_of::<ExtentData>();
@@ -1629,7 +1629,7 @@ pub(crate) fn handle_truncate_fs(msg: &BesaltMsg) -> BesaltMsg {
                 );
                 let ext_total = ext_hdr_size2 + new_size as usize;
                 if !btree_cow_insert(&ext_key_0, &extent_buf[..ext_total]) {
-                    reply.label = BESALT_OUT_OF_MEMORY;
+                    reply.label = TRONA_OUT_OF_MEMORY;
                     return reply;
                 }
             }
@@ -1644,7 +1644,7 @@ pub(crate) fn handle_truncate_fs(msg: &BesaltMsg) -> BesaltMsg {
         let mut ext_disk_num = [0u64; 128];
         let mut ext_count = 0usize;
 
-        btree_find_all_for_ino(root_tree, ino, BESALT_EXTENT_DATA, |key, data_ptr, _size| {
+        btree_find_all_for_ino(root_tree, ino, TRONA_EXTENT_DATA, |key, data_ptr, _size| {
             let ext = unsafe { read_extent_data(data_ptr) };
             if ext.extent_type == EXTENT_REGULAR && key.offset >= new_size {
                 if ext_count < 128 {
@@ -1672,7 +1672,7 @@ pub(crate) fn handle_truncate_fs(msg: &BesaltMsg) -> BesaltMsg {
             }
             let ext_key = BTreeKey {
                 object_id: ino,
-                item_type: BESALT_EXTENT_DATA,
+                item_type: TRONA_EXTENT_DATA,
                 offset: ext_offsets[i],
             };
             btree_cow_delete(&ext_key);
@@ -1686,22 +1686,22 @@ pub(crate) fn handle_truncate_fs(msg: &BesaltMsg) -> BesaltMsg {
     updated.blocks = if new_size == 0 { 0 } else { (new_size + bs - 1) / bs };
     updated.mtime = unsafe { (*(&raw const SB)).generation + 1 };
     if !btree_cow_update(&inode_key, &inode_to_bytes(&updated)) {
-        reply.label = BESALT_OUT_OF_MEMORY;
+        reply.label = TRONA_OUT_OF_MEMORY;
         return reply;
     }
 
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
     reply
 }
 
 /// Handle SALTYFS_SHM_SETUP: map a VFS-shared SHM region for bulk data transport.
 /// MR0 = SHM ID to map
-pub(crate) fn handle_shm_setup(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_shm_setup(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
     let shm_id = msg.regs[0];
 
     let ctx = crate::ipc_ctx();
-    let mut mm_msg = BesaltMsg::zeroed();
+    let mut mm_msg = TronaMsg::zeroed();
     mm_msg.label = MM_SHM_MAP;
     mm_msg.length = 4;
     mm_msg.regs[0] = shm_id;
@@ -1709,35 +1709,35 @@ pub(crate) fn handle_shm_setup(msg: &BesaltMsg) -> BesaltMsg {
     mm_msg.regs[2] = VFS_SHM_VADDR;
     mm_msg.regs[3] = 0x3; // RW
 
-    let mut mm_reply = BesaltMsg::zeroed();
+    let mut mm_reply = TronaMsg::zeroed();
     let err = unsafe {
-        besalt::ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const mm_msg, &raw mut mm_reply)
+        trona::ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const mm_msg, &raw mut mm_reply)
     };
     if err != 0 || mm_reply.label != 0 {
-        besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] VFS SHM map failed\n"); });
-        reply.label = BESALT_INVALID_OPERATION;
+        trona::uerror!(|_lb| { _lb.str(b"[saltyfs] VFS SHM map failed\n"); });
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
     unsafe { *(&raw mut crate::VFS_SHM_MAPPED) = true; }
-    besalt::uinfo!(|_lb| { _lb.str(b"[saltyfs] VFS SHM mapped for bulk transport\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[saltyfs] VFS SHM mapped for bulk transport\n"); });
 
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
     reply
 }
 
 /// Handle SALTYFS_WRITE: SHM-based write for bulk data transport.
 /// MR0 = ino, MR1 = offset, MR2 = count, MR3 = shm_offset
 /// Data is read from VFS SHM at shm_offset.
-pub(crate) fn handle_write_shm(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_write_shm(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
     if !unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
     if !unsafe { *(&raw const crate::VFS_SHM_MAPPED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
@@ -1749,14 +1749,14 @@ pub(crate) fn handle_write_shm(msg: &BesaltMsg) -> BesaltMsg {
     // Validate SHM bounds
     let shm_size = VFS_SHM_PAGES * 4096;
     if shm_offset >= shm_size || count > shm_size - shm_offset {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
     let inode = match get_inode(ino) {
         Some(i) => i,
         None => {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
             return reply;
         }
     };
@@ -1773,7 +1773,7 @@ pub(crate) fn handle_write_shm(msg: &BesaltMsg) -> BesaltMsg {
     // Delete any existing inline extent and promote to regular
     let inline_key = BTreeKey {
         object_id: ino,
-        item_type: BESALT_EXTENT_DATA,
+        item_type: TRONA_EXTENT_DATA,
         offset: 0,
     };
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
@@ -1784,7 +1784,7 @@ pub(crate) fn handle_write_shm(msg: &BesaltMsg) -> BesaltMsg {
             let promo_block = match alloc_block() {
                 Some(b) => b,
                 None => {
-                    reply.label = BESALT_OUT_OF_MEMORY;
+                    reply.label = TRONA_OUT_OF_MEMORY;
                     return reply;
                 }
             };
@@ -1797,19 +1797,19 @@ pub(crate) fn handle_write_shm(msg: &BesaltMsg) -> BesaltMsg {
             }
             if !write_block(promo_block, promo_buf.as_ptr()) {
                 free_block(promo_block);
-                reply.label = BESALT_OUT_OF_MEMORY;
+                reply.label = TRONA_OUT_OF_MEMORY;
                 return reply;
             }
             if !btree_cow_delete(&inline_key) {
                 free_block(promo_block);
-                reply.label = BESALT_OUT_OF_MEMORY;
+                reply.label = TRONA_OUT_OF_MEMORY;
                 return reply;
             }
             let mut ext_buf = [0u8; 304];
             build_extent_regular(&mut ext_buf, bs, promo_block * bs, bs, 0, bs);
             if !btree_cow_insert(&inline_key, &ext_buf[..ext_hdr_size]) {
                 free_block(promo_block);
-                reply.label = BESALT_OUT_OF_MEMORY;
+                reply.label = TRONA_OUT_OF_MEMORY;
                 return reply;
             }
             bitmap_flush();
@@ -1824,7 +1824,7 @@ pub(crate) fn handle_write_shm(msg: &BesaltMsg) -> BesaltMsg {
     while block_off < write_end {
         let extent_key = BTreeKey {
             object_id: ino,
-            item_type: BESALT_EXTENT_DATA,
+            item_type: TRONA_EXTENT_DATA,
             offset: block_off,
         };
 
@@ -1870,13 +1870,13 @@ pub(crate) fn handle_write_shm(msg: &BesaltMsg) -> BesaltMsg {
         let data_block = match alloc_block() {
             Some(b) => b,
             None => {
-                reply.label = BESALT_OUT_OF_MEMORY;
+                reply.label = TRONA_OUT_OF_MEMORY;
                 return reply;
             }
         };
         if !write_block(data_block, block_buf.as_ptr()) {
             free_block(data_block);
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return reply;
         }
 
@@ -1890,7 +1890,7 @@ pub(crate) fn handle_write_shm(msg: &BesaltMsg) -> BesaltMsg {
         };
         if !ok {
             free_block(data_block);
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return reply;
         }
 
@@ -1910,15 +1910,15 @@ pub(crate) fn handle_write_shm(msg: &BesaltMsg) -> BesaltMsg {
     updated_inode.mtime = unsafe { (*(&raw const SB)).generation + 1 };
     let inode_key = BTreeKey {
         object_id: ino,
-        item_type: BESALT_INODE_ITEM,
+        item_type: TRONA_INODE_ITEM,
         offset: 0,
     };
     if !btree_cow_update(&inode_key, &inode_to_bytes(&updated_inode)) {
-        reply.label = BESALT_OUT_OF_MEMORY;
+        reply.label = TRONA_OUT_OF_MEMORY;
         return reply;
     }
 
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
     reply.length = 1;
     reply.regs[0] = count;
     reply
@@ -1931,10 +1931,10 @@ pub(crate) fn handle_write_shm(msg: &BesaltMsg) -> BesaltMsg {
 /// Handle SALTYFS_SYMLINK: create a symbolic link.
 /// MR0=parent_ino, MR1=link_name_len (max 72), MR2=target_len (max 64),
 /// MR3..MR11=link_name (72 bytes), MR12..MR19=target (64 bytes)
-pub(crate) fn handle_symlink(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_symlink(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
     if !unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
@@ -1943,7 +1943,7 @@ pub(crate) fn handle_symlink(msg: &BesaltMsg) -> BesaltMsg {
     let target_len = msg.regs[2] as usize;
 
     if name_len == 0 || name_len > 72 || target_len == 0 || target_len > 64 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
@@ -1969,18 +1969,18 @@ pub(crate) fn handle_symlink(msg: &BesaltMsg) -> BesaltMsg {
     let parent_inode = match get_inode(parent_ino) {
         Some(i) => i,
         None => {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
             return reply;
         }
     };
     if parent_inode.mode & 0o170000 != 0o040000 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
     // Check name doesn't already exist
     if lookup_in_dir(parent_ino, name_buf.as_ptr(), name_len as u8).is_some() {
-        reply.label = BESALT_ALREADY_EXISTS;
+        reply.label = TRONA_ALREADY_EXISTS;
         return reply;
     }
 
@@ -1995,11 +1995,11 @@ pub(crate) fn handle_symlink(msg: &BesaltMsg) -> BesaltMsg {
     let inode_data = build_inode_bytes(target_len as u64, 0, 1, 0o120000 | 0o777);
     let inode_key = BTreeKey {
         object_id: new_ino,
-        item_type: BESALT_INODE_ITEM,
+        item_type: TRONA_INODE_ITEM,
         offset: 0,
     };
     if !btree_cow_insert(&inode_key, &inode_data) {
-        reply.label = BESALT_OUT_OF_MEMORY;
+        reply.label = TRONA_OUT_OF_MEMORY;
         return reply;
     }
 
@@ -2009,11 +2009,11 @@ pub(crate) fn handle_symlink(msg: &BesaltMsg) -> BesaltMsg {
     let ext_size = core::mem::size_of::<ExtentData>() + target_len;
     let extent_key = BTreeKey {
         object_id: new_ino,
-        item_type: BESALT_EXTENT_DATA,
+        item_type: TRONA_EXTENT_DATA,
         offset: 0,
     };
     if !btree_cow_insert(&extent_key, &ext_buf[..ext_size]) {
-        reply.label = BESALT_OUT_OF_MEMORY;
+        reply.label = TRONA_OUT_OF_MEMORY;
         return reply;
     }
 
@@ -2023,20 +2023,20 @@ pub(crate) fn handle_symlink(msg: &BesaltMsg) -> BesaltMsg {
             delete_all_extents(new_ino);
             bitmap_flush();
             if !btree_cow_delete(&inode_key) {
-                besalt::uwarn!(|_lb| { _lb.str(b"[saltyfs] WARN: symlink rollback inode delete failed\n"); });
+                trona::uwarn!(|_lb| { _lb.str(b"[saltyfs] WARN: symlink rollback inode delete failed\n"); });
             }
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return reply;
         }
         Err(DirEntryTxnError::FailedDirty) => {
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return reply;
         }
     }
 
     update_inode_mtime(parent_ino);
 
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
     reply.length = 1;
     reply.regs[0] = new_ino;
     reply
@@ -2044,10 +2044,10 @@ pub(crate) fn handle_symlink(msg: &BesaltMsg) -> BesaltMsg {
 
 /// Handle SALTYFS_READLINK: read a symlink target.
 /// MR0=ino -> MR0=target_len, MR1..MR19=target_data (up to 152 bytes)
-pub(crate) fn handle_readlink(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_readlink(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
     if !unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
@@ -2057,12 +2057,12 @@ pub(crate) fn handle_readlink(msg: &BesaltMsg) -> BesaltMsg {
     let inode = match get_inode(ino) {
         Some(i) => i,
         None => {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
             return reply;
         }
     };
     if inode.mode & 0o170000 != 0o120000 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
@@ -2070,26 +2070,26 @@ pub(crate) fn handle_readlink(msg: &BesaltMsg) -> BesaltMsg {
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
     let extent_key = BTreeKey {
         object_id: ino,
-        item_type: BESALT_EXTENT_DATA,
+        item_type: TRONA_EXTENT_DATA,
         offset: 0,
     };
     let (data_ptr, data_size) = match btree_find_item(root_tree, &extent_key) {
         Some((d, s)) => (d, s),
         None => {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
             return reply;
         }
     };
 
     let ext_hdr_size = core::mem::size_of::<ExtentData>();
     if (data_size as usize) < ext_hdr_size {
-        reply.label = BESALT_NOT_FOUND;
+        reply.label = TRONA_NOT_FOUND;
         return reply;
     }
 
     let ext = unsafe { core::ptr::read_unaligned(data_ptr as *const ExtentData) };
     if ext.extent_type != EXTENT_INLINE {
-        reply.label = BESALT_NOT_FOUND;
+        reply.label = TRONA_NOT_FOUND;
         return reply;
     }
 
@@ -2099,7 +2099,7 @@ pub(crate) fn handle_readlink(msg: &BesaltMsg) -> BesaltMsg {
     let copy_len = core::cmp::min(copy_len, 152); // max IPC register space
 
     // Pack target into reply registers MR1..MR19
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
     reply.regs[0] = copy_len as u64;
     unsafe {
         let src = (data_ptr as *const u8).add(ext_hdr_size);
@@ -2115,10 +2115,10 @@ pub(crate) fn handle_readlink(msg: &BesaltMsg) -> BesaltMsg {
 /// Handle SALTYFS_LINK: create a hard link.
 /// MR0=existing_ino, MR1=new_parent_ino, MR2=name_len (max 136),
 /// MR3..MR19=name (136 bytes)
-pub(crate) fn handle_link(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_link(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
     if !unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
@@ -2127,7 +2127,7 @@ pub(crate) fn handle_link(msg: &BesaltMsg) -> BesaltMsg {
     let name_len = msg.regs[2] as usize;
 
     if name_len == 0 || name_len > 136 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
@@ -2144,12 +2144,12 @@ pub(crate) fn handle_link(msg: &BesaltMsg) -> BesaltMsg {
     let inode = match get_inode(existing_ino) {
         Some(i) => i,
         None => {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
             return reply;
         }
     };
     if inode.mode & 0o170000 == 0o040000 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
@@ -2157,18 +2157,18 @@ pub(crate) fn handle_link(msg: &BesaltMsg) -> BesaltMsg {
     let parent_inode = match get_inode(new_parent) {
         Some(i) => i,
         None => {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
             return reply;
         }
     };
     if parent_inode.mode & 0o170000 != 0o040000 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
     // Check name doesn't already exist in parent
     if lookup_in_dir(new_parent, name_buf.as_ptr(), name_len as u8).is_some() {
-        reply.label = BESALT_ALREADY_EXISTS;
+        reply.label = TRONA_ALREADY_EXISTS;
         return reply;
     }
 
@@ -2176,7 +2176,7 @@ pub(crate) fn handle_link(msg: &BesaltMsg) -> BesaltMsg {
     match dir_entry_insert_with_ref(new_parent, existing_ino, &name_buf[..name_len], dir_type) {
         Ok(()) => {}
         Err(DirEntryTxnError::FailedClean) | Err(DirEntryTxnError::FailedDirty) => {
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return reply;
         }
     }
@@ -2187,49 +2187,49 @@ pub(crate) fn handle_link(msg: &BesaltMsg) -> BesaltMsg {
     updated_inode.ctime = unsafe { (*(&raw const SB)).generation + 1 };
     let inode_key = BTreeKey {
         object_id: existing_ino,
-        item_type: BESALT_INODE_ITEM,
+        item_type: TRONA_INODE_ITEM,
         offset: 0,
     };
     if !btree_cow_update(&inode_key, &inode_to_bytes(&updated_inode)) {
         if dir_entry_remove_with_ref(new_parent, existing_ino, &name_buf[..name_len]).is_err() {
-            besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] CRIT: link rollback (remove dir+ref) failed\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[saltyfs] CRIT: link rollback (remove dir+ref) failed\n"); });
         }
-        reply.label = BESALT_OUT_OF_MEMORY;
+        reply.label = TRONA_OUT_OF_MEMORY;
         return reply;
     }
 
     update_inode_mtime(new_parent);
 
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
     reply.length = 1;
     reply.regs[0] = existing_ino;
     reply
 }
 
 /// Handle SALTYFS_GETPARENT: return the parent inode of a given child inode.
-/// Protocol: MR0 = child_ino → reply label = BESALT_OK, MR0 = parent_ino on success;
-/// label = BESALT_NOT_FOUND when no INODE_REF exists for the child (root or orphan).
-pub(crate) fn handle_getparent(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+/// Protocol: MR0 = child_ino → reply label = TRONA_OK, MR0 = parent_ino on success;
+/// label = TRONA_NOT_FOUND when no INODE_REF exists for the child (root or orphan).
+pub(crate) fn handle_getparent(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
     if !unsafe { *(&raw const MOUNTED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
     let child_ino = msg.regs[0];
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
     let mut parent_ino: u64 = 0;
     let mut found = false;
-    btree_find_all_for_ino(root_tree, child_ino, BESALT_INODE_REF, |key, _, _| {
+    btree_find_all_for_ino(root_tree, child_ino, TRONA_INODE_REF, |key, _, _| {
         parent_ino = key.offset; // offset = parent_ino stored when inserting INODE_REF
         found = true;
         false // stop after first match
     });
     if found {
-        reply.label = BESALT_OK;
+        reply.label = TRONA_OK;
         reply.length = 1;
         reply.regs[0] = parent_ino;
     } else {
-        reply.label = BESALT_NOT_FOUND;
+        reply.label = TRONA_NOT_FOUND;
     }
     reply
 }

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! VirtIO block device transport layer.
 
-use besalt::consts::*;
-use besalt::ipc;
-use besalt::invoke;
-use besalt::types::*;
+use trona::consts::*;
+use trona::ipc;
+use trona::invoke;
+use trona::types::*;
 
 use crate::ipc_ctx;
 use crate::{CAPACITY_SECTORS, BAR0_IS_IO, PCI_IOPORT_CAP, VIRTIO_INITIALIZED, VQUEUE_BASE};
@@ -192,13 +192,13 @@ pub(crate) fn bar_write32(offset: u64, val: u32) {
 
 /// Query pcisrv for virtio-blk device.
 pub(crate) fn find_virtio_blk() -> Option<(u8, u8, u8, u32, u64)> {
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = PCI_FIND_DEVICE;
     msg.length = 2;
     msg.regs[0] = VIRTIO_VENDOR as u64;
     msg.regs[1] = VIRTIO_BLK_DEVICE as u64;
 
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
@@ -214,7 +214,7 @@ pub(crate) fn find_virtio_blk() -> Option<(u8, u8, u8, u32, u64)> {
 
 /// Get BAR/IRQ info from pcisrv. Returns (bar_base, bar_bits, bar_size, irq, bar_is_io).
 pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u32, u8, bool)> {
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = PCI_GET_CAPS;
     msg.length = 3;
     msg.regs[0] = bus as u64;
@@ -226,7 +226,7 @@ pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u
         ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_RECEIVED_IOPORT, 0);
     }
 
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
@@ -251,7 +251,7 @@ pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u
 pub(crate) fn init_virtio(bar0_raw: u32, bar_size: u32) -> bool {
     unsafe {
         if bar0_raw == 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] Invalid BAR0 (0)\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[blkdrv] Invalid BAR0 (0)\n"); });
             return false;
         }
         *(&raw mut BAR0_IS_IO) = (bar0_raw & 1) != 0;
@@ -259,17 +259,17 @@ pub(crate) fn init_virtio(bar0_raw: u32, bar_size: u32) -> bool {
         if *(&raw const BAR0_IS_IO) {
             let cap = *(&raw const PCI_IOPORT_CAP);
             if cap == 0 {
-                besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] BAR0 is I/O space -- no IoPort cap available\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[blkdrv] BAR0 is I/O space -- no IoPort cap available\n"); });
                 return false;
             }
-            besalt::uinfo!(|_lb| { _lb.str(b"[blkdrv] BAR0 is I/O space -- using IoPort cap\n"); });
+            trona::uinfo!(|_lb| { _lb.str(b"[blkdrv] BAR0 is I/O space -- using IoPort cap\n"); });
             return virtio_negotiate();
         }
 
         // MMIO BAR: map device untyped into our VSpace
         let num_pages = ((bar_size as u64) + 4095) / 4096;
         if num_pages == 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] Invalid MMIO BAR size\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[blkdrv] Invalid MMIO BAR size\n"); });
             return false;
         }
         let (err, _mapped) = invoke::vspace_map_device_range(
@@ -281,10 +281,10 @@ pub(crate) fn init_virtio(bar0_raw: u32, bar_size: u32) -> bool {
             0x3, // RW
         );
         if err != 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] MMIO BAR mapping failed\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[blkdrv] MMIO BAR mapping failed\n"); });
             return false;
         }
-        besalt::uinfo!(|_lb| { _lb.str(b"[blkdrv] BAR0 MMIO mapped\n"); });
+        trona::uinfo!(|_lb| { _lb.str(b"[blkdrv] BAR0 MMIO mapped\n"); });
         virtio_negotiate()
     }
 }
@@ -318,7 +318,7 @@ fn virtio_negotiate() -> bool {
         *(&raw mut CAPACITY_SECTORS) = ((cap_hi as u64) << 32) | (cap_lo as u64);
     }
 
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[blkdrv] Capacity: ");
         _lb.dec(unsafe { *(&raw const CAPACITY_SECTORS) });
         _lb.str(b" sectors (");
@@ -330,19 +330,19 @@ fn virtio_negotiate() -> bool {
     bar_write16(VIRTIO_QUEUE_SELECT, 0);
     let qsize = bar_read16(VIRTIO_QUEUE_SIZE);
     if qsize == 0 {
-        besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] Queue 0 unavailable\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[blkdrv] Queue 0 unavailable\n"); });
         return false;
     }
     let event_idx = (negotiated_features & VIRTIO_RING_F_EVENT_IDX) != 0;
     let layout = match virtq_layout(qsize, event_idx) {
         Some(v) => v,
         None => {
-            besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] Invalid virtqueue size/layout\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[blkdrv] Invalid virtqueue size/layout\n"); });
             return false;
         }
     };
 
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[blkdrv] Queue 0 size: ");
         _lb.dec(qsize as u64);
         _lb.putc(b'\n');
@@ -358,17 +358,17 @@ fn virtio_negotiate() -> bool {
     let vq_bytes = layout.total_bytes;
     let vq_pages = (vq_bytes + 4095) / 4096;
     let ctx = ipc_ctx();
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = MM_MMAP;
     msg.length = 4;
     msg.regs[0] = VQUEUE_HINT_VADDR;
     msg.regs[1] = vq_pages * 4096;
     msg.regs[2] = 0x3; // PROT_READ | PROT_WRITE
     msg.regs[3] = 0x22; // MAP_PRIVATE | MAP_ANONYMOUS
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
-        besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] Failed to allocate virtqueue memory\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[blkdrv] Failed to allocate virtqueue memory\n"); });
         return false;
     }
     let vq_base = reply.regs[0];
@@ -385,7 +385,7 @@ fn virtio_negotiate() -> bool {
     // Get physical address of virtqueue page
     let vq_phys = vaddr_to_phys(vq_base);
     if vq_phys == 0 {
-        besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] Failed to get virtqueue phys addr\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[blkdrv] Failed to get virtqueue phys addr\n"); });
         return false;
     }
 
@@ -400,7 +400,7 @@ fn virtio_negotiate() -> bool {
         let avail_base = (vq_base + layout.avail_off) as *mut u16;
         core::ptr::write_volatile(avail_base, VIRTQ_AVAIL_F_NO_INTERRUPT);
     }
-    besalt::udebug!(|_lb| { _lb.str(b"[blkdrv] Queue interrupts suppressed (polling mode)\n"); });
+    trona::udebug!(|_lb| { _lb.str(b"[blkdrv] Queue interrupts suppressed (polling mode)\n"); });
 
     // Now set DRIVER_OK
     bar_write8(
@@ -409,6 +409,6 @@ fn virtio_negotiate() -> bool {
     );
 
     unsafe { *(&raw mut VIRTIO_INITIALIZED) = true; }
-    besalt::uinfo!(|_lb| { _lb.str(b"[blkdrv] virtio initialized OK\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[blkdrv] virtio initialized OK\n"); });
     true
 }

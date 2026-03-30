@@ -1,7 +1,7 @@
 //! POSIX interval timers owned by procmgr.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::types::BesaltMsg;
+use trona::types::TronaMsg;
 
 use crate::proc_table::{find_by_badge, proctab, proctab_cap, PROC_RUNNING, PROC_STOPPED};
 
@@ -10,9 +10,9 @@ const USEC_PER_SEC: u64 = 1_000_000;
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 
 fn clock_realtime_ns() -> u64 {
-    let now = besalt::syscall::syscall(
-        besalt::SYS_CLOCK_GETTIME,
-        besalt::consts::CLOCK_REALTIME as u64,
+    let now = trona::syscall::syscall(
+        trona::SYS_CLOCK_GETTIME,
+        trona::consts::CLOCK_REALTIME as u64,
         0,
         0,
         0,
@@ -122,15 +122,15 @@ pub(crate) fn process_expired_timers() {
     }
 }
 
-pub(crate) unsafe fn handle_setitimer(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_setitimer(msg: &TronaMsg, reply: &mut TronaMsg, badge: u64) {
     unsafe {
         if msg.regs[0] != ITIMER_REAL {
-            reply.label = crate::BESALT_INVALID_ARGUMENT;
+            reply.label = crate::TRONA_INVALID_ARGUMENT;
             return;
         }
 
         let Some(idx) = find_by_badge(badge) else {
-            reply.label = crate::BESALT_NOT_FOUND;
+            reply.label = crate::TRONA_NOT_FOUND;
             return;
         };
 
@@ -140,11 +140,11 @@ pub(crate) unsafe fn handle_setitimer(msg: &BesaltMsg, reply: &mut BesaltMsg, ba
         let interval_usec = msg.regs[4];
 
         let Some(value_ns) = timeval_to_ns(value_sec, value_usec) else {
-            reply.label = crate::BESALT_INVALID_ARGUMENT;
+            reply.label = crate::TRONA_INVALID_ARGUMENT;
             return;
         };
         let Some(interval_ns) = timeval_to_ns(interval_sec, interval_usec) else {
-            reply.label = crate::BESALT_INVALID_ARGUMENT;
+            reply.label = crate::TRONA_INVALID_ARGUMENT;
             return;
         };
 
@@ -156,7 +156,7 @@ pub(crate) unsafe fn handle_setitimer(msg: &BesaltMsg, reply: &mut BesaltMsg, ba
         };
 
         if value_ns != 0 && now_ns == 0 {
-            reply.label = crate::BESALT_INVALID_OPERATION;
+            reply.label = crate::TRONA_INVALID_OPERATION;
             return;
         }
 
@@ -167,7 +167,7 @@ pub(crate) unsafe fn handle_setitimer(msg: &BesaltMsg, reply: &mut BesaltMsg, ba
             now_ns.saturating_add(value_ns)
         };
 
-        reply.label = crate::BESALT_OK;
+        reply.label = crate::TRONA_OK;
         reply.length = 4;
         reply.regs[0] = old_value_sec;
         reply.regs[1] = old_value_usec;
@@ -176,15 +176,15 @@ pub(crate) unsafe fn handle_setitimer(msg: &BesaltMsg, reply: &mut BesaltMsg, ba
     }
 }
 
-pub(crate) unsafe fn handle_getitimer(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_getitimer(msg: &TronaMsg, reply: &mut TronaMsg, badge: u64) {
     unsafe {
         if msg.regs[0] != ITIMER_REAL {
-            reply.label = crate::BESALT_INVALID_ARGUMENT;
+            reply.label = crate::TRONA_INVALID_ARGUMENT;
             return;
         }
 
         let Some(idx) = find_by_badge(badge) else {
-            reply.label = crate::BESALT_NOT_FOUND;
+            reply.label = crate::TRONA_NOT_FOUND;
             return;
         };
 
@@ -195,7 +195,7 @@ pub(crate) unsafe fn handle_getitimer(msg: &BesaltMsg, reply: &mut BesaltMsg, ba
             current_timer_value(idx, now_ns)
         };
 
-        reply.label = crate::BESALT_OK;
+        reply.label = crate::TRONA_OK;
         reply.length = 4;
         reply.regs[0] = value_sec;
         reply.regs[1] = value_usec;

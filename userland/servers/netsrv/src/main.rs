@@ -23,15 +23,16 @@
 #![no_std]
 #![no_main]
 
-extern crate besalt;
+extern crate trona;
+extern crate trona_posix;
 
 mod net;
 
-use besalt::consts::*;
-use besalt::invoke;
-use besalt::ipc;
-use besalt::serial;
-use besalt::types::*;
+use trona::consts::*;
+use trona::invoke;
+use trona::ipc;
+use trona::serial;
+use trona::types::*;
 
 // ---------------------------------------------------------------------------
 // Capability slot layout
@@ -93,7 +94,7 @@ pub(crate) fn puts(s: &[u8]) {
 }
 
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
-    besalt::tls::current_ipc_ctx()
+    trona_posix::tls::current_ipc_ctx()
 }
 
 pub(crate) fn mac_addr() -> [u8; 6] {
@@ -102,10 +103,10 @@ pub(crate) fn mac_addr() -> [u8; 6] {
 }
 
 fn signal_ready() {
-    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
-fn log_ipv4(lb: &mut besalt::serial::LineBuf, ip: u32) {
+fn log_ipv4(lb: &mut trona::serial::LineBuf, ip: u32) {
     lb.dec(((ip >> 24) & 0xFF) as u64);
     lb.putc(b'.');
     lb.dec(((ip >> 16) & 0xFF) as u64);
@@ -117,7 +118,7 @@ fn log_ipv4(lb: &mut besalt::serial::LineBuf, ip: u32) {
 
 fn log_network_config(prefix: &[u8]) {
     let cfg = net::config::snapshot();
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(prefix);
         _lb.str(b" IP=");
         log_ipv4(&mut _lb, cfg.our_ip);
@@ -138,7 +139,7 @@ fn log_inet_ipc(op: &[u8], conn_id: u32, ip: u32, port: u16, len: usize) {
         }
         *(&raw mut LOGGED_INET_IPC) += 1;
     }
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(b"[netsrv] ipc ");
         _lb.str(op);
         _lb.str(b" conn=");
@@ -164,7 +165,7 @@ fn log_inet_recv_result(op: &[u8], conn_id: u32, src_ip: u32, len: usize, data: 
         }
         *(&raw mut LOGGED_INET_RECV_RESULTS) += 1;
     }
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(b"[netsrv] ipc ");
         _lb.str(op);
         _lb.str(b" conn=");
@@ -194,7 +195,7 @@ fn log_frame_once(frame: &[u8]) {
         return;
     }
     let ethertype = ((frame[12] as u16) << 8) | (frame[13] as u16);
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(b"[netsrv] RX frame len=");
         _lb.dec(frame.len() as u64);
         _lb.str(b" ethertype=");
@@ -204,7 +205,7 @@ fn log_frame_once(frame: &[u8]) {
 }
 
 fn log_ipv4_packet(hdr: &net::proto::ipv4::Ipv4Header, payload_len: usize) {
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(b"[netsrv] IPv4 src=");
         log_ipv4(&mut _lb, hdr.src);
         _lb.str(b" dst=");
@@ -220,7 +221,7 @@ fn log_ipv4_packet(hdr: &net::proto::ipv4::Ipv4Header, payload_len: usize) {
 fn bootstrap_network_config() {
     net::config::init(mac_addr());
 
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[netsrv] DHCP bootstrap starting\n");
     });
 
@@ -238,7 +239,7 @@ fn bootstrap_network_config() {
             if net::dns::clock_monotonic_ns().saturating_sub(start_ns) >= DHCP_BOOTSTRAP_TIMEOUT_NS {
                 break;
             }
-            let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+            let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
         }
     }
 
@@ -248,7 +249,7 @@ fn bootstrap_network_config() {
         if dhcp_started && net::dhcp::is_finished() {
             let _ = net::dhcp::start();
         }
-        besalt::uwarn!(|_lb| {
+        trona::uwarn!(|_lb| {
             _lb.str(b"[netsrv] DHCP bootstrap incomplete, continuing without a fallback config\n");
         });
     }
@@ -281,7 +282,7 @@ pub(crate) fn shm_tx_enqueue(frame: &[u8]) -> bool {
             let next = (tx_head + 1) % slot_count;
             if next == tx_tail {
                 signal_netdrv_tx();
-                let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+                let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
                 continue;
             }
 
@@ -305,7 +306,7 @@ pub(crate) fn shm_tx_enqueue(frame: &[u8]) -> bool {
 /// We pass TX_BADGE via the `bits` argument so netdrv sees badge & 0x2 != 0
 /// in its event loop (kernel computes: notification.signal(cap.badge | bits)).
 pub(crate) fn signal_netdrv_tx() {
-    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_TX_NOTIFICATION, TX_BADGE, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_TX_NOTIFICATION, TX_BADGE, 0, 0, 0, 0);
 }
 
 /// Read a frame from the SHM RX ring. Returns the frame length on success.
@@ -350,16 +351,16 @@ fn setup_shm() -> bool {
     let ctx = ipc_ctx();
 
     // Create SHM
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = MM_SHM_CREATE;
     msg.regs[0] = NET_SHM_ID;
     msg.regs[1] = NET_SHM_PAGES;
     msg.length = 2;
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
-    if err != 0 || (reply.label != BESALT_OK && reply.label != BESALT_ALREADY_EXISTS) {
-        besalt::uerror!(|_lb| {
+    if err != 0 || (reply.label != TRONA_OK && reply.label != TRONA_ALREADY_EXISTS) {
+        trona::uerror!(|_lb| {
             _lb.str(b"[netsrv] SHM create failed: ");
             _lb.dec(if err != 0 { err as u64 } else { reply.label });
             _lb.putc(b'\n');
@@ -368,18 +369,18 @@ fn setup_shm() -> bool {
     }
 
     // Map SHM
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = MM_SHM_MAP;
     msg.regs[0] = NET_SHM_ID;
     msg.regs[1] = 0;
     msg.regs[2] = SHM_VADDR;
     msg.regs[3] = 0x3; // RW
     msg.length = 4;
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
-    if err != 0 || reply.label != BESALT_OK {
-        besalt::uerror!(|_lb| {
+    if err != 0 || reply.label != TRONA_OK {
+        trona::uerror!(|_lb| {
             _lb.str(b"[netsrv] SHM map failed: ");
             _lb.dec(if err != 0 { err as u64 } else { reply.label });
             _lb.putc(b'\n');
@@ -400,7 +401,7 @@ fn setup_shm() -> bool {
         *hdr.add(5) = SHM_TX_SLOT_COUNT as u32;
     }
 
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[netsrv] SHM allocated and mapped\n");
     });
     true
@@ -418,16 +419,16 @@ fn setup_notification() -> bool {
     unsafe {
         ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_RX_NOTIFICATION, 0);
     }
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = MM_ALLOC_OBJECT;
     msg.regs[0] = OBJ_NOTIFICATION;
     msg.regs[1] = 0;
     msg.length = 2;
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
-    if err != 0 || reply.label != BESALT_OK {
-        besalt::uerror!(|_lb| {
+    if err != 0 || reply.label != TRONA_OK {
+        trona::uerror!(|_lb| {
             _lb.str(b"[netsrv] Failed to allocate notification: ");
             _lb.dec(if err != 0 { err as u64 } else { reply.label });
             _lb.putc(b'\n');
@@ -438,7 +439,7 @@ fn setup_notification() -> bool {
     // Bind notification to our TCB
     let err = invoke::tcb_bind_notification(CAP_SELF_TCB, CAP_RX_NOTIFICATION);
     if err != 0 {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[netsrv] Failed to bind notification to TCB: ");
             _lb.dec(err as u64);
             _lb.putc(b'\n');
@@ -446,7 +447,7 @@ fn setup_notification() -> bool {
         return false;
     }
 
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[netsrv] Notification allocated and bound\n");
     });
     true
@@ -470,22 +471,22 @@ fn driver_register() -> bool {
         ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_TX_NOTIFICATION, 0);
     }
 
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = DRIVER_REGISTER; // 0xC0
     msg.regs[0] = NET_SHM_ID;
     msg.length = 1;
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to netdrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_NETDRV_EP, &raw const msg, &raw mut reply) };
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(b"[netsrv] DRIVER_REGISTER call result=");
         _lb.dec(err as u64);
         _lb.str(b" label=");
         _lb.dec(reply.label);
         _lb.putc(b'\n');
     });
-    if err != 0 || reply.label != BESALT_OK {
-        besalt::uerror!(|_lb| {
+    if err != 0 || reply.label != TRONA_OK {
+        trona::uerror!(|_lb| {
             _lb.str(b"[netsrv] DRIVER_REGISTER failed: ");
             _lb.dec(if err != 0 { err as u64 } else { reply.label });
             _lb.putc(b'\n');
@@ -507,7 +508,7 @@ fn driver_register() -> bool {
         (*mac)[5] = mac_hi as u8;
     }
 
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[netsrv] Registered with netdrv, MAC=");
         let mac = mac_addr();
         let mut i = 0;
@@ -529,7 +530,7 @@ fn driver_register() -> bool {
 
 fn register_nameserv() {
     let name = b"netsrv";
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = POSIX_NS_REGISTER;
     msg.regs[0] = name.len() as u64;
     msg.length = 1 + (name.len() as u64 + 7) / 8;
@@ -542,15 +543,15 @@ fn register_nameserv() {
             i += 1;
         }
         ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         let err = ipc::call_ctx(
             ipc_ctx(),
             CAP_NAMESERV_EP,
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != BESALT_OK {
-            besalt::uerror!(|_lb| {
+        if err != 0 || reply.label != TRONA_OK {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[netsrv] nameserv registration failed\n");
             });
         }
@@ -597,7 +598,7 @@ fn process_packet(data: &[u8]) {
             _ => unsafe {
                 if !*(&raw const LOGGED_UNKNOWN_ETHERTYPE) {
                     *(&raw mut LOGGED_UNKNOWN_ETHERTYPE) = true;
-                    besalt::udebug!(|_lb| {
+                    trona::udebug!(|_lb| {
                         _lb.str(b"[netsrv] unhandled ethertype=");
                         _lb.hex(eth_hdr.ethertype as u64);
                         _lb.putc(b'\n');
@@ -652,7 +653,7 @@ fn check_self_test() {
             }
 
             if net::proto::arp::lookup(gateway).is_some() {
-                besalt::udebug!(|_lb| {
+                trona::udebug!(|_lb| {
                     _lb.str(b"[netsrv] ARP reply received for gateway\n");
                 });
                 unsafe {
@@ -664,7 +665,7 @@ fn check_self_test() {
                     *(&raw mut SELF_TEST_TICKS) = ticks + 1;
                 }
                 if ticks + 1 >= 200 {
-                    besalt::uwarn!(|_lb| {
+                    trona::uwarn!(|_lb| {
                         _lb.str(b"[netsrv] ARP timeout for gateway\n");
                     });
                     // SAFETY: Single-threaded server.
@@ -706,19 +707,19 @@ fn socket_kind(conn_id: u32) -> SocketKind {
 ///
 /// All operations return immediately: synchronous operations fill `reply`
 /// with the result; asynchronous operations (connect, recv, accept) return
-/// `BESALT_PENDING` and the TCP/UDP/raw state machine will push a completion
+/// `TRONA_PENDING` and the TCP/UDP/raw state machine will push a completion
 /// later (delivered to VFS via the callback endpoint).
 ///
 /// Returns `true` if the reply is deferred (DNS async): the caller's reply
 /// cap has been saved and will be replied to later via `drain_dns_completions`.
-fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
-    fn set_send_reply(reply: &mut BesaltMsg, sent: i32) {
+fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
+    fn set_send_reply(reply: &mut TronaMsg, sent: i32) {
         if sent >= 0 {
-            reply.label = BESALT_OK;
+            reply.label = TRONA_OK;
             reply.regs[0] = sent as u64;
             reply.length = 1;
         } else {
-            besalt::udebug!(|_lb| {
+            trona::udebug!(|_lb| {
                 _lb.str(b"[netsrv] send failed label=");
                 _lb.dec((-sent) as u64);
                 _lb.putc(b'\n');
@@ -742,20 +743,20 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
                 NETSRV_CALLBACK_BADGE,
             );
             if mint_err != 0 {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[netsrv] failed to mint local callback alias err=");
                     _lb.dec(mint_err as u64);
                     _lb.putc(b'\n');
                 });
-                reply.label = BESALT_INVALID_OPERATION;
+                reply.label = TRONA_INVALID_OPERATION;
             } else {
                 unsafe {
                     *(&raw mut VFS_REGISTERED) = true;
                 }
-                besalt::uinfo!(|_lb| {
+                trona::uinfo!(|_lb| {
                     _lb.str(b"[netsrv] VFS callback EP registered\n");
                 });
-                reply.label = BESALT_OK;
+                reply.label = TRONA_OK;
             }
         }
         NET_SOCKET => {
@@ -768,18 +769,18 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
             } else if sock_type == SOCK_RAW {
                 net::socket::raw_ipv4::raw_socket(protocol as u8)
             } else {
-                -(BESALT_PROTO_NOT_SUPPORTED as i32)
+                -(TRONA_PROTO_NOT_SUPPORTED as i32)
             };
             if id >= 0 {
                 log_inet_ipc(b"socket", id as u32, 0, protocol as u16, 0);
-                reply.label = BESALT_OK;
+                reply.label = TRONA_OK;
                 reply.regs[0] = id as u64;
                 reply.length = 1;
             } else {
-                reply.label = if id == -(BESALT_PROTO_NOT_SUPPORTED as i32) {
-                    BESALT_PROTO_NOT_SUPPORTED
+                reply.label = if id == -(TRONA_PROTO_NOT_SUPPORTED as i32) {
+                    TRONA_PROTO_NOT_SUPPORTED
                 } else {
-                    BESALT_OUT_OF_MEMORY
+                    TRONA_OUT_OF_MEMORY
                 };
             }
         }
@@ -792,25 +793,25 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
                 SocketKind::Raw => {
                     let result = net::socket::raw_ipv4::raw_connect(conn_id, ip);
                     reply.label = if result == 0 {
-                        BESALT_OK
+                        TRONA_OK
                     } else {
-                        BESALT_INVALID_ARGUMENT
+                        TRONA_INVALID_ARGUMENT
                     };
                 }
                 SocketKind::Udp => {
                     let result = net::socket::udp::udp_connect(conn_id, ip, port);
                     reply.label = if result == 0 {
-                        BESALT_OK
+                        TRONA_OK
                     } else {
-                        BESALT_INVALID_ARGUMENT
+                        TRONA_INVALID_ARGUMENT
                     };
                 }
                 SocketKind::Tcp => {
                     let result = net::socket::tcp::tcp_connect(conn_id, ip, port);
                     if result == -1 {
-                        reply.label = BESALT_PENDING;
+                        reply.label = TRONA_PENDING;
                     } else {
-                        reply.label = BESALT_INVALID_ARGUMENT;
+                        reply.label = TRONA_INVALID_ARGUMENT;
                     }
                 }
             }
@@ -821,22 +822,22 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
             let port = msg.regs[2] as u16;
             match socket_kind(conn_id) {
                 SocketKind::Raw => {
-                    reply.label = BESALT_INVALID_OPERATION;
+                    reply.label = TRONA_INVALID_OPERATION;
                 }
                 SocketKind::Udp => {
                     let result = net::socket::udp::udp_bind(conn_id, ip, port);
                     reply.label = if result == 0 {
-                        BESALT_OK
+                        TRONA_OK
                     } else {
-                        BESALT_INVALID_ARGUMENT
+                        TRONA_INVALID_ARGUMENT
                     };
                 }
                 SocketKind::Tcp => {
                     let result = net::socket::tcp::tcp_bind(conn_id, ip, port);
                     reply.label = if result == 0 {
-                        BESALT_OK
+                        TRONA_OK
                     } else {
-                        BESALT_INVALID_ARGUMENT
+                        TRONA_INVALID_ARGUMENT
                     };
                 }
             }
@@ -848,13 +849,13 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
                     let backlog = msg.regs[1] as u8;
                     let result = net::socket::tcp::tcp_listen(conn_id, backlog);
                     reply.label = if result == 0 {
-                        BESALT_OK
+                        TRONA_OK
                     } else {
-                        BESALT_INVALID_ARGUMENT
+                        TRONA_INVALID_ARGUMENT
                     };
                 }
                 _ => {
-                    reply.label = BESALT_INVALID_OPERATION;
+                    reply.label = TRONA_INVALID_OPERATION;
                 }
             }
         }
@@ -866,13 +867,13 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
                     if result == -1 {
                         // No pending connections -- tell VFS this is async
                         net::socket::tcp::set_pending_accept(conn_id);
-                        reply.label = BESALT_PENDING;
+                        reply.label = TRONA_PENDING;
                     } else if result > 0 {
                         // Connection already in backlog, completed immediately
                         let new_cid = result as u32;
                         match net::socket::tcp::tcp_getpeername(new_cid) {
                             Ok((ip, port)) => {
-                                reply.label = BESALT_OK;
+                                reply.label = TRONA_OK;
                                 reply.regs[0] = new_cid as u64;
                                 reply.regs[1] = ip as u64;
                                 reply.regs[2] = port as u64;
@@ -883,11 +884,11 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
                             }
                         }
                     } else {
-                        reply.label = BESALT_INVALID_ARGUMENT;
+                        reply.label = TRONA_INVALID_ARGUMENT;
                     }
                 }
                 _ => {
-                    reply.label = BESALT_INVALID_OPERATION;
+                    reply.label = TRONA_INVALID_OPERATION;
                 }
             }
         }
@@ -934,9 +935,9 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
                         net::socket::tcp::set_pending_recv(conn_id, capped as u16);
                     }
                 }
-                reply.label = BESALT_PENDING;
+                reply.label = TRONA_PENDING;
             } else {
-                reply.label = BESALT_OK;
+                reply.label = TRONA_OK;
                 reply.regs[0] = result as u64;
                 reply.length = 1 + ((result as u64 + 7) / 8);
             }
@@ -986,10 +987,10 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
                             capped as u16,
                             flags,
                         );
-                        reply.label = BESALT_PENDING;
+                        reply.label = TRONA_PENDING;
                     } else {
                         let data_len = result as usize;
-                        reply.label = BESALT_OK;
+                        reply.label = TRONA_OK;
                         reply.regs[0] = result as u64;
                         reply.regs[1] = src_ip as u64;
                         reply.regs[2] = src_port as u64;
@@ -1009,9 +1010,9 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
                         net::socket::udp::udp_recvfrom(conn_id, buf, want_timestamp);
                     if result == -1 {
                         net::socket::udp::set_pending_recvfrom(conn_id, capped as u16, flags);
-                        reply.label = BESALT_PENDING;
+                        reply.label = TRONA_PENDING;
                     } else {
-                        reply.label = BESALT_OK;
+                        reply.label = TRONA_OK;
                         reply.regs[0] = result as u64;
                         reply.regs[1] = src_ip as u64;
                         reply.regs[2] = src_port as u64;
@@ -1020,7 +1021,7 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
                     }
                 }
                 SocketKind::Tcp => {
-                    reply.label = BESALT_INVALID_OPERATION;
+                    reply.label = TRONA_INVALID_OPERATION;
                 }
             }
         }
@@ -1031,7 +1032,7 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
                 SocketKind::Udp => { net::socket::udp::udp_close(conn_id); }
                 SocketKind::Tcp => { net::socket::tcp::tcp_close(conn_id); }
             }
-            reply.label = BESALT_OK;
+            reply.label = TRONA_OK;
         }
         NET_SHUTDOWN => {
             let conn_id = msg.regs[0] as u32;
@@ -1041,7 +1042,7 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
                 SocketKind::Udp => { net::socket::udp::udp_close(conn_id); }
                 SocketKind::Tcp => { net::socket::tcp::tcp_shutdown(conn_id, how); }
             }
-            reply.label = BESALT_OK;
+            reply.label = TRONA_OK;
         }
         NET_GETSOCKNAME => {
             let conn_id = msg.regs[0] as u32;
@@ -1050,7 +1051,7 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
                 SocketKind::Udp => net::socket::udp::udp_getsockname(conn_id),
                 SocketKind::Tcp => net::socket::tcp::tcp_getsockname(conn_id),
             };
-            reply.label = BESALT_OK;
+            reply.label = TRONA_OK;
             reply.regs[0] = ip as u64;
             reply.regs[1] = port as u64;
             reply.length = 2;
@@ -1064,7 +1065,7 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
             };
             match result {
                 Ok((ip, port)) => {
-                    reply.label = BESALT_OK;
+                    reply.label = TRONA_OK;
                     reply.regs[0] = ip as u64;
                     reply.regs[1] = port as u64;
                     reply.length = 2;
@@ -1103,7 +1104,7 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
             };
             match result {
                 Ok((value, len)) => {
-                    reply.label = BESALT_OK;
+                    reply.label = TRONA_OK;
                     reply.regs[0] = value;
                     reply.regs[1] = len as u64;
                     reply.length = 2;
@@ -1121,14 +1122,14 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
                 SocketKind::Udp => net::socket::udp::udp_poll_status(conn_id, events),
                 SocketKind::Tcp => net::socket::tcp::tcp_poll_status(conn_id, events),
             };
-            reply.label = BESALT_OK;
+            reply.label = TRONA_OK;
             reply.regs[0] = revents as u64;
             reply.length = 1;
         }
         NET_DNS_RESOLVE => {
             let hostname_len = msg.regs[0] as usize;
             if hostname_len == 0 || hostname_len > 120 {
-                reply.label = BESALT_INVALID_ARGUMENT;
+                reply.label = TRONA_INVALID_ARGUMENT;
                 return false;
             }
             // SAFETY: Reading hostname bytes from IPC message register area.
@@ -1141,7 +1142,7 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
             match net::dns::start_resolve(&hostname[..hostname_len]) {
                 Some(_) => return true, // deferred
                 None => {
-                    reply.label = BESALT_OUT_OF_MEMORY;
+                    reply.label = TRONA_OUT_OF_MEMORY;
                 }
             }
         }
@@ -1150,13 +1151,13 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
             match net::dns::start_resolve_ptr(ip) {
                 Some(_) => return true, // deferred
                 None => {
-                    reply.label = BESALT_OUT_OF_MEMORY;
+                    reply.label = TRONA_OUT_OF_MEMORY;
                 }
             }
         }
         NET_GET_CONFIG => {
             let cfg = net::config::snapshot();
-            reply.label = BESALT_OK;
+            reply.label = TRONA_OK;
             reply.regs[0] = cfg.state as u64;
             reply.regs[1] = cfg.our_ip as u64;
             reply.regs[2] = cfg.subnet_mask as u64;
@@ -1171,9 +1172,9 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
         NET_GET_ARP_ENTRY => {
             let idx = msg.regs[0] as usize;
             if idx >= 16 {
-                reply.label = BESALT_INVALID_ARGUMENT;
+                reply.label = TRONA_INVALID_ARGUMENT;
             } else if let Some((ip, mac)) = net::proto::arp::entry(idx) {
-                reply.label = BESALT_OK;
+                reply.label = TRONA_OK;
                 reply.regs[0] = 1;
                 reply.regs[1] = ip as u64;
                 reply.regs[2] = ((mac[0] as u64) << 40)
@@ -1184,13 +1185,13 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
                     | (mac[5] as u64);
                 reply.length = 3;
             } else {
-                reply.label = BESALT_OK;
+                reply.label = TRONA_OK;
                 reply.regs[0] = 0;
                 reply.length = 1;
             }
         }
         _ => {
-            reply.label = BESALT_INVALID_OPERATION;
+            reply.label = TRONA_INVALID_OPERATION;
         }
     }
     false
@@ -1199,10 +1200,10 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
 /// Map a DNS error to an IPC error label.
 fn dns_error_to_label(err: net::dns::DnsError) -> u64 {
     match err {
-        net::dns::DnsError::NxDomain => BESALT_DNS_NXDOMAIN,
-        net::dns::DnsError::ServerFail => BESALT_DNS_SERVER_FAIL,
-        net::dns::DnsError::Timeout => BESALT_TIMED_OUT,
-        net::dns::DnsError::Other => BESALT_NOT_FOUND,
+        net::dns::DnsError::NxDomain => TRONA_DNS_NXDOMAIN,
+        net::dns::DnsError::ServerFail => TRONA_DNS_SERVER_FAIL,
+        net::dns::DnsError::Timeout => TRONA_TIMED_OUT,
+        net::dns::DnsError::Other => TRONA_NOT_FOUND,
     }
 }
 
@@ -1210,11 +1211,11 @@ fn dns_error_to_label(err: net::dns::DnsError) -> u64 {
 /// caller caps.
 fn drain_dns_completions(ctx: *mut IpcContext) {
     while let Some(c) = net::dns::pop_completion() {
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         match c.query_type {
             net::dns::DnsQueryType::A => {
                 if c.success {
-                    reply.label = BESALT_OK;
+                    reply.label = TRONA_OK;
                     reply.regs[0] = c.dns_result.ip_count as u64;
                     reply.regs[1] = c.dns_result.ttl as u64;
                     let mut i = 0;
@@ -1229,7 +1230,7 @@ fn drain_dns_completions(ctx: *mut IpcContext) {
             }
             net::dns::DnsQueryType::Ptr => {
                 if c.success {
-                    reply.label = BESALT_OK;
+                    reply.label = TRONA_OK;
                     let copy_len = core::cmp::min(c.ptr_hostname_len, 152);
                     reply.regs[0] = copy_len as u64;
                     if copy_len > 0 {
@@ -1263,7 +1264,7 @@ fn drain_dns_completions(ctx: *mut IpcContext) {
 /// # Safety
 ///
 /// `ctx` must be a valid IPC context. `msg` and `badge` must be valid pointers.
-unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut BesaltMsg, badge: *mut u64) {
+unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut TronaMsg, badge: *mut u64) {
     unsafe {
         if net::dns::has_pending() || net::dhcp::has_timer() {
             let now = net::dns::clock_monotonic_ns();
@@ -1284,7 +1285,7 @@ unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut BesaltMsg, badge: *mut u64) {
                 return;
             }
             let timeout = deadline.saturating_sub(now).max(100_000); // min 100us
-            let r = besalt::syscall::syscall(
+            let r = trona::syscall::syscall(
                 SYS_RECV_TIMED,
                 CAP_SERVER_EP,
                 timeout,
@@ -1296,7 +1297,7 @@ unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut BesaltMsg, badge: *mut u64) {
             if r.error == 0 {
                 *badge = r.value;
                 // Read message from IPC buffer (same as recv_ctx does)
-                let buf = (*ctx).ipc_buffer as *const BesaltMsg;
+                let buf = (*ctx).ipc_buffer as *const TronaMsg;
                 *msg = *buf;
             } else {
                 // Timeout: trigger notification processing to check DNS deadlines
@@ -1318,7 +1319,7 @@ unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut BesaltMsg, badge: *mut u64) {
 /// Message format sent to VFS:
 ///   label = NET_COMPLETE
 ///   regs[0] = conn_id (the connection this completion belongs to)
-///   regs[1] = result  (BESALT_OK, BESALT_CONN_REFUSED, etc.)
+///   regs[1] = result  (TRONA_OK, TRONA_CONN_REFUSED, etc.)
 ///   regs[2] = op_type (INET_OP_CONNECT, INET_OP_RECV, etc.)
 ///   regs[3] = data_len / extra_conn_id (depends on op_type)
 ///   regs[4] = extra_ip / data start
@@ -1339,7 +1340,7 @@ fn notify_vfs_completion(
     // SAFETY: Single-threaded server; VFS_REGISTERED is set once.
     let registered = unsafe { *(&raw const VFS_REGISTERED) };
     if !registered {
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[netsrv] notify skip conn=");
             _lb.dec(conn_id as u64);
             _lb.str(b" op=");
@@ -1348,7 +1349,7 @@ fn notify_vfs_completion(
         });
         return;
     }
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = NET_COMPLETE;
     msg.regs[0] = conn_id as u64;
     msg.regs[1] = result;
@@ -1403,7 +1404,7 @@ fn notify_vfs_completion(
         }
     }
 
-    let mut resp = BesaltMsg::zeroed();
+    let mut resp = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; slot 84 holds the local badged alias.
     let call_err = unsafe {
         ipc::call_ctx(
@@ -1413,7 +1414,7 @@ fn notify_vfs_completion(
             &raw mut resp,
         )
     };
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(b"[netsrv] notify conn=");
         _lb.dec(conn_id as u64);
         _lb.str(b" op=");
@@ -1435,7 +1436,7 @@ fn notify_vfs_completion(
 /// on a netsrv call) and after timer processing.
 fn drain_completion_queue() {
     while let Some(c) = net::socket::raw_ipv4::pop_completion() {
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[netsrv] drain raw conn=");
             _lb.dec(c.conn_id as u64);
             _lb.str(b" op=");
@@ -1466,7 +1467,7 @@ fn drain_completion_queue() {
             c.extra_conn_id,
             c.extra_ip,
             c.extra_port,
-            besalt::consts::INET_RECV_TIMESTAMP_NONE,
+            trona::consts::INET_RECV_TIMESTAMP_NONE,
         );
     }
     while let Some(c) = net::socket::udp::pop_completion() {
@@ -1496,12 +1497,12 @@ fn drain_completion_queue() {
 /// - On IPC request (badge == 0): dispatch the request, fill reply, then
 ///   reply_recv (atomically reply and wait for next event).
 fn event_loop() -> ! {
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[netsrv] Entering event loop\n");
     });
 
     let ctx = ipc_ctx();
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     let mut badge: u64 = 0;
 
     // Set receive slot for the plain VFS callback EP (slot 83).
@@ -1533,20 +1534,20 @@ fn event_loop() -> ! {
             check_self_test();
 
             // Wait for next event (with timeout if DNS queries are pending)
-            msg = BesaltMsg::zeroed();
+            msg = TronaMsg::zeroed();
             badge = 0;
             unsafe {
                 do_recv(ctx, &raw mut msg, &raw mut badge);
             }
         } else {
             // IPC request on server endpoint
-            let mut reply = BesaltMsg::zeroed();
+            let mut reply = TronaMsg::zeroed();
             let deferred = dispatch_ipc(&msg, &mut reply);
             badge = 0;
 
             if deferred {
                 unsafe {
-                    msg = BesaltMsg::zeroed();
+                    msg = TronaMsg::zeroed();
                     do_recv(ctx, &raw mut msg, &raw mut badge);
                 }
             } else if net::dns::has_pending() || net::dhcp::has_timer() {
@@ -1557,7 +1558,7 @@ fn event_loop() -> ! {
                     let err = invoke::cnode_save_caller(CAP_SELF_CSPACE, CAP_REPLY_TEMP);
                     if err == 0 {
                         ipc::send_ctx(ctx, CAP_REPLY_TEMP, &raw const reply);
-                        msg = BesaltMsg::zeroed();
+                        msg = TronaMsg::zeroed();
                         do_recv(ctx, &raw mut msg, &raw mut badge);
                     } else {
                         ipc::reply_recv_ctx(
@@ -1592,13 +1593,13 @@ fn event_loop() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[netsrv] Network Stack Server starting\n");
     });
 
     // 1. Allocate and map SHM
     if !setup_shm() {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[netsrv] SHM setup failed, halting\n");
         });
         idle();
@@ -1606,7 +1607,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // 2. Setup notification (allocate, bind to TCB, mint badged copy)
     if !setup_notification() {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[netsrv] Notification setup failed, halting\n");
         });
         idle();
@@ -1614,7 +1615,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // 3. Register with netdrv (DRIVER_REGISTER: exchange SHM ID, caps, get MAC)
     if !driver_register() {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[netsrv] Driver register failed, halting\n");
         });
         idle();
@@ -1625,7 +1626,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // 4b. Fire-and-forget ARP request for the configured gateway.
     if net::proto::ipv4::our_ip() != 0 && net::proto::ipv4::gateway_ip() != 0 {
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[netsrv] Self-test: ARP request for configured gateway\n");
         });
         net::proto::arp::request(
@@ -1654,6 +1655,6 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
 fn idle() -> ! {
     loop {
-        let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 }

@@ -1,8 +1,8 @@
 use crate::types::*;
 use crate::client::find_client_by_badge;
-use besalt::consts::*;
-use besalt::invoke;
-use besalt::types::*;
+use trona::consts::*;
+use trona::invoke;
+use trona::types::*;
 
 pub(crate) unsafe fn find_shm_by_id(id: u64) -> *mut ShmObject {
     unsafe {
@@ -21,20 +21,20 @@ pub(crate) unsafe fn find_shm_by_id(id: u64) -> *mut ShmObject {
 /// MM_SHM_CREATE: allocate frames for a SHM object.
 ///   MR0 = shm_id
 ///   MR1 = num_pages
-///   Reply: label = BESALT_OK or error
-pub(crate) unsafe fn handle_mm_shm_create(msg: *const BesaltMsg, _caller_badge: u64, reply: *mut BesaltMsg) {
+///   Reply: label = TRONA_OK or error
+pub(crate) unsafe fn handle_mm_shm_create(msg: *const TronaMsg, _caller_badge: u64, reply: *mut TronaMsg) {
     unsafe {
         let shm_id = (*msg).regs[0];
         let num_pages = (*msg).regs[1] as usize;
 
         if num_pages == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
         // Check for duplicate
         if !find_shm_by_id(shm_id).is_null() {
-            (*reply).label = BESALT_ALREADY_EXISTS;
+            (*reply).label = TRONA_ALREADY_EXISTS;
             return;
         }
 
@@ -57,7 +57,7 @@ pub(crate) unsafe fn handle_mm_shm_create(msg: *const BesaltMsg, _caller_badge: 
             let new_pages = if new_pages == 0 { 1 } else { new_pages };
             let new_ptr = super::self_mmap(new_pages);
             if new_ptr.is_null() {
-                (*reply).label = BESALT_OUT_OF_MEMORY;
+                (*reply).label = TRONA_OUT_OF_MEMORY;
                 return;
             }
             let new_ptr = new_ptr as *mut ShmObject;
@@ -72,7 +72,7 @@ pub(crate) unsafe fn handle_mm_shm_create(msg: *const BesaltMsg, _caller_badge: 
         // Allocate frame_caps array
         let fcaps = super::alloc_frame_cap_array(num_pages);
         if fcaps.is_null() {
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -84,7 +84,7 @@ pub(crate) unsafe fn handle_mm_shm_create(msg: *const BesaltMsg, _caller_badge: 
                     for j in 0..i {
                         super::frame_pool_push(*fcaps.add(j));
                     }
-                    (*reply).label = BESALT_OUT_OF_MEMORY;
+                    (*reply).label = TRONA_OUT_OF_MEMORY;
                     return;
                 }
             };
@@ -99,7 +99,7 @@ pub(crate) unsafe fn handle_mm_shm_create(msg: *const BesaltMsg, _caller_badge: 
             frame_cap_capacity: num_pages as u32,
         };
 
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[MMSRV] SHM create id=");
             _lb.hex(shm_id);
             _lb.str(b" pages=");
@@ -107,7 +107,7 @@ pub(crate) unsafe fn handle_mm_shm_create(msg: *const BesaltMsg, _caller_badge: 
             _lb.str(b"\n");
         });
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }
 
@@ -116,8 +116,8 @@ pub(crate) unsafe fn handle_mm_shm_create(msg: *const BesaltMsg, _caller_badge: 
 ///   MR1 = client badge
 ///   MR2 = vaddr
 ///   MR3 = prot (vspace flags)
-///   Reply: label = BESALT_OK, MR0 = mapped_base
-pub(crate) unsafe fn handle_mm_shm_map(msg: *const BesaltMsg, caller_badge: u64, reply: *mut BesaltMsg) {
+///   Reply: label = TRONA_OK, MR0 = mapped_base
+pub(crate) unsafe fn handle_mm_shm_map(msg: *const TronaMsg, caller_badge: u64, reply: *mut TronaMsg) {
     unsafe {
         let shm_id = (*msg).regs[0];
         let client_badge = if (*msg).regs[1] == 0 { caller_badge } else { (*msg).regs[1] };
@@ -126,13 +126,13 @@ pub(crate) unsafe fn handle_mm_shm_map(msg: *const BesaltMsg, caller_badge: u64,
 
         let shm = find_shm_by_id(shm_id);
         if shm.is_null() {
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
         let client = find_client_by_badge(client_badge);
         if client.is_null() {
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
@@ -158,7 +158,7 @@ pub(crate) unsafe fn handle_mm_shm_map(msg: *const BesaltMsg, caller_badge: u64,
                 for j in 0..i {
                     invoke::vspace_unmap(vspace_cap, actual_vaddr + j as u64 * 4096);
                 }
-                (*reply).label = BESALT_BAD_ADDRESS;
+                (*reply).label = TRONA_BAD_ADDRESS;
                 return;
             }
         }
@@ -168,7 +168,7 @@ pub(crate) unsafe fn handle_mm_shm_map(msg: *const BesaltMsg, caller_badge: u64,
             (*client).mmap_next = actual_vaddr + page_count as u64 * 4096;
         }
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 1;
         (*reply).regs[0] = actual_vaddr;
     }
@@ -178,8 +178,8 @@ pub(crate) unsafe fn handle_mm_shm_map(msg: *const BesaltMsg, caller_badge: u64,
 ///   MR0 = shm_id
 ///   MR1 = client badge
 ///   MR2 = vaddr (base address of the mapping)
-///   Reply: label = BESALT_OK
-pub(crate) unsafe fn handle_mm_shm_unmap(msg: *const BesaltMsg, caller_badge: u64, reply: *mut BesaltMsg) {
+///   Reply: label = TRONA_OK
+pub(crate) unsafe fn handle_mm_shm_unmap(msg: *const TronaMsg, caller_badge: u64, reply: *mut TronaMsg) {
     unsafe {
         let shm_id = (*msg).regs[0];
         let client_badge = if (*msg).regs[1] == 0 { caller_badge } else { (*msg).regs[1] };
@@ -187,13 +187,13 @@ pub(crate) unsafe fn handle_mm_shm_unmap(msg: *const BesaltMsg, caller_badge: u6
 
         let shm = find_shm_by_id(shm_id);
         if shm.is_null() {
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
         let client = find_client_by_badge(client_badge);
         if client.is_null() {
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
@@ -205,6 +205,6 @@ pub(crate) unsafe fn handle_mm_shm_unmap(msg: *const BesaltMsg, caller_badge: u6
             }
         }
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }

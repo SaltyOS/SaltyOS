@@ -5,10 +5,10 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::serial;
-use besalt::serial::LineBuf;
-use besalt::consts::*;
-use besalt::posix;
+use trona::serial;
+use trona::serial::LineBuf;
+use trona::consts::*;
+use trona_posix::proc as posix;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -68,7 +68,7 @@ fn test_neon_survives_fork() -> bool {
         );
     }
 
-    let pid = posix::posix_fork();
+    let pid = trona_posix::posix_fork();
     if pid < 0 {
         puts(b"  NEON survives fork: FAIL (fork failed)\n");
         return false;
@@ -89,7 +89,7 @@ fn test_neon_survives_fork() -> bool {
         if child_read == parent_val {
             puts(b"  NEON survives fork (child): OK\n");
             // SAFETY: Exiting the child process with success status.
-            unsafe { posix::posix_exit(0); }
+            unsafe { trona_posix::posix_exit(0); }
         } else {
             let mut lb = LineBuf::new();
             lb.str(b"  NEON survives fork (child): FAIL (expected ");
@@ -99,14 +99,14 @@ fn test_neon_survives_fork() -> bool {
             lb.str(b")\n");
             lb.flush();
             // SAFETY: Exiting the child process with failure status.
-            unsafe { posix::posix_exit(1); }
+            unsafe { trona_posix::posix_exit(1); }
         }
     }
 
     // Parent: verify our D1 is still intact after child ran
     // Yield a few times to force context switches
     for _ in 0..3 {
-        let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
     let parent_read: u64;
@@ -123,7 +123,7 @@ fn test_neon_survives_fork() -> bool {
     // Wait for child
     let mut status: i32 = 0;
     // SAFETY: Waiting for the child process we just forked. status pointer is valid.
-    unsafe { posix::posix_waitpid(pid, &mut status); }
+    unsafe { trona_posix::posix_waitpid(pid, &mut status); }
 
     if parent_read != parent_val {
         let mut lb = LineBuf::new();
@@ -325,7 +325,7 @@ fn test_neon_no_fpu_threads() -> bool {
     }
 
     // Fork a child that does NO FPU work -- only yields
-    let pid = posix::posix_fork();
+    let pid = trona_posix::posix_fork();
     if pid < 0 {
         puts(b"  NEON no-FPU thread: FAIL (fork failed)\n");
         return false;
@@ -334,15 +334,15 @@ fn test_neon_no_fpu_threads() -> bool {
     if pid == 0 {
         // Child: yield several times without touching any NEON register
         for _ in 0..5 {
-            let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+            let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
         }
         // SAFETY: Exiting the child process.
-        unsafe { posix::posix_exit(0); }
+        unsafe { trona_posix::posix_exit(0); }
     }
 
     // Parent: yield to let child run (interleave context switches)
     for _ in 0..5 {
-        let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
     let parent_read: u64;
@@ -357,7 +357,7 @@ fn test_neon_no_fpu_threads() -> bool {
 
     let mut status: i32 = 0;
     // SAFETY: Waiting for the child process. status pointer is valid.
-    unsafe { posix::posix_waitpid(pid, &mut status); }
+    unsafe { trona_posix::posix_waitpid(pid, &mut status); }
 
     if parent_read != parent_val {
         let mut lb = LineBuf::new();
@@ -394,7 +394,7 @@ fn test_neon_heavy_context_switch() -> bool {
         );
     }
 
-    let pid = posix::posix_fork();
+    let pid = trona_posix::posix_fork();
     if pid < 0 {
         puts(b"  NEON heavy ctx switch: FAIL (fork failed)\n");
         return false;
@@ -414,7 +414,7 @@ fn test_neon_heavy_context_switch() -> bool {
 
         // Yield many times to stress FPU switching
         for _ in 0..10 {
-            let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+            let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
         }
 
         let child_read: u64;
@@ -430,7 +430,7 @@ fn test_neon_heavy_context_switch() -> bool {
         if child_read == child_pattern {
             puts(b"  NEON heavy ctx switch (child): OK\n");
             // SAFETY: Exiting the child process with success status.
-            unsafe { posix::posix_exit(0); }
+            unsafe { trona_posix::posix_exit(0); }
         } else {
             let mut lb = LineBuf::new();
             lb.str(b"  NEON heavy ctx switch (child): FAIL (expected ");
@@ -440,13 +440,13 @@ fn test_neon_heavy_context_switch() -> bool {
             lb.str(b")\n");
             lb.flush();
             // SAFETY: Exiting the child process with failure status.
-            unsafe { posix::posix_exit(1); }
+            unsafe { trona_posix::posix_exit(1); }
         }
     }
 
     // Parent: yield many times, interleaving with child
     for _ in 0..10 {
-        let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
     let parent_read: u64;
@@ -461,7 +461,7 @@ fn test_neon_heavy_context_switch() -> bool {
 
     let mut status: i32 = 0;
     // SAFETY: Waiting for the child process. status pointer is valid.
-    unsafe { posix::posix_waitpid(pid, &mut status); }
+    unsafe { trona_posix::posix_waitpid(pid, &mut status); }
 
     if parent_read != parent_pattern {
         let mut lb = LineBuf::new();

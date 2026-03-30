@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! x86_64 console hardware — COM1 serial and PS/2 keyboard I/O via IoPort caps.
 
-use besalt::invoke;
+use trona::invoke;
 
 use crate::kbd::KbdState;
 
@@ -155,7 +155,7 @@ fn kbd_init() {
         }
     }
 
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[CONSOLE] PS/2 keyboard initialized\n");
     });
 }

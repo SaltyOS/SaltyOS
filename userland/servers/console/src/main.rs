@@ -11,7 +11,8 @@
 #![no_std]
 #![no_main]
 
-extern crate besalt;
+extern crate trona;
+extern crate trona_posix;
 
 #[cfg(target_arch = "x86_64")]
 #[path = "arch/x86_64.rs"]
@@ -23,10 +24,10 @@ mod arch;
 #[cfg(target_arch = "x86_64")]
 mod kbd;
 
-use besalt::consts::*;
-use besalt::ipc;
-use besalt::serial;
-use besalt::types::*;
+use trona::consts::*;
+use trona::ipc;
+use trona::serial;
+use trona::types::*;
 
 // Cap layout (architecture-neutral slots)
 const CAP_SELF_CSPACE: u64 = 2;
@@ -76,7 +77,7 @@ static mut DISPLAY_TX_TAIL: usize = 0;
 // ======================================================================
 
 fn ipc_ctx() -> *mut IpcContext {
-    besalt::tls::current_ipc_ctx()
+    trona_posix::tls::current_ipc_ctx()
 }
 
 unsafe fn init_console_termios() {
@@ -103,7 +104,7 @@ unsafe fn init_console_termios() {
 }
 
 fn signal_ready() {
-    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 /// Write a byte slice with CR/LF translation via DebugPutStr syscall.
@@ -229,7 +230,7 @@ unsafe fn display_flush_blocking_one() -> bool {
             return true;
         }
 
-        let mut msg = BesaltMsg::zeroed();
+        let mut msg = TronaMsg::zeroed();
         msg.label = DISPLAY_TERMINAL_WRITE;
         msg.regs[0] = len as u64;
         msg.length = 1 + ((len as u64 + 7) / 8);
@@ -261,7 +262,7 @@ unsafe fn display_try_flush() {
                 break;
             }
 
-            let mut msg = BesaltMsg::zeroed();
+            let mut msg = TronaMsg::zeroed();
             msg.label = DISPLAY_TERMINAL_WRITE;
             msg.regs[0] = len as u64;
             msg.length = 1 + ((len as u64 + 7) / 8);
@@ -288,7 +289,7 @@ fn forward_to_ttyd(raw: &[u8], raw_len: usize) {
     let mut offset = 0usize;
     while offset < raw_len {
         let chunk_len = core::cmp::min(raw_len - offset, 128);
-        let mut fwd = BesaltMsg::zeroed();
+        let mut fwd = TronaMsg::zeroed();
         fwd.label = TTYD_INPUT_EVENT;
         fwd.regs[0] = chunk_len as u64;
         fwd.length = 1 + ((chunk_len as u64 + 7) / 8);
@@ -302,7 +303,7 @@ fn forward_to_ttyd(raw: &[u8], raw_len: usize) {
                 err = ipc::send_ctx(ipc_ctx(), CAP_TTYD_EP, &raw const fwd);
             }
             if err != 0 {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[CONSOLE] FAIL: ttyd input send failed\n");
                 });
                 return;
@@ -312,7 +313,7 @@ fn forward_to_ttyd(raw: &[u8], raw_len: usize) {
     }
 }
 
-unsafe fn handle_write(msg: *const BesaltMsg) {
+unsafe fn handle_write(msg: *const TronaMsg) {
     unsafe {
         let mut len = (*msg).regs[0];
         if len > 24 { len = 24; }
@@ -326,10 +327,10 @@ unsafe fn handle_write(msg: *const BesaltMsg) {
     }
 }
 
-unsafe fn handle_tcgetattr(reply: *mut BesaltMsg) {
+unsafe fn handle_tcgetattr(reply: *mut TronaMsg) {
     unsafe {
         let t = &raw const CONSOLE_TERMIOS;
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 10;
         (*reply).regs[0] = (*t).c_iflag as u64;
         (*reply).regs[1] = (*t).c_oflag as u64;
@@ -344,12 +345,12 @@ unsafe fn handle_tcgetattr(reply: *mut BesaltMsg) {
     }
 }
 
-unsafe fn handle_tcsetattr(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
+unsafe fn handle_tcsetattr(msg: *const TronaMsg, reply: *mut TronaMsg) {
     unsafe {
         // Expected layout from VFS:
         // regs[0]=fd regs[1]=action regs[2..7]=flags/speeds regs[8..11]=c_cc[32]
         if (*msg).length < 11 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -365,7 +366,7 @@ unsafe fn handle_tcsetattr(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
             (*t).c_cc[i] = *src.add(i);
         }
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 0;
     }
 }
@@ -377,7 +378,7 @@ unsafe fn handle_tcsetattr(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     arch::serial_init();
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[CONSOLE] SaltyOS console server ready\n");
     });
 
@@ -387,13 +388,13 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     arch::irq_setup();
     signal_ready();
 
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     let mut badge: u64 = 0;
 
     // Initial recv
     let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
     if err != 0 {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[CONSOLE] initial recv failed\n");
         });
         idle();
@@ -419,7 +420,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
             };
             if err != 0 {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[CONSOLE] recv failed after IRQ\n");
                 });
                 break;
@@ -428,12 +429,12 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         }
 
         // IPC message
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
 
         match msg.label {
             CONSOLE_WRITE => {
                 unsafe { handle_write(&raw const msg) };
-                reply.label = BESALT_OK;
+                reply.label = TRONA_OK;
             }
             CONSOLE_TCGETATTR => {
                 unsafe { handle_tcgetattr(&raw mut reply) };
@@ -442,7 +443,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 unsafe { handle_tcsetattr(&raw const msg, &raw mut reply) };
             }
             _ => {
-                reply.label = BESALT_INVALID_OPERATION;
+                reply.label = TRONA_INVALID_OPERATION;
             }
         }
 
@@ -456,7 +457,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             )
         };
         if err != 0 {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[CONSOLE] reply_recv failed\n");
             });
             break;
@@ -468,6 +469,6 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
 fn idle() -> ! {
     loop {
-        besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 }

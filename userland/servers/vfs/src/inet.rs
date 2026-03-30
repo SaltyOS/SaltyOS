@@ -7,10 +7,10 @@
 //! (connect, recv, accept) save the client's reply cap and return
 //! asynchronously via netsrv's badged callback EP.
 
-use besalt::consts::*;
-use besalt::invoke;
-use besalt::ipc;
-use besalt::types::*;
+use trona::consts::*;
+use trona::invoke;
+use trona::ipc;
+use trona::types::*;
 
 use crate::client::get_client;
 use crate::consts::*;
@@ -94,7 +94,7 @@ unsafe fn find_pending(conn_id: u32, op_type: u8) -> Option<(u64, u64)> {
     }
 }
 
-fn log_ipv4(lb: &mut besalt::serial::LineBuf, ip: u32) {
+fn log_ipv4(lb: &mut trona::serial::LineBuf, ip: u32) {
     lb.dec(((ip >> 24) & 0xFF) as u64);
     lb.putc(b'.');
     lb.dec(((ip >> 16) & 0xFF) as u64);
@@ -111,7 +111,7 @@ fn log_inet_op(op: &[u8], fd: i32, conn_id: u32, ip: u32, port: u16, len: usize)
         }
         *(&raw mut LOGGED_INET_OPS) += 1;
     }
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(b"[VFS] inet ");
         _lb.str(op);
         if fd >= 0 {
@@ -141,7 +141,7 @@ fn log_inet_recv_result(fd: i32, conn_id: u32, src_ip: u32, len: usize, data: &[
         }
         *(&raw mut LOGGED_INET_RECV_RESULTS) += 1;
     }
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(b"[VFS] inet recvfrom result fd=");
         _lb.dec(fd as u64);
         _lb.str(b" conn=");
@@ -211,12 +211,12 @@ unsafe fn ensure_inet_callback_registered() -> bool {
         // callback sends.
         ipc::set_send_cap_ctx(ipc_ctx(), 0, VFS_CAP_NETSRV_CALLBACK_EP);
 
-        let mut msg = BesaltMsg::zeroed();
+        let mut msg = TronaMsg::zeroed();
         msg.label = NET_REGISTER_VFS;
         msg.length = 0;
-        let mut resp = BesaltMsg::zeroed();
+        let mut resp = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const msg, &raw mut resp);
-        if err != 0 || resp.label != BESALT_OK {
+        if err != 0 || resp.label != TRONA_OK {
             crate::puts(b"[VFS] inet: failed to register with netsrv\n");
             return false;
         }
@@ -244,8 +244,8 @@ pub(crate) unsafe fn prepare_inet_callback_endpoint() -> bool {
 
 /// Forward NET_SOCKET to netsrv, create FD_TYPE_INET_SOCKET fd.
 pub(crate) unsafe fn handle_inet_socket(
-    _msg: *const BesaltMsg,
-    reply: *mut BesaltMsg,
+    _msg: *const TronaMsg,
+    reply: *mut TronaMsg,
     badge: u64,
     sock_type: i32,
     protocol: i32,
@@ -253,20 +253,20 @@ pub(crate) unsafe fn handle_inet_socket(
     // SAFETY: IPC context is valid; making synchronous RPC to netsrv.
     unsafe {
         if !ensure_inet_callback_registered() {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = NET_SOCKET;
         req.regs[0] = sock_type as u64;
         req.regs[1] = protocol as u64;
         req.length = 2;
-        let mut resp = BesaltMsg::zeroed();
+        let mut resp = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
-        if err != 0 || resp.label != BESALT_OK {
+        if err != 0 || resp.label != TRONA_OK {
             (*reply).label = if err != 0 {
-                BESALT_INVALID_OPERATION
+                TRONA_INVALID_OPERATION
             } else {
                 resp.label
             };
@@ -277,7 +277,7 @@ pub(crate) unsafe fn handle_inet_socket(
 
         let cli = get_client(badge);
         if cli.is_null() {
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return false;
         }
 
@@ -288,7 +288,7 @@ pub(crate) unsafe fn handle_inet_socket(
                 (*(*cli).fds.add(fd)).sock_id = conn_id;
                 (*(*cli).fds.add(fd)).offset = 0;
                 (*(*cli).fds.add(fd)).flags = 0;
-                (*reply).label = BESALT_OK;
+                (*reply).label = TRONA_OK;
                 (*reply).length = 1;
                 (*reply).regs[0] = fd as u64;
                 return false;
@@ -296,18 +296,18 @@ pub(crate) unsafe fn handle_inet_socket(
         }
 
         // No free fd — close the netsrv conn
-        let mut close_req = BesaltMsg::zeroed();
+        let mut close_req = TronaMsg::zeroed();
         close_req.label = NET_CLOSE;
         close_req.regs[0] = conn_id as u64;
         close_req.length = 1;
-        let mut close_resp = BesaltMsg::zeroed();
+        let mut close_resp = TronaMsg::zeroed();
         let _ = ipc::call_ctx(
             ipc_ctx(),
             VFS_CAP_NETSRV_EP,
             &raw const close_req,
             &raw mut close_resp,
         );
-        (*reply).label = BESALT_OUT_OF_MEMORY;
+        (*reply).label = TRONA_OUT_OF_MEMORY;
         false
     }
 }
@@ -317,14 +317,14 @@ pub(crate) unsafe fn handle_inet_socket(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_connect(
-    msg: *const BesaltMsg,
-    reply: *mut BesaltMsg,
+    msg: *const TronaMsg,
+    reply: *mut TronaMsg,
     badge: u64,
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
         if !ensure_inet_callback_registered() {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
@@ -339,7 +339,7 @@ pub(crate) unsafe fn handle_inet_connect(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_INET_SOCKET
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return false;
         }
 
@@ -347,37 +347,37 @@ pub(crate) unsafe fn handle_inet_connect(
         log_inet_op(b"connect", fd, conn_id, ip, port, 0);
 
         // Call netsrv synchronously
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = NET_CONNECT;
         req.regs[0] = conn_id as u64;
         req.regs[1] = ip as u64;
         req.regs[2] = port as u64;
         req.length = 3;
-        let mut resp = BesaltMsg::zeroed();
+        let mut resp = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
 
         if err != 0 {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
-        if resp.label == BESALT_PENDING {
+        if resp.label == TRONA_PENDING {
             if fd_is_nonblocking(cli, fd) {
-                (*reply).label = BESALT_IN_PROGRESS;
+                (*reply).label = TRONA_IN_PROGRESS;
                 return false;
             }
 
             let client_slot = alloc_reply_slot();
             let err = invoke::cnode_save_caller(CAP_SELF_CSPACE, client_slot);
             if err != 0 {
-                (*reply).label = BESALT_INVALID_OPERATION;
+                (*reply).label = TRONA_INVALID_OPERATION;
                 return false;
             }
 
             // TCP SYN sent, handshake pending — record and wait for callback
             if !alloc_pending(conn_id, INET_OP_CONNECT, client_slot, badge) {
-                let mut client_reply = BesaltMsg::zeroed();
-                client_reply.label = BESALT_OUT_OF_MEMORY;
+                let mut client_reply = TronaMsg::zeroed();
+                client_reply.label = TRONA_OUT_OF_MEMORY;
                 ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
             }
             return true; // skip_reply
@@ -394,14 +394,14 @@ pub(crate) unsafe fn handle_inet_connect(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_bind(
-    msg: *const BesaltMsg,
-    reply: *mut BesaltMsg,
+    msg: *const TronaMsg,
+    reply: *mut TronaMsg,
     badge: u64,
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
         if !ensure_inet_callback_registered() {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
@@ -416,22 +416,22 @@ pub(crate) unsafe fn handle_inet_bind(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_INET_SOCKET
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return false;
         }
 
         let conn_id = (*(*cli).fds.add(fd as usize)).sock_id;
 
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = NET_BIND;
         req.regs[0] = conn_id as u64;
         req.regs[1] = ip as u64;
         req.regs[2] = port as u64;
         req.length = 3;
-        let mut resp = BesaltMsg::zeroed();
+        let mut resp = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         (*reply).label = if err != 0 {
-            BESALT_INVALID_OPERATION
+            TRONA_INVALID_OPERATION
         } else {
             resp.label
         };
@@ -444,14 +444,14 @@ pub(crate) unsafe fn handle_inet_bind(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_listen(
-    msg: *const BesaltMsg,
-    reply: *mut BesaltMsg,
+    msg: *const TronaMsg,
+    reply: *mut TronaMsg,
     badge: u64,
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
         if !ensure_inet_callback_registered() {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
@@ -465,21 +465,21 @@ pub(crate) unsafe fn handle_inet_listen(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_INET_SOCKET
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return false;
         }
 
         let conn_id = (*(*cli).fds.add(fd as usize)).sock_id;
 
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = NET_LISTEN;
         req.regs[0] = conn_id as u64;
         req.regs[1] = backlog as u64;
         req.length = 2;
-        let mut resp = BesaltMsg::zeroed();
+        let mut resp = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         (*reply).label = if err != 0 {
-            BESALT_INVALID_OPERATION
+            TRONA_INVALID_OPERATION
         } else {
             resp.label
         };
@@ -492,14 +492,14 @@ pub(crate) unsafe fn handle_inet_listen(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_accept(
-    msg: *const BesaltMsg,
-    reply: *mut BesaltMsg,
+    msg: *const TronaMsg,
+    reply: *mut TronaMsg,
     badge: u64,
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
         if !ensure_inet_callback_registered() {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
@@ -511,59 +511,59 @@ pub(crate) unsafe fn handle_inet_accept(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_INET_SOCKET
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return false;
         }
 
         let conn_id = (*(*cli).fds.add(fd as usize)).sock_id;
 
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = NET_ACCEPT;
         req.regs[0] = conn_id as u64;
         req.length = 1;
-        let mut resp = BesaltMsg::zeroed();
+        let mut resp = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
 
         if err != 0 {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
-        if resp.label == BESALT_PENDING {
+        if resp.label == TRONA_PENDING {
             if fd_is_nonblocking(cli, fd) {
-                (*reply).label = BESALT_WOULD_BLOCK;
+                (*reply).label = TRONA_WOULD_BLOCK;
                 return false;
             }
 
             let client_slot = alloc_reply_slot();
             let err = invoke::cnode_save_caller(CAP_SELF_CSPACE, client_slot);
             if err != 0 {
-                (*reply).label = BESALT_INVALID_OPERATION;
+                (*reply).label = TRONA_INVALID_OPERATION;
                 return false;
             }
 
             // No pending connections — wait for callback
             if !alloc_pending(conn_id, INET_OP_ACCEPT, client_slot, badge) {
-                let mut client_reply = BesaltMsg::zeroed();
-                client_reply.label = BESALT_OUT_OF_MEMORY;
+                let mut client_reply = TronaMsg::zeroed();
+                client_reply.label = TRONA_OUT_OF_MEMORY;
                 ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
             }
             true
-        } else if resp.label == BESALT_OK {
+        } else if resp.label == TRONA_OK {
             // Connection already queued — allocate new fd
             let new_conn_id = resp.regs[0] as u32;
             let remote_ip = resp.regs[1] as u32;
             let remote_port = resp.regs[2] as u16;
             match alloc_inet_fd(badge, new_conn_id) {
                 Some(new_fd) => {
-                    (*reply).label = BESALT_OK;
+                    (*reply).label = TRONA_OK;
                     (*reply).regs[0] = new_fd as u64;
                     (*reply).regs[1] = remote_ip as u64;
                     (*reply).regs[2] = remote_port as u64;
                     (*reply).length = 3;
                 }
                 None => {
-                    (*reply).label = BESALT_OUT_OF_MEMORY;
+                    (*reply).label = TRONA_OUT_OF_MEMORY;
                 }
             }
             false
@@ -579,14 +579,14 @@ pub(crate) unsafe fn handle_inet_accept(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_write(
-    msg: *const BesaltMsg,
+    msg: *const TronaMsg,
     fde: *mut FdEntry,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
         if !ensure_inet_callback_registered() {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
@@ -594,7 +594,7 @@ pub(crate) unsafe fn handle_inet_write(
         let count = (*msg).regs[1] as usize;
         let actual = if count > 144 { 144 } else { count };
 
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = NET_SEND;
         req.regs[0] = conn_id as u64;
         req.regs[1] = actual as u64;
@@ -605,10 +605,10 @@ pub(crate) unsafe fn handle_inet_write(
         }
         req.length = 2 + ((actual as u64 + 7) / 8);
 
-        let mut resp = BesaltMsg::zeroed();
+        let mut resp = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         if err != 0 {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
         } else {
             (*reply).label = resp.label;
             (*reply).regs[0] = resp.regs[0];
@@ -623,15 +623,15 @@ pub(crate) unsafe fn handle_inet_write(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_read(
-    msg: *const BesaltMsg,
+    msg: *const TronaMsg,
     fde: *mut FdEntry,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
     badge: u64,
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
         if !ensure_inet_callback_registered() {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
@@ -639,36 +639,36 @@ pub(crate) unsafe fn handle_inet_read(
         let max_len = (*msg).regs[1] as u16;
         let capped = if max_len > 152 { 152 } else { max_len };
 
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = NET_RECV;
         req.regs[0] = conn_id as u64;
         req.regs[1] = capped as u64;
         req.length = 2;
-        let mut resp = BesaltMsg::zeroed();
+        let mut resp = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
 
         if err != 0 {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
-        if resp.label == BESALT_PENDING {
+        if resp.label == TRONA_PENDING {
             if ((*fde).flags & O_NONBLOCK) != 0 {
-                (*reply).label = BESALT_WOULD_BLOCK;
+                (*reply).label = TRONA_WOULD_BLOCK;
                 return false;
             }
 
             let client_slot = alloc_reply_slot();
             let err = invoke::cnode_save_caller(CAP_SELF_CSPACE, client_slot);
             if err != 0 {
-                (*reply).label = BESALT_INVALID_OPERATION;
+                (*reply).label = TRONA_INVALID_OPERATION;
                 return false;
             }
 
             // No data yet — record pending
             if !alloc_pending(conn_id, INET_OP_RECV, client_slot, badge) {
-                let mut client_reply = BesaltMsg::zeroed();
-                client_reply.label = BESALT_OUT_OF_MEMORY;
+                let mut client_reply = TronaMsg::zeroed();
+                client_reply.label = TRONA_OUT_OF_MEMORY;
                 ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
             }
             true
@@ -696,14 +696,14 @@ pub(crate) unsafe fn handle_inet_read(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_sendto(
-    msg: *const BesaltMsg,
-    reply: *mut BesaltMsg,
+    msg: *const TronaMsg,
+    reply: *mut TronaMsg,
     badge: u64,
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
         if !ensure_inet_callback_registered() {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
@@ -719,7 +719,7 @@ pub(crate) unsafe fn handle_inet_sendto(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_INET_SOCKET
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return false;
         }
 
@@ -727,7 +727,7 @@ pub(crate) unsafe fn handle_inet_sendto(
         let actual = if data_len > 120 { 120 } else { data_len };
         log_inet_op(b"sendto", fd, conn_id, dst_ip, dst_port, actual);
 
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = NET_SENDTO;
         req.regs[0] = conn_id as u64;
         req.regs[1] = dst_ip as u64;
@@ -740,10 +740,10 @@ pub(crate) unsafe fn handle_inet_sendto(
         }
         req.length = 4 + ((actual as u64 + 7) / 8);
 
-        let mut resp = BesaltMsg::zeroed();
+        let mut resp = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         if err != 0 {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
         } else {
             (*reply).label = resp.label;
             (*reply).regs[0] = resp.regs[0]; // bytes sent
@@ -758,14 +758,14 @@ pub(crate) unsafe fn handle_inet_sendto(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_recvfrom(
-    msg: *const BesaltMsg,
-    reply: *mut BesaltMsg,
+    msg: *const TronaMsg,
+    reply: *mut TronaMsg,
     badge: u64,
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
         if !ensure_inet_callback_registered() {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
@@ -779,7 +779,7 @@ pub(crate) unsafe fn handle_inet_recvfrom(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_INET_SOCKET
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return false;
         }
 
@@ -787,36 +787,36 @@ pub(crate) unsafe fn handle_inet_recvfrom(
         let capped = if max_len > 128 { 128 } else { max_len };
         log_inet_op(b"recvfrom", fd, conn_id, 0, 0, capped as usize);
 
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = NET_RECVFROM;
         req.regs[0] = conn_id as u64;
         req.regs[1] = capped as u64;
         req.regs[2] = (*msg).regs[2];
         req.length = 3;
-        let mut resp = BesaltMsg::zeroed();
+        let mut resp = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
 
         if err != 0 {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
-        if resp.label == BESALT_PENDING {
+        if resp.label == TRONA_PENDING {
             if fd_is_nonblocking(cli, fd) {
-                (*reply).label = BESALT_WOULD_BLOCK;
+                (*reply).label = TRONA_WOULD_BLOCK;
                 return false;
             }
 
             let client_slot = alloc_reply_slot();
             let err = invoke::cnode_save_caller(CAP_SELF_CSPACE, client_slot);
             if err != 0 {
-                (*reply).label = BESALT_INVALID_OPERATION;
+                (*reply).label = TRONA_INVALID_OPERATION;
                 return false;
             }
 
             if !alloc_pending(conn_id, INET_OP_RECVFROM, client_slot, badge) {
-                let mut client_reply = BesaltMsg::zeroed();
-                client_reply.label = BESALT_OUT_OF_MEMORY;
+                let mut client_reply = TronaMsg::zeroed();
+                client_reply.label = TRONA_OUT_OF_MEMORY;
                 ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
             }
             true
@@ -850,14 +850,14 @@ pub(crate) unsafe fn handle_inet_recvfrom(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_shutdown(
-    msg: *const BesaltMsg,
-    reply: *mut BesaltMsg,
+    msg: *const TronaMsg,
+    reply: *mut TronaMsg,
     badge: u64,
 ) -> bool {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
         if !ensure_inet_callback_registered() {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
@@ -871,21 +871,21 @@ pub(crate) unsafe fn handle_inet_shutdown(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_INET_SOCKET
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return false;
         }
 
         let conn_id = (*(*cli).fds.add(fd as usize)).sock_id;
 
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = NET_SHUTDOWN;
         req.regs[0] = conn_id as u64;
         req.regs[1] = how as u64;
         req.length = 2;
-        let mut resp = BesaltMsg::zeroed();
+        let mut resp = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         (*reply).label = if err != 0 {
-            BESALT_INVALID_OPERATION
+            TRONA_INVALID_OPERATION
         } else {
             resp.label
         };
@@ -898,13 +898,13 @@ pub(crate) unsafe fn handle_inet_shutdown(
 // ======================================================================
 
 pub(crate) unsafe fn handle_inet_getsockname(
-    msg: *const BesaltMsg,
-    reply: *mut BesaltMsg,
+    msg: *const TronaMsg,
+    reply: *mut TronaMsg,
     badge: u64,
 ) -> bool {
     unsafe {
         if !ensure_inet_callback_registered() {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
@@ -916,19 +916,19 @@ pub(crate) unsafe fn handle_inet_getsockname(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_INET_SOCKET
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return false;
         }
 
         let conn_id = (*(*cli).fds.add(fd as usize)).sock_id;
-        let mut req = BesaltMsg::zeroed();
-        let mut resp = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
+        let mut resp = TronaMsg::zeroed();
         req.label = NET_GETSOCKNAME;
         req.length = 1;
         req.regs[0] = conn_id as u64;
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         if err != 0 {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
@@ -941,13 +941,13 @@ pub(crate) unsafe fn handle_inet_getsockname(
 }
 
 pub(crate) unsafe fn handle_inet_getpeername(
-    msg: *const BesaltMsg,
-    reply: *mut BesaltMsg,
+    msg: *const TronaMsg,
+    reply: *mut TronaMsg,
     badge: u64,
 ) -> bool {
     unsafe {
         if !ensure_inet_callback_registered() {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
@@ -959,38 +959,38 @@ pub(crate) unsafe fn handle_inet_getpeername(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_INET_SOCKET
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return false;
         }
 
         let conn_id = (*(*cli).fds.add(fd as usize)).sock_id;
-        let mut req = BesaltMsg::zeroed();
-        let mut resp = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
+        let mut resp = TronaMsg::zeroed();
         req.label = NET_GETPEERNAME;
         req.length = 1;
         req.regs[0] = conn_id as u64;
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         if err != 0 {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
         (*reply).label = resp.label;
         (*reply).regs[0] = resp.regs[0];
         (*reply).regs[1] = resp.regs[1];
-        (*reply).length = if resp.label == BESALT_OK { 2 } else { 0 };
+        (*reply).length = if resp.label == TRONA_OK { 2 } else { 0 };
         false
     }
 }
 
 pub(crate) unsafe fn handle_inet_setsockopt(
-    msg: *const BesaltMsg,
-    reply: *mut BesaltMsg,
+    msg: *const TronaMsg,
+    reply: *mut TronaMsg,
     badge: u64,
 ) -> bool {
     unsafe {
         if !ensure_inet_callback_registered() {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
@@ -1007,13 +1007,13 @@ pub(crate) unsafe fn handle_inet_setsockopt(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_INET_SOCKET
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return false;
         }
 
         let conn_id = (*(*cli).fds.add(fd as usize)).sock_id;
-        let mut req = BesaltMsg::zeroed();
-        let mut resp = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
+        let mut resp = TronaMsg::zeroed();
         req.label = NET_SETSOCKOPT;
         req.length = 5;
         req.regs[0] = conn_id as u64;
@@ -1023,7 +1023,7 @@ pub(crate) unsafe fn handle_inet_setsockopt(
         req.regs[4] = optlen as u64;
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         (*reply).label = if err != 0 {
-            BESALT_INVALID_OPERATION
+            TRONA_INVALID_OPERATION
         } else {
             resp.label
         };
@@ -1032,13 +1032,13 @@ pub(crate) unsafe fn handle_inet_setsockopt(
 }
 
 pub(crate) unsafe fn handle_inet_getsockopt(
-    msg: *const BesaltMsg,
-    reply: *mut BesaltMsg,
+    msg: *const TronaMsg,
+    reply: *mut TronaMsg,
     badge: u64,
 ) -> bool {
     unsafe {
         if !ensure_inet_callback_registered() {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
@@ -1053,13 +1053,13 @@ pub(crate) unsafe fn handle_inet_getsockopt(
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_INET_SOCKET
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return false;
         }
 
         let conn_id = (*(*cli).fds.add(fd as usize)).sock_id;
-        let mut req = BesaltMsg::zeroed();
-        let mut resp = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
+        let mut resp = TronaMsg::zeroed();
         req.label = NET_GETSOCKOPT;
         req.length = 3;
         req.regs[0] = conn_id as u64;
@@ -1067,14 +1067,14 @@ pub(crate) unsafe fn handle_inet_getsockopt(
         req.regs[2] = optname as u64;
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
         if err != 0 {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
         (*reply).label = resp.label;
         (*reply).regs[0] = resp.regs[0];
         (*reply).regs[1] = resp.regs[1];
-        (*reply).length = if resp.label == BESALT_OK { 2 } else { 0 };
+        (*reply).length = if resp.label == TRONA_OK { 2 } else { 0 };
         false
     }
 }
@@ -1087,13 +1087,13 @@ pub(crate) unsafe fn close_inet_socket(fde: *mut FdEntry) {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
         let conn_id = (*fde).sock_id;
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = NET_CLOSE;
         req.regs[0] = conn_id as u64;
         req.length = 1;
-        let mut resp = BesaltMsg::zeroed();
+        let mut resp = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
-        if err != 0 || resp.label != BESALT_OK {
+        if err != 0 || resp.label != TRONA_OK {
             crate::puts(b"[VFS] inet: close_inet_socket failed\n");
         }
     }
@@ -1131,7 +1131,7 @@ unsafe fn alloc_inet_fd(badge: u64, conn_id: u32) -> Option<i32> {
 /// Handle async completion callback from netsrv.
 ///
 /// Called when VFS receives IPC with badge == NETSRV_CALLBACK_BADGE.
-pub(crate) unsafe fn handle_netsrv_callback(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
+pub(crate) unsafe fn handle_netsrv_callback(msg: *const TronaMsg, reply: *mut TronaMsg) {
     // SAFETY: Single-threaded VFS; IPC context valid.
     unsafe {
         let conn_id = (*msg).regs[0] as u32;
@@ -1142,7 +1142,7 @@ pub(crate) unsafe fn handle_netsrv_callback(msg: *const BesaltMsg, reply: *mut B
 
         if let Some((client_slot, client_badge)) = find_pending(conn_id, op_type) {
             replied_to_pending = true;
-            let mut client_reply = BesaltMsg::zeroed();
+            let mut client_reply = TronaMsg::zeroed();
 
             match op_type {
                 INET_OP_CONNECT => {
@@ -1150,7 +1150,7 @@ pub(crate) unsafe fn handle_netsrv_callback(msg: *const BesaltMsg, reply: *mut B
                 }
                 INET_OP_RECV => {
                     client_reply.label = result;
-                    if result == BESALT_OK {
+                    if result == TRONA_OK {
                         let data_len = (*msg).regs[3] as usize;
                         // Cap to max bytes that fit in regs[4..20] (16 regs * 8 = 128)
                         let actual_len = if data_len > 128 { 128 } else { data_len };
@@ -1170,7 +1170,7 @@ pub(crate) unsafe fn handle_netsrv_callback(msg: *const BesaltMsg, reply: *mut B
                 }
                 INET_OP_RECVFROM => {
                     client_reply.label = result;
-                    if result == BESALT_OK {
+                    if result == TRONA_OK {
                         let data_len = (*msg).regs[3] as usize;
                         // Cap to max bytes that fit in regs[7..20] (13 regs * 8 = 104)
                         let actual_len = if data_len > 104 { 104 } else { data_len };
@@ -1196,7 +1196,7 @@ pub(crate) unsafe fn handle_netsrv_callback(msg: *const BesaltMsg, reply: *mut B
                 }
                 INET_OP_ACCEPT => {
                     client_reply.label = result;
-                    if result == BESALT_OK {
+                    if result == TRONA_OK {
                         let new_conn_id = (*msg).regs[3] as u32;
                         let remote_ip = (*msg).regs[4] as u32;
                         let remote_port = (*msg).regs[5] as u16;
@@ -1209,13 +1209,13 @@ pub(crate) unsafe fn handle_netsrv_callback(msg: *const BesaltMsg, reply: *mut B
                                 client_reply.length = 3;
                             }
                             None => {
-                                client_reply.label = BESALT_OUT_OF_MEMORY;
+                                client_reply.label = TRONA_OUT_OF_MEMORY;
                             }
                         }
                     }
                 }
                 _ => {
-                    client_reply.label = BESALT_INVALID_OPERATION;
+                    client_reply.label = TRONA_INVALID_OPERATION;
                 }
             }
 
@@ -1231,14 +1231,14 @@ pub(crate) unsafe fn handle_netsrv_callback(msg: *const BesaltMsg, reply: *mut B
                     continue;
                 }
                 if let Some(fd) = find_inet_fd_by_conn(c.badge, conn_id) {
-                    let revents = if result == BESALT_OK { 0x004 } else { 0x008 };
+                    let revents = if result == TRONA_OK { 0x004 } else { 0x008 };
                     wake_poll_waiters(c.badge, fd, revents);
                     woke_poll_fd = fd;
                     break;
                 }
             }
         } else if !replied_to_pending
-            && result == BESALT_OK
+            && result == TRONA_OK
             && (op_type == INET_OP_RECV || op_type == INET_OP_RECVFROM)
         {
             for ci in 0..crate::max_clients() {
@@ -1256,7 +1256,7 @@ pub(crate) unsafe fn handle_netsrv_callback(msg: *const BesaltMsg, reply: *mut B
 
         if *(&raw const LOGGED_INET_CALLBACKS) < 32 {
             *(&raw mut LOGGED_INET_CALLBACKS) += 1;
-            besalt::udebug!(|_lb| {
+            trona::udebug!(|_lb| {
                 _lb.str(b"[VFS] inet callback conn=");
                 _lb.dec(conn_id as u64);
                 _lb.str(b" op=");
@@ -1276,6 +1276,6 @@ pub(crate) unsafe fn handle_netsrv_callback(msg: *const BesaltMsg, reply: *mut B
         }
 
         // Reply OK to netsrv (completing the callback IPC)
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }

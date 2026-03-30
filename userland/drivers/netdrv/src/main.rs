@@ -30,15 +30,16 @@
 #![no_std]
 #![no_main]
 
-extern crate besalt;
+extern crate trona;
+extern crate trona_posix;
 
 mod virtio;
 mod virtio_modern;
 
-use besalt::consts::*;
-use besalt::invoke;
-use besalt::ipc;
-use besalt::types::*;
+use trona::consts::*;
+use trona::invoke;
+use trona::ipc;
+use trona::types::*;
 
 // ---------------------------------------------------------------------------
 // Capability slot constants
@@ -81,7 +82,7 @@ static mut LOGGED_TX_FRAME: bool = false;
 // ---------------------------------------------------------------------------
 
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
-    besalt::tls::current_ipc_ctx()
+    trona_posix::tls::current_ipc_ctx()
 }
 
 fn irq_badge_bits() -> u64 {
@@ -90,12 +91,12 @@ fn irq_badge_bits() -> u64 {
 }
 
 fn signal_ready() {
-    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 fn log_frame_bytes(prefix: &[u8], frame: &[u8]) {
     let dump_len = core::cmp::min(frame.len(), 32);
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(prefix);
         _lb.str(b" len=");
         _lb.dec(frame.len() as u64);
@@ -124,7 +125,7 @@ fn log_ethertype(prefix: &[u8], frame: &[u8]) {
         return;
     }
     let ethertype = ((frame[12] as u16) << 8) | (frame[13] as u16);
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(prefix);
         _lb.str(b" len=");
         _lb.dec(frame.len() as u64);
@@ -143,7 +144,7 @@ fn mac_addr() -> [u8; 6] {
 /// Register with name service as "netdrv".
 fn register_nameserv() {
     let name = b"netdrv";
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = POSIX_NS_REGISTER;
     msg.regs[0] = name.len() as u64;
     msg.length = 1 + (name.len() as u64 + 7) / 8;
@@ -154,10 +155,10 @@ fn register_nameserv() {
             *dst.add(i) = name[i];
         }
         ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != BESALT_OK {
-            besalt::uerror!(|_lb| {
+        if err != 0 || reply.label != TRONA_OK {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[netdrv] nameserv registration failed\n");
             });
         }
@@ -178,7 +179,7 @@ fn register_nameserv() {
 /// 3. Bind notification to our TCB for Recv wakeup
 fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
     if !has_irq_handler {
-        besalt::uwarn!(|_lb| {
+        trona::uwarn!(|_lb| {
             _lb.str(b"[netdrv] No IRQ handler cap from pcisrv, skipping IRQ setup\n");
         });
         return false;
@@ -189,12 +190,12 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
     unsafe {
         ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_IRQ_NOTIFICATION, 0);
     }
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = MM_ALLOC_OBJECT;
     msg.regs[0] = OBJ_NOTIFICATION;
     msg.regs[1] = 0;
     msg.length = 2;
-    let mut alloc_reply = BesaltMsg::zeroed();
+    let mut alloc_reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
     let err = unsafe {
         ipc::call_ctx(
@@ -204,8 +205,8 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
             &raw mut alloc_reply,
         )
     };
-    if err != 0 || alloc_reply.label != BESALT_OK {
-        besalt::uerror!(|_lb| {
+    if err != 0 || alloc_reply.label != TRONA_OK {
+        trona::uerror!(|_lb| {
             _lb.str(b"[netdrv] Failed to allocate Notification via mmsrv: ");
             _lb.dec(if err != 0 {
                 err as u64
@@ -220,7 +221,7 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
     // Step 2: Bind IRQ handler to notification
     let err = invoke::irq_handler_set_notification(CAP_IRQ_HANDLER, CAP_IRQ_NOTIFICATION);
     if err != 0 {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[netdrv] Failed to bind IRQ to notification: ");
             _lb.dec(err as u64);
             _lb.putc(b'\n');
@@ -231,7 +232,7 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
     // Step 3: Bind notification to our TCB for Recv wakeup
     let err = invoke::tcb_bind_notification(CAP_SELF_TCB, CAP_IRQ_NOTIFICATION);
     if err != 0 {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[netdrv] Failed to bind notification to TCB: ");
             _lb.dec(err as u64);
             _lb.putc(b'\n');
@@ -248,7 +249,7 @@ fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
         *(&raw mut IRQ_BADGE_BITS) = 1u64 << ((irq_line as u64) & 63);
     }
 
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[netdrv] IRQ ");
         _lb.dec(irq_line as u64);
         _lb.str(b" handler configured\n");
@@ -285,7 +286,7 @@ fn shm_rx_enqueue(frame: &[u8]) -> bool {
             let next = (rx_head + 1) % slot_count;
             if next == rx_tail {
                 signal_netsrv_rx();
-                let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+                let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
                 continue;
             }
 
@@ -361,7 +362,7 @@ fn signal_netsrv_rx() {
     // signal calls. Single-threaded driver.
     let cap = unsafe { *(&raw const NETSRV_RX_NTFN) };
     if cap != 0 {
-        let _ = besalt::syscall::syscall(SYS_SIGNAL, cap, 1, 0, 0, 0, 0);
+        let _ = trona::syscall::syscall(SYS_SIGNAL, cap, 1, 0, 0, 0, 0);
     }
 }
 
@@ -384,7 +385,7 @@ fn drain_rx() -> bool {
             unsafe {
                 if !*(&raw const LOGGED_RX_FRAME) {
                     *(&raw mut LOGGED_RX_FRAME) = true;
-                    besalt::udebug!(|_lb| {
+                    trona::udebug!(|_lb| {
                         _lb.str(b"[netdrv] RX header-skip=");
                         _lb.dec(hdr_sz as u64);
                         _lb.putc(b'\n');
@@ -455,15 +456,15 @@ fn poll_device_once(irq_enabled: bool, badge: u64) {
 ///   extra_caps[0] = netsrv's badged RX notification cap
 ///
 /// On success, replies with:
-///   label = BESALT_OK
+///   label = TRONA_OK
 ///   regs[0] = MAC address low 4 bytes (network order)
 ///   regs[1] = MAC address high 2 bytes (network order)
 ///   regs[2] = link status (1 = up)
 ///   extra_caps[0] = badged copy of our IRQ notification (badge=TX_BADGE)
-fn handle_driver_register(msg: &BesaltMsg, reply: &mut BesaltMsg) {
+fn handle_driver_register(msg: &TronaMsg, reply: &mut TronaMsg) {
     let shm_id = msg.regs[0];
     if shm_id != NET_SHM_ID {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return;
     }
 
@@ -476,21 +477,21 @@ fn handle_driver_register(msg: &BesaltMsg, reply: &mut BesaltMsg) {
 
     // Map the SHM into our address space via mmsrv
     let ctx = ipc_ctx();
-    let mut map_msg = BesaltMsg::zeroed();
+    let mut map_msg = TronaMsg::zeroed();
     map_msg.label = MM_SHM_MAP;
     map_msg.regs[0] = NET_SHM_ID;
     map_msg.regs[1] = 0; // client_badge: 0 = map into caller (netdrv)
     map_msg.regs[2] = SHM_VADDR;
     map_msg.regs[3] = 0x3; // RW permissions
     map_msg.length = 4;
-    let mut map_reply = BesaltMsg::zeroed();
+    let mut map_reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const map_msg, &raw mut map_reply) };
-    if err != 0 || map_reply.label != BESALT_OK {
-        besalt::uerror!(|_lb| {
+    if err != 0 || map_reply.label != TRONA_OK {
+        trona::uerror!(|_lb| {
             _lb.str(b"[netdrv] Failed to map SHM\n");
         });
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return;
     }
     // SAFETY: Single-threaded driver; written once during registration.
@@ -513,13 +514,13 @@ fn handle_driver_register(msg: &BesaltMsg, reply: &mut BesaltMsg) {
         | ((mac[2] as u32) << 8)
         | (mac[3] as u32);
     let mac_hi = ((mac[4] as u16) << 8) | (mac[5] as u16);
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
     reply.regs[0] = mac_lo as u64;
     reply.regs[1] = mac_hi as u64;
     reply.regs[2] = 1; // link status: up
     reply.length = 3;
 
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[netdrv] DRIVER_REGISTER complete, SHM mapped rx_ntfn_cap=");
         _lb.dec(CAP_NETSRV_RX_NTFN);
         _lb.str(b" tx_ntfn_cap=");
@@ -540,7 +541,7 @@ fn handle_driver_register(msg: &BesaltMsg, reply: &mut BesaltMsg) {
 /// - On IPC request (badge == 0): dispatch DRIVER_REGISTER, fill reply,
 ///   then reply_recv (atomically reply and wait for next event).
 fn event_loop(device_ok: bool) -> ! {
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[netdrv] Entering event loop\n");
     });
 
@@ -549,17 +550,17 @@ fn event_loop(device_ok: bool) -> ! {
     let use_timed_poll = device_ok;
 
     if device_ok && !irq_enabled {
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[netdrv] No IRQ, using timed-recv polling\n");
         });
     } else if !device_ok {
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[netdrv] No device, serving IPC only\n");
         });
     }
 
     let ctx = ipc_ctx();
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     let mut badge: u64 = 0;
     let mut have_event = false;
 
@@ -571,7 +572,7 @@ fn event_loop(device_ok: bool) -> ! {
 
     loop {
         if !have_event {
-            msg = BesaltMsg::zeroed();
+            msg = TronaMsg::zeroed();
             badge = 0;
 
             if use_timed_poll {
@@ -603,11 +604,11 @@ fn event_loop(device_ok: bool) -> ! {
             }
         } else {
             // IPC request on server endpoint
-            let mut reply = BesaltMsg::zeroed();
+            let mut reply = TronaMsg::zeroed();
             match msg.label {
                 DRIVER_REGISTER => handle_driver_register(&msg, &mut reply),
                 _ => {
-                    reply.label = BESALT_INVALID_OPERATION;
+                    reply.label = TRONA_INVALID_OPERATION;
                 }
             }
 
@@ -619,7 +620,7 @@ fn event_loop(device_ok: bool) -> ! {
                     let _ = unsafe { ipc::send_ctx(ctx, CAP_REPLY_TEMP, &raw const reply) };
                 } else {
                     // Fall back to reply_recv if we cannot split reply + timed recv.
-                    msg = BesaltMsg::zeroed();
+                    msg = TronaMsg::zeroed();
                     badge = 0;
                     // SAFETY: IPC context is valid.
                     unsafe {
@@ -635,11 +636,11 @@ fn event_loop(device_ok: bool) -> ! {
                 }
             } else {
                 if use_timed_poll && reply_has_caps {
-                    besalt::udebug!(|_lb| {
+                    trona::udebug!(|_lb| {
                         _lb.str(b"[netdrv] reply carries caps, using reply_recv path\n");
                     });
                 }
-                msg = BesaltMsg::zeroed();
+                msg = TronaMsg::zeroed();
                 badge = 0;
                 // SAFETY: IPC context is valid.
                 unsafe {
@@ -663,7 +664,7 @@ fn event_loop(device_ok: bool) -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[netdrv] virtio-net Hardware Driver starting\n");
     });
 
@@ -674,7 +675,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // Try modern virtio (device ID 0x1041) first
     if let Some((bus, dev, func)) = virtio_modern::find_virtio_net_modern() {
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[netdrv] Found modern virtio-net device\n");
         });
         if virtio_modern::init_virtio_modern(bus, dev, func) {
@@ -695,7 +696,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     if !device_ok {
         match virtio::find_virtio_net() {
             Some((bus, dev, func, bar0, _bar0_full)) => {
-                besalt::uinfo!(|_lb| {
+                trona::uinfo!(|_lb| {
                     _lb.str(b"[netdrv] Found virtio-net at ");
                     _lb.dec(bus as u64);
                     _lb.putc(b':');
@@ -709,7 +710,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     Some((_bar_phys, _bar_bits, bar_size, irq, _bar_is_io, has_irq)) => {
                         irq_line = irq;
                         has_irq_handler = has_irq;
-                        besalt::uinfo!(|_lb| {
+                        trona::uinfo!(|_lb| {
                             _lb.str(b"[netdrv] IRQ=");
                             _lb.dec(irq as u64);
                             _lb.putc(b'\n');
@@ -724,20 +725,20 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                         } else if virtio::init_virtio(bar0, bar_size) {
                             device_ok = true;
                         } else {
-                            besalt::uerror!(|_lb| {
+                            trona::uerror!(|_lb| {
                                 _lb.str(b"[netdrv] Failed to init virtio transport\n");
                             });
                         }
                     }
                     None => {
-                        besalt::uerror!(|_lb| {
+                        trona::uerror!(|_lb| {
                             _lb.str(b"[netdrv] Failed to get PCI caps from pcisrv\n");
                         });
                     }
                 }
             }
             None => {
-                besalt::uwarn!(|_lb| {
+                trona::uwarn!(|_lb| {
                     _lb.str(b"[netdrv] No virtio-net device found\n");
                 });
             }
@@ -747,18 +748,18 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     // Set up IRQ handling
     if device_ok && irq_line > 0 {
         if setup_irq(irq_line, has_irq_handler) {
-            besalt::uinfo!(|_lb| {
+            trona::uinfo!(|_lb| {
                 _lb.str(b"[netdrv] IRQ handling enabled\n");
             });
         } else {
-            besalt::uwarn!(|_lb| {
+            trona::uwarn!(|_lb| {
                 _lb.str(b"[netdrv] IRQ setup failed, using polling mode\n");
             });
         }
     }
 
     if device_ok {
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[netdrv] virtio-net device ready\n");
         });
     }

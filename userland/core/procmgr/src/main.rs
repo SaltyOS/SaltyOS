@@ -1,7 +1,7 @@
 //! SaltyOS Process Manager
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! Panic handler provided by libbesalt.so (dynamic linking).
+//! Panic handler provided by libtrona.so (dynamic linking).
 
 #![no_std]
 #![no_main]
@@ -17,8 +17,8 @@ mod spawn_tx;
 mod timer;
 mod vfs_load;
 
-use besalt::ipc;
-use besalt::types::*;
+use trona::ipc;
+use trona::types::*;
 
 use proc_table::{
     find_by_badge, find_by_pid, init_proctab, proctab, proctab_cap, MAX_NAME_LEN, PROC_FREE,
@@ -74,7 +74,7 @@ const PM_UMASK: u64 = 30;
 const PM_REQUEST_UNTYPED: u64 = 31;
 const PM_SETITIMER: u64 = 32;
 const PM_GETITIMER: u64 = 33;
-const BESALT_PENDING: u64 = 0x80;
+const TRONA_PENDING: u64 = 0x80;
 
 const PM_SIGKILL: usize = 9;
 const PM_SIGALRM: usize = 14;
@@ -85,7 +85,7 @@ const PM_SIGTSTP: usize = 20;
 const PM_SIGTTIN: usize = 21;
 const PM_SIGTTOU: usize = 22;
 
-use besalt::layout::{self};
+use trona::layout::{self};
 
 const CHILD_RTLD_FRAME_SLOT_START: u64 = 64;
 const PROCMGR_SCRATCH_VADDR: u64 = 0x0000_0000_0500_0000;
@@ -114,49 +114,49 @@ const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
 const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
-const AT_BESALT_VSPACE: u64 = 0x1001;
-const AT_BESALT_SCRATCH: u64 = 0x1002;
-const AT_BESALT_INITRD: u64 = 0x1003;
-const AT_BESALT_INITRD_SZ: u64 = 0x1004;
-const AT_BESALT_FRAME_SLOT: u64 = 0x1005;
-const AT_BESALT_SHARED_LIB_BASE: u64 = 0x1006;
-const AT_BESALT_SLOT_BASE: u64 = 0x1007;
-const AT_BESALT_SLOT_COUNT: u64 = 0x1008;
-const AT_BESALT_CSPACE_NTFN: u64 = 0x100A;
-const AT_BESALT_MM_EP: u64 = 0x100B;
+const AT_TRONA_VSPACE: u64 = 0x1001;
+const AT_TRONA_SCRATCH: u64 = 0x1002;
+const AT_TRONA_INITRD: u64 = 0x1003;
+const AT_TRONA_INITRD_SZ: u64 = 0x1004;
+const AT_TRONA_FRAME_SLOT: u64 = 0x1005;
+const AT_TRONA_SHARED_LIB_BASE: u64 = 0x1006;
+const AT_TRONA_SLOT_BASE: u64 = 0x1007;
+const AT_TRONA_SLOT_COUNT: u64 = 0x1008;
+const AT_TRONA_CSPACE_NTFN: u64 = 0x100A;
+const AT_TRONA_MM_EP: u64 = 0x100B;
 
 // ---- waitpid options ----
 const WNOHANG: u32 = 1;
 const WUNTRACED: u32 = 2;
 
 // ---- Shorthand re-exports ----
-const OBJ_TCB: u64 = besalt::OBJ_TCB;
-const OBJ_UNTYPED: u64 = besalt::OBJ_UNTYPED;
-const OBJ_VSPACE: u64 = besalt::OBJ_VSPACE;
-const OBJ_CNODE: u64 = besalt::OBJ_CNODE;
-const OBJ_SCHED_CONTEXT: u64 = besalt::OBJ_SCHED_CONTEXT;
-const OBJ_NOTIFICATION: u64 = besalt::OBJ_NOTIFICATION;
-const BESALT_OK: u64 = besalt::BESALT_OK;
-const BESALT_OUT_OF_MEMORY: u64 = besalt::BESALT_OUT_OF_MEMORY;
-const BESALT_NOT_FOUND: u64 = besalt::BESALT_NOT_FOUND;
-const BESALT_OUT_OF_RANGE: u64 = besalt::BESALT_OUT_OF_RANGE;
-const BESALT_INVALID_ARGUMENT: u64 = besalt::BESALT_INVALID_ARGUMENT;
-const BESALT_INVALID_OPERATION: u64 = besalt::BESALT_INVALID_OPERATION;
-const BESALT_WOULD_BLOCK: u64 = besalt::BESALT_WOULD_BLOCK;
-const BESALT_CANCELLED: u64 = besalt::BESALT_CANCELLED;
-const VSPACE_FLAG_WRITABLE: u64 = besalt::VSPACE_FLAG_WRITABLE;
-const VSPACE_FLAG_USER: u64 = besalt::VSPACE_FLAG_USER;
-const CAP_RIGHTS_ALL: u64 = besalt::CAP_RIGHTS_ALL;
+const OBJ_TCB: u64 = trona::OBJ_TCB;
+const OBJ_UNTYPED: u64 = trona::OBJ_UNTYPED;
+const OBJ_VSPACE: u64 = trona::OBJ_VSPACE;
+const OBJ_CNODE: u64 = trona::OBJ_CNODE;
+const OBJ_SCHED_CONTEXT: u64 = trona::OBJ_SCHED_CONTEXT;
+const OBJ_NOTIFICATION: u64 = trona::OBJ_NOTIFICATION;
+const TRONA_OK: u64 = trona::TRONA_OK;
+const TRONA_OUT_OF_MEMORY: u64 = trona::TRONA_OUT_OF_MEMORY;
+const TRONA_NOT_FOUND: u64 = trona::TRONA_NOT_FOUND;
+const TRONA_OUT_OF_RANGE: u64 = trona::TRONA_OUT_OF_RANGE;
+const TRONA_INVALID_ARGUMENT: u64 = trona::TRONA_INVALID_ARGUMENT;
+const TRONA_INVALID_OPERATION: u64 = trona::TRONA_INVALID_OPERATION;
+const TRONA_WOULD_BLOCK: u64 = trona::TRONA_WOULD_BLOCK;
+const TRONA_CANCELLED: u64 = trona::TRONA_CANCELLED;
+const VSPACE_FLAG_WRITABLE: u64 = trona::VSPACE_FLAG_WRITABLE;
+const VSPACE_FLAG_USER: u64 = trona::VSPACE_FLAG_USER;
+const CAP_RIGHTS_ALL: u64 = trona::CAP_RIGHTS_ALL;
 const INITRD_COPY_RIGHTS: u64 = (1 << 0) | (1 << 2) | (1 << 3);
 const UT_MIRROR_COUNT: Cap = 16;
-const INITRD_VADDR: u64 = besalt::INITRD_VADDR;
-const BOOTINFO_VADDR: u64 = besalt::BOOTINFO_VADDR;
-const BOOTINFO_MAGIC: u64 = besalt::BOOTINFO_MAGIC;
+const INITRD_VADDR: u64 = trona::INITRD_VADDR;
+const BOOTINFO_VADDR: u64 = trona::BOOTINFO_VADDR;
+const BOOTINFO_MAGIC: u64 = trona::BOOTINFO_MAGIC;
 
 // ---- CSpace expansion via bound notification ----
 const CHILD_CAP_CSPACE_NTFN: u64 = 10; // Minted notification for CSpace expansion signaling
-const CSPACE_EXPAND_BASE: u64 = besalt::consts::CSPACE_EXPAND_BASE;
-const MAX_CSPACE_EXPANSIONS: usize = besalt::consts::MAX_CSPACE_EXPANSIONS;
+const CSPACE_EXPAND_BASE: u64 = trona::consts::CSPACE_EXPAND_BASE;
+const MAX_CSPACE_EXPANSIONS: usize = trona::consts::MAX_CSPACE_EXPANSIONS;
 const CSPACE_EXPAND_BITS: u64 = 10; // 1024 slots per expansion sub-CNode
 
 /// Procmgr's bound notification cap (for receiving CSpace expansion signals).
@@ -184,11 +184,11 @@ fn read_boot_info_initrd_size() -> usize {
 // ===========================================================================
 
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
-    besalt::tls::current_ipc_ctx()
+    trona_posix::tls::current_ipc_ctx()
 }
 
 fn signal_ready() {
-    let _ = besalt::syscall::syscall(besalt::SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(trona::SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
@@ -218,7 +218,7 @@ fn strip_elf_suffix(name: &mut [u8], mut len: usize) -> usize {
 /// Extract process path/name from message regs and normalize by stripping
 /// an optional trailing ".elf" suffix.
 /// Returns the name buffer and its length.
-fn extract_name(msg: &BesaltMsg, name_reg_idx: usize) -> ([u8; MAX_NAME_LEN + 5], usize) {
+fn extract_name(msg: &TronaMsg, name_reg_idx: usize) -> ([u8; MAX_NAME_LEN + 5], usize) {
     let mut name = [0u8; MAX_NAME_LEN + 5];
     let mut name_len = msg.regs[0] as usize;
     if name_len > MAX_NAME_LEN {
@@ -244,7 +244,7 @@ unsafe fn wait_for_child_ready(
     timeout_ns: u64,
 ) -> i32 {
     let start_ns = {
-        let now = besalt::syscall::syscall(besalt::SYS_CLOCK_GETTIME, 1, 0, 0, 0, 0, 0);
+        let now = trona::syscall::syscall(trona::SYS_CLOCK_GETTIME, 1, 0, 0, 0, 0, 0);
         if now.error == 0 {
             Some(now.value)
         } else {
@@ -254,18 +254,18 @@ unsafe fn wait_for_child_ready(
     let mut yields: usize = 0;
 
     loop {
-        let poll = besalt::syscall::syscall(besalt::SYS_POLL, ready_ntfn, 0, 0, 0, 0, 0);
+        let poll = trona::syscall::syscall(trona::SYS_POLL, ready_ntfn, 0, 0, 0, 0, 0);
         if poll.error == 0 {
             if (poll.value & READY_SIGNAL_BITS) != 0 {
                 return 0;
             }
-        } else if poll.error != BESALT_WOULD_BLOCK {
-            besalt::uerror!(|_lb| {
+        } else if poll.error != TRONA_WOULD_BLOCK {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] ready poll failed err=");
                 _lb.hex(poll.error);
                 _lb.str(b"\n");
             });
-            let _ = besalt::invoke::tcb_suspend_retry(child_tcb, 4);
+            let _ = trona::invoke::tcb_suspend_retry(child_tcb, 4);
             return -1;
         }
 
@@ -275,7 +275,7 @@ unsafe fn wait_for_child_ready(
         unsafe {
             let bound_ntfn = *(&raw const PM_BOUND_NTFN);
             if bound_ntfn != 0 {
-                let np = besalt::syscall::syscall(besalt::SYS_POLL, bound_ntfn, 0, 0, 0, 0, 0);
+                let np = trona::syscall::syscall(trona::SYS_POLL, bound_ntfn, 0, 0, 0, 0, 0);
                 if np.error == 0 && np.value != 0 {
                     let cs_bits = (np.value >> 16) & 0xFFFF;
                     if cs_bits != 0 {
@@ -286,7 +286,7 @@ unsafe fn wait_for_child_ready(
         }
 
         let timed_out = if let Some(start) = start_ns {
-            let now = besalt::syscall::syscall(besalt::SYS_CLOCK_GETTIME, 1, 0, 0, 0, 0, 0);
+            let now = trona::syscall::syscall(trona::SYS_CLOCK_GETTIME, 1, 0, 0, 0, 0, 0);
             if now.error == 0 {
                 now.value.saturating_sub(start) >= timeout_ns
             } else {
@@ -299,16 +299,16 @@ unsafe fn wait_for_child_ready(
             break;
         }
 
-        let _ = besalt::syscall::syscall(besalt::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        let _ = trona::syscall::syscall(trona::SYS_YIELD, 0, 0, 0, 0, 0, 0);
         yields += 1;
     }
 
-    besalt::uerror!(|_lb| {
+    trona::uerror!(|_lb| {
         _lb.str(b"[PROCMGR] child ready timeout: ");
         _lb.bytes(child_name);
         _lb.str(b"\n");
     });
-    let _ = besalt::invoke::tcb_suspend_retry(child_tcb, 4);
+    let _ = trona::invoke::tcb_suspend_retry(child_tcb, 4);
     -1
 }
 
@@ -316,29 +316,29 @@ unsafe fn wait_for_child_ready(
 // handle_getpid / handle_getppid
 // ===========================================================================
 
-unsafe fn handle_getpid(reply: &mut BesaltMsg, badge: u64) {
+unsafe fn handle_getpid(reply: &mut TronaMsg, badge: u64) {
     let Some(idx) = find_by_badge(badge) else {
-        reply.label = BESALT_NOT_FOUND;
+        reply.label = TRONA_NOT_FOUND;
         return;
     };
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
     reply.length = 1;
     reply.regs[0] = unsafe { proctab(idx).pid as u64 };
 }
 
-unsafe fn handle_getppid(reply: &mut BesaltMsg, badge: u64) {
+unsafe fn handle_getppid(reply: &mut TronaMsg, badge: u64) {
     let Some(idx) = find_by_badge(badge) else {
-        reply.label = BESALT_NOT_FOUND;
+        reply.label = TRONA_NOT_FOUND;
         return;
     };
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
     reply.length = 1;
     reply.regs[0] = unsafe { proctab(idx).ppid as u64 };
 }
 
 /// List all active PIDs.
 /// Reply: regs[0..18] = PIDs (up to 18), regs[19] = count.
-unsafe fn handle_list_pids(reply: &mut BesaltMsg) {
+unsafe fn handle_list_pids(reply: &mut TronaMsg) {
     unsafe {
         let cap = proc_table::proctab_cap();
         let mut count: usize = 0;
@@ -350,20 +350,20 @@ unsafe fn handle_list_pids(reply: &mut BesaltMsg) {
             }
         }
         reply.regs[19] = count as u64;
-        reply.label = BESALT_OK;
+        reply.label = TRONA_OK;
         reply.length = 20;
     }
 }
 
 unsafe fn recv_with_timer(
-    msg: *mut BesaltMsg,
+    msg: *mut TronaMsg,
     badge: *mut u64,
 ) -> i32 {
     unsafe {
         if timer::has_pending_timers() {
-            let now = besalt::syscall::syscall(
-                besalt::SYS_CLOCK_GETTIME,
-                besalt::consts::CLOCK_REALTIME as u64,
+            let now = trona::syscall::syscall(
+                trona::SYS_CLOCK_GETTIME,
+                trona::consts::CLOCK_REALTIME as u64,
                 0,
                 0,
                 0,
@@ -374,7 +374,7 @@ unsafe fn recv_with_timer(
                 let deadline = timer::nearest_deadline_ns();
                 if deadline <= now.value {
                     if !msg.is_null() {
-                        *msg = BesaltMsg::zeroed();
+                        *msg = TronaMsg::zeroed();
                     }
                     if !badge.is_null() {
                         *badge = 1;
@@ -383,16 +383,16 @@ unsafe fn recv_with_timer(
                 }
 
                 let timeout = deadline.saturating_sub(now.value).max(100_000);
-                let err = besalt::ipc::recv_timed_ctx(
+                let err = trona::ipc::recv_timed_ctx(
                     ipc_ctx(),
                     CAP_SERVER_EP,
                     timeout,
                     msg,
                     badge,
                 );
-                if err as u64 == BESALT_CANCELLED {
+                if err as u64 == TRONA_CANCELLED {
                     if !msg.is_null() {
-                        *msg = BesaltMsg::zeroed();
+                        *msg = TronaMsg::zeroed();
                     }
                     if !badge.is_null() {
                         *badge = 1;
@@ -403,7 +403,7 @@ unsafe fn recv_with_timer(
             }
         }
 
-        besalt::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, msg, badge)
+        trona::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, msg, badge)
     }
 }
 
@@ -411,11 +411,11 @@ unsafe fn recv_with_timer(
 /// Request: regs[0] = pid
 /// Reply: regs[0]=pid, regs[1]=ppid, regs[2]=pgid, regs[3]=sid,
 ///        regs[4]=state, regs[5..9]=name(32B)
-unsafe fn handle_get_proc_info(msg: &BesaltMsg, reply: &mut BesaltMsg) {
+unsafe fn handle_get_proc_info(msg: &TronaMsg, reply: &mut TronaMsg) {
     unsafe {
         let pid = msg.regs[0] as u32;
         let Some(idx) = proc_table::find_by_pid(pid) else {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
             return;
         };
         let p = &*proc_table::proctab(idx);
@@ -429,7 +429,7 @@ unsafe fn handle_get_proc_info(msg: &BesaltMsg, reply: &mut BesaltMsg) {
         for i in 0..32 {
             *dst.add(i) = p.name[i];
         }
-        reply.label = BESALT_OK;
+        reply.label = TRONA_OK;
         reply.length = 9;
     }
 }
@@ -438,16 +438,16 @@ unsafe fn handle_get_proc_info(msg: &BesaltMsg, reply: &mut BesaltMsg) {
 // handle_umask
 // ===========================================================================
 
-unsafe fn handle_umask(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: u64) {
+unsafe fn handle_umask(msg: &TronaMsg, reply: &mut TronaMsg, badge: u64) {
     let Some(idx) = find_by_badge(badge) else {
-        reply.label = BESALT_NOT_FOUND;
+        reply.label = TRONA_NOT_FOUND;
         return;
     };
     unsafe {
         let p = proctab(idx);
         let old = p.umask;
         p.umask = (msg.regs[0] as u32) & 0o777;
-        reply.label = BESALT_OK;
+        reply.label = TRONA_OK;
         reply.length = 1;
         reply.regs[0] = old as u64;
     }
@@ -462,8 +462,8 @@ unsafe fn handle_umask(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: u64) {
 ///   msg.regs[0] = desired sub-untyped size_bits (e.g. 28 = 256 MB)
 /// Reply sends the sub-untyped cap via extra_caps (1 cap transferred).
 unsafe fn handle_request_untyped(
-    msg: &BesaltMsg,
-    reply: &mut BesaltMsg,
+    msg: &TronaMsg,
+    reply: &mut TronaMsg,
     allocator: &mut alloc::Allocator,
 ) {
     unsafe {
@@ -481,7 +481,7 @@ unsafe fn handle_request_untyped(
         let temp_slot = match allocator.alloc_single_slot() {
             Some(s) => s,
             None => {
-                reply.label = BESALT_OUT_OF_MEMORY;
+                reply.label = TRONA_OUT_OF_MEMORY;
                 return;
             }
         };
@@ -500,18 +500,18 @@ unsafe fn handle_request_untyped(
 
         if !success {
             allocator.free_single_slot(temp_slot);
-            reply.label = BESALT_OUT_OF_MEMORY;
+            reply.label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
         // Stage the sub-untyped cap for transfer via IPC extra_caps
         ipc::set_send_cap_ctx(ipc_ctx(), 0, temp_slot);
 
-        reply.label = BESALT_OK;
+        reply.label = TRONA_OK;
         reply.length = 1;
         reply.regs[0] = actual_bits;
 
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] Provisioned sub-untyped 2^");
             _lb.hex(actual_bits);
             _lb.str(b" to mmsrv\n");
@@ -525,14 +525,14 @@ unsafe fn handle_request_untyped(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[PROCMGR] SaltyOS process manager starting\n");
     });
 
     unsafe {
         // Initialize process table (allocates via mmsrv)
         init_proctab();
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[PROCMGR] process table ready\n");
         });
 
@@ -543,7 +543,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             CAP_UNTYPED_START,
             UT_MIRROR_COUNT as usize,
         );
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[PROCMGR] allocator ready\n");
         });
 
@@ -560,7 +560,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             let ntfn_slot = match alloc.alloc_single_slot() {
                 Some(s) => s,
                 None => {
-                    besalt::uwarn!(|_lb| {
+                    trona::uwarn!(|_lb| {
                         _lb.str(b"[PROCMGR] WARN: could not alloc slot for bound ntfn\n");
                     });
                     0
@@ -568,39 +568,39 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             };
             if ntfn_slot != 0 {
                 // Request notification object from mmsrv (centralized allocator)
-                besalt::ipc::set_receive_slot_ctx(
+                trona::ipc::set_receive_slot_ctx(
                     ipc_ctx(),
                     CAP_SELF_CSPACE,
                     ntfn_slot,
                     0,
                 );
-                let mut mm_msg = besalt::types::BesaltMsg::zeroed();
-                let mut mm_reply = besalt::types::BesaltMsg::zeroed();
-                mm_msg.label = besalt::MM_ALLOC_OBJECT;
+                let mut mm_msg = trona::types::TronaMsg::zeroed();
+                let mut mm_reply = trona::types::TronaMsg::zeroed();
+                mm_msg.label = trona::MM_ALLOC_OBJECT;
                 mm_msg.length = 2;
                 mm_msg.regs[0] = OBJ_NOTIFICATION;
                 mm_msg.regs[1] = 0;
-                let err = besalt::ipc::call_ctx(
+                let err = trona::ipc::call_ctx(
                     ipc_ctx(),
                     CAP_MMSRV_EP,
                     &raw const mm_msg,
                     &raw mut mm_reply,
                 );
-                let alloc_ok = err == 0 && mm_reply.label == besalt::BESALT_OK;
+                let alloc_ok = err == 0 && mm_reply.label == trona::TRONA_OK;
                 if !alloc_ok {
-                    besalt::uwarn!(|_lb| {
+                    trona::uwarn!(|_lb| {
                         _lb.str(b"[PROCMGR] WARN: alloc notification from mmsrv failed\n");
                     });
                     alloc.free_single_slot(ntfn_slot);
                 } else {
-                    let err = besalt::invoke::tcb_bind_notification(CAP_SELF_TCB, ntfn_slot);
+                    let err = trona::invoke::tcb_bind_notification(CAP_SELF_TCB, ntfn_slot);
                     if err != 0 {
-                        besalt::uwarn!(|_lb| {
+                        trona::uwarn!(|_lb| {
                             _lb.str(b"[PROCMGR] WARN: bind notification failed\n");
                         });
                     } else {
                         *(&raw mut PM_BOUND_NTFN) = ntfn_slot;
-                        besalt::uinfo!(|_lb| {
+                        trona::uinfo!(|_lb| {
                             _lb.str(b"[PROCMGR] bound notification ready for CSpace expansion\n");
                         });
                     }
@@ -614,10 +614,10 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
         // Register with nameserv — blocks until nameserv Recv()s
         if CAP_NAMESERV_EP != 0 {
-            let mut reg_msg = BesaltMsg::zeroed();
-            let mut reg_reply = BesaltMsg::zeroed();
+            let mut reg_msg = TronaMsg::zeroed();
+            let mut reg_reply = TronaMsg::zeroed();
             let svc_name = b"procmgr";
-            reg_msg.label = besalt::consts::POSIX_NS_REGISTER;
+            reg_msg.label = trona::consts::POSIX_NS_REGISTER;
             reg_msg.regs[0] = svc_name.len() as u64;
             reg_msg.length = 1 + (svc_name.len() as u64 + 7) / 8;
             let dst = &raw mut reg_msg.regs[1] as *mut u8;
@@ -633,27 +633,27 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 &raw const reg_msg,
                 &raw mut reg_reply,
             );
-            if err == 0 && reg_reply.label == BESALT_OK {
-                besalt::uinfo!(|_lb| {
+            if err == 0 && reg_reply.label == TRONA_OK {
+                trona::uinfo!(|_lb| {
                     _lb.str(b"[PROCMGR] registered with nameserv\n");
                 });
             } else {
-                besalt::uwarn!(|_lb| {
+                trona::uwarn!(|_lb| {
                     _lb.str(b"[PROCMGR] WARN: nameserv registration failed\n");
                 });
             }
         }
 
         // Initial recv
-        let mut msg = BesaltMsg::zeroed();
+        let mut msg = TronaMsg::zeroed();
         let mut badge: u64 = 0;
 
-        besalt::invoke::cnode_delete(CAP_SELF_CSPACE, CAP_RECV_SCRATCH);
+        trona::invoke::cnode_delete(CAP_SELF_CSPACE, CAP_RECV_SCRATCH);
         ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_RECV_SCRATCH, 0);
 
         let err = recv_with_timer(&raw mut msg, &raw mut badge);
         if err != 0 {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] initial recv failed\n");
             });
             idle();
@@ -663,7 +663,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         loop {
             timer::process_expired_timers();
 
-            let mut reply = BesaltMsg::zeroed();
+            let mut reply = TronaMsg::zeroed();
             let mut skip_reply = false;
             // Bound notification delivery: label=0 and badge!=0 means the
             // kernel delivered a notification word instead of an IPC message.
@@ -728,34 +728,34 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     PM_UMASK => handle_umask(&msg, &mut reply, badge),
                     PM_REQUEST_UNTYPED => handle_request_untyped(&msg, &mut reply, &mut *(&raw mut ALLOCATOR)),
                     _ => {
-                        besalt::uerror!(|_lb| {
+                        trona::uerror!(|_lb| {
                             _lb.str(b"[PROCMGR] unknown label=");
                             _lb.hex(msg.label);
                             _lb.str(b"\n");
                         });
-                        reply.label = BESALT_INVALID_OPERATION;
+                        reply.label = TRONA_INVALID_OPERATION;
                     }
                 }
             } // end else (notification vs IPC dispatch)
 
-            besalt::invoke::cnode_delete(CAP_SELF_CSPACE, CAP_RECV_SCRATCH);
+            trona::invoke::cnode_delete(CAP_SELF_CSPACE, CAP_RECV_SCRATCH);
             ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_RECV_SCRATCH, 0);
 
             let err = if skip_reply {
                 recv_with_timer(&raw mut msg, &raw mut badge)
             } else if timer::has_pending_timers() {
-                let save_err = besalt::invoke::cnode_save_caller(CAP_SELF_CSPACE, CAP_REPLY_TEMP);
+                let save_err = trona::invoke::cnode_save_caller(CAP_SELF_CSPACE, CAP_REPLY_TEMP);
                 if save_err != 0 {
-                    besalt::uerror!(|_lb| {
+                    trona::uerror!(|_lb| {
                         _lb.str(b"[PROCMGR] save_caller failed for timed recv err=");
                         _lb.hex(save_err as u64);
                         _lb.str(b"\n");
                     });
                     break;
                 }
-                let send_err = besalt::ipc::send_ctx(ipc_ctx(), CAP_REPLY_TEMP, &raw const reply);
+                let send_err = trona::ipc::send_ctx(ipc_ctx(), CAP_REPLY_TEMP, &raw const reply);
                 if send_err != 0 {
-                    besalt::uerror!(|_lb| {
+                    trona::uerror!(|_lb| {
                         _lb.str(b"[PROCMGR] reply send failed before timed recv err=");
                         _lb.hex(send_err as u64);
                         _lb.str(b"\n");
@@ -764,7 +764,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 }
                 recv_with_timer(&raw mut msg, &raw mut badge)
             } else {
-                besalt::ipc::reply_recv_ctx(
+                trona::ipc::reply_recv_ctx(
                     ipc_ctx(),
                     CAP_SERVER_EP,
                     &raw const reply,
@@ -773,7 +773,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 )
             };
             if err != 0 {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[PROCMGR] reply_recv failed err=");
                     _lb.hex(err as u64);
                     _lb.str(b"\n");
@@ -788,6 +788,6 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
 fn idle() -> ! {
     loop {
-        besalt::syscall::syscall(besalt::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        trona::syscall::syscall(trona::SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 }

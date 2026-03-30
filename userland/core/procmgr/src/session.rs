@@ -2,17 +2,17 @@
 //! Extracted from main.rs for separation of concerns.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::types::*;
+use trona::types::*;
 
 use crate::proc_table::{find_by_badge, find_by_pid, proctab, PROC_ZOMBIE};
 
-pub(crate) unsafe fn handle_setpgid(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_setpgid(msg: &TronaMsg, reply: &mut TronaMsg, badge: u64) {
     unsafe {
         let mut target_pid = msg.regs[0] as u32;
         let mut pgid = msg.regs[1] as u32;
 
         let Some(caller_idx) = find_by_badge(badge) else {
-            reply.label = super::BESALT_NOT_FOUND;
+            reply.label = super::TRONA_NOT_FOUND;
             return;
         };
         let caller_pid = proctab(caller_idx).pid;
@@ -28,28 +28,28 @@ pub(crate) unsafe fn handle_setpgid(msg: &BesaltMsg, reply: &mut BesaltMsg, badg
         }
 
         let Some(ti) = find_by_pid(target_pid) else {
-            reply.label = super::BESALT_NOT_FOUND;
+            reply.label = super::TRONA_NOT_FOUND;
             return;
         };
 
         if target_pid != caller_pid && proctab(ti).ppid != caller_pid {
-            reply.label = super::BESALT_INVALID_OPERATION;
+            reply.label = super::TRONA_INVALID_OPERATION;
             return;
         }
 
         if proctab(ti).sid != caller_sid {
-            reply.label = super::BESALT_INVALID_OPERATION;
+            reply.label = super::TRONA_INVALID_OPERATION;
             return;
         }
 
         if proctab(ti).pid == proctab(ti).sid {
-            reply.label = super::BESALT_INVALID_OPERATION;
+            reply.label = super::TRONA_INVALID_OPERATION;
             return;
         }
 
         // Idempotent: target already in the requested group
         if proctab(ti).pgid == pgid {
-            reply.label = super::BESALT_OK;
+            reply.label = super::TRONA_OK;
             reply.length = 0;
             return;
         }
@@ -71,142 +71,142 @@ pub(crate) unsafe fn handle_setpgid(msg: &BesaltMsg, reply: &mut BesaltMsg, badg
                 }
             }
             if !pg_exists {
-                reply.label = super::BESALT_NOT_FOUND;
+                reply.label = super::TRONA_NOT_FOUND;
                 return;
             }
         }
 
         proctab(ti).pgid = pgid;
-        reply.label = super::BESALT_OK;
+        reply.label = super::TRONA_OK;
         reply.length = 0;
     }
 }
 
-pub(crate) unsafe fn handle_getpgid(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_getpgid(msg: &TronaMsg, reply: &mut TronaMsg, badge: u64) {
     unsafe {
         let mut target_pid = msg.regs[0] as u32;
 
         if target_pid == 0 {
             let Some(caller_idx) = find_by_badge(badge) else {
-                reply.label = super::BESALT_NOT_FOUND;
+                reply.label = super::TRONA_NOT_FOUND;
                 return;
             };
             target_pid = proctab(caller_idx).pid;
         }
 
         let Some(ti) = find_by_pid(target_pid) else {
-            reply.label = super::BESALT_NOT_FOUND;
+            reply.label = super::TRONA_NOT_FOUND;
             return;
         };
 
-        reply.label = super::BESALT_OK;
+        reply.label = super::TRONA_OK;
         reply.length = 1;
         reply.regs[0] = proctab(ti).pgid as u64;
     }
 }
 
-pub(crate) unsafe fn handle_setsid(reply: &mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_setsid(reply: &mut TronaMsg, badge: u64) {
     unsafe {
         let Some(idx) = find_by_badge(badge) else {
-            reply.label = super::BESALT_NOT_FOUND;
+            reply.label = super::TRONA_NOT_FOUND;
             return;
         };
         let pid = proctab(idx).pid;
         if proctab(idx).pgid == pid {
-            reply.label = super::BESALT_INVALID_OPERATION;
+            reply.label = super::TRONA_INVALID_OPERATION;
             return;
         }
         proctab(idx).sid = pid;
         proctab(idx).pgid = pid;
-        reply.label = super::BESALT_OK;
+        reply.label = super::TRONA_OK;
         reply.length = 1;
         reply.regs[0] = pid as u64;
     }
 }
 
-pub(crate) unsafe fn handle_getsid(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_getsid(msg: &TronaMsg, reply: &mut TronaMsg, badge: u64) {
     unsafe {
         let mut target_pid = msg.regs[0] as u32;
 
         if target_pid == 0 {
             let Some(caller_idx) = find_by_badge(badge) else {
-                reply.label = super::BESALT_NOT_FOUND;
+                reply.label = super::TRONA_NOT_FOUND;
                 return;
             };
             target_pid = proctab(caller_idx).pid;
         }
 
         let Some(ti) = find_by_pid(target_pid) else {
-            reply.label = super::BESALT_NOT_FOUND;
+            reply.label = super::TRONA_NOT_FOUND;
             return;
         };
 
-        reply.label = super::BESALT_OK;
+        reply.label = super::TRONA_OK;
         reply.length = 1;
         reply.regs[0] = proctab(ti).sid as u64;
     }
 }
 
-pub(crate) unsafe fn handle_getpgid_badge(msg: &BesaltMsg, reply: &mut BesaltMsg) {
+pub(crate) unsafe fn handle_getpgid_badge(msg: &TronaMsg, reply: &mut TronaMsg) {
     unsafe {
         let target_badge = msg.regs[0];
         let Some(ti) = find_by_badge(target_badge) else {
-            reply.label = super::BESALT_NOT_FOUND;
+            reply.label = super::TRONA_NOT_FOUND;
             return;
         };
 
         // Zombies are effectively dead -- don't report their pgid
         if proctab(ti).state == PROC_ZOMBIE {
-            reply.label = super::BESALT_NOT_FOUND;
+            reply.label = super::TRONA_NOT_FOUND;
             return;
         }
 
-        reply.label = super::BESALT_OK;
+        reply.label = super::TRONA_OK;
         reply.length = 1;
         reply.regs[0] = proctab(ti).pgid as u64;
     }
 }
 
-pub(crate) unsafe fn handle_getsid_badge(msg: &BesaltMsg, reply: &mut BesaltMsg) {
+pub(crate) unsafe fn handle_getsid_badge(msg: &TronaMsg, reply: &mut TronaMsg) {
     unsafe {
         let target_badge = msg.regs[0];
         let Some(ti) = find_by_badge(target_badge) else {
-            reply.label = super::BESALT_NOT_FOUND;
+            reply.label = super::TRONA_NOT_FOUND;
             return;
         };
 
-        reply.label = super::BESALT_OK;
+        reply.label = super::TRONA_OK;
         reply.length = 1;
         reply.regs[0] = proctab(ti).sid as u64;
     }
 }
 
-pub(crate) unsafe fn handle_getuid(reply: &mut BesaltMsg, _badge: u64) {
-    reply.label = super::BESALT_OK;
+pub(crate) unsafe fn handle_getuid(reply: &mut TronaMsg, _badge: u64) {
+    reply.label = super::TRONA_OK;
     reply.length = 1;
     reply.regs[0] = 0;
 }
 
-pub(crate) unsafe fn handle_geteuid(reply: &mut BesaltMsg, _badge: u64) {
-    reply.label = super::BESALT_OK;
+pub(crate) unsafe fn handle_geteuid(reply: &mut TronaMsg, _badge: u64) {
+    reply.label = super::TRONA_OK;
     reply.length = 1;
     reply.regs[0] = 0;
 }
 
-pub(crate) unsafe fn handle_getgid(reply: &mut BesaltMsg, _badge: u64) {
-    reply.label = super::BESALT_OK;
+pub(crate) unsafe fn handle_getgid(reply: &mut TronaMsg, _badge: u64) {
+    reply.label = super::TRONA_OK;
     reply.length = 1;
     reply.regs[0] = 0;
 }
 
-pub(crate) unsafe fn handle_getegid(reply: &mut BesaltMsg, _badge: u64) {
-    reply.label = super::BESALT_OK;
+pub(crate) unsafe fn handle_getegid(reply: &mut TronaMsg, _badge: u64) {
+    reply.label = super::TRONA_OK;
     reply.length = 1;
     reply.regs[0] = 0;
 }
 
-pub(crate) unsafe fn handle_getgroups(reply: &mut BesaltMsg) {
-    reply.label = super::BESALT_OK;
+pub(crate) unsafe fn handle_getgroups(reply: &mut TronaMsg) {
+    reply.label = super::TRONA_OK;
     reply.length = 1;
     reply.regs[0] = 0;
 }

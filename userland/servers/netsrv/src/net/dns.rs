@@ -5,7 +5,7 @@
 //! internal UDP socket to the runtime-configured recursive resolver, and parses
 //! responses (CNAME resolution is delegated to the upstream recursive resolver).
 
-use besalt::consts::*;
+use trona::consts::*;
 
 const DNS_PORT: u16 = 53;
 const MAX_DNS_RESULTS: usize = 4;
@@ -62,7 +62,7 @@ pub(crate) fn init_dns_socket() {
 
 /// Get monotonic time in nanoseconds.
 pub(crate) fn clock_monotonic_ns() -> u64 {
-    let r = besalt::syscall::syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0);
+    let r = trona::syscall::syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0);
     if r.error != 0 { 0 } else { r.value }
 }
 
@@ -72,7 +72,7 @@ fn generate_txn_id() -> u16 {
     let mut buf = [0u8; 2];
     // SAFETY: Passing valid stack buffer to GetRandom syscall.
     let r = unsafe {
-        besalt::syscall::syscall(SYS_GETRANDOM, buf.as_mut_ptr() as u64, 2, 0, 0, 0, 0)
+        trona::syscall::syscall(SYS_GETRANDOM, buf.as_mut_ptr() as u64, 2, 0, 0, 0, 0)
     };
     let id = u16::from_ne_bytes(buf);
     if r.error != 0 || id == 0 {
@@ -727,7 +727,7 @@ pub(crate) fn start_resolve(hostname: &[u8]) -> Option<u64> {
 
     let slot_idx = find_free_slot()?;
     let reply_cap_slot = CAP_DNS_REPLY_BASE + slot_idx as u64;
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(b"[netsrv] DNS start A slot=");
         _lb.dec(slot_idx as u64);
         _lb.str(b" host_len=");
@@ -738,7 +738,7 @@ pub(crate) fn start_resolve(hostname: &[u8]) -> Option<u64> {
     });
 
     // Save the caller's reply cap into a CNode slot
-    let err = besalt::invoke::cnode_save_caller(CAP_SELF_CSPACE, reply_cap_slot);
+    let err = trona::invoke::cnode_save_caller(CAP_SELF_CSPACE, reply_cap_slot);
     if err != 0 {
         return None;
     }
@@ -788,7 +788,7 @@ pub(crate) fn start_resolve_ptr(ip: u32) -> Option<u64> {
     let slot_idx = find_free_slot()?;
     let reply_cap_slot = CAP_DNS_REPLY_BASE + slot_idx as u64;
 
-    let err = besalt::invoke::cnode_save_caller(CAP_SELF_CSPACE, reply_cap_slot);
+    let err = trona::invoke::cnode_save_caller(CAP_SELF_CSPACE, reply_cap_slot);
     if err != 0 {
         return None;
     }
@@ -856,7 +856,7 @@ pub(crate) fn process_pending() {
         if src_ip != super::config::dns_server() || src_port != DNS_PORT {
             continue;
         }
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[netsrv] DNS recv len=");
             _lb.dec(len as u64);
             _lb.str(b" src=0x");
@@ -882,7 +882,7 @@ pub(crate) fn process_pending() {
                     DnsQueryType::A => {
                         match parse_response(&resp_buf[..len as usize], txn_id) {
                             Some(Ok(result)) => {
-                                besalt::udebug!(|_lb| {
+                                trona::udebug!(|_lb| {
                                     _lb.str(b"[netsrv] DNS match A slot=");
                                     _lb.dec(i as u64);
                                     _lb.str(b" txn=");
@@ -903,7 +903,7 @@ pub(crate) fn process_pending() {
                                 true
                             }
                             Some(Err(rcode)) => {
-                                besalt::udebug!(|_lb| {
+                                trona::udebug!(|_lb| {
                                     _lb.str(b"[netsrv] DNS error A slot=");
                                     _lb.dec(i as u64);
                                     _lb.str(b" txn=");
@@ -975,7 +975,7 @@ pub(crate) fn process_pending() {
         let mut i = 0;
         while i < MAX_PENDING_DNS {
                 if (*pending)[i].active && now >= (*pending)[i].deadline_ns {
-                    besalt::udebug!(|_lb| {
+                    trona::udebug!(|_lb| {
                         _lb.str(b"[netsrv] DNS deadline slot=");
                         _lb.dec(i as u64);
                         _lb.str(b" attempt=");

@@ -1,14 +1,14 @@
 //! Process spawning helpers
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::consts::*;
-use besalt::cpio;
-use besalt::elf_dynamic;
-use besalt::elf_loader;
-use besalt::invoke;
-use besalt::ipc;
-use besalt::syscall;
-use besalt::types::*;
+use trona::consts::*;
+use trona_loader::cpio;
+use trona_loader::elf_dynamic;
+use trona_loader::elf_loader;
+use trona::invoke;
+use trona::ipc;
+use trona::syscall;
+use trona::types::*;
 
 #[derive(Clone, Copy)]
 pub struct ExtraCapCopy {
@@ -238,8 +238,8 @@ unsafe fn wait_for_child_ready(
             if (poll.value & READY_SIGNAL_BITS) != 0 {
                 return 0;
             }
-        } else if poll.error != BESALT_WOULD_BLOCK {
-            besalt::uerror!(|_lb| {
+        } else if poll.error != TRONA_WOULD_BLOCK {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[INIT] ready poll failed err=");
                 _lb.hex(poll.error);
                 _lb.str(b"\n");
@@ -266,7 +266,7 @@ unsafe fn wait_for_child_ready(
         yields += 1;
     }
 
-    besalt::uerror!(|_lb| {
+    trona::uerror!(|_lb| {
         _lb.str(b"[INIT] ");
         _lb.bytes(label);
         _lb.str(b" ready timeout\n");
@@ -312,7 +312,7 @@ unsafe fn retype_from_any_untyped_with_source(
         first = start;
     }
 
-    let mut best_err = BESALT_OUT_OF_MEMORY as i32;
+    let mut best_err = TRONA_OUT_OF_MEMORY as i32;
 
     for ut in first..end {
         let err = invoke::untyped_retype(ut, new_type, size_bits, dest_slot);
@@ -323,9 +323,9 @@ unsafe fn retype_from_any_untyped_with_source(
             }
             return 0;
         }
-        if err != BESALT_INVALID_CAPABILITY as i32
-            && err != BESALT_INVALID_OPERATION as i32
-            && err != BESALT_NOT_FOUND as i32
+        if err != TRONA_INVALID_CAPABILITY as i32
+            && err != TRONA_INVALID_OPERATION as i32
+            && err != TRONA_NOT_FOUND as i32
         {
             best_err = err;
         }
@@ -339,9 +339,9 @@ unsafe fn retype_from_any_untyped_with_source(
             }
             return 0;
         }
-        if err != BESALT_INVALID_CAPABILITY as i32
-            && err != BESALT_INVALID_OPERATION as i32
-            && err != BESALT_NOT_FOUND as i32
+        if err != TRONA_INVALID_CAPABILITY as i32
+            && err != TRONA_INVALID_OPERATION as i32
+            && err != TRONA_NOT_FOUND as i32
         {
             best_err = err;
         }
@@ -365,7 +365,7 @@ unsafe fn retype_from_any_untyped_excluding(
         first = start;
     }
 
-    let mut best_err = BESALT_OUT_OF_MEMORY as i32;
+    let mut best_err = TRONA_OUT_OF_MEMORY as i32;
 
     for ut in first..end {
         if ut == exclude_ut {
@@ -379,9 +379,9 @@ unsafe fn retype_from_any_untyped_excluding(
             }
             return 0;
         }
-        if err != BESALT_INVALID_CAPABILITY as i32
-            && err != BESALT_INVALID_OPERATION as i32
-            && err != BESALT_NOT_FOUND as i32
+        if err != TRONA_INVALID_CAPABILITY as i32
+            && err != TRONA_INVALID_OPERATION as i32
+            && err != TRONA_NOT_FOUND as i32
         {
             best_err = err;
         }
@@ -398,9 +398,9 @@ unsafe fn retype_from_any_untyped_excluding(
             }
             return 0;
         }
-        if err != BESALT_INVALID_CAPABILITY as i32
-            && err != BESALT_INVALID_OPERATION as i32
-            && err != BESALT_NOT_FOUND as i32
+        if err != TRONA_INVALID_CAPABILITY as i32
+            && err != TRONA_INVALID_OPERATION as i32
+            && err != TRONA_NOT_FOUND as i32
         {
             best_err = err;
         }
@@ -416,7 +416,7 @@ unsafe fn allocate_child_untyped_budget(
     src_ut_out: *mut Cap,
 ) -> Result<u8, i32> {
     let mut bits = clamp_ut_bits(preferred_bits);
-    let mut last_err = BESALT_OUT_OF_MEMORY as i32;
+    let mut last_err = TRONA_OUT_OF_MEMORY as i32;
 
     while bits >= CHILD_UT_BITS_MIN {
         let mut err = unsafe {
@@ -456,7 +456,7 @@ unsafe fn allocate_child_untyped_budget(
 // ===========================================================================
 
 /// Pre-load shared library RO segments into permanent frame caps.
-/// Called once at init startup. Processes both libbesalt.so and libc.so.
+/// Called once at init startup. Processes both libtrona.so and libc.so.
 /// On failure, cache stays uninitialized and all spawns fall through
 /// to per-process RTLD allocation.
 pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
@@ -466,7 +466,7 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
         let initrd = super::INITRD_VADDR as *const u8;
         let initrd_size = super::INITRD_SIZE;
 
-        let libs: [&[u8]; 3] = [b"libbesalt.so", b"libc.so", b"libc++.so"];
+        let libs: [&[u8]; 3] = [b"libtrona.so", b"libc.so", b"libc++.so"];
 
         let mut cache_ok = true;
         for lib_name in &libs {
@@ -477,11 +477,11 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
             let mut lib_failed = false;
 
             let mut entry = CpioEntry::zeroed();
-            if besalt::cpio::cpio_find_file(
+            if trona_loader::cpio::cpio_find_file(
                 initrd, initrd_size, lib_name.as_ptr(), lib_name.len(), &raw mut entry,
             ) == 0
             {
-                besalt::udebug!(|_lb| {
+                trona::udebug!(|_lb| {
                     _lb.str(b"[INIT] shared lib cache: ");
                     _lb.bytes(lib_name);
                     _lb.str(b" not found, skipping\n");
@@ -498,7 +498,7 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
             {
                 continue;
             }
-            if ehdr.e_type != besalt::ET_DYN {
+            if ehdr.e_type != trona::ET_DYN {
                 continue;
             }
 
@@ -508,7 +508,7 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
             let mut max_seg_end: u64 = 0;
             for i in 0..ehdr.e_phnum as usize {
                 let ph = &*phdrs.add(i);
-                if ph.p_type == besalt::PT_LOAD {
+                if ph.p_type == trona::PT_LOAD {
                     if ph.p_vaddr < min_vaddr { min_vaddr = ph.p_vaddr; }
                     let se = (ph.p_vaddr + ph.p_memsz + 0xFFF) & !0xFFFu64;
                     if se > max_seg_end { max_seg_end = se; }
@@ -533,11 +533,11 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
             // Cache each page of each read-only PT_LOAD segment
             for i in 0..ehdr.e_phnum as usize {
                 let ph = &*phdrs.add(i);
-                if ph.p_type != besalt::PT_LOAD {
+                if ph.p_type != trona::PT_LOAD {
                     continue;
                 }
                 // Record RW segments as metadata (mapped per-child later)
-                if (ph.p_flags & besalt::PF_W) != 0 {
+                if (ph.p_flags & trona::PF_W) != 0 {
                     if (lib_entry.rw_seg_count as usize) < MAX_RW_SEGS {
                         let idx = lib_entry.rw_seg_count as usize;
                         // W^X: writable segments never get executable permission
@@ -560,7 +560,7 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
                 let seg_end = (seg_vaddr + ph.p_memsz + 0xFFF) & !0xFFFu64;
 
                 let mut flags = VSPACE_FLAG_USER;
-                if (ph.p_flags & besalt::PF_X) != 0 {
+                if (ph.p_flags & trona::PF_X) != 0 {
                     flags |= VSPACE_FLAG_EXECUTABLE;
                 }
 
@@ -651,7 +651,7 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
         }
 
         if !cache_ok {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[INIT] shared lib cache disabled: capacity or frame allocation failure\n");
             });
             *cache = SharedLibCache::new();
@@ -660,7 +660,7 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
 
         if cache.page_count > 0 {
             cache.initialized = true;
-            besalt::uinfo!(|_lb| {
+            trona::uinfo!(|_lb| {
                 _lb.str(b"[INIT] shared lib cache: ");
                 _lb.hex(cache.page_count as u64);
                 _lb.str(b" RO pages cached\n");
@@ -677,7 +677,7 @@ unsafe fn map_shared_lib_to_child(
     child_vs: Cap,
     _child_cn: Cap,
     shared_lib_base_vaddr: u64,
-    needed: &besalt::elf_dynamic::NeededLibs,
+    needed: &trona_loader::elf_dynamic::NeededLibs,
     root_ut: Cap,
 ) -> u64 {
     unsafe {
@@ -723,7 +723,7 @@ unsafe fn map_shared_lib_to_child(
                     let vaddr = running_base + page.vaddr_offset;
                     let err = invoke::vspace_map(child_vs, page.frame_cap, vaddr, page.flags);
                     if err != 0 {
-                        besalt::uerror!(|_lb| {
+                        trona::uerror!(|_lb| {
                             _lb.str(b"[INIT] shared lib map failed at ");
                             _lb.hex(vaddr);
                             _lb.str(b" err=");
@@ -742,7 +742,7 @@ unsafe fn map_shared_lib_to_child(
                     let initrd_size = super::INITRD_SIZE;
                     let mut lib_entry = CpioEntry::zeroed();
                     let lib_name = &cl.name[..cl.name_len as usize];
-                    let lib_found = besalt::cpio::cpio_find_file(
+                    let lib_found = trona_loader::cpio::cpio_find_file(
                         initrd, initrd_size,
                         lib_name.as_ptr(), lib_name.len(),
                         &raw mut lib_entry,
@@ -786,7 +786,7 @@ unsafe fn map_shared_lib_to_child(
                                         VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
                                     );
                                     if err != 0 {
-                                        besalt::uerror!(|_lb| { _lb.str(b"[INIT] RW overlap scratch map failed\n"); });
+                                        trona::uerror!(|_lb| { _lb.str(b"[INIT] RW overlap scratch map failed\n"); });
                                         return 0;
                                     }
 
@@ -835,7 +835,7 @@ unsafe fn map_shared_lib_to_child(
                                 err = retype_from_any_untyped(OBJ_FRAME, 0, frame_slot);
                             }
                             if err != 0 {
-                                besalt::uerror!(|_lb| {
+                                trona::uerror!(|_lb| {
                                     _lb.str(b"[INIT] RW frame retype failed err=");
                                     _lb.hex(err as u64);
                                     _lb.str(b"\n");
@@ -848,7 +848,7 @@ unsafe fn map_shared_lib_to_child(
                                 VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
                             );
                             if err != 0 {
-                                besalt::uerror!(|_lb| { _lb.str(b"[INIT] RW scratch map failed\n"); });
+                                trona::uerror!(|_lb| { _lb.str(b"[INIT] RW scratch map failed\n"); });
                                 return 0;
                             }
 
@@ -901,7 +901,7 @@ unsafe fn map_shared_lib_to_child(
                                 child_vs, frame_slot, page, rw.flags,
                             );
                             if err != 0 {
-                                besalt::uerror!(|_lb| {
+                                trona::uerror!(|_lb| {
                                     _lb.str(b"[INIT] RW child map failed at ");
                                     _lb.hex(page);
                                     _lb.str(b" err=");
@@ -931,7 +931,7 @@ unsafe fn map_shared_lib_to_child(
 
             if !found {
                 // Library not in cache — RTLD will load it from initrd
-                besalt::udebug!(|_lb| {
+                trona::udebug!(|_lb| {
                     _lb.str(b"[INIT] shared lib cache miss: ");
                     _lb.bytes(name);
                     _lb.str(b"\n");
@@ -949,7 +949,7 @@ unsafe fn map_shared_lib_to_child(
 
 /// Return the total VA pages needed for the specified DT_NEEDED libraries.
 /// This accounts for full library spans (including RW segments) plus inter-lib gaps.
-pub fn shared_lib_va_pages_for_needed(needed: &besalt::elf_dynamic::NeededLibs) -> usize {
+pub fn shared_lib_va_pages_for_needed(needed: &trona_loader::elf_dynamic::NeededLibs) -> usize {
     unsafe {
         let cache = &*(&raw const SHARED_LIB_CACHE);
         if !cache.initialized || needed.count == 0 {
@@ -1021,7 +1021,7 @@ pub unsafe fn spawn_server(
     mirror_untypeds: bool,
     pager_child_slot: u64,
 ) -> i32 {
-    besalt::uinfo!(|_lb| { _lb.str(b"[INIT] Spawning "); _lb.bytes(label); _lb.str(b" ("); _lb.bytes(elf_name); _lb.str(b")\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[INIT] Spawning "); _lb.bytes(label); _lb.str(b" ("); _lb.bytes(elf_name); _lb.str(b")\n"); });
 
     unsafe {
         let initrd = super::INITRD_VADDR as *const u8;
@@ -1049,7 +1049,7 @@ pub unsafe fn spawn_server(
             ) != 0;
         }
         if !found {
-            besalt::uerror!(|_lb| { _lb.str(b"[INIT] "); _lb.bytes(elf_name); _lb.str(b" not found in initrd\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[INIT] "); _lb.bytes(elf_name); _lb.str(b" not found in initrd\n"); });
             return -1;
         }
 
@@ -1059,9 +1059,9 @@ pub unsafe fn spawn_server(
         let elf_span = elf_loader::elf_compute_load_span(entry.data, entry.data_len);
         let mut rtld_entry = CpioEntry::zeroed();
         let rtld_span = if is_dynamic {
-            let rtld_name = b"ld-besalt.so";
+            let rtld_name = b"ld-trona.so";
             if cpio::cpio_find_file(initrd, initrd_size, rtld_name.as_ptr(), rtld_name.len(), &raw mut rtld_entry) == 0 {
-                besalt::uerror!(|_lb| { _lb.str(b"[INIT] rtld not found in initrd\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[INIT] rtld not found in initrd\n"); });
                 return -1;
             }
             elf_loader::elf_compute_load_span(rtld_entry.data, rtld_entry.data_len)
@@ -1073,20 +1073,20 @@ pub unsafe fn spawn_server(
         let needed = if is_dynamic {
             elf_dynamic::elf_get_needed(entry.data, entry.data_len)
         } else {
-            besalt::elf_dynamic::NeededLibs::new()
+            trona_loader::elf_dynamic::NeededLibs::new()
         };
 
         let shared_lib_pages = shared_lib_va_pages_for_needed(&needed);
-        let layout = besalt::layout::compute_vm_layout_randomized(
+        let layout = trona::layout::compute_vm_layout_randomized(
             elf_span,
             rtld_span,
             shared_lib_pages,
             map_initrd || is_dynamic,
             initrd_size,
-            || besalt::syscall::sys_getrandom(),
+            || trona::syscall::sys_getrandom(),
         );
         if layout.stack_top == 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[INIT] ELF too large for VA layout\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[INIT] ELF too large for VA layout\n"); });
             return -1;
         }
 
@@ -1124,7 +1124,7 @@ pub unsafe fn spawn_server(
                 err = invoke::untyped_retype(loader_ut, OBJ_CNODE, cnode_size_bits, child_cn);
             }
             if err != 0 {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[INIT] retype CNode (large) failed err=");
                     _lb.hex(err as u64);
                     _lb.str(b"\n");
@@ -1140,7 +1140,7 @@ pub unsafe fn spawn_server(
                     err = retype_from_any_untyped($obj, 0, $slot);
                 }
                 if err != 0 {
-                    besalt::uerror!(|_lb| {
+                    trona::uerror!(|_lb| {
                         _lb.str(b"[INIT] retype ");
                         _lb.bytes($name);
                         _lb.str(b" failed err=");
@@ -1167,7 +1167,7 @@ pub unsafe fn spawn_server(
                 CAP_RIGHTS_ALL,
             );
             if err != 0 {
-                besalt::uerror!(|_lb| { _lb.str(b"[INIT] copy pre-EP failed\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[INIT] copy pre-EP failed\n"); });
                 return -1;
             }
         } else {
@@ -1183,7 +1183,7 @@ pub unsafe fn spawn_server(
         ) {
             Ok(bits) => bits,
             Err(err) => {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[INIT] sub-untyped retype failed err=");
                     _lb.hex(err as u64);
                     _lb.str(b"\n");
@@ -1192,7 +1192,7 @@ pub unsafe fn spawn_server(
             }
         };
         if granted_bits != budget.boot_load_bits {
-            besalt::udebug!(|_lb| {
+            trona::udebug!(|_lb| {
                 _lb.str(b"[INIT] sub-untyped downshifted to 2^");
                 _lb.hex(granted_bits as u64);
                 _lb.str(b"\n");
@@ -1220,7 +1220,7 @@ pub unsafe fn spawn_server(
             &raw mut elf_result,
         );
         if err != 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[INIT] ELF load failed err="); _lb.hex(err as u64); _lb.str(b"\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[INIT] ELF load failed err="); _lb.hex(err as u64); _lb.str(b"\n"); });
             return -1;
         }
 
@@ -1236,7 +1236,7 @@ pub unsafe fn spawn_server(
                 &raw mut rtld_result,
             );
             if err != 0 {
-                besalt::uerror!(|_lb| { _lb.str(b"[INIT] rtld ELF load failed\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[INIT] rtld ELF load failed\n"); });
                 return -1;
             }
 
@@ -1257,7 +1257,7 @@ pub unsafe fn spawn_server(
                     err = retype_from_any_untyped(OBJ_FRAME, 0, frame_slot);
                 }
                 if err != 0 {
-                    besalt::uerror!(|_lb| { _lb.str(b"[INIT] stack frame retype failed\n"); });
+                    trona::uerror!(|_lb| { _lb.str(b"[INIT] stack frame retype failed\n"); });
                     return -1;
                 }
             }
@@ -1269,7 +1269,7 @@ pub unsafe fn spawn_server(
                 VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
             );
             if err != 0 {
-                besalt::uerror!(|_lb| { _lb.str(b"[INIT] stack map failed\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[INIT] stack map failed\n"); });
                 return -1;
             }
         }
@@ -1282,7 +1282,7 @@ pub unsafe fn spawn_server(
             VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
         );
         if err != 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[INIT] IPC buf map failed\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[INIT] IPC buf map failed\n"); });
             return -1;
         }
 
@@ -1300,7 +1300,7 @@ pub unsafe fn spawn_server(
                     VSPACE_FLAG_USER,
                 );
                 if err != 0 {
-                    besalt::udebug!(|_lb| {
+                    trona::udebug!(|_lb| {
                         _lb.str(b"[INIT] initrd device map failed pg=");
                         _lb.hex(pg as u64);
                         _lb.str(b" err=");
@@ -1319,7 +1319,7 @@ pub unsafe fn spawn_server(
             }
 
             if mapped_with_device {
-                besalt::udebug!(|_lb| {
+                trona::udebug!(|_lb| {
                     _lb.str(b"[INIT] initrd device-mapped: ");
                     _lb.dec(initrd_pages as u64);
                     _lb.str(b" pages at ");
@@ -1336,7 +1336,7 @@ pub unsafe fn spawn_server(
                         err = retype_from_any_untyped(OBJ_FRAME, 0, fr_slot);
                     }
                     if err != 0 {
-                        besalt::uerror!(|_lb| { _lb.str(b"[INIT] initrd frame retype failed\n"); });
+                        trona::uerror!(|_lb| { _lb.str(b"[INIT] initrd frame retype failed\n"); });
                         return -1;
                     }
 
@@ -1347,7 +1347,7 @@ pub unsafe fn spawn_server(
                         VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
                     );
                     if err != 0 {
-                        besalt::uerror!(|_lb| { _lb.str(b"[INIT] initrd scratch map failed\n"); });
+                        trona::uerror!(|_lb| { _lb.str(b"[INIT] initrd scratch map failed\n"); });
                         return -1;
                     }
 
@@ -1373,11 +1373,11 @@ pub unsafe fn spawn_server(
                         VSPACE_FLAG_USER,
                     );
                     if err != 0 {
-                        besalt::uerror!(|_lb| { _lb.str(b"[INIT] initrd child map failed\n"); });
+                        trona::uerror!(|_lb| { _lb.str(b"[INIT] initrd child map failed\n"); });
                         return -1;
                     }
                 }
-                besalt::udebug!(|_lb| {
+                trona::udebug!(|_lb| {
                     _lb.str(b"[INIT] initrd copy-mapped: ");
                     _lb.dec(initrd_pages as u64);
                     _lb.str(b" pages at ");
@@ -1393,7 +1393,7 @@ pub unsafe fn spawn_server(
                 VSPACE_FLAG_USER,
             );
             if err != 0 {
-                besalt::uerror!(|_lb| { _lb.str(b"[INIT] bootinfo child map failed\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[INIT] bootinfo child map failed\n"); });
                 return -1;
             }
         }
@@ -1405,12 +1405,12 @@ pub unsafe fn spawn_server(
             };
         }
 
-        if copy_cap!(child_tcb, 0) != 0 { besalt::uerror!(|_lb| { _lb.str(b"[INIT] copy TCB failed\n"); }); return -1; }
-        if copy_cap!(child_vs, 1) != 0 { besalt::uerror!(|_lb| { _lb.str(b"[INIT] copy VSpace failed\n"); }); return -1; }
-        if copy_cap!(child_cn, 2) != 0 { besalt::uerror!(|_lb| { _lb.str(b"[INIT] copy CNode failed\n"); }); return -1; }
-        if copy_cap!(child_ep, 3) != 0 { besalt::uerror!(|_lb| { _lb.str(b"[INIT] copy EP failed\n"); }); return -1; }
+        if copy_cap!(child_tcb, 0) != 0 { trona::uerror!(|_lb| { _lb.str(b"[INIT] copy TCB failed\n"); }); return -1; }
+        if copy_cap!(child_vs, 1) != 0 { trona::uerror!(|_lb| { _lb.str(b"[INIT] copy VSpace failed\n"); }); return -1; }
+        if copy_cap!(child_cn, 2) != 0 { trona::uerror!(|_lb| { _lb.str(b"[INIT] copy CNode failed\n"); }); return -1; }
+        if copy_cap!(child_ep, 3) != 0 { trona::uerror!(|_lb| { _lb.str(b"[INIT] copy EP failed\n"); }); return -1; }
         if copy_cap!(child_ready_ntfn, CAP_READINESS_NTFN) != 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[INIT] copy ready ntfn failed\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[INIT] copy ready ntfn failed\n"); });
             return -1;
         }
         if is_dynamic {
@@ -1422,13 +1422,13 @@ pub unsafe fn spawn_server(
                 INITRD_COPY_RIGHTS,
             );
             if derr != 0 {
-                besalt::uerror!(|_lb| { _lb.str(b"[INIT] WARN: copy initrd untyped failed\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[INIT] WARN: copy initrd untyped failed\n"); });
             }
         }
 
         let err = copy_cap!(sub_ut_slot, 7);
         if err != 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[INIT] copy child Untyped failed\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[INIT] copy child Untyped failed\n"); });
             return -1;
         }
 
@@ -1459,9 +1459,9 @@ pub unsafe fn spawn_server(
                 }
             }
             if mirrored == 0 {
-                besalt::uerror!(|_lb| { _lb.str(b"[INIT] WARN: no untyped mirrors copied for rtld fallback\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[INIT] WARN: no untyped mirrors copied for rtld fallback\n"); });
             } else if mirrored < mirror_slots {
-                besalt::udebug!(|_lb| {
+                trona::udebug!(|_lb| {
                     _lb.str(b"[INIT] rtld untyped mirrors copied=");
                     _lb.hex(mirrored);
                     _lb.str(b"\n");
@@ -1488,7 +1488,7 @@ pub unsafe fn spawn_server(
                 copy_cap!(extra.src, extra.dst)
             };
             if err != 0 {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[INIT] ERROR: cap copy failed src=");
                     _lb.hex(extra.src);
                     _lb.str(b" dst=");
@@ -1509,7 +1509,7 @@ pub unsafe fn spawn_server(
                 spawn_badge,
             );
             if err != 0 {
-                besalt::uerror!(|_lb| { _lb.str(b"[INIT] WARN: mint expand EP failed\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[INIT] WARN: mint expand EP failed\n"); });
             }
         }
 
@@ -1519,7 +1519,7 @@ pub unsafe fn spawn_server(
 
         // Configure TCB
         let err = invoke::tcb_set_space(child_tcb, child_cn, child_vs);
-        if err != 0 { besalt::uerror!(|_lb| { _lb.str(b"[INIT] TCB set_space failed\n"); }); return -1; }
+        if err != 0 { trona::uerror!(|_lb| { _lb.str(b"[INIT] TCB set_space failed\n"); }); return -1; }
 
         // Set fault handler so VMFaults route to mmsrv for demand paging
         if mmsrv_ep != 0 {
@@ -1532,14 +1532,14 @@ pub unsafe fn spawn_server(
             if err == 0 {
                 let err2 = invoke::tcb_set_fault_handler(child_tcb, fault_ep_slot);
                 if err2 != 0 {
-                    besalt::uerror!(|_lb| {
+                    trona::uerror!(|_lb| {
                         _lb.str(b"[INIT] WARN: tcb_set_fault_handler failed err=");
                         _lb.hex(err2 as u64);
                         _lb.str(b"\n");
                     });
                 }
             } else {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[INIT] WARN: fault EP mint failed err=");
                     _lb.hex(err as u64);
                     _lb.str(b"\n");
@@ -1566,7 +1566,7 @@ pub unsafe fn spawn_server(
                 VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
             );
             if err != 0 {
-                besalt::uerror!(|_lb| { _lb.str(b"[INIT] dynamic stack scratch map failed\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[INIT] dynamic stack scratch map failed\n"); });
                 return -1;
             }
 
@@ -1581,13 +1581,13 @@ pub unsafe fn spawn_server(
                 &raw mut phent,
                 &raw mut phnum,
             ) != 0 {
-                besalt::uerror!(|_lb| { _lb.str(b"[INIT] dynamic phdr info extraction failed\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[INIT] dynamic phdr info extraction failed\n"); });
                 invoke::vspace_unmap(CAP_SELF_VSPACE, SCRATCH_VADDR);
                 return -1;
             }
 
-            // +2 for AT_BESALT_SLOT_BASE/COUNT, +1 for AT_BESALT_EXPAND_EP if procmgr available,
-            // +1 for AT_BESALT_MM_EP if pager EP is available for this child.
+            // +2 for AT_TRONA_SLOT_BASE/COUNT, +1 for AT_TRONA_EXPAND_EP if procmgr available,
+            // +1 for AT_TRONA_MM_EP if pager EP is available for this child.
             let has_expand_ep = procmgr_ep != 0;
             let has_mm_ep = mmsrv_ep != 0 && pager_child_slot != 0;
             let base_count: u64 = if shared_lib_base != 0 { 16 } else { 15 };
@@ -1617,11 +1617,11 @@ pub unsafe fn spawn_server(
             w!(super::AT_ENTRY); w!(elf_result.entry);
             w!(super::AT_BASE); w!(rtld_result.base);
             w!(super::AT_PAGESZ); w!(4096);
-            w!(super::AT_BESALT_UNTYPED); w!(super::CAP_CHILD_UNTYPED_OFFSET);
-            w!(super::AT_BESALT_VSPACE); w!(1);
-            w!(super::AT_BESALT_SCRATCH); w!(layout.scratch.base);
-            w!(super::AT_BESALT_INITRD); w!(layout.initrd.base);
-            w!(super::AT_BESALT_INITRD_SZ); w!(initrd_size as u64);
+            w!(super::AT_TRONA_UNTYPED); w!(super::CAP_CHILD_UNTYPED_OFFSET);
+            w!(super::AT_TRONA_VSPACE); w!(1);
+            w!(super::AT_TRONA_SCRATCH); w!(layout.scratch.base);
+            w!(super::AT_TRONA_INITRD); w!(layout.initrd.base);
+            w!(super::AT_TRONA_INITRD_SZ); w!(initrd_size as u64);
             // Compute first free child CNode slot past extras and shared lib cache
             let frame_slot_start = {
                 let mut s = super::CHILD_RTLD_FRAME_SLOT_START;
@@ -1639,24 +1639,24 @@ pub unsafe fn spawn_server(
                 }
                 s
             };
-            w!(super::AT_BESALT_FRAME_SLOT); w!(frame_slot_start);
+            w!(super::AT_TRONA_FRAME_SLOT); w!(frame_slot_start);
             // Slot pool: from frame_slot_start to CNode end
             let effective_cnode_bits: u64 = if cnode_size_bits > 0 { cnode_size_bits } else { 10 };
             let cnode_total_slots: u64 = 1u64 << effective_cnode_bits;
             let slot_pool_count = cnode_total_slots.saturating_sub(frame_slot_start);
-            w!(super::AT_BESALT_SLOT_BASE); w!(frame_slot_start);
-            w!(super::AT_BESALT_SLOT_COUNT); w!(slot_pool_count);
+            w!(super::AT_TRONA_SLOT_BASE); w!(frame_slot_start);
+            w!(super::AT_TRONA_SLOT_COUNT); w!(slot_pool_count);
             if has_expand_ep {
-                w!(super::AT_BESALT_EXPAND_EP); w!(super::CAP_EXPAND_EP);
+                w!(super::AT_TRONA_EXPAND_EP); w!(super::CAP_EXPAND_EP);
             }
             // Emit pager EP slot so the CRT can discover it from auxv.
             // Invariant: a pre-procmgr service using the C CRT must declare
             // NeedEP=<pager>:<slot>[:badge] to receive this tag.
             if has_mm_ep {
-                w!(super::AT_BESALT_MM_EP); w!(pager_child_slot);
+                w!(super::AT_TRONA_MM_EP); w!(pager_child_slot);
             }
             if shared_lib_base != 0 {
-                w!(super::AT_BESALT_SHARED_LIB_BASE); w!(shared_lib_base);
+                w!(super::AT_TRONA_SHARED_LIB_BASE); w!(shared_lib_base);
             }
             w!(super::AT_NULL); w!(0);
             w!(0); // padding
@@ -1669,7 +1669,7 @@ pub unsafe fn spawn_server(
         }
 
         #[cfg(target_arch = "aarch64")]
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[INIT] child layout ");
             _lb.bytes(label);
             _lb.str(b" entry=");
@@ -1691,7 +1691,7 @@ pub unsafe fn spawn_server(
 
         let err = invoke::tcb_configure(child_tcb, child_entry, child_rsp, 0);
         if err != 0 {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[INIT] TCB configure failed err=");
                 _lb.hex(err as u64);
                 _lb.str(b"\n");
@@ -1702,18 +1702,18 @@ pub unsafe fn spawn_server(
         invoke::tcb_set_ipc_buffer(child_tcb, layout.ipc_buf.base);
 
         let err = invoke::sc_configure(child_sc, 10000, 100000);
-        if err != 0 { besalt::uerror!(|_lb| { _lb.str(b"[INIT] SC configure failed\n"); }); return -1; }
+        if err != 0 { trona::uerror!(|_lb| { _lb.str(b"[INIT] SC configure failed\n"); }); return -1; }
 
         let err = invoke::sc_bind(child_sc, child_tcb);
-        if err != 0 { besalt::uerror!(|_lb| { _lb.str(b"[INIT] SC bind failed\n"); }); return -1; }
+        if err != 0 { trona::uerror!(|_lb| { _lb.str(b"[INIT] SC bind failed\n"); }); return -1; }
 
         // Register pre-procmgr child with mmsrv before first user instruction.
         // This guarantees posix_mmap()/brk() works immediately on service start.
         if mmsrv_ep != 0 {
             let heap_base = layout.elf_code.end();
-            let mmap_base = besalt::layout::compute_mmap_base(&layout, heap_base);
-            let mut mm_msg = BesaltMsg::zeroed();
-            let mut mm_reply = BesaltMsg::zeroed();
+            let mmap_base = trona::layout::compute_mmap_base(&layout, heap_base);
+            let mut mm_msg = TronaMsg::zeroed();
+            let mut mm_reply = TronaMsg::zeroed();
             mm_msg.label = MM_REGISTER;
             mm_msg.length = 4;
             mm_msg.regs[0] = spawn_badge;
@@ -1727,8 +1727,8 @@ pub unsafe fn spawn_server(
                 &raw const mm_msg,
                 &raw mut mm_reply,
             );
-            if mm_err != 0 || (mm_reply.label != BESALT_OK && mm_reply.label != BESALT_ALREADY_EXISTS) {
-                besalt::uerror!(|_lb| {
+            if mm_err != 0 || (mm_reply.label != TRONA_OK && mm_reply.label != TRONA_ALREADY_EXISTS) {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[INIT] WARN: MM_REGISTER ");
                     _lb.bytes(label);
                     _lb.str(b" failed err=");
@@ -1742,12 +1742,12 @@ pub unsafe fn spawn_server(
         }
 
         let err = invoke::tcb_resume(child_tcb);
-        if err != 0 { besalt::uerror!(|_lb| { _lb.str(b"[INIT] TCB resume failed\n"); }); return -1; }
+        if err != 0 { trona::uerror!(|_lb| { _lb.str(b"[INIT] TCB resume failed\n"); }); return -1; }
 
         // Register init-spawned service with procmgr (badge + CNode)
         if procmgr_ep != 0 {
-            let mut reg_msg = BesaltMsg::zeroed();
-            let mut reg_reply = BesaltMsg::zeroed();
+            let mut reg_msg = TronaMsg::zeroed();
+            let mut reg_reply = TronaMsg::zeroed();
             reg_msg.label = POSIX_PM_REGISTER;
             reg_msg.length = 2;
             reg_msg.regs[0] = spawn_badge;
@@ -1757,8 +1757,8 @@ pub unsafe fn spawn_server(
                 super::ipc_ctx(), procmgr_ep,
                 &raw const reg_msg, &raw mut reg_reply,
             );
-            if reg_err != 0 || reg_reply.label != BESALT_OK {
-                besalt::uerror!(|_lb| {
+            if reg_err != 0 || reg_reply.label != TRONA_OK {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[INIT] WARN: PM_REGISTER ");
                     _lb.bytes(label);
                     _lb.str(b" failed err=");
@@ -1779,7 +1779,7 @@ pub unsafe fn spawn_server(
             return -1;
         }
 
-        besalt::uinfo!(|_lb| { _lb.str(b"[INIT] "); _lb.bytes(label); _lb.str(b" ready\n"); });
+        trona::uinfo!(|_lb| { _lb.str(b"[INIT] "); _lb.bytes(label); _lb.str(b" ready\n"); });
         0
     }
 }
@@ -1828,7 +1828,7 @@ pub unsafe fn pm_spawn(
         if start_suspended {
             spawn_flags |= SPAWN_FLAG_START_SUSPENDED;
         }
-        let mut spawn_msg = BesaltMsg::zeroed();
+        let mut spawn_msg = TronaMsg::zeroed();
         spawn_msg.label = POSIX_PM_SPAWN;
         let packed_name_words = ((len as u64) + 7) / 8;
         let args_len = def.spawn_args_len as u64;
@@ -1848,9 +1848,9 @@ pub unsafe fn pm_spawn(
             *args_dst.add(i) = def.spawn_args[i];
         }
 
-        let mut spawn_reply = BesaltMsg::zeroed();
+        let mut spawn_reply = TronaMsg::zeroed();
         let err = ipc::call_ctx(super::ipc_ctx(), pm_ep, &raw const spawn_msg, &raw mut spawn_reply);
-        if err != 0 || spawn_reply.label != BESALT_OK {
+        if err != 0 || spawn_reply.label != TRONA_OK {
             return -1;
         }
 
@@ -1862,14 +1862,14 @@ pub unsafe fn pm_spawn(
 /// Uses PM_RESUME so boot sequencing is not coupled to signal semantics.
 pub unsafe fn pm_resume_child(pm_ep: Cap, pid: u32) -> i32 {
     unsafe {
-        let mut msg = BesaltMsg::zeroed();
+        let mut msg = TronaMsg::zeroed();
         msg.label = POSIX_PM_RESUME;
         msg.length = 1;
         msg.regs[0] = pid as u64;
 
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         let err = ipc::call_ctx(super::ipc_ctx(), pm_ep, &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != BESALT_OK {
+        if err != 0 || reply.label != TRONA_OK {
             -1
         } else {
             0
@@ -1881,16 +1881,16 @@ pub unsafe fn pm_resume_child(pm_ep: Cap, pid: u32) -> i32 {
 /// Uses PM_INJECT_CAP IPC to have procmgr copy the cap into the child.
 pub unsafe fn pm_inject_cap(pm_ep: Cap, pid: u32, dst_slot: u64, cap: Cap) -> i32 {
     unsafe {
-        let mut msg = BesaltMsg::zeroed();
+        let mut msg = TronaMsg::zeroed();
         msg.label = POSIX_PM_INJECT_CAP;
         msg.length = 2;
         msg.regs[0] = pid as u64;
         msg.regs[1] = dst_slot;
         ipc::set_send_cap_ctx(super::ipc_ctx(), 0, cap);
 
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         let err = ipc::call_ctx(super::ipc_ctx(), pm_ep, &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != BESALT_OK {
+        if err != 0 || reply.label != TRONA_OK {
             -1
         } else {
             0

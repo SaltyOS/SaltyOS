@@ -16,17 +16,18 @@
 #![no_std]
 #![no_main]
 
-extern crate besalt;
+extern crate trona;
+extern crate trona_posix;
 
 mod types;
 mod input;
 mod handlers;
 
-use besalt::consts::*;
-use besalt::ipc;
-use besalt::serial;
-use besalt::serial::LineBuf as SerialLB;
-use besalt::types::*;
+use trona::consts::*;
+use trona::ipc;
+use trona::serial;
+use trona::serial::LineBuf as SerialLB;
+use trona::types::*;
 
 use types::*;
 
@@ -67,11 +68,11 @@ fn puts(s: &[u8]) {
 }
 
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
-    besalt::tls::current_ipc_ctx()
+    trona_posix::tls::current_ipc_ctx()
 }
 
 fn signal_ready() {
-    let _ = besalt::syscall::syscall(besalt::SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(trona::SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 // ======================================================================
@@ -125,16 +126,16 @@ pub(crate) fn display_write(data: &[u8]) {
             offset += written;
             if written > 0 {
                 // SAFETY: Signal display notification — always succeeds, coalesces.
-                besalt::syscall::syscall(
-                    besalt::SYS_SIGNAL, CAP_DISPLAY_RING_NTFN, 1, 0, 0, 0, 0,
+                trona::syscall::syscall(
+                    trona::SYS_SIGNAL, CAP_DISPLAY_RING_NTFN, 1, 0, 0, 0, 0,
                 );
             }
             if offset < data.len() {
                 // Ring full — signal display to drain, yield CPU, retry.
-                besalt::syscall::syscall(
-                    besalt::SYS_SIGNAL, CAP_DISPLAY_RING_NTFN, 1, 0, 0, 0, 0,
+                trona::syscall::syscall(
+                    trona::SYS_SIGNAL, CAP_DISPLAY_RING_NTFN, 1, 0, 0, 0, 0,
                 );
-                besalt::syscall::syscall(besalt::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+                trona::syscall::syscall(trona::SYS_YIELD, 0, 0, 0, 0, 0, 0);
             }
         }
     }
@@ -150,45 +151,45 @@ fn setup_display_ring() -> bool {
     unsafe {
         ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_DISPLAY_RING_NTFN, 0);
     }
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = MM_ALLOC_OBJECT;
     msg.regs[0] = OBJ_NOTIFICATION;
     msg.regs[1] = 0;
     msg.length = 2;
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
-    if err != 0 || reply.label != BESALT_OK {
+    if err != 0 || reply.label != TRONA_OK {
         puts(b"[TTYD] Failed to allocate ring notification\n");
         return false;
     }
 
     // 2. Create SHM
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = MM_SHM_CREATE;
     msg.regs[0] = TERM_SHM_ID;
     msg.regs[1] = TERM_RING_PAGES;
     msg.length = 2;
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
-    if err != 0 || (reply.label != BESALT_OK && reply.label != BESALT_ALREADY_EXISTS) {
+    if err != 0 || (reply.label != TRONA_OK && reply.label != TRONA_ALREADY_EXISTS) {
         puts(b"[TTYD] SHM create failed\n");
         return false;
     }
 
     // 3. Map SHM into our address space
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = MM_SHM_MAP;
     msg.regs[0] = TERM_SHM_ID;
     msg.regs[1] = 0; // map into self
     msg.regs[2] = TERM_RING_VADDR;
     msg.regs[3] = 0x3; // RW
     msg.length = 4;
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
-    if err != 0 || reply.label != BESALT_OK {
+    if err != 0 || reply.label != TRONA_OK {
         puts(b"[TTYD] SHM map failed\n");
         return false;
     }
@@ -209,14 +210,14 @@ fn setup_display_ring() -> bool {
     unsafe {
         ipc::set_send_cap_ctx(ctx, 0, CAP_DISPLAY_RING_NTFN);
     }
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = DISPLAY_SETUP_RING;
     msg.regs[0] = TERM_SHM_ID;
     msg.length = 1;
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to display.
     let err = unsafe { ipc::call_ctx(ctx, CAP_DISPLAY_EP, &raw const msg, &raw mut reply) };
-    if err != 0 || reply.label != BESALT_OK {
+    if err != 0 || reply.label != TRONA_OK {
         puts(b"[TTYD] DISPLAY_SETUP_RING failed\n");
         return false;
     }
@@ -280,8 +281,8 @@ unsafe fn serial_try_flush() {
 // ======================================================================
 
 fn register_with_nameserv() -> bool {
-    let mut reg_msg = BesaltMsg::zeroed();
-    let mut reg_reply = BesaltMsg::zeroed();
+    let mut reg_msg = TronaMsg::zeroed();
+    let mut reg_reply = TronaMsg::zeroed();
     let svc_name = b"ttyd";
 
     reg_msg.label = POSIX_NS_REGISTER;
@@ -300,7 +301,7 @@ fn register_with_nameserv() -> bool {
             &raw const reg_msg,
             &raw mut reg_reply,
         );
-        if err == 0 && reg_reply.label == BESALT_OK {
+        if err == 0 && reg_reply.label == TRONA_OK {
             puts(b"[TTYD] registered with nameserv\n");
             return true;
         }
@@ -325,17 +326,17 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // Query display server for actual framebuffer dimensions.
     unsafe {
-        let mut qmsg = BesaltMsg::zeroed();
-        let mut qreply = BesaltMsg::zeroed();
+        let mut qmsg = TronaMsg::zeroed();
+        let mut qreply = TronaMsg::zeroed();
         qmsg.label = DISPLAY_GET_INFO;
         qmsg.length = 0;
-        let err = besalt::ipc::call_ctx(
+        let err = trona::ipc::call_ctx(
             ipc_ctx(),
             CAP_DISPLAY_EP,
             &raw const qmsg,
             &raw mut qreply,
         );
-        if err == 0 && qreply.label == BESALT_OK {
+        if err == 0 && qreply.label == TRONA_OK {
             let fb_width = qreply.regs[0] as u32;
             let fb_height = qreply.regs[1] as u32;
             // GLYPH_WIDTH=8, GLYPH_HEIGHT=16
@@ -376,11 +377,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     puts(b"[TTYD] Ready\n");
 
     // Main server loop
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     let mut badge = 0u64;
 
     let err = unsafe {
-        besalt::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
+        trona::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
     };
     if err != 0 {
         puts(b"[TTYD] initial recv failed\n");
@@ -390,7 +391,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     loop {
         unsafe { serial_try_flush(); }
 
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         let mut skip_reply = false;
 
         match msg.label {
@@ -433,7 +434,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                         }
                     }
                 }
-                reply.label = BESALT_OK;
+                reply.label = TRONA_OK;
                 reply.length = 0;
             }
             // Legacy labels (backward compat, redirect to PTY 0)
@@ -441,7 +442,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 unsafe { handlers::handle_legacy(msg.label, &msg, &mut reply) };
             }
             _ => {
-                reply.label = BESALT_INVALID_OPERATION;
+                reply.label = TRONA_INVALID_OPERATION;
                 reply.length = 0;
             }
         }
@@ -453,7 +454,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
         if skip_reply {
             let err = unsafe {
-                besalt::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
+                trona::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
             };
             if err != 0 {
                 puts(b"[TTYD] recv failed\n");
@@ -461,7 +462,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             }
         } else {
             let err = unsafe {
-                besalt::ipc::reply_recv_ctx(
+                trona::ipc::reply_recv_ctx(
                     ipc_ctx(),
                     CAP_SERVER_EP,
                     &raw const reply,
@@ -481,6 +482,6 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
 fn idle() -> ! {
     loop {
-        besalt::syscall::syscall(besalt::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        trona::syscall::syscall(trona::SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 }

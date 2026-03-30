@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Runtime network configuration owned by netsrv.
 
-use besalt::consts::{NETCFG_STATE_CONFIGURING, NETCFG_STATE_DOWN, NETCFG_STATE_READY};
+use trona::consts::{NETCFG_STATE_CONFIGURING, NETCFG_STATE_DOWN, NETCFG_STATE_READY};
 
 pub(crate) const HOSTNAME: &[u8] = b"salty";
 pub(crate) const IFACE_NAME: &[u8] = b"eth0";

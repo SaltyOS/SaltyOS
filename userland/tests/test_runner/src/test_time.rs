@@ -1,9 +1,9 @@
 //! Time API test suite
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::posix;
-use besalt::serial;
-use besalt::types::Timespec;
+use trona_posix::proc as posix;
+use trona::serial;
+use trona::types::Timespec;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -14,7 +14,7 @@ fn test_clock_monotonic() -> bool {
     let mut ts1 = Timespec::zeroed();
     let mut ts2 = Timespec::zeroed();
 
-    let ret = unsafe { posix::posix_clock_gettime(0, &raw mut ts1) };
+    let ret = unsafe { trona_posix::posix_clock_gettime(0, &raw mut ts1) };
     if ret != 0 {
         puts(b"  clock_gettime(1) failed\n");
         return false;
@@ -22,10 +22,10 @@ fn test_clock_monotonic() -> bool {
 
     // Yield a few times to advance clock
     for _ in 0..10 {
-        besalt::syscall::syscall(besalt::consts::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        trona::syscall::syscall(trona::consts::SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
-    let ret = unsafe { posix::posix_clock_gettime(0, &raw mut ts2) };
+    let ret = unsafe { trona_posix::posix_clock_gettime(0, &raw mut ts2) };
     if ret != 0 {
         puts(b"  clock_gettime(2) failed\n");
         return false;
@@ -48,16 +48,16 @@ fn test_nanosleep() -> bool {
     let mut before = Timespec::zeroed();
     let mut after = Timespec::zeroed();
 
-    unsafe { posix::posix_clock_gettime(0, &raw mut before) };
+    unsafe { trona_posix::posix_clock_gettime(0, &raw mut before) };
 
     let req = Timespec { tv_sec: 0, tv_nsec: 50_000_000 }; // 50ms
-    let ret = unsafe { posix::posix_nanosleep(&raw const req, core::ptr::null_mut()) };
+    let ret = unsafe { trona_posix::posix_nanosleep(&raw const req, core::ptr::null_mut()) };
     if ret != 0 {
         puts(b"  nanosleep failed\n");
         return false;
     }
 
-    unsafe { posix::posix_clock_gettime(0, &raw mut after) };
+    unsafe { trona_posix::posix_clock_gettime(0, &raw mut after) };
 
     let ns_before = before.tv_sec * 1_000_000_000 + before.tv_nsec;
     let ns_after = after.tv_sec * 1_000_000_000 + after.tv_nsec;

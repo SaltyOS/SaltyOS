@@ -6,9 +6,9 @@
 //! bulk reads can copy data directly from the VFS-SaltyFS SHM into the
 //! client's SHM, avoiding the 152-byte-per-IPC bottleneck.
 
-use besalt::consts::*;
-use besalt::ipc;
-use besalt::types::*;
+use trona::consts::*;
+use trona::ipc;
+use trona::types::*;
 
 use crate::client;
 use crate::consts::*;
@@ -21,8 +21,8 @@ use crate::types::*;
 ///   regs[0] = shm_id (unique per client, typically badge | 0x42_0000_0000)
 ///   regs[1] = page_count (informational)
 pub(crate) unsafe fn handle_bulk_setup(
-    msg: *const BesaltMsg,
-    reply: *mut BesaltMsg,
+    msg: *const TronaMsg,
+    reply: *mut TronaMsg,
     badge: u64,
 ) {
     unsafe {
@@ -33,14 +33,14 @@ pub(crate) unsafe fn handle_bulk_setup(
         // VFS always writes up to CLIENT_BULK_SHM_PAGES pages per request;
         // a smaller mapping would allow writes past the end of the client SHM.
         if client_pages < CLIENT_BULK_SHM_PAGES {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             (*reply).length = 0;
             return;
         }
 
         // Map the client-created SHM into VFS via mmsrv (auto-place)
-        let mut req = BesaltMsg::zeroed();
-        let mut mm_reply = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
+        let mut mm_reply = TronaMsg::zeroed();
         req.label = MM_SHM_MAP;
         req.regs[0] = shm_id;
         req.regs[1] = 0; // map into VFS (caller's own badge)
@@ -54,8 +54,8 @@ pub(crate) unsafe fn handle_bulk_setup(
             &raw mut mm_reply,
         );
 
-        if mm_reply.label != BESALT_OK {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+        if mm_reply.label != TRONA_OK {
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             (*reply).length = 0;
             return;
         }
@@ -67,7 +67,7 @@ pub(crate) unsafe fn handle_bulk_setup(
             (*cli).bulk_shm_id = shm_id;
         }
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 0;
     }
 }
@@ -80,11 +80,11 @@ pub(crate) unsafe fn handle_bulk_setup(
 ///   regs[2] = shm_offset (offset within client SHM)
 ///
 /// Reply:
-///   label = BESALT_OK
+///   label = TRONA_OK
 ///   regs[0] = total bytes read
 pub(crate) unsafe fn handle_bulk_read(
-    msg: *const BesaltMsg,
-    reply: *mut BesaltMsg,
+    msg: *const TronaMsg,
+    reply: *mut TronaMsg,
     badge: u64,
 ) {
     unsafe {
@@ -94,14 +94,14 @@ pub(crate) unsafe fn handle_bulk_read(
 
         let cli = client::get_client_noalloc(badge);
         if cli.is_null() || (*cli).bulk_shm_vaddr == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             (*reply).length = 1;
             (*reply).regs[0] = 0;
             return;
         }
 
         if fd < 0 || fd >= (*cli).fds_cap as i32 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             (*reply).length = 1;
             (*reply).regs[0] = 0;
             return;
@@ -109,7 +109,7 @@ pub(crate) unsafe fn handle_bulk_read(
 
         let fde = &mut *(*cli).fds.add(fd as usize);
         if fde.active == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             (*reply).length = 1;
             (*reply).regs[0] = 0;
             return;
@@ -124,7 +124,7 @@ pub(crate) unsafe fn handle_bulk_read(
                 bulk_read_mount(fde, client_shm, shm_offset, capped, reply);
             }
             _ => {
-                (*reply).label = BESALT_INVALID_ARGUMENT;
+                (*reply).label = TRONA_INVALID_ARGUMENT;
                 (*reply).length = 1;
                 (*reply).regs[0] = 0;
             }
@@ -141,7 +141,7 @@ unsafe fn bulk_read_mount(
     client_shm: u64,
     shm_offset: u64,
     count: u64,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
 ) {
     unsafe {
         let mount_idx = fde.dev_type as usize;
@@ -159,7 +159,7 @@ unsafe fn bulk_read_mount(
                 0,
                 reply,
             );
-            if (*reply).label != BESALT_OK {
+            if (*reply).label != TRONA_OK {
                 break;
             }
 
@@ -182,7 +182,7 @@ unsafe fn bulk_read_mount(
         }
 
         fde.offset += total;
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).regs[0] = total;
         (*reply).length = 1;
     }
@@ -199,7 +199,7 @@ pub(crate) unsafe fn cleanup_bulk_shm(cli: *mut ClientState) {
 
         // Unmap from VFS address space (non-blocking: avoid deadlock with mmsrv
         // during client exit while VFS is already on the mmsrv call stack)
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = MM_SHM_UNMAP;
         req.regs[0] = (*cli).bulk_shm_id;
         req.regs[1] = 0; // VFS's own badge

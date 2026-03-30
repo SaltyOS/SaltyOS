@@ -2,10 +2,10 @@
 //! Ported from userland/mmap_test/main.c
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::consts::*;
-use besalt::posix_mm;
-use besalt::serial;
-use besalt::serial::LineBuf;
+use trona::consts::*;
+use trona_posix::mm as posix_mm;
+use trona::serial;
+use trona::serial::LineBuf;
 
 const CAP_MMSRV_EP: u64 = 7;
 

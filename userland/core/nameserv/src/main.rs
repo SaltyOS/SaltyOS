@@ -17,11 +17,12 @@
 #![no_std]
 #![no_main]
 
-extern crate besalt;
+extern crate trona;
+extern crate trona_posix;
 
-use besalt::consts::*;
-use besalt::ipc;
-use besalt::types::*;
+use trona::consts::*;
+use trona::ipc;
+use trona::types::*;
 
 const CAP_SELF_CSPACE: u64 = 2;
 const CAP_SERVER_EP: u64 = 3;
@@ -54,11 +55,11 @@ static mut SERVICES: [ServiceEntry; MAX_SERVICES] = [ServiceEntry::zeroed(); MAX
 static mut SERVICE_COUNT: usize = 0;
 
 fn ipc_ctx() -> *mut IpcContext {
-    besalt::tls::current_ipc_ctx()
+    trona_posix::tls::current_ipc_ctx()
 }
 
 fn signal_ready() {
-    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 fn name_equal(a: &[u8], alen: u8, b: &[u8], blen: u8) -> bool {
@@ -73,7 +74,7 @@ fn name_equal(a: &[u8], alen: u8, b: &[u8], blen: u8) -> bool {
     true
 }
 
-unsafe fn extract_name(msg: *const BesaltMsg, out: &mut [u8; MAX_NAME_LEN]) -> u8 {
+unsafe fn extract_name(msg: *const TronaMsg, out: &mut [u8; MAX_NAME_LEN]) -> u8 {
     unsafe {
         let mut len = (*msg).regs[0] as u8;
         if (len as usize) > MAX_NAME_LEN {
@@ -87,16 +88,16 @@ unsafe fn extract_name(msg: *const BesaltMsg, out: &mut [u8; MAX_NAME_LEN]) -> u
     }
 }
 
-unsafe fn handle_register(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
+unsafe fn handle_register(msg: *const TronaMsg, reply: *mut TronaMsg) {
     unsafe {
         let mut name = [0u8; MAX_NAME_LEN];
         let name_len = extract_name(msg, &mut name);
 
         if name_len == 0 {
-            besalt::uwarn!(|_lb| {
+            trona::uwarn!(|_lb| {
                 _lb.str(b"[NAMESERV] REGISTER: empty name\n");
             });
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -105,21 +106,21 @@ unsafe fn handle_register(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
             if SERVICES[i].active != 0
                 && name_equal(&SERVICES[i].name, SERVICES[i].name_len, &name, name_len)
             {
-                besalt::uwarn!(|_lb| {
+                trona::uwarn!(|_lb| {
                     _lb.str(b"[NAMESERV] REGISTER: duplicate name '");
                     _lb.bytes(&name[..name_len as usize]);
                     _lb.str(b"'\n");
                 });
-                (*reply).label = BESALT_ALREADY_EXISTS;
+                (*reply).label = TRONA_ALREADY_EXISTS;
                 return;
             }
         }
 
         if SERVICE_COUNT >= MAX_SERVICES {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[NAMESERV] REGISTER: table full\n");
             });
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -134,7 +135,7 @@ unsafe fn handle_register(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
         entry.active = 1;
         SERVICE_COUNT += 1;
 
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[NAMESERV] registered '");
             _lb.bytes(&name[..name_len as usize]);
             _lb.str(b"' at slot ");
@@ -142,17 +143,17 @@ unsafe fn handle_register(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
             _lb.str(b"\n");
         });
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }
 
-unsafe fn handle_lookup(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
+unsafe fn handle_lookup(msg: *const TronaMsg, reply: *mut TronaMsg) {
     unsafe {
         let mut name = [0u8; MAX_NAME_LEN];
         let name_len = extract_name(msg, &mut name);
 
         if name_len == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -161,24 +162,24 @@ unsafe fn handle_lookup(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
                 && name_equal(&SERVICES[i].name, SERVICES[i].name_len, &name, name_len)
             {
                 ipc::set_send_cap_ctx(ipc_ctx(), 0, SERVICES[i].ep_slot);
-                (*reply).label = BESALT_OK;
+                (*reply).label = TRONA_OK;
                 (*reply).length = 0;
                 return;
             }
         }
 
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[NAMESERV] LOOKUP: not found '");
             _lb.bytes(&name[..name_len as usize]);
             _lb.str(b"'\n");
         });
-        (*reply).label = BESALT_NOT_FOUND;
+        (*reply).label = TRONA_NOT_FOUND;
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[NAMESERV] SaltyOS name server starting\n");
     });
 
@@ -189,12 +190,12 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     signal_ready();
 
     // Initial recv
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     let mut badge: u64 = 0;
 
     let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
     if err != 0 {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[NAMESERV] initial recv failed\n");
         });
         idle();
@@ -202,19 +203,19 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // Server loop
     loop {
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
 
         unsafe {
             match msg.label {
                 POSIX_NS_REGISTER => handle_register(&raw const msg, &raw mut reply),
                 POSIX_NS_LOOKUP => handle_lookup(&raw const msg, &raw mut reply),
                 _ => {
-                    besalt::uerror!(|_lb| {
+                    trona::uerror!(|_lb| {
                         _lb.str(b"[NAMESERV] unknown label=");
                         _lb.hex(msg.label);
                         _lb.str(b"\n");
                     });
-                    reply.label = BESALT_INVALID_OPERATION;
+                    reply.label = TRONA_INVALID_OPERATION;
                 }
             }
         }
@@ -239,7 +240,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             )
         };
         if err != 0 {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[NAMESERV] reply_recv failed err=");
                 _lb.hex(err as u64);
                 _lb.str(b"\n");
@@ -253,6 +254,6 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
 fn idle() -> ! {
     loop {
-        besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 }

@@ -5,9 +5,9 @@
 //! Used for tools like `ping` (IPPROTO_ICMP) and extensible to other
 //! IPv4 protocol numbers.
 
-use besalt::consts::{
-    BESALT_INVALID_ARGUMENT, BESALT_INVALID_OPERATION, BESALT_NOT_CONNECTED, BESALT_NO_BUFS,
-    BESALT_OK, INET_OP_RECV, INET_OP_RECVFROM, SOCK_RAW,
+use trona::consts::{
+    TRONA_INVALID_ARGUMENT, TRONA_INVALID_OPERATION, TRONA_NOT_CONNECTED, TRONA_NO_BUFS,
+    TRONA_OK, INET_OP_RECV, INET_OP_RECVFROM, SOCK_RAW,
 };
 
 use crate::net::proto::ipv4::{self, Ipv4Header, IPV4_HEADER_LEN, PROTO_ICMP};
@@ -87,7 +87,7 @@ static mut LOGGED_RAW_DELIVERS: u8 = 0;
 static mut LOGGED_RAW_COMPLETIONS: u8 = 0;
 static mut LOGGED_RAW_BUFFERED: u8 = 0;
 
-fn log_ipv4(lb: &mut besalt::serial::LineBuf, ip: u32) {
+fn log_ipv4(lb: &mut trona::serial::LineBuf, ip: u32) {
     lb.dec(((ip >> 24) & 0xFF) as u64);
     lb.putc(b'.');
     lb.dec(((ip >> 16) & 0xFF) as u64);
@@ -118,7 +118,7 @@ fn push_completion(c: Completion) {
         *(&raw mut COMP_HEAD) = next_head;
         if *(&raw const LOGGED_RAW_COMPLETIONS) < 24 {
             *(&raw mut LOGGED_RAW_COMPLETIONS) += 1;
-            besalt::udebug!(|_lb| {
+            trona::udebug!(|_lb| {
                 _lb.str(b"[netsrv] raw queued conn=");
                 _lb.dec(conn_id as u64);
                 _lb.str(b" op=");
@@ -192,13 +192,13 @@ pub(crate) fn raw_socket(protocol: u8) -> i32 {
             }
         }
     }
-    -(besalt::consts::BESALT_OUT_OF_MEMORY as i32)
+    -(trona::consts::TRONA_OUT_OF_MEMORY as i32)
 }
 
 pub(crate) fn raw_connect(conn_id: u32, ip: u32) -> i32 {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return -(BESALT_INVALID_ARGUMENT as i32),
+        None => return -(TRONA_INVALID_ARGUMENT as i32),
     };
     // SAFETY: Single-threaded netsrv event loop — `idx` was validated above.
     unsafe {
@@ -211,10 +211,10 @@ pub(crate) fn raw_connect(conn_id: u32, ip: u32) -> i32 {
 pub(crate) fn raw_sendto(conn_id: u32, data: &[u8], dst_ip: u32) -> i32 {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return -(BESALT_INVALID_ARGUMENT as i32),
+        None => return -(TRONA_INVALID_ARGUMENT as i32),
     };
     if dst_ip == 0 || data.is_empty() || data.len() > 1480 {
-        return -(BESALT_INVALID_ARGUMENT as i32);
+        return -(TRONA_INVALID_ARGUMENT as i32);
     }
 
     // SAFETY: Single-threaded netsrv event loop — `idx` was validated above.
@@ -226,7 +226,7 @@ pub(crate) fn raw_sendto(conn_id: u32, data: &[u8], dst_ip: u32) -> i32 {
     unsafe {
         if *(&raw const LOGGED_RAW_SENDS) < 8 {
             *(&raw mut LOGGED_RAW_SENDS) += 1;
-            besalt::udebug!(|_lb| {
+            trona::udebug!(|_lb| {
                 _lb.str(b"[netsrv] raw send conn=");
                 _lb.dec(conn_id as u64);
                 _lb.str(b" proto=");
@@ -252,26 +252,26 @@ pub(crate) fn raw_sendto(conn_id: u32, data: &[u8], dst_ip: u32) -> i32 {
         (*sockets)[idx].opts.broadcast
     };
     if crate::net::config::is_broadcast(dst_ip) && !allow_broadcast {
-        return -(BESALT_INVALID_OPERATION as i32);
+        return -(TRONA_INVALID_OPERATION as i32);
     }
     if crate::net::send_ip_packet_with_ttl(&our_mac, ipv4::our_ip(), dst_ip, proto, ttl, data) {
         data.len() as i32
     } else {
-        -(BESALT_NO_BUFS as i32)
+        -(TRONA_NO_BUFS as i32)
     }
 }
 
 pub(crate) fn raw_send(conn_id: u32, data: &[u8]) -> i32 {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return -(BESALT_INVALID_ARGUMENT as i32),
+        None => return -(TRONA_INVALID_ARGUMENT as i32),
     };
     // SAFETY: Single-threaded netsrv event loop — `idx` was validated above.
     unsafe {
         let sockets = &raw const RAW_SOCKETS;
         let dst_ip = (*sockets)[idx].remote_ip;
         if dst_ip == 0 {
-            return -(BESALT_INVALID_ARGUMENT as i32);
+            return -(TRONA_INVALID_ARGUMENT as i32);
         }
         raw_sendto(conn_id, data, dst_ip)
     }
@@ -280,7 +280,7 @@ pub(crate) fn raw_send(conn_id: u32, data: &[u8]) -> i32 {
 pub(crate) fn raw_recv(conn_id: u32, buf: &mut [u8]) -> i32 {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return -(BESALT_INVALID_ARGUMENT as i32),
+        None => return -(TRONA_INVALID_ARGUMENT as i32),
     };
     // SAFETY: Single-threaded netsrv event loop — `idx` was validated above.
     unsafe {
@@ -300,7 +300,7 @@ pub(crate) fn raw_recv(conn_id: u32, buf: &mut [u8]) -> i32 {
 pub(crate) fn raw_recvfrom(conn_id: u32, buf: &mut [u8], want_timestamp: bool) -> (i32, u32, u16, u64) {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return (-(BESALT_INVALID_ARGUMENT as i32), 0, 0, options::TIMESTAMP_NONE_NS),
+        None => return (-(TRONA_INVALID_ARGUMENT as i32), 0, 0, options::TIMESTAMP_NONE_NS),
     };
     // SAFETY: Single-threaded netsrv event loop — `idx` was validated above.
     unsafe {
@@ -337,7 +337,7 @@ pub(crate) fn set_pending_recv(conn_id: u32, max_len: u16) {
             let copy_len = core::cmp::min(copy_len, 128);
             let mut comp = Completion {
                 conn_id: sock.conn_id,
-                result: BESALT_OK,
+                result: TRONA_OK,
                 op_type: INET_OP_RECV,
                 data: [0; 152],
                 data_len: copy_len,
@@ -370,14 +370,14 @@ pub(crate) fn set_pending_recvfrom(conn_id: u32, max_len: u16, flags: u32) {
             let copy_len = core::cmp::min(copy_len, 104);
             let mut comp = Completion {
                 conn_id: sock.conn_id,
-                result: BESALT_OK,
+                result: TRONA_OK,
                 op_type: INET_OP_RECVFROM,
                 data: [0; 152],
                 data_len: copy_len,
                 extra_conn_id: 0,
                 extra_ip: sock.rx_src_ip,
                 extra_port: 0,
-                timestamp_ns: if (flags & besalt::consts::INET_RECVMSG_WANT_TIMESTAMP) != 0 {
+                timestamp_ns: if (flags & trona::consts::INET_RECVMSG_WANT_TIMESTAMP) != 0 {
                     sock.rx_timestamp_ns
                 } else {
                     options::TIMESTAMP_NONE_NS
@@ -405,14 +405,14 @@ pub(crate) fn raw_getsockname(conn_id: u32) -> (u32, u16) {
 pub(crate) fn raw_getpeername(conn_id: u32) -> Result<(u32, u16), u64> {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return Err(BESALT_INVALID_ARGUMENT),
+        None => return Err(TRONA_INVALID_ARGUMENT),
     };
     // SAFETY: Single-threaded netsrv event loop — `idx` was validated above.
     unsafe {
         let sockets = &raw const RAW_SOCKETS;
         let remote_ip = (*sockets)[idx].remote_ip;
         if remote_ip == 0 {
-            return Err(BESALT_NOT_CONNECTED);
+            return Err(TRONA_NOT_CONNECTED);
         }
         Ok((remote_ip, 0))
     }
@@ -427,7 +427,7 @@ pub(crate) fn raw_setsockopt(
 ) -> u64 {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return BESALT_INVALID_ARGUMENT,
+        None => return TRONA_INVALID_ARGUMENT,
     };
     unsafe {
         let sockets = &raw mut RAW_SOCKETS;
@@ -438,7 +438,7 @@ pub(crate) fn raw_setsockopt(
 pub(crate) fn raw_getsockopt(conn_id: u32, level: i32, optname: i32) -> Result<(u64, u32), u64> {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return Err(BESALT_INVALID_ARGUMENT),
+        None => return Err(TRONA_INVALID_ARGUMENT),
     };
     unsafe {
         let sockets = &raw mut RAW_SOCKETS;
@@ -470,7 +470,7 @@ pub(crate) fn raw_poll_status(conn_id: u32, events: u16) -> u16 {
 pub(crate) fn raw_close(conn_id: u32) -> i32 {
     let idx = match find_socket(conn_id) {
         Some(i) => i,
-        None => return -(BESALT_INVALID_ARGUMENT as i32),
+        None => return -(TRONA_INVALID_ARGUMENT as i32),
     };
     // SAFETY: Single-threaded netsrv event loop — `idx` was validated above.
     unsafe {
@@ -540,7 +540,7 @@ pub(crate) fn deliver(ip_hdr: &Ipv4Header, data: &[u8]) {
             unsafe {
                 if *(&raw const LOGGED_RAW_DELIVERS) < 12 {
                     *(&raw mut LOGGED_RAW_DELIVERS) += 1;
-                    besalt::udebug!(|_lb| {
+                    trona::udebug!(|_lb| {
                         _lb.str(b"[netsrv] raw deliver conn=");
                         _lb.dec(sock.conn_id as u64);
                         _lb.str(b" proto=");
@@ -568,7 +568,7 @@ pub(crate) fn deliver(ip_hdr: &Ipv4Header, data: &[u8]) {
                 let copy_len = core::cmp::min(copy_len, 128);
                 let mut comp = Completion {
                     conn_id: sock.conn_id,
-                    result: BESALT_OK,
+                    result: TRONA_OK,
                     op_type: INET_OP_RECV,
                     data: [0; 152],
                     data_len: copy_len,
@@ -581,7 +581,7 @@ pub(crate) fn deliver(ip_hdr: &Ipv4Header, data: &[u8]) {
                 unsafe {
                     if *(&raw const LOGGED_RAW_COMPLETIONS) < 12 {
                         *(&raw mut LOGGED_RAW_COMPLETIONS) += 1;
-                        besalt::udebug!(|_lb| {
+                        trona::udebug!(|_lb| {
                             _lb.str(b"[netsrv] raw completion recv conn=");
                             _lb.dec(sock.conn_id as u64);
                             _lb.str(b" len=");
@@ -600,7 +600,7 @@ pub(crate) fn deliver(ip_hdr: &Ipv4Header, data: &[u8]) {
                 let copy_len = core::cmp::min(copy_len, 104);
                 let mut comp = Completion {
                     conn_id: sock.conn_id,
-                    result: BESALT_OK,
+                    result: TRONA_OK,
                     op_type: INET_OP_RECVFROM,
                     data: [0; 152],
                     data_len: copy_len,
@@ -608,7 +608,7 @@ pub(crate) fn deliver(ip_hdr: &Ipv4Header, data: &[u8]) {
                     extra_ip: ip_hdr.src,
                     extra_port: 0,
                     timestamp_ns: if (sock.pending_recvfrom_flags
-                        & besalt::consts::INET_RECVMSG_WANT_TIMESTAMP)
+                        & trona::consts::INET_RECVMSG_WANT_TIMESTAMP)
                         != 0
                     {
                         options::sample_timestamp_ns(&sock.opts)
@@ -621,7 +621,7 @@ pub(crate) fn deliver(ip_hdr: &Ipv4Header, data: &[u8]) {
                 unsafe {
                     if *(&raw const LOGGED_RAW_COMPLETIONS) < 12 {
                         *(&raw mut LOGGED_RAW_COMPLETIONS) += 1;
-                        besalt::udebug!(|_lb| {
+                        trona::udebug!(|_lb| {
                             _lb.str(b"[netsrv] raw completion recvfrom conn=");
                             _lb.dec(sock.conn_id as u64);
                             _lb.str(b" len=");
@@ -644,7 +644,7 @@ pub(crate) fn deliver(ip_hdr: &Ipv4Header, data: &[u8]) {
             sock.rx_timestamp_ns = options::sample_timestamp_ns(&sock.opts);
             if *(&raw const LOGGED_RAW_BUFFERED) < 12 {
                 *(&raw mut LOGGED_RAW_BUFFERED) += 1;
-                besalt::udebug!(|_lb| {
+                trona::udebug!(|_lb| {
                     _lb.str(b"[netsrv] raw buffered conn=");
                     _lb.dec(sock.conn_id as u64);
                     _lb.str(b" len=");
@@ -657,7 +657,7 @@ pub(crate) fn deliver(ip_hdr: &Ipv4Header, data: &[u8]) {
             if was_empty {
                 push_completion(Completion {
                     conn_id: sock.conn_id,
-                    result: BESALT_OK,
+                    result: TRONA_OK,
                     op_type: INET_OP_RECV,
                     data: [0; 152],
                     data_len: 0,

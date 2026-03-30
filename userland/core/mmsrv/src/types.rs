@@ -1,4 +1,4 @@
-use besalt::types::Cap;
+use trona::types::Cap;
 
 pub(crate) const MAX_UT_SOURCES: usize = 32;
 

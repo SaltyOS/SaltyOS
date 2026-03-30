@@ -5,10 +5,10 @@
 //! regions via PCI vendor-specific capabilities.  Falls back to legacy
 //! transport when the device is transitional (0x1001).
 
-use besalt::consts::*;
-use besalt::ipc;
-use besalt::invoke;
-use besalt::types::*;
+use trona::consts::*;
+use trona::ipc;
+use trona::invoke;
+use trona::types::*;
 
 use crate::ipc_ctx;
 use crate::{CAPACITY_SECTORS, VIRTIO_INITIALIZED, VQUEUE_BASE};
@@ -71,7 +71,7 @@ static mut BAR_VADDRS: [u64; 6] = [0; 6];
 
 /// Read 32-bit PCI config via pcisrv IPC
 fn pci_config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = PCI_READ_CONFIG32;
     msg.length = 4;
     msg.regs[0] = bus as u64;
@@ -79,7 +79,7 @@ fn pci_config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     msg.regs[2] = func as u64;
     msg.regs[3] = offset as u64;
 
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return 0xFFFF_FFFF;
@@ -89,13 +89,13 @@ fn pci_config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
 
 /// Query pcisrv for modern virtio-blk device (device ID 0x1042).
 pub(crate) fn find_virtio_blk_modern() -> Option<(u8, u8, u8)> {
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = PCI_FIND_DEVICE;
     msg.length = 2;
     msg.regs[0] = VIRTIO_VENDOR as u64;
     msg.regs[1] = VIRTIO_BLK_MODERN_DEVICE as u64;
 
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
@@ -115,7 +115,7 @@ const CAP_BAR_SLOT_BASE: u64 = 82;
 fn map_bar(bus: u8, dev: u8, func: u8, bar_idx: u8) -> Option<(u64, u32)> {
     let recv_slot = CAP_BAR_SLOT_BASE + bar_idx as u64;
 
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = PCI_GET_BAR_CAP;
     msg.length = 4;
     msg.regs[0] = bus as u64;
@@ -127,7 +127,7 @@ fn map_bar(bus: u8, dev: u8, func: u8, bar_idx: u8) -> Option<(u64, u32)> {
         ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, recv_slot, 0);
     }
 
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
@@ -221,7 +221,7 @@ fn scan_virtio_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioModernLayout> {
     }
 
     if common_bar == 0xFF || notify_bar == 0xFF || device_bar == 0xFF {
-        besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] Missing required virtio PCI capabilities\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[blkdrv] Missing required virtio PCI capabilities\n"); });
         return None;
     }
 
@@ -234,7 +234,7 @@ fn scan_virtio_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioModernLayout> {
         let vaddr = unsafe { *(&raw const BAR_VADDRS[b as usize]) };
         if vaddr == 0 {
             if map_bar(bus, dev, func, b).is_none() {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[blkdrv] Failed to map BAR ");
                     _lb.dec(b as u64);
                     _lb.putc(b'\n');
@@ -348,14 +348,14 @@ fn align_up(value: u64, align: u64) -> u64 {
 
 /// Initialize virtio-blk device via modern (1.0+) PCI transport.
 pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
-    besalt::uinfo!(|_lb| { _lb.str(b"[blkdrv] Probing modern virtio transport\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[blkdrv] Probing modern virtio transport\n"); });
 
     let layout = match scan_virtio_caps(bus, dev, func) {
         Some(l) => l,
         None => return false,
     };
 
-    besalt::uinfo!(|_lb| { _lb.str(b"[blkdrv] Modern virtio caps discovered\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[blkdrv] Modern virtio caps discovered\n"); });
 
     // 1. Reset device
     layout.common_write8(CC_DEVICE_STATUS, 0);
@@ -377,7 +377,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
     );
     let status = layout.common_read8(CC_DEVICE_STATUS);
     if (status & VIRTIO_STATUS_FEATURES_OK) == 0 {
-        besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] Device did not accept features\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[blkdrv] Device did not accept features\n"); });
         return false;
     }
 
@@ -387,7 +387,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
     unsafe {
         *(&raw mut CAPACITY_SECTORS) = ((cap_hi as u64) << 32) | (cap_lo as u64);
     }
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[blkdrv] Capacity: ");
         _lb.dec(unsafe { *(&raw const CAPACITY_SECTORS) });
         _lb.str(b" sectors (");
@@ -399,12 +399,12 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
     layout.common_write16(CC_QUEUE_SELECT, 0);
     let qsize = layout.common_read16(CC_QUEUE_SIZE);
     if qsize == 0 {
-        besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] Queue 0 unavailable\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[blkdrv] Queue 0 unavailable\n"); });
         return false;
     }
 
     {
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[blkdrv] Queue 0 size: ");
             _lb.dec(qsize as u64);
             _lb.putc(b'\n');
@@ -430,17 +430,17 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
     // Allocate virtqueue memory via mmsrv mmap
     let vq_pages = (total_bytes + 4095) / 4096;
     let ctx = ipc_ctx();
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = MM_MMAP;
     msg.length = 4;
     msg.regs[0] = VQUEUE_HINT_VADDR;
     msg.regs[1] = vq_pages * 4096;
     msg.regs[2] = 0x3; // PROT_READ | PROT_WRITE
     msg.regs[3] = 0x22; // MAP_PRIVATE | MAP_ANONYMOUS
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
-        besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] Failed to allocate virtqueue memory\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[blkdrv] Failed to allocate virtqueue memory\n"); });
         return false;
     }
     let vq_base = reply.regs[0];
@@ -459,7 +459,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
     let avail_phys = crate::virtio::vaddr_to_phys(vq_base + avail_off);
     let used_phys = crate::virtio::vaddr_to_phys(vq_base + used_off);
     if desc_phys == 0 || avail_phys == 0 || used_phys == 0 {
-        besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] Failed to translate virtqueue ring addresses\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[blkdrv] Failed to translate virtqueue ring addresses\n"); });
         return false;
     }
     unsafe { *(&raw mut QUEUE_PHYS) = desc_phys; }
@@ -481,7 +481,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         let avail_base = (vq_base + avail_off) as *mut u16;
         core::ptr::write_volatile(avail_base, VIRTQ_AVAIL_F_NO_INTERRUPT);
     }
-    besalt::udebug!(|_lb| { _lb.str(b"[blkdrv] Queue interrupts suppressed (polling mode)\n"); });
+    trona::udebug!(|_lb| { _lb.str(b"[blkdrv] Queue interrupts suppressed (polling mode)\n"); });
 
     // Enable queue
     layout.common_write16(CC_QUEUE_ENABLE, 1);
@@ -496,7 +496,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
     unsafe { *(&raw mut MODERN_LAYOUT) = Some(layout); }
     unsafe { *(&raw mut VIRTIO_INITIALIZED) = true; }
 
-    besalt::uinfo!(|_lb| { _lb.str(b"[blkdrv] Modern virtio initialized OK\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[blkdrv] Modern virtio initialized OK\n"); });
     true
 }
 

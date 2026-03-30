@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Block I/O with caching and prefetching.
 
-use besalt::consts::*;
-use besalt::ipc;
-use besalt::types::*;
+use trona::consts::*;
+use trona::ipc;
+use trona::types::*;
 
 use crate::consts::*;
 use crate::crc::crc32c_superblock;
@@ -424,28 +424,28 @@ fn scan_gpt_for_saltyfs_partition() -> Option<(u64, Superblock)> {
 
 /// Read sectors from blkdrv into SHM at given offset.
 pub(crate) fn blk_read_sectors(start_sector: u64, count: u64, shm_offset: u64) -> bool {
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = BLK_READ;
     msg.length = 3;
     msg.regs[0] = start_sector;
     msg.regs[1] = count;
     msg.regs[2] = shm_offset;
 
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_BLKDRV_EP, &raw const msg, &raw mut reply) };
     err == 0 && reply.label == 0
 }
 
 /// Write sectors to blkdrv from SHM at given offset.
 pub(crate) fn blk_write_sectors(start_sector: u64, count: u64, shm_offset: u64) -> bool {
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = BLK_WRITE;
     msg.length = 3;
     msg.regs[0] = start_sector;
     msg.regs[1] = count;
     msg.regs[2] = shm_offset;
 
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_BLKDRV_EP, &raw const msg, &raw mut reply) };
     err == 0 && reply.label == 0
 }
@@ -564,7 +564,7 @@ fn scan_leaf_for_max_ino(leaf: *const u8) {
             let item = core::ptr::read_unaligned(
                 items_start.add(i * item_size) as *const BTreeItem,
             );
-            if item.key.item_type == BESALT_INODE_ITEM && item.key.object_id > max_ino {
+            if item.key.item_type == TRONA_INODE_ITEM && item.key.object_id > max_ino {
                 max_ino = item.key.object_id;
             }
         }
@@ -660,21 +660,21 @@ pub(crate) fn setup_blk_shm() -> bool {
     let ctx = ipc_ctx();
 
     // Get SHM ID from blkdrv
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = BLK_GET_SHM_ID;
     msg.length = 0;
 
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_BLKDRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
-        besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] Failed to get SHM ID from blkdrv\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[saltyfs] Failed to get SHM ID from blkdrv\n"); });
         return false;
     }
 
     unsafe { *(&raw mut BLK_SHM_ID) = reply.regs[0]; }
 
     // Map the SHM into our address space
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = MM_SHM_MAP;
     msg.length = 4;
     msg.regs[0] = unsafe { *(&raw const BLK_SHM_ID) };
@@ -682,10 +682,10 @@ pub(crate) fn setup_blk_shm() -> bool {
     msg.regs[2] = SHM_VADDR;
     msg.regs[3] = 0x3; // RW
 
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[saltyfs] SHM map failed: ");
             _lb.dec(if err != 0 { err as u64 } else { reply.label });
             _lb.putc(b'\n');
@@ -693,7 +693,7 @@ pub(crate) fn setup_blk_shm() -> bool {
         return false;
     }
 
-    besalt::uinfo!(|_lb| { _lb.str(b"[saltyfs] SHM mapped from blkdrv\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[saltyfs] SHM mapped from blkdrv\n"); });
     true
 }
 
@@ -702,20 +702,20 @@ pub(crate) fn setup_cache() -> bool {
     let ctx = ipc_ctx();
 
     // Allocate pages for block cache
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = MM_SHM_CREATE;
     msg.length = 2;
     msg.regs[0] = 0x53465343; // "SFSC" - saltyfs cache
     msg.regs[1] = CACHE_TOTAL_PAGES;
 
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
-    if err != 0 || (reply.label != 0 && reply.label != BESALT_ALREADY_EXISTS) {
-        besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] Cache SHM create failed\n"); });
+    if err != 0 || (reply.label != 0 && reply.label != TRONA_ALREADY_EXISTS) {
+        trona::uerror!(|_lb| { _lb.str(b"[saltyfs] Cache SHM create failed\n"); });
         return false;
     }
 
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = MM_SHM_MAP;
     msg.length = 4;
     msg.regs[0] = 0x53465343;
@@ -723,14 +723,14 @@ pub(crate) fn setup_cache() -> bool {
     msg.regs[2] = CACHE_VADDR;
     msg.regs[3] = 0x3; // RW
 
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
-        besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] Cache SHM map failed\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[saltyfs] Cache SHM map failed\n"); });
         return false;
     }
 
-    besalt::uinfo!(|_lb| { _lb.str(b"[saltyfs] Block cache allocated\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[saltyfs] Block cache allocated\n"); });
     true
 }
 
@@ -753,7 +753,7 @@ pub(crate) fn read_superblock() -> bool {
     } else if let Some((lba, sb)) = scan_mbr_for_saltyfs_partition() {
         (lba, sb)
     } else {
-        besalt::uerror!(|_lb| { _lb.str(b"[saltyfs] Failed to find SaltyFS superblock (raw/GPT/MBR)\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[saltyfs] Failed to find SaltyFS superblock (raw/GPT/MBR)\n"); });
         return false;
     };
 
@@ -762,7 +762,7 @@ pub(crate) fn read_superblock() -> bool {
         *(&raw mut SB) = probed_sb;
         *(&raw mut BLOCK_SIZE) = (*(&raw const SB)).block_size;
 
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[saltyfs] Mounted: part_lba=");
             _lb.dec(*(&raw const PARTITION_BASE_LBA));
             _lb.str(b" blocks=");

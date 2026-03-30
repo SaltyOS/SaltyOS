@@ -30,7 +30,8 @@
 #![no_std]
 #![no_main]
 
-extern crate besalt;
+extern crate trona;
+extern crate trona_posix;
 
 #[cfg(target_arch = "x86_64")]
 #[path = "arch/x86_64.rs"]
@@ -39,10 +40,10 @@ mod arch;
 #[path = "arch/aarch64.rs"]
 mod arch;
 
-use besalt::consts::*;
-use besalt::ipc;
-use besalt::invoke;
-use besalt::types::*;
+use trona::consts::*;
+use trona::ipc;
+use trona::invoke;
+use trona::types::*;
 
 const CAP_SELF_CSPACE: u64 = 2;
 const CAP_SERVER_EP: u64 = 3;
@@ -101,11 +102,11 @@ static mut DEVICES: [PciDevice; MAX_PCI_DEVICES] = [PciDevice::zeroed(); MAX_PCI
 static mut DEVICE_COUNT: usize = 0;
 
 fn ipc_ctx() -> *mut IpcContext {
-    besalt::tls::current_ipc_ctx()
+    trona_posix::tls::current_ipc_ctx()
 }
 
 fn signal_ready() {
-    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 /// Probe one PCI BAR size by writing all 1s and reading back.
@@ -127,7 +128,7 @@ fn probe_bar_size(bus: u8, dev: u8, func: u8, bar_idx: u8) -> u32 {
 
 /// Scan PCI bus 0, devices 0-31, all functions (multi-function aware).
 fn scan_bus() {
-    besalt::uinfo!(|_lb| { _lb.str(b"[pcisrv] Scanning PCI bus 0...\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[pcisrv] Scanning PCI bus 0...\n"); });
 
     let mut count = 0usize;
     for dev in 0u8..32 {
@@ -269,7 +270,7 @@ fn scan_bus() {
                     if err == 0 {
                         entry.irq_handler_slot = slot;
                     } else {
-                        besalt::uwarn!(|_lb| {
+                        trona::uwarn!(|_lb| {
                             _lb.str(b"[pcisrv] irq_control_get IRQ ");
                             _lb.dec(effective_irq as u64);
                             _lb.str(b" failed: ");
@@ -280,7 +281,7 @@ fn scan_bus() {
                 }
             }
 
-            besalt::udebug!(|_lb| {
+            trona::udebug!(|_lb| {
                 _lb.str(b"[pcisrv]   ");
                 _lb.hex(vid as u64);
                 _lb.putc(b':');
@@ -306,7 +307,7 @@ fn scan_bus() {
 
     unsafe { *(&raw mut DEVICE_COUNT) = count; }
 
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[pcisrv] Found ");
         _lb.dec(count as u64);
         _lb.str(b" PCI device(s)\n");
@@ -327,9 +328,9 @@ fn find_device(vendor_id: u16, device_id: u16) -> Option<usize> {
 
 /// Register with name service.
 fn register_nameserv() -> bool {
-    besalt::udebug!(|_lb| { _lb.str(b"[pcisrv] Registering with nameserv\n"); });
+    trona::udebug!(|_lb| { _lb.str(b"[pcisrv] Registering with nameserv\n"); });
     let name = b"pcisrv";
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = POSIX_NS_REGISTER;
     msg.regs[0] = name.len() as u64;
     msg.length = 1 + (name.len() as u64 + 7) / 8;
@@ -339,10 +340,10 @@ fn register_nameserv() -> bool {
             *dst.add(i) = name[i];
         }
         ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != BESALT_OK {
-            besalt::uerror!(|_lb| {
+        if err != 0 || reply.label != TRONA_OK {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[pcisrv] nameserv register failed err=");
                 _lb.hex(err as u64);
                 _lb.str(b" label=");
@@ -352,16 +353,16 @@ fn register_nameserv() -> bool {
             return false;
         }
     }
-    besalt::uinfo!(|_lb| { _lb.str(b"[pcisrv] registered with nameserv\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[pcisrv] registered with nameserv\n"); });
     true
 }
 
 /// Handle PCI_FIND_DEVICE request.
-fn handle_find_device(msg: &BesaltMsg) -> BesaltMsg {
+fn handle_find_device(msg: &TronaMsg) -> TronaMsg {
     let vendor_id = msg.regs[0] as u16;
     let device_id = msg.regs[1] as u16;
 
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
 
     match find_device(vendor_id, device_id) {
         Some(idx) => {
@@ -378,7 +379,7 @@ fn handle_find_device(msg: &BesaltMsg) -> BesaltMsg {
             reply.regs[7] = d.bars[3] as u64;
         }
         None => {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
             reply.length = 0;
         }
     }
@@ -395,12 +396,12 @@ fn ensure_bus_master(bus: u8, dev: u8, func: u8) {
     }
 }
 
-fn handle_get_caps(msg: &BesaltMsg) -> BesaltMsg {
+fn handle_get_caps(msg: &TronaMsg) -> TronaMsg {
     let bus = msg.regs[0] as u8;
     let dev = msg.regs[1] as u8;
     let func = msg.regs[2] as u8;
 
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
 
     let count = unsafe { *(&raw const DEVICE_COUNT) };
     let mut found = None;
@@ -415,7 +416,7 @@ fn handle_get_caps(msg: &BesaltMsg) -> BesaltMsg {
     let idx = match found {
         Some(i) => i,
         None => {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
             return reply;
         }
     };
@@ -471,9 +472,9 @@ fn handle_get_caps(msg: &BesaltMsg) -> BesaltMsg {
 }
 
 /// Handle PCI_LIST request.
-fn handle_list() -> BesaltMsg {
+fn handle_list() -> TronaMsg {
     let count = unsafe { *(&raw const DEVICE_COUNT) };
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     reply.label = 0;
     reply.length = 1 + (count * 3).min(18) as u64;
     reply.regs[0] = count as u64;
@@ -501,10 +502,10 @@ fn ceil_log2(n: u64) -> u8 {
 /// PCI_GET_BAR_CAP: Get device untyped (or IoPort) cap for a specific BAR.
 /// Request: MR0=bus, MR1=dev, MR2=func, MR3=bar_idx
 /// Reply: MR0=bar_phys, MR1=bar_size, MR2=bar_is_io + extra_cap #0
-fn handle_get_bar_cap(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+fn handle_get_bar_cap(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
     if msg.length < 4 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
     let bus = msg.regs[0] as u8;
@@ -513,7 +514,7 @@ fn handle_get_bar_cap(msg: &BesaltMsg) -> BesaltMsg {
     let bar_idx = msg.regs[3] as usize;
 
     if bar_idx >= 6 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
@@ -530,7 +531,7 @@ fn handle_get_bar_cap(msg: &BesaltMsg) -> BesaltMsg {
     let idx = match found {
         Some(i) => i,
         None => {
-            reply.label = BESALT_NOT_FOUND;
+            reply.label = TRONA_NOT_FOUND;
             return reply;
         }
     };
@@ -544,7 +545,7 @@ fn handle_get_bar_cap(msg: &BesaltMsg) -> BesaltMsg {
     let phys = d.bar_phys[bar_idx];
 
     if phys == 0 && bar_size == 0 {
-        reply.label = BESALT_NOT_FOUND;
+        reply.label = TRONA_NOT_FOUND;
         return reply;
     }
 
@@ -567,10 +568,10 @@ fn handle_get_bar_cap(msg: &BesaltMsg) -> BesaltMsg {
 }
 
 /// PCI_READ_CONFIG32: Read a 32-bit word from PCI config space.
-fn handle_read_config32(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+fn handle_read_config32(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
     if msg.length < 4 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
     let bus = msg.regs[0] as u8;
@@ -583,10 +584,10 @@ fn handle_read_config32(msg: &BesaltMsg) -> BesaltMsg {
 }
 
 /// PCI_WRITE_CONFIG32: Write a 32-bit word to PCI config space.
-fn handle_write_config32(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+fn handle_write_config32(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
     if msg.length < 5 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
     let bus = msg.regs[0] as u8;
@@ -600,10 +601,10 @@ fn handle_write_config32(msg: &BesaltMsg) -> BesaltMsg {
 
 /// Server main loop.
 fn server_loop() -> ! {
-    besalt::uinfo!(|_lb| { _lb.str(b"[pcisrv] Entering server loop\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[pcisrv] Entering server loop\n"); });
 
     let ctx = ipc_ctx();
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     let mut badge: u64 = 0;
     unsafe { ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge); }
 
@@ -616,13 +617,13 @@ fn server_loop() -> ! {
             PCI_WRITE_CONFIG32 => handle_write_config32(&msg),
             PCI_GET_BAR_CAP => handle_get_bar_cap(&msg),
             _ => {
-                let mut r = BesaltMsg::zeroed();
-                r.label = BESALT_INVALID_OPERATION;
+                let mut r = TronaMsg::zeroed();
+                r.label = TRONA_INVALID_OPERATION;
                 r
             }
         };
 
-        msg = BesaltMsg::zeroed();
+        msg = TronaMsg::zeroed();
         badge = 0;
         unsafe {
             ipc::reply_recv_ctx(
@@ -634,7 +635,7 @@ fn server_loop() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    besalt::uinfo!(|_lb| { _lb.str(b"[pcisrv] PCI Enumeration Server starting\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[pcisrv] PCI Enumeration Server starting\n"); });
 
     arch::pci_init();
     scan_bus();
@@ -647,6 +648,6 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
 fn idle() -> ! {
     loop {
-        let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 }

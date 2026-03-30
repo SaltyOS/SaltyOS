@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! aarch64 console hardware — PL011 UART I/O via device untyped + MMIO.
 
-use besalt::consts::*;
-use besalt::invoke;
+use trona::consts::*;
+use trona::invoke;
 
 // Cap layout (set up by init for the console server)
 const CAP_SELF_TCB: u64 = 0;
@@ -64,7 +64,7 @@ pub fn serial_init() {
     let flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER | VSPACE_FLAG_CACHE_DISABLE;
     let err = invoke::vspace_map_device(CAP_SELF_VSPACE, CAP_UART_DEVUT, 0, UART_MMIO_VADDR, flags);
     if err != 0 {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[CONSOLE] FAIL: PL011 device map failed err=");
             _lb.hex(err as u64);
             _lb.str(b"\n");
@@ -83,7 +83,7 @@ pub fn serial_init() {
         *&raw mut UART_READY = true;
     }
 
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[CONSOLE] PL011 UART mapped\n");
     });
 }
@@ -93,7 +93,7 @@ pub fn irq_setup() {
     // If MMIO mapping is unavailable, keep the service alive in output-only mode.
     unsafe {
         if !*(&raw const UART_READY) {
-            besalt::uwarn!(|_lb| {
+            trona::uwarn!(|_lb| {
                 _lb.str(b"[CONSOLE] UART input disabled\n");
             });
             return;

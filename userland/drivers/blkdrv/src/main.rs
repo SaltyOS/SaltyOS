@@ -27,15 +27,16 @@
 #![no_std]
 #![no_main]
 
-extern crate besalt;
+extern crate trona;
+extern crate trona_posix;
 
 mod virtio;
 mod virtio_modern;
 mod handlers;
 
-use besalt::consts::*;
-use besalt::ipc;
-use besalt::types::*;
+use trona::consts::*;
+use trona::ipc;
+use trona::types::*;
 
 const CAP_SERVER_EP: u64 = 68;
 const CAP_READINESS_NTFN: u64 = 14;
@@ -70,27 +71,27 @@ static mut QUEUE_USED_OFF: u64 = 0;
 static mut QUEUE_EVENT_IDX: bool = false;
 
 fn ipc_ctx() -> *mut IpcContext {
-    besalt::tls::current_ipc_ctx()
+    trona_posix::tls::current_ipc_ctx()
 }
 
 fn signal_ready() {
-    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 /// Create SHM for data transfer.
 fn setup_shm() -> bool {
     let ctx = ipc_ctx();
 
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = MM_SHM_CREATE;
     msg.length = 2;
     msg.regs[0] = BLK_SHM_ID;
     msg.regs[1] = BLK_SHM_PAGES;
 
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
-    if err != 0 || (reply.label != 0 && reply.label != BESALT_ALREADY_EXISTS) {
-        besalt::uerror!(|_lb| {
+    if err != 0 || (reply.label != 0 && reply.label != TRONA_ALREADY_EXISTS) {
+        trona::uerror!(|_lb| {
             _lb.str(b"[blkdrv] SHM create failed: ");
             _lb.dec(if err != 0 { err as u64 } else { reply.label });
             _lb.putc(b'\n');
@@ -98,7 +99,7 @@ fn setup_shm() -> bool {
         return false;
     }
 
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = MM_SHM_MAP;
     msg.length = 4;
     msg.regs[0] = BLK_SHM_ID;
@@ -106,10 +107,10 @@ fn setup_shm() -> bool {
     msg.regs[2] = SHM_VADDR;
     msg.regs[3] = 0x3; // RW
 
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[blkdrv] SHM map failed: ");
             _lb.dec(if err != 0 { err as u64 } else { reply.label });
             _lb.putc(b'\n');
@@ -117,14 +118,14 @@ fn setup_shm() -> bool {
         return false;
     }
 
-    besalt::uinfo!(|_lb| { _lb.str(b"[blkdrv] SHM region mapped\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[blkdrv] SHM region mapped\n"); });
     true
 }
 
 /// Register with name service.
 fn register_nameserv() {
     let name = b"blkdrv";
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = POSIX_NS_REGISTER;
     msg.regs[0] = name.len() as u64;
     msg.length = 1 + (name.len() as u64 + 7) / 8;
@@ -134,20 +135,20 @@ fn register_nameserv() {
             *dst.add(i) = name[i];
         }
         ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != BESALT_OK {
-            besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] nameserv registration failed\n"); });
+        if err != 0 || reply.label != TRONA_OK {
+            trona::uerror!(|_lb| { _lb.str(b"[blkdrv] nameserv registration failed\n"); });
         }
     }
 }
 
 /// Server main loop.
 fn server_loop() -> ! {
-    besalt::uinfo!(|_lb| { _lb.str(b"[blkdrv] Entering server loop\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[blkdrv] Entering server loop\n"); });
 
     let ctx = ipc_ctx();
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     let mut badge: u64 = 0;
     unsafe { ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge); }
 
@@ -157,19 +158,19 @@ fn server_loop() -> ! {
             BLK_WRITE => handlers::handle_write(&msg),
             BLK_GET_INFO => handlers::handle_get_info(),
             BLK_FLUSH => {
-                let mut r = BesaltMsg::zeroed();
+                let mut r = TronaMsg::zeroed();
                 r.label = 0;
                 r
             }
             BLK_GET_SHM_ID => handlers::handle_get_shm_id(),
             _ => {
-                let mut r = BesaltMsg::zeroed();
-                r.label = BESALT_INVALID_OPERATION;
+                let mut r = TronaMsg::zeroed();
+                r.label = TRONA_INVALID_OPERATION;
                 r
             }
         };
 
-        msg = BesaltMsg::zeroed();
+        msg = TronaMsg::zeroed();
         badge = 0;
         unsafe {
             ipc::reply_recv_ctx(
@@ -181,12 +182,12 @@ fn server_loop() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    besalt::uinfo!(|_lb| { _lb.str(b"[blkdrv] virtio-blk Block Device Driver starting\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[blkdrv] virtio-blk Block Device Driver starting\n"); });
 
     // Try modern virtio (device ID 0x1042) first
     let mut initialized = false;
     if let Some((bus, dev, func)) = virtio_modern::find_virtio_blk_modern() {
-        besalt::uinfo!(|_lb| { _lb.str(b"[blkdrv] Found modern virtio-blk device\n"); });
+        trona::uinfo!(|_lb| { _lb.str(b"[blkdrv] Found modern virtio-blk device\n"); });
         if virtio_modern::init_virtio_modern(bus, dev, func) {
             unsafe { *(&raw mut USING_MODERN_TRANSPORT) = true; }
             initialized = true;
@@ -197,7 +198,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     if !initialized {
         match virtio::find_virtio_blk() {
             Some((bus, dev, func, bar0, _bar0_full)) => {
-                besalt::uinfo!(|_lb| {
+                trona::uinfo!(|_lb| {
                     _lb.str(b"[blkdrv] Found virtio-blk at ");
                     _lb.dec(bus as u64);
                     _lb.putc(b':');
@@ -208,12 +209,12 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 });
 
                 let Some((_bar_phys, _bar_bits, bar_size, irq, _bar_is_io)) = virtio::get_device_caps(bus, dev, func) else {
-                    besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] Failed to get PCI caps from pcisrv\n"); });
+                    trona::uerror!(|_lb| { _lb.str(b"[blkdrv] Failed to get PCI caps from pcisrv\n"); });
                     register_nameserv();
                     signal_ready();
                     server_loop()
                 };
-                besalt::uinfo!(|_lb| {
+                trona::uinfo!(|_lb| {
                     _lb.str(b"[blkdrv] IRQ=");
                     _lb.dec(irq as u64);
                     _lb.putc(b'\n');
@@ -226,20 +227,20 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     unsafe { *(&raw mut USING_MODERN_TRANSPORT) = true; }
                     handlers::clear_pending_irq();
                 } else if !virtio::init_virtio(bar0, bar_size) {
-                    besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] Failed to init virtio transport\n"); });
-                    besalt::uwarn!(|_lb| { _lb.str(b"[blkdrv] Running in stub mode -- no actual I/O\n"); });
+                    trona::uerror!(|_lb| { _lb.str(b"[blkdrv] Failed to init virtio transport\n"); });
+                    trona::uwarn!(|_lb| { _lb.str(b"[blkdrv] Running in stub mode -- no actual I/O\n"); });
                 } else {
                     handlers::clear_pending_irq();
                 }
             }
             None => {
-                besalt::uwarn!(|_lb| { _lb.str(b"[blkdrv] No virtio-blk device found -- running in stub mode\n"); });
+                trona::uwarn!(|_lb| { _lb.str(b"[blkdrv] No virtio-blk device found -- running in stub mode\n"); });
             }
         }
     }
 
     if !setup_shm() {
-        besalt::uwarn!(|_lb| { _lb.str(b"[blkdrv] SHM setup failed -- continuing without SHM\n"); });
+        trona::uwarn!(|_lb| { _lb.str(b"[blkdrv] SHM setup failed -- continuing without SHM\n"); });
     }
 
     register_nameserv();

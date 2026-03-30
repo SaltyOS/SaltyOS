@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Block I/O request handlers and dispatch logic.
 
-use besalt::consts::*;
-use besalt::types::*;
+use trona::consts::*;
+use trona::types::*;
 
 use crate::virtio::*;
 use crate::{CAPACITY_SECTORS, VIRTIO_INITIALIZED, USING_MODERN_TRANSPORT, VQUEUE_BASE};
@@ -33,11 +33,11 @@ fn transport_notify_queue() {
     }
 }
 
-pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_read(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
 
     if !unsafe { *(&raw const VIRTIO_INITIALIZED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
@@ -50,12 +50,12 @@ pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
     let byte_count = actual_count * 512;
 
     if actual_count == 0 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
     if shm_offset + byte_count > SHM_SIZE {
-        reply.label = BESALT_OUT_OF_RANGE;
+        reply.label = TRONA_OUT_OF_RANGE;
         return reply;
     }
 
@@ -79,7 +79,7 @@ pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
         let data_vaddr = SHM_VADDR + shm_offset;
         let data_phys = vaddr_to_phys(data_vaddr);
         if data_phys == 0 {
-            reply.label = BESALT_BAD_ADDRESS;
+            reply.label = TRONA_BAD_ADDRESS;
             return reply;
         }
 
@@ -90,7 +90,7 @@ pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
         (*hdr).sector = start_sector;
         let hdr_phys = vaddr_to_phys(hdr as u64);
         if hdr_phys == 0 {
-            reply.label = BESALT_BAD_ADDRESS;
+            reply.label = TRONA_BAD_ADDRESS;
             return reply;
         }
 
@@ -98,7 +98,7 @@ pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
         *(&raw mut REQ_STATUS) = 0xFF;
         let status_phys = vaddr_to_phys(&raw const REQ_STATUS as u64);
         if status_phys == 0 {
-            reply.label = BESALT_BAD_ADDRESS;
+            reply.label = TRONA_BAD_ADDRESS;
             return reply;
         }
 
@@ -153,9 +153,9 @@ pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
             }
             spin_count += 1;
             if spin_count > 100_000_000 {
-                besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] virtio read timeout\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[blkdrv] virtio read timeout\n"); });
                 let _ = read_isr();
-                reply.label = BESALT_BUSY;
+                reply.label = TRONA_BUSY;
                 return reply;
             }
         }
@@ -171,12 +171,12 @@ pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
         // Check status
         let status = *(&raw const REQ_STATUS);
         if status != 0 {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[blkdrv] read error status=");
                 _lb.dec(status as u64);
                 _lb.putc(b'\n');
             });
-            reply.label = BESALT_INVALID_OPERATION;
+            reply.label = TRONA_INVALID_OPERATION;
             return reply;
         }
     }
@@ -187,11 +187,11 @@ pub(crate) fn handle_read(msg: &BesaltMsg) -> BesaltMsg {
     reply
 }
 
-pub(crate) fn handle_write(msg: &BesaltMsg) -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_write(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
 
     if !unsafe { *(&raw const VIRTIO_INITIALIZED) } {
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
 
@@ -204,12 +204,12 @@ pub(crate) fn handle_write(msg: &BesaltMsg) -> BesaltMsg {
     let byte_count = actual_count * 512;
 
     if actual_count == 0 {
-        reply.label = BESALT_INVALID_ARGUMENT;
+        reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
     if shm_offset + byte_count > SHM_SIZE {
-        reply.label = BESALT_OUT_OF_RANGE;
+        reply.label = TRONA_OUT_OF_RANGE;
         return reply;
     }
 
@@ -231,7 +231,7 @@ pub(crate) fn handle_write(msg: &BesaltMsg) -> BesaltMsg {
         let data_vaddr = SHM_VADDR + shm_offset;
         let data_phys = vaddr_to_phys(data_vaddr);
         if data_phys == 0 {
-            reply.label = BESALT_BAD_ADDRESS;
+            reply.label = TRONA_BAD_ADDRESS;
             return reply;
         }
 
@@ -242,7 +242,7 @@ pub(crate) fn handle_write(msg: &BesaltMsg) -> BesaltMsg {
         (*hdr).sector = start_sector;
         let hdr_phys = vaddr_to_phys(hdr as u64);
         if hdr_phys == 0 {
-            reply.label = BESALT_BAD_ADDRESS;
+            reply.label = TRONA_BAD_ADDRESS;
             return reply;
         }
 
@@ -250,7 +250,7 @@ pub(crate) fn handle_write(msg: &BesaltMsg) -> BesaltMsg {
         *(&raw mut REQ_STATUS) = 0xFF;
         let status_phys = vaddr_to_phys(&raw const REQ_STATUS as u64);
         if status_phys == 0 {
-            reply.label = BESALT_BAD_ADDRESS;
+            reply.label = TRONA_BAD_ADDRESS;
             return reply;
         }
 
@@ -299,9 +299,9 @@ pub(crate) fn handle_write(msg: &BesaltMsg) -> BesaltMsg {
             }
             spin_count += 1;
             if spin_count > 100_000_000 {
-                besalt::uerror!(|_lb| { _lb.str(b"[blkdrv] virtio write timeout\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[blkdrv] virtio write timeout\n"); });
                 let _ = read_isr();
-                reply.label = BESALT_BUSY;
+                reply.label = TRONA_BUSY;
                 return reply;
             }
         }
@@ -315,12 +315,12 @@ pub(crate) fn handle_write(msg: &BesaltMsg) -> BesaltMsg {
         // Check status
         let status = *(&raw const REQ_STATUS);
         if status != 0 {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[blkdrv] write error status=");
                 _lb.dec(status as u64);
                 _lb.putc(b'\n');
             });
-            reply.label = BESALT_INVALID_OPERATION;
+            reply.label = TRONA_INVALID_OPERATION;
             return reply;
         }
     }
@@ -331,8 +331,8 @@ pub(crate) fn handle_write(msg: &BesaltMsg) -> BesaltMsg {
     reply
 }
 
-pub(crate) fn handle_get_info() -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_get_info() -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
     reply.label = 0;
     reply.length = 2;
     reply.regs[0] = unsafe { *(&raw const CAPACITY_SECTORS) };
@@ -340,8 +340,8 @@ pub(crate) fn handle_get_info() -> BesaltMsg {
     reply
 }
 
-pub(crate) fn handle_get_shm_id() -> BesaltMsg {
-    let mut reply = BesaltMsg::zeroed();
+pub(crate) fn handle_get_shm_id() -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
     reply.label = 0;
     reply.length = 1;
     reply.regs[0] = BLK_SHM_ID;

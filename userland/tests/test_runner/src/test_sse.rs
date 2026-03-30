@@ -5,10 +5,10 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::serial;
-use besalt::serial::LineBuf;
-use besalt::consts::*;
-use besalt::posix;
+use trona::serial;
+use trona::serial::LineBuf;
+use trona::consts::*;
+use trona_posix::proc as posix;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -60,7 +60,7 @@ fn test_xmm_survives_fork() -> bool {
         );
     }
 
-    let pid = unsafe { posix::posix_fork() };
+    let pid = unsafe { trona_posix::posix_fork() };
     if pid < 0 {
         puts(b"  XMM survives fork: FAIL (fork failed)\n");
         return false;
@@ -78,7 +78,7 @@ fn test_xmm_survives_fork() -> bool {
         }
         if child_read == parent_val {
             puts(b"  XMM survives fork (child): OK\n");
-            unsafe { posix::posix_exit(0); }
+            unsafe { trona_posix::posix_exit(0); }
         } else {
             let mut lb = LineBuf::new();
             lb.str(b"  XMM survives fork (child): FAIL (expected ");
@@ -87,14 +87,14 @@ fn test_xmm_survives_fork() -> bool {
             lb.hex(child_read);
             lb.str(b")\n");
             lb.flush();
-            unsafe { posix::posix_exit(1); }
+            unsafe { trona_posix::posix_exit(1); }
         }
     }
 
     // Parent: verify our XMM1 is still intact after child ran
     // Yield a few times to force context switches
     for _ in 0..3 {
-        let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
     let parent_read: u64;
@@ -108,7 +108,7 @@ fn test_xmm_survives_fork() -> bool {
 
     // Wait for child
     let mut status: i32 = 0;
-    unsafe { posix::posix_waitpid(pid, &mut status); }
+    unsafe { trona_posix::posix_waitpid(pid, &mut status); }
 
     if parent_read != parent_val {
         let mut lb = LineBuf::new();
@@ -249,7 +249,7 @@ fn test_xmm_no_fpu_threads() -> bool {
     }
 
     // Fork a child that does NO FPU work — only yields
-    let pid = posix::posix_fork();
+    let pid = trona_posix::posix_fork();
     if pid < 0 {
         puts(b"  XMM no-FPU thread: FAIL (fork failed)\n");
         return false;
@@ -258,14 +258,14 @@ fn test_xmm_no_fpu_threads() -> bool {
     if pid == 0 {
         // Child: yield several times without touching any XMM register
         for _ in 0..5 {
-            let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+            let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
         }
-        unsafe { posix::posix_exit(0); }
+        unsafe { trona_posix::posix_exit(0); }
     }
 
     // Parent: yield to let child run (interleave context switches)
     for _ in 0..5 {
-        let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
     let parent_read: u64;
@@ -278,7 +278,7 @@ fn test_xmm_no_fpu_threads() -> bool {
     }
 
     let mut status: i32 = 0;
-    unsafe { posix::posix_waitpid(pid, &mut status); }
+    unsafe { trona_posix::posix_waitpid(pid, &mut status); }
 
     if parent_read != parent_val {
         let mut lb = LineBuf::new();
@@ -314,7 +314,7 @@ fn test_xmm_heavy_context_switch() -> bool {
         );
     }
 
-    let pid = posix::posix_fork();
+    let pid = trona_posix::posix_fork();
     if pid < 0 {
         puts(b"  XMM heavy ctx switch: FAIL (fork failed)\n");
         return false;
@@ -333,7 +333,7 @@ fn test_xmm_heavy_context_switch() -> bool {
 
         // Yield many times to stress FPU switching
         for _ in 0..10 {
-            let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+            let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
         }
 
         let child_read: u64;
@@ -347,7 +347,7 @@ fn test_xmm_heavy_context_switch() -> bool {
 
         if child_read == child_pattern {
             puts(b"  XMM heavy ctx switch (child): OK\n");
-            unsafe { posix::posix_exit(0); }
+            unsafe { trona_posix::posix_exit(0); }
         } else {
             let mut lb = LineBuf::new();
             lb.str(b"  XMM heavy ctx switch (child): FAIL (expected ");
@@ -356,13 +356,13 @@ fn test_xmm_heavy_context_switch() -> bool {
             lb.hex(child_read);
             lb.str(b")\n");
             lb.flush();
-            unsafe { posix::posix_exit(1); }
+            unsafe { trona_posix::posix_exit(1); }
         }
     }
 
     // Parent: yield many times, interleaving with child
     for _ in 0..10 {
-        let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 
     let parent_read: u64;
@@ -375,7 +375,7 @@ fn test_xmm_heavy_context_switch() -> bool {
     }
 
     let mut status: i32 = 0;
-    unsafe { posix::posix_waitpid(pid, &mut status); }
+    unsafe { trona_posix::posix_waitpid(pid, &mut status); }
 
     if parent_read != parent_pattern {
         let mut lb = LineBuf::new();

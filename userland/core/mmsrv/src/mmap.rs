@@ -1,9 +1,9 @@
 use crate::types::*;
 use crate::client::{find_client_by_badge, client_add_region, find_region_by_addr};
-use besalt::consts::*;
-use besalt::invoke;
-use besalt::ipc;
-use besalt::types::*;
+use trona::consts::*;
+use trona::invoke;
+use trona::ipc;
+use trona::types::*;
 
 /// MM_BRK: client sets program break via MemoryObject.
 ///   MR0 = new break address
@@ -12,17 +12,17 @@ use besalt::types::*;
 /// On first growth, creates a heap MO (min 256 pages). Subsequent
 /// growths commit and map additional pages from the same MO. If the MO
 /// is exhausted, it is resized via `mo_resize`.
-pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mut BesaltMsg) {
+pub(crate) unsafe fn handle_mm_brk(msg: *const TronaMsg, badge: u64, reply: *mut TronaMsg) {
     unsafe {
         let client = find_client_by_badge(badge);
         if client.is_null() {
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
         let new_brk = (*msg).regs[0];
         if new_brk < (*client).heap_base {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -48,7 +48,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mu
         if heap_region.is_null() {
             heap_region = client_add_region(client);
             if heap_region.is_null() {
-                (*reply).label = BESALT_OUT_OF_MEMORY;
+                (*reply).label = TRONA_OUT_OF_MEMORY;
                 return;
             }
             (*heap_region).base = (*client).heap_base;
@@ -66,7 +66,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mu
                 let initial = if grow_pages > 256 { grow_pages } else { 256 };
                 let (mo_cap, _actual) = super::create_mo(initial);
                 if mo_cap == 0 {
-                    (*reply).label = BESALT_OUT_OF_MEMORY;
+                    (*reply).label = TRONA_OUT_OF_MEMORY;
                     return;
                 }
                 (*heap_region).mo_cap = mo_cap;
@@ -88,7 +88,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mu
                 };
                 let err = invoke::mo_resize(mo_cap, new_mo_pages as u64);
                 if err != 0 {
-                    (*reply).label = BESALT_OUT_OF_MEMORY;
+                    (*reply).label = TRONA_OUT_OF_MEMORY;
                     return;
                 }
             }
@@ -96,7 +96,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mu
             // Commit new pages
             let (err, committed) = super::commit_mo_pages(mo_cap, existing_pages as u64, grow_pages as u64);
             if err != 0 || committed != grow_pages as u64 {
-                (*reply).label = BESALT_OUT_OF_MEMORY;
+                (*reply).label = TRONA_OUT_OF_MEMORY;
                 return;
             }
 
@@ -108,7 +108,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mu
                 vspace_cap, mo_cap, old_page, existing_pages as u64, cf,
             );
             if err != 0 {
-                (*reply).label = BESALT_BAD_ADDRESS;
+                (*reply).label = TRONA_BAD_ADDRESS;
                 return;
             }
 
@@ -133,7 +133,7 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mu
         }
 
         (*client).heap_current = new_brk;
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 1;
         (*reply).regs[0] = new_brk;
     }
@@ -143,11 +143,11 @@ pub(crate) unsafe fn handle_mm_brk(msg: *const BesaltMsg, badge: u64, reply: *mu
 ///   MR0 = increment (signed as u64)
 ///   Badge identifies the client.
 ///   Reply: MR0 = old break address
-pub(crate) unsafe fn handle_mm_sbrk(msg: *const BesaltMsg, badge: u64, reply: *mut BesaltMsg) {
+pub(crate) unsafe fn handle_mm_sbrk(msg: *const TronaMsg, badge: u64, reply: *mut TronaMsg) {
     unsafe {
         let client = find_client_by_badge(badge);
         if client.is_null() {
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
@@ -155,7 +155,7 @@ pub(crate) unsafe fn handle_mm_sbrk(msg: *const BesaltMsg, badge: u64, reply: *m
         let old_break = (*client).heap_current;
 
         if increment == 0 {
-            (*reply).label = BESALT_OK;
+            (*reply).label = TRONA_OK;
             (*reply).length = 1;
             (*reply).regs[0] = old_break;
             return;
@@ -166,19 +166,19 @@ pub(crate) unsafe fn handle_mm_sbrk(msg: *const BesaltMsg, badge: u64, reply: *m
         } else {
             let dec = (-increment) as u64;
             if dec > old_break - (*client).heap_base {
-                (*reply).label = BESALT_INVALID_ARGUMENT;
+                (*reply).label = TRONA_INVALID_ARGUMENT;
                 return;
             }
             old_break - dec
         };
 
         // Delegate to brk handler
-        let mut brk_msg = BesaltMsg::zeroed();
+        let mut brk_msg = TronaMsg::zeroed();
         brk_msg.regs[0] = new_break;
         handle_mm_brk(&raw const brk_msg, badge, reply);
 
         // On success, return old break in MR0
-        if (*reply).label == BESALT_OK {
+        if (*reply).label == TRONA_OK {
             (*reply).regs[0] = old_break;
         }
     }
@@ -195,11 +195,11 @@ pub(crate) unsafe fn handle_mm_sbrk(msg: *const BesaltMsg, badge: u64, reply: *m
 /// Creates a MemoryObject for the mapping. Eager mappings commit and map
 /// all pages immediately. Lazy mappings defer commitment to VMFault time
 /// (mo_commit + vspace_map_mo per faulting page).
-pub(crate) unsafe fn handle_mm_mmap(msg: *const BesaltMsg, badge: u64, reply: *mut BesaltMsg) {
+pub(crate) unsafe fn handle_mm_mmap(msg: *const TronaMsg, badge: u64, reply: *mut TronaMsg) {
     unsafe {
         let client = find_client_by_badge(badge);
         if client.is_null() {
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
@@ -209,14 +209,14 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const BesaltMsg, badge: u64, reply: *m
         let _flags = (*msg).regs[3] as i32;
 
         if length == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
         let len = match length.checked_add(4095) {
             Some(v) => v & !4095u64,
             None => {
-                (*reply).label = BESALT_INVALID_ARGUMENT;
+                (*reply).label = TRONA_INVALID_ARGUMENT;
                 return;
             }
         };
@@ -236,7 +236,7 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const BesaltMsg, badge: u64, reply: *m
         // Create MO for this mapping
         let (mo_cap, _mo_pages) = super::create_mo(num_pages);
         if mo_cap == 0 {
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -244,7 +244,7 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const BesaltMsg, badge: u64, reply: *m
         let region = client_add_region(client);
         if region.is_null() {
             super::recycled_cnode_delete(mo_cap);
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
         (*region).base = base;
@@ -262,7 +262,7 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const BesaltMsg, badge: u64, reply: *m
             // Lazy: MO created but pages NOT committed.
             // On VMFault, mo_commit + vspace_map_mo per page.
             (*client).mmap_next = base + len;
-            (*reply).label = BESALT_OK;
+            (*reply).label = TRONA_OK;
             (*reply).length = 1;
             (*reply).regs[0] = base;
             return;
@@ -274,7 +274,7 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const BesaltMsg, badge: u64, reply: *m
             (*region).active = false;
             (*region).mo_cap = 0;
             super::recycled_cnode_delete(mo_cap);
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -284,13 +284,13 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const BesaltMsg, badge: u64, reply: *m
             (*region).active = false;
             (*region).mo_cap = 0;
             super::recycled_cnode_delete(mo_cap);
-            (*reply).label = BESALT_BAD_ADDRESS;
+            (*reply).label = TRONA_BAD_ADDRESS;
             return;
         }
 
         (*client).mmap_next = base + len;
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 1;
         (*reply).regs[0] = base;
     }
@@ -300,11 +300,11 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const BesaltMsg, badge: u64, reply: *m
 ///   MR0 = base address
 ///   MR1 = length
 ///   Badge identifies the client.
-pub(crate) unsafe fn handle_mm_munmap(msg: *const BesaltMsg, badge: u64, reply: *mut BesaltMsg) {
+pub(crate) unsafe fn handle_mm_munmap(msg: *const TronaMsg, badge: u64, reply: *mut TronaMsg) {
     unsafe {
         let client = find_client_by_badge(badge);
         if client.is_null() {
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
@@ -315,7 +315,7 @@ pub(crate) unsafe fn handle_mm_munmap(msg: *const BesaltMsg, badge: u64, reply: 
         let len = match length.checked_add(4095) {
             Some(v) => v & !4095u64,
             None => {
-                (*reply).label = BESALT_INVALID_ARGUMENT;
+                (*reply).label = TRONA_INVALID_ARGUMENT;
                 return;
             }
         };
@@ -343,7 +343,7 @@ pub(crate) unsafe fn handle_mm_munmap(msg: *const BesaltMsg, badge: u64, reply: 
             }
         }
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }
 
@@ -354,11 +354,11 @@ pub(crate) unsafe fn handle_mm_munmap(msg: *const BesaltMsg, badge: u64, reply: 
 ///   Badge identifies the client.
 ///
 /// Uses vspace_mprotect to change page table flags in-place.
-pub(crate) unsafe fn handle_mm_mprotect(msg: *const BesaltMsg, badge: u64, reply: *mut BesaltMsg) {
+pub(crate) unsafe fn handle_mm_mprotect(msg: *const TronaMsg, badge: u64, reply: *mut TronaMsg) {
     unsafe {
         let client = find_client_by_badge(badge);
         if client.is_null() {
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
@@ -368,7 +368,7 @@ pub(crate) unsafe fn handle_mm_mprotect(msg: *const BesaltMsg, badge: u64, reply
 
         let region = find_region_by_addr(client, addr);
         if region.is_null() || !(*region).active {
-            (*reply).label = BESALT_OK;
+            (*reply).label = TRONA_OK;
             return;
         }
 
@@ -383,7 +383,7 @@ pub(crate) unsafe fn handle_mm_mprotect(msg: *const BesaltMsg, badge: u64, reply
         let len = match length.checked_add(4095) {
             Some(v) => v & !4095u64,
             None => {
-                (*reply).label = BESALT_INVALID_ARGUMENT;
+                (*reply).label = TRONA_INVALID_ARGUMENT;
                 return;
             }
         };
@@ -480,7 +480,7 @@ pub(crate) unsafe fn handle_mm_mprotect(msg: *const BesaltMsg, badge: u64, reply
             }
         }
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }
 
@@ -497,7 +497,7 @@ pub(crate) unsafe fn handle_mm_mprotect(msg: *const BesaltMsg, badge: u64, reply
 /// prior MM_MAP_BATCH), the existing MO is reused for the scratch
 /// mapping. Otherwise, a new MO-backed region is created (used for
 /// ELF segment loading).
-pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: u64, reply: *mut BesaltMsg) {
+pub(crate) unsafe fn handle_mm_map_window(msg: *const TronaMsg, _caller_badge: u64, reply: *mut TronaMsg) {
     unsafe {
         let target_badge = (*msg).regs[0];
         let target_vaddr = (*msg).regs[1];
@@ -510,7 +510,7 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: 
         let client = find_client_by_badge(target_badge);
         if client.is_null() {
             invoke::cnode_delete(super::CAP_SELF_CSPACE, caller_vspace_cap);
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
@@ -529,7 +529,7 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: 
                 let (mo, _actual) = super::create_mo(num_pages);
                 if mo == 0 {
                     invoke::cnode_delete(super::CAP_SELF_CSPACE, caller_vspace_cap);
-                    (*reply).label = BESALT_OUT_OF_MEMORY;
+                    (*reply).label = TRONA_OUT_OF_MEMORY;
                     return;
                 }
                 // Commit pages
@@ -537,7 +537,7 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: 
                 if commit_err != 0 || committed != num_pages as u64 {
                     super::recycled_cnode_delete(mo);
                     invoke::cnode_delete(super::CAP_SELF_CSPACE, caller_vspace_cap);
-                    (*reply).label = BESALT_OUT_OF_MEMORY;
+                    (*reply).label = TRONA_OUT_OF_MEMORY;
                     return;
                 }
                 // Map into target VSpace
@@ -545,7 +545,7 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: 
                 if invoke::vspace_map_mo(target_vspace_cap, mo, page_addr, 0, cf) != 0 {
                     super::recycled_cnode_delete(mo);
                     invoke::cnode_delete(super::CAP_SELF_CSPACE, caller_vspace_cap);
-                    (*reply).label = BESALT_BAD_ADDRESS;
+                    (*reply).label = TRONA_BAD_ADDRESS;
                     return;
                 }
                 (mo, 0u64, true)
@@ -565,7 +565,7 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: 
                 super::recycled_cnode_delete(mo_cap);
             }
             invoke::cnode_delete(super::CAP_SELF_CSPACE, caller_vspace_cap);
-            (*reply).label = BESALT_BAD_ADDRESS;
+            (*reply).label = TRONA_BAD_ADDRESS;
             return;
         }
 
@@ -584,7 +584,7 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: 
 
         invoke::cnode_delete(super::CAP_SELF_CSPACE, caller_vspace_cap);
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 1;
         (*reply).regs[0] = num_pages as u64;
     }
@@ -594,11 +594,11 @@ pub(crate) unsafe fn handle_mm_map_window(msg: *const BesaltMsg, _caller_badge: 
 ///   MR0 = window vaddr in caller
 ///   MR1 = num_pages
 ///   + cap transfer: caller's VSpace cap
-///   Reply: label = BESALT_OK
+///   Reply: label = TRONA_OK
 ///
 /// Frame caps stay in mmsrv's CSpace; target mapping persists after
 /// window removal.
-pub(crate) unsafe fn handle_mm_unmap_window(msg: *const BesaltMsg, _caller_badge: u64, reply: *mut BesaltMsg) {
+pub(crate) unsafe fn handle_mm_unmap_window(msg: *const TronaMsg, _caller_badge: u64, reply: *mut TronaMsg) {
     unsafe {
         let window_vaddr = (*msg).regs[0];
         let num_pages = (*msg).regs[1] as usize;
@@ -613,7 +613,7 @@ pub(crate) unsafe fn handle_mm_unmap_window(msg: *const BesaltMsg, _caller_badge
         // Delete transient caller VSpace cap
         invoke::cnode_delete(super::CAP_SELF_CSPACE, caller_vspace_cap);
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }
 
@@ -628,20 +628,20 @@ pub(crate) unsafe fn handle_mm_unmap_window(msg: *const BesaltMsg, _caller_badge
 /// Shared library RO regions (`REGION_SHARED_RO`) must stay attached to the
 /// original shared MO and be mapped read-only into the child; sending them
 /// through the COW clone path risks mutating global shared-lib cache state.
-pub(crate) unsafe fn handle_mm_fork_regions(msg: *const BesaltMsg, _caller_badge: u64, reply: *mut BesaltMsg) {
+pub(crate) unsafe fn handle_mm_fork_regions(msg: *const TronaMsg, _caller_badge: u64, reply: *mut TronaMsg) {
     unsafe {
         let parent_badge = (*msg).regs[0];
         let child_badge = (*msg).regs[1];
 
         let parent = find_client_by_badge(parent_badge);
         if parent.is_null() {
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
         let child = find_client_by_badge(child_badge);
         if child.is_null() {
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
@@ -713,7 +713,7 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const BesaltMsg, _caller_badge
                                 found_child_mo,
                                 super::CAP_SELF_CSPACE,
                                 copy_slot,
-                                besalt::consts::CAP_RIGHTS_ALL,
+                                trona::consts::CAP_RIGHTS_ALL,
                             );
                             if err != 0 {
                                 super::recycle_empty_slot(copy_slot);
@@ -738,7 +738,7 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const BesaltMsg, _caller_badge
                                     parent_mo,
                                     super::CAP_SELF_CSPACE,
                                     child_mo_slot,
-                                    besalt::consts::CAP_RIGHTS_ALL,
+                                    trona::consts::CAP_RIGHTS_ALL,
                                 )
                             } else {
                                 invoke::mo_clone(parent_mo, child_mo_slot, 0)
@@ -791,7 +791,7 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const BesaltMsg, _caller_badge
                     *child_regions.add(ri) = cr;
                 }
                 if mo_clone_failed {
-                    besalt::uerror!(|_lb| {
+                    trona::uerror!(|_lb| {
                         _lb.str(b"[MMSRV] fork: mo_clone failed for some regions\n");
                     });
                 }
@@ -799,7 +799,7 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const BesaltMsg, _caller_badge
                 (*child).region_count = parent_rc;
                 (*child).region_cap = child_region_cap;
             } else {
-                (*reply).label = BESALT_OUT_OF_MEMORY;
+                (*reply).label = TRONA_OUT_OF_MEMORY;
                 return;
             }
         }
@@ -808,7 +808,7 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const BesaltMsg, _caller_badge
         crate::pool::init_pool(child);
         crate::pool::init_pool(parent);
 
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[MMSRV] fork-regions parent=");
             _lb.hex(parent_badge);
             _lb.str(b" child=");
@@ -820,7 +820,7 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const BesaltMsg, _caller_badge
             _lb.str(b"\n");
         });
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }
 
@@ -830,31 +830,31 @@ pub(crate) unsafe fn handle_mm_fork_regions(msg: *const BesaltMsg, _caller_badge
 /// the resulting caps should be placed. mmsrv retypes the objects into
 /// temporary slots, then transfers them back via IPC cap transfer.
 ///
-/// Reply: label = BESALT_OK with 3 caps transferred, or error.
+/// Reply: label = TRONA_OK with 3 caps transferred, or error.
 pub(crate) unsafe fn handle_mm_alloc_thread_objects(
-    _msg: *const BesaltMsg,
+    _msg: *const TronaMsg,
     _caller_badge: u64,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
 ) {
     unsafe {
         // Allocate 3 temp slots for the new objects
         let tcb_slot = match super::recycled_slot_alloc() {
             Some(s) => s,
-            None => { (*reply).label = BESALT_OUT_OF_MEMORY; return; }
+            None => { (*reply).label = TRONA_OUT_OF_MEMORY; return; }
         };
         let sc_slot = match super::recycled_slot_alloc() {
             Some(s) => s,
-            None => { (*reply).label = BESALT_OUT_OF_MEMORY; return; }
+            None => { (*reply).label = TRONA_OUT_OF_MEMORY; return; }
         };
         let frame_slot = match super::recycled_slot_alloc() {
             Some(s) => s,
-            None => { (*reply).label = BESALT_OUT_OF_MEMORY; return; }
+            None => { (*reply).label = TRONA_OUT_OF_MEMORY; return; }
         };
 
         // Retype: TCB (0 size_bits = default)
         let err = super::retype_any(OBJ_TCB, 0, tcb_slot);
         if err != 0 {
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -863,7 +863,7 @@ pub(crate) unsafe fn handle_mm_alloc_thread_objects(
         if err != 0 {
             // Clean up TCB
             super::recycled_cnode_delete(tcb_slot);
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -872,7 +872,7 @@ pub(crate) unsafe fn handle_mm_alloc_thread_objects(
         if err != 0 {
             super::recycled_cnode_delete(tcb_slot);
             super::recycled_cnode_delete(sc_slot);
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -887,7 +887,7 @@ pub(crate) unsafe fn handle_mm_alloc_thread_objects(
         *(&raw mut super::PENDING_CLEANUP_SLOTS) = [tcb_slot, sc_slot, frame_slot, 0];
         *(&raw mut super::PENDING_CLEANUP_COUNT) = 3;
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 0;
     }
 }
@@ -895,11 +895,11 @@ pub(crate) unsafe fn handle_mm_alloc_thread_objects(
 /// MM_ALLOC_OBJECT: allocate a single kernel object of any type.
 ///
 /// Request: MR0 = obj_type, MR1 = size_bits, length = 2
-/// Reply: label = BESALT_OK with 1 cap transferred, or BESALT_OUT_OF_MEMORY.
+/// Reply: label = TRONA_OK with 1 cap transferred, or TRONA_OUT_OF_MEMORY.
 pub(crate) unsafe fn handle_mm_alloc_object(
-    msg: *const BesaltMsg,
+    msg: *const TronaMsg,
     _caller_badge: u64,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
 ) {
     unsafe {
         let obj_type = (*msg).regs[0];
@@ -907,13 +907,13 @@ pub(crate) unsafe fn handle_mm_alloc_object(
 
         let slot = match super::recycled_slot_alloc() {
             Some(s) => s,
-            None => { (*reply).label = BESALT_OUT_OF_MEMORY; return; }
+            None => { (*reply).label = TRONA_OUT_OF_MEMORY; return; }
         };
 
         let err = super::retype_any(obj_type, size_bits, slot);
         if err != 0 {
             super::recycle_empty_slot(slot);
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -922,7 +922,7 @@ pub(crate) unsafe fn handle_mm_alloc_object(
         *(&raw mut super::PENDING_CLEANUP_SLOTS) = [slot, 0, 0, 0];
         *(&raw mut super::PENDING_CLEANUP_COUNT) = 1;
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 0;
     }
 }
@@ -937,7 +937,7 @@ pub(crate) unsafe fn handle_mm_alloc_object(
 /// Creates a MemoryObject, commits all pages, and maps them into the
 /// target VSpace. The MO cap is stored in the region so fork can use
 /// `mo_clone` for COW semantics.
-pub(crate) unsafe fn handle_mm_map_batch(msg: *const BesaltMsg, _caller_badge: u64, reply: *mut BesaltMsg) {
+pub(crate) unsafe fn handle_mm_map_batch(msg: *const TronaMsg, _caller_badge: u64, reply: *mut TronaMsg) {
     unsafe {
         let target_badge = (*msg).regs[0];
         let start_vaddr = (*msg).regs[1];
@@ -946,14 +946,14 @@ pub(crate) unsafe fn handle_mm_map_batch(msg: *const BesaltMsg, _caller_badge: u
 
         let client = find_client_by_badge(target_badge);
         if client.is_null() {
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
         let vspace_cap = (*client).vspace_cap;
 
         if num_pages == 0 {
-            (*reply).label = BESALT_OK;
+            (*reply).label = TRONA_OK;
             (*reply).length = 1;
             (*reply).regs[0] = 0;
             return;
@@ -962,7 +962,7 @@ pub(crate) unsafe fn handle_mm_map_batch(msg: *const BesaltMsg, _caller_badge: u
         // Create MO with capacity >= num_pages
         let (mo_cap, _mo_pages) = super::create_mo(num_pages);
         if mo_cap == 0 {
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -970,7 +970,7 @@ pub(crate) unsafe fn handle_mm_map_batch(msg: *const BesaltMsg, _caller_badge: u
         let (err, committed) = super::commit_mo_pages(mo_cap, 0, num_pages as u64);
         if err != 0 || committed != num_pages as u64 {
             super::recycled_cnode_delete(mo_cap);
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -981,7 +981,7 @@ pub(crate) unsafe fn handle_mm_map_batch(msg: *const BesaltMsg, _caller_badge: u
         );
         if err != 0 {
             super::recycled_cnode_delete(mo_cap);
-            (*reply).label = BESALT_BAD_ADDRESS;
+            (*reply).label = TRONA_BAD_ADDRESS;
             return;
         }
 
@@ -990,7 +990,7 @@ pub(crate) unsafe fn handle_mm_map_batch(msg: *const BesaltMsg, _caller_badge: u
         if region.is_null() {
             invoke::vspace_unmap_mo(vspace_cap, start_vaddr, num_pages as u64);
             super::recycled_cnode_delete(mo_cap);
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
         (*region).base = start_vaddr;
@@ -1000,7 +1000,7 @@ pub(crate) unsafe fn handle_mm_map_batch(msg: *const BesaltMsg, _caller_badge: u
         (*region).active = true;
         (*region).mo_cap = mo_cap;
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 1;
         (*reply).regs[0] = num_pages as u64;
     }
@@ -1020,9 +1020,9 @@ pub(crate) unsafe fn handle_mm_map_batch(msg: *const BesaltMsg, _caller_badge: u
 ///   MR4 = mo_offset (page offset within MO for this segment)
 ///   MR5 = VSpace flags for this segment
 pub(crate) unsafe fn handle_mm_register_shared_region(
-    msg: *const BesaltMsg,
+    msg: *const TronaMsg,
     _caller_badge: u64,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
 ) {
     unsafe {
         let target_badge = (*msg).regs[0];
@@ -1034,12 +1034,12 @@ pub(crate) unsafe fn handle_mm_register_shared_region(
 
         let client = find_client_by_badge(target_badge);
         if client.is_null() {
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
         if page_count == 0 {
-            (*reply).label = BESALT_OK;
+            (*reply).label = TRONA_OK;
             return;
         }
 
@@ -1058,7 +1058,7 @@ pub(crate) unsafe fn handle_mm_register_shared_region(
 
         let region = client_add_region(client);
         if region.is_null() {
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -1070,6 +1070,6 @@ pub(crate) unsafe fn handle_mm_register_shared_region(
         (*region).mo_cap = mo_cap;
         (*region).mo_offset = mo_offset;
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }

@@ -12,14 +12,14 @@
 #![no_std]
 #![no_main]
 
-extern crate besalt;
+extern crate trona;
 
-use besalt::posix::*;
+use trona_posix::*;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     unsafe {
-        besalt::serial::serial_puts(b"[getty] starting session setup\n");
+        trona::serial::serial_puts(b"[getty] starting session setup\n");
 
         // 1. Close CRT-opened /dev/console fds
         posix_close(0);
@@ -29,7 +29,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         // 2. Create new session (sid=pid, pgid=pid)
         let sid = posix_setsid();
         if sid < 0 {
-            besalt::serial::serial_puts(b"[getty] setsid failed\n");
+            trona::serial::serial_puts(b"[getty] setsid failed\n");
         }
 
         // 3. Open PTY slave as fd 0 — retry with backoff if TTYD/VFS not ready
@@ -38,12 +38,12 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         for _attempt in 0..5u32 {
             fd0 = posix_open(b"/dev/pts/0\0".as_ptr(), 2, 0); // O_RDWR
             if fd0 >= 0 { break; }
-            besalt::serial::serial_puts(b"[getty] /dev/pts/0 open failed, retrying\n");
-            besalt::syscall::syscall(besalt::SYS_NANOSLEEP, 0, delay_ns, 0, 0, 0, 0);
+            trona::serial::serial_puts(b"[getty] /dev/pts/0 open failed, retrying\n");
+            trona::syscall::syscall(trona::SYS_NANOSLEEP, 0, delay_ns, 0, 0, 0, 0);
             delay_ns *= 2;
         }
         if fd0 < 0 {
-            besalt::serial::serial_puts(b"[getty] /dev/pts/0 open failed after retries\n");
+            trona::serial::serial_puts(b"[getty] /dev/pts/0 open failed after retries\n");
             posix_exit(1);
         }
 
@@ -54,7 +54,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         // 5. Acquire controlling terminal
         let tio = posix_ioctl(fd0, 0x540E, 0); // TIOCSCTTY
         if tio < 0 {
-            besalt::serial::serial_puts(b"[getty] TIOCSCTTY failed\n");
+            trona::serial::serial_puts(b"[getty] TIOCSCTTY failed\n");
         }
 
         // 5b. Set foreground process group for the controlling tty.
@@ -68,11 +68,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         if fg_pgid != 0 {
             let pgrp = posix_ioctl(fd0, 0x5410, fg_pgid); // TIOCSPGRP
             if pgrp < 0 {
-                besalt::serial::serial_puts(b"[getty] TIOCSPGRP failed\n");
+                trona::serial::serial_puts(b"[getty] TIOCSPGRP failed\n");
             }
         }
 
-        besalt::serial::serial_puts(b"[getty] session ready, exec bash\n");
+        trona::serial::serial_puts(b"[getty] session ready, exec bash\n");
 
         // 6. Exec bash — replaces this process image
         let new_argv: [*const u8; 3] = [
@@ -82,7 +82,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         ];
         let mut path_buf = [0u8; 48];
         let prefix = b"PATH=";
-        let path_val = besalt::DEFAULT_PATH;
+        let path_val = trona::DEFAULT_PATH;
         let mut i = 0usize;
         while i < prefix.len() {
             path_buf[i] = prefix[i];
@@ -113,7 +113,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         );
 
         // If exec fails
-        besalt::serial::serial_puts(b"[getty] exec failed\n");
+        trona::serial::serial_puts(b"[getty] exec failed\n");
         posix_exit(1);
     }
 }

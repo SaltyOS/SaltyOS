@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Path resolution with symlink following and mount point detection.
 
-use besalt::consts::*;
-use besalt::types::*;
+use trona::consts::*;
+use trona::types::*;
 
 use crate::client::get_client;
 use crate::consts::*;
@@ -585,13 +585,13 @@ pub(crate) enum AtResolution {
 ///
 /// # Safety
 /// `path` must point to a buffer of at least MAX_PATH_LEN bytes.
-/// `reply` must be a valid mutable pointer to a BesaltMsg.
+/// `reply` must be a valid mutable pointer to a TronaMsg.
 pub(crate) unsafe fn resolve_at_base(
     badge: u64,
     dirfd: i32,
     path: *mut u8,
     path_len: &mut u8,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
 ) -> AtResolution {
     unsafe {
         let start_ino = resolve_at_start(badge, dirfd, path, *path_len);
@@ -621,11 +621,11 @@ pub(crate) unsafe fn resolve_at_base(
                     start_ino: ROOT_INO,
                 };
             }
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return AtResolution::Error;
         }
 
-        (*reply).label = BESALT_INVALID_ARGUMENT;
+        (*reply).label = TRONA_INVALID_ARGUMENT;
         AtResolution::Error
     }
 }
