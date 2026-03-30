@@ -145,8 +145,8 @@ static void apply_rela(struct rtld_state *st, struct link_map *map,
     }
 
     case R_TPOFF64: {
-        /* Offset from thread pointer (Variant II: TLS data below TP).
-         * TP + offset = address of TLS variable. */
+        /* TP-relative offset for static TLS.
+         * x86_64 encodes negative offsets; aarch64 uses positive offsets. */
         Elf64_Sym *sym = &map->symtab[sym_idx];
         *target = (uint64_t)(map->tls_tpoff + (int64_t)sym->st_value + r->r_addend);
         break;
@@ -154,7 +154,7 @@ static void apply_rela(struct rtld_state *st, struct link_map *map,
 
 #ifdef R_TLSDESC
     case R_TLSDESC: {
-        /* GOT descriptor {resolver, tp_offset} for TLSDESC access sequence. */
+        /* GOT descriptor {resolver, tp_offset} for the arch-specific static TLS ABI. */
         Elf64_Sym *sym = &map->symtab[sym_idx];
         int64_t tpoff = map->tls_tpoff + (int64_t)sym->st_value + r->r_addend;
         target[0] = (uint64_t)_tlsdesc_static_resolver;
