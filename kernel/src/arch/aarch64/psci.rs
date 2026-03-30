@@ -4,8 +4,6 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use core::sync::atomic::{AtomicU8, Ordering};
-
 /// PSCI function IDs (SMC32 convention for 32-bit functions)
 pub const PSCI_VERSION: u32 = 0x8400_0000;
 pub const PSCI_CPU_OFF: u32 = 0x8400_0002;
@@ -24,39 +22,14 @@ pub const PSCI_ALREADY_ON: i64 = -4;
 pub const PSCI_ON_PENDING: i64 = -5;
 pub const PSCI_INTERNAL_FAILURE: i64 = -6;
 
-const PSCI_CONDUIT_UNKNOWN: u8 = 0;
-const PSCI_CONDUIT_SMC: u8 = 1;
-
-static PSCI_CONDUIT: AtomicU8 = AtomicU8::new(PSCI_CONDUIT_UNKNOWN);
-
-/// Initialize PSCI conduit selection from boot handoff and ACPI FADT.
-pub fn init_from_firmware(rsdp_phys: u64, boot_flags: u32) {
-    let _ = boot_flags;
-
-    if rsdp_phys == 0 {
-        PSCI_CONDUIT.store(PSCI_CONDUIT_SMC, Ordering::Relaxed);
-        return;
-    }
-
-    let conduit = unsafe { crate::acpi::parse_psci_conduit(rsdp_phys) };
-    let conduit = match conduit {
-        Some(crate::acpi::PsciConduit::Smc) => PSCI_CONDUIT_SMC,
-        Some(crate::acpi::PsciConduit::Hvc) => PSCI_CONDUIT_SMC,
-        None => PSCI_CONDUIT_SMC,
-    };
-
-    PSCI_CONDUIT.store(conduit, Ordering::Relaxed);
-}
-
 /// Issue a PSCI call with 0 extra arguments (x0 = function ID).
 macro_rules! psci_call0 {
     ($fn_id:expr) => {{
         let result: i64;
-        // SAFETY: PSCI calls are the standard firmware interface for power
-        // management. The host kernel always uses the SMC conduit here.
+        // SAFETY: PSCI SMC call — standard firmware interface.
         unsafe {
             core::arch::asm!(
-                ".inst 0xD4000003", // smc #0
+                "smc #0",
                 inlateout("x0") $fn_id as u64 => result,
                 options(nomem, nostack),
             );
@@ -69,11 +42,10 @@ macro_rules! psci_call0 {
 macro_rules! psci_call3 {
     ($fn_id:expr, $x1:expr, $x2:expr, $x3:expr) => {{
         let result: i64;
-        // SAFETY: PSCI calls are the standard firmware interface. Arguments
-        // in x0-x3 follow the SMC calling convention.
+        // SAFETY: PSCI SMC call with arguments in x0-x3.
         unsafe {
             core::arch::asm!(
-                ".inst 0xD4000003", // smc #0
+                "smc #0",
                 inlateout("x0") $fn_id as u64 => result,
                 in("x1") $x1, in("x2") $x2, in("x3") $x3,
                 options(nomem, nostack),

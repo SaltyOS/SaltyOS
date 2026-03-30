@@ -72,13 +72,6 @@ pub fn phys_to_ptr<T>(phys: u64) -> *const T {
     (phys + PHYS_MAP_OFFSET) as *const T
 }
 
-/// PSCI conduit advertised by firmware.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PsciConduit {
-    Smc,
-    Hvc,
-}
-
 // ---------------------------------------------------------------------------
 // Generic table walker
 // ---------------------------------------------------------------------------
@@ -184,71 +177,6 @@ unsafe fn find_table_in_rsdt(rsdt_phys: u64, signature: &[u8; 4]) -> Option<u64>
     }
 
     None
-}
-
-// ---------------------------------------------------------------------------
-// FADT — ARM boot architecture flags
-// ---------------------------------------------------------------------------
-
-const FADT_FLAGS_OFFSET: usize = 112;
-const FADT_ARM_BOOT_FLAGS_OFFSET: usize = 132;
-const FADT_MINOR_REVISION_OFFSET: usize = 134;
-
-const ACPI_FADT_HW_REDUCED: u32 = 1 << 20;
-const ACPI_FADT_PSCI_COMPLIANT: u16 = 1 << 0;
-const ACPI_FADT_PSCI_USE_HVC: u16 = 1 << 1;
-
-/// Parse the FADT ARM boot architecture flags to discover the PSCI conduit.
-///
-/// Returns `Some(PsciConduit)` only when firmware explicitly advertises PSCI
-/// support via `ARM_BOOT_ARCH`. Otherwise returns `None`.
-///
-/// # Safety
-/// `rsdp_phys` must be a valid physical address of an ACPI RSDP structure,
-/// reachable via the kernel direct physical map.
-pub unsafe fn parse_psci_conduit(rsdp_phys: u64) -> Option<PsciConduit> {
-    let fadt_phys = unsafe { find_table(rsdp_phys, b"FACP") }?;
-    let fadt_ptr = phys_to_ptr::<u8>(fadt_phys);
-    let hdr = unsafe { &*(fadt_ptr as *const SdtHeader) };
-    let length = hdr.length as usize;
-
-    if length <= FADT_MINOR_REVISION_OFFSET {
-        return None;
-    }
-
-    let major_revision = hdr.revision;
-    let minor_revision = unsafe { *fadt_ptr.add(FADT_MINOR_REVISION_OFFSET) };
-    let arm_boot_flags =
-        unsafe { core::ptr::read_unaligned(fadt_ptr.add(FADT_ARM_BOOT_FLAGS_OFFSET) as *const u16) };
-
-    // arm64 ACPI requires HW-reduced mode. If firmware does not advertise it,
-    // do not trust PSCI flags from this FADT.
-    if length >= FADT_FLAGS_OFFSET + 4 {
-        let flags =
-            unsafe { core::ptr::read_unaligned(fadt_ptr.add(FADT_FLAGS_OFFSET) as *const u32) };
-        if (flags & ACPI_FADT_HW_REDUCED) == 0 {
-            return None;
-        }
-    }
-
-    // ACPI 5.1 introduced ARM boot flags. Some firmware reports 5.0 but still
-    // fills in `arm_boot_flags`; accept that case only when the flags are
-    // actually present and non-zero.
-    if major_revision < 5 || (major_revision == 5 && minor_revision < 1) {
-        if arm_boot_flags == 0 {
-            return None;
-        }
-    }
-
-    if (arm_boot_flags & ACPI_FADT_PSCI_COMPLIANT) == 0 {
-        return None;
-    }
-
-    if (arm_boot_flags & ACPI_FADT_PSCI_USE_HVC) != 0 {
-        Some(PsciConduit::Hvc)
-    } else {
-        Some(PsciConduit::Smc)
-    }
 }
 
 // ---------------------------------------------------------------------------

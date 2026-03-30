@@ -516,10 +516,6 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // Initialize paging (direct physical map)
     paging::init();
 
-    if let Some(info) = boot_info {
-        psci::init_from_firmware(info.rsdp_addr, info.flags);
-    }
-
     // Remap always-on MMIO from boot identity addresses to kernel mappings.
     pl011::remap_to_direct_map();
     gic::remap_to_direct_map();
