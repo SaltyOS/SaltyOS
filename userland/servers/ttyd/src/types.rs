@@ -170,7 +170,7 @@ pub struct PtyInstance {
     pub termios: PtyTermios,
     // Controlling terminal ownership + foreground process group
     pub has_ctty: bool,
-    pub ctty_owner_badge: u64,
+    pub ctty_session_id: u64,
     pub fg_pgid: u32,
     // Whether VFS has a pending read for this PTY (needs notification on data)
     pub vfs_pending: bool,
@@ -188,7 +188,7 @@ impl PtyInstance {
             line: InputLineBuf::new(),
             termios: PtyTermios::default(),
             has_ctty: false,
-            ctty_owner_badge: 0,
+            ctty_session_id: 0,
             fg_pgid: 0,
             vfs_pending: false,
             master_closed: false,

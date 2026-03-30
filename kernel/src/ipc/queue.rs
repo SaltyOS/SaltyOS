@@ -4,12 +4,17 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use crate::sched::thread::Tcb;
+use crate::sched::thread::{RecvWaitLink, Tcb};
 
 /// FIFO queue of TCB pointers
 pub struct WaitQueue {
     head: *mut Tcb,
     tail: *mut Tcb,
+}
+
+pub struct RecvWaitQueue {
+    head: *mut RecvWaitLink,
+    tail: *mut RecvWaitLink,
 }
 
 impl WaitQueue {
@@ -115,5 +120,102 @@ impl WaitQueue {
         }
 
         false
+    }
+}
+
+impl RecvWaitQueue {
+    pub const fn new() -> Self {
+        Self {
+            head: core::ptr::null_mut(),
+            tail: core::ptr::null_mut(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.head.is_null()
+    }
+
+    pub fn push(&mut self, link: *mut RecvWaitLink) {
+        unsafe {
+            (*link).prev = self.tail;
+            (*link).next = core::ptr::null_mut();
+            if self.tail.is_null() {
+                self.head = link;
+                self.tail = link;
+            } else {
+                (*self.tail).next = link;
+                self.tail = link;
+            }
+        }
+    }
+
+    pub fn push_front(&mut self, link: *mut RecvWaitLink) {
+        unsafe {
+            (*link).prev = core::ptr::null_mut();
+            (*link).next = self.head;
+            if self.head.is_null() {
+                self.tail = link;
+            } else {
+                (*self.head).prev = link;
+            }
+            self.head = link;
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<*mut RecvWaitLink> {
+        if self.head.is_null() {
+            None
+        } else {
+            unsafe {
+                let link = self.head;
+                self.head = (*link).next;
+                if self.head.is_null() {
+                    self.tail = core::ptr::null_mut();
+                } else {
+                    (*self.head).prev = core::ptr::null_mut();
+                }
+                (*link).prev = core::ptr::null_mut();
+                (*link).next = core::ptr::null_mut();
+                Some(link)
+            }
+        }
+    }
+
+    pub fn peek(&self) -> Option<*mut RecvWaitLink> {
+        if self.head.is_null() {
+            None
+        } else {
+            Some(self.head)
+        }
+    }
+
+    pub fn remove(&mut self, link: *mut RecvWaitLink) -> bool {
+        if link.is_null() {
+            return false;
+        }
+
+        unsafe {
+            let prev = (*link).prev;
+            let next = (*link).next;
+
+            if prev.is_null() {
+                if self.head != link {
+                    return false;
+                }
+                self.head = next;
+            } else {
+                (*prev).next = next;
+            }
+
+            if next.is_null() {
+                self.tail = prev;
+            } else {
+                (*next).prev = prev;
+            }
+
+            (*link).prev = core::ptr::null_mut();
+            (*link).next = core::ptr::null_mut();
+            true
+        }
     }
 }

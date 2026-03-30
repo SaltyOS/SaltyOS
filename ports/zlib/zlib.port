@@ -1,0 +1,25 @@
+[port]
+name = zlib
+version = 1.3.1
+description = zlib compression library
+homepage = https://zlib.net/
+license = Zlib
+
+[source]
+url = https://github.com/madler/zlib/releases/download/v${version}/zlib-${version}.tar.gz
+subdir = zlib-${version}
+sha256 = 9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23
+
+[build]
+type = cmake
+configure =
+    -DCMAKE_SYSTEM_NAME=SaltyOS
+    -DCMAKE_CROSSCOMPILING=TRUE
+    -DCMAKE_SYSTEM_PROCESSOR=${ARCH}
+    -DCMAKE_MODULE_PATH=${REPOROOT}/tools/cmake
+    -DCMAKE_AR=${TOOLCHAIN_PREFIX}/bin/llvm-ar
+    -DCMAKE_RANLIB=${TOOLCHAIN_PREFIX}/bin/llvm-ranlib
+    -DBUILD_SHARED_LIBS=OFF
+
+[install]
+libz.a = _build/libz.a

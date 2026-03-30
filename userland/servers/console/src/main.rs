@@ -76,7 +76,7 @@ static mut DISPLAY_TX_TAIL: usize = 0;
 // ======================================================================
 
 fn ipc_ctx() -> *mut IpcContext {
-    &raw mut besalt::__besalt_ipc_ctx
+    besalt::tls::current_ipc_ctx()
 }
 
 unsafe fn init_console_termios() {

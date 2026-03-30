@@ -10,9 +10,9 @@ pub mod context;
 pub mod cpu;
 pub mod exceptions;
 pub mod fpu;
-pub mod pl011;
-pub mod paging;
 pub mod gic;
+pub mod paging;
+pub mod pl011;
 pub mod timer;
 pub mod psci;
 
@@ -93,6 +93,26 @@ pub unsafe fn inb(_port: u16) -> u8 {
     0
 }
 
+// --- EL state ---
+
+/// Return the current exception level number.
+pub fn current_el() -> u64 {
+    let current_el: u64;
+    // SAFETY: Reading CurrentEL is always safe in privileged code.
+    unsafe {
+        core::arch::asm!("mrs {}, CurrentEL", out(reg) current_el, options(nomem, nostack));
+    }
+    current_el >> 2
+}
+
+/// Returns true if the host kernel is running at EL2.
+///
+/// SaltyOS now fixes the AArch64 host kernel at EL1. EL2 is reserved for a
+/// future virtualization backend, so the host-side answer is always false.
+pub fn is_el2() -> bool {
+    false
+}
+
 // --- Per-CPU data ---
 
 /// Get current CPU ID (from MPIDR_EL1)
@@ -116,7 +136,7 @@ pub fn current_invoke_seq() -> u64 {
     cpu::current_invoke_seq()
 }
 
-/// Set kernel stack for current CPU (via TPIDR_EL1 per-CPU data).
+/// Set kernel stack for current CPU (via host TPIDR-backed per-CPU data).
 pub fn set_kernel_stack(stack_top: u64) {
     cpu::set_kernel_stack(stack_top);
 }
@@ -176,7 +196,7 @@ pub fn generate_stack_canary() -> u64 {
     fallback
 }
 
-/// Set per-CPU stack canary (via TPIDR_EL1 per-CPU data).
+/// Set per-CPU stack canary (via host TPIDR-backed per-CPU data).
 pub fn set_per_cpu_canary(canary: u64) {
     cpu::set_per_cpu_canary(canary);
 }
@@ -214,6 +234,74 @@ pub fn now_ns() -> u64 {
     // Convert ticks to nanoseconds: ticks * 1_000_000_000 / freq
     // Use 128-bit math to avoid overflow
     ((ticks as u128 * 1_000_000_000u128) / freq as u128) as u64
+}
+
+pub fn publish_page_table_page(table_phys: u64) {
+    paging::flush_dcache_poc_page(crate::mm::phys_to_virt(table_phys));
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "isb",
+            options(nostack),
+        );
+    }
+}
+
+/// Flush a user page that was populated through the current VA alias.
+///
+/// Userland loaders fill pages through a scratch mapping, unmap that alias,
+/// and then remap the same frame at a different VA. Under strict AArch64
+/// cache models this requires explicit cache maintenance on the written alias
+/// before the remap, otherwise the new mapping may observe stale data or code.
+pub fn sync_user_page_before_unmap(vaddr: u64) {
+    let ctr: u64;
+    // SAFETY: Reading CTR_EL0 from EL1 is always safe.
+    unsafe {
+        core::arch::asm!("mrs {}, CTR_EL0", out(reg) ctr, options(nomem, nostack));
+    }
+
+    let dline_shift = ((ctr >> 16) & 0xF) as usize;
+    let iline_shift = (ctr & 0xF) as usize;
+    let dline = 4usize << dline_shift;
+    let iline = 4usize << iline_shift;
+    let dline = if dline == 0 { 64 } else { dline };
+    let iline = if iline == 0 { 64 } else { iline };
+
+    let page_start = vaddr & !0xFFFu64;
+    let page_end = page_start + 4096;
+
+    let mut addr = page_start;
+    while addr < page_end {
+        // SAFETY: The caller keeps the VA mapped until after this helper
+        // returns; cleaning by VA is required to publish data written through
+        // the scratch alias.
+        unsafe {
+            core::arch::asm!("dc civac, {}", in(reg) addr, options(nostack));
+        }
+        addr += dline as u64;
+    }
+
+    // SAFETY: Complete data cache clean before invalidating I-cache.
+    unsafe {
+        core::arch::asm!("dsb ish", options(nomem, nostack));
+    }
+
+    let mut addr = page_start;
+    while addr < page_end {
+        // SAFETY: Invalidating I-cache after publishing freshly written code
+        // is harmless for data pages and required for executable remaps.
+        unsafe {
+            core::arch::asm!("ic ivau, {}", in(reg) addr, options(nostack));
+        }
+        addr += iline as u64;
+    }
+
+    // SAFETY: Ensure the invalidation is globally observed before returning
+    // to the unmap/remap path.
+    unsafe {
+        core::arch::asm!("dsb ish", options(nomem, nostack));
+        core::arch::asm!("isb", options(nomem, nostack));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -387,7 +475,7 @@ pub unsafe fn context_switch(
 /// Trampoline to enter usermode for newly created threads.
 ///
 /// Delegates to the `context` module which reads the thread's saved
-/// ELR_EL1, SP_EL0, SPSR_EL1 from the TCB, loads TTBR0, zeroes all
+/// host return ELR/SPSR pair plus SP_EL0 from the TCB, loads TTBR0, zeroes all
 /// GPRs, and executes `eret` to enter EL0.
 ///
 /// # Safety
@@ -416,7 +504,7 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // Install exception vector table (must be early so any faults are caught)
     exceptions::init();
 
-    // Initialize BSP per-CPU data (TPIDR_EL1). Must be early so per-CPU
+    // Initialize BSP per-CPU data (host TPIDR). Must be early so per-CPU
     // field accessors work for the rest of boot.
     cpu::init_bsp();
 
@@ -441,9 +529,9 @@ pub fn init(boot_info: Option<&crate::ParsedBootInfo>) {
     // Configure the generic timer (reads frequency, does not start ticking)
     timer::init();
 
-    // Switch frame bitmap pointer from identity map (TTBR0) to direct
-    // physical map (TTBR1). Must happen after paging::init() creates the
-    // direct map and before TTBR0 identity map is cleared.
+    // Switch frame bitmap pointer from the early identity mapping to the
+    // higher-half direct map. Must happen after paging::init() creates the
+    // direct map and before the low boot alias is cleared.
     crate::mm::remap_frame_bitmap();
 
     // Allocate per-frame tracking arrays now that direct map covers all RAM.
@@ -503,12 +591,18 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
     let mair = paging::read_mair();
     let tcr = paging::read_tcr();
     let sctlr = paging::read_sctlr();
-    let ttbr0 = paging::read_cr3();    // Identity map root
-    let ttbr1 = paging::read_ttbr1();  // Kernel root
+    let host_ttbr0 = paging::read_cr3();      // Shared bootstrap/full root
+    let compat_ttbr1 = paging::read_ttbr1();  // Kernel root template for EL1 compatibility
     let entry_virt = ap_boot::ap_entry as *const () as u64;
 
     // Map GICR MMIO pages for all potential APs before starting them.
     gic::remap_ap_gicr(MAX_CPUS);
+
+    // Secondary CPUs enable the MMU and start walking the kernel root as soon
+    // as paging is enabled. Clean the shared page-table tree to PoC so their
+    // walkers cannot observe stale descriptors sitting dirty in the BSP cache
+    // hierarchy.
+    paging::clean_kernel_page_tables_to_poc();
 
     let mut ap_count = 0u32;
 
@@ -539,8 +633,8 @@ pub fn init_smp(boot_info: Option<&crate::ParsedBootInfo>) {
             (*mb).mair = mair;
             (*mb).tcr = tcr;
             (*mb).sctlr = sctlr;
-            (*mb).ttbr0 = ttbr0;
-            (*mb).ttbr1 = ttbr1;
+            (*mb).host_ttbr0 = host_ttbr0;
+            (*mb).compat_ttbr1 = compat_ttbr1;
             (*mb).entry_virt = entry_virt;
         }
 
@@ -671,6 +765,11 @@ pub mod uaccess {
     /// Checks ID_AA64MMFR1_EL1.PAN (bits 23:20) and clears SCTLR_EL1.SPAN
     /// so that PAN is automatically set on exception entry from EL0.
     pub fn init() {
+        if super::current_el() != 1 {
+            PAN_ACTIVE.store(false, Ordering::Release);
+            return;
+        }
+
         let mmfr1: u64;
         // SAFETY: Reading ID_AA64MMFR1_EL1 is always safe from EL1.
         unsafe {

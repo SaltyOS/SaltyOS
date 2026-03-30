@@ -62,6 +62,96 @@ unsafe fn volatile_copy(dst: *mut u8, src: *const u8, len: usize) {
     }
 }
 
+/// Convert ELF `p_flags` to VSpace flags, enforcing W^X for a single segment.
+fn elf_segment_vspace_flags(p_flags: u32) -> u64 {
+    let mut flags = VSPACE_FLAG_USER;
+    if p_flags & PF_W != 0 {
+        flags |= VSPACE_FLAG_WRITABLE;
+    } else if p_flags & PF_X != 0 {
+        flags |= VSPACE_FLAG_EXECUTABLE;
+    }
+    flags
+}
+
+/// Apply final page protections for all PT_LOAD pages in an ELF image.
+///
+/// This merges permissions page-wise across overlapping PT_LOAD segments so a
+/// trailing RW segment cannot accidentally strip execute permission from a page
+/// that also contains code.
+unsafe fn protect_load_pages(
+    child_vspace: Cap,
+    phdr_ptr: *const u8,
+    phdr_count: usize,
+    phdr_size: usize,
+    phdr_bytes_len: usize,
+    delta: u64,
+) {
+    unsafe {
+        let mut min_page = u64::MAX;
+        let mut max_page_end = 0u64;
+
+        for i in 0..phdr_count {
+            let off = i * phdr_size;
+            if off + core::mem::size_of::<Elf64Phdr>() > phdr_bytes_len {
+                break;
+            }
+            let phdr = &*(phdr_ptr.add(off) as *const Elf64Phdr);
+            if phdr.p_type != PT_LOAD || phdr.p_memsz == 0 {
+                continue;
+            }
+
+            let seg_start_page = phdr.p_vaddr.wrapping_add(delta) & !0xFFFu64;
+            let seg_end_page = (phdr.p_vaddr.wrapping_add(delta).wrapping_add(phdr.p_memsz) + 0xFFF) & !0xFFFu64;
+            if seg_start_page < min_page {
+                min_page = seg_start_page;
+            }
+            if seg_end_page > max_page_end {
+                max_page_end = seg_end_page;
+            }
+        }
+
+        if min_page == u64::MAX || max_page_end <= min_page {
+            return;
+        }
+
+        let mut page = min_page;
+        while page < max_page_end {
+            let mut flags = VSPACE_FLAG_USER;
+            let mut covered = false;
+
+            for i in 0..phdr_count {
+                let off = i * phdr_size;
+                if off + core::mem::size_of::<Elf64Phdr>() > phdr_bytes_len {
+                    break;
+                }
+                let phdr = &*(phdr_ptr.add(off) as *const Elf64Phdr);
+                if phdr.p_type != PT_LOAD || phdr.p_memsz == 0 {
+                    continue;
+                }
+
+                let seg_vaddr = phdr.p_vaddr.wrapping_add(delta);
+                let seg_start_page = seg_vaddr & !0xFFFu64;
+                let seg_end_page = (seg_vaddr.wrapping_add(phdr.p_memsz) + 0xFFF) & !0xFFFu64;
+                if page < seg_start_page || page >= seg_end_page {
+                    continue;
+                }
+
+                covered = true;
+                flags |= elf_segment_vspace_flags(phdr.p_flags);
+            }
+
+            if covered {
+                if (flags & VSPACE_FLAG_WRITABLE != 0) && (flags & VSPACE_FLAG_EXECUTABLE != 0) {
+                    flags &= !VSPACE_FLAG_EXECUTABLE;
+                }
+                let _ = besalt::invoke::vspace_protect_range(child_vspace, page, 1, flags);
+            }
+
+            page = page.wrapping_add(4096);
+        }
+    }
+}
+
 // ---- Layout offsets within a reservation ----
 // These are sequential offsets, NOT absolute cap slots.
 const OFF_TCB: usize = 0;
@@ -92,6 +182,9 @@ const BESALT_INVALID_ARGUMENT: u64 = besalt::BESALT_INVALID_ARGUMENT;
 const VSPACE_FLAG_WRITABLE: u64 = besalt::VSPACE_FLAG_WRITABLE;
 const VSPACE_FLAG_USER: u64 = besalt::VSPACE_FLAG_USER;
 const VSPACE_FLAG_EXECUTABLE: u64 = besalt::VSPACE_FLAG_EXECUTABLE;
+const PF_W: u32 = besalt::PF_W;
+const PF_X: u32 = besalt::PF_X;
+const PT_LOAD: u32 = besalt::PT_LOAD;
 const CAP_RIGHTS_ALL: u64 = besalt::CAP_RIGHTS_ALL;
 const INITRD_COPY_RIGHTS: u64 = (1 << 0) | (1 << 2) | (1 << 3);
 
@@ -164,7 +257,7 @@ const SPAWN_FLAG_START_SUSPENDED: u64 = besalt::SPAWN_FLAG_START_SUSPENDED;
 // Shared library physical frame cache
 // ===========================================================================
 
-const MAX_SHARED_LIB_PAGES: usize = 576;
+const MAX_SHARED_LIB_PAGES: usize = 1152;
 const MAX_CACHED_LIBS: usize = 4;
 const MAX_LIB_NAME: usize = 24;
 
@@ -1886,33 +1979,14 @@ pub(crate) unsafe fn exec_load_elf_mmsrv(
             chunk_off += chunk_count;
         }
 
-        // Tighten per-segment permissions (W^X enforcement)
-        for i in 0..phdr_count {
-            let off = phdr_base + i * phdr_size;
-            if off + core::mem::size_of::<Elf64Phdr>() > data_len {
-                break;
-            }
-            let phdr = &*(data.add(off) as *const Elf64Phdr);
-            if phdr.p_type != PT_LOAD {
-                continue;
-            }
-
-            let seg_vaddr = phdr.p_vaddr.wrapping_add(delta);
-            let seg_start_page = seg_vaddr & !0xFFFu64;
-            let seg_end = seg_vaddr + phdr.p_memsz;
-            let seg_end_page = (seg_end + 0xFFF) & !0xFFFu64;
-
-            // Convert ELF segment flags to VSpace flags (W^X: W and X are mutually exclusive)
-            let mut flags: u64 = VSPACE_FLAG_USER;
-            if phdr.p_flags & PF_W != 0 {
-                flags |= VSPACE_FLAG_WRITABLE;
-            } else if phdr.p_flags & PF_X != 0 {
-                flags |= VSPACE_FLAG_EXECUTABLE;
-            }
-
-            let page_count = ((seg_end_page - seg_start_page) / 4096) as u64;
-            besalt::invoke::vspace_protect_range(child_vspace, seg_start_page, page_count, flags);
-        }
+        protect_load_pages(
+            child_vspace,
+            data.add(phdr_base),
+            phdr_count,
+            phdr_size,
+            data_len - phdr_base,
+            delta,
+        );
 
         let brk = span_end;
 
@@ -2287,31 +2361,14 @@ pub(crate) unsafe fn exec_load_elf_vfs_mmsrv(
             chunk_off += chunk_count;
         }
 
-        for i in 0..phdr_count {
-            let off = i * phdr_size;
-            if off + core::mem::size_of::<Elf64Phdr>() > phdr_bytes_len {
-                break;
-            }
-            let phdr = &*(phdr_bytes.as_ptr().add(off) as *const Elf64Phdr);
-            if phdr.p_type != PT_LOAD {
-                continue;
-            }
-
-            let seg_vaddr = phdr.p_vaddr.wrapping_add(delta);
-            let seg_start_page = seg_vaddr & !0xFFFu64;
-            let seg_end = seg_vaddr + phdr.p_memsz;
-            let seg_end_page = (seg_end + 0xFFF) & !0xFFFu64;
-
-            let mut flags: u64 = VSPACE_FLAG_USER;
-            if phdr.p_flags & PF_W != 0 {
-                flags |= VSPACE_FLAG_WRITABLE;
-            } else if phdr.p_flags & PF_X != 0 {
-                flags |= VSPACE_FLAG_EXECUTABLE;
-            }
-
-            let page_count = ((seg_end_page - seg_start_page) / 4096) as u64;
-            besalt::invoke::vspace_protect_range(child_vspace, seg_start_page, page_count, flags);
-        }
+        protect_load_pages(
+            child_vspace,
+            phdr_bytes.as_ptr(),
+            phdr_count,
+            phdr_size,
+            phdr_bytes_len,
+            delta,
+        );
 
         (*result).entry = if is_pie {
             ehdr.e_entry.wrapping_add(delta)
@@ -3186,6 +3243,32 @@ pub unsafe fn handle_spawn_tx(
             (0, proc_table::ProcLibMap::zeroed())
         };
 
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] layout pid=");
+            _lb.hex(pid as u64);
+            _lb.str(b" elf=[");
+            _lb.hex(plan.layout.elf_code.base);
+            _lb.str(b",");
+            _lb.hex(plan.layout.elf_code.end());
+            _lb.str(b") rtld=[");
+            _lb.hex(plan.layout.rtld.base);
+            _lb.str(b",");
+            _lb.hex(plan.layout.rtld.end());
+            _lb.str(b") shlib=[");
+            _lb.hex(plan.layout.shared_libs.base);
+            _lb.str(b",");
+            _lb.hex(plan.layout.shared_libs.end());
+            _lb.str(b") elf_entry=");
+            _lb.hex(elf_result.entry);
+            _lb.str(b" rtld_entry=");
+            _lb.hex(rtld_result.entry);
+            _lb.str(b" rtld_base=");
+            _lb.hex(rtld_result.base);
+            _lb.str(b" shlib_base=");
+            _lb.hex(shared_lib_base);
+            _lb.str(b"\n");
+        });
+
         // ---- Schedule ----
         let err = besalt::invoke::sc_configure(child_sc, 10000, 100000);
         if err != 0 {
@@ -3386,8 +3469,23 @@ pub unsafe fn handle_spawn_tx(
             }
 
             // envp strings
+            let mut path_env = [0u8; 48];
+            let prefix = b"PATH=";
+            let mut pi = 0usize;
+            while pi < prefix.len() {
+                path_env[pi] = prefix[pi];
+                pi += 1;
+            }
+            let dp = besalt::DEFAULT_PATH;
+            let mut di = 0usize;
+            while di < dp.len() && pi < path_env.len() {
+                path_env[pi] = dp[di];
+                pi += 1;
+                di += 1;
+            }
+
             let env_strs: [&[u8]; 4] = [
-                b"PATH=/bin:/usr/bin",
+                &path_env[..pi],
                 b"HOME=/",
                 b"TERM=vt100",
                 b"SHELL=/bin/sh",

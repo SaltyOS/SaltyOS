@@ -101,7 +101,7 @@ static mut DEVICES: [PciDevice; MAX_PCI_DEVICES] = [PciDevice::zeroed(); MAX_PCI
 static mut DEVICE_COUNT: usize = 0;
 
 fn ipc_ctx() -> *mut IpcContext {
-    &raw mut besalt::__besalt_ipc_ctx
+    besalt::tls::current_ipc_ctx()
 }
 
 fn signal_ready() {

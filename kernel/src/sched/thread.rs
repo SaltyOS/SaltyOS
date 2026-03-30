@@ -8,6 +8,32 @@ use crate::cap::{KernelObject, ObjectType};
 use crate::cap::CNode;
 use crate::mm::VSpace;
 
+pub const MAX_RECV_WAIT_ENDPOINTS: usize = 32;
+pub const RECV_WAIT_SELECTED_NONE: u16 = u16::MAX;
+pub const RECV_WAIT_SELECTED_NOTIFICATION: u16 = u16::MAX - 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RecvWaitLink {
+    pub tcb: *mut Tcb,
+    pub endpoint: *mut u8,
+    pub prev: *mut RecvWaitLink,
+    pub next: *mut RecvWaitLink,
+    pub wait_index: u16,
+}
+
+impl RecvWaitLink {
+    pub const fn new() -> Self {
+        Self {
+            tcb: core::ptr::null_mut(),
+            endpoint: core::ptr::null_mut(),
+            prev: core::ptr::null_mut(),
+            next: core::ptr::null_mut(),
+            wait_index: 0,
+        }
+    }
+}
+
 /// XSAVE state area for FPU/SSE context
 ///
 /// FPU/SIMD save area.
@@ -171,6 +197,10 @@ pub struct Tcb {
     pub saved_caller_badge: u64,
     /// Saved caller message (for reply_recv)
     pub saved_caller_msg: super::super::ipc::Message,
+    /// Number of endpoint recv queues this thread is currently armed on.
+    pub recv_wait_link_count: u8,
+    /// Selected recv source for multi-endpoint waits.
+    pub recv_wait_selected: u16,
     /// Endpoint pointer if blocked on endpoint send/recv queue
     pub blocked_endpoint: *mut u8,
     /// Notification pointer if blocked on notification
@@ -217,6 +247,8 @@ pub struct Tcb {
     pub futex_vspace: *mut VSpace,
     /// Futex timed wait result: 0 = woken by futex_wake, non-zero = timeout
     pub futex_wakeup_result: u64,
+    /// Intrusive links used when the thread is blocked on multiple recv endpoints.
+    pub recv_wait_links: [RecvWaitLink; MAX_RECV_WAIT_ENDPOINTS],
 }
 
 /// Saved thread context (x86_64)
@@ -255,16 +287,18 @@ pub struct ThreadContext {
 pub struct ThreadContext {
     /// General purpose registers x0-x30
     pub x: [u64; 31],
+    /// Saved userspace stack pointer restored into SP_EL0 on return.
+    pub user_sp: u64,
     /// Saved EL1 stack pointer / context-switch anchor.
     ///
     /// For inactive/ready threads this points at the saved callee-saved
     /// register frame consumed by `aarch64_context_switch`. It is not the
-    /// user-mode SP; first user dispatch stores SP_EL0 in `x[19]`.
+    /// user-mode SP.
     pub sp: u64,
-    /// Exception link register (return address)
-    pub elr_el1: u64,
-    /// Saved program status register
-    pub spsr_el1: u64,
+    /// Saved return PC restored into the active host ELR on `eret`.
+    pub return_elr: u64,
+    /// Saved return PSTATE restored into the active host SPSR on `eret`.
+    pub return_spsr: u64,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -300,9 +334,10 @@ impl ThreadContext {
     pub const fn empty() -> Self {
         Self {
             x: [0u64; 31],
+            user_sp: 0,
             sp: 0,
-            elr_el1: 0,
-            spsr_el1: 0,
+            return_elr: 0,
+            return_spsr: 0,
         }
     }
 }
@@ -400,6 +435,8 @@ impl Tcb {
             blocked_reason: None,
             saved_caller_badge: 0,
             saved_caller_msg: super::super::ipc::Message::empty(),
+            recv_wait_link_count: 0,
+            recv_wait_selected: RECV_WAIT_SELECTED_NONE,
             blocked_endpoint: core::ptr::null_mut(),
             blocked_notification: core::ptr::null_mut(),
             blocked_vspace_tracking: core::ptr::null_mut(),
@@ -422,6 +459,7 @@ impl Tcb {
             futex_addr: 0,
             futex_vspace: core::ptr::null_mut(),
             futex_wakeup_result: 0,
+            recv_wait_links: [RecvWaitLink::new(); MAX_RECV_WAIT_ENDPOINTS],
         }
     }
 
@@ -454,6 +492,8 @@ impl Tcb {
         self.woken_by_notification = false;
         self.clear_run_owner_cpu();
         self.blocked_reason = None;
+        self.recv_wait_link_count = 0;
+        self.recv_wait_selected = RECV_WAIT_SELECTED_NONE;
         self.blocked_endpoint = core::ptr::null_mut();
         self.blocked_notification = core::ptr::null_mut();
         self.blocked_vspace_tracking = core::ptr::null_mut();

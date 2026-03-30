@@ -1,0 +1,44 @@
+[port]
+name = perl
+version = 5.40.1
+description = Perl programming language
+homepage = https://www.perl.org/
+license = Artistic-1.0, GPL-1.0
+
+[source]
+url = https://www.cpan.org/src/5.0/perl-${version}.tar.gz
+subdir = perl-${version}
+sha256 = 02f8c45bb379ed0c3de7514fad48c714fd46be8f0b536bfd5320050165a1ee26
+
+[build]
+type = custom
+
+[prepare]
+cp ${PORTDIR}/hints/saltyos.sh ${SRCDIR}/hints/saltyos.sh
+cd ${SRCDIR}
+
+# Phase 1: Build host miniperl + generate_uudmap in a separate object dir.
+mkdir -p host-tools
+cd host-tools
+CC=cc LD=cc sh ../Configure -des -Dusedevel -Dmksymlinks -Dprefix=/usr -Uusethreads -Dcc=cc -Dld=cc
+CC=cc make miniperl generate_uudmap
+cd ..
+
+# Phase 2: Install SaltyOS config.sh and substitute placeholders
+cp ${PORTDIR}/config.sh.saltyos config.sh
+sed -i.bak \
+    -e "s|@@ARCH@@|${ARCH}|g" \
+    -e "s|@@CC@@|${CC}|g" \
+    -e "s|@@AR@@|${AR}|g" \
+    -e "s|@@RANLIB@@|${RANLIB}|g" \
+    -e "s|@@CFLAGS@@|${CFLAGS}|g" \
+    -e "s|@@LDFLAGS@@|${LDFLAGS}|g" \
+    config.sh
+rm -f config.sh.bak
+
+# Phase 3: Regenerate target Makefile from SaltyOS config.sh
+sh Configure -S
+rm -f *.o
+
+[install]
+bin/perl = perl

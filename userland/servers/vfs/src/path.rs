@@ -10,6 +10,10 @@ use crate::fileops::normalize_path_for_client;
 use crate::ramfs::{dir_find_entry, inode_by_ino};
 use crate::types::*;
 
+fn proc_dirlike(dev_type: u8) -> bool {
+    matches!(dev_type, PROC_FILE_ROOT | PROC_FILE_PID_DIR | PROC_FILE_NET_DIR)
+}
+
 /// Check if a dirfd refers to a mount FD. Returns (mount_idx, dir_remote_ino) if so.
 pub(crate) unsafe fn resolve_at_mount(badge: u64, dirfd: i32) -> Option<(usize, u64)> {
     unsafe {
@@ -81,7 +85,8 @@ unsafe fn resolve_path_raw_inner(
 
         let plen = path_len as usize;
         while pos < plen {
-            if (*current).ftype != FTYPE_DIRECTORY && (*current).ftype != FTYPE_MOUNT_POINT {
+            let is_proc_dir = (*current).ftype == FTYPE_PROC_FILE && proc_dirlike((*current).dev_type);
+            if (*current).ftype != FTYPE_DIRECTORY && (*current).ftype != FTYPE_MOUNT_POINT && !is_proc_dir {
                 return core::ptr::null_mut();
             }
 

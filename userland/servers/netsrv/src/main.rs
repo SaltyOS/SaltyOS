@@ -17,7 +17,8 @@
 //!   68 = server endpoint (pre-created service EP)
 //!   80 = RX notification (allocated via mmsrv, sent to netdrv via IPC)
 //!   82 = TX notification (received from netdrv during DRIVER_REGISTER)
-//!   83 = VFS callback endpoint (received from VFS via NET_REGISTER_VFS)
+//!   83 = VFS callback endpoint (plain cap received from VFS via NET_REGISTER_VFS)
+//!   84 = local badged alias of the VFS callback endpoint
 
 #![no_std]
 #![no_main]
@@ -47,7 +48,9 @@ const CAP_SERVER_EP: u64 = 68;
 const CAP_RX_NOTIFICATION: u64 = 80;
 const CAP_TX_NOTIFICATION: u64 = 82;
 const CAP_VFS_CALLBACK_EP: u64 = 83;
+const CAP_VFS_CALLBACK_BADGED_EP: u64 = 84;
 const CAP_REPLY_TEMP: u64 = 89;
+const NETSRV_CALLBACK_BADGE: u64 = 0x4E37D;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -55,7 +58,14 @@ const CAP_REPLY_TEMP: u64 = 89;
 
 const SHM_VADDR: u64 = 0x0000_0000_6000_0000;
 const NET_SHM_ID: u64 = 0x4E455400; // "NET\0"
-const NET_SHM_PAGES: u64 = 32;
+const SHM_HEADER_BYTES: u64 = 0x1000;
+const SHM_SLOT_BYTES: u64 = 2048;
+const SHM_RX_SLOT_COUNT: u64 = 32;
+const SHM_TX_SLOT_COUNT: u64 = 32;
+const SHM_TX_OFFSET: u64 = SHM_HEADER_BYTES + (SHM_RX_SLOT_COUNT * SHM_SLOT_BYTES);
+const NET_SHM_BYTES: u64 = SHM_TX_OFFSET + (SHM_TX_SLOT_COUNT * SHM_SLOT_BYTES);
+const NET_SHM_PAGES: u64 = (NET_SHM_BYTES + 4095) / 4096;
+const DHCP_BOOTSTRAP_TIMEOUT_NS: u64 = 10_000_000_000;
 const RX_BADGE: u64 = 0x1;
 const TX_BADGE: u64 = 0x2;
 
@@ -68,6 +78,11 @@ static mut VFS_REGISTERED: bool = false;
 static mut SHM_BASE: u64 = 0;
 static mut SELF_TEST_PHASE: u8 = 0;
 static mut SELF_TEST_TICKS: u32 = 0;
+static mut LOGGED_RX_FRAME: bool = false;
+static mut LOGGED_UNKNOWN_ETHERTYPE: bool = false;
+static mut LOGGED_IPV4_PACKETS: u8 = 0;
+static mut LOGGED_INET_IPC: u8 = 0;
+static mut LOGGED_INET_RECV_RESULTS: u8 = 0;
 
 // ---------------------------------------------------------------------------
 // Utility functions
@@ -78,7 +93,7 @@ pub(crate) fn puts(s: &[u8]) {
 }
 
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
-    &raw mut besalt::__besalt_ipc_ctx
+    besalt::tls::current_ipc_ctx()
 }
 
 pub(crate) fn mac_addr() -> [u8; 6] {
@@ -88,6 +103,155 @@ pub(crate) fn mac_addr() -> [u8; 6] {
 
 fn signal_ready() {
     let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+}
+
+fn log_ipv4(lb: &mut besalt::serial::LineBuf, ip: u32) {
+    lb.dec(((ip >> 24) & 0xFF) as u64);
+    lb.putc(b'.');
+    lb.dec(((ip >> 16) & 0xFF) as u64);
+    lb.putc(b'.');
+    lb.dec(((ip >> 8) & 0xFF) as u64);
+    lb.putc(b'.');
+    lb.dec((ip & 0xFF) as u64);
+}
+
+fn log_network_config(prefix: &[u8]) {
+    let cfg = net::config::snapshot();
+    besalt::uinfo!(|_lb| {
+        _lb.str(prefix);
+        _lb.str(b" IP=");
+        log_ipv4(&mut _lb, cfg.our_ip);
+        _lb.str(b" MASK=");
+        log_ipv4(&mut _lb, cfg.subnet_mask);
+        _lb.str(b" GW=");
+        log_ipv4(&mut _lb, cfg.gateway_ip);
+        _lb.str(b" DNS=");
+        log_ipv4(&mut _lb, cfg.dns_server);
+        _lb.putc(b'\n');
+    });
+}
+
+fn log_inet_ipc(op: &[u8], conn_id: u32, ip: u32, port: u16, len: usize) {
+    unsafe {
+        if *(&raw const LOGGED_INET_IPC) >= 24 {
+            return;
+        }
+        *(&raw mut LOGGED_INET_IPC) += 1;
+    }
+    besalt::udebug!(|_lb| {
+        _lb.str(b"[netsrv] ipc ");
+        _lb.str(op);
+        _lb.str(b" conn=");
+        _lb.dec(conn_id as u64);
+        if ip != 0 || port != 0 {
+            _lb.str(b" ip=");
+            log_ipv4(&mut _lb, ip);
+            _lb.str(b" port=");
+            _lb.dec(port as u64);
+        }
+        if len != 0 {
+            _lb.str(b" len=");
+            _lb.dec(len as u64);
+        }
+        _lb.putc(b'\n');
+    });
+}
+
+fn log_inet_recv_result(op: &[u8], conn_id: u32, src_ip: u32, len: usize, data: &[u8]) {
+    unsafe {
+        if *(&raw const LOGGED_INET_RECV_RESULTS) >= 24 {
+            return;
+        }
+        *(&raw mut LOGGED_INET_RECV_RESULTS) += 1;
+    }
+    besalt::udebug!(|_lb| {
+        _lb.str(b"[netsrv] ipc ");
+        _lb.str(op);
+        _lb.str(b" conn=");
+        _lb.dec(conn_id as u64);
+        _lb.str(b" src=");
+        log_ipv4(&mut _lb, src_ip);
+        _lb.str(b" len=");
+        _lb.dec(len as u64);
+        let preview_len = core::cmp::min(data.len(), 8);
+        if preview_len > 0 {
+            _lb.str(b" bytes=");
+            let mut i = 0;
+            while i < preview_len {
+                if i != 0 {
+                    _lb.putc(b':');
+                }
+                _lb.hex(data[i] as u64);
+                i += 1;
+            }
+        }
+        _lb.putc(b'\n');
+    });
+}
+
+fn log_frame_once(frame: &[u8]) {
+    if frame.len() < 14 {
+        return;
+    }
+    let ethertype = ((frame[12] as u16) << 8) | (frame[13] as u16);
+    besalt::udebug!(|_lb| {
+        _lb.str(b"[netsrv] RX frame len=");
+        _lb.dec(frame.len() as u64);
+        _lb.str(b" ethertype=");
+        _lb.hex(ethertype as u64);
+        _lb.putc(b'\n');
+    });
+}
+
+fn log_ipv4_packet(hdr: &net::proto::ipv4::Ipv4Header, payload_len: usize) {
+    besalt::udebug!(|_lb| {
+        _lb.str(b"[netsrv] IPv4 src=");
+        log_ipv4(&mut _lb, hdr.src);
+        _lb.str(b" dst=");
+        log_ipv4(&mut _lb, hdr.dst);
+        _lb.str(b" proto=");
+        _lb.dec(hdr.protocol as u64);
+        _lb.str(b" len=");
+        _lb.dec(payload_len as u64);
+        _lb.putc(b'\n');
+    });
+}
+
+fn bootstrap_network_config() {
+    net::config::init(mac_addr());
+
+    besalt::uinfo!(|_lb| {
+        _lb.str(b"[netsrv] DHCP bootstrap starting\n");
+    });
+
+    let start_ns = net::dns::clock_monotonic_ns();
+    let mut dhcp_started = false;
+
+    if net::dhcp::start() {
+        dhcp_started = true;
+        loop {
+            process_rx_from_shm();
+            net::dhcp::process();
+            if net::dhcp::is_bound() || net::dhcp::is_finished() {
+                break;
+            }
+            if net::dns::clock_monotonic_ns().saturating_sub(start_ns) >= DHCP_BOOTSTRAP_TIMEOUT_NS {
+                break;
+            }
+            let _ = besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        }
+    }
+
+    if net::dhcp::is_bound() {
+        log_network_config(b"[netsrv] DHCP configured");
+    } else {
+        if dhcp_started && net::dhcp::is_finished() {
+            let _ = net::dhcp::start();
+        }
+        besalt::uwarn!(|_lb| {
+            _lb.str(b"[netsrv] DHCP bootstrap incomplete, continuing without a fallback config\n");
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -232,8 +396,8 @@ fn setup_shm() -> bool {
         *hdr.add(1) = 0; // rx_tail
         *hdr.add(2) = 0; // tx_head
         *hdr.add(3) = 0; // tx_tail
-        *hdr.add(4) = 32; // rx_slot_count
-        *hdr.add(5) = 32; // tx_slot_count
+        *hdr.add(4) = SHM_RX_SLOT_COUNT as u32;
+        *hdr.add(5) = SHM_TX_SLOT_COUNT as u32;
     }
 
     besalt::uinfo!(|_lb| {
@@ -399,33 +563,47 @@ fn register_nameserv() {
 
 /// Dispatch a received Ethernet frame through the protocol stack.
 fn process_packet(data: &[u8]) {
+    let our_ip = net::proto::ipv4::our_ip();
     if let Some((eth_hdr, payload)) = net::ethernet::parse(data) {
         match eth_hdr.ethertype {
             net::ethernet::ETHERTYPE_ARP => {
-                net::arp::handle_packet(&mac_addr(), net::ipv4::OUR_IP, payload);
+                net::proto::arp::handle_packet(&mac_addr(), our_ip, payload);
             }
             net::ethernet::ETHERTYPE_IPV4 => {
-                if let Some((ip_hdr, ip_payload)) = net::ipv4::parse(payload) {
+                if let Some((ip_hdr, ip_payload)) = net::proto::ipv4::parse(payload) {
+                    unsafe {
+                        if *(&raw const LOGGED_IPV4_PACKETS) < 8 {
+                            *(&raw mut LOGGED_IPV4_PACKETS) += 1;
+                            log_ipv4_packet(&ip_hdr, ip_payload.len());
+                        }
+                    }
+                    // Deliver to raw sockets first (fans out by protocol)
+                    net::socket::raw_ipv4::deliver(&ip_hdr, ip_payload);
+
                     match ip_hdr.protocol {
-                        net::ipv4::PROTO_ICMP => {
-                            net::icmp::handle(
-                                &mac_addr(),
-                                net::ipv4::OUR_IP,
-                                &ip_hdr,
-                                ip_payload,
-                            );
+                        net::proto::ipv4::PROTO_ICMP => {
+                            net::proto::icmp::handle(&mac_addr(), our_ip, &ip_hdr, ip_payload);
                         }
-                        net::ipv4::PROTO_TCP => {
-                            net::tcp::handle_segment(&ip_hdr, ip_payload);
+                        net::proto::ipv4::PROTO_TCP => {
+                            net::socket::tcp::handle_segment(&ip_hdr, ip_payload);
                         }
-                        net::ipv4::PROTO_UDP => {
-                            net::udp::handle_datagram(&ip_hdr, ip_payload);
+                        net::proto::ipv4::PROTO_UDP => {
+                            net::socket::udp::handle_datagram(&ip_hdr, ip_payload);
                         }
                         _ => {}
                     }
                 }
             }
-            _ => {}
+            _ => unsafe {
+                if !*(&raw const LOGGED_UNKNOWN_ETHERTYPE) {
+                    *(&raw mut LOGGED_UNKNOWN_ETHERTYPE) = true;
+                    besalt::udebug!(|_lb| {
+                        _lb.str(b"[netsrv] unhandled ethertype=");
+                        _lb.hex(eth_hdr.ethertype as u64);
+                        _lb.putc(b'\n');
+                    });
+                }
+            },
         }
     }
 }
@@ -434,20 +612,25 @@ fn process_packet(data: &[u8]) {
 pub(crate) fn process_rx_from_shm() {
     let mut frame_buf = [0u8; 2048];
     while let Some(len) = shm_rx_dequeue(&mut frame_buf) {
+        unsafe {
+            if !*(&raw const LOGGED_RX_FRAME) {
+                *(&raw mut LOGGED_RX_FRAME) = true;
+                log_frame_once(&frame_buf[..len]);
+            }
+        }
+        net::config::note_rx(len);
         process_packet(&frame_buf[..len]);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Self-test: ARP + ICMP ping
+// Self-test: gateway ARP
 // ---------------------------------------------------------------------------
 
 /// Non-blocking self-test state machine, called from the event loop.
 ///
-/// Phase 0: waiting for ARP reply for gateway → on success, send ICMP echo,
-///          advance to phase 1.
-/// Phase 1: waiting for ICMP echo reply → on success, log and advance to
-///          phase 2 (done).
+/// Phase 0: waiting for ARP reply for gateway.
+/// Phase 1+: done.
 /// Each phase times out after 200 ticks.
 fn check_self_test() {
     // SAFETY: Single-threaded server; globals written only here.
@@ -460,24 +643,20 @@ fn check_self_test() {
 
     match phase {
         0 => {
-            if net::arp::lookup(net::ipv4::GATEWAY_IP).is_some() {
+            let gateway = net::proto::ipv4::gateway_ip();
+            if gateway == 0 || net::proto::ipv4::our_ip() == 0 {
+                unsafe {
+                    *(&raw mut SELF_TEST_PHASE) = 2;
+                }
+                return;
+            }
+
+            if net::proto::arp::lookup(gateway).is_some() {
                 besalt::udebug!(|_lb| {
                     _lb.str(b"[netsrv] ARP reply received for gateway\n");
                 });
-                besalt::udebug!(|_lb| {
-                    _lb.str(b"[netsrv] Sending ICMP echo to 10.0.2.2 seq=1\n");
-                });
-                net::icmp::reset_echo_reply_flag();
-                net::icmp::send_echo_request(
-                    &mac_addr(),
-                    net::ipv4::OUR_IP,
-                    net::ipv4::GATEWAY_IP,
-                    1,
-                );
-                // SAFETY: Single-threaded server.
                 unsafe {
-                    *(&raw mut SELF_TEST_PHASE) = 1;
-                    *(&raw mut SELF_TEST_TICKS) = 0;
+                    *(&raw mut SELF_TEST_PHASE) = 2;
                 }
             } else {
                 // SAFETY: Single-threaded server.
@@ -495,32 +674,27 @@ fn check_self_test() {
                 }
             }
         }
-        1 => {
-            if net::icmp::echo_reply_received() {
-                besalt::udebug!(|_lb| {
-                    _lb.str(b"[netsrv] ICMP echo reply received\n");
-                });
-                // SAFETY: Single-threaded server.
-                unsafe {
-                    *(&raw mut SELF_TEST_PHASE) = 2;
-                }
-            } else {
-                // SAFETY: Single-threaded server.
-                unsafe {
-                    *(&raw mut SELF_TEST_TICKS) = ticks + 1;
-                }
-                if ticks + 1 >= 200 {
-                    besalt::uwarn!(|_lb| {
-                        _lb.str(b"[netsrv] ICMP echo reply timeout\n");
-                    });
-                    // SAFETY: Single-threaded server.
-                    unsafe {
-                        *(&raw mut SELF_TEST_PHASE) = 2;
-                    }
-                }
-            }
-        }
         _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Socket kind routing
+// ---------------------------------------------------------------------------
+
+enum SocketKind {
+    Tcp,
+    Udp,
+    Raw,
+}
+
+fn socket_kind(conn_id: u32) -> SocketKind {
+    if conn_id >= 2000 {
+        SocketKind::Raw
+    } else if conn_id >= 1000 {
+        SocketKind::Udp
+    } else {
+        SocketKind::Tcp
     }
 }
 
@@ -532,62 +706,112 @@ fn check_self_test() {
 ///
 /// All operations return immediately: synchronous operations fill `reply`
 /// with the result; asynchronous operations (connect, recv, accept) return
-/// `BESALT_PENDING` and the TCP/UDP state machine will push a completion
+/// `BESALT_PENDING` and the TCP/UDP/raw state machine will push a completion
 /// later (delivered to VFS via the callback endpoint).
 ///
 /// Returns `true` if the reply is deferred (DNS async): the caller's reply
 /// cap has been saved and will be replied to later via `drain_dns_completions`.
 fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
+    fn set_send_reply(reply: &mut BesaltMsg, sent: i32) {
+        if sent >= 0 {
+            reply.label = BESALT_OK;
+            reply.regs[0] = sent as u64;
+            reply.length = 1;
+        } else {
+            besalt::udebug!(|_lb| {
+                _lb.str(b"[netsrv] send failed label=");
+                _lb.dec((-sent) as u64);
+                _lb.putc(b'\n');
+            });
+            reply.label = (-sent) as u64;
+            reply.regs[0] = 0;
+            reply.length = 0;
+        }
+    }
+
     match msg.label {
         NET_REGISTER_VFS => {
-            // VFS registers its badged callback EP as an extra cap.
-            // The cap was placed in our receive slot (CAP_VFS_CALLBACK_EP)
-            // by the kernel during the IPC.
-            // SAFETY: Single-threaded; written once.
-            unsafe {
-                *(&raw mut VFS_REGISTERED) = true;
+            // VFS transfers a plain, IPC-transferable endpoint cap. Rebadge it
+            // locally so callbacks arrive with a distinctive badge on the VFS
+            // side without relying on label-based fallback routing.
+            let mint_err = invoke::cnode_mint(
+                CAP_SELF_CSPACE,
+                CAP_VFS_CALLBACK_EP,
+                CAP_SELF_CSPACE,
+                CAP_VFS_CALLBACK_BADGED_EP,
+                NETSRV_CALLBACK_BADGE,
+            );
+            if mint_err != 0 {
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[netsrv] failed to mint local callback alias err=");
+                    _lb.dec(mint_err as u64);
+                    _lb.putc(b'\n');
+                });
+                reply.label = BESALT_INVALID_OPERATION;
+            } else {
+                unsafe {
+                    *(&raw mut VFS_REGISTERED) = true;
+                }
+                besalt::uinfo!(|_lb| {
+                    _lb.str(b"[netsrv] VFS callback EP registered\n");
+                });
+                reply.label = BESALT_OK;
             }
-            besalt::uinfo!(|_lb| {
-                _lb.str(b"[netsrv] VFS callback EP registered\n");
-            });
-            reply.label = BESALT_OK;
         }
         NET_SOCKET => {
             let sock_type = msg.regs[0] as i32;
+            let protocol = msg.regs[1] as i32;
             let id = if sock_type == SOCK_STREAM {
-                net::tcp::tcp_socket()
+                net::socket::tcp::tcp_socket()
             } else if sock_type == SOCK_DGRAM {
-                net::udp::udp_socket()
+                net::socket::udp::udp_socket()
+            } else if sock_type == SOCK_RAW {
+                net::socket::raw_ipv4::raw_socket(protocol as u8)
             } else {
-                -1
+                -(BESALT_PROTO_NOT_SUPPORTED as i32)
             };
             if id >= 0 {
+                log_inet_ipc(b"socket", id as u32, 0, protocol as u16, 0);
                 reply.label = BESALT_OK;
                 reply.regs[0] = id as u64;
                 reply.length = 1;
             } else {
-                reply.label = BESALT_OUT_OF_MEMORY;
+                reply.label = if id == -(BESALT_PROTO_NOT_SUPPORTED as i32) {
+                    BESALT_PROTO_NOT_SUPPORTED
+                } else {
+                    BESALT_OUT_OF_MEMORY
+                };
             }
         }
         NET_CONNECT => {
             let conn_id = msg.regs[0] as u32;
             let ip = msg.regs[1] as u32;
             let port = msg.regs[2] as u16;
-            if conn_id >= 1000 {
-                // UDP connect: store default destination, always immediate
-                let result = net::udp::udp_connect(conn_id, ip, port);
-                reply.label = if result == 0 {
-                    BESALT_OK
-                } else {
-                    BESALT_INVALID_ARGUMENT
-                };
-            } else {
-                // TCP connect: sends SYN, returns -1 (pending)
-                let result = net::tcp::tcp_connect(conn_id, ip, port);
-                if result == -1 {
-                    reply.label = BESALT_PENDING;
-                } else {
-                    reply.label = BESALT_INVALID_ARGUMENT;
+            log_inet_ipc(b"connect", conn_id, ip, port, 0);
+            match socket_kind(conn_id) {
+                SocketKind::Raw => {
+                    let result = net::socket::raw_ipv4::raw_connect(conn_id, ip);
+                    reply.label = if result == 0 {
+                        BESALT_OK
+                    } else {
+                        BESALT_INVALID_ARGUMENT
+                    };
+                }
+                SocketKind::Udp => {
+                    let result = net::socket::udp::udp_connect(conn_id, ip, port);
+                    reply.label = if result == 0 {
+                        BESALT_OK
+                    } else {
+                        BESALT_INVALID_ARGUMENT
+                    };
+                }
+                SocketKind::Tcp => {
+                    let result = net::socket::tcp::tcp_connect(conn_id, ip, port);
+                    if result == -1 {
+                        reply.label = BESALT_PENDING;
+                    } else {
+                        reply.label = BESALT_INVALID_ARGUMENT;
+                    }
                 }
             }
         }
@@ -595,64 +819,94 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
             let conn_id = msg.regs[0] as u32;
             let ip = msg.regs[1] as u32;
             let port = msg.regs[2] as u16;
-            let result = if conn_id >= 1000 {
-                net::udp::udp_bind(conn_id, ip, port)
-            } else {
-                net::tcp::tcp_bind(conn_id, ip, port)
-            };
-            reply.label = if result == 0 {
-                BESALT_OK
-            } else {
-                BESALT_INVALID_ARGUMENT
-            };
+            match socket_kind(conn_id) {
+                SocketKind::Raw => {
+                    reply.label = BESALT_INVALID_OPERATION;
+                }
+                SocketKind::Udp => {
+                    let result = net::socket::udp::udp_bind(conn_id, ip, port);
+                    reply.label = if result == 0 {
+                        BESALT_OK
+                    } else {
+                        BESALT_INVALID_ARGUMENT
+                    };
+                }
+                SocketKind::Tcp => {
+                    let result = net::socket::tcp::tcp_bind(conn_id, ip, port);
+                    reply.label = if result == 0 {
+                        BESALT_OK
+                    } else {
+                        BESALT_INVALID_ARGUMENT
+                    };
+                }
+            }
         }
         NET_LISTEN => {
             let conn_id = msg.regs[0] as u32;
-            let backlog = msg.regs[1] as u8;
-            let result = net::tcp::tcp_listen(conn_id, backlog);
-            reply.label = if result == 0 {
-                BESALT_OK
-            } else {
-                BESALT_INVALID_ARGUMENT
-            };
+            match socket_kind(conn_id) {
+                SocketKind::Tcp => {
+                    let backlog = msg.regs[1] as u8;
+                    let result = net::socket::tcp::tcp_listen(conn_id, backlog);
+                    reply.label = if result == 0 {
+                        BESALT_OK
+                    } else {
+                        BESALT_INVALID_ARGUMENT
+                    };
+                }
+                _ => {
+                    reply.label = BESALT_INVALID_OPERATION;
+                }
+            }
         }
         NET_ACCEPT => {
             let conn_id = msg.regs[0] as u32;
-            let result = net::tcp::tcp_accept(conn_id);
-            if result == -1 {
-                // No pending connections -- tell VFS this is async
-                net::tcp::set_pending_accept(conn_id);
-                reply.label = BESALT_PENDING;
-            } else if result > 0 {
-                // Connection already in backlog, completed immediately
-                let new_cid = result as u32;
-                let (ip, port) = net::tcp::tcp_getpeername(new_cid);
-                reply.label = BESALT_OK;
-                reply.regs[0] = new_cid as u64;
-                reply.regs[1] = ip as u64;
-                reply.regs[2] = port as u64;
-                reply.length = 3;
-            } else {
-                reply.label = BESALT_INVALID_ARGUMENT;
+            match socket_kind(conn_id) {
+                SocketKind::Tcp => {
+                    let result = net::socket::tcp::tcp_accept(conn_id);
+                    if result == -1 {
+                        // No pending connections -- tell VFS this is async
+                        net::socket::tcp::set_pending_accept(conn_id);
+                        reply.label = BESALT_PENDING;
+                    } else if result > 0 {
+                        // Connection already in backlog, completed immediately
+                        let new_cid = result as u32;
+                        match net::socket::tcp::tcp_getpeername(new_cid) {
+                            Ok((ip, port)) => {
+                                reply.label = BESALT_OK;
+                                reply.regs[0] = new_cid as u64;
+                                reply.regs[1] = ip as u64;
+                                reply.regs[2] = port as u64;
+                                reply.length = 3;
+                            }
+                            Err(label) => {
+                                reply.label = label;
+                            }
+                        }
+                    } else {
+                        reply.label = BESALT_INVALID_ARGUMENT;
+                    }
+                }
+                _ => {
+                    reply.label = BESALT_INVALID_OPERATION;
+                }
             }
         }
         NET_SEND => {
             let conn_id = msg.regs[0] as u32;
             let len = msg.regs[1] as usize;
             let actual_len = core::cmp::min(len, 144);
+            log_inet_ipc(b"send", conn_id, 0, 0, actual_len);
             // SAFETY: Reading data bytes from IPC message register area.
             let data = unsafe {
                 let data_ptr = &msg.regs[2] as *const u64 as *const u8;
                 core::slice::from_raw_parts(data_ptr, actual_len)
             };
-            let sent = if conn_id >= 1000 {
-                net::udp::udp_send(conn_id, data)
-            } else {
-                net::tcp::tcp_send(conn_id, data)
+            let sent = match socket_kind(conn_id) {
+                SocketKind::Raw => net::socket::raw_ipv4::raw_send(conn_id, data),
+                SocketKind::Udp => net::socket::udp::udp_send(conn_id, data),
+                SocketKind::Tcp => net::socket::tcp::tcp_send(conn_id, data),
             };
-            reply.label = BESALT_OK;
-            reply.regs[0] = if sent >= 0 { sent as u64 } else { 0 };
-            reply.length = 1;
+            set_send_reply(reply, sent);
         }
         NET_RECV => {
             let conn_id = msg.regs[0] as u32;
@@ -663,17 +917,22 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
                 let dst = &raw mut reply.regs[1] as *mut u8;
                 core::slice::from_raw_parts_mut(dst, capped)
             };
-            let result = if conn_id >= 1000 {
-                net::udp::udp_recv(conn_id, buf)
-            } else {
-                net::tcp::tcp_recv(conn_id, buf)
+            let result = match socket_kind(conn_id) {
+                SocketKind::Raw => net::socket::raw_ipv4::raw_recv(conn_id, buf),
+                SocketKind::Udp => net::socket::udp::udp_recv(conn_id, buf),
+                SocketKind::Tcp => net::socket::tcp::tcp_recv(conn_id, buf),
             };
             if result == -1 {
-                // No data available -- tell VFS this is async
-                if conn_id >= 1000 {
-                    net::udp::set_pending_recv(conn_id, capped as u16);
-                } else {
-                    net::tcp::set_pending_recv(conn_id, capped as u16);
+                match socket_kind(conn_id) {
+                    SocketKind::Raw => {
+                        net::socket::raw_ipv4::set_pending_recv(conn_id, capped as u16);
+                    }
+                    SocketKind::Udp => {
+                        net::socket::udp::set_pending_recv(conn_id, capped as u16);
+                    }
+                    SocketKind::Tcp => {
+                        net::socket::tcp::set_pending_recv(conn_id, capped as u16);
+                    }
                 }
                 reply.label = BESALT_PENDING;
             } else {
@@ -688,58 +947,108 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
             let port = msg.regs[2] as u16;
             let len = msg.regs[3] as usize;
             let actual = core::cmp::min(len, 128);
+            log_inet_ipc(b"sendto", conn_id, ip, port, actual);
             // SAFETY: Reading data bytes from IPC message register area.
             let data = unsafe {
                 let data_ptr = &msg.regs[4] as *const u64 as *const u8;
                 core::slice::from_raw_parts(data_ptr, actual)
             };
-            let sent = net::udp::udp_sendto(conn_id, data, ip, port);
-            reply.label = BESALT_OK;
-            reply.regs[0] = if sent >= 0 { sent as u64 } else { 0 };
-            reply.length = 1;
+            let sent = match socket_kind(conn_id) {
+                SocketKind::Raw => net::socket::raw_ipv4::raw_sendto(conn_id, data, ip),
+                SocketKind::Udp => net::socket::udp::udp_sendto(conn_id, data, ip, port),
+                SocketKind::Tcp => net::socket::tcp::tcp_send(conn_id, data),
+            };
+            set_send_reply(reply, sent);
         }
         NET_RECVFROM => {
             let conn_id = msg.regs[0] as u32;
             let max_len = msg.regs[1] as u16;
-            let capped = core::cmp::min(max_len, 136) as usize;
+            let flags = if msg.length >= 3 {
+                msg.regs[2] as u32
+            } else {
+                INET_RECVMSG_WANT_ADDR
+            };
+            let want_timestamp = (flags & INET_RECVMSG_WANT_TIMESTAMP) != 0;
+            let capped = core::cmp::min(max_len, 128) as usize;
+            log_inet_ipc(b"recvfrom", conn_id, 0, 0, capped);
             // SAFETY: Writing data into reply register area.
             let buf = unsafe {
-                let dst = &raw mut reply.regs[3] as *mut u8;
+                let dst = &raw mut reply.regs[4] as *mut u8;
                 core::slice::from_raw_parts_mut(dst, capped)
             };
-            let (result, src_ip, src_port) = net::udp::udp_recvfrom(conn_id, buf);
-            if result == -1 {
-                net::udp::set_pending_recv(conn_id, capped as u16);
-                reply.label = BESALT_PENDING;
-            } else {
-                reply.label = BESALT_OK;
-                reply.regs[0] = result as u64;
-                reply.regs[1] = src_ip as u64;
-                reply.regs[2] = src_port as u64;
-                reply.length = 3 + ((result as u64 + 7) / 8);
+            match socket_kind(conn_id) {
+                SocketKind::Raw => {
+                    let (result, src_ip, src_port, timestamp_ns) =
+                        net::socket::raw_ipv4::raw_recvfrom(conn_id, buf, want_timestamp);
+                    if result == -1 {
+                        net::socket::raw_ipv4::set_pending_recvfrom(
+                            conn_id,
+                            capped as u16,
+                            flags,
+                        );
+                        reply.label = BESALT_PENDING;
+                    } else {
+                        let data_len = result as usize;
+                        reply.label = BESALT_OK;
+                        reply.regs[0] = result as u64;
+                        reply.regs[1] = src_ip as u64;
+                        reply.regs[2] = src_port as u64;
+                        reply.regs[3] = timestamp_ns;
+                        reply.length = 4 + (((result as u64) + 7) / 8);
+                        log_inet_recv_result(
+                            b"recvfrom",
+                            conn_id,
+                            src_ip,
+                            data_len,
+                            &buf[..data_len],
+                        );
+                    }
+                }
+                SocketKind::Udp => {
+                    let (result, src_ip, src_port, timestamp_ns) =
+                        net::socket::udp::udp_recvfrom(conn_id, buf, want_timestamp);
+                    if result == -1 {
+                        net::socket::udp::set_pending_recvfrom(conn_id, capped as u16, flags);
+                        reply.label = BESALT_PENDING;
+                    } else {
+                        reply.label = BESALT_OK;
+                        reply.regs[0] = result as u64;
+                        reply.regs[1] = src_ip as u64;
+                        reply.regs[2] = src_port as u64;
+                        reply.regs[3] = timestamp_ns;
+                        reply.length = 4 + ((result as u64 + 7) / 8);
+                    }
+                }
+                SocketKind::Tcp => {
+                    reply.label = BESALT_INVALID_OPERATION;
+                }
             }
         }
         NET_CLOSE => {
             let conn_id = msg.regs[0] as u32;
-            if conn_id >= 1000 {
-                net::udp::udp_close(conn_id);
-            } else {
-                net::tcp::tcp_close(conn_id);
+            match socket_kind(conn_id) {
+                SocketKind::Raw => { net::socket::raw_ipv4::raw_close(conn_id); }
+                SocketKind::Udp => { net::socket::udp::udp_close(conn_id); }
+                SocketKind::Tcp => { net::socket::tcp::tcp_close(conn_id); }
             }
             reply.label = BESALT_OK;
         }
         NET_SHUTDOWN => {
             let conn_id = msg.regs[0] as u32;
             let how = msg.regs[1] as i32;
-            net::tcp::tcp_shutdown(conn_id, how);
+            match socket_kind(conn_id) {
+                SocketKind::Raw => { net::socket::raw_ipv4::raw_close(conn_id); }
+                SocketKind::Udp => { net::socket::udp::udp_close(conn_id); }
+                SocketKind::Tcp => { net::socket::tcp::tcp_shutdown(conn_id, how); }
+            }
             reply.label = BESALT_OK;
         }
         NET_GETSOCKNAME => {
             let conn_id = msg.regs[0] as u32;
-            let (ip, port) = if conn_id >= 1000 {
-                net::udp::udp_getsockname(conn_id)
-            } else {
-                net::tcp::tcp_getsockname(conn_id)
+            let (ip, port) = match socket_kind(conn_id) {
+                SocketKind::Raw => net::socket::raw_ipv4::raw_getsockname(conn_id),
+                SocketKind::Udp => net::socket::udp::udp_getsockname(conn_id),
+                SocketKind::Tcp => net::socket::tcp::tcp_getsockname(conn_id),
             };
             reply.label = BESALT_OK;
             reply.regs[0] = ip as u64;
@@ -748,23 +1057,69 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
         }
         NET_GETPEERNAME => {
             let conn_id = msg.regs[0] as u32;
-            let (ip, port) = if conn_id >= 1000 {
-                net::udp::udp_getpeername(conn_id)
-            } else {
-                net::tcp::tcp_getpeername(conn_id)
+            let result = match socket_kind(conn_id) {
+                SocketKind::Raw => net::socket::raw_ipv4::raw_getpeername(conn_id),
+                SocketKind::Udp => net::socket::udp::udp_getpeername(conn_id),
+                SocketKind::Tcp => net::socket::tcp::tcp_getpeername(conn_id),
             };
-            reply.label = BESALT_OK;
-            reply.regs[0] = ip as u64;
-            reply.regs[1] = port as u64;
-            reply.length = 2;
+            match result {
+                Ok((ip, port)) => {
+                    reply.label = BESALT_OK;
+                    reply.regs[0] = ip as u64;
+                    reply.regs[1] = port as u64;
+                    reply.length = 2;
+                }
+                Err(label) => {
+                    reply.label = label;
+                }
+            }
+        }
+        NET_SETSOCKOPT => {
+            let conn_id = msg.regs[0] as u32;
+            let level = msg.regs[1] as i32;
+            let optname = msg.regs[2] as i32;
+            let optval = msg.regs[3];
+            let optlen = msg.regs[4] as u32;
+            reply.label = match socket_kind(conn_id) {
+                SocketKind::Raw => {
+                    net::socket::raw_ipv4::raw_setsockopt(conn_id, level, optname, optval, optlen)
+                }
+                SocketKind::Udp => {
+                    net::socket::udp::udp_setsockopt(conn_id, level, optname, optval, optlen)
+                }
+                SocketKind::Tcp => {
+                    net::socket::tcp::tcp_setsockopt(conn_id, level, optname, optval, optlen)
+                }
+            };
+        }
+        NET_GETSOCKOPT => {
+            let conn_id = msg.regs[0] as u32;
+            let level = msg.regs[1] as i32;
+            let optname = msg.regs[2] as i32;
+            let result = match socket_kind(conn_id) {
+                SocketKind::Raw => net::socket::raw_ipv4::raw_getsockopt(conn_id, level, optname),
+                SocketKind::Udp => net::socket::udp::udp_getsockopt(conn_id, level, optname),
+                SocketKind::Tcp => net::socket::tcp::tcp_getsockopt(conn_id, level, optname),
+            };
+            match result {
+                Ok((value, len)) => {
+                    reply.label = BESALT_OK;
+                    reply.regs[0] = value;
+                    reply.regs[1] = len as u64;
+                    reply.length = 2;
+                }
+                Err(label) => {
+                    reply.label = label;
+                }
+            }
         }
         NET_POLL_STATUS => {
             let conn_id = msg.regs[0] as u32;
             let events = msg.regs[1] as u16;
-            let revents = if conn_id >= 1000 {
-                net::udp::udp_poll_status(conn_id, events)
-            } else {
-                net::tcp::tcp_poll_status(conn_id, events)
+            let revents = match socket_kind(conn_id) {
+                SocketKind::Raw => net::socket::raw_ipv4::raw_poll_status(conn_id, events),
+                SocketKind::Udp => net::socket::udp::udp_poll_status(conn_id, events),
+                SocketKind::Tcp => net::socket::tcp::tcp_poll_status(conn_id, events),
             };
             reply.label = BESALT_OK;
             reply.regs[0] = revents as u64;
@@ -797,6 +1152,41 @@ fn dispatch_ipc(msg: &BesaltMsg, reply: &mut BesaltMsg) -> bool {
                 None => {
                     reply.label = BESALT_OUT_OF_MEMORY;
                 }
+            }
+        }
+        NET_GET_CONFIG => {
+            let cfg = net::config::snapshot();
+            reply.label = BESALT_OK;
+            reply.regs[0] = cfg.state as u64;
+            reply.regs[1] = cfg.our_ip as u64;
+            reply.regs[2] = cfg.subnet_mask as u64;
+            reply.regs[3] = cfg.gateway_ip as u64;
+            reply.regs[4] = cfg.dns_server as u64;
+            reply.regs[5] = cfg.rx_bytes;
+            reply.regs[6] = cfg.rx_packets;
+            reply.regs[7] = cfg.tx_bytes;
+            reply.regs[8] = cfg.tx_packets;
+            reply.length = 9;
+        }
+        NET_GET_ARP_ENTRY => {
+            let idx = msg.regs[0] as usize;
+            if idx >= 16 {
+                reply.label = BESALT_INVALID_ARGUMENT;
+            } else if let Some((ip, mac)) = net::proto::arp::entry(idx) {
+                reply.label = BESALT_OK;
+                reply.regs[0] = 1;
+                reply.regs[1] = ip as u64;
+                reply.regs[2] = ((mac[0] as u64) << 40)
+                    | ((mac[1] as u64) << 32)
+                    | ((mac[2] as u64) << 24)
+                    | ((mac[3] as u64) << 16)
+                    | ((mac[4] as u64) << 8)
+                    | (mac[5] as u64);
+                reply.length = 3;
+            } else {
+                reply.label = BESALT_OK;
+                reply.regs[0] = 0;
+                reply.length = 1;
             }
         }
         _ => {
@@ -875,9 +1265,19 @@ fn drain_dns_completions(ctx: *mut IpcContext) {
 /// `ctx` must be a valid IPC context. `msg` and `badge` must be valid pointers.
 unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut BesaltMsg, badge: *mut u64) {
     unsafe {
-        if net::dns::has_pending() {
+        if net::dns::has_pending() || net::dhcp::has_timer() {
             let now = net::dns::clock_monotonic_ns();
-            let deadline = net::dns::nearest_deadline_ns();
+            let dns_deadline = if net::dns::has_pending() {
+                net::dns::nearest_deadline_ns()
+            } else {
+                u64::MAX
+            };
+            let dhcp_deadline = if net::dhcp::has_timer() {
+                net::dhcp::nearest_deadline_ns()
+            } else {
+                u64::MAX
+            };
+            let deadline = core::cmp::min(dns_deadline, dhcp_deadline);
             if deadline <= now {
                 // Deadline already passed; skip recv and process immediately
                 *badge = 1;
@@ -923,7 +1323,8 @@ unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut BesaltMsg, badge: *mut u64) {
 ///   regs[3] = data_len / extra_conn_id (depends on op_type)
 ///   regs[4] = extra_ip / data start
 ///   regs[5] = extra_port
-///   regs[6..] = data bytes (for recv/recvfrom)
+///   regs[6] = timestamp_ns_or_none (recvfrom only)
+///   regs[7..] = data bytes (for recvfrom)
 fn notify_vfs_completion(
     conn_id: u32,
     result: u64,
@@ -933,13 +1334,20 @@ fn notify_vfs_completion(
     extra_conn_id: u32,
     extra_ip: u32,
     extra_port: u16,
+    timestamp_ns: u64,
 ) {
     // SAFETY: Single-threaded server; VFS_REGISTERED is set once.
     let registered = unsafe { *(&raw const VFS_REGISTERED) };
     if !registered {
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[netsrv] notify skip conn=");
+            _lb.dec(conn_id as u64);
+            _lb.str(b" op=");
+            _lb.dec(op_type as u64);
+            _lb.str(b" registered=0\n");
+        });
         return;
     }
-
     let mut msg = BesaltMsg::zeroed();
     msg.label = NET_COMPLETE;
     msg.regs[0] = conn_id as u64;
@@ -954,7 +1362,6 @@ fn notify_vfs_completion(
             let max_data = core::cmp::min(data_len, 128);
             msg.regs[3] = max_data as u64;
             if max_data > 0 {
-                // SAFETY: Writing data bytes into message register area.
                 unsafe {
                     let dst = &raw mut msg.regs[4] as *mut u8;
                     let mut i = 0;
@@ -973,14 +1380,15 @@ fn notify_vfs_completion(
             msg.length = 6;
         }
         INET_OP_RECVFROM => {
-            let max_data = core::cmp::min(data_len, 112);
+            let max_data = core::cmp::min(data_len, 104);
             msg.regs[3] = max_data as u64;
             msg.regs[4] = extra_ip as u64;
             msg.regs[5] = extra_port as u64;
+            msg.regs[6] = timestamp_ns;
             if max_data > 0 {
                 // SAFETY: Writing data bytes into message register area.
                 unsafe {
-                    let dst = &raw mut msg.regs[6] as *mut u8;
+                    let dst = &raw mut msg.regs[7] as *mut u8;
                     let mut i = 0;
                     while i < max_data {
                         *dst.add(i) = data[i];
@@ -988,7 +1396,7 @@ fn notify_vfs_completion(
                     }
                 }
             }
-            msg.length = 6 + ((max_data as u64 + 7) / 8);
+            msg.length = 7 + ((max_data as u64 + 7) / 8);
         }
         _ => {
             msg.length = 3;
@@ -996,24 +1404,46 @@ fn notify_vfs_completion(
     }
 
     let mut resp = BesaltMsg::zeroed();
-    // SAFETY: IPC context is valid; VFS callback EP is in slot 83.
-    unsafe {
+    // SAFETY: IPC context is valid; slot 84 holds the local badged alias.
+    let call_err = unsafe {
         ipc::call_ctx(
             ipc_ctx(),
-            CAP_VFS_CALLBACK_EP,
+            CAP_VFS_CALLBACK_BADGED_EP,
             &raw const msg,
             &raw mut resp,
-        );
-    }
+        )
+    };
+    besalt::udebug!(|_lb| {
+        _lb.str(b"[netsrv] notify conn=");
+        _lb.dec(conn_id as u64);
+        _lb.str(b" op=");
+        _lb.dec(op_type as u64);
+        _lb.str(b" len=");
+        _lb.dec(data_len as u64);
+        _lb.str(b" err=");
+        _lb.hex(call_err as u64);
+        _lb.str(b" resp=");
+        _lb.hex(resp.label);
+        _lb.putc(b'\n');
+    });
 }
 
-/// Drain all pending completions from TCP and UDP modules, delivering each
+/// Drain all pending completions from raw, TCP, and UDP modules, delivering each
 /// to VFS via the callback endpoint.
 ///
 /// Called after RX processing (when VFS is in its event loop, not blocked
 /// on a netsrv call) and after timer processing.
 fn drain_completion_queue() {
-    while let Some(c) = net::tcp::pop_completion() {
+    while let Some(c) = net::socket::raw_ipv4::pop_completion() {
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[netsrv] drain raw conn=");
+            _lb.dec(c.conn_id as u64);
+            _lb.str(b" op=");
+            _lb.dec(c.op_type as u64);
+            _lb.str(b" len=");
+            _lb.dec(c.data_len as u64);
+            _lb.putc(b'\n');
+        });
         notify_vfs_completion(
             c.conn_id,
             c.result,
@@ -1023,9 +1453,10 @@ fn drain_completion_queue() {
             c.extra_conn_id,
             c.extra_ip,
             c.extra_port,
+            c.timestamp_ns,
         );
     }
-    while let Some(c) = net::udp::pop_completion() {
+    while let Some(c) = net::socket::tcp::pop_completion() {
         notify_vfs_completion(
             c.conn_id,
             c.result,
@@ -1035,6 +1466,20 @@ fn drain_completion_queue() {
             c.extra_conn_id,
             c.extra_ip,
             c.extra_port,
+            besalt::consts::INET_RECV_TIMESTAMP_NONE,
+        );
+    }
+    while let Some(c) = net::socket::udp::pop_completion() {
+        notify_vfs_completion(
+            c.conn_id,
+            c.result,
+            c.op_type,
+            &c.data[..c.data_len],
+            c.data_len,
+            c.extra_conn_id,
+            c.extra_ip,
+            c.extra_port,
+            c.timestamp_ns,
         );
     }
 }
@@ -1059,8 +1504,8 @@ fn event_loop() -> ! {
     let mut msg = BesaltMsg::zeroed();
     let mut badge: u64 = 0;
 
-    // Set receive slot for VFS callback EP (slot 83).
-    // VFS sends its badged EP via NET_REGISTER_VFS with extra_caps=1.
+    // Set receive slot for the plain VFS callback EP (slot 83).
+    // We rebadge it locally into slot 84 after registration.
     // SAFETY: IPC context is valid.
     unsafe {
         ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_VFS_CALLBACK_EP, 0);
@@ -1074,18 +1519,22 @@ fn event_loop() -> ! {
 
     loop {
         if badge != 0 {
-            // Woken by bound notification: RX frames available from netdrv
+            // Woken by bound notification: RX/TX progress from netdrv.
+            // Retry queued IP packets on every notification so packets queued
+            // due to transient TX-ring pressure are not stranded waiting for
+            // an unrelated ARP reply.
             process_rx_from_shm();
-            check_self_test();
-            net::tcp::process_timers();
+            net::flush_pending_packets();
+            net::dhcp::process();
+            net::socket::tcp::process_timers();
             net::dns::process_pending();
             drain_completion_queue();
             drain_dns_completions(ctx);
+            check_self_test();
 
             // Wait for next event (with timeout if DNS queries are pending)
             msg = BesaltMsg::zeroed();
             badge = 0;
-            // SAFETY: IPC context is valid.
             unsafe {
                 do_recv(ctx, &raw mut msg, &raw mut badge);
             }
@@ -1093,24 +1542,32 @@ fn event_loop() -> ! {
             // IPC request on server endpoint
             let mut reply = BesaltMsg::zeroed();
             let deferred = dispatch_ipc(&msg, &mut reply);
-
-            msg = BesaltMsg::zeroed();
             badge = 0;
 
             if deferred {
-                // DNS deferred: reply cap was saved; just wait for next event
-                // SAFETY: IPC context is valid.
                 unsafe {
+                    msg = BesaltMsg::zeroed();
                     do_recv(ctx, &raw mut msg, &raw mut badge);
                 }
-            } else if net::dns::has_pending() {
-                // Non-deferred reply, but DNS is pending: split reply + recv
-                // so we can use a timed recv for DNS deadline tracking.
+            } else if net::dns::has_pending() || net::dhcp::has_timer() {
+                // Non-deferred reply, but timer-driven work is pending: split
+                // reply + recv so we can use a timed recv for DNS/DHCP deadlines.
                 // SAFETY: IPC context is valid; reply cap saved then sent.
                 unsafe {
-                    let _ = invoke::cnode_save_caller(CAP_SELF_CSPACE, CAP_REPLY_TEMP);
-                    ipc::send_ctx(ctx, CAP_REPLY_TEMP, &raw const reply);
-                    do_recv(ctx, &raw mut msg, &raw mut badge);
+                    let err = invoke::cnode_save_caller(CAP_SELF_CSPACE, CAP_REPLY_TEMP);
+                    if err == 0 {
+                        ipc::send_ctx(ctx, CAP_REPLY_TEMP, &raw const reply);
+                        msg = BesaltMsg::zeroed();
+                        do_recv(ctx, &raw mut msg, &raw mut badge);
+                    } else {
+                        ipc::reply_recv_ctx(
+                            ctx,
+                            CAP_SERVER_EP,
+                            &raw const reply,
+                            &raw mut msg,
+                            &raw mut badge,
+                        );
+                    }
                 }
             } else {
                 // Normal path: reply + recv atomically
@@ -1163,14 +1620,24 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         idle();
     }
 
-    // 4. Fire-and-forget ARP request for self-test (checked in event loop)
-    besalt::uinfo!(|_lb| {
-        _lb.str(b"[netsrv] IP: 10.0.2.15/24, GW: 10.0.2.2\n");
-    });
-    besalt::udebug!(|_lb| {
-        _lb.str(b"[netsrv] Self-test: ARP request for 10.0.2.2\n");
-    });
-    net::arp::request(&mac_addr(), net::ipv4::OUR_IP, net::ipv4::GATEWAY_IP);
+    // 4. Resolve initial network configuration via DHCP with a static fallback.
+    bootstrap_network_config();
+
+    // 4b. Fire-and-forget ARP request for the configured gateway.
+    if net::proto::ipv4::our_ip() != 0 && net::proto::ipv4::gateway_ip() != 0 {
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[netsrv] Self-test: ARP request for configured gateway\n");
+        });
+        net::proto::arp::request(
+            &mac_addr(),
+            net::proto::ipv4::our_ip(),
+            net::proto::ipv4::gateway_ip(),
+        );
+    } else {
+        unsafe {
+            *(&raw mut SELF_TEST_PHASE) = 2;
+        }
+    }
 
     // 5. Register with name service
     register_nameserv();

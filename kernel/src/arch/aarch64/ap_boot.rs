@@ -49,10 +49,12 @@ pub extern "C" fn ap_entry(cpu_id: usize) -> ! {
     crate::kinfo!(|_g| {
         _g.puts("[AP] Entry cpu_id=");
         _g.dec(cpu_id as u64);
+        _g.puts(" EL");
+        _g.dec(super::current_el());
         _g.putc(b'\n');
     });
 
-    // 1. Initialize per-CPU data (sets TPIDR_EL1 for this AP).
+    // 1. Initialize per-CPU data (sets the active host TPIDR for this AP).
     super::cpu::init_ap(cpu_id as u32);
 
     // 2. Initialize GIC redistributor + CPU interface for this AP.

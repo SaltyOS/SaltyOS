@@ -59,8 +59,14 @@
 #define PTE_KERNEL_RWX      (PTE_VALID | PTE_AF | PTE_SH_IS | PTE_ATTR_IDX(MAIR_IDX_NORMAL_WB) | PTE_AP_RW_EL1)
 #define PTE_DEVICE          (PTE_VALID | PTE_AF | PTE_SH_NS | PTE_ATTR_IDX(MAIR_IDX_DEVICE_nGnRnE) | PTE_AP_RW_EL1 | PTE_PXN | PTE_UXN)
 
-/* Kernel virtual base for higher-half mapping */
-#define KERNEL_VIRT_BASE    0xFFFF000000000000ULL
+/* Kernel virtual base for higher-half mapping.
+ *
+ * With TCR_EL1/EL2 configured for a 48-bit VA space (T0SZ/T1SZ = 16), the
+ * upper canonical range starts at 0xFFFF800000000000. 0xFFFF000000000000 is
+ * non-canonical for 48-bit translation and faults immediately on instruction
+ * fetch when Stage 3 branches to the relocated kernel entry.
+ */
+#define KERNEL_VIRT_BASE    0xFFFF800000000000ULL
 
 /* TCR_EL1 configuration for 48-bit VA, 4KB granule */
 #define TCR_T0SZ(n)         ((uint64_t)(n))         /* TTBR0 VA size = 64 - n */
@@ -82,6 +88,17 @@
     TCR_ORGN0_WB_WA | TCR_IRGN0_WB_WA | \
     TCR_ORGN1_WB_WA | TCR_IRGN1_WB_WA | \
     TCR_IPS_48BIT \
+)
+
+/* TCR_EL2 configuration for 48-bit VA, 4KB granule */
+#define TCR_EL2_PS_48BIT    (5ULL << 16)
+
+#define TCR_EL2_VALUE ( \
+    TCR_T0SZ(16) | \
+    TCR_TG0_4K | \
+    TCR_SH0_IS | \
+    TCR_ORGN0_WB_WA | TCR_IRGN0_WB_WA | \
+    TCR_EL2_PS_48BIT \
 )
 
 #endif /* BOOT_STAGE3_ARCH_AARCH64_PAGING_IMPL_H */

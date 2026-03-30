@@ -1,7 +1,6 @@
 //! Power State Coordination Interface (PSCI) for SMP and power management
 //!
-//! Implements PSCI calls via HVC (for QEMU virt platform). The conduit
-//! can be changed to SMC for bare-metal platforms via ACPI FADT in the future.
+//! Uses SMC for PSCI calls.
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
@@ -23,21 +22,45 @@ pub const PSCI_ALREADY_ON: i64 = -4;
 pub const PSCI_ON_PENDING: i64 = -5;
 pub const PSCI_INTERNAL_FAILURE: i64 = -6;
 
+/// Issue a PSCI call with 0 extra arguments (x0 = function ID).
+macro_rules! psci_call0 {
+    ($fn_id:expr) => {{
+        let result: i64;
+        // SAFETY: PSCI SMC call — standard firmware interface.
+        unsafe {
+            core::arch::asm!(
+                "smc #0",
+                inlateout("x0") $fn_id as u64 => result,
+                options(nomem, nostack),
+            );
+        }
+        result
+    }};
+}
+
+/// Issue a PSCI call with 3 extra arguments (x0-x3).
+macro_rules! psci_call3 {
+    ($fn_id:expr, $x1:expr, $x2:expr, $x3:expr) => {{
+        let result: i64;
+        // SAFETY: PSCI SMC call with arguments in x0-x3.
+        unsafe {
+            core::arch::asm!(
+                "smc #0",
+                inlateout("x0") $fn_id as u64 => result,
+                in("x1") $x1, in("x2") $x2, in("x3") $x3,
+                options(nomem, nostack),
+            );
+        }
+        result
+    }};
+}
+
 /// Query PSCI version.
 ///
 /// Returns the version as a 32-bit value (major in bits 31:16, minor in 15:0),
 /// or a negative error code.
 pub fn version() -> i64 {
-    let result: i64;
-    // SAFETY: HVC with PSCI_VERSION is a read-only query with no side effects.
-    unsafe {
-        core::arch::asm!(
-            "hvc #0",
-            inlateout("x0") PSCI_VERSION as u64 => result,
-            options(nomem, nostack),
-        );
-    }
-    result
+    psci_call0!(PSCI_VERSION)
 }
 
 /// Start an application processor via PSCI CPU_ON (SMC64).
@@ -48,38 +71,14 @@ pub fn version() -> i64 {
 ///
 /// Returns `PSCI_SUCCESS` (0) on success, or a negative error code.
 pub fn cpu_on(target_cpu: u64, entry_point: u64, context_id: u64) -> i64 {
-    let result: i64;
-    // SAFETY: PSCI CPU_ON is the standard mechanism for bringing up
-    // secondary cores. The entry_point must be a valid physical address
-    // with executable code. The caller is responsible for ensuring this.
-    unsafe {
-        core::arch::asm!(
-            "hvc #0",
-            inlateout("x0") PSCI_CPU_ON_64 as u64 => result,
-            in("x1") target_cpu,
-            in("x2") entry_point,
-            in("x3") context_id,
-            options(nomem, nostack),
-        );
-    }
-    result
+    psci_call3!(PSCI_CPU_ON_64, target_cpu, entry_point, context_id)
 }
 
 /// Turn off the calling CPU. Does not return on success.
 ///
 /// Returns a negative error code only on failure.
 pub fn cpu_off() -> i64 {
-    let result: i64;
-    // SAFETY: PSCI CPU_OFF powers down the calling core. On success it
-    // never returns. On failure, the return value indicates the error.
-    unsafe {
-        core::arch::asm!(
-            "hvc #0",
-            inlateout("x0") PSCI_CPU_OFF as u64 => result,
-            options(nomem, nostack),
-        );
-    }
-    result
+    psci_call0!(PSCI_CPU_OFF)
 }
 
 /// Shut down the entire system. Does not return.
@@ -87,7 +86,7 @@ pub fn system_off() -> ! {
     // SAFETY: PSCI SYSTEM_OFF powers down the entire system and never returns.
     unsafe {
         core::arch::asm!(
-            "hvc #0",
+            ".inst 0xD4000003", // smc #0
             in("x0") PSCI_SYSTEM_OFF as u64,
             options(noreturn, nomem, nostack),
         );
@@ -99,7 +98,7 @@ pub fn system_reset() -> ! {
     // SAFETY: PSCI SYSTEM_RESET resets the system and never returns.
     unsafe {
         core::arch::asm!(
-            "hvc #0",
+            ".inst 0xD4000003", // smc #0
             in("x0") PSCI_SYSTEM_RESET as u64,
             options(noreturn, nomem, nostack),
         );

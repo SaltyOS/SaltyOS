@@ -1,0 +1,29 @@
+[port]
+name = bzip2
+version = 1.0.8
+description = bzip2 compression library and utilities
+homepage = https://sourceware.org/bzip2/
+license = BSD
+
+[source]
+url = https://sourceware.org/pub/bzip2/bzip2-${version}.tar.gz
+subdir = bzip2-${version}
+sha256 = ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269
+
+[build]
+type = make
+
+[prepare]
+sed -i.bak \
+    -e 's/^CC=.*/CC?=cc/' \
+    -e 's/^AR=.*/AR?=ar/' \
+    -e 's/^RANLIB=.*/RANLIB?=ranlib/' \
+    -e 's/^CFLAGS=.*/CFLAGS?=-Wall -Winline -O2 $(BIGFILES)/' \
+    -e '/^all:/s/test//' \
+    ${SRCDIR}/Makefile
+
+[install]
+libbz2.a = libbz2.a
+bin/bzip2 = bzip2
+bin/bunzip2 = bzip2
+bin/bzcat = bzip2

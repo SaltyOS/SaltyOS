@@ -345,9 +345,86 @@ pub(crate) unsafe fn handle_ioctl(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
         }
 
         let fde = *(*cli).fds.add(fd as usize);
+        if fde.fd_type == FD_TYPE_INET_SOCKET {
+            besalt::udebug!(|_lb| {
+                _lb.str(b"[VFS] inet ioctl fd=");
+                _lb.dec(fd as u64);
+                _lb.str(b" req=");
+                _lb.hex(request);
+                _lb.putc(b'\n');
+            });
+        }
+
+        fn is_net_ioctl(request: u64) -> bool {
+            matches!(
+                request,
+                0x8910 | 0x8912 | 0x8913 | 0x8915 | 0x8919 | 0x891B | 0x8933
+            )
+        }
 
         if fde.fd_type == FD_TYPE_DEVICE && fde.dev_type == DEV_FB0 {
             handle_ioctl_fb0(request, reply);
+            return;
+        }
+
+        if fde.fd_type == FD_TYPE_INET_SOCKET && is_net_ioctl(request) {
+            let mut nreq = BesaltMsg::zeroed();
+            let mut nreply = BesaltMsg::zeroed();
+            nreq.label = NET_GET_CONFIG;
+            let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const nreq, &raw mut nreply);
+            if err != 0 || nreply.label != BESALT_OK {
+                (*reply).label = BESALT_INVALID_OPERATION;
+                return;
+            }
+
+            let our_ip = nreply.regs[1] as u32;
+            let subnet_mask = nreply.regs[2] as u32;
+            let flags = if our_ip != 0 {
+                0x1u64 | 0x2u64 | 0x40u64 | 0x1000u64
+            } else {
+                0
+            };
+
+            (*reply).label = BESALT_OK;
+            match request {
+                0x8910 => {
+                    (*reply).length = 1;
+                    (*reply).regs[0] = 1;
+                }
+                0x8912 => {
+                    (*reply).length = 1;
+                    (*reply).regs[0] = our_ip as u64;
+                }
+                0x8913 => {
+                    (*reply).length = 1;
+                    (*reply).regs[0] = flags;
+                }
+                0x8915 => {
+                    (*reply).length = 1;
+                    (*reply).regs[0] = our_ip as u64;
+                }
+                0x8919 => {
+                    let broadcast = if our_ip != 0 && subnet_mask != 0 {
+                        ((our_ip & subnet_mask) | !subnet_mask) as u64
+                    } else {
+                        0
+                    };
+                    (*reply).length = 1;
+                    (*reply).regs[0] = broadcast;
+                }
+                0x891B => {
+                    (*reply).length = 1;
+                    (*reply).regs[0] = subnet_mask as u64;
+                }
+                0x8933 => {
+                    (*reply).length = 1;
+                    (*reply).regs[0] = 1;
+                }
+                _ => {
+                    (*reply).label = BESALT_INVALID_OPERATION;
+                }
+            }
+            let _ = arg;
             return;
         }
 
@@ -624,6 +701,16 @@ pub(crate) unsafe fn handle_fcntl(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
         {
             (*reply).label = BESALT_INVALID_ARGUMENT;
             return;
+        }
+
+        if (*(*cli).fds.add(fd as usize)).fd_type == FD_TYPE_INET_SOCKET {
+            besalt::udebug!(|_lb| {
+                _lb.str(b"[VFS] inet fcntl fd=");
+                _lb.dec(fd as u64);
+                _lb.str(b" cmd=");
+                _lb.dec(cmd as u64);
+                _lb.putc(b'\n');
+            });
         }
 
         match cmd {

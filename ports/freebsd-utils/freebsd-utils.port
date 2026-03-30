@@ -13,8 +13,16 @@ sha256 = SKIP
 [build]
 type = targets
 
+[depends]
+build = zlib, bzip2, xz, zstd, openssl
+
 [env]
 EXTRA_CFLAGS = -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers -Wno-missing-braces -Wno-gnu-designator -Wno-#warnings -D__FreeBSD_version=1402000 -DBOOTSTRAP_CAT -DNO_UDOM_SUPPORT -DWITHOUT_NLS
+EXTRA_LIBS = -L${PORTDIR}/../zlib/stage -L${PORTDIR}/../bzip2/stage -L${PORTDIR}/../xz/stage -L${PORTDIR}/../zstd/stage -L${PORTDIR}/../openssl/stage -lz -lbz2 -llzma -lzstd
+
+[libs]
+archive = contrib/libarchive/libarchive/*.c :: -Icontrib/libarchive/libarchive -DPLATFORM_CONFIG_H=\"${PORTDIR}/config_saltyos_libarchive.h\" -I${PORTDIR}/../zlib/${ARCH_WORK}/zlib-1.3.1 -I${PORTDIR}/../zlib/${ARCH_WORK}/zlib-1.3.1/_build -I${PORTDIR}/../bzip2/${ARCH_WORK}/bzip2-1.0.8 -I${PORTDIR}/../xz/${ARCH_WORK}/xz-5.6.3/src/liblzma/api -I${PORTDIR}/../zstd/${ARCH_WORK}/zstd-1.5.6/lib
+fetch = lib/libfetch/common.c lib/libfetch/fetch.c lib/libfetch/file.c lib/libfetch/ftp.c lib/libfetch/http.c :: -Ilib/libfetch -DWITH_SSL -DOPENSSL_API_COMPAT=0x10100000L -DINET -I${PORTDIR}/../openssl/${ARCH_WORK}/openssl-3.4.1/include
 
 [targets.cflags]
 -I${SRCDIR} -I${SRCDIR}/include -I${SRCDIR}/lib/libc/include
@@ -57,10 +65,34 @@ cut      = usr.bin/cut/cut.c
 touch    = usr.bin/touch/touch.c
 date     = bin/date/date.c bin/date/vary.c :: -Ibin/date
 find     = usr.bin/find/find.c usr.bin/find/function.c usr.bin/find/ls.c usr.bin/find/main.c usr.bin/find/misc.c usr.bin/find/operator.c usr.bin/find/option.c :: -Iusr.bin/find
+sed      = usr.bin/sed/compile.c usr.bin/sed/main.c usr.bin/sed/misc.c usr.bin/sed/process.c :: -Iusr.bin/sed
+awk      = contrib/one-true-awk/b.c contrib/one-true-awk/lex.c contrib/one-true-awk/lib.c contrib/one-true-awk/main.c contrib/one-true-awk/parse.c contrib/one-true-awk/proctab.c contrib/one-true-awk/run.c contrib/one-true-awk/tran.c contrib/one-true-awk/awkgram.tab.c :: -Icontrib/one-true-awk -DHAS_ISBLANK -DFOPEN_MAX=64
+diff     = usr.bin/diff/diff.c usr.bin/diff/diffdir.c usr.bin/diff/diffreg.c usr.bin/diff/xmalloc.c usr.bin/diff/pr.c :: -Iusr.bin/diff -include unistd.h
+patch    = usr.bin/patch/backupfile.c usr.bin/patch/inp.c usr.bin/patch/mkpath.c usr.bin/patch/patch.c usr.bin/patch/pch.c usr.bin/patch/util.c :: -Iusr.bin/patch
+gzip     = usr.bin/gzip/gzip.c :: -Iusr.bin/gzip -I${PORTDIR}/../zlib/${ARCH_WORK}/zlib-1.3.1 -I${PORTDIR}/../zlib/${ARCH_WORK}/zlib-1.3.1/_build -I${PORTDIR}/../bzip2/${ARCH_WORK}/bzip2-1.0.8 -I${PORTDIR}/../xz/${ARCH_WORK}/xz-5.6.3/src/liblzma/api -I${PORTDIR}/../zstd/${ARCH_WORK}/zstd-1.5.6/lib
+m4       = usr.bin/m4/eval.c usr.bin/m4/expr.c usr.bin/m4/gnum4.c usr.bin/m4/look.c usr.bin/m4/main.c usr.bin/m4/misc.c usr.bin/m4/trace.c usr.bin/m4/parser.c usr.bin/m4/tokenizer.c lib/libopenbsd/ohash.c :: -Iusr.bin/m4 -Ilib/libopenbsd -DEXTENDED -include stdlib.h -include unistd.h
+tar      = contrib/libarchive/tar/bsdtar.c contrib/libarchive/tar/cmdline.c contrib/libarchive/tar/creation_set.c contrib/libarchive/tar/read.c contrib/libarchive/tar/subst.c contrib/libarchive/tar/util.c contrib/libarchive/tar/write.c contrib/libarchive/libarchive_fe/err.c contrib/libarchive/libarchive_fe/line_reader.c contrib/libarchive/libarchive_fe/passphrase.c :: -Icontrib/libarchive/tar -Icontrib/libarchive/libarchive -Icontrib/libarchive/libarchive_fe -DPLATFORM_CONFIG_H=\"${PORTDIR}/config_saltyos_libarchive.h\" -DBSDTAR_VERSION_STRING=\"3.7.4\" -larchive
+ping     = sbin/ping/main.c sbin/ping/ping.c sbin/ping/utils.c :: -Isbin/ping -DINET -include unistd.h
+fetch    = usr.bin/fetch/fetch.c :: -Iusr.bin/fetch -Ilib/libfetch -DWITH_SSL -DOPENSSL_API_COMPAT=0x10100000L -I${PORTDIR}/../openssl/${ARCH_WORK}/openssl-3.4.1/include -lfetch -lssl -lcrypto
 
 [prepare]
 ln -sfn ${MACHINE}/include ${SRCDIR}/sys/machine
 ln -sfn sys/x86/include ${SRCDIR}/x86
+# Generate awk grammar and proctab on host
+cd ${SRCDIR}/contrib/one-true-awk
+yacc -d awkgram.y
+mv y.tab.h awkgram.tab.h
+mv y.tab.c awkgram.tab.c
+cc -o maketab maketab.c
+./maketab awkgram.tab.h > proctab.c
+# Generate m4 parser and tokenizer on host
+cd ${SRCDIR}/usr.bin/m4
+yacc -d -o parser.c parser.y
+lex -t tokenizer.l > tokenizer.c
+# Generate libfetch error headers
+cd ${SRCDIR}/lib/libfetch
+awk 'BEGIN { print "static struct fetcherr ftp_errlist[] = {" } /^[0-9]/ { printf "\t{ %s, FETCH_%s, \"%s\" },\n", $1, $2, substr($0, index($0,$3)) } END { print "\t{ -1, FETCH_OK, \"\" }\n};" }' ftp.errors > ftperr.h
+awk 'BEGIN { print "static struct fetcherr http_errlist[] = {" } /^[0-9]/ { printf "\t{ %s, FETCH_%s, \"%s\" },\n", $1, $2, substr($0, index($0,$3)) } END { print "\t{ -1, FETCH_OK, \"\" }\n};" }' http.errors > httperr.h
 
 [install]
 bin/echo = echo
@@ -100,3 +132,14 @@ usr/bin/cut = cut
 usr/bin/stat = stat
 # stat dispatches on argv[0]: behaves as readlink when called as readlink
 usr/bin/readlink = stat
+usr/bin/sed = sed
+usr/bin/awk = awk
+usr/bin/diff = diff
+usr/bin/patch = patch
+usr/bin/gzip = gzip
+usr/bin/gunzip = gzip
+usr/bin/zcat = gzip
+usr/bin/m4 = m4
+usr/bin/tar = tar
+sbin/ping = ping
+usr/bin/fetch = fetch

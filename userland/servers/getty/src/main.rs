@@ -80,8 +80,24 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             b"-i\0".as_ptr(),
             core::ptr::null(),
         ];
+        let mut path_buf = [0u8; 48];
+        let prefix = b"PATH=";
+        let path_val = besalt::DEFAULT_PATH;
+        let mut i = 0usize;
+        while i < prefix.len() {
+            path_buf[i] = prefix[i];
+            i += 1;
+        }
+        let mut j = 0usize;
+        while j < path_val.len() && i < path_buf.len() - 1 {
+            path_buf[i] = path_val[j];
+            i += 1;
+            j += 1;
+        }
+        path_buf[i] = 0;
+
         let new_envp: [*const u8; 7] = [
-            b"PATH=/bin:/usr/bin\0".as_ptr(),
+            path_buf.as_ptr(),
             b"HOME=/\0".as_ptr(),
             b"TERM=vt100\0".as_ptr(),
             b"SHELL=/bin/sh\0".as_ptr(),

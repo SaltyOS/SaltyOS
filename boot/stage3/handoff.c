@@ -30,6 +30,7 @@ struct BootInfoHeader *handoff_build_bootinfo(
     void *buffer,
     size_t buffer_size,
     struct Stage2Info *stage2_info,
+    uint32_t extra_flags,
     struct ElfLoadResult *kernel,
     uint64_t initrd_addr,
     uint64_t initrd_size,
@@ -52,6 +53,7 @@ struct BootInfoHeader *handoff_build_bootinfo(
         builder.hdr->flags |= BOOTINFO_FLAG_UEFI_BOOT;
     if (stage2_info->framebuffer_addr != 0)
         builder.hdr->flags |= BOOTINFO_FLAG_HAS_FB;
+    builder.hdr->flags |= extra_flags;
 
     /* Add memory map */
     if (stage2_info->memmap_addr && stage2_info->memmap_count > 0) {
@@ -202,7 +204,7 @@ struct BootInfoHeader *handoff_build_bootinfo(
     }
 
     /* Add kernel image info */
-    struct BootInfoKernelImage kernel_info = {
+    struct BootInfoKernelImage kernel_info __attribute__((aligned(8))) = {
         .phys_base = kernel->phys_base,
         .virt_base = kernel->virt_base,
         .size = kernel->mem_size,
@@ -213,7 +215,7 @@ struct BootInfoHeader *handoff_build_bootinfo(
 
     /* Add initrd if present */
     if (initrd_addr != 0 && initrd_size != 0) {
-        struct BootInfoInitrd initrd_info = {
+        struct BootInfoInitrd initrd_info __attribute__((aligned(8))) = {
             .phys_addr = initrd_addr,
             .size = initrd_size,
         };
@@ -228,7 +230,7 @@ struct BootInfoHeader *handoff_build_bootinfo(
          * otherwise fall back to BGR888 (common VGA/VBE default).
          */
         bool has_pixel_fmt = stage2_info->fb_red_size != 0;
-        struct BootInfoFramebuffer fb_info = {
+        struct BootInfoFramebuffer fb_info __attribute__((aligned(8))) = {
             .phys_addr = stage2_info->framebuffer_addr,
             .width = stage2_info->framebuffer_width,
             .height = stage2_info->framebuffer_height,
@@ -247,27 +249,25 @@ struct BootInfoHeader *handoff_build_bootinfo(
 
     /* Add ACPI RSDP if present */
     if (stage2_info->rsdp_addr != 0) {
-        struct BootInfoACPI acpi_info = {
-            .rsdp_addr = stage2_info->rsdp_addr,
-            .revision = stage2_info->acpi_revision,
-        };
+        uint8_t acpi_info[sizeof(struct BootInfoACPI)] __attribute__((aligned(8))) = {0};
+        memcpy(acpi_info, &stage2_info->rsdp_addr, sizeof(stage2_info->rsdp_addr));
+        acpi_info[sizeof(uint64_t)] = stage2_info->acpi_revision;
         bootinfo_builder_add_tlv(&builder, TLV_ACPI_RSDP,
                                  &acpi_info, sizeof(acpi_info));
     }
 
     /* Add SMBIOS if present */
     if (stage2_info->smbios_addr != 0) {
-        struct BootInfoSMBIOS smbios_info = {
-            .entry_point = stage2_info->smbios_addr,
-            .major_version = stage2_info->smbios_major,
-            .minor_version = stage2_info->smbios_minor,
-        };
+        uint8_t smbios_info[sizeof(struct BootInfoSMBIOS)] __attribute__((aligned(8))) = {0};
+        memcpy(smbios_info, &stage2_info->smbios_addr, sizeof(stage2_info->smbios_addr));
+        smbios_info[sizeof(uint64_t)] = stage2_info->smbios_major;
+        smbios_info[sizeof(uint64_t) + 1] = stage2_info->smbios_minor;
         bootinfo_builder_add_tlv(&builder, TLV_SMBIOS,
                                  &smbios_info, sizeof(smbios_info));
     }
 
     /* Add bootloader info */
-    struct BootInfoLoader loader_info = {
+    struct BootInfoLoader loader_info __attribute__((aligned(8))) = {
         .name = "SaltyOS Boot",
         .version_major = 1,
         .version_minor = 0,

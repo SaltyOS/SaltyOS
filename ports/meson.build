@@ -7,7 +7,7 @@
 #
 # Two-pass approach:
 #   Pass 1: discover ports, parse [depends] build deps
-#   Pass 2: create custom_targets, resolving deps to target objects
+#   Pass 2: topological sort, then create custom_targets with resolved deps
 
 fs_mod = import('fs')
 
@@ -60,20 +60,39 @@ foreach pname : port_names
   set_variable('_port_deps_' + pname.underscorify(), _build_deps)
 endforeach
 
-# Pass 2: create targets in dependency order.
-# Build ordered list: ports without deps first, then ports with deps.
-# This ensures dependencies are available when dependents are processed.
+# Pass 2: topological sort (Kahn's algorithm).
+# Repeatedly pick ports whose dependencies have all been placed already.
+_remaining = port_names
 _ordered_ports = []
-foreach pname : port_names
-  _deps = get_variable('_port_deps_' + pname.underscorify())
-  if _deps.length() == 0
-    _ordered_ports += pname
+_max_iter = port_names.length() * port_names.length() + 1
+_iter = 0
+foreach _unused : range(_max_iter)
+  if _remaining.length() == 0 or _iter >= _max_iter
+    break
   endif
-endforeach
-foreach pname : port_names
-  _deps = get_variable('_port_deps_' + pname.underscorify())
-  if _deps.length() > 0
-    _ordered_ports += pname
+  _iter += 1
+  _next_remaining = []
+  _progress = false
+  foreach pname : _remaining
+    _deps = get_variable('_port_deps_' + pname.underscorify())
+    _all_resolved = true
+    foreach _d : _deps
+      if _d not in _ordered_ports
+        _all_resolved = false
+      endif
+    endforeach
+    if _all_resolved
+      _ordered_ports += pname
+      _progress = true
+    else
+      _next_remaining += pname
+    endif
+  endforeach
+  _remaining = _next_remaining
+  if not _progress
+    # Cycle detected or unresolvable deps — append rest as-is
+    _ordered_ports += _remaining
+    _remaining = []
   endif
 endforeach
 
@@ -93,7 +112,7 @@ foreach pname : _ordered_ports
 
   _pt = custom_target('port_' + pname,
     output: [pname + '.manifest'],
-    depends: [port_tool, libbesalt_so, libc_so, crt_start_obj, sysroot_target] + _extra_deps,
+    depends: [port_tool, libbesalt_so, libc_so, libcxx_so, crt_start_obj, sysroot_target] + _extra_deps,
     depend_files: files(port_file) + besaltc_header_files,
     command: [port_tool, 'build',
       meson.current_source_dir() / pname,
@@ -101,7 +120,7 @@ foreach pname : _ordered_ports
       '-b', meson.project_build_root()],
     env: {'SALTYOS_ARCH': arch},
     console: true,
-    build_always_stale: true,
+    build_always_stale: false,
     build_by_default: get_option('build_ports'),
   )
 

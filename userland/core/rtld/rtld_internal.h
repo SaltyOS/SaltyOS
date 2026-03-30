@@ -552,7 +552,7 @@ struct link_map {
     uint64_t    tls_filesz;     /* Initialized bytes in PT_TLS */
     uint64_t    tls_memsz;      /* Total PT_TLS size */
     uint64_t    tls_align;      /* PT_TLS alignment */
-    int64_t     tls_tpoff;      /* Variant II module base relative to TP */
+    int64_t     tls_tpoff;      /* Module base relative to TP (arch ABI specific) */
     uint64_t    tls_module_id;  /* 1-based module ID for __tls_get_addr */
     struct link_map *next;
 };

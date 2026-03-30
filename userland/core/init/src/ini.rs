@@ -9,6 +9,7 @@ pub const MAX_DEPS: usize = 8;
 pub const MAX_CAP_COPIES: usize = 6;
 pub const MAX_EP_NEEDS: usize = 8;
 pub const MAX_EP_INJECTS: usize = 2;
+pub const MAX_CREATE_EPS: usize = 2;
 pub const MAX_SPAWN_ARGS_BYTES: usize = 96;
 pub const MAX_SPAWN_ARGS: usize = 6;
 
@@ -31,6 +32,11 @@ pub struct EpInjectDef {
     pub target: [u8; MAX_SERVICE_NAME],
     pub target_len: u8,
     pub target_slot: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct CreateEpDef {
+    pub dst_slot: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -71,6 +77,8 @@ pub struct ServiceDef {
     pub ep_need_count: u8,
     pub ep_injects: [EpInjectDef; MAX_EP_INJECTS],
     pub ep_inject_count: u8,
+    pub create_eps: [CreateEpDef; MAX_CREATE_EPS],
+    pub create_ep_count: u8,
     /// NUL-separated argv entries appended after argv[0] by procmgr spawn path.
     pub spawn_args: [u8; MAX_SPAWN_ARGS_BYTES],
     pub spawn_args_len: u8,
@@ -104,6 +112,8 @@ impl ServiceDef {
             ep_need_count: 0,
             ep_injects: [EpInjectDef { target: [0; MAX_SERVICE_NAME], target_len: 0, target_slot: 0 }; MAX_EP_INJECTS],
             ep_inject_count: 0,
+            create_eps: [CreateEpDef { dst_slot: 0 }; MAX_CREATE_EPS],
+            create_ep_count: 0,
             spawn_args: [0; MAX_SPAWN_ARGS_BYTES],
             spawn_args_len: 0,
             spawn_argc: 0,
@@ -489,6 +499,36 @@ fn parse_ep_injects(value: &[u8], injects: &mut [EpInjectDef; MAX_EP_INJECTS]) -
     count
 }
 
+fn parse_create_eps(value: &[u8], create_eps: &mut [CreateEpDef; MAX_CREATE_EPS]) -> u8 {
+    let mut count: u8 = 0;
+    let mut i = 0;
+    let val = trim(value);
+
+    while i < val.len() && (count as usize) < MAX_CREATE_EPS {
+        while i < val.len() && (val[i] == b' ' || val[i] == b'\t') {
+            i += 1;
+        }
+        if i >= val.len() {
+            break;
+        }
+
+        let start = i;
+        while i < val.len() && val[i] != b' ' && val[i] != b'\t' {
+            i += 1;
+        }
+
+        let token = &val[start..i];
+        if !token.is_empty() {
+            create_eps[count as usize] = CreateEpDef {
+                dst_slot: parse_decimal_u64(token),
+            };
+            count += 1;
+        }
+    }
+
+    count
+}
+
 fn parse_spawn_args(value: &[u8], out: &mut [u8; MAX_SPAWN_ARGS_BYTES]) -> (u8, u8) {
     let val = trim(value);
     let mut i = 0usize;
@@ -635,6 +675,8 @@ pub fn parse_service(data: &[u8], out: &mut ServiceDef) -> bool {
                                 out.ep_need_count = parse_ep_needs(value, &mut out.ep_needs);
                             } else if key_matches_current_arch(key, b"InjectEP") {
                                 out.ep_inject_count = parse_ep_injects(value, &mut out.ep_injects);
+                            } else if key_matches_current_arch(key, b"CreateEP") {
+                                out.create_ep_count = parse_create_eps(value, &mut out.create_eps);
                             }
                         }
                         Section::None => {}

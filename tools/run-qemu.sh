@@ -10,7 +10,14 @@
 #   --headless        Disable GUI (-display none)
 #   --gdb             Start GDB server (-s -S)
 #   --uefi            Boot with OVMF/AAVMF UEFI firmware
+#   --utm             Launch through UTM on macOS instead of invoking QEMU directly
+#   --utm-name NAME   Override the UTM VM name (default: SaltyOS-<arch>)
 #   --no-net          Skip virtio-net attachment
+#   --net-mode MODE   user, tap, vmnet-shared, vmnet-host, or vmnet-bridged (default: user)
+#   --tap-ifname IF   TAP interface name for --net-mode tap (default: tap0)
+#   --vmnet-ifname IF Host interface name for --net-mode vmnet-bridged
+#   --hvf             Enable Hypervisor.framework acceleration in UTM (default)
+#   --no-hvf          Disable HVF in UTM (use TCG emulation)
 #   --legacy-virtio   Force legacy (transitional) virtio devices
 #   --disk FILE       Override boot disk path
 #   --extra-disk FILE Attach an additional virtio-blk disk (repeatable)
@@ -19,7 +26,7 @@ set -euo pipefail
 die() { echo "error: $*" >&2; exit 1; }
 
 usage() {
-    sed -n '3,14p' "$0" | sed 's/^# \?//'
+    sed -n '3,17p' "$0" | sed 's/^# \?//'
     exit 1
 }
 
@@ -33,8 +40,14 @@ DEBUG=false
 HEADLESS=false
 GDB=false
 UEFI=false
+UTM=false
+UTM_NAME=""
 NO_DATA=false
 NO_NET=false
+NET_MODE="user"
+TAP_IFNAME="tap0"
+VMNET_IFNAME=""
+USE_HVF=true
 LEGACY_VIRTIO=false
 DISK=""
 EXTRA_DISKS=()
@@ -48,8 +61,15 @@ while [[ $# -gt 0 ]]; do
         --headless) HEADLESS=true; shift ;;
         --gdb)      GDB=true;    shift ;;
         --uefi)     UEFI=true;   shift ;;
+        --utm)      UTM=true;    shift ;;
+        --utm-name) UTM_NAME="${2:?--utm-name requires a value}"; shift 2 ;;
         --no-data)  NO_DATA=true; shift ;; # Deprecated no-op (kept for compatibility)
         --no-net)   NO_NET=true;  shift ;;
+        --net-mode) NET_MODE="${2:?--net-mode requires a value}"; shift 2 ;;
+        --tap-ifname) TAP_IFNAME="${2:?--tap-ifname requires a value}"; shift 2 ;;
+        --vmnet-ifname) VMNET_IFNAME="${2:?--vmnet-ifname requires a value}"; shift 2 ;;
+        --hvf)      USE_HVF=true; shift ;;
+        --no-hvf)   USE_HVF=false; shift ;;
         --legacy-virtio) LEGACY_VIRTIO=true; shift ;;
         --disk)     DISK="${2:?--disk requires a value}"; shift 2 ;;
         --extra-disk) EXTRA_DISKS+=("${2:?--extra-disk requires a value}"); shift 2 ;;
@@ -81,12 +101,34 @@ if [[ "$ARCH" == "aarch64" ]]; then
     UEFI=true
 fi
 
+if $UTM; then
+    $GDB && die "--gdb is not supported with --utm"
+    $LEGACY_VIRTIO && die "--legacy-virtio is not supported with --utm"
+
+    UTM_CMD=(bash tools/run-utm.sh "$BUILD_DIR" --arch "$ARCH" --mem "$MEM" --net-mode "$NET_MODE")
+    [[ -n "$SMP" ]] && UTM_CMD+=(--smp "$SMP")
+    $DEBUG && UTM_CMD+=(--debug)
+    $HEADLESS && UTM_CMD+=(--headless)
+    $UEFI && UTM_CMD+=(--uefi)
+    $NO_NET && UTM_CMD+=(--no-net)
+    $USE_HVF || UTM_CMD+=(--no-hvf)
+    [[ -n "$UTM_NAME" ]] && UTM_CMD+=(--utm-name "$UTM_NAME")
+    [[ -n "$VMNET_IFNAME" ]] && UTM_CMD+=(--vmnet-ifname "$VMNET_IFNAME")
+    [[ -n "$DISK" ]] && UTM_CMD+=(--disk "$DISK")
+    if [[ ${#EXTRA_DISKS[@]} -gt 0 ]]; then
+        for extra in "${EXTRA_DISKS[@]}"; do
+            UTM_CMD+=(--extra-disk "$extra")
+        done
+    fi
+    exec "${UTM_CMD[@]}"
+fi
+
 # --- Architecture-specific QEMU configuration ---
 case "$ARCH" in
     x86_64)
         QEMU=qemu-system-x86_64
         MACHINE=q35
-        CPU=qemu64
+        CPU=default
         BLK_DEVICE="virtio-blk-pci"
         if $LEGACY_VIRTIO; then
             NET_DEVICE="virtio-net-pci"
@@ -213,8 +255,29 @@ done
 
 # --- Networking ---
 if ! $NO_NET; then
-    CMD+=(-netdev user,id=net0
-          -device "$NET_DEVICE,netdev=net0")
+    case "$NET_MODE" in
+        user)
+            CMD+=(-netdev user,id=net0)
+            ;;
+        tap)
+            [[ -n "$TAP_IFNAME" ]] || die "--tap-ifname is required for --net-mode tap"
+            CMD+=(-netdev "tap,id=net0,ifname=$TAP_IFNAME,script=no,downscript=no")
+            ;;
+        vmnet-shared)
+            CMD+=(-netdev vmnet-shared,id=net0)
+            ;;
+        vmnet-host)
+            CMD+=(-netdev vmnet-host,id=net0)
+            ;;
+        vmnet-bridged)
+            [[ -n "$VMNET_IFNAME" ]] || die "--vmnet-ifname is required for --net-mode vmnet-bridged"
+            CMD+=(-netdev "vmnet-bridged,id=net0,ifname=$VMNET_IFNAME")
+            ;;
+        *)
+            die "unsupported net mode: $NET_MODE"
+            ;;
+    esac
+    CMD+=(-device "$NET_DEVICE,netdev=net0")
 fi
 
 # --- Debug logging ---

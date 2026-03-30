@@ -71,6 +71,11 @@ pub struct Process {
     pub wait_ready_on_resume: bool,
     /// Timeout used when waiting for the child's readiness signal after resume.
     pub ready_timeout_ns: u64,
+    /// POSIX ITIMER_REAL reload interval in nanoseconds (0 = one-shot/disabled).
+    pub itimer_real_interval_ns: u64,
+    /// Absolute CLOCK_REALTIME deadline in nanoseconds for the next SIGALRM.
+    /// Zero means no ITIMER_REAL is armed.
+    pub itimer_real_deadline_ns: u64,
     pub sig_disposition: [u8; NSIG],
     pub stop_status: i32,
     pub pgid: u32,
@@ -127,6 +132,8 @@ impl Process {
             ready_ntfn: 0,
             wait_ready_on_resume: false,
             ready_timeout_ns: 0,
+            itimer_real_interval_ns: 0,
+            itimer_real_deadline_ns: 0,
             sig_disposition: [SIG_DISP_DFL; NSIG],
             stop_status: 0,
             pgid: 0,
@@ -366,6 +373,8 @@ pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
         p.ready_ntfn = 0;
         p.wait_ready_on_resume = false;
         p.ready_timeout_ns = 0;
+        p.itimer_real_interval_ns = 0;
+        p.itimer_real_deadline_ns = 0;
         p.stop_status = 0;
         p.pgid = 0;
         p.slot_base = 0;

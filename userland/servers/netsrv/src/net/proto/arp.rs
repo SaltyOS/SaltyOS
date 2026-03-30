@@ -3,7 +3,7 @@
 //!
 //! Maintains a static ARP table and handles ARP request/reply packets.
 
-use super::ethernet;
+use crate::net::ethernet;
 
 const ARP_TABLE_SIZE: usize = 16;
 static mut ARP_TABLE: [(u32, [u8; 6], bool); ARP_TABLE_SIZE] = [(0, [0; 6], false); ARP_TABLE_SIZE];
@@ -26,6 +26,22 @@ pub(crate) fn lookup(ip: u32) -> Option<[u8; 6]> {
         }
     }
     None
+}
+
+pub(crate) fn entry(index: usize) -> Option<(u32, [u8; 6])> {
+    if index >= ARP_TABLE_SIZE {
+        return None;
+    }
+
+    // SAFETY: Single-threaded userland server; only this module accesses ARP_TABLE.
+    unsafe {
+        let entry = (*(&raw const ARP_TABLE))[index];
+        if entry.2 {
+            Some((entry.0, entry.1))
+        } else {
+            None
+        }
+    }
 }
 
 /// Insert or update an ARP table entry.
@@ -88,7 +104,8 @@ pub(crate) fn handle_packet(our_mac: &[u8; 6], our_ip: u32, data: &[u8]) {
     arp_table_insert(spa, sha);
 
     // ARP cache updated — flush any DNS queries waiting for this MAC
-    super::dns::flush_arp_waiters();
+    crate::net::dns::flush_arp_waiters();
+    crate::net::flush_pending_packets();
 
     if op == ARP_OP_REQUEST && tpa == our_ip {
         // Send ARP reply

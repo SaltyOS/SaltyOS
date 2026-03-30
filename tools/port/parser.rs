@@ -23,7 +23,14 @@ pub struct Target {
     pub extra_flags: Vec<String>,
 }
 
+/// A static library to build before targets.
 #[derive(Debug, Clone)]
+pub struct LibTarget {
+    pub name: String,
+    pub sources: Vec<String>,
+    pub extra_flags: Vec<String>,
+}
+
 pub struct PortConfig {
     pub name: String,
     pub version: String,
@@ -42,6 +49,7 @@ pub struct PortConfig {
     pub install_map: Vec<(String, String)>,
     pub env_overrides: HashMap<String, String>,
     pub autoconf_cache: Vec<(String, String)>,
+    pub libs: Vec<LibTarget>,
     pub targets: Vec<Target>,
     pub targets_cflags: String,
 }
@@ -66,6 +74,7 @@ impl Default for PortConfig {
             install_map: Vec::new(),
             env_overrides: HashMap::new(),
             autoconf_cache: Vec::new(),
+            libs: Vec::new(),
             targets: Vec::new(),
             targets_cflags: String::new(),
         }
@@ -258,6 +267,31 @@ pub fn parse_port_file(path: &Path) -> Result<PortConfig, String> {
                         key.to_string(),
                         value.to_string(),
                     ));
+                }
+                "libs" => {
+                    // name = src1.c src2.c :: -Dflag -Ipath
+                    let (sources_part, extra_part) = if let Some((s, e)) = value.split_once("::") {
+                        (s.trim(), e.trim())
+                    } else {
+                        (value, "")
+                    };
+                    let sources: Vec<String> = sources_part
+                        .split_whitespace()
+                        .map(|s| s.to_string())
+                        .collect();
+                    let extra_flags: Vec<String> = if extra_part.is_empty() {
+                        Vec::new()
+                    } else {
+                        extra_part
+                            .split_whitespace()
+                            .map(|s| s.to_string())
+                            .collect()
+                    };
+                    config.libs.push(LibTarget {
+                        name: key.to_string(),
+                        sources,
+                        extra_flags,
+                    });
                 }
                 "targets" => {
                     // name = src1.c src2.c :: -Dflag -Ipath

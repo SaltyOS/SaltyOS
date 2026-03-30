@@ -10,9 +10,54 @@
 use crate::cap::{CapRights, ObjectType};
 use crate::ipc::{EndpointState, Endpoint, Message};
 use crate::mm::{save_irq_disable, restore_irq, CAP_LOCK};
+use crate::sched::thread::MAX_RECV_WAIT_ENDPOINTS;
 use crate::sched::thread::{BlockedReason, Tcb, ThreadState};
 
 use super::{lookup_capability, validate_endpoint_cap, msg_info, write_msg_to_ipc_buffer};
+
+unsafe fn build_locked_endpoint_order(
+    endpoints: &[*mut Endpoint],
+    order: &mut [usize; MAX_RECV_WAIT_ENDPOINTS],
+) -> usize {
+    let count = endpoints.len();
+    let mut i = 0;
+    while i < count {
+        order[i] = i;
+        i += 1;
+    }
+
+    let mut outer = 1;
+    while outer < count {
+        let key = order[outer];
+        let key_addr = endpoints[key] as usize;
+        let mut inner = outer;
+        while inner > 0 && (endpoints[order[inner - 1]] as usize) > key_addr {
+            order[inner] = order[inner - 1];
+            inner -= 1;
+        }
+        order[inner] = key;
+        outer += 1;
+    }
+
+    let mut idx = 0;
+    while idx < count {
+        (*endpoints[order[idx]]).ep_lock();
+        idx += 1;
+    }
+    count
+}
+
+unsafe fn unlock_endpoint_order(
+    endpoints: &[*mut Endpoint],
+    order: &[usize; MAX_RECV_WAIT_ENDPOINTS],
+    count: usize,
+) {
+    let mut idx = count;
+    while idx > 0 {
+        idx -= 1;
+        (*endpoints[order[idx]]).ep_unlock();
+    }
+}
 
 /// Fastpath result returned in RAX:RDX.
 ///
@@ -126,24 +171,27 @@ pub unsafe extern "C" fn fastpath_call_rust(
             return FastpathResult::slowpath();
         }
 
-        let receiver = match endpoint.fastpath_pop_recv() {
-            Some(r) => r,
+        let recv_link = match endpoint.fastpath_pop_recv_locked() {
+            Some(link) => link,
             None => {
+                endpoint.fastpath_recv_unlock();
                 endpoint.ep_unlock();
                 restore_irq(irq);
                 return FastpathResult::slowpath();
             }
         };
 
+        let receiver = (*recv_link).tcb;
+
         if !fastpath_waiter_is_local_stable(receiver, this_cpu) {
-            endpoint.fastpath_push_recv(receiver);
+            endpoint.fastpath_abort_recv_locked(recv_link);
             endpoint.ep_unlock();
             restore_irq(irq);
             return FastpathResult::slowpath();
         }
 
         if (*receiver).vspace_root.is_null() || (*receiver).kernel_stack_top == 0 {
-            endpoint.fastpath_push_recv(receiver);
+            endpoint.fastpath_abort_recv_locked(recv_link);
             endpoint.ep_unlock();
             restore_irq(irq);
             return FastpathResult::slowpath();
@@ -152,7 +200,7 @@ pub unsafe extern "C" fn fastpath_call_rust(
         let sched = crate::sched::scheduler::scheduler();
         let current = sched.current();
         if current.is_null() {
-            endpoint.fastpath_push_recv(receiver);
+            endpoint.fastpath_abort_recv_locked(recv_link);
             endpoint.ep_unlock();
             restore_irq(irq);
             return FastpathResult::slowpath();
@@ -184,7 +232,7 @@ pub unsafe extern "C" fn fastpath_call_rust(
             (*receiver).reply_can_grant = false;
             (*current).state = ThreadState::Running;
             (*current).blocked_reason = None;
-            endpoint.fastpath_push_recv(receiver);
+            endpoint.fastpath_abort_recv_locked(recv_link);
             if endpoint.state() == EndpointState::Idle {
                 endpoint.fastpath_set_state(EndpointState::RecvBlocked);
             }
@@ -192,6 +240,7 @@ pub unsafe extern "C" fn fastpath_call_rust(
             restore_irq(irq);
             return FastpathResult::slowpath();
         }
+        let (receiver, _selected) = Endpoint::fastpath_finish_recv_locked(recv_link);
         crate::sched::pip::pip_donate(current, receiver);
 
         (*receiver).saved_caller_msg = msg;
@@ -446,5 +495,224 @@ pub unsafe extern "C" fn fastpath_reply_recv_rust(
 
         // No context switch — server stays running
         FastpathResult::ok(badge)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpath_reply_recv_any_rust(
+    endpoint_count: u64,
+    msg_info: u64,
+    mr0: u64,
+    mr1: u64,
+    mr2: u64,
+    mr3: u64,
+) -> FastpathResult {
+    let extra_caps = msg_info::get_extra_caps(msg_info);
+    if extra_caps != 0 {
+        return FastpathResult::slowpath();
+    }
+    let length = msg_info::get_length(msg_info);
+    if length > 4 {
+        return FastpathResult::slowpath();
+    }
+
+    let mut endpoints = [core::ptr::null_mut(); MAX_RECV_WAIT_ENDPOINTS];
+    let count = match super::read_recv_any_endpoints(endpoint_count as usize, &mut endpoints) {
+        Ok(count) => count,
+        Err(_) => return FastpathResult::slowpath(),
+    };
+
+    let this_cpu = crate::arch::current_cpu() as usize;
+
+    unsafe {
+        let irq = save_irq_disable();
+        let mut order = [0usize; MAX_RECV_WAIT_ENDPOINTS];
+        let lock_count = build_locked_endpoint_order(&endpoints[..count], &mut order);
+
+        let sched = crate::sched::scheduler::scheduler();
+        let current = sched.current();
+        if current.is_null() {
+            unlock_endpoint_order(&endpoints[..count], &order, lock_count);
+            restore_irq(irq);
+            return FastpathResult::slowpath();
+        }
+
+        let caller = (*current).reply_tcb;
+        let mut wake_caller: *mut Tcb = core::ptr::null_mut();
+
+        if !caller.is_null() {
+            if !fastpath_waiter_is_local_stable(caller, this_cpu) {
+                unlock_endpoint_order(&endpoints[..count], &order, lock_count);
+                restore_irq(irq);
+                return FastpathResult::slowpath();
+            }
+            let is_reply_wait = matches!((*caller).blocked_reason, Some(BlockedReason::ReplyWait { .. }));
+            if !is_reply_wait {
+                unlock_endpoint_order(&endpoints[..count], &order, lock_count);
+                restore_irq(irq);
+                return FastpathResult::slowpath();
+            }
+
+            crate::sched::pip::pip_undonate(current, caller);
+
+            let reply_label = msg_info::get_label(msg_info);
+            let mut reply_msg = Message::empty();
+            reply_msg.label = reply_label;
+            reply_msg.length = length;
+            if length > 0 { reply_msg.regs[0] = mr0; }
+            if length > 1 { reply_msg.regs[1] = mr1; }
+            if length > 2 { reply_msg.regs[2] = mr2; }
+            if length > 3 { reply_msg.regs[3] = mr3; }
+
+            (*caller).saved_caller_msg = reply_msg;
+            (*caller).saved_caller_badge = 0;
+            (*caller).blocked_reason = None;
+            (*caller).state = ThreadState::Ready;
+            wake_caller = caller;
+
+            (*current).reply_tcb = core::ptr::null_mut();
+            (*current).reply_can_grant = false;
+        }
+
+        let mut chosen_idx: Option<usize> = None;
+        let mut chosen_sender: *mut Tcb = core::ptr::null_mut();
+        let mut chosen_msg = Message::empty();
+        let mut chosen_badge = 0u64;
+        let mut keep_blocked = false;
+
+        let mut wait_idx = 0usize;
+        while wait_idx < count {
+            let endpoint = &mut *endpoints[wait_idx];
+            if endpoint.state() != EndpointState::SendBlocked {
+                wait_idx += 1;
+                continue;
+            }
+
+            let sender = match endpoint.fastpath_pop_send() {
+                Some(sender) => sender,
+                None => {
+                    endpoint.fastpath_set_state(EndpointState::Idle);
+                    wait_idx += 1;
+                    continue;
+                }
+            };
+
+            if !fastpath_waiter_is_local_stable(sender, this_cpu) {
+                endpoint.fastpath_push_send(sender);
+                unlock_endpoint_order(&endpoints[..count], &order, lock_count);
+                if !wake_caller.is_null() {
+                    sched.lock();
+                    sched.enqueue_unlocked(wake_caller);
+                    sched.unlock();
+                }
+                restore_irq(irq);
+                return FastpathResult::slowpath();
+            }
+
+            let parsed = match (*sender).blocked_reason {
+                Some(BlockedReason::SendBlocked { msg, badge }) => Some((msg, badge, false)),
+                Some(BlockedReason::CallSendBlocked { msg, badge }) => Some((msg, badge, true)),
+                _ => None,
+            };
+            let Some((msg, badge, should_keep_blocked)) = parsed else {
+                endpoint.fastpath_push_send(sender);
+                unlock_endpoint_order(&endpoints[..count], &order, lock_count);
+                if !wake_caller.is_null() {
+                    sched.lock();
+                    sched.enqueue_unlocked(wake_caller);
+                    sched.unlock();
+                }
+                restore_irq(irq);
+                return FastpathResult::slowpath();
+            };
+
+            if msg.extra_caps != 0 || msg.length > 4 {
+                endpoint.fastpath_push_send(sender);
+                unlock_endpoint_order(&endpoints[..count], &order, lock_count);
+                if !wake_caller.is_null() {
+                    sched.lock();
+                    sched.enqueue_unlocked(wake_caller);
+                    sched.unlock();
+                }
+                restore_irq(irq);
+                return FastpathResult::slowpath();
+            }
+
+            chosen_idx = Some(wait_idx);
+            chosen_sender = sender;
+            chosen_msg = msg;
+            chosen_badge = badge;
+            keep_blocked = should_keep_blocked;
+            break;
+        }
+
+        if chosen_idx.is_none() && !(*current).bound_notification.is_null() {
+            let ntfn = &mut *((*current).bound_notification as *mut crate::ipc::Notification);
+            ntfn.ntfn_lock();
+            let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
+            ntfn.ntfn_unlock();
+            if bits != 0 {
+                write_msg_to_ipc_buffer(&Message::empty(), bits);
+                unlock_endpoint_order(&endpoints[..count], &order, lock_count);
+                if !wake_caller.is_null() {
+                    sched.lock();
+                    sched.enqueue_unlocked(wake_caller);
+                    sched.unlock();
+                }
+                restore_irq(irq);
+                return FastpathResult::ok(u64::MAX);
+            }
+        }
+
+        let Some(wait_idx) = chosen_idx else {
+            unlock_endpoint_order(&endpoints[..count], &order, lock_count);
+            if !wake_caller.is_null() {
+                sched.lock();
+                sched.enqueue_unlocked(wake_caller);
+                sched.unlock();
+            }
+            restore_irq(irq);
+            return FastpathResult::slowpath();
+        };
+
+        (*current).saved_caller_msg = chosen_msg;
+        (*current).saved_caller_badge = chosen_badge;
+        write_msg_to_ipc_buffer(&chosen_msg, chosen_badge);
+
+        if keep_blocked {
+            (*current).reply_tcb = chosen_sender;
+            (*current).reply_can_grant = true;
+            crate::sched::pip::pip_donate(chosen_sender, current);
+            (*chosen_sender).blocked_endpoint = core::ptr::null_mut();
+            (*chosen_sender).blocked_reason = Some(BlockedReason::ReplyWait {
+                msg: chosen_msg,
+                badge: chosen_badge,
+            });
+        } else {
+            (*chosen_sender).state = ThreadState::Ready;
+            (*chosen_sender).blocked_reason = None;
+            (*chosen_sender).blocked_endpoint = core::ptr::null_mut();
+        }
+
+        let chosen_endpoint = &mut *endpoints[wait_idx];
+        if chosen_endpoint.fastpath_send_queue_empty() {
+            chosen_endpoint.fastpath_set_state(EndpointState::Idle);
+        }
+
+        unlock_endpoint_order(&endpoints[..count], &order, lock_count);
+
+        if !wake_caller.is_null() {
+            sched.lock();
+            sched.enqueue_unlocked(wake_caller);
+            sched.unlock();
+        }
+        if !keep_blocked {
+            sched.lock();
+            sched.enqueue_unlocked(chosen_sender);
+            sched.unlock();
+        }
+
+        restore_irq(irq);
+        FastpathResult::ok(wait_idx as u64)
     }
 }

@@ -465,7 +465,7 @@ if mkrootfs.found() and build_userland
     build_by_default: false,
   )
 
-  _rootfs_cmd = [mkrootfs, '--output', '@OUTPUT@', '--size', '512M',
+  _rootfs_cmd = [mkrootfs, '--output', '@OUTPUT@', '--size', '1G',
                  '--manifest', rootfs_binaries_manifest]
   _rootfs_deps = [rootfs_binaries_manifest]
   _rootfs_dep_files = [mkrootfs_script, mksaltyfs_script]

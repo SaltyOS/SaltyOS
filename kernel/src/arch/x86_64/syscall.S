@@ -68,7 +68,8 @@ syscall_entry:
     # At this point, all GPRs still hold their original user-space values
     # (push copies to stack but does not modify the register).
     #
-    # Check for Call (2) or ReplyRecv (3) — the client-server hot path.
+    # Check for Call (2), ReplyRecv (3), or ReplyRecvAny (24) — the
+    # client-server hot path.
     # Fastpath functions use System V ABI:
     #   RDI=cap_ptr  RSI=msg_info  RDX=mr0  RCX=mr1  R8=mr2  R9=mr3
     # Only R10→RCX needs remapping.
@@ -76,6 +77,8 @@ syscall_entry:
     je .Lfastpath_call
     cmp $3, %rax
     je .Lfastpath_reply_recv
+    cmp $24, %rax
+    je .Lfastpath_reply_recv_any
 
 .Lslowpath:
     # --------------------------------------------------------------------------
@@ -205,6 +208,25 @@ syscall_entry:
 
 .Lfastpath_reply_recv_bail:
     # Restore clobbered registers for slowpath
+    mov 0(%rsp), %rax
+    mov 24(%rsp), %rdx
+    mov 32(%rsp), %rsi
+    mov 40(%rsp), %rdi
+    mov 56(%rsp), %r8
+    mov 64(%rsp), %r9
+    mov 72(%rsp), %r10
+    jmp .Lslowpath
+
+.Lfastpath_reply_recv_any:
+    mov %r10, %rcx
+    call fastpath_reply_recv_any_rust
+    test %rax, %rax
+    jz .Lfastpath_reply_recv_any_bail
+    movq $0, 0(%rsp)
+    mov %rdx, 24(%rsp)
+    jmp .Lreturn
+
+.Lfastpath_reply_recv_any_bail:
     mov 0(%rsp), %rax
     mov 24(%rsp), %rdx
     mov 32(%rsp), %rsi

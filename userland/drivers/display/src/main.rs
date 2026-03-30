@@ -221,7 +221,7 @@ fn idle() -> ! {
 }
 
 fn ipc_ctx() -> *mut IpcContext {
-    &raw mut besalt::__besalt_ipc_ctx
+    besalt::tls::current_ipc_ctx()
 }
 
 unsafe fn recv_timed_ctx(

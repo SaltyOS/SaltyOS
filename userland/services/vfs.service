@@ -10,5 +10,6 @@ After=console nameserv mmsrv
 Before=test_runner
 
 [Capabilities]
+CreateEP=63
 CopyCap=13:66 14:68
 NeedEP=console:64 nameserv:65 ttyd:67 mmsrv:69:badge procmgr:70 netsrv:71

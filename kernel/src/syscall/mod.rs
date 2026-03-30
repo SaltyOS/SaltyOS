@@ -40,6 +40,10 @@ pub enum Syscall {
     Shutdown = 20,
     SendTimed = 21,
     RecvTimed = 22,
+    RecvAny = 23,
+    ReplyRecvAny = 24,
+    RecvAnyTimed = 25,
+    ReplyRecvAnyTimed = 26,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -70,6 +74,10 @@ impl TryFrom<u64> for Syscall {
             20 => Ok(Syscall::Shutdown),
             21 => Ok(Syscall::SendTimed),
             22 => Ok(Syscall::RecvTimed),
+            23 => Ok(Syscall::RecvAny),
+            24 => Ok(Syscall::ReplyRecvAny),
+            25 => Ok(Syscall::RecvAnyTimed),
+            26 => Ok(Syscall::ReplyRecvAnyTimed),
             _ => Err(SyscallError::InvalidOperation),
         }
     }
@@ -493,6 +501,92 @@ fn construct_message(msg_info: u64, mr0: u64, mr1: u64, mr2: u64, mr3: u64) -> M
     }
 }
 
+pub(crate) unsafe fn read_recv_any_endpoints(
+    count: usize,
+    out: &mut [*mut Endpoint; crate::sched::thread::MAX_RECV_WAIT_ENDPOINTS],
+) -> Result<usize, SyscallError> {
+    if count == 0 || count > crate::sched::thread::MAX_RECV_WAIT_ENDPOINTS {
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    let scheduler = crate::sched::scheduler::scheduler();
+    let current = scheduler.current();
+    if current.is_null() {
+        return Err(SyscallError::InvalidOperation);
+    }
+
+    let buf = (*current).ipc_buffer;
+    if buf == 0 {
+        return Err(SyscallError::BadAddress);
+    }
+    if validate_ipc_buffer_addr(buf).is_err() {
+        return Err(SyscallError::BadAddress);
+    }
+
+    let ipc_buf = buf as *const crate::ipc::IpcBuffer;
+    let _guard = crate::arch::uaccess::UserAccessGuard::new();
+
+    let irq = save_irq_disable();
+    CAP_LOCK.lock();
+
+    let mut idx = 0usize;
+    while idx < count {
+        let slot = (*ipc_buf).reserved[idx];
+        let cap = match lookup_capability(slot) {
+            Ok(cap) => *cap,
+            Err(err) => {
+                CAP_LOCK.unlock();
+                restore_irq(irq);
+                return Err(err);
+            }
+        };
+
+        if let Err(err) = validate_endpoint_cap(&cap, CapRights::RECV) {
+            CAP_LOCK.unlock();
+            restore_irq(irq);
+            return Err(err);
+        }
+
+        let endpoint = cap.object as *mut Endpoint;
+        let mut dup_idx = 0usize;
+        while dup_idx < idx {
+            if out[dup_idx] == endpoint {
+                CAP_LOCK.unlock();
+                restore_irq(irq);
+                return Err(SyscallError::InvalidArgument);
+            }
+            dup_idx += 1;
+        }
+
+        out[idx] = endpoint;
+        idx += 1;
+    }
+
+    CAP_LOCK.unlock();
+    restore_irq(irq);
+    Ok(count)
+}
+
+unsafe fn read_recv_any_timeout_ns(endpoint_count: usize) -> Result<u64, SyscallError> {
+    let scheduler = crate::sched::scheduler::scheduler();
+    let current = scheduler.current();
+    if current.is_null() {
+        return Err(SyscallError::InvalidOperation);
+    }
+
+    let buf = (*current).ipc_buffer;
+    if buf == 0 {
+        return Err(SyscallError::BadAddress);
+    }
+    if validate_ipc_buffer_addr(buf).is_err() {
+        return Err(SyscallError::BadAddress);
+    }
+
+    let ipc_buf = buf as *const crate::ipc::IpcBuffer;
+    let _guard = crate::arch::uaccess::UserAccessGuard::new();
+    Ok((*ipc_buf).reserved[endpoint_count])
+}
+
 /// Write received IPC message to current thread's IPC buffer
 ///
 /// Writes in `struct besalt_msg` layout (matching userland overlay):
@@ -750,6 +844,102 @@ fn syscall_reply_recv(
     }
 }
 
+fn syscall_recv_any(endpoint_count: u64) -> SyscallResult {
+    let mut endpoints = [core::ptr::null_mut(); crate::sched::thread::MAX_RECV_WAIT_ENDPOINTS];
+    let count = match unsafe { read_recv_any_endpoints(endpoint_count as usize, &mut endpoints) } {
+        Ok(count) => count,
+        Err(err) => return SyscallResult::err(err),
+    };
+
+    unsafe {
+        let irq = save_irq_disable();
+        let (msg, badge, source) = Endpoint::recv_any(&endpoints[..count]);
+        write_msg_to_ipc_buffer(&msg, badge);
+        restore_irq(irq);
+        SyscallResult::ok(source)
+    }
+}
+
+fn syscall_reply_recv_any(
+    endpoint_count: u64,
+    msg_info: u64,
+    mr0: u64,
+    mr1: u64,
+    mr2: u64,
+    mr3: u64,
+) -> SyscallResult {
+    let mut endpoints = [core::ptr::null_mut(); crate::sched::thread::MAX_RECV_WAIT_ENDPOINTS];
+    let count = match unsafe { read_recv_any_endpoints(endpoint_count as usize, &mut endpoints) } {
+        Ok(count) => count,
+        Err(err) => return SyscallResult::err(err),
+    };
+
+    let reply = construct_message(msg_info, mr0, mr1, mr2, mr3);
+
+    unsafe {
+        let irq = save_irq_disable();
+        let (msg, badge, source) = Endpoint::reply_recv_any(&endpoints[..count], &reply);
+        write_msg_to_ipc_buffer(&msg, badge);
+        restore_irq(irq);
+        SyscallResult::ok(source)
+    }
+}
+
+fn syscall_recv_any_timed(endpoint_count: u64, timeout_ns: u64) -> SyscallResult {
+    let mut endpoints = [core::ptr::null_mut(); crate::sched::thread::MAX_RECV_WAIT_ENDPOINTS];
+    let count = match unsafe { read_recv_any_endpoints(endpoint_count as usize, &mut endpoints) } {
+        Ok(count) => count,
+        Err(err) => return SyscallResult::err(err),
+    };
+
+    unsafe {
+        let irq = save_irq_disable();
+        let (msg, badge, source, result) = Endpoint::recv_any_timeout(&endpoints[..count], timeout_ns);
+        if result == 0 {
+            write_msg_to_ipc_buffer(&msg, badge);
+            restore_irq(irq);
+            SyscallResult::ok(source)
+        } else {
+            restore_irq(irq);
+            SyscallResult::err(SyscallError::Cancelled)
+        }
+    }
+}
+
+fn syscall_reply_recv_any_timed(
+    endpoint_count: u64,
+    msg_info: u64,
+    mr0: u64,
+    mr1: u64,
+    mr2: u64,
+    mr3: u64,
+) -> SyscallResult {
+    let mut endpoints = [core::ptr::null_mut(); crate::sched::thread::MAX_RECV_WAIT_ENDPOINTS];
+    let count = match unsafe { read_recv_any_endpoints(endpoint_count as usize, &mut endpoints) } {
+        Ok(count) => count,
+        Err(err) => return SyscallResult::err(err),
+    };
+
+    let timeout_ns = match unsafe { read_recv_any_timeout_ns(count) } {
+        Ok(timeout_ns) => timeout_ns,
+        Err(err) => return SyscallResult::err(err),
+    };
+
+    let reply = construct_message(msg_info, mr0, mr1, mr2, mr3);
+    unsafe {
+        let irq = save_irq_disable();
+        let (msg, badge, source, result) = Endpoint::reply_recv_any_timeout(&endpoints[..count], &reply, timeout_ns);
+        if result == 0 {
+            write_msg_to_ipc_buffer(&msg, badge);
+            restore_irq(irq);
+            SyscallResult::ok(source)
+        } else {
+            restore_irq(irq);
+            SyscallResult::err(SyscallError::Cancelled)
+        }
+    }
+}
+
 /// Non-blocking send to endpoint
 fn syscall_nbsend(
     cap_ptr: u64,
@@ -891,7 +1081,7 @@ fn syscall_invoke(
 ) -> SyscallResult {
     // Stamp this invocation with a per-CPU monotonic sequence number for tracing.
     let seq = crate::arch::next_invoke_seq();
-    crate::kdebug!(syscall, |_g| {
+    crate::ktrace!(syscall, |_g| {
         _g.puts("[INVOKE] seq=");
         _g.hex(seq);
         _g.puts(" cap=");
@@ -1940,7 +2130,16 @@ unsafe fn detach_thread_wait_queues(tcb: *mut Tcb) {
         if !(*tcb).blocked_endpoint.is_null() {
             let ep = &mut *((*tcb).blocked_endpoint as *mut crate::ipc::Endpoint);
             ep.ep_lock();
-            ep.remove_from_queue(tcb);
+            if matches!(blocked_reason, Some(BlockedReason::RecvTimedBlocked) | Some(BlockedReason::RecvBlocked))
+                && (*tcb).recv_wait_link_count != 0
+            {
+                crate::ipc::Endpoint::clear_tcb_recv_waits(
+                    tcb,
+                    crate::sched::thread::RECV_WAIT_SELECTED_NONE,
+                );
+            } else {
+                ep.remove_from_queue(tcb);
+            }
             ep.ep_unlock();
             (*tcb).blocked_endpoint = core::ptr::null_mut();
         }
@@ -2219,7 +2418,7 @@ fn syscall_tcb_read_registers(cap: &Capability, _flags: u64) -> SyscallResult {
             }
             #[cfg(target_arch = "aarch64")]
             {
-                SyscallResult::ok(tcb.context.elr_el1)
+                SyscallResult::ok(tcb.context.return_elr)
             }
         };
         tcb.tcb_unlock();
@@ -2261,9 +2460,9 @@ fn syscall_tcb_write_registers(cap: &Capability, flags: u64, rip: u64, rsp: u64)
         #[cfg(target_arch = "aarch64")]
         {
             if !tcb.vspace_root.is_null() {
-                tcb.context.elr_el1 = rip;
-                tcb.context.x[19] = rsp;
-                tcb.context.spsr_el1 = 0x0;
+                tcb.context.return_elr = rip;
+                tcb.context.user_sp = rsp;
+                tcb.context.return_spsr = 0x0;
             } else {
                 crate::arch::aarch64::context::init_kernel_thread_context(
                     &mut tcb.context,
@@ -2603,7 +2802,7 @@ fn syscall_untyped_retype(
     dest_offset: u64,
 ) -> SyscallResult {
     let retype_seq = crate::arch::current_invoke_seq();
-    crate::kdebug!(syscall, |_g| {
+    crate::ktrace!(syscall, |_g| {
         _g.puts("[RETYPE] seq=");
         _g.hex(retype_seq);
         _g.puts(" cap=");
@@ -2802,6 +3001,15 @@ fn syscall_vspace_unmap(cap: &Capability, virt_addr: u64) -> SyscallResult {
     }
 
     unsafe {
+        let current = crate::sched::scheduler::scheduler().current();
+        if !current.is_null()
+            && !(*current).vspace_root.is_null()
+            && core::ptr::eq(cap.object as *const VSpace, (*current).vspace_root as *const VSpace)
+            && virt_addr < 0x0001_0000_0000_0000
+        {
+            crate::arch::sync_user_page_before_unmap(virt_addr);
+        }
+
         let vspace = &mut *(cap.object as *mut VSpace);
         match vspace.unmap(virt_addr) {
             Ok(()) => SyscallResult::ok(0),
@@ -4024,6 +4232,7 @@ fn syscall_vspace_walk(cap: &Capability, start_vaddr: u64, max_entries: u64) -> 
         }
         let ipc_buf = buf as *mut crate::ipc::IpcBuffer;
         let ipc_words = ipc_buf as *mut u64;
+        let _guard = crate::arch::uaccess::UserAccessGuard::new();
 
         (*ipc_buf).msg[0] = count as u64;
         (*ipc_buf).msg[1] = next_vaddr;
@@ -4369,9 +4578,11 @@ fn syscall_error_from_cap_error(err: CapError) -> SyscallError {
 
 /// ClockGetTime: Return current monotonic time in nanoseconds
 fn syscall_clock_gettime(clock_id: u64) -> SyscallResult {
-    // Only CLOCK_REALTIME(0) and CLOCK_MONOTONIC(1) are supported
-    if clock_id > 1 {
-        return SyscallResult::err(SyscallError::InvalidArgument);
+    // Accept both the native SaltyOS IDs and the FreeBSD IDs used by some
+    // imported userland sources.
+    match clock_id {
+        0 | 1 | 4 | 9 | 10 | 11 | 12 => {}
+        _ => return SyscallResult::err(SyscallError::InvalidArgument),
     }
     let ns = crate::arch::now_ns();
     SyscallResult::ok(ns)
@@ -4555,12 +4766,12 @@ pub fn handle(
                     }
                     #[cfg(target_arch = "aarch64")]
                     {
-                        s.puts("  ELR=");
-                        s.hex(tcb.context.elr_el1);
+                        s.puts("  RET_ELR=");
+                        s.hex(tcb.context.return_elr);
                         s.puts(" SP=");
                         s.hex(tcb.context.sp);
-                        s.puts(" SPSR=");
-                        s.hex(tcb.context.spsr_el1);
+                        s.puts(" RET_SPSR=");
+                        s.hex(tcb.context.return_spsr);
                     }
                     s.putc(b'\n');
                     drop(s);
@@ -4670,6 +4881,12 @@ pub fn handle(
                     SyscallResult::err(SyscallError::Cancelled)
                 }
             }
+        }
+        Syscall::RecvAny => syscall_recv_any(cap_ptr),
+        Syscall::ReplyRecvAny => syscall_reply_recv_any(cap_ptr, msg_info, mr0, mr1, mr2, mr3),
+        Syscall::RecvAnyTimed => syscall_recv_any_timed(cap_ptr, msg_info),
+        Syscall::ReplyRecvAnyTimed => {
+            syscall_reply_recv_any_timed(cap_ptr, msg_info, mr0, mr1, mr2, mr3)
         }
     }
 }
@@ -5131,6 +5348,7 @@ fn syscall_mo_read(cap: &Capability, offset: u64, count: u64) -> SyscallResult {
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
         let ipc_buf = buf_addr as *mut u8;
+        let _guard = crate::arch::uaccess::UserAccessGuard::new();
 
         let mut bytes_read = 0usize;
         let mut src_off = offset as usize;
@@ -5183,6 +5401,7 @@ fn syscall_mo_write(cap: &Capability, offset: u64, count: u64) -> SyscallResult 
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
         let ipc_buf = (*current).ipc_buffer as *const u8;
+        let _guard = crate::arch::uaccess::UserAccessGuard::new();
 
         let mut bytes_written = 0usize;
         let mut dst_off = offset as usize;

@@ -16,12 +16,8 @@ pub fn do_extract(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Result<
         return Ok(());
     }
 
-    let filename = url
-        .rsplit('/')
-        .next()
-        .ok_or_else(|| "Cannot determine filename from URL".to_string())?;
-
-    let distfile = vars::distfiles_dir(port_dir).join(filename);
+    let filename = vars::distfile_name(port, &url);
+    let distfile = vars::distfiles_dir(port_dir).join(&filename);
     if !distfile.exists() {
         return Err(format!("Source file not found: {}", distfile.display()));
     }

@@ -94,8 +94,10 @@ pub(crate) static mut ROOT_UNDERLAY_IDX: i32 = -1;
 pub(crate) static mut MOUNT_TRIED: u8 = 0;
 pub(crate) static mut VFS_SHM_ACTIVE: bool = false;
 
-pub(crate) static mut URANDOM_S0: u64 = 0;
-pub(crate) static mut URANDOM_S1: u64 = 0;
+pub(crate) static mut URANDOM_KEY: [u8; 32] = [0u8; 32];
+pub(crate) static mut URANDOM_CTR: u64 = 0;
+pub(crate) static mut URANDOM_BUF: [u8; 64] = [0u8; 64];
+pub(crate) static mut URANDOM_BUF_POS: usize = 64;
 pub(crate) static mut URANDOM_COUNTER: u64 = 0;
 const URANDOM_RESEED_INTERVAL: u64 = 1024;
 
@@ -490,52 +492,143 @@ fn signal_ready() {
 }
 
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
-    &raw mut besalt::__besalt_ipc_ctx
+    besalt::tls::current_ipc_ctx()
 }
 
 // ======================================================================
-// xorshift128+ PRNG for /dev/urandom
+// ChaCha20-based CSPRNG for /dev/urandom
 // ======================================================================
+
+const CHACHA20_SIGMA: [u32; 4] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574];
+
+#[inline(always)]
+fn chacha_qr(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+    s[a] = s[a].wrapping_add(s[b]);
+    s[d] ^= s[a];
+    s[d] = s[d].rotate_left(16);
+    s[c] = s[c].wrapping_add(s[d]);
+    s[b] ^= s[c];
+    s[b] = s[b].rotate_left(12);
+    s[a] = s[a].wrapping_add(s[b]);
+    s[d] ^= s[a];
+    s[d] = s[d].rotate_left(8);
+    s[c] = s[c].wrapping_add(s[d]);
+    s[b] ^= s[c];
+    s[b] = s[b].rotate_left(7);
+}
+
+/// Generate one 64-byte ChaCha20 keystream block into `out`.
+unsafe fn chacha20_block(key: *const u8, counter: u64, out: *mut u8) {
+    let mut state = [0u32; 16];
+
+    state[0] = CHACHA20_SIGMA[0];
+    state[1] = CHACHA20_SIGMA[1];
+    state[2] = CHACHA20_SIGMA[2];
+    state[3] = CHACHA20_SIGMA[3];
+
+    unsafe {
+        let mut i = 0;
+        while i < 8 {
+            let off = i * 4;
+            state[4 + i] = u32::from_le_bytes([
+                *key.add(off),
+                *key.add(off + 1),
+                *key.add(off + 2),
+                *key.add(off + 3),
+            ]);
+            i += 1;
+        }
+    }
+
+    state[12] = counter as u32;
+    state[13] = (counter >> 32) as u32;
+    state[14] = 0;
+    state[15] = 0;
+
+    let initial = state;
+
+    let mut r = 0;
+    while r < 10 {
+        chacha_qr(&mut state, 0, 4, 8, 12);
+        chacha_qr(&mut state, 1, 5, 9, 13);
+        chacha_qr(&mut state, 2, 6, 10, 14);
+        chacha_qr(&mut state, 3, 7, 11, 15);
+        chacha_qr(&mut state, 0, 5, 10, 15);
+        chacha_qr(&mut state, 1, 6, 11, 12);
+        chacha_qr(&mut state, 2, 7, 8, 13);
+        chacha_qr(&mut state, 3, 4, 9, 14);
+        r += 1;
+    }
+
+    unsafe {
+        let mut i = 0;
+        while i < 16 {
+            let val = state[i].wrapping_add(initial[i]);
+            let bytes = val.to_le_bytes();
+            *out.add(i * 4) = bytes[0];
+            *out.add(i * 4 + 1) = bytes[1];
+            *out.add(i * 4 + 2) = bytes[2];
+            *out.add(i * 4 + 3) = bytes[3];
+            i += 1;
+        }
+    }
+}
 
 pub(crate) unsafe fn urandom_init() {
     unsafe {
-        // Primary: hardware RDRAND via kernel syscall
-        let r0 = besalt::syscall::sys_getrandom();
-        let r1 = besalt::syscall::sys_getrandom();
-        if let (Some(s0), Some(s1)) = (r0, r1) {
-            URANDOM_S0 = s0;
-            URANDOM_S1 = s1;
-            // xorshift128+ requires non-zero state
-            if URANDOM_S0 == 0 && URANDOM_S1 == 0 {
-                URANDOM_S0 = s0 | 1;
+        let key = &raw mut URANDOM_KEY as *mut u8;
+        let mut filled = 0usize;
+
+        // Primary: seed from hardware RDRAND/RNDR via kernel syscall
+        while filled < 32 {
+            match besalt::syscall::sys_getrandom() {
+                Some(val) => {
+                    let bytes = val.to_le_bytes();
+                    let remain = 32 - filled;
+                    let n = if remain < 8 { remain } else { 8 };
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), key.add(filled), n);
+                    filled += n;
+                }
+                None => {
+                    // Fallback: TSC + clock mixing
+                    let mut ts = Timespec::zeroed();
+                    besalt::syscall::syscall(
+                        SYS_CLOCK_GETTIME,
+                        0,
+                        &raw mut ts as u64,
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
+                    let tsc: u64;
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        let tsc_lo: u32;
+                        let tsc_hi: u32;
+                        core::arch::asm!("rdtsc", out("eax") tsc_lo, out("edx") tsc_hi);
+                        tsc = (tsc_hi as u64) << 32 | tsc_lo as u64;
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) tsc);
+                    }
+                    let v = ts
+                        .tv_nsec
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(tsc);
+                    let bytes = v.to_le_bytes();
+                    let remain = 32 - filled;
+                    let n = if remain < 8 { remain } else { 8 };
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), key.add(filled), n);
+                    filled += n;
+                }
             }
-            return;
         }
 
-        // Fallback: TSC + clock (original method)
-        let mut ts = Timespec::zeroed();
-        besalt::syscall::syscall(SYS_CLOCK_GETTIME, 0, &raw mut ts as u64, 0, 0, 0, 0);
-        let tsc: u64;
-        #[cfg(target_arch = "x86_64")]
-        {
-            let tsc_lo: u32;
-            let tsc_hi: u32;
-            core::arch::asm!("rdtsc", out("eax") tsc_lo, out("edx") tsc_hi);
-            tsc = (tsc_hi as u64) << 32 | tsc_lo as u64;
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) tsc);
-        }
-        URANDOM_S0 = ts.tv_nsec ^ tsc;
-        URANDOM_S1 = ts
-            .tv_sec
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(tsc);
-        if URANDOM_S0 == 0 && URANDOM_S1 == 0 {
-            URANDOM_S0 = 0x0123456789ABCDEF;
-            URANDOM_S1 = 0xFEDCBA9876543210;
-        }
+        URANDOM_COUNTER = 0;
+        URANDOM_CTR = 0;
+        URANDOM_BUF_POS = 64; // Force refill on first read
     }
 }
 
@@ -544,17 +637,43 @@ pub(crate) unsafe fn urandom_next() -> u64 {
         URANDOM_COUNTER += 1;
         if URANDOM_COUNTER >= URANDOM_RESEED_INTERVAL {
             URANDOM_COUNTER = 0;
+            // Reseed: XOR fresh RDRAND bytes into the key
             if let Some(fresh) = besalt::syscall::sys_getrandom() {
-                URANDOM_S1 ^= fresh;
+                let key = &raw mut URANDOM_KEY as *mut u8;
+                let bytes = fresh.to_le_bytes();
+                let mut i = 0;
+                while i < 8 {
+                    *key.add(i) ^= bytes[i];
+                    i += 1;
+                }
             }
         }
 
-        let mut s1 = URANDOM_S0;
-        let s0 = URANDOM_S1;
-        let result = s0.wrapping_add(s1);
-        URANDOM_S0 = s0;
-        s1 ^= s1 << 23;
-        URANDOM_S1 = s1 ^ s0 ^ (s1 >> 17) ^ (s0 >> 26);
+        // Refill buffer if exhausted
+        let pos = URANDOM_BUF_POS;
+        if pos + 8 > 64 {
+            chacha20_block(
+                &raw const URANDOM_KEY as *const u8,
+                URANDOM_CTR,
+                &raw mut URANDOM_BUF as *mut u8,
+            );
+            URANDOM_CTR = URANDOM_CTR.wrapping_add(1);
+            URANDOM_BUF_POS = 0;
+            let buf = &raw const URANDOM_BUF as *const u8;
+            let result = u64::from_le_bytes([
+                *buf, *buf.add(1), *buf.add(2), *buf.add(3),
+                *buf.add(4), *buf.add(5), *buf.add(6), *buf.add(7),
+            ]);
+            URANDOM_BUF_POS = 8;
+            return result;
+        }
+
+        let buf = (&raw const URANDOM_BUF as *const u8).add(pos);
+        let result = u64::from_le_bytes([
+            *buf, *buf.add(1), *buf.add(2), *buf.add(3),
+            *buf.add(4), *buf.add(5), *buf.add(6), *buf.add(7),
+        ]);
+        URANDOM_BUF_POS = pos + 8;
         result
     }
 }
@@ -694,6 +813,39 @@ unsafe fn init_ramfs() {
         ramfs::dir_add_entry(root, b"proc".as_ptr(), 4, (*proc_dir).ino);
         PROC_ROOT_INO = (*proc_dir).ino;
 
+        let proc_net_dir = ramfs::alloc_inode();
+        (*proc_net_dir).ftype = FTYPE_PROC_FILE;
+        (*proc_net_dir).dev_type = PROC_FILE_NET_DIR;
+        (*proc_net_dir).mode = S_IFDIR_L | 0o555;
+        (*proc_net_dir).readonly = 1;
+        (*proc_net_dir).nlink = 2;
+        (*proc_net_dir).parent_ino = (*proc_dir).ino;
+        ramfs::dir_add_entry(proc_dir, b"net".as_ptr(), 3, (*proc_net_dir).ino);
+
+        let proc_route = ramfs::alloc_inode();
+        (*proc_route).ftype = FTYPE_PROC_FILE;
+        (*proc_route).dev_type = PROC_FILE_NET_ROUTE;
+        (*proc_route).mode = S_IFREG_L | 0o444;
+        (*proc_route).readonly = 1;
+        (*proc_route).parent_ino = (*proc_net_dir).ino;
+        ramfs::dir_add_entry(proc_net_dir, b"route".as_ptr(), 5, (*proc_route).ino);
+
+        let proc_arp = ramfs::alloc_inode();
+        (*proc_arp).ftype = FTYPE_PROC_FILE;
+        (*proc_arp).dev_type = PROC_FILE_NET_ARP;
+        (*proc_arp).mode = S_IFREG_L | 0o444;
+        (*proc_arp).readonly = 1;
+        (*proc_arp).parent_ino = (*proc_net_dir).ino;
+        ramfs::dir_add_entry(proc_net_dir, b"arp".as_ptr(), 3, (*proc_arp).ino);
+
+        let proc_dev = ramfs::alloc_inode();
+        (*proc_dev).ftype = FTYPE_PROC_FILE;
+        (*proc_dev).dev_type = PROC_FILE_NET_DEV;
+        (*proc_dev).mode = S_IFREG_L | 0o444;
+        (*proc_dev).readonly = 1;
+        (*proc_dev).parent_ino = (*proc_net_dir).ino;
+        ramfs::dir_add_entry(proc_net_dir, b"dev".as_ptr(), 3, (*proc_dev).ino);
+
         let mnt_dir = ramfs::alloc_inode();
         (*mnt_dir).ftype = FTYPE_DIRECTORY;
         (*mnt_dir).mode = S_IFDIR_L | 0o755;
@@ -715,6 +867,37 @@ unsafe fn init_ramfs() {
         (*tmp_dir).nlink = 2;
         (*tmp_dir).parent_ino = (*root).ino;
         ramfs::dir_add_entry(root, b"tmp".as_ptr(), 3, (*tmp_dir).ino);
+
+        let etc_dir = ramfs::alloc_inode();
+        (*etc_dir).ftype = FTYPE_DIRECTORY;
+        (*etc_dir).mode = S_IFDIR_L | 0o755;
+        (*etc_dir).nlink = 2;
+        (*etc_dir).parent_ino = (*root).ino;
+        ramfs::dir_add_entry(root, b"etc".as_ptr(), 3, (*etc_dir).ino);
+
+        let hosts = ramfs::alloc_inode();
+        (*hosts).ftype = FTYPE_PROC_FILE;
+        (*hosts).dev_type = PROC_FILE_ETC_HOSTS;
+        (*hosts).mode = S_IFREG_L | 0o444;
+        (*hosts).readonly = 1;
+        (*hosts).parent_ino = (*etc_dir).ino;
+        ramfs::dir_add_entry(etc_dir, b"hosts".as_ptr(), 5, (*hosts).ino);
+
+        let host = ramfs::alloc_inode();
+        (*host).ftype = FTYPE_PROC_FILE;
+        (*host).dev_type = PROC_FILE_ETC_HOSTS;
+        (*host).mode = S_IFREG_L | 0o444;
+        (*host).readonly = 1;
+        (*host).parent_ino = (*etc_dir).ino;
+        ramfs::dir_add_entry(etc_dir, b"host".as_ptr(), 4, (*host).ino);
+
+        let resolv_conf = ramfs::alloc_inode();
+        (*resolv_conf).ftype = FTYPE_PROC_FILE;
+        (*resolv_conf).dev_type = PROC_FILE_ETC_RESOLV_CONF;
+        (*resolv_conf).mode = S_IFREG_L | 0o444;
+        (*resolv_conf).readonly = 1;
+        (*resolv_conf).parent_ino = (*etc_dir).ino;
+        ramfs::dir_add_entry(etc_dir, b"resolv.conf".as_ptr(), 11, (*resolv_conf).ino);
 
         let initrd = INITRD_VADDR as *const u8;
         let initrd_size = ramfs::read_boot_info_initrd_size();
@@ -834,10 +1017,29 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     signal_ready();
 
+    if unsafe { !inet::prepare_inet_callback_endpoint() } {
+        besalt::uerror!(|_lb| {
+            _lb.str(b"[VFS] failed to prepare netsrv callback endpoint\n");
+        });
+        idle();
+    }
+
     let mut msg = BesaltMsg::zeroed();
     let mut badge: u64 = 0;
+    let mut recv_source: u64 = 0;
+    let recv_endpoints = [CAP_SERVER_EP, VFS_CAP_NETSRV_CALLBACK_EP];
+    let mut have_message = true;
 
-    let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
+    let err = unsafe {
+        ipc::recv_any_ctx(
+            ipc_ctx(),
+            recv_endpoints.as_ptr(),
+            recv_endpoints.len(),
+            &raw mut msg,
+            &raw mut badge,
+            &raw mut recv_source,
+        )
+    };
     if err != 0 {
         besalt::uerror!(|_lb| {
             _lb.str(b"[VFS] initial recv failed\n");
@@ -847,208 +1049,215 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     loop {
         let mut reply = BesaltMsg::zeroed();
-        let mut skip_reply = false;
+        let mut skip_reply = true;
 
-        if badge == consts::NETSRV_CALLBACK_BADGE {
-            // Async completion from netsrv (NET_COMPLETE)
-            unsafe {
-                inet::handle_netsrv_callback(&raw const msg, &raw mut reply);
-            }
-            // reply to netsrv to complete the callback IPC — do NOT skip reply
-        } else if msg.length == 0 && msg.label == 0 && badge != 0 {
-            unsafe {
-                misc::handle_pty_notification(badge);
-            }
-            skip_reply = true;
-        } else {
-            unsafe {
-                match msg.label {
-                    VFS_OPEN => {
-                        fileops::handle_open(&raw const msg, &raw mut reply, badge);
+        if have_message {
+            skip_reply = false;
+
+            if recv_source == IPC_RECV_SOURCE_NOTIFICATION {
+                unsafe {
+                    misc::handle_pty_notification(badge);
+                }
+                skip_reply = true;
+            } else if recv_source == 1 {
+                // Async completion from netsrv. netsrv rebadges the transferred
+                // callback endpoint locally, so callback identity is enforced by
+                // the badge on the dedicated callback EP.
+                if badge == consts::NETSRV_CALLBACK_BADGE {
+                    unsafe {
+                        inet::handle_netsrv_callback(&raw const msg, &raw mut reply);
                     }
-                    VFS_READ => {
-                        let fd = msg.regs[0] as i32;
-                        let cli = client::get_client(badge);
-                        if !cli.is_null()
-                            && fd >= 0
-                            && fd < (*cli).fds_cap as i32
-                            && (*(*cli).fds.add(fd as usize)).active != 0
-                        {
-                            match (*(*cli).fds.add(fd as usize)).fd_type {
-                                FD_TYPE_INET_SOCKET => {
-                                    skip_reply = inet::handle_inet_read(
-                                        &raw const msg,
-                                        (*cli).fds.add(fd as usize),
-                                        &raw mut reply,
-                                        badge,
-                                    );
-                                }
-                                FD_TYPE_SOCKET => {
-                                    skip_reply = socket::handle_socket_read(
-                                        (*cli).fds.add(fd as usize),
-                                        &raw mut reply,
-                                        badge,
-                                    );
-                                }
-                                FD_TYPE_PIPE => {
-                                    skip_reply = pipe::handle_pipe_read(
-                                        &raw const msg,
-                                        (*cli).fds.add(fd as usize),
-                                        &raw mut reply,
-                                        badge,
-                                    );
-                                }
-                                FD_TYPE_DEVICE => {
-                                    if (*(*cli).fds.add(fd as usize)).dev_type == DEV_PTY_SLAVE {
-                                        skip_reply = misc::handle_pty_dev_read(
+                } else {
+                    reply.label = BESALT_INVALID_OPERATION;
+                }
+                // reply to netsrv to complete the callback IPC — do NOT skip reply
+            } else {
+                unsafe {
+                    match msg.label {
+                        VFS_OPEN => {
+                            fileops::handle_open(&raw const msg, &raw mut reply, badge);
+                        }
+                        VFS_READ => {
+                            let fd = msg.regs[0] as i32;
+                            let cli = client::get_client(badge);
+                            if !cli.is_null()
+                                && fd >= 0
+                                && fd < (*cli).fds_cap as i32
+                                && (*(*cli).fds.add(fd as usize)).active != 0
+                            {
+                                match (*(*cli).fds.add(fd as usize)).fd_type {
+                                    FD_TYPE_INET_SOCKET => {
+                                        skip_reply = inet::handle_inet_read(
                                             &raw const msg,
                                             (*cli).fds.add(fd as usize),
                                             &raw mut reply,
                                             badge,
                                         );
-                                    } else {
-                                        fileops::handle_read(&raw const msg, &raw mut reply, badge);
                                     }
-                                }
-                                FD_TYPE_MOUNT => {
-                                    let fde = &mut *(*cli).fds.add(fd as usize);
-                                    let mount_idx = fde.dev_type as usize;
-                                    let remote_ino = fde.sock_id as u64;
-                                    let count = msg.regs[1];
-                                    if *(&raw const VFS_SHM_ACTIVE) {
-                                        // SHM bulk read path
-                                        mount::mount_read_shm(
-                                            mount_idx,
-                                            remote_ino,
-                                            fde.offset,
-                                            count,
-                                            0,
+                                    FD_TYPE_SOCKET => {
+                                        skip_reply = socket::handle_socket_read(
+                                            (*cli).fds.add(fd as usize),
                                             &raw mut reply,
+                                            badge,
                                         );
-                                        if reply.label == BESALT_OK {
-                                            let bytes_read = reply.regs[0];
-                                            let copy_len = bytes_read.min(152);
-                                            reply.length = 1 + (copy_len + 7) / 8;
-                                            let src = VFS_SALTYFS_SHM_VADDR as *const u8;
-                                            let dst = &raw mut reply.regs[1] as *mut u8;
-                                            for j in 0..copy_len as usize {
-                                                *dst.add(j) = *src.add(j);
-                                            }
+                                    }
+                                    FD_TYPE_PIPE => {
+                                        skip_reply = pipe::handle_pipe_read(
+                                            &raw const msg,
+                                            (*cli).fds.add(fd as usize),
+                                            &raw mut reply,
+                                            badge,
+                                        );
+                                    }
+                                    FD_TYPE_DEVICE => {
+                                        if (*(*cli).fds.add(fd as usize)).dev_type == DEV_PTY_SLAVE {
+                                            skip_reply = misc::handle_pty_dev_read(
+                                                &raw const msg,
+                                                (*cli).fds.add(fd as usize),
+                                                &raw mut reply,
+                                                badge,
+                                            );
+                                        } else {
+                                            fileops::handle_read(&raw const msg, &raw mut reply, badge);
                                         }
-                                    } else {
-                                        let capped = count.min(152);
-                                        mount::mount_read_inline(
-                                            mount_idx,
-                                            remote_ino,
-                                            fde.offset,
-                                            capped,
-                                            &raw mut reply,
-                                        );
                                     }
-                                    if reply.label == BESALT_OK {
-                                        let bytes_read = reply.regs[0];
-                                        fde.offset += bytes_read;
-                                    }
-                                }
-                                _ => {
-                                    fileops::handle_read(&raw const msg, &raw mut reply, badge);
-                                }
-                            }
-                        } else {
-                            fileops::handle_read(&raw const msg, &raw mut reply, badge);
-                        }
-                    }
-                    VFS_WRITE => {
-                        let fd = msg.regs[0] as i32;
-                        let cli = client::get_client(badge);
-                        if !cli.is_null()
-                            && fd >= 0
-                            && fd < (*cli).fds_cap as i32
-                            && (*(*cli).fds.add(fd as usize)).active != 0
-                        {
-                            match (*(*cli).fds.add(fd as usize)).fd_type {
-                                FD_TYPE_INET_SOCKET => {
-                                    skip_reply = inet::handle_inet_write(
-                                        &raw const msg,
-                                        (*cli).fds.add(fd as usize),
-                                        &raw mut reply,
-                                    );
-                                }
-                                FD_TYPE_SOCKET => {
-                                    skip_reply = socket::handle_socket_write(
-                                        &raw const msg,
-                                        (*cli).fds.add(fd as usize),
-                                        &raw mut reply,
-                                    );
-                                }
-                                FD_TYPE_PIPE => {
-                                    skip_reply = pipe::handle_pipe_write(
-                                        &raw const msg,
-                                        (*cli).fds.add(fd as usize),
-                                        &raw mut reply,
-                                        badge,
-                                    );
-                                }
-                                FD_TYPE_MOUNT => {
-                                    let fde = &mut *(*cli).fds.add(fd as usize);
-                                    if !client::flags_allow_write(fde.flags) {
-                                        reply.label = BESALT_INVALID_OPERATION;
-                                    } else {
+                                    FD_TYPE_MOUNT => {
+                                        let fde = &mut *(*cli).fds.add(fd as usize);
                                         let mount_idx = fde.dev_type as usize;
                                         let remote_ino = fde.sock_id as u64;
                                         let count = msg.regs[1];
-                                        let mut offset = fde.offset;
-                                        if (fde.flags & O_APPEND) != 0 {
-                                            if let Some((sz, _, _, _, _)) =
-                                                mount::mount_stat(mount_idx, remote_ino)
-                                            {
-                                                offset = sz;
-                                            }
-                                        }
-                                        if count > 136 && *(&raw const VFS_SHM_ACTIVE) {
-                                            // SHM bulk write path
-                                            let max_inline: u64 = 18 * 8;
-                                            let shm_limit: u64 = VFS_SALTYFS_SHM_PAGES * 4096;
-                                            let safe_count = count.min(max_inline).min(shm_limit);
-                                            let src = &msg.regs[2] as *const u64 as *const u8;
-                                            let dst = VFS_SALTYFS_SHM_VADDR as *mut u8;
-                                            for j in 0..safe_count as usize {
-                                                *dst.add(j) = *src.add(j);
-                                            }
-                                            mount::mount_write_shm(
+                                        if *(&raw const VFS_SHM_ACTIVE) {
+                                            mount::mount_read_shm(
                                                 mount_idx,
                                                 remote_ino,
-                                                offset,
-                                                safe_count,
+                                                fde.offset,
+                                                count,
                                                 0,
                                                 &raw mut reply,
                                             );
+                                            if reply.label == BESALT_OK {
+                                                let bytes_read = reply.regs[0];
+                                                let copy_len = bytes_read.min(152);
+                                                reply.length = 1 + (copy_len + 7) / 8;
+                                                let src = VFS_SALTYFS_SHM_VADDR as *const u8;
+                                                let dst = &raw mut reply.regs[1] as *mut u8;
+                                                for j in 0..copy_len as usize {
+                                                    *dst.add(j) = *src.add(j);
+                                                }
+                                            }
                                         } else {
-                                            let capped = count.min(136);
-                                            let src = &msg.regs[2] as *const u64 as *const u8;
-                                            mount::mount_write_inline(
+                                            let capped = count.min(152);
+                                            mount::mount_read_inline(
                                                 mount_idx,
                                                 remote_ino,
-                                                offset,
-                                                src,
+                                                fde.offset,
                                                 capped,
                                                 &raw mut reply,
                                             );
                                         }
                                         if reply.label == BESALT_OK {
-                                            let written = reply.regs[0];
-                                            fde.offset = offset + written;
+                                            let bytes_read = reply.regs[0];
+                                            fde.offset += bytes_read;
                                         }
                                     }
+                                    _ => {
+                                        fileops::handle_read(&raw const msg, &raw mut reply, badge);
+                                    }
                                 }
-                                _ => {
-                                    fileops::handle_write(&raw const msg, &raw mut reply, badge);
-                                }
+                            } else {
+                                fileops::handle_read(&raw const msg, &raw mut reply, badge);
                             }
-                        } else {
-                            fileops::handle_write(&raw const msg, &raw mut reply, badge);
-                        }
-                    }
+                        },
+                        VFS_WRITE => {
+                            let fd = msg.regs[0] as i32;
+                            let cli = client::get_client(badge);
+                            if !cli.is_null()
+                                && fd >= 0
+                                && fd < (*cli).fds_cap as i32
+                                && (*(*cli).fds.add(fd as usize)).active != 0
+                            {
+                                match (*(*cli).fds.add(fd as usize)).fd_type {
+                                    FD_TYPE_INET_SOCKET => {
+                                        skip_reply = inet::handle_inet_write(
+                                            &raw const msg,
+                                            (*cli).fds.add(fd as usize),
+                                            &raw mut reply,
+                                        );
+                                    }
+                                    FD_TYPE_SOCKET => {
+                                        skip_reply = socket::handle_socket_write(
+                                            &raw const msg,
+                                            (*cli).fds.add(fd as usize),
+                                            &raw mut reply,
+                                        );
+                                    }
+                                    FD_TYPE_PIPE => {
+                                        skip_reply = pipe::handle_pipe_write(
+                                            &raw const msg,
+                                            (*cli).fds.add(fd as usize),
+                                            &raw mut reply,
+                                            badge,
+                                        );
+                                    }
+                                    FD_TYPE_MOUNT => {
+                                        let fde = &mut *(*cli).fds.add(fd as usize);
+                                        if !client::flags_allow_write(fde.flags) {
+                                            reply.label = BESALT_INVALID_OPERATION;
+                                        } else {
+                                            let mount_idx = fde.dev_type as usize;
+                                            let remote_ino = fde.sock_id as u64;
+                                            let count = msg.regs[1];
+                                            let mut offset = fde.offset;
+                                            if (fde.flags & O_APPEND) != 0 {
+                                                if let Some((sz, _, _, _, _)) =
+                                                    mount::mount_stat(mount_idx, remote_ino)
+                                                {
+                                                    offset = sz;
+                                                }
+                                            }
+                                            if count > 136 && *(&raw const VFS_SHM_ACTIVE) {
+                                                let max_inline: u64 = 18 * 8;
+                                                let shm_limit: u64 = VFS_SALTYFS_SHM_PAGES * 4096;
+                                                let safe_count = count.min(max_inline).min(shm_limit);
+                                                let src = &msg.regs[2] as *const u64 as *const u8;
+                                                let dst = VFS_SALTYFS_SHM_VADDR as *mut u8;
+                                                for j in 0..safe_count as usize {
+                                                    *dst.add(j) = *src.add(j);
+                                                }
+                                                mount::mount_write_shm(
+                                                    mount_idx,
+                                                    remote_ino,
+                                                    offset,
+                                                    safe_count,
+                                                    0,
+                                                    &raw mut reply,
+                                                );
+                                            } else {
+                                                let capped = count.min(136);
+                                                let src = &msg.regs[2] as *const u64 as *const u8;
+                                                mount::mount_write_inline(
+                                                    mount_idx,
+                                                    remote_ino,
+                                                    offset,
+                                                    src,
+                                                    capped,
+                                                    &raw mut reply,
+                                                );
+                                            }
+                                            if reply.label == BESALT_OK {
+                                                let written = reply.regs[0];
+                                                fde.offset = offset + written;
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        fileops::handle_write(&raw const msg, &raw mut reply, badge);
+                                    }
+                                }
+                            } else {
+                                fileops::handle_write(&raw const msg, &raw mut reply, badge);
+                            }
+                        },
                     VFS_CLOSE => {
                         let fd = msg.regs[0] as i32;
                         let cli = client::get_client(badge);
@@ -1276,6 +1485,22 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                                 socket::handle_shutdown(&raw const msg, &raw mut reply, badge);
                         }
                     }
+                    VFS_GETSOCKNAME => {
+                        skip_reply =
+                            inet::handle_inet_getsockname(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_GETPEERNAME => {
+                        skip_reply =
+                            inet::handle_inet_getpeername(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_SETSOCKOPT => {
+                        skip_reply =
+                            inet::handle_inet_setsockopt(&raw const msg, &raw mut reply, badge);
+                    }
+                    VFS_GETSOCKOPT => {
+                        skip_reply =
+                            inet::handle_inet_getsockopt(&raw const msg, &raw mut reply, badge);
+                    }
                     VFS_PIPE => {
                         pipe::handle_pipe(&raw const msg, &raw mut reply, badge);
                     }
@@ -1394,20 +1619,78 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 }
             }
         }
+        }
+
+        unsafe {
+            let now_ns = poll::monotonic_now_ns();
+            poll::expire_poll_timeouts(now_ns);
+        }
+        let timeout_ns = unsafe {
+            let now_ns = poll::monotonic_now_ns();
+            poll::next_poll_timeout_ns(now_ns)
+        };
 
         let err = if skip_reply {
-            unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) }
+            if timeout_ns == 0 {
+                unsafe {
+                    ipc::recv_any_ctx(
+                        ipc_ctx(),
+                        recv_endpoints.as_ptr(),
+                        recv_endpoints.len(),
+                        &raw mut msg,
+                        &raw mut badge,
+                        &raw mut recv_source,
+                    )
+                }
+            } else {
+                unsafe {
+                    ipc::recv_any_timed_ctx(
+                        ipc_ctx(),
+                        recv_endpoints.as_ptr(),
+                        recv_endpoints.len(),
+                        timeout_ns,
+                        &raw mut msg,
+                        &raw mut badge,
+                        &raw mut recv_source,
+                    )
+                }
+            }
         } else {
-            unsafe {
-                ipc::reply_recv_ctx(
-                    ipc_ctx(),
-                    CAP_SERVER_EP,
-                    &raw const reply,
-                    &raw mut msg,
-                    &raw mut badge,
-                )
+            if timeout_ns == 0 {
+                unsafe {
+                    ipc::reply_recv_any_ctx(
+                        ipc_ctx(),
+                        recv_endpoints.as_ptr(),
+                        recv_endpoints.len(),
+                        &raw const reply,
+                        &raw mut msg,
+                        &raw mut badge,
+                        &raw mut recv_source,
+                    )
+                }
+            } else {
+                unsafe {
+                    ipc::reply_recv_any_timed_ctx(
+                        ipc_ctx(),
+                        recv_endpoints.as_ptr(),
+                        recv_endpoints.len(),
+                        timeout_ns,
+                        &raw const reply,
+                        &raw mut msg,
+                        &raw mut badge,
+                        &raw mut recv_source,
+                    )
+                }
             }
         };
+        if err == BESALT_CANCELLED as i32 || err == BESALT_TIMED_OUT as i32 {
+            unsafe {
+                let now_ns = poll::monotonic_now_ns();
+                poll::expire_poll_timeouts(now_ns);
+            }
+            have_message = false;
+            continue;
+        }
         if err != 0 {
             besalt::uerror!(|_lb| {
                 _lb.str(b"[VFS] reply_recv failed err=");
@@ -1416,6 +1699,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             });
             break;
         }
+        have_message = true;
     }
 
     idle();

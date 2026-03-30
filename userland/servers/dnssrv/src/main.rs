@@ -88,7 +88,7 @@ fn puts(s: &[u8]) {
 }
 
 fn ipc_ctx() -> *mut IpcContext {
-    &raw mut besalt::__besalt_ipc_ctx
+    besalt::tls::current_ipc_ctx()
 }
 
 fn signal_ready() {
@@ -271,6 +271,13 @@ fn handle_resolve(msg: &BesaltMsg, reply: &mut BesaltMsg) {
 
     // 1. Check cache
     if let Some((ip_count, ips)) = cache_lookup(&hostname[..hostname_len]) {
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[dnssrv] cache hit host_len=");
+            _lb.dec(hostname_len as u64);
+            _lb.str(b" count=");
+            _lb.dec(ip_count as u64);
+            _lb.putc(b'\n');
+        });
         reply.label = BESALT_OK;
         reply.regs[0] = ip_count as u64;
         reply.regs[1] = 0;
@@ -284,6 +291,11 @@ fn handle_resolve(msg: &BesaltMsg, reply: &mut BesaltMsg) {
     }
 
     // 2. Cache miss: forward to netsrv
+    besalt::udebug!(|_lb| {
+        _lb.str(b"[dnssrv] resolve miss host_len=");
+        _lb.dec(hostname_len as u64);
+        _lb.putc(b'\n');
+    });
     let mut netsrv_msg = BesaltMsg::zeroed();
     netsrv_msg.label = NET_DNS_RESOLVE;
     netsrv_msg.regs[0] = hostname_len as u64;
@@ -304,6 +316,13 @@ fn handle_resolve(msg: &BesaltMsg, reply: &mut BesaltMsg) {
             &raw mut netsrv_reply,
         )
     };
+    besalt::udebug!(|_lb| {
+        _lb.str(b"[dnssrv] netsrv reply err=");
+        _lb.dec(err as u64);
+        _lb.str(b" label=");
+        _lb.dec(netsrv_reply.label);
+        _lb.putc(b'\n');
+    });
     if err != 0 || netsrv_reply.label != BESALT_OK {
         reply.label = if netsrv_reply.label != 0 {
             netsrv_reply.label
@@ -323,6 +342,13 @@ fn handle_resolve(msg: &BesaltMsg, reply: &mut BesaltMsg) {
         ips[i] = netsrv_reply.regs[2 + i] as u32;
         i += 1;
     }
+    besalt::udebug!(|_lb| {
+        _lb.str(b"[dnssrv] resolve done count=");
+        _lb.dec(ip_count as u64);
+        _lb.str(b" ttl=");
+        _lb.dec(ttl as u64);
+        _lb.putc(b'\n');
+    });
     cache_insert(&hostname[..hostname_len], &ips, ip_count, ttl);
 
     // 4. Return to client

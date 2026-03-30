@@ -32,6 +32,7 @@ struct BootInfoHeader *handoff_build_bootinfo(
     void *buffer,
     size_t buffer_size,
     struct Stage2Info *stage2_info,
+    uint32_t extra_flags,
     struct ElfLoadResult *kernel,
     uint64_t initrd_addr,
     uint64_t initrd_size,

@@ -55,6 +55,21 @@ unsafe extern "C" {
     fn aarch64_context_switch(old_sp: *mut u64, new_sp: u64);
 }
 
+#[inline(always)]
+unsafe fn write_user_return_state(return_elr: u64, return_spsr: u64, user_sp: u64) {
+    unsafe {
+        core::arch::asm!(
+            "msr ELR_EL1, {return_elr}",
+            "msr SPSR_EL1, {return_spsr}",
+            "msr SP_EL0, {sp}",
+            return_elr = in(reg) return_elr,
+            return_spsr = in(reg) return_spsr,
+            sp = in(reg) user_sp,
+            options(nomem, nostack),
+        );
+    }
+}
+
 /// Size of the callee-saved register frame used by `aarch64_context_switch`.
 pub const SWITCH_FRAME_SIZE: u64 = 96;
 const SWITCH_FRAME_LR_OFFSET: u64 = 88;
@@ -85,7 +100,7 @@ pub unsafe fn init_kernel_thread_context(
     }
     *context = ThreadContext::empty();
     context.sp = frame_base;
-    context.elr_el1 = entry;
+    context.return_elr = entry;
 }
 
 /// Initialize a fresh user thread for first dispatch through the trampoline.
@@ -101,13 +116,13 @@ pub unsafe fn init_user_thread_context(
     let frame_base = kernel_stack_top - SWITCH_FRAME_SIZE;
     // SAFETY: Caller provides a valid writable kernel stack for the new thread.
     unsafe {
-        init_switch_frame(frame_base, usermode_trampoline as usize as u64);
+        init_switch_frame(frame_base, usermode_trampoline as *const () as usize as u64);
     }
     *context = ThreadContext::empty();
     context.sp = frame_base;
-    context.elr_el1 = user_entry;
-    context.spsr_el1 = spsr;
-    context.x[19] = user_sp;
+    context.return_elr = user_entry;
+    context.return_spsr = spsr;
+    context.user_sp = user_sp;
 }
 
 /// Return the kernel PC that `context_switch` will `ret` to for this context.
@@ -146,18 +161,18 @@ pub unsafe fn context_switch(
 /// When `context_switch` restores a new thread for the first time, it
 /// "returns" to this function (LR was set to this address during thread
 /// setup). The trampoline reads the thread's saved state from the TCB,
-/// loads TTBR0_EL1 from the thread's VSpace, zeroes all general-purpose
+/// loads the active host TTBR0 from the thread's VSpace, zeroes all general-purpose
 /// registers to prevent kernel address leaks, and executes `eret` to
 /// enter EL0.
 ///
 /// Convention for initial thread setup (must be set by init.rs / thread_configure):
 ///   - `context.sp`       = kernel stack pointer (with trampoline frame)
-///   - `context.elr_el1`  = user entry point (ELR_EL1 for eret)
-///   - `context.spsr_el1` = user PSTATE (SPSR_EL1 for eret)
-///   - `context.x[19]`    = user stack pointer (SP_EL0)
+///   - `context.return_elr`  = user entry point (restored into host ELR for `eret`)
+///   - `context.return_spsr` = user PSTATE (restored into host SPSR for `eret`)
+///   - `context.user_sp` = user stack pointer (restored into SP_EL0)
 ///
 /// `context.sp` is consumed by `context_switch` for the kernel SP.
-/// The `elr_el1`, `spsr_el1`, and `x[19]` fields are untouched by
+/// The `return_elr`, `return_spsr`, and `user_sp` fields are untouched by
 /// `context_switch` (which only saves/restores callee-saved regs on
 /// the stack and the SP field).
 ///
@@ -174,12 +189,12 @@ pub unsafe extern "C" fn usermode_trampoline() -> ! {
         let scheduler = crate::sched::scheduler::scheduler();
         let tcb = &*scheduler.current();
 
-        let entry = tcb.context.elr_el1;
-        let user_sp = tcb.context.x[19];  // User SP_EL0 (stored in x19 slot)
-        let spsr = tcb.context.spsr_el1;
+        let return_elr = tcb.context.return_elr;
+        let user_sp = tcb.context.user_sp;
+        let return_spsr = tcb.context.return_spsr;
 
         // Load user page table if a VSpace is configured.
-        // On AArch64, TTBR0_EL1 must include the ASID in bits [63:48].
+        // On AArch64, the active host TTBR0 must include the ASID in bits [63:48].
         // prepare_switch_target_full() already called switch_to() which set
         // the correct TTBR0 with ASID, but the trampoline must also set it
         // so that threads created after boot (e.g. fork children) get the
@@ -188,29 +203,22 @@ pub unsafe extern "C" fn usermode_trampoline() -> ! {
         // child's virtual addresses to wrong physical pages.
         if !tcb.vspace_root.is_null() {
             let vspace = &*tcb.vspace_root;
-            let ttbr0 = vspace.ensure_asid() | vspace.root();
+            let ttbr0 = vspace.host_ttbr0();
             // SAFETY: The scheduler has already selected this thread's VSpace.
             // Reuse the common helper so first-entry trampolines get the same
             // TLB semantics as normal AArch64 VSpace switches.
             crate::arch::paging::write_cr3(ttbr0);
         }
 
-        // SAFETY: Setting ELR_EL1, SPSR_EL1, and SP_EL0 configures the
-        // processor state that eret will restore. All three values come
-        // from the TCB which was initialized by the kernel.
-        core::arch::asm!(
-            "msr ELR_EL1, {entry}",
-            "msr SPSR_EL1, {spsr}",
-            "msr SP_EL0, {sp}",
-            entry = in(reg) entry,
-            spsr = in(reg) spsr,
-            sp = in(reg) user_sp,
-            options(nomem, nostack),
-        );
+        // SAFETY: Setting the active host ELR/SPSR pair plus SP_EL0
+        // configures the processor state that eret will restore. All three
+        // values come from the TCB which was initialized by the kernel.
+        write_user_return_state(return_elr, return_spsr, user_sp);
 
         // SAFETY: Zeroing all GPRs prevents leaking kernel addresses to
         // userspace. The eret instruction atomically restores PSTATE from
-        // SPSR_EL1 and jumps to ELR_EL1 at EL0. This sequence does not
+        // the active host SPSR and jumps to the active host ELR at EL0.
+        // This sequence does not
         // return.
         core::arch::asm!(
             "mov x0, xzr",

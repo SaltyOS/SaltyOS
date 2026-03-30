@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! AArch64 exception vector table and dispatch handlers.
 //!
-//! Provides the VBAR_EL1 vector table (via `global_asm!`) and Rust-side
+//! Provides the active host vector table (via `global_asm!`) and Rust-side
 //! handlers for synchronous exceptions (SVC, data/instruction aborts) and
 //! IRQs from both EL1 and EL0.
 
@@ -51,12 +51,93 @@ const EC_SPALIGN: u64 = 0x26;
 /// Access to SVE, Advanced SIMD, or floating-point (trapped).
 const EC_FP_TRAP: u64 = 0x07;
 
+#[inline(always)]
+fn read_exception_esr() -> u64 {
+    let esr: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, ESR_EL1", out(reg) esr, options(nomem, nostack));
+    }
+    esr
+}
+
+#[inline(always)]
+fn read_exception_far() -> u64 {
+    let far: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, FAR_EL1", out(reg) far, options(nomem, nostack));
+    }
+    far
+}
+
 /// Spurious interrupt ID (no pending interrupt).
 const INTID_SPURIOUS: u32 = 1023;
-/// Physical timer PPI interrupt ID.
-const INTID_PHYS_TIMER: u32 = 30;
 /// Maximum SGI interrupt ID (inclusive).
 const INTID_SGI_MAX: u32 = 15;
+
+unsafe fn save_el0_frame_to_current_tcb(frame: *const ExceptionFrame) {
+    unsafe {
+        let current = crate::sched::scheduler::scheduler().current();
+        if current.is_null() {
+            return;
+        }
+        let ctx = &mut (*current).context;
+        let mut i = 0usize;
+        while i < 31 {
+            ctx.x[i] = (*frame).regs[i];
+            i += 1;
+        }
+        ctx.user_sp = (*frame).sp_el0;
+        ctx.return_elr = (*frame).elr_el1;
+        ctx.return_spsr = (*frame).spsr_el1;
+    }
+}
+
+unsafe fn restore_el0_frame_from_current_tcb(frame: *mut ExceptionFrame, x0: u64, x1: u64) {
+    unsafe {
+        let current = crate::sched::scheduler::scheduler().current();
+        if current.is_null() {
+            (*frame).regs[0] = x0;
+            (*frame).regs[1] = x1;
+            return;
+        }
+        let ctx = &(*current).context;
+        let mut i = 0usize;
+        while i < 31 {
+            (*frame).regs[i] = ctx.x[i];
+            i += 1;
+        }
+        (*frame).sp_el0 = ctx.user_sp;
+        (*frame).elr_el1 = ctx.return_elr;
+        (*frame).spsr_el1 = ctx.return_spsr;
+        (*frame).regs[0] = x0;
+        (*frame).regs[1] = x1;
+    }
+}
+
+unsafe fn sync_el0_ttbr0_from_current_tcb(frame: *const ExceptionFrame) {
+    unsafe {
+        let current = crate::sched::scheduler::scheduler().current();
+        if current.is_null() || (*current).vspace_root.is_null() {
+            return;
+        }
+
+        let vspace = &*(*current).vspace_root;
+        let expected = vspace.host_ttbr0();
+        let active = crate::arch::paging::read_cr3();
+        if active != expected {
+            let f = &*frame;
+            let s = crate::SerialGuard::acquire();
+            s.puts("[A64] TTBR0 mismatch on EL0 resume: active=");
+            s.hex(active);
+            s.puts(" expected=");
+            s.hex(expected);
+            s.puts(" elr=");
+            s.hex(f.elr_el1);
+            s.puts("\n");
+        }
+        crate::arch::paging::write_cr3(expected);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Vector table + save/restore macros (assembly)
@@ -220,21 +301,13 @@ el0_serror:
 /// Reads ESR_EL1 to determine the exception class and dispatches accordingly.
 #[unsafe(no_mangle)]
 extern "C" fn el1_sync_handler(frame: *const ExceptionFrame) {
-    let esr: u64;
-    // SAFETY: Reading ESR_EL1 is always safe from EL1.
-    unsafe {
-        core::arch::asm!("mrs {}, ESR_EL1", out(reg) esr, options(nomem, nostack));
-    }
+    let esr = read_exception_esr();
     let ec = (esr >> 26) & 0x3F;
 
     match ec {
         EC_DABT_CURRENT => {
             // Data abort from EL1 (kernel page fault).
-            let far: u64;
-            // SAFETY: Reading FAR_EL1 is always safe from EL1.
-            unsafe {
-                core::arch::asm!("mrs {}, FAR_EL1", out(reg) far, options(nomem, nostack));
-            }
+            let far = read_exception_far();
             // SAFETY: frame was set up by SAVE_REGS and is valid.
             let elr = unsafe { (*frame).elr_el1 };
 
@@ -300,11 +373,7 @@ extern "C" fn el1_sync_handler(frame: *const ExceptionFrame) {
         }
         EC_IABT_CURRENT => {
             // Instruction abort from EL1.
-            let far: u64;
-            // SAFETY: Reading FAR_EL1 is always safe from EL1.
-            unsafe {
-                core::arch::asm!("mrs {}, FAR_EL1", out(reg) far, options(nomem, nostack));
-            }
+            let far = read_exception_far();
             // SAFETY: frame was set up by SAVE_REGS and is valid.
             let elr = unsafe { (*frame).elr_el1 };
             panic!(
@@ -337,9 +406,9 @@ extern "C" fn el1_irq_handler(_frame: *const ExceptionFrame) {
     let intid = super::gic::acknowledge_irq();
 
     match intid {
-        INTID_PHYS_TIMER => {
-            // Physical timer PPI — re-arm before EOI to clear ISTATUS,
-            // then EOI before timer_tick (which may context-switch).
+        intid if intid == super::timer::irq_intid() => {
+            // Active timer PPI — re-arm before EOI to clear ISTATUS, then EOI
+            // before timer_tick (which may context-switch).
             super::timer::rearm();
             super::gic::eoi(intid);
             crate::sched::timer_tick();
@@ -467,6 +536,8 @@ fn log_el0_sync_state(
         s.hex(f.elr_el1);
         s.puts(" SP_EL0=");
         s.hex(f.sp_el0);
+        s.puts(" TTBR0=");
+        s.hex(crate::arch::paging::read_cr3());
         s.puts(" X29=");
         s.hex(f.regs[29]);
         s.puts(" X30=");
@@ -481,11 +552,7 @@ fn log_el0_sync_state(
 /// aborts, and FP/NEON traps.
 #[unsafe(no_mangle)]
 extern "C" fn el0_sync_handler(frame: *mut ExceptionFrame) {
-    let esr: u64;
-    // SAFETY: Reading ESR_EL1 is always safe from EL1.
-    unsafe {
-        core::arch::asm!("mrs {}, ESR_EL1", out(reg) esr, options(nomem, nostack));
-    }
+    let esr = read_exception_esr();
     let ec = (esr >> 26) & 0x3F;
 
     match ec {
@@ -500,28 +567,34 @@ extern "C" fn el0_sync_handler(frame: *mut ExceptionFrame) {
             // syscall_handle_rust and the fastpath functions are unsafe
             // because they perform privileged kernel operations.
             unsafe {
+                save_el0_frame_to_current_tcb(frame);
                 let f = &*frame;
                 let syscall_num = f.regs[8];
 
-                // IPC fastpath: Call (2) and ReplyRecv (3).
+                // IPC fastpath: Call (2), ReplyRecv (3), and ReplyRecvAny (24).
                 // Mirrors x86_64 syscall.S fastpath dispatch. The AAPCS64
                 // calling convention matches the register layout exactly
                 // (x0-x5 → first 6 arguments), so no remapping is needed.
-                if syscall_num == 2 || syscall_num == 3 {
+                if syscall_num == 2 || syscall_num == 3 || syscall_num == 24 {
                     let fp_result = if syscall_num == 2 {
                         crate::syscall::fastpath::fastpath_call_rust(
                             f.regs[0], f.regs[1], f.regs[2],
                             f.regs[3], f.regs[4], f.regs[5],
                         )
-                    } else {
+                    } else if syscall_num == 3 {
                         crate::syscall::fastpath::fastpath_reply_recv_rust(
+                            f.regs[0], f.regs[1], f.regs[2],
+                            f.regs[3], f.regs[4], f.regs[5],
+                        )
+                    } else {
+                        crate::syscall::fastpath::fastpath_reply_recv_any_rust(
                             f.regs[0], f.regs[1], f.regs[2],
                             f.regs[3], f.regs[4], f.regs[5],
                         )
                     };
                     if fp_result.status != 0 {
-                        (*frame).regs[0] = 0;              // x0 = no error
-                        (*frame).regs[1] = fp_result.value; // x1 = return value
+                        restore_el0_frame_from_current_tcb(frame, 0, fp_result.value);
+                        sync_el0_ttbr0_from_current_tcb(frame);
                         return;
                     }
                 }
@@ -538,17 +611,13 @@ extern "C" fn el0_sync_handler(frame: *mut ExceptionFrame) {
                 );
                 // Write return values back into the saved frame so RESTORE_REGS
                 // delivers them to userspace.
-                (*frame).regs[0] = result.error; // x0 = error code
-                (*frame).regs[1] = result.value; // x1 = return value
+                restore_el0_frame_from_current_tcb(frame, result.error, result.value);
+                sync_el0_ttbr0_from_current_tcb(frame);
             }
         }
         EC_DABT_LOWER => {
             // Data abort from EL0 (user page fault or device access error).
-            let far: u64;
-            // SAFETY: Reading FAR_EL1 is always safe from EL1.
-            unsafe {
-                core::arch::asm!("mrs {}, FAR_EL1", out(reg) far, options(nomem, nostack));
-            }
+            let far = read_exception_far();
 
             let dfsc = esr & 0x3F;
 
@@ -613,11 +682,7 @@ extern "C" fn el0_sync_handler(frame: *mut ExceptionFrame) {
         }
         EC_IABT_LOWER => {
             // Instruction abort from EL0.
-            let far: u64;
-            // SAFETY: Reading FAR_EL1 is always safe from EL1.
-            unsafe {
-                core::arch::asm!("mrs {}, FAR_EL1", out(reg) far, options(nomem, nostack));
-            }
+            let far = read_exception_far();
 
             let ifsc = esr & 0x3F;
 
@@ -699,11 +764,7 @@ extern "C" fn el0_irq_handler(frame: *const ExceptionFrame) {
 /// unrecoverable hardware-level corruption so we dump state and panic.
 #[unsafe(no_mangle)]
 extern "C" fn el1_serror_handler(frame: *const ExceptionFrame) {
-    let esr: u64;
-    // SAFETY: Reading ESR_EL1 is always safe from EL1.
-    unsafe {
-        core::arch::asm!("mrs {}, ESR_EL1", out(reg) esr, options(nomem, nostack));
-    }
+    let esr = read_exception_esr();
     let f = unsafe { &*frame };
     let iss = esr & 0x01FF_FFFF;
     let dfsc = iss & 0x3F;
@@ -722,11 +783,7 @@ extern "C" fn el1_serror_handler(frame: *const ExceptionFrame) {
 /// the system can continue.
 #[unsafe(no_mangle)]
 extern "C" fn el0_serror_handler(frame: *const ExceptionFrame) {
-    let esr: u64;
-    // SAFETY: Reading ESR_EL1 is always safe from EL1.
-    unsafe {
-        core::arch::asm!("mrs {}, ESR_EL1", out(reg) esr, options(nomem, nostack));
-    }
+    let esr = read_exception_esr();
     let f = unsafe { &*frame };
     let iss = esr & 0x01FF_FFFF;
     let dfsc = iss & 0x3F;
@@ -742,27 +799,25 @@ extern "C" fn el0_serror_handler(frame: *const ExceptionFrame) {
 
 /// Dump register state for SError diagnostics.
 fn dump_serror_state(f: &ExceptionFrame, esr: u64) {
-    unsafe {
-        let s = crate::SerialGuard::acquire();
-        s.puts("  ESR=");
-        s.hex(esr);
-        s.puts(" ELR=");
-        s.hex(f.elr_el1);
-        s.puts(" SPSR=");
-        s.hex(f.spsr_el1);
-        s.puts(" SP_EL0=");
-        s.hex(f.sp_el0);
-        s.puts("\n");
-        s.puts("  x0=");
-        s.hex(f.regs[0]);
-        s.puts(" x1=");
-        s.hex(f.regs[1]);
-        s.puts(" x29=");
-        s.hex(f.regs[29]);
-        s.puts(" x30=");
-        s.hex(f.regs[30]);
-        s.puts("\n");
-    }
+    let s = crate::SerialGuard::acquire();
+    s.puts("  ESR=");
+    s.hex(esr);
+    s.puts(" ELR=");
+    s.hex(f.elr_el1);
+    s.puts(" SPSR=");
+    s.hex(f.spsr_el1);
+    s.puts(" SP_EL0=");
+    s.hex(f.sp_el0);
+    s.puts("\n");
+    s.puts("  x0=");
+    s.hex(f.regs[0]);
+    s.puts(" x1=");
+    s.hex(f.regs[1]);
+    s.puts(" x29=");
+    s.hex(f.regs[29]);
+    s.puts(" x30=");
+    s.hex(f.regs[30]);
+    s.puts("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -780,7 +835,7 @@ pub fn init() {
     // SAFETY: exception_vectors is defined in the global_asm! block above
     // and is guaranteed to be 2048-byte aligned.
     let vbar = core::ptr::addr_of!(exception_vectors) as u64;
-    // SAFETY: Writing VBAR_EL1 is safe during single-threaded boot from EL1.
+    // SAFETY: Writing VBAR_EL1 is safe during single-threaded boot.
     // The ISB ensures the new vector table address is visible before any
     // subsequent exception can be taken.
     unsafe {

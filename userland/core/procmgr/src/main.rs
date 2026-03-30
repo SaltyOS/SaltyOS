@@ -14,6 +14,7 @@ mod proc_table;
 mod session;
 mod signal;
 mod spawn_tx;
+mod timer;
 mod vfs_load;
 
 use besalt::ipc;
@@ -34,6 +35,7 @@ const CAP_VFS_EP: Cap = 65; // NeedEP vfs:65
 const CAP_FB_UNTYPED: Cap = 66; // CopyCap 13:66
 const CAP_INITRD_UNTYPED: Cap = 12;
 const CAP_RECV_SCRATCH: Cap = 15; // Scratch slot for receiving transferred caps
+const CAP_REPLY_TEMP: Cap = 86; // Temporary reply cap for timed receive path
 const CAP_UNTYPED_START: Cap = 16;
 
 const VSPACE_WALK_BATCH: u64 = 48;
@@ -70,9 +72,12 @@ const PM_GET_PROC_INFO: u64 = 28;
 const PM_RESUME: u64 = 29;
 const PM_UMASK: u64 = 30;
 const PM_REQUEST_UNTYPED: u64 = 31;
+const PM_SETITIMER: u64 = 32;
+const PM_GETITIMER: u64 = 33;
 const BESALT_PENDING: u64 = 0x80;
 
 const PM_SIGKILL: usize = 9;
+const PM_SIGALRM: usize = 14;
 const PM_SIGCHLD: usize = 17;
 const PM_SIGCONT: usize = 18;
 const PM_SIGSTOP: usize = 19;
@@ -138,6 +143,7 @@ const BESALT_OUT_OF_RANGE: u64 = besalt::BESALT_OUT_OF_RANGE;
 const BESALT_INVALID_ARGUMENT: u64 = besalt::BESALT_INVALID_ARGUMENT;
 const BESALT_INVALID_OPERATION: u64 = besalt::BESALT_INVALID_OPERATION;
 const BESALT_WOULD_BLOCK: u64 = besalt::BESALT_WOULD_BLOCK;
+const BESALT_CANCELLED: u64 = besalt::BESALT_CANCELLED;
 const VSPACE_FLAG_WRITABLE: u64 = besalt::VSPACE_FLAG_WRITABLE;
 const VSPACE_FLAG_USER: u64 = besalt::VSPACE_FLAG_USER;
 const CAP_RIGHTS_ALL: u64 = besalt::CAP_RIGHTS_ALL;
@@ -178,7 +184,7 @@ fn read_boot_info_initrd_size() -> usize {
 // ===========================================================================
 
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
-    &raw mut besalt::__besalt_ipc_ctx
+    besalt::tls::current_ipc_ctx()
 }
 
 fn signal_ready() {
@@ -346,6 +352,58 @@ unsafe fn handle_list_pids(reply: &mut BesaltMsg) {
         reply.regs[19] = count as u64;
         reply.label = BESALT_OK;
         reply.length = 20;
+    }
+}
+
+unsafe fn recv_with_timer(
+    msg: *mut BesaltMsg,
+    badge: *mut u64,
+) -> i32 {
+    unsafe {
+        if timer::has_pending_timers() {
+            let now = besalt::syscall::syscall(
+                besalt::SYS_CLOCK_GETTIME,
+                besalt::consts::CLOCK_REALTIME as u64,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+            if now.error == 0 {
+                let deadline = timer::nearest_deadline_ns();
+                if deadline <= now.value {
+                    if !msg.is_null() {
+                        *msg = BesaltMsg::zeroed();
+                    }
+                    if !badge.is_null() {
+                        *badge = 1;
+                    }
+                    return 0;
+                }
+
+                let timeout = deadline.saturating_sub(now.value).max(100_000);
+                let err = besalt::ipc::recv_timed_ctx(
+                    ipc_ctx(),
+                    CAP_SERVER_EP,
+                    timeout,
+                    msg,
+                    badge,
+                );
+                if err as u64 == BESALT_CANCELLED {
+                    if !msg.is_null() {
+                        *msg = BesaltMsg::zeroed();
+                    }
+                    if !badge.is_null() {
+                        *badge = 1;
+                    }
+                    return 0;
+                }
+                return err;
+            }
+        }
+
+        besalt::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, msg, badge)
     }
 }
 
@@ -593,7 +651,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         besalt::invoke::cnode_delete(CAP_SELF_CSPACE, CAP_RECV_SCRATCH);
         ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_RECV_SCRATCH, 0);
 
-        let err = besalt::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge);
+        let err = recv_with_timer(&raw mut msg, &raw mut badge);
         if err != 0 {
             besalt::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] initial recv failed\n");
@@ -603,6 +661,8 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
         // Server loop
         loop {
+            timer::process_expired_timers();
+
             let mut reply = BesaltMsg::zeroed();
             let mut skip_reply = false;
             // Bound notification delivery: label=0 and badge!=0 means the
@@ -643,6 +703,8 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     PM_INJECT_CAP => signal::handle_inject_cap(&msg, &mut reply),
                     PM_RESUME => signal::handle_resume(&msg, &mut reply),
                     PM_SIGACTION => signal::handle_sigaction(&msg, &mut reply, badge),
+                    PM_SETITIMER => timer::handle_setitimer(&msg, &mut reply, badge),
+                    PM_GETITIMER => timer::handle_getitimer(&msg, &mut reply, badge),
                     PM_GETUID => session::handle_getuid(&mut reply, badge),
                     PM_GETGID => session::handle_getgid(&mut reply, badge),
                     PM_SETPGID => session::handle_setpgid(&msg, &mut reply, badge),
@@ -680,7 +742,27 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_RECV_SCRATCH, 0);
 
             let err = if skip_reply {
-                besalt::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
+                recv_with_timer(&raw mut msg, &raw mut badge)
+            } else if timer::has_pending_timers() {
+                let save_err = besalt::invoke::cnode_save_caller(CAP_SELF_CSPACE, CAP_REPLY_TEMP);
+                if save_err != 0 {
+                    besalt::uerror!(|_lb| {
+                        _lb.str(b"[PROCMGR] save_caller failed for timed recv err=");
+                        _lb.hex(save_err as u64);
+                        _lb.str(b"\n");
+                    });
+                    break;
+                }
+                let send_err = besalt::ipc::send_ctx(ipc_ctx(), CAP_REPLY_TEMP, &raw const reply);
+                if send_err != 0 {
+                    besalt::uerror!(|_lb| {
+                        _lb.str(b"[PROCMGR] reply send failed before timed recv err=");
+                        _lb.hex(send_err as u64);
+                        _lb.str(b"\n");
+                    });
+                    break;
+                }
+                recv_with_timer(&raw mut msg, &raw mut badge)
             } else {
                 besalt::ipc::reply_recv_ctx(
                     ipc_ctx(),

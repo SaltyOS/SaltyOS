@@ -16,10 +16,6 @@ unsafe extern "C" {
 fn is_canonical_addr(addr: u64) -> bool {
     #[cfg(target_arch = "aarch64")]
     {
-        // With the current 48-bit AArch64 split, kernel addresses live in the
-        // upper region selected by TTBR1 and carry a 0xFFFF top half. This
-        // includes both the kernel image at 0xFFFF_0000_... and the direct map
-        // at 0xFFFF_8000_....
         return (addr >> 48) == 0xFFFF;
     }
 
@@ -35,7 +31,8 @@ fn is_canonical_addr(addr: u64) -> bool {
 fn is_kernel_addr(addr: u64) -> bool {
     #[cfg(target_arch = "aarch64")]
     {
-        is_canonical_addr(addr)
+        let kernel_base = core::ptr::addr_of!(_text_start) as u64;
+        is_canonical_addr(addr) && addr >= kernel_base
     }
 
     #[cfg(target_arch = "x86_64")]

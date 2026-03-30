@@ -1627,7 +1627,9 @@ pub(crate) unsafe fn handle_opendir(msg: *const BesaltMsg, reply: *mut BesaltMsg
         } else if (*inode).ftype == FTYPE_MOUNT_POINT {
             true
         } else if (*inode).ftype == FTYPE_PROC_FILE
-            && ((*inode).dev_type == PROC_FILE_ROOT || (*inode).dev_type == PROC_FILE_PID_DIR)
+            && ((*inode).dev_type == PROC_FILE_ROOT
+                || (*inode).dev_type == PROC_FILE_PID_DIR
+                || (*inode).dev_type == PROC_FILE_NET_DIR)
         {
             true
         } else {
@@ -1747,7 +1749,16 @@ pub(crate) unsafe fn handle_readdir(msg: *const BesaltMsg, reply: *mut BesaltMsg
                             FTYPE_DIRECTORY => 4,   // DT_DIR
                             FTYPE_CHAR_DEVICE => 2, // DT_CHR
                             FTYPE_SYMLINK => 10,    // DT_LNK
-                            FTYPE_PROC_FILE => 4,   // DT_DIR (proc virtual dir)
+                            FTYPE_PROC_FILE => {
+                                if (*child).dev_type == PROC_FILE_ROOT
+                                    || (*child).dev_type == PROC_FILE_PID_DIR
+                                    || (*child).dev_type == PROC_FILE_NET_DIR
+                                {
+                                    4
+                                } else {
+                                    8
+                                }
+                            }
                             FTYPE_MOUNT_POINT => 4, // DT_DIR (mount point)
                             _ => 0,
                         }

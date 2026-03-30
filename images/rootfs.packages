@@ -3,3 +3,14 @@ freebsd-utils
 ncurses
 nano
 nasm
+make
+zlib
+bzip2
+xz
+zstd
+openssl
+perl
+python
+curl
+wget
+ninja

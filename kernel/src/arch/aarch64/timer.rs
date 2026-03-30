@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! ARM Generic Timer driver.
 //!
-//! Uses the EL1 Physical Timer (CNTP) to generate periodic 1 ms interrupts
-//! via PPI 30 (INTID 30) on the GICv3.
+//! Uses the EL1 Virtual Timer (CNTV).
 //!
 //! ## Registers used
 //!
 //! - `CNTFRQ_EL0`  — counter frequency (set by firmware, read-only)
-//! - `CNTPCT_EL0`  — physical counter value (monotonic, read-only)
-//! - `CNTP_TVAL_EL0` — timer countdown value (write to arm, auto-decrements)
-//! - `CNTP_CTL_EL0`  — timer control (bit 0 = ENABLE, bit 1 = IMASK)
+//! - `CNTVCT_EL0`  — virtual counter value (monotonic, read-only)
+//! - `CNTV_CVAL_EL0` — EL1 virtual timer compare value
+//! - `CNTV_CTL_EL0`  — EL1 virtual timer control (bit 0 = ENABLE, bit 1 = IMASK)
 
 use core::ptr;
 
-/// Physical timer PPI interrupt ID.
-const TIMER_PPI_INTID: u32 = 30;
+/// EL1 virtual timer PPI interrupt ID.
+const VIRT_TIMER_PPI_INTID: u32 = 27;
+/// Timer control bit: enable timer output/comparison.
+const TIMER_CTL_ENABLE: u64 = 1 << 0;
+/// Timer control bit: mask timer interrupt delivery.
+const TIMER_CTL_IMASK: u64 = 1 << 1;
 
 /// Timer tick interval: 1 ms (1000 Hz).
 const TICK_HZ: u64 = 1000;
@@ -37,21 +40,32 @@ fn read_cntfrq() -> u64 {
     val
 }
 
-/// Write the timer countdown value (CNTP_TVAL_EL0).
+/// Read the active counter value used by the virtual timer.
 #[inline(always)]
-fn write_cntp_tval(tval: u64) {
-    // SAFETY: Writing CNTP_TVAL_EL0 is safe from EL1.
+fn read_timer_count() -> u64 {
+    let val: u64;
+    // SAFETY: Reading CNTVCT_EL0 is always safe from EL1 kernel context.
     unsafe {
-        core::arch::asm!("msr CNTP_TVAL_EL0, {}", in(reg) tval, options(nomem, nostack));
+        core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) val, options(nomem, nostack));
+    }
+    val
+}
+
+/// Write the virtual timer compare value.
+#[inline(always)]
+fn write_timer_cval(cval: u64) {
+    // SAFETY: Writing CNTV_CVAL_EL0 is safe from EL1 kernel context.
+    unsafe {
+        core::arch::asm!("msr CNTV_CVAL_EL0, {}", in(reg) cval, options(nomem, nostack));
     }
 }
 
-/// Write the timer control register (CNTP_CTL_EL0).
+/// Write the virtual timer control register.
 #[inline(always)]
-fn write_cntp_ctl(ctl: u64) {
-    // SAFETY: Writing CNTP_CTL_EL0 is safe from EL1.
+fn write_timer_ctl(ctl: u64) {
+    // SAFETY: Writing CNTV_CTL_EL0 is safe from EL1 kernel context.
     unsafe {
-        core::arch::asm!("msr CNTP_CTL_EL0, {}", in(reg) ctl, options(nomem, nostack));
+        core::arch::asm!("msr CNTV_CTL_EL0, {}", in(reg) ctl, options(nomem, nostack));
     }
 }
 
@@ -77,7 +91,7 @@ pub fn init() {
     }
 
     // Disable the timer while we configure.
-    write_cntp_ctl(0);
+    write_timer_ctl(0);
 
     crate::kinfo!(|_g| {
         _g.puts("[TIMER] Counter frequency: ");
@@ -88,8 +102,10 @@ pub fn init() {
 
 /// Start periodic timer interrupts.
 ///
-/// Arms the countdown with a 1 ms interval, enables the timer (IMASK
-/// cleared), and enables PPI 30 in the GIC redistributor.
+/// Programs the active timer in a masked state first, enables delivery in the
+/// GIC, then unmasks the timer as the final step. This mirrors the x86 LAPIC
+/// pattern where the timer is fully configured before the first interrupt can
+/// be delivered.
 pub fn start() {
     let freq = get_frequency();
     if freq == 0 {
@@ -97,7 +113,6 @@ pub fn start() {
     }
 
     // Per-CPU: allow EL0 to read CNTVCT_EL0 (virtual counter).
-    // CNTKCTL_EL1 is banked per CPU, so this must run on each core.
     // SAFETY: Writing CNTKCTL_EL1 is safe from EL1.
     unsafe {
         let mut cntkctl: u64;
@@ -107,18 +122,36 @@ pub fn start() {
         core::arch::asm!("msr CNTKCTL_EL1, {}", in(reg) cntkctl, options(nomem, nostack));
     }
 
-    let tval = freq / TICK_HZ;
+    let ticks = freq / TICK_HZ;
 
-    // Set the countdown value.
-    write_cntp_tval(tval);
+    // Quiesce the timer while programming it.
+    write_timer_ctl(0);
 
-    // Enable the timer: ENABLE=1 (bit 0), IMASK=0 (bit 1 clear).
-    write_cntp_ctl(1);
+    // Arm the countdown but keep interrupt delivery masked.
+    write_timer_cval(read_timer_count().wrapping_add(ticks));
+    write_timer_ctl(TIMER_CTL_ENABLE | TIMER_CTL_IMASK);
 
-    // Enable PPI 30 in the GIC so the interrupt is delivered.
-    super::gic::enable_irq(TIMER_PPI_INTID);
+    // Enable the timer PPI in the GIC while the timer is still masked.
+    super::gic::enable_irq(irq_intid());
+
+    // Refresh the countdown so the first visible tick starts from a clean
+    // interval after the GIC path is ready.
+    write_timer_cval(read_timer_count().wrapping_add(ticks));
+
+    // Finally unmask timer interrupt delivery.
+    write_timer_ctl(TIMER_CTL_ENABLE);
 
     crate::serial_puts("[TIMER] Started (1 ms tick)\n");
+}
+
+/// Stop the local timer and mask further timer interrupt delivery.
+pub fn stop() {
+    write_timer_ctl(0);
+}
+
+/// Return the active timer interrupt ID for the current exception level.
+pub fn irq_intid() -> u32 {
+    VIRT_TIMER_PPI_INTID
 }
 
 /// Return the cached counter frequency.
@@ -130,13 +163,13 @@ pub fn get_frequency() -> u64 {
 
 /// Re-arm the timer for the next tick.
 ///
-/// Called from the IRQ handler after acknowledging PPI 30. Writing
-/// CNTP_TVAL_EL0 clears the ISTATUS condition and starts a new countdown.
+/// Called from the IRQ handler after acknowledging the active timer PPI.
+/// Writing a future timer CVAL clears ISTATUS and arms the next deadline.
 pub fn rearm() {
     let freq = get_frequency();
     if freq == 0 {
         return;
     }
-    let tval = freq / TICK_HZ;
-    write_cntp_tval(tval);
+    let ticks = freq / TICK_HZ;
+    write_timer_cval(read_timer_count().wrapping_add(ticks));
 }

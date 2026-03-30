@@ -8,7 +8,7 @@
  *
  * Supported architectures:
  *   - x86_64: 4-level page tables (PML4/PDPT/PD/PT)
- *   - aarch64: (future) 4-level page tables with configurable granule
+ *   - aarch64: 4-level page tables with configurable granule
  */
 
 #ifndef BOOT_STAGE3_PAGING_H

@@ -8,8 +8,6 @@
 //! GICD/GICR registers are accessed via MMIO; ICC registers are accessed via
 //! system register instructions (MSR/MRS with `S3_0_Cn_Cm_op2` encodings).
 
-use core::ptr;
-
 // ---------------------------------------------------------------------------
 // QEMU virt GICv3 base addresses (hardcoded; ACPI/DTB parsing comes later)
 // ---------------------------------------------------------------------------
@@ -24,8 +22,11 @@ const GICR_PHYS_BASE: u64 = 0x080A_0000;
 /// Size of one redistributor region (RD_base + SGI_base).
 const GICR_STRIDE: u64 = 0x2_0000; // 128 KB
 
-/// GICD registers touched during boot fit in the first 4 KB page.
-const GICD_MMIO_SIZE: u64 = 0x1000;
+/// Map the full architected distributor window.
+///
+/// Linux uses a 64 KB distributor aperture, and our bringup now touches
+/// GICD_IROUTER at 0x6000 in addition to the low control/config registers.
+const GICD_MMIO_SIZE: u64 = 0x1_0000;
 
 // ---------------------------------------------------------------------------
 // GICD register offsets
@@ -33,24 +34,44 @@ const GICD_MMIO_SIZE: u64 = 0x1000;
 
 /// Distributor Control Register.
 const GICD_CTLR: u64 = 0x0000;
+/// Distributor Type Register.
+const GICD_TYPER: u64 = 0x0004;
 /// Interrupt Group Registers (32 bits per register, 1 bit per IRQ).
 const GICD_IGROUPR: u64 = 0x0080;
 /// Interrupt Set-Enable Registers.
 const GICD_ISENABLER: u64 = 0x0100;
 /// Interrupt Clear-Enable Registers.
 const GICD_ICENABLER: u64 = 0x0180;
+/// Interrupt Clear-Active Registers.
+const GICD_ICACTIVER: u64 = 0x0380;
 /// Interrupt Priority Registers (8 bits per IRQ).
 const GICD_IPRIORITYR: u64 = 0x0400;
+/// Interrupt Configuration Registers.
+const GICD_ICFGR: u64 = 0x0C00;
+/// Interrupt Router Registers.
+const GICD_IROUTER: u64 = 0x6000;
 
 /// GICD_CTLR bit: Enable Affinity Routing (ARE) for Non-Secure state.
 const GICD_CTLR_ARE_NS: u32 = 1 << 4;
 /// GICD_CTLR bit: Enable Group 1 Non-Secure interrupts.
 const GICD_CTLR_ENABLE_GRP1_NS: u32 = 1 << 1;
+/// GICD_CTLR bit: Disable Security state.
+const GICD_CTLR_DS: u32 = 1 << 6;
+/// GICD_CTLR bit: Register Write Pending.
+const GICD_CTLR_RWP: u32 = 1 << 31;
 
+/// Maximum architected interrupt ID handled by this driver.
+const GIC_MAX_INTID: u32 = 1020;
+/// Default Group-1 priority encoded four times in one 32-bit word.
+const GIC_PRIORITY_DEFAULT: u32 = 0xA0A0_A0A0;
+/// Default CPU priority mask used by Linux for normal IRQ delivery.
+const ICC_PMR_DEFAULT: u8 = 0xF0;
 // ---------------------------------------------------------------------------
 // GICR register offsets (relative to redistributor base)
 // ---------------------------------------------------------------------------
 
+/// Redistributor Control Register (RD_base + 0x0).
+const GICR_CTLR: u64 = 0x0000;
 /// Redistributor Wake Register (RD_base + 0x14).
 const GICR_WAKER: u64 = 0x0014;
 
@@ -61,6 +82,10 @@ const GICR_SGI_BASE_OFFSET: u64 = 0x1_0000; // 64 KB
 const GICR_IGROUPR0: u64 = GICR_SGI_BASE_OFFSET + 0x0080;
 /// Interrupt Set-Enable Register 0 (SGI_base + 0x100).
 const GICR_ISENABLER0: u64 = GICR_SGI_BASE_OFFSET + 0x0100;
+/// Interrupt Clear-Enable Register 0 (SGI_base + 0x180).
+const GICR_ICENABLER0: u64 = GICR_SGI_BASE_OFFSET + 0x0180;
+/// Interrupt Clear-Active Register 0 (SGI_base + 0x380).
+const GICR_ICACTIVER0: u64 = GICR_SGI_BASE_OFFSET + 0x0380;
 /// Interrupt Priority Registers (SGI_base + 0x400).
 const GICR_IPRIORITYR: u64 = GICR_SGI_BASE_OFFSET + 0x0400;
 
@@ -68,17 +93,8 @@ const GICR_IPRIORITYR: u64 = GICR_SGI_BASE_OFFSET + 0x0400;
 const GICR_WAKER_PROCESSOR_SLEEP: u32 = 1 << 1;
 /// GICR_WAKER bit: Children Asleep.
 const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
-
-// ---------------------------------------------------------------------------
-// Virtual base address storage
-// ---------------------------------------------------------------------------
-
-/// Mapped virtual base of the GICD. Set once during `init()`.
-static mut GICD_BASE: u64 = 0;
-
-/// Mapped virtual base of the GICR for the BSP. Each AP computes its own
-/// offset as `GICR_BASE_START + cpu_id * GICR_STRIDE`.
-static mut GICR_BASE_START: u64 = 0;
+/// GICR_CTLR bit: Register Write Pending.
+const GICR_CTLR_RWP: u32 = 1 << 3;
 
 // ---------------------------------------------------------------------------
 // MMIO helpers
@@ -90,8 +106,18 @@ static mut GICR_BASE_START: u64 = 0;
 /// `addr` must be a valid, mapped MMIO address.
 #[inline(always)]
 unsafe fn mmio_read32(addr: u64) -> u32 {
-    // SAFETY: Caller guarantees addr is valid MMIO.
-    unsafe { ptr::read_volatile(addr as *const u32) }
+    let val: u32;
+    // SAFETY: Caller guarantees `addr` is a valid MMIO location. Use a plain
+    // base-register load so HVF sees a simple syndrome-bearing access form.
+    unsafe {
+        core::arch::asm!(
+            "ldr {val:w}, [{addr}]",
+            addr = in(reg) addr,
+            val = lateout(reg) val,
+            options(nostack, preserves_flags),
+        );
+    }
+    val
 }
 
 /// Volatile 32-bit MMIO write.
@@ -100,8 +126,78 @@ unsafe fn mmio_read32(addr: u64) -> u32 {
 /// `addr` must be a valid, mapped MMIO address.
 #[inline(always)]
 unsafe fn mmio_write32(addr: u64, val: u32) {
-    // SAFETY: Caller guarantees addr is valid MMIO.
-    unsafe { ptr::write_volatile(addr as *mut u32, val) }
+    // SAFETY: Caller guarantees `addr` is a valid MMIO location. Use a plain
+    // base-register store to avoid writeback addressing forms in HVF MMIO exits.
+    unsafe {
+        core::arch::asm!(
+            "str {val:w}, [{addr}]",
+            addr = in(reg) addr,
+            val = in(reg) val,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Volatile 64-bit MMIO write.
+///
+/// # Safety
+/// `addr` must be a valid, naturally aligned, mapped MMIO address.
+#[inline(always)]
+unsafe fn mmio_write64(addr: u64, val: u64) {
+    // SAFETY: Caller guarantees `addr` is valid MMIO and 64-bit aligned. Use
+    // a plain base-register store to keep the fault syndrome fully decoded.
+    unsafe {
+        core::arch::asm!(
+            "str {val}, [{addr}]",
+            addr = in(reg) addr,
+            val = in(reg) val,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+#[inline(always)]
+fn gicd_wait_for_rwp(gicd: u64) {
+    // SAFETY: GICD MMIO is mapped and the caller is sequencing distributor
+    // configuration writes that architecturally complete when RWP clears.
+    unsafe {
+        while mmio_read32(gicd + GICD_CTLR) & GICD_CTLR_RWP != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+#[inline(always)]
+fn gicr_wait_for_rwp(gicr: u64) {
+    // SAFETY: GICR MMIO is mapped and the caller is sequencing redistributor
+    // configuration writes that architecturally complete when RWP clears.
+    unsafe {
+        while mmio_read32(gicr + GICR_CTLR) & GICR_CTLR_RWP != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+#[inline(always)]
+fn implemented_irq_count(gicd: u64) -> u32 {
+    // SAFETY: GICD MMIO is mapped; GICD_TYPER is a read-only architectural
+    // register describing the implemented interrupt range.
+    let typer = unsafe { mmio_read32(gicd + GICD_TYPER) };
+    let irq_count = ((typer & 0x1f) + 1) * 32;
+    irq_count.min(GIC_MAX_INTID)
+}
+
+#[inline(always)]
+fn current_cpu_affinity() -> u64 {
+    let mpidr: u64;
+    // SAFETY: Reading MPIDR_EL1 is always safe in privileged code.
+    unsafe {
+        core::arch::asm!("mrs {}, MPIDR_EL1", out(reg) mpidr, options(nomem, nostack));
+    }
+    ((mpidr >> 32) & 0xff) << 32
+        | ((mpidr >> 16) & 0xff) << 16
+        | ((mpidr >> 8) & 0xff) << 8
+        | (mpidr & 0xff)
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +246,21 @@ fn icc_pmr_write(priority: u8) {
             options(nomem, nostack),
         );
     }
+}
+
+/// Read ICC_PMR_EL1 (Priority Mask Register).
+#[inline(always)]
+fn icc_pmr_read() -> u8 {
+    let val: u64;
+    // SAFETY: Reading ICC_PMR_EL1 is safe from EL1.
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, S3_0_C4_C6_0",
+            out(reg) val,
+            options(nomem, nostack),
+        );
+    }
+    val as u8
 }
 
 /// Write ICC_BPR1_EL1 (Binary Point Register, Group 1).
@@ -209,6 +320,59 @@ fn icc_igrpen1_write(val: u64) {
     }
 }
 
+/// Read ICC_CTLR_EL1.
+#[inline(always)]
+fn icc_ctlr_read() -> u64 {
+    let val: u64;
+    // SAFETY: Reading ICC_CTLR_EL1 is safe from EL1.
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, S3_0_C12_C12_4",
+            out(reg) val,
+            options(nomem, nostack),
+        );
+    }
+    val
+}
+
+/// Write ICC_CTLR_EL1.
+#[inline(always)]
+fn icc_ctlr_write(val: u64) {
+    // SAFETY: Writing ICC_CTLR_EL1 is safe from EL1.
+    unsafe {
+        core::arch::asm!(
+            "msr S3_0_C12_C12_4, {}",
+            in(reg) val,
+            options(nomem, nostack),
+        );
+    }
+}
+
+macro_rules! define_icc_bank_writer {
+    ($name:ident, $sysreg:literal) => {
+        #[inline(always)]
+        fn $name(val: u64) {
+            // SAFETY: Writing ICC bank registers is safe from EL1.
+            unsafe {
+                core::arch::asm!(
+                    concat!("msr ", $sysreg, ", {}"),
+                    in(reg) val,
+                    options(nomem, nostack),
+                );
+            }
+        }
+    };
+}
+
+define_icc_bank_writer!(icc_ap0r0_write, "S3_0_C12_C8_4");
+define_icc_bank_writer!(icc_ap0r1_write, "S3_0_C12_C8_5");
+define_icc_bank_writer!(icc_ap0r2_write, "S3_0_C12_C8_6");
+define_icc_bank_writer!(icc_ap0r3_write, "S3_0_C12_C8_7");
+define_icc_bank_writer!(icc_ap1r0_write, "S3_0_C12_C9_0");
+define_icc_bank_writer!(icc_ap1r1_write, "S3_0_C12_C9_1");
+define_icc_bank_writer!(icc_ap1r2_write, "S3_0_C12_C9_2");
+define_icc_bank_writer!(icc_ap1r3_write, "S3_0_C12_C9_3");
+
 /// Write ICC_SGI1R_EL1 (SGI Generation Register, Group 1).
 #[inline(always)]
 fn icc_sgi1r_write(val: u64) {
@@ -227,31 +391,13 @@ fn icc_sgi1r_write(val: u64) {
 // Address resolution helpers
 // ---------------------------------------------------------------------------
 
-/// Return the virtual base address of the GICD.
-///
-/// Before `paging::init()` (i.e., during early boot with identity mapping),
-/// this returns the physical address directly. After the direct map is
-/// established, it returns `phys_to_virt(GICD_PHYS_BASE)`.
 fn gicd_base() -> u64 {
-    // SAFETY: GICD_BASE is written once in init() and only read afterwards.
-    let base = unsafe { ptr::read_volatile(ptr::addr_of!(GICD_BASE)) };
-    if base != 0 {
-        return base;
-    }
-    // Fallback: identity map (early boot).
-    GICD_PHYS_BASE
+    crate::mm::phys_to_virt(GICD_PHYS_BASE)
 }
 
 /// Return the virtual base address of the GICR for `cpu_id`.
 fn gicr_base(cpu_id: usize) -> u64 {
-    // SAFETY: GICR_BASE_START is written once in init() and only read afterwards.
-    let start = unsafe { ptr::read_volatile(ptr::addr_of!(GICR_BASE_START)) };
-    let base = if start != 0 {
-        start
-    } else {
-        GICR_PHYS_BASE
-    };
-    base + (cpu_id as u64) * GICR_STRIDE
+    crate::mm::phys_to_virt(GICR_PHYS_BASE + (cpu_id as u64) * GICR_STRIDE)
 }
 
 // ---------------------------------------------------------------------------
@@ -263,21 +409,12 @@ fn gicr_base(cpu_id: usize) -> u64 {
 ///
 /// Must be called once during single-threaded boot.
 pub fn init() {
-    // If the paging path has not remapped the GIC yet, fall back to the
-    // boot-time identity mapping.
-    //
-    // SAFETY: Single-threaded boot context. These statics are initialized once
-    // before use and only updated during early boot remap.
-    unsafe {
-        if ptr::read_volatile(ptr::addr_of!(GICD_BASE)) == 0 {
-            ptr::write_volatile(ptr::addr_of_mut!(GICD_BASE), GICD_PHYS_BASE);
-        }
-        if ptr::read_volatile(ptr::addr_of!(GICR_BASE_START)) == 0 {
-            ptr::write_volatile(ptr::addr_of_mut!(GICR_BASE_START), GICR_PHYS_BASE);
-        }
-    }
-
     let gicd = gicd_base();
+    let irq_count = implemented_irq_count(gicd) as u64;
+    let distributor_reg_count = (irq_count + 31) / 32;
+    let priority_reg_count = (irq_count + 3) / 4;
+    let config_reg_count = (irq_count + 15) / 16;
+    let boot_cpu_affinity = current_cpu_affinity();
 
     // ---- Step 1: Distributor (GICD) ----
 
@@ -286,46 +423,57 @@ pub fn init() {
     unsafe {
         mmio_write32(gicd + GICD_CTLR, 0);
     }
-
-    // Wait for RWP (Register Write Pending) to clear — bit 31.
-    // SAFETY: Reading GICD_CTLR is safe.
-    unsafe {
-        while mmio_read32(gicd + GICD_CTLR) & (1 << 31) != 0 {
-            core::hint::spin_loop();
-        }
-    }
+    gicd_wait_for_rwp(gicd);
 
     // Set all SPIs (INTID 32+) to Group 1 Non-Secure.
     // Register 0 covers INTIDs 0-31 (SGIs/PPIs, handled by GICR).
-    // Registers 1-31 cover INTIDs 32-1019.
-    for i in 1u64..32 {
+    for i in 1u64..distributor_reg_count {
         // SAFETY: GICD MMIO is mapped.
         unsafe {
             mmio_write32(gicd + GICD_IGROUPR + i * 4, 0xFFFF_FFFF);
         }
     }
 
-    // Set all SPI priorities to 0xA0 (middle priority).
-    // IPRIORITYR registers start at INTID 0; skip first 32 (SGI/PPI).
-    for i in 8u64..256 {
+    // Normalize all SPIs to level-triggered configuration.
+    for i in 2u64..config_reg_count {
         // SAFETY: GICD MMIO is mapped.
         unsafe {
-            mmio_write32(gicd + GICD_IPRIORITYR + i * 4, 0xA0A0_A0A0);
+            mmio_write32(gicd + GICD_ICFGR + i * 4, 0);
+        }
+    }
+
+    // Set all SPI priorities to 0xA0 (middle priority).
+    // IPRIORITYR registers start at INTID 0; skip first 32 (SGI/PPI).
+    for i in 8u64..priority_reg_count {
+        // SAFETY: GICD MMIO is mapped.
+        unsafe {
+            mmio_write32(gicd + GICD_IPRIORITYR + i * 4, GIC_PRIORITY_DEFAULT);
         }
     }
 
     // Disable all SPIs initially.
-    for i in 1u64..32 {
+    for i in 1u64..distributor_reg_count {
         // SAFETY: GICD MMIO is mapped.
         unsafe {
+            mmio_write32(gicd + GICD_ICACTIVER + i * 4, 0xFFFF_FFFF);
             mmio_write32(gicd + GICD_ICENABLER + i * 4, 0xFFFF_FFFF);
         }
     }
+    gicd_wait_for_rwp(gicd);
 
     // Enable the distributor with ARE_NS and Group 1 NS.
     // SAFETY: GICD MMIO is mapped.
     unsafe {
         mmio_write32(gicd + GICD_CTLR, GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_GRP1_NS);
+    }
+    gicd_wait_for_rwp(gicd);
+
+    // Route all SPIs to the boot CPU now that ARE_NS is active.
+    for intid in 32u64..irq_count {
+        // SAFETY: GICD MMIO is mapped and IROUTER uses 64-bit aligned access.
+        unsafe {
+            mmio_write64(gicd + GICD_IROUTER + intid * 8, boot_cpu_affinity);
+        }
     }
 
     // ---- Step 2: BSP Redistributor (GICR) ----
@@ -363,15 +511,18 @@ fn init_redistributor(cpu_id: usize) {
     // SAFETY: GICR MMIO is mapped.
     unsafe {
         mmio_write32(gicr + GICR_IGROUPR0, 0xFFFF_FFFF);
+        mmio_write32(gicr + GICR_ICACTIVER0, 0xFFFF_FFFF);
+        mmio_write32(gicr + GICR_ICENABLER0, 0xFFFF_FFFF);
     }
 
     // Set all SGI/PPI priorities to 0xA0.
     for i in 0u64..8 {
         // SAFETY: GICR MMIO is mapped.
         unsafe {
-            mmio_write32(gicr + GICR_IPRIORITYR + i * 4, 0xA0A0_A0A0);
+            mmio_write32(gicr + GICR_IPRIORITYR + i * 4, GIC_PRIORITY_DEFAULT);
         }
     }
+    gicr_wait_for_rwp(gicr);
 
     // Enable all SGIs (INTIDs 0-15) — needed for IPIs.
     // PPIs are enabled individually (e.g., timer PPI 30 via enable_irq).
@@ -379,6 +530,7 @@ fn init_redistributor(cpu_id: usize) {
     unsafe {
         mmio_write32(gicr + GICR_ISENABLER0, 0x0000_FFFF);
     }
+    gicr_wait_for_rwp(gicr);
 }
 
 /// Initialize the CPU interface (ICC system registers) for the current CPU.
@@ -386,15 +538,87 @@ fn init_redistributor(cpu_id: usize) {
 /// Enables the system register interface, sets the priority mask to allow
 /// all priorities, and enables Group 1 interrupts.
 fn init_cpu_interface() {
+    if super::current_el() == 2 {
+        let sre_el2: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, ICC_SRE_EL2", out(reg) sre_el2, options(nomem, nostack));
+            core::arch::asm!("msr ICC_SRE_EL2, {}", in(reg) (sre_el2 | 0x1), options(nomem, nostack));
+            core::arch::asm!("isb", options(nomem, nostack));
+        }
+    }
+
     // Enable system register access (ICC_SRE_EL1.SRE = 1).
     let sre = icc_sre_read();
     icc_sre_write(sre | 0x1);
+    if (icc_sre_read() & 0x1) == 0 {
+        crate::serial_puts("[GIC] WARNING: ICC_SRE_EL1.SRE did not stick\n");
+    }
 
-    // Set priority mask to 0xFF — allow all priority levels.
-    icc_pmr_write(0xFF);
+    let pribits = (((icc_ctlr_read() >> 8) & 0x7) + 1) as u32;
+    let old_pmr = icc_pmr_read();
+    let probe_pmr = 1u8 << (8 - pribits.min(8));
+    icc_pmr_write(probe_pmr);
+    let has_group0 = icc_pmr_read() != 0;
+    icc_pmr_write(old_pmr);
+
+    // Restore a known CPU-interface state regardless of firmware handoff.
+    icc_pmr_write(ICC_PMR_DEFAULT);
 
     // Set binary point to 0 — all priority bits used for preemption.
     icc_bpr1_write(0);
+
+    // Use architected combined EOI+deactivate mode.
+    //
+    // QEMU under Apple HVF aborts if the guest writes ICC_DIR_EL1, even after
+    // the interrupt has been acknowledged. Combined mode keeps the IRQ
+    // lifecycle entirely on ICC_EOIR1_EL1 and avoids the hypervisor-specific
+    // assert while remaining architecturally valid for GICv3.
+    icc_ctlr_write(icc_ctlr_read() & !(1 << 1));
+
+    if has_group0 {
+        match pribits {
+            7 | 8 => {
+                icc_ap0r3_write(0);
+                icc_ap0r2_write(0);
+                icc_ap0r1_write(0);
+                icc_ap0r0_write(0);
+            }
+            6 => {
+                icc_ap0r1_write(0);
+                icc_ap0r0_write(0);
+            }
+            4 | 5 => {
+                icc_ap0r0_write(0);
+            }
+            _ => {}
+        }
+        // SAFETY: ISB is always safe.
+        unsafe {
+            core::arch::asm!("isb", options(nomem, nostack));
+        }
+    }
+
+    match pribits {
+        7 | 8 => {
+            icc_ap1r3_write(0);
+            icc_ap1r2_write(0);
+            icc_ap1r1_write(0);
+            icc_ap1r0_write(0);
+        }
+        6 => {
+            icc_ap1r1_write(0);
+            icc_ap1r0_write(0);
+        }
+        4 | 5 => {
+            icc_ap1r0_write(0);
+        }
+        _ => {}
+    }
+
+    // SAFETY: ISB is always safe.
+    unsafe {
+        core::arch::asm!("isb", options(nomem, nostack));
+    }
 
     // Enable Group 1 interrupts.
     icc_igrpen1_write(1);
@@ -445,14 +669,18 @@ pub fn enable_irq(intid: u32) {
         unsafe {
             mmio_write32(gicr + GICR_ISENABLER0, bit);
         }
+        gicr_wait_for_rwp(gicr);
     } else {
         // SPI — use the distributor.
         let gicd = gicd_base();
-        // SAFETY: GICD MMIO is mapped. ISB ensures the ISENABLER write
-        // is observable before any subsequent instruction that might
-        // depend on the interrupt being enabled.
+        // SAFETY: GICD MMIO is mapped.
         unsafe {
             mmio_write32(gicd + GICD_ISENABLER + reg_index * 4, bit);
+        }
+        gicd_wait_for_rwp(gicd);
+        // SAFETY: ISB is always safe and ensures subsequent instructions see
+        // the completed interrupt-enable side effects.
+        unsafe {
             core::arch::asm!("isb", options(nomem, nostack));
         }
     }
@@ -477,8 +705,9 @@ pub fn disable_irq(intid: u32) {
         let gicr = gicr_base(cpu_id);
         // SAFETY: GICR MMIO is mapped.
         unsafe {
-            mmio_write32(gicr + GICR_SGI_BASE_OFFSET + 0x0180, bit);
+            mmio_write32(gicr + GICR_ICENABLER0, bit);
         }
+        gicr_wait_for_rwp(gicr);
     } else {
         // SPI — use the distributor.
         let gicd = gicd_base();
@@ -487,10 +716,8 @@ pub fn disable_irq(intid: u32) {
         // a concurrent enable_irq on another CPU is swallowed.
         unsafe {
             mmio_write32(gicd + GICD_ICENABLER + reg_index * 4, bit);
-            while mmio_read32(gicd + GICD_CTLR) & (1 << 31) != 0 {
-                core::hint::spin_loop();
-            }
         }
+        gicd_wait_for_rwp(gicd);
     }
 }
 
@@ -561,13 +788,4 @@ pub fn remap_to_direct_map() {
         offset += crate::mm::PAGE_SIZE as u64;
     }
 
-    let gicd_virt = crate::mm::phys_to_virt(GICD_PHYS_BASE);
-    let gicr_virt = crate::mm::phys_to_virt(GICR_PHYS_BASE);
-
-    // SAFETY: Single-threaded context during boot; these statics are only
-    // updated from identity-map addresses to direct-map addresses.
-    unsafe {
-        ptr::write_volatile(ptr::addr_of_mut!(GICD_BASE), gicd_virt);
-        ptr::write_volatile(ptr::addr_of_mut!(GICR_BASE_START), gicr_virt);
-    }
 }

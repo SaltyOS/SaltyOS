@@ -78,7 +78,7 @@ impl BuildEnv {
         // CFLAGS: the driver auto-injects system includes from the sysroot.
         // -fno-builtin omitted: autotools needs builtin recognition for function checks.
         let cflags = format!(
-            "-fno-stack-protector \
+            "-fno-stack-protector -fPIC \
              --target={target_triple} \
              --sysroot={sysroot}",
             sysroot = sysroot_dir.display(),

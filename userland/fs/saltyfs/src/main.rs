@@ -74,7 +74,7 @@ static mut ALLOC_HINT: u64 = 0;
 static mut VFS_SHM_MAPPED: bool = false;
 
 fn ipc_ctx() -> *mut IpcContext {
-    &raw mut besalt::__besalt_ipc_ctx
+    besalt::tls::current_ipc_ctx()
 }
 
 fn signal_ready() {

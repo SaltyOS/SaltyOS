@@ -2,8 +2,9 @@
 /*
  * SaltyOS Bootloader - AArch64 Page Table Setup
  *
- * Sets up 4-level page tables (4KB granule) for the kernel.
- * Creates identity map in TTBR0 and kernel higher-half in TTBR1.
+ * Sets up a 4-level page-table root (4KB granule) for the kernel.
+ * The single root contains both the low identity map and the higher-half
+ * kernel mapping; the active host EL decides which TTBR bank consumes it.
  */
 
 #include "paging_impl.h"
@@ -91,29 +92,7 @@ int paging_map_region(uint64_t root_table, uint64_t virt, uint64_t phys,
 
 void paging_load_cr3(uint64_t root_table)
 {
-    /* Configure MAIR */
-    write_mair_el1(MAIR_EL1_VALUE);
-
-    /* Configure TCR */
-    write_tcr_el1(TCR_EL1_VALUE);
-
-    /* Load TTBR0 (identity map and user space) */
-    write_ttbr0_el1(root_table);
-
-    /* Load TTBR1 (kernel higher-half, same table for now) */
-    write_ttbr1_el1(root_table);
-
-    /* Full TLB invalidation */
-    tlbi_vmalle1();
-
-    /* Enable MMU via SCTLR_EL1 */
-    uint64_t sctlr = read_sctlr_el1();
-    sctlr |= (1ULL << 0);  /* M bit: enable MMU */
-    sctlr |= (1ULL << 2);  /* C bit: data cache enable */
-    sctlr |= (1ULL << 12); /* I bit: instruction cache enable */
-    sctlr |= (1ULL << 26); /* UCI: allow EL0 IC IVAU / DC CVAU instructions */
-    sctlr &= ~(1ULL << 1); /* A bit: disable alignment checking */
-    write_sctlr_el1(sctlr);
+    paging_load_root_current_el(root_table);
 }
 
 uint64_t paging_init_dynamic(uint64_t pt_pool_base, uint64_t pt_pool_size,
@@ -161,6 +140,8 @@ uint64_t paging_init_dynamic(uint64_t pt_pool_base, uint64_t pt_pool_size,
     uint64_t uart_flags = PTE_SH_NS | PTE_ATTR_IDX(MAIR_IDX_DEVICE_nGnRnE) | PTE_AP_RW_EL1 | PTE_PXN | PTE_UXN;
     if (map_2m_block(l0, 0x09000000ULL, 0x09000000ULL, uart_flags) != 0)
         return 0;
+
+    flush_dcache_poc_range(pt_pool_base, next_page_table - pt_pool_base);
 
     return l0;
 }

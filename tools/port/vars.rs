@@ -96,6 +96,25 @@ pub fn resolve_source_dir(port: &PortConfig, port_dir: &Path) -> Option<PathBuf>
     }
 }
 
+/// Distfile name: "{name}-{version}.{ext}" derived from port metadata and URL.
+///
+/// Uses the port name and version to form a predictable filename, with the
+/// extension extracted from the source URL (e.g. `.tar.gz`, `.tgz`).
+pub fn distfile_name(port: &PortConfig, url: &str) -> String {
+    // Extract extension from URL (handle .tar.gz, .tar.xz, .tar.bz2, .tgz, etc.)
+    let url_filename = url.rsplit('/').next().unwrap_or("");
+    let ext = if url_filename.contains(".tar.") {
+        // e.g. "foo.tar.gz" → ".tar.gz"
+        let idx = url_filename.find(".tar.").unwrap();
+        &url_filename[idx..]
+    } else if let Some(idx) = url_filename.rfind('.') {
+        &url_filename[idx..]
+    } else {
+        ".tar.gz"
+    };
+    format!("{}-{}{}", port.name, port.version, ext)
+}
+
 /// Build a variable map from port config and environment
 pub fn build_var_map(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> HashMap<String, String> {
     let mut vars = HashMap::new();

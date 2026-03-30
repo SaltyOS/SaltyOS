@@ -141,6 +141,28 @@ pub fn shutdown() -> ! {
     }
 }
 
+pub fn publish_page_table_page(table_phys: crate::mm::PhysAddr) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = table_phys;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::publish_page_table_page(table_phys);
+    }
+}
+
+pub fn sync_user_page_before_unmap(vaddr: u64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = vaddr;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::sync_user_page_before_unmap(vaddr);
+    }
+}
+
 /// Output byte to I/O port
 ///
 /// # Safety

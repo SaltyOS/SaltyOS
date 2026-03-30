@@ -6,7 +6,9 @@
 //! Protected by a dedicated SLEEP_LOCK for SMP safety.
 
 use crate::mm::SpinLock;
-use crate::sched::thread::{BlockedReason, Tcb, ThreadState};
+use crate::sched::thread::{
+    BlockedReason, Tcb, ThreadState, RECV_WAIT_SELECTED_NONE,
+};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Dedicated lock protecting the global sleep queue.
@@ -187,7 +189,16 @@ pub unsafe fn check_wakeups(now_ns: u64) -> usize {
                         Some(BlockedReason::SendTimedBlocked { .. }) | Some(BlockedReason::RecvTimedBlocked)
                     ) && (*tcb).blocked_endpoint == ep as *mut u8
                     {
-                        (*ep).remove_from_queue(tcb);
+                        if matches!((*tcb).blocked_reason, Some(BlockedReason::RecvTimedBlocked))
+                            && (*tcb).recv_wait_link_count != 0
+                        {
+                            crate::ipc::Endpoint::clear_tcb_recv_waits(
+                                tcb,
+                                RECV_WAIT_SELECTED_NONE,
+                            );
+                        } else {
+                            (*ep).remove_from_queue(tcb);
+                        }
                         (*ep).ep_unlock();
                         (*tcb).blocked_endpoint = core::ptr::null_mut();
                         (*tcb).futex_wakeup_result = 12; // SyscallError::Cancelled = timeout

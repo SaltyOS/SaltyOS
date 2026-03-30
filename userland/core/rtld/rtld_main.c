@@ -10,6 +10,36 @@
 
 struct rtld_state g_rtld;
 
+static struct link_map *find_loaded_object(struct rtld_state *st, const char *name) {
+    struct link_map *cur = st->head;
+    while (cur) {
+        if (cur->name && rtld_strcmp(cur->name, name) == 0)
+            return cur;
+        cur = cur->next;
+    }
+    return NULL;
+}
+
+static uint64_t resolve_symbol_addr_in_object(
+    struct rtld_state *st,
+    const char *object_name,
+    const char *symbol_name
+) {
+    struct link_map *map = find_loaded_object(st, object_name);
+    if (!map)
+        return resolve_symbol_addr(st, symbol_name);
+
+    uint64_t addr = gnu_hash_lookup(map, symbol_name);
+    if (addr)
+        return addr;
+    return linear_lookup(map, symbol_name);
+}
+
+/* Exported pointer to g_rtld for libc dladdr()/dl_iterate_phdr().
+ * libc declares this as `extern` and uses it to walk the link_map chain. */
+__attribute__((visibility("default")))
+struct rtld_state *__rtld_global = &g_rtld;
+
 /* Exported so applications can continue allocating frame slots after rtld */
 uint64_t __besalt_next_frame_slot = 0;
 
@@ -29,7 +59,9 @@ struct rtld_tls_module __besalt_tls_modules[RTLD_MAX_OBJECTS];
 void __attribute__((naked, noreturn)) _start(void) {
 #if defined(__x86_64__)
     __asm__ volatile(
+        "xor %%ebp, %%ebp\n"
         "mov %%rsp, %%rdi\n"
+        "andq $-16, %%rsp\n"
         "call rtld_main\n"
         : : : "memory"
     );
@@ -81,8 +113,13 @@ static Elf64_Dyn *find_dynamic(uint64_t base) {
 }
 
 static void finalize_static_tls_layout(struct rtld_state *st) {
+#if defined(__aarch64__)
+    uint64_t total = 16; /* AArch64 ABI TP header (two machine words). */
+    uint64_t max_align = 16;
+#else
     uint64_t total = 0;
     uint64_t max_align = 1;
+#endif
     uint64_t module_id = 1;
 
     for (struct link_map *map = st->head; map; map = map->next) {
@@ -92,6 +129,16 @@ static void finalize_static_tls_layout(struct rtld_state *st) {
             continue;
 
         uint64_t align = map->tls_align ? map->tls_align : 1;
+#if defined(__aarch64__)
+        if (align > 1)
+            total = (total + align - 1) & ~(align - 1);
+        if (align > max_align)
+            max_align = align;
+
+        map->tls_module_id = module_id++;
+        map->tls_tpoff = (int64_t)total;
+        total += map->tls_memsz;
+#else
         uint64_t next_total = total + map->tls_memsz;
         if (align > 1)
             next_total = (next_total + align - 1) & ~(align - 1);
@@ -101,14 +148,21 @@ static void finalize_static_tls_layout(struct rtld_state *st) {
 
         map->tls_module_id = module_id++;
         map->tls_tpoff = -(int64_t)total;
+#endif
     }
 
+#if defined(__aarch64__)
+    st->tls_memsz = total - 16;
+#else
     st->tls_memsz = total;
+#endif
     st->tls_align = max_align;
     st->tls_module_count = module_id - 1;
 }
 
 static void export_static_tls_layout(struct rtld_state *st) {
+    const char *libbesalt_name = "libbesalt.so";
+
     __besalt_tls_template = st->exe_tls_vaddr;
     __besalt_tls_filesz = st->exe_tls_filesz;
     __besalt_tls_memsz = st->tls_memsz;
@@ -129,22 +183,22 @@ static void export_static_tls_layout(struct rtld_state *st) {
         tls_index++;
     }
 
-    uint64_t tmpl_addr = resolve_symbol_addr(&g_rtld, "__besalt_tls_template");
+    uint64_t tmpl_addr = resolve_symbol_addr_in_object(st, libbesalt_name, "__besalt_tls_template");
     if (tmpl_addr != 0)
         *(volatile uint64_t *)tmpl_addr = __besalt_tls_template;
-    uint64_t fsz_addr = resolve_symbol_addr(&g_rtld, "__besalt_tls_filesz");
+    uint64_t fsz_addr = resolve_symbol_addr_in_object(st, libbesalt_name, "__besalt_tls_filesz");
     if (fsz_addr != 0)
         *(volatile uint64_t *)fsz_addr = __besalt_tls_filesz;
-    uint64_t msz_addr = resolve_symbol_addr(&g_rtld, "__besalt_tls_memsz");
+    uint64_t msz_addr = resolve_symbol_addr_in_object(st, libbesalt_name, "__besalt_tls_memsz");
     if (msz_addr != 0)
         *(volatile uint64_t *)msz_addr = __besalt_tls_memsz;
-    uint64_t align_addr = resolve_symbol_addr(&g_rtld, "__besalt_tls_align");
+    uint64_t align_addr = resolve_symbol_addr_in_object(st, libbesalt_name, "__besalt_tls_align");
     if (align_addr != 0)
         *(volatile uint64_t *)align_addr = __besalt_tls_align;
-    uint64_t count_addr = resolve_symbol_addr(&g_rtld, "__besalt_tls_module_count");
+    uint64_t count_addr = resolve_symbol_addr_in_object(st, libbesalt_name, "__besalt_tls_module_count");
     if (count_addr != 0)
         *(volatile uint64_t *)count_addr = __besalt_tls_module_count;
-    uint64_t mods_addr = resolve_symbol_addr(&g_rtld, "__besalt_tls_modules");
+    uint64_t mods_addr = resolve_symbol_addr_in_object(st, libbesalt_name, "__besalt_tls_modules");
     if (mods_addr != 0)
         rtld_memcpy((void *)(uintptr_t)mods_addr, __besalt_tls_modules,
                     sizeof(__besalt_tls_modules));
@@ -336,20 +390,24 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
                     rtld_exit(127);
                 }
 
-                /* Debug: log successful library load */
+                /* Advance load address by actual library footprint + 1-page gap */
+                struct link_map *loaded_map = &g_rtld.objects[g_rtld.nobjects - 1];
                 {
                     struct rtld_linebuf dlb;
                     rtld_dbg_lb_init(&dlb);
                     rtld_dbg_lb_str(&dlb, "[RTLD] loaded ");
                     rtld_dbg_lb_str(&dlb, lib_name);
-                    rtld_dbg_lb_str(&dlb, " at ");
+                    rtld_dbg_lb_str(&dlb, " req=");
                     rtld_dbg_lb_hex(&dlb, lib_load_addr);
-                    rtld_dbg_lb_str(&dlb, "\n");
+                    rtld_dbg_lb_str(&dlb, " base=");
+                    rtld_dbg_lb_hex(&dlb, loaded_map->base);
+                    rtld_dbg_lb_str(&dlb, " span=[");
+                    rtld_dbg_lb_hex(&dlb, loaded_map->base);
+                    rtld_dbg_lb_str(&dlb, ",");
+                    rtld_dbg_lb_hex(&dlb, loaded_map->base + loaded_map->load_size);
+                    rtld_dbg_lb_str(&dlb, ")\n");
                     rtld_dbg_lb_flush(&dlb);
                 }
-
-                /* Advance load address by actual library footprint + 1-page gap */
-                struct link_map *loaded_map = &g_rtld.objects[g_rtld.nobjects - 1];
                 uint64_t advance = loaded_map->load_size;
                 if (advance == 0) advance = 0x80000ULL; /* fallback */
                 lib_load_addr += advance + PAGE_SIZE;
@@ -387,9 +445,11 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
     /* 7. Export frame slot so user code can allocate after rtld.
      * __besalt_next_frame_slot references in user code resolve to libbesalt,
      * so update that symbol explicitly if present. */
+    const char *libbesalt_name = "libbesalt.so";
+
     __besalt_next_frame_slot = g_rtld.next_frame_slot;
     {
-        uint64_t slot_addr = resolve_symbol_addr(&g_rtld, "__besalt_next_frame_slot");
+        uint64_t slot_addr = resolve_symbol_addr_in_object(&g_rtld, libbesalt_name, "__besalt_next_frame_slot");
         if (slot_addr != 0)
             *(volatile uint64_t *)slot_addr = g_rtld.next_frame_slot;
     }
@@ -416,10 +476,10 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
     __besalt_slot_base = export_slot_base;
     __besalt_slot_count = export_slot_count;
     {
-        uint64_t base_addr = resolve_symbol_addr(&g_rtld, "__besalt_slot_base");
+        uint64_t base_addr = resolve_symbol_addr_in_object(&g_rtld, libbesalt_name, "__besalt_slot_base");
         if (base_addr != 0)
             *(volatile uint64_t *)base_addr = export_slot_base;
-        uint64_t count_addr = resolve_symbol_addr(&g_rtld, "__besalt_slot_count");
+        uint64_t count_addr = resolve_symbol_addr_in_object(&g_rtld, libbesalt_name, "__besalt_slot_count");
         if (count_addr != 0)
             *(volatile uint64_t *)count_addr = export_slot_count;
     }
@@ -427,7 +487,7 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
     /* 7c. Export CSpace expansion notification cap for slot_alloc. */
     __besalt_cspace_ntfn = g_rtld.cspace_ntfn;
     {
-        uint64_t ntfn_addr = resolve_symbol_addr(&g_rtld, "__besalt_cspace_ntfn");
+        uint64_t ntfn_addr = resolve_symbol_addr_in_object(&g_rtld, libbesalt_name, "__besalt_cspace_ntfn");
         if (ntfn_addr != 0)
             *(volatile uint64_t *)ntfn_addr = g_rtld.cspace_ntfn;
     }
@@ -441,11 +501,27 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
      */
     for (int i = 1; i < g_rtld.nobjects; i++) {
         struct link_map *map = &g_rtld.objects[i];
-        if (map->init_fn)
+        if (map->init_fn) {
+            struct rtld_linebuf lb;
+            rtld_dbg_lb_init(&lb);
+            rtld_dbg_lb_str(&lb, "[RTLD] calling DT_INIT for ");
+            rtld_dbg_lb_str(&lb, map->name ? map->name : "(unnamed)");
+            rtld_dbg_lb_str(&lb, "\n");
+            rtld_dbg_lb_flush(&lb);
             map->init_fn();
+        }
         for (uint64_t j = 0; j < map->init_array_count; j++) {
-            if (map->init_array[j])
+            if (map->init_array[j]) {
+                struct rtld_linebuf lb;
+                rtld_dbg_lb_init(&lb);
+                rtld_dbg_lb_str(&lb, "[RTLD] calling DT_INIT_ARRAY for ");
+                rtld_dbg_lb_str(&lb, map->name ? map->name : "(unnamed)");
+                rtld_dbg_lb_str(&lb, " idx=");
+                rtld_dbg_lb_hex(&lb, j);
+                rtld_dbg_lb_str(&lb, "\n");
+                rtld_dbg_lb_flush(&lb);
                 map->init_array[j]();
+            }
         }
     }
 
