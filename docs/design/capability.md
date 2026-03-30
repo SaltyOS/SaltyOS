@@ -79,7 +79,7 @@ Trade-off: More memory per capability, but simpler implementation and better deb
 
 ## Capability Types
 
-The `ObjectType` enum (defined in `kernel/src/cap/object.rs`) has 11 variants.
+The `ObjectType` enum (defined in `kernite/src/cap/object.rs`) has 11 variants.
 The same discriminant values are used in both the `Capability.obj_type` field
 and the `KernelObject` header.
 
@@ -124,13 +124,13 @@ pub enum ObjectType {
 ## Capability Rights
 
 Rights are stored as a `u32` bitmap wrapper (`CapRights(u32)`) in
-`kernel/src/cap/mod.rs`. There are 15 defined rights. CNode operations
+`kernite/src/cap/mod.rs`. There are 15 defined rights. CNode operations
 (copy, mint, move, delete) are controlled by invoke labels and the
 GRANT/REVOKE rights, not separate CNode-specific right bits.
 
 ```rust
 /// CapRights is a newtype wrapper around u32, with named constants.
-/// Defined in kernel/src/cap/mod.rs.
+/// Defined in kernite/src/cap/mod.rs.
 pub struct CapRights(pub u32);
 
 // Common rights
@@ -502,14 +502,14 @@ graph TD
 ## Initial Capability Distribution
 
 At boot, the kernel creates the init task with well-known capability slots.
-These are set up in `kernel/src/init.rs` using the parsed boot info and CPIO
+These are set up in `kernite/src/init.rs` using the parsed boot info and CPIO
 initrd. Init is statically linked and is the first userspace process.
 
 ```rust
-// kernel/src/init.rs (simplified)
+// kernite/src/init.rs (simplified)
 
 /// Well-known capability slot assignments for the init task.
-/// These must match the constants in lib/besalt/lib/src/consts.rs.
+/// These must match the constants in lib/trona/substrate/src/consts.rs.
 const CAP_SELF_TCB: usize       = 0;
 const CAP_SELF_VSPACE: usize    = 1;
 const CAP_SELF_CSPACE: usize    = 2;
@@ -553,13 +553,13 @@ fn create_init_task(boot_info: &BootInfo) {
 
 CNode operations are performed via the Invoke syscall (number 9) with the
 CNode capability and an invoke label. Labels are defined in
-`lib/besalt/lib/src/consts.rs` (range `0x10`-`0x16`).
+`lib/trona/substrate/src/consts.rs` (range `0x10`-`0x16`).
 
 Arguments are passed in message registers (MR0-MR3 in CPU registers,
 MR4+ via IPC buffer).
 
 ```rust
-/// CNode invoke labels (from lib/besalt/lib/src/consts.rs)
+/// CNode invoke labels (from lib/trona/substrate/src/consts.rs)
 const CNODE_COPY:       u64 = 0x10;
 const CNODE_MINT:       u64 = 0x11;
 const CNODE_MOVE:       u64 = 0x12;
@@ -633,13 +633,13 @@ Memory is only accessible through:
 
 ## Example: Creating a Server
 
-This example shows the userland flow using libbesalt invoke wrappers.
+This example shows the userland flow using trona invoke wrappers.
 
 ```rust
-// In init process (using libbesalt invoke wrappers)
+// In init process (using trona invoke wrappers)
 
 // 1. Retype untyped memory to create an endpoint
-besalt_untyped_retype(
+trona_untyped_retype(
     untyped_cap,            // source untyped capability slot
     OBJ_ENDPOINT,           // ObjectType::Endpoint = 2
     0,                      // size_bits (unused for Endpoint)
@@ -649,7 +649,7 @@ besalt_untyped_retype(
 );
 
 // 2. Mint a badged copy for clients (send-only)
-besalt_cnode_mint(
+trona_cnode_mint(
     CAP_SELF_CSPACE,        // dest CNode
     client_ep_slot,         // dest slot
     CAP_SELF_CSPACE,        // src CNode

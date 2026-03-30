@@ -69,31 +69,31 @@ aarch64 is **UEFI-only** (no BIOS bootloader). QEMU uses `virt,gic-version=3` ma
 No `Cargo.toml` files — all Rust code is compiled via Meson with direct `rustc` invocation. The build chain:
 
 1. `rust/meson.build` — Builds `core` and `compiler_builtins` from `rust-src`
-2. `kernel/meson.build` — Compiles kernel Rust → `.o`, assembles `.S` files, links to `kernel.elf`
-3. `lib/besalt/lib/meson.build` — Builds libbesalt (Rust → `.o` + `.rmeta`, plus `fork.S` → `.o`, links to `libbesalt.so`)
-4. `lib/besalt/c/meson.build` — Builds saltyc (C stdlib → `libc.so`)
-5. `lib/besalt/cpp/meson.build` — Builds libc++ (optional, from `toolchain/llvm-project`)
-6. `userland/*/meson.build` — Each program compiled against libbesalt `.rmeta`, linked with libbesalt `.o` + `core.o`
+2. `kernite/meson.build` — Compiles kernel Rust → `.o`, assembles `.S` files, links to `kernel.elf`
+3. `lib/trona/substrate/meson.build` — Builds trona substrate (Rust → `.o` + `.rmeta`, plus `fork.S` → `.o`, links to `libtrona.so`)
+4. `lib/basalt/c/meson.build` — Builds basaltc (C stdlib → `libc.so`)
+5. `lib/basalt/cpp/meson.build` — Builds libc++ (optional, from `toolchain/llvm-project`)
+6. `userland/*/meson.build` — Each program compiled against trona `.rmeta`, linked with trona `.o` + `core.o`
 7. `tools/mkcpio.py` — Packs all userland ELFs + `.service` files into `initrd.cpio`
 8. `tools/mkimage.py` — Creates bootable disk image with bootloader + kernel + initrd
 
-**Kernel rustc flags** (from `kernel/meson.build`):
+**Kernel rustc flags** (from `kernite/meson.build`):
 ```
 --edition=2024  --target=<arch-specific-target-json>
 -C panic=abort  -C opt-level=2  -C debuginfo=2
 -C code-model=small  -C relocation-model=pic
 ```
 
-**Userland** uses built-in rustc targets (`x86_64-unknown-saltyos`, `aarch64-unknown-saltyos`) — these require the patched stage1 rustc from the custom toolchain. The kernel uses custom JSON target specs (`kernel/x86_64-saltyos.json`, `kernel/aarch64-saltyos.json`).
+**Userland** uses built-in rustc targets (`x86_64-unknown-saltyos`, `aarch64-unknown-saltyos`) — these require the patched stage1 rustc from the custom toolchain. The kernel uses custom JSON target specs (`kernite/x86_64-saltyos.json`, `kernite/aarch64-saltyos.json`).
 
-**Init is statically linked** (embeds libbesalt.o directly). Other userland programs use shared `libbesalt.so` loaded by `rtld` (the runtime dynamic linker).
+**Init is statically linked** (embeds trona substrate .o directly). Other userland programs use shared `libtrona.so` loaded by `rtld` (the runtime dynamic linker).
 
 ### Build Gotchas
 
 - **Clang is enforced.** The build fails with gcc. Do not suggest `cargo build`, `cargo test`, or create `Cargo.toml` files — this project does not use Cargo.
 - **Rust flags live in `meson.build`**, not `.cargo/config.toml`.
-- **Linker scripts are per-architecture:** e.g., `kernel/arch/x86_64.ld` and `kernel/arch/aarch64.ld`; similarly each userland program has `arch/x86_64/link.ld` and `arch/aarch64/link.ld`.
-- **Meson file discovery runs at setup time** — the `find` in `kernel/meson.build` auto-discovers `.rs` files only during `meson setup`. After adding new source files: `just distclean && just setup && just build`.
+- **Linker scripts are per-architecture:** e.g., `kernite/arch/x86_64.ld` and `kernite/arch/aarch64.ld`; similarly each userland program has `arch/x86_64/link.ld` and `arch/aarch64/link.ld`.
+- **Meson file discovery runs at setup time** — the `find` in `kernite/meson.build` auto-discovers `.rs` files only during `meson setup`. After adding new source files: `just distclean && just setup && just build`.
 
 ## Custom Toolchain
 
@@ -145,7 +145,7 @@ just mksaltyfs              # Generate SaltyFS test image
 
 ### Lock Ordering
 
-Lock ordering (outermost → innermost), from `kernel/src/mm/mod.rs`:
+Lock ordering (outermost → innermost), from `kernite/src/mm/mod.rs`:
 
 ```
 CAP_LOCK → SCHED_IPC_LOCK → scheduler.lock_state → VSpace.lock → MM_LOCK (FRAME_LOCK)
@@ -188,18 +188,18 @@ restore_irq(irq);
 
 - **Kernel error types:** `SyscallError`, `CapError`, `VSpaceError` — all enums with specific variants, not strings
 - **Map between error types explicitly** with dedicated functions (e.g., `syscall_error_from_cap_error()` in `syscall/mod.rs`). Do not add `impl From<X> for Y` — explicit mapping prevents accidental information loss.
-- **Userland error codes** in `lib/besalt/lib/src/consts.rs` (`BESALT_OK`, `BESALT_INVALID_CAPABILITY`, etc.) must match kernel `SyscallError` variants
+- **Userland error codes** in `lib/trona/substrate/src/consts.rs` (`TRONA_OK`, `TRONA_INVALID_CAPABILITY`, etc.) must match kernel `SyscallError` variants
 
 ### FFI Conventions
 
 - Kernel functions called from assembly: `#[unsafe(no_mangle)] pub extern "C" fn`
-- libbesalt public exports: `#[unsafe(no_mangle)] pub extern "C" fn` with `besalt_` prefix
+- trona substrate public exports: `#[unsafe(no_mangle)] pub extern "C" fn` with `trona_` prefix
 - Shared structures: `#[repr(C)]` always
 - Constants shared between kernel and userland (syscall numbers, invoke labels, error codes) must be kept in sync manually — `consts.rs` is the userland source of truth
 
 ## Architecture
 
-### Kernel (Rust, `kernel/src/`)
+### Kernel (Rust, `kernite/src/`)
 
 | Module | Purpose |
 |--------|---------|
@@ -219,12 +219,12 @@ restore_irq(irq);
 | `sched/` | EDF scheduler, TCB, PIP, sleep queue, context switch |
 | `syscall/` | 23 syscalls, capability invocation dispatch, IPC fastpath |
 
-**Key x86_64 assembly files** in `kernel/src/arch/x86_64/`:
+**Key x86_64 assembly files** in `kernite/src/arch/x86_64/`:
 - `syscall.S` — Syscall entry/exit via `syscall`/`sysretq`. User RSP is saved on the **per-thread kernel stack** (not per-CPU `%gs:16`) to prevent RSP corruption during context switches. IPC fastpath dispatch happens here (checks RAX==2 for Call, RAX==3 for ReplyRecv before slowpath).
 - `exceptions.S` — IDT exception handlers
 - `ap_tramp.S` — SMP application processor trampoline (real→long mode)
 
-**Key aarch64 details** in `kernel/src/arch/aarch64/`:
+**Key aarch64 details** in `kernite/src/arch/aarch64/`:
 - SMP via PSCI `CPU_ON` (HVC call), AP mailbox structure for stack/register handoff
 - GICv3: distributor (GICD), redistributor (GICR), CPU interface via system registers (ICC)
 - Generic timer: EL1 physical timer (CNTP) with PPI 30, 10ms tick
@@ -265,11 +265,11 @@ x86_64: Number in `rax`, args in `rdi, rsi, rdx, r10, r8, r9`. Returns error in 
 
 **Message info encoding** (seL4-style): bits 6:0 = length (0-127 MRs), bits 11:7 = extra caps, bits 51:12 = label. MR0-MR3 in registers, MR4-MR19 via IPC buffer.
 
-**Invoke labels** (defined in `lib/besalt/lib/src/consts.rs`): CNode ops `0x10-0x18`, Untyped `0x20`, SchedContext `0x30-0x31`, TCB `0x40-0x4D`, VSpace `0x50-0x5A`, IRQ `0x60-0x64`, IoPort `0x70-0x77`.
+**Invoke labels** (defined in `lib/trona/substrate/src/consts.rs`): CNode ops `0x10-0x18`, Untyped `0x20`, SchedContext `0x30-0x31`, TCB `0x40-0x4D`, VSpace `0x50-0x5A`, IRQ `0x60-0x64`, IoPort `0x70-0x77`.
 
 ### Well-Known Capability Slots
 
-**Kernel-side init slots** (set in `kernel/src/init.rs` for the init task):
+**Kernel-side init slots** (set in `kernite/src/init.rs` for the init task):
 
 | Slot | Name | Description |
 |------|------|-------------|
@@ -287,7 +287,7 @@ x86_64: Number in `rax`, args in `rdi, rsi, rdx, r10, r8, r9`. Returns error in 
 | 15 | CAP_PCI_IOPORT | PCI config space I/O port |
 | 16+ | CAP_UNTYPED_START | Untyped memory capabilities |
 
-**Userland child convention** (defined in `lib/besalt/lib/src/consts.rs`, set by procmgr):
+**Userland child convention** (defined in `lib/trona/substrate/src/consts.rs`, set by procmgr):
 
 | Slot | Name | Description |
 |------|------|-------------|
@@ -319,7 +319,7 @@ Domain-based layout with programs organized by function:
 | Program | Path | Role |
 |---------|------|------|
 | `init` | `core/init` | First process — service-based multi-phase bootstrap |
-| `rtld` | `core/rtld` | Runtime dynamic linker (loads libbesalt.so) |
+| `rtld` | `core/rtld` | Runtime dynamic linker (loads libtrona.so) |
 | `mmsrv` | `core/mmsrv` | Memory manager server (centralized frame allocation, VSpace mapping) |
 | `procmgr` | `core/procmgr` | Process manager (spawn/exit/waitpid) |
 | `nameserv` | `core/nameserv` | Name service (endpoint lookup) |
@@ -339,34 +339,41 @@ All userland ELFs + service files are packed into a CPIO initrd (`tools/mkcpio.p
 
 **Architecture-specific code** in userland programs lives in `src/arch/x86_64.rs` and `src/arch/aarch64.rs` modules (e.g., `pcisrv` has PCI ECAM mapping for aarch64 vs I/O port access for x86_64).
 
-### Libraries (`lib/besalt/`)
+### Libraries
 
-Three sub-libraries under `lib/besalt/`:
+Three-tier library architecture:
 
-**libbesalt** (`lib/besalt/lib/`, Rust) — Userspace system library:
-- `consts.rs` — Syscall numbers, invoke labels, error codes, object types, well-known cap slots, POSIX constants
-- `types.rs` — Message struct, PollFd, SockAddrUn, signal types
-- `syscall.rs` — Raw syscall wrappers (inline asm)
-- `ipc.rs` — IPC wrappers (call, send, recv, reply_recv)
-- `invoke.rs` — Capability invocation helpers (CNode/Untyped/TCB/VSpace/IRQ/IoPort ops)
-- `posix/` — POSIX compatibility: `at`, `file`, `misc`, `pipe`, `poll`, `proc`, `socket`
-- `posix_mm.rs` — POSIX memory management (mmap, shm)
-- `signals.rs` — POSIX signal delivery via notifications
-- `cpio.rs` / `elf_loader.rs` / `elf_dynamic.rs` — CPIO parsing, ELF loading, dynamic linking support
+**trona** (`lib/trona/`, Rust) — System library (substrate + POSIX implementation + loader):
+
+- `substrate/` (crate: `trona`) — Syscall wrappers, IPC, capability invocations, types, constants
+  - `consts.rs` — Syscall numbers, invoke labels, error codes, object types, well-known cap slots, POSIX constants
+  - `types.rs` — TronaMsg, PollFd, SockAddrUn, signal types
+  - `syscall.rs` — Raw syscall wrappers (inline asm)
+  - `ipc.rs` — IPC wrappers (call, send, recv, reply_recv)
+  - `invoke.rs` — Capability invocation helpers (CNode/Untyped/TCB/VSpace/IRQ/IoPort ops)
+- `posix/` (crate: `trona_posix`) — POSIX compatibility (Rust API only, no C ABI)
+  - `at`, `file`, `misc`, `pipe`, `poll`, `proc`, `socket`
+  - `posix_mm.rs` — POSIX memory management (mmap, shm)
+  - `signals.rs` — POSIX signal delivery via notifications
+- `rtld/loader/` (crate: `trona_loader`) — ELF/TLS/CPIO loading
+  - `cpio.rs` / `elf_loader.rs` / `elf_dynamic.rs` — CPIO parsing, ELF loading, dynamic linking support
+- `rtld/ld/` — `ld-trona.so` (C dynamic linker)
 - `sync.rs` — Synchronization primitives (Mutex, RWLock, Semaphore)
 - `pthread.rs` — POSIX threads support
 - `fork.S` — Fork assembly stub (arch-specific: `arch/x86_64/fork.S`, `arch/aarch64/fork.S`)
 
-**saltyc** (`lib/besalt/c/`, C) — C standard library:
-- POSIX stdio, stdlib, string, unistd, signal, time, termios, dirent, regex
-- BSD compatibility (fts, getopt, termcap, pwd, grp)
-- Delegates to userspace servers (VFS, procmgr) via libbesalt IPC
-- Built as `libc.so`
+**basalt** (`lib/basalt/`, C/C++) — C/C++ standard library (thin C ABI surface):
 
-**libc++** (`lib/besalt/cpp/`, C++) — Optional C++ runtime:
-- libcxx + libcxxabi from `toolchain/llvm-project` sources
-- `-fno-exceptions -fno-rtti`
-- Built as `libc++.so` (auto-detected when llvm-project submodule is present)
+- `c/` (crate: `basaltc`) — C standard library:
+  - POSIX stdio, stdlib, string, unistd, signal, time, termios, dirent, regex
+  - BSD compatibility (fts, getopt, termcap, pwd, grp)
+  - Delegates to userspace servers (VFS, procmgr) via trona IPC
+  - Built as `libc.so`
+
+- `cpp/` — Optional C++ runtime:
+  - libcxx + libcxxabi from `toolchain/llvm-project` sources
+  - `-fno-exceptions -fno-rtti`
+  - Built as `libc++.so` (auto-detected when llvm-project submodule is present)
 
 ## Rust 2024 Edition
 
@@ -392,9 +399,9 @@ Three sub-libraries under `lib/besalt/`:
 
 ### New Kernel Source File
 
-1. Create the `.rs` file in the appropriate `kernel/src/` subdirectory
+1. Create the `.rs` file in the appropriate `kernite/src/` subdirectory
 2. Add `mod my_module;` to the parent module's `mod.rs` or `lib.rs`
-3. Run `just distclean && just setup && just build` (the `find` in `kernel/meson.build` auto-discovers `.rs` files, but only on `meson setup`)
+3. Run `just distclean && just setup && just build` (the `find` in `kernite/meson.build` auto-discovers `.rs` files, but only on `meson setup`)
 
 ### New Userland Program
 
@@ -408,17 +415,17 @@ Three sub-libraries under `lib/besalt/`:
 
 ### New Syscall
 
-1. Add variant to the `Syscall` enum and its `TryFrom<u64>` impl in `kernel/src/syscall/mod.rs`
-2. Add matching constant to `lib/besalt/lib/src/consts.rs`
-3. Add dispatch arm in `syscall_handle_rust()` in `kernel/src/syscall/mod.rs`
-4. Add raw syscall wrapper in `lib/besalt/lib/src/syscall.rs`
+1. Add variant to the `Syscall` enum and its `TryFrom<u64>` impl in `kernite/src/syscall/mod.rs`
+2. Add matching constant to `lib/trona/substrate/src/consts.rs`
+3. Add dispatch arm in `syscall_handle_rust()` in `kernite/src/syscall/mod.rs`
+4. Add raw syscall wrapper in `lib/trona/substrate/src/syscall.rs`
 5. Update `docs/spec/syscalls.md`
 
 ### New Capability Invocation
 
-1. Add invoke label constant to `lib/besalt/lib/src/consts.rs`
-2. Add dispatch arm in `handle_invoke()` in `kernel/src/syscall/mod.rs`
-3. Add wrapper function in `lib/besalt/lib/src/invoke.rs`
+1. Add invoke label constant to `lib/trona/substrate/src/consts.rs`
+2. Add dispatch arm in `handle_invoke()` in `kernite/src/syscall/mod.rs`
+3. Add wrapper function in `lib/trona/substrate/src/invoke.rs`
 4. Update `docs/spec/syscalls.md`
 
 ## Testing and Verification
@@ -444,14 +451,14 @@ Format: `<type>(<scope>): <subject>` (scope is optional for cross-cutting change
 
 **Types:** `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `perf`
 
-**Scopes:** `kernel`, `boot`, `ipc`, `sched`, `cap`, `mm`, `vspace`, `syscall`, `libbesalt`, `saltyc`, `init`, `procmgr`, `vfs`, `console`, `nameserv`, `test_runner`, `mmsrv`, `rtld`, `ttyd`, `getty`, `blkdrv`, `pcisrv`, `display`, `saltyfs`
+**Scopes:** `kernite`, `boot`, `ipc`, `sched`, `cap`, `mm`, `vspace`, `syscall`, `trona`, `basaltc`, `init`, `procmgr`, `vfs`, `console`, `nameserv`, `test_runner`, `mmsrv`, `rtld`, `ttyd`, `getty`, `blkdrv`, `pcisrv`, `display`, `saltyfs`
 
 Examples:
 ```
 feat(ipc): add notification polling with timeout
 fix(sched): send EOI before timer_tick to prevent APIC lockup
 feat: implement POSIX Phase 2 — sockets, poll, shm, fd passing
-feat(kernel): aarch64 SMP support — PSCI AP bringup, GICv3 IPI, per-CPU data
+feat(kernite): aarch64 SMP support — PSCI AP bringup, GICv3 IPI, per-CPU data
 docs: update design docs for bound notification
 ```
 

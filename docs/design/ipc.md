@@ -303,7 +303,7 @@ futex are in `ThreadState::BlockedOnFutex` and can be woken by any thread that
 calls FUTEX_WAKE on the same address.
 
 Futexes are the building block for userspace mutexes, condition variables,
-semaphores, and rwlocks in libbesalt (see `lib/besalt/lib/src/sync/`).
+semaphores, and rwlocks in trona (see `lib/trona/substrate/src/sync/`).
 
 ## IPC Wait Queue
 

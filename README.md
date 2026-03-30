@@ -18,7 +18,7 @@ and Fuchsia, implementing a minimal trusted computing base with most system serv
 - **Multi-Architecture**: Designed for x86_64 with aarch64 support planned
 - **Custom Bootloader**: 3-stage bootloader supporting both BIOS and UEFI
 - **POSIX Compatibility Layer**: Signals, pipes, sockets, poll/epoll, shared memory, fork/exec
-- **C Standard Library (saltyc)**: Full stdio/stdlib/string/unistd for C program support
+- **C Standard Library (basaltc)**: Full stdio/stdlib/string/unistd for C program support
 - **Terminal Support**: Line discipline with canonical/raw mode, signal generation
 
 ## Project Status
@@ -50,7 +50,7 @@ and Fuchsia, implementing a minimal trusted computing base with most system serv
 - [x] **Bound notifications** (bidirectional TCB↔Notification link, combined IPC wait)
 - [x] **SMP locking discipline** (lock ordering enforcement, atomic serial output)
 - [x] **Time syscalls** (ClockGetTime, NanoSleep)
-- [x] **saltyc C standard library** (stdio, stdlib, string, malloc, unistd, signal, termios, dirent, regex)
+- [x] **basaltc C standard library** (stdio, stdlib, string, malloc, unistd, signal, termios, dirent, regex)
 - [x] **Terminal line discipline** (ICANON, ECHO, ISIG with Ctrl-C/Ctrl-\/Ctrl-Z, tcgetattr/tcsetattr)
 - [x] **Automated test suite** (test_runner with 10 modules: hello, fs, mmap, fork, signal, socket, pipe, time, terminal, epoll)
 - [x] **Framebuffer display server** (shadow buffer, damage tracking, WC-optimized flush)
@@ -164,7 +164,7 @@ SaltyOS/
 │   ├── stage2/             # Protected/Long mode setup (C)
 │   ├── stage3/             # Filesystem + kernel loader (C)
 │   └── common/             # Shared utilities
-├── kernel/                 # Rust microkernel
+├── kernite/                # Rust microkernel
 │   └── src/
 │       ├── arch/           # Architecture-specific code
 │       ├── cap/            # Capability system
@@ -184,8 +184,8 @@ SaltyOS/
 │   ├── test_runner/        # Automated test suite
 │   └── services/           # Service descriptor files (.service)
 ├── lib/                    # Shared libraries
-│   ├── libsalty/           # System library (Rust, syscall wrappers + POSIX compat)
-│   └── saltyc/             # C standard library (stdio, math, string, malloc, etc.)
+│   ├── trona/              # System library (Rust, syscall wrappers + POSIX compat)
+│   └── basalt/             # C/C++ standard library (stdio, math, string, malloc, etc.)
 ├── tools/                  # Build utilities
 │   ├── mkcpio.py           # Pack userland ELFs + services into initrd.cpio
 │   └── mkimage.py          # Create bootable disk image

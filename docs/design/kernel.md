@@ -51,7 +51,7 @@ All system calls should have bounded worst-case execution time (WCET):
 ### Module Structure
 
 ```
-kernel/src/
+kernite/src/
 ├── lib.rs              # Entry (kmain), serial I/O, panic handler
 ├── bootinfo.rs         # Boot info TLV parsing from bootloader
 ├── builtins.rs         # Compiler built-in function stubs (memcpy, memset, etc.)
@@ -133,7 +133,7 @@ graph TD
 ### Entry Point
 
 ```rust
-// kernel/src/lib.rs
+// kernite/src/lib.rs
 
 #![no_std]
 #![no_main]
@@ -196,7 +196,7 @@ fn panic(info: &PanicInfo) -> ! {
 ### x86_64 Initialization
 
 ```rust
-// kernel/src/arch/x86_64/mod.rs
+// kernite/src/arch/x86_64/mod.rs
 
 pub mod acpi;
 pub mod ap_boot;
@@ -254,7 +254,7 @@ data is accessed via raw pointers (`core::ptr::addr_of_mut!`) or through
 `SyncUnsafeCell`-based per-CPU storage.
 
 ```rust
-// kernel/src/arch/x86_64/gdt.rs
+// kernite/src/arch/x86_64/gdt.rs
 
 use core::cell::SyncUnsafeCell;
 use core::mem::size_of;
@@ -312,7 +312,7 @@ The IDT is a static 256-entry array accessed through raw pointers (Rust 2024
 disallows `&mut` of `static mut`).
 
 ```rust
-// kernel/src/arch/x86_64/idt.rs
+// kernite/src/arch/x86_64/idt.rs
 
 #[repr(C, packed)]
 struct IdtEntry {
@@ -380,7 +380,7 @@ TCBs are kernel objects (carved from untyped memory via retype, never heap-alloc
 All references to other kernel objects are raw pointers, not smart pointers.
 
 ```rust
-// kernel/src/sched/thread.rs
+// kernite/src/sched/thread.rs
 
 /// Thread state — determines schedulability and blocking reason
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -434,7 +434,7 @@ pub struct Tcb {
 ### Context Switching
 
 ```rust
-// kernel/src/arch/x86_64/context.rs
+// kernite/src/arch/x86_64/context.rs
 
 /// Saved CPU context for context switching
 #[repr(C)]
@@ -536,7 +536,7 @@ Syscall entry is via the `syscall` instruction. The assembly stub in
 and falls through to the Rust slowpath handler for all other syscalls.
 
 ```rust
-// kernel/src/syscall/mod.rs
+// kernite/src/syscall/mod.rs
 
 mod fastpath;
 
@@ -612,7 +612,7 @@ based on the capability's `obj_type` field. The invoke label (passed in the
 message info) determines the specific operation within each type.
 
 ```rust
-// kernel/src/syscall/mod.rs (handle_invoke function)
+// kernite/src/syscall/mod.rs (handle_invoke function)
 
 /// Invoke a capability. The cap slot is looked up in the thread's CSpace,
 /// then dispatched based on ObjectType and invoke label.
@@ -678,7 +678,7 @@ capability. Pointers to kernel objects remain valid for the lifetime of the
 system.
 
 ```rust
-// kernel/src/cap/object.rs
+// kernite/src/cap/object.rs
 
 /// Object type discriminant (stored in KernelObject header and Capability)
 #[repr(u8)]

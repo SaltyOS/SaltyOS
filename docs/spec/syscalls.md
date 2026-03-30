@@ -1208,26 +1208,26 @@ MR0-MR3 are passed in CPU registers for the fastpath. MR4-MR19 overflow to the I
 
 ```c
 // Client side
-struct besalt_msg msg = {
+struct trona_msg msg = {
     .label = REQUEST_ADD,
     .length = 2,
     .regs = { 42, 0, 0, 0 },
 };
-besalt_call(server_ep, &msg);
+trona_call(server_ep, &msg);
 uint64_t result = msg.regs[0];
 
 // Server side
-struct besalt_msg msg, reply;
+struct trona_msg msg, reply;
 uint64_t badge;
-besalt_recv(endpoint, &msg, &badge);
+trona_recv(endpoint, &msg, &badge);
 
 for (;;) {
     uint64_t result = handle_request(msg.label, msg.regs[0]);
 
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
     reply.length = 1;
     reply.regs[0] = result;
 
-    besalt_reply_recv(endpoint, &reply, &msg, &badge);
+    trona_reply_recv(endpoint, &reply, &msg, &badge);
 }
 ```

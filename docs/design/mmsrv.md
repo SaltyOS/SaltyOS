@@ -78,7 +78,7 @@ Set by init in `spawn.rs`:
 
 ### Message Labels (0x80-0x90 Range)
 
-Defined in `lib/besalt/lib/src/consts.rs`:
+Defined in `lib/trona/substrate/src/consts.rs`:
 
 | Label | Name | Source | Purpose |
 |-------|------|--------|---------|
@@ -582,7 +582,7 @@ Both use the same VMFault handler. The only difference is the initial state.
 
 ### procmgr Shared Library Cache
 
-**Problem:** procmgr maintains a shared library cache (loads `libbesalt.so`, `libc.so` once, maps into all children). This cache needs frames, but procmgr can't use mmsrv (circular dependency — mmsrv uses procmgr for process management).
+**Problem:** procmgr maintains a shared library cache (loads `libtrona.so`, `libc.so` once, maps into all children). This cache needs frames, but procmgr can't use mmsrv (circular dependency — mmsrv uses procmgr for process management).
 
 **Solution:** procmgr also has its own child untyped capability:
 - Allocates cache frames directly via `untyped_retype()`
@@ -691,7 +691,7 @@ Planned: Debug IPC label to query server state:
 ## 15. Cross-References
 
 - **[POSIX Compatibility](posix.md)** — How `posix_mmap()`/`brk()`/`sbrk()` delegate to mmsrv
-- **[libbesalt Design](libbesalt.md)** — Slot allocator's use of mmsrv for frame allocation
+- **[trona Design](libsalty.md)** — Slot allocator's use of mmsrv for frame allocation
 - **[Process Manager](procmgr.md)** — Spawn/fork integration with MM_MAP_BATCH/MM_MAP_WINDOW/MM_FORK_REGIONS
 - **[VFS Design](vfs.md)** — SHM object lifecycle and mmap integration
 - **[Kernel Memory Management](memory.md)** — Untyped retype, VSpace mapping, COW implementation
