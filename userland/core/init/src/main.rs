@@ -113,7 +113,7 @@ static mut INITRD_SIZE: usize = 0;
 // ======================================================================
 
 pub fn ipc_ctx() -> *mut IpcContext {
-    &raw mut besalt::__besalt_ipc_ctx
+    besalt::tls::current_ipc_ctx()
 }
 
 pub unsafe extern "C" fn init_alloc_frame_slot(_opaque: *mut u8) -> Cap {
@@ -153,10 +153,16 @@ fn select_init_work_untyped() -> Cap {
     CAP_UNTYPED_START
 }
 
-/// Validate that all service-declared cap slots are in the allowed range (>= 64).
+/// Validate service-declared capability slots.
+///
+/// `CopyCap`, `NeedEP`, and `InjectEP` occupy the service-injected range (>= 64).
+/// `CreateEP` reserves a private bootstrap endpoint slot in the low per-service
+/// range [32, 63], below rtld's runtime slot pool and above fixed ABI slots.
 /// Returns error count.
 fn validate_service_caps(mgr: &svc_mgr::ServiceManager) -> u32 {
     const MIN_SVC_SLOT: u64 = 64;
+    const MIN_BOOTSTRAP_EP_SLOT: u64 = 32;
+    const MAX_BOOTSTRAP_EP_SLOT: u64 = 63;
     let mut errors: u32 = 0;
     for i in 0..mgr.count {
         let def = &mgr.services[i].def;
@@ -197,8 +203,54 @@ fn validate_service_caps(mgr: &svc_mgr::ServiceManager) -> u32 {
                 errors += 1;
             }
         }
+        for c in 0..def.create_ep_count as usize {
+            let slot = def.create_eps[c].dst_slot;
+            if !(MIN_BOOTSTRAP_EP_SLOT..=MAX_BOOTSTRAP_EP_SLOT).contains(&slot) {
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[INIT] ERROR: ");
+                    _lb.bytes(name);
+                    _lb.str(b" CreateEP dst=");
+                    _lb.hex(slot);
+                    _lb.str(b" outside [32,63] bootstrap-private range\n");
+                });
+                errors += 1;
+            }
+        }
     }
     errors
+}
+
+unsafe fn create_declared_endpoints(
+    svc_name: &[u8],
+    ut: Cap,
+    defs: &[ini::CreateEpDef],
+    out_slots: &mut [Cap],
+) -> bool {
+    unsafe {
+        for slot in out_slots.iter_mut() {
+            *slot = 0;
+        }
+
+        for (index, def) in defs.iter().enumerate() {
+            let ep_slot = init_alloc_frame_slot(core::ptr::null_mut());
+            let err = invoke::untyped_retype(ut, besalt::OBJ_ENDPOINT, 0, ep_slot);
+            if err != 0 {
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[INIT] ERROR: CreateEP for ");
+                    _lb.bytes(svc_name);
+                    _lb.str(b" dst=");
+                    _lb.hex(def.dst_slot);
+                    _lb.str(b" failed err=");
+                    _lb.hex(err as u64);
+                    _lb.str(b"\n");
+                });
+                return false;
+            }
+            out_slots[index] = ep_slot;
+        }
+
+        true
+    }
 }
 
 /// Read the kernel boot info page at BOOTINFO_VADDR.
@@ -327,6 +379,18 @@ unsafe fn inject_caps_and_resume(
         let ep_needs = mgr.services[svc_idx].def.ep_needs;
         let cap_count = mgr.services[svc_idx].def.cap_count;
         let caps = mgr.services[svc_idx].def.caps;
+        let create_ep_count = mgr.services[svc_idx].def.create_ep_count;
+        let create_eps = mgr.services[svc_idx].def.create_eps;
+        let mut created_ep_slots = [0u64; ini::MAX_CREATE_EPS];
+
+        if !create_declared_endpoints(
+            name,
+            select_init_work_untyped(),
+            &create_eps[..create_ep_count as usize],
+            &mut created_ep_slots,
+        ) {
+            return false;
+        }
 
         // Inject NeedEP caps into child via PM_INJECT_CAP
         for i in 0..ep_need_count as usize {
@@ -367,6 +431,26 @@ unsafe fn inject_caps_and_resume(
                     _lb.hex(caps[i].src_slot);
                     _lb.str(b" dst=");
                     _lb.hex(caps[i].dst_slot);
+                    _lb.str(b" failed\n");
+                });
+            }
+        }
+
+        for i in 0..create_ep_count as usize {
+            let cap = created_ep_slots[i];
+            if cap == 0 {
+                continue;
+            }
+            let r = spawn::pm_inject_cap(
+                procmgr_ep,
+                pid,
+                create_eps[i].dst_slot,
+                cap,
+            );
+            if r != 0 {
+                besalt::uerror!(|_lb| {
+                    _lb.str(b"[INIT] WARN: inject CreateEP dst=");
+                    _lb.hex(create_eps[i].dst_slot);
                     _lb.str(b" failed\n");
                 });
             }
@@ -523,12 +607,15 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
         if is_pre_procmgr {
             let cap_base = get_cap_base(pre_spawn_idx);
             let child_badge = 0x1000 + pre_spawn_idx;
+            const MAX_EXTRA_CAPS: usize = ini::MAX_CAP_COPIES + ini::MAX_EP_NEEDS + ini::MAX_CREATE_EPS;
 
             // Copy capability-related fields to stack to avoid borrow conflicts
             let cap_count = mgr.services[svc_idx].def.cap_count;
             let caps = mgr.services[svc_idx].def.caps;
             let ep_need_count = mgr.services[svc_idx].def.ep_need_count;
             let ep_needs = mgr.services[svc_idx].def.ep_needs;
+            let create_ep_count = mgr.services[svc_idx].def.create_ep_count;
+            let create_eps = mgr.services[svc_idx].def.create_eps;
             let ep_inject_count = mgr.services[svc_idx].def.ep_inject_count;
             let ep_injects = mgr.services[svc_idx].def.ep_injects;
             let cnode_bits = mgr.services[svc_idx].def.cnode_bits as u64;
@@ -538,10 +625,22 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
             let svc_pre_ep = mgr.services[svc_idx].pre_ep;
 
             // Build extras from [Capabilities] declarations
-            let mut extras = [ExtraCapCopy { src: 0, dst: 0, badge: 0 }; 10];
+            let mut extras = [ExtraCapCopy { src: 0, dst: 0, badge: 0 }; MAX_EXTRA_CAPS];
             let mut n: usize = 0;
             let mut pager_ep_src: Cap = 0;
             let mut pager_child_slot: u64 = 0;
+            let mut created_ep_slots = [0u64; ini::MAX_CREATE_EPS];
+
+            if !create_declared_endpoints(
+                name,
+                ut,
+                &create_eps[..create_ep_count as usize],
+                &mut created_ep_slots,
+            ) {
+                mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
+                pre_spawn_idx += 1;
+                continue;
+            }
 
             for i in 0..cap_count as usize {
                 if n < extras.len() {
@@ -579,6 +678,17 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                 }
             }
 
+            for i in 0..create_ep_count as usize {
+                if n < extras.len() && created_ep_slots[i] != 0 {
+                    extras[n] = ExtraCapCopy {
+                        src: created_ep_slots[i],
+                        dst: create_eps[i].dst_slot,
+                        badge: 0,
+                    };
+                    n += 1;
+                }
+            }
+
             let svc_role = mgr.services[svc_idx].def.role_bytes();
             let mirror_untypeds = bytes_eq(svc_role, b"pager");
             let ut_bits = if mirror_untypeds {
@@ -591,6 +701,7 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
             } else {
                 compute_service_budget(total_usable, mgr.count, memory_kb, do_map_initrd)
             };
+            let copy_shared_lib_caps = bytes_eq(name, b"procmgr") || mirror_untypeds;
             let err = unsafe {
                 spawn::spawn_server(
                     ut,
@@ -601,7 +712,7 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                     do_map_initrd,
                     cnode_bits,
                     ut_bits,
-                    do_map_initrd,
+                    copy_shared_lib_caps,
                     ready_timeout_ns,
                     svc_pre_ep,
                     pager_ep_src,

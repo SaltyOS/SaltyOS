@@ -40,7 +40,7 @@ const STACK_ENTRY_BIAS: u64 = 8;
 // Shared library physical frame cache
 // ===========================================================================
 
-const MAX_SHARED_LIB_PAGES: usize = 576;
+const MAX_SHARED_LIB_PAGES: usize = 1152;
 const MAX_CACHED_LIBS: usize = 4;
 const MAX_LIB_NAME: usize = 24;
 const MAX_RW_SEGS: usize = 4;
@@ -651,6 +651,9 @@ pub unsafe fn init_shared_lib_cache(root_ut: Cap) {
         }
 
         if !cache_ok {
+            besalt::uerror!(|_lb| {
+                _lb.str(b"[INIT] shared lib cache disabled: capacity or frame allocation failure\n");
+            });
             *cache = SharedLibCache::new();
             return;
         }
@@ -1628,7 +1631,7 @@ pub unsafe fn spawn_server(
                     }
                 }
                 let cache = &*(&raw const SHARED_LIB_CACHE);
-                if cache.initialized && cache.page_count > 0 {
+                if copy_shared_lib_caps && cache.initialized && cache.page_count > 0 {
                     let cache_end = CAP_SHARED_LIB_CACHE_BASE + cache.page_count as u64;
                     if cache_end > s {
                         s = cache_end;
@@ -1664,6 +1667,27 @@ pub unsafe fn spawn_server(
             child_rsp = layout.stack_top - srv_stack_frame_size - stack_rsp_bias;
             child_entry = rtld_result.entry;
         }
+
+        #[cfg(target_arch = "aarch64")]
+        besalt::udebug!(|_lb| {
+            _lb.str(b"[INIT] child layout ");
+            _lb.bytes(label);
+            _lb.str(b" entry=");
+            _lb.hex(child_entry);
+            _lb.str(b" stack=");
+            _lb.hex(layout.stack.base);
+            _lb.str(b"..");
+            _lb.hex(layout.stack.base + layout.stack.page_count() as u64 * 4096);
+            _lb.str(b" rsp=");
+            _lb.hex(child_rsp);
+            _lb.str(b" ipc=");
+            _lb.hex(layout.ipc_buf.base);
+            if shared_lib_base != 0 {
+                _lb.str(b" shared=");
+                _lb.hex(shared_lib_base);
+            }
+            _lb.str(b"\n");
+        });
 
         let err = invoke::tcb_configure(child_tcb, child_entry, child_rsp, 0);
         if err != 0 {
