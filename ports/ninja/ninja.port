@@ -1,0 +1,26 @@
+[port]
+name = ninja
+version = 1.12.1
+description = Small build system with a focus on speed
+homepage = https://ninja-build.org/
+license = Apache-2.0
+
+[source]
+url = https://github.com/ninja-build/ninja/archive/refs/tags/v${version}.tar.gz
+subdir = ninja-${version}
+sha256 = 821bdff48a3f683bc4bb3b6f0b5fe7b2d647cf65d52aeb63328c91a6c6df285a
+
+[build]
+type = cmake
+configure =
+    -DCMAKE_SYSTEM_NAME=SaltyOS
+    -DCMAKE_CROSSCOMPILING=TRUE
+    -DCMAKE_SYSTEM_PROCESSOR=${ARCH}
+    -DCMAKE_MODULE_PATH=${REPOROOT}/tools/cmake
+    -DCMAKE_AR=${TOOLCHAIN_PREFIX}/bin/llvm-ar
+    -DCMAKE_RANLIB=${TOOLCHAIN_PREFIX}/bin/llvm-ranlib
+    -DBUILD_TESTING=OFF
+    -DCMAKE_CXX_STANDARD=17
+
+[install]
+bin/ninja = _build/ninja

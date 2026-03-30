@@ -1,0 +1,27 @@
+[port]
+name = make
+version = 4.4.1
+description = GNU make build tool
+homepage = https://www.gnu.org/software/make/
+license = GPL-3.0
+
+[source]
+url = https://ftp.gnu.org/gnu/make/make-${version}.tar.gz
+subdir = make-${version}
+sha256 = dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3
+
+[build]
+type = autotools
+configure =
+    -C
+    --without-guile
+    --disable-nls
+    --disable-load
+
+[env]
+CFLAGS_FOR_BUILD =
+
+[autoconf_cache]
+
+[install]
+bin/make = make
