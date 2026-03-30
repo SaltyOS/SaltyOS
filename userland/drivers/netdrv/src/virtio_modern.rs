@@ -44,6 +44,7 @@ const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
 
 /// Feature bits
 const VIRTIO_NET_F_MAC: u32 = 1 << 5;
+const VIRTIO_NET_F_MRG_RXBUF: u32 = 1 << 15;
 
 // Common config register offsets (virtio 1.0 spec §4.1.4.3)
 const CC_DEVICE_FEATURE_SELECT: u32 = 0x00;
@@ -359,6 +360,10 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
     if (dev_features0 & VIRTIO_NET_F_MAC) != 0 {
         driver_features0 |= VIRTIO_NET_F_MAC;
     }
+    let use_mrg_rxbuf = (dev_features0 & VIRTIO_NET_F_MRG_RXBUF) != 0;
+    if use_mrg_rxbuf {
+        driver_features0 |= VIRTIO_NET_F_MRG_RXBUF;
+    }
     layout.common_write32(CC_DRIVER_FEATURE_SELECT, 0);
     layout.common_write32(CC_DRIVER_FEATURE, driver_features0);
 
@@ -523,9 +528,16 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         *(&raw mut MODERN_LAYOUT) = Some(layout);
         *(&raw mut crate::USING_MODERN_TRANSPORT) = true;
         *(&raw mut crate::virtio::USE_FLEX_LAYOUT) = true;
-        // VIRTIO_F_VERSION_1: net header is 12 bytes (includes num_buffers)
-        crate::virtio::set_net_hdr_size(12);
+        crate::virtio::set_net_hdr_size(if use_mrg_rxbuf { 12 } else { 10 });
     }
+
+    besalt::udebug!(|_lb| {
+        _lb.str(b"[netdrv] modern net hdr size=");
+        _lb.dec(if use_mrg_rxbuf { 12 } else { 10 });
+        _lb.str(b" mrg_rxbuf=");
+        _lb.dec(use_mrg_rxbuf as u64);
+        _lb.putc(b'\n');
+    });
 
     // DRIVER_OK must be set BEFORE prefill_rx_ring: the device ignores
     // queue notifications until DRIVER_OK is active (virtio 1.0 §3.1.1).

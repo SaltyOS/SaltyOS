@@ -73,13 +73,15 @@ static mut IRQ_BADGE_BITS: u64 = 0;
 pub(crate) static mut USING_MODERN_TRANSPORT: bool = false;
 static mut SHM_BASE: u64 = 0;
 static mut NETSRV_RX_NTFN: u64 = 0;
+static mut LOGGED_RX_FRAME: bool = false;
+static mut LOGGED_TX_FRAME: bool = false;
 
 // ---------------------------------------------------------------------------
 // Utility functions
 // ---------------------------------------------------------------------------
 
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
-    &raw mut besalt::__besalt_ipc_ctx
+    besalt::tls::current_ipc_ctx()
 }
 
 fn irq_badge_bits() -> u64 {
@@ -89,6 +91,47 @@ fn irq_badge_bits() -> u64 {
 
 fn signal_ready() {
     let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+}
+
+fn log_frame_bytes(prefix: &[u8], frame: &[u8]) {
+    let dump_len = core::cmp::min(frame.len(), 32);
+    besalt::udebug!(|_lb| {
+        _lb.str(prefix);
+        _lb.str(b" len=");
+        _lb.dec(frame.len() as u64);
+        _lb.str(b" bytes=");
+        let mut i = 0;
+        while i < dump_len {
+            if i > 0 {
+                _lb.putc(b' ');
+            }
+            let b = frame[i];
+            if b < 0x10 {
+                _lb.putc(b'0');
+            }
+            _lb.hex(b as u64);
+            i += 1;
+        }
+        if dump_len < frame.len() {
+            _lb.str(b" ...");
+        }
+        _lb.putc(b'\n');
+    });
+}
+
+fn log_ethertype(prefix: &[u8], frame: &[u8]) {
+    if frame.len() < 14 {
+        return;
+    }
+    let ethertype = ((frame[12] as u16) << 8) | (frame[13] as u16);
+    besalt::udebug!(|_lb| {
+        _lb.str(prefix);
+        _lb.str(b" len=");
+        _lb.dec(frame.len() as u64);
+        _lb.str(b" ethertype=");
+        _lb.hex(ethertype as u64);
+        _lb.putc(b'\n');
+    });
 }
 
 /// Get our MAC address from the virtio driver.
@@ -338,6 +381,19 @@ fn drain_rx() -> bool {
         let hdr_sz = virtio::net_hdr_size();
         if len > hdr_sz {
             let pkt = &data[hdr_sz..];
+            unsafe {
+                if !*(&raw const LOGGED_RX_FRAME) {
+                    *(&raw mut LOGGED_RX_FRAME) = true;
+                    besalt::udebug!(|_lb| {
+                        _lb.str(b"[netdrv] RX header-skip=");
+                        _lb.dec(hdr_sz as u64);
+                        _lb.putc(b'\n');
+                    });
+                    log_frame_bytes(b"[netdrv] RX raw", data);
+                    log_frame_bytes(b"[netdrv] RX pkt", pkt);
+                    log_ethertype(b"[netdrv] RX pkt", pkt);
+                }
+            }
             if shm_rx_enqueue(pkt) {
                 any_enqueued = true;
             }
@@ -355,6 +411,13 @@ fn drain_rx() -> bool {
 fn drain_tx_ring() {
     let mut buf = [0u8; 2048];
     while let Some(len) = shm_tx_peek(&mut buf) {
+        unsafe {
+            if !*(&raw const LOGGED_TX_FRAME) {
+                *(&raw mut LOGGED_TX_FRAME) = true;
+                log_frame_bytes(b"[netdrv] TX pkt", &buf[..len]);
+                log_ethertype(b"[netdrv] TX pkt", &buf[..len]);
+            }
+        }
         let ok = virtio::tx_packet(&buf[..len]);
         if !ok {
             break;
