@@ -1,0 +1,41 @@
+[port]
+name = openssl
+version = 3.4.1
+description = OpenSSL cryptography and TLS library
+homepage = https://www.openssl.org/
+license = Apache-2.0
+
+[source]
+url = https://github.com/openssl/openssl/releases/download/openssl-${version}/openssl-${version}.tar.gz
+subdir = openssl-${version}
+sha256 = 002a2d6b30b58bf4bea46c43bdd96365aaf8daa6c428782aa4feee06da197df3
+
+[depends]
+build = perl
+
+[build]
+type = custom
+
+[prepare]
+cd ${SRCDIR}
+if [ "${ARCH}" = "aarch64" ]; then OPENSSL_TARGET="linux-aarch64"; else OPENSSL_TARGET="linux-x86_64-clang"; fi
+perl ./Configure $OPENSSL_TARGET \
+    --prefix=/usr \
+    --openssldir=/etc/ssl \
+    no-shared \
+    no-asm \
+    no-tests \
+    no-docs \
+    no-apps \
+    no-autoload-config \
+    no-engine \
+    CC="${CC}" \
+    CXX="${CXX}" \
+    CFLAGS="${CFLAGS}" \
+    LDFLAGS="${LDFLAGS}" \
+    AR="${AR}" \
+    RANLIB="${RANLIB}"
+
+[install]
+libcrypto.a = libcrypto.a
+libssl.a = libssl.a
