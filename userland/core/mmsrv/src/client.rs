@@ -205,6 +205,7 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const TronaMsg, _caller_badge: u
             for ri in 0..region_count {
                 let r = regions.add(ri);
                 if (*r).active {
+                    crate::mmap::flush_writeback_region(r, (*r).base, (*r).length);
                     if vspace_cap != 0 && (*r).length != 0 {
                         if (*r).mo_cap != 0 {
                             let page_count = (*r).length / 4096;
