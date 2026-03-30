@@ -156,9 +156,10 @@ pub fn build_var_map(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Hash
     vars.insert("MACHINE".to_string(), freebsd_machine.clone());
     vars.insert("MACHINE_INCLUDE".to_string(), format!("{}/include", freebsd_machine));
 
-    // Arch-qualified work directory name (e.g. "work-x86_64", "work-aarch64")
-    // Allows .port files to reference dependency work dirs: ${PORTDIR}/../dep/${ARCH_WORK}/...
+    // Arch-qualified work/stage directory names (e.g. "work-x86_64", "stage-x86_64")
+    // Allows .port files to reference dependency dirs: ${PORTDIR}/../dep/${ARCH_WORK}/...
     vars.insert("ARCH_WORK".to_string(), format!("work-{}", arch));
+    vars.insert("ARCH_STAGE".to_string(), format!("stage-{}", arch));
 
     // Project and toolchain paths
     let project_root = env.build_root.parent().unwrap_or(&env.build_root);

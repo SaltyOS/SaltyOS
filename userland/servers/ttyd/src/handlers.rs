@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! IPC request handlers for PTY operations.
 
-use besalt::consts::*;
+use trona::consts::*;
 
-use besalt::types::*;
+use trona::types::*;
 
 use crate::types::*;
 use crate::input::{pty_has_readable_data, refill_slave_ring, signal_vfs_if_readable};
@@ -12,13 +12,13 @@ use crate::PTYS;
 /// TTYD_PTY_READ: try-read from slave side (called by VFS).
 /// msg.regs[0] = pty_id, msg.regs[1] = max_count
 /// Reply: regs[0] = actual_count (0 = WOULD_BLOCK), regs[1..] = data
-pub unsafe fn handle_pty_read(msg: &BesaltMsg, reply: &mut BesaltMsg) {
+pub unsafe fn handle_pty_read(msg: &TronaMsg, reply: &mut TronaMsg) {
     unsafe {
         let pty_id = msg.regs[0] as usize;
         let max_count = msg.regs[1] as usize;
 
         if pty_id >= MAX_PTYS || !PTYS[pty_id].active {
-            reply.label = BESALT_INVALID_ARGUMENT;
+            reply.label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -29,7 +29,7 @@ pub unsafe fn handle_pty_read(msg: &BesaltMsg, reply: &mut BesaltMsg) {
         if available > 0 {
             let count = if available < max_count { available } else { max_count };
             let count = if count > 152 { 152 } else { count };
-            reply.label = BESALT_OK;
+            reply.label = TRONA_OK;
             reply.regs[0] = count as u64;
             reply.length = 1 + ((count as u64 + 7) / 8);
             let dst = &raw mut reply.regs[1] as *mut u8;
@@ -43,7 +43,7 @@ pub unsafe fn handle_pty_read(msg: &BesaltMsg, reply: &mut BesaltMsg) {
             signal_vfs_if_readable(pty_id, pty);
         } else {
             // No data -- return WOULD_BLOCK, mark VFS as pending
-            reply.label = BESALT_OK;
+            reply.label = TRONA_OK;
             reply.regs[0] = 0; // 0 = WOULD_BLOCK
             reply.length = 1;
             pty.vfs_pending = true;
@@ -53,13 +53,13 @@ pub unsafe fn handle_pty_read(msg: &BesaltMsg, reply: &mut BesaltMsg) {
 
 /// TTYD_PTY_COLLECT: VFS collects data after notification wake.
 /// Same as PTY_READ but called when data is guaranteed available.
-pub unsafe fn handle_pty_collect(msg: &BesaltMsg, reply: &mut BesaltMsg) {
+pub unsafe fn handle_pty_collect(msg: &TronaMsg, reply: &mut TronaMsg) {
     unsafe {
         let pty_id = msg.regs[0] as usize;
         let max_count = msg.regs[1] as usize;
 
         if pty_id >= MAX_PTYS || !PTYS[pty_id].active {
-            reply.label = BESALT_INVALID_ARGUMENT;
+            reply.label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -69,7 +69,7 @@ pub unsafe fn handle_pty_collect(msg: &BesaltMsg, reply: &mut BesaltMsg) {
         let count = if available < max_count { available } else { max_count };
         let count = if count > 152 { 152 } else { count };
 
-        reply.label = BESALT_OK;
+        reply.label = TRONA_OK;
         reply.regs[0] = count as u64;
         reply.length = 1 + ((count as u64 + 7) / 8);
 
@@ -88,17 +88,17 @@ pub unsafe fn handle_pty_collect(msg: &BesaltMsg, reply: &mut BesaltMsg) {
 /// TTYD_PTY_WRITE: write from slave side (output from bash via VFS).
 /// msg.regs[0] = pty_id, msg.regs[1] = byte_count, msg.regs[2..] = data
 /// Applies OPOST processing and outputs to serial + display.
-pub unsafe fn handle_pty_write(msg: &BesaltMsg, reply: &mut BesaltMsg) {
+pub unsafe fn handle_pty_write(msg: &TronaMsg, reply: &mut TronaMsg) {
     unsafe {
         let pty_id = msg.regs[0] as usize;
         let count = msg.regs[1] as usize;
 
         if pty_id >= MAX_PTYS || !PTYS[pty_id].active {
-            reply.label = BESALT_INVALID_ARGUMENT;
+            reply.label = TRONA_INVALID_ARGUMENT;
             return;
         }
         if count == 0 || count > 152 {
-            reply.label = BESALT_OK;
+            reply.label = TRONA_OK;
             reply.regs[0] = 0;
             reply.length = 1;
             return;
@@ -136,7 +136,7 @@ pub unsafe fn handle_pty_write(msg: &BesaltMsg, reply: &mut BesaltMsg) {
             crate::display_write(&buf[..count]);
             crate::serial_write_queued(&buf[..count]);
         }
-        reply.label = BESALT_OK;
+        reply.label = TRONA_OK;
         reply.regs[0] = count as u64;
         reply.length = 1;
     }
@@ -144,15 +144,15 @@ pub unsafe fn handle_pty_write(msg: &BesaltMsg, reply: &mut BesaltMsg) {
 
 /// TTYD_PTY_TCGETATTR: get per-PTY termios.
 /// msg.regs[0] = pty_id
-pub unsafe fn handle_pty_tcgetattr(msg: &BesaltMsg, reply: &mut BesaltMsg) {
+pub unsafe fn handle_pty_tcgetattr(msg: &TronaMsg, reply: &mut TronaMsg) {
     unsafe {
         let pty_id = msg.regs[0] as usize;
         if pty_id >= MAX_PTYS || !PTYS[pty_id].active {
-            reply.label = BESALT_INVALID_ARGUMENT;
+            reply.label = TRONA_INVALID_ARGUMENT;
             return;
         }
         let t = &PTYS[pty_id].termios;
-        reply.label = BESALT_OK;
+        reply.label = TRONA_OK;
         reply.length = 10;
         reply.regs[0] = t.c_iflag as u64;
         reply.regs[1] = t.c_oflag as u64;
@@ -170,11 +170,11 @@ pub unsafe fn handle_pty_tcgetattr(msg: &BesaltMsg, reply: &mut BesaltMsg) {
 /// TTYD_PTY_TCSETATTR: set per-PTY termios.
 /// msg.regs[0] = pty_id, msg.regs[1] = action,
 /// msg.regs[2..7] = iflag/oflag/cflag/lflag/ispeed/ospeed, msg.regs[8..11] = c_cc
-pub unsafe fn handle_pty_tcsetattr(msg: &BesaltMsg, reply: &mut BesaltMsg) {
+pub unsafe fn handle_pty_tcsetattr(msg: &TronaMsg, reply: &mut TronaMsg) {
     unsafe {
         let pty_id = msg.regs[0] as usize;
         if pty_id >= MAX_PTYS || !PTYS[pty_id].active {
-            reply.label = BESALT_INVALID_ARGUMENT;
+            reply.label = TRONA_INVALID_ARGUMENT;
             return;
         }
         let t = &mut (*(&raw mut PTYS[pty_id])).termios;
@@ -188,14 +188,14 @@ pub unsafe fn handle_pty_tcsetattr(msg: &BesaltMsg, reply: &mut BesaltMsg) {
         for i in 0..32 {
             t.c_cc[i] = *src.add(i);
         }
-        reply.label = BESALT_OK;
+        reply.label = TRONA_OK;
         reply.length = 0;
     }
 }
 
 /// TTYD_PTY_IOCTL: per-PTY ioctl handling.
 /// msg.regs[0] = pty_id, msg.regs[1] = ioctl_cmd, msg.regs[2] = arg, msg.regs[3] = caller_badge
-pub unsafe fn handle_pty_ioctl(msg: &BesaltMsg, reply: &mut BesaltMsg) {
+pub unsafe fn handle_pty_ioctl(msg: &TronaMsg, reply: &mut TronaMsg) {
     unsafe {
         let pty_id = msg.regs[0] as usize;
         let cmd = msg.regs[1];
@@ -203,7 +203,7 @@ pub unsafe fn handle_pty_ioctl(msg: &BesaltMsg, reply: &mut BesaltMsg) {
         let caller_badge = msg.regs[3];
 
         if pty_id >= MAX_PTYS || !PTYS[pty_id].active {
-            reply.label = BESALT_INVALID_ARGUMENT;
+            reply.label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -218,7 +218,7 @@ pub unsafe fn handle_pty_ioctl(msg: &BesaltMsg, reply: &mut BesaltMsg) {
                 // Stale pgid cleanup is handled by:
                 // - TIOCSCTTY: resets dead owner on session takeover
                 // - TIOCSPGRP: caller sets fg_pgid authoritatively
-                reply.label = BESALT_OK;
+                reply.label = TRONA_OK;
                 reply.length = 1;
                 reply.regs[0] = pty.fg_pgid as u64;
             }
@@ -230,10 +230,10 @@ pub unsafe fn handle_pty_ioctl(msg: &BesaltMsg, reply: &mut BesaltMsg) {
                 // updates for any process on the controlling tty.
                 if pty.has_ctty {
                     pty.fg_pgid = arg as u32;
-                    reply.label = BESALT_OK;
+                    reply.label = TRONA_OK;
                     reply.length = 0;
                 } else {
-                    reply.label = BESALT_INVALID_OPERATION;
+                    reply.label = TRONA_INVALID_OPERATION;
                 }
             }
             TIOCSCTTY => {
@@ -253,7 +253,7 @@ pub unsafe fn handle_pty_ioctl(msg: &BesaltMsg, reply: &mut BesaltMsg) {
                         pty.fg_pgid = caller_badge as u32;
                     }
                 }
-                reply.label = BESALT_OK;
+                reply.label = TRONA_OK;
                 reply.length = 0;
             }
             TIOCNOTTY => {
@@ -261,21 +261,21 @@ pub unsafe fn handle_pty_ioctl(msg: &BesaltMsg, reply: &mut BesaltMsg) {
                     pty.has_ctty = false;
                     pty.ctty_session_id = 0;
                     pty.fg_pgid = 0;
-                    reply.label = BESALT_OK;
+                    reply.label = TRONA_OK;
                     reply.length = 0;
                 } else {
-                    reply.label = BESALT_INVALID_OPERATION;
+                    reply.label = TRONA_INVALID_OPERATION;
                 }
             }
             TIOCGWINSZ => {
                 // Return actual display dimensions (queried from display server at startup)
-                reply.label = BESALT_OK;
+                reply.label = TRONA_OK;
                 reply.length = 2;
                 reply.regs[0] = *(&raw const crate::types::WINSIZE_ROWS) as u64;
                 reply.regs[1] = *(&raw const crate::types::WINSIZE_COLS) as u64;
             }
             _ => {
-                reply.label = BESALT_INVALID_OPERATION;
+                reply.label = TRONA_INVALID_OPERATION;
             }
         }
     }
@@ -284,13 +284,13 @@ pub unsafe fn handle_pty_ioctl(msg: &BesaltMsg, reply: &mut BesaltMsg) {
 /// TTYD_PTY_POLL: check PTY readiness.
 /// msg.regs[0] = pty_id, msg.regs[1] = requested events
 /// Reply: regs[0] = ready events
-pub unsafe fn handle_pty_poll(msg: &BesaltMsg, reply: &mut BesaltMsg) {
+pub unsafe fn handle_pty_poll(msg: &TronaMsg, reply: &mut TronaMsg) {
     unsafe {
         let pty_id = msg.regs[0] as usize;
         let events = msg.regs[1] as u32;
 
         if pty_id >= MAX_PTYS || !PTYS[pty_id].active {
-            reply.label = BESALT_INVALID_ARGUMENT;
+            reply.label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -308,23 +308,23 @@ pub unsafe fn handle_pty_poll(msg: &BesaltMsg, reply: &mut BesaltMsg) {
             rev |= POLLHUP as u32;
         }
 
-        reply.label = BESALT_OK;
+        reply.label = TRONA_OK;
         reply.length = 1;
         reply.regs[0] = rev as u64;
     }
 }
 
 /// Handle legacy TTYD labels (1-4) by redirecting to PTY 0.
-pub unsafe fn handle_legacy(label: u64, msg: &BesaltMsg, reply: &mut BesaltMsg) {
+pub unsafe fn handle_legacy(label: u64, msg: &TronaMsg, reply: &mut TronaMsg) {
     match label {
         TTYD_GET_FG_PGRP => {
             unsafe {
                 let pty = &*(&raw const PTYS[0]);
                 if !pty.has_ctty {
-                    reply.label = BESALT_INVALID_OPERATION;
+                    reply.label = TRONA_INVALID_OPERATION;
                     return;
                 }
-                reply.label = BESALT_OK;
+                reply.label = TRONA_OK;
                 reply.length = 1;
                 reply.regs[0] = pty.fg_pgid as u64;
             }
@@ -334,11 +334,11 @@ pub unsafe fn handle_legacy(label: u64, msg: &BesaltMsg, reply: &mut BesaltMsg) 
             unsafe {
                 let pty = &mut *(&raw mut PTYS[0]);
                 if !pty.has_ctty {
-                    reply.label = BESALT_INVALID_OPERATION;
+                    reply.label = TRONA_INVALID_OPERATION;
                     return;
                 }
                 pty.fg_pgid = requested;
-                reply.label = BESALT_OK;
+                reply.label = TRONA_OK;
                 reply.length = 0;
             }
         }
@@ -352,7 +352,7 @@ pub unsafe fn handle_legacy(label: u64, msg: &BesaltMsg, reply: &mut BesaltMsg) 
                 }
                 pty.has_ctty = true;
                 pty.ctty_session_id = caller_badge;
-                reply.label = BESALT_OK;
+                reply.label = TRONA_OK;
                 reply.length = 0;
             }
         }
@@ -361,18 +361,18 @@ pub unsafe fn handle_legacy(label: u64, msg: &BesaltMsg, reply: &mut BesaltMsg) 
             unsafe {
                 let pty = &mut *(&raw mut PTYS[0]);
                 if !pty.has_ctty || pty.ctty_session_id != caller_badge {
-                    reply.label = BESALT_INVALID_OPERATION;
+                    reply.label = TRONA_INVALID_OPERATION;
                     return;
                 }
                 pty.has_ctty = false;
                 pty.ctty_session_id = 0;
                 pty.fg_pgid = 0;
-                reply.label = BESALT_OK;
+                reply.label = TRONA_OK;
                 reply.length = 0;
             }
         }
         _ => {
-            reply.label = BESALT_INVALID_OPERATION;
+            reply.label = TRONA_INVALID_OPERATION;
         }
     }
 }

@@ -12,14 +12,14 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::consts::*;
-use besalt::ipc;
-use besalt::types::*;
+use trona::consts::*;
+use trona::ipc;
+use trona::types::*;
 
 const CAP_VFS_EP: Cap = super::CAP_VFS_EP;
 const CAP_MMSRV_EP: Cap = super::CAP_MMSRV_EP;
 
-// VFS protocol labels (must match besalt::consts)
+// VFS protocol labels (must match trona::consts)
 const VFS_OPEN: u64 = POSIX_VFS_OPEN;
 const VFS_READ: u64 = POSIX_VFS_READ;
 const VFS_CLOSE: u64 = POSIX_VFS_CLOSE;
@@ -38,7 +38,7 @@ const MAX_STREAM_ELF_PHDR_BYTES: usize = 4096;
 const MAX_STREAM_INTERP_LEN: usize = 64;
 
 /// Bytes readable per VFS READ IPC call (legacy inline path).
-/// BesaltMsg has 20 regs; READ returns data in regs[1..], so max 19*8=152 bytes.
+/// TronaMsg has 20 regs; READ returns data in regs[1..], so max 19*8=152 bytes.
 const READ_CHUNK_SIZE: u64 = 152;
 
 /// Per-process bulk SHM state for procmgr.
@@ -60,7 +60,7 @@ pub struct VfsStreamExec {
     pub file_size: usize,
     pub elf_span: u64,
     pub is_dynamic: bool,
-    pub needed: besalt::elf_dynamic::NeededLibs,
+    pub needed: trona_loader::elf_dynamic::NeededLibs,
     pub interp_name: [u8; MAX_STREAM_INTERP_LEN],
     pub interp_name_len: usize,
     pub phdr_vaddr: u64,
@@ -107,7 +107,7 @@ unsafe fn mint_badged_vfs_cap(client_badge: u64) -> Option<Cap> {
     unsafe {
         let alloc = &mut *(&raw mut super::ALLOCATOR);
         let slot = alloc.alloc_single_slot()?;
-        let err = besalt::invoke::cnode_mint(
+        let err = trona::invoke::cnode_mint(
             super::CAP_SELF_CSPACE,
             CAP_VFS_EP,
             super::CAP_SELF_CSPACE,
@@ -124,7 +124,7 @@ unsafe fn mint_badged_vfs_cap(client_badge: u64) -> Option<Cap> {
 
 unsafe fn release_badged_vfs_cap(slot: Cap) {
     unsafe {
-        let _ = besalt::invoke::cnode_delete(super::CAP_SELF_CSPACE, slot);
+        let _ = trona::invoke::cnode_delete(super::CAP_SELF_CSPACE, slot);
         (&mut *(&raw mut super::ALLOCATOR)).free_single_slot(slot);
     }
 }
@@ -132,15 +132,15 @@ unsafe fn release_badged_vfs_cap(slot: Cap) {
 unsafe fn get_cwd_for_badge(client_badge: u64, cwd_buf: &mut [u8; 128]) -> Option<usize> {
     unsafe {
         let vfs_cap = mint_badged_vfs_cap(client_badge)?;
-        let mut msg = BesaltMsg::zeroed();
-        let mut reply = BesaltMsg::zeroed();
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         msg.label = VFS_GETCWD;
         msg.length = 1;
         msg.regs[0] = cwd_buf.len() as u64;
 
         let err = ipc::call_ctx(super::ipc_ctx(), vfs_cap, &raw const msg, &raw mut reply);
         release_badged_vfs_cap(vfs_cap);
-        if err != 0 || reply.label != BESALT_OK {
+        if err != 0 || reply.label != TRONA_OK {
             return None;
         }
 
@@ -350,7 +350,7 @@ unsafe fn stream_va_to_file_offset(
 unsafe fn read_open_vfs_file_to_buffer(fd: i32, file_size: usize) -> Option<VfsLoadResult> {
     unsafe {
         let alloc_size = ((file_size + 0xFFF) & !0xFFF) as u64;
-        let buf = besalt::posix_mm::posix_mmap(
+        let buf = trona_posix::mm::posix_mmap(
             core::ptr::null_mut(),
             alloc_size,
             PROT_READ | PROT_WRITE,
@@ -362,7 +362,7 @@ unsafe fn read_open_vfs_file_to_buffer(fd: i32, file_size: usize) -> Option<VfsL
             0,
         );
         if buf as usize == usize::MAX {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] VFS: scratch mmap failed\n");
             });
             return None;
@@ -378,11 +378,11 @@ unsafe fn read_open_vfs_file_to_buffer(fd: i32, file_size: usize) -> Option<VfsL
         };
 
         if total_read == 0 {
-            besalt::posix_mm::posix_munmap(buf, alloc_size);
+            trona_posix::mm::posix_munmap(buf, alloc_size);
             return None;
         }
 
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] VFS: loaded ");
             _lb.hex(total_read as u64);
             _lb.str(b" bytes\n");
@@ -416,7 +416,7 @@ pub unsafe fn try_load_from_vfs_for_badge(
         let mut path_buf = [0u8; 256];
         let path_len = build_vfs_path(name, name_len, client_badge, &mut path_buf)?;
 
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] VFS load: ");
             _lb.bytes(&path_buf[..path_len]);
             _lb.str(b"\n");
@@ -434,7 +434,7 @@ pub unsafe fn try_load_from_vfs_for_badge(
         };
 
         if file_size == 0 || file_size > MAX_VFS_FILE_SIZE {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] VFS: bad file size ");
                 _lb.hex(file_size as u64);
                 _lb.str(b"\n");
@@ -473,20 +473,20 @@ unsafe fn ensure_bulk_shm() -> bool {
         let shm_id: u64 = 0x50_524F_434D; // "PROCM"
 
         // 1. Create SHM via mmsrv
-        let mut msg = BesaltMsg::zeroed();
-        let mut reply = BesaltMsg::zeroed();
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         msg.label = MM_SHM_CREATE;
         msg.regs[0] = shm_id;
         msg.regs[1] = BULK_SHM_PAGES;
         msg.length = 2;
         ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply);
-        if reply.label != BESALT_OK && reply.label != BESALT_ALREADY_EXISTS {
+        if reply.label != TRONA_OK && reply.label != TRONA_ALREADY_EXISTS {
             return false;
         }
 
         // 2. Map into our address space (auto-place)
-        msg = BesaltMsg::zeroed();
-        reply = BesaltMsg::zeroed();
+        msg = TronaMsg::zeroed();
+        reply = TronaMsg::zeroed();
         msg.label = MM_SHM_MAP;
         msg.regs[0] = shm_id;
         msg.regs[1] = 0; // self
@@ -494,25 +494,25 @@ unsafe fn ensure_bulk_shm() -> bool {
         msg.regs[3] = 0x3; // RW
         msg.length = 4;
         ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply);
-        if reply.label != BESALT_OK {
+        if reply.label != TRONA_OK {
             return false;
         }
         *(&raw mut BULK_SHM_ADDR) = reply.regs[0];
 
         // 3. Tell VFS to map our SHM
-        msg = BesaltMsg::zeroed();
-        reply = BesaltMsg::zeroed();
+        msg = TronaMsg::zeroed();
+        reply = TronaMsg::zeroed();
         msg.label = VFS_BULK_SETUP;
         msg.regs[0] = shm_id;
         msg.regs[1] = BULK_SHM_PAGES;
         msg.length = 2;
         ipc::call_ctx(ctx, CAP_VFS_EP, &raw const msg, &raw mut reply);
-        if reply.label != BESALT_OK {
+        if reply.label != TRONA_OK {
             return false;
         }
 
         *(&raw mut BULK_SHM_READY) = true;
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] VFS: SHM bulk setup OK\n");
         });
         true
@@ -536,8 +536,8 @@ unsafe fn vfs_bulk_read_all(fd: i32, buf: *mut u8, file_size: usize) -> Option<u
             let remaining = (file_size - total_read) as u64;
             let chunk = remaining.min(shm_size);
 
-            let mut msg = BesaltMsg::zeroed();
-            let mut reply = BesaltMsg::zeroed();
+            let mut msg = TronaMsg::zeroed();
+            let mut reply = TronaMsg::zeroed();
             msg.label = VFS_BULK_READ;
             msg.regs[0] = fd as u64;
             msg.regs[1] = chunk;
@@ -545,7 +545,7 @@ unsafe fn vfs_bulk_read_all(fd: i32, buf: *mut u8, file_size: usize) -> Option<u
             msg.length = 3;
 
             let err = ipc::call_ctx(ctx, CAP_VFS_EP, &raw const msg, &raw mut reply);
-            if err != 0 || reply.label != BESALT_OK {
+            if err != 0 || reply.label != TRONA_OK {
                 if total_read > 0 {
                     return Some(total_read);
                 }
@@ -599,13 +599,13 @@ unsafe fn vfs_legacy_read_all(
             let got = match vfs_read(fd, buf.add(total_read), chunk) {
                 Some(n) => n,
                 None => {
-                    besalt::uerror!(|_lb| {
+                    trona::uerror!(|_lb| {
                         _lb.str(b"[PROCMGR] VFS: read failed at offset ");
                         _lb.hex(total_read as u64);
                         _lb.str(b"\n");
                     });
                     vfs_close(fd);
-                    besalt::posix_mm::posix_munmap(buf, alloc_size);
+                    trona_posix::mm::posix_munmap(buf, alloc_size);
                     return None;
                 }
             };
@@ -636,8 +636,8 @@ unsafe fn vfs_bulk_read_exact_at(fd: i32, buf: *mut u8, count: usize, offset: us
 
         while total_read < count {
             let chunk = core::cmp::min(count - total_read, shm_size);
-            let mut msg = BesaltMsg::zeroed();
-            let mut reply = BesaltMsg::zeroed();
+            let mut msg = TronaMsg::zeroed();
+            let mut reply = TronaMsg::zeroed();
             msg.label = VFS_BULK_READ;
             msg.regs[0] = fd as u64;
             msg.regs[1] = chunk as u64;
@@ -645,7 +645,7 @@ unsafe fn vfs_bulk_read_exact_at(fd: i32, buf: *mut u8, count: usize, offset: us
             msg.length = 3;
 
             let err = ipc::call_ctx(ctx, CAP_VFS_EP, &raw const msg, &raw mut reply);
-            if err != 0 || reply.label != BESALT_OK {
+            if err != 0 || reply.label != TRONA_OK {
                 return None;
             }
 
@@ -767,7 +767,7 @@ unsafe fn inspect_streamed_vfs_elf(fd: i32, file_size: usize) -> Option<VfsStrea
         let mut is_dynamic = false;
         let mut interp_name = [0u8; MAX_STREAM_INTERP_LEN];
         let mut interp_name_len = 12usize;
-        let default_interp = b"ld-besalt.so";
+        let default_interp = b"ld-trona.so";
         for i in 0..default_interp.len() {
             interp_name[i] = default_interp[i];
         }
@@ -831,7 +831,7 @@ unsafe fn inspect_streamed_vfs_elf(fd: i32, file_size: usize) -> Option<VfsStrea
             }
         }
 
-        let mut needed = besalt::elf_dynamic::NeededLibs::new();
+        let mut needed = trona_loader::elf_dynamic::NeededLibs::new();
         let mut rela_data: *const u8 = core::ptr::null();
         let mut rela_len = 0usize;
         let mut rela_ent = 0usize;
@@ -840,7 +840,7 @@ unsafe fn inspect_streamed_vfs_elf(fd: i32, file_size: usize) -> Option<VfsStrea
         if dyn_size != 0 {
             let dyn_count = dyn_size / core::mem::size_of::<Elf64Dyn>();
             let mut strtab_va = 0u64;
-            let mut needed_offsets = [0u64; besalt::elf_dynamic::MAX_NEEDED_LIBS];
+            let mut needed_offsets = [0u64; trona_loader::elf_dynamic::MAX_NEEDED_LIBS];
             let mut needed_count = 0usize;
             let mut rela_va = 0u64;
             let mut rela_size = 0usize;
@@ -880,7 +880,7 @@ unsafe fn inspect_streamed_vfs_elf(fd: i32, file_size: usize) -> Option<VfsStrea
             if strtab_va != 0 {
                 let strtab_file_off = stream_va_to_file_offset(phdr_bytes, phnum, phentsz, strtab_va)?;
                 for i in 0..needed_count {
-                    let mut name_buf = [0u8; besalt::elf_dynamic::MAX_NEEDED_NAME];
+                    let mut name_buf = [0u8; trona_loader::elf_dynamic::MAX_NEEDED_NAME];
                     let name_len = read_c_string_at(
                         fd,
                         strtab_file_off + needed_offsets[i] as usize,
@@ -889,8 +889,8 @@ unsafe fn inspect_streamed_vfs_elf(fd: i32, file_size: usize) -> Option<VfsStrea
                     if name_len == 0 {
                         continue;
                     }
-                    let copy_len = core::cmp::min(name_len, besalt::elf_dynamic::MAX_NEEDED_NAME);
-                    if needed.count < besalt::elf_dynamic::MAX_NEEDED_LIBS {
+                    let copy_len = core::cmp::min(name_len, trona_loader::elf_dynamic::MAX_NEEDED_NAME);
+                    if needed.count < trona_loader::elf_dynamic::MAX_NEEDED_LIBS {
                         for j in 0..copy_len {
                             needed.names[needed.count][j] = name_buf[j];
                         }
@@ -903,7 +903,7 @@ unsafe fn inspect_streamed_vfs_elf(fd: i32, file_size: usize) -> Option<VfsStrea
             if ehdr.e_type == ET_DYN && rela_va != 0 && rela_size != 0 && rela_ent_size >= core::mem::size_of::<Elf64Rela>() {
                 let rela_file_off = stream_va_to_file_offset(phdr_bytes, phnum, phentsz, rela_va)?;
                 rela_alloc_size = page_align_up_u64(rela_size as u64);
-                let rela_buf = besalt::posix_mm::posix_mmap(
+                let rela_buf = trona_posix::mm::posix_mmap(
                     core::ptr::null_mut(),
                     rela_alloc_size,
                     PROT_READ | PROT_WRITE,
@@ -915,7 +915,7 @@ unsafe fn inspect_streamed_vfs_elf(fd: i32, file_size: usize) -> Option<VfsStrea
                     return None;
                 }
                 if !vfs_read_exact_at(fd, rela_buf, rela_size, rela_file_off) {
-                    besalt::posix_mm::posix_munmap(rela_buf, rela_alloc_size);
+                    trona_posix::mm::posix_munmap(rela_buf, rela_alloc_size);
                     return None;
                 }
                 rela_data = rela_buf as *const u8;
@@ -956,7 +956,7 @@ pub unsafe fn try_open_exec_source_from_vfs_for_badge(
         let mut path_buf = [0u8; 256];
         let path_len = build_vfs_path(name, name_len, client_badge, &mut path_buf)?;
 
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] VFS load: ");
             _lb.bytes(&path_buf[..path_len]);
             _lb.str(b"\n");
@@ -972,7 +972,7 @@ pub unsafe fn try_open_exec_source_from_vfs_for_badge(
         };
 
         if file_size == 0 || file_size > MAX_VFS_FILE_SIZE {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] VFS: bad file size ");
                 _lb.hex(file_size as u64);
                 _lb.str(b"\n");
@@ -1011,8 +1011,8 @@ unsafe fn vfs_open(path: &[u8], path_len: usize) -> Option<i32> {
     // SAFETY: We are constructing an IPC message to send to VFS.
     // The ipc_ctx() pointer is valid for procmgr's lifetime.
     unsafe {
-        let mut msg = BesaltMsg::zeroed();
-        let mut reply = BesaltMsg::zeroed();
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
 
         msg.label = VFS_OPEN;
         msg.regs[0] = 0o644; // mode (ignored for O_RDONLY)
@@ -1038,7 +1038,7 @@ unsafe fn vfs_open(path: &[u8], path_len: usize) -> Option<i32> {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != BESALT_OK {
+        if err != 0 || reply.label != TRONA_OK {
             return None;
         }
 
@@ -1054,8 +1054,8 @@ unsafe fn vfs_open(path: &[u8], path_len: usize) -> Option<i32> {
 unsafe fn vfs_fstat(fd: i32) -> Option<usize> {
     // SAFETY: IPC message construction is safe; ipc_ctx() is valid.
     unsafe {
-        let mut msg = BesaltMsg::zeroed();
-        let mut reply = BesaltMsg::zeroed();
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
 
         msg.label = VFS_FSTAT;
         msg.length = 1;
@@ -1067,7 +1067,7 @@ unsafe fn vfs_fstat(fd: i32) -> Option<usize> {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != BESALT_OK {
+        if err != 0 || reply.label != TRONA_OK {
             return None;
         }
 
@@ -1079,8 +1079,8 @@ unsafe fn vfs_fstat(fd: i32) -> Option<usize> {
 
 unsafe fn vfs_lseek(fd: i32, offset: i64, whence: i32) -> Option<i64> {
     unsafe {
-        let mut msg = BesaltMsg::zeroed();
-        let mut reply = BesaltMsg::zeroed();
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
 
         msg.label = POSIX_VFS_LSEEK;
         msg.length = 3;
@@ -1094,7 +1094,7 @@ unsafe fn vfs_lseek(fd: i32, offset: i64, whence: i32) -> Option<i64> {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != BESALT_OK {
+        if err != 0 || reply.label != TRONA_OK {
             return None;
         }
         Some(reply.regs[0] as i64)
@@ -1107,8 +1107,8 @@ unsafe fn vfs_read(fd: i32, buf: *mut u8, count: u64) -> Option<usize> {
     // SAFETY: buf must be valid for writes of up to count bytes.
     // ipc_ctx() is valid for procmgr's lifetime.
     unsafe {
-        let mut msg = BesaltMsg::zeroed();
-        let mut reply = BesaltMsg::zeroed();
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
 
         msg.label = VFS_READ;
         msg.length = 2;
@@ -1121,7 +1121,7 @@ unsafe fn vfs_read(fd: i32, buf: *mut u8, count: u64) -> Option<usize> {
             &raw const msg,
             &raw mut reply,
         );
-        if err != 0 || reply.label != BESALT_OK {
+        if err != 0 || reply.label != TRONA_OK {
             return None;
         }
 
@@ -1150,8 +1150,8 @@ unsafe fn vfs_read(fd: i32, buf: *mut u8, count: u64) -> Option<usize> {
 unsafe fn vfs_close(fd: i32) {
     // SAFETY: IPC message construction is safe; ipc_ctx() is valid.
     unsafe {
-        let mut msg = BesaltMsg::zeroed();
-        let mut reply = BesaltMsg::zeroed();
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
 
         msg.label = VFS_CLOSE;
         msg.length = 1;
@@ -1177,7 +1177,7 @@ unsafe fn vfs_close(fd: i32) {
 pub unsafe fn cleanup_vfs_load(data: *const u8, alloc_size: u64) {
     // SAFETY: Unmapping a region we previously mapped via posix_mmap.
     unsafe {
-        besalt::posix_mm::posix_munmap(data as *mut u8, alloc_size);
+        trona_posix::mm::posix_munmap(data as *mut u8, alloc_size);
     }
 }
 
@@ -1194,7 +1194,7 @@ pub unsafe fn cleanup_exec_source(source: &mut VfsExecSource) {
                     vfs_close(exec.fd);
                 }
                 if !exec.rela_data.is_null() && exec.rela_alloc_size != 0 {
-                    besalt::posix_mm::posix_munmap(exec.rela_data as *mut u8, exec.rela_alloc_size);
+                    trona_posix::mm::posix_munmap(exec.rela_data as *mut u8, exec.rela_alloc_size);
                 }
             }
         }

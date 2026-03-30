@@ -5,7 +5,7 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::types::Cap;
+use trona::types::Cap;
 
 // ---- Pool layout ----
 /// Slots 0..255 are reserved for well-known caps (server EP, untypeds, etc.)
@@ -251,7 +251,7 @@ impl Allocator {
             self.ut_count += 1;
         }
 
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] Allocator: ");
             _lb.hex(self.ut_count as u64);
             _lb.str(b" untyped sources\n");
@@ -311,7 +311,7 @@ impl Allocator {
     /// Scans from `ut_hint` with wrap-around.
     pub fn retype_any(&mut self, obj_type: u64, size_bits: u64, dest_slot: Cap) -> i32 {
         if self.ut_count == 0 {
-            return besalt::BESALT_OUT_OF_MEMORY as i32;
+            return trona::TRONA_OUT_OF_MEMORY as i32;
         }
 
         let start = if self.ut_hint < self.ut_count {
@@ -320,14 +320,14 @@ impl Allocator {
             0
         };
 
-        let mut best_err = besalt::BESALT_OUT_OF_MEMORY as i32;
+        let mut best_err = trona::TRONA_OUT_OF_MEMORY as i32;
 
         // First pass: from hint to end
         for i in start..self.ut_count {
             if !self.ut_sources[i].active {
                 continue;
             }
-            let err = besalt::invoke::untyped_retype(
+            let err = trona::invoke::untyped_retype(
                 self.ut_sources[i].cap,
                 obj_type,
                 size_bits,
@@ -345,7 +345,7 @@ impl Allocator {
             if !self.ut_sources[i].active {
                 continue;
             }
-            let err = besalt::invoke::untyped_retype(
+            let err = trona::invoke::untyped_retype(
                 self.ut_sources[i].cap,
                 obj_type,
                 size_bits,
@@ -358,7 +358,7 @@ impl Allocator {
             best_err = err;
         }
 
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[PROCMGR] retype_any: all ");
             _lb.hex(self.ut_count as u64);
             _lb.str(b" sources failed, best_err=");
@@ -381,12 +381,12 @@ impl Allocator {
     /// predictable region of the untyped pool.
     pub fn retype_core_object(&mut self, obj_type: u64, size_bits: u64, dest_slot: Cap) -> i32 {
         if self.ut_count == 0 {
-            return besalt::BESALT_OUT_OF_MEMORY as i32;
+            return trona::TRONA_OUT_OF_MEMORY as i32;
         }
 
         // Try primary untyped first (index 0)
         if self.ut_sources[0].active {
-            let err = besalt::invoke::untyped_retype(
+            let err = trona::invoke::untyped_retype(
                 self.ut_sources[0].cap,
                 obj_type,
                 size_bits,
@@ -399,12 +399,12 @@ impl Allocator {
         }
 
         // Fallback: scan mirrors (indices 1..ut_count)
-        let mut best_err = besalt::BESALT_OUT_OF_MEMORY as i32;
+        let mut best_err = trona::TRONA_OUT_OF_MEMORY as i32;
         for i in 1..self.ut_count {
             if !self.ut_sources[i].active {
                 continue;
             }
-            let err = besalt::invoke::untyped_retype(
+            let err = trona::invoke::untyped_retype(
                 self.ut_sources[i].cap,
                 obj_type,
                 size_bits,
@@ -417,7 +417,7 @@ impl Allocator {
             best_err = err;
         }
 
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[PROCMGR] retype_core_object: all ");
             _lb.hex(self.ut_count as u64);
             _lb.str(b" sources failed, best_err=");
@@ -440,7 +440,7 @@ impl Allocator {
     /// Returns `(error, total_committed)`.
     pub fn commit_mo_pages(&mut self, mo_cap: Cap, offset: u64, count: u64) -> (i32, u64) {
         if self.ut_count == 0 {
-            return besalt::invoke::mo_commit(mo_cap, offset, count, 0);
+            return trona::invoke::mo_commit(mo_cap, offset, count, 0);
         }
 
         let start = if self.ut_hint < self.ut_count {
@@ -462,7 +462,7 @@ impl Allocator {
                 continue;
             }
             let (err, committed) =
-                besalt::invoke::mo_commit(mo_cap, cur_offset, remaining, self.ut_sources[i].cap);
+                trona::invoke::mo_commit(mo_cap, cur_offset, remaining, self.ut_sources[i].cap);
             if committed > 0 {
                 total_committed += committed;
                 cur_offset += committed;
@@ -486,7 +486,7 @@ impl Allocator {
                 continue;
             }
             let (err, committed) =
-                besalt::invoke::mo_commit(mo_cap, cur_offset, remaining, self.ut_sources[i].cap);
+                trona::invoke::mo_commit(mo_cap, cur_offset, remaining, self.ut_sources[i].cap);
             if committed > 0 {
                 total_committed += committed;
                 cur_offset += committed;
@@ -506,7 +506,7 @@ impl Allocator {
         }
 
         // Final fallback: PMM (ut_cap=0)
-        let (err, committed) = besalt::invoke::mo_commit(mo_cap, cur_offset, remaining, 0);
+        let (err, committed) = trona::invoke::mo_commit(mo_cap, cur_offset, remaining, 0);
         total_committed += committed;
         remaining -= committed;
 
@@ -521,10 +521,10 @@ impl Allocator {
     /// next available reservation slot, preferring the primary untyped source.
     pub fn realize_core_object(&mut self, obj_type: u64, size_bits: u64) -> Result<Cap, i32> {
         if !self.reservation.active {
-            return Err(besalt::BESALT_INVALID_OPERATION as i32);
+            return Err(trona::TRONA_INVALID_OPERATION as i32);
         }
         if self.reservation.next_offset >= self.reservation.slot_count {
-            return Err(besalt::BESALT_OUT_OF_MEMORY as i32);
+            return Err(trona::TRONA_OUT_OF_MEMORY as i32);
         }
 
         let slot = self.reservation_slot(self.reservation.next_offset);
@@ -556,10 +556,10 @@ impl Allocator {
         size_bits: u64,
     ) -> Result<Cap, i32> {
         if !self.reservation.active {
-            return Err(besalt::BESALT_INVALID_OPERATION as i32);
+            return Err(trona::TRONA_INVALID_OPERATION as i32);
         }
         if self.reservation.next_offset >= self.reservation.slot_count {
-            return Err(besalt::BESALT_OUT_OF_MEMORY as i32);
+            return Err(trona::TRONA_OUT_OF_MEMORY as i32);
         }
 
         let offset = self.reservation.next_offset;
@@ -569,7 +569,7 @@ impl Allocator {
         // SAFETY: ipc_ctx() returns procmgr's valid IPC context; slot is a
         // valid reservation slot in our CSpace.
         unsafe {
-            besalt::ipc::set_receive_slot_ctx(
+            trona::ipc::set_receive_slot_ctx(
                 crate::ipc_ctx(),
                 self.cap_self_cspace,
                 slot,
@@ -577,23 +577,23 @@ impl Allocator {
             );
         }
 
-        let mut msg = besalt::types::BesaltMsg::zeroed();
-        let mut reply = besalt::types::BesaltMsg::zeroed();
-        msg.label = besalt::MM_ALLOC_OBJECT;
+        let mut msg = trona::types::TronaMsg::zeroed();
+        let mut reply = trona::types::TronaMsg::zeroed();
+        msg.label = trona::MM_ALLOC_OBJECT;
         msg.length = 2;
         msg.regs[0] = obj_type;
         msg.regs[1] = size_bits;
         // SAFETY: ipc_ctx() is valid; msg/reply are stack-local.
         let err = unsafe {
-            besalt::ipc::call_ctx(
+            trona::ipc::call_ctx(
                 crate::ipc_ctx(),
                 mmsrv_ep,
                 &raw const msg,
                 &raw mut reply,
             )
         };
-        if err != 0 || reply.label != besalt::BESALT_OK {
-            return Err(besalt::BESALT_OUT_OF_MEMORY as i32);
+        if err != 0 || reply.label != trona::TRONA_OK {
+            return Err(trona::TRONA_OUT_OF_MEMORY as i32);
         }
 
         if self.reservation.object_count < MAX_RESERVE_OBJECTS {
@@ -617,10 +617,10 @@ impl Allocator {
         offset: usize,
     ) -> Result<Cap, i32> {
         if !self.reservation.active {
-            return Err(besalt::BESALT_INVALID_OPERATION as i32);
+            return Err(trona::TRONA_INVALID_OPERATION as i32);
         }
         if offset >= self.reservation.slot_count {
-            return Err(besalt::BESALT_OUT_OF_MEMORY as i32);
+            return Err(trona::TRONA_OUT_OF_MEMORY as i32);
         }
 
         let slot = self.reservation_slot(offset);
@@ -682,10 +682,10 @@ impl Allocator {
     /// Records the object for potential rollback.
     pub fn realize_object(&mut self, obj_type: u64, size_bits: u64) -> Result<Cap, i32> {
         if !self.reservation.active {
-            return Err(besalt::BESALT_INVALID_OPERATION as i32);
+            return Err(trona::TRONA_INVALID_OPERATION as i32);
         }
         if self.reservation.next_offset >= self.reservation.slot_count {
-            return Err(besalt::BESALT_OUT_OF_MEMORY as i32);
+            return Err(trona::TRONA_OUT_OF_MEMORY as i32);
         }
 
         let slot = self.reservation_slot(self.reservation.next_offset);
@@ -716,10 +716,10 @@ impl Allocator {
         offset: usize,
     ) -> Result<Cap, i32> {
         if !self.reservation.active {
-            return Err(besalt::BESALT_INVALID_OPERATION as i32);
+            return Err(trona::TRONA_INVALID_OPERATION as i32);
         }
         if offset >= self.reservation.slot_count {
-            return Err(besalt::BESALT_OUT_OF_MEMORY as i32);
+            return Err(trona::TRONA_OUT_OF_MEMORY as i32);
         }
 
         let slot = self.reservation_slot(offset);
@@ -756,10 +756,10 @@ impl Allocator {
         offset: usize,
     ) -> Result<Cap, i32> {
         if !self.reservation.active {
-            return Err(besalt::BESALT_INVALID_OPERATION as i32);
+            return Err(trona::TRONA_INVALID_OPERATION as i32);
         }
         if offset >= self.reservation.slot_count {
-            return Err(besalt::BESALT_OUT_OF_MEMORY as i32);
+            return Err(trona::TRONA_OUT_OF_MEMORY as i32);
         }
 
         let slot = self.reservation_slot(offset);
@@ -768,7 +768,7 @@ impl Allocator {
         // SAFETY: ipc_ctx() returns procmgr's valid IPC context; slot is a
         // valid reservation slot in our CSpace.
         unsafe {
-            besalt::ipc::set_receive_slot_ctx(
+            trona::ipc::set_receive_slot_ctx(
                 crate::ipc_ctx(),
                 self.cap_self_cspace,
                 slot,
@@ -776,23 +776,23 @@ impl Allocator {
             );
         }
 
-        let mut msg = besalt::types::BesaltMsg::zeroed();
-        let mut reply = besalt::types::BesaltMsg::zeroed();
-        msg.label = besalt::MM_ALLOC_OBJECT;
+        let mut msg = trona::types::TronaMsg::zeroed();
+        let mut reply = trona::types::TronaMsg::zeroed();
+        msg.label = trona::MM_ALLOC_OBJECT;
         msg.length = 2;
         msg.regs[0] = obj_type;
         msg.regs[1] = size_bits;
         // SAFETY: ipc_ctx() is valid; msg/reply are stack-local.
         let err = unsafe {
-            besalt::ipc::call_ctx(
+            trona::ipc::call_ctx(
                 crate::ipc_ctx(),
                 mmsrv_ep,
                 &raw const msg,
                 &raw mut reply,
             )
         };
-        if err != 0 || reply.label != besalt::BESALT_OK {
-            return Err(besalt::BESALT_OUT_OF_MEMORY as i32);
+        if err != 0 || reply.label != trona::TRONA_OK {
+            return Err(trona::TRONA_OUT_OF_MEMORY as i32);
         }
 
         if offset >= self.reservation.next_offset {
@@ -831,9 +831,9 @@ impl Allocator {
         // realized more objects than explicit tracking capacity.
         for off in 0..self.reservation.slot_count {
             let slot = SLOT_POOL_BASE + (self.reservation.pool_base + off) as Cap;
-            let err = besalt::invoke::cnode_revoke(self.cap_self_cspace, slot);
+            let err = trona::invoke::cnode_revoke(self.cap_self_cspace, slot);
             if err != 0 {
-                besalt::invoke::cnode_delete(self.cap_self_cspace, slot);
+                trona::invoke::cnode_delete(self.cap_self_cspace, slot);
             }
         }
 

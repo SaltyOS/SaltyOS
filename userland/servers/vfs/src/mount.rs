@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Remote mount point proxy for SaltyFS integration.
 
-use besalt::consts::*;
-use besalt::ipc;
-use besalt::types::*;
+use trona::consts::*;
+use trona::ipc;
+use trona::types::*;
 
 use crate::consts::*;
 use crate::types::*;
@@ -98,7 +98,7 @@ pub(crate) unsafe fn try_root_underlay_nofollow(
 
 /// Fill a stat reply from mount-resolved metadata.
 pub(crate) unsafe fn fill_mount_stat_reply(
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
     remote_ino: u64,
     size: u64,
     mode: u32,
@@ -106,7 +106,7 @@ pub(crate) unsafe fn fill_mount_stat_reply(
     mtime: u64,
 ) {
     unsafe {
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 8;
         (*reply).regs[0] = remote_ino;
         (*reply).regs[1] = mode as u64;
@@ -168,22 +168,22 @@ pub(crate) unsafe fn mount_lookup_from_nofollow(
 }
 
 /// Ask SaltyFS for the parent inode of a given inode.
-/// Returns the parent inode number on success (BESALT_OK).
-/// Returns 0 if the inode has no INODE_REF (BESALT_NOT_FOUND — root or orphan).
+/// Returns the parent inode number on success (TRONA_OK).
+/// Returns 0 if the inode has no INODE_REF (TRONA_NOT_FOUND — root or orphan).
 /// Returns u64::MAX on IPC or structural errors (any other reply label).
 unsafe fn mount_getparent(mount_idx: usize, child_ino: u64) -> u64 {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = SALTYFS_GETPARENT;
         req.regs[0] = child_ino;
         req.length = 1;
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut reply);
-        if reply.label == BESALT_OK {
+        if reply.label == TRONA_OK {
             reply.regs[0]
-        } else if reply.label == BESALT_NOT_FOUND {
+        } else if reply.label == TRONA_NOT_FOUND {
             0 // no parent ref (root or orphan)
         } else {
             u64::MAX // IPC/structural error
@@ -294,7 +294,7 @@ unsafe fn mount_lookup_from_inner(
             };
 
             // Send SALTYFS_LOOKUP IPC — reply now includes dir_type in regs[1]
-            let mut req = BesaltMsg::zeroed();
+            let mut req = TronaMsg::zeroed();
             req.label = SALTYFS_LOOKUP;
             req.regs[0] = current_ino;
             req.regs[1] = comp_len as u64;
@@ -305,10 +305,10 @@ unsafe fn mount_lookup_from_inner(
             }
             req.length = 2 + ((comp_len as u64) + 7) / 8;
 
-            let mut reply = BesaltMsg::zeroed();
+            let mut reply = TronaMsg::zeroed();
             ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut reply);
 
-            if reply.label != BESALT_OK {
+            if reply.label != TRONA_OK {
                 return 0;
             }
 
@@ -393,15 +393,15 @@ pub(crate) unsafe fn mount_stat(
     unsafe {
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = SALTYFS_STAT;
         req.regs[0] = remote_ino;
         req.length = 1;
 
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut reply);
 
-        if reply.label != BESALT_OK {
+        if reply.label != TRONA_OK {
             return None;
         }
 
@@ -419,28 +419,28 @@ pub(crate) unsafe fn mount_read_inline(
     remote_ino: u64,
     offset: u64,
     count: u64,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
 ) {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = SALTYFS_READ_INLINE;
         req.regs[0] = remote_ino;
         req.regs[1] = offset;
         req.regs[2] = count;
         req.length = 3;
 
-        let mut fs_reply = BesaltMsg::zeroed();
+        let mut fs_reply = TronaMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
 
-        if fs_reply.label != BESALT_OK {
-            (*reply).label = BESALT_INVALID_OPERATION;
+        if fs_reply.label != TRONA_OK {
+            (*reply).label = TRONA_INVALID_OPERATION;
             return;
         }
 
         let bytes_read = fs_reply.regs[0];
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 1 + (bytes_read + 7) / 8;
         (*reply).regs[0] = bytes_read;
 
@@ -464,7 +464,7 @@ pub(crate) unsafe fn mount_create(
     unsafe {
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = SALTYFS_CREATE;
         req.regs[0] = parent_ino;
         req.regs[1] = mode as u64;
@@ -474,9 +474,9 @@ pub(crate) unsafe fn mount_create(
             *dst.add(i) = *name.add(i);
         }
         req.length = 3 + ((name_len as u64) + 7) / 8;
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut reply);
-        if reply.label != BESALT_OK {
+        if reply.label != TRONA_OK {
             return 0;
         }
         reply.regs[0]
@@ -489,12 +489,12 @@ pub(crate) unsafe fn mount_write_inline(
     offset: u64,
     data: *const u8,
     count: u64,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
 ) {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = SALTYFS_WRITE_INLINE;
         req.regs[0] = remote_ino;
         req.regs[1] = offset;
@@ -504,13 +504,13 @@ pub(crate) unsafe fn mount_write_inline(
             *dst.add(i) = *data.add(i);
         }
         req.length = 3 + (count + 7) / 8;
-        let mut fs_reply = BesaltMsg::zeroed();
+        let mut fs_reply = TronaMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
-        if fs_reply.label != BESALT_OK {
+        if fs_reply.label != TRONA_OK {
             (*reply).label = fs_reply.label;
             return;
         }
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 1;
         (*reply).regs[0] = fs_reply.regs[0];
     }
@@ -522,12 +522,12 @@ pub(crate) unsafe fn mount_mkdir(
     name: *const u8,
     name_len: u8,
     mode: u32,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
 ) {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = SALTYFS_MKDIR;
         req.regs[0] = parent_ino;
         req.regs[1] = mode as u64;
@@ -537,7 +537,7 @@ pub(crate) unsafe fn mount_mkdir(
             *dst.add(i) = *name.add(i);
         }
         req.length = 3 + ((name_len as u64) + 7) / 8;
-        let mut fs_reply = BesaltMsg::zeroed();
+        let mut fs_reply = TronaMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
         (*reply).label = fs_reply.label;
     }
@@ -548,12 +548,12 @@ pub(crate) unsafe fn mount_unlink(
     parent_ino: u64,
     name: *const u8,
     name_len: u8,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
 ) {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = SALTYFS_UNLINK;
         req.regs[0] = parent_ino;
         req.regs[1] = name_len as u64;
@@ -562,7 +562,7 @@ pub(crate) unsafe fn mount_unlink(
             *dst.add(i) = *name.add(i);
         }
         req.length = 2 + ((name_len as u64) + 7) / 8;
-        let mut fs_reply = BesaltMsg::zeroed();
+        let mut fs_reply = TronaMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
         (*reply).label = fs_reply.label;
     }
@@ -573,12 +573,12 @@ pub(crate) unsafe fn mount_rmdir(
     parent_ino: u64,
     name: *const u8,
     name_len: u8,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
 ) {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = SALTYFS_RMDIR;
         req.regs[0] = parent_ino;
         req.regs[1] = name_len as u64;
@@ -587,7 +587,7 @@ pub(crate) unsafe fn mount_rmdir(
             *dst.add(i) = *name.add(i);
         }
         req.length = 2 + ((name_len as u64) + 7) / 8;
-        let mut fs_reply = BesaltMsg::zeroed();
+        let mut fs_reply = TronaMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
         (*reply).label = fs_reply.label;
     }
@@ -601,16 +601,16 @@ pub(crate) unsafe fn mount_rename(
     new_parent_ino: u64,
     new_name: *const u8,
     new_name_len: u8,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
 ) {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = SALTYFS_RENAME;
         // MR4..MR11 = old name (64 bytes), MR12..MR19 = new name (64 bytes)
         if old_name_len > 64 || new_name_len > 64 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
         req.regs[0] = old_parent_ino;
@@ -626,7 +626,7 @@ pub(crate) unsafe fn mount_rename(
             *dst2.add(i) = *new_name.add(i);
         }
         req.length = 20;
-        let mut fs_reply = BesaltMsg::zeroed();
+        let mut fs_reply = TronaMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
         (*reply).label = fs_reply.label;
     }
@@ -636,17 +636,17 @@ pub(crate) unsafe fn mount_truncate(
     mount_idx: usize,
     remote_ino: u64,
     new_size: u64,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
 ) {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = SALTYFS_TRUNCATE;
         req.regs[0] = remote_ino;
         req.regs[1] = new_size;
         req.length = 2;
-        let mut fs_reply = BesaltMsg::zeroed();
+        let mut fs_reply = TronaMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
         (*reply).label = fs_reply.label;
     }
@@ -655,12 +655,12 @@ pub(crate) unsafe fn mount_truncate(
 /// SHM-based read from mounted filesystem. Data is placed in VFS-SaltyFS SHM.
 pub(crate) unsafe fn mount_read_shm(
     mount_idx: usize, remote_ino: u64, offset: u64, count: u64,
-    shm_offset: u64, reply: *mut BesaltMsg,
+    shm_offset: u64, reply: *mut TronaMsg,
 ) {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = SALTYFS_READ;
         req.regs[0] = remote_ino;
         req.regs[1] = offset;
@@ -668,15 +668,15 @@ pub(crate) unsafe fn mount_read_shm(
         req.regs[3] = shm_offset;
         req.length = 4;
 
-        let mut fs_reply = BesaltMsg::zeroed();
+        let mut fs_reply = TronaMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
 
-        if fs_reply.label != BESALT_OK {
-            (*reply).label = BESALT_INVALID_OPERATION;
+        if fs_reply.label != TRONA_OK {
+            (*reply).label = TRONA_INVALID_OPERATION;
             return;
         }
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 1;
         (*reply).regs[0] = fs_reply.regs[0]; // bytes_read
     }
@@ -685,12 +685,12 @@ pub(crate) unsafe fn mount_read_shm(
 /// SHM-based write to mounted filesystem. Data is in VFS-SaltyFS SHM.
 pub(crate) unsafe fn mount_write_shm(
     mount_idx: usize, remote_ino: u64, offset: u64, count: u64,
-    shm_offset: u64, reply: *mut BesaltMsg,
+    shm_offset: u64, reply: *mut TronaMsg,
 ) {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = SALTYFS_WRITE;
         req.regs[0] = remote_ino;
         req.regs[1] = offset;
@@ -698,11 +698,11 @@ pub(crate) unsafe fn mount_write_shm(
         req.regs[3] = shm_offset;
         req.length = 4;
 
-        let mut fs_reply = BesaltMsg::zeroed();
+        let mut fs_reply = TronaMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
 
         (*reply).label = fs_reply.label;
-        if fs_reply.label == BESALT_OK {
+        if fs_reply.label == TRONA_OK {
             (*reply).length = 1;
             (*reply).regs[0] = fs_reply.regs[0]; // bytes_written
         }
@@ -731,13 +731,13 @@ pub(crate) fn split_mount_sub_path(
     }
 }
 
-pub(crate) unsafe fn mount_readdir_emit_cached(fde: *mut FdEntry, reply: *mut BesaltMsg) {
+pub(crate) unsafe fn mount_readdir_emit_cached(fde: *mut FdEntry, reply: *mut TronaMsg) {
     unsafe {
         let fd = &mut *fde;
         let idx = fd.mount_batch_index as usize;
         let ent = &fd.mount_batch[idx];
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 5 + ((ent.name_len as u64 + 7) / 8);
         (*reply).regs[0] = ent.name_len as u64;
         (*reply).regs[1] = 0;
@@ -768,13 +768,13 @@ pub(crate) unsafe fn mount_readdir(
     mount_idx: usize,
     fde: *mut FdEntry,
     dir_ino: u64,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
 ) {
     unsafe {
         let fd = &mut *fde;
 
         if fd.dir_cursor == u32::MAX {
-            (*reply).label = BESALT_OK;
+            (*reply).label = TRONA_OK;
             (*reply).length = 1;
             (*reply).regs[0] = 0;
             return;
@@ -787,17 +787,17 @@ pub(crate) unsafe fn mount_readdir(
 
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = SALTYFS_READDIR;
         req.regs[0] = dir_ino;
         req.regs[1] = fd.dir_cursor as u64;
         req.length = 2;
 
-        let mut fs_reply = BesaltMsg::zeroed();
+        let mut fs_reply = TronaMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
 
-        if fs_reply.label != BESALT_OK {
-            (*reply).label = BESALT_OK;
+        if fs_reply.label != TRONA_OK {
+            (*reply).label = TRONA_OK;
             (*reply).length = 1;
             (*reply).regs[0] = 0;
             fd.dir_cursor = u32::MAX;
@@ -807,7 +807,7 @@ pub(crate) unsafe fn mount_readdir(
         let next_cursor = fs_reply.regs[0] as u32;
         let num_entries = (fs_reply.length.saturating_sub(1)) / 6;
         if num_entries == 0 {
-            (*reply).label = BESALT_OK;
+            (*reply).label = TRONA_OK;
             (*reply).length = 1;
             (*reply).regs[0] = 0;
             fd.dir_cursor = u32::MAX;
@@ -864,10 +864,10 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
     unsafe {
         crate::MOUNT_TRIED += 1;
 
-        let fs_slot = match besalt::slot_alloc::slot_alloc() {
+        let fs_slot = match trona::slot_alloc::slot_alloc() {
             Some(s) => s,
             None => {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[VFS] saltyfs: no slot available\n");
                 });
                 return;
@@ -876,7 +876,7 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
 
         ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, fs_slot, 16);
 
-        let mut ns_req = BesaltMsg::zeroed();
+        let mut ns_req = TronaMsg::zeroed();
         ns_req.label = POSIX_NS_LOOKUP;
         let name = b"saltyfs";
         ns_req.regs[0] = name.len() as u64;
@@ -886,7 +886,7 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
             *ns_dst.add(i) = name[i];
         }
 
-        let mut ns_reply = BesaltMsg::zeroed();
+        let mut ns_reply = TronaMsg::zeroed();
         let err = ipc::call_ctx(
             ipc_ctx(),
             VFS_CAP_NAMESERV_EP,
@@ -894,26 +894,26 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
             &raw mut ns_reply,
         );
 
-        if err != 0 || ns_reply.label != BESALT_OK {
-            besalt::udebug!(|_lb| {
+        if err != 0 || ns_reply.label != TRONA_OK {
+            trona::udebug!(|_lb| {
                 _lb.str(b"[VFS] saltyfs not found in nameserv (ok if no data disk)\n");
             });
             return;
         }
 
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[VFS] Found saltyfs endpoint via nameserv\n");
         });
 
-        let mut mnt_req = BesaltMsg::zeroed();
+        let mut mnt_req = TronaMsg::zeroed();
         mnt_req.label = SALTYFS_MOUNT;
         mnt_req.length = 0;
 
-        let mut mnt_reply = BesaltMsg::zeroed();
+        let mut mnt_reply = TronaMsg::zeroed();
         let merr = ipc::call_ctx(ipc_ctx(), fs_slot, &raw const mnt_req, &raw mut mnt_reply);
 
-        if merr != 0 || (mnt_reply.label != BESALT_OK && mnt_reply.label != BESALT_ALREADY_EXISTS) {
-            besalt::uerror!(|_lb| {
+        if merr != 0 || (mnt_reply.label != TRONA_OK && mnt_reply.label != TRONA_ALREADY_EXISTS) {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[VFS] saltyfs mount failed err=");
                 _lb.hex(merr as u64);
                 _lb.str(b" label=");
@@ -937,31 +937,31 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
             }
         }
 
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[VFS] Mounted saltyfs as root underlay root_ino=");
             _lb.hex(root_ino as u64);
             _lb.str(b"\n");
         });
 
         // Set up VFS-SaltyFS SHM for bulk data transport
-        let mut shm_create = BesaltMsg::zeroed();
+        let mut shm_create = TronaMsg::zeroed();
         shm_create.label = MM_SHM_CREATE;
         shm_create.length = 2;
         shm_create.regs[0] = VFS_SALTYFS_SHM_ID;
         shm_create.regs[1] = VFS_SALTYFS_SHM_PAGES;
 
-        let mut shm_reply = BesaltMsg::zeroed();
+        let mut shm_reply = TronaMsg::zeroed();
         let serr = ipc::call_ctx(
             ipc_ctx(), VFS_CAP_MMSRV_EP,
             &raw const shm_create, &raw mut shm_reply,
         );
-        if serr != 0 || (shm_reply.label != 0 && shm_reply.label != BESALT_ALREADY_EXISTS) {
-            besalt::uwarn!(|_lb| {
+        if serr != 0 || (shm_reply.label != 0 && shm_reply.label != TRONA_ALREADY_EXISTS) {
+            trona::uwarn!(|_lb| {
                 _lb.str(b"[VFS] saltyfs SHM create failed (non-fatal)\n");
             });
         } else {
             // Map SHM into VFS address space
-            let mut shm_map = BesaltMsg::zeroed();
+            let mut shm_map = TronaMsg::zeroed();
             shm_map.label = MM_SHM_MAP;
             shm_map.length = 4;
             shm_map.regs[0] = VFS_SALTYFS_SHM_ID;
@@ -969,44 +969,44 @@ pub(crate) unsafe fn setup_saltyfs_mount() {
             shm_map.regs[2] = VFS_SALTYFS_SHM_VADDR;
             shm_map.regs[3] = 0x3; // RW
 
-            let mut map_reply = BesaltMsg::zeroed();
+            let mut map_reply = TronaMsg::zeroed();
             let merr2 = ipc::call_ctx(
                 ipc_ctx(), VFS_CAP_MMSRV_EP,
                 &raw const shm_map, &raw mut map_reply,
             );
             if merr2 != 0 || map_reply.label != 0 {
-                besalt::uwarn!(|_lb| {
+                trona::uwarn!(|_lb| {
                     _lb.str(b"[VFS] saltyfs SHM map failed (non-fatal)\n");
                 });
             } else {
                 // Send SHM ID to SaltyFS so it can map the same region
-                let mut setup_msg = BesaltMsg::zeroed();
+                let mut setup_msg = TronaMsg::zeroed();
                 setup_msg.label = SALTYFS_SHM_SETUP;
                 setup_msg.regs[0] = VFS_SALTYFS_SHM_ID;
                 setup_msg.length = 1;
 
-                let mut setup_reply = BesaltMsg::zeroed();
+                let mut setup_reply = TronaMsg::zeroed();
                 let serr2 = ipc::call_ctx(
                     ipc_ctx(), fs_slot,
                     &raw const setup_msg, &raw mut setup_reply,
                 );
-                if serr2 == 0 && setup_reply.label == BESALT_OK {
-                    besalt::uinfo!(|_lb| {
+                if serr2 == 0 && setup_reply.label == TRONA_OK {
+                    trona::uinfo!(|_lb| {
                         _lb.str(b"[VFS] saltyfs SHM transport established\n");
                     });
                     *(&raw mut crate::VFS_SHM_ACTIVE) = true;
                 } else {
-                    besalt::uwarn!(|_lb| {
+                    trona::uwarn!(|_lb| {
                         _lb.str(b"[VFS] saltyfs SHM setup failed (non-fatal)\n");
                     });
                     // Cleanup: unmap VFS SHM since SaltyFS didn't establish transport
-                    let mut shm_unmap = BesaltMsg::zeroed();
+                    let mut shm_unmap = TronaMsg::zeroed();
                     shm_unmap.label = MM_SHM_UNMAP;
                     shm_unmap.length = 3;
                     shm_unmap.regs[0] = VFS_SALTYFS_SHM_ID;
                     shm_unmap.regs[1] = 0; // 0 = caller's own badge
                     shm_unmap.regs[2] = VFS_SALTYFS_SHM_VADDR;
-                    let mut unmap_reply = BesaltMsg::zeroed();
+                    let mut unmap_reply = TronaMsg::zeroed();
                     let _ = ipc::call_ctx(ipc_ctx(), VFS_CAP_MMSRV_EP, &raw const shm_unmap, &raw mut unmap_reply);
                 }
             }
@@ -1022,16 +1022,16 @@ pub(crate) unsafe fn mount_symlink(
     mount_idx: usize, parent_ino: u64,
     name: *const u8, name_len: u8,
     target: *const u8, target_len: u8,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
 ) {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = SALTYFS_SYMLINK;
         req.regs[0] = parent_ino;
         if name_len as usize > 72 || target_len as usize > 64 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
         req.regs[1] = name_len as u64;
@@ -1049,10 +1049,10 @@ pub(crate) unsafe fn mount_symlink(
             *dst_target.add(i) = *target.add(i);
         }
         req.length = 20;
-        let mut fs_reply = BesaltMsg::zeroed();
+        let mut fs_reply = TronaMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
         (*reply).label = fs_reply.label;
-        if fs_reply.label == BESALT_OK {
+        if fs_reply.label == TRONA_OK {
             (*reply).regs[0] = fs_reply.regs[0]; // new_ino
         }
     }
@@ -1069,15 +1069,15 @@ pub(crate) unsafe fn mount_readlink_raw(
     unsafe {
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = SALTYFS_READLINK;
         req.regs[0] = remote_ino;
         req.length = 1;
 
-        let mut fs_reply = BesaltMsg::zeroed();
+        let mut fs_reply = TronaMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
 
-        if fs_reply.label != BESALT_OK {
+        if fs_reply.label != TRONA_OK {
             return 0;
         }
         let target_len = fs_reply.regs[0] as usize;
@@ -1100,26 +1100,26 @@ pub(crate) unsafe fn mount_readlink_raw(
 
 /// Read a symlink target from the mounted SaltyFS filesystem.
 pub(crate) unsafe fn mount_readlink(
-    mount_idx: usize, remote_ino: u64, reply: *mut BesaltMsg,
+    mount_idx: usize, remote_ino: u64, reply: *mut TronaMsg,
 ) {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = SALTYFS_READLINK;
         req.regs[0] = remote_ino;
         req.length = 1;
 
-        let mut fs_reply = BesaltMsg::zeroed();
+        let mut fs_reply = TronaMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
 
-        if fs_reply.label != BESALT_OK {
+        if fs_reply.label != TRONA_OK {
             (*reply).label = fs_reply.label;
             return;
         }
 
         // Copy target data from SaltyFS reply to VFS reply
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).regs[0] = fs_reply.regs[0]; // target_len
         (*reply).length = fs_reply.length;
         let target_len = fs_reply.regs[0] as usize;
@@ -1138,17 +1138,17 @@ pub(crate) unsafe fn mount_readlink(
 pub(crate) unsafe fn mount_link(
     mount_idx: usize, existing_ino: u64,
     new_parent_ino: u64, name: *const u8, name_len: u8,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
 ) {
     unsafe {
         let mounts = &raw const crate::MOUNTS;
         let m = &(*mounts)[mount_idx];
-        let mut req = BesaltMsg::zeroed();
+        let mut req = TronaMsg::zeroed();
         req.label = SALTYFS_LINK;
         req.regs[0] = existing_ino;
         req.regs[1] = new_parent_ino;
         if name_len as usize > 136 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
         let copy = name_len as usize;
@@ -1159,7 +1159,7 @@ pub(crate) unsafe fn mount_link(
             *dst.add(i) = *name.add(i);
         }
         req.length = 3 + ((copy as u64) + 7) / 8;
-        let mut fs_reply = BesaltMsg::zeroed();
+        let mut fs_reply = TronaMsg::zeroed();
         ipc::call_ctx(ipc_ctx(), m.fs_cap, &raw const req, &raw mut fs_reply);
         (*reply).label = fs_reply.label;
     }

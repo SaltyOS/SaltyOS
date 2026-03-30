@@ -2,15 +2,15 @@
 //! Extracted from main.rs for separation of concerns.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::ipc;
-use besalt::types::*;
+use trona::ipc;
+use trona::types::*;
 
 use crate::proc_table::{
     alloc_proc, find_by_badge, proctab, MAX_NAME_LEN, NEXT_PID, NSIG, PROC_RUNNING,
     SIG_DISP_CATCH, SIG_DISP_DFL,
 };
 
-pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u64) {
     unsafe {
         let alloc = &mut *(&raw mut super::ALLOCATOR);
 
@@ -18,13 +18,13 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         let child_entry = msg.regs[1];
 
         if child_entry == 0 {
-            reply.label = super::BESALT_INVALID_ARGUMENT;
+            reply.label = super::TRONA_INVALID_ARGUMENT;
             return;
         }
 
         let Some(parent_idx) = find_by_badge(badge) else {
-            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK from unknown badge\n"); });
-            reply.label = super::BESALT_NOT_FOUND;
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK from unknown badge\n"); });
+            reply.label = super::TRONA_NOT_FOUND;
             return;
         };
         let parent_pid = proctab(parent_idx).pid;
@@ -33,15 +33,15 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         let _parent_shared_base = proctab(parent_idx).shared_lib_base;
         let parent_lib_map = proctab(parent_idx).lib_map;
         let parent_layout = proctab(parent_idx).layout;
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] FORK from PID=");
             _lb.hex(parent_pid as u64);
             _lb.str(b"\n");
         });
 
         let Some(slot_idx) = alloc_proc() else {
-            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: process table full\n"); });
-            reply.label = super::BESALT_OUT_OF_MEMORY;
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: process table full\n"); });
+            reply.label = super::TRONA_OUT_OF_MEMORY;
             return;
         };
 
@@ -51,8 +51,8 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         // Reserve slots for fixed kernel objects (TCB, VSpace, CNode, SC, Notification) + margin.
         let total_slots = 8;
         if !alloc.reserve(total_slots) {
-            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: slot reservation failed\n"); });
-            reply.label = super::BESALT_OUT_OF_MEMORY;
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: slot reservation failed\n"); });
+            reply.label = super::TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -62,9 +62,9 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                 match alloc.realize_via_mmsrv_next(super::CAP_MMSRV_EP, $ty, 0) {
                     Ok(s) => s,
                     Err(_) => {
-                        besalt::uerror!(|_lb| { _lb.str($what); });
+                        trona::uerror!(|_lb| { _lb.str($what); });
                         alloc.rollback();
-                        reply.label = super::BESALT_OUT_OF_MEMORY;
+                        reply.label = super::TRONA_OUT_OF_MEMORY;
                         return;
                     }
                 }
@@ -92,7 +92,7 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         // vspace_clone_cow_page internally.
 
         // Mint mmsrv EP into child CNode slot 7 (badged with child pid)
-        let err = besalt::invoke::cnode_mint(
+        let err = trona::invoke::cnode_mint(
             super::CAP_SELF_CSPACE,
             super::CAP_MMSRV_EP_UNBADGED,
             child_cn,
@@ -100,16 +100,16 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             child_pid as u64,
         );
         if err != 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: mint mmsrv EP failed\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: mint mmsrv EP failed\n"); });
             alloc.rollback();
-            reply.label = super::BESALT_OUT_OF_MEMORY;
+            reply.label = super::TRONA_OUT_OF_MEMORY;
             return;
         }
 
         // Copy caps into child CNode
         macro_rules! copy_or_fail {
             ($src:expr, $dst:expr, $what:expr) => {
-                if besalt::invoke::cnode_copy(
+                if trona::invoke::cnode_copy(
                     super::CAP_SELF_CSPACE,
                     $src,
                     child_cn,
@@ -117,9 +117,9 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                     super::CAP_RIGHTS_ALL,
                 ) != 0
                 {
-                    besalt::uerror!(|_lb| { _lb.str($what); });
+                    trona::uerror!(|_lb| { _lb.str($what); });
                     alloc.rollback();
-                    reply.label = super::BESALT_OUT_OF_MEMORY;
+                    reply.label = super::TRONA_OUT_OF_MEMORY;
                     return;
                 }
             };
@@ -140,7 +140,7 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             b"[PROCMGR] FORK: copy CNode cap failed\n"
         );
 
-        let err = besalt::invoke::cnode_mint(
+        let err = trona::invoke::cnode_mint(
             super::CAP_SELF_CSPACE,
             super::CAP_SERVER_EP,
             child_cn,
@@ -148,12 +148,12 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             child_pid as u64,
         );
         if err != 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: mint server EP failed\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: mint server EP failed\n"); });
             alloc.rollback();
-            reply.label = super::BESALT_OUT_OF_MEMORY;
+            reply.label = super::TRONA_OUT_OF_MEMORY;
             return;
         }
-        let err = besalt::invoke::cnode_mint(
+        let err = trona::invoke::cnode_mint(
             super::CAP_SELF_CSPACE,
             super::CAP_VFS_EP,
             child_cn,
@@ -161,19 +161,19 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             child_pid as u64,
         );
         if err != 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: mint child VFS EP failed\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: mint child VFS EP failed\n"); });
             alloc.rollback();
-            reply.label = super::BESALT_OUT_OF_MEMORY;
+            reply.label = super::TRONA_OUT_OF_MEMORY;
             return;
         }
-        let _ = besalt::invoke::cnode_copy(
+        let _ = trona::invoke::cnode_copy(
             super::CAP_SELF_CSPACE,
             super::CAP_NAMESERV_EP,
             child_cn,
             super::CHILD_CAP_NAMESERV,
             super::CAP_RIGHTS_ALL,
         );
-        let _ = besalt::invoke::cnode_copy(
+        let _ = trona::invoke::cnode_copy(
             super::CAP_SELF_CSPACE,
             child_sig_ntfn,
             child_cn,
@@ -182,7 +182,7 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         );
         // Keep fork child cap layout aligned with spawn path so rtld/slot alloc
         // can use initrd device mapping and mirrored untyped sources.
-        let _ = besalt::invoke::cnode_copy(
+        let _ = trona::invoke::cnode_copy(
             super::CAP_SELF_CSPACE,
             super::CAP_INITRD_UNTYPED,
             child_cn,
@@ -195,7 +195,7 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         let pm_ntfn = *(&raw const super::PM_BOUND_NTFN);
         if pm_ntfn != 0 {
             let cs_badge = 1u64 << (16 + slot_idx);
-            let _ = besalt::invoke::cnode_mint(
+            let _ = trona::invoke::cnode_mint(
                 super::CAP_SELF_CSPACE,
                 pm_ntfn,
                 child_cn,
@@ -205,11 +205,11 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         }
 
         // Configure child TCB
-        let err = besalt::invoke::tcb_set_space(child_tcb, child_cn, child_vs);
+        let err = trona::invoke::tcb_set_space(child_tcb, child_cn, child_vs);
         if err != 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: set_space failed\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: set_space failed\n"); });
             alloc.rollback();
-            reply.label = super::BESALT_OUT_OF_MEMORY;
+            reply.label = super::TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -219,11 +219,11 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                 Some(s) => s,
                 None => {
                     alloc.rollback();
-                    reply.label = super::BESALT_OUT_OF_MEMORY;
+                    reply.label = super::TRONA_OUT_OF_MEMORY;
                     return;
                 }
             };
-            let err = besalt::invoke::cnode_mint(
+            let err = trona::invoke::cnode_mint(
                 super::CAP_SELF_CSPACE,
                 super::CAP_MMSRV_EP_UNBADGED,
                 super::CAP_SELF_CSPACE,
@@ -231,25 +231,25 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                 child_pid as u64,
             );
             if err == 0 {
-                besalt::invoke::tcb_set_fault_handler(child_tcb, temp_slot);
+                trona::invoke::tcb_set_fault_handler(child_tcb, temp_slot);
             }
-            besalt::invoke::cnode_delete(super::CAP_SELF_CSPACE, temp_slot);
+            trona::invoke::cnode_delete(super::CAP_SELF_CSPACE, temp_slot);
             alloc.free_single_slot(temp_slot);
         }
 
-        let err = besalt::invoke::tcb_configure(child_tcb, child_entry, parent_rsp, 0);
+        let err = trona::invoke::tcb_configure(child_tcb, child_entry, parent_rsp, 0);
         if err != 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: configure failed\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: configure failed\n"); });
             alloc.rollback();
-            reply.label = super::BESALT_OUT_OF_MEMORY;
+            reply.label = super::TRONA_OUT_OF_MEMORY;
             return;
         }
         // Copy parent's FPU/SSE state to child (preserves XMM registers across fork)
-        let err = besalt::invoke::tcb_copy_fpu(child_tcb, proctab(parent_idx).tcb_cap);
+        let err = trona::invoke::tcb_copy_fpu(child_tcb, proctab(parent_idx).tcb_cap);
         if err != 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: copy FPU state failed\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: copy FPU state failed\n"); });
             alloc.rollback();
-            reply.label = super::BESALT_OUT_OF_MEMORY;
+            reply.label = super::TRONA_OUT_OF_MEMORY;
             return;
         }
         // Copy parent's TLS base to child TCB so FS_BASE is correct after
@@ -257,25 +257,25 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         // at the same virtual address, so it needs the same FS_BASE.
         let parent_tls_base = msg.regs[9];
         if parent_tls_base != 0 {
-            let err = besalt::invoke::tcb_set_tls_base(child_tcb, parent_tls_base);
+            let err = trona::invoke::tcb_set_tls_base(child_tcb, parent_tls_base);
             if err != 0 {
-                besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: set TLS base failed\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: set TLS base failed\n"); });
             }
         }
 
-        let err = besalt::invoke::tcb_set_ipc_buffer(child_tcb, parent_layout.ipc_buf.base);
+        let err = trona::invoke::tcb_set_ipc_buffer(child_tcb, parent_layout.ipc_buf.base);
         if err != 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: set IPC buf failed\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: set IPC buf failed\n"); });
             alloc.rollback();
-            reply.label = super::BESALT_OUT_OF_MEMORY;
+            reply.label = super::TRONA_OUT_OF_MEMORY;
             return;
         }
 
         // Clone FD table BEFORE resuming child
         {
-            let mut clone_msg = BesaltMsg::zeroed();
-            let mut clone_reply = BesaltMsg::zeroed();
-            clone_msg.label = besalt::consts::POSIX_VFS_CLONE_FDS;
+            let mut clone_msg = TronaMsg::zeroed();
+            let mut clone_reply = TronaMsg::zeroed();
+            clone_msg.label = trona::consts::POSIX_VFS_CLONE_FDS;
             clone_msg.length = 2;
             clone_msg.regs[0] = badge;
             clone_msg.regs[1] = child_pid as u64;
@@ -285,8 +285,8 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                 &raw const clone_msg,
                 &raw mut clone_reply,
             );
-            if err != 0 || clone_reply.label != super::BESALT_OK {
-                besalt::uerror!(|_lb| {
+            if err != 0 || clone_reply.label != super::TRONA_OK {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[PROCMGR] FORK: VFS clone_fds failed err=");
                     _lb.hex(err as u64);
                     _lb.str(b" reply=");
@@ -294,7 +294,7 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                     _lb.str(b", aborting fork\n");
                 });
                 alloc.rollback();
-                reply.label = super::BESALT_INVALID_OPERATION;
+                reply.label = super::TRONA_INVALID_OPERATION;
                 return;
             }
         }
@@ -302,10 +302,10 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         // Register child with mmsrv (VSpace cap transfer + initial state)
         {
             let fork_heap_base = parent_layout.elf_code.end();
-            let fork_mmap_base = besalt::layout::compute_mmap_base(&parent_layout, fork_heap_base);
-            let mut mm_msg = BesaltMsg::zeroed();
-            let mut mm_reply = BesaltMsg::zeroed();
-            mm_msg.label = besalt::consts::MM_REGISTER;
+            let fork_mmap_base = trona::layout::compute_mmap_base(&parent_layout, fork_heap_base);
+            let mut mm_msg = TronaMsg::zeroed();
+            let mut mm_reply = TronaMsg::zeroed();
+            mm_msg.label = trona::consts::MM_REGISTER;
             mm_msg.length = 4;
             mm_msg.regs[0] = child_pid as u64; // client badge
                                                // Seed with dynamic defaults; MM_FORK_REGIONS overwrites with exact runtime state.
@@ -319,23 +319,23 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                 &raw const mm_msg,
                 &raw mut mm_reply,
             );
-            if err != 0 || mm_reply.label != super::BESALT_OK {
-                besalt::uerror!(|_lb| {
+            if err != 0 || mm_reply.label != super::TRONA_OK {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[PROCMGR] FORK: mmsrv register failed err=");
                     _lb.hex(err as u64);
                     _lb.str(b"\n");
                 });
                 alloc.rollback();
-                reply.label = super::BESALT_OUT_OF_MEMORY;
+                reply.label = super::TRONA_OUT_OF_MEMORY;
                 return;
             }
         }
 
         // Clone parent's memory state to child in mmsrv
         {
-            let mut mm_msg = BesaltMsg::zeroed();
-            let mut mm_reply = BesaltMsg::zeroed();
-            mm_msg.label = besalt::consts::MM_FORK_REGIONS;
+            let mut mm_msg = TronaMsg::zeroed();
+            let mut mm_reply = TronaMsg::zeroed();
+            mm_msg.label = trona::consts::MM_FORK_REGIONS;
             mm_msg.length = 2;
             mm_msg.regs[0] = badge; // parent badge
             mm_msg.regs[1] = child_pid as u64; // child badge
@@ -345,13 +345,13 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                 &raw const mm_msg,
                 &raw mut mm_reply,
             );
-            if err != 0 || mm_reply.label != super::BESALT_OK {
-                besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: mmsrv fork_regions failed, aborting\n"); });
+            if err != 0 || mm_reply.label != super::TRONA_OK {
+                trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: mmsrv fork_regions failed, aborting\n"); });
                 // Deregister child from mmsrv and abort fork
                 {
-                    let mut dereg = BesaltMsg::zeroed();
-                    let mut drep = BesaltMsg::zeroed();
-                    dereg.label = besalt::consts::MM_DEREGISTER;
+                    let mut dereg = TronaMsg::zeroed();
+                    let mut drep = TronaMsg::zeroed();
+                    dereg.label = trona::consts::MM_DEREGISTER;
                     dereg.length = 1;
                     dereg.regs[0] = child_pid as u64;
                     let _ = ipc::call_ctx(
@@ -362,16 +362,16 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                     );
                 }
                 alloc.rollback();
-                reply.label = super::BESALT_OUT_OF_MEMORY;
+                reply.label = super::TRONA_OUT_OF_MEMORY;
                 return;
             }
         }
 
         // Map IPC buffer for child via mmsrv (zero-filled, child only)
         {
-            let mut mm_msg = BesaltMsg::zeroed();
-            let mut mm_reply = BesaltMsg::zeroed();
-            mm_msg.label = besalt::consts::MM_MAP_BATCH;
+            let mut mm_msg = TronaMsg::zeroed();
+            let mut mm_reply = TronaMsg::zeroed();
+            mm_msg.label = trona::consts::MM_MAP_BATCH;
             mm_msg.length = 4;
             mm_msg.regs[0] = child_pid as u64;
             mm_msg.regs[1] = parent_layout.ipc_buf.base;
@@ -383,13 +383,13 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                 &raw const mm_msg,
                 &raw mut mm_reply,
             );
-            if err != 0 || mm_reply.label != super::BESALT_OK || mm_reply.regs[0] != 1 {
-                besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: MM_MAP_BATCH ipc failed\n"); });
+            if err != 0 || mm_reply.label != super::TRONA_OK || mm_reply.regs[0] != 1 {
+                trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] FORK: MM_MAP_BATCH ipc failed\n"); });
                 // Deregister child from mmsrv on failure
                 {
-                    let mut dereg = BesaltMsg::zeroed();
-                    let mut drep = BesaltMsg::zeroed();
-                    dereg.label = besalt::consts::MM_DEREGISTER;
+                    let mut dereg = TronaMsg::zeroed();
+                    let mut drep = TronaMsg::zeroed();
+                    dereg.label = trona::consts::MM_DEREGISTER;
                     dereg.length = 1;
                     dereg.regs[0] = child_pid as u64;
                     let _ = ipc::call_ctx(
@@ -400,28 +400,28 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                     );
                 }
                 alloc.rollback();
-                reply.label = super::BESALT_OUT_OF_MEMORY;
+                reply.label = super::TRONA_OUT_OF_MEMORY;
                 return;
             }
         }
 
         // Schedule the child
-        let err = besalt::invoke::sc_configure(child_sc, 10000, 100000);
+        let err = trona::invoke::sc_configure(child_sc, 10000, 100000);
         if err != 0 {
             alloc.rollback();
-            reply.label = super::BESALT_OUT_OF_MEMORY;
+            reply.label = super::TRONA_OUT_OF_MEMORY;
             return;
         }
-        let err = besalt::invoke::sc_bind(child_sc, child_tcb);
+        let err = trona::invoke::sc_bind(child_sc, child_tcb);
         if err != 0 {
             alloc.rollback();
-            reply.label = super::BESALT_OUT_OF_MEMORY;
+            reply.label = super::TRONA_OUT_OF_MEMORY;
             return;
         }
-        let err = besalt::invoke::tcb_resume(child_tcb);
+        let err = trona::invoke::tcb_resume(child_tcb);
         if err != 0 {
             alloc.rollback();
-            reply.label = super::BESALT_OUT_OF_MEMORY;
+            reply.label = super::TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -460,12 +460,12 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         }
         p.umask = proctab(parent_idx).umask;
 
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] FORK: child PID=");
             _lb.hex(child_pid as u64);
             _lb.str(b" started\n");
         });
-        reply.label = super::BESALT_OK;
+        reply.label = super::TRONA_OK;
         reply.length = 1;
         reply.regs[0] = child_pid as u64;
     }
@@ -473,11 +473,11 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
 
 unsafe fn abort_destroyed_exec(
     idx: usize,
-    reply: &mut BesaltMsg,
+    reply: &mut TronaMsg,
     vfs_source: &mut super::vfs_load::VfsExecSource,
 ) {
     unsafe {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[PROCMGR] EXEC: terminating PID=");
             _lb.hex(proctab(idx).pid as u64);
             _lb.str(b" after destructive failure\n");
@@ -489,17 +489,17 @@ unsafe fn abort_destroyed_exec(
     }
 }
 
-pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u64) {
     unsafe {
         let alloc = &mut *(&raw mut super::ALLOCATOR);
 
         let Some(idx) = find_by_badge(badge) else {
-            reply.label = super::BESALT_NOT_FOUND;
+            reply.label = super::TRONA_NOT_FOUND;
             return;
         };
 
         if msg.regs[0] > 64 {
-            reply.label = super::BESALT_INVALID_ARGUMENT;
+            reply.label = super::TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -512,7 +512,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         let mut exec_str_data = [0u8; IPC_BUFFER_RESERVED_BYTES];
         let exec_str_len: usize;
         if msg.length as usize <= path_regs + 1 {
-            reply.label = super::BESALT_INVALID_ARGUMENT;
+            reply.label = super::TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -521,13 +521,13 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         envc = (packed & 0xFFFF_FFFF) as u32;
         exec_str_len = msg.regs[path_regs + 1] as usize;
         if exec_str_len > exec_str_data.len() {
-            reply.label = super::BESALT_OUT_OF_RANGE;
+            reply.label = super::TRONA_OUT_OF_RANGE;
             return;
         }
         if exec_str_len != 0 {
             let ctx = &*super::ipc_ctx();
             if ctx.ipc_buffer.is_null() {
-                reply.label = super::BESALT_INVALID_ARGUMENT;
+                reply.label = super::TRONA_INVALID_ARGUMENT;
                 return;
             }
 
@@ -537,7 +537,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             }
         }
 
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] EXEC PID=");
             _lb.hex(proctab(idx).pid as u64);
             _lb.str(b" -> '");
@@ -553,7 +553,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
 
         let mut elf_entry = CpioEntry::zeroed();
 
-        let mut found = besalt::cpio::cpio_find_file(
+        let mut found = trona_loader::cpio::cpio_find_file(
             initrd,
             initrd_size,
             name.as_ptr(),
@@ -565,7 +565,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         if !found && name_len > 0 && name[0] == b'/' {
             base_off = 1;
             base_len = name_len - 1;
-            found = besalt::cpio::cpio_find_file(
+            found = trona_loader::cpio::cpio_find_file(
                 initrd,
                 initrd_size,
                 (&name[base_off]) as *const u8,
@@ -583,7 +583,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             legacy[base_len + 1] = b'e';
             legacy[base_len + 2] = b'l';
             legacy[base_len + 3] = b'f';
-            found = besalt::cpio::cpio_find_file(
+            found = trona_loader::cpio::cpio_find_file(
                 initrd,
                 initrd_size,
                 legacy.as_ptr(),
@@ -607,8 +607,8 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             }
         }
         if !found {
-            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] EXEC: ELF not found in initrd or VFS\n"); });
-            reply.label = super::BESALT_NOT_FOUND;
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] EXEC: ELF not found in initrd or VFS\n"); });
+            reply.label = super::TRONA_NOT_FOUND;
             return;
         }
 
@@ -616,7 +616,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         let is_dynamic = if let Some(vfs) = vfs_stream {
             vfs.is_dynamic
         } else {
-            besalt::elf_dynamic::elf_has_interp(elf_entry.data, elf_entry.data_len)
+            trona_loader::elf_dynamic::elf_has_interp(elf_entry.data, elf_entry.data_len)
         };
         let proc_vs = proctab(idx).vspace_cap;
         let pid = proctab(idx).pid;
@@ -627,11 +627,11 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         // 2. Unmap existing user pages
         let mut walk_start: u64 = 0;
         loop {
-            let err = besalt::invoke::vspace_walk(proc_vs, walk_start, super::VSPACE_WALK_BATCH);
+            let err = trona::invoke::vspace_walk(proc_vs, walk_start, super::VSPACE_WALK_BATCH);
             if err != 0 {
                 break;
             }
-            let Some((count, next_addr)) = besalt::invoke::vspace_walk_result_header() else {
+            let Some((count, next_addr)) = trona::invoke::vspace_walk_result_header() else {
                 break;
             };
             if count == 0 {
@@ -639,11 +639,11 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             }
 
             for i in 0..count {
-                let Some((page_vaddr, _, _)) = besalt::invoke::vspace_walk_result_entry(i as usize)
+                let Some((page_vaddr, _, _)) = trona::invoke::vspace_walk_result_entry(i as usize)
                 else {
                     break;
                 };
-                besalt::invoke::vspace_unmap(proc_vs, page_vaddr);
+                trona::invoke::vspace_unmap(proc_vs, page_vaddr);
             }
 
             if next_addr == 0 {
@@ -661,7 +661,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
                 super::CHILD_RTLD_FRAME_SLOT_START
             };
             let mut cnode_bits: u64 = 10;
-            let cinfo = besalt::invoke::cnode_get_info(child_cn);
+            let cinfo = trona::invoke::cnode_get_info(child_cn);
             if cinfo.error == 0 {
                 let ctx = &*super::ipc_ctx();
                 if !ctx.ipc_buffer.is_null() {
@@ -674,7 +674,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             }
             let cnode_total = 1u64 << cnode_bits;
             for slot in frame_floor..cnode_total {
-                besalt::invoke::cnode_delete(child_cn, slot);
+                trona::invoke::cnode_delete(child_cn, slot);
             }
         }
 
@@ -686,9 +686,9 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         if old_slot_count > off_fixed {
             for i in off_fixed..old_slot_count {
                 let slot = old_slot_base + i as u64;
-                let err = besalt::invoke::cnode_revoke(super::CAP_SELF_CSPACE, slot);
+                let err = trona::invoke::cnode_revoke(super::CAP_SELF_CSPACE, slot);
                 if err != 0 {
-                    besalt::invoke::cnode_delete(super::CAP_SELF_CSPACE, slot);
+                    trona::invoke::cnode_delete(super::CAP_SELF_CSPACE, slot);
                 }
             }
             alloc.free_slots(old_slot_base + off_fixed as u64, old_slot_count - off_fixed);
@@ -699,7 +699,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         let elf_span = if let Some(vfs) = vfs_stream {
             vfs.elf_span
         } else {
-            besalt::elf_loader::elf_compute_load_span(elf_entry.data, elf_entry.data_len)
+            trona_loader::elf_loader::elf_compute_load_span(elf_entry.data, elf_entry.data_len)
         };
         let rtld_span = if is_dynamic {
             if let Some(vfs) = vfs_stream {
@@ -721,9 +721,9 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             0
         };
         let needed_owned = if is_dynamic && vfs_stream.is_none() {
-            besalt::elf_dynamic::elf_get_needed(elf_entry.data, elf_entry.data_len)
+            trona_loader::elf_dynamic::elf_get_needed(elf_entry.data, elf_entry.data_len)
         } else {
-            besalt::elf_dynamic::NeededLibs::new()
+            trona_loader::elf_dynamic::NeededLibs::new()
         };
         let needed = if let Some(vfs) = vfs_stream {
             &vfs.needed
@@ -736,23 +736,23 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         } else {
             0
         };
-        let layout = besalt::layout::compute_vm_layout_randomized(
+        let layout = trona::layout::compute_vm_layout_randomized(
             elf_span,
             rtld_span,
             shared_lib_cache_pages,
             is_dynamic,
             lib_window_pages * 4096,
-            || besalt::syscall::sys_getrandom(),
+            || trona::syscall::sys_getrandom(),
         );
         if layout.stack_top == 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] EXEC: ELF too large for VA layout\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] EXEC: ELF too large for VA layout\n"); });
             abort_destroyed_exec(idx, reply, &mut vfs_source);
             return;
         }
 
         // 4. Re-register with mmsrv for the new exec image
         let heap_base = layout.heap_base();
-        let mmap_base = besalt::layout::compute_mmap_base(&layout, heap_base);
+        let mmap_base = trona::layout::compute_mmap_base(&layout, heap_base);
         super::spawn_tx::register_with_mmsrv(pid, proc_vs, heap_base, mmap_base);
 
         // 5. Load ELF via mmsrv
@@ -780,7 +780,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             )
         };
         if err != 0 {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[PROCMGR] EXEC: ELF load failed err=");
                 _lb.hex(err as u64);
                 _lb.str(b"\n");
@@ -892,7 +892,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             let mut phdr_vaddr = 0u64;
             let mut phent = 0u64;
             let mut phnum = 0u64;
-            if besalt::elf_dynamic::elf_get_phdr_info(
+            if trona_loader::elf_dynamic::elf_get_phdr_info(
                 elf_entry.data,
                 elf_entry.data_len,
                 layout.elf_code.base,
@@ -910,7 +910,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
 
         if is_dynamic {
             let mut exec_cnode_bits: u64 = 10;
-            let cinfo = besalt::invoke::cnode_get_info(proctab(idx).cnode_cap);
+            let cinfo = trona::invoke::cnode_get_info(proctab(idx).cnode_cap);
             if cinfo.error == 0 {
                 let ctx = &*super::ipc_ctx();
                 if !ctx.ipc_buffer.is_null() {
@@ -985,17 +985,17 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         super::spawn_tx::unmap_window_from_mmsrv(super::PROCMGR_SCRATCH_VADDR, 1);
 
         // 11. Suspend and reconfigure
-        let susp_err = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 64);
+        let susp_err = trona::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 64);
         if susp_err != 0 {
-            besalt::syscall::syscall(besalt::SYS_NANOSLEEP, 2_000_000, 0, 0, 0, 0, 0);
-            let err2 = besalt::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 64);
+            trona::syscall::syscall(trona::SYS_NANOSLEEP, 2_000_000, 0, 0, 0, 0, 0);
+            let err2 = trona::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 64);
             if err2 != 0 {
-                besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] EXEC: tcb_suspend failed\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] EXEC: tcb_suspend failed\n"); });
                 abort_destroyed_exec(idx, reply, &mut vfs_source);
                 return;
             }
         }
-        besalt::syscall::syscall(besalt::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        trona::syscall::syscall(trona::SYS_YIELD, 0, 0, 0, 0, 0, 0);
 
         // POSIX: exec resets caught signals to SIG_DFL
         for i in 0..NSIG {
@@ -1004,23 +1004,23 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             }
         }
 
-        let err = besalt::invoke::tcb_configure(proctab(idx).tcb_cap, new_entry, new_rsp, 0);
+        let err = trona::invoke::tcb_configure(proctab(idx).tcb_cap, new_entry, new_rsp, 0);
         if err != 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] EXEC: tcb_configure failed\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] EXEC: tcb_configure failed\n"); });
             abort_destroyed_exec(idx, reply, &mut vfs_source);
             return;
         }
-        let err = besalt::invoke::tcb_set_tls_base(proctab(idx).tcb_cap, 0);
+        let err = trona::invoke::tcb_set_tls_base(proctab(idx).tcb_cap, 0);
         if err != 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] EXEC: clear TLS base failed\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] EXEC: clear TLS base failed\n"); });
             abort_destroyed_exec(idx, reply, &mut vfs_source);
             return;
         }
-        besalt::invoke::tcb_set_ipc_buffer(proctab(idx).tcb_cap, layout.ipc_buf.base);
+        trona::invoke::tcb_set_ipc_buffer(proctab(idx).tcb_cap, layout.ipc_buf.base);
 
-        let err = besalt::invoke::tcb_resume(proctab(idx).tcb_cap);
+        let err = trona::invoke::tcb_resume(proctab(idx).tcb_cap);
         if err != 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[PROCMGR] EXEC: resume failed\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] EXEC: resume failed\n"); });
             abort_destroyed_exec(idx, reply, &mut vfs_source);
             return;
         }
@@ -1040,7 +1040,7 @@ pub(crate) unsafe fn handle_exec(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
             }
         }
 
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] EXEC: PID=");
             _lb.hex(proctab(idx).pid as u64);
             _lb.str(b" -> entry=");

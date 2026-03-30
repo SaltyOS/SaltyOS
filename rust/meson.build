@@ -10,7 +10,7 @@
 #   rust_kernel_target_needs_unstable, rust_lib_src, build_kernel, build_userland
 # =============================================================================
 
-rust_kernel_target_file = files('../kernel/' + arch + '-saltyos.json')
+rust_kernel_target_file = files('../kernite/' + arch + '-kernite.json')
 
 # Core library configuration
 # Disable floating-point formatting to reduce code size and avoid FP intrinsics

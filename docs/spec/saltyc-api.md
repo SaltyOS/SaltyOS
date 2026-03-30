@@ -1,13 +1,13 @@
-# besaltc API Reference
+# basaltc API Reference
 
 SaltyOS C Standard Library — POSIX and BSD-compatible C functions implemented in
 Rust. All functions use C ABI (`extern "C"`) and are linked into executables via
-`libbesalt.so`.
+`libtrona.so`.
 
 **Status key:** **F** = full implementation, **P** = partial (reduced functionality),
 **S** = stub (returns ENOSYS/-1/no-op).
 
-**Source:** `lib/besalt/c/src/`
+**Source:** `lib/basalt/c/src/`
 
 ---
 
@@ -311,7 +311,7 @@ Defined constants (50+): `EPERM`(1), `ENOENT`(2), `ESRCH`(3), `EINTR`(4),
 
 Source: `unistd.rs`
 
-All file operations delegate to `libbesalt` POSIX wrappers which communicate
+All file operations delegate to `trona` POSIX wrappers which communicate
 with the VFS server via IPC.
 
 ### File I/O
@@ -457,20 +457,20 @@ Source: `unistd.rs`
 
 | Function | St | Notes |
 |---|---|---|
-| `mmap` | F | MAP_ANONYMOUS, MAP_SHARED, MAP_PRIVATE; pages allocated via libbesalt posix_mmap |
-| `munmap` | F | Via libbesalt posix_munmap |
+| `mmap` | F | MAP_ANONYMOUS, MAP_SHARED, MAP_PRIVATE; pages allocated via trona posix_mmap |
+| `munmap` | F | Via trona posix_munmap |
 
 Constants: `PROT_READ`(1), `PROT_WRITE`(2), `PROT_EXEC`(4), `PROT_NONE`(0),
 `MAP_SHARED`(1), `MAP_PRIVATE`(2), `MAP_ANONYMOUS`(0x20), `MAP_FIXED`(0x10),
 `MAP_FAILED`(-1 as pointer).
 
-`shm_open`/`shm_unlink` are in `libbesalt` (not besaltc).
+`shm_open`/`shm_unlink` are in `trona` (not basaltc).
 
 ---
 
 ## sys/socket.h
 
-Socket operations are in `libbesalt` (`posix.rs`) rather than besaltc. The besaltc
+Socket operations are in `trona` (`posix.rs`) rather than basaltc. The basaltc
 layer provides type definitions and constants used by ported programs.
 
 Constants: `AF_UNIX`(1), `AF_LOCAL`(1), `SOCK_STREAM`(1), `SOCK_DGRAM`(2),
@@ -480,7 +480,7 @@ Constants: `AF_UNIX`(1), `AF_LOCAL`(1), `SOCK_STREAM`(1), `SOCK_DGRAM`(2),
 Socket functions (`socket`, `bind`, `listen`, `accept`, `connect`, `send`,
 `recv`, `sendmsg`, `recvmsg`, `sendto`, `recvfrom`, `getsockopt`, `setsockopt`,
 `shutdown`, `socketpair`, `getpeername`, `getsockname`) are available through
-`libbesalt::posix`.
+`trona::posix`.
 
 ---
 
@@ -502,7 +502,7 @@ Source: `select_impl.rs`
 
 ## poll.h
 
-`poll` is available through `libbesalt::posix::posix_poll`. The besaltc layer
+`poll` is available through `trona::posix::posix_poll`. The basaltc layer
 provides the `select` wrapper (see above) which delegates to poll internally.
 
 Constants: `POLLIN`(1), `POLLOUT`(4), `POLLERR`(8), `POLLHUP`(16),
@@ -533,14 +533,14 @@ Encoding: bits 7:0 = signal (0 if exited normally), bits 15:8 = exit code.
 Source: `signal_impl.rs`
 
 Notification-based signal delivery. 32 signals maximum. Signal handlers are
-stored in shared `libbesalt` globals and dispatched from a notification-polling
+stored in shared `trona` globals and dispatched from a notification-polling
 trampoline.
 
 | Function | St | Notes |
 |---|---|---|
 | `signal` | F | Installs handler via `sigaction`; returns previous handler |
 | `sigaction` | F | Stores sa_handler/sa_mask/sa_flags; SA_SIGINFO not supported |
-| `sigprocmask` | F | SIG_BLOCK, SIG_UNBLOCK, SIG_SETMASK; modifies libbesalt's mask |
+| `sigprocmask` | F | SIG_BLOCK, SIG_UNBLOCK, SIG_SETMASK; modifies trona's mask |
 | `sigsuspend` | S | Returns -1 / EINTR |
 | `sigpending` | S | Returns 0 (empty set) |
 | `sigemptyset` | F | |

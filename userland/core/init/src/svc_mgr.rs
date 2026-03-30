@@ -82,7 +82,7 @@ impl ServiceManager {
     /// Register a parsed service definition. Returns index or -1 on error.
     pub fn add_service(&mut self, def: &ServiceDef) -> i32 {
         if self.count >= MAX_SERVICES {
-            besalt::uerror!(|_lb| { _lb.str(b"[INIT] svc_mgr: too many services\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[INIT] svc_mgr: too many services\n"); });
             return -1;
         }
         let idx = self.count;
@@ -201,7 +201,7 @@ impl ServiceManager {
 
         if self.boot_order_len != n {
             // Cycle detected — mark unprocessed services as Failed
-            besalt::uerror!(|_lb| { _lb.str(b"[INIT] svc_mgr: cycle detected! Only "); _lb.hex(self.boot_order_len as u64); _lb.str(b" of "); _lb.hex(n as u64); _lb.str(b" services sorted\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[INIT] svc_mgr: cycle detected! Only "); _lb.hex(self.boot_order_len as u64); _lb.str(b" of "); _lb.hex(n as u64); _lb.str(b" services sorted\n"); });
 
             for i in 0..n {
                 let mut in_order = false;
@@ -213,7 +213,7 @@ impl ServiceManager {
                 }
                 if !in_order {
                     self.services[i].state = ServiceState::Failed;
-                    besalt::uerror!(|_lb| { _lb.str(b"[INIT] svc="); _lb.bytes(self.services[i].def.name_bytes()); _lb.str(b" state=Failed (cycle)\n"); });
+                    trona::uerror!(|_lb| { _lb.str(b"[INIT] svc="); _lb.bytes(self.services[i].def.name_bytes()); _lb.str(b" state=Failed (cycle)\n"); });
                 }
             }
             return false;
@@ -238,7 +238,7 @@ impl ServiceManager {
             return;
         }
         self.services[idx].state = state;
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[INIT] svc=");
             _lb.bytes(self.services[idx].def.name_bytes());
             _lb.str(b" state=");
@@ -291,12 +291,12 @@ impl ServiceManager {
             return;
         }
         self.services[idx].exit_code = exit_code;
-        besalt::uinfo!(|_lb| { _lb.str(b"[INIT] svc="); _lb.bytes(self.services[idx].def.name_bytes()); _lb.str(b" exited code="); _lb.hex(exit_code as u64); _lb.str(b"\n"); });
+        trona::uinfo!(|_lb| { _lb.str(b"[INIT] svc="); _lb.bytes(self.services[idx].def.name_bytes()); _lb.str(b" exited code="); _lb.hex(exit_code as u64); _lb.str(b"\n"); });
 
         if self.should_restart(idx) {
             self.services[idx].restart_count += 1;
             self.services[idx].state = ServiceState::Stopped;
-            besalt::uinfo!(|_lb| { _lb.str(b"[INIT] svc="); _lb.bytes(self.services[idx].def.name_bytes()); _lb.str(b" will restart (attempt "); _lb.hex(self.services[idx].restart_count as u64); _lb.str(b")\n"); });
+            trona::uinfo!(|_lb| { _lb.str(b"[INIT] svc="); _lb.bytes(self.services[idx].def.name_bytes()); _lb.str(b" will restart (attempt "); _lb.hex(self.services[idx].restart_count as u64); _lb.str(b")\n"); });
         } else {
             self.services[idx].state = ServiceState::Failed;
         }
@@ -304,7 +304,7 @@ impl ServiceManager {
 
     /// Log the boot order
     pub fn log_boot_order(&self) {
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[INIT] Boot order: ");
             for i in 0..self.boot_order_len {
                 if i > 0 {

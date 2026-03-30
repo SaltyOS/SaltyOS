@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! In-memory filesystem: inode allocation, directory operations, and initrd mounting.
 
-use besalt::consts::*;
-use besalt::cpio;
-use besalt::types::*;
+use trona::consts::*;
+use trona_loader::cpio;
+use trona::types::*;
 
 use crate::consts::*;
 use crate::types::*;
@@ -323,7 +323,7 @@ pub(crate) unsafe fn grow_writable_pool() -> i32 {
         // Grow WRITABLE_USED (WRITABLE_CAP was updated by vfs_grow_pool above)
         let used_bytes = new_cap;
         let used_pages = (used_bytes + 4095) / 4096;
-        let new_used_ptr = besalt::posix_mm::posix_mmap(
+        let new_used_ptr = trona_posix::mm::posix_mmap(
             core::ptr::null_mut(),
             (used_pages * 4096) as u64,
             0x3,
@@ -339,14 +339,14 @@ pub(crate) unsafe fn grow_writable_pool() -> i32 {
         core::ptr::write_bytes(new_used_ptr.add(old_cap), 0, new_cap - old_cap);
         if !old_used_ptr.is_null() {
             let old_used_pages = (old_cap + 4095) / 4096;
-            besalt::posix_mm::posix_munmap(old_used_ptr, (old_used_pages * 4096) as u64);
+            trona_posix::mm::posix_munmap(old_used_ptr, (old_used_pages * 4096) as u64);
         }
         crate::WRITABLE_USED_PTR = new_used_ptr;
 
         // Grow WRITABLE_NEXT
         let next_bytes = new_cap * core::mem::size_of::<u32>();
         let next_pages = (next_bytes + 4095) / 4096;
-        let new_next_ptr = besalt::posix_mm::posix_mmap(
+        let new_next_ptr = trona_posix::mm::posix_mmap(
             core::ptr::null_mut(),
             (next_pages * 4096) as u64,
             0x3,
@@ -367,7 +367,7 @@ pub(crate) unsafe fn grow_writable_pool() -> i32 {
         if !old_next_ptr.is_null() {
             let old_next_bytes = old_cap * core::mem::size_of::<u32>();
             let old_next_pages = (old_next_bytes + 4095) / 4096;
-            besalt::posix_mm::posix_munmap(old_next_ptr as *mut u8, (old_next_pages * 4096) as u64);
+            trona_posix::mm::posix_munmap(old_next_ptr as *mut u8, (old_next_pages * 4096) as u64);
         }
         crate::WRITABLE_NEXT_PTR = new_next;
         0
@@ -813,7 +813,7 @@ pub(crate) unsafe fn init_ramfs() {
         let initrd = INITRD_VADDR as *const u8;
         let initrd_size = read_boot_info_initrd_size();
 
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[VFS] Initrd size: ");
             _lb.hex(initrd_size as u64);
             _lb.str(b" bytes\n");
@@ -833,7 +833,7 @@ pub(crate) unsafe fn init_ramfs() {
             }
         }
 
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[VFS] Mounted ");
             _lb.hex(file_count as u64);
             _lb.str(b" initrd files\n");

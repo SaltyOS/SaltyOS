@@ -2,10 +2,10 @@
 //! Ported from userland/test_fork/main.c
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::posix;
-use besalt::serial;
-use besalt::serial::LineBuf;
-use besalt::types::*;
+use trona_posix::proc as posix;
+use trona::serial;
+use trona::serial::LineBuf;
+use trona::types::*;
 
 const STACK_TOUCH_BYTES: usize = 32 * 1024;
 fn puts(s: &[u8]) {
@@ -51,7 +51,7 @@ pub fn run() -> bool {
     puts(b"[TEST_FORK] Starting fork tests\n");
 
     // Test 1: getpid
-    let my_pid = unsafe { posix::posix_getpid() };
+    let my_pid = unsafe { trona_posix::posix_getpid() };
     { let mut lb = LineBuf::new(); lb.str(b"[TEST_FORK] Test 1: getpid = "); lb.dec(my_pid as u64); lb.str(b"\n"); lb.flush(); }
     if my_pid <= 0 {
         puts(b"[TEST_FORK] FAIL: getpid\n");
@@ -60,13 +60,13 @@ pub fn run() -> bool {
     puts(b"[TEST_FORK] Test 1: PASS\n");
 
     // Test 2: getppid
-    let my_ppid = unsafe { posix::posix_getppid() };
+    let my_ppid = unsafe { trona_posix::posix_getppid() };
     { let mut lb = LineBuf::new(); lb.str(b"[TEST_FORK] Test 2: getppid = "); lb.dec(my_ppid as u64); lb.str(b"\n"); lb.flush(); }
     puts(b"[TEST_FORK] Test 2: PASS\n");
 
     // Test 3: fork + waitpid
     puts(b"[TEST_FORK] Test 3: fork...\n");
-    let pid = posix::posix_fork();
+    let pid = trona_posix::posix_fork();
     if pid < 0 {
         puts(b"[TEST_FORK] FAIL: fork returned -1\n");
         return false;
@@ -74,13 +74,13 @@ pub fn run() -> bool {
 
     if pid == 0 {
         puts(b"[TEST_FORK] Child: I am the child, exiting with code 7\n");
-        unsafe { posix::posix_exit(7) };
+        unsafe { trona_posix::posix_exit(7) };
     }
 
     { let mut lb = LineBuf::new(); lb.str(b"[TEST_FORK] Parent: child PID = "); lb.dec(pid as u64); lb.str(b"\n"); lb.flush(); }
 
     let mut status: i32 = 0;
-    let ret = unsafe { posix::posix_waitpid(pid, &raw mut status) };
+    let ret = unsafe { trona_posix::posix_waitpid(pid, &raw mut status) };
     { let mut lb = LineBuf::new(); lb.str(b"[TEST_FORK] Parent: waitpid returned "); lb.dec(ret as u64); lb.str(b", status = "); lb.dec(status as u64); lb.str(b"\n"); lb.flush(); }
 
     if ret != pid || !wifexited(status) || wexitstatus(status) != 7 {
@@ -93,7 +93,7 @@ pub fn run() -> bool {
     puts(b"[TEST_FORK] Test 4: fork + stack headroom\n");
     let expected_parent = expected_stack_checksum(0x30);
     let expected_child = expected_stack_checksum(0x70);
-    let pid = posix::posix_fork();
+    let pid = trona_posix::posix_fork();
     if pid < 0 {
         puts(b"[TEST_FORK] FAIL: second fork returned -1\n");
         return false;
@@ -101,7 +101,7 @@ pub fn run() -> bool {
 
     if pid == 0 {
         let sum = stack_checksum(0x70);
-        unsafe { posix::posix_exit(if sum == expected_child { 11 } else { 12 }) };
+        unsafe { trona_posix::posix_exit(if sum == expected_child { 11 } else { 12 }) };
     }
 
     let parent_sum = stack_checksum(0x30);
@@ -117,7 +117,7 @@ pub fn run() -> bool {
     }
 
     let mut stack_status: i32 = 0;
-    let ret = unsafe { posix::posix_waitpid(pid, &raw mut stack_status) };
+    let ret = unsafe { trona_posix::posix_waitpid(pid, &raw mut stack_status) };
     if ret != pid || !wifexited(stack_status) || wexitstatus(stack_status) != 11 {
         let mut lb = LineBuf::new();
         lb.str(b"[TEST_FORK] FAIL: stack headroom child status=");

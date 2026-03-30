@@ -528,7 +528,7 @@ def create_efi_image(
     print(f"    EFI/BOOT/{efi_boot_name}")
     print(f"    EFI/SALTYOS/stage2.efi")
     print(f"    EFI/SALTYOS/stage3.bin")
-    print(f"    EFI/SALTYOS/kernel.elf")
+    print(f"    EFI/SALTYOS/kernite.elf")
     if initrd_path and initrd_path.exists():
         print(f"    EFI/SALTYOS/initrd.img")
     print()
@@ -538,7 +538,7 @@ def create_efi_image(
         f'EFI/BOOT/{efi_boot_name}': stage1_efi_path,
         'EFI/SALTYOS/stage2.efi': stage2_efi_path,
         'EFI/SALTYOS/stage3.bin': stage3_path,
-        'EFI/SALTYOS/kernel.elf': kernel_path,
+        'EFI/SALTYOS/kernite.elf': kernel_path,
     }
 
     for efi_path, file_path in efi_files.items():
@@ -662,7 +662,7 @@ def create_efi_image(
 
             subprocess.run([
                 'mcopy', '-i', str(esp_img),
-                str(kernel_path), '::/EFI/SALTYOS/kernel.elf'
+                str(kernel_path), '::/EFI/SALTYOS/kernite.elf'
             ], check=True)
 
             # Copy initrd if provided
@@ -899,7 +899,7 @@ def main():
         '--kernel',
         type=Path,
         default=None,
-        help='Kernel ELF path (defaults to build-dir/kernel/kernel.elf)'
+        help='Kernel ELF path (defaults to build-dir/kernite/kernite.elf)'
     )
     parser.add_argument(
         '--efi',
@@ -927,7 +927,7 @@ def main():
         stage1_efi = args.build_dir / 'boot' / efi_name
         stage2_efi = args.build_dir / 'boot' / 'stage2.efi'
         stage3 = args.build_dir / 'boot' / 'stage3_uefi.bin'
-        kernel = args.kernel if args.kernel is not None else args.build_dir / 'kernel' / 'kernel.elf'
+        kernel = args.kernel if args.kernel is not None else args.build_dir / 'kernite' / 'kernite.elf'
 
         # Validate paths
         for name, path in [('Stage1 EFI', stage1_efi), ('Stage2 EFI', stage2_efi),
@@ -955,7 +955,7 @@ def main():
         mbr = args.build_dir / 'boot' / 'mbr.bin'
         stage2 = args.build_dir / 'boot' / 'stage2.bin'
         stage3 = args.build_dir / 'boot' / 'stage3.bin'
-        kernel = args.kernel if args.kernel is not None else args.build_dir / 'kernel' / 'kernel.elf'
+        kernel = args.kernel if args.kernel is not None else args.build_dir / 'kernite' / 'kernite.elf'
 
         # Validate paths
         for name, path in [('MBR', mbr), ('Stage2', stage2),

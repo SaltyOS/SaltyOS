@@ -1,16 +1,16 @@
-# besaltc -- C Standard Library
+# basaltc -- C Standard Library
 
-This document describes the design and implementation of besaltc, SaltyOS's C standard library.
+This document describes the design and implementation of basaltc, SaltyOS's C standard library.
 
 ## Overview
 
-besaltc is a C standard library (`libc.so`) implemented primarily in Rust, providing a POSIX.1-2008 subset plus BSD extensions sufficient to run ported FreeBSD userland utilities (ls, cat, etc.). It is not a standalone library -- all system operations are delegated to libbesalt, which communicates with kernel services via IPC. This layered design means besaltc never issues syscalls directly; it translates C calling conventions into libbesalt's Rust API.
+basaltc is a C standard library (`libc.so`) implemented primarily in Rust, providing a POSIX.1-2008 subset plus BSD extensions sufficient to run ported FreeBSD userland utilities (ls, cat, etc.). It is not a standalone library -- all system operations are delegated to trona, which communicates with kernel services via IPC. This layered design means basaltc never issues syscalls directly; it translates C calling conventions into trona's Rust API.
 
 The library targets SaltyOS on x86_64 and aarch64. Multi-threading is supported via POSIX pthreads (mutexes, condition variables, barriers, semaphores, TLS). This dual-arch, multi-threaded design provides the foundation for a fully self-hosting OS.
 
 ## Design Goals
 
-**Port-compatible.** The primary goal is to compile unmodified FreeBSD utility source code. Function signatures, errno values, header layouts, and struct definitions match what ported C code expects. Where FreeBSD's libc exposes internal symbols (e.g., `__stdoutp`, `___runetype`, `__swbuf`), besaltc provides them.
+**Port-compatible.** The primary goal is to compile unmodified FreeBSD utility source code. Function signatures, errno values, header layouts, and struct definitions match what ported C code expects. Where FreeBSD's libc exposes internal symbols (e.g., `__stdoutp`, `___runetype`, `__swbuf`), basaltc provides them.
 
 **Minimal footprint.** The library uses static allocation wherever possible -- fixed-size pools for FILE streams (16), DIR handles (16), environment variables (128), and atexit handlers (32). The only dynamic allocation is through the malloc subsystem, which itself uses a simple sbrk-backed free list.
 
@@ -26,10 +26,10 @@ The library targets SaltyOS on x86_64 and aarch64. Multi-threading is supported 
 +------------------------------------------------+
 |         C program (main, compiled by clang)     |
 +------------------------------------------------+
-|  crt_start.o  |       libc.so (besaltc)          |
+|  crt_start.o  |       libc.so (basaltc)          |
 |   [_start]    |  [stdio, malloc, string, ...]   |
 +------------------------------------------------+
-|            libbesalt.so (Rust)                    |
+|            libtrona.so (Rust)                    |
 |  [syscall wrappers, POSIX layer, IPC helpers]   |
 +------------------------------------------------+
 |           SaltyOS kernel (Rust)                  |
@@ -39,7 +39,7 @@ The library targets SaltyOS on x86_64 and aarch64. Multi-threading is supported 
 
 The startup sequence:
 
-1. The dynamic linker (`rtld`) loads `libc.so` and `libbesalt.so`, then calls `_start` in `crt_start.o`
+1. The dynamic linker (`rtld`) loads `libc.so` and `libtrona.so`, then calls `_start` in `crt_start.o`
 2. `_start` (assembly) passes `main` and the stack pointer to `__libc_start_main`
 3. `__libc_start_main` (Rust) parses argc/argv/envp/auxv, initializes IPC context, memory manager, locale tables, and program name
 4. `main()` is called
@@ -49,33 +49,33 @@ The startup sequence:
 
 | Module | Source | Purpose | Backend |
 |--------|--------|---------|---------|
-| `crt.rs` | Rust | CRT startup, atexit, exit | libbesalt IPC + posix_mm init |
-| `stdio.rs` | Rust | Buffered I/O (FILE), printf/scanf | libbesalt posix_read/write |
-| `malloc.rs` | Rust | malloc/free/realloc/calloc | libbesalt posix_sbrk |
+| `crt.rs` | Rust | CRT startup, atexit, exit | trona IPC + posix_mm init |
+| `stdio.rs` | Rust | Buffered I/O (FILE), printf/scanf | trona posix_read/write |
+| `malloc.rs` | Rust | malloc/free/realloc/calloc | trona posix_sbrk |
 | `string.rs` | Rust | strlen, strcmp, strcpy, strlcpy, strerror | Pure Rust |
 | `mem.rs` | Rust | memcpy, memset, memmove, memcmp | Pure Rust (compiler intrinsics) |
 | `ctype.rs` | Rust | isalpha, isdigit, toupper, etc. | Pure Rust (lookup table) |
-| `unistd.rs` | Rust | open, close, read, write, stat, mmap, *at() | libbesalt posix_* |
-| `process.rs` | Rust | fork, exec*, waitpid, kill, getpid, uid/gid | libbesalt posix_* |
-| `signal.rs` | Rust | signal, sigaction, sigprocmask, sigset ops | libbesalt notifications |
-| `dirent.rs` | Rust | opendir, readdir, closedir, scandir, alphasort | libbesalt posix_opendir/readdir |
+| `unistd.rs` | Rust | open, close, read, write, stat, mmap, *at() | trona posix_* |
+| `process.rs` | Rust | fork, exec*, waitpid, kill, getpid, uid/gid | trona posix_* |
+| `signal.rs` | Rust | signal, sigaction, sigprocmask, sigset ops | trona notifications |
+| `dirent.rs` | Rust | opendir, readdir, closedir, scandir, alphasort | trona posix_opendir/readdir |
 | `env.rs` | Rust | getenv, setenv, unsetenv, environ | Static array (128 entries) |
 | `errno.rs` | Rust | errno global, __errno_location | Static `ERRNO` variable |
-| `time.rs` | Rust | time, gmtime, localtime, mktime, strftime, tzset | libbesalt posix_clock_gettime |
+| `time.rs` | Rust | time, gmtime, localtime, mktime, strftime, tzset | trona posix_clock_gettime |
 | `stdlib.rs` | Rust | atoi, strtol, strtod, qsort, bsearch, rand | Pure Rust |
 | `locale.rs` | Rust | setlocale (C-only), localeconv, gettext, nl_langinfo | Pure Rust (hardcoded C locale) |
 | `wchar.rs` | Rust | Wide char/multibyte (UTF-8, MB_CUR_MAX=4) | Pure Rust (full UTF-8 codec) |
 | `regex.rs` | Rust | POSIX BRE/ERE regex (backtracking NFA) | Pure Rust |
 | `sysinfo.rs` | Rust | uname, sysconf, getrlimit, gethostname | Pure Rust (hardcoded values) |
 | `pwd.rs` | Rust | getpwnam, getpwuid, getgrnam, user_from_uid | Pure Rust (root-only) |
-| `glob.rs` | Rust | glob() pathname pattern matching | libbesalt posix_opendir |
-| `select.rs` | Rust | select/pselect wrappers | libbesalt posix_select |
+| `glob.rs` | Rust | glob() pathname pattern matching | trona posix_opendir |
+| `select.rs` | Rust | select/pselect wrappers | trona posix_select |
 | `math.rs` | Rust | Math functions (fabs, sqrt, pow, sin, etc.) | Pure Rust + x87/NEON |
 | `misc.rs` | Rust | dirname, basename, utime, syslog stubs | Mixed |
 | `pthread.rs` | Rust | pthreads, mutexes, condvars, semaphores, TLS | salty::sync / salty::tls |
 | `search.rs` | Rust | tsearch, tfind, tdelete, twalk | Pure Rust |
 | `dlfcn.rs` | Rust | dlopen/dlsym stubs | Returns errors |
-| `socket.rs` | Rust | Socket API (socket, bind, connect, etc.) | libbesalt posix_socket |
+| `socket.rs` | Rust | Socket API (socket, bind, connect, etc.) | trona posix_socket |
 | `inet.rs` | Rust | inet_aton, htonl, getservbyname, etc. | Pure Rust |
 | `getrandom.rs` | Rust | getrandom, getentropy | salty::syscall (RDRAND) |
 | `getopt.rs` | Rust | POSIX getopt + GNU getopt_long/getopt_long_only | Pure Rust |
@@ -83,7 +83,7 @@ The startup sequence:
 | `iconv.rs` | Rust | Character encoding conversion (8 encodings) | Pure Rust |
 | `termios.rs` | Rust | Terminal I/O stubs | Returns defaults |
 | `termcap.rs` | Rust | termcap/terminfo stubs | Returns defaults |
-| `ioctl.rs` | Rust | ioctl stubs | libbesalt posix_ioctl |
+| `ioctl.rs` | Rust | ioctl stubs | trona posix_ioctl |
 | `jobctl.rs` | Rust | Job control stubs (setpgid, tcgetpgrp) | Hardcoded returns |
 | `compat/` | Rust | FreeBSD compatibility layer | See below |
 | `crt_start.S` | ASM | `_start` entry point | Calls `__libc_start_main` |
@@ -95,8 +95,8 @@ The startup sequence:
 
 Writing a C standard library in Rust is unusual but practical here:
 
-1. **Shared toolchain.** SaltyOS already uses Rust everywhere (kernel, libbesalt, userland). Adding a C-only library would require maintaining separate build infrastructure.
-2. **Backend reuse.** Most besaltc functions are thin wrappers around libbesalt's Rust API. Writing them in Rust means direct function calls instead of FFI thunks.
+1. **Shared toolchain.** SaltyOS already uses Rust everywhere (kernel, trona, userland). Adding a C-only library would require maintaining separate build infrastructure.
+2. **Backend reuse.** Most basaltc functions are thin wrappers around trona's Rust API. Writing them in Rust means direct function calls instead of FFI thunks.
 3. **Controlled unsafety.** Each `unsafe` block is narrow and documented. The Rust compiler catches logic errors in the safe portions (off-by-one, type mismatches) that would silently compile in C.
 4. **No performance penalty.** The exported functions use `extern "C"` ABI. From the caller's perspective, they are indistinguishable from C implementations.
 
@@ -139,7 +139,7 @@ FreeBSD compatibility aliases (`__stdoutp`, `__stdinp`, `__stderrp`, `__isthread
 
 ### malloc Implementation
 
-A first-fit free-list allocator backed by `sbrk()` (via libbesalt's `posix_sbrk`). Every allocation has a 16-byte `BlockHeader` placed immediately before the returned pointer:
+A first-fit free-list allocator backed by `sbrk()` (via trona's `posix_sbrk`). Every allocation has a 16-byte `BlockHeader` placed immediately before the returned pointer:
 
 ```
 [BlockHeader (16 bytes)] [user data (aligned to 16)]
@@ -159,15 +159,15 @@ The CRT startup parses the SaltyOS auxiliary vector (`auxv`) to discover per-pro
 
 | Tag | Constant | Purpose |
 |-----|----------|---------|
-| `0x1000` | `AT_BESALT_UNTYPED` | Untyped memory cap (rtld bootstrap only; general frame alloc via mmsrv) |
-| `0x1001` | `AT_BESALT_VSPACE` | VSpace capability slot |
-| `0x1002` | `AT_BESALT_SCRATCH` | Scratch virtual address region |
-| `0x1005` | `AT_BESALT_FRAME_SLOT` | Frame slot for page mapping |
-| `0x1007` | `AT_BESALT_SLOT_BASE` | Slot allocator pool base |
-| `0x1008` | `AT_BESALT_SLOT_COUNT` | Slot allocator pool size |
-| `0x1009` | `AT_BESALT_EXPAND_EP` | Endpoint for requesting more slots |
+| `0x1000` | `AT_TRONA_UNTYPED` | Untyped memory cap (rtld bootstrap only; general frame alloc via mmsrv) |
+| `0x1001` | `AT_TRONA_VSPACE` | VSpace capability slot |
+| `0x1002` | `AT_TRONA_SCRATCH` | Scratch virtual address region |
+| `0x1005` | `AT_TRONA_FRAME_SLOT` | Frame slot for page mapping |
+| `0x1007` | `AT_TRONA_SLOT_BASE` | Slot allocator pool base |
+| `0x1008` | `AT_TRONA_SLOT_COUNT` | Slot allocator pool size |
+| `0x1009` | `AT_TRONA_EXPAND_EP` | Endpoint for requesting more slots |
 
-The RTLD may have already consumed some slots while loading shared libraries, so its exported `__besalt_slot_base` / `__besalt_slot_count` take precedence over raw auxv values when non-zero.
+The RTLD may have already consumed some slots while loading shared libraries, so its exported `__trona_slot_base` / `__trona_slot_count` take precedence over raw auxv values when non-zero.
 
 After slot allocation setup, the heap region is placed 1 MB after the scratch area, and the mmap region starts 16 MB after the heap base.
 
@@ -176,13 +176,13 @@ After slot allocation setup, the heap region is placed 1 MB after the scratch ar
 | Tag | Name | Type | Description |
 |-----|------|------|-------------|
 | `0x0000` | `AT_NULL` | - | End of auxv |
-| `0x1000` | `AT_BESALT_UNTYPED` | slot | Untyped memory cap (rtld bootstrap only; general frame allocation via mmsrv) |
-| `0x1001` | `AT_BESALT_VSPACE` | slot | VSpace cap for mapping frames |
-| `0x1002` | `AT_BESALT_SCRATCH` | vaddr | Scratch region base address |
-| `0x1005` | `AT_BESALT_FRAME_SLOT` | slot | CSpace slot for temporary frames |
-| `0x1007` | `AT_BESALT_SLOT_BASE` | slot | First available cap slot |
-| `0x1008` | `AT_BESALT_SLOT_COUNT` | count | Number of available cap slots |
-| `0x1009` | `AT_BESALT_EXPAND_EP` | slot | Endpoint to request more slots from procmgr |
+| `0x1000` | `AT_TRONA_UNTYPED` | slot | Untyped memory cap (rtld bootstrap only; general frame allocation via mmsrv) |
+| `0x1001` | `AT_TRONA_VSPACE` | slot | VSpace cap for mapping frames |
+| `0x1002` | `AT_TRONA_SCRATCH` | vaddr | Scratch region base address |
+| `0x1005` | `AT_TRONA_FRAME_SLOT` | slot | CSpace slot for temporary frames |
+| `0x1007` | `AT_TRONA_SLOT_BASE` | slot | First available cap slot |
+| `0x1008` | `AT_TRONA_SLOT_COUNT` | count | Number of available cap slots |
+| `0x1009` | `AT_TRONA_EXPAND_EP` | slot | Endpoint to request more slots from procmgr |
 
 ## FreeBSD Compatibility Layer
 
@@ -233,7 +233,7 @@ FreeBSD compatibility code that was previously in C has been converted to Rust:
 
 ### Headers
 
-besaltc provides 70+ headers in `lib/besaltc/include/` organized to match standard POSIX/BSD layout:
+basaltc provides 70+ headers in `lib/basaltc/include/` organized to match standard POSIX/BSD layout:
 
 - Standard C: `stdio.h`, `stdlib.h`, `string.h`, `ctype.h`, `errno.h`, `math.h`, `stdint.h`, `stddef.h`, `stdarg.h`, `stdbool.h`, `limits.h`, `assert.h`, `setjmp.h`, `inttypes.h`, `time.h`, `locale.h`, `wchar.h`, `wctype.h`, `signal.h`, `fcntl.h`
 - POSIX: `unistd.h`, `dirent.h`, `pwd.h`, `grp.h`, `poll.h`, `regex.h`, `fnmatch.h`, `glob.h`, `getopt.h`, `termios.h`, `sched.h`, `libgen.h`, `utime.h`
@@ -260,12 +260,12 @@ besaltc provides 70+ headers in `lib/besaltc/include/` organized to match standa
 
 ## Build Pipeline
 
-besaltc is built in three steps, then linked into a single shared object. All logic is in Rust -- only assembly stubs remain as non-Rust sources:
+basaltc is built in three steps, then linked into a single shared object. All logic is in Rust -- only assembly stubs remain as non-Rust sources:
 
 ```
 Step 1: Rust sources
   src/lib.rs ─── rustc ───> saltyc.o + saltyc.rmeta
-                 --extern salty=libbesalt.rmeta
+                 --extern salty=trona.rmeta
                  --crate-type=lib
 
 Step 2: Assembly sources
@@ -283,6 +283,6 @@ A separate freestanding `string.c` provides basic string/memory functions for th
 
 ## Cross-References
 
-- **[ports.md](ports.md)** -- How besaltc enables cross-compilation of third-party C software
-- **[posix.md](posix.md)** -- POSIX compatibility layer in libbesalt that besaltc delegates to
-- **[besaltc-api.md](../spec/besaltc-api.md)** -- Complete API reference with function signatures
+- **[ports.md](ports.md)** -- How basaltc enables cross-compilation of third-party C software
+- **[posix.md](posix.md)** -- POSIX compatibility layer in trona that basaltc delegates to
+- **[basaltc-api.md](../spec/basaltc-api.md)** -- Complete API reference with function signatures

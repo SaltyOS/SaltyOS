@@ -41,10 +41,10 @@ mod mmap;
 mod pool;
 mod shm;
 
-use besalt::consts::*;
-use besalt::invoke;
-use besalt::ipc;
-use besalt::types::*;
+use trona::consts::*;
+use trona::invoke;
+use trona::ipc;
+use trona::types::*;
 
 use types::*;
 
@@ -80,7 +80,7 @@ unsafe fn self_mmap(num_pages: usize) -> *mut u8 {
     unsafe {
         let base = *(&raw const SELF_MMAP_NEXT);
         for i in 0..num_pages {
-            let slot = match besalt::slot_alloc::slot_alloc() {
+            let slot = match trona::slot_alloc::slot_alloc() {
                 Some(s) => s,
                 None => return core::ptr::null_mut(),
             };
@@ -376,7 +376,7 @@ unsafe fn init_dynamic_pools() {
             *(&raw mut FREE_SLOTS_PTR) = slot_ptr as *mut u32;
             *(&raw mut FREE_SLOTS_CAP) = cap;
         } else {
-            besalt::uwarn!(|_lb| {
+            trona::uwarn!(|_lb| {
                 _lb.str(b"[MMSRV] WARN: FREE_SLOTS alloc failed, using fallback\n");
             });
         }
@@ -389,12 +389,12 @@ unsafe fn init_dynamic_pools() {
             *(&raw mut FRAME_POOL_PTR) = pool_ptr as *mut u64;
             *(&raw mut FRAME_POOL_CAP) = cap;
         } else {
-            besalt::uwarn!(|_lb| {
+            trona::uwarn!(|_lb| {
                 _lb.str(b"[MMSRV] WARN: FRAME_POOL alloc failed, using fallback\n");
             });
         }
 
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[MMSRV] dynamic pools: cap=");
             _lb.hex(cap as u64);
             _lb.str(b" (");
@@ -416,11 +416,11 @@ static mut SHM_CAP: usize = 0;
 // ---------------------------------------------------------------------------
 
 fn ipc_ctx() -> *mut IpcContext {
-    besalt::tls::current_ipc_ctx()
+    trona_posix::tls::current_ipc_ctx()
 }
 
 fn signal_ready() {
-    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -450,7 +450,7 @@ unsafe fn resolve_procmgr_ep() -> Cap {
 
         // Build POSIX_NS_LOOKUP request for "procmgr"
         let name = b"procmgr";
-        let mut msg = BesaltMsg::zeroed();
+        let mut msg = TronaMsg::zeroed();
         msg.label = POSIX_NS_LOOKUP;
         msg.regs[0] = name.len() as u64;
         msg.length = 1 + (name.len() as u64 + 7) / 8;
@@ -461,7 +461,7 @@ unsafe fn resolve_procmgr_ep() -> Cap {
             core::ptr::write(dst.add(i), name[i]);
         }
 
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         let err = ipc::call_ctx(
             ipc_ctx(),
             CAP_NAMESERV,
@@ -469,16 +469,16 @@ unsafe fn resolve_procmgr_ep() -> Cap {
             &raw mut reply,
         );
 
-        if err != 0 || reply.label != BESALT_OK {
+        if err != 0 || reply.label != TRONA_OK {
             recycle_empty_slot(ep_slot);
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[MMSRV] procmgr lookup via nameserv failed\n");
             });
             return 0;
         }
 
         *(&raw mut PROCMGR_EP) = ep_slot;
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[MMSRV] Resolved procmgr EP via nameserv\n");
         });
         ep_slot
@@ -505,13 +505,13 @@ unsafe fn request_untyped_from_procmgr(size_bits: u64) -> Cap {
         ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, recv_slot, 0);
 
         // Build request message
-        let mut msg = BesaltMsg::zeroed();
+        let mut msg = TronaMsg::zeroed();
         msg.label = POSIX_PM_REQUEST_UNTYPED;
         msg.length = 1;
         msg.regs[0] = size_bits;
 
         // Send request and wait for reply
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         let err = ipc::call_ctx(
             ipc_ctx(),
             procmgr_ep,
@@ -519,14 +519,14 @@ unsafe fn request_untyped_from_procmgr(size_bits: u64) -> Cap {
             &raw mut reply,
         );
 
-        if err != 0 || reply.label != BESALT_OK {
+        if err != 0 || reply.label != TRONA_OK {
             // Failed — recycle the slot
             recycle_empty_slot(recv_slot);
             return 0;
         }
 
         // The sub-untyped cap should now be at recv_slot
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[MMSRV] Received sub-untyped from procmgr at slot ");
             _lb.hex(recv_slot);
             _lb.str(b"\n");
@@ -541,7 +541,7 @@ unsafe fn retype_any(obj_type: u64, size_bits: u64, dest_slot: Cap) -> i32 {
     unsafe {
         let ut_count = *(&raw const UT_COUNT);
         if ut_count == 0 {
-            return BESALT_OUT_OF_MEMORY as i32;
+            return TRONA_OUT_OF_MEMORY as i32;
         }
 
         let start = {
@@ -576,7 +576,7 @@ unsafe fn retype_any(obj_type: u64, size_bits: u64, dest_slot: Cap) -> i32 {
         }
 
         // All sources exhausted — log per-source diagnostics
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[MMSRV] retype_any: all ");
             _lb.hex(ut_count as u64);
             _lb.str(b" sources failed, type=");
@@ -588,7 +588,7 @@ unsafe fn retype_any(obj_type: u64, size_bits: u64, dest_slot: Cap) -> i32 {
                 continue;
             }
             let err = invoke::untyped_retype(sources[i].cap, obj_type, size_bits, dest_slot);
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"  src[");
                 _lb.hex(i as u64);
                 _lb.str(b"] cap=");
@@ -624,7 +624,7 @@ unsafe fn retype_any(obj_type: u64, size_bits: u64, dest_slot: Cap) -> i32 {
             }
         }
 
-        BESALT_OUT_OF_MEMORY as i32
+        TRONA_OUT_OF_MEMORY as i32
     }
 }
 
@@ -659,7 +659,7 @@ unsafe fn init_untyped_pool() {
         *(&raw mut UT_COUNT) = count;
         *(&raw mut UT_HINT) = 0;
 
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[MMSRV] untyped pool: ");
             _lb.hex(count as u64);
             _lb.str(b" sources\n");
@@ -674,7 +674,7 @@ unsafe fn init_untyped_pool() {
 unsafe fn register_with_nameserv() -> bool {
     unsafe {
         let name = b"mmsrv";
-        let mut msg = BesaltMsg::zeroed();
+        let mut msg = TronaMsg::zeroed();
         msg.label = POSIX_NS_REGISTER;
         msg.length = 1 + ((name.len() + 7) / 8) as u64;
         msg.regs[0] = name.len() as u64;
@@ -686,10 +686,10 @@ unsafe fn register_with_nameserv() -> bool {
         // Send our server EP cap
         ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
 
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV, &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != BESALT_OK {
-            besalt::uerror!(|_lb| {
+        if err != 0 || reply.label != TRONA_OK {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[MMSRV] nameserv register failed err=");
                 _lb.hex(err as u64);
                 _lb.str(b" label=");
@@ -740,7 +740,7 @@ pub(crate) fn recycled_slot_alloc() -> Option<u64> {
             }
         }
     }
-    besalt::slot_alloc::slot_alloc()
+    trona::slot_alloc::slot_alloc()
 }
 
 /// Delete a capability and return its CNode slot to the free pool for reuse.
@@ -853,14 +853,14 @@ pub(crate) fn alloc_frame() -> Option<Cap> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[MMSRV] SaltyOS memory server starting\n");
     });
 
     // Set up IPC buffer
     let err = invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, IPC_BUF_VADDR);
     if err != 0 {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[MMSRV] FAIL: set IPC buffer err=");
             _lb.hex(err as u64);
             _lb.str(b"\n");
@@ -871,23 +871,23 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
     }
 
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[MMSRV] IPC buffer ready\n");
     });
 
     // Initialize per-process slot allocator from RTLD-exported globals.
     // self_mmap() depends on slot_alloc for temporary frame-cap slots.
     unsafe {
-        let base = *(&raw const besalt::__besalt_slot_base);
-        let count = *(&raw const besalt::__besalt_slot_count);
-        let cspace_ntfn = *(&raw const besalt::__besalt_cspace_ntfn);
+        let base = *(&raw const trona::__trona_slot_base);
+        let count = *(&raw const trona::__trona_slot_count);
+        let cspace_ntfn = *(&raw const trona::__trona_cspace_ntfn);
         // Clamp count so the bump allocator cannot reach the receive-slot pool.
         let max_count = RECV_SLOT_BASE.saturating_sub(base);
         let count = if count > max_count { max_count } else { count };
         if base != 0 {
-            besalt::slot_alloc::slot_alloc_init(base, count, cspace_ntfn);
+            trona::slot_alloc::slot_alloc_init(base, count, cspace_ntfn);
         } else {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[MMSRV] FATAL: slot pool not provided by RTLD/auxv\n");
             });
             idle();
@@ -908,7 +908,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     unsafe {
         let ptr = self_mmap(1);
         if ptr.is_null() {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[MMSRV] FATAL: client table alloc failed\n");
             });
             idle();
@@ -921,7 +921,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     unsafe {
         let ptr = self_mmap(1);
         if ptr.is_null() {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[MMSRV] FATAL: SHM table alloc failed\n");
             });
             idle();
@@ -934,7 +934,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     unsafe {
         let slot = alloc_recv_slot();
         if slot == 0 {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[MMSRV] FATAL: no receive slots\n");
             });
             idle();
@@ -945,28 +945,28 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // Register with nameserv
     if !unsafe { register_with_nameserv() } {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[MMSRV] FATAL: nameserv registration failed\n");
         });
         idle();
     }
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[MMSRV] registered with nameserv\n");
     });
 
     // Signal readiness to init
     signal_ready();
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[MMSRV] ready\n");
     });
 
     // Initial recv
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     let mut badge: u64 = 0;
 
     let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
     if err != 0 {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[MMSRV] initial recv failed\n");
         });
         idle();
@@ -974,7 +974,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // Server loop
     loop {
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         // Set to true for unrecoverable faults: use recv() instead of reply_recv()
         // so the faulting thread stays permanently blocked rather than re-faulting.
         let mut skip_reply = false;
@@ -1028,12 +1028,12 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                         // 1. Find client by badge
                         let client_ptr = client::find_client_by_badge(badge);
                         if client_ptr.is_null() {
-                            besalt::uerror!(|_lb| {
+                            trona::uerror!(|_lb| {
                                 _lb.str(b"[MMSRV] VMFault: unknown client badge=");
                                 _lb.hex(badge);
                                 _lb.str(b"\n");
                             });
-                            reply.label = BESALT_INVALID_OPERATION;
+                            reply.label = TRONA_INVALID_OPERATION;
                             break 'fault;
                         }
 
@@ -1044,7 +1044,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                             // Don't reply: leave the faulting thread permanently
                             // FaultBlocked instead of re-faulting in a tight loop.
                             let rc = (*client_ptr).region_count;
-                            besalt::uerror!(|_lb| {
+                            trona::uerror!(|_lb| {
                                 _lb.str(b"[MMSRV] Segfault: badge=");
                                 _lb.hex(badge);
                                 _lb.str(b" addr=");
@@ -1078,7 +1078,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                                 for ri in 0..rc {
                                     let rd = &*regs.add(ri);
                                     if rd.active {
-                                        besalt::uerror!(|_lb| {
+                                        trona::uerror!(|_lb| {
                                             _lb.str(b"  r");
                                             _lb.hex(ri as u64);
                                             _lb.str(b"=[");
@@ -1104,7 +1104,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                         // faults are reported separately in MR3.
                         if (error_code & 0x1) != 0 {
                             let write_fault = (error_code & 0x2) != 0;
-                            besalt::uerror!(|_lb| {
+                            trona::uerror!(|_lb| {
                                 _lb.str(b"[MMSRV] protection fault: badge=");
                                 _lb.hex(badge);
                                 _lb.str(b" kind=");
@@ -1141,7 +1141,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                                 for ri in 0..rc {
                                     let rd = &*regs.add(ri);
                                     if rd.active {
-                                        besalt::uerror!(|_lb| {
+                                        trona::uerror!(|_lb| {
                                             _lb.str(b"  r");
                                             _lb.hex(ri as u64);
                                             _lb.str(b"=[");
@@ -1169,7 +1169,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                         // Commit the page via mo_commit, then map into VSpace.
                         if (*region).mo_cap == 0 {
                             // No MO — region is corrupted or legacy. Segfault.
-                            besalt::uerror!(|_lb| {
+                            trona::uerror!(|_lb| {
                                 _lb.str(b"[MMSRV] VMFault: region has no MO badge=");
                                 _lb.hex(badge);
                                 _lb.str(b" addr=");
@@ -1189,7 +1189,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                             1,
                         );
                         if err != 0 || committed != 1 {
-                            besalt::uerror!(|_lb| {
+                            trona::uerror!(|_lb| {
                                 _lb.str(b"[MMSRV] VMFault: mo_commit failed badge=");
                                 _lb.hex(badge);
                                 _lb.str(b" addr=");
@@ -1198,7 +1198,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                                 _lb.hex(err as u64);
                                 _lb.str(b"\n");
                             });
-                            reply.label = BESALT_OUT_OF_MEMORY;
+                            reply.label = TRONA_OUT_OF_MEMORY;
                             break 'fault;
                         }
 
@@ -1214,11 +1214,11 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                         // AlreadyMapped is OK (page was already present
                         // from the spawn-time vspace_map_mo).
 
-                        reply.label = BESALT_OK;
+                        reply.label = TRONA_OK;
                     } // end 'fault
                 }
                 _ => {
-                    besalt::uwarn!(|_lb| {
+                    trona::uwarn!(|_lb| {
                         _lb.str(b"[MMSRV] unknown label=");
                         _lb.hex(msg.label);
                         _lb.str(b" badge=");
@@ -1249,7 +1249,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     if msg.label <= 4 {
                         skip_reply = true;
                     } else {
-                        reply.label = BESALT_INVALID_OPERATION;
+                        reply.label = TRONA_INVALID_OPERATION;
                     }
                 }
             }
@@ -1280,7 +1280,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
             };
             if err != 0 {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[MMSRV] recv failed err=");
                     _lb.hex(err as u64);
                     _lb.str(b"\n");
@@ -1298,7 +1298,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 )
             };
             if err != 0 {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[MMSRV] reply_recv failed err=");
                     _lb.hex(err as u64);
                     _lb.str(b"\n");
@@ -1313,6 +1313,6 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
 fn idle() -> ! {
     loop {
-        besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 }

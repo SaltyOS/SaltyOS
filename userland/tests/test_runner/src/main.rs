@@ -8,7 +8,8 @@
 #![no_std]
 #![no_main]
 
-extern crate besalt;
+extern crate trona;
+extern crate trona_posix;
 
 mod test_hello;
 mod test_fs;
@@ -28,10 +29,10 @@ mod test_sse;
 #[cfg(target_arch = "aarch64")]
 mod test_neon;
 
-use besalt::consts::*;
-use besalt::posix;
-use besalt::serial;
-use besalt::serial::LineBuf;
+use trona::consts::*;
+use trona_posix::proc as posix;
+use trona::serial;
+use trona::serial::LineBuf;
 
 const CAP_READINESS_NTFN: u64 = 14;
 
@@ -40,7 +41,7 @@ fn puts(s: &[u8]) {
 }
 
 fn signal_ready() {
-    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 #[unsafe(no_mangle)]
@@ -102,9 +103,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     if failed == 0 {
         puts(b"[TEST_RUNNER] ALL TESTS PASSED\n");
-        unsafe { posix::posix_exit(42) };
+        unsafe { trona_posix::posix_exit(42) };
     } else {
         puts(b"[TEST_RUNNER] TESTS FAILED\n");
-        unsafe { posix::posix_exit(1) };
+        unsafe { trona_posix::posix_exit(1) };
     }
 }

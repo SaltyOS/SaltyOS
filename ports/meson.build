@@ -112,8 +112,8 @@ foreach pname : _ordered_ports
 
   _pt = custom_target('port_' + pname,
     output: [pname + '.manifest'],
-    depends: [port_tool, libbesalt_so, libc_so, libcxx_so, crt_start_obj, sysroot_target] + _extra_deps,
-    depend_files: files(port_file) + besaltc_header_files,
+    depends: [port_tool, libtrona_so, libc_so, libcxx_so, crt_start_obj, sysroot_target] + _extra_deps,
+    depend_files: files(port_file) + basaltc_header_files,
     command: [port_tool, 'build',
       meson.current_source_dir() / pname,
       '-o', '@OUTDIR@',

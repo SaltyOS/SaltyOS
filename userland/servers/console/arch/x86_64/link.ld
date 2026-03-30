@@ -2,11 +2,11 @@
  * SPDX-License-Identifier: GPL-2.0-only
  *
  * Produces ET_DYN (PIE) ELF with base address 0.
- * Includes PLT/GOT sections for dynamic linking via ld-besalt.so.
+ * Includes PLT/GOT sections for dynamic linking via ld-trona.so.
  *
  * SIZEOF_HEADERS ensures the ELF header and program headers are placed
  * inside the first PT_LOAD segment, making them accessible at runtime
- * for the dynamic linker (ld-besalt.so) to parse PT_DYNAMIC, PT_PHDR, etc.
+ * for the dynamic linker (ld-trona.so) to parse PT_DYNAMIC, PT_PHDR, etc.
  */
 
 OUTPUT_FORMAT(elf64-x86-64)

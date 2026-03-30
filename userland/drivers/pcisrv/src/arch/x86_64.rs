@@ -1,7 +1,7 @@
 //! x86_64 PCI config space access via I/O port mechanism 1 (ports 0xCF8/0xCFC).
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::invoke;
+use trona::invoke;
 
 /// PCI config space IoPort cap slot (received via CopyCap from init slot 15).
 const CAP_PCI_IOPORT: u64 = 64;

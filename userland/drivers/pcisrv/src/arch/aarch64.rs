@@ -6,8 +6,8 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::consts::*;
-use besalt::invoke;
+use trona::consts::*;
+use trona::invoke;
 
 /// ECAM device untyped cap slot (received via CopyCap from init slot 15).
 const CAP_ECAM_DEVUT: u64 = 64;
@@ -42,7 +42,7 @@ pub fn pci_init() {
     );
 
     if err != 0 || mapped != num_pages {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[pcisrv] ECAM map failed err=");
             _lb.hex(err as u64);
             _lb.str(b" mapped=");

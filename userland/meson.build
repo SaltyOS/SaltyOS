@@ -6,7 +6,7 @@
 
 # Core system services (boot-essential)
 subdir('core/init')
-subdir('core/rtld')
+# rtld is now built from lib/trona/rtld/ (ld_trona_so)
 subdir('core/nameserv')
 subdir('core/mmsrv')
 subdir('core/procmgr')

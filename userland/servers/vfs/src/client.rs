@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Per-client state management and file descriptor cleanup on exit.
 
-use besalt::consts::*;
-use besalt::ipc;
-use besalt::types::*;
+use trona::consts::*;
+use trona::ipc;
+use trona::types::*;
 
 use crate::consts::*;
 use crate::path::resolve_path;
@@ -66,7 +66,7 @@ pub(crate) unsafe fn get_client(badge: u64) -> *mut ClientState {
     }
 }
 
-pub(crate) unsafe fn extract_path(msg: *const BesaltMsg, reg_offset: usize, path: *mut u8) -> u8 {
+pub(crate) unsafe fn extract_path(msg: *const TronaMsg, reg_offset: usize, path: *mut u8) -> u8 {
     unsafe {
         let mut path_len = (*msg).regs[reg_offset] as u8;
         if (path_len as usize) > MAX_PATH_LEN {
@@ -86,21 +86,21 @@ pub(crate) unsafe fn extract_path(msg: *const BesaltMsg, reg_offset: usize, path
 /// Path data starts at `regs[hdr_regs+2]`, old path first (8-byte aligned), then new path.
 /// Returns `Some((old_len, new_len))` on success, or sets `(*reply).label` and returns `None`.
 pub(crate) unsafe fn extract_dual_paths(
-    msg: *const BesaltMsg,
+    msg: *const TronaMsg,
     hdr_regs: usize,
     old_path: *mut u8,
     new_path: *mut u8,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
 ) -> Option<(u8, u8)> {
     unsafe {
         let old_len = (*msg).regs[hdr_regs] as u8;
         let new_len = (*msg).regs[hdr_regs + 1] as u8;
         if old_len == 0 || new_len == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return None;
         }
         if (old_len as usize) > MAX_PATH_LEN || (new_len as usize) > MAX_PATH_LEN {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return None;
         }
         let data_start = hdr_regs + 2;
@@ -108,11 +108,11 @@ pub(crate) unsafe fn extract_dual_paths(
         let new_regs = ((new_len as usize) + 7) / 8;
         let required = data_start + old_regs + new_regs;
         if required > 20 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return None;
         }
         if required as u64 > (*msg).length {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return None;
         }
         // SAFETY: required <= 20 <= regs.len(), old_len <= MAX_PATH_LEN, buffers are caller-provided.
@@ -175,8 +175,8 @@ pub(crate) unsafe fn send_client_exit_error(reply_slot: u64) {
         if reply_slot == 0 {
             return;
         }
-        let mut wake = BesaltMsg::zeroed();
-        wake.label = BESALT_INVALID_OPERATION;
+        let mut wake = TronaMsg::zeroed();
+        wake.label = TRONA_INVALID_OPERATION;
         ipc::send_ctx(ipc_ctx(), reply_slot, &raw const wake);
     }
 }
@@ -339,7 +339,7 @@ pub(crate) unsafe fn cleanup_client_state(dead_badge: u64) {
         }
 
         // Notify ttyd to release any controlling terminal owned by this dead client.
-        let mut treq = BesaltMsg::zeroed();
+        let mut treq = TronaMsg::zeroed();
         treq.label = TTYD_CLIENT_EXIT;
         treq.regs[0] = dead_badge;
         treq.length = 1;
@@ -352,10 +352,10 @@ pub(crate) unsafe fn cleanup_client_state(dead_badge: u64) {
     }
 }
 
-pub(crate) unsafe fn handle_client_exit(msg: *const BesaltMsg, reply: *mut BesaltMsg) {
+pub(crate) unsafe fn handle_client_exit(msg: *const TronaMsg, reply: *mut TronaMsg) {
     unsafe {
         let dead_badge = (*msg).regs[0];
         cleanup_client_state(dead_badge);
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }

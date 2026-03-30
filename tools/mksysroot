@@ -18,19 +18,19 @@ from pathlib import Path
 
 # Required files: (sysroot destination relative to usr/lib, source relative to build-dir)
 REQUIRED_BUILD_FILES = [
-    ("libc.so",              "lib/besalt/c/libc.so"),
-    ("libbesalt.so",         "lib/besalt/lib/libbesalt.so"),
-    ("crt_start.o",          "lib/besalt/c/crt_start.o"),
+    ("libc.so",              "lib/basalt/c/libc.so"),
+    ("libtrona.so",          "lib/trona/libtrona.so"),
+    ("crt_start.o",          "lib/basalt/c/crt_start.o"),
     ("core.o",               "rust/core.o"),
     ("compiler_builtins.o",  "rust/compiler_builtins.o"),
-    ("ld-besalt.so",         "userland/core/rtld/ld-besalt.so"),
+    ("ld-trona.so",          "lib/trona/rtld/ld-trona.so"),
 ]
 
 # Optional files: copied if present, warned if missing
 OPTIONAL_BUILD_FILES = [
-    ("libbesalt.rmeta", "lib/besalt/lib/libbesalt.rmeta"),
-    ("besaltc.rmeta",   "lib/besalt/c/besaltc.rmeta"),
-    ("libc++.so",       "lib/besalt/cpp/libc++.so"),
+    ("trona.rmeta",     "lib/trona/trona.rmeta"),
+    ("basaltc.rmeta",   "lib/basalt/c/basaltc.rmeta"),
+    ("libc++.so",       "lib/basalt/cpp/libc++.so"),
 ]
 
 
@@ -82,12 +82,12 @@ def main():
     build_dir = args.build_dir.resolve()
     output_dir = args.output.resolve()
 
-    header_src = repo_root / "lib" / "besalt" / "c" / "include"
-    pie_linker_script = repo_root / "lib" / "besalt" / "saltyos-pie.ld"
+    header_src = repo_root / "lib" / "basalt" / "c" / "include"
+    pie_linker_script = repo_root / "lib" / "trona" / "trona-pie.ld"
     cxx_inc_src = repo_root / "toolchain" / "llvm-project" / "libcxx" / "include"
     cxxabi_inc_src = repo_root / "toolchain" / "llvm-project" / "libcxxabi" / "include"
-    cxx_config_site = repo_root / "lib" / "besalt" / "cpp" / "__config_site"
-    cxx_assertion_handler = repo_root / "lib" / "besalt" / "cpp" / "__assertion_handler"
+    cxx_config_site = repo_root / "lib" / "basalt" / "cpp" / "__config_site"
+    cxx_assertion_handler = repo_root / "lib" / "basalt" / "cpp" / "__assertion_handler"
 
     # Validate sources exist
     if not build_dir.is_dir():

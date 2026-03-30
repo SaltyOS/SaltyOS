@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Poll and epoll subsystem for event multiplexing.
 
-use besalt::consts::*;
-use besalt::ipc;
-use besalt::types::*;
+use trona::consts::*;
+use trona::ipc;
+use trona::types::*;
 
 use crate::client::get_client;
 use crate::consts::*;
@@ -21,7 +21,7 @@ const POLL_WAITER_KIND_POLL: u8 = 1;
 const POLL_WAITER_KIND_EPOLL: u8 = 2;
 
 pub(crate) fn monotonic_now_ns() -> u64 {
-    besalt::syscall::syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0).value
+    trona::syscall::syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0).value
 }
 
 fn timeout_deadline_ns(timeout_ms: i32) -> u64 {
@@ -34,8 +34,8 @@ fn timeout_deadline_ns(timeout_ms: i32) -> u64 {
 
 unsafe fn send_waiter_timeout_reply(waiter: *mut PollWaiter) {
     unsafe {
-        let mut reply = BesaltMsg::zeroed();
-        reply.label = BESALT_OK;
+        let mut reply = TronaMsg::zeroed();
+        reply.label = TRONA_OK;
         reply.regs[0] = 0;
         reply.length = 1;
         ipc::send_ctx(ipc_ctx(), (*waiter).reply_slot, &raw const reply);
@@ -94,8 +94,8 @@ pub(crate) unsafe fn wake_poll_waiters(badge: u64, fd: i32, revents: u16) {
             }
             if fd == -1 {
                 // Broadcast: report revents on all fds that requested matching events.
-                let mut wake_reply = BesaltMsg::zeroed();
-                wake_reply.label = BESALT_OK;
+                let mut wake_reply = TronaMsg::zeroed();
+                wake_reply.label = TRONA_OK;
                 let mut ready_count: u64 = 0;
                 for j in 0..POLL_WAITERS!()[i].nfds as usize {
                     let requested = POLL_WAITERS!()[i].fds[j].1;
@@ -127,8 +127,8 @@ pub(crate) unsafe fn wake_poll_waiters(badge: u64, fd: i32, revents: u16) {
                 }
             } else {
                 // Targeted: match specific fd
-                let mut wake_reply = BesaltMsg::zeroed();
-                wake_reply.label = BESALT_OK;
+                let mut wake_reply = TronaMsg::zeroed();
+                wake_reply.label = TRONA_OK;
                 let mut ready_count: u64 = 0;
                 for j in 0..POLL_WAITERS!()[i].nfds as usize {
                     if POLL_WAITERS!()[i].fds[j].0 == fd {
@@ -162,7 +162,7 @@ pub(crate) unsafe fn wake_poll_waiters(badge: u64, fd: i32, revents: u16) {
                     POLL_WAITERS!()[i].deadline_ns = 0;
                     if *(&raw const LOGGED_POLL_WAKES) < 32 {
                         *(&raw mut LOGGED_POLL_WAKES) += 1;
-                        besalt::udebug!(|_lb| {
+                        trona::udebug!(|_lb| {
                             _lb.str(b"[VFS] poll wake badge=");
                             _lb.hex(badge);
                             _lb.str(b" fd=");
@@ -180,7 +180,7 @@ pub(crate) unsafe fn wake_poll_waiters(badge: u64, fd: i32, revents: u16) {
 
         if fd != -1 && !matched_targeted && *(&raw const LOGGED_POLL_WAKES) < 32 {
             *(&raw mut LOGGED_POLL_WAKES) += 1;
-            besalt::udebug!(|_lb| {
+            trona::udebug!(|_lb| {
                 _lb.str(b"[VFS] poll wake miss badge=");
                 _lb.hex(badge);
                 _lb.str(b" fd=");
@@ -215,15 +215,15 @@ pub(crate) unsafe fn check_fd_readiness(cli: *const ClientState, fd: i32, events
             FD_TYPE_DEVICE => {
                 if fde.dev_type == DEV_PTY_SLAVE {
                     // Query ttyd for PTY readiness
-                    let mut treq = BesaltMsg::zeroed();
-                    let mut treply = BesaltMsg::zeroed();
+                    let mut treq = TronaMsg::zeroed();
+                    let mut treply = TronaMsg::zeroed();
                     treq.label = TTYD_PTY_POLL;
                     treq.regs[0] = fde.sock_id as u64; // pty_id
                     treq.regs[1] = events as u64;
                     treq.length = 2;
                     let err =
                         ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
-                    if err == 0 && treply.label == BESALT_OK {
+                    if err == 0 && treply.label == TRONA_OK {
                         rev = treply.regs[0] as u32;
                     }
                 } else {
@@ -281,8 +281,8 @@ pub(crate) unsafe fn check_fd_readiness(cli: *const ClientState, fd: i32, events
             }
             FD_TYPE_INET_SOCKET => {
                 // Query netsrv for inet socket readiness
-                let mut nreq = BesaltMsg::zeroed();
-                let mut nreply = BesaltMsg::zeroed();
+                let mut nreq = TronaMsg::zeroed();
+                let mut nreply = TronaMsg::zeroed();
                 nreq.label = NET_POLL_STATUS;
                 nreq.regs[0] = fde.sock_id as u64;
                 nreq.regs[1] = events as u64;
@@ -293,7 +293,7 @@ pub(crate) unsafe fn check_fd_readiness(cli: *const ClientState, fd: i32, events
                     &raw const nreq,
                     &raw mut nreply,
                 );
-                if err == 0 && nreply.label == BESALT_OK {
+                if err == 0 && nreply.label == TRONA_OK {
                     rev = nreply.regs[0] as u32;
                 }
             }
@@ -306,11 +306,11 @@ pub(crate) unsafe fn check_fd_readiness(cli: *const ClientState, fd: i32, events
     }
 }
 
-pub(crate) unsafe fn handle_epoll_create(reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_epoll_create(reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let cli = get_client(badge);
         if cli.is_null() {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -330,7 +330,7 @@ pub(crate) unsafe fn handle_epoll_create(reply: *mut BesaltMsg, badge: u64) {
                 core::mem::size_of::<EpollInstance>(),
             ) != 0
             {
-                (*reply).label = BESALT_OUT_OF_MEMORY;
+                (*reply).label = TRONA_OUT_OF_MEMORY;
                 return;
             }
             // Retry scan from old_cap
@@ -341,7 +341,7 @@ pub(crate) unsafe fn handle_epoll_create(reply: *mut BesaltMsg, badge: u64) {
                 }
             }
             if epoll_idx < 0 {
-                (*reply).label = BESALT_OUT_OF_MEMORY;
+                (*reply).label = TRONA_OUT_OF_MEMORY;
                 return;
             }
         }
@@ -355,7 +355,7 @@ pub(crate) unsafe fn handle_epoll_create(reply: *mut BesaltMsg, badge: u64) {
             }
         }
         if fd < 0 {
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -367,7 +367,7 @@ pub(crate) unsafe fn handle_epoll_create(reply: *mut BesaltMsg, badge: u64) {
             let ptr = vfs_alloc_array::<EpollEntry>(INITIAL_EPOLL_ENTRIES);
             if ptr.is_null() {
                 EPOLLS!()[epoll_idx as usize].active = 0;
-                (*reply).label = BESALT_OUT_OF_MEMORY;
+                (*reply).label = TRONA_OUT_OF_MEMORY;
                 return;
             }
             EPOLLS!()[epoll_idx as usize].entries = ptr;
@@ -385,13 +385,13 @@ pub(crate) unsafe fn handle_epoll_create(reply: *mut BesaltMsg, badge: u64) {
         (*(*cli).fds.add(fd as usize)).offset = 0;
         (*(*cli).fds.add(fd as usize)).flags = 0;
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 1;
         (*reply).regs[0] = fd as u64;
     }
 }
 
-pub(crate) unsafe fn handle_epoll_ctl(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_epoll_ctl(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let epfd = (*msg).regs[0] as i32;
         let op = (*msg).regs[1] as i32;
@@ -406,19 +406,19 @@ pub(crate) unsafe fn handle_epoll_ctl(msg: *const BesaltMsg, reply: *mut BesaltM
             || (*(*cli).fds.add(epfd as usize)).active == 0
             || (*(*cli).fds.add(epfd as usize)).fd_type != FD_TYPE_EPOLL
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
         let ep_idx = (*(*cli).fds.add(epfd as usize)).sock_id as usize;
         if ep_idx >= max_epoll_instances() || EPOLLS!()[ep_idx].active == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
         // Validate target fd
         if fd < 0 || fd >= (*cli).fds_cap as i32 || (*(*cli).fds.add(fd as usize)).active == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -430,7 +430,7 @@ pub(crate) unsafe fn handle_epoll_ctl(msg: *const BesaltMsg, reply: *mut BesaltM
                 // Check not already present
                 for i in 0..(*ep).entries_cap as usize {
                     if (*ep.entries.add(i)).active != 0 && (*ep.entries.add(i)).fd == fd {
-                        (*reply).label = BESALT_INVALID_ARGUMENT; // EEXIST
+                        (*reply).label = TRONA_INVALID_ARGUMENT; // EEXIST
                         return;
                     }
                 }
@@ -443,7 +443,7 @@ pub(crate) unsafe fn handle_epoll_ctl(msg: *const BesaltMsg, reply: *mut BesaltM
                     }
                 }
                 if slot < 0 {
-                    (*reply).label = BESALT_OUT_OF_MEMORY;
+                    (*reply).label = TRONA_OUT_OF_MEMORY;
                     return;
                 }
                 (*ep.entries.add(slot as usize)).active = 1;
@@ -462,7 +462,7 @@ pub(crate) unsafe fn handle_epoll_ctl(msg: *const BesaltMsg, reply: *mut BesaltM
                     }
                 }
                 if !found {
-                    (*reply).label = BESALT_NOT_FOUND;
+                    (*reply).label = TRONA_NOT_FOUND;
                     return;
                 }
             }
@@ -478,24 +478,24 @@ pub(crate) unsafe fn handle_epoll_ctl(msg: *const BesaltMsg, reply: *mut BesaltM
                     }
                 }
                 if !found {
-                    (*reply).label = BESALT_NOT_FOUND;
+                    (*reply).label = TRONA_NOT_FOUND;
                     return;
                 }
             }
             _ => {
-                (*reply).label = BESALT_INVALID_ARGUMENT;
+                (*reply).label = TRONA_INVALID_ARGUMENT;
                 return;
             }
         }
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 0;
     }
 }
 
 pub(crate) unsafe fn handle_epoll_wait(
-    msg: *const BesaltMsg,
-    reply: *mut BesaltMsg,
+    msg: *const TronaMsg,
+    reply: *mut TronaMsg,
     badge: u64,
 ) -> bool {
     unsafe {
@@ -510,13 +510,13 @@ pub(crate) unsafe fn handle_epoll_wait(
             || (*(*cli).fds.add(epfd as usize)).active == 0
             || (*(*cli).fds.add(epfd as usize)).fd_type != FD_TYPE_EPOLL
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return false;
         }
 
         let ep_idx = (*(*cli).fds.add(epfd as usize)).sock_id as usize;
         if ep_idx >= max_epoll_instances() || EPOLLS!()[ep_idx].active == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return false;
         }
 
@@ -543,7 +543,7 @@ pub(crate) unsafe fn handle_epoll_wait(
         }
 
         if ready_count > 0 || timeout == 0 {
-            (*reply).label = BESALT_OK;
+            (*reply).label = TRONA_OK;
             (*reply).regs[0] = ready_count as u64;
             (*reply).length = 1 + (ready_count as u64 * 2);
             return false;
@@ -551,9 +551,9 @@ pub(crate) unsafe fn handle_epoll_wait(
 
         // Blocking: use poll waiter infrastructure
         let slot = alloc_reply_slot();
-        let err = besalt::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
+        let err = trona::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
         if err != 0 {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
@@ -583,8 +583,8 @@ pub(crate) unsafe fn handle_epoll_wait(
         }
 
         if !found {
-            let mut err_reply = BesaltMsg::zeroed();
-            err_reply.label = BESALT_OUT_OF_MEMORY;
+            let mut err_reply = TronaMsg::zeroed();
+            err_reply.label = TRONA_OUT_OF_MEMORY;
             ipc::send_ctx(ipc_ctx(), slot, &raw const err_reply);
         }
 
@@ -592,7 +592,7 @@ pub(crate) unsafe fn handle_epoll_wait(
     }
 }
 
-pub(crate) unsafe fn handle_poll(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) -> bool {
+pub(crate) unsafe fn handle_poll(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) -> bool {
     unsafe {
         let nfds = (*msg).regs[0] as u32;
         let timeout = (*msg).regs[1] as i32;
@@ -600,7 +600,7 @@ pub(crate) unsafe fn handle_poll(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
 
         let cli = get_client(badge);
         if cli.is_null() {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return false;
         }
 
@@ -628,7 +628,7 @@ pub(crate) unsafe fn handle_poll(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
         }
 
         if ready_count > 0 || timeout == 0 {
-            (*reply).label = BESALT_OK;
+            (*reply).label = TRONA_OK;
             (*reply).regs[0] = ready_count as u64;
             for i in 0..actual_nfds as usize {
                 (*reply).regs[1 + i] = revents_arr[i] as u64;
@@ -639,9 +639,9 @@ pub(crate) unsafe fn handle_poll(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
 
         // Block — register poll waiter
         let slot = alloc_reply_slot();
-        let err = besalt::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
+        let err = trona::invoke::cnode_save_caller(CAP_SELF_CSPACE, slot);
         if err != 0 {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
 
@@ -692,15 +692,15 @@ pub(crate) unsafe fn handle_poll(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
             }
             if !found {
                 // Still no slot — reply with error via saved cap
-                let mut err_reply = BesaltMsg::zeroed();
-                err_reply.label = BESALT_OUT_OF_MEMORY;
+                let mut err_reply = TronaMsg::zeroed();
+                err_reply.label = TRONA_OUT_OF_MEMORY;
                 ipc::send_ctx(ipc_ctx(), slot, &raw const err_reply);
             }
         }
 
         if found && *(&raw const LOGGED_POLL_REGISTRATIONS) < 32 {
             *(&raw mut LOGGED_POLL_REGISTRATIONS) += 1;
-            besalt::udebug!(|_lb| {
+            trona::udebug!(|_lb| {
                 _lb.str(b"[VFS] poll wait badge=");
                 _lb.hex(badge);
                 _lb.str(b" nfds=");

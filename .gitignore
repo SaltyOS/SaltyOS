@@ -47,6 +47,11 @@ Cargo.lock
 # Generated
 *.generated.*
 
+# Port build artifacts
+ports/*/stage-*/
+ports/*/work/
+ports/*/work-*/
+
 # Python
 __pycache__/
 *.py[cod]

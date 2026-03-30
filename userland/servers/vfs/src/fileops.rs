@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Core file operations: open, read, write, close, stat, lseek, and mkdir.
 
-use besalt::consts::*;
-use besalt::ipc;
-use besalt::types::*;
+use trona::consts::*;
+use trona::ipc;
+use trona::types::*;
 
 use crate::client::{
     extract_path, flags_allow_read, flags_allow_write, get_client, get_client_noalloc,
@@ -162,12 +162,12 @@ pub(crate) unsafe fn normalize_path_for_client(
 }
 
 /// Open a remote mount inode: stat, handle O_TRUNC, allocate fd.
-/// Sets reply on return (BESALT_OK + fd, or an error code).
+/// Sets reply on return (TRONA_OK + fd, or an error code).
 pub(crate) unsafe fn open_mount_inode(
     mount_idx: usize,
     remote_ino: u64,
     flags: u32,
-    reply: *mut BesaltMsg,
+    reply: *mut TronaMsg,
     badge: u64,
 ) {
     unsafe {
@@ -175,15 +175,15 @@ pub(crate) unsafe fn open_mount_inode(
         let (_size, _mode, _nlink, _mtime, is_dir) = match stat {
             Some(s) => s,
             None => {
-                (*reply).label = BESALT_NOT_FOUND;
+                (*reply).label = TRONA_NOT_FOUND;
                 return;
             }
         };
 
         if !is_dir && (flags & O_TRUNC) != 0 && flags_allow_write(flags) {
-            let mut trunc_reply = BesaltMsg::zeroed();
+            let mut trunc_reply = TronaMsg::zeroed();
             mount_truncate(mount_idx, remote_ino, 0, &raw mut trunc_reply);
-            if trunc_reply.label != BESALT_OK {
+            if trunc_reply.label != TRONA_OK {
                 (*reply).label = trunc_reply.label;
                 return;
             }
@@ -191,7 +191,7 @@ pub(crate) unsafe fn open_mount_inode(
 
         let cli = get_client(badge);
         if cli.is_null() {
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
         for fd in 0..(*cli).fds_cap as usize {
@@ -207,17 +207,17 @@ pub(crate) unsafe fn open_mount_inode(
                 (*(*cli).fds.add(fd)).mount_batch_count = 0;
                 (*(*cli).fds.add(fd)).mount_batch_index = 0;
                 (*(*cli).fds.add(fd)).mount_batch_next_cursor = 0;
-                (*reply).label = BESALT_OK;
+                (*reply).label = TRONA_OK;
                 (*reply).length = 1;
                 (*reply).regs[0] = fd as u64;
                 return;
             }
         }
-        (*reply).label = BESALT_OUT_OF_MEMORY;
+        (*reply).label = TRONA_OUT_OF_MEMORY;
     }
 }
 
-pub(crate) unsafe fn handle_open(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_open(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
         let mut abs_path = [0u8; MAX_PATH_LEN];
@@ -226,14 +226,14 @@ pub(crate) unsafe fn handle_open(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
         let raw_len = extract_path(msg, 2, path.as_mut_ptr());
 
         if raw_len == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
         let Some((path_ptr, path_len)) =
             normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
         else {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         };
 
@@ -257,7 +257,7 @@ pub(crate) unsafe fn handle_open(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
         if inode.is_null() {
             if let Some((mi, rino)) = try_root_underlay(path_ptr, path_len) {
                 if (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL) {
-                    (*reply).label = BESALT_ALREADY_EXISTS;
+                    (*reply).label = TRONA_ALREADY_EXISTS;
                     return;
                 }
                 open_mount_inode(mi, rino, flags, reply, badge);
@@ -267,7 +267,7 @@ pub(crate) unsafe fn handle_open(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
 
         if inode.is_null() {
             if (flags & O_CREAT) == 0 {
-                (*reply).label = BESALT_NOT_FOUND;
+                (*reply).label = TRONA_NOT_FOUND;
                 return;
             }
 
@@ -324,18 +324,18 @@ pub(crate) unsafe fn handle_open(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
                         }
                     }
                 }
-                (*reply).label = BESALT_NOT_FOUND;
+                (*reply).label = TRONA_NOT_FOUND;
                 return;
             }
         } else if (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL) {
-            (*reply).label = BESALT_ALREADY_EXISTS;
+            (*reply).label = TRONA_ALREADY_EXISTS;
             return;
         }
 
         // Validate access mode
         if (*inode).ftype == FTYPE_DIRECTORY {
             if flags_allow_write(flags) || (flags & (O_TRUNC | O_APPEND)) != 0 {
-                (*reply).label = BESALT_INVALID_OPERATION;
+                (*reply).label = TRONA_INVALID_OPERATION;
                 return;
             }
         }
@@ -344,7 +344,7 @@ pub(crate) unsafe fn handle_open(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
             if (*inode).readonly != 0
                 && (flags_allow_write(flags) || (flags & (O_TRUNC | O_APPEND)) != 0)
             {
-                (*reply).label = BESALT_INVALID_OPERATION;
+                (*reply).label = TRONA_INVALID_OPERATION;
                 return;
             }
             if (flags & O_TRUNC) != 0 && flags_allow_write(flags) {
@@ -357,7 +357,7 @@ pub(crate) unsafe fn handle_open(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
 
         let cli = get_client(badge);
         if cli.is_null() {
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -383,7 +383,7 @@ pub(crate) unsafe fn handle_open(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
                     let pipe = find_pipe(pipe_id);
                     if pipe.is_null() {
                         (*(*cli).fds.add(fd)).active = 0;
-                        (*reply).label = BESALT_INVALID_OPERATION;
+                        (*reply).label = TRONA_INVALID_OPERATION;
                         return;
                     }
                     (*(*cli).fds.add(fd)).fd_type = FD_TYPE_PIPE;
@@ -403,18 +403,18 @@ pub(crate) unsafe fn handle_open(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
                 }
 
                 inode_open((*inode).ino);
-                (*reply).label = BESALT_OK;
+                (*reply).label = TRONA_OK;
                 (*reply).length = 1;
                 (*reply).regs[0] = fd as u64;
                 return;
             }
         }
 
-        (*reply).label = BESALT_OUT_OF_MEMORY;
+        (*reply).label = TRONA_OUT_OF_MEMORY;
     }
 }
 
-pub(crate) unsafe fn handle_read(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_read(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let mut count = (*msg).regs[1];
@@ -425,7 +425,7 @@ pub(crate) unsafe fn handle_read(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
             || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -434,7 +434,7 @@ pub(crate) unsafe fn handle_read(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
         }
 
         if !flags_allow_read((*(*cli).fds.add(fd as usize)).flags) {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return;
         }
 
@@ -443,8 +443,8 @@ pub(crate) unsafe fn handle_read(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
         match fde.fd_type {
             FD_TYPE_DEVICE => match fde.dev_type {
                 DEV_CONSOLE => {
-                    let mut creq = BesaltMsg::zeroed();
-                    let mut creply = BesaltMsg::zeroed();
+                    let mut creq = TronaMsg::zeroed();
+                    let mut creply = TronaMsg::zeroed();
                     creq.label = CONSOLE_READ;
                     creq.length = 0;
 
@@ -454,14 +454,14 @@ pub(crate) unsafe fn handle_read(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
                         &raw const creq,
                         &raw mut creply,
                     );
-                    if err != 0 || creply.label != BESALT_OK {
-                        (*reply).label = BESALT_INVALID_OPERATION;
+                    if err != 0 || creply.label != TRONA_OK {
+                        (*reply).label = TRONA_INVALID_OPERATION;
                         return;
                     }
 
                     let read_count = creply.regs[0];
                     if read_count == 0 {
-                        (*reply).label = BESALT_OK;
+                        (*reply).label = TRONA_OK;
                         (*reply).length = 1;
                         (*reply).regs[0] = 0;
                     } else {
@@ -470,7 +470,7 @@ pub(crate) unsafe fn handle_read(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
                         } else {
                             read_count
                         };
-                        (*reply).label = BESALT_OK;
+                        (*reply).label = TRONA_OK;
                         (*reply).length = 1 + (actual + 7) / 8;
                         (*reply).regs[0] = actual;
                         let src = &creply.regs[1] as *const u64 as *const u8;
@@ -481,12 +481,12 @@ pub(crate) unsafe fn handle_read(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
                     }
                 }
                 DEV_NULL => {
-                    (*reply).label = BESALT_OK;
+                    (*reply).label = TRONA_OK;
                     (*reply).length = 1;
                     (*reply).regs[0] = 0;
                 }
                 DEV_ZERO => {
-                    (*reply).label = BESALT_OK;
+                    (*reply).label = TRONA_OK;
                     (*reply).length = 1 + (count + 7) / 8;
                     (*reply).regs[0] = count;
                     let data = &raw mut (*reply).regs[1] as *mut u8;
@@ -495,7 +495,7 @@ pub(crate) unsafe fn handle_read(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
                     }
                 }
                 DEV_URANDOM => {
-                    (*reply).label = BESALT_OK;
+                    (*reply).label = TRONA_OK;
                     (*reply).length = 1 + (count + 7) / 8;
                     (*reply).regs[0] = count;
                     let data = &raw mut (*reply).regs[1] as *mut u8;
@@ -520,26 +520,26 @@ pub(crate) unsafe fn handle_read(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
                     }
                 }
                 DEV_FB0 => {
-                    (*reply).label = BESALT_INVALID_OPERATION;
+                    (*reply).label = TRONA_INVALID_OPERATION;
                 }
                 DEV_PTY_SLAVE => {
                     // PTY reads should go through main loop dispatch for deferred support.
                     // If we end up here, do a non-blocking try-read.
                     let pty_id = fde.sock_id as u64;
-                    let mut treq = BesaltMsg::zeroed();
-                    let mut treply = BesaltMsg::zeroed();
+                    let mut treq = TronaMsg::zeroed();
+                    let mut treply = TronaMsg::zeroed();
                     treq.label = TTYD_PTY_READ;
                     treq.regs[0] = pty_id;
                     treq.regs[1] = count;
                     treq.length = 2;
                     let err =
                         ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const treq, &raw mut treply);
-                    if err != 0 || treply.label != BESALT_OK {
-                        (*reply).label = BESALT_INVALID_OPERATION;
+                    if err != 0 || treply.label != TRONA_OK {
+                        (*reply).label = TRONA_INVALID_OPERATION;
                         return;
                     }
                     let actual = treply.regs[0];
-                    (*reply).label = BESALT_OK;
+                    (*reply).label = TRONA_OK;
                     (*reply).length = 1 + (actual + 7) / 8;
                     (*reply).regs[0] = actual;
                     if actual > 0 {
@@ -551,13 +551,13 @@ pub(crate) unsafe fn handle_read(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
                     }
                 }
                 _ => {
-                    (*reply).label = BESALT_INVALID_OPERATION;
+                    (*reply).label = TRONA_INVALID_OPERATION;
                 }
             },
             FD_TYPE_FILE => {
                 let inode = inode_by_ino(fde.inode);
                 if inode.is_null() {
-                    (*reply).label = BESALT_INVALID_ARGUMENT;
+                    (*reply).label = TRONA_INVALID_ARGUMENT;
                     return;
                 }
 
@@ -572,7 +572,7 @@ pub(crate) unsafe fn handle_read(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
 
                 let offset = fde.offset;
                 if offset >= (*inode).size {
-                    (*reply).label = BESALT_OK;
+                    (*reply).label = TRONA_OK;
                     (*reply).length = 1;
                     (*reply).regs[0] = 0;
                     return;
@@ -593,26 +593,26 @@ pub(crate) unsafe fn handle_read(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
                     let actual = chain_read((*inode).rw_data, offset, dst, count);
                     count = actual;
                 } else {
-                    (*reply).label = BESALT_OK;
+                    (*reply).label = TRONA_OK;
                     (*reply).length = 1;
                     (*reply).regs[0] = 0;
                     return;
                 }
 
-                (*reply).label = BESALT_OK;
+                (*reply).label = TRONA_OK;
                 (*reply).length = 1 + (count + 7) / 8;
                 (*reply).regs[0] = count;
 
                 fde.offset = offset + count;
             }
             _ => {
-                (*reply).label = BESALT_INVALID_OPERATION;
+                (*reply).label = TRONA_INVALID_OPERATION;
             }
         }
     }
 }
 
-pub(crate) unsafe fn handle_write(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_write(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let mut count = (*msg).regs[1];
@@ -623,7 +623,7 @@ pub(crate) unsafe fn handle_write(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
             || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -632,7 +632,7 @@ pub(crate) unsafe fn handle_write(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
         }
 
         if !flags_allow_write((*(*cli).fds.add(fd as usize)).flags) {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return;
         }
 
@@ -644,8 +644,8 @@ pub(crate) unsafe fn handle_write(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
                     let src = &(*msg).regs[2] as *const u64 as *const u8;
                     let mut sent: u64 = 0;
                     while sent < count {
-                        let mut creq = BesaltMsg::zeroed();
-                        let mut creply = BesaltMsg::zeroed();
+                        let mut creq = TronaMsg::zeroed();
+                        let mut creply = TronaMsg::zeroed();
                         let mut chunk = count - sent;
                         if chunk > 24 {
                             chunk = 24;
@@ -666,21 +666,21 @@ pub(crate) unsafe fn handle_write(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
                             &raw const creq,
                             &raw mut creply,
                         );
-                        if err != 0 || creply.label != BESALT_OK {
+                        if err != 0 || creply.label != TRONA_OK {
                             break;
                         }
                         sent += chunk;
                     }
                     (*reply).label = if sent > 0 {
-                        BESALT_OK
+                        TRONA_OK
                     } else {
-                        BESALT_INVALID_OPERATION
+                        TRONA_INVALID_OPERATION
                     };
                     (*reply).length = 1;
                     (*reply).regs[0] = sent;
                 }
                 DEV_NULL | DEV_ZERO | DEV_URANDOM => {
-                    (*reply).label = BESALT_OK;
+                    (*reply).label = TRONA_OK;
                     (*reply).length = 1;
                     (*reply).regs[0] = count;
                 }
@@ -690,8 +690,8 @@ pub(crate) unsafe fn handle_write(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
                     let src = &(*msg).regs[2] as *const u64 as *const u8;
                     let mut sent: u64 = 0;
                     while sent < count {
-                        let mut treq = BesaltMsg::zeroed();
-                        let mut treply = BesaltMsg::zeroed();
+                        let mut treq = TronaMsg::zeroed();
+                        let mut treply = TronaMsg::zeroed();
                         let mut chunk = count - sent;
                         if chunk > 136 {
                             // 17 regs * 8 bytes (regs[2..19])
@@ -711,37 +711,37 @@ pub(crate) unsafe fn handle_write(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
                             &raw const treq,
                             &raw mut treply,
                         );
-                        if err != 0 || treply.label != BESALT_OK {
+                        if err != 0 || treply.label != TRONA_OK {
                             break;
                         }
                         sent += chunk;
                     }
                     (*reply).label = if sent > 0 {
-                        BESALT_OK
+                        TRONA_OK
                     } else {
-                        BESALT_INVALID_OPERATION
+                        TRONA_INVALID_OPERATION
                     };
                     (*reply).length = 1;
                     (*reply).regs[0] = sent;
                 }
                 DEV_FB0 => {
-                    (*reply).label = BESALT_INVALID_OPERATION;
+                    (*reply).label = TRONA_INVALID_OPERATION;
                 }
                 _ => {
-                    (*reply).label = BESALT_INVALID_OPERATION;
+                    (*reply).label = TRONA_INVALID_OPERATION;
                 }
             },
             FD_TYPE_FILE => {
                 let inode = inode_by_ino(fde.inode);
                 if inode.is_null() || (*inode).readonly != 0 {
-                    (*reply).label = BESALT_INVALID_OPERATION;
+                    (*reply).label = TRONA_INVALID_OPERATION;
                     return;
                 }
 
                 if (*inode).rw_data.is_null() {
                     (*inode).rw_data = alloc_writable();
                     if (*inode).rw_data.is_null() {
-                        (*reply).label = BESALT_OUT_OF_MEMORY;
+                        (*reply).label = TRONA_OUT_OF_MEMORY;
                         return;
                     }
                 }
@@ -754,7 +754,7 @@ pub(crate) unsafe fn handle_write(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
                 let src = &(*msg).regs[2] as *const u64 as *const u8;
                 let written = chain_write((*inode).rw_data, offset, src, count);
                 if written == 0 && count > 0 {
-                    (*reply).label = BESALT_OUT_OF_MEMORY;
+                    (*reply).label = TRONA_OUT_OF_MEMORY;
                     return;
                 }
                 count = written;
@@ -764,12 +764,12 @@ pub(crate) unsafe fn handle_write(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
                     (*inode).size = fde.offset;
                 }
 
-                (*reply).label = BESALT_OK;
+                (*reply).label = TRONA_OK;
                 (*reply).length = 1;
                 (*reply).regs[0] = count;
             }
             _ => {
-                (*reply).label = BESALT_INVALID_OPERATION;
+                (*reply).label = TRONA_INVALID_OPERATION;
             }
         }
     }
@@ -778,7 +778,7 @@ pub(crate) unsafe fn handle_write(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
 /// Positioned read: read at an explicit offset without updating the fd cursor.
 /// IPC: regs[0]=fd, regs[1]=count, regs[2]=offset (i64).
 /// Only supported for FD_TYPE_FILE (not devices, pipes, or sockets).
-pub(crate) unsafe fn handle_pread(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_pread(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let mut count = (*msg).regs[1];
@@ -790,7 +790,7 @@ pub(crate) unsafe fn handle_pread(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
             || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -801,23 +801,23 @@ pub(crate) unsafe fn handle_pread(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
         let fde = &*(*cli).fds.add(fd as usize);
 
         if !flags_allow_read(fde.flags) {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return;
         }
 
         if fde.fd_type != FD_TYPE_FILE {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return;
         }
 
         let inode = inode_by_ino(fde.inode);
         if inode.is_null() {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
         if offset >= (*inode).size {
-            (*reply).label = BESALT_OK;
+            (*reply).label = TRONA_OK;
             (*reply).length = 1;
             (*reply).regs[0] = 0;
             return;
@@ -838,13 +838,13 @@ pub(crate) unsafe fn handle_pread(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
             let actual = chain_read((*inode).rw_data, offset, dst, count);
             count = actual;
         } else {
-            (*reply).label = BESALT_OK;
+            (*reply).label = TRONA_OK;
             (*reply).length = 1;
             (*reply).regs[0] = 0;
             return;
         }
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 1 + (count + 7) / 8;
         (*reply).regs[0] = count;
         // Note: fd cursor (fde.offset) is NOT updated
@@ -854,7 +854,7 @@ pub(crate) unsafe fn handle_pread(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
 /// Positioned write: write at an explicit offset without updating the fd cursor.
 /// IPC: regs[0]=fd, regs[1]=count, regs[2]=offset (i64), regs[3..]=data.
 /// Only supported for FD_TYPE_FILE (not devices, pipes, or sockets).
-pub(crate) unsafe fn handle_pwrite(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_pwrite(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let mut count = (*msg).regs[1];
@@ -866,7 +866,7 @@ pub(crate) unsafe fn handle_pwrite(msg: *const BesaltMsg, reply: *mut BesaltMsg,
             || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -878,25 +878,25 @@ pub(crate) unsafe fn handle_pwrite(msg: *const BesaltMsg, reply: *mut BesaltMsg,
         let fde = &*(*cli).fds.add(fd as usize);
 
         if !flags_allow_write(fde.flags) {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return;
         }
 
         if fde.fd_type != FD_TYPE_FILE {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return;
         }
 
         let inode = inode_by_ino(fde.inode);
         if inode.is_null() || (*inode).readonly != 0 {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return;
         }
 
         if (*inode).rw_data.is_null() {
             (*inode).rw_data = alloc_writable();
             if (*inode).rw_data.is_null() {
-                (*reply).label = BESALT_OUT_OF_MEMORY;
+                (*reply).label = TRONA_OUT_OF_MEMORY;
                 return;
             }
         }
@@ -904,7 +904,7 @@ pub(crate) unsafe fn handle_pwrite(msg: *const BesaltMsg, reply: *mut BesaltMsg,
         let src = &(*msg).regs[3] as *const u64 as *const u8;
         let written = chain_write((*inode).rw_data, offset, src, count);
         if written == 0 && count > 0 {
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
         count = written;
@@ -914,14 +914,14 @@ pub(crate) unsafe fn handle_pwrite(msg: *const BesaltMsg, reply: *mut BesaltMsg,
             (*inode).size = end;
         }
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 1;
         (*reply).regs[0] = count;
         // Note: fd cursor (fde.offset) is NOT updated
     }
 }
 
-pub(crate) unsafe fn handle_close(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_close(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
@@ -930,7 +930,7 @@ pub(crate) unsafe fn handle_close(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
             || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -941,8 +941,8 @@ pub(crate) unsafe fn handle_close(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
             let inode = inode_by_ino(fde.inode);
             if !inode.is_null() && (*inode).ftype == FTYPE_SHM {
                 let shm_idx = (*inode).dev_type as usize;
-                let mut mm_msg = BesaltMsg::zeroed();
-                let mut mm_reply_msg = BesaltMsg::zeroed();
+                let mut mm_msg = TronaMsg::zeroed();
+                let mut mm_reply_msg = TronaMsg::zeroed();
                 mm_msg.label = MM_SHM_UNMAP;
                 mm_msg.length = 3;
                 mm_msg.regs[0] = shm_idx as u64;
@@ -963,11 +963,11 @@ pub(crate) unsafe fn handle_close(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
         }
 
         (*(*cli).fds.add(fd as usize)).active = 0;
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }
 
-pub(crate) unsafe fn handle_lseek(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_lseek(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let offset = (*msg).regs[1] as i64;
@@ -979,13 +979,13 @@ pub(crate) unsafe fn handle_lseek(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
             || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
         let fdt = (*(*cli).fds.add(fd as usize)).fd_type;
         if fdt != FD_TYPE_FILE && fdt != FD_TYPE_MOUNT {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return;
         }
 
@@ -999,7 +999,7 @@ pub(crate) unsafe fn handle_lseek(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
         } else {
             let inode = inode_by_ino((*(*cli).fds.add(fd as usize)).inode);
             if inode.is_null() {
-                (*reply).label = BESALT_INVALID_ARGUMENT;
+                (*reply).label = TRONA_INVALID_ARGUMENT;
                 return;
             }
             (*inode).size
@@ -1010,26 +1010,26 @@ pub(crate) unsafe fn handle_lseek(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
             1 => (*(*cli).fds.add(fd as usize)).offset as i64 + offset, // SEEK_CUR
             2 => file_size as i64 + offset,                             // SEEK_END
             _ => {
-                (*reply).label = BESALT_INVALID_ARGUMENT;
+                (*reply).label = TRONA_INVALID_ARGUMENT;
                 return;
             }
         };
 
         if new_offset < 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
         (*(*cli).fds.add(fd as usize)).offset = new_offset as u64;
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 1;
         (*reply).regs[0] = new_offset as u64;
     }
 }
 
-pub(crate) unsafe fn fill_stat_reply(reply: *mut BesaltMsg, inode: *const RamfsInode) {
+pub(crate) unsafe fn fill_stat_reply(reply: *mut TronaMsg, inode: *const RamfsInode) {
     unsafe {
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 8;
         (*reply).regs[0] = (*inode).ino as u64;
         (*reply).regs[1] = (*inode).mode as u64;
@@ -1046,7 +1046,7 @@ pub(crate) unsafe fn fill_stat_reply(reply: *mut BesaltMsg, inode: *const RamfsI
     }
 }
 
-pub(crate) unsafe fn handle_fstat(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_fstat(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
         let cli = get_client(badge);
@@ -1055,7 +1055,7 @@ pub(crate) unsafe fn handle_fstat(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
             || fd >= (*cli).fds_cap as i32
             || (*(*cli).fds.add(fd as usize)).active == 0
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -1066,7 +1066,7 @@ pub(crate) unsafe fn handle_fstat(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
             let remote_ino = fde.sock_id as u64;
             match mount_stat(mount_idx, remote_ino) {
                 Some((size, mode, nlink, mtime, _)) => {
-                    (*reply).label = BESALT_OK;
+                    (*reply).label = TRONA_OK;
                     (*reply).length = 8;
                     (*reply).regs[0] = remote_ino;
                     (*reply).regs[1] = mode as u64;
@@ -1082,7 +1082,7 @@ pub(crate) unsafe fn handle_fstat(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
                     };
                 }
                 None => {
-                    (*reply).label = BESALT_INVALID_ARGUMENT;
+                    (*reply).label = TRONA_INVALID_ARGUMENT;
                 }
             }
             return;
@@ -1090,26 +1090,26 @@ pub(crate) unsafe fn handle_fstat(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
 
         let inode = inode_by_ino((*(*cli).fds.add(fd as usize)).inode);
         if inode.is_null() {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
         fill_stat_reply(reply, inode);
     }
 }
 
-pub(crate) unsafe fn handle_stat(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_stat(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
         let mut abs_path = [0u8; MAX_PATH_LEN];
         let raw_len = extract_path(msg, 0, path.as_mut_ptr());
         if raw_len == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
         let Some((path_ptr, path_len)) =
             normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
         else {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         };
 
@@ -1135,26 +1135,26 @@ pub(crate) unsafe fn handle_stat(msg: *const BesaltMsg, reply: *mut BesaltMsg, b
                     return;
                 }
             }
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
         fill_stat_reply(reply, inode);
     }
 }
 
-pub(crate) unsafe fn handle_access(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_access(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
         let mut abs_path = [0u8; MAX_PATH_LEN];
         let raw_len = extract_path(msg, 1, path.as_mut_ptr());
         if raw_len == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
         let Some((path_ptr, path_len)) =
             normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
         else {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         };
         let inode = resolve_path(path_ptr, path_len);
@@ -1168,36 +1168,36 @@ pub(crate) unsafe fn handle_access(msg: *const BesaltMsg, reply: *mut BesaltMsg,
                 && *path_ptr.add(4) == b'c'
                 && *path_ptr.add(5) == b'/'
             {
-                if handle_proc_stat(path_ptr, path_len, &mut BesaltMsg::zeroed(), badge) {
-                    (*reply).label = BESALT_OK;
+                if handle_proc_stat(path_ptr, path_len, &mut TronaMsg::zeroed(), badge) {
+                    (*reply).label = TRONA_OK;
                     return;
                 }
             }
             // Root underlay fallback
             if try_root_underlay(path_ptr, path_len).is_some() {
-                (*reply).label = BESALT_OK;
+                (*reply).label = TRONA_OK;
                 return;
             }
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }
 
-pub(crate) unsafe fn handle_unlink(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_unlink(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
         let mut abs_path = [0u8; MAX_PATH_LEN];
         let raw_len = extract_path(msg, 0, path.as_mut_ptr());
         if raw_len == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
         let Some((path_ptr, path_len)) =
             normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
         else {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         };
 
@@ -1228,19 +1228,19 @@ pub(crate) unsafe fn handle_unlink(msg: *const BesaltMsg, reply: *mut BesaltMsg,
                     }
                 }
             }
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return;
         }
 
         let de = dir_find_entry(parent, child_name, child_len);
         if de.is_null() {
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
         let inode = inode_by_ino((*de).ino);
         if inode.is_null() || (*inode).ftype == FTYPE_DIRECTORY {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return;
         }
 
@@ -1249,11 +1249,11 @@ pub(crate) unsafe fn handle_unlink(msg: *const BesaltMsg, reply: *mut BesaltMsg,
         if (*inode).nlink == 0 && (*inode).open_count == 0 {
             free_inode(inode);
         }
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }
 
-pub(crate) unsafe fn handle_rename(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_rename(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let mut old_len = (*msg).regs[0] as u8;
         let mut new_len = (*msg).regs[1] as u8;
@@ -1277,19 +1277,19 @@ pub(crate) unsafe fn handle_rename(msg: *const BesaltMsg, reply: *mut BesaltMsg,
             new_path[i] = *raw2.add(i);
         }
         if old_len == 0 || new_len == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
         let Some((old_ptr, old_norm_len)) =
             normalize_path_for_client(badge, old_path.as_ptr(), old_len, old_abs.as_mut_ptr())
         else {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         };
         let Some((new_ptr, new_norm_len)) =
             normalize_path_for_client(badge, new_path.as_ptr(), new_len, new_abs.as_mut_ptr())
         else {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         };
 
@@ -1334,13 +1334,13 @@ pub(crate) unsafe fn handle_rename(msg: *const BesaltMsg, reply: *mut BesaltMsg,
                     }
                 }
             }
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return;
         }
 
         let de = dir_find_entry(old_parent, old_child, old_child_len);
         if de.is_null() {
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
         let ino = (*de).ino;
@@ -1350,7 +1350,7 @@ pub(crate) unsafe fn handle_rename(msg: *const BesaltMsg, reply: *mut BesaltMsg,
         let mut new_child_len: u8 = 0;
         let new_parent = resolve_parent(new_ptr, new_norm_len, &mut new_child, &mut new_child_len);
         if new_parent.is_null() || (*new_parent).readonly != 0 {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return;
         }
 
@@ -1371,29 +1371,29 @@ pub(crate) unsafe fn handle_rename(msg: *const BesaltMsg, reply: *mut BesaltMsg,
         }
 
         dir_add_entry(new_parent, new_child, new_child_len, ino);
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }
 
-pub(crate) unsafe fn handle_mkdir(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_mkdir(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
         let mut abs_path = [0u8; MAX_PATH_LEN];
         let raw_len = extract_path(msg, 1, path.as_mut_ptr());
         if raw_len == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
         let Some((path_ptr, path_len)) =
             normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
         else {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         };
 
         let existing = resolve_path(path_ptr, path_len);
         if !existing.is_null() {
-            (*reply).label = BESALT_ALREADY_EXISTS;
+            (*reply).label = TRONA_ALREADY_EXISTS;
             return;
         }
 
@@ -1425,13 +1425,13 @@ pub(crate) unsafe fn handle_mkdir(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
                     }
                 }
             }
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return;
         }
 
         let dir = alloc_inode();
         if dir.is_null() {
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -1441,29 +1441,29 @@ pub(crate) unsafe fn handle_mkdir(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
         (*dir).parent_ino = (*parent).ino;
 
         dir_add_entry(parent, child_name, child_len, (*dir).ino);
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }
 
-pub(crate) unsafe fn handle_mkfifo(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_mkfifo(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
         let mut abs_path = [0u8; MAX_PATH_LEN];
         let raw_len = extract_path(msg, 1, path.as_mut_ptr());
         if raw_len == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
         let Some((path_ptr, path_len)) =
             normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
         else {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         };
 
         let existing = resolve_path(path_ptr, path_len);
         if !existing.is_null() {
-            (*reply).label = BESALT_ALREADY_EXISTS;
+            (*reply).label = TRONA_ALREADY_EXISTS;
             return;
         }
 
@@ -1471,21 +1471,21 @@ pub(crate) unsafe fn handle_mkfifo(msg: *const BesaltMsg, reply: *mut BesaltMsg,
         let mut child_len: u8 = 0;
         let parent = resolve_parent(path_ptr, path_len, &mut child_name, &mut child_len);
         if parent.is_null() || (*parent).ftype != FTYPE_DIRECTORY || (*parent).readonly != 0 {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return;
         }
 
         // Allocate a pipe for the FIFO
         let pipe = alloc_pipe();
         if pipe.is_null() {
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
         let fifo = alloc_inode();
         if fifo.is_null() {
             (*pipe).active = 0;
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -1497,23 +1497,23 @@ pub(crate) unsafe fn handle_mkfifo(msg: *const BesaltMsg, reply: *mut BesaltMsg,
         (*fifo).size = (*pipe).pipe_id as u64; // Store pipe_id in size field
 
         dir_add_entry(parent, child_name, child_len, (*fifo).ino);
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }
 
-pub(crate) unsafe fn handle_rmdir(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_rmdir(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
         let mut abs_path = [0u8; MAX_PATH_LEN];
         let raw_len = extract_path(msg, 0, path.as_mut_ptr());
         if raw_len == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
         let Some((path_ptr, path_len)) =
             normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
         else {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         };
 
@@ -1544,19 +1544,19 @@ pub(crate) unsafe fn handle_rmdir(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
                     }
                 }
             }
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
         if (*inode).readonly != 0 {
-            (*reply).label = BESALT_INVALID_OPERATION;
+            (*reply).label = TRONA_INVALID_OPERATION;
             return;
         }
 
         // Check directory is empty
         for i in 0..(*inode).dirents_cap as usize {
             if (*(*inode).dirents.add(i)).active != 0 {
-                (*reply).label = BESALT_INVALID_OPERATION;
+                (*reply).label = TRONA_INVALID_OPERATION;
                 return;
             }
         }
@@ -1570,23 +1570,23 @@ pub(crate) unsafe fn handle_rmdir(msg: *const BesaltMsg, reply: *mut BesaltMsg, 
         }
 
         (*inode).active = 0;
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }
 
-pub(crate) unsafe fn handle_opendir(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_opendir(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
         let mut abs_path = [0u8; MAX_PATH_LEN];
         let raw_len = extract_path(msg, 0, path.as_mut_ptr());
         if raw_len == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
         let Some((path_ptr, path_len)) =
             normalize_path_for_client(badge, path.as_ptr(), raw_len, abs_path.as_mut_ptr())
         else {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         };
 
@@ -1615,7 +1615,7 @@ pub(crate) unsafe fn handle_opendir(msg: *const BesaltMsg, reply: *mut BesaltMsg
                         return;
                     }
                 }
-                (*reply).label = BESALT_NOT_FOUND;
+                (*reply).label = TRONA_NOT_FOUND;
                 return;
             }
         }
@@ -1636,7 +1636,7 @@ pub(crate) unsafe fn handle_opendir(msg: *const BesaltMsg, reply: *mut BesaltMsg
             false
         };
         if !is_dir {
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
@@ -1647,7 +1647,7 @@ pub(crate) unsafe fn handle_opendir(msg: *const BesaltMsg, reply: *mut BesaltMsg
                 if m.active != 0 && m.mount_ino == (*inode).ino {
                     let cli = get_client(badge);
                     if cli.is_null() {
-                        (*reply).label = BESALT_OUT_OF_MEMORY;
+                        (*reply).label = TRONA_OUT_OF_MEMORY;
                         return;
                     }
                     for fd in 0..(*cli).fds_cap as usize {
@@ -1663,23 +1663,23 @@ pub(crate) unsafe fn handle_opendir(msg: *const BesaltMsg, reply: *mut BesaltMsg
                             (*(*cli).fds.add(fd)).mount_batch_count = 0;
                             (*(*cli).fds.add(fd)).mount_batch_index = 0;
                             (*(*cli).fds.add(fd)).mount_batch_next_cursor = 0;
-                            (*reply).label = BESALT_OK;
+                            (*reply).label = TRONA_OK;
                             (*reply).length = 1;
                             (*reply).regs[0] = fd as u64;
                             return;
                         }
                     }
-                    (*reply).label = BESALT_OUT_OF_MEMORY;
+                    (*reply).label = TRONA_OUT_OF_MEMORY;
                     return;
                 }
             }
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
         let cli = get_client(badge);
         if cli.is_null() {
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -1691,18 +1691,18 @@ pub(crate) unsafe fn handle_opendir(msg: *const BesaltMsg, reply: *mut BesaltMsg
                 (*(*cli).fds.add(fd)).offset = 0;
                 (*(*cli).fds.add(fd)).dir_cursor = 0;
                 inode_open((*inode).ino);
-                (*reply).label = BESALT_OK;
+                (*reply).label = TRONA_OK;
                 (*reply).length = 1;
                 (*reply).regs[0] = fd as u64;
                 return;
             }
         }
 
-        (*reply).label = BESALT_OUT_OF_MEMORY;
+        (*reply).label = TRONA_OUT_OF_MEMORY;
     }
 }
 
-pub(crate) unsafe fn handle_readdir(msg: *const BesaltMsg, reply: *mut BesaltMsg, badge: u64) {
+pub(crate) unsafe fn handle_readdir(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
 
@@ -1713,13 +1713,13 @@ pub(crate) unsafe fn handle_readdir(msg: *const BesaltMsg, reply: *mut BesaltMsg
             || (*(*cli).fds.add(fd as usize)).active == 0
             || (*(*cli).fds.add(fd as usize)).fd_type != FD_TYPE_DIR
         {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
         let dir = inode_by_ino((*(*cli).fds.add(fd as usize)).inode);
         if dir.is_null() {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
@@ -1727,7 +1727,7 @@ pub(crate) unsafe fn handle_readdir(msg: *const BesaltMsg, reply: *mut BesaltMsg
         if (*dir).ftype == FTYPE_PROC_FILE {
             let cursor = (*(*cli).fds.add(fd as usize)).dir_cursor;
             handle_proc_readdir(dir, cursor, reply);
-            if (*reply).label == BESALT_OK && (*reply).regs[0] != 0 {
+            if (*reply).label == TRONA_OK && (*reply).regs[0] != 0 {
                 // Advance cursor: use regs[1] (next cursor) if set by proc_readdir
                 (*(*cli).fds.add(fd as usize)).dir_cursor = (*reply).regs[1] as u32;
                 (*reply).regs[1] = 0; // clear before returning to client
@@ -1767,7 +1767,7 @@ pub(crate) unsafe fn handle_readdir(msg: *const BesaltMsg, reply: *mut BesaltMsg
                     };
 
                     let name_len = (*(*dir).dirents.add(i)).name_len;
-                    (*reply).label = BESALT_OK;
+                    (*reply).label = TRONA_OK;
                     (*reply).length = 5 + ((name_len as u64 + 7) / 8);
                     (*reply).regs[0] = name_len as u64;
                     (*reply).regs[1] = 0; // reserved
@@ -1796,7 +1796,7 @@ pub(crate) unsafe fn handle_readdir(msg: *const BesaltMsg, reply: *mut BesaltMsg
                 fde.mount_batch_next_cursor = 0;
                 // fall through to underlay below
             } else {
-                (*reply).label = BESALT_OK;
+                (*reply).label = TRONA_OK;
                 (*reply).length = 1;
                 (*reply).regs[0] = 0;
                 return;
@@ -1818,7 +1818,7 @@ pub(crate) unsafe fn handle_readdir(msg: *const BesaltMsg, reply: *mut BesaltMsg
         }
 
         // Step 3 (or fallthrough): end of directory
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
         (*reply).length = 1;
         (*reply).regs[0] = 0;
     }

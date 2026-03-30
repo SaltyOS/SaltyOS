@@ -4,10 +4,10 @@
 //! Discovers modern virtio-net devices (device ID 0x1041) and locates register
 //! regions via PCI vendor-specific capabilities.
 
-use besalt::consts::*;
-use besalt::ipc;
-use besalt::invoke;
-use besalt::types::*;
+use trona::consts::*;
+use trona::ipc;
+use trona::invoke;
+use trona::types::*;
 
 use crate::ipc_ctx;
 
@@ -90,7 +90,7 @@ static mut QUEUE_NOTIFY_OFFS: [u16; 2] = [0; 2];
 // ---------------------------------------------------------------------------
 
 fn pci_config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = PCI_READ_CONFIG32;
     msg.length = 4;
     msg.regs[0] = bus as u64;
@@ -98,7 +98,7 @@ fn pci_config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     msg.regs[2] = func as u64;
     msg.regs[3] = offset as u64;
 
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return 0xFFFF_FFFF;
@@ -112,13 +112,13 @@ fn pci_config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
 
 /// Query pcisrv for modern virtio-net device (device ID 0x1041).
 pub(crate) fn find_virtio_net_modern() -> Option<(u8, u8, u8)> {
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = PCI_FIND_DEVICE;
     msg.length = 2;
     msg.regs[0] = VIRTIO_VENDOR as u64;
     msg.regs[1] = VIRTIO_NET_MODERN_DEVICE as u64;
 
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
@@ -134,7 +134,7 @@ pub(crate) fn find_virtio_net_modern() -> Option<(u8, u8, u8)> {
 fn map_bar(bus: u8, dev: u8, func: u8, bar_idx: u8) -> Option<(u64, u32)> {
     let recv_slot = CAP_BAR_SLOT_BASE + bar_idx as u64;
 
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     msg.label = PCI_GET_BAR_CAP;
     msg.length = 4;
     msg.regs[0] = bus as u64;
@@ -146,7 +146,7 @@ fn map_bar(bus: u8, dev: u8, func: u8, bar_idx: u8) -> Option<(u64, u32)> {
         ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, recv_slot, 0);
     }
 
-    let mut reply = BesaltMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
     let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
@@ -233,7 +233,7 @@ fn scan_virtio_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioModernLayout> {
     }
 
     if common_bar == 0xFF || notify_bar == 0xFF || device_bar == 0xFF {
-        besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Missing required virtio PCI capabilities\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[netdrv] Missing required virtio PCI capabilities\n"); });
         return None;
     }
 
@@ -245,7 +245,7 @@ fn scan_virtio_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioModernLayout> {
         let vaddr = unsafe { *(&raw const BAR_VADDRS[b as usize]) };
         if vaddr == 0 {
             if map_bar(bus, dev, func, b).is_none() {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[netdrv] Failed to map BAR ");
                     _lb.dec(b as u64);
                     _lb.putc(b'\n');
@@ -338,14 +338,14 @@ fn align_up(value: u64, align: u64) -> u64 {
 /// Sets up the same global state as `virtio::init_virtio` so the legacy
 /// RX/TX ring code in virtio.rs can be reused.
 pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
-    besalt::uinfo!(|_lb| { _lb.str(b"[netdrv] Probing modern virtio transport\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[netdrv] Probing modern virtio transport\n"); });
 
     let layout = match scan_virtio_caps(bus, dev, func) {
         Some(l) => l,
         None => return false,
     };
 
-    besalt::uinfo!(|_lb| { _lb.str(b"[netdrv] Modern virtio caps discovered\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[netdrv] Modern virtio caps discovered\n"); });
 
     // Reset
     layout.common_write8(CC_DEVICE_STATUS, 0);
@@ -385,7 +385,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
     );
     let status = layout.common_read8(CC_DEVICE_STATUS);
     if (status & VIRTIO_STATUS_FEATURES_OK) == 0 {
-        besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Device did not accept features\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[netdrv] Device did not accept features\n"); });
         return false;
     }
 
@@ -397,7 +397,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         }
         unsafe { *(&raw mut crate::virtio::MAC_ADDR) = mac; }
 
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[netdrv] MAC: ");
             for i in 0..6 {
                 if i > 0 { _lb.putc(b':'); }
@@ -413,7 +413,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
     // Set up RX queue (queue 0) and TX queue (queue 1)
     let num_queues = layout.common_read16(CC_NUM_QUEUES);
     if num_queues < 2 {
-        besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Device has fewer than 2 queues\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[netdrv] Device has fewer than 2 queues\n"); });
         return false;
     }
 
@@ -424,7 +424,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         layout.common_write16(CC_QUEUE_SELECT, qi);
         let qsize = layout.common_read16(CC_QUEUE_SIZE);
         if qsize == 0 {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[netdrv] Queue ");
                 _lb.dec(qi as u64);
                 _lb.str(b" unavailable\n");
@@ -444,17 +444,17 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
 
         // Allocate virtqueue memory via mmsrv
         let hint_vaddr: u64 = if qi == 0 { 0x4100_0000 } else { 0x4180_0000 };
-        let mut msg = BesaltMsg::zeroed();
+        let mut msg = TronaMsg::zeroed();
         msg.label = MM_MMAP;
         msg.length = 4;
         msg.regs[0] = hint_vaddr;
         msg.regs[1] = vq_pages * 4096;
         msg.regs[2] = 0x3;
         msg.regs[3] = 0x22;
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
         if err != 0 || reply.label != 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to allocate virtqueue memory\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to allocate virtqueue memory\n"); });
             return false;
         }
         let vq_base = reply.regs[0];
@@ -472,7 +472,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         let avail_phys = crate::virtio::vaddr_to_phys(vq_base + avail_off);
         let used_phys = crate::virtio::vaddr_to_phys(vq_base + used_off);
         if desc_phys == 0 || avail_phys == 0 || used_phys == 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to get virtqueue phys addr\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to get virtqueue phys addr\n"); });
             return false;
         }
 
@@ -508,7 +508,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
             }
         }
 
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[netdrv] Queue ");
             _lb.dec(qi as u64);
             _lb.str(b" size: ");
@@ -519,7 +519,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
 
     // Allocate DMA buffers (reuse legacy allocation logic)
     if !crate::virtio::alloc_dma_buffers() {
-        besalt::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to allocate DMA buffers\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[netdrv] Failed to allocate DMA buffers\n"); });
         return false;
     }
 
@@ -531,7 +531,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         crate::virtio::set_net_hdr_size(if use_mrg_rxbuf { 12 } else { 10 });
     }
 
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(b"[netdrv] modern net hdr size=");
         _lb.dec(if use_mrg_rxbuf { 12 } else { 10 });
         _lb.str(b" mrg_rxbuf=");
@@ -558,7 +558,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
         *(&raw mut crate::virtio::VIRTIO_INITIALIZED) = true;
     }
 
-    besalt::uinfo!(|_lb| { _lb.str(b"[netdrv] Modern virtio-net initialized OK\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[netdrv] Modern virtio-net initialized OK\n"); });
     true
 }
 

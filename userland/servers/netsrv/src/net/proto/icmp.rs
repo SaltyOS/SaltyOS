@@ -14,7 +14,7 @@ pub(crate) const ICMP_HEADER_LEN: usize = 8;
 /// Flag set when an echo reply is received, used by self-test for early break.
 static mut ECHO_REPLY_RECEIVED: bool = false;
 
-fn log_ipv4(lb: &mut besalt::serial::LineBuf, ip: u32) {
+fn log_ipv4(lb: &mut trona::serial::LineBuf, ip: u32) {
     lb.dec(((ip >> 24) & 0xFF) as u64);
     lb.putc(b'.');
     lb.dec(((ip >> 16) & 0xFF) as u64);
@@ -64,7 +64,7 @@ pub(crate) fn handle(
     };
 
     if icmp_type == ICMP_TYPE_ECHO_REQUEST {
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[netsrv] ICMP echo request src=");
             log_ipv4(&mut _lb, ip_hdr.src);
             _lb.str(b" dst=");
@@ -79,7 +79,7 @@ pub(crate) fn handle(
         });
         send_echo_reply(our_mac, our_ip, ip_hdr.src, data);
     } else if icmp_type == ICMP_TYPE_ECHO_REPLY {
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[netsrv] ICMP echo reply src=");
             log_ipv4(&mut _lb, ip_hdr.src);
             _lb.str(b" dst=");
@@ -132,7 +132,7 @@ fn send_echo_reply(our_mac: &[u8; 6], our_ip: u32, dst_ip: u32, request_data: &[
     } else {
         0
     };
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(b"[netsrv] ICMP echo reply send dst=");
         log_ipv4(&mut _lb, dst_ip);
         _lb.str(b" ident=");

@@ -48,7 +48,7 @@ d_getservbyname='define'
 d_sigaction='define'
 d_sigsetjmp='define'
 
-# Standard functions available in besaltc
+# Standard functions available in basaltc
 d_access='define'
 d_chown='define'
 d_chroot='define'

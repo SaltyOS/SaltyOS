@@ -15,19 +15,21 @@
 #![no_std]
 #![no_main]
 
-extern crate besalt;
+extern crate trona;
+extern crate trona_posix;
+extern crate trona_loader;
 
 mod ini;
 mod selftest;
 mod spawn;
 mod svc_mgr;
 
-use besalt::consts::*;
-use besalt::cpio;
-use besalt::invoke;
-use besalt::ipc;
-use besalt::syscall::syscall;
-use besalt::types::*;
+use trona::consts::*;
+use trona_loader::cpio;
+use trona::invoke;
+use trona::ipc;
+use trona::syscall::syscall;
+use trona::types::*;
 
 use spawn::ExtraCapCopy;
 
@@ -76,7 +78,7 @@ pub const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
 const PM_WAIT_ANY_CHILD: u64 = u32::MAX as u64;
 
-pub const AT_BESALT_SHARED_LIB_BASE: u64 = 0x1006;
+pub const AT_TRONA_SHARED_LIB_BASE: u64 = 0x1006;
 
 // Keep init's transient frame/cap allocations above per-service child slots
 // while staying inside init CSpace (0..4095).
@@ -89,16 +91,16 @@ pub const AT_PHNUM: u64 = 5;
 pub const AT_PAGESZ: u64 = 6;
 pub const AT_BASE: u64 = 7;
 pub const AT_ENTRY: u64 = 9;
-pub const AT_BESALT_UNTYPED: u64 = 0x1000;
-pub const AT_BESALT_VSPACE: u64 = 0x1001;
-pub const AT_BESALT_SCRATCH: u64 = 0x1002;
-pub const AT_BESALT_INITRD: u64 = 0x1003;
-pub const AT_BESALT_INITRD_SZ: u64 = 0x1004;
-pub const AT_BESALT_FRAME_SLOT: u64 = 0x1005;
-pub const AT_BESALT_SLOT_BASE: u64 = 0x1007;
-pub const AT_BESALT_SLOT_COUNT: u64 = 0x1008;
-pub const AT_BESALT_EXPAND_EP: u64 = 0x1009;
-pub const AT_BESALT_MM_EP: u64 = 0x100B;
+pub const AT_TRONA_UNTYPED: u64 = 0x1000;
+pub const AT_TRONA_VSPACE: u64 = 0x1001;
+pub const AT_TRONA_SCRATCH: u64 = 0x1002;
+pub const AT_TRONA_INITRD: u64 = 0x1003;
+pub const AT_TRONA_INITRD_SZ: u64 = 0x1004;
+pub const AT_TRONA_FRAME_SLOT: u64 = 0x1005;
+pub const AT_TRONA_SLOT_BASE: u64 = 0x1007;
+pub const AT_TRONA_SLOT_COUNT: u64 = 0x1008;
+pub const AT_TRONA_EXPAND_EP: u64 = 0x1009;
+pub const AT_TRONA_MM_EP: u64 = 0x100B;
 pub const CAP_EXPAND_EP: u64 = 9;
 
 // ======================================================================
@@ -113,7 +115,7 @@ static mut INITRD_SIZE: usize = 0;
 // ======================================================================
 
 pub fn ipc_ctx() -> *mut IpcContext {
-    besalt::tls::current_ipc_ctx()
+    trona_posix::tls::current_ipc_ctx()
 }
 
 pub unsafe extern "C" fn init_alloc_frame_slot(_opaque: *mut u8) -> Cap {
@@ -169,7 +171,7 @@ fn validate_service_caps(mgr: &svc_mgr::ServiceManager) -> u32 {
         let name = def.name_bytes();
         for c in 0..def.cap_count as usize {
             if def.caps[c].dst_slot < MIN_SVC_SLOT {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[INIT] ERROR: ");
                     _lb.bytes(name);
                     _lb.str(b" CopyCap dst=");
@@ -181,7 +183,7 @@ fn validate_service_caps(mgr: &svc_mgr::ServiceManager) -> u32 {
         }
         for c in 0..def.ep_need_count as usize {
             if def.ep_needs[c].dst_slot < MIN_SVC_SLOT {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[INIT] ERROR: ");
                     _lb.bytes(name);
                     _lb.str(b" NeedEP dst=");
@@ -193,7 +195,7 @@ fn validate_service_caps(mgr: &svc_mgr::ServiceManager) -> u32 {
         }
         for c in 0..def.ep_inject_count as usize {
             if def.ep_injects[c].target_slot < MIN_SVC_SLOT {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[INIT] ERROR: ");
                     _lb.bytes(name);
                     _lb.str(b" InjectEP target=");
@@ -206,7 +208,7 @@ fn validate_service_caps(mgr: &svc_mgr::ServiceManager) -> u32 {
         for c in 0..def.create_ep_count as usize {
             let slot = def.create_eps[c].dst_slot;
             if !(MIN_BOOTSTRAP_EP_SLOT..=MAX_BOOTSTRAP_EP_SLOT).contains(&slot) {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[INIT] ERROR: ");
                     _lb.bytes(name);
                     _lb.str(b" CreateEP dst=");
@@ -233,9 +235,9 @@ unsafe fn create_declared_endpoints(
 
         for (index, def) in defs.iter().enumerate() {
             let ep_slot = init_alloc_frame_slot(core::ptr::null_mut());
-            let err = invoke::untyped_retype(ut, besalt::OBJ_ENDPOINT, 0, ep_slot);
+            let err = invoke::untyped_retype(ut, trona::OBJ_ENDPOINT, 0, ep_slot);
             if err != 0 {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[INIT] ERROR: CreateEP for ");
                     _lb.bytes(svc_name);
                     _lb.str(b" dst=");
@@ -260,7 +262,7 @@ unsafe fn read_boot_info() -> (u64, usize) {
         let page = BOOTINFO_VADDR as *const u64;
         let magic = core::ptr::read_volatile(page);
         if magic != BOOTINFO_MAGIC {
-            besalt::uerror!(|_lb| { _lb.str(b"[INIT] WARN: boot info magic mismatch\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[INIT] WARN: boot info magic mismatch\n"); });
             return (INITRD_VADDR, 0);
         }
         let vaddr = core::ptr::read_volatile(page.add(1));
@@ -290,7 +292,7 @@ unsafe fn init_bootinfo_snapshot_frame(ut: Cap) -> bool {
     unsafe {
         let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, CAP_BOOTINFO_SNAPSHOT_FRAME);
         if err != 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[INIT] FAIL: bootinfo snapshot frame retype\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[INIT] FAIL: bootinfo snapshot frame retype\n"); });
             return false;
         }
 
@@ -301,7 +303,7 @@ unsafe fn init_bootinfo_snapshot_frame(ut: Cap) -> bool {
             VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
         );
         if err != 0 {
-            besalt::uerror!(|_lb| { _lb.str(b"[INIT] FAIL: bootinfo snapshot scratch map\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[INIT] FAIL: bootinfo snapshot scratch map\n"); });
             return false;
         }
 
@@ -404,7 +406,7 @@ unsafe fn inject_caps_and_resume(
                         ep_needs[i].dst_slot, provider_ep,
                     );
                     if r != 0 {
-                        besalt::uerror!(|_lb| {
+                        trona::uerror!(|_lb| {
                             _lb.str(b"[INIT] WARN: inject NeedEP ");
                             _lb.bytes(svc_name);
                             _lb.str(b" slot=");
@@ -426,7 +428,7 @@ unsafe fn inject_caps_and_resume(
                 caps[i].dst_slot, caps[i].src_slot,
             );
             if r != 0 {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[INIT] WARN: inject CopyCap src=");
                     _lb.hex(caps[i].src_slot);
                     _lb.str(b" dst=");
@@ -448,7 +450,7 @@ unsafe fn inject_caps_and_resume(
                 cap,
             );
             if r != 0 {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[INIT] WARN: inject CreateEP dst=");
                     _lb.hex(create_eps[i].dst_slot);
                     _lb.str(b" failed\n");
@@ -458,7 +460,7 @@ unsafe fn inject_caps_and_resume(
 
         // Child was spawned suspended; resume only after all cap injections.
         if spawn::pm_resume_child(procmgr_ep, pid) != 0 {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[INIT] Failed to resume ");
                 _lb.bytes(name);
                 _lb.str(b"\n");
@@ -474,7 +476,7 @@ unsafe fn inject_caps_and_resume(
 // ======================================================================
 
 unsafe fn load_service_defs(mgr: &mut svc_mgr::ServiceManager) {
-    besalt::uinfo!(|_lb| { _lb.str(b"[INIT] Loading service definitions...\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[INIT] Loading service definitions...\n"); });
 
     unsafe {
         let initrd = INITRD_VADDR as *const u8;
@@ -491,19 +493,19 @@ unsafe fn load_service_defs(mgr: &mut svc_mgr::ServiceManager) {
                 continue;
             }
 
-            besalt::udebug!(|_lb| { _lb.str(b"[INIT] Found service file: "); _lb.bytes(name); _lb.str(b"\n"); });
+            trona::udebug!(|_lb| { _lb.str(b"[INIT] Found service file: "); _lb.bytes(name); _lb.str(b"\n"); });
 
             let data = core::slice::from_raw_parts(entry.data, entry.data_len);
             let mut def = ini::ServiceDef::zeroed();
             if ini::parse_service(data, &mut def) {
-                besalt::udebug!(|_lb| { _lb.str(b"[INIT] Parsed service: "); _lb.bytes(def.name_bytes()); _lb.str(b" binary="); _lb.bytes(def.binary_bytes()); _lb.str(b"\n"); });
+                trona::udebug!(|_lb| { _lb.str(b"[INIT] Parsed service: "); _lb.bytes(def.name_bytes()); _lb.str(b" binary="); _lb.bytes(def.binary_bytes()); _lb.str(b"\n"); });
                 mgr.add_service(&def);
             } else {
-                besalt::uerror!(|_lb| { _lb.str(b"[INIT] WARN: failed to parse service file\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[INIT] WARN: failed to parse service file\n"); });
             }
         }
 
-        besalt::uinfo!(|_lb| { _lb.str(b"[INIT] Found "); _lb.hex(mgr.count as u64); _lb.str(b" services\n"); });
+        trona::uinfo!(|_lb| { _lb.str(b"[INIT] Found "); _lb.hex(mgr.count as u64); _lb.str(b" services\n"); });
     }
 }
 
@@ -537,14 +539,14 @@ fn ends_with(haystack: &[u8], suffix: &[u8]) -> bool {
 // ======================================================================
 
 unsafe fn pre_create_endpoints(mgr: &mut svc_mgr::ServiceManager, ut: Cap) {
-    besalt::uinfo!(|_lb| { _lb.str(b"[INIT] Pre-creating service endpoints...\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[INIT] Pre-creating service endpoints...\n"); });
     for i in 0..mgr.count {
         let ep_slot = EP_POOL_BASE + i as u64;
-        let err = invoke::untyped_retype(ut, besalt::OBJ_ENDPOINT, 0, ep_slot);
+        let err = invoke::untyped_retype(ut, trona::OBJ_ENDPOINT, 0, ep_slot);
         if err == 0 {
             mgr.services[i].pre_ep = ep_slot;
         } else {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[INIT] WARN: pre-create EP for ");
                 _lb.bytes(mgr.services[i].def.name_bytes());
                 _lb.str(b" slot=");
@@ -576,12 +578,12 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
         let svc_idx = mgr.boot_order[order_idx] as usize;
 
         if mgr.services[svc_idx].state == svc_mgr::ServiceState::Failed {
-            besalt::udebug!(|_lb| { _lb.str(b"[INIT] Skipping failed service: "); _lb.bytes(mgr.services[svc_idx].def.name_bytes()); _lb.str(b"\n"); });
+            trona::udebug!(|_lb| { _lb.str(b"[INIT] Skipping failed service: "); _lb.bytes(mgr.services[svc_idx].def.name_bytes()); _lb.str(b"\n"); });
             continue;
         }
 
         if !mgr.deps_satisfied(svc_idx) {
-            besalt::uerror!(|_lb| { _lb.str(b"[INIT] Dependencies not met for "); _lb.bytes(mgr.services[svc_idx].def.name_bytes()); _lb.str(b", marking Failed\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[INIT] Dependencies not met for "); _lb.bytes(mgr.services[svc_idx].def.name_bytes()); _lb.str(b", marking Failed\n"); });
             mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
             continue;
         }
@@ -745,7 +747,7 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                         CAP_RIGHTS_ALL,
                     );
                     if err == 0 {
-                        besalt::udebug!(|_lb| {
+                        trona::udebug!(|_lb| {
                             _lb.str(b"[INIT] Injected EP into ");
                             _lb.bytes(tgt_name);
                             _lb.str(b" slot ");
@@ -753,7 +755,7 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                             _lb.str(b"\n");
                         });
                     } else {
-                        besalt::uerror!(|_lb| {
+                        trona::uerror!(|_lb| {
                             _lb.str(b"[INIT] ERROR: InjectEP into ");
                             _lb.bytes(tgt_name);
                             _lb.str(b" slot ");
@@ -776,10 +778,10 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                     let merr = invoke::cnode_mint(CAP_SELF_CSPACE, ep, CAP_SELF_CSPACE, pm_badged_slot, 1);
                     if merr == 0 {
                         procmgr_ep = pm_badged_slot;
-                        besalt::udebug!(|_lb| { _lb.str(b"[INIT] Minted badged PM EP (badge=1)\n"); });
+                        trona::udebug!(|_lb| { _lb.str(b"[INIT] Minted badged PM EP (badge=1)\n"); });
                     } else {
                         procmgr_ep = ep;
-                        besalt::uerror!(|_lb| { _lb.str(b"[INIT] WARN: mint badged PM EP failed\n"); });
+                        trona::uerror!(|_lb| { _lb.str(b"[INIT] WARN: mint badged PM EP failed\n"); });
                     }
                 }
             }
@@ -791,7 +793,7 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
         } else {
             // Post-procmgr: spawn via procmgr IPC
             if procmgr_ep == 0 {
-                besalt::uerror!(|_lb| { _lb.str(b"[INIT] Cannot spawn "); _lb.bytes(name); _lb.str(b" - procmgr not available\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[INIT] Cannot spawn "); _lb.bytes(name); _lb.str(b" - procmgr not available\n"); });
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
                 continue;
             }
@@ -813,7 +815,7 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
                 )
             };
             if pid < 0 {
-                besalt::uerror!(|_lb| { _lb.str(b"[INIT] Failed to spawn "); _lb.bytes(name); _lb.str(b" via procmgr\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[INIT] Failed to spawn "); _lb.bytes(name); _lb.str(b" via procmgr\n"); });
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
                 continue;
             }
@@ -852,15 +854,15 @@ fn find_service_by_pid(mgr: &svc_mgr::ServiceManager, pid: u32) -> i32 {
 /// Returns (exit_status, child_pid), or (0, 0) on error / no children.
 unsafe fn blocking_wait_child(pm_ep: Cap) -> (i32, u32) {
     unsafe {
-        let mut msg = BesaltMsg::zeroed();
+        let mut msg = TronaMsg::zeroed();
         msg.label = POSIX_PM_WAIT;
         msg.length = 2;
         msg.regs[0] = PM_WAIT_ANY_CHILD;
         msg.regs[1] = 0; // blocking (no WNOHANG)
 
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), pm_ep, &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != BESALT_OK {
+        if err != 0 || reply.label != TRONA_OK {
             return (0, 0);
         }
 
@@ -877,11 +879,11 @@ unsafe fn handle_child_exit(
     child_pid: u32,
     exit_status: i32,
 ) {
-    besalt::uinfo!(|_lb| { _lb.str(b"[INIT] Child exited: pid="); _lb.hex(child_pid as u64); _lb.str(b" status="); _lb.hex(exit_status as u64); _lb.str(b"\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[INIT] Child exited: pid="); _lb.hex(child_pid as u64); _lb.str(b" status="); _lb.hex(exit_status as u64); _lb.str(b"\n"); });
 
     let idx = find_service_by_pid(mgr, child_pid);
     if idx < 0 {
-        besalt::udebug!(|_lb| { _lb.str(b"[INIT] Unknown child pid, ignoring\n"); });
+        trona::udebug!(|_lb| { _lb.str(b"[INIT] Unknown child pid, ignoring\n"); });
         return;
     }
 
@@ -907,7 +909,7 @@ unsafe fn handle_child_exit(
             let pre_ep = mgr.services[svc_idx].pre_ep;
             let new_pid = spawn::pm_spawn(pm_ep, spawn_name, &mgr.services[svc_idx].def, pre_ep, true);
             if new_pid < 0 {
-                besalt::uerror!(|_lb| { _lb.str(b"[INIT] Failed to restart service\n"); });
+                trona::uerror!(|_lb| { _lb.str(b"[INIT] Failed to restart service\n"); });
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
             } else if !inject_caps_and_resume(mgr, svc_idx, pm_ep, new_pid as u32) {
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
@@ -923,15 +925,15 @@ unsafe fn handle_child_exit(
 unsafe fn drain_zombies(mgr: &mut svc_mgr::ServiceManager, pm_ep: Cap) {
     unsafe {
         loop {
-            let mut msg = BesaltMsg::zeroed();
+            let mut msg = TronaMsg::zeroed();
             msg.label = POSIX_PM_WAIT;
             msg.length = 2;
             msg.regs[0] = PM_WAIT_ANY_CHILD;
             msg.regs[1] = WNOHANG;
 
-            let mut reply = BesaltMsg::zeroed();
+            let mut reply = TronaMsg::zeroed();
             let err = ipc::call_ctx(ipc_ctx(), pm_ep, &raw const msg, &raw mut reply);
-            if err != 0 || reply.label != BESALT_OK {
+            if err != 0 || reply.label != TRONA_OK {
                 break;
             }
 
@@ -976,15 +978,15 @@ unsafe fn service_monitor(mgr: &mut svc_mgr::ServiceManager, pm_ep: Cap) -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    besalt::uinfo!(|_lb| { _lb.str(b"[INIT] SaltyOS init process starting\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[INIT] SaltyOS init process starting\n"); });
 
     let ut: Cap = select_init_work_untyped();
-    besalt::udebug!(|_lb| { _lb.str(b"[INIT] Bootstrap untyped slot="); _lb.hex(ut); _lb.str(b"\n"); });
+    trona::udebug!(|_lb| { _lb.str(b"[INIT] Bootstrap untyped slot="); _lb.hex(ut); _lb.str(b"\n"); });
 
     // Set up IPC buffer for init
     let err = invoke::untyped_retype(ut, OBJ_FRAME, 0, CAP_IPC_BUF_FRAME);
     if err != 0 {
-        besalt::uerror!(|_lb| { _lb.str(b"[INIT] FAIL: IPC buf frame retype\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[INIT] FAIL: IPC buf frame retype\n"); });
         idle();
     }
     let err = invoke::vspace_map(
@@ -994,7 +996,7 @@ pub extern "C" fn _start() -> ! {
         VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
     );
     if err != 0 {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[INIT] FAIL: IPC buf map err=");
             _lb.hex(err as u64);
             _lb.str(b"\n");
@@ -1005,15 +1007,15 @@ pub extern "C" fn _start() -> ! {
     unsafe {
         ipc::ipc_context_init(ipc_ctx(), IPC_BUF_VADDR as *mut IpcBuffer);
     }
-    besalt::udebug!(|_lb| { _lb.str(b"[INIT] IPC buffer mapped at "); _lb.hex(IPC_BUF_VADDR); _lb.str(b"\n"); });
+    trona::udebug!(|_lb| { _lb.str(b"[INIT] IPC buffer mapped at "); _lb.hex(IPC_BUF_VADDR); _lb.str(b"\n"); });
 
     // Read initrd size from kernel boot info page (once, at startup)
     let (_, initrd_size) = unsafe { read_boot_info() };
     unsafe { INITRD_SIZE = initrd_size; }
-    besalt::udebug!(|_lb| { _lb.str(b"[INIT] Initrd size from boot info: "); _lb.hex(initrd_size as u64); _lb.str(b" bytes\n"); });
+    trona::udebug!(|_lb| { _lb.str(b"[INIT] Initrd size from boot info: "); _lb.hex(initrd_size as u64); _lb.str(b" bytes\n"); });
 
     let total_usable = unsafe { read_total_usable_bytes() };
-    besalt::uinfo!(|_lb| { _lb.str(b"[INIT] Total usable RAM: "); _lb.hex(total_usable); _lb.str(b" bytes\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[INIT] Total usable RAM: "); _lb.hex(total_usable); _lb.str(b" bytes\n"); });
 
     if unsafe { !init_bootinfo_snapshot_frame(ut) } {
         idle();
@@ -1029,7 +1031,7 @@ pub extern "C" fn _start() -> ! {
     };
 
     if run_selftest {
-        besalt::uinfo!(|_lb| { _lb.str(b"[INIT] Self-test mode enabled\n"); });
+        trona::uinfo!(|_lb| { _lb.str(b"[INIT] Self-test mode enabled\n"); });
 
         if unsafe { selftest::phase1_ipc_test(ut) } != 0 {
             idle();
@@ -1048,7 +1050,7 @@ pub extern "C" fn _start() -> ! {
     unsafe { load_service_defs(mgr) };
 
     if mgr.count == 0 {
-        besalt::uerror!(|_lb| { _lb.str(b"[INIT] No service definitions found in initrd\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[INIT] No service definitions found in initrd\n"); });
         idle();
     }
 
@@ -1060,14 +1062,14 @@ pub extern "C" fn _start() -> ! {
     mgr.build_deps();
     let sort_ok = mgr.topological_sort();
     if !sort_ok {
-        besalt::uerror!(|_lb| { _lb.str(b"[INIT] WARNING: dependency cycle detected, some services may not start\n"); });
+        trona::uerror!(|_lb| { _lb.str(b"[INIT] WARNING: dependency cycle detected, some services may not start\n"); });
     }
     mgr.log_boot_order();
 
     // Validate service-declared cap slots are in the safe range (>= 64)
     let cap_errors = validate_service_caps(&mgr);
     if cap_errors > 0 {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[INIT] FATAL: ");
             _lb.hex(cap_errors as u64);
             _lb.str(b" service cap slot(s) in reserved range [0..63]\n");
@@ -1084,7 +1086,7 @@ pub extern "C" fn _start() -> ! {
             }
         }
         if pager_count != 1 {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[INIT] FATAL: exactly one service must declare Role=pager, found ");
                 _lb.hex(pager_count as u64);
                 _lb.str(b"\n");
@@ -1097,13 +1099,13 @@ pub extern "C" fn _start() -> ! {
     {
         let err = invoke::untyped_retype(ut, OBJ_NOTIFICATION, 0, CAP_PTY_NTFN);
         if err != 0 {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[INIT] WARN: PTY notification retype failed err=");
                 _lb.hex(err as u64);
                 _lb.str(b"\n");
             });
         } else {
-            besalt::udebug!(|_lb| { _lb.str(b"[INIT] PTY notification created at slot 14\n"); });
+            trona::udebug!(|_lb| { _lb.str(b"[INIT] PTY notification created at slot 14\n"); });
         }
     }
 
@@ -1114,6 +1116,6 @@ pub extern "C" fn _start() -> ! {
     let pm_ep = unsafe { boot_services(mgr, ut, total_usable) };
 
     // Service monitor loop
-    besalt::uinfo!(|_lb| { _lb.str(b"[INIT] Entering service monitor loop\n"); });
+    trona::uinfo!(|_lb| { _lb.str(b"[INIT] Entering service monitor loop\n"); });
     unsafe { service_monitor(mgr, pm_ep) };
 }

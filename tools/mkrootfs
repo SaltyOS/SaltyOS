@@ -125,8 +125,10 @@ def main():
         description='Create SaltyOS rootfs disk image from manifest')
     parser.add_argument('--output', '-o', required=True,
                         help='Output disk image path')
-    parser.add_argument('--manifest', '-m', action='append', required=True,
+    parser.add_argument('--manifest', '-m', action='append', default=[],
                         help='Manifest file (can specify multiple)')
+    parser.add_argument('--manifest-optional', action='append', default=[],
+                        help='Optional manifest file (silently skipped if missing)')
     parser.add_argument('--size', '-s', default='256M',
                         help='Disk image size (default: 256M)')
     parser.add_argument('--verbose', '-v', action='store_true',
@@ -139,6 +141,14 @@ def main():
     entries: list[ManifestEntry] = []
     for manifest in args.manifest:
         entries.extend(load_manifest(Path(manifest), args.verbose))
+    for manifest in args.manifest_optional:
+        p = Path(manifest)
+        if p.exists():
+            if args.verbose:
+                print(f"Optional manifest found: {p}")
+            entries.extend(load_manifest(p, args.verbose))
+        elif args.verbose:
+            print(f"Optional manifest skipped (not found): {p}")
 
     if not entries:
         print("Error: no entries found in manifest(s)", file=sys.stderr)

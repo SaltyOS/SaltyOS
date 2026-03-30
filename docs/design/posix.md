@@ -8,14 +8,14 @@ SaltyOS follows the **microkernel POSIX model** pioneered by Minix3 and QNX:
 
 - The kernel provides only primitives: IPC, scheduling, memory management, capabilities
 - POSIX semantics are implemented entirely in **userspace servers**
-- **libbesalt** (Rust) provides POSIX wrappers that translate calls to IPC messages
-- **besaltc** (C) provides a standard C library on top of libbesalt
+- **trona** (Rust) provides POSIX wrappers that translate calls to IPC messages
+- **basaltc** (C) provides a standard C library on top of trona
 
 ```
 +-----------------------------------------------+
 |              Applications                      |
 +-----------------------------------------------+
-|    besaltc (C stdlib)  |  libbesalt (Rust)       |
+|    basaltc (C stdlib)  |  trona (Rust)       |
 |      [POSIX calls -> IPC + capabilities]       |
 +-----------------------------------------------+
 |  VFS  |  ProcMgr  |  Console  |  Drivers      |
@@ -36,19 +36,19 @@ SaltyOS follows the **microkernel POSIX model** pioneered by Minix3 and QNX:
 
 ## Architecture
 
-### Libraries: libbesalt + besaltc
+### Libraries: trona + basaltc
 
 SaltyOS uses a two-layer userspace library stack:
 
-- **libbesalt** (`lib/besalt/lib/`, Rust): System library providing raw syscall wrappers, IPC helpers, capability invocations, and POSIX compatibility functions (`posix.rs`, `posix_mm.rs`, `signals.rs`). Compiled as `libbesalt.so` (shared) and linked statically into `init`.
-- **besaltc** (`lib/besaltc/`, C): Standard C library built on top of libbesalt, providing stdio, stdlib, string, malloc, unistd, signal, termios, dirent, regex, and more.
+- **trona** (`lib/trona/substrate/`, Rust): System library providing raw syscall wrappers, IPC helpers, capability invocations, and POSIX compatibility functions (`posix.rs`, `posix_mm.rs`, `signals.rs`). Compiled as `libtrona.so` (shared) and linked statically into `init`.
+- **basaltc** (`lib/basaltc/`, C): Standard C library built on top of trona, providing stdio, stdlib, string, malloc, unistd, signal, termios, dirent, regex, and more.
 
 **How POSIX calls work**:
 ```rust
-// libbesalt posix.rs — open() sends IPC to VFS server
+// trona posix.rs — open() sends IPC to VFS server
 pub extern "C" fn open(path: *const u8, flags: i32, mode: u32) -> i32 {
     // Build IPC message with VFS_OPEN label
-    // besalt_call(vfs_ep, &msg) → VFS server handles it
+    // trona_call(vfs_ep, &msg) → VFS server handles it
 }
 ```
 
@@ -59,12 +59,12 @@ pub extern "C" fn open(path: *const u8, flags: i32, mode: u32) -> i32 {
 | **VFS** | open, read, write, close, stat, lseek, dup/dup3, pipe/pipe2, mkfifo, socket (AF_UNIX), poll, epoll, shm_open/shm_unlink, ftruncate |
 | **ProcMgr** | fork, exec, exit, wait, getpid, kill, signal delivery, process groups |
 | **Console** | Serial I/O, line discipline (ICANON/ECHO/ISIG), tcgetattr/tcsetattr, signal generation (Ctrl-C/Ctrl-\/Ctrl-Z) |
-| **libbesalt** | mmap (anonymous), munmap, mprotect, brk/sbrk, sigaction, sigprocmask, select |
+| **trona** | mmap (anonymous), munmap, mprotect, brk/sbrk, sigaction, sigprocmask, select |
 
 ### IPC Flow Example
 
 ```
-Application                  libbesalt                    VFS Server
+Application                  trona                    VFS Server
     |                           |                            |
     | open("/etc/hosts", O_RDONLY)                           |
     |-------------------------->|                            |
@@ -120,28 +120,28 @@ Application                  libbesalt                    VFS Server
 **Unix Domain Sockets**:
 | Function | Status | Notes |
 |----------|--------|-------|
-| `socket(AF_UNIX, ...)` | Implemented | VFS server + libbesalt posix.rs |
-| `bind`, `listen`, `accept` | Implemented | VFS server + libbesalt posix.rs |
-| `connect` | Implemented | VFS server + libbesalt posix.rs |
+| `socket(AF_UNIX, ...)` | Implemented | VFS server + trona posix.rs |
+| `bind`, `listen`, `accept` | Implemented | VFS server + trona posix.rs |
+| `connect` | Implemented | VFS server + trona posix.rs |
 | `sendmsg`, `recvmsg` | Implemented | With fd passing support |
-| `socketpair` | Implemented | VFS server + libbesalt posix.rs |
+| `socketpair` | Implemented | VFS server + trona posix.rs |
 | `shutdown` | Implemented | SHUT_RD/SHUT_WR/SHUT_RDWR |
 | `SCM_RIGHTS` | Implemented | fd passing via sendmsg/recvmsg |
 
 **Event Multiplexing**:
 | Function | Status | Notes |
 |----------|--------|-------|
-| `poll` | Implemented | VFS server + libbesalt posix.rs |
-| `select` | Implemented | Wrapper around poll in libbesalt |
-| `epoll_create1`, `epoll_ctl`, `epoll_wait` | Implemented | VFS server + libbesalt posix.rs |
+| `poll` | Implemented | VFS server + trona posix.rs |
+| `select` | Implemented | Wrapper around poll in trona |
+| `epoll_create1`, `epoll_ctl`, `epoll_wait` | Implemented | VFS server + trona posix.rs |
 
 **POSIX Shared Memory**:
 | Function | Status | Notes |
 |----------|--------|-------|
-| `shm_open` | Implemented | VFS server + libbesalt posix.rs |
-| `shm_unlink` | Implemented | VFS server + libbesalt posix.rs |
+| `shm_open` | Implemented | VFS server + trona posix.rs |
+| `shm_unlink` | Implemented | VFS server + trona posix.rs |
 | `mmap` (shared) | Implemented | MAP_SHARED flag support |
-| `ftruncate` | Implemented | VFS server + libbesalt posix.rs |
+| `ftruncate` | Implemented | VFS server + trona posix.rs |
 
 **Signals**:
 | Function | Status | Notes |
@@ -149,7 +149,7 @@ Application                  libbesalt                    VFS Server
 | `kill` | Implemented | Via ProcMgr IPC, pid==0 kills process group |
 | `signal` | Implemented | Notification-based delivery |
 | `sigaction` | Implemented | sa_mask, SA_RESETHAND, pending re-raise |
-| `sigprocmask` | Implemented | Syncs with libbesalt globals |
+| `sigprocmask` | Implemented | Syncs with trona globals |
 
 ### Pipes, FIFOs, and File Descriptors
 
@@ -322,7 +322,7 @@ Modern X11 (Xorg 1.15+) no longer requires:
 
 ```
 Phase 1: Core POSIX                              [DONE]
-├── libbesalt (Rust) + besaltc (C stdlib)
+├── trona (Rust) + basaltc (C stdlib)
 ├── VFS server (file I/O, ramfs, devfs)
 ├── ProcMgr (fork, exec, wait, kill)
 └── Signal delivery (notification-based)

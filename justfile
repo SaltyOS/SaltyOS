@@ -178,7 +178,7 @@ run *ARGS: build
 # Connect GDB to running QEMU
 gdb:
     gdb -ex "target remote localhost:1234" \
-        -ex "symbol-file {{builddir}}/kernel/kernel.elf"
+        -ex "symbol-file {{builddir}}/kernite/kernite.elf"
 
 # =============================================================================
 # Utilities
@@ -237,12 +237,12 @@ cross-hello-cpp: sysroot
 
 # Format all source code
 fmt:
-    find kernel -name "*.rs" -exec rustfmt {} \;
+    find kernite -name "*.rs" -exec rustfmt {} \;
     find boot -name "*.c" -o -name "*.h" | xargs clang-format -i
 
 # Check formatting without modifying
 fmt-check:
-    find kernel -name "*.rs" -exec rustfmt --check {} \;
+    find kernite -name "*.rs" -exec rustfmt --check {} \;
 
 # Run clippy on kernel
 clippy:
@@ -255,7 +255,7 @@ docs:
 # Show line counts
 loc:
     @echo "=== Source Lines of Code ==="
-    @find kernel boot userland lib -name "*.rs" -o -name "*.c" -o -name "*.h" -o -name "*.asm" 2>/dev/null | xargs wc -l | tail -1
+    @find kernite boot userland lib -name "*.rs" -o -name "*.c" -o -name "*.h" -o -name "*.asm" 2>/dev/null | xargs wc -l | tail -1
 
 # =============================================================================
 # Ports
@@ -283,8 +283,10 @@ clean-ports:
         for w in "$d"work-*/; do
             [ -d "$w" ] && rm -rf "$w" && echo "Removed $w"
         done
-        # Remove staged artifacts
-        [ -d "${d}stage" ] && rm -rf "${d}stage" && echo "Removed ${d}stage"
+        # Remove staged artifacts (arch-qualified: stage-x86_64/, stage-aarch64/)
+        for s in "$d"stage-*/; do
+            [ -d "$s" ] && rm -rf "$s" && echo "Removed $s"
+        done
     done
     # Remove meson port stamps from build dirs
     for bd in build-*/ports/; do
@@ -316,6 +318,7 @@ mksaltyfs:
 mkrootfs: build
     #!/usr/bin/env bash
     source tools/toolchain/env.sh
+    rm -f {{builddir}}/rootfs.img
     meson compile -C {{builddir}} rootfs_image
 
 # Create a new component skeleton

@@ -1,6 +1,6 @@
 use crate::types::*;
-use besalt::consts::*;
-use besalt::types::*;
+use trona::consts::*;
+use trona::types::*;
 
 pub(crate) unsafe fn find_client_by_badge(badge: u64) -> *mut MmClient {
     unsafe {
@@ -44,7 +44,7 @@ pub(crate) unsafe fn find_free_client_slot() -> *mut MmClient {
         let free = new_ptr.add(cap);
         *(&raw mut super::CLIENTS_PTR) = new_ptr;
         *(&raw mut super::CLIENTS_CAP) = new_cap;
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[MMSRV] clients grown to ");
             _lb.hex(new_cap as u64);
             _lb.str(b"\n");
@@ -112,7 +112,7 @@ pub(crate) unsafe fn find_region_by_addr(client: *mut MmClient, addr: u64) -> *m
 ///   MR2 = mmap_base
 ///   MR3 = pid
 ///   + cap transfer: client's VSpace cap
-pub(crate) unsafe fn handle_mm_register(msg: *const BesaltMsg, _caller_badge: u64, reply: *mut BesaltMsg) {
+pub(crate) unsafe fn handle_mm_register(msg: *const TronaMsg, _caller_badge: u64, reply: *mut TronaMsg) {
     unsafe {
         let client_badge = (*msg).regs[0];
         let heap_base = (*msg).regs[1];
@@ -120,28 +120,28 @@ pub(crate) unsafe fn handle_mm_register(msg: *const BesaltMsg, _caller_badge: u6
         let pid = (*msg).regs[3] as u32;
 
         if client_badge == 0 {
-            (*reply).label = BESALT_INVALID_ARGUMENT;
+            (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
         // Check for duplicate
         if !find_client_by_badge(client_badge).is_null() {
-            besalt::uwarn!(|_lb| {
+            trona::uwarn!(|_lb| {
                 _lb.str(b"[MMSRV] REGISTER: duplicate badge=");
                 _lb.hex(client_badge);
                 _lb.str(b"\n");
             });
-            (*reply).label = BESALT_ALREADY_EXISTS;
+            (*reply).label = TRONA_ALREADY_EXISTS;
             return;
         }
 
         // Find free slot in client table (grows if needed)
         let slot = find_free_client_slot();
         if slot.is_null() {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[MMSRV] REGISTER: client table full, grow failed\n");
             });
-            (*reply).label = BESALT_OUT_OF_MEMORY;
+            (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
 
@@ -165,7 +165,7 @@ pub(crate) unsafe fn handle_mm_register(msg: *const BesaltMsg, _caller_badge: u6
         // This handler permanently keeps the VSpace cap
         super::mark_recv_slot_kept();
 
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[MMSRV] registered client badge=");
             _lb.hex(client_badge);
             _lb.str(b" pid=");
@@ -177,18 +177,18 @@ pub(crate) unsafe fn handle_mm_register(msg: *const BesaltMsg, _caller_badge: u6
             _lb.str(b"\n");
         });
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }
 
 /// MM_DEREGISTER: procmgr removes a client on exit.
 ///   MR0 = client badge
-pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: u64, reply: *mut BesaltMsg) {
+pub(crate) unsafe fn handle_mm_deregister(msg: *const TronaMsg, _caller_badge: u64, reply: *mut TronaMsg) {
     unsafe {
         let client_badge = (*msg).regs[0];
         let client = find_client_by_badge(client_badge);
         if client.is_null() {
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
             return;
         }
 
@@ -209,13 +209,13 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: 
                         if (*r).mo_cap != 0 {
                             let page_count = (*r).length / 4096;
                             if page_count != 0 {
-                                let err = besalt::invoke::vspace_unmap_mo(
+                                let err = trona::invoke::vspace_unmap_mo(
                                     vspace_cap,
                                     (*r).base,
                                     page_count,
                                 );
                                 if err != 0 {
-                                    besalt::uerror!(|_lb| {
+                                    trona::uerror!(|_lb| {
                                         _lb.str(b"[MMSRV] DEREGISTER: unmap_mo failed badge=");
                                         _lb.hex(client_badge);
                                         _lb.str(b" base=");
@@ -231,7 +231,7 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: 
                         } else {
                             let page_count = (*r).length / 4096;
                             for page in 0..page_count {
-                                let _ = besalt::invoke::vspace_unmap(
+                                let _ = trona::invoke::vspace_unmap(
                                     vspace_cap,
                                     (*r).base + page * 4096,
                                 );
@@ -255,7 +255,7 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: 
         (*client).badge = 0;
         *(&raw mut super::CLIENT_COUNT) -= 1;
 
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[MMSRV] deregistered client badge=");
             _lb.hex(client_badge);
             _lb.str(b" pid=");
@@ -263,14 +263,14 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const BesaltMsg, _caller_badge: 
             _lb.str(b"\n");
         });
 
-        (*reply).label = BESALT_OK;
+        (*reply).label = TRONA_OK;
     }
 }
 
 /// MM_GET_CLIENT_STATS: return memory stats for a client identified by PID.
 /// Request: regs[0] = pid
 /// Reply: regs[0]=heap_base, regs[1]=heap_current, regs[2]=region_count, regs[3]=total_pages
-pub(crate) unsafe fn handle_mm_get_client_stats(msg: *const BesaltMsg, _badge: u64, reply: *mut BesaltMsg) {
+pub(crate) unsafe fn handle_mm_get_client_stats(msg: *const TronaMsg, _badge: u64, reply: *mut TronaMsg) {
     unsafe {
         let pid = (*msg).regs[0] as u32;
         let ptr = *(&raw const super::CLIENTS_PTR);
@@ -290,14 +290,14 @@ pub(crate) unsafe fn handle_mm_get_client_stats(msg: *const BesaltMsg, _badge: u
                     }
                 }
                 (*reply).regs[3] = total_pages;
-                (*reply).label = BESALT_OK;
+                (*reply).label = TRONA_OK;
                 (*reply).length = 4;
                 found = true;
                 break;
             }
         }
         if !found {
-            (*reply).label = BESALT_NOT_FOUND;
+            (*reply).label = TRONA_NOT_FOUND;
         }
     }
 }

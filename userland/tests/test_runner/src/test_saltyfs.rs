@@ -3,11 +3,11 @@
 //! Tests are skipped gracefully if no data disk is present.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::consts::*;
-use besalt::posix;
-use besalt::serial;
-use besalt::serial::LineBuf;
-use besalt::types::*;
+use trona::consts::*;
+use trona_posix::proc as posix;
+use trona::serial;
+use trona::serial::LineBuf;
+use trona::types::*;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -15,8 +15,8 @@ fn puts(s: &[u8]) {
 
 /// Check if /mnt/data is accessible (SaltyFS is mounted).
 fn saltyfs_available() -> bool {
-    let mut st = BesaltStat::zeroed();
-    let ret = unsafe { posix::posix_stat(b"/mnt/data\0".as_ptr(), &raw mut st) };
+    let mut st = TronaStat::zeroed();
+    let ret = unsafe { trona_posix::posix_stat(b"/mnt/data\0".as_ptr(), &raw mut st) };
     ret == 0
 }
 
@@ -31,8 +31,8 @@ pub fn run() -> bool {
     // Test 1: stat /mnt/data
     puts(b"[TEST_SALTYFS] Test 1: stat /mnt/data\n");
     {
-        let mut st = BesaltStat::zeroed();
-        let ret = unsafe { posix::posix_stat(b"/mnt/data\0".as_ptr(), &raw mut st) };
+        let mut st = TronaStat::zeroed();
+        let ret = unsafe { trona_posix::posix_stat(b"/mnt/data\0".as_ptr(), &raw mut st) };
         if ret != 0 {
             puts(b"[TEST_SALTYFS] FAIL: stat /mnt/data returned error\n");
             return false;
@@ -47,18 +47,18 @@ pub fn run() -> bool {
     // Test 2: mkdir /mnt/data/testdir
     puts(b"[TEST_SALTYFS] Test 2: mkdir /mnt/data/testdir\n");
     {
-        let ret = unsafe { posix::posix_mkdir(b"/mnt/data/testdir\0".as_ptr(), 0o755) };
+        let ret = unsafe { trona_posix::posix_mkdir(b"/mnt/data/testdir\0".as_ptr(), 0o755) };
         if ret != 0 {
             // On re-run the directory may already exist; treat that as success
-            let mut st2 = BesaltStat::zeroed();
-            let sret = unsafe { posix::posix_stat(b"/mnt/data/testdir\0".as_ptr(), &raw mut st2) };
+            let mut st2 = TronaStat::zeroed();
+            let sret = unsafe { trona_posix::posix_stat(b"/mnt/data/testdir\0".as_ptr(), &raw mut st2) };
             if sret != 0 || (st2.st_mode & S_IFMT) != S_IFDIR {
                 puts(b"[TEST_SALTYFS] FAIL: mkdir /mnt/data/testdir failed\n");
                 return false;
             }
         }
-        let mut st = BesaltStat::zeroed();
-        let ret = unsafe { posix::posix_stat(b"/mnt/data/testdir\0".as_ptr(), &raw mut st) };
+        let mut st = TronaStat::zeroed();
+        let ret = unsafe { trona_posix::posix_stat(b"/mnt/data/testdir\0".as_ptr(), &raw mut st) };
         if ret != 0 {
             puts(b"[TEST_SALTYFS] FAIL: stat /mnt/data/testdir failed\n");
             return false;
@@ -70,30 +70,30 @@ pub fn run() -> bool {
     puts(b"[TEST_SALTYFS] Test 3: create + write + read file\n");
     {
         let path = b"/mnt/data/testdir/test.txt\0";
-        let fd = unsafe { posix::posix_open(path.as_ptr(), (O_CREAT | O_TRUNC | O_WRONLY) as i32, 0o644) };
+        let fd = unsafe { trona_posix::posix_open(path.as_ptr(), (O_CREAT | O_TRUNC | O_WRONLY) as i32, 0o644) };
         if fd < 0 {
             puts(b"[TEST_SALTYFS] FAIL: open for write failed\n");
             return false;
         }
 
         let data = b"Hello SaltyFS!";
-        let written = unsafe { posix::posix_write(fd, data.as_ptr(), data.len() as u64) };
-        unsafe { posix::posix_close(fd) };
+        let written = unsafe { trona_posix::posix_write(fd, data.as_ptr(), data.len() as u64) };
+        unsafe { trona_posix::posix_close(fd) };
 
         if written != data.len() as i64 {
             puts(b"[TEST_SALTYFS] FAIL: write returned wrong count\n");
             return false;
         }
 
-        let fd = unsafe { posix::posix_open(path.as_ptr(), O_RDONLY as i32, 0) };
+        let fd = unsafe { trona_posix::posix_open(path.as_ptr(), O_RDONLY as i32, 0) };
         if fd < 0 {
             puts(b"[TEST_SALTYFS] FAIL: open for read failed\n");
             return false;
         }
 
         let mut buf = [0u8; 64];
-        let read_count = unsafe { posix::posix_read(fd, buf.as_mut_ptr(), buf.len() as u64) };
-        unsafe { posix::posix_close(fd) };
+        let read_count = unsafe { trona_posix::posix_read(fd, buf.as_mut_ptr(), buf.len() as u64) };
+        unsafe { trona_posix::posix_close(fd) };
 
         if read_count != data.len() as i64 {
             puts(b"[TEST_SALTYFS] FAIL: read returned wrong count\n");
@@ -118,7 +118,7 @@ pub fn run() -> bool {
     puts(b"[TEST_SALTYFS] Test 4: large file write + read (8KB)\n");
     {
         let path = b"/mnt/data/testdir/large.bin\0";
-        let fd = unsafe { posix::posix_open(path.as_ptr(), (O_CREAT | O_WRONLY) as i32, 0o644) };
+        let fd = unsafe { trona_posix::posix_open(path.as_ptr(), (O_CREAT | O_WRONLY) as i32, 0o644) };
         if fd < 0 {
             puts(b"[TEST_SALTYFS] FAIL: open large file for write failed\n");
             return false;
@@ -134,18 +134,18 @@ pub fn run() -> bool {
         let mut written_total: usize = 0;
         while written_total < total_size {
             let chunk = core::cmp::min(pattern.len(), total_size - written_total);
-            let w = unsafe { posix::posix_write(fd, pattern.as_ptr(), chunk as u64) };
+            let w = unsafe { trona_posix::posix_write(fd, pattern.as_ptr(), chunk as u64) };
             if w <= 0 {
                 puts(b"[TEST_SALTYFS] FAIL: write chunk failed\n");
-                unsafe { posix::posix_close(fd) };
+                unsafe { trona_posix::posix_close(fd) };
                 return false;
             }
             written_total += w as usize;
         }
-        unsafe { posix::posix_close(fd) };
+        unsafe { trona_posix::posix_close(fd) };
 
         // Read back and verify
-        let fd = unsafe { posix::posix_open(path.as_ptr(), O_RDONLY as i32, 0) };
+        let fd = unsafe { trona_posix::posix_open(path.as_ptr(), O_RDONLY as i32, 0) };
         if fd < 0 {
             puts(b"[TEST_SALTYFS] FAIL: open large file for read failed\n");
             return false;
@@ -155,7 +155,7 @@ pub fn run() -> bool {
         let mut read_buf = [0u8; 256];
         let mut data_ok = true;
         while read_total < total_size {
-            let r = unsafe { posix::posix_read(fd, read_buf.as_mut_ptr(), read_buf.len() as u64) };
+            let r = unsafe { trona_posix::posix_read(fd, read_buf.as_mut_ptr(), read_buf.len() as u64) };
             if r <= 0 {
                 break;
             }
@@ -182,7 +182,7 @@ pub fn run() -> bool {
             }
             read_total += r as usize;
         }
-        unsafe { posix::posix_close(fd) };
+        unsafe { trona_posix::posix_close(fd) };
 
         if !data_ok || read_total != total_size {
             {
@@ -202,18 +202,18 @@ pub fn run() -> bool {
     // Test 5: readdir /mnt/data/testdir
     puts(b"[TEST_SALTYFS] Test 5: readdir /mnt/data/testdir\n");
     {
-        let dir_fd = unsafe { posix::posix_opendir(b"/mnt/data/testdir\0".as_ptr()) };
+        let dir_fd = unsafe { trona_posix::posix_opendir(b"/mnt/data/testdir\0".as_ptr()) };
         if dir_fd < 0 {
             puts(b"[TEST_SALTYFS] FAIL: opendir /mnt/data/testdir failed\n");
             return false;
         }
 
-        let mut dent = BesaltDirent::zeroed();
+        let mut dent = TronaDirent::zeroed();
         let mut count = 0u32;
-        while unsafe { posix::posix_readdir(dir_fd, &raw mut dent) } != 0 {
+        while unsafe { trona_posix::posix_readdir(dir_fd, &raw mut dent) } != 0 {
             count += 1;
         }
-        unsafe { posix::posix_closedir(dir_fd) };
+        unsafe { trona_posix::posix_closedir(dir_fd) };
 
         if count < 2 {
             puts(b"[TEST_SALTYFS] FAIL: readdir found fewer than 2 entries\n");
@@ -232,23 +232,23 @@ pub fn run() -> bool {
     puts(b"[TEST_SALTYFS] Test 6: lseek on mounted file\n");
     {
         let path = b"/mnt/data/testdir/test.txt\0";
-        let fd = unsafe { posix::posix_open(path.as_ptr(), O_RDONLY as i32, 0) };
+        let fd = unsafe { trona_posix::posix_open(path.as_ptr(), O_RDONLY as i32, 0) };
         if fd < 0 {
             puts(b"[TEST_SALTYFS] FAIL: open for lseek test failed\n");
             return false;
         }
 
         // Seek to offset 6
-        let off = unsafe { posix::posix_lseek(fd, 6, SEEK_SET as i32) };
+        let off = unsafe { trona_posix::posix_lseek(fd, 6, SEEK_SET as i32) };
         if off != 6 {
             puts(b"[TEST_SALTYFS] FAIL: lseek SET failed\n");
-            unsafe { posix::posix_close(fd) };
+            unsafe { trona_posix::posix_close(fd) };
             return false;
         }
 
         let mut buf = [0u8; 8];
-        let r = unsafe { posix::posix_read(fd, buf.as_mut_ptr(), 8) };
-        unsafe { posix::posix_close(fd) };
+        let r = unsafe { trona_posix::posix_read(fd, buf.as_mut_ptr(), 8) };
+        unsafe { trona_posix::posix_close(fd) };
 
         if r < 8 || buf[0] != b'S' || buf[1] != b'a' || buf[2] != b'l' {
             puts(b"[TEST_SALTYFS] FAIL: read after lseek returned wrong data\n");
@@ -261,15 +261,15 @@ pub fn run() -> bool {
     puts(b"[TEST_SALTYFS] Test 7: fstat on mounted file\n");
     {
         let path = b"/mnt/data/testdir/test.txt\0";
-        let fd = unsafe { posix::posix_open(path.as_ptr(), O_RDONLY as i32, 0) };
+        let fd = unsafe { trona_posix::posix_open(path.as_ptr(), O_RDONLY as i32, 0) };
         if fd < 0 {
             puts(b"[TEST_SALTYFS] FAIL: open for fstat test failed\n");
             return false;
         }
 
-        let mut st = BesaltStat::zeroed();
-        let ret = unsafe { posix::posix_fstat(fd, &raw mut st) };
-        unsafe { posix::posix_close(fd) };
+        let mut st = TronaStat::zeroed();
+        let ret = unsafe { trona_posix::posix_fstat(fd, &raw mut st) };
+        unsafe { trona_posix::posix_close(fd) };
 
         if ret != 0 {
             puts(b"[TEST_SALTYFS] FAIL: fstat failed\n");
@@ -290,44 +290,44 @@ pub fn run() -> bool {
     puts(b"[TEST_SALTYFS] Test 8: truncate file\n");
     {
         let path = b"/mnt/data/testdir/trunc.txt\0";
-        let fd = unsafe { posix::posix_open(path.as_ptr(), (O_CREAT | O_WRONLY) as i32, 0o644) };
+        let fd = unsafe { trona_posix::posix_open(path.as_ptr(), (O_CREAT | O_WRONLY) as i32, 0o644) };
         if fd < 0 {
             puts(b"[TEST_SALTYFS] FAIL: open for truncate test failed\n");
             return false;
         }
         let data = b"0123456789ABCDEF";
-        unsafe { posix::posix_write(fd, data.as_ptr(), data.len() as u64) };
-        unsafe { posix::posix_close(fd) };
+        unsafe { trona_posix::posix_write(fd, data.as_ptr(), data.len() as u64) };
+        unsafe { trona_posix::posix_close(fd) };
 
         // Open for truncate via ftruncate
-        let fd2 = unsafe { posix::posix_open(path.as_ptr(), O_WRONLY as i32, 0) };
+        let fd2 = unsafe { trona_posix::posix_open(path.as_ptr(), O_WRONLY as i32, 0) };
         if fd2 < 0 {
             puts(b"[TEST_SALTYFS] FAIL: open for ftruncate failed\n");
             return false;
         }
-        let ret = unsafe { posix::posix_ftruncate(fd2, 8) };
-        unsafe { posix::posix_close(fd2) };
+        let ret = unsafe { trona_posix::posix_ftruncate(fd2, 8) };
+        unsafe { trona_posix::posix_close(fd2) };
         if ret != 0 {
             puts(b"[TEST_SALTYFS] FAIL: ftruncate failed\n");
             return false;
         }
 
-        let mut st = BesaltStat::zeroed();
-        let ret = unsafe { posix::posix_stat(path.as_ptr(), &raw mut st) };
+        let mut st = TronaStat::zeroed();
+        let ret = unsafe { trona_posix::posix_stat(path.as_ptr(), &raw mut st) };
         if ret != 0 || st.st_size != 8 {
             puts(b"[TEST_SALTYFS] FAIL: stat after truncate wrong size\n");
             return false;
         }
 
         // Read back truncated data
-        let fd = unsafe { posix::posix_open(path.as_ptr(), O_RDONLY as i32, 0) };
+        let fd = unsafe { trona_posix::posix_open(path.as_ptr(), O_RDONLY as i32, 0) };
         if fd < 0 {
             puts(b"[TEST_SALTYFS] FAIL: open after truncate failed\n");
             return false;
         }
         let mut buf = [0u8; 16];
-        let r = unsafe { posix::posix_read(fd, buf.as_mut_ptr(), 16) };
-        unsafe { posix::posix_close(fd) };
+        let r = unsafe { trona_posix::posix_read(fd, buf.as_mut_ptr(), 16) };
+        unsafe { trona_posix::posix_close(fd) };
         if r != 8 || buf[0] != b'0' || buf[7] != b'7' {
             puts(b"[TEST_SALTYFS] FAIL: data after truncate wrong\n");
             return false;
@@ -340,19 +340,19 @@ pub fn run() -> bool {
     {
         let old = b"/mnt/data/testdir/trunc.txt\0";
         let new = b"/mnt/data/testdir/renamed.txt\0";
-        let ret = unsafe { posix::posix_rename(old.as_ptr(), new.as_ptr()) };
+        let ret = unsafe { trona_posix::posix_rename(old.as_ptr(), new.as_ptr()) };
         if ret != 0 {
             puts(b"[TEST_SALTYFS] FAIL: rename failed\n");
             return false;
         }
 
-        let mut st = BesaltStat::zeroed();
-        let ret = unsafe { posix::posix_stat(new.as_ptr(), &raw mut st) };
+        let mut st = TronaStat::zeroed();
+        let ret = unsafe { trona_posix::posix_stat(new.as_ptr(), &raw mut st) };
         if ret != 0 {
             puts(b"[TEST_SALTYFS] FAIL: stat renamed file failed\n");
             return false;
         }
-        let ret = unsafe { posix::posix_stat(old.as_ptr(), &raw mut st) };
+        let ret = unsafe { trona_posix::posix_stat(old.as_ptr(), &raw mut st) };
         if ret == 0 {
             puts(b"[TEST_SALTYFS] FAIL: old path still exists after rename\n");
             return false;
@@ -364,13 +364,13 @@ pub fn run() -> bool {
     puts(b"[TEST_SALTYFS] Test 10: unlink file\n");
     {
         let path = b"/mnt/data/testdir/renamed.txt\0";
-        let ret = unsafe { posix::posix_unlink(path.as_ptr()) };
+        let ret = unsafe { trona_posix::posix_unlink(path.as_ptr()) };
         if ret != 0 {
             puts(b"[TEST_SALTYFS] FAIL: unlink failed\n");
             return false;
         }
-        let mut st = BesaltStat::zeroed();
-        let ret = unsafe { posix::posix_stat(path.as_ptr(), &raw mut st) };
+        let mut st = TronaStat::zeroed();
+        let ret = unsafe { trona_posix::posix_stat(path.as_ptr(), &raw mut st) };
         if ret == 0 {
             puts(b"[TEST_SALTYFS] FAIL: file still exists after unlink\n");
             return false;
@@ -383,14 +383,14 @@ pub fn run() -> bool {
     {
         let target = b"/mnt/data/testdir/test.txt\0";
         let link = b"/mnt/data/testdir/link.txt\0";
-        let ret = unsafe { posix::posix_symlink(target.as_ptr(), link.as_ptr()) };
+        let ret = unsafe { trona_posix::posix_symlink(target.as_ptr(), link.as_ptr()) };
         if ret != 0 {
             puts(b"[TEST_SALTYFS] FAIL: symlink failed\n");
             return false;
         }
 
         let mut buf = [0u8; 128];
-        let r = unsafe { posix::posix_readlink(link.as_ptr(), buf.as_mut_ptr(), 128) };
+        let r = unsafe { trona_posix::posix_readlink(link.as_ptr(), buf.as_mut_ptr(), 128) };
         if r <= 0 {
             puts(b"[TEST_SALTYFS] FAIL: readlink failed\n");
             return false;
@@ -430,21 +430,21 @@ pub fn run() -> bool {
     {
         let src = b"/mnt/data/testdir/test.txt\0";
         let dst = b"/mnt/data/testdir/hardlink.txt\0";
-        let ret = unsafe { posix::posix_link(src.as_ptr(), dst.as_ptr()) };
+        let ret = unsafe { trona_posix::posix_link(src.as_ptr(), dst.as_ptr()) };
         if ret != 0 {
             puts(b"[TEST_SALTYFS] FAIL: link failed\n");
             return false;
         }
 
         // Read through the hard link
-        let fd = unsafe { posix::posix_open(dst.as_ptr(), O_RDONLY as i32, 0) };
+        let fd = unsafe { trona_posix::posix_open(dst.as_ptr(), O_RDONLY as i32, 0) };
         if fd < 0 {
             puts(b"[TEST_SALTYFS] FAIL: open hard link failed\n");
             return false;
         }
         let mut buf = [0u8; 64];
-        let r = unsafe { posix::posix_read(fd, buf.as_mut_ptr(), 64) };
-        unsafe { posix::posix_close(fd) };
+        let r = unsafe { trona_posix::posix_read(fd, buf.as_mut_ptr(), 64) };
+        unsafe { trona_posix::posix_close(fd) };
 
         if r != 14 {
             puts(b"[TEST_SALTYFS] FAIL: read through hard link wrong count\n");
@@ -471,20 +471,20 @@ pub fn run() -> bool {
     {
         // Clean up files first
         unsafe {
-            posix::posix_unlink(b"/mnt/data/testdir/test.txt\0".as_ptr());
-            posix::posix_unlink(b"/mnt/data/testdir/large.bin\0".as_ptr());
-            posix::posix_unlink(b"/mnt/data/testdir/link.txt\0".as_ptr());
-            posix::posix_unlink(b"/mnt/data/testdir/hardlink.txt\0".as_ptr());
+            trona_posix::posix_unlink(b"/mnt/data/testdir/test.txt\0".as_ptr());
+            trona_posix::posix_unlink(b"/mnt/data/testdir/large.bin\0".as_ptr());
+            trona_posix::posix_unlink(b"/mnt/data/testdir/link.txt\0".as_ptr());
+            trona_posix::posix_unlink(b"/mnt/data/testdir/hardlink.txt\0".as_ptr());
         }
 
-        let ret = unsafe { posix::posix_rmdir(b"/mnt/data/testdir\0".as_ptr()) };
+        let ret = unsafe { trona_posix::posix_rmdir(b"/mnt/data/testdir\0".as_ptr()) };
         if ret != 0 {
             puts(b"[TEST_SALTYFS] FAIL: rmdir /mnt/data/testdir failed\n");
             return false;
         }
 
-        let mut st = BesaltStat::zeroed();
-        let ret = unsafe { posix::posix_stat(b"/mnt/data/testdir\0".as_ptr(), &raw mut st) };
+        let mut st = TronaStat::zeroed();
+        let ret = unsafe { trona_posix::posix_stat(b"/mnt/data/testdir\0".as_ptr(), &raw mut st) };
         if ret == 0 {
             puts(b"[TEST_SALTYFS] FAIL: testdir still exists after rmdir\n");
             return false;

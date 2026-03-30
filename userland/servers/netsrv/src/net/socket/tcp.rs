@@ -10,12 +10,12 @@ use crate::net::checksum;
 use crate::net::proto::ipv4::{self, Ipv4Header, PROTO_TCP};
 use crate::net::proto::tcp as tcp_proto;
 use crate::net::socket::options::{self, SocketOptions};
-use besalt::consts::{
-    BESALT_CONN_REFUSED, BESALT_INVALID_ARGUMENT, BESALT_NOT_CONNECTED, BESALT_OK,
-    BESALT_TIMED_OUT, INET_OP_ACCEPT, INET_OP_CONNECT, INET_OP_RECV, SOCK_STREAM,
+use trona::consts::{
+    TRONA_CONN_REFUSED, TRONA_INVALID_ARGUMENT, TRONA_NOT_CONNECTED, TRONA_OK,
+    TRONA_TIMED_OUT, INET_OP_ACCEPT, INET_OP_CONNECT, INET_OP_RECV, SOCK_STREAM,
     SYS_CLOCK_GETTIME, SYS_GETRANDOM,
 };
-use besalt::types::Timespec;
+use trona::types::Timespec;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -326,7 +326,7 @@ fn now_ns() -> u64 {
     let mut ts = Timespec::zeroed();
     // SAFETY: Passing valid stack pointer for clock_gettime output.
     let _ =
-        unsafe { besalt::syscall::syscall(SYS_CLOCK_GETTIME, 0, &raw mut ts as u64, 0, 0, 0, 0) };
+        unsafe { trona::syscall::syscall(SYS_CLOCK_GETTIME, 0, &raw mut ts as u64, 0, 0, 0, 0) };
     ts.tv_sec * 1_000_000_000 + ts.tv_nsec
 }
 
@@ -334,7 +334,7 @@ fn generate_isn() -> u32 {
     let mut buf = [0u8; 4];
     // SAFETY: Passing valid stack buffer to GetRandom syscall.
     let _ =
-        unsafe { besalt::syscall::syscall(SYS_GETRANDOM, buf.as_mut_ptr() as u64, 4, 0, 0, 0, 0) };
+        unsafe { trona::syscall::syscall(SYS_GETRANDOM, buf.as_mut_ptr() as u64, 4, 0, 0, 0, 0) };
     let rnd = u32::from_ne_bytes(buf);
     let clock = (now_ns() / 4_000) as u32; // ~4us granularity
     rnd.wrapping_add(clock)
@@ -943,13 +943,13 @@ pub(crate) fn tcp_getsockname(conn_id: u32) -> (u32, u16) {
 pub(crate) fn tcp_getpeername(conn_id: u32) -> Result<(u32, u16), u64> {
     let idx = match find_tcb_by_conn_id(conn_id) {
         Some(i) => i,
-        None => return Err(BESALT_INVALID_ARGUMENT),
+        None => return Err(TRONA_INVALID_ARGUMENT),
     };
     // SAFETY: Single-threaded driver.
     unsafe {
         let tcb = &(*(&raw const TCBS))[idx];
         if tcb.remote_ip == 0 || tcb.remote_port == 0 {
-            return Err(BESALT_NOT_CONNECTED);
+            return Err(TRONA_NOT_CONNECTED);
         }
         Ok((tcb.remote_ip, tcb.remote_port))
     }
@@ -964,7 +964,7 @@ pub(crate) fn tcp_setsockopt(
 ) -> u64 {
     let idx = match find_tcb_by_conn_id(conn_id) {
         Some(i) => i,
-        None => return BESALT_INVALID_ARGUMENT,
+        None => return TRONA_INVALID_ARGUMENT,
     };
     unsafe {
         let tcb = &mut (*(&raw mut TCBS))[idx];
@@ -975,14 +975,14 @@ pub(crate) fn tcp_setsockopt(
 pub(crate) fn tcp_getsockopt(conn_id: u32, level: i32, optname: i32) -> Result<(u64, u32), u64> {
     let idx = match find_tcb_by_conn_id(conn_id) {
         Some(i) => i,
-        None => return Err(BESALT_INVALID_ARGUMENT),
+        None => return Err(TRONA_INVALID_ARGUMENT),
     };
     unsafe {
         let tcb = &mut (*(&raw mut TCBS))[idx];
         options::get_option(
             &mut tcb.opts,
             SOCK_STREAM,
-            besalt::consts::IPPROTO_TCP,
+            trona::consts::IPPROTO_TCP,
             level,
             optname,
         )
@@ -1100,9 +1100,9 @@ pub(crate) fn handle_local_ip_change(new_ip: u32) {
                 | TcpState::Closing
                 | TcpState::LastAck
                 | TcpState::TimeWait => {
-                    complete_pending_with_error(i, BESALT_TIMED_OUT);
+                    complete_pending_with_error(i, TRONA_TIMED_OUT);
                     if tcb.pending_connect || tcb.state == TcpState::SynSent {
-                        close_tcb_preserve_socket(i, BESALT_TIMED_OUT);
+                        close_tcb_preserve_socket(i, TRONA_TIMED_OUT);
                     } else {
                         reset_tcb(i);
                     }
@@ -1139,9 +1139,9 @@ pub(crate) fn handle_local_ip_loss() {
                 | TcpState::Closing
                 | TcpState::LastAck
                 | TcpState::TimeWait => {
-                    complete_pending_with_error(i, BESALT_TIMED_OUT);
+                    complete_pending_with_error(i, TRONA_TIMED_OUT);
                     if tcb.pending_connect || tcb.state == TcpState::SynSent {
-                        close_tcb_preserve_socket(i, BESALT_TIMED_OUT);
+                        close_tcb_preserve_socket(i, TRONA_TIMED_OUT);
                     } else {
                         reset_tcb(i);
                     }
@@ -1366,7 +1366,7 @@ fn handle_syn_sent(idx: usize, ip_hdr: &Ipv4Header, hdr: &tcp_proto::TcpHeader) 
                     tcb.pending_connect = false;
                     push_completion(Completion {
                         conn_id: tcb.conn_id,
-                        result: BESALT_CONN_REFUSED,
+                        result: TRONA_CONN_REFUSED,
                         op_type: INET_OP_CONNECT,
                         data: [0u8; 152],
                         data_len: 0,
@@ -1375,7 +1375,7 @@ fn handle_syn_sent(idx: usize, ip_hdr: &Ipv4Header, hdr: &tcp_proto::TcpHeader) 
                         extra_port: 0,
                     });
                 }
-                close_tcb_preserve_socket(idx, BESALT_CONN_REFUSED);
+                close_tcb_preserve_socket(idx, TRONA_CONN_REFUSED);
             }
             return;
         }
@@ -1417,7 +1417,7 @@ fn handle_syn_sent(idx: usize, ip_hdr: &Ipv4Header, hdr: &tcp_proto::TcpHeader) 
                 tcb.opts.last_error = 0;
                 push_completion(Completion {
                     conn_id: tcb.conn_id,
-                    result: BESALT_OK,
+                    result: TRONA_OK,
                     op_type: INET_OP_CONNECT,
                     data: [0u8; 152],
                     data_len: 0,
@@ -1456,7 +1456,7 @@ fn handle_syn_received(idx: usize, hdr: &tcp_proto::TcpHeader) {
                 tcb.pending_accept = false;
                 push_completion(Completion {
                     conn_id: tcb.parent_conn_id,
-                    result: BESALT_CONN_REFUSED,
+                    result: TRONA_CONN_REFUSED,
                     op_type: INET_OP_ACCEPT,
                     data: [0u8; 152],
                     data_len: 0,
@@ -1489,7 +1489,7 @@ fn handle_syn_received(idx: usize, hdr: &tcp_proto::TcpHeader) {
             tcb.pending_accept = false;
             push_completion(Completion {
                 conn_id: tcb.parent_conn_id,
-                result: BESALT_OK,
+                result: TRONA_OK,
                 op_type: INET_OP_ACCEPT,
                 data: [0u8; 152],
                 data_len: 0,
@@ -1508,7 +1508,7 @@ fn handle_established(idx: usize, hdr: &tcp_proto::TcpHeader, payload: &[u8]) {
 
         // RST
         if (hdr.flags & tcp_proto::TCP_FLAG_RST) != 0 {
-            complete_pending_with_error(idx, BESALT_CONN_REFUSED);
+            complete_pending_with_error(idx, TRONA_CONN_REFUSED);
             reset_tcb(idx);
             return;
         }
@@ -1523,7 +1523,7 @@ fn handle_established(idx: usize, hdr: &tcp_proto::TcpHeader, payload: &[u8]) {
                 hdr.ack,
                 0,
             );
-            complete_pending_with_error(idx, BESALT_CONN_REFUSED);
+            complete_pending_with_error(idx, TRONA_CONN_REFUSED);
             reset_tcb(idx);
             return;
         }
@@ -1565,7 +1565,7 @@ fn handle_established(idx: usize, hdr: &tcp_proto::TcpHeader, payload: &[u8]) {
                 tcb.pending_recv = false;
                 push_completion(Completion {
                     conn_id: tcb.conn_id,
-                    result: BESALT_OK,
+                    result: TRONA_OK,
                     op_type: INET_OP_RECV,
                     data: [0u8; 152],
                     data_len: 0,
@@ -1851,7 +1851,7 @@ fn process_data(idx: usize, hdr: &tcp_proto::TcpHeader, payload: &[u8]) {
             let max = core::cmp::min(tcb.pending_recv_max as usize, 152);
             let mut comp = Completion {
                 conn_id: tcb.conn_id,
-                result: BESALT_OK,
+                result: TRONA_OK,
                 op_type: INET_OP_RECV,
                 data: [0u8; 152],
                 data_len: 0,
@@ -1869,7 +1869,7 @@ fn process_data(idx: usize, hdr: &tcp_proto::TcpHeader, payload: &[u8]) {
         } else if was_empty && written > 0 {
             push_completion(Completion {
                 conn_id: tcb.conn_id,
-                result: BESALT_OK,
+                result: TRONA_OK,
                 op_type: INET_OP_RECV,
                 data: [0u8; 152],
                 data_len: 0,
@@ -1999,9 +1999,9 @@ pub(crate) fn process_timers() {
                     tcb.snd_nxt,
                     tcb.rcv_nxt,
                 );
-                complete_pending_with_error(i, BESALT_TIMED_OUT);
+                complete_pending_with_error(i, TRONA_TIMED_OUT);
                 if tcb.pending_connect || tcb.state == TcpState::SynSent {
-                    close_tcb_preserve_socket(i, BESALT_TIMED_OUT);
+                    close_tcb_preserve_socket(i, TRONA_TIMED_OUT);
                 } else {
                     reset_tcb(i);
                 }

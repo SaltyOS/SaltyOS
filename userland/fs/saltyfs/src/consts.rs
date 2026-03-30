@@ -26,11 +26,11 @@ pub(crate) const SALTYFS_MAGIC: [u8; 8] = *b"SALTYFS\0";
 pub(crate) const BTREE_NODE_MAGIC: [u8; 4] = *b"BTND";
 
 /// Item type constants (docs/design/saltyfs.md:154-160)
-pub(crate) const BESALT_INODE_ITEM: u8 = 0x01;
-pub(crate) const BESALT_INODE_REF: u8 = 0x02;
-pub(crate) const BESALT_DIR_ITEM: u8 = 0x03;
-pub(crate) const BESALT_DIR_INDEX: u8 = 0x04;
-pub(crate) const BESALT_EXTENT_DATA: u8 = 0x05;
+pub(crate) const TRONA_INODE_ITEM: u8 = 0x01;
+pub(crate) const TRONA_INODE_REF: u8 = 0x02;
+pub(crate) const TRONA_DIR_ITEM: u8 = 0x03;
+pub(crate) const TRONA_DIR_INDEX: u8 = 0x04;
+pub(crate) const TRONA_EXTENT_DATA: u8 = 0x05;
 
 /// Extent types
 pub(crate) const EXTENT_INLINE: u8 = 0;

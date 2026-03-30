@@ -1,10 +1,10 @@
 //! Terminal (termios) tests
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use besalt::consts::TIOCGWINSZ;
-use besalt::posix;
-use besalt::serial;
-use besalt::types::*;
+use trona::consts::TIOCGWINSZ;
+use trona_posix::proc as posix;
+use trona::serial;
+use trona::types::*;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
@@ -22,7 +22,7 @@ pub fn run() -> bool {
     puts(b"[TEST_TERMINAL] Starting terminal tests\n");
 
     // Open /dev/console explicitly (test_runner doesn't have fd 0 pre-opened)
-    let fd = unsafe { posix::posix_open(b"/dev/console\0".as_ptr(), 0, 0) };
+    let fd = unsafe { trona_posix::posix_open(b"/dev/console\0".as_ptr(), 0, 0) };
     if fd < 0 {
         puts(b"[TEST_TERMINAL] FAIL: could not open /dev/console\n");
         return false;
@@ -31,10 +31,10 @@ pub fn run() -> bool {
     // Test 1: tcgetattr on console fd
     puts(b"[TEST_TERMINAL] Test 1: tcgetattr\n");
     let mut termios = Termios::zeroed();
-    let ret = unsafe { posix::posix_tcgetattr(fd, &raw mut termios) };
+    let ret = unsafe { trona_posix::posix_tcgetattr(fd, &raw mut termios) };
     if ret != 0 {
         puts(b"[TEST_TERMINAL] FAIL: tcgetattr returned error\n");
-        unsafe { posix::posix_close(fd) };
+        unsafe { trona_posix::posix_close(fd) };
         return false;
     }
 
@@ -43,19 +43,19 @@ pub fn run() -> bool {
     if lflag & 0o000002 == 0 {
         // ICANON
         puts(b"[TEST_TERMINAL] FAIL: ICANON not set\n");
-        unsafe { posix::posix_close(fd) };
+        unsafe { trona_posix::posix_close(fd) };
         return false;
     }
     if lflag & 0o000010 == 0 {
         // ECHO
         puts(b"[TEST_TERMINAL] FAIL: ECHO not set\n");
-        unsafe { posix::posix_close(fd) };
+        unsafe { trona_posix::posix_close(fd) };
         return false;
     }
     if lflag & 0o000001 == 0 {
         // ISIG
         puts(b"[TEST_TERMINAL] FAIL: ISIG not set\n");
-        unsafe { posix::posix_close(fd) };
+        unsafe { trona_posix::posix_close(fd) };
         return false;
     }
     puts(b"[TEST_TERMINAL] PASS: tcgetattr returned correct c_lflag\n");
@@ -69,7 +69,7 @@ pub fn run() -> bool {
         ws_ypixel: 0xFFFF,
     };
     let ret = unsafe {
-        posix::posix_ioctl(
+        trona_posix::posix_ioctl(
             fd,
             TIOCGWINSZ,
             (&raw mut ws as *mut Winsize).cast::<u8>() as u64,
@@ -77,12 +77,12 @@ pub fn run() -> bool {
     };
     if ret != 0 {
         puts(b"[TEST_TERMINAL] FAIL: ioctl(TIOCGWINSZ) returned error\n");
-        unsafe { posix::posix_close(fd) };
+        unsafe { trona_posix::posix_close(fd) };
         return false;
     }
     if ws.ws_row == 0 || ws.ws_col == 0 || ws.ws_row > 500 || ws.ws_col > 1000 {
         puts(b"[TEST_TERMINAL] FAIL: ioctl(TIOCGWINSZ) returned invalid size\n");
-        unsafe { posix::posix_close(fd) };
+        unsafe { trona_posix::posix_close(fd) };
         return false;
     }
     puts(b"[TEST_TERMINAL] PASS: ioctl(TIOCGWINSZ) filled winsize\n");
@@ -96,50 +96,50 @@ pub fn run() -> bool {
     raw.c_cc[6] = 1; // VMIN = 1
     raw.c_cc[5] = 0; // VTIME = 0
 
-    let ret = unsafe { posix::posix_tcsetattr(fd, 0, &raw const raw) };
+    let ret = unsafe { trona_posix::posix_tcsetattr(fd, 0, &raw const raw) };
     if ret != 0 {
         puts(b"[TEST_TERMINAL] FAIL: tcsetattr raw mode failed\n");
-        unsafe { posix::posix_close(fd) };
+        unsafe { trona_posix::posix_close(fd) };
         return false;
     }
 
     // Verify raw mode took effect
     let mut check = Termios::zeroed();
-    let ret = unsafe { posix::posix_tcgetattr(fd, &raw mut check) };
+    let ret = unsafe { trona_posix::posix_tcgetattr(fd, &raw mut check) };
     if ret != 0 {
         puts(b"[TEST_TERMINAL] FAIL: tcgetattr after raw mode failed\n");
-        unsafe { posix::posix_tcsetattr(fd, 0, &raw const termios) };
-        unsafe { posix::posix_close(fd) };
+        unsafe { trona_posix::posix_tcsetattr(fd, 0, &raw const termios) };
+        unsafe { trona_posix::posix_close(fd) };
         return false;
     }
 
     if check.c_lflag & 0o000002 != 0 {
         puts(b"[TEST_TERMINAL] FAIL: ICANON still set after raw mode\n");
-        unsafe { posix::posix_tcsetattr(fd, 0, &raw const termios) };
-        unsafe { posix::posix_close(fd) };
+        unsafe { trona_posix::posix_tcsetattr(fd, 0, &raw const termios) };
+        unsafe { trona_posix::posix_close(fd) };
         return false;
     }
     puts(b"[TEST_TERMINAL] PASS: raw mode verified\n");
 
     // Test 4: Restore original termios
     puts(b"[TEST_TERMINAL] Test 4: restore original termios\n");
-    let ret = unsafe { posix::posix_tcsetattr(fd, 0, &raw const termios) };
+    let ret = unsafe { trona_posix::posix_tcsetattr(fd, 0, &raw const termios) };
     if ret != 0 {
         puts(b"[TEST_TERMINAL] FAIL: tcsetattr restore failed\n");
-        unsafe { posix::posix_close(fd) };
+        unsafe { trona_posix::posix_close(fd) };
         return false;
     }
 
     let mut restored = Termios::zeroed();
-    let ret = unsafe { posix::posix_tcgetattr(fd, &raw mut restored) };
+    let ret = unsafe { trona_posix::posix_tcgetattr(fd, &raw mut restored) };
     if ret != 0 || restored.c_lflag & 0o000002 == 0 {
         puts(b"[TEST_TERMINAL] FAIL: ICANON not restored\n");
-        unsafe { posix::posix_close(fd) };
+        unsafe { trona_posix::posix_close(fd) };
         return false;
     }
     puts(b"[TEST_TERMINAL] PASS: original termios restored\n");
 
-    unsafe { posix::posix_close(fd) };
+    unsafe { trona_posix::posix_close(fd) };
     puts(b"[TEST_TERMINAL] All terminal tests passed\n");
     true
 }

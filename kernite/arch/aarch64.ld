@@ -1,4 +1,4 @@
-/* SaltyOS Kernel Linker Script (AArch64) */
+/* Kernite Linker Script (AArch64) */
 /* SPDX-License-Identifier: GPL-2.0-only */
 
 OUTPUT_FORMAT(elf64-littleaarch64)

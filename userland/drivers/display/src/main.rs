@@ -8,17 +8,18 @@
 #![no_std]
 #![no_main]
 
-extern crate besalt;
+extern crate trona;
+extern crate trona_posix;
 
 mod font;
 mod vt100;
 
-use besalt::consts::*;
-use besalt::framebuffer;
-use besalt::invoke;
-use besalt::ipc;
-use besalt::syscall::syscall;
-use besalt::types::*;
+use trona::consts::*;
+use trona::framebuffer;
+use trona::invoke;
+use trona::ipc;
+use trona::syscall::syscall;
+use trona::types::*;
 
 const FB_MAP_VADDR: u64 = 0x0000_0000_3000_0000;
 const MAX_DAMAGE_SCANLINES: usize = 8192;
@@ -221,14 +222,14 @@ fn idle() -> ! {
 }
 
 fn ipc_ctx() -> *mut IpcContext {
-    besalt::tls::current_ipc_ctx()
+    trona_posix::tls::current_ipc_ctx()
 }
 
 unsafe fn recv_timed_ctx(
     ctx: *mut IpcContext,
     ep: Cap,
     timeout_ns: u64,
-    msg: *mut BesaltMsg,
+    msg: *mut TronaMsg,
     badge: *mut u64,
 ) -> i32 {
     let r = syscall(SYS_RECV_TIMED, ep, timeout_ns, 0, 0, 0, 0);
@@ -238,7 +239,7 @@ unsafe fn recv_timed_ctx(
                 *badge = r.value;
             }
             if !msg.is_null() && !ctx.is_null() && !(*ctx).ipc_buffer.is_null() {
-                let buf = (*ctx).ipc_buffer as *const BesaltMsg;
+                let buf = (*ctx).ipc_buffer as *const TronaMsg;
                 *msg = *buf;
             }
         }
@@ -899,7 +900,7 @@ fn switch_to_alt_screen(state: &mut DisplayState) {
     // Lazy-allocate alt buffer
     if state.alt_shadow.is_null() {
         let ptr = unsafe {
-            besalt::posix_mm::posix_mmap(
+            trona_posix::mm::posix_mmap(
                 core::ptr::null_mut(),
                 (fb_size + 4095) & !4095u64,
                 0x3,  // PROT_READ | PROT_WRITE
@@ -920,7 +921,7 @@ fn switch_to_alt_screen(state: &mut DisplayState) {
         let cell_bytes = grid * core::mem::size_of::<Cell>();
         let cell_len = ((cell_bytes as u64) + 4095) & !4095u64;
         let ptr = unsafe {
-            besalt::posix_mm::posix_mmap(
+            trona_posix::mm::posix_mmap(
                 core::ptr::null_mut(),
                 cell_len,
                 0x3,  // PROT_READ | PROT_WRITE
@@ -1115,7 +1116,7 @@ fn map_framebuffer(fb: &framebuffer::FramebufferInfo) -> bool {
     );
 
     if err != 0 || mapped != num_pages {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[DISPLAY] FB batch map failed: err=");
             _lb.hex(err as u64);
             _lb.str(b" mapped=");
@@ -1127,7 +1128,7 @@ fn map_framebuffer(fb: &framebuffer::FramebufferInfo) -> bool {
         return false;
     }
 
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[DISPLAY] Mapped ");
         _lb.hex(num_pages);
         _lb.str(b" FB pages at ");
@@ -1141,7 +1142,7 @@ fn map_framebuffer(fb: &framebuffer::FramebufferInfo) -> bool {
 fn alloc_shadow_buffer(fb_size: u64) -> *mut u8 {
     let len = (fb_size + 4095) & !4095u64;
     let ptr = unsafe {
-        besalt::posix_mm::posix_mmap(
+        trona_posix::mm::posix_mmap(
             core::ptr::null_mut(),
             len,
             0x3,  // PROT_READ | PROT_WRITE
@@ -1151,13 +1152,13 @@ fn alloc_shadow_buffer(fb_size: u64) -> *mut u8 {
         )
     };
     if ptr == usize::MAX as *mut u8 || ptr.is_null() {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[DISPLAY] Shadow buffer posix_mmap failed\n");
         });
         return core::ptr::null_mut();
     }
 
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(b"[DISPLAY] Shadow buffer: ");
         _lb.hex(len / 4096);
         _lb.str(b" pages at ");
@@ -1169,8 +1170,8 @@ fn alloc_shadow_buffer(fb_size: u64) -> *mut u8 {
 }
 
 fn register_with_nameserv() -> bool {
-    let mut reg_msg = BesaltMsg::zeroed();
-    let mut reg_reply = BesaltMsg::zeroed();
+    let mut reg_msg = TronaMsg::zeroed();
+    let mut reg_reply = TronaMsg::zeroed();
     let svc_name = b"display";
     reg_msg.label = POSIX_NS_REGISTER;
     reg_msg.regs[0] = svc_name.len() as u64;
@@ -1191,13 +1192,13 @@ fn register_with_nameserv() -> bool {
             &raw const reg_msg,
             &raw mut reg_reply,
         );
-        if err == 0 && reg_reply.label == BESALT_OK {
-            besalt::uinfo!(|_lb| {
+        if err == 0 && reg_reply.label == TRONA_OK {
+            trona::uinfo!(|_lb| {
                 _lb.str(b"[DISPLAY] registered with nameserv\n");
             });
             return true;
         }
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[DISPLAY] nameserv register failed: err=");
             _lb.hex(err as u64);
             _lb.str(b" label=");
@@ -1208,8 +1209,8 @@ fn register_with_nameserv() -> bool {
     }
 }
 
-fn handle_get_info(state: &DisplayState, reply: &mut BesaltMsg) {
-    reply.label = BESALT_OK;
+fn handle_get_info(state: &DisplayState, reply: &mut TronaMsg) {
+    reply.label = TRONA_OK;
     reply.length = 6;
     reply.regs[0] = state.width as u64;
     reply.regs[1] = state.height as u64;
@@ -1222,7 +1223,7 @@ fn handle_get_info(state: &DisplayState, reply: &mut BesaltMsg) {
     reply.regs[5] = ((state.blue_pos as u64) << 24) | ((state.blue_size as u64) << 16);
 }
 
-fn handle_fill_rect(state: &mut DisplayState, msg: &BesaltMsg, reply: &mut BesaltMsg) {
+fn handle_fill_rect(state: &mut DisplayState, msg: &TronaMsg, reply: &mut TronaMsg) {
     if state.cursor_drawn {
         invert_cursor_cell(state, state.drawn_col, state.drawn_row);
         state.cursor_drawn = false;
@@ -1235,10 +1236,10 @@ fn handle_fill_rect(state: &mut DisplayState, msg: &BesaltMsg, reply: &mut Besal
     let color = msg.regs[4] as u32;
     fill_rect(state, x, y, w, h, color);
     flush_damage(state);
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
 }
 
-fn handle_write_text(state: &mut DisplayState, msg: &BesaltMsg, reply: &mut BesaltMsg) {
+fn handle_write_text(state: &mut DisplayState, msg: &TronaMsg, reply: &mut TronaMsg) {
     if state.cursor_drawn {
         invert_cursor_cell(state, state.drawn_col, state.drawn_row);
         state.cursor_drawn = false;
@@ -1278,7 +1279,7 @@ fn handle_write_text(state: &mut DisplayState, msg: &BesaltMsg, reply: &mut Besa
     state.bg = saved_bg;
     state.reverse_video = saved_rv;
     flush_damage(state);
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
 }
 
 /// Drain all available bytes from the SHM terminal ring and process through VT100.
@@ -1325,54 +1326,54 @@ fn drain_terminal_ring(state: &mut DisplayState) {
 }
 
 /// Handle DISPLAY_SETUP_RING: bind notification, map SHM ring buffer.
-fn handle_setup_ring(state: &mut DisplayState, msg: &BesaltMsg, reply: &mut BesaltMsg) {
+fn handle_setup_ring(state: &mut DisplayState, msg: &TronaMsg, reply: &mut TronaMsg) {
     let shm_id = msg.regs[0];
 
     // Notification cap was transferred via extra_caps into CAP_RING_NTFN.
     // Bind it to our TCB so signals wake us from recv.
     let bind_err = invoke::tcb_bind_notification(CAP_SELF_TCB, CAP_RING_NTFN);
     if bind_err != 0 {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[DISPLAY] ring: bind notification failed err=");
             _lb.dec(bind_err as u64);
             _lb.str(b"\n");
         });
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return;
     }
 
     // Map SHM (RW — we need to update the tail pointer).
-    let mut map_msg = BesaltMsg::zeroed();
+    let mut map_msg = TronaMsg::zeroed();
     map_msg.label = MM_SHM_MAP;
     map_msg.regs[0] = shm_id;
     map_msg.regs[1] = 0; // map into self
     map_msg.regs[2] = TERM_RING_VADDR;
     map_msg.regs[3] = 0x3; // RW
     map_msg.length = 4;
-    let mut map_reply = BesaltMsg::zeroed();
+    let mut map_reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; nested call to mmsrv during handler.
     let map_err = unsafe {
         ipc::call_ctx(ipc_ctx(), CAP_MMSRV_EP, &raw const map_msg, &raw mut map_reply)
     };
-    if map_err != 0 || map_reply.label != BESALT_OK {
-        besalt::uerror!(|_lb| {
+    if map_err != 0 || map_reply.label != TRONA_OK {
+        trona::uerror!(|_lb| {
             _lb.str(b"[DISPLAY] ring: SHM map failed err=");
             _lb.dec(if map_err != 0 { map_err as u64 } else { map_reply.label });
             _lb.str(b"\n");
         });
-        reply.label = BESALT_INVALID_OPERATION;
+        reply.label = TRONA_INVALID_OPERATION;
         return;
     }
 
     state.term_ring_base = TERM_RING_VADDR as *mut u8;
     state.term_ring_active = true;
-    reply.label = BESALT_OK;
-    besalt::uinfo!(|_lb| {
+    reply.label = TRONA_OK;
+    trona::uinfo!(|_lb| {
         _lb.str(b"[DISPLAY] Terminal ring buffer active\n");
     });
 }
 
-fn handle_terminal_write(state: &mut DisplayState, msg: &BesaltMsg) {
+fn handle_terminal_write(state: &mut DisplayState, msg: &TronaMsg) {
     if state.cursor_drawn {
         invert_cursor_cell(state, state.drawn_col, state.drawn_row);
         state.cursor_drawn = false;
@@ -1389,14 +1390,14 @@ fn handle_terminal_write(state: &mut DisplayState, msg: &BesaltMsg) {
     }
 }
 
-fn handle_present(state: &mut DisplayState, reply: &mut BesaltMsg) {
+fn handle_present(state: &mut DisplayState, reply: &mut TronaMsg) {
     flush_damage(state);
-    reply.label = BESALT_OK;
+    reply.label = TRONA_OK;
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[DISPLAY] Display server starting\n");
     });
 
@@ -1404,7 +1405,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     let fb = match unsafe { framebuffer::read_framebuffer_info() } {
         Some(fb) => fb,
         None => {
-            besalt::uwarn!(|_lb| {
+            trona::uwarn!(|_lb| {
                 _lb.str(b"[DISPLAY] No framebuffer detected\n");
             });
             signal_ready();
@@ -1412,7 +1413,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         }
     };
 
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[DISPLAY] FB: ");
         _lb.dec(fb.width as u64);
         _lb.str(b"x");
@@ -1426,7 +1427,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // Map framebuffer with write-combining (WRITE_THROUGH flag)
     if !map_framebuffer(&fb) {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[DISPLAY] Failed to map framebuffer\n");
         });
         signal_ready();
@@ -1437,7 +1438,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     let fb_size = fb.height as u64 * fb.pitch as u64;
     let shadow_ptr = alloc_shadow_buffer(fb_size);
     if shadow_ptr.is_null() {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[DISPLAY] Failed to allocate shadow buffer\n");
         });
         signal_ready();
@@ -1546,7 +1547,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // Disable kernel console so we own the framebuffer
     syscall(SYS_DEBUG_CONSOLE_CONTROL, 0, 0, 0, 0, 0, 0);
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[DISPLAY] Kernel console disabled, display server owns FB\n");
     });
 
@@ -1556,7 +1557,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         let cell_bytes = grid * core::mem::size_of::<Cell>();
         let cell_len = ((cell_bytes as u64) + 4095) & !4095u64;
         let ptr = unsafe {
-            besalt::posix_mm::posix_mmap(
+            trona_posix::mm::posix_mmap(
                 core::ptr::null_mut(),
                 cell_len,
                 0x3,  // PROT_READ | PROT_WRITE
@@ -1589,12 +1590,12 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // Signal readiness
     signal_ready();
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[DISPLAY] Ready, entering server loop\n");
     });
 
     // IPC server loop
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     let mut badge: u64 = 0;
 
     // Pre-configure receive slot for DISPLAY_SETUP_RING cap transfer.
@@ -1606,7 +1607,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
     if err != 0 {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[DISPLAY] initial recv failed err=");
             _lb.hex(err as u64);
             _lb.str(b"\n");
@@ -1626,7 +1627,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
             };
             if err != 0 {
-                besalt::uerror!(|_lb| {
+                trona::uerror!(|_lb| {
                     _lb.str(b"[DISPLAY] recv failed after ring drain\n");
                 });
                 break;
@@ -1654,7 +1655,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                         ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
                     };
                     if err != 0 {
-                        besalt::uerror!(|_lb| {
+                        trona::uerror!(|_lb| {
                             _lb.str(b"[DISPLAY] recv failed err=");
                             _lb.hex(err as u64);
                             _lb.str(b"\n");
@@ -1673,7 +1674,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             continue;
         }
 
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
 
         match msg.label {
             DISPLAY_GET_INFO => {
@@ -1691,13 +1692,13 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             DISPLAY_TERMINAL_WRITE => {
                 handle_terminal_write(&mut state, &msg);
                 flush_damage(&mut state);
-                reply.label = BESALT_OK;
+                reply.label = TRONA_OK;
             }
             DISPLAY_SETUP_RING => {
                 handle_setup_ring(&mut state, &msg, &mut reply);
             }
             _ => {
-                reply.label = BESALT_INVALID_OPERATION;
+                reply.label = TRONA_INVALID_OPERATION;
             }
         }
 
@@ -1711,7 +1712,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             )
         };
         if err != 0 {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[DISPLAY] reply_recv failed err=");
                 _lb.hex(err as u64);
                 _lb.str(b"\n");

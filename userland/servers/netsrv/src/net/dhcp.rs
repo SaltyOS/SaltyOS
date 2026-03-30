@@ -3,7 +3,7 @@
 
 use crate::net::config;
 use crate::net::socket::udp;
-use besalt::consts::{SO_BROADCAST, SOL_SOCKET};
+use trona::consts::{SO_BROADCAST, SOL_SOCKET};
 
 const DHCP_CLIENT_PORT: u16 = 68;
 const DHCP_SERVER_PORT: u16 = 67;
@@ -90,7 +90,7 @@ static mut DHCP_RENEW_AT_NS: u64 = 0;
 static mut DHCP_REBIND_AT_NS: u64 = 0;
 static mut LOGGED_DHCP_DISCOVER_BYTES: bool = false;
 
-fn log_ipv4(lb: &mut besalt::serial::LineBuf, ip: u32) {
+fn log_ipv4(lb: &mut trona::serial::LineBuf, ip: u32) {
     lb.dec(((ip >> 24) & 0xFF) as u64);
     lb.putc(b'.');
     lb.dec(((ip >> 16) & 0xFF) as u64);
@@ -101,7 +101,7 @@ fn log_ipv4(lb: &mut besalt::serial::LineBuf, ip: u32) {
 }
 
 fn log_dhcp_send(prefix: &[u8], dst_ip: u32, socket_id: i32) {
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(prefix);
         _lb.str(b" sock=");
         _lb.dec(socket_id as u64);
@@ -116,7 +116,7 @@ fn log_dhcp_send(prefix: &[u8], dst_ip: u32, socket_id: i32) {
 }
 
 fn log_dhcp_recv(prefix: &[u8], src_ip: u32, src_port: u16, len: i32) {
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(prefix);
         _lb.str(b" src=");
         log_ipv4(&mut _lb, src_ip);
@@ -130,7 +130,7 @@ fn log_dhcp_recv(prefix: &[u8], src_ip: u32, src_port: u16, len: i32) {
 
 fn log_dhcp_packet_bytes(prefix: &[u8], buf: &[u8]) {
     let dump_len = core::cmp::min(buf.len(), 96);
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(prefix);
         _lb.str(b" bytes=");
         let mut i = 0;
@@ -160,8 +160,8 @@ fn next_xid() -> u32 {
     let mut bytes = [0u8; 4];
     // SAFETY: Passing a valid stack buffer to the syscall.
     let r = unsafe {
-        besalt::syscall::syscall(
-            besalt::consts::SYS_GETRANDOM,
+        trona::syscall::syscall(
+            trona::consts::SYS_GETRANDOM,
             bytes.as_mut_ptr() as u64,
             4,
             0,
@@ -560,7 +560,7 @@ fn apply_lease(offer: Offer, fallback_ip: u32) {
         crate::net::socket::udp::handle_local_ip_change(our_ip);
         crate::net::socket::tcp::handle_local_ip_change(our_ip);
     }
-    besalt::udebug!(|_lb| {
+    trona::udebug!(|_lb| {
         _lb.str(b"[netsrv] DHCP lease applied IP=");
         log_ipv4(&mut _lb, our_ip);
         _lb.str(b" GW=");
@@ -622,19 +622,19 @@ pub(crate) fn start() -> bool {
     if socket_id < 0 {
         socket_id = udp::udp_socket();
         if socket_id < 0 {
-            besalt::udebug!(|_lb| {
+            trona::udebug!(|_lb| {
                 _lb.str(b"[netsrv] DHCP start failed: udp_socket\n");
             });
             return false;
         }
         if udp::udp_bind(socket_id as u32, 0, DHCP_CLIENT_PORT) < 0 {
-            besalt::udebug!(|_lb| {
+            trona::udebug!(|_lb| {
                 _lb.str(b"[netsrv] DHCP start failed: udp_bind port 68\n");
             });
             let _ = udp::udp_close(socket_id as u32);
             return false;
         }
-        besalt::udebug!(|_lb| {
+        trona::udebug!(|_lb| {
             _lb.str(b"[netsrv] DHCP socket bound to 0.0.0.0:68 sock=");
             _lb.dec(socket_id as u64);
             _lb.putc(b'\n');
@@ -676,7 +676,7 @@ pub(crate) fn process() {
         }
 
         let Some((msg_type, offer)) = parse_offer(&buf[..len as usize]) else {
-            besalt::udebug!(|_lb| {
+            trona::udebug!(|_lb| {
                 _lb.str(b"[netsrv] DHCP recv ignored: parse failed\n");
             });
             continue;
@@ -684,7 +684,7 @@ pub(crate) fn process() {
 
         match unsafe { *(&raw const DHCP_STATE) } {
             DhcpState::Discovering if msg_type == DHCPOFFER && offer.yiaddr != 0 => {
-                besalt::udebug!(|_lb| {
+                trona::udebug!(|_lb| {
                     _lb.str(b"[netsrv] DHCP offer yiaddr=");
                     log_ipv4(&mut _lb, offer.yiaddr);
                     _lb.putc(b'\n');
@@ -699,7 +699,7 @@ pub(crate) fn process() {
                 }
             }
             DhcpState::Requesting if msg_type == DHCPACK && offer.yiaddr != 0 => {
-                besalt::udebug!(|_lb| {
+                trona::udebug!(|_lb| {
                     _lb.str(b"[netsrv] DHCP ack yiaddr=");
                     log_ipv4(&mut _lb, offer.yiaddr);
                     _lb.putc(b'\n');
@@ -709,7 +709,7 @@ pub(crate) fn process() {
             DhcpState::Renewing if msg_type == DHCPACK => {
                 let fallback_ip = config::our_ip();
                 if fallback_ip != 0 {
-                    besalt::udebug!(|_lb| {
+                    trona::udebug!(|_lb| {
                         _lb.str(b"[netsrv] DHCP renew ack\n");
                     });
                     apply_lease(offer, fallback_ip);
@@ -718,7 +718,7 @@ pub(crate) fn process() {
             DhcpState::Rebinding if msg_type == DHCPACK => {
                 let fallback_ip = config::our_ip();
                 if fallback_ip != 0 {
-                    besalt::udebug!(|_lb| {
+                    trona::udebug!(|_lb| {
                         _lb.str(b"[netsrv] DHCP rebind ack\n");
                     });
                     apply_lease(offer, fallback_ip);
@@ -747,7 +747,7 @@ pub(crate) fn process() {
             let retries = unsafe { *(&raw const DHCP_RETRIES) };
             if last_tx != 0 && now.saturating_sub(last_tx) >= DHCP_RETRY_NS {
                 if retries >= DHCP_MAX_RETRIES || !send_discover() {
-                    besalt::udebug!(|_lb| {
+                    trona::udebug!(|_lb| {
                         _lb.str(b"[netsrv] DHCP discover retries exhausted\n");
                     });
                     unsafe { *(&raw mut DHCP_STATE) = DhcpState::Failed; }
@@ -759,14 +759,14 @@ pub(crate) fn process() {
             let retries = unsafe { *(&raw const DHCP_RETRIES) };
             if last_tx != 0 && now.saturating_sub(last_tx) >= DHCP_RETRY_NS {
                 if retries >= DHCP_MAX_RETRIES {
-                    besalt::udebug!(|_lb| {
+                    trona::udebug!(|_lb| {
                         _lb.str(b"[netsrv] DHCP request retries exhausted\n");
                     });
                     unsafe { *(&raw mut DHCP_STATE) = DhcpState::Failed; }
                 } else {
                     let offer = unsafe { *(&raw const DHCP_OFFER) };
                     if !send_request(offer) {
-                        besalt::udebug!(|_lb| {
+                        trona::udebug!(|_lb| {
                             _lb.str(b"[netsrv] DHCP request send failed\n");
                         });
                         unsafe { *(&raw mut DHCP_STATE) = DhcpState::Failed; }

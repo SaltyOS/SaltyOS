@@ -7,7 +7,9 @@
 #![no_std]
 #![no_main]
 
-extern crate besalt;
+extern crate trona;
+extern crate trona_posix;
+extern crate trona_loader;
 
 mod at_ops;
 mod bulk;
@@ -25,11 +27,11 @@ mod ramfs;
 mod socket;
 mod types;
 
-use besalt::consts::*;
-use besalt::cpio;
-use besalt::ipc;
-use besalt::serial;
-use besalt::types::*;
+use trona::consts::*;
+use trona_loader::cpio;
+use trona::ipc;
+use trona::serial;
+use trona::types::*;
 
 use consts::*;
 use types::*;
@@ -247,7 +249,7 @@ pub(crate) unsafe fn vfs_grow_pool_with_min(
     };
     let new_pages = (new_bytes + 4095) / 4096;
     let new_ptr = unsafe {
-        besalt::posix_mm::posix_mmap(
+        trona_posix::mm::posix_mmap(
             core::ptr::null_mut(),
             (new_pages * 4096) as u64,
             0x3,
@@ -267,7 +269,7 @@ pub(crate) unsafe fn vfs_grow_pool_with_min(
     if !old_ptr.is_null() {
         let old_pages = (old_bytes + 4095) / 4096;
         unsafe {
-            besalt::posix_mm::posix_munmap(old_ptr, (old_pages * 4096) as u64);
+            trona_posix::mm::posix_munmap(old_ptr, (old_pages * 4096) as u64);
         }
     }
     unsafe {
@@ -292,7 +294,7 @@ pub(crate) unsafe fn vfs_alloc_array<T>(count: usize) -> *mut T {
             return core::ptr::null_mut();
         }
         let pages = (bytes + 4095) / 4096;
-        let ptr = besalt::posix_mm::posix_mmap(
+        let ptr = trona_posix::mm::posix_mmap(
             core::ptr::null_mut(),
             (pages * 4096) as u64,
             0x3,
@@ -336,7 +338,7 @@ pub(crate) unsafe fn vfs_grow_array_with_min<T: Copy>(
     let old_bytes = old_cap * core::mem::size_of::<T>();
     let old_pages = (old_bytes + 4095) / 4096;
     unsafe {
-        besalt::posix_mm::posix_munmap(old_ptr as *mut u8, (old_pages * 4096) as u64);
+        trona_posix::mm::posix_munmap(old_ptr as *mut u8, (old_pages * 4096) as u64);
     }
     (new_ptr, new_cap)
 }
@@ -357,7 +359,7 @@ unsafe fn init_dynamic_state_storage() -> i32 {
         };
         let pages = (bytes + 4095) / 4096;
         let ptr = unsafe {
-            besalt::posix_mm::posix_mmap(
+            trona_posix::mm::posix_mmap(
                 core::ptr::null_mut(),
                 (pages * 4096) as u64,
                 0x3,
@@ -379,7 +381,7 @@ unsafe fn init_dynamic_state_storage() -> i32 {
 
     unsafe {
         if alloc_pool(&raw mut INODES_PTR, &raw mut INODES_CAP, INITIAL_INODES) != 0 {
-            return BESALT_OUT_OF_MEMORY as i32;
+            return TRONA_OUT_OF_MEMORY as i32;
         }
         if alloc_pool(
             &raw mut WRITABLE_POOL_PTR,
@@ -387,11 +389,11 @@ unsafe fn init_dynamic_state_storage() -> i32 {
             INITIAL_WRITABLE,
         ) != 0
         {
-            return BESALT_OUT_OF_MEMORY as i32;
+            return TRONA_OUT_OF_MEMORY as i32;
         }
         let writable_used_bytes = INITIAL_WRITABLE;
         let writable_used_pages = (writable_used_bytes + 4095) / 4096;
-        let ptr = besalt::posix_mm::posix_mmap(
+        let ptr = trona_posix::mm::posix_mmap(
             core::ptr::null_mut(),
             (writable_used_pages * 4096) as u64,
             0x3,
@@ -400,14 +402,14 @@ unsafe fn init_dynamic_state_storage() -> i32 {
             0,
         );
         if ptr.is_null() || ptr == usize::MAX as *mut u8 {
-            return BESALT_OUT_OF_MEMORY as i32;
+            return TRONA_OUT_OF_MEMORY as i32;
         }
         core::ptr::write_bytes(ptr, 0, writable_used_pages * 4096);
         WRITABLE_USED_PTR = ptr;
 
         let next_bytes = INITIAL_WRITABLE * core::mem::size_of::<u32>();
         let next_pages = (next_bytes + 4095) / 4096;
-        let next_ptr = besalt::posix_mm::posix_mmap(
+        let next_ptr = trona_posix::mm::posix_mmap(
             core::ptr::null_mut(),
             (next_pages * 4096) as u64,
             0x3,
@@ -416,7 +418,7 @@ unsafe fn init_dynamic_state_storage() -> i32 {
             0,
         );
         if next_ptr.is_null() || next_ptr == usize::MAX as *mut u8 {
-            return BESALT_OUT_OF_MEMORY as i32;
+            return TRONA_OUT_OF_MEMORY as i32;
         }
         let next_arr = next_ptr as *mut u32;
         for i in 0..INITIAL_WRITABLE {
@@ -430,10 +432,10 @@ unsafe fn init_dynamic_state_storage() -> i32 {
             INITIAL_SYMLINKS,
         ) != 0
         {
-            return BESALT_OUT_OF_MEMORY as i32;
+            return TRONA_OUT_OF_MEMORY as i32;
         }
         let sym_used_pages = (INITIAL_SYMLINKS + 4095) / 4096;
-        let sym_used_ptr = besalt::posix_mm::posix_mmap(
+        let sym_used_ptr = trona_posix::mm::posix_mmap(
             core::ptr::null_mut(),
             (sym_used_pages * 4096) as u64,
             0x3,
@@ -442,16 +444,16 @@ unsafe fn init_dynamic_state_storage() -> i32 {
             0,
         );
         if sym_used_ptr.is_null() || sym_used_ptr == usize::MAX as *mut u8 {
-            return BESALT_OUT_OF_MEMORY as i32;
+            return TRONA_OUT_OF_MEMORY as i32;
         }
         core::ptr::write_bytes(sym_used_ptr, 0, sym_used_pages * 4096);
         SYMLINK_USED_PTR = sym_used_ptr;
 
         if alloc_pool(&raw mut CLIENTS_PTR, &raw mut CLIENTS_CAP, INITIAL_CLIENTS) != 0 {
-            return BESALT_OUT_OF_MEMORY as i32;
+            return TRONA_OUT_OF_MEMORY as i32;
         }
         if alloc_pool(&raw mut SOCKETS_PTR, &raw mut SOCKETS_CAP, INITIAL_SOCKETS) != 0 {
-            return BESALT_OUT_OF_MEMORY as i32;
+            return TRONA_OUT_OF_MEMORY as i32;
         }
         if alloc_pool(
             &raw mut POLL_WAITERS_PTR,
@@ -459,19 +461,19 @@ unsafe fn init_dynamic_state_storage() -> i32 {
             INITIAL_POLL_WAITERS,
         ) != 0
         {
-            return BESALT_OUT_OF_MEMORY as i32;
+            return TRONA_OUT_OF_MEMORY as i32;
         }
         if alloc_pool(&raw mut EPOLLS_PTR, &raw mut EPOLLS_CAP, INITIAL_EPOLLS) != 0 {
-            return BESALT_OUT_OF_MEMORY as i32;
+            return TRONA_OUT_OF_MEMORY as i32;
         }
         if alloc_pool(&raw mut SHM_DATA_PTR, &raw mut SHM_CAP, INITIAL_SHM) != 0 {
-            return BESALT_OUT_OF_MEMORY as i32;
+            return TRONA_OUT_OF_MEMORY as i32;
         }
         if alloc_pool(&raw mut PIPES_PTR, &raw mut PIPES_CAP, INITIAL_PIPES) != 0 {
-            return BESALT_OUT_OF_MEMORY as i32;
+            return TRONA_OUT_OF_MEMORY as i32;
         }
 
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[VFS] Growable pools initialized: inodes=128 clients=16 sockets=32 pipes=16\n");
         });
 
@@ -488,11 +490,11 @@ pub(crate) fn puts(s: &[u8]) {
 }
 
 fn signal_ready() {
-    let _ = besalt::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
 
 pub(crate) fn ipc_ctx() -> *mut IpcContext {
-    besalt::tls::current_ipc_ctx()
+    trona_posix::tls::current_ipc_ctx()
 }
 
 // ======================================================================
@@ -581,7 +583,7 @@ pub(crate) unsafe fn urandom_init() {
 
         // Primary: seed from hardware RDRAND/RNDR via kernel syscall
         while filled < 32 {
-            match besalt::syscall::sys_getrandom() {
+            match trona::syscall::sys_getrandom() {
                 Some(val) => {
                     let bytes = val.to_le_bytes();
                     let remain = 32 - filled;
@@ -592,7 +594,7 @@ pub(crate) unsafe fn urandom_init() {
                 None => {
                     // Fallback: TSC + clock mixing
                     let mut ts = Timespec::zeroed();
-                    besalt::syscall::syscall(
+                    trona::syscall::syscall(
                         SYS_CLOCK_GETTIME,
                         0,
                         &raw mut ts as u64,
@@ -638,7 +640,7 @@ pub(crate) unsafe fn urandom_next() -> u64 {
         if URANDOM_COUNTER >= URANDOM_RESEED_INTERVAL {
             URANDOM_COUNTER = 0;
             // Reseed: XOR fresh RDRAND bytes into the key
-            if let Some(fresh) = besalt::syscall::sys_getrandom() {
+            if let Some(fresh) = trona::syscall::sys_getrandom() {
                 let key = &raw mut URANDOM_KEY as *mut u8;
                 let bytes = fresh.to_le_bytes();
                 let mut i = 0;
@@ -902,7 +904,7 @@ unsafe fn init_ramfs() {
         let initrd = INITRD_VADDR as *const u8;
         let initrd_size = ramfs::read_boot_info_initrd_size();
 
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[VFS] Initrd size: ");
             _lb.hex(initrd_size as u64);
             _lb.str(b" bytes\n");
@@ -921,7 +923,7 @@ unsafe fn init_ramfs() {
             }
         }
 
-        besalt::uinfo!(|_lb| {
+        trona::uinfo!(|_lb| {
             _lb.str(b"[VFS] Mounted ");
             _lb.hex(file_count as u64);
             _lb.str(b" initrd files\n");
@@ -935,14 +937,14 @@ unsafe fn init_ramfs() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[VFS] SaltyOS VFS server starting\n");
     });
 
     unsafe {
         let derr = init_dynamic_state_storage();
         if derr != 0 {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[VFS] FAIL: state storage init err=");
                 _lb.hex(derr as u64);
                 _lb.str(b"\n");
@@ -957,13 +959,13 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         init_fb_info();
     }
 
-    besalt::uinfo!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[VFS] Filesystem ready\n");
     });
 
     if VFS_CAP_NAMESERV_EP != 0 {
-        let mut reg_msg = BesaltMsg::zeroed();
-        let mut reg_reply = BesaltMsg::zeroed();
+        let mut reg_msg = TronaMsg::zeroed();
+        let mut reg_reply = TronaMsg::zeroed();
         let svc_name = b"vfs";
         reg_msg.label = POSIX_NS_REGISTER;
         reg_msg.regs[0] = svc_name.len() as u64;
@@ -983,12 +985,12 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 &raw const reg_msg,
                 &raw mut reg_reply,
             );
-            if err == 0 && reg_reply.label == BESALT_OK {
-                besalt::uinfo!(|_lb| {
+            if err == 0 && reg_reply.label == TRONA_OK {
+                trona::uinfo!(|_lb| {
                     _lb.str(b"[VFS] registered with nameserv\n");
                 });
             } else {
-                besalt::uwarn!(|_lb| {
+                trona::uwarn!(|_lb| {
                     _lb.str(b"[VFS] WARN: nameserv registration failed\n");
                 });
             }
@@ -996,13 +998,13 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     }
 
     {
-        let err = besalt::invoke::tcb_bind_notification(CAP_SELF_TCB, VFS_CAP_PTY_NTFN);
+        let err = trona::invoke::tcb_bind_notification(CAP_SELF_TCB, VFS_CAP_PTY_NTFN);
         if err == 0 {
-            besalt::uinfo!(|_lb| {
+            trona::uinfo!(|_lb| {
                 _lb.str(b"[VFS] PTY notification bound to TCB\n");
             });
         } else {
-            besalt::uwarn!(|_lb| {
+            trona::uwarn!(|_lb| {
                 _lb.str(b"[VFS] WARN: PTY notification bind failed\n");
             });
         }
@@ -1018,13 +1020,13 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     signal_ready();
 
     if unsafe { !inet::prepare_inet_callback_endpoint() } {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[VFS] failed to prepare netsrv callback endpoint\n");
         });
         idle();
     }
 
-    let mut msg = BesaltMsg::zeroed();
+    let mut msg = TronaMsg::zeroed();
     let mut badge: u64 = 0;
     let mut recv_source: u64 = 0;
     let recv_endpoints = [CAP_SERVER_EP, VFS_CAP_NETSRV_CALLBACK_EP];
@@ -1041,14 +1043,14 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         )
     };
     if err != 0 {
-        besalt::uerror!(|_lb| {
+        trona::uerror!(|_lb| {
             _lb.str(b"[VFS] initial recv failed\n");
         });
         idle();
     }
 
     loop {
-        let mut reply = BesaltMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         let mut skip_reply = true;
 
         if have_message {
@@ -1068,7 +1070,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                         inet::handle_netsrv_callback(&raw const msg, &raw mut reply);
                     }
                 } else {
-                    reply.label = BESALT_INVALID_OPERATION;
+                    reply.label = TRONA_INVALID_OPERATION;
                 }
                 // reply to netsrv to complete the callback IPC — do NOT skip reply
             } else {
@@ -1135,7 +1137,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                                                 0,
                                                 &raw mut reply,
                                             );
-                                            if reply.label == BESALT_OK {
+                                            if reply.label == TRONA_OK {
                                                 let bytes_read = reply.regs[0];
                                                 let copy_len = bytes_read.min(152);
                                                 reply.length = 1 + (copy_len + 7) / 8;
@@ -1155,7 +1157,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                                                 &raw mut reply,
                                             );
                                         }
-                                        if reply.label == BESALT_OK {
+                                        if reply.label == TRONA_OK {
                                             let bytes_read = reply.regs[0];
                                             fde.offset += bytes_read;
                                         }
@@ -1202,7 +1204,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                                     FD_TYPE_MOUNT => {
                                         let fde = &mut *(*cli).fds.add(fd as usize);
                                         if !client::flags_allow_write(fde.flags) {
-                                            reply.label = BESALT_INVALID_OPERATION;
+                                            reply.label = TRONA_INVALID_OPERATION;
                                         } else {
                                             let mount_idx = fde.dev_type as usize;
                                             let remote_ino = fde.sock_id as u64;
@@ -1244,7 +1246,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                                                     &raw mut reply,
                                                 );
                                             }
-                                            if reply.label == BESALT_OK {
+                                            if reply.label == TRONA_OK {
                                                 let written = reply.regs[0];
                                                 fde.offset = offset + written;
                                             }
@@ -1356,7 +1358,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     }
                     VFS_BIND => {
                         // Check for AF_INET bind (regs[1] == AF_INET)
-                        if msg.regs[1] == besalt::consts::AF_INET as u64 {
+                        if msg.regs[1] == trona::consts::AF_INET as u64 {
                             skip_reply =
                                 inet::handle_inet_bind(&raw const msg, &raw mut reply, badge);
                         } else {
@@ -1614,7 +1616,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                         bulk::handle_bulk_read(&raw const msg, &raw mut reply, badge);
                     }
                     _ => {
-                        reply.label = BESALT_INVALID_OPERATION;
+                        reply.label = TRONA_INVALID_OPERATION;
                     }
                 }
             }
@@ -1683,7 +1685,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 }
             }
         };
-        if err == BESALT_CANCELLED as i32 || err == BESALT_TIMED_OUT as i32 {
+        if err == TRONA_CANCELLED as i32 || err == TRONA_TIMED_OUT as i32 {
             unsafe {
                 let now_ns = poll::monotonic_now_ns();
                 poll::expire_poll_timeouts(now_ns);
@@ -1692,7 +1694,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             continue;
         }
         if err != 0 {
-            besalt::uerror!(|_lb| {
+            trona::uerror!(|_lb| {
                 _lb.str(b"[VFS] reply_recv failed err=");
                 _lb.hex(err as u64);
                 _lb.str(b"\n");
@@ -1707,6 +1709,6 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
 fn idle() -> ! {
     loop {
-        besalt::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 }

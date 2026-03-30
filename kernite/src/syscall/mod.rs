@@ -589,7 +589,7 @@ unsafe fn read_recv_any_timeout_ns(endpoint_count: usize) -> Result<u64, Syscall
 
 /// Write received IPC message to current thread's IPC buffer
 ///
-/// Writes in `struct besalt_msg` layout (matching userland overlay):
+/// Writes in `struct trona_msg` layout (matching userland overlay):
 ///   msg[0] = label
 ///   msg[1] = length
 ///   msg[2..5] = regs[0..3]  (inline MRs)

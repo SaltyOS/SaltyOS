@@ -41,9 +41,9 @@ build = ncurses
 [env]
 CFLAGS_FOR_BUILD =
 NCURSESW_CFLAGS = -I${PORTDIR}/../ncurses/${ARCH_WORK}/ncurses-6.5/include
-NCURSESW_LIBS = -L${PORTDIR}/../ncurses/stage -lncursesw
+NCURSESW_LIBS = -L${PORTDIR}/../ncurses/${ARCH_STAGE} -lncursesw
 EXTRA_CFLAGS = -I${PORTDIR}/../ncurses/${ARCH_WORK}/ncurses-6.5/include -Wno-implicit-function-declaration
-EXTRA_LDFLAGS = -L${PORTDIR}/../ncurses/stage
+EXTRA_LDFLAGS = -L${PORTDIR}/../ncurses/${ARCH_STAGE}
 EXTRA_LIBS = -lncursesw
 
 [autoconf_cache]
