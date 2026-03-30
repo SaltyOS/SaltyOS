@@ -1,0 +1,52 @@
+[port]
+name = python
+version = 3.14.0
+description = Python programming language
+homepage = https://www.python.org/
+license = PSF-2.0
+
+[source]
+url = https://www.python.org/ftp/python/${version}/Python-${version}.tgz
+subdir = Python-${version}
+sha256 = 88d2da4eed42fa9a5f42ff58a8bc8988881bd6c547e297e46682c2687638a851
+
+[depends]
+build = openssl, zlib, bzip2, xz, zstd, ncurses
+
+[build]
+type = autotools
+configure =
+    -C
+    --without-ensurepip
+    --without-pymalloc
+    --disable-ipv6
+    --disable-shared
+    --disable-test-modules
+    --with-build-python=python3
+    --with-openssl=${PORTDIR}/../openssl/${ARCH_WORK}/openssl-3.4.1
+    ac_cv_file__dev_ptmx=no
+    ac_cv_file__dev_ptc=no
+
+[env]
+CFLAGS_FOR_BUILD =
+EXTRA_CFLAGS = -I${PORTDIR}/../zlib/${ARCH_WORK}/zlib-1.3.1 -I${PORTDIR}/../zlib/${ARCH_WORK}/zlib-1.3.1/_build -I${PORTDIR}/../bzip2/${ARCH_WORK}/bzip2-1.0.8 -I${PORTDIR}/../xz/${ARCH_WORK}/xz-5.6.3/src/liblzma/api -I${PORTDIR}/../zstd/${ARCH_WORK}/zstd-1.5.6/lib -I${PORTDIR}/../ncurses/${ARCH_WORK}/ncurses-6.5/include
+EXTRA_LDFLAGS = -L${PORTDIR}/../zlib/stage -L${PORTDIR}/../bzip2/stage -L${PORTDIR}/../xz/stage -L${PORTDIR}/../zstd/stage -L${PORTDIR}/../openssl/stage -L${PORTDIR}/../ncurses/stage
+EXTRA_LIBS = -lncursesw
+PKG_CONFIG = no
+
+[autoconf_cache]
+ac_cv_buggy_getaddrinfo=no
+ac_cv_file__dev_ptmx=no
+ac_cv_file__dev_ptc=no
+ac_cv_func_getentropy=yes
+ac_cv_func_getrandom=yes
+ac_cv_func_getgrouplist=no
+ac_cv_search_initscr=-lncursesw
+ac_cv_header_ffi_h=no
+ac_cv_lib_ffi_ffi_call=no
+py_cv_module__ctypes=disabled
+py_cv_module__ctypes_test=disabled
+
+[install]
+bin/python3 = python.exe
+lib/python3.14 = Lib

@@ -1,0 +1,8 @@
+--- a/configure
++++ b/configure
+@@ -4154,6 +4154,7 @@
+ 	cygwin*) MACHDEP="cygwin";;
+ 	darwin*) MACHDEP="darwin";;
++	saltyos*) MACHDEP="saltyos";;
+ 	'')	MACHDEP="unknown";;
+     esac

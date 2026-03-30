@@ -1,0 +1,12 @@
+--- a/configure
++++ b/configure
+@@ -4127,6 +4127,9 @@
+ 	*-*-wasi*)
+ 	    ac_sys_system=WASI
+ 	    ;;
++	*-*-saltyos*)
++	    ac_sys_system=SaltyOS
++	    ;;
+ 	*)
+ 		# for now, limit cross builds to known configurations
+ 		MACHDEP="unknown"
