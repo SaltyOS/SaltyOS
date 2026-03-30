@@ -804,7 +804,7 @@ impl VSpace {
     }
 
     /// Ensure this VSpace has a valid ASID and return it shifted into the
-    /// TTBR0_EL1[63:48] position.  Allocates lazily on first call and
+    /// active host TTBR0[63:48] position. Allocates lazily on first call and
     /// re-allocates if the global generation has rolled over.
     ///
     /// Must be called with IRQs disabled (satisfied by `switch_to`).
@@ -826,6 +826,12 @@ impl VSpace {
         }
 
         (asid as u64) << 48
+    }
+
+    /// Return the fully encoded active host TTBR0 value for this VSpace.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn host_ttbr0(&self) -> u64 {
+        self.ensure_asid() | self.root
     }
 
     pub fn tracking(&self) -> &VSpaceTracking {
@@ -1065,11 +1071,13 @@ impl VSpace {
 
                 // Zero the new page table
                 unsafe {
-                    core::ptr::write_bytes(new_table_virt, 0, 1);
+                    core::ptr::write_bytes(new_table_virt as *mut u8, 0, PAGE_SIZE);
                 }
+                crate::arch::publish_page_table_page(new_frame);
 
                 // Set the entry
                 table.set_entry(idx, new_frame | table_flags);
+                crate::arch::publish_page_table_page(current_table);
 
                 current_table = new_frame;
             } else {
@@ -1100,6 +1108,7 @@ impl VSpace {
         match level {
             4 => {
                 pml4.set_entry(Self::pml4_index(vaddr), value);
+                crate::arch::publish_page_table_page(self.root);
                 Ok(())
             }
             3 => {
@@ -1110,6 +1119,7 @@ impl VSpace {
                 let pdpt =
                     unsafe { &mut *(phys_to_virt(pml4e & ENTRY_ADDR_MASK) as *mut PageTable) };
                 pdpt.set_entry(Self::pdpt_index(vaddr), value);
+                crate::arch::publish_page_table_page(pml4e & ENTRY_ADDR_MASK);
                 Ok(())
             }
             2 => {
@@ -1125,6 +1135,7 @@ impl VSpace {
                 }
                 let pd = unsafe { &mut *(phys_to_virt(pdpte & ENTRY_ADDR_MASK) as *mut PageTable) };
                 pd.set_entry(Self::pd_index(vaddr), value);
+                crate::arch::publish_page_table_page(pdpte & ENTRY_ADDR_MASK);
                 Ok(())
             }
             1 => {
@@ -1145,6 +1156,7 @@ impl VSpace {
                 }
                 let pt = unsafe { &mut *(phys_to_virt(pde & ENTRY_ADDR_MASK) as *mut PageTable) };
                 pt.set_entry(Self::pt_index(vaddr), value);
+                crate::arch::publish_page_table_page(pde & ENTRY_ADDR_MASK);
                 Ok(())
             }
             _ => Err(VSpaceError::NotMapped),
@@ -1487,6 +1499,7 @@ impl VSpace {
             }
 
             parent_table.set_entry(idx, pt_phys | table_flags);
+            crate::arch::publish_page_table_page(current_table);
             // Protect the installed PT frame from premature reclamation if the
             // user-held Frame capability is later deleted (pmm_free).
             super::pmm_retain_mapping(pt_phys);
@@ -2684,7 +2697,7 @@ impl VSpace {
         // Load CR3
         unsafe {
             #[cfg(target_arch = "aarch64")]
-            let cr3 = self.ensure_asid() | self.root;
+            let cr3 = self.host_ttbr0();
             #[cfg(not(target_arch = "aarch64"))]
             let cr3 = self.root;
             crate::arch::paging::write_cr3(cr3);

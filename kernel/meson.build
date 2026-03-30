@@ -18,6 +18,7 @@ all_asm_files = run_command(
 ).stdout().strip()
 
 kernel_crate_root = files('src/lib.rs')
+kernel_target_spec = files(arch + '-saltyos.json')
 kernel_ld = meson.current_source_dir() / 'arch' / arch + '.ld'
 kernel_link_target = '--target=' + asm_target
 kernel_ld_lld = find_program('ld.lld', required: true)
@@ -78,6 +79,7 @@ kernel_obj = custom_target('kernel_obj',
   input: kernel_crate_root,
   output: 'kernel.o',
   depfile: 'kernel.d',
+  depend_files: kernel_target_spec,
   command: [
     rustc,
     rust_kernel_args,

@@ -1,8 +1,8 @@
 //! AArch64 per-CPU data management
 //!
 //! Uses TPIDR_EL1 to store a pointer to the current CPU's `PerCpuData`
-//! entry in a static array.  This register is only accessible from EL1,
-//! so userspace cannot tamper with it.
+//! entry in a static array. The register is inaccessible from EL0, so
+//! userspace cannot tamper with it.
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Per-CPU data structure.
 ///
-/// Accessed via TPIDR_EL1 → pointer → field offset.
+/// Accessed via the active host TPIDR register → pointer → field offset.
 /// Layout must be `#[repr(C)]` for stable offsets used by inline assembly.
 #[repr(C)]
 pub struct PerCpuData {
@@ -49,13 +49,13 @@ static AP_CLAIMED: [AtomicBool; super::MAX_CPUS] =
     [const { AtomicBool::new(false) }; super::MAX_CPUS];
 
 // ---------------------------------------------------------------------------
-// TPIDR_EL1 helpers
+// Host TPIDR helpers
 // ---------------------------------------------------------------------------
 
 /// Write a pointer to TPIDR_EL1 (per-CPU data base).
 #[inline(always)]
-fn write_tpidr_el1(val: u64) {
-    // SAFETY: Writing TPIDR_EL1 is safe from EL1.
+fn write_host_tpidr(val: u64) {
+    // SAFETY: Writing TPIDR_EL1 is safe from EL1 kernel context.
     unsafe {
         core::arch::asm!("msr TPIDR_EL1, {}", in(reg) val, options(nomem, nostack));
     }
@@ -63,9 +63,9 @@ fn write_tpidr_el1(val: u64) {
 
 /// Read TPIDR_EL1 (per-CPU data base pointer).
 #[inline(always)]
-fn read_tpidr_el1() -> u64 {
+fn read_host_tpidr() -> u64 {
     let val: u64;
-    // SAFETY: Reading TPIDR_EL1 is always safe from EL1.
+    // SAFETY: Reading TPIDR_EL1 is always safe from EL1 kernel context.
     unsafe {
         core::arch::asm!("mrs {}, TPIDR_EL1", out(reg) val, options(nomem, nostack));
     }
@@ -78,21 +78,21 @@ fn read_tpidr_el1() -> u64 {
 
 /// Initialize per-CPU data for the boot CPU (CPU 0).
 ///
-/// Sets `PER_CPU_DATA[0].cpu_id = 0` and writes TPIDR_EL1 to point at it.
+/// Sets `PER_CPU_DATA[0].cpu_id = 0` and writes the active host TPIDR to point at it.
 /// Must be called early during BSP init before any per-CPU field access.
 pub fn init_bsp() {
     // SAFETY: Single-threaded boot context; no other CPU is running.
     unsafe {
         let per_cpu = &raw mut PER_CPU_DATA[0];
         (*per_cpu).cpu_id = 0;
-        write_tpidr_el1(per_cpu as u64);
+        write_host_tpidr(per_cpu as u64);
     }
     AP_CLAIMED[0].store(true, Ordering::Release);
 }
 
 /// Initialize per-CPU data for an application processor.
 ///
-/// Sets `PER_CPU_DATA[cpu_id]` fields and writes TPIDR_EL1.
+/// Sets `PER_CPU_DATA[cpu_id]` fields and writes the active host TPIDR.
 /// Called from `ap_entry()` during AP startup.
 pub fn init_ap(cpu_id: u32) {
     let idx = cpu_id as usize;
@@ -104,7 +104,7 @@ pub fn init_ap(cpu_id: u32) {
     unsafe {
         let per_cpu = &raw mut PER_CPU_DATA[idx];
         (*per_cpu).cpu_id = cpu_id;
-        write_tpidr_el1(per_cpu as u64);
+        write_host_tpidr(per_cpu as u64);
     }
 }
 
@@ -152,11 +152,11 @@ pub unsafe fn per_cpu_mut(cpu_id: u32) -> &'static mut PerCpuData {
 
 /// Set the kernel stack top for the current CPU.
 pub fn set_kernel_stack(stack_top: u64) {
-    let base = read_tpidr_el1();
+    let base = read_host_tpidr();
     if base == 0 {
         return;
     }
-    // SAFETY: TPIDR_EL1 points to a valid PerCpuData; kernel_stack_top is
+    // SAFETY: The active host TPIDR points to a valid PerCpuData; kernel_stack_top is
     // at offset 8 (after cpu_id u32 + _pad0 u32).
     unsafe {
         let ptr = (base + 8) as *mut u64;
@@ -166,11 +166,11 @@ pub fn set_kernel_stack(stack_top: u64) {
 
 /// Set the stack canary for the current CPU.
 pub fn set_per_cpu_canary(canary: u64) {
-    let base = read_tpidr_el1();
+    let base = read_host_tpidr();
     if base == 0 {
         return;
     }
-    // SAFETY: TPIDR_EL1 points to a valid PerCpuData; canary is at offset 16.
+    // SAFETY: The active host TPIDR points to a valid PerCpuData; canary is at offset 16.
     unsafe {
         let ptr = (base + 16) as *mut u64;
         core::ptr::write_volatile(ptr, canary);
@@ -179,11 +179,11 @@ pub fn set_per_cpu_canary(canary: u64) {
 
 /// Increment and return the invocation sequence number for the current CPU.
 pub fn next_invoke_seq() -> u64 {
-    let base = read_tpidr_el1();
+    let base = read_host_tpidr();
     if base == 0 {
         return 0;
     }
-    // SAFETY: TPIDR_EL1 points to a valid PerCpuData; invoke_seq is at offset 24.
+    // SAFETY: The active host TPIDR points to a valid PerCpuData; invoke_seq is at offset 24.
     // Only the current CPU accesses its own invoke_seq, so no races.
     unsafe {
         let ptr = (base + 24) as *mut u64;
@@ -196,11 +196,11 @@ pub fn next_invoke_seq() -> u64 {
 
 /// Return the current invocation sequence number for the current CPU.
 pub fn current_invoke_seq() -> u64 {
-    let base = read_tpidr_el1();
+    let base = read_host_tpidr();
     if base == 0 {
         return 0;
     }
-    // SAFETY: TPIDR_EL1 points to a valid PerCpuData; invoke_seq at offset 24.
+    // SAFETY: The active host TPIDR points to a valid PerCpuData; invoke_seq at offset 24.
     unsafe {
         let ptr = (base + 24) as *const u64;
         core::ptr::read_volatile(ptr)

@@ -22,6 +22,7 @@ const TLV_ACPI_RSDP: u16 = 6;
 
 /// BootInfo header flags
 pub const BOOTINFO_FLAG_UEFI_BOOT: u32 = 1 << 0;
+pub const BOOTINFO_FLAG_STAGE3_EL2: u32 = 1 << 4;
 
 /// Raw BootInfo header (matches C struct exactly)
 #[repr(C, packed)]
@@ -156,6 +157,7 @@ pub struct ParsedBootInfo {
     pub memory_map_len: usize,
     pub kernel_phys_base: u64,
     pub kernel_virt_base: u64,
+    pub kernel_size: u64,
     pub initrd_addr: u64,
     pub initrd_size: u64,
     pub rsdp_addr: u64,
@@ -173,6 +175,7 @@ static mut PARSED_BOOT_INFO: ParsedBootInfo = ParsedBootInfo {
     memory_map_len: 0,
     kernel_phys_base: 0,
     kernel_virt_base: 0,
+    kernel_size: 0,
     initrd_addr: 0,
     initrd_size: 0,
     rsdp_addr: 0,
@@ -268,6 +271,7 @@ pub unsafe fn parse(ptr: *const u8) -> Option<&'static ParsedBootInfo> {
                         let ki = &*(data_ptr as *const RawKernelImage);
                         info.kernel_phys_base = ki.phys_base;
                         info.kernel_virt_base = ki.virt_base;
+                        info.kernel_size = ki.size;
                     }
                 }
                 TLV_INITRD => {

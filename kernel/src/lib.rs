@@ -451,6 +451,7 @@ pub extern "C" fn kmain(raw_boot_info: *const u8) -> ! {
             _g.dec(info.memory_map_len as u64);
             _g.puts(" memory map entries\n");
         });
+
     } else {
         crate::kwarn!(|_g| {
             _g.puts("[KMAIN] WARNING: Failed to parse BootInfo!\n");
@@ -502,6 +503,15 @@ pub extern "C" fn kmain(raw_boot_info: *const u8) -> ! {
 /// Panic handler
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // Freeze local IRQ delivery so timer/IPI activity cannot re-enter the
+    // panic path and obscure the original fault.
+    arch::cli();
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        arch::aarch64::timer::stop();
+    }
+
     // Re-enable framebuffer console so crash output is visible on screen
     // even if the display server had taken over
     console::enable();
@@ -532,6 +542,14 @@ fn panic(info: &PanicInfo) -> ! {
 /// `msg` must be a valid NUL-terminated C string pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kernel_panic(msg: *const u8) -> ! {
+    // Assembly-callable panic entry can arrive with IRQs enabled.
+    arch::cli();
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        arch::aarch64::timer::stop();
+    }
+
     console::enable();
     serial_puts_raw("\n!!! KERNEL PANIC !!!\n  ");
     if !msg.is_null() {

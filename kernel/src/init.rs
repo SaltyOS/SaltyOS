@@ -227,17 +227,14 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
         core::ptr::write_bytes(pml4_virt, 0, PAGE_SIZE / 8);
     }
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Copy kernel higher-half PML4 entries so the kernel remains mapped
-        // after CR3 switches into this address space.
-        let kernel_cr3 = crate::mm::vspace::kernel_vspace_root();
-        let kernel_pml4 = phys_to_virt(kernel_cr3) as *const u64;
-        unsafe {
-            for i in 256..512 {
-                let entry = kernel_pml4.add(i).read();
-                pml4_virt.add(i).write(entry);
-            }
+    // Copy kernel upper-half top-level entries so the kernel remains mapped
+    // after switching into this address space.
+    let kernel_cr3 = crate::mm::vspace::kernel_vspace_root();
+    let kernel_pml4 = phys_to_virt(kernel_cr3) as *const u64;
+    unsafe {
+        for i in 256..512 {
+            let entry = kernel_pml4.add(i).read();
+            pml4_virt.add(i).write(entry);
         }
     }
 

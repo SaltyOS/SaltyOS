@@ -27,6 +27,10 @@
 #include "handoff.h"
 #include "boot_alloc.h"
 
+#if defined(__aarch64__)
+#include "arch/aarch64/cpu.h"
+#endif
+
 /* GUIDs for UEFI file loading */
 static EFI_GUID s_LoadedImageGuid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
 static EFI_GUID s_FileSysGuid = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
@@ -41,6 +45,22 @@ static CHAR16 s_InitrdPath[] = { '\\','E','F','I','\\','S','A','L','T','Y',
 
 /* Page table pool: 32 pages = 128KB */
 #define PT_POOL_PAGES   32
+
+#if defined(__aarch64__)
+extern uint64_t stage3_prepare_handoff_el(void);
+#endif
+
+static uint64_t load_u64_unaligned(const void *ptr)
+{
+    const uint8_t *p = (const uint8_t *)ptr;
+    uint64_t value = 0;
+
+    for (unsigned int i = 0; i < 8; i++) {
+        value |= ((uint64_t)p[i]) << (i * 8);
+    }
+
+    return value;
+}
 
 /*
  * Load a file from ESP using UEFI Boot Services
@@ -136,8 +156,10 @@ void stage3_entry_64(struct Stage2Info *info)
     print_str("Boot mode: UEFI (64-bit)\n");
 
     /* Get EFI context from Stage2Info */
-    EFI_SYSTEM_TABLE *systable = (EFI_SYSTEM_TABLE *)(uintptr_t)info->efi_system_table;
-    EFI_HANDLE image_handle = (EFI_HANDLE)(uintptr_t)info->efi_image_handle;
+    EFI_SYSTEM_TABLE *systable =
+        (EFI_SYSTEM_TABLE *)(uintptr_t)load_u64_unaligned(&info->efi_system_table);
+    EFI_HANDLE image_handle =
+        (EFI_HANDLE)(uintptr_t)load_u64_unaligned(&info->efi_image_handle);
 
     if (!systable || !image_handle) {
         stage3_panic("No EFI context in Stage2Info");
@@ -324,6 +346,14 @@ void stage3_entry_64(struct Stage2Info *info)
         }
     }
 
+#if defined(__aarch64__)
+    /* Boot Services are gone; prepare the final exception level and record
+     * whether Stage 3 had to descend from EL2. */
+    uint32_t extra_bootinfo_flags = (uint32_t)stage3_prepare_handoff_el();
+#else
+    uint32_t extra_bootinfo_flags = 0;
+#endif
+
     /*
      * After ExitBootServices:
      * - No more UEFI Boot Services
@@ -349,16 +379,26 @@ void stage3_entry_64(struct Stage2Info *info)
         stage3_panic("Failed to set up page tables");
     }
 
+#if defined(__aarch64__)
+    mask_all_exceptions();
+#endif
+
     /* Build BootInfo */
     struct BootInfoHeader *bootinfo = handoff_build_bootinfo(
         (void *)(uintptr_t)bi_buf, BOOTINFO_BUFFER_SIZE,
-        info, &load_result,
+        info, extra_bootinfo_flags, &load_result,
         (uint64_t)(uintptr_t)initrd_buffer, initrd_file_size,
         ba.records, ba.record_count);
 
     if (!bootinfo) {
         stage3_panic("Failed to build BootInfo");
     }
+
+#if defined(__aarch64__)
+    mask_all_exceptions();
+    flush_dcache_poc_range(load_result.phys_base, load_result.mem_size);
+    invalidate_icache_range(load_result.phys_base, load_result.mem_size);
+#endif
 
     /* Load new page table */
     paging_load_cr3(pml4);

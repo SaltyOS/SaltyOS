@@ -16,7 +16,7 @@ use crate::mm::{
     PHYS_MAP_OFFSET, SpinLock,
 };
 
-/// Dedicated TTBR1 root used for kernel higher-half mappings.
+/// Kernel-global root template used for higher-half mappings.
 static mut KERNEL_ROOT_EARLY: u64 = 0;
 
 #[inline]
@@ -315,40 +315,38 @@ impl PageTable {
 // System register accessors
 // ---------------------------------------------------------------------------
 
-/// Read the current page table root (TTBR0_EL1).
-pub fn read_cr3() -> u64 {
+#[inline(always)]
+fn read_boot_root() -> u64 {
     let val: u64;
-    // SAFETY: Reading TTBR0_EL1 is always safe from EL1.
     unsafe {
         core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) val, options(nomem, nostack));
     }
     val
 }
 
-#[inline]
-unsafe fn write_ttbr1(root: u64) {
-    // SAFETY: Caller guarantees `root` is a valid top-level page table root.
+/// Read the current active host TTBR0 value.
+pub fn read_cr3() -> u64 {
+    let val: u64;
+    // SAFETY: Reading the active host TTBR0 is always safe from privileged code.
     unsafe {
-        core::arch::asm!(
-            "msr TTBR1_EL1, {}",
-            "isb",
-            in(reg) root,
-            options(nostack),
-        );
+        core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) val, options(nomem, nostack));
     }
+    val
 }
 
-/// Write the page table root (TTBR0_EL1) with an embedded ASID.
+/// Write the active host TTBR0 value with an embedded ASID.
 ///
 /// The caller must encode the ASID in bits [63:48] of `value`.  Because each
 /// VSpace carries a distinct ASID, the hardware TLB naturally partitions
-/// entries per address-space — no full TLB flush is needed on a plain switch.
+/// entries per address-space. In practice, Apple HVF has exhibited stale user
+/// translations across TTBR0 switches even when the guest ASID changes, so we
+/// invalidate the full host stage-1 TLB after installing the new TTBR0.
 ///
 /// # Safety
 /// `value` must encode a valid, 4 KB-aligned page table address in bits [47:0]
 /// and a valid ASID in bits [63:48].
 pub unsafe fn write_cr3(value: u64) {
-    // SAFETY: Caller guarantees value is a valid TTBR0 encoding.
+    // SAFETY: Caller guarantees value is a valid host TTBR0 encoding.
     // DSB ISH before the TTBR write ensures all prior PTE stores (e.g. from
     // COW clone) are visible to the page walker before it consults the new
     // page tables.  Without this barrier the walker may see stale zero
@@ -361,25 +359,51 @@ pub unsafe fn write_cr3(value: u64) {
             in(reg) value,
             options(nostack),
         );
+
+        // HVF can retain stale EL0 translations across TTBR0+ASID switches
+        // when multiple processes reuse the same low VA ranges (for example,
+        // the shared 0x3f8000..0x418000 user stack window). Flush after every
+        // user-root switch so execution never depends on hypervisor ASID
+        // correctness.
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack),
+        );
     }
 }
 
 /// Invalidate the TLB entry for a single virtual address with the
 /// ASID of the currently loaded TTBR0 (inner-shareable).
 ///
-/// Uses `TLBI VAE1IS` which targets a specific ASID, avoiding
+/// Uses the active host TLBI-by-VA operation which targets a specific ASID, avoiding
 /// collateral invalidation of other VSpaces that map the same VA.
+fn emit_kernel_pte_barriers() {
+    // SAFETY: These barriers are required after publishing a valid kernel
+    // page-table entry so the hardware table walker sees the store and any
+    // previously speculated invalid translation is discarded.
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "isb",
+            options(nostack),
+        );
+    }
+}
+
 pub fn invlpg(virt: u64) {
     unsafe {
-        // Read current TTBR0 to get the active ASID
-        let ttbr0: u64;
-        core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0, options(nomem, nostack));
+        // Read current TTBR0 to get the active ASID.
+        let ttbr0 = read_cr3();
         let asid = (ttbr0 >> 48) & 0xFFFF;
-        // TLBI VAE1IS: bits [63:48] = ASID, bits [43:0] = VA >> 12
+        // TLBI operand: bits [63:48] = ASID, bits [43:0] = VA >> 12.
         // Mask VA to 44 bits to prevent kernel addresses (0xFFFF_xxxx...)
         // from overflowing into the ASID field.
         let operand = (asid << 48) | ((virt >> 12) & 0x0000_0FFF_FFFF_FFFF);
         core::arch::asm!(
+            "dsb ishst",
             "tlbi vae1is, {}",
             "dsb ish",
             "isb",
@@ -395,6 +419,7 @@ pub fn invlpg_asid(virt: u64, asid: u16) {
     unsafe {
         let operand = ((asid as u64) << 48) | ((virt >> 12) & 0x0000_0FFF_FFFF_FFFF);
         core::arch::asm!(
+            "dsb ishst",
             "tlbi vae1is, {}",
             "dsb ish",
             "isb",
@@ -411,6 +436,7 @@ pub fn invlpg_all_asid(virt: u64) {
     unsafe {
         let va_shifted = (virt >> 12) & 0x0000_0FFF_FFFF_FFFF;
         core::arch::asm!(
+            "dsb ishst",
             "tlbi vaae1is, {}",
             "dsb ish",
             "isb",
@@ -422,9 +448,10 @@ pub fn invlpg_all_asid(virt: u64) {
 
 /// Flush the entire TLB (inner-shareable).
 pub fn flush_tlb_all() {
-    // SAFETY: Full TLB invalidation is always safe from EL1.
+    // SAFETY: Full TLB invalidation is always safe from privileged code.
     unsafe {
         core::arch::asm!(
+            "dsb ishst",
             "tlbi vmalle1is",
             "dsb ish",
             "isb",
@@ -435,11 +462,12 @@ pub fn flush_tlb_all() {
 
 /// Flush all TLB entries matching a specific ASID (inner-shareable).
 pub fn flush_asid(asid: u16) {
-    // SAFETY: TLBI is always safe from EL1. The ASID operand occupies
-    // bits [63:48] of the register passed to TLBI ASIDE1IS.
+    // SAFETY: TLBI is always safe from privileged code. The ASID operand
+    // occupies bits [63:48] of the register passed to TLBI ASIDE1IS.
     unsafe {
         let val = (asid as u64) << 48;
         core::arch::asm!(
+            "dsb ishst",
             "tlbi aside1is, {}",
             "dsb ish",
             "isb",
@@ -486,6 +514,71 @@ pub fn flush_dcache_pou_page(kva: u64) {
             addr += 64; // ARMv8 minimum cache line size
         }
         core::arch::asm!("dsb ish", options(nostack));
+    }
+}
+
+/// Clean D-cache to Point of Coherency for a 4 KiB page at kernel VA.
+///
+/// Use this before another CPU starts walking page tables that were built by
+/// the BSP. A plain DSB orders descriptor writes on the current CPU, but it
+/// does not push dirty cache lines out to the PoC for a secondary CPU's table
+/// walker.
+pub fn flush_dcache_poc_page(kva: u64) {
+    // SAFETY: DC CVAC is always safe from EL1. It cleans the cache line
+    // containing the virtual address to the Point of Coherency.
+    unsafe {
+        let mut addr = kva;
+        let end = kva + 4096;
+        while addr < end {
+            core::arch::asm!("dc cvac, {}", in(reg) addr, options(nostack));
+            addr += 64; // ARMv8 minimum cache line size
+        }
+        core::arch::asm!("dsb ish", options(nostack));
+    }
+}
+
+unsafe fn clean_page_table_tree_to_poc(table_phys: u64, level: u8) {
+    let table_virt = phys_to_virt(table_phys);
+    flush_dcache_poc_page(table_virt);
+
+    if level >= 3 {
+        return;
+    }
+
+    // SAFETY: `table_phys` is a page-table frame belonging to the active
+    // kernel host root and is reachable through the direct map.
+    let table = unsafe { &*(table_virt as *const PageTable) };
+    for index in 0..512 {
+        // SAFETY: Volatile read of a valid page-table slot.
+        let raw = unsafe { core::ptr::read_volatile(&table.entries[index]) };
+        if raw & HW_VALID == 0 {
+            continue;
+        }
+        if raw & HW_TABLE_OR_PAGE == 0 {
+            continue;
+        }
+        unsafe {
+            clean_page_table_tree_to_poc(raw & HW_ADDR_MASK, level + 1);
+        }
+    }
+}
+
+/// Clean the current kernel host-root page-table tree to PoC.
+///
+/// Secondary CPUs begin translation-table walks immediately after MMU enable.
+/// The BSP must clean newly built page tables out to PoC so those walkers
+/// cannot observe stale zero descriptors.
+pub fn clean_kernel_page_tables_to_poc() {
+    let root = kernel_root();
+    if root == 0 {
+        return;
+    }
+
+    // SAFETY: The kernel root template is established during early boot and
+    // this routine is only called once the direct map is active.
+    unsafe {
+        clean_page_table_tree_to_poc(root, 0);
+        core::arch::asm!("dsb ish", "isb", options(nostack));
     }
 }
 
@@ -589,8 +682,7 @@ pub unsafe fn asid_free(asid: u16) {
 /// Initialize aarch64 paging: configure MAIR, build the direct physical map,
 /// and register the kernel VSpace.
 pub fn init() {
-    // Step 1: Configure MAIR_EL1 (memory attribute indirection register).
-    // SAFETY: Writing MAIR_EL1 is safe during single-threaded boot from EL1.
+    // Step 1: Configure the active host MAIR.
     unsafe {
         core::arch::asm!(
             "msr MAIR_EL1, {}",
@@ -600,28 +692,24 @@ pub fn init() {
         );
     }
 
-    // Step 2: Split the shared Stage 3 root into a dedicated TTBR1 kernel
-    // root. In the boot root, L0 indices mean different things for TTBR0 and
-    // TTBR1: for example index 0 is the boot identity map in TTBR0 but the
-    // kernel text region in TTBR1. Teardown of the boot alias therefore
-    // requires independent roots.
-    let boot_root = read_cr3();
-    let kernel_root = unsafe { clone_kernel_root(boot_root) };
-    // SAFETY: `kernel_root` is a valid L0 root cloned from the active boot tables.
+    // Step 2: Reuse the shared Stage 3 root as the kernel root template.
+    // AArch64 full-root VSpaces will copy its upper-half entries so each
+    // process root contains both user mappings and kernel-global mappings.
+    let boot_root = read_boot_root();
     unsafe {
-        write_ttbr1(kernel_root);
-        KERNEL_ROOT_EARLY = kernel_root;
+        KERNEL_ROOT_EARLY = boot_root;
     }
 
-    // Step 3: Build the direct physical map sized to actual RAM in TTBR1.
+    // Step 3: Build the direct physical map sized to actual RAM in the
+    // kernel root template.
     let max_phys = crate::mm::max_phys();
     // SAFETY: Single-threaded boot context, frame allocator initialized.
     unsafe {
-        init_direct_map(kernel_root, max_phys);
+        init_direct_map(boot_root, max_phys);
     }
 
     // Step 4: Register kernel VSpace tracking (needed before any VSpace::new()).
-    crate::mm::vspace::init_kernel_vspace(kernel_root);
+    crate::mm::vspace::init_kernel_vspace(boot_root);
 }
 
 // ---------------------------------------------------------------------------
@@ -795,6 +883,8 @@ unsafe fn ensure_next_table(table: &mut PageTable, index: usize, context: &'stat
         core::ptr::write_volatile(&mut table.entries[index], desc);
     }
 
+    emit_kernel_pte_barriers();
+
     frame
 }
 
@@ -822,7 +912,7 @@ pub unsafe fn map_mmio_page(phys: u64) -> u64 {
 
     let kernel_root = kernel_root();
     if kernel_root == 0 {
-        panic!("kernel MMIO mapping requested before kernel TTBR1 root was registered");
+        panic!("kernel MMIO mapping requested before kernel host root was registered");
     }
     // SAFETY: kernel_root points at the dedicated kernel L0 table, reachable
     // via the already-established direct map.
@@ -874,21 +964,25 @@ pub unsafe fn map_mmio_page(phys: u64) -> u64 {
     }
 
     // L3 page descriptor: Valid + Page (0b11), Device-nGnRnE (AttrIdx=0),
-    // AF=1, SH=IS, AP=RW, UXN=1.
+    // AF=1, SH=IS, AP=RW, PXN=1, UXN=1.
     let desc = phys_page
         | HW_VALID
         | HW_TABLE_OR_PAGE
         | HW_AF
         | HW_SH_IS
         | (MAIR_IDX_DEVICE << HW_ATTRINDX_SHIFT)
+        | HW_PXN
         | HW_UXN;
 
     // SAFETY: Volatile write to a valid L3 PTE slot.
     unsafe {
         core::ptr::write_volatile(&mut l3.entries[pte_idx], desc);
     }
-    // Kernel MMIO lives in TTBR1 (higher half) — use the all-ASID TLBI
-    // variant since TTBR0's ASID is irrelevant for kernel mappings.
+    emit_kernel_pte_barriers();
+
+    // Kernel MMIO lives in the higher half of every AArch64 host root. Use
+    // the all-ASID TLBI variant so stale kernel translations are dropped
+    // regardless of the currently active user ASID.
     invlpg_all_asid(virt_page);
 
     virt_page + (phys & page_mask)
@@ -898,13 +992,13 @@ pub unsafe fn map_mmio_page(phys: u64) -> u64 {
 // clear_boot_identity_map()
 // ---------------------------------------------------------------------------
 
-/// Clear the bootloader identity mapping from the TTBR0 boot root.
+/// Clear the bootloader identity mapping from the shared boot root.
 ///
-/// Must be called AFTER all APs have booted. The kernel higher-half now lives
-/// in a dedicated TTBR1 root, so removing TTBR0.L0[0] only drops the low boot
-/// alias without tearing down kernel text/data mappings.
+/// Must be called AFTER all APs have booted. The kernel higher-half remains
+/// present in the shared root template, so removing L0[0] only drops the low
+/// boot alias without tearing down kernel text/data mappings.
 pub fn clear_boot_identity_map() {
-    let cr3 = read_cr3();
+    let cr3 = read_boot_root();
     // SAFETY: cr3 → L0 table via the direct map.
     let l0 = unsafe { &mut *(phys_to_virt(cr3) as *mut PageTable) };
     // Write a zero descriptor (raw, bypass encode since 0 encodes to 0).
@@ -921,20 +1015,18 @@ pub fn clear_boot_identity_map() {
 // System register read helpers (needed by init_smp for AP mailbox)
 // ---------------------------------------------------------------------------
 
-/// Read TTBR1_EL1 (kernel page table root).
+/// Read the current kernel root template.
+///
+/// On the transitional EL1 compatibility path, callers still populate the AP
+/// mailbox's TTBR1 field, but the source of truth is the shared kernel root
+/// template rather than the live TTBR1 register contents.
 pub fn read_ttbr1() -> u64 {
-    let val: u64;
-    // SAFETY: Reading TTBR1_EL1 is always safe from EL1.
-    unsafe {
-        core::arch::asm!("mrs {}, TTBR1_EL1", out(reg) val, options(nomem, nostack));
-    }
-    val
+    kernel_root()
 }
 
 /// Read MAIR_EL1 (Memory Attribute Indirection Register).
 pub fn read_mair() -> u64 {
     let val: u64;
-    // SAFETY: Reading MAIR_EL1 is always safe from EL1.
     unsafe {
         core::arch::asm!("mrs {}, MAIR_EL1", out(reg) val, options(nomem, nostack));
     }
@@ -944,7 +1036,6 @@ pub fn read_mair() -> u64 {
 /// Read TCR_EL1 (Translation Control Register).
 pub fn read_tcr() -> u64 {
     let val: u64;
-    // SAFETY: Reading TCR_EL1 is always safe from EL1.
     unsafe {
         core::arch::asm!("mrs {}, TCR_EL1", out(reg) val, options(nomem, nostack));
     }
@@ -954,26 +1045,8 @@ pub fn read_tcr() -> u64 {
 /// Read SCTLR_EL1 (System Control Register).
 pub fn read_sctlr() -> u64 {
     let val: u64;
-    // SAFETY: Reading SCTLR_EL1 is always safe from EL1.
     unsafe {
         core::arch::asm!("mrs {}, SCTLR_EL1", out(reg) val, options(nomem, nostack));
     }
     val
-}
-
-unsafe fn clone_kernel_root(boot_root: u64) -> u64 {
-    let kernel_root = pmm_alloc(&FrameOwner::KernelPrivate { subkind: KernelMetaKind::PageTable }).expect("Failed to allocate TTBR1 kernel root");
-
-    // The boot root is still identity-mapped via TTBR0 at this point.
-    let src = boot_root as *const u64;
-    let dst = kernel_root as *mut u64;
-    for i in 0..512 {
-        // SAFETY: both roots are valid 4 KiB L0 tables reachable via the
-        // boot identity mapping during early boot.
-        unsafe {
-            core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i)));
-        }
-    }
-
-    kernel_root
 }

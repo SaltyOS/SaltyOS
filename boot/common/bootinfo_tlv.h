@@ -48,6 +48,7 @@ enum MemMapType {
 #define BOOTINFO_FLAG_UEFI_BOOT    (1 << 0)  /* Booted via UEFI */
 #define BOOTINFO_FLAG_SECURE_BOOT  (1 << 1)  /* Secure boot active */
 #define BOOTINFO_FLAG_HAS_FB       (1 << 2)  /* Framebuffer available */
+#define BOOTINFO_FLAG_STAGE3_EL2   (1 << 4)  /* Stage3 entered kernel path from EL2 */
 
 /*
  * BootInfoHeader - Main BootInfo header

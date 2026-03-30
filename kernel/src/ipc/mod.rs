@@ -13,7 +13,7 @@ mod queue;
 pub use endpoint::{Endpoint, EndpointState};
 pub use irq::IrqHandler;
 pub use notification::Notification;
-pub use queue::WaitQueue;
+pub use queue::{RecvWaitQueue, WaitQueue};
 
 /// IPC message (register-based for fastpath)
 #[repr(C)]

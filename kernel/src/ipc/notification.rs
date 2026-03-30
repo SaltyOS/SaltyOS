@@ -5,7 +5,9 @@
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use crate::cap::{KernelObject, ObjectType};
-use crate::sched::thread::{BlockedReason, Tcb, ThreadState};
+use crate::sched::thread::{
+    BlockedReason, Tcb, ThreadState, RECV_WAIT_SELECTED_NOTIFICATION,
+};
 
 use crate::sched::scheduler::scheduler as get_scheduler;
 
@@ -150,7 +152,7 @@ impl Notification {
                 }
 
                 let timed = matches!((*tcb).blocked_reason, Some(BlockedReason::RecvTimedBlocked));
-                ep.remove_from_queue(tcb);
+                super::Endpoint::clear_tcb_recv_waits(tcb, RECV_WAIT_SELECTED_NOTIFICATION);
 
                 // Mark TCB as woken by notification — recv resume path
                 // will consume bits from ntfn under ntfn_lock.

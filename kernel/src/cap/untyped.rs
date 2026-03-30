@@ -417,18 +417,17 @@ unsafe fn init_vspace_metadata(
 ) -> *mut crate::cap::object::KernelObject {
     let pml4_virt = mm::phys_to_virt(pml4_phys) as *mut u64;
     unsafe {
-        core::ptr::write_bytes(pml4_virt, 0, PAGE_SIZE / 8);
+        core::ptr::write_bytes(pml4_virt as *mut u8, 0, PAGE_SIZE);
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            // Copy kernel higher-half entries so the kernel remains mapped
-            // after CR3 switches into the new VSpace.
-            let kernel_cr3 = crate::mm::vspace::kernel_vspace_root();
-            let kernel_pml4 = mm::phys_to_virt(kernel_cr3) as *const u64;
-            for i in 256..512 {
-                pml4_virt.add(i).write(kernel_pml4.add(i).read());
-            }
+        // Copy kernel upper-half entries so the kernel remains mapped after
+        // switching into the new VSpace.
+        let kernel_cr3 = crate::mm::vspace::kernel_vspace_root();
+        let kernel_pml4 = mm::phys_to_virt(kernel_cr3) as *const u64;
+        for i in 256..512 {
+            pml4_virt.add(i).write(kernel_pml4.add(i).read());
         }
+
+        crate::arch::publish_page_table_page(pml4_phys);
 
         // Initialize embedded VSpaceTracking at pml4_phys + PAGE_SIZE
         let tracking_ptr = crate::mm::vspace::tracking_from_vspace_phys(pml4_phys);

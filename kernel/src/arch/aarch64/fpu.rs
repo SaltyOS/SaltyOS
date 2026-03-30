@@ -1,21 +1,21 @@
 //! AArch64 FPU/NEON lazy state management
 //!
-//! Implements lazy FPU switching using CPACR_EL1.FPEN trapping.
+//! Implements lazy FPU switching using CPACR_EL1.
 //! The kernel is compiled without NEON/FP support, so FPU state only
 //! needs to be saved/restored when switching between userspace threads.
 //!
-//! The kernel target spec (`aarch64-saltyos.json`) disables NEON/FP via
-//! `-neon,-fp-armv8` features, and C code uses `-mgeneral-regs-only`,
+//! The kernel target spec (`aarch64-saltyos.json`) disables NEON via
+//! `-neon` and uses a soft-float ABI, while C code uses `-mgeneral-regs-only`,
 //! preventing the compiler from emitting AdvSIMD/FP instructions in
 //! kernel code. This ensures the lazy switching strategy is correct:
-//! kernel code never touches Q registers outside explicit save/restore
-//! in this module.
+//! Rust code never touches Q registers directly, and the save/restore
+//! path lives in dedicated assembly helpers.
 //!
 //! Strategy:
-//! - CPACR_EL1.FPEN = 0b01 after every context switch (trap EL0, allow EL1)
+//! - EL1 host: CPACR_EL1.FPEN = 0b01 after every context switch (trap EL0, allow EL1)
 //! - First NEON/FP instruction in usermode triggers ESR EC=0x07 exception
 //! - Exception handler saves previous owner's state, restores current
-//!   thread's state, and sets FPEN = 0b11
+//!   thread's state, and re-enables FP access
 //!
 //! NEON/FP state per thread:
 //! - 32 x 128-bit Q registers (V0-V31) = 512 bytes
@@ -26,6 +26,11 @@
 
 use crate::sched::thread::Tcb;
 
+unsafe extern "C" {
+    fn aarch64_fpsimd_save_state(area: *mut u8);
+    fn aarch64_fpsimd_restore_state(area: *const u8);
+}
+
 /// Per-CPU FPU owner tracking.
 ///
 /// Each element holds a pointer to the TCB that currently owns the
@@ -33,14 +38,12 @@ use crate::sched::thread::Tcb;
 static mut FPU_OWNER: [*mut Tcb; super::MAX_CPUS] = [core::ptr::null_mut(); super::MAX_CPUS];
 
 // ---------------------------------------------------------------------------
-// CPACR_EL1 FPEN control
+// Host FP trap control
 // ---------------------------------------------------------------------------
 
-/// Trap EL0 FPU/NEON access while keeping EL1 available.
+/// Trap user FPU/NEON access while keeping EL1 able to toggle FP access.
 ///
-/// Sets CPACR_EL1.FPEN (bits 21:20) to 0b01, causing FP/NEON
-/// instructions from EL0 to trap while still permitting EL1 code to use
-/// compiler-emitted AdvSIMD instructions in routines like `memset`.
+/// Sets CPACR_EL1.FPEN (bits 21:20) to 0b01.
 #[inline]
 fn disable_fpu() {
     let mut cpacr: u64;
@@ -52,17 +55,13 @@ fn disable_fpu() {
     cpacr |= 1u64 << 20;
     // SAFETY: Writing CPACR_EL1 to trap EL0 FP access while leaving EL1
     // available is safe.
-    // ISB ensures the change takes effect before the next instruction.
     unsafe {
         core::arch::asm!("msr CPACR_EL1, {}", in(reg) cpacr, options(nomem, nostack));
         core::arch::asm!("isb", options(nomem, nostack));
     }
 }
 
-/// Enable FPU/NEON access.
-///
-/// Sets CPACR_EL1.FPEN (bits 21:20) to 0b11, permitting FP/NEON
-/// instructions from both EL0 and EL1.
+/// Enable FPU/NEON access by setting CPACR_EL1.FPEN (bits 21:20) to 0b11.
 #[inline]
 fn enable_fpu() {
     let mut cpacr: u64;
@@ -72,7 +71,6 @@ fn enable_fpu() {
     }
     cpacr |= 3u64 << 20;
     // SAFETY: Writing CPACR_EL1 to allow FP access is safe.
-    // ISB ensures the change takes effect before the next instruction.
     unsafe {
         core::arch::asm!("msr CPACR_EL1, {}", in(reg) cpacr, options(nomem, nostack));
         core::arch::asm!("isb", options(nomem, nostack));
@@ -91,39 +89,11 @@ fn enable_fpu() {
 /// # Safety
 /// `tcb` must be a valid pointer to a Tcb with a writable fpu_state field.
 unsafe fn save(tcb: *mut Tcb) {
-    // SAFETY: tcb is guaranteed valid by caller. We use addr_of_mut! to
-    // get a raw pointer to the fpu_state field without creating a mutable
-    // reference (avoiding aliasing concerns with the static FPU_OWNER).
-    let area = unsafe { core::ptr::addr_of_mut!((*tcb).fpu_state).cast::<u8>() };
-    // SAFETY: area points to the TCB's 528-byte XSaveArea which is large
-    // enough for 32 Q registers (512 bytes) + FPCR (4) + FPSR (4).
-    // FPU must be enabled (caller responsibility).
-    unsafe {
-        core::arch::asm!(
-            "stp q0,  q1,  [{area}]",
-            "stp q2,  q3,  [{area}, #32]",
-            "stp q4,  q5,  [{area}, #64]",
-            "stp q6,  q7,  [{area}, #96]",
-            "stp q8,  q9,  [{area}, #128]",
-            "stp q10, q11, [{area}, #160]",
-            "stp q12, q13, [{area}, #192]",
-            "stp q14, q15, [{area}, #224]",
-            "stp q16, q17, [{area}, #256]",
-            "stp q18, q19, [{area}, #288]",
-            "stp q20, q21, [{area}, #320]",
-            "stp q22, q23, [{area}, #352]",
-            "stp q24, q25, [{area}, #384]",
-            "stp q26, q27, [{area}, #416]",
-            "stp q28, q29, [{area}, #448]",
-            "stp q30, q31, [{area}, #480]",
-            "mrs {tmp}, FPCR",
-            "str {tmp:w}, [{area}, #512]",
-            "mrs {tmp}, FPSR",
-            "str {tmp:w}, [{area}, #516]",
-            area = in(reg) area,
-            tmp = out(reg) _,
-        );
-    }
+    // SAFETY: tcb is guaranteed valid by caller. data is the start of the
+    // 528-byte save area consumed by the assembly helper.
+    let area = unsafe { core::ptr::addr_of_mut!((*tcb).fpu_state.data).cast::<u8>() };
+    // SAFETY: FPU must be enabled by caller; area points at writable storage.
+    unsafe { aarch64_fpsimd_save_state(area); }
 }
 
 /// Restore NEON/FP register state from the TCB's XSaveArea.
@@ -132,35 +102,9 @@ unsafe fn save(tcb: *mut Tcb) {
 /// must be enabled (FPEN=0b11) before calling.
 fn restore(tcb: &Tcb) {
     let area = tcb.fpu_state.data.as_ptr();
-    // SAFETY: area points to the TCB's 528-byte XSaveArea containing
-    // previously saved NEON state (or zeroes for first use after init).
-    // FPU must be enabled (caller responsibility).
-    unsafe {
-        core::arch::asm!(
-            "ldp q0,  q1,  [{area}]",
-            "ldp q2,  q3,  [{area}, #32]",
-            "ldp q4,  q5,  [{area}, #64]",
-            "ldp q6,  q7,  [{area}, #96]",
-            "ldp q8,  q9,  [{area}, #128]",
-            "ldp q10, q11, [{area}, #160]",
-            "ldp q12, q13, [{area}, #192]",
-            "ldp q14, q15, [{area}, #224]",
-            "ldp q16, q17, [{area}, #256]",
-            "ldp q18, q19, [{area}, #288]",
-            "ldp q20, q21, [{area}, #320]",
-            "ldp q22, q23, [{area}, #352]",
-            "ldp q24, q25, [{area}, #384]",
-            "ldp q26, q27, [{area}, #416]",
-            "ldp q28, q29, [{area}, #448]",
-            "ldp q30, q31, [{area}, #480]",
-            "ldr {tmp:w}, [{area}, #512]",
-            "msr FPCR, {tmp}",
-            "ldr {tmp:w}, [{area}, #516]",
-            "msr FPSR, {tmp}",
-            area = in(reg) area,
-            tmp = out(reg) _,
-        );
-    }
+    // SAFETY: area points at a valid save area, including the zeroed default
+    // state used before a thread first touches FP/SIMD.
+    unsafe { aarch64_fpsimd_restore_state(area); }
 }
 
 // ---------------------------------------------------------------------------
@@ -267,7 +211,7 @@ pub fn disown_if_current(tcb_ptr: *mut u8) {
 /// Handle FPU/NEON access trap (ESR EC=0x07).
 ///
 /// Called from the exception handler when a usermode thread executes a
-/// NEON/FP instruction while CPACR_EL1.FPEN=0b01. Saves the previous
+/// NEON/FP instruction while host FP access trapping is armed. Saves the previous
 /// owner's state, restores the current thread's state (or initializes
 /// default state on first use), and enables FPU access.
 pub fn handle_trap() {
@@ -294,14 +238,10 @@ pub fn handle_trap() {
         // SAFETY: current is the running thread's TCB, guaranteed
         // valid by the scheduler.
         let tcb = unsafe { &*current };
-        if tcb.fpu_initialized {
-            restore(tcb);
-        } else {
-            // First FPU use — zero all Q registers and control regs.
-            // Hardware reset state is already zero after enable_fpu,
-            // but explicitly mark the thread as initialized.
-            // SAFETY: current is valid and we have exclusive access
-            // during exception handling.
+        restore(tcb);
+        if !tcb.fpu_initialized {
+            // SAFETY: current is valid and we have exclusive access during
+            // exception handling.
             unsafe {
                 (*current).fpu_initialized = true;
             }

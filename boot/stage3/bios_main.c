@@ -450,7 +450,7 @@ void stage3_entry(struct Stage2Info *info)
     print_line("Building BootInfo...");
     struct BootInfoHeader *bootinfo = handoff_build_bootinfo(
         (void *)(uintptr_t)bi_buf, BOOTINFO_BUFFER_SIZE,
-        info, &load_result,
+        info, 0, &load_result,
         g_ctx.initrd_phys_addr, g_ctx.initrd_size,
         ba.records, ba.record_count);
 

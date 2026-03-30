@@ -93,6 +93,14 @@ exception_common:
     jz 1f
     swapgs
 1:
+    // Clear AC in the handler context.
+    // Unlike SYSCALL, IDT delivery does not honor IA32_FMASK, so an interrupt
+    // or exception can arrive with AC=1 either from user mode or while the
+    // kernel is inside a temporary SMAP bypass region. The saved RFLAGS on the
+    // exception frame are restored by iretq; we only harden the live handler.
+    pushfq
+    andq $~(1 << 18), (%rsp)
+    popfq
 
     // Preserve user RAX while capturing CR2.
     // Previous code did `mov %cr2, %rax` then pushed %rax twice, which
@@ -178,6 +186,11 @@ irq_stub_\name:
     jz 1f
     swapgs
 1:
+    // Hard-clear AC for the duration of the IRQ handler. IDT delivery does not
+    // clear it the way SYSCALL does via IA32_FMASK.
+    pushfq
+    andq $~(1 << 18), (%rsp)
+    popfq
     // Save caller-saved registers
     push %rax
     push %rcx
@@ -228,6 +241,11 @@ irq_stub_generic_\vector:
     jz 1f
     swapgs
 1:
+    // Hard-clear AC for the duration of the IRQ handler. IDT delivery does not
+    // clear it the way SYSCALL does via IA32_FMASK.
+    pushfq
+    andq $~(1 << 18), (%rsp)
+    popfq
     // Save caller-saved registers
     push %rax
     push %rcx

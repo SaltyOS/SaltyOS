@@ -10,6 +10,8 @@
 #   rust_kernel_target_needs_unstable, rust_lib_src, build_kernel, build_userland
 # =============================================================================
 
+rust_kernel_target_file = files('../kernel/' + arch + '-saltyos.json')
+
 # Core library configuration
 # Disable floating-point formatting to reduce code size and avoid FP intrinsics
 core_cfgs = ['no_fp_fmt_parse']
@@ -109,6 +111,7 @@ if build_kernel
     core_kernel = custom_target('core_kernel',
       input: [],
       output: ['core-kernel.o', 'libcore-kernel.rmeta'],
+      depend_files: rust_kernel_target_file,
       command: [
         rustc,
         rust_kernel_core_args,
@@ -133,6 +136,7 @@ if build_kernel
     compiler_builtins_kernel = custom_target('compiler_builtins_kernel',
       input: compiler_builtins_src,
       output: ['compiler_builtins-kernel.o', 'libcompiler_builtins-kernel.rmeta'],
+      depend_files: rust_kernel_target_file,
       command: [
         rustc,
         rust_kernel_core_args,
