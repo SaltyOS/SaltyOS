@@ -86,7 +86,7 @@ if arch == 'x86_64'
   rust_target            = 'x86_64-unknown-saltyos'
   c_target               = 'x86_64-unknown-saltyos'
   efi_target             = 'x86_64-unknown-uefi'
-  rust_kernel_target     = meson.project_source_root() / 'kernel/x86_64-saltyos.json'
+  rust_kernel_target     = meson.project_source_root() / 'kernite/x86_64-kernite.json'
   rust_kernel_target_needs_unstable = true
   kernel_link_emulation  = 'elf_x86_64'
   asm_target             = 'x86_64-unknown-none-elf'
@@ -97,7 +97,7 @@ elif arch == 'aarch64'
   rust_target            = 'aarch64-unknown-saltyos'
   c_target               = 'aarch64-unknown-saltyos'
   efi_target             = 'aarch64-unknown-windows'
-  rust_kernel_target     = meson.project_source_root() / 'kernel/aarch64-saltyos.json'
+  rust_kernel_target     = meson.project_source_root() / 'kernite/aarch64-kernite.json'
   rust_kernel_target_needs_unstable = true
   kernel_link_emulation  = 'aarch64elf'
   asm_target             = 'aarch64-unknown-none-elf'
@@ -180,7 +180,7 @@ if build_kernel or build_userland
 endif
 
 if build_kernel
-  subdir('kernel')
+  subdir('kernite')
 endif
 
 if build_userland
@@ -198,8 +198,8 @@ if build_userland
   mksysroot_prog = find_program('tools/mksysroot')
   sysroot_target = custom_target('sysroot',
     output: 'sysroot.stamp',
-    depends: [core, compiler_builtins, libbesalt_so, libc_so, crt_start_obj, ld_besalt_so],
-    depend_files: besaltc_header_files + [files('lib/besalt/saltyos-pie.ld')],
+    depends: [core, compiler_builtins, libtrona_so, libc_so, crt_start_obj, ld_trona_so],
+    depend_files: basaltc_header_files + [files('lib/trona/trona-pie.ld')],
     command: [
       mksysroot_prog,
       '--build-dir', meson.project_build_root(),
@@ -245,14 +245,14 @@ if build_userland and mkcpio.found()
     build_by_default: true,
   )
   initrd_rtld_so = custom_target('initrd_rtld_so',
-    input: ld_besalt_so,
-    output: 'ld-besalt.initrd.so',
+    input: ld_trona_so,
+    output: 'ld-trona.initrd.so',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
-  initrd_libbesalt_so = custom_target('initrd_libbesalt_so',
-    input: libbesalt_so,
-    output: 'libbesalt.initrd.so',
+  initrd_libtrona_so = custom_target('initrd_libtrona_so',
+    input: libtrona_so,
+    output: 'libtrona.initrd.so',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
@@ -375,7 +375,7 @@ if build_userland and mkcpio.found()
   mkcpio_script = files('tools/mkcpio.py')
   # Boot-critical binaries only (non-critical moved to rootfs).
   initrd = custom_target('initrd',
-    input: [initrd_rtld_so, initrd_libbesalt_so, initrd_libc_so,
+    input: [initrd_rtld_so, initrd_libtrona_so, initrd_libc_so,
             initrd_libcxx_so,
             initrd_init_elf, initrd_console_elf, initrd_nameserv_elf,
             initrd_procmgr_elf, initrd_vfs_elf, initrd_mmsrv_elf,
@@ -391,8 +391,8 @@ if build_userland and mkcpio.found()
       '--output', '@OUTPUT@',
       ] + [
       # Shared libraries (inputs 0-3)
-      'ld-besalt.so=@INPUT0@',
-      'libbesalt.so=@INPUT1@',
+      'ld-trona.so=@INPUT0@',
+      'libtrona.so=@INPUT1@',
       'libc.so=@INPUT2@',
       'libc++.so=@INPUT3@',
       # Boot-critical services (inputs 4-12)
@@ -471,12 +471,10 @@ if mkrootfs.found() and build_userland
   _rootfs_dep_files = [mkrootfs_script, mksaltyfs_script]
 
   # Layer 2 (optional): LLVM toolchain — present after `just tc package`
+  # Always pass the manifest path; mkrootfs skips it if the file is missing.
   _llvm_stripped_dir = 'build-toolchain' / 'llvm-' + arch + '-stripped'
   _llvm_manifest = meson.project_source_root() / _llvm_stripped_dir / 'rootfs.manifest'
-  if fs.is_file(_llvm_manifest)
-    message('Rootfs: including LLVM toolchain from ' + _llvm_stripped_dir)
-    _rootfs_cmd += ['--manifest', _llvm_manifest]
-  endif
+  _rootfs_cmd += ['--manifest-optional', _llvm_manifest]
 
   # Layer 3 (optional): ports — only when build_ports=true
   if get_option('build_ports') and is_variable('pkg_tool')

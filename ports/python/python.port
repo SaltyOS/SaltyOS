@@ -30,7 +30,7 @@ configure =
 [env]
 CFLAGS_FOR_BUILD =
 EXTRA_CFLAGS = -I${PORTDIR}/../zlib/${ARCH_WORK}/zlib-1.3.1 -I${PORTDIR}/../zlib/${ARCH_WORK}/zlib-1.3.1/_build -I${PORTDIR}/../bzip2/${ARCH_WORK}/bzip2-1.0.8 -I${PORTDIR}/../xz/${ARCH_WORK}/xz-5.6.3/src/liblzma/api -I${PORTDIR}/../zstd/${ARCH_WORK}/zstd-1.5.6/lib -I${PORTDIR}/../ncurses/${ARCH_WORK}/ncurses-6.5/include
-EXTRA_LDFLAGS = -L${PORTDIR}/../zlib/stage -L${PORTDIR}/../bzip2/stage -L${PORTDIR}/../xz/stage -L${PORTDIR}/../zstd/stage -L${PORTDIR}/../openssl/stage -L${PORTDIR}/../ncurses/stage
+EXTRA_LDFLAGS = -L${PORTDIR}/../zlib/${ARCH_STAGE} -L${PORTDIR}/../bzip2/${ARCH_STAGE} -L${PORTDIR}/../xz/${ARCH_STAGE} -L${PORTDIR}/../zstd/${ARCH_STAGE} -L${PORTDIR}/../openssl/${ARCH_STAGE} -L${PORTDIR}/../ncurses/${ARCH_STAGE}
 EXTRA_LIBS = -lncursesw
 PKG_CONFIG = no
 

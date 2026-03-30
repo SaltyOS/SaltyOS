@@ -177,10 +177,15 @@ fn main() {
                     }
                 }
             }
-            let stage_dir = port_dir.join("stage");
-            if stage_dir.exists() {
-                std::fs::remove_dir_all(&stage_dir).ok();
-                println!("Removed {}", stage_dir.display());
+            if let Ok(entries) = std::fs::read_dir(&port_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with("stage-") && entry.path().is_dir() {
+                        std::fs::remove_dir_all(entry.path()).ok();
+                        println!("Removed {}", entry.path().display());
+                    }
+                }
             }
             process::exit(0);
         }

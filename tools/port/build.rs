@@ -666,7 +666,7 @@ pub fn do_stage(
     let var_map = vars::build_var_map(port, port_dir, env);
     let src = vars::resolve_source_dir(port, port_dir)
         .unwrap_or_else(|| vars::preferred_source_dir(port, port_dir));
-    let stage_dir = port_dir.join("stage");
+    let stage_dir = port_dir.join(format!("stage-{}", env.arch));
     fs::create_dir_all(&stage_dir)
         .map_err(|e| format!("Cannot create stage/: {}", e))?;
 

@@ -18,7 +18,7 @@ build = zlib, bzip2, xz, zstd, openssl
 
 [env]
 EXTRA_CFLAGS = -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers -Wno-missing-braces -Wno-gnu-designator -Wno-#warnings -D__FreeBSD_version=1402000 -DBOOTSTRAP_CAT -DNO_UDOM_SUPPORT -DWITHOUT_NLS
-EXTRA_LIBS = -L${PORTDIR}/../zlib/stage -L${PORTDIR}/../bzip2/stage -L${PORTDIR}/../xz/stage -L${PORTDIR}/../zstd/stage -L${PORTDIR}/../openssl/stage -lz -lbz2 -llzma -lzstd
+EXTRA_LIBS = -L${PORTDIR}/../zlib/${ARCH_STAGE} -L${PORTDIR}/../bzip2/${ARCH_STAGE} -L${PORTDIR}/../xz/${ARCH_STAGE} -L${PORTDIR}/../zstd/${ARCH_STAGE} -L${PORTDIR}/../openssl/${ARCH_STAGE} -lz -lbz2 -llzma -lzstd
 
 [libs]
 archive = contrib/libarchive/libarchive/*.c :: -Icontrib/libarchive/libarchive -DPLATFORM_CONFIG_H=\"${PORTDIR}/config_saltyos_libarchive.h\" -I${PORTDIR}/../zlib/${ARCH_WORK}/zlib-1.3.1 -I${PORTDIR}/../zlib/${ARCH_WORK}/zlib-1.3.1/_build -I${PORTDIR}/../bzip2/${ARCH_WORK}/bzip2-1.0.8 -I${PORTDIR}/../xz/${ARCH_WORK}/xz-5.6.3/src/liblzma/api -I${PORTDIR}/../zstd/${ARCH_WORK}/zstd-1.5.6/lib

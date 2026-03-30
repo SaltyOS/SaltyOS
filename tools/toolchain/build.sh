@@ -218,7 +218,7 @@ Run 'just tc build host llvm' first (it installs/links FileCheck into the prefix
 # =============================================================================
 
 cmd_sysroot() {
-  # Ensure build outputs (libc.so, libbesalt.so, libc++.so, ...) are up to date
+  # Ensure build outputs (libc.so, libtrona.so, libc++.so, ...) are up to date
   # before collecting them into the sysroot.
   if [ ! -d "$SALTYOS_MESON_BUILDDIR" ]; then
     die "Build directory not found: $SALTYOS_MESON_BUILDDIR
@@ -336,7 +336,7 @@ Run 'just tc build host llvm' first."
   echo "LLVM/Clang/LLD cross-compiled for SaltyOS ($SALTYOS_ARCH) successfully."
   echo "  Binaries: $build_root/bin/"
   echo "  Verify: llvm-readelf -d $build_root/bin/clang | grep NEEDED"
-  echo "  Expected: libc++.so, libc.so, libbesalt.so"
+  echo "  Expected: libc++.so, libc.so, libtrona.so"
 }
 
 # =============================================================================
@@ -593,7 +593,7 @@ Run 'just arch=${SALTYOS_ARCH} tc build cross llvm' first."
   done
 
   # C++ runtime
-  cp "$builddir/lib/besalt/cpp/libc++.so" "$dst/lib/libc++.so"
+  cp "$builddir/lib/basalt/cpp/libc++.so" "$dst/lib/libc++.so"
 
   # Clang resource directory and compiler-rt builtins
   echo "Copying clang resource directory..."
@@ -614,14 +614,14 @@ Run 'just arch=${SALTYOS_ARCH} tc build cross llvm' first."
 
   # CRT objects and linker script
   echo "Copying development files..."
-  cp "$builddir/lib/besalt/c/crt_start.o" "$dst/lib/crt_start.o"
+  cp "$builddir/lib/basalt/c/crt_start.o" "$dst/lib/crt_start.o"
   cp "$builddir/rust/core.o" "$dst/lib/core.o"
   cp "$builddir/rust/compiler_builtins.o" "$dst/lib/compiler_builtins.o"
-  cp "$SALTYOS_REPO_ROOT/lib/besalt/saltyos-pie.ld" "$dst/lib/saltyos-pie.ld"
+  cp "$SALTYOS_REPO_ROOT/lib/trona/trona-pie.ld" "$dst/lib/trona-pie.ld"
 
   # Link-time libraries
-  cp "$builddir/lib/besalt/c/libc.so" "$dst/lib/libc.so"
-  cp "$builddir/lib/besalt/lib/libbesalt.so" "$dst/lib/libbesalt.so"
+  cp "$builddir/lib/basalt/c/libc.so" "$dst/lib/libc.so"
+  cp "$builddir/lib/trona/libtrona.so" "$dst/lib/libtrona.so"
 
   # Stub archives
   for stub in libm.a libpthread.a librt.a libdl.a libutil.a; do
@@ -652,17 +652,17 @@ Run 'just arch=${SALTYOS_ARCH} tc build cross llvm' first."
 # C++ runtime
 /lib/libc++.so=./lib/libc++.so
 # System C headers
-/usr/include/=${SALTYOS_REPO_ROOT}/lib/besalt/c/include/
+/usr/include/=${SALTYOS_REPO_ROOT}/lib/basalt/c/include/
 # Clang resource headers
 /usr/lib/clang/=./lib/clang/
 # CRT and linker support
 /usr/lib/crt_start.o=./lib/crt_start.o
 /usr/lib/core.o=./lib/core.o
 /usr/lib/compiler_builtins.o=./lib/compiler_builtins.o
-/usr/lib/saltyos-pie.ld=./lib/saltyos-pie.ld
+/usr/lib/trona-pie.ld=./lib/trona-pie.ld
 # Link-time libraries
 /usr/lib/libc.so=./lib/libc.so
-/usr/lib/libbesalt.so=./lib/libbesalt.so
+/usr/lib/libtrona.so=./lib/libtrona.so
 # Stub archives
 /usr/lib/libm.a=./lib/libm.a
 /usr/lib/libpthread.a=./lib/libpthread.a
