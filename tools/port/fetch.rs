@@ -20,13 +20,8 @@ pub fn do_fetch(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Result<()
     std::fs::create_dir_all(&distfiles)
         .map_err(|e| format!("Cannot create distfiles/: {}", e))?;
 
-    // Extract filename from URL
-    let filename = url
-        .rsplit('/')
-        .next()
-        .ok_or_else(|| "Cannot determine filename from URL".to_string())?;
-
-    let target = distfiles.join(filename);
+    let filename = vars::distfile_name(port, &url);
+    let target = distfiles.join(&filename);
 
     if target.exists() {
         if env.verbose {
@@ -62,12 +57,8 @@ pub fn do_checksum(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Result
     let url = vars::substitute(&port.source_url, &var_map);
 
     let distfiles = vars::distfiles_dir(port_dir);
-    let filename = url
-        .rsplit('/')
-        .next()
-        .ok_or_else(|| "Cannot determine filename from URL".to_string())?;
-
-    let target = distfiles.join(filename);
+    let filename = vars::distfile_name(port, &url);
+    let target = distfiles.join(&filename);
     if !target.exists() {
         return Err(format!("Source file not found: {}", target.display()));
     }

@@ -52,6 +52,137 @@ fn validate_install_path(install_path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn stage_install_file(
+    install_path: &str,
+    src_file: &Path,
+    stage_dir: &Path,
+    port_out: &Path,
+    port_name: &str,
+    env: &BuildEnv,
+    manifest: &mut String,
+) -> Result<(), String> {
+    let output_target = port_out.join(install_path);
+    if let Some(parent) = output_target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Cannot create output subdir: {}", e))?;
+    }
+
+    let stage_target = stage_dir.join(install_path);
+    if let Some(parent) = stage_target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Cannot create stage subdir: {}", e))?;
+    }
+
+    fs::copy(src_file, &stage_target)
+        .map_err(|e| format!("Cannot copy to stage: {}", e))?;
+
+    let should_strip = install_path.ends_with(".a")
+        || install_path.ends_with(".so")
+        || install_path.ends_with(".so.0")
+        || install_path.ends_with(".so.1")
+        || install_path.ends_with(".so.2")
+        || install_path.ends_with(".so.3")
+        || install_path.starts_with("bin/")
+        || install_path.starts_with("sbin/")
+        || install_path.starts_with("libexec/");
+
+    if should_strip {
+        let strip_flag = if install_path.ends_with(".a") {
+            "--strip-debug"
+        } else {
+            "--strip-all"
+        };
+        let strip_status = Command::new(&env.strip)
+            .args([strip_flag, "-o"])
+            .arg(&output_target)
+            .arg(&stage_target)
+            .status();
+
+        match strip_status {
+            Ok(s) if s.success() => {
+                if env.verbose {
+                    println!("   {} -> {}/{}", install_path, port_name, install_path);
+                }
+            }
+            _ => {
+                fs::copy(&stage_target, &output_target)
+                    .map_err(|e| format!("Cannot copy to output: {}", e))?;
+                if env.verbose {
+                    println!("   {} -> {}/{} (unstripped)", install_path, port_name, install_path);
+                }
+            }
+        }
+    } else {
+        fs::copy(&stage_target, &output_target)
+            .map_err(|e| format!("Cannot copy to output: {}", e))?;
+        if env.verbose {
+            println!("   {} -> {}/{} (copied)", install_path, port_name, install_path);
+        }
+    }
+
+    let _ = writeln!(manifest, "{}={}/{}", install_path, port_name, install_path);
+    Ok(())
+}
+
+fn stage_install_path(
+    install_path: &Path,
+    src_path: &Path,
+    stage_dir: &Path,
+    port_out: &Path,
+    port_name: &str,
+    env: &BuildEnv,
+    manifest: &mut String,
+) -> Result<(), String> {
+    let meta = fs::symlink_metadata(src_path)
+        .map_err(|e| format!("Cannot stat install source {}: {}", src_path.display(), e))?;
+
+    if meta.is_dir() {
+        for entry in fs::read_dir(src_path)
+            .map_err(|e| format!("Cannot read install source dir {}: {}", src_path.display(), e))?
+        {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "Cannot read directory entry in install source {}: {}",
+                    src_path.display(),
+                    e
+                )
+            })?;
+            let child_src = entry.path();
+            let child_install = install_path.join(entry.file_name());
+            stage_install_path(
+                &child_install,
+                &child_src,
+                stage_dir,
+                port_out,
+                port_name,
+                env,
+                manifest,
+            )?;
+        }
+        return Ok(());
+    }
+
+    if !meta.is_file() {
+        return Err(format!(
+            "Unsupported install source type (only regular files and directories supported): {}",
+            src_path.display()
+        ));
+    }
+
+    let install_path_str = install_path
+        .to_str()
+        .ok_or_else(|| format!("Install path is not valid UTF-8: {}", install_path.display()))?;
+    stage_install_file(
+        install_path_str,
+        src_path,
+        stage_dir,
+        port_out,
+        port_name,
+        env,
+        manifest,
+    )
+}
+
 fn package_arch(env: &BuildEnv) -> &str {
     env.salty_host.split('-').next().unwrap_or(&env.salty_host)
 }
@@ -122,6 +253,7 @@ fn cross_env(
     vars.insert("CPP".to_string(), format!("{} {} -E", env.cc, env.cflags));
     vars.insert("CXXCPP".to_string(), format!("{} {} -E", env.cxx, env.cflags));
     vars.insert("LDFLAGS".to_string(), env.ldflags.clone());
+    vars.insert("LDSHARED".to_string(), format!("{} -shared", env.cc));
     vars.insert("LIBS".to_string(), env.libs.clone());
     vars.insert("AR".to_string(), env.ar.clone());
     vars.insert("RANLIB".to_string(), env.ranlib.clone());
@@ -293,8 +425,23 @@ pub fn do_configure(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Resul
                 ));
             }
 
+            // Detect build system triplet for cross-compilation
+            let build_triple = {
+                let output = std::process::Command::new("cc")
+                    .arg("-dumpmachine")
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                if output.is_empty() {
+                    env.salty_host.clone()
+                } else {
+                    output
+                }
+            };
+
             let mut args = vec![
                 format!("--host={}", env.autotools_host),
+                format!("--build={}", build_triple),
                 "--prefix=/usr".to_string(),
             ];
 
@@ -312,7 +459,10 @@ pub fn do_configure(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Resul
             let mut args = vec![
                 format!("-DCMAKE_C_COMPILER={}", env.cc),
                 format!("-DCMAKE_CXX_COMPILER={}", env.cxx),
+                format!("-DCMAKE_ASM_COMPILER={}", env.cc),
                 format!("-DCMAKE_C_FLAGS={}", env.cflags),
+                format!("-DCMAKE_CXX_FLAGS={}", env.cflags),
+                format!("-DCMAKE_ASM_FLAGS={}", env.cflags),
                 format!("-DCMAKE_EXE_LINKER_FLAGS={}", env.ldflags),
                 "-DCMAKE_INSTALL_PREFIX=/usr".to_string(),
             ];
@@ -383,6 +533,74 @@ pub fn do_build_targets(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> R
     let cross_vars = cross_env(env, &port.env_overrides, &var_map);
     let common_cflags = vars::substitute(&port.targets_cflags, &var_map);
 
+    // Build [libs] first — compile each source to .o, then archive into lib<name>.a
+    let cflags_base = cross_vars.get("CFLAGS").cloned().unwrap_or_default();
+    let obj_dir = out_dir.join("obj");
+    if !port.libs.is_empty() {
+        fs::create_dir_all(&obj_dir)
+            .map_err(|e| format!("Cannot create obj dir: {}", e))?;
+    }
+
+    for lib in &port.libs {
+        let extra = vars::substitute_list(&lib.extra_flags, &var_map);
+        let mut objects: Vec<String> = Vec::new();
+
+        for source in &lib.sources {
+            let substituted = vars::substitute(source, &var_map);
+            let src_path = src.join(&substituted);
+
+            // Resolve glob: only supports trailing `*.ext` pattern
+            let source_files: Vec<std::path::PathBuf> = if let Some(star_pos) = substituted.rfind('*') {
+                let dir = src_path.parent().unwrap_or(&src);
+                let suffix = &substituted[star_pos + 1..]; // e.g. ".c"
+                let mut files: Vec<std::path::PathBuf> = fs::read_dir(dir)
+                    .map_err(|e| format!("Cannot read dir {}: {}", dir.display(), e))?
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.to_string_lossy().ends_with(suffix))
+                    .collect();
+                files.sort();
+                files
+            } else {
+                vec![src_path]
+            };
+
+            for sf in &source_files {
+                let stem = sf.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("obj");
+                // Use a unique name to avoid collisions from different directories
+                let obj_name = format!("{}_{}.o", lib.name, stem);
+                let obj_path = obj_dir.join(&obj_name);
+
+                let cmd_str = format!(
+                    "{cc} {cflags} {extra} {tcflags} -c -o {obj} {src}",
+                    cc = env.cc,
+                    cflags = cflags_base,
+                    tcflags = common_cflags,
+                    extra = extra.join(" "),
+                    obj = obj_path.display(),
+                    src = sf.display(),
+                );
+                run_shell(&cmd_str, &src, &cross_vars, env.verbose)?;
+                objects.push(obj_path.to_string_lossy().to_string());
+            }
+        }
+
+        let archive_path = out_dir.join(format!("lib{}.a", lib.name));
+        let ar = &env.ar;
+        let cmd_str = format!(
+            "{ar} rcs {archive} {objs}",
+            ar = ar,
+            archive = archive_path.display(),
+            objs = objects.join(" "),
+        );
+        if env.verbose {
+            println!("   [lib{}]", lib.name);
+        }
+        run_shell(&cmd_str, &src, &cross_vars, env.verbose)?;
+    }
+
     for target in &port.targets {
         let sources: Vec<String> = target
             .sources
@@ -407,8 +625,15 @@ pub fn do_build_targets(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> R
         let ldflags = cross_vars.get("LDFLAGS").cloned().unwrap_or_default();
         let libs = cross_vars.get("LIBS").cloned().unwrap_or_default();
 
+        // Add .salty-build/ to library search path so [libs] archives are found
+        let lib_path = if !port.libs.is_empty() {
+            format!("-L{}", out_dir.display())
+        } else {
+            String::new()
+        };
+
         let cmd_str = format!(
-            "{cc} {cflags} {tcflags} {extra} {ldflags} -o {out} {srcs} {libs}",
+            "{cc} {cflags} {extra} {tcflags} {ldflags} {lib_path} -o {out} {srcs} {libs}",
             cc = env.cc,
             cflags = cflags,
             tcflags = common_cflags,
@@ -466,54 +691,15 @@ pub fn do_stage(
         if !src_file.exists() {
             return Err(format!("Install source not found: {}", src_file.display()));
         }
-
-        // Preserve install path in output: port_out/<install_path>
-        let output_target = port_out.join(&install_path);
-        if let Some(parent) = output_target.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Cannot create output subdir: {}", e))?;
-        }
-
-        // Stage with same path structure
-        let stage_target = stage_dir.join(&install_path);
-        if let Some(parent) = stage_target.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Cannot create stage subdir: {}", e))?;
-        }
-
-        fs::copy(&src_file, &stage_target)
-            .map_err(|e| format!("Cannot copy to stage: {}", e))?;
-
-        // Strip with llvm-strip (use --strip-debug for .a archives to preserve symbol tables)
-        let strip_flag = if install_path.ends_with(".a") {
-            "--strip-debug"
-        } else {
-            "--strip-all"
-        };
-        let strip_status = Command::new(&env.strip)
-            .args([strip_flag, "-o"])
-            .arg(&output_target)
-            .arg(&stage_target)
-            .status();
-
-        match strip_status {
-            Ok(s) if s.success() => {
-                if env.verbose {
-                    println!("   {} -> {}/{}", install_path, port.name, install_path);
-                }
-            }
-            _ => {
-                // If strip fails, just copy unstripped
-                fs::copy(&stage_target, &output_target)
-                    .map_err(|e| format!("Cannot copy to output: {}", e))?;
-                if env.verbose {
-                    println!("   {} -> {}/{} (unstripped)", install_path, port.name, install_path);
-                }
-            }
-        }
-
-        // Manifest entry: install_path=port_name/install_path
-        let _ = writeln!(manifest, "{}={}/{}", install_path, port.name, install_path);
+        stage_install_path(
+            Path::new(&install_path),
+            &src_file,
+            &stage_dir,
+            &port_out,
+            &port.name,
+            env,
+            &mut manifest,
+        )?;
     }
 
     // Write manifest file
@@ -671,7 +857,7 @@ pub fn do_package(
         let _ = writeln!(filelist, "{}", path_str);
     }
 
-    let work_dir = port_dir.join("work");
+    let work_dir = vars::work_dir(port_dir);
     fs::create_dir_all(&work_dir)
         .map_err(|e| format!("Cannot create work dir {}: {}", work_dir.display(), e))?;
     let pkg_root = work_dir.join(format!(
