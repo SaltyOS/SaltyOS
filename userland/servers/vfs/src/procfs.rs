@@ -78,6 +78,252 @@ pub(crate) fn fmt_u64_hex(mut v: u64, buf: &mut [u8]) -> usize {
     len + 2
 }
 
+const PROC_TEXT_BUF_SIZE: usize = 2048;
+const MAX_NET_ARP_ENTRIES: usize = 16;
+
+#[derive(Clone, Copy)]
+struct NetConfigInfo {
+    state: u8,
+    our_ip: u32,
+    subnet_mask: u32,
+    gateway_ip: u32,
+    dns_server: u32,
+    rx_bytes: u64,
+    rx_packets: u64,
+    tx_bytes: u64,
+    tx_packets: u64,
+}
+
+impl NetConfigInfo {
+    const fn zeroed() -> Self {
+        Self {
+            state: 0,
+            our_ip: 0,
+            subnet_mask: 0,
+            gateway_ip: 0,
+            dns_server: 0,
+            rx_bytes: 0,
+            rx_packets: 0,
+            tx_bytes: 0,
+            tx_packets: 0,
+        }
+    }
+}
+
+fn append_bytes(buf: &mut [u8], pos: &mut usize, data: &[u8]) {
+    let mut i = 0usize;
+    while i < data.len() && *pos < buf.len() {
+        buf[*pos] = data[i];
+        *pos += 1;
+        i += 1;
+    }
+}
+
+fn append_u32_dec(buf: &mut [u8], pos: &mut usize, v: u32) {
+    let mut tmp = [0u8; 16];
+    let len = fmt_u32(v, &mut tmp);
+    append_bytes(buf, pos, &tmp[..len]);
+}
+
+fn append_u64_dec(buf: &mut [u8], pos: &mut usize, mut v: u64) {
+    if v == 0 {
+        append_bytes(buf, pos, b"0");
+        return;
+    }
+    let mut tmp = [0u8; 20];
+    let mut len = 0usize;
+    while v > 0 && len < tmp.len() {
+        tmp[len] = b'0' + (v % 10) as u8;
+        v /= 10;
+        len += 1;
+    }
+    while len > 0 {
+        len -= 1;
+        append_bytes(buf, pos, &tmp[len..len + 1]);
+    }
+}
+
+fn append_ipv4(buf: &mut [u8], pos: &mut usize, ip: u32) {
+    append_u32_dec(buf, pos, (ip >> 24) & 0xFF);
+    append_bytes(buf, pos, b".");
+    append_u32_dec(buf, pos, (ip >> 16) & 0xFF);
+    append_bytes(buf, pos, b".");
+    append_u32_dec(buf, pos, (ip >> 8) & 0xFF);
+    append_bytes(buf, pos, b".");
+    append_u32_dec(buf, pos, ip & 0xFF);
+}
+
+fn append_mac(buf: &mut [u8], pos: &mut usize, mac: &[u8; 6]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut i = 0usize;
+    while i < 6 {
+        let b = mac[i];
+        append_bytes(buf, pos, &[HEX[(b >> 4) as usize], HEX[(b & 0x0F) as usize]]);
+        if i != 5 {
+            append_bytes(buf, pos, b":");
+        }
+        i += 1;
+    }
+}
+
+fn append_hex_u32_fixed(buf: &mut [u8], pos: &mut usize, mut v: u32) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = [0u8; 8];
+    let mut i = 8usize;
+    while i > 0 {
+        i -= 1;
+        out[i] = HEX[(v & 0x0F) as usize];
+        v >>= 4;
+    }
+    append_bytes(buf, pos, &out);
+}
+
+unsafe fn netsrv_get_config(info: &mut NetConfigInfo) -> bool {
+    unsafe {
+        let mut msg = BesaltMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
+        msg.label = NET_GET_CONFIG;
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const msg, &raw mut reply);
+        if err != 0 || reply.label != BESALT_OK {
+            return false;
+        }
+        info.state = reply.regs[0] as u8;
+        info.our_ip = reply.regs[1] as u32;
+        info.subnet_mask = reply.regs[2] as u32;
+        info.gateway_ip = reply.regs[3] as u32;
+        info.dns_server = reply.regs[4] as u32;
+        info.rx_bytes = reply.regs[5];
+        info.rx_packets = reply.regs[6];
+        info.tx_bytes = reply.regs[7];
+        info.tx_packets = reply.regs[8];
+        true
+    }
+}
+
+unsafe fn netsrv_get_arp_entry(index: usize, ip: &mut u32, mac: &mut [u8; 6]) -> bool {
+    unsafe {
+        let mut msg = BesaltMsg::zeroed();
+        let mut reply = BesaltMsg::zeroed();
+        msg.label = NET_GET_ARP_ENTRY;
+        msg.length = 1;
+        msg.regs[0] = index as u64;
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const msg, &raw mut reply);
+        if err != 0 || reply.label != BESALT_OK || reply.regs[0] == 0 {
+            return false;
+        }
+
+        *ip = reply.regs[1] as u32;
+        let packed = reply.regs[2];
+        mac[0] = (packed >> 40) as u8;
+        mac[1] = (packed >> 32) as u8;
+        mac[2] = (packed >> 24) as u8;
+        mac[3] = (packed >> 16) as u8;
+        mac[4] = (packed >> 8) as u8;
+        mac[5] = packed as u8;
+        true
+    }
+}
+
+fn proc_gen_hosts(buf: &mut [u8]) -> usize {
+    let mut pos = 0usize;
+    append_bytes(buf, &mut pos, b"127.0.0.1\tlocalhost\n");
+    let mut info = NetConfigInfo::zeroed();
+    // SAFETY: VFS is single-threaded; the query uses a valid server EP.
+    if unsafe { netsrv_get_config(&mut info) } && info.our_ip != 0 {
+        append_ipv4(buf, &mut pos, info.our_ip);
+        append_bytes(buf, &mut pos, b"\tsalty\n");
+    }
+    pos
+}
+
+fn proc_gen_resolv_conf(buf: &mut [u8]) -> usize {
+    let mut info = NetConfigInfo::zeroed();
+    // SAFETY: VFS is single-threaded; the query uses a valid server EP.
+    if !unsafe { netsrv_get_config(&mut info) } || info.dns_server == 0 {
+        return 0;
+    }
+
+    let mut pos = 0usize;
+    append_bytes(buf, &mut pos, b"nameserver ");
+    append_ipv4(buf, &mut pos, info.dns_server);
+    append_bytes(buf, &mut pos, b"\n");
+    pos
+}
+
+fn proc_gen_route(buf: &mut [u8]) -> usize {
+    let mut info = NetConfigInfo::zeroed();
+    // SAFETY: VFS is single-threaded; the query uses a valid server EP.
+    if !unsafe { netsrv_get_config(&mut info) } {
+        return 0;
+    }
+
+    let mut pos = 0usize;
+    append_bytes(
+        buf,
+        &mut pos,
+        b"Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n",
+    );
+
+    if info.our_ip != 0 && info.subnet_mask != 0 {
+        append_bytes(buf, &mut pos, b"eth0\t");
+        append_hex_u32_fixed(buf, &mut pos, (info.our_ip & info.subnet_mask).swap_bytes());
+        append_bytes(buf, &mut pos, b"\t00000000\t0001\t0\t0\t0\t");
+        append_hex_u32_fixed(buf, &mut pos, info.subnet_mask.swap_bytes());
+        append_bytes(buf, &mut pos, b"\t0\t0\t0\n");
+    }
+
+    if info.gateway_ip != 0 {
+        append_bytes(buf, &mut pos, b"eth0\t00000000\t");
+        append_hex_u32_fixed(buf, &mut pos, info.gateway_ip.swap_bytes());
+        append_bytes(buf, &mut pos, b"\t0003\t0\t0\t0\t00000000\t0\t0\t0\n");
+    }
+
+    pos
+}
+
+fn proc_gen_arp(buf: &mut [u8]) -> usize {
+    let mut pos = 0usize;
+    append_bytes(buf, &mut pos, b"IP address\tHW type\tFlags\tHW address\tMask\tDevice\n");
+
+    let mut idx = 0usize;
+    while idx < MAX_NET_ARP_ENTRIES {
+        let mut ip = 0u32;
+        let mut mac = [0u8; 6];
+        // SAFETY: VFS is single-threaded; the query uses a valid server EP.
+        if unsafe { netsrv_get_arp_entry(idx, &mut ip, &mut mac) } {
+            append_ipv4(buf, &mut pos, ip);
+            append_bytes(buf, &mut pos, b"\t0x1\t0x2\t");
+            append_mac(buf, &mut pos, &mac);
+            append_bytes(buf, &mut pos, b"\t*\teth0\n");
+        }
+        idx += 1;
+    }
+
+    pos
+}
+
+fn proc_gen_net_dev(buf: &mut [u8]) -> usize {
+    let mut info = NetConfigInfo::zeroed();
+    // SAFETY: VFS is single-threaded; the query uses a valid server EP.
+    if !unsafe { netsrv_get_config(&mut info) } {
+        return 0;
+    }
+
+    let mut pos = 0usize;
+    append_bytes(buf, &mut pos, b"Inter-|   Receive                                                |  Transmit\n");
+    append_bytes(buf, &mut pos, b" face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
+    append_bytes(buf, &mut pos, b" eth0:");
+    append_u64_dec(buf, &mut pos, info.rx_bytes);
+    append_bytes(buf, &mut pos, b" ");
+    append_u64_dec(buf, &mut pos, info.rx_packets);
+    append_bytes(buf, &mut pos, b" 0 0 0 0 0 0 ");
+    append_u64_dec(buf, &mut pos, info.tx_bytes);
+    append_bytes(buf, &mut pos, b" ");
+    append_u64_dec(buf, &mut pos, info.tx_packets);
+    append_bytes(buf, &mut pos, b" 0 0 0 0 0 0\n");
+    pos
+}
+
 /// Query procmgr for list of PIDs. Returns count (up to 19).
 unsafe fn proc_list_pids(pids: &mut [u32; 19]) -> usize {
     unsafe {
@@ -451,6 +697,15 @@ pub(crate) unsafe fn handle_proc_open(
             && *rest.add(1) == b'e'
             && *rest.add(2) == b'l'
             && *rest.add(3) == b'f';
+        let is_net_prefix = rest_len >= 3
+            && *rest == b'n'
+            && *rest.add(1) == b'e'
+            && *rest.add(2) == b't'
+            && (rest_len == 3 || *rest.add(3) == b'/');
+
+        if is_net_prefix {
+            return false;
+        }
 
         let (pid, file_offset) = if is_self_prefix && (rest_len == 4 || *rest.add(4) == b'/') {
             let cli = get_client_noalloc(badge);
@@ -480,8 +735,7 @@ pub(crate) unsafe fn handle_proc_open(
             }
             let (pid, ok) = parse_pid(&pid_buf[..pid_end as usize]);
             if !ok {
-                (*reply).label = BESALT_NOT_FOUND;
-                return true;
+                return false;
             }
             (pid, pid_end)
         };
@@ -627,6 +881,15 @@ pub(crate) unsafe fn handle_proc_stat(
             && *rest.add(1) == b'e'
             && *rest.add(2) == b'l'
             && *rest.add(3) == b'f';
+        let is_net_prefix = rest_len >= 3
+            && *rest == b'n'
+            && *rest.add(1) == b'e'
+            && *rest.add(2) == b't'
+            && (rest_len == 3 || *rest.add(3) == b'/');
+
+        if is_net_prefix {
+            return false;
+        }
 
         let (pid, file_offset) = if is_self_prefix && (rest_len == 4 || *rest.add(4) == b'/') {
             let client_pid = (badge & 0xFFFF) as u32;
@@ -642,8 +905,7 @@ pub(crate) unsafe fn handle_proc_stat(
             }
             let (pid, ok) = parse_pid(&core::slice::from_raw_parts(rest, pid_end as usize));
             if !ok {
-                (*reply).label = BESALT_NOT_FOUND;
-                return true;
+                return false;
             }
             (pid, pid_end)
         };
@@ -708,10 +970,10 @@ pub(crate) unsafe fn handle_proc_read(inode: *const RamfsInode, offset: u64, rep
         let proc_type = (*inode).dev_type;
 
         // Generate content into a stack buffer
-        let mut content = [0u8; 512];
+        let mut content = [0u8; PROC_TEXT_BUF_SIZE];
         let content_len = match proc_type {
-            PROC_FILE_STATUS => proc_gen_status(pid, content.as_mut_ptr(), 512),
-            PROC_FILE_STAT => proc_gen_stat(pid, content.as_mut_ptr(), 512),
+            PROC_FILE_STATUS => proc_gen_status(pid, content.as_mut_ptr(), PROC_TEXT_BUF_SIZE),
+            PROC_FILE_STAT => proc_gen_stat(pid, content.as_mut_ptr(), PROC_TEXT_BUF_SIZE),
             PROC_FILE_MAPS => {
                 // /proc/<pid>/maps — query mmsrv for memory stats
                 let mut heap_base: u64 = 0;
@@ -730,68 +992,68 @@ pub(crate) unsafe fn handle_proc_read(inode: *const RamfsInode, offset: u64, rep
                     // "heap: <base>-<current> <pages> pages\n"
                     let hdr = b"heap: ";
                     for b in hdr {
-                        if pos < 512 {
+                        if pos < PROC_TEXT_BUF_SIZE {
                             content[pos] = *b;
                             pos += 1;
                         }
                     }
                     let n = fmt_u64_hex(heap_base, &mut tmp);
                     for i in 0..n {
-                        if pos < 512 {
+                        if pos < PROC_TEXT_BUF_SIZE {
                             content[pos] = tmp[i];
                             pos += 1;
                         }
                     }
-                    if pos < 512 {
+                    if pos < PROC_TEXT_BUF_SIZE {
                         content[pos] = b'-';
                         pos += 1;
                     }
                     let n = fmt_u64_hex(heap_current, &mut tmp);
                     for i in 0..n {
-                        if pos < 512 {
+                        if pos < PROC_TEXT_BUF_SIZE {
                             content[pos] = tmp[i];
                             pos += 1;
                         }
                     }
-                    if pos < 512 {
+                    if pos < PROC_TEXT_BUF_SIZE {
                         content[pos] = b'\n';
                         pos += 1;
                     }
                     // "regions: <count>\n"
                     let hdr = b"regions: ";
                     for b in hdr {
-                        if pos < 512 {
+                        if pos < PROC_TEXT_BUF_SIZE {
                             content[pos] = *b;
                             pos += 1;
                         }
                     }
                     let n = fmt_u32(region_count as u32, &mut tmp);
                     for i in 0..n {
-                        if pos < 512 {
+                        if pos < PROC_TEXT_BUF_SIZE {
                             content[pos] = tmp[i];
                             pos += 1;
                         }
                     }
-                    if pos < 512 {
+                    if pos < PROC_TEXT_BUF_SIZE {
                         content[pos] = b'\n';
                         pos += 1;
                     }
                     // "pages: <total>\n"
                     let hdr = b"pages: ";
                     for b in hdr {
-                        if pos < 512 {
+                        if pos < PROC_TEXT_BUF_SIZE {
                             content[pos] = *b;
                             pos += 1;
                         }
                     }
                     let n = fmt_u32(total_pages as u32, &mut tmp);
                     for i in 0..n {
-                        if pos < 512 {
+                        if pos < PROC_TEXT_BUF_SIZE {
                             content[pos] = tmp[i];
                             pos += 1;
                         }
                     }
-                    if pos < 512 {
+                    if pos < PROC_TEXT_BUF_SIZE {
                         content[pos] = b'\n';
                         pos += 1;
                     }
@@ -800,6 +1062,11 @@ pub(crate) unsafe fn handle_proc_read(inode: *const RamfsInode, offset: u64, rep
                     0
                 }
             }
+            PROC_FILE_NET_ROUTE => proc_gen_route(&mut content),
+            PROC_FILE_NET_ARP => proc_gen_arp(&mut content),
+            PROC_FILE_NET_DEV => proc_gen_net_dev(&mut content),
+            PROC_FILE_ETC_HOSTS => proc_gen_hosts(&mut content),
+            PROC_FILE_ETC_RESOLV_CONF => proc_gen_resolv_conf(&mut content),
             _ => 0,
         };
 
@@ -837,11 +1104,11 @@ pub(crate) unsafe fn handle_proc_readdir(
 ) {
     unsafe {
         if (*inode).dev_type == PROC_FILE_ROOT {
-            // /proc root readdir: list PIDs + "self"
+            // /proc root readdir: list "self", "net", then PIDs
             let mut pids = [0u32; 19];
             let count = proc_list_pids(&mut pids);
 
-            // cursor 0 = "self", then PIDs
+            // cursor 0 = "self", cursor 1 = "net", then PIDs
             if cursor == 0 {
                 // Return "self" entry
                 (*reply).label = BESALT_OK;
@@ -858,7 +1125,21 @@ pub(crate) unsafe fn handle_proc_readdir(
                 return;
             }
 
-            let idx = (cursor - 1) as usize;
+            if cursor == 1 {
+                (*reply).label = BESALT_OK;
+                (*reply).regs[0] = 3;
+                (*reply).regs[1] = 2;
+                (*reply).regs[2] = 0;
+                (*reply).regs[3] = 4;
+                let dst = &mut (*reply).regs[4] as *mut u64 as *mut u8;
+                *dst = b'n';
+                *dst.add(1) = b'e';
+                *dst.add(2) = b't';
+                (*reply).length = 5;
+                return;
+            }
+
+            let idx = (cursor - 2) as usize;
             if idx >= count {
                 // No more entries
                 (*reply).label = BESALT_OK;
@@ -879,6 +1160,26 @@ pub(crate) unsafe fn handle_proc_readdir(
             let dst = &mut (*reply).regs[4] as *mut u64 as *mut u8;
             for i in 0..name_len {
                 *dst.add(i) = name_buf[i];
+            }
+            (*reply).length = 5;
+        } else if (*inode).dev_type == PROC_FILE_NET_DIR {
+            let entries: &[&[u8]] = &[b"route", b"arp", b"dev"];
+            let cursor_idx = cursor as usize;
+            if cursor_idx >= entries.len() {
+                (*reply).label = BESALT_OK;
+                (*reply).regs[0] = 0;
+                (*reply).length = 1;
+                return;
+            }
+            let entry = entries[cursor_idx];
+            (*reply).label = BESALT_OK;
+            (*reply).regs[0] = entry.len() as u64;
+            (*reply).regs[1] = cursor as u64 + 1;
+            (*reply).regs[2] = 0;
+            (*reply).regs[3] = 8;
+            let dst = &mut (*reply).regs[4] as *mut u64 as *mut u8;
+            for i in 0..entry.len() {
+                *dst.add(i) = entry[i];
             }
             (*reply).length = 5;
         } else if (*inode).dev_type == PROC_FILE_PID_DIR {

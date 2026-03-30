@@ -236,9 +236,12 @@ unsafe impl Sync for SocketState {}
 #[repr(C)]
 pub(crate) struct PollWaiter {
     pub(crate) active: u8,
+    pub(crate) kind: u8,
     pub(crate) badge: u64,
     pub(crate) reply_slot: u64,
+    pub(crate) deadline_ns: u64,
     pub(crate) fds: [(i32, u16); 8],
+    pub(crate) data: [u64; 8],
     pub(crate) nfds: u8,
 }
 
@@ -246,9 +249,12 @@ impl PollWaiter {
     pub(crate) const fn zeroed() -> Self {
         PollWaiter {
             active: 0,
+            kind: 0,
             badge: 0,
             reply_slot: 0,
+            deadline_ns: 0,
             fds: [(-1, 0); 8],
+            data: [0; 8],
             nfds: 0,
         }
     }

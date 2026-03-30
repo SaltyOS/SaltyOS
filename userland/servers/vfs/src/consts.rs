@@ -16,7 +16,6 @@ pub(crate) const VFS_CAP_PTY_NTFN: u64 = 68; // CopyCap 14:68 (PTY data-ready no
 pub(crate) const VFS_CAP_MMSRV_EP: u64 = 69; // NeedEP mmsrv:69
 pub(crate) const VFS_CAP_PROCMGR_EP: u64 = 70; // NeedEP procmgr:70
 pub(crate) const VFS_CAP_NETSRV_EP: u64 = 71; // NeedEP netsrv:71
-pub(crate) const VFS_CAP_NETSRV_CALLBACK_EP: u64 = 72; // badged copy of server EP for netsrv callbacks
 pub(crate) const NETSRV_CALLBACK_BADGE: u64 = 0x4E37D;
 
 // VFS protocol labels
@@ -85,6 +84,10 @@ pub(crate) const VFS_PREAD: u64 = 62;
 pub(crate) const VFS_PWRITE: u64 = 63;
 pub(crate) const VFS_BULK_SETUP: u64 = 64;
 pub(crate) const VFS_BULK_READ: u64 = 65;
+pub(crate) const VFS_GETSOCKNAME: u64 = 66;
+pub(crate) const VFS_GETPEERNAME: u64 = 67;
+pub(crate) const VFS_SETSOCKOPT: u64 = 68;
+pub(crate) const VFS_GETSOCKOPT: u64 = 69;
 
 /// Per-client bulk SHM size (1MB = 256 pages).
 pub(crate) const CLIENT_BULK_SHM_PAGES: u64 = 256;
@@ -124,6 +127,12 @@ pub(crate) const PROC_FILE_STAT: u8 = 2;
 pub(crate) const PROC_FILE_MAPS: u8 = 3;
 pub(crate) const PROC_FILE_ROOT: u8 = 4; // /proc directory itself
 pub(crate) const PROC_FILE_PID_DIR: u8 = 5; // /proc/<pid> directory
+pub(crate) const PROC_FILE_NET_DIR: u8 = 6; // /proc/net
+pub(crate) const PROC_FILE_NET_ROUTE: u8 = 7; // /proc/net/route
+pub(crate) const PROC_FILE_NET_ARP: u8 = 8; // /proc/net/arp
+pub(crate) const PROC_FILE_NET_DEV: u8 = 9; // /proc/net/dev
+pub(crate) const PROC_FILE_ETC_HOSTS: u8 = 10; // /etc/hosts and /etc/host
+pub(crate) const PROC_FILE_ETC_RESOLV_CONF: u8 = 11; // /etc/resolv.conf
 
 // Open flags — use besalt::consts::O_* (POSIX u32)
 
@@ -182,7 +191,8 @@ pub(crate) const INITIAL_PENDING_CONN: usize = 4;
 // Keep this strictly below 64 so it never collides with service-injected caps
 // (NeedEP/CopyCap are validated to use slots >= 64) or rtld runtime slot pool.
 pub(crate) const CAP_REPLY_BASE: u64 = 32;
-pub(crate) const CAP_REPLY_LIMIT: u64 = 63;
+pub(crate) const CAP_REPLY_LIMIT: u64 = 62;
+pub(crate) const VFS_CAP_NETSRV_CALLBACK_EP: u64 = 63; // bootstrap-private callback EP injected by init
 
 // Root inode
 pub(crate) const ROOT_INO: u32 = 1;
