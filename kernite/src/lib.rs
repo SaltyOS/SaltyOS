@@ -1,4 +1,4 @@
-//! SaltyOS Microkernel
+//! Kernite — SaltyOS Microkernel
 //!
 //! A capability-based microkernel with EDF scheduling and synchronous IPC.
 //!

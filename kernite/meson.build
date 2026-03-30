@@ -1,4 +1,4 @@
-# SaltyOS Kernel Build
+# Kernite — SaltyOS Kernel Build
 # SPDX-License-Identifier: GPL-2.0-only
 
 # =============================================================================
@@ -18,7 +18,7 @@ all_asm_files = run_command(
 ).stdout().strip()
 
 kernel_crate_root = files('src/lib.rs')
-kernel_target_spec = files(arch + '-saltyos.json')
+kernel_target_spec = files(arch + '-kernite.json')
 kernel_ld = meson.current_source_dir() / 'arch' / arch + '.ld'
 kernel_link_target = '--target=' + asm_target
 kernel_ld_lld = find_program('ld.lld', required: true)
@@ -84,7 +84,7 @@ kernel_obj = custom_target('kernel_obj',
     rustc,
     rust_kernel_args,
     '--emit=obj=@OUTPUT@,dep-info=@DEPFILE@',
-    '--crate-name=saltyos_kernel',
+    '--crate-name=kernite',
     '--sysroot=/dev/null',
     '--extern', 'core=' + core_kernel_rmeta.full_path(),
     '--extern', 'compiler_builtins=' + compiler_builtins_kernel_rmeta.full_path(),
@@ -99,7 +99,7 @@ kernel_obj = custom_target('kernel_obj',
 # Step 2: Link kernel object with core, compiler_builtins, and assembly objects into ELF executable
 kernel = custom_target('kernel',
   input: [kernel_obj, core_kernel_obj, compiler_builtins_kernel_obj] + asm_objs,
-  output: 'kernel.elf',
+  output: 'kernite.elf',
   command: [
     kernel_ld_lld,
     '-m', kernel_link_emulation,
@@ -115,10 +115,10 @@ kernel = custom_target('kernel',
 )
 
 # Step 3: Link boot image kernel ELF with debug sections stripped.
-# Keep kernel.elf unchanged for local debugging/symbol work.
+# Keep kernite.elf unchanged for local debugging/symbol work.
 kernel_boot = custom_target('kernel_boot',
   input: [kernel_obj, core_kernel_obj, compiler_builtins_kernel_obj] + asm_objs,
-  output: 'kernel.boot.elf',
+  output: 'kernite.boot.elf',
   command: [
     kernel_ld_lld,
     '-m', kernel_link_emulation,
