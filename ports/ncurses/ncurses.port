@@ -99,6 +99,11 @@ cf_cv_link_funcs = link symlink
 cf_cv_posix_visible = no
 cf_cv_sys_time_select = yes
 cf_cv_func_nanosleep = yes
+ac_cv_type_pid_t = yes
+ac_cv_type_intptr_t = yes
+ac_cv_type_ssize_t = yes
+cf_cv_wchar_t = yes
+cf_cv_wint_t = yes
 
 [install]
 libncursesw.a = lib/libncursesw.a
