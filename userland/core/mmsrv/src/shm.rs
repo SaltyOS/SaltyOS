@@ -140,11 +140,37 @@ pub(crate) unsafe fn handle_mm_shm_map(msg: *const TronaMsg, caller_badge: u64, 
         let actual_vaddr = if requested_vaddr == 0 {
             (*client).mmap_next
         } else {
+            if (requested_vaddr & 0xFFF) != 0 {
+                (*reply).label = TRONA_INVALID_ARGUMENT;
+                return;
+            }
             requested_vaddr
         };
 
         let vspace_cap = (*client).vspace_cap;
         let page_count = (*shm).page_count as usize;
+        let length = match (page_count as u64).checked_mul(4096) {
+            Some(v) => v,
+            None => {
+                (*reply).label = TRONA_INVALID_ARGUMENT;
+                return;
+            }
+        };
+        let mapping_end = match actual_vaddr.checked_add(length) {
+            Some(v) => v,
+            None => {
+                (*reply).label = TRONA_INVALID_ARGUMENT;
+                return;
+            }
+        };
+
+        if requested_vaddr != 0 {
+            let remove_err = crate::mmap::remove_client_range(client, actual_vaddr, length, true, 0);
+            if remove_err != TRONA_OK {
+                (*reply).label = remove_err;
+                return;
+            }
+        }
 
         for i in 0..page_count {
             let err = invoke::vspace_map(
@@ -163,9 +189,8 @@ pub(crate) unsafe fn handle_mm_shm_map(msg: *const TronaMsg, caller_badge: u64, 
             }
         }
 
-        // Advance mmap_next if auto-placed
-        if requested_vaddr == 0 {
-            (*client).mmap_next = actual_vaddr + page_count as u64 * 4096;
+        if mapping_end > (*client).mmap_next {
+            (*client).mmap_next = mapping_end;
         }
 
         (*reply).label = TRONA_OK;

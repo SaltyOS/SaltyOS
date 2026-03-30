@@ -54,31 +54,57 @@ pub(crate) unsafe fn find_free_client_slot() -> *mut MmClient {
 }
 
 /// Add a region to a client. Returns pointer to the new region or null.
+pub(crate) unsafe fn client_reserve_regions(client: *mut MmClient, additional: usize) -> bool {
+    unsafe {
+        let count = (*client).region_count;
+        let required = match count.checked_add(additional) {
+            Some(v) => v,
+            None => return false,
+        };
+        let cap = (*client).region_cap;
+
+        if required <= cap {
+            return true;
+        }
+
+        let mut new_cap = if cap == 0 { REGION_INITIAL_CAP } else { cap };
+        while new_cap < required {
+            new_cap = match new_cap.checked_mul(2) {
+                Some(v) => v,
+                None => return false,
+            };
+        }
+
+        let new_bytes = match new_cap.checked_mul(core::mem::size_of::<MmRegion>()) {
+            Some(v) => v,
+            None => return false,
+        };
+        let new_pages = (new_bytes + 4095) / 4096;
+        let new_pages = if new_pages == 0 { 1 } else { new_pages };
+        let new_ptr = super::self_mmap(new_pages);
+        if new_ptr.is_null() {
+            return false;
+        }
+        let new_ptr = new_ptr as *mut MmRegion;
+
+        let old_ptr = (*client).regions;
+        if !old_ptr.is_null() {
+            for i in 0..count {
+                *new_ptr.add(i) = *old_ptr.add(i);
+            }
+        }
+
+        (*client).regions = new_ptr;
+        (*client).region_cap = new_cap;
+        true
+    }
+}
+
 pub(crate) unsafe fn client_add_region(client: *mut MmClient) -> *mut MmRegion {
     unsafe {
         let count = (*client).region_count;
-        let cap = (*client).region_cap;
-
-        if count >= cap {
-            // Grow regions array
-            let new_cap = if cap == 0 { REGION_INITIAL_CAP } else { cap * 2 };
-            let new_bytes = new_cap * core::mem::size_of::<MmRegion>();
-            let new_pages = (new_bytes + 4095) / 4096;
-            let new_pages = if new_pages == 0 { 1 } else { new_pages };
-            let new_ptr = super::self_mmap(new_pages);
-            if new_ptr.is_null() {
-                return core::ptr::null_mut();
-            }
-            let new_ptr = new_ptr as *mut MmRegion;
-            // Copy old regions
-            let old_ptr = (*client).regions;
-            if !old_ptr.is_null() {
-                for i in 0..count {
-                    *new_ptr.add(i) = *old_ptr.add(i);
-                }
-            }
-            (*client).regions = new_ptr;
-            (*client).region_cap = new_cap;
+        if !client_reserve_regions(client, 1) {
+            return core::ptr::null_mut();
         }
 
         let region = (*client).regions.add(count);
@@ -239,10 +265,7 @@ pub(crate) unsafe fn handle_mm_deregister(msg: *const TronaMsg, _caller_badge: u
                             }
                         }
                     }
-                    if (*r).mo_cap != 0 {
-                        super::recycled_cnode_delete((*r).mo_cap);
-                    }
-                    (*r).active = false;
+                    crate::mmap::retire_region(client, r);
                 }
             }
         }

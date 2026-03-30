@@ -1,9 +1,229 @@
 use crate::types::*;
-use crate::client::{find_client_by_badge, client_add_region, find_region_by_addr};
+use crate::client::{client_add_region, client_reserve_regions, find_client_by_badge, find_region_by_addr};
 use trona::consts::*;
 use trona::invoke;
 use trona::ipc;
 use trona::types::*;
+
+#[inline]
+fn checked_aligned_len(length: u64) -> Option<u64> {
+    length.checked_add(4095).map(|v| v & !0xFFFu64)
+}
+
+#[inline]
+fn checked_mapping_len(page_count: usize) -> Option<u64> {
+    (page_count as u64).checked_mul(4096)
+}
+
+#[inline]
+fn checked_page_count(len: u64) -> Option<usize> {
+    usize::try_from(len / 4096).ok()
+}
+
+#[inline]
+fn checked_range_end(base: u64, length: u64) -> Option<u64> {
+    base.checked_add(length)
+}
+
+#[inline]
+fn checked_mo_offset_add(base: u32, delta_bytes: u64) -> Option<u32> {
+    let pages = u32::try_from(delta_bytes / 4096).ok()?;
+    base.checked_add(pages)
+}
+
+unsafe fn release_mo_cap_if_unused(client: *mut MmClient, mo_cap: Cap) {
+    unsafe {
+        if client.is_null() || mo_cap == 0 {
+            return;
+        }
+
+        let count = (*client).region_count;
+        let regions = (*client).regions;
+        if regions.is_null() {
+            super::recycled_cnode_delete(mo_cap);
+            return;
+        }
+
+        for i in 0..count {
+            let region = regions.add(i);
+            if (*region).active && (*region).mo_cap == mo_cap {
+                return;
+            }
+        }
+
+        super::recycled_cnode_delete(mo_cap);
+    }
+}
+
+pub(crate) unsafe fn retire_region(client: *mut MmClient, region: *mut MmRegion) {
+    unsafe {
+        if region.is_null() || !(*region).active {
+            return;
+        }
+
+        let mo_cap = (*region).mo_cap;
+        *region = MmRegion::zeroed();
+        release_mo_cap_if_unused(client, mo_cap);
+    }
+}
+
+unsafe fn count_split_regions_for_removal(client: *mut MmClient, start: u64, end: u64) -> Option<usize> {
+    unsafe {
+        let mut extra = 0usize;
+        let count = (*client).region_count;
+        let regions = (*client).regions;
+        if regions.is_null() {
+            return Some(0);
+        }
+
+        for i in 0..count {
+            let region = regions.add(i);
+            if !(*region).active || (*region).length == 0 {
+                continue;
+            }
+
+            let r_base = (*region).base;
+            let r_end = checked_range_end(r_base, (*region).length)?;
+            if r_base >= end || r_end <= start {
+                continue;
+            }
+
+            let overlap_start = core::cmp::max(r_base, start);
+            let overlap_end = core::cmp::min(r_end, end);
+            if overlap_start > r_base && overlap_end < r_end {
+                extra = extra.checked_add(1)?;
+            }
+        }
+
+        Some(extra)
+    }
+}
+
+pub(crate) unsafe fn remove_client_range(
+    client: *mut MmClient,
+    start: u64,
+    length: u64,
+    flush_writeback: bool,
+    reserve_additional: usize,
+) -> u64 {
+    unsafe {
+        if client.is_null() || length == 0 || (start & 0xFFF) != 0 || (length & 0xFFF) != 0 {
+            return TRONA_INVALID_ARGUMENT;
+        }
+
+        let end = match checked_range_end(start, length) {
+            Some(v) => v,
+            None => return TRONA_INVALID_ARGUMENT,
+        };
+        let extra = match count_split_regions_for_removal(client, start, end) {
+            Some(v) => v,
+            None => return TRONA_INVALID_ARGUMENT,
+        };
+        let reserve_total = match extra.checked_add(reserve_additional) {
+            Some(v) => v,
+            None => return TRONA_OUT_OF_MEMORY,
+        };
+        if !client_reserve_regions(client, reserve_total) {
+            return TRONA_OUT_OF_MEMORY;
+        }
+
+        let orig_count = (*client).region_count;
+        let regions = (*client).regions;
+        for i in 0..orig_count {
+            let region = regions.add(i);
+            if !(*region).active || (*region).length == 0 {
+                continue;
+            }
+
+            let r_base = (*region).base;
+            let r_end = match checked_range_end(r_base, (*region).length) {
+                Some(v) => v,
+                None => return TRONA_INVALID_ARGUMENT,
+            };
+            if r_base >= end || r_end <= start {
+                continue;
+            }
+
+            if flush_writeback {
+                let overlap_start = core::cmp::max(r_base, start);
+                let overlap_end = core::cmp::min(r_end, end);
+                flush_writeback_region(region, overlap_start, overlap_end - overlap_start);
+            }
+        }
+
+        let page_count = match checked_page_count(length) {
+            Some(v) => v,
+            None => return TRONA_INVALID_ARGUMENT,
+        };
+        for i in 0..page_count {
+            invoke::vspace_unmap((*client).vspace_cap, start + i as u64 * 4096);
+        }
+
+        for i in 0..orig_count {
+            let region = regions.add(i);
+            if !(*region).active || (*region).length == 0 {
+                continue;
+            }
+
+            let r_base = (*region).base;
+            let r_end = match checked_range_end(r_base, (*region).length) {
+                Some(v) => v,
+                None => return TRONA_INVALID_ARGUMENT,
+            };
+            if r_base >= end || r_end <= start {
+                continue;
+            }
+
+            let overlap_start = core::cmp::max(r_base, start);
+            let overlap_end = core::cmp::min(r_end, end);
+
+            if overlap_start == r_base && overlap_end == r_end {
+                retire_region(client, region);
+                continue;
+            }
+
+            if overlap_start == r_base {
+                let removed_len = overlap_end - r_base;
+                (*region).base = overlap_end;
+                (*region).length = r_end - overlap_end;
+                (*region).mo_offset = match checked_mo_offset_add((*region).mo_offset, removed_len) {
+                    Some(v) => v,
+                    None => return TRONA_INVALID_ARGUMENT,
+                };
+                (*region).backing_file_offset = match (*region).backing_file_offset.checked_add(removed_len) {
+                    Some(v) => v,
+                    None => return TRONA_INVALID_ARGUMENT,
+                };
+                continue;
+            }
+
+            if overlap_end == r_end {
+                (*region).length = overlap_start - r_base;
+                continue;
+            }
+
+            let suffix = client_add_region(client);
+            if suffix.is_null() {
+                return TRONA_OUT_OF_MEMORY;
+            }
+            *suffix = *region;
+            (*suffix).base = overlap_end;
+            (*suffix).length = r_end - overlap_end;
+            (*suffix).mo_offset = match checked_mo_offset_add((*region).mo_offset, overlap_end - r_base) {
+                Some(v) => v,
+                None => return TRONA_INVALID_ARGUMENT,
+            };
+            (*suffix).backing_file_offset = match (*region).backing_file_offset.checked_add(overlap_end - r_base) {
+                Some(v) => v,
+                None => return TRONA_INVALID_ARGUMENT,
+            };
+
+            (*region).length = overlap_start - r_base;
+        }
+
+        TRONA_OK
+    }
+}
 
 /// MM_BRK: client sets program break via MemoryObject.
 ///   MR0 = new break address
@@ -203,33 +423,52 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const TronaMsg, badge: u64, reply: *mu
             return;
         }
 
-        let _addr_hint = (*msg).regs[0];
+        let addr_hint = (*msg).regs[0];
         let length = (*msg).regs[1];
-        let _prot = (*msg).regs[2] as i32;
-        let _flags = (*msg).regs[3] as i32;
+        let prot = (*msg).regs[2] as i32;
+        let flags = (*msg).regs[3] as i32;
 
         if length == 0 {
             (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
-        let len = match length.checked_add(4095) {
-            Some(v) => v & !4095u64,
+        let len = match checked_aligned_len(length) {
+            Some(v) => v,
             None => {
                 (*reply).label = TRONA_INVALID_ARGUMENT;
                 return;
             }
         };
-        let num_pages = (len / 4096) as usize;
-        let vspace_cap = (*client).vspace_cap;
-        let base = (*client).mmap_next;
+        let num_pages = match checked_page_count(len) {
+            Some(v) if v != 0 => v,
+            _ => {
+                (*reply).label = TRONA_INVALID_ARGUMENT;
+                return;
+            }
+        };
+
+        let requested_base = if (flags & MAP_FIXED) != 0 {
+            if (addr_hint & 0xFFF) != 0 {
+                (*reply).label = TRONA_INVALID_ARGUMENT;
+                return;
+            }
+            addr_hint
+        } else {
+            0
+        };
+
+        if !client_reserve_regions(client, 1) {
+            (*reply).label = TRONA_OUT_OF_MEMORY;
+            return;
+        }
 
         // Map flags
         let mut map_flags = VSPACE_FLAG_USER;
-        if _prot & PROT_WRITE != 0 {
+        if prot & PROT_WRITE != 0 {
             map_flags |= VSPACE_FLAG_WRITABLE;
         }
-        if _prot & PROT_EXEC != 0 {
+        if prot & PROT_EXEC != 0 {
             map_flags |= VSPACE_FLAG_EXECUTABLE;
         }
 
@@ -240,6 +479,27 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const TronaMsg, badge: u64, reply: *mu
             return;
         }
 
+        let base = if requested_base != 0 {
+            let remove_err = remove_client_range(client, requested_base, len, true, 1);
+            if remove_err != TRONA_OK {
+                super::recycled_cnode_delete(mo_cap);
+                (*reply).label = remove_err;
+                return;
+            }
+            requested_base
+        } else {
+            (*client).mmap_next
+        };
+        let mapping_end = match checked_range_end(base, len) {
+            Some(v) => v,
+            None => {
+                super::recycled_cnode_delete(mo_cap);
+                (*reply).label = TRONA_INVALID_ARGUMENT;
+                return;
+            }
+        };
+        let vspace_cap = (*client).vspace_cap;
+
         // Create region to track mapping
         let region = client_add_region(client);
         if region.is_null() {
@@ -249,19 +509,21 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const TronaMsg, badge: u64, reply: *mu
         }
         (*region).base = base;
         (*region).length = len;
-        (*region).prot = _prot as u8;
+        (*region).prot = prot as u8;
         (*region).region_type = REGION_MMAP;
         (*region).active = true;
         (*region).mo_cap = mo_cap;
 
         // Check for MAP_LAZY flag
-        let is_lazy = (_flags & MAP_LAZY) != 0;
+        let is_lazy = (flags & MAP_LAZY) != 0;
         (*region).lazy = is_lazy;
 
         if is_lazy {
             // Lazy: MO created but pages NOT committed.
             // On VMFault, mo_commit + vspace_map_mo per page.
-            (*client).mmap_next = base + len;
+            if mapping_end > (*client).mmap_next {
+                (*client).mmap_next = mapping_end;
+            }
             (*reply).label = TRONA_OK;
             (*reply).length = 1;
             (*reply).regs[0] = base;
@@ -271,8 +533,7 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const TronaMsg, badge: u64, reply: *mu
         // Eager: commit all pages and map into client VSpace
         let (err, committed) = super::commit_mo_pages(mo_cap, 0, num_pages as u64);
         if err != 0 || committed != num_pages as u64 {
-            (*region).active = false;
-            (*region).mo_cap = 0;
+            *region = MmRegion::zeroed();
             super::recycled_cnode_delete(mo_cap);
             (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
@@ -281,14 +542,15 @@ pub(crate) unsafe fn handle_mm_mmap(msg: *const TronaMsg, badge: u64, reply: *mu
         let count_and_flags = ((num_pages as u64) << 32) | map_flags;
         let err = invoke::vspace_map_mo(vspace_cap, mo_cap, base, 0, count_and_flags);
         if err != 0 {
-            (*region).active = false;
-            (*region).mo_cap = 0;
+            *region = MmRegion::zeroed();
             super::recycled_cnode_delete(mo_cap);
             (*reply).label = TRONA_BAD_ADDRESS;
             return;
         }
 
-        (*client).mmap_next = base + len;
+        if mapping_end > (*client).mmap_next {
+            (*client).mmap_next = mapping_end;
+        }
 
         (*reply).label = TRONA_OK;
         (*reply).length = 1;
@@ -448,39 +710,18 @@ pub(crate) unsafe fn handle_mm_munmap(msg: *const TronaMsg, badge: u64, reply: *
 
         let base = (*msg).regs[0];
         let length = (*msg).regs[1];
-        let vspace_cap = (*client).vspace_cap;
-
-        let len = match length.checked_add(4095) {
-            Some(v) => v & !4095u64,
+        let len = match checked_aligned_len(length) {
+            Some(v) => v,
             None => {
                 (*reply).label = TRONA_INVALID_ARGUMENT;
                 return;
             }
         };
-        let num_pages = (len / 4096) as usize;
 
-        // Look up region
-        let region = find_region_by_addr(client, base);
-        if !region.is_null() && (*region).active {
-            flush_writeback_region(region, base, len);
-
-            // Unmap pages
-            for i in 0..num_pages {
-                invoke::vspace_unmap(vspace_cap, base + i as u64 * 4096);
-            }
-            // If entire region unmapped, mark inactive and clean up MO cap
-            if base == (*region).base && len >= (*region).length {
-                if (*region).mo_cap != 0 {
-                    super::recycled_cnode_delete((*region).mo_cap);
-                    (*region).mo_cap = 0;
-                }
-                (*region).active = false;
-            }
-        } else {
-            // No region tracking — just unmap
-            for i in 0..num_pages {
-                invoke::vspace_unmap(vspace_cap, base + i as u64 * 4096);
-            }
+        let err = remove_client_range(client, base, len, true, 0);
+        if err != TRONA_OK {
+            (*reply).label = err;
+            return;
         }
 
         (*reply).label = TRONA_OK;
@@ -528,7 +769,25 @@ pub(crate) unsafe fn handle_mm_mprotect(msg: *const TronaMsg, badge: u64, reply:
             }
         };
         let page_count = (len / 4096) as usize;
-        let mprotect_end = addr + len;
+        let mprotect_end = match checked_range_end(addr, len) {
+            Some(v) => v,
+            None => {
+                (*reply).label = TRONA_INVALID_ARGUMENT;
+                return;
+            }
+        };
+
+        let extra_regions = if addr == (*region).base && mprotect_end >= (*region).base + (*region).length {
+            0
+        } else if addr == (*region).base || mprotect_end >= (*region).base + (*region).length {
+            1
+        } else {
+            2
+        };
+        if extra_regions != 0 && !client_reserve_regions(client, extra_regions) {
+            (*reply).label = TRONA_OUT_OF_MEMORY;
+            return;
+        }
 
         // Update page table flags
         for i in 0..page_count {
@@ -1238,19 +1497,45 @@ pub(crate) unsafe fn handle_mm_map_object_region(
             return;
         }
 
+        let length = match checked_mapping_len(page_count) {
+            Some(v) => v,
+            None => {
+                (*reply).label = TRONA_INVALID_ARGUMENT;
+                return;
+            }
+        };
+        if requested_base != 0 && (requested_base & 0xFFF) != 0 {
+            (*reply).label = TRONA_INVALID_ARGUMENT;
+            return;
+        }
+
         let mo_cap = *(&raw const super::CURRENT_RECV_SLOT);
         if mo_cap == 0 {
             (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
 
-        let length = page_count as u64 * 4096;
+        if !client_reserve_regions(client, 1) {
+            (*reply).label = TRONA_OUT_OF_MEMORY;
+            return;
+        }
+
         let base = if requested_base != 0 {
+            let remove_err = remove_client_range(client, requested_base, length, true, 1);
+            if remove_err != TRONA_OK {
+                (*reply).label = remove_err;
+                return;
+            }
             requested_base
         } else {
-            let auto_base = (*client).mmap_next;
-            (*client).mmap_next = auto_base + length;
-            auto_base
+            (*client).mmap_next
+        };
+        let mapping_end = match checked_range_end(base, length) {
+            Some(v) => v,
+            None => {
+                (*reply).label = TRONA_INVALID_ARGUMENT;
+                return;
+            }
         };
 
         if !is_lazy {
@@ -1263,9 +1548,6 @@ pub(crate) unsafe fn handle_mm_map_object_region(
                 count_and_flags,
             );
             if err != 0 {
-                if requested_base == 0 {
-                    (*client).mmap_next = base;
-                }
                 (*reply).label = TRONA_BAD_ADDRESS;
                 return;
             }
@@ -1274,9 +1556,6 @@ pub(crate) unsafe fn handle_mm_map_object_region(
         let region = client_add_region(client);
         if region.is_null() {
             let _ = invoke::vspace_unmap_mo((*client).vspace_cap, base, page_count as u64);
-            if requested_base == 0 {
-                (*client).mmap_next = base;
-            }
             (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
@@ -1297,6 +1576,10 @@ pub(crate) unsafe fn handle_mm_map_object_region(
         (*region).backing_id1 = backing_id1;
         (*region).backing_file_offset = backing_file_offset;
         (*region).backing_file_size = backing_file_size;
+
+        if mapping_end > (*client).mmap_next {
+            (*client).mmap_next = mapping_end;
+        }
 
         (*reply).label = TRONA_OK;
         (*reply).length = 1;
