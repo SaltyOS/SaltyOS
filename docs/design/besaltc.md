@@ -6,7 +6,7 @@ This document describes the design and implementation of besaltc, SaltyOS's C st
 
 besaltc is a C standard library (`libc.so`) implemented primarily in Rust, providing a POSIX.1-2008 subset plus BSD extensions sufficient to run ported FreeBSD userland utilities (ls, cat, etc.). It is not a standalone library -- all system operations are delegated to libbesalt, which communicates with kernel services via IPC. This layered design means besaltc never issues syscalls directly; it translates C calling conventions into libbesalt's Rust API.
 
-The library targets a single platform (SaltyOS on x86_64) and a single execution model (single-threaded processes). This deliberate narrowing eliminates the complexity of thread-safety, TLS, and multi-architecture support that dominates traditional C library implementations.
+The library targets SaltyOS on x86_64 and aarch64. Multi-threading is supported via POSIX pthreads (mutexes, condition variables, barriers, semaphores, TLS). This dual-arch, multi-threaded design provides the foundation for a fully self-hosting OS.
 
 ## Design Goals
 
@@ -57,22 +57,30 @@ The startup sequence:
 | `ctype.rs` | Rust | isalpha, isdigit, toupper, etc. | Pure Rust (lookup table) |
 | `unistd.rs` | Rust | open, close, read, write, stat, mmap, *at() | libbesalt posix_* |
 | `process.rs` | Rust | fork, exec*, waitpid, kill, getpid, uid/gid | libbesalt posix_* |
-| `signal_impl.rs` | Rust | signal, sigaction, sigprocmask, sigset ops | libbesalt notifications |
-| `dirent_impl.rs` | Rust | opendir, readdir, closedir | libbesalt posix_opendir/readdir |
+| `signal.rs` | Rust | signal, sigaction, sigprocmask, sigset ops | libbesalt notifications |
+| `dirent.rs` | Rust | opendir, readdir, closedir, scandir, alphasort | libbesalt posix_opendir/readdir |
 | `env.rs` | Rust | getenv, setenv, unsetenv, environ | Static array (128 entries) |
 | `errno.rs` | Rust | errno global, __errno_location | Static `ERRNO` variable |
-| `time_impl.rs` | Rust | time, gmtime, strftime, clock_gettime | libbesalt posix_clock_gettime |
-| `stdlib_impl.rs` | Rust | atoi, strtol, strtod, qsort, bsearch, rand | Pure Rust |
-| `locale.rs` | Rust | setlocale (C-only), localeconv, gettext | Pure Rust (hardcoded C locale) |
-| `wchar.rs` | Rust | Wide char/multibyte stubs (MB_CUR_MAX=1) | Pure Rust (ASCII pass-through) |
+| `time.rs` | Rust | time, gmtime, localtime, mktime, strftime, tzset | libbesalt posix_clock_gettime |
+| `stdlib.rs` | Rust | atoi, strtol, strtod, qsort, bsearch, rand | Pure Rust |
+| `locale.rs` | Rust | setlocale (C-only), localeconv, gettext, nl_langinfo | Pure Rust (hardcoded C locale) |
+| `wchar.rs` | Rust | Wide char/multibyte (UTF-8, MB_CUR_MAX=4) | Pure Rust (full UTF-8 codec) |
 | `regex.rs` | Rust | POSIX BRE/ERE regex (backtracking NFA) | Pure Rust |
 | `sysinfo.rs` | Rust | uname, sysconf, getrlimit, gethostname | Pure Rust (hardcoded values) |
-| `pwd_impl.rs` | Rust | getpwnam, getpwuid, getgrnam, getgrgid | Pure Rust (root-only) |
-| `glob_impl.rs` | Rust | glob() pathname pattern matching | libbesalt posix_opendir |
-| `select_impl.rs` | Rust | select/pselect wrappers | libbesalt posix_select |
-| `math_impl.rs` | Rust | Basic math functions (fabs, sqrt, pow, etc.) | Pure Rust (soft-float) |
-| `misc_impl.rs` | Rust | getprogname, dirname, basename, getentropy | Mixed |
-| `err_impl.rs` | Rust | BSD err/warn/errx/warnx | stdio + errno |
+| `pwd.rs` | Rust | getpwnam, getpwuid, getgrnam, user_from_uid | Pure Rust (root-only) |
+| `glob.rs` | Rust | glob() pathname pattern matching | libbesalt posix_opendir |
+| `select.rs` | Rust | select/pselect wrappers | libbesalt posix_select |
+| `math.rs` | Rust | Math functions (fabs, sqrt, pow, sin, etc.) | Pure Rust + x87/NEON |
+| `misc.rs` | Rust | dirname, basename, utime, syslog stubs | Mixed |
+| `pthread.rs` | Rust | pthreads, mutexes, condvars, semaphores, TLS | salty::sync / salty::tls |
+| `search.rs` | Rust | tsearch, tfind, tdelete, twalk | Pure Rust |
+| `dlfcn.rs` | Rust | dlopen/dlsym stubs | Returns errors |
+| `socket.rs` | Rust | Socket API (socket, bind, connect, etc.) | libbesalt posix_socket |
+| `inet.rs` | Rust | inet_aton, htonl, getservbyname, etc. | Pure Rust |
+| `getrandom.rs` | Rust | getrandom, getentropy | salty::syscall (RDRAND) |
+| `getopt.rs` | Rust | POSIX getopt + GNU getopt_long/getopt_long_only | Pure Rust |
+| `fts.rs` | Rust | BSD file tree stream (fts_open, fts_read, etc.) | opendir/stat |
+| `iconv.rs` | Rust | Character encoding conversion (8 encodings) | Pure Rust |
 | `termios.rs` | Rust | Terminal I/O stubs | Returns defaults |
 | `termcap.rs` | Rust | termcap/terminfo stubs | Returns defaults |
 | `ioctl.rs` | Rust | ioctl stubs | libbesalt posix_ioctl |
@@ -80,12 +88,6 @@ The startup sequence:
 | `compat/` | Rust | FreeBSD compatibility layer | See below |
 | `crt_start.S` | ASM | `_start` entry point | Calls `__libc_start_main` |
 | `setjmp.S` | ASM | setjmp/longjmp/sigsetjmp/siglongjmp | Register save/restore |
-| `fts.c` | C | BSD file tree stream (fts_open, etc.) | opendir/stat |
-| `getopt.c` | C | POSIX getopt + GNU getopt_long | Pure C |
-| `libutil_compat.c` | C | expand_number, fgetln | stdio + malloc |
-| `md5.c` | C | RFC 1321 MD5 hash | Pure C |
-| `cap_fileargs.c` | C | Capsicum fileargs wrapper (stub) | No-op |
-| `xo_stub.c` | C | libxo text-mode stub | fprintf |
 
 ## Key Design Decisions
 
@@ -107,7 +109,7 @@ All pools use fixed-size arrays in static memory:
 | Resource | Pool Size | Location |
 |----------|-----------|----------|
 | FILE streams | 16 (3 reserved for std*) | `stdio.rs: OPEN_FILES` |
-| DIR handles | 16 | `dirent_impl.rs: DIR_POOL` |
+| DIR handles | 16 | `dirent.rs: DIR_POOL` |
 | Environment vars | 128 | `env.rs: ENV_PTRS` |
 | atexit handlers | 32 | `crt.rs: ATEXIT_FUNCS` |
 
@@ -115,7 +117,7 @@ This eliminates any dependency on malloc during early startup and prevents alloc
 
 ### errno Implementation
 
-errno is a single `static mut ERRNO: i32`. The `__errno_location()` function returns its address, matching the Linux ABI that C headers expand `errno` to `(*__errno_location())`. This works because SaltyOS processes are single-threaded. A multi-threaded implementation would require thread-local storage (TLS), which the platform does not yet support.
+errno is a single `static mut ERRNO: i32` protected by a spinlock. The `__errno_location()` function returns its address, matching the Linux ABI that C headers expand `errno` to `(*__errno_location())`.
 
 errno values use Linux numbering (ENOENT=2, EINVAL=22, etc.) rather than FreeBSD numbering. This is intentional -- the header files that ported programs include define these constants, so the numeric values are consistent within a given compilation.
 
@@ -218,18 +220,16 @@ The `compat/freebsd/` module implements FreeBSD-specific interfaces using a thre
 | `statvfs`, `fstatvfs` | `statvfs.rs` | Same as above |
 | `mknod` | `bsd_misc.rs` | Device special files not supported |
 
-### C Components
+### Compat Rust Modules
 
-Some FreeBSD compatibility code is written in C rather than Rust because the original source is reused directly or the code uses C-specific patterns:
+FreeBSD compatibility code that was previously in C has been converted to Rust:
 
-| File | Purpose | Origin |
-|------|---------|--------|
-| `fts.c` | File tree stream (`fts_open`, `fts_read`, etc.) | Adapted from FreeBSD |
-| `getopt.c` | POSIX getopt + GNU getopt_long/getopt_long_only | Standard implementation |
-| `libutil_compat.c` | `expand_number`, `fgetln` | FreeBSD libutil |
-| `md5.c` | RFC 1321 MD5 hash (used by FreeBSD md5(1)) | Standard implementation |
-| `cap_fileargs.c` | Capsicum fileargs wrapper (fileargs_init, etc.) | Minimal stub |
-| `xo_stub.c` | libxo text-mode output (xo_emit -> fprintf) | Minimal stub |
+| Module | Purpose |
+|--------|---------|
+| `compat/freebsd/cap_fileargs.rs` | Capsicum fileargs wrapper (open/fopen/lstat delegation) |
+| `compat/freebsd/xo.rs` | libxo text-mode stub (xo_emit → vfprintf) |
+| `compat/freebsd/md5.rs` | RFC 1321 MD5 hash (used by sort -R) |
+| `compat/freebsd/libutil.rs` | expand_number, humanize_number, fgetln |
 
 ### Headers
 
@@ -242,15 +242,11 @@ besaltc provides 70+ headers in `lib/besaltc/include/` organized to match standa
 
 ## Limitations
 
-**Single-threaded only.** All global state (`errno`, `STRTOK_SAVE`, `FREE_LIST`, `OPEN_FILES`, etc.) uses `static mut` without synchronization. Adding pthreads would require replacing these with TLS or mutex-protected storage.
+**C locale only.** `setlocale()` always returns "C". All character classification is ASCII. Wide character and multibyte functions support full UTF-8 (MB_CUR_MAX=4), but locale switching is not implemented.
 
-**C locale only.** `setlocale()` always returns "C". All character classification is ASCII. Wide character functions treat `wchar_t` as a simple 32-bit value with `MB_CUR_MAX = 1`. No multibyte encoding support.
+**No timezone database.** Timezone support is via the POSIX `TZ` environment variable only (e.g., `TZ=EST5EDT,M3.2.0,M11.1.0`). There is no `/usr/share/zoneinfo` or binary TZ file support. `tzset()` parses POSIX TZ strings with full DST transition rule support (Mm.w.d format). Without `TZ`, the default is UTC.
 
-**UTC only.** `localtime()` is an alias for `gmtime()`. No timezone database, no DST support, no `TZ` environment variable parsing. `strftime %Z` always produces "UTC".
-
-**No CSPRNG.** `getentropy()` uses a xorshift64 PRNG seeded from the monotonic clock and PID. It is suitable for hash table seeding but not for cryptographic keys or nonces.
-
-**No dlopen.** The dynamic linker loads shared libraries at process startup only. Runtime dynamic loading (`dlopen`, `dlsym`, `dlclose`) is not supported.
+**No dlopen.** The dynamic linker loads shared libraries at process startup only. Runtime dynamic loading (`dlopen`, `dlsym`, `dlclose`) stubs return errors.
 
 **No symlinks.** `lstat()` is identical to `stat()`. `readlink()`, `symlink()`, `readlinkat()`, `symlinkat()` return `ENOSYS`. The VFS does not implement symbolic links.
 
@@ -258,17 +254,17 @@ besaltc provides 70+ headers in `lib/besaltc/include/` organized to match standa
 
 **No file locking.** `flock()` returns `ENOSYS`. POSIX advisory locks (`fcntl F_SETLK`) are not implemented.
 
-**No popen/system.** Shell execution (`popen`, `system`) returns `ENOSYS`/-1. There is no shell binary on the system yet.
+**iconv encoding subset.** iconv supports 8 encodings (UTF-8, ASCII, ISO-8859-1, ISO-8859-15, UTF-16LE/BE, UTF-32LE/BE). CJK encodings (Shift-JIS, EUC-JP, GB2312, etc.) are not implemented.
 
 **Regex limitations.** The regex engine is a backtracking NFA, not a compiled DFA. It handles basic and extended regular expressions but may exhibit exponential behavior on pathological patterns.
 
 ## Build Pipeline
 
-besaltc is built through four parallel compilation steps, then linked into a single shared object:
+besaltc is built in three steps, then linked into a single shared object. All logic is in Rust -- only assembly stubs remain as non-Rust sources:
 
 ```
 Step 1: Rust sources
-  src/lib.rs ─── rustc ───> besaltc.o + besaltc.rmeta
+  src/lib.rs ─── rustc ───> saltyc.o + saltyc.rmeta
                  --extern salty=libbesalt.rmeta
                  --crate-type=lib
 
@@ -276,24 +272,14 @@ Step 2: Assembly sources
   crt_start.S ── clang -c ──> crt_start.o    (NOT linked into libc.so)
   setjmp.S   ── clang -c ──> setjmp.o
 
-Step 3: C sources
-  fts.c            ── clang -c ──> fts.o
-  getopt.c         ── clang -c ──> getopt.o
-  libutil_compat.c ── clang -c ──> libutil_compat.o
-  md5.c            ── clang -c ──> md5.o
-  cap_fileargs.c   ── clang -c ──> cap_fileargs.o
-  xo_stub.c        ── clang -c ──> xo_stub.o
-
-Step 4: Link
-  besaltc.o + setjmp.o + fts.o + getopt.o + libutil_compat.o
-  + md5.o + cap_fileargs.o + xo_stub.o + core.o
-  + compiler_builtins.o
-  ───> libc.so  (-shared, -T besaltc.ld, -soname libc.so)
+Step 3: Link
+  saltyc.o + setjmp.o + core.o + compiler_builtins.o
+  ───> libc.so  (-shared, -T saltyc.ld, -soname libc.so)
 ```
 
 `crt_start.o` is intentionally excluded from `libc.so` because it contains an unresolved reference to `main()`. Instead, it is linked directly into each C program's executable, providing the `_start` entry point.
 
-C sources are compiled with `-ffreestanding -nostdlib -nostdinc -isystem lib/besaltc/include/` to use besaltc's own headers rather than the host system's.
+A separate freestanding `string.c` provides basic string/memory functions for the statically-linked `init` binary, which cannot use `libc.so`.
 
 ## Cross-References
 

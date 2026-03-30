@@ -24,11 +24,16 @@ help:
     @echo "  just run --gdb          Run with GDB server (-s -S)"
     @echo "  just run --headless     Run without GUI (serial only)"
     @echo "  just run --mem 1G       Set memory size"
+    @echo "  just run --utm          Build + run via UTM on macOS"
     @echo "  just run --extra-disk F Attach additional virtio-blk disk"
     @echo ""
     @echo "== Debugging =="
     @echo "  just gdb                Connect GDB to running QEMU"
     @echo "  just reconfigure -Dkernel_log_level=debug"
+    @echo "  just reconfigure -Duserland_log_level=debug"
+    @echo "  just reconfigure -Dkernel_debug_modules=mm,ipc,syscall,arch"
+    @echo "  just reconfigure -Duserland_debug_programs=procmgr,mmsrv,vfs,netsrv"
+    @echo "  just arch=aarch64 reconfigure -Dkernel_log_level=debug -Duserland_log_level=debug"
     @echo ""
     @echo "== Code Quality =="
     @echo "  just fmt                Format Rust + C source"
@@ -274,12 +279,19 @@ clean-ports:
     set -euo pipefail
     for d in ports/*/; do
         [ -f "$d/$(basename "$d").port" ] || continue
+        # Remove arch-qualified work dirs (work-x86_64/, work-aarch64/)
         for w in "$d"work-*/; do
             [ -d "$w" ] && rm -rf "$w" && echo "Removed $w"
         done
+        # Remove staged artifacts
         [ -d "${d}stage" ] && rm -rf "${d}stage" && echo "Removed ${d}stage"
     done
-    echo "All port work directories cleaned."
+    # Remove meson port stamps from build dirs
+    for bd in build-*/ports/; do
+        [ -d "$bd" ] || continue
+        rm -f "$bd"/*.manifest 2>/dev/null && echo "Removed manifests in $bd"
+    done
+    echo "All port build artifacts cleaned."
 
 # Show port info
 port-info NAME:
