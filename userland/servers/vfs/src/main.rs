@@ -90,6 +90,7 @@ pub(crate) static mut PTY_PENDING: [[PtyPendingReader; MAX_PTY_WAITERS]; MAX_PTY
 pub(crate) static mut PTY_PENDING_COUNT: [usize; MAX_PTYS] = [0; MAX_PTYS];
 
 pub(crate) static mut NEXT_REPLY_SLOT: u64 = CAP_REPLY_BASE;
+pub(crate) static mut CURRENT_RECV_SLOT: u64 = 0;
 
 pub(crate) static mut MOUNTS: [MountEntry; MAX_MOUNTS] = [MountEntry::zeroed(); MAX_MOUNTS];
 pub(crate) static mut ROOT_UNDERLAY_IDX: i32 = -1;
@@ -1019,6 +1020,20 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     signal_ready();
 
+    unsafe {
+        let slot = match trona::slot_alloc::slot_alloc() {
+            Some(s) => s,
+            None => {
+                trona::uerror!(|_lb| {
+                    _lb.str(b"[VFS] FATAL: no receive slot for pager IPC\n");
+                });
+                idle();
+            }
+        };
+        CURRENT_RECV_SLOT = slot;
+        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, slot, 0);
+    }
+
     if unsafe { !inet::prepare_inet_callback_endpoint() } {
         trona::uerror!(|_lb| {
             _lb.str(b"[VFS] failed to prepare netsrv callback endpoint\n");
@@ -1615,10 +1630,23 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     VFS_BULK_READ => {
                         bulk::handle_bulk_read(&raw const msg, &raw mut reply, badge);
                     }
+                    VFS_MMAP_PAGEIN => {
+                        misc::handle_mmap_pagein(&raw const msg, &raw mut reply);
+                    }
+                    VFS_MMAP_WRITEBACK => {
+                        misc::handle_mmap_writeback(&raw const msg, &raw mut reply);
+                    }
                     _ => {
                         reply.label = TRONA_INVALID_OPERATION;
                     }
                 }
+            }
+        }
+
+        unsafe {
+            if CURRENT_RECV_SLOT != 0 {
+                let _ = trona::invoke::cnode_delete(CAP_SELF_CSPACE, CURRENT_RECV_SLOT);
+                ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CURRENT_RECV_SLOT, 0);
             }
         }
         }

@@ -385,6 +385,35 @@ unsafe fn proc_get_info(
     }
 }
 
+unsafe fn proc_get_exe_path(pid: u32, exe_path: &mut [u8; MAX_PATH_LEN]) -> Option<usize> {
+    unsafe {
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = POSIX_PM_GET_EXE_PATH;
+        msg.length = 1;
+        msg.regs[0] = pid as u64;
+        let err = ipc::call_ctx(
+            ipc_ctx(),
+            VFS_CAP_PROCMGR_EP,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != TRONA_OK {
+            return None;
+        }
+
+        let path_len = reply.regs[0] as usize;
+        if path_len == 0 || path_len > exe_path.len() {
+            return None;
+        }
+        let src = &reply.regs[1] as *const u64 as *const u8;
+        for i in 0..path_len {
+            exe_path[i] = *src.add(i);
+        }
+        Some(path_len)
+    }
+}
+
 /// Query mmsrv for client memory stats. Returns true on success.
 unsafe fn proc_get_mem_stats(
     pid: u32,
@@ -938,7 +967,9 @@ pub(crate) unsafe fn handle_proc_stat(
             (after_pid, after_len)
         };
 
-        let is_known = (file_name_len == 6 && mem_eq(file_name, b"status".as_ptr(), 6))
+        let is_exe = file_name_len == 3 && mem_eq(file_name, b"exe".as_ptr(), 3);
+        let is_known = is_exe
+            || (file_name_len == 6 && mem_eq(file_name, b"status".as_ptr(), 6))
             || (file_name_len == 4 && mem_eq(file_name, b"stat".as_ptr(), 4))
             || (file_name_len == 4 && mem_eq(file_name, b"maps".as_ptr(), 4));
 
@@ -951,13 +982,83 @@ pub(crate) unsafe fn handle_proc_stat(
         (*reply).label = TRONA_OK;
         (*reply).length = 8;
         (*reply).regs[0] = 0; // ino (virtual)
-        (*reply).regs[1] = (S_IFREG_L | 0o444) as u64; // mode
+        (*reply).regs[1] = if is_exe {
+            (S_IFLNK_L | 0o777) as u64
+        } else {
+            (S_IFREG_L | 0o444) as u64
+        };
         (*reply).regs[2] = 1; // nlink
         (*reply).regs[3] = 0; // size (unknown for virtual files)
         (*reply).regs[4] = 0; // uid
         (*reply).regs[5] = 0; // gid
         (*reply).regs[6] = 0; // mtime
-        (*reply).regs[7] = FTYPE_PROC_FILE as u64;
+        (*reply).regs[7] = if is_exe {
+            FTYPE_SYMLINK as u64
+        } else {
+            FTYPE_PROC_FILE as u64
+        };
+        true
+    }
+}
+
+pub(crate) unsafe fn handle_proc_readlink(
+    path: *const u8,
+    path_len: u8,
+    reply: *mut TronaMsg,
+    badge: u64,
+) -> bool {
+    unsafe {
+        if path_len < 10 {
+            return false;
+        }
+        let proc_prefix = b"/proc/";
+        for i in 0..6 {
+            if *path.add(i) != proc_prefix[i] {
+                return false;
+            }
+        }
+
+        let rest = path.add(6);
+        let rest_len = path_len - 6;
+        let is_self_prefix = rest_len >= 4
+            && *rest == b's'
+            && *rest.add(1) == b'e'
+            && *rest.add(2) == b'l'
+            && *rest.add(3) == b'f';
+
+        let (pid, file_offset) = if is_self_prefix && rest_len >= 8 && *rest.add(4) == b'/' {
+            ((badge & 0xFFFF) as u32, 5u8)
+        } else {
+            let mut pid_end = 0u8;
+            while (pid_end as usize) < rest_len as usize && *rest.add(pid_end as usize) != b'/' {
+                pid_end += 1;
+            }
+            let (pid, ok) = parse_pid(&core::slice::from_raw_parts(rest, pid_end as usize));
+            if !ok || pid_end >= rest_len {
+                return false;
+            }
+            (pid, pid_end + 1)
+        };
+
+        let file_name = rest.add(file_offset as usize);
+        let file_name_len = rest_len.saturating_sub(file_offset);
+        if file_name_len != 3 || !mem_eq(file_name, b"exe".as_ptr(), 3) {
+            return false;
+        }
+
+        let mut exe_path = [0u8; MAX_PATH_LEN];
+        let Some(exe_len) = proc_get_exe_path(pid, &mut exe_path) else {
+            (*reply).label = TRONA_NOT_FOUND;
+            return true;
+        };
+
+        (*reply).label = TRONA_OK;
+        (*reply).regs[0] = exe_len as u64;
+        (*reply).length = 1 + ((exe_len as u64 + 7) / 8);
+        let dst = &mut (*reply).regs[1] as *mut u64 as *mut u8;
+        for i in 0..exe_len {
+            *dst.add(i) = exe_path[i];
+        }
         true
     }
 }
@@ -1183,8 +1284,13 @@ pub(crate) unsafe fn handle_proc_readdir(
             }
             (*reply).length = 5;
         } else if (*inode).dev_type == PROC_FILE_PID_DIR {
-            // /proc/<pid> readdir: list status, stat, maps
-            let entries: &[&[u8]] = &[b"status", b"stat", b"maps"];
+            // /proc/<pid> readdir: list status, stat, maps, exe
+            let entries: &[(&[u8], u64)] = &[
+                (b"status", 8),
+                (b"stat", 8),
+                (b"maps", 8),
+                (b"exe", 10),
+            ];
             let cursor_idx = cursor as usize;
             if cursor_idx >= entries.len() {
                 (*reply).label = TRONA_OK;
@@ -1192,12 +1298,12 @@ pub(crate) unsafe fn handle_proc_readdir(
                 (*reply).length = 1;
                 return;
             }
-            let entry = entries[cursor_idx];
+            let (entry, dtype) = entries[cursor_idx];
             (*reply).label = TRONA_OK;
             (*reply).regs[0] = entry.len() as u64;
             (*reply).regs[1] = cursor as u64 + 1;
             (*reply).regs[2] = 0; // ino
-            (*reply).regs[3] = 8; // DT_REG
+            (*reply).regs[3] = dtype;
             let dst = &mut (*reply).regs[4] as *mut u64 as *mut u8;
             for i in 0..entry.len() {
                 *dst.add(i) = entry[i];

@@ -750,6 +750,7 @@ pub(crate) unsafe fn handle_write(msg: *const TronaMsg, reply: *mut TronaMsg, ba
                 if (fde.flags & O_APPEND) != 0 {
                     offset = (*inode).size;
                 }
+                let old_size = (*inode).size;
 
                 let src = &(*msg).regs[2] as *const u64 as *const u8;
                 let written = chain_write((*inode).rw_data, offset, src, count);
@@ -763,6 +764,14 @@ pub(crate) unsafe fn handle_write(msg: *const TronaMsg, reply: *mut TronaMsg, ba
                 if fde.offset > (*inode).size {
                     (*inode).size = fde.offset;
                 }
+                crate::misc::sync_shared_mmap_after_write(
+                    &*fde,
+                    offset,
+                    src,
+                    count,
+                    old_size,
+                    (*inode).size,
+                );
 
                 (*reply).label = TRONA_OK;
                 (*reply).length = 1;
@@ -777,7 +786,7 @@ pub(crate) unsafe fn handle_write(msg: *const TronaMsg, reply: *mut TronaMsg, ba
 
 /// Positioned read: read at an explicit offset without updating the fd cursor.
 /// IPC: regs[0]=fd, regs[1]=count, regs[2]=offset (i64).
-/// Only supported for FD_TYPE_FILE (not devices, pipes, or sockets).
+/// Supported for FD_TYPE_FILE and FD_TYPE_MOUNT.
 pub(crate) unsafe fn handle_pread(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
@@ -805,55 +814,108 @@ pub(crate) unsafe fn handle_pread(msg: *const TronaMsg, reply: *mut TronaMsg, ba
             return;
         }
 
-        if fde.fd_type != FD_TYPE_FILE {
-            (*reply).label = TRONA_INVALID_OPERATION;
-            return;
-        }
+        match fde.fd_type {
+            FD_TYPE_FILE => {
+                let inode = inode_by_ino(fde.inode);
+                if inode.is_null() {
+                    (*reply).label = TRONA_INVALID_ARGUMENT;
+                    return;
+                }
 
-        let inode = inode_by_ino(fde.inode);
-        if inode.is_null() {
-            (*reply).label = TRONA_INVALID_ARGUMENT;
-            return;
-        }
+                if offset >= (*inode).size {
+                    (*reply).label = TRONA_OK;
+                    (*reply).length = 1;
+                    (*reply).regs[0] = 0;
+                    return;
+                }
 
-        if offset >= (*inode).size {
-            (*reply).label = TRONA_OK;
-            (*reply).length = 1;
-            (*reply).regs[0] = 0;
-            return;
-        }
+                let avail = (*inode).size - offset;
+                if count > avail {
+                    count = avail;
+                }
 
-        let avail = (*inode).size - offset;
-        if count > avail {
-            count = avail;
-        }
+                let dst = &raw mut (*reply).regs[1] as *mut u8;
+                if !(*inode).ro_data.is_null() {
+                    let src = (*inode).ro_data.add(offset as usize);
+                    for i in 0..count as usize {
+                        *dst.add(i) = *src.add(i);
+                    }
+                } else if !(*inode).rw_data.is_null() {
+                    let actual = chain_read((*inode).rw_data, offset, dst, count);
+                    count = actual;
+                } else {
+                    (*reply).label = TRONA_OK;
+                    (*reply).length = 1;
+                    (*reply).regs[0] = 0;
+                    return;
+                }
 
-        let dst = &raw mut (*reply).regs[1] as *mut u8;
-        if !(*inode).ro_data.is_null() {
-            let src = (*inode).ro_data.add(offset as usize);
-            for i in 0..count as usize {
-                *dst.add(i) = *src.add(i);
+                (*reply).label = TRONA_OK;
+                (*reply).length = 1 + (count + 7) / 8;
+                (*reply).regs[0] = count;
             }
-        } else if !(*inode).rw_data.is_null() {
-            let actual = chain_read((*inode).rw_data, offset, dst, count);
-            count = actual;
-        } else {
-            (*reply).label = TRONA_OK;
-            (*reply).length = 1;
-            (*reply).regs[0] = 0;
-            return;
-        }
+            FD_TYPE_MOUNT => {
+                let mount_idx = fde.dev_type as usize;
+                let remote_ino = fde.sock_id as u64;
+                let Some((size, _, _, _, _)) = mount_stat(mount_idx, remote_ino) else {
+                    (*reply).label = TRONA_INVALID_ARGUMENT;
+                    return;
+                };
 
-        (*reply).label = TRONA_OK;
-        (*reply).length = 1 + (count + 7) / 8;
-        (*reply).regs[0] = count;
+                if offset >= size {
+                    (*reply).label = TRONA_OK;
+                    (*reply).length = 1;
+                    (*reply).regs[0] = 0;
+                    return;
+                }
+
+                if count > size - offset {
+                    count = size - offset;
+                }
+
+                if *(&raw const crate::VFS_SHM_ACTIVE) {
+                    crate::mount::mount_read_shm(
+                        mount_idx,
+                        remote_ino,
+                        offset,
+                        count,
+                        0,
+                        reply,
+                    );
+                    if (*reply).label != TRONA_OK {
+                        return;
+                    }
+                    let bytes_read = (*reply).regs[0];
+                    let copy_len = bytes_read.min(152);
+                    (*reply).length = 1 + (copy_len + 7) / 8;
+                    let src = crate::consts::VFS_SALTYFS_SHM_VADDR as *const u8;
+                    let dst = &raw mut (*reply).regs[1] as *mut u8;
+                    for i in 0..copy_len as usize {
+                        *dst.add(i) = *src.add(i);
+                    }
+                    (*reply).regs[0] = copy_len;
+                } else {
+                    crate::mount::mount_read_inline(
+                        mount_idx,
+                        remote_ino,
+                        offset,
+                        count.min(152),
+                        reply,
+                    );
+                }
+            }
+            _ => {
+                (*reply).label = TRONA_INVALID_OPERATION;
+                return;
+            }
+        }
         // Note: fd cursor (fde.offset) is NOT updated
     }
 }
 
 /// Positioned write: write at an explicit offset without updating the fd cursor.
 /// IPC: regs[0]=fd, regs[1]=count, regs[2]=offset (i64), regs[3..]=data.
-/// Only supported for FD_TYPE_FILE (not devices, pipes, or sockets).
+/// Supported for FD_TYPE_FILE and FD_TYPE_MOUNT.
 pub(crate) unsafe fn handle_pwrite(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
@@ -882,41 +944,97 @@ pub(crate) unsafe fn handle_pwrite(msg: *const TronaMsg, reply: *mut TronaMsg, b
             return;
         }
 
-        if fde.fd_type != FD_TYPE_FILE {
-            (*reply).label = TRONA_INVALID_OPERATION;
-            return;
-        }
+        match fde.fd_type {
+            FD_TYPE_FILE => {
+                let inode = inode_by_ino(fde.inode);
+                if inode.is_null() || (*inode).readonly != 0 {
+                    (*reply).label = TRONA_INVALID_OPERATION;
+                    return;
+                }
 
-        let inode = inode_by_ino(fde.inode);
-        if inode.is_null() || (*inode).readonly != 0 {
-            (*reply).label = TRONA_INVALID_OPERATION;
-            return;
-        }
+                if (*inode).rw_data.is_null() {
+                    (*inode).rw_data = alloc_writable();
+                    if (*inode).rw_data.is_null() {
+                        (*reply).label = TRONA_OUT_OF_MEMORY;
+                        return;
+                    }
+                }
 
-        if (*inode).rw_data.is_null() {
-            (*inode).rw_data = alloc_writable();
-            if (*inode).rw_data.is_null() {
-                (*reply).label = TRONA_OUT_OF_MEMORY;
+                let old_size = (*inode).size;
+                let src = &(*msg).regs[3] as *const u64 as *const u8;
+                let written = chain_write((*inode).rw_data, offset, src, count);
+                if written == 0 && count > 0 {
+                    (*reply).label = TRONA_OUT_OF_MEMORY;
+                    return;
+                }
+                count = written;
+
+                let end = offset + count;
+                if end > (*inode).size {
+                    (*inode).size = end;
+                }
+                crate::misc::sync_shared_mmap_after_write(
+                    fde,
+                    offset,
+                    src,
+                    count,
+                    old_size,
+                    (*inode).size,
+                );
+
+                (*reply).label = TRONA_OK;
+                (*reply).length = 1;
+                (*reply).regs[0] = count;
+            }
+            FD_TYPE_MOUNT => {
+                let mount_idx = fde.dev_type as usize;
+                let remote_ino = fde.sock_id as u64;
+                let old_size = crate::mount::mount_stat(mount_idx, remote_ino).map(|s| s.0).unwrap_or(0);
+                let src = &(*msg).regs[3] as *const u64 as *const u8;
+                if count > 136 && *(&raw const crate::VFS_SHM_ACTIVE) {
+                    let safe_count = count.min(crate::consts::VFS_SALTYFS_SHM_PAGES * 4096);
+                    let dst = crate::consts::VFS_SALTYFS_SHM_VADDR as *mut u8;
+                    for i in 0..safe_count as usize {
+                        *dst.add(i) = *src.add(i);
+                    }
+                    crate::mount::mount_write_shm(
+                        mount_idx,
+                        remote_ino,
+                        offset,
+                        safe_count,
+                        0,
+                        reply,
+                    );
+                } else {
+                    crate::mount::mount_write_inline(
+                        mount_idx,
+                        remote_ino,
+                        offset,
+                        src,
+                        count.min(136),
+                        reply,
+                    );
+                }
+                if (*reply).label == TRONA_OK {
+                    let actual = (*reply).regs[0];
+                    let new_size = crate::mount::mount_stat(mount_idx, remote_ino)
+                        .map(|s| s.0)
+                        .unwrap_or(old_size.max(offset + actual));
+                    crate::misc::sync_shared_mmap_after_write(
+                        fde,
+                        offset,
+                        src,
+                        actual,
+                        old_size,
+                        new_size,
+                    );
+                }
+            }
+            _ => {
+                (*reply).label = TRONA_INVALID_OPERATION;
                 return;
             }
         }
-
-        let src = &(*msg).regs[3] as *const u64 as *const u8;
-        let written = chain_write((*inode).rw_data, offset, src, count);
-        if written == 0 && count > 0 {
-            (*reply).label = TRONA_OUT_OF_MEMORY;
-            return;
-        }
-        count = written;
-
-        let end = offset + count;
-        if end > (*inode).size {
-            (*inode).size = end;
-        }
-
-        (*reply).label = TRONA_OK;
-        (*reply).length = 1;
-        (*reply).regs[0] = count;
         // Note: fd cursor (fde.offset) is NOT updated
     }
 }
