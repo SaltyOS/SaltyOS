@@ -155,7 +155,7 @@ def main():
             file=sys.stderr,
         )
         sys.exit(1)
-    copy_file(pie_linker_script, lib_dir / "saltyos-pie.ld", args.verbose)
+    copy_file(pie_linker_script, lib_dir / "trona-pie.ld", args.verbose)
     copied += 1
 
     # Copy optional files
