@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 pcisrv_link = meson.current_source_dir() / 'arch' / arch / 'link.ld'
-libbesalt_build_dir = meson.project_build_root() / 'lib/besalt/lib'
 
 # Per-program debug override
 _prog_rust_args = rust_userland_args
@@ -20,10 +19,11 @@ pcisrv_obj = custom_target('pcisrv_obj',
     '--emit=obj=@OUTPUT@,dep-info=@DEPFILE@',
     '--crate-name=pcisrv',
     '--crate-type=lib',
-    '--extern', 'besalt=' + libbesalt_build_dir / 'libbesalt.rmeta',
+    '--extern', 'trona=' + trona_rmeta,
+    '--extern', 'trona_posix=' + trona_posix_rmeta,
     '@INPUT@',
   ],
-  depends: [core, compiler_builtins, libbesalt_rust],
+  depends: [core, compiler_builtins, libtrona_rust, trona_posix],
   build_by_default: true,
 )
 
@@ -31,18 +31,18 @@ pcisrv_obj = custom_target('pcisrv_obj',
 pcisrv_elf = custom_target('pcisrv_elf',
   input: [pcisrv_obj],
   output: 'pcisrv.elf',
-  depends: [libbesalt_so, libc_so, crt_start_obj],
+  depends: [libtrona_so, libc_so, crt_start_obj],
   command: [cc_cmd,
     '--target=' + c_target,
     '-nostdlib', '-nostartfiles', '-ffreestanding',
     '-fno-stack-protector',
     '-T', pcisrv_link,
-    '-L', libbesalt_build_dir,
-    '-L', besaltc_build_dir,
+    '-L', libtrona_build_dir,
+    '-L', basaltc_build_dir,
     '-o', '@OUTPUT@',
-    besaltc_build_dir / 'crt_start.o',
+    basaltc_build_dir / 'crt_start.o',
     '@INPUT@',
-    '-lbesalt', '-lc',
+    '-ltrona', '-lc',
   ],
   build_by_default: true,
 )
