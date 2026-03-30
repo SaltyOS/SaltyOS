@@ -23,6 +23,8 @@ const MMAP_REGION_TYPE_PRIVATE: u64 = 1;
 const MMAP_REGION_TYPE_FILE_SHARED: u64 = 4;
 const MMAP_CACHE_SOURCE_FILE: u8 = 1;
 const MMAP_CACHE_SOURCE_MOUNT: u8 = 2;
+const VTIME: usize = 5;
+const VMIN: usize = 6;
 
 #[derive(Clone, Copy)]
 struct FileMmapCacheEntry {
@@ -55,6 +57,106 @@ impl FileMmapCacheEntry {
 
 static mut FILE_MMAP_CACHE: [FileMmapCacheEntry; INITIAL_FILE_MMAP_CACHE] =
     [FileMmapCacheEntry::zeroed(); INITIAL_FILE_MMAP_CACHE];
+
+unsafe fn fetch_pty_termios(pty_id: u64, termios: *mut Termios) -> bool {
+    unsafe {
+        let mut req = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        req.label = TTYD_PTY_TCGETATTR;
+        req.regs[0] = pty_id;
+        req.length = 1;
+
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const req, &raw mut reply);
+        if err != 0 || reply.label != TRONA_OK {
+            return false;
+        }
+
+        (*termios).c_iflag = reply.regs[0] as u32;
+        (*termios).c_oflag = reply.regs[1] as u32;
+        (*termios).c_cflag = reply.regs[2] as u32;
+        (*termios).c_lflag = reply.regs[3] as u32;
+        (*termios).c_ispeed = reply.regs[4] as u32;
+        (*termios).c_ospeed = reply.regs[5] as u32;
+        (*termios).c_line = 0;
+        let src = &reply.regs[6] as *const u64 as *const u8;
+        for i in 0..32 {
+            (*termios).c_cc[i] = *src.add(i);
+        }
+
+        true
+    }
+}
+
+unsafe fn remove_pty_pending_reader(pty_id: usize, index: usize) {
+    unsafe {
+        let count = crate::PTY_PENDING_COUNT[pty_id];
+        for j in (index + 1)..count {
+            crate::PTY_PENDING[pty_id][j - 1] = crate::PTY_PENDING[pty_id][j];
+        }
+        crate::PTY_PENDING_COUNT[pty_id] -= 1;
+        crate::PTY_PENDING[pty_id][crate::PTY_PENDING_COUNT[pty_id]] = PtyPendingReader::zeroed();
+    }
+}
+
+unsafe fn send_pty_timeout_reply(reply_slot: u64) {
+    unsafe {
+        let mut wake = TronaMsg::zeroed();
+        wake.label = TRONA_OK;
+        wake.length = 1;
+        wake.regs[0] = 0;
+        ipc::send_ctx(ipc_ctx(), reply_slot, &raw const wake);
+    }
+}
+
+pub(crate) unsafe fn expire_pty_read_timeouts(now_ns: u64) -> bool {
+    unsafe {
+        let mut expired = false;
+
+        for pty_id in 0..MAX_PTYS {
+            let mut index = 0usize;
+            while index < crate::PTY_PENDING_COUNT[pty_id] {
+                let reader = crate::PTY_PENDING[pty_id][index];
+                if reader.active == 0 || reader.deadline_ns == 0 || reader.deadline_ns > now_ns {
+                    index += 1;
+                    continue;
+                }
+
+                send_pty_timeout_reply(reader.reply_slot);
+                remove_pty_pending_reader(pty_id, index);
+                expired = true;
+            }
+        }
+
+        expired
+    }
+}
+
+pub(crate) unsafe fn next_pty_read_timeout_ns(now_ns: u64) -> u64 {
+    unsafe {
+        let mut earliest = u64::MAX;
+
+        for pty_id in 0..MAX_PTYS {
+            for index in 0..crate::PTY_PENDING_COUNT[pty_id] {
+                let reader = crate::PTY_PENDING[pty_id][index];
+                if reader.active == 0 || reader.deadline_ns == 0 {
+                    continue;
+                }
+                if reader.deadline_ns <= now_ns {
+                    return 1;
+                }
+                if reader.deadline_ns < earliest {
+                    earliest = reader.deadline_ns;
+                }
+            }
+        }
+
+        if earliest == u64::MAX {
+            0
+        } else {
+            earliest.saturating_sub(now_ns)
+        }
+    }
+}
 
 #[inline]
 unsafe fn mmap_prot_to_vspace_flags(prot: u64) -> u64 {
@@ -718,29 +820,8 @@ unsafe fn map_object_region_into_client(
 
 pub(crate) unsafe fn handle_mmap_pagein(msg: *const TronaMsg, reply: *mut TronaMsg) {
     unsafe {
-        trona::uerror!(|_lb| {
-            _lb.str(b"[VFS] mmap pagein entry kind=");
-            _lb.hex((*msg).regs[0]);
-            _lb.str(b" id0=");
-            _lb.hex((*msg).regs[1]);
-            _lb.str(b" id1=");
-            _lb.hex((*msg).regs[2]);
-            _lb.str(b" file_off=");
-            _lb.hex((*msg).regs[3]);
-            _lb.str(b" mo_page=");
-            _lb.dec((*msg).regs[4]);
-            _lb.str(b" bytes=");
-            _lb.dec((*msg).regs[5]);
-            _lb.str(b" recv_slot=");
-            _lb.dec(*(&raw const crate::CURRENT_RECV_SLOT));
-            _lb.str(b"\n");
-        });
-
         let mo_cap = *(&raw const crate::CURRENT_RECV_SLOT);
         if mo_cap == 0 {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[VFS] mmap pagein: missing recv slot cap\n");
-            });
             (*reply).label = TRONA_INVALID_ARGUMENT;
             return;
         }
@@ -754,15 +835,6 @@ pub(crate) unsafe fn handle_mmap_pagein(msg: *const TronaMsg, reply: *mut TronaM
 
         let (has_err, has_page) = trona::invoke::mo_has_page(mo_cap, mo_page_idx);
         if has_err != 0 {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[VFS] mmap pagein: mo_has_page failed mo=");
-                _lb.dec(mo_cap);
-                _lb.str(b" page=");
-                _lb.dec(mo_page_idx);
-                _lb.str(b" err=");
-                _lb.hex(has_err as u64);
-                _lb.str(b"\n");
-            });
             (*reply).label = TRONA_INVALID_OPERATION;
             return;
         }
@@ -773,17 +845,6 @@ pub(crate) unsafe fn handle_mmap_pagein(msg: *const TronaMsg, reply: *mut TronaM
 
         let (commit_err, committed) = trona::invoke::mo_commit(mo_cap, mo_page_idx, 1, 0);
         if commit_err != 0 || committed != 1 {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[VFS] mmap pagein: mo_commit failed mo=");
-                _lb.dec(mo_cap);
-                _lb.str(b" page=");
-                _lb.dec(mo_page_idx);
-                _lb.str(b" err=");
-                _lb.hex(commit_err as u64);
-                _lb.str(b" committed=");
-                _lb.dec(committed);
-                _lb.str(b"\n");
-            });
             (*reply).label = TRONA_OUT_OF_MEMORY;
             return;
         }
@@ -797,17 +858,6 @@ pub(crate) unsafe fn handle_mmap_pagein(msg: *const TronaMsg, reply: *mut TronaM
             map_flags,
         );
         if map_err != 0 {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[VFS] mmap pagein: vspace_map_mo failed mo=");
-                _lb.dec(mo_cap);
-                _lb.str(b" page=");
-                _lb.dec(mo_page_idx);
-                _lb.str(b" vaddr=");
-                _lb.hex(VFS_FILE_MMAP_SCRATCH_VADDR);
-                _lb.str(b" err=");
-                _lb.hex(map_err as u64);
-                _lb.str(b"\n");
-            });
             let _ = trona::invoke::mo_decommit(mo_cap, mo_page_idx, 1);
             (*reply).label = TRONA_INVALID_OPERATION;
             return;
@@ -816,19 +866,6 @@ pub(crate) unsafe fn handle_mmap_pagein(msg: *const TronaMsg, reply: *mut TronaM
         let dst = VFS_FILE_MMAP_SCRATCH_VADDR as *mut u8;
         core::ptr::write_bytes(dst, 0, 4096);
         if bytes > 0 && read_backing_bytes(backing_kind, backing_id0, backing_id1, file_offset, dst, bytes).is_none() {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[VFS] mmap pagein: backing read failed kind=");
-                _lb.hex(backing_kind);
-                _lb.str(b" id0=");
-                _lb.hex(backing_id0);
-                _lb.str(b" id1=");
-                _lb.hex(backing_id1);
-                _lb.str(b" off=");
-                _lb.hex(file_offset);
-                _lb.str(b" bytes=");
-                _lb.dec(bytes);
-                _lb.str(b"\n");
-            });
             let _ = trona::invoke::vspace_unmap(CAP_SELF_VSPACE, VFS_FILE_MMAP_SCRATCH_VADDR);
             let _ = trona::invoke::mo_decommit(mo_cap, mo_page_idx, 1);
             (*reply).label = TRONA_INVALID_OPERATION;
@@ -930,6 +967,29 @@ pub(crate) unsafe fn handle_pty_dev_read(
             return false;
         }
 
+        if ((*fde).flags & O_NONBLOCK as u32) != 0 {
+            (*reply).label = TRONA_WOULD_BLOCK;
+            return false;
+        }
+
+        let mut deadline_ns = 0u64;
+        let mut termios = Termios::zeroed();
+        if fetch_pty_termios(pty_id, &raw mut termios) {
+            let vmin = termios.c_cc[VMIN] as u64;
+            let vtime = termios.c_cc[VTIME] as u64;
+            if vmin == 0 {
+                if vtime == 0 {
+                    (*reply).label = TRONA_OK;
+                    (*reply).length = 1;
+                    (*reply).regs[0] = 0;
+                    return false;
+                }
+
+                deadline_ns = crate::poll::monotonic_now_ns()
+                    .saturating_add(vtime.saturating_mul(100_000_000));
+            }
+        }
+
         // WOULD_BLOCK — save caller's reply cap, enqueue pending reader
         let pid = pty_id as usize;
         if pid >= MAX_PTYS || crate::PTY_PENDING_COUNT[pid] >= MAX_PTY_WAITERS {
@@ -950,6 +1010,7 @@ pub(crate) unsafe fn handle_pty_dev_read(
             badge,
             reply_slot: slot,
             max_count: max,
+            deadline_ns,
         };
         crate::PTY_PENDING_COUNT[pid] += 1;
 
@@ -1001,15 +1062,7 @@ pub(crate) unsafe fn handle_pty_notification(ntfn_badge: u64) {
                 }
                 ipc::send_ctx(ipc_ctx(), reader.reply_slot, &raw const wake);
 
-                // Shift remaining waiters forward (FIFO)
-                for j in 1..crate::PTY_PENDING_COUNT[pty_id] {
-                    crate::PTY_PENDING[pty_id][j - 1] = crate::PTY_PENDING[pty_id][j];
-                }
-                crate::PTY_PENDING_COUNT[pty_id] -= 1;
-                if crate::PTY_PENDING_COUNT[pty_id] < MAX_PTY_WAITERS {
-                    crate::PTY_PENDING[pty_id][crate::PTY_PENDING_COUNT[pty_id]] =
-                        PtyPendingReader::zeroed();
-                }
+                remove_pty_pending_reader(pty_id, 0);
             }
 
             // Wake poll/epoll waiters for PTY fds (POLLIN event)

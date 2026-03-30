@@ -1630,6 +1630,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     VFS_BULK_READ => {
                         bulk::handle_bulk_read(&raw const msg, &raw mut reply, badge);
                     }
+                    VFS_BULK_PWRITE => {
+                        bulk::handle_bulk_pwrite(&raw const msg, &raw mut reply, badge);
+                    }
                     VFS_MMAP_PAGEIN => {
                         misc::handle_mmap_pagein(&raw const msg, &raw mut reply);
                     }
@@ -1654,10 +1657,17 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         unsafe {
             let now_ns = poll::monotonic_now_ns();
             poll::expire_poll_timeouts(now_ns);
+            misc::expire_pty_read_timeouts(now_ns);
         }
         let timeout_ns = unsafe {
             let now_ns = poll::monotonic_now_ns();
-            poll::next_poll_timeout_ns(now_ns)
+            let poll_timeout_ns = poll::next_poll_timeout_ns(now_ns);
+            let pty_timeout_ns = misc::next_pty_read_timeout_ns(now_ns);
+            match (poll_timeout_ns, pty_timeout_ns) {
+                (0, other) => other,
+                (other, 0) => other,
+                (lhs, rhs) => core::cmp::min(lhs, rhs),
+            }
         };
 
         let err = if skip_reply {
@@ -1717,6 +1727,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             unsafe {
                 let now_ns = poll::monotonic_now_ns();
                 poll::expire_poll_timeouts(now_ns);
+                misc::expire_pty_read_timeouts(now_ns);
             }
             have_message = false;
             continue;

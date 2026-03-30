@@ -88,6 +88,9 @@ pub(crate) const VFS_GETSOCKNAME: u64 = 66;
 pub(crate) const VFS_GETPEERNAME: u64 = 67;
 pub(crate) const VFS_SETSOCKOPT: u64 = 68;
 pub(crate) const VFS_GETSOCKOPT: u64 = 69;
+pub(crate) const VFS_MMAP_PAGEIN: u64 = 70;
+pub(crate) const VFS_MMAP_WRITEBACK: u64 = 71;
+pub(crate) const VFS_BULK_PWRITE: u64 = 72;
 
 /// Per-client bulk SHM size (1MB = 256 pages).
 pub(crate) const CLIENT_BULK_SHM_PAGES: u64 = 256;

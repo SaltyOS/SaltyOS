@@ -991,30 +991,14 @@ pub(crate) unsafe fn handle_pwrite(msg: *const TronaMsg, reply: *mut TronaMsg, b
                 let remote_ino = fde.sock_id as u64;
                 let old_size = crate::mount::mount_stat(mount_idx, remote_ino).map(|s| s.0).unwrap_or(0);
                 let src = &(*msg).regs[3] as *const u64 as *const u8;
-                if count > 136 && *(&raw const crate::VFS_SHM_ACTIVE) {
-                    let safe_count = count.min(crate::consts::VFS_SALTYFS_SHM_PAGES * 4096);
-                    let dst = crate::consts::VFS_SALTYFS_SHM_VADDR as *mut u8;
-                    for i in 0..safe_count as usize {
-                        *dst.add(i) = *src.add(i);
-                    }
-                    crate::mount::mount_write_shm(
-                        mount_idx,
-                        remote_ino,
-                        offset,
-                        safe_count,
-                        0,
-                        reply,
-                    );
-                } else {
-                    crate::mount::mount_write_inline(
-                        mount_idx,
-                        remote_ino,
-                        offset,
-                        src,
-                        count.min(136),
-                        reply,
-                    );
-                }
+                crate::mount::mount_write_inline(
+                    mount_idx,
+                    remote_ino,
+                    offset,
+                    src,
+                    count,
+                    reply,
+                );
                 if (*reply).label == TRONA_OK {
                     let actual = (*reply).regs[0];
                     let new_size = crate::mount::mount_stat(mount_idx, remote_ino)

@@ -132,6 +132,64 @@ pub(crate) unsafe fn handle_bulk_read(
     }
 }
 
+/// Handle VFS_BULK_PWRITE: write file data from client's SHM.
+///
+/// Message layout:
+///   regs[0] = fd
+///   regs[1] = count (bytes to write)
+///   regs[2] = file offset
+///   regs[3] = shm_offset (offset within client SHM)
+pub(crate) unsafe fn handle_bulk_pwrite(
+    msg: *const TronaMsg,
+    reply: *mut TronaMsg,
+    badge: u64,
+) {
+    unsafe {
+        let fd = (*msg).regs[0] as i32;
+        let count = (*msg).regs[1];
+        let file_offset = (*msg).regs[2];
+        let shm_offset = (*msg).regs[3];
+
+        let cli = client::get_client_noalloc(badge);
+        if cli.is_null() || (*cli).bulk_shm_vaddr == 0 {
+            (*reply).label = TRONA_INVALID_ARGUMENT;
+            (*reply).length = 1;
+            (*reply).regs[0] = 0;
+            return;
+        }
+
+        if fd < 0 || fd >= (*cli).fds_cap as i32 {
+            (*reply).label = TRONA_INVALID_ARGUMENT;
+            (*reply).length = 1;
+            (*reply).regs[0] = 0;
+            return;
+        }
+
+        let fde = &mut *(*cli).fds.add(fd as usize);
+        if fde.active == 0 || !client::flags_allow_write(fde.flags) {
+            (*reply).label = TRONA_INVALID_ARGUMENT;
+            (*reply).length = 1;
+            (*reply).regs[0] = 0;
+            return;
+        }
+
+        let client_shm = (*cli).bulk_shm_vaddr;
+        let shm_limit = CLIENT_BULK_SHM_PAGES * 4096;
+        let capped = count.min(shm_limit.saturating_sub(shm_offset));
+
+        match fde.fd_type {
+            FD_TYPE_MOUNT if *(&raw const crate::VFS_SHM_ACTIVE) => {
+                bulk_pwrite_mount(fde, client_shm, shm_offset, capped, file_offset, reply);
+            }
+            _ => {
+                (*reply).label = TRONA_INVALID_OPERATION;
+                (*reply).length = 1;
+                (*reply).regs[0] = 0;
+            }
+        }
+    }
+}
+
 /// Read from a mount-backed fd into client SHM.
 ///
 /// Reads from SaltyFS via the VFS-SaltyFS SHM and copies chunks into the
@@ -185,6 +243,69 @@ unsafe fn bulk_read_mount(
         (*reply).label = TRONA_OK;
         (*reply).regs[0] = total;
         (*reply).length = 1;
+    }
+}
+
+unsafe fn bulk_pwrite_mount(
+    fde: &FdEntry,
+    client_shm: u64,
+    shm_offset: u64,
+    count: u64,
+    file_offset: u64,
+    reply: *mut TronaMsg,
+) {
+    unsafe {
+        let mount_idx = fde.dev_type as usize;
+        let remote_ino = fde.sock_id as u64;
+        let saltyfs_shm_size = VFS_SALTYFS_SHM_PAGES * 4096;
+        let old_size = mount::mount_stat(mount_idx, remote_ino).map(|s| s.0).unwrap_or(0);
+
+        let mut total = 0u64;
+        while total < count {
+            let chunk = (count - total).min(saltyfs_shm_size);
+            let src = (client_shm + shm_offset + total) as *const u8;
+            let dst = VFS_SALTYFS_SHM_VADDR as *mut u8;
+            core::ptr::copy_nonoverlapping(src, dst, chunk as usize);
+
+            mount::mount_write_shm(
+                mount_idx,
+                remote_ino,
+                file_offset + total,
+                chunk,
+                0,
+                reply,
+            );
+            if (*reply).label != TRONA_OK {
+                break;
+            }
+
+            let wrote = (*reply).regs[0];
+            if wrote == 0 {
+                break;
+            }
+
+            total += wrote;
+            if wrote < chunk {
+                break;
+            }
+        }
+
+        if (*reply).label == TRONA_OK || total > 0 {
+            let new_size = mount::mount_stat(mount_idx, remote_ino)
+                .map(|s| s.0)
+                .unwrap_or(old_size.max(file_offset + total));
+            crate::misc::sync_shared_mmap_after_write(
+                fde,
+                file_offset,
+                (client_shm + shm_offset) as *const u8,
+                total,
+                old_size,
+                new_size,
+            );
+            (*reply).label = TRONA_OK;
+            (*reply).regs[0] = total;
+            (*reply).length = 1;
+        }
     }
 }
 
