@@ -1135,6 +1135,32 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                                 _lb.hex((*region).mo_offset as u64);
                                 _lb.str(b"\n");
                             });
+                            let rc = (*client_ptr).region_count;
+                            if rc > 0 && rc <= 80 {
+                                let regs = (*client_ptr).regions;
+                                for ri in 0..rc {
+                                    let rd = &*regs.add(ri);
+                                    if rd.active {
+                                        besalt::uerror!(|_lb| {
+                                            _lb.str(b"  r");
+                                            _lb.hex(ri as u64);
+                                            _lb.str(b"=[");
+                                            _lb.hex(rd.base);
+                                            _lb.str(b",");
+                                            _lb.hex(rd.base + rd.length);
+                                            _lb.str(b") prot=");
+                                            _lb.hex(rd.prot as u64);
+                                            _lb.str(b" t=");
+                                            _lb.hex(rd.region_type as u64);
+                                            _lb.str(b" mo=");
+                                            _lb.hex(rd.mo_cap);
+                                            _lb.str(b" mo_off=");
+                                            _lb.hex(rd.mo_offset as u64);
+                                            _lb.str(b"\n");
+                                        });
+                                    }
+                                }
+                            }
                             skip_reply = true;
                             break 'fault;
                         }
@@ -1197,6 +1223,23 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                         _lb.hex(msg.label);
                         _lb.str(b" badge=");
                         _lb.hex(badge);
+                        if msg.label == 4 {
+                            _lb.str(b" vec=");
+                            _lb.hex(msg.regs[0]);
+                            _lb.str(b" err=");
+                            _lb.hex(msg.regs[1]);
+                            _lb.str(b" rip=");
+                            _lb.hex(msg.regs[2]);
+                            _lb.str(b" rsp=");
+                            _lb.hex(msg.regs[3]);
+                        } else if msg.label == 2 {
+                            _lb.str(b" fault_addr=");
+                            _lb.hex(msg.regs[0]);
+                            _lb.str(b" err=");
+                            _lb.hex(msg.regs[1]);
+                            _lb.str(b" rip=");
+                            _lb.hex(msg.regs[2]);
+                        }
                         _lb.str(b"\n");
                     });
                     // Fault labels (CapFault=1, UnknownSyscall=3, UserException=4)
