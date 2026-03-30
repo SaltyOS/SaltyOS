@@ -192,7 +192,7 @@ pub(crate) unsafe fn terminate_proc(idx: usize, sig: usize) -> bool {
 
 /// Deliver a signal to a single process by table index.
 /// Returns true if the signal was delivered (or ignored), false if target invalid.
-unsafe fn deliver_signal_to(ti: usize, sig: usize) -> bool {
+pub(crate) unsafe fn deliver_signal_to(ti: usize, sig: usize) -> bool {
     unsafe {
         if proctab(ti).state != PROC_RUNNING && proctab(ti).state != PROC_STOPPED {
             return false;

@@ -445,6 +445,8 @@ pub(crate) unsafe fn handle_fork(msg: &BesaltMsg, reply: &mut BesaltMsg, badge: 
         p.ready_ntfn = 0;
         p.wait_ready_on_resume = false;
         p.ready_timeout_ns = 0;
+        p.itimer_real_interval_ns = 0;
+        p.itimer_real_deadline_ns = 0;
         p.pgid = proctab(parent_idx).pgid;
         p.slot_base = slot_base;
         p.slot_count = slot_count;
