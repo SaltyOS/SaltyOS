@@ -54,7 +54,7 @@ static mut SERVICES: [ServiceEntry; MAX_SERVICES] = [ServiceEntry::zeroed(); MAX
 static mut SERVICE_COUNT: usize = 0;
 
 fn ipc_ctx() -> *mut IpcContext {
-    &raw mut besalt::__besalt_ipc_ctx
+    besalt::tls::current_ipc_ctx()
 }
 
 fn signal_ready() {

@@ -70,7 +70,7 @@ static mut QUEUE_USED_OFF: u64 = 0;
 static mut QUEUE_EVENT_IDX: bool = false;
 
 fn ipc_ctx() -> *mut IpcContext {
-    &raw mut besalt::__besalt_ipc_ctx
+    besalt::tls::current_ipc_ctx()
 }
 
 fn signal_ready() {
