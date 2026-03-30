@@ -307,6 +307,67 @@ unsafe fn build_vfs_path(
     }
 }
 
+pub(crate) unsafe fn derive_exec_path_for_badge(
+    name: &[u8],
+    name_len: usize,
+    client_badge: u64,
+    out: &mut [u8; super::proc_table::MAX_EXE_PATH_LEN],
+) -> usize {
+    unsafe {
+        let mut path_buf = [0u8; 256];
+        if let Some(path_len) = build_vfs_path(name, name_len, client_badge, &mut path_buf) {
+            let copy_len = core::cmp::min(path_len, out.len().saturating_sub(1));
+            for i in 0..copy_len {
+                out[i] = path_buf[i];
+            }
+            out[copy_len] = 0;
+            return copy_len;
+        }
+
+        if name_len == 0 || out.is_empty() {
+            return 0;
+        }
+
+        if name[0] == b'/' {
+            let copy_len = core::cmp::min(name_len, out.len().saturating_sub(1));
+            for i in 0..copy_len {
+                out[i] = name[i];
+            }
+            out[copy_len] = 0;
+            return copy_len;
+        }
+
+        let mut has_slash = false;
+        for i in 0..name_len {
+            if name[i] == b'/' {
+                has_slash = true;
+                break;
+            }
+        }
+
+        if !has_slash {
+            let prefix = b"/bin/";
+            let name_copy = core::cmp::min(name_len, out.len().saturating_sub(prefix.len() + 1));
+            for i in 0..prefix.len() {
+                out[i] = prefix[i];
+            }
+            for i in 0..name_copy {
+                out[prefix.len() + i] = name[i];
+            }
+            let total = prefix.len() + name_copy;
+            out[total] = 0;
+            return total;
+        }
+
+        let copy_len = core::cmp::min(name_len, out.len().saturating_sub(1));
+        for i in 0..copy_len {
+            out[i] = name[i];
+        }
+        out[copy_len] = 0;
+        copy_len
+    }
+}
+
 fn elf_page_align_down(v: u64) -> u64 {
     v & !0xFFFu64
 }

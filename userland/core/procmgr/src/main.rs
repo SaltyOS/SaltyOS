@@ -21,7 +21,8 @@ use trona::ipc;
 use trona::types::*;
 
 use proc_table::{
-    find_by_badge, find_by_pid, init_proctab, proctab, proctab_cap, MAX_NAME_LEN, PROC_FREE,
+    find_by_badge, find_by_pid, init_proctab, proctab, proctab_cap, MAX_EXE_PATH_LEN,
+    MAX_NAME_LEN, PROC_FREE,
 };
 
 // ---- Cap layout (set by init for this process) ----
@@ -74,6 +75,7 @@ const PM_UMASK: u64 = 30;
 const PM_REQUEST_UNTYPED: u64 = 31;
 const PM_SETITIMER: u64 = 32;
 const PM_GETITIMER: u64 = 33;
+const PM_GET_EXE_PATH: u64 = 34;
 const TRONA_PENDING: u64 = 0x80;
 
 const PM_SIGKILL: usize = 9;
@@ -434,6 +436,34 @@ unsafe fn handle_get_proc_info(msg: &TronaMsg, reply: &mut TronaMsg) {
     }
 }
 
+unsafe fn handle_get_exe_path(msg: &TronaMsg, reply: &mut TronaMsg) {
+    unsafe {
+        let pid = msg.regs[0] as u32;
+        let Some(idx) = proc_table::find_by_pid(pid) else {
+            reply.label = TRONA_NOT_FOUND;
+            return;
+        };
+
+        let p = &*proc_table::proctab(idx);
+        let mut exe_len = 0usize;
+        while exe_len < MAX_EXE_PATH_LEN && p.exe_path[exe_len] != 0 {
+            exe_len += 1;
+        }
+        if exe_len == 0 {
+            reply.label = TRONA_NOT_FOUND;
+            return;
+        }
+
+        reply.regs[0] = exe_len as u64;
+        let dst = &mut reply.regs[1] as *mut u64 as *mut u8;
+        for i in 0..exe_len {
+            *dst.add(i) = p.exe_path[i];
+        }
+        reply.label = TRONA_OK;
+        reply.length = 1 + ((exe_len as u64 + 7) / 8);
+    }
+}
+
 // ===========================================================================
 // handle_umask
 // ===========================================================================
@@ -725,6 +755,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     PM_GETSID_BADGE => session::handle_getsid_badge(&msg, &mut reply),
                     PM_LIST_PIDS => handle_list_pids(&mut reply),
                     PM_GET_PROC_INFO => handle_get_proc_info(&msg, &mut reply),
+                    PM_GET_EXE_PATH => handle_get_exe_path(&msg, &mut reply),
                     PM_UMASK => handle_umask(&msg, &mut reply, badge),
                     PM_REQUEST_UNTYPED => handle_request_untyped(&msg, &mut reply, &mut *(&raw mut ALLOCATOR)),
                     _ => {
