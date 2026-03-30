@@ -29,7 +29,7 @@ macro_rules! psci_call0 {
         // SAFETY: PSCI SMC call — standard firmware interface.
         unsafe {
             core::arch::asm!(
-                "smc #0",
+                ".inst 0xD4000003", // smc #0
                 inlateout("x0") $fn_id as u64 => result,
                 options(nomem, nostack),
             );
@@ -45,7 +45,7 @@ macro_rules! psci_call3 {
         // SAFETY: PSCI SMC call with arguments in x0-x3.
         unsafe {
             core::arch::asm!(
-                "smc #0",
+                ".inst 0xD4000003", // smc #0
                 inlateout("x0") $fn_id as u64 => result,
                 in("x1") $x1, in("x2") $x2, in("x3") $x3,
                 options(nomem, nostack),
