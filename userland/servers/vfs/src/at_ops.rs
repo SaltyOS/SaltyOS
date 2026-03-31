@@ -52,7 +52,7 @@ pub(crate) unsafe fn do_open(
                 && *p.add(4) == b'c'
                 && *p.add(5) == b'/'
             {
-                if handle_proc_open(path, path_len, reply, badge) {
+                if handle_proc_open(path, path_len, flags, true, reply, badge) {
                     return;
                 }
             }

@@ -545,6 +545,11 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             }
         }
 
+        let mut argv0_len = 0usize;
+        while argv0_len < exec_str_len && exec_str_data[argv0_len] != 0 {
+            argv0_len += 1;
+        }
+
         trona::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] EXEC PID=");
             _lb.hex(proctab(idx).pid as u64);
@@ -554,7 +559,11 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             _lb.hex(argc as u64);
             _lb.str(b" envc=");
             _lb.hex(envc as u64);
-            _lb.str(b"\n");
+            _lb.str(b" argv0='");
+            if argv0_len != 0 {
+                _lb.bytes(&exec_str_data[..argv0_len]);
+            }
+            _lb.str(b"'\n");
         });
         let initrd = super::INITRD_VADDR as *const u8;
         let initrd_size = super::read_boot_info_initrd_size();

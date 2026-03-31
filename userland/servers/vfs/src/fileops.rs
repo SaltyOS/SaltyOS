@@ -217,6 +217,108 @@ pub(crate) unsafe fn open_mount_inode(
     }
 }
 
+/// Open an already-existing absolute path, following symlinks and using the
+/// normal root-underlay fallback. This is used by procfs for symlink-like
+/// entries such as /proc/<pid>/exe.
+pub(crate) unsafe fn open_existing_path(
+    path_ptr: *const u8,
+    path_len: u8,
+    flags: u32,
+    reply: *mut TronaMsg,
+    badge: u64,
+) {
+    unsafe {
+        let inode = resolve_path(path_ptr, path_len);
+
+        if inode.is_null() {
+            if let Some((mi, rino)) = try_root_underlay(path_ptr, path_len) {
+                open_mount_inode(mi, rino, flags, reply, badge);
+                return;
+            }
+            (*reply).label = TRONA_NOT_FOUND;
+            return;
+        }
+
+        if (*inode).ftype == FTYPE_DIRECTORY {
+            if flags_allow_write(flags) || (flags & (O_TRUNC | O_APPEND)) != 0 {
+                (*reply).label = TRONA_INVALID_OPERATION;
+                return;
+            }
+        }
+
+        if (*inode).ftype == FTYPE_REGULAR {
+            if (*inode).readonly != 0
+                && (flags_allow_write(flags) || (flags & (O_TRUNC | O_APPEND)) != 0)
+            {
+                (*reply).label = TRONA_INVALID_OPERATION;
+                return;
+            }
+            if (flags & O_TRUNC) != 0 && flags_allow_write(flags) {
+                if !(*inode).rw_data.is_null() {
+                    chain_truncate((*inode).rw_data, 0);
+                }
+                (*inode).size = 0;
+            }
+        }
+
+        let cli = get_client(badge);
+        if cli.is_null() {
+            (*reply).label = TRONA_OUT_OF_MEMORY;
+            return;
+        }
+
+        for fd in 0..(*cli).fds_cap as usize {
+            if (*(*cli).fds.add(fd)).active == 0 {
+                (*(*cli).fds.add(fd)).active = 1;
+                (*(*cli).fds.add(fd)).inode = (*inode).ino;
+                (*(*cli).fds.add(fd)).offset = 0;
+                (*(*cli).fds.add(fd)).dir_cursor = 0;
+                (*(*cli).fds.add(fd)).flags = flags;
+
+                if (*inode).ftype == FTYPE_CHAR_DEVICE {
+                    (*(*cli).fds.add(fd)).fd_type = FD_TYPE_DEVICE;
+                    (*(*cli).fds.add(fd)).dev_type = (*inode).dev_type;
+                    if (*inode).dev_type == DEV_PTY_SLAVE {
+                        (*(*cli).fds.add(fd)).sock_id = (*inode).size as u32;
+                    }
+                } else if (*inode).ftype == FTYPE_DIRECTORY {
+                    (*(*cli).fds.add(fd)).fd_type = FD_TYPE_DIR;
+                } else if (*inode).ftype == FTYPE_FIFO {
+                    let pipe_id = (*inode).size as u32;
+                    let pipe = find_pipe(pipe_id);
+                    if pipe.is_null() {
+                        (*(*cli).fds.add(fd)).active = 0;
+                        (*reply).label = TRONA_INVALID_OPERATION;
+                        return;
+                    }
+                    (*(*cli).fds.add(fd)).fd_type = FD_TYPE_PIPE;
+                    (*(*cli).fds.add(fd)).sock_id = pipe_id;
+                    if flags_allow_write(flags) {
+                        (*(*cli).fds.add(fd)).flags = O_WRONLY;
+                        (*pipe).write_refcount += 1;
+                    } else {
+                        (*(*cli).fds.add(fd)).flags = 0;
+                        (*pipe).read_refcount += 1;
+                    }
+                } else {
+                    (*(*cli).fds.add(fd)).fd_type = FD_TYPE_FILE;
+                    if (flags & O_APPEND) != 0 {
+                        (*(*cli).fds.add(fd)).offset = (*inode).size;
+                    }
+                }
+
+                inode_open((*inode).ino);
+                (*reply).label = TRONA_OK;
+                (*reply).length = 1;
+                (*reply).regs[0] = fd as u64;
+                return;
+            }
+        }
+
+        (*reply).label = TRONA_OUT_OF_MEMORY;
+    }
+}
+
 pub(crate) unsafe fn handle_open(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let mut path = [0u8; MAX_PATH_LEN];
@@ -246,7 +348,7 @@ pub(crate) unsafe fn handle_open(msg: *const TronaMsg, reply: *mut TronaMsg, bad
             && *path_ptr.add(4) == b'c'
             && *path_ptr.add(5) == b'/'
         {
-            if handle_proc_open(path_ptr, path_len, reply, badge) {
+            if handle_proc_open(path_ptr, path_len, flags, true, reply, badge) {
                 return;
             }
         }
@@ -1701,7 +1803,7 @@ pub(crate) unsafe fn handle_opendir(msg: *const TronaMsg, reply: *mut TronaMsg, 
             && *path_ptr.add(4) == b'c'
             && *path_ptr.add(5) == b'/'
         {
-            if handle_proc_open(path_ptr, path_len, reply, badge) {
+            if handle_proc_open(path_ptr, path_len, 0, false, reply, badge) {
                 return;
             }
         }

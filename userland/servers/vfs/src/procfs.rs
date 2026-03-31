@@ -7,6 +7,7 @@ use trona::types::*;
 
 use crate::client::{get_client, get_client_noalloc};
 use crate::consts::*;
+use crate::fileops::open_existing_path;
 use crate::ipc_ctx;
 use crate::ramfs::{alloc_inode, inode_by_ino, inode_open};
 use crate::types::*;
@@ -399,17 +400,40 @@ unsafe fn proc_get_exe_path(pid: u32, exe_path: &mut [u8; MAX_PATH_LEN]) -> Opti
             &raw mut reply,
         );
         if err != 0 || reply.label != TRONA_OK {
+            trona::udebug!(|_lb| {
+                _lb.str(b"[VFS] proc_get_exe_path pid=");
+                _lb.hex(pid as u64);
+                _lb.str(b" err=");
+                _lb.hex(err as u64);
+                _lb.str(b" label=");
+                _lb.hex(reply.label);
+                _lb.str(b"\n");
+            });
             return None;
         }
 
         let path_len = reply.regs[0] as usize;
         if path_len == 0 || path_len > exe_path.len() {
+            trona::udebug!(|_lb| {
+                _lb.str(b"[VFS] proc_get_exe_path pid=");
+                _lb.hex(pid as u64);
+                _lb.str(b" invalid-len=");
+                _lb.hex(path_len as u64);
+                _lb.str(b"\n");
+            });
             return None;
         }
         let src = &reply.regs[1] as *const u64 as *const u8;
         for i in 0..path_len {
             exe_path[i] = *src.add(i);
         }
+        trona::udebug!(|_lb| {
+            _lb.str(b"[VFS] proc_get_exe_path pid=");
+            _lb.hex(pid as u64);
+            _lb.str(b" -> '");
+            _lb.bytes(&exe_path[..path_len]);
+            _lb.str(b"'\n");
+        });
         Some(path_len)
     }
 }
@@ -702,6 +726,8 @@ unsafe fn proc_gen_stat(pid: u32, buf: *mut u8, buf_size: usize) -> usize {
 pub(crate) unsafe fn handle_proc_open(
     path: *const u8,
     path_len: u8,
+    flags: u32,
+    follow_exe_target: bool,
     reply: *mut TronaMsg,
     badge: u64,
 ) -> bool {
@@ -830,6 +856,26 @@ pub(crate) unsafe fn handle_proc_open(
             PROC_FILE_STAT
         } else if file_name_len == 4 && mem_eq(file_name, b"maps".as_ptr(), 4) {
             PROC_FILE_MAPS
+        } else if file_name_len == 3 && mem_eq(file_name, b"exe".as_ptr(), 3) {
+            if !follow_exe_target {
+                (*reply).label = TRONA_NOT_FOUND;
+                return true;
+            }
+
+            let mut exe_path = [0u8; MAX_PATH_LEN];
+            let Some(exe_len) = proc_get_exe_path(pid, &mut exe_path) else {
+                (*reply).label = TRONA_NOT_FOUND;
+                return true;
+            };
+
+            open_existing_path(
+                exe_path.as_ptr(),
+                exe_len as u8,
+                flags & !(O_CREAT | O_EXCL),
+                reply,
+                badge,
+            );
+            return true;
         } else {
             (*reply).label = TRONA_NOT_FOUND;
             return true;
@@ -978,6 +1024,14 @@ pub(crate) unsafe fn handle_proc_stat(
             return true;
         }
 
+        if is_exe {
+            trona::udebug!(|_lb| {
+                _lb.str(b"[VFS] stat /proc/");
+                _lb.hex(pid as u64);
+                _lb.str(b"/exe\n");
+            });
+        }
+
         // Regular file stat
         (*reply).label = TRONA_OK;
         (*reply).length = 8;
@@ -1045,6 +1099,12 @@ pub(crate) unsafe fn handle_proc_readlink(
         if file_name_len != 3 || !mem_eq(file_name, b"exe".as_ptr(), 3) {
             return false;
         }
+
+        trona::udebug!(|_lb| {
+            _lb.str(b"[VFS] readlink /proc/");
+            _lb.hex(pid as u64);
+            _lb.str(b"/exe\n");
+        });
 
         let mut exe_path = [0u8; MAX_PATH_LEN];
         let Some(exe_len) = proc_get_exe_path(pid, &mut exe_path) else {

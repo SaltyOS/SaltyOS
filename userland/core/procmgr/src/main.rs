@@ -440,6 +440,11 @@ unsafe fn handle_get_exe_path(msg: &TronaMsg, reply: &mut TronaMsg) {
     unsafe {
         let pid = msg.regs[0] as u32;
         let Some(idx) = proc_table::find_by_pid(pid) else {
+            trona::udebug!(|_lb| {
+                _lb.str(b"[PROCMGR] GET_EXE_PATH pid=");
+                _lb.hex(pid as u64);
+                _lb.str(b" -> not found\n");
+            });
             reply.label = TRONA_NOT_FOUND;
             return;
         };
@@ -450,9 +455,22 @@ unsafe fn handle_get_exe_path(msg: &TronaMsg, reply: &mut TronaMsg) {
             exe_len += 1;
         }
         if exe_len == 0 {
+            trona::udebug!(|_lb| {
+                _lb.str(b"[PROCMGR] GET_EXE_PATH pid=");
+                _lb.hex(pid as u64);
+                _lb.str(b" -> empty\n");
+            });
             reply.label = TRONA_NOT_FOUND;
             return;
         }
+
+        trona::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] GET_EXE_PATH pid=");
+            _lb.hex(pid as u64);
+            _lb.str(b" -> '");
+            _lb.bytes(&p.exe_path[..exe_len]);
+            _lb.str(b"'\n");
+        });
 
         reply.regs[0] = exe_len as u64;
         let dst = &mut reply.regs[1] as *mut u64 as *mut u8;
