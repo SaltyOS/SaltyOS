@@ -54,8 +54,11 @@ pub fn run() -> bool {
 
     trona::trona_yield();
 
-    let dispatched = unsafe { signals::posix_sigcheck() };
-    if dispatched == 0 || unsafe { G_SIGUSR1_COUNT } == 0 {
+    // The handler may have already been called by the kernel's signal
+    // frame injection (EINTR path) during the kill IPC itself. Poll for
+    // any remaining pending signals just in case.
+    unsafe { signals::posix_sigcheck() };
+    if unsafe { G_SIGUSR1_COUNT } == 0 {
         puts(b"[TEST_SIGNAL] FAIL: SIGUSR1 handler not called\n");
         return false;
     }

@@ -219,16 +219,21 @@ pub(crate) unsafe fn handle_exit(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             wake.regs[1] = proctab(idx).pid as u64;
 
             let waiter_cap = proctab(idx).waiter_reply;
-            trona::ipc::send_ctx(super::ipc_ctx(), waiter_cap, &raw const wake);
+            let send_err = trona::ipc::send_ctx(super::ipc_ctx(), waiter_cap, &raw const wake);
             trona::invoke::cnode_delete(super::CAP_SELF_CSPACE, waiter_cap);
             (&mut *(&raw mut super::ALLOCATOR)).free_single_slot(waiter_cap);
             proctab(idx).waiter_reply = 0;
             proctab(idx).waiter_pid = 0;
-            free_proc_alloc_slots(idx);
-            cleanup_proc_resources(idx, super::CAP_SELF_CSPACE);
-            if should_respawn {
-                respawn_process(&saved_binary);
+            if send_err == 0 {
+                // Reply delivered — safe to reap zombie
+                free_proc_alloc_slots(idx);
+                cleanup_proc_resources(idx, super::CAP_SELF_CSPACE);
+                if should_respawn {
+                    respawn_process(&saved_binary);
+                }
             }
+            // send_err != 0: waiter was interrupted (EINTR). Leave zombie
+            // in PROC_ZOMBIE so the parent's next PM_WAIT finds it.
             return;
         }
 
@@ -251,14 +256,19 @@ pub(crate) unsafe fn handle_exit(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
                 wake.regs[1] = proctab(idx).pid as u64;
 
                 let waiter_cap = proctab(pi).any_waiter_reply;
-                trona::ipc::send_ctx(super::ipc_ctx(), waiter_cap, &raw const wake);
+                let send_err = trona::ipc::send_ctx(super::ipc_ctx(), waiter_cap, &raw const wake);
                 trona::invoke::cnode_delete(super::CAP_SELF_CSPACE, waiter_cap);
                 (&mut *(&raw mut super::ALLOCATOR)).free_single_slot(waiter_cap);
                 proctab(pi).any_waiter_reply = 0;
                 proctab(pi).waiting_for_any = 0;
-                free_proc_alloc_slots(idx);
-                cleanup_proc_resources(idx, super::CAP_SELF_CSPACE);
-                reaped = true;
+                if send_err == 0 {
+                    // Reply delivered — safe to reap zombie
+                    free_proc_alloc_slots(idx);
+                    cleanup_proc_resources(idx, super::CAP_SELF_CSPACE);
+                    reaped = true;
+                }
+                // send_err != 0: waiter was interrupted (EINTR). Leave zombie
+                // in PROC_ZOMBIE so the parent's next PM_WAIT finds it.
             }
         }
 

@@ -219,6 +219,10 @@ pub struct Tcb {
     pub fault_handler_badge: u64,
     /// Bound notification for combined IPC wait
     pub bound_notification: *mut u8,
+    /// User-mode signal dispatcher entry point (0 = not registered).
+    /// When non-zero, the kernel injects a signal frame on the user stack
+    /// and redirects control here instead of returning EINTR directly.
+    pub signal_dispatcher: u64,
     /// Kernel stack top for syscall entry (per-thread kernel stack)
     pub kernel_stack_top: u64,
     /// Per-thread stack canary (verified at syscall exit against %gs:40).
@@ -446,6 +450,7 @@ impl Tcb {
             fault_handler: core::ptr::null_mut(),
             fault_handler_badge: 0,
             bound_notification: core::ptr::null_mut(),
+            signal_dispatcher: 0,
             kernel_stack_top: 0,
             stack_canary: 0,
             user_stack_top: 0,
@@ -500,6 +505,7 @@ impl Tcb {
         self.vspace_wait_next = core::ptr::null_mut();
         self.invoke_depth0 = 0;
         self.invoke_depth1 = 0;
+        self.signal_dispatcher = 0;
 
         // If we have a reply capability, wake the blocked caller
         // This handles the case where a server dies before replying

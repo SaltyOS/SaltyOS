@@ -119,6 +119,71 @@ impl Notification {
                 get_scheduler().enqueue(waiter);
             } else if !self.bound_tcb.is_null() {
                 let tcb = self.bound_tcb;
+
+                // ReplyWait / CallSendBlocked: only interrupt a blocking
+                // Call if the thread has opted into signal delivery by
+                // registering a signal dispatcher. Servers that use bound
+                // notifications for other purposes (IRQ, ring buffers)
+                // must NOT have their outgoing Calls interrupted.
+                if (*tcb).signal_dispatcher != 0 {
+                    // ReplyWait: thread is waiting for a server reply after Call.
+                    // Not in any endpoint queue; blocked_endpoint is null.
+                    // Must check BEFORE the blocked_endpoint null guard.
+                    if (*tcb).state == ThreadState::Blocked
+                        && matches!(
+                            (*tcb).blocked_reason,
+                            Some(BlockedReason::ReplyWait { .. })
+                        )
+                    {
+                        // Revert PIP donation (caller→server). The server's
+                        // reply_recv will see caller_replyable == false and
+                        // silently drop the reply.
+                        crate::sched::pip::pip_cleanup(tcb);
+                        (*tcb).woken_by_notification = true;
+                        (*tcb).blocked_reason = None;
+                        (*tcb).state = ThreadState::Ready;
+                        self.ntfn_unlock();
+                        get_scheduler().enqueue(tcb);
+                        return;
+                    }
+
+                    // CallSendBlocked: thread is in the endpoint send queue
+                    // waiting for a receiver. Has blocked_endpoint set.
+                    if (*tcb).state == ThreadState::Blocked
+                        && matches!(
+                            (*tcb).blocked_reason,
+                            Some(BlockedReason::CallSendBlocked { .. })
+                        )
+                    {
+                        let ep_ptr = (*tcb).blocked_endpoint;
+                        if !ep_ptr.is_null() {
+                            // Release ntfn_lock before ep_lock (lock ordering).
+                            self.ntfn_unlock();
+                            let ep = &mut *(ep_ptr as *mut super::Endpoint);
+                            ep.ep_lock();
+                            // Re-validate after lock gap (TOCTOU).
+                            if (*tcb).state == ThreadState::Blocked
+                                && matches!(
+                                    (*tcb).blocked_reason,
+                                    Some(BlockedReason::CallSendBlocked { .. })
+                                )
+                                && (*tcb).blocked_endpoint == ep_ptr
+                            {
+                                ep.remove_from_queue(tcb);
+                                (*tcb).blocked_endpoint = core::ptr::null_mut();
+                                (*tcb).woken_by_notification = true;
+                                (*tcb).blocked_reason = None;
+                                (*tcb).state = ThreadState::Ready;
+                                ep.ep_unlock();
+                                get_scheduler().enqueue(tcb);
+                            } else {
+                                ep.ep_unlock();
+                            }
+                            return;
+                        }
+                    }
+                }
+
                 let ep_ptr = (*tcb).blocked_endpoint;
                 if ep_ptr.is_null() {
                     // TCB not blocked on endpoint — bits stay in ntfn for the
