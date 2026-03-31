@@ -55,6 +55,18 @@ static mut LOGGED_INET_OPS: u8 = 0;
 static mut LOGGED_INET_CALLBACKS: u8 = 0;
 static mut LOGGED_INET_RECV_RESULTS: u8 = 0;
 
+unsafe fn has_pending_capacity() -> bool {
+    unsafe {
+        let table = &raw const PENDING_INET;
+        for i in 0..MAX_PENDING_INET {
+            if (*table)[i].active == 0 {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 unsafe fn alloc_pending(
     conn_id: u32,
     op_type: u8,
@@ -187,8 +199,6 @@ unsafe fn find_inet_fd_by_conn(badge: u64, conn_id: u32) -> Option<i32> {
     }
 }
 
-// ======================================================================
-// Initialization
 // ======================================================================
 
 /// Ensure VFS has registered its callback EP with netsrv.
@@ -535,6 +545,11 @@ pub(crate) unsafe fn handle_inet_accept(
                 return false;
             }
 
+            if !has_pending_capacity() {
+                (*reply).label = TRONA_OUT_OF_MEMORY;
+                return false;
+            }
+
             let client_slot = alloc_reply_slot();
             let err = invoke::cnode_save_caller(CAP_SELF_CSPACE, client_slot);
             if err != 0 {
@@ -542,12 +557,55 @@ pub(crate) unsafe fn handle_inet_accept(
                 return false;
             }
 
-            // No pending connections — wait for callback
-            if !alloc_pending(conn_id, INET_OP_ACCEPT, client_slot, badge) {
+            let mut wait_req = TronaMsg::zeroed();
+            wait_req.label = NET_ACCEPT_WAIT;
+            wait_req.regs[0] = conn_id as u64;
+            wait_req.length = 1;
+            let mut wait_resp = TronaMsg::zeroed();
+            let wait_err = ipc::call_ctx(
+                ipc_ctx(),
+                VFS_CAP_NETSRV_EP,
+                &raw const wait_req,
+                &raw mut wait_resp,
+            );
+
+            if wait_err != 0 {
                 let mut client_reply = TronaMsg::zeroed();
-                client_reply.label = TRONA_OUT_OF_MEMORY;
+                client_reply.label = TRONA_INVALID_OPERATION;
                 ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
+                return true;
             }
+
+            if wait_resp.label == TRONA_PENDING {
+                if !alloc_pending(conn_id, INET_OP_ACCEPT, client_slot, badge) {
+                    let mut client_reply = TronaMsg::zeroed();
+                    client_reply.label = TRONA_OUT_OF_MEMORY;
+                    ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
+                }
+                return true;
+            }
+
+            let mut client_reply = TronaMsg::zeroed();
+            if wait_resp.label == TRONA_OK {
+                let new_conn_id = wait_resp.regs[0] as u32;
+                let remote_ip = wait_resp.regs[1] as u32;
+                let remote_port = wait_resp.regs[2] as u16;
+                match alloc_inet_fd(badge, new_conn_id) {
+                    Some(new_fd) => {
+                        client_reply.label = TRONA_OK;
+                        client_reply.regs[0] = new_fd as u64;
+                        client_reply.regs[1] = remote_ip as u64;
+                        client_reply.regs[2] = remote_port as u64;
+                        client_reply.length = 3;
+                    }
+                    None => {
+                        client_reply.label = TRONA_OUT_OF_MEMORY;
+                    }
+                }
+            } else {
+                client_reply.label = wait_resp.label;
+            }
+            ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
             true
         } else if resp.label == TRONA_OK {
             // Connection already queued — allocate new fd
@@ -658,6 +716,11 @@ pub(crate) unsafe fn handle_inet_read(
                 return false;
             }
 
+            if !has_pending_capacity() {
+                (*reply).label = TRONA_OUT_OF_MEMORY;
+                return false;
+            }
+
             let client_slot = alloc_reply_slot();
             let err = invoke::cnode_save_caller(CAP_SELF_CSPACE, client_slot);
             if err != 0 {
@@ -665,12 +728,36 @@ pub(crate) unsafe fn handle_inet_read(
                 return false;
             }
 
-            // No data yet — record pending
-            if !alloc_pending(conn_id, INET_OP_RECV, client_slot, badge) {
+            let mut wait_req = TronaMsg::zeroed();
+            wait_req.label = NET_RECV_WAIT;
+            wait_req.regs[0] = conn_id as u64;
+            wait_req.regs[1] = capped as u64;
+            wait_req.length = 2;
+            let mut wait_resp = TronaMsg::zeroed();
+            let wait_err = ipc::call_ctx(
+                ipc_ctx(),
+                VFS_CAP_NETSRV_EP,
+                &raw const wait_req,
+                &raw mut wait_resp,
+            );
+
+            if wait_err != 0 {
                 let mut client_reply = TronaMsg::zeroed();
-                client_reply.label = TRONA_OUT_OF_MEMORY;
+                client_reply.label = TRONA_INVALID_OPERATION;
                 ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
+                return true;
             }
+
+            if wait_resp.label == TRONA_PENDING {
+                if !alloc_pending(conn_id, INET_OP_RECV, client_slot, badge) {
+                    let mut client_reply = TronaMsg::zeroed();
+                    client_reply.label = TRONA_OUT_OF_MEMORY;
+                    ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
+                }
+                return true;
+            }
+
+            ipc::send_ctx(ipc_ctx(), client_slot, &raw const wait_resp);
             true
         } else {
             // Data available immediately
@@ -807,6 +894,11 @@ pub(crate) unsafe fn handle_inet_recvfrom(
                 return false;
             }
 
+            if !has_pending_capacity() {
+                (*reply).label = TRONA_OUT_OF_MEMORY;
+                return false;
+            }
+
             let client_slot = alloc_reply_slot();
             let err = invoke::cnode_save_caller(CAP_SELF_CSPACE, client_slot);
             if err != 0 {
@@ -814,11 +906,37 @@ pub(crate) unsafe fn handle_inet_recvfrom(
                 return false;
             }
 
-            if !alloc_pending(conn_id, INET_OP_RECVFROM, client_slot, badge) {
+            let mut wait_req = TronaMsg::zeroed();
+            wait_req.label = NET_RECVFROM_WAIT;
+            wait_req.regs[0] = conn_id as u64;
+            wait_req.regs[1] = capped as u64;
+            wait_req.regs[2] = (*msg).regs[2];
+            wait_req.length = 3;
+            let mut wait_resp = TronaMsg::zeroed();
+            let wait_err = ipc::call_ctx(
+                ipc_ctx(),
+                VFS_CAP_NETSRV_EP,
+                &raw const wait_req,
+                &raw mut wait_resp,
+            );
+
+            if wait_err != 0 {
                 let mut client_reply = TronaMsg::zeroed();
-                client_reply.label = TRONA_OUT_OF_MEMORY;
+                client_reply.label = TRONA_INVALID_OPERATION;
                 ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
+                return true;
             }
+
+            if wait_resp.label == TRONA_PENDING {
+                if !alloc_pending(conn_id, INET_OP_RECVFROM, client_slot, badge) {
+                    let mut client_reply = TronaMsg::zeroed();
+                    client_reply.label = TRONA_OUT_OF_MEMORY;
+                    ipc::send_ctx(ipc_ctx(), client_slot, &raw const client_reply);
+                }
+                return true;
+            }
+
+            ipc::send_ctx(ipc_ctx(), client_slot, &raw const wait_resp);
             true
         } else {
             // Data available

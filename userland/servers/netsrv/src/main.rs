@@ -730,6 +730,136 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
         }
     }
 
+    fn handle_net_accept(reply: &mut TronaMsg, conn_id: u32, arm_pending: bool) {
+        match socket_kind(conn_id) {
+            SocketKind::Tcp => {
+                let result = net::socket::tcp::tcp_accept(conn_id);
+                if result == -1 {
+                    if arm_pending {
+                        net::socket::tcp::set_pending_accept(conn_id);
+                    }
+                    reply.label = TRONA_PENDING;
+                } else if result > 0 {
+                    let new_cid = result as u32;
+                    match net::socket::tcp::tcp_getpeername(new_cid) {
+                        Ok((ip, port)) => {
+                            reply.label = TRONA_OK;
+                            reply.regs[0] = new_cid as u64;
+                            reply.regs[1] = ip as u64;
+                            reply.regs[2] = port as u64;
+                            reply.length = 3;
+                        }
+                        Err(label) => {
+                            reply.label = label;
+                        }
+                    }
+                } else {
+                    reply.label = TRONA_INVALID_ARGUMENT;
+                }
+            }
+            _ => {
+                reply.label = TRONA_INVALID_OPERATION;
+            }
+        }
+    }
+
+    fn handle_net_recv(reply: &mut TronaMsg, conn_id: u32, max_len: u16, arm_pending: bool) {
+        let capped = core::cmp::min(max_len, 152) as usize;
+        let buf = unsafe {
+            let dst = &raw mut reply.regs[1] as *mut u8;
+            core::slice::from_raw_parts_mut(dst, capped)
+        };
+        let kind = socket_kind(conn_id);
+        let result = match kind {
+            SocketKind::Raw => net::socket::raw_ipv4::raw_recv(conn_id, buf),
+            SocketKind::Udp => net::socket::udp::udp_recv(conn_id, buf),
+            SocketKind::Tcp => net::socket::tcp::tcp_recv(conn_id, buf),
+        };
+        if result == -1 {
+            if arm_pending {
+                match kind {
+                    SocketKind::Raw => {
+                        net::socket::raw_ipv4::set_pending_recv(conn_id, capped as u16);
+                    }
+                    SocketKind::Udp => {
+                        net::socket::udp::set_pending_recv(conn_id, capped as u16);
+                    }
+                    SocketKind::Tcp => {
+                        net::socket::tcp::set_pending_recv(conn_id, capped as u16);
+                    }
+                }
+            }
+            reply.label = TRONA_PENDING;
+        } else {
+            reply.label = TRONA_OK;
+            reply.regs[0] = result as u64;
+            reply.length = 1 + ((result as u64 + 7) / 8);
+        }
+    }
+
+    fn handle_net_recvfrom(
+        reply: &mut TronaMsg,
+        conn_id: u32,
+        max_len: u16,
+        flags: u32,
+        arm_pending: bool,
+    ) {
+        let want_timestamp = (flags & INET_RECVMSG_WANT_TIMESTAMP) != 0;
+        let capped = core::cmp::min(max_len, 128) as usize;
+        log_inet_ipc(b"recvfrom", conn_id, 0, 0, capped);
+        let buf = unsafe {
+            let dst = &raw mut reply.regs[4] as *mut u8;
+            core::slice::from_raw_parts_mut(dst, capped)
+        };
+        match socket_kind(conn_id) {
+            SocketKind::Raw => {
+                let (result, src_ip, src_port, timestamp_ns) =
+                    net::socket::raw_ipv4::raw_recvfrom(conn_id, buf, want_timestamp);
+                if result == -1 {
+                    if arm_pending {
+                        net::socket::raw_ipv4::set_pending_recvfrom(conn_id, capped as u16, flags);
+                    }
+                    reply.label = TRONA_PENDING;
+                } else {
+                    let data_len = result as usize;
+                    reply.label = TRONA_OK;
+                    reply.regs[0] = result as u64;
+                    reply.regs[1] = src_ip as u64;
+                    reply.regs[2] = src_port as u64;
+                    reply.regs[3] = timestamp_ns;
+                    reply.length = 4 + (((result as u64) + 7) / 8);
+                    log_inet_recv_result(
+                        b"recvfrom",
+                        conn_id,
+                        src_ip,
+                        data_len,
+                        &buf[..data_len],
+                    );
+                }
+            }
+            SocketKind::Udp => {
+                let (result, src_ip, src_port, timestamp_ns) =
+                    net::socket::udp::udp_recvfrom(conn_id, buf, want_timestamp);
+                if result == -1 {
+                    if arm_pending {
+                        net::socket::udp::set_pending_recvfrom(conn_id, capped as u16, flags);
+                    }
+                    reply.label = TRONA_PENDING;
+                } else {
+                    reply.label = TRONA_OK;
+                    reply.regs[0] = result as u64;
+                    reply.regs[1] = src_ip as u64;
+                    reply.regs[2] = src_port as u64;
+                    reply.regs[3] = timestamp_ns;
+                    reply.length = 4 + ((result as u64 + 7) / 8);
+                }
+            }
+            SocketKind::Tcp => {
+                reply.label = TRONA_INVALID_OPERATION;
+            }
+        }
+    }
+
     match msg.label {
         NET_REGISTER_VFS => {
             // VFS transfers a plain, IPC-transferable endpoint cap. Rebadge it
@@ -861,36 +991,7 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
         }
         NET_ACCEPT => {
             let conn_id = msg.regs[0] as u32;
-            match socket_kind(conn_id) {
-                SocketKind::Tcp => {
-                    let result = net::socket::tcp::tcp_accept(conn_id);
-                    if result == -1 {
-                        // No pending connections -- tell VFS this is async
-                        net::socket::tcp::set_pending_accept(conn_id);
-                        reply.label = TRONA_PENDING;
-                    } else if result > 0 {
-                        // Connection already in backlog, completed immediately
-                        let new_cid = result as u32;
-                        match net::socket::tcp::tcp_getpeername(new_cid) {
-                            Ok((ip, port)) => {
-                                reply.label = TRONA_OK;
-                                reply.regs[0] = new_cid as u64;
-                                reply.regs[1] = ip as u64;
-                                reply.regs[2] = port as u64;
-                                reply.length = 3;
-                            }
-                            Err(label) => {
-                                reply.label = label;
-                            }
-                        }
-                    } else {
-                        reply.label = TRONA_INVALID_ARGUMENT;
-                    }
-                }
-                _ => {
-                    reply.label = TRONA_INVALID_OPERATION;
-                }
-            }
+            handle_net_accept(reply, conn_id, false);
         }
         NET_SEND => {
             let conn_id = msg.regs[0] as u32;
@@ -912,35 +1013,7 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
         NET_RECV => {
             let conn_id = msg.regs[0] as u32;
             let max_len = msg.regs[1] as u16;
-            let capped = core::cmp::min(max_len, 152) as usize;
-            // SAFETY: Writing data into reply register area.
-            let buf = unsafe {
-                let dst = &raw mut reply.regs[1] as *mut u8;
-                core::slice::from_raw_parts_mut(dst, capped)
-            };
-            let result = match socket_kind(conn_id) {
-                SocketKind::Raw => net::socket::raw_ipv4::raw_recv(conn_id, buf),
-                SocketKind::Udp => net::socket::udp::udp_recv(conn_id, buf),
-                SocketKind::Tcp => net::socket::tcp::tcp_recv(conn_id, buf),
-            };
-            if result == -1 {
-                match socket_kind(conn_id) {
-                    SocketKind::Raw => {
-                        net::socket::raw_ipv4::set_pending_recv(conn_id, capped as u16);
-                    }
-                    SocketKind::Udp => {
-                        net::socket::udp::set_pending_recv(conn_id, capped as u16);
-                    }
-                    SocketKind::Tcp => {
-                        net::socket::tcp::set_pending_recv(conn_id, capped as u16);
-                    }
-                }
-                reply.label = TRONA_PENDING;
-            } else {
-                reply.label = TRONA_OK;
-                reply.regs[0] = result as u64;
-                reply.length = 1 + ((result as u64 + 7) / 8);
-            }
+            handle_net_recv(reply, conn_id, max_len, false);
         }
         NET_SENDTO => {
             let conn_id = msg.regs[0] as u32;
@@ -969,61 +1042,26 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
             } else {
                 INET_RECVMSG_WANT_ADDR
             };
-            let want_timestamp = (flags & INET_RECVMSG_WANT_TIMESTAMP) != 0;
-            let capped = core::cmp::min(max_len, 128) as usize;
-            log_inet_ipc(b"recvfrom", conn_id, 0, 0, capped);
-            // SAFETY: Writing data into reply register area.
-            let buf = unsafe {
-                let dst = &raw mut reply.regs[4] as *mut u8;
-                core::slice::from_raw_parts_mut(dst, capped)
+            handle_net_recvfrom(reply, conn_id, max_len, flags, false);
+        }
+        NET_RECV_WAIT => {
+            let conn_id = msg.regs[0] as u32;
+            let max_len = msg.regs[1] as u16;
+            handle_net_recv(reply, conn_id, max_len, true);
+        }
+        NET_ACCEPT_WAIT => {
+            let conn_id = msg.regs[0] as u32;
+            handle_net_accept(reply, conn_id, true);
+        }
+        NET_RECVFROM_WAIT => {
+            let conn_id = msg.regs[0] as u32;
+            let max_len = msg.regs[1] as u16;
+            let flags = if msg.length >= 3 {
+                msg.regs[2] as u32
+            } else {
+                INET_RECVMSG_WANT_ADDR
             };
-            match socket_kind(conn_id) {
-                SocketKind::Raw => {
-                    let (result, src_ip, src_port, timestamp_ns) =
-                        net::socket::raw_ipv4::raw_recvfrom(conn_id, buf, want_timestamp);
-                    if result == -1 {
-                        net::socket::raw_ipv4::set_pending_recvfrom(
-                            conn_id,
-                            capped as u16,
-                            flags,
-                        );
-                        reply.label = TRONA_PENDING;
-                    } else {
-                        let data_len = result as usize;
-                        reply.label = TRONA_OK;
-                        reply.regs[0] = result as u64;
-                        reply.regs[1] = src_ip as u64;
-                        reply.regs[2] = src_port as u64;
-                        reply.regs[3] = timestamp_ns;
-                        reply.length = 4 + (((result as u64) + 7) / 8);
-                        log_inet_recv_result(
-                            b"recvfrom",
-                            conn_id,
-                            src_ip,
-                            data_len,
-                            &buf[..data_len],
-                        );
-                    }
-                }
-                SocketKind::Udp => {
-                    let (result, src_ip, src_port, timestamp_ns) =
-                        net::socket::udp::udp_recvfrom(conn_id, buf, want_timestamp);
-                    if result == -1 {
-                        net::socket::udp::set_pending_recvfrom(conn_id, capped as u16, flags);
-                        reply.label = TRONA_PENDING;
-                    } else {
-                        reply.label = TRONA_OK;
-                        reply.regs[0] = result as u64;
-                        reply.regs[1] = src_ip as u64;
-                        reply.regs[2] = src_port as u64;
-                        reply.regs[3] = timestamp_ns;
-                        reply.length = 4 + ((result as u64 + 7) / 8);
-                    }
-                }
-                SocketKind::Tcp => {
-                    reply.label = TRONA_INVALID_OPERATION;
-                }
-            }
+            handle_net_recvfrom(reply, conn_id, max_len, flags, true);
         }
         NET_CLOSE => {
             let conn_id = msg.regs[0] as u32;
