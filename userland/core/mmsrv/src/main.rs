@@ -429,6 +429,8 @@ fn signal_ready() {
 
 /// Cached procmgr endpoint cap (resolved lazily via nameserv lookup).
 static mut PROCMGR_EP: Cap = 0;
+/// Cached VFS endpoint cap (resolved lazily via nameserv lookup).
+static mut VFS_EP: Cap = 0;
 
 /// Look up the procmgr endpoint via nameserv and cache it.
 /// Returns the cap slot, or 0 on failure.
@@ -480,6 +482,50 @@ unsafe fn resolve_procmgr_ep() -> Cap {
         *(&raw mut PROCMGR_EP) = ep_slot;
         trona::udebug!(|_lb| {
             _lb.str(b"[MMSRV] Resolved procmgr EP via nameserv\n");
+        });
+        ep_slot
+    }
+}
+
+/// Look up the VFS endpoint via nameserv and cache it.
+/// Returns the cap slot, or 0 on failure.
+pub(crate) unsafe fn resolve_vfs_ep() -> Cap {
+    unsafe {
+        let cached = *(&raw const VFS_EP);
+        if cached != 0 {
+            return cached;
+        }
+
+        let ep_slot = match recycled_slot_alloc() {
+            Some(s) => s,
+            None => return 0,
+        };
+
+        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, ep_slot, 0);
+
+        let name = b"vfs";
+        let mut msg = TronaMsg::zeroed();
+        msg.label = POSIX_NS_LOOKUP;
+        msg.regs[0] = name.len() as u64;
+        msg.length = 1 + (name.len() as u64 + 7) / 8;
+        let dst = &raw mut msg.regs[1] as *mut u8;
+        for i in 0..name.len() {
+            core::ptr::write(dst.add(i), name[i]);
+        }
+
+        let mut reply = TronaMsg::zeroed();
+        let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV, &raw const msg, &raw mut reply);
+        if err != 0 || reply.label != TRONA_OK {
+            recycle_empty_slot(ep_slot);
+            trona::uerror!(|_lb| {
+                _lb.str(b"[MMSRV] vfs lookup via nameserv failed\n");
+            });
+            return 0;
+        }
+
+        *(&raw mut VFS_EP) = ep_slot;
+        trona::udebug!(|_lb| {
+            _lb.str(b"[MMSRV] Resolved vfs EP via nameserv\n");
         });
         ep_slot
     }
@@ -1011,6 +1057,8 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 MM_GET_CLIENT_STATS => client::handle_mm_get_client_stats(&raw const msg, badge, &raw mut reply),
                 MM_ALLOC_OBJECT => mmap::handle_mm_alloc_object(&raw const msg, badge, &raw mut reply),
                 MM_REGISTER_SHARED_REGION => mmap::handle_mm_register_shared_region(&raw const msg, badge, &raw mut reply),
+                MM_MAP_OBJECT_REGION => mmap::handle_mm_map_object_region(&raw const msg, badge, &raw mut reply),
+                MM_SYNC_FILE_BACKING => mmap::handle_mm_sync_file_backing(&raw const msg, badge, &raw mut reply),
                 // VMFault: label=2 from kernel FaultType::VMFault.
                 // Badge identifies the faulting client. Replying resumes the faulting thread.
                 //
@@ -1183,23 +1231,41 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                         let page_offset = page_addr - (*region).base;
                         let mo_page_idx = (*region).mo_offset as u64 + page_offset / 4096;
                         let flags = prot_to_vspace_flags((*region).prot);
-                        let (err, committed) = commit_mo_pages(
-                            (*region).mo_cap,
-                            mo_page_idx,
-                            1,
-                        );
-                        if err != 0 || committed != 1 {
-                            trona::uerror!(|_lb| {
-                                _lb.str(b"[MMSRV] VMFault: mo_commit failed badge=");
-                                _lb.hex(badge);
-                                _lb.str(b" addr=");
-                                _lb.hex(fault_addr);
-                                _lb.str(b" err=");
-                                _lb.hex(err as u64);
-                                _lb.str(b"\n");
-                            });
-                            reply.label = TRONA_OUT_OF_MEMORY;
-                            break 'fault;
+
+                        if (*region).backing_kind != MMAP_BACKING_NONE as u8 {
+                            let pager_err = mmap::pagein_backing_page(region, page_addr);
+                            if pager_err != TRONA_OK as i32 {
+                                trona::uerror!(|_lb| {
+                                    _lb.str(b"[MMSRV] VMFault: backing page-in failed badge=");
+                                    _lb.hex(badge);
+                                    _lb.str(b" addr=");
+                                    _lb.hex(fault_addr);
+                                    _lb.str(b" kind=");
+                                    _lb.hex((*region).backing_kind as u64);
+                                    _lb.str(b"\n");
+                                });
+                                reply.label = pager_err as u64;
+                                break 'fault;
+                            }
+                        } else {
+                            let (err, committed) = commit_mo_pages(
+                                (*region).mo_cap,
+                                mo_page_idx,
+                                1,
+                            );
+                            if err != 0 || committed != 1 {
+                                trona::uerror!(|_lb| {
+                                    _lb.str(b"[MMSRV] VMFault: mo_commit failed badge=");
+                                    _lb.hex(badge);
+                                    _lb.str(b" addr=");
+                                    _lb.hex(fault_addr);
+                                    _lb.str(b" err=");
+                                    _lb.hex(err as u64);
+                                    _lb.str(b"\n");
+                                });
+                                reply.label = TRONA_OUT_OF_MEMORY;
+                                break 'fault;
+                            }
                         }
 
                         // Map committed page into client's VSpace

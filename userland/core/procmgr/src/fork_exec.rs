@@ -455,6 +455,7 @@ pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
         p.layout = parent_layout;
         p.mmsrv_registered = true;
         p.has_service_ep = proctab(parent_idx).has_service_ep;
+        p.exe_path = proctab(parent_idx).exe_path;
         for i in 0..NSIG {
             p.sig_disposition[i] = proctab(parent_idx).sig_disposition[i];
         }
@@ -504,6 +505,13 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
         }
 
         let (name, name_len) = super::extract_name(msg, 1);
+        let mut exec_path = [0u8; crate::proc_table::MAX_EXE_PATH_LEN];
+        let exec_path_len = super::vfs_load::derive_exec_path_for_badge(
+            &name,
+            name_len,
+            badge,
+            &mut exec_path,
+        );
 
         // Parse argv/envp from message registers after the path
         let path_regs = 1 + ((msg.regs[0] as usize + 7) / 8);
@@ -537,6 +545,11 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             }
         }
 
+        let mut argv0_len = 0usize;
+        while argv0_len < exec_str_len && exec_str_data[argv0_len] != 0 {
+            argv0_len += 1;
+        }
+
         trona::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] EXEC PID=");
             _lb.hex(proctab(idx).pid as u64);
@@ -546,7 +559,11 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             _lb.hex(argc as u64);
             _lb.str(b" envc=");
             _lb.hex(envc as u64);
-            _lb.str(b"\n");
+            _lb.str(b" argv0='");
+            if argv0_len != 0 {
+                _lb.bytes(&exec_str_data[..argv0_len]);
+            }
+            _lb.str(b"'\n");
         });
         let initrd = super::INITRD_VADDR as *const u8;
         let initrd_size = super::read_boot_info_initrd_size();
@@ -1037,6 +1054,17 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             }
             for i in name_copy..32 {
                 proctab(idx).name[i] = 0;
+            }
+            let exe_copy = if exec_path_len >= crate::proc_table::MAX_EXE_PATH_LEN {
+                crate::proc_table::MAX_EXE_PATH_LEN - 1
+            } else {
+                exec_path_len
+            };
+            for i in 0..exe_copy {
+                proctab(idx).exe_path[i] = exec_path[i];
+            }
+            for i in exe_copy..crate::proc_table::MAX_EXE_PATH_LEN {
+                proctab(idx).exe_path[i] = 0;
             }
         }
 

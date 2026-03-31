@@ -1779,6 +1779,10 @@ fn syscall_invoke_inner(
             // MO_WRITE: arg0 = offset, arg1 = count
             syscall_mo_write(&cap, arg0, arg1)
         }
+        (ObjectType::MemoryObject, 0x97) => {
+            // MO_HAS_PAGE: arg0 = page index
+            syscall_mo_has_page(&cap, arg0)
+        }
 
         _ => SyscallResult::err(SyscallError::InvalidOperation),
     }
@@ -5425,6 +5429,27 @@ fn syscall_mo_write(cap: &Capability, offset: u64, count: u64) -> SyscallResult 
         }
 
         SyscallResult::ok(bytes_written as u64)
+    }
+}
+
+/// MO_HAS_PAGE: Check whether a page resolves in this MO or any COW ancestor.
+///
+/// Args:
+/// - page_index: page index within the MO
+///
+/// Returns 1 if `resolve_page(page_index)` succeeds, else 0.
+fn syscall_mo_has_page(cap: &Capability, page_index: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::MemoryObject, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let mo = &*(cap.object as *const crate::cap::memory_object::MemoryObject);
+        let index = page_index as usize;
+        if index >= mo.page_count as usize {
+            return SyscallResult::err(SyscallError::OutOfRange);
+        }
+        SyscallResult::ok(if mo.resolve_page(index).is_some() { 1 } else { 0 })
     }
 }
 

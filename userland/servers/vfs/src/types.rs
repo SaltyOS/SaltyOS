@@ -396,6 +396,7 @@ pub(crate) struct PtyPendingReader {
     pub(crate) badge: u64,
     pub(crate) reply_slot: u64,
     pub(crate) max_count: u64,
+    pub(crate) deadline_ns: u64,
 }
 
 impl PtyPendingReader {
@@ -405,6 +406,7 @@ impl PtyPendingReader {
             badge: 0,
             reply_slot: 0,
             max_count: 0,
+            deadline_ns: 0,
         }
     }
 }

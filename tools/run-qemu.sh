@@ -128,7 +128,7 @@ case "$ARCH" in
     x86_64)
         QEMU=qemu-system-x86_64
         MACHINE=q35
-        CPU=default
+        CPU=Skylake-Client
         BLK_DEVICE="virtio-blk-pci"
         if $LEGACY_VIRTIO; then
             NET_DEVICE="virtio-net-pci"

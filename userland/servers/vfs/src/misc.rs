@@ -19,6 +19,913 @@ use crate::{
     ipc_ctx, max_clients, max_shm_objects, max_shm_pages, vfs_grow_pool, CLIENTS, SHM_DATA,
 };
 
+const MMAP_REGION_TYPE_PRIVATE: u64 = 1;
+const MMAP_REGION_TYPE_FILE_SHARED: u64 = 4;
+const MMAP_CACHE_SOURCE_FILE: u8 = 1;
+const MMAP_CACHE_SOURCE_MOUNT: u8 = 2;
+const VTIME: usize = 5;
+const VMIN: usize = 6;
+
+#[derive(Clone, Copy)]
+struct FileMmapCacheEntry {
+    active: u8,
+    source_type: u8,
+    _pad0: [u8; 2],
+    source_id0: u64,
+    source_id1: u64,
+    page_count: u32,
+    _pad1: u32,
+    file_size: u64,
+    mo_cap: Cap,
+}
+
+impl FileMmapCacheEntry {
+    const fn zeroed() -> Self {
+        Self {
+            active: 0,
+            source_type: 0,
+            _pad0: [0; 2],
+            source_id0: 0,
+            source_id1: 0,
+            page_count: 0,
+            _pad1: 0,
+            file_size: 0,
+            mo_cap: 0,
+        }
+    }
+}
+
+static mut FILE_MMAP_CACHE: [FileMmapCacheEntry; INITIAL_FILE_MMAP_CACHE] =
+    [FileMmapCacheEntry::zeroed(); INITIAL_FILE_MMAP_CACHE];
+
+unsafe fn fetch_pty_termios(pty_id: u64, termios: *mut Termios) -> bool {
+    unsafe {
+        let mut req = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        req.label = TTYD_PTY_TCGETATTR;
+        req.regs[0] = pty_id;
+        req.length = 1;
+
+        let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_TTYD_EP, &raw const req, &raw mut reply);
+        if err != 0 || reply.label != TRONA_OK {
+            return false;
+        }
+
+        (*termios).c_iflag = reply.regs[0] as u32;
+        (*termios).c_oflag = reply.regs[1] as u32;
+        (*termios).c_cflag = reply.regs[2] as u32;
+        (*termios).c_lflag = reply.regs[3] as u32;
+        (*termios).c_ispeed = reply.regs[4] as u32;
+        (*termios).c_ospeed = reply.regs[5] as u32;
+        (*termios).c_line = 0;
+        let src = &reply.regs[6] as *const u64 as *const u8;
+        for i in 0..32 {
+            (*termios).c_cc[i] = *src.add(i);
+        }
+
+        true
+    }
+}
+
+unsafe fn remove_pty_pending_reader(pty_id: usize, index: usize) {
+    unsafe {
+        let count = crate::PTY_PENDING_COUNT[pty_id];
+        for j in (index + 1)..count {
+            crate::PTY_PENDING[pty_id][j - 1] = crate::PTY_PENDING[pty_id][j];
+        }
+        crate::PTY_PENDING_COUNT[pty_id] -= 1;
+        crate::PTY_PENDING[pty_id][crate::PTY_PENDING_COUNT[pty_id]] = PtyPendingReader::zeroed();
+    }
+}
+
+unsafe fn send_pty_timeout_reply(reply_slot: u64) {
+    unsafe {
+        let mut wake = TronaMsg::zeroed();
+        wake.label = TRONA_OK;
+        wake.length = 1;
+        wake.regs[0] = 0;
+        ipc::send_ctx(ipc_ctx(), reply_slot, &raw const wake);
+    }
+}
+
+pub(crate) unsafe fn expire_pty_read_timeouts(now_ns: u64) -> bool {
+    unsafe {
+        let mut expired = false;
+
+        for pty_id in 0..MAX_PTYS {
+            let mut index = 0usize;
+            while index < crate::PTY_PENDING_COUNT[pty_id] {
+                let reader = crate::PTY_PENDING[pty_id][index];
+                if reader.active == 0 || reader.deadline_ns == 0 || reader.deadline_ns > now_ns {
+                    index += 1;
+                    continue;
+                }
+
+                send_pty_timeout_reply(reader.reply_slot);
+                remove_pty_pending_reader(pty_id, index);
+                expired = true;
+            }
+        }
+
+        expired
+    }
+}
+
+pub(crate) unsafe fn next_pty_read_timeout_ns(now_ns: u64) -> u64 {
+    unsafe {
+        let mut earliest = u64::MAX;
+
+        for pty_id in 0..MAX_PTYS {
+            for index in 0..crate::PTY_PENDING_COUNT[pty_id] {
+                let reader = crate::PTY_PENDING[pty_id][index];
+                if reader.active == 0 || reader.deadline_ns == 0 {
+                    continue;
+                }
+                if reader.deadline_ns <= now_ns {
+                    return 1;
+                }
+                if reader.deadline_ns < earliest {
+                    earliest = reader.deadline_ns;
+                }
+            }
+        }
+
+        if earliest == u64::MAX {
+            0
+        } else {
+            earliest.saturating_sub(now_ns)
+        }
+    }
+}
+
+#[inline]
+unsafe fn mmap_prot_to_vspace_flags(prot: u64) -> u64 {
+    let mut flags = VSPACE_FLAG_USER;
+    if prot & PROT_WRITE as u64 != 0 {
+        flags |= VSPACE_FLAG_WRITABLE;
+    }
+    if prot & PROT_EXEC as u64 != 0 {
+        flags |= VSPACE_FLAG_EXECUTABLE;
+    }
+    flags
+}
+
+unsafe fn alloc_mo_cap(page_count: usize) -> Cap {
+    let mut size_bits: u64 = 0;
+    while (1u64 << size_bits) < page_count as u64 {
+        size_bits += 1;
+    }
+
+    let slot = match trona::slot_alloc::slot_alloc() {
+        Some(slot) => slot,
+        None => return 0,
+    };
+
+    ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, slot, 0);
+
+    let mut msg = TronaMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
+    msg.label = MM_ALLOC_OBJECT;
+    msg.length = 2;
+    msg.regs[0] = OBJ_MEMORY_OBJECT;
+    msg.regs[1] = size_bits;
+
+    let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_MMSRV_EP, &raw const msg, &raw mut reply);
+    if err != 0 || reply.label != TRONA_OK {
+        let _ = trona::invoke::cnode_delete(CAP_SELF_CSPACE, slot);
+        return 0;
+    }
+
+    slot
+}
+
+unsafe fn mmap_cache_lookup(
+    source_type: u8,
+    source_id0: u64,
+    source_id1: u64,
+    min_pages: u32,
+    file_size: u64,
+) -> *mut FileMmapCacheEntry {
+    let cache = &raw mut FILE_MMAP_CACHE;
+    for i in 0..INITIAL_FILE_MMAP_CACHE {
+        let entry = &raw mut (*cache)[i];
+        if (*entry).active != 0
+            && (*entry).source_type == source_type
+            && (*entry).source_id0 == source_id0
+            && (*entry).source_id1 == source_id1
+            && (*entry).page_count >= min_pages
+            && (*entry).file_size == file_size
+        {
+            return entry;
+        }
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn mmap_cache_find_source(source_type: u8, source_id0: u64, source_id1: u64) -> *mut FileMmapCacheEntry {
+    let cache = &raw mut FILE_MMAP_CACHE;
+    for i in 0..INITIAL_FILE_MMAP_CACHE {
+        let entry = &raw mut (*cache)[i];
+        if (*entry).active != 0
+            && (*entry).source_type == source_type
+            && (*entry).source_id0 == source_id0
+            && (*entry).source_id1 == source_id1
+        {
+            return entry;
+        }
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn mmap_cache_alloc_or_replace(source_type: u8, source_id0: u64, source_id1: u64) -> *mut FileMmapCacheEntry {
+    let cache = &raw mut FILE_MMAP_CACHE;
+    for i in 0..INITIAL_FILE_MMAP_CACHE {
+        let entry = &raw mut (*cache)[i];
+        if (*entry).active == 0 {
+            return entry;
+        }
+    }
+    for i in 0..INITIAL_FILE_MMAP_CACHE {
+        let entry = &raw mut (*cache)[i];
+        if (*entry).source_type == source_type
+            && (*entry).source_id0 == source_id0
+            && (*entry).source_id1 == source_id1
+        {
+            if (*entry).mo_cap != 0 {
+                let _ = trona::invoke::cnode_delete(CAP_SELF_CSPACE, (*entry).mo_cap);
+            }
+            *entry = FileMmapCacheEntry::zeroed();
+            return entry;
+        }
+    }
+    core::ptr::null_mut()
+}
+
+pub(crate) unsafe fn invalidate_mmap_cache_source(source_type: u8, source_id0: u64, source_id1: u64) {
+    let cache = &raw mut FILE_MMAP_CACHE;
+    for i in 0..INITIAL_FILE_MMAP_CACHE {
+        let entry = &raw mut (*cache)[i];
+        if (*entry).active != 0
+            && (*entry).source_type == source_type
+            && (*entry).source_id0 == source_id0
+            && (*entry).source_id1 == source_id1
+        {
+            if (*entry).mo_cap != 0 {
+                let _ = trona::invoke::cnode_delete(CAP_SELF_CSPACE, (*entry).mo_cap);
+            }
+            *entry = FileMmapCacheEntry::zeroed();
+        }
+    }
+}
+
+unsafe fn backing_source_for_fd(fde: &FdEntry) -> Option<(u8, u64, u64)> {
+    match fde.fd_type {
+        FD_TYPE_FILE => Some((MMAP_CACHE_SOURCE_FILE, fde.inode as u64, 0)),
+        FD_TYPE_MOUNT => Some((MMAP_CACHE_SOURCE_MOUNT, fde.dev_type as u64, fde.sock_id as u64)),
+        _ => None,
+    }
+}
+
+pub(crate) unsafe fn invalidate_mmap_cache_for_fd(fde: &FdEntry) {
+    if let Some((source_type, source_id0, source_id1)) = backing_source_for_fd(fde) {
+        invalidate_mmap_cache_source(source_type, source_id0, source_id1);
+    }
+}
+
+unsafe fn file_mapping_size(fde: &FdEntry) -> Option<u64> {
+    match fde.fd_type {
+        FD_TYPE_FILE => {
+            let inode = inode_by_ino(fde.inode);
+            if inode.is_null() {
+                None
+            } else {
+                Some((*inode).size)
+            }
+        }
+        FD_TYPE_MOUNT => mount_stat(fde.dev_type as usize, fde.sock_id as u64).map(|s| s.0),
+        _ => None,
+    }
+}
+
+unsafe fn read_backing_bytes(
+    backing_kind: u64,
+    backing_id0: u64,
+    backing_id1: u64,
+    offset: u64,
+    dst: *mut u8,
+    count: u64,
+) -> Option<u64> {
+    match backing_kind {
+        MMAP_BACKING_FILE => {
+            let inode = inode_by_ino(backing_id0 as u32);
+            if inode.is_null() {
+                return None;
+            }
+            if offset >= (*inode).size {
+                return Some(0);
+            }
+            let mut take = count;
+            let avail = (*inode).size - offset;
+            if take > avail {
+                take = avail;
+            }
+            if !(*inode).ro_data.is_null() {
+                let src = (*inode).ro_data.add(offset as usize);
+                for i in 0..take as usize {
+                    *dst.add(i) = *src.add(i);
+                }
+                Some(take)
+            } else if !(*inode).rw_data.is_null() {
+                Some(crate::ramfs::chain_read((*inode).rw_data, offset, dst, take))
+            } else {
+                Some(0)
+            }
+        }
+        MMAP_BACKING_MOUNT => {
+            let mount_idx = backing_id0 as usize;
+            let remote_ino = backing_id1;
+            if *(&raw const crate::VFS_SHM_ACTIVE) {
+                let mut total = 0u64;
+                let shm_chunk_max = crate::consts::VFS_SALTYFS_SHM_PAGES * 4096;
+                while total < count {
+                    let chunk = core::cmp::min(count - total, shm_chunk_max);
+                    let mut reply = TronaMsg::zeroed();
+                    crate::mount::mount_read_shm(
+                        mount_idx,
+                        remote_ino,
+                        offset + total,
+                        chunk,
+                        0,
+                        &raw mut reply,
+                    );
+                    if reply.label != TRONA_OK {
+                        break;
+                    }
+                    let bytes = reply.regs[0];
+                    let src = VFS_SALTYFS_SHM_VADDR as *const u8;
+                    if bytes == 0 {
+                        break;
+                    }
+                    for i in 0..bytes as usize {
+                        *dst.add(total as usize + i) = *src.add(i);
+                    }
+                    total += bytes;
+                    if bytes < chunk {
+                        break;
+                    }
+                }
+                if total == count {
+                    Some(total)
+                } else {
+                    while total < count {
+                        let chunk = (count - total).min(152);
+                        let mut reply = TronaMsg::zeroed();
+                        crate::mount::mount_read_inline(
+                            mount_idx,
+                            remote_ino,
+                            offset + total,
+                            chunk,
+                            &raw mut reply,
+                        );
+                        if reply.label != TRONA_OK {
+                            return None;
+                        }
+                        let bytes = reply.regs[0];
+                        if bytes == 0 {
+                            break;
+                        }
+                        let src = &raw const reply.regs[1] as *const u8;
+                        for i in 0..bytes as usize {
+                            *dst.add(total as usize + i) = *src.add(i);
+                        }
+                        total += bytes;
+                        if bytes < chunk {
+                            break;
+                        }
+                    }
+                    Some(total)
+                }
+            } else {
+                let mut total = 0u64;
+                while total < count {
+                    let chunk = (count - total).min(152);
+                    let mut reply = TronaMsg::zeroed();
+                    crate::mount::mount_read_inline(
+                        mount_idx,
+                        remote_ino,
+                        offset + total,
+                        chunk,
+                        &raw mut reply,
+                    );
+                    if reply.label != TRONA_OK {
+                        return None;
+                    }
+                    let bytes = reply.regs[0];
+                    if bytes == 0 {
+                        break;
+                    }
+                    let src = &raw const reply.regs[1] as *const u8;
+                    for i in 0..bytes as usize {
+                        *dst.add(total as usize + i) = *src.add(i);
+                    }
+                    total += bytes;
+                    if bytes < chunk {
+                        break;
+                    }
+                }
+                Some(total)
+            }
+        }
+        _ => None,
+    }
+}
+
+unsafe fn write_backing_bytes(
+    backing_kind: u64,
+    backing_id0: u64,
+    backing_id1: u64,
+    offset: u64,
+    src: *const u8,
+    count: u64,
+) -> Option<u64> {
+    match backing_kind {
+        MMAP_BACKING_FILE => {
+            let inode = inode_by_ino(backing_id0 as u32);
+            if inode.is_null() || (*inode).readonly != 0 {
+                return None;
+            }
+            if (*inode).rw_data.is_null() && count > 0 {
+                (*inode).rw_data = crate::ramfs::alloc_writable();
+                if (*inode).rw_data.is_null() {
+                    return None;
+                }
+            }
+            let written = crate::ramfs::chain_write((*inode).rw_data, offset, src, count);
+            if written == 0 && count > 0 {
+                return None;
+            }
+            let end = offset + written;
+            if end > (*inode).size {
+                (*inode).size = end;
+            }
+            Some(written)
+        }
+        MMAP_BACKING_MOUNT => {
+            let mount_idx = backing_id0 as usize;
+            let remote_ino = backing_id1;
+            let mut total = 0u64;
+            if *(&raw const crate::VFS_SHM_ACTIVE) {
+                while total < count {
+                    let chunk = core::cmp::min(count - total, crate::consts::VFS_SALTYFS_SHM_PAGES * 4096);
+                    let dst = crate::consts::VFS_SALTYFS_SHM_VADDR as *mut u8;
+                    for i in 0..chunk as usize {
+                        *dst.add(i) = *src.add(total as usize + i);
+                    }
+                    let mut reply = TronaMsg::zeroed();
+                    crate::mount::mount_write_shm(mount_idx, remote_ino, offset + total, chunk, 0, &raw mut reply);
+                    if reply.label != TRONA_OK {
+                        break;
+                    }
+                    let wrote = reply.regs[0];
+                    total += wrote;
+                    if wrote < chunk {
+                        break;
+                    }
+                }
+                if total == count {
+                    Some(total)
+                } else {
+                    while total < count {
+                        let chunk = core::cmp::min(count - total, 136);
+                        let mut reply = TronaMsg::zeroed();
+                        crate::mount::mount_write_inline(
+                            mount_idx,
+                            remote_ino,
+                            offset + total,
+                            src.add(total as usize),
+                            chunk,
+                            &raw mut reply,
+                        );
+                        if reply.label != TRONA_OK {
+                            return None;
+                        }
+                        let wrote = reply.regs[0];
+                        total += wrote;
+                        if wrote < chunk {
+                            break;
+                        }
+                    }
+                    Some(total)
+                }
+            } else {
+                while total < count {
+                    let chunk = core::cmp::min(count - total, 136);
+                    let mut reply = TronaMsg::zeroed();
+                    crate::mount::mount_write_inline(
+                        mount_idx,
+                        remote_ino,
+                        offset + total,
+                        src.add(total as usize),
+                        chunk,
+                        &raw mut reply,
+                    );
+                    if reply.label != TRONA_OK {
+                        return None;
+                    }
+                    let wrote = reply.regs[0];
+                    total += wrote;
+                    if wrote < chunk {
+                        break;
+                    }
+                }
+                Some(total)
+            }
+        }
+        _ => None,
+    }
+}
+
+unsafe fn get_or_create_shared_file_mo(
+    source_type: u8,
+    source_id0: u64,
+    source_id1: u64,
+    file_size: u64,
+) -> Cap {
+    let needed_pages = ((file_size + 4095) / 4096) as u32;
+    let existing = mmap_cache_lookup(source_type, source_id0, source_id1, needed_pages, file_size);
+    if !existing.is_null() {
+        return (*existing).mo_cap;
+    }
+
+    let slot = mmap_cache_alloc_or_replace(source_type, source_id0, source_id1);
+    if slot.is_null() {
+        return 0;
+    }
+
+    let mo_cap = alloc_mo_cap(needed_pages as usize);
+    if mo_cap == 0 {
+        return 0;
+    }
+
+    let actual_pages = match trona::invoke::mo_get_size(mo_cap) {
+        (0, pages) if pages != 0 => pages as u32,
+        _ => needed_pages,
+    };
+
+    *slot = FileMmapCacheEntry {
+        active: 1,
+        source_type,
+        _pad0: [0; 2],
+        source_id0,
+        source_id1,
+        page_count: actual_pages,
+        _pad1: 0,
+        file_size,
+        mo_cap,
+    };
+    mo_cap
+}
+
+unsafe fn sync_backing_size_with_mmsrv(
+    backing_kind: u64,
+    backing_id0: u64,
+    backing_id1: u64,
+    new_size: u64,
+    sync_flags: u64,
+) {
+    let mut msg = TronaMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
+    msg.label = MM_SYNC_FILE_BACKING;
+    msg.length = 5;
+    msg.regs[0] = backing_kind;
+    msg.regs[1] = backing_id0;
+    msg.regs[2] = backing_id1;
+    msg.regs[3] = new_size;
+    msg.regs[4] = sync_flags;
+    let _ = ipc::call_ctx(ipc_ctx(), VFS_CAP_MMSRV_EP, &raw const msg, &raw mut reply);
+}
+
+unsafe fn write_shared_mo_range(
+    entry: *mut FileMmapCacheEntry,
+    offset: u64,
+    src: *const u8,
+    count: u64,
+    old_size: u64,
+    new_size: u64,
+) {
+    if entry.is_null() || (*entry).active == 0 || count == 0 {
+        if !entry.is_null() && new_size > (*entry).file_size {
+            (*entry).file_size = new_size;
+        }
+        return;
+    }
+
+    let needed_pages = ((new_size + 4095) / 4096) as u32;
+    if needed_pages > (*entry).page_count {
+        if trona::invoke::mo_resize((*entry).mo_cap, needed_pages as u64) == 0 {
+            let (_, pages) = trona::invoke::mo_get_size((*entry).mo_cap);
+            if pages != 0 {
+                (*entry).page_count = pages as u32;
+            } else {
+                (*entry).page_count = needed_pages;
+            }
+        }
+    }
+
+    if old_size < offset {
+        let mut zero_pos = old_size;
+        while zero_pos < offset {
+            let page_idx = zero_pos / 4096;
+            let page_off = zero_pos & 0xFFF;
+            let page_end = (page_idx + 1) * 4096;
+            let zero_len = core::cmp::min(offset, page_end) - zero_pos;
+            let (has_err, has_page) = trona::invoke::mo_has_page((*entry).mo_cap, page_idx);
+            if has_err == 0 && has_page {
+                let map_flags = (1u64 << 32) | VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
+                if trona::invoke::vspace_map_mo(
+                    CAP_SELF_VSPACE,
+                    (*entry).mo_cap,
+                    VFS_FILE_MMAP_SCRATCH_VADDR,
+                    page_idx,
+                    map_flags,
+                ) == 0 {
+                    core::ptr::write_bytes(
+                        (VFS_FILE_MMAP_SCRATCH_VADDR as *mut u8).add(page_off as usize),
+                        0,
+                        zero_len as usize,
+                    );
+                    let _ = trona::invoke::vspace_unmap(CAP_SELF_VSPACE, VFS_FILE_MMAP_SCRATCH_VADDR);
+                }
+            }
+            zero_pos += zero_len;
+        }
+    }
+
+    let mut copied = 0u64;
+    while copied < count {
+        let absolute = offset + copied;
+        let page_idx = absolute / 4096;
+        let page_off = absolute & 0xFFF;
+        let chunk = core::cmp::min(count - copied, 4096 - page_off);
+        let (has_err, has_page) = trona::invoke::mo_has_page((*entry).mo_cap, page_idx);
+        if has_err == 0 && has_page {
+            let map_flags = (1u64 << 32) | VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
+            if trona::invoke::vspace_map_mo(
+                CAP_SELF_VSPACE,
+                (*entry).mo_cap,
+                VFS_FILE_MMAP_SCRATCH_VADDR,
+                page_idx,
+                map_flags,
+            ) == 0 {
+                core::ptr::copy_nonoverlapping(
+                    src.add(copied as usize),
+                    (VFS_FILE_MMAP_SCRATCH_VADDR as *mut u8).add(page_off as usize),
+                    chunk as usize,
+                );
+                let _ = trona::invoke::vspace_unmap(CAP_SELF_VSPACE, VFS_FILE_MMAP_SCRATCH_VADDR);
+            }
+        }
+        copied += chunk;
+    }
+
+    if new_size > (*entry).file_size {
+        (*entry).file_size = new_size;
+    }
+}
+
+pub(crate) unsafe fn sync_shared_mmap_after_write(
+    fde: &FdEntry,
+    offset: u64,
+    src: *const u8,
+    count: u64,
+    old_size: u64,
+    new_size: u64,
+) {
+    if let Some((source_type, source_id0, source_id1)) = backing_source_for_fd(fde) {
+        let backing_kind = if source_type == MMAP_CACHE_SOURCE_FILE {
+            MMAP_BACKING_FILE
+        } else {
+            MMAP_BACKING_MOUNT
+        };
+        let entry = mmap_cache_find_source(source_type, source_id0, source_id1);
+        write_shared_mo_range(entry, offset, src, count, old_size, new_size);
+        if new_size != old_size {
+            sync_backing_size_with_mmsrv(backing_kind, source_id0, source_id1, new_size, 0);
+        }
+    }
+}
+
+pub(crate) unsafe fn sync_shared_mmap_after_truncate(fde: &FdEntry, old_size: u64, new_size: u64) {
+    let Some((source_type, source_id0, source_id1)) = backing_source_for_fd(fde) else {
+        return;
+    };
+    let backing_kind = if source_type == MMAP_CACHE_SOURCE_FILE {
+        MMAP_BACKING_FILE
+    } else {
+        MMAP_BACKING_MOUNT
+    };
+
+    sync_backing_size_with_mmsrv(
+        backing_kind,
+        source_id0,
+        source_id1,
+        new_size,
+        if new_size < old_size { MM_SYNC_BACKING_TRUNCATE } else { 0 },
+    );
+
+    let entry = mmap_cache_find_source(source_type, source_id0, source_id1);
+    if entry.is_null() || (*entry).active == 0 {
+        return;
+    }
+
+    if new_size < old_size {
+        let last_kept_page = new_size / 4096;
+        let last_kept_off = new_size & 0xFFF;
+        if last_kept_off != 0 {
+            let (has_err, has_page) = trona::invoke::mo_has_page((*entry).mo_cap, last_kept_page);
+            if has_err == 0 && has_page {
+                let map_flags = (1u64 << 32) | VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
+                if trona::invoke::vspace_map_mo(
+                    CAP_SELF_VSPACE,
+                    (*entry).mo_cap,
+                    VFS_FILE_MMAP_SCRATCH_VADDR,
+                    last_kept_page,
+                    map_flags,
+                ) == 0 {
+                    core::ptr::write_bytes(
+                        (VFS_FILE_MMAP_SCRATCH_VADDR as *mut u8).add(last_kept_off as usize),
+                        0,
+                        (4096 - last_kept_off) as usize,
+                    );
+                    let _ = trona::invoke::vspace_unmap(CAP_SELF_VSPACE, VFS_FILE_MMAP_SCRATCH_VADDR);
+                }
+            }
+        }
+
+        let first_drop_page = (new_size + 4095) / 4096;
+        let mut page = first_drop_page;
+        while page < (*entry).page_count as u64 {
+            let (has_err, has_page) = trona::invoke::mo_has_page((*entry).mo_cap, page);
+            if has_err == 0 && has_page {
+                let _ = trona::invoke::mo_decommit((*entry).mo_cap, page, 1);
+            }
+            page += 1;
+        }
+    }
+
+    (*entry).file_size = new_size;
+}
+
+unsafe fn map_object_region_into_client(
+    badge: u64,
+    requested_base: u64,
+    page_count: usize,
+    mo_offset: u64,
+    flags: u64,
+    region_type: u64,
+    mo_cap: Cap,
+    backing_kind: u64,
+    backing_id0: u64,
+    backing_id1: u64,
+    backing_file_offset: u64,
+    backing_file_size: u64,
+    options: u64,
+) -> Option<u64> {
+    ipc::set_send_cap_ctx(ipc_ctx(), 0, mo_cap);
+
+    let mut msg = TronaMsg::zeroed();
+    let mut reply = TronaMsg::zeroed();
+    msg.label = MM_MAP_OBJECT_REGION;
+    msg.length = 12;
+    msg.regs[0] = badge;
+    msg.regs[1] = requested_base;
+    msg.regs[2] = page_count as u64;
+    msg.regs[3] = mo_offset;
+    msg.regs[4] = flags;
+    msg.regs[5] = region_type;
+    msg.regs[6] = backing_kind;
+    msg.regs[7] = backing_id0;
+    msg.regs[8] = backing_id1;
+    msg.regs[9] = backing_file_offset;
+    msg.regs[10] = backing_file_size;
+    msg.regs[11] = options;
+
+    let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_MMSRV_EP, &raw const msg, &raw mut reply);
+    if err != 0 || reply.label != TRONA_OK {
+        None
+    } else {
+        Some(reply.regs[0])
+    }
+}
+
+pub(crate) unsafe fn handle_mmap_pagein(msg: *const TronaMsg, reply: *mut TronaMsg) {
+    unsafe {
+        let mo_cap = *(&raw const crate::CURRENT_RECV_SLOT);
+        if mo_cap == 0 {
+            (*reply).label = TRONA_INVALID_ARGUMENT;
+            return;
+        }
+
+        let backing_kind = (*msg).regs[0];
+        let backing_id0 = (*msg).regs[1];
+        let backing_id1 = (*msg).regs[2];
+        let file_offset = (*msg).regs[3];
+        let mo_page_idx = (*msg).regs[4];
+        let bytes = (*msg).regs[5];
+
+        let (has_err, has_page) = trona::invoke::mo_has_page(mo_cap, mo_page_idx);
+        if has_err != 0 {
+            (*reply).label = TRONA_INVALID_OPERATION;
+            return;
+        }
+        if has_page {
+            (*reply).label = TRONA_OK;
+            return;
+        }
+
+        let (commit_err, committed) = trona::invoke::mo_commit(mo_cap, mo_page_idx, 1, 0);
+        if commit_err != 0 || committed != 1 {
+            (*reply).label = TRONA_OUT_OF_MEMORY;
+            return;
+        }
+
+        let map_flags = (1u64 << 32) | VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
+        let map_err = trona::invoke::vspace_map_mo(
+            CAP_SELF_VSPACE,
+            mo_cap,
+            VFS_FILE_MMAP_SCRATCH_VADDR,
+            mo_page_idx,
+            map_flags,
+        );
+        if map_err != 0 {
+            let _ = trona::invoke::mo_decommit(mo_cap, mo_page_idx, 1);
+            (*reply).label = TRONA_INVALID_OPERATION;
+            return;
+        }
+
+        let dst = VFS_FILE_MMAP_SCRATCH_VADDR as *mut u8;
+        core::ptr::write_bytes(dst, 0, 4096);
+        if bytes > 0 && read_backing_bytes(backing_kind, backing_id0, backing_id1, file_offset, dst, bytes).is_none() {
+            let _ = trona::invoke::vspace_unmap(CAP_SELF_VSPACE, VFS_FILE_MMAP_SCRATCH_VADDR);
+            let _ = trona::invoke::mo_decommit(mo_cap, mo_page_idx, 1);
+            (*reply).label = TRONA_INVALID_OPERATION;
+            return;
+        }
+
+        let _ = trona::invoke::vspace_unmap(CAP_SELF_VSPACE, VFS_FILE_MMAP_SCRATCH_VADDR);
+        (*reply).label = TRONA_OK;
+    }
+}
+
+pub(crate) unsafe fn handle_mmap_writeback(msg: *const TronaMsg, reply: *mut TronaMsg) {
+    unsafe {
+        let mo_cap = *(&raw const crate::CURRENT_RECV_SLOT);
+        if mo_cap == 0 {
+            (*reply).label = TRONA_INVALID_ARGUMENT;
+            return;
+        }
+
+        let backing_kind = (*msg).regs[0];
+        let backing_id0 = (*msg).regs[1];
+        let backing_id1 = (*msg).regs[2];
+        let file_offset = (*msg).regs[3];
+        let mo_page_idx = (*msg).regs[4];
+        let bytes = (*msg).regs[5];
+
+        let (has_err, has_page) = trona::invoke::mo_has_page(mo_cap, mo_page_idx);
+        if has_err != 0 {
+            (*reply).label = TRONA_INVALID_OPERATION;
+            return;
+        }
+        if !has_page || bytes == 0 {
+            (*reply).label = TRONA_OK;
+            return;
+        }
+
+        let map_flags = (1u64 << 32) | VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
+        let map_err = trona::invoke::vspace_map_mo(
+            CAP_SELF_VSPACE,
+            mo_cap,
+            VFS_FILE_MMAP_SCRATCH_VADDR,
+            mo_page_idx,
+            map_flags,
+        );
+        if map_err != 0 {
+            (*reply).label = TRONA_INVALID_OPERATION;
+            return;
+        }
+
+        let src = VFS_FILE_MMAP_SCRATCH_VADDR as *const u8;
+        let wrote = write_backing_bytes(backing_kind, backing_id0, backing_id1, file_offset, src, bytes);
+        let _ = trona::invoke::vspace_unmap(CAP_SELF_VSPACE, VFS_FILE_MMAP_SCRATCH_VADDR);
+        if wrote == Some(bytes) {
+            (*reply).label = TRONA_OK;
+        } else {
+            (*reply).label = TRONA_INVALID_OPERATION;
+        }
+    }
+}
+
 /// Handle a deferred PTY device read. Called from main loop when fd is DEV_PTY_SLAVE.
 /// Returns true if reply is deferred (skip_reply), false if reply is ready now.
 pub(crate) unsafe fn handle_pty_dev_read(
@@ -60,6 +967,29 @@ pub(crate) unsafe fn handle_pty_dev_read(
             return false;
         }
 
+        if ((*fde).flags & O_NONBLOCK as u32) != 0 {
+            (*reply).label = TRONA_WOULD_BLOCK;
+            return false;
+        }
+
+        let mut deadline_ns = 0u64;
+        let mut termios = Termios::zeroed();
+        if fetch_pty_termios(pty_id, &raw mut termios) {
+            let vmin = termios.c_cc[VMIN] as u64;
+            let vtime = termios.c_cc[VTIME] as u64;
+            if vmin == 0 {
+                if vtime == 0 {
+                    (*reply).label = TRONA_OK;
+                    (*reply).length = 1;
+                    (*reply).regs[0] = 0;
+                    return false;
+                }
+
+                deadline_ns = crate::poll::monotonic_now_ns()
+                    .saturating_add(vtime.saturating_mul(100_000_000));
+            }
+        }
+
         // WOULD_BLOCK — save caller's reply cap, enqueue pending reader
         let pid = pty_id as usize;
         if pid >= MAX_PTYS || crate::PTY_PENDING_COUNT[pid] >= MAX_PTY_WAITERS {
@@ -80,6 +1010,7 @@ pub(crate) unsafe fn handle_pty_dev_read(
             badge,
             reply_slot: slot,
             max_count: max,
+            deadline_ns,
         };
         crate::PTY_PENDING_COUNT[pid] += 1;
 
@@ -131,15 +1062,7 @@ pub(crate) unsafe fn handle_pty_notification(ntfn_badge: u64) {
                 }
                 ipc::send_ctx(ipc_ctx(), reader.reply_slot, &raw const wake);
 
-                // Shift remaining waiters forward (FIFO)
-                for j in 1..crate::PTY_PENDING_COUNT[pty_id] {
-                    crate::PTY_PENDING[pty_id][j - 1] = crate::PTY_PENDING[pty_id][j];
-                }
-                crate::PTY_PENDING_COUNT[pty_id] -= 1;
-                if crate::PTY_PENDING_COUNT[pty_id] < MAX_PTY_WAITERS {
-                    crate::PTY_PENDING[pty_id][crate::PTY_PENDING_COUNT[pty_id]] =
-                        PtyPendingReader::zeroed();
-                }
+                remove_pty_pending_reader(pty_id, 0);
             }
 
             // Wake poll/epoll waiters for PTY fds (POLLIN event)
@@ -597,8 +1520,11 @@ pub(crate) unsafe fn handle_munmap(_msg: *const TronaMsg, reply: *mut TronaMsg, 
 pub(crate) unsafe fn handle_mmap(msg: *const TronaMsg, reply: *mut TronaMsg, badge: u64) {
     unsafe {
         let fd = (*msg).regs[0] as i32;
-        let _offset = (*msg).regs[1];
+        let file_offset = (*msg).regs[1];
         let length = (*msg).regs[2];
+        let prot = (*msg).regs[3];
+        let map_flags = (*msg).regs[4] as i32;
+        let addr_hint = if (*msg).length >= 6 { (*msg).regs[5] } else { 0 };
 
         let cli = get_client(badge);
         if cli.is_null()
@@ -611,6 +1537,141 @@ pub(crate) unsafe fn handle_mmap(msg: *const TronaMsg, reply: *mut TronaMsg, bad
         }
 
         let fde = *(*cli).fds.add(fd as usize);
+
+        if (fde.fd_type == FD_TYPE_FILE || fde.fd_type == FD_TYPE_MOUNT) && length != 0 {
+            if file_offset & 0xFFF != 0 {
+                (*reply).label = TRONA_INVALID_ARGUMENT;
+                return;
+            }
+
+            let Some(file_size) = file_mapping_size(&fde) else {
+                (*reply).label = TRONA_INVALID_ARGUMENT;
+                return;
+            };
+            if file_offset >= file_size {
+                (*reply).label = TRONA_INVALID_ARGUMENT;
+                return;
+            }
+
+            let mapping_pages = ((length + 4095) / 4096) as usize;
+            if mapping_pages == 0 {
+                (*reply).label = TRONA_INVALID_ARGUMENT;
+                return;
+            }
+
+            let requested_base = if (map_flags & MAP_FIXED) != 0 {
+                if addr_hint & 0xFFF != 0 {
+                    (*reply).label = TRONA_INVALID_ARGUMENT;
+                    return;
+                }
+                addr_hint
+            } else {
+                0
+            };
+
+            let Some((source_type, source_id0, source_id1)) = backing_source_for_fd(&fde) else {
+                (*reply).label = TRONA_INVALID_ARGUMENT;
+                return;
+            };
+
+            let backing_kind = match source_type {
+                MMAP_CACHE_SOURCE_FILE => MMAP_BACKING_FILE,
+                MMAP_CACHE_SOURCE_MOUNT => MMAP_BACKING_MOUNT,
+                _ => MMAP_BACKING_NONE,
+            };
+
+            let vspace_flags = mmap_prot_to_vspace_flags(prot);
+            let is_shared = (map_flags & MAP_SHARED) != 0;
+            let wants_write = (prot & PROT_WRITE as u64) != 0;
+            if is_shared && wants_write {
+                if !crate::client::flags_allow_write(fde.flags) {
+                    (*reply).label = TRONA_INVALID_OPERATION;
+                    return;
+                }
+                if fde.fd_type == FD_TYPE_FILE {
+                    let inode = inode_by_ino(fde.inode);
+                    if inode.is_null() || (*inode).readonly != 0 {
+                        (*reply).label = TRONA_INVALID_OPERATION;
+                        return;
+                    }
+                }
+                if file_offset.checked_add(length).is_none() || file_offset + length > file_size {
+                    (*reply).label = TRONA_INVALID_ARGUMENT;
+                    return;
+                }
+            }
+
+            if is_shared {
+                let shared_mo = get_or_create_shared_file_mo(source_type, source_id0, source_id1, file_size);
+                if shared_mo == 0 {
+                    (*reply).label = TRONA_OUT_OF_MEMORY;
+                    return;
+                }
+
+                let options = MMAP_OBJECT_OPT_LAZY
+                    | if wants_write { MMAP_OBJECT_OPT_WRITEBACK } else { 0 };
+                let Some(base) = map_object_region_into_client(
+                    badge,
+                    requested_base,
+                    mapping_pages,
+                    file_offset / 4096,
+                    vspace_flags,
+                    MMAP_REGION_TYPE_FILE_SHARED,
+                    shared_mo,
+                    backing_kind,
+                    source_id0,
+                    source_id1,
+                    file_offset,
+                    file_size,
+                    options,
+                ) else {
+                    (*reply).label = TRONA_INVALID_OPERATION;
+                    return;
+                };
+
+                (*reply).label = TRONA_OK;
+                (*reply).length = 3;
+                (*reply).regs[0] = base;
+                (*reply).regs[1] = 0;
+                (*reply).regs[2] = 1;
+                return;
+            }
+
+            let private_mo = alloc_mo_cap(mapping_pages);
+            if private_mo == 0 {
+                (*reply).label = TRONA_OUT_OF_MEMORY;
+                return;
+            }
+
+            let mapped = map_object_region_into_client(
+                badge,
+                requested_base,
+                mapping_pages,
+                0,
+                vspace_flags,
+                MMAP_REGION_TYPE_PRIVATE,
+                private_mo,
+                backing_kind,
+                source_id0,
+                source_id1,
+                file_offset,
+                file_size,
+                MMAP_OBJECT_OPT_LAZY,
+            );
+            let _ = trona::invoke::cnode_delete(CAP_SELF_CSPACE, private_mo);
+
+            let Some(base) = mapped else {
+                (*reply).label = TRONA_INVALID_OPERATION;
+                return;
+            };
+
+            (*reply).label = TRONA_OK;
+            (*reply).length = 3;
+            (*reply).regs[0] = base;
+            (*reply).regs[1] = 0;
+            (*reply).regs[2] = 1;
+            return;
+        }
 
         // SHM mmap — delegate to mmsrv
         if fde.fd_type == FD_TYPE_SHM {
@@ -625,8 +1686,6 @@ pub(crate) unsafe fn handle_mmap(msg: *const TronaMsg, reply: *mut TronaMsg, bad
                 (*reply).label = TRONA_INVALID_OPERATION;
                 return;
             }
-
-            let prot = (*msg).regs[3];
 
             let mut mm_msg = TronaMsg::zeroed();
             let mut mm_reply = TronaMsg::zeroed();
@@ -1120,7 +2179,13 @@ pub(crate) unsafe fn handle_ftruncate(
         let fde = *(*cli).fds.add(fd as usize);
 
         if fde.fd_type == FD_TYPE_MOUNT {
+            let old_size = mount_stat(fde.dev_type as usize, fde.sock_id as u64)
+                .map(|s| s.0)
+                .unwrap_or(0);
             mount_truncate(fde.dev_type as usize, fde.sock_id as u64, length, reply);
+            if (*reply).label == TRONA_OK {
+                sync_shared_mmap_after_truncate(&fde, old_size, length);
+            }
             return false;
         }
 
@@ -1178,10 +2243,12 @@ pub(crate) unsafe fn handle_ftruncate(
             (*reply).label = TRONA_INVALID_OPERATION;
             return false;
         }
+        let old_size = (*inode).size;
         if !(*inode).rw_data.is_null() && length < (*inode).size {
             chain_truncate((*inode).rw_data, length);
         }
         (*inode).size = length;
+        sync_shared_mmap_after_truncate(&fde, old_size, length);
         (*reply).label = TRONA_OK;
         false
     }

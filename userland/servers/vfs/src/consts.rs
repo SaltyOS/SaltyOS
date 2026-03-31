@@ -88,6 +88,9 @@ pub(crate) const VFS_GETSOCKNAME: u64 = 66;
 pub(crate) const VFS_GETPEERNAME: u64 = 67;
 pub(crate) const VFS_SETSOCKOPT: u64 = 68;
 pub(crate) const VFS_GETSOCKOPT: u64 = 69;
+pub(crate) const VFS_MMAP_PAGEIN: u64 = 70;
+pub(crate) const VFS_MMAP_WRITEBACK: u64 = 71;
+pub(crate) const VFS_BULK_PWRITE: u64 = 72;
 
 /// Per-client bulk SHM size (1MB = 256 pages).
 pub(crate) const CLIENT_BULK_SHM_PAGES: u64 = 256;
@@ -156,6 +159,7 @@ pub(crate) const INITIAL_WRITABLE: usize = 32;
 pub(crate) const WRITABLE_SIZE: usize = 8192;
 pub(crate) const INITIAL_CLIENTS: usize = 16;
 pub(crate) const INITIAL_FDS: usize = 32;
+pub(crate) const INITIAL_FILE_MMAP_CACHE: usize = 32;
 // Semantic limits (not pool sizes)
 pub(crate) const MAX_PATH_LEN: usize = 128;
 pub(crate) const MAX_NAME_LEN: usize = 255;
@@ -218,6 +222,7 @@ pub(crate) const MAX_MOUNTS: usize = 4;
 pub(crate) const VFS_SALTYFS_SHM_VADDR: u64 = 0x0000_0000_5000_0000;
 pub(crate) const VFS_SALTYFS_SHM_PAGES: u64 = 256; // 1MB
 pub(crate) const VFS_SALTYFS_SHM_ID: u64 = 0x56534653; // "VSFS"
+pub(crate) const VFS_FILE_MMAP_SCRATCH_VADDR: u64 = 0x0000_0000_7000_0000;
 
 // PTY pending reader queue for deferred terminal reads
 pub(crate) const MAX_PTYS: usize = 4;

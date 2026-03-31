@@ -544,6 +544,39 @@ pub fn run() -> bool {
     }
     puts(b"[TEST_FS] PASS: /proc/self/status OK\n");
 
+    // Test 19: /proc/self/exe
+    puts(b"[TEST_FS] Test 19: /proc/self/exe\n");
+    let mut exe_buf = [0u8; 128];
+    let exe_len = unsafe {
+        trona_posix::posix_readlink(b"/proc/self/exe\0".as_ptr(), exe_buf.as_mut_ptr(), exe_buf.len())
+    };
+    if exe_len <= 0 {
+        puts(b"[TEST_FS] FAIL: readlink /proc/self/exe failed\n");
+        return false;
+    }
+    if exe_buf[0] != b'/' {
+        puts(b"[TEST_FS] FAIL: /proc/self/exe is not absolute\n");
+        return false;
+    }
+
+    let fd = unsafe { trona_posix::posix_open(b"/proc/self/exe\0".as_ptr(), O_RDONLY as i32, 0) };
+    if fd < 0 {
+        puts(b"[TEST_FS] FAIL: open /proc/self/exe failed\n");
+        return false;
+    }
+    let mut elf_hdr = [0u8; 4];
+    let rd = unsafe { trona_posix::posix_read(fd, elf_hdr.as_mut_ptr(), elf_hdr.len() as u64) };
+    unsafe { trona_posix::posix_close(fd) };
+    if rd != 4 {
+        puts(b"[TEST_FS] FAIL: read /proc/self/exe header failed\n");
+        return false;
+    }
+    if elf_hdr[0] != 0x7f || elf_hdr[1] != b'E' || elf_hdr[2] != b'L' || elf_hdr[3] != b'F' {
+        puts(b"[TEST_FS] FAIL: /proc/self/exe is not ELF\n");
+        return false;
+    }
+    puts(b"[TEST_FS] PASS: /proc/self/exe OK\n");
+
     // Cleanup /tmp
     unsafe { trona_posix::posix_rmdir(b"/tmp\0".as_ptr()) };
 

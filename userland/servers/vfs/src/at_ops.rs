@@ -18,7 +18,7 @@ use crate::path::{
     resolve_path_raw_nofollow, symlink_target, AtResolution,
 };
 use crate::pipe::find_pipe;
-use crate::procfs::{handle_proc_open, handle_proc_stat};
+use crate::procfs::{handle_proc_open, handle_proc_readlink, handle_proc_stat};
 use crate::ramfs::{
     alloc_inode, alloc_symlink_target, chain_truncate, dir_add_entry, dir_find_entry,
     dir_remove_entry, free_inode, free_symlink_target, inode_by_ino, inode_open,
@@ -52,7 +52,7 @@ pub(crate) unsafe fn do_open(
                 && *p.add(4) == b'c'
                 && *p.add(5) == b'/'
             {
-                if handle_proc_open(path, path_len, reply, badge) {
+                if handle_proc_open(path, path_len, flags, true, reply, badge) {
                     return;
                 }
             }
@@ -1518,6 +1518,10 @@ pub(crate) unsafe fn handle_readlinkat(msg: *const TronaMsg, reply: *mut TronaMs
 
         if path_len == 0 {
             (*reply).label = TRONA_INVALID_ARGUMENT;
+            return;
+        }
+
+        if dirfd == -100 && handle_proc_readlink(path.as_ptr(), path_len, reply, badge) {
             return;
         }
 

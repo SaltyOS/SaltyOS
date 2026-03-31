@@ -2814,6 +2814,13 @@ pub unsafe fn handle_spawn_tx(
         let policy_is_display = trona::spawn_policy_is_display(spawn_policy);
         let policy_cnode_bits = trona::spawn_policy_cnode_bits(spawn_policy);
         let (name, name_len) = super::extract_name(msg, name_reg_idx);
+        let mut exec_path = [0u8; proc_table::MAX_EXE_PATH_LEN];
+        let exec_path_len = super::vfs_load::derive_exec_path_for_badge(
+            &name,
+            name_len,
+            badge,
+            &mut exec_path,
+        );
         let is_display = policy_is_display || super::bytes_eq(&name[..name_len], b"display");
 
         trona::udebug!(|_lb| {
@@ -3415,27 +3422,15 @@ pub unsafe fn handle_spawn_tx(
             let mut str_buf = [0u8; 256];
             let mut str_pos = 0usize;
 
-            // argv[0]: "/bin/<name>" (extensionless runtime name)
-            let prefix = b"/bin/";
-            for &b in prefix {
+            // argv[0]: resolved executable path captured at spawn time.
+            let argv0 = if exec_path_len != 0 {
+                &exec_path[..exec_path_len]
+            } else {
+                &name[..name_len]
+            };
+            for &b in argv0 {
                 if str_pos < str_buf.len() {
                     str_buf[str_pos] = b;
-                    str_pos += 1;
-                }
-            }
-            let base_len = if name_len >= 4
-                && name[name_len - 4] == b'.'
-                && name[name_len - 3] == b'e'
-                && name[name_len - 2] == b'l'
-                && name[name_len - 1] == b'f'
-            {
-                name_len - 4
-            } else {
-                name_len
-            };
-            for i in 0..base_len {
-                if str_pos < str_buf.len() {
-                    str_buf[str_pos] = name[i];
                     str_pos += 1;
                 }
             }
@@ -3706,6 +3701,17 @@ pub unsafe fn handle_spawn_tx(
             }
             for i in name_copy..32 {
                 p.name[i] = 0;
+            }
+            let exe_copy = if exec_path_len >= proc_table::MAX_EXE_PATH_LEN {
+                proc_table::MAX_EXE_PATH_LEN - 1
+            } else {
+                exec_path_len
+            };
+            for i in 0..exe_copy {
+                p.exe_path[i] = exec_path[i];
+            }
+            for i in exe_copy..proc_table::MAX_EXE_PATH_LEN {
+                p.exe_path[i] = 0;
             }
         }
 

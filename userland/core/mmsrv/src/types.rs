@@ -21,6 +21,7 @@ pub(crate) const REGION_HEAP: u8 = 0;
 pub(crate) const REGION_MMAP: u8 = 1;
 pub(crate) const REGION_SPAWN: u8 = 2;
 pub(crate) const REGION_SHARED_RO: u8 = 3;
+pub(crate) const REGION_FILE_SHARED: u8 = 4;
 pub(crate) const REGION_INITIAL_CAP: usize = 8;
 
 #[derive(Clone, Copy)]
@@ -36,6 +37,13 @@ pub(crate) struct MmRegion {
     /// Used for per-segment shared lib mappings where multiple regions
     /// share one MO at different offsets.
     pub(crate) mo_offset: u32,
+    pub(crate) backing_kind: u8,
+    pub(crate) backing_writeback: u8,
+    pub(crate) _pad: [u8; 2],
+    pub(crate) backing_id0: u64,
+    pub(crate) backing_id1: u64,
+    pub(crate) backing_file_offset: u64,
+    pub(crate) backing_file_size: u64,
 }
 
 impl MmRegion {
@@ -49,6 +57,13 @@ impl MmRegion {
             lazy: false,
             mo_cap: 0,
             mo_offset: 0,
+            backing_kind: 0,
+            backing_writeback: 0,
+            _pad: [0; 2],
+            backing_id0: 0,
+            backing_id1: 0,
+            backing_file_offset: 0,
+            backing_file_size: 0,
         }
     }
 }

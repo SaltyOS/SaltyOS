@@ -20,6 +20,7 @@ pub const SIG_DISP_CATCH: u8 = 2;
 // ---- Limits ----
 pub const INITIAL_CAPACITY: usize = 16;
 pub const MAX_NAME_LEN: usize = 32;
+pub const MAX_EXE_PATH_LEN: usize = 128;
 
 // ---- Per-process shared library mapping ----
 pub const MAX_PROC_MAPPED_LIBS: usize = 4;
@@ -107,6 +108,8 @@ pub struct Process {
     pub respawn_binary: [u8; MAX_NAME_LEN],
     /// NUL-terminated process name (set at spawn/exec).
     pub name: [u8; 32],
+    /// NUL-terminated executable path used for /proc/<pid>/exe.
+    pub exe_path: [u8; MAX_EXE_PATH_LEN],
     /// File creation mask (default 0o022).
     pub umask: u32,
 }
@@ -151,6 +154,7 @@ impl Process {
             respawn: false,
             respawn_binary: [0; MAX_NAME_LEN],
             name: [0; 32],
+            exe_path: [0; MAX_EXE_PATH_LEN],
             umask: 0o022,
         }
     }
@@ -390,6 +394,9 @@ pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
         p.respawn = false;
         for i in 0..MAX_NAME_LEN {
             p.respawn_binary[i] = 0;
+        }
+        for i in 0..MAX_EXE_PATH_LEN {
+            p.exe_path[i] = 0;
         }
         for i in 0..NSIG {
             p.sig_disposition[i] = SIG_DISP_DFL;
