@@ -661,7 +661,7 @@ pub(crate) fn handle_datagram(ip_hdr: &ipv4::Ipv4Header, data: &[u8]) {
         // If a recv is pending, deliver directly via completion
         if sock.pending_recv {
             let op_type = sock.pending_recv_op_type;
-            let want_timestamp = (sock.pending_recv_flags & trona::consts::INET_RECVMSG_WANT_TIMESTAMP) != 0;
+            let want_timestamp = (sock.pending_recv_flags & trona::consts::INET_RECV_FLAG_WANT_TIMESTAMP) != 0;
             sock.pending_recv = false;
             let max_len = sock.pending_recv_max_len as usize;
             let copy_len = core::cmp::min(payload.len(), max_len);
@@ -836,7 +836,7 @@ pub(crate) fn set_pending_recvfrom(conn_id: u32, max_len: u16, flags: u32) {
                     extra_conn_id: 0,
                     extra_ip: entry.src_ip,
                     extra_port: entry.src_port,
-                    timestamp_ns: if (flags & trona::consts::INET_RECVMSG_WANT_TIMESTAMP) != 0 {
+                    timestamp_ns: if (flags & trona::consts::INET_RECV_FLAG_WANT_TIMESTAMP) != 0 {
                         entry.timestamp_ns
                     } else {
                         options::TIMESTAMP_NONE_NS

@@ -695,13 +695,15 @@ pub(crate) unsafe fn handle_inet_read(
 
         let conn_id = (*fde).sock_id;
         let max_len = (*msg).regs[1] as u16;
+        let flags = (*msg).regs[2] as u32;
         let capped = if max_len > 152 { 152 } else { max_len };
 
         let mut req = TronaMsg::zeroed();
         req.label = NET_RECV;
         req.regs[0] = conn_id as u64;
         req.regs[1] = capped as u64;
-        req.length = 2;
+        req.regs[2] = flags as u64;
+        req.length = 3;
         let mut resp = TronaMsg::zeroed();
         let err = ipc::call_ctx(ipc_ctx(), VFS_CAP_NETSRV_EP, &raw const req, &raw mut resp);
 
@@ -732,7 +734,8 @@ pub(crate) unsafe fn handle_inet_read(
             wait_req.label = NET_RECV_WAIT;
             wait_req.regs[0] = conn_id as u64;
             wait_req.regs[1] = capped as u64;
-            wait_req.length = 2;
+            wait_req.regs[2] = flags as u64;
+            wait_req.length = 3;
             let mut wait_resp = TronaMsg::zeroed();
             let wait_err = ipc::call_ctx(
                 ipc_ctx(),

@@ -1463,8 +1463,8 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                             && (*(*cli).fds.add(fd as usize)).active != 0
                             && (*(*cli).fds.add(fd as usize)).fd_type == FD_TYPE_INET_SOCKET
                         {
-                            // Check regs[2]: 1 = recvfrom (wants address), 0 = recv
-                            if msg.regs[2] != 0 {
+                            let inet_flags = msg.regs[2] as u32;
+                            if (inet_flags & INET_RECV_FLAG_WANT_ADDR) != 0 {
                                 skip_reply = inet::handle_inet_recvfrom(
                                     &raw const msg,
                                     &raw mut reply,

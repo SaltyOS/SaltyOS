@@ -44,6 +44,59 @@ unsafe fn send_waiter_timeout_reply(waiter: *mut PollWaiter) {
     }
 }
 
+unsafe fn try_deliver_ready_waiter(cli: *const ClientState, waiter_idx: usize) -> bool {
+    unsafe {
+        let waiter = &mut POLL_WAITERS!()[waiter_idx];
+        if waiter.active == 0 {
+            return false;
+        }
+
+        let mut reply = TronaMsg::zeroed();
+        reply.label = TRONA_OK;
+
+        match waiter.kind {
+            POLL_WAITER_KIND_POLL => {
+                let mut ready_count: u64 = 0;
+                for i in 0..waiter.nfds as usize {
+                    let rev = check_fd_readiness(cli, waiter.fds[i].0, waiter.fds[i].1 as u32) as u16;
+                    reply.regs[1 + i] = rev as u64;
+                    if rev != 0 {
+                        ready_count += 1;
+                    }
+                }
+                if ready_count == 0 {
+                    return false;
+                }
+                reply.regs[0] = ready_count;
+                reply.length = 1 + waiter.nfds as u64;
+            }
+            POLL_WAITER_KIND_EPOLL => {
+                let mut ready_count: usize = 0;
+                for i in 0..waiter.nfds as usize {
+                    let rev = check_fd_readiness(cli, waiter.fds[i].0, waiter.fds[i].1 as u32);
+                    if rev == 0 {
+                        continue;
+                    }
+                    reply.regs[1 + ready_count * 2] = rev as u64;
+                    reply.regs[2 + ready_count * 2] = waiter.data[i];
+                    ready_count += 1;
+                }
+                if ready_count == 0 {
+                    return false;
+                }
+                reply.regs[0] = ready_count as u64;
+                reply.length = 1 + (ready_count as u64 * 2);
+            }
+            _ => return false,
+        }
+
+        ipc::send_ctx(ipc_ctx(), waiter.reply_slot, &raw const reply);
+        waiter.active = 0;
+        waiter.deadline_ns = 0;
+        true
+    }
+}
+
 pub(crate) unsafe fn expire_poll_timeouts(now_ns: u64) -> bool {
     unsafe {
         let mut expired = false;
@@ -559,6 +612,7 @@ pub(crate) unsafe fn handle_epoll_wait(
 
         // Build a synthetic poll waiter from epoll entries
         let mut found = false;
+        let mut waiter_idx = 0usize;
         for w in 0..max_poll_waiters() {
             if POLL_WAITERS!()[w].active == 0 {
                 POLL_WAITERS!()[w].active = 1;
@@ -578,6 +632,7 @@ pub(crate) unsafe fn handle_epoll_wait(
                 }
                 POLL_WAITERS!()[w].nfds = n;
                 found = true;
+                waiter_idx = w;
                 break;
             }
         }
@@ -586,6 +641,10 @@ pub(crate) unsafe fn handle_epoll_wait(
             let mut err_reply = TronaMsg::zeroed();
             err_reply.label = TRONA_OUT_OF_MEMORY;
             ipc::send_ctx(ipc_ctx(), slot, &raw const err_reply);
+        }
+
+        if found && try_deliver_ready_waiter(cli, waiter_idx) {
+            return true;
         }
 
         true // deferred
@@ -646,6 +705,7 @@ pub(crate) unsafe fn handle_poll(msg: *const TronaMsg, reply: *mut TronaMsg, bad
         }
 
         let mut found = false;
+        let mut waiter_idx = 0usize;
         for i in 0..max_poll_waiters() {
             if POLL_WAITERS!()[i].active == 0 {
                 POLL_WAITERS!()[i].active = 1;
@@ -660,6 +720,7 @@ pub(crate) unsafe fn handle_poll(msg: *const TronaMsg, reply: *mut TronaMsg, bad
                     POLL_WAITERS!()[i].data[j] = 0;
                 }
                 found = true;
+                waiter_idx = i;
                 break;
             }
         }
@@ -686,6 +747,7 @@ pub(crate) unsafe fn handle_poll(msg: *const TronaMsg, reply: *mut TronaMsg, bad
                             POLL_WAITERS!()[i].data[j] = 0;
                         }
                         found = true;
+                        waiter_idx = i;
                         break;
                     }
                 }
@@ -696,6 +758,10 @@ pub(crate) unsafe fn handle_poll(msg: *const TronaMsg, reply: *mut TronaMsg, bad
                 err_reply.label = TRONA_OUT_OF_MEMORY;
                 ipc::send_ctx(ipc_ctx(), slot, &raw const err_reply);
             }
+        }
+
+        if found && try_deliver_ready_waiter(cli, waiter_idx) {
+            return true;
         }
 
         if found && *(&raw const LOGGED_POLL_REGISTRATIONS) < 32 {

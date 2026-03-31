@@ -377,7 +377,7 @@ pub(crate) fn set_pending_recvfrom(conn_id: u32, max_len: u16, flags: u32) {
                 extra_conn_id: 0,
                 extra_ip: sock.rx_src_ip,
                 extra_port: 0,
-                timestamp_ns: if (flags & trona::consts::INET_RECVMSG_WANT_TIMESTAMP) != 0 {
+                timestamp_ns: if (flags & trona::consts::INET_RECV_FLAG_WANT_TIMESTAMP) != 0 {
                     sock.rx_timestamp_ns
                 } else {
                     options::TIMESTAMP_NONE_NS
@@ -608,7 +608,7 @@ pub(crate) fn deliver(ip_hdr: &Ipv4Header, data: &[u8]) {
                     extra_ip: ip_hdr.src,
                     extra_port: 0,
                     timestamp_ns: if (sock.pending_recvfrom_flags
-                        & trona::consts::INET_RECVMSG_WANT_TIMESTAMP)
+                        & trona::consts::INET_RECV_FLAG_WANT_TIMESTAMP)
                         != 0
                     {
                         options::sample_timestamp_ns(&sock.opts)

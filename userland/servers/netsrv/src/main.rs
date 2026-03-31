@@ -763,17 +763,30 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
         }
     }
 
-    fn handle_net_recv(reply: &mut TronaMsg, conn_id: u32, max_len: u16, arm_pending: bool) {
+    fn handle_net_recv(
+        reply: &mut TronaMsg,
+        conn_id: u32,
+        max_len: u16,
+        flags: u32,
+        arm_pending: bool,
+    ) {
         let capped = core::cmp::min(max_len, 152) as usize;
         let buf = unsafe {
             let dst = &raw mut reply.regs[1] as *mut u8;
             core::slice::from_raw_parts_mut(dst, capped)
         };
         let kind = socket_kind(conn_id);
+        let peek = (flags & INET_RECV_FLAG_PEEK) != 0;
         let result = match kind {
             SocketKind::Raw => net::socket::raw_ipv4::raw_recv(conn_id, buf),
             SocketKind::Udp => net::socket::udp::udp_recv(conn_id, buf),
-            SocketKind::Tcp => net::socket::tcp::tcp_recv(conn_id, buf),
+            SocketKind::Tcp => {
+                if peek {
+                    net::socket::tcp::tcp_recv_peek(conn_id, buf)
+                } else {
+                    net::socket::tcp::tcp_recv(conn_id, buf)
+                }
+            }
         };
         if result == -1 {
             if arm_pending {
@@ -785,7 +798,7 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
                         net::socket::udp::set_pending_recv(conn_id, capped as u16);
                     }
                     SocketKind::Tcp => {
-                        net::socket::tcp::set_pending_recv(conn_id, capped as u16);
+                        net::socket::tcp::set_pending_recv(conn_id, capped as u16, peek);
                     }
                 }
             }
@@ -804,7 +817,7 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
         flags: u32,
         arm_pending: bool,
     ) {
-        let want_timestamp = (flags & INET_RECVMSG_WANT_TIMESTAMP) != 0;
+        let want_timestamp = (flags & INET_RECV_FLAG_WANT_TIMESTAMP) != 0;
         let capped = core::cmp::min(max_len, 128) as usize;
         log_inet_ipc(b"recvfrom", conn_id, 0, 0, capped);
         let buf = unsafe {
@@ -1013,7 +1026,8 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
         NET_RECV => {
             let conn_id = msg.regs[0] as u32;
             let max_len = msg.regs[1] as u16;
-            handle_net_recv(reply, conn_id, max_len, false);
+            let flags = if msg.length >= 3 { msg.regs[2] as u32 } else { 0 };
+            handle_net_recv(reply, conn_id, max_len, flags, false);
         }
         NET_SENDTO => {
             let conn_id = msg.regs[0] as u32;
@@ -1040,14 +1054,15 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
             let flags = if msg.length >= 3 {
                 msg.regs[2] as u32
             } else {
-                INET_RECVMSG_WANT_ADDR
+                INET_RECV_FLAG_WANT_ADDR
             };
             handle_net_recvfrom(reply, conn_id, max_len, flags, false);
         }
         NET_RECV_WAIT => {
             let conn_id = msg.regs[0] as u32;
             let max_len = msg.regs[1] as u16;
-            handle_net_recv(reply, conn_id, max_len, true);
+            let flags = if msg.length >= 3 { msg.regs[2] as u32 } else { 0 };
+            handle_net_recv(reply, conn_id, max_len, flags, true);
         }
         NET_ACCEPT_WAIT => {
             let conn_id = msg.regs[0] as u32;
@@ -1059,7 +1074,7 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
             let flags = if msg.length >= 3 {
                 msg.regs[2] as u32
             } else {
-                INET_RECVMSG_WANT_ADDR
+                INET_RECV_FLAG_WANT_ADDR
             };
             handle_net_recvfrom(reply, conn_id, max_len, flags, true);
         }

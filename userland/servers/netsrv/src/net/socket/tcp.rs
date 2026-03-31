@@ -160,6 +160,7 @@ struct TcpControlBlock {
     pending_connect: bool,
     pending_recv: bool,
     pending_recv_max: u16,
+    pending_recv_peek: bool,
     pending_accept: bool,
 
     // Listen backlog
@@ -217,6 +218,7 @@ static mut TCBS: [TcpControlBlock; MAX_TCP_CONNS] = {
         pending_connect: false,
         pending_recv: false,
         pending_recv_max: 0,
+        pending_recv_peek: false,
         pending_accept: false,
         backlog: [PendingSyn {
             remote_ip: 0,
@@ -468,6 +470,7 @@ fn reset_tcb(idx: usize) {
         tcb.pending_connect = false;
         tcb.pending_recv = false;
         tcb.pending_recv_max = 0;
+        tcb.pending_recv_peek = false;
         tcb.pending_accept = false;
         tcb.backlog_count = 0;
         tcb.max_backlog = 0;
@@ -841,6 +844,33 @@ pub(crate) fn tcp_recv(conn_id: u32, buf: &mut [u8]) -> i32 {
     }
 }
 
+pub(crate) fn tcp_recv_peek(conn_id: u32, buf: &mut [u8]) -> i32 {
+    let idx = match find_tcb_by_conn_id(conn_id) {
+        Some(i) => i,
+        None => return -1,
+    };
+    // SAFETY: Single-threaded driver.
+    unsafe {
+        let tcb = &mut (*(&raw mut TCBS))[idx];
+
+        match tcb.state {
+            TcpState::CloseWait | TcpState::Closing | TcpState::LastAck | TcpState::TimeWait => {
+                if tcb.rx_buf.len == 0 {
+                    return 0;
+                }
+            }
+            TcpState::Closed => return -1,
+            _ => {}
+        }
+
+        if tcb.rx_buf.len > 0 {
+            return tcb.rx_buf.peek_all(buf) as i32;
+        }
+
+        -1
+    }
+}
+
 pub(crate) fn tcp_close(conn_id: u32) -> i32 {
     let idx = match find_tcb_by_conn_id(conn_id) {
         Some(i) => i,
@@ -1052,13 +1082,14 @@ pub(crate) fn tcp_poll_status(conn_id: u32, events: u16) -> u16 {
     }
 }
 
-pub(crate) fn set_pending_recv(conn_id: u32, max_len: u16) {
+pub(crate) fn set_pending_recv(conn_id: u32, max_len: u16, peek: bool) {
     if let Some(idx) = find_tcb_by_conn_id(conn_id) {
         // SAFETY: Single-threaded driver.
         unsafe {
             let tcb = &mut (*(&raw mut TCBS))[idx];
             tcb.pending_recv = true;
             tcb.pending_recv_max = max_len;
+            tcb.pending_recv_peek = peek;
         }
     }
 }
@@ -1563,6 +1594,7 @@ fn handle_established(idx: usize, hdr: &tcp_proto::TcpHeader, payload: &[u8]) {
             // If recv is pending, deliver EOF
             if tcb.pending_recv {
                 tcb.pending_recv = false;
+                tcb.pending_recv_peek = false;
                 push_completion(Completion {
                     conn_id: tcb.conn_id,
                     result: TRONA_OK,
@@ -1859,8 +1891,13 @@ fn process_data(idx: usize, hdr: &tcp_proto::TcpHeader, payload: &[u8]) {
                 extra_ip: 0,
                 extra_port: 0,
             };
-            let n = tcb.rx_buf.read(&mut comp.data[..max]);
+            let n = if tcb.pending_recv_peek {
+                tcb.rx_buf.peek_all(&mut comp.data[..max])
+            } else {
+                tcb.rx_buf.read(&mut comp.data[..max])
+            };
             comp.data_len = n;
+            tcb.pending_recv_peek = false;
             // TCP window field is 16 bits (max 65535). Our rx_buf capacity is
             // TCP_RX_BUF_SIZE (8192) which fits in u16. Window scaling (RFC
             // 7323) is not implemented.
@@ -1901,6 +1938,7 @@ fn complete_pending_with_error(idx: usize, err_code: u64) {
         }
         if tcb.pending_recv {
             tcb.pending_recv = false;
+            tcb.pending_recv_peek = false;
             push_completion(Completion {
                 conn_id: tcb.conn_id,
                 result: err_code,
