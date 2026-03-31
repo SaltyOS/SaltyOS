@@ -270,7 +270,16 @@ pub unsafe extern "C" fn fastpath_call_rust(
 
         sched.do_context_switch_fastpath(current, receiver);
 
-        // --- Caller has been woken by reply ---
+        // --- Caller has been woken ---
+        // If woken by notification (signal), bail to slowpath.
+        // The assembly reloads registers and re-enters syscall_call(),
+        // which catches woken_by_notification at the top without
+        // re-issuing the Call.
+        if (*current).woken_by_notification {
+            restore_irq(irq);
+            return FastpathResult::slowpath();
+        }
+
         let reply_msg = (*current).saved_caller_msg;
         let reply_badge = (*current).saved_caller_badge;
         write_msg_to_ipc_buffer(&reply_msg, reply_badge);

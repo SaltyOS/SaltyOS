@@ -1152,7 +1152,12 @@ impl Endpoint {
     /// Unlike send() followed by recv(), this is atomic: the caller is blocked
     /// BEFORE the receiver is woken, preventing a race where the receiver
     /// replies before the caller enters the Blocked state.
-    pub fn call(&mut self, msg: &Message, badge: u64) -> Message {
+    ///
+    /// Returns `(reply_message, interruption)`:
+    /// - `0` = normal reply from server
+    /// - `1` = interrupted from CallSendBlocked (server never received; safe to retry)
+    /// - `2` = interrupted from ReplyWait (server received; reply lost)
+    pub fn call(&mut self, msg: &Message, badge: u64) -> (Message, u8) {
         unsafe {
             self.ep_lock();
             let current = get_scheduler().current();
@@ -1170,7 +1175,11 @@ impl Endpoint {
                             super::block_current_thread_no_switch(current, BlockedReason::CallSendBlocked { msg: *msg, badge });
                             self.ep_unlock();
                             get_scheduler().reschedule();
-                            return (*current).saved_caller_msg;
+                            let intr = if (*current).woken_by_notification {
+                                (*current).woken_by_notification = false;
+                                1 // CallSendBlocked — server never received
+                            } else { 0 };
+                            return ((*current).saved_caller_msg, intr);
                         }
                     };
 
@@ -1210,7 +1219,11 @@ impl Endpoint {
 
                     // Caller blocked (ReplyWait) — reschedule with no lock held
                     get_scheduler().reschedule();
-                    (*current).saved_caller_msg
+                    let intr = if (*current).woken_by_notification {
+                        (*current).woken_by_notification = false;
+                        2 // ReplyWait — server received, reply lost
+                    } else { 0 };
+                    ((*current).saved_caller_msg, intr)
                 }
                 EndpointState::Idle | EndpointState::SendBlocked => {
                     self.send_queue.push(current);
@@ -1219,7 +1232,11 @@ impl Endpoint {
                     super::block_current_thread_no_switch(current, BlockedReason::CallSendBlocked { msg: *msg, badge });
                     self.ep_unlock();
                     get_scheduler().reschedule();
-                    (*current).saved_caller_msg
+                    let intr = if (*current).woken_by_notification {
+                        (*current).woken_by_notification = false;
+                        1 // CallSendBlocked — server never received
+                    } else { 0 };
+                    ((*current).saved_caller_msg, intr)
                 }
             }
         }

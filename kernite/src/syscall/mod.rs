@@ -44,6 +44,7 @@ pub enum Syscall {
     ReplyRecvAny = 24,
     RecvAnyTimed = 25,
     ReplyRecvAnyTimed = 26,
+    Sigreturn = 27,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -78,6 +79,7 @@ impl TryFrom<u64> for Syscall {
             24 => Ok(Syscall::ReplyRecvAny),
             25 => Ok(Syscall::RecvAnyTimed),
             26 => Ok(Syscall::ReplyRecvAnyTimed),
+            27 => Ok(Syscall::Sigreturn),
             _ => Err(SyscallError::InvalidOperation),
         }
     }
@@ -164,6 +166,7 @@ pub enum SyscallError {
     Cancelled = 12,
     Restart = 13,
     Deadlock = 14,
+    Interrupted = 15,
 }
 
 /// Maximum spin iterations waiting for cross-CPU suspend to complete.
@@ -803,13 +806,453 @@ fn syscall_call(
     // Phase 2: IPC under per-endpoint lock (managed inside method)
     unsafe {
         let irq = save_irq_disable();
+        let current = crate::sched::scheduler::scheduler().current();
+
+        // Fastpath may have woken us from ReplyWait with notification
+        // and bailed to slowpath. Catch that here without re-issuing call.
+        // Fastpath only enters ReplyWait (not CallSendBlocked), so intr=2.
+        if (*current).woken_by_notification {
+            (*current).woken_by_notification = false;
+            return handle_call_interrupted(current, cap_ptr, msg_info, irq, 2);
+        }
+
         let endpoint = &mut *(cap.object as *mut Endpoint);
-        let reply_msg = endpoint.call(&msg, cap.badge);
+        let (reply_msg, intr) = endpoint.call(&msg, cap.badge);
+
+        if intr != 0 {
+            return handle_call_interrupted(current, cap_ptr, msg_info, irq, intr);
+        }
+
         write_msg_to_ipc_buffer(&reply_msg, 0);
         restore_irq(irq);
     }
 
     SyscallResult::ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// Signal frame: kernel-injected context on the user stack for signal delivery
+// ---------------------------------------------------------------------------
+
+/// Magic value for signal frame validation
+const SIGFRAME_MAGIC: u64 = 0x5A17_5349_4746_524D;
+
+/// Signal frame pushed onto the user stack when the kernel interrupts
+/// a blocking IPC call due to a bound notification (signal delivery).
+///
+/// The kernel saves the full user register state plus FPU context,
+/// then redirects execution to the user-mode signal dispatcher.
+/// After signal handlers run, userspace calls `SYS_SIGRETURN` to
+/// restore the original context.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct SigFrame {
+    // General-purpose registers and control state (18 × 8 = 144 bytes)
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rbp: u64,
+    rsp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rip: u64,
+    rflags: u64,
+    // Signal metadata (6 × 8 = 48 bytes)
+    notification_bits: u64,
+    interrupted_syscall: u64,
+    syscall_cap_ptr: u64,
+    syscall_msg_info: u64,
+    restart_syscall: u64,
+    magic: u64,
+    // FPU/SSE/AVX state
+    fpu_saved: u64,
+    _fpu_pad: [u64; 7],
+    fpu_state: [u8; 832],
+}
+
+/// Signal frame (aarch64 variant).
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+struct SigFrame {
+    // General-purpose registers x0-x30 (31 × 8 = 248 bytes)
+    x: [u64; 31],
+    sp: u64,
+    pc: u64,
+    pstate: u64,
+    // Signal metadata
+    notification_bits: u64,
+    interrupted_syscall: u64,
+    syscall_cap_ptr: u64,
+    syscall_msg_info: u64,
+    restart_syscall: u64,
+    magic: u64,
+    // NEON/FP state
+    fpu_saved: u64,
+    _fpu_pad: [u64; 1],
+    fpu_state: [u8; 528],
+}
+
+/// Verify that all pages in `[addr, addr+size)` are mapped in the
+/// current thread's VSpace. Returns `false` if any page is unmapped.
+///
+/// # Safety
+/// Current thread's `vspace_root` must be valid. IRQs should be disabled.
+unsafe fn verify_user_pages_mapped(tcb: *mut crate::sched::thread::Tcb, addr: u64, size: u64, writable: bool) -> bool {
+    unsafe {
+        if size == 0 {
+            return true;
+        }
+        if (*tcb).vspace_root.is_null() {
+            return false;
+        }
+        let last_byte = match addr.checked_add(size - 1) {
+            Some(end) => end,
+            None => return false,
+        };
+        let first_page = addr & !0xFFF;
+        let last_page = last_byte & !0xFFF;
+
+        if writable {
+            let vspace = &mut *(*tcb).vspace_root;
+            let mut page_addr = first_page;
+            loop {
+                if !vspace.ensure_writable(page_addr) {
+                    return false;
+                }
+                if page_addr == last_page {
+                    break;
+                }
+                page_addr += 0x1000;
+            }
+        } else {
+            let vspace = &*(*tcb).vspace_root;
+            let mut page_addr = first_page;
+            loop {
+                if vspace.resolve_page(page_addr).is_none() {
+                    return false;
+                }
+                if page_addr == last_page {
+                    break;
+                }
+                page_addr += 0x1000;
+            }
+        }
+        true
+    }
+}
+
+/// Consume and return pending notification bits from the TCB's bound
+/// notification, atomically clearing them.
+///
+/// # Safety
+/// `tcb` must be a valid TCB pointer. IRQs should be disabled.
+unsafe fn consume_notification_bits(tcb: *mut crate::sched::thread::Tcb) -> u64 {
+    unsafe {
+        if (*tcb).bound_notification.is_null() {
+            return 0;
+        }
+        let ntfn = &mut *((*tcb).bound_notification as *mut crate::ipc::Notification);
+        ntfn.ntfn_lock();
+        let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
+        ntfn.ntfn_unlock();
+        bits
+    }
+}
+
+/// Inject a signal frame onto the user stack and redirect execution
+/// to the signal dispatcher.
+///
+/// Returns `Some(result)` on success with the arch-appropriate
+/// `SyscallResult` to return to userspace, or `None` on failure
+/// (e.g., stack overflow or unmapped page).
+///
+/// # Safety
+/// Must be called with IRQs disabled. `tcb` must be the current thread.
+/// The kernel stack must contain the user register state from syscall entry.
+unsafe fn inject_signal_frame(
+    tcb: *mut crate::sched::thread::Tcb,
+    dispatcher: u64,
+    cap_ptr: u64,
+    msg_info: u64,
+) -> Option<SyscallResult> {
+    unsafe {
+        let bits = consume_notification_bits(tcb);
+
+        // Flush FPU state from hardware to TCB if this thread owns it
+        let fpu_initialized = (*tcb).fpu_initialized;
+        if fpu_initialized {
+            crate::arch::fpu::flush_if_owner(tcb as *mut u8);
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Read saved user registers from the per-thread kernel stack.
+            // Layout (from syscall_entry pushes, syscall.S line 42-59):
+            //   kst-8  = user_rsp    kst-72  = r8
+            //   kst-16 = r15         kst-80  = rbp
+            //   kst-24 = r14         kst-88  = rdi
+            //   kst-32 = r13         kst-96  = rsi
+            //   kst-40 = r12         kst-104 = rdx
+            //   kst-48 = r11/RFLAGS  kst-112 = rcx/user RIP
+            //   kst-56 = r10         kst-120 = rbx
+            //   kst-64 = r9          kst-128 = rax/syscall#
+            let kst = (*tcb).kernel_stack_top as *const u64;
+            let user_rsp = *kst.offset(-1);
+
+            let mut frame = SigFrame {
+                rax: *kst.offset(-16),
+                rbx: *kst.offset(-15),
+                rcx: *kst.offset(-14),
+                rdx: *kst.offset(-13),
+                rsi: *kst.offset(-12),
+                rdi: *kst.offset(-11),
+                rbp: *kst.offset(-10),
+                rsp: user_rsp,
+                r8: *kst.offset(-9),
+                r9: *kst.offset(-8),
+                r10: *kst.offset(-7),
+                r11: *kst.offset(-6),
+                r12: *kst.offset(-5),
+                r13: *kst.offset(-4),
+                r14: *kst.offset(-3),
+                r15: *kst.offset(-2),
+                rip: *kst.offset(-14),
+                rflags: *kst.offset(-6),
+                notification_bits: bits,
+                interrupted_syscall: Syscall::Call as u64,
+                syscall_cap_ptr: cap_ptr,
+                syscall_msg_info: msg_info,
+                restart_syscall: 0,
+                magic: SIGFRAME_MAGIC,
+                fpu_saved: if fpu_initialized { 1 } else { 0 },
+                _fpu_pad: [0u64; 7],
+                fpu_state: [0u8; 832],
+            };
+
+            if fpu_initialized {
+                frame.fpu_state.copy_from_slice(&(*tcb).fpu_state.data);
+            }
+
+            let frame_size = core::mem::size_of::<SigFrame>() as u64;
+            // Keep the frame 64-byte aligned for XSAVE compatibility, and
+            // reserve one synthetic return-address slot below it so the
+            // dispatcher enters with the normal SysV x86_64 stack layout.
+            let frame_addr = match user_rsp.checked_sub(frame_size) {
+                Some(addr) => addr & !63,
+                None => return None,
+            };
+            let dispatcher_rsp = match frame_addr.checked_sub(8) {
+                Some(rsp) => rsp,
+                None => return None,
+            };
+
+            if dispatcher_rsp < (*tcb).user_stack_min || dispatcher_rsp >= user_rsp {
+                return None;
+            }
+
+            // Verify the synthetic return slot plus frame are writable before
+            // touching user memory.
+            if !verify_user_pages_mapped(tcb, dispatcher_rsp, frame_size + 8, true) {
+                return None;
+            }
+
+            let synthetic_return = 0u64;
+            if !crate::arch::uaccess::copy_to_user(frame_addr, &frame)
+                || !crate::arch::uaccess::copy_to_user(dispatcher_rsp, &synthetic_return)
+            {
+                return None;
+            }
+
+            // Redirect: modify kernel stack so sysretq goes to dispatcher
+            let kst = (*tcb).kernel_stack_top as *mut u64;
+            *kst.offset(-14) = dispatcher; // RCX → user RIP = dispatcher
+            *kst.offset(-1) = dispatcher_rsp; // user RSP = synthetic call frame
+            *kst.offset(-11) = frame_addr; // RDI = frame pointer (1st arg)
+
+            // x86_64: frame pointer delivered via RDI (1st arg register).
+            // RAX (error) is written by SyscallResult, but dispatcher
+            // ignores it — SyscallResult::ok(0) is fine.
+            Some(SyscallResult::ok(0))
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let ctx = &(*tcb).context;
+            let mut frame = SigFrame {
+                x: ctx.x,
+                sp: ctx.user_sp,
+                pc: ctx.return_elr,
+                pstate: ctx.return_spsr,
+                notification_bits: bits,
+                interrupted_syscall: Syscall::Call as u64,
+                syscall_cap_ptr: cap_ptr,
+                syscall_msg_info: msg_info,
+                restart_syscall: 0,
+                magic: SIGFRAME_MAGIC,
+                fpu_saved: if fpu_initialized { 1 } else { 0 },
+                _fpu_pad: [0u64; 1],
+                fpu_state: [0u8; 528],
+            };
+
+            if fpu_initialized {
+                frame.fpu_state.copy_from_slice(&(*tcb).fpu_state.data);
+            }
+
+            let frame_size = core::mem::size_of::<SigFrame>() as u64;
+            let new_sp = (ctx.user_sp - frame_size) & !0xF;
+
+            if new_sp < (*tcb).user_stack_min || new_sp >= ctx.user_sp {
+                return None;
+            }
+
+            let frame_size_check = core::mem::size_of::<SigFrame>() as u64;
+            if !verify_user_pages_mapped(tcb, new_sp, frame_size_check, true) {
+                return None;
+            }
+
+            if !crate::arch::uaccess::copy_to_user(new_sp, &frame) {
+                return None;
+            }
+
+            let ctx = &mut (*tcb).context;
+            ctx.user_sp = new_sp;
+            ctx.return_elr = dispatcher;
+
+            // aarch64: the syscall return path writes SyscallResult.error
+            // to x0 (restore_el0_frame_from_current_tcb overwrites ctx.x[0]).
+            // Deliver the frame pointer via SyscallResult.error so the
+            // dispatcher receives it in x0 as its first argument.
+            Some(SyscallResult { error: new_sp, value: 0 })
+        }
+    }
+}
+
+/// SYS_SIGRETURN: restore user context from a signal frame on the user stack.
+///
+/// Always returns `Interrupted` (EINTR). SA_RESTART is handled at the
+/// POSIX library level, not here, because:
+/// - The signal handler may have issued IPC that overwrote the IPC buffer
+/// - For ReplyWait interruptions, the message was already delivered to the
+///   server, so re-sending would cause duplicate processing
+fn syscall_sigreturn(frame_ptr: u64) -> SyscallResult {
+    unsafe {
+        let irq = save_irq_disable();
+        let current = crate::sched::scheduler::scheduler().current();
+
+        // Verify pages are mapped before reading to avoid kernel fault
+        let frame_size = core::mem::size_of::<SigFrame>() as u64;
+        if !verify_user_pages_mapped(current, frame_ptr, frame_size, false) {
+            restore_irq(irq);
+            return SyscallResult::err(SyscallError::BadAddress);
+        }
+
+        let frame: SigFrame = match crate::arch::uaccess::copy_from_user(frame_ptr) {
+            Some(f) => f,
+            None => {
+                restore_irq(irq);
+                return SyscallResult::err(SyscallError::BadAddress);
+            }
+        };
+
+        if frame.magic != SIGFRAME_MAGIC {
+            restore_irq(irq);
+            return SyscallResult::err(SyscallError::InvalidArgument);
+        }
+
+        // Restore FPU state from the signal frame. The signal handler may
+        // have used FPU/SSE/NEON and corrupted the thread's FPU context.
+        if frame.fpu_saved == 1 {
+            (*current).fpu_state.data.copy_from_slice(&frame.fpu_state);
+            // Invalidate FPU ownership so the next FPU instruction triggers
+            // a lazy reload from the (now-restored) TCB state.
+            crate::arch::fpu::disown_if_current(current as *mut u8);
+        }
+
+        // Restore user registers from the signal frame
+        #[cfg(target_arch = "x86_64")]
+        {
+            let kst = (*current).kernel_stack_top as *mut u64;
+            *kst.offset(-1) = frame.rsp;
+            *kst.offset(-2) = frame.r15;
+            *kst.offset(-3) = frame.r14;
+            *kst.offset(-4) = frame.r13;
+            *kst.offset(-5) = frame.r12;
+            *kst.offset(-6) = frame.rflags; // R11
+            *kst.offset(-7) = frame.r10;
+            *kst.offset(-8) = frame.r9;
+            *kst.offset(-9) = frame.r8;
+            *kst.offset(-10) = frame.rbp;
+            *kst.offset(-11) = frame.rdi;
+            *kst.offset(-12) = frame.rsi;
+            *kst.offset(-13) = frame.rdx;
+            *kst.offset(-14) = frame.rip; // RCX = user RIP
+            *kst.offset(-15) = frame.rbx;
+            // RAX is overwritten by SyscallResult.error → Interrupted
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let ctx = &mut (*current).context;
+            ctx.x = frame.x;
+            ctx.user_sp = frame.sp;
+            ctx.return_elr = frame.pc;
+            ctx.return_spsr = frame.pstate;
+        }
+
+        restore_irq(irq);
+        SyscallResult::err(SyscallError::Interrupted)
+    }
+}
+
+/// Handle a Call syscall that was interrupted by a bound notification.
+/// Injects a signal frame if a dispatcher is registered, otherwise
+/// returns Interrupted directly.
+///
+/// # Safety
+/// Must be called with IRQs disabled (`irq` from `save_irq_disable`).
+/// `tcb` must be the current thread.
+/// Handle a Call that was interrupted by a bound notification.
+///
+/// `intr`: 1 = CallSendBlocked (server never received → Restart),
+///         2 = ReplyWait (server received, reply lost → Interrupted).
+///
+/// # Safety
+/// IRQs disabled, `tcb` is current thread.
+unsafe fn handle_call_interrupted(
+    tcb: *mut crate::sched::thread::Tcb,
+    cap_ptr: u64,
+    msg_info: u64,
+    irq: u64,
+    intr: u8,
+) -> SyscallResult {
+    unsafe {
+        let dispatcher = (*tcb).signal_dispatcher;
+        if dispatcher != 0 {
+            if let Some(result) = inject_signal_frame(tcb, dispatcher, cap_ptr, msg_info) {
+                restore_irq(irq);
+                return result;
+            }
+        }
+        restore_irq(irq);
+        // Restart = server never received (safe to retry)
+        // Interrupted = server received, reply lost (non-idempotent ops must not retry)
+        if intr == 1 {
+            SyscallResult::err(SyscallError::Restart)
+        } else {
+            SyscallResult::err(SyscallError::Interrupted)
+        }
+    }
 }
 
 /// Reply to caller and receive next message (server pattern)
@@ -1578,6 +2021,10 @@ fn syscall_invoke_inner(
         (ObjectType::Tcb, 0x4D) => {
             // TCB_SET_TLS_BASE: arg0 = tls_base address
             syscall_tcb_set_tls_base(&cap, arg0)
+        }
+        (ObjectType::Tcb, 0x4E) => {
+            // TCB_SET_SIGNAL_DISPATCHER: arg0 = dispatcher address
+            syscall_tcb_set_signal_dispatcher(&cap, arg0)
         }
 
         // VSpace operations
@@ -2769,6 +3216,34 @@ fn syscall_tcb_set_tls_base(cap: &Capability, tls_base: u64) -> SyscallResult {
         restore_irq(irq);
     }
 
+    SyscallResult::ok(0)
+}
+
+/// TCB_SET_SIGNAL_DISPATCHER: Set the user-mode signal dispatcher entry
+/// point for a thread. When non-zero, the kernel injects a signal frame
+/// and redirects control to this address instead of returning EINTR.
+fn syscall_tcb_set_signal_dispatcher(cap: &Capability, dispatcher: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::CONFIGURE) {
+        return SyscallResult::err(e);
+    }
+
+    // 0 clears the dispatcher. Otherwise require a user-space entry point.
+    if dispatcher != 0 && dispatcher >= 0x0000_8000_0000_0000 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+    #[cfg(target_arch = "aarch64")]
+    if dispatcher & 0x3 != 0 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
+    unsafe {
+        let irq = save_irq_disable();
+        let tcb = &mut *(cap.object as *mut Tcb);
+        tcb.tcb_lock();
+        tcb.signal_dispatcher = dispatcher;
+        tcb.tcb_unlock();
+        restore_irq(irq);
+    }
     SyscallResult::ok(0)
 }
 
@@ -4892,6 +5367,7 @@ pub fn handle(
         Syscall::ReplyRecvAnyTimed => {
             syscall_reply_recv_any_timed(cap_ptr, msg_info, mr0, mr1, mr2, mr3)
         }
+        Syscall::Sigreturn => syscall_sigreturn(cap_ptr),
     }
 }
 

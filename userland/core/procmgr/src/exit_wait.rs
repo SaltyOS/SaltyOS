@@ -219,16 +219,25 @@ pub(crate) unsafe fn handle_exit(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             wake.regs[1] = proctab(idx).pid as u64;
 
             let waiter_cap = proctab(idx).waiter_reply;
-            trona::ipc::send_ctx(super::ipc_ctx(), waiter_cap, &raw const wake);
+            let send_err = trona::ipc::send_ctx(super::ipc_ctx(), waiter_cap, &raw const wake);
             trona::invoke::cnode_delete(super::CAP_SELF_CSPACE, waiter_cap);
             (&mut *(&raw mut super::ALLOCATOR)).free_single_slot(waiter_cap);
             proctab(idx).waiter_reply = 0;
             proctab(idx).waiter_pid = 0;
-            free_proc_alloc_slots(idx);
-            cleanup_proc_resources(idx, super::CAP_SELF_CSPACE);
-            if should_respawn {
-                respawn_process(&saved_binary);
+            let parent_alive = find_by_pid(ppid).is_some();
+            let preserve_zombie = send_err != 0 && parent_alive;
+            if !preserve_zombie {
+                // Reply delivered — safe to reap zombie
+                free_proc_alloc_slots(idx);
+                cleanup_proc_resources(idx, super::CAP_SELF_CSPACE);
+                if should_respawn {
+                    respawn_process(&saved_binary);
+                }
             }
+            // Preserve the zombie while the parent still exists, even if the
+            // waiter wake failed with InvalidOperation: interrupted waiters are
+            // no longer ReplyWait-blocked, so saved reply caps cannot wake
+            // them directly. The parent's retrying waitpid must find the zombie.
             return;
         }
 
@@ -251,14 +260,21 @@ pub(crate) unsafe fn handle_exit(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
                 wake.regs[1] = proctab(idx).pid as u64;
 
                 let waiter_cap = proctab(pi).any_waiter_reply;
-                trona::ipc::send_ctx(super::ipc_ctx(), waiter_cap, &raw const wake);
+                let send_err = trona::ipc::send_ctx(super::ipc_ctx(), waiter_cap, &raw const wake);
                 trona::invoke::cnode_delete(super::CAP_SELF_CSPACE, waiter_cap);
                 (&mut *(&raw mut super::ALLOCATOR)).free_single_slot(waiter_cap);
                 proctab(pi).any_waiter_reply = 0;
                 proctab(pi).waiting_for_any = 0;
-                free_proc_alloc_slots(idx);
-                cleanup_proc_resources(idx, super::CAP_SELF_CSPACE);
-                reaped = true;
+                let preserve_zombie = send_err != 0;
+                if !preserve_zombie {
+                    // Reply delivered — safe to reap zombie
+                    free_proc_alloc_slots(idx);
+                    cleanup_proc_resources(idx, super::CAP_SELF_CSPACE);
+                    reaped = true;
+                }
+                // If the wake fails, the parent is still alive but no longer
+                // blocked on the saved reply cap. Keep the zombie so the
+                // parent's retrying waitpid(-1) can collect it.
             }
         }
 

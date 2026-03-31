@@ -156,13 +156,16 @@ pub(crate) unsafe fn terminate_proc(idx: usize, sig: usize) -> bool {
             wake.regs[1] = proctab(idx).pid as u64;
 
             let waiter_cap = proctab(idx).waiter_reply;
-            trona::ipc::send_ctx(super::ipc_ctx(), waiter_cap, &raw const wake);
+            let send_err = trona::ipc::send_ctx(super::ipc_ctx(), waiter_cap, &raw const wake);
             trona::invoke::cnode_delete(super::CAP_SELF_CSPACE, waiter_cap);
             (&mut *(&raw mut super::ALLOCATOR)).free_single_slot(waiter_cap);
             proctab(idx).waiter_reply = 0;
             proctab(idx).waiter_pid = 0;
-            free_proc_alloc_slots(idx);
-            cleanup_proc_resources(idx, super::CAP_SELF_CSPACE);
+            let parent_alive = find_by_pid(ppid).is_some();
+            if send_err == 0 || !parent_alive {
+                free_proc_alloc_slots(idx);
+                cleanup_proc_resources(idx, super::CAP_SELF_CSPACE);
+            }
             return true;
         }
 
@@ -176,13 +179,15 @@ pub(crate) unsafe fn terminate_proc(idx: usize, sig: usize) -> bool {
                 wake.regs[1] = proctab(idx).pid as u64;
 
                 let waiter_cap = proctab(pi).any_waiter_reply;
-                trona::ipc::send_ctx(super::ipc_ctx(), waiter_cap, &raw const wake);
+                let send_err = trona::ipc::send_ctx(super::ipc_ctx(), waiter_cap, &raw const wake);
                 trona::invoke::cnode_delete(super::CAP_SELF_CSPACE, waiter_cap);
                 (&mut *(&raw mut super::ALLOCATOR)).free_single_slot(waiter_cap);
                 proctab(pi).any_waiter_reply = 0;
                 proctab(pi).waiting_for_any = 0;
-                free_proc_alloc_slots(idx);
-                cleanup_proc_resources(idx, super::CAP_SELF_CSPACE);
+                if send_err == 0 {
+                    free_proc_alloc_slots(idx);
+                    cleanup_proc_resources(idx, super::CAP_SELF_CSPACE);
+                }
             }
         }
 

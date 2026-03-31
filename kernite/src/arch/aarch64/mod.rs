@@ -826,4 +826,46 @@ pub mod uaccess {
             }
         }
     }
+
+    /// Maximum valid user-space address (lower half of 48-bit VA space).
+    const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
+
+    #[inline]
+    fn validate_user_range(addr: u64, size: usize) -> bool {
+        if addr >= USER_ADDR_LIMIT {
+            return false;
+        }
+        match addr.checked_add(size as u64) {
+            Some(end) => end <= USER_ADDR_LIMIT,
+            None => false,
+        }
+    }
+
+    /// Copy a value of type `T` from user-space address `addr`.
+    ///
+    /// # Safety
+    /// The user address must point to a mapped, readable page.
+    pub unsafe fn copy_from_user<T: Copy>(addr: u64) -> Option<T> {
+        if !validate_user_range(addr, core::mem::size_of::<T>()) {
+            return None;
+        }
+        let _guard = UserAccessGuard::new();
+        // SAFETY: Address validated; PAN relaxed by guard.
+        let val = unsafe { core::ptr::read_volatile(addr as *const T) };
+        Some(val)
+    }
+
+    /// Write a value of type `T` to user-space address `addr`.
+    ///
+    /// # Safety
+    /// The user address must point to a mapped, writable page.
+    pub unsafe fn copy_to_user<T: Copy>(addr: u64, val: &T) -> bool {
+        if !validate_user_range(addr, core::mem::size_of::<T>()) {
+            return false;
+        }
+        let _guard = UserAccessGuard::new();
+        // SAFETY: Address validated; PAN relaxed by guard.
+        unsafe { core::ptr::write_volatile(addr as *mut T, *val); }
+        true
+    }
 }
