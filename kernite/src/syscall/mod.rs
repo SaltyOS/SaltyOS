@@ -848,7 +848,7 @@ const SIGFRAME_MAGIC: u64 = 0x5A17_5349_4746_524D;
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 struct SigFrame {
-    // General-purpose registers (16 × 8 = 128 bytes)
+    // General-purpose registers and control state (18 × 8 = 144 bytes)
     rax: u64,
     rbx: u64,
     rcx: u64,
@@ -1045,28 +1045,40 @@ unsafe fn inject_signal_frame(
             }
 
             let frame_size = core::mem::size_of::<SigFrame>() as u64;
-            // 64-byte align for XSAVE area compatibility
-            let new_rsp = (user_rsp - frame_size) & !63;
+            // Keep the frame 64-byte aligned for XSAVE compatibility, and
+            // reserve one synthetic return-address slot below it so the
+            // dispatcher enters with the normal SysV x86_64 stack layout.
+            let frame_addr = match user_rsp.checked_sub(frame_size) {
+                Some(addr) => addr & !63,
+                None => return None,
+            };
+            let dispatcher_rsp = match frame_addr.checked_sub(8) {
+                Some(rsp) => rsp,
+                None => return None,
+            };
 
-            if new_rsp < (*tcb).user_stack_min || new_rsp >= user_rsp {
+            if dispatcher_rsp < (*tcb).user_stack_min || dispatcher_rsp >= user_rsp {
                 return None;
             }
 
-            // Verify all pages are mapped and writable before writing
-            let frame_size = core::mem::size_of::<SigFrame>() as u64;
-            if !verify_user_pages_mapped(tcb, new_rsp, frame_size, true) {
+            // Verify the synthetic return slot plus frame are writable before
+            // touching user memory.
+            if !verify_user_pages_mapped(tcb, dispatcher_rsp, frame_size + 8, true) {
                 return None;
             }
 
-            if !crate::arch::uaccess::copy_to_user(new_rsp, &frame) {
+            let synthetic_return = 0u64;
+            if !crate::arch::uaccess::copy_to_user(frame_addr, &frame)
+                || !crate::arch::uaccess::copy_to_user(dispatcher_rsp, &synthetic_return)
+            {
                 return None;
             }
 
             // Redirect: modify kernel stack so sysretq goes to dispatcher
             let kst = (*tcb).kernel_stack_top as *mut u64;
             *kst.offset(-14) = dispatcher; // RCX → user RIP = dispatcher
-            *kst.offset(-1) = new_rsp; // user RSP = signal frame
-            *kst.offset(-11) = new_rsp; // RDI = frame pointer (1st arg)
+            *kst.offset(-1) = dispatcher_rsp; // user RSP = synthetic call frame
+            *kst.offset(-11) = frame_addr; // RDI = frame pointer (1st arg)
 
             // x86_64: frame pointer delivered via RDI (1st arg register).
             // RAX (error) is written by SyscallResult, but dispatcher
@@ -3214,6 +3226,16 @@ fn syscall_tcb_set_signal_dispatcher(cap: &Capability, dispatcher: u64) -> Sysca
     if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::CONFIGURE) {
         return SyscallResult::err(e);
     }
+
+    // 0 clears the dispatcher. Otherwise require a user-space entry point.
+    if dispatcher != 0 && dispatcher >= 0x0000_8000_0000_0000 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+    #[cfg(target_arch = "aarch64")]
+    if dispatcher & 0x3 != 0 {
+        return SyscallResult::err(SyscallError::InvalidArgument);
+    }
+
     unsafe {
         let irq = save_irq_disable();
         let tcb = &mut *(cap.object as *mut Tcb);
