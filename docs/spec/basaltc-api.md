@@ -55,6 +55,13 @@ Rust. All functions use C ABI (`extern "C"`) and are linked into executables via
 - [FreeBSD Compat — Rune / Locale Internals](#freebsd-compat--rune--locale-internals)
 - [FreeBSD Compat — Miscellaneous](#freebsd-compat--miscellaneous)
 - [Miscellaneous POSIX](#miscellaneous-posix)
+- [pthread.h](#pthreadh)
+- [arpa/inet.h](#arpaineth)
+- [dlfcn.h](#dlfcnh)
+- [iconv.h](#iconvh)
+- [sys/random.h](#sysrandomh)
+- [netdb.h / netinet/in.h](#netdbh--netinetinh)
+- [search.h](#searchh)
 - [CRT / Process Startup](#crt--process-startup)
 - [Design Notes](#design-notes)
 
@@ -131,7 +138,7 @@ Flags: `-`, `+`, ` `, `0`, `#`. Width and precision supported (including `*`).
 
 ## stdlib.h
 
-Source: `stdlib_impl.rs`, `malloc.rs`, `process.rs`
+Source: `stdlib.rs`, `malloc.rs`, `process.rs`
 
 ### Memory Allocation (malloc.rs)
 
@@ -148,7 +155,7 @@ free blocks on `free()`. No thread safety.
 | `strdup` | F | malloc + strcpy |
 | `strndup` | F | malloc + bounded copy |
 
-### Conversions and Utilities (stdlib_impl.rs)
+### Conversions and Utilities (stdlib.rs)
 
 | Function | St | Notes |
 |---|---|---|
@@ -473,9 +480,13 @@ Constants: `PROT_READ`(1), `PROT_WRITE`(2), `PROT_EXEC`(4), `PROT_NONE`(0),
 Socket operations are in `trona` (`posix.rs`) rather than basaltc. The basaltc
 layer provides type definitions and constants used by ported programs.
 
-Constants: `AF_UNIX`(1), `AF_LOCAL`(1), `SOCK_STREAM`(1), `SOCK_DGRAM`(2),
-`SOCK_SEQPACKET`(5), `SOL_SOCKET`(1), `SO_REUSEADDR`(2), `SO_KEEPALIVE`(9),
-`SO_RCVBUF`(8), `SO_SNDBUF`(7), `SCM_RIGHTS`(1), `MSG_DONTWAIT`(0x40).
+Constants: `AF_UNIX`(1), `AF_LOCAL`(1), `AF_INET`(2), `AF_UNSPEC`(0),
+`SOCK_STREAM`(1), `SOCK_DGRAM`(2), `SOCK_SEQPACKET`(5), `SOL_SOCKET`(1),
+`SO_REUSEADDR`(2), `SO_KEEPALIVE`(9), `SO_RCVBUF`(8), `SO_SNDBUF`(7),
+`SCM_RIGHTS`(1), `MSG_DONTWAIT`(0x40), `MSG_PEEK`(0x02).
+
+Includes `getaddrinfo`, `freeaddrinfo`, `gai_strerror` for DNS resolution
+(delegates to dnssrv via netsrv).
 
 Socket functions (`socket`, `bind`, `listen`, `accept`, `connect`, `send`,
 `recv`, `sendmsg`, `recvmsg`, `sendto`, `recvfrom`, `getsockopt`, `setsockopt`,
@@ -486,7 +497,7 @@ Socket functions (`socket`, `bind`, `listen`, `accept`, `connect`, `send`,
 
 ## sys/select.h
 
-Source: `select_impl.rs`
+Source: `select.rs`
 
 | Function | St | Notes |
 |---|---|---|
@@ -530,7 +541,7 @@ Encoding: bits 7:0 = signal (0 if exited normally), bits 15:8 = exit code.
 
 ## signal.h
 
-Source: `signal_impl.rs`
+Source: `signal.rs`
 
 Notification-based signal delivery. 32 signals maximum. Signal handlers are
 stored in shared `trona` globals and dispatched from a notification-polling
@@ -563,11 +574,12 @@ Defined signals: `SIGHUP`(1), `SIGINT`(2), `SIGQUIT`(3), `SIGILL`(4),
 
 ## time.h / sys/time.h
 
-Source: `time_impl.rs`
+Source: `time.rs`
 
-UTC only — no timezone or DST support. `localtime` and `gmtime` return
-identical results. The kernel's monotonic clock starts at zero on boot (not
-wall-clock time).
+Timezone support via POSIX `TZ` environment variable (`tzset()` parses
+`EST5EDT,M3.2.0,M11.1.0` format with full DST transition rules). No
+`/usr/share/zoneinfo` database. Without `TZ`, defaults to UTC. The kernel's
+monotonic clock starts at zero on boot (not wall-clock time).
 
 | Function | St | Notes |
 |---|---|---|
@@ -579,8 +591,8 @@ wall-clock time).
 | `difftime` | F | `time1 - time0` as double |
 | `gmtime_r` | F | Breaks seconds into year/month/day/etc. Handles leap years. |
 | `gmtime` | F | Static-buffer variant |
-| `localtime_r` | F | Same as `gmtime_r` (UTC only) |
-| `localtime` | F | Same as `gmtime` (UTC only) |
+| `localtime_r` | F | Applies TZ offset + DST; calls `tzset()` on first use |
+| `localtime` | F | Static-buffer variant |
 | `mktime` | F | Converts struct tm to time_t; normalizes fields |
 | `asctime_r` | F | "Day Mon DD HH:MM:SS YYYY\n" format |
 | `asctime` | F | Static-buffer variant |
@@ -598,7 +610,7 @@ wall-clock time).
 
 ## math.h
 
-Source: `math_impl.rs`
+Source: `math.rs`
 
 All math functions use x87 FPU inline assembly. Both `double` and `float`
 variants provided where applicable. No SSE/AVX (target is
@@ -709,7 +721,7 @@ variants provided where applicable. No SSE/AVX (target is
 
 ## dirent.h
 
-Source: `dirent_impl.rs`
+Source: `dirent.rs`
 
 Static pool of 16 `DIR` entries. Each wraps a POSIX file descriptor obtained
 from `opendir` via VFS.
@@ -801,7 +813,7 @@ grouping (`()` in ERE, `\(\)` in BRE), case-insensitive matching.
 
 ## glob.h / fnmatch.h
 
-Source: `glob_impl.rs`
+Source: `glob.rs`
 
 | Function | St | Notes |
 |---|---|---|
@@ -815,7 +827,7 @@ Source: `glob_impl.rs`
 
 ## pwd.h
 
-Source: `pwd_impl.rs`
+Source: `pwd.rs`
 
 Single hardcoded user entry: `root` (uid=0, gid=0, home=/root, shell=/bin/sh).
 No `/etc/passwd` file is read.
@@ -838,7 +850,7 @@ No `/etc/passwd` file is read.
 
 ## grp.h
 
-Source: `pwd_impl.rs`
+Source: `pwd.rs`
 
 Single hardcoded group entry: `wheel` (gid=0, members=["root"]).
 
@@ -922,7 +934,7 @@ values.
 
 ## err.h
 
-Source: `err_impl.rs`
+Source: `misc.rs`
 
 BSD err(3) family. All functions write to stderr via `vsnprintf` + `write`.
 
@@ -989,7 +1001,7 @@ Source: `ioctl.rs`
 
 ## getopt (unistd.h)
 
-Source: `stdlib_impl.rs`
+Source: `stdlib.rs`
 
 | Function | St | Notes |
 |---|---|---|
@@ -1004,7 +1016,7 @@ Globals: `optind` (starts at 1), `optarg`, `opterr` (1 = print errors),
 
 ## setjmp.h
 
-Source: `stdlib_impl.rs`
+Source: `stdlib.rs`
 
 | Function | St | Notes |
 |---|---|---|
@@ -1173,7 +1185,7 @@ Source: `compat/freebsd/bsd_misc.rs`, `compat/freebsd/bsd_io.rs`
 
 ## Miscellaneous POSIX
 
-Source: `misc_impl.rs`
+Source: `misc.rs`
 
 | Function | St | Notes |
 |---|---|---|
@@ -1241,19 +1253,176 @@ Source: `crt.rs`
 
 | Function | St | Notes |
 |---|---|---|
-| `__libc_start_main` | F | CRT entry point; parses auxv for AT_BESALT_* tags, initializes IPC context and memory manager, calls main |
+| `__libc_start_main` | F | CRT entry point; parses auxv for AT_TRONA_* tags, initializes IPC context and memory manager, calls main |
 
 Custom auxiliary vector tags (set by init/rtld):
-- `AT_BESALT_IPC_BUFFER` (0x1000) — IPC buffer address
-- `AT_BESALT_VFS_EP` (0x1001) — VFS endpoint cap slot
-- `AT_BESALT_PROCMGR_EP` (0x1002) — Process manager endpoint cap slot
-- `AT_BESALT_CONSOLE_EP` (0x1003) — Console endpoint cap slot
-- `AT_BESALT_CSPACE` (0x1004) — CSpace root cap slot
-- `AT_BESALT_SIGNAL_NTF` (0x1005) — Signal notification cap slot
-- `AT_BESALT_MM_UNTYPED` (0x1006) — Memory manager untyped cap
-- `AT_BESALT_MM_VSPACE` (0x1007) — Memory manager vspace cap
-- `AT_BESALT_MM_NEXT_FREE` (0x1008) — First free CNode slot
-- `AT_BESALT_MM_CNODE_BITS` (0x1009) — CNode size in bits
+- `AT_TRONA_SLOT_BASE` (0x1007) — Slot allocator pool base
+- `AT_TRONA_SLOT_COUNT` (0x1008) — Slot allocator pool size
+- `AT_TRONA_CSPACE_NTFN` (0x100A) — CSpace notification cap
+- `AT_TRONA_MM_EP` (0x100B) — Memory manager (mmsrv) endpoint cap slot
+- `AT_TRONA_IPC_BUFFER` (0x100C) — IPC buffer address
+
+---
+
+## pthread.h
+
+Source: `pthread.rs`
+
+Full POSIX threads implementation backed by trona's thread creation and
+kernel futex-based synchronization.
+
+| Function | St | Notes |
+|---|---|---|
+| `pthread_create` | F | Creates thread via trona_clone, allocates 64KB stack |
+| `pthread_join` | F | Futex-based wait for thread completion |
+| `pthread_exit` | F | Calls trona_thread_exit |
+| `pthread_self` | F | Returns PthreadT (wraps thread ID) |
+| `pthread_detach` | F | Marks thread as detached |
+| `pthread_equal` | F | Compares two PthreadT values |
+| `pthread_cancel` | P | Sets cancellation flag, no async cancel |
+| `pthread_setcancelstate` | F | ENABLE/DISABLE |
+| `pthread_setcanceltype` | F | DEFERRED only (no ASYNCHRONOUS) |
+| `pthread_testcancel` | F | Checks cancellation flag |
+| `pthread_once` | F | Atomic one-time initialization via CAS |
+| `pthread_attr_init` | F | Default: joinable, 64KB stack |
+| `pthread_attr_destroy` | F | No-op |
+| `pthread_attr_setdetachstate` | F | JOINABLE/DETACHED |
+| `pthread_attr_getdetachstate` | F | |
+| `pthread_attr_setstacksize` | F | Custom stack size |
+| `pthread_attr_getstacksize` | F | |
+| `pthread_mutex_init` | F | Normal/recursive/errorcheck types |
+| `pthread_mutex_lock` | F | Kernel futex for contention |
+| `pthread_mutex_trylock` | F | Non-blocking |
+| `pthread_mutex_timedlock` | F | Absolute timeout |
+| `pthread_mutex_unlock` | F | Wakes one waiter |
+| `pthread_mutex_destroy` | F | No-op (no allocation) |
+| `pthread_mutexattr_init` | F | |
+| `pthread_mutexattr_destroy` | F | |
+| `pthread_mutexattr_settype` | F | NORMAL/RECURSIVE/ERRORCHECK |
+| `pthread_mutexattr_gettype` | F | |
+| `pthread_cond_init` | F | Futex-based |
+| `pthread_cond_wait` | F | |
+| `pthread_cond_signal` | F | Wakes one waiter |
+| `pthread_cond_broadcast` | F | Wakes all waiters |
+| `pthread_cond_timedwait` | F | Absolute timeout |
+| `pthread_cond_destroy` | F | No-op |
+| `pthread_condattr_init` | F | |
+| `pthread_condattr_destroy` | F | |
+| `pthread_rwlock_init` | F | Reader/writer lock via futex |
+| `pthread_rwlock_rdlock` | F | |
+| `pthread_rwlock_wrlock` | F | |
+| `pthread_rwlock_unlock` | F | |
+| `pthread_rwlock_tryrdlock` | F | |
+| `pthread_rwlock_trywrlock` | F | |
+| `pthread_rwlock_timedrdlock` | F | |
+| `pthread_rwlock_timedwrlock` | F | |
+| `pthread_rwlock_destroy` | F | |
+| `pthread_barrier_init` | F | |
+| `pthread_barrier_wait` | F | Returns SERIAL_THREAD for one waiter |
+| `pthread_barrier_destroy` | F | |
+| `pthread_key_create` | F | Thread-local storage (max 128 keys) |
+| `pthread_key_delete` | F | |
+| `pthread_getspecific` | F | Per-thread key-value lookup |
+| `pthread_setspecific` | F | |
+| `__pthread_cleanup_push` | F | Cleanup handler stack |
+| `__pthread_cleanup_pop` | F | |
+| `pthread_sigmask` | F | (in signal.rs) Signal mask manipulation |
+| `pthread_getthreadid_np` | F | BSD extension — returns integer thread ID |
+
+---
+
+## arpa/inet.h
+
+Source: `inet.rs`
+
+| Function | St | Notes |
+|---|---|---|
+| `inet_pton` | F | AF_INET: dotted-quad → binary; AF_INET6 not supported |
+| `inet_ntop` | F | AF_INET: binary → dotted-quad string |
+| `inet_addr` | F | Dotted-quad → network-order u32 |
+| `inet_aton` | F | Dotted-quad → in_addr |
+| `inet_ntoa` | F | in_addr → static string (single static buffer) |
+| `hstrerror` | F | Returns string for h_errno values |
+| `gethostbyname2` | S | Stub: returns null |
+| `gethostbyaddr` | S | Stub: returns null |
+| `bcmp` | F | BSD legacy: memcmp alias |
+| `sysctl` | S | Stub: returns -1 with ENOSYS |
+
+BSD aliases: `__inet_pton`, `__inet_ntop`, `__inet_aton`, `__inet_ntoa`,
+`__inet_addr`, `__h_errno`.
+
+---
+
+## dlfcn.h
+
+Source: `dlfcn.rs`
+
+| Function | St | Notes |
+|---|---|---|
+| `dlopen` | P | Limited: walks rtld link map for already-loaded libraries |
+| `dlsym` | P | Symbol lookup in loaded libraries via link map |
+| `dlclose` | P | Decrements refcount, no actual unloading |
+| `dlerror` | F | Returns last error string |
+| `dladdr` | F | Address-to-symbol lookup |
+
+No runtime loading of new shared objects; only pre-loaded libraries (via rtld)
+can be found.
+
+---
+
+## iconv.h
+
+Source: `iconv.rs`
+
+| Function | St | Notes |
+|---|---|---|
+| `iconv_open` | F | Supported encodings: UTF-8, ASCII, ISO-8859-1, UCS-2, UCS-4 |
+| `iconv` | F | Streaming conversion with shift state |
+| `iconv_close` | F | Frees conversion descriptor |
+
+Pure Rust implementation. No external ICU or glibc dependency.
+
+---
+
+## sys/random.h
+
+Source: `getrandom.rs`
+
+| Function | St | Notes |
+|---|---|---|
+| `getentropy` | F | Fills buffer from kernel RDRAND/RNDR via SYS_GETRANDOM |
+| `getrandom` | F | Same as getentropy with flags parameter (flags ignored) |
+| `arc4random` | F | Returns 32-bit random value |
+| `arc4random_buf` | F | Fills buffer with random bytes |
+| `arc4random_uniform` | F | Uniform random in [0, upper_bound) |
+
+---
+
+## netdb.h / netinet/in.h
+
+Source: `socket.rs`
+
+| Function | St | Notes |
+|---|---|---|
+| `getaddrinfo` | F | DNS resolution via dnssrv; supports AF_INET, SOCK_STREAM/DGRAM |
+| `freeaddrinfo` | F | Frees linked list of addrinfo |
+| `gai_strerror` | F | Error string for getaddrinfo error codes |
+| `gethostbyname` | F | Legacy resolver; returns static hostent |
+| `htons` / `ntohs` | F | Network byte order conversion |
+| `htonl` / `ntohl` | F | Network byte order conversion |
+
+---
+
+## search.h
+
+Source: `search.rs`
+
+| Function | St | Notes |
+|---|---|---|
+| `tsearch` | F | Binary tree insert |
+| `tfind` | F | Binary tree search |
+| `tdelete` | F | Binary tree delete |
+| `twalk` | F | Binary tree walk (preorder, postorder, leaf) |
 
 ---
 
@@ -1267,8 +1436,9 @@ Custom auxiliary vector tags (set by init/rtld):
   compact. Long-running programs with varied allocation patterns may fragment.
 - **ASCII only**: All string functions, ctype, locale, and wide character
   support assume ASCII / C locale. No UTF-8 or multibyte encoding.
-- **UTC only**: No timezone database. `localtime` = `gmtime`. The system
-  clock starts at zero on boot.
+- **No timezone database**: Timezone via POSIX `TZ` env var only (no
+  `/usr/share/zoneinfo`). `localtime` applies TZ offset + DST rules.
+  Without `TZ`, defaults to UTC. System clock starts at zero on boot.
 - **Single user**: uid=0 (root), gid=0 (wheel). All credential functions
   return these values.
 - **ramfs**: `fsync`/`fdatasync` are no-ops. All data is in memory.
@@ -1280,12 +1450,10 @@ Custom auxiliary vector tags (set by init/rtld):
 
 Functions not yet implemented that may be needed by additional ported programs:
 
-- `fts_open` / `fts_read` / `fts_close` / `fts_children` (file tree walk)
-- `nftw` / `ftw` (POSIX file tree walk)
-- Thread support (`pthread_*`)
-- `dlopen` / `dlsym` / `dlclose` (dynamic loading)
-- `iconv` (character encoding conversion)
+- `nftw` / `ftw` (POSIX file tree walk — `fts_*` is implemented)
 - Full symbolic mode parsing in `setmode`
-- `kqueue`/`kevent` (BSD event notification)
-- Cryptographically secure `getentropy` (needs kernel entropy source)
+- `kqueue` / `kevent` (BSD event notification)
 - Real timezone/DST support
+- `AF_INET6` support in socket/inet functions
+- `gethostbyname2` / `gethostbyaddr` (currently stubs)
+- Runtime `dlopen` of new shared objects (only pre-loaded libraries supported)

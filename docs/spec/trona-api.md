@@ -1,6 +1,6 @@
 # trona API Reference
 
-**Library:** `lib/trona/substrate/` (Rust, compiled to `libtrona.so`)
+**Library:** `lib/trona/` (Rust, 5-crate architecture, compiled to `libtrona.so`)
 **Edition:** Rust 2024
 **ABI:** All public functions use `extern "C"` for FFI compatibility.
 
@@ -8,6 +8,20 @@ This document catalogs every public function, type, and constant exported by
 trona. Functions are available both as Rust module APIs (e.g.
 `trona::ipc::call_ctx`) and as C ABI symbols (e.g. `trona_call`) resolved
 by the runtime dynamic linker (`rtld`).
+
+### Crate Structure
+
+| Crate | Path | Description |
+|-------|------|-------------|
+| `trona` | `substrate/` | Core: syscall wrappers, IPC, invoke, types, constants |
+| `trona_posix` | `posix/` | POSIX compatibility (Rust API only, no C ABI) |
+| `trona_loader` | `rtld/loader/` | ELF/TLS/CPIO loading |
+| `trona_uapi` | `uapi/` | Shared constants, protocol definitions, types |
+| `trona_win32` | `win32/` | Win32 subsystem support |
+
+Runtime dynamic linkers:
+- `ld-trona.so` (`rtld/ld/`) — ELF dynamic linker
+- `ld-trona-pe.so` (`rtld/pe/`) — PE/COFF dynamic linker (Win32 subsystem)
 
 ---
 
@@ -44,7 +58,14 @@ All error codes are defined in `consts.rs` and must match kernel `SyscallError` 
 | `TRONA_BUSY` | 7 | Resource is busy |
 | `TRONA_ALREADY_EXISTS` | 8 | Object already exists |
 | `TRONA_WOULD_BLOCK` | 9 | Operation would block (non-blocking mode) |
-| `TRONA_PENDING` | 0x80 | Async operation in progress |
+| `TRONA_BAD_ADDRESS` | 10 | Invalid memory address |
+| `TRONA_OUT_OF_RANGE` | 11 | Value exceeds valid range |
+| `TRONA_CANCELLED` | 12 | Operation cancelled or timed out |
+| `TRONA_RESTART` | 13 | Syscall should be restarted |
+| `TRONA_DEADLOCK` | 14 | Deadlock detected |
+| `TRONA_INTERRUPTED` | 15 | Interrupted by notification dispatch |
+| `TRONA_IN_PROGRESS` | 0x10 | Async operation in progress |
+| `TRONA_PENDING` | 0x80 | Deferred result pending |
 
 ---
 
@@ -64,7 +85,7 @@ All error codes are defined in `consts.rs` and must match kernel `SyscallError` 
 
 | Type | Repr | Description |
 |------|------|-------------|
-| `BesaltStat` | `#[repr(C)]` | File stat: st_ino, st_mode, st_nlink, st_size, st_uid, st_gid, st_mtime, st_type |
+| `TronaStat` | `#[repr(C)]` | File stat: st_ino, st_mode, st_nlink, st_size, st_uid, st_gid, st_mtime, st_type |
 | `BesaltDirent` | `#[repr(C)]` | Directory entry: d_ino, d_type, d_namlen, d_name[62] |
 | `PollFd` | `#[repr(C)]` | Poll descriptor: fd, events, revents |
 | `EpollEvent` | `#[repr(C)]` | Epoll event: events (u32), data (u64) |
@@ -130,8 +151,9 @@ pub fn syscall(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
 ```
 
 Issue a raw syscall. `num` is the syscall number (`SYS_SEND`, `SYS_RECV`, etc.).
-Arguments map to registers: a0=RDI, a1=RSI, a2=RDX, a3=R10, a4=R8, a5=R9.
-Returns `TronaResult { error, value }`.
+On x86_64: arguments map to registers a0=RDI, a1=RSI, a2=RDX, a3=R10, a4=R8, a5=R9.
+On aarch64: num=x8, a0=x0, a1=x1, a2=x2, a3=x3, a4=x4, a5=x5.
+Returns `TronaResult { error, value }` (RAX:RDX on x86_64, x0:x1 on aarch64).
 
 **Syscall numbers:**
 
@@ -154,6 +176,17 @@ Returns `TronaResult { error, value }`.
 | `SYS_DEBUG_PUTSTR` | 14 | Write string to serial |
 | `SYS_DEBUG_PUTBUF` | 15 | Write buffer to serial (atomic) |
 | `SYS_DEBUG_CONSOLE_CONTROL` | 16 | Console control |
+| `SYS_SET_INVOKE_DEPTHS` | 17 | Set CNode resolve depths |
+| `SYS_FUTEX` | 18 | Futex operations |
+| `SYS_GETRANDOM` | 19 | Hardware random |
+| `SYS_SHUTDOWN` | 20 | ACPI shutdown |
+| `SYS_SEND_TIMED` | 21 | Blocking send with timeout |
+| `SYS_RECV_TIMED` | 22 | Blocking receive with timeout |
+| `SYS_RECV_ANY` | 23 | Receive from any endpoint |
+| `SYS_REPLY_RECV_ANY` | 24 | Reply + wait on any endpoint |
+| `SYS_RECV_ANY_TIMED` | 25 | RecvAny with timeout |
+| `SYS_REPLY_RECV_ANY_TIMED` | 26 | ReplyRecvAny with timeout |
+| `SYS_NOTIF_RETURN` | 27 | Return from notification dispatcher |
 
 ---
 
@@ -280,7 +313,7 @@ Object types: `OBJ_UNTYPED` (1), `OBJ_ENDPOINT` (2), `OBJ_NOTIFICATION` (3), `OB
 | `tcb_write_registers` | `trona_tcb_write_registers` | `tcb, flags, rip, rsp` | `i32` |
 | `tcb_bind_notification` | -- | `tcb, ntfn` | `i32` |
 
-Invoke labels: `TCB_CONFIGURE` (0x40), `TCB_RESUME` (0x41), `TCB_SUSPEND` (0x42), `TCB_SET_SPACE` (0x43), `TCB_WRITE_REGISTERS` (0x46), `TCB_SET_IPC_BUFFER` (0x48), `TCB_BIND_NOTIFICATION` (0x49), `TCB_SET_FAULT_HANDLER` (0x4B).
+Invoke labels: `TCB_CONFIGURE` (0x40), `TCB_RESUME` (0x41), `TCB_SUSPEND` (0x42), `TCB_SET_SPACE` (0x43), `TCB_WRITE_REGISTERS` (0x46), `TCB_SET_IPC_BUFFER` (0x48), `TCB_BIND_NOTIFICATION` (0x49), `TCB_SET_FAULT_HANDLER` (0x4B), `TCB_COPY_FPU` (0x4C), `TCB_SET_TLS_BASE` (0x4D), `TCB_SET_NOTIFICATION_DISPATCHER` (0x4E).
 
 ### SchedContext Operations
 
@@ -289,7 +322,7 @@ Invoke labels: `TCB_CONFIGURE` (0x40), `TCB_RESUME` (0x41), `TCB_SUSPEND` (0x42)
 | `sc_configure` | `trona_sc_configure` | `sc, budget_us, period_us` | `i32` |
 | `sc_bind` | `trona_sc_bind` | `sc, tcb` | `i32` |
 
-Invoke labels: `SC_CONFIGURE` (0x30), `SC_BIND` (0x31).
+Invoke labels: `SC_CONFIGURE` (0x30), `SC_BIND` (0x31), `SC_UNBIND` (0x32), `SC_YIELD_TO` (0x33), `SC_CONSUMED` (0x34).
 
 ### VSpace Operations
 
@@ -304,7 +337,9 @@ Invoke labels: `SC_CONFIGURE` (0x30), `SC_BIND` (0x31).
 | `vspace_map_device_range` | -- | `vspace, device_untyped, offset_start, vaddr_start, num_pages, flags` | `(i32, u64)` |
 | `vspace_clone_cow_page` | `trona_vspace_clone_cow_page` | `src_vspace, src_vaddr, dst_vspace, dst_vaddr` | `i32` |
 
-Invoke labels: `VSPACE_MAP` (0x50), `VSPACE_UNMAP` (0x51), `VSPACE_MAP_PT` (0x52), `VSPACE_WALK` (0x53), `VSPACE_COPY_PAGE` (0x54), `VSPACE_MAP_DEVICE` (0x55), `VSPACE_CLONE_COW_PAGE` (0x56), `VSPACE_MAP_DEVICE_RANGE` (0x57).
+Invoke labels: `VSPACE_MAP` (0x50), `VSPACE_UNMAP` (0x51), `VSPACE_MAP_PT` (0x52), `VSPACE_WALK` (0x53), `VSPACE_COPY_PAGE` (0x54), `VSPACE_MAP_DEVICE` (0x55), `VSPACE_CLONE_COW_PAGE` (0x56), `VSPACE_MAP_DEVICE_RANGE` (0x57), `VSPACE_PROTECT` (0x58), `VSPACE_MAP_DEMAND` (0x59), `VSPACE_MAP_DEMAND_RANGE` (0x5A), `VSPACE_COW_RESOLVE` (0x5B), `VSPACE_SET_COW_POOL` (0x5C), `VSPACE_SET_COW_NOTIF` (0x5D), `VSPACE_REPLENISH_COW_POOL` (0x5E), `VSPACE_PROTECT_RANGE` (0x5F).
+
+VSpace MO labels: `VSPACE_MAP_MO` (0x97), `VSPACE_UNMAP_MO` (0x98), `VSPACE_SHARE_RO_PAGE` (0x99), `VSPACE_FORK_RANGE` (0x9A).
 
 VSpace flags: `VSPACE_FLAG_WRITABLE` (1), `VSPACE_FLAG_USER` (2), `VSPACE_FLAG_EXECUTABLE` (4), `VSPACE_FLAG_CACHE_DISABLE` (8), `VSPACE_FLAG_WRITE_THROUGH` (16), `VSPACE_FLAG_COW` (32).
 
@@ -326,7 +361,24 @@ Invoke labels: `IRQ_HANDLER_ACK` (0x61), `IRQ_HANDLER_SET_NOTIFICATION` (0x62).
 | `ioport_in16` | -- | `ioport, offset` | `u16` |
 | `ioport_out16` | -- | `ioport, offset, value` | `()` |
 
-Invoke labels: `IOPORT_IN8` (0x70), `IOPORT_OUT8` (0x71), `IOPORT_IN16` (0x72), `IOPORT_OUT16` (0x73).
+Invoke labels: `IOPORT_IN8` (0x70), `IOPORT_OUT8` (0x71), `IOPORT_IN16` (0x72), `IOPORT_OUT16` (0x73), `IOPORT_IN32` (0x74), `IOPORT_OUT32` (0x75), `IOPORT_CONFIGURE` (0x76), `IOPORT_CREATE` (0x77).
+
+### MemoryObject Operations
+
+| Rust Function | C ABI Name | Parameters | Returns |
+|---------------|------------|------------|---------|
+| `mo_commit` | `trona_mo_commit` | `mo, offset, count, ut_cap` | `i32` |
+| `mo_decommit` | `trona_mo_decommit` | `mo, offset, count` | `i32` |
+| `mo_get_size` | `trona_mo_get_size` | `mo` | `u64` |
+| `mo_clone` | `trona_mo_clone` | `mo, dest_slot, flags` | `i32` |
+| `mo_resize` | `trona_mo_resize` | `mo, new_page_count` | `i32` |
+| `mo_read` | `trona_mo_read` | `mo, offset, count` | `i32` |
+| `mo_write` | `trona_mo_write` | `mo, offset, count` | `i32` |
+| `mo_has_page` | `trona_mo_has_page` | `mo, page_index` | `u64` |
+| `vspace_map_mo` | `trona_vspace_map_mo` | `vspace, mo, vaddr, mo_offset, count, flags` | `i32` |
+| `vspace_unmap_mo` | `trona_vspace_unmap_mo` | `vspace, vaddr, count` | `i32` |
+
+Invoke labels: `MO_COMMIT` (0x90), `MO_DECOMMIT` (0x91), `MO_GET_SIZE` (0x92), `MO_CLONE` (0x93), `MO_RESIZE` (0x94), `MO_READ` (0x95), `MO_WRITE` (0x96), `MO_HAS_PAGE` (0x97).
 
 ---
 
@@ -341,9 +393,9 @@ All file I/O operations send IPC messages to the VFS server (`CAP_VFS_EP`).
 | `posix_write` | -- | `(fd: i32, buf: *const u8, count: u64) -> i64` | bytes written or -1 |
 | `posix_close` | -- | `(fd: i32) -> i32` | 0 or -1 |
 | `posix_lseek` | -- | `(fd: i32, offset: i64, whence: i32) -> i64` | new offset or -1 |
-| `posix_stat` | -- | `(path: *const u8, st: *mut BesaltStat) -> i32` | 0 or -1 |
-| `posix_lstat` | -- | `(path: *const u8, st: *mut BesaltStat) -> i32` | 0 or -1 |
-| `posix_fstat` | -- | `(fd: i32, st: *mut BesaltStat) -> i32` | 0 or -1 |
+| `posix_stat` | -- | `(path: *const u8, st: *mut TronaStat) -> i32` | 0 or -1 |
+| `posix_lstat` | -- | `(path: *const u8, st: *mut TronaStat) -> i32` | 0 or -1 |
+| `posix_fstat` | -- | `(fd: i32, st: *mut TronaStat) -> i32` | 0 or -1 |
 | `posix_access` | -- | `(path: *const u8, mode: i32) -> i32` | 0 or -1 |
 | `posix_unlink` | -- | `(path: *const u8) -> i32` | 0 or -1 |
 | `posix_rename` | -- | `(old_path: *const u8, new_path: *const u8) -> i32` | 0 or -1 |
@@ -805,11 +857,11 @@ pub struct FramebufferInfo {
 pub unsafe fn read_framebuffer_info() -> Option<FramebufferInfo>
 ```
 
-Reads framebuffer metadata from the kernel boot info page at `BOOTINFO_VADDR` (0xC00000). Returns `None` if magic is invalid or no framebuffer present.
+Reads framebuffer metadata from the kernel boot info page at `BOOTINFO_VADDR` (0x001F_F000). Returns `None` if magic is invalid or no framebuffer present.
 
 ---
 
-## 21. Constants Reference (`consts.rs`)
+## 21. Constants Reference (`uapi/consts/`)
 
 ### Fixed Virtual Addresses
 
@@ -817,7 +869,7 @@ Reads framebuffer metadata from the kernel boot info page at `BOOTINFO_VADDR` (0
 |----------|-------|-------------|
 | `INITRD_VADDR` | 0x0100_0000 | Initrd mapping base |
 | `SCRATCH_VADDR` | 0x0200_0000 | Scratch page for ELF loading |
-| `BOOTINFO_VADDR` | 0x00C0_0000 | Kernel boot info page |
+| `BOOTINFO_VADDR` | 0x001F_F000 | Kernel boot info page |
 | `BOOTINFO_MAGIC` | 0x534C5459_424F4F54 | "SLTYBOOT" magic value |
 
 ### Capability Rights

@@ -1,100 +1,69 @@
 # SaltyOS
 
-A Unix-like microkernel operating system written in Rust, with a custom 3-stage bootloader in Assembly and C.
+A capability-based microkernel operating system written in Rust, with a custom bootloader in Assembly and C. Dual-architecture (x86_64 + aarch64) with multi-personality subsystem support (POSIX and Win32).
 
 ## Overview
 
-SaltyOS is a capability-based microkernel designed with security and modularity as primary goals. It draws inspiration from seL4, L4, Minix3,
-and Fuchsia, implementing a minimal trusted computing base with most system services running in userspace.
+SaltyOS is a microkernel designed with security and modularity as primary goals. It draws inspiration from seL4, L4, Minix3, and Fuchsia, implementing a minimal trusted computing base with most system services running in userspace.
 
 ### Key Features
 
 - **Microkernel Architecture**: Only essential services (scheduling, IPC, memory management, capabilities) run in kernel space
-- **Capability-Based Security**: All resource access is mediated through unforgeable capability tokens
-- **Fat Capabilities**: Extended capability format with rich metadata for fine-grained access control
-- **Synchronous IPC + Notifications**: Fast rendezvous-style IPC with lightweight async signaling
-- **SMP Support**: Multi-core boot via ACPI MADT, per-CPU scheduling with IPI-driven reschedule (up to 16 CPUs)
-- **EDF Scheduler**: Earliest Deadline First scheduling for real-time workload support
-- **Multi-Architecture**: Designed for x86_64 with aarch64 support planned
+- **Capability-Based Security**: All resource access is mediated through unforgeable fat capability tokens (32 bytes with inline metadata)
+- **Synchronous IPC + Notifications**: Fast rendezvous-style IPC with lightweight async signaling and assembly fastpath for Call/ReplyRecv
+- **Multi-Architecture**: Full support for x86_64 (BIOS + UEFI) and aarch64 (UEFI)
+- **SMP Support**: Multi-core boot (ACPI MADT on x86_64, PSCI on aarch64), per-CPU scheduling with IPI-driven reschedule (up to 256 CPUs)
+- **EDF Scheduler**: Earliest Deadline First scheduling with budget enforcement and CPU affinity
+- **Multi-Personality Subsystem**: POSIX and Win32 subsystems running side-by-side, with personality-specific servers
+- **POSIX Compatibility**: Signals, pipes, Unix domain sockets, TCP/UDP inet sockets, poll/epoll, shared memory, fork/exec, PTY
+- **Win32 Compatibility**: PE/COFF loader, kernel32.dll shim, Win32 console subsystem (csrss)
+- **Network Stack**: TCP/UDP/ICMP via smoltcp, DNS resolver, DHCP, virtio-net driver
+- **MemoryObject-Based MM**: Fuchsia-inspired MemoryObject abstraction for mmap, file-backed pages, COW fork
 - **Custom Bootloader**: 3-stage bootloader supporting both BIOS and UEFI
-- **POSIX Compatibility Layer**: Signals, pipes, sockets, poll/epoll, shared memory, fork/exec
-- **C Standard Library (basaltc)**: Full stdio/stdlib/string/unistd for C program support
-- **Terminal Support**: Line discipline with canonical/raw mode, signal generation
-
-## Project Status
-
-### Completed Components
-
-- [x] **3-stage bootloader** (BIOS + UEFI support)
-- [x] **Kernel entry** with serial debug output
-- [x] **Memory management** (frame allocator, page tables, VSpace)
-- [x] **Capability system** (fat caps, CDT, CNode operations: copy/mint/move/mutate/revoke/delete/save_caller)
-- [x] **Synchronous IPC** (endpoints with send/recv/call/reply_recv/nbsend)
-- [x] **Async notifications** (signal/wait/poll, combined endpoint wait)
-- [x] **EDF scheduler** (budget enforcement, deadline-based)
-- [x] **Context switching** (full save/restore, per-thread user RSP)
-- [x] **Interrupt handling** (IDT, IRQ routing via notifications)
-- [x] **System call dispatch** (16 syscalls, capability invocations)
-- [x] **ELF loader** (loads userspace from CPIO initrd)
-- [x] **Init process** (service-based multi-phase bootstrap)
-- [x] **Console server** (serial I/O, line discipline, signal generation)
-- [x] **Runtime dynamic linker** (shared library loading)
-- [x] **Fault handling** (page fault delivery via fault endpoints, reply-to-resume)
-- [x] **IPC buffer** (message overflow MR4-MR19, capability transfer)
-- [x] **I/O port capabilities** (IoPort_In8/Out8/In16/Out16)
-- [x] **Debug syscalls** (DebugPutChar, DebugDumpState, DebugPutStr, DebugPutBuf)
-- [x] **Userspace servers** (procmgr, vfs, nameserv, mmsrv, display)
-- [x] **SMP** (ACPI MADT discovery, AP trampoline, per-CPU GDT/TSS, APIC timer, IPI reschedule/VSpace teardown, CPU affinity)
-- [x] **IPC assembly fastpath** (hybrid asm/Rust for Call + ReplyRecv, short messages, no cap transfer)
-- [x] **POSIX compatibility** (signals, Unix domain sockets, poll/select/epoll, pipes/FIFOs, shm, fd passing, fork/exec)
-- [x] **Bound notifications** (bidirectional TCB↔Notification link, combined IPC wait)
-- [x] **SMP locking discipline** (lock ordering enforcement, atomic serial output)
-- [x] **Time syscalls** (ClockGetTime, NanoSleep)
-- [x] **basaltc C standard library** (stdio, stdlib, string, malloc, unistd, signal, termios, dirent, regex)
-- [x] **Terminal line discipline** (ICANON, ECHO, ISIG with Ctrl-C/Ctrl-\/Ctrl-Z, tcgetattr/tcsetattr)
-- [x] **Automated test suite** (test_runner with 10 modules: hello, fs, mmap, fork, signal, socket, pipe, time, terminal, epoll)
-- [x] **Framebuffer display server** (shadow buffer, damage tracking, WC-optimized flush)
-- [x] **Centralized memory server (mmsrv)** (frame allocation, VSpace mapping, brk/mmap/fork delegation)
-- [x] **FPU/SSE lazy context switching** (per-thread FPU state, SSE2-optimized libc routines)
-- [x] **Declarative service wiring** (.service files with dependency graph, topological sort boot ordering)
-
-### Planned
-
-- [ ] **SaltyFS** (copy-on-write filesystem with snapshot support)
-- [ ] **aarch64 port**
-- [ ] **Network stack**
+- **SaltyFS**: Copy-on-write filesystem with B-tree directory indexing and snapshot support
+- **C/C++ Standard Library**: basalt libc (stdio, stdlib, string, malloc, termios, regex) and optional libc++
+- **Self-Hosting Toolchain**: Patched LLVM/Clang/LLD and rustc cross-compiled for SaltyOS targets
+- **Ports System**: 16+ third-party packages buildable for SaltyOS (bash, curl, python, perl, make, etc.)
 
 ## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                              Userspace                                       │
-├────────┬─────────┬────────┬────────┬──────┬──────────┬─────────┬─────────────┤
-│  init  │ console │ mmsrv  │procmgr │ vfs  │ nameserv │ display │    apps     │
-│        │(serial) │(pager) │        │      │          │  (fb)   │             │
-└───┬────┴────┬────┴───┬────┴───┬────┴──┬───┴────┬─────┴────┬────┴─────────────┘
-    │         │        │        │       │        │          │
-    │         │    IPC (Endpoints + Notifications)         │
-    │         │        │        │       │        │          │
-┌───┴─────────┴────────┴────────┴───────┴────────┴──────────┴──────────────────┐
-│                          SaltyOS Microkernel                                  │
-├──────────┬──────────┬──────────┬──────────┬──────────┬────────────────────────┤
-│Capability│   IPC    │Scheduler │  Memory  │   SMP    │   Arch (x86_64)        │
-│  System  │Endpoints │  (EDF)   │Management│ (APIC/   │   GDT/IDT/APIC        │
-│          │          │          │          │  IPI)    │                        │
-└──────────┴──────────┴──────────┴──────────┴──────────┴────────────────────────┘
+├──────────────────────────────────────────────────────────────────────────────┤
+│  POSIX Personality               │  Win32 Personality                        │
+│  ┌────────────────────────────┐  │  ┌─────────────────────────────────────┐  │
+│  │ posix_ttysrv  posix_getty  │  │  │ win32_csrss (console + imports)     │  │
+│  │ netsrv  dnssrv             │  │  │ kernel32.dll shim                   │  │
+│  └────────────────────────────┘  │  └─────────────────────────────────────┘  │
+├──────────────────────────────────┴──────────────────────────────────────────┤
+│  Core Services                                                               │
+│  ┌───────┬─────────┬────────┬─────────┬──────────┬──────────┬─────────────┐  │
+│  │ init  │  mmsrv  │procmgr │   vfs   │ nameserv │ console  │    apps     │  │
+│  └──┬────┴────┬────┴───┬────┴────┬────┴─────┬────┴─────┬────┴─────────────┘  │
+│     │         │        │         │          │          │                      │
+│  Drivers: pcidrv, blkdrv, netdrv, dispdrv  │  FS: saltyfs                    │
+├──────────────────────────────────┬──────────┴────────────────────────────────┤
+│     IPC (Endpoints + Notifications + Fastpath)                               │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                          SaltyOS Microkernel (kernite)                        │
+├──────────┬──────────┬──────────┬──────────┬──────────┬───────────────────────┤
+│Capability│   IPC    │Scheduler │  Memory  │   SMP    │ Arch (x86_64/aarch64) │
+│  System  │Endpoints │  (EDF)   │ (VSpace, │ (APIC/   │ GDT/IDT/APIC (x86)   │
+│ (fat cap)│ + Notif  │          │  MO,COW) │ GIC/IPI) │ GICv3/PSCI (arm)     │
+└──────────┴──────────┴──────────┴──────────┴──────────┴───────────────────────┘
 ```
 
 ## Building
 
 ### Prerequisites
 
-- Rust toolchain (nightly)
-- Meson build system (>= 1.1)
-- Ninja
-- NASM assembler
+- Rust nightly with `rust-src` component (edition 2024)
 - Clang (required; gcc is not supported)
+- NASM assembler
+- Meson (>= 1.1) + Ninja
 - QEMU (for testing)
+- OVMF / AAVMF (for UEFI testing)
 
 ### Quick Start
 
@@ -104,42 +73,176 @@ rustup install nightly
 rustup default nightly
 rustup component add rust-src
 
-# Configure build (requires CC=clang)
+# Configure and build (defaults to x86_64)
 just setup
-
-# Build
 just build
 
-# Run in QEMU (BIOS)
+# Run in QEMU
 just run
-
-# Run in QEMU (UEFI)
-just run-uefi
 ```
 
-### Build Options
+### Build Commands
 
 ```bash
-# Enable debug symbols
-just reconfigure -Ddebug_symbols=true
+just setup                  # Configure build (run once, defaults to x86_64)
+just build                  # Build all components
+just run                    # Build + run in QEMU (BIOS, single CPU)
+just run --smp 2            # Run with 2 CPUs
+just run --smp 4            # Run with 4 CPUs
+just run --uefi             # Run with UEFI firmware
+just run --gdb              # QEMU with GDB server (-s -S)
+just run --debug            # Run with interrupt/reset logging (qemu.log)
+just run --headless         # Headless (serial only, no GUI)
+just rr                     # Quick rebuild + run
+just distclean              # Remove all build dirs (needed before re-setup)
 
-# Change log level
+# Code quality
+just fmt                    # Format Rust (rustfmt) and C (clang-format)
+just fmt-check              # Check Rust formatting
+
+# Configuration
 just reconfigure -Dkernel_log_level=debug
-
-# Quick rebuild and run
-just rr
-
-# Run with GDB server
-just run-gdb
-
-# Headless debug (serial only, no GUI)
-just run-debug-headless
+just reconfigure -Ddebug_symbols=true
 ```
+
+Flags can be combined: `just run --smp 4 --uefi --headless --debug`.
+
+### Multi-Architecture
+
+```bash
+# aarch64 (UEFI-only)
+just arch=aarch64 setup
+just arch=aarch64 build
+just arch=aarch64 run
+```
+
+Build directories are arch-qualified (`build-x86_64`, `build-aarch64`). The `arch=` prefix applies to any recipe.
+
+### Custom Toolchain
+
+```bash
+just tc all                 # Build host Clang/LLD + rustc
+just self-host              # Cross-compile toolchain for SaltyOS
+```
+
+See [Toolchain Guide](docs/TOOLCHAIN.md) for details.
+
+### Ports
+
+Third-party software built via declarative `.port` files:
+
+```bash
+just port bash              # Build a port
+just fetch-ports            # Download all sources
+```
+
+Available ports: bash, bzip2, curl, freebsd-utils, make, nano, nasm, ncurses, ninja, openssl, perl, python, wget, xz, zlib, zstd.
+
+## Project Structure
+
+```
+SaltyOS/
+├── boot/                          # 3-stage bootloader (BIOS + UEFI)
+│   ├── stage1/                    # MBR / UEFI PE/COFF entry
+│   ├── stage2/                    # Mode setup (protected/long mode, identity map)
+│   ├── stage3/                    # FS mount, kernel + initrd loading
+│   └── common/                    # Shared utilities
+├── kernite/                       # Microkernel (Rust)
+│   └── src/
+│       ├── arch/{x86_64,aarch64}/ # Architecture-specific code
+│       ├── cap/                   # Capability system (CNode, CDT, Untyped, IoPort)
+│       ├── ipc/                   # Endpoints, Notifications, Futex, IRQ routing
+│       ├── mm/                    # VSpace, MemoryObject, COW, Bitmap PMM
+│       ├── sched/                 # EDF scheduler, TCB, PIP, sleep queue
+│       └── syscall/               # 28 syscalls, invoke dispatch, IPC fastpath
+├── userland/                      # Userspace programs (domain-based layout)
+│   ├── core/                      # Core infrastructure
+│   │   ├── init/                  # First process (service-based bootstrap)
+│   │   ├── mmsrv/                 # Memory manager server
+│   │   ├── procmgr/              # Process manager (spawn/exit/waitpid)
+│   │   ├── namesrv/              # Name service (endpoint lookup)
+│   │   └── vfs/                   # Virtual filesystem server
+│   ├── servers/                   # Service daemons
+│   │   ├── console/               # Serial console server
+│   │   ├── netsrv/                # TCP/UDP network stack (smoltcp)
+│   │   ├── dnssrv/                # DNS resolver
+│   │   ├── posix/                 # POSIX personality servers
+│   │   │   ├── posix_ttysrv/      # TTY/PTY daemon
+│   │   │   └── posix_getty/       # Login prompt
+│   │   └── win32/                 # Win32 personality servers
+│   │       └── win32_csrss/       # Win32 console + import resolver
+│   ├── drivers/                   # Device drivers
+│   │   ├── pcidrv/                # PCI enumeration server
+│   │   ├── blkdrv/                # Block device driver (virtio-blk)
+│   │   ├── netdrv/                # Network driver (virtio-net)
+│   │   ├── dispdrv/               # Display driver (framebuffer)
+│   │   └── filesystems/saltyfs/   # SaltyFS filesystem server
+│   ├── tests/                     # Test programs
+│   │   ├── test_runner/           # Automated test suite (16 modules)
+│   │   └── hello_pe/              # Win32 PE test program
+│   └── services/                  # Service descriptor files (.service)
+├── lib/                           # Shared libraries
+│   ├── trona/                     # System library (Rust)
+│   │   ├── substrate/             # Core kernel ABI (syscalls, IPC, invoke, types)
+│   │   ├── uapi/                  # Shared UAPI constants and protocol labels
+│   │   ├── posix/                 # POSIX compatibility layer
+│   │   ├── win32/                 # Win32 shim (kernel32.dll, console)
+│   │   ├── loader/                # ELF/PE/CPIO loaders
+│   │   └── rtld/{elf,pe}/         # Runtime dynamic linkers (ELF + PE)
+│   └── basalt/                    # C/C++ standard library
+│       ├── c/                     # libc.so (basaltc)
+│       └── cpp/                   # libc++.so (optional, from LLVM)
+├── ports/                         # Third-party software ports
+├── toolchain/                     # Custom LLVM + rustc (git submodules)
+├── tools/                         # Build utilities (mkcpio, mkimage, port builder)
+└── docs/                          # Documentation
+```
+
+## Design Philosophy
+
+### What the Kernel Does
+
+- SMP multi-core support (ACPI/PSCI discovery, per-CPU state, IPI reschedule/teardown)
+- Thread management and EDF scheduling with budget enforcement and CPU affinity
+- Synchronous IPC (endpoints) and async notifications with bound notification support
+- Virtual address space management (VSpace) with MemoryObject-based page mapping
+- Physical memory allocation (frame allocator, untyped retype, MemoryObject commit/decommit)
+- Capability-based access control (fat capabilities, CDT, CNode guard/radix tree)
+- Context switching, FPU lazy save/restore, and interrupt handling
+- IRQ routing to userspace via notification capabilities
+- I/O port access control via IoPort capabilities
+- Fault delivery to userspace fault handlers (page fault, cap fault)
+- Futex for userspace synchronization primitives
+
+### What the Kernel Does NOT Do
+
+- Filesystem (VFS + SaltyFS are userspace servers)
+- Memory allocation policy (mmsrv handles brk/mmap/fork/file-backed pages)
+- Network stack (netsrv handles TCP/UDP/ICMP via smoltcp)
+- Device drivers (userspace, with mapped MMIO or IoPort caps)
+- Process management policy (procmgr handles spawn/exit/signals)
+- DNS resolution (dnssrv handles recursive DNS)
+- Display management (dispdrv handles framebuffer)
+- Terminal/PTY management (posix_ttysrv handles line discipline)
+
+## Testing
+
+```bash
+just build                      # Must succeed before any commit
+just run                        # Quick smoke test — watch serial for KERNEL PANIC
+just run --smp 2                # SMP test — race conditions only show with >1 CPU
+just run --smp 4                # Stress test with 4 CPUs
+just run --headless --debug     # CI-like testing (serial only, logs to qemu.log)
+just fmt-check                  # Check Rust formatting
+```
+
+The `test_runner` runs 16 automated test modules (hello, fs, mmap, fork, signal, socket, pipe, time, terminal, epoll, dns, saltyfs, pthread, sse, neon, pe) and prints `PASS`/`FAIL` via serial output.
 
 ## Documentation
 
 - [Architecture Overview](docs/ARCHITECTURE.md)
 - [Building Guide](docs/BUILDING.md)
+- [Toolchain Guide](docs/TOOLCHAIN.md)
 - [Design Documents](docs/design/)
   - [Design Overview](docs/design/overview.md)
   - [Bootloader](docs/design/bootloader.md)
@@ -150,87 +253,14 @@ just run-debug-headless
   - [Memory Management](docs/design/memory.md)
   - [SaltyFS](docs/design/saltyfs.md)
   - [POSIX Compatibility](docs/design/posix.md)
+  - [trona System Library](docs/design/trona.md)
+  - [basalt C Library](docs/design/basaltc.md)
+  - [Memory Manager Server](docs/design/mmsrv.md)
+  - [Ports System](docs/design/ports.md)
 - [Specifications](docs/spec/)
   - [System Calls](docs/spec/syscalls.md)
   - [ABI](docs/spec/abi.md)
   - [Boot Protocol](docs/spec/boot_protocol.md)
-
-## Project Structure
-
-```
-SaltyOS/
-├── boot/                   # 3-stage bootloader
-│   ├── stage1/             # MBR/UEFI entry (ASM)
-│   ├── stage2/             # Protected/Long mode setup (C)
-│   ├── stage3/             # Filesystem + kernel loader (C)
-│   └── common/             # Shared utilities
-├── kernite/                # Rust microkernel
-│   └── src/
-│       ├── arch/           # Architecture-specific code
-│       ├── cap/            # Capability system
-│       ├── ipc/            # IPC subsystem
-│       ├── mm/             # Memory management
-│       ├── sched/          # Scheduler
-│       └── syscall/        # System call handlers
-├── userland/               # Userspace programs
-│   ├── init/               # First process (service-based bootstrap)
-│   ├── console/            # Serial console server
-│   ├── rtld/               # Runtime dynamic linker
-│   ├── mmsrv/              # Memory manager server (centralized pager)
-│   ├── procmgr/            # Process manager (spawn/exit/waitpid)
-│   ├── vfs/                # Virtual filesystem server
-│   ├── nameserv/           # Name service (endpoint lookup)
-│   ├── display/            # Framebuffer display server
-│   ├── test_runner/        # Automated test suite
-│   └── services/           # Service descriptor files (.service)
-├── lib/                    # Shared libraries
-│   ├── trona/              # System library (Rust, syscall wrappers + POSIX compat)
-│   └── basalt/             # C/C++ standard library (stdio, math, string, malloc, etc.)
-├── tools/                  # Build utilities
-│   ├── mkcpio.py           # Pack userland ELFs + services into initrd.cpio
-│   └── mkimage.py          # Create bootable disk image
-└── docs/                   # Documentation
-```
-
-## Design Philosophy
-
-### What the Kernel Does (Implemented)
-
-- SMP multi-core support (ACPI discovery, AP bootstrap, per-CPU state, IPI)
-- Thread management and EDF scheduling with budget enforcement and CPU affinity
-- Synchronous IPC (endpoints) and async notifications
-- Virtual address space management (VSpace) with page tables
-- Physical memory allocation (frame allocator, untyped retype)
-- Capability-based access control (fat capabilities, CDT)
-- Context switching and interrupt handling
-- IRQ routing to userspace via notification capabilities
-- I/O port access control via IoPort capabilities
-- Fault delivery to userspace fault handlers
-
-### What the Kernel Does NOT Do (Userspace)
-
-- Filesystem (VFS is a userspace server)
-- Memory allocation policy (mmsrv pager handles brk/mmap/frame allocation)
-- Network stack
-- Device drivers (userspace, with mapped MMIO)
-- Process management policy (userspace procmgr)
-- Access control policy (enforced via capabilities)
-
-## Testing
-
-```bash
-# Build and run in QEMU — watch serial for KERNEL PANIC or test_runner PASS/FAIL
-just run
-
-# SMP smoke test (boots with 2 CPUs — race conditions only show with >1 CPU)
-just run-smp
-
-# Stress test with 4 CPUs
-just run-smp4
-
-# Headless debug (serial only, logs to qemu.log)
-just run-debug-headless
-```
 
 ## Contributing
 
@@ -251,3 +281,4 @@ SaltyOS draws inspiration from:
 - [L4 family](https://en.wikipedia.org/wiki/L4_microkernel_family) - Microkernel principles
 - [Minix3](https://www.minix3.org/) - Userspace drivers
 - [Redox OS](https://www.redox-os.org/) - Rust OS development
+- [smoltcp](https://github.com/smoltcp-rs/smoltcp) - TCP/IP stack

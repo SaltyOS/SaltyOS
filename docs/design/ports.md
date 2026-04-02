@@ -11,7 +11,7 @@ Key components:
 | Component | Location | Purpose |
 |-----------|----------|---------|
 | `.port` files | `ports/<name>/<name>.port` | Declarative port definitions |
-| `portbuild` | `tools/portbuild/` | Host-side build tool (Rust) |
+| `port` | `tools/port/` | Host-side build tool (Rust) |
 | `basaltc` | `lib/basalt/c/` | C standard library (`libc.so`) |
 | Meson integration | `ports/meson.build` | Auto-discovery and build orchestration |
 
@@ -26,7 +26,7 @@ Key components:
 |  crt_start.o  |  libc.so (basaltc)             |
 |   [_start]    |  [stdio, malloc, string, ...]  |
 +-----------------------------------------------+
-|           trona.so (Rust)                    |
+|           libtrona.so (Rust)                    |
 |  [syscall wrappers, POSIX layer, IPC helpers]  |
 +-----------------------------------------------+
 |           SaltyOS Microkernel                  |
@@ -36,7 +36,7 @@ Key components:
 A C program links against:
 - `crt_start.o` — assembly entry point (`_start` -> `__libc_start_main`)
 - `libc.so` — C standard library (Rust + C implementation)
-- `trona.so` — system library with syscall wrappers
+- `libtrona.so` — system library with syscall wrappers
 - `core.o` + `compiler_builtins.o` — Rust runtime support
 
 ### Build-Time Flow
@@ -45,7 +45,7 @@ A C program links against:
 .port file
     |
     v
-portbuild (host tool)
+port (host tool)
     |
     +-- fetch -> checksum -> extract -> patch
     |
@@ -218,14 +218,14 @@ Available in `[source].url`, `[source].subdir`, `[prepare]`, `[targets.cflags]`,
 | `${SALTY_INC}` | Path to `lib/basalt/c/include/` |
 | `${NPROC}` | Number of parallel jobs |
 
-## portbuild Tool
+## port Tool
 
-`portbuild` is a Rust host tool (`tools/portbuild/`) that executes the port build pipeline.
+`port` is a Rust host tool (`tools/port/`) that executes the port build pipeline.
 
 ### Usage
 
 ```
-portbuild <command> <port-dir> [options]
+port <command> <port-dir> [options]
 
 Commands:
   build   Full build (all phases)
@@ -262,13 +262,13 @@ Cached phases use stamp files with input hashing. If a cached phase's inputs hav
 
 ### Cross-Compilation Environment
 
-portbuild automatically configures the cross-compilation environment:
+port automatically configures the cross-compilation environment:
 
 | Variable | Value |
 |----------|-------|
 | `CC` | `clang` |
 | `CFLAGS` | `-ffreestanding -nostdlib -nostdinc -fno-stack-protector -mno-red-zone -fPIC -isystem <basaltc-include> -isystem <clang-resource-dir>/include --target=x86_64-unknown-none` |
-| `LDFLAGS` | `-nostdlib -nostartfiles -fuse-ld=lld --target=x86_64-unknown-none -L<basaltc> -L<trona> -L<rust> -Wl,--dynamic-linker,/lib/ld-trona.so` |
+| `LDFLAGS` | `-nostdlib -nostartfiles -fuse-ld=lld --target=x86_64-unknown-none -L<basaltc> -L<trona> -L<rust> -Wl,--dynamic-linker,/lib/ld-libtrona.so` |
 | `LIBS` | `<basaltc>/crt_start.o -lc -ltrona <rust>/core.o <rust>/compiler_builtins.o` |
 | `AR` | `llvm-ar` |
 | `RANLIB` | `llvm-ranlib` |
@@ -302,7 +302,7 @@ ports/
 
 ## C Standard Library (basaltc)
 
-Ports link against `libc.so`, SaltyOS's C standard library implemented primarily in Rust with some C/ASM components.
+Ports link against `libc.so`, SaltyOS's C standard library implemented primarily in Rust.
 
 ### Architecture
 
@@ -316,20 +316,22 @@ lib/basalt/c/
 │   ├── string.rs        # strlen, strcmp, memcpy, strlcpy, ...
 │   ├── unistd.rs        # open, close, read, write, fork, exec, ...
 │   ├── process.rs       # fork, execve, execvp, wait
-│   ├── stdlib_impl.rs   # strtol, qsort, bsearch, rand
-│   ├── math_impl.rs     # fabs, copysign (x87 FPU inline asm)
-│   ├── err_impl.rs      # err(3), warn(3) BSD error reporting
+│   ├── stdlib.rs        # strtol, qsort, bsearch, rand
+│   ├── math.rs          # fabs, copysign (x87 FPU inline asm)
+│   ├── misc.rs          # dirname, basename, err(3), warn(3), syslog stubs
+│   ├── fts.rs           # BSD file tree stream
+│   ├── getopt.rs        # POSIX getopt + GNU getopt_long
 │   └── compat/freebsd/  # FreeBSD-specific stubs (capsicum, rune, bsd_io, ...)
+│       ├── libutil.rs   # expand_number, humanize_number, fgetln
+│       ├── md5.rs       # RFC 1321 MD5
+│       ├── cap_fileargs.rs  # Capsicum fileargs wrapper
+│       └── xo.rs        # libxo text-mode stubs
 ├── crt_start.S          # _start entry point (calls __libc_start_main)
 ├── setjmp.S             # setjmp/longjmp
-├── fts.c                # BSD file tree stream
-├── getopt.c             # POSIX getopt + GNU getopt_long
-├── libutil_compat.c     # expand_number, humanize_number, fgetln
-├── md5.c                # RFC 1321 MD5
-├── cap_fileargs.c       # Capsicum fileargs wrapper
-├── xo_stub.c            # libxo text-mode stubs
-├── include/             # 72 POSIX/BSD headers
-├── basaltc.ld            # Shared library linker script
+├── string.c             # Freestanding string/mem functions (for statically-linked init)
+├── include/             # 105 POSIX/BSD headers
+├── arch/x86_64/basaltc.ld   # Shared library linker script (x86_64)
+├── arch/aarch64/basaltc.ld  # Shared library linker script (aarch64)
 └── meson.build          # Build configuration
 ```
 
@@ -350,7 +352,7 @@ lib/basalt/c/
 
 ### Headers
 
-72 headers in `lib/basalt/c/include/` provide the C API surface:
+105 headers in `lib/basalt/c/include/` provide the C API surface:
 
 - **Standard C**: `stdio.h`, `stdlib.h`, `string.h`, `ctype.h`, `math.h`, `time.h`, `signal.h`, `setjmp.h`, `stddef.h`, `stdint.h`, `stdarg.h`, `stdbool.h`, `errno.h`, `assert.h`, `limits.h`, `inttypes.h`, `locale.h`
 - **POSIX**: `unistd.h`, `fcntl.h`, `dirent.h`, `sys/types.h`, `sys/stat.h`, `sys/mman.h`, `sys/socket.h`, `sys/un.h`, `sys/time.h`, `sys/wait.h`, `sys/select.h`, `sys/uio.h`, `sys/resource.h`, `poll.h`, `termios.h`, `sched.h`, `pwd.h`, `grp.h`, `glob.h`, `fnmatch.h`, `regex.h`
@@ -368,8 +370,8 @@ lib/basalt/c/
    ```
    custom_target('port_bash',
      output: ['bash.elf'],
-     depends: [portbuild, trona_so, libc_so, crt_start_obj],
-     command: [portbuild, 'build', <port-dir>, '-o', '@OUTDIR@', '-b', <build-root>],
+     depends: [port, trona_so, libc_so, crt_start_obj],
+     command: [port, 'build', <port-dir>, '-o', '@OUTDIR@', '-b', <build-root>],
    )
    ```
 4. **Manifest**: Each port generates a `.manifest` file listing its outputs
@@ -440,8 +442,8 @@ just run
 
 ### Tips
 
-- Use `portbuild info ports/myport` to verify the parsed configuration
-- Use `portbuild build ports/myport -v` for verbose build output
+- Use `port info ports/myport` to verify the parsed configuration
+- Use `port build ports/myport -v` for verbose build output
 - Use `--phase configure` to run a single phase for debugging
 - Set `sha256 = SKIP` during development, add the real checksum before committing
 - For programs that run host tools during build (e.g., code generators), ensure `CC_FOR_BUILD` and `CFLAGS_FOR_BUILD` are set correctly in `[env]`
@@ -449,10 +451,26 @@ just run
 
 ## Current Ports
 
-| Port | Version | Build Type | Programs | Description |
-|------|---------|------------|----------|-------------|
-| bash | 5.2.32 | autotools | `bash` | GNU Bourne Again Shell (minimal config: no readline, history, job control) |
-| freebsd-utils | 14.2 | targets | 22 utilities | FreeBSD userland utilities |
+16 ports are available:
+
+| Port | Build Type | Description |
+|------|------------|-------------|
+| bash | autotools | GNU Bourne Again Shell |
+| bzip2 | make/custom | bzip2 compression |
+| curl | autotools | URL transfer tool |
+| freebsd-utils | targets | FreeBSD userland utilities (22+ programs) |
+| make | autotools | GNU Make |
+| nano | autotools | GNU nano text editor |
+| nasm | autotools | Netwide Assembler |
+| ncurses | autotools | Terminal UI library |
+| ninja | custom | Ninja build system |
+| openssl | custom | OpenSSL cryptographic library |
+| perl | autotools | Perl interpreter |
+| python | autotools | Python interpreter |
+| wget | autotools | Network file retrieval |
+| xz | autotools | XZ compression |
+| zlib | make/custom | zlib compression library |
+| zstd | make/custom | Zstandard compression |
 
 ### freebsd-utils Programs
 
@@ -461,7 +479,9 @@ just run
 | `bin/` | echo, cat, ls, cp, mv, rm, mkdir, rmdir, ln, chmod, test, sleep, pwd |
 | `usr/bin/` | head, tail, wc, sort, uniq, basename, dirname, env, tee, id, uname, true, false |
 
-## References
+## Cross-References
 
+- [POSIX Compatibility](posix.md) -- basaltc POSIX API coverage
+- [basaltc Design](basaltc.md) -- C standard library that ports link against
+- [trona Design](trona.md) -- System library providing syscall wrappers
 - [FreeBSD Ports Collection](https://docs.freebsd.org/en/books/porters-handbook/)
-- [POSIX Compatibility](posix.md) — basaltc POSIX API coverage

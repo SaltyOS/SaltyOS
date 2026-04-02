@@ -472,9 +472,21 @@ fn cross_cpu_wakeup(tcb: TcbRef, target_cpu: usize) {
     enqueue_unlocked(tcb);
 
     // Send IPI to trigger reschedule on target CPU
+    // x86_64: Local APIC ICR write (vector 0xFD)
+    // aarch64: GICv3 SGI (Software Generated Interrupt) via ICC_SGI1R_EL1
     arch::send_ipi(target_cpu, IPI_RESCHEDULE);
 }
 ```
+
+### Multi-Architecture SMP
+
+| Aspect | x86_64 | aarch64 |
+|--------|--------|---------|
+| CPU discovery | ACPI MADT table | Device tree / ACPI |
+| AP bringup | AP trampoline (real→long mode) | PSCI CPU_ON (HVC call) + mailbox handoff |
+| IPI mechanism | Local APIC ICR | GICv3 SGI (ICC_SGI1R_EL1) |
+| Timer | APIC timer (PIT-calibrated) | Generic timer CNTP (PPI 30, 10ms tick) |
+| Per-CPU data | `%gs:offset` via MSR | TPIDR_EL1 system register |
 
 ## Configuration
 
@@ -516,12 +528,15 @@ pub const DEFAULT_SCHED_CONFIG: SchedConfig = SchedConfig {
 
 ### SC Operations
 
-SchedContext has two invoke labels (0x30-0x31):
+SchedContext has five invoke labels (0x30-0x34):
 
 | Label | Name | Description |
 |-------|------|-------------|
 | 0x30 | SC_CONFIGURE | Set budget, period, and priority |
 | 0x31 | SC_BIND | Bind SC to a TCB |
+| 0x32 | SC_UNBIND | Unbind SC from its TCB |
+| 0x33 | SC_YIELD_TO | Yield current timeslice to target SC |
+| 0x34 | SC_CONSUMED | Query consumed CPU time |
 
 ```rust
 /// Scheduling context invocation dispatch
@@ -547,6 +562,22 @@ pub fn invoke_sched_context(
         SC_BIND => {
             let tcb_cap = msg.get_cap(0);
             sc_bind(sc, tcb_cap)
+        }
+
+        // Unbind SC from its current TCB
+        SC_UNBIND => {
+            sc_unbind(sc)
+        }
+
+        // Yield current timeslice to the target SC
+        SC_YIELD_TO => {
+            let target_sc_cap = msg.get_cap(0);
+            sc_yield_to(sc, target_sc_cap)
+        }
+
+        // Query consumed CPU time
+        SC_CONSUMED => {
+            sc_consumed(sc)
         }
 
         _ => InvokeResult::Error(SyscallError::InvalidOperation),

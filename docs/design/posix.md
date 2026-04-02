@@ -12,17 +12,17 @@ SaltyOS follows the **microkernel POSIX model** pioneered by Minix3 and QNX:
 - **basaltc** (C) provides a standard C library on top of trona
 
 ```
-+-----------------------------------------------+
-|              Applications                      |
-+-----------------------------------------------+
-|    basaltc (C stdlib)  |  trona (Rust)       |
-|      [POSIX calls -> IPC + capabilities]       |
-+-----------------------------------------------+
-|  VFS  |  ProcMgr  |  Console  |  Drivers      |
-+-----------------------------------------------+
-|            SaltyOS Microkernel                 |
-|  [Endpoints, Notifications, CNodes, VSpace]   |
-+-----------------------------------------------+
++----------------------------------------------------------+
+|                     Applications                          |
++----------------------------------------------------------+
+|    basaltc (C stdlib)     |  trona (Rust)                |
+|         [POSIX calls -> IPC + capabilities]               |
++----------------------------------------------------------+
+|  VFS  |  ProcMgr  |  Console  |  netsrv  |  Drivers      |
++----------------------------------------------------------+
+|                 SaltyOS Microkernel                       |
+|  [Endpoints, Notifications, CNodes, VSpace, MemoryObject] |
++----------------------------------------------------------+
 ```
 
 ### Why This Approach?
@@ -40,8 +40,8 @@ SaltyOS follows the **microkernel POSIX model** pioneered by Minix3 and QNX:
 
 SaltyOS uses a two-layer userspace library stack:
 
-- **trona** (`lib/trona/substrate/`, Rust): System library providing raw syscall wrappers, IPC helpers, capability invocations, and POSIX compatibility functions (`posix.rs`, `posix_mm.rs`, `signals.rs`). Compiled as `libtrona.so` (shared) and linked statically into `init`.
-- **basaltc** (`lib/basaltc/`, C): Standard C library built on top of trona, providing stdio, stdlib, string, malloc, unistd, signal, termios, dirent, regex, and more.
+- **trona** (`lib/trona/`, Rust): System library with 5 crates -- substrate (syscalls, IPC, invoke), posix (file, socket, poll, mm, signals, pthread, dns), loader (ELF/PE), uapi (shared constants/types/protocols), and win32 (Win32 personality support). Compiled as `libtrona.so` (shared) and linked statically into `init`.
+- **basaltc** (`lib/basalt/c/`, C): Standard C library (40 Rust modules) built on top of trona, providing stdio, stdlib, string, malloc, unistd, signal, termios, dirent, regex, socket, inet, pthread, iconv, and more.
 
 **How POSIX calls work**:
 ```rust
@@ -56,10 +56,15 @@ pub extern "C" fn open(path: *const u8, flags: i32, mode: u32) -> i32 {
 
 | Server | POSIX Functions |
 |--------|-----------------|
-| **VFS** | open, read, write, close, stat, lseek, dup/dup3, pipe/pipe2, mkfifo, socket (AF_UNIX), poll, epoll, shm_open/shm_unlink, ftruncate |
-| **ProcMgr** | fork, exec, exit, wait, getpid, kill, signal delivery, process groups |
-| **Console** | Serial I/O, line discipline (ICANON/ECHO/ISIG), tcgetattr/tcsetattr, signal generation (Ctrl-C/Ctrl-\/Ctrl-Z) |
-| **trona** | mmap (anonymous), munmap, mprotect, brk/sbrk, sigaction, sigprocmask, select |
+| **VFS** (`core/vfs/`) | open, read, write, close, stat, lseek, dup/dup3, pipe/pipe2, mkfifo, socket (AF_UNIX), poll, epoll, shm_open/shm_unlink, ftruncate, AF_INET socket proxy (forwarded to netsrv) |
+| **ProcMgr** (`core/procmgr/`) | fork, exec, exit, wait, getpid, kill, signal delivery, process groups, personality state (POSIX/Win32) |
+| **Console** (`servers/console/`) | Serial I/O, line discipline (ICANON/ECHO/ISIG), tcgetattr/tcsetattr, signal generation (Ctrl-C/Ctrl-\/Ctrl-Z) |
+| **posix_ttysrv** (`servers/posix/posix_ttysrv/`) | TTY daemon with SHM ring buffer for terminal I/O |
+| **posix_getty** (`servers/posix/posix_getty/`) | Getty (login prompt) |
+| **netsrv** (`servers/netsrv/`) | TCP/UDP/ICMP stack, ARP, DHCP client, DNS forwarding, AF_INET socket implementation |
+| **dnssrv** (`servers/dnssrv/`) | Caching DNS resolver, getaddrinfo backend |
+| **mmsrv** (`core/mmsrv/`) | mmap (anonymous + file-backed), munmap, mprotect, brk/sbrk, demand paging, shared memory frames |
+| **trona** (library) | sigaction, sigprocmask, select (wrapper around poll), pthread |
 
 ### IPC Flow Example
 
@@ -168,6 +173,8 @@ Application                  trona                    VFS Server
 | Line discipline | Implemented | ICANON, ECHO/ECHOE/ECHOK/ECHOCTL, ISIG |
 | Signal generation | Implemented | Ctrl-C→SIGINT, Ctrl-\→SIGQUIT, Ctrl-Z→SIGTSTP |
 
+**Terminal servers:** Console (`servers/console/`) provides raw serial I/O with line discipline. posix_ttysrv (`servers/posix/posix_ttysrv/`) provides the TTY daemon using SHM ring buffers for terminal I/O. posix_getty (`servers/posix/posix_getty/`) provides the login prompt (getty).
+
 ### Time
 
 | Function | Status | Notes |
@@ -179,8 +186,43 @@ Application                  trona                    VFS Server
 
 | Function | Status | Notes |
 |----------|--------|-------|
-| `socket(AF_INET, ...)` | Future | Via NetStack server |
-| `getaddrinfo` | Future | |
+| `socket(AF_INET, SOCK_STREAM)` | Implemented | VFS → netsrv (TCP) |
+| `socket(AF_INET, SOCK_DGRAM)` | Implemented | VFS → netsrv (UDP) |
+| `connect` | Implemented | VFS → netsrv (blocking, async completion via callback EP) |
+| `bind` | Implemented | VFS → netsrv |
+| `listen` | Implemented | VFS → netsrv |
+| `accept` | Implemented | VFS → netsrv (blocking, NET_ACCEPT_WAIT) |
+| `send`, `recv` | Implemented | VFS → netsrv (MSG_PEEK supported, NET_RECV_WAIT/NET_SEND_WAIT for blocking) |
+| `sendto`, `recvfrom` | Implemented | VFS → netsrv (UDP datagrams) |
+| `shutdown` | Implemented | VFS → netsrv |
+| `getsockname`, `getpeername` | Implemented | VFS → netsrv |
+| `setsockopt`, `getsockopt` | Implemented | VFS → netsrv |
+| `getaddrinfo` | Implemented | trona posix dns.rs → dnssrv (caching resolver) |
+| `poll` on AF_INET sockets | Implemented | VFS → netsrv (NET_POLL_STATUS) |
+
+**Network architecture:**
+
+```
+Application
+    ↓ socket(AF_INET, ...)
+trona posix
+    ↓ IPC (VFS_SOCKET, VFS_READ, VFS_WRITE, ...)
+VFS (core/vfs/src/posix/inet.rs)
+    ↓ IPC forwarding (NET_SOCKET, NET_CONNECT, NET_SEND, ...)
+netsrv (servers/netsrv/)
+    ├── TCP (net/proto/tcp.rs, net/socket/tcp.rs)
+    ├── UDP (net/proto/udp.rs, net/socket/udp.rs)
+    ├── ARP (net/proto/arp.rs)
+    ├── ICMP (net/proto/icmp.rs)
+    ├── DHCP (net/dhcp.rs)
+    └── DNS forwarding (net/dns.rs)
+    ↓ virtio-net
+netdrv (drivers/netdrv/ — virtio-net driver)
+```
+
+**NET_* IPC labels** (0xA0-0xBA, 27 labels): `NET_SOCKET`, `NET_CONNECT`, `NET_SEND`, `NET_RECV`, `NET_CLOSE`, `NET_BIND`, `NET_LISTEN`, `NET_ACCEPT`, `NET_SENDTO`, `NET_RECVFROM`, `NET_SHUTDOWN`, `NET_GETSOCKNAME`, `NET_GETPEERNAME`, `NET_SETSOCKOPT`, `NET_GETSOCKOPT`, `NET_POLL_STATUS`, `NET_REGISTER_VFS`, `NET_COMPLETE`, `NET_DNS_RESOLVE`, `NET_DNS_RESOLVE_PTR`, `NET_GET_CONFIG`, `NET_GET_ARP_ENTRY`, `NET_RECV_WAIT`, `NET_ACCEPT_WAIT`, `NET_RECVFROM_WAIT`, `NET_SEND_WAIT`, `NET_SENDTO_WAIT`.
+
+**Blocking operation model:** VFS acts as a proxy between userland and netsrv. Non-blocking operations (socket, bind, listen, getsockname, close) are forwarded synchronously. Blocking operations (connect, recv, accept) save the client's reply cap and return asynchronously via netsrv's badged callback endpoint when the operation completes.
 
 ## Intentionally Unsupported
 
@@ -335,12 +377,21 @@ Phase 2: GUI-Ready                                [DONE]
 ├── Pipes, FIFOs, dup/dup3
 └── Terminal line discipline
 
-Phase 3: Extended Compatibility                   [IN PROGRESS]
+Phase 3: Networking + Threading                   [DONE]
+├── TCP/IP stack (netsrv: TCP, UDP, ARP, ICMP)
+├── DHCP client (netsrv built-in)
+├── DNS resolver (dnssrv — caching)
+├── AF_INET sockets (stream + datagram)
+├── virtio-net driver (netdrv)
+├── POSIX threads (pthread_create, join, mutexes, condvars, barriers, semaphores, TLS)
+└── getaddrinfo / DNS resolution
+
+Phase 4: Extended Compatibility                   [IN PROGRESS]
 ├── SA_RESTART, sigaltstack                       [Planned]
-├── TCP/IP networking                             [Planned]
+├── Real-time signals (SIGRTMIN-SIGRTMAX)         [Planned]
 └── Broader application testing                   [Ongoing]
 
-Phase 4: Optimization                            [Planned]
+Phase 5: Optimization                            [Planned]
 ├── Zero-copy I/O paths
 ├── Async I/O (io_uring style)
 └── Performance tuning

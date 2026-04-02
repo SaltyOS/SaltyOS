@@ -837,6 +837,22 @@ The kernel is `#![no_std]` with `core::` only. No `alloc` crate.
 
 ---
 
+## Lock Ordering Addendum
+
+Beyond the global lock ordering (`CAP_LOCK → SCHED_IPC_LOCK → scheduler.lock_state
+→ VSpace.lock → MM_LOCK`), two per-object locks are used in the MO/Untyped layer:
+
+- **per-MO `commit_lock`**: Protects radix tree mutations during commit/decommit.
+  Ordering: `commit_lock` → `ut.alloc_lock` (never reversed).
+- **per-Untyped `alloc_lock`**: Protects watermark and free list during page
+  allocation/return. Multiple MOs can hold their respective `commit_lock`
+  concurrently while contending on the same `alloc_lock`.
+
+These locks are finer-grained than the global `MM_LOCK` and are only acquired
+during MO commit/decommit paths, not during general memory operations.
+
+---
+
 ## mmsrv Integration
 
 mmsrv is the userspace memory server. It owns root untyped capabilities
@@ -852,6 +868,26 @@ With MO-everywhere, mmsrv's role simplifies:
   COW write faults are handled by kernel fast-path (never reach mmsrv)
 - **Cleanup**: Delete MO cap → MO destruction → reverse map traversal →
   PTE invalidation → PMM frame return
+
+### mmsrv IPC Labels
+
+mmsrv uses IPC labels in the range `0x80`-`0xA3` (36 labels), defined in
+`lib/trona/uapi/protocol/mmsrv.rs`:
+
+| Range | Category | Examples |
+|-------|----------|---------|
+| 0x80-0x83 | Client lifecycle | MM_REGISTER, MM_DEREGISTER, MM_BRK, MM_SBRK |
+| 0x84-0x86 | POSIX memory | MM_MMAP, MM_MUNMAP, MM_MPROTECT |
+| 0x87-0x89 | Window mapping | MM_MAP_BATCH, MM_MAP_WINDOW, MM_UNMAP_WINDOW |
+| 0x8A-0x8C | Shared memory | MM_SHM_CREATE, MM_SHM_MAP, MM_SHM_UNMAP |
+| 0x8D-0x8F | Fork/thread | MM_FORK_REGIONS, MM_ALLOC_THREAD_OBJECTS, MM_FREE_THREAD_OBJECTS |
+| 0x90-0x94 | Object management | MM_GET_CLIENT_STATS, MM_ALLOC_OBJECT, MM_REGISTER_SHARED_REGION, MM_MAP_OBJECT_REGION, MM_SYNC_FILE_BACKING |
+| 0x95-0x97 | File-backed mmap | MM_FILE_MMAP, MM_SYNC_MMAP_WRITE |
+| 0x98-0x99 | Untyped provisioning | MM_PROVISION_UNTYPED, MM_QUERY_CAPACITY |
+| 0x9A-0x9D | Pager protocol | MM_PAGER_REQUEST, MM_PAGER_WRITE_REQUEST, MM_DUMP_PENDING, MM_REGISTER_PAGER_EP |
+| 0x9E-0xA3 | Private regions | MM_ALLOC_PRIVATE_REGION, MM_ALLOC_PRIVATE_WINDOW, MM_ALLOC_INITRD_COPY, MM_ALLOC_BOOTINFO_COPY, MM_COPY_FROM_CLIENT_REGION, MM_ALLOC_PRIVATE_COPY_FROM_CLIENT_REGION |
+
+See [mmsrv Design](mmsrv.md) for the full protocol specification.
 
 ### Region tracking (`MmRegion`)
 
@@ -870,3 +906,22 @@ struct MmRegion {
 ```
 
 All regions are MO-backed. There is no legacy non-MO path.
+
+---
+
+## Implementation Status
+
+The MO-based memory architecture described in this document is **fully
+implemented**. Current status of `MoKind` variants:
+
+| Variant | Status | Notes |
+|---------|--------|-------|
+| `Anon` | Implemented | Used for mmap, brk, stack, heap |
+| `CowChild` | Implemented | Created by MO_CLONE, used by fork |
+| `FileBacked` | Enum exists | Not yet implemented (future page cache integration) |
+| `Shm` | Enum exists | Used by mmsrv for shared memory regions |
+
+Future work:
+- **FileBacked MoKind**: Page cache integration for file-backed mappings
+- **Per-MO dirty bitmap**: For FileBacked writeback tracking (design above)
+- **PageCache FrameOwner**: Enum variant exists but not yet used

@@ -61,30 +61,46 @@ kernite/src/
 ├── rng.rs              # RDRAND-based random number generator
 ├── arch/
 │   ├── mod.rs
-│   └── x86_64/
+│   ├── x86_64/
+│   │   ├── mod.rs
+│   │   ├── acpi.rs     # ACPI table parsing (MADT, FADT for shutdown)
+│   │   ├── ap_boot.rs  # Application Processor startup
+│   │   ├── ap_tramp.S  # AP trampoline (real → long mode)
+│   │   ├── apic.rs     # Local APIC + I/O APIC + IPI messaging
+│   │   ├── boot.rs     # BSP early boot (GDT/IDT/paging init)
+│   │   ├── context.rs  # Context switch (save/restore x86_64 registers)
+│   │   ├── cpu.rs      # CPU state, MSR access, per-CPU data
+│   │   ├── cpuid.rs    # CPUID feature detection
+│   │   ├── exceptions.S # IDT exception handlers
+│   │   ├── fpu.rs      # FPU/SSE state save/restore (FXSAVE/FXRSTOR)
+│   │   ├── gdt.rs      # GDT + TSS setup (per-CPU)
+│   │   ├── idt.rs      # IDT setup + interrupt handlers
+│   │   ├── paging.rs   # Page table manipulation (4-level)
+│   │   ├── pit.rs      # PIT timer for APIC calibration
+│   │   ├── smap.rs     # SMAP/SMEP enforcement
+│   │   ├── syscall.S   # Syscall entry/exit, IPC fastpath
+│   │   └── uaccess.rs  # User memory access helpers (SMAP-safe copy)
+│   └── aarch64/
 │       ├── mod.rs
-│       ├── acpi.rs     # ACPI table parsing (MADT, FADT for shutdown)
-│       ├── ap_boot.rs  # Application Processor startup
-│       ├── ap_tramp.S  # AP trampoline (real → long mode)
-│       ├── apic.rs     # Local APIC + I/O APIC + IPI messaging
-│       ├── boot.rs     # BSP early boot (GDT/IDT/paging init)
-│       ├── context.rs  # Context switch (save/restore registers)
-│       ├── cpu.rs      # CPU state, MSR access, per-CPU data
-│       ├── cpuid.rs    # CPUID feature detection
-│       ├── exceptions.S # IDT exception handlers
-│       ├── fpu.rs      # FPU/SSE state save/restore (FXSAVE/FXRSTOR)
-│       ├── gdt.rs      # GDT + TSS setup (per-CPU)
-│       ├── idt.rs      # IDT setup + interrupt handlers
-│       ├── paging.rs   # Page table manipulation (4-level)
-│       ├── pit.rs      # PIT timer for APIC calibration
-│       ├── smap.rs     # SMAP/SMEP enforcement
-│       └── syscall.S   # Syscall entry/exit, IPC fastpath
+│       ├── ap_boot.rs  # Application Processor startup (PSCI CPU_ON)
+│       ├── boot.rs     # BSP early boot (EL2→EL1 drop, MMU setup)
+│       ├── context.rs  # Context switch (save/restore aarch64 registers)
+│       ├── cpu.rs      # CPU state, system registers, per-CPU data
+│       ├── exceptions.rs # Exception vector table handlers
+│       ├── fpsimd.S    # NEON/FP register save/restore assembly
+│       ├── fpu.rs      # FPU/NEON lazy context switch (CPACR_EL1 trap)
+│       ├── gic.rs      # GICv3 (distributor, redistributor, CPU interface)
+│       ├── paging.rs   # Page table manipulation (TTBR0/TTBR1)
+│       ├── pl011.rs    # PL011 UART driver for serial console
+│       ├── psci.rs     # PSCI interface (CPU_ON, SYSTEM_OFF via HVC)
+│       └── timer.rs    # Generic timer (CNTP, PPI 30, 10ms tick)
 ├── cap/
 │   ├── mod.rs          # Capability struct (32-byte fat cap), CapRights
 │   ├── cdt.rs          # Capability Derivation Tree
 │   ├── cnode.rs        # CNode (capability table, 4-16 bit slots)
 │   ├── ioport.rs       # I/O port range capabilities
-│   ├── object.rs       # ObjectType enum, KernelObject header
+│   ├── memory_object.rs # MemoryObject (radix tree pages, COW, reverse maps)
+│   ├── object.rs       # ObjectType enum (12 types), KernelObject header
 │   ├── refcount.rs     # Object reference counting
 │   ├── slot.rs         # Slot allocation/access helpers
 │   └── untyped.rs      # Untyped memory retype
@@ -101,16 +117,19 @@ kernite/src/
 │   └── queue.rs        # IPC wait queue management
 ├── mm/
 │   ├── mod.rs          # Memory management globals, lock ordering, helpers
-│   ├── frame.rs        # Bitmap-based physical frame allocator (PMM)
-│   └── vspace.rs       # VSpace (page tables, COW, demand paging, VSpaceTracking)
+│   ├── frame.rs        # Bitmap-based physical frame allocator (PMM), FrameOwner
+│   ├── maple_tree.rs   # Maple tree (generic B-tree for VA range tracking)
+│   ├── node_alloc.rs   # NodeAllocator trait (page-granular allocator interface)
+│   ├── radix_tree.rs   # 4-level radix tree (page storage for MemoryObject)
+│   └── vspace.rs       # VSpace (page tables, COW, demand paging, MapleTree<VmArea>)
 ├── sched/
 │   ├── mod.rs          # Scheduler module entry
 │   ├── pip.rs          # Priority Inheritance Protocol
 │   ├── scheduler.rs    # EDF scheduler (global ready queue)
 │   ├── sleep_queue.rs  # Timed sleep queue (NanoSleep, timed IPC)
-│   └── thread.rs       # TCB, SchedContext, ThreadState, context switch
+│   └── thread.rs       # TCB, SchedContext, ThreadState, BlockedReason
 └── syscall/
-    ├── mod.rs          # 23 syscalls, capability invocation dispatch
+    ├── mod.rs          # 28 syscalls, capability invocation dispatch
     └── fastpath.rs     # IPC fastpath (Call/ReplyRecv optimization)
 ```
 
@@ -153,7 +172,7 @@ mod syscall;
 
 use core::panic::PanicInfo;
 
-/// Kernel entry point (called from bootloader with BootInfo pointer in RDI)
+/// Kernel entry point (called from bootloader with BootInfo pointer in RDI/x0)
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain(boot_info_addr: u64) -> ! {
     // Parse TLV-encoded boot info from bootloader
@@ -186,7 +205,7 @@ pub extern "C" fn kmain(boot_info_addr: u64) -> ! {
 fn panic(info: &PanicInfo) -> ! {
     kprintln!("KERNEL PANIC: {}", info);
     loop {
-        arch::x86_64::halt();
+        arch::halt();
     }
 }
 ```
@@ -245,6 +264,56 @@ pub fn init(boot_info: &BootInfo) {
     ap_boot::start_aps();
 }
 ```
+
+### aarch64 Initialization
+
+```rust
+// kernite/src/arch/aarch64/mod.rs
+
+pub mod ap_boot;
+pub mod boot;
+pub mod context;
+pub mod cpu;
+pub mod exceptions;
+pub mod fpu;
+pub mod gic;
+pub mod paging;
+pub mod pl011;
+pub mod psci;
+pub mod timer;
+
+/// Initialize aarch64 architecture (called from kmain)
+///
+/// Entry at EL1 (boot.rs drops from EL2 via ERET before calling kmain).
+/// x0 = BootInfo pointer.
+pub fn init(boot_info: &BootInfo) {
+    // PL011 UART for early serial output
+    pl011::init(boot_info);
+
+    // Exception vector table (EL1)
+    exceptions::init();
+
+    // Page tables (TTBR0 for user, TTBR1 for kernel)
+    paging::init(boot_info);
+
+    // GICv3: distributor (GICD), redistributor (GICR), CPU interface (ICC)
+    gic::init(boot_info);
+
+    // Generic timer: EL1 physical timer (CNTP), PPI 30, 10ms tick
+    timer::init();
+
+    // SMP: PSCI CPU_ON for each secondary CPU, mailbox handoff
+    ap_boot::start_aps(boot_info);
+}
+```
+
+Key aarch64 differences from x86_64:
+- **SMP via PSCI**: `CPU_ON` HVC call with AP mailbox for stack/register handoff (vs ACPI MADT + AP trampoline)
+- **Interrupt controller**: GICv3 with system register interface (ICC) (vs Local APIC + I/O APIC)
+- **Timer**: Generic timer CNTP with PPI 30 (vs PIT + APIC timer)
+- **FPU**: NEON Q0-Q31 (512 bytes) with lazy context switch via CPACR_EL1 trapping (vs XSAVE 832 bytes)
+- **Syscall entry**: `svc #0` with x8=syscall number, x0-x5=args (vs `syscall` with RAX=number, RDI/RSI/RDX/R10/R8/R9=args)
+- **Context switch**: x19-x28 callee-saved + SPSR_EL1/ELR_EL1 (vs rbx/rbp/r12-r15 + rflags)
 
 ### GDT Setup
 
@@ -382,17 +451,31 @@ All references to other kernel objects are raw pointers, not smart pointers.
 ```rust
 // kernite/src/sched/thread.rs
 
-/// Thread state — determines schedulability and blocking reason
+/// Thread state — determines schedulability
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ThreadState {
-    Ready,
-    Running,
-    SendBlocked,         // Blocked on synchronous send
-    RecvBlocked,         // Blocked on synchronous receive
-    NotificationWait,    // Blocked waiting on notification
-    FutexBlocked,        // Blocked on futex wait
-    Sleeping,            // Blocked on NanoSleep / timed wait
-    Suspended,           // Not schedulable
+    Inactive,   // Not yet started or permanently stopped
+    Ready,      // In ready queue, waiting for CPU
+    Running,    // Currently executing on a CPU
+    Blocked,    // Blocked (reason stored in BlockedReason)
+    Waiting,    // Waiting on notification
+}
+
+/// Reason why a thread is in ThreadState::Blocked
+#[derive(Clone, Copy)]
+pub enum BlockedReason {
+    SendBlocked { msg, badge },         // Blocked on synchronous send
+    RecvBlocked,                        // Blocked on synchronous receive
+    NotificationWait,                   // Blocked waiting on notification
+    VSpaceWait,                         // Blocked on VSpace teardown
+    ReplyWait { msg, badge },           // Blocked waiting for reply (after call())
+    FaultBlocked { msg, badge },        // Blocked on fault delivery
+    CallSendBlocked { msg, badge },     // Blocked on call() send phase
+    TimerBlocked,                       // Blocked on nanosleep timer
+    FutexBlocked,                       // Blocked on futex wait
+    FutexTimedBlocked,                  // Blocked on futex wait with timeout
+    SendTimedBlocked { msg, badge },    // Blocked on send with timeout
+    RecvTimedBlocked,                   // Blocked on receive with timeout
 }
 
 /// Thread Control Block (kernel object, allocated from untyped memory)
@@ -540,7 +623,7 @@ and falls through to the Rust slowpath handler for all other syscalls.
 
 mod fastpath;
 
-/// System call numbers (23 total)
+/// System call numbers (28 total)
 #[repr(u64)]
 pub enum Syscall {
     Send = 0,
@@ -566,6 +649,11 @@ pub enum Syscall {
     Shutdown = 20,
     SendTimed = 21,
     RecvTimed = 22,
+    RecvAny = 23,          // Multi-endpoint receive (any of N endpoints)
+    ReplyRecvAny = 24,     // Reply + multi-endpoint receive
+    RecvAnyTimed = 25,     // Multi-endpoint receive with timeout
+    ReplyRecvAnyTimed = 26, // Reply + multi-endpoint receive with timeout
+    NotifReturn = 27,      // Return from notification dispatch
 }
 
 /// Slowpath syscall handler (called from syscall.S assembly stub).
@@ -645,13 +733,14 @@ fn handle_invoke(
 
     // Dispatch based on object type
     let result = match cap_copy.obj_type {
-        ObjectType::CNode       => invoke_cnode(&cap_copy, label, mr0, mr1, mr2, mr3),
-        ObjectType::Untyped     => invoke_untyped(&cap_copy, label, mr0, mr1, mr2, mr3),
-        ObjectType::Tcb         => invoke_tcb(&cap_copy, label, mr0, mr1, mr2, mr3),
-        ObjectType::VSpace      => invoke_vspace(&cap_copy, label, mr0, mr1, mr2),
-        ObjectType::SchedContext => invoke_sched_context(&cap_copy, label, mr0, mr1, mr2),
-        ObjectType::IrqHandler  => invoke_irq(&cap_copy, label, mr0, mr1),
-        ObjectType::IoPort      => invoke_ioport(&cap_copy, label, mr0, mr1),
+        ObjectType::CNode        => invoke_cnode(&cap_copy, label, mr0, mr1, mr2, mr3),
+        ObjectType::Untyped      => invoke_untyped(&cap_copy, label, mr0, mr1, mr2, mr3),
+        ObjectType::Tcb          => invoke_tcb(&cap_copy, label, mr0, mr1, mr2, mr3),
+        ObjectType::VSpace       => invoke_vspace(&cap_copy, label, mr0, mr1, mr2),
+        ObjectType::SchedContext  => invoke_sched_context(&cap_copy, label, mr0, mr1, mr2),
+        ObjectType::MemoryObject => invoke_memory_object(&cap_copy, label, mr0, mr1, mr2, mr3),
+        ObjectType::IrqHandler   => invoke_irq(&cap_copy, label, mr0, mr1),
+        ObjectType::IoPort       => invoke_ioport(&cap_copy, label, mr0, mr1),
         _ => Err(SyscallError::InvalidCapability),
     };
 
@@ -694,6 +783,7 @@ pub enum ObjectType {
     IrqHandler = 8,
     IoPort = 9,
     SchedContext = 10,
+    MemoryObject = 11,
 }
 
 /// Common header for all kernel objects (must be first field in every object struct)
@@ -715,6 +805,23 @@ pub struct Endpoint {
 // The capability's obj_type field tells you how to cast:
 //   let ep: *mut Endpoint = cap.object as *mut Endpoint;
 ```
+
+### MemoryObject
+
+MemoryObject (MO) is a kernel object that manages user data pages. It is created
+via `untyped_retype(OBJ_MEMORY_OBJECT)` and provides page-level operations
+(commit, decommit, clone, read, write) through invoke labels `0x90`-`0x97`.
+
+Key properties:
+- **Page storage**: 4-level radix tree (`radix_tree.rs`) with per-page PhysAddr entries
+- **Dual-source commit**: `MO_COMMIT` borrows frames from untyped (primary, via `ut_cap` arg)
+  or PMM (fallback, when `ut_cap == 0`)
+- **COW clone**: `MO_CLONE` creates a snapshot child with cap-refcounted parent link
+- **Reverse maps**: Tracks which VSpaces observe MO pages (inline 8 + overflow chain)
+- **VSpace integration**: `VSPACE_MAP_MO` (0x97), `VSPACE_UNMAP_MO` (0x98),
+  `VSPACE_SHARE_RO_PAGE` (0x99), `VSPACE_FORK_RANGE` (0x9A)
+
+See [Memory Management](memory.md) for full design details.
 
 ## Kernel Configuration
 

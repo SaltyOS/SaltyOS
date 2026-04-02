@@ -605,12 +605,12 @@ int saltyfs_set_snapshot(struct SaltyFsContext *ctx, uint64_t snapshot_id) {
 
 ## Userspace Driver
 
-The full read-write driver runs in userspace:
+The full read-write SaltyFS driver runs in userspace at `userland/drivers/filesystems/saltyfs/`.
 
 ### VFS Interface
 
 ```rust
-// userland/vfs/saltyfs/mod.rs
+// userland/drivers/filesystems/saltyfs/src/main.rs
 
 pub struct SaltyFsDriver {
     device: BlockDevice,

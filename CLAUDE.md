@@ -70,7 +70,7 @@ No `Cargo.toml` files — all Rust code is compiled via Meson with direct `rustc
 
 1. `rust/meson.build` — Builds `core` and `compiler_builtins` from `rust-src`
 2. `kernite/meson.build` — Compiles kernel Rust → `.o`, assembles `.S` files, links to `kernel.elf`
-3. `lib/trona/substrate/meson.build` — Builds trona substrate (Rust → `.o` + `.rmeta`, plus `fork.S` → `.o`, links to `libtrona.so`)
+3. `lib/trona/substrate/meson.build` — Builds trona substrate + uapi (Rust → `.o` + `.rmeta`, plus `fork.S` → `.o`, links to `libtrona.so`)
 4. `lib/basalt/c/meson.build` — Builds basaltc (C stdlib → `libc.so`)
 5. `lib/basalt/cpp/meson.build` — Builds libc++ (optional, from `toolchain/llvm-project`)
 6. `userland/*/meson.build` — Each program compiled against trona `.rmeta`, linked with trona `.o` + `core.o`
@@ -122,7 +122,7 @@ Environment setup: `eval "$(just toolchain-env)"` or `source tools/toolchain/env
 
 ## Ports System
 
-Third-party software is built via declarative `.port` files in `ports/`. Available ports: **bash**, **freebsd-utils**, **nano**, **nasm**, **ncurses**.
+Third-party software is built via declarative `.port` files in `ports/`. Available ports: **bash**, **bzip2**, **curl**, **freebsd-utils**, **make**, **nano**, **nasm**, **ncurses**, **ninja**, **openssl**, **perl**, **python**, **wget**, **xz**, **zlib**, **zstd**.
 
 ```bash
 just port bash              # Build a port (fetch, configure, make, install)
@@ -188,14 +188,14 @@ restore_irq(irq);
 
 - **Kernel error types:** `SyscallError`, `CapError`, `VSpaceError` — all enums with specific variants, not strings
 - **Map between error types explicitly** with dedicated functions (e.g., `syscall_error_from_cap_error()` in `syscall/mod.rs`). Do not add `impl From<X> for Y` — explicit mapping prevents accidental information loss.
-- **Userland error codes** in `lib/trona/substrate/src/consts.rs` (`TRONA_OK`, `TRONA_INVALID_CAPABILITY`, etc.) must match kernel `SyscallError` variants
+- **Userland error codes** in `lib/trona/uapi/consts/kernel.rs` (`TRONA_OK`, `TRONA_INVALID_CAPABILITY`, etc.) must match kernel `SyscallError` variants. Extended network errors in `lib/trona/uapi/consts/server.rs`.
 
 ### FFI Conventions
 
 - Kernel functions called from assembly: `#[unsafe(no_mangle)] pub extern "C" fn`
 - trona substrate public exports: `#[unsafe(no_mangle)] pub extern "C" fn` with `trona_` prefix
 - Shared structures: `#[repr(C)]` always
-- Constants shared between kernel and userland (syscall numbers, invoke labels, error codes) must be kept in sync manually — `consts.rs` is the userland source of truth
+- Constants shared between kernel and userland (syscall numbers, invoke labels, error codes) must be kept in sync manually — `lib/trona/uapi/consts/kernel.rs` is the userland source of truth
 
 ## Architecture
 
@@ -204,6 +204,7 @@ restore_irq(irq);
 | Module | Purpose |
 |--------|---------|
 | `lib.rs` | Entry (`kmain`), serial I/O, panic handler |
+| `acpi.rs` | Shared ACPI table parsing (RSDP/XSDT, MCFG/PCIe ECAM) |
 | `bootinfo.rs` | Boot info TLV parsing |
 | `builtins.rs` | Compiler built-in stubs (memcpy, memset) |
 | `cpio.rs` | CPIO archive parser for initrd |
@@ -215,9 +216,9 @@ restore_irq(irq);
 | `cap/` | CNode, Untyped retype, CDT, IoPort caps, refcounting |
 | `console/` | Kernel console output (serial + framebuffer) |
 | `ipc/` | Endpoints, Notifications, Futex, IRQ routing, IPC queue |
-| `mm/` | VSpace (page tables, COW, demand paging), Bitmap PMM |
+| `mm/` | VSpace (page tables, COW, demand paging), MemoryObject, Bitmap PMM |
 | `sched/` | EDF scheduler, TCB, PIP, sleep queue, context switch |
-| `syscall/` | 23 syscalls, capability invocation dispatch, IPC fastpath |
+| `syscall/` | 28 syscalls, capability invocation dispatch, IPC fastpath |
 
 **Key x86_64 assembly files** in `kernite/src/arch/x86_64/`:
 - `syscall.S` — Syscall entry/exit via `syscall`/`sysretq`. User RSP is saved on the **per-thread kernel stack** (not per-CPU `%gs:16`) to prevent RSP corruption during context switches. IPC fastpath dispatch happens here (checks RAX==2 for Call, RAX==3 for ReplyRecv before slowpath).
@@ -248,7 +249,7 @@ x86_64: Number in `rax`, args in `rdi, rsi, rdx, r10, r8, r9`. Returns error in 
 | 6 | Wait | Wait on notification |
 | 7 | Poll | Non-blocking poll notification |
 | 8 | Yield | Yield CPU |
-| 9 | Invoke | Capability invocation (CNode/Untyped/TCB/VSpace/IRQ/IoPort ops) |
+| 9 | Invoke | Capability invocation (CNode/Untyped/TCB/VSpace/IRQ/IoPort/MO ops) |
 | 10 | DebugPutChar | Write char to serial |
 | 11 | DebugDumpState | Dump CPU state |
 | 12 | ClockGetTime | Read monotonic clock |
@@ -262,10 +263,15 @@ x86_64: Number in `rax`, args in `rdi, rsi, rdx, r10, r8, r9`. Returns error in 
 | 20 | Shutdown | ACPI system shutdown |
 | 21 | SendTimed | Blocking send with timeout |
 | 22 | RecvTimed | Blocking receive with timeout |
+| 23 | RecvAny | Receive from any endpoint (badged source) |
+| 24 | ReplyRecvAny | Reply + receive from any endpoint |
+| 25 | RecvAnyTimed | RecvAny with timeout |
+| 26 | ReplyRecvAnyTimed | ReplyRecvAny with timeout |
+| 27 | NotifReturn | Return from notification dispatcher |
 
 **Message info encoding** (seL4-style): bits 6:0 = length (0-127 MRs), bits 11:7 = extra caps, bits 51:12 = label. MR0-MR3 in registers, MR4-MR19 via IPC buffer.
 
-**Invoke labels** (defined in `lib/trona/substrate/src/consts.rs`): CNode ops `0x10-0x18`, Untyped `0x20`, SchedContext `0x30-0x31`, TCB `0x40-0x4D`, VSpace `0x50-0x5A`, IRQ `0x60-0x64`, IoPort `0x70-0x77`.
+**Invoke labels** (defined in `lib/trona/uapi/consts/kernel.rs`): CNode `0x10-0x18`, Untyped `0x20`, SchedContext `0x30-0x31`, TCB `0x40-0x4E`, VSpace `0x50-0x5F`, IRQ `0x60-0x64`, IoPort `0x70-0x77`, MemoryObject `0x90-0x97`, VSpace MO mapping `0x97-0x9A`.
 
 ### Well-Known Capability Slots
 
@@ -287,7 +293,7 @@ x86_64: Number in `rax`, args in `rdi, rsi, rdx, r10, r8, r9`. Returns error in 
 | 15 | CAP_PCI_IOPORT | PCI config space I/O port |
 | 16+ | CAP_UNTYPED_START | Untyped memory capabilities |
 
-**Userland child convention** (defined in `lib/trona/substrate/src/consts.rs`, set by procmgr):
+**Userland child convention** (defined in `lib/trona/uapi/consts/server.rs`, set by procmgr):
 
 | Slot | Name | Description |
 |------|------|-------------|
@@ -319,48 +325,75 @@ Domain-based layout with programs organized by function:
 | Program | Path | Role |
 |---------|------|------|
 | `init` | `core/init` | First process — service-based multi-phase bootstrap |
-| `rtld` | `core/rtld` | Runtime dynamic linker (loads libtrona.so) |
-| `mmsrv` | `core/mmsrv` | Memory manager server (centralized frame allocation, VSpace mapping) |
-| `procmgr` | `core/procmgr` | Process manager (spawn/exit/waitpid) |
-| `nameserv` | `core/nameserv` | Name service (endpoint lookup) |
-| `vfs` | `servers/vfs` | Virtual filesystem server (ramfs + devfs + Unix sockets + shm + poll) |
+| `mmsrv` | `core/mmsrv` | Memory manager server (centralized frame allocation, VSpace mapping, MO) |
+| `procmgr` | `core/procmgr` | Process manager (spawn/exit/waitpid/signals/subsystem dispatch) |
+| `namesrv` | `core/namesrv` | Name service (endpoint lookup) |
+| `vfs` | `core/vfs` | Virtual filesystem server (ramfs + devfs + sockets + shm + poll) |
 | `console` | `servers/console` | Serial console server (IoPort cap for COM1) |
-| `ttyd` | `servers/ttyd` | TTY daemon |
-| `getty` | `servers/getty` | Getty (login prompt) |
-| `blkdrv` | `drivers/blkdrv` | Block device driver (virtio) |
-| `pcisrv` | `drivers/pcisrv` | PCI server |
-| `display` | `drivers/display` | Display driver |
-| `saltyfs` | `fs/saltyfs` | SaltyFS filesystem server |
-| `test_runner` | `tests/test_runner` | Automated test suite (hello, fs, mmap, fork, signal, socket, pipe, time) |
+| `netsrv` | `servers/netsrv` | TCP/UDP/ICMP network stack (smoltcp) |
+| `dnssrv` | `servers/dnssrv` | DNS resolver (recursive, caching) |
+| `posix_ttysrv` | `servers/posix/posix_ttysrv` | POSIX TTY/PTY daemon (line discipline, signal generation) |
+| `posix_getty` | `servers/posix/posix_getty` | POSIX login prompt |
+| `win32_csrss` | `servers/win32/win32_csrss` | Win32 console subsystem + import resolver |
+| `pcidrv` | `drivers/pcidrv` | PCI enumeration server |
+| `blkdrv` | `drivers/blkdrv` | Block device driver (virtio-blk) |
+| `netdrv` | `drivers/netdrv` | Network device driver (virtio-net) |
+| `dispdrv` | `drivers/dispdrv` | Display driver (framebuffer) |
+| `saltyfs` | `drivers/filesystems/saltyfs` | SaltyFS filesystem server (COW, B-tree, snapshots) |
+| `test_runner` | `tests/test_runner` | Automated test suite (16 modules) |
+| `hello_pe` | `tests/hello_pe` | Win32 PE test program (C) |
 
 **Service-based bootstrap**: Init reads `.service` files from `userland/services/` in the initrd to determine boot order and dependencies. Each `.service` file declares `[Service]` (name, binary, type, restart policy) and `[Dependencies]` (After/Before ordering).
 
 All userland ELFs + service files are packed into a CPIO initrd (`tools/mkcpio.py`) embedded in the disk image.
 
-**Architecture-specific code** in userland programs lives in `src/arch/x86_64.rs` and `src/arch/aarch64.rs` modules (e.g., `pcisrv` has PCI ECAM mapping for aarch64 vs I/O port access for x86_64).
+**Architecture-specific code** in userland programs lives in `src/arch/x86_64.rs` and `src/arch/aarch64.rs` modules (e.g., `pcidrv` has PCI ECAM mapping for aarch64 vs I/O port access for x86_64).
 
 ### Libraries
 
-Three-tier library architecture:
+Multi-tier library architecture:
 
-**trona** (`lib/trona/`, Rust) — System library (substrate + POSIX implementation + loader):
+**trona** (`lib/trona/`, Rust) — System library (5-crate structure):
 
-- `substrate/` (crate: `trona`) — Syscall wrappers, IPC, capability invocations, types, constants
-  - `consts.rs` — Syscall numbers, invoke labels, error codes, object types, well-known cap slots, POSIX constants
+- `substrate/` (crate: `trona`) — Core kernel ABI layer
+  - `syscall.rs` — Raw inline-assembly syscall wrappers
+  - `ipc.rs` — IPC operations (send, recv, call, reply_recv)
+  - `invoke.rs` — Typed capability invocation helpers (CNode/Untyped/TCB/VSpace/IRQ/IoPort/MO)
+  - `consts.rs` — Re-exports from `uapi/consts/` (kernel + server namespaces)
   - `types.rs` — TronaMsg, PollFd, SockAddrUn, signal types
-  - `syscall.rs` — Raw syscall wrappers (inline asm)
-  - `ipc.rs` — IPC wrappers (call, send, recv, reply_recv)
-  - `invoke.rs` — Capability invocation helpers (CNode/Untyped/TCB/VSpace/IRQ/IoPort ops)
+  - `slot_alloc.rs` — Dynamic CNode slot allocator
+  - `protocol.rs` — Re-exports from `uapi/protocol/`
+  - `layout.rs` — Child process VA layout planner
+  - `framebuffer.rs` — Framebuffer info reader
+- `uapi/` — Shared UAPI constants and protocol labels (included by substrate via `include!`)
+  - `consts/kernel.rs` — Syscall numbers, invoke labels, error codes, object types, cap slots, ELF/PE constants
+  - `consts/server.rs` — Well-known service caps, spawn policy, mmap backing, network config
+  - `consts/posix.rs` — POSIX file flags, signals, sockets, poll, mmap, device types
+  - `protocol/vfs.rs` — VFS server IPC labels
+  - `protocol/procmgr.rs` — Process manager IPC labels
+  - `protocol/mmsrv.rs` — Memory manager IPC labels (0x80-0xA3)
+  - `protocol/server.rs` — Console, display, PCI, block, SaltyFS, network, DNS, driver labels
+  - `protocol/posix.rs` — POSIX-only labels (ttysrv, VFS POSIX extensions)
+  - `protocol/win32.rs` — Win32 subsystem labels (csrss protocol, 0x100-0x106)
+  - `protocol/namesrv.rs` — Name service labels
+  - `types/` — Shared `#[repr(C)]` types (core, posix, PE)
 - `posix/` (crate: `trona_posix`) — POSIX compatibility (Rust API only, no C ABI)
-  - `at`, `file`, `misc`, `pipe`, `poll`, `proc`, `socket`
-  - `posix_mm.rs` — POSIX memory management (mmap, shm)
+  - `at`, `file`, `misc`, `pipe`, `poll`, `proc`, `socket`, `dns`
+  - `mm.rs` — POSIX memory management (mmap, shm)
   - `signals.rs` — POSIX signal delivery via notifications
-- `rtld/loader/` (crate: `trona_loader`) — ELF/TLS/CPIO loading
-  - `cpio.rs` / `elf_loader.rs` / `elf_dynamic.rs` — CPIO parsing, ELF loading, dynamic linking support
-- `rtld/ld/` — `ld-trona.so` (C dynamic linker)
-- `sync.rs` — Synchronization primitives (Mutex, RWLock, Semaphore)
-- `pthread.rs` — POSIX threads support
-- `fork.S` — Fork assembly stub (arch-specific: `arch/x86_64/fork.S`, `arch/aarch64/fork.S`)
+  - `sync.rs` — Synchronization primitives (Mutex, RWLock, Semaphore)
+  - `pthread.rs` — POSIX threads support
+  - `tls.rs` — Thread-local storage
+- `win32/` (crate: `trona_win32`) — Win32 shim layer
+  - `kernel32_pe.c` — kernel32.dll PE stub
+  - `console.rs`, `handle.rs`, `process.rs`, `error.rs` — Win32 API implementations
+- `loader/` (crate: `trona_loader`) — ELF/PE/CPIO loading
+  - `elf_loader.rs` / `elf_dynamic.rs` — ELF loading, dynamic linking support
+  - `pe_loader.rs` / `pe_types.rs` — PE/COFF loading
+  - `cpio.rs` — CPIO archive parser
+- `rtld/elf/` — `ld-trona.so` (ELF dynamic linker, C)
+- `rtld/pe/` — `ld-trona-pe.so` (PE dynamic linker, C)
+- `arch/` — Fork assembly stubs (arch-specific: `x86_64/fork.S`, `aarch64/fork.S`)
 
 **basalt** (`lib/basalt/`, C/C++) — C/C++ standard library (thin C ABI surface):
 
@@ -394,6 +427,9 @@ Three-tier library architecture:
 - **Frame minimum**: size_bits=12 enforced (4K pages) to prevent misaligned objects
 - **IPC fastpath**: Assembly-dispatched fast path for Call (syscall 2) and ReplyRecv (syscall 3) — bails to slowpath for extra_caps>0, length>4, no waiting partner, cross-CPU, or fault-blocked
 - **Bound notifications**: Bidirectional TCB↔Notification link; signals wake RecvBlocked threads
+- **MemoryObject**: Fuchsia-inspired memory abstraction (OBJ_MEMORY_OBJECT=11) with commit/decommit/clone/resize; invoke labels 0x90-0x97. VSpace MO mapping at 0x97-0x9A (MAP_MO, UNMAP_MO, SHARE_RO_PAGE, FORK_RANGE)
+- **Multi-personality subsystem**: POSIX (subsystem ID 0) and Win32 (subsystem ID 1) run side-by-side. Each personality has its own servers (posix_ttysrv/posix_getty for POSIX, win32_csrss for Win32). PE/COFF loader and kernel32.dll shim for Win32 processes. Subsystem IDs in `lib/trona/uapi/consts/kernel.rs` (SUBSYSTEM_POSIX, SUBSYSTEM_WIN32, SUBSYSTEM_STARNITE)
+- **Network stack**: TCP/UDP/ICMP via smoltcp in netsrv, with split blocking ops (NET_*_WAIT IPC labels). DNS resolution in dedicated dnssrv. DHCP auto-configuration via netdrv (virtio-net)
 
 ## Adding New Components
 
@@ -416,16 +452,16 @@ Three-tier library architecture:
 ### New Syscall
 
 1. Add variant to the `Syscall` enum and its `TryFrom<u64>` impl in `kernite/src/syscall/mod.rs`
-2. Add matching constant to `lib/trona/substrate/src/consts.rs`
+2. Add matching constant to `lib/trona/uapi/consts/kernel.rs`
 3. Add dispatch arm in `syscall_handle_rust()` in `kernite/src/syscall/mod.rs`
-4. Add raw syscall wrapper in `lib/trona/substrate/src/syscall.rs`
+4. Add raw syscall wrapper in `lib/trona/substrate/syscall.rs`
 5. Update `docs/spec/syscalls.md`
 
 ### New Capability Invocation
 
-1. Add invoke label constant to `lib/trona/substrate/src/consts.rs`
+1. Add invoke label constant to `lib/trona/uapi/consts/kernel.rs`
 2. Add dispatch arm in `handle_invoke()` in `kernite/src/syscall/mod.rs`
-3. Add wrapper function in `lib/trona/substrate/src/invoke.rs`
+3. Add wrapper function in `lib/trona/substrate/invoke.rs`
 4. Update `docs/spec/syscalls.md`
 
 ## Testing and Verification
@@ -441,7 +477,7 @@ just run --headless --debug     # CI-like testing (serial only, logs to qemu.log
 just fmt-check                  # Check kernel Rust formatting
 ```
 
-The `test_runner` userland program runs automated tests and prints `PASS`/`FAIL` for each test case via serial output. Watch for these lines to verify correctness.
+The `test_runner` userland program runs 16 automated test modules (hello, fs, mmap, fork, signal, socket, pipe, time, terminal, epoll, dns, saltyfs, pthread, sse, neon, pe) and prints `PASS`/`FAIL` for each test case via serial output. Watch for these lines to verify correctness.
 
 **Do not use `cargo test`** — this project does not use Cargo.
 
@@ -451,7 +487,7 @@ Format: `<type>(<scope>): <subject>` (scope is optional for cross-cutting change
 
 **Types:** `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `perf`
 
-**Scopes:** `kernite`, `boot`, `ipc`, `sched`, `cap`, `mm`, `vspace`, `syscall`, `trona`, `basaltc`, `init`, `procmgr`, `vfs`, `console`, `nameserv`, `test_runner`, `mmsrv`, `rtld`, `ttyd`, `getty`, `blkdrv`, `pcisrv`, `display`, `saltyfs`
+**Scopes:** `kernite`, `boot`, `ipc`, `sched`, `cap`, `mm`, `vspace`, `syscall`, `trona`, `uapi`, `basaltc`, `init`, `procmgr`, `vfs`, `console`, `namesrv`, `test_runner`, `mmsrv`, `rtld`, `posix_ttysrv`, `posix_getty`, `blkdrv`, `pcidrv`, `dispdrv`, `netdrv`, `netsrv`, `dnssrv`, `saltyfs`, `win32`, `win32_csrss`, `ports`
 
 Examples:
 ```
@@ -468,13 +504,16 @@ docs: update design docs for bound notification
 - [ ] `just run` boots to test_runner output without panics
 - [ ] `just run --smp 2` does not deadlock or corrupt state
 - [ ] `just fmt-check` passes
-- [ ] Constants in sync: any new syscall/invoke label/error code in both kernel and `consts.rs`
+- [ ] Constants in sync: any new syscall/invoke label/error code in both kernel and `lib/trona/uapi/consts/kernel.rs`
 - [ ] Design docs updated if architectural changes were made
 
 ## Documentation
 
 Design documents in `docs/design/` — **read before making architectural changes**:
-- `overview.md`, `kernel.md`, `capability.md`, `ipc.md`, `scheduling.md`, `memory.md`, `bootloader.md`, `saltyfs.md`, `posix.md`
+- `overview.md`, `kernel.md`, `capability.md`, `ipc.md`, `scheduling.md`, `memory.md`, `bootloader.md`, `saltyfs.md`, `posix.md`, `trona.md`, `basaltc.md`, `mmsrv.md`, `ports.md`
 
 Specifications in `docs/spec/` — **read before changing ABI or syscall interfaces**:
 - `syscalls.md`, `abi.md`, `boot_protocol.md`
+
+API references in `docs/spec/`:
+- `trona-api.md`, `basaltc-api.md`

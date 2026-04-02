@@ -79,7 +79,7 @@ Trade-off: More memory per capability, but simpler implementation and better deb
 
 ## Capability Types
 
-The `ObjectType` enum (defined in `kernite/src/cap/object.rs`) has 11 variants.
+The `ObjectType` enum (defined in `kernite/src/cap/object.rs`) has 12 variants.
 The same discriminant values are used in both the `Capability.obj_type` field
 and the `KernelObject` header.
 
@@ -118,6 +118,9 @@ pub enum ObjectType {
 
     /// Scheduling context (EDF parameters)
     SchedContext = 10,
+
+    /// Memory object (user page management, radix tree, COW)
+    MemoryObject = 11,
 }
 ```
 
@@ -509,7 +512,7 @@ initrd. Init is statically linked and is the first userspace process.
 // kernite/src/init.rs (simplified)
 
 /// Well-known capability slot assignments for the init task.
-/// These must match the constants in lib/trona/substrate/src/consts.rs.
+/// These must match the constants in lib/trona/uapi/consts/kernel.rs.
 const CAP_SELF_TCB: usize       = 0;
 const CAP_SELF_VSPACE: usize    = 1;
 const CAP_SELF_CSPACE: usize    = 2;
@@ -553,20 +556,22 @@ fn create_init_task(boot_info: &BootInfo) {
 
 CNode operations are performed via the Invoke syscall (number 9) with the
 CNode capability and an invoke label. Labels are defined in
-`lib/trona/substrate/src/consts.rs` (range `0x10`-`0x16`).
+`lib/trona/uapi/consts/kernel.rs` (range `0x10`-`0x18`).
 
 Arguments are passed in message registers (MR0-MR3 in CPU registers,
 MR4+ via IPC buffer).
 
 ```rust
-/// CNode invoke labels (from lib/trona/substrate/src/consts.rs)
-const CNODE_COPY:       u64 = 0x10;
-const CNODE_MINT:       u64 = 0x11;
-const CNODE_MOVE:       u64 = 0x12;
-const CNODE_DELETE:     u64 = 0x13;
-const CNODE_REVOKE:     u64 = 0x14;
-const CNODE_ROTATE:     u64 = 0x15;
+/// CNode invoke labels (from lib/trona/uapi/consts/kernel.rs)
+const CNODE_COPY:        u64 = 0x10;
+const CNODE_MINT:        u64 = 0x11;
+const CNODE_MOVE:        u64 = 0x12;
+const CNODE_MUTATE:      u64 = 0x13;
+const CNODE_DELETE:      u64 = 0x14;
+const CNODE_REVOKE:      u64 = 0x15;
 const CNODE_SAVE_CALLER: u64 = 0x16;
+const CNODE_SET_GUARD:   u64 = 0x17;
+const CNODE_GET_INFO:    u64 = 0x18;
 
 /// CNode capability invocation dispatch
 fn invoke_cnode(
@@ -587,19 +592,62 @@ fn invoke_cnode(
             // badge from IPC buffer MR4
             cnode_mint(cap, mr0, mr1, mr2, CapRights(mr3 as u32))
         }
+        CNODE_MOVE => {
+            cnode_move(cap, mr0, mr1, mr2)
+        }
+        CNODE_MUTATE => {
+            cnode_mutate(cap, mr0, mr1, mr2, CapRights(mr3 as u32))
+        }
         CNODE_DELETE => {
             cnode_delete(cap, mr0)
         }
         CNODE_REVOKE => {
             cnode_revoke(cap, mr0)
         }
-        CNODE_MOVE => {
-            cnode_move(cap, mr0, mr1, mr2)
+        CNODE_SAVE_CALLER => {
+            cnode_save_caller(cap, mr0)
+        }
+        CNODE_SET_GUARD => {
+            cnode_set_guard(cap, mr0, mr1)
+        }
+        CNODE_GET_INFO => {
+            cnode_get_info(cap, mr0)
         }
         _ => Err(SyscallError::InvalidInvocation),
     }
 }
 ```
+
+### MemoryObject Invocations
+
+MemoryObject (MO) operations manage user data pages. MO is created via
+`untyped_retype(OBJ_MEMORY_OBJECT)`. Labels defined in
+`lib/trona/uapi/consts/kernel.rs` (range `0x90`-`0x97`):
+
+| Label | Value | Operation | Description |
+|-------|-------|-----------|-------------|
+| `MO_COMMIT` | 0x90 | Commit pages | Allocate frames for page range (arg2=ut_cap, 0=PMM fallback) |
+| `MO_DECOMMIT` | 0x91 | Decommit pages | Release physical frames back to source |
+| `MO_GET_SIZE` | 0x92 | Get size | Return page count |
+| `MO_CLONE` | 0x93 | COW clone | Create copy-on-write snapshot child |
+| `MO_RESIZE` | 0x94 | Resize | Change page count |
+| `MO_READ` | 0x95 | Read page | Read data from MO page |
+| `MO_WRITE` | 0x96 | Write page | Write data to MO page |
+| `MO_HAS_PAGE` | 0x97 | Check page | Check if page is committed |
+
+### VSpace MemoryObject Labels
+
+VSpace operations for MO-based mappings. Invoked on a VSpace capability
+(range `0x97`-`0x9A`):
+
+| Label | Value | Operation | Description |
+|-------|-------|-----------|-------------|
+| `VSPACE_MAP_MO` | 0x97 | Map MO range | Map MO pages into VSpace at given VA |
+| `VSPACE_UNMAP_MO` | 0x98 | Unmap MO range | Remove MO mapping from VSpace |
+| `VSPACE_SHARE_RO_PAGE` | 0x99 | Share page RO | Share a read-only page between VSpaces |
+| `VSPACE_FORK_RANGE` | 0x9A | Fork range | COW-fork a VA range (used by fork()) |
+
+See [Memory Management](memory.md) for the full MO design.
 
 ## Security Properties
 
@@ -627,8 +675,8 @@ Capability revocation is:
 ### Memory Safety
 
 Memory is only accessible through:
-1. Frame capabilities (for mapping to VSpace)
-2. VSpace capabilities (for map/unmap operations)
+1. MemoryObject capabilities (for page commit/decommit/clone)
+2. VSpace capabilities (for mapping MO pages via VSPACE_MAP_MO)
 3. No direct physical memory access for userspace
 
 ## Example: Creating a Server

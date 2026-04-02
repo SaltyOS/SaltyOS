@@ -1,8 +1,12 @@
 # Bootloader Design
 
-SaltyOS uses a custom **three-stage bootloader** designed to operate on constrained systems (≈4 MB RAM), support multiple architectures, and maintain full control over the boot process while allowing optional filesystem-based booting.
+SaltyOS uses a custom **three-stage bootloader** designed to operate on constrained systems (≈4 MB RAM), support multiple architectures (x86_64 and aarch64), and maintain full control over the boot process while allowing optional filesystem-based booting.
 
 The design is inspired by **BSD-style loaders** and **microkernel systems such as seL4**, emphasizing a small trusted computing base, explicit boot contracts, and clear stage responsibilities.
+
+**Architecture support:**
+- **x86_64**: BIOS (MBR) and UEFI boot paths
+- **aarch64**: UEFI only (no BIOS path)
 
 ---
 
@@ -36,25 +40,49 @@ The three-stage design exists to satisfy the following constraints:
 
 ## Boot Flow
 
+### x86_64
+
 ```mermaid
 graph TD
     A[Power On] --> B{BIOS or UEFI?}
     B -->|BIOS| C[Stage 1: MBR]
     B -->|UEFI| D[Stage 1: EFI Entry]
-    
-    C --> E[Stage 2]
-    D --> E
-    
-    E --> F[Stage 2: CPU & Block Setup]
-    F --> G[Stage 3: Policy Loader]
-    
+
+    C --> E[Stage 2: Real → Long Mode]
+    D --> F[Stage 2: UEFI setup]
+
+    E --> G[Stage 3: Policy Loader]
+    F --> G
+
     G --> H[Read Boot Manifest]
-    H --> I[Load Kernel (raw extents)]
-    I --> J[Optional: FS-based load]
-    J --> K[Relocate ET_DYN Kernel]
-    K --> L[Build BootInfo]
-    L --> M[Jump to Kernel]
+    H --> I[Load Kernel + initrd]
+    I --> J[Relocate ET_DYN Kernel]
+    J --> K[Build BootInfo]
+    K --> L[Jump to Kernel, RDI = BootInfo*]
 ```
+
+### aarch64
+
+```mermaid
+graph TD
+    A[Power On / UEFI] --> B[Stage 1: EFI Entry]
+    B --> C[Stage 2: Identity map, ExitBootServices]
+    C --> D[Stage 3: Policy Loader]
+
+    D --> E[Detect EL: EL2 or EL1?]
+    E -->|EL2 non-VHE| F[Drop to EL1 via eret]
+    E -->|EL1| G[Stay at EL1]
+
+    F --> H[Setup 4-level page tables]
+    G --> H
+
+    H --> I[Load Kernel + initrd]
+    I --> J[Relocate ET_DYN Kernel]
+    J --> K[Build BootInfo]
+    K --> L[Jump to Kernel, x0 = BootInfo*]
+```
+
+**aarch64 EL2 handling:** When Stage 3 runs at EL2 (common on QEMU virt and bare-metal hypervisors), it cannot use the higher-half kernel mapping because non-VHE EL2 only has TTBR0_EL2 (lower VA range). Stage 3 therefore drops to EL1 via `eret` with `HCR_EL2.RW=1`, enabling the TTBR0/TTBR1 split regime needed for the kernel's higher-half entry at `0xFFFF800000000000`.
 
 ---
 
@@ -109,9 +137,9 @@ Filesystem-based booting, if enabled, is layered on top of the manifest rather t
 
 ## Stage 1: Initial Loader
 
-### BIOS Path (MBR)
+### x86_64 BIOS Path (MBR)
 
-Stage 1 for BIOS resides in the MBR boot sector.
+Stage 1 for BIOS resides in the MBR boot sector (`boot/stage1/arch/x86/bios/mbr.asm`).
 
 **Responsibilities:**
 
@@ -127,9 +155,9 @@ Stage 1 contains:
 
 ---
 
-### UEFI Path
+### x86_64 UEFI Path
 
-Under UEFI, Stage 1 is implemented as an EFI application.
+Under UEFI, Stage 1 is implemented as an EFI application (`boot/stage1/arch/x86/uefi/entry.c`).
 
 **Responsibilities:**
 
@@ -141,19 +169,43 @@ UEFI services are not exited until Stage 3 determines it is safe to do so.
 
 ---
 
+### aarch64 UEFI Path
+
+aarch64 is **UEFI-only** -- there is no BIOS MBR path. Stage 1 is a PE/COFF EFI application that loads Stage 2 and transfers control. Stage 1 and Stage 2 for aarch64 are combined into the UEFI application flow; the first arch-specific code entry is `_stage3_entry` in `boot/stage3/arch/aarch64/uefi/entry_uefi.S`.
+
+**Key differences from x86_64:**
+
+- No real mode, protected mode, or long mode transitions
+- UEFI firmware provides an identity-mapped environment at EL1 or EL2
+- Stage 2 calls `ExitBootServices()` and sets up identity page tables
+
+---
+
 ## Stage 2: Platform and Block Setup
 
 Stage 2 is responsible for **mechanical platform initialization**.
 
-### Responsibilities
+### x86_64 BIOS Responsibilities
 
-* Enable full address space (A20 or equivalent)
-* Establish initial CPU execution mode
-* Perform minimal paging setup if required
+* Enable A20 gate (`boot/stage2/arch/x86/bios/a20.c`)
+* Set up GDT for 32-bit protected mode, then transition to 64-bit long mode (`boot/stage2/arch/x86/bios/gdt.c`)
+* Query BIOS E820 memory map (`boot/stage2/arch/x86/bios/memory.c`)
 * Provide a uniform **block device abstraction**
 * Load Stage 3 using raw block reads
 
-### Non-Responsibilities
+### x86_64 UEFI Responsibilities
+
+* Obtain memory map and framebuffer info from UEFI Boot Services (`boot/stage2/arch/x86/uefi/main.c`)
+* Prepare Stage2Info structure for Stage 3
+* Transfer control to Stage 3
+
+### aarch64 UEFI Responsibilities
+
+* Obtain memory map from UEFI Boot Services
+* Call `ExitBootServices()`
+* Set up identity page tables for Stage 3
+
+### Non-Responsibilities (all architectures)
 
 * No filesystem parsing
 * No kernel loading
@@ -174,10 +226,40 @@ Stage 3 performs all policy-heavy boot logic.
 2. Select a physical load address for the kernel
 3. Load kernel and initrd via raw extents
 4. Perform ELF relocation
-5. Construct the BootInfo structure
-6. Transfer control to the kernel
+5. Set up kernel page tables (identity map + higher-half mapping)
+6. Construct the BootInfo structure
+7. Transfer control to the kernel
 
 Stage 3 is the **only stage** that understands kernel format and boot ABI.
+
+### Architecture-Specific Stage 3
+
+| Component | x86_64 BIOS | x86_64 UEFI | aarch64 UEFI |
+|-----------|-------------|-------------|--------------|
+| Entry | `boot/stage3/arch/x86/bios/entry.asm` | `boot/stage3/arch/x86/uefi/entry_uefi.asm` | `boot/stage3/arch/aarch64/uefi/entry_uefi.S` |
+| Paging | `boot/stage3/arch/x86/paging.c` | `boot/stage3/arch/x86/paging.c` | `boot/stage3/arch/aarch64/paging.c` |
+| CPU ops | `boot/stage3/arch/x86/cpu.h` | `boot/stage3/arch/x86/cpu.h` | `boot/stage3/arch/aarch64/cpu.h` |
+| Linker script | `boot/stage3/arch/x86/bios/stage3.ld` | `boot/stage3/arch/x86/uefi/stage3.ld` | `boot/stage3/arch/aarch64/uefi/stage3.ld` |
+
+### aarch64 Stage 3 Details
+
+**Page table setup** (`boot/stage3/arch/aarch64/paging.c`):
+- 4-level page tables with 4KB granule (L0-L3)
+- Single root table covers both identity map (low) and higher-half kernel mapping (high at `0xFFFF800000000000`)
+- MAIR configuration: index 0 = Device-nGnRnE, index 1 = Normal Non-Cacheable, index 2 = Normal Write-Back
+- TCR_EL1: 48-bit VA (T0SZ=16, T1SZ=16), 4KB granule, Inner Shareable, WB-WA cacheability
+
+**EL2→EL1 transition** (`boot/stage3/arch/aarch64/uefi/entry_uefi.S`):
+- `stage3_prepare_handoff_el()` detects current EL via `CurrentEL` register
+- At EL1: installs VBAR_EL1 vector table, returns 0
+- At EL2: configures `HCR_EL2.RW=1` (AArch64 mode for EL1), quiesces firmware timers (`CNTHP_CTL_EL2`, `CNTP_CTL_EL0`, `CNTV_CTL_EL0`), sets up SPSR_EL2 for EL1h with DAIF masked, then performs `eret` to drop to EL1
+- Returns `BOOTINFO_FLAG_STAGE3_EL2` (bit 4) to inform the kernel that the boot came through EL2
+
+**Kernel handoff:**
+- x0 = pointer to BootInfo structure (same contract as x86_64 RDI = BootInfo*)
+- MMU enabled with identity + higher-half mappings active
+- All exceptions masked (DAIF = 0xF)
+- Stack set up in .bss (16 KiB)
 
 ---
 
@@ -293,11 +375,16 @@ TLVs may include:
 
 * Memory map (filtered)
 * Framebuffer info
-* ACPI RSDP or device tree
+* ACPI RSDP (x86_64) or device tree (aarch64)
 * initrd location
 * Command line
+* Boot flags (e.g., `BOOTINFO_FLAG_STAGE3_EL2` on aarch64)
 
 All addresses are physical unless specified otherwise.
+
+**Kernel entry convention:**
+- x86_64: `RDI` = pointer to BootInfo
+- aarch64: `x0` = pointer to BootInfo
 
 ---
 
@@ -323,14 +410,17 @@ The bootloader must function on systems with approximately **4 MB RAM**.
 
 ## Multi-Architecture Considerations
 
-Architecture-specific code is limited to:
+Architecture-specific code is isolated to `boot/stage*/arch/<arch>/`:
 
-* CPU mode transitions
-* MMU and page table setup
-* Cache and barrier operations
-* Final kernel entry jump
+| Concern | x86_64 | aarch64 |
+|---------|--------|---------|
+| CPU mode transitions | Real → Protected → Long mode | EL2 → EL1 (eret) |
+| MMU/page tables | CR3-based 4-level (PML4) | TTBR0/TTBR1-based 4-level (4KB granule) |
+| Cache/barriers | None needed (x86 coherent) | DSB/ISB, DC CIVAC, IC IVAU |
+| Kernel entry | `jmp` with RDI = BootInfo* | `br` with x0 = BootInfo* |
+| Firmware | BIOS INT 13h / UEFI | UEFI only |
 
-All other logic (manifest parsing, ELF loading, relocation, BootInfo construction) is architecture-independent.
+All other logic (manifest parsing, ELF loading, relocation, BootInfo construction) is architecture-independent and shared between both architectures.
 
 ---
 
@@ -351,6 +441,8 @@ The following are explicitly out of scope:
 The SaltyOS bootloader guarantees:
 
 * A consistent three-stage model across BIOS and UEFI
+* Full support for both x86_64 (BIOS + UEFI) and aarch64 (UEFI only)
+* EL2-aware aarch64 boot with automatic EL2→EL1 transition when needed
 * MBR and GPT compatibility without partition parsing
 * ET_DYN kernel support with runtime relocation
 * Operation under ~4 MB RAM

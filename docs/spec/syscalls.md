@@ -6,10 +6,16 @@ This document defines the system call interface for SaltyOS.
 
 SaltyOS uses a capability-invocation model for system calls. Most operations are performed by invoking capabilities rather than traditional numbered system calls.
 
-### Calling Convention (x86_64)
+### Calling Conventions
+
+For the complete ABI specification including both x86_64 and aarch64 register
+conventions, IPC buffer layout, message info encoding, and VSpace page flags,
+see [abi.md](abi.md).
+
+#### x86_64
 
 ```
-User Registers (before SYSCALL instruction):
+Entry: SYSCALL instruction
   RAX  - System call number
   RDI  - Argument 0 (capability pointer)
   RSI  - Argument 1 (msg_info / label)
@@ -25,13 +31,38 @@ Return:
 Note: RCX and R11 are clobbered by the SYSCALL instruction (RCX=RIP, R11=RFLAGS).
 ```
 
+#### aarch64
+
+```
+Entry: SVC #0 instruction
+  x8   - System call number
+  x0   - Argument 0 (capability pointer)
+  x1   - Argument 1 (msg_info / label)
+  x2   - Argument 2 (MR0 / arg0)
+  x3   - Argument 3 (MR1 / arg1)
+  x4   - Argument 4 (MR2 / arg2)
+  x5   - Argument 5 (MR3 / arg3)
+
+Return:
+  x0   - Error code (0 = success)
+  x1   - Return value (syscall-specific)
+```
+
 ### System Call Entry
 
 ```nasm
-; User-space syscall wrapper
+; x86_64 user-space syscall wrapper
 syscall_invoke:
-    mov r10, rcx        ; Save arg4 (RCX clobbered by SYSCALL)
+    mov r10, rcx        ; Save arg3 (RCX clobbered by SYSCALL)
     syscall
+    ret
+```
+
+```asm
+// aarch64 user-space syscall wrapper
+syscall_invoke:
+    mov x8, x7          // syscall number from argument
+    svc #0
     ret
 ```
 
@@ -62,6 +93,11 @@ syscall_invoke:
 | 20 | `Shutdown` | ACPI system shutdown |
 | 21 | `SendTimed` | Blocking send with timeout |
 | 22 | `RecvTimed` | Blocking receive with timeout |
+| 23 | `RecvAny` | Receive from any of multiple endpoints |
+| 24 | `ReplyRecvAny` | Reply and wait on any of multiple endpoints |
+| 25 | `RecvAnyTimed` | RecvAny with timeout |
+| 26 | `ReplyRecvAnyTimed` | ReplyRecvAny with timeout |
+| 27 | `NotifReturn` | Return from notification dispatcher |
 
 ## Message Info Word Format
 
@@ -82,7 +118,7 @@ All IPC syscalls (Send, Recv, Call, ReplyRecv, NBSend) use a packed `msg_info` w
 | Reserved | 63:52 | Must be zero |
 
 ```c
-#define BESALT_MSGINFO(label, length, extra_caps) \
+#define TRONA_MSGINFO(label, length, extra_caps) \
     (((uint64_t)(label) << 12) | \
      ((uint64_t)(extra_caps) << 7) | \
      ((uint64_t)(length) & 0x7F))
@@ -548,6 +584,124 @@ long sys_recv_timed(
 
 ---
 
+### RecvAny (23)
+
+Receive from any of multiple endpoints. The endpoint capability pointers are
+read from the thread's IPC buffer `reserved[]` area.
+
+```c
+long sys_recv_any(
+    uint64_t endpoint_count  // RDI: Number of endpoints (read from IPC buffer)
+);
+```
+
+**Arguments:**
+- `endpoint_count`: Number of endpoint capability pointers stored in IPC buffer `reserved[0..N-1]`
+
+**Returns:**
+- RAX = `0`: Success, RDX = source endpoint index (0-based)
+- RAX = `4` (InvalidArgument): Count is 0 or exceeds maximum, or duplicate endpoint
+- RAX = `10` (BadAddress): Invalid IPC buffer address
+
+**Behavior:**
+- Reads endpoint capability pointers from the IPC buffer's `reserved[0..N-1]` words
+- Blocks until a message arrives on any of the specified endpoints
+- Message is written to the IPC buffer; badge is stored in `ipc_buffer.badge`
+- Returns the index of the endpoint that received the message
+
+---
+
+### ReplyRecvAny (24)
+
+Reply to current caller and wait for next message on any of multiple endpoints.
+
+```c
+long sys_reply_recv_any(
+    uint64_t endpoint_count,  // RDI: Number of endpoints
+    uint64_t msg_info,        // RSI: Reply message info
+    uint64_t mr0,             // RDX: Reply MR0
+    uint64_t mr1,             // R10: Reply MR1
+    uint64_t mr2,             // R8:  Reply MR2
+    uint64_t mr3              // R9:  Reply MR3
+);
+```
+
+**Behavior:**
+1. Sends reply to saved caller (from previous Call)
+2. Waits for next message on any of the specified endpoints
+3. Returns source endpoint index in RDX
+
+---
+
+### RecvAnyTimed (25)
+
+RecvAny with a timeout.
+
+```c
+long sys_recv_any_timed(
+    uint64_t endpoint_count,  // RDI: Number of endpoints
+    uint64_t timeout_ns       // RSI: Timeout in nanoseconds
+);
+```
+
+**Returns:**
+- RAX = `0`: Success, RDX = source endpoint index
+- RAX = `12` (Cancelled): Timeout expired
+
+---
+
+### ReplyRecvAnyTimed (26)
+
+ReplyRecvAny with a timeout. The timeout is read from the IPC buffer at
+`reserved[endpoint_count]` (the word immediately after the endpoint list).
+
+```c
+long sys_reply_recv_any_timed(
+    uint64_t endpoint_count,  // RDI: Number of endpoints
+    uint64_t msg_info,        // RSI: Reply message info
+    uint64_t mr0,             // RDX: Reply MR0
+    uint64_t mr1,             // R10: Reply MR1
+    uint64_t mr2,             // R8:  Reply MR2
+    uint64_t mr3              // R9:  Reply MR3
+);
+```
+
+**Returns:**
+- RAX = `0`: Success, RDX = source endpoint index
+- RAX = `12` (Cancelled): Timeout expired
+
+---
+
+### NotifReturn (27)
+
+Return from a notification dispatcher. Restores the user context from a
+notification frame on the user stack.
+
+```c
+long sys_notif_return(
+    uint64_t frame_ptr  // RDI: Pointer to NotifFrame on user stack
+);
+```
+
+**Arguments:**
+- `frame_ptr`: Pointer to a `NotifFrame` structure saved by the kernel when
+  dispatching a notification signal
+
+**Returns:**
+- Always returns `15` (Interrupted). SA_RESTART is handled at the POSIX library
+  level, not in the kernel, because:
+  - The notification handler may have issued IPC that overwrote the IPC buffer
+  - For ReplyRecv interruptions, the message was already delivered to the server
+- RAX = `10` (BadAddress): Invalid frame pointer
+- RAX = `4` (InvalidArgument): Invalid magic in NotifFrame
+
+**Behavior:**
+- Validates the NotifFrame magic and address
+- Restores the full register context (GPRs, FPU/NEON state) from the frame
+- Resumes execution at the point where the notification interrupted the thread
+
+---
+
 ## Capability Operations
 
 ### TCB Invocations
@@ -568,6 +722,7 @@ long sys_recv_timed(
 | 0x4B | `TCB_SetFaultHandler` | Set fault handler endpoint |
 | 0x4C | `TCB_CopyFpu` | Copy FPU state between TCBs |
 | 0x4D | `TCB_SetTlsBase` | Set thread-local storage base |
+| 0x4E | `TCB_SetNotificationDispatcher` | Set notification dispatcher entry point |
 
 #### TCB_Configure (0x40)
 
@@ -667,7 +822,23 @@ Set the thread-local storage base address (FS base register) for a thread.
 arg0 = tls_base          (virtual address for FS base)
 ```
 
-Sets the FS segment base for the target thread. Takes effect on next context switch to the thread. Requires WRITE right.
+Sets the FS segment base (x86_64) or TPIDR_EL0 (aarch64) for the target thread. Takes effect on next context switch to the thread. Requires WRITE right.
+
+#### TCB_SetNotificationDispatcher (0x4E)
+
+Set the user-mode notification dispatcher entry point for a thread.
+
+```
+arg0 = dispatcher        (virtual address of dispatcher function, or 0 to clear)
+```
+
+When non-zero, the kernel injects a notification frame onto the user stack and
+redirects control to this address instead of returning EINTR when a bound
+notification fires during a blocking syscall. The thread uses `NotifReturn` (27)
+to restore the original context after handling the notification.
+
+Requires CONFIGURE right. Returns `InvalidArgument` if the address is in kernel
+space (>= 0x0000_8000_0000_0000).
 
 ---
 
@@ -816,6 +987,11 @@ Query CNode metadata (size, guard, depth).
 | 0x58 | `VSpace_Protect` | Change page protection flags |
 | 0x59 | `VSpace_MapDemand` | Map demand-paged region |
 | 0x5A | `VSpace_MapDemandRange` | Batch demand-page mapping |
+| 0x5B | `VSpace_CowResolve` | Resolve COW fault with new frame |
+| 0x5C | `VSpace_SetCowPool` | Set COW page pool for fast resolution |
+| 0x5D | `VSpace_SetCowNotif` | Set COW pool depletion notification |
+| 0x5E | `VSpace_ReplenishCowPool` | Replenish COW page pool |
+| 0x5F | `VSpace_ProtectRange` | Change protection for a range of pages |
 
 #### VSpace_Map (0x50)
 
@@ -939,6 +1115,196 @@ arg2 = flags_bits      (flags for the eventual mappings)
 
 Like VSpace_MapDemand but for a contiguous range of pages.
 
+#### VSpace_CowResolve (0x5B)
+
+Resolve a COW fault by providing a new frame.
+
+```
+arg0 = virt_addr       (faulting virtual address)
+arg1 = frame_cap_ptr   (capability pointer to new frame)
+arg2 = flags_bits      (page flags for the new mapping)
+```
+
+#### VSpace_SetCowPool (0x5C)
+
+Set a pool of pre-allocated frames for fast COW resolution.
+
+```
+arg0 = pool_frame_cap_ptr  (capability pointer to pool frame)
+arg1 = src_cnode_cap_ptr   (CNode containing pool frames)
+arg2 = count               (number of frames in pool)
+```
+
+#### VSpace_SetCowNotif (0x5D)
+
+Set a notification to signal when the COW pool is depleted.
+
+```
+arg0 = ring_frame_cap_ptr  (capability pointer to ring buffer frame)
+arg1 = notif_cap_ptr       (capability pointer to notification)
+```
+
+#### VSpace_ReplenishCowPool (0x5E)
+
+Replenish the COW page pool with additional frames.
+
+```
+arg0 = src_cnode_cap_ptr   (CNode containing new frames)
+arg1 = start_slot          (starting slot index)
+arg2 = count               (number of frames to add)
+```
+
+#### VSpace_ProtectRange (0x5F)
+
+Change protection flags for a contiguous range of pages.
+
+```
+arg0 = virt_addr       (starting virtual address)
+arg1 = num_pages       (number of 4KB pages)
+arg2 = flags_bits      (new page flags)
+```
+
+---
+
+### VSpace MemoryObject Invocations
+
+| Label | Operation | Description |
+|-------|-----------|-------------|
+| 0x97 | `VSpace_MapMO` | Map MemoryObject pages into VSpace |
+| 0x98 | `VSpace_UnmapMO` | Unmap MemoryObject region |
+| 0x99 | `VSpace_ShareRoPage` | Share a page read-only to another VSpace |
+| 0x9A | `VSpace_ForkRange` | COW-fork a range of MO-backed pages |
+
+#### VSpace_MapMO (0x97)
+
+Map pages from a MemoryObject into the VSpace.
+
+```
+arg0 = mo_cap_ptr         (capability pointer to MemoryObject)
+arg1 = vaddr              (virtual address to map at)
+arg2 = mo_offset          (page offset within MO)
+arg3 = count_and_flags    (page count in upper 32 bits, flags in lower 32 bits)
+```
+
+#### VSpace_UnmapMO (0x98)
+
+Unmap a MemoryObject region from the VSpace.
+
+```
+arg0 = vaddr              (starting virtual address)
+arg1 = count              (number of pages to unmap)
+```
+
+#### VSpace_ShareRoPage (0x99)
+
+Share a page read-only from this VSpace to another.
+
+```
+arg0 = src_vaddr          (source virtual address)
+arg1 = dst_vspace_cap_ptr (capability pointer to destination VSpace)
+arg2 = dst_vaddr          (destination virtual address)
+```
+
+#### VSpace_ForkRange (0x9A)
+
+COW-fork a range of MO-backed pages from parent to child VSpace.
+
+```
+arg0 = child_vspace_cap   (capability pointer to child VSpace)
+arg1 = child_mo_cap       (capability pointer to child MemoryObject)
+arg2 = va_start           (starting virtual address)
+arg3 = count_and_offset   (page_count in upper 32 bits, mo_offset in lower 32 bits)
+```
+
+---
+
+### MemoryObject Invocations
+
+| Label | Operation | Description |
+|-------|-----------|-------------|
+| 0x90 | `MO_Commit` | Commit physical pages to MO |
+| 0x91 | `MO_Decommit` | Release physical pages from MO |
+| 0x92 | `MO_GetSize` | Query MO size in pages |
+| 0x93 | `MO_Clone` | Create COW clone of MO |
+| 0x94 | `MO_Resize` | Resize MO |
+| 0x95 | `MO_Read` | Read data from MO pages |
+| 0x96 | `MO_Write` | Write data to MO pages |
+| 0x97 | `MO_HasPage` | Check if a page is committed |
+
+#### MO_Commit (0x90)
+
+Commit physical pages to a MemoryObject. Pages can be sourced from an untyped
+capability (primary path) or from the PMM fallback allocator.
+
+```
+arg0 = offset        (page offset within MO)
+arg1 = count         (number of pages to commit)
+arg2 = ut_cap_ptr    (untyped capability pointer, or 0 for PMM fallback)
+```
+
+#### MO_Decommit (0x91)
+
+Release committed physical pages from a MemoryObject.
+
+```
+arg0 = offset        (page offset within MO)
+arg1 = count         (number of pages to decommit)
+```
+
+#### MO_GetSize (0x92)
+
+Query the size of a MemoryObject in pages.
+
+**Returns:** Page count in value field. Requires READ right.
+
+#### MO_Clone (0x93)
+
+Create a COW clone of a MemoryObject.
+
+```
+arg0 = dest_slot     (destination capability slot index)
+arg1 = flags         (clone flags)
+```
+
+The clone shares physical pages with the original. Writes to either copy trigger
+COW resolution.
+
+#### MO_Resize (0x94)
+
+Resize a MemoryObject.
+
+```
+arg0 = new_page_count    (new size in pages)
+```
+
+#### MO_Read (0x95)
+
+Read data from MemoryObject pages into the IPC buffer.
+
+```
+arg0 = offset        (page offset within MO)
+arg1 = count         (number of pages to read)
+```
+
+#### MO_Write (0x96)
+
+Write data from the IPC buffer to MemoryObject pages.
+
+```
+arg0 = offset        (page offset within MO)
+arg1 = count         (number of pages to write)
+```
+
+#### MO_HasPage (0x97)
+
+Check if a specific page is committed in the MemoryObject.
+
+```
+arg0 = page_index    (page index to check)
+```
+
+**Returns:** 1 if page is committed, 0 if not. Requires READ right.
+
 ---
 
 ### Untyped Invocations
@@ -950,7 +1316,7 @@ Like VSpace_MapDemand but for a contiguous range of pages.
 #### Untyped_Retype (0x20)
 
 ```
-arg0 = object_type   (ObjectType enum, 1..=10)
+arg0 = object_type   (ObjectType enum, 1..=11)
 arg1 = size_bits     (for variable-size objects)
 arg2 = dest_offset   (destination slot index in current CSpace)
 ```
@@ -968,6 +1334,7 @@ arg2 = dest_offset   (destination slot index in current CSpace)
 | 8 | IrqHandler | Interrupt handler object |
 | 9 | IoPort | I/O port range |
 | 10 | SchedContext | Scheduling parameters |
+| 11 | MemoryObject | Memory object (page-granular backing store) |
 
 ---
 
@@ -1164,7 +1531,7 @@ arg2 = dest_slot     (destination slot index in current CSpace)
 
 ## Error Codes
 
-SaltyOS uses positive error codes (returned in RAX).
+SaltyOS uses positive error codes (returned in RAX on x86_64, x0 on aarch64).
 
 | Code | Name | Description |
 |------|------|-------------|
@@ -1183,6 +1550,9 @@ SaltyOS uses positive error codes (returned in RAX).
 | 12 | `Cancelled` | Operation was cancelled |
 | 13 | `Restart` | Syscall should be restarted |
 | 14 | `Deadlock` | Deadlock detected |
+| 15 | `Interrupted` | Interrupted by notification dispatch |
+| 0x10 | `InProgress` | Async operation in progress |
+| 0x80 | `Pending` | Deferred result pending |
 
 ## IPC Buffer Layout
 
@@ -1231,3 +1601,15 @@ for (;;) {
     trona_reply_recv(endpoint, &reply, &msg, &badge);
 }
 ```
+
+---
+
+## Cross-References
+
+- [ABI Specification](abi.md) -- register conventions, IPC buffer layout, message info encoding, page flags
+- [Boot Protocol](boot_protocol.md) -- kernel entry state and BootInfo ABI
+- [trona API Reference](trona-api.md) -- userspace syscall wrappers
+- [basaltc API Reference](basaltc-api.md) -- C standard library functions
+- [Capability Design](../design/capability.md) -- capability model details
+- [IPC Design](../design/ipc.md) -- IPC protocol design
+- [Memory Design](../design/memory.md) -- MemoryObject architecture

@@ -12,41 +12,109 @@ runtime dynamic linker (`rtld`) loads into every process.
 trona has a dual personality:
 
 - **Rust module API** -- Internal modules (`ipc`, `invoke`, `posix`,
-  `posix_mm`, `signals`, `slot_alloc`, etc.) are used directly by Rust
+  `mm`, `signals`, `slot_alloc`, etc.) are used directly by Rust
   userland programs that link against the `.rmeta` at compile time.
 - **C ABI surface** -- Every public entry point is
   `#[unsafe(no_mangle)] pub extern "C" fn trona_*`, making the shared
   library callable from C code, the C standard library (`basaltc`), and
   the runtime linker.
 
-The library is approximately 3,500 lines of Rust plus 55 lines of assembly
-(`fork.S`), deliberately kept small to minimize the trusted computing base
-outside the kernel.
+### 5-Crate Architecture
 
-### Source files
+trona is organized as 5 crates plus a dual-format runtime linker:
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| `lib.rs` | 635 | Module declarations, global state, C ABI exports, panic handler |
-| `consts.rs` | 471 | Syscall numbers, invoke labels, error codes, capability slots, POSIX constants |
-| `types.rs` | 419 | `#[repr(C)]` types: `TronaMsg`, `IpcBuffer`, `IpcContext`, ELF types, POSIX types |
-| `syscall.rs` | 37 | Single `syscall()` function with inline assembly |
-| `ipc.rs` | 233 | IPC operations: send, recv, call, reply_recv, nbsend, cap transfer |
-| `invoke.rs` | 267 | Capability invocation wrappers for all kernel object types |
-| `posix.rs` | 2079 | POSIX file I/O, process management, sockets, poll, terminal I/O, `*at()` family |
-| `posix_mm.rs` | 404 | Memory management: brk, sbrk, mmap (anonymous + fd-backed), munmap, mprotect |
-| `signals.rs` | 141 | Signal handling: registration, dispatch, blocked mask, SA_RESETHAND |
-| `slot_alloc.rs` | 503 | Dynamic CNode slot allocator with async expansion protocol |
-| `serial.rs` | 173 | Serial output via DebugPutBuf syscall, atomic `LineBuf` |
-| `layout.rs` | 149 | Child process VM layout planner |
-| `framebuffer.rs` | 60 | Framebuffer info reader from boot info page |
-| `cpio.rs` | 264 | CPIO newc archive parser |
-| `elf_loader.rs` | 687 | Userspace ELF64 loader with PIE relocation support |
-| `elf_dynamic.rs` | 244 | ELF dynamic linking helpers (PT_INTERP, DT_NEEDED extraction) |
-| `fork.S` | 55 | Fork assembly trampoline (callee-save register preservation) |
-| `pthread.rs` | - | POSIX threads: pthread_create, pthread_join, mutexes, condvars, rwlocks |
-| `sync.rs` | - | Synchronization primitives: futex-based Mutex, RWLock, Semaphore |
-| `tls.rs` | - | Thread-local storage setup and access |
+| Crate | Path | Purpose |
+|-------|------|---------|
+| **substrate** | `lib/trona/substrate/` | Core syscall wrappers, IPC, capability invocations, slot allocator, serial I/O, layout planner |
+| **posix** | `lib/trona/posix/` | POSIX compatibility: file I/O, sockets, poll, mm, signals, pthread, sync, tls, dns, bulk transfers |
+| **loader** | `lib/trona/loader/` | ELF64 loader, PE loader, CPIO parser, ELF dynamic helpers |
+| **uapi** | `lib/trona/uapi/` | Shared constants, types, and IPC protocol definitions (kernel + server + POSIX) |
+| **win32** | `lib/trona/win32/` | Win32 personality support: console, CRT, error handling, process, protocol, handle management |
+| **rtld/elf** | `lib/trona/rtld/elf/` | ELF runtime dynamic linker (`ld-trona.so`) |
+| **rtld/pe** | `lib/trona/rtld/pe/` | PE runtime dynamic linker (`ld-trona-pe.so`) for Win32 subsystem |
+
+### Source Layout
+
+**substrate** (`lib/trona/substrate/`):
+
+| File | Purpose |
+|------|---------|
+| `lib.rs` | Module declarations, global state, C ABI exports, panic handler |
+| `syscall.rs` | Single `syscall()` function with inline assembly (x86_64 + aarch64) |
+| `ipc.rs` | IPC operations: send, recv, call, reply_recv, nbsend, cap transfer |
+| `invoke.rs` | Capability invocation wrappers for all kernel object types |
+| `slot_alloc.rs` | Dynamic CNode slot allocator with async expansion protocol |
+| `serial.rs` | Serial output via DebugPutBuf syscall, atomic `LineBuf` |
+| `layout.rs` | Child process VM layout planner |
+| `framebuffer.rs` | Framebuffer info reader from boot info page |
+| `pending.rs` | Pending operation tracking |
+| `protocol.rs` | IPC protocol helpers |
+| `consts.rs` | Legacy constants (re-exports from uapi) |
+| `types.rs` | Legacy types (re-exports from uapi) |
+| `arch/x86_64/fork.S` | Fork assembly trampoline (x86_64) |
+| `arch/aarch64/fork.S` | Fork assembly trampoline (aarch64) |
+
+**posix** (`lib/trona/posix/`):
+
+| File | Purpose |
+|------|---------|
+| `file.rs` | POSIX file I/O: open, read, write, close, stat, lseek, dup, *at() family |
+| `proc.rs` | Process management: fork, exec, exit, wait, kill, getpid |
+| `socket.rs` | Socket API: AF_UNIX + AF_INET, bind, connect, send, recv |
+| `poll.rs` | Event multiplexing: poll, select, epoll |
+| `pipe.rs` | Pipes: pipe, pipe2, mkfifo |
+| `mm.rs` | Memory management: brk, sbrk, mmap, munmap, mprotect (delegates to mmsrv) |
+| `signals.rs` | Signal handling: registration, dispatch, blocked mask, SA_RESETHAND |
+| `at.rs` | *at() family: openat, renameat, fstatat, etc. |
+| `misc.rs` | Miscellaneous: getcwd, chdir, ioctl, fcntl, terminal I/O |
+| `dns.rs` | DNS resolution: getaddrinfo backend (IPC to dnssrv) |
+| `bulk.rs` | Bulk data transfer helpers |
+| `pthread.rs` | POSIX threads: pthread_create, pthread_join, mutexes, condvars, rwlocks |
+| `sync.rs` | Synchronization primitives: futex-based Mutex, RWLock, Semaphore |
+| `tls.rs` | Thread-local storage setup and access |
+| `protocol.rs` | POSIX IPC protocol definitions |
+| `consts.rs` | POSIX constants (O_*, F_*, SEEK_*, etc.) |
+| `types.rs` | POSIX types (stat, dirent, sockaddr, etc.) |
+
+**loader** (`lib/trona/loader/`):
+
+| File | Purpose |
+|------|---------|
+| `elf_loader.rs` | Userspace ELF64 loader with PIE relocation support |
+| `elf_dynamic.rs` | ELF dynamic linking helpers (PT_INTERP, DT_NEEDED extraction) |
+| `pe_loader.rs` | PE/COFF loader for Win32 personality executables |
+| `pe_types.rs` | PE format type definitions |
+| `cpio.rs` | CPIO newc archive parser |
+
+**uapi** (`lib/trona/uapi/`):
+
+| Directory | Files | Purpose |
+|-----------|-------|---------|
+| `consts/` | `kernel.rs`, `posix.rs`, `server.rs` | Syscall numbers, invoke labels, error codes, cap slots, POSIX constants, server labels |
+| `protocol/` | `mmsrv.rs`, `procmgr.rs`, `vfs.rs`, `namesrv.rs`, `server.rs`, `posix.rs`, `win32.rs` | IPC message label definitions for all servers |
+| `types/` | `core.rs`, `posix.rs`, `pe.rs` | `#[repr(C)]` shared types: TronaMsg, IpcBuffer, PollFd, SockAddrUn, PE types |
+| `include/trona/` | `uapi.h` | C header for uapi constants (shared with Win32 PE programs) |
+
+**win32** (`lib/trona/win32/`):
+
+| File | Purpose |
+|------|---------|
+| `lib.rs` | Win32 subsystem module root |
+| `console.rs` | Win32 console I/O (ReadConsole/WriteConsole) |
+| `crt.rs` | Win32 CRT startup |
+| `error.rs` | Win32 error code translation |
+| `handle.rs` | Win32 HANDLE management |
+| `process.rs` | Win32 process operations |
+| `protocol.rs` | Win32 CSRSS IPC protocol |
+| `kernel32_pe.c` | kernel32.dll PE stub |
+| `kernel32_pe.def` | kernel32.dll export definitions |
+
+**rtld** (`lib/trona/rtld/`):
+
+| Component | Path | Purpose |
+|-----------|------|---------|
+| ELF rtld | `rtld/elf/` | `ld-trona.so` -- loads ELF shared libraries (libtrona.so, libc.so) |
+| PE rtld | `rtld/pe/` | `ld-trona-pe.so` -- loads PE/COFF executables for Win32 personality |
 
 ## 2. Design Principles
 
@@ -81,62 +149,66 @@ yield loop. No `unwrap()` or `expect()` calls exist in the library.
 ```
  +------------------------------------------------------------------+
  |                        User Application                          |
- |  (Rust: uses trona::ipc, trona::invoke, trona::posix directly)    |
- |  (C:    calls trona_open(), trona_call(), trona_vspace_map()...)  |
- +----+----+----+----+----+----+----+----+----+----+----+----+------+
-      |    |    |    |    |    |    |    |    |    |    |    |
- +----v----v----v----v----v----v----v----v----v----v----v----v------+
- | lib.rs  C ABI surface (trona_send, trona_open, trona_mmap, ...) |
- +--------+----------+-----------+----------+----------+----------+
-          |          |           |          |          |
-  +-------v--+  +---v------+  +-v--------+ | +-------v--------+
-  | ipc.rs   |  | invoke.rs|  | posix.rs | | | posix_mm.rs    |
-  | send     |  | CNode    |  | open     | | | brk/sbrk       |
-  | recv     |  | Untyped  |  | read     | | | mmap/munmap    |
-  | call     |  | TCB      |  | write    | | | mprotect       |
-  | reply_   |  | VSpace   |  | fork     | | +----------------+
-  | recv     |  | IRQ      |  | exec     | |
-  | nbsend   |  | IoPort   |  | socket   | | +----------------+
-  +----+-----+  | SchedCtx |  | poll     | +>| signals.rs     |
-       |        +----+-----+  | pipe     |   | posix_signal   |
-       |             |        | dup      |   | posix_sigcheck |
-  +----v-------------v---+    | termios  |   +----------------+
-  | syscall.rs            |   | *at()    |
-  | syscall(num,a0..a5)   |   +----+-----+ +------------------+
-  | inline asm "syscall"  |        |       | slot_alloc.rs    |
-  +----------+------------+        |       | slot_alloc()     |
-             |                     |       | async expansion  |
-             v                     v       +------------------+
-  +-----------------------+   +---------+  +------------------+
-  |  Kernel syscall entry |   | VFS /   |
-  |  (syscall.S)          |   | procmgr |  +------------------+
-  +-----------------------+   | servers |  | elf_loader.rs    |
-                              +---------+  | cpio.rs          |
-                                           | elf_dynamic.rs   |
-                                           | layout.rs        |
-                                           | framebuffer.rs   |
-                                           +------------------+
+ |  POSIX (Rust/C)               |  Win32 (PE)                     |
+ +-------------------------------+----------------------------------+
+ |  basaltc (libc.so)            |  win32 (kernel32.dll stub)      |
+ +-------------------------------+----------------------------------+
+ |                                                                  |
+ |  posix crate                  |  win32 crate                    |
+ |  ├── file.rs, proc.rs         |  ├── console.rs, process.rs     |
+ |  ├── socket.rs, poll.rs       |  ├── handle.rs, error.rs        |
+ |  ├── mm.rs, signals.rs        |  └── protocol.rs                |
+ |  ├── pthread.rs, sync.rs      |                                 |
+ |  └── dns.rs, bulk.rs          |                                 |
+ +-------------------------------+----------------------------------+
+ |                   substrate crate                                |
+ |  ipc.rs, invoke.rs, syscall.rs, slot_alloc.rs, serial.rs        |
+ +-------------------------------+----------------------------------+
+ |                   uapi crate (shared types + constants)          |
+ |  consts/{kernel,posix,server}, protocol/{mmsrv,...}, types/{...} |
+ +------------------------------------------------------------------+
+ |                   loader crate                                   |
+ |  elf_loader.rs, pe_loader.rs, cpio.rs, elf_dynamic.rs           |
+ +------------------------------------------------------------------+
+ |  rtld/elf (ld-trona.so)       |  rtld/pe (ld-trona-pe.so)      |
+ +-------------------------------+----------------------------------+
+                    |                          |
+                    v                          v
+ +------------------------------------------------------------------+
+ |                    SaltyOS Kernel                                 |
+ |  syscall entry (syscall.S / svc #0)                              |
+ +------------------------------------------------------------------+
 ```
 
-### Module Dependency Graph
+### Crate Dependency Graph
 
 ```
-lib.rs ──> consts.rs
-       ──> types.rs
-       ──> syscall.rs ──> types.rs
-       ──> ipc.rs ──> syscall.rs, consts.rs, types.rs
-       ──> invoke.rs ──> syscall.rs, consts.rs, types.rs
-       ──> posix.rs ──> ipc.rs, consts.rs, types.rs
-       ──> posix_mm.rs ──> invoke.rs, slot_alloc.rs, consts.rs, types.rs
-       ──> signals.rs ──> ipc.rs, consts.rs, types.rs
-       ──> slot_alloc.rs ──> invoke.rs, ipc.rs, syscall.rs, serial.rs, consts.rs, types.rs
-       ──> serial.rs ──> syscall.rs, consts.rs
-       ──> layout.rs  (standalone)
-       ──> framebuffer.rs ──> consts.rs
-       ──> cpio.rs ──> consts.rs, types.rs
-       ──> elf_loader.rs ──> invoke.rs, serial.rs, consts.rs, types.rs
-       ──> elf_dynamic.rs ──> consts.rs, types.rs
+                  +----------+
+                  |   uapi   | (consts, types, protocols — no dependencies)
+                  +----+-----+
+                       |
+          +------------+------------+
+          |            |            |
+     +----v-----+  +--v-------+  +-v---------+
+     | substrate |  | posix    |  | win32     |
+     | (syscall, |  | (file,   |  | (console, |
+     |  ipc,     |  |  socket, |  |  process, |
+     |  invoke,  |  |  mm,     |  |  handle)  |
+     |  slot)    |  |  signal) |  +-----------+
+     +----+------+  +----+-----+
+          |              |
+          |   +----------+
+          |   |
+     +----v---v---+
+     |   loader   | (elf_loader, pe_loader, cpio)
+     +------------+
 ```
+
+- **uapi** has zero crate dependencies (pure constants/types)
+- **substrate** depends on uapi
+- **posix** depends on substrate + uapi
+- **win32** depends on substrate + uapi
+- **loader** depends on substrate + uapi
 
 ## 4. Syscall Wrapper Layer
 
@@ -148,6 +220,8 @@ pub fn syscall(num: u64, a0..a5: u64) -> TronaResult { error, value }
 ```
 
 The inline assembly maps directly to the SaltyOS syscall ABI:
+
+**x86_64** (`syscall` instruction):
 
 | Register | Direction | Purpose |
 |----------|-----------|---------|
@@ -161,9 +235,20 @@ The inline assembly maps directly to the SaltyOS syscall ABI:
 | `rcx` | clobbered | Destroyed by `syscall` instruction (saves RIP) |
 | `r11` | clobbered | Destroyed by `syscall` instruction (saves RFLAGS) |
 
-The function uses `options(nostack)` because the `syscall` instruction
-does not touch the user stack. The `inlateout` constraint on `rax` and
-`rdx` allows the compiler to reuse the input registers for the outputs.
+**aarch64** (`svc #0` instruction):
+
+| Register | Direction | Purpose |
+|----------|-----------|---------|
+| `x8` | in | Syscall number |
+| `x0` | in/out | Argument 0 in, error code out |
+| `x1` | in/out | Argument 1 in, return value out |
+| `x2` | in | Argument 2 |
+| `x3` | in | Argument 3 |
+| `x4` | in | Argument 4 |
+| `x5` | in | Argument 5 |
+
+The function uses `options(nostack)` because the syscall instruction
+does not touch the user stack.
 
 ## 5. IPC Abstraction Layer
 
@@ -309,11 +394,11 @@ after CSpace expansion.
 
 Also has a `untyped_retype_depth()` variant for expanded CSpaces.
 
-### TCB Operations (0x40-0x4D)
+### TCB Operations (0x40-0x4E)
 
 | Label | Function | Purpose |
 |-------|----------|---------|
-| `TCB_CONFIGURE` (0x40) | `tcb_configure()` | Set initial RIP, RSP, IPC buffer |
+| `TCB_CONFIGURE` (0x40) | `tcb_configure()` | Set initial RIP/PC, RSP/SP, IPC buffer |
 | `TCB_RESUME` (0x41) | `tcb_resume()` | Make thread runnable |
 | `TCB_SUSPEND` (0x42) | `tcb_suspend()` | Remove thread from scheduler |
 | `TCB_SET_SPACE` (0x43) | `tcb_set_space()` | Assign CSpace and VSpace |
@@ -323,8 +408,9 @@ Also has a `untyped_retype_depth()` variant for expanded CSpaces.
 | `TCB_SET_FAULT_HANDLER` (0x4B) | `tcb_set_fault_handler()` | Set or clear fault endpoint |
 | `TCB_COPY_FPU` (0x4C) | `tcb_copy_fpu()` | Copy FPU state between threads |
 | `TCB_SET_TLS_BASE` (0x4D) | `tcb_set_tls_base()` | Set thread-local storage base address |
+| `TCB_SET_NOTIFICATION_DISPATCHER` (0x4E) | `tcb_set_notification_dispatcher()` | Set notification dispatcher for signal delivery |
 
-### VSpace Operations (0x50-0x5A)
+### VSpace Operations (0x50-0x5F)
 
 | Label | Function | Purpose |
 |-------|----------|---------|
@@ -339,6 +425,33 @@ Also has a `untyped_retype_depth()` variant for expanded CSpaces.
 | `VSPACE_PROTECT` (0x58) | `vspace_protect()` | Change page protection flags |
 | `VSPACE_MAP_DEMAND` (0x59) | `vspace_map_demand()` | Map a demand-paged region |
 | `VSPACE_MAP_DEMAND_RANGE` (0x5A) | `vspace_map_demand_range()` | Batch-map demand-paged regions |
+| `VSPACE_COW_RESOLVE` (0x5B) | `vspace_cow_resolve()` | Resolve COW fault for a page |
+| `VSPACE_SET_COW_POOL` (0x5C) | `vspace_set_cow_pool()` | Set COW frame pool for VSpace |
+| `VSPACE_SET_COW_NOTIF` (0x5D) | `vspace_set_cow_notif()` | Set COW notification endpoint |
+| `VSPACE_REPLENISH_COW_POOL` (0x5E) | `vspace_replenish_cow_pool()` | Replenish COW frame pool |
+| `VSPACE_PROTECT_RANGE` (0x5F) | `vspace_protect_range()` | Batch change page protection |
+
+### MemoryObject Operations (0x90-0x97)
+
+| Label | Function | Purpose |
+|-------|----------|---------|
+| `MO_COMMIT` (0x90) | `mo_commit()` | Commit a page into a MemoryObject |
+| `MO_DECOMMIT` (0x91) | `mo_decommit()` | Decommit a page from a MemoryObject |
+| `MO_GET_SIZE` (0x92) | `mo_get_size()` | Query MemoryObject size |
+| `MO_CLONE` (0x93) | `mo_clone()` | COW clone a MemoryObject |
+| `MO_RESIZE` (0x94) | `mo_resize()` | Resize a MemoryObject |
+| `MO_READ` (0x95) | `mo_read()` | Read data from a MemoryObject page |
+| `MO_WRITE` (0x96) | `mo_write()` | Write data to a MemoryObject page |
+| `MO_HAS_PAGE` (0x97) | `mo_has_page()` | Check if a page is committed |
+
+### VSpace MemoryObject Mapping (0x97-0x9A)
+
+| Label | Function | Purpose |
+|-------|----------|---------|
+| `VSPACE_MAP_MO` (0x97) | `vspace_map_mo()` | Map MemoryObject pages into VSpace |
+| `VSPACE_UNMAP_MO` (0x98) | `vspace_unmap_mo()` | Unmap MemoryObject pages from VSpace |
+| `VSPACE_SHARE_RO_PAGE` (0x99) | `vspace_share_ro_page()` | Share a read-only page between VSpaces |
+| `VSPACE_FORK_RANGE` (0x9A) | `vspace_fork_range()` | Fork a VA range (COW) between VSpaces |
 
 ### Scheduling Operations (0x30-0x31)
 
@@ -375,15 +488,19 @@ Also has a `untyped_retype_depth()` variant for expanded CSpaces.
 ### Delegation Model
 
 trona does not implement POSIX semantics. It acts as a message-passing
-stub that translates POSIX calls into IPC messages to two userspace
-servers:
+stub that translates POSIX calls into IPC messages to userspace servers:
 
-- **VFS** (`CAP_VFS_EP`, slot 4) -- File I/O, directories, sockets,
-  pipes, poll/select/epoll, shared memory, terminal I/O, ioctl, fcntl,
-  `*at()` family
+- **VFS** (`CAP_VFS_EP`, slot 4) -- File I/O, directories, sockets
+  (AF_UNIX + AF_INET proxy), pipes, poll/select/epoll, shared memory,
+  terminal I/O, ioctl, fcntl, `*at()` family
 - **procmgr** (`CAP_PROCMGR_EP`, slot 3) -- Process lifecycle (spawn,
   exit, wait, fork, exec, kill), signal disposition, process groups,
-  UID/GID queries, CSpace expansion
+  UID/GID queries, CSpace expansion, personality state (POSIX/Win32)
+- **mmsrv** (`CAP_MMSRV_EP`, slot 7) -- Frame allocation, VSpace
+  mapping, heap management (brk/sbrk), mmap/munmap/mprotect, demand
+  paging, shared memory frames
+- **dnssrv** -- DNS resolution (getaddrinfo), accessed via trona posix
+  dns.rs
 
 Every POSIX function follows the same pattern:
 
@@ -422,7 +539,7 @@ requested, the loop terminates and returns the total transferred.
 
 ### Memory Management
 
-The `posix_mm.rs` module provides `brk`/`sbrk` (heap) and
+The `mm.rs` module (in the posix crate) provides `brk`/`sbrk` (heap) and
 `mmap`/`munmap`/`mprotect` (memory mapping) using the slot allocator
 and capability invocations:
 
@@ -550,15 +667,23 @@ dynamic linking metadata (`.gnu.hash`, `.dynsym`, `.dynstr`,
 
 ### Runtime Loader Integration
 
-The runtime dynamic linker (`rtld`) loads `libtrona.so` into every
-dynamically-linked process. RTLD:
+SaltyOS has two runtime dynamic linkers, both in `lib/trona/rtld/`:
 
-1. Finds `libtrona.so` in the shared library cache region
-2. Maps it into the child's address space
-3. Resolves relocations (R_X86_64_RELATIVE for PIE)
+**ELF RTLD** (`lib/trona/rtld/elf/` → `ld-trona.so`):
+Loads `libtrona.so` and `libc.so` into every POSIX dynamically-linked
+process:
+
+1. Finds shared libraries in the shared library cache region
+2. Maps them into the child's address space
+3. Resolves relocations (R_X86_64_RELATIVE / R_AARCH64_RELATIVE for PIE)
 4. Sets up the GOT and PLT entries
 
-Init is the exception: it is **statically linked** with `trona.o`
+**PE RTLD** (`lib/trona/rtld/pe/` → `ld-trona-pe.so`):
+Loads PE/COFF executables for the Win32 personality subsystem. Uses the
+`pe_loader.rs` module in the loader crate to parse PE headers, map
+sections, and resolve imports.
+
+Init is the exception: it is **statically linked** with substrate .o
 embedded directly, since it runs before `rtld` and VFS are available.
 
 ### ELF Loader
@@ -569,9 +694,16 @@ spaces. It supports:
 - ET_EXEC (fixed address) and ET_DYN (PIE, relocated to `load_base`)
 - Multiple PT_LOAD segments with correct permissions
 - Overlapping page merging (permission union)
-- R_X86_64_RELATIVE relocation patching via scratch page
+- R_X86_64_RELATIVE / R_AARCH64_RELATIVE relocation patching via scratch page
 - Callback-based frame allocation (`alloc_frame_slot` function pointer)
 - Page recording callback for COW fork tracking
+
+### PE Loader
+
+The `pe_loader.rs` module (in the loader crate) loads PE/COFF binaries
+for the Win32 personality subsystem. It parses PE headers, maps sections
+with correct permissions, and resolves import address tables. The
+`pe_types.rs` module provides PE format type definitions.
 
 ### CPIO Parser
 
@@ -610,7 +742,7 @@ All mutable global state in trona:
 | `EXTRA_UT_SLOTS` | `[Cap; 8]` | `slot_alloc.rs` | Dynamically-granted untyped caps |
 | `EXTRA_UT_COUNT` | `usize` | `slot_alloc.rs` | Number of extra untypeds granted |
 | `PENDING_FRAME_SLOT` | `Cap` | `slot_alloc.rs` | Saved slot across async WouldBlock |
-| `DEVICE_REGIONS` | `[DeviceRegion; 4]` | `posix_mm.rs` | Device-backed mmap tracking (framebuffer, etc.) |
+| `DEVICE_REGIONS` | `[DeviceRegion; 4]` | `mm.rs` | Device-backed mmap tracking (framebuffer, etc.) |
 | `NEXT_UT_HINT` | `Cap` | `elf_loader.rs` | Hint for untyped scanning during ELF load |
 
 **Why this is safe:** SaltyOS userland processes are single-threaded.
@@ -677,9 +809,13 @@ The `libtrona.ld` script creates a shared object with:
   numbering and semantics
 - [IPC Design](ipc.md) -- Kernel-side endpoint and notification
   implementation
-- [Memory Management](memory.md) -- Kernel VSpace and frame allocator
+- [Memory Management](memory.md) -- Kernel VSpace, MemoryObject, and
+  frame allocator
+- [mmsrv Design](mmsrv.md) -- Userspace memory manager server
 - [Capability System](capability.md) -- CNode structure, CDT, rights
   model
-- [POSIX Compatibility](posix.md) -- VFS and procmgr protocol design
-- [trona API Reference](../spec/libsalty-api.md) -- Complete function
+- [POSIX Compatibility](posix.md) -- VFS and procmgr protocol design,
+  networking (netsrv/dnssrv)
+- [basaltc Design](basaltc.md) -- C standard library built on trona
+- [trona API Reference](../spec/trona-api.md) -- Complete function
   signatures and error codes

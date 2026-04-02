@@ -72,12 +72,13 @@ The startup sequence:
 | `select.rs` | Rust | select/pselect wrappers | trona posix_select |
 | `math.rs` | Rust | Math functions (fabs, sqrt, pow, sin, etc.) | Pure Rust + x87/NEON |
 | `misc.rs` | Rust | dirname, basename, utime, syslog stubs | Mixed |
-| `pthread.rs` | Rust | pthreads, mutexes, condvars, semaphores, TLS | salty::sync / salty::tls |
+| `pthread.rs` | Rust | pthreads, mutexes, condvars, semaphores, TLS | trona::sync / trona::tls |
 | `search.rs` | Rust | tsearch, tfind, tdelete, twalk | Pure Rust |
 | `dlfcn.rs` | Rust | dlopen/dlsym stubs | Returns errors |
 | `socket.rs` | Rust | Socket API (socket, bind, connect, etc.) | trona posix_socket |
 | `inet.rs` | Rust | inet_aton, htonl, getservbyname, etc. | Pure Rust |
-| `getrandom.rs` | Rust | getrandom, getentropy | salty::syscall (RDRAND) |
+| `netif.rs` | Rust | if_nametoindex, if_indextoname | Pure Rust |
+| `getrandom.rs` | Rust | getrandom, getentropy | trona::syscall (RDRAND/RNDR) |
 | `getopt.rs` | Rust | POSIX getopt + GNU getopt_long/getopt_long_only | Pure Rust |
 | `fts.rs` | Rust | BSD file tree stream (fts_open, fts_read, etc.) | opendir/stat |
 | `iconv.rs` | Rust | Character encoding conversion (8 encodings) | Pure Rust |
@@ -85,9 +86,10 @@ The startup sequence:
 | `termcap.rs` | Rust | termcap/terminfo stubs | Returns defaults |
 | `ioctl.rs` | Rust | ioctl stubs | trona posix_ioctl |
 | `jobctl.rs` | Rust | Job control stubs (setpgid, tcgetpgrp) | Hardcoded returns |
+| `stack_protector.rs` | Rust | Stack smashing detection (`__stack_chk_fail`) | Pure Rust |
 | `compat/` | Rust | FreeBSD compatibility layer | See below |
-| `crt_start.S` | ASM | `_start` entry point | Calls `__libc_start_main` |
-| `setjmp.S` | ASM | setjmp/longjmp/sigsetjmp/siglongjmp | Register save/restore |
+| `arch/x86_64/` | ASM + Rust | x86_64: crt_start.S, setjmp.S, math_x87.rs, math_sse2.rs, mem_sse2.rs, string_sse2.rs | Register save/restore, x87 FPU, SSE2 intrinsics |
+| `arch/aarch64/` | ASM + Rust | aarch64: crt_start.S, setjmp.S, mod.rs | Register save/restore, scalar FP instructions (fsqrt, frintp), no NEON optimization yet |
 
 ## Key Design Decisions
 
@@ -233,7 +235,7 @@ FreeBSD compatibility code that was previously in C has been converted to Rust:
 
 ### Headers
 
-basaltc provides 70+ headers in `lib/basaltc/include/` organized to match standard POSIX/BSD layout:
+basaltc provides 105 headers in `lib/basalt/c/include/` organized to match standard POSIX/BSD layout:
 
 - Standard C: `stdio.h`, `stdlib.h`, `string.h`, `ctype.h`, `errno.h`, `math.h`, `stdint.h`, `stddef.h`, `stdarg.h`, `stdbool.h`, `limits.h`, `assert.h`, `setjmp.h`, `inttypes.h`, `time.h`, `locale.h`, `wchar.h`, `wctype.h`, `signal.h`, `fcntl.h`
 - POSIX: `unistd.h`, `dirent.h`, `pwd.h`, `grp.h`, `poll.h`, `regex.h`, `fnmatch.h`, `glob.h`, `getopt.h`, `termios.h`, `sched.h`, `libgen.h`, `utime.h`
@@ -248,9 +250,7 @@ basaltc provides 70+ headers in `lib/basaltc/include/` organized to match standa
 
 **No dlopen.** The dynamic linker loads shared libraries at process startup only. Runtime dynamic loading (`dlopen`, `dlsym`, `dlclose`) stubs return errors.
 
-**No symlinks.** `lstat()` is identical to `stat()`. `readlink()`, `symlink()`, `readlinkat()`, `symlinkat()` return `ENOSYS`. The VFS does not implement symbolic links.
-
-**No hard links or device nodes.** `link()`, `linkat()`, `mknod()`, `mknodat()` return `ENOSYS`.
+**No device nodes.** `mknod()`, `mknodat()` return `ENOSYS`.
 
 **No file locking.** `flock()` returns `ENOSYS`. POSIX advisory locks (`fcntl F_SETLK`) are not implemented.
 
@@ -260,21 +260,21 @@ basaltc provides 70+ headers in `lib/basaltc/include/` organized to match standa
 
 ## Build Pipeline
 
-basaltc is built in three steps, then linked into a single shared object. All logic is in Rust -- only assembly stubs remain as non-Rust sources:
+basaltc is built in three steps, then linked into a single shared object. Nearly all logic is in Rust -- only assembly stubs (crt_start.S, setjmp.S) and one freestanding C file (string.c for statically-linked init) remain as non-Rust sources:
 
 ```
 Step 1: Rust sources
-  src/lib.rs ─── rustc ───> saltyc.o + saltyc.rmeta
-                 --extern salty=trona.rmeta
-                 --crate-type=lib
+  src/lib.rs ─── rustc ───> basaltc.o + basaltc.rmeta
+                 --extern trona=trona.rmeta
+                 --crate-name=basaltc
 
 Step 2: Assembly sources
   crt_start.S ── clang -c ──> crt_start.o    (NOT linked into libc.so)
   setjmp.S   ── clang -c ──> setjmp.o
 
 Step 3: Link
-  saltyc.o + setjmp.o + core.o + compiler_builtins.o
-  ───> libc.so  (-shared, -T saltyc.ld, -soname libc.so)
+  basaltc.o + setjmp.o + core.o + compiler_builtins.o
+  ───> libc.so  (-shared, -T arch/<ARCH>/basaltc.ld, -soname libc.so)
 ```
 
 `crt_start.o` is intentionally excluded from `libc.so` because it contains an unresolved reference to `main()`. Instead, it is linked directly into each C program's executable, providing the `_start` entry point.
@@ -283,6 +283,7 @@ A separate freestanding `string.c` provides basic string/memory functions for th
 
 ## Cross-References
 
-- **[ports.md](ports.md)** -- How basaltc enables cross-compilation of third-party C software
+- **[ports.md](ports.md)** -- How basaltc enables cross-compilation of third-party C software (16 ports)
 - **[posix.md](posix.md)** -- POSIX compatibility layer in trona that basaltc delegates to
+- **[trona.md](trona.md)** -- System library (5-crate architecture) that basaltc depends on
 - **[basaltc-api.md](../spec/basaltc-api.md)** -- Complete API reference with function signatures

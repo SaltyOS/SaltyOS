@@ -6,34 +6,43 @@ This document provides a technical overview of the SaltyOS system architecture.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Applications                                    │
-│                         (shell, utilities, etc.)                            │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                           System Libraries                                   │
-│              (trona, POSIX libc, protocol libs)                              │
-├─────────────┬─────────────┬─────────────┬─────────────┬─────────────────────┤
-│    init     │   procmgr   │     vfs     │  nameserv   │      drivers        │
-│             │             │   saltyfs   │             │  (pci,nvme,usb)     │
-├─────────────┴─────────────┴─────────────┴─────────────┴─────────────────────┤
-│                              Userspace                                       │
+│                              Applications                                   │
+│                  (shell, utilities, ports, hello_pe)                        │
+├──────────────────────────────┬──────────────────────────────────────────────┤
+│     POSIX Personality        │          Win32 Personality                   │
+│  (posix_ttysrv, posix_getty) │  (win32_csrss, PE loader)                    │
+├──────────────────────────────┴──────────────────────────────────────────────┤
+│                           System Libraries                                  │
+│      trona (substrate/posix/loader/uapi/win32) + basalt (libc/libc++)       │
+├──────┬────────┬──────┬────────┬────────┬────────┬────────┬──────────────────┤
+│ init │procmgr │ vfs  │namesrv │ mmsrv  │netsrv  │ dnssrv │    drivers       │
+│      │        │      │        │        │        │        │(pcidrv, blkdrv,  │
+│      │        │      │        │        │        │        │netdrv, dispdrv,  │
+│      │        │      │        │        │        │        │saltyfs)          │
+├──────┴────────┴──────┴────────┴────────┴────────┴────────┴──────────────────┤
+│                              Userspace                                      │
 ╠═════════════════════════════════════════════════════════════════════════════╣
-│                          System Call Interface                               │
+│                          System Call Interface                              │
+│                  28 syscalls (IPC, memory, scheduling)                      │
 ╠═════════════════════════════════════════════════════════════════════════════╣
-│                                                                              │
-│                          SaltyOS Microkernel                                 │
-│                                                                              │
-│  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐             │
-│  │ Capability │  │    IPC     │  │ Scheduler  │  │   Memory   │             │
-│  │   System   │  │  Subsystem │  │   (EDF)    │  │ Management │             │
-│  └────────────┘  └────────────┘  └────────────┘  └────────────┘             │
-│                                                                              │
-│  ┌────────────────────────────────────────────────────────────┐             │
-│  │                  Architecture Layer (x86_64)               │             │
-│  │     GDT │ IDT │ Paging │ Interrupts │ Context Switch       │             │
-│  └────────────────────────────────────────────────────────────┘             │
-│                                                                              │
+│                                                                             │
+│                          SaltyOS Microkernel                                │
+│                                                                             │
+│  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────────────┐     │
+│  │ Capability │  │    IPC     │  │ Scheduler  │  │      Memory        │     │
+│  │   System   │  │  Subsystem │  │   (EDF)    │  │    Management      │     │
+│  │            │  │            │  │            │  │ (PMM, Untyped, MO, │     │
+│  │            │  │            │  │            │  │  VSpace+MapleTree) │     │
+│  └────────────┘  └────────────┘  └────────────┘  └────────────────────┘     │
+│                                                                             │
+│  ┌────────────────────────────────────────────────────────────────────┐     │
+│  │              Architecture Layer (x86_64 / aarch64)                 │     │
+│  │  x86_64: GDT │ IDT │ APIC │ Paging │ ACPI │ PIT │ SMAP/SMEP        │     │
+│  │  aarch64: GICv3 │ PSCI │ PL011 │ Paging │ Generic Timer            │     │
+│  └────────────────────────────────────────────────────────────────────┘     │
+│                                                                             │
 ╠═════════════════════════════════════════════════════════════════════════════╣
-│                             Hardware                                         │
+│                             Hardware                                        │
 │              CPU │ Memory │ Devices │ Timers │ IOMMU                        │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -61,8 +70,9 @@ graph TB
     end
 
     subgraph "Memory Management"
-        VSPACE[VSpace]
-        FRAME[Frame Allocator]
+        VSPACE[VSpace + MapleTree]
+        FRAME[PMM Frame Allocator]
+        MO[MemoryObject + RadixTree]
     end
 
     subgraph "Capability System"
@@ -77,13 +87,14 @@ graph TB
     SYSCALL --> IPC
     SYSCALL --> SCHED
     SYSCALL --> MM
-    
+
     CAP --> KOBJ
     IPC --> EP
     IPC --> NOTIF
     MM --> VSPACE
     MM --> FRAME
-    
+    MM --> MO
+
     ARCH --> SCHED
     ARCH --> MM
 ```
@@ -96,12 +107,13 @@ graph TB
 | `Notification` | Async signaling primitive | signal, wait |
 | `TCB` | Thread control block | configure, suspend, resume |
 | `CNode` | Capability storage | insert, delete, copy |
-| `VSpace` | Virtual address space | map, unmap |
+| `VSpace` | Virtual address space | map, unmap, map_mo |
 | `Frame` | Physical memory page | retype, map |
 | `Untyped` | Raw physical memory | retype |
 | `IRQHandler` | Interrupt handler | ack, set_notification |
 | `IoPort` | I/O port range access | in, out |
-| `SchedContext` | Scheduling context | bind, set_params |
+| `SchedContext` | Scheduling context | bind, set_params, yield_to |
+| `MemoryObject` | User page container | commit, decommit, clone, resize |
 
 ### Address Space Layout (x86_64)
 
@@ -145,21 +157,28 @@ graph TB
 
 ```mermaid
 sequenceDiagram
-    participant BIOS/UEFI
-    participant Stage1
-    participant Stage2
-    participant Stage3
-    participant Kernel
+    participant FW as BIOS/UEFI
+    participant S1 as Stage 1
+    participant S2 as Stage 2
+    participant S3 as Stage 3
+    participant K as Kernel
 
-    BIOS/UEFI->>Stage1: Load MBR/EFI app
-    Stage1->>Stage2: Load from fixed LBA
-    Stage2->>Stage2: A20, Protected Mode, Long Mode
-    Stage2->>Stage3: Load from partition
-    Stage3->>Stage3: Mount SaltyFS (read-only)
-    Stage3->>Stage3: Parse /boot/saltyos.cfg
-    Stage3->>Kernel: Load kernel.elf + initrd
-    Stage3->>Kernel: Jump with BootInfo
+    FW->>S1: Load MBR (x86_64 BIOS) or EFI app (UEFI)
+    S1->>S2: Load from fixed LBA (BIOS) or EFI partition (UEFI)
+    S2->>S2: x86_64: A20, Protected Mode, Long Mode
+    Note over S2: aarch64: EL2→EL1 drop, identity map
+    S2->>S3: Load from partition
+    S3->>S3: Mount SaltyFS (read-only)
+    S3->>S3: Parse /boot/saltyos.cfg
+    S3->>K: Load kernel.elf + initrd.cpio
+    S3->>K: Jump with BootInfo in RDI (x86_64) / x0 (aarch64)
 ```
+
+**Architecture-specific boot paths:**
+
+- **x86_64 BIOS**: MBR → real mode → protected mode → long mode → SaltyFS → kernel
+- **x86_64 UEFI**: UEFI PE/COFF entry → long mode → SaltyFS/FAT32 → kernel
+- **aarch64 UEFI** (UEFI-only, no BIOS): UEFI PE/COFF → EL2→EL1 drop → PSCI for SMP → kernel
 
 ### Disk Layout
 
@@ -277,7 +296,7 @@ graph LR
         T2[Thread 2<br/>deadline: 15ms<br/>budget: 3ms]
         T3[Thread 3<br/>deadline: 20ms<br/>budget: 5ms]
     end
-    
+
     T1 --> T2 --> T3
 ```
 
@@ -301,30 +320,54 @@ graph LR
 
 ## Memory Architecture
 
-### Physical Memory Management
+### Four-Tier Memory Management
+
+SaltyOS uses a four-tier memory management architecture where each tier has a distinct role:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Physical Memory                           │
-├───────────────────────────────────────────────┬─────────────┤
-│              Usable Memory                    │  Reserved   │
-│        (tracked by frame allocator)           │  (MMIO)     │
-└───────────────────────────────────────────────┴─────────────┘
-                        │
-                        ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   Frame Allocator                            │
-│                    (Bitmap based)                             │
-├─────────────────────────────────────────────────────────────┤
-│  Bitmap: [1][1][0][0][1][0][0][0][0][1] ...  (1=used)       │
-└─────────────────────────────────────────────────────────────┘
-                        │
-                        ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  Untyped Capabilities                        │
-│          (handed to root task at boot)                       │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│  mmsrv (userspace pager)                                                │
+│   - Orchestrates MO lifecycle (create, commit, map)                     │
+│   - Per-client region tracking, demand paging coordination              │
+│   - Delegates to kernel via capability invocations                      │
+└────────────────────────────┬────────────────────────────────────────────┘
+                             │ invoke syscall
+┌────────────────────────────▼────────────────────────────────────────────┐
+│  Kernel                                                                  │
+│                                                                          │
+│  MemoryObject (cap/memory_object.rs)                                    │
+│  ├── 4-level RadixTree — per-page PhysAddr storage                      │
+│  ├── ReverseMaps — region rmap (inline 8 + overflow)                    │
+│  ├── COW parent chain (cap-refcounted)                                  │
+│  └── Dual-source commit:                                                │
+│       ├── ut_cap != 0 → Untyped watermark/freelist (primary)            │
+│       └── ut_cap == 0 → PMM fallback                                    │
+│                                                                          │
+│  VSpace (mm/vspace.rs)                                                  │
+│  ├── MapleTree<VmArea> — VA range tracking                              │
+│  ├── VSPACE_MAP_MO → resolve MO pages → install PTEs                   │
+│  └── COW fast-path (kernel-internal, no IPC to mmsrv)                   │
+│                                                                          │
+│  Untyped (cap/untyped.rs)                                               │
+│  ├── Kernel object retype (TCB, CNode, EP, MO, etc.)                   │
+│  └── MO data page source (primary path for MO_COMMIT)                  │
+│                                                                          │
+│  PMM (mm/frame.rs)                                                      │
+│  ├── Bitmap allocator, 16-byte FrameMeta per frame                      │
+│  ├── FrameOwner: Free|MoData|MoMeta|KernelPrivate|...                  │
+│  ├── Emergency reserve pool (32 pages)                                  │
+│  └── Role: kernel metadata only (page tables, stacks, radix/maple)     │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
+
+**Tier roles:**
+
+| Tier | Location | Role |
+|------|----------|------|
+| PMM | Kernel (`mm/frame.rs`) | Bitmap frame allocator for kernel metadata (page tables, stacks, tree nodes) |
+| Untyped | Kernel (`cap/untyped.rs`) | Kernel object retype + primary data page source for MO_COMMIT |
+| MemoryObject | Kernel (`cap/memory_object.rs`) | User page lifecycle: RadixTree storage, COW clone, reverse maps |
+| mmsrv | Userspace (`core/mmsrv/`) | Pager: region tracking, demand paging coordination, MO orchestration |
 
 ### Page Table Hierarchy (x86_64)
 
@@ -341,39 +384,119 @@ Virtual Address (48-bit):
 └────────┴────────┴────────┴────────┴────────────┘
 ```
 
+### Page Table Hierarchy (aarch64)
+
+```
+┌─────────┐     ┌─────────┐     ┌─────────┐     ┌─────────┐
+│  L0     │────►│  L1     │────►│  L2     │────►│  L3     │────► Page
+│  (512)  │     │  (512)  │     │  (512)  │     │  (512)  │     Frame
+└─────────┘     └─────────┘     └─────────┘     └─────────┘
+
+Virtual Address (48-bit, 4KB granule):
+┌────────┬────────┬────────┬────────┬────────────┐
+│  L0    │  L1    │  L2    │  L3    │   Offset   │
+│ (9bit) │ (9bit) │ (9bit) │ (9bit) │  (12bit)   │
+└────────┴────────┴────────┴────────┴────────────┘
+
+TTBR0_EL1 → User space (lower VA range)
+TTBR1_EL1 → Kernel space (upper VA range)
+```
+
+## Subsystem Architecture
+
+SaltyOS implements a multi-personality subsystem model. Each process has a personality (POSIX, Win32, or None) tracked by procmgr via `PersonalityState`.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Applications                              │
+├───────────────────────────────┬──────────────────────────────────┤
+│       POSIX Personality       │       Win32 Personality          │
+│                               │                                  │
+│  posix_ttysrv  posix_getty    │  win32_csrss                     │
+│  trona_posix   basaltc        │  trona_win32   kernel32.dll      │
+│  ld-trona.so (ELF)            │  ld-trona-pe.so (PE)             │
+├───────────────────────────────┴──────────────────────────────────┤
+│              Core Services (personality-neutral)                  │
+│    init │ procmgr │ vfs │ namesrv │ mmsrv │ console              │
+├──────────────────────────────────────────────────────────────────┤
+│              Network Stack                                        │
+│    netsrv (TCP/UDP/ARP/ICMP/DHCP) │ dnssrv │ netdrv (virtio)    │
+├──────────────────────────────────────────────────────────────────┤
+│              Storage & Filesystem                                 │
+│    blkdrv (virtio) │ saltyfs │ pcidrv │ dispdrv                  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**VFS** dispatches to personality-specific handlers based on the calling process's personality. POSIX processes use POSIX file descriptors and Unix semantics; Win32 processes use NT-style handles.
+
 ## Userspace Architecture
 
 ### Server Communication
 
 ```mermaid
 graph TB
-    subgraph Userspace
-        APP[Application]
-        LIBSALTY[trona]
+    subgraph "Subsystem Layer"
+        POSIX[POSIX personality]
+        WIN32[Win32 personality]
+    end
+
+    subgraph "Libraries"
+        TRONA[trona substrate + posix/win32]
+        BASALT[basalt libc/libc++]
+    end
+
+    subgraph "Core Servers"
         VFS[VFS Server]
         PROCMGR[Process Manager]
-        DRIVER[Device Driver]
+        MMSRV[Memory Manager]
+        NAMESRV[Name Service]
     end
-    
-    APP --> LIBSALTY
-    LIBSALTY -->|IPC| VFS
-    LIBSALTY -->|IPC| PROCMGR
-    VFS -->|IPC| DRIVER
-    
+
+    subgraph "Network"
+        NETSRV[netsrv]
+        DNSSRV[dnssrv]
+        NETDRV[netdrv]
+    end
+
+    subgraph "Drivers"
+        PCIDRV[pcidrv]
+        BLKDRV[blkdrv]
+        SALTYFS[saltyfs]
+    end
+
     subgraph Kernel
         SYSCALL[Syscall Handler]
     end
-    
-    LIBSALTY -->|syscall| SYSCALL
+
+    POSIX --> TRONA
+    WIN32 --> TRONA
+    TRONA --> BASALT
+    TRONA -->|IPC| VFS
+    TRONA -->|IPC| PROCMGR
+    TRONA -->|IPC| MMSRV
+    TRONA -->|IPC| NETSRV
+    VFS -->|IPC| BLKDRV
+    VFS -->|IPC| SALTYFS
+    NETSRV -->|IPC| NETDRV
+    TRONA -->|syscall| SYSCALL
 ```
 
 ### Init Process Responsibilities
 
 1. Receive all initial capabilities from kernel
-2. Create and configure system servers
-3. Distribute capabilities to servers
-4. Start the process manager
-5. Optionally start a shell
+2. Parse `.service` files from initrd for boot ordering and dependencies
+3. Create and configure system servers (mmsrv, procmgr, vfs, namesrv, ...)
+4. Distribute capabilities to servers
+5. Start the process manager and remaining services
+6. Optionally start a shell via posix_getty
+
+### Service-Based Bootstrap
+
+Init reads `.service` files from `userland/services/` packed into the initrd. Each service file declares:
+- `[Service]` — name, binary path, type, restart policy
+- `[Dependencies]` — After/Before ordering for boot sequencing
+
+Services are started in dependency order across multiple boot phases.
 
 ## File Tree
 
@@ -391,53 +514,65 @@ SaltyOS/
 │   │       ├── efi_types.h, efi_protocol.h, print.c/h
 │   ├── stage1/arch/x86/
 │   │   ├── bios/
-│   │   │   ├── mbr.asm, mbr         # BIOS MBR entry
+│   │   │   ├── mbr.asm, mbr             # BIOS MBR entry
 │   │   └── uefi/
-│   │       └── entry.c, efi.ld      # UEFI PE/COFF entry
-│   ├── stage2/arch/x86/
-│   │   ├── bios/
-│   │   │   ├── entry.asm, a20.c/h, gdt.c/h, memory.c/h, stage2.ld
-│   │   └── uefi/
-│   │       ├── main.c, stage2.ld
+│   │       └── entry.c, efi.ld          # UEFI PE/COFF entry
+│   ├── stage2/arch/
+│   │   ├── x86/
+│   │   │   ├── bios/                    # A20, GDT, memory, entry.asm
+│   │   │   └── uefi/                    # UEFI stage2 main
+│   │   ├── cpu.h, paging.c, paging_impl.h  # Shared paging setup
+│   │   └── uefi/                        # Shared UEFI code
 │   └── stage3/
 │       ├── bios_main.c, boot_alloc.c/h, config.h, elf.c/h, handoff.c/h
-│       ├── arch/x86/
-│       │   ├── cpu.h, paging.c, paging_impl.h
-│       │   ├── bios/
-│       │   │   ├── entry.asm, mode_switch.asm/h, stage3.ld
-│       │   └── uefi/
-│       │       ├── entry_uefi.asm, stage3.ld
+│       ├── arch/
+│       │   ├── x86/
+│       │   │   ├── cpu.h, paging.c, paging_impl.h
+│       │   │   ├── bios/               # BIOS stage3 entry + linker script
+│       │   │   └── uefi/               # UEFI stage3 entry + linker script
+│       │   └── aarch64/
+│       │       └── uefi/               # aarch64 UEFI entry + linker script
 │       ├── disk/
 │       │   ├── disk.h, bios_disk.c, memory_disk.c
 │       └── fs/
 │           ├── fs.h, fat32.c, raw.c, saltyfs.c
 │
-├── kernite/
+├── kernite/                             # Microkernel (Rust)
+│   ├── x86_64-kernite.json             # Kernel target spec (x86_64)
+│   ├── aarch64-kernite.json            # Kernel target spec (aarch64)
+│   ├── arch/
+│   │   ├── x86_64.ld                   # Kernel linker script (x86_64)
+│   │   └── aarch64.ld                  # Kernel linker script (aarch64)
 │   └── src/
-│       ├── lib.rs                # Kernel entry (kmain), serial I/O, panic handler
-│       ├── bootinfo.rs           # Boot info TLV parsing
-│       ├── builtins.rs           # Compiler built-in stubs (memcpy, memset)
-│       ├── cpio.rs               # CPIO archive parser for initrd
-│       ├── elf.rs                # ELF binary loader
-│       ├── init.rs               # Init task bootstrap, CSpace setup
-│       ├── rng.rs                # RDRAND-based random number generator
+│       ├── lib.rs                       # Kernel entry (kmain), serial I/O, panic handler
+│       ├── bootinfo.rs                  # Boot info TLV parsing
+│       ├── builtins.rs                  # Compiler built-in stubs (memcpy, memset)
+│       ├── cpio.rs                      # CPIO archive parser for initrd
+│       ├── elf.rs                       # ELF binary loader
+│       ├── init.rs                      # Init task bootstrap, CSpace setup
+│       ├── rng.rs                       # RDRAND-based random number generator
 │       ├── arch/
 │       │   ├── mod.rs
-│       │   └── x86_64/
-│       │       ├── mod.rs, acpi.rs, ap_boot.rs, ap_tramp.S, apic.rs
-│       │       ├── boot.rs, context.rs, cpu.rs, cpuid.rs
-│       │       ├── exceptions.S, fpu.rs, gdt.rs, idt.rs
-│       │       ├── paging.rs, pit.rs, smap.rs, syscall.S
+│       │   ├── x86_64/
+│       │   │   ├── mod.rs, acpi.rs, ap_boot.rs, ap_tramp.S, apic.rs
+│       │   │   ├── boot.rs, context.rs, cpu.rs, cpuid.rs
+│       │   │   ├── exceptions.S, fpu.rs, gdt.rs, idt.rs
+│       │   │   ├── paging.rs, pit.rs, syscall.S, uaccess.rs
+│       │   └── aarch64/
+│       │       ├── mod.rs, ap_boot.rs, boot.rs, context.rs, cpu.rs
+│       │       ├── exceptions.rs, fpu.rs, fpsimd.S
+│       │       ├── gic.rs, paging.rs, pl011.rs, psci.rs, timer.rs
 │       ├── cap/
 │       │   ├── mod.rs, cdt.rs, cnode.rs, ioport.rs
-│       │   ├── object.rs, refcount.rs, slot.rs, untyped.rs
+│       │   ├── memory_object.rs, object.rs, refcount.rs, slot.rs, untyped.rs
 │       ├── console/
 │       │   ├── mod.rs, fb.rs, font.rs
 │       ├── ipc/
 │       │   ├── mod.rs, endpoint.rs, futex.rs
 │       │   ├── irq.rs, notification.rs, queue.rs
 │       ├── mm/
-│       │   ├── mod.rs, frame.rs, vspace.rs
+│       │   ├── mod.rs, frame.rs, maple_tree.rs
+│       │   ├── node_alloc.rs, radix_tree.rs, vspace.rs
 │       ├── sched/
 │       │   ├── mod.rs, pip.rs, scheduler.rs
 │       │   ├── sleep_queue.rs, thread.rs
@@ -446,64 +581,73 @@ SaltyOS/
 │
 ├── userland/
 │   ├── core/
-│   │   ├── init/                 # First process (service-based bootstrap)
+│   │   ├── init/                        # First process (service-based bootstrap)
 │   │   │   └── src/ (main.rs, ini.rs, selftest.rs, spawn.rs, svc_mgr.rs)
-│   │   ├── rtld/                 # Runtime dynamic linker
-│   │   ├── mmsrv/               # Memory manager server
-│   │   │   └── src/ (main.rs)
-│   │   ├── procmgr/             # Process manager (spawn/exit/waitpid)
-│   │   │   └── src/ (main.rs, alloc.rs, proc_table.rs, spawn_tx.rs)
-│   │   └── nameserv/            # Name service (endpoint lookup)
-│   │       └── src/ (main.rs)
+│   │   ├── mmsrv/                       # Memory manager server
+│   │   ├── procmgr/                     # Process manager (spawn/exit/waitpid)
+│   │   ├── namesrv/                     # Name service (endpoint lookup)
+│   │   └── vfs/                         # Virtual filesystem (ramfs + devfs + sockets + shm + poll)
 │   ├── servers/
-│   │   ├── vfs/                  # VFS server (ramfs + devfs + sockets + shm + poll)
-│   │   │   └── src/ (main.rs, at_ops.rs, client.rs, consts.rs, fileops.rs,
-│   │   │            misc.rs, mount.rs, path.rs, pipe.rs, poll.rs,
-│   │   │            procfs.rs, ramfs.rs, socket.rs, types.rs)
-│   │   ├── console/              # Serial console server
-│   │   │   └── src/ (main.rs, kbd.rs)
-│   │   ├── ttyd/                 # TTY daemon
-│   │   │   └── src/ (main.rs, handlers.rs, input.rs, types.rs)
-│   │   └── getty/                # Getty (login prompt)
-│   │       └── src/ (main.rs)
+│   │   ├── console/                     # Serial console server
+│   │   ├── netsrv/                      # TCP/IP network stack (TCP/UDP/ARP/ICMP/DNS/DHCP)
+│   │   ├── dnssrv/                      # Caching DNS resolver
+│   │   ├── posix/
+│   │   │   ├── posix_ttysrv/            # POSIX TTY daemon
+│   │   │   └── posix_getty/             # POSIX getty (login prompt)
+│   │   └── win32/
+│   │       └── win32_csrss/             # Win32 client/server runtime
 │   ├── drivers/
-│   │   ├── blkdrv/               # Block device driver (virtio)
-│   │   │   └── src/ (main.rs, handlers.rs, virtio.rs)
-│   │   ├── pcisrv/               # PCI server
-│   │   │   └── src/ (main.rs)
-│   │   └── display/              # Display driver
-│   │       └── src/ (main.rs, font.rs)
-│   ├── fs/
-│   │   └── saltyfs/              # SaltyFS filesystem server
-│   │       └── src/ (main.rs, alloc.rs, block.rs, btree.rs, consts.rs,
-│   │                crc.rs, handlers.rs, types.rs)
+│   │   ├── blkdrv/                      # Block device driver (virtio-blk)
+│   │   ├── netdrv/                      # Network device driver (virtio-net)
+│   │   ├── pcidrv/                      # PCI enumeration server
+│   │   ├── dispdrv/                     # Display driver
+│   │   └── filesystems/
+│   │       └── saltyfs/                 # SaltyFS filesystem server
 │   ├── tests/
-│   │   ├── test_runner/          # Automated test suite
-│   │   │   └── src/ (main.rs + test_*.rs modules)
-│   │   └── hello/                # Hello world test
-│   └── services/                 # .service files for boot ordering
+│   │   ├── test_runner/                 # Automated test suite (14 modules)
+│   │   └── hello_pe/                    # Win32 PE hello world test
+│   └── services/                        # .service files for boot ordering
 │
 ├── lib/
-│   └── trona/                     # Userspace system library
-│       └── src/ (consts.rs, cpio.rs, elf_dynamic.rs, elf_loader.rs,
-│                framebuffer.rs, invoke.rs, ipc.rs, layout.rs, lib.rs,
-│                posix/ (mod.rs, at.rs, file.rs, misc.rs, pipe.rs,
-│                        poll.rs, proc.rs, socket.rs),
-│                posix_mm.rs, serial.rs, signals.rs, slot_alloc.rs,
-│                pthread.rs, sync.rs, syscall.rs, tls.rs, types.rs,
-│                fork.S)
+│   ├── trona/                           # Userspace system library (5 crates + rtld)
+│   │   ├── substrate/                   # Core: syscall wrappers, IPC, capability invocations
+│   │   ├── posix/                       # POSIX compatibility (file, socket, poll, mmap, signals, pthread)
+│   │   ├── loader/                      # ELF + PE loader (cpio, elf_loader, pe_loader)
+│   │   ├── uapi/                        # Userspace API definitions (consts, protocol, types)
+│   │   ├── win32/                       # Win32 API layer (console, process, handle, kernel32)
+│   │   ├── rtld/
+│   │   │   ├── elf/                     # ld-trona.so (ELF dynamic linker)
+│   │   │   └── pe/                      # ld-trona-pe.so (PE dynamic linker)
+│   │   └── arch/
+│   │       ├── x86_64/                  # x86_64 fork.S, syscall asm
+│   │       └── aarch64/                 # aarch64 fork.S, syscall asm
+│   ├── basalt/                          # C/C++ standard library
+│   │   ├── c/                           # libc.so (basaltc — POSIX libc)
+│   │   └── cpp/                         # libc++.so (from toolchain/llvm-project)
+│   └── rust-lang/                       # Patched Rust standard library sources
 │
 ├── tools/
-│   ├── cross/x86_64.txt          # Meson cross file
-│   ├── mkcpio.py                 # CPIO initrd packer
-│   ├── mkimage.py                # Disk image creator
-│   ├── mksaltyfs.py              # SaltyFS image builder
-│   └── portbuild/                # Port build system
-│       ├── main.rs, build.rs, config.rs, deps.rs, extract.rs
-│       ├── fetch.rs, meson.build, parser.rs, stamps.rs, vars.rs
+│   ├── cross/                           # Meson cross files
+│   ├── mkcpio.py                        # CPIO initrd packer
+│   ├── mkimage.py                       # Disk image creator
+│   ├── mksaltyfs.py                     # SaltyFS image builder
+│   ├── mkrootfs/                        # Rootfs image builder
+│   ├── mksysroot/                       # Cross-compilation sysroot generator
+│   ├── port/                            # Port build tool (Rust)
+│   │   ├── main.rs, build.rs, config.rs, deps.rs, extract.rs
+│   │   ├── fetch.rs, meson.build, parser.rs, stamps.rs, vars.rs
+│   ├── run-qemu.sh                      # QEMU launcher (all flags, both architectures)
+│   ├── run-utm.sh                       # UTM launcher (macOS)
+│   └── toolchain/                       # Toolchain build scripts and env setup
+│
+├── ports/                               # Third-party port definitions (.port files)
+│   ├── bash, bzip2, curl, freebsd-utils, make, nano, nasm
+│   ├── ncurses, ninja, openssl, perl, python, wget, xz, zlib, zstd
 │
 └── docs/
-    ├── ARCHITECTURE.md           # This file
-    ├── design/                   # Design documents
-    └── spec/                     # Specifications
+    ├── ARCHITECTURE.md                  # This file
+    ├── BUILDING.md                      # Build instructions
+    ├── TOOLCHAIN.md                     # Custom toolchain build guide
+    ├── design/                          # Design documents
+    └── spec/                            # Specifications
 ```

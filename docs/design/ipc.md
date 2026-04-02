@@ -25,6 +25,9 @@ This dual-primitive design follows the L4/seL4 tradition, providing both reliabl
 | Fault delivery via endpoint | Implemented |
 | IPC assembly fastpath | Implemented |
 | Timed IPC (SendTimed/RecvTimed) | Implemented |
+| Multi-endpoint receive (RecvAny/ReplyRecvAny) | Implemented |
+| Timed multi-endpoint receive (RecvAnyTimed/ReplyRecvAnyTimed) | Implemented |
+| Notification return (NotifReturn) | Implemented |
 | Futex (userspace mutex primitive) | Implemented |
 | IPC wait queue management | Implemented |
 
@@ -279,12 +282,44 @@ Two additional syscalls extend the basic Send/Recv with timeout support:
 
 When the timeout expires before a partner arrives, the blocked thread is removed
 from the endpoint's wait queue by the sleep queue timer and the syscall returns
-`BESALT_CANCELLED`. This uses the same sleep queue infrastructure as `NanoSleep`
+`TRONA_CANCELLED`. This uses the same sleep queue infrastructure as `NanoSleep`
 (syscall 13), implemented in `sched/sleep_queue.rs`.
 
 Timed IPC prevents indefinite blocking in client-server interactions. A server
 can use `RecvTimed` to periodically perform housekeeping even when no client
 requests arrive, and a client can use `SendTimed` to detect unresponsive servers.
+
+## Multi-Endpoint Receive (RecvAny / ReplyRecvAny)
+
+For servers that handle requests from multiple endpoints, the kernel provides
+multi-endpoint receive syscalls:
+
+| Syscall # | Name | Description |
+|-----------|------|-------------|
+| 23 | RecvAny | Block until a message arrives on any of N registered endpoints |
+| 24 | ReplyRecvAny | Reply to previous caller, then RecvAny |
+| 25 | RecvAnyTimed | RecvAny with timeout (microseconds) |
+| 26 | ReplyRecvAnyTimed | ReplyRecvAny with timeout |
+
+Each thread can register up to 32 endpoints in its `RecvWaitLink` array
+(defined in `sched/thread.rs`, `MAX_RECV_WAIT_ENDPOINTS = 32`). When a RecvAny
+syscall is issued, the thread is simultaneously enqueued on all registered
+endpoint recv queues. Whichever endpoint receives a sender first wakes the
+thread and removes it from all other queues.
+
+The return value indicates which endpoint was selected (`wait_index`), allowing
+the server to dispatch to the correct handler.
+
+## Notification Return (NotifReturn)
+
+| Syscall # | Name | Description |
+|-----------|------|-------------|
+| 27 | NotifReturn | Return from notification dispatch handler |
+
+When a thread has a notification dispatcher set (via `TCB_SET_NOTIFICATION_DISPATCHER`,
+label `0x4E`), incoming signals on the bound notification invoke the dispatcher
+function. `NotifReturn` (syscall 27) is used by the dispatcher to return to the
+interrupted context after handling the notification.
 
 ## Futex
 
@@ -299,8 +334,8 @@ The kernel provides a userspace futex primitive (syscall 18, implemented in
 
 The futex syscall takes a userspace virtual address as the wait key. The kernel
 hashes the (VSpace, vaddr) pair to locate the wait queue. Threads blocked on a
-futex are in `ThreadState::BlockedOnFutex` and can be woken by any thread that
-calls FUTEX_WAKE on the same address.
+futex have `BlockedReason::FutexBlocked` (or `FutexTimedBlocked` for timed waits)
+and can be woken by any thread that calls FUTEX_WAKE on the same address.
 
 Futexes are the building block for userspace mutexes, condition variables,
 semaphores, and rwlocks in trona (see `lib/trona/substrate/src/sync/`).

@@ -137,7 +137,7 @@ struct BootManifestEntry {
 
 ### 4.1 Stage 1 → Stage 2
 
-#### BIOS
+#### BIOS (x86_64 only)
 
 * CPU in Real Mode
 * `DL` contains boot drive
@@ -152,12 +152,13 @@ Stage 1 responsibilities:
 
 Stage 1 MUST NOT parse filesystems or ELF.
 
-#### UEFI
+#### UEFI (x86_64 and aarch64)
 
-* Stage 1 is an EFI application
+* Stage 1 is an EFI application (PE/COFF)
 * Stage 2 is loaded as a payload
 * Boot Services remain available
 * Stage 1 MUST NOT exit Boot Services
+* On aarch64: CPU may be at EL2; Stage 2 or kernel _start handles the EL2 → EL1 drop
 
 ---
 
@@ -263,12 +264,25 @@ delta = load_base - min(p_vaddr)
 
 ### Entry State (x86_64)
 
-* Long Mode
+* Long Mode (64-bit)
 * Interrupts disabled
 * `RDI` = physical pointer to BootInfo
 * `RSP` = initial kernel stack
+* Identity-mapped pages only; the kernel must rebuild its own address space
 
-Paging guarantees are minimal; the kernel must rebuild its own address space.
+### Entry State (aarch64)
+
+* EL1h (if firmware enters at EL2, the bootloader or kernel _start drops to EL1
+  via `eret` after configuring HCR_EL2.RW=1)
+* All exceptions masked (DAIFSet #0xF)
+* `x0` = physical pointer to BootInfo (preserved from bootloader handoff)
+* `SP_EL1` = initial kernel stack
+* MMU enabled with identity mapping by UEFI Stage 3
+* GICv3 and generic timer not yet initialized (kernel does this in `kmain`)
+* PSCI available via HVC for AP bringup
+
+aarch64 is UEFI-only (no BIOS bootloader). The bootloader uses the UEFI memory
+map and services; Stage 3 builds BootInfo with the same TLV format as x86_64.
 
 ---
 

@@ -1,6 +1,6 @@
 # Building the SaltyOS Toolchain
 
-SaltyOS uses a custom `x86_64-unknown-saltyos` target registered in patched forks of LLVM/Clang and Rust. This document describes the recommended local layout and build flow for that toolchain.
+SaltyOS uses custom `x86_64-unknown-saltyos` and `aarch64-unknown-saltyos` targets registered in patched forks of LLVM/Clang and Rust. This document describes the recommended local layout and build flow for that toolchain.
 
 ## Layout Model (Source vs Build vs Prefix)
 
@@ -12,8 +12,6 @@ Use three separate locations:
 | Toolchain build outputs | `build-toolchain/` | CMake/x.py build directories |
 | Toolchain prefix | `build-toolchain/prefix/` | Active `clang`/`lld`/`llvm-config`/`rustc` on `PATH` |
 
-This avoids the current ambiguity where Rust often appears to "live inside the subtree" (`toolchain/rust/build/...`) while Clang is often installed somewhere else (for example `~/.local/...`).
-
 Recommended defaults in this repo:
 
 ```text
@@ -24,12 +22,33 @@ build-toolchain/rust            # Rust x.py build dir
 build-toolchain/prefix          # installed/active host toolchain prefix
 ```
 
+## Quick Start (just recipes)
+
+The fastest way to build the entire toolchain:
+
+```bash
+just tc setup                    # Create directories
+just tc build host llvm          # Build host Clang/LLD (~30 min)
+just tc build host rust          # Build host rustc (~20 min)
+just tc doctor                   # Validate toolchain
+
+# Or all at once:
+just tc all                      # setup → host llvm → host rust → doctor
+```
+
+For aarch64 (the `arch=` prefix applies to all `tc` commands):
+
+```bash
+just arch=aarch64 tc all
+```
+
 ## Toolchain Helper Scripts
 
-SaltyOS now includes helper scripts for this layout:
+SaltyOS includes helper scripts for this layout:
 
 - `tools/toolchain/env.sh` — exports the recommended local paths and prepends the prefix `bin/` to `PATH`
-- `tools/toolchain/doctor.sh` — validates that `clang`, `llvm-config`, and `rustc` recognize the SaltyOS target
+- `tools/toolchain/doctor.sh` — validates that `clang`, `llvm-config`, and `rustc` recognize the SaltyOS targets
+- `tools/toolchain/build.sh` — unified build script invoked by `just tc`
 
 Usage:
 
@@ -38,22 +57,17 @@ Usage:
 source tools/toolchain/env.sh
 
 # Or print exports for eval (same effect)
-eval "$(tools/toolchain/env.sh --print)"
+eval "$(just toolchain-env)"
 
 # Quick validation
-tools/toolchain/doctor.sh
-
-# just wrappers
-eval "$(just toolchain-env)"
-just toolchain-doctor
-just toolchain-setup
+just tc doctor
 ```
 
-`tools/toolchain/env.sh` now auto-detects and exports `SALTYOS_HOST_TRIPLE` from the active host (`uname -s` + `uname -m`). Typical values are `x86_64-unknown-linux-gnu`, `x86_64-apple-darwin`, and `aarch64-apple-darwin`. When writing manual `x.py` configs below, use `${SALTYOS_HOST_TRIPLE}` instead of hardcoding a Linux host triple.
+`tools/toolchain/env.sh` auto-detects and exports `SALTYOS_HOST_TRIPLE` from the active host (`uname -s` + `uname -m`). Typical values are `x86_64-unknown-linux-gnu`, `x86_64-apple-darwin`, and `aarch64-apple-darwin`. When writing manual `x.py` configs below, use `${SALTYOS_HOST_TRIPLE}` instead of hardcoding a Linux host triple.
 
 ## Overview
 
-The `x86_64-unknown-saltyos` target encodes OS-specific defaults so that every compilation does not need many repeated flags. The target provides:
+The SaltyOS targets encode OS-specific defaults so that every compilation does not need many repeated flags:
 
 | Default | Value |
 |---------|-------|
@@ -66,7 +80,7 @@ The `x86_64-unknown-saltyos` target encodes OS-specific defaults so that every c
 | Hash style | GNU |
 | Preprocessor | `__saltyos__`, `__SaltyOS__`, `__ELF__` |
 
-The patched sources live as git submodules under `toolchain/`:
+Both `x86_64-unknown-saltyos` and `aarch64-unknown-saltyos` share these defaults. The patched sources live as git submodules under `toolchain/`:
 
 ```text
 toolchain/
@@ -80,8 +94,8 @@ Building the toolchain requires significant disk space and time:
 
 | Component | Disk | Time (8-core) |
 |-----------|------|---------------|
-| LLVM/Clang/LLD | ~30 GB | 30–90 min |
-| Rust (stage 1) | ~20 GB | 30–60 min |
+| LLVM/Clang/LLD | ~30 GB | 30-90 min |
+| Rust (stage 1) | ~20 GB | 30-60 min |
 
 Required host tools:
 
@@ -117,7 +131,7 @@ mkdir -p "$SALTYOS_LLVM_BUILD_DIR" "$SALTYOS_RUST_BUILD_DIR" "$SALTYOS_TOOLCHAIN
 Equivalent `just` command:
 
 ```bash
-just toolchain-setup
+just tc setup
 ```
 
 If you prefer a shared global prefix, override only the prefix before sourcing:
@@ -134,7 +148,7 @@ This keeps sources and build dirs local to the repo while allowing a shared inst
 Recommended shortcut:
 
 ```bash
-just toolchain-build-llvm
+just tc build host llvm
 ```
 
 Manual steps (equivalent):
@@ -146,18 +160,20 @@ HOST_JOBS="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysct
 cmake -S "$SALTYOS_LLVM_SRC_DIR/llvm" -B "$SALTYOS_LLVM_BUILD_DIR" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_ENABLE_PROJECTS="clang;lld" \
-  -DLLVM_TARGETS_TO_BUILD="X86" \
+  -DLLVM_TARGETS_TO_BUILD="AArch64;X86" \
   -DLLVM_INSTALL_UTILS=ON \
   -C "$SALTYOS_REPO_ROOT/tools/toolchain/cmake/saltyos-builtins-target-cache.cmake" \
   -DLLVM_ENABLE_RUNTIMES=compiler-rt \
-  -DLLVM_BUILTIN_TARGETS="default;x86_64-unknown-saltyos" \
+  -DLLVM_BUILTIN_TARGETS="default;x86_64-unknown-saltyos;aarch64-unknown-saltyos" \
   -DCMAKE_INSTALL_PREFIX="$SALTYOS_TOOLCHAIN_PREFIX"
 
 ninja -C "$SALTYOS_LLVM_BUILD_DIR" -j"$HOST_JOBS"
 ninja -C "$SALTYOS_LLVM_BUILD_DIR" install
 ```
 
-SaltyOS now uses a dedicated compiler-rt builtins cache at `tools/toolchain/cmake/saltyos-builtins-target-cache.cmake` so the host LLVM build also bootstraps `x86_64-unknown-saltyos` builtins without relying on legacy `LLVM_RUNTIME_TARGETS` wiring.
+The host LLVM build includes both `X86` and `AArch64` backends, and bootstraps compiler-rt builtins for both `x86_64-unknown-saltyos` and `aarch64-unknown-saltyos`.
+
+SaltyOS uses a dedicated compiler-rt builtins cache at `tools/toolchain/cmake/saltyos-builtins-target-cache.cmake` so the host LLVM build also bootstraps SaltyOS builtins without relying on legacy `LLVM_RUNTIME_TARGETS` wiring.
 
 ### Build options
 
@@ -165,10 +181,10 @@ SaltyOS now uses a dedicated compiler-rt builtins cache at `tools/toolchain/cmak
 |--------|--------|
 | `-DCMAKE_BUILD_TYPE=Release` | Optimized build (recommended) |
 | `-DCMAKE_BUILD_TYPE=RelWithDebInfo` | Optimized + debug symbols |
-| `-DLLVM_TARGETS_TO_BUILD="X86"` | Only x86 backend (faster build) |
+| `-DLLVM_TARGETS_TO_BUILD="AArch64;X86"` | Both architecture backends |
 | `-C tools/toolchain/cmake/saltyos-builtins-target-cache.cmake` | Load the SaltyOS compiler-rt builtins cache |
 | `-DLLVM_ENABLE_RUNTIMES=compiler-rt` | Build compiler-rt alongside LLVM |
-| `-DLLVM_BUILTIN_TARGETS="default;x86_64-unknown-saltyos"` | Build compiler-rt builtins for the SaltyOS target |
+| `-DLLVM_BUILTIN_TARGETS="default;x86_64-unknown-saltyos;aarch64-unknown-saltyos"` | Build compiler-rt builtins for both SaltyOS targets |
 | `-DLLVM_USE_LINKER=lld` | Use LLD to link LLVM itself (faster) |
 | `-DLLVM_PARALLEL_LINK_JOBS=2` | Limit link parallelism (saves RAM) |
 
@@ -177,11 +193,15 @@ SaltyOS now uses a dedicated compiler-rt builtins cache at `tools/toolchain/cmak
 ```bash
 source tools/toolchain/env.sh
 
-# Preprocessor defines
+# Preprocessor defines (x86_64)
 echo | clang --target=x86_64-unknown-saltyos -E -dM - | grep -i salty
 # Expected:
 #   #define __SaltyOS__ 1
 #   #define __saltyos__ 1
+
+# Preprocessor defines (aarch64)
+echo | clang --target=aarch64-unknown-saltyos -E -dM - | grep -i salty
+# Expected: same as above
 
 # Driver defaults (ld.lld, -pie, dynamic linker)
 clang --target=x86_64-unknown-saltyos -### /dev/null 2>&1 \
@@ -196,7 +216,7 @@ Rust bootstrap needs the patched LLVM via `llvm-config`, and the key belongs und
 Recommended shortcut:
 
 ```bash
-just toolchain-build-rust
+just tc build host rust
 ```
 
 Manual steps (equivalent):
@@ -250,9 +270,11 @@ file "$SALTYOS_TOOLCHAIN_PREFIX/bin/rustc"
 # Sysroot resolves to the prefix
 "$SALTYOS_TOOLCHAIN_PREFIX/bin/rustc" --print sysroot
 
-# Target is registered
+# Both targets are registered
 "$SALTYOS_TOOLCHAIN_PREFIX/bin/rustc" --print target-list | grep saltyos
-# Expected: x86_64-unknown-saltyos
+# Expected:
+#   x86_64-unknown-saltyos
+#   aarch64-unknown-saltyos
 
 # rust-src is available (needed by Meson for core library cross-compilation)
 ls "$SALTYOS_TOOLCHAIN_PREFIX/lib/rustlib/src/rust/library/core/src/lib.rs"
@@ -263,8 +285,14 @@ ls "$SALTYOS_TOOLCHAIN_PREFIX/lib/rustlib/src/rust/library/core/src/lib.rs"
 Run the toolchain doctor to verify the prefix is complete:
 
 ```bash
-tools/toolchain/doctor.sh
+just tc doctor
 ```
+
+The doctor checks:
+- `clang` recognizes both `x86_64-unknown-saltyos` and `aarch64-unknown-saltyos`
+- `rustc` lists both SaltyOS targets
+- compiler-rt builtins exist for both targets
+- `llvm-config`, `lld`, and `FileCheck` are present in the prefix
 
 ## Step 6: Build SaltyOS
 
@@ -272,43 +300,53 @@ With the local prefix active:
 
 ```bash
 source tools/toolchain/env.sh
-tools/toolchain/doctor.sh
 
 just distclean
 just setup
 just build
+
+# For aarch64
+just arch=aarch64 setup
+just arch=aarch64 build
 ```
 
 ### Full verification
 
 ```bash
-just build          # Must succeed with no new warnings
-just run            # Boot in QEMU — no KERNEL PANIC
-just run-smp        # 2-CPU test — no deadlocks
-just run-smp4       # 4-CPU stress test
-just fmt-check      # Formatting check
+just build                      # Must succeed with no new warnings
+just run                        # Boot in QEMU — no KERNEL PANIC
+just run --smp 2                # 2-CPU test — no deadlocks
+just run --smp 4                # 4-CPU stress test
+just fmt-check                  # Formatting check
 ```
 
 Watch serial output for `test_runner` PASS/FAIL lines.
 
 ## Target Architecture
 
-### Kernel vs Userland
+### Kernel vs Userland Targets
 
-The `x86_64-unknown-saltyos` target is for **userland** code. The kernel uses a separate JSON target spec (`kernel/x86_64-saltyos.json`) because it needs:
+SaltyOS defines two target types per architecture:
+
+| | Kernel | Userland |
+|--|--------|----------|
+| **x86_64** | `kernite/x86_64-kernite.json` | `x86_64-unknown-saltyos` (built-in) |
+| **aarch64** | `kernite/aarch64-kernite.json` | `aarch64-unknown-saltyos` (built-in) |
+
+The kernel uses custom JSON target specs because it needs different settings:
 
 | Property | Kernel | Userland |
 |----------|--------|----------|
-| SSE/FPU | disabled (soft-float) | enabled (SSE2) |
+| SSE/FPU | disabled (soft-float) | enabled (SSE2 / NEON) |
 | Code model | kernel | small |
 | Relocation | PIC | PIC |
 | Red zone | disabled | allowed |
 
-The `core` library is built twice: once with the kernel JSON target (soft-float, kernel code model) and once with `x86_64-unknown-saltyos` (SSE2, small code model). This ensures each binary links against a `core` compiled with matching ABI and target settings.
+The `core` library is built twice per architecture: once with the kernel JSON target (soft-float, kernel code model) and once with the userland built-in target (SSE2/NEON, small code model). This ensures each binary links against a `core` compiled with matching ABI and target settings.
 
 ### What the target implies
 
-When you pass `--target=x86_64-unknown-saltyos` to clang, these defaults are automatically applied:
+When you pass `--target=x86_64-unknown-saltyos` (or `aarch64-unknown-saltyos`) to clang, these defaults are automatically applied:
 
 ```text
 -fPIC                   (position-independent code)
@@ -328,6 +366,35 @@ Flags you still need to pass explicitly:
 -nostdlib               (no default libraries)
 -mno-red-zone           (kernel/interrupt-safe code)
 ```
+
+## Cross-Compilation for Self-Hosting
+
+SaltyOS can cross-compile its own toolchain (Clang/LLD and rustc) to run natively on SaltyOS:
+
+```bash
+# Generate sysroot from the built userland
+just sysroot
+
+# Cross-compile Clang/LLD for SaltyOS
+just tc build cross llvm
+
+# Cross-compile rustc for SaltyOS
+just tc build cross rust
+
+# Package for rootfs
+just tc package
+
+# Or all at once:
+just self-host                   # sysroot → cross llvm → cross rust → package
+```
+
+For aarch64 self-hosting:
+
+```bash
+just arch=aarch64 self-host
+```
+
+The cross-compiled toolchain is packaged and included in the rootfs image.
 
 ## Updating the Toolchain
 
@@ -354,9 +421,9 @@ python3 "$SALTYOS_RUST_SRC_DIR/x.py" install \
 
 ## Troubleshooting
 
-### "unknown target triple 'x86_64-unknown-saltyos'"
+### "unknown target triple 'x86_64-unknown-saltyos'" (or aarch64)
 
-You are using upstream `clang` or `rustc` instead of the patched versions. Run `tools/toolchain/doctor.sh` and check `which clang`, `which rustc`.
+You are using upstream `clang` or `rustc` instead of the patched versions. Run `just tc doctor` and check `which clang`, `which rustc`.
 
 ### LLVM build runs out of memory
 
@@ -368,7 +435,7 @@ cmake -S "$SALTYOS_LLVM_SRC_DIR/llvm" -B "$SALTYOS_LLVM_BUILD_DIR" -G Ninja \
   -DLLVM_PARALLEL_LINK_JOBS=1
 ```
 
-Each LLD link of a large LLVM library can use 4–8 GB of RAM.
+Each LLD link of a large LLVM library can use 4-8 GB of RAM.
 
 ### `nproc: command not found`
 
@@ -392,7 +459,7 @@ Also verify `llvm-config` points to the patched LLVM in your active prefix.
 
 Rust bootstrap sanity checks require `FileCheck` when using an external LLVM.
 
-- `just toolchain-build-llvm` now configures `-DLLVM_INSTALL_UTILS=ON`
+- `just tc build host llvm` now configures `-DLLVM_INSTALL_UTILS=ON`
 - It also links `FileCheck` into the prefix if LLVM did not install it
 
 ### Rust bootstrap on macOS fails to link `-lzstd`
