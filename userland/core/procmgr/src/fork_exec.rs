@@ -3,7 +3,7 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use trona::ipc;
-use trona::types::*;
+use trona::types::core::*;
 
 use crate::proc_table::{
     alloc_proc, find_by_badge, proctab, MAX_NAME_LEN, NEXT_PID, NSIG, PROC_RUNNING,
@@ -47,6 +47,9 @@ pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
 
         let child_pid = NEXT_PID;
         NEXT_PID += 1;
+
+        // Pre-provision mmsrv untyped (breaks Procmgr↔MMSRV cycle)
+        super::spawn_tx::ensure_mmsrv_capacity(alloc);
 
         // Reserve slots for fixed kernel objects (TCB, VSpace, CNode, SC, Notification) + margin.
         let total_slots = 8;
@@ -168,9 +171,9 @@ pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
         }
         let _ = trona::invoke::cnode_copy(
             super::CAP_SELF_CSPACE,
-            super::CAP_NAMESERV_EP,
+            super::CAP_NAMESRV_EP,
             child_cn,
-            super::CHILD_CAP_NAMESERV,
+            super::CHILD_CAP_NAMESRV,
             super::CAP_RIGHTS_ALL,
         );
         let _ = trona::invoke::cnode_copy(
@@ -275,7 +278,7 @@ pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
         {
             let mut clone_msg = TronaMsg::zeroed();
             let mut clone_reply = TronaMsg::zeroed();
-            clone_msg.label = trona::consts::POSIX_VFS_CLONE_FDS;
+            clone_msg.label = trona::protocol::VFS_CLONE_FDS;
             clone_msg.length = 2;
             clone_msg.regs[0] = badge;
             clone_msg.regs[1] = child_pid as u64;
@@ -305,7 +308,7 @@ pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             let fork_mmap_base = trona::layout::compute_mmap_base(&parent_layout, fork_heap_base);
             let mut mm_msg = TronaMsg::zeroed();
             let mut mm_reply = TronaMsg::zeroed();
-            mm_msg.label = trona::consts::MM_REGISTER;
+            mm_msg.label = trona::protocol::MM_REGISTER;
             mm_msg.length = 4;
             mm_msg.regs[0] = child_pid as u64; // client badge
                                                // Seed with dynamic defaults; MM_FORK_REGIONS overwrites with exact runtime state.
@@ -335,7 +338,7 @@ pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
         {
             let mut mm_msg = TronaMsg::zeroed();
             let mut mm_reply = TronaMsg::zeroed();
-            mm_msg.label = trona::consts::MM_FORK_REGIONS;
+            mm_msg.label = trona::protocol::MM_FORK_REGIONS;
             mm_msg.length = 2;
             mm_msg.regs[0] = badge; // parent badge
             mm_msg.regs[1] = child_pid as u64; // child badge
@@ -351,7 +354,7 @@ pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
                 {
                     let mut dereg = TronaMsg::zeroed();
                     let mut drep = TronaMsg::zeroed();
-                    dereg.label = trona::consts::MM_DEREGISTER;
+                    dereg.label = trona::protocol::MM_DEREGISTER;
                     dereg.length = 1;
                     dereg.regs[0] = child_pid as u64;
                     let _ = ipc::call_ctx(
@@ -367,11 +370,13 @@ pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             }
         }
 
-        // Map IPC buffer for child via mmsrv (zero-filled, child only)
+        // Map IPC buffer for child via mmsrv (zero-filled, child only).
+        // MM_FORK_REGIONS intentionally skips the parent's IPC region so this
+        // remains the single owner of child IPC-buffer instantiation.
         {
             let mut mm_msg = TronaMsg::zeroed();
             let mut mm_reply = TronaMsg::zeroed();
-            mm_msg.label = trona::consts::MM_MAP_BATCH;
+            mm_msg.label = trona::protocol::MM_MAP_BATCH;
             mm_msg.length = 4;
             mm_msg.regs[0] = child_pid as u64;
             mm_msg.regs[1] = parent_layout.ipc_buf.base;
@@ -389,7 +394,7 @@ pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
                 {
                     let mut dereg = TronaMsg::zeroed();
                     let mut drep = TronaMsg::zeroed();
-                    dereg.label = trona::consts::MM_DEREGISTER;
+                    dereg.label = trona::protocol::MM_DEREGISTER;
                     dereg.length = 1;
                     dereg.regs[0] = child_pid as u64;
                     let _ = ipc::call_ctx(
@@ -429,9 +434,9 @@ pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
         let (slot_base, slot_count) = alloc.commit();
 
         let p = proctab(slot_idx);
+        p.set_posix_personality();
         p.pid = child_pid;
         p.ppid = parent_pid;
-        p.sid = proctab(parent_idx).sid;
         p.state = PROC_RUNNING;
         p.exit_code = 0;
         p.badge = child_pid as u64;
@@ -439,15 +444,6 @@ pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
         p.vspace_cap = child_vs;
         p.cnode_cap = child_cn;
         p.sc_cap = child_sc;
-        p.waiter_reply = 0;
-        p.waiter_pid = 0;
-        p.signal_ntfn = child_sig_ntfn;
-        p.ready_ntfn = 0;
-        p.wait_ready_on_resume = false;
-        p.ready_timeout_ns = 0;
-        p.itimer_real_interval_ns = 0;
-        p.itimer_real_deadline_ns = 0;
-        p.pgid = proctab(parent_idx).pgid;
         p.slot_base = slot_base;
         p.slot_count = slot_count;
         p.shared_lib_base = proctab(parent_idx).shared_lib_base;
@@ -455,11 +451,26 @@ pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
         p.layout = parent_layout;
         p.mmsrv_registered = true;
         p.has_service_ep = proctab(parent_idx).has_service_ep;
-        p.exe_path = proctab(parent_idx).exe_path;
-        for i in 0..NSIG {
-            p.sig_disposition[i] = proctab(parent_idx).sig_disposition[i];
+        p.timer_interval_ns = 0;
+        p.timer_deadline_ns = 0;
+        p.ready_ntfn = 0;
+        p.wait_ready_on_resume = false;
+        p.ready_timeout_ns = 0;
+        p.pending_ready_reply = 0;
+        p.pending_ready_deadline_ns = 0;
+        {
+            let posix = p.posix_mut();
+            posix.waiter_reply = 0;
+            posix.waiter_pid = 0;
+            posix.signal_ntfn = child_sig_ntfn;
+            posix.pgid = proctab(parent_idx).posix().pgid;
+            posix.sid = proctab(parent_idx).posix().sid;
+            posix.exe_path = proctab(parent_idx).posix().exe_path;
+            for i in 0..NSIG {
+                posix.sig_disposition[i] = proctab(parent_idx).posix().sig_disposition[i];
+            }
+            posix.umask = proctab(parent_idx).posix().umask;
         }
-        p.umask = proctab(parent_idx).umask;
 
         trona::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] FORK: child PID=");
@@ -485,7 +496,7 @@ unsafe fn abort_destroyed_exec(
         });
 
         super::vfs_load::cleanup_exec_source(vfs_source);
-        let _ = super::signal::terminate_proc(idx, super::PM_SIGKILL);
+        let _ = crate::posix::signal::terminate_proc(idx, crate::posix::PM_SIGKILL);
         reply.label = 0;
     }
 }
@@ -883,20 +894,16 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             (0, crate::proc_table::ProcLibMap::zeroed())
         };
 
-        // 9. Set up stack via mmsrv (top page left mapped at PROCMGR_SCRATCH_VADDR)
+        // 9. Build the stack top page locally, then materialize it in mmsrv.
         let stack_pages = layout.stack.page_count();
-        let err = super::spawn_tx::exec_map_stack_mmsrv(
-            pid,
-            layout.stack.base,
-            stack_pages,
-            layout.stack_top,
-        );
-        if err != 0 {
+        let stack_stage = super::spawn_tx::alloc_staging_buffer(1);
+        if stack_stage.is_null() {
             abort_destroyed_exec(idx, reply, &mut vfs_source);
             return;
         }
+        super::spawn_tx::volatile_zero(stack_stage, 4096);
 
-        // 10. Entry point and dynamic stack (top page already at PROCMGR_SCRATCH_VADDR)
+        // 10. Entry point and final stack image.
         let mut new_entry = elf_result.entry;
         let new_rsp: u64;
         let (phdr_vaddr, phent, phnum) = if let Some(vfs) = vfs_stream {
@@ -918,7 +925,7 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
                 &raw mut phnum,
             ) != 0
             {
-                super::spawn_tx::unmap_window_from_mmsrv(super::PROCMGR_SCRATCH_VADDR, 1);
+                super::spawn_tx::free_staging_buffer(stack_stage, 1);
                 abort_destroyed_exec(idx, reply, &mut vfs_source);
                 return;
             }
@@ -960,14 +967,15 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
                 } else {
                     super::CHILD_RTLD_FRAME_SLOT_START
                 },
-                true, // pre-mapped: stack top already at PROCMGR_SCRATCH_VADDR via mmsrv
+                stack_stage,
+                true,
             ) {
                 Ok(rsp) => {
                     new_rsp = rsp;
                     new_entry = rtld_result.entry;
                 }
                 Err(_) => {
-                    super::spawn_tx::unmap_window_from_mmsrv(super::PROCMGR_SCRATCH_VADDR, 1);
+                    super::spawn_tx::free_staging_buffer(stack_stage, 1);
                     abort_destroyed_exec(idx, reply, &mut vfs_source);
                     return;
                 }
@@ -982,24 +990,40 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
                 layout.scratch.base,
                 layout.initrd.base,
                 layout.stack_top,
-                true, // pre-mapped: stack top already at PROCMGR_SCRATCH_VADDR via mmsrv
+                stack_stage,
+                true,
             ) {
                 Ok(rsp) => {
                     new_rsp = rsp;
                 }
                 Err(_) => {
-                    super::spawn_tx::unmap_window_from_mmsrv(super::PROCMGR_SCRATCH_VADDR, 1);
+                    super::spawn_tx::free_staging_buffer(stack_stage, 1);
                     abort_destroyed_exec(idx, reply, &mut vfs_source);
                     return;
                 }
             }
         }
 
+        match super::spawn_tx::alloc_private_copy_from_client_region_to_mmsrv(
+            pid,
+            layout.stack.base,
+            stack_pages as u64,
+            layout.stack_top - 4096,
+            stack_stage as u64,
+            1,
+            super::VSPACE_FLAG_WRITABLE | super::VSPACE_FLAG_USER,
+        ) {
+            Ok(base) if base == layout.stack.base => {}
+            _ => {
+                super::spawn_tx::free_staging_buffer(stack_stage, 1);
+                abort_destroyed_exec(idx, reply, &mut vfs_source);
+                return;
+            }
+        }
+        super::spawn_tx::free_staging_buffer(stack_stage, 1);
+
         // ELF scratch buffer no longer needed (all elf_entry.data users complete).
         super::vfs_load::cleanup_exec_source(&mut vfs_source);
-
-        // Unmap the stack top write window
-        super::spawn_tx::unmap_window_from_mmsrv(super::PROCMGR_SCRATCH_VADDR, 1);
 
         // 11. Suspend and reconfigure
         let susp_err = trona::invoke::tcb_suspend_retry(proctab(idx).tcb_cap, 64);
@@ -1015,9 +1039,11 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
         trona::syscall::syscall(trona::SYS_YIELD, 0, 0, 0, 0, 0, 0);
 
         // POSIX: exec resets caught signals to SIG_DFL
-        for i in 0..NSIG {
-            if proctab(idx).sig_disposition[i] == SIG_DISP_CATCH {
-                proctab(idx).sig_disposition[i] = SIG_DISP_DFL;
+        if proctab(idx).is_posix() {
+            for i in 0..NSIG {
+                if proctab(idx).posix().sig_disposition[i] == SIG_DISP_CATCH {
+                    proctab(idx).posix_mut().sig_disposition[i] = SIG_DISP_DFL;
+                }
             }
         }
 
@@ -1055,16 +1081,18 @@ pub(crate) unsafe fn handle_exec(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             for i in name_copy..32 {
                 proctab(idx).name[i] = 0;
             }
-            let exe_copy = if exec_path_len >= crate::proc_table::MAX_EXE_PATH_LEN {
-                crate::proc_table::MAX_EXE_PATH_LEN - 1
-            } else {
-                exec_path_len
-            };
-            for i in 0..exe_copy {
-                proctab(idx).exe_path[i] = exec_path[i];
-            }
-            for i in exe_copy..crate::proc_table::MAX_EXE_PATH_LEN {
-                proctab(idx).exe_path[i] = 0;
+            if proctab(idx).is_posix() {
+                let exe_copy = if exec_path_len >= crate::proc_table::MAX_EXE_PATH_LEN {
+                    crate::proc_table::MAX_EXE_PATH_LEN - 1
+                } else {
+                    exec_path_len
+                };
+                for i in 0..exe_copy {
+                    proctab(idx).posix_mut().exe_path[i] = exec_path[i];
+                }
+                for i in exe_copy..crate::proc_table::MAX_EXE_PATH_LEN {
+                    proctab(idx).posix_mut().exe_path[i] = 0;
+                }
             }
         }
 

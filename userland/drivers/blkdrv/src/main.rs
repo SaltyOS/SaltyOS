@@ -1,7 +1,7 @@
 //! SaltyOS virtio-blk Block Device Driver
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! Discovers virtio-blk-pci device via pcisrv, initializes the virtio
+//! Discovers virtio-blk-pci device via pcidrv, initializes the virtio
 //! transport (legacy PCI), and serves block read/write requests over IPC.
 //!
 //! Data is transferred via mmsrv shared memory (SHM). Clients map the same
@@ -20,8 +20,8 @@
 //!   2  = self CSpace
 //!   68 = server endpoint (pre-created service EP)
 //!   14 = readiness notification
-//!   64 = pcisrv endpoint
-//!   5  = nameserv endpoint
+//!   64 = pcidrv endpoint
+//!   5  = namesrv endpoint
 //!   7  = mmsrv endpoint
 
 #![no_std]
@@ -34,13 +34,15 @@ mod virtio;
 mod virtio_modern;
 mod handlers;
 
-use trona::consts::*;
+use trona::consts::kernel::*;
+use trona::consts::server::*;
 use trona::ipc;
-use trona::types::*;
+use trona::protocol::*;
+use trona::types::core::*;
 
 const CAP_SERVER_EP: u64 = 68;
 const CAP_READINESS_NTFN: u64 = 14;
-const CAP_NAMESERV_EP: u64 = 5;
+const CAP_NAMESRV_EP: u64 = 5;
 const CAP_MMSRV_EP: u64 = 7;
 
 pub(crate) const SECTOR_SIZE: u32 = 512;
@@ -123,10 +125,10 @@ fn setup_shm() -> bool {
 }
 
 /// Register with name service.
-fn register_nameserv() {
+fn register_namesrv() {
     let name = b"blkdrv";
     let mut msg = TronaMsg::zeroed();
-    msg.label = POSIX_NS_REGISTER;
+    msg.label = NS_REGISTER;
     msg.regs[0] = name.len() as u64;
     msg.length = 1 + (name.len() as u64 + 7) / 8;
     unsafe {
@@ -136,9 +138,9 @@ fn register_nameserv() {
         }
         ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
         let mut reply = TronaMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const msg, &raw mut reply);
+        let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESRV_EP, &raw const msg, &raw mut reply);
         if err != 0 || reply.label != TRONA_OK {
-            trona::uerror!(|_lb| { _lb.str(b"[blkdrv] nameserv registration failed\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[blkdrv] namesrv registration failed\n"); });
         }
     }
 }
@@ -209,8 +211,8 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 });
 
                 let Some((_bar_phys, _bar_bits, bar_size, irq, _bar_is_io)) = virtio::get_device_caps(bus, dev, func) else {
-                    trona::uerror!(|_lb| { _lb.str(b"[blkdrv] Failed to get PCI caps from pcisrv\n"); });
-                    register_nameserv();
+                    trona::uerror!(|_lb| { _lb.str(b"[blkdrv] Failed to get PCI caps from pcidrv\n"); });
+                    register_namesrv();
                     signal_ready();
                     server_loop()
                 };
@@ -243,7 +245,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         trona::uwarn!(|_lb| { _lb.str(b"[blkdrv] SHM setup failed -- continuing without SHM\n"); });
     }
 
-    register_nameserv();
+    register_namesrv();
     signal_ready();
     server_loop()
 }

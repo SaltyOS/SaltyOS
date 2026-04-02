@@ -5,7 +5,9 @@
 //! internal UDP socket to the runtime-configured recursive resolver, and parses
 //! responses (CNAME resolution is delegated to the upstream recursive resolver).
 
-use trona::consts::*;
+use trona::consts::kernel::*;
+use trona::consts::server::*;
+use trona_posix::consts::*;
 
 const DNS_PORT: u16 = 53;
 const MAX_DNS_RESULTS: usize = 4;

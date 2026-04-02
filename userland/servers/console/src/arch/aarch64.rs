@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! aarch64 console hardware — PL011 UART I/O via device untyped + MMIO.
 
-use trona::consts::*;
+use trona::consts::kernel::*;
 use trona::invoke;
 
 // Cap layout (set up by init for the console server)

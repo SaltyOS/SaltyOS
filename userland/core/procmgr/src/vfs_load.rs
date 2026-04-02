@@ -12,21 +12,15 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::consts::*;
+use trona::consts::kernel::*;
+use trona::consts::server::*;
 use trona::ipc;
-use trona::types::*;
+use trona::protocol::*;
+use trona::types::core::*;
+use trona_posix::consts::*;
 
 const CAP_VFS_EP: Cap = super::CAP_VFS_EP;
 const CAP_MMSRV_EP: Cap = super::CAP_MMSRV_EP;
-
-// VFS protocol labels (must match trona::consts)
-const VFS_OPEN: u64 = POSIX_VFS_OPEN;
-const VFS_READ: u64 = POSIX_VFS_READ;
-const VFS_CLOSE: u64 = POSIX_VFS_CLOSE;
-const VFS_FSTAT: u64 = POSIX_VFS_FSTAT;
-const VFS_GETCWD: u64 = POSIX_VFS_GETCWD;
-const VFS_BULK_SETUP: u64 = POSIX_VFS_BULK_SETUP;
-const VFS_BULK_READ: u64 = POSIX_VFS_BULK_READ;
 
 /// Maximum file size we will attempt to load from VFS (128 MiB).
 const MAX_VFS_FILE_SIZE: usize = 128 * 1024 * 1024;
@@ -1143,7 +1137,7 @@ unsafe fn vfs_lseek(fd: i32, offset: i64, whence: i32) -> Option<i64> {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
 
-        msg.label = POSIX_VFS_LSEEK;
+        msg.label = VFS_LSEEK;
         msg.length = 3;
         msg.regs[0] = fd as u64;
         msg.regs[1] = offset as u64;

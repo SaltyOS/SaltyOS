@@ -1,0 +1,10 @@
+[Service]
+Name=namesrv
+Binary=namesrv
+Type=simple
+Restart=always
+PreProcmgr=yes
+
+[Dependencies]
+After=console
+Before=vfs

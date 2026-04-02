@@ -1,0 +1,14 @@
+[Service]
+Name=pcidrv
+Binary=pcidrv
+Type=simple
+Restart=always
+PreProcmgr=yes
+
+[Dependencies]
+After=console namesrv
+Before=blkdrv
+
+[Capabilities]
+CopyCap=15:64 11:66
+NeedEP=namesrv:65

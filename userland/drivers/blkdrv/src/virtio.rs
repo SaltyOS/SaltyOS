@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! VirtIO block device transport layer.
 
-use trona::consts::*;
-use trona::ipc;
+use trona::consts::kernel::*;
+use trona::consts::server::*;
 use trona::invoke;
-use trona::types::*;
+use trona::ipc;
+use trona::protocol::*;
+use trona::types::core::*;
 
 use crate::ipc_ctx;
 use crate::{CAPACITY_SECTORS, BAR0_IS_IO, PCI_IOPORT_CAP, VIRTIO_INITIALIZED, VQUEUE_BASE};
@@ -12,12 +14,12 @@ use crate::{QUEUE_SIZE, QUEUE_PHYS, QUEUE_AVAIL_OFF, QUEUE_USED_OFF, QUEUE_EVENT
 
 const CAP_SELF_VSPACE: u64 = 1;
 const CAP_SELF_CSPACE: u64 = 2;
-const CAP_PCISRV_EP: u64 = 64;
+const CAP_PCIDRV_EP: u64 = 64;
 const CAP_MMSRV_EP: u64 = 7;
 
-/// Slot for dynamically received IoPort cap from pcisrv
+/// Slot for dynamically received IoPort cap from pcidrv
 const CAP_RECEIVED_IOPORT: u64 = 80;
-/// Slot for dynamically received device untyped cap from pcisrv (MMIO BAR)
+/// Slot for dynamically received device untyped cap from pcidrv (MMIO BAR)
 const CAP_RECEIVED_DEVUT: u64 = 81;
 
 /// virtio-blk PCI vendor/device IDs
@@ -190,7 +192,7 @@ pub(crate) fn bar_write32(offset: u64, val: u32) {
     }
 }
 
-/// Query pcisrv for virtio-blk device.
+/// Query pcidrv for virtio-blk device.
 pub(crate) fn find_virtio_blk() -> Option<(u8, u8, u8, u32, u64)> {
     let mut msg = TronaMsg::zeroed();
     msg.label = PCI_FIND_DEVICE;
@@ -199,7 +201,7 @@ pub(crate) fn find_virtio_blk() -> Option<(u8, u8, u8, u32, u64)> {
     msg.regs[1] = VIRTIO_BLK_DEVICE as u64;
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCIDRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
     }
@@ -212,7 +214,7 @@ pub(crate) fn find_virtio_blk() -> Option<(u8, u8, u8, u32, u64)> {
     Some((bus, dev, func, bar0 as u32, bar0))
 }
 
-/// Get BAR/IRQ info from pcisrv. Returns (bar_base, bar_bits, bar_size, irq, bar_is_io).
+/// Get BAR/IRQ info from pcidrv. Returns (bar_base, bar_bits, bar_size, irq, bar_is_io).
 pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u32, u8, bool)> {
     let mut msg = TronaMsg::zeroed();
     msg.label = PCI_GET_CAPS;
@@ -227,7 +229,7 @@ pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u
     }
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCIDRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
     }

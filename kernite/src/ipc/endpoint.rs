@@ -27,7 +27,7 @@ const NBSEND_QUEUE_DEPTH: usize = 128;
 static mut EP_IRQ_FLAGS: [u64; crate::arch::MAX_CPUS] = [0; crate::arch::MAX_CPUS];
 static mut EP_LOCK_DEPTH: [u32; crate::arch::MAX_CPUS] = [0; crate::arch::MAX_CPUS];
 static RECV_WAIT_LOCK: SpinLock = SpinLock::new();
-const POSIX_PM_EXEC_LABEL: u64 = 6;
+const PM_EXEC_LABEL: u64 = 6;
 const IPC_BUFFER_RESERVED_BYTES: usize = core::mem::size_of::<[u64; 478]>();
 
 #[inline]
@@ -41,7 +41,7 @@ fn recv_wait_unlock() {
 }
 
 fn exec_payload_len(msg: &Message) -> Option<usize> {
-    if msg.label != POSIX_PM_EXEC_LABEL {
+    if msg.label != PM_EXEC_LABEL {
         return None;
     }
 
@@ -82,7 +82,7 @@ unsafe fn resolve_ipc_buffer_ptr(tcb: *mut Tcb) -> Option<*mut super::IpcBuffer>
 
 unsafe fn transfer_exec_payload(sender: *mut Tcb, receiver: *mut Tcb, msg: &Message) {
     unsafe {
-        if msg.label != POSIX_PM_EXEC_LABEL {
+        if msg.label != PM_EXEC_LABEL {
             return;
         }
 

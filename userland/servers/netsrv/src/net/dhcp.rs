@@ -3,7 +3,8 @@
 
 use crate::net::config;
 use crate::net::socket::udp;
-use trona::consts::{SO_BROADCAST, SOL_SOCKET};
+use trona::consts::posix::{SO_BROADCAST, SOL_SOCKET};
+use trona_posix::consts::*;
 
 const DHCP_CLIENT_PORT: u16 = 68;
 const DHCP_SERVER_PORT: u16 = 67;

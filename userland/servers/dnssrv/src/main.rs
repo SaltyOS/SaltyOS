@@ -8,11 +8,11 @@
 //! Cap layout:
 //!   0  = self TCB
 //!   2  = self CSpace
-//!   5  = nameserv endpoint
+//!   5  = namesrv endpoint
 //!   7  = mmsrv endpoint
 //!   14 = readiness notification
 //!   64 = netsrv endpoint (NeedEP=netsrv:64)
-//!   65 = nameserv endpoint #2 (NeedEP=nameserv:65)
+//!   65 = namesrv endpoint #2 (NeedEP=namesrv:65)
 //!   68 = server endpoint (pre-created service EP)
 
 #![no_std]
@@ -21,21 +21,23 @@
 extern crate trona;
 extern crate trona_posix;
 
-use trona::consts::*;
+use trona::consts::kernel::*;
+use trona::consts::server::*;
 use trona::ipc;
+use trona::protocol::*;
 use trona::serial;
-use trona::types::*;
+use trona::types::core::*;
 
 // ---------------------------------------------------------------------------
 // Capability slot layout
 // ---------------------------------------------------------------------------
 
 const CAP_SELF_CSPACE: u64 = 2;
-const CAP_NAMESERV_EP: u64 = 5;
+const CAP_NAMESRV_EP: u64 = 5;
 const CAP_MMSRV_EP: u64 = 7;
 const CAP_READINESS_NTFN: u64 = 14;
 const CAP_NETSRV_EP: u64 = 64;
-const CAP_NAMESERV_EP2: u64 = 65;
+const CAP_NAMESRV_EP2: u64 = 65;
 const CAP_SERVER_EP: u64 = 68;
 
 // ---------------------------------------------------------------------------
@@ -222,10 +224,10 @@ fn cache_flush() {
 // Name service registration
 // ---------------------------------------------------------------------------
 
-fn register_nameserv() {
+fn register_namesrv() {
     let name = b"dnssrv";
     let mut msg = TronaMsg::zeroed();
-    msg.label = POSIX_NS_REGISTER;
+    msg.label = NS_REGISTER;
     msg.regs[0] = name.len() as u64;
     msg.length = 1 + (name.len() as u64 + 7) / 8;
     // SAFETY: Writing name bytes into message register space; IPC context valid.
@@ -240,14 +242,14 @@ fn register_nameserv() {
         let mut reply = TronaMsg::zeroed();
         let err = ipc::call_ctx(
             ipc_ctx(),
-            CAP_NAMESERV_EP,
+            CAP_NAMESRV_EP,
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 || reply.label != TRONA_OK {
-            puts(b"[dnssrv] nameserv registration failed\n");
+            puts(b"[dnssrv] namesrv registration failed\n");
         } else {
-            puts(b"[dnssrv] Registered with nameserv\n");
+            puts(b"[dnssrv] Registered with namesrv\n");
         }
     }
 }
@@ -425,7 +427,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     puts(b"[dnssrv] DNS Resolver Service starting\n");
 
     // Register with name service
-    register_nameserv();
+    register_namesrv();
 
     // Signal readiness to init
     signal_ready();

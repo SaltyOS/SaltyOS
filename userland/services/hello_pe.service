@@ -1,0 +1,11 @@
+[Service]
+Name=hello_pe
+Binary=hello_pe
+Type=simple
+Restart=no
+
+[Capabilities]
+NeedEP=win32_csrss:69
+
+[Dependencies]
+After=win32_csrss

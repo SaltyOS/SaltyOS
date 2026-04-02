@@ -48,7 +48,7 @@ S_IFREG = 0o100000
 ROOT_INO = 1
 FIRST_FILE_INO = 2
 
-# B-tree on-disk sizes (match userland/fs/saltyfs/src/types.rs packed layouts)
+# B-tree on-disk sizes (match userland/drivers/filesystems/saltyfs/src/types.rs packed layouts)
 BTREE_NODE_HEADER_SIZE = 64
 BTREE_ITEM_SIZE = 25       # BTreeItem = BTreeKey(17) + offset(4) + size(4)
 BTREE_POINTER_SIZE = 33    # BTreePointer = BTreeKey(17) + block_nr(8) + generation(8)

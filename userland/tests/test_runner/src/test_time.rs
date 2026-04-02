@@ -3,7 +3,7 @@
 
 use trona_posix::proc as posix;
 use trona::serial;
-use trona::types::Timespec;
+use trona::types::core::Timespec;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);

@@ -1,0 +1,8 @@
+[Service]
+Name=dispdrv
+Binary=dispdrv
+Type=notify
+Restart=no
+
+[Dependencies]
+After=console namesrv procmgr saltyfs vfs

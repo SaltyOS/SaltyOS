@@ -1,0 +1,13 @@
+[Service]
+Name=posix_ttysrv
+Binary=posix_ttysrv
+Type=notify
+Restart=always
+
+[Dependencies]
+After=console namesrv procmgr vfs saltyfs dispdrv
+Before=posix_getty
+
+[Capabilities]
+CopyCap=14:66
+NeedEP=dispdrv:65

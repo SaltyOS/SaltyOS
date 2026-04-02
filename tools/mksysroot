@@ -23,11 +23,12 @@ REQUIRED_BUILD_FILES = [
     ("crt_start.o",          "lib/basalt/c/crt_start.o"),
     ("core.o",               "rust/core.o"),
     ("compiler_builtins.o",  "rust/compiler_builtins.o"),
-    ("ld-trona.so",          "lib/trona/rtld/ld-trona.so"),
+    ("ld-trona.so",          "lib/trona/rtld/elf/ld-trona.so"),
 ]
 
 # Optional files: copied if present, warned if missing
 OPTIONAL_BUILD_FILES = [
+    ("ld-trona-pe.so",  "lib/trona/rtld/pe/ld-trona-pe.so"),
     ("trona.rmeta",     "lib/trona/trona.rmeta"),
     ("basaltc.rmeta",   "lib/basalt/c/basaltc.rmeta"),
     ("libc++.so",       "lib/basalt/cpp/libc++.so"),

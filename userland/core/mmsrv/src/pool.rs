@@ -6,7 +6,7 @@
 //! breaking callers during the transition.
 
 use crate::types::MmClient;
-use trona::types::Cap;
+use trona::types::core::Cap;
 
 /// No-op: MO-based COW does not need a userspace frame pool.
 pub(crate) unsafe fn init_pool(_client: *mut MmClient) -> bool {

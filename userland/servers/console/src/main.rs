@@ -3,10 +3,10 @@
 //!
 //! Handles hardware I/O for serial (COM1 on x86_64, PL011 on aarch64)
 //! and PS/2 keyboard (x86_64 only).
-//! Forwards raw input bytes to ttyd via TTYD_INPUT_EVENT.
+//! Forwards raw input bytes to posix_ttysrv via POSIX_TTYSRV_INPUT_EVENT.
 //! Handles CONSOLE_WRITE for direct serial + display output.
 //!
-//! Line discipline, termios, and signal delivery are handled by ttyd.
+//! Line discipline, termios, and signal delivery are handled by posix_ttysrv.
 
 #![no_std]
 #![no_main]
@@ -24,19 +24,22 @@ mod arch;
 #[cfg(target_arch = "x86_64")]
 mod kbd;
 
-use trona::consts::*;
+use trona::consts::kernel::*;
+use trona::consts::server::*;
 use trona::ipc;
+use trona::protocol::*;
 use trona::serial;
-use trona::types::*;
+use trona::types::core::*;
+use trona_posix::*;
 
 // Cap layout (architecture-neutral slots)
 const CAP_SELF_CSPACE: u64 = 2;
 const CAP_SERVER_EP: u64 = 3;
 const CAP_READINESS_NTFN: u64 = 14;
-const CAP_TTYD_EP: u64 = 67;    // TTYD endpoint (NeedEP ttyd:67)
-const CAP_DISPLAY_EP: u64 = 68; // Display EP (NeedEP display:68)
+const CAP_POSIX_TTYSRV_EP: u64 = 67; // POSIX TTY server endpoint (NeedEP posix_ttysrv:67)
+const CAP_DISPDRV_EP: u64 = 68;     // Display driver EP (NeedEP dispdrv:68)
 
-// termios flag defaults (match ttyd canonical defaults)
+// termios flag defaults (match posix_ttysrv canonical defaults)
 const ISIG: u32 = 0o000001;
 const ICANON: u32 = 0o000002;
 const ECHO: u32 = 0o000010;
@@ -239,7 +242,7 @@ unsafe fn display_flush_blocking_one() -> bool {
             *dst.add(i) = *b;
         }
 
-        let err = ipc::send_ctx(ipc_ctx(), CAP_DISPLAY_EP, &raw const msg);
+        let err = ipc::send_ctx(ipc_ctx(), CAP_DISPDRV_EP, &raw const msg);
         if err == 0 {
             display_tx_consume(len);
             true
@@ -271,7 +274,7 @@ unsafe fn display_try_flush() {
                 *dst.add(i) = chunk[i];
             }
 
-            let err = ipc::nbsend_ctx(ipc_ctx(), CAP_DISPLAY_EP, &raw const msg);
+            let err = ipc::nbsend_ctx(ipc_ctx(), CAP_DISPDRV_EP, &raw const msg);
             if err == 0 {
                 display_tx_consume(len);
                 continue;
@@ -282,15 +285,15 @@ unsafe fn display_try_flush() {
     }
 }
 
-/// Forward raw input bytes to ttyd in bounded chunks.
-/// Uses nbsend first, then applies blocking backpressure if ttyd is saturated.
-fn forward_to_ttyd(raw: &[u8], raw_len: usize) {
+/// Forward raw input bytes to posix_ttysrv in bounded chunks.
+/// Uses nbsend first, then applies blocking backpressure if posix_ttysrv is saturated.
+fn forward_to_ttysrv(raw: &[u8], raw_len: usize) {
     if raw_len == 0 { return; }
     let mut offset = 0usize;
     while offset < raw_len {
         let chunk_len = core::cmp::min(raw_len - offset, 128);
         let mut fwd = TronaMsg::zeroed();
-        fwd.label = TTYD_INPUT_EVENT;
+        fwd.label = POSIX_TTYSRV_INPUT_EVENT;
         fwd.regs[0] = chunk_len as u64;
         fwd.length = 1 + ((chunk_len as u64 + 7) / 8);
         let dst = &raw mut fwd.regs[1] as *mut u8;
@@ -298,13 +301,13 @@ fn forward_to_ttyd(raw: &[u8], raw_len: usize) {
             for i in 0..chunk_len {
                 *dst.add(i) = raw[offset + i];
             }
-            let mut err = ipc::nbsend_ctx(ipc_ctx(), CAP_TTYD_EP, &raw const fwd);
+            let mut err = ipc::nbsend_ctx(ipc_ctx(), CAP_POSIX_TTYSRV_EP, &raw const fwd);
             if err != 0 {
-                err = ipc::send_ctx(ipc_ctx(), CAP_TTYD_EP, &raw const fwd);
+                err = ipc::send_ctx(ipc_ctx(), CAP_POSIX_TTYSRV_EP, &raw const fwd);
             }
             if err != 0 {
                 trona::uerror!(|_lb| {
-                    _lb.str(b"[CONSOLE] FAIL: ttyd input send failed\n");
+                    _lb.str(b"[CONSOLE] FAIL: posix_ttysrv input send failed\n");
                 });
                 return;
             }
@@ -315,11 +318,12 @@ fn forward_to_ttyd(raw: &[u8], raw_len: usize) {
 
 unsafe fn handle_write(msg: *const TronaMsg) {
     unsafe {
-        let mut len = (*msg).regs[0];
-        if len > 24 { len = 24; }
+        let requested_len = (*msg).regs[0] as usize;
+        let inline_len = ((*msg).length.saturating_sub(1) as usize) * 8;
+        let len = core::cmp::min(requested_len, inline_len);
         let data = core::slice::from_raw_parts(
             &(*msg).regs[1] as *const u64 as *const u8,
-            len as usize,
+            len,
         );
         console_puts(data);
         display_write(data);
@@ -406,13 +410,13 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         // Bound notifications have label=0 and length=0.
         // Regular IPC may carry a non-zero badge (sender badge).
         if badge != 0 && msg.label == 0 && msg.length == 0 {
-            // Notification: drain hardware input, forward to ttyd.
+            // Notification: drain hardware input, forward to posix_ttysrv.
             let mut raw_buf = [0u8; 256];
             let raw_len = arch::drain_input(&mut raw_buf);
             arch::ack_irqs();
 
-            // Forward raw bytes to ttyd
-            forward_to_ttyd(&raw_buf, raw_len);
+            // Forward raw bytes to posix_ttysrv
+            forward_to_ttysrv(&raw_buf, raw_len);
             unsafe { display_try_flush(); }
 
             // Wait for next event

@@ -24,12 +24,15 @@ mod selftest;
 mod spawn;
 mod svc_mgr;
 
-use trona::consts::*;
-use trona_loader::cpio;
+use trona::consts::kernel::*;
+use trona::consts::server::*;
 use trona::invoke;
 use trona::ipc;
+use trona::protocol::*;
 use trona::syscall::syscall;
-use trona::types::*;
+use trona::types::core::*;
+use trona_loader::cpio;
+use trona_posix::consts::*;
 
 use spawn::ExtraCapCopy;
 
@@ -803,14 +806,12 @@ unsafe fn boot_services(mgr: &mut svc_mgr::ServiceManager, ut: Cap, total_usable
             }
 
             let spawn_name = elf_name;
-
-            let pre_ep = mgr.services[svc_idx].pre_ep;
             let pid = unsafe {
                 spawn::pm_spawn(
                     procmgr_ep,
                     spawn_name,
                     &mgr.services[svc_idx].def,
-                    pre_ep,
+                    mgr.services[svc_idx].pre_ep,
                     true,
                 )
             };
@@ -855,7 +856,7 @@ fn find_service_by_pid(mgr: &svc_mgr::ServiceManager, pid: u32) -> i32 {
 unsafe fn blocking_wait_child(pm_ep: Cap) -> (i32, u32) {
     unsafe {
         let mut msg = TronaMsg::zeroed();
-        msg.label = POSIX_PM_WAIT;
+        msg.label = PM_WAIT;
         msg.length = 2;
         msg.regs[0] = PM_WAIT_ANY_CHILD;
         msg.regs[1] = 0; // blocking (no WNOHANG)
@@ -906,8 +907,13 @@ unsafe fn handle_child_exit(
 
             let spawn_name = elf_name;
 
-            let pre_ep = mgr.services[svc_idx].pre_ep;
-            let new_pid = spawn::pm_spawn(pm_ep, spawn_name, &mgr.services[svc_idx].def, pre_ep, true);
+            let new_pid = spawn::pm_spawn(
+                pm_ep,
+                spawn_name,
+                &mgr.services[svc_idx].def,
+                mgr.services[svc_idx].pre_ep,
+                true,
+            );
             if new_pid < 0 {
                 trona::uerror!(|_lb| { _lb.str(b"[INIT] Failed to restart service\n"); });
                 mgr.set_state(svc_idx, svc_mgr::ServiceState::Failed);
@@ -926,7 +932,7 @@ unsafe fn drain_zombies(mgr: &mut svc_mgr::ServiceManager, pm_ep: Cap) {
     unsafe {
         loop {
             let mut msg = TronaMsg::zeroed();
-            msg.label = POSIX_PM_WAIT;
+            msg.label = PM_WAIT;
             msg.length = 2;
             msg.regs[0] = PM_WAIT_ANY_CHILD;
             msg.regs[1] = WNOHANG;

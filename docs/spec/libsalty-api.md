@@ -106,7 +106,7 @@ Set by the kernel for `init`; inherited by child processes.
 | `CAP_SELF_CSPACE` | 2 | Thread's CNode root |
 | `CAP_PROCMGR_EP` | 3 | Process manager endpoint |
 | `CAP_VFS_EP` | 4 | VFS server endpoint |
-| `CAP_NAMESERV_EP` | 5 | Name service endpoint |
+| `CAP_NAMESRV_EP` | 5 | Name service endpoint |
 | `CAP_SIGNAL_NTFN` | 6 | Signal delivery notification |
 | `CAP_UNTYPED` | 7 | Dedicated untyped memory |
 | `CAP_COM1_IOPORT` | 8 | Serial port I/O port cap |
@@ -562,7 +562,7 @@ Initialize the per-process memory client. Must be called once during startup. St
 
 **mmap modes:**
 - **Anonymous** (`MAP_ANONYMOUS`): allocates fresh frames, zeroes them, maps at next available address (or at `addr` with `MAP_FIXED`).
-- **fd-backed** (`fd >= 0`): sends `POSIX_VFS_MMAP` to VFS, receives device untyped cap, maps with write-combining flags (used for framebuffer).
+- **fd-backed** (`fd >= 0`): sends `VFS_MMAP` to VFS, receives device untyped cap, maps with write-combining flags (used for framebuffer).
 
 Protection flags: `PROT_NONE` (0), `PROT_READ` (1), `PROT_WRITE` (2), `PROT_EXEC` (4).
 Map flags: `MAP_SHARED` (0x01), `MAP_PRIVATE` (0x02), `MAP_FIXED` (0x10), `MAP_ANONYMOUS` (0x20).
@@ -831,7 +831,7 @@ Reads framebuffer metadata from the kernel boot info page at `BOOTINFO_VADDR` (0
 ```rust
 pub const fn spawn_policy_build(
     readiness_mode: u64, map_initrd: bool, is_display: bool,
-    cnode_bits: u8, memory_kb: u16,
+    cnode_bits: u8, memory_kb: u16, subsystem_id: u8,
 ) -> u64
 
 pub const fn spawn_policy_readiness(policy: u64) -> u64
@@ -839,9 +839,10 @@ pub const fn spawn_policy_map_initrd(policy: u64) -> bool
 pub const fn spawn_policy_is_display(policy: u64) -> bool
 pub const fn spawn_policy_cnode_bits(policy: u64) -> u8
 pub const fn spawn_policy_memory_kb(policy: u64) -> u16
+pub const fn spawn_policy_subsystem(policy: u64) -> u8
 ```
 
-Layout: bits [1:0] = readiness_mode, bit [2] = map_initrd, bit [3] = is_display, bits [15:8] = cnode_bits, bits [31:16] = memory_kb.
+Layout: bits [1:0] = readiness_mode, bit [2] = map_initrd, bit [3] = is_display, bits [15:8] = cnode_bits, bits [31:16] = memory_kb, bits [35:32] = subsystem_id.
 
 Readiness modes: `SPAWN_READY_IMMEDIATE` (0), `SPAWN_READY_NOTIFY` (1).
 
@@ -863,8 +864,8 @@ Readiness modes: `SPAWN_READY_IMMEDIATE` (0), `SPAWN_READY_NOTIFY` (1).
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `POSIX_NS_REGISTER` | 1 | Register endpoint by name |
-| `POSIX_NS_LOOKUP` | 2 | Lookup endpoint by name |
+| `NS_REGISTER` | 1 | Register endpoint by name |
+| `NS_LOOKUP` | 2 | Lookup endpoint by name |
 
 ---
 

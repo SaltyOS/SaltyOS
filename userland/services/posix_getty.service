@@ -1,0 +1,9 @@
+[Service]
+Name=posix_getty
+Binary=posix_getty
+Type=simple
+Restart=always
+
+[Dependencies]
+After=console namesrv procmgr vfs posix_ttysrv saltyfs
+Before=test_runner

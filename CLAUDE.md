@@ -296,7 +296,7 @@ x86_64: Number in `rax`, args in `rdi, rsi, rdx, r10, r8, r9`. Returns error in 
 | 2 | CAP_SELF_CSPACE | Thread's CNode root |
 | 3 | CAP_PROCMGR_EP | Process manager endpoint |
 | 4 | CAP_VFS_EP | VFS server endpoint |
-| 5 | CAP_NAMESERV_EP | Name service endpoint |
+| 5 | CAP_NAMESRV_EP | Name service endpoint |
 | 7 | CAP_MMSRV_EP | Memory manager server endpoint |
 | 8 | CAP_COM1_IOPORT | Serial port I/O port |
 | 11 | CAP_CONSOLE_EP | Console server endpoint |

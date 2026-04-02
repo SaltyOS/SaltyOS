@@ -121,11 +121,11 @@ impl Notification {
                 let tcb = self.bound_tcb;
 
                 // ReplyWait / CallSendBlocked: only interrupt a blocking
-                // Call if the thread has opted into signal delivery by
-                // registering a signal dispatcher. Servers that use bound
-                // notifications for other purposes (IRQ, ring buffers)
-                // must NOT have their outgoing Calls interrupted.
-                if (*tcb).signal_dispatcher != 0 {
+                // Call if the thread has opted into notification delivery
+                // by registering a notification dispatcher. Servers that
+                // use bound notifications for other purposes (IRQ, ring
+                // buffers) must NOT have their outgoing Calls interrupted.
+                if (*tcb).notification_dispatcher != 0 {
                     // ReplyWait: thread is waiting for a server reply after Call.
                     // Not in any endpoint queue; blocked_endpoint is null.
                     // Must check BEFORE the blocked_endpoint null guard.

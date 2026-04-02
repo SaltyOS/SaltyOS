@@ -5,7 +5,7 @@ Type=notify
 Restart=always
 
 [Dependencies]
-After=blkdrv nameserv mmsrv
+After=blkdrv namesrv mmsrv
 
 [Capabilities]
 NeedEP=blkdrv:64

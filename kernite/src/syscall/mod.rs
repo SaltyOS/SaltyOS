@@ -44,7 +44,7 @@ pub enum Syscall {
     ReplyRecvAny = 24,
     RecvAnyTimed = 25,
     ReplyRecvAnyTimed = 26,
-    Sigreturn = 27,
+    NotifReturn = 27,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -79,7 +79,7 @@ impl TryFrom<u64> for Syscall {
             24 => Ok(Syscall::ReplyRecvAny),
             25 => Ok(Syscall::RecvAnyTimed),
             26 => Ok(Syscall::ReplyRecvAnyTimed),
-            27 => Ok(Syscall::Sigreturn),
+            27 => Ok(Syscall::NotifReturn),
             _ => Err(SyscallError::InvalidOperation),
         }
     }
@@ -831,23 +831,24 @@ fn syscall_call(
 }
 
 // ---------------------------------------------------------------------------
-// Signal frame: kernel-injected context on the user stack for signal delivery
+// Notification frame: kernel-injected context on the user stack for
+// notification delivery (used by POSIX signal layer and future subsystems).
 // ---------------------------------------------------------------------------
 
-/// Magic value for signal frame validation
-const SIGFRAME_MAGIC: u64 = 0x5A17_5349_4746_524D;
+/// Magic value for notification frame validation
+const NOTIFFRAME_MAGIC: u64 = 0x5A17_5349_4746_524D;
 
-/// Signal frame pushed onto the user stack when the kernel interrupts
-/// a blocking IPC call due to a bound notification (signal delivery).
+/// Notification frame pushed onto the user stack when the kernel interrupts
+/// a blocking IPC call due to a bound notification.
 ///
 /// The kernel saves the full user register state plus FPU context,
-/// then redirects execution to the user-mode signal dispatcher.
-/// After signal handlers run, userspace calls `SYS_SIGRETURN` to
+/// then redirects execution to the user-mode notification dispatcher.
+/// After handlers run, userspace calls `SYS_NOTIF_RETURN` to
 /// restore the original context.
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
-struct SigFrame {
+struct NotifFrame {
     // General-purpose registers and control state (18 × 8 = 144 bytes)
     rax: u64,
     rbx: u64,
@@ -867,7 +868,7 @@ struct SigFrame {
     r15: u64,
     rip: u64,
     rflags: u64,
-    // Signal metadata (6 × 8 = 48 bytes)
+    // Notification metadata (6 × 8 = 48 bytes)
     notification_bits: u64,
     interrupted_syscall: u64,
     syscall_cap_ptr: u64,
@@ -880,17 +881,17 @@ struct SigFrame {
     fpu_state: [u8; 832],
 }
 
-/// Signal frame (aarch64 variant).
+/// Notification frame (aarch64 variant).
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
 #[repr(C, align(16))]
-struct SigFrame {
+struct NotifFrame {
     // General-purpose registers x0-x30 (31 × 8 = 248 bytes)
     x: [u64; 31],
     sp: u64,
     pc: u64,
     pstate: u64,
-    // Signal metadata
+    // Notification metadata
     notification_bits: u64,
     interrupted_syscall: u64,
     syscall_cap_ptr: u64,
@@ -970,8 +971,8 @@ unsafe fn consume_notification_bits(tcb: *mut crate::sched::thread::Tcb) -> u64 
     }
 }
 
-/// Inject a signal frame onto the user stack and redirect execution
-/// to the signal dispatcher.
+/// Inject a notification frame onto the user stack and redirect execution
+/// to the notification dispatcher.
 ///
 /// Returns `Some(result)` on success with the arch-appropriate
 /// `SyscallResult` to return to userspace, or `None` on failure
@@ -980,7 +981,7 @@ unsafe fn consume_notification_bits(tcb: *mut crate::sched::thread::Tcb) -> u64 
 /// # Safety
 /// Must be called with IRQs disabled. `tcb` must be the current thread.
 /// The kernel stack must contain the user register state from syscall entry.
-unsafe fn inject_signal_frame(
+unsafe fn inject_notif_frame(
     tcb: *mut crate::sched::thread::Tcb,
     dispatcher: u64,
     cap_ptr: u64,
@@ -1010,7 +1011,7 @@ unsafe fn inject_signal_frame(
             let kst = (*tcb).kernel_stack_top as *const u64;
             let user_rsp = *kst.offset(-1);
 
-            let mut frame = SigFrame {
+            let mut frame = NotifFrame {
                 rax: *kst.offset(-16),
                 rbx: *kst.offset(-15),
                 rcx: *kst.offset(-14),
@@ -1034,7 +1035,7 @@ unsafe fn inject_signal_frame(
                 syscall_cap_ptr: cap_ptr,
                 syscall_msg_info: msg_info,
                 restart_syscall: 0,
-                magic: SIGFRAME_MAGIC,
+                magic: NOTIFFRAME_MAGIC,
                 fpu_saved: if fpu_initialized { 1 } else { 0 },
                 _fpu_pad: [0u64; 7],
                 fpu_state: [0u8; 832],
@@ -1044,7 +1045,7 @@ unsafe fn inject_signal_frame(
                 frame.fpu_state.copy_from_slice(&(*tcb).fpu_state.data);
             }
 
-            let frame_size = core::mem::size_of::<SigFrame>() as u64;
+            let frame_size = core::mem::size_of::<NotifFrame>() as u64;
             // Keep the frame 64-byte aligned for XSAVE compatibility, and
             // reserve one synthetic return-address slot below it so the
             // dispatcher enters with the normal SysV x86_64 stack layout.
@@ -1089,7 +1090,7 @@ unsafe fn inject_signal_frame(
         #[cfg(target_arch = "aarch64")]
         {
             let ctx = &(*tcb).context;
-            let mut frame = SigFrame {
+            let mut frame = NotifFrame {
                 x: ctx.x,
                 sp: ctx.user_sp,
                 pc: ctx.return_elr,
@@ -1099,7 +1100,7 @@ unsafe fn inject_signal_frame(
                 syscall_cap_ptr: cap_ptr,
                 syscall_msg_info: msg_info,
                 restart_syscall: 0,
-                magic: SIGFRAME_MAGIC,
+                magic: NOTIFFRAME_MAGIC,
                 fpu_saved: if fpu_initialized { 1 } else { 0 },
                 _fpu_pad: [0u64; 1],
                 fpu_state: [0u8; 528],
@@ -1109,14 +1110,14 @@ unsafe fn inject_signal_frame(
                 frame.fpu_state.copy_from_slice(&(*tcb).fpu_state.data);
             }
 
-            let frame_size = core::mem::size_of::<SigFrame>() as u64;
+            let frame_size = core::mem::size_of::<NotifFrame>() as u64;
             let new_sp = (ctx.user_sp - frame_size) & !0xF;
 
             if new_sp < (*tcb).user_stack_min || new_sp >= ctx.user_sp {
                 return None;
             }
 
-            let frame_size_check = core::mem::size_of::<SigFrame>() as u64;
+            let frame_size_check = core::mem::size_of::<NotifFrame>() as u64;
             if !verify_user_pages_mapped(tcb, new_sp, frame_size_check, true) {
                 return None;
             }
@@ -1138,26 +1139,26 @@ unsafe fn inject_signal_frame(
     }
 }
 
-/// SYS_SIGRETURN: restore user context from a signal frame on the user stack.
+/// SYS_NOTIF_RETURN: restore user context from a notification frame on the user stack.
 ///
 /// Always returns `Interrupted` (EINTR). SA_RESTART is handled at the
 /// POSIX library level, not here, because:
-/// - The signal handler may have issued IPC that overwrote the IPC buffer
+/// - The notification handler may have issued IPC that overwrote the IPC buffer
 /// - For ReplyWait interruptions, the message was already delivered to the
 ///   server, so re-sending would cause duplicate processing
-fn syscall_sigreturn(frame_ptr: u64) -> SyscallResult {
+fn syscall_notif_return(frame_ptr: u64) -> SyscallResult {
     unsafe {
         let irq = save_irq_disable();
         let current = crate::sched::scheduler::scheduler().current();
 
         // Verify pages are mapped before reading to avoid kernel fault
-        let frame_size = core::mem::size_of::<SigFrame>() as u64;
+        let frame_size = core::mem::size_of::<NotifFrame>() as u64;
         if !verify_user_pages_mapped(current, frame_ptr, frame_size, false) {
             restore_irq(irq);
             return SyscallResult::err(SyscallError::BadAddress);
         }
 
-        let frame: SigFrame = match crate::arch::uaccess::copy_from_user(frame_ptr) {
+        let frame: NotifFrame = match crate::arch::uaccess::copy_from_user(frame_ptr) {
             Some(f) => f,
             None => {
                 restore_irq(irq);
@@ -1165,12 +1166,12 @@ fn syscall_sigreturn(frame_ptr: u64) -> SyscallResult {
             }
         };
 
-        if frame.magic != SIGFRAME_MAGIC {
+        if frame.magic != NOTIFFRAME_MAGIC {
             restore_irq(irq);
             return SyscallResult::err(SyscallError::InvalidArgument);
         }
 
-        // Restore FPU state from the signal frame. The signal handler may
+        // Restore FPU state from the notification frame. The handler may
         // have used FPU/SSE/NEON and corrupted the thread's FPU context.
         if frame.fpu_saved == 1 {
             (*current).fpu_state.data.copy_from_slice(&frame.fpu_state);
@@ -1179,7 +1180,7 @@ fn syscall_sigreturn(frame_ptr: u64) -> SyscallResult {
             crate::arch::fpu::disown_if_current(current as *mut u8);
         }
 
-        // Restore user registers from the signal frame
+        // Restore user registers from the notification frame
         #[cfg(target_arch = "x86_64")]
         {
             let kst = (*current).kernel_stack_top as *mut u64;
@@ -1216,7 +1217,7 @@ fn syscall_sigreturn(frame_ptr: u64) -> SyscallResult {
 }
 
 /// Handle a Call syscall that was interrupted by a bound notification.
-/// Injects a signal frame if a dispatcher is registered, otherwise
+/// Injects a notification frame if a dispatcher is registered, otherwise
 /// returns Interrupted directly.
 ///
 /// # Safety
@@ -1237,9 +1238,9 @@ unsafe fn handle_call_interrupted(
     intr: u8,
 ) -> SyscallResult {
     unsafe {
-        let dispatcher = (*tcb).signal_dispatcher;
+        let dispatcher = (*tcb).notification_dispatcher;
         if dispatcher != 0 {
-            if let Some(result) = inject_signal_frame(tcb, dispatcher, cap_ptr, msg_info) {
+            if let Some(result) = inject_notif_frame(tcb, dispatcher, cap_ptr, msg_info) {
                 restore_irq(irq);
                 return result;
             }
@@ -2023,8 +2024,8 @@ fn syscall_invoke_inner(
             syscall_tcb_set_tls_base(&cap, arg0)
         }
         (ObjectType::Tcb, 0x4E) => {
-            // TCB_SET_SIGNAL_DISPATCHER: arg0 = dispatcher address
-            syscall_tcb_set_signal_dispatcher(&cap, arg0)
+            // TCB_SET_NOTIFICATION_DISPATCHER: arg0 = dispatcher address
+            syscall_tcb_set_notification_dispatcher(&cap, arg0)
         }
 
         // VSpace operations
@@ -3219,10 +3220,10 @@ fn syscall_tcb_set_tls_base(cap: &Capability, tls_base: u64) -> SyscallResult {
     SyscallResult::ok(0)
 }
 
-/// TCB_SET_SIGNAL_DISPATCHER: Set the user-mode signal dispatcher entry
-/// point for a thread. When non-zero, the kernel injects a signal frame
-/// and redirects control to this address instead of returning EINTR.
-fn syscall_tcb_set_signal_dispatcher(cap: &Capability, dispatcher: u64) -> SyscallResult {
+/// TCB_SET_NOTIFICATION_DISPATCHER: Set the user-mode notification dispatcher
+/// entry point for a thread. When non-zero, the kernel injects a notification
+/// frame and redirects control to this address instead of returning EINTR.
+fn syscall_tcb_set_notification_dispatcher(cap: &Capability, dispatcher: u64) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::CONFIGURE) {
         return SyscallResult::err(e);
     }
@@ -3240,7 +3241,7 @@ fn syscall_tcb_set_signal_dispatcher(cap: &Capability, dispatcher: u64) -> Sysca
         let irq = save_irq_disable();
         let tcb = &mut *(cap.object as *mut Tcb);
         tcb.tcb_lock();
-        tcb.signal_dispatcher = dispatcher;
+        tcb.notification_dispatcher = dispatcher;
         tcb.tcb_unlock();
         restore_irq(irq);
     }
@@ -5367,7 +5368,7 @@ pub fn handle(
         Syscall::ReplyRecvAnyTimed => {
             syscall_reply_recv_any_timed(cap_ptr, msg_info, mr0, mr1, mr2, mr3)
         }
-        Syscall::Sigreturn => syscall_sigreturn(cap_ptr),
+        Syscall::NotifReturn => syscall_notif_return(cap_ptr),
     }
 }
 

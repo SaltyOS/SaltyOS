@@ -10,12 +10,14 @@ use crate::net::checksum;
 use crate::net::proto::ipv4::{self, Ipv4Header, PROTO_TCP};
 use crate::net::proto::tcp as tcp_proto;
 use crate::net::socket::options::{self, SocketOptions};
-use trona::consts::{
-    TRONA_CONN_REFUSED, TRONA_INVALID_ARGUMENT, TRONA_NOT_CONNECTED, TRONA_OK,
-    TRONA_TIMED_OUT, INET_OP_ACCEPT, INET_OP_CONNECT, INET_OP_RECV, SOCK_STREAM,
-    SYS_CLOCK_GETTIME, SYS_GETRANDOM,
+use trona::consts::kernel::{SYS_CLOCK_GETTIME, SYS_GETRANDOM, TRONA_INVALID_ARGUMENT, TRONA_OK};
+use trona::consts::posix::SOCK_STREAM;
+use trona::consts::server::{
+    INET_OP_ACCEPT, INET_OP_CONNECT, INET_OP_RECV, TRONA_CONN_REFUSED, TRONA_NOT_CONNECTED,
+    TRONA_TIMED_OUT,
 };
-use trona::types::Timespec;
+use trona_posix::consts::*;
+use trona::types::core::Timespec;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1012,7 +1014,7 @@ pub(crate) fn tcp_getsockopt(conn_id: u32, level: i32, optname: i32) -> Result<(
         options::get_option(
             &mut tcb.opts,
             SOCK_STREAM,
-            trona::consts::IPPROTO_TCP,
+            trona::consts::posix::IPPROTO_TCP,
             level,
             optname,
         )

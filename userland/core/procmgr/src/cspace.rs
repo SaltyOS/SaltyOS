@@ -2,7 +2,7 @@
 //! Extracted from main.rs for separation of concerns.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::types::*;
+use trona::types::core::*;
 
 use crate::proc_table::{alloc_proc, find_by_badge, proctab, proctab_cap, NEXT_PID, PROC_RUNNING};
 
@@ -362,10 +362,12 @@ pub(crate) unsafe fn handle_register(msg: &TronaMsg, reply: &mut TronaMsg, _badg
             }
         };
 
+        proctab(ci).set_posix_personality();
         proctab(ci).pid = NEXT_PID;
         NEXT_PID += 1;
-        proctab(ci).sid = proctab(ci).pid;
-        proctab(ci).pgid = proctab(ci).pid;
+        let new_pid = proctab(ci).pid;
+        proctab(ci).posix_mut().sid = new_pid;
+        proctab(ci).posix_mut().pgid = new_pid;
         proctab(ci).badge = reg_badge;
         proctab(ci).state = PROC_RUNNING;
         proctab(ci).cnode_cap = cn_perm;

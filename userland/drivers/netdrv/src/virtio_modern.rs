@@ -4,16 +4,18 @@
 //! Discovers modern virtio-net devices (device ID 0x1041) and locates register
 //! regions via PCI vendor-specific capabilities.
 
-use trona::consts::*;
-use trona::ipc;
+use trona::consts::kernel::*;
+use trona::consts::server::*;
 use trona::invoke;
-use trona::types::*;
+use trona::ipc;
+use trona::protocol::*;
+use trona::types::core::*;
 
 use crate::ipc_ctx;
 
 const CAP_SELF_VSPACE: u64 = 1;
 const CAP_SELF_CSPACE: u64 = 2;
-const CAP_PCISRV_EP: u64 = 64;
+const CAP_PCIDRV_EP: u64 = 64;
 const CAP_MMSRV_EP: u64 = 7;
 
 /// Modern virtio-net PCI device ID (non-transitional)
@@ -86,7 +88,7 @@ pub(crate) static mut MODERN_LAYOUT: Option<VirtioModernLayout> = None;
 static mut QUEUE_NOTIFY_OFFS: [u16; 2] = [0; 2];
 
 // ---------------------------------------------------------------------------
-// PCI config space read via pcisrv IPC
+// PCI config space read via pcidrv IPC
 // ---------------------------------------------------------------------------
 
 fn pci_config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
@@ -99,7 +101,7 @@ fn pci_config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     msg.regs[3] = offset as u64;
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCIDRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return 0xFFFF_FFFF;
     }
@@ -110,7 +112,7 @@ fn pci_config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
 // Device discovery
 // ---------------------------------------------------------------------------
 
-/// Query pcisrv for modern virtio-net device (device ID 0x1041).
+/// Query pcidrv for modern virtio-net device (device ID 0x1041).
 pub(crate) fn find_virtio_net_modern() -> Option<(u8, u8, u8)> {
     let mut msg = TronaMsg::zeroed();
     msg.label = PCI_FIND_DEVICE;
@@ -119,7 +121,7 @@ pub(crate) fn find_virtio_net_modern() -> Option<(u8, u8, u8)> {
     msg.regs[1] = VIRTIO_NET_MODERN_DEVICE as u64;
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCIDRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
     }
@@ -147,7 +149,7 @@ fn map_bar(bus: u8, dev: u8, func: u8, bar_idx: u8) -> Option<(u64, u32)> {
     }
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCIDRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
     }

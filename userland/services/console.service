@@ -7,9 +7,9 @@ PreProcmgr=yes
 
 [Dependencies]
 After=
-Before=procmgr nameserv vfs
+Before=procmgr namesrv vfs
 
 [Capabilities]
 CopyCap.aarch64=8:64 9:65 10:66
 CopyCap.x86_64=8:64 9:65 10:66 6:69 7:70
-NeedEP=ttyd:67 display:68
+NeedEP=posix_ttysrv:67 dispdrv:68

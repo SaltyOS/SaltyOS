@@ -674,8 +674,8 @@ extern "C" fn el0_sync_handler(frame: *mut ExceptionFrame) {
                 return;
             }
 
-            // Fast-path didn't resolve — fall through to IPC fault delivery.
-            log_el0_sync_state("[EXCEPTION] EL0 data abort:", frame, None, esr, Some(far));
+            // Fast-path didn't resolve — deliver the recoverable VM fault to
+            // userspace without logging it as a fatal-looking exception.
             let elr = unsafe { (*frame).elr_el1 };
             let ipc_ec = fault.to_ipc_error_code(false);
             finish_el0_fault(&crate::ipc::vm_fault_message(far, ipc_ec, elr, false));
@@ -720,8 +720,8 @@ extern "C" fn el0_sync_handler(frame: *mut ExceptionFrame) {
                 return;
             }
 
-            // Fast-path didn't resolve — fall through to IPC fault delivery.
-            log_el0_sync_state("[EXCEPTION] EL0 instruction abort:", frame, None, esr, Some(far));
+            // Fast-path didn't resolve — deliver the recoverable VM fault to
+            // userspace without logging it as a fatal-looking exception.
             let elr = unsafe { (*frame).elr_el1 };
             let ipc_ec = fault.to_ipc_error_code(true);
             finish_el0_fault(&crate::ipc::vm_fault_message(far, ipc_ec, elr, true));

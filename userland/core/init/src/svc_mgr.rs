@@ -3,7 +3,7 @@
 
 use crate::ini::{ServiceDef, RestartPolicy};
 
-pub const MAX_SERVICES: usize = 16;
+pub const MAX_SERVICES: usize = 32;
 const MAX_RESTARTS: u16 = 5;
 
 
@@ -60,7 +60,7 @@ pub struct ServiceManager {
     pub services: [ServiceInstance; MAX_SERVICES],
     pub count: usize,
     // Dependency adjacency matrix: adj[i] has bit j set => service i depends on j (i.e., i After j)
-    adj: [u16; MAX_SERVICES],
+    adj: [u32; MAX_SERVICES],
     pub boot_order: [u8; MAX_SERVICES],
     pub boot_order_len: usize,
 }
@@ -118,7 +118,7 @@ impl ServiceManager {
                 let dep_idx = self.find_dep_name(dep_name);
                 if dep_idx >= 0 {
                     // i depends on dep_idx
-                    self.adj[i] |= 1u16 << dep_idx;
+                    self.adj[i] |= 1u32 << dep_idx;
                 }
             }
 
@@ -128,7 +128,7 @@ impl ServiceManager {
                 let dep_idx = self.find_dep_name(dep_name);
                 if dep_idx >= 0 {
                     // dep_idx depends on i
-                    self.adj[dep_idx as usize] |= 1u16 << i;
+                    self.adj[dep_idx as usize] |= 1u32 << i;
                 }
             }
         }
@@ -155,13 +155,13 @@ impl ServiceManager {
         // Compute in-degree for each node
         let mut in_degree = [0u8; MAX_SERVICES];
         // Work copy of adjacency
-        let mut adj_work = [0u16; MAX_SERVICES];
+        let mut adj_work = [0u32; MAX_SERVICES];
         for i in 0..n {
             adj_work[i] = self.adj[i];
         }
         for i in 0..n {
             for j in 0..n {
-                if adj_work[i] & (1u16 << j) != 0 {
+                if adj_work[i] & (1u32 << j) != 0 {
                     in_degree[i] += 1;
                 }
             }
@@ -188,8 +188,8 @@ impl ServiceManager {
 
             // For all nodes that depend on `node`, decrement in_degree
             for i in 0..n {
-                if adj_work[i] & (1u16 << node) != 0 {
-                    adj_work[i] &= !(1u16 << node);
+                if adj_work[i] & (1u32 << node) != 0 {
+                    adj_work[i] &= !(1u32 << node);
                     in_degree[i] -= 1;
                     if in_degree[i] == 0 {
                         queue[q_tail] = i as u8;
@@ -260,7 +260,7 @@ impl ServiceManager {
         }
         let deps = self.adj[idx];
         for j in 0..self.count {
-            if deps & (1u16 << j) != 0 {
+            if deps & (1u32 << j) != 0 {
                 if self.services[j].state != ServiceState::Running {
                     return false;
                 }

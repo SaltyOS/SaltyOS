@@ -8,20 +8,19 @@
 
 mod alloc;
 mod cspace;
-mod exit_wait;
 mod fork_exec;
+mod posix;
 mod proc_table;
-mod session;
-mod signal;
+mod readiness;
 mod spawn_tx;
-mod timer;
 mod vfs_load;
 
 use trona::ipc;
-use trona::types::*;
+use trona::protocol::*;
+use trona::types::core::*;
 
 use proc_table::{
-    find_by_badge, find_by_pid, init_proctab, proctab, proctab_cap, MAX_EXE_PATH_LEN,
+    find_by_badge, find_by_pid, init_proctab, proctab, proctab_cap,
     MAX_NAME_LEN, PROC_FREE,
 };
 
@@ -31,7 +30,7 @@ const CAP_SELF_VSPACE: Cap = 1;
 const CAP_SELF_CSPACE: Cap = 2;
 const CAP_SERVER_EP: Cap = 3;
 const CAP_UNTYPED: Cap = 7;
-const CAP_NAMESERV_EP: Cap = 64; // NeedEP nameserv:64
+const CAP_NAMESRV_EP: Cap = 64; // NeedEP namesrv:64
 const CAP_VFS_EP: Cap = 65; // NeedEP vfs:65
 const CAP_FB_UNTYPED: Cap = 66; // CopyCap 13:66
 const CAP_INITRD_UNTYPED: Cap = 12;
@@ -41,51 +40,7 @@ const CAP_UNTYPED_START: Cap = 16;
 
 const VSPACE_WALK_BATCH: u64 = 48;
 
-// ---- Protocol labels ----
-const PM_SPAWN: u64 = 1;
-const PM_EXIT: u64 = 2;
-const PM_WAIT: u64 = 3;
-const PM_GETPID: u64 = 4;
-const PM_FORK: u64 = 5;
-const PM_EXEC: u64 = 6;
-const PM_GETPPID: u64 = 7;
-const PM_KILL: u64 = 8;
-const PM_SIGACTION: u64 = 9;
-const PM_GETUID: u64 = 10;
-const PM_GETGID: u64 = 11;
-const PM_SETPGID: u64 = 12;
-const PM_GETPGID: u64 = 13;
-const PM_SETSID: u64 = 14;
-const PM_GETEUID: u64 = 15;
-const PM_GETEGID: u64 = 16;
-const PM_GETGROUPS: u64 = 17;
-const PM_EXPAND_CSPACE: u64 = 18;
-const PM_EXPAND_CSPACE_ASYNC: u64 = 19;
-const PM_EXPAND_COLLECT: u64 = 20;
-const PM_REGISTER: u64 = 21;
-const PM_GETSID: u64 = 22;
-const PM_GETPGID_BADGE: u64 = 23;
-const PM_GETSID_BADGE: u64 = 24;
-const PM_KILL_PGID: u64 = 25;
-const PM_INJECT_CAP: u64 = 26;
-const PM_LIST_PIDS: u64 = 27;
-const PM_GET_PROC_INFO: u64 = 28;
-const PM_RESUME: u64 = 29;
-const PM_UMASK: u64 = 30;
-const PM_REQUEST_UNTYPED: u64 = 31;
-const PM_SETITIMER: u64 = 32;
-const PM_GETITIMER: u64 = 33;
-const PM_GET_EXE_PATH: u64 = 34;
 const TRONA_PENDING: u64 = 0x80;
-
-const PM_SIGKILL: usize = 9;
-const PM_SIGALRM: usize = 14;
-const PM_SIGCHLD: usize = 17;
-const PM_SIGCONT: usize = 18;
-const PM_SIGSTOP: usize = 19;
-const PM_SIGTSTP: usize = 20;
-const PM_SIGTTIN: usize = 21;
-const PM_SIGTTOU: usize = 22;
 
 use trona::layout::{self};
 
@@ -98,15 +53,16 @@ const CHILD_CAP_VSPACE: u64 = 1;
 const CHILD_CAP_CSPACE: u64 = 2;
 const CHILD_CAP_EP: u64 = 3;
 const CHILD_CAP_VFS: u64 = 4;
-const CHILD_CAP_NAMESERV: u64 = 5;
+const CHILD_CAP_NAMESRV: u64 = 5;
 const CHILD_CAP_SIGNAL_NTFN: u64 = 6;
 const CHILD_CAP_MMSRV_EP: u64 = 7;
 const CHILD_CAP_READINESS_NTFN: u64 = 14;
 const CHILD_CAP_SERVICE_EP: u64 = 68; // Pre-created service EP
+const CHILD_CAP_WIN32SRV_EP: u64 = 69; // win32/csrss EP for PE processes
 const CAP_READINESS_NTFN: u64 = 14; // Self readiness notification
 const READY_SIGNAL_BITS: u64 = 1;
 const READY_TIMEOUT_NS_DEFAULT: u64 = 10_000_000_000; // 10s
-const READY_WAIT_YIELDS_FALLBACK: usize = 200_000;
+const READY_POLL_QUANTUM_NS: u64 = 1_000_000; // 1ms
 
 // ---- Auxiliary vector types ----
 const AT_NULL: u64 = 0;
@@ -126,10 +82,12 @@ const AT_TRONA_SLOT_BASE: u64 = 0x1007;
 const AT_TRONA_SLOT_COUNT: u64 = 0x1008;
 const AT_TRONA_CSPACE_NTFN: u64 = 0x100A;
 const AT_TRONA_MM_EP: u64 = 0x100B;
-
-// ---- waitpid options ----
-const WNOHANG: u32 = 1;
-const WUNTRACED: u32 = 2;
+const AT_TRONA_IPC_BUFFER: u64 = 0x100C;
+const AT_SALTYOS_PE_BASE: u64 = 0x2000;
+const AT_SALTYOS_PE_SIZE: u64 = 0x2001;
+const AT_SALTYOS_WIN32SRV: u64 = 0x2002;
+const AT_SALTYOS_KERNEL32_BASE: u64 = 0x2003;
+const AT_SALTYOS_KERNEL32_SIZE: u64 = 0x2004;
 
 // ---- Shorthand re-exports ----
 const OBJ_TCB: u64 = trona::OBJ_TCB;
@@ -163,6 +121,8 @@ const CSPACE_EXPAND_BITS: u64 = 10; // 1024 slots per expansion sub-CNode
 
 /// Procmgr's bound notification cap (for receiving CSpace expansion signals).
 static mut PM_BOUND_NTFN: Cap = 0;
+/// TCB to resume after the current caller has been replied to.
+static mut POST_REPLY_RESUME_TCB: Cap = 0;
 
 /// mmsrv endpoint cap (via NeedEP=mmsrv:67).
 const CAP_MMSRV_EP: Cap = 67;
@@ -192,6 +152,7 @@ pub(crate) fn ipc_ctx() -> *mut IpcContext {
 fn signal_ready() {
     let _ = trona::syscall::syscall(trona::SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
 }
+
 
 fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -237,81 +198,6 @@ fn extract_name(msg: &TronaMsg, name_reg_idx: usize) -> ([u8; MAX_NAME_LEN + 5],
     name_len = strip_elf_suffix(&mut name, name_len);
     name[name_len] = 0;
     (name, name_len)
-}
-
-unsafe fn wait_for_child_ready(
-    child_tcb: Cap,
-    ready_ntfn: Cap,
-    child_name: &[u8],
-    timeout_ns: u64,
-) -> i32 {
-    let start_ns = {
-        let now = trona::syscall::syscall(trona::SYS_CLOCK_GETTIME, 1, 0, 0, 0, 0, 0);
-        if now.error == 0 {
-            Some(now.value)
-        } else {
-            None
-        }
-    };
-    let mut yields: usize = 0;
-
-    loop {
-        let poll = trona::syscall::syscall(trona::SYS_POLL, ready_ntfn, 0, 0, 0, 0, 0);
-        if poll.error == 0 {
-            if (poll.value & READY_SIGNAL_BITS) != 0 {
-                return 0;
-            }
-        } else if poll.error != TRONA_WOULD_BLOCK {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[PROCMGR] ready poll failed err=");
-                _lb.hex(poll.error);
-                _lb.str(b"\n");
-            });
-            let _ = trona::invoke::tcb_suspend_retry(child_tcb, 4);
-            return -1;
-        }
-
-        // Service CSpace expansion requests during child startup by polling
-        // the bound notification. Without this, a child that needs CSpace
-        // expansion before signaling readiness would deadlock.
-        unsafe {
-            let bound_ntfn = *(&raw const PM_BOUND_NTFN);
-            if bound_ntfn != 0 {
-                let np = trona::syscall::syscall(trona::SYS_POLL, bound_ntfn, 0, 0, 0, 0, 0);
-                if np.error == 0 && np.value != 0 {
-                    let cs_bits = (np.value >> 16) & 0xFFFF;
-                    if cs_bits != 0 {
-                        cspace::handle_cspace_expand_ntfn(cs_bits);
-                    }
-                }
-            }
-        }
-
-        let timed_out = if let Some(start) = start_ns {
-            let now = trona::syscall::syscall(trona::SYS_CLOCK_GETTIME, 1, 0, 0, 0, 0, 0);
-            if now.error == 0 {
-                now.value.saturating_sub(start) >= timeout_ns
-            } else {
-                yields >= READY_WAIT_YIELDS_FALLBACK
-            }
-        } else {
-            yields >= READY_WAIT_YIELDS_FALLBACK
-        };
-        if timed_out {
-            break;
-        }
-
-        let _ = trona::syscall::syscall(trona::SYS_YIELD, 0, 0, 0, 0, 0, 0);
-        yields += 1;
-    }
-
-    trona::uerror!(|_lb| {
-        _lb.str(b"[PROCMGR] child ready timeout: ");
-        _lb.bytes(child_name);
-        _lb.str(b"\n");
-    });
-    let _ = trona::invoke::tcb_suspend_retry(child_tcb, 4);
-    -1
 }
 
 // ===========================================================================
@@ -362,18 +248,27 @@ unsafe fn recv_with_timer(
     badge: *mut u64,
 ) -> i32 {
     unsafe {
-        if timer::has_pending_timers() {
+        let has_timers = posix::timer::has_pending_timers();
+        let has_readiness = readiness::has_pending_readiness();
+        if has_timers || has_readiness {
             let now = trona::syscall::syscall(
                 trona::SYS_CLOCK_GETTIME,
                 trona::consts::CLOCK_REALTIME as u64,
-                0,
-                0,
-                0,
-                0,
-                0,
+                0, 0, 0, 0, 0,
             );
             if now.error == 0 {
-                let deadline = timer::nearest_deadline_ns();
+                let timer_deadline = if has_timers {
+                    posix::timer::nearest_deadline_ns()
+                } else {
+                    u64::MAX
+                };
+                let ready_deadline = if has_readiness {
+                    readiness::nearest_readiness_deadline_ns()
+                } else {
+                    u64::MAX
+                };
+                let deadline = timer_deadline.min(ready_deadline);
+
                 if deadline <= now.value {
                     if !msg.is_null() {
                         *msg = TronaMsg::zeroed();
@@ -384,7 +279,13 @@ unsafe fn recv_with_timer(
                     return 0;
                 }
 
-                let timeout = deadline.saturating_sub(now.value).max(100_000);
+                let mut timeout = deadline.saturating_sub(now.value).max(100_000);
+                // Child readiness notifications are polled, not bound to procmgr's
+                // TCB, so they do not wake recv_timed directly. Cap the sleep so the
+                // main loop periodically re-polls readiness even when no IPC arrives.
+                if has_readiness {
+                    timeout = timeout.min(READY_POLL_QUANTUM_NS);
+                }
                 let err = trona::ipc::recv_timed_ctx(
                     ipc_ctx(),
                     CAP_SERVER_EP,
@@ -403,9 +304,78 @@ unsafe fn recv_with_timer(
                 }
                 return err;
             }
+
+            // If the clock read failed, keep making progress on deferred timers /
+            // readiness with a short timed receive instead of blocking forever.
+            let timeout = if has_readiness {
+                READY_POLL_QUANTUM_NS
+            } else {
+                100_000
+            };
+            let err = trona::ipc::recv_timed_ctx(
+                ipc_ctx(),
+                CAP_SERVER_EP,
+                timeout,
+                msg,
+                badge,
+            );
+            if err as u64 == TRONA_CANCELLED {
+                if !msg.is_null() {
+                    *msg = TronaMsg::zeroed();
+                }
+                if !badge.is_null() {
+                    *badge = 1;
+                }
+                return 0;
+            }
+            return err;
         }
 
         trona::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, msg, badge)
+    }
+}
+
+unsafe fn run_post_reply_work() {
+    unsafe {
+        let tcb = POST_REPLY_RESUME_TCB;
+        if tcb == 0 {
+            return;
+        }
+
+        let mut pid = 0u32;
+        for i in 0..proctab_cap() {
+            if proctab(i).state != PROC_FREE && proctab(i).tcb_cap == tcb {
+                pid = proctab(i).pid;
+                break;
+            }
+        }
+
+        POST_REPLY_RESUME_TCB = 0;
+        trona::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] deferred resume begin pid=");
+            _lb.hex(pid as u64);
+            _lb.str(b" tcb=");
+            _lb.hex(tcb);
+            _lb.str(b"\n");
+        });
+        let err = trona::invoke::tcb_resume(tcb);
+        if err != 0 {
+            trona::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] deferred resume failed err=");
+                _lb.hex(err as u64);
+                _lb.str(b" tcb=");
+                _lb.hex(tcb);
+                _lb.str(b"\n");
+            });
+        } else {
+            trona::udebug!(|_lb| {
+                _lb.str(b"[PROCMGR] deferred resume ok pid=");
+                _lb.hex(pid as u64);
+                _lb.str(b" tcb=");
+                _lb.hex(tcb);
+                _lb.str(b"\n");
+            });
+        }
     }
 }
 
@@ -423,8 +393,8 @@ unsafe fn handle_get_proc_info(msg: &TronaMsg, reply: &mut TronaMsg) {
         let p = &*proc_table::proctab(idx);
         reply.regs[0] = p.pid as u64;
         reply.regs[1] = p.ppid as u64;
-        reply.regs[2] = p.pgid as u64;
-        reply.regs[3] = p.sid as u64;
+        reply.regs[2] = p.posix().pgid as u64;
+        reply.regs[3] = p.posix().sid as u64;
         reply.regs[4] = p.state as u64;
         // Pack name (32 bytes = 4 u64s) into regs[5..9]
         let dst = &mut reply.regs[5] as *mut u64 as *mut u8;
@@ -436,70 +406,7 @@ unsafe fn handle_get_proc_info(msg: &TronaMsg, reply: &mut TronaMsg) {
     }
 }
 
-unsafe fn handle_get_exe_path(msg: &TronaMsg, reply: &mut TronaMsg) {
-    unsafe {
-        let pid = msg.regs[0] as u32;
-        let Some(idx) = proc_table::find_by_pid(pid) else {
-            trona::udebug!(|_lb| {
-                _lb.str(b"[PROCMGR] GET_EXE_PATH pid=");
-                _lb.hex(pid as u64);
-                _lb.str(b" -> not found\n");
-            });
-            reply.label = TRONA_NOT_FOUND;
-            return;
-        };
 
-        let p = &*proc_table::proctab(idx);
-        let mut exe_len = 0usize;
-        while exe_len < MAX_EXE_PATH_LEN && p.exe_path[exe_len] != 0 {
-            exe_len += 1;
-        }
-        if exe_len == 0 {
-            trona::udebug!(|_lb| {
-                _lb.str(b"[PROCMGR] GET_EXE_PATH pid=");
-                _lb.hex(pid as u64);
-                _lb.str(b" -> empty\n");
-            });
-            reply.label = TRONA_NOT_FOUND;
-            return;
-        }
-
-        trona::udebug!(|_lb| {
-            _lb.str(b"[PROCMGR] GET_EXE_PATH pid=");
-            _lb.hex(pid as u64);
-            _lb.str(b" -> '");
-            _lb.bytes(&p.exe_path[..exe_len]);
-            _lb.str(b"'\n");
-        });
-
-        reply.regs[0] = exe_len as u64;
-        let dst = &mut reply.regs[1] as *mut u64 as *mut u8;
-        for i in 0..exe_len {
-            *dst.add(i) = p.exe_path[i];
-        }
-        reply.label = TRONA_OK;
-        reply.length = 1 + ((exe_len as u64 + 7) / 8);
-    }
-}
-
-// ===========================================================================
-// handle_umask
-// ===========================================================================
-
-unsafe fn handle_umask(msg: &TronaMsg, reply: &mut TronaMsg, badge: u64) {
-    let Some(idx) = find_by_badge(badge) else {
-        reply.label = TRONA_NOT_FOUND;
-        return;
-    };
-    unsafe {
-        let p = proctab(idx);
-        let old = p.umask;
-        p.umask = (msg.regs[0] as u32) & 0o777;
-        reply.label = TRONA_OK;
-        reply.length = 1;
-        reply.regs[0] = old as u64;
-    }
-}
 
 // ===========================================================================
 // handle_request_untyped
@@ -624,7 +531,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 );
                 let mut mm_msg = trona::types::TronaMsg::zeroed();
                 let mut mm_reply = trona::types::TronaMsg::zeroed();
-                mm_msg.label = trona::MM_ALLOC_OBJECT;
+                mm_msg.label = trona::protocol::MM_ALLOC_OBJECT;
                 mm_msg.length = 2;
                 mm_msg.regs[0] = OBJ_NOTIFICATION;
                 mm_msg.regs[1] = 0;
@@ -656,16 +563,16 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             }
         }
 
-        // Signal ready BEFORE registration — init needs to proceed to spawn nameserv.
-        // The registration Call will block in the EP send queue until nameserv starts.
+        // Signal ready BEFORE registration — init needs to proceed to spawn namesrv.
+        // The registration Call will block in the EP send queue until namesrv starts.
         signal_ready();
 
-        // Register with nameserv — blocks until nameserv Recv()s
-        if CAP_NAMESERV_EP != 0 {
+        // Register with namesrv — blocks until namesrv Recv()s
+        if CAP_NAMESRV_EP != 0 {
             let mut reg_msg = TronaMsg::zeroed();
             let mut reg_reply = TronaMsg::zeroed();
             let svc_name = b"procmgr";
-            reg_msg.label = trona::consts::POSIX_NS_REGISTER;
+            reg_msg.label = trona::protocol::NS_REGISTER;
             reg_msg.regs[0] = svc_name.len() as u64;
             reg_msg.length = 1 + (svc_name.len() as u64 + 7) / 8;
             let dst = &raw mut reg_msg.regs[1] as *mut u8;
@@ -677,17 +584,17 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
             let err = ipc::call_ctx(
                 ipc_ctx(),
-                CAP_NAMESERV_EP,
+                CAP_NAMESRV_EP,
                 &raw const reg_msg,
                 &raw mut reg_reply,
             );
             if err == 0 && reg_reply.label == TRONA_OK {
                 trona::uinfo!(|_lb| {
-                    _lb.str(b"[PROCMGR] registered with nameserv\n");
+                    _lb.str(b"[PROCMGR] registered with namesrv\n");
                 });
             } else {
                 trona::uwarn!(|_lb| {
-                    _lb.str(b"[PROCMGR] WARN: nameserv registration failed\n");
+                    _lb.str(b"[PROCMGR] WARN: namesrv registration failed\n");
                 });
             }
         }
@@ -709,7 +616,8 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
         // Server loop
         loop {
-            timer::process_expired_timers();
+            posix::timer::process_expired_timers();
+            readiness::check_pending_readiness();
 
             let mut reply = TronaMsg::zeroed();
             let mut skip_reply = false;
@@ -723,45 +631,38 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 }
                 skip_reply = true;
             } else {
+                // Try POSIX subsystem dispatch first (includes subsystem guard).
+                if let Some(posix_skip) = posix::dispatch_posix(msg.label, &msg, &mut reply, badge) {
+                    if !posix::is_posix_caller(badge) {
+                        reply.label = TRONA_INVALID_OPERATION;
+                    } else {
+                        skip_reply = posix_skip;
+                    }
+                } else {
+                // Subsystem-neutral handlers
                 match msg.label {
-                    PM_SPAWN => spawn_tx::handle_spawn_tx(
-                        &msg,
-                        &mut reply,
-                        badge,
-                        &mut *(&raw mut ALLOCATOR),
-                    ),
-                    PM_EXIT => {
-                        exit_wait::handle_exit(&msg, &mut reply, badge);
-                        skip_reply = true;
-                    }
-                    PM_WAIT => {
-                        skip_reply = exit_wait::handle_wait(&msg, &mut reply, badge);
-                    }
-                    PM_GETPID => handle_getpid(&mut reply, badge),
-                    PM_FORK => fork_exec::handle_fork(&msg, &mut reply, badge),
-                    PM_EXEC => {
-                        fork_exec::handle_exec(&msg, &mut reply, badge);
-                        if reply.label == 0 {
+                    PM_SPAWN => {
+                        if spawn_tx::handle_spawn_tx(
+                            &msg,
+                            &mut reply,
+                            badge,
+                            &mut *(&raw mut ALLOCATOR),
+                        ) {
                             skip_reply = true;
                         }
                     }
+                    PM_EXIT => {
+                        posix::exit_wait::handle_exit(&msg, &mut reply, badge);
+                        skip_reply = true;
+                    }
+                    PM_GETPID => handle_getpid(&mut reply, badge),
                     PM_GETPPID => handle_getppid(&mut reply, badge),
-                    PM_KILL => signal::handle_kill(&msg, &mut reply, badge),
-                    PM_KILL_PGID => signal::handle_kill_pgid(&msg, &mut reply),
-                    PM_INJECT_CAP => signal::handle_inject_cap(&msg, &mut reply),
-                    PM_RESUME => signal::handle_resume(&msg, &mut reply),
-                    PM_SIGACTION => signal::handle_sigaction(&msg, &mut reply, badge),
-                    PM_SETITIMER => timer::handle_setitimer(&msg, &mut reply, badge),
-                    PM_GETITIMER => timer::handle_getitimer(&msg, &mut reply, badge),
-                    PM_GETUID => session::handle_getuid(&mut reply, badge),
-                    PM_GETGID => session::handle_getgid(&mut reply, badge),
-                    PM_SETPGID => session::handle_setpgid(&msg, &mut reply, badge),
-                    PM_GETPGID => session::handle_getpgid(&msg, &mut reply, badge),
-                    PM_SETSID => session::handle_setsid(&mut reply, badge),
-                    PM_GETSID => session::handle_getsid(&msg, &mut reply, badge),
-                    PM_GETEUID => session::handle_geteuid(&mut reply, badge),
-                    PM_GETEGID => session::handle_getegid(&mut reply, badge),
-                    PM_GETGROUPS => session::handle_getgroups(&mut reply),
+                    PM_INJECT_CAP => posix::signal::handle_inject_cap(&msg, &mut reply),
+                    PM_RESUME => {
+                        if posix::signal::handle_resume(&msg, &mut reply) {
+                            skip_reply = true;
+                        }
+                    }
                     PM_EXPAND_CSPACE => cspace::handle_expand_cspace(&msg, &mut reply, badge),
                     PM_EXPAND_CSPACE_ASYNC => {
                         cspace::handle_expand_cspace_async(&msg, badge);
@@ -769,13 +670,21 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     }
                     PM_EXPAND_COLLECT => cspace::handle_expand_collect(&mut reply, badge),
                     PM_REGISTER => cspace::handle_register(&msg, &mut reply, badge),
-                    PM_GETPGID_BADGE => session::handle_getpgid_badge(&msg, &mut reply),
-                    PM_GETSID_BADGE => session::handle_getsid_badge(&msg, &mut reply),
                     PM_LIST_PIDS => handle_list_pids(&mut reply),
                     PM_GET_PROC_INFO => handle_get_proc_info(&msg, &mut reply),
-                    PM_GET_EXE_PATH => handle_get_exe_path(&msg, &mut reply),
-                    PM_UMASK => handle_umask(&msg, &mut reply, badge),
                     PM_REQUEST_UNTYPED => handle_request_untyped(&msg, &mut reply, &mut *(&raw mut ALLOCATOR)),
+                    PM_DUMP_PENDING => {
+                        trona::uinfo!(|_lb| {
+                            _lb.str(b"[PROCMGR] dump: POST_REPLY_RESUME_TCB=");
+                            _lb.hex(*(&raw const POST_REPLY_RESUME_TCB));
+                            _lb.str(b" has_timers=");
+                            _lb.dec(if posix::timer::has_pending_timers() { 1 } else { 0 });
+                            _lb.str(b" has_readiness=");
+                            _lb.dec(if readiness::has_pending_readiness() { 1 } else { 0 });
+                            _lb.str(b"\n");
+                        });
+                        reply.label = TRONA_OK;
+                    }
                     _ => {
                         trona::uerror!(|_lb| {
                             _lb.str(b"[PROCMGR] unknown label=");
@@ -785,6 +694,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                         reply.label = TRONA_INVALID_OPERATION;
                     }
                 }
+                } // end non-posix dispatch
             } // end else (notification vs IPC dispatch)
 
             trona::invoke::cnode_delete(CAP_SELF_CSPACE, CAP_RECV_SCRATCH);
@@ -792,7 +702,20 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
             let err = if skip_reply {
                 recv_with_timer(&raw mut msg, &raw mut badge)
-            } else if timer::has_pending_timers() {
+            } else if POST_REPLY_RESUME_TCB != 0
+                || posix::timer::has_pending_timers()
+                || readiness::has_pending_readiness()
+            {
+                let has_post_reply_resume = POST_REPLY_RESUME_TCB != 0;
+                if has_post_reply_resume {
+                    trona::udebug!(|_lb| {
+                        _lb.str(b"[PROCMGR] reply-before-post-work begin label=");
+                        _lb.hex(msg.label);
+                        _lb.str(b" badge=");
+                        _lb.hex(badge);
+                        _lb.str(b"\n");
+                    });
+                }
                 let save_err = trona::invoke::cnode_save_caller(CAP_SELF_CSPACE, CAP_REPLY_TEMP);
                 if save_err != 0 {
                     trona::uerror!(|_lb| {
@@ -803,6 +726,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     break;
                 }
                 let send_err = trona::ipc::send_ctx(ipc_ctx(), CAP_REPLY_TEMP, &raw const reply);
+                trona::invoke::cnode_delete(CAP_SELF_CSPACE, CAP_REPLY_TEMP);
                 if send_err != 0 {
                     trona::uerror!(|_lb| {
                         _lb.str(b"[PROCMGR] reply send failed before timed recv err=");
@@ -811,6 +735,16 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     });
                     break;
                 }
+                if has_post_reply_resume {
+                    trona::udebug!(|_lb| {
+                        _lb.str(b"[PROCMGR] reply-before-post-work sent label=");
+                        _lb.hex(msg.label);
+                        _lb.str(b" badge=");
+                        _lb.hex(badge);
+                        _lb.str(b"\n");
+                    });
+                }
+                run_post_reply_work();
                 recv_with_timer(&raw mut msg, &raw mut badge)
             } else {
                 trona::ipc::reply_recv_ctx(

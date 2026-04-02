@@ -1,14 +1,16 @@
 //! Process spawning helpers
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::consts::*;
+use trona::consts::kernel::*;
+use trona::consts::server::*;
+use trona::invoke;
+use trona::ipc;
+use trona::protocol::*;
+use trona::syscall;
+use trona::types::core::*;
 use trona_loader::cpio;
 use trona_loader::elf_dynamic;
 use trona_loader::elf_loader;
-use trona::invoke;
-use trona::ipc;
-use trona::syscall;
-use trona::types::*;
 
 #[derive(Clone, Copy)]
 pub struct ExtraCapCopy {
@@ -1748,7 +1750,7 @@ pub unsafe fn spawn_server(
         if procmgr_ep != 0 {
             let mut reg_msg = TronaMsg::zeroed();
             let mut reg_reply = TronaMsg::zeroed();
-            reg_msg.label = POSIX_PM_REGISTER;
+            reg_msg.label = PM_REGISTER;
             reg_msg.length = 2;
             reg_msg.regs[0] = spawn_badge;
             // Transfer child CNode cap so procmgr can access child's untyped
@@ -1829,7 +1831,7 @@ pub unsafe fn pm_spawn(
             spawn_flags |= SPAWN_FLAG_START_SUSPENDED;
         }
         let mut spawn_msg = TronaMsg::zeroed();
-        spawn_msg.label = POSIX_PM_SPAWN;
+        spawn_msg.label = PM_SPAWN;
         let packed_name_words = ((len as u64) + 7) / 8;
         let args_len = def.spawn_args_len as u64;
         let packed_args_words = (args_len + 7) / 8;
@@ -1863,7 +1865,7 @@ pub unsafe fn pm_spawn(
 pub unsafe fn pm_resume_child(pm_ep: Cap, pid: u32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
-        msg.label = POSIX_PM_RESUME;
+        msg.label = PM_RESUME;
         msg.length = 1;
         msg.regs[0] = pid as u64;
 
@@ -1882,7 +1884,7 @@ pub unsafe fn pm_resume_child(pm_ep: Cap, pid: u32) -> i32 {
 pub unsafe fn pm_inject_cap(pm_ep: Cap, pid: u32, dst_slot: u64, cap: Cap) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
-        msg.label = POSIX_PM_INJECT_CAP;
+        msg.label = PM_INJECT_CAP;
         msg.length = 2;
         msg.regs[0] = pid as u64;
         msg.regs[1] = dst_slot;

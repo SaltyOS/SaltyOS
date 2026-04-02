@@ -5,9 +5,9 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+use trona::consts::kernel::*;
 use trona::serial;
 use trona::serial::LineBuf;
-use trona::consts::*;
 use trona_posix::proc as posix;
 
 fn puts(s: &[u8]) {

@@ -1,8 +1,8 @@
-use crate::types::*;
 use crate::client::find_client_by_badge;
-use trona::consts::*;
+use crate::types::*;
+use trona::consts::kernel::*;
 use trona::invoke;
-use trona::types::*;
+use trona::types::core::*;
 
 pub(crate) unsafe fn find_shm_by_id(id: u64) -> *mut ShmObject {
     unsafe {

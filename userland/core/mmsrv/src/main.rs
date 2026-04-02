@@ -14,7 +14,12 @@
 //!   MM_MUNMAP      — client unmaps region
 //!   MM_MPROTECT    — client changes protection
 //!   MM_MAP_BATCH   — procmgr batch-maps frames for spawn
-//!   MM_MAP_WINDOW  — procmgr creates write window in caller's VSpace
+//!   MM_MAP_WINDOW  — procmgr opens write window for an existing client region
+//!   MM_ALLOC_PRIVATE_WINDOW — materialize region + open first write window
+//!   MM_ALLOC_INITRD_COPY — materialize region + populate it from initrd
+//!   MM_ALLOC_BOOTINFO_COPY — materialize region + populate it from bootinfo
+//!   MM_COPY_FROM_CLIENT_REGION — copy caller-owned region pages into client region
+//!   MM_ALLOC_PRIVATE_COPY_FROM_CLIENT_REGION — allocate region + copy caller pages
 //!   MM_UNMAP_WINDOW — procmgr removes write window
 //!   MM_SHM_CREATE  — VFS creates SHM object
 //!   MM_SHM_MAP     — VFS maps SHM into client
@@ -30,7 +35,7 @@
 //!   12 = initrd untyped
 //!   14 = readiness notification
 //!   16+ = mirrored parent untyped caps
-//!   64 = nameserv endpoint (via NeedEP)
+//!   64 = namesrv endpoint (via NeedEP)
 
 #![no_std]
 #![no_main]
@@ -41,10 +46,13 @@ mod mmap;
 mod pool;
 mod shm;
 
-use trona::consts::*;
+use trona::consts::kernel::*;
+use trona::consts::server::*;
 use trona::invoke;
 use trona::ipc;
-use trona::types::*;
+use trona::protocol::*;
+use trona::types::core::*;
+use trona_posix::consts::*;
 
 use types::*;
 
@@ -54,10 +62,20 @@ use types::*;
 
 const CAP_SERVER_EP: u64 = 3;
 const CAP_UNTYPED: u64 = 7;
+const CAP_INITRD_UNTYPED: u64 = 12;
 const CAP_READINESS_NTFN: u64 = 14;
 const CAP_UNTYPED_START: u64 = 16;
 const CAP_NAMESERV: u64 = 64;
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
+
+/// VFS pager callback EP: when set (non-zero), mmsrv routes VFS_PAGER_READ /
+/// VFS_PAGER_WRITE requests through this EP instead of the VFS service EP.
+/// This breaks the VFS↔MMSRV cycle by allowing VFS to receive pager requests
+/// on a dedicated callback EP while it's blocked on mmsrv's service EP.
+///
+/// The cap is transferred by VFS during registration (via a new label) or
+/// injected by init. Zero means not registered (use VFS service EP directly).
+static mut VFS_PAGER_CALLBACK_EP: Cap = 0;
 
 /// Receive slot pool: top of CSpace to avoid conflicts with slot_alloc.
 /// CNodeBits=16 → 65536 total slots. Reserve last 1024 for cap receives.
@@ -251,6 +269,9 @@ unsafe fn commit_mo_pages(mo_cap: Cap, offset: u64, count: u64) -> (i32, u64) {
                 *(&raw mut UT_HINT) = i;
             }
             if err != 0 && committed == 0 {
+                if err as u64 == TRONA_OUT_OF_MEMORY {
+                    deactivate_ut_source(i);
+                }
                 continue;
             }
             if remaining == 0 {
@@ -274,6 +295,9 @@ unsafe fn commit_mo_pages(mo_cap: Cap, offset: u64, count: u64) -> (i32, u64) {
                 *(&raw mut UT_HINT) = i;
             }
             if err != 0 && committed == 0 {
+                if err as u64 == TRONA_OUT_OF_MEMORY {
+                    deactivate_ut_source(i);
+                }
                 continue;
             }
             if remaining == 0 {
@@ -427,67 +451,10 @@ fn signal_ready() {
 // Lazy procmgr EP acquisition (for sub-untyped provisioning)
 // ---------------------------------------------------------------------------
 
-/// Cached procmgr endpoint cap (resolved lazily via nameserv lookup).
-static mut PROCMGR_EP: Cap = 0;
-/// Cached VFS endpoint cap (resolved lazily via nameserv lookup).
+/// Cached VFS endpoint cap (resolved lazily via namesrv lookup).
 static mut VFS_EP: Cap = 0;
 
-/// Look up the procmgr endpoint via nameserv and cache it.
-/// Returns the cap slot, or 0 on failure.
-unsafe fn resolve_procmgr_ep() -> Cap {
-    unsafe {
-        let cached = *(&raw const PROCMGR_EP);
-        if cached != 0 {
-            return cached;
-        }
-
-        // Allocate a slot to receive the procmgr EP
-        let ep_slot = match recycled_slot_alloc() {
-            Some(s) => s,
-            None => return 0,
-        };
-
-        // Configure receive slot for the EP transfer from nameserv
-        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, ep_slot, 0);
-
-        // Build POSIX_NS_LOOKUP request for "procmgr"
-        let name = b"procmgr";
-        let mut msg = TronaMsg::zeroed();
-        msg.label = POSIX_NS_LOOKUP;
-        msg.regs[0] = name.len() as u64;
-        msg.length = 1 + (name.len() as u64 + 7) / 8;
-        // SAFETY: regs array has 20 entries; we write 7 bytes at regs[1]
-        // (offset 8 bytes into &regs[1]). 7 < 8*19 so this is in bounds.
-        let dst = &raw mut msg.regs[1] as *mut u8;
-        for i in 0..name.len() {
-            core::ptr::write(dst.add(i), name[i]);
-        }
-
-        let mut reply = TronaMsg::zeroed();
-        let err = ipc::call_ctx(
-            ipc_ctx(),
-            CAP_NAMESERV,
-            &raw const msg,
-            &raw mut reply,
-        );
-
-        if err != 0 || reply.label != TRONA_OK {
-            recycle_empty_slot(ep_slot);
-            trona::uerror!(|_lb| {
-                _lb.str(b"[MMSRV] procmgr lookup via nameserv failed\n");
-            });
-            return 0;
-        }
-
-        *(&raw mut PROCMGR_EP) = ep_slot;
-        trona::udebug!(|_lb| {
-            _lb.str(b"[MMSRV] Resolved procmgr EP via nameserv\n");
-        });
-        ep_slot
-    }
-}
-
-/// Look up the VFS endpoint via nameserv and cache it.
+/// Look up the VFS endpoint via namesrv and cache it.
 /// Returns the cap slot, or 0 on failure.
 pub(crate) unsafe fn resolve_vfs_ep() -> Cap {
     unsafe {
@@ -505,7 +472,7 @@ pub(crate) unsafe fn resolve_vfs_ep() -> Cap {
 
         let name = b"vfs";
         let mut msg = TronaMsg::zeroed();
-        msg.label = POSIX_NS_LOOKUP;
+        msg.label = NS_LOOKUP;
         msg.regs[0] = name.len() as u64;
         msg.length = 1 + (name.len() as u64 + 7) / 8;
         let dst = &raw mut msg.regs[1] as *mut u8;
@@ -518,67 +485,78 @@ pub(crate) unsafe fn resolve_vfs_ep() -> Cap {
         if err != 0 || reply.label != TRONA_OK {
             recycle_empty_slot(ep_slot);
             trona::uerror!(|_lb| {
-                _lb.str(b"[MMSRV] vfs lookup via nameserv failed\n");
+                _lb.str(b"[MMSRV] vfs lookup via namesrv failed\n");
             });
             return 0;
         }
 
         *(&raw mut VFS_EP) = ep_slot;
         trona::udebug!(|_lb| {
-            _lb.str(b"[MMSRV] Resolved vfs EP via nameserv\n");
+            _lb.str(b"[MMSRV] Resolved vfs EP via namesrv\n");
         });
         ep_slot
     }
 }
 
-/// Request a sub-untyped from procmgr when all local UT sources are
-/// exhausted.  Returns the cap slot of the newly received sub-untyped,
-/// or 0 on failure.
-unsafe fn request_untyped_from_procmgr(size_bits: u64) -> Cap {
+/// Register a sub-untyped provisioned by procmgr via MM_PROVISION_UNTYPED.
+/// Returns true on success.
+unsafe fn register_provisioned_untyped(cap: Cap) -> bool {
     unsafe {
-        let procmgr_ep = resolve_procmgr_ep();
-        if procmgr_ep == 0 {
-            return 0;
+        let count = *(&raw const UT_COUNT);
+        if count >= MAX_UT_SOURCES {
+            return false;
         }
-
-        // Allocate a receive slot for the incoming cap transfer
-        let recv_slot = match recycled_slot_alloc() {
-            Some(s) => s,
-            None => return 0,
+        let sources_ptr = &raw mut UT_SOURCES;
+        (*sources_ptr)[count] = UntypedSource {
+            cap,
+            active: true,
         };
-
-        // Configure receive slot for incoming cap transfer
-        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, recv_slot, 0);
-
-        // Build request message
-        let mut msg = TronaMsg::zeroed();
-        msg.label = POSIX_PM_REQUEST_UNTYPED;
-        msg.length = 1;
-        msg.regs[0] = size_bits;
-
-        // Send request and wait for reply
-        let mut reply = TronaMsg::zeroed();
-        let err = ipc::call_ctx(
-            ipc_ctx(),
-            procmgr_ep,
-            &raw const msg,
-            &raw mut reply,
-        );
-
-        if err != 0 || reply.label != TRONA_OK {
-            // Failed — recycle the slot
-            recycle_empty_slot(recv_slot);
-            return 0;
-        }
-
-        // The sub-untyped cap should now be at recv_slot
-        trona::udebug!(|_lb| {
-            _lb.str(b"[MMSRV] Received sub-untyped from procmgr at slot ");
-            _lb.hex(recv_slot);
+        *(&raw mut UT_COUNT) = count + 1;
+        *(&raw mut UT_HINT) = count;
+        trona::uinfo!(|_lb| {
+            _lb.str(b"[MMSRV] provisioned untyped slot=");
+            _lb.hex(cap);
+            _lb.str(b" total=");
+            _lb.dec((count + 1) as u64);
             _lb.str(b"\n");
         });
+        true
+    }
+}
 
-        recv_slot
+unsafe fn deactivate_ut_source(index: usize) {
+    unsafe {
+        let count = *(&raw const UT_COUNT);
+        if index >= count {
+            return;
+        }
+        let sources_ptr = &raw mut UT_SOURCES;
+        if !(*sources_ptr)[index].active {
+            return;
+        }
+        (*sources_ptr)[index].active = false;
+        trona::uwarn!(|_lb| {
+            _lb.str(b"[MMSRV] deactivating exhausted UT source idx=");
+            _lb.dec(index as u64);
+            _lb.str(b" cap=");
+            _lb.hex((*sources_ptr)[index].cap);
+            _lb.str(b"\n");
+        });
+    }
+}
+
+/// Estimate remaining retype capacity (number of active UT sources).
+unsafe fn estimate_capacity() -> u64 {
+    unsafe {
+        let count = *(&raw const UT_COUNT);
+        let sources = &*(&raw const UT_SOURCES);
+        let mut active = 0u64;
+        for i in 0..count {
+            if sources[i].active {
+                active += 1;
+            }
+        }
+        active
     }
 }
 
@@ -607,6 +585,9 @@ unsafe fn retype_any(obj_type: u64, size_bits: u64, dest_slot: Cap) -> i32 {
                 *(&raw mut UT_HINT) = i;
                 return 0;
             }
+            if err as u64 == TRONA_OUT_OF_MEMORY {
+                deactivate_ut_source(i);
+            }
         }
 
         // Second pass: wrap around
@@ -618,6 +599,9 @@ unsafe fn retype_any(obj_type: u64, size_bits: u64, dest_slot: Cap) -> i32 {
             if err == 0 {
                 *(&raw mut UT_HINT) = i;
                 return 0;
+            }
+            if err as u64 == TRONA_OUT_OF_MEMORY {
+                deactivate_ut_source(i);
             }
         }
 
@@ -647,26 +631,8 @@ unsafe fn retype_any(obj_type: u64, size_bits: u64, dest_slot: Cap) -> i32 {
                 *(&raw mut UT_HINT) = i;
                 return 0;
             }
-        }
-
-        // All local sources exhausted — request a sub-untyped from procmgr
-        let new_cap = request_untyped_from_procmgr(28); // Request 256 MB sub-untyped
-        if new_cap != 0 {
-            let count = *(&raw const UT_COUNT);
-            if count < MAX_UT_SOURCES {
-                let sources_ptr = &raw mut UT_SOURCES;
-                (*sources_ptr)[count] = UntypedSource {
-                    cap: new_cap,
-                    active: true,
-                };
-                *(&raw mut UT_COUNT) = count + 1;
-                *(&raw mut UT_HINT) = count;
-
-                // Retry with the new source
-                let err = invoke::untyped_retype(new_cap, obj_type, size_bits, dest_slot);
-                if err == 0 {
-                    return 0;
-                }
+            if err as u64 == TRONA_OUT_OF_MEMORY {
+                deactivate_ut_source(i);
             }
         }
 
@@ -717,11 +683,11 @@ unsafe fn init_untyped_pool() {
 // Nameserv registration
 // ---------------------------------------------------------------------------
 
-unsafe fn register_with_nameserv() -> bool {
+unsafe fn register_with_namesrv() -> bool {
     unsafe {
         let name = b"mmsrv";
         let mut msg = TronaMsg::zeroed();
-        msg.label = POSIX_NS_REGISTER;
+        msg.label = NS_REGISTER;
         msg.length = 1 + ((name.len() + 7) / 8) as u64;
         msg.regs[0] = name.len() as u64;
         let dst = &raw mut msg.regs[1] as *mut u8;
@@ -736,7 +702,7 @@ unsafe fn register_with_nameserv() -> bool {
         let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV, &raw const msg, &raw mut reply);
         if err != 0 || reply.label != TRONA_OK {
             trona::uerror!(|_lb| {
-                _lb.str(b"[MMSRV] nameserv register failed err=");
+                _lb.str(b"[MMSRV] namesrv register failed err=");
                 _lb.hex(err as u64);
                 _lb.str(b" label=");
                 _lb.hex(reply.label);
@@ -989,15 +955,15 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, slot, 0);
     }
 
-    // Register with nameserv
-    if !unsafe { register_with_nameserv() } {
+    // Register with namesrv
+    if !unsafe { register_with_namesrv() } {
         trona::uerror!(|_lb| {
-            _lb.str(b"[MMSRV] FATAL: nameserv registration failed\n");
+            _lb.str(b"[MMSRV] FATAL: namesrv registration failed\n");
         });
         idle();
     }
     trona::uinfo!(|_lb| {
-        _lb.str(b"[MMSRV] registered with nameserv\n");
+        _lb.str(b"[MMSRV] registered with namesrv\n");
     });
 
     // Signal readiness to init
@@ -1059,6 +1025,67 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 MM_REGISTER_SHARED_REGION => mmap::handle_mm_register_shared_region(&raw const msg, badge, &raw mut reply),
                 MM_MAP_OBJECT_REGION => mmap::handle_mm_map_object_region(&raw const msg, badge, &raw mut reply),
                 MM_SYNC_FILE_BACKING => mmap::handle_mm_sync_file_backing(&raw const msg, badge, &raw mut reply),
+                MM_FILE_MMAP => mmap::handle_mm_file_mmap(&raw const msg, badge, &raw mut reply),
+                MM_SYNC_MMAP_WRITE => mmap::handle_mm_sync_mmap_write(&raw const msg, badge, &raw mut reply),
+                MM_PROVISION_UNTYPED => {
+                    // Procmgr pushes a sub-untyped to replenish our pool.
+                    // The cap arrives via IPC cap transfer at CURRENT_RECV_SLOT.
+                    let recv_slot = *(&raw const CURRENT_RECV_SLOT);
+                    if register_provisioned_untyped(recv_slot) {
+                        mark_recv_slot_kept();
+                        reply.label = TRONA_OK;
+                    } else {
+                        reply.label = TRONA_OUT_OF_MEMORY;
+                    }
+                }
+                MM_QUERY_CAPACITY => {
+                    reply.label = TRONA_OK;
+                    reply.length = 1;
+                    reply.regs[0] = estimate_capacity();
+                }
+                MM_ALLOC_PRIVATE_REGION => mmap::handle_mm_alloc_private_region(&raw const msg, badge, &raw mut reply),
+                MM_ALLOC_PRIVATE_WINDOW => mmap::handle_mm_alloc_private_window(&raw const msg, badge, &raw mut reply),
+                MM_ALLOC_INITRD_COPY => mmap::handle_mm_alloc_initrd_copy(&raw const msg, badge, &raw mut reply),
+                MM_ALLOC_BOOTINFO_COPY => mmap::handle_mm_alloc_bootinfo_copy(&raw const msg, badge, &raw mut reply),
+                MM_COPY_FROM_CLIENT_REGION => mmap::handle_mm_copy_from_client_region(&raw const msg, badge, &raw mut reply),
+                MM_ALLOC_PRIVATE_COPY_FROM_CLIENT_REGION => mmap::handle_mm_alloc_private_copy_from_client_region(&raw const msg, badge, &raw mut reply),
+                MM_REGISTER_PAGER_EP => {
+                    // VFS registers a dedicated callback endpoint for pager requests.
+                    // The EP cap arrives via IPC cap transfer at CURRENT_RECV_SLOT.
+                    let recv_slot = *(&raw const CURRENT_RECV_SLOT);
+                    *(&raw mut VFS_PAGER_CALLBACK_EP) = recv_slot;
+                    mark_recv_slot_kept();
+                    trona::uinfo!(|_lb| {
+                        _lb.str(b"[MMSRV] VFS pager callback EP registered slot=");
+                        _lb.hex(recv_slot);
+                        _lb.str(b"\n");
+                    });
+                    reply.label = TRONA_OK;
+                }
+                MM_DUMP_PENDING => {
+                    // Debug: dump UT source pool to serial
+                    let count = *(&raw const UT_COUNT);
+                    trona::uinfo!(|_lb| {
+                        _lb.str(b"[MMSRV] UT sources: ");
+                        _lb.dec(count as u64);
+                        _lb.str(b"/");
+                        _lb.dec(MAX_UT_SOURCES as u64);
+                        _lb.str(b"\n");
+                    });
+                    let sources = &*(&raw const UT_SOURCES);
+                    for i in 0..count {
+                        if sources[i].active {
+                            trona::uinfo!(|_lb| {
+                                _lb.str(b"  src[");
+                                _lb.dec(i as u64);
+                                _lb.str(b"] cap=");
+                                _lb.hex(sources[i].cap);
+                                _lb.str(b" active\n");
+                            });
+                        }
+                    }
+                    reply.label = TRONA_OK;
+                }
                 // VMFault: label=2 from kernel FaultType::VMFault.
                 // Badge identifies the faulting client. Replying resumes the faulting thread.
                 //
