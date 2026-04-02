@@ -17,6 +17,7 @@ typedef unsigned long long size_t;
 #define FALSE 0
 #define STD_OUTPUT_HANDLE 0xFFFFFFF5u
 #define STD_INPUT_HANDLE  0xFFFFFFF6u
+#define ERROR_INVALID_HANDLE 6u
 #define INVALID_HANDLE_VALUE ((HANDLE)-1)
 
 /* kernel32.dll imports */
@@ -127,8 +128,9 @@ void mainCRTStartup(void) {
 
     /* 6. Invalid handle test */
     {
+        SetLastError(0);
         HANDLE bad = GetStdHandle(999);
-        if (bad == INVALID_HANDLE_VALUE && GetLastError() != 0) {
+        if (bad == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_HANDLE) {
             print(stdout_h, "[HELLO_PE] Invalid handle detection OK\n");
         } else {
             print(stdout_h, "[HELLO_PE] FAIL invalid handle\n");
