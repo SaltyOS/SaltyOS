@@ -29,10 +29,10 @@ mod test_sse;
 #[cfg(target_arch = "aarch64")]
 mod test_neon;
 
-use trona::consts::*;
-use trona_posix::proc as posix;
+use trona::consts::kernel::*;
 use trona::serial;
 use trona::serial::LineBuf;
+use trona_posix::proc as posix;
 
 const CAP_READINESS_NTFN: u64 = 14;
 

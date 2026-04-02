@@ -5,7 +5,9 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::types::*;
+use trona::types::core::*;
+use trona::types::pe::*;
+use trona_posix::consts::*;
 
 use crate::alloc::Allocator;
 use crate::proc_table;
@@ -15,7 +17,7 @@ use crate::proc_table;
 ///
 /// # Safety
 /// `ptr..ptr+len` must be valid, writable, and non-overlapping with any live reference.
-unsafe fn volatile_zero(ptr: *mut u8, len: usize) {
+pub(crate) unsafe fn volatile_zero(ptr: *mut u8, len: usize) {
     unsafe {
         let align_off = ptr.align_offset(8).min(len);
         for i in 0..align_off {
@@ -59,6 +61,135 @@ unsafe fn volatile_copy(dst: *mut u8, src: *const u8, len: usize) {
         for i in tail_start..len {
             core::ptr::write_volatile(dst.add(i), *src.add(i));
         }
+    }
+}
+
+pub(crate) unsafe fn alloc_staging_buffer(num_pages: usize) -> *mut u8 {
+    unsafe {
+        let len = match (num_pages as u64).checked_mul(4096) {
+            Some(v) => v,
+            None => return core::ptr::null_mut(),
+        };
+        let ptr = trona_posix::mm::posix_mmap(
+            core::ptr::null_mut(),
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if ptr as usize == usize::MAX {
+            core::ptr::null_mut()
+        } else {
+            ptr
+        }
+    }
+}
+
+pub(crate) unsafe fn free_staging_buffer(ptr: *mut u8, num_pages: usize) {
+    unsafe {
+        if ptr.is_null() {
+            return;
+        }
+        let len = match (num_pages as u64).checked_mul(4096) {
+            Some(v) => v,
+            None => return,
+        };
+        trona_posix::mm::posix_munmap(ptr, len);
+    }
+}
+
+/// Pre-provision mmsrv with untyped memory if capacity is low.
+/// Eliminates the Procmgr↔MMSRV deadlock cycle: instead of mmsrv
+/// calling back to procmgr when out of memory (pull), procmgr
+/// pushes untyped proactively before spawning (push).
+///
+/// Returns true if mmsrv has sufficient capacity (or was replenished).
+pub(crate) unsafe fn ensure_mmsrv_capacity(alloc: &mut crate::alloc::Allocator) -> bool {
+    unsafe {
+        // Query mmsrv capacity
+        let mut qmsg = TronaMsg::zeroed();
+        let mut qreply = TronaMsg::zeroed();
+        qmsg.label = trona::protocol::MM_QUERY_CAPACITY;
+        qmsg.length = 0;
+        let err = trona::ipc::call_ctx(
+            super::ipc_ctx(),
+            CAP_MMSRV_EP,
+            &raw const qmsg,
+            &raw mut qreply,
+        );
+        if err != 0 || qreply.label != trona::TRONA_OK {
+            trona::uwarn!(|_lb| {
+                _lb.str(b"[PROCMGR] MM_QUERY_CAPACITY failed, proceeding anyway\n");
+            });
+            return true; // proceed optimistically
+        }
+
+        let capacity = qreply.regs[0];
+        // Threshold: if fewer than 2 active UT sources, pre-provision
+        if capacity >= 2 {
+            return true;
+        }
+
+        trona::uinfo!(|_lb| {
+            _lb.str(b"[PROCMGR] mmsrv capacity low (");
+            _lb.dec(capacity);
+            _lb.str(b"), provisioning untyped\n");
+        });
+
+        provision_untyped_to_mmsrv(alloc)
+    }
+}
+
+/// Provision a sub-untyped to mmsrv via MM_PROVISION_UNTYPED.
+unsafe fn provision_untyped_to_mmsrv(alloc: &mut crate::alloc::Allocator) -> bool {
+    unsafe {
+        // Allocate a slot and retype a 256 MB sub-untyped
+        let slot = match alloc.alloc_single_slot() {
+            Some(s) => s,
+            None => {
+                trona::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] no slot for untyped provision\n");
+                });
+                return false;
+            }
+        };
+
+        let err = alloc.retype_any(trona::OBJ_UNTYPED, 28, slot);
+        if err != 0 {
+            trona::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] retype sub-untyped failed err=");
+                _lb.hex(err as u64);
+                _lb.str(b"\n");
+            });
+            alloc.free_single_slot(slot);
+            return false;
+        }
+
+        // Send the sub-untyped cap to mmsrv
+        trona::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, slot);
+        let mut pmsg = TronaMsg::zeroed();
+        let mut preply = TronaMsg::zeroed();
+        pmsg.label = trona::protocol::MM_PROVISION_UNTYPED;
+        pmsg.length = 1;
+        pmsg.regs[0] = 28; // size_bits
+        let err = trona::ipc::call_ctx(
+            super::ipc_ctx(),
+            CAP_MMSRV_EP,
+            &raw const pmsg,
+            &raw mut preply,
+        );
+        if err != 0 || preply.label != trona::TRONA_OK {
+            trona::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] MM_PROVISION_UNTYPED failed\n");
+            });
+            return false;
+        }
+
+        trona::uinfo!(|_lb| {
+            _lb.str(b"[PROCMGR] provisioned 256MB untyped to mmsrv\n");
+        });
+        true
     }
 }
 
@@ -198,18 +329,20 @@ const CHILD_CAP_VSPACE: u64 = super::CHILD_CAP_VSPACE;
 const CHILD_CAP_CSPACE: u64 = super::CHILD_CAP_CSPACE;
 const CHILD_CAP_EP: u64 = super::CHILD_CAP_EP;
 const CHILD_CAP_VFS: u64 = super::CHILD_CAP_VFS;
-const CHILD_CAP_NAMESERV: u64 = super::CHILD_CAP_NAMESERV;
+const CHILD_CAP_NAMESRV: u64 = super::CHILD_CAP_NAMESRV;
 const CHILD_CAP_SIGNAL_NTFN: u64 = super::CHILD_CAP_SIGNAL_NTFN;
 const CHILD_CAP_MMSRV_EP: u64 = super::CHILD_CAP_MMSRV_EP;
 const CHILD_CAP_READINESS_NTFN: u64 = super::CHILD_CAP_READINESS_NTFN;
 const CHILD_CAP_CSPACE_NTFN: u64 = super::CHILD_CAP_CSPACE_NTFN;
 const CHILD_CAP_SERVICE_EP: u64 = super::CHILD_CAP_SERVICE_EP;
+const CHILD_CAP_WIN32SRV_EP: u64 = super::CHILD_CAP_WIN32SRV_EP;
 
 const CAP_SELF_CSPACE: Cap = super::CAP_SELF_CSPACE;
 const CAP_SELF_VSPACE: Cap = super::CAP_SELF_VSPACE;
 const CAP_SERVER_EP: Cap = super::CAP_SERVER_EP;
 const CAP_RECV_SCRATCH: Cap = super::CAP_RECV_SCRATCH;
-const CAP_NAMESERV_EP: Cap = super::CAP_NAMESERV_EP;
+const CAP_REPLY_TEMP: Cap = super::CAP_REPLY_TEMP;
+const CAP_NAMESRV_EP: Cap = super::CAP_NAMESRV_EP;
 const CAP_VFS_EP: Cap = super::CAP_VFS_EP;
 const CAP_FB_UNTYPED: Cap = super::CAP_FB_UNTYPED;
 const CAP_INITRD_UNTYPED: Cap = super::CAP_INITRD_UNTYPED;
@@ -233,6 +366,12 @@ const AT_TRONA_SLOT_BASE: u64 = super::AT_TRONA_SLOT_BASE;
 const AT_TRONA_SLOT_COUNT: u64 = super::AT_TRONA_SLOT_COUNT;
 const AT_TRONA_CSPACE_NTFN: u64 = super::AT_TRONA_CSPACE_NTFN;
 const AT_TRONA_MM_EP: u64 = super::AT_TRONA_MM_EP;
+const AT_TRONA_IPC_BUFFER: u64 = super::AT_TRONA_IPC_BUFFER;
+const AT_SALTYOS_PE_BASE: u64 = super::AT_SALTYOS_PE_BASE;
+const AT_SALTYOS_PE_SIZE: u64 = super::AT_SALTYOS_PE_SIZE;
+const AT_SALTYOS_WIN32SRV: u64 = super::AT_SALTYOS_WIN32SRV;
+const AT_SALTYOS_KERNEL32_BASE: u64 = super::AT_SALTYOS_KERNEL32_BASE;
+const AT_SALTYOS_KERNEL32_SIZE: u64 = super::AT_SALTYOS_KERNEL32_SIZE;
 const CSPACE_EXPAND_BASE: u64 = super::CSPACE_EXPAND_BASE;
 const READY_TIMEOUT_NS_DEFAULT: u64 = super::READY_TIMEOUT_NS_DEFAULT;
 const SPAWN_FLAG_USE_PRE_EP: u64 = trona::SPAWN_FLAG_USE_PRE_EP;
@@ -804,7 +943,7 @@ pub(crate) unsafe fn init_shared_lib_cache(alloc: &mut Allocator) {
             {
                 let mut msg = TronaMsg::zeroed();
                 let mut rpl = TronaMsg::zeroed();
-                msg.label = trona::MM_ALLOC_OBJECT;
+                msg.label = trona::protocol::MM_ALLOC_OBJECT;
                 msg.length = 2;
                 msg.regs[0] = trona::OBJ_MEMORY_OBJECT;
                 msg.regs[1] = sb;
@@ -1106,8 +1245,8 @@ unsafe fn try_inherit_shared_lib_cache(
 /// Map cached shared library frames into a child VSpace, mapping only
 /// libraries listed in `needed` in their DT_NEEDED order.
 /// RO pages are mapped from the shared frame cache (shared across processes).
-/// RW pages are allocated per-child via mmsrv MM_MAP_WINDOW and populated
-/// with .data content from the initrd; BSS is zeroed.
+/// RW pages are allocated per-child via mmsrv copy transactions and populated
+/// from a staged image built from the initrd; BSS is zeroed.
 /// `shared_lib_base_vaddr` is the layout-computed VA where libs start.
 /// Returns (lib_load_addr, ProcLibMap) on success, (0, empty) on failure.
 pub(crate) unsafe fn map_shared_lib_to_vspace(
@@ -1172,14 +1311,14 @@ pub(crate) unsafe fn map_shared_lib_to_vspace(
                         let seg_vaddr = running_base + seg.vaddr_offset;
                         let count_and_flags =
                             ((seg.page_count as u64) << 32) | seg.flags;
-                        let err = trona::invoke::vspace_map_mo(
+                        let (err, mapped) = trona::invoke::vspace_map_mo_with_count(
                             child_vs,
                             cl.ro_mo_cap,
                             seg_vaddr,
                             seg.mo_page_start as u64,
                             count_and_flags,
                         );
-                        if err != 0 {
+                        if err != 0 || mapped != seg.page_count as u64 {
                             trona::uerror!(|_lb| {
                                 _lb.str(b"[PROCMGR] shared lib MO map failed seg=");
                                 _lb.hex(si as u64);
@@ -1222,7 +1361,7 @@ pub(crate) unsafe fn map_shared_lib_to_vspace(
                     let seg = &cl.ro_segs[si];
                     let mut sr_msg = TronaMsg::zeroed();
                     let mut sr_reply = TronaMsg::zeroed();
-                    sr_msg.label = trona::consts::MM_REGISTER_SHARED_REGION;
+                    sr_msg.label = trona::protocol::MM_REGISTER_SHARED_REGION;
                     sr_msg.length = 6;
                     sr_msg.regs[0] = pid as u64;
                     sr_msg.regs[1] = running_base + seg.vaddr_offset;
@@ -1272,13 +1411,14 @@ pub(crate) unsafe fn map_shared_lib_to_vspace(
 }
 
 /// Allocate and populate RW segment pages for a shared library in a child process.
-/// Uses mmsrv MM_MAP_WINDOW to dual-map pages (child + procmgr scratch),
-/// copies .data content from procmgr's own initrd mapping, zeroes BSS, and unmaps scratch.
+/// Uses a local staging buffer plus mmsrv copy transactions so procmgr does not
+/// need a direct writable mapping of the child region.
 ///
 /// lld-20 RELRO split can produce multiple RW PT_LOAD segments whose page-aligned
 /// ranges overlap (e.g. seg4 vaddr=0x43000, seg5 vaddr=0x43F20 both page-align to
-/// 0x43000). To avoid AlreadyMapped errors, we merge all RW segments into a single
-/// contiguous page range and call MM_MAP_WINDOW once.
+/// 0x43000). To avoid overlapping child-region allocation, we merge all RW
+/// segments into a single contiguous page range and populate it in one staged
+/// copy transaction.
 /// Returns true on success.
 unsafe fn map_rw_segments(cl: &CachedLib, running_base: u64, pid: u32) -> bool {
     unsafe {
@@ -1331,93 +1471,99 @@ unsafe fn map_rw_segments(cl: &CachedLib, running_base: u64, pid: u32) -> bool {
             return true;
         }
 
-        // Single MM_MAP_WINDOW call for the merged range
-        let mut mm_msg = TronaMsg::zeroed();
-        let mut mm_reply = TronaMsg::zeroed();
-        mm_msg.label = trona::consts::MM_MAP_WINDOW;
-        mm_msg.length = 5;
-        mm_msg.regs[0] = pid as u64;
-        mm_msg.regs[1] = merged_start;
-        mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
-        mm_msg.regs[3] = merged_pages as u64;
-        mm_msg.regs[4] = merged_flags;
-        trona::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-        let err = trona::ipc::call_ctx(
-            super::ipc_ctx(),
-            CAP_MMSRV_EP,
-            &raw const mm_msg,
-            &raw mut mm_reply,
-        );
-        if err != 0 || mm_reply.label != TRONA_OK || mm_reply.regs[0] != merged_pages as u64 {
-            trona::uerror!(|_lb| {
-                _lb.str(b"[PROCMGR] RW MAP_WINDOW failed err=");
-                _lb.hex(err as u64);
-                _lb.str(b" mapped=");
-                _lb.hex(mm_reply.regs[0]);
-                _lb.str(b"\n");
-            });
+        let stage = alloc_staging_buffer(merged_pages);
+        if stage.is_null() {
             return false;
         }
 
-        // Zero the entire merged window
-        let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
-        unsafe { volatile_zero(scratch, merged_pages * 4096) };
+        let status = (|| -> bool {
+            volatile_zero(stage, merged_pages * 4096);
 
-        // Copy file data from each segment at its correct offset
-        for si in 0..cl.rw_seg_count as usize {
-            let rw = &cl.rw_segs[si];
-            if rw.file_size == 0 {
-                continue;
-            }
-            let seg_start = running_base + rw.vaddr_offset;
-            let sub_page_off = (rw.seg_vaddr & 0xFFF) as usize;
-            let file_off = rw.file_offset as usize;
-            let copy_len = rw.file_size as usize;
-
-            // Offset into the scratch window: distance from merged_start
-            // to this segment's page-aligned start, plus sub-page offset
-            let window_off = (seg_start - merged_start) as usize + sub_page_off;
-
-            if file_off + copy_len <= entry.data_len {
-                let src = entry.data.add(file_off);
-                let dst = scratch.add(window_off);
-                unsafe { volatile_copy(dst, src, copy_len) };
-            }
-        }
-
-        // Copy RO tail data for boundary pages trimmed from the RO MO.
-        if entry.data_len >= core::mem::size_of::<Elf64Ehdr>() {
-            let ehdr = &*(entry.data as *const Elf64Ehdr);
-            let elf_phdrs = entry.data.add(ehdr.e_phoff as usize) as *const Elf64Phdr;
-            let merged_vaddr_start = merged_start - running_base;
-            let merged_vaddr_end = merged_vaddr_start + (merged_pages as u64) * 4096;
-            for pi in 0..ehdr.e_phnum as usize {
-                let ph = &*elf_phdrs.add(pi);
-                if ph.p_type != trona::PT_LOAD || (ph.p_flags & trona::PF_W) != 0 {
+            // Copy file data from each segment at its correct offset.
+            for si in 0..cl.rw_seg_count as usize {
+                let rw = &cl.rw_segs[si];
+                if rw.file_size == 0 {
                     continue;
                 }
-                let seg_file_end = ph.p_vaddr + ph.p_filesz;
-                if seg_file_end <= merged_vaddr_start || (ph.p_vaddr & !0xFFFu64) >= merged_vaddr_end {
-                    continue;
-                }
-                let overlap_start = if ph.p_vaddr > merged_vaddr_start { ph.p_vaddr } else { merged_vaddr_start };
-                let overlap_end = if seg_file_end < merged_vaddr_end { seg_file_end } else { merged_vaddr_end };
-                if overlap_start >= overlap_end { continue; }
-                let file_off = (overlap_start - ph.p_vaddr + ph.p_offset) as usize;
-                let window_off = (overlap_start - merged_vaddr_start) as usize;
-                let copy_len = (overlap_end - overlap_start) as usize;
+                let seg_start = running_base + rw.vaddr_offset;
+                let sub_page_off = (rw.seg_vaddr & 0xFFF) as usize;
+                let file_off = rw.file_offset as usize;
+                let copy_len = rw.file_size as usize;
+                let window_off = (seg_start - merged_start) as usize + sub_page_off;
+
                 if file_off + copy_len <= entry.data_len {
                     let src = entry.data.add(file_off);
-                    let dst = scratch.add(window_off);
-                    unsafe { volatile_copy(dst, src, copy_len) };
+                    let dst = stage.add(window_off);
+                    volatile_copy(dst, src, copy_len);
                 }
             }
-        }
 
-        // Unmap scratch window (child mapping persists)
-        unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, merged_pages as u64);
+            // Copy RO tail data for boundary pages trimmed from the RO MO.
+            if entry.data_len >= core::mem::size_of::<Elf64Ehdr>() {
+                let ehdr = &*(entry.data as *const Elf64Ehdr);
+                let elf_phdrs = entry.data.add(ehdr.e_phoff as usize) as *const Elf64Phdr;
+                let merged_vaddr_start = merged_start - running_base;
+                let merged_vaddr_end = merged_vaddr_start + (merged_pages as u64) * 4096;
+                for pi in 0..ehdr.e_phnum as usize {
+                    let ph = &*elf_phdrs.add(pi);
+                    if ph.p_type != trona::PT_LOAD || (ph.p_flags & trona::PF_W) != 0 {
+                        continue;
+                    }
+                    let seg_file_end = ph.p_vaddr + ph.p_filesz;
+                    if seg_file_end <= merged_vaddr_start || (ph.p_vaddr & !0xFFFu64) >= merged_vaddr_end {
+                        continue;
+                    }
+                    let overlap_start = if ph.p_vaddr > merged_vaddr_start { ph.p_vaddr } else { merged_vaddr_start };
+                    let overlap_end = if seg_file_end < merged_vaddr_end { seg_file_end } else { merged_vaddr_end };
+                    if overlap_start >= overlap_end {
+                        continue;
+                    }
+                    let file_off = (overlap_start - ph.p_vaddr + ph.p_offset) as usize;
+                    let window_off = (overlap_start - merged_vaddr_start) as usize;
+                    let copy_len = (overlap_end - overlap_start) as usize;
+                    if file_off + copy_len <= entry.data_len {
+                        let src = entry.data.add(file_off);
+                        let dst = stage.add(window_off);
+                        volatile_copy(dst, src, copy_len);
+                    }
+                }
+            }
 
-        true
+            let region_base = match alloc_private_copy_from_client_region_to_mmsrv(
+                pid,
+                merged_start,
+                merged_pages as u64,
+                merged_start,
+                stage as u64,
+                merged_pages as u64,
+                merged_flags,
+            ) {
+                Ok(v) => v,
+                Err((err, label, mapped)) => {
+                    trona::uerror!(|_lb| {
+                        _lb.str(b"[PROCMGR] RW MM_ALLOC_PRIVATE_COPY failed err=");
+                        _lb.hex(err as u64);
+                        _lb.str(b" label=");
+                        _lb.hex(label);
+                        _lb.str(b" mapped=");
+                        _lb.hex(mapped);
+                        _lb.str(b"\n");
+                    });
+                    return false;
+                }
+            };
+            if region_base != merged_start {
+                trona::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] RW MM_ALLOC_PRIVATE_COPY base mismatch\n");
+                });
+                return false;
+            }
+
+            true
+        })();
+
+        free_staging_buffer(stage, merged_pages);
+        status
     }
 }
 
@@ -1461,9 +1607,16 @@ pub(crate) unsafe fn write_dynamic_stack(
     stack_top: u64,
     _cnode_bits: u64,
     slot_pool_floor: u64,
+    page_base: *mut u8,
     pre_mapped: bool,
 ) -> Result<u64, StackBuildError> {
     unsafe {
+        let page_base = if pre_mapped {
+            page_base
+        } else {
+            PROCMGR_SCRATCH_VADDR as *mut u8
+        };
+
         if !pre_mapped {
             let err = trona::invoke::vspace_map(
                 CAP_SELF_VSPACE,
@@ -1516,6 +1669,7 @@ pub(crate) unsafe fn write_dynamic_stack(
                 slot_pool_base,
                 slot_pool_count,
             )),
+            page_base,
             scratch_vaddr,
             initrd_vaddr,
             stack_top,
@@ -1546,9 +1700,16 @@ pub(crate) unsafe fn write_static_stack(
     scratch_vaddr: u64,
     initrd_vaddr: u64,
     stack_top: u64,
+    page_base: *mut u8,
     pre_mapped: bool,
 ) -> Result<u64, StackBuildError> {
     unsafe {
+        let page_base = if pre_mapped {
+            page_base
+        } else {
+            PROCMGR_SCRATCH_VADDR as *mut u8
+        };
+
         if !pre_mapped {
             let err = trona::invoke::vspace_map(
                 CAP_SELF_VSPACE,
@@ -1568,6 +1729,7 @@ pub(crate) unsafe fn write_static_stack(
             str_data,
             str_len,
             None,
+            page_base,
             scratch_vaddr,
             initrd_vaddr,
             stack_top,
@@ -1608,6 +1770,7 @@ unsafe fn write_stack_with_args(
     str_data: &[u8],
     str_len: usize,
     auxv_info: Option<(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)>,
+    page_base: *mut u8,
     scratch_vaddr: u64,
     initrd_vaddr: u64,
     stack_top: u64,
@@ -1620,7 +1783,6 @@ unsafe fn write_stack_with_args(
             return Err(StackBuildError::TooLarge);
         }
 
-        let page_base = PROCMGR_SCRATCH_VADDR as *mut u8;
         // The child sees this page at the top of its stack
         let Some(child_page_base) = stack_top.checked_sub(4096) else {
             return Err(StackBuildError::InvalidArgument);
@@ -1700,7 +1862,7 @@ unsafe fn write_stack_with_args(
             return Err(StackBuildError::TooLarge);
         };
 
-        let stack_u64 = (PROCMGR_SCRATCH_VADDR + metadata_start as u64) as *mut u64;
+        let stack_u64 = page_base.add(metadata_start) as *mut u64;
         let mut wi: usize = 0;
         let mut w = |v: u64| {
             core::ptr::write_volatile(stack_u64.add(wi), v);
@@ -1787,9 +1949,8 @@ unsafe fn write_stack_with_args(
 
 /// Load an ELF64 binary into a child's VSpace using mmsrv for frame allocation.
 ///
-/// Uses MM_MAP_WINDOW to allocate frames in the child's VSpace and create a
-/// write window in procmgr's scratch area. ELF segment data is copied through
-/// the window, then the window is unmapped.
+/// Materializes one anonymous private region in mmsrv, then copies chunked
+/// staged page images from procmgr's own anonymous buffer into the child MO.
 ///
 /// Returns 0 on success, nonzero on error. Populates `*result` with entry,
 /// base, and brk on success.
@@ -1808,7 +1969,7 @@ pub(crate) unsafe fn exec_load_elf_mmsrv(
         use trona::consts::{
             ELFCLASS64, ELFDATA2LSB, ELF_BAD_ARCH, ELF_BAD_TYPE, ELF_MAP_FAILED, ELF_NOT_64BIT,
             ELF_NOT_ELF, ELF_NOT_LE, ELF_NO_LOAD, ELF_OUT_OF_MEMORY, ELF_TOO_SMALL,
-            EM_AARCH64, EM_X86_64, ET_DYN, ET_EXEC, MM_MAP_WINDOW, PF_W, PF_X, PT_LOAD,
+            EM_AARCH64, EM_X86_64, ET_DYN, ET_EXEC, PF_W, PF_X, PT_LOAD,
         };
 
         if data_len < core::mem::size_of::<Elf64Ehdr>() {
@@ -1889,127 +2050,154 @@ pub(crate) unsafe fn exec_load_elf_mmsrv(
             return ELF_OUT_OF_MEMORY;
         }
 
-        // Load the ELF span in 512-page chunks to stay within MM_MAP_WINDOW limit.
         const CHUNK_PAGES: usize = 512;
-        let mut chunk_off: usize = 0;
-        while chunk_off < total_span_pages {
-            let chunk_count = if total_span_pages - chunk_off > CHUNK_PAGES {
-                CHUNK_PAGES
-            } else {
-                total_span_pages - chunk_off
-            };
-            let chunk_vaddr = span_start + (chunk_off as u64) * 4096;
-            let chunk_size = (chunk_count as u64) * 4096;
-
-            // 1. Map window (dual-mapped: child + procmgr scratch)
-            let mut mm_msg = TronaMsg::zeroed();
-            let mut mm_reply = TronaMsg::zeroed();
-            mm_msg.label = MM_MAP_WINDOW;
-            mm_msg.length = 5;
-            mm_msg.regs[0] = pid as u64;
-            mm_msg.regs[1] = chunk_vaddr;
-            mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
-            mm_msg.regs[3] = chunk_count as u64;
-            mm_msg.regs[4] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-            trona::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-            let err = trona::ipc::call_ctx(
-                super::ipc_ctx(),
-                CAP_MMSRV_EP,
-                &raw const mm_msg,
-                &raw mut mm_reply,
-            );
-            if err != 0 || mm_reply.label != TRONA_OK || mm_reply.regs[0] != chunk_count as u64 {
-                trona::uerror!(|_lb| {
-                    _lb.str(b"[PROCMGR] exec ELF MM_MAP_WINDOW failed err=");
-                    _lb.hex(err as u64);
-                    _lb.str(b" label=");
-                    _lb.hex(mm_reply.label);
-                    _lb.str(b" mapped=");
-                    _lb.hex(mm_reply.regs[0]);
-                    _lb.str(b"/");
-                    _lb.hex(chunk_count as u64);
-                    _lb.str(b"\n");
-                });
-                return ELF_MAP_FAILED;
-            }
-
-            // 2. Zero the window
-            let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
-            unsafe { volatile_zero(scratch, chunk_count * 4096) };
-
-            // 3. Copy overlapping PT_LOAD segment data into the window
-            for seg_i in 0..phdr_count {
-                let off = phdr_base + seg_i * phdr_size;
-                if off + core::mem::size_of::<Elf64Phdr>() > data_len {
-                    break;
-                }
-                let phdr = &*(data.add(off) as *const Elf64Phdr);
-                if phdr.p_type != PT_LOAD {
-                    continue;
-                }
-
-                let seg_vaddr = phdr.p_vaddr.wrapping_add(delta);
-                let seg_file_end = seg_vaddr + phdr.p_filesz;
-                let chunk_end = chunk_vaddr + chunk_size;
-
-                if seg_vaddr >= chunk_end || seg_file_end <= chunk_vaddr {
-                    continue;
-                }
-
-                let copy_start = if seg_vaddr > chunk_vaddr { seg_vaddr } else { chunk_vaddr };
-                let copy_end = if seg_file_end < chunk_end { seg_file_end } else { chunk_end };
-                let file_off = phdr.p_offset as usize + (copy_start - seg_vaddr) as usize;
-                let win_off = (copy_start - chunk_vaddr) as usize;
-                let copy_len = (copy_end - copy_start) as usize;
-
-                if copy_len > 0 && file_off + copy_len <= data_len {
-                    unsafe { volatile_copy(scratch.add(win_off), data.add(file_off), copy_len) };
-                }
-            }
-
-            // 4. Apply relocations targeting this chunk
-            if is_pie {
-                exec_apply_relocs_chunk(
-                    data, data_len, ehdr, delta, load_base,
-                    scratch, chunk_vaddr, chunk_size,
-                );
-            }
-
-            // 5. Unmap window
-            unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, chunk_count as u64);
-            chunk_off += chunk_count;
+        let stage = alloc_staging_buffer(CHUNK_PAGES);
+        if stage.is_null() {
+            return ELF_OUT_OF_MEMORY;
         }
 
-        protect_load_pages(
-            child_vspace,
-            data.add(phdr_base),
-            phdr_count,
-            phdr_size,
-            data_len - phdr_base,
-            delta,
-        );
+        let load_status = (|| -> i32 {
+            let mut chunk_off: usize = 0;
+            while chunk_off < total_span_pages {
+                let chunk_count = if total_span_pages - chunk_off > CHUNK_PAGES {
+                    CHUNK_PAGES
+                } else {
+                    total_span_pages - chunk_off
+                };
+                let chunk_vaddr = span_start + (chunk_off as u64) * 4096;
+                let chunk_size = (chunk_count as u64) * 4096;
 
-        let brk = span_end;
+                volatile_zero(stage, chunk_count * 4096);
 
-        (*result).entry = if is_pie {
-            ehdr.e_entry.wrapping_add(delta)
-        } else {
-            ehdr.e_entry
-        };
-        (*result).base = load_base;
-        (*result).brk = brk;
+                for seg_i in 0..phdr_count {
+                    let off = phdr_base + seg_i * phdr_size;
+                    if off + core::mem::size_of::<Elf64Phdr>() > data_len {
+                        break;
+                    }
+                    let phdr = &*(data.add(off) as *const Elf64Phdr);
+                    if phdr.p_type != PT_LOAD {
+                        continue;
+                    }
 
-        0
+                    let seg_vaddr = phdr.p_vaddr.wrapping_add(delta);
+                    let seg_file_end = seg_vaddr + phdr.p_filesz;
+                    let chunk_end = chunk_vaddr + chunk_size;
+                    if seg_vaddr >= chunk_end || seg_file_end <= chunk_vaddr {
+                        continue;
+                    }
+
+                    let copy_start = if seg_vaddr > chunk_vaddr { seg_vaddr } else { chunk_vaddr };
+                    let copy_end = if seg_file_end < chunk_end { seg_file_end } else { chunk_end };
+                    let file_off = phdr.p_offset as usize + (copy_start - seg_vaddr) as usize;
+                    let win_off = (copy_start - chunk_vaddr) as usize;
+                    let copy_len = (copy_end - copy_start) as usize;
+
+                    if copy_len > 0 && file_off + copy_len <= data_len {
+                        volatile_copy(stage.add(win_off), data.add(file_off), copy_len);
+                    }
+                }
+
+                if is_pie {
+                    exec_apply_relocs_chunk(
+                        data,
+                        data_len,
+                        ehdr,
+                        delta,
+                        load_base,
+                        stage,
+                        chunk_vaddr,
+                        chunk_size,
+                    );
+                }
+
+                if chunk_off == 0 {
+                    let region_base = match alloc_private_copy_from_client_region_to_mmsrv(
+                        pid,
+                        span_start,
+                        total_span_pages as u64,
+                        chunk_vaddr,
+                        stage as u64,
+                        chunk_count as u64,
+                        VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+                    ) {
+                        Ok(v) => v,
+                        Err((err, label, value)) => {
+                            trona::uerror!(|_lb| {
+                                _lb.str(b"[PROCMGR] exec ELF MM_ALLOC_PRIVATE_COPY failed err=");
+                                _lb.hex(err as u64);
+                                _lb.str(b" label=");
+                                _lb.hex(label);
+                                _lb.str(b" value=");
+                                _lb.hex(value);
+                                _lb.str(b"\n");
+                            });
+                            return ELF_MAP_FAILED;
+                        }
+                    };
+                    if region_base != span_start {
+                        return ELF_MAP_FAILED;
+                    }
+                } else {
+                    let copied = match copy_from_client_region_to_mmsrv(
+                        pid,
+                        chunk_vaddr,
+                        stage as u64,
+                        chunk_count as u64,
+                    ) {
+                        Ok(v) => v,
+                        Err((err, label, value)) => {
+                            trona::uerror!(|_lb| {
+                                _lb.str(b"[PROCMGR] exec ELF MM_COPY_FROM_CLIENT_REGION failed err=");
+                                _lb.hex(err as u64);
+                                _lb.str(b" label=");
+                                _lb.hex(label);
+                                _lb.str(b" value=");
+                                _lb.hex(value);
+                                _lb.str(b"\n");
+                            });
+                            return ELF_MAP_FAILED;
+                        }
+                    };
+                    if copied != chunk_count as u64 {
+                        return ELF_MAP_FAILED;
+                    }
+                }
+
+                chunk_off += chunk_count;
+            }
+
+            protect_load_pages(
+                child_vspace,
+                data.add(phdr_base),
+                phdr_count,
+                phdr_size,
+                data_len - phdr_base,
+                delta,
+            );
+
+            (*result).entry = if is_pie {
+                ehdr.e_entry.wrapping_add(delta)
+            } else {
+                ehdr.e_entry
+            };
+            (*result).base = load_base;
+            (*result).brk = span_end;
+
+            0
+        })();
+
+        free_staging_buffer(stage, CHUNK_PAGES);
+        load_status
     }
 }
 
-/// Apply RELATIVE relocations through a mapped write window chunk.
+/// Apply RELATIVE relocations into a staged chunk buffer.
 ///
 /// Only applies relocations whose target address falls within
 /// `[chunk_vaddr, chunk_vaddr + chunk_size)`.
 ///
 /// # Safety
-/// `scratch` must point to a mapped region covering the chunk.
+/// `scratch` must point to a writable chunk buffer covering the chunk.
 unsafe fn exec_apply_relocs_chunk(
     data: *const u8,
     data_len: usize,
@@ -2188,7 +2376,7 @@ pub(crate) unsafe fn exec_load_elf_vfs_mmsrv(
         use trona::consts::{
             ELFCLASS64, ELFDATA2LSB, ELF_BAD_ARCH, ELF_BAD_TYPE, ELF_MAP_FAILED, ELF_NOT_64BIT,
             ELF_NOT_ELF, ELF_NOT_LE, ELF_NO_LOAD, ELF_OUT_OF_MEMORY, ELF_TOO_SMALL,
-            EM_AARCH64, EM_X86_64, ET_DYN, ET_EXEC, MM_MAP_WINDOW, PF_W, PF_X, PT_LOAD,
+            EM_AARCH64, EM_X86_64, ET_DYN, ET_EXEC, PF_W, PF_X, PT_LOAD,
         };
 
         let fd = vfs.fd;
@@ -2285,100 +2473,118 @@ pub(crate) unsafe fn exec_load_elf_vfs_mmsrv(
         }
 
         const CHUNK_PAGES: usize = 512;
-        let mut chunk_off = 0usize;
-        while chunk_off < total_span_pages {
-            let chunk_count = core::cmp::min(total_span_pages - chunk_off, CHUNK_PAGES);
-            let chunk_vaddr = span_start + (chunk_off as u64) * 4096;
-            let chunk_size = (chunk_count as u64) * 4096;
+        let stage = alloc_staging_buffer(CHUNK_PAGES);
+        if stage.is_null() {
+            return ELF_OUT_OF_MEMORY;
+        }
 
-            let mut mm_msg = TronaMsg::zeroed();
-            let mut mm_reply = TronaMsg::zeroed();
-            mm_msg.label = MM_MAP_WINDOW;
-            mm_msg.length = 5;
-            mm_msg.regs[0] = pid as u64;
-            mm_msg.regs[1] = chunk_vaddr;
-            mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
-            mm_msg.regs[3] = chunk_count as u64;
-            mm_msg.regs[4] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-            trona::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-            let err = trona::ipc::call_ctx(
-                super::ipc_ctx(),
-                CAP_MMSRV_EP,
-                &raw const mm_msg,
-                &raw mut mm_reply,
-            );
-            if err != 0 || mm_reply.label != TRONA_OK || mm_reply.regs[0] != chunk_count as u64 {
-                return ELF_MAP_FAILED;
-            }
+        let load_status = (|| -> i32 {
+            let mut chunk_off = 0usize;
+            while chunk_off < total_span_pages {
+                let chunk_count = core::cmp::min(total_span_pages - chunk_off, CHUNK_PAGES);
+                let chunk_vaddr = span_start + (chunk_off as u64) * 4096;
+                let chunk_size = (chunk_count as u64) * 4096;
 
-            let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
-            volatile_zero(scratch, chunk_count * 4096);
+                volatile_zero(stage, chunk_count * 4096);
 
-            for seg_i in 0..phdr_count {
-                let off = seg_i * phdr_size;
-                if off + core::mem::size_of::<Elf64Phdr>() > phdr_bytes_len {
-                    break;
-                }
-                let phdr = &*(phdr_bytes.as_ptr().add(off) as *const Elf64Phdr);
-                if phdr.p_type != PT_LOAD {
-                    continue;
-                }
+                for seg_i in 0..phdr_count {
+                    let off = seg_i * phdr_size;
+                    if off + core::mem::size_of::<Elf64Phdr>() > phdr_bytes_len {
+                        break;
+                    }
+                    let phdr = &*(phdr_bytes.as_ptr().add(off) as *const Elf64Phdr);
+                    if phdr.p_type != PT_LOAD {
+                        continue;
+                    }
 
-                let seg_vaddr = phdr.p_vaddr.wrapping_add(delta);
-                let seg_file_end = seg_vaddr + phdr.p_filesz;
-                let chunk_end = chunk_vaddr + chunk_size;
-                if seg_vaddr >= chunk_end || seg_file_end <= chunk_vaddr {
-                    continue;
+                    let seg_vaddr = phdr.p_vaddr.wrapping_add(delta);
+                    let seg_file_end = seg_vaddr + phdr.p_filesz;
+                    let chunk_end = chunk_vaddr + chunk_size;
+                    if seg_vaddr >= chunk_end || seg_file_end <= chunk_vaddr {
+                        continue;
+                    }
+
+                    let copy_start = if seg_vaddr > chunk_vaddr { seg_vaddr } else { chunk_vaddr };
+                    let copy_end = if seg_file_end < chunk_end { seg_file_end } else { chunk_end };
+                    let file_off = phdr.p_offset as usize + (copy_start - seg_vaddr) as usize;
+                    let win_off = (copy_start - chunk_vaddr) as usize;
+                    let copy_len = (copy_end - copy_start) as usize;
+
+                    if copy_len > 0 && file_off + copy_len <= data_len {
+                        if !super::vfs_load::vfs_read_exact_at(fd, stage.add(win_off), copy_len, file_off) {
+                            return ELF_MAP_FAILED;
+                        }
+                    }
                 }
 
-                let copy_start = if seg_vaddr > chunk_vaddr { seg_vaddr } else { chunk_vaddr };
-                let copy_end = if seg_file_end < chunk_end { seg_file_end } else { chunk_end };
-                let file_off = phdr.p_offset as usize + (copy_start - seg_vaddr) as usize;
-                let win_off = (copy_start - chunk_vaddr) as usize;
-                let copy_len = (copy_end - copy_start) as usize;
+                if is_pie {
+                    exec_apply_relocs_chunk_cached(
+                        vfs.rela_data,
+                        vfs.rela_len,
+                        vfs.rela_ent,
+                        delta,
+                        load_base,
+                        stage,
+                        chunk_vaddr,
+                        chunk_size,
+                    );
+                }
 
-                if copy_len > 0 && file_off + copy_len <= data_len {
-                    if !super::vfs_load::vfs_read_exact_at(fd, scratch.add(win_off), copy_len, file_off) {
-                        unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, chunk_count as u64);
+                if chunk_off == 0 {
+                    let region_base = match alloc_private_copy_from_client_region_to_mmsrv(
+                        pid,
+                        span_start,
+                        total_span_pages as u64,
+                        chunk_vaddr,
+                        stage as u64,
+                        chunk_count as u64,
+                        VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+                    ) {
+                        Ok(v) => v,
+                        Err(_) => return ELF_MAP_FAILED,
+                    };
+                    if region_base != span_start {
+                        return ELF_MAP_FAILED;
+                    }
+                } else {
+                    let copied = match copy_from_client_region_to_mmsrv(
+                        pid,
+                        chunk_vaddr,
+                        stage as u64,
+                        chunk_count as u64,
+                    ) {
+                        Ok(v) => v,
+                        Err(_) => return ELF_MAP_FAILED,
+                    };
+                    if copied != chunk_count as u64 {
                         return ELF_MAP_FAILED;
                     }
                 }
+
+                chunk_off += chunk_count;
             }
 
-            if is_pie {
-                exec_apply_relocs_chunk_cached(
-                    vfs.rela_data,
-                    vfs.rela_len,
-                    vfs.rela_ent,
-                    delta,
-                    load_base,
-                    scratch,
-                    chunk_vaddr,
-                    chunk_size,
-                );
-            }
+            protect_load_pages(
+                child_vspace,
+                phdr_bytes.as_ptr(),
+                phdr_count,
+                phdr_size,
+                phdr_bytes_len,
+                delta,
+            );
 
-            unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, chunk_count as u64);
-            chunk_off += chunk_count;
-        }
+            (*result).entry = if is_pie {
+                ehdr.e_entry.wrapping_add(delta)
+            } else {
+                ehdr.e_entry
+            };
+            (*result).base = load_base;
+            (*result).brk = span_end;
+            0
+        })();
 
-        protect_load_pages(
-            child_vspace,
-            phdr_bytes.as_ptr(),
-            phdr_count,
-            phdr_size,
-            phdr_bytes_len,
-            delta,
-        );
-
-        (*result).entry = if is_pie {
-            ehdr.e_entry.wrapping_add(delta)
-        } else {
-            ehdr.e_entry
-        };
-        (*result).base = load_base;
-        (*result).brk = span_end;
-        0
+        free_staging_buffer(stage, CHUNK_PAGES);
+        load_status
     }
 }
 
@@ -2478,74 +2684,336 @@ pub(crate) unsafe fn exec_load_rtld_mmsrv_by_name(
     }
 }
 
-/// Map stack pages for exec via mmsrv.
-///
-/// Maps lower stack pages (zero-filled) via MM_MAP_BATCH and the top stack
-/// page via MM_MAP_WINDOW (dual-mapped for writing stack data).
-/// After this returns, PROCMGR_SCRATCH_VADDR points to the top stack page.
-///
-/// Returns 0 on success, nonzero on error.
-pub(crate) unsafe fn exec_map_stack_mmsrv(
+pub(crate) unsafe fn exec_load_pe_mmsrv_by_name(
+    pe_name: *const u8,
+    pe_name_len: usize,
+    initrd: *const u8,
+    initrd_size: usize,
+    pe_load_base: u64,
     pid: u32,
-    stack_base: u64,
-    stack_pages: usize,
-    stack_top: u64,
-) -> i32 {
+    child_vspace: Cap,
+) -> Option<PeLoadResult> {
     unsafe {
-        // Map lower stack pages (zero-filled, child only) via MM_MAP_BATCH
-        if stack_pages > 0 {
-            let mut mm_msg = TronaMsg::zeroed();
-            let mut mm_reply = TronaMsg::zeroed();
-            mm_msg.label = trona::consts::MM_MAP_BATCH;
-            mm_msg.length = 4;
-            mm_msg.regs[0] = pid as u64;
-            mm_msg.regs[1] = stack_base;
-            mm_msg.regs[2] = stack_pages as u64;
-            mm_msg.regs[3] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-            let err = trona::ipc::call_ctx(
-                super::ipc_ctx(),
-                CAP_MMSRV_EP,
-                &raw const mm_msg,
-                &raw mut mm_reply,
-            );
-            if err != 0
-                || mm_reply.label != TRONA_OK
-                || mm_reply.regs[0] != stack_pages as u64
-            {
-                trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] exec: MM_MAP_BATCH stack failed\n"); });
-                return -1;
+        let mut pe_entry = CpioEntry::zeroed();
+        if trona_loader::cpio::cpio_find_file(
+            initrd,
+            initrd_size,
+            pe_name,
+            pe_name_len,
+            &raw mut pe_entry,
+        ) == 0
+        {
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] exec: PE image not found in initrd\n"); });
+            return None;
+        }
+
+        match exec_load_pe_mmsrv(
+            pe_entry.data,
+            pe_entry.data_len,
+            pe_load_base,
+            pid,
+            child_vspace,
+        ) {
+            Ok(result) => Some(result),
+            Err(err) => {
+                trona::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] exec: PE image load failed err=");
+                    _lb.hex(err as u64);
+                    _lb.str(b"\n");
+                });
+                None
             }
         }
+    }
+}
 
-        // Map top stack page via MM_MAP_WINDOW (dual-mapped: child + procmgr scratch)
-        let mut mm_msg = TronaMsg::zeroed();
-        let mut mm_reply = TronaMsg::zeroed();
-        mm_msg.label = trona::consts::MM_MAP_WINDOW;
-        mm_msg.length = 5;
-        mm_msg.regs[0] = pid as u64;
-        mm_msg.regs[1] = stack_top - 4096;
-        mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
-        mm_msg.regs[3] = 1;
-        mm_msg.regs[4] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-        trona::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-        let err = trona::ipc::call_ctx(
-            super::ipc_ctx(),
-            CAP_MMSRV_EP,
-            &raw const mm_msg,
-            &raw mut mm_reply,
-        );
-        if err != 0 || mm_reply.label != TRONA_OK || mm_reply.regs[0] != 1 {
-            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] exec: MM_MAP_WINDOW stack top failed\n"); });
-            return -1;
+/// Load a PE image into a child's VSpace using mmsrv for frame allocation.
+///
+/// Maps the PE image into the child's VSpace at `load_base`. The PE data is
+/// copied section-by-section through a staged chunk buffer, then transferred
+/// into the child region via mmsrv copy transactions.
+///
+/// Returns a `PeLoadResult` on success (entry VA, base VA, image end VA).
+///
+/// # Safety
+/// `data` must point to a valid PE32+ file of at least `data_len` bytes.
+pub(crate) unsafe fn exec_load_pe_mmsrv(
+    data: *const u8,
+    data_len: usize,
+    load_base: u64,
+    pid: u32,
+    child_vspace: Cap,
+) -> Result<PeLoadResult, i32> {
+    unsafe {
+        let mut info = trona_loader::pe_loader::PeInfo::zeroed();
+        let err = trona_loader::pe_loader::pe_validate(data, data_len, &raw mut info);
+        if err != 0 {
+            return Err(err);
         }
 
-        0
+        let image_size = info.size_of_image as u64;
+        let total_pages = ((image_size + 4095) / 4096) as usize;
+        if total_pages == 0 {
+            return Err(-1);
+        }
+
+        const MAX_CHUNK: usize = 16;
+        let stage = alloc_staging_buffer(MAX_CHUNK);
+        if stage.is_null() {
+            return Err(-1);
+        }
+
+        let load_status = (|| -> Result<(), i32> {
+            let mut page_off: usize = 0;
+            while page_off < total_pages {
+                let chunk_count = core::cmp::min(MAX_CHUNK, total_pages - page_off);
+                let chunk_vaddr = load_base + (page_off as u64 * 4096);
+                let chunk_rva = page_off * 4096;
+                let chunk_len = chunk_count * 4096;
+
+                volatile_zero(stage, chunk_len);
+
+                let header_bytes = core::cmp::min(info.size_of_headers as usize, data_len);
+                let header_copy_start = chunk_rva;
+                let header_copy_end = core::cmp::min(chunk_rva + chunk_len, header_bytes);
+                if header_copy_start < header_copy_end {
+                    volatile_copy(
+                        stage,
+                        data.add(header_copy_start),
+                        header_copy_end - header_copy_start,
+                    );
+                }
+
+                for sec_idx in 0..info.number_of_sections as usize {
+                    let sec_off = info.section_headers_offset
+                        + sec_idx * core::mem::size_of::<SectionHeader>();
+                    let sec = core::ptr::read_unaligned(data.add(sec_off) as *const SectionHeader);
+                    let sec_rva = sec.virtual_address as usize;
+                    let sec_raw_off = sec.pointer_to_raw_data as usize;
+                    let sec_raw_size = sec.size_of_raw_data as usize;
+
+                    if sec_raw_size == 0 || sec_raw_off >= data_len {
+                        continue;
+                    }
+
+                    let sec_copy_start = core::cmp::max(chunk_rva, sec_rva);
+                    let sec_copy_end = core::cmp::min(chunk_rva + chunk_len, sec_rva + sec_raw_size);
+                    if sec_copy_start >= sec_copy_end {
+                        continue;
+                    }
+
+                    let file_start = sec_raw_off + (sec_copy_start - sec_rva);
+                    if file_start >= data_len {
+                        continue;
+                    }
+
+                    let max_copy = data_len - file_start;
+                    let copy_len = core::cmp::min(sec_copy_end - sec_copy_start, max_copy);
+                    if copy_len == 0 {
+                        continue;
+                    }
+
+                    volatile_copy(
+                        stage.add(sec_copy_start - chunk_rva),
+                        data.add(file_start),
+                        copy_len,
+                    );
+                }
+
+                if page_off == 0 {
+                    let region_base = alloc_private_copy_from_client_region_to_mmsrv(
+                        pid,
+                        load_base,
+                        total_pages as u64,
+                        chunk_vaddr,
+                        stage as u64,
+                        chunk_count as u64,
+                        VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+                    )
+                    .map_err(|_| -2)?;
+                    if region_base != load_base {
+                        return Err(-2);
+                    }
+                } else {
+                    let copied = copy_from_client_region_to_mmsrv(
+                        pid,
+                        chunk_vaddr,
+                        stage as u64,
+                        chunk_count as u64,
+                    )
+                    .map_err(|_| -2)?;
+                    if copied != chunk_count as u64 {
+                        return Err(-2);
+                    }
+                }
+
+                page_off += chunk_count;
+            }
+
+            Ok(())
+        })();
+
+        free_staging_buffer(stage, MAX_CHUNK);
+        load_status?;
+
+        // NOTE: Section permissions are NOT set here for PE images.
+        // The PE rtld writes to the IAT (in .rdata) during import resolution,
+        // then applies final protections through mmsrv MM_MPROTECT so region
+        // metadata and live PTE permissions stay in sync.
+
+        let entry_va = load_base + info.entry_point_rva as u64;
+        Ok(PeLoadResult {
+            entry: entry_va,
+            base: load_base,
+            image_end: load_base + image_size,
+        })
+    }
+}
+
+/// Write a PE-specific initial stack with PE auxv entries.
+///
+/// Stack layout for PE processes (same SysV ABI format as ELF):
+///   - string data (argv/envp)
+///   - auxv entries (PE-specific: PE_BASE, PE_SIZE, WIN32SRV, plus common)
+///   - envp array + NULL
+///   - argv array + NULL
+///   - argc   <-- SP
+///
+/// # Safety
+/// `page_base` must point to a writable 4K stack page image buffer.
+pub(crate) unsafe fn write_pe_stack(
+    pe_result: &PeLoadResult,
+    rtld_result: &ElfLoadResult,
+    kernel32_result: &PeLoadResult,
+    page_base: *mut u8,
+    scratch_vaddr: u64,
+    ipc_buffer_vaddr: u64,
+    win32srv_ep: u64,
+    argc: u32,
+    envc: u32,
+    str_data: &[u8],
+    str_len: usize,
+    stack_top: u64,
+    slot_pool_base: u64,
+    slot_pool_count: u64,
+) -> Result<u64, StackBuildError> {
+    unsafe {
+        if str_len > str_data.len() || str_len > 4096 {
+            return Err(StackBuildError::TooLarge);
+        }
+        if argc as usize > MAX_STACK_STRINGS || envc as usize > MAX_STACK_STRINGS {
+            return Err(StackBuildError::TooLarge);
+        }
+
+        let Some(child_page_base) = stack_top.checked_sub(4096) else {
+            return Err(StackBuildError::InvalidArgument);
+        };
+
+        // 1. Copy string data to the top of the page
+        let Some(str_area_start) = 4096usize.checked_sub(str_len) else {
+            return Err(StackBuildError::TooLarge);
+        };
+        for i in 0..str_len {
+            core::ptr::write_volatile(page_base.add(str_area_start + i), str_data[i]);
+        }
+
+        // 2. Build pointer arrays
+        let mut argv_ptrs = [0u64; MAX_STACK_STRINGS];
+        let mut envp_ptrs = [0u64; MAX_STACK_STRINGS];
+        let mut arg_idx: u32 = 0;
+        let mut env_idx: u32 = 0;
+        let mut pos = 0usize;
+
+        while arg_idx < argc {
+            if pos >= str_len {
+                return Err(StackBuildError::InvalidArgument);
+            }
+            let str_start = pos;
+            while pos < str_len && str_data[pos] != 0 {
+                pos += 1;
+            }
+            if pos >= str_len {
+                return Err(StackBuildError::InvalidArgument);
+            }
+            argv_ptrs[arg_idx as usize] = child_page_base + str_area_start as u64 + str_start as u64;
+            arg_idx += 1;
+            pos += 1;
+        }
+
+        while env_idx < envc {
+            if pos >= str_len {
+                return Err(StackBuildError::InvalidArgument);
+            }
+            let str_start = pos;
+            while pos < str_len && str_data[pos] != 0 {
+                pos += 1;
+            }
+            if pos >= str_len {
+                return Err(StackBuildError::InvalidArgument);
+            }
+            envp_ptrs[env_idx as usize] = child_page_base + str_area_start as u64 + str_start as u64;
+            env_idx += 1;
+            pos += 1;
+        }
+
+        // 3. PE auxv: 16 entries (including AT_NULL)
+        let auxv_entries: usize = 16;
+        let auxv_u64s = auxv_entries * 2;
+        let metadata_u64s = 1 // argc
+            + arg_idx as usize + 1 // argv + NULL
+            + env_idx as usize + 1 // envp + NULL
+            + auxv_u64s;
+        let metadata_bytes = metadata_u64s * 8;
+        let metadata_end = str_area_start;
+        let Some(metadata_floor) = metadata_end.checked_sub(metadata_bytes) else {
+            return Err(StackBuildError::TooLarge);
+        };
+        let Some(metadata_start) = (metadata_floor & !0xF).checked_sub(STACK_ENTRY_BIAS) else {
+            return Err(StackBuildError::TooLarge);
+        };
+
+        let stack_u64 = page_base.add(metadata_start) as *mut u64;
+        let mut wi: usize = 0;
+        let mut w = |v: u64| {
+            core::ptr::write_volatile(stack_u64.add(wi), v);
+            wi += 1;
+        };
+
+        w(arg_idx as u64);
+        for i in 0..arg_idx as usize {
+            w(argv_ptrs[i]);
+        }
+        w(0);
+        for i in 0..env_idx as usize {
+            w(envp_ptrs[i]);
+        }
+        w(0);
+
+        // PE-specific auxv
+        w(AT_SALTYOS_PE_BASE); w(pe_result.base);
+        w(AT_SALTYOS_PE_SIZE); w(pe_result.image_end - pe_result.base);
+        w(AT_SALTYOS_WIN32SRV); w(win32srv_ep);
+        w(AT_SALTYOS_KERNEL32_BASE); w(kernel32_result.base);
+        w(AT_SALTYOS_KERNEL32_SIZE); w(kernel32_result.image_end - kernel32_result.base);
+        w(AT_BASE); w(rtld_result.base);
+        w(AT_ENTRY); w(pe_result.entry);
+        w(AT_PAGESZ); w(4096);
+        w(AT_TRONA_VSPACE); w(CHILD_CAP_VSPACE);
+        w(AT_TRONA_SCRATCH); w(scratch_vaddr);
+        w(AT_TRONA_IPC_BUFFER); w(ipc_buffer_vaddr);
+        w(AT_TRONA_SLOT_BASE); w(slot_pool_base);
+        w(AT_TRONA_SLOT_COUNT); w(slot_pool_count);
+        w(AT_TRONA_CSPACE_NTFN); w(CHILD_CAP_CSPACE_NTFN);
+        w(AT_TRONA_MM_EP); w(CHILD_CAP_MMSRV_EP);
+        w(AT_NULL); w(0);
+
+        Ok(child_page_base + metadata_start as u64)
     }
 }
 
 /// Map initrd pages into a child's VSpace for exec.
 ///
-/// Tries device-mapping first. Falls back to mmsrv MM_MAP_WINDOW copy.
+/// Tries device-mapping first. Falls back to mmsrv initrd copy transactions.
 ///
 /// # Safety
 /// `initrd` must point to the initrd data, `initrd_size` must be valid.
@@ -2581,43 +3049,18 @@ pub(crate) unsafe fn exec_map_initrd_mmsrv(
             return 0;
         }
 
-        // Copy fallback: allocate frames via mmsrv MM_MAP_WINDOW (one page at a time)
-        for pg in 0..initrd_pages {
-            let mut mm_msg = TronaMsg::zeroed();
-            let mut mm_reply = TronaMsg::zeroed();
-            mm_msg.label = trona::consts::MM_MAP_WINDOW;
-            mm_msg.length = 5;
-            mm_msg.regs[0] = pid as u64;
-            mm_msg.regs[1] = initrd_base + pg as u64 * 4096;
-            mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
-            mm_msg.regs[3] = 1;
-            mm_msg.regs[4] = VSPACE_FLAG_USER;
-            trona::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-            let err = trona::ipc::call_ctx(
-                super::ipc_ctx(),
-                CAP_MMSRV_EP,
-                &raw const mm_msg,
-                &raw mut mm_reply,
-            );
-            if err != 0 || mm_reply.label != TRONA_OK || mm_reply.regs[0] != 1 {
-                trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] exec: initrd MM_MAP_WINDOW failed\n"); });
-                return -1;
-            }
-
-            let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
-            let src = initrd.add(pg * 4096);
-            let mut copy_len = 4096usize;
-            if pg * 4096 + copy_len > initrd_size {
-                copy_len = initrd_size - pg * 4096;
-            }
-            for i in 0..copy_len {
-                core::ptr::write_volatile(scratch.add(i), *src.add(i));
-            }
-            for i in copy_len..4096 {
-                core::ptr::write_volatile(scratch.add(i), 0);
-            }
-
-            unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, 1);
+        let _ = initrd;
+        if alloc_initrd_copy_from_mmsrv(
+            pid,
+            initrd_base,
+            initrd_pages as u64,
+            initrd_size as u64,
+            VSPACE_FLAG_USER,
+        )
+        .is_err()
+        {
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] exec: initrd MM_ALLOC_INITRD_COPY failed\n"); });
+            return -1;
         }
 
         0
@@ -2629,34 +3072,16 @@ pub(crate) unsafe fn exec_map_initrd_mmsrv(
 /// Returns 0 on success.
 pub(crate) unsafe fn exec_map_bootinfo_mmsrv(pid: u32) -> i32 {
     unsafe {
-        let mut mm_msg = TronaMsg::zeroed();
-        let mut mm_reply = TronaMsg::zeroed();
-        mm_msg.label = trona::consts::MM_MAP_WINDOW;
-        mm_msg.length = 5;
-        mm_msg.regs[0] = pid as u64;
-        mm_msg.regs[1] = super::BOOTINFO_VADDR;
-        mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
-        mm_msg.regs[3] = 1;
-        mm_msg.regs[4] = VSPACE_FLAG_USER;
-        trona::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-        let err = trona::ipc::call_ctx(
-            super::ipc_ctx(),
-            CAP_MMSRV_EP,
-            &raw const mm_msg,
-            &raw mut mm_reply,
-        );
-        if err != 0 || mm_reply.label != TRONA_OK || mm_reply.regs[0] != 1 {
-            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] exec: bootinfo MM_MAP_WINDOW failed\n"); });
+        if alloc_bootinfo_copy_from_mmsrv(
+            pid,
+            super::BOOTINFO_VADDR,
+            VSPACE_FLAG_USER,
+        )
+        .is_err()
+        {
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] exec: bootinfo MM_ALLOC_BOOTINFO_COPY failed\n"); });
             return -1;
         }
-
-        let bi_src = super::BOOTINFO_VADDR as *const u8;
-        let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
-        for i in 0..4096usize {
-            core::ptr::write_volatile(scratch.add(i), core::ptr::read_volatile(bi_src.add(i)));
-        }
-
-        unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, 1);
 
         0
     }
@@ -2669,7 +3094,7 @@ pub(crate) unsafe fn exec_map_ipc_buf_mmsrv(pid: u32, ipc_buf_vaddr: u64) -> i32
     unsafe {
         let mut mm_msg = TronaMsg::zeroed();
         let mut mm_reply = TronaMsg::zeroed();
-        mm_msg.label = trona::consts::MM_MAP_BATCH;
+        mm_msg.label = trona::protocol::MM_MAP_BATCH;
         mm_msg.length = 4;
         mm_msg.regs[0] = pid as u64;
         mm_msg.regs[1] = ipc_buf_vaddr;
@@ -2700,7 +3125,7 @@ pub(crate) unsafe fn exec_map_ipc_buf_mmsrv(pid: u32, ipc_buf_vaddr: u64) -> i32
 pub(crate) fn register_with_mmsrv(pid: u32, vspace_cap: Cap, heap_base: u64, mmap_base: u64) {
     let mut msg = TronaMsg::zeroed();
     let mut mm_reply = TronaMsg::zeroed();
-    msg.label = trona::consts::MM_REGISTER;
+    msg.label = trona::protocol::MM_REGISTER;
     msg.length = 4;
     msg.regs[0] = pid as u64; // client badge
     msg.regs[1] = heap_base;
@@ -2747,7 +3172,7 @@ pub(crate) fn clear_fault_handler(tcb_cap: Cap, pid: u32) {
 pub(crate) fn deregister_from_mmsrv(pid: u32) {
     let mut msg = TronaMsg::zeroed();
     let mut mm_reply = TronaMsg::zeroed();
-    msg.label = trona::consts::MM_DEREGISTER;
+    msg.label = trona::protocol::MM_DEREGISTER;
     msg.length = 1;
     msg.regs[0] = pid as u64;
     let _ = unsafe {
@@ -2760,22 +3185,125 @@ pub(crate) fn deregister_from_mmsrv(pid: u32) {
     };
 }
 
-/// Unmap a write window from procmgr's VSpace via mmsrv.
-pub(crate) fn unmap_window_from_mmsrv(window_vaddr: u64, num_pages: u64) {
+pub(crate) fn alloc_initrd_copy_from_mmsrv(
+    pid: u32,
+    region_base: u64,
+    region_pages: u64,
+    copy_len: u64,
+    flags: u64,
+) -> Result<u64, (i32, u64, u64)> {
     let mut msg = TronaMsg::zeroed();
     let mut mm_reply = TronaMsg::zeroed();
-    msg.label = trona::consts::MM_UNMAP_WINDOW;
-    msg.length = 2;
-    msg.regs[0] = window_vaddr;
-    msg.regs[1] = num_pages;
+    msg.label = trona::protocol::MM_ALLOC_INITRD_COPY;
+    msg.length = 5;
+    msg.regs[0] = pid as u64;
+    msg.regs[1] = region_base;
+    msg.regs[2] = region_pages;
+    msg.regs[3] = copy_len;
+    msg.regs[4] = flags;
     unsafe {
-        trona::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-        let _ = trona::ipc::call_ctx(
+        let err = trona::ipc::call_ctx(
             super::ipc_ctx(),
             CAP_MMSRV_EP,
             &raw const msg,
             &raw mut mm_reply,
         );
+        if err != 0 || mm_reply.label != TRONA_OK {
+            Err((err, mm_reply.label, mm_reply.regs[0]))
+        } else {
+            Ok(mm_reply.regs[0])
+        }
+    }
+}
+
+pub(crate) fn alloc_bootinfo_copy_from_mmsrv(
+    pid: u32,
+    region_base: u64,
+    flags: u64,
+) -> Result<u64, (i32, u64, u64)> {
+    let mut msg = TronaMsg::zeroed();
+    let mut mm_reply = TronaMsg::zeroed();
+    msg.label = trona::protocol::MM_ALLOC_BOOTINFO_COPY;
+    msg.length = 3;
+    msg.regs[0] = pid as u64;
+    msg.regs[1] = region_base;
+    msg.regs[2] = flags;
+    unsafe {
+        let err = trona::ipc::call_ctx(
+            super::ipc_ctx(),
+            CAP_MMSRV_EP,
+            &raw const msg,
+            &raw mut mm_reply,
+        );
+        if err != 0 || mm_reply.label != TRONA_OK {
+            Err((err, mm_reply.label, mm_reply.regs[0]))
+        } else {
+            Ok(mm_reply.regs[0])
+        }
+    }
+}
+
+pub(crate) fn copy_from_client_region_to_mmsrv(
+    pid: u32,
+    target_vaddr: u64,
+    source_vaddr: u64,
+    page_count: u64,
+) -> Result<u64, (i32, u64, u64)> {
+    let mut msg = TronaMsg::zeroed();
+    let mut mm_reply = TronaMsg::zeroed();
+    msg.label = trona::protocol::MM_COPY_FROM_CLIENT_REGION;
+    msg.length = 4;
+    msg.regs[0] = pid as u64;
+    msg.regs[1] = target_vaddr;
+    msg.regs[2] = source_vaddr;
+    msg.regs[3] = page_count;
+    unsafe {
+        let err = trona::ipc::call_ctx(
+            super::ipc_ctx(),
+            CAP_MMSRV_EP,
+            &raw const msg,
+            &raw mut mm_reply,
+        );
+        if err != 0 || mm_reply.label != TRONA_OK {
+            Err((err, mm_reply.label, mm_reply.regs[0]))
+        } else {
+            Ok(mm_reply.regs[0])
+        }
+    }
+}
+
+pub(crate) fn alloc_private_copy_from_client_region_to_mmsrv(
+    pid: u32,
+    region_base: u64,
+    region_pages: u64,
+    target_vaddr: u64,
+    source_vaddr: u64,
+    page_count: u64,
+    flags: u64,
+) -> Result<u64, (i32, u64, u64)> {
+    let mut msg = TronaMsg::zeroed();
+    let mut mm_reply = TronaMsg::zeroed();
+    msg.label = trona::protocol::MM_ALLOC_PRIVATE_COPY_FROM_CLIENT_REGION;
+    msg.length = 7;
+    msg.regs[0] = pid as u64;
+    msg.regs[1] = region_base;
+    msg.regs[2] = region_pages;
+    msg.regs[3] = target_vaddr;
+    msg.regs[4] = source_vaddr;
+    msg.regs[5] = page_count;
+    msg.regs[6] = flags;
+    unsafe {
+        let err = trona::ipc::call_ctx(
+            super::ipc_ctx(),
+            CAP_MMSRV_EP,
+            &raw const msg,
+            &raw mut mm_reply,
+        );
+        if err != 0 || mm_reply.label != TRONA_OK {
+            Err((err, mm_reply.label, mm_reply.regs[0]))
+        } else {
+            Ok(mm_reply.regs[0])
+        }
     }
 }
 
@@ -2790,7 +3318,7 @@ pub unsafe fn handle_spawn_tx(
     reply: &mut TronaMsg,
     badge: u64,
     alloc: &mut Allocator,
-) {
+) -> bool {
     unsafe {
         // Parse message — new wire format:
         //   regs[0] = name_len
@@ -2821,7 +3349,7 @@ pub unsafe fn handle_spawn_tx(
             badge,
             &mut exec_path,
         );
-        let is_display = policy_is_display || super::bytes_eq(&name[..name_len], b"display");
+        let is_display = policy_is_display || super::bytes_eq(&name[..name_len], b"dispdrv");
 
         trona::udebug!(|_lb| {
             _lb.str(b"[PROCMGR] SPAWN: '");
@@ -2873,9 +3401,47 @@ pub unsafe fn handle_spawn_tx(
             }
         }
         if !found {
-            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] ELF not found in initrd or VFS\n"); });
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] binary not found in initrd or VFS\n"); });
             reply.label = TRONA_NOT_FOUND;
-            return;
+            return false;
+        }
+
+        // ---- PE detection: check for MZ magic ----
+        let is_pe = vfs_source.streamed().is_none()
+            && elf_entry.data_len >= 2
+            && trona_loader::pe_loader::pe_is_pe(elf_entry.data, elf_entry.data_len);
+        let subsystem_id = if is_pe {
+            proc_table::SUBSYS_WIN32
+        } else {
+            proc_table::SUBSYS_POSIX
+        };
+
+        if is_pe {
+            // Delegate to PE-specific spawn path
+            return handle_pe_spawn_inner(
+                msg,
+                reply,
+                badge,
+                alloc,
+                elf_entry.data,
+                elf_entry.data_len,
+                &name,
+                name_len,
+                &exec_path,
+                exec_path_len,
+                subsystem_id,
+                readiness_mode,
+                requested_timeout_ns,
+                spawn_flags,
+                spawn_args_len,
+                args_reg_idx,
+                use_pre_ep,
+                start_suspended,
+                policy_map_initrd,
+                policy_is_display,
+                policy_cnode_bits,
+                is_display,
+            );
         }
 
         let vfs_stream = vfs_source.streamed();
@@ -2952,7 +3518,7 @@ pub unsafe fn handle_spawn_tx(
             trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] ELF too large for VA layout\n"); });
             super::vfs_load::cleanup_exec_source(&mut vfs_source);
             reply.label = TRONA_INVALID_ARGUMENT;
-            return;
+            return false;
         }
 
         let plan = SpawnPlan {
@@ -2969,6 +3535,7 @@ pub unsafe fn handle_spawn_tx(
         let caller_idx = proc_table::find_by_badge(badge);
         if caller_idx.is_none() && badge != 0 {
             if let Some(ci) = proc_table::alloc_proc() {
+                proc_table::proctab(ci).set_posix_personality();
                 proc_table::proctab(ci).pid = badge as u32;
                 proc_table::proctab(ci).ppid = 0;
                 proc_table::proctab(ci).state = proc_table::PROC_RUNNING;
@@ -2980,18 +3547,21 @@ pub unsafe fn handle_spawn_tx(
             trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] process table full\n"); });
             super::vfs_load::cleanup_exec_source(&mut vfs_source);
             reply.label = TRONA_OUT_OF_MEMORY;
-            return;
+            return false;
         };
 
         let pid = proc_table::NEXT_PID;
         proc_table::NEXT_PID += 1;
+
+        // ---- PRE-PROVISION mmsrv untyped (breaks Procmgr↔MMSRV cycle) ----
+        ensure_mmsrv_capacity(alloc);
 
         // ---- RESERVE ----
         if !alloc.reserve(plan.total_slots) {
             trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] slot reservation failed\n"); });
             super::vfs_load::cleanup_exec_source(&mut vfs_source);
             reply.label = TRONA_OUT_OF_MEMORY;
-            return;
+            return false;
         }
 
         // ---- REALIZE fixed objects via mmsrv ----
@@ -3012,7 +3582,7 @@ pub unsafe fn handle_spawn_tx(
                         super::vfs_load::cleanup_exec_source(&mut vfs_source);
                         alloc.rollback();
                         reply.label = TRONA_OUT_OF_MEMORY;
-                        return;
+                        return false;
                     }
                 }
             };
@@ -3050,7 +3620,7 @@ pub unsafe fn handle_spawn_tx(
             super::vfs_load::cleanup_exec_source(&mut vfs_source);
             alloc.rollback();
             reply.label = TRONA_OUT_OF_MEMORY;
-            return;
+            return false;
         }
 
         // ---- Copy caps into child CNode ----
@@ -3069,7 +3639,7 @@ pub unsafe fn handle_spawn_tx(
             super::vfs_load::cleanup_exec_source(&mut vfs_source);
             alloc.rollback();
             reply.label = TRONA_OUT_OF_MEMORY;
-            return;
+            return false;
         }
 
         // ---- Mint CSpace expansion notification into child CNode ----
@@ -3095,7 +3665,7 @@ pub unsafe fn handle_spawn_tx(
             super::vfs_load::cleanup_exec_source(&mut vfs_source);
             alloc.rollback();
             reply.label = TRONA_OUT_OF_MEMORY;
-            return;
+            return false;
         }
 
         // ---- Set fault handler: badged mmsrv EP so VMFaults route to mmsrv ----
@@ -3107,7 +3677,7 @@ pub unsafe fn handle_spawn_tx(
                     super::vfs_load::cleanup_exec_source(&mut vfs_source);
                     alloc.rollback();
                     reply.label = TRONA_OUT_OF_MEMORY;
-                    return;
+                    return false;
                 }
             };
             let err = trona::invoke::cnode_mint(
@@ -3143,7 +3713,7 @@ pub unsafe fn handle_spawn_tx(
         {
             let mut mm_msg = TronaMsg::zeroed();
             let mut mm_reply = TronaMsg::zeroed();
-            mm_msg.label = trona::consts::MM_REGISTER;
+            mm_msg.label = trona::protocol::MM_REGISTER;
             mm_msg.length = 4;
             mm_msg.regs[0] = pid as u64; // client badge
             mm_msg.regs[1] = heap_base;
@@ -3165,7 +3735,7 @@ pub unsafe fn handle_spawn_tx(
                 super::vfs_load::cleanup_exec_source(&mut vfs_source);
                 alloc.rollback();
                 reply.label = TRONA_OUT_OF_MEMORY;
-                return;
+                return false;
             }
         }
 
@@ -3203,7 +3773,7 @@ pub unsafe fn handle_spawn_tx(
             deregister_from_mmsrv(pid);
             alloc.rollback();
             reply.label = TRONA_INVALID_ARGUMENT;
-            return;
+            return false;
         }
 
         // ---- Load RTLD via mmsrv if dynamic ----
@@ -3241,7 +3811,7 @@ pub unsafe fn handle_spawn_tx(
                     deregister_from_mmsrv(pid);
                     alloc.rollback();
                     reply.label = TRONA_NOT_FOUND;
-                    return;
+                    return false;
                 }
             }
         }
@@ -3285,7 +3855,7 @@ pub unsafe fn handle_spawn_tx(
             super::vfs_load::cleanup_exec_source(&mut vfs_source);
             alloc.rollback();
             reply.label = TRONA_OUT_OF_MEMORY;
-            return;
+            return false;
         }
         let err = trona::invoke::sc_bind(child_sc, child_tcb);
         if err != 0 {
@@ -3293,7 +3863,7 @@ pub unsafe fn handle_spawn_tx(
             super::vfs_load::cleanup_exec_source(&mut vfs_source);
             alloc.rollback();
             reply.label = TRONA_OUT_OF_MEMORY;
-            return;
+            return false;
         }
 
         // ---- Map initrd and boot info for dynamic executables ----
@@ -3311,78 +3881,30 @@ pub unsafe fn handle_spawn_tx(
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
                 reply.label = TRONA_OUT_OF_MEMORY;
-                return;
+                return false;
             }
             if map_boot_info_to_child_tx(child_vs, pid) != 0 {
                 super::vfs_load::cleanup_exec_source(&mut vfs_source);
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
                 reply.label = TRONA_OUT_OF_MEMORY;
-                return;
+                return false;
             }
         }
 
-        // ---- Allocate stack frames via mmsrv ----
+        // ---- Materialize stack via mmsrv from a local staged top-page image ----
         let stack_pages = plan.layout.stack.page_count();
-
-        // Map lower stack pages (zero-filled, child only) via MM_MAP_BATCH
-        if stack_pages > 0 {
-            let mut mm_msg = TronaMsg::zeroed();
-            let mut mm_reply = TronaMsg::zeroed();
-            mm_msg.label = trona::consts::MM_MAP_BATCH;
-            mm_msg.length = 4;
-            mm_msg.regs[0] = pid as u64;
-            mm_msg.regs[1] = plan.layout.stack.base;
-            mm_msg.regs[2] = stack_pages as u64;
-            mm_msg.regs[3] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-            let err = trona::ipc::call_ctx(
-                super::ipc_ctx(),
-                CAP_MMSRV_EP,
-                &raw const mm_msg,
-                &raw mut mm_reply,
-            );
-            if err != 0
-                || mm_reply.label != TRONA_OK
-                || mm_reply.regs[0] != stack_pages as u64
-            {
-                trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] SPAWN: MM_MAP_BATCH stack failed\n"); });
-                super::vfs_load::cleanup_exec_source(&mut vfs_source);
-                deregister_from_mmsrv(pid);
-                alloc.rollback();
-                reply.label = TRONA_OUT_OF_MEMORY;
-                return;
-            }
+        let stack_stage = alloc_staging_buffer(1);
+        if stack_stage.is_null() {
+            super::vfs_load::cleanup_exec_source(&mut vfs_source);
+            deregister_from_mmsrv(pid);
+            alloc.rollback();
+            reply.label = TRONA_OUT_OF_MEMORY;
+            return false;
         }
+        volatile_zero(stack_stage, 4096);
 
-        // Map top stack page via MM_MAP_WINDOW (dual-mapped: child + procmgr scratch)
-        {
-            let mut mm_msg = TronaMsg::zeroed();
-            let mut mm_reply = TronaMsg::zeroed();
-            mm_msg.label = trona::consts::MM_MAP_WINDOW;
-            mm_msg.length = 5;
-            mm_msg.regs[0] = pid as u64; // target badge
-            mm_msg.regs[1] = plan.layout.stack_top - 4096; // child stack top page VA
-            mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR; // procmgr write window
-            mm_msg.regs[3] = 1; // 1 page
-            mm_msg.regs[4] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
-            trona::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-            let err = trona::ipc::call_ctx(
-                super::ipc_ctx(),
-                CAP_MMSRV_EP,
-                &raw const mm_msg,
-                &raw mut mm_reply,
-            );
-            if err != 0 || mm_reply.label != TRONA_OK || mm_reply.regs[0] != 1 {
-                trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] SPAWN: MM_MAP_WINDOW stack top failed\n"); });
-                super::vfs_load::cleanup_exec_source(&mut vfs_source);
-                deregister_from_mmsrv(pid);
-                alloc.rollback();
-                reply.label = TRONA_OUT_OF_MEMORY;
-                return;
-            }
-        }
-
-        // ---- Write stack data (pre-mapped at PROCMGR_SCRATCH_VADDR) ----
+        // ---- Write stack data into the staged top page ----
         let mut child_entry_rip = elf_result.entry;
         let mut child_rsp = plan.layout.stack_top;
         let (phdr_vaddr, phent, phnum) = if let Some(vfs) = vfs_stream {
@@ -3404,12 +3926,11 @@ pub unsafe fn handle_spawn_tx(
                 &raw mut phnum,
             ) != 0
             {
-                unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, 1);
                 super::vfs_load::cleanup_exec_source(&mut vfs_source);
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
                 reply.label = TRONA_INVALID_ARGUMENT;
-                return;
+                return false;
             }
             (phdr_vaddr, phent, phnum)
         };
@@ -3473,7 +3994,7 @@ pub unsafe fn handle_spawn_tx(
                 path_env[pi] = prefix[pi];
                 pi += 1;
             }
-            let dp = trona::DEFAULT_PATH;
+            let dp = trona::consts::posix::DEFAULT_PATH;
             let mut di = 0usize;
             while di < dp.len() && pi < path_env.len() {
                 path_env[pi] = dp[di];
@@ -3522,6 +4043,7 @@ pub unsafe fn handle_spawn_tx(
                 } else {
                     CHILD_RTLD_FRAME_SLOT_START
                 },
+                stack_stage,
                 true, // pre_mapped: stack top page already at PROCMGR_SCRATCH_VADDR
             ) {
                 Ok(rsp) => {
@@ -3529,8 +4051,7 @@ pub unsafe fn handle_spawn_tx(
                     child_entry_rip = rtld_result.entry;
                 }
                 Err(err) => {
-                    // Unmap scratch window before rollback
-                    unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, 1);
+                    free_staging_buffer(stack_stage, 1);
                     super::vfs_load::cleanup_exec_source(&mut vfs_source);
                     deregister_from_mmsrv(pid);
                     alloc.rollback();
@@ -3539,22 +4060,40 @@ pub unsafe fn handle_spawn_tx(
                         StackBuildError::InvalidArgument => TRONA_INVALID_ARGUMENT,
                         StackBuildError::TooLarge => TRONA_OUT_OF_RANGE,
                     };
-                    return;
+                    return false;
                 }
             }
         }
 
+        match alloc_private_copy_from_client_region_to_mmsrv(
+            pid,
+            plan.layout.stack.base,
+            stack_pages as u64,
+            plan.layout.stack_top - 4096,
+            stack_stage as u64,
+            1,
+            VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+        ) {
+            Ok(base) if base == plan.layout.stack.base => {}
+            _ => {
+                free_staging_buffer(stack_stage, 1);
+                super::vfs_load::cleanup_exec_source(&mut vfs_source);
+                deregister_from_mmsrv(pid);
+                alloc.rollback();
+                reply.label = TRONA_OUT_OF_MEMORY;
+                return false;
+            }
+        }
+        free_staging_buffer(stack_stage, 1);
+
         // ELF scratch buffer no longer needed (all elf_entry.data users complete).
         super::vfs_load::cleanup_exec_source(&mut vfs_source);
-
-        // ---- Unmap procmgr's stack write window ----
-        unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, 1);
 
         // ---- Map IPC buffer via mmsrv (child only, zero-filled) ----
         {
             let mut mm_msg = TronaMsg::zeroed();
             let mut mm_reply = TronaMsg::zeroed();
-            mm_msg.label = trona::consts::MM_MAP_BATCH;
+            mm_msg.label = trona::protocol::MM_MAP_BATCH;
             mm_msg.length = 4;
             mm_msg.regs[0] = pid as u64;
             mm_msg.regs[1] = plan.layout.ipc_buf.base;
@@ -3571,7 +4110,7 @@ pub unsafe fn handle_spawn_tx(
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
                 reply.label = TRONA_OUT_OF_MEMORY;
-                return;
+                return false;
             }
         }
 
@@ -3582,7 +4121,7 @@ pub unsafe fn handle_spawn_tx(
             deregister_from_mmsrv(pid);
             alloc.rollback();
             reply.label = TRONA_OUT_OF_MEMORY;
-            return;
+            return false;
         }
         let err = trona::invoke::tcb_set_ipc_buffer(child_tcb, plan.layout.ipc_buf.base);
         if err != 0 {
@@ -3590,20 +4129,29 @@ pub unsafe fn handle_spawn_tx(
             deregister_from_mmsrv(pid);
             alloc.rollback();
             reply.label = TRONA_OUT_OF_MEMORY;
-            return;
+            return false;
         }
 
         // Pre-populate minimal PROCTAB fields so that CSpace expansion
-        // handlers (called from wait_for_child_ready's bound-ntfn poll)
-        // can identify and serve this child.
-        proc_table::proctab(slot_idx).state = if start_suspended {
-            proc_table::PROC_STOPPED
-        } else {
-            proc_table::PROC_RUNNING
-        };
-        proc_table::proctab(slot_idx).cnode_cap = child_cn;
-        proc_table::proctab(slot_idx).pid = pid;
-        proc_table::proctab(slot_idx).badge = pid as u64;
+        // handlers (serviced by the main loop's bound-ntfn poll) can
+        // identify and serve this child during async readiness wait.
+        {
+            let p = proc_table::proctab(slot_idx);
+            p.set_personality_from_subsystem_id(subsystem_id);
+            p.state = if start_suspended {
+                proc_table::PROC_STOPPED
+            } else {
+                proc_table::PROC_RUNNING
+            };
+            p.tcb_cap = child_tcb;
+            p.vspace_cap = child_vs;
+            p.cnode_cap = child_cn;
+            p.sc_cap = child_sc;
+            p.pid = pid;
+            p.badge = pid as u64;
+            p.has_service_ep = use_pre_ep;
+            p.mmsrv_registered = true;
+        }
 
         // ---- Start ----
         if !start_suspended {
@@ -3613,27 +4161,7 @@ pub unsafe fn handle_spawn_tx(
                 deregister_from_mmsrv(pid);
                 alloc.rollback();
                 reply.label = TRONA_OUT_OF_MEMORY;
-                return;
-            }
-        }
-
-        if !start_suspended && plan.readiness_mode == trona::SPAWN_READY_NOTIFY {
-            if super::wait_for_child_ready(
-                child_tcb,
-                child_ready_ntfn,
-                &name[..name_len],
-                plan.ready_timeout_ns,
-            ) != 0
-            {
-                proc_table::proctab(slot_idx).state = proc_table::PROC_FREE;
-                proc_table::proctab(slot_idx).cnode_cap = 0;
-                proc_table::proctab(slot_idx).pid = 0;
-                proc_table::proctab(slot_idx).badge = 0;
-                clear_fault_handler(child_tcb, pid);
-                deregister_from_mmsrv(pid);
-                alloc.rollback();
-                reply.label = TRONA_BUSY;
-                return;
+                return false;
             }
         }
 
@@ -3643,16 +4171,12 @@ pub unsafe fn handle_spawn_tx(
         // Record in process table
         let caller_idx = proc_table::find_by_badge(badge);
         let p = proc_table::proctab(slot_idx);
+        p.set_personality_from_subsystem_id(subsystem_id);
         p.pid = pid;
         p.ppid = if let Some(ci) = caller_idx {
             proc_table::proctab(ci).pid
         } else {
             0
-        };
-        p.sid = if let Some(ci) = caller_idx {
-            proc_table::proctab(ci).sid
-        } else {
-            pid
         };
         p.state = if start_suspended {
             proc_table::PROC_STOPPED
@@ -3665,22 +4189,6 @@ pub unsafe fn handle_spawn_tx(
         p.vspace_cap = child_vs;
         p.cnode_cap = child_cn;
         p.sc_cap = child_sc;
-        p.waiter_reply = 0;
-        p.waiter_pid = 0;
-        p.signal_ntfn = child_sig_ntfn;
-        p.ready_ntfn = if start_suspended { child_ready_ntfn } else { 0 };
-        p.wait_ready_on_resume =
-            start_suspended && plan.readiness_mode == trona::SPAWN_READY_NOTIFY;
-        p.ready_timeout_ns = if start_suspended {
-            plan.ready_timeout_ns
-        } else {
-            0
-        };
-        p.pgid = if let Some(ci) = caller_idx {
-            proc_table::proctab(ci).pgid
-        } else {
-            pid
-        };
         p.slot_base = slot_base;
         p.slot_count = slot_count;
         p.shared_lib_base = shared_lib_base;
@@ -3688,11 +4196,30 @@ pub unsafe fn handle_spawn_tx(
         p.layout = plan.layout;
         p.has_service_ep = use_pre_ep;
         p.mmsrv_registered = true;
-        for i in 0..proc_table::NSIG {
-            p.sig_disposition[i] = proc_table::SIG_DISP_DFL;
+        let is_notify = plan.readiness_mode == trona::SPAWN_READY_NOTIFY;
+        p.ready_ntfn = if is_notify { child_ready_ntfn } else { 0 };
+        p.wait_ready_on_resume = start_suspended && is_notify;
+        p.ready_timeout_ns = if is_notify { plan.ready_timeout_ns } else { 0 };
+        if p.is_posix() {
+            let posix = p.posix_mut();
+            posix.sid = if let Some(ci) = caller_idx {
+                proc_table::proctab(ci).posix().sid
+            } else {
+                pid
+            };
+            posix.waiter_reply = 0;
+            posix.waiter_pid = 0;
+            posix.signal_ntfn = child_sig_ntfn;
+            posix.pgid = if let Some(ci) = caller_idx {
+                proc_table::proctab(ci).posix().pgid
+            } else {
+                pid
+            };
+            for i in 0..proc_table::NSIG {
+                posix.sig_disposition[i] = proc_table::SIG_DISP_DFL;
+            }
         }
 
-        // SPAWN_FLAG_RESPAWN: mark process for automatic restart on exit
         // Set process name (up to 31 chars + NUL)
         {
             let name_copy = if name_len > 31 { 31 } else { name_len };
@@ -3707,11 +4234,721 @@ pub unsafe fn handle_spawn_tx(
             } else {
                 exec_path_len
             };
-            for i in 0..exe_copy {
-                p.exe_path[i] = exec_path[i];
+            if p.is_posix() {
+                let posix = p.posix_mut();
+                for i in 0..exe_copy {
+                    posix.exe_path[i] = exec_path[i];
+                }
+                for i in exe_copy..proc_table::MAX_EXE_PATH_LEN {
+                    posix.exe_path[i] = 0;
+                }
             }
-            for i in exe_copy..proc_table::MAX_EXE_PATH_LEN {
-                p.exe_path[i] = 0;
+        }
+
+        // SPAWN_FLAG_RESPAWN: mark process for automatic restart on exit
+        if (spawn_flags & SPAWN_FLAG_RESPAWN) != 0 {
+            p.respawn = true;
+            let copy_len = if name_len > proc_table::MAX_NAME_LEN {
+                proc_table::MAX_NAME_LEN
+            } else {
+                name_len
+            };
+            for i in 0..copy_len {
+                p.respawn_binary[i] = name[i];
+            }
+            for i in copy_len..proc_table::MAX_NAME_LEN {
+                p.respawn_binary[i] = 0;
+            }
+        }
+
+        // Defer readiness wait: save caller reply and return to main loop
+        if !start_suspended && is_notify {
+            if super::readiness::defer_readiness(slot_idx) {
+                return true;
+            }
+            // Defer failed (OOM) — graceful degradation: clear readiness fields
+            // and reply immediately. The child is already running.
+            p.ready_ntfn = 0;
+            p.ready_timeout_ns = 0;
+        }
+
+        trona::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] Process started PID=");
+            _lb.hex(pid as u64);
+            _lb.str(b"\n");
+        });
+        reply.label = TRONA_OK;
+        reply.length = 1;
+        reply.regs[0] = pid as u64;
+        return false;
+    }
+}
+
+// ===========================================================================
+// PE spawn inner — handles PE/COFF binary loading
+// ===========================================================================
+
+/// Inner PE spawn path: validates PE, loads image + pe_rtld, builds stack,
+/// starts the child process.
+///
+/// # Safety
+/// All pointers must be valid. `data` must point to a valid PE32+ file.
+#[allow(clippy::too_many_arguments)]
+unsafe fn handle_pe_spawn_inner(
+    msg: &TronaMsg,
+    reply: &mut TronaMsg,
+    badge: u64,
+    alloc: &mut Allocator,
+    data: *const u8,
+    data_len: usize,
+    name: &[u8],
+    name_len: usize,
+    exec_path: &[u8],
+    exec_path_len: usize,
+    subsystem_id: u8,
+    readiness_mode: u64,
+    requested_timeout_ns: u64,
+    spawn_flags: u64,
+    spawn_args_len: usize,
+    args_reg_idx: usize,
+    use_pre_ep: bool,
+    start_suspended: bool,
+    _policy_map_initrd: bool,
+    policy_is_display: bool,
+    policy_cnode_bits: u8,
+    is_display: bool,
+) -> bool {
+    unsafe {
+        trona::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] PE spawn: '");
+            _lb.bytes(&name[..name_len]);
+            _lb.str(b"'\n");
+        });
+
+        // Validate PE and get image span
+        let mut pe_info = trona_loader::pe_loader::PeInfo::zeroed();
+        let err = trona_loader::pe_loader::pe_validate(data, data_len, &raw mut pe_info);
+        if err != 0 {
+            trona::uerror!(|_lb| {
+                _lb.str(b"[PROCMGR] PE validation failed err=");
+                _lb.hex(err as u64);
+                _lb.str(b"\n");
+            });
+            reply.label = TRONA_INVALID_ARGUMENT;
+            return false;
+        }
+
+        let pe_span = trona_loader::pe_loader::pe_compute_load_span(data, data_len);
+        if pe_span == 0 {
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] PE span is zero\n"); });
+            reply.label = TRONA_INVALID_ARGUMENT;
+            return false;
+        }
+
+        // Find ld-trona-pe.so in initrd
+        let initrd = super::INITRD_VADDR as *const u8;
+        let initrd_size = super::read_boot_info_initrd_size();
+
+        let pe_rtld_name = b"ld-trona-pe.so";
+        let pe_rtld_span = {
+            let mut pe_rtld_entry = CpioEntry::zeroed();
+            if trona_loader::cpio::cpio_find_file(
+                initrd,
+                initrd_size,
+                pe_rtld_name.as_ptr(),
+                pe_rtld_name.len(),
+                &raw mut pe_rtld_entry,
+            ) == 0
+            {
+                trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] ld-trona-pe.so not found in initrd\n"); });
+                reply.label = TRONA_NOT_FOUND;
+                return false;
+            }
+            trona_loader::elf_loader::elf_compute_load_span(
+                pe_rtld_entry.data,
+                pe_rtld_entry.data_len,
+            )
+        };
+
+        // Find kernel32.dll in initrd to compute its VA span for layout planning
+        let kernel32_name = b"kernel32.dll";
+        let kernel32_span = {
+            let mut k32_entry = CpioEntry::zeroed();
+            if trona_loader::cpio::cpio_find_file(
+                initrd,
+                initrd_size,
+                kernel32_name.as_ptr(),
+                kernel32_name.len(),
+                &raw mut k32_entry,
+            ) != 0
+            {
+                trona_loader::pe_loader::pe_compute_load_span(k32_entry.data, k32_entry.data_len)
+            } else {
+                0
+            }
+        };
+        let kernel32_pages = ((kernel32_span + 0xFFF) / 0x1000) as usize;
+
+        // Compute VM layout: PE image + pe_rtld + kernel32 + stack
+        // Reuse ELF layout with PE span in the elf_code slot, pe_rtld in rtld,
+        // and kernel32 in shared_libs.
+        let layout = layout::compute_vm_layout_randomized(
+            pe_span,
+            pe_rtld_span,
+            kernel32_pages,
+            false, // no initrd mapping needed
+            0,
+            || trona::syscall::sys_getrandom(),
+        );
+
+        if layout.stack_top == 0 {
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] PE too large for VA layout\n"); });
+            reply.label = TRONA_INVALID_ARGUMENT;
+            return false;
+        }
+
+        let effective_timeout_ns = if readiness_mode == trona::SPAWN_READY_NOTIFY {
+            compute_ready_timeout_ns(requested_timeout_ns, true, data_len, 0)
+        } else {
+            0
+        };
+
+        let plan = SpawnPlan {
+            is_dynamic: true, // PE always uses pe_rtld
+            readiness_mode,
+            ready_timeout_ns: effective_timeout_ns,
+            total_slots: compute_slot_budget(),
+            is_display,
+            lib_window_pages: 0,
+            layout,
+        };
+
+        // Auto-register caller if unknown
+        let caller_idx = proc_table::find_by_badge(badge);
+        if caller_idx.is_none() && badge != 0 {
+            if let Some(ci) = proc_table::alloc_proc() {
+                proc_table::proctab(ci).set_posix_personality();
+                proc_table::proctab(ci).pid = badge as u32;
+                proc_table::proctab(ci).ppid = 0;
+                proc_table::proctab(ci).state = proc_table::PROC_RUNNING;
+                proc_table::proctab(ci).badge = badge;
+            }
+        }
+
+        let Some(slot_idx) = proc_table::alloc_proc() else {
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] process table full\n"); });
+            reply.label = TRONA_OUT_OF_MEMORY;
+            return false;
+        };
+
+        let pid = proc_table::NEXT_PID;
+        proc_table::NEXT_PID += 1;
+
+        // ---- PRE-PROVISION mmsrv untyped (breaks Procmgr↔MMSRV cycle) ----
+        ensure_mmsrv_capacity(alloc);
+
+        // ---- RESERVE ----
+        if !alloc.reserve(plan.total_slots) {
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] slot reservation failed\n"); });
+            reply.label = TRONA_OUT_OF_MEMORY;
+            return false;
+        }
+
+        // ---- REALIZE fixed objects via mmsrv ----
+        macro_rules! realize_mm {
+            ($ty:expr, $sz:expr, $off:expr, $what:expr) => {
+                match alloc.realize_via_mmsrv(CAP_MMSRV_EP, $ty, $sz, $off) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        trona::uerror!(|_lb| {
+                            _lb.str(b"[PROCMGR] PE alloc ");
+                            _lb.bytes($what);
+                            _lb.str(b" failed err=");
+                            _lb.hex(e as u64);
+                            _lb.str(b"\n");
+                        });
+                        alloc.rollback();
+                        reply.label = TRONA_OUT_OF_MEMORY;
+                        return false;
+                    }
+                }
+            };
+        }
+
+        let child_tcb = realize_mm!(OBJ_TCB, 0, OFF_TCB, b"TCB");
+        let child_vs = realize_mm!(OBJ_VSPACE, 0, OFF_VSPACE, b"VSpace");
+        let cn_size_bits = if policy_cnode_bits > 0 {
+            policy_cnode_bits as u64
+        } else {
+            0
+        };
+        let child_cn = realize_mm!(OBJ_CNODE, cn_size_bits, OFF_CNODE, b"CNode");
+        let child_sc = realize_mm!(OBJ_SCHED_CONTEXT, 0, OFF_SC, b"SC");
+        let child_sig_ntfn = realize_mm!(OBJ_NOTIFICATION, 0, OFF_SIGNAL_NTFN, b"signal ntfn");
+
+        let child_ready_ntfn = if plan.readiness_mode == trona::SPAWN_READY_NOTIFY {
+            realize_mm!(OBJ_NOTIFICATION, 0, OFF_READY_NTFN, b"ready ntfn")
+        } else {
+            0
+        };
+
+        // Mint mmsrv EP into child CNode slot 7
+        let err = trona::invoke::cnode_mint(
+            CAP_SELF_CSPACE,
+            CAP_MMSRV_EP_UNBADGED,
+            child_cn,
+            CHILD_CAP_MMSRV_EP,
+            pid as u64,
+        );
+        if err != 0 {
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] PE mint mmsrv EP failed\n"); });
+            alloc.rollback();
+            reply.label = TRONA_OUT_OF_MEMORY;
+            return false;
+        }
+
+        // Copy standard caps into child CNode
+        let err = copy_child_caps_tx(
+            child_tcb,
+            child_vs,
+            child_cn,
+            child_sig_ntfn,
+            child_ready_ntfn,
+            plan.readiness_mode == trona::SPAWN_READY_NOTIFY,
+            plan.is_display,
+            pid,
+            if use_pre_ep { CAP_RECV_SCRATCH } else { 0 },
+        );
+        if err != 0 {
+            alloc.rollback();
+            reply.label = TRONA_OUT_OF_MEMORY;
+            return false;
+        }
+
+        // Mint CSpace expansion notification
+        let pm_ntfn = *(&raw const super::PM_BOUND_NTFN);
+        if pm_ntfn != 0 {
+            let cs_badge = 1u64 << (16 + slot_idx);
+            let _ = trona::invoke::cnode_mint(
+                CAP_SELF_CSPACE,
+                pm_ntfn,
+                child_cn,
+                CHILD_CAP_CSPACE_NTFN,
+                cs_badge,
+            );
+        }
+
+        // Configure TCB
+        let err = trona::invoke::tcb_set_space(child_tcb, child_cn, child_vs);
+        if err != 0 {
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] PE TCB set_space failed\n"); });
+            alloc.rollback();
+            reply.label = TRONA_OUT_OF_MEMORY;
+            return false;
+        }
+
+        // Set fault handler
+        {
+            let temp_slot = match alloc.alloc_single_slot() {
+                Some(s) => s,
+                None => {
+                    alloc.rollback();
+                    reply.label = TRONA_OUT_OF_MEMORY;
+                    return false;
+                }
+            };
+            let err = trona::invoke::cnode_mint(
+                CAP_SELF_CSPACE,
+                CAP_MMSRV_EP_UNBADGED,
+                CAP_SELF_CSPACE,
+                temp_slot,
+                pid as u64,
+            );
+            if err == 0 {
+                let _ = trona::invoke::tcb_set_fault_handler(child_tcb, temp_slot);
+            }
+            trona::invoke::cnode_delete(CAP_SELF_CSPACE, temp_slot);
+            alloc.free_single_slot(temp_slot);
+        }
+
+        // Register with mmsrv
+        let heap_base = plan.layout.heap_base();
+        let mmap_base = trona::layout::compute_mmap_base(&plan.layout, heap_base);
+        {
+            let mut mm_msg = TronaMsg::zeroed();
+            let mut mm_reply = TronaMsg::zeroed();
+            mm_msg.label = trona::protocol::MM_REGISTER;
+            mm_msg.length = 4;
+            mm_msg.regs[0] = pid as u64;
+            mm_msg.regs[1] = heap_base;
+            mm_msg.regs[2] = mmap_base;
+            mm_msg.regs[3] = pid as u64;
+            trona::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, child_vs);
+            let err = trona::ipc::call_ctx(
+                super::ipc_ctx(),
+                CAP_MMSRV_EP,
+                &raw const mm_msg,
+                &raw mut mm_reply,
+            );
+            if err != 0 || mm_reply.label != TRONA_OK {
+                trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] PE mmsrv register failed\n"); });
+                alloc.rollback();
+                reply.label = TRONA_OUT_OF_MEMORY;
+                return false;
+            }
+        }
+        // ---- Load PE image via mmsrv ----
+        let pe_result = match exec_load_pe_mmsrv(
+            data,
+            data_len,
+            plan.layout.elf_code.base, // PE image goes in the "elf_code" layout region
+            pid,
+            child_vs,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                trona::uerror!(|_lb| {
+                    _lb.str(b"[PROCMGR] PE load failed err=");
+                    _lb.hex(e as u64);
+                    _lb.str(b"\n");
+                });
+                deregister_from_mmsrv(pid);
+                alloc.rollback();
+                reply.label = TRONA_INVALID_ARGUMENT;
+                return false;
+            }
+        };
+
+        // ---- Load ld-trona-pe.so (PE runtime loader, ELF format) via mmsrv ----
+        let rtld_result = match exec_load_rtld_mmsrv_by_name(
+            pe_rtld_name.as_ptr(),
+            pe_rtld_name.len(),
+            initrd,
+            initrd_size,
+            plan.layout.rtld.base,
+            pid,
+            child_vs,
+        ) {
+            Some(r) => r,
+            None => {
+                deregister_from_mmsrv(pid);
+                alloc.rollback();
+                reply.label = TRONA_NOT_FOUND;
+                return false;
+            }
+        };
+
+        let kernel32_result = match exec_load_pe_mmsrv_by_name(
+            kernel32_name.as_ptr(),
+            kernel32_name.len(),
+            initrd,
+            initrd_size,
+            plan.layout.shared_libs.base,
+            pid,
+            child_vs,
+        ) {
+            Some(r) => r,
+            None => {
+                deregister_from_mmsrv(pid);
+                alloc.rollback();
+                reply.label = TRONA_NOT_FOUND;
+                return false;
+            }
+        };
+
+        trona::udebug!(|_lb| {
+            _lb.str(b"[PROCMGR] PE layout pid=");
+            _lb.hex(pid as u64);
+            _lb.str(b" pe=[");
+            _lb.hex(pe_result.base);
+            _lb.str(b",");
+            _lb.hex(pe_result.image_end);
+            _lb.str(b") rtld=[");
+            _lb.hex(rtld_result.base);
+            _lb.str(b",");
+            _lb.hex(rtld_result.base + rtld_result.brk);
+            _lb.str(b") kernel32=[");
+            _lb.hex(kernel32_result.base);
+            _lb.str(b",");
+            _lb.hex(kernel32_result.image_end);
+            _lb.str(b") pe_entry=");
+            _lb.hex(pe_result.entry);
+            _lb.str(b" rtld_entry=");
+            _lb.hex(rtld_result.entry);
+            _lb.str(b"\n");
+        });
+
+        // ---- Schedule ----
+        let err = trona::invoke::sc_configure(child_sc, 10000, 100000);
+        if err != 0 {
+            deregister_from_mmsrv(pid);
+            alloc.rollback();
+            reply.label = TRONA_OUT_OF_MEMORY;
+            return false;
+        }
+        let err = trona::invoke::sc_bind(child_sc, child_tcb);
+        if err != 0 {
+            deregister_from_mmsrv(pid);
+            alloc.rollback();
+            reply.label = TRONA_OUT_OF_MEMORY;
+            return false;
+        }
+
+        // ---- Materialize stack via mmsrv from a local staged top-page image ----
+        let stack_pages = plan.layout.stack.page_count();
+        let stack_stage = alloc_staging_buffer(1);
+        if stack_stage.is_null() {
+            deregister_from_mmsrv(pid);
+            alloc.rollback();
+            reply.label = TRONA_OUT_OF_MEMORY;
+            return false;
+        }
+        volatile_zero(stack_stage, 4096);
+
+        // ---- Write PE stack with PE-specific auxv ----
+        let slot_pool_floor = if use_pre_ep {
+            CHILD_CAP_WIN32SRV_EP + 1
+        } else if CHILD_CAP_WIN32SRV_EP + 1 > CHILD_RTLD_FRAME_SLOT_START {
+            CHILD_CAP_WIN32SRV_EP + 1
+        } else {
+            CHILD_RTLD_FRAME_SLOT_START
+        };
+        let slot_pool_base = if slot_pool_floor > CHILD_RTLD_FRAME_SLOT_START {
+            slot_pool_floor
+        } else {
+            CHILD_RTLD_FRAME_SLOT_START
+        };
+        let slot_pool_count = CSPACE_EXPAND_BASE.saturating_sub(slot_pool_base);
+
+        // Build minimal argv
+        let mut str_buf = [0u8; 256];
+        let mut str_pos = 0usize;
+        let argv0 = if exec_path_len != 0 {
+            &exec_path[..exec_path_len]
+        } else {
+            &name[..name_len]
+        };
+        for &b in argv0 {
+            if str_pos < str_buf.len() {
+                str_buf[str_pos] = b;
+                str_pos += 1;
+            }
+        }
+        if str_pos < str_buf.len() {
+            str_buf[str_pos] = 0;
+            str_pos += 1;
+        }
+
+        let mut argc: u32 = 1;
+        if spawn_args_len > 0 && msg.length as usize > args_reg_idx && str_pos < str_buf.len() {
+            let src = &msg.regs[args_reg_idx] as *const u64 as *const u8;
+            let copy_len = core::cmp::min(spawn_args_len, str_buf.len() - str_pos);
+            let mut in_arg = false;
+            for i in 0..copy_len {
+                let b = *src.add(i);
+                str_buf[str_pos] = b;
+                str_pos += 1;
+                if b != 0 {
+                    if !in_arg {
+                        in_arg = true;
+                        argc += 1;
+                    }
+                } else {
+                    in_arg = false;
+                }
+            }
+            if in_arg && str_pos < str_buf.len() {
+                str_buf[str_pos] = 0;
+                str_pos += 1;
+            }
+        }
+
+        let envc: u32 = 0;
+        let win32srv_ep: u64 = CHILD_CAP_WIN32SRV_EP;
+
+        let child_entry_rip;
+        let child_rsp;
+        match write_pe_stack(
+            &pe_result,
+            &rtld_result,
+            &kernel32_result,
+            stack_stage,
+            plan.layout.scratch.base,
+            plan.layout.ipc_buf.base,
+            win32srv_ep,
+            argc,
+            envc,
+            &str_buf,
+            str_pos,
+            plan.layout.stack_top,
+            slot_pool_base,
+            slot_pool_count,
+        ) {
+            Ok(rsp) => {
+                child_rsp = rsp;
+                child_entry_rip = rtld_result.entry; // Start at pe_rtld, not PE entry
+            }
+            Err(_) => {
+                free_staging_buffer(stack_stage, 1);
+                deregister_from_mmsrv(pid);
+                alloc.rollback();
+                reply.label = TRONA_OUT_OF_MEMORY;
+                return false;
+            }
+        }
+
+        match alloc_private_copy_from_client_region_to_mmsrv(
+            pid,
+            plan.layout.stack.base,
+            stack_pages as u64,
+            plan.layout.stack_top - 4096,
+            stack_stage as u64,
+            1,
+            VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
+        ) {
+            Ok(base) if base == plan.layout.stack.base => {}
+            _ => {
+                free_staging_buffer(stack_stage, 1);
+                deregister_from_mmsrv(pid);
+                alloc.rollback();
+                reply.label = TRONA_OUT_OF_MEMORY;
+                return false;
+            }
+        }
+        free_staging_buffer(stack_stage, 1);
+
+        // Map IPC buffer
+        {
+            let mut mm_msg = TronaMsg::zeroed();
+            let mut mm_reply = TronaMsg::zeroed();
+            mm_msg.label = trona::protocol::MM_MAP_BATCH;
+            mm_msg.length = 4;
+            mm_msg.regs[0] = pid as u64;
+            mm_msg.regs[1] = plan.layout.ipc_buf.base;
+            mm_msg.regs[2] = 1;
+            mm_msg.regs[3] = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
+            let err = trona::ipc::call_ctx(
+                super::ipc_ctx(),
+                CAP_MMSRV_EP,
+                &raw const mm_msg,
+                &raw mut mm_reply,
+            );
+            if err != 0 || mm_reply.label != TRONA_OK || mm_reply.regs[0] != 1 {
+                deregister_from_mmsrv(pid);
+                alloc.rollback();
+                reply.label = TRONA_OUT_OF_MEMORY;
+                return false;
+            }
+        }
+
+        // Configure TCB with entry point and stack
+        let err = trona::invoke::tcb_configure(child_tcb, child_entry_rip, child_rsp, 0);
+        if err != 0 {
+            deregister_from_mmsrv(pid);
+            alloc.rollback();
+            reply.label = TRONA_OUT_OF_MEMORY;
+            return false;
+        }
+        let err = trona::invoke::tcb_set_ipc_buffer(child_tcb, plan.layout.ipc_buf.base);
+        if err != 0 {
+            deregister_from_mmsrv(pid);
+            alloc.rollback();
+            reply.label = TRONA_OUT_OF_MEMORY;
+            return false;
+        }
+
+        // Pre-populate PROCTAB before the child runs so early procmgr IPC
+        // sees the correct Win32 subsystem/personality rather than the
+        // default zeroed POSIX state.
+        {
+            let p = proc_table::proctab(slot_idx);
+            p.set_win32_personality();
+            p.state = if start_suspended {
+                proc_table::PROC_STOPPED
+            } else {
+                proc_table::PROC_RUNNING
+            };
+            p.tcb_cap = child_tcb;
+            p.vspace_cap = child_vs;
+            p.cnode_cap = child_cn;
+            p.sc_cap = child_sc;
+            p.pid = pid;
+            p.badge = pid as u64;
+            p.shared_lib_base = kernel32_result.base;
+            p.layout = plan.layout;
+            p.has_service_ep = use_pre_ep;
+            p.mmsrv_registered = true;
+            p.ready_ntfn = if start_suspended { child_ready_ntfn } else { 0 };
+            p.wait_ready_on_resume =
+                start_suspended && plan.readiness_mode == trona::SPAWN_READY_NOTIFY;
+            p.ready_timeout_ns = if start_suspended {
+                plan.ready_timeout_ns
+            } else {
+                0
+            };
+            let name_copy = if name_len > 31 { 31 } else { name_len };
+            for i in 0..name_copy {
+                p.name[i] = name[i];
+            }
+            for i in name_copy..32 {
+                p.name[i] = 0;
+            }
+        }
+
+        // Start
+        if !start_suspended {
+            let err = trona::invoke::tcb_resume(child_tcb);
+            if err != 0 {
+                deregister_from_mmsrv(pid);
+                alloc.rollback();
+                reply.label = TRONA_OUT_OF_MEMORY;
+                return false;
+            }
+        }
+
+        // ---- COMMIT ----
+        let (slot_base, slot_count) = alloc.commit();
+
+        let caller_idx = proc_table::find_by_badge(badge);
+        let p = proc_table::proctab(slot_idx);
+        p.set_win32_personality();
+        p.pid = pid;
+        p.ppid = if let Some(ci) = caller_idx {
+            proc_table::proctab(ci).pid
+        } else {
+            0
+        };
+        p.state = if start_suspended {
+            proc_table::PROC_STOPPED
+        } else {
+            proc_table::PROC_RUNNING
+        };
+        p.exit_code = 0;
+        p.badge = pid as u64;
+        p.tcb_cap = child_tcb;
+        p.vspace_cap = child_vs;
+        p.cnode_cap = child_cn;
+        p.sc_cap = child_sc;
+        p.slot_base = slot_base;
+        p.slot_count = slot_count;
+        p.shared_lib_base = kernel32_result.base;
+        p.lib_map = proc_table::ProcLibMap::zeroed();
+        p.layout = plan.layout;
+        p.has_service_ep = use_pre_ep;
+        p.mmsrv_registered = true;
+        let is_notify = plan.readiness_mode == trona::SPAWN_READY_NOTIFY;
+        p.ready_ntfn = if is_notify { child_ready_ntfn } else { 0 };
+        p.wait_ready_on_resume = start_suspended && is_notify;
+        p.ready_timeout_ns = if is_notify { plan.ready_timeout_ns } else { 0 };
+
+        // Set process name
+        {
+            let name_copy = if name_len > 31 { 31 } else { name_len };
+            for i in 0..name_copy {
+                p.name[i] = name[i];
+            }
+            for i in name_copy..32 {
+                p.name[i] = 0;
             }
         }
 
@@ -3730,14 +4967,25 @@ pub unsafe fn handle_spawn_tx(
             }
         }
 
+        // Defer readiness wait: save caller reply and return to main loop
+        if !start_suspended && is_notify {
+            if super::readiness::defer_readiness(slot_idx) {
+                return true;
+            }
+            // Defer failed (OOM) — graceful degradation
+            p.ready_ntfn = 0;
+            p.ready_timeout_ns = 0;
+        }
+
         trona::udebug!(|_lb| {
-            _lb.str(b"[PROCMGR] Process started PID=");
+            _lb.str(b"[PROCMGR] PE process started PID=");
             _lb.hex(pid as u64);
             _lb.str(b"\n");
         });
         reply.label = TRONA_OK;
         reply.length = 1;
         reply.regs[0] = pid as u64;
+        return false;
     }
 }
 
@@ -3794,97 +5042,40 @@ unsafe fn map_initrd_to_child_tx(
             return 0;
         }
 
-        // Copy fallback: allocate frames via mmsrv MM_MAP_WINDOW (one page at a time)
-        let initrd = _initrd;
+        let _ = _initrd;
         let copy_size = map_pages * 4096;
-        for pg in 0..map_pages {
-            // Dual-map: child gets RO at initrd_base + offset, procmgr gets RW at scratch
-            let mut mm_msg = TronaMsg::zeroed();
-            let mut mm_reply = TronaMsg::zeroed();
-            mm_msg.label = trona::consts::MM_MAP_WINDOW;
-            mm_msg.length = 5;
-            mm_msg.regs[0] = pid as u64;
-            mm_msg.regs[1] = initrd_base_vaddr + pg as u64 * 4096;
-            mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
-            mm_msg.regs[3] = 1;
-            mm_msg.regs[4] = VSPACE_FLAG_USER; // child gets read-only
-            trona::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-            let err = trona::ipc::call_ctx(
-                super::ipc_ctx(),
-                CAP_MMSRV_EP,
-                &raw const mm_msg,
-                &raw mut mm_reply,
-            );
-            if err != 0 || mm_reply.label != TRONA_OK || mm_reply.regs[0] != 1 {
-                trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] initrd MM_MAP_WINDOW failed\n"); });
-                return -1;
-            }
-
-            // Copy initrd data via the write window
-            let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
-            let src = initrd.add(pg * 4096);
-            let mut copy_len = 4096usize;
-            let byte_offset = pg * 4096;
-            if byte_offset + copy_len > copy_size {
-                copy_len = if copy_size > byte_offset {
-                    copy_size - byte_offset
-                } else {
-                    0
-                };
-            }
-            for i in 0..copy_len {
-                core::ptr::write_volatile(scratch.add(i), *src.add(i));
-            }
-            for i in copy_len..4096 {
-                core::ptr::write_volatile(scratch.add(i), 0);
-            }
-
-            // Remove procmgr's write window (child mapping persists)
-            unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, 1);
+        if alloc_initrd_copy_from_mmsrv(
+            pid,
+            initrd_base_vaddr,
+            map_pages as u64,
+            copy_size as u64,
+            VSPACE_FLAG_USER,
+        )
+        .is_err()
+        {
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] initrd MM_ALLOC_INITRD_COPY failed\n"); });
+            return -1;
         }
         0
     }
 }
 
-/// Map boot info page into child VSpace via mmsrv MM_MAP_WINDOW.
+/// Map boot info page into child VSpace via mmsrv.
 ///
 /// The child must already be registered with mmsrv (MM_REGISTER done).
-/// Uses MM_MAP_WINDOW to dual-map the boot info frame into both
-/// the child (at BOOTINFO_VADDR, read-only) and procmgr (at
-/// PROCMGR_SCRATCH_VADDR, writable) so we can copy the data.
 unsafe fn map_boot_info_to_child_tx(child_vs: Cap, pid: u32) -> i32 {
     unsafe {
-        // Dual-map 1 page: child gets it at BOOTINFO_VADDR, procmgr at scratch
-        let mut mm_msg = TronaMsg::zeroed();
-        let mut mm_reply = TronaMsg::zeroed();
-        mm_msg.label = trona::consts::MM_MAP_WINDOW;
-        mm_msg.length = 5;
-        mm_msg.regs[0] = pid as u64;
-        mm_msg.regs[1] = super::BOOTINFO_VADDR;
-        mm_msg.regs[2] = PROCMGR_SCRATCH_VADDR;
-        mm_msg.regs[3] = 1;
-        mm_msg.regs[4] = VSPACE_FLAG_USER; // child gets read-only
-        trona::ipc::set_send_cap_ctx(super::ipc_ctx(), 0, CAP_SELF_VSPACE);
-        let err = trona::ipc::call_ctx(
-            super::ipc_ctx(),
-            CAP_MMSRV_EP,
-            &raw const mm_msg,
-            &raw mut mm_reply,
-        );
-        if err != 0 || mm_reply.label != TRONA_OK || mm_reply.regs[0] != 1 {
-            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] bootinfo MM_MAP_WINDOW failed\n"); });
+        let _ = child_vs;
+        if alloc_bootinfo_copy_from_mmsrv(
+            pid,
+            super::BOOTINFO_VADDR,
+            VSPACE_FLAG_USER,
+        )
+        .is_err()
+        {
+            trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] bootinfo MM_ALLOC_BOOTINFO_COPY failed\n"); });
             return -1;
         }
-
-        // Copy boot info data via the write window
-        let bi_src = super::BOOTINFO_VADDR as *const u8;
-        let scratch = PROCMGR_SCRATCH_VADDR as *mut u8;
-        for i in 0..4096usize {
-            core::ptr::write_volatile(scratch.add(i), core::ptr::read_volatile(bi_src.add(i)));
-        }
-
-        // Remove procmgr's write window
-        unmap_window_from_mmsrv(PROCMGR_SCRATCH_VADDR, 1);
 
         0
     }
@@ -3995,9 +5186,9 @@ fn copy_child_caps_tx(
 
     err = trona::invoke::cnode_copy(
         CAP_SELF_CSPACE,
-        CAP_NAMESERV_EP,
+        CAP_NAMESRV_EP,
         child_cn,
-        CHILD_CAP_NAMESERV,
+        CHILD_CAP_NAMESRV,
         CAP_RIGHTS_ALL,
     );
     if err != 0 {
@@ -4055,7 +5246,8 @@ fn copy_child_caps_tx(
     }
 
     // Note: root untypeds are no longer mirrored to children.
-    // All frame allocation goes through mmsrv (MM_MAP_BATCH / MM_MAP_WINDOW).
+    // Child-private regions are materialized by mmsrv and populated via
+    // staged copy transactions from procmgr.
 
     0
 }

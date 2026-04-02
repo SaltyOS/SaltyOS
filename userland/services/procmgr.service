@@ -13,4 +13,4 @@ Before=vfs test_runner
 
 [Capabilities]
 CopyCap=13:66
-NeedEP=nameserv:64 vfs:65 mmsrv:67:badge mmsrv:68
+NeedEP=namesrv:64 vfs:65 mmsrv:67:badge mmsrv:68

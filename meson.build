@@ -250,6 +250,12 @@ if build_userland and mkcpio.found()
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
+  initrd_pe_rtld_so = custom_target('initrd_pe_rtld_so',
+    input: ld_trona_pe_so,
+    output: 'ld-trona-pe.initrd.so',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
   initrd_libtrona_so = custom_target('initrd_libtrona_so',
     input: libtrona_so,
     output: 'libtrona.initrd.so',
@@ -268,9 +274,15 @@ if build_userland and mkcpio.found()
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
-  initrd_nameserv_elf = custom_target('initrd_nameserv_elf',
-    input: nameserv_elf,
-    output: 'nameserv.initrd.elf',
+  initrd_kernel32_dll = custom_target('initrd_kernel32_dll',
+    input: kernel32_dll,
+    output: 'kernel32.initrd.dll',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+  initrd_namesrv_elf = custom_target('initrd_namesrv_elf',
+    input: namesrv_elf,
+    output: 'namesrv.initrd.elf',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
@@ -286,16 +298,18 @@ if build_userland and mkcpio.found()
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
-  # Non-boot-critical binaries: stripped for rootfs, NOT included in initrd.
-  stripped_display_elf = custom_target('stripped_display_elf',
-    input: display_elf,
-    output: 'display.stripped.elf',
+  # Keep late userspace services in both initrd and rootfs.
+  # This preserves the renamed service set while avoiding a boot-time
+  # dependency on the root underlay being mounted before spawn.
+  stripped_dispdrv_elf = custom_target('stripped_dispdrv_elf',
+    input: dispdrv_elf,
+    output: 'dispdrv.stripped.elf',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
-  stripped_ttyd_elf = custom_target('stripped_ttyd_elf',
-    input: ttyd_elf,
-    output: 'ttyd.stripped.elf',
+  stripped_posix_ttysrv_elf = custom_target('stripped_posix_ttysrv_elf',
+    input: posix_ttysrv_elf,
+    output: 'posix_ttysrv.stripped.elf',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
@@ -305,9 +319,9 @@ if build_userland and mkcpio.found()
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
-  stripped_getty_elf = custom_target('stripped_getty_elf',
-    input: getty_elf,
-    output: 'getty.stripped.elf',
+  stripped_posix_getty_elf = custom_target('stripped_posix_getty_elf',
+    input: posix_getty_elf,
+    output: 'posix_getty.stripped.elf',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
@@ -335,9 +349,9 @@ if build_userland and mkcpio.found()
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
-  initrd_pcisrv_elf = custom_target('initrd_pcisrv_elf',
-    input: pcisrv_elf,
-    output: 'pcisrv.initrd.elf',
+  initrd_pcidrv_elf = custom_target('initrd_pcidrv_elf',
+    input: pcidrv_elf,
+    output: 'pcidrv.initrd.elf',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
@@ -353,74 +367,108 @@ if build_userland and mkcpio.found()
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
+  initrd_win32_csrss_elf = custom_target('initrd_win32_csrss_elf',
+    input: win32_csrss_elf,
+    output: 'win32_csrss.initrd.elf',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+  stripped_hello_pe_exe = custom_target('stripped_hello_pe_exe',
+    input: hello_pe_exe,
+    output: 'hello_pe.stripped.exe',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
 
   # Service definition files
   svc_console = files('userland/services/console.service')
-  svc_nameserv = files('userland/services/nameserv.service')
+  svc_namesrv = files('userland/services/namesrv.service')
   svc_mmsrv = files('userland/services/mmsrv.service')
   svc_vfs = files('userland/services/vfs.service')
   svc_procmgr = files('userland/services/procmgr.service')
-  svc_display = files('userland/services/display.service')
-  svc_ttyd = files('userland/services/ttyd.service')
+  svc_dispdrv = files('userland/services/dispdrv.service')
+  svc_posix_ttysrv = files('userland/services/posix_ttysrv.service')
   svc_test_runner = files('userland/services/test_runner.service')
-  svc_getty = files('userland/services/getty.service')
-  svc_pcisrv = files('userland/services/pcisrv.service')
+  svc_posix_getty = files('userland/services/posix_getty.service')
+  svc_pcidrv = files('userland/services/pcidrv.service')
   svc_blkdrv = files('userland/services/blkdrv.service')
   svc_saltyfs = files('userland/services/saltyfs.service')
   svc_netdrv = files('userland/services/netdrv.service')
   svc_netsrv = files('userland/services/netsrv.service')
   svc_dnssrv = files('userland/services/dnssrv.service')
+  svc_win32_csrss = files('userland/services/win32_csrss.service')
+  svc_hello_pe = files('userland/services/hello_pe.service')
 
   # Shared libraries first for minimal library-window mapping.
   mkcpio_script = files('tools/mkcpio.py')
-  # Boot-critical binaries only (non-critical moved to rootfs).
+  # Include the renamed late userspace services in initrd as well as rootfs,
+  # so the boot path matches the previous behavior while keeping new names.
   initrd = custom_target('initrd',
-    input: [initrd_rtld_so, initrd_libtrona_so, initrd_libc_so,
-            initrd_libcxx_so,
-            initrd_init_elf, initrd_console_elf, initrd_nameserv_elf,
-            initrd_procmgr_elf, initrd_vfs_elf, initrd_mmsrv_elf,
-            initrd_pcisrv_elf, initrd_blkdrv_elf, initrd_saltyfs_elf,
-            svc_console, svc_nameserv, svc_mmsrv,
-            svc_vfs, svc_procmgr, svc_display,
-            svc_ttyd, svc_test_runner, svc_getty,
-            svc_pcisrv, svc_blkdrv, svc_saltyfs, svc_netdrv, svc_netsrv,
-            svc_dnssrv],
+        input: [initrd_rtld_so, initrd_pe_rtld_so, initrd_libtrona_so, initrd_libc_so,
+          initrd_libcxx_so, initrd_kernel32_dll,
+          initrd_init_elf, initrd_console_elf, initrd_namesrv_elf,
+          initrd_procmgr_elf, initrd_vfs_elf, initrd_mmsrv_elf,
+          initrd_pcidrv_elf, initrd_blkdrv_elf, initrd_saltyfs_elf,
+          initrd_win32_csrss_elf,
+          stripped_dispdrv_elf, stripped_posix_ttysrv_elf, stripped_posix_getty_elf,
+          stripped_test_runner_elf, stripped_netdrv_elf, stripped_netsrv_elf,
+          stripped_dnssrv_elf, stripped_hello_pe_exe,
+          svc_console, svc_namesrv, svc_mmsrv,
+          svc_vfs, svc_procmgr, svc_dispdrv,
+          svc_posix_ttysrv, svc_test_runner, svc_posix_getty,
+          svc_pcidrv, svc_blkdrv, svc_saltyfs, svc_netdrv, svc_netsrv,
+          svc_dnssrv, svc_win32_csrss, svc_hello_pe],
     depend_files: mkcpio_script,
     output: 'initrd.cpio',
     command: [mkcpio,
       '--output', '@OUTPUT@',
       ] + [
-      # Shared libraries (inputs 0-3)
+
+      # Shared libraries and runtime loaders (inputs 0-5)
       'ld-trona.so=@INPUT0@',
-      'libtrona.so=@INPUT1@',
-      'libc.so=@INPUT2@',
-      'libc++.so=@INPUT3@',
-      # Boot-critical services (inputs 4-12)
-      'init=@INPUT4@',
-      'console=@INPUT5@',
-      'nameserv=@INPUT6@',
-      'procmgr=@INPUT7@',
-      'vfs=@INPUT8@',
-      'mmsrv=@INPUT9@',
-      'pcisrv=@INPUT10@',
-      'blkdrv=@INPUT11@',
-      'saltyfs=@INPUT12@',
-      # Service definitions (inputs 13-28)
-      'services/console.service=@INPUT13@',
-      'services/nameserv.service=@INPUT14@',
-      'services/mmsrv.service=@INPUT15@',
-      'services/vfs.service=@INPUT16@',
-      'services/procmgr.service=@INPUT17@',
-      'services/display.service=@INPUT18@',
-      'services/ttyd.service=@INPUT19@',
-      'services/test_runner.service=@INPUT20@',
-      'services/getty.service=@INPUT21@',
-      'services/pcisrv.service=@INPUT22@',
-      'services/blkdrv.service=@INPUT23@',
-      'services/saltyfs.service=@INPUT24@',
-      'services/netdrv.service=@INPUT25@',
-      'services/netsrv.service=@INPUT26@',
-      'services/dnssrv.service=@INPUT27@',
+      'ld-trona-pe.so=@INPUT1@',
+      'libtrona.so=@INPUT2@',
+      'libc.so=@INPUT3@',
+      'libc++.so=@INPUT4@',
+      'kernel32.dll=@INPUT5@',
+      # Early boot services (inputs 6-15)
+      'init=@INPUT6@',
+      'console=@INPUT7@',
+      'namesrv=@INPUT8@',
+      'procmgr=@INPUT9@',
+      'vfs=@INPUT10@',
+      'mmsrv=@INPUT11@',
+      'pcidrv=@INPUT12@',
+      'blkdrv=@INPUT13@',
+      'saltyfs=@INPUT14@',
+      'win32_csrss=@INPUT15@',
+      # Late services mirrored into initrd (inputs 16-23)
+      'dispdrv=@INPUT16@',
+      'posix_ttysrv=@INPUT17@',
+      'posix_getty=@INPUT18@',
+      'test_runner=@INPUT19@',
+      'netdrv=@INPUT20@',
+      'netsrv=@INPUT21@',
+      'dnssrv=@INPUT22@',
+      'hello_pe=@INPUT23@',
+      # Service definitions (inputs 24-40)
+      'services/console.service=@INPUT24@',
+      'services/namesrv.service=@INPUT25@',
+      'services/mmsrv.service=@INPUT26@',
+      'services/vfs.service=@INPUT27@',
+      'services/procmgr.service=@INPUT28@',
+      'services/dispdrv.service=@INPUT29@',
+      'services/posix_ttysrv.service=@INPUT30@',
+      'services/test_runner.service=@INPUT31@',
+      'services/posix_getty.service=@INPUT32@',
+      'services/pcidrv.service=@INPUT33@',
+      'services/blkdrv.service=@INPUT34@',
+      'services/saltyfs.service=@INPUT35@',
+      'services/netdrv.service=@INPUT36@',
+      'services/netsrv.service=@INPUT37@',
+      'services/dnssrv.service=@INPUT38@',
+      'services/win32_csrss.service=@INPUT39@',
+      'services/hello_pe.service=@INPUT40@',
     ],
     build_by_default: true,
   )
@@ -447,16 +495,16 @@ rootfs_args = []
 if mkrootfs.found() and build_userland
   # Layer 1 (always): non-initrd userland binaries
   rootfs_binaries_manifest = custom_target('rootfs_binaries_manifest',
-    input: [stripped_display_elf, stripped_ttyd_elf, stripped_getty_elf,
+    input: [stripped_dispdrv_elf, stripped_posix_ttysrv_elf, stripped_posix_getty_elf,
             stripped_test_runner_elf,
             stripped_netdrv_elf, stripped_netsrv_elf, stripped_dnssrv_elf],
     output: 'rootfs-binaries.manifest',
     command: [find_program('python3'), '-c',
       'import sys; f=open(sys.argv[1],"w"); [f.write(e+chr(10)) for e in sys.argv[2:]]',
       '@OUTPUT@',
-      '/bin/display=@INPUT0@',
-      '/bin/ttyd=@INPUT1@',
-      '/bin/getty=@INPUT2@',
+      '/bin/dispdrv=@INPUT0@',
+      '/bin/posix_ttysrv=@INPUT1@',
+      '/bin/posix_getty=@INPUT2@',
       '/bin/test_runner=@INPUT3@',
       '/bin/netdrv=@INPUT4@',
       '/bin/netsrv=@INPUT5@',

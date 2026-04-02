@@ -432,7 +432,7 @@ and capability invocations:
 - **Anonymous mmap:** Allocates frames from untyped memory, maps them
   at the next available address in the mmap region, tracks them in a
   region table (max 32 regions, 64 pages each).
-- **fd-backed mmap:** Sends `POSIX_VFS_MMAP` to VFS, receives a device
+- **fd-backed mmap:** Sends `VFS_MMAP` to VFS, receives a device
   untyped capability via IPC cap transfer, then batch-maps the pages
   using `vspace_map_device_range()` with write-combining flags.
 - **munmap:** Unmaps pages and deletes frame capabilities.

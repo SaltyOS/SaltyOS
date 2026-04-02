@@ -1,6 +1,6 @@
 use crate::types::*;
-use trona::consts::*;
-use trona::types::*;
+use trona::consts::kernel::*;
+use trona::types::core::*;
 
 pub(crate) unsafe fn find_client_by_badge(badge: u64) -> *mut MmClient {
     unsafe {

@@ -1,10 +1,11 @@
 //! Epoll tests
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::consts::*;
-use trona_posix::proc as posix;
+use trona::consts::kernel::*;
 use trona::serial;
-use trona::types::*;
+use trona::types::core::*;
+use trona_posix::proc as posix;
+use trona_posix::*;
 
 fn puts(s: &[u8]) {
     serial::serial_puts(s);

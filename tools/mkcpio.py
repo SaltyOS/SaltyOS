@@ -22,7 +22,7 @@ from pathlib import Path
 
 CPIO_HEADER_SIZE = 110
 DEFAULT_PAGE_ALIGN = 4096
-DEFAULT_PAGE_ALIGN_EXTENSIONS = ('.elf', '.so')
+DEFAULT_PAGE_ALIGN_EXTENSIONS = ('.elf', '.so', '.dll')
 
 
 def cpio_newc_header(ino, mode, filesize, namesize):

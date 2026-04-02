@@ -5,7 +5,7 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::types::Cap;
+use trona::types::core::Cap;
 
 // ---- Pool layout ----
 /// Slots 0..255 are reserved for well-known caps (server EP, untypeds, etc.)
@@ -579,7 +579,7 @@ impl Allocator {
 
         let mut msg = trona::types::TronaMsg::zeroed();
         let mut reply = trona::types::TronaMsg::zeroed();
-        msg.label = trona::MM_ALLOC_OBJECT;
+        msg.label = trona::protocol::MM_ALLOC_OBJECT;
         msg.length = 2;
         msg.regs[0] = obj_type;
         msg.regs[1] = size_bits;
@@ -778,7 +778,7 @@ impl Allocator {
 
         let mut msg = trona::types::TronaMsg::zeroed();
         let mut reply = trona::types::TronaMsg::zeroed();
-        msg.label = trona::MM_ALLOC_OBJECT;
+        msg.label = trona::protocol::MM_ALLOC_OBJECT;
         msg.length = 2;
         msg.regs[0] = obj_type;
         msg.regs[1] = size_bits;

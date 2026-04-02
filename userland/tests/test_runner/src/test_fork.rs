@@ -2,10 +2,11 @@
 //! Ported from userland/test_fork/main.c
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona_posix::proc as posix;
 use trona::serial;
 use trona::serial::LineBuf;
-use trona::types::*;
+use trona::types::core::*;
+use trona_posix::proc as posix;
+use trona_posix::*;
 
 const STACK_TOUCH_BYTES: usize = 32 * 1024;
 fn puts(s: &[u8]) {

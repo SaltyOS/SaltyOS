@@ -1,4 +1,4 @@
-use trona::types::Cap;
+use trona::types::core::Cap;
 
 pub(crate) const MAX_UT_SOURCES: usize = 32;
 
@@ -22,6 +22,7 @@ pub(crate) const REGION_MMAP: u8 = 1;
 pub(crate) const REGION_SPAWN: u8 = 2;
 pub(crate) const REGION_SHARED_RO: u8 = 3;
 pub(crate) const REGION_FILE_SHARED: u8 = 4;
+pub(crate) const REGION_IPC: u8 = 5;
 pub(crate) const REGION_INITIAL_CAP: usize = 8;
 
 #[derive(Clone, Copy)]

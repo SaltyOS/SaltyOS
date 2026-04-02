@@ -5,10 +5,12 @@
 //! regions via PCI vendor-specific capabilities.  Falls back to legacy
 //! transport when the device is transitional (0x1001).
 
-use trona::consts::*;
-use trona::ipc;
+use trona::consts::kernel::*;
+use trona::consts::server::*;
 use trona::invoke;
-use trona::types::*;
+use trona::ipc;
+use trona::protocol::*;
+use trona::types::core::*;
 
 use crate::ipc_ctx;
 use crate::{CAPACITY_SECTORS, VIRTIO_INITIALIZED, VQUEUE_BASE};
@@ -16,10 +18,10 @@ use crate::{QUEUE_SIZE, QUEUE_PHYS, QUEUE_AVAIL_OFF, QUEUE_USED_OFF, QUEUE_EVENT
 
 const CAP_SELF_VSPACE: u64 = 1;
 const CAP_SELF_CSPACE: u64 = 2;
-const CAP_PCISRV_EP: u64 = 64;
+const CAP_PCIDRV_EP: u64 = 64;
 const CAP_MMSRV_EP: u64 = 7;
 
-/// Slot for dynamically received device untyped cap from pcisrv (MMIO BAR)
+/// Slot for dynamically received device untyped cap from pcidrv (MMIO BAR)
 const CAP_RECEIVED_DEVUT: u64 = 81;
 
 /// Modern virtio-blk PCI device ID (non-transitional)
@@ -69,7 +71,7 @@ struct VirtioModernLayout {
 /// Mapped BAR virtual addresses (indexed by BAR number 0-5)
 static mut BAR_VADDRS: [u64; 6] = [0; 6];
 
-/// Read 32-bit PCI config via pcisrv IPC
+/// Read 32-bit PCI config via pcidrv IPC
 fn pci_config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     let mut msg = TronaMsg::zeroed();
     msg.label = PCI_READ_CONFIG32;
@@ -80,14 +82,14 @@ fn pci_config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     msg.regs[3] = offset as u64;
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCIDRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return 0xFFFF_FFFF;
     }
     reply.regs[0] as u32
 }
 
-/// Query pcisrv for modern virtio-blk device (device ID 0x1042).
+/// Query pcidrv for modern virtio-blk device (device ID 0x1042).
 pub(crate) fn find_virtio_blk_modern() -> Option<(u8, u8, u8)> {
     let mut msg = TronaMsg::zeroed();
     msg.label = PCI_FIND_DEVICE;
@@ -96,7 +98,7 @@ pub(crate) fn find_virtio_blk_modern() -> Option<(u8, u8, u8)> {
     msg.regs[1] = VIRTIO_BLK_MODERN_DEVICE as u64;
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCIDRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
     }
@@ -111,7 +113,7 @@ pub(crate) fn find_virtio_blk_modern() -> Option<(u8, u8, u8)> {
 /// Each BAR gets its own slot so multiple BARs can be mapped simultaneously.
 const CAP_BAR_SLOT_BASE: u64 = 82;
 
-/// Map a PCI BAR into our address space via pcisrv PCI_GET_BAR_CAP.
+/// Map a PCI BAR into our address space via pcidrv PCI_GET_BAR_CAP.
 fn map_bar(bus: u8, dev: u8, func: u8, bar_idx: u8) -> Option<(u64, u32)> {
     let recv_slot = CAP_BAR_SLOT_BASE + bar_idx as u64;
 
@@ -128,7 +130,7 @@ fn map_bar(bus: u8, dev: u8, func: u8, bar_idx: u8) -> Option<(u64, u32)> {
     }
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCIDRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
     }

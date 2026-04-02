@@ -2,14 +2,15 @@
 //! DNS resolution tests.
 //!
 //! Tests DNS resolution via the dnssrv service. Requires:
-//! - dnssrv running and registered with nameserv
+//! - dnssrv running and registered with namesrv
 //! - netsrv running with network connectivity
 //! - QEMU user networking with DNS forwarder at 10.0.2.3
 
-use trona::consts::*;
+use trona::consts::kernel::*;
 use trona::serial;
 use trona::serial::LineBuf;
-use trona::types::*;
+use trona::types::core::*;
+use trona_posix::*;
 
 pub fn run() -> bool {
     serial::serial_puts(b"[TEST_DNS] Starting DNS tests\n");

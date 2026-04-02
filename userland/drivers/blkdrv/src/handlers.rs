@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Block I/O request handlers and dispatch logic.
 
-use trona::consts::*;
-use trona::types::*;
+use trona::consts::kernel::*;
+use trona::consts::server::*;
+use trona::types::core::*;
 
 use crate::virtio::*;
 use crate::{CAPACITY_SECTORS, VIRTIO_INITIALIZED, USING_MODERN_TRANSPORT, VQUEUE_BASE};

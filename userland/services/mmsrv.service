@@ -8,8 +8,8 @@ CNodeBits=16
 Role=pager
 
 [Dependencies]
-After=console nameserv
+After=console namesrv
 Before=vfs procmgr
 
 [Capabilities]
-NeedEP=nameserv:64
+NeedEP=namesrv:64

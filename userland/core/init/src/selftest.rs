@@ -2,11 +2,11 @@
 //! Extracted from original init phases 1 & 2.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::consts::*;
+use trona::consts::kernel::*;
 use trona::invoke;
 use trona::ipc;
 use trona::syscall::syscall;
-use trona::types::*;
+use trona::types::core::*;
 
 use super::{CAP_SELF_TCB, CAP_SELF_VSPACE, CAP_SELF_CSPACE};
 

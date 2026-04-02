@@ -1,9 +1,9 @@
 //! Pthreads test suite
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::consts::*;
-use trona_posix::pthread;
+use trona::consts::kernel::*;
 use trona::serial;
+use trona_posix::pthread;
 use trona_posix::sync;
 use trona_posix::tls;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};

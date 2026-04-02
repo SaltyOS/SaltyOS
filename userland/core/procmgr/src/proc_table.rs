@@ -3,13 +3,17 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use trona::layout::VmLayoutPlan;
-use trona::types::Cap;
+use trona::types::core::Cap;
 
 // ---- Process states ----
 pub const PROC_FREE: u8 = 0;
 pub const PROC_RUNNING: u8 = 1;
 pub const PROC_ZOMBIE: u8 = 2;
 pub const PROC_STOPPED: u8 = 3;
+
+// ---- Subsystem IDs ----
+pub const SUBSYS_POSIX: u8 = 0;
+pub const SUBSYS_WIN32: u8 = 1;
 
 // ---- Signal constants ----
 pub const NSIG: usize = 32;
@@ -47,41 +51,118 @@ impl ProcLibMap {
 }
 
 // ===========================================================================
+// POSIX personality state (all fields previously in Process)
+// ===========================================================================
+
+pub struct PosixState {
+    pub pgid: u32,
+    pub sid: u32,
+    pub signal_ntfn: Cap,
+    pub sig_disposition: [u8; NSIG],
+    pub stop_status: i32,
+    pub waiter_reply: Cap,
+    pub waiter_pid: u32,
+    pub any_waiter_reply: Cap,
+    pub waiting_for_any: u8,
+    /// NUL-terminated executable path used for /proc/<pid>/exe.
+    pub exe_path: [u8; MAX_EXE_PATH_LEN],
+    /// File creation mask (default 0o022).
+    pub umask: u32,
+}
+
+impl PosixState {
+    pub const fn zeroed() -> Self {
+        PosixState {
+            pgid: 0,
+            sid: 0,
+            signal_ntfn: 0,
+            sig_disposition: [SIG_DISP_DFL; NSIG],
+            stop_status: 0,
+            waiter_reply: 0,
+            waiter_pid: 0,
+            any_waiter_reply: 0,
+            waiting_for_any: 0,
+            exe_path: [0; MAX_EXE_PATH_LEN],
+            umask: 0o022,
+        }
+    }
+}
+
+// ===========================================================================
+// Win32 personality state (minimal placeholder)
+// ===========================================================================
+
+pub struct Win32State {
+    pub _reserved: u8,
+}
+
+impl Win32State {
+    pub const fn zeroed() -> Self {
+        Win32State { _reserved: 0 }
+    }
+}
+
+// ===========================================================================
+// Personality state enum
+// ===========================================================================
+
+pub enum PersonalityState {
+    Posix(PosixState),
+    Win32(Win32State),
+    None,
+}
+
+impl PersonalityState {
+    pub const fn none() -> Self {
+        PersonalityState::None
+    }
+
+    pub const fn from_subsystem_id(subsystem_id: u8) -> Self {
+        match subsystem_id {
+            SUBSYS_WIN32 => PersonalityState::Win32(Win32State::zeroed()),
+            _ => PersonalityState::Posix(PosixState::zeroed()),
+        }
+    }
+
+    pub const fn is_posix(&self) -> bool {
+        matches!(self, PersonalityState::Posix(_))
+    }
+
+    pub const fn is_win32(&self) -> bool {
+        matches!(self, PersonalityState::Win32(_))
+    }
+
+    pub fn posix(&self) -> Option<&PosixState> {
+        match self {
+            PersonalityState::Posix(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn posix_mut(&mut self) -> Option<&mut PosixState> {
+        match self {
+            PersonalityState::Posix(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+// ===========================================================================
 // Process struct
 // ===========================================================================
 
 pub struct Process {
+    // ---- Generic core (subsystem-neutral) ----
+    pub state: u8,
     pub pid: u32,
     pub ppid: u32,
-    pub sid: u32,
-    pub state: u8,
     pub exit_code: i32,
     pub badge: u64,
     pub tcb_cap: Cap,
     pub vspace_cap: Cap,
     pub cnode_cap: Cap,
     pub sc_cap: Cap,
-    pub waiter_reply: Cap,
-    pub waiter_pid: u32,
-    pub any_waiter_reply: Cap,
-    pub waiting_for_any: u8,
-    pub signal_ntfn: Cap,
-    /// Child readiness notification captured at spawn time for notify services.
-    pub ready_ntfn: Cap,
-    /// Whether PM_RESUME must wait for the child readiness notification once.
-    pub wait_ready_on_resume: bool,
-    /// Timeout used when waiting for the child's readiness signal after resume.
-    pub ready_timeout_ns: u64,
-    /// POSIX ITIMER_REAL reload interval in nanoseconds (0 = one-shot/disabled).
-    pub itimer_real_interval_ns: u64,
-    /// Absolute CLOCK_REALTIME deadline in nanoseconds for the next SIGALRM.
-    /// Zero means no ITIMER_REAL is armed.
-    pub itimer_real_deadline_ns: u64,
-    pub sig_disposition: [u8; NSIG],
-    pub stop_status: i32,
-    pub pgid: u32,
     /// Base cap slot and count for this process's objects in procmgr CSpace.
-    /// Set by the allocator during spawn; used for cleanup.
     pub slot_base: Cap,
     pub slot_count: u16,
     /// Base address of shared library RO pages (from spawn_tx cache).
@@ -108,38 +189,38 @@ pub struct Process {
     pub respawn_binary: [u8; MAX_NAME_LEN],
     /// NUL-terminated process name (set at spawn/exec).
     pub name: [u8; 32],
-    /// NUL-terminated executable path used for /proc/<pid>/exe.
-    pub exe_path: [u8; MAX_EXE_PATH_LEN],
-    /// File creation mask (default 0o022).
-    pub umask: u32,
+    /// Per-process timer reload interval in nanoseconds (0 = one-shot/disabled).
+    pub timer_interval_ns: u64,
+    /// Absolute CLOCK_REALTIME deadline in nanoseconds for the next timer signal.
+    pub timer_deadline_ns: u64,
+    /// Child readiness notification captured at spawn time for notify services.
+    pub ready_ntfn: Cap,
+    /// Whether PM_RESUME must wait for the child readiness notification once.
+    pub wait_ready_on_resume: bool,
+    /// Timeout used when waiting for the child's readiness signal after resume.
+    pub ready_timeout_ns: u64,
+    /// CNode slot holding the saved reply cap for a deferred readiness wait.
+    /// 0 = no pending readiness wait.
+    pub pending_ready_reply: Cap,
+    /// Absolute deadline (ns) for the pending readiness timeout.
+    pub pending_ready_deadline_ns: u64,
+
+    // ---- Personality (subsystem-specific state) ----
+    pub personality: PersonalityState,
 }
 
 impl Process {
     pub const fn zeroed() -> Self {
         Process {
+            state: PROC_FREE,
             pid: 0,
             ppid: 0,
-            sid: 0,
-            state: PROC_FREE,
             exit_code: 0,
             badge: 0,
             tcb_cap: 0,
             vspace_cap: 0,
             cnode_cap: 0,
             sc_cap: 0,
-            waiter_reply: 0,
-            waiter_pid: 0,
-            any_waiter_reply: 0,
-            waiting_for_any: 0,
-            signal_ntfn: 0,
-            ready_ntfn: 0,
-            wait_ready_on_resume: false,
-            ready_timeout_ns: 0,
-            itimer_real_interval_ns: 0,
-            itimer_real_deadline_ns: 0,
-            sig_disposition: [SIG_DISP_DFL; NSIG],
-            stop_status: 0,
-            pgid: 0,
             slot_base: 0,
             slot_count: 0,
             shared_lib_base: 0,
@@ -154,9 +235,54 @@ impl Process {
             respawn: false,
             respawn_binary: [0; MAX_NAME_LEN],
             name: [0; 32],
-            exe_path: [0; MAX_EXE_PATH_LEN],
-            umask: 0o022,
+            timer_interval_ns: 0,
+            timer_deadline_ns: 0,
+            ready_ntfn: 0,
+            wait_ready_on_resume: false,
+            ready_timeout_ns: 0,
+            pending_ready_reply: 0,
+            pending_ready_deadline_ns: 0,
+            personality: PersonalityState::None,
         }
+    }
+
+    /// Access POSIX state (panics if not POSIX subsystem).
+    /// Callers that iterate all processes must guard with `is_posix()`.
+    pub fn posix(&self) -> &PosixState {
+        match &self.personality {
+            PersonalityState::Posix(s) => s,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Mutable access to POSIX state.
+    /// Panics if the personality is not POSIX. Callers that iterate all
+    /// processes should guard with `is_posix()` or check `.posix()` first.
+    pub fn posix_mut(&mut self) -> &mut PosixState {
+        match &mut self.personality {
+            PersonalityState::Posix(s) => s,
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn is_posix(&self) -> bool {
+        self.personality.is_posix()
+    }
+
+    pub fn is_win32(&self) -> bool {
+        self.personality.is_win32()
+    }
+
+    pub fn set_personality_from_subsystem_id(&mut self, subsystem_id: u8) {
+        self.personality = PersonalityState::from_subsystem_id(subsystem_id);
+    }
+
+    pub fn set_posix_personality(&mut self) {
+        self.personality = PersonalityState::Posix(PosixState::zeroed());
+    }
+
+    pub fn set_win32_personality(&mut self) {
+        self.personality = PersonalityState::Win32(Win32State::zeroed());
     }
 }
 
@@ -359,49 +485,6 @@ pub unsafe fn cleanup_proc_resources(idx: usize, cap_self_cspace: Cap) {
         }
 
         // Reset process entry
-        let p = &mut *PROCTAB_PTR.add(idx);
-        p.pid = 0;
-        p.ppid = 0;
-        p.sid = 0;
-        p.exit_code = 0;
-        p.badge = 0;
-        p.tcb_cap = 0;
-        p.vspace_cap = 0;
-        p.cnode_cap = 0;
-        p.sc_cap = 0;
-        p.waiter_reply = 0;
-        p.waiter_pid = 0;
-        p.any_waiter_reply = 0;
-        p.waiting_for_any = 0;
-        p.signal_ntfn = 0;
-        p.ready_ntfn = 0;
-        p.wait_ready_on_resume = false;
-        p.ready_timeout_ns = 0;
-        p.itimer_real_interval_ns = 0;
-        p.itimer_real_deadline_ns = 0;
-        p.stop_status = 0;
-        p.pgid = 0;
-        p.slot_base = 0;
-        p.slot_count = 0;
-        p.shared_lib_base = 0;
-        p.lib_map = ProcLibMap::zeroed();
-        p.expand_pending = false;
-        p.expand_result_base = 0;
-        p.expand_result_count = 0;
-        p.cspace_expand_count = 0;
-        p.mmsrv_registered = false;
-        p.has_service_ep = false;
-        p.respawn = false;
-        for i in 0..MAX_NAME_LEN {
-            p.respawn_binary[i] = 0;
-        }
-        for i in 0..MAX_EXE_PATH_LEN {
-            p.exe_path[i] = 0;
-        }
-        for i in 0..NSIG {
-            p.sig_disposition[i] = SIG_DISP_DFL;
-        }
-        p.umask = 0o022;
-        p.state = PROC_FREE;
+        core::ptr::write(PROCTAB_PTR.add(idx), Process::zeroed());
     }
 }

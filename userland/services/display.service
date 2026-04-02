@@ -1,8 +1,0 @@
-[Service]
-Name=display
-Binary=display
-Type=notify
-Restart=no
-
-[Dependencies]
-After=console nameserv procmgr saltyfs vfs

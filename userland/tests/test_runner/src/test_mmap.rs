@@ -2,11 +2,12 @@
 //! Ported from userland/mmap_test/main.c
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::consts::*;
-use trona_posix;
-use trona_posix::mm as posix_mm;
+use trona::consts::kernel::*;
+use trona::consts::posix::*;
 use trona::serial;
 use trona::serial::LineBuf;
+use trona_posix;
+use trona_posix::mm as posix_mm;
 
 const CAP_MMSRV_EP: u64 = 7;
 

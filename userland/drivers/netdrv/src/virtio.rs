@@ -4,20 +4,22 @@
 //! Manages two virtqueues: RX (queue 0) for receiving packets and TX (queue 1)
 //! for transmitting packets. DMA buffers are allocated via mmsrv.
 
-use trona::consts::*;
-use trona::ipc;
+use trona::consts::kernel::*;
+use trona::consts::server::*;
 use trona::invoke;
+use trona::ipc;
+use trona::protocol::*;
 use trona::serial::LineBuf;
-use trona::types::*;
+use trona::types::core::*;
 
 use crate::ipc_ctx;
 
 const CAP_SELF_VSPACE: u64 = 1;
 const CAP_SELF_CSPACE: u64 = 2;
-const CAP_PCISRV_EP: u64 = 64;
+const CAP_PCIDRV_EP: u64 = 64;
 const CAP_MMSRV_EP: u64 = 7;
 
-/// Slot for dynamically received BAR cap from pcisrv (IoPort or device untyped)
+/// Slot for dynamically received BAR cap from pcidrv (IoPort or device untyped)
 const CAP_RECEIVED_BAR: u64 = 80;
 
 /// virtio-net PCI vendor/device IDs (legacy transitional)
@@ -256,7 +258,7 @@ pub(crate) fn vaddr_to_phys(vaddr: u64) -> u64 {
 
 // --- PCI discovery ---
 
-/// Query pcisrv for virtio-net device.
+/// Query pcidrv for virtio-net device.
 /// Returns (bus, dev, func, bar0_raw, bar0_full).
 pub(crate) fn find_virtio_net() -> Option<(u8, u8, u8, u32, u64)> {
     let mut msg = TronaMsg::zeroed();
@@ -267,7 +269,7 @@ pub(crate) fn find_virtio_net() -> Option<(u8, u8, u8, u32, u64)> {
 
     let mut reply = TronaMsg::zeroed();
     // SAFETY: ipc_ctx() returns a valid pointer to our thread-local IPC context.
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCIDRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
     }
@@ -280,7 +282,7 @@ pub(crate) fn find_virtio_net() -> Option<(u8, u8, u8, u32, u64)> {
     Some((bus, dev, func, bar0 as u32, bar0))
 }
 
-/// Get BAR/IRQ info from pcisrv.
+/// Get BAR/IRQ info from pcidrv.
 /// Returns (bar_base, bar_bits, bar_size, irq, bar_is_io, has_irq_handler).
 pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u32, u8, bool, bool)> {
     let mut msg = TronaMsg::zeroed();
@@ -297,7 +299,7 @@ pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u
 
     let mut reply = TronaMsg::zeroed();
     // SAFETY: ipc_ctx() returns a valid pointer.
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCISRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCIDRV_EP, &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
     }
@@ -310,7 +312,7 @@ pub(crate) fn get_device_caps(bus: u8, dev: u8, func: u8) -> Option<(u64, u64, u
         unsafe { *(&raw mut PCI_IOPORT_CAP) = CAP_RECEIVED_BAR; }
     }
     // For MMIO BAR, the device untyped cap stays at slot 80 (CAP_RECEIVED_BAR).
-    // IRQ handler cap from pcisrv (extra cap #1) is at slot 81.
+    // IRQ handler cap from pcidrv (extra cap #1) is at slot 81.
 
     Some((reply.regs[0], reply.regs[1], reply.regs[2] as u32, reply.regs[3] as u8, bar_is_io, has_irq_handler))
 }

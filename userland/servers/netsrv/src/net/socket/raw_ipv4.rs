@@ -5,10 +5,12 @@
 //! Used for tools like `ping` (IPPROTO_ICMP) and extensible to other
 //! IPv4 protocol numbers.
 
-use trona::consts::{
-    TRONA_INVALID_ARGUMENT, TRONA_INVALID_OPERATION, TRONA_NOT_CONNECTED, TRONA_NO_BUFS,
-    TRONA_OK, INET_OP_RECV, INET_OP_RECVFROM, SOCK_RAW,
+use trona::consts::kernel::{TRONA_INVALID_ARGUMENT, TRONA_INVALID_OPERATION, TRONA_OK};
+use trona::consts::posix::SOCK_RAW;
+use trona::consts::server::{
+    INET_OP_RECV, INET_OP_RECVFROM, TRONA_NOT_CONNECTED, TRONA_NO_BUFS,
 };
+use trona_posix::consts::*;
 
 use crate::net::proto::ipv4::{self, Ipv4Header, IPV4_HEADER_LEN, PROTO_ICMP};
 use crate::net::socket::options::{self, SocketOptions};

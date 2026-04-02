@@ -1,4 +1,4 @@
-/* SaltyOS pcisrv - dynamically linked PIE linker script
+/* SaltyOS blkdrv - dynamically linked PIE linker script
  * SPDX-License-Identifier: GPL-2.0-only
  */
 

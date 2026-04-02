@@ -9,11 +9,11 @@
 //! Cap layout:
 //!   0  = self TCB
 //!   2  = self CSpace
-//!   5  = nameserv endpoint
+//!   5  = namesrv endpoint
 //!   7  = mmsrv endpoint
 //!   14 = readiness notification
 //!   64 = netdrv endpoint (NeedEP=netdrv:64)
-//!   65 = nameserv endpoint #2 (NeedEP=nameserv:65, for registration)
+//!   65 = namesrv endpoint #2 (NeedEP=namesrv:65, for registration)
 //!   68 = server endpoint (pre-created service EP)
 //!   80 = RX notification (allocated via mmsrv, sent to netdrv via IPC)
 //!   82 = TX notification (received from netdrv during DRIVER_REGISTER)
@@ -28,11 +28,14 @@ extern crate trona_posix;
 
 mod net;
 
-use trona::consts::*;
+use trona::consts::kernel::*;
+use trona::consts::server::*;
 use trona::invoke;
 use trona::ipc;
+use trona::protocol::*;
 use trona::serial;
-use trona::types::*;
+use trona::types::core::*;
+use trona_posix::consts::*;
 
 // ---------------------------------------------------------------------------
 // Capability slot layout
@@ -40,11 +43,11 @@ use trona::types::*;
 
 const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_CSPACE: u64 = 2;
-const CAP_NAMESERV_EP: u64 = 5;
+const CAP_NAMESRV_EP: u64 = 5;
 const CAP_MMSRV_EP: u64 = 7;
 const CAP_READINESS_NTFN: u64 = 14;
 const CAP_NETDRV_EP: u64 = 64;
-const CAP_NAMESERV_EP2: u64 = 65;
+const CAP_NAMESRV_EP2: u64 = 65;
 const CAP_SERVER_EP: u64 = 68;
 const CAP_RX_NOTIFICATION: u64 = 80;
 const CAP_TX_NOTIFICATION: u64 = 82;
@@ -76,6 +79,9 @@ const TX_BADGE: u64 = 0x2;
 
 static mut MAC_ADDR: [u8; 6] = [0; 6];
 static mut VFS_REGISTERED: bool = false;
+/// Guard: true while processing a synchronous IPC handler that must not
+/// trigger VFS callbacks. See `notify_vfs_completion()` assertion.
+static mut IN_SYNC_HANDLER: bool = false;
 static mut SHM_BASE: u64 = 0;
 static mut SELF_TEST_PHASE: u8 = 0;
 static mut SELF_TEST_TICKS: u32 = 0;
@@ -528,10 +534,10 @@ fn driver_register() -> bool {
 // Startup: Register with name service
 // ---------------------------------------------------------------------------
 
-fn register_nameserv() {
+fn register_namesrv() {
     let name = b"netsrv";
     let mut msg = TronaMsg::zeroed();
-    msg.label = POSIX_NS_REGISTER;
+    msg.label = NS_REGISTER;
     msg.regs[0] = name.len() as u64;
     msg.length = 1 + (name.len() as u64 + 7) / 8;
     // SAFETY: Writing name bytes into message register space; IPC context is valid.
@@ -546,13 +552,13 @@ fn register_nameserv() {
         let mut reply = TronaMsg::zeroed();
         let err = ipc::call_ctx(
             ipc_ctx(),
-            CAP_NAMESERV_EP,
+            CAP_NAMESRV_EP,
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 || reply.label != TRONA_OK {
             trona::uerror!(|_lb| {
-                _lb.str(b"[netsrv] nameserv registration failed\n");
+                _lb.str(b"[netsrv] namesrv registration failed\n");
             });
         }
     }
@@ -871,6 +877,28 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
                 reply.label = TRONA_INVALID_OPERATION;
             }
         }
+    }
+
+    // Category A handlers (socket, bind, listen, send, close, etc.) are
+    // synchronous metadata ops that must never trigger VFS callbacks.
+    // The IN_SYNC_HANDLER flag guards against accidental callback dispatch.
+    let is_sync_handler = matches!(
+        msg.label,
+        NET_SOCKET
+            | NET_BIND
+            | NET_LISTEN
+            | NET_SEND
+            | NET_SENDTO
+            | NET_CLOSE
+            | NET_SHUTDOWN
+            | NET_GETSOCKNAME
+            | NET_GETPEERNAME
+            | NET_SETSOCKOPT
+            | NET_GETSOCKOPT
+            | NET_POLL_STATUS
+    );
+    if is_sync_handler {
+        unsafe { *(&raw mut IN_SYNC_HANDLER) = true; }
     }
 
     match msg.label {
@@ -1247,6 +1275,9 @@ fn dispatch_ipc(msg: &TronaMsg, reply: &mut TronaMsg) -> bool {
             reply.label = TRONA_INVALID_OPERATION;
         }
     }
+    if is_sync_handler {
+        unsafe { *(&raw mut IN_SYNC_HANDLER) = false; }
+    }
     false
 }
 
@@ -1390,6 +1421,22 @@ fn notify_vfs_completion(
     extra_port: u16,
     timestamp_ns: u64,
 ) {
+    // Cycle safety: VFS callbacks must never be sent while processing a
+    // synchronous VFS request (socket/bind/listen/etc.), as VFS would be
+    // blocked on netsrv and unable to receive the callback.
+    unsafe {
+        if *(&raw const IN_SYNC_HANDLER) {
+            trona::uerror!(|_lb| {
+                _lb.str(b"[netsrv] BUG: VFS callback attempted during sync handler! conn=");
+                _lb.dec(conn_id as u64);
+                _lb.str(b" op=");
+                _lb.dec(op_type as u64);
+                _lb.str(b"\n");
+            });
+            return;
+        }
+    }
+
     // SAFETY: Single-threaded server; VFS_REGISTERED is set once.
     let registered = unsafe { *(&raw const VFS_REGISTERED) };
     if !registered {
@@ -1694,7 +1741,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     }
 
     // 5. Register with name service
-    register_nameserv();
+    register_namesrv();
 
     // 5b. Initialize DNS protocol engine
     net::dns::init_dns_socket();

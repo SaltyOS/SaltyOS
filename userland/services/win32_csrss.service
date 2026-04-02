@@ -1,0 +1,12 @@
+[Service]
+Name=win32_csrss
+Binary=win32_csrss
+Type=notify
+Restart=always
+
+[Dependencies]
+After=console namesrv vfs procmgr
+Before=
+
+[Capabilities]
+NeedEP=namesrv:64 console:65 vfs:66

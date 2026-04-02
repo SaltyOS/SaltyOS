@@ -8,10 +8,10 @@
 //! Stateless header parsing and construction live in `crate::net::proto::udp`;
 //! this module handles the stateful socket layer.
 
-use trona::consts::{
-    TRONA_INVALID_ARGUMENT, TRONA_NOT_CONNECTED, TRONA_NO_BUFS, TRONA_OK, INET_OP_RECV,
-    INET_OP_RECVFROM, SOCK_DGRAM,
-};
+use trona::consts::kernel::{TRONA_INVALID_ARGUMENT, TRONA_OK};
+use trona::consts::posix::SOCK_DGRAM;
+use trona::consts::server::{INET_OP_RECV, INET_OP_RECVFROM, TRONA_NOT_CONNECTED, TRONA_NO_BUFS};
+use trona_posix::consts::*;
 
 use crate::net::proto::ipv4;
 use crate::net::proto::udp as udp_proto;
@@ -556,7 +556,7 @@ pub(crate) fn udp_getsockopt(conn_id: u32, level: i32, optname: i32) -> Result<(
         options::get_option(
             &mut (*sockets)[idx].opts,
             SOCK_DGRAM,
-            trona::consts::IPPROTO_UDP,
+            trona::consts::posix::IPPROTO_UDP,
             level,
             optname,
         )

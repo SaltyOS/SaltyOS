@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! SaltyOS virtio-net Hardware-Only Network Device Driver
 //!
-//! Discovers a virtio-net PCI device via pcisrv, initializes the virtio
+//! Discovers a virtio-net PCI device via pcidrv, initializes the virtio
 //! transport (legacy PCI), sets up IRQ handling, and forwards raw Ethernet
 //! frames between the hardware and netsrv via SHM ring buffers.
 //!
@@ -18,13 +18,13 @@
 //!   0  = self TCB
 //!   1  = self VSpace
 //!   2  = self CSpace
-//!   5  = nameserv endpoint
+//!   5  = namesrv endpoint
 //!   7  = mmsrv endpoint
 //!   14 = readiness notification
-//!   64 = pcisrv endpoint
+//!   64 = pcidrv endpoint
 //!   68 = server endpoint (pre-created service EP)
 //!   84 = netsrv's RX notification cap (received during DRIVER_REGISTER)
-//!   81 = IRQ handler cap (received from pcisrv via PCI_GET_CAPS extra cap #1)
+//!   81 = IRQ handler cap (received from pcidrv via PCI_GET_CAPS extra cap #1)
 //!   82 = IRQ notification (retyped from untyped, sent to netsrv via IPC)
 
 #![no_std]
@@ -36,10 +36,12 @@ extern crate trona_posix;
 mod virtio;
 mod virtio_modern;
 
-use trona::consts::*;
+use trona::consts::kernel::*;
+use trona::consts::server::*;
 use trona::invoke;
 use trona::ipc;
-use trona::types::*;
+use trona::protocol::*;
+use trona::types::core::*;
 
 // ---------------------------------------------------------------------------
 // Capability slot constants
@@ -49,7 +51,7 @@ const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_CSPACE: u64 = 2;
 const CAP_SERVER_EP: u64 = 68;
 const CAP_READINESS_NTFN: u64 = 14;
-const CAP_NAMESERV_EP: u64 = 5;
+const CAP_NAMESRV_EP: u64 = 5;
 const CAP_MMSRV_EP: u64 = 7;
 const CAP_IRQ_HANDLER: u64 = 81;
 const CAP_IRQ_NOTIFICATION: u64 = 82;
@@ -142,10 +144,10 @@ fn mac_addr() -> [u8; 6] {
 }
 
 /// Register with name service as "netdrv".
-fn register_nameserv() {
+fn register_namesrv() {
     let name = b"netdrv";
     let mut msg = TronaMsg::zeroed();
-    msg.label = POSIX_NS_REGISTER;
+    msg.label = NS_REGISTER;
     msg.regs[0] = name.len() as u64;
     msg.length = 1 + (name.len() as u64 + 7) / 8;
     // SAFETY: Writing name bytes into message register space; IPC context is valid.
@@ -156,10 +158,10 @@ fn register_nameserv() {
         }
         ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
         let mut reply = TronaMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV_EP, &raw const msg, &raw mut reply);
+        let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESRV_EP, &raw const msg, &raw mut reply);
         if err != 0 || reply.label != TRONA_OK {
             trona::uerror!(|_lb| {
-                _lb.str(b"[netdrv] nameserv registration failed\n");
+                _lb.str(b"[netdrv] namesrv registration failed\n");
             });
         }
     }
@@ -171,16 +173,16 @@ fn register_nameserv() {
 
 /// Set up IRQ handling for the device.
 ///
-/// Uses the IRQ handler cap received from pcisrv (slot 81) rather than
+/// Uses the IRQ handler cap received from pcidrv (slot 81) rather than
 /// creating one via irq_control_get, following least-privilege principles.
 ///
 /// 1. Retype a Notification from untyped memory
-/// 2. Bind IRQ handler (from pcisrv) to notification
+/// 2. Bind IRQ handler (from pcidrv) to notification
 /// 3. Bind notification to our TCB for Recv wakeup
 fn setup_irq(irq_line: u8, has_irq_handler: bool) -> bool {
     if !has_irq_handler {
         trona::uwarn!(|_lb| {
-            _lb.str(b"[netdrv] No IRQ handler cap from pcisrv, skipping IRQ setup\n");
+            _lb.str(b"[netdrv] No IRQ handler cap from pcidrv, skipping IRQ setup\n");
         });
         return false;
     }
@@ -681,7 +683,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         if virtio_modern::init_virtio_modern(bus, dev, func) {
             // USING_MODERN_TRANSPORT already set inside init_virtio_modern
             device_ok = true;
-            // Get IRQ handler cap from pcisrv (resolves PCI INTx → GIC SPI on aarch64)
+            // Get IRQ handler cap from pcidrv (resolves PCI INTx → GIC SPI on aarch64)
             match virtio::get_device_caps(bus, dev, func) {
                 Some((_bar_phys, _bar_bits, _bar_size, irq, _bar_is_io, has_irq)) => {
                     irq_line = irq;
@@ -732,7 +734,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     }
                     None => {
                         trona::uerror!(|_lb| {
-                            _lb.str(b"[netdrv] Failed to get PCI caps from pcisrv\n");
+                            _lb.str(b"[netdrv] Failed to get PCI caps from pcidrv\n");
                         });
                     }
                 }
@@ -764,8 +766,8 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         });
     }
 
-    // Register with nameserv and signal readiness
-    register_nameserv();
+    // Register with namesrv and signal readiness
+    register_namesrv();
     signal_ready();
 
     event_loop(device_ok)
