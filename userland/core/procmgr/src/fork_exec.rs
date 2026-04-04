@@ -6,7 +6,7 @@ use trona::ipc;
 use trona::types::core::*;
 
 use crate::proc_table::{
-    alloc_proc, find_by_badge, proctab, MAX_NAME_LEN, NEXT_PID, NSIG, PROC_RUNNING,
+    alloc_proc, find_by_badge, proctab, MAX_NAME_LEN, NEXT_PID, NSIG, PROC_FREE, PROC_RUNNING,
     SIG_DISP_CATCH, SIG_DISP_DFL,
 };
 
@@ -423,14 +423,9 @@ pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             reply.label = super::TRONA_OUT_OF_MEMORY;
             return;
         }
-        let err = trona::invoke::tcb_resume(child_tcb);
-        if err != 0 {
-            alloc.rollback();
-            reply.label = super::TRONA_OUT_OF_MEMORY;
-            return;
-        }
 
-        // Commit and record
+        // Commit and populate proc table BEFORE resume so the child can
+        // immediately query procmgr (e.g. PM_GET_THREAD_CAPS) without racing.
         let (slot_base, slot_count) = alloc.commit();
 
         let p = proctab(slot_idx);
@@ -470,6 +465,14 @@ pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
                 posix.sig_disposition[i] = proctab(parent_idx).posix().sig_disposition[i];
             }
             posix.umask = proctab(parent_idx).posix().umask;
+        }
+
+        let err = trona::invoke::tcb_resume(child_tcb);
+        if err != 0 {
+            // Unlikely after successful sc_bind, but clean up proc table entry.
+            p.state = PROC_FREE;
+            reply.label = super::TRONA_OUT_OF_MEMORY;
+            return;
         }
 
         trona::udebug!(|_lb| {

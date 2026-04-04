@@ -723,6 +723,7 @@ long sys_notif_return(
 | 0x4C | `TCB_CopyFpu` | Copy FPU state between TCBs |
 | 0x4D | `TCB_SetTlsBase` | Set thread-local storage base |
 | 0x4E | `TCB_SetNotificationDispatcher` | Set notification dispatcher entry point |
+| 0x4F | `TCB_GetSpaceInfo` | Read CSpace depth and address space info |
 
 #### TCB_Configure (0x40)
 
@@ -839,6 +840,20 @@ to restore the original context after handling the notification.
 
 Requires CONFIGURE right. Returns `InvalidArgument` if the address is in kernel
 space (>= 0x0000_8000_0000_0000).
+
+#### TCB_GetSpaceInfo (0x4F)
+
+Read the CSpace depth (and future address space metadata) of a thread.
+
+```
+Returns via IPC buffer:
+  msg[0] = cspace_depth   (0 = flat mode, non-zero = multi-level tree)
+```
+
+Requires READ right. Returns `InsufficientRights` otherwise.
+
+Used by the substrate thread infrastructure to discover the current process's
+CSpace depth when spawning worker threads via `tcb_set_space_with_depth`.
 
 ---
 

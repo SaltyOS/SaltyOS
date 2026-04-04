@@ -2027,6 +2027,10 @@ fn syscall_invoke_inner(
             // TCB_SET_NOTIFICATION_DISPATCHER: arg0 = dispatcher address
             syscall_tcb_set_notification_dispatcher(&cap, arg0)
         }
+        (ObjectType::Tcb, 0x4F) => {
+            // TCB_GET_SPACE_INFO: returns cspace_depth via IPC buffer msg[0]
+            syscall_tcb_get_space_info(&cap)
+        }
 
         // VSpace operations
         (ObjectType::VSpace, 0x50) => {
@@ -3245,6 +3249,49 @@ fn syscall_tcb_set_notification_dispatcher(cap: &Capability, dispatcher: u64) ->
         tcb.tcb_unlock();
         restore_irq(irq);
     }
+    SyscallResult::ok(0)
+}
+
+/// TCB_GET_SPACE_INFO: Read the CSpace depth of a thread
+///
+/// Returns cspace_depth in IPC buffer msg[0]. This allows userland
+/// (e.g. the thread pool) to discover its own CSpace depth without
+/// needing the spawner to communicate it out-of-band.
+fn syscall_tcb_get_space_info(cap: &Capability) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::Tcb, CapRights::READ) {
+        return SyscallResult::err(e);
+    }
+
+    let depth;
+    unsafe {
+        let irq = save_irq_disable();
+        let tcb = &*(cap.object as *const Tcb);
+        tcb.tcb_lock();
+        depth = tcb.cspace_depth as u64;
+        tcb.tcb_unlock();
+        restore_irq(irq);
+    }
+
+    // Write to IPC buffer msg[0]
+    unsafe {
+        let scheduler = crate::sched::scheduler::scheduler();
+        let current = scheduler.current();
+        if !current.is_null() {
+            let buf = (*current).ipc_buffer;
+            if buf != 0
+                && validate_ipc_buffer_addr(buf).is_ok()
+                && !(*current).vspace_root.is_null()
+            {
+                let vs = &mut *(*current).vspace_root;
+                if vs.ensure_writable(buf) {
+                    let _guard = crate::arch::uaccess::UserAccessGuard::new();
+                    let ipc_buf = buf as *mut crate::ipc::IpcBuffer;
+                    (*ipc_buf).msg[0] = depth;
+                }
+            }
+        }
+    }
+
     SyscallResult::ok(0)
 }
 

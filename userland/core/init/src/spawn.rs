@@ -1415,6 +1415,10 @@ pub unsafe fn spawn_server(
             trona::uerror!(|_lb| { _lb.str(b"[INIT] copy ready ntfn failed\n"); });
             return -1;
         }
+        if copy_cap!(child_sc, super::CAP_CHILD_SC) != 0 {
+            trona::uerror!(|_lb| { _lb.str(b"[INIT] copy SC failed\n"); });
+            return -1;
+        }
         if is_dynamic {
             let derr = invoke::cnode_copy(
                 CAP_SELF_CSPACE,
@@ -1589,10 +1593,11 @@ pub unsafe fn spawn_server(
             }
 
             // +2 for AT_TRONA_SLOT_BASE/COUNT, +1 for AT_TRONA_EXPAND_EP if procmgr available,
-            // +1 for AT_TRONA_MM_EP if pager EP is available for this child.
+            // +1 for AT_TRONA_MM_EP if pager EP is available for this child,
+            // +1 for AT_TRONA_SC_CAP.
             let has_expand_ep = procmgr_ep != 0;
             let has_mm_ep = mmsrv_ep != 0 && pager_child_slot != 0;
-            let base_count: u64 = if shared_lib_base != 0 { 16 } else { 15 };
+            let base_count: u64 = if shared_lib_base != 0 { 17 } else { 16 };
             let auxv_count: u64 = base_count
                 + if has_expand_ep { 1 } else { 0 }
                 + if has_mm_ep { 1 } else { 0 };
@@ -1657,6 +1662,7 @@ pub unsafe fn spawn_server(
             if has_mm_ep {
                 w!(super::AT_TRONA_MM_EP); w!(pager_child_slot);
             }
+            w!(super::AT_TRONA_SC_CAP); w!(super::CAP_CHILD_SC);
             if shared_lib_base != 0 {
                 w!(super::AT_TRONA_SHARED_LIB_BASE); w!(shared_lib_base);
             }

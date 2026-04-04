@@ -561,7 +561,7 @@ fn apply_lease(offer: Offer, fallback_ip: u32) {
         crate::net::socket::udp::handle_local_ip_change(our_ip);
         crate::net::socket::tcp::handle_local_ip_change(our_ip);
     }
-    trona::udebug!(|_lb| {
+    trona::uinfo!(|_lb| {
         _lb.str(b"[netsrv] DHCP lease applied IP=");
         log_ipv4(&mut _lb, our_ip);
         _lb.str(b" GW=");
