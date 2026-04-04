@@ -6,9 +6,49 @@ use trona::ipc;
 use trona::types::core::*;
 
 use crate::proc_table::{
-    alloc_proc, find_by_badge, proctab, MAX_NAME_LEN, NEXT_PID, NSIG, PROC_RUNNING,
+    alloc_proc, find_by_badge, proctab, MAX_NAME_LEN, NEXT_PID, NSIG, PROC_FREE, PROC_RUNNING,
     SIG_DISP_CATCH, SIG_DISP_DFL,
 };
+
+unsafe fn cleanup_failed_fork_child(idx: usize) {
+    unsafe {
+        let pid = proctab(idx).pid;
+        let badge = proctab(idx).badge;
+        let tcb_cap = proctab(idx).tcb_cap;
+
+        if proctab(idx).mmsrv_registered {
+            super::spawn_tx::clear_fault_handler(tcb_cap, pid);
+
+            let mut mm_msg = TronaMsg::zeroed();
+            let mut mm_reply = TronaMsg::zeroed();
+            mm_msg.label = trona::protocol::MM_DEREGISTER;
+            mm_msg.length = 1;
+            mm_msg.regs[0] = badge;
+            let _ = ipc::call_ctx(
+                super::ipc_ctx(),
+                super::CAP_MMSRV_EP,
+                &raw const mm_msg,
+                &raw mut mm_reply,
+            );
+            proctab(idx).mmsrv_registered = false;
+        }
+
+        let mut vfs_msg = TronaMsg::zeroed();
+        vfs_msg.label = trona::protocol::VFS_CLIENT_EXIT;
+        vfs_msg.length = 1;
+        vfs_msg.regs[0] = badge;
+        for _ in 0..16 {
+            let err = ipc::nbsend_ctx(super::ipc_ctx(), super::CAP_VFS_EP, &raw const vfs_msg);
+            if err == 0 {
+                break;
+            }
+            trona::syscall::syscall(trona::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        }
+
+        crate::posix::exit_wait::free_proc_alloc_slots(idx);
+        crate::proc_table::cleanup_proc_resources(idx, super::CAP_SELF_CSPACE);
+    }
+}
 
 pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u64) {
     unsafe {
@@ -141,6 +181,11 @@ pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             child_cn,
             super::CHILD_CAP_CSPACE,
             b"[PROCMGR] FORK: copy CNode cap failed\n"
+        );
+        copy_or_fail!(
+            child_sc,
+            super::CHILD_CAP_SC,
+            b"[PROCMGR] FORK: copy SC cap failed\n"
         );
 
         let err = trona::invoke::cnode_mint(
@@ -423,14 +468,9 @@ pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
             reply.label = super::TRONA_OUT_OF_MEMORY;
             return;
         }
-        let err = trona::invoke::tcb_resume(child_tcb);
-        if err != 0 {
-            alloc.rollback();
-            reply.label = super::TRONA_OUT_OF_MEMORY;
-            return;
-        }
 
-        // Commit and record
+        // Commit and populate proc table BEFORE resume so the child can
+        // immediately query procmgr (e.g. PM_GET_THREAD_CAPS) without racing.
         let (slot_base, slot_count) = alloc.commit();
 
         let p = proctab(slot_idx);
@@ -470,6 +510,13 @@ pub(crate) unsafe fn handle_fork(msg: &TronaMsg, reply: &mut TronaMsg, badge: u6
                 posix.sig_disposition[i] = proctab(parent_idx).posix().sig_disposition[i];
             }
             posix.umask = proctab(parent_idx).posix().umask;
+        }
+
+        let err = trona::invoke::tcb_resume(child_tcb);
+        if err != 0 {
+            cleanup_failed_fork_child(slot_idx);
+            reply.label = super::TRONA_OUT_OF_MEMORY;
+            return;
         }
 
         trona::udebug!(|_lb| {

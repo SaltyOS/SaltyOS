@@ -104,7 +104,9 @@ pub const AT_TRONA_SLOT_BASE: u64 = 0x1007;
 pub const AT_TRONA_SLOT_COUNT: u64 = 0x1008;
 pub const AT_TRONA_EXPAND_EP: u64 = 0x1009;
 pub const AT_TRONA_MM_EP: u64 = 0x100B;
+pub const AT_TRONA_SC_CAP: u64 = 0x100E;
 pub const CAP_EXPAND_EP: u64 = 9;
+pub const CAP_CHILD_SC: u64 = 13;
 
 // ======================================================================
 // Statics

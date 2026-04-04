@@ -332,6 +332,7 @@ const CHILD_CAP_VFS: u64 = super::CHILD_CAP_VFS;
 const CHILD_CAP_NAMESRV: u64 = super::CHILD_CAP_NAMESRV;
 const CHILD_CAP_SIGNAL_NTFN: u64 = super::CHILD_CAP_SIGNAL_NTFN;
 const CHILD_CAP_MMSRV_EP: u64 = super::CHILD_CAP_MMSRV_EP;
+const CHILD_CAP_SC: u64 = super::CHILD_CAP_SC;
 const CHILD_CAP_READINESS_NTFN: u64 = super::CHILD_CAP_READINESS_NTFN;
 const CHILD_CAP_CSPACE_NTFN: u64 = super::CHILD_CAP_CSPACE_NTFN;
 const CHILD_CAP_SERVICE_EP: u64 = super::CHILD_CAP_SERVICE_EP;
@@ -367,6 +368,7 @@ const AT_TRONA_SLOT_COUNT: u64 = super::AT_TRONA_SLOT_COUNT;
 const AT_TRONA_CSPACE_NTFN: u64 = super::AT_TRONA_CSPACE_NTFN;
 const AT_TRONA_MM_EP: u64 = super::AT_TRONA_MM_EP;
 const AT_TRONA_IPC_BUFFER: u64 = super::AT_TRONA_IPC_BUFFER;
+const AT_TRONA_SC_CAP: u64 = super::AT_TRONA_SC_CAP;
 const AT_SALTYOS_PE_BASE: u64 = super::AT_SALTYOS_PE_BASE;
 const AT_SALTYOS_PE_SIZE: u64 = super::AT_SALTYOS_PE_SIZE;
 const AT_SALTYOS_WIN32SRV: u64 = super::AT_SALTYOS_WIN32SRV;
@@ -1638,8 +1640,9 @@ pub(crate) unsafe fn write_dynamic_stack(
             return Err(StackBuildError::InvalidArgument);
         }
 
-        // +2 for AT_TRONA_SLOT_BASE/COUNT, +1 for AT_TRONA_CSPACE_NTFN, +1 for AT_TRONA_MM_EP
-        let auxv_entries: u64 = if shared_lib_base != 0 { 17 } else { 16 };
+        // +2 for AT_TRONA_SLOT_BASE/COUNT, +1 for AT_TRONA_CSPACE_NTFN, +1 for AT_TRONA_MM_EP,
+        // +1 for AT_TRONA_SC_CAP
+        let auxv_entries: u64 = if shared_lib_base != 0 { 18 } else { 17 };
 
         // Compute slot pool for child: from frame_slot_start to CSPACE_EXPAND_BASE.
         // Slots [CSPACE_EXPAND_BASE..CSPACE_EXPAND_BASE+8) are reserved for
@@ -1928,6 +1931,8 @@ unsafe fn write_stack_with_args(
                 w(CHILD_CAP_CSPACE_NTFN);
                 w(AT_TRONA_MM_EP);
                 w(CHILD_CAP_MMSRV_EP);
+                w(AT_TRONA_SC_CAP);
+                w(CHILD_CAP_SC);
                 if shared_lib != 0 {
                     w(AT_TRONA_SHARED_LIB_BASE);
                     w(shared_lib);
@@ -2956,8 +2961,8 @@ pub(crate) unsafe fn write_pe_stack(
             pos += 1;
         }
 
-        // 3. PE auxv: 16 entries (including AT_NULL)
-        let auxv_entries: usize = 16;
+        // 3. PE auxv: 17 entries (including AT_NULL)
+        let auxv_entries: usize = 17;
         let auxv_u64s = auxv_entries * 2;
         let metadata_u64s = 1 // argc
             + arg_idx as usize + 1 // argv + NULL
@@ -3005,6 +3010,7 @@ pub(crate) unsafe fn write_pe_stack(
         w(AT_TRONA_SLOT_COUNT); w(slot_pool_count);
         w(AT_TRONA_CSPACE_NTFN); w(CHILD_CAP_CSPACE_NTFN);
         w(AT_TRONA_MM_EP); w(CHILD_CAP_MMSRV_EP);
+        w(AT_TRONA_SC_CAP); w(CHILD_CAP_SC);
         w(AT_NULL); w(0);
 
         Ok(child_page_base + metadata_start as u64)
@@ -3628,6 +3634,7 @@ pub unsafe fn handle_spawn_tx(
             child_tcb,
             child_vs,
             child_cn,
+            child_sc,
             child_sig_ntfn,
             child_ready_ntfn,
             plan.readiness_mode == trona::SPAWN_READY_NOTIFY,
@@ -4512,6 +4519,7 @@ unsafe fn handle_pe_spawn_inner(
             child_tcb,
             child_vs,
             child_cn,
+            child_sc,
             child_sig_ntfn,
             child_ready_ntfn,
             plan.readiness_mode == trona::SPAWN_READY_NOTIFY,
@@ -5086,6 +5094,7 @@ fn copy_child_caps_tx(
     child_tcb: Cap,
     child_vs: Cap,
     child_cn: Cap,
+    child_sc: Cap,
     child_sig_ntfn: Cap,
     child_ready_ntfn: Cap,
     with_ready_ntfn: bool,
@@ -5127,6 +5136,18 @@ fn copy_child_caps_tx(
     );
     if err != 0 {
         trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] copy CNode cap failed\n"); });
+        return err;
+    }
+
+    err = trona::invoke::cnode_copy(
+        CAP_SELF_CSPACE,
+        child_sc,
+        child_cn,
+        CHILD_CAP_SC,
+        CAP_RIGHTS_ALL,
+    );
+    if err != 0 {
+        trona::uerror!(|_lb| { _lb.str(b"[PROCMGR] copy SC cap failed\n"); });
         return err;
     }
 

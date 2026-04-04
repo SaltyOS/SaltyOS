@@ -271,7 +271,7 @@ x86_64: Number in `rax`, args in `rdi, rsi, rdx, r10, r8, r9`. Returns error in 
 
 **Message info encoding** (seL4-style): bits 6:0 = length (0-127 MRs), bits 11:7 = extra caps, bits 51:12 = label. MR0-MR3 in registers, MR4-MR19 via IPC buffer.
 
-**Invoke labels** (defined in `lib/trona/uapi/consts/kernel.rs`): CNode `0x10-0x18`, Untyped `0x20`, SchedContext `0x30-0x31`, TCB `0x40-0x4E`, VSpace `0x50-0x5F`, IRQ `0x60-0x64`, IoPort `0x70-0x77`, MemoryObject `0x90-0x97`, VSpace MO mapping `0x97-0x9A`.
+**Invoke labels** (defined in `lib/trona/uapi/consts/kernel.rs`): CNode `0x10-0x18`, Untyped `0x20`, SchedContext `0x30-0x31`, TCB `0x40-0x4F`, VSpace `0x50-0x5F`, IRQ `0x60-0x64`, IoPort `0x70-0x77`, MemoryObject `0x90-0x97`, VSpace MO mapping `0x97-0x9A`.
 
 ### Well-Known Capability Slots
 

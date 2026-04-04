@@ -56,6 +56,7 @@ const CHILD_CAP_VFS: u64 = 4;
 const CHILD_CAP_NAMESRV: u64 = 5;
 const CHILD_CAP_SIGNAL_NTFN: u64 = 6;
 const CHILD_CAP_MMSRV_EP: u64 = 7;
+const CHILD_CAP_SC: u64 = 9;
 const CHILD_CAP_READINESS_NTFN: u64 = 14;
 const CHILD_CAP_SERVICE_EP: u64 = 68; // Pre-created service EP
 const CHILD_CAP_WIN32SRV_EP: u64 = 69; // win32/csrss EP for PE processes
@@ -83,6 +84,7 @@ const AT_TRONA_SLOT_COUNT: u64 = 0x1008;
 const AT_TRONA_CSPACE_NTFN: u64 = 0x100A;
 const AT_TRONA_MM_EP: u64 = 0x100B;
 const AT_TRONA_IPC_BUFFER: u64 = 0x100C;
+const AT_TRONA_SC_CAP: u64 = 0x100E;
 const AT_SALTYOS_PE_BASE: u64 = 0x2000;
 const AT_SALTYOS_PE_SIZE: u64 = 0x2001;
 const AT_SALTYOS_WIN32SRV: u64 = 0x2002;
@@ -222,6 +224,16 @@ unsafe fn handle_getppid(reply: &mut TronaMsg, badge: u64) {
     reply.label = TRONA_OK;
     reply.length = 1;
     reply.regs[0] = unsafe { proctab(idx).ppid as u64 };
+}
+
+unsafe fn handle_get_thread_caps(reply: &mut TronaMsg, badge: u64) {
+    let Some(_idx) = find_by_badge(badge) else {
+        reply.label = TRONA_NOT_FOUND;
+        return;
+    };
+    reply.label = TRONA_OK;
+    reply.length = 1;
+    reply.regs[0] = CHILD_CAP_SC as u64;
 }
 
 /// List all active PIDs.
@@ -673,6 +685,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     PM_LIST_PIDS => handle_list_pids(&mut reply),
                     PM_GET_PROC_INFO => handle_get_proc_info(&msg, &mut reply),
                     PM_REQUEST_UNTYPED => handle_request_untyped(&msg, &mut reply, &mut *(&raw mut ALLOCATOR)),
+                    PM_GET_THREAD_CAPS => handle_get_thread_caps(&mut reply, badge),
                     PM_DUMP_PENDING => {
                         trona::uinfo!(|_lb| {
                             _lb.str(b"[PROCMGR] dump: POST_REPLY_RESUME_TCB=");

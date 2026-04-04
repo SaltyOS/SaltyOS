@@ -69,7 +69,6 @@ const SHM_TX_SLOT_COUNT: u64 = 32;
 const SHM_TX_OFFSET: u64 = SHM_HEADER_BYTES + (SHM_RX_SLOT_COUNT * SHM_SLOT_BYTES);
 const NET_SHM_BYTES: u64 = SHM_TX_OFFSET + (SHM_TX_SLOT_COUNT * SHM_SLOT_BYTES);
 const NET_SHM_PAGES: u64 = (NET_SHM_BYTES + 4095) / 4096;
-const DHCP_BOOTSTRAP_TIMEOUT_NS: u64 = 10_000_000_000;
 const RX_BADGE: u64 = 0x1;
 const TX_BADGE: u64 = 0x2;
 
@@ -231,32 +230,13 @@ fn bootstrap_network_config() {
         _lb.str(b"[netsrv] DHCP bootstrap starting\n");
     });
 
-    let start_ns = net::dns::clock_monotonic_ns();
-    let mut dhcp_started = false;
-
     if net::dhcp::start() {
-        dhcp_started = true;
-        loop {
-            process_rx_from_shm();
-            net::dhcp::process();
-            if net::dhcp::is_bound() || net::dhcp::is_finished() {
-                break;
-            }
-            if net::dns::clock_monotonic_ns().saturating_sub(start_ns) >= DHCP_BOOTSTRAP_TIMEOUT_NS {
-                break;
-            }
-            let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-        }
-    }
-
-    if net::dhcp::is_bound() {
-        log_network_config(b"[netsrv] DHCP configured");
+        process_rx_from_shm();
+        net::flush_pending_packets();
+        net::dhcp::process();
     } else {
-        if dhcp_started && net::dhcp::is_finished() {
-            let _ = net::dhcp::start();
-        }
         trona::uwarn!(|_lb| {
-            _lb.str(b"[netsrv] DHCP bootstrap incomplete, continuing without a fallback config\n");
+            _lb.str(b"[netsrv] DHCP start failed, continuing without a fallback config\n");
         });
     }
 }
@@ -1612,10 +1592,10 @@ fn event_loop() -> ! {
         ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_VFS_CALLBACK_EP, 0);
     }
 
-    // Initial recv -- wait for first event
-    // SAFETY: IPC context is valid; server EP was set up by procmgr.
+    // Initial wait must also honor DNS/DHCP timers so asynchronous bootstrap
+    // work can progress before the first external IPC arrives.
     unsafe {
-        ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge);
+        do_recv(ctx, &raw mut msg, &raw mut badge);
     }
 
     loop {

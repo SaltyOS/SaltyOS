@@ -819,3 +819,68 @@ The `libtrona.ld` script creates a shared object with:
 - [basaltc Design](basaltc.md) -- C standard library built on trona
 - [trona API Reference](../spec/trona-api.md) -- Complete function
   signatures and error codes
+
+---
+
+## Substrate Thread Infrastructure
+
+### Architecture
+
+The substrate owns all thread-local storage (TLS) and thread lifecycle
+infrastructure. Personality layers (POSIX, Win32) extend threads via
+personality-specific data and callbacks.
+
+```
+substrate/tls.rs
+  ThreadDesc pool, TLS init, TP management, thread_id, current_tls()
+  post_fork_child(), personality callbacks
+substrate/worker.rs
+  Worker pool: multi-threaded IPC services
+         extends via personality_data + owner
+           ┌──────┴──────┐
+      posix/pthread.rs  win32/thread.rs
+      PosixThreadExt    Win32ThreadExt
+```
+
+### ThreadDesc
+
+`ThreadDesc` is a substrate-internal Rust type (not C ABI) that tracks
+per-thread capabilities, memory layout, identity, and personality extension.
+It lives in a static pool of `MAX_THREADS` (64) slots. Each thread's
+`ThreadLocalBlock.desc` (opaque `*mut u8`) points to its `ThreadDesc`.
+
+### ThreadOwner
+
+Determines resource cleanup responsibility:
+- **Main** — lives for process lifetime, never cleaned up
+- **Worker** — substrate handles resource cleanup (unmap, cap delete)
+- **Personality** — personality handles cleanup (e.g., POSIX munmap + join)
+
+### Worker Pool
+
+`substrate/worker.rs` provides `run_workers()` for multi-threaded IPC
+services. N threads recv on the same endpoint; the kernel dispatches
+messages to available workers (FIFO). Workers are first-class threads
+with full TLS. See module docs for usage.
+
+### Fork Child Reinit
+
+`_trona_post_fork_child()` (called from `fork.S` child entry) reinits the
+substrate thread pool in the child process: updates main thread caps,
+invalidates non-main slots (ABA generation bump), invokes personality
+fork callback, resets thread ID counter. The child's SC cap is discovered
+via `PM_GET_THREAD_CAPS` IPC to procmgr.
+
+### PM_GET_THREAD_CAPS Protocol
+
+Procmgr IPC label `PM_GET_THREAD_CAPS` (36). Returns the caller's
+scheduling context cap slot via `reply.regs[0]`. Used by fork children
+to discover their SC cap (which differs from the parent's).
+
+### AT_TRONA_SC_CAP Auxv
+
+`AT_TRONA_SC_CAP` (0x100E) passes the main thread's SchedContext
+capability slot to the child process via the auxiliary vector. Parsed by
+ELF rtld, PE rtld, and the static CRT. Stored in the substrate global
+`__trona_sc_cap` and read into `ThreadDesc.sc_cap` during
+`init_main_thread_tls()`.
