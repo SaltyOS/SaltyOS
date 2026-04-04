@@ -3276,20 +3276,23 @@ fn syscall_tcb_get_space_info(cap: &Capability) -> SyscallResult {
     unsafe {
         let scheduler = crate::sched::scheduler::scheduler();
         let current = scheduler.current();
-        if !current.is_null() {
-            let buf = (*current).ipc_buffer;
-            if buf != 0
-                && validate_ipc_buffer_addr(buf).is_ok()
-                && !(*current).vspace_root.is_null()
-            {
-                let vs = &mut *(*current).vspace_root;
-                if vs.ensure_writable(buf) {
-                    let _guard = crate::arch::uaccess::UserAccessGuard::new();
-                    let ipc_buf = buf as *mut crate::ipc::IpcBuffer;
-                    (*ipc_buf).msg[0] = depth;
-                }
-            }
+        if current.is_null() {
+            return SyscallResult::err(SyscallError::InvalidOperation);
         }
+
+        let buf = (*current).ipc_buffer;
+        if buf == 0 || validate_ipc_buffer_addr(buf).is_err() || (*current).vspace_root.is_null() {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+
+        let vs = &mut *(*current).vspace_root;
+        if !vs.ensure_writable(buf) {
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+
+        let _guard = crate::arch::uaccess::UserAccessGuard::new();
+        let ipc_buf = buf as *mut crate::ipc::IpcBuffer;
+        (*ipc_buf).msg[0] = depth;
     }
 
     SyscallResult::ok(0)

@@ -227,13 +227,13 @@ unsafe fn handle_getppid(reply: &mut TronaMsg, badge: u64) {
 }
 
 unsafe fn handle_get_thread_caps(reply: &mut TronaMsg, badge: u64) {
-    let Some(idx) = find_by_badge(badge) else {
+    let Some(_idx) = find_by_badge(badge) else {
         reply.label = TRONA_NOT_FOUND;
         return;
     };
     reply.label = TRONA_OK;
     reply.length = 1;
-    reply.regs[0] = unsafe { proctab(idx).sc_cap };
+    reply.regs[0] = CHILD_CAP_SC as u64;
 }
 
 /// List all active PIDs.
