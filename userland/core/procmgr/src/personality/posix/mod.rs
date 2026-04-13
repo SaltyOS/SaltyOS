@@ -2,7 +2,6 @@
 //! All POSIX-specific IPC handlers and state management live here.
 //! SPDX-License-Identifier: GPL-2.0-only
 
-pub(crate) mod exit_wait;
 pub(crate) mod session;
 pub(crate) mod signal;
 pub(crate) mod timer;
@@ -10,7 +9,7 @@ pub(crate) mod timer;
 use trona::protocol::*;
 use trona::types::core::*;
 
-use crate::proc_table::{find_by_badge, find_by_pid, proctab, PROC_FREE, MAX_EXE_PATH_LEN};
+use crate::base::proc_table::{find_by_badge, find_by_pid, proctab, MAX_EXE_PATH_LEN};
 
 // ---- POSIX signal numbers ----
 pub(crate) const PM_SIGKILL: usize = 9;
@@ -65,9 +64,8 @@ pub(crate) unsafe fn handle_get_exe_path(msg: &TronaMsg, reply: &mut TronaMsg) {
         };
 
         let p = &*proctab(idx);
-        let posix = p.posix();
         let mut exe_len = 0usize;
-        while exe_len < MAX_EXE_PATH_LEN && posix.exe_path[exe_len] != 0 {
+        while exe_len < MAX_EXE_PATH_LEN && p.exe_path[exe_len] != 0 {
             exe_len += 1;
         }
         if exe_len == 0 {
@@ -84,14 +82,14 @@ pub(crate) unsafe fn handle_get_exe_path(msg: &TronaMsg, reply: &mut TronaMsg) {
             _lb.str(b"[PROCMGR] GET_EXE_PATH pid=");
             _lb.hex(pid as u64);
             _lb.str(b" -> '");
-            _lb.bytes(&posix.exe_path[..exe_len]);
+            _lb.bytes(&p.exe_path[..exe_len]);
             _lb.str(b"'\n");
         });
 
         reply.regs[0] = exe_len as u64;
         let dst = &mut reply.regs[1] as *mut u64 as *mut u8;
         for i in 0..exe_len {
-            *dst.add(i) = posix.exe_path[i];
+            *dst.add(i) = p.exe_path[i];
         }
         reply.label = crate::TRONA_OK;
         reply.length = 1 + ((exe_len as u64 + 7) / 8);
@@ -109,15 +107,15 @@ pub(crate) unsafe fn dispatch_posix(
     unsafe {
         match label {
             PM_FORK => {
-                crate::fork_exec::handle_fork(msg, reply, badge);
+                crate::lifecycle::fork::handle_fork(msg, reply, badge);
                 Some(false)
             }
             PM_EXEC => {
-                crate::fork_exec::handle_exec(msg, reply, badge);
+                crate::lifecycle::exec::handle_exec(msg, reply, badge);
                 Some(reply.label == 0)
             }
             PM_WAIT => {
-                let skip = exit_wait::handle_wait(msg, reply, badge);
+                let skip = crate::lifecycle::wait::handle_wait(msg, reply, badge);
                 Some(skip)
             }
             PM_KILL => {
@@ -173,7 +171,7 @@ pub(crate) unsafe fn dispatch_posix(
                 Some(false)
             }
             PM_GETGROUPS => {
-                session::handle_getgroups(reply);
+                session::handle_getgroups(msg, reply, badge);
                 Some(false)
             }
             PM_GETPGID_BADGE => {
@@ -184,12 +182,84 @@ pub(crate) unsafe fn dispatch_posix(
                 session::handle_getsid_badge(msg, reply);
                 Some(false)
             }
+            PM_GET_SESSION_TTY_BADGE => {
+                session::handle_get_session_tty_badge(msg, reply);
+                Some(false)
+            }
             PM_UMASK => {
                 handle_umask(msg, reply, badge);
                 Some(false)
             }
             PM_GET_EXE_PATH => {
                 handle_get_exe_path(msg, reply);
+                Some(false)
+            }
+            PM_SETUID => {
+                session::handle_setuid(msg, reply, badge);
+                Some(false)
+            }
+            PM_SETGID => {
+                session::handle_setgid(msg, reply, badge);
+                Some(false)
+            }
+            PM_SETEUID => {
+                session::handle_seteuid(msg, reply, badge);
+                Some(false)
+            }
+            PM_SETEGID => {
+                session::handle_setegid(msg, reply, badge);
+                Some(false)
+            }
+            PM_SETREUID => {
+                session::handle_setreuid(msg, reply, badge);
+                Some(false)
+            }
+            PM_SETREGID => {
+                session::handle_setregid(msg, reply, badge);
+                Some(false)
+            }
+            PM_SETGROUPS => {
+                session::handle_setgroups(msg, reply, badge);
+                Some(false)
+            }
+            PM_GET_CREDS_BY_BADGE => {
+                session::handle_get_creds_by_badge(msg, reply);
+                Some(false)
+            }
+            PM_GETRESUID => {
+                session::handle_getresuid(reply, badge);
+                Some(false)
+            }
+            PM_GETRESGID => {
+                session::handle_getresgid(reply, badge);
+                Some(false)
+            }
+            PM_SETRESUID => {
+                session::handle_setresuid(msg, reply, badge);
+                Some(false)
+            }
+            PM_SETRESGID => {
+                session::handle_setresgid(msg, reply, badge);
+                Some(false)
+            }
+            PM_GETRLIMIT => {
+                session::handle_getrlimit(msg, reply, badge);
+                Some(false)
+            }
+            PM_SETRLIMIT => {
+                session::handle_setrlimit(msg, reply, badge);
+                Some(false)
+            }
+            PM_SET_SESSION_TTY => {
+                session::handle_set_session_tty(msg, reply);
+                Some(false)
+            }
+            PM_CLEAR_SESSION_TTY => {
+                session::handle_clear_session_tty(msg, reply);
+                Some(false)
+            }
+            PM_SET_SESSION_TTY_PGRP => {
+                session::handle_set_session_tty_pgrp(msg, reply);
                 Some(false)
             }
             _ => None,

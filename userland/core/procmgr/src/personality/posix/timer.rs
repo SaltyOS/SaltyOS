@@ -4,7 +4,7 @@
 
 use trona::types::core::TronaMsg;
 
-use crate::proc_table::{find_by_badge, proctab, proctab_cap, PROC_RUNNING, PROC_STOPPED};
+use crate::base::proc_table::{find_by_badge, proctab, proctab_cap, ProcessState};
 
 const ITIMER_REAL: u64 = 0;
 const USEC_PER_SEC: u64 = 1_000_000;
@@ -20,7 +20,11 @@ fn clock_realtime_ns() -> u64 {
         0,
         0,
     );
-    if now.error == 0 { now.value } else { 0 }
+    if now.error == 0 {
+        now.value
+    } else {
+        0
+    }
 }
 
 fn timeval_to_ns(sec: u64, usec: u64) -> Option<u64> {
@@ -54,9 +58,7 @@ pub(crate) fn has_pending_timers() -> bool {
     unsafe {
         for i in 0..proctab_cap() {
             let p = proctab(i);
-            if (p.state == PROC_RUNNING || p.state == PROC_STOPPED)
-                && p.timer_deadline_ns != 0
-            {
+            if (p.state == ProcessState::Running || p.state == ProcessState::Stopped) && p.timer_deadline_ns != 0 {
                 return true;
             }
         }
@@ -69,7 +71,7 @@ pub(crate) fn nearest_deadline_ns() -> u64 {
     unsafe {
         for i in 0..proctab_cap() {
             let p = proctab(i);
-            if (p.state == PROC_RUNNING || p.state == PROC_STOPPED)
+            if (p.state == ProcessState::Running || p.state == ProcessState::Stopped)
                 && p.timer_deadline_ns != 0
                 && p.timer_deadline_ns < deadline
             {
@@ -90,7 +92,7 @@ pub(crate) fn process_expired_timers() {
                 (p.state, p.timer_deadline_ns, p.timer_interval_ns)
             };
 
-            if state != PROC_RUNNING && state != PROC_STOPPED {
+            if state != ProcessState::Running && state != ProcessState::Stopped {
                 continue;
             }
             if deadline_ns == 0 || deadline_ns > now_ns {
@@ -113,7 +115,7 @@ pub(crate) fn process_expired_timers() {
 
             {
                 let p = proctab(i);
-                if p.state != PROC_RUNNING && p.state != PROC_STOPPED {
+                if p.state != ProcessState::Running && p.state != ProcessState::Stopped {
                     continue;
                 }
                 p.timer_deadline_ns = next_deadline_ns;
@@ -179,29 +181,27 @@ pub(crate) unsafe fn handle_setitimer(msg: &TronaMsg, reply: &mut TronaMsg, badg
 }
 
 pub(crate) unsafe fn handle_getitimer(msg: &TronaMsg, reply: &mut TronaMsg, badge: u64) {
-    unsafe {
-        if msg.regs[0] != ITIMER_REAL {
-            reply.label = crate::TRONA_INVALID_ARGUMENT;
-            return;
-        }
-
-        let Some(idx) = find_by_badge(badge) else {
-            reply.label = crate::TRONA_NOT_FOUND;
-            return;
-        };
-
-        let now_ns = clock_realtime_ns();
-        let (value_sec, value_usec, interval_sec, interval_usec) = if now_ns == 0 {
-            (0, 0, 0, 0)
-        } else {
-            current_timer_value(idx, now_ns)
-        };
-
-        reply.label = crate::TRONA_OK;
-        reply.length = 4;
-        reply.regs[0] = value_sec;
-        reply.regs[1] = value_usec;
-        reply.regs[2] = interval_sec;
-        reply.regs[3] = interval_usec;
+    if msg.regs[0] != ITIMER_REAL {
+        reply.label = crate::TRONA_INVALID_ARGUMENT;
+        return;
     }
+
+    let Some(idx) = find_by_badge(badge) else {
+        reply.label = crate::TRONA_NOT_FOUND;
+        return;
+    };
+
+    let now_ns = clock_realtime_ns();
+    let (value_sec, value_usec, interval_sec, interval_usec) = if now_ns == 0 {
+        (0, 0, 0, 0)
+    } else {
+        current_timer_value(idx, now_ns)
+    };
+
+    reply.label = crate::TRONA_OK;
+    reply.length = 4;
+    reply.regs[0] = value_sec;
+    reply.regs[1] = value_usec;
+    reply.regs[2] = interval_sec;
+    reply.regs[3] = interval_usec;
 }
