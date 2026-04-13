@@ -66,10 +66,11 @@ impl ChildSlotAlloc {
 /// Layout of well-known capabilities in a child's CSpace, as chosen by
 /// the spawner for one specific spawn.
 ///
-/// A field that is `0` means the corresponding capability was not minted
-/// for this child — `spawn_server` may legitimately omit some caps (for
-/// example, services spawned before procmgr have no procmgr control EP, and
-/// services that do not use the rsrcsrv have no rsrcsrv EP).
+/// These fields record reserved child-slot positions, not whether a
+/// capability was actually minted into that slot. Slots 0/1/2 are always
+/// reserved for `CAP_SELF_TCB`/`CAP_SELF_VSPACE`/`CAP_SELF_CSPACE`, while
+/// context-dependent roles (for example `procmgr_ep` or `rsrcsrv_ep`) may
+/// still have a non-zero slot number whose entry is intentionally left empty.
 #[derive(Clone, Copy)]
 pub struct ChildCapLayout {
     pub self_tcb: u64,

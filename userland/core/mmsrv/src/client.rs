@@ -254,6 +254,7 @@ pub(crate) unsafe fn handle_mm_deregister(
         // later COW faults to the wrong backing MO.
         let region_count = (*client).region_count;
         let regions = (*client).regions;
+        let not_found_err = TRONA_NOT_FOUND as i32;
         if !regions.is_null() {
             for ri in 0..region_count {
                 let r = regions.add(ri);
@@ -266,7 +267,7 @@ pub(crate) unsafe fn handle_mm_deregister(
                         for page in 0..page_count {
                             let page_addr = (*r).base + page * 4096;
                             let err = trona::invoke::vspace_unmap(vspace_cap, page_addr);
-                            if err as u64 == TRONA_NOT_FOUND {
+                            if err == not_found_err {
                                 continue;
                             }
                             if err != 0 && unmap_err == 0 {
