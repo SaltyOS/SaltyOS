@@ -3,7 +3,7 @@
 
 use crate::block::{read_block, write_block};
 use crate::consts::BITMAP_CACHE_SLOTS;
-use crate::{SB, BITMAP_CACHE, BITMAP_CACHE_BLOCK, BITMAP_CACHE_DIRTY, BITMAP_BLOCK_COUNT, ALLOC_HINT};
+use crate::{SB, BITMAP_CACHE, BITMAP_CACHE_BLOCK, BITMAP_CACHE_DIRTY, BITMAP_BLOCK_COUNT, ALLOC_HINT, READONLY};
 
 /// Initialize bitmap allocator from superblock.
 pub(crate) fn init_bitmap() {
@@ -53,7 +53,11 @@ pub(crate) fn bitmap_load(bitmap_block_idx: u64) -> Option<usize> {
 }
 
 /// Allocate a free block. Returns block number.
+/// Refuses on read-only mount.
 pub(crate) fn alloc_block() -> Option<u64> {
+    if unsafe { *(&raw const READONLY) } {
+        return None;
+    }
     unsafe {
         let total = (*(&raw const SB)).total_blocks;
         let hint = *(&raw const ALLOC_HINT);
@@ -77,8 +81,11 @@ pub(crate) fn alloc_block() -> Option<u64> {
     }
 }
 
-/// Free a previously allocated block.
+/// Free a previously allocated block. No-op on read-only mount.
 pub(crate) fn free_block(block_nr: u64) {
+    if unsafe { *(&raw const READONLY) } {
+        return;
+    }
     unsafe {
         let bitmap_idx = block_nr / 32768;
         let bit_in_block = (block_nr % 32768) as usize;
@@ -113,8 +120,12 @@ pub(crate) fn count_used_blocks() -> u64 {
     }
 }
 
-/// Flush all dirty bitmap cache entries to disk.
+/// Flush all dirty bitmap cache entries to disk. No-op on read-only mount
+/// (defensive — no dirty entries should exist in RO mode).
 pub(crate) fn bitmap_flush() -> bool {
+    if unsafe { *(&raw const READONLY) } {
+        return true;
+    }
     unsafe {
         for i in 0..BITMAP_CACHE_SLOTS {
             if *(&raw const BITMAP_CACHE_DIRTY[i]) {

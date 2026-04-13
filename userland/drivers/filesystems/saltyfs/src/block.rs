@@ -7,11 +7,14 @@ use trona::ipc;
 use trona::protocol::*;
 use trona::types::core::*;
 
+use crate::btree::btree_find_all_for_ino;
 use crate::consts::*;
 use crate::crc::crc32c_superblock;
 use crate::types::*;
-use crate::{ipc_ctx, SB, BLOCK_SIZE, BLK_SHM_ID, CACHE_BLOCK_NR, CACHE_AGE, CACHE_TICK, CACHE_DIRTY, NEXT_INO};
-use crate::btree::btree_search;
+use crate::{
+    ipc_ctx, BLK_SHM_ID, BLOCK_SIZE, CACHE_AGE, CACHE_BLOCK_NR, CACHE_DIRTY, CACHE_TICK, NEXT_INO,
+    READONLY, SB,
+};
 
 /// Filesystem block number 0 is read from this disk LBA offset.
 /// `0` means the filesystem starts at the beginning of the block device (legacy raw image).
@@ -46,12 +49,11 @@ const GPT_ENTRY_LAST_LBA_OFF: usize = 40;
 // Linux filesystem data partition type GUID (bytes_le / on-disk GPT layout).
 // 0FC63DAF-8483-4772-8E79-3D69D8477DE4
 const GPT_PART_TYPE_LINUX_FS_LE: [u8; 16] = [
-    0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47,
-    0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4,
+    0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4,
 ];
 
 const PROBE_BLOCK_SIZE: u64 = DEFAULT_BLOCK_SIZE; // Superblock is always 4KB on disk.
-// Defensive cap for malformed GPTs; far above normal GPT entry arrays.
+                                                  // Defensive cap for malformed GPTs; far above normal GPT entry arrays.
 const GPT_MAX_ENTRY_ARRAY_BYTES: u64 = 64 * 1024 * 1024;
 
 #[inline]
@@ -62,8 +64,7 @@ fn read_u32_le(bytes: &[u8]) -> u32 {
 #[inline]
 fn read_u64_le(bytes: &[u8]) -> u64 {
     u64::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ])
 }
 
@@ -141,9 +142,8 @@ fn crc32_gpt_entries(entries_lba: u64, total_bytes: u64) -> Option<u32> {
             return None;
         }
 
-        let shm = unsafe {
-            core::slice::from_raw_parts(SHM_VADDR as *const u8, chunk_bytes as usize)
-        };
+        let shm =
+            unsafe { core::slice::from_raw_parts(SHM_VADDR as *const u8, chunk_bytes as usize) };
         crc = crc32_ieee_update(crc, shm);
 
         lba += chunk_sectors;
@@ -263,10 +263,10 @@ fn scan_mbr_for_saltyfs_partition() -> Option<(u64, Superblock)> {
         let entry = &mbr[off..off + MBR_PART_ENTRY_SIZE];
 
         let ptype = entry[MBR_PART_TYPE_OFF];
-        let start_lba = read_u32_le(&entry[MBR_PART_START_LBA_OFF..MBR_PART_START_LBA_OFF + 4]) as u64;
-        let sectors = read_u32_le(
-            &entry[MBR_PART_SECTOR_COUNT_OFF..MBR_PART_SECTOR_COUNT_OFF + 4],
-        ) as u64;
+        let start_lba =
+            read_u32_le(&entry[MBR_PART_START_LBA_OFF..MBR_PART_START_LBA_OFF + 4]) as u64;
+        let sectors =
+            read_u32_le(&entry[MBR_PART_SECTOR_COUNT_OFF..MBR_PART_SECTOR_COUNT_OFF + 4]) as u64;
 
         if ptype == 0 || start_lba == 0 || sectors == 0 {
             continue;
@@ -341,8 +341,7 @@ fn scan_gpt_for_saltyfs_partition() -> Option<(u64, Superblock)> {
     let entries_lba = read_u64_le(&hdr[GPT_ENTRIES_LBA_OFF..GPT_ENTRIES_LBA_OFF + 8]);
     let entry_count = read_u32_le(&hdr[GPT_ENTRIES_COUNT_OFF..GPT_ENTRIES_COUNT_OFF + 4]);
     let entry_size = read_u32_le(&hdr[GPT_ENTRY_SIZE_OFF..GPT_ENTRY_SIZE_OFF + 4]);
-    let expected_entries_crc =
-        read_u32_le(&hdr[GPT_ENTRIES_CRC32_OFF..GPT_ENTRIES_CRC32_OFF + 4]);
+    let expected_entries_crc = read_u32_le(&hdr[GPT_ENTRIES_CRC32_OFF..GPT_ENTRIES_CRC32_OFF + 4]);
 
     if entries_lba == 0 || entry_count == 0 {
         return None;
@@ -434,7 +433,7 @@ pub(crate) fn blk_read_sectors(start_sector: u64, count: u64, shm_offset: u64) -
     msg.regs[2] = shm_offset;
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_BLKDRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ipc_ctx(), svc_caps::blkdrv_ep(), &raw const msg, &raw mut reply) };
     err == 0 && reply.label == 0
 }
 
@@ -448,12 +447,22 @@ pub(crate) fn blk_write_sectors(start_sector: u64, count: u64, shm_offset: u64) 
     msg.regs[2] = shm_offset;
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_BLKDRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ipc_ctx(), svc_caps::blkdrv_ep(), &raw const msg, &raw mut reply) };
     err == 0 && reply.label == 0
 }
 
-/// Write a 4KB block to disk.
+/// Write a 4KB block to disk. Refuses when the filesystem is mounted read-only
+/// — this is a defensive guard; in practice the mutating handlers short-circuit
+/// before any write path is reached.
 pub(crate) fn write_block(block_nr: u64, data: *const u8) -> bool {
+    if unsafe { *(&raw const READONLY) } {
+        trona::uwarn!(|_lb| {
+            _lb.str(b"[saltyfs] write_block refused: read-only mount (block=");
+            _lb.dec(block_nr);
+            _lb.str(b")\n");
+        });
+        return false;
+    }
     unsafe {
         let bs = *(&raw const BLOCK_SIZE);
         let sectors_per_block = bs / SECTOR_SIZE;
@@ -531,8 +540,11 @@ pub(crate) fn cache_invalidate(block_nr: u64) {
     }
 }
 
-/// Write the superblock to disk (primary + backup).
+/// Write the superblock to disk (primary + backup). No-op on read-only mount.
 pub(crate) fn write_superblock() -> bool {
+    if unsafe { *(&raw const READONLY) } {
+        return false;
+    }
     unsafe {
         let sb = &mut *(&raw mut SB);
         sb.generation += 1;
@@ -552,47 +564,36 @@ pub(crate) fn write_superblock() -> bool {
     }
 }
 
-/// Scan a leaf node for the maximum inode number.
-fn scan_leaf_for_max_ino(leaf: *const u8) {
-    unsafe {
-        let hdr = &*(leaf as *const BTreeNodeHeader);
-        if hdr.magic != BTREE_NODE_MAGIC || hdr.level != 0 {
-            return;
-        }
-        let items_start = leaf.add(core::mem::size_of::<BTreeNodeHeader>());
-        let item_size = core::mem::size_of::<BTreeItem>();
-        let mut max_ino: u64 = (*(&raw const NEXT_INO)).saturating_sub(1);
-        for i in 0..hdr.num_items as usize {
-            let item = core::ptr::read_unaligned(
-                items_start.add(i * item_size) as *const BTreeItem,
-            );
-            if item.key.item_type == TRONA_INODE_ITEM && item.key.object_id > max_ino {
-                max_ino = item.key.object_id;
-            }
-        }
-        *(&raw mut NEXT_INO) = max_ino + 1;
-    }
-}
-
 /// Scan the B-tree to find the maximum inode number and set NEXT_INO.
-/// Uses btree_search with max key to find the last leaf in multi-level trees.
+///
+/// The tree is ordered by `(object_id, item_type, offset)`, so the last leaf is
+/// not guaranteed to contain the highest `INODE_ITEM` object id once other item
+/// types (extents, xattrs, refs) are interleaved. Walk all inode ids and stop at
+/// the first gap.
 pub(crate) fn discover_max_inode() {
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
-    // Search with the largest possible key to reach the last leaf
-    let max_key = BTreeKey {
-        object_id: u64::MAX,
-        item_type: 0xFF,
-        offset: u64::MAX,
-    };
-    let leaf = btree_search(root_tree, &max_key);
-    if !leaf.is_null() {
-        scan_leaf_for_max_ino(leaf);
-        return;
+    let mut max_ino = unsafe { (*(&raw const SB)).root_inode };
+
+    loop {
+        let next_ino = max_ino.saturating_add(1);
+        let mut found = false;
+        btree_find_all_for_ino(
+            root_tree,
+            next_ino,
+            TRONA_INODE_ITEM,
+            |_key, _data_ptr, _size| {
+                found = true;
+                false
+            },
+        );
+        if !found {
+            break;
+        }
+        max_ino = next_ino;
     }
-    // Fallback: try root block directly (single-leaf tree)
-    let leaf = read_block(root_tree);
-    if !leaf.is_null() {
-        scan_leaf_for_max_ino(leaf);
+
+    unsafe {
+        *(&raw mut NEXT_INO) = max_ino.saturating_add(1);
     }
 }
 
@@ -667,13 +668,17 @@ pub(crate) fn setup_blk_shm() -> bool {
     msg.length = 0;
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ctx, CAP_BLKDRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ctx, svc_caps::blkdrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
-        trona::uerror!(|_lb| { _lb.str(b"[saltyfs] Failed to get SHM ID from blkdrv\n"); });
+        trona::uerror!(|_lb| {
+            _lb.str(b"[saltyfs] Failed to get SHM ID from blkdrv\n");
+        });
         return false;
     }
 
-    unsafe { *(&raw mut BLK_SHM_ID) = reply.regs[0]; }
+    unsafe {
+        *(&raw mut BLK_SHM_ID) = reply.regs[0];
+    }
 
     // Map the SHM into our address space
     let mut msg = TronaMsg::zeroed();
@@ -685,7 +690,7 @@ pub(crate) fn setup_blk_shm() -> bool {
     msg.regs[3] = 0x3; // RW
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         trona::uerror!(|_lb| {
             _lb.str(b"[saltyfs] SHM map failed: ");
@@ -695,7 +700,9 @@ pub(crate) fn setup_blk_shm() -> bool {
         return false;
     }
 
-    trona::uinfo!(|_lb| { _lb.str(b"[saltyfs] SHM mapped from blkdrv\n"); });
+    trona::uinfo!(|_lb| {
+        _lb.str(b"[saltyfs] SHM mapped from blkdrv\n");
+    });
     true
 }
 
@@ -711,9 +718,11 @@ pub(crate) fn setup_cache() -> bool {
     msg.regs[1] = CACHE_TOTAL_PAGES;
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || (reply.label != 0 && reply.label != TRONA_ALREADY_EXISTS) {
-        trona::uerror!(|_lb| { _lb.str(b"[saltyfs] Cache SHM create failed\n"); });
+        trona::uerror!(|_lb| {
+            _lb.str(b"[saltyfs] Cache SHM create failed\n");
+        });
         return false;
     }
 
@@ -726,13 +735,65 @@ pub(crate) fn setup_cache() -> bool {
     msg.regs[3] = 0x3; // RW
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
-        trona::uerror!(|_lb| { _lb.str(b"[saltyfs] Cache SHM map failed\n"); });
+        trona::uerror!(|_lb| {
+            _lb.str(b"[saltyfs] Cache SHM map failed\n");
+        });
         return false;
     }
 
-    trona::uinfo!(|_lb| { _lb.str(b"[saltyfs] Block cache allocated\n"); });
+    trona::uinfo!(|_lb| {
+        _lb.str(b"[saltyfs] Block cache allocated\n");
+    });
+    true
+}
+
+/// Validate feature flags on a freshly-read superblock. Must be called after
+/// the superblock has been loaded into `SB`.
+///
+/// Returns `false` if the filesystem should not be mounted. May also set the
+/// global `READONLY` flag if `compat_ro_flags` carries unknown bits (auto
+/// read-only fallback; mount still succeeds).
+fn check_features(sb: &Superblock) -> bool {
+    // 1) Unknown incompat bits → hard refuse
+    let unknown_incompat = sb.incompat_flags & !SALTYFS_INCOMPAT_SUPPORTED;
+    if unknown_incompat != 0 {
+        trona::uerror!(|_lb| {
+            _lb.str(b"[saltyfs] mount refused: unsupported incompat flags=0x");
+            _lb.hex(unknown_incompat as u64);
+            _lb.putc(b'\n');
+        });
+        return false;
+    }
+
+    // 2) Casefold version must match driver when casefold is enabled
+    if (sb.incompat_flags & SALTYFS_INCOMPAT_CASEFOLD) != 0
+        && sb.casefold_version != CASEFOLD_VERSION_UNICODE_15_1
+    {
+        trona::uerror!(|_lb| {
+            _lb.str(b"[saltyfs] mount refused: casefold version mismatch (image=");
+            _lb.dec(sb.casefold_version as u64);
+            _lb.str(b" driver=");
+            _lb.dec(CASEFOLD_VERSION_UNICODE_15_1 as u64);
+            _lb.str(b")\n");
+        });
+        return false;
+    }
+
+    // 3) Unknown compat_ro bits → force read-only mount
+    let unknown_compat_ro = sb.compat_ro_flags & !SALTYFS_COMPAT_RO_SUPPORTED;
+    if unknown_compat_ro != 0 {
+        trona::uwarn!(|_lb| {
+            _lb.str(b"[saltyfs] mount read-only: unsupported compat_ro flags=0x");
+            _lb.hex(unknown_compat_ro as u64);
+            _lb.putc(b'\n');
+        });
+        unsafe {
+            *(&raw mut READONLY) = true;
+        }
+    }
+
     true
 }
 
@@ -746,6 +807,7 @@ pub(crate) fn read_superblock() -> bool {
     unsafe {
         *(&raw mut BLOCK_SIZE) = DEFAULT_BLOCK_SIZE;
         *(&raw mut PARTITION_BASE_LBA) = 0;
+        *(&raw mut READONLY) = false;
     }
 
     let (base_lba, probed_sb) = if let Some(sb) = probe_superblock_at_partition_lba(0) {
@@ -755,7 +817,9 @@ pub(crate) fn read_superblock() -> bool {
     } else if let Some((lba, sb)) = scan_mbr_for_saltyfs_partition() {
         (lba, sb)
     } else {
-        trona::uerror!(|_lb| { _lb.str(b"[saltyfs] Failed to find SaltyFS superblock (raw/GPT/MBR)\n"); });
+        trona::uerror!(|_lb| {
+            _lb.str(b"[saltyfs] Failed to find SaltyFS superblock (raw/GPT/MBR)\n");
+        });
         return false;
     };
 
@@ -763,7 +827,14 @@ pub(crate) fn read_superblock() -> bool {
         *(&raw mut PARTITION_BASE_LBA) = base_lba;
         *(&raw mut SB) = probed_sb;
         *(&raw mut BLOCK_SIZE) = (*(&raw const SB)).block_size;
+    }
 
+    // Validate feature flags before letting the rest of the server touch the fs.
+    if !check_features(&probed_sb) {
+        return false;
+    }
+
+    unsafe {
         trona::uinfo!(|_lb| {
             _lb.str(b"[saltyfs] Mounted: part_lba=");
             _lb.dec(*(&raw const PARTITION_BASE_LBA));
@@ -777,6 +848,9 @@ pub(crate) fn read_superblock() -> bool {
             _lb.dec((*(&raw const SB)).root_tree);
             _lb.str(b" root_ino=");
             _lb.dec((*(&raw const SB)).root_inode);
+            if *(&raw const READONLY) {
+                _lb.str(b" (READ-ONLY)");
+            }
             _lb.putc(b'\n');
         });
     }

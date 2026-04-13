@@ -15,15 +15,8 @@
 //!   Label 5 = SALTYFS_STAT:    MR0=ino -> stat info
 //!   Label 6 = SALTYFS_GETINFO: -> total/free blocks, label
 //!
-//! Cap layout:
-//!   0  = self TCB
-//!   1  = self VSpace
-//!   2  = self CSpace
-//!   68 = server endpoint (pre-created service EP)
-//!   14 = readiness notification
-//!   64 = blkdrv endpoint
-//!   5  = namesrv endpoint
-//!   7  = mmsrv endpoint
+//! Startup caps are role-based. System caps come from `trona::caps::*()`,
+//! and the blkdrv dependency comes from generated `svc_caps::*()`.
 
 #![no_std]
 #![no_main]
@@ -37,7 +30,11 @@ mod crc;
 mod block;
 mod alloc;
 mod btree;
+#[allow(dead_code)]
+mod casefold_table;
+mod name;
 mod handlers;
+mod xattr;
 
 use trona::consts::kernel::*;
 use trona::consts::server::*;
@@ -53,6 +50,11 @@ use types::Superblock;
 // ======================================================================
 
 static mut MOUNTED: bool = false;
+/// Mount-wide read-only flag. Set by `block::check_features` when the
+/// image carries unknown `compat_ro_flags`, or by an explicit
+/// `SALTYFS_MOUNT_RO` request. When true, all mutating handlers short-circuit
+/// with `TRONA_READONLY` and no dirty blocks should ever accumulate.
+static mut READONLY: bool = false;
 static mut SB: Superblock = unsafe { core::mem::zeroed() };
 static mut BLOCK_SIZE: u64 = DEFAULT_BLOCK_SIZE;
 static mut BLK_SHM_ID: u64 = 0;
@@ -81,7 +83,7 @@ fn ipc_ctx() -> *mut IpcContext {
 }
 
 fn signal_ready() {
-    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, trona::caps::readiness_ntfn(), 1, 0, 0, 0, 0);
 }
 
 // ======================================================================
@@ -99,9 +101,10 @@ fn register_namesrv() {
         for i in 0..name.len() {
             *dst.add(i) = name[i];
         }
-        ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, trona::caps::service_ep());
         let mut reply = TronaMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESRV_EP, &raw const msg, &raw mut reply);
+        let err =
+            ipc::call_ctx(ipc_ctx(), trona::caps::namesrv_ep(), &raw const msg, &raw mut reply);
         if err != 0 || reply.label != TRONA_OK {
             trona::uerror!(|_lb| { _lb.str(b"[saltyfs] namesrv registration failed\n"); });
         }
@@ -118,12 +121,12 @@ fn server_loop() -> ! {
     let ctx = ipc_ctx();
     let mut msg = TronaMsg::zeroed();
     let mut badge: u64 = 0;
-    unsafe { ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge); }
+    unsafe { ipc::recv_ctx(ctx, trona::caps::service_ep(), &raw mut msg, &raw mut badge); }
 
     loop {
         let label = msg.label;
         let reply = match label {
-            SALTYFS_MOUNT => handlers::handle_mount(),
+            SALTYFS_MOUNT => handlers::handle_mount(&msg),
             SALTYFS_LOOKUP => handlers::handle_lookup(&msg),
             SALTYFS_READ => handlers::handle_read(&msg),
             SALTYFS_READDIR => handlers::handle_readdir(&msg),
@@ -143,6 +146,12 @@ fn server_loop() -> ! {
             SALTYFS_READLINK => handlers::handle_readlink(&msg),
             SALTYFS_LINK => handlers::handle_link(&msg),
             SALTYFS_GETPARENT => handlers::handle_getparent(&msg),
+            SALTYFS_CHMOD => handlers::handle_chmod(&msg),
+            SALTYFS_CHOWN => handlers::handle_chown(&msg),
+            SALTYFS_GETXATTR => xattr::handle_getxattr(&msg),
+            SALTYFS_SETXATTR => xattr::handle_setxattr(&msg),
+            SALTYFS_REMOVEXATTR => xattr::handle_removexattr(&msg),
+            SALTYFS_LISTXATTR => xattr::handle_listxattr(&msg),
             _ => {
                 let mut r = TronaMsg::zeroed();
                 r.label = TRONA_INVALID_OPERATION;
@@ -161,6 +170,10 @@ fn server_loop() -> ! {
             || label == SALTYFS_TRUNCATE
             || label == SALTYFS_SYMLINK
             || label == SALTYFS_LINK
+            || label == SALTYFS_CHMOD
+            || label == SALTYFS_CHOWN
+            || label == SALTYFS_SETXATTR
+            || label == SALTYFS_REMOVEXATTR
         {
             block::cache_flush_all();
         }
@@ -169,7 +182,11 @@ fn server_loop() -> ! {
         badge = 0;
         unsafe {
             ipc::reply_recv_ctx(
-                ctx, CAP_SERVER_EP, &raw const reply, &raw mut msg, &raw mut badge,
+                ctx,
+                trona::caps::service_ep(),
+                &raw const reply,
+                &raw mut msg,
+                &raw mut badge,
             );
         }
     }
@@ -196,19 +213,27 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         unsafe { *(&raw mut MOUNTED) = true; }
         alloc::init_bitmap();
 
-        // Bitmap consistency check: verify used_blocks matches actual bitmap
+        // Bitmap consistency check: verify used_blocks matches actual bitmap.
+        // Skip the correcting write path when mounted read-only.
         let actual_used = alloc::count_used_blocks();
         let sb_used = unsafe { (*(&raw const SB)).used_blocks };
         if actual_used != sb_used {
+            let ro = unsafe { *(&raw const READONLY) };
             trona::uwarn!(|_lb| {
                 _lb.str(b"[saltyfs] WARN: bitmap mismatch: sb.used_blocks=");
                 _lb.dec(sb_used);
                 _lb.str(b" actual=");
                 _lb.dec(actual_used);
-                _lb.str(b" (correcting)\n");
+                if ro {
+                    _lb.str(b" (read-only; not correcting)\n");
+                } else {
+                    _lb.str(b" (correcting)\n");
+                }
             });
-            unsafe { (*(&raw mut SB)).used_blocks = actual_used; }
-            block::write_superblock();
+            if !ro {
+                unsafe { (*(&raw mut SB)).used_blocks = actual_used; }
+                block::write_superblock();
+            }
         }
 
         block::discover_max_inode();

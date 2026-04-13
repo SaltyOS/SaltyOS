@@ -2,10 +2,22 @@
 //! IPC request handlers for file operations.
 //!
 //! Name length limits are dictated by IPC message register packing:
-//! - 136 bytes (MR3..MR19): create, mkdir, link name fields
-//! - 144 bytes (MR2..MR19): lookup, unlink, rmdir name fields
-//! - 72 bytes (MR3..MR11): symlink link name (old name in rename)
-//! - 64 bytes (MR12..MR19): symlink target, rename new name
+//!
+//! V1 inbound layout (legacy, uid/gid implied zero):
+//!   - 136 bytes (MR3..MR19): create, mkdir, link name fields
+//!   - 144 bytes (MR2..MR19): lookup, unlink, rmdir name fields
+//!   - 72  bytes (MR3..MR11): symlink link name
+//!   - 64  bytes (MR12..MR19): symlink target, rename new name
+//!
+//! V2 inbound layout (multi-user, bit 63 of MR0 set via `SALTYFS_PROTO_V2`):
+//!   - 120 bytes (MR5..MR20): create, mkdir name fields (MR2=uid, MR3=gid, MR4=name_len)
+//!   - 56  bytes (MR5..MR11): symlink link name (MR1=uid, MR2=gid, MR3=name_len, MR4=target_len)
+//!   - 64  bytes (MR12..MR19): symlink target (unchanged between V1/V2)
+//!
+//! Outbound STAT-merged layouts:
+//!   - `handle_lookup` reply carries 9 regs (ino/mode/size/nlink/mtime/uid/gid/dir_type/blocks)
+//!   - `handle_readdir` streams fixed 96B records into VFS SHM — see `READDIR_ENTRY_BYTES`
+//!   - `handle_stat` reply carries 8 regs (ino/size/mode/nlink/mtime/blocks/uid/gid)
 
 use trona::consts::kernel::*;
 use trona::consts::server::*;
@@ -18,27 +30,46 @@ use crate::block::{read_block, write_block, read_superblock};
 use crate::btree::{btree_find_item, btree_find_all_for_ino, btree_cow_insert, btree_cow_delete, btree_cow_update};
 use crate::consts::*;
 use crate::types::*;
-use crate::{SB, BLOCK_SIZE, MOUNTED, NEXT_INO};
+use crate::{SB, BLOCK_SIZE, MOUNTED, NEXT_INO, READONLY};
 
-/// FNV-1a hash for generating DIR_ITEM key offsets from entry names.
-/// Used for hardlink entries where reusing the target inode number
-/// as key offset would cause collisions.
-fn fnv1a_hash(name: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in name {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x00000100000001B3);
+/// Branch used by every mutating handler: returns an early reply carrying
+/// `TRONA_READONLY` when the filesystem was mounted read-only. Callers must
+/// return the produced message directly.
+#[inline]
+fn ro_reject_if_readonly() -> Option<TronaMsg> {
+    if unsafe { *(&raw const READONLY) } {
+        let mut reply = TronaMsg::zeroed();
+        reply.label = TRONA_READONLY;
+        Some(reply)
+    } else {
+        None
     }
-    h
 }
 
-/// Insert a DIR_ITEM with linear probing on FNV-1a hash collision.
-/// Returns false if insertion fails (out of memory or too many collisions).
+/// Look up a directory's `SALTY_INODE_CASEFOLD` bit. Used by DIR_ITEM hash
+/// and comparison helpers to pick between raw-byte and Unicode Simple
+/// Case-Folding behaviour.
+#[inline]
+fn dir_is_casefold(parent_ino: u64) -> bool {
+    match get_inode(parent_ino) {
+        Some(p) => (p.flags & SALTY_INODE_CASEFOLD) != 0,
+        None => false,
+    }
+}
+
+/// Insert a DIR_ITEM with linear probing on hash collision. The hash uses
+/// Simple Case-Folding when the parent directory has `SALTY_INODE_CASEFOLD`
+/// set, so that `Hello.txt` and `hello.txt` collapse onto the same key.
+///
+/// Callers are expected to have already verified that no matching entry
+/// exists (via `lookup_in_dir`) so that collisions here are genuine
+/// hash collisions rather than duplicate names.
 fn dir_item_insert(parent_ino: u64, name: &[u8], dir_buf: &[u8]) -> bool {
+    let casefold = dir_is_casefold(parent_ino);
     let mut key = BTreeKey {
         object_id: parent_ino,
         item_type: TRONA_DIR_ITEM,
-        offset: fnv1a_hash(name),
+        offset: crate::name::dir_name_hash(name, casefold),
     };
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
     for _ in 0..16 {
@@ -50,29 +81,28 @@ fn dir_item_insert(parent_ino: u64, name: &[u8], dir_buf: &[u8]) -> bool {
     false
 }
 
-/// Find the actual BTreeKey for a DIR_ITEM entry by scanning for a matching name.
-/// Returns None if no matching entry is found. This handles both old-style
-/// (offset=child_ino) and new-style (offset=fnv1a_hash(name)) DIR_ITEM keys.
+/// Find the actual BTreeKey for a DIR_ITEM entry by scanning for a matching
+/// name. Falls through the full directory on old images where the key
+/// offset is `child_ino` instead of the name hash. Casefold-aware: when the
+/// parent directory has `SALTY_INODE_CASEFOLD`, names compare under Simple
+/// Case-Folding.
 fn find_dir_item_key(dir_ino: u64, name: *const u8, name_len: u8) -> Option<BTreeKey> {
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
+    let casefold = dir_is_casefold(dir_ino);
+    let name_slice = unsafe { core::slice::from_raw_parts(name, name_len as usize) };
     let mut found_key: Option<BTreeKey> = None;
 
     btree_find_all_for_ino(root_tree, dir_ino, TRONA_DIR_ITEM, |key, data_ptr, _size| {
         unsafe {
             let (_, entry_name_len, _) = parse_dir_item_header(data_ptr);
-            if entry_name_len as u8 == name_len {
-                let entry_name = data_ptr.add(DIR_ITEM_HEADER_SIZE);
-                let mut match_found = true;
-                for j in 0..name_len as usize {
-                    if *entry_name.add(j) != *name.add(j) {
-                        match_found = false;
-                        break;
-                    }
-                }
-                if match_found {
-                    found_key = Some(*key);
-                    return false;
-                }
+            let entry_name_ptr = data_ptr.add(DIR_ITEM_HEADER_SIZE);
+            let entry_name_slice = core::slice::from_raw_parts(
+                entry_name_ptr,
+                entry_name_len as usize,
+            );
+            if crate::name::dir_name_equal(entry_name_slice, name_slice, casefold) {
+                found_key = Some(*key);
+                return false;
             }
         }
         true
@@ -183,17 +213,21 @@ fn dir_entry_remove_with_ref(parent_ino: u64, child_ino: u64, name: &[u8]) -> Di
 }
 
 /// Look up a directory entry by name within a directory inode.
+///
 /// Uses direct hash-based B-tree lookup with linear probing for collisions,
-/// matching the insertion strategy in `dir_item_insert`.
-/// Falls back to full scan for old-style entries (offset != fnv1a_hash).
+/// matching the insertion strategy in `dir_item_insert`. Falls back to a
+/// full scan for old-style entries (offset != name hash). When the parent
+/// directory has `SALTY_INODE_CASEFOLD`, both the hash and the per-entry
+/// comparison use Unicode 15.1 Simple Case-Folding.
 pub(crate) fn lookup_in_dir(dir_ino: u64, name: *const u8, name_len: u8) -> Option<(u64, u8)> {
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
 
-    // Build a slice for hashing
+    // Build a slice for hashing & comparison.
     let name_slice = unsafe { core::slice::from_raw_parts(name, name_len as usize) };
-    let base_hash = fnv1a_hash(name_slice);
+    let casefold = dir_is_casefold(dir_ino);
+    let base_hash = crate::name::dir_name_hash(name_slice, casefold);
 
-    // Direct hash lookup with linear probing (matches dir_item_insert)
+    // Direct hash lookup with linear probing (matches dir_item_insert).
     let mut key = BTreeKey {
         object_id: dir_ino,
         item_type: TRONA_DIR_ITEM,
@@ -204,50 +238,38 @@ pub(crate) fn lookup_in_dir(dir_ino: u64, name: *const u8, name_len: u8) -> Opti
             // SAFETY: data_ptr points to a valid DIR_ITEM within a mapped B-tree leaf.
             unsafe {
                 let (child_ino, entry_name_len, dir_type) = parse_dir_item_header(data_ptr);
-                if entry_name_len == name_len as u16 {
-                    let entry_name = data_ptr.add(DIR_ITEM_HEADER_SIZE);
-                    let mut matched = true;
-                    for j in 0..name_len as usize {
-                        if *entry_name.add(j) != *name.add(j) {
-                            matched = false;
-                            break;
-                        }
-                    }
-                    if matched {
-                        return Some((child_ino, dir_type));
-                    }
+                let entry_slice = core::slice::from_raw_parts(
+                    data_ptr.add(DIR_ITEM_HEADER_SIZE),
+                    entry_name_len as usize,
+                );
+                if crate::name::dir_name_equal(entry_slice, name_slice, casefold) {
+                    return Some((child_ino, dir_type));
                 }
             }
         } else {
-            break; // No entry at this offset — no more probing needed
+            break; // No entry at this offset — no more probing needed.
         }
         key.offset = key.offset.wrapping_add(1);
     }
 
-    // Fallback: full scan for old-style entries where offset is the child inode
-    // number rather than fnv1a_hash(name). This covers images created before the
-    // hash-based keying was introduced.
+    // Fallback: full scan for old-style entries where offset is the child
+    // inode number rather than the name hash. This covers images created
+    // before hash-based keying, and also handles directories that mix old
+    // entries with new ones.
     let mut result: Option<(u64, u8)> = None;
     btree_find_all_for_ino(root_tree, dir_ino, TRONA_DIR_ITEM, |_key, data_ptr, _size| {
-        // SAFETY: data_ptr points to a valid DIR_ITEM within a mapped B-tree leaf.
         unsafe {
             let (child_ino, entry_name_len, dir_type) = parse_dir_item_header(data_ptr);
-            if entry_name_len as u8 == name_len {
-                let entry_name = data_ptr.add(DIR_ITEM_HEADER_SIZE);
-                let mut match_found = true;
-                for j in 0..name_len as usize {
-                    if *entry_name.add(j) != *name.add(j) {
-                        match_found = false;
-                        break;
-                    }
-                }
-                if match_found {
-                    result = Some((child_ino, dir_type));
-                    return false; // stop iteration
-                }
+            let entry_slice = core::slice::from_raw_parts(
+                data_ptr.add(DIR_ITEM_HEADER_SIZE),
+                entry_name_len as usize,
+            );
+            if crate::name::dir_name_equal(entry_slice, name_slice, casefold) {
+                result = Some((child_ino, dir_type));
+                return false;
             }
         }
-        true // continue
+        true
     });
 
     result
@@ -387,69 +409,121 @@ fn read_file_data(ino: u64, file_offset: u64, count: u64, dest_base: u64) -> u64
     bytes_read
 }
 
-/// Read directory entries from a directory inode, using cross-leaf iteration.
-/// Returns up to 3 entries per call via MR registers.
-/// `cursor` is the entry index among matching DIR_ITEM keys.
-fn readdir_entries(
+/// Fixed 96-byte per-entry record layout written into VFS SHM by `handle_readdir`.
+///
+/// Callers are expected to cast consecutive 96-byte spans into this struct.
+/// `name` is NUL-padded up to 44 bytes; `name_len` gives the actual length.
+pub(crate) const READDIR_ENTRY_BYTES: u64 = 96;
+pub(crate) const READDIR_NAME_MAX: usize = 44;
+
+/// Stream directory entries into VFS SHM as fixed-size records. Replaces the
+/// old 3-entries-per-IPC inline scheme so that the reply also carries
+/// stat-merged metadata (mode, size, blocks, mtime, uid, gid, nlink) without
+/// forcing the caller to issue a follow-up STAT for every entry.
+///
+/// The caller pre-allocates `buf_bytes` in VFS SHM at `shm_offset`. Each
+/// written entry is `READDIR_ENTRY_BYTES` bytes. Entries whose names exceed
+/// `READDIR_NAME_MAX` are truncated at the record boundary; the IPC name
+/// limits elsewhere already prevent DIR_ITEMs longer than 44 bytes from being
+/// created from userland, so truncation is defensive.
+fn readdir_stream_shm(
     dir_ino: u64,
     cursor: u64,
+    shm_offset: u64,
+    buf_bytes: u64,
     reply: &mut TronaMsg,
 ) {
     let root_tree = unsafe { (*(&raw const SB)).root_tree };
 
+    let max_entries = (buf_bytes / READDIR_ENTRY_BYTES) as usize;
+    if max_entries == 0 {
+        reply.label = TRONA_OK;
+        reply.length = 3;
+        reply.regs[0] = cursor; // no progress
+        reply.regs[1] = 0;
+        reply.regs[2] = 0;
+        return;
+    }
+
+    let base_ptr = (VFS_SHM_VADDR + shm_offset) as *mut u8;
+
     let mut entry_idx = 0u64;
-    let mut out_idx = 0usize;
+    let mut written = 0usize;
     let mut has_more = false;
 
-    // MR0 = next_cursor, then repeated groups of 6:
-    // (ino, type, name_0, name_1, name_2, name_3) — 32-byte names, 3 entries max
     btree_find_all_for_ino(root_tree, dir_ino, TRONA_DIR_ITEM, |_key, data_ptr, _size| {
         if entry_idx < cursor {
             entry_idx += 1;
             return true;
         }
 
-        if out_idx >= 3 {
+        if written >= max_entries {
             has_more = true;
             return false;
         }
 
         unsafe {
             let (child_ino, entry_name_len, entry_dir_type) = parse_dir_item_header(data_ptr);
+
+            // Fetch child inode for stat metadata. Missing inode = stale dir
+            // entry; skip it but keep scanning.
+            let inode = match get_inode(child_ino) {
+                Some(i) => i,
+                None => {
+                    entry_idx += 1;
+                    return true;
+                }
+            };
+
             let name_ptr = data_ptr.add(DIR_ITEM_HEADER_SIZE);
+            let nlen_full = entry_name_len as usize;
+            let nlen = nlen_full.min(READDIR_NAME_MAX);
 
-            let base = 1 + out_idx * 6;
-            reply.regs[base] = child_ino;
-            reply.regs[base + 1] = entry_dir_type as u64;
+            let rec = base_ptr.add(written * (READDIR_ENTRY_BYTES as usize));
 
-            let nlen = (entry_name_len as usize).min(32);
-            let mut name_regs = [0u64; 4];
-            for j in 0..nlen {
-                let reg_idx = j / 8;
-                let bit_pos = (j % 8) * 8;
-                name_regs[reg_idx] |= (*name_ptr.add(j) as u64) << bit_pos;
+            // +0..8   ino
+            // +8..16  size
+            // +16..24 blocks
+            // +24..32 mtime
+            // +32..36 mode
+            // +36..40 uid
+            // +40..44 gid
+            // +44..48 nlink
+            // +48     dir_type
+            // +49     name_len (clamped)
+            // +50..52 pad
+            // +52..96 name (NUL-padded 44 bytes)
+            core::ptr::write_unaligned(rec.add(0) as *mut u64, child_ino);
+            core::ptr::write_unaligned(rec.add(8) as *mut u64, inode.size);
+            core::ptr::write_unaligned(rec.add(16) as *mut u64, inode.blocks);
+            core::ptr::write_unaligned(rec.add(24) as *mut u64, inode.mtime);
+            core::ptr::write_unaligned(rec.add(32) as *mut u32, inode.mode);
+            core::ptr::write_unaligned(rec.add(36) as *mut u32, inode.uid);
+            core::ptr::write_unaligned(rec.add(40) as *mut u32, inode.gid);
+            core::ptr::write_unaligned(rec.add(44) as *mut u32, inode.nlink);
+            *rec.add(48) = entry_dir_type;
+            *rec.add(49) = nlen as u8;
+            *rec.add(50) = 0;
+            *rec.add(51) = 0;
+            for j in 0..READDIR_NAME_MAX {
+                if j < nlen {
+                    *rec.add(52 + j) = *name_ptr.add(j);
+                } else {
+                    *rec.add(52 + j) = 0;
+                }
             }
-            reply.regs[base + 2] = name_regs[0];
-            reply.regs[base + 3] = name_regs[1];
-            reply.regs[base + 4] = name_regs[2];
-            reply.regs[base + 5] = name_regs[3];
         }
 
-        out_idx += 1;
+        written += 1;
         entry_idx += 1;
         true
     });
 
-    if out_idx == 0 {
-        reply.regs[0] = 0;
-        reply.label = 0;
-        reply.length = 1;
-        return;
-    }
-
-    reply.regs[0] = if has_more { cursor + out_idx as u64 } else { 0 };
-    reply.label = 0;
-    reply.length = 1 + (out_idx as u64) * 6;
+    reply.label = TRONA_OK;
+    reply.length = 3;
+    reply.regs[0] = if has_more { cursor + written as u64 } else { 0 };
+    reply.regs[1] = written as u64;
+    reply.regs[2] = (written as u64) * READDIR_ENTRY_BYTES;
 }
 
 /// Serialize a SaltyInodeItem to bytes.
@@ -462,22 +536,34 @@ fn inode_to_bytes(inode: &SaltyInodeItem) -> [u8; 128] {
 }
 
 /// Build inode bytes for a new file or directory.
-fn build_inode_bytes(size: u64, blocks: u64, nlink: u32, mode: u32) -> [u8; 128] {
-    let ngen =unsafe { (*(&raw const SB)).generation + 1 };
+///
+/// `uid`/`gid` carry the owning credentials (0/0 when the caller has no
+/// identity context yet — see the IPC shim in create/mkdir/symlink handlers).
+/// `flags` carries inheritable directory flags such as `SALTY_INODE_CASEFOLD`.
+fn build_inode_bytes(
+    size: u64,
+    blocks: u64,
+    nlink: u32,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    flags: u32,
+) -> [u8; 128] {
+    let ngen = unsafe { (*(&raw const SB)).generation + 1 };
     let inode = SaltyInodeItem {
         generation: ngen,
         size,
         blocks,
         block_group: 0,
         nlink,
-        uid: 0,
-        gid: 0,
+        uid,
+        gid,
         mode,
         atime: 0,
         mtime: 0,
         ctime: 0,
         crtime: 0,
-        flags: 0,
+        flags,
         sequence: 0,
         reserved: [0; 32],
     };
@@ -611,7 +697,15 @@ fn update_inode_mtime(ino: u64) -> bool {
     true
 }
 
-pub(crate) fn handle_mount() -> TronaMsg {
+/// Handle SALTYFS_MOUNT.
+///
+/// Request: `regs[0] = mount_flags (bit 0 = SALTYFS_MOUNT_RO)`.
+/// Zero-length / zero-flag requests are the historical "plain mount" path.
+///
+/// When `SALTYFS_MOUNT_RO` is set, or when `read_superblock` detected unknown
+/// `compat_ro_flags` on the on-disk image, the filesystem is marked read-only
+/// for the lifetime of this mount.
+pub(crate) fn handle_mount(msg: &TronaMsg) -> TronaMsg {
     let mut reply = TronaMsg::zeroed();
 
     if unsafe { *(&raw const MOUNTED) } {
@@ -621,9 +715,20 @@ pub(crate) fn handle_mount() -> TronaMsg {
         return reply;
     }
 
+    // Parse optional mount_flags from regs[0]. Older callers that sent a
+    // bare mount request have length==0 which yields zeros and thus the same
+    // RW behaviour as before.
+    let mount_flags = if msg.length >= 1 { msg.regs[0] } else { 0 };
+    let force_ro = (mount_flags & SALTYFS_MOUNT_RO) != 0;
+
     if !read_superblock() {
         reply.label = TRONA_NOT_FOUND;
         return reply;
+    }
+
+    if force_ro {
+        unsafe { *(&raw mut READONLY) = true; }
+        trona::uinfo!(|_lb| { _lb.str(b"[saltyfs] explicit read-only mount\n"); });
     }
 
     unsafe { *(&raw mut MOUNTED) = true; }
@@ -633,6 +738,26 @@ pub(crate) fn handle_mount() -> TronaMsg {
     reply
 }
 
+/// Handle SALTYFS_LOOKUP with stat-merged reply.
+///
+/// Request:
+///   regs[0] = parent_ino
+///   regs[1] = name_len (≤ 144)
+///   regs[2..20] = name bytes (144 bytes)
+///
+/// Reply (success, length = 9):
+///   regs[0] = child_ino
+///   regs[1] = mode
+///   regs[2] = size
+///   regs[3] = nlink
+///   regs[4] = mtime
+///   regs[5] = uid
+///   regs[6] = gid
+///   regs[7] = dir_type
+///   regs[8] = blocks
+///
+/// Merging stat into lookup eliminates a round-trip for every path resolution
+/// and keeps uid/gid inline for the future multi-user aware VFS.
 pub(crate) fn handle_lookup(msg: &TronaMsg) -> TronaMsg {
     let mut reply = TronaMsg::zeroed();
 
@@ -642,7 +767,6 @@ pub(crate) fn handle_lookup(msg: &TronaMsg) -> TronaMsg {
     }
 
     let parent_ino = msg.regs[0];
-    // Name packed in MR1..MR19 (up to 144 bytes)
     let name_len = msg.regs[1] as u8;
     if name_len == 0 || name_len > 144 {
         reply.label = TRONA_INVALID_ARGUMENT;
@@ -657,17 +781,36 @@ pub(crate) fn handle_lookup(msg: &TronaMsg) -> TronaMsg {
         }
     }
 
-    match lookup_in_dir(parent_ino, name_buf.as_ptr(), name_len) {
-        Some((child_ino, dir_type)) => {
-            reply.label = 0;
-            reply.length = 2;
-            reply.regs[0] = child_ino;
-            reply.regs[1] = dir_type as u64;
-        }
+    let (child_ino, dir_type) = match lookup_in_dir(parent_ino, name_buf.as_ptr(), name_len) {
+        Some(x) => x,
         None => {
             reply.label = TRONA_NOT_FOUND;
+            return reply;
         }
-    }
+    };
+
+    // Fetch the child inode so the reply carries stat metadata inline.
+    // If the inode is missing (stale dir entry), report NOT_FOUND rather than
+    // a half-populated entry.
+    let inode = match get_inode(child_ino) {
+        Some(i) => i,
+        None => {
+            reply.label = TRONA_NOT_FOUND;
+            return reply;
+        }
+    };
+
+    reply.label = TRONA_OK;
+    reply.length = 9;
+    reply.regs[0] = child_ino;
+    reply.regs[1] = inode.mode as u64;
+    reply.regs[2] = inode.size;
+    reply.regs[3] = inode.nlink as u64;
+    reply.regs[4] = inode.mtime;
+    reply.regs[5] = inode.uid as u64;
+    reply.regs[6] = inode.gid as u64;
+    reply.regs[7] = dir_type as u64;
+    reply.regs[8] = inode.blocks;
     reply
 }
 
@@ -708,6 +851,22 @@ pub(crate) fn handle_read(msg: &TronaMsg) -> TronaMsg {
     reply
 }
 
+/// Handle SALTYFS_READDIR.
+///
+/// Request:
+///   regs[0] = dir_ino
+///   regs[1] = cursor (opaque; 0 to start)
+///   regs[2] = shm_offset (into VFS SHM)
+///   regs[3] = buf_bytes  (maximum bytes to write in VFS SHM)
+///
+/// Reply:
+///   regs[0] = next_cursor (0 = EOF)
+///   regs[1] = entries_written
+///   regs[2] = bytes_written
+///
+/// Each entry is `READDIR_ENTRY_BYTES` (96) bytes of fixed layout containing
+/// stat-merged metadata plus the (possibly truncated) name. See
+/// `readdir_stream_shm` for the exact record layout.
 pub(crate) fn handle_readdir(msg: &TronaMsg) -> TronaMsg {
     let mut reply = TronaMsg::zeroed();
 
@@ -716,10 +875,26 @@ pub(crate) fn handle_readdir(msg: &TronaMsg) -> TronaMsg {
         return reply;
     }
 
+    if !unsafe { *(&raw const crate::VFS_SHM_MAPPED) } {
+        reply.label = TRONA_INVALID_OPERATION;
+        return reply;
+    }
+
     let dir_ino = msg.regs[0];
     let cursor = msg.regs[1];
+    let shm_offset = msg.regs[2];
+    let buf_bytes = msg.regs[3];
 
-    readdir_entries(dir_ino, cursor, &mut reply);
+    // Bound check: the request must fit entirely inside VFS SHM.
+    let shm_size = VFS_SHM_PAGES * 4096;
+    if shm_offset >= shm_size
+        || buf_bytes > shm_size.saturating_sub(shm_offset)
+    {
+        reply.label = TRONA_INVALID_ARGUMENT;
+        return reply;
+    }
+
+    readdir_stream_shm(dir_ino, cursor, shm_offset, buf_bytes, &mut reply);
     reply
 }
 
@@ -736,13 +911,15 @@ pub(crate) fn handle_stat(msg: &TronaMsg) -> TronaMsg {
     match get_inode(ino) {
         Some(inode) => {
             reply.label = 0;
-            reply.length = 6;
+            reply.length = 8;
             reply.regs[0] = ino;
             reply.regs[1] = inode.size;
             reply.regs[2] = inode.mode as u64;
             reply.regs[3] = inode.nlink as u64;
             reply.regs[4] = inode.mtime;
             reply.regs[5] = inode.blocks;
+            reply.regs[6] = inode.uid as u64;
+            reply.regs[7] = inode.gid as u64;
         }
         None => {
             reply.label = TRONA_NOT_FOUND;
@@ -817,27 +994,56 @@ pub(crate) fn handle_read_inline(msg: &TronaMsg) -> TronaMsg {
 }
 
 /// Handle SALTYFS_CREATE: create a new regular file.
+///
+/// Accepts both V1 (legacy) and V2 (multi-user) layouts; see `SALTYFS_PROTO_V2`
+/// in consts.rs. V2 carries uid/gid and uses a 120-byte name slot, V1 uses the
+/// historical 136-byte layout with uid/gid implicitly zero.
 pub(crate) fn handle_create(msg: &TronaMsg) -> TronaMsg {
     let mut reply = TronaMsg::zeroed();
     if !unsafe { *(&raw const MOUNTED) } {
         reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
+    if let Some(r) = ro_reject_if_readonly() { return r; }
 
-    let parent_ino = msg.regs[0];
+    let raw_parent = msg.regs[0];
+    let is_v2 = (raw_parent & SALTYFS_PROTO_V2) != 0;
+    let parent_ino = raw_parent & !SALTYFS_PROTO_V2;
     let mode = msg.regs[1] as u32;
-    let name_len = msg.regs[2] as u8;
-    if name_len == 0 || name_len > 136 {
+
+    let (uid, gid, name_len, name_off, name_cap) = if is_v2 {
+        (msg.regs[2] as u32, msg.regs[3] as u32, msg.regs[4] as u8, 5usize, 120usize)
+    } else {
+        (0u32, 0u32, msg.regs[2] as u8, 3usize, 136usize)
+    };
+
+    if name_len == 0 || (name_len as usize) > name_cap {
         reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
     let mut name_buf = [0u8; 136];
-    let name_data = &msg.regs[3] as *const u64 as *const u8;
+    let name_data = unsafe { (&msg.regs[name_off] as *const u64 as *const u8) };
     unsafe {
         for i in 0..name_len as usize {
             name_buf[i] = *name_data.add(i);
         }
+    }
+
+    // Inherit parent directory flags (CASEFOLD) so that subordinate lookups
+    // within a case-insensitive directory tree stay coherent.
+    let inherit_flags = match get_inode(parent_ino) {
+        Some(p) => p.flags & SALTY_INODE_CASEFOLD,
+        None => 0,
+    };
+
+    // Casefold directories must only accept valid UTF-8 names so that the
+    // table-driven fold function has a well-defined hash/compare key.
+    if (inherit_flags & SALTY_INODE_CASEFOLD) != 0
+        && !crate::name::is_valid_utf8(&name_buf[..name_len as usize])
+    {
+        reply.label = TRONA_INVALID_ARGUMENT;
+        return reply;
     }
 
     // Check if already exists
@@ -853,7 +1059,7 @@ pub(crate) fn handle_create(msg: &TronaMsg) -> TronaMsg {
     };
 
     // Insert INODE_ITEM
-    let inode_data = build_inode_bytes(0, 0, 1, mode | 0o100000); // S_IFREG
+    let inode_data = build_inode_bytes(0, 0, 1, mode | 0o100000, uid, gid, inherit_flags); // S_IFREG
     let inode_key = BTreeKey {
         object_id: new_ino,
         item_type: TRONA_INODE_ITEM,
@@ -904,6 +1110,7 @@ pub(crate) fn handle_write_inline(msg: &TronaMsg) -> TronaMsg {
         reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
+    if let Some(r) = ro_reject_if_readonly() { return r; }
 
     let ino = msg.regs[0];
     let offset = msg.regs[1];
@@ -1189,27 +1396,53 @@ fn write_regular_extents(
 }
 
 /// Handle SALTYFS_MKDIR: create a new directory.
+///
+/// Accepts V1/V2 layouts — see `SALTYFS_PROTO_V2`. Inherits `SALTY_INODE_CASEFOLD`
+/// from the parent directory so casefold coherence is preserved across subtrees.
 pub(crate) fn handle_mkdir_fs(msg: &TronaMsg) -> TronaMsg {
     let mut reply = TronaMsg::zeroed();
     if !unsafe { *(&raw const MOUNTED) } {
         reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
+    if let Some(r) = ro_reject_if_readonly() { return r; }
 
-    let parent_ino = msg.regs[0];
+    let raw_parent = msg.regs[0];
+    let is_v2 = (raw_parent & SALTYFS_PROTO_V2) != 0;
+    let parent_ino = raw_parent & !SALTYFS_PROTO_V2;
     let mode = msg.regs[1] as u32;
-    let name_len = msg.regs[2] as u8;
-    if name_len == 0 || name_len > 136 {
+
+    let (uid, gid, name_len, name_off, name_cap) = if is_v2 {
+        (msg.regs[2] as u32, msg.regs[3] as u32, msg.regs[4] as u8, 5usize, 120usize)
+    } else {
+        (0u32, 0u32, msg.regs[2] as u8, 3usize, 136usize)
+    };
+
+    if name_len == 0 || (name_len as usize) > name_cap {
         reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
     let mut name_buf = [0u8; 136];
-    let name_data = &msg.regs[3] as *const u64 as *const u8;
+    let name_data = unsafe { (&msg.regs[name_off] as *const u64 as *const u8) };
     unsafe {
         for i in 0..name_len as usize {
             name_buf[i] = *name_data.add(i);
         }
+    }
+
+    // Inherit parent CASEFOLD flag into the new directory.
+    let inherit_flags = match get_inode(parent_ino) {
+        Some(p) => p.flags & SALTY_INODE_CASEFOLD,
+        None => 0,
+    };
+
+    // Casefold parent: reject invalid UTF-8.
+    if (inherit_flags & SALTY_INODE_CASEFOLD) != 0
+        && !crate::name::is_valid_utf8(&name_buf[..name_len as usize])
+    {
+        reply.label = TRONA_INVALID_ARGUMENT;
+        return reply;
     }
 
     if lookup_in_dir(parent_ino, name_buf.as_ptr(), name_len).is_some() {
@@ -1224,7 +1457,7 @@ pub(crate) fn handle_mkdir_fs(msg: &TronaMsg) -> TronaMsg {
     };
 
     // Insert INODE_ITEM for directory (nlink=2, S_IFDIR)
-    let inode_data = build_inode_bytes(0, 0, 2, mode | 0o040000);
+    let inode_data = build_inode_bytes(0, 0, 2, mode | 0o040000, uid, gid, inherit_flags);
     let inode_key = BTreeKey {
         object_id: new_ino,
         item_type: TRONA_INODE_ITEM,
@@ -1265,6 +1498,7 @@ pub(crate) fn handle_unlink_fs(msg: &TronaMsg) -> TronaMsg {
         reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
+    if let Some(r) = ro_reject_if_readonly() { return r; }
 
     let parent_ino = msg.regs[0];
     let name_len = msg.regs[1] as u8;
@@ -1313,6 +1547,10 @@ pub(crate) fn handle_unlink_fs(msg: &TronaMsg) -> TronaMsg {
 
     let new_nlink = inode.nlink.saturating_sub(1);
     if new_nlink == 0 {
+        // Drop all xattrs (including hidden-inode backed indirect entries)
+        // before tearing down the file's own extents and INODE_ITEM.
+        crate::xattr::delete_all_xattrs(child_ino);
+
         // Delete all extent data items (multi-block aware)
         delete_all_extents(child_ino);
         bitmap_flush();
@@ -1355,6 +1593,7 @@ pub(crate) fn handle_rmdir_fs(msg: &TronaMsg) -> TronaMsg {
         reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
+    if let Some(r) = ro_reject_if_readonly() { return r; }
 
     let parent_ino = msg.regs[0];
     let name_len = msg.regs[1] as u8;
@@ -1437,6 +1676,7 @@ pub(crate) fn handle_rename_fs(msg: &TronaMsg) -> TronaMsg {
         reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
+    if let Some(r) = ro_reject_if_readonly() { return r; }
 
     let old_parent = msg.regs[0];
     let old_name_len = msg.regs[1] as u8;
@@ -1491,10 +1731,14 @@ pub(crate) fn handle_rename_fs(msg: &TronaMsg) -> TronaMsg {
             }
         }
 
-        // Decrement nlink; if 0, clean up inode + extents
+        // Decrement nlink; if 0, clean up inode + extents + xattrs
         if let Some(existing_inode) = get_inode(existing_ino) {
             let new_nlink = existing_inode.nlink.saturating_sub(1);
             if new_nlink == 0 {
+                // Reclaim xattrs (including hidden-inode indirect entries)
+                // before tearing down extents and the INODE_ITEM.
+                crate::xattr::delete_all_xattrs(existing_ino);
+
                 // Delete all extent data items (multi-block aware)
                 delete_all_extents(existing_ino);
                 bitmap_flush();
@@ -1562,6 +1806,7 @@ pub(crate) fn handle_truncate_fs(msg: &TronaMsg) -> TronaMsg {
         reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
+    if let Some(r) = ro_reject_if_readonly() { return r; }
 
     let ino = msg.regs[0];
     let new_size = msg.regs[1];
@@ -1714,7 +1959,7 @@ pub(crate) fn handle_shm_setup(msg: &TronaMsg) -> TronaMsg {
 
     let mut mm_reply = TronaMsg::zeroed();
     let err = unsafe {
-        trona::ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const mm_msg, &raw mut mm_reply)
+        trona::ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const mm_msg, &raw mut mm_reply)
     };
     if err != 0 || mm_reply.label != 0 {
         trona::uerror!(|_lb| { _lb.str(b"[saltyfs] VFS SHM map failed\n"); });
@@ -1738,6 +1983,7 @@ pub(crate) fn handle_write_shm(msg: &TronaMsg) -> TronaMsg {
         reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
+    if let Some(r) = ro_reject_if_readonly() { return r; }
 
     if !unsafe { *(&raw const crate::VFS_SHM_MAPPED) } {
         reply.label = TRONA_INVALID_OPERATION;
@@ -1932,28 +2178,46 @@ pub(crate) fn handle_write_shm(msg: &TronaMsg) -> TronaMsg {
 // ======================================================================
 
 /// Handle SALTYFS_SYMLINK: create a symbolic link.
-/// MR0=parent_ino, MR1=link_name_len (max 72), MR2=target_len (max 64),
-/// MR3..MR11=link_name (72 bytes), MR12..MR19=target (64 bytes)
+///
+/// V1 layout: MR0=parent_ino, MR1=name_len (max 72), MR2=target_len (max 64),
+///            MR3..MR11=name, MR12..MR19=target.
+/// V2 layout (`SALTYFS_PROTO_V2` bit in MR0):
+///            MR0=parent|V2, MR1=uid, MR2=gid, MR3=name_len (max 56),
+///            MR4=target_len (max 64), MR5..MR11=name, MR12..MR19=target.
 pub(crate) fn handle_symlink(msg: &TronaMsg) -> TronaMsg {
     let mut reply = TronaMsg::zeroed();
     if !unsafe { *(&raw const MOUNTED) } {
         reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
+    if let Some(r) = ro_reject_if_readonly() { return r; }
 
-    let parent_ino = msg.regs[0];
-    let name_len = msg.regs[1] as usize;
-    let target_len = msg.regs[2] as usize;
+    let raw_parent = msg.regs[0];
+    let is_v2 = (raw_parent & SALTYFS_PROTO_V2) != 0;
+    let parent_ino = raw_parent & !SALTYFS_PROTO_V2;
 
-    if name_len == 0 || name_len > 72 || target_len == 0 || target_len > 64 {
+    let (uid, gid, name_len, target_len, name_off, name_cap) = if is_v2 {
+        (
+            msg.regs[1] as u32,
+            msg.regs[2] as u32,
+            msg.regs[3] as usize,
+            msg.regs[4] as usize,
+            5usize,
+            56usize,
+        )
+    } else {
+        (0u32, 0u32, msg.regs[1] as usize, msg.regs[2] as usize, 3usize, 72usize)
+    };
+
+    if name_len == 0 || name_len > name_cap || target_len == 0 || target_len > 64 {
         reply.label = TRONA_INVALID_ARGUMENT;
         return reply;
     }
 
-    // Extract link name from MR3..MR11
+    // Extract link name from name_off..MR11
     let mut name_buf = [0u8; 72];
     unsafe {
-        let src = &raw const msg.regs[3] as *const u8;
+        let src = &raw const msg.regs[name_off] as *const u8;
         for i in 0..name_len {
             name_buf[i] = *src.add(i);
         }
@@ -1981,11 +2245,24 @@ pub(crate) fn handle_symlink(msg: &TronaMsg) -> TronaMsg {
         return reply;
     }
 
+    // Casefold parent: the symlink's own name must be valid UTF-8. The
+    // target bytes are opaque (they become file content) and are not
+    // subject to name-level UTF-8 validation.
+    if (parent_inode.flags & SALTY_INODE_CASEFOLD) != 0
+        && !crate::name::is_valid_utf8(&name_buf[..name_len])
+    {
+        reply.label = TRONA_INVALID_ARGUMENT;
+        return reply;
+    }
+
     // Check name doesn't already exist
     if lookup_in_dir(parent_ino, name_buf.as_ptr(), name_len as u8).is_some() {
         reply.label = TRONA_ALREADY_EXISTS;
         return reply;
     }
+
+    // Inherit CASEFOLD bit from parent for consistency with the directory.
+    let inherit_flags = parent_inode.flags & SALTY_INODE_CASEFOLD;
 
     // Allocate inode number
     let new_ino = unsafe {
@@ -1995,7 +2272,7 @@ pub(crate) fn handle_symlink(msg: &TronaMsg) -> TronaMsg {
     };
 
     // Insert INODE_ITEM with S_IFLNK mode, size = target length
-    let inode_data = build_inode_bytes(target_len as u64, 0, 1, 0o120000 | 0o777);
+    let inode_data = build_inode_bytes(target_len as u64, 0, 1, 0o120000 | 0o777, uid, gid, inherit_flags);
     let inode_key = BTreeKey {
         object_id: new_ino,
         item_type: TRONA_INODE_ITEM,
@@ -2124,6 +2401,7 @@ pub(crate) fn handle_link(msg: &TronaMsg) -> TronaMsg {
         reply.label = TRONA_INVALID_OPERATION;
         return reply;
     }
+    if let Some(r) = ro_reject_if_readonly() { return r; }
 
     let existing_ino = msg.regs[0];
     let new_parent = msg.regs[1];
@@ -2234,5 +2512,92 @@ pub(crate) fn handle_getparent(msg: &TronaMsg) -> TronaMsg {
     } else {
         reply.label = TRONA_NOT_FOUND;
     }
+    reply
+}
+
+/// Handle SALTYFS_CHMOD: update inode mode, preserving file type bits.
+/// regs[0] = ino, regs[1] = new_mode (permission bits only, 0o7777 mask)
+pub(crate) fn handle_chmod(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
+    if !unsafe { *(&raw const MOUNTED) } {
+        reply.label = TRONA_INVALID_OPERATION;
+        return reply;
+    }
+    if let Some(r) = ro_reject_if_readonly() { return r; }
+
+    let ino = msg.regs[0];
+    let new_perm = msg.regs[1] as u32;
+
+    let inode = match get_inode(ino) {
+        Some(i) => i,
+        None => {
+            reply.label = TRONA_NOT_FOUND;
+            return reply;
+        }
+    };
+
+    let inode_key = BTreeKey {
+        object_id: ino,
+        item_type: TRONA_INODE_ITEM,
+        offset: 0,
+    };
+
+    // Preserve file type bits (S_IFMT = 0o170000), replace permission bits
+    let mut updated = inode;
+    updated.mode = (inode.mode & 0o170000) | (new_perm & 0o7777);
+    updated.mtime = unsafe { (*(&raw const SB)).generation + 1 };
+
+    if !btree_cow_update(&inode_key, &inode_to_bytes(&updated)) {
+        reply.label = TRONA_OUT_OF_MEMORY;
+        return reply;
+    }
+
+    reply.label = TRONA_OK;
+    reply
+}
+
+/// Handle SALTYFS_CHOWN: update inode uid/gid.
+/// regs[0] = ino, regs[1] = new_uid (u32::MAX = no change), regs[2] = new_gid (u32::MAX = no change)
+pub(crate) fn handle_chown(msg: &TronaMsg) -> TronaMsg {
+    let mut reply = TronaMsg::zeroed();
+    if !unsafe { *(&raw const MOUNTED) } {
+        reply.label = TRONA_INVALID_OPERATION;
+        return reply;
+    }
+    if let Some(r) = ro_reject_if_readonly() { return r; }
+
+    let ino = msg.regs[0];
+    let new_uid = msg.regs[1] as u32;
+    let new_gid = msg.regs[2] as u32;
+
+    let inode = match get_inode(ino) {
+        Some(i) => i,
+        None => {
+            reply.label = TRONA_NOT_FOUND;
+            return reply;
+        }
+    };
+
+    let inode_key = BTreeKey {
+        object_id: ino,
+        item_type: TRONA_INODE_ITEM,
+        offset: 0,
+    };
+
+    let mut updated = inode;
+    if new_uid != u32::MAX {
+        updated.uid = new_uid;
+    }
+    if new_gid != u32::MAX {
+        updated.gid = new_gid;
+    }
+    updated.mtime = unsafe { (*(&raw const SB)).generation + 1 };
+
+    if !btree_cow_update(&inode_key, &inode_to_bytes(&updated)) {
+        reply.label = TRONA_OUT_OF_MEMORY;
+        return reply;
+    }
+
+    reply.label = TRONA_OK;
     reply
 }

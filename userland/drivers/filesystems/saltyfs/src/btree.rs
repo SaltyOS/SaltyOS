@@ -1,19 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! B-tree read and copy-on-write (COW) mutation operations.
 
-use crate::alloc::{alloc_block, free_block, bitmap_flush};
-use crate::block::{read_block, read_block_mut, write_block, write_superblock, cache_flush_block};
+use crate::alloc::{alloc_block, bitmap_flush, free_block};
+use crate::block::{cache_flush_block, read_block, read_block_mut, write_block, write_superblock};
 use crate::consts::*;
 use crate::crc::crc32c_btree_node;
 use crate::types::*;
-use crate::{SB, BLOCK_SIZE};
+use crate::{BLOCK_SIZE, SB};
 
 /// Search a leaf node for an item matching the given key.
 /// Returns pointer to item data within the block, and its size.
-pub(crate) fn btree_leaf_find(
-    block_data: *const u8,
-    key: &BTreeKey,
-) -> Option<(*const u8, u32)> {
+pub(crate) fn btree_leaf_find(block_data: *const u8, key: &BTreeKey) -> Option<(*const u8, u32)> {
     unsafe {
         let hdr = &*(block_data as *const BTreeNodeHeader);
         if hdr.level != 0 {
@@ -100,9 +97,7 @@ pub(crate) fn btree_search(root_block: u64, key: &BTreeKey) -> *const u8 {
         }
 
         // Internal node: binary search for child
-        let ptrs_start = unsafe {
-            data.add(core::mem::size_of::<BTreeNodeHeader>())
-        };
+        let ptrs_start = unsafe { data.add(core::mem::size_of::<BTreeNodeHeader>()) };
         let ptr_size = core::mem::size_of::<BTreePointer>();
         let num_ptrs = hdr.num_items as usize;
 
@@ -157,14 +152,10 @@ fn find_next_leaf_key(root_block: u64, key: &BTreeKey) -> Option<BTreeKey> {
         let hdr = unsafe { &*(parent_data as *const BTreeNodeHeader) };
         let next_idx = child_idx + 1;
         if next_idx < hdr.num_items as usize {
-            let ptrs_start = unsafe {
-                parent_data.add(core::mem::size_of::<BTreeNodeHeader>())
-            };
+            let ptrs_start = unsafe { parent_data.add(core::mem::size_of::<BTreeNodeHeader>()) };
             let ptr_size = core::mem::size_of::<BTreePointer>();
             let next_ptr = unsafe {
-                core::ptr::read_unaligned(
-                    ptrs_start.add(next_idx * ptr_size) as *const BTreePointer,
-                )
+                core::ptr::read_unaligned(ptrs_start.add(next_idx * ptr_size) as *const BTreePointer)
             };
             return Some(next_ptr.key);
         }
@@ -223,9 +214,9 @@ where
         }
         prev_leaf_block = hdr.block_nr;
 
-        let mut found_in_leaf = false;
         let mut stopped = false;
-        let mut leaf_max_offset = search_key.offset;
+        let mut saw_past_range = false;
+        let mut next_search_key: Option<BTreeKey> = None;
 
         // SAFETY: leaf pointer is valid and points to a mapped B-tree node block.
         // Items are read via read_unaligned to handle packed layout.
@@ -234,13 +225,14 @@ where
             let item_size = core::mem::size_of::<BTreeItem>();
 
             for i in 0..hdr.num_items as usize {
-                let item = core::ptr::read_unaligned(
-                    items_start.add(i * item_size) as *const BTreeItem,
-                );
-                if item.key.object_id == ino
-                    && item.key.item_type == item_type
-                    && item.key.offset >= search_key.offset
-                {
+                let item =
+                    core::ptr::read_unaligned(items_start.add(i * item_size) as *const BTreeItem);
+
+                if item.key.cmp(&search_key) == core::cmp::Ordering::Less {
+                    continue;
+                }
+
+                if item.key.object_id == ino && item.key.item_type == item_type {
                     let data_ptr = leaf.add(item.offset as usize);
                     if !callback(&item.key, data_ptr, item.size) {
                         stopped = true;
@@ -248,24 +240,49 @@ where
                         break;
                     }
                     total += 1;
-                    found_in_leaf = true;
-                    if item.key.offset >= leaf_max_offset {
-                        if item.key.offset < u64::MAX {
-                            leaf_max_offset = item.key.offset + 1;
-                        } else {
-                            leaf_max_offset = u64::MAX;
-                        }
+
+                    if item.key.offset == u64::MAX {
+                        saw_past_range = true;
+                        break;
                     }
+
+                    next_search_key = Some(BTreeKey {
+                        object_id: ino,
+                        item_type,
+                        offset: item.key.offset + 1,
+                    });
+                    continue;
+                }
+
+                if item.key.object_id > ino
+                    || (item.key.object_id == ino && item.key.item_type > item_type)
+                {
+                    saw_past_range = true;
+                    break;
                 }
             }
         }
 
-        if !stopped {
-            search_key.offset = leaf_max_offset;
+        if stopped || saw_past_range {
+            break;
         }
 
-        if stopped || !found_in_leaf {
-            break;
+        match next_search_key {
+            Some(next_key) => {
+                search_key = next_key;
+            }
+            None => match find_next_leaf_key(root_block, &search_key) {
+                Some(next_key) => {
+                    if next_key.object_id > ino
+                        || (next_key.object_id == ino && next_key.item_type > item_type)
+                    {
+                        break;
+                    }
+                    search_key = next_key;
+                    prev_leaf_block = u64::MAX;
+                }
+                None => break,
+            },
         }
     }
 
@@ -320,9 +337,8 @@ pub(crate) fn btree_search_path(root_block: u64, key: &BTreeKey) -> Option<BTree
         }
 
         let mut child_idx = 0u32;
-        let mut child_block = unsafe {
-            core::ptr::read_unaligned(ptrs_start as *const BTreePointer).block_nr
-        };
+        let mut child_block =
+            unsafe { core::ptr::read_unaligned(ptrs_start as *const BTreePointer).block_nr };
         for i in 0..num_ptrs {
             let p = unsafe {
                 core::ptr::read_unaligned(ptrs_start.add(i * ptr_size) as *const BTreePointer)
@@ -417,15 +433,9 @@ pub(crate) fn cow_propagate_up(
             let ptr_loc = ptrs_start.add(child_idx * ptr_size);
             // BTreePointer layout: key(17) + block_nr(8) + generation(8)
             let block_nr_offset = 17;
-            core::ptr::write_unaligned(
-                ptr_loc.add(block_nr_offset) as *mut u64,
-                child_block,
-            );
+            core::ptr::write_unaligned(ptr_loc.add(block_nr_offset) as *mut u64, child_block);
             let ngen = (*(&raw const SB)).generation + 1;
-            core::ptr::write_unaligned(
-                ptr_loc.add(block_nr_offset + 8) as *mut u64,
-                ngen,
-            );
+            core::ptr::write_unaligned(ptr_loc.add(block_nr_offset + 8) as *mut u64, ngen);
         }
 
         // Recompute CRC32c
@@ -716,9 +726,8 @@ fn insert_right_sibling(
         // Descend using right_key to guide navigation
         path_blocks[depth] = current_block;
         let mut next_child_idx = 0u32;
-        let mut next_child = unsafe {
-            core::ptr::read_unaligned(ptrs_start as *const BTreePointer).block_nr
-        };
+        let mut next_child =
+            unsafe { core::ptr::read_unaligned(ptrs_start as *const BTreePointer).block_nr };
         for i in 0..num_ptrs {
             let p = unsafe {
                 core::ptr::read_unaligned(ptrs_start.add(i * ptr_size) as *const BTreePointer)
@@ -814,12 +823,11 @@ fn insert_right_sibling(
         };
         let mut freed = [0u64; MAX_BTREE_DEPTH];
         let mut freed_count = 0usize;
-        let final_root = match cow_propagate_up(
-            &prop_path, depth, new_parent, &mut freed, &mut freed_count,
-        ) {
-            Some(r) => r,
-            None => return None,
-        };
+        let final_root =
+            match cow_propagate_up(&prop_path, depth, new_parent, &mut freed, &mut freed_count) {
+                Some(r) => r,
+                None => return None,
+            };
         free_block(parent_block);
         for i in 0..freed_count {
             free_block(freed[i]);
@@ -875,7 +883,14 @@ fn btree_cow_insert_split(
         right_items[i].data = items[mid + i].data;
     }
     let mut right_buf = [0u8; 4096];
-    if !rebuild_leaf(&mut right_buf, 0, ngen, right_block, &right_items, right_count) {
+    if !rebuild_leaf(
+        &mut right_buf,
+        0,
+        ngen,
+        right_block,
+        &right_items,
+        right_count,
+    ) {
         free_block(left_block);
         free_block(right_block);
         return false;
@@ -901,9 +916,14 @@ fn btree_cow_insert_split(
         };
         let mut root_buf = [0u8; 4096];
         build_internal_node(
-            &mut root_buf, ngen, new_root, 1,
-            &left_key, left_block,
-            &right_key, right_block,
+            &mut root_buf,
+            ngen,
+            new_root,
+            1,
+            &left_key,
+            left_block,
+            &right_key,
+            right_block,
         );
         if !write_block(new_root, root_buf.as_ptr()) {
             free_block(left_block);
@@ -924,16 +944,15 @@ fn btree_cow_insert_split(
         // Do NOT update SB yet — compute new_root only.
         let mut freed = [0u64; MAX_BTREE_DEPTH];
         let mut freed_count = 0usize;
-        let new_root = match cow_propagate_up(
-            path, path.depth, left_block, &mut freed, &mut freed_count,
-        ) {
-            Some(r) => r,
-            None => {
-                free_block(left_block);
-                free_block(right_block);
-                return false;
-            }
-        };
+        let new_root =
+            match cow_propagate_up(path, path.depth, left_block, &mut freed, &mut freed_count) {
+                Some(r) => r,
+                None => {
+                    free_block(left_block);
+                    free_block(right_block);
+                    return false;
+                }
+            };
 
         // Step 2: Insert right_block into parent using the uncommitted new_root
         let final_root = match insert_right_sibling(new_root, left_block, &right_key, right_block) {
@@ -960,8 +979,12 @@ fn btree_cow_insert_split(
         }
     }
 
-    if !bitmap_flush() { return false; }
-    if !write_superblock() { return false; }
+    if !bitmap_flush() {
+        return false;
+    }
+    if !write_superblock() {
+        return false;
+    }
     true
 }
 
@@ -1006,9 +1029,8 @@ pub(crate) fn btree_cow_insert(key: &BTreeKey, data: &[u8]) -> bool {
     // COW propagate up
     let mut freed = [0u64; MAX_BTREE_DEPTH];
     let mut freed_count = 0usize;
-    let new_root = match cow_propagate_up(
-        &path, path.depth, new_leaf, &mut freed, &mut freed_count,
-    ) {
+    let new_root = match cow_propagate_up(&path, path.depth, new_leaf, &mut freed, &mut freed_count)
+    {
         Some(r) => r,
         None => return false,
     };
@@ -1023,8 +1045,12 @@ pub(crate) fn btree_cow_insert(key: &BTreeKey, data: &[u8]) -> bool {
         free_block(freed[i]);
     }
 
-    if !bitmap_flush() { return false; }
-    if !write_superblock() { return false; }
+    if !bitmap_flush() {
+        return false;
+    }
+    if !write_superblock() {
+        return false;
+    }
     true
 }
 
@@ -1068,9 +1094,8 @@ pub(crate) fn btree_cow_delete(key: &BTreeKey) -> bool {
 
     let mut freed = [0u64; MAX_BTREE_DEPTH];
     let mut freed_count = 0usize;
-    let new_root = match cow_propagate_up(
-        &path, path.depth, new_leaf, &mut freed, &mut freed_count,
-    ) {
+    let new_root = match cow_propagate_up(&path, path.depth, new_leaf, &mut freed, &mut freed_count)
+    {
         Some(r) => r,
         None => return false,
     };
@@ -1084,8 +1109,12 @@ pub(crate) fn btree_cow_delete(key: &BTreeKey) -> bool {
         free_block(freed[i]);
     }
 
-    if !bitmap_flush() { return false; }
-    if !write_superblock() { return false; }
+    if !bitmap_flush() {
+        return false;
+    }
+    if !write_superblock() {
+        return false;
+    }
     true
 }
 
@@ -1141,9 +1170,8 @@ pub(crate) fn btree_cow_update(key: &BTreeKey, data: &[u8]) -> bool {
 
     let mut freed = [0u64; MAX_BTREE_DEPTH];
     let mut freed_count = 0usize;
-    let new_root = match cow_propagate_up(
-        &path, path.depth, new_leaf, &mut freed, &mut freed_count,
-    ) {
+    let new_root = match cow_propagate_up(&path, path.depth, new_leaf, &mut freed, &mut freed_count)
+    {
         Some(r) => r,
         None => return false,
     };
@@ -1157,7 +1185,11 @@ pub(crate) fn btree_cow_update(key: &BTreeKey, data: &[u8]) -> bool {
         free_block(freed[i]);
     }
 
-    if !bitmap_flush() { return false; }
-    if !write_superblock() { return false; }
+    if !bitmap_flush() {
+        return false;
+    }
+    if !write_superblock() {
+        return false;
+    }
     true
 }
