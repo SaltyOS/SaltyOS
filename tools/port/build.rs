@@ -474,7 +474,7 @@ pub fn do_configure(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Resul
             let cmd_str = format!("cmake {} ..", quoted.join(" "));
             run_shell(&cmd_str, &build, &cross_vars, env.verbose)
         }
-        BuildType::Make | BuildType::Custom | BuildType::Targets => {
+        BuildType::Make | BuildType::Custom | BuildType::Targets | BuildType::Cargo => {
             // No configure step
             Ok(())
         }
@@ -514,6 +514,9 @@ pub fn do_build(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Result<()
         BuildType::Targets => {
             do_build_targets(port, port_dir, env)
         }
+        BuildType::Cargo => {
+            do_build_cargo(port, port_dir, env)
+        }
     }
 }
 
@@ -525,9 +528,9 @@ pub fn do_build_targets(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> R
         return Err(format!("Source directory not found: {}", src.display()));
     }
 
-    let out_dir = src.join(".salty-build");
+    let out_dir = src.join("_build");
     fs::create_dir_all(&out_dir)
-        .map_err(|e| format!("Cannot create .salty-build/: {}", e))?;
+        .map_err(|e| format!("Cannot create _build/: {}", e))?;
 
     let var_map = vars::build_var_map(port, port_dir, env);
     let cross_vars = cross_env(env, &port.env_overrides, &var_map);
@@ -615,7 +618,7 @@ pub fn do_build_targets(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> R
 
         let out_path = out_dir.join(&target.name);
 
-        // Ensure parent directory exists (e.g. .salty-build/bin/)
+        // Ensure parent directory exists (e.g. _build/bin/)
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Cannot create output dir: {}", e))?;
@@ -625,7 +628,7 @@ pub fn do_build_targets(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> R
         let ldflags = cross_vars.get("LDFLAGS").cloned().unwrap_or_default();
         let libs = cross_vars.get("LIBS").cloned().unwrap_or_default();
 
-        // Add .salty-build/ to library search path so [libs] archives are found
+        // Add _build/ to library search path so [libs] archives are found
         let lib_path = if !port.libs.is_empty() {
             format!("-L{}", out_dir.display())
         } else {
@@ -651,6 +654,94 @@ pub fn do_build_targets(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> R
     }
 
     Ok(())
+}
+
+/// Cargo cross-compile build for Rust ports
+pub fn do_build_cargo(port: &PortConfig, port_dir: &Path, env: &BuildEnv) -> Result<(), String> {
+    let src = vars::resolve_source_dir(port, port_dir)
+        .unwrap_or_else(|| vars::preferred_source_dir(port, port_dir));
+    if !src.exists() {
+        return Err(format!("Source directory not found: {}", src.display()));
+    }
+
+    let var_map = vars::build_var_map(port, port_dir, env);
+    let mut cross_vars = cross_env(env, &port.env_overrides, &var_map);
+
+    let target_triple = &env.salty_host;
+
+    // Set up Cargo cross-compilation environment:
+    // - CARGO_TARGET_<TRIPLE>_LINKER: use our cross-clang
+    // - CARGO_BUILD_JOBS: respect nproc
+    // - RUSTFLAGS: pass sysroot flags
+    let triple_env = target_triple.replace('-', "_").to_uppercase();
+    cross_vars.insert(
+        format!("CARGO_TARGET_{}_LINKER", triple_env),
+        env.cc.clone(),
+    );
+    cross_vars.insert("CARGO_BUILD_JOBS".to_string(), env.nproc.to_string());
+    cross_vars.insert("RUSTC".to_string(), env.rustc.clone());
+
+    // Pass sysroot and target flags via RUSTFLAGS.
+    // If the port sets LIBRARY_PATH, add -L flags so the Rust linker finds
+    // shared libraries from dependency ports (e.g. libpam.so from freebsd-utils).
+    let mut rustflags = format!(
+        "-C linker={cc} -C link-arg=--target={target} -C link-arg=--sysroot={sysroot}",
+        cc = env.cc,
+        target = target_triple,
+        sysroot = env.sysroot_dir.display(),
+    );
+    if let Some(lib_path) = cross_vars.get("LIBRARY_PATH") {
+        for dir in lib_path.split(':') {
+            if !dir.is_empty() {
+                let _ = write!(rustflags, " -C link-arg=-L{}", dir);
+            }
+        }
+    }
+    cross_vars.insert("RUSTFLAGS".to_string(), rustflags);
+
+    // Inject .cargo/config.toml with [patch.crates-io] for SaltyOS libc fork.
+    // Without this, cargo resolves libc from crates.io which has no saltyos support.
+    let cargo_dir = src.join(".cargo");
+    let _ = fs::create_dir_all(&cargo_dir);
+    let cargo_config = cargo_dir.join("config.toml");
+    let mut config_content = String::new();
+    if cargo_config.exists() {
+        config_content = fs::read_to_string(&cargo_config).unwrap_or_default();
+    }
+    if !config_content.contains("[patch.crates-io]") {
+        let _ = writeln!(
+            config_content,
+            "\n[patch.crates-io]\nlibc = {{ git = \"https://github.com/SaltyOS/rust-lang-libc\", branch = \"libc-0.2\" }}\n"
+        );
+        let _ = fs::write(&cargo_config, &config_content);
+    }
+
+    // Update lockfile so cargo picks up the patched libc instead of the
+    // registry version pinned in the upstream Cargo.lock.
+    let update_cmd = format!("{} update -p libc", env.cargo);
+    run_shell(&update_cmd, &src, &cross_vars, env.verbose)?;
+
+    // Build command: cargo build --release --target=<triple>
+    let mut args = vec![
+        "build".to_string(),
+        "--release".to_string(),
+        format!("--target={}", target_triple),
+    ];
+
+    // Append extra configure args from [build].configure if any
+    let substituted_args = vars::substitute_list(&port.configure_args, &var_map);
+    args.extend(substituted_args);
+
+    let cmd_str = format!("{} {}", env.cargo, args.join(" "));
+    run_shell(&cmd_str, &src, &cross_vars, env.verbose)
+}
+
+/// Resolve Cargo build artifact for [install] mappings
+pub fn cargo_artifact_path(src: &Path, target_triple: &str, artifact: &str) -> PathBuf {
+    src.join("target")
+        .join(target_triple)
+        .join("release")
+        .join(artifact)
 }
 
 pub fn do_stage(
@@ -682,9 +773,12 @@ pub fn do_stage(
         let artifact = vars::substitute(artifact_ref, &var_map);
         validate_install_path(&install_path)?;
 
-        // Resolve source artifact based on build type
+        // Resolve source artifact: all paths are relative to source root.
+        // Build outputs go to _build/, data files stay in source tree.
+        // The [install] section must use explicit paths (e.g. _build/cat,
+        // saltyos-files/etc/pam.d).
         let src_file = match port.build_type {
-            BuildType::Targets => src.join(".salty-build").join(&artifact),
+            BuildType::Cargo => cargo_artifact_path(&src, &env.salty_host, &artifact),
             _ => src.join(&artifact),
         };
 

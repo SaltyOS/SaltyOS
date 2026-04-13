@@ -14,6 +14,7 @@ pub enum BuildType {
     Make,
     Custom,
     Targets,
+    Cargo,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +228,7 @@ pub fn parse_port_file(path: &Path) -> Result<PortConfig, String> {
                             "make" => BuildType::Make,
                             "custom" => BuildType::Custom,
                             "targets" => BuildType::Targets,
+                            "cargo" => BuildType::Cargo,
                             _ => {
                                 return Err(format!(
                                     "Unknown build type '{}' at line {}",

@@ -25,15 +25,15 @@ DEFAULT_PAGE_ALIGN = 4096
 DEFAULT_PAGE_ALIGN_EXTENSIONS = ('.elf', '.so', '.dll')
 
 
-def cpio_newc_header(ino, mode, filesize, namesize):
+def cpio_newc_header(ino, mode, filesize, namesize, uid=0, gid=0):
     """Create a CPIO newc header (110 bytes ASCII)."""
     # "070701" magic + 13 fields of 8 hex chars each
     return (
         f"070701"
         f"{ino:08X}"          # c_ino
-        f"{mode:08X}"         # c_mode (regular file, 0644)
-        f"{0:08X}"            # c_uid
-        f"{0:08X}"            # c_gid
+        f"{mode:08X}"         # c_mode
+        f"{uid:08X}"          # c_uid
+        f"{gid:08X}"          # c_gid
         f"{1:08X}"            # c_nlink
         f"{0:08X}"            # c_mtime
         f"{filesize:08X}"     # c_filesize
@@ -51,13 +51,13 @@ def align4(n):
     return (n + 3) & ~3
 
 
-def append_cpio_entry(archive, ino, name, data):
+def append_cpio_entry(archive, ino, name, data, mode=0o100644, uid=0, gid=0):
     """Append one newc entry to archive."""
     filesize = len(data)
     namesize = len(name) + 1  # Include NUL terminator
 
     # Header (110 bytes)
-    header = cpio_newc_header(ino, 0o100644, filesize, namesize)
+    header = cpio_newc_header(ino, mode, filesize, namesize, uid=uid, gid=gid)
     archive.extend(header)
 
     # Filename + NUL
@@ -102,8 +102,38 @@ def calc_pad_payload_size(cur_archive_len, next_name, pad_name, page_align):
     return None
 
 
-def create_cpio_archive(entries, output_path, page_align_exts):
-    """Create a CPIO newc archive from a list of (name, filepath) tuples."""
+def load_permissions(perms_path):
+    """Load a permissions file mapping paths to mode/uid/gid.
+
+    Format: /path/to/file MODE UID GID
+    where MODE is octal (e.g. 0104755 for setuid), UID and GID are decimal.
+    Lines starting with '#' and blank lines are ignored.
+
+    Returns a dict mapping path → (mode, uid, gid).
+    """
+    perms = {}
+    with open(perms_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) != 4:
+                continue
+            path, mode_str, uid_str, gid_str = parts
+            perms[path] = (int(mode_str, 8), int(uid_str), int(gid_str))
+    return perms
+
+
+def create_cpio_archive(entries, output_path, page_align_exts, permissions=None):
+    """Create a CPIO newc archive from a list of (name, filepath) tuples.
+
+    If permissions is provided (dict mapping path → (mode, uid, gid)),
+    entries matching a path will use the specified mode/uid/gid instead
+    of the default 0100644/0/0.
+    """
+    if permissions is None:
+        permissions = {}
     archive = bytearray()
     ino = 1
     pad_idx = 0
@@ -125,7 +155,12 @@ def create_cpio_archive(entries, output_path, page_align_exts):
                 pad_idx += 1
 
         data = filepath.read_bytes()
-        append_cpio_entry(archive, ino, name, data)
+
+        # Look up permissions: try the name as-is, then with leading '/'
+        lookup_name = name if name.startswith('/') else '/' + name
+        mode, uid, gid = permissions.get(lookup_name,
+                             permissions.get(name, (0o100644, 0, 0)))
+        append_cpio_entry(archive, ino, name, data, mode=mode, uid=uid, gid=gid)
 
         ino += 1
 
@@ -201,6 +236,12 @@ def main():
         default=','.join(DEFAULT_PAGE_ALIGN_EXTENSIONS),
         help='Comma-separated suffixes that should have 4KB-aligned data starts (default: .elf,.so)'
     )
+    parser.add_argument(
+        '--permissions',
+        type=Path,
+        default=None,
+        help='Permissions file mapping paths to mode/uid/gid overrides'
+    )
 
     args = parser.parse_args()
 
@@ -243,7 +284,11 @@ def main():
         print("Error: No entries to archive", file=sys.stderr)
         sys.exit(1)
 
-    total_size = create_cpio_archive(entries, args.output, page_align_exts)
+    permissions = {}
+    if args.permissions and args.permissions.exists():
+        permissions = load_permissions(args.permissions)
+
+    total_size = create_cpio_archive(entries, args.output, page_align_exts, permissions=permissions)
     print(f"Created CPIO archive: {args.output} ({total_size} bytes, {len(entries)} entries)")
 
 
