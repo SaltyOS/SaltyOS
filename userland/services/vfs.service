@@ -1,7 +1,7 @@
 [Service]
 Name=vfs
-Binary=vfs
-Type=simple
+Binary=/bin/vfs
+Type=notify
 Restart=always
 PreProcmgr=yes
 
@@ -11,5 +11,5 @@ Before=test_runner
 
 [Capabilities]
 CreateEP=63
-CopyCap=13:66 14:68
+CopyCap=13:66 138:68 137:72
 NeedEP=console:64 namesrv:65 posix_ttysrv:67 mmsrv:69:badge procmgr:70 netsrv:71

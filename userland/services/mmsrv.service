@@ -1,14 +1,14 @@
 [Service]
 Name=mmsrv
-Binary=mmsrv
-Type=simple
+Binary=/bin/mmsrv
+Type=notify
 Restart=always
 PreProcmgr=yes
-CNodeBits=16
 Role=pager
+CNodeBits=16
 
 [Dependencies]
-After=console namesrv
+After=rsrcsrv console namesrv
 Before=vfs procmgr
 
 [Capabilities]

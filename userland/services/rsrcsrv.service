@@ -1,0 +1,14 @@
+[Service]
+Name=rsrcsrv
+Binary=/bin/rsrcsrv
+Type=notify
+Restart=always
+PreProcmgr=yes
+Role=authority
+CNodeBits=14
+
+[Dependencies]
+Before=namesrv mmsrv vfs procmgr
+
+[Capabilities]
+CopySharedLibCaps=yes

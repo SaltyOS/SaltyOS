@@ -1,6 +1,6 @@
 [Service]
 Name=saltyfs
-Binary=saltyfs
+Binary=/bin/saltyfs
 Type=notify
 Restart=always
 
@@ -8,4 +8,7 @@ Restart=always
 After=blkdrv namesrv mmsrv
 
 [Capabilities]
-NeedEP=blkdrv:64
+# System roles via trona::caps::*, service-local via generated svc_caps::*.
+Require=namesrv
+Require=mmsrv
+Require=blkdrv:blkdrv_ep

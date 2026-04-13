@@ -1,7 +1,7 @@
 [Service]
 Name=blkdrv
-Binary=blkdrv
-Type=simple
+Binary=/bin/blkdrv
+Type=notify
 Restart=always
 
 [Dependencies]
@@ -9,4 +9,7 @@ After=pcidrv namesrv mmsrv
 Before=saltyfs
 
 [Capabilities]
-NeedEP=pcidrv:64
+# System roles via trona::caps::*, service-local via generated svc_caps::*.
+Require=namesrv
+Require=mmsrv
+Require=pcidrv:pcidrv_ep

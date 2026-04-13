@@ -1,7 +1,7 @@
 [Service]
 Name=namesrv
-Binary=namesrv
-Type=simple
+Binary=/bin/namesrv
+Type=notify
 Restart=always
 PreProcmgr=yes
 
