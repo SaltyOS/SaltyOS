@@ -339,7 +339,9 @@ Invoke labels: `SC_CONFIGURE` (0x30), `SC_BIND` (0x31), `SC_UNBIND` (0x32), `SC_
 
 Invoke labels: `VSPACE_MAP` (0x50), `VSPACE_UNMAP` (0x51), `VSPACE_MAP_PT` (0x52), `VSPACE_WALK` (0x53), `VSPACE_COPY_PAGE` (0x54), `VSPACE_MAP_DEVICE` (0x55), `VSPACE_CLONE_COW_PAGE` (0x56), `VSPACE_MAP_DEVICE_RANGE` (0x57), `VSPACE_PROTECT` (0x58), `VSPACE_MAP_DEMAND` (0x59), `VSPACE_MAP_DEMAND_RANGE` (0x5A), `VSPACE_COW_RESOLVE` (0x5B), `VSPACE_SET_COW_POOL` (0x5C), `VSPACE_SET_COW_NOTIF` (0x5D), `VSPACE_REPLENISH_COW_POOL` (0x5E), `VSPACE_PROTECT_RANGE` (0x5F).
 
-VSpace MO labels: `VSPACE_MAP_MO` (0x97), `VSPACE_UNMAP_MO` (0x98), `VSPACE_SHARE_RO_PAGE` (0x99), `VSPACE_FORK_RANGE` (0x9A).
+`VSPACE_UNMAP` is tracking-aware: for MO-backed VmAreas it tears down the single-page mapping plus the corresponding VmArea / reverse-map metadata.
+
+VSpace MO labels: `VSPACE_MAP_MO` (0x97), `VSPACE_SHARE_RO_PAGE` (0x99), `VSPACE_FORK_RANGE` (0x9A).
 
 VSpace flags: `VSPACE_FLAG_WRITABLE` (1), `VSPACE_FLAG_USER` (2), `VSPACE_FLAG_EXECUTABLE` (4), `VSPACE_FLAG_CACHE_DISABLE` (8), `VSPACE_FLAG_WRITE_THROUGH` (16), `VSPACE_FLAG_COW` (32).
 
@@ -376,7 +378,6 @@ Invoke labels: `IOPORT_IN8` (0x70), `IOPORT_OUT8` (0x71), `IOPORT_IN16` (0x72), 
 | `mo_write` | `trona_mo_write` | `mo, offset, count` | `i32` |
 | `mo_has_page` | `trona_mo_has_page` | `mo, page_index` | `u64` |
 | `vspace_map_mo` | `trona_vspace_map_mo` | `vspace, mo, vaddr, mo_offset, count, flags` | `i32` |
-| `vspace_unmap_mo` | `trona_vspace_unmap_mo` | `vspace, vaddr, count` | `i32` |
 
 Invoke labels: `MO_COMMIT` (0x90), `MO_DECOMMIT` (0x91), `MO_GET_SIZE` (0x92), `MO_CLONE` (0x93), `MO_RESIZE` (0x94), `MO_READ` (0x95), `MO_WRITE` (0x96), `MO_HAS_PAGE` (0x97).
 
@@ -696,7 +697,7 @@ pub enum SlotResult {
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `slot_alloc_init` | `(base: Cap, count: u64, expand_ep: u64)` | Initialize allocator with pool from auxv. Called once at startup. |
+| `slot_alloc_init` | `(base: Cap, count: u64, cspace_ntfn: u64)` | Initialize allocator with pool from `AT_TRONA_CSPACE_LAYOUT` + `AT_TRONA_CSPACE_NTFN`. Called once at startup. |
 | `slot_alloc_is_initialized` | `() -> bool` | Check if allocator has been initialized |
 | `slot_alloc_base` | `() -> Cap` | Return the first segment's base slot |
 | `slot_alloc_count` | `() -> u64` | Total pool size across all segments |
@@ -709,11 +710,11 @@ pub enum SlotResult {
 
 ### CSpace Expansion Protocol
 
-When all CSpace segments are exhausted:
-1. NBSend `PM_EXPAND_CSPACE_ASYNC` to procmgr
-2. Call `PM_EXPAND_COLLECT` to get new segment base/count
+CSpace expansion is handled by objsrv via `OBJ_ALLOC_OBJECT`. The previous
+procmgr-based protocol (`PM_EXPAND_CSPACE_ASYNC`/`PM_EXPAND_COLLECT`) has been
+removed.
 
-Auxv types: `AT_TRONA_SLOT_BASE` (0x1007), `AT_TRONA_SLOT_COUNT` (0x1008), `AT_TRONA_EXPAND_EP` (0x1009).
+Auxv types: `AT_TRONA_SLOT_BASE` (0x1007), `AT_TRONA_SLOT_COUNT` (0x1008).
 
 ---
 
@@ -929,6 +930,6 @@ Readiness modes: `SPAWN_READY_IMMEDIATE` (0), `SPAWN_READY_NOTIFY` (1).
 | `__trona_next_frame_slot` | `u64` (weak) | Next CNode slot for frame allocation |
 | `__trona_slot_base` | `u64` (weak) | Slot pool base from auxv |
 | `__trona_slot_count` | `u64` (weak) | Slot pool size from auxv |
-| `__trona_expand_ep` | `u64` (weak) | Notification cap for UT expansion |
+| `__trona_cspace_ntfn` | `u64` (weak) | CSpace expansion notification cap (from `AT_TRONA_CSPACE_NTFN`) |
 
 Weak symbols are overridden by `rtld` with per-process values from auxv entries.

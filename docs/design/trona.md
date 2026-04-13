@@ -99,15 +99,15 @@ trona is organized as 5 crates plus a dual-format runtime linker:
 
 | File | Purpose |
 |------|---------|
-| `lib.rs` | Win32 subsystem module root |
+| `kernel32.rs` | kernel32.dll Rust crate root |
 | `console.rs` | Win32 console I/O (ReadConsole/WriteConsole) |
 | `crt.rs` | Win32 CRT startup |
 | `error.rs` | Win32 error code translation |
 | `handle.rs` | Win32 HANDLE management |
 | `process.rs` | Win32 process operations |
 | `protocol.rs` | Win32 CSRSS IPC protocol |
-| `kernel32_pe.c` | kernel32.dll PE stub |
-| `kernel32_pe.def` | kernel32.dll export definitions |
+| `trona.rs` | local PE ABI shim for kernel32.dll |
+| `kernel32.def` | kernel32.dll export definitions |
 
 **rtld** (`lib/trona/rtld/`):
 
@@ -415,7 +415,7 @@ Also has a `untyped_retype_depth()` variant for expanded CSpaces.
 | Label | Function | Purpose |
 |-------|----------|---------|
 | `VSPACE_MAP` (0x50) | `vspace_map()` | Map frame at virtual address |
-| `VSPACE_UNMAP` (0x51) | `vspace_unmap()` | Unmap page at virtual address |
+| `VSPACE_UNMAP` (0x51) | `vspace_unmap()` | Unmap page at virtual address and tear down tracked MO metadata for that page |
 | `VSPACE_MAP_PT` (0x52) | `vspace_map_pt()` | Install intermediate page table |
 | `VSPACE_WALK` (0x53) | `vspace_walk()` | Walk page table (debugging) |
 | `VSPACE_COPY_PAGE` (0x54) | `vspace_copy_page()` | Copy page contents to frame |
@@ -444,12 +444,11 @@ Also has a `untyped_retype_depth()` variant for expanded CSpaces.
 | `MO_WRITE` (0x96) | `mo_write()` | Write data to a MemoryObject page |
 | `MO_HAS_PAGE` (0x97) | `mo_has_page()` | Check if a page is committed |
 
-### VSpace MemoryObject Mapping (0x97-0x9A)
+### VSpace MemoryObject Mapping (0x97, 0x99-0x9A)
 
 | Label | Function | Purpose |
 |-------|----------|---------|
 | `VSPACE_MAP_MO` (0x97) | `vspace_map_mo()` | Map MemoryObject pages into VSpace |
-| `VSPACE_UNMAP_MO` (0x98) | `vspace_unmap_mo()` | Unmap MemoryObject pages from VSpace |
 | `VSPACE_SHARE_RO_PAGE` (0x99) | `vspace_share_ro_page()` | Share a read-only page between VSpaces |
 | `VSPACE_FORK_RANGE` (0x9A) | `vspace_fork_range()` | Fork a VA range (COW) between VSpaces |
 
@@ -593,19 +592,10 @@ Each segment is a contiguous range of CNode indices with a bump pointer.
 The initial segment is assigned by procmgr at spawn time and communicated
 via auxv entries (`AT_TRONA_SLOT_BASE`, `AT_TRONA_SLOT_COUNT`).
 
-**Async expansion protocol:** When all segments are exhausted:
-
-1. Send `NBSend(PM_EXPAND_CSPACE_ASYNC, bits=10)` to procmgr
-   (fire-and-forget, does not block the caller)
-2. On next allocation attempt, re-send NBSend (idempotent) and call
-   `PM_EXPAND_COLLECT` (blocking) to collect the result
-3. If procmgr has completed the expansion, it returns the base and
-   count of the new sub-CNode segment
-4. The new segment is appended to the chain
-
-This two-phase protocol (NBSend then Call) ensures the caller never
-blocks indefinitely on expansion. If the NBSend is dropped (procmgr
-busy), the next attempt resends it.
+**Expansion protocol:** When all segments are exhausted, the slot
+allocator requests a new CNode from objsrv via `OBJ_ALLOC_OBJECT`
+(label 0xD2) on `CAP_OBJSRV_EP`. The previous two-phase procmgr-based
+protocol (`PM_EXPAND_CSPACE_ASYNC`/`PM_EXPAND_COLLECT`) has been removed.
 
 **Untyped expansion (legacy path for rtld/init bootstrap only):**
 
@@ -736,7 +726,7 @@ All mutable global state in trona:
 | `__trona_next_frame_slot` | `u64` (weak) | `lib.rs` | Legacy frame slot counter (overridden by slot_alloc) |
 | `__trona_slot_base` | `u64` (weak) | `lib.rs` | Slot allocator pool base (from auxv) |
 | `__trona_slot_count` | `u64` (weak) | `lib.rs` | Slot allocator pool size (from auxv) |
-| `__trona_expand_ep` | `u64` (weak) | `lib.rs` | Expansion notification cap (from auxv) |
+| `__trona_cspace_ntfn` | `u64` (weak) | `lib.rs` | CSpace expansion notification cap (from `AT_TRONA_CSPACE_NTFN`) |
 | `SLOT_ALLOC` | `SlotAllocState` | `slot_alloc.rs` | Segment chain and expansion state |
 | `UT_EXPAND_REQUESTED` | `bool` | `slot_alloc.rs` | Whether untyped expansion is in flight |
 | `EXTRA_UT_SLOTS` | `[Cap; 8]` | `slot_alloc.rs` | Dynamically-granted untyped caps |
@@ -750,7 +740,7 @@ Each process has its own address space with private copies of all
 statics. There is no shared mutable state between processes. Signal
 handlers run synchronously in the context of `posix_sigcheck()`, not
 asynchronously, so there are no reentrancy concerns. The weak linkage
-on `__trona_slot_*` and `__trona_expand_ep` allows RTLD or CRT to
+on `__trona_slot_*` and `__trona_cspace_ntfn` allows RTLD or CRT to
 override these values before the library is used.
 
 ## 11. Build and Linking

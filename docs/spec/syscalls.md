@@ -992,7 +992,7 @@ Query CNode metadata (size, guard, depth).
 | Label | Operation | Description |
 |-------|-----------|-------------|
 | 0x50 | `VSpace_Map` | Map frame into VSpace |
-| 0x51 | `VSpace_Unmap` | Unmap page |
+| 0x51 | `VSpace_Unmap` | Unmap page (tracking-aware for MO-backed VmAreas) |
 | 0x52 | `VSpace_MapPT` | Install page table at specific level |
 | 0x53 | `VSpace_Walk` | Walk page tables, return mapping info |
 | 0x54 | `VSpace_CopyPage` | Copy page content between VSpaces |
@@ -1186,7 +1186,6 @@ arg2 = flags_bits      (new page flags)
 | Label | Operation | Description |
 |-------|-----------|-------------|
 | 0x97 | `VSpace_MapMO` | Map MemoryObject pages into VSpace |
-| 0x98 | `VSpace_UnmapMO` | Unmap MemoryObject region |
 | 0x99 | `VSpace_ShareRoPage` | Share a page read-only to another VSpace |
 | 0x9A | `VSpace_ForkRange` | COW-fork a range of MO-backed pages |
 
@@ -1199,15 +1198,6 @@ arg0 = mo_cap_ptr         (capability pointer to MemoryObject)
 arg1 = vaddr              (virtual address to map at)
 arg2 = mo_offset          (page offset within MO)
 arg3 = count_and_flags    (page count in upper 32 bits, flags in lower 32 bits)
-```
-
-#### VSpace_UnmapMO (0x98)
-
-Unmap a MemoryObject region from the VSpace.
-
-```
-arg0 = vaddr              (starting virtual address)
-arg1 = count              (number of pages to unmap)
 ```
 
 #### VSpace_ShareRoPage (0x99)

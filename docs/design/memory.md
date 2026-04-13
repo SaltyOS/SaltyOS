@@ -323,7 +323,7 @@ Stored in `ReverseMaps` on the MO. Each entry covers a contiguous VA
 range. Used for:
 - MO destruction (unmap all regions, TLB shootdown)
 - Fork bookkeeping (clone region list)
-- `VSPACE_MAP_MO` / `VSPACE_UNMAP_MO` (add/remove entries)
+- `VSPACE_MAP_MO` / page-by-page `VSPACE_UNMAP` (add/remove entries)
 
 Cost: O(regions) per MO. Typically 1-8 entries.
 
@@ -598,7 +598,6 @@ source ranges are disjoint and never split.
 | MO_CLONE | 0x93 | Create COW snapshot clone |
 | MO_RESIZE | 0x94 | Resize page count |
 | VSPACE_MAP_MO | 0x97 | Map MO range into VSpace |
-| VSPACE_UNMAP_MO | 0x98 | Unmap MO range from VSpace |
 
 ---
 
@@ -879,9 +878,9 @@ mmsrv uses IPC labels in the range `0x80`-`0xA3` (36 labels), defined in
 | 0x80-0x83 | Client lifecycle | MM_REGISTER, MM_DEREGISTER, MM_BRK, MM_SBRK |
 | 0x84-0x86 | POSIX memory | MM_MMAP, MM_MUNMAP, MM_MPROTECT |
 | 0x87-0x89 | Window mapping | MM_MAP_BATCH, MM_MAP_WINDOW, MM_UNMAP_WINDOW |
-| 0x8A-0x8C | Shared memory | MM_SHM_CREATE, MM_SHM_MAP, MM_SHM_UNMAP |
-| 0x8D-0x8F | Fork/thread | MM_FORK_REGIONS, MM_ALLOC_THREAD_OBJECTS, MM_FREE_THREAD_OBJECTS |
-| 0x90-0x94 | Object management | MM_GET_CLIENT_STATS, MM_ALLOC_OBJECT, MM_REGISTER_SHARED_REGION, MM_MAP_OBJECT_REGION, MM_SYNC_FILE_BACKING |
+| 0x8A-0x8F | Shared memory | MM_SHM_CREATE, MM_SHM_MAP, MM_SHM_UNMAP, MM_SHM_DESTROY, MM_SHM_RESIZE |
+| 0x8D | Fork | MM_FORK_REGIONS |
+| 0x90, 0x92-0x94 | Object management | MM_GET_CLIENT_STATS, MM_REGISTER_SHARED_REGION, MM_MAP_OBJECT_REGION, MM_SYNC_FILE_BACKING |
 | 0x95-0x97 | File-backed mmap | MM_FILE_MMAP, MM_SYNC_MMAP_WRITE |
 | 0x98-0x99 | Untyped provisioning | MM_PROVISION_UNTYPED, MM_QUERY_CAPACITY |
 | 0x9A-0x9D | Pager protocol | MM_PAGER_REQUEST, MM_PAGER_WRITE_REQUEST, MM_DUMP_PENDING, MM_REGISTER_PAGER_EP |

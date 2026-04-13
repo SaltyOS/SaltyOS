@@ -54,7 +54,6 @@ All system calls should have bounded worst-case execution time (WCET):
 kernite/src/
 ├── lib.rs              # Entry (kmain), serial I/O, panic handler
 ├── bootinfo.rs         # Boot info TLV parsing from bootloader
-├── builtins.rs         # Compiler built-in function stubs (memcpy, memset, etc.)
 ├── cpio.rs             # CPIO archive parser for initrd
 ├── elf.rs              # ELF binary loader for init task
 ├── init.rs             # Init task bootstrap (CSpace setup, capability grants)
@@ -159,7 +158,6 @@ graph TD
 
 mod arch;
 mod bootinfo;
-mod builtins;
 mod cap;
 mod cpio;
 mod elf;
@@ -818,8 +816,9 @@ Key properties:
   or PMM (fallback, when `ut_cap == 0`)
 - **COW clone**: `MO_CLONE` creates a snapshot child with cap-refcounted parent link
 - **Reverse maps**: Tracks which VSpaces observe MO pages (inline 8 + overflow chain)
-- **VSpace integration**: `VSPACE_MAP_MO` (0x97), `VSPACE_UNMAP_MO` (0x98),
-  `VSPACE_SHARE_RO_PAGE` (0x99), `VSPACE_FORK_RANGE` (0x9A)
+- **VSpace integration**: `VSPACE_MAP_MO` (0x97), tracking-aware
+  `VSPACE_UNMAP` (0x51), `VSPACE_SHARE_RO_PAGE` (0x99),
+  `VSPACE_FORK_RANGE` (0x9A)
 
 See [Memory Management](memory.md) for full design details.
 

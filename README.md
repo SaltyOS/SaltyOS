@@ -268,6 +268,8 @@ Contributions are welcome! Please read the design documents first to understand 
 
 ## License
 
+Copyright (c) 2026 Hamin Sung a.k.a saltyming
+
 This project is licensed under the GNU General Public License v2.0 only (GPL-2.0-only).
 
 See [LICENSE.md](LICENSE.md) for the full license text.
