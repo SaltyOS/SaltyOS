@@ -12,6 +12,10 @@ use core::sync::atomic::Ordering;
 ///
 /// Decrements reference count and destroys object if it reaches zero.
 ///
+/// For TCB objects, destruction is deferred if the scheduler still holds
+/// a reference (`sched_ref > 0`).  In that case, `pending_destroy` is set
+/// and the scheduler will trigger destruction when its reference drops.
+///
 /// # Safety
 /// obj must be a valid pointer to a KernelObject.
 pub unsafe fn release_object(obj: *mut KernelObject, obj_type: ObjectType) {
@@ -24,10 +28,32 @@ pub unsafe fn release_object(obj: *mut KernelObject, obj_type: ObjectType) {
         let old_count = (*obj).ref_count.fetch_sub(1, Ordering::AcqRel);
 
         if old_count == 1 {
-            // Last reference - destroy object
+            // Last capability reference gone.
+            // For TCBs: if the scheduler still references this TCB
+            // (it is current[] on some CPU), defer destruction.
+            // The scheduler will trigger it when sched_ref drops to 0.
+            if obj_type == ObjectType::Tcb {
+                let tcb = obj as *mut crate::sched::thread::Tcb;
+                if (*tcb).sched_ref.load(Ordering::Acquire) > 0 {
+                    (*tcb).pending_destroy.store(true, Ordering::Release);
+                    return;
+                }
+            }
             destroy_object(obj, obj_type);
         }
     }
+}
+
+/// Run destroy_object from the scheduler's deferred destruction path.
+///
+/// Called after the scheduler releases its last reference on a TCB
+/// whose capability refcount already reached 0 (pending_destroy was set).
+/// The caller must hold CAP_LOCK.
+///
+/// # Safety
+/// obj must be a valid pointer to a KernelObject.  CAP_LOCK must be held.
+pub(crate) unsafe fn destroy_object_deferred(obj: *mut KernelObject, obj_type: ObjectType) {
+    unsafe { destroy_object(obj, obj_type); }
 }
 
 /// Increment object reference count

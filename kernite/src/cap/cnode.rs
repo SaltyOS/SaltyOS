@@ -378,7 +378,7 @@ impl CNode {
             core::ptr::write(self.slot_ptr_mut(index), CapRef { slot });
 
             // Clear the reply capability from the current thread (one-shot)
-            tcb.reply_tcb = core::ptr::null_mut();
+            crate::sched::thread::Tcb::release_tcb_ref(tcb.clear_reply_tcb());
             tcb.reply_can_grant = false;
         }
 

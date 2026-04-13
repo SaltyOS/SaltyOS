@@ -55,13 +55,26 @@ impl IrqHandler {
         }
     }
 
-    /// Cleanup when IRQ handler is destroyed
+    /// Cleanup when IRQ handler is destroyed.
+    ///
+    /// Unregisters from the global IRQ table and releases the refcount on
+    /// any bound notification.
     pub fn cleanup(&mut self) {
         if self.active {
             unregister_handler(self as *mut IrqHandler);
             self.active = false;
         }
-        self.notification.store(core::ptr::null_mut(), Ordering::Release);
+        let old_ntfn = self.notification.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !old_ntfn.is_null() {
+            // SAFETY: old_ntfn was a valid Notification pointer kept alive
+            // by our refcount (incremented at bind time).
+            unsafe {
+                crate::cap::release_object(
+                    old_ntfn as *mut crate::cap::KernelObject,
+                    crate::cap::ObjectType::Notification,
+                );
+            }
+        }
     }
 }
 

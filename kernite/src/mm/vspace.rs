@@ -2,7 +2,7 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use super::{pmm_alloc, phys_to_virt, PhysAddr, SpinLock, VirtAddr, PAGE_SIZE};
+use super::{phys_to_virt, pmm_alloc, PhysAddr, SpinLock, VirtAddr, PAGE_SIZE};
 use crate::arch::paging::PageTable;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -35,10 +35,18 @@ impl PageFaultInfo {
     ///   \[4\] I/D     — 1 if instruction fetch
     pub fn to_ipc_error_code(&self, is_instr: bool) -> u64 {
         let mut code: u64 = 0;
-        if self.present { code |= 1; }
-        if self.write   { code |= 2; }
-        if self.user    { code |= 4; }
-        if is_instr     { code |= 16; }
+        if self.present {
+            code |= 1;
+        }
+        if self.write {
+            code |= 2;
+        }
+        if self.user {
+            code |= 4;
+        }
+        if is_instr {
+            code |= 16;
+        }
         code
     }
 }
@@ -202,7 +210,8 @@ static mut DEFERRED_FREE_LOCK: SpinLock = SpinLock::new();
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct VmArea {
-    /// Pointer to the backing MemoryObject (raw, refcounted via capability).
+    /// Pointer to the backing MemoryObject. Each live VmArea holds a strong
+    /// ref on the MO for as long as the mapping metadata exists.
     pub mo: *mut crate::cap::memory_object::MemoryObject,
     /// Page offset within the MO for this region's start.
     pub mo_offset: u32,
@@ -222,6 +231,27 @@ impl VmArea {
         perms: 0,
         _pad: [0; 7],
     };
+
+    #[inline]
+    pub unsafe fn retain_mo_ref(&self) {
+        if !self.mo.is_null() {
+            unsafe {
+                crate::cap::increment_refcount(self.mo as *mut crate::cap::KernelObject);
+            }
+        }
+    }
+
+    #[inline]
+    pub unsafe fn release_mo_ref(&self) {
+        if !self.mo.is_null() {
+            unsafe {
+                crate::cap::release_object(
+                    self.mo as *mut crate::cap::KernelObject,
+                    crate::cap::ObjectType::MemoryObject,
+                );
+            }
+        }
+    }
 }
 
 #[repr(C)]
@@ -266,7 +296,7 @@ pub struct VSpaceTracking {
     pub asid_generation: AtomicU64,
 
     /// Maple tree of VmArea entries: VA range → (MO, offset, perms).
-    /// VSpace owns nothing — VmAreas are observers of MO pages.
+    /// VSpace owns the lifetime of mapped MOs through per-VmArea refs.
     /// Protected by VSpace.lock.
     pub mappings: super::maple_tree::MapleTree<VmArea>,
 }
@@ -593,7 +623,9 @@ pub unsafe fn defer_free_tracking(tracking: *mut VSpaceTracking) {
 
         // Snapshot only online CPUs — non-existent CPUs never advance generation
         let online = ONLINE_CPU_COUNT.load(Ordering::Acquire) as usize;
-        (*tracking).retire_online_cpus.store(online as u32, Ordering::Release);
+        (*tracking)
+            .retire_online_cpus
+            .store(online as u32, Ordering::Release);
         for cpu in 0..online {
             let cpu_gen = PENDING_GENERATION[cpu].load(Ordering::Acquire);
             (*tracking).retire_snapshot[cpu].store(cpu_gen, Ordering::Release);
@@ -786,10 +818,7 @@ impl VSpace {
     /// The tracking pointer must be valid and initialized with `VSpaceTracking::new()`.
     pub fn new(pml4_addr: PhysAddr, tracking: *mut VSpaceTracking) -> Self {
         Self {
-            header: crate::cap::KernelObject::new(
-                crate::cap::ObjectType::VSpace,
-                0,
-            ),
+            header: crate::cap::KernelObject::new(crate::cap::ObjectType::VSpace, 0),
             root: pml4_addr,
             tracking,
             lock: SpinLock::new(),
@@ -869,11 +898,7 @@ impl VSpace {
     /// Configure the COW notification ring and notification object.
     ///
     /// Acquires VSpace.lock to synchronize with the fault handler.
-    pub fn set_cow_notif(
-        &mut self,
-        ring_phys: PhysAddr,
-        ntfn: *mut crate::ipc::Notification,
-    ) {
+    pub fn set_cow_notif(&mut self, ring_phys: PhysAddr, ntfn: *mut crate::ipc::Notification) {
         let irq = unsafe { save_irq_disable() };
         self.lock.lock();
         self.cow_notif_phys = ring_phys;
@@ -980,9 +1005,7 @@ impl VSpace {
     /// Returns `true` if the page can be safely written by the kernel.
     pub fn is_page_writable(&self, vaddr: VirtAddr) -> bool {
         if let Some(pte) = self.read_entry(vaddr, 1) {
-            pte & ENTRY_PRESENT != 0
-                && pte & ENTRY_WRITABLE != 0
-                && pte & ENTRY_COW == 0
+            pte & ENTRY_PRESENT != 0 && pte & ENTRY_WRITABLE != 0 && pte & ENTRY_COW == 0
         } else {
             false
         }
@@ -1046,16 +1069,20 @@ impl VSpace {
             if entry & ENTRY_PRESENT == 0 {
                 let new_frame = pmm_alloc(&super::frame::FrameOwner::KernelPrivate {
                     subkind: super::frame::KernelMetaKind::PageTable,
-                }).ok_or(VSpaceError::OutOfMemory)?;
+                })
+                .ok_or(VSpaceError::OutOfMemory)?;
 
                 // SAFETY: retain before the PDE is visible so the frame cannot
                 // be reclaimed between pmm_alloc() and the PDE write.
                 super::pmm_retain_mapping(new_frame);
                 // Mark as page-table frame and kernel-runtime: prevents accidental
                 // reclamation via refcount bugs and exposure via untyped retype.
-                super::pmm_set_owner(new_frame, &super::frame::FrameOwner::KernelPrivate {
-                    subkind: super::frame::KernelMetaKind::PageTable,
-                });
+                super::pmm_set_owner(
+                    new_frame,
+                    &super::frame::FrameOwner::KernelPrivate {
+                        subkind: super::frame::KernelMetaKind::PageTable,
+                    },
+                );
                 crate::ktrace!(mm, |_g| {
                     _g.puts("[PT_ALLOC] seq=");
                     _g.hex(crate::arch::current_invoke_seq());
@@ -1324,9 +1351,7 @@ impl VSpace {
             // Clean D-cache to PoU first so the I-cache refill path sees data
             // written via any VA (e.g. RTLD scratch mappings).
             if flags.executable {
-                crate::arch::paging::flush_dcache_pou_page(
-                    phys_to_virt(phys) as u64,
-                );
+                crate::arch::paging::flush_dcache_pou_page(phys_to_virt(phys) as u64);
                 crate::arch::paging::flush_icache_all();
             }
 
@@ -1513,7 +1538,11 @@ impl VSpace {
         result
     }
 
-    /// Unmap a page
+    /// Unmap a page.
+    ///
+    /// If the page belongs to a tracked VmArea, this also shrinks or removes
+    /// the VmArea and reverse-map metadata so MO-backed mappings cannot leak
+    /// refs when callers use the general single-page unmap path.
     pub fn unmap(&mut self, virt: VirtAddr) -> Result<(), VSpaceError> {
         // Check alignment (no lock needed)
         if virt & (PAGE_SIZE as u64 - 1) != 0 {
@@ -1523,20 +1552,231 @@ impl VSpace {
         // Acquire per-VSpace lock
         let irq = unsafe { save_irq_disable() };
         self.lock.lock();
+        let self_ptr = self as *mut VSpace;
+        let mut mo_ref_delta: i8 = 0;
+        let mut mo_ref_vma = VmArea::EMPTY;
 
         let result = (|| {
-            // Check if mapped
             let entry = self.read_entry(virt, 1).ok_or(VSpaceError::NotMapped)?;
+            let page_size = PAGE_SIZE as u64;
+            let is_demand = entry & ENTRY_PRESENT == 0 && entry & ENTRY_DEMAND != 0;
+            if !is_demand && entry & ENTRY_PRESENT == 0 {
+                return Err(VSpaceError::NotMapped);
+            }
+
+            if !self.tracking.is_null() {
+                let t = unsafe { &mut *self.tracking };
+                if let Some((tracked_start, tracked_vma_ref)) = t.mappings.lookup(virt) {
+                    let tracked_vma = *tracked_vma_ref;
+                    let tracked_len = u64::from(tracked_vma.page_count)
+                        .checked_mul(page_size)
+                        .ok_or(VSpaceError::InvalidArgument)?;
+                    let tracked_end = tracked_start
+                        .checked_add(tracked_len)
+                        .ok_or(VSpaceError::InvalidArgument)?;
+                    if tracked_vma.page_count != 0 && virt >= tracked_start && virt < tracked_end {
+                        let page_index = ((virt - tracked_start) / page_size) as u32;
+                        let left_pages = page_index;
+                        let right_pages = tracked_vma
+                            .page_count
+                            .checked_sub(page_index + 1)
+                            .ok_or(VSpaceError::InvalidArgument)?;
+                        let has_mo = !tracked_vma.mo.is_null();
+                        let mut tree_alloc = super::node_alloc::PmmNodeAllocator {
+                            owner: super::frame::FrameOwner::KernelPrivate {
+                                subkind: super::frame::KernelMetaKind::MapleNode,
+                            },
+                            use_reserve: false,
+                        };
+
+                        let make_vma = |start: u64, mo_offset: u32, page_count: u32| -> Result<(u64, VmArea), VSpaceError> {
+                            Ok((
+                                start,
+                                VmArea {
+                                    mo: tracked_vma.mo,
+                                    mo_offset,
+                                    page_count,
+                                    perms: tracked_vma.perms,
+                                    _pad: [0; 7],
+                                },
+                            ))
+                        };
+                        let make_rmap = |start: u64, mo_offset: u32, page_count: u32| {
+                            crate::cap::memory_object::ReverseMapEntry {
+                                vspace: self_ptr,
+                                va_start: start,
+                                page_count,
+                                mo_offset,
+                                perms: tracked_vma.perms,
+                                _pad: [0; 7],
+                            }
+                        };
+
+                        match (left_pages, right_pages) {
+                            (0, 0) => {
+                                if !unsafe { t.mappings.remove(tracked_start, &mut tree_alloc) } {
+                                    return Err(VSpaceError::NotMapped);
+                                }
+                                if has_mo {
+                                    unsafe {
+                                        (*tracked_vma.mo)
+                                            .reverse_maps
+                                            .remove(self_ptr, tracked_start);
+                                    }
+                                    mo_ref_delta = -1;
+                                    mo_ref_vma = tracked_vma;
+                                }
+                            }
+                            (0, _) => {
+                                let new_start = virt
+                                    .checked_add(page_size)
+                                    .ok_or(VSpaceError::InvalidArgument)?;
+                                let new_mo_offset = tracked_vma
+                                    .mo_offset
+                                    .checked_add(1)
+                                    .ok_or(VSpaceError::InvalidArgument)?;
+                                let (_, new_vma) = make_vma(new_start, new_mo_offset, right_pages)?;
+                                if !unsafe { t.mappings.insert(new_start, new_vma, &mut tree_alloc) } {
+                                    return Err(VSpaceError::OutOfMemory);
+                                }
+                                if has_mo {
+                                    let new_rmap = make_rmap(new_start, new_mo_offset, right_pages);
+                                    let replaced = unsafe {
+                                        (*tracked_vma.mo)
+                                            .reverse_maps
+                                            .replace(self_ptr, tracked_start, new_rmap)
+                                    };
+                                    if !replaced {
+                                        let _ = unsafe { t.mappings.remove(new_start, &mut tree_alloc) };
+                                        return Err(VSpaceError::NotMapped);
+                                    }
+                                }
+                                if !unsafe { t.mappings.remove(tracked_start, &mut tree_alloc) } {
+                                    if has_mo {
+                                        let _ = unsafe {
+                                            (*tracked_vma.mo).reverse_maps.replace(
+                                                self_ptr,
+                                                new_start,
+                                                make_rmap(
+                                                    tracked_start,
+                                                    tracked_vma.mo_offset,
+                                                    tracked_vma.page_count,
+                                                ),
+                                            )
+                                        };
+                                    }
+                                    let _ = unsafe { t.mappings.remove(new_start, &mut tree_alloc) };
+                                    return Err(VSpaceError::NotMapped);
+                                }
+                            }
+                            (_, 0) => {
+                                let (_, new_vma) = make_vma(
+                                    tracked_start,
+                                    tracked_vma.mo_offset,
+                                    left_pages,
+                                )?;
+                                if !unsafe { t.mappings.replace(tracked_start, new_vma) } {
+                                    return Err(VSpaceError::NotMapped);
+                                }
+                                if has_mo {
+                                    let replaced = unsafe {
+                                        (*tracked_vma.mo).reverse_maps.replace(
+                                            self_ptr,
+                                            tracked_start,
+                                            make_rmap(tracked_start, tracked_vma.mo_offset, left_pages),
+                                        )
+                                    };
+                                    if !replaced {
+                                        let _ = unsafe { t.mappings.replace(tracked_start, tracked_vma) };
+                                        return Err(VSpaceError::NotMapped);
+                                    }
+                                }
+                            }
+                            _ => {
+                                let right_start = virt
+                                    .checked_add(page_size)
+                                    .ok_or(VSpaceError::InvalidArgument)?;
+                                let right_mo_offset = tracked_vma
+                                    .mo_offset
+                                    .checked_add(page_index + 1)
+                                    .ok_or(VSpaceError::InvalidArgument)?;
+                                let (_, left_vma) =
+                                    make_vma(tracked_start, tracked_vma.mo_offset, left_pages)?;
+                                let (_, right_vma) =
+                                    make_vma(right_start, right_mo_offset, right_pages)?;
+
+                                if has_mo {
+                                    let has_slot =
+                                        unsafe { (*tracked_vma.mo).reverse_maps.ensure_slot(tracked_vma.mo) };
+                                    if !has_slot {
+                                        return Err(VSpaceError::OutOfMemory);
+                                    }
+                                    let added = unsafe {
+                                        (*tracked_vma.mo)
+                                            .reverse_maps
+                                            .add(make_rmap(right_start, right_mo_offset, right_pages))
+                                    };
+                                    if !added {
+                                        return Err(VSpaceError::OutOfMemory);
+                                    }
+                                }
+
+                                if !unsafe { t.mappings.insert(right_start, right_vma, &mut tree_alloc) } {
+                                    if has_mo {
+                                        unsafe {
+                                            (*tracked_vma.mo)
+                                                .reverse_maps
+                                                .remove(self_ptr, right_start);
+                                        }
+                                    }
+                                    return Err(VSpaceError::OutOfMemory);
+                                }
+
+                                if !unsafe { t.mappings.replace(tracked_start, left_vma) } {
+                                    let _ = unsafe { t.mappings.remove(right_start, &mut tree_alloc) };
+                                    if has_mo {
+                                        unsafe {
+                                            (*tracked_vma.mo)
+                                                .reverse_maps
+                                                .remove(self_ptr, right_start);
+                                        }
+                                    }
+                                    return Err(VSpaceError::NotMapped);
+                                }
+
+                                if has_mo {
+                                    let replaced = unsafe {
+                                        (*tracked_vma.mo).reverse_maps.replace(
+                                            self_ptr,
+                                            tracked_start,
+                                            make_rmap(tracked_start, tracked_vma.mo_offset, left_pages),
+                                        )
+                                    };
+                                    if !replaced {
+                                        let _ = unsafe { t.mappings.replace(tracked_start, tracked_vma) };
+                                        let _ = unsafe { t.mappings.remove(right_start, &mut tree_alloc) };
+                                        unsafe {
+                                            (*tracked_vma.mo)
+                                                .reverse_maps
+                                                .remove(self_ptr, right_start);
+                                        }
+                                        return Err(VSpaceError::NotMapped);
+                                    }
+                                    mo_ref_delta = 1;
+                                    mo_ref_vma = tracked_vma;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // Demand PTE (PRESENT=0, DEMAND=1): no frame to release, just clear
-            if entry & ENTRY_PRESENT == 0 && entry & ENTRY_DEMAND != 0 {
+            if is_demand {
                 self.write_entry(virt, 1, 0)?;
                 return Ok(());
             }
 
-            if entry & ENTRY_PRESENT == 0 {
-                return Err(VSpaceError::NotMapped);
-            }
             let phys = entry & ENTRY_ADDR_MASK;
 
             // Clear the entry
@@ -1555,6 +1795,14 @@ impl VSpace {
 
         self.lock.unlock();
         unsafe { restore_irq(irq) };
+
+        if result.is_ok() {
+            match mo_ref_delta {
+                -1 => unsafe { mo_ref_vma.release_mo_ref() },
+                1 => unsafe { mo_ref_vma.retain_mo_ref() },
+                _ => {}
+            }
+        }
 
         result
     }
@@ -1691,9 +1939,7 @@ impl VSpace {
                 if let Some(entry) = self.read_entry(addr, 1) {
                     if entry & ENTRY_PRESENT != 0 {
                         let phys = entry & ENTRY_ADDR_MASK;
-                        crate::arch::paging::flush_dcache_pou_page(
-                            phys_to_virt(phys) as u64,
-                        );
+                        crate::arch::paging::flush_dcache_pou_page(phys_to_virt(phys) as u64);
                     }
                 }
             }
@@ -1736,7 +1982,9 @@ impl VSpace {
         }
 
         let result = (|| {
-            let src_entry = self.read_entry(src_vaddr, 1).ok_or(VSpaceError::NotMapped)?;
+            let src_entry = self
+                .read_entry(src_vaddr, 1)
+                .ok_or(VSpaceError::NotMapped)?;
 
             // Demand PTE (PRESENT=0, DEMAND=1): copy to child as-is (no frame sharing)
             if src_entry & ENTRY_PRESENT == 0 && src_entry & ENTRY_DEMAND != 0 {
@@ -1806,17 +2054,14 @@ impl VSpace {
         dst: &mut VSpace,
         dst_vaddr: VirtAddr,
     ) -> Result<(), VSpaceError> {
-        if src_vaddr & (PAGE_SIZE as u64 - 1) != 0
-            || dst_vaddr & (PAGE_SIZE as u64 - 1) != 0
-        {
+        if src_vaddr & (PAGE_SIZE as u64 - 1) != 0 || dst_vaddr & (PAGE_SIZE as u64 - 1) != 0 {
             return Err(VSpaceError::Alignment);
         }
 
         let irq = unsafe { save_irq_disable() };
 
         let same_vspace = core::ptr::eq(self, dst);
-        let self_first =
-            (self as *const VSpace as usize) <= (dst as *const VSpace as usize);
+        let self_first = (self as *const VSpace as usize) <= (dst as *const VSpace as usize);
 
         if self_first {
             self.lock.lock();
@@ -1829,8 +2074,9 @@ impl VSpace {
         }
 
         let result = (|| {
-            let src_entry =
-                self.read_entry(src_vaddr, 1).ok_or(VSpaceError::NotMapped)?;
+            let src_entry = self
+                .read_entry(src_vaddr, 1)
+                .ok_or(VSpaceError::NotMapped)?;
 
             if src_entry & ENTRY_PRESENT == 0 {
                 return Err(VSpaceError::NotMapped);
@@ -1889,16 +2135,10 @@ impl VSpace {
     ///
     /// Uses arch-neutral PageFlags — works on both x86_64 and aarch64.
     /// Caller must hold no locks; this function manages lock ordering.
-    pub fn fork_range(
-        &mut self,
-        dst: &mut VSpace,
-        va_start: VirtAddr,
-        page_count: usize,
-    ) -> usize {
+    pub fn fork_range(&mut self, dst: &mut VSpace, va_start: VirtAddr, page_count: usize) -> usize {
         if va_start & (PAGE_SIZE as u64 - 1) != 0 {
             return 0;
         }
-
 
         let irq = unsafe { save_irq_disable() };
 
@@ -1906,7 +2146,9 @@ impl VSpace {
         let self_first = (self as *const VSpace as usize) <= (dst as *const VSpace as usize);
         if self_first {
             self.lock.lock();
-            if !same { dst.lock.lock(); }
+            if !same {
+                dst.lock.lock();
+            }
         } else {
             dst.lock.lock();
             self.lock.lock();
@@ -1943,7 +2185,11 @@ impl VSpace {
                 #[cfg(target_arch = "aarch64")]
                 {
                     let parent_asid = if !self.tracking.is_null() {
-                        unsafe { (*self.tracking).asid.load(core::sync::atomic::Ordering::Relaxed) }
+                        unsafe {
+                            (*self.tracking)
+                                .asid
+                                .load(core::sync::atomic::Ordering::Relaxed)
+                        }
                     } else {
                         0
                     };
@@ -1973,7 +2219,9 @@ impl VSpace {
         }
 
         if self_first {
-            if !same { dst.lock.unlock(); }
+            if !same {
+                dst.lock.unlock();
+            }
             self.lock.unlock();
         } else {
             self.lock.unlock();
@@ -2001,7 +2249,9 @@ impl VSpace {
         self.lock.lock();
 
         let result = (|| {
-            let entry = self.read_entry(page_vaddr, 1).ok_or(VSpaceError::NotMapped)?;
+            let entry = self
+                .read_entry(page_vaddr, 1)
+                .ok_or(VSpaceError::NotMapped)?;
             if entry & ENTRY_PRESENT == 0 || entry & ENTRY_COW == 0 {
                 return Ok(false);
             }
@@ -2009,7 +2259,8 @@ impl VSpace {
             let old_phys = entry & ENTRY_ADDR_MASK;
             let new_phys = pmm_alloc(&super::frame::FrameOwner::KernelPrivate {
                 subkind: super::frame::KernelMetaKind::General,
-            }).ok_or(VSpaceError::OutOfMemory)?;
+            })
+            .ok_or(VSpaceError::OutOfMemory)?;
 
             unsafe {
                 let src = phys_to_virt(old_phys) as *const u8;
@@ -2021,10 +2272,16 @@ impl VSpace {
             new_flags |= ENTRY_WRITABLE;
             new_flags &= !ENTRY_COW;
 
-            if self.write_entry(page_vaddr, 1, new_phys | new_flags).is_err() {
-                super::pmm_free(new_phys, &super::frame::FrameOwner::KernelPrivate {
-                    subkind: super::frame::KernelMetaKind::General,
-                });
+            if self
+                .write_entry(page_vaddr, 1, new_phys | new_flags)
+                .is_err()
+            {
+                super::pmm_free(
+                    new_phys,
+                    &super::frame::FrameOwner::KernelPrivate {
+                        subkind: super::frame::KernelMetaKind::General,
+                    },
+                );
                 return Err(VSpaceError::NotMapped);
             }
 
@@ -2036,9 +2293,7 @@ impl VSpace {
             // If the resolved page is executable, ensure I-cache coherence
             // (the copied data went to D-cache via the kernel direct-map VA).
             if new_flags & ENTRY_NO_EXECUTE == 0 {
-                crate::arch::paging::flush_dcache_pou_page(
-                    phys_to_virt(new_phys) as u64,
-                );
+                crate::arch::paging::flush_dcache_pou_page(phys_to_virt(new_phys) as u64);
                 crate::arch::paging::flush_icache_all();
             }
 
@@ -2064,9 +2319,7 @@ impl VSpace {
                                 },
                                 use_reserve: true,
                             };
-                            (*child_mo).cow_resolve_page(
-                                mo_page_idx, new_phys, &mut node_alloc,
-                            );
+                            (*child_mo).cow_resolve_page(mo_page_idx, new_phys, &mut node_alloc);
                         }
                         // Tag new frame as owned by the child's MO
                         super::pmm_set_owner(
@@ -2111,7 +2364,9 @@ impl VSpace {
         self.lock.lock();
 
         let result = (|| {
-            let entry = self.read_entry(page_vaddr, 1).ok_or(VSpaceError::NotMapped)?;
+            let entry = self
+                .read_entry(page_vaddr, 1)
+                .ok_or(VSpaceError::NotMapped)?;
 
             // Not present -> NotMapped
             if entry & ENTRY_PRESENT == 0 {
@@ -2143,7 +2398,10 @@ impl VSpace {
             new_flags |= ENTRY_WRITABLE;
             new_flags &= !ENTRY_COW;
 
-            if self.write_entry(page_vaddr, 1, new_phys | new_flags).is_err() {
+            if self
+                .write_entry(page_vaddr, 1, new_phys | new_flags)
+                .is_err()
+            {
                 return Err(VSpaceError::NotMapped);
             }
 
@@ -2201,7 +2459,9 @@ impl VSpace {
         let mut signal_ntfn: *mut crate::ipc::Notification = core::ptr::null_mut();
 
         let result = (|| {
-            let entry = self.read_entry(page_vaddr, 1).ok_or(VSpaceError::NotMapped)?;
+            let entry = self
+                .read_entry(page_vaddr, 1)
+                .ok_or(VSpaceError::NotMapped)?;
             if entry & ENTRY_PRESENT == 0 || entry & ENTRY_COW == 0 {
                 return Ok(false);
             }
@@ -2238,15 +2498,20 @@ impl VSpace {
 
                 // Advance head (kernel is sole consumer, VSpace lock serializes)
                 // SAFETY: pool is valid and kernel is sole writer of head.
-                (*(pool as *mut CowPool)).head.store(head.wrapping_add(1), Ordering::Release);
+                (*(pool as *mut CowPool))
+                    .head
+                    .store(head.wrapping_add(1), Ordering::Release);
 
                 let old_phys = entry & ENTRY_ADDR_MASK;
 
                 // Mark pool frame as kernel-runtime to prevent untyped retype
                 // from reclaiming it while the COW mapping is active.
-                super::pmm_set_owner(new_phys, &super::frame::FrameOwner::KernelPrivate {
-                    subkind: super::frame::KernelMetaKind::General,
-                });
+                super::pmm_set_owner(
+                    new_phys,
+                    &super::frame::FrameOwner::KernelPrivate {
+                        subkind: super::frame::KernelMetaKind::General,
+                    },
+                );
 
                 // SAFETY: Both frames are valid physical pages accessible via direct map.
                 let src = phys_to_virt(old_phys) as *const u8;
@@ -2258,10 +2523,16 @@ impl VSpace {
                 new_flags |= ENTRY_WRITABLE;
                 new_flags &= !ENTRY_COW;
 
-                if self.write_entry(page_vaddr, 1, new_phys | new_flags).is_err() {
-                    super::pmm_free(new_phys, &super::frame::FrameOwner::KernelPrivate {
-                    subkind: super::frame::KernelMetaKind::General,
-                });
+                if self
+                    .write_entry(page_vaddr, 1, new_phys | new_flags)
+                    .is_err()
+                {
+                    super::pmm_free(
+                        new_phys,
+                        &super::frame::FrameOwner::KernelPrivate {
+                            subkind: super::frame::KernelMetaKind::General,
+                        },
+                    );
                     return Err(VSpaceError::NotMapped);
                 }
 
@@ -2270,9 +2541,7 @@ impl VSpace {
 
                 // If resolved page is executable, ensure I-cache coherence.
                 if new_flags & ENTRY_NO_EXECUTE == 0 {
-                    crate::arch::paging::flush_dcache_pou_page(
-                        phys_to_virt(new_phys) as u64,
-                    );
+                    crate::arch::paging::flush_dcache_pou_page(phys_to_virt(new_phys) as u64);
                     crate::arch::paging::flush_icache_all();
                 }
 
@@ -2294,9 +2563,7 @@ impl VSpace {
                                 },
                                 use_reserve: true,
                             };
-                            (*child_mo).cow_resolve_page(
-                                mo_page_idx, new_phys, &mut node_alloc,
-                            );
+                            (*child_mo).cow_resolve_page(mo_page_idx, new_phys, &mut node_alloc);
                             super::pmm_set_owner(
                                 new_phys,
                                 &super::frame::FrameOwner::MoData {
@@ -2321,14 +2588,15 @@ impl VSpace {
                         pool_idx: head,
                         _pad: 0,
                     };
-                    (*ring).head.store(ring_head.wrapping_add(1), Ordering::Release);
+                    (*ring)
+                        .head
+                        .store(ring_head.wrapping_add(1), Ordering::Release);
 
                     // Capture notification pointer; signal after lock release.
                     if !self.cow_notif_ntfn.is_null() {
                         signal_ntfn = self.cow_notif_ntfn;
                     }
                 }
-
             }
 
             Ok(true)
@@ -2459,7 +2727,10 @@ impl VSpace {
             }
 
             let entry_flags = Self::flags_to_entry_flags(PageFlags::USER_RW);
-            if self.write_entry(page_vaddr, 1, new_phys | entry_flags).is_err() {
+            if self
+                .write_entry(page_vaddr, 1, new_phys | entry_flags)
+                .is_err()
+            {
                 return Err(VSpaceError::NotMapped);
             }
 
@@ -2478,11 +2749,7 @@ impl VSpace {
     ///
     /// On first user access, #PF → `handle_demand_fault` allocates a zero-fill
     /// frame and makes the page PRESENT, avoiding IPC to mmsrv.
-    pub fn map_demand(
-        &mut self,
-        virt: VirtAddr,
-        flags: PageFlags,
-    ) -> Result<(), VSpaceError> {
+    pub fn map_demand(&mut self, virt: VirtAddr, flags: PageFlags) -> Result<(), VSpaceError> {
         if virt & (PAGE_SIZE as u64 - 1) != 0 {
             return Err(VSpaceError::Alignment);
         }
@@ -2659,9 +2926,7 @@ impl VSpace {
 
             // Demand-faulted executable page: ensure I-cache coherence.
             if new_entry & ENTRY_NO_EXECUTE == 0 {
-                crate::arch::paging::flush_dcache_pou_page(
-                    phys_to_virt(new_phys) as u64,
-                );
+                crate::arch::paging::flush_dcache_pou_page(phys_to_virt(new_phys) as u64);
                 crate::arch::paging::flush_icache_all();
             }
 
@@ -2817,6 +3082,19 @@ impl VSpace {
 
         // Free page tables
         unsafe {
+            if !self.tracking.is_null() {
+                let t = &mut *self.tracking;
+                t.mappings.for_each(&mut |_start, vma| unsafe {
+                    vma.release_mo_ref();
+                });
+                let mut tree_alloc = crate::mm::node_alloc::PmmNodeAllocator {
+                    owner: crate::mm::frame::FrameOwner::KernelPrivate {
+                        subkind: crate::mm::frame::KernelMetaKind::MapleNode,
+                    },
+                    use_reserve: false,
+                };
+                t.mappings.destroy(&mut tree_alloc);
+            }
             self.free_page_tables_recursive(self.root);
         }
 
@@ -2922,7 +3200,11 @@ impl VSpace {
         &self,
         start_vaddr: VirtAddr,
         max_entries: usize,
-    ) -> (usize, VirtAddr, [(VirtAddr, PhysAddr, u64); WALK_MAX_RESULTS]) {
+    ) -> (
+        usize,
+        VirtAddr,
+        [(VirtAddr, PhysAddr, u64); WALK_MAX_RESULTS],
+    ) {
         let mut results = [(0u64, 0u64, 0u64); WALK_MAX_RESULTS];
         let max = if max_entries > WALK_MAX_RESULTS {
             WALK_MAX_RESULTS
@@ -2946,7 +3228,11 @@ impl VSpace {
             }
             let pdpt = unsafe { &*(phys_to_virt(pml4e & ENTRY_ADDR_MASK) as *const PageTable) };
 
-            let start_pdpt = if pml4_idx == start_pml4 { Self::pdpt_index(vaddr) } else { 0 };
+            let start_pdpt = if pml4_idx == start_pml4 {
+                Self::pdpt_index(vaddr)
+            } else {
+                0
+            };
 
             for pdpt_idx in start_pdpt..512 {
                 let pdpte = pdpt.entry(pdpt_idx);
@@ -2963,27 +3249,33 @@ impl VSpace {
 
                 let start_pd = if pml4_idx == start_pml4 && pdpt_idx == start_pdpt {
                     Self::pd_index(vaddr)
-                } else { 0 };
+                } else {
+                    0
+                };
 
                 for pd_idx in start_pd..512 {
                     let pde = pd.entry(pd_idx);
                     if pde & ENTRY_PRESENT == 0 {
-                        vaddr = ((pml4_idx as u64) << 39) | ((pdpt_idx as u64) << 30) |
-                                ((pd_idx + 1) as u64) << 21;
+                        vaddr = ((pml4_idx as u64) << 39)
+                            | ((pdpt_idx as u64) << 30)
+                            | ((pd_idx + 1) as u64) << 21;
                         continue;
                     }
                     // Skip 2MB huge pages
                     if pde & (1 << 7) != 0 {
-                        vaddr = ((pml4_idx as u64) << 39) | ((pdpt_idx as u64) << 30) |
-                                ((pd_idx + 1) as u64) << 21;
+                        vaddr = ((pml4_idx as u64) << 39)
+                            | ((pdpt_idx as u64) << 30)
+                            | ((pd_idx + 1) as u64) << 21;
                         continue;
                     }
                     let pt = unsafe { &*(phys_to_virt(pde & ENTRY_ADDR_MASK) as *const PageTable) };
 
-                    let start_pt = if pml4_idx == start_pml4 && pdpt_idx == start_pdpt &&
-                                      pd_idx == start_pd {
-                        Self::pt_index(vaddr)
-                    } else { 0 };
+                    let start_pt =
+                        if pml4_idx == start_pml4 && pdpt_idx == start_pdpt && pd_idx == start_pd {
+                            Self::pt_index(vaddr)
+                        } else {
+                            0
+                        };
 
                     for pt_idx in start_pt..512 {
                         let pte = pt.entry(pt_idx);
@@ -2991,10 +3283,10 @@ impl VSpace {
                             continue;
                         }
 
-                        let page_vaddr = ((pml4_idx as u64) << 39) |
-                                          ((pdpt_idx as u64) << 30) |
-                                          ((pd_idx as u64) << 21) |
-                                          ((pt_idx as u64) << 12);
+                        let page_vaddr = ((pml4_idx as u64) << 39)
+                            | ((pdpt_idx as u64) << 30)
+                            | ((pd_idx as u64) << 21)
+                            | ((pt_idx as u64) << 12);
                         let page_phys = pte & ENTRY_ADDR_MASK;
                         let page_flags = pte & !ENTRY_ADDR_MASK;
 

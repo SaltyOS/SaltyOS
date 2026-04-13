@@ -8,12 +8,12 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use crate::cap::{CapRights, ObjectType};
-use crate::ipc::{EndpointState, Endpoint, Message};
-use crate::mm::{save_irq_disable, restore_irq, CAP_LOCK};
+use crate::ipc::{Endpoint, EndpointState, Message};
+use crate::mm::{restore_irq, save_irq_disable, CAP_LOCK};
 use crate::sched::thread::MAX_RECV_WAIT_ENDPOINTS;
 use crate::sched::thread::{BlockedReason, Tcb, ThreadState};
 
-use super::{lookup_capability, validate_endpoint_cap, msg_info, write_msg_to_ipc_buffer};
+use super::{lookup_capability, msg_info, validate_endpoint_cap, write_msg_to_ipc_buffer};
 
 unsafe fn build_locked_endpoint_order(
     endpoints: &[*mut Endpoint],
@@ -72,7 +72,10 @@ pub struct FastpathResult {
 impl FastpathResult {
     #[inline(always)]
     const fn slowpath() -> Self {
-        Self { status: 0, value: 0 }
+        Self {
+            status: 0,
+            value: 0,
+        }
     }
 
     #[inline(always)]
@@ -216,19 +219,27 @@ pub unsafe extern "C" fn fastpath_call_rust(
         let mut msg = Message::empty();
         msg.label = label;
         msg.length = length;
-        if length > 0 { msg.regs[0] = mr0; }
-        if length > 1 { msg.regs[1] = mr1; }
-        if length > 2 { msg.regs[2] = mr2; }
-        if length > 3 { msg.regs[3] = mr3; }
+        if length > 0 {
+            msg.regs[0] = mr0;
+        }
+        if length > 1 {
+            msg.regs[1] = mr1;
+        }
+        if length > 2 {
+            msg.regs[2] = mr2;
+        }
+        if length > 3 {
+            msg.regs[3] = mr3;
+        }
 
         (*current).state = ThreadState::Blocked;
         (*current).blocked_reason = Some(BlockedReason::ReplyWait { msg, badge });
 
-        (*receiver).reply_tcb = current;
+        (*receiver).set_reply_tcb(current);
         (*receiver).reply_can_grant = true;
 
         if !(*receiver).pip_donating_to.is_null() {
-            (*receiver).reply_tcb = core::ptr::null_mut();
+            Tcb::release_tcb_ref((*receiver).clear_reply_tcb());
             (*receiver).reply_can_grant = false;
             (*current).state = ThreadState::Running;
             (*current).blocked_reason = None;
@@ -246,7 +257,10 @@ pub unsafe extern "C" fn fastpath_call_rust(
         (*receiver).saved_caller_msg = msg;
         (*receiver).saved_caller_badge = badge;
 
-        if matches!((*receiver).blocked_reason, Some(BlockedReason::RecvTimedBlocked)) {
+        if matches!(
+            (*receiver).blocked_reason,
+            Some(BlockedReason::RecvTimedBlocked)
+        ) {
             crate::sched::sleep_queue::remove(receiver);
             (*receiver).timer_wakeup_ns = 0;
         }
@@ -384,10 +398,18 @@ pub unsafe extern "C" fn fastpath_reply_recv_rust(
             let mut reply_msg = Message::empty();
             reply_msg.label = reply_label;
             reply_msg.length = length;
-            if length > 0 { reply_msg.regs[0] = mr0; }
-            if length > 1 { reply_msg.regs[1] = mr1; }
-            if length > 2 { reply_msg.regs[2] = mr2; }
-            if length > 3 { reply_msg.regs[3] = mr3; }
+            if length > 0 {
+                reply_msg.regs[0] = mr0;
+            }
+            if length > 1 {
+                reply_msg.regs[1] = mr1;
+            }
+            if length > 2 {
+                reply_msg.regs[2] = mr2;
+            }
+            if length > 3 {
+                reply_msg.regs[3] = mr3;
+            }
 
             (*caller).saved_caller_msg = reply_msg;
             (*caller).saved_caller_badge = 0;
@@ -397,6 +419,7 @@ pub unsafe extern "C" fn fastpath_reply_recv_rust(
 
             (*current).reply_tcb = core::ptr::null_mut();
             (*current).reply_can_grant = false;
+            Tcb::release_tcb_ref(caller);
         }
 
         // ---- RECV PHASE ----
@@ -471,7 +494,7 @@ pub unsafe extern "C" fn fastpath_reply_recv_rust(
         write_msg_to_ipc_buffer(&msg, badge);
 
         if keep_blocked {
-            (*current).reply_tcb = sender;
+            (*current).set_reply_tcb(sender);
             (*current).reply_can_grant = true;
             crate::sched::pip::pip_donate(sender, current);
             (*sender).blocked_endpoint = core::ptr::null_mut();
@@ -555,7 +578,10 @@ pub unsafe extern "C" fn fastpath_reply_recv_any_rust(
                 restore_irq(irq);
                 return FastpathResult::slowpath();
             }
-            let is_reply_wait = matches!((*caller).blocked_reason, Some(BlockedReason::ReplyWait { .. }));
+            let is_reply_wait = matches!(
+                (*caller).blocked_reason,
+                Some(BlockedReason::ReplyWait { .. })
+            );
             if !is_reply_wait {
                 unlock_endpoint_order(&endpoints[..count], &order, lock_count);
                 restore_irq(irq);
@@ -568,10 +594,18 @@ pub unsafe extern "C" fn fastpath_reply_recv_any_rust(
             let mut reply_msg = Message::empty();
             reply_msg.label = reply_label;
             reply_msg.length = length;
-            if length > 0 { reply_msg.regs[0] = mr0; }
-            if length > 1 { reply_msg.regs[1] = mr1; }
-            if length > 2 { reply_msg.regs[2] = mr2; }
-            if length > 3 { reply_msg.regs[3] = mr3; }
+            if length > 0 {
+                reply_msg.regs[0] = mr0;
+            }
+            if length > 1 {
+                reply_msg.regs[1] = mr1;
+            }
+            if length > 2 {
+                reply_msg.regs[2] = mr2;
+            }
+            if length > 3 {
+                reply_msg.regs[3] = mr3;
+            }
 
             (*caller).saved_caller_msg = reply_msg;
             (*caller).saved_caller_badge = 0;
@@ -581,6 +615,7 @@ pub unsafe extern "C" fn fastpath_reply_recv_any_rust(
 
             (*current).reply_tcb = core::ptr::null_mut();
             (*current).reply_can_grant = false;
+            Tcb::release_tcb_ref(caller);
         }
 
         let mut chosen_idx: Option<usize> = None;
@@ -689,7 +724,7 @@ pub unsafe extern "C" fn fastpath_reply_recv_any_rust(
         write_msg_to_ipc_buffer(&chosen_msg, chosen_badge);
 
         if keep_blocked {
-            (*current).reply_tcb = chosen_sender;
+            (*current).set_reply_tcb(chosen_sender);
             (*current).reply_can_grant = true;
             crate::sched::pip::pip_donate(chosen_sender, current);
             (*chosen_sender).blocked_endpoint = core::ptr::null_mut();

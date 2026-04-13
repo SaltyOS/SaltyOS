@@ -108,10 +108,11 @@ impl SpinLock {
 /// Lock ordering (outermost → innermost):
 ///   CAP_LOCK → endpoint.lock / ntfn.lock / tcb.lock / sc.lock → SLEEP_LOCK / FUTEX_LOCK / IRQ_LOCK → sched.lock_cpu → VSpace.lock → ASID_LOCK → FRAME_LOCK → SERIAL_LOCK
 ///
-/// MemoryObject::destroy() runs after refcount reaches 0 (no concurrent
-/// accessors). It acquires VSpace.lock per reverse-map entry without
-/// holding CAP_LOCK (released before release_object), which is safe
-/// because no outer locks are held at that point.
+/// `release_object()` is called from `delete_capability()` with CAP_LOCK held.
+/// `destroy_object()` (and all type-specific cleanup functions) therefore run
+/// under CAP_LOCK.  `MemoryObject::destroy()` acquires VSpace.lock per
+/// reverse-map entry; this is valid because CAP_LOCK → VSpace.lock is the
+/// documented ordering.
 ///
 /// Subsystem locks (SLEEP_LOCK, FUTEX_LOCK, IRQ_LOCK) are independent of each other
 /// and of per-object locks. They protect their own global data structures.

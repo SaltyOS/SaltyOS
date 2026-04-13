@@ -4,8 +4,8 @@
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use crate::cap::{KernelObject, ObjectType};
 use crate::cap::CNode;
+use crate::cap::{KernelObject, ObjectType};
 use crate::mm::VSpace;
 
 pub const MAX_RECV_WAIT_ENDPOINTS: usize = 32;
@@ -58,9 +58,13 @@ pub struct XSaveArea {
 impl XSaveArea {
     pub const fn zeroed() -> Self {
         #[cfg(target_arch = "x86_64")]
-        { Self { data: [0u8; 832] } }
+        {
+            Self { data: [0u8; 832] }
+        }
         #[cfg(target_arch = "aarch64")]
-        { Self { data: [0u8; 528] } }
+        {
+            Self { data: [0u8; 528] }
+        }
     }
 }
 
@@ -225,6 +229,8 @@ pub struct Tcb {
     pub notification_dispatcher: u64,
     /// Kernel stack top for syscall entry (per-thread kernel stack)
     pub kernel_stack_top: u64,
+    /// One-page kernel trampoline stack used for first user dispatch on x86_64.
+    pub trampoline_stack_top: u64,
     /// Per-thread stack canary (verified at syscall exit against %gs:40).
     /// Each thread gets its own unique canary so migration across CPUs
     /// does not cause false-positive corruption panics.
@@ -251,6 +257,15 @@ pub struct Tcb {
     pub futex_vspace: *mut VSpace,
     /// Futex timed wait result: 0 = woken by futex_wake, non-zero = timeout
     pub futex_wakeup_result: u64,
+    /// Scheduler reference count — number of scheduler `current[]` slots
+    /// referencing this TCB.  While > 0, the capability system defers
+    /// destruction (sets `pending_destroy` instead).  When this drops to 0,
+    /// the scheduler triggers the deferred destruction under CAP_LOCK.
+    pub sched_ref: core::sync::atomic::AtomicU32,
+    /// Set by `release_object` when capability refcount reaches 0 while
+    /// `sched_ref > 0`.  Checked when `sched_ref` drops to 0 to trigger
+    /// deferred destruction.
+    pub pending_destroy: core::sync::atomic::AtomicBool,
     /// Intrusive links used when the thread is blocked on multiple recv endpoints.
     pub recv_wait_links: [RecvWaitLink; MAX_RECV_WAIT_ENDPOINTS],
 }
@@ -371,16 +386,29 @@ impl Tcb {
     #[inline]
     pub fn tcb_lock(&self) {
         use core::sync::atomic::Ordering;
-        if self.tcb_lock_state.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        if self
+            .tcb_lock_state
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
             return;
         }
         let mut backoff: u32 = 0;
         loop {
-            for _ in 0..(1u32 << backoff.min(6)) { core::hint::spin_loop(); }
+            for _ in 0..(1u32 << backoff.min(6)) {
+                core::hint::spin_loop();
+            }
             if self.tcb_lock_state.load(Ordering::Relaxed) == 0
-                && self.tcb_lock_state.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
-            { return; }
-            if backoff < 6 { backoff += 1; }
+                && self
+                    .tcb_lock_state
+                    .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return;
+            }
+            if backoff < 6 {
+                backoff += 1;
+            }
         }
     }
 
@@ -452,6 +480,7 @@ impl Tcb {
             bound_notification: core::ptr::null_mut(),
             notification_dispatcher: 0,
             kernel_stack_top: 0,
+            trampoline_stack_top: 0,
             stack_canary: 0,
             user_stack_top: 0,
             user_stack_min: 0,
@@ -464,6 +493,8 @@ impl Tcb {
             futex_addr: 0,
             futex_vspace: core::ptr::null_mut(),
             futex_wakeup_result: 0,
+            sched_ref: core::sync::atomic::AtomicU32::new(0),
+            pending_destroy: core::sync::atomic::AtomicBool::new(false),
             recv_wait_links: [RecvWaitLink::new(); MAX_RECV_WAIT_ENDPOINTS],
         }
     }
@@ -486,11 +517,98 @@ impl Tcb {
 
     /// Cleanup when TCB is destroyed
     ///
-    /// Note: This does not wake the thread if blocked or remove it from scheduler queues.
-    /// Those operations should be handled by the caller before calling cleanup.
+    // ------------------------------------------------------------------
+    // Refcounted reply_tcb / pip_donating_to helpers
+    // ------------------------------------------------------------------
+
+    /// Set `reply_tcb` with refcount bookkeeping. Increments the new
+    /// target's refcount and decrements the old one (if any). Passing
+    /// null clears the field.
     ///
-    /// However, this DOES wake any caller waiting for a reply via reply_tcb.
+    /// # Safety
+    /// `caller` must be a valid TCB pointer or null.
+    #[inline]
+    pub unsafe fn set_reply_tcb(&mut self, caller: *mut Tcb) {
+        unsafe {
+            let old = self.reply_tcb;
+            if caller == old {
+                return;
+            }
+            tcb_ref_inc(caller);
+            self.reply_tcb = caller;
+            tcb_ref_dec(old);
+        }
+    }
+
+    /// Clear `reply_tcb` and release the refcount. Returns the old
+    /// pointer — it remains valid until the caller calls
+    /// [`Tcb::release_tcb_ref`] on it.
+    #[inline]
+    pub unsafe fn clear_reply_tcb(&mut self) -> *mut Tcb {
+        let old = self.reply_tcb;
+        self.reply_tcb = core::ptr::null_mut();
+        // Caller must release via release_tcb_ref when done with `old`.
+        old
+    }
+
+    /// Set `pip_donating_to` with refcount bookkeeping.
+    ///
+    /// # Safety
+    /// `holder` must be a valid TCB pointer or null.
+    #[inline]
+    pub unsafe fn set_pip_target(&mut self, holder: *mut Tcb) {
+        unsafe {
+            let old = self.pip_donating_to;
+            if holder == old {
+                return;
+            }
+            tcb_ref_inc(holder);
+            self.pip_donating_to = holder;
+            tcb_ref_dec(old);
+        }
+    }
+
+    /// Clear `pip_donating_to` and release the refcount.
+    #[inline]
+    pub unsafe fn clear_pip_target(&mut self) {
+        unsafe {
+            let old = self.pip_donating_to;
+            self.pip_donating_to = core::ptr::null_mut();
+            tcb_ref_dec(old);
+        }
+    }
+
+    /// Release a TCB reference obtained from `clear_reply_tcb`.
+    #[inline]
+    pub unsafe fn release_tcb_ref(tcb: *mut Tcb) {
+        unsafe {
+            tcb_ref_dec(tcb);
+        }
+    }
+
+    // ------------------------------------------------------------------
+
+    /// Reset TCB state for destruction/reuse.
+    ///
+    /// Detaches from any wait queues the thread may be blocked on, then
+    /// resets all state. Also wakes any caller waiting for a reply via
+    /// reply_tcb.
     pub fn cleanup(&mut self) {
+        let old_kernel_stack_top = self.kernel_stack_top;
+        let old_trampoline_stack_top = self.trampoline_stack_top;
+        // Detach from all wait queues BEFORE clearing state.
+        // This properly unlinks the TCB from endpoint send/recv queues,
+        // notification waits, sleep queue, futex hash, and VSpace waiter
+        // queues — preventing dangling nodes when a TCB is destroyed
+        // while blocked.
+        // SAFETY: self pointer is valid; CAP_LOCK is held by the caller
+        // (destroy_object path), and detach_thread_wait_queues only
+        // acquires inner locks (ep.lock, ntfn_lock, SLEEP_LOCK, etc.)
+        // which are all below CAP_LOCK in the ordering hierarchy.
+        unsafe {
+            detach_thread_wait_queues(self as *mut Tcb);
+        }
+
         self.state = ThreadState::Inactive;
         self.ready_queued = false;
         self.queued_cpu = 0xFFFF_FFFF;
@@ -518,8 +636,21 @@ impl Tcb {
                 crate::sched::scheduler::scheduler().enqueue(caller);
             }
         }
+        // Release refcount on the caller TCB we were holding
+        unsafe {
+            tcb_ref_dec(self.reply_tcb);
+        }
         self.reply_tcb = core::ptr::null_mut();
         self.reply_can_grant = false;
+        // Release refcount on fault handler endpoint
+        if !self.fault_handler.is_null() {
+            unsafe {
+                crate::cap::release_object(
+                    self.fault_handler as *mut crate::cap::KernelObject,
+                    crate::cap::ObjectType::Endpoint,
+                );
+            }
+        }
         self.fault_handler = core::ptr::null_mut();
         self.fault_handler_badge = 0;
         self.user_stack_top = 0;
@@ -527,18 +658,97 @@ impl Tcb {
         self.timer_wakeup_ns = 0;
         self.sleep_next = core::ptr::null_mut();
 
-        // Clear bound notification's back-pointer to prevent use-after-free
+        if self.kernel_stack_top != 0 {
+            const KSTACK_PAGES: usize = 4;
+            let base = self.kernel_stack_top - (KSTACK_PAGES as u64 * crate::mm::PAGE_SIZE as u64);
+            let phys = crate::mm::virt_to_phys(base);
+            let owner = crate::mm::frame::FrameOwner::KernelPrivate {
+                subkind: crate::mm::frame::KernelMetaKind::KernelStack,
+            };
+            for i in 0..KSTACK_PAGES {
+                crate::mm::pmm_free(phys + (i * crate::mm::PAGE_SIZE) as u64, &owner);
+            }
+            self.kernel_stack_top = 0;
+        }
+
+        if self.trampoline_stack_top != 0 {
+            let phys = crate::mm::virt_to_phys(self.trampoline_stack_top - crate::mm::PAGE_SIZE as u64);
+            crate::mm::pmm_free(
+                phys,
+                &crate::mm::frame::FrameOwner::KernelPrivate {
+                    subkind: crate::mm::frame::KernelMetaKind::KernelStack,
+                },
+            );
+            self.trampoline_stack_top = 0;
+        }
+
+        if old_kernel_stack_top != 0 || old_trampoline_stack_top != 0 {
+            crate::kdebug!(sched, |_g| {
+                _g.puts("[TCB_CLEANUP] freed stacks tcb=");
+                _g.hex(self as *const Tcb as u64);
+                _g.puts(" kstack_top=");
+                _g.hex(old_kernel_stack_top);
+                _g.puts(" tramp_top=");
+                _g.hex(old_trampoline_stack_top);
+                _g.puts(" free=");
+                _g.dec(crate::mm::pmm_free_count() as u64);
+                _g.puts("\n");
+            });
+        }
+
+        // Release refcount on bound notification and clear back-pointer
         if !self.bound_notification.is_null() {
             unsafe {
                 let ntfn = &mut *(self.bound_notification as *mut crate::ipc::Notification);
+                ntfn.ntfn_lock();
                 ntfn.bound_tcb = core::ptr::null_mut();
+                ntfn.ntfn_unlock();
+                let old_ntfn = self.bound_notification;
+                self.bound_notification = core::ptr::null_mut();
+                crate::cap::release_object(
+                    old_ntfn as *mut crate::cap::KernelObject,
+                    crate::cap::ObjectType::Notification,
+                );
             }
         }
-        self.bound_notification = core::ptr::null_mut();
 
         // Clean up PIP state: revert donation to holder if active
         unsafe {
             crate::sched::pip::pip_cleanup(self as *mut Tcb);
+        }
+
+        // Release refcount on SchedContext held by this TCB
+        if !self.sched_context.is_null() {
+            unsafe {
+                let sc = &mut *self.sched_context;
+                sc.sc_lock();
+                sc.bound_tcb = core::ptr::null_mut();
+                sc.sc_unlock();
+                let old_sc = self.sched_context;
+                self.sched_context = core::ptr::null_mut();
+                crate::cap::release_object(
+                    old_sc as *mut crate::cap::KernelObject,
+                    crate::cap::ObjectType::SchedContext,
+                );
+            }
+        }
+
+        // Release refcounts on VSpace/CSpace held by this TCB
+        unsafe {
+            if !self.vspace_root.is_null() {
+                crate::cap::release_object(
+                    self.vspace_root as *mut crate::cap::KernelObject,
+                    crate::cap::ObjectType::VSpace,
+                );
+                self.vspace_root = core::ptr::null_mut();
+            }
+            if !self.cspace_root.is_null() {
+                crate::cap::release_object(
+                    self.cspace_root as *mut _ as *mut crate::cap::KernelObject,
+                    crate::cap::ObjectType::CNode,
+                );
+                self.cspace_root = core::ptr::null_mut();
+            }
         }
 
         // Clear FPU ownership if this TCB is the current CPU's FPU owner
@@ -554,26 +764,179 @@ impl Tcb {
     }
 }
 
+// -----------------------------------------------------------------------
+// Module-internal refcount helpers for TCB cross-references
+// (reply_tcb, pip_donating_to).  These keep the peer alive while a raw
+// pointer relation exists so that pip_undonate / reply_recv never hit UAF.
+// -----------------------------------------------------------------------
+
+/// # Safety
+/// `tcb` must be a valid TCB pointer or null.
+#[inline]
+unsafe fn tcb_ref_inc(tcb: *mut Tcb) {
+    if !tcb.is_null() {
+        unsafe {
+            crate::cap::increment_refcount(tcb as *mut crate::cap::KernelObject);
+        }
+    }
+}
+
+/// # Safety
+/// `tcb` must be a valid TCB pointer or null.
+#[inline]
+unsafe fn tcb_ref_dec(tcb: *mut Tcb) {
+    if !tcb.is_null() {
+        unsafe {
+            crate::cap::release_object(
+                tcb as *mut crate::cap::KernelObject,
+                crate::cap::ObjectType::Tcb,
+            );
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// Wait queue detachment
+//
+// Properly unlinks a blocked TCB from all auxiliary wait queues (endpoint
+// send/recv, notification, sleep, futex, VSpace waiter) before changing
+// its run state.  Called from both TCB_SUSPEND (syscall) and
+// Tcb::cleanup() (destroy path).
+//
+// Lock ordering: the caller may hold CAP_LOCK (destroy path) or not
+// (suspend path).  This function acquires only inner locks (ep.lock,
+// ntfn_lock, SLEEP_LOCK, FUTEX_LOCK, sched.lock_cpu) — all below
+// CAP_LOCK in the hierarchy.
+// -----------------------------------------------------------------------
+
+/// Detach a blocked thread from auxiliary wait queues.
+///
+/// # Safety
+/// `tcb` must be a valid, non-null TCB pointer.
+pub(crate) unsafe fn detach_thread_wait_queues(tcb: *mut Tcb) {
+    unsafe {
+        let blocked_reason = (*tcb).blocked_reason;
+
+        // 1. Sleep queue (timer-based waits)
+        if matches!(
+            blocked_reason,
+            Some(BlockedReason::TimerBlocked)
+                | Some(BlockedReason::FutexTimedBlocked)
+                | Some(BlockedReason::SendTimedBlocked { .. })
+                | Some(BlockedReason::RecvTimedBlocked)
+        ) {
+            crate::sched::sleep_queue::remove(tcb);
+            (*tcb).timer_wakeup_ns = 0;
+        }
+
+        // 2. Endpoint send/recv queue
+        if !(*tcb).blocked_endpoint.is_null() {
+            let ep = &mut *((*tcb).blocked_endpoint as *mut crate::ipc::Endpoint);
+            ep.ep_lock();
+            if matches!(
+                blocked_reason,
+                Some(BlockedReason::RecvTimedBlocked) | Some(BlockedReason::RecvBlocked)
+            ) && (*tcb).recv_wait_link_count != 0
+            {
+                crate::ipc::Endpoint::clear_tcb_recv_waits(tcb, RECV_WAIT_SELECTED_NONE);
+            } else {
+                ep.remove_from_queue(tcb);
+            }
+            ep.ep_unlock();
+            (*tcb).blocked_endpoint = core::ptr::null_mut();
+        }
+
+        // 3. Notification wait
+        if !(*tcb).blocked_notification.is_null() {
+            crate::ipc::Notification::clear_tcb_wait_registration(tcb);
+        }
+
+        // 4. Futex hash table
+        if matches!(
+            blocked_reason,
+            Some(BlockedReason::FutexBlocked) | Some(BlockedReason::FutexTimedBlocked)
+        ) {
+            crate::ipc::futex::futex_remove_thread(tcb);
+        }
+
+        // 5. VSpace waiter queue (intrusive singly-linked list under scheduler lock)
+        if matches!(blocked_reason, Some(BlockedReason::VSpaceWait)) {
+            if !(*tcb).blocked_vspace_tracking.is_null() {
+                let tracking = &*(*tcb).blocked_vspace_tracking;
+                let irq = crate::mm::save_irq_disable();
+                let sched = crate::sched::scheduler::scheduler();
+                let cpu = crate::arch::current_cpu() as usize;
+                sched.lock_cpu(cpu);
+
+                let head = tracking.waiter_head_get_locked();
+                if head == tcb {
+                    // TCB is head of the waiter list
+                    tracking.waiter_head_set_locked((*tcb).vspace_wait_next);
+                } else {
+                    // Walk to find predecessor
+                    let mut prev = head;
+                    while !prev.is_null() && (*prev).vspace_wait_next != tcb {
+                        prev = (*prev).vspace_wait_next;
+                    }
+                    if !prev.is_null() {
+                        (*prev).vspace_wait_next = (*tcb).vspace_wait_next;
+                    }
+                }
+
+                sched.unlock_cpu(cpu);
+                crate::mm::restore_irq(irq);
+
+                (*tcb).vspace_wait_next = core::ptr::null_mut();
+                (*tcb).blocked_vspace_tracking = core::ptr::null_mut();
+            }
+        }
+
+        // 6. Clear timed-wait residual state
+        if matches!(
+            blocked_reason,
+            Some(BlockedReason::FutexTimedBlocked)
+                | Some(BlockedReason::SendTimedBlocked { .. })
+                | Some(BlockedReason::RecvTimedBlocked)
+        ) {
+            (*tcb).futex_wakeup_result = 0;
+        }
+    }
+}
+
 impl SchedContext {
     #[inline]
     pub fn sc_lock(&self) {
         use core::sync::atomic::Ordering;
-        if self.sc_lock_state.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        if self
+            .sc_lock_state
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
             return;
         }
         let mut backoff: u32 = 0;
         loop {
-            for _ in 0..(1u32 << backoff.min(6)) { core::hint::spin_loop(); }
+            for _ in 0..(1u32 << backoff.min(6)) {
+                core::hint::spin_loop();
+            }
             if self.sc_lock_state.load(Ordering::Relaxed) == 0
-                && self.sc_lock_state.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
-            { return; }
-            if backoff < 6 { backoff += 1; }
+                && self
+                    .sc_lock_state
+                    .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return;
+            }
+            if backoff < 6 {
+                backoff += 1;
+            }
         }
     }
 
     #[inline]
     pub fn sc_unlock(&self) {
-        self.sc_lock_state.store(0, core::sync::atomic::Ordering::Release);
+        self.sc_lock_state
+            .store(0, core::sync::atomic::Ordering::Release);
     }
 
     pub const fn new() -> Self {
@@ -589,8 +952,23 @@ impl SchedContext {
         }
     }
 
-    /// Cleanup when scheduling context is destroyed
+    /// Cleanup when scheduling context is destroyed.
+    ///
+    /// The TCB holds the strong ref on this SC. By the time SC::cleanup()
+    /// runs (refcount == 0), the TCB must have already released its ref
+    /// (via Tcb::cleanup() or syscall_sc_unbind). The bound_tcb null
+    /// check is purely defensive.
     pub fn cleanup(&mut self) {
+        if !self.bound_tcb.is_null() {
+            unsafe {
+                let tcb = &mut *self.bound_tcb;
+                tcb.tcb_lock();
+                if core::ptr::eq(tcb.sched_context, self as *mut SchedContext) {
+                    tcb.sched_context = core::ptr::null_mut();
+                }
+                tcb.tcb_unlock();
+            }
+        }
         self.bound_tcb = core::ptr::null_mut();
     }
 }

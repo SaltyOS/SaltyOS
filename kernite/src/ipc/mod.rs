@@ -25,8 +25,8 @@ pub struct Message {
     pub length: usize,
     /// Number of capabilities to transfer (extracted from msg_info bits 11:7)
     pub extra_caps: usize,
-    /// Message registers (MR0..MR19)
-    pub regs: [u64; 20],
+    /// Message registers (MR0..MR31)
+    pub regs: [u64; 32],
     /// Sender CSpace slot indices for capability transfer (up to 4)
     pub caps: [u64; 4],
 }
@@ -37,7 +37,7 @@ impl Message {
             label: 0,
             length: 0,
             extra_caps: 0,
-            regs: [0; 20],
+            regs: [0; 32],
             caps: [0; 4],
         }
     }
@@ -46,27 +46,30 @@ impl Message {
 /// IPC Buffer layout (mapped into user VSpace, shared between kernel and user)
 ///
 /// The msg[] array is overlaid by userland as `struct trona_msg`:
-///   msg[0] = label, msg[1] = length, msg[2..21] = regs[0..19]
-/// So 22 slots = 2 header + 20 message registers.
+///   msg[0] = label, msg[1] = length, msg[2..33] = regs[0..31]
+/// So 34 slots = 2 header + 32 message registers.
 ///
 /// Total size: 4096 bytes (one page)
 #[repr(C)]
 pub struct IpcBuffer {
-    /// trona_msg overlay: [label, length, regs[0..19]]
-    pub msg: [u64; 22],         // 0x000: 176 bytes
+    /// trona_msg overlay: [label, length, regs[0..31]]
+    pub msg: [u64; 34],         // 0x000: 272 bytes
     /// Badge received from sender
-    pub badge: u64,             // 0x0B0: 8 bytes
+    pub badge: u64,             // 0x110: 8 bytes
     /// Capability slots to transfer (sender-side: indices into sender's CNode)
-    pub caps: [u64; 4],         // 0x0B8: 32 bytes
+    pub caps: [u64; 4],         // 0x118: 32 bytes
     /// CNode for receiving transferred capabilities
-    pub receive_cnode: u64,     // 0x0D8: 8 bytes
+    pub receive_cnode: u64,     // 0x138: 8 bytes
     /// Starting slot index in receive CNode
-    pub receive_index: u64,     // 0x0E0: 8 bytes
+    pub receive_index: u64,     // 0x140: 8 bytes
     /// CNode depth for receive
-    pub receive_depth: u64,     // 0x0E8: 8 bytes
+    pub receive_depth: u64,     // 0x148: 8 bytes
+    /// Timeout in nanoseconds for timed IPC operations (SendTimed, etc.).
+    /// Written by userland before the syscall; read by the kernel.
+    pub timeout_ns: u64,        // 0x150: 8 bytes
     /// Reserved/extended payload area used by invoke extensions.
-    /// VSPACE_WALK writes tuples at word offset 30.
-    pub reserved: [u64; 478],   // 0x0F0: 3824 bytes
+    /// VSPACE_WALK writes tuples at word offset 43.
+    pub reserved: [u64; 465],   // 0x158: 3720 bytes
 }
 
 // Compile-time assertion: IpcBuffer fits in one page

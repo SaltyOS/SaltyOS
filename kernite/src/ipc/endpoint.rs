@@ -3,12 +3,13 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use super::{Message, RecvWaitQueue, WaitQueue};
-use crate::cap::{KernelObject, ObjectType};
+use crate::cap::{CNode, CapError, CapRights, KernelObject, ObjectType};
 use crate::mm::SpinLock;
 use crate::sched::thread::{
     BlockedReason, RecvWaitLink, Tcb, ThreadState, MAX_RECV_WAIT_ENDPOINTS,
     RECV_WAIT_SELECTED_NONE, RECV_WAIT_SELECTED_NOTIFICATION,
 };
+use crate::syscall::SyscallError;
 
 use crate::sched::scheduler::scheduler as get_scheduler;
 
@@ -28,7 +29,7 @@ static mut EP_IRQ_FLAGS: [u64; crate::arch::MAX_CPUS] = [0; crate::arch::MAX_CPU
 static mut EP_LOCK_DEPTH: [u32; crate::arch::MAX_CPUS] = [0; crate::arch::MAX_CPUS];
 static RECV_WAIT_LOCK: SpinLock = SpinLock::new();
 const PM_EXEC_LABEL: u64 = 6;
-const IPC_BUFFER_RESERVED_BYTES: usize = core::mem::size_of::<[u64; 478]>();
+const IPC_BUFFER_RESERVED_BYTES: usize = core::mem::size_of::<[u64; 466]>();
 
 #[inline]
 fn recv_wait_lock() {
@@ -118,6 +119,25 @@ pub enum EndpointState {
     RecvBlocked,
 }
 
+#[derive(Clone, Copy)]
+enum MultiWaitReady {
+    Sender {
+        wait_index: usize,
+        sender: *mut Tcb,
+        msg: Message,
+        badge: u64,
+        keep_blocked: bool,
+    },
+    Nbsend {
+        wait_index: usize,
+        msg: Message,
+        badge: u64,
+    },
+    Notification {
+        bits: u64,
+    },
+}
+
 /// IPC Endpoint
 #[repr(C)]
 pub struct Endpoint {
@@ -192,7 +212,11 @@ impl Endpoint {
             *(&raw mut EP_LOCK_DEPTH[cpu]) += 1;
         }
 
-        if self.lock.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        if self
+            .lock
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
             return;
         }
         let mut backoff: u32 = 0;
@@ -201,11 +225,16 @@ impl Endpoint {
                 core::hint::spin_loop();
             }
             if self.lock.load(Ordering::Relaxed) == 0
-                && self.lock.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
+                && self
+                    .lock
+                    .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
             {
                 return;
             }
-            if backoff < 6 { backoff += 1; }
+            if backoff < 6 {
+                backoff += 1;
+            }
         }
     }
 
@@ -284,6 +313,239 @@ impl Endpoint {
         }
     }
 
+    fn syscall_error_from_cap_error(err: CapError) -> SyscallError {
+        match err {
+            CapError::SlotOccupied => SyscallError::SlotOccupied,
+            CapError::InsufficientRights => SyscallError::InsufficientRights,
+            CapError::InsufficientMemory | CapError::OutOfSlots => SyscallError::OutOfMemory,
+            CapError::InvalidOperation => SyscallError::InvalidOperation,
+            _ => SyscallError::InvalidCapability,
+        }
+    }
+
+    unsafe fn lookup_cspace_cap_for_ipc(
+        cspace: &CNode,
+        cap_ptr: u64,
+        depth: u64,
+    ) -> Result<crate::cap::Capability, SyscallError> {
+        unsafe {
+            if depth != 0 {
+                return crate::cap::cnode::resolve_address(cspace, cap_ptr, depth as u8)
+                    .map(|cap| *cap)
+                    .map_err(|_| SyscallError::InvalidCapability);
+            }
+
+            if let Some(cap) = cspace.get(cap_ptr as usize) {
+                return Ok(*cap);
+            }
+
+            let root_bits = cspace.header.size_bits as usize;
+            for sub_bits in 4usize..=16 {
+                let root_idx = (cap_ptr >> sub_bits) as usize;
+                if root_idx >= cspace.num_slots() {
+                    continue;
+                }
+                let Some(cap) = cspace.get(root_idx) else {
+                    continue;
+                };
+                if cap.obj_type != ObjectType::CNode || cap.object.is_null() {
+                    continue;
+                }
+                let sub_cnode = &*(cap.object as *const CNode);
+                if sub_cnode.header.size_bits as usize != sub_bits {
+                    continue;
+                }
+                let total_depth = (root_bits + sub_bits) as u8;
+                return crate::cap::cnode::resolve_address(cspace, cap_ptr, total_depth)
+                    .map(|cap| *cap)
+                    .map_err(|_| SyscallError::InvalidCapability);
+            }
+
+            Err(SyscallError::InvalidCapability)
+        }
+    }
+
+    unsafe fn resolve_receive_cnode_locked(
+        receiver: *mut Tcb,
+        cap_offset: u64,
+    ) -> Result<(*mut CNode, usize), SyscallError> {
+        unsafe {
+            let recv_cnode_ptr = (*receiver).ipc_receive_cnode;
+            if recv_cnode_ptr == 0 || (*receiver).cspace_root.is_null() {
+                return Err(SyscallError::InvalidOperation);
+            }
+
+            let recv_cspace = &*(*receiver).cspace_root;
+            let recv_cnode_cap = Self::lookup_cspace_cap_for_ipc(
+                recv_cspace,
+                recv_cnode_ptr,
+                (*receiver).ipc_receive_depth,
+            )?;
+            if recv_cnode_cap.obj_type != ObjectType::CNode || recv_cnode_cap.object.is_null() {
+                return Err(SyscallError::InvalidCapability);
+            }
+
+            let recv_cnode = recv_cnode_cap.object as *mut CNode;
+            let dest_slot = ((*receiver).ipc_receive_index + cap_offset) as usize;
+            if dest_slot >= (*recv_cnode).num_slots() {
+                if (*receiver).ipc_receive_depth == 0 {
+                    let root_cnode = &*recv_cnode;
+                    let root_bits = root_cnode.header.size_bits as usize;
+                    let cap_addr = (*receiver).ipc_receive_index + cap_offset;
+
+                    for sub_bits in 4usize..=16 {
+                        let root_idx = (cap_addr >> sub_bits) as usize;
+                        if root_idx >= root_cnode.num_slots() {
+                            continue;
+                        }
+                        let Some(cap) = root_cnode.get(root_idx) else {
+                            continue;
+                        };
+                        if cap.obj_type != ObjectType::CNode || cap.object.is_null() {
+                            continue;
+                        }
+                        let sub_cnode = &*(cap.object as *const CNode);
+                        if sub_cnode.header.size_bits as usize != sub_bits {
+                            continue;
+                        }
+                        let total_depth = (root_bits + sub_bits) as u8;
+                        return crate::cap::cnode::resolve_address_for_slot(
+                            root_cnode,
+                            cap_addr,
+                            total_depth,
+                        )
+                        .map_err(|_| SyscallError::InvalidCapability);
+                    }
+                }
+                return Err(SyscallError::InvalidCapability);
+            }
+            Ok((recv_cnode, dest_slot))
+        }
+    }
+
+    unsafe fn copy_ipc_caps_locked(
+        sender: *mut Tcb,
+        receiver: *mut Tcb,
+        msg: &Message,
+    ) -> Result<(), SyscallError> {
+        unsafe {
+            let cap_count = msg.extra_caps.min(4) as usize;
+            if cap_count == 0 {
+                return Ok(());
+            }
+            if (*sender).cspace_root.is_null() {
+                return Err(SyscallError::InvalidCapability);
+            }
+
+            let sender_cspace = &*(*sender).cspace_root;
+            let mut dest_cnodes = [core::ptr::null_mut::<CNode>(); 4];
+            let mut dest_slots = [usize::MAX; 4];
+            let mut copied = [false; 4];
+
+            for i in 0..cap_count {
+                let src_slot_idx = msg.caps[i];
+                if src_slot_idx == 0 {
+                    continue;
+                }
+
+                let src_cap = sender_cspace
+                    .get(src_slot_idx as usize)
+                    .ok_or(SyscallError::InvalidCapability)?;
+                if !src_cap.has_right(CapRights::GRANT) {
+                    return Err(SyscallError::InsufficientRights);
+                }
+
+                let (dest_cnode, dest_slot) =
+                    Self::resolve_receive_cnode_locked(receiver, i as u64)?;
+                if !(*dest_cnode).is_slot_empty(dest_slot) {
+                    return Err(SyscallError::SlotOccupied);
+                }
+                dest_cnodes[i] = dest_cnode;
+                dest_slots[i] = dest_slot;
+            }
+
+            for i in 0..cap_count {
+                let src_slot_idx = msg.caps[i];
+                if src_slot_idx == 0 {
+                    continue;
+                }
+
+                let src_cap = sender_cspace
+                    .get(src_slot_idx as usize)
+                    .ok_or(SyscallError::InvalidCapability)?;
+                let dest_cnode = &mut *dest_cnodes[i];
+                if let Err(err) = dest_cnode.copy_slot(
+                    dest_slots[i],
+                    sender_cspace,
+                    src_slot_idx as usize,
+                    src_cap.rights,
+                ) {
+                    for rollback_idx in 0..i {
+                        if copied[rollback_idx] {
+                            let rollback_cnode = &mut *dest_cnodes[rollback_idx];
+                            let _ = rollback_cnode.delete(dest_slots[rollback_idx]);
+                        }
+                    }
+                    return Err(Self::syscall_error_from_cap_error(err));
+                }
+                copied[i] = true;
+            }
+
+            Ok(())
+        }
+    }
+
+    unsafe fn transfer_message_checked(
+        &self,
+        sender: *mut Tcb,
+        receiver: *mut Tcb,
+        msg: &Message,
+        badge: u64,
+    ) -> Result<(), SyscallError> {
+        unsafe {
+            if msg.extra_caps.min(4) > 0 {
+                self.ep_unlock();
+                let transfer_res = Self::transfer_message_unlocked(sender, receiver, msg, badge);
+                self.ep_lock();
+                return transfer_res;
+            }
+
+            Self::transfer_message_unlocked(sender, receiver, msg, badge)
+        }
+    }
+
+    unsafe fn transfer_message_unlocked(
+        sender: *mut Tcb,
+        receiver: *mut Tcb,
+        msg: &Message,
+        badge: u64,
+    ) -> Result<(), SyscallError> {
+        unsafe {
+            if msg.extra_caps.min(4) > 0 {
+                crate::mm::CAP_LOCK.lock();
+                let transfer_res = Self::copy_ipc_caps_locked(sender, receiver, msg);
+                crate::mm::CAP_LOCK.unlock();
+                transfer_res?;
+            }
+
+            (*receiver).saved_caller_msg = *msg;
+            (*receiver).saved_caller_badge = badge;
+            transfer_exec_payload(sender, receiver, msg);
+            Ok(())
+        }
+    }
+
+    unsafe fn restore_single_recv_wait(&mut self, receiver: *mut Tcb) {
+        unsafe {
+            (*receiver).recv_wait_link_count = 1;
+            (*receiver).recv_wait_selected = RECV_WAIT_SELECTED_NONE;
+            (*receiver).blocked_endpoint = self as *mut Endpoint as *mut u8;
+            (*receiver).woken_by_notification = false;
+            self.arm_recv_wait_link(receiver, 0, 0);
+            self.state = EndpointState::RecvBlocked;
+        }
+    }
+
     unsafe fn clear_recv_wait_link(link: *mut RecvWaitLink) {
         unsafe {
             if link.is_null() {
@@ -295,12 +557,7 @@ impl Endpoint {
         }
     }
 
-    unsafe fn arm_recv_wait_link(
-        &mut self,
-        current: *mut Tcb,
-        link_index: usize,
-        wait_index: u16,
-    ) {
+    unsafe fn arm_recv_wait_link(&mut self, current: *mut Tcb, link_index: usize, wait_index: u16) {
         unsafe {
             let link = &raw mut (*current).recv_wait_links[link_index];
             (*link).tcb = current;
@@ -423,10 +680,26 @@ impl Endpoint {
         }
     }
 
+    unsafe fn unlock_endpoint_order_except(
+        endpoints: &[*mut Endpoint],
+        order: &[usize; MAX_RECV_WAIT_ENDPOINTS],
+        count: usize,
+        keep: *mut Endpoint,
+    ) {
+        let mut idx = count;
+        while idx > 0 {
+            idx -= 1;
+            let ep = endpoints[order[idx]];
+            if ep != keep {
+                (*ep).ep_unlock();
+            }
+        }
+    }
+
     unsafe fn recv_any_ready_locked(
         current: *mut Tcb,
         endpoints: &[*mut Endpoint],
-    ) -> Option<(Message, u64, u64, *mut Tcb)> {
+    ) -> Result<Option<MultiWaitReady>, SyscallError> {
         unsafe {
             let mut wait_index = 0usize;
             while wait_index < endpoints.len() {
@@ -443,46 +716,18 @@ impl Endpoint {
 
                     let (msg, badge, keep_blocked) = match (*sender).blocked_reason {
                         Some(BlockedReason::SendBlocked { msg, badge }) => (msg, badge, false),
-                        Some(BlockedReason::SendTimedBlocked { msg, badge }) => {
-                            crate::sched::sleep_queue::remove(sender);
-                            (*sender).timer_wakeup_ns = 0;
-                            (msg, badge, false)
-                        }
+                        Some(BlockedReason::SendTimedBlocked { msg, badge }) => (msg, badge, false),
                         Some(BlockedReason::FaultBlocked { msg, badge }) => (msg, badge, true),
                         Some(BlockedReason::CallSendBlocked { msg, badge }) => (msg, badge, true),
                         _ => (Message::empty(), 0, false),
                     };
-
-                    if endpoint.send_queue.is_empty() {
-                        endpoint.state = EndpointState::Idle;
-                    }
-
-                    endpoint.transfer_message(sender, current, &msg, badge);
-
-                    if keep_blocked {
-                        (*current).reply_tcb = sender;
-                        (*current).reply_can_grant = !matches!(
-                            (*sender).blocked_reason,
-                            Some(BlockedReason::FaultBlocked { .. })
-                        );
-                        crate::sched::pip::pip_donate(sender, current);
-                        (*sender).blocked_endpoint = core::ptr::null_mut();
-                        if matches!(
-                            (*sender).blocked_reason,
-                            Some(BlockedReason::CallSendBlocked { .. })
-                        ) {
-                            (*sender).blocked_reason = Some(BlockedReason::ReplyWait {
-                                msg,
-                                badge,
-                            });
-                        }
-                        return Some((msg, badge, wait_index as u64, core::ptr::null_mut()));
-                    }
-
-                    (*sender).state = ThreadState::Ready;
-                    (*sender).blocked_reason = None;
-                    (*sender).blocked_endpoint = core::ptr::null_mut();
-                    return Some((msg, badge, wait_index as u64, sender));
+                    return Ok(Some(MultiWaitReady::Sender {
+                        wait_index,
+                        sender,
+                        msg,
+                        badge,
+                        keep_blocked,
+                    }));
                 }
                 wait_index += 1;
             }
@@ -491,7 +736,11 @@ impl Endpoint {
             while wait_index < endpoints.len() {
                 let endpoint = &mut *endpoints[wait_index];
                 if let Some((msg, badge)) = endpoint.dequeue_nbsend() {
-                    return Some((msg, badge, wait_index as u64, core::ptr::null_mut()));
+                    return Ok(Some(MultiWaitReady::Nbsend {
+                        wait_index,
+                        msg,
+                        badge,
+                    }));
                 }
                 wait_index += 1;
             }
@@ -502,11 +751,72 @@ impl Endpoint {
                 let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
                 ntfn.ntfn_unlock();
                 if bits != 0 {
-                    return Some((Message::empty(), bits, u64::MAX, core::ptr::null_mut()));
+                    return Ok(Some(MultiWaitReady::Notification { bits }));
                 }
             }
 
-            None
+            Ok(None)
+        }
+    }
+
+    unsafe fn commit_multiwait_sender(
+        current: *mut Tcb,
+        endpoints: &[*mut Endpoint],
+        order: &[usize; MAX_RECV_WAIT_ENDPOINTS],
+        count: usize,
+        wait_index: usize,
+        sender: *mut Tcb,
+        msg: Message,
+        badge: u64,
+        keep_blocked: bool,
+    ) -> Result<(Message, u64, u64, *mut Tcb), SyscallError> {
+        unsafe {
+            let endpoint = &mut *endpoints[wait_index];
+            Self::unlock_endpoint_order_except(endpoints, order, count, endpoint);
+
+            let send_queue_empty = endpoint.send_queue.is_empty();
+            if let Err(err) = endpoint.transfer_message_checked(sender, current, &msg, badge) {
+                endpoint.send_queue.push_front(sender);
+                endpoint.state = EndpointState::SendBlocked;
+                endpoint.ep_unlock();
+                return Err(err);
+            }
+            endpoint.state = if send_queue_empty {
+                EndpointState::Idle
+            } else {
+                EndpointState::SendBlocked
+            };
+
+            if keep_blocked {
+                if matches!(
+                    (*sender).blocked_reason,
+                    Some(BlockedReason::CallSendBlocked { .. })
+                ) {
+                    (*sender).blocked_reason = Some(BlockedReason::ReplyWait { msg, badge });
+                }
+                (*current).set_reply_tcb(sender);
+                (*current).reply_can_grant = !matches!(
+                    (*sender).blocked_reason,
+                    Some(BlockedReason::FaultBlocked { .. })
+                );
+                crate::sched::pip::pip_donate(sender, current);
+                (*sender).blocked_endpoint = core::ptr::null_mut();
+                endpoint.ep_unlock();
+                return Ok((msg, badge, wait_index as u64, core::ptr::null_mut()));
+            }
+
+            if matches!(
+                (*sender).blocked_reason,
+                Some(BlockedReason::SendTimedBlocked { .. })
+            ) {
+                crate::sched::sleep_queue::remove(sender);
+                (*sender).timer_wakeup_ns = 0;
+            }
+            (*sender).state = ThreadState::Ready;
+            (*sender).blocked_reason = None;
+            (*sender).blocked_endpoint = core::ptr::null_mut();
+            endpoint.ep_unlock();
+            Ok((msg, badge, wait_index as u64, sender))
         }
     }
 
@@ -537,7 +847,7 @@ impl Endpoint {
         }
     }
 
-    pub fn recv_any(endpoints: &[*mut Endpoint]) -> (Message, u64, u64) {
+    pub fn recv_any(endpoints: &[*mut Endpoint]) -> Result<(Message, u64, u64), SyscallError> {
         unsafe {
             let current = get_scheduler().current();
             let mut order = [0usize; MAX_RECV_WAIT_ENDPOINTS];
@@ -545,18 +855,57 @@ impl Endpoint {
 
             if !(*current).reply_tcb.is_null() {
                 crate::sched::pip::pip_undonate(current, (*current).reply_tcb);
-                (*current).reply_tcb = core::ptr::null_mut();
+                Tcb::release_tcb_ref((*current).clear_reply_tcb());
                 (*current).reply_can_grant = false;
             }
 
             Self::cache_receive_slot(current);
 
-            if let Some((msg, badge, source, wake)) = Self::recv_any_ready_locked(current, endpoints) {
-                Self::unlock_endpoint_order(endpoints, &order, lock_count);
-                if !wake.is_null() {
-                    get_scheduler().enqueue(wake);
+            let ready = match Self::recv_any_ready_locked(current, endpoints) {
+                Ok(v) => v,
+                Err(err) => {
+                    Self::unlock_endpoint_order(endpoints, &order, lock_count);
+                    return Err(err);
                 }
-                return (msg, badge, source);
+            };
+            if let Some(ready) = ready {
+                return match ready {
+                    MultiWaitReady::Sender {
+                        wait_index,
+                        sender,
+                        msg,
+                        badge,
+                        keep_blocked,
+                    } => {
+                        let (msg, badge, source, wake) = Self::commit_multiwait_sender(
+                            current,
+                            endpoints,
+                            &order,
+                            lock_count,
+                            wait_index,
+                            sender,
+                            msg,
+                            badge,
+                            keep_blocked,
+                        )?;
+                        if !wake.is_null() {
+                            get_scheduler().enqueue(wake);
+                        }
+                        Ok((msg, badge, source))
+                    }
+                    MultiWaitReady::Nbsend {
+                        wait_index,
+                        msg,
+                        badge,
+                    } => {
+                        Self::unlock_endpoint_order(endpoints, &order, lock_count);
+                        Ok((msg, badge, wait_index as u64))
+                    }
+                    MultiWaitReady::Notification { bits } => {
+                        Self::unlock_endpoint_order(endpoints, &order, lock_count);
+                        Ok((Message::empty(), bits, u64::MAX))
+                    }
+                };
             }
 
             super::block_current_thread_no_switch(current, BlockedReason::RecvBlocked);
@@ -573,7 +922,7 @@ impl Endpoint {
                     (*current).blocked_endpoint = core::ptr::null_mut();
                     (*current).state = ThreadState::Running;
                     Self::unlock_endpoint_order(endpoints, &order, lock_count);
-                    return (Message::empty(), bits, u64::MAX);
+                    return Ok((Message::empty(), bits, u64::MAX));
                 }
             }
 
@@ -586,23 +935,23 @@ impl Endpoint {
                 ntfn.ntfn_lock();
                 let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
                 ntfn.ntfn_unlock();
-                (super::Message::empty(), bits, u64::MAX)
+                Ok((super::Message::empty(), bits, u64::MAX))
             } else {
-                (
+                Ok((
                     (*current).saved_caller_msg,
                     (*current).saved_caller_badge,
                     Self::current_multiwait_source(current),
-                )
+                ))
             }
         }
     }
 
-    pub fn reply_recv_any(endpoints: &[*mut Endpoint], reply: &Message) -> (Message, u64, u64) {
+    pub fn reply_recv_any(
+        endpoints: &[*mut Endpoint],
+        reply: &Message,
+    ) -> Result<(Message, u64, u64), SyscallError> {
         unsafe {
             let current = get_scheduler().current();
-            let mut order = [0usize; MAX_RECV_WAIT_ENDPOINTS];
-            let lock_count = Self::build_locked_endpoint_order(endpoints, &mut order);
-
             let caller = (*current).reply_tcb;
             let mut wake_caller: *mut Tcb = core::ptr::null_mut();
 
@@ -610,21 +959,24 @@ impl Endpoint {
                 let caller_replyable = (*caller).state == ThreadState::Blocked
                     && matches!(
                         (*caller).blocked_reason,
-                        Some(BlockedReason::ReplyWait { .. }) | Some(BlockedReason::FaultBlocked { .. })
+                        Some(BlockedReason::ReplyWait { .. })
+                            | Some(BlockedReason::FaultBlocked { .. })
                     );
 
                 if caller_replyable {
-                    crate::sched::pip::pip_undonate(current, caller);
-
-                    if (*current).reply_can_grant {
-                        (*endpoints[0]).transfer_message(current, caller, reply, 0);
+                    let reply_result = if (*current).reply_can_grant {
+                        Self::transfer_message_unlocked(current, caller, reply, 0)
                     } else {
                         let mut no_grant_reply = *reply;
                         no_grant_reply.extra_caps = 0;
                         no_grant_reply.caps = [0; 4];
-                        (*endpoints[0]).transfer_message(current, caller, &no_grant_reply, 0);
+                        Self::transfer_message_unlocked(current, caller, &no_grant_reply, 0)
+                    };
+                    if let Err(err) = reply_result {
+                        return Err(err);
                     }
 
+                    crate::sched::pip::pip_undonate(current, caller);
                     (*caller).blocked_reason = None;
                     (*caller).state = ThreadState::Ready;
                     wake_caller = caller;
@@ -632,19 +984,82 @@ impl Endpoint {
 
                 (*current).reply_tcb = core::ptr::null_mut();
                 (*current).reply_can_grant = false;
+                Tcb::release_tcb_ref(caller);
             }
 
+            let mut order = [0usize; MAX_RECV_WAIT_ENDPOINTS];
+            let lock_count = Self::build_locked_endpoint_order(endpoints, &mut order);
             Self::cache_receive_slot(current);
 
-            if let Some((msg, badge, source, wake_sender)) = Self::recv_any_ready_locked(current, endpoints) {
-                Self::unlock_endpoint_order(endpoints, &order, lock_count);
-                if !wake_caller.is_null() {
+            let ready = match Self::recv_any_ready_locked(current, endpoints) {
+                Ok(v) => v,
+                Err(err) => {
+                    Self::unlock_endpoint_order(endpoints, &order, lock_count);
+                    if !wake_caller.is_null() {
+                        get_scheduler().enqueue(wake_caller);
+                    }
+                    return Err(err);
+                }
+            };
+            if let Some(ready) = ready {
+                let result = match ready {
+                    MultiWaitReady::Sender {
+                        wait_index,
+                        sender,
+                        msg,
+                        badge,
+                        keep_blocked,
+                    } => {
+                        let (msg, badge, source, wake_sender) = match Self::commit_multiwait_sender(
+                            current,
+                            endpoints,
+                            &order,
+                            lock_count,
+                            wait_index,
+                            sender,
+                            msg,
+                            badge,
+                            keep_blocked,
+                        ) {
+                            Ok(v) => v,
+                            Err(err) => {
+                                if !wake_caller.is_null() {
+                                    get_scheduler().enqueue(wake_caller);
+                                }
+                                return Err(err);
+                            }
+                        };
+                        if !wake_caller.is_null() {
+                            get_scheduler().enqueue(wake_caller);
+                        }
+                        if !wake_sender.is_null() {
+                            get_scheduler().enqueue(wake_sender);
+                        }
+                        Ok((msg, badge, source))
+                    }
+                    MultiWaitReady::Nbsend {
+                        wait_index,
+                        msg,
+                        badge,
+                    } => {
+                        Self::unlock_endpoint_order(endpoints, &order, lock_count);
+                        if !wake_caller.is_null() {
+                            get_scheduler().enqueue(wake_caller);
+                        }
+                        Ok((msg, badge, wait_index as u64))
+                    }
+                    MultiWaitReady::Notification { bits } => {
+                        Self::unlock_endpoint_order(endpoints, &order, lock_count);
+                        if !wake_caller.is_null() {
+                            get_scheduler().enqueue(wake_caller);
+                        }
+                        Ok((Message::empty(), bits, u64::MAX))
+                    }
+                };
+                if result.is_err() && !wake_caller.is_null() {
                     get_scheduler().enqueue(wake_caller);
                 }
-                if !wake_sender.is_null() {
-                    get_scheduler().enqueue(wake_sender);
-                }
-                return (msg, badge, source);
+                return result;
             }
 
             super::block_current_thread_no_switch(current, BlockedReason::RecvBlocked);
@@ -664,7 +1079,7 @@ impl Endpoint {
                     if !wake_caller.is_null() {
                         get_scheduler().enqueue(wake_caller);
                     }
-                    return (Message::empty(), bits, u64::MAX);
+                    return Ok((Message::empty(), bits, u64::MAX));
                 }
             }
 
@@ -680,18 +1095,21 @@ impl Endpoint {
                 ntfn.ntfn_lock();
                 let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
                 ntfn.ntfn_unlock();
-                (super::Message::empty(), bits, u64::MAX)
+                Ok((super::Message::empty(), bits, u64::MAX))
             } else {
-                (
+                Ok((
                     (*current).saved_caller_msg,
                     (*current).saved_caller_badge,
                     Self::current_multiwait_source(current),
-                )
+                ))
             }
         }
     }
 
-    pub fn recv_any_timeout(endpoints: &[*mut Endpoint], timeout_ns: u64) -> (Message, u64, u64, u64) {
+    pub fn recv_any_timeout(
+        endpoints: &[*mut Endpoint],
+        timeout_ns: u64,
+    ) -> Result<(Message, u64, u64, u64), SyscallError> {
         unsafe {
             let current = get_scheduler().current();
             let mut order = [0usize; MAX_RECV_WAIT_ENDPOINTS];
@@ -699,18 +1117,57 @@ impl Endpoint {
 
             if !(*current).reply_tcb.is_null() {
                 crate::sched::pip::pip_undonate(current, (*current).reply_tcb);
-                (*current).reply_tcb = core::ptr::null_mut();
+                Tcb::release_tcb_ref((*current).clear_reply_tcb());
                 (*current).reply_can_grant = false;
             }
 
             Self::cache_receive_slot(current);
 
-            if let Some((msg, badge, source, wake)) = Self::recv_any_ready_locked(current, endpoints) {
-                Self::unlock_endpoint_order(endpoints, &order, lock_count);
-                if !wake.is_null() {
-                    get_scheduler().enqueue(wake);
+            let ready = match Self::recv_any_ready_locked(current, endpoints) {
+                Ok(v) => v,
+                Err(err) => {
+                    Self::unlock_endpoint_order(endpoints, &order, lock_count);
+                    return Err(err);
                 }
-                return (msg, badge, source, 0);
+            };
+            if let Some(ready) = ready {
+                return match ready {
+                    MultiWaitReady::Sender {
+                        wait_index,
+                        sender,
+                        msg,
+                        badge,
+                        keep_blocked,
+                    } => {
+                        let (msg, badge, source, wake) = Self::commit_multiwait_sender(
+                            current,
+                            endpoints,
+                            &order,
+                            lock_count,
+                            wait_index,
+                            sender,
+                            msg,
+                            badge,
+                            keep_blocked,
+                        )?;
+                        if !wake.is_null() {
+                            get_scheduler().enqueue(wake);
+                        }
+                        Ok((msg, badge, source, 0))
+                    }
+                    MultiWaitReady::Nbsend {
+                        wait_index,
+                        msg,
+                        badge,
+                    } => {
+                        Self::unlock_endpoint_order(endpoints, &order, lock_count);
+                        Ok((msg, badge, wait_index as u64, 0))
+                    }
+                    MultiWaitReady::Notification { bits } => {
+                        Self::unlock_endpoint_order(endpoints, &order, lock_count);
+                        Ok((Message::empty(), bits, u64::MAX, 0))
+                    }
+                };
             }
 
             Self::arm_recv_any_locked(current, endpoints);
@@ -729,7 +1186,7 @@ impl Endpoint {
                     (*current).blocked_endpoint = core::ptr::null_mut();
                     (*current).state = ThreadState::Running;
                     Self::unlock_endpoint_order(endpoints, &order, lock_count);
-                    return (Message::empty(), bits, u64::MAX, 0);
+                    return Ok((Message::empty(), bits, u64::MAX, 0));
                 }
             }
 
@@ -745,18 +1202,18 @@ impl Endpoint {
                 ntfn.ntfn_lock();
                 let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
                 ntfn.ntfn_unlock();
-                (Message::empty(), bits, u64::MAX, 0)
+                Ok((Message::empty(), bits, u64::MAX, 0))
             } else {
                 let result = (*current).futex_wakeup_result;
                 if result != 0 {
-                    (Message::empty(), 0, 0, result)
+                    Ok((Message::empty(), 0, 0, result))
                 } else {
-                    (
+                    Ok((
                         (*current).saved_caller_msg,
                         (*current).saved_caller_badge,
                         Self::current_multiwait_source(current),
                         0,
-                    )
+                    ))
                 }
             }
         }
@@ -766,12 +1223,9 @@ impl Endpoint {
         endpoints: &[*mut Endpoint],
         reply: &Message,
         timeout_ns: u64,
-    ) -> (Message, u64, u64, u64) {
+    ) -> Result<(Message, u64, u64, u64), SyscallError> {
         unsafe {
             let current = get_scheduler().current();
-            let mut order = [0usize; MAX_RECV_WAIT_ENDPOINTS];
-            let lock_count = Self::build_locked_endpoint_order(endpoints, &mut order);
-
             let caller = (*current).reply_tcb;
             let mut wake_caller: *mut Tcb = core::ptr::null_mut();
 
@@ -779,21 +1233,24 @@ impl Endpoint {
                 let caller_replyable = (*caller).state == ThreadState::Blocked
                     && matches!(
                         (*caller).blocked_reason,
-                        Some(BlockedReason::ReplyWait { .. }) | Some(BlockedReason::FaultBlocked { .. })
+                        Some(BlockedReason::ReplyWait { .. })
+                            | Some(BlockedReason::FaultBlocked { .. })
                     );
 
                 if caller_replyable {
-                    crate::sched::pip::pip_undonate(current, caller);
-
-                    if (*current).reply_can_grant {
-                        (*endpoints[0]).transfer_message(current, caller, reply, 0);
+                    let reply_result = if (*current).reply_can_grant {
+                        Self::transfer_message_unlocked(current, caller, reply, 0)
                     } else {
                         let mut no_grant_reply = *reply;
                         no_grant_reply.extra_caps = 0;
                         no_grant_reply.caps = [0; 4];
-                        (*endpoints[0]).transfer_message(current, caller, &no_grant_reply, 0);
+                        Self::transfer_message_unlocked(current, caller, &no_grant_reply, 0)
+                    };
+                    if let Err(err) = reply_result {
+                        return Err(err);
                     }
 
+                    crate::sched::pip::pip_undonate(current, caller);
                     (*caller).blocked_reason = None;
                     (*caller).state = ThreadState::Ready;
                     wake_caller = caller;
@@ -801,19 +1258,82 @@ impl Endpoint {
 
                 (*current).reply_tcb = core::ptr::null_mut();
                 (*current).reply_can_grant = false;
+                Tcb::release_tcb_ref(caller);
             }
 
+            let mut order = [0usize; MAX_RECV_WAIT_ENDPOINTS];
+            let lock_count = Self::build_locked_endpoint_order(endpoints, &mut order);
             Self::cache_receive_slot(current);
 
-            if let Some((msg, badge, source, wake_sender)) = Self::recv_any_ready_locked(current, endpoints) {
-                Self::unlock_endpoint_order(endpoints, &order, lock_count);
-                if !wake_caller.is_null() {
+            let ready = match Self::recv_any_ready_locked(current, endpoints) {
+                Ok(v) => v,
+                Err(err) => {
+                    Self::unlock_endpoint_order(endpoints, &order, lock_count);
+                    if !wake_caller.is_null() {
+                        get_scheduler().enqueue(wake_caller);
+                    }
+                    return Err(err);
+                }
+            };
+            if let Some(ready) = ready {
+                let result = match ready {
+                    MultiWaitReady::Sender {
+                        wait_index,
+                        sender,
+                        msg,
+                        badge,
+                        keep_blocked,
+                    } => {
+                        let (msg, badge, source, wake_sender) = match Self::commit_multiwait_sender(
+                            current,
+                            endpoints,
+                            &order,
+                            lock_count,
+                            wait_index,
+                            sender,
+                            msg,
+                            badge,
+                            keep_blocked,
+                        ) {
+                            Ok(v) => v,
+                            Err(err) => {
+                                if !wake_caller.is_null() {
+                                    get_scheduler().enqueue(wake_caller);
+                                }
+                                return Err(err);
+                            }
+                        };
+                        if !wake_caller.is_null() {
+                            get_scheduler().enqueue(wake_caller);
+                        }
+                        if !wake_sender.is_null() {
+                            get_scheduler().enqueue(wake_sender);
+                        }
+                        Ok((msg, badge, source, 0))
+                    }
+                    MultiWaitReady::Nbsend {
+                        wait_index,
+                        msg,
+                        badge,
+                    } => {
+                        Self::unlock_endpoint_order(endpoints, &order, lock_count);
+                        if !wake_caller.is_null() {
+                            get_scheduler().enqueue(wake_caller);
+                        }
+                        Ok((msg, badge, wait_index as u64, 0))
+                    }
+                    MultiWaitReady::Notification { bits } => {
+                        Self::unlock_endpoint_order(endpoints, &order, lock_count);
+                        if !wake_caller.is_null() {
+                            get_scheduler().enqueue(wake_caller);
+                        }
+                        Ok((Message::empty(), bits, u64::MAX, 0))
+                    }
+                };
+                if result.is_err() && !wake_caller.is_null() {
                     get_scheduler().enqueue(wake_caller);
                 }
-                if !wake_sender.is_null() {
-                    get_scheduler().enqueue(wake_sender);
-                }
-                return (msg, badge, source, 0);
+                return result;
             }
 
             Self::arm_recv_any_locked(current, endpoints);
@@ -835,7 +1355,7 @@ impl Endpoint {
                     if !wake_caller.is_null() {
                         get_scheduler().enqueue(wake_caller);
                     }
-                    return (Message::empty(), bits, u64::MAX, 0);
+                    return Ok((Message::empty(), bits, u64::MAX, 0));
                 }
             }
 
@@ -854,25 +1374,25 @@ impl Endpoint {
                 ntfn.ntfn_lock();
                 let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
                 ntfn.ntfn_unlock();
-                (Message::empty(), bits, u64::MAX, 0)
+                Ok((Message::empty(), bits, u64::MAX, 0))
             } else {
                 let result = (*current).futex_wakeup_result;
                 if result != 0 {
-                    (Message::empty(), 0, 0, result)
+                    Ok((Message::empty(), 0, 0, result))
                 } else {
-                    (
+                    Ok((
                         (*current).saved_caller_msg,
                         (*current).saved_caller_badge,
                         Self::current_multiwait_source(current),
                         0,
-                    )
+                    ))
                 }
             }
         }
     }
 
     /// Send message (blocks until receiver ready)
-    pub fn send(&mut self, msg: &Message, badge: u64) {
+    pub fn send(&mut self, msg: &Message, badge: u64) -> Result<(), SyscallError> {
         unsafe {
             self.ep_lock();
             let current = get_scheduler().current();
@@ -888,26 +1408,37 @@ impl Endpoint {
                             self.send_queue.push(current);
                             self.state = EndpointState::SendBlocked;
                             (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
-                            super::block_current_thread_no_switch(current, BlockedReason::SendBlocked { msg: *msg, badge });
+                            super::block_current_thread_no_switch(
+                                current,
+                                BlockedReason::SendBlocked { msg: *msg, badge },
+                            );
                             self.ep_unlock();
                             get_scheduler().reschedule();
-                            return;
+                            return Ok(());
                         }
                     };
 
-                    if self.recv_queue.is_empty() {
-                        self.state = EndpointState::Idle;
+                    let recv_queue_empty = self.recv_queue.is_empty();
+                    if let Err(err) = self.transfer_message_checked(current, receiver, msg, badge) {
+                        self.restore_single_recv_wait(receiver);
+                        self.ep_unlock();
+                        return Err(err);
                     }
 
-                    if matches!((*receiver).blocked_reason, Some(BlockedReason::RecvTimedBlocked)) {
+                    if matches!(
+                        (*receiver).blocked_reason,
+                        Some(BlockedReason::RecvTimedBlocked)
+                    ) {
                         crate::sched::sleep_queue::remove(receiver);
                         (*receiver).timer_wakeup_ns = 0;
                     }
-
+                    self.state = if recv_queue_empty {
+                        EndpointState::Idle
+                    } else {
+                        EndpointState::RecvBlocked
+                    };
                     (*receiver).blocked_reason = None;
                     (*receiver).blocked_endpoint = core::ptr::null_mut();
-
-                    self.transfer_message(current, receiver, msg, badge);
 
                     if (*receiver).state != ThreadState::Inactive {
                         (*receiver).state = ThreadState::Ready;
@@ -916,15 +1447,20 @@ impl Endpoint {
                     if (*receiver).state == ThreadState::Ready {
                         get_scheduler().enqueue(receiver);
                     }
+                    Ok(())
                 }
                 EndpointState::Idle | EndpointState::SendBlocked => {
                     // SLOWPATH: No receiver - block sender
                     self.send_queue.push(current);
                     self.state = EndpointState::SendBlocked;
                     (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
-                    super::block_current_thread_no_switch(current, BlockedReason::SendBlocked { msg: *msg, badge });
+                    super::block_current_thread_no_switch(
+                        current,
+                        BlockedReason::SendBlocked { msg: *msg, badge },
+                    );
                     self.ep_unlock();
                     get_scheduler().reschedule();
+                    Ok(())
                 }
             }
         }
@@ -937,8 +1473,8 @@ impl Endpoint {
     /// - Otherwise, enqueue in endpoint-local async queue and return.
     /// - If queue is full (or message needs cap transfer without receiver), fail.
     ///
-    /// Returns `true` on success, `false` if message cannot be accepted.
-    pub fn nbsend(&mut self, msg: &Message, badge: u64) -> bool {
+    /// Returns `Ok(())` on success or a concrete syscall-style error.
+    pub fn nbsend(&mut self, msg: &Message, badge: u64) -> Result<(), SyscallError> {
         unsafe {
             self.ep_lock();
             let current = get_scheduler().current();
@@ -946,19 +1482,30 @@ impl Endpoint {
             let result = match self.state {
                 EndpointState::RecvBlocked => {
                     if let Some((receiver, _selected)) = self.pop_recv_waiter() {
-                        if self.recv_queue.is_empty() {
-                            self.state = EndpointState::Idle;
+                        let recv_queue_empty = self.recv_queue.is_empty();
+                        if let Err(err) =
+                            self.transfer_message_checked(current, receiver, msg, badge)
+                        {
+                            self.restore_single_recv_wait(receiver);
+                            self.ep_unlock();
+                            return Err(err);
                         }
 
-                        if matches!((*receiver).blocked_reason, Some(BlockedReason::RecvTimedBlocked)) {
+                        if matches!(
+                            (*receiver).blocked_reason,
+                            Some(BlockedReason::RecvTimedBlocked)
+                        ) {
                             crate::sched::sleep_queue::remove(receiver);
                             (*receiver).timer_wakeup_ns = 0;
                         }
 
+                        self.state = if recv_queue_empty {
+                            EndpointState::Idle
+                        } else {
+                            EndpointState::RecvBlocked
+                        };
                         (*receiver).blocked_reason = None;
                         (*receiver).blocked_endpoint = core::ptr::null_mut();
-
-                        self.transfer_message(current, receiver, msg, badge);
 
                         let wake = (*receiver).state != ThreadState::Inactive;
                         if wake {
@@ -968,21 +1515,25 @@ impl Endpoint {
                         if wake {
                             get_scheduler().enqueue(receiver);
                         }
-                        return true;
+                        return Ok(());
                     } else {
                         self.state = EndpointState::Idle;
                         if msg.extra_caps != 0 {
-                            false
+                            Err(SyscallError::WouldBlock)
                         } else {
                             self.enqueue_nbsend(msg, badge)
+                                .then_some(())
+                                .ok_or(SyscallError::WouldBlock)
                         }
                     }
                 }
                 EndpointState::Idle | EndpointState::SendBlocked => {
                     if msg.extra_caps != 0 {
-                        false
+                        Err(SyscallError::WouldBlock)
                     } else {
                         self.enqueue_nbsend(msg, badge)
+                            .then_some(())
+                            .ok_or(SyscallError::WouldBlock)
                     }
                 }
             };
@@ -996,7 +1547,10 @@ impl Endpoint {
     /// Returns `Some((msg, badge, wake_tcb))` on non-blocking path.
     /// `wake_tcb` is a sender to enqueue (or null if kept blocked / no sender to wake).
     /// Returns `None` if thread is now Blocked and needs reschedule after ep_unlock.
-    unsafe fn recv_inner(&mut self, current: *mut Tcb) -> Option<(Message, u64, *mut Tcb)> {
+    unsafe fn recv_inner(
+        &mut self,
+        current: *mut Tcb,
+    ) -> Result<Option<(Message, u64, *mut Tcb)>, SyscallError> {
         unsafe {
             match self.state {
                 EndpointState::SendBlocked => {
@@ -1010,67 +1564,77 @@ impl Endpoint {
                             self.arm_recv_wait_link(current, 0, 0);
                             self.state = EndpointState::RecvBlocked;
                             (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
-                            super::block_current_thread_no_switch(current, BlockedReason::RecvBlocked);
-                            return None;
+                            super::block_current_thread_no_switch(
+                                current,
+                                BlockedReason::RecvBlocked,
+                            );
+                            return Ok(None);
                         }
                     };
 
                     let (msg, badge, keep_blocked) = match (*sender).blocked_reason {
                         Some(BlockedReason::SendBlocked { msg, badge }) => (msg, badge, false),
-                        Some(BlockedReason::SendTimedBlocked { msg, badge }) => {
-                            crate::sched::sleep_queue::remove(sender);
-                            (*sender).timer_wakeup_ns = 0;
-                            (msg, badge, false)
-                        }
+                        Some(BlockedReason::SendTimedBlocked { msg, badge }) => (msg, badge, false),
                         Some(BlockedReason::FaultBlocked { msg, badge }) => (msg, badge, true),
                         Some(BlockedReason::CallSendBlocked { msg, badge }) => (msg, badge, true),
                         _ => (Message::empty(), 0, false),
                     };
 
-                    if self.send_queue.is_empty() {
-                        self.state = EndpointState::Idle;
+                    let send_queue_empty = self.send_queue.is_empty();
+                    if let Err(err) = self.transfer_message_checked(sender, current, &msg, badge) {
+                        self.send_queue.push_front(sender);
+                        self.state = EndpointState::SendBlocked;
+                        return Err(err);
                     }
-
-                    self.transfer_message(sender, current, &msg, badge);
+                    self.state = if send_queue_empty {
+                        EndpointState::Idle
+                    } else {
+                        EndpointState::SendBlocked
+                    };
 
                     if keep_blocked {
-                        (*current).reply_tcb = sender;
+                        if matches!(
+                            (*sender).blocked_reason,
+                            Some(BlockedReason::CallSendBlocked { .. })
+                        ) {
+                            (*sender).blocked_reason =
+                                Some(BlockedReason::ReplyWait { msg, badge });
+                        }
+                        (*current).set_reply_tcb(sender);
                         (*current).reply_can_grant = !matches!(
                             (*sender).blocked_reason,
                             Some(BlockedReason::FaultBlocked { .. })
                         );
                         crate::sched::pip::pip_donate(sender, current);
                         (*sender).blocked_endpoint = core::ptr::null_mut();
+                        Ok(Some((msg, badge, core::ptr::null_mut())))
+                    } else {
                         if matches!(
                             (*sender).blocked_reason,
-                            Some(BlockedReason::CallSendBlocked { .. })
+                            Some(BlockedReason::SendTimedBlocked { .. })
                         ) {
-                            (*sender).blocked_reason = Some(BlockedReason::ReplyWait {
-                                msg,
-                                badge,
-                            });
+                            crate::sched::sleep_queue::remove(sender);
+                            (*sender).timer_wakeup_ns = 0;
                         }
-                        Some((msg, badge, core::ptr::null_mut()))
-                    } else {
                         (*sender).state = ThreadState::Ready;
                         (*sender).blocked_reason = None;
                         (*sender).blocked_endpoint = core::ptr::null_mut();
-                        Some((msg, badge, sender))
+                        Ok(Some((msg, badge, sender)))
                     }
                 }
                 EndpointState::Idle | EndpointState::RecvBlocked => {
                     if let Some((msg, badge)) = self.dequeue_nbsend() {
-                        return Some((msg, badge, core::ptr::null_mut()));
+                        return Ok(Some((msg, badge, core::ptr::null_mut())));
                     }
 
                     if !(*current).bound_notification.is_null() {
-                        let ntfn = &mut *((*current).bound_notification
-                            as *mut super::Notification);
+                        let ntfn =
+                            &mut *((*current).bound_notification as *mut super::Notification);
                         ntfn.ntfn_lock();
                         let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
                         ntfn.ntfn_unlock();
                         if bits != 0 {
-                            return Some((Message::empty(), bits, core::ptr::null_mut()));
+                            return Ok(Some((Message::empty(), bits, core::ptr::null_mut())));
                         }
                     }
 
@@ -1083,8 +1647,8 @@ impl Endpoint {
                     super::block_current_thread_no_switch(current, BlockedReason::RecvBlocked);
 
                     if !(*current).bound_notification.is_null() {
-                        let ntfn = &mut *((*current).bound_notification
-                            as *mut super::Notification);
+                        let ntfn =
+                            &mut *((*current).bound_notification as *mut super::Notification);
                         ntfn.ntfn_lock();
                         let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
                         ntfn.ntfn_unlock();
@@ -1093,18 +1657,18 @@ impl Endpoint {
                             (*current).blocked_reason = None;
                             (*current).blocked_endpoint = core::ptr::null_mut();
                             (*current).state = ThreadState::Running;
-                            return Some((Message::empty(), bits, core::ptr::null_mut()));
+                            return Ok(Some((Message::empty(), bits, core::ptr::null_mut())));
                         }
                     }
 
-                    None
+                    Ok(None)
                 }
             }
         }
     }
 
     /// Receive message (blocks until sender ready)
-    pub fn recv(&mut self) -> (Message, u64) {
+    pub fn recv(&mut self) -> Result<(Message, u64), SyscallError> {
         unsafe {
             self.ep_lock();
             let current = get_scheduler().current();
@@ -1112,18 +1676,25 @@ impl Endpoint {
             // Clear stale reply capability
             if !(*current).reply_tcb.is_null() {
                 crate::sched::pip::pip_undonate(current, (*current).reply_tcb);
-                (*current).reply_tcb = core::ptr::null_mut();
+                Tcb::release_tcb_ref((*current).clear_reply_tcb());
                 (*current).reply_can_grant = false;
             }
 
             Self::cache_receive_slot(current);
 
-            if let Some((msg, badge, wake)) = self.recv_inner(current) {
+            let ready = match self.recv_inner(current) {
+                Ok(v) => v,
+                Err(err) => {
+                    self.ep_unlock();
+                    return Err(err);
+                }
+            };
+            if let Some((msg, badge, wake)) = ready {
                 self.ep_unlock();
                 if !wake.is_null() {
                     get_scheduler().enqueue(wake);
                 }
-                return (msg, badge);
+                return Ok((msg, badge));
             }
 
             // Blocked — release lock, then reschedule
@@ -1133,16 +1704,15 @@ impl Endpoint {
             // Check wake source: notification (consume bits) or IPC (saved msg)
             if (*current).woken_by_notification {
                 (*current).woken_by_notification = false;
-                let ntfn = &mut *((*current).bound_notification
-                    as *mut super::Notification);
+                let ntfn = &mut *((*current).bound_notification as *mut super::Notification);
                 ntfn.ntfn_lock();
                 let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
                 ntfn.ntfn_unlock();
-                (super::Message::empty(), bits)
+                Ok((super::Message::empty(), bits))
             } else {
                 let msg = (*current).saved_caller_msg;
                 let badge = (*current).saved_caller_badge;
-                (msg, badge)
+                Ok((msg, badge))
             }
         }
     }
@@ -1157,7 +1727,7 @@ impl Endpoint {
     /// - `0` = normal reply from server
     /// - `1` = interrupted from CallSendBlocked (server never received; safe to retry)
     /// - `2` = interrupted from ReplyWait (server received; reply lost)
-    pub fn call(&mut self, msg: &Message, badge: u64) -> (Message, u8) {
+    pub fn call(&mut self, msg: &Message, badge: u64) -> Result<(Message, u8), SyscallError> {
         unsafe {
             self.ep_lock();
             let current = get_scheduler().current();
@@ -1172,41 +1742,50 @@ impl Endpoint {
                             self.send_queue.push(current);
                             self.state = EndpointState::SendBlocked;
                             (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
-                            super::block_current_thread_no_switch(current, BlockedReason::CallSendBlocked { msg: *msg, badge });
+                            super::block_current_thread_no_switch(
+                                current,
+                                BlockedReason::CallSendBlocked { msg: *msg, badge },
+                            );
                             self.ep_unlock();
                             get_scheduler().reschedule();
                             let intr = if (*current).woken_by_notification {
                                 (*current).woken_by_notification = false;
                                 1 // CallSendBlocked — server never received
-                            } else { 0 };
-                            return ((*current).saved_caller_msg, intr);
+                            } else {
+                                0
+                            };
+                            return Ok(((*current).saved_caller_msg, intr));
                         }
                     };
 
-                    // Block caller BEFORE waking receiver
-                    (*current).state = ThreadState::Blocked;
-                    (*current).blocked_reason = Some(BlockedReason::ReplyWait {
-                        msg: *msg,
-                        badge,
-                    });
-
-                    (*receiver).reply_tcb = current;
-                    (*receiver).reply_can_grant = true;
-                    crate::sched::pip::pip_donate(current, receiver);
-
-                    if self.recv_queue.is_empty() {
-                        self.state = EndpointState::Idle;
+                    let recv_queue_empty = self.recv_queue.is_empty();
+                    if let Err(err) = self.transfer_message_checked(current, receiver, msg, badge) {
+                        self.restore_single_recv_wait(receiver);
+                        self.ep_unlock();
+                        return Err(err);
                     }
 
-                    if matches!((*receiver).blocked_reason, Some(BlockedReason::RecvTimedBlocked)) {
+                    if matches!(
+                        (*receiver).blocked_reason,
+                        Some(BlockedReason::RecvTimedBlocked)
+                    ) {
                         crate::sched::sleep_queue::remove(receiver);
                         (*receiver).timer_wakeup_ns = 0;
                     }
 
+                    // Block caller BEFORE waking receiver.
+                    (*current).state = ThreadState::Blocked;
+                    (*current).blocked_reason = Some(BlockedReason::ReplyWait { msg: *msg, badge });
+                    (*receiver).set_reply_tcb(current);
+                    (*receiver).reply_can_grant = true;
+                    crate::sched::pip::pip_donate(current, receiver);
+                    self.state = if recv_queue_empty {
+                        EndpointState::Idle
+                    } else {
+                        EndpointState::RecvBlocked
+                    };
                     (*receiver).blocked_reason = None;
                     (*receiver).blocked_endpoint = core::ptr::null_mut();
-
-                    self.transfer_message(current, receiver, msg, badge);
 
                     let wake_receiver = (*receiver).state != ThreadState::Inactive;
                     if wake_receiver {
@@ -1222,28 +1801,35 @@ impl Endpoint {
                     let intr = if (*current).woken_by_notification {
                         (*current).woken_by_notification = false;
                         2 // ReplyWait — server received, reply lost
-                    } else { 0 };
-                    ((*current).saved_caller_msg, intr)
+                    } else {
+                        0
+                    };
+                    Ok(((*current).saved_caller_msg, intr))
                 }
                 EndpointState::Idle | EndpointState::SendBlocked => {
                     self.send_queue.push(current);
                     self.state = EndpointState::SendBlocked;
                     (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
-                    super::block_current_thread_no_switch(current, BlockedReason::CallSendBlocked { msg: *msg, badge });
+                    super::block_current_thread_no_switch(
+                        current,
+                        BlockedReason::CallSendBlocked { msg: *msg, badge },
+                    );
                     self.ep_unlock();
                     get_scheduler().reschedule();
                     let intr = if (*current).woken_by_notification {
                         (*current).woken_by_notification = false;
                         1 // CallSendBlocked — server never received
-                    } else { 0 };
-                    ((*current).saved_caller_msg, intr)
+                    } else {
+                        0
+                    };
+                    Ok(((*current).saved_caller_msg, intr))
                 }
             }
         }
     }
 
     /// Reply to saved caller and receive next message
-    pub fn reply_recv(&mut self, reply: &Message) -> (Message, u64) {
+    pub fn reply_recv(&mut self, reply: &Message) -> Result<(Message, u64), SyscallError> {
         unsafe {
             self.ep_lock();
             let current = get_scheduler().current();
@@ -1256,21 +1842,25 @@ impl Endpoint {
                 let caller_replyable = (*caller).state == ThreadState::Blocked
                     && matches!(
                         (*caller).blocked_reason,
-                        Some(BlockedReason::ReplyWait { .. }) | Some(BlockedReason::FaultBlocked { .. })
+                        Some(BlockedReason::ReplyWait { .. })
+                            | Some(BlockedReason::FaultBlocked { .. })
                     );
 
                 if caller_replyable {
-                    crate::sched::pip::pip_undonate(current, caller);
-
-                    if (*current).reply_can_grant {
-                        self.transfer_message(current, caller, reply, 0);
+                    let reply_result = if (*current).reply_can_grant {
+                        self.transfer_message_checked(current, caller, reply, 0)
                     } else {
                         let mut no_grant_reply = *reply;
                         no_grant_reply.extra_caps = 0;
                         no_grant_reply.caps = [0; 4];
-                        self.transfer_message(current, caller, &no_grant_reply, 0);
+                        self.transfer_message_checked(current, caller, &no_grant_reply, 0)
+                    };
+                    if let Err(err) = reply_result {
+                        self.ep_unlock();
+                        return Err(err);
                     }
 
+                    crate::sched::pip::pip_undonate(current, caller);
                     (*caller).blocked_reason = None;
                     (*caller).state = ThreadState::Ready;
                     wake_caller = caller;
@@ -1278,12 +1868,23 @@ impl Endpoint {
 
                 (*current).reply_tcb = core::ptr::null_mut();
                 (*current).reply_can_grant = false;
+                Tcb::release_tcb_ref(caller);
             }
 
             // ---- RECV PHASE ----
             Self::cache_receive_slot(current);
 
-            if let Some((msg, badge, wake_sender)) = self.recv_inner(current) {
+            let ready = match self.recv_inner(current) {
+                Ok(v) => v,
+                Err(err) => {
+                    self.ep_unlock();
+                    if !wake_caller.is_null() {
+                        get_scheduler().enqueue(wake_caller);
+                    }
+                    return Err(err);
+                }
+            };
+            if let Some((msg, badge, wake_sender)) = ready {
                 self.ep_unlock();
                 // Wake caller and/or sender outside lock
                 if !wake_caller.is_null() {
@@ -1292,7 +1893,7 @@ impl Endpoint {
                 if !wake_sender.is_null() {
                     get_scheduler().enqueue(wake_sender);
                 }
-                return (msg, badge);
+                return Ok((msg, badge));
             }
 
             // Blocked — release lock, wake caller, reschedule
@@ -1303,10 +1904,9 @@ impl Endpoint {
             get_scheduler().reschedule();
 
             // Check wake source: notification or IPC
-            let (msg, badge) = if (*current).woken_by_notification {
+            let result = if (*current).woken_by_notification {
                 (*current).woken_by_notification = false;
-                let ntfn = &mut *((*current).bound_notification
-                    as *mut super::Notification);
+                let ntfn = &mut *((*current).bound_notification as *mut super::Notification);
                 ntfn.ntfn_lock();
                 let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
                 ntfn.ntfn_unlock();
@@ -1314,7 +1914,7 @@ impl Endpoint {
             } else {
                 ((*current).saved_caller_msg, (*current).saved_caller_badge)
             };
-            (msg, badge)
+            Ok(result)
         }
     }
 
@@ -1371,19 +1971,12 @@ impl Endpoint {
                         continue;
                     }
 
-                    // Look up receiver's CNode
-                    let recv_cspace = &*(*receiver).cspace_root;
-                    let recv_cnode_cap = match recv_cspace.get(recv_cnode_ptr as usize) {
-                        Some(c) => c,
-                        None => continue,
-                    };
-
-                    if recv_cnode_cap.obj_type != crate::cap::ObjectType::CNode {
-                        continue;
-                    }
-
-                    let recv_cnode = &mut *(recv_cnode_cap.object as *mut crate::cap::CNode);
-                    let dest_slot = (recv_index + i) as usize;
+                    let (recv_cnode, dest_slot) =
+                        match Self::resolve_receive_cnode_locked(receiver, i) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                    let recv_cnode = &mut *recv_cnode;
 
                     // Copy capability into receiver's CNode
                     let _ = recv_cnode.copy_slot(
@@ -1435,7 +2028,7 @@ impl Endpoint {
                         }
                     };
 
-                    (*receiver).reply_tcb = faulting_tcb;
+                    (*receiver).set_reply_tcb(faulting_tcb);
                     (*receiver).reply_can_grant = false;
 
                     if self.recv_queue.is_empty() {
@@ -1445,7 +2038,12 @@ impl Endpoint {
                     (*receiver).blocked_reason = None;
                     (*receiver).blocked_endpoint = core::ptr::null_mut();
 
-                    self.transfer_message(faulting_tcb, receiver, msg, (*faulting_tcb).fault_handler_badge);
+                    self.transfer_message(
+                        faulting_tcb,
+                        receiver,
+                        msg,
+                        (*faulting_tcb).fault_handler_badge,
+                    );
 
                     let wake = (*receiver).state != ThreadState::Inactive;
                     if wake {
@@ -1507,9 +2105,7 @@ impl Endpoint {
         recv_wait_unlock();
     }
 
-    pub(crate) unsafe fn fastpath_finish_recv_locked(
-        link: *mut RecvWaitLink,
-    ) -> (*mut Tcb, u16) {
+    pub(crate) unsafe fn fastpath_finish_recv_locked(link: *mut RecvWaitLink) -> (*mut Tcb, u16) {
         unsafe {
             let receiver = (*link).tcb;
             let selected = (*link).wait_index;
@@ -1549,7 +2145,12 @@ impl Endpoint {
     ///
     /// Returns 0 on success, `SyscallError::Cancelled` (12) on timeout.
     /// Uses dual-queue pattern: thread is in both endpoint send queue and sleep queue.
-    pub fn send_timeout(&mut self, msg: &Message, badge: u64, timeout_ns: u64) -> u64 {
+    pub fn send_timeout(
+        &mut self,
+        msg: &Message,
+        badge: u64,
+        timeout_ns: u64,
+    ) -> Result<u64, SyscallError> {
         unsafe {
             self.ep_lock();
             let current = get_scheduler().current();
@@ -1560,23 +2161,31 @@ impl Endpoint {
                         Some((r, _selected)) => r,
                         None => {
                             self.state = EndpointState::Idle;
-                            return self.send_timeout_slowpath(current, msg, badge, timeout_ns);
+                            return Ok(self.send_timeout_slowpath(current, msg, badge, timeout_ns));
                         }
                     };
 
-                    if self.recv_queue.is_empty() {
-                        self.state = EndpointState::Idle;
+                    let recv_queue_empty = self.recv_queue.is_empty();
+                    if let Err(err) = self.transfer_message_checked(current, receiver, msg, badge) {
+                        self.restore_single_recv_wait(receiver);
+                        self.ep_unlock();
+                        return Err(err);
                     }
 
-                    if matches!((*receiver).blocked_reason, Some(BlockedReason::RecvTimedBlocked)) {
+                    if matches!(
+                        (*receiver).blocked_reason,
+                        Some(BlockedReason::RecvTimedBlocked)
+                    ) {
                         crate::sched::sleep_queue::remove(receiver);
                         (*receiver).timer_wakeup_ns = 0;
                     }
-
+                    self.state = if recv_queue_empty {
+                        EndpointState::Idle
+                    } else {
+                        EndpointState::RecvBlocked
+                    };
                     (*receiver).blocked_reason = None;
                     (*receiver).blocked_endpoint = core::ptr::null_mut();
-
-                    self.transfer_message(current, receiver, msg, badge);
 
                     let wake = (*receiver).state != ThreadState::Inactive;
                     if wake {
@@ -1586,10 +2195,10 @@ impl Endpoint {
                     if wake {
                         get_scheduler().enqueue(receiver);
                     }
-                    0 // success
+                    Ok(0)
                 }
                 EndpointState::Idle | EndpointState::SendBlocked => {
-                    self.send_timeout_slowpath(current, msg, badge, timeout_ns)
+                    Ok(self.send_timeout_slowpath(current, msg, badge, timeout_ns))
                 }
             }
         }
@@ -1608,10 +2217,7 @@ impl Endpoint {
             self.send_queue.push(current);
             self.state = EndpointState::SendBlocked;
             (*current).blocked_endpoint = self as *mut Endpoint as *mut u8;
-            (*current).blocked_reason = Some(BlockedReason::SendTimedBlocked {
-                msg: *msg,
-                badge,
-            });
+            (*current).blocked_reason = Some(BlockedReason::SendTimedBlocked { msg: *msg, badge });
             (*current).state = ThreadState::Blocked;
             (*current).futex_wakeup_result = 0;
 
@@ -1629,14 +2235,14 @@ impl Endpoint {
     ///
     /// Returns `(msg, badge, result)` where result is 0 on success or
     /// `SyscallError::Cancelled` (12) on timeout.
-    pub fn recv_timeout(&mut self, timeout_ns: u64) -> (Message, u64, u64) {
+    pub fn recv_timeout(&mut self, timeout_ns: u64) -> Result<(Message, u64, u64), SyscallError> {
         unsafe {
             self.ep_lock();
             let current = get_scheduler().current();
 
             if !(*current).reply_tcb.is_null() {
                 crate::sched::pip::pip_undonate(current, (*current).reply_tcb);
-                (*current).reply_tcb = core::ptr::null_mut();
+                Tcb::release_tcb_ref((*current).clear_reply_tcb());
                 (*current).reply_can_grant = false;
             }
 
@@ -1648,47 +2254,54 @@ impl Endpoint {
                         Some(s) => s,
                         None => {
                             self.state = EndpointState::Idle;
-                            return self.recv_timeout_slowpath(current, timeout_ns);
+                            return Ok(self.recv_timeout_slowpath(current, timeout_ns));
                         }
                     };
 
                     let (msg, badge, keep_blocked) = match (*sender).blocked_reason {
                         Some(BlockedReason::SendBlocked { msg, badge }) => (msg, badge, false),
-                        Some(BlockedReason::SendTimedBlocked { msg, badge }) => {
-                            crate::sched::sleep_queue::remove(sender);
-                            (*sender).timer_wakeup_ns = 0;
-                            (msg, badge, false)
-                        }
+                        Some(BlockedReason::SendTimedBlocked { msg, badge }) => (msg, badge, false),
                         Some(BlockedReason::FaultBlocked { msg, badge }) => (msg, badge, true),
                         Some(BlockedReason::CallSendBlocked { msg, badge }) => (msg, badge, true),
                         _ => (Message::empty(), 0, false),
                     };
 
-                    if self.send_queue.is_empty() {
-                        self.state = EndpointState::Idle;
+                    let send_queue_empty = self.send_queue.is_empty();
+                    if let Err(err) = self.transfer_message_checked(sender, current, &msg, badge) {
+                        self.send_queue.push_front(sender);
+                        self.state = EndpointState::SendBlocked;
+                        return Err(err);
                     }
-
-                    self.transfer_message(sender, current, &msg, badge);
+                    self.state = if send_queue_empty {
+                        EndpointState::Idle
+                    } else {
+                        EndpointState::SendBlocked
+                    };
 
                     if keep_blocked {
-                        (*current).reply_tcb = sender;
+                        if matches!(
+                            (*sender).blocked_reason,
+                            Some(BlockedReason::CallSendBlocked { .. })
+                        ) {
+                            (*sender).blocked_reason =
+                                Some(BlockedReason::ReplyWait { msg, badge });
+                        }
+                        (*current).set_reply_tcb(sender);
                         (*current).reply_can_grant = !matches!(
                             (*sender).blocked_reason,
                             Some(BlockedReason::FaultBlocked { .. })
                         );
                         crate::sched::pip::pip_donate(sender, current);
                         (*sender).blocked_endpoint = core::ptr::null_mut();
-                        if matches!(
-                            (*sender).blocked_reason,
-                            Some(BlockedReason::CallSendBlocked { .. })
-                        ) {
-                            (*sender).blocked_reason = Some(BlockedReason::ReplyWait {
-                                msg,
-                                badge,
-                            });
-                        }
                         self.ep_unlock();
                     } else {
+                        if matches!(
+                            (*sender).blocked_reason,
+                            Some(BlockedReason::SendTimedBlocked { .. })
+                        ) {
+                            crate::sched::sleep_queue::remove(sender);
+                            (*sender).timer_wakeup_ns = 0;
+                        }
                         (*sender).state = ThreadState::Ready;
                         (*sender).blocked_reason = None;
                         (*sender).blocked_endpoint = core::ptr::null_mut();
@@ -1696,27 +2309,27 @@ impl Endpoint {
                         get_scheduler().enqueue(sender);
                     }
 
-                    (msg, badge, 0)
+                    Ok((msg, badge, 0))
                 }
                 EndpointState::Idle | EndpointState::RecvBlocked => {
                     if let Some((msg, badge)) = self.dequeue_nbsend() {
                         self.ep_unlock();
-                        return (msg, badge, 0);
+                        return Ok((msg, badge, 0));
                     }
 
                     if !(*current).bound_notification.is_null() {
-                        let ntfn = &mut *((*current).bound_notification
-                            as *mut super::Notification);
+                        let ntfn =
+                            &mut *((*current).bound_notification as *mut super::Notification);
                         ntfn.ntfn_lock();
                         let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
                         ntfn.ntfn_unlock();
                         if bits != 0 {
                             self.ep_unlock();
-                            return (Message::empty(), bits, 0);
+                            return Ok((Message::empty(), bits, 0));
                         }
                     }
 
-                    self.recv_timeout_slowpath(current, timeout_ns)
+                    Ok(self.recv_timeout_slowpath(current, timeout_ns))
                 }
             }
         }
@@ -1741,8 +2354,7 @@ impl Endpoint {
             (*current).woken_by_notification = false;
 
             if !(*current).bound_notification.is_null() {
-                let ntfn = &mut *((*current).bound_notification
-                    as *mut super::Notification);
+                let ntfn = &mut *((*current).bound_notification as *mut super::Notification);
                 ntfn.ntfn_lock();
                 let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
                 ntfn.ntfn_unlock();
@@ -1764,8 +2376,7 @@ impl Endpoint {
 
             if (*current).woken_by_notification {
                 (*current).woken_by_notification = false;
-                let ntfn = &mut *((*current).bound_notification
-                    as *mut super::Notification);
+                let ntfn = &mut *((*current).bound_notification as *mut super::Notification);
                 ntfn.ntfn_lock();
                 let bits = ntfn.bits.swap(0, core::sync::atomic::Ordering::SeqCst);
                 ntfn.ntfn_unlock();
@@ -1797,7 +2408,10 @@ impl Endpoint {
             // Wake all blocked senders
             while let Some(sender) = self.send_queue.pop() {
                 // Remove timed senders from sleep queue
-                if matches!((*sender).blocked_reason, Some(BlockedReason::SendTimedBlocked { .. })) {
+                if matches!(
+                    (*sender).blocked_reason,
+                    Some(BlockedReason::SendTimedBlocked { .. })
+                ) {
                     crate::sched::sleep_queue::remove(sender);
                     (*sender).timer_wakeup_ns = 0;
                 }
@@ -1813,7 +2427,10 @@ impl Endpoint {
                 let receiver = (*link).tcb;
                 Self::remove_all_recv_waits_locked(receiver, RECV_WAIT_SELECTED_NONE, link);
                 // Remove timed receivers from sleep queue
-                if matches!((*receiver).blocked_reason, Some(BlockedReason::RecvTimedBlocked)) {
+                if matches!(
+                    (*receiver).blocked_reason,
+                    Some(BlockedReason::RecvTimedBlocked)
+                ) {
                     crate::sched::sleep_queue::remove(receiver);
                     (*receiver).timer_wakeup_ns = 0;
                 }

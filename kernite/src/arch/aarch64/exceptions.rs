@@ -500,7 +500,7 @@ fn finish_el0_fault(msg: &crate::ipc::Message) {
             (*current).blocked_reason = None;
             (*current).blocked_endpoint = core::ptr::null_mut();
             (*current).blocked_notification = core::ptr::null_mut();
-            (*current).reply_tcb = core::ptr::null_mut();
+            crate::sched::thread::Tcb::release_tcb_ref((*current).clear_reply_tcb());
         }
 
         scheduler.reschedule();

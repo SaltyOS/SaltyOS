@@ -382,6 +382,28 @@ impl<V: Copy + 'static> MapleTree<V> {
         }
     }
 
+    pub unsafe fn replace(&mut self, start: u64, value: V) -> bool {
+        if self.root.is_null() {
+            return false;
+        }
+        let leaf = unsafe { self.find_leaf(start) };
+        if leaf.is_null() {
+            return false;
+        }
+
+        unsafe {
+            let count = hdr(leaf).count as usize;
+            for i in 0..count {
+                if leaf_pivot(leaf, i) == start {
+                    leaf_val_set(leaf, i, Self::SLOTS, value);
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     unsafe fn propagate_split<A: NodeAllocator>(
         &mut self, left: *mut u8, pivot: u64, right: *mut u8, alloc: &mut A,
     ) -> bool {

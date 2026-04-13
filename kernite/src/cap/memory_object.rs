@@ -121,6 +121,38 @@ impl ReverseMaps {
         false
     }
 
+    pub fn ensure_slot(&mut self, mo: *mut MemoryObject) -> bool {
+        let count = self.inline_count as usize;
+        if count < RMAP_INLINE {
+            return true;
+        }
+
+        let mut page = self.overflow;
+        while !page.is_null() {
+            let p = unsafe { &mut *page };
+            for slot in p.entries.iter() {
+                if slot.is_empty() {
+                    return true;
+                }
+            }
+            page = p.next;
+        }
+
+        let owner = crate::mm::frame::FrameOwner::MoMeta {
+            mo,
+            subkind: crate::mm::frame::MoMetaKind::Rmap,
+        };
+        let Some(phys) = crate::mm::pmm_alloc(&owner) else {
+            return false;
+        };
+        let page_ptr = crate::mm::phys_to_virt(phys) as *mut ReverseMapPage;
+        unsafe {
+            core::ptr::write_bytes(page_ptr as *mut u8, 0, crate::mm::PAGE_SIZE);
+            self.add_overflow_page(page_ptr);
+        }
+        true
+    }
+
     /// # Safety
     /// `page_ptr` must point to a zeroed PMM page.
     pub unsafe fn add_overflow_page(&mut self, page_ptr: *mut ReverseMapPage) {
@@ -152,6 +184,32 @@ impl ReverseMaps {
             }
             page = p.next;
         }
+    }
+
+    pub fn replace(
+        &mut self,
+        vspace: *mut crate::mm::vspace::VSpace,
+        va_start: u64,
+        entry: ReverseMapEntry,
+    ) -> bool {
+        for i in 0..self.inline_count as usize {
+            if self.inline[i].vspace == vspace && self.inline[i].va_start == va_start {
+                self.inline[i] = entry;
+                return true;
+            }
+        }
+        let mut page = self.overflow;
+        while !page.is_null() {
+            let p = unsafe { &mut *page };
+            for slot in p.entries.iter_mut() {
+                if slot.vspace == vspace && slot.va_start == va_start {
+                    *slot = entry;
+                    return true;
+                }
+            }
+            page = p.next;
+        }
+        false
     }
 
     pub fn for_each<F: FnMut(&ReverseMapEntry)>(&self, f: &mut F) {
@@ -388,7 +446,15 @@ impl MemoryObject {
     /// The radix tree traversal (`pages.for_each`) is safe because
     /// refcount==0 guarantees no concurrent commit/resolve operations.
     pub unsafe fn destroy(&mut self) {
-        // 1. Walk reverse maps: unmap all PTEs in all observing VSpaces
+        // 1. Walk reverse maps: unmap all PTEs in all observing VSpaces.
+        //    Collect VSpace pointers for deferred refcount release — we cannot
+        //    call release_object(VSpace) inside the for_each closure because
+        //    VSpace::cleanup() acquires VSpace.lock, and we already hold it
+        //    for the unmap operations.
+        const VS_BATCH: usize = 32;
+        let mut vs_batch: [*mut crate::mm::VSpace; VS_BATCH] = [core::ptr::null_mut(); VS_BATCH];
+        let mut vs_count: usize = 0;
+
         unsafe {
             self.reverse_maps.for_each(&mut |entry| {
                 if entry.vspace.is_null() {
@@ -411,7 +477,22 @@ impl MemoryObject {
                 }
                 vspace.lock.unlock();
                 crate::mm::restore_irq(irq);
+
+                // Collect for deferred refcount release
+                if vs_count < VS_BATCH {
+                    vs_batch[vs_count] = entry.vspace;
+                    vs_count += 1;
+                }
             });
+        }
+
+        // Release VSpace refcounts after all rmap walks (no VSpace.lock held)
+        for i in 0..vs_count {
+            if !vs_batch[i].is_null() {
+                unsafe {
+                    super::release_object(vs_batch[i] as *mut KernelObject, ObjectType::VSpace);
+                }
+            }
         }
 
         // 2. Free all pages in the radix tree.

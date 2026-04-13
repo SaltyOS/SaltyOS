@@ -17,11 +17,13 @@ pub use cdt::CDT;
 pub use cnode::{CNode, CapError, CapRef};
 pub use object::{KernelObject, ObjectType};
 pub use refcount::{increment_refcount, release_object};
+pub(crate) use refcount::destroy_object_deferred;
 pub use slot::{
     alloc_slot, free_slot, get_cap, get_cap_mut, get_meta, get_meta_mut, nullify_capability,
     CapSlot, INVALID_SLOT,
 };
 pub use ioport::IoPortRange;
+pub(crate) use untyped::UntypedTracker;
 pub use untyped::{FrameObject, UntypedMemory};
 
 /// Capability rights bitmap
