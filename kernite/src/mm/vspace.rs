@@ -3084,7 +3084,11 @@ impl VSpace {
         unsafe {
             if !self.tracking.is_null() {
                 let t = &mut *self.tracking;
-                t.mappings.for_each(&mut |_start, vma| unsafe {
+                let self_ptr = self as *mut VSpace;
+                t.mappings.for_each(&mut |start, vma| unsafe {
+                    if !vma.mo.is_null() {
+                        (*vma.mo).reverse_maps.remove(self_ptr, start);
+                    }
                     vma.release_mo_ref();
                 });
                 let mut tree_alloc = crate::mm::node_alloc::PmmNodeAllocator {

@@ -446,15 +446,10 @@ impl MemoryObject {
     /// The radix tree traversal (`pages.for_each`) is safe because
     /// refcount==0 guarantees no concurrent commit/resolve operations.
     pub unsafe fn destroy(&mut self) {
-        // 1. Walk reverse maps: unmap all PTEs in all observing VSpaces.
-        //    Collect VSpace pointers for deferred refcount release — we cannot
-        //    call release_object(VSpace) inside the for_each closure because
-        //    VSpace::cleanup() acquires VSpace.lock, and we already hold it
-        //    for the unmap operations.
-        const VS_BATCH: usize = 32;
-        let mut vs_batch: [*mut crate::mm::VSpace; VS_BATCH] = [core::ptr::null_mut(); VS_BATCH];
-        let mut vs_count: usize = 0;
-
+        // 1. Walk reverse maps: unmap all PTEs in all still-live observing
+        //    VSpaces. VSpace::cleanup() removes its observer entries before it
+        //    drops VmArea MO refs, so stale reverse-map pointers must not remain
+        //    here by the time an MO reaches destroy().
         unsafe {
             self.reverse_maps.for_each(&mut |entry| {
                 if entry.vspace.is_null() {
@@ -477,22 +472,7 @@ impl MemoryObject {
                 }
                 vspace.lock.unlock();
                 crate::mm::restore_irq(irq);
-
-                // Collect for deferred refcount release
-                if vs_count < VS_BATCH {
-                    vs_batch[vs_count] = entry.vspace;
-                    vs_count += 1;
-                }
             });
-        }
-
-        // Release VSpace refcounts after all rmap walks (no VSpace.lock held)
-        for i in 0..vs_count {
-            if !vs_batch[i].is_null() {
-                unsafe {
-                    super::release_object(vs_batch[i] as *mut KernelObject, ObjectType::VSpace);
-                }
-            }
         }
 
         // 2. Free all pages in the radix tree.
