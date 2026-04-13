@@ -15,6 +15,118 @@
 use core::cmp::Ordering;
 
 // ---------------------------------------------------------------------------
+// C memory/string builtins
+// ---------------------------------------------------------------------------
+
+#[cfg(trona_mem_builtins)]
+
+/// memset implementation
+///
+/// # Safety
+/// Caller must ensure dest points to valid memory of at least n bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
+    let c = c as u8;
+    unsafe {
+        let mut i = 0;
+        while i < n {
+            *dest.add(i) = c;
+            i += 1;
+        }
+    }
+    dest
+}
+
+#[cfg(trona_mem_builtins)]
+/// memcpy implementation
+///
+/// # Safety
+/// Caller must ensure src and dest point to valid non-overlapping memory.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    unsafe {
+        let mut i = 0;
+        while i < n {
+            *dest.add(i) = *src.add(i);
+            i += 1;
+        }
+    }
+    dest
+}
+
+#[cfg(trona_mem_builtins)]
+/// memmove implementation (handles overlapping regions)
+///
+/// # Safety
+/// Caller must ensure src and dest point to valid memory.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    unsafe {
+        if (dest as usize) < (src as usize) {
+            let mut i = 0;
+            while i < n {
+                *dest.add(i) = *src.add(i);
+                i += 1;
+            }
+        } else {
+            let mut i = n;
+            while i > 0 {
+                i -= 1;
+                *dest.add(i) = *src.add(i);
+            }
+        }
+    }
+    dest
+}
+
+#[cfg(trona_mem_builtins)]
+/// memcmp implementation
+///
+/// # Safety
+/// Caller must ensure s1 and s2 point to valid memory of at least n bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
+    unsafe {
+        let mut i = 0;
+        while i < n {
+            let a = *s1.add(i);
+            let b = *s2.add(i);
+            if a != b {
+                return (a as i32) - (b as i32);
+            }
+            i += 1;
+        }
+    }
+    0
+}
+
+#[cfg(trona_mem_builtins)]
+/// bcmp implementation (like memcmp but only returns 0 or non-zero)
+///
+/// # Safety
+/// Caller must ensure s1 and s2 point to valid memory of at least n bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
+    unsafe { memcmp(s1, s2, n) }
+}
+
+#[cfg(trona_mem_builtins)]
+/// strlen implementation
+///
+/// # Safety
+/// Caller must ensure s points to a valid null-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
+    unsafe {
+        let mut len = 0;
+        while *s.add(len) != 0 {
+            len += 1;
+        }
+        len
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Integer helper types
 // ---------------------------------------------------------------------------
 

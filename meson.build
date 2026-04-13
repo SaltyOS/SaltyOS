@@ -188,9 +188,11 @@ if build_userland
   subdir('userland')
 endif
 
-# Port host tools — always built (needed by `just port`, `just clean-ports`)
-subdir('tools/port')
-subdir('tools/pkg')
+# Port host tools — only when ports are enabled (requires host std for rustc)
+if get_option('build_ports')
+  subdir('tools/port')
+  subdir('tools/pkg')
+endif
 
 # Generate cross-compilation sysroot from build outputs.
 # Ports depend on this to find headers, libraries, and linker scripts.
@@ -204,17 +206,15 @@ if build_userland
       mksysroot_prog,
       '--build-dir', meson.project_build_root(),
       '--output', meson.project_build_root() / 'sysroot',
-      '--clean', '-v',
+      '-v',
       '--stamp', '@OUTPUT@',
     ],
-    build_by_default: false,
+    build_by_default: true,
   )
 endif
 
-# Ports metadata/targets are always defined with userland. Individual port
-# targets are only built by default when -Dbuild_ports=true, but rootfs/image
-# targets may depend on specific runtime ports (e.g. bash).
-if build_userland
+# Ports metadata/targets — only when ports are enabled.
+if build_userland and get_option('build_ports')
   subdir('ports')
 endif
 if not is_variable('port_depends')
@@ -319,9 +319,21 @@ if build_userland and mkcpio.found()
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
+  stripped_vfs_stress_elf = custom_target('stripped_vfs_stress_elf',
+    input: vfs_stress_elf_elf,
+    output: 'vfs_stress_elf.stripped.elf',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
   stripped_posix_getty_elf = custom_target('stripped_posix_getty_elf',
     input: posix_getty_elf,
     output: 'posix_getty.stripped.elf',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+  stripped_posix_login_elf = custom_target('stripped_posix_login_elf',
+    input: posix_login_elf,
+    output: 'posix_login.stripped.elf',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
@@ -346,6 +358,12 @@ if build_userland and mkcpio.found()
   initrd_mmsrv_elf = custom_target('initrd_mmsrv_elf',
     input: mmsrv_elf,
     output: 'mmsrv.initrd.elf',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+  initrd_rsrcsrv_elf = custom_target('initrd_rsrcsrv_elf',
+    input: rsrcsrv_elf,
+    output: 'rsrcsrv.initrd.elf',
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
@@ -379,13 +397,28 @@ if build_userland and mkcpio.found()
     command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
     build_by_default: true,
   )
+  stripped_vfs_stress_pe_exe = custom_target('stripped_vfs_stress_pe_exe',
+    input: vfs_stress_pe_exe,
+    output: 'vfs_stress_pe.stripped.exe',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
+  stripped_console_stress_pe_exe = custom_target('stripped_console_stress_pe_exe',
+    input: console_stress_pe_exe,
+    output: 'console_stress_pe.stripped.exe',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: true,
+  )
 
   # Service definition files
   svc_console = files('userland/services/console.service')
   svc_namesrv = files('userland/services/namesrv.service')
   svc_mmsrv = files('userland/services/mmsrv.service')
+  svc_rsrcsrv = files('userland/services/rsrcsrv.service')
+  svc_rsrcsrv_target = files('userland/services/rsrcsrv.target')
   svc_vfs = files('userland/services/vfs.service')
   svc_procmgr = files('userland/services/procmgr.service')
+  svc_procmgr_target = files('userland/services/procmgr.target')
   svc_dispdrv = files('userland/services/dispdrv.service')
   svc_posix_ttysrv = files('userland/services/posix_ttysrv.service')
   svc_test_runner = files('userland/services/test_runner.service')
@@ -399,76 +432,34 @@ if build_userland and mkcpio.found()
   svc_win32_csrss = files('userland/services/win32_csrss.service')
   svc_hello_pe = files('userland/services/hello_pe.service')
 
-  # Shared libraries first for minimal library-window mapping.
+  # Initrd CPIO from manifest — the manifest references build output filenames
+  # resolved via --port-dir, and service files via repo-relative paths.
   mkcpio_script = files('tools/mkcpio.py')
-  # Include the renamed late userspace services in initrd as well as rootfs,
-  # so the boot path matches the previous behavior while keeping new names.
+  initramfs_manifest = files('images/initramfs.manifest')
+
   initrd = custom_target('initrd',
-        input: [initrd_rtld_so, initrd_pe_rtld_so, initrd_libtrona_so, initrd_libc_so,
+    input: [initrd_rtld_so, initrd_pe_rtld_so, initrd_libtrona_so, initrd_libc_so,
           initrd_libcxx_so, initrd_kernel32_dll,
           initrd_init_elf, initrd_console_elf, initrd_namesrv_elf,
           initrd_procmgr_elf, initrd_vfs_elf, initrd_mmsrv_elf,
+          initrd_rsrcsrv_elf,
           initrd_pcidrv_elf, initrd_blkdrv_elf, initrd_saltyfs_elf,
           initrd_win32_csrss_elf,
           stripped_dispdrv_elf, stripped_posix_ttysrv_elf, stripped_posix_getty_elf,
           stripped_test_runner_elf, stripped_netdrv_elf, stripped_netsrv_elf,
-          stripped_dnssrv_elf, stripped_hello_pe_exe,
-          svc_console, svc_namesrv, svc_mmsrv,
-          svc_vfs, svc_procmgr, svc_dispdrv,
+          stripped_dnssrv_elf, stripped_hello_pe_exe],
+    depend_files: [mkcpio_script, initramfs_manifest,
+          svc_console, svc_namesrv, svc_mmsrv, svc_rsrcsrv, svc_rsrcsrv_target,
+          svc_vfs, svc_procmgr, svc_procmgr_target, svc_dispdrv,
           svc_posix_ttysrv, svc_test_runner, svc_posix_getty,
           svc_pcidrv, svc_blkdrv, svc_saltyfs, svc_netdrv, svc_netsrv,
           svc_dnssrv, svc_win32_csrss, svc_hello_pe],
-    depend_files: mkcpio_script,
     output: 'initrd.cpio',
     command: [mkcpio,
       '--output', '@OUTPUT@',
-      ] + [
-
-      # Shared libraries and runtime loaders (inputs 0-5)
-      'ld-trona.so=@INPUT0@',
-      'ld-trona-pe.so=@INPUT1@',
-      'libtrona.so=@INPUT2@',
-      'libc.so=@INPUT3@',
-      'libc++.so=@INPUT4@',
-      'kernel32.dll=@INPUT5@',
-      # Early boot services (inputs 6-15)
-      'init=@INPUT6@',
-      'console=@INPUT7@',
-      'namesrv=@INPUT8@',
-      'procmgr=@INPUT9@',
-      'vfs=@INPUT10@',
-      'mmsrv=@INPUT11@',
-      'pcidrv=@INPUT12@',
-      'blkdrv=@INPUT13@',
-      'saltyfs=@INPUT14@',
-      'win32_csrss=@INPUT15@',
-      # Late services mirrored into initrd (inputs 16-23)
-      'dispdrv=@INPUT16@',
-      'posix_ttysrv=@INPUT17@',
-      'posix_getty=@INPUT18@',
-      'test_runner=@INPUT19@',
-      'netdrv=@INPUT20@',
-      'netsrv=@INPUT21@',
-      'dnssrv=@INPUT22@',
-      'hello_pe=@INPUT23@',
-      # Service definitions (inputs 24-40)
-      'services/console.service=@INPUT24@',
-      'services/namesrv.service=@INPUT25@',
-      'services/mmsrv.service=@INPUT26@',
-      'services/vfs.service=@INPUT27@',
-      'services/procmgr.service=@INPUT28@',
-      'services/dispdrv.service=@INPUT29@',
-      'services/posix_ttysrv.service=@INPUT30@',
-      'services/test_runner.service=@INPUT31@',
-      'services/posix_getty.service=@INPUT32@',
-      'services/pcidrv.service=@INPUT33@',
-      'services/blkdrv.service=@INPUT34@',
-      'services/saltyfs.service=@INPUT35@',
-      'services/netdrv.service=@INPUT36@',
-      'services/netsrv.service=@INPUT37@',
-      'services/dnssrv.service=@INPUT38@',
-      'services/win32_csrss.service=@INPUT39@',
-      'services/hello_pe.service=@INPUT40@',
+      '--manifest', initramfs_manifest,
+      '--port-dir', meson.project_build_root(),
+      '--permissions', meson.project_source_root() / 'images' / 'rootfs.permissions',
     ],
     build_by_default: true,
   )
@@ -493,36 +484,96 @@ mksaltyfs_script = files('tools/mksaltyfs.py')
 rootfs_inputs = []
 rootfs_args = []
 if mkrootfs.found() and build_userland
-  # Layer 1 (always): non-initrd userland binaries
+  # Stripped shared libraries for rootfs (separate from initrd targets)
+  rootfs_rtld_so = custom_target('rootfs_rtld_so',
+    input: ld_trona_so,
+    output: 'ld-trona.rootfs.so',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: false,
+  )
+  rootfs_pe_rtld_so = custom_target('rootfs_pe_rtld_so',
+    input: ld_trona_pe_so,
+    output: 'ld-trona-pe.rootfs.so',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: false,
+  )
+  rootfs_libtrona_so = custom_target('rootfs_libtrona_so',
+    input: libtrona_so,
+    output: 'libtrona.rootfs.so',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: false,
+  )
+  rootfs_libc_so = custom_target('rootfs_libc_so',
+    input: libc_so,
+    output: 'libc.rootfs.so',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: false,
+  )
+  rootfs_libcxx_so = custom_target('rootfs_libcxx_so',
+    input: libcxx_so,
+    output: 'libc++.rootfs.so',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: false,
+  )
+  rootfs_kernel32_dll = custom_target('rootfs_kernel32_dll',
+    input: kernel32_dll,
+    output: 'kernel32.rootfs.dll',
+    command: [llvm_strip, '--strip-all', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default: false,
+  )
+
+  # Layer 1 (always): stripped shared libraries + stripped userland binaries
   rootfs_binaries_manifest = custom_target('rootfs_binaries_manifest',
-    input: [stripped_dispdrv_elf, stripped_posix_ttysrv_elf, stripped_posix_getty_elf,
-            stripped_test_runner_elf,
-            stripped_netdrv_elf, stripped_netsrv_elf, stripped_dnssrv_elf],
+    input: [rootfs_rtld_so, rootfs_pe_rtld_so, rootfs_libtrona_so,
+            rootfs_libc_so, rootfs_libcxx_so, rootfs_kernel32_dll,
+            stripped_dispdrv_elf, stripped_posix_ttysrv_elf, stripped_posix_getty_elf,
+            stripped_posix_login_elf, stripped_test_runner_elf,
+            stripped_netdrv_elf, stripped_netsrv_elf, stripped_dnssrv_elf,
+            stripped_vfs_stress_elf, stripped_vfs_stress_pe_exe,
+            stripped_console_stress_pe_exe],
     output: 'rootfs-binaries.manifest',
     command: [find_program('python3'), '-c',
       'import sys; f=open(sys.argv[1],"w"); [f.write(e+chr(10)) for e in sys.argv[2:]]',
       '@OUTPUT@',
-      '/bin/dispdrv=@INPUT0@',
-      '/bin/posix_ttysrv=@INPUT1@',
-      '/bin/posix_getty=@INPUT2@',
-      '/bin/test_runner=@INPUT3@',
-      '/bin/netdrv=@INPUT4@',
-      '/bin/netsrv=@INPUT5@',
-      '/bin/dnssrv=@INPUT6@',
+      '/lib/ld-trona.so=@INPUT0@',
+      '/lib/ld-trona-pe.so=@INPUT1@',
+      '/lib/libtrona.so=@INPUT2@',
+      '/lib/libc.so=@INPUT3@',
+      '/lib/libc++.so=@INPUT4@',
+      '/lib/kernel32.dll=@INPUT5@',
+      '/bin/dispdrv=@INPUT6@',
+      '/bin/posix_ttysrv=@INPUT7@',
+      '/bin/posix_getty=@INPUT8@',
+      '/bin/login=@INPUT9@',
+      '/bin/test_runner=@INPUT10@',
+      '/bin/netdrv=@INPUT11@',
+      '/bin/netsrv=@INPUT12@',
+      '/bin/dnssrv=@INPUT13@',
+      '/bin/vfs_stress_elf=@INPUT14@',
+      '/bin/vfs_stress_pe=@INPUT15@',
+      '/bin/console_stress_pe=@INPUT16@',
     ],
     build_by_default: false,
   )
 
+  rootfs_permissions = files('images/rootfs.permissions')
   _rootfs_cmd = [mkrootfs, '--output', '@OUTPUT@', '--size', '1G',
-                 '--manifest', rootfs_binaries_manifest]
+                 '--manifest', rootfs_binaries_manifest,
+                 '--permissions', meson.project_source_root() / 'images' / 'rootfs.permissions']
   _rootfs_deps = [rootfs_binaries_manifest]
-  _rootfs_dep_files = [mkrootfs_script, mksaltyfs_script]
+  _rootfs_dep_files = [mkrootfs_script, mksaltyfs_script, rootfs_permissions]
 
   # Layer 2 (optional): LLVM toolchain — present after `just tc package`
-  # Always pass the manifest path; mkrootfs skips it if the file is missing.
-  _llvm_stripped_dir = 'build-toolchain' / 'llvm-' + arch + '-stripped'
-  _llvm_manifest = meson.project_source_root() / _llvm_stripped_dir / 'rootfs.manifest'
-  _rootfs_cmd += ['--manifest-optional', _llvm_manifest]
+  # tc-package/ lives inside the build directory so distclean cleans it.
+  # The manifest references meson build outputs directly for OS libraries,
+  # eliminating stale-copy bugs.
+  _tc_package_dir = meson.project_build_root() / 'tc-package'
+  _tc_manifest = _tc_package_dir / 'rootfs.manifest'
+  _rootfs_cmd += ['--manifest-optional', _tc_manifest]
+  # Legacy fallback: support old location during transition
+  _legacy_stripped_dir = 'build-toolchain' / 'llvm-' + arch + '-stripped'
+  _legacy_manifest = meson.project_source_root() / _legacy_stripped_dir / 'rootfs.manifest'
+  _rootfs_cmd += ['--manifest-optional', _legacy_manifest]
 
   # Layer 3 (optional): ports — only when build_ports=true
   if get_option('build_ports') and is_variable('pkg_tool')

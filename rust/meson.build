@@ -46,6 +46,7 @@ endif
 
 core_src = rust_lib_src / 'core/src/lib.rs'
 compiler_builtins_src = files('compiler_builtins.rs')
+compiler_builtins_mem_cfg = ['--cfg', 'trona_mem_builtins']
 
 # Userland set (generic names used by lib/ and userland/ subdirs)
 if build_userland
@@ -137,12 +138,13 @@ if build_kernel
       input: compiler_builtins_src,
       output: ['compiler_builtins-kernel.o', 'libcompiler_builtins-kernel.rmeta'],
       depend_files: rust_kernel_target_file,
-      command: [
-        rustc,
-        rust_kernel_core_args,
-        '--emit=obj=@OUTPUT0@,metadata=@OUTPUT1@',
-        '--crate-name=compiler_builtins',
-        '--crate-type=lib',
+    command: [
+      rustc,
+      rust_kernel_core_args,
+      compiler_builtins_mem_cfg,
+      '--emit=obj=@OUTPUT0@,metadata=@OUTPUT1@',
+      '--crate-name=compiler_builtins',
+      '--crate-type=lib',
         '--sysroot=/dev/null',
         '--extern', 'core=' + meson.current_build_dir() / 'libcore-kernel.rmeta',
         '-L', meson.current_build_dir(),
