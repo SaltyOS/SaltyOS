@@ -18,8 +18,9 @@ use crate::{QUEUE_SIZE, QUEUE_PHYS, QUEUE_AVAIL_OFF, QUEUE_USED_OFF, QUEUE_EVENT
 
 const CAP_SELF_VSPACE: u64 = 1;
 const CAP_SELF_CSPACE: u64 = 2;
-const CAP_PCIDRV_EP: u64 = 64;
-const CAP_MMSRV_EP: u64 = 7;
+
+// Service-local role `Require=pcidrv:pcidrv_ep` via generated `svc_caps`
+// crate; system role `mmsrv` via substrate `trona::caps::*` getters.
 
 /// Slot for dynamically received device untyped cap from pcidrv (MMIO BAR)
 const CAP_RECEIVED_DEVUT: u64 = 81;
@@ -82,7 +83,8 @@ fn pci_config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     msg.regs[3] = offset as u64;
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCIDRV_EP, &raw const msg, &raw mut reply) };
+    let err =
+        unsafe { ipc::call_ctx(ipc_ctx(), svc_caps::pcidrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return 0xFFFF_FFFF;
     }
@@ -98,7 +100,8 @@ pub(crate) fn find_virtio_blk_modern() -> Option<(u8, u8, u8)> {
     msg.regs[1] = VIRTIO_BLK_MODERN_DEVICE as u64;
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCIDRV_EP, &raw const msg, &raw mut reply) };
+    let err =
+        unsafe { ipc::call_ctx(ipc_ctx(), svc_caps::pcidrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
     }
@@ -130,7 +133,8 @@ fn map_bar(bus: u8, dev: u8, func: u8, bar_idx: u8) -> Option<(u64, u32)> {
     }
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ipc_ctx(), CAP_PCIDRV_EP, &raw const msg, &raw mut reply) };
+    let err =
+        unsafe { ipc::call_ctx(ipc_ctx(), svc_caps::pcidrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         return None;
     }
@@ -440,7 +444,7 @@ pub(crate) fn init_virtio_modern(bus: u8, dev: u8, func: u8) -> bool {
     msg.regs[2] = 0x3; // PROT_READ | PROT_WRITE
     msg.regs[3] = 0x22; // MAP_PRIVATE | MAP_ANONYMOUS
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         trona::uerror!(|_lb| { _lb.str(b"[blkdrv] Failed to allocate virtqueue memory\n"); });
         return false;

@@ -1,11 +1,16 @@
 [Service]
 Name=netsrv
-Binary=netsrv
-Type=simple
+Binary=/bin/netsrv
+Type=notify
 Restart=always
 
 [Dependencies]
-After=netdrv namesrv mmsrv saltyfs vfs
+After=netdrv namesrv rsrcsrv mmsrv saltyfs vfs
 
 [Capabilities]
-NeedEP=netdrv:64 namesrv:65
+# System roles via trona::caps::* (procmgr's populate_cap_table path);
+# service-local via generated svc_caps::* — procmgr's resolve_local_requires
+# looks `netdrv` up in PROVIDER_REGISTRY and mints a per-consumer-badged
+# copy into the netsrv child cspace.
+Require=namesrv
+Require=netdrv:netdrv_ep

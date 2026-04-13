@@ -54,9 +54,7 @@ pub fn run() -> bool {
 
     // epoll_wait with timeout=0 should return 1 event
     let mut events: [EpollEvent; 4] = [EpollEvent::zeroed(); 4];
-    let nready = unsafe {
-        trona_posix::posix_epoll_wait(epfd, events.as_mut_ptr(), 4, 0)
-    };
+    let nready = unsafe { trona_posix::posix_epoll_wait(epfd, events.as_mut_ptr(), 4, 0) };
     if nready != 1 {
         puts(b"[TEST_EPOLL] FAIL: epoll_wait expected 1 ready event\n");
         return false;
@@ -84,9 +82,7 @@ pub fn run() -> bool {
     unsafe { trona_posix::posix_read(read_fd, buf.as_mut_ptr(), 16) };
 
     // epoll_wait should now return 0
-    let nready = unsafe {
-        trona_posix::posix_epoll_wait(epfd, events.as_mut_ptr(), 4, 0)
-    };
+    let nready = unsafe { trona_posix::posix_epoll_wait(epfd, events.as_mut_ptr(), 4, 0) };
     if nready != 0 {
         puts(b"[TEST_EPOLL] FAIL: epoll_wait expected 0 after DEL\n");
         return false;

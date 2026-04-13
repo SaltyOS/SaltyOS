@@ -11,7 +11,6 @@
 mod acpi;
 mod arch;
 mod bootinfo;
-mod builtins;
 mod cap;
 mod console;
 mod cpio;

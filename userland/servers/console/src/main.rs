@@ -34,10 +34,13 @@ use trona_posix::*;
 
 // Cap layout (architecture-neutral slots)
 const CAP_SELF_CSPACE: u64 = 2;
-const CAP_SERVER_EP: u64 = 3;
-const CAP_READINESS_NTFN: u64 = 14;
-const CAP_POSIX_TTYSRV_EP: u64 = 67; // POSIX TTY server endpoint (NeedEP posix_ttysrv:67)
-const CAP_DISPDRV_EP: u64 = 68;     // Display driver EP (NeedEP dispdrv:68)
+
+// posix_ttysrv and dispdrv are post-procmgr services; console receives their
+// EPs via init-time `NeedEP=` hand-off into fixed runtime slots. Kept as
+// consts because the role delivery path for pre-procmgr -> post-procmgr
+// cross-hand-offs does not yet populate svc_caps for init-spawned services.
+const CAP_POSIX_TTYSRV_EP: u64 = 67; // NeedEP posix_ttysrv:67
+const CAP_DISPDRV_EP: u64 = 68; // NeedEP dispdrv:68
 
 // termios flag defaults (match posix_ttysrv canonical defaults)
 const ISIG: u32 = 0o000001;
@@ -107,7 +110,7 @@ unsafe fn init_console_termios() {
 }
 
 fn signal_ready() {
-    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, trona::caps::readiness_ntfn(), 1, 0, 0, 0, 0);
 }
 
 /// Write a byte slice with CR/LF translation via DebugPutStr syscall.
@@ -396,7 +399,14 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     let mut badge: u64 = 0;
 
     // Initial recv
-    let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
+    let err = unsafe {
+        ipc::recv_ctx(
+            ipc_ctx(),
+            trona::caps::service_ep(),
+            &raw mut msg,
+            &raw mut badge,
+        )
+    };
     if err != 0 {
         trona::uerror!(|_lb| {
             _lb.str(b"[CONSOLE] initial recv failed\n");
@@ -421,7 +431,12 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
             // Wait for next event
             let err = unsafe {
-                ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
+                ipc::recv_ctx(
+                    ipc_ctx(),
+                    trona::caps::service_ep(),
+                    &raw mut msg,
+                    &raw mut badge,
+                )
             };
             if err != 0 {
                 trona::uerror!(|_lb| {
@@ -454,7 +469,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         let err = unsafe {
             ipc::reply_recv_ctx(
                 ipc_ctx(),
-                CAP_SERVER_EP,
+                trona::caps::service_ep(),
                 &raw const reply,
                 &raw mut msg,
                 &raw mut badge,

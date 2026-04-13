@@ -1,0 +1,9 @@
+[Service]
+Name=rootfs.target
+Type=target
+Activation=event
+Restart=no
+
+[Dependencies]
+After=vfs saltyfs
+Before=posix_getty test_runner

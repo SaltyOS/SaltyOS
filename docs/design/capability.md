@@ -638,12 +638,11 @@ MemoryObject (MO) operations manage user data pages. MO is created via
 ### VSpace MemoryObject Labels
 
 VSpace operations for MO-based mappings. Invoked on a VSpace capability
-(range `0x97`-`0x9A`):
+(labels `0x97`, `0x99`-`0x9A`; unmapping uses the general `VSPACE_UNMAP` label):
 
 | Label | Value | Operation | Description |
 |-------|-------|-----------|-------------|
 | `VSPACE_MAP_MO` | 0x97 | Map MO range | Map MO pages into VSpace at given VA |
-| `VSPACE_UNMAP_MO` | 0x98 | Unmap MO range | Remove MO mapping from VSpace |
 | `VSPACE_SHARE_RO_PAGE` | 0x99 | Share page RO | Share a read-only page between VSpaces |
 | `VSPACE_FORK_RANGE` | 0x9A | Fork range | COW-fork a VA range (used by fork()) |
 

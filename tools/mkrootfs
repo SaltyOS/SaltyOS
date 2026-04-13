@@ -19,6 +19,29 @@ from pathlib import Path
 ManifestEntry = tuple[str, str, Path]
 
 
+def check_build_hash_freshness(manifest_path: Path) -> None:
+    """Warn if a tc-package manifest references artifacts newer than its stamp."""
+    hash_file = manifest_path.parent / '.build-hash'
+    if not hash_file.exists():
+        return
+    hash_mtime = hash_file.stat().st_mtime
+    with open(manifest_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            _, src = line.split('=', 1)
+            src = src.strip()
+            src_path = Path(src)
+            if not src_path.is_absolute():
+                continue
+            if src_path.exists() and src_path.stat().st_mtime > hash_mtime:
+                print(f"WARNING: {src_path} is newer than tc-package stamp.",
+                      file=sys.stderr)
+                print(f"  Run 'just tc package' to update.", file=sys.stderr)
+                return
+
+
 def parse_size(s: str) -> str:
     """Validate size string (pass through to mksaltyfs.py)."""
     s = s.strip().upper()
@@ -133,6 +156,10 @@ def main():
                         help='Disk image size (default: 256M)')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Verbose output')
+    parser.add_argument('--permissions', type=Path, default=None,
+                        help='Permissions file for mode/uid/gid overrides')
+    parser.add_argument('--etc-dir', type=Path, default=None,
+                        help='Directory containing /etc templates to include in rootfs')
 
     args = parser.parse_args()
     size = parse_size(args.size)
@@ -146,6 +173,7 @@ def main():
         if p.exists():
             if args.verbose:
                 print(f"Optional manifest found: {p}")
+            check_build_hash_freshness(p)
             entries.extend(load_manifest(p, args.verbose))
         elif args.verbose:
             print(f"Optional manifest skipped (not found): {p}")
@@ -186,6 +214,22 @@ def main():
             print(f"  {dst} <- {src}", file=sys.stderr)
         sys.exit(1)
 
+    # Include /etc templates if --etc-dir is provided or auto-detected
+    etc_dir = args.etc_dir
+    if etc_dir is None:
+        default_etc = repo_root / 'images' / 'etc'
+        if default_etc.is_dir():
+            etc_dir = default_etc
+
+    if etc_dir and etc_dir.is_dir():
+        for child in sorted(etc_dir.rglob('*')):
+            if child.is_file():
+                rel = child.relative_to(etc_dir)
+                child_dst = 'etc/' + str(rel)
+                file_size = child.stat().st_size
+                total_size += file_size
+                resolved.append((child_dst, str(child)))
+
     # Build mksaltyfs.py command
     mksaltyfs = script_dir / 'mksaltyfs.py'
 
@@ -193,6 +237,14 @@ def main():
            '-o', args.output,
            '-s', size,
            '--label', 'rootfs']
+
+    # FHS empty directories needed for pivot_root child re-binding
+    for fhs_dir in ['/dev', '/proc', '/tmp', '/sys', '/pipe', '/initramfs', '/root',
+                    '/var', '/var/log', '/var/run', '/var/tmp']:
+        cmd.extend(['--add-dir', fhs_dir])
+
+    if args.permissions and args.permissions.exists():
+        cmd.extend(['--set-permissions', str(args.permissions)])
 
     for dst, src in resolved:
         cmd.extend(['--add-file-from', dst, src])

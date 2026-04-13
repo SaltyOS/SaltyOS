@@ -6,19 +6,9 @@
 //! notification signaling. Exposes a NET_* IPC interface for VFS to forward
 //! POSIX socket operations.
 //!
-//! Cap layout:
-//!   0  = self TCB
-//!   2  = self CSpace
-//!   5  = namesrv endpoint
-//!   7  = mmsrv endpoint
-//!   14 = readiness notification
-//!   64 = netdrv endpoint (NeedEP=netdrv:64)
-//!   65 = namesrv endpoint #2 (NeedEP=namesrv:65, for registration)
-//!   68 = server endpoint (pre-created service EP)
-//!   80 = RX notification (allocated via mmsrv, sent to netdrv via IPC)
-//!   82 = TX notification (received from netdrv during DRIVER_REGISTER)
-//!   83 = VFS callback endpoint (plain cap received from VFS via NET_REGISTER_VFS)
-//!   84 = local badged alias of the VFS callback endpoint
+//! Startup caps are role-based. System caps come from `trona::caps::*()`,
+//! the netdrv dependency comes from generated `svc_caps::*()`, and a few
+//! runtime-allocated callback/notification slots remain file-local.
 
 #![no_std]
 #![no_main]
@@ -43,12 +33,9 @@ use trona_posix::consts::*;
 
 const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_CSPACE: u64 = 2;
-const CAP_NAMESRV_EP: u64 = 5;
-const CAP_MMSRV_EP: u64 = 7;
-const CAP_READINESS_NTFN: u64 = 14;
-const CAP_NETDRV_EP: u64 = 64;
-const CAP_NAMESRV_EP2: u64 = 65;
-const CAP_SERVER_EP: u64 = 68;
+// All cross-service caps are reached via the role-based startup capability
+// table. System roles flow through `trona::caps::*`; the service-local
+// `Require=netdrv:netdrv_ep` flows through generated `svc_caps::*`.
 const CAP_RX_NOTIFICATION: u64 = 80;
 const CAP_TX_NOTIFICATION: u64 = 82;
 const CAP_VFS_CALLBACK_EP: u64 = 83;
@@ -108,7 +95,7 @@ pub(crate) fn mac_addr() -> [u8; 6] {
 }
 
 fn signal_ready() {
-    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, trona::caps::readiness_ntfn(), 1, 0, 0, 0, 0);
 }
 
 fn log_ipv4(lb: &mut trona::serial::LineBuf, ip: u32) {
@@ -344,7 +331,7 @@ fn setup_shm() -> bool {
     msg.length = 2;
     let mut reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
-    let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || (reply.label != TRONA_OK && reply.label != TRONA_ALREADY_EXISTS) {
         trona::uerror!(|_lb| {
             _lb.str(b"[netsrv] SHM create failed: ");
@@ -364,7 +351,7 @@ fn setup_shm() -> bool {
     msg.length = 4;
     let mut reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
-    let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != TRONA_OK {
         trona::uerror!(|_lb| {
             _lb.str(b"[netsrv] SHM map failed: ");
@@ -400,19 +387,21 @@ fn setup_shm() -> bool {
 fn setup_notification() -> bool {
     let ctx = ipc_ctx();
 
-    // Allocate Notification via mmsrv (MM_ALLOC_OBJECT with OBJ_NOTIFICATION)
+    // Allocate Notification via rsrcsrv (RES_ALLOC_OBJECT, owner=self).
     // SAFETY: IPC context is valid; set up receive slot for cap transfer.
     unsafe {
         ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_RX_NOTIFICATION, 0);
     }
     let mut msg = TronaMsg::zeroed();
-    msg.label = MM_ALLOC_OBJECT;
-    msg.regs[0] = OBJ_NOTIFICATION;
-    msg.regs[1] = 0;
-    msg.length = 2;
+    msg.label = RES_ALLOC_OBJECT;
+    msg.regs[0] = 0; // owner_id=0 → caller's badge
+    msg.regs[1] = OBJ_NOTIFICATION;
+    msg.regs[2] = 0;
+    msg.regs[3] = 0;
+    msg.length = 4;
     let mut reply = TronaMsg::zeroed();
-    // SAFETY: IPC context is valid; making RPC to mmsrv.
-    let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
+    // SAFETY: IPC context is valid; making RPC to rsrcsrv.
+    let err = unsafe { ipc::call_ctx(ctx, trona::caps::rsrcsrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != TRONA_OK {
         trona::uerror!(|_lb| {
             _lb.str(b"[netsrv] Failed to allocate notification: ");
@@ -463,7 +452,7 @@ fn driver_register() -> bool {
     msg.length = 1;
     let mut reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to netdrv.
-    let err = unsafe { ipc::call_ctx(ctx, CAP_NETDRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ctx, svc_caps::netdrv_ep(), &raw const msg, &raw mut reply) };
     trona::udebug!(|_lb| {
         _lb.str(b"[netsrv] DRIVER_REGISTER call result=");
         _lb.dec(err as u64);
@@ -528,11 +517,11 @@ fn register_namesrv() {
             *dst.add(i) = name[i];
             i += 1;
         }
-        ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, trona::caps::service_ep());
         let mut reply = TronaMsg::zeroed();
         let err = ipc::call_ctx(
             ipc_ctx(),
-            CAP_NAMESRV_EP,
+            trona::caps::namesrv_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -1351,7 +1340,7 @@ unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut TronaMsg, badge: *mut u64) {
             let timeout = deadline.saturating_sub(now).max(100_000); // min 100us
             let r = trona::syscall::syscall(
                 SYS_RECV_TIMED,
-                CAP_SERVER_EP,
+                trona::caps::service_ep(),
                 timeout,
                 0,
                 0,
@@ -1368,7 +1357,7 @@ unsafe fn do_recv(ctx: *mut IpcContext, msg: *mut TronaMsg, badge: *mut u64) {
                 *badge = 1;
             }
         } else {
-            ipc::recv_ctx(ctx, CAP_SERVER_EP, msg, badge);
+            ipc::recv_ctx(ctx, trona::caps::service_ep(), msg, badge);
         }
     }
 }
@@ -1643,7 +1632,7 @@ fn event_loop() -> ! {
                     } else {
                         ipc::reply_recv_ctx(
                             ctx,
-                            CAP_SERVER_EP,
+                            trona::caps::service_ep(),
                             &raw const reply,
                             &raw mut msg,
                             &raw mut badge,
@@ -1656,7 +1645,7 @@ fn event_loop() -> ! {
                 unsafe {
                     ipc::reply_recv_ctx(
                         ctx,
-                        CAP_SERVER_EP,
+                        trona::caps::service_ep(),
                         &raw const reply,
                         &raw mut msg,
                         &raw mut badge,

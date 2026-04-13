@@ -1,0 +1,13 @@
+# SaltyOS rootfs file permission overrides
+# Format: /path/to/file MODE UID GID
+#   MODE is octal (e.g. 0104755 for setuid root executable)
+#   UID and GID are decimal
+#
+# Setuid binaries
+/usr/bin/su 0104755 0 0
+/usr/bin/sudo 0104755 0 0
+
+# Test fixtures
+/bin/vfs_stress_elf 0100755 0 0
+/bin/vfs_stress_pe 0100755 0 0
+/bin/console_stress_pe 0100755 0 0

@@ -83,3 +83,16 @@ option('build_libcxx',
   choices: ['auto', 'true', 'false'],
   value: 'auto',
   description: 'Build libc++.so from toolchain/llvm-project sources (auto=detect, true=require, false=skip)')
+
+# VFS worker pool
+option('vfs_worker_pool',
+  type: 'boolean',
+  value: false,
+  description: 'Enable multi-threaded worker pool for the VFS server')
+
+option('vfs_worker_count_override',
+  type: 'integer',
+  min: 0,
+  max: 32,
+  value: 0,
+  description: 'Override VFS worker count (0 = auto)')

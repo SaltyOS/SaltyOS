@@ -48,9 +48,15 @@ use trona::protocol::*;
 use trona::types::core::*;
 
 const CAP_SELF_CSPACE: u64 = 2;
-const CAP_SERVER_EP: u64 = 3;
-const CAP_READINESS_NTFN: u64 = 14;
-const CAP_NAMESRV_EP: u64 = 65;
+
+// namesrv EP is delivered via `NeedEP=namesrv:65` in pcidrv.service; init
+// also pushes `ROLE_NAMESRV_CLIENT` into the startup cap_table (see
+// `ini::system_role_for_bare_name`) so the slot is reachable via the
+// substrate getter regardless of the specific NeedEP assignment.
+// IRQ control cap is delivered via `CopyCap=11:66` from init's slot 11
+// (CAP_IRQ_CONTROL in kernite/init.rs). It is not a role-bearing
+// system cap — there is no `trona::caps::irq_control()` getter — so the
+// slot number remains hardcoded here.
 const CAP_IRQ_CONTROL: u64 = 66;
 
 const MAX_PCI_DEVICES: usize = 64;
@@ -108,7 +114,7 @@ fn ipc_ctx() -> *mut IpcContext {
 }
 
 fn signal_ready() {
-    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, trona::caps::readiness_ntfn(), 1, 0, 0, 0, 0);
 }
 
 /// Probe one PCI BAR size by writing all 1s and reading back.
@@ -341,9 +347,10 @@ fn register_namesrv() -> bool {
         for i in 0..name.len() {
             *dst.add(i) = name[i];
         }
-        ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, trona::caps::service_ep());
         let mut reply = TronaMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESRV_EP, &raw const msg, &raw mut reply);
+        let err =
+            ipc::call_ctx(ipc_ctx(), trona::caps::namesrv_ep(), &raw const msg, &raw mut reply);
         if err != 0 || reply.label != TRONA_OK {
             trona::uerror!(|_lb| {
                 _lb.str(b"[pcidrv] namesrv register failed err=");
@@ -608,7 +615,7 @@ fn server_loop() -> ! {
     let ctx = ipc_ctx();
     let mut msg = TronaMsg::zeroed();
     let mut badge: u64 = 0;
-    unsafe { ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge); }
+    unsafe { ipc::recv_ctx(ctx, trona::caps::service_ep(), &raw mut msg, &raw mut badge); }
 
     loop {
         let reply = match msg.label {
@@ -629,7 +636,11 @@ fn server_loop() -> ! {
         badge = 0;
         unsafe {
             ipc::reply_recv_ctx(
-                ctx, CAP_SERVER_EP, &raw const reply, &raw mut msg, &raw mut badge,
+                ctx,
+                trona::caps::service_ep(),
+                &raw const reply,
+                &raw mut msg,
+                &raw mut badge,
             );
         }
     }

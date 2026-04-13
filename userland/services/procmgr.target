@@ -1,0 +1,7 @@
+[Service]
+Name=procmgr.target
+Type=target
+Restart=no
+
+[Dependencies]
+After=procmgr

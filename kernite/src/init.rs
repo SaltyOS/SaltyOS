@@ -266,7 +266,7 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
         // Allocate a kernel stack for the trampoline (used by context_switch → iretq)
         let tramp_stack_phys = boot_unwrap!(
             pmm_alloc(&FrameOwner::KernelPrivate {
-                subkind: KernelMetaKind::General
+                subkind: KernelMetaKind::KernelStack
             }),
             "trampoline stack alloc failed"
         );
@@ -285,6 +285,12 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
         pmm_alloc_contiguous(KSTACK_PAGES),
         "kernel stack alloc failed"
     );
+    let kstack_owner = FrameOwner::KernelPrivate {
+        subkind: KernelMetaKind::KernelStack,
+    };
+    for i in 0..KSTACK_PAGES {
+        pmm_set_owner(kstack_phys + (i * PAGE_SIZE) as u64, &kstack_owner);
+    }
     let kstack_virt = phys_to_virt(kstack_phys);
     let kstack_top = kstack_virt + (KSTACK_PAGES * PAGE_SIZE) as u64;
     unsafe {
@@ -351,6 +357,10 @@ pub fn bootstrap(boot_info: Option<&ParsedBootInfo>) {
         (*tcb).vspace_root = (&raw mut INIT_VSPACE).cast::<VSpace>();
         (*tcb).cspace_root = &raw mut INIT_CNODE_STORAGE as *mut CNode;
         (*tcb).kernel_stack_top = kstack_top;
+        #[cfg(target_arch = "x86_64")]
+        {
+            (*tcb).trampoline_stack_top = tramp_stack_top;
+        }
         (*tcb).stack_canary = crate::arch::generate_stack_canary();
 
         // Seed %gs:40 with init's canary so the first syscall entry picks it up
@@ -913,8 +923,7 @@ fn load_from_initrd(info: &ParsedBootInfo, vspace: &mut VSpace) -> (u64, u64) {
         )
     };
 
-    let elf_entry = crate::cpio::find_file(initrd, "init")
-        .or_else(|| crate::cpio::find_file(initrd, "init.elf"));
+    let elf_entry = crate::cpio::find_file(initrd, "bin/init");
     let elf_data = match elf_entry {
         Some(entry) => {
             crate::kinfo!(|_g| {

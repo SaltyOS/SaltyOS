@@ -53,7 +53,13 @@ pub fn run() -> bool {
 
     // Test 1: getpid
     let my_pid = unsafe { trona_posix::posix_getpid() };
-    { let mut lb = LineBuf::new(); lb.str(b"[TEST_FORK] Test 1: getpid = "); lb.dec(my_pid as u64); lb.str(b"\n"); lb.flush(); }
+    {
+        let mut lb = LineBuf::new();
+        lb.str(b"[TEST_FORK] Test 1: getpid = ");
+        lb.dec(my_pid as u64);
+        lb.str(b"\n");
+        lb.flush();
+    }
     if my_pid <= 0 {
         puts(b"[TEST_FORK] FAIL: getpid\n");
         return false;
@@ -62,7 +68,13 @@ pub fn run() -> bool {
 
     // Test 2: getppid
     let my_ppid = unsafe { trona_posix::posix_getppid() };
-    { let mut lb = LineBuf::new(); lb.str(b"[TEST_FORK] Test 2: getppid = "); lb.dec(my_ppid as u64); lb.str(b"\n"); lb.flush(); }
+    {
+        let mut lb = LineBuf::new();
+        lb.str(b"[TEST_FORK] Test 2: getppid = ");
+        lb.dec(my_ppid as u64);
+        lb.str(b"\n");
+        lb.flush();
+    }
     puts(b"[TEST_FORK] Test 2: PASS\n");
 
     // Test 3: fork + waitpid
@@ -78,11 +90,25 @@ pub fn run() -> bool {
         unsafe { trona_posix::posix_exit(7) };
     }
 
-    { let mut lb = LineBuf::new(); lb.str(b"[TEST_FORK] Parent: child PID = "); lb.dec(pid as u64); lb.str(b"\n"); lb.flush(); }
+    {
+        let mut lb = LineBuf::new();
+        lb.str(b"[TEST_FORK] Parent: child PID = ");
+        lb.dec(pid as u64);
+        lb.str(b"\n");
+        lb.flush();
+    }
 
     let mut status: i32 = 0;
     let ret = unsafe { trona_posix::posix_waitpid(pid, &raw mut status) };
-    { let mut lb = LineBuf::new(); lb.str(b"[TEST_FORK] Parent: waitpid returned "); lb.dec(ret as u64); lb.str(b", status = "); lb.dec(status as u64); lb.str(b"\n"); lb.flush(); }
+    {
+        let mut lb = LineBuf::new();
+        lb.str(b"[TEST_FORK] Parent: waitpid returned ");
+        lb.dec(ret as u64);
+        lb.str(b", status = ");
+        lb.dec(status as u64);
+        lb.str(b"\n");
+        lb.flush();
+    }
 
     if ret != pid || !wifexited(status) || wexitstatus(status) != 7 {
         puts(b"[TEST_FORK] FAIL: waitpid\n");

@@ -1,11 +1,14 @@
 [Service]
 Name=dnssrv
-Binary=dnssrv
-Type=simple
+Binary=/bin/dnssrv
+Type=notify
 Restart=always
 
 [Dependencies]
 After=netsrv namesrv mmsrv saltyfs vfs
 
 [Capabilities]
-NeedEP=netsrv:64 namesrv:65
+# System roles via trona::caps::*, service-local via generated svc_caps::*.
+Require=namesrv
+Require=mmsrv
+Require=netsrv:netsrv_ep

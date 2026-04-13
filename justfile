@@ -36,13 +36,18 @@ help:
     @echo "  just arch=aarch64 reconfigure -Dkernel_log_level=debug -Duserland_log_level=debug"
     @echo ""
     @echo "== Code Quality =="
-    @echo "  just fmt                Format Rust + C source"
-    @echo "  just fmt-check          Check Rust formatting"
+    @echo "  just fmt                  Format Rust + C source"
+    @echo "  just fmt-check            Check Rust formatting + cap discipline"
+    @echo "  just lint-cap-discipline  Enforce cap_table invariants (no legacy slots)"
+    @echo "  just warn                 Recheck all sources for warnings (no cache, no images)"
+    @echo "  just arch=aarch64 warn    Same for aarch64 build"
     @echo ""
     @echo "== Toolchain (use arch= to target aarch64, e.g. just arch=aarch64 tc all) =="
     @echo "  just tc setup                    Create directories"
     @echo "  just tc build host llvm          Build host Clang/LLD (~30 min)"
-    @echo "  just tc build host rust          Build host rustc (~20 min)"
+    @echo "  just tc build host rust          Build host rustc (compiler only)"
+    @echo "  just tc build host rust-host-std Build host std + cargo"
+    @echo "  just tc build host rust-cross-std Build std for SaltyOS targets (needs sysroot)"
     @echo "  just tc doctor                   Validate toolchain"
     @echo "  just tc all                      Run all host steps in order"
     @echo ""
@@ -73,8 +78,12 @@ help:
     @echo "== Misc =="
     @echo "  just info               Show build configuration"
     @echo "  just loc                Show source line counts"
+    @echo "  just cloc               Detailed line counts by language (requires cloc)"
     @echo "  just watch              Watch for changes + rebuild"
-    @echo "  just distclean          Remove all build dirs"
+    @echo "  just bootstrap          Full 4-stage bootstrap (both archs, from scratch)"
+    @echo "  just bootstrap --from=N Skip to stage N (0=toolchain, 1=OS, 2=std, 3=ports)"
+    @echo "  just distclean          Remove meson build dirs (preserves toolchains)"
+    @echo "  just distclean-all      Remove everything including ports and host toolchain"
 
 # Default target architecture
 arch := "x86_64"
@@ -159,13 +168,135 @@ build:
 build-verbose:
     meson compile -C {{builddir}} -v
 
+# Recheck all sources for compiler warnings (no cache; disk-image targets excluded)
+warn:
+    #!/usr/bin/env bash
+    # All compiled objects are wiped first so the result is not affected by a
+    # previous incremental build.  Works with 'arch=' just like other recipes.
+    set -euo pipefail
+    source tools/toolchain/env.sh
+
+    # Drop all compiled outputs so every translation unit is freshly examined.
+    # build.ninja and meson-info are preserved — this is a clean compilation
+    # pass, not a full reconfigure.
+    ninja -C {{builddir}} -t clean
+
+    # Collect compilation targets by output extension.  All targets in this
+    # project are 'custom' type (freestanding OS), so type-based filtering
+    # does not work.  Instead we keep targets whose first output file is a
+    # compiled artifact and exclude packaging targets by name/prefix.
+    targets=()
+    while IFS= read -r target; do
+        targets+=("$target")
+    done < <(
+        meson introspect --targets {{builddir}} \
+        | python3 -c "import json,sys;exc={'sysroot','initrd','disk_image','uefi_image','rootfs_image'};pref=('stripped_','port_');keep={'.o','.obj','.elf','.exe','.rlib','.rmeta','.rs','.a','.so'};[print(t['name']) for t in json.load(sys.stdin) if t['name'] not in exc and not any(t['name'].startswith(p) for p in pref) and t.get('filename') and '.'+t['filename'][0].rsplit('.',1)[-1] in keep]" \
+        2>/dev/null
+    )
+
+    if [[ ${#targets[@]} -eq 0 ]]; then
+        echo "warn: no compilation targets found — has 'just setup' been run?" >&2
+        exit 1
+    fi
+
+    echo "Scanning ${#targets[@]} targets for warnings (no cache) ..."
+    # Exit code is suppressed so diagnostics from all targets are visible
+    # even when some translation units fail to compile.
+    meson compile -C {{builddir}} "${targets[@]}" 2>&1 || true
+
 # Clean build artifacts
 clean:
     meson compile -C {{builddir}} --clean
 
-# Full clean (remove meson build directories, preserve build-toolchain)
+# Full clean (remove meson build directories + tc-package, preserve toolchains)
 distclean:
     rm -rf build-x86_64 build-aarch64
+
+# Nuclear clean including host toolchain and ports (WARNING: ~1h rebuild)
+[confirm("This will delete everything including the host toolchain (~1h to rebuild). Continue? (y/n)")]
+distclean-all: clean-ports
+    rm -rf build-x86_64 build-aarch64 build-toolchain
+
+# =============================================================================
+# Bootstrap (full toolchain + OS build from scratch, both architectures)
+# =============================================================================
+
+# Stage 0: host toolchain (compiler only, no std/cargo)
+# Stage 1: OS build without ports → sysroot
+# Stage 2: host std + cargo, then cross std for both architectures
+# Stage 3: full rebuild with ports enabled
+bootstrap *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    start_stage=0
+    for arg in {{ARGS}}; do
+      case "$arg" in
+        --from=*) start_stage="${arg#--from=}" ;;
+        *) echo "Unknown arg: $arg (usage: just bootstrap [--from=N])" >&2; exit 1 ;;
+      esac
+    done
+
+    if (( start_stage <= 0 )); then
+    echo "=== Stage 0: Host toolchain (compiler only) ==="
+    just tc all
+    fi
+
+    source tools/toolchain/env.sh
+
+    if (( start_stage <= 1 )); then
+    echo ""
+    echo "=== Stage 1: OS build (no ports) ==="
+    for a in x86_64 aarch64; do
+      echo "--- setup $a ---"
+      dir="build-$a"
+      mkdir -p "$dir"
+      {
+        printf '[binaries]\n'
+        printf 'c     = %s\n' "'${CC:-$SALTYOS_TOOLCHAIN_PREFIX/bin/clang}'"
+        printf 'rustc = %s\n' "'${RUSTC:-$SALTYOS_TOOLCHAIN_PREFIX/bin/rustc}'"
+        prefix="${SALTYOS_TOOLCHAIN_PREFIX}/bin"
+        for tool in llvm-objcopy lld-link llvm-strip llvm-ar; do
+          [ -x "${prefix}/${tool}" ] && printf '%s = %s\n' "${tool}" "'${prefix}/${tool}'"
+        done
+      } > "$dir/toolchain.ini"
+      if [[ "$(uname -s)" == "Darwin" ]]; then
+        export SDKROOT="${SDKROOT:-$(xcrun --show-sdk-path)}"
+      fi
+      meson setup "$dir" \
+        --native-file="$dir/toolchain.ini" \
+        -Darch=$a \
+        -Dbuild_boot=true \
+        -Dbuild_kernel=true \
+        -Dbuild_userland=true \
+        -Dbuild_ports=false
+      echo "--- build $a ---"
+      just arch=$a build
+    done
+    fi
+
+    if (( start_stage <= 2 )); then
+    echo ""
+    echo "=== Stage 2: Host std + cargo, cross std ==="
+    just tc build host rust-host-std
+    for a in x86_64 aarch64; do
+      echo "--- rust-cross-std $a ---"
+      just arch=$a tc build host rust-cross-std
+    done
+    fi
+
+    if (( start_stage <= 3 )); then
+    echo ""
+    echo "=== Stage 3: Full build with ports ==="
+    for a in x86_64 aarch64; do
+      echo "--- $a ---"
+      meson configure build-$a -Dbuild_ports=true
+      just arch=$a build
+    done
+
+    fi
+
+    echo ""
+    echo "=== Bootstrap complete ==="
 
 # =============================================================================
 # Run & Debug
@@ -202,22 +333,12 @@ toolchain-env:
     bash tools/toolchain/env.sh --print
 
 # Unified toolchain entry point
-# Usage: just tc <command> [args...]
-#   just tc setup                     Create directories
-#   just tc build host llvm           Build host Clang/LLD
-#   just tc build host rust           Build host rustc
-#   just tc build cross llvm          Cross-compile Clang/LLD for SaltyOS
-#   just tc build cross rust          Cross-compile rustc for SaltyOS
-#   just tc sysroot                   Generate sysroot (includes libc++ when available)
-#   just tc doctor                    Validate toolchain
-#   just tc all                       setup → host llvm → host rust → doctor
-#   just tc self-host                 sysroot → cross llvm → cross rust
 tc CMD *ARGS:
     SALTYOS_MESON_BUILDDIR={{builddir}} SALTYOS_ARCH={{arch}} bash tools/toolchain/build.sh {{CMD}} {{ARGS}}
 
-# Generate cross-compilation sysroot (requires: just build)
+# Generate cross-compilation sysroot (clean rebuild; incremental is part of `just build`)
 sysroot: build
-    @just arch={{arch}} tc sysroot
+    python3 tools/mksysroot --build-dir {{builddir}} --output {{builddir}}/sysroot --clean -v
 
 # Full cross-compile pipeline (requires: just sysroot)
 # libc++ is built by 'just build' when build_libcxx=auto|true and
@@ -243,6 +364,15 @@ fmt:
 # Check formatting without modifying
 fmt-check:
     find kernite -name "*.rs" -exec rustfmt --check {} \;
+    @just lint-cap-discipline
+
+# Capability discipline lint — enforces the role-based startup
+# capability table invariants. See tools/lint/cap_discipline.sh for
+# the exact rules. Fails on any legacy AT_TRONA_*_EP tag reference,
+# removed ROLE_PROCMGR_EXPAND_EP bridge role, raw __trona_cap_*
+# access outside substrate/rtld, or literal CAP_<well-known> const.
+lint-cap-discipline:
+    @bash tools/lint/cap_discipline.sh
 
 # Run clippy on kernel
 clippy:
@@ -256,6 +386,10 @@ docs:
 loc:
     @echo "=== Source Lines of Code ==="
     @find kernite boot userland lib -name "*.rs" -o -name "*.c" -o -name "*.h" -o -name "*.asm" 2>/dev/null | xargs wc -l | tail -1
+
+# Detailed line counts by language (requires cloc)
+cloc:
+    cloc kernite boot userland lib tools --exclude-dir=rust-lang
 
 # =============================================================================
 # Ports

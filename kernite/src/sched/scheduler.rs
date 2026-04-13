@@ -78,6 +78,13 @@ pub struct Scheduler {
     /// its registers. Prevents the double-schedule race where another CPU
     /// dequeues and switches to a thread before its context is saved.
     pending_enqueue: [AtomicPtr<Tcb>; MAX_CPUS],
+    /// Per-CPU deferred current[] release slot.
+    ///
+    /// When `set_current(new)` replaces old, the old TCB pointer is stored
+    /// here.  After the scheduler lock is released, `flush_deferred_current_release()`
+    /// decrements `sched_ref` on the old TCB and triggers deferred destruction
+    /// if its capability refcount already reached 0 (`pending_destroy`).
+    deferred_current_release: [*mut Tcb; MAX_CPUS],
     /// Per-CPU lock states (each protects that CPU's ready queue and per-CPU state)
     lock_states: [core::sync::atomic::AtomicU8; MAX_CPUS],
     /// Per-CPU context switch count
@@ -101,6 +108,7 @@ impl Scheduler {
             current: [core::ptr::null_mut(); MAX_CPUS],
             idle: [core::ptr::null_mut(); MAX_CPUS],
             pending_enqueue: [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS],
+            deferred_current_release: [core::ptr::null_mut(); MAX_CPUS],
             lock_states: [const { core::sync::atomic::AtomicU8::new(0) }; MAX_CPUS],
             context_switches: [0; MAX_CPUS],
             timer_ticks: [0; MAX_CPUS],
@@ -519,8 +527,7 @@ impl Scheduler {
                 (*tcb).last_cpu = cpu_id as u32;
                 (*tcb).set_run_owner_cpu(cpu_id);
             }
-            self.current[cpu_id] = tcb;
-            CURRENT_ON_CPU[cpu_id].store(tcb as usize, core::sync::atomic::Ordering::Release);
+            self.set_current(tcb);
             return tcb;
         }
 
@@ -544,8 +551,7 @@ impl Scheduler {
                     (*tcb).last_cpu = cpu_id as u32;
                     (*tcb).set_run_owner_cpu(cpu_id);
                 }
-                self.current[cpu_id] = tcb;
-                CURRENT_ON_CPU[cpu_id].store(tcb as usize, core::sync::atomic::Ordering::Release);
+                self.set_current(tcb);
                 return tcb;
             }
             self.unlock_cpu(victim);
@@ -596,9 +602,23 @@ impl Scheduler {
         self.current[cpu_id]
     }
 
-    /// Set current running thread (on calling CPU)
+    /// Set current running thread (on calling CPU).
+    ///
+    /// Manages `sched_ref`: increments on the new TCB, saves the old TCB
+    /// to `deferred_current_release` for later `sched_ref` decrement
+    /// (done by `flush_deferred_current_release()` after lock release).
+    ///
+    /// Idempotent: if `current[cpu]` already equals `tcb`, this is a no-op.
+    /// This handles the case where `schedule_unlocked()` already set
+    /// `current[cpu]` and the caller calls `set_current` redundantly.
     pub fn set_current(&mut self, tcb: *mut Tcb) {
         let cpu_id = crate::arch::current_cpu() as usize;
+        let old = self.current[cpu_id];
+
+        if old == tcb {
+            return;
+        }
+
         self.current[cpu_id] = tcb;
         unsafe {
             if !tcb.is_null() {
@@ -606,6 +626,21 @@ impl Scheduler {
             }
         }
         CURRENT_ON_CPU[cpu_id].store(tcb as usize, core::sync::atomic::Ordering::Release);
+
+        // Increment sched_ref on new TCB (skip idle/bootstrap — static, never destroyed)
+        if !tcb.is_null() && tcb != self.idle[cpu_id] && !is_bootstrap_tcb(tcb) {
+            unsafe { (*tcb).sched_ref.fetch_add(1, core::sync::atomic::Ordering::AcqRel); }
+        }
+
+        // Save old for deferred sched_ref decrement.
+        // Only the first old per scheduling cycle matters — if the slot is
+        // already occupied (shouldn't happen in practice since flush runs
+        // between context switches), keep the first one.
+        if !old.is_null() && old != self.idle[cpu_id] && !is_bootstrap_tcb(old)
+            && self.deferred_current_release[cpu_id].is_null()
+        {
+            self.deferred_current_release[cpu_id] = old;
+        }
     }
 
     /// Get idle thread for calling CPU
@@ -806,6 +841,9 @@ impl Scheduler {
             unsafe {
                 self.validate_tcb_ptr(old, "set_pending_enqueue displaced", cpu_id);
                 // The displaced thread was waiting for deferred enqueue.
+                // It is no longer owned by this CPU — clear run_owner so
+                // TCB_SUSPEND's wait_for_tcb_quiesced can succeed.
+                (*old).clear_run_owner_cpu();
                 // Enqueue it directly now — its context has been saved
                 // (it was pending, meaning it already switched out).
                 if (*old).state == ThreadState::Ready {
@@ -842,6 +880,7 @@ impl Scheduler {
         if !old.is_null() && old != tcb {
             unsafe {
                 self.validate_tcb_ptr(old, "track_pending_switch_out stale slot", cpu_id);
+                (*old).clear_run_owner_cpu();
                 if (*old).state == ThreadState::Ready {
                     self.enqueue_unlocked(old);
                 }
@@ -898,6 +937,42 @@ impl Scheduler {
         unsafe { crate::mm::restore_irq(irq_flag) };
     }
 
+    /// Flush deferred current[] release after scheduler lock is released.
+    ///
+    /// Decrements `sched_ref` on the old TCB that was displaced from
+    /// `current[cpu]` by `set_current()`.  If `sched_ref` drops to 0
+    /// and `pending_destroy` is set (capability refcount already reached 0),
+    /// triggers deferred destruction under CAP_LOCK.
+    ///
+    /// # Safety
+    /// - Must be called with scheduler lock NOT held (acquires CAP_LOCK if needed).
+    /// - IRQs may be disabled (spinlock-safe).
+    pub(crate) unsafe fn flush_deferred_current_release(&mut self) {
+        let cpu_id = crate::arch::current_cpu() as usize;
+        let old = self.deferred_current_release[cpu_id];
+        self.deferred_current_release[cpu_id] = core::ptr::null_mut();
+
+        if old.is_null() {
+            return;
+        }
+
+        unsafe {
+            let prev = (*old).sched_ref.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+            if prev == 1 && (*old).pending_destroy.load(core::sync::atomic::Ordering::Acquire) {
+                // Last scheduler reference dropped on a TCB whose capability
+                // refcount is already 0.  Acquire CAP_LOCK and run destruction.
+                let irq = crate::mm::save_irq_disable();
+                crate::mm::CAP_LOCK.lock();
+                crate::cap::destroy_object_deferred(
+                    old as *mut crate::cap::KernelObject,
+                    crate::cap::ObjectType::Tcb,
+                );
+                crate::mm::CAP_LOCK.unlock();
+                crate::mm::restore_irq(irq);
+            }
+        }
+    }
+
     /// Process deferred enqueue after context switch.
     ///
     /// If there is a pending thread and its state is still Ready
@@ -905,7 +980,7 @@ impl Scheduler {
     /// Clears the pending slot.
     ///
     /// Caller MUST hold the scheduler lock.
-    fn process_pending_enqueue(&mut self) {
+    pub(crate) fn process_pending_enqueue(&mut self) {
         use core::sync::atomic::Ordering;
 
         let cpu_id = checked_cpu_id("process_pending_enqueue");
@@ -1079,6 +1154,12 @@ impl Scheduler {
             self.lock();
             self.process_pending_enqueue();
             self.unlock();
+
+            // Flush deferred sched_ref decrements (outside scheduler lock).
+            // This may trigger deferred TCB destruction under CAP_LOCK in
+            // the rare case where a TCB's last capability was deleted while
+            // it was still the running thread.
+            self.flush_deferred_current_release();
         }
     }
 

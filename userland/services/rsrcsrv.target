@@ -1,0 +1,7 @@
+[Service]
+Name=rsrcsrv.target
+Type=target
+Restart=no
+
+[Dependencies]
+After=rsrcsrv

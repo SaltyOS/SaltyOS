@@ -1,6 +1,6 @@
 [Service]
 Name=win32_csrss
-Binary=win32_csrss
+Binary=/bin/win32_csrss
 Type=notify
 Restart=always
 
@@ -9,4 +9,9 @@ After=console namesrv vfs procmgr
 Before=
 
 [Capabilities]
-NeedEP=namesrv:64 console:65 vfs:66
+# System roles via trona::caps::* — all four (namesrv, console, vfs, procmgr)
+# are populated by procmgr's populate_cap_table for every post-procmgr child.
+Require=namesrv
+Require=console
+Require=vfs
+Require=procmgr

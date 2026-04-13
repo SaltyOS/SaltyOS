@@ -1,0 +1,208 @@
+diff --git a/src/common/resolve.rs b/src/common/resolve.rs
+index 5f67338..1625001 100644
+--- a/src/common/resolve.rs
++++ b/src/common/resolve.rs
+@@ -143,7 +143,7 @@ pub(crate) fn resolve_target_user_and_group(
+         // when no -u or -g is specified, default to root:root
+         (None, None) => {
+             target_user = User::from_name(cstr!("root"))?;
+-            target_group = Group::from_name(if cfg!(target_os = "linux") {
++            target_group = Group::from_name(if cfg!(any(target_os = "linux", target_os = "saltyos")) {
+                 cstr!("root")
+             } else {
+                 cstr!("wheel")
+diff --git a/src/cutils/mod.rs b/src/cutils/mod.rs
+index bc608d8..57b9257 100644
+--- a/src/cutils/mod.rs
++++ b/src/cutils/mod.rs
+@@ -22,7 +22,7 @@ extern "C" {
+         any(target_os = "openbsd", target_os = "netbsd", target_os = "android"),
+         link_name = "__errno"
+     )]
+-    #[cfg_attr(target_os = "linux", link_name = "__errno_location")]
++    #[cfg_attr(any(target_os = "linux", target_os = "saltyos"), link_name = "__errno_location")]
+     fn errno_location() -> *mut libc::c_int;
+ }
+ 
+@@ -80,7 +80,7 @@ pub fn safe_isatty(fildes: BorrowedFd) -> bool {
+     // SAFETY: we are passing fstat a pointer to valid memory
+     if unsafe { libc::fstat(fildes.as_raw_fd(), maybe_stat.as_mut_ptr()) } == 0 {
+         // SAFETY: if `fstat` returned 0, maybe_stat will be initialized
+-        let mode = unsafe { maybe_stat.assume_init() }.st_mode;
++        let mode = unsafe { maybe_stat.assume_init() }.st_mode as u32;
+ 
+         // To complicate matters further, the S_ISCHR macro isn't in libc as well.
+         let is_char_device = (mode & libc::S_IFMT) == libc::S_IFCHR;
+diff --git a/src/pam/mod.rs b/src/pam/mod.rs
+index c28cd85..2cd4863 100644
+--- a/src/pam/mod.rs
++++ b/src/pam/mod.rs
+@@ -18,10 +18,11 @@ mod securemem;
+ 
+ #[cfg_attr(target_os = "linux", path = "sys_linuxpam.rs")]
+ #[cfg_attr(target_os = "freebsd", path = "sys_openpam.rs")]
++#[cfg_attr(target_os = "saltyos", path = "sys_saltyos.rs")]
+ #[allow(nonstandard_style)]
+ pub mod sys;
+ 
+-#[cfg(target_os = "freebsd")]
++#[cfg(any(target_os = "freebsd", target_os = "saltyos"))]
+ const PAM_DATA_SILENT: std::ffi::c_int = 0;
+ 
+ pub use converse::CLIConverser;
+diff --git a/src/pam/sys_saltyos.rs b/src/pam/sys_saltyos.rs
+new file mode 100644
+index 0000000..a10da6b
+--- /dev/null
++++ b/src/pam/sys_saltyos.rs
+@@ -0,0 +1 @@
++include!("./sys_openpam.rs");
+diff --git a/src/system/kernel.rs b/src/system/kernel.rs
+index 52de333..71900ed 100644
+--- a/src/system/kernel.rs
++++ b/src/system/kernel.rs
+@@ -43,7 +43,12 @@ pub fn kernel_check() -> Result<(), Error> {
+     Ok(())
+ }
+ 
+-#[cfg(not(any(target_os = "freebsd", target_os = "linux")))]
++#[cfg(target_os = "saltyos")]
+ pub fn kernel_check() -> Result<(), Error> {
+-    compile_error!("sudo-rs only works on Linux and FreeBSD")
++    Ok(())
++}
++
++#[cfg(not(any(target_os = "freebsd", target_os = "linux", target_os = "saltyos")))]
++pub fn kernel_check() -> Result<(), Error> {
++    compile_error!("sudo-rs only works on Linux, FreeBSD and SaltyOS")
+ }
+diff --git a/src/system/mod.rs b/src/system/mod.rs
+index 6644b5c..1d4d852 100644
+--- a/src/system/mod.rs
++++ b/src/system/mod.rs
+@@ -1,6 +1,6 @@
+ use core::fmt;
+ // TODO: remove unused attribute when system is cleaned up
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "saltyos"))]
+ use std::str::FromStr;
+ use std::{
+     collections::BTreeSet,
+@@ -116,6 +116,30 @@ impl FileCloser {
+ 
+ fn close_range(min_fd: c_uint, max_fd: c_uint) -> io::Result<()> {
+     if min_fd <= max_fd {
++        #[cfg(target_os = "saltyos")]
++        {
++            let open_max = crate::cutils::sysconf(libc::_SC_OPEN_MAX)
++                .filter(|v| *v > 0)
++                .unwrap_or(1024) as c_uint;
++            let capped_max = if max_fd == c_uint::MAX {
++                open_max.saturating_sub(1)
++            } else {
++                max_fd.min(open_max.saturating_sub(1))
++            };
++            let mut fd = min_fd;
++            while fd <= capped_max {
++                // SAFETY: closing an integer fd is always memory-safe, and per-fd errors are ignored.
++                unsafe {
++                    libc::close(fd as libc::c_int);
++                }
++                if fd == c_uint::MAX {
++                    break;
++                }
++                fd += 1;
++            }
++        }
++
++        #[cfg(not(target_os = "saltyos"))]
+         // SAFETY: this function is safe to call:
+         // - any errors while closing a specific fd will be effectively ignored
+         // - if the provided range or flags are invalid, that will be reported
+@@ -601,7 +625,7 @@ pub enum WithProcess {
+ }
+ 
+ impl WithProcess {
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "saltyos"))]
+     fn to_proc_string(&self) -> String {
+         match self {
+             WithProcess::Current => "self".into(),
+@@ -660,7 +684,7 @@ impl Process {
+ 
+     /// Returns the device identifier of the TTY device that is currently
+     /// attached to the given process
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "saltyos"))]
+     pub fn tty_device_id(pid: WithProcess) -> std::io::Result<Option<DeviceId>> {
+         // device id of tty is displayed as a signed integer of 32 bits
+         let data: i32 = read_proc_stat(pid, 6 /* tty_nr */)?;
+@@ -735,7 +759,7 @@ impl Process {
+     }
+ 
+     /// Get the process starting time of a specific process
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "saltyos"))]
+     pub fn starting_time(pid: WithProcess) -> io::Result<ProcessCreateTime> {
+         let process_start: u64 = read_proc_stat(pid, 21 /* start_time */)?;
+ 
+@@ -821,7 +845,7 @@ impl Process {
+ /// IMPORTANT: the first two fields are not accessible with this routine.
+ ///
+ /// [proc_stat_fields]: https://www.kernel.org/doc/html/latest/filesystems/proc.html#id10
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "saltyos"))]
+ fn read_proc_stat<T: FromStr>(pid: WithProcess, field_idx: isize) -> io::Result<T> {
+     // the first two fields are skipped by the code below, and we never need them,
+     // so no point in implementing code for it in this private function.
+@@ -898,10 +922,10 @@ pub fn make_zeroed_sigaction() -> libc::sigaction {
+     unsafe { std::mem::zeroed() }
+ }
+ 
+-#[cfg(all(test, target_os = "linux"))]
++#[cfg(all(test, any(target_os = "linux", target_os = "saltyos")))]
+ pub(crate) const ROOT_GROUP_NAME: &str = "root";
+ 
+-#[cfg(all(test, not(target_os = "linux")))]
++#[cfg(all(test, not(any(target_os = "linux", target_os = "saltyos"))))]
+ pub(crate) const ROOT_GROUP_NAME: &str = "wheel";
+ 
+ #[allow(clippy::undocumented_unsafe_blocks)]
+@@ -1159,7 +1183,7 @@ mod tests {
+         assert_eq!(status.exit_status(), Some(0));
+     }
+ 
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "saltyos"))]
+     #[test]
+     fn proc_stat_test() {
+         use super::{read_proc_stat, Process, WithProcess::Current};
+diff --git a/src/system/signal/info.rs b/src/system/signal/info.rs
+index c48e028..0eba99f 100644
+--- a/src/system/signal/info.rs
++++ b/src/system/signal/info.rs
+@@ -23,7 +23,7 @@ impl SignalInfo {
+     pub(crate) fn signaler_pid(&self) -> Option<ProcessId> {
+         if self.is_user_signaled() {
+             // SAFETY: si_pid is always initialized if the signal is user signaled.
+-            let id = unsafe { self.info.si_pid() };
++            let id = self.info.si_pid;
+             Some(ProcessId::new(id))
+         } else {
+             None
+diff --git a/src/visudo/mod.rs b/src/visudo/mod.rs
+index 0c73dda..ec57a99 100644
+--- a/src/visudo/mod.rs
++++ b/src/visudo/mod.rs
+@@ -335,8 +335,10 @@ fn edit_sudoers_file(
+ fn editor_path_fallback() -> io::Result<PathBuf> {
+     let editors = if cfg!(target_os = "linux") {
+         &["/usr/bin/editor"][..]
++    } else if cfg!(target_os = "saltyos") {
++        &["/bin/vi", "/usr/bin/vi"][..]
+     } else if cfg!(target_os = "freebsd") {
+-        &["/usr/bin/vi"]
++        &["/usr/bin/vi"][..]
+     } else {
+         unimplemented!("unknown default editor for target")
+     };

@@ -40,11 +40,11 @@
 #![no_std]
 #![no_main]
 
-mod types;
 mod client;
 mod mmap;
 mod pool;
 mod shm;
+mod types;
 
 use trona::consts::kernel::*;
 use trona::consts::server::*;
@@ -60,16 +60,19 @@ use types::*;
 // Cap slot layout
 // ---------------------------------------------------------------------------
 
-const CAP_SERVER_EP: u64 = 3;
-const CAP_UNTYPED: u64 = 7;
-const CAP_INITRD_UNTYPED: u64 = 12;
-const CAP_READINESS_NTFN: u64 = 14;
-const CAP_UNTYPED_START: u64 = 16;
-const CAP_NAMESERV: u64 = 64;
+// namesrv endpoint is delivered by init at the slot named in
+// `mmsrv.service` NeedEP=namesrv:64. Init also pushes ROLE_NAMESRV_CLIENT
+// into mmsrv's startup cap_table (see
+// `ini::system_role_for_bare_name`), so the substrate getter returns the
+// correct slot regardless of the specific NeedEP assignment.
 const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 
-/// VFS pager callback EP: when set (non-zero), mmsrv routes VFS_PAGER_READ /
-/// VFS_PAGER_WRITE requests through this EP instead of the VFS service EP.
+// rsrcsrv / readiness / initrd slots are delivered by init via `AT_TRONA_*`
+// auxv tags. The cursor places them at varying positions, so we read them at
+// runtime through the substrate `caps::*` getters. The service endpoint
+// remains the fixed child slot 3 for init-spawned bootstrap services.
+/// VFS pager callback EP: when set (non-zero), mmsrv routes VFS_BACKEND_PAGER_READ /
+/// VFS_BACKEND_PAGER_WRITE requests through this EP instead of the VFS service EP.
 /// This breaks the VFS↔MMSRV cycle by allowing VFS to receive pager requests
 /// on a dedicated callback EP while it's blocked on mmsrv's service EP.
 ///
@@ -77,14 +80,10 @@ const IPC_BUF_VADDR: u64 = 0x0000_0000_0020_0000;
 /// injected by init. Zero means not registered (use VFS service EP directly).
 static mut VFS_PAGER_CALLBACK_EP: Cap = 0;
 
-/// Receive slot pool: top of CSpace to avoid conflicts with slot_alloc.
-/// CNodeBits=16 → 65536 total slots. Reserve last 1024 for cap receives.
-const RECV_SLOT_BASE: Cap = 0xFC00; // 64512
-const RECV_SLOT_END: Cap = 0x10000; // 65536
-
 // ---------------------------------------------------------------------------
-// Self-mmap: internal memory allocation for mmsrv's own data structures.
-// Cannot use posix_mmap (would be recursive IPC). Direct retype + vspace_map.
+// Internal metadata allocation for mmsrv's own data structures.
+// Cannot use posix_mmap (would be recursive IPC), so metadata lives in
+// private tracked MOs mapped into mmsrv's own VSpace.
 // ---------------------------------------------------------------------------
 
 const SELF_MMAP_BASE: u64 = 0x2000_0000;
@@ -94,30 +93,107 @@ const CAP_SELF_TCB: Cap = 0;
 const CAP_SELF_VSPACE: Cap = 1;
 const CAP_SELF_CSPACE: Cap = 2;
 
-unsafe fn self_mmap(num_pages: usize) -> *mut u8 {
+unsafe fn tracked_alloc_pages(num_pages: usize) -> TrackedBuffer {
     unsafe {
-        let base = *(&raw const SELF_MMAP_NEXT);
-        for i in 0..num_pages {
-            let slot = match trona::slot_alloc::slot_alloc() {
-                Some(s) => s,
-                None => return core::ptr::null_mut(),
-            };
-            if retype_any(OBJ_FRAME, 0, slot) != 0 {
-                return core::ptr::null_mut();
-            }
-            let err = invoke::vspace_map(
-                CAP_SELF_VSPACE,
-                slot,
-                base + i as u64 * 4096,
-                VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
-            );
-            if err != 0 {
-                return core::ptr::null_mut();
-            }
+        if num_pages == 0 {
+            return TrackedBuffer::zeroed();
         }
+
+        let base = *(&raw const SELF_MMAP_NEXT);
+        let (mo_cap, actual_pages) = create_mo(num_pages);
+        if mo_cap == 0 || actual_pages < num_pages {
+            if mo_cap != 0 {
+                recycled_cnode_delete(mo_cap);
+            }
+            return TrackedBuffer::zeroed();
+        }
+
+        let (commit_err, committed) = commit_mo_pages(mo_cap, 0, num_pages as u64);
+        if commit_err != 0 || committed != num_pages as u64 {
+            recycled_cnode_delete(mo_cap);
+            return TrackedBuffer::zeroed();
+        }
+
+        let count_and_flags = ((num_pages as u64) << 32) | VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER;
+        let (map_err, mapped) =
+            invoke::vspace_map_mo_with_count(CAP_SELF_VSPACE, mo_cap, base, 0, count_and_flags);
+        if map_err != 0 || mapped != num_pages as u64 {
+            for page in 0..mapped {
+                let _ = invoke::vspace_unmap(CAP_SELF_VSPACE, base + page * 4096);
+            }
+            recycled_cnode_delete(mo_cap);
+            return TrackedBuffer::zeroed();
+        }
+
         *(&raw mut SELF_MMAP_NEXT) = base + num_pages as u64 * 4096;
         core::ptr::write_bytes(base as *mut u8, 0, num_pages * 4096);
-        base as *mut u8
+        trona::udebug!(|_lb| {
+            _lb.str(b"[MMSRV] tracked_alloc pages=");
+            _lb.hex(num_pages as u64);
+            _lb.str(b" base=");
+            _lb.hex(base);
+            _lb.str(b" mo=");
+            _lb.hex(mo_cap);
+            _lb.str(b" self_next=");
+            _lb.hex(*(&raw const SELF_MMAP_NEXT));
+            _lb.str(b"\n");
+        });
+        TrackedBuffer {
+            ptr: base as *mut u8,
+            pages: num_pages,
+            mo_cap,
+        }
+    }
+}
+
+unsafe fn tracked_free_pages(buf: TrackedBuffer) {
+    unsafe {
+        if buf.ptr.is_null() || buf.pages == 0 || buf.mo_cap == 0 {
+            return;
+        }
+
+        for page in 0..buf.pages as u64 {
+            let _ = invoke::vspace_unmap(CAP_SELF_VSPACE, buf.ptr as u64 + page * 4096);
+        }
+        recycled_cnode_delete(buf.mo_cap);
+        trona::udebug!(|_lb| {
+            _lb.str(b"[MMSRV] tracked_free pages=");
+            _lb.hex(buf.pages as u64);
+            _lb.str(b" base=");
+            _lb.hex(buf.ptr as u64);
+            _lb.str(b" mo=");
+            _lb.hex(buf.mo_cap);
+            _lb.str(b"\n");
+        });
+    }
+}
+
+/// Allocate a kernel object from rsrcsrv into `dest_slot`. mmsrv is its own
+/// owner — `owner_id=0` makes rsrcsrv use mmsrv's caller badge automatically.
+unsafe fn rsrcsrv_alloc_object(obj_type: u64, size_bits: u64, dest_slot: Cap) -> i32 {
+    unsafe {
+        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, dest_slot, 0);
+        let mut req = TronaMsg::zeroed();
+        req.label = RES_ALLOC_OBJECT;
+        req.length = 4;
+        req.regs[0] = 0;
+        req.regs[1] = obj_type;
+        req.regs[2] = size_bits;
+        req.regs[3] = 0;
+        let mut resp = TronaMsg::zeroed();
+        let err = ipc::call_ctx(
+            ipc_ctx(),
+            trona::caps::rsrcsrv_ep(),
+            &raw const req,
+            &raw mut resp,
+        );
+        if err != 0 {
+            return err;
+        }
+        if resp.label != TRONA_OK {
+            return resp.label as i32;
+        }
+        0
     }
 }
 
@@ -166,7 +242,7 @@ unsafe fn create_mo(min_pages: usize) -> (Cap, usize) {
             Some(s) => s,
             None => return (0, 0),
         };
-        if retype_any(OBJ_MEMORY_OBJECT, sb, slot) != 0 {
+        if rsrcsrv_alloc_object(OBJ_MEMORY_OBJECT, sb, slot) != 0 {
             recycle_empty_slot(slot);
             return (0, 0);
         }
@@ -175,32 +251,8 @@ unsafe fn create_mo(min_pages: usize) -> (Cap, usize) {
 }
 
 // ---------------------------------------------------------------------------
-// Untyped source tracking
-// ---------------------------------------------------------------------------
-
-static mut UT_SOURCES: [UntypedSource; MAX_UT_SOURCES] = {
-    const E: UntypedSource = UntypedSource::empty();
-    [E; MAX_UT_SOURCES]
-};
-static mut UT_COUNT: usize = 0;
-static mut UT_HINT: usize = 0;
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Allocate a Cap array of `cap` entries via self_mmap (used by SHM).
-unsafe fn alloc_frame_cap_array(cap: usize) -> *mut Cap {
-    unsafe {
-        let bytes = cap * core::mem::size_of::<Cap>();
-        let pages = (bytes + 4095) / 4096;
-        let ptr = self_mmap(pages);
-        if ptr.is_null() {
-            return core::ptr::null_mut();
-        }
-        ptr as *mut Cap
-    }
-}
 
 /// Convert POSIX prot flags to VSpace flags.
 fn prot_to_vspace_flags(prot: u8) -> u64 {
@@ -225,100 +277,88 @@ fn vspace_flags_to_prot(flags: u64) -> u8 {
     prot
 }
 
-/// Commit `count` pages starting at `offset` in a MemoryObject, trying each
-/// available untyped source (round-robin from UT_HINT). If an untyped is
-/// partially exhausted, continues with the next untyped for the remaining
-/// pages. Falls back to PMM (ut_cap=0) as a last resort.
-///
-/// Returns `(error, total_committed)`.
-///
-/// # Safety
-///
-/// Must be called from the mmsrv main loop (single-threaded access to statics).
+/// Commit `count` pages starting at `offset` in a MemoryObject. mmsrv no
+/// longer owns any untyped of its own — every commit goes through the
+/// kernel PMM path (`ut_cap=0`). The kernel handles physical-frame
+/// allocation directly via the bitmap PMM.
 unsafe fn commit_mo_pages(mo_cap: Cap, offset: u64, count: u64) -> (i32, u64) {
+    unsafe { invoke::mo_commit(mo_cap, offset, count, 0) }
+}
+
+unsafe fn debug_total_region_count() -> usize {
     unsafe {
-        let ut_count = *(&raw const UT_COUNT);
-        if ut_count == 0 {
-            // No untyped sources — fall back to PMM directly
-            return invoke::mo_commit(mo_cap, offset, count, 0);
+        let ptr = *(&raw const CLIENTS_PTR);
+        let cap = *(&raw const CLIENTS_CAP);
+        if ptr.is_null() || cap == 0 {
+            return 0;
         }
 
-        let start = {
-            let h = *(&raw const UT_HINT);
-            if h < ut_count { h } else { 0 }
-        };
-
-        let sources = &*(&raw const UT_SOURCES);
-        let mut remaining = count;
-        let mut cur_offset = offset;
-        let mut total_committed: u64 = 0;
-
-        // First pass: from hint to end
-        for i in start..ut_count {
-            if remaining == 0 {
-                break;
-            }
-            if !sources[i].active {
-                continue;
-            }
-            let (err, committed) = invoke::mo_commit(mo_cap, cur_offset, remaining, sources[i].cap);
-            if committed > 0 {
-                total_committed += committed;
-                cur_offset += committed;
-                remaining -= committed;
-                *(&raw mut UT_HINT) = i;
-            }
-            if err != 0 && committed == 0 {
-                if err as u64 == TRONA_OUT_OF_MEMORY {
-                    deactivate_ut_source(i);
-                }
-                continue;
-            }
-            if remaining == 0 {
-                return (0, total_committed);
+        let mut total = 0usize;
+        for i in 0..cap {
+            let client = ptr.add(i);
+            if (*client).active {
+                total = total.saturating_add((*client).region_count);
             }
         }
+        total
+    }
+}
 
-        // Second pass: wrap around (0..start)
-        for i in 0..start {
-            if remaining == 0 {
-                break;
-            }
-            if !sources[i].active {
-                continue;
-            }
-            let (err, committed) = invoke::mo_commit(mo_cap, cur_offset, remaining, sources[i].cap);
-            if committed > 0 {
-                total_committed += committed;
-                cur_offset += committed;
-                remaining -= committed;
-                *(&raw mut UT_HINT) = i;
-            }
-            if err != 0 && committed == 0 {
-                if err as u64 == TRONA_OUT_OF_MEMORY {
-                    deactivate_ut_source(i);
-                }
-                continue;
-            }
-            if remaining == 0 {
-                return (0, total_committed);
-            }
+unsafe fn debug_total_region_buf_pages() -> usize {
+    unsafe {
+        let ptr = *(&raw const CLIENTS_PTR);
+        let cap = *(&raw const CLIENTS_CAP);
+        if ptr.is_null() || cap == 0 {
+            return 0;
         }
 
-        if remaining == 0 {
-            return (0, total_committed);
+        let mut total = 0usize;
+        for i in 0..cap {
+            let client = ptr.add(i);
+            if (*client).active {
+                total = total.saturating_add((*client).regions_buf.pages);
+            }
         }
+        total
+    }
+}
 
-        // Final fallback: PMM (ut_cap=0)
-        let (err, committed) = invoke::mo_commit(mo_cap, cur_offset, remaining, 0);
-        total_committed += committed;
-        remaining -= committed;
-
-        if remaining == 0 {
-            (0, total_committed)
-        } else {
-            (err, total_committed)
-        }
+pub(crate) unsafe fn debug_log_state(prefix: &[u8], client: *const MmClient) {
+    unsafe {
+        let total_regions = debug_total_region_count();
+        let total_region_pages = debug_total_region_buf_pages();
+        trona::udebug!(|_lb| {
+            _lb.bytes(prefix);
+            _lb.str(b" clients=");
+            _lb.hex(*(&raw const CLIENT_COUNT) as u64);
+            _lb.str(b" total_regions=");
+            _lb.hex(total_regions as u64);
+            _lb.str(b" total_region_pages=");
+            _lb.hex(total_region_pages as u64);
+            _lb.str(b" free_slots=");
+            _lb.hex(*(&raw const FREE_SLOT_COUNT) as u64);
+            _lb.str(b" frame_pool=");
+            _lb.hex(*(&raw const FRAME_POOL_COUNT) as u64);
+            _lb.str(b" self_next=");
+            _lb.hex(*(&raw const SELF_MMAP_NEXT));
+            if !client.is_null() {
+                _lb.str(b" badge=");
+                _lb.hex((*client).badge);
+                _lb.str(b" pid=");
+                _lb.hex((*client).pid as u64);
+                _lb.str(b" rc=");
+                _lb.hex((*client).region_count as u64);
+                _lb.str(b" cap=");
+                _lb.hex((*client).region_cap as u64);
+                _lb.str(b" rpages=");
+                _lb.hex((*client).regions_buf.pages as u64);
+                _lb.str(b" heap=");
+                _lb.hex((*client).heap_current);
+                _lb.str(b" mmap=");
+                _lb.hex((*client).mmap_next);
+            }
+            _lb.str(b"\n");
+        });
     }
 }
 
@@ -329,11 +369,14 @@ unsafe fn commit_mo_pages(mo_cap: Cap, offset: u64, count: u64) -> (i32, u64) {
 static mut CLIENTS_PTR: *mut MmClient = core::ptr::null_mut();
 static mut CLIENTS_CAP: usize = 0;
 static mut CLIENT_COUNT: usize = 0;
+static mut CLIENTS_BUF: TrackedBuffer = TrackedBuffer::zeroed();
 
 /// Receive slot tracking: NEXT_RECV_SLOT is the bump allocator pointer,
 /// CURRENT_RECV_SLOT is the slot configured for the current recv operation,
 /// RECV_SLOT_KEPT indicates if the handler permanently kept the cap.
-static mut NEXT_RECV_SLOT: Cap = RECV_SLOT_BASE;
+static mut RECV_SLOT_BASE_RUNTIME: Cap = 0;
+static mut RECV_SLOT_END_RUNTIME: Cap = 0;
+static mut NEXT_RECV_SLOT: Cap = 0;
 static mut CURRENT_RECV_SLOT: Cap = 0;
 static mut RECV_SLOT_KEPT: bool = false;
 
@@ -350,6 +393,7 @@ static mut PENDING_CLEANUP_COUNT: usize = 0;
 static mut FREE_SLOTS_PTR: *mut u32 = core::ptr::null_mut();
 static mut FREE_SLOTS_CAP: usize = 0;
 static mut FREE_SLOT_COUNT: usize = 0;
+static mut FREE_SLOTS_BUF: TrackedBuffer = TrackedBuffer::zeroed();
 
 // ---------------------------------------------------------------------------
 // Frame cap recycling pool
@@ -359,6 +403,7 @@ static mut FREE_SLOT_COUNT: usize = 0;
 static mut FRAME_POOL_PTR: *mut u64 = core::ptr::null_mut();
 static mut FRAME_POOL_CAP: usize = 0;
 static mut FRAME_POOL_COUNT: usize = 0;
+static mut FRAME_POOL_BUF: TrackedBuffer = TrackedBuffer::zeroed();
 
 /// Zeroing window: used by frame_pool_push for zeroing before pool push.
 /// Located just below SELF_MMAP_BASE to avoid VA conflicts.
@@ -395,9 +440,10 @@ unsafe fn init_dynamic_pools() {
         // Allocate FREE_SLOTS array (cap * 4 bytes)
         let slot_bytes = cap * core::mem::size_of::<u32>();
         let slot_pages = (slot_bytes + 4095) / 4096;
-        let slot_ptr = self_mmap(slot_pages);
-        if !slot_ptr.is_null() {
-            *(&raw mut FREE_SLOTS_PTR) = slot_ptr as *mut u32;
+        let slot_buf = tracked_alloc_pages(slot_pages);
+        if !slot_buf.ptr.is_null() {
+            *(&raw mut FREE_SLOTS_BUF) = slot_buf;
+            *(&raw mut FREE_SLOTS_PTR) = slot_buf.ptr as *mut u32;
             *(&raw mut FREE_SLOTS_CAP) = cap;
         } else {
             trona::uwarn!(|_lb| {
@@ -408,9 +454,10 @@ unsafe fn init_dynamic_pools() {
         // Allocate FRAME_POOL array (cap * 8 bytes)
         let pool_bytes = cap * core::mem::size_of::<u64>();
         let pool_pages = (pool_bytes + 4095) / 4096;
-        let pool_ptr = self_mmap(pool_pages);
-        if !pool_ptr.is_null() {
-            *(&raw mut FRAME_POOL_PTR) = pool_ptr as *mut u64;
+        let pool_buf = tracked_alloc_pages(pool_pages);
+        if !pool_buf.ptr.is_null() {
+            *(&raw mut FRAME_POOL_BUF) = pool_buf;
+            *(&raw mut FRAME_POOL_PTR) = pool_buf.ptr as *mut u64;
             *(&raw mut FRAME_POOL_CAP) = cap;
         } else {
             trona::uwarn!(|_lb| {
@@ -434,6 +481,7 @@ unsafe fn init_dynamic_pools() {
 
 static mut SHM_PTR: *mut ShmObject = core::ptr::null_mut();
 static mut SHM_CAP: usize = 0;
+static mut SHM_BUF: TrackedBuffer = TrackedBuffer::zeroed();
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -444,7 +492,7 @@ fn ipc_ctx() -> *mut IpcContext {
 }
 
 fn signal_ready() {
-    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, trona::caps::readiness_ntfn(), 1, 0, 0, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -481,7 +529,12 @@ pub(crate) unsafe fn resolve_vfs_ep() -> Cap {
         }
 
         let mut reply = TronaMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV, &raw const msg, &raw mut reply);
+        let err = ipc::call_ctx(
+            ipc_ctx(),
+            trona::caps::namesrv_ep(),
+            &raw const msg,
+            &raw mut reply,
+        );
         if err != 0 || reply.label != TRONA_OK {
             recycle_empty_slot(ep_slot);
             trona::uerror!(|_lb| {
@@ -498,186 +551,9 @@ pub(crate) unsafe fn resolve_vfs_ep() -> Cap {
     }
 }
 
-/// Register a sub-untyped provisioned by procmgr via MM_PROVISION_UNTYPED.
-/// Returns true on success.
-unsafe fn register_provisioned_untyped(cap: Cap) -> bool {
-    unsafe {
-        let count = *(&raw const UT_COUNT);
-        if count >= MAX_UT_SOURCES {
-            return false;
-        }
-        let sources_ptr = &raw mut UT_SOURCES;
-        (*sources_ptr)[count] = UntypedSource {
-            cap,
-            active: true,
-        };
-        *(&raw mut UT_COUNT) = count + 1;
-        *(&raw mut UT_HINT) = count;
-        trona::uinfo!(|_lb| {
-            _lb.str(b"[MMSRV] provisioned untyped slot=");
-            _lb.hex(cap);
-            _lb.str(b" total=");
-            _lb.dec((count + 1) as u64);
-            _lb.str(b"\n");
-        });
-        true
-    }
-}
-
-unsafe fn deactivate_ut_source(index: usize) {
-    unsafe {
-        let count = *(&raw const UT_COUNT);
-        if index >= count {
-            return;
-        }
-        let sources_ptr = &raw mut UT_SOURCES;
-        if !(*sources_ptr)[index].active {
-            return;
-        }
-        (*sources_ptr)[index].active = false;
-        trona::uwarn!(|_lb| {
-            _lb.str(b"[MMSRV] deactivating exhausted UT source idx=");
-            _lb.dec(index as u64);
-            _lb.str(b" cap=");
-            _lb.hex((*sources_ptr)[index].cap);
-            _lb.str(b"\n");
-        });
-    }
-}
-
-/// Estimate remaining retype capacity (number of active UT sources).
-unsafe fn estimate_capacity() -> u64 {
-    unsafe {
-        let count = *(&raw const UT_COUNT);
-        let sources = &*(&raw const UT_SOURCES);
-        let mut active = 0u64;
-        for i in 0..count {
-            if sources[i].active {
-                active += 1;
-            }
-        }
-        active
-    }
-}
-
-/// Retype an object from any available untyped source (round-robin scan).
-unsafe fn retype_any(obj_type: u64, size_bits: u64, dest_slot: Cap) -> i32 {
-    unsafe {
-        let ut_count = *(&raw const UT_COUNT);
-        if ut_count == 0 {
-            return TRONA_OUT_OF_MEMORY as i32;
-        }
-
-        let start = {
-            let h = *(&raw const UT_HINT);
-            if h < ut_count { h } else { 0 }
-        };
-
-        let sources = &*(&raw const UT_SOURCES);
-
-        // First pass: from hint to end
-        for i in start..ut_count {
-            if !sources[i].active {
-                continue;
-            }
-            let err = invoke::untyped_retype(sources[i].cap, obj_type, size_bits, dest_slot);
-            if err == 0 {
-                *(&raw mut UT_HINT) = i;
-                return 0;
-            }
-            if err as u64 == TRONA_OUT_OF_MEMORY {
-                deactivate_ut_source(i);
-            }
-        }
-
-        // Second pass: wrap around
-        for i in 0..start {
-            if !sources[i].active {
-                continue;
-            }
-            let err = invoke::untyped_retype(sources[i].cap, obj_type, size_bits, dest_slot);
-            if err == 0 {
-                *(&raw mut UT_HINT) = i;
-                return 0;
-            }
-            if err as u64 == TRONA_OUT_OF_MEMORY {
-                deactivate_ut_source(i);
-            }
-        }
-
-        // All sources exhausted — log per-source diagnostics
-        trona::uerror!(|_lb| {
-            _lb.str(b"[MMSRV] retype_any: all ");
-            _lb.hex(ut_count as u64);
-            _lb.str(b" sources failed, type=");
-            _lb.hex(obj_type);
-            _lb.str(b"\n");
-        });
-        for i in 0..ut_count {
-            if !sources[i].active {
-                continue;
-            }
-            let err = invoke::untyped_retype(sources[i].cap, obj_type, size_bits, dest_slot);
-            trona::uerror!(|_lb| {
-                _lb.str(b"  src[");
-                _lb.hex(i as u64);
-                _lb.str(b"] cap=");
-                _lb.hex(sources[i].cap);
-                _lb.str(b" err=");
-                _lb.hex(err as u64);
-                _lb.str(b"\n");
-            });
-            if err == 0 {
-                *(&raw mut UT_HINT) = i;
-                return 0;
-            }
-            if err as u64 == TRONA_OUT_OF_MEMORY {
-                deactivate_ut_source(i);
-            }
-        }
-
-        TRONA_OUT_OF_MEMORY as i32
-    }
-}
-
-/// Initialize the untyped source pool from well-known cap slots.
-unsafe fn init_untyped_pool() {
-    unsafe {
-        let sources = &raw mut UT_SOURCES;
-        let mut count: usize = 0;
-
-        // Primary child untyped at slot 7
-        (*sources)[count] = UntypedSource {
-            cap: CAP_UNTYPED,
-            active: true,
-        };
-        count += 1;
-
-        // Mirrored parent untyped caps at slots 16+
-        for slot in CAP_UNTYPED_START..CAP_UNTYPED_START + 16 {
-            if count >= MAX_UT_SOURCES {
-                break;
-            }
-            // Probe: try to retype a frame. If it succeeds, this untyped exists.
-            // We don't actually want the frame, so just record the source.
-            // Simpler: just add it and let retype_any skip on failure.
-            (*sources)[count] = UntypedSource {
-                cap: slot,
-                active: true,
-            };
-            count += 1;
-        }
-
-        *(&raw mut UT_COUNT) = count;
-        *(&raw mut UT_HINT) = 0;
-
-        trona::uinfo!(|_lb| {
-            _lb.str(b"[MMSRV] untyped pool: ");
-            _lb.hex(count as u64);
-            _lb.str(b" sources\n");
-        });
-    }
-}
+// Untyped pool, MM_PROVISION_UNTYPED handler, MM_QUERY_CAPACITY estimator,
+// retype_any round-robin scan, and init_untyped_pool — all gone. mmsrv now
+// asks rsrcsrv for every kernel object via `rsrcsrv_alloc_object`.
 
 // ---------------------------------------------------------------------------
 // Nameserv registration
@@ -696,10 +572,15 @@ unsafe fn register_with_namesrv() -> bool {
         }
 
         // Send our server EP cap
-        ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, 3);
 
         let mut reply = TronaMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESERV, &raw const msg, &raw mut reply);
+        let err = ipc::call_ctx(
+            ipc_ctx(),
+            trona::caps::namesrv_ep(),
+            &raw const msg,
+            &raw mut reply,
+        );
         if err != 0 || reply.label != TRONA_OK {
             trona::uerror!(|_lb| {
                 _lb.str(b"[MMSRV] namesrv register failed err=");
@@ -719,7 +600,7 @@ unsafe fn register_with_namesrv() -> bool {
 unsafe fn alloc_recv_slot() -> Cap {
     unsafe {
         let slot = *(&raw const NEXT_RECV_SLOT);
-        if slot >= RECV_SLOT_END {
+        if slot >= *(&raw const RECV_SLOT_END_RUNTIME) {
             return 0;
         }
         *(&raw mut NEXT_RECV_SLOT) = slot + 1;
@@ -752,7 +633,7 @@ pub(crate) fn recycled_slot_alloc() -> Option<u64> {
             }
         }
     }
-    trona::slot_alloc::slot_alloc()
+    trona::slot_alloc::slot_alloc_no_expand()
 }
 
 /// Delete a capability and return its CNode slot to the free pool for reuse.
@@ -805,7 +686,9 @@ pub(crate) fn frame_pool_push(frame_cap: Cap) {
         }
         let va = ZERO_WINDOW_BASE;
         let err = invoke::vspace_map(
-            CAP_SELF_VSPACE, frame_cap, va,
+            CAP_SELF_VSPACE,
+            frame_cap,
+            va,
             VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER,
         );
         if err != 0 {
@@ -841,18 +724,18 @@ pub(crate) fn frame_pool_pop() -> Option<Cap> {
     }
 }
 
-/// Allocate a frame cap: tries the recycled frame pool first, then falls
-/// back to slot_alloc + retype_any. Returns the CNode slot holding a valid
+/// Allocate a frame cap: tries the recycled frame pool first, then asks
+/// rsrcsrv for a fresh `OBJ_FRAME`. Returns the CNode slot holding a valid
 /// frame cap, or None on OOM.
 pub(crate) fn alloc_frame() -> Option<Cap> {
     // Tier 1: recycled frame (already zeroed)
     if let Some(cap) = frame_pool_pop() {
         return Some(cap);
     }
-    // Tier 2: fresh retype
+    // Tier 2: fresh allocation via rsrcsrv
     let slot = recycled_slot_alloc()?;
-    // SAFETY: retype_any accesses static state; mmsrv is single-threaded.
-    if unsafe { retype_any(OBJ_FRAME, 0, slot) } != 0 {
+    // SAFETY: rsrcsrv_alloc_object touches static IPC state; mmsrv is single-threaded.
+    if unsafe { rsrcsrv_alloc_object(OBJ_FRAME, 0, slot) } != 0 {
         recycle_empty_slot(slot);
         return None;
     }
@@ -887,28 +770,41 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         _lb.str(b"[MMSRV] IPC buffer ready\n");
     });
 
-    // Initialize per-process slot allocator from RTLD-exported globals.
-    // self_mmap() depends on slot_alloc for temporary frame-cap slots.
+    // Ensure the startup CSpace contract is coherent before continuing.
     unsafe {
-        let base = *(&raw const trona::__trona_slot_base);
-        let count = *(&raw const trona::__trona_slot_count);
-        let cspace_ntfn = *(&raw const trona::__trona_cspace_ntfn);
-        // Clamp count so the bump allocator cannot reach the receive-slot pool.
-        let max_count = RECV_SLOT_BASE.saturating_sub(base);
-        let count = if count > max_count { max_count } else { count };
-        if base != 0 {
-            trona::slot_alloc::slot_alloc_init(base, count, cspace_ntfn);
-        } else {
+        let Some(cspace_layout) = trona::runtime_get_cspace_layout() else {
             trona::uerror!(|_lb| {
-                _lb.str(b"[MMSRV] FATAL: slot pool not provided by RTLD/auxv\n");
+                _lb.str(b"[MMSRV] FATAL: missing startup CSpace layout\n");
+            });
+            idle();
+        };
+
+        if !cspace_layout.has_recv_range() {
+            trona::uerror!(|_lb| {
+                _lb.str(b"[MMSRV] FATAL: pager receive-slot range missing from CSpace layout\n");
             });
             idle();
         }
-    }
 
-    // Initialize untyped pool
-    unsafe {
-        init_untyped_pool();
+        if !trona::slot_alloc::slot_alloc_is_initialized() {
+            trona::uerror!(|_lb| {
+                _lb.str(b"[MMSRV] FATAL: slot allocator not initialized from CSpace layout\n");
+            });
+            idle();
+        }
+
+        let alloc_base = trona::slot_alloc::slot_alloc_base();
+        let alloc_limit = alloc_base.saturating_add(trona::slot_alloc::slot_alloc_count());
+        if alloc_base != cspace_layout.alloc_base || alloc_limit != cspace_layout.alloc_limit {
+            trona::uerror!(|_lb| {
+                _lb.str(b"[MMSRV] FATAL: allocator range does not match startup CSpace layout\n");
+            });
+            idle();
+        }
+
+        *(&raw mut RECV_SLOT_BASE_RUNTIME) = cspace_layout.recv_base;
+        *(&raw mut RECV_SLOT_END_RUNTIME) = cspace_layout.recv_limit;
+        *(&raw mut NEXT_RECV_SLOT) = cspace_layout.recv_base;
     }
 
     // Initialize dynamically-sized free-slot and frame pools
@@ -918,27 +814,29 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
 
     // Initialize growable client table
     unsafe {
-        let ptr = self_mmap(1);
-        if ptr.is_null() {
+        let buf = tracked_alloc_pages(1);
+        if buf.ptr.is_null() {
             trona::uerror!(|_lb| {
                 _lb.str(b"[MMSRV] FATAL: client table alloc failed\n");
             });
             idle();
         }
-        *(&raw mut CLIENTS_PTR) = ptr as *mut MmClient;
+        *(&raw mut CLIENTS_BUF) = buf;
+        *(&raw mut CLIENTS_PTR) = buf.ptr as *mut MmClient;
         *(&raw mut CLIENTS_CAP) = 4096 / core::mem::size_of::<MmClient>();
     }
 
     // Initialize growable SHM table
     unsafe {
-        let ptr = self_mmap(1);
-        if ptr.is_null() {
+        let buf = tracked_alloc_pages(1);
+        if buf.ptr.is_null() {
             trona::uerror!(|_lb| {
                 _lb.str(b"[MMSRV] FATAL: SHM table alloc failed\n");
             });
             idle();
         }
-        *(&raw mut SHM_PTR) = ptr as *mut ShmObject;
+        *(&raw mut SHM_BUF) = buf;
+        *(&raw mut SHM_PTR) = buf.ptr as *mut ShmObject;
         *(&raw mut SHM_CAP) = 4096 / core::mem::size_of::<ShmObject>();
     }
 
@@ -976,7 +874,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     let mut msg = TronaMsg::zeroed();
     let mut badge: u64 = 0;
 
-    let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
+    let err = unsafe { ipc::recv_ctx(ipc_ctx(), 3, &raw mut msg, &raw mut badge) };
     if err != 0 {
         trona::uerror!(|_lb| {
             _lb.str(b"[MMSRV] initial recv failed\n");
@@ -1006,49 +904,81 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         unsafe {
             match msg.label {
                 MM_REGISTER => client::handle_mm_register(&raw const msg, badge, &raw mut reply),
-                MM_DEREGISTER => client::handle_mm_deregister(&raw const msg, badge, &raw mut reply),
+                MM_DEREGISTER => {
+                    client::handle_mm_deregister(&raw const msg, badge, &raw mut reply)
+                }
                 MM_BRK => mmap::handle_mm_brk(&raw const msg, badge, &raw mut reply),
                 MM_SBRK => mmap::handle_mm_sbrk(&raw const msg, badge, &raw mut reply),
                 MM_MMAP => mmap::handle_mm_mmap(&raw const msg, badge, &raw mut reply),
                 MM_MUNMAP => mmap::handle_mm_munmap(&raw const msg, badge, &raw mut reply),
                 MM_MPROTECT => mmap::handle_mm_mprotect(&raw const msg, badge, &raw mut reply),
+                MM_MPROTECT_TARGET => {
+                    mmap::handle_mm_mprotect_target(&raw const msg, badge, &raw mut reply)
+                }
                 MM_MAP_BATCH => mmap::handle_mm_map_batch(&raw const msg, badge, &raw mut reply),
                 MM_MAP_WINDOW => mmap::handle_mm_map_window(&raw const msg, badge, &raw mut reply),
-                MM_UNMAP_WINDOW => mmap::handle_mm_unmap_window(&raw const msg, badge, &raw mut reply),
-                MM_FORK_REGIONS => mmap::handle_mm_fork_regions(&raw const msg, badge, &raw mut reply),
-                MM_ALLOC_THREAD_OBJECTS => mmap::handle_mm_alloc_thread_objects(&raw const msg, badge, &raw mut reply),
+                MM_UNMAP_WINDOW => {
+                    mmap::handle_mm_unmap_window(&raw const msg, badge, &raw mut reply)
+                }
+                MM_FORK_REGIONS => {
+                    mmap::handle_mm_fork_regions(&raw const msg, badge, &raw mut reply)
+                }
                 MM_SHM_CREATE => shm::handle_mm_shm_create(&raw const msg, badge, &raw mut reply),
                 MM_SHM_MAP => shm::handle_mm_shm_map(&raw const msg, badge, &raw mut reply),
                 MM_SHM_UNMAP => shm::handle_mm_shm_unmap(&raw const msg, badge, &raw mut reply),
-                MM_GET_CLIENT_STATS => client::handle_mm_get_client_stats(&raw const msg, badge, &raw mut reply),
-                MM_ALLOC_OBJECT => mmap::handle_mm_alloc_object(&raw const msg, badge, &raw mut reply),
-                MM_REGISTER_SHARED_REGION => mmap::handle_mm_register_shared_region(&raw const msg, badge, &raw mut reply),
-                MM_MAP_OBJECT_REGION => mmap::handle_mm_map_object_region(&raw const msg, badge, &raw mut reply),
-                MM_SYNC_FILE_BACKING => mmap::handle_mm_sync_file_backing(&raw const msg, badge, &raw mut reply),
+                MM_SHM_DESTROY => shm::handle_mm_shm_destroy(&raw const msg, badge, &raw mut reply),
+                MM_SHM_RESIZE => shm::handle_mm_shm_resize(&raw const msg, badge, &raw mut reply),
+                MM_GET_CLIENT_STATS => {
+                    client::handle_mm_get_client_stats(&raw const msg, badge, &raw mut reply)
+                }
+                MM_REGISTER_SHARED_REGION => {
+                    mmap::handle_mm_register_shared_region(&raw const msg, badge, &raw mut reply)
+                }
+                MM_MAP_OBJECT_REGION => {
+                    mmap::handle_mm_map_object_region(&raw const msg, badge, &raw mut reply)
+                }
+                MM_SYNC_FILE_BACKING => {
+                    mmap::handle_mm_sync_file_backing(&raw const msg, badge, &raw mut reply)
+                }
                 MM_FILE_MMAP => mmap::handle_mm_file_mmap(&raw const msg, badge, &raw mut reply),
-                MM_SYNC_MMAP_WRITE => mmap::handle_mm_sync_mmap_write(&raw const msg, badge, &raw mut reply),
-                MM_PROVISION_UNTYPED => {
-                    // Procmgr pushes a sub-untyped to replenish our pool.
-                    // The cap arrives via IPC cap transfer at CURRENT_RECV_SLOT.
-                    let recv_slot = *(&raw const CURRENT_RECV_SLOT);
-                    if register_provisioned_untyped(recv_slot) {
-                        mark_recv_slot_kept();
-                        reply.label = TRONA_OK;
-                    } else {
-                        reply.label = TRONA_OUT_OF_MEMORY;
-                    }
+                MM_SYNC_MMAP_WRITE => {
+                    mmap::handle_mm_sync_mmap_write(&raw const msg, badge, &raw mut reply)
                 }
-                MM_QUERY_CAPACITY => {
-                    reply.label = TRONA_OK;
-                    reply.length = 1;
-                    reply.regs[0] = estimate_capacity();
+                // MM_PROVISION_UNTYPED / MM_QUERY_CAPACITY removed: mmsrv no
+                // longer owns an untyped pool. Every kernel object goes
+                // through rsrcsrv via `rsrcsrv_alloc_object`.
+                MM_ALLOC_PRIVATE_REGION => {
+                    mmap::handle_mm_alloc_private_region(&raw const msg, badge, &raw mut reply)
                 }
-                MM_ALLOC_PRIVATE_REGION => mmap::handle_mm_alloc_private_region(&raw const msg, badge, &raw mut reply),
-                MM_ALLOC_PRIVATE_WINDOW => mmap::handle_mm_alloc_private_window(&raw const msg, badge, &raw mut reply),
-                MM_ALLOC_INITRD_COPY => mmap::handle_mm_alloc_initrd_copy(&raw const msg, badge, &raw mut reply),
-                MM_ALLOC_BOOTINFO_COPY => mmap::handle_mm_alloc_bootinfo_copy(&raw const msg, badge, &raw mut reply),
-                MM_COPY_FROM_CLIENT_REGION => mmap::handle_mm_copy_from_client_region(&raw const msg, badge, &raw mut reply),
-                MM_ALLOC_PRIVATE_COPY_FROM_CLIENT_REGION => mmap::handle_mm_alloc_private_copy_from_client_region(&raw const msg, badge, &raw mut reply),
+                MM_ALLOC_PRIVATE_WINDOW => {
+                    mmap::handle_mm_alloc_private_window(&raw const msg, badge, &raw mut reply)
+                }
+                MM_ALLOC_INITRD_COPY => {
+                    mmap::handle_mm_alloc_initrd_copy(&raw const msg, badge, &raw mut reply)
+                }
+                MM_ALLOC_BOOTINFO_COPY => {
+                    mmap::handle_mm_alloc_bootinfo_copy(&raw const msg, badge, &raw mut reply)
+                }
+                MM_COPY_FROM_CLIENT_REGION => {
+                    mmap::handle_mm_copy_from_client_region(&raw const msg, badge, &raw mut reply)
+                }
+                MM_ALLOC_PRIVATE_COPY_FROM_CLIENT_REGION => {
+                    mmap::handle_mm_alloc_private_copy_from_client_region(
+                        &raw const msg,
+                        badge,
+                        &raw mut reply,
+                    )
+                }
+                MM_ALLOC_TYPED_COPY_FROM_CLIENT_REGION => {
+                    mmap::handle_mm_alloc_typed_copy_from_client_region(
+                        &raw const msg,
+                        badge,
+                        &raw mut reply,
+                    )
+                }
+                MM_PREFAULT_RANGE => {
+                    mmap::handle_mm_prefault_range(&raw const msg, badge, &raw mut reply)
+                }
                 MM_REGISTER_PAGER_EP => {
                     // VFS registers a dedicated callback endpoint for pager requests.
                     // The EP cap arrives via IPC cap transfer at CURRENT_RECV_SLOT.
@@ -1063,27 +993,20 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     reply.label = TRONA_OK;
                 }
                 MM_DUMP_PENDING => {
-                    // Debug: dump UT source pool to serial
-                    let count = *(&raw const UT_COUNT);
+                    // Debug: dump frame pool / client counts. mmsrv no
+                    // longer owns untyped sources, so the legacy UT pool
+                    // dump is gone.
                     trona::uinfo!(|_lb| {
-                        _lb.str(b"[MMSRV] UT sources: ");
-                        _lb.dec(count as u64);
-                        _lb.str(b"/");
-                        _lb.dec(MAX_UT_SOURCES as u64);
+                        _lb.str(b"[MMSRV] frame_pool count=");
+                        _lb.dec(*(&raw const FRAME_POOL_COUNT) as u64);
+                        _lb.str(b" cap=");
+                        _lb.dec(*(&raw const FRAME_POOL_CAP) as u64);
+                        _lb.str(b" recycled=");
+                        _lb.dec(*(&raw const FRAME_POOL_TOTAL_RECYCLED));
+                        _lb.str(b" reused=");
+                        _lb.dec(*(&raw const FRAME_POOL_TOTAL_REUSED));
                         _lb.str(b"\n");
                     });
-                    let sources = &*(&raw const UT_SOURCES);
-                    for i in 0..count {
-                        if sources[i].active {
-                            trona::uinfo!(|_lb| {
-                                _lb.str(b"  src[");
-                                _lb.dec(i as u64);
-                                _lb.str(b"] cap=");
-                                _lb.hex(sources[i].cap);
-                                _lb.str(b" active\n");
-                            });
-                        }
-                    }
                     reply.label = TRONA_OK;
                 }
                 // VMFault: label=2 from kernel FaultType::VMFault.
@@ -1098,17 +1021,20 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                     let is_instruction_fault = msg.regs[3] != 0;
                     let page_addr = fault_addr & !0xFFFu64;
 
-
                     'fault: {
                         // 1. Find client by badge
                         let client_ptr = client::find_client_by_badge(badge);
                         if client_ptr.is_null() {
-                            trona::uerror!(|_lb| {
-                                _lb.str(b"[MMSRV] VMFault: unknown client badge=");
-                                _lb.hex(badge);
-                                _lb.str(b"\n");
-                            });
-                            reply.label = TRONA_INVALID_OPERATION;
+                            // The fault endpoint can still carry in-flight
+                            // faults briefly after procmgr has torn the client
+                            // down. Keep the dead thread FaultBlocked quietly
+                            // instead of spamming logs and re-faulting.
+                            skip_reply = true;
+                            break 'fault;
+                        }
+
+                        if (*client_ptr).deregistering {
+                            skip_reply = true;
                             break 'fault;
                         }
 
@@ -1240,8 +1166,8 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                             break 'fault;
                         }
 
-                        // 4. Demand-page path: all regions are MO-backed.
-                        // Commit the page via mo_commit, then map into VSpace.
+                        // 4. Demand-page path: materialize the target page
+                        // through the same helper used by explicit prefaults.
                         if (*region).mo_cap == 0 {
                             // No MO — region is corrupted or legacy. Segfault.
                             trona::uerror!(|_lb| {
@@ -1255,57 +1181,21 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                             break 'fault;
                         }
 
-                        let page_offset = page_addr - (*region).base;
-                        let mo_page_idx = (*region).mo_offset as u64 + page_offset / 4096;
-                        let flags = prot_to_vspace_flags((*region).prot);
-
-                        if (*region).backing_kind != MMAP_BACKING_NONE as u8 {
-                            let pager_err = mmap::pagein_backing_page(region, page_addr);
-                            if pager_err != TRONA_OK as i32 {
-                                trona::uerror!(|_lb| {
-                                    _lb.str(b"[MMSRV] VMFault: backing page-in failed badge=");
-                                    _lb.hex(badge);
-                                    _lb.str(b" addr=");
-                                    _lb.hex(fault_addr);
-                                    _lb.str(b" kind=");
-                                    _lb.hex((*region).backing_kind as u64);
-                                    _lb.str(b"\n");
-                                });
-                                reply.label = pager_err as u64;
-                                break 'fault;
-                            }
-                        } else {
-                            let (err, committed) = commit_mo_pages(
-                                (*region).mo_cap,
-                                mo_page_idx,
-                                1,
-                            );
-                            if err != 0 || committed != 1 {
-                                trona::uerror!(|_lb| {
-                                    _lb.str(b"[MMSRV] VMFault: mo_commit failed badge=");
-                                    _lb.hex(badge);
-                                    _lb.str(b" addr=");
-                                    _lb.hex(fault_addr);
-                                    _lb.str(b" err=");
-                                    _lb.hex(err as u64);
-                                    _lb.str(b"\n");
-                                });
-                                reply.label = TRONA_OUT_OF_MEMORY;
-                                break 'fault;
-                            }
+                        let prefault_err =
+                            mmap::materialize_region_page(client_ptr, region, page_addr);
+                        if prefault_err != TRONA_OK {
+                            trona::uerror!(|_lb| {
+                                _lb.str(b"[MMSRV] VMFault: materialize failed badge=");
+                                _lb.hex(badge);
+                                _lb.str(b" addr=");
+                                _lb.hex(fault_addr);
+                                _lb.str(b" err=");
+                                _lb.hex(prefault_err);
+                                _lb.str(b"\n");
+                            });
+                            reply.label = prefault_err;
+                            break 'fault;
                         }
-
-                        // Map committed page into client's VSpace
-                        let count_and_flags = (1u64 << 32) | flags;
-                        let _ = invoke::vspace_map_mo(
-                            (*client_ptr).vspace_cap,
-                            (*region).mo_cap,
-                            page_addr,
-                            mo_page_idx,
-                            count_and_flags,
-                        );
-                        // AlreadyMapped is OK (page was already present
-                        // from the spawn-time vspace_map_mo).
 
                         reply.label = TRONA_OK;
                     } // end 'fault
@@ -1369,9 +1259,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         if skip_reply {
             // Unrecoverable fault (e.g. no region): leave faulting thread permanently
             // FaultBlocked and wait for the next incoming message without replying.
-            let err = unsafe {
-                ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
-            };
+            let err = unsafe { ipc::recv_ctx(ipc_ctx(), 3, &raw mut msg, &raw mut badge) };
             if err != 0 {
                 trona::uerror!(|_lb| {
                     _lb.str(b"[MMSRV] recv failed err=");
@@ -1382,13 +1270,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             }
         } else {
             let err = unsafe {
-                ipc::reply_recv_ctx(
-                    ipc_ctx(),
-                    CAP_SERVER_EP,
-                    &raw const reply,
-                    &raw mut msg,
-                    &raw mut badge,
-                )
+                ipc::reply_recv_ctx(ipc_ctx(), 3, &raw const reply, &raw mut msg, &raw mut badge)
             };
             if err != 0 {
                 trona::uerror!(|_lb| {

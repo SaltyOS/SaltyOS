@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! PTY data structures: ring buffers, termios settings, and PTY instances.
 
-// Capability layout
-pub const CAP_SELF_CSPACE: u64 = 2;
-pub const CAP_PROCMGR_EP: u64 = 3;
-pub const CAP_NAMESRV_EP: u64 = 5;
-pub const CAP_READINESS_NTFN: u64 = 14;
-pub const CAP_MMSRV_EP: u64 = 7;
-pub const CAP_DISPDRV_EP: u64 = 65;
+// Capability layout: system roles flow through `trona::caps::*` (populated by
+// libtrona's `__trona_cap_*` weak symbols). The service-local
+// `Require=dispdrv:dispdrv_ep` flows through the build-generated `svc_caps`
+// crate. TTY-specific runtime-allocated slots (VFS notification, display ring
+// notification) are kept as plain constants.
 pub const CAP_VFS_NTFN: u64 = 66;
-pub const CAP_SERVER_EP: u64 = 68;
 pub const CAP_DISPLAY_RING_NTFN: u64 = 69;
 
 // Buffer sizes and limits
@@ -54,10 +51,7 @@ pub const VSUSP: usize = 10;
 
 pub const B38400: u32 = 38400;
 
-// POLLIN/POLLOUT for PTY_POLL
-pub const POLLIN: i16 = 0x0001;
-pub const POLLOUT: i16 = 0x0004;
-pub const POLLHUP: i16 = 0x0010;
+// POLLIN/POLLOUT/POLLHUP from trona::consts::posix (via trona_posix::consts)
 
 // Actual terminal dimensions (queried from display server at startup)
 pub static mut WINSIZE_ROWS: u32 = 24;
@@ -164,6 +158,8 @@ pub struct PtyInstance {
     pub slave_ring: RingBuf,
     // Overflow ring used when the primary slave ring is temporarily full.
     pub spill_ring: RingBuf,
+    // Master-side read ring (data written by the slave, readable by ptmx).
+    pub master_ring: RingBuf,
     // Canonical mode line accumulator
     pub line: InputLineBuf,
     // Per-PTY termios
@@ -185,6 +181,7 @@ impl PtyInstance {
             active: false,
             slave_ring: RingBuf::new(),
             spill_ring: RingBuf::new(),
+            master_ring: RingBuf::new(),
             line: InputLineBuf::new(),
             termios: PtyTermios::default(),
             has_ctty: false,

@@ -1,11 +1,15 @@
 [Service]
 Name=netdrv
-Binary=netdrv
-Type=simple
+Binary=/bin/netdrv
+Type=notify
 Restart=always
 
 [Dependencies]
-After=pcidrv namesrv mmsrv saltyfs vfs
+After=pcidrv namesrv rsrcsrv mmsrv saltyfs vfs
 
 [Capabilities]
-NeedEP=pcidrv:64
+# System roles via trona::caps::*, service-local via generated svc_caps::*.
+Require=namesrv
+Require=mmsrv
+Require=rsrcsrv
+Require=pcidrv:pcidrv_ep

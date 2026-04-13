@@ -12,6 +12,8 @@ pub struct BuildEnv {
     pub ar: String,
     pub ranlib: String,
     pub strip: String,
+    pub rustc: String,
+    pub cargo: String,
     pub autotools_host: String,
     pub salty_host: String,
     pub salty_inc: PathBuf,
@@ -96,6 +98,24 @@ impl BuildEnv {
         // LIBS is empty: CRT objects and runtime libs are injected by the driver.
         let libs = String::new();
 
+        let rustc = {
+            let rustc_path = toolchain_prefix.join("bin").join("rustc");
+            if rustc_path.is_file() {
+                rustc_path.to_string_lossy().into_owned()
+            } else {
+                "rustc".to_string()
+            }
+        };
+
+        let cargo = {
+            let cargo_path = toolchain_prefix.join("bin").join("cargo");
+            if cargo_path.is_file() {
+                cargo_path.to_string_lossy().into_owned()
+            } else {
+                "cargo".to_string()
+            }
+        };
+
         BuildEnv {
             cc,
             cxx,
@@ -105,6 +125,8 @@ impl BuildEnv {
             ar: "llvm-ar".to_string(),
             ranlib: "llvm-ranlib".to_string(),
             strip: "llvm-strip".to_string(),
+            rustc,
+            cargo,
             autotools_host: target_triple.clone(),
             salty_host: target_triple,
             salty_inc,

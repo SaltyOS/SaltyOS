@@ -1,0 +1,8 @@
+# SaltyOS /etc/fstab
+# <source>    <target>    <fstype>     <options>    <dump>  <pass>
+saltyfs       /           saltyfs      defaults     0       1
+none          /dev        devfs        defaults     0       0
+none          /proc       procfs       defaults     0       0
+none          /tmp        tmpfs        defaults     0       0
+none          /sys        sysctlfs     defaults     0       0
+none          /pipe       pipefs       defaults     0       0

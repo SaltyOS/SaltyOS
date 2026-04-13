@@ -37,6 +37,11 @@ impl RadixTree {
         }
     }
 
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.root.is_null() || self.depth == 0
+    }
+
     /// Compute the minimum depth needed to index `max_idx`.
     fn depth_for_index(max_idx: usize) -> u32 {
         if max_idx == 0 {

@@ -167,7 +167,6 @@ The CRT startup parses the SaltyOS auxiliary vector (`auxv`) to discover per-pro
 | `0x1005` | `AT_TRONA_FRAME_SLOT` | Frame slot for page mapping |
 | `0x1007` | `AT_TRONA_SLOT_BASE` | Slot allocator pool base |
 | `0x1008` | `AT_TRONA_SLOT_COUNT` | Slot allocator pool size |
-| `0x1009` | `AT_TRONA_EXPAND_EP` | Endpoint for requesting more slots |
 
 The RTLD may have already consumed some slots while loading shared libraries, so its exported `__trona_slot_base` / `__trona_slot_count` take precedence over raw auxv values when non-zero.
 
@@ -184,7 +183,6 @@ After slot allocation setup, the heap region is placed 1 MB after the scratch ar
 | `0x1005` | `AT_TRONA_FRAME_SLOT` | slot | CSpace slot for temporary frames |
 | `0x1007` | `AT_TRONA_SLOT_BASE` | slot | First available cap slot |
 | `0x1008` | `AT_TRONA_SLOT_COUNT` | count | Number of available cap slots |
-| `0x1009` | `AT_TRONA_EXPAND_EP` | slot | Endpoint to request more slots from procmgr |
 
 ## FreeBSD Compatibility Layer
 

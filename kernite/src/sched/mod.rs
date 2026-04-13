@@ -36,6 +36,9 @@ extern "C" fn idle_thread() -> ! {
         // with_lock acquires scheduler lock internally and calls kernel_exit_epilogue
         scheduler().with_lock(|_| {});
 
+        // Flush any deferred TCB destruction from sched_ref release
+        unsafe { scheduler().flush_deferred_current_release(); }
+
         // BSP also processes deferred free (only BSP to avoid concurrent manipulation)
         if arch::current_cpu() == 0 {
             crate::mm::process_deferred_free();

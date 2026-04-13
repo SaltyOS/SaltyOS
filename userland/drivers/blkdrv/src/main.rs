@@ -14,15 +14,8 @@
 //!   Label 4 = BLK_FLUSH:    flush disk cache
 //!   Label 5 = BLK_GET_SHM_ID: -> MR0=shm_id
 //!
-//! Cap layout:
-//!   0  = self TCB
-//!   1  = self VSpace
-//!   2  = self CSpace
-//!   68 = server endpoint (pre-created service EP)
-//!   14 = readiness notification
-//!   64 = pcidrv endpoint
-//!   5  = namesrv endpoint
-//!   7  = mmsrv endpoint
+//! Startup caps are role-based. System caps come from `trona::caps::*()`,
+//! and the pcidrv dependency comes from generated `svc_caps::*()`.
 
 #![no_std]
 #![no_main]
@@ -40,10 +33,10 @@ use trona::ipc;
 use trona::protocol::*;
 use trona::types::core::*;
 
-const CAP_SERVER_EP: u64 = 68;
-const CAP_READINESS_NTFN: u64 = 14;
-const CAP_NAMESRV_EP: u64 = 5;
-const CAP_MMSRV_EP: u64 = 7;
+// All cross-service caps flow through the role-based startup cap_table.
+// System roles (`namesrv`, `mmsrv`) come from `trona::caps::*`; the
+// service-local `pcidrv_ep` getter lives in `virtio*.rs` via generated
+// `svc_caps`.
 
 pub(crate) const SECTOR_SIZE: u32 = 512;
 
@@ -77,7 +70,7 @@ fn ipc_ctx() -> *mut IpcContext {
 }
 
 fn signal_ready() {
-    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, trona::caps::readiness_ntfn(), 1, 0, 0, 0, 0);
 }
 
 /// Create SHM for data transfer.
@@ -91,7 +84,7 @@ fn setup_shm() -> bool {
     msg.regs[1] = BLK_SHM_PAGES;
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || (reply.label != 0 && reply.label != TRONA_ALREADY_EXISTS) {
         trona::uerror!(|_lb| {
             _lb.str(b"[blkdrv] SHM create failed: ");
@@ -110,7 +103,7 @@ fn setup_shm() -> bool {
     msg.regs[3] = 0x3; // RW
 
     let mut reply = TronaMsg::zeroed();
-    let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != 0 {
         trona::uerror!(|_lb| {
             _lb.str(b"[blkdrv] SHM map failed: ");
@@ -136,9 +129,10 @@ fn register_namesrv() {
         for i in 0..name.len() {
             *dst.add(i) = name[i];
         }
-        ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, trona::caps::service_ep());
         let mut reply = TronaMsg::zeroed();
-        let err = ipc::call_ctx(ipc_ctx(), CAP_NAMESRV_EP, &raw const msg, &raw mut reply);
+        let err =
+            ipc::call_ctx(ipc_ctx(), trona::caps::namesrv_ep(), &raw const msg, &raw mut reply);
         if err != 0 || reply.label != TRONA_OK {
             trona::uerror!(|_lb| { _lb.str(b"[blkdrv] namesrv registration failed\n"); });
         }
@@ -152,7 +146,7 @@ fn server_loop() -> ! {
     let ctx = ipc_ctx();
     let mut msg = TronaMsg::zeroed();
     let mut badge: u64 = 0;
-    unsafe { ipc::recv_ctx(ctx, CAP_SERVER_EP, &raw mut msg, &raw mut badge); }
+    unsafe { ipc::recv_ctx(ctx, trona::caps::service_ep(), &raw mut msg, &raw mut badge); }
 
     loop {
         let reply = match msg.label {
@@ -176,7 +170,11 @@ fn server_loop() -> ! {
         badge = 0;
         unsafe {
             ipc::reply_recv_ctx(
-                ctx, CAP_SERVER_EP, &raw const reply, &raw mut msg, &raw mut badge,
+                ctx,
+                trona::caps::service_ep(),
+                &raw const reply,
+                &raw mut msg,
+                &raw mut badge,
             );
         }
     }

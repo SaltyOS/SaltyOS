@@ -18,6 +18,8 @@
 #   --vmnet-ifname IF Host interface name for --net-mode vmnet-bridged
 #   --hvf             Enable Hypervisor.framework acceleration in UTM (default)
 #   --no-hvf          Disable HVF in UTM (use TCG emulation)
+#   --kvm             Enable KVM acceleration (Linux host; ARCH must match host arch)
+#   --cpu NAME        Override QEMU -cpu (default: per-arch; --kvm switches default to "host")
 #   --legacy-virtio   Force legacy (transitional) virtio devices
 #   --disk FILE       Override boot disk path
 #   --extra-disk FILE Attach an additional virtio-blk disk (repeatable)
@@ -26,7 +28,7 @@ set -euo pipefail
 die() { echo "error: $*" >&2; exit 1; }
 
 usage() {
-    sed -n '3,17p' "$0" | sed 's/^# \?//'
+    sed -n '3,25p' "$0" | sed 's/^# \?//'
     exit 1
 }
 
@@ -48,6 +50,8 @@ NET_MODE="user"
 TAP_IFNAME="tap0"
 VMNET_IFNAME=""
 USE_HVF=true
+USE_KVM=false
+CPU_OVERRIDE=""
 LEGACY_VIRTIO=false
 DISK=""
 EXTRA_DISKS=()
@@ -70,6 +74,9 @@ while [[ $# -gt 0 ]]; do
         --vmnet-ifname) VMNET_IFNAME="${2:?--vmnet-ifname requires a value}"; shift 2 ;;
         --hvf)      USE_HVF=true; shift ;;
         --no-hvf)   USE_HVF=false; shift ;;
+        --kvm)      USE_KVM=true; shift ;;
+        --no-kvm)   USE_KVM=false; shift ;;
+        --cpu)      CPU_OVERRIDE="${2:?--cpu requires a value}"; shift 2 ;;
         --legacy-virtio) LEGACY_VIRTIO=true; shift ;;
         --disk)     DISK="${2:?--disk requires a value}"; shift 2 ;;
         --extra-disk) EXTRA_DISKS+=("${2:?--extra-disk requires a value}"); shift 2 ;;
@@ -154,6 +161,36 @@ case "$ARCH" in
         die "unsupported architecture: $ARCH"
         ;;
 esac
+
+# --- KVM acceleration ---
+# KVM requires a Linux host whose architecture matches the guest. When
+# enabled we pass `accel=kvm` on the machine line (works on both x86_64
+# and aarch64) and default `-cpu host` for full feature passthrough.
+if $USE_KVM; then
+    [[ "$(uname -s)" == "Linux" ]] \
+        || die "--kvm requires a Linux host (got $(uname -s)); on macOS use --hvf via UTM"
+    [[ -e /dev/kvm ]] \
+        || die "--kvm requires /dev/kvm; install qemu-kvm and ensure the host CPU supports virtualization"
+    [[ -r /dev/kvm && -w /dev/kvm ]] \
+        || die "--kvm: /dev/kvm exists but is not accessible — add the user to the 'kvm' group"
+    host_arch="$(uname -m)"
+    case "$ARCH" in
+        x86_64)  [[ "$host_arch" == "x86_64" || "$host_arch" == "amd64" ]] \
+                 || die "--kvm: guest x86_64 requires x86_64 host (got $host_arch)" ;;
+        aarch64) [[ "$host_arch" == "aarch64" || "$host_arch" == "arm64" ]] \
+                 || die "--kvm: guest aarch64 requires aarch64 host (got $host_arch)" ;;
+    esac
+    $GDB && echo "warning: --gdb with --kvm only supports software breakpoints" >&2
+    MACHINE="${MACHINE},accel=kvm"
+    if [[ "$ARCH" == "aarch64" ]]; then
+        # gic-version=host lets KVM use the host's GIC implementation when
+        # available (most Linux/aarch64 hosts expose GICv3).
+        MACHINE="${MACHINE/gic-version=3/gic-version=host}"
+    fi
+    [[ -z "$CPU_OVERRIDE" ]] && CPU_OVERRIDE="host"
+fi
+
+[[ -n "$CPU_OVERRIDE" ]] && CPU="$CPU_OVERRIDE"
 
 CMD=($QEMU
     -machine "$MACHINE"

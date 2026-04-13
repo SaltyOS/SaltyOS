@@ -1,7 +1,7 @@
 [Service]
 Name=pcidrv
-Binary=pcidrv
-Type=simple
+Binary=/bin/pcidrv
+Type=notify
 Restart=always
 PreProcmgr=yes
 

@@ -37,6 +37,8 @@ just distclean              # Remove all build dirs (needed before re-setup)
 # Code quality
 just fmt                    # Format Rust (rustfmt) and C (clang-format)
 just fmt-check              # Check Rust formatting
+just warn                   # Force-recheck all sources for warnings (no cache, no disk images)
+just arch=aarch64 warn      # Same for aarch64
 
 # Configuration
 just reconfigure -Dkernel_log_level=debug
@@ -92,8 +94,9 @@ No `Cargo.toml` files — all Rust code is compiled via Meson with direct `rustc
 
 - **Clang is enforced.** The build fails with gcc. Do not suggest `cargo build`, `cargo test`, or create `Cargo.toml` files — this project does not use Cargo.
 - **Rust flags live in `meson.build`**, not `.cargo/config.toml`.
+- **All Meson targets are `custom` type.** Because the kernel and userland are freestanding and require direct `rustc`/`clang` invocations, Meson's `executable()` and `shared_library()` rules are never used. `meson introspect --targets` reports every target as `type: custom`. Filtering by Meson target type does not distinguish compilation targets from packaging targets — filter by output file extension (`.elf`, `.o`, `.rlib`, etc.) instead.
 - **Linker scripts are per-architecture:** e.g., `kernite/arch/x86_64.ld` and `kernite/arch/aarch64.ld`; similarly each userland program has `arch/x86_64/link.ld` and `arch/aarch64/link.ld`.
-- **Meson file discovery runs at setup time** — the `find` in `kernite/meson.build` auto-discovers `.rs` files only during `meson setup`. After adding new source files: `just distclean && just setup && just build`.
+- **Meson file discovery runs at setup time** — the `find` in `kernite/meson.build` auto-discovers `.rs` files only during `meson setup`. 
 
 ## Custom Toolchain
 
@@ -206,7 +209,6 @@ restore_irq(irq);
 | `lib.rs` | Entry (`kmain`), serial I/O, panic handler |
 | `acpi.rs` | Shared ACPI table parsing (RSDP/XSDT, MCFG/PCIe ECAM) |
 | `bootinfo.rs` | Boot info TLV parsing |
-| `builtins.rs` | Compiler built-in stubs (memcpy, memset) |
 | `cpio.rs` | CPIO archive parser for initrd |
 | `elf.rs` | ELF binary loader |
 | `init.rs` | Init task bootstrap, CSpace setup |
@@ -385,7 +387,8 @@ Multi-tier library architecture:
   - `pthread.rs` — POSIX threads support
   - `tls.rs` — Thread-local storage
 - `win32/` (crate: `trona_win32`) — Win32 shim layer
-  - `kernel32_pe.c` — kernel32.dll PE stub
+  - `kernel32.rs` — kernel32.dll Rust crate root
+  - `trona.rs` — local PE ABI shim used by the Rust-backed kernel32.dll
   - `console.rs`, `handle.rs`, `process.rs`, `error.rs` — Win32 API implementations
 - `loader/` (crate: `trona_loader`) — ELF/PE/CPIO loading
   - `elf_loader.rs` / `elf_dynamic.rs` — ELF loading, dynamic linking support
@@ -437,7 +440,7 @@ Multi-tier library architecture:
 
 1. Create the `.rs` file in the appropriate `kernite/src/` subdirectory
 2. Add `mod my_module;` to the parent module's `mod.rs` or `lib.rs`
-3. Run `just distclean && just setup && just build` (the `find` in `kernite/meson.build` auto-discovers `.rs` files, but only on `meson setup`)
+3. Run `just build` (the `find` in `kernite/meson.build` auto-discovers `.rs` files, but only on `meson setup`)
 
 ### New Userland Program
 
@@ -447,7 +450,7 @@ Multi-tier library architecture:
 4. Create `userland/services/<name>.service` with `[Service]` and `[Dependencies]` sections
 5. Add `subdir('<domain>/<name>')` to `userland/meson.build`
 6. Add the ELF and service file entries to the manifest in `tools/mkcpio.py`
-7. Run `just distclean && just setup && just build`
+7. Run `just build`
 
 ### New Syscall
 
@@ -500,7 +503,7 @@ docs: update design docs for bound notification
 
 ## Definition of Done
 
-- [ ] `just build` succeeds with no new warnings
+- [ ] `just warn` passes with no new warnings, then `just build` succeeds
 - [ ] `just run` boots to test_runner output without panics
 - [ ] `just run --smp 2` does not deadlock or corrupt state
 - [ ] `just fmt-check` passes

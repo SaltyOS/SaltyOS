@@ -47,7 +47,7 @@ SaltyOS uses a two-layer userspace library stack:
 ```rust
 // trona posix.rs — open() sends IPC to VFS server
 pub extern "C" fn open(path: *const u8, flags: i32, mode: u32) -> i32 {
-    // Build IPC message with VFS_OPEN label
+    // Build IPC message with VFS_POSIX_OPEN label
     // trona_call(vfs_ep, &msg) → VFS server handles it
 }
 ```
@@ -74,7 +74,7 @@ Application                  trona                    VFS Server
     | open("/etc/hosts", O_RDONLY)                           |
     |-------------------------->|                            |
     |                           | sys_call(vfs_endpoint,     |
-    |                           |   VFS_OPEN, path, flags)   |
+    |                           |   VFS_POSIX_OPEN, path, flags)   |
     |                           |--------------------------->|
     |                           |                            | validate path
     |                           |                            | check capabilities
@@ -188,7 +188,7 @@ Application                  trona                    VFS Server
 |----------|--------|-------|
 | `socket(AF_INET, SOCK_STREAM)` | Implemented | VFS → netsrv (TCP) |
 | `socket(AF_INET, SOCK_DGRAM)` | Implemented | VFS → netsrv (UDP) |
-| `connect` | Implemented | VFS → netsrv (blocking, async completion via callback EP) |
+| `connect` | Implemented | VFS → netsrv (blocking, async completion via shared backend callback EP) |
 | `bind` | Implemented | VFS → netsrv |
 | `listen` | Implemented | VFS → netsrv |
 | `accept` | Implemented | VFS → netsrv (blocking, NET_ACCEPT_WAIT) |
@@ -206,7 +206,7 @@ Application                  trona                    VFS Server
 Application
     ↓ socket(AF_INET, ...)
 trona posix
-    ↓ IPC (VFS_SOCKET, VFS_READ, VFS_WRITE, ...)
+    ↓ IPC (VFS_POSIX_SOCKET, VFS_READ, VFS_WRITE, ...)
 VFS (core/vfs/src/posix/inet.rs)
     ↓ IPC forwarding (NET_SOCKET, NET_CONNECT, NET_SEND, ...)
 netsrv (servers/netsrv/)
@@ -222,7 +222,7 @@ netdrv (drivers/netdrv/ — virtio-net driver)
 
 **NET_* IPC labels** (0xA0-0xBA, 27 labels): `NET_SOCKET`, `NET_CONNECT`, `NET_SEND`, `NET_RECV`, `NET_CLOSE`, `NET_BIND`, `NET_LISTEN`, `NET_ACCEPT`, `NET_SENDTO`, `NET_RECVFROM`, `NET_SHUTDOWN`, `NET_GETSOCKNAME`, `NET_GETPEERNAME`, `NET_SETSOCKOPT`, `NET_GETSOCKOPT`, `NET_POLL_STATUS`, `NET_REGISTER_VFS`, `NET_COMPLETE`, `NET_DNS_RESOLVE`, `NET_DNS_RESOLVE_PTR`, `NET_GET_CONFIG`, `NET_GET_ARP_ENTRY`, `NET_RECV_WAIT`, `NET_ACCEPT_WAIT`, `NET_RECVFROM_WAIT`, `NET_SEND_WAIT`, `NET_SENDTO_WAIT`.
 
-**Blocking operation model:** VFS acts as a proxy between userland and netsrv. Non-blocking operations (socket, bind, listen, getsockname, close) are forwarded synchronously. Blocking operations (connect, recv, accept) save the client's reply cap and return asynchronously via netsrv's badged callback endpoint when the operation completes.
+**Blocking operation model:** VFS acts as a proxy between userland and netsrv. Non-blocking operations (socket, bind, listen, getsockname, close) are forwarded synchronously. Blocking operations (connect, recv, accept) save the client's reply cap and return asynchronously via netsrv's badged message on the shared VFS backend callback endpoint when the operation completes.
 
 ## Intentionally Unsupported
 
@@ -326,7 +326,7 @@ Operations:
 | POSIX | SaltyOS |
 |-------|---------|
 | `shm_open("/name")` | Create named shared memory object |
-| `mmap(fd, ...)` | Map Frame capability into VSpace |
+| `mmap(fd, ...)` | Map SHM backing via mmsrv shared/private mmap path |
 | Send fd via socket | Transfer Frame capability via IPC |
 
 ## GUI Stack Support

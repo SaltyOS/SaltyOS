@@ -1,6 +1,6 @@
 [Service]
 Name=procmgr
-Binary=procmgr
+Binary=/bin/procmgr
 Type=simple
 Restart=always
 CNodeBits=12
@@ -8,9 +8,27 @@ MapInitrd=yes
 PreProcmgr=yes
 
 [Dependencies]
-After=console mmsrv
+After=rsrcsrv console mmsrv
 Before=vfs test_runner
 
 [Capabilities]
+# CopyCap=13:66 delivers the framebuffer untyped (init slot 13) into
+# procmgr slot 66; init's `init_slot_to_role` helper also emits
+# ROLE_FB_UNTYPED into procmgr's cap_table so `trona::caps::fb_untyped()`
+# resolves to the right slot.
 CopyCap=13:66
-NeedEP=namesrv:64 vfs:65 mmsrv:67:badge mmsrv:68
+# NeedEP delivers the bootstrap endpoints procmgr needs for its own
+# client calls and for minting per-child badged copies. init's
+# `system_role_for_needep` helper maps each entry to the matching
+# cap_table role:
+#
+#   mmsrv:67:badge    → ROLE_MMSRV_CLIENT       (client cap for procmgr's own IPC)
+#   mmsrv:68          → ROLE_MMSRV_AUTHORITY_RAW (unbadged — procmgr-private)
+#   rsrcsrv:71        → ROLE_RSRCSRV_AUTHORITY_RAW (unbadged — procmgr-private)
+#
+# The client-side rsrcsrv_ep (`ROLE_RSRCSRV_CLIENT`) is pushed separately
+# by init's `has_rsrcsrv_ep` always-on path and lands at the cursor slot
+# rather than slot 71.
+NeedEP=namesrv:64 vfs:65:late mmsrv:67:badge mmsrv:68 rsrcsrv:71
+BootstrapPrivileged=yes
+CopySharedLibCaps=yes

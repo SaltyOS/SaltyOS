@@ -1,12 +1,13 @@
 [Service]
 Name=test_runner
-Binary=test_runner
+Binary=/bin/test_runner
 Type=simple
 Restart=no
 
 [Dependencies]
-After=procmgr vfs posix_getty dnssrv saltyfs
+After=procmgr vfs posix_getty dnssrv saltyfs rootfs.target
 Before=
 
 [Capabilities]
-NeedEP=dnssrv:64
+# test_runner resolves dnssrv dynamically via namesrv lookup; all other
+# system roles flow through procmgr's populate_cap_table by default.

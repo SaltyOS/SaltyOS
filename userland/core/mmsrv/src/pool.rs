@@ -14,5 +14,4 @@ pub(crate) unsafe fn init_pool(_client: *mut MmClient) -> bool {
 }
 
 /// No-op: MO-based COW does not need pool teardown.
-pub(crate) unsafe fn teardown_pool(_vspace_cap: Cap) {
-}
+pub(crate) unsafe fn teardown_pool(_vspace_cap: Cap) {}

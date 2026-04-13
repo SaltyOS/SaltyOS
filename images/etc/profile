@@ -1,0 +1,11 @@
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export HOME="${HOME:-/root}"
+export TERM="${TERM:-vt100}"
+export SHELL="${SHELL:-/bin/bash}"
+
+umask 022
+
+# Source user-specific profile
+if [ -f "$HOME/.profile" ]; then
+    . "$HOME/.profile"
+fi

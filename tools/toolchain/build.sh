@@ -10,6 +10,7 @@
 #   setup                    Create toolchain directories
 #   build host llvm          Build host Clang/LLD + compiler-rt
 #   build host rust          Build host rustc
+#   build host rust-std      Build std for cross-targets (for cargo --target)
 #   build cross llvm         Cross-compile Clang/LLD for SaltyOS
 #   build cross rust         Cross-compile rustc for SaltyOS
 #   sysroot                  Generate cross-compilation sysroot (includes libc++ via Meson)
@@ -89,7 +90,9 @@ Usage: bash tools/toolchain/build.sh <command> [args...]
 Commands:
   setup                    Create toolchain directories
   build host llvm          Build host Clang/LLD + compiler-rt (~30 min)
-  build host rust          Build host rustc (~20 min)
+  build host rust          Build host rustc (compiler only, no std/cargo)
+  build host rust-host-std Build host std + cargo (no sysroot needed)
+  build host rust-cross-std Build std for SaltyOS targets (sysroot needed)
   build cross llvm         Cross-compile Clang/LLD for SaltyOS
   build cross rust         Cross-compile rustc for SaltyOS
   sysroot                  Generate cross-compilation sysroot (includes libc++ via Meson)
@@ -208,9 +211,141 @@ Run 'just tc build host llvm' first (it installs/links FileCheck into the prefix
     --build-dir "$SALTYOS_RUST_BUILD_DIR" \
     --config "$config_path" \
     --stage 1 \
-    compiler/rustc library/std src
+    compiler/rustc src
 
   echo "Installed stage1 rustc into prefix: $SALTYOS_TOOLCHAIN_PREFIX"
+  echo "Note: std and cargo are NOT included. Run 'just tc build host rust-host-std' after OS build."
+}
+
+# =============================================================================
+# cmd_build_host_rust_host_std — Build host std + cargo (no sysroot needed)
+# =============================================================================
+
+cmd_build_host_rust_host_std() {
+  local llvm_config_path="$SALTYOS_TOOLCHAIN_PREFIX/bin/llvm-config"
+  if [ ! -x "$llvm_config_path" ]; then
+    die "Missing llvm-config. Run 'just tc build host llvm' first."
+  fi
+  local filecheck_path="$SALTYOS_TOOLCHAIN_PREFIX/bin/FileCheck"
+
+  local config_path="$SALTYOS_TOOLCHAIN_BUILD_ROOT/rust-host-std-only.toml"
+  {
+    echo '[build]'
+    echo "target = [\"${SALTYOS_HOST_TRIPLE}\"]"
+    echo ''
+    echo '[install]'
+    echo "prefix = \"$SALTYOS_TOOLCHAIN_PREFIX\""
+    echo 'sysconfdir = "etc"'
+    echo ''
+    echo '[llvm]'
+    echo 'download-ci-llvm = false'
+    echo ''
+    echo '[rust]'
+    echo 'use-lld = true'
+    echo ''
+    echo "[target.${SALTYOS_HOST_TRIPLE}]"
+    echo "llvm-config = \"$llvm_config_path\""
+    echo "llvm-filecheck = \"$filecheck_path\""
+  } > "$config_path"
+
+  _configure_external_llvm_env "$llvm_config_path"
+
+  echo "Building host std + cargo for ${SALTYOS_HOST_TRIPLE}..."
+  python3 "$SALTYOS_RUST_SRC_DIR/x.py" install \
+    --src "$SALTYOS_RUST_SRC_DIR" \
+    --build-dir "$SALTYOS_RUST_BUILD_DIR" \
+    --config "$config_path" \
+    --stage 1 \
+    library/std cargo
+
+  echo "Installed host std + cargo into prefix: $SALTYOS_TOOLCHAIN_PREFIX"
+}
+
+# =============================================================================
+# cmd_build_host_rust_cross_std — Build std for SaltyOS cross-targets (sysroot needed)
+# =============================================================================
+
+cmd_build_host_rust_cross_std() {
+  local target_triple="${SALTYOS_ARCH}-unknown-saltyos"
+
+  local llvm_config_path="$SALTYOS_TOOLCHAIN_PREFIX/bin/llvm-config"
+  if [ ! -x "$llvm_config_path" ]; then
+    die "Missing llvm-config. Run 'just tc build host llvm' first."
+  fi
+  local filecheck_path="$SALTYOS_TOOLCHAIN_PREFIX/bin/FileCheck"
+
+  if [ ! -d "$SYSROOT/usr/lib" ]; then
+    die "sysroot not found at $SYSROOT
+Run 'just sysroot' first."
+  fi
+
+  # Create cross-compiler wrappers that pin --target so macOS host
+  # clang doesn't fall back to ld64.lld (Mach-O) instead of ld.lld (ELF).
+  # Also add -L for sysroot libs so std.so can link against libc.so/libtrona.so.
+  local wrapper_dir="$SALTYOS_TOOLCHAIN_BUILD_ROOT/cross-wrappers"
+  mkdir -p "$wrapper_dir"
+
+  cat > "$wrapper_dir/${target_triple}-clang" <<WRAPPER
+#!/bin/sh
+exec "$SALTYOS_TOOLCHAIN_PREFIX/bin/clang" --target=${target_triple} -fuse-ld=lld -L${SYSROOT}/usr/lib "\$@"
+WRAPPER
+  chmod +x "$wrapper_dir/${target_triple}-clang"
+
+  cat > "$wrapper_dir/${target_triple}-clang++" <<WRAPPER
+#!/bin/sh
+exec "$SALTYOS_TOOLCHAIN_PREFIX/bin/clang++" --target=${target_triple} -fuse-ld=lld -L${SYSROOT}/usr/lib "\$@"
+WRAPPER
+  chmod +x "$wrapper_dir/${target_triple}-clang++"
+
+  local config_path="$SALTYOS_TOOLCHAIN_BUILD_ROOT/rust-host-std.toml"
+  {
+    echo '[build]'
+    echo "rustc = \"$SALTYOS_TOOLCHAIN_PREFIX/bin/rustc\""
+    echo "cargo = \"$SALTYOS_TOOLCHAIN_PREFIX/bin/cargo\""
+    echo "target = [\"${SALTYOS_HOST_TRIPLE}\", \"${target_triple}\"]"
+    echo ''
+    echo '[install]'
+    echo "prefix = \"$SALTYOS_TOOLCHAIN_PREFIX\""
+    echo 'sysconfdir = "etc"'
+    echo ''
+    echo '[llvm]'
+    echo 'download-ci-llvm = false'
+    echo ''
+    echo '[rust]'
+    echo 'use-lld = true'
+    echo ''
+    echo "[target.${SALTYOS_HOST_TRIPLE}]"
+    echo "llvm-config = \"$llvm_config_path\""
+    echo "llvm-filecheck = \"$filecheck_path\""
+    echo ''
+    echo "[target.${target_triple}]"
+    echo "cc = \"$wrapper_dir/${target_triple}-clang\""
+    echo "cxx = \"$wrapper_dir/${target_triple}-clang++\""
+    echo "linker = \"$wrapper_dir/${target_triple}-clang\""
+    echo "llvm-config = \"$llvm_config_path\""
+  } > "$config_path"
+
+  _configure_external_llvm_env "$llvm_config_path"
+
+  echo "Building std for ${target_triple}..."
+  python3 "$SALTYOS_RUST_SRC_DIR/x.py" build \
+    --src "$SALTYOS_RUST_SRC_DIR" \
+    --build-dir "$SALTYOS_RUST_BUILD_DIR" \
+    --config "$config_path" \
+    --stage 1 \
+    --target "$target_triple" \
+    library/std
+
+  # Install std rlibs into the prefix sysroot
+  local src_lib="$SALTYOS_RUST_BUILD_DIR/${SALTYOS_HOST_TRIPLE}/stage1/lib/rustlib/${target_triple}/lib"
+  local dst_lib="$SALTYOS_TOOLCHAIN_PREFIX/lib/rustlib/${target_triple}/lib"
+  if [ -d "$src_lib" ]; then
+    mkdir -p "$dst_lib"
+    cp -r "$src_lib"/* "$dst_lib/"
+    echo "Installed std for ${target_triple} into: $dst_lib"
+  else
+    die "std build artifacts not found at: $src_lib"
+  fi
 }
 
 # =============================================================================
@@ -374,6 +509,23 @@ Run 'just tc build host llvm' first."
   echo "  Sysroot:      $SYSROOT"
   echo "  llvm-config:  $llvm_config"
 
+  # Create cross-compiler wrappers that pin --target so macOS host
+  # clang doesn't fall back to ld64.lld (Mach-O) instead of ld.lld (ELF).
+  local wrapper_dir="$SALTYOS_TOOLCHAIN_BUILD_ROOT/cross-wrappers"
+  mkdir -p "$wrapper_dir"
+
+  cat > "$wrapper_dir/${target_triple}-clang" <<WRAPPER
+#!/bin/sh
+exec "$SALTYOS_TOOLCHAIN_PREFIX/bin/clang" --target=${target_triple} -fuse-ld=lld "\$@"
+WRAPPER
+  chmod +x "$wrapper_dir/${target_triple}-clang"
+
+  cat > "$wrapper_dir/${target_triple}-clang++" <<WRAPPER
+#!/bin/sh
+exec "$SALTYOS_TOOLCHAIN_PREFIX/bin/clang++" --target=${target_triple} -fuse-ld=lld "\$@"
+WRAPPER
+  chmod +x "$wrapper_dir/${target_triple}-clang++"
+
   # Generate cross-bootstrap config
   local config_path="$build_root/config.toml"
   cat > "$config_path" << EOF
@@ -398,9 +550,9 @@ llvm-config = "$llvm_config"
 llvm-filecheck = "$filecheck_path"
 
 [target.${target_triple}]
-cc = "$SALTYOS_TOOLCHAIN_PREFIX/bin/clang"
-cxx = "$SALTYOS_TOOLCHAIN_PREFIX/bin/clang++"
-linker = "$SALTYOS_TOOLCHAIN_PREFIX/bin/clang"
+cc = "$wrapper_dir/${target_triple}-clang"
+cxx = "$wrapper_dir/${target_triple}-clang++"
+linker = "$wrapper_dir/${target_triple}-clang"
 llvm-config = "$llvm_config"
 EOF
 
@@ -534,13 +686,18 @@ cmd_doctor() {
   fi
 
   if [[ -x "${SALTYOS_TOOLCHAIN_PREFIX}/bin/llvm-config" ]]; then
-    local clang_version
+    local clang_version clang_res_dir
     clang_version=$("${SALTYOS_TOOLCHAIN_PREFIX}/bin/llvm-config" --version 2>/dev/null \
       | sed 's/\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/')
-    local crt_builtins="${SALTYOS_TOOLCHAIN_PREFIX}/lib/clang/${clang_version}/lib/x86_64-unknown-saltyos/libclang_rt.builtins.a"
+    # Resource directory may use major-only (e.g. "23") or full version (e.g. "23.0.0")
+    clang_res_dir="${SALTYOS_TOOLCHAIN_PREFIX}/lib/clang/${clang_version}"
+    if [[ ! -d "$clang_res_dir" ]]; then
+      clang_res_dir="${SALTYOS_TOOLCHAIN_PREFIX}/lib/clang/${clang_version%%.*}"
+    fi
+    local crt_builtins="${clang_res_dir}/lib/x86_64-unknown-saltyos/libclang_rt.builtins.a"
     _check_file "${crt_builtins}" "compiler-rt builtins (saltyos)"
 
-    local crt_builtins_aarch64="${SALTYOS_TOOLCHAIN_PREFIX}/lib/clang/${clang_version}/lib/aarch64-unknown-saltyos/libclang_rt.builtins.a"
+    local crt_builtins_aarch64="${clang_res_dir}/lib/aarch64-unknown-saltyos/libclang_rt.builtins.a"
     if [[ -f "${crt_builtins_aarch64}" ]]; then
       _ok "compiler-rt builtins (saltyos aarch64): ${crt_builtins_aarch64}"
     else
@@ -565,7 +722,7 @@ cmd_package() {
     cross_build="$SALTYOS_TOOLCHAIN_BUILD_ROOT/llvm-saltyos"
   fi
   local src="$cross_build/bin"
-  local dst="$SALTYOS_TOOLCHAIN_BUILD_ROOT/llvm-${SALTYOS_ARCH}-stripped"
+  local dst="$SALTYOS_REPO_ROOT/$SALTYOS_MESON_BUILDDIR/tc-package"
   local builddir="$SALTYOS_REPO_ROOT/$SALTYOS_MESON_BUILDDIR"
   local target_triple="${SALTYOS_ARCH}-unknown-saltyos"
 
@@ -592,9 +749,6 @@ Run 'just arch=${SALTYOS_ARCH} tc build cross llvm' first."
     "$strip" "$dst/bin/$f"
   done
 
-  # C++ runtime
-  cp "$builddir/lib/basalt/cpp/libc++.so" "$dst/lib/libc++.so"
-
   # Clang resource directory and compiler-rt builtins
   echo "Copying clang resource directory..."
   rm -rf "$dst/lib/clang"
@@ -612,18 +766,7 @@ Run 'just arch=${SALTYOS_ARCH} tc build cross llvm' first."
     cp -r "$rt_dir" "$(dirname "$dst/lib/clang/$rt_rel")"
   fi
 
-  # CRT objects and linker script
-  echo "Copying development files..."
-  cp "$builddir/lib/basalt/c/crt_start.o" "$dst/lib/crt_start.o"
-  cp "$builddir/rust/core.o" "$dst/lib/core.o"
-  cp "$builddir/rust/compiler_builtins.o" "$dst/lib/compiler_builtins.o"
-  cp "$SALTYOS_REPO_ROOT/lib/trona/trona-pie.ld" "$dst/lib/trona-pie.ld"
-
-  # Link-time libraries
-  cp "$builddir/lib/basalt/c/libc.so" "$dst/lib/libc.so"
-  cp "$builddir/lib/trona/libtrona.so" "$dst/lib/libtrona.so"
-
-  # Stub archives
+  # Stub archives (still needed as physical files for autotools compat)
   for stub in libm.a libpthread.a librt.a libdl.a libutil.a; do
     printf '!<arch>\n' > "$dst/lib/$stub"
   done
@@ -631,7 +774,8 @@ Run 'just arch=${SALTYOS_ARCH} tc build cross llvm' first."
   echo "Done. Stripped sizes:"
   du -sh "$dst/bin/"* "$dst/lib/"*
 
-  # Generate rootfs manifest for meson to pick up
+  # Generate rootfs manifest
+  # LLVM binaries and stubs are local (./); OS libraries reference meson build outputs directly.
   echo "Generating rootfs manifest..."
   cat > "$dst/rootfs.manifest" << MANIFEST
 # Auto-generated by 'just tc package' for ${SALTYOS_ARCH}
@@ -649,20 +793,20 @@ Run 'just arch=${SALTYOS_ARCH} tc build cross llvm' first."
 /usr/bin/llvm-nm=./bin/llvm-nm
 /usr/bin/llvm-objcopy=./bin/llvm-objcopy
 /usr/bin/llvm-strip=./bin/llvm-objcopy
-# C++ runtime
-/lib/libc++.so=./lib/libc++.so
+# C++ runtime — reference meson build output
+/lib/libc++.so=$builddir/lib/basalt/cpp/libc++.so
 # System C headers
 /usr/include/=${SALTYOS_REPO_ROOT}/lib/basalt/c/include/
 # Clang resource headers
 /usr/lib/clang/=./lib/clang/
-# CRT and linker support
-/usr/lib/crt_start.o=./lib/crt_start.o
-/usr/lib/core.o=./lib/core.o
-/usr/lib/compiler_builtins.o=./lib/compiler_builtins.o
-/usr/lib/trona-pie.ld=./lib/trona-pie.ld
-# Link-time libraries
-/usr/lib/libc.so=./lib/libc.so
-/usr/lib/libtrona.so=./lib/libtrona.so
+# CRT and linker support — reference meson build outputs
+/usr/lib/crt_start.o=$builddir/lib/basalt/c/crt_start.o
+/usr/lib/core.o=$builddir/rust/core.o
+/usr/lib/compiler_builtins.o=$builddir/rust/compiler_builtins.o
+/usr/lib/trona-pie.ld=${SALTYOS_REPO_ROOT}/lib/trona/trona-pie.ld
+# Link-time libraries — reference meson build outputs (single source of truth)
+/usr/lib/libc.so=$builddir/lib/basalt/c/libc.so
+/usr/lib/libtrona.so=$builddir/lib/trona/libtrona.so
 # Stub archives
 /usr/lib/libm.a=./lib/libm.a
 /usr/lib/libpthread.a=./lib/libpthread.a
@@ -670,9 +814,21 @@ Run 'just arch=${SALTYOS_ARCH} tc build cross llvm' first."
 /usr/lib/libdl.a=./lib/libdl.a
 /usr/lib/libutil.a=./lib/libutil.a
 MANIFEST
+
+  # Generate content-hash stamp for staleness detection by mkrootfs
+  {
+    sha256sum "$builddir/lib/basalt/c/libc.so" \
+              "$builddir/lib/trona/libtrona.so" \
+              "$builddir/lib/basalt/cpp/libc++.so" \
+              "$builddir/rust/core.o" \
+              "$builddir/lib/basalt/c/crt_start.o" \
+              "$dst/bin/"* \
+              2>/dev/null || true
+  } > "$dst/.build-hash"
+
   echo "Manifest: $dst/rootfs.manifest"
   echo
-  echo "Run 'just distclean && just setup && just build' to include in rootfs."
+  echo "Run 'just mkrootfs' to include in rootfs."
 }
 
 # =============================================================================
@@ -703,11 +859,13 @@ cmd_build() {
   local target="${1:-}"
   local component="${2:-}"
   case "$target/$component" in
-    host/llvm)  cmd_build_host_llvm ;;
-    host/rust)  cmd_build_host_rust ;;
-    cross/llvm) cmd_build_cross_llvm ;;
-    cross/rust) cmd_build_cross_rust ;;
-    *) die "Usage: build {host|cross} {llvm|rust}" ;;
+    host/llvm)     cmd_build_host_llvm ;;
+    host/rust)           cmd_build_host_rust ;;
+    host/rust-host-std)  cmd_build_host_rust_host_std ;;
+    host/rust-cross-std) cmd_build_host_rust_cross_std ;;
+    cross/llvm)          cmd_build_cross_llvm ;;
+    cross/rust)          cmd_build_cross_rust ;;
+    *) die "Usage: build {host|cross} {llvm|rust|rust-host-std|rust-cross-std}" ;;
   esac
 }
 

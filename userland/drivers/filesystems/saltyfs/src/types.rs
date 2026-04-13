@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! On-disk structures: superblock, B-tree nodes, and inodes.
 
-/// Superblock (4KB, docs/design/saltyfs.md:57-104)
+/// Superblock (4KB, docs/design/saltyfs.md Feature flags section)
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct Superblock {
     pub(crate) magic: [u8; 8],
     pub(crate) version: u32,
-    pub(crate) flags: u32,
+    /// Incompatible feature flags. Unknown bits cause mount to be refused.
+    /// (Historically this field was named `flags`.)
+    pub(crate) incompat_flags: u32,
     pub(crate) fs_uuid: [u8; 16],
     pub(crate) device_uuid: [u8; 16],
     // Geometry (offset 0x030)
@@ -37,9 +39,15 @@ pub(crate) struct Superblock {
     pub(crate) reserved1: u32,
     // Label (offset 0x0C0)
     pub(crate) label: [u8; 64],
+    // Feature fields (offset 0x100). Added in the xattr/casefold/multi-user
+    // revision; older images have zero here, which reads as "no new features".
+    pub(crate) compat_flags: u32,        // 0x100
+    pub(crate) compat_ro_flags: u32,     // 0x104
+    pub(crate) casefold_version: u32,    // 0x108
+    pub(crate) reserved2: u32,           // 0x10C
     // Padding to 4KB
-    // 0x100 .. 0xFFC (3836 bytes), checksum is final 4 bytes at 0xFFC
-    pub(crate) reserved: [u8; 3836],
+    // 0x110 .. 0xFFC (3820 bytes), checksum is final 4 bytes at 0xFFC
+    pub(crate) reserved: [u8; 3820],
     pub(crate) checksum: u32,
 }
 
@@ -186,4 +194,33 @@ pub(crate) struct LeafItem {
     pub(crate) key: BTreeKey,
     pub(crate) data: [u8; 256],
     pub(crate) data_len: usize,
+}
+
+/// On-disk header for `TRONA_XATTR_ITEM = 0x07` payloads.
+///
+/// Two variants share the 8-byte header:
+///   - **INLINE** (`flags & 0x01 == 0`): payload is `[header | name | value]`
+///     with `name_len + value_len + 8 <= SALTY_XATTR_INLINE_MAX`.
+///   - **INDIRECT** (`flags & 0x01 == 1`): payload is `[header | name | ref_ino: u64]`,
+///     where `ref_ino` is a hidden inode whose extent data holds the value.
+///     `value_len` is the hidden inode's file size.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub(crate) struct XattrHeader {
+    pub(crate) name_len: u16,
+    pub(crate) flags: u8,
+    pub(crate) reserved0: u8,
+    pub(crate) value_len: u32,
+}
+
+/// `XattrHeader.flags` bit 0: 0 = INLINE, 1 = INDIRECT.
+pub(crate) const XATTR_FLAG_INDIRECT: u8 = 1 << 0;
+
+/// Byte-size of the packed XattrHeader.
+pub(crate) const XATTR_HEADER_SIZE: usize = 8;
+
+/// Read an XattrHeader from an unaligned pointer (B-tree leaves are packed).
+#[inline]
+pub(crate) unsafe fn read_xattr_header(ptr: *const u8) -> XattrHeader {
+    unsafe { core::ptr::read_unaligned(ptr as *const XattrHeader) }
 }

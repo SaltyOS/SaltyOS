@@ -10,8 +10,6 @@ use trona_posix::mm as posix_mm;
 use trona_posix::proc as posix;
 use trona_posix::*;
 
-const CAP_MMSRV_EP: u64 = 7;
-
 fn puts(s: &[u8]) {
     serial::serial_puts(s);
 }
@@ -28,13 +26,75 @@ fn streq(a: &[u8], b: &[u8]) -> bool {
     true
 }
 
+fn copy_name(src: &[u8], dst: &mut [u8; 128]) -> usize {
+    let copy_len = if src.len() < dst.len() {
+        src.len()
+    } else {
+        dst.len()
+    };
+    for i in 0..copy_len {
+        dst[i] = src[i];
+    }
+    copy_len
+}
+
+fn readdir_makes_progress(path: &[u8], must_find: &[&[u8]], limit: usize) -> bool {
+    let dir_fd = unsafe { trona_posix::posix_opendir(path.as_ptr()) };
+    if dir_fd < 0 {
+        return false;
+    }
+
+    let mut dent = TronaDirent::zeroed();
+    let mut seen = 0usize;
+    let mut last_name = [0u8; 128];
+    let mut last_name_len = 0usize;
+    let mut same_name_streak = 0usize;
+    let mut found = [false; 8];
+
+    while unsafe { trona_posix::posix_readdir(dir_fd, &raw mut dent) } != 0 {
+        let name = &dent.d_name[..dent.d_namlen as usize];
+        if name.len() == last_name_len && streq(name, &last_name[..last_name_len]) {
+            same_name_streak += 1;
+        } else {
+            same_name_streak = 0;
+            last_name_len = copy_name(name, &mut last_name);
+        }
+
+        if same_name_streak >= 4 {
+            unsafe { trona_posix::posix_closedir(dir_fd) };
+            return false;
+        }
+
+        for i in 0..must_find.len() {
+            if streq(name, must_find[i]) {
+                found[i] = true;
+            }
+        }
+
+        seen += 1;
+        if seen > limit {
+            unsafe { trona_posix::posix_closedir(dir_fd) };
+            return false;
+        }
+    }
+
+    unsafe { trona_posix::posix_closedir(dir_fd) };
+    if seen == 0 {
+        return false;
+    }
+    for i in 0..must_find.len() {
+        if !found[i] {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn run() -> bool {
     puts(b"[TEST_FS] Starting filesystem tests\n");
 
-    // Initialize posix_mm with the mmsrv endpoint (slot 7)
-    unsafe {
-        posix_mm::posix_mm_init(CAP_MMSRV_EP);
-    }
+    // posix_mm reads mmsrv via trona::caps::mmsrv_ep() now — no explicit
+    // init call needed here.
 
     // Test 1: stat /dev/console
     puts(b"[TEST_FS] Test 1: stat /dev/console\n");
@@ -50,24 +110,24 @@ pub fn run() -> bool {
     }
     puts(b"[TEST_FS] PASS: /dev/console is a char device\n");
 
-    // Test 2: stat /initrd
-    puts(b"[TEST_FS] Test 2: stat /initrd\n");
-    let ret = unsafe { trona_posix::posix_stat(b"/initrd\0".as_ptr(), &raw mut st) };
+    // Test 2: stat /initramfs (old boot root, persists after pivot_root)
+    puts(b"[TEST_FS] Test 2: stat /initramfs\n");
+    let ret = unsafe { trona_posix::posix_stat(b"/initramfs\0".as_ptr(), &raw mut st) };
     if ret != 0 {
-        puts(b"[TEST_FS] FAIL: stat /initrd returned error\n");
+        puts(b"[TEST_FS] FAIL: stat /initramfs returned error\n");
         return false;
     }
     if (st.st_mode & S_IFMT) != S_IFDIR {
-        puts(b"[TEST_FS] FAIL: /initrd is not a directory\n");
+        puts(b"[TEST_FS] FAIL: /initramfs is not a directory\n");
         return false;
     }
-    puts(b"[TEST_FS] PASS: /initrd is a directory\n");
+    puts(b"[TEST_FS] PASS: /initramfs is a directory\n");
 
-    // Test 3: opendir /initrd + readdir
-    puts(b"[TEST_FS] Test 3: opendir/readdir /initrd\n");
-    let dir_fd = unsafe { trona_posix::posix_opendir(b"/initrd\0".as_ptr()) };
+    // Test 3: opendir /initramfs + readdir (old boot root, still mounted after pivot_root)
+    puts(b"[TEST_FS] Test 3: opendir/readdir /initramfs\n");
+    let dir_fd = unsafe { trona_posix::posix_opendir(b"/initramfs\0".as_ptr()) };
     if dir_fd < 0 {
-        puts(b"[TEST_FS] FAIL: opendir /initrd failed\n");
+        puts(b"[TEST_FS] FAIL: opendir /initramfs failed\n");
         return false;
     }
 
@@ -82,10 +142,10 @@ pub fn run() -> bool {
     unsafe { trona_posix::posix_closedir(dir_fd) };
 
     if file_count == 0 {
-        puts(b"[TEST_FS] FAIL: /initrd is empty\n");
+        puts(b"[TEST_FS] FAIL: /initramfs is empty\n");
         return false;
     }
-    puts(b"[TEST_FS] PASS: listed initrd entries\n");
+    puts(b"[TEST_FS] PASS: listed initramfs entries\n");
 
     // Test 4: access
     puts(b"[TEST_FS] Test 4: access checks\n");
@@ -118,14 +178,21 @@ pub fn run() -> bool {
 
     // Test 6: create + write + read round-trip
     puts(b"[TEST_FS] Test 6: file create/write/read round-trip\n");
-    let fd = unsafe { trona_posix::posix_open(b"/tmp/test.txt\0".as_ptr(), (O_CREAT | O_RDWR) as i32, 0o644) };
+    let fd = unsafe {
+        trona_posix::posix_open(
+            b"/tmp/test.txt\0".as_ptr(),
+            (O_CREAT | O_RDWR) as i32,
+            0o644,
+        )
+    };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: open /tmp/test.txt O_CREAT failed\n");
         return false;
     }
 
     let test_data = b"Hello, SaltyOS filesystem!";
-    let written = unsafe { trona_posix::posix_write(fd, test_data.as_ptr(), test_data.len() as u64) };
+    let written =
+        unsafe { trona_posix::posix_write(fd, test_data.as_ptr(), test_data.len() as u64) };
     if written != test_data.len() as i64 {
         puts(b"[TEST_FS] FAIL: write returned wrong count\n");
         return false;
@@ -208,61 +275,51 @@ pub fn run() -> bool {
     }
     puts(b"[TEST_FS] PASS: unlink OK\n");
 
-    // Test 10: rmdir
+    // Test 10: rmdir mountpoint should fail with EBUSY
     puts(b"[TEST_FS] Test 10: rmdir /tmp\n");
     let ret = unsafe { trona_posix::posix_rmdir(b"/tmp\0".as_ptr()) };
-    if ret != 0 {
-        puts(b"[TEST_FS] FAIL: rmdir /tmp returned error\n");
+    if ret != -16 {
+        puts(b"[TEST_FS] FAIL: rmdir /tmp should have returned EBUSY\n");
         return false;
     }
     let ret = unsafe { trona_posix::posix_access(b"/tmp\0".as_ptr(), F_OK as i32) };
-    if ret == 0 {
-        puts(b"[TEST_FS] FAIL: /tmp still exists after rmdir\n");
+    if ret != 0 {
+        puts(b"[TEST_FS] FAIL: /tmp disappeared after failed rmdir\n");
         return false;
     }
-    puts(b"[TEST_FS] PASS: rmdir OK\n");
+    puts(b"[TEST_FS] PASS: mountpoint rmdir rejected with EBUSY\n");
+
+    puts(b"[TEST_FS] Test 10a: readdir / makes progress\n");
+    if !readdir_makes_progress(b"/\0", &[b"dev", b"tmp", b"usr"], 128) {
+        puts(b"[TEST_FS] FAIL: readdir / did not make progress\n");
+        return false;
+    }
+    puts(b"[TEST_FS] PASS: readdir / makes progress\n");
 
     // Test 11: opendir /dev + readdir
     puts(b"[TEST_FS] Test 11: readdir /dev\n");
-    let dir_fd = unsafe { trona_posix::posix_opendir(b"/dev\0".as_ptr()) };
-    if dir_fd < 0 {
-        puts(b"[TEST_FS] FAIL: opendir /dev failed\n");
-        return false;
-    }
-
-    let mut found_console = false;
-    let mut found_null = false;
-    let mut found_zero = false;
-    while unsafe { trona_posix::posix_readdir(dir_fd, &raw mut dent) } != 0 {
-        let name = &dent.d_name[..dent.d_namlen as usize];
-        if streq(name, b"console") {
-            found_console = true;
-        }
-        if streq(name, b"null") {
-            found_null = true;
-        }
-        if streq(name, b"zero") {
-            found_zero = true;
-        }
-    }
-    unsafe { trona_posix::posix_closedir(dir_fd) };
-
-    if !found_console || !found_null || !found_zero {
-        puts(b"[TEST_FS] FAIL: missing device entries in /dev\n");
+    if !readdir_makes_progress(b"/dev\0", &[b"console", b"null", b"zero"], 128) {
+        puts(b"[TEST_FS] FAIL: readdir /dev did not make progress\n");
         return false;
     }
     puts(b"[TEST_FS] PASS: /dev contains console, null, zero\n");
 
     // Test 12: rename
     puts(b"[TEST_FS] Test 12: rename\n");
-    let ret = unsafe { trona_posix::posix_mkdir(b"/tmp2\0".as_ptr(), 0o755) };
+    let ret = unsafe { trona_posix::posix_mkdir(b"/tmp/rename_test\0".as_ptr(), 0o755) };
     if ret != 0 {
-        puts(b"[TEST_FS] FAIL: mkdir /tmp2 failed\n");
+        puts(b"[TEST_FS] FAIL: mkdir /tmp/rename_test failed\n");
         return false;
     }
-    let fd = unsafe { trona_posix::posix_open(b"/tmp2/a.txt\0".as_ptr(), (O_CREAT | O_RDWR) as i32, 0o644) };
+    let fd = unsafe {
+        trona_posix::posix_open(
+            b"/tmp/rename_test/a.txt\0".as_ptr(),
+            (O_CREAT | O_RDWR) as i32,
+            0o644,
+        )
+    };
     if fd < 0 {
-        puts(b"[TEST_FS] FAIL: create /tmp2/a.txt failed\n");
+        puts(b"[TEST_FS] FAIL: create /tmp/rename_test/a.txt failed\n");
         return false;
     }
     unsafe {
@@ -270,19 +327,27 @@ pub fn run() -> bool {
         trona_posix::posix_close(fd);
     }
 
-    let ret = unsafe { trona_posix::posix_rename(b"/tmp2/a.txt\0".as_ptr(), b"/tmp2/b.txt\0".as_ptr()) };
+    let ret = unsafe {
+        trona_posix::posix_rename(
+            b"/tmp/rename_test/a.txt\0".as_ptr(),
+            b"/tmp/rename_test/b.txt\0".as_ptr(),
+        )
+    };
     if ret != 0 {
         puts(b"[TEST_FS] FAIL: rename failed\n");
         return false;
     }
 
-    let ret = unsafe { trona_posix::posix_access(b"/tmp2/a.txt\0".as_ptr(), F_OK as i32) };
+    let ret =
+        unsafe { trona_posix::posix_access(b"/tmp/rename_test/a.txt\0".as_ptr(), F_OK as i32) };
     if ret == 0 {
         puts(b"[TEST_FS] FAIL: old name still exists after rename\n");
         return false;
     }
 
-    let fd = unsafe { trona_posix::posix_open(b"/tmp2/b.txt\0".as_ptr(), O_RDONLY as i32, 0) };
+    let fd = unsafe {
+        trona_posix::posix_open(b"/tmp/rename_test/b.txt\0".as_ptr(), O_RDONLY as i32, 0)
+    };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: open renamed file failed\n");
         return false;
@@ -298,8 +363,8 @@ pub fn run() -> bool {
 
     // Cleanup
     unsafe {
-        trona_posix::posix_unlink(b"/tmp2/b.txt\0".as_ptr());
-        trona_posix::posix_rmdir(b"/tmp2\0".as_ptr());
+        trona_posix::posix_unlink(b"/tmp/rename_test/b.txt\0".as_ptr());
+        trona_posix::posix_rmdir(b"/tmp/rename_test\0".as_ptr());
     }
 
     // Test 13: /dev/urandom
@@ -321,7 +386,10 @@ pub fn run() -> bool {
     // Check non-zero (probabilistic but extremely unlikely to fail)
     let mut all_zero = true;
     for i in 0..32 {
-        if ubuf1[i] != 0 { all_zero = false; break; }
+        if ubuf1[i] != 0 {
+            all_zero = false;
+            break;
+        }
     }
     if all_zero {
         puts(b"[TEST_FS] FAIL: urandom returned all zeros\n");
@@ -330,7 +398,10 @@ pub fn run() -> bool {
     // Two reads should differ
     let mut same = true;
     for i in 0..32 {
-        if ubuf1[i] != ubuf2[i] { same = false; break; }
+        if ubuf1[i] != ubuf2[i] {
+            same = false;
+            break;
+        }
     }
     if same {
         puts(b"[TEST_FS] FAIL: two urandom reads identical\n");
@@ -344,7 +415,8 @@ pub fn run() -> bool {
     unsafe { trona_posix::posix_mkdir(b"/tmp/a_very_long_directory_name_here\0".as_ptr(), 0o755) };
     // Path = /tmp/a_very_long_directory_name_here/test_long_path.txt (total > 64 bytes)
     let long_path = b"/tmp/a_very_long_directory_name_here/test_long_path.txt\0";
-    let fd = unsafe { trona_posix::posix_open(long_path.as_ptr(), (O_CREAT | O_RDWR) as i32, 0o644) };
+    let fd =
+        unsafe { trona_posix::posix_open(long_path.as_ptr(), (O_CREAT | O_RDWR) as i32, 0o644) };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: open long path failed\n");
         return false;
@@ -367,7 +439,9 @@ pub fn run() -> bool {
 
     // Test 15: Large file (>8KB)
     puts(b"[TEST_FS] Test 15: large file write/read\n");
-    let fd = unsafe { trona_posix::posix_open(b"/tmp/bigfile\0".as_ptr(), (O_CREAT | O_RDWR) as i32, 0o644) };
+    let fd = unsafe {
+        trona_posix::posix_open(b"/tmp/bigfile\0".as_ptr(), (O_CREAT | O_RDWR) as i32, 0o644)
+    };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: create bigfile failed\n");
         return false;
@@ -377,7 +451,11 @@ pub fn run() -> bool {
     let target_size: usize = 10240;
     let mut written_total: usize = 0;
     while written_total < target_size {
-        let chunk = if target_size - written_total < 128 { target_size - written_total } else { 128 };
+        let chunk = if target_size - written_total < 128 {
+            target_size - written_total
+        } else {
+            128
+        };
         for j in 0..chunk {
             wbuf[j] = ((written_total + j) % 251) as u8;
         }
@@ -400,7 +478,9 @@ pub fn run() -> bool {
     let mut rbuf = [0u8; 128];
     loop {
         let r = unsafe { trona_posix::posix_read(fd, rbuf.as_mut_ptr(), 128) };
-        if r <= 0 { break; }
+        if r <= 0 {
+            break;
+        }
         for j in 0..r as usize {
             if rbuf[j] != ((read_total + j) % 251) as u8 {
                 puts(b"[TEST_FS] FAIL: large file data mismatch\n");
@@ -420,7 +500,13 @@ pub fn run() -> bool {
 
     // Test 16: Symlink
     puts(b"[TEST_FS] Test 16: symlink\n");
-    let fd = unsafe { trona_posix::posix_open(b"/tmp/orig.txt\0".as_ptr(), (O_CREAT | O_RDWR) as i32, 0o644) };
+    let fd = unsafe {
+        trona_posix::posix_open(
+            b"/tmp/orig.txt\0".as_ptr(),
+            (O_CREAT | O_RDWR) as i32,
+            0o644,
+        )
+    };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: create orig.txt failed\n");
         return false;
@@ -429,7 +515,9 @@ pub fn run() -> bool {
         trona_posix::posix_write(fd, b"symlink_test".as_ptr(), 12);
         trona_posix::posix_close(fd);
     }
-    let ret = unsafe { trona_posix::posix_symlink(b"/tmp/orig.txt\0".as_ptr(), b"/tmp/link.txt\0".as_ptr()) };
+    let ret = unsafe {
+        trona_posix::posix_symlink(b"/tmp/orig.txt\0".as_ptr(), b"/tmp/link.txt\0".as_ptr())
+    };
     if ret != 0 {
         puts(b"[TEST_FS] FAIL: symlink creation failed\n");
         return false;
@@ -449,7 +537,8 @@ pub fn run() -> bool {
     }
     // readlink
     let mut lbuf = [0u8; 128];
-    let rl = unsafe { trona_posix::posix_readlink(b"/tmp/link.txt\0".as_ptr(), lbuf.as_mut_ptr(), 128) };
+    let rl =
+        unsafe { trona_posix::posix_readlink(b"/tmp/link.txt\0".as_ptr(), lbuf.as_mut_ptr(), 128) };
     if rl <= 0 {
         puts(b"[TEST_FS] FAIL: readlink failed\n");
         return false;
@@ -482,7 +571,9 @@ pub fn run() -> bool {
 
     // Test 17: Hard link
     puts(b"[TEST_FS] Test 17: hard link\n");
-    let fd = unsafe { trona_posix::posix_open(b"/tmp/src.txt\0".as_ptr(), (O_CREAT | O_RDWR) as i32, 0o644) };
+    let fd = unsafe {
+        trona_posix::posix_open(b"/tmp/src.txt\0".as_ptr(), (O_CREAT | O_RDWR) as i32, 0o644)
+    };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: create src.txt failed\n");
         return false;
@@ -491,7 +582,8 @@ pub fn run() -> bool {
         trona_posix::posix_write(fd, b"hardlink".as_ptr(), 8);
         trona_posix::posix_close(fd);
     }
-    let ret = unsafe { trona_posix::posix_link(b"/tmp/src.txt\0".as_ptr(), b"/tmp/dst.txt\0".as_ptr()) };
+    let ret =
+        unsafe { trona_posix::posix_link(b"/tmp/src.txt\0".as_ptr(), b"/tmp/dst.txt\0".as_ptr()) };
     if ret != 0 {
         puts(b"[TEST_FS] FAIL: link creation failed\n");
         return false;
@@ -526,7 +618,8 @@ pub fn run() -> bool {
         puts(b"[TEST_FS] FAIL: stat /proc failed\n");
         return false;
     }
-    let fd = unsafe { trona_posix::posix_open(b"/proc/self/status\0".as_ptr(), O_RDONLY as i32, 0) };
+    let fd =
+        unsafe { trona_posix::posix_open(b"/proc/self/status\0".as_ptr(), O_RDONLY as i32, 0) };
     if fd < 0 {
         puts(b"[TEST_FS] FAIL: open /proc/self/status failed\n");
         return false;
@@ -550,7 +643,11 @@ pub fn run() -> bool {
     puts(b"[TEST_FS] Test 19: /proc/self/exe\n");
     let mut exe_buf = [0u8; 128];
     let exe_len = unsafe {
-        trona_posix::posix_readlink(b"/proc/self/exe\0".as_ptr(), exe_buf.as_mut_ptr(), exe_buf.len())
+        trona_posix::posix_readlink(
+            b"/proc/self/exe\0".as_ptr(),
+            exe_buf.as_mut_ptr(),
+            exe_buf.len(),
+        )
     };
     if exe_len <= 0 {
         puts(b"[TEST_FS] FAIL: readlink /proc/self/exe failed\n");

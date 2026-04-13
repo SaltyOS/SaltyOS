@@ -28,12 +28,14 @@ SALTYFS_MAGIC = b"SALTYFS\0"
 # B-tree node magic
 BTREE_NODE_MAGIC = b"BTND"
 
-# Item types (docs/design/saltyfs.md:154-160)
+# Item types (must match userland/drivers/filesystems/saltyfs/src/consts.rs)
 SALTY_INODE_ITEM = 0x01
 SALTY_INODE_REF = 0x02
 SALTY_DIR_ITEM = 0x03
 SALTY_DIR_INDEX = 0x04
 SALTY_EXTENT_DATA = 0x05
+SALTY_EXTENT_REF = 0x06
+SALTY_XATTR_ITEM = 0x07
 
 # Extent types
 EXTENT_INLINE = 0
@@ -47,6 +49,17 @@ S_IFREG = 0o100000
 # Inode numbers
 ROOT_INO = 1
 FIRST_FILE_INO = 2
+
+# Feature flags (must match SALTYFS_INCOMPAT_* in saltyfs consts.rs)
+SALTYFS_INCOMPAT_XATTR = 1 << 0
+SALTYFS_INCOMPAT_CASEFOLD = 1 << 1
+
+# Inode flags (must match SALTY_INODE_* in saltyfs consts.rs)
+SALTY_INODE_CASEFOLD = 1 << 0
+SALTY_INODE_HIDDEN = 1 << 1
+
+# Default Unicode version for casefold table
+CASEFOLD_VERSION_UNICODE_15_1 = 15_001_000
 
 # B-tree on-disk sizes (match userland/drivers/filesystems/saltyfs/src/types.rs packed layouts)
 BTREE_NODE_HEADER_SIZE = 64
@@ -386,6 +399,10 @@ def build_superblock(
     root_inode: int,
     generation: int = 1,
     label: str = "saltyfs",
+    incompat_flags: int = 0,
+    compat_flags: int = 0,
+    compat_ro_flags: int = 0,
+    casefold_version: int = 0,
 ) -> bytes:
     """Build a 4KB superblock."""
     now = int(time.time())
@@ -401,9 +418,9 @@ def build_superblock(
 
     sb = bytearray(BLOCK_SIZE)
 
-    # Identity (0x000)
+    # Identity (0x000) — magic(8), version(4), incompat_flags(4)
     struct.pack_into("<8sII", sb, 0x000,
-                     SALTYFS_MAGIC, 1, 0)
+                     SALTYFS_MAGIC, 1, incompat_flags)
 
     # UUIDs (0x010)
     sb[0x010:0x020] = fs_uuid
@@ -429,10 +446,14 @@ def build_superblock(
     struct.pack_into("<Q", sb, 0x0B0, root_inode)
 
     # Checksums (0x0B8)
-    struct.pack_into("<II", sb, 0x0B8, 0, 0)  # CRC32c, reserved
+    struct.pack_into("<II", sb, 0x0B8, 0, 0)  # CRC32c type, reserved1
 
     # Label (0x0C0)
     sb[0x0C0:0x100] = label_bytes
+
+    # Feature fields (0x100): compat_flags, compat_ro_flags, casefold_version, reserved2
+    struct.pack_into("<IIII", sb, 0x100,
+                     compat_flags, compat_ro_flags, casefold_version, 0)
 
     # Checksum (last 4 bytes)
     checksum = crc32c(bytes(sb))
@@ -450,16 +471,34 @@ def parse_size(size_str: str) -> int:
     return int(size_str)
 
 
-def create_saltyfs_image(output_path: Path, size: int, files: list, label: str = "saltyfs"):
+def create_saltyfs_image(output_path: Path, size: int, files: list, label: str = "saltyfs",
+                         permissions: dict = None,
+                         empty_dirs: list = None,
+                         incompat_flags: int = 0,
+                         compat_ro_flags: int = 0,
+                         casefold_version: int = 0,
+                         casefold_root: bool = False):
     """
     Create a SaltyFS image with the given files.
 
     files: list of (name, content_bytes) tuples.
+    permissions: optional dict mapping path → (mode, uid, gid).
+    empty_dirs: optional list of directory paths to create (even if no files live there).
+    casefold_root: if True, set SALTY_INODE_CASEFOLD on the root inode and
+                   also set SALTYFS_INCOMPAT_CASEFOLD + casefold_version.
     """
+    if permissions is None:
+        permissions = {}
     total_blocks = size // BLOCK_SIZE
     if total_blocks < 16:
         print("Error: Image too small (need at least 16 blocks)", file=sys.stderr)
         sys.exit(1)
+
+    # Casefold root implies the corresponding incompat bit + version
+    if casefold_root:
+        incompat_flags |= SALTYFS_INCOMPAT_CASEFOLD
+        if casefold_version == 0:
+            casefold_version = CASEFOLD_VERSION_UNICODE_15_1
 
     # Layout:
     # Block 0: Primary Superblock
@@ -496,12 +535,21 @@ def create_saltyfs_image(output_path: Path, size: int, files: list, label: str =
             for i in range(1, len(parts)):  # skip the filename itself
                 dir_paths.add('/'.join(parts[:i]))
 
+        # Merge explicitly requested empty directories and their parents
+        if empty_dirs:
+            for d in empty_dirs:
+                d = d.strip('/')
+                parts = d.split('/')
+                for i in range(1, len(parts) + 1):
+                    dir_paths.add('/'.join(parts[:i]))
+
         # Sort by depth (parents before children)
         sorted_dirs = sorted(dir_paths, key=lambda d: d.count('/'))
 
         # Root directory inode (ino=1)
         # nlink = 2 (self + parent) + number of immediate child directories
         root_child_dirs = sum(1 for d in sorted_dirs if '/' not in d)
+        root_inode_flags = SALTY_INODE_CASEFOLD if casefold_root else 0
         root_inode_data = pack_inode(
             generation=generation,
             size=0,
@@ -509,6 +557,7 @@ def create_saltyfs_image(output_path: Path, size: int, files: list, label: str =
             nlink=2 + root_child_dirs,
             mode=S_IFDIR | 0o755,
             atime=now_ns, mtime=now_ns, ctime=now_ns, crtime=now_ns,
+            flags=root_inode_flags,
         )
         btree_items.append((
             pack_btree_key(ROOT_INO, SALTY_INODE_ITEM, 0),
@@ -571,14 +620,19 @@ def create_saltyfs_image(output_path: Path, size: int, files: list, label: str =
 
             fname_bytes = basename.encode("ascii")
 
-            # File inode
+            # File inode — apply permission overrides if available
             file_blocks = (len(content) + BLOCK_SIZE - 1) // BLOCK_SIZE
+            lookup_name = '/' + stripped if not stripped.startswith('/') else stripped
+            perm_mode, perm_uid, perm_gid = permissions.get(
+                lookup_name, permissions.get(stripped, (S_IFREG | 0o644, 0, 0)))
             file_inode_data = pack_inode(
                 generation=generation,
                 size=len(content),
                 blocks=file_blocks,
                 nlink=1,
-                mode=S_IFREG | 0o644,
+                uid=perm_uid,
+                gid=perm_gid,
+                mode=perm_mode,
                 atime=now_ns, mtime=now_ns, ctime=now_ns, crtime=now_ns,
             )
             btree_items.append((
@@ -679,6 +733,10 @@ def create_saltyfs_image(output_path: Path, size: int, files: list, label: str =
         root_inode=ROOT_INO,
         generation=generation,
         label=label,
+        incompat_flags=incompat_flags,
+        compat_flags=0,
+        compat_ro_flags=compat_ro_flags,
+        casefold_version=casefold_version,
     )
 
     # Build allocation bitmap
@@ -770,9 +828,53 @@ def main():
         help="Add a file with content read from a path",
     )
     parser.add_argument(
+        "--add-dir",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Create an empty directory at PATH (e.g., /dev, /proc)",
+    )
+    parser.add_argument(
         "--label",
         default="saltyfs",
         help="Volume label (default: saltyfs)",
+    )
+    parser.add_argument(
+        "--set-permissions",
+        default=None,
+        metavar="FILE",
+        help="Permissions file mapping paths to mode/uid/gid overrides",
+    )
+
+    # Feature-flag debug hooks (for regression/testing)
+    def _parse_hex(s):
+        return int(s, 0)
+
+    parser.add_argument(
+        "--fake-incompat",
+        type=_parse_hex,
+        default=0,
+        metavar="HEX",
+        help="Set arbitrary incompat_flags value (testing driver rejection path)",
+    )
+    parser.add_argument(
+        "--fake-compat-ro",
+        type=_parse_hex,
+        default=0,
+        metavar="HEX",
+        help="Set arbitrary compat_ro_flags value (testing auto-RO mount path)",
+    )
+    parser.add_argument(
+        "--casefold-root",
+        action="store_true",
+        help="Enable Unicode Simple Case-Folding on the root directory",
+    )
+    parser.add_argument(
+        "--casefold-version",
+        type=int,
+        default=0,
+        metavar="VER",
+        help="Override casefold_version (default 15_001_000 when --casefold-root)",
     )
 
     args = parser.parse_args()
@@ -799,7 +901,28 @@ def main():
             with open(path, "rb") as f:
                 files.append((name, f.read()))
 
-    create_saltyfs_image(args.output, size, files, label=args.label)
+    permissions = {}
+    if args.set_permissions:
+        perm_path = Path(args.set_permissions)
+        if perm_path.exists():
+            with open(perm_path) as pf:
+                for line in pf:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    parts = line.split()
+                    if len(parts) != 4:
+                        continue
+                    path, mode_str, uid_str, gid_str = parts
+                    permissions[path] = (int(mode_str, 8), int(uid_str), int(gid_str))
+
+    create_saltyfs_image(args.output, size, files, label=args.label,
+                         permissions=permissions,
+                         empty_dirs=args.add_dir if args.add_dir else None,
+                         incompat_flags=args.fake_incompat,
+                         compat_ro_flags=args.fake_compat_ro,
+                         casefold_version=args.casefold_version,
+                         casefold_root=args.casefold_root)
 
 
 if __name__ == "__main__":

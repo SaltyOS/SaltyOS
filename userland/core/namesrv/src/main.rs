@@ -22,12 +22,13 @@ extern crate trona_posix;
 
 use trona::consts::kernel::*;
 use trona::ipc;
+use trona::invoke;
 use trona::protocol::*;
 use trona::types::core::*;
 
 const CAP_SELF_CSPACE: u64 = 2;
-const CAP_SERVER_EP: u64 = 3;
-const CAP_READINESS_NTFN: u64 = 14;
+
+const CAP_RECV_SCRATCH: u64 = 15;
 
 const CAP_SERVICE_BASE: u64 = 32;
 const MAX_SERVICES: usize = 32;
@@ -60,7 +61,14 @@ fn ipc_ctx() -> *mut IpcContext {
 }
 
 fn signal_ready() {
-    let _ = trona::syscall::syscall(SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(SYS_SIGNAL, trona::caps::readiness_ntfn(), 1, 0, 0, 0, 0);
+}
+
+fn arm_recv_scratch() {
+    unsafe {
+        let _ = invoke::cnode_delete(CAP_SELF_CSPACE, CAP_RECV_SCRATCH);
+        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_RECV_SCRATCH, 0);
+    }
 }
 
 fn name_equal(a: &[u8], alen: u8, b: &[u8], blen: u8) -> bool {
@@ -95,6 +103,7 @@ unsafe fn handle_register(msg: *const TronaMsg, reply: *mut TronaMsg) {
         let name_len = extract_name(msg, &mut name);
 
         if name_len == 0 {
+            let _ = invoke::cnode_delete(CAP_SELF_CSPACE, CAP_RECV_SCRATCH);
             trona::uwarn!(|_lb| {
                 _lb.str(b"[NAMESERV] REGISTER: empty name\n");
             });
@@ -107,6 +116,7 @@ unsafe fn handle_register(msg: *const TronaMsg, reply: *mut TronaMsg) {
             if SERVICES[i].active != 0
                 && name_equal(&SERVICES[i].name, SERVICES[i].name_len, &name, name_len)
             {
+                let _ = invoke::cnode_delete(CAP_SELF_CSPACE, CAP_RECV_SCRATCH);
                 trona::uwarn!(|_lb| {
                     _lb.str(b"[NAMESERV] REGISTER: duplicate name '");
                     _lb.bytes(&name[..name_len as usize]);
@@ -118,6 +128,7 @@ unsafe fn handle_register(msg: *const TronaMsg, reply: *mut TronaMsg) {
         }
 
         if SERVICE_COUNT >= MAX_SERVICES {
+            let _ = invoke::cnode_delete(CAP_SELF_CSPACE, CAP_RECV_SCRATCH);
             trona::uerror!(|_lb| {
                 _lb.str(b"[NAMESERV] REGISTER: table full\n");
             });
@@ -126,6 +137,24 @@ unsafe fn handle_register(msg: *const TronaMsg, reply: *mut TronaMsg) {
         }
 
         let ep_slot = CAP_SERVICE_BASE + SERVICE_COUNT as u64;
+        let move_err = invoke::cnode_move(
+            CAP_SELF_CSPACE,
+            ep_slot,
+            CAP_SELF_CSPACE,
+            CAP_RECV_SCRATCH,
+        );
+        if move_err != 0 {
+            let _ = invoke::cnode_delete(CAP_SELF_CSPACE, CAP_RECV_SCRATCH);
+            trona::uerror!(|_lb| {
+                _lb.str(b"[NAMESERV] REGISTER: failed to stash endpoint cap for '");
+                _lb.bytes(&name[..name_len as usize]);
+                _lb.str(b"' err=");
+                _lb.hex(move_err as u64);
+                _lb.str(b"\n");
+            });
+            (*reply).label = TRONA_INVALID_CAPABILITY;
+            return;
+        }
 
         let entry = &mut SERVICES[SERVICE_COUNT];
         for i in 0..name_len as usize {
@@ -185,16 +214,21 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     });
 
     // Set up receive slot for cap transfers
-    unsafe {
-        ipc::set_receive_slot_ctx(ipc_ctx(), CAP_SELF_CSPACE, CAP_SERVICE_BASE, 0);
-    }
+    arm_recv_scratch();
     signal_ready();
 
     // Initial recv
     let mut msg = TronaMsg::zeroed();
     let mut badge: u64 = 0;
 
-    let err = unsafe { ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge) };
+    let err = unsafe {
+        ipc::recv_ctx(
+            ipc_ctx(),
+            trona::caps::service_ep(),
+            &raw mut msg,
+            &raw mut badge,
+        )
+    };
     if err != 0 {
         trona::uerror!(|_lb| {
             _lb.str(b"[NAMESERV] initial recv failed\n");
@@ -222,19 +256,12 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         }
 
         // Update receive slot for next incoming cap transfer
-        unsafe {
-            ipc::set_receive_slot_ctx(
-                ipc_ctx(),
-                CAP_SELF_CSPACE,
-                CAP_SERVICE_BASE + SERVICE_COUNT as u64,
-                0,
-            );
-        }
+        arm_recv_scratch();
 
         let err = unsafe {
             ipc::reply_recv_ctx(
                 ipc_ctx(),
-                CAP_SERVER_EP,
+                trona::caps::service_ep(),
                 &raw const reply,
                 &raw mut msg,
                 &raw mut badge,

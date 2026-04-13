@@ -52,11 +52,11 @@ const TERM_RING_HDR_SIZE: usize = 16;
 static mut TERM_RING_BASE: *mut u8 = core::ptr::null_mut();
 static mut TERM_RING_ACTIVE: bool = false;
 
-// Serial TX queue. Decouples UART busy-wait from the event loop — data is
-// enqueued here and drained in small chunks (SERIAL_TX_DRAIN_MAX bytes per
-// loop iteration) so TTYD remains responsive during large writes.
+// Serial TX queue. Decouples write bursts from IPC handlers, but the queue is
+// drained fully before the server blocks again so prompt output never waits
+// for a later input event to become visible.
 const SERIAL_TX_BUF_SIZE: usize = 4096;
-const SERIAL_TX_DRAIN_MAX: usize = 64;
+const SERIAL_TX_DRAIN_MAX: usize = 256;
 static mut SERIAL_TX_BUF: [u8; SERIAL_TX_BUF_SIZE] = [0; SERIAL_TX_BUF_SIZE];
 static mut SERIAL_TX_HEAD: usize = 0;
 static mut SERIAL_TX_TAIL: usize = 0;
@@ -74,7 +74,15 @@ pub(crate) fn ipc_ctx() -> *mut IpcContext {
 }
 
 fn signal_ready() {
-    let _ = trona::syscall::syscall(trona::SYS_SIGNAL, CAP_READINESS_NTFN, 1, 0, 0, 0, 0);
+    let _ = trona::syscall::syscall(
+        trona::SYS_SIGNAL,
+        trona::caps::readiness_ntfn(),
+        1,
+        0,
+        0,
+        0,
+        0,
+    );
 }
 
 // ======================================================================
@@ -148,19 +156,23 @@ pub(crate) fn display_write(data: &[u8]) {
 fn setup_display_ring() -> bool {
     let ctx = ipc_ctx();
 
-    // 1. Allocate notification via mmsrv
+    // 1. Allocate notification via rsrcsrv (RES_ALLOC_OBJECT, owner=self)
     // SAFETY: IPC context is valid; set up receive slot for cap transfer.
     unsafe {
         ipc::set_receive_slot_ctx(ctx, CAP_SELF_CSPACE, CAP_DISPLAY_RING_NTFN, 0);
     }
     let mut msg = TronaMsg::zeroed();
-    msg.label = MM_ALLOC_OBJECT;
-    msg.regs[0] = OBJ_NOTIFICATION;
-    msg.regs[1] = 0;
-    msg.length = 2;
+    msg.label = RES_ALLOC_OBJECT;
+    msg.regs[0] = 0; // owner_id=0 → caller's badge
+    msg.regs[1] = OBJ_NOTIFICATION;
+    msg.regs[2] = 0;
+    msg.regs[3] = 0;
+    msg.length = 4;
     let mut reply = TronaMsg::zeroed();
-    // SAFETY: IPC context is valid; making RPC to mmsrv.
-    let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
+    // SAFETY: IPC context is valid; making RPC to rsrcsrv.
+    let err = unsafe {
+        ipc::call_ctx(ctx, trona::caps::rsrcsrv_ep(), &raw const msg, &raw mut reply)
+    };
     if err != 0 || reply.label != TRONA_OK {
         puts(b"[posix_ttysrv] Failed to allocate ring notification\n");
         return false;
@@ -174,7 +186,7 @@ fn setup_display_ring() -> bool {
     msg.length = 2;
     let mut reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
-    let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || (reply.label != TRONA_OK && reply.label != TRONA_ALREADY_EXISTS) {
         puts(b"[posix_ttysrv] SHM create failed\n");
         return false;
@@ -190,7 +202,7 @@ fn setup_display_ring() -> bool {
     msg.length = 4;
     let mut reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to mmsrv.
-    let err = unsafe { ipc::call_ctx(ctx, CAP_MMSRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ctx, trona::caps::mmsrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != TRONA_OK {
         puts(b"[posix_ttysrv] SHM map failed\n");
         return false;
@@ -218,7 +230,7 @@ fn setup_display_ring() -> bool {
     msg.length = 1;
     let mut reply = TronaMsg::zeroed();
     // SAFETY: IPC context is valid; making RPC to display.
-    let err = unsafe { ipc::call_ctx(ctx, CAP_DISPDRV_EP, &raw const msg, &raw mut reply) };
+    let err = unsafe { ipc::call_ctx(ctx, svc_caps::dispdrv_ep(), &raw const msg, &raw mut reply) };
     if err != 0 || reply.label != TRONA_OK {
         puts(b"[posix_ttysrv] DISPLAY_SETUP_RING failed\n");
         return false;
@@ -241,7 +253,7 @@ pub(crate) fn serial_write_queued(data: &[u8]) {
             let next = (SERIAL_TX_HEAD + 1) % SERIAL_TX_BUF_SIZE;
             if next == SERIAL_TX_TAIL {
                 // Buffer full — drain synchronously to avoid dropping bytes
-                serial_try_flush();
+                serial_flush_until_empty();
                 let next2 = (SERIAL_TX_HEAD + 1) % SERIAL_TX_BUF_SIZE;
                 if next2 == SERIAL_TX_TAIL {
                     // Still full after flush — write directly as fallback
@@ -256,8 +268,7 @@ pub(crate) fn serial_write_queued(data: &[u8]) {
 }
 
 /// Drain up to SERIAL_TX_DRAIN_MAX bytes from the serial TX queue.
-/// Called once per event loop iteration to keep TTYD responsive.
-unsafe fn serial_try_flush() {
+unsafe fn serial_try_flush_chunk() {
     unsafe {
         if SERIAL_TX_HEAD == SERIAL_TX_TAIL {
             return;
@@ -274,6 +285,14 @@ unsafe fn serial_try_flush() {
         if n > 0 {
             serial::serial_puts(&buf[..n]);
             SERIAL_TX_TAIL = (SERIAL_TX_TAIL + n) % SERIAL_TX_BUF_SIZE;
+        }
+    }
+}
+
+unsafe fn serial_flush_until_empty() {
+    unsafe {
+        while SERIAL_TX_HEAD != SERIAL_TX_TAIL {
+            serial_try_flush_chunk();
         }
     }
 }
@@ -296,10 +315,10 @@ fn register_with_namesrv() -> bool {
         for i in 0..svc_name.len() {
             *ns_dst.add(i) = svc_name[i];
         }
-        ipc::set_send_cap_ctx(ipc_ctx(), 0, CAP_SERVER_EP);
+        ipc::set_send_cap_ctx(ipc_ctx(), 0, trona::caps::service_ep());
         let err = ipc::call_ctx(
             ipc_ctx(),
-            CAP_NAMESRV_EP,
+            trona::caps::namesrv_ep(),
             &raw const reg_msg,
             &raw mut reg_reply,
         );
@@ -334,7 +353,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         qmsg.length = 0;
         let err = trona::ipc::call_ctx(
             ipc_ctx(),
-            CAP_DISPDRV_EP,
+            svc_caps::dispdrv_ep(),
             &raw const qmsg,
             &raw mut qreply,
         );
@@ -383,7 +402,12 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     let mut badge = 0u64;
 
     let err = unsafe {
-        trona::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
+        trona::ipc::recv_ctx(
+            ipc_ctx(),
+            trona::caps::service_ep(),
+            &raw mut msg,
+            &raw mut badge,
+        )
     };
     if err != 0 {
         puts(b"[posix_ttysrv] initial recv failed\n");
@@ -391,7 +415,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     }
 
     loop {
-        unsafe { serial_try_flush(); }
+        unsafe { serial_flush_until_empty(); }
 
         let mut reply = TronaMsg::zeroed();
         let mut skip_reply = false;
@@ -403,6 +427,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 // Console used send (not call), no reply expected
                 skip_reply = true;
             }
+            POSIX_TTYSRV_PTY_ALLOC => {
+                unsafe { handlers::handle_pty_alloc(&mut reply) };
+            }
             POSIX_TTYSRV_PTY_READ => {
                 unsafe { handlers::handle_pty_read(&msg, &mut reply) };
             }
@@ -411,6 +438,12 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             }
             POSIX_TTYSRV_PTY_WRITE => {
                 unsafe { handlers::handle_pty_write(&msg, &mut reply) };
+            }
+            POSIX_TTYSRV_PTY_MASTER_WRITE => {
+                unsafe { handlers::handle_pty_master_write(&msg, &mut reply) };
+            }
+            POSIX_TTYSRV_PTY_CLOSE => {
+                unsafe { handlers::handle_pty_close(&msg, &mut reply) };
             }
             POSIX_TTYSRV_PTY_TCGETATTR => {
                 unsafe { handlers::handle_pty_tcgetattr(&msg, &mut reply) };
@@ -425,17 +458,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
                 unsafe { handlers::handle_pty_poll(&msg, &mut reply) };
             }
             POSIX_TTYSRV_CLIENT_EXIT => {
-                let dead_badge = msg.regs[0];
-                unsafe {
-                    for i in 0..MAX_PTYS {
-                        let pty = &mut *(&raw mut PTYS[i]);
-                        if pty.has_ctty && pty.ctty_session_id == dead_badge {
-                            pty.has_ctty = false;
-                            pty.ctty_session_id = 0;
-                            pty.fg_pgid = 0;
-                        }
-                    }
-                }
+                let _dead_badge = msg.regs[0];
                 reply.label = TRONA_OK;
                 reply.length = 0;
             }
@@ -449,14 +472,18 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             }
         }
 
-        // Flush queued serial echo BEFORE blocking on IPC, otherwise
-        // characters echoed during input processing stay buffered until
-        // the next event arrives — causing a visible one-character delay.
-        unsafe { serial_try_flush(); }
+        // Flush queued tty output BEFORE blocking on IPC so prompt/readline
+        // startup bursts are fully visible without waiting for a later input.
+        unsafe { serial_flush_until_empty(); }
 
         if skip_reply {
             let err = unsafe {
-                trona::ipc::recv_ctx(ipc_ctx(), CAP_SERVER_EP, &raw mut msg, &raw mut badge)
+                trona::ipc::recv_ctx(
+                    ipc_ctx(),
+                    trona::caps::service_ep(),
+                    &raw mut msg,
+                    &raw mut badge,
+                )
             };
             if err != 0 {
                 puts(b"[posix_ttysrv] recv failed\n");
@@ -466,7 +493,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             let err = unsafe {
                 trona::ipc::reply_recv_ctx(
                     ipc_ctx(),
-                    CAP_SERVER_EP,
+                    trona::caps::service_ep(),
                     &raw const reply,
                     &raw mut msg,
                     &raw mut badge,

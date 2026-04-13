@@ -13,6 +13,15 @@ pub const MAX_CREATE_EPS: usize = 2;
 pub const MAX_SPAWN_ARGS_BYTES: usize = 96;
 pub const MAX_SPAWN_ARGS: usize = 6;
 
+// `Require=` machinery — re-exported from uapi so the parser, the spawner,
+// and procmgr all share the same on-wire layout. The local alias
+// `RequireDef = TronaRequireDefV1` keeps the existing call sites readable
+// without inventing a separate parser-only struct.
+pub use trona::types::core::{
+    TronaRequireDefV1 as RequireDef, MAX_REQUIRES, MAX_REQUIRE_ALIAS, MAX_REQUIRE_PROVIDER,
+    REQUIRE_KIND_LOCAL, REQUIRE_KIND_SYSTEM,
+};
+
 #[derive(Clone, Copy)]
 pub struct CapCopyDef {
     pub src_slot: u64,
@@ -25,7 +34,14 @@ pub struct EpNeedDef {
     pub service_len: u8,
     pub dst_slot: u64,
     pub badged: bool,
+    pub late: bool,
 }
+
+// `RequireDef` is a type alias to `trona::types::core::TronaRequireDefV1`
+// (see top-of-file `pub use`). The full doc-comment for the syntax it
+// represents lives on the uapi struct; init's parser sets the fields by
+// hand and emits the resolved `role_id` so procmgr can consume the entries
+// without re-parsing.
 
 #[derive(Clone, Copy)]
 pub struct EpInjectDef {
@@ -43,6 +59,13 @@ pub struct CreateEpDef {
 pub enum ServiceType {
     Simple,
     Notify,
+    Target,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum TargetActivation {
+    Passive,
+    Event,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -59,6 +82,7 @@ pub struct ServiceDef {
     pub binary: [u8; MAX_BINARY_NAME],
     pub binary_len: u8,
     pub svc_type: ServiceType,
+    pub target_activation: TargetActivation,
     pub restart: RestartPolicy,
     pub after: [[u8; MAX_SERVICE_NAME]; MAX_DEPS],
     pub after_count: u8,
@@ -75,6 +99,8 @@ pub struct ServiceDef {
     pub cap_count: u8,
     pub ep_needs: [EpNeedDef; MAX_EP_NEEDS],
     pub ep_need_count: u8,
+    pub requires: [RequireDef; MAX_REQUIRES],
+    pub require_count: u8,
     pub ep_injects: [EpInjectDef; MAX_EP_INJECTS],
     pub ep_inject_count: u8,
     pub create_eps: [CreateEpDef; MAX_CREATE_EPS],
@@ -83,9 +109,21 @@ pub struct ServiceDef {
     pub spawn_args: [u8; MAX_SPAWN_ARGS_BYTES],
     pub spawn_args_len: u8,
     pub spawn_argc: u8,
-    /// Service role declaration (e.g. "pager" for the memory manager).
+    /// Service role declaration. The only currently honored value is
+    /// "authority", which selects init's bootstrap-class spawn path
+    /// (direct retype, untyped hand-off at the end of spawn). Anything
+    /// else (or empty) means a normal Service-class spawn.
     pub role: [u8; 16],
     pub role_len: u8,
+    /// If set, init promotes this service's spawn badge to the bootstrap
+    /// authority's privileged caller set right after spawn, so it can
+    /// allocate kernel objects on behalf of arbitrary owner ids.
+    pub bootstrap_privileged: bool,
+    /// If set, init copies its preloaded shared-library frame caps into
+    /// the child's CNode at spawn. Required for any service that runs
+    /// before the regular per-process shared-lib cache is available
+    /// (i.e. services that spawn before procmgr is up).
+    pub copy_shared_lib_caps: bool,
 }
 
 impl ServiceDef {
@@ -96,6 +134,7 @@ impl ServiceDef {
             binary: [0; MAX_BINARY_NAME],
             binary_len: 0,
             svc_type: ServiceType::Simple,
+            target_activation: TargetActivation::Passive,
             restart: RestartPolicy::No,
             after: [[0; MAX_SERVICE_NAME]; MAX_DEPS],
             after_count: 0,
@@ -106,11 +145,26 @@ impl ServiceDef {
             cnode_bits: 0,
             map_initrd: false,
             pre_procmgr: false,
-            caps: [CapCopyDef { src_slot: 0, dst_slot: 0 }; MAX_CAP_COPIES],
+            caps: [CapCopyDef {
+                src_slot: 0,
+                dst_slot: 0,
+            }; MAX_CAP_COPIES],
             cap_count: 0,
-            ep_needs: [EpNeedDef { service: [0; MAX_SERVICE_NAME], service_len: 0, dst_slot: 0, badged: false }; MAX_EP_NEEDS],
+            ep_needs: [EpNeedDef {
+                service: [0; MAX_SERVICE_NAME],
+                service_len: 0,
+                dst_slot: 0,
+                badged: false,
+                late: false,
+            }; MAX_EP_NEEDS],
             ep_need_count: 0,
-            ep_injects: [EpInjectDef { target: [0; MAX_SERVICE_NAME], target_len: 0, target_slot: 0 }; MAX_EP_INJECTS],
+            requires: [RequireDef::zeroed(); MAX_REQUIRES],
+            require_count: 0,
+            ep_injects: [EpInjectDef {
+                target: [0; MAX_SERVICE_NAME],
+                target_len: 0,
+                target_slot: 0,
+            }; MAX_EP_INJECTS],
             ep_inject_count: 0,
             create_eps: [CreateEpDef { dst_slot: 0 }; MAX_CREATE_EPS],
             create_ep_count: 0,
@@ -119,6 +173,8 @@ impl ServiceDef {
             spawn_argc: 0,
             role: [0; 16],
             role_len: 0,
+            bootstrap_privileged: false,
+            copy_shared_lib_caps: false,
         }
     }
 
@@ -184,8 +240,16 @@ fn bytes_eq_ci(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     for i in 0..a.len() {
-        let ca = if a[i] >= b'A' && a[i] <= b'Z' { a[i] + 32 } else { a[i] };
-        let cb = if b[i] >= b'A' && b[i] <= b'Z' { b[i] + 32 } else { b[i] };
+        let ca = if a[i] >= b'A' && a[i] <= b'Z' {
+            a[i] + 32
+        } else {
+            a[i]
+        };
+        let cb = if b[i] >= b'A' && b[i] <= b'Z' {
+            b[i] + 32
+        } else {
+            b[i]
+        };
         if ca != cb {
             return false;
         }
@@ -223,7 +287,11 @@ fn arch_suffix_matches(suffix: &[u8]) -> bool {
 }
 
 fn copy_to_buf(src: &[u8], dst: &mut [u8]) -> u8 {
-    let len = if src.len() < dst.len() { src.len() } else { dst.len() };
+    let len = if src.len() < dst.len() {
+        src.len()
+    } else {
+        dst.len()
+    };
     for i in 0..len {
         dst[i] = src[i];
     }
@@ -325,14 +393,10 @@ fn parse_duration_ns(data: &[u8]) -> u64 {
         || bytes_eq_ci(unit, b"seconds")
     {
         1_000_000_000u64
-    } else if bytes_eq_ci(unit, b"ms")
-        || bytes_eq_ci(unit, b"msec")
-        || bytes_eq_ci(unit, b"msecs")
+    } else if bytes_eq_ci(unit, b"ms") || bytes_eq_ci(unit, b"msec") || bytes_eq_ci(unit, b"msecs")
     {
         1_000_000u64
-    } else if bytes_eq_ci(unit, b"us")
-        || bytes_eq_ci(unit, b"usec")
-        || bytes_eq_ci(unit, b"usecs")
+    } else if bytes_eq_ci(unit, b"us") || bytes_eq_ci(unit, b"usec") || bytes_eq_ci(unit, b"usecs")
     {
         1_000u64
     } else if bytes_eq_ci(unit, b"m")
@@ -366,7 +430,9 @@ fn parse_cap_copies(value: &[u8], caps: &mut [CapCopyDef; MAX_CAP_COPIES]) -> u8
         while i < val.len() && (val[i] == b' ' || val[i] == b'\t') {
             i += 1;
         }
-        if i >= val.len() { break; }
+        if i >= val.len() {
+            break;
+        }
 
         let start = i;
         while i < val.len() && val[i] != b' ' && val[i] != b'\t' {
@@ -403,7 +469,9 @@ fn parse_ep_needs(value: &[u8], needs: &mut [EpNeedDef; MAX_EP_NEEDS]) -> u8 {
         while i < val.len() && (val[i] == b' ' || val[i] == b'\t') {
             i += 1;
         }
-        if i >= val.len() { break; }
+        if i >= val.len() {
+            break;
+        }
 
         let start = i;
         while i < val.len() && val[i] != b' ' && val[i] != b'\t' {
@@ -440,18 +508,39 @@ fn parse_ep_needs(value: &[u8], needs: &mut [EpNeedDef; MAX_EP_NEEDS]) -> u8 {
                 service_len: 0,
                 dst_slot: 0,
                 badged: false,
+                late: false,
             };
             entry.service_len = copy_to_buf(name, &mut entry.service);
 
             if found_second {
-                // Parse slot from rest[..second_colon], check for "badge" flag
+                // Parse slot from rest[..second_colon], then parse any colon-
+                // separated flags such as `badge` / `late`.
                 entry.dst_slot = parse_decimal_u64(&rest[..second_colon]);
-                let flag = &rest[second_colon + 1..];
-                entry.badged = bytes_eq_ci(flag, b"badge");
+                let mut flags = &rest[second_colon + 1..];
+                while !flags.is_empty() {
+                    let mut split = flags.len();
+                    for j in 0..flags.len() {
+                        if flags[j] == b':' {
+                            split = j;
+                            break;
+                        }
+                    }
+                    let flag = &flags[..split];
+                    if bytes_eq_ci(flag, b"badge") {
+                        entry.badged = true;
+                    } else if bytes_eq_ci(flag, b"late") {
+                        entry.late = true;
+                    }
+                    if split >= flags.len() {
+                        break;
+                    }
+                    flags = &flags[split + 1..];
+                }
             } else {
                 // No second colon, just parse slot
                 entry.dst_slot = parse_decimal_u64(rest);
                 entry.badged = false;
+                entry.late = false;
             }
 
             needs[count as usize] = entry;
@@ -470,7 +559,9 @@ fn parse_ep_injects(value: &[u8], injects: &mut [EpInjectDef; MAX_EP_INJECTS]) -
         while i < val.len() && (val[i] == b' ' || val[i] == b'\t') {
             i += 1;
         }
-        if i >= val.len() { break; }
+        if i >= val.len() {
+            break;
+        }
 
         let start = i;
         while i < val.len() && val[i] != b' ' && val[i] != b'\t' {
@@ -489,12 +580,281 @@ fn parse_ep_injects(value: &[u8], injects: &mut [EpInjectDef; MAX_EP_INJECTS]) -
         }
         if found {
             let name = &token[..colon];
-            let mut entry = EpInjectDef { target: [0; MAX_SERVICE_NAME], target_len: 0, target_slot: 0 };
+            let mut entry = EpInjectDef {
+                target: [0; MAX_SERVICE_NAME],
+                target_len: 0,
+                target_slot: 0,
+            };
             entry.target_len = copy_to_buf(name, &mut entry.target);
             entry.target_slot = parse_decimal_u64(&token[colon + 1..]);
             injects[count as usize] = entry;
             count += 1;
         }
+    }
+    count
+}
+
+/// djb2 string hash used to deterministically assign role IDs to
+/// service-local `Require=provider:alias` declarations.
+/// Must match `djb2_hash` in `tools/svc_caps_gen.py` exactly.
+fn djb2_hash(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 5381;
+    for &b in bytes {
+        hash = hash.wrapping_mul(33).wrapping_add(b as u32);
+    }
+    hash
+}
+
+/// Resolve a `NeedEP=` provider name to the matching `ROLE_*`
+/// identifier and its default cap_table flags, taking the `badged`
+/// flag into account for roles that have a raw-authority variant.
+///
+/// For most system roles the `badged` flag is ignored — both badged
+/// and unbadged `NeedEP=namesrv` entries map to `ROLE_NAMESRV_CLIENT`.
+/// The exception is mmsrv and rsrcsrv: **unbadged** entries resolve to
+/// the `*_AUTHORITY_RAW` variants (used by procmgr-private cap_table
+/// lookups via `procmgr_caps`), while **badged** entries resolve to
+/// the client variants that flow through `trona::caps::*`. This lets
+/// `procmgr.service` declare `NeedEP=mmsrv:67:badge mmsrv:68` and have
+/// init place each slot under the correct role.
+///
+/// Returns `None` if `name` is not a known system role.
+pub fn system_role_for_needep(name: &[u8], badged: bool) -> Option<(u32, u32)> {
+    use trona::consts::kernel::{
+        CAP_TBL_FLAG_BADGED, CAP_TBL_FLAG_DEVICE_UT, CAP_TBL_FLAG_IO_PORT,
+        CAP_TBL_FLAG_NOTIFICATION, CAP_TBL_FLAG_RAW, CAP_TBL_FLAG_UNTYPED, ROLE_COM1_IOPORT,
+        ROLE_CONSOLE_CLIENT, ROLE_CSPACE_NTFN, ROLE_FB_UNTYPED, ROLE_INITRD_UNTYPED,
+        ROLE_MMSRV_AUTHORITY_RAW, ROLE_MMSRV_CLIENT, ROLE_NAMESRV_CLIENT, ROLE_PCI_IOPORT,
+        ROLE_PROCMGR_CONTROL, ROLE_READINESS_NTFN, ROLE_RSRCSRV_AUTHORITY_RAW, ROLE_RSRCSRV_CLIENT,
+        ROLE_SC_CAP, ROLE_SERVICE_EP, ROLE_SIGNAL_NTFN, ROLE_VFS_CLIENT, ROLE_WIN32SRV_CLIENT,
+    };
+    // mmsrv / rsrcsrv split: unbadged → raw authority, badged → client.
+    if bytes_eq_ci(name, b"mmsrv") {
+        return Some(if badged {
+            (ROLE_MMSRV_CLIENT, CAP_TBL_FLAG_BADGED)
+        } else {
+            (ROLE_MMSRV_AUTHORITY_RAW, CAP_TBL_FLAG_RAW)
+        });
+    }
+    if bytes_eq_ci(name, b"rsrcsrv") {
+        return Some(if badged {
+            (ROLE_RSRCSRV_CLIENT, CAP_TBL_FLAG_BADGED)
+        } else {
+            (ROLE_RSRCSRV_AUTHORITY_RAW, CAP_TBL_FLAG_RAW)
+        });
+    }
+    let (role_id, _raw) = system_role_lookup(name, &[])?;
+    let flags = match role_id {
+        ROLE_PROCMGR_CONTROL => CAP_TBL_FLAG_BADGED,
+        ROLE_SIGNAL_NTFN | ROLE_READINESS_NTFN | ROLE_CSPACE_NTFN => CAP_TBL_FLAG_NOTIFICATION,
+        ROLE_INITRD_UNTYPED | ROLE_FB_UNTYPED => CAP_TBL_FLAG_UNTYPED | CAP_TBL_FLAG_DEVICE_UT,
+        ROLE_PCI_IOPORT | ROLE_COM1_IOPORT => CAP_TBL_FLAG_IO_PORT,
+        ROLE_VFS_CLIENT | ROLE_NAMESRV_CLIENT | ROLE_CONSOLE_CLIENT | ROLE_SERVICE_EP
+        | ROLE_SC_CAP | ROLE_WIN32SRV_CLIENT => 0,
+        _ => 0,
+    };
+    Some((role_id, flags))
+}
+
+/// Resolve a `Require=` name (+ optional attribute suffix) to a
+/// system-role `ROLE_*` id. Returns `None` if the name is not a known
+/// system role — callers then fall through to the service-local path.
+///
+/// `attr` is the suffix after the first `:` (if any). For plain system
+/// roles (`Require=namesrv`) it is empty. For raw authority roles
+/// (`Require=mmsrv:authority_raw`) it is `b"authority_raw"`.
+fn system_role_lookup(name: &[u8], attr: &[u8]) -> Option<(u32, bool /* raw */)> {
+    use trona::consts::kernel::{
+        ROLE_COM1_IOPORT, ROLE_CONSOLE_CLIENT, ROLE_CSPACE_NTFN, ROLE_FB_UNTYPED,
+        ROLE_INITRD_UNTYPED, ROLE_MMSRV_AUTHORITY_RAW, ROLE_MMSRV_CLIENT, ROLE_NAMESRV_CLIENT,
+        ROLE_PCI_IOPORT, ROLE_PROCMGR_CONTROL, ROLE_READINESS_NTFN, ROLE_RSRCSRV_AUTHORITY_RAW,
+        ROLE_RSRCSRV_CLIENT, ROLE_SC_CAP, ROLE_SERVICE_EP, ROLE_SIGNAL_NTFN, ROLE_VFS_CLIENT,
+        ROLE_WIN32SRV_CLIENT,
+    };
+    let has_attr = !attr.is_empty();
+    // mmsrv / rsrcsrv support the `authority_raw` attribute, everything
+    // else only accepts a bare name.
+    if bytes_eq_ci(name, b"mmsrv") {
+        if has_attr && bytes_eq_ci(attr, b"authority_raw") {
+            return Some((ROLE_MMSRV_AUTHORITY_RAW, true));
+        } else if !has_attr {
+            return Some((ROLE_MMSRV_CLIENT, false));
+        }
+        return None;
+    }
+    if bytes_eq_ci(name, b"rsrcsrv") {
+        if has_attr && bytes_eq_ci(attr, b"authority_raw") {
+            return Some((ROLE_RSRCSRV_AUTHORITY_RAW, true));
+        } else if !has_attr {
+            return Some((ROLE_RSRCSRV_CLIENT, false));
+        }
+        return None;
+    }
+    if has_attr {
+        return None;
+    }
+    if bytes_eq_ci(name, b"procmgr") {
+        Some((ROLE_PROCMGR_CONTROL, false))
+    } else if bytes_eq_ci(name, b"service") {
+        Some((ROLE_SERVICE_EP, false))
+    } else if bytes_eq_ci(name, b"namesrv") {
+        Some((ROLE_NAMESRV_CLIENT, false))
+    } else if bytes_eq_ci(name, b"vfs") {
+        Some((ROLE_VFS_CLIENT, false))
+    } else if bytes_eq_ci(name, b"console") {
+        Some((ROLE_CONSOLE_CLIENT, false))
+    } else if bytes_eq_ci(name, b"signal") {
+        Some((ROLE_SIGNAL_NTFN, false))
+    } else if bytes_eq_ci(name, b"readiness") {
+        Some((ROLE_READINESS_NTFN, false))
+    } else if bytes_eq_ci(name, b"initrd_untyped") {
+        Some((ROLE_INITRD_UNTYPED, false))
+    } else if bytes_eq_ci(name, b"fb_untyped") {
+        Some((ROLE_FB_UNTYPED, false))
+    } else if bytes_eq_ci(name, b"pci_ioport") {
+        Some((ROLE_PCI_IOPORT, false))
+    } else if bytes_eq_ci(name, b"com1_ioport") {
+        Some((ROLE_COM1_IOPORT, false))
+    } else if bytes_eq_ci(name, b"win32srv") {
+        Some((ROLE_WIN32SRV_CLIENT, false))
+    } else if bytes_eq_ci(name, b"cspace_ntfn") {
+        Some((ROLE_CSPACE_NTFN, false))
+    } else if bytes_eq_ci(name, b"sc_cap") {
+        Some((ROLE_SC_CAP, false))
+    } else {
+        None
+    }
+}
+
+/// Parse a whitespace-separated `Require=` value into `requires`.
+///
+/// Each token has one of these shapes:
+///
+/// ```text
+/// <name>                       # bare system role
+/// <name>:<suffix>              # system role with attribute, OR
+///                              #   service-local with empty-flag alias
+/// <name>:<suffix>:badge        # as above, with badged flag
+/// ```
+///
+/// A token is classified as a system role first (via
+/// [`system_role_lookup`]); on miss it falls through to the
+/// service-local path, where the role id is
+/// `LOCAL_ROLE_BASE + djb2("<name>:<suffix>") % 0xF00`.
+fn parse_require_list(value: &[u8], out: &mut [RequireDef; MAX_REQUIRES]) -> u8 {
+    use trona::consts::kernel::LOCAL_ROLE_BASE;
+
+    let mut count: u8 = 0;
+    let mut i = 0;
+    let val = trim(value);
+
+    while i < val.len() && (count as usize) < MAX_REQUIRES {
+        while i < val.len() && (val[i] == b' ' || val[i] == b'\t') {
+            i += 1;
+        }
+        if i >= val.len() {
+            break;
+        }
+
+        let start = i;
+        while i < val.len() && val[i] != b' ' && val[i] != b'\t' {
+            i += 1;
+        }
+        let token = &val[start..i];
+        if token.is_empty() {
+            continue;
+        }
+
+        // Split on first ':'.
+        let mut first_colon = 0;
+        let mut has_first = false;
+        for j in 0..token.len() {
+            if token[j] == b':' {
+                first_colon = j;
+                has_first = true;
+                break;
+            }
+        }
+        let name = if has_first {
+            &token[..first_colon]
+        } else {
+            token
+        };
+        let rest = if has_first {
+            &token[first_colon + 1..]
+        } else {
+            &[][..]
+        };
+
+        // Split rest on optional second ':' — everything after is the
+        // trailing flag (`badge` today).
+        let mut second_colon = 0;
+        let mut has_second = false;
+        for j in 0..rest.len() {
+            if rest[j] == b':' {
+                second_colon = j;
+                has_second = true;
+                break;
+            }
+        }
+        let suffix = if has_second {
+            &rest[..second_colon]
+        } else {
+            rest
+        };
+        let flag = if has_second {
+            &rest[second_colon + 1..]
+        } else {
+            &[][..]
+        };
+        let badged = bytes_eq_ci(flag, b"badge");
+
+        let mut entry = RequireDef::zeroed();
+        entry.badged = if badged { 1 } else { 0 };
+        entry.provider_len = copy_to_buf(name, &mut entry.provider);
+
+        if let Some((role_id, raw)) = system_role_lookup(name, suffix) {
+            entry.kind = REQUIRE_KIND_SYSTEM;
+            entry.role_id = role_id;
+            entry.raw = if raw { 1 } else { 0 };
+            // Store the attribute suffix (if any) so diagnostics can
+            // render the original token.
+            entry.alias_len = copy_to_buf(suffix, &mut entry.alias);
+        } else if has_first && !suffix.is_empty() {
+            // Service-local role: hash "<provider>:<alias>".
+            entry.kind = REQUIRE_KIND_LOCAL;
+            entry.alias_len = copy_to_buf(suffix, &mut entry.alias);
+            let mut key = [0u8; MAX_SERVICE_NAME + 1 + MAX_REQUIRE_ALIAS];
+            let mut k = 0usize;
+            for &b in name {
+                if k >= key.len() {
+                    break;
+                }
+                key[k] = b;
+                k += 1;
+            }
+            if k < key.len() {
+                key[k] = b':';
+                k += 1;
+            }
+            for &b in suffix {
+                if k >= key.len() {
+                    break;
+                }
+                key[k] = b;
+                k += 1;
+            }
+            let hash = djb2_hash(&key[..k]);
+            entry.role_id = LOCAL_ROLE_BASE + (hash % 0x0F00);
+        } else {
+            // Malformed token (e.g. bare unknown name without a
+            // service-local alias). Skip it — parser does not hard-fail
+            // the whole .service, but init's validate pass can flag it.
+            continue;
+        }
+
+        out[count as usize] = entry;
+        count += 1;
     }
     count
 }
@@ -625,11 +985,27 @@ pub fn parse_service(data: &[u8], out: &mut ServiceDef) -> bool {
                                 out.name_len = copy_to_buf(value, &mut out.name);
                             } else if key_matches_current_arch(key, b"Binary") {
                                 out.binary_len = copy_to_buf(value, &mut out.binary);
+                                if out.binary_len > 0 && out.binary[0] != b'/' {
+                                    trona::uerror!(|_lb| {
+                                        _lb.str(b"[INIT] Binary= must be absolute path: ");
+                                        _lb.bytes(&out.binary[..out.binary_len as usize]);
+                                        _lb.str(b"\n");
+                                    });
+                                    out.binary_len = 0;
+                                }
                             } else if key_matches_current_arch(key, b"Type") {
                                 if bytes_eq_ci(value, b"simple") {
                                     out.svc_type = ServiceType::Simple;
                                 } else if bytes_eq_ci(value, b"notify") {
                                     out.svc_type = ServiceType::Notify;
+                                } else if bytes_eq_ci(value, b"target") {
+                                    out.svc_type = ServiceType::Target;
+                                }
+                            } else if key_matches_current_arch(key, b"Activation") {
+                                if bytes_eq_ci(value, b"event") {
+                                    out.target_activation = TargetActivation::Event;
+                                } else {
+                                    out.target_activation = TargetActivation::Passive;
                                 }
                             } else if key_matches_current_arch(key, b"MemoryKB") {
                                 out.memory_kb = parse_decimal_u16(value);
@@ -673,10 +1049,16 @@ pub fn parse_service(data: &[u8], out: &mut ServiceDef) -> bool {
                                 out.cap_count = parse_cap_copies(value, &mut out.caps);
                             } else if key_matches_current_arch(key, b"NeedEP") {
                                 out.ep_need_count = parse_ep_needs(value, &mut out.ep_needs);
+                            } else if key_matches_current_arch(key, b"Require") {
+                                out.require_count = parse_require_list(value, &mut out.requires);
                             } else if key_matches_current_arch(key, b"InjectEP") {
                                 out.ep_inject_count = parse_ep_injects(value, &mut out.ep_injects);
                             } else if key_matches_current_arch(key, b"CreateEP") {
                                 out.create_ep_count = parse_create_eps(value, &mut out.create_eps);
+                            } else if key_matches_current_arch(key, b"BootstrapPrivileged") {
+                                out.bootstrap_privileged = bytes_eq_ci(value, b"yes");
+                            } else if key_matches_current_arch(key, b"CopySharedLibCaps") {
+                                out.copy_shared_lib_caps = bytes_eq_ci(value, b"yes");
                             }
                         }
                         Section::None => {}
@@ -688,5 +1070,5 @@ pub fn parse_service(data: &[u8], out: &mut ServiceDef) -> bool {
         line_start = line_end + 1;
     }
 
-    out.name_len > 0 && out.binary_len > 0
+    out.name_len > 0 && (out.svc_type == ServiceType::Target || out.binary_len > 0)
 }

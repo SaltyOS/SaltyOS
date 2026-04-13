@@ -45,6 +45,7 @@ pub enum Syscall {
     RecvAnyTimed = 25,
     ReplyRecvAnyTimed = 26,
     NotifReturn = 27,
+    ThreadExit = 28,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -80,6 +81,7 @@ impl TryFrom<u64> for Syscall {
             25 => Ok(Syscall::RecvAnyTimed),
             26 => Ok(Syscall::ReplyRecvAnyTimed),
             27 => Ok(Syscall::NotifReturn),
+            28 => Ok(Syscall::ThreadExit),
             _ => Err(SyscallError::InvalidOperation),
         }
     }
@@ -167,6 +169,9 @@ pub enum SyscallError {
     Restart = 13,
     Deadlock = 14,
     Interrupted = 15,
+    SlotOccupied = 0x18,
+    AlreadyMapped = 0x19,
+    AlreadyBound = 0x1A,
 }
 
 /// Maximum spin iterations waiting for cross-CPU suspend to complete.
@@ -448,9 +453,9 @@ fn validate_notification_cap(
 /// - mr0-mr3: Message registers (inline fastpath)
 fn construct_message(msg_info: u64, mr0: u64, mr1: u64, mr2: u64, mr3: u64) -> Message {
     let label = msg_info::get_label(msg_info);
-    let length = msg_info::get_length(msg_info).min(20);
+    let length = msg_info::get_length(msg_info).min(32);
     let extra_caps = msg_info::get_extra_caps(msg_info).min(4);
-    let mut regs = [0u64; 20];
+    let mut regs = [0u64; 32];
     let mut caps = [0u64; 4];
 
     // Copy inline registers based on length (max 4 in registers)
@@ -481,7 +486,7 @@ fn construct_message(msg_info: u64, mr0: u64, mr1: u64, mr2: u64, mr3: u64) -> M
                     let _guard = crate::arch::uaccess::UserAccessGuard::new();
 
                     if length > 4 {
-                        let overflow = (length - 4).min(16);
+                        let overflow = (length - 4).min(28);
                         for i in 0..overflow {
                             regs[4 + i] = (*ipc_buf).msg[6 + i];
                         }
@@ -529,7 +534,7 @@ pub(crate) unsafe fn read_recv_any_endpoints(
     let ipc_buf = buf as *const crate::ipc::IpcBuffer;
     let _guard = crate::arch::uaccess::UserAccessGuard::new();
 
-    let irq = save_irq_disable();
+    let irq = unsafe { save_irq_disable() };
     CAP_LOCK.lock();
 
     let mut idx = 0usize;
@@ -566,28 +571,25 @@ pub(crate) unsafe fn read_recv_any_endpoints(
     }
 
     CAP_LOCK.unlock();
-    restore_irq(irq);
+    unsafe { restore_irq(irq) };
     Ok(count)
 }
 
-unsafe fn read_recv_any_timeout_ns(endpoint_count: usize) -> Result<u64, SyscallError> {
+/// Read timeout_ns from the current thread's IPC buffer.
+/// Returns 0 if no IPC buffer is mapped.
+unsafe fn read_ipc_buffer_timeout() -> u64 {
     let scheduler = crate::sched::scheduler::scheduler();
     let current = scheduler.current();
     if current.is_null() {
-        return Err(SyscallError::InvalidOperation);
+        return 0;
     }
-
     let buf = (*current).ipc_buffer;
     if buf == 0 {
-        return Err(SyscallError::BadAddress);
+        return 0;
     }
-    if validate_ipc_buffer_addr(buf).is_err() {
-        return Err(SyscallError::BadAddress);
-    }
-
     let ipc_buf = buf as *const crate::ipc::IpcBuffer;
     let _guard = crate::arch::uaccess::UserAccessGuard::new();
-    Ok((*ipc_buf).reserved[endpoint_count])
+    (*ipc_buf).timeout_ns
 }
 
 /// Write received IPC message to current thread's IPC buffer
@@ -638,7 +640,7 @@ pub(crate) unsafe fn write_msg_to_ipc_buffer(msg: &Message, badge: u64) {
         (*ipc_buf).msg[0] = msg.label;
         (*ipc_buf).msg[1] = msg.length as u64;
 
-        let reg_count = msg.length.min(20);
+        let reg_count = msg.length.min(32);
 
         // Write inline message registers (MR0-MR3) → msg[2..5]
         let inline_count = reg_count.min(4);
@@ -646,9 +648,9 @@ pub(crate) unsafe fn write_msg_to_ipc_buffer(msg: &Message, badge: u64) {
             (*ipc_buf).msg[2 + i] = msg.regs[i];
         }
 
-        // Write overflow message registers (MR4-MR19) → msg[6..21]
+        // Write overflow message registers (MR4-MR31) → msg[6..33]
         if reg_count > 4 {
-            let overflow_count = (reg_count - 4).min(16);
+            let overflow_count = (reg_count - 4).min(28);
             for i in 0..overflow_count {
                 (*ipc_buf).msg[6 + i] = msg.regs[4 + i];
             }
@@ -660,7 +662,7 @@ pub(crate) unsafe fn write_msg_to_ipc_buffer(msg: &Message, badge: u64) {
         } else {
             6 + (reg_count - 4)
         };
-        for i in first_clear.min(22)..22 {
+        for i in first_clear.min(34)..34 {
             (*ipc_buf).msg[i] = 0;
         }
 
@@ -697,7 +699,10 @@ fn syscall_send(
         unsafe {
             let irq = save_irq_disable();
             let endpoint = &mut *(cap.object as *mut Endpoint);
-            endpoint.send(&msg, cap.badge);
+            if let Err(err) = endpoint.send(&msg, cap.badge) {
+                restore_irq(irq);
+                return SyscallResult::err(err);
+            }
             restore_irq(irq);
         }
         return SyscallResult::ok(0);
@@ -775,7 +780,13 @@ fn syscall_recv(cap_ptr: u64) -> SyscallResult {
     unsafe {
         let irq = save_irq_disable();
         let endpoint = &mut *(cap.object as *mut Endpoint);
-        let (msg, badge) = endpoint.recv();
+        let (msg, badge) = match endpoint.recv() {
+            Ok(v) => v,
+            Err(err) => {
+                restore_irq(irq);
+                return SyscallResult::err(err);
+            }
+        };
         write_msg_to_ipc_buffer(&msg, badge);
         restore_irq(irq);
         SyscallResult::ok(badge)
@@ -817,7 +828,13 @@ fn syscall_call(
         }
 
         let endpoint = &mut *(cap.object as *mut Endpoint);
-        let (reply_msg, intr) = endpoint.call(&msg, cap.badge);
+        let (reply_msg, intr) = match endpoint.call(&msg, cap.badge) {
+            Ok(v) => v,
+            Err(err) => {
+                restore_irq(irq);
+                return SyscallResult::err(err);
+            }
+        };
 
         if intr != 0 {
             return handle_call_interrupted(current, cap_ptr, msg_info, irq, intr);
@@ -909,7 +926,12 @@ struct NotifFrame {
 ///
 /// # Safety
 /// Current thread's `vspace_root` must be valid. IRQs should be disabled.
-unsafe fn verify_user_pages_mapped(tcb: *mut crate::sched::thread::Tcb, addr: u64, size: u64, writable: bool) -> bool {
+unsafe fn verify_user_pages_mapped(
+    tcb: *mut crate::sched::thread::Tcb,
+    addr: u64,
+    size: u64,
+    writable: bool,
+) -> bool {
     unsafe {
         if size == 0 {
             return true;
@@ -1134,7 +1156,10 @@ unsafe fn inject_notif_frame(
             // to x0 (restore_el0_frame_from_current_tcb overwrites ctx.x[0]).
             // Deliver the frame pointer via SyscallResult.error so the
             // dispatcher receives it in x0 as its first argument.
-            Some(SyscallResult { error: new_sp, value: 0 })
+            Some(SyscallResult {
+                error: new_sp,
+                value: 0,
+            })
         }
     }
 }
@@ -1216,6 +1241,35 @@ fn syscall_notif_return(frame_ptr: u64) -> SyscallResult {
     }
 }
 
+fn syscall_thread_exit() -> SyscallResult {
+    unsafe {
+        let irq = save_irq_disable();
+        let scheduler = crate::sched::scheduler::scheduler();
+        let current = scheduler.current();
+        if current.is_null() {
+            restore_irq(irq);
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+
+        let tcb = &mut *current;
+        tcb.tcb_lock();
+        crate::sched::pip::pip_cleanup(current);
+        detach_thread_wait_queues(current);
+        tcb.state = ThreadState::Inactive;
+        tcb.blocked_reason = None;
+        Tcb::release_tcb_ref(tcb.clear_reply_tcb());
+        tcb.reply_can_grant = false;
+        tcb.saved_caller_msg = crate::ipc::Message::empty();
+        tcb.saved_caller_badge = 0;
+        tcb.tcb_unlock();
+
+        scheduler.reschedule();
+        restore_irq(irq);
+    }
+
+    SyscallResult::ok(0)
+}
+
 /// Handle a Call syscall that was interrupted by a bound notification.
 /// Injects a notification frame if a dispatcher is registered, otherwise
 /// returns Interrupted directly.
@@ -1281,7 +1335,13 @@ fn syscall_reply_recv(
     unsafe {
         let irq = save_irq_disable();
         let endpoint = &mut *(cap.object as *mut Endpoint);
-        let (msg, badge) = endpoint.reply_recv(&reply);
+        let (msg, badge) = match endpoint.reply_recv(&reply) {
+            Ok(v) => v,
+            Err(err) => {
+                restore_irq(irq);
+                return SyscallResult::err(err);
+            }
+        };
         write_msg_to_ipc_buffer(&msg, badge);
         restore_irq(irq);
         SyscallResult::ok(badge)
@@ -1297,7 +1357,13 @@ fn syscall_recv_any(endpoint_count: u64) -> SyscallResult {
 
     unsafe {
         let irq = save_irq_disable();
-        let (msg, badge, source) = Endpoint::recv_any(&endpoints[..count]);
+        let (msg, badge, source) = match Endpoint::recv_any(&endpoints[..count]) {
+            Ok(v) => v,
+            Err(err) => {
+                restore_irq(irq);
+                return SyscallResult::err(err);
+            }
+        };
         write_msg_to_ipc_buffer(&msg, badge);
         restore_irq(irq);
         SyscallResult::ok(source)
@@ -1322,23 +1388,38 @@ fn syscall_reply_recv_any(
 
     unsafe {
         let irq = save_irq_disable();
-        let (msg, badge, source) = Endpoint::reply_recv_any(&endpoints[..count], &reply);
+        let (msg, badge, source) = match Endpoint::reply_recv_any(&endpoints[..count], &reply) {
+            Ok(v) => v,
+            Err(err) => {
+                restore_irq(irq);
+                return SyscallResult::err(err);
+            }
+        };
         write_msg_to_ipc_buffer(&msg, badge);
         restore_irq(irq);
         SyscallResult::ok(source)
     }
 }
 
-fn syscall_recv_any_timed(endpoint_count: u64, timeout_ns: u64) -> SyscallResult {
+fn syscall_recv_any_timed(endpoint_count: u64) -> SyscallResult {
     let mut endpoints = [core::ptr::null_mut(); crate::sched::thread::MAX_RECV_WAIT_ENDPOINTS];
     let count = match unsafe { read_recv_any_endpoints(endpoint_count as usize, &mut endpoints) } {
         Ok(count) => count,
         Err(err) => return SyscallResult::err(err),
     };
 
+    let timeout_ns = unsafe { read_ipc_buffer_timeout() };
+
     unsafe {
         let irq = save_irq_disable();
-        let (msg, badge, source, result) = Endpoint::recv_any_timeout(&endpoints[..count], timeout_ns);
+        let (msg, badge, source, result) =
+            match Endpoint::recv_any_timeout(&endpoints[..count], timeout_ns) {
+                Ok(v) => v,
+                Err(err) => {
+                    restore_irq(irq);
+                    return SyscallResult::err(err);
+                }
+            };
         if result == 0 {
             write_msg_to_ipc_buffer(&msg, badge);
             restore_irq(irq);
@@ -1364,15 +1445,19 @@ fn syscall_reply_recv_any_timed(
         Err(err) => return SyscallResult::err(err),
     };
 
-    let timeout_ns = match unsafe { read_recv_any_timeout_ns(count) } {
-        Ok(timeout_ns) => timeout_ns,
-        Err(err) => return SyscallResult::err(err),
-    };
+    let timeout_ns = unsafe { read_ipc_buffer_timeout() };
 
     let reply = construct_message(msg_info, mr0, mr1, mr2, mr3);
     unsafe {
         let irq = save_irq_disable();
-        let (msg, badge, source, result) = Endpoint::reply_recv_any_timeout(&endpoints[..count], &reply, timeout_ns);
+        let (msg, badge, source, result) =
+            match Endpoint::reply_recv_any_timeout(&endpoints[..count], &reply, timeout_ns) {
+                Ok(v) => v,
+                Err(err) => {
+                    restore_irq(irq);
+                    return SyscallResult::err(err);
+                }
+            };
         if result == 0 {
             write_msg_to_ipc_buffer(&msg, badge);
             restore_irq(irq);
@@ -1409,10 +1494,9 @@ fn syscall_nbsend(
     unsafe {
         let irq = save_irq_disable();
         let endpoint = &mut *(cap.object as *mut Endpoint);
-        let result = if endpoint.nbsend(&msg, cap.badge) {
-            SyscallResult::ok(0)
-        } else {
-            SyscallResult::err(SyscallError::WouldBlock)
+        let result = match endpoint.nbsend(&msg, cap.badge) {
+            Ok(()) => SyscallResult::ok(0),
+            Err(err) => SyscallResult::err(err),
         };
         restore_irq(irq);
         result
@@ -1965,6 +2049,10 @@ fn syscall_invoke_inner(
             // UNTYPED_RETYPE: arg0 = new_type, arg1 = size_bits, arg2 = dest_offset
             syscall_untyped_retype(&cap, cap_ptr, arg0, arg1, arg2)
         }
+        (ObjectType::Untyped, 0x21) => {
+            // UNTYPED_RESET: reset watermark after the untyped becomes child-free
+            syscall_untyped_reset(&cap, cap_ptr)
+        }
 
         // TCB operations
         (ObjectType::Tcb, 0x40) => {
@@ -2106,10 +2194,6 @@ fn syscall_invoke_inner(
             // VSPACE_MAP_MO: arg0 = mo_cap_ptr, arg1 = vaddr, arg2 = mo_offset, arg3 = count_and_flags
             syscall_vspace_map_mo(&cap, arg0, arg1, arg2, arg3)
         }
-        (ObjectType::VSpace, 0x98) => {
-            // VSPACE_UNMAP_MO: arg0 = vaddr, arg1 = count
-            syscall_vspace_unmap_mo(&cap, arg0, arg1)
-        }
         (ObjectType::VSpace, 0x99) => {
             // VSPACE_SHARE_RO_PAGE: arg0 = src_vaddr,
             //   arg1 = dst_vspace_cap_ptr, arg2 = dst_vaddr
@@ -2216,7 +2300,7 @@ fn syscall_invoke_inner(
             syscall_mo_get_size(&cap)
         }
         (ObjectType::MemoryObject, 0x93) => {
-            // MO_CLONE: arg0 = dest_slot, arg1 = flags
+            // MO_CLONE: arg0 = child_mo_cap_ptr, arg1 = flags
             syscall_mo_clone(&cap, arg0, arg1)
         }
         (ObjectType::MemoryObject, 0x94) => {
@@ -2334,6 +2418,9 @@ fn syscall_sc_bind(cap: &Capability, tcb_cap_ptr: u64) -> SyscallResult {
         tcb.base_priority = sc.deadline;
         tcb.priority = sc.deadline;
 
+        // TCB holds a strong reference on the SchedContext
+        crate::cap::increment_refcount(sc as *mut SchedContext as *mut crate::cap::KernelObject);
+
         if tcb.state == ThreadState::Ready {
             let scheduler = crate::sched::scheduler::scheduler();
             scheduler.remove_from_ready_queue(tcb as *mut Tcb);
@@ -2354,6 +2441,7 @@ fn syscall_sc_unbind(cap: &Capability) -> SyscallResult {
     }
 
     // Operation under per-SC lock
+    let old_sc;
     unsafe {
         let irq = save_irq_disable();
         let sc = &mut *(cap.object as *mut SchedContext);
@@ -2373,10 +2461,21 @@ fn syscall_sc_unbind(cap: &Capability) -> SyscallResult {
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
 
+        old_sc = tcb.sched_context;
         tcb.sched_context = core::ptr::null_mut();
         sc.bound_tcb = core::ptr::null_mut();
         sc.sc_unlock();
         restore_irq(irq);
+    }
+
+    // Release TCB's strong reference on the SchedContext
+    if !old_sc.is_null() {
+        unsafe {
+            crate::cap::release_object(
+                old_sc as *mut crate::cap::KernelObject,
+                ObjectType::SchedContext,
+            );
+        }
     }
 
     SyscallResult::ok(0)
@@ -2463,6 +2562,20 @@ fn syscall_tcb_configure(
         return SyscallResult::err(e);
     }
 
+    crate::kdebug!(syscall, |_g| {
+        _g.puts("[TCB_CONFIGURE] begin tcb=");
+        _g.hex(cap.object as u64);
+        _g.puts(" entry=");
+        _g.hex(entry_rip);
+        _g.puts(" rsp=");
+        _g.hex(entry_rsp);
+        _g.puts(" ipc=");
+        _g.hex(ipc_buffer);
+        _g.puts(" free=");
+        _g.dec(crate::mm::pmm_free_count() as u64);
+        _g.puts("\n");
+    });
+
     // Allocate kernel stack (4 contiguous pages = 16 KiB).
     // A single page (4 KiB) overflows on deep syscall paths (IPC fastpath
     // with context switching, VSpace operations, capability chains).
@@ -2471,8 +2584,25 @@ fn syscall_tcb_configure(
     // pmm_alloc_contiguous has its own MM_LOCK — do BEFORE acquiring per-TCB lock
     let kstack_phys = match crate::mm::pmm_alloc_contiguous(KSTACK_PAGES) {
         Some(f) => f,
-        None => return SyscallResult::err(SyscallError::OutOfMemory),
+        None => {
+            crate::kdebug!(syscall, |_g| {
+                _g.puts("[TCB_CONFIGURE] kernel-stack alloc failed tcb=");
+                _g.hex(cap.object as u64);
+                _g.puts(" need_pages=");
+                _g.dec(KSTACK_PAGES as u64);
+                _g.puts(" free=");
+                _g.dec(crate::mm::pmm_free_count() as u64);
+                _g.puts("\n");
+            });
+            return SyscallResult::err(SyscallError::OutOfMemory);
+        }
     };
+    let kstack_owner = crate::mm::frame::FrameOwner::KernelPrivate {
+        subkind: crate::mm::frame::KernelMetaKind::KernelStack,
+    };
+    for i in 0..KSTACK_PAGES {
+        crate::mm::pmm_set_owner(kstack_phys + (i * crate::mm::PAGE_SIZE) as u64, &kstack_owner);
+    }
 
     // TCB mutation under per-TCB lock
     unsafe {
@@ -2485,6 +2615,18 @@ fn syscall_tcb_configure(
         if tcb.state != ThreadState::Inactive {
             tcb.tcb_unlock();
             restore_irq(irq);
+            for i in 0..KSTACK_PAGES {
+                crate::mm::pmm_free(kstack_phys + (i * crate::mm::PAGE_SIZE) as u64, &kstack_owner);
+            }
+            crate::kdebug!(syscall, |_g| {
+                _g.puts("[TCB_CONFIGURE] rejected busy tcb=");
+                _g.hex(cap.object as u64);
+                _g.puts(" state=");
+                _g.dec(tcb.state as u64);
+                _g.puts(" free=");
+                _g.dec(crate::mm::pmm_free_count() as u64);
+                _g.puts("\n");
+            });
             return SyscallResult::err(SyscallError::Busy);
         }
 
@@ -2495,8 +2637,6 @@ fn syscall_tcb_configure(
             0,
             KSTACK_PAGES * crate::mm::PAGE_SIZE,
         );
-        tcb.kernel_stack_top = kstack_top;
-        tcb.stack_canary = crate::arch::generate_stack_canary();
 
         if !tcb.vspace_root.is_null() {
             #[cfg(target_arch = "x86_64")]
@@ -2512,7 +2652,22 @@ fn syscall_tcb_configure(
                         subkind: crate::mm::frame::KernelMetaKind::KernelStack,
                     }) {
                         Some(f) => f,
-                        None => return SyscallResult::err(SyscallError::OutOfMemory),
+                        None => {
+                            for i in 0..KSTACK_PAGES {
+                                crate::mm::pmm_free(
+                                    kstack_phys + (i * crate::mm::PAGE_SIZE) as u64,
+                                    &kstack_owner,
+                                );
+                            }
+                            crate::kdebug!(syscall, |_g| {
+                                _g.puts("[TCB_CONFIGURE] trampoline alloc failed tcb=");
+                                _g.hex(cap.object as u64);
+                                _g.puts(" free=");
+                                _g.dec(crate::mm::pmm_free_count() as u64);
+                                _g.puts("\n");
+                            });
+                            return SyscallResult::err(SyscallError::OutOfMemory);
+                        }
                     };
                 let tramp_stack_virt = crate::mm::phys_to_virt(tramp_stack_phys);
                 let tramp_stack_top = tramp_stack_virt + crate::mm::PAGE_SIZE as u64;
@@ -2526,6 +2681,9 @@ fn syscall_tcb_configure(
             #[cfg(target_arch = "x86_64")]
             {
                 let vspace = &*vspace_root;
+                tcb.kernel_stack_top = kstack_top;
+                tcb.trampoline_stack_top = tramp_stack_top;
+                tcb.stack_canary = crate::arch::generate_stack_canary();
                 tcb.context.rip = crate::arch::usermode_trampoline as *const () as u64;
                 tcb.context.rsp = tramp_stack_top;
                 tcb.context.r12 = entry_rip;
@@ -2536,6 +2694,9 @@ fn syscall_tcb_configure(
             }
             #[cfg(target_arch = "aarch64")]
             {
+                tcb.kernel_stack_top = kstack_top;
+                tcb.trampoline_stack_top = 0;
+                tcb.stack_canary = crate::arch::generate_stack_canary();
                 crate::arch::aarch64::context::init_user_thread_context(
                     &mut tcb.context,
                     kstack_top,
@@ -2544,6 +2705,7 @@ fn syscall_tcb_configure(
                     0x0,
                 );
             }
+
             tcb.ipc_buffer = ipc_buffer;
             tcb.user_stack_top = entry_rsp;
             tcb.user_stack_min = entry_rsp.saturating_sub(USER_STACK_GROW_LIMIT);
@@ -2555,70 +2717,98 @@ fn syscall_tcb_configure(
         } else {
             tcb.tcb_unlock();
             restore_irq(irq);
+            for i in 0..KSTACK_PAGES {
+                crate::mm::pmm_free(kstack_phys + (i * crate::mm::PAGE_SIZE) as u64, &kstack_owner);
+            }
+            crate::kdebug!(syscall, |_g| {
+                _g.puts("[TCB_CONFIGURE] missing vspace root tcb=");
+                _g.hex(cap.object as u64);
+                _g.puts(" free=");
+                _g.dec(crate::mm::pmm_free_count() as u64);
+                _g.puts("\n");
+            });
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
     }
+
+    crate::kdebug!(syscall, |_g| {
+        _g.puts("[TCB_CONFIGURE] success tcb=");
+        _g.hex(cap.object as u64);
+        _g.puts(" kstack_phys=");
+        _g.hex(kstack_phys);
+        _g.puts(" free=");
+        _g.dec(crate::mm::pmm_free_count() as u64);
+        _g.puts("\n");
+    });
 
     SyscallResult::ok(0)
 }
 
 /// Detach a blocked thread from auxiliary wait queues before changing its run state.
 ///
-/// This intentionally avoids holding the scheduler lock while acquiring
-/// endpoint/notification/futex/sleep-queue locks. Wake paths take those
-/// subsystem locks first and only enqueue afterwards, so suspend/resume must
-/// follow the same order to avoid lock inversion on SMP.
+/// Delegates to `sched::thread::detach_thread_wait_queues` which handles
+/// endpoint, notification, sleep, futex, and VSpace waiter queues.
+#[inline]
 unsafe fn detach_thread_wait_queues(tcb: *mut Tcb) {
     unsafe {
-        let blocked_reason = (*tcb).blocked_reason;
+        crate::sched::thread::detach_thread_wait_queues(tcb);
+    }
+}
 
-        if matches!(
-            blocked_reason,
-            Some(BlockedReason::TimerBlocked)
-                | Some(BlockedReason::FutexTimedBlocked)
-                | Some(BlockedReason::SendTimedBlocked { .. })
-                | Some(BlockedReason::RecvTimedBlocked)
-        ) {
-            crate::sched::sleep_queue::remove(tcb);
-            (*tcb).timer_wakeup_ns = 0;
-        }
+/// Wait until a suspended thread is fully drained from scheduler ownership.
+///
+/// A thread is not safe to reuse merely because its state changed away from
+/// `Running`: another CPU may still own its live kernel context, or the thread
+/// may still be parked in a deferred switch-out slot awaiting post-switch
+/// cleanup. `exec` reuses the same TCB immediately after `TCB_SUSPEND`, so the
+/// suspend path must wait for both conditions to clear.
+unsafe fn wait_for_tcb_quiesced(tcb: *mut Tcb, cpu_hint: Option<usize>) -> bool {
+    let this_cpu = crate::arch::current_cpu() as usize;
 
-        if !(*tcb).blocked_endpoint.is_null() {
-            let ep = &mut *((*tcb).blocked_endpoint as *mut crate::ipc::Endpoint);
-            ep.ep_lock();
-            if matches!(blocked_reason, Some(BlockedReason::RecvTimedBlocked) | Some(BlockedReason::RecvBlocked))
-                && (*tcb).recv_wait_link_count != 0
-            {
-                crate::ipc::Endpoint::clear_tcb_recv_waits(
-                    tcb,
-                    crate::sched::thread::RECV_WAIT_SELECTED_NONE,
-                );
-            } else {
-                ep.remove_from_queue(tcb);
+    for spins in 0..SUSPEND_SPIN_LIMIT {
+        let (running_cpu, pending_cpu, run_owner_cpu) = {
+            let irq = save_irq_disable();
+            let scheduler = crate::sched::scheduler::scheduler();
+            scheduler.lock();
+
+            // Same-CPU fast path: the target may be parked in *our* deferred
+            // pending slot. On x86_64 the syscall entry path clears IF via
+            // IA32_FMASK, so IRQs stay disabled throughout — timer_tick (and
+            // therefore process_pending_enqueue) can never fire. Flush the
+            // slot ourselves to break the self-deadlock.
+            if scheduler.pending_cpu_for(tcb) == Some(this_cpu) {
+                scheduler.process_pending_enqueue();
             }
-            ep.ep_unlock();
-            (*tcb).blocked_endpoint = core::ptr::null_mut();
+
+            let running_cpu = scheduler.find_running_cpu(tcb);
+            let pending_cpu = scheduler.pending_cpu_for(tcb);
+            let run_owner_cpu = (*tcb).run_owner();
+            scheduler.unlock();
+            restore_irq(irq);
+            (running_cpu, pending_cpu, run_owner_cpu)
+        };
+
+        if running_cpu.is_none() && pending_cpu.is_none() && run_owner_cpu.is_none() {
+            return true;
         }
 
-        if !(*tcb).blocked_notification.is_null() {
-            crate::ipc::Notification::clear_tcb_wait_registration(tcb);
+        if spins == 0 || (spins & 0x3ff) == 0 {
+            if let Some(cpu) = running_cpu.or(pending_cpu).or(run_owner_cpu).or(cpu_hint) {
+                if cpu != this_cpu {
+                    crate::arch::send_ipi(cpu, crate::arch::IpiKind::Reschedule);
+                }
+            }
         }
 
-        if matches!(
-            blocked_reason,
-            Some(BlockedReason::FutexBlocked) | Some(BlockedReason::FutexTimedBlocked)
-        ) {
-            crate::ipc::futex::futex_remove_thread(tcb);
-        }
+        core::hint::spin_loop();
+    }
 
-        if matches!(
-            blocked_reason,
-            Some(BlockedReason::FutexTimedBlocked)
-                | Some(BlockedReason::SendTimedBlocked { .. })
-                | Some(BlockedReason::RecvTimedBlocked)
-        ) {
-            (*tcb).futex_wakeup_result = 0;
-        }
+    false
+}
+
+unsafe fn wait_for_tcb_quiesced_blocking(tcb: *mut Tcb, cpu_hint: Option<usize>) {
+    while unsafe { !wait_for_tcb_quiesced(tcb, cpu_hint) } {
+        crate::sched::yield_now();
     }
 }
 
@@ -2667,12 +2857,16 @@ fn syscall_tcb_suspend(cap: &Capability) -> SyscallResult {
         return SyscallResult::err(e);
     }
 
+    let target_tcb = cap.object as *mut Tcb;
+
     // Operation under per-TCB lock (TCB state transitions + scheduler)
     unsafe {
         let irq = save_irq_disable();
-        let tcb = &mut *(cap.object as *mut Tcb);
+        let tcb = &mut *target_tcb;
         tcb.tcb_lock();
         let scheduler = crate::sched::scheduler::scheduler();
+        let mut wait_for_quiesce = false;
+        let mut cpu_hint = None;
 
         // Clean up PIP state before suspension
         crate::sched::pip::pip_cleanup(tcb as *mut Tcb);
@@ -2694,69 +2888,49 @@ fn syscall_tcb_suspend(cap: &Capability) -> SyscallResult {
                         return SyscallResult::ok(0);
                     }
                     Some(cpu) => {
-                        // Cross-CPU: synchronous suspend.
-                        let target_tcb_ptr = tcb as *mut Tcb as usize;
-                        tcb.tcb_unlock();
-                        restore_irq(irq);
-                        // SAFETY: cpu is a valid CPU index from current[] scan
-                        crate::arch::send_ipi(cpu, crate::arch::IpiKind::Reschedule);
-                        // Spin until target CPU has context-switched away.
-                        // Bounded: IPI + handler is single-digit microseconds.
-                        // No ABA: TCB pointers are never freed/reused in this kernel.
-                        let mut spins: u32 = 0;
-                        while crate::sched::scheduler::current_on_cpu(cpu) == target_tcb_ptr {
-                            core::hint::spin_loop();
-                            spins += 1;
-                            if spins >= SUSPEND_SPIN_LIMIT {
-                                return SyscallResult::err(SyscallError::Busy);
-                            }
-                        }
-                        let irq = save_irq_disable();
-                        tcb.tcb_lock();
-                        scheduler.cancel_pending_enqueue(tcb as *mut Tcb);
-                        scheduler.remove_from_ready_queue(tcb as *mut Tcb);
-                        detach_thread_wait_queues(tcb as *mut Tcb);
-                        tcb.tcb_unlock();
-                        restore_irq(irq);
-                        return SyscallResult::ok(0);
+                        cpu_hint = Some(cpu);
+                        wait_for_quiesce = true;
                     }
                     None => {
-                        // Thread already descheduled (raced with yield/block).
-                        // Fall through to common inactive cleanup below.
+                        // The target may already be in the scheduler's deferred
+                        // switch-out path. Wait for that bookkeeping to drain
+                        // before reporting the TCB safe to reuse.
+                        wait_for_quiesce = true;
                     }
                 }
 
-                scheduler.cancel_pending_enqueue(tcb as *mut Tcb);
-                scheduler.remove_from_ready_queue(tcb as *mut Tcb);
                 detach_thread_wait_queues(tcb as *mut Tcb);
             }
             ThreadState::Ready => {
-                scheduler.cancel_pending_enqueue(tcb as *mut Tcb);
-                scheduler.remove_from_ready_queue(tcb as *mut Tcb);
                 tcb.state = ThreadState::Inactive;
+                wait_for_quiesce = true;
             }
             ThreadState::Blocked => {
-                scheduler.cancel_pending_enqueue(tcb as *mut Tcb);
                 detach_thread_wait_queues(tcb as *mut Tcb);
-                scheduler.remove_from_ready_queue(tcb as *mut Tcb);
                 tcb.state = ThreadState::Inactive;
                 tcb.blocked_reason = None;
-                tcb.reply_tcb = core::ptr::null_mut();
+                Tcb::release_tcb_ref(tcb.clear_reply_tcb());
                 tcb.reply_can_grant = false;
                 tcb.saved_caller_msg = crate::ipc::Message::empty();
                 tcb.saved_caller_badge = 0;
+                wait_for_quiesce = true;
             }
             ThreadState::Waiting => {
-                scheduler.cancel_pending_enqueue(tcb as *mut Tcb);
                 detach_thread_wait_queues(tcb as *mut Tcb);
-                scheduler.remove_from_ready_queue(tcb as *mut Tcb);
                 tcb.state = ThreadState::Inactive;
                 tcb.blocked_reason = None;
+                wait_for_quiesce = true;
             }
             ThreadState::Inactive => {}
         }
         tcb.tcb_unlock();
         restore_irq(irq);
+
+        if wait_for_quiesce {
+            wait_for_tcb_quiesced_blocking(target_tcb, cpu_hint);
+            scheduler.cancel_pending_enqueue(target_tcb);
+            scheduler.remove_from_ready_queue(target_tcb);
+        }
     }
 
     SyscallResult::ok(0)
@@ -2805,6 +2979,22 @@ fn syscall_tcb_set_space(
         let irq = save_irq_disable();
         let tcb = &mut *(cap.object as *mut Tcb);
         tcb.tcb_lock();
+        // Release old refcounts
+        if !tcb.cspace_root.is_null() {
+            crate::cap::release_object(
+                tcb.cspace_root as *mut crate::cap::KernelObject,
+                crate::cap::ObjectType::CNode,
+            );
+        }
+        if !tcb.vspace_root.is_null() {
+            crate::cap::release_object(
+                tcb.vspace_root as *mut crate::cap::KernelObject,
+                crate::cap::ObjectType::VSpace,
+            );
+        }
+        // Acquire new refcounts — keeps VSpace/CNode alive while TCB references them
+        crate::cap::increment_refcount(cspace_cap.object as *mut crate::cap::KernelObject);
+        crate::cap::increment_refcount(vspace_cap.object as *mut crate::cap::KernelObject);
         tcb.cspace_root = cspace_cap.object as *mut CNode;
         tcb.vspace_root = vspace_cap.object as *mut VSpace;
         tcb.cspace_depth = cspace_depth as u8;
@@ -3036,7 +3226,7 @@ fn syscall_tcb_bind_notification(cap: &Capability, ntfn_cap_ptr: u64) -> Syscall
         if !tcb.bound_notification.is_null() {
             tcb.tcb_unlock();
             restore_irq(irq);
-            return SyscallResult::err(SyscallError::Busy);
+            return SyscallResult::err(SyscallError::AlreadyBound);
         }
 
         let ntfn = &mut *(ntfn_cap.object as *mut crate::ipc::Notification);
@@ -3045,11 +3235,15 @@ fn syscall_tcb_bind_notification(cap: &Capability, ntfn_cap_ptr: u64) -> Syscall
             ntfn.ntfn_unlock();
             tcb.tcb_unlock();
             restore_irq(irq);
-            return SyscallResult::err(SyscallError::Busy);
+            return SyscallResult::err(SyscallError::AlreadyBound);
         }
 
         tcb.bound_notification = ntfn_cap.object as *mut u8;
         ntfn.bound_tcb = tcb as *mut Tcb;
+
+        // TCB holds a strong reference on the bound Notification
+        crate::cap::increment_refcount(ntfn_cap.object as *mut crate::cap::KernelObject);
+
         ntfn.ntfn_unlock();
         tcb.tcb_unlock();
         restore_irq(irq);
@@ -3065,6 +3259,7 @@ fn syscall_tcb_unbind_notification(cap: &Capability) -> SyscallResult {
     }
 
     // TCB + notification mutation under per-TCB lock
+    let old_ntfn;
     unsafe {
         let irq = save_irq_disable();
         let tcb = &mut *(cap.object as *mut Tcb);
@@ -3075,6 +3270,7 @@ fn syscall_tcb_unbind_notification(cap: &Capability) -> SyscallResult {
             return SyscallResult::err(SyscallError::InvalidOperation);
         }
 
+        old_ntfn = tcb.bound_notification;
         let ntfn = &mut *(tcb.bound_notification as *mut crate::ipc::Notification);
         ntfn.ntfn_lock();
         ntfn.bound_tcb = core::ptr::null_mut();
@@ -3082,6 +3278,16 @@ fn syscall_tcb_unbind_notification(cap: &Capability) -> SyscallResult {
         tcb.bound_notification = core::ptr::null_mut();
         tcb.tcb_unlock();
         restore_irq(irq);
+    }
+
+    // Release TCB's strong reference on the Notification
+    if !old_ntfn.is_null() {
+        unsafe {
+            crate::cap::release_object(
+                old_ntfn as *mut crate::cap::KernelObject,
+                ObjectType::Notification,
+            );
+        }
     }
 
     SyscallResult::ok(0)
@@ -3114,11 +3320,20 @@ fn syscall_tcb_set_fault_handler(cap: &Capability, fault_ep_cap_ptr: u64) -> Sys
         Some((ep_cap.object as *mut u8, ep_cap.badge))
     };
 
+    // Increment refcount on new fault handler endpoint (if setting, not clearing)
+    if let Some((handler, _)) = fault_handler {
+        unsafe {
+            crate::cap::increment_refcount(handler as *mut crate::cap::KernelObject);
+        }
+    }
+
     // TCB mutation under per-TCB lock
+    let old_handler;
     unsafe {
         let irq = save_irq_disable();
         let tcb = &mut *(cap.object as *mut Tcb);
         tcb.tcb_lock();
+        old_handler = tcb.fault_handler;
         match fault_handler {
             Some((handler, badge)) => {
                 tcb.fault_handler = handler;
@@ -3131,6 +3346,16 @@ fn syscall_tcb_set_fault_handler(cap: &Capability, fault_ep_cap_ptr: u64) -> Sys
         }
         tcb.tcb_unlock();
         restore_irq(irq);
+    }
+
+    // Release refcount on old fault handler endpoint
+    if !old_handler.is_null() {
+        unsafe {
+            crate::cap::release_object(
+                old_handler as *mut crate::cap::KernelObject,
+                ObjectType::Endpoint,
+            );
+        }
     }
 
     SyscallResult::ok(0)
@@ -3316,6 +3541,29 @@ fn syscall_sc_consumed(cap: &Capability) -> SyscallResult {
     }
 }
 
+/// Resolve an invoked capability pointer to the authoritative slot in the
+/// current thread's CSpace.
+fn resolve_current_cspace_cap_slot(
+    cspace: &mut CNode,
+    depth: u8,
+    cap_ptr: u64,
+) -> Result<crate::cap::CapSlot, SyscallError> {
+    if depth == 0 {
+        match cspace.get_ref(cap_ptr as usize) {
+            Some(r) => Ok(r.slot),
+            None => match lookup_expanded_slot(cspace, cap_ptr) {
+                Ok(r) => Ok(r.slot),
+                Err(_) => Err(SyscallError::InvalidCapability),
+            },
+        }
+    } else {
+        match crate::cap::cnode::resolve_address_slot(cspace, cap_ptr, depth) {
+            Ok(r) => Ok(r.slot),
+            Err(_) => Err(SyscallError::InvalidCapability),
+        }
+    }
+}
+
 /// UNTYPED_RETYPE: Create typed kernel objects from untyped memory
 ///
 /// Args:
@@ -3379,34 +3627,14 @@ fn syscall_untyped_retype(
         let cspace = &mut *(*current_tcb).cspace_root;
         let depth = (*current_tcb).cspace_depth;
 
-        // Resolve untyped cap_ref (may be in expanded slot)
-        let cap_ref = if depth == 0 {
-            // Try flat first, then expanded fallback
-            match cspace.get_ref(cap_ptr as usize) {
-                Some(r) => r,
-                None => {
-                    // Try expanded resolution for untyped caps in sub-CNodes
-                    match lookup_expanded_slot(cspace, cap_ptr) {
-                        Ok(r) => r,
-                        Err(_) => {
-                            CAP_LOCK.unlock();
-                            restore_irq(irq);
-                            return SyscallResult::err(SyscallError::InvalidCapability);
-                        }
-                    }
-                }
-            }
-        } else {
-            match crate::cap::cnode::resolve_address_slot(cspace, cap_ptr, depth) {
-                Ok(r) => r,
-                Err(_) => {
-                    CAP_LOCK.unlock();
-                    restore_irq(irq);
-                    return SyscallResult::err(SyscallError::InvalidCapability);
-                }
+        let untyped_slot = match resolve_current_cspace_cap_slot(cspace, depth, cap_ptr) {
+            Ok(slot) => slot,
+            Err(e) => {
+                CAP_LOCK.unlock();
+                restore_irq(irq);
+                return SyscallResult::err(e);
             }
         };
-        let untyped_slot = cap_ref.slot;
 
         // Read dest_depth from per-thread invoke state
         let (dest_depth, _) = read_invoke_depths(current_tcb);
@@ -3470,6 +3698,55 @@ fn syscall_untyped_retype(
     }
 }
 
+/// UNTYPED_RESET: Clear an untyped watermark once it has no live children.
+fn syscall_untyped_reset(cap: &Capability, cap_ptr: u64) -> SyscallResult {
+    if let Err(e) = validate_capability(cap, ObjectType::Untyped, CapRights::RETYPE) {
+        return SyscallResult::err(e);
+    }
+
+    unsafe {
+        let irq = save_irq_disable();
+        CAP_LOCK.lock();
+        let current_tcb = crate::sched::scheduler::scheduler().current();
+        if current_tcb.is_null() {
+            CAP_LOCK.unlock();
+            restore_irq(irq);
+            return SyscallResult::err(SyscallError::InvalidOperation);
+        }
+
+        let cspace = &mut *(*current_tcb).cspace_root;
+        let depth = (*current_tcb).cspace_depth;
+        let untyped_slot = match resolve_current_cspace_cap_slot(cspace, depth, cap_ptr) {
+            Ok(slot) => slot,
+            Err(e) => {
+                CAP_LOCK.unlock();
+                restore_irq(irq);
+                return SyscallResult::err(e);
+            }
+        };
+
+        let live_cap = *crate::cap::get_cap(untyped_slot);
+        if live_cap.obj_type != ObjectType::Untyped || live_cap.object.is_null() {
+            CAP_LOCK.unlock();
+            restore_irq(irq);
+            return SyscallResult::err(SyscallError::InvalidCapability);
+        }
+        if !live_cap.rights.contains(CapRights::RETYPE) {
+            CAP_LOCK.unlock();
+            restore_irq(irq);
+            return SyscallResult::err(SyscallError::InsufficientRights);
+        }
+
+        let result = match crate::cap::UntypedTracker::reset(untyped_slot) {
+            Ok(()) => SyscallResult::ok(0),
+            Err(e) => SyscallResult::err(syscall_error_from_cap_error(e)),
+        };
+        CAP_LOCK.unlock();
+        restore_irq(irq);
+        result
+    }
+}
+
 /// VSPACE_MAP: Map a physical frame into a virtual address space
 ///
 /// Args:
@@ -3521,7 +3798,7 @@ fn syscall_vspace_map(
     }
 }
 
-/// VSPACE_UNMAP: Unmap a page from a virtual address space
+/// VSPACE_UNMAP: Unmap a page from a virtual address space.
 ///
 /// Args:
 /// - virt_addr: Virtual address to unmap
@@ -3534,7 +3811,10 @@ fn syscall_vspace_unmap(cap: &Capability, virt_addr: u64) -> SyscallResult {
         let current = crate::sched::scheduler::scheduler().current();
         if !current.is_null()
             && !(*current).vspace_root.is_null()
-            && core::ptr::eq(cap.object as *const VSpace, (*current).vspace_root as *const VSpace)
+            && core::ptr::eq(
+                cap.object as *const VSpace,
+                (*current).vspace_root as *const VSpace,
+            )
             && virt_addr < 0x0001_0000_0000_0000
         {
             crate::arch::sync_user_page_before_unmap(virt_addr);
@@ -4084,7 +4364,7 @@ fn syscall_irq_control_get(
             }
             let syscall_err = match e {
                 CapError::InvalidSlot => SyscallError::OutOfRange,
-                _ => SyscallError::AlreadyExists,
+                other => syscall_error_from_cap_error(other),
             };
             return SyscallResult::err(syscall_err);
         }
@@ -4144,11 +4424,24 @@ fn syscall_irq_handler_set_notification(cap: &Capability, ntfn_cap_ptr: u64) -> 
     unsafe {
         let irq = save_irq_disable();
         let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
-        irq_handler.notification.store(
+
+        // Increment refcount on new notification — keeps it alive while
+        // the IRQ handler references it (prevents UAF during dispatch_irq).
+        crate::cap::increment_refcount(ntfn_cap.object as *mut crate::cap::KernelObject);
+
+        // Swap out old notification and release its refcount
+        let old_ntfn = irq_handler.notification.swap(
             ntfn_cap.object as *mut Notification,
-            core::sync::atomic::Ordering::Release,
+            core::sync::atomic::Ordering::AcqRel,
         );
         restore_irq(irq);
+
+        if !old_ntfn.is_null() {
+            crate::cap::release_object(
+                old_ntfn as *mut crate::cap::KernelObject,
+                ObjectType::Notification,
+            );
+        }
     }
 
     SyscallResult::ok(0)
@@ -4166,16 +4459,27 @@ fn syscall_irq_handler_clear(cap: &Capability) -> SyscallResult {
     // IRQ handler mutation (IRQ_LOCK managed by irq.rs)
     let irq_num;
     let should_mask;
+    let old_ntfn;
     unsafe {
         let irq = save_irq_disable();
         let irq_handler = &mut *(cap.object as *mut crate::ipc::IrqHandler);
         irq_num = irq_handler.irq_num;
-        irq_handler
+        old_ntfn = irq_handler
             .notification
-            .store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
+            .swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
         // Only mask if no other handler on this IRQ has a notification
         should_mask = !crate::ipc::irq::has_active_notification(irq_num as usize);
         restore_irq(irq);
+    }
+
+    // Release refcount on the old notification (outside IRQ-disabled region)
+    if !old_ntfn.is_null() {
+        unsafe {
+            crate::cap::release_object(
+                old_ntfn as *mut crate::cap::KernelObject,
+                ObjectType::Notification,
+            );
+        }
     }
 
     if should_mask {
@@ -4249,7 +4553,7 @@ fn syscall_device_untyped_create(
         if let Err(e) = dest_cnode.insert_ref(dest_slot as usize, crate::cap::CapRef { slot }) {
             let syscall_err = match e {
                 CapError::InvalidSlot => SyscallError::OutOfRange,
-                _ => SyscallError::AlreadyExists,
+                other => syscall_error_from_cap_error(other),
             };
             return SyscallResult::err(syscall_err);
         }
@@ -4323,7 +4627,7 @@ fn syscall_ioport_create(
         if let Err(e) = dest_cnode.insert_ref(dest_slot as usize, crate::cap::CapRef { slot }) {
             let syscall_err = match e {
                 CapError::InvalidSlot => SyscallError::OutOfRange,
-                _ => SyscallError::AlreadyExists,
+                other => syscall_error_from_cap_error(other),
             };
             return SyscallResult::err(syscall_err);
         }
@@ -4386,7 +4690,7 @@ fn syscall_ioport_create(
         if let Err(e) = dest_cnode.insert_ref(dest_slot as usize, crate::cap::CapRef { slot }) {
             let syscall_err = match e {
                 CapError::InvalidSlot => SyscallError::OutOfRange,
-                _ => SyscallError::AlreadyExists,
+                other => syscall_error_from_cap_error(other),
             };
             return SyscallResult::err(syscall_err);
         }
@@ -4731,7 +5035,7 @@ fn syscall_vspace_walk(cap: &Capability, start_vaddr: u64, max_entries: u64) -> 
     }
 
     unsafe {
-        const EXT_ENTRY_BASE_WORD: usize = 30;
+        const EXT_ENTRY_BASE_WORD: usize = 42;
         const WALK_MAGIC: u64 = 0x5357_4c4b_434f_4d50; // "SWLKCOMP"
 
         let vspace = &*(cap.object as *const VSpace);
@@ -5085,7 +5389,7 @@ fn syscall_vspace_map_device_range(
 fn syscall_error_from_vspace_error(err: VSpaceError) -> SyscallError {
     match err {
         VSpaceError::Alignment => SyscallError::InvalidArgument,
-        VSpaceError::AlreadyMapped => SyscallError::AlreadyExists,
+        VSpaceError::AlreadyMapped => SyscallError::AlreadyMapped,
         VSpaceError::NotMapped => SyscallError::NotFound,
         VSpaceError::OutOfMemory => SyscallError::OutOfMemory,
         VSpaceError::NotCow => SyscallError::InvalidOperation,
@@ -5100,7 +5404,7 @@ fn syscall_error_from_cap_error(err: CapError) -> SyscallError {
         CapError::SlotEmpty => SyscallError::NotFound,
         CapError::InsufficientRights => SyscallError::InsufficientRights,
         CapError::InsufficientMemory | CapError::OutOfSlots => SyscallError::OutOfMemory,
-        CapError::SlotOccupied => SyscallError::AlreadyExists,
+        CapError::SlotOccupied => SyscallError::SlotOccupied,
         CapError::HasChildren => SyscallError::InvalidOperation,
         _ => SyscallError::InvalidOperation,
     }
@@ -5265,6 +5569,7 @@ pub fn handle(
             }
             SyscallResult::ok(0)
         }
+        Syscall::ThreadExit => syscall_thread_exit(),
         Syscall::DebugDumpState => {
             // Read scheduler state (debug only, no lock needed)
             unsafe {
@@ -5349,8 +5654,8 @@ pub fn handle(
             crate::arch::shutdown();
         }
         Syscall::SendTimed => {
-            // cap_ptr = cap slot, msg_info = message info, mr0 = MR0, mr1 = timeout_ns
-            // Returns 0 on success, Cancelled (12) on timeout
+            // Same register layout as Send: (cap, msg_info, mr0, mr1, mr2, mr3).
+            // Timeout is read from IpcBuffer.timeout_ns (set by userland).
             let cap = match lookup_cap_locked(cap_ptr) {
                 Ok(c) => c,
                 Err(e) => return SyscallResult::err(e),
@@ -5363,13 +5668,29 @@ pub fn handle(
                 return SyscallResult::err(e);
             }
 
-            let msg = construct_message(msg_info, mr0, 0, 0, 0);
-            let timeout_ns = mr1;
+            let msg = construct_message(msg_info, mr0, mr1, mr2, mr3);
+            let timeout_ns = unsafe {
+                let scheduler = crate::sched::scheduler::scheduler();
+                let current = scheduler.current();
+                if !current.is_null() && (*current).ipc_buffer != 0 {
+                    let ipc_buf = (*current).ipc_buffer as *const crate::ipc::IpcBuffer;
+                    let _guard = crate::arch::uaccess::UserAccessGuard::new();
+                    (*ipc_buf).timeout_ns
+                } else {
+                    0
+                }
+            };
 
             unsafe {
                 let irq = save_irq_disable();
                 let endpoint = &mut *(cap.object as *mut Endpoint);
-                let result = endpoint.send_timeout(&msg, cap.badge, timeout_ns);
+                let result = match endpoint.send_timeout(&msg, cap.badge, timeout_ns) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        restore_irq(irq);
+                        return SyscallResult::err(err);
+                    }
+                };
                 restore_irq(irq);
 
                 if result == 0 {
@@ -5380,8 +5701,8 @@ pub fn handle(
             }
         }
         Syscall::RecvTimed => {
-            // cap_ptr = cap slot, msg_info = timeout_ns
-            // Returns badge in value, 0 in error on success, Cancelled (12) on timeout
+            // Timeout read from IpcBuffer.timeout_ns.
+            // Returns badge in value, 0 in error on success, Cancelled (12) on timeout.
             let cap = match lookup_cap_locked(cap_ptr) {
                 Ok(c) => c,
                 Err(e) => return SyscallResult::err(e),
@@ -5394,12 +5715,18 @@ pub fn handle(
                 return SyscallResult::err(e);
             }
 
-            let timeout_ns = msg_info;
+            let timeout_ns = unsafe { read_ipc_buffer_timeout() };
 
             unsafe {
                 let irq = save_irq_disable();
                 let endpoint = &mut *(cap.object as *mut Endpoint);
-                let (msg, badge, result) = endpoint.recv_timeout(timeout_ns);
+                let (msg, badge, result) = match endpoint.recv_timeout(timeout_ns) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        restore_irq(irq);
+                        return SyscallResult::err(err);
+                    }
+                };
                 if result == 0 {
                     write_msg_to_ipc_buffer(&msg, badge);
                 }
@@ -5414,7 +5741,7 @@ pub fn handle(
         }
         Syscall::RecvAny => syscall_recv_any(cap_ptr),
         Syscall::ReplyRecvAny => syscall_reply_recv_any(cap_ptr, msg_info, mr0, mr1, mr2, mr3),
-        Syscall::RecvAnyTimed => syscall_recv_any_timed(cap_ptr, msg_info),
+        Syscall::RecvAnyTimed => syscall_recv_any_timed(cap_ptr),
         Syscall::ReplyRecvAnyTimed => {
             syscall_reply_recv_any_timed(cap_ptr, msg_info, mr0, mr1, mr2, mr3)
         }
@@ -5681,32 +6008,49 @@ fn syscall_mo_get_size(cap: &Capability) -> SyscallResult {
     }
 }
 
-/// MO_CLONE: Create a COW snapshot clone into dest_slot.
+/// MO_CLONE: Initialize an existing MemoryObject as a COW snapshot child.
 ///
-/// Creates a CowChild MemoryObject with an empty radix tree and a
-/// cow_parent CapSlot referencing the parent. The parent's pages are
-/// NOT moved — the child resolves pages by walking the cow_parent chain.
-/// The parent's ref_count is incremented to prevent premature destruction.
-fn syscall_mo_clone(cap: &Capability, dest_slot: u64, _flags: u64) -> SyscallResult {
+/// The caller must supply `child_mo_cap_ptr`, a capability pointer to a
+/// freshly allocated MemoryObject object. This preserves the Untyped/MO
+/// boundary: kernel object storage comes from Untyped retype, while MO_CLONE
+/// only wires up the COW relationship.
+fn syscall_mo_clone(cap: &Capability, child_mo_cap_ptr: u64, _flags: u64) -> SyscallResult {
     if let Err(e) = validate_capability(cap, ObjectType::MemoryObject, CapRights::READ) {
         return SyscallResult::err(e);
     }
 
+    let child_cap = match lookup_cap_locked(child_mo_cap_ptr) {
+        Ok(c) => c,
+        Err(e) => return SyscallResult::err(e),
+    };
+    if let Err(e) = validate_capability(&child_cap, ObjectType::MemoryObject, CapRights::WRITE) {
+        return SyscallResult::err(e);
+    }
+
     unsafe {
-        let parent_mo = &*(cap.object as *const crate::cap::memory_object::MemoryObject);
+        let parent_mo = &mut *(cap.object as *mut crate::cap::memory_object::MemoryObject);
+        let child_mo_ptr = child_cap.object as *mut crate::cap::memory_object::MemoryObject;
+        if child_mo_ptr.is_null() || child_mo_ptr == parent_mo as *mut _ {
+            return SyscallResult::err(SyscallError::InvalidArgument);
+        }
+        let child_mo = &mut *child_mo_ptr;
 
-        // Allocate space for child MO struct (radix tree nodes allocated lazily)
-        let child_size =
-            crate::cap::memory_object::MemoryObject::required_bytes(parent_mo.page_count);
-        let child_pages = (child_size + crate::mm::PAGE_SIZE - 1) / crate::mm::PAGE_SIZE;
-        let child_phys = match crate::mm::pmm_alloc_contiguous(child_pages) {
-            Some(p) => p,
-            None => return SyscallResult::err(SyscallError::OutOfMemory),
-        };
+        let child_refcount = child_mo
+            .header
+            .ref_count
+            .load(core::sync::atomic::Ordering::Acquire);
+        let child_is_pristine = child_refcount != 0
+            && child_mo.cow_parent == 0
+            && child_mo.first_child.is_null()
+            && child_mo.next_sibling.is_null()
+            && child_mo.pages.is_empty()
+            && child_mo.reverse_maps.inline_count == 0
+            && child_mo.reverse_maps.overflow.is_null();
+        if !child_is_pristine {
+            return SyscallResult::err(SyscallError::Busy);
+        }
 
-        let child_base = crate::mm::phys_to_virt(child_phys) as *mut u8;
-        core::ptr::write_bytes(child_base, 0, child_pages * crate::mm::PAGE_SIZE);
-        let child_mo_ptr = child_base as *mut crate::cap::memory_object::MemoryObject;
+        let child_untyped_phys = child_mo.untyped_phys;
 
         // Allocate a cap slot for the parent reference (cow_parent)
         let parent_ref_slot = match crate::cap::alloc_slot() {
@@ -5721,62 +6065,19 @@ fn syscall_mo_clone(cap: &Capability, dest_slot: u64, _flags: u64) -> SyscallRes
         parent_ref_cap.rights = CapRights::READ;
         parent_ref_cap.depth = 0;
         parent_ref_cap.badge = 0;
-        // Increment parent's refcount
-        let parent_header = &mut *(cap.object as *mut crate::cap::KernelObject);
-        parent_header
-            .ref_count
-            .fetch_add(1, core::sync::atomic::Ordering::Acquire);
+        crate::cap::increment_refcount(cap.object);
 
-        // Initialize child MO
+        // Initialize the already-allocated child object in place.
         core::ptr::write(
             child_mo_ptr,
-            crate::cap::memory_object::MemoryObject::new(child_phys, parent_mo.page_count),
+            crate::cap::memory_object::MemoryObject::new(child_untyped_phys, parent_mo.page_count),
         );
         (*child_mo_ptr).kind = crate::cap::memory_object::MoKind::CowChild;
         (*child_mo_ptr).cow_parent = parent_ref_slot as u64;
 
         // Add child to parent's intrusive child list
-        let parent_mo_mut = &mut *(cap.object as *mut crate::cap::memory_object::MemoryObject);
-        (*child_mo_ptr).next_sibling = parent_mo_mut.first_child;
-        parent_mo_mut.first_child = child_mo_ptr;
-
-        // Allocate a cap slot for the child MO
-        let child_cap_slot = match crate::cap::alloc_slot() {
-            Some(s) => s,
-            None => {
-                crate::cap::free_slot(parent_ref_slot);
-                return SyscallResult::err(SyscallError::OutOfMemory);
-            }
-        };
-
-        let child_cap = crate::cap::get_cap_mut(child_cap_slot);
-        child_cap.object = child_mo_ptr as *mut crate::cap::KernelObject;
-        child_cap.obj_type = ObjectType::MemoryObject;
-        child_cap.rights = CapRights::ALL;
-        child_cap.depth = 0;
-        child_cap.badge = 0;
-
-        // Install into caller's CNode at dest_slot
-        let scheduler = crate::sched::scheduler::scheduler();
-        let current = scheduler.current();
-        if current.is_null() || (*current).cspace_root.is_null() {
-            crate::cap::free_slot(child_cap_slot);
-            crate::cap::free_slot(parent_ref_slot);
-            return SyscallResult::err(SyscallError::InvalidOperation);
-        }
-        let cnode = &mut *(*current).cspace_root;
-        if let Err(e) = cnode.insert_ref(
-            dest_slot as usize,
-            crate::cap::cnode::CapRef {
-                slot: child_cap_slot,
-            },
-        ) {
-            crate::cap::free_slot(child_cap_slot);
-            crate::cap::free_slot(parent_ref_slot);
-            return SyscallResult::err(match e {
-                _ => SyscallError::InvalidArgument,
-            });
-        }
+        (*child_mo_ptr).next_sibling = parent_mo.first_child;
+        parent_mo.first_child = child_mo_ptr;
 
         SyscallResult::ok(0)
     }
@@ -5976,7 +6277,11 @@ fn syscall_mo_has_page(cap: &Capability, page_index: u64) -> SyscallResult {
         if index >= mo.page_count as usize {
             return SyscallResult::err(SyscallError::OutOfRange);
         }
-        SyscallResult::ok(if mo.resolve_page(index).is_some() { 1 } else { 0 })
+        SyscallResult::ok(if mo.resolve_page(index).is_some() {
+            1
+        } else {
+            0
+        })
     }
 }
 
@@ -6038,6 +6343,12 @@ fn syscall_vspace_fork_range(
 
         let forked = parent_vs.fork_range(child_vs, va_start, page_count);
 
+        if forked > 0 {
+            if !(*child_mo).reverse_maps.ensure_slot(child_mo) {
+                return SyscallResult::err(SyscallError::OutOfMemory);
+            }
+        }
+
         if forked > 0 && !child_vs.tracking.is_null() {
             let t = &mut *child_vs.tracking;
             let mut tree_alloc = crate::mm::node_alloc::PmmNodeAllocator {
@@ -6065,21 +6376,21 @@ fn syscall_vspace_fork_range(
                 perms |= 0x04;
             }
 
-            let _ = t.mappings.insert(
-                va_start,
-                crate::mm::vspace::VmArea {
-                    mo: child_mo,
-                    mo_offset: mo_offset as u32,
-                    page_count: forked as u32,
-                    perms,
-                    _pad: [0; 7],
-                },
-                &mut tree_alloc,
-            );
+            let vma = crate::mm::vspace::VmArea {
+                mo: child_mo,
+                mo_offset: mo_offset as u32,
+                page_count: forked as u32,
+                perms,
+                _pad: [0; 7],
+            };
+            if !t.mappings.insert(va_start, vma, &mut tree_alloc) {
+                return SyscallResult::err(SyscallError::OutOfMemory);
+            }
+            vma.retain_mo_ref();
         }
 
         if forked > 0 {
-            (*child_mo)
+            if !(*child_mo)
                 .reverse_maps
                 .add(crate::cap::memory_object::ReverseMapEntry {
                     vspace: child_vs as *mut VSpace,
@@ -6088,7 +6399,10 @@ fn syscall_vspace_fork_range(
                     mo_offset: mo_offset as u32,
                     perms: 0,
                     _pad: [0; 7],
-                });
+                })
+            {
+                return SyscallResult::err(SyscallError::OutOfMemory);
+            }
         }
 
         SyscallResult::ok(forked as u64)
@@ -6219,8 +6533,12 @@ fn syscall_vspace_map_mo(
         }
 
         if mapped > 0 {
+            if !(*mo_ptr).reverse_maps.ensure_slot(mo_ptr) {
+                return SyscallResult::err(SyscallError::OutOfMemory);
+            }
+
             // Register reverse map on MO
-            (*mo_ptr)
+            if !(*mo_ptr)
                 .reverse_maps
                 .add(crate::cap::memory_object::ReverseMapEntry {
                     vspace: cap.object as *mut VSpace,
@@ -6229,7 +6547,10 @@ fn syscall_vspace_map_mo(
                     mo_offset: offset as u32,
                     perms: (flags_bits & 0xFF) as u8,
                     _pad: [0; 7],
-                });
+                })
+            {
+                return SyscallResult::err(SyscallError::OutOfMemory);
+            }
 
             // Insert VmArea into VSpace Maple tree
             if !vspace.tracking.is_null() {
@@ -6240,92 +6561,31 @@ fn syscall_vspace_map_mo(
                     },
                     use_reserve: false,
                 };
-                let _ = t.mappings.insert(
-                    vaddr,
-                    crate::mm::vspace::VmArea {
-                        mo: mo_cap.object as *mut crate::cap::memory_object::MemoryObject,
-                        mo_offset: offset as u32,
-                        page_count: mapped as u32,
-                        perms: (flags_bits & 0xFF) as u8,
-                        _pad: [0; 7],
-                    },
-                    &mut tree_alloc,
-                );
-            }
-
-            // Update per-frame map_count
-            for i in 0..mapped as usize {
-                if let Some(phys) = (*mo_ptr).resolve_page(offset + i) {
-                    crate::mm::pmm_retain_mapping(phys);
+                let vma = crate::mm::vspace::VmArea {
+                    mo: mo_cap.object as *mut crate::cap::memory_object::MemoryObject,
+                    mo_offset: offset as u32,
+                    page_count: mapped as u32,
+                    perms: (flags_bits & 0xFF) as u8,
+                    _pad: [0; 7],
+                };
+                if !t.mappings.insert(vaddr, vma, &mut tree_alloc) {
+                    if !vspace.tracking.is_null() {
+                        let t = &*vspace.tracking;
+                        if let Some((_start, existing)) = t.mappings.lookup(vaddr) {
+                            if !existing.mo.is_null() {
+                                (*existing.mo)
+                                    .reverse_maps
+                                    .remove(cap.object as *mut VSpace, vaddr);
+                            }
+                        }
+                    }
+                    return SyscallResult::err(SyscallError::OutOfMemory);
                 }
+                vma.retain_mo_ref();
             }
         }
 
         SyscallResult::ok(mapped)
-    }
-}
-
-/// VSPACE_UNMAP_MO: Unmap memory object pages from a VSpace
-fn syscall_vspace_unmap_mo(cap: &Capability, vaddr: u64, count: u64) -> SyscallResult {
-    if let Err(e) = validate_capability(cap, ObjectType::VSpace, CapRights::UNMAP) {
-        return SyscallResult::err(e);
-    }
-    if vaddr & 0xFFF != 0 {
-        return SyscallResult::err(SyscallError::InvalidArgument);
-    }
-
-    let cnt = count as usize;
-    unsafe {
-        let vspace = &mut *(cap.object as *mut VSpace);
-        let vspace_ptr = cap.object as *mut VSpace;
-
-        // 1. Look up VmArea in Maple tree BEFORE removal to get the MO pointer
-        let mut mo_ptr: *mut crate::cap::memory_object::MemoryObject = core::ptr::null_mut();
-        if !vspace.tracking.is_null() {
-            let t = &*vspace.tracking;
-            if let Some((_start, val)) = t.mappings.lookup(vaddr) {
-                if !val.mo.is_null() {
-                    mo_ptr = val.mo;
-                }
-            }
-        }
-
-        // 2. Unmap pages from page table + decrement map_count
-        let irq = save_irq_disable();
-        vspace.lock.lock();
-        for i in 0..cnt {
-            let page_vaddr = vaddr + (i as u64 * crate::mm::PAGE_SIZE as u64);
-            if let Some(entry) = vspace.read_entry(page_vaddr, 1) {
-                if entry & crate::mm::vspace::ENTRY_PRESENT != 0 {
-                    let phys = entry & crate::mm::vspace::ENTRY_ADDR_MASK;
-                    let _ = vspace.write_entry(page_vaddr, 1, 0);
-                    crate::arch::paging::invlpg(page_vaddr);
-                    vspace.tlb_shootdown(page_vaddr);
-                    crate::mm::pmm_release_mapping(phys);
-                }
-            }
-        }
-        vspace.lock.unlock();
-        restore_irq(irq);
-
-        // 3. Remove VmArea from Maple tree
-        if !vspace.tracking.is_null() {
-            let t = &mut *vspace.tracking;
-            let mut tree_alloc = crate::mm::node_alloc::PmmNodeAllocator {
-                owner: crate::mm::frame::FrameOwner::KernelPrivate {
-                    subkind: crate::mm::frame::KernelMetaKind::MapleNode,
-                },
-                use_reserve: false,
-            };
-            t.mappings.remove(vaddr, &mut tree_alloc);
-        }
-
-        // 4. Remove reverse map from MO
-        if !mo_ptr.is_null() {
-            (*mo_ptr).reverse_maps.remove(vspace_ptr, vaddr);
-        }
-
-        SyscallResult::ok(cnt as u64)
     }
 }
 

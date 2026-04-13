@@ -1,11 +1,10 @@
 //! Service Manager - dependency graph, state machine, boot orchestration
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use crate::ini::{ServiceDef, RestartPolicy};
+use crate::ini::{RestartPolicy, ServiceDef, ServiceType, TargetActivation};
 
 pub const MAX_SERVICES: usize = 32;
 const MAX_RESTARTS: u16 = 5;
-
 
 fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -82,7 +81,9 @@ impl ServiceManager {
     /// Register a parsed service definition. Returns index or -1 on error.
     pub fn add_service(&mut self, def: &ServiceDef) -> i32 {
         if self.count >= MAX_SERVICES {
-            trona::uerror!(|_lb| { _lb.str(b"[INIT] svc_mgr: too many services\n"); });
+            trona::uerror!(|_lb| {
+                _lb.str(b"[INIT] svc_mgr: too many services\n");
+            });
             return -1;
         }
         let idx = self.count;
@@ -130,6 +131,47 @@ impl ServiceManager {
                     // dep_idx depends on i
                     self.adj[dep_idx as usize] |= 1u32 << i;
                 }
+            }
+        }
+
+        // Implicit dependency: non-PreProcmgr, non-target services require
+        // procmgr.target to be reached before they can be spawned via PM_SPAWN.
+        let pm_target_idx = self.find_dep_name(b"procmgr.target");
+        if pm_target_idx >= 0 {
+            for i in 0..self.count {
+                if self.services[i].def.pre_procmgr {
+                    continue;
+                }
+                if self.services[i].def.svc_type == ServiceType::Target {
+                    continue;
+                }
+                if bytes_eq(self.services[i].def.name_bytes(), b"procmgr") {
+                    continue;
+                }
+                self.adj[i] |= 1u32 << pm_target_idx;
+            }
+        }
+
+        // Implicit dependency: every non-Authority, non-target service needs
+        // the bootstrap authority (rsrcsrv) to be Running before it can be
+        // spawned, because spawn_server's Service path issues a RES_*
+        // request to obtain its loader untyped. The Authority service
+        // itself and any service it transitively needs (i.e. nothing in
+        // the current design) are exempt.
+        let rs_target_idx = self.find_dep_name(b"rsrcsrv.target");
+        if rs_target_idx >= 0 {
+            for i in 0..self.count {
+                if i as i32 == rs_target_idx {
+                    continue;
+                }
+                if self.services[i].def.svc_type == ServiceType::Target {
+                    continue;
+                }
+                let role = self.services[i].def.role_bytes();
+                if bytes_eq(role, b"authority") {
+                    continue;
+                }
+                self.adj[i] |= 1u32 << rs_target_idx;
             }
         }
     }
@@ -201,7 +243,13 @@ impl ServiceManager {
 
         if self.boot_order_len != n {
             // Cycle detected — mark unprocessed services as Failed
-            trona::uerror!(|_lb| { _lb.str(b"[INIT] svc_mgr: cycle detected! Only "); _lb.hex(self.boot_order_len as u64); _lb.str(b" of "); _lb.hex(n as u64); _lb.str(b" services sorted\n"); });
+            trona::uerror!(|_lb| {
+                _lb.str(b"[INIT] svc_mgr: cycle detected! Only ");
+                _lb.hex(self.boot_order_len as u64);
+                _lb.str(b" of ");
+                _lb.hex(n as u64);
+                _lb.str(b" services sorted\n");
+            });
 
             for i in 0..n {
                 let mut in_order = false;
@@ -213,7 +261,11 @@ impl ServiceManager {
                 }
                 if !in_order {
                     self.services[i].state = ServiceState::Failed;
-                    trona::uerror!(|_lb| { _lb.str(b"[INIT] svc="); _lb.bytes(self.services[i].def.name_bytes()); _lb.str(b" state=Failed (cycle)\n"); });
+                    trona::uerror!(|_lb| {
+                        _lb.str(b"[INIT] svc=");
+                        _lb.bytes(self.services[i].def.name_bytes());
+                        _lb.str(b" state=Failed (cycle)\n");
+                    });
                 }
             }
             return false;
@@ -269,12 +321,139 @@ impl ServiceManager {
         true
     }
 
+    /// Check if any dependency for service `idx` has already failed permanently.
+    pub fn deps_failed(&self, idx: usize) -> bool {
+        if idx >= self.count {
+            return false;
+        }
+        let deps = self.adj[idx];
+        for j in 0..self.count {
+            if deps & (1u32 << j) != 0 && self.services[j].state == ServiceState::Failed {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Return true when at least one unit is still pending boot-time completion.
+    pub fn has_pending_units(&self) -> bool {
+        for i in 0..self.count {
+            if !self.services[i].active {
+                continue;
+            }
+            match self.services[i].state {
+                ServiceState::Stopped | ServiceState::Starting => return true,
+                ServiceState::Running | ServiceState::Failed | ServiceState::Stopping => {}
+            }
+        }
+        false
+    }
+
+    /// Reach a milestone target unit from an external event.
+    pub fn reach_target(&mut self, name: &[u8]) -> bool {
+        let idx = self.find_service(name);
+        if idx < 0 {
+            return false;
+        }
+        let idx = idx as usize;
+        if self.services[idx].def.svc_type != ServiceType::Target {
+            return false;
+        }
+        if self.services[idx].state == ServiceState::Running {
+            return false;
+        }
+        self.set_state(idx, ServiceState::Running);
+        true
+    }
+
+    pub fn reach_event_targets(&mut self) -> bool {
+        let mut reached = false;
+        for i in 0..self.count {
+            if self.services[i].def.svc_type != ServiceType::Target {
+                continue;
+            }
+            if self.services[i].def.target_activation != TargetActivation::Event {
+                continue;
+            }
+            if self.services[i].state == ServiceState::Running {
+                continue;
+            }
+            self.set_state(i, ServiceState::Running);
+            reached = true;
+        }
+        reached
+    }
+
+    /// Auto-promote passive targets whose dependencies are all Running.
+    ///
+    /// Passive targets transition to Running automatically when all their
+    /// After-dependencies are satisfied, unlike `reach_target()` which
+    /// requires an explicit external event. Returns true if any target
+    /// was promoted.
+    pub fn promote_passive_targets(&mut self) -> bool {
+        let mut promoted = false;
+        for i in 0..self.count {
+            if self.services[i].def.svc_type != ServiceType::Target {
+                continue;
+            }
+            if self.services[i].def.target_activation != TargetActivation::Passive {
+                continue;
+            }
+            if self.services[i].state != ServiceState::Starting {
+                continue;
+            }
+            if self.deps_satisfied(i) {
+                self.set_state(i, ServiceState::Running);
+                promoted = true;
+            }
+        }
+        promoted
+    }
+
+    /// Fail a milestone target unit from an external event.
+    pub fn fail_target(&mut self, name: &[u8]) -> bool {
+        let idx = self.find_service(name);
+        if idx < 0 {
+            return false;
+        }
+        let idx = idx as usize;
+        if self.services[idx].def.svc_type != ServiceType::Target {
+            return false;
+        }
+        if self.services[idx].state == ServiceState::Failed {
+            return false;
+        }
+        self.set_state(idx, ServiceState::Failed);
+        true
+    }
+
+    pub fn fail_event_targets(&mut self) -> bool {
+        let mut failed = false;
+        for i in 0..self.count {
+            if self.services[i].def.svc_type != ServiceType::Target {
+                continue;
+            }
+            if self.services[i].def.target_activation != TargetActivation::Event {
+                continue;
+            }
+            if self.services[i].state == ServiceState::Failed {
+                continue;
+            }
+            self.set_state(i, ServiceState::Failed);
+            failed = true;
+        }
+        failed
+    }
+
     /// Check if a service should be restarted based on its policy and exit code.
     pub fn should_restart(&self, idx: usize) -> bool {
         if idx >= self.count {
             return false;
         }
         let svc = &self.services[idx];
+        if svc.def.svc_type == ServiceType::Target {
+            return false;
+        }
         if svc.restart_count >= MAX_RESTARTS {
             return false;
         }
@@ -291,12 +470,24 @@ impl ServiceManager {
             return;
         }
         self.services[idx].exit_code = exit_code;
-        trona::uinfo!(|_lb| { _lb.str(b"[INIT] svc="); _lb.bytes(self.services[idx].def.name_bytes()); _lb.str(b" exited code="); _lb.hex(exit_code as u64); _lb.str(b"\n"); });
+        trona::uinfo!(|_lb| {
+            _lb.str(b"[INIT] svc=");
+            _lb.bytes(self.services[idx].def.name_bytes());
+            _lb.str(b" exited code=");
+            _lb.hex(exit_code as u64);
+            _lb.str(b"\n");
+        });
 
         if self.should_restart(idx) {
             self.services[idx].restart_count += 1;
             self.services[idx].state = ServiceState::Stopped;
-            trona::uinfo!(|_lb| { _lb.str(b"[INIT] svc="); _lb.bytes(self.services[idx].def.name_bytes()); _lb.str(b" will restart (attempt "); _lb.hex(self.services[idx].restart_count as u64); _lb.str(b")\n"); });
+            trona::uinfo!(|_lb| {
+                _lb.str(b"[INIT] svc=");
+                _lb.bytes(self.services[idx].def.name_bytes());
+                _lb.str(b" will restart (attempt ");
+                _lb.hex(self.services[idx].restart_count as u64);
+                _lb.str(b")\n");
+            });
         } else {
             self.services[idx].state = ServiceState::Failed;
         }

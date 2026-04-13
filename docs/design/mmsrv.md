@@ -98,7 +98,8 @@ Set by init in `spawn.rs`:
 
 ### Message Labels (0x80-0xA3 Range)
 
-Defined in `lib/trona/uapi/protocol/mmsrv.rs` (36 labels):
+Defined in `lib/trona/uapi/protocol/mmsrv.rs`. Label 0x91 remains
+unused; 0x96 is reserved (device mmap handled as subcase of `MM_FILE_MMAP`).
 
 | Label | Name | Source | Purpose |
 |-------|------|--------|---------|
@@ -116,10 +117,9 @@ Defined in `lib/trona/uapi/protocol/mmsrv.rs` (36 labels):
 | 0x8B | `MM_SHM_MAP` | vfs | Map SHM into client VSpace |
 | 0x8C | `MM_SHM_UNMAP` | vfs | Unmap SHM from client VSpace |
 | 0x8D | `MM_FORK_REGIONS` | procmgr | Clone parent's region state to child |
-| 0x8E | `MM_ALLOC_THREAD_OBJECTS` | procmgr | Allocate TCB + SchedContext for new thread |
-| 0x8F | `MM_FREE_THREAD_OBJECTS` | procmgr | Free thread objects on exit |
+| 0x8E | `MM_SHM_DESTROY` | vfs | Destroy SHM backing after last close |
+| 0x8F | `MM_SHM_RESIZE` | vfs | Resize SHM backing with mapped-tail safety checks |
 | 0x90 | `MM_GET_CLIENT_STATS` | any | Query per-client memory usage |
-| 0x91 | `MM_ALLOC_OBJECT` | procmgr | Allocate arbitrary kernel object |
 | 0x92 | `MM_REGISTER_SHARED_REGION` | procmgr | Register shared library region |
 | 0x93 | `MM_MAP_OBJECT_REGION` | procmgr | Map MO-backed region into client |
 | 0x94 | `MM_SYNC_FILE_BACKING` | vfs | Sync file-backed MO to storage |
@@ -130,7 +130,7 @@ Defined in `lib/trona/uapi/protocol/mmsrv.rs` (36 labels):
 | 0x9A | `MM_PAGER_REQUEST` | kernel/vfs | Page-in request (demand paging) |
 | 0x9B | `MM_PAGER_WRITE_REQUEST` | kernel/vfs | Write-back request for dirty page |
 | 0x9C | `MM_DUMP_PENDING` | debug | Dump pending operations (debug) |
-| 0x9D | `MM_REGISTER_PAGER_EP` | vfs | Register pager endpoint for file-backed regions |
+| 0x9D | `MM_REGISTER_PAGER_EP` | vfs | Register backend callback endpoint for file-backed regions |
 | 0x9E | `MM_ALLOC_PRIVATE_REGION` | procmgr | Allocate private MO-backed region |
 | 0x9F | `MM_ALLOC_PRIVATE_WINDOW` | procmgr | Allocate private dual-mapped window |
 | 0xA0 | `MM_ALLOC_INITRD_COPY` | procmgr | Copy initrd data into MO pages |
@@ -138,7 +138,7 @@ Defined in `lib/trona/uapi/protocol/mmsrv.rs` (36 labels):
 | 0xA2 | `MM_COPY_FROM_CLIENT_REGION` | procmgr | Copy data from client's region |
 | 0xA3 | `MM_ALLOC_PRIVATE_COPY_FROM_CLIENT_REGION` | procmgr | Allocate + copy from client region |
 
-**Note:** 0x96 is reserved (device mmap handled as subcase of `MM_FILE_MMAP`).
+**Note:** 0x91 is currently unused. 0x96 is reserved (device mmap handled as subcase of `MM_FILE_MMAP`).
 
 ### Message Layouts
 
@@ -198,7 +198,18 @@ MR4 = pager_ep (endpoint for page-in/write-back)
 Reply: label = TRONA_OK, MR0 = mapped_base
 ```
 
-Creates a file-backed MO. On page fault, mmsrv sends `MM_PAGER_REQUEST` to the registered pager endpoint (typically VFS) to fill the page.
+Creates a file-backed MO. On page fault, mmsrv sends `MM_PAGER_REQUEST` to the registered backend callback endpoint (typically VFS endpoint slot 63) to fill the page. The same callback endpoint is also reused by netsrv async completions, so VFS treats it as a shared backend ingress rather than a pager-only channel.
+
+### File-Backed Pager Verification Plan
+
+The current design assumes a single VFS-owned backend callback endpoint that services both netsrv async completions and mmsrv pager traffic. The minimum runtime verification should check:
+
+1. Backend callback registration succeeds during VFS startup, or VFS logs the service-EP fallback path.
+2. `VFS_BACKEND_RESOLVE_BACKING` from mmsrv resolves against the target client badge rather than auto-registering mmsrv as a fake client.
+3. First fault on a file-backed `MAP_SHARED` mapping triggers `MM_PAGER_REQUEST` and populates one page from backing storage.
+4. Dirtying a shared mapping triggers `MM_PAGER_WRITE_REQUEST` write-back through the same callback endpoint.
+5. `ftruncate()` on an mmapped file emits `MM_SYNC_FILE_BACKING` so mmsrv drops pages past the new EOF.
+6. netsrv async completions still arrive on the shared backend callback endpoint and are demultiplexed by badge without regressing socket operations.
 
 **VMFault (kernel → mmsrv):**
 ```
@@ -512,11 +523,26 @@ Reply: TRONA_OK
 **Algorithm:**
 1. Check for duplicate shm_id (error if exists)
 2. Find free slot in SHM table (grow if needed)
-3. Create MO: `create_mo(num_pages)`
-4. Commit all pages via `mo_commit()`
-5. Store in ShmObject struct with `active=true`
+3. Allocate one frame cap per page from the frame pool / retype path
+4. Store the frame-cap array in `ShmObject` with `active=true`
 
-**SHM lifetime:** Created by VFS, destroyed when all mappings removed (reference counting not yet implemented — SHM objects persist until server restart).
+**SHM lifetime:** Created by VFS on first truncate, remains reachable while a name or live fd exists, and is destroyed by VFS via `MM_SHM_DESTROY` after `shm_unlink()` plus the last close.
+
+### Resize (MM_SHM_RESIZE)
+
+**Caller:** VFS (on behalf of `ftruncate()` on an existing SHM object)
+
+**Protocol:**
+```
+MR0 = shm_id
+MR1 = new_num_pages
+Reply: TRONA_OK or error
+```
+
+**Policy:**
+1. Grow is allowed in place by appending newly allocated frames to the SHM backing.
+2. Shrink is allowed only if no live shared mapping covers bytes beyond the new end.
+3. Existing mappings are never auto-expanded or auto-relocated; callers must create a new mapping to observe grown capacity.
 
 ### Mapping (MM_SHM_MAP)
 
@@ -535,11 +561,11 @@ Reply: MR0 = actual_vaddr
 1. Find SHM object by ID (error if not found)
 2. Find client by badge
 3. Pick vaddr (auto: use `client.mmap_next`, explicit: use MR2)
-4. Map SHM's MO into client VSpace via `vspace_map_mo()`
+4. Map SHM's backing frames directly into client VSpace via `vspace_map()`
 5. If auto-pick, advance `client.mmap_next`
 6. Return mapped address
 
-**Shared access:** Multiple clients can map the same SHM MO. All see the same physical frames (shared memory semantics).
+**Shared access:** Multiple clients can map the same SHM frame set. All shared mappings see the same physical frames.
 
 ### Unmapping (MM_SHM_UNMAP)
 
@@ -556,9 +582,26 @@ Reply: TRONA_OK
 **Algorithm:**
 1. Find SHM object by ID
 2. Find client by badge
-3. Unmap MO pages from client VSpace
+3. Unmap SHM-backed pages from client VSpace
 
 **Frame lifetime:** MO remains alive (not deleted). Other mappings persist.
+
+### Destruction (MM_SHM_DESTROY)
+
+**Caller:** VFS (after unlink and last close)
+
+**Protocol:**
+```
+MR0 = shm_id
+Reply: TRONA_OK
+```
+
+**Algorithm:**
+1. Find SHM object by ID
+2. Return all frame caps to the frame pool
+3. Mark the SHM slot inactive for reuse
+
+**Idempotence:** Destroy is idempotent. If the SHM object is already gone, mmsrv still returns `TRONA_OK`.
 
 ## 9. Demand Paging (VMFault Handling)
 
@@ -605,11 +648,16 @@ Both use the same VMFault handler. The only difference is the initial state.
 **Purpose:** VFS requests file-backed memory mapping on behalf of `mmap(fd, ...)`.
 
 **Flow:**
-1. VFS sends `MM_FILE_MMAP` with pager endpoint
-2. mmsrv creates MO, registers pager EP via `MM_REGISTER_PAGER_EP`
-3. On page fault in file-backed region, mmsrv sends `MM_PAGER_REQUEST` to VFS
-4. VFS reads file data, fills page via pager protocol
-5. mmsrv commits and maps the page, resumes faulting thread
+1. VFS resolves the fd into a backing identity (`FILE`, `MOUNT`, `DEVICE`, or `SHM`)
+2. VFS sends `MM_FILE_MMAP` with fd, offset, length, protection, and map flags
+3. mmsrv dispatches by backing kind:
+  - `FILE` / `MOUNT`: MO + pager-backed lazy mapping
+  - `DEVICE`: direct device-cap mapping
+  - `SHM` + `MAP_SHARED`: direct frame mapping of the shared backing
+  - `SHM` + `MAP_PRIVATE`: eager snapshot into a private MO
+4. mmsrv records a region entry and returns the mapped base address
+
+**Why SHM is separate from file pagering:** POSIX shared memory has stable backing frames owned by mmsrv already. Treating it as a pager-backed tmpfs file leaks the wrong identity into the common mmap path and makes resize/lifetime semantics harder to define.
 
 ### MM_SYNC_MMAP_WRITE / MM_SYNC_FILE_BACKING
 

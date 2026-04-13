@@ -546,7 +546,6 @@ SaltyOS/
 │   └── src/
 │       ├── lib.rs                       # Kernel entry (kmain), serial I/O, panic handler
 │       ├── bootinfo.rs                  # Boot info TLV parsing
-│       ├── builtins.rs                  # Compiler built-in stubs (memcpy, memset)
 │       ├── cpio.rs                      # CPIO archive parser for initrd
 │       ├── elf.rs                       # ELF binary loader
 │       ├── init.rs                      # Init task bootstrap, CSpace setup

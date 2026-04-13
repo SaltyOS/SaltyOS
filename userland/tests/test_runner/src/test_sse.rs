@@ -78,7 +78,9 @@ fn test_xmm_survives_fork() -> bool {
         }
         if child_read == parent_val {
             puts(b"  XMM survives fork (child): OK\n");
-            unsafe { trona_posix::posix_exit(0); }
+            unsafe {
+                trona_posix::posix_exit(0);
+            }
         } else {
             let mut lb = LineBuf::new();
             lb.str(b"  XMM survives fork (child): FAIL (expected ");
@@ -87,7 +89,9 @@ fn test_xmm_survives_fork() -> bool {
             lb.hex(child_read);
             lb.str(b")\n");
             lb.flush();
-            unsafe { trona_posix::posix_exit(1); }
+            unsafe {
+                trona_posix::posix_exit(1);
+            }
         }
     }
 
@@ -108,7 +112,9 @@ fn test_xmm_survives_fork() -> bool {
 
     // Wait for child
     let mut status: i32 = 0;
-    unsafe { trona_posix::posix_waitpid(pid, &mut status); }
+    unsafe {
+        trona_posix::posix_waitpid(pid, &mut status);
+    }
 
     if parent_read != parent_val {
         let mut lb = LineBuf::new();
@@ -260,7 +266,9 @@ fn test_xmm_no_fpu_threads() -> bool {
         for _ in 0..5 {
             let _ = trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
         }
-        unsafe { trona_posix::posix_exit(0); }
+        unsafe {
+            trona_posix::posix_exit(0);
+        }
     }
 
     // Parent: yield to let child run (interleave context switches)
@@ -278,7 +286,9 @@ fn test_xmm_no_fpu_threads() -> bool {
     }
 
     let mut status: i32 = 0;
-    unsafe { trona_posix::posix_waitpid(pid, &mut status); }
+    unsafe {
+        trona_posix::posix_waitpid(pid, &mut status);
+    }
 
     if parent_read != parent_val {
         let mut lb = LineBuf::new();
@@ -347,7 +357,9 @@ fn test_xmm_heavy_context_switch() -> bool {
 
         if child_read == child_pattern {
             puts(b"  XMM heavy ctx switch (child): OK\n");
-            unsafe { trona_posix::posix_exit(0); }
+            unsafe {
+                trona_posix::posix_exit(0);
+            }
         } else {
             let mut lb = LineBuf::new();
             lb.str(b"  XMM heavy ctx switch (child): FAIL (expected ");
@@ -356,7 +368,9 @@ fn test_xmm_heavy_context_switch() -> bool {
             lb.hex(child_read);
             lb.str(b")\n");
             lb.flush();
-            unsafe { trona_posix::posix_exit(1); }
+            unsafe {
+                trona_posix::posix_exit(1);
+            }
         }
     }
 
@@ -375,7 +389,9 @@ fn test_xmm_heavy_context_switch() -> bool {
     }
 
     let mut status: i32 = 0;
-    unsafe { trona_posix::posix_waitpid(pid, &mut status); }
+    unsafe {
+        trona_posix::posix_waitpid(pid, &mut status);
+    }
 
     if parent_read != parent_pattern {
         let mut lb = LineBuf::new();
@@ -395,10 +411,20 @@ fn test_xmm_heavy_context_switch() -> bool {
 pub fn run() -> bool {
     puts(b"[test_sse] Running SSE tests\n");
     let mut ok = true;
-    if !test_xmm_survives_syscall() { ok = false; }
-    if !test_xmm_survives_fork() { ok = false; }
-    if !test_xmm_all_registers() { ok = false; }
-    if !test_xmm_no_fpu_threads() { ok = false; }
-    if !test_xmm_heavy_context_switch() { ok = false; }
+    if !test_xmm_survives_syscall() {
+        ok = false;
+    }
+    if !test_xmm_survives_fork() {
+        ok = false;
+    }
+    if !test_xmm_all_registers() {
+        ok = false;
+    }
+    if !test_xmm_no_fpu_threads() {
+        ok = false;
+    }
+    if !test_xmm_heavy_context_switch() {
+        ok = false;
+    }
     ok
 }
