@@ -1,0 +1,65 @@
+# SaltyOS initramfs manifest
+# Minimal set of files needed before rootfs mount.
+# Format: initrd_path=build_output_path
+#
+# Binary entries are resolved via --port-dir (the build directory).
+# Service entries use repo-relative paths from the manifest directory.
+
+# Runtime loaders
+lib/ld-trona.so=ld-trona.initrd.so
+lib/ld-trona-pe.so=ld-trona-pe.initrd.so
+
+# Shared libraries
+lib/libtrona.so=libtrona.initrd.so
+lib/libc.so=libc.initrd.so
+lib/libc++.so=libc++.initrd.so
+lib/kernel32.dll=kernel32.initrd.dll
+
+# Early boot services (required before rootfs mount)
+bin/init=init.initrd.elf
+bin/console=console.initrd.elf
+bin/namesrv=namesrv.initrd.elf
+bin/procmgr=procmgr.initrd.elf
+bin/vfs=vfs.initrd.elf
+bin/mmsrv=mmsrv.initrd.elf
+bin/rsrcsrv=rsrcsrv.initrd.elf
+bin/pcidrv=pcidrv.initrd.elf
+bin/blkdrv=blkdrv.initrd.elf
+bin/saltyfs=saltyfs.initrd.elf
+bin/win32_csrss=win32_csrss.initrd.elf
+
+# Late services (mirrored into initrd for pre-rootfs boot path)
+bin/dispdrv=dispdrv.stripped.elf
+bin/posix_ttysrv=posix_ttysrv.stripped.elf
+bin/posix_getty=posix_getty.stripped.elf
+bin/test_runner=test_runner.stripped.elf
+bin/netdrv=netdrv.stripped.elf
+bin/netsrv=netsrv.stripped.elf
+bin/dnssrv=dnssrv.stripped.elf
+bin/hello_pe=hello_pe.stripped.exe
+
+# Service definitions (loaded by init from initrd)
+services/console.service=../userland/services/console.service
+services/namesrv.service=../userland/services/namesrv.service
+services/mmsrv.service=../userland/services/mmsrv.service
+services/rsrcsrv.service=../userland/services/rsrcsrv.service
+services/rsrcsrv.target=../userland/services/rsrcsrv.target
+services/vfs.service=../userland/services/vfs.service
+services/procmgr.service=../userland/services/procmgr.service
+services/procmgr.target=../userland/services/procmgr.target
+services/dispdrv.service=../userland/services/dispdrv.service
+services/posix_ttysrv.service=../userland/services/posix_ttysrv.service
+services/rootfs.target=../userland/services/rootfs.target
+services/test_runner.service=../userland/services/test_runner.service
+services/posix_getty.service=../userland/services/posix_getty.service
+services/pcidrv.service=../userland/services/pcidrv.service
+services/blkdrv.service=../userland/services/blkdrv.service
+services/saltyfs.service=../userland/services/saltyfs.service
+services/netdrv.service=../userland/services/netdrv.service
+services/netsrv.service=../userland/services/netsrv.service
+services/dnssrv.service=../userland/services/dnssrv.service
+services/win32_csrss.service=../userland/services/win32_csrss.service
+services/hello_pe.service=../userland/services/hello_pe.service
+
+# Configuration
+etc/fstab=../images/etc/fstab
