@@ -67,7 +67,7 @@ pub fn send_signal_pgid(pgid: u32, sig: i32) {
     msg.regs[0] = pgid as u64;
     msg.regs[1] = sig as u64;
     unsafe {
-        ipc::nbsend_ctx(ipc_ctx(), CAP_PROCMGR_EP, &raw const msg);
+        ipc::nbsend_ctx(ipc_ctx(), trona::caps::procmgr_ep(), &raw const msg);
     }
 }
 
@@ -101,7 +101,7 @@ pub(crate) fn refill_slave_ring(pty: &mut PtyInstance) {
     }
 }
 
-fn push_slave_byte(pty_id: usize, pty: &mut PtyInstance, byte: u8) {
+pub(crate) fn push_slave_byte(pty_id: usize, pty: &mut PtyInstance, byte: u8) {
     if pty.slave_ring.push(byte) {
         return;
     }
@@ -151,7 +151,15 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
                 if pty.fg_pgid != 0 {
                     send_signal_pgid(pty.fg_pgid, SIGINT);
                 }
-                if canonical { pty.line.clear(); }
+                // POSIX: INTR flushes the canonical input queue (termios(3)).
+                // Flushing slave_ring/spill_ring too prevents stale bytes from
+                // the killed fg_pgrp being consumed by its exec-chain successor
+                // (e.g. respawned login reading a stale "root\n").
+                if canonical {
+                    pty.line.clear();
+                    pty.slave_ring.clear();
+                    pty.spill_ring.clear();
+                }
                 return;
             }
             if ch == pty.termios.c_cc[VQUIT] {
@@ -165,7 +173,12 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
                 if pty.fg_pgid != 0 {
                     send_signal_pgid(pty.fg_pgid, SIGQUIT);
                 }
-                if canonical { pty.line.clear(); }
+                // POSIX: QUIT flushes the canonical input queue (termios(3)).
+                if canonical {
+                    pty.line.clear();
+                    pty.slave_ring.clear();
+                    pty.spill_ring.clear();
+                }
                 return;
             }
             if ch == pty.termios.c_cc[VSUSP] {
@@ -179,7 +192,12 @@ pub unsafe fn process_input_char(pty_id: usize, c: u8, echo_buf: &mut [u8; 64], 
                 if pty.fg_pgid != 0 {
                     send_signal_pgid(pty.fg_pgid, SIGTSTP);
                 }
-                if canonical { pty.line.clear(); }
+                // POSIX: SUSP flushes the canonical input queue (termios(3)).
+                if canonical {
+                    pty.line.clear();
+                    pty.slave_ring.clear();
+                    pty.spill_ring.clear();
+                }
                 return;
             }
         }

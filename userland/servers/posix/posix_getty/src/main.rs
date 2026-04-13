@@ -2,12 +2,12 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
 //! Analogous to agetty(8). Opens a PTY slave, creates a new session,
-//! acquires the controlling terminal, then execs the shell.
+//! acquires the controlling terminal, then execs login (or bash as fallback).
 //!
 //! Lifecycle:
 //!   init spawns getty (SPAWN_FLAG_RESPAWN) →
-//!   getty: close fds → setsid → open /dev/pts/0 → dup → TIOCSCTTY → exec bash →
-//!   bash exits → procmgr respawns getty → new session cycle
+//!   getty: close fds → setsid → open /dev/pts/0 → dup → TIOCSCTTY → exec login →
+//!   login authenticates → exec shell → shell exits → procmgr respawns getty
 
 #![no_std]
 #![no_main]
@@ -72,14 +72,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             }
         }
 
-        trona::serial::serial_puts(b"[posix_getty] session ready, exec bash\n");
-
-        // 6. Exec bash — replaces this process image
-        let new_argv: [*const u8; 3] = [
-            b"bash\0".as_ptr(),
-            b"-i\0".as_ptr(),
-            core::ptr::null(),
-        ];
+        // 6. Build minimal environment for login/bash
         let mut path_buf = [0u8; 48];
         let prefix = b"PATH=";
         let path_val = trona::consts::posix::DEFAULT_PATH;
@@ -96,24 +89,53 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         }
         path_buf[i] = 0;
 
-        let new_envp: [*const u8; 7] = [
+        let new_envp: [*const u8; 5] = [
             path_buf.as_ptr(),
             b"HOME=/\0".as_ptr(),
             b"TERM=vt100\0".as_ptr(),
-            b"SHELL=/bin/sh\0".as_ptr(),
+            b"TTY=/dev/pts/0\0".as_ptr(),
+            core::ptr::null(),
+        ];
+
+        // 7. Try exec login first — handles authentication and credential setup
+        trona::serial::serial_puts(b"[posix_getty] session ready, exec login\n");
+
+        let login_argv: [*const u8; 2] = [
+            b"login\0".as_ptr(),
+            core::ptr::null(),
+        ];
+        posix_execve(
+            b"/bin/login\0".as_ptr(),
+            login_argv.as_ptr(),
+            new_envp.as_ptr(),
+        );
+
+        // 8. Login not available — fall back to bash (early boot / no rootfs)
+        trona::serial::serial_puts(b"[posix_getty] login exec failed, falling back to bash\n");
+
+        let bash_envp: [*const u8; 7] = [
+            path_buf.as_ptr(),
+            b"HOME=/\0".as_ptr(),
+            b"TERM=vt100\0".as_ptr(),
+            b"SHELL=/bin/bash\0".as_ptr(),
             b"PS1=$ \0".as_ptr(),
             b"TTY=/dev/pts/0\0".as_ptr(),
             core::ptr::null(),
         ];
 
-        posix_execve(
+        let bash_argv: [*const u8; 3] = [
             b"bash\0".as_ptr(),
-            new_argv.as_ptr(),
-            new_envp.as_ptr(),
+            b"-i\0".as_ptr(),
+            core::ptr::null(),
+        ];
+        posix_execve(
+            b"/bin/bash\0".as_ptr(),
+            bash_argv.as_ptr(),
+            bash_envp.as_ptr(),
         );
 
-        // If exec fails
-        trona::serial::serial_puts(b"[posix_getty] exec failed\n");
+        // Both failed
+        trona::serial::serial_puts(b"[posix_getty] all exec attempts failed\n");
         posix_exit(1);
     }
 }
