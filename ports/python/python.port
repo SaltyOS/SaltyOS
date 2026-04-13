@@ -48,5 +48,7 @@ py_cv_module__ctypes=disabled
 py_cv_module__ctypes_test=disabled
 
 [install]
-bin/python3 = python.exe
+# CPython names the build artifact `python.exe` on case-insensitive
+# macOS filesystems and `python` on Linux — list both.
+bin/python3 = python.exe|python
 lib/python3.14 = Lib

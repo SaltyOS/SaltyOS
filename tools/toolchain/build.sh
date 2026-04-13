@@ -274,6 +274,11 @@ cmd_build_host_rust_cross_std() {
   fi
   local filecheck_path="$SALTYOS_TOOLCHAIN_PREFIX/bin/FileCheck"
 
+  if [ ! -d "$SYSROOT/usr/lib" ]; then
+    die "sysroot not found at $SYSROOT
+Run 'just sysroot' first."
+  fi
+
   # Create cross-compiler wrappers that pin --target so macOS host
   # clang doesn't fall back to ld64.lld (Mach-O) instead of ld.lld (ELF).
   # Also add -L for sysroot libs so std.so can link against libc.so/libtrona.so.

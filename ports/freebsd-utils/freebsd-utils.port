@@ -110,7 +110,11 @@ cc -o maketab maketab.c
 # Generate m4 parser and tokenizer on host
 cd ${SRCDIR}/usr.bin/m4
 yacc -d -o parser.c parser.y
-lex -t tokenizer.l > tokenizer.c
+# Linux distributions typically ship `flex` without a `lex` symlink,
+# while macOS provides BSD `lex` directly. Pick whichever exists.
+LEX=$(command -v lex 2>/dev/null || command -v flex 2>/dev/null) || \
+    { echo "error: neither lex nor flex is installed (need flex on Linux/WSL)" >&2; exit 1; }
+"$LEX" -t tokenizer.l > tokenizer.c
 # Generate libfetch error headers
 cd ${SRCDIR}/lib/libfetch
 awk 'BEGIN { print "static struct fetcherr ftp_errlist[] = {" } /^[0-9]/ { printf "\t{ %s, FETCH_%s, \"%s\" },\n", $1, $2, substr($0, index($0,$3)) } END { print "\t{ -1, FETCH_OK, \"\" }\n};" }' ftp.errors > ftperr.h

@@ -777,14 +777,47 @@ pub fn do_stage(
         // Build outputs go to _build/, data files stay in source tree.
         // The [install] section must use explicit paths (e.g. _build/cat,
         // saltyos-files/etc/pam.d).
-        let src_file = match port.build_type {
-            BuildType::Cargo => cargo_artifact_path(&src, &env.salty_host, &artifact),
-            _ => src.join(&artifact),
-        };
-
-        if !src_file.exists() {
-            return Err(format!("Install source not found: {}", src_file.display()));
+        //
+        // The artifact spec may list `|`-separated alternatives so a single
+        // port can target build outputs whose name differs across hosts
+        // (e.g. CPython produces `python.exe` on case-insensitive macOS
+        // filesystems and `python` on Linux). The first existing candidate
+        // wins; if none exist the error reports every path tried.
+        let candidates: Vec<String> = artifact
+            .split('|')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if candidates.is_empty() {
+            return Err(format!(
+                "Install entry has no artifact: {} = {}",
+                install_path, artifact_ref
+            ));
         }
+
+        let mut tried: Vec<std::path::PathBuf> = Vec::with_capacity(candidates.len());
+        let src_file = candidates
+            .iter()
+            .map(|cand| match port.build_type {
+                BuildType::Cargo => cargo_artifact_path(&src, &env.salty_host, cand),
+                _ => src.join(cand),
+            })
+            .find(|p| {
+                let exists = p.exists();
+                if !exists {
+                    tried.push(p.clone());
+                }
+                exists
+            })
+            .ok_or_else(|| {
+                let list = tried
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("Install source not found (tried: {})", list)
+            })?;
         stage_install_path(
             Path::new(&install_path),
             &src_file,
